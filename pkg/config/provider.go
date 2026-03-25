@@ -89,6 +89,15 @@ func (cp Provider) Find(input string) string {
 	return ""
 }
 
+// FindAlias 检查别名是否已存在，返回该别名所属的节点ID
+// 如果别名不存在，返回空字符串
+func (cp Provider) FindAlias(alias string) string {
+	if alias == "" {
+		return ""
+	}
+	return cp.Find(alias)
+}
+
 func (cp Provider) GetNode(nodeID string) (models.Node, bool) {
 	return cp.cfg.Nodes.Get(nodeID)
 }

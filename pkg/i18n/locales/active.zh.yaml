@@ -638,6 +638,10 @@ identity_err_no_name:
 identity_err_exists:
   other: "认证信息模板 {{.Name}} 已存在"
 
+# ---- alias errors ----
+alias_err_exists:
+  other: "别名 {{.Alias}} 已被节点 {{.Node}} 使用"
+
 # ---- firewall additions ----
 fw_err_os_not_supported:
   other: "防火墙管理功能仅支持 Linux 系统 (当前系统为 {{.OS}})"

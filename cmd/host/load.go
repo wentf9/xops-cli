@@ -128,6 +128,11 @@ func getOrCreateNode(provider config.ConfigProvider, addr utils.HostInfo) (strin
 	}
 
 	if addr.Alias != "" {
+		// 检查别名是否已被其他节点使用
+		if existingNode := provider.FindAlias(addr.Alias); existingNode != "" && existingNode != nodeID {
+			logger.PrintError(i18n.Tf("alias_err_exists", map[string]any{"Alias": addr.Alias, "Node": existingNode}))
+			return nodeID, false, nil
+		}
 		node.Alias = []string{addr.Alias}
 	}
 
@@ -180,10 +185,15 @@ func updateNodeFromHostInfo(nodeID string, provider config.ConfigProvider, addr 
 
 	// 更新别名
 	if addr.Alias != "" {
-		aliases, changed := appendUnique(node.Alias, addr.Alias)
-		if changed {
-			node.Alias = aliases
-			updated = true
+		// 检查别名是否已被其他节点使用
+		if existingNode := provider.FindAlias(addr.Alias); existingNode != "" && existingNode != nodeID {
+			logger.PrintWarn(i18n.Tf("alias_err_exists", map[string]any{"Alias": addr.Alias, "Node": existingNode}))
+		} else {
+			aliases, changed := appendUnique(node.Alias, addr.Alias)
+			if changed {
+				node.Alias = aliases
+				updated = true
+			}
 		}
 	}
 

@@ -152,7 +152,7 @@ func (o *SshOptions) Run() error {
 	return nil
 }
 
-func updateNodeFields(node *models.Node, o *SshOptions, provider config.ConfigProvider) bool {
+func updateNodeFields(node *models.Node, nodeID string, o *SshOptions, provider config.ConfigProvider) bool {
 	nodeUpdated := false
 	if o.JumpHost != "" {
 		jumpHost := provider.Find(o.JumpHost)
@@ -166,8 +166,13 @@ func updateNodeFields(node *models.Node, o *SshOptions, provider config.ConfigPr
 		nodeUpdated = true
 	}
 	if o.Alias != "" {
-		node.Alias = append(node.Alias, o.Alias)
-		nodeUpdated = true
+		// 检查别名是否已被其他节点使用
+		if existingNode := provider.FindAlias(o.Alias); existingNode != "" && existingNode != nodeID {
+			// 别名已存在，跳过
+		} else {
+			node.Alias = append(node.Alias, o.Alias)
+			nodeUpdated = true
+		}
 	}
 	if len(o.Tags) > 0 {
 		tagMap := make(map[string]bool)
@@ -223,6 +228,10 @@ func (o *SshOptions) createNewNode(provider config.ConfigProvider) (string, erro
 		Port:    o.Port,
 	}
 	if o.Alias != "" {
+		// 检查别名是否已存在
+		if existingNode := provider.FindAlias(o.Alias); existingNode != "" {
+			return "", fmt.Errorf("%s", i18n.Tf("alias_err_exists", map[string]any{"Alias": o.Alias, "Node": existingNode}))
+		}
 		node.Alias = append(node.Alias, strings.TrimSpace(o.Alias))
 	}
 	identity := models.Identity{
@@ -256,7 +265,7 @@ func update(nodeID string, o *SshOptions, provider config.ConfigProvider) bool {
 	node, _ := provider.GetNode(nodeID)
 	identity, _ := provider.GetIdentity(nodeID)
 
-	nodeUpdated := updateNodeFields(&node, o, provider)
+	nodeUpdated := updateNodeFields(&node, nodeID, o, provider)
 	identityUpdated := updateIdentityFields(&identity, o)
 
 	if nodeUpdated {

@@ -76,10 +76,18 @@ func (m *Model) initForm(nodeID string) Model {
 					if s == "" {
 						return nil
 					}
-					// Check for duplicate alias
-					if !state.isEdit || s != state.alias {
-						if m.provider.Find(s) != "" {
-							return errors.New(i18n.T("tui_validation_alias_exists"))
+					// Check for duplicate aliases (comma-separated)
+					for _, a := range strings.Split(s, ",") {
+						a = strings.TrimSpace(a)
+						if a == "" {
+							continue
+						}
+						if existingNode := m.provider.FindAlias(a); existingNode != "" {
+							// 如果是编辑模式且别名属于当前节点，则跳过
+							if state.isEdit && existingNode == state.originalID {
+								continue
+							}
+							return errors.New(i18n.Tf("alias_err_exists", map[string]any{"Alias": a, "Node": existingNode}))
 						}
 					}
 					return nil

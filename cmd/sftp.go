@@ -132,6 +132,10 @@ func (o *SftpOptions) createNewNode(provider config.ConfigProvider) (string, err
 		Port:    o.Port,
 	}
 	if o.Alias != "" {
+		// 检查别名是否已存在
+		if existingNode := provider.FindAlias(o.Alias); existingNode != "" {
+			return "", fmt.Errorf("%s", i18n.Tf("alias_err_exists", map[string]any{"Alias": o.Alias, "Node": existingNode}))
+		}
 		node.Alias = append(node.Alias, strings.TrimSpace(o.Alias))
 	}
 	identity := models.Identity{

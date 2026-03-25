@@ -5,6 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
 	"github.com/wentf9/xops-cli/pkg/models"
@@ -40,7 +41,7 @@ func NewCmdInventoryEdit() *cobra.Command {
 			host, _ := provider.GetHost(oldName)
 			identity, _ := provider.GetIdentity(oldName)
 
-			updated, nameChanged := applyNodeUpdates(cmd, &host, &identity, &node, flags)
+			updated, nameChanged := applyNodeUpdates(cmd, provider, oldName, &host, &identity, &node, flags)
 
 			if updated {
 				newName := oldName
@@ -78,7 +79,7 @@ func NewCmdInventoryEdit() *cobra.Command {
 	return cmd
 }
 
-func applyNodeUpdates(cmd *cobra.Command, host *models.Host, identity *models.Identity, node *models.Node, flags *editFlags) (updated, nameChanged bool) {
+func applyNodeUpdates(cmd *cobra.Command, provider config.ConfigProvider, oldName string, host *models.Host, identity *models.Identity, node *models.Node, flags *editFlags) (updated, nameChanged bool) {
 	if flags.address != "" {
 		host.Address, updated, nameChanged = flags.address, true, true
 	}
@@ -97,6 +98,13 @@ func applyNodeUpdates(cmd *cobra.Command, host *models.Host, identity *models.Id
 		identity.Passphrase, updated = flags.keyPass, true
 	}
 	if cmd.Flags().Changed("alias") {
+		// 检查别名是否已被其他节点使用
+		for _, a := range flags.alias {
+			if existingNode := provider.FindAlias(a); existingNode != "" && existingNode != oldName {
+				// 别名已存在，跳过该别名
+				continue
+			}
+		}
 		node.Alias, updated = flags.alias, true
 	}
 	if cmd.Flags().Changed("jump") {

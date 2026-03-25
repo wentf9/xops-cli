@@ -381,10 +381,8 @@ func (o *ExecOptions) execCreateNewNode(provider config.ConfigProvider, host, us
 		SuPwd:       o.SuPwd,
 	}
 
-	if addr.Alias != "" {
-		node.Alias = []string{addr.Alias}
-	} else if o.Alias != "" {
-		node.Alias = []string{o.Alias}
+	if err := o.setNodeAlias(provider, &node, addr.Alias); err != nil {
+		return "", err
 	}
 
 	if node.ProxyJump != "" {
@@ -395,9 +393,34 @@ func (o *ExecOptions) execCreateNewNode(provider config.ConfigProvider, host, us
 		node.ProxyJump = jumpHost
 	}
 
-	identity := models.Identity{
-		User: user,
+	identity := o.buildIdentity(host, user, addr)
+
+	provider.AddHost(node.HostRef, models.Host{Address: host, Port: port})
+	provider.AddIdentity(node.IdentityRef, identity)
+	provider.AddNode(nodeID, node)
+
+	return nodeID, nil
+}
+
+// setNodeAlias sets the node alias with duplicate check
+func (o *ExecOptions) setNodeAlias(provider config.ConfigProvider, node *models.Node, alias string) error {
+	aliasToSet := alias
+	if aliasToSet == "" {
+		aliasToSet = o.Alias
 	}
+	if aliasToSet == "" {
+		return nil
+	}
+	if existingNode := provider.FindAlias(aliasToSet); existingNode != "" {
+		return fmt.Errorf("%s", i18n.Tf("alias_err_exists", map[string]any{"Alias": aliasToSet, "Node": existingNode}))
+	}
+	node.Alias = []string{aliasToSet}
+	return nil
+}
+
+// buildIdentity creates an identity from the given parameters
+func (o *ExecOptions) buildIdentity(host, user string, addr utils.HostInfo) models.Identity {
+	identity := models.Identity{User: user}
 
 	password := addr.Password
 	if password == "" && addr.KeyPath == "" {
@@ -405,38 +428,34 @@ func (o *ExecOptions) execCreateNewNode(provider config.ConfigProvider, host, us
 			password = o.Password
 		} else if o.KeyFile == "" {
 			pass, err := utils.ReadPasswordFromTerminal(i18n.Tf("prompt_enter_password_for", map[string]any{"User": user, "Host": host}))
-			if err != nil {
-				return "", err
+			if err == nil {
+				password = pass
 			}
-			password = pass
 		}
 	}
 
 	if password != "" {
 		identity.Password = password
 		identity.AuthType = "password"
-	} else {
-		keyPath := addr.KeyPath
-		if keyPath == "" {
-			keyPath = o.KeyFile
-		}
-		keyPass := addr.Passphrase
-		if keyPass == "" {
-			keyPass = o.KeyPass
-		}
-
-		if keyPath != "" {
-			identity.KeyPath = utils.ToAbsolutePath(keyPath)
-			identity.Passphrase = keyPass
-			identity.AuthType = "key"
-		}
+		return identity
 	}
 
-	provider.AddHost(node.HostRef, models.Host{Address: host, Port: port})
-	provider.AddIdentity(node.IdentityRef, identity)
-	provider.AddNode(nodeID, node)
+	keyPath := addr.KeyPath
+	if keyPath == "" {
+		keyPath = o.KeyFile
+	}
+	keyPass := addr.Passphrase
+	if keyPass == "" {
+		keyPass = o.KeyPass
+	}
 
-	return nodeID, nil
+	if keyPath != "" {
+		identity.KeyPath = utils.ToAbsolutePath(keyPath)
+		identity.Passphrase = keyPass
+		identity.AuthType = "key"
+	}
+
+	return identity
 }
 
 func appendExecAlias(slice []string, val string) ([]string, bool) {
@@ -456,7 +475,22 @@ func (o *ExecOptions) updateNodeFromHostInfo(nodeID string, provider config.Conf
 	identity, _ := provider.GetIdentity(nodeID)
 	updated := false
 
-	// 更新密码或密钥
+	updated = o.updateIdentity(&identity, addr) || updated
+	updated = o.updateNodeAlias(nodeID, &node, addr.Alias, provider) || updated
+	updated = o.updateNodeSudo(&node) || updated
+
+	if updated {
+		provider.AddNode(nodeID, node)
+		provider.AddIdentity(node.IdentityRef, identity)
+	}
+
+	return updated
+}
+
+// updateIdentity updates identity credentials and returns true if changed
+func (o *ExecOptions) updateIdentity(identity *models.Identity, addr utils.HostInfo) bool {
+	updated := false
+
 	if addr.Password != "" {
 		if identity.Password != addr.Password || identity.AuthType != "password" {
 			identity.Password = addr.Password
@@ -473,12 +507,28 @@ func (o *ExecOptions) updateNodeFromHostInfo(nodeID string, provider config.Conf
 		}
 	}
 
-	// 更新别名
-	aliases, changed := appendExecAlias(node.Alias, addr.Alias)
+	return updated
+}
+
+// updateNodeAlias updates node alias and returns true if changed
+func (o *ExecOptions) updateNodeAlias(nodeID string, node *models.Node, alias string, provider config.ConfigProvider) bool {
+	if alias == "" {
+		return false
+	}
+	// 检查别名是否已被其他节点使用
+	if existingNode := provider.FindAlias(alias); existingNode != "" && existingNode != nodeID {
+		return false
+	}
+	aliases, changed := appendExecAlias(node.Alias, alias)
 	if changed {
 		node.Alias = aliases
-		updated = true
 	}
+	return changed
+}
+
+// updateNodeSudo updates sudo settings and returns true if changed
+func (o *ExecOptions) updateNodeSudo(node *models.Node) bool {
+	updated := false
 
 	sudoMode := models.SudoModeNone
 	if o.Sudo {
@@ -493,11 +543,6 @@ func (o *ExecOptions) updateNodeFromHostInfo(nodeID string, provider config.Conf
 	if o.SuPwd != "" && node.SuPwd != o.SuPwd {
 		node.SuPwd = o.SuPwd
 		updated = true
-	}
-
-	if updated {
-		provider.AddNode(nodeID, node)
-		provider.AddIdentity(node.IdentityRef, identity)
 	}
 
 	return updated

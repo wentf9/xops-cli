@@ -638,6 +638,10 @@ identity_err_no_name:
 identity_err_exists:
   other: "Authentication template {{.Name}} already exists"
 
+# ---- alias errors ----
+alias_err_exists:
+  other: "Alias {{.Alias}} is already used by node {{.Node}}"
+
 # ---- firewall additions ----
 fw_err_os_not_supported:
   other: "Firewall management is only supported on Linux (current system is {{.OS}})"

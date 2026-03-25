@@ -75,6 +75,13 @@ func NewCmdInventoryAdd() *cobra.Command {
 				return fmt.Errorf("节点 %s 已存在", name)
 			}
 
+			// 检查别名是否已存在
+			for _, a := range alias {
+				if existingNode := provider.FindAlias(a); existingNode != "" {
+					return fmt.Errorf("%s", i18n.Tf("alias_err_exists", map[string]any{"Alias": a, "Node": existingNode}))
+				}
+			}
+
 			hostObj := models.Host{Address: address, Port: port}
 			node := models.Node{
 				HostRef:     fmt.Sprintf("host-%s:%d", address, port),

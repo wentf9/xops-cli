@@ -49,5 +49,6 @@ type ConfigProvider interface {
 	ListIdentities() map[string]models.Identity
 	DeleteIdentity(name string)
 	Find(input string) string
+	FindAlias(alias string) string
 	GetConfig() *Configuration
 }
