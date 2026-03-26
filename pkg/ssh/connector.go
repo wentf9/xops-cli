@@ -94,7 +94,7 @@ func (c *Connector) Connect(ctx context.Context, nodeName string) (*Client, erro
 		}
 
 		// 4. 构建目标 SSH 配置 (认证信息)
-		sshConfig, cleanup, err := c.buildSSHConfig(identity, host.Address)
+		sshConfig, cleanup, err := c.buildSSHConfig(&identity, host.Address)
 		if err != nil {
 			return nil, fmt.Errorf("failed to build ssh config for '%s': %w", nodeName, err)
 		}
@@ -141,7 +141,7 @@ func (c *Connector) CloseAll() {
 }
 
 // buildSSHConfig 根据 Identity 模型构建 ssh.ClientConfig
-func (c *Connector) buildSSHConfig(id models.Identity, hostAddr string) (*ssh.ClientConfig, func(), error) {
+func (c *Connector) buildSSHConfig(id *models.Identity, hostAddr string) (*ssh.ClientConfig, func(), error) {
 	var cleanup func()
 	authMethods := []ssh.AuthMethod{}
 
@@ -149,7 +149,12 @@ func (c *Connector) buildSSHConfig(id models.Identity, hostAddr string) (*ssh.Cl
 	switch id.AuthType {
 	case "auto":
 		var autoCleanup func()
-		authMethods, autoCleanup = BuildAutoAuthMethods(id.User, hostAddr, id.KeyPath)
+		authMethods, autoCleanup = BuildAutoAuthMethods(id.User, hostAddr, func(s string) {
+			if s != "" {
+				id.Password = s
+				id.AuthType = "password"
+			}
+		})
 		cleanup = autoCleanup
 
 	case "password":

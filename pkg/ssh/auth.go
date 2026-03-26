@@ -1,13 +1,14 @@
 package ssh
 
 import (
-	"fmt"
 	"net"
 	"os"
 
+	cmdutil "github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/pkg/i18n"
+	"github.com/wentf9/xops-cli/pkg/logger"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
-	"golang.org/x/term"
 )
 
 // AuthMethod 定义获取 SSH 认证方法的接口
@@ -45,11 +46,11 @@ func (k *KeyAuth) GetMethod() (ssh.AuthMethod, error) {
 }
 
 // BuildAutoAuthMethods 生成一个包含多种回退机制的 AuthMethod 链
-func BuildAutoAuthMethods(user, host, keyPath string) ([]ssh.AuthMethod, func()) {
+func BuildAutoAuthMethods(user, host string, passwordCallback func(string)) ([]ssh.AuthMethod, func()) {
 	var methods []ssh.AuthMethod
 	var cleanup func()
 
-	// 1. SSH Agent
+	// SSH Agent
 	if socket := os.Getenv("SSH_AUTH_SOCK"); socket != "" {
 		if conn, err := net.Dial("unix", socket); err == nil {
 			agentClient := agent.NewClient(conn)
@@ -58,21 +59,12 @@ func BuildAutoAuthMethods(user, host, keyPath string) ([]ssh.AuthMethod, func())
 		}
 	}
 
-	// 2. Specific Key Path
-	if keyPath != "" {
-		keyAuth := &KeyAuth{Path: expandHomeDir(keyPath)}
-		if m, err := keyAuth.GetMethod(); err == nil {
-			methods = append(methods, m)
-		}
-	}
-
-	// 3. Default Keys
+	// Default Keys
 	defaultKeys := []string{"~/.ssh/id_rsa", "~/.ssh/id_ed25519", "~/.ssh/id_ecdsa", "~/.ssh/id_dsa"}
 	for _, p := range defaultKeys {
-		if expandHomeDir(p) == expandHomeDir(keyPath) {
-			continue
-		}
+		logger.Debugf("Checking default key: %s", expandHomeDir(p))
 		if _, err := os.Stat(expandHomeDir(p)); err == nil {
+			logger.Debugf("Found default key: %s", expandHomeDir(p))
 			keyAuth := &KeyAuth{Path: expandHomeDir(p)}
 			if m, err := keyAuth.GetMethod(); err == nil {
 				methods = append(methods, m)
@@ -80,15 +72,14 @@ func BuildAutoAuthMethods(user, host, keyPath string) ([]ssh.AuthMethod, func())
 		}
 	}
 
-	// 4. Password Fallback
+	// Password Fallback
 	methods = append(methods, ssh.RetryableAuthMethod(ssh.PasswordCallback(func() (string, error) {
-		fmt.Printf("%s@%s's password: ", user, host)
-		password, err := term.ReadPassword(int(os.Stdin.Fd()))
-		fmt.Println()
+		password, err := cmdutil.ReadPasswordFromTerminal(i18n.T("prompt_enter_password"))
 		if err != nil {
 			return "", err
 		}
-		return string(password), nil
+		passwordCallback(password)
+		return password, nil
 	}), 3))
 
 	return methods, cleanup

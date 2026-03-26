@@ -238,12 +238,7 @@ func (o *SshOptions) createNewNode(provider config.ConfigProvider) (string, erro
 		User: strings.TrimSpace(o.User),
 	}
 	if o.Password == "" && o.KeyFile == "" {
-		pass, err := utils.ReadPasswordFromTerminal(i18n.T("prompt_enter_password"))
-		if err != nil {
-			return "", err
-		}
-		identity.Password = pass
-		identity.AuthType = "password"
+		identity.AuthType = "auto"
 	} else if o.Password != "" {
 		identity.Password = o.Password
 		identity.AuthType = "password"
