@@ -59,6 +59,9 @@ xops ssh web-01
 
 # 连接的同时指定分组
 xops ssh root@192.168.1.11 -t db
+
+# 建立本地端口转发隧道并将进程挂起 (-L 本地端口:目标IP:目标端口, -N 不执行远程命令)
+xops ssh web-01 -L 8080:localhost:80 -N
 ```
 
 ### 3. 批量命令执行

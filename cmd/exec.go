@@ -301,7 +301,10 @@ func (o *ExecOptions) getOrCreateNode(provider config.ConfigProvider, addr utils
 		return nodeID, updated, nil
 	}
 
-	nodeID, err := o.execCreateNewNode(provider, host, user, port, addr)
+	addr.Host = host
+	addr.User = user
+	addr.Port = port
+	nodeID, err := o.execCreateNewNode(provider, addr)
 	return nodeID, true, err
 }
 
@@ -366,7 +369,11 @@ func (o *ExecOptions) buildTasksFromHosts(provider config.ConfigProvider) ([]exe
 	return tasks, nil
 }
 
-func (o *ExecOptions) execCreateNewNode(provider config.ConfigProvider, host, user string, port uint16, addr utils.HostInfo) (string, error) {
+func (o *ExecOptions) execCreateNewNode(provider config.ConfigProvider, addr utils.HostInfo) (string, error) {
+	host := addr.Host
+	user := addr.User
+	port := addr.Port
+
 	nodeID := fmt.Sprintf("%s@%s:%d", user, host, port)
 	sudoMode := models.SudoModeNone
 	if o.Sudo {
@@ -393,7 +400,7 @@ func (o *ExecOptions) execCreateNewNode(provider config.ConfigProvider, host, us
 		node.ProxyJump = jumpHost
 	}
 
-	identity := o.buildIdentity(host, user, addr)
+	identity := o.buildIdentity(addr)
 
 	provider.AddHost(node.HostRef, models.Host{Address: host, Port: port})
 	provider.AddIdentity(node.IdentityRef, identity)
@@ -419,25 +426,12 @@ func (o *ExecOptions) setNodeAlias(provider config.ConfigProvider, node *models.
 }
 
 // buildIdentity creates an identity from the given parameters
-func (o *ExecOptions) buildIdentity(host, user string, addr utils.HostInfo) models.Identity {
-	identity := models.Identity{User: user}
+func (o *ExecOptions) buildIdentity(addr utils.HostInfo) models.Identity {
+	identity := models.Identity{User: addr.User}
 
 	password := addr.Password
-	if password == "" && addr.KeyPath == "" {
-		if o.Password != "" {
-			password = o.Password
-		} else if o.KeyFile == "" {
-			pass, err := utils.ReadPasswordFromTerminal(i18n.Tf("prompt_enter_password_for", map[string]any{"User": user, "Host": host}))
-			if err == nil {
-				password = pass
-			}
-		}
-	}
-
-	if password != "" {
-		identity.Password = password
-		identity.AuthType = "password"
-		return identity
+	if password == "" && o.Password != "" {
+		password = o.Password
 	}
 
 	keyPath := addr.KeyPath
@@ -449,7 +443,12 @@ func (o *ExecOptions) buildIdentity(host, user string, addr utils.HostInfo) mode
 		keyPass = o.KeyPass
 	}
 
-	if keyPath != "" {
+	if password == "" && keyPath == "" {
+		identity.AuthType = "auto"
+	} else if password != "" {
+		identity.Password = password
+		identity.AuthType = "password"
+	} else if keyPath != "" {
 		identity.KeyPath = utils.ToAbsolutePath(keyPath)
 		identity.Passphrase = keyPass
 		identity.AuthType = "key"

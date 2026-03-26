@@ -57,6 +57,12 @@ flag_alias:
   other: "连接别名"
 flag_tag:
   other: "为节点添加标签(分组)"
+flag_local_forward:
+  other: "本地端口转发 [bind_address:]port:host:hostport"
+flag_remote_forward:
+  other: "远程端口转发 [bind_address:]port:host:hostport"
+flag_no_cmd:
+  other: "不执行远程命令 (通常与端口转发配合使用)"
 prompt_enter_password:
   other: "请输入密码: "
 prompt_enter_password_for:

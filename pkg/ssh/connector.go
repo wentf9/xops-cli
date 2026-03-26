@@ -59,76 +59,112 @@ func (c *Connector) Connect(ctx context.Context, nodeName string) (*Client, erro
 			return newClient(cachedClient, node, host, identity, c.Config, nodeName), nil
 		}
 
-		// 1. 获取节点配置
-		node, ok := c.Config.GetNode(nodeName)
-		if !ok {
-			return nil, fmt.Errorf("node not found '%s'", nodeName)
-		}
-
-		// 2. 获取关联的 Host 和 Identity 数据
-		host, ok := c.Config.GetHost(nodeName)
-		if !ok {
-			return nil, fmt.Errorf("host ref '%s' not found for node '%s'", node.HostRef, nodeName)
-		}
-		identity, ok := c.Config.GetIdentity(nodeName)
-		if !ok {
-			return nil, fmt.Errorf("identity ref '%s' not found for node '%s'", node.IdentityRef, nodeName)
-		}
-
-		// 3. 确定网络拨号器 (Dialer)
-		// 如果有 ProxyJump，递归连接跳板机，将其 SSH Client 封装为 Dialer
-		var dialer Dialer = &net.Dialer{Timeout: 10 * time.Second} // 默认直连
-
-		if node.ProxyJump != "" {
-			jumpHost := c.Config.Find(node.ProxyJump)
-			if jumpHost == "" {
-				jumpHost = node.ProxyJump
-			}
-			// 递归：连接跳板机
-			jumpNodeClient, err := c.Connect(ctx, jumpHost)
-			if err != nil {
-				return nil, fmt.Errorf("failed to connect to jump host '%s': %w", node.ProxyJump, err)
-			}
-			// 封装：使用跳板机的 SSH 通道作为 Dialer
-			dialer = &SSHProxyDialer{Client: jumpNodeClient.sshClient}
-		}
-
-		// 4. 构建目标 SSH 配置 (认证信息)
-		sshConfig, cleanup, err := c.buildSSHConfig(&identity, host.Address)
-		if err != nil {
-			return nil, fmt.Errorf("failed to build ssh config for '%s': %w", nodeName, err)
-		}
-		if cleanup != nil {
-			defer cleanup()
-		}
-
-		// 5. 建立底层 TCP 连接 (通过 Dialer)
-		if host.Port == 0 {
-			host.Port = 22
-		}
-		targetAddr := fmt.Sprintf("%s:%d", host.Address, host.Port)
-		conn, err := dialer.DialContext(ctx, "tcp", targetAddr)
-		if err != nil {
-			return nil, fmt.Errorf("failed to dial target '%s' (%s): %w", nodeName, targetAddr, err)
-		}
-
-		// 6. 建立 SSH 会话
-		// 使用 NewClientConn 接管底层的 conn
-		ncc, chans, reqs, err := ssh.NewClientConn(conn, targetAddr, sshConfig)
-		if err != nil {
-			_ = conn.Close()
-			return nil, fmt.Errorf("ssh handshake failed for '%s': %w", nodeName, err)
-		}
-		rawClient := ssh.NewClient(ncc, chans, reqs)
-		c.clients.Set(nodeName, rawClient)
-		// 7. 返回封装的 Client
-		return newClient(rawClient, node, host, identity, c.Config, nodeName), nil
+		return c.initializeConnection(ctx, nodeName)
 	})
 	if err != nil {
 		return nil, err
 	}
 	// 类型断言返回结果
 	return result.(*Client), nil
+}
+
+func (c *Connector) initializeConnection(ctx context.Context, nodeName string) (*Client, error) {
+	node, host, identity, err := c.fetchNodeConfig(nodeName)
+	if err != nil {
+		return nil, err
+	}
+
+	dialer, err := c.setupDialer(ctx, node)
+	if err != nil {
+		return nil, err
+	}
+
+	sshConfig, cleanup, err := c.buildSSHConfig(&identity, host.Address)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build ssh config for '%s': %w", nodeName, err)
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+
+	rawClient, err := c.dialAndHandshake(ctx, nodeName, host, dialer, sshConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	// 认证并连接成功后，检查我们是否通过 "auto" 下的终端交互获取到了新密码。
+	// 如果 identity 对象被 buildSSHConfig 内部的回调赋予了密码，则把它写回提供者内存
+	if identity.Password != "" {
+		c.Config.AddIdentity(node.IdentityRef, identity)
+		// 同时保证如果是首次建立的节点（例如 openssh: 前缀的节点），能被正确驻留在配置树内
+		c.Config.AddNode(nodeName, node)
+		c.Config.AddHost(node.HostRef, host)
+	}
+
+	c.clients.Set(nodeName, rawClient)
+	// 7. 返回封装的 Client
+	return newClient(rawClient, node, host, identity, c.Config, nodeName), nil
+}
+
+func (c *Connector) fetchNodeConfig(nodeName string) (models.Node, models.Host, models.Identity, error) {
+	node, ok := c.Config.GetNode(nodeName)
+	if !ok {
+		return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("node not found '%s'", nodeName)
+	}
+
+	// 用户确认这里明确要求兼容传入 nodeName
+	host, ok := c.Config.GetHost(nodeName)
+	if !ok {
+		return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("host ref '%s' not found for node '%s'", node.HostRef, nodeName)
+	}
+
+	identity, ok := c.Config.GetIdentity(nodeName)
+	if !ok {
+		return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("identity ref '%s' not found for node '%s'", node.IdentityRef, nodeName)
+	}
+
+	return node, host, identity, nil
+}
+
+func (c *Connector) setupDialer(ctx context.Context, node models.Node) (Dialer, error) {
+	var dialer Dialer = &net.Dialer{Timeout: 10 * time.Second} // 默认直连
+
+	if node.ProxyJump != "" {
+		jumpHost := c.Config.Find(node.ProxyJump)
+		if jumpHost == "" {
+			jumpHost = node.ProxyJump
+		}
+		// 递归：连接跳板机
+		jumpNodeClient, err := c.Connect(ctx, jumpHost)
+		if err != nil {
+			return nil, fmt.Errorf("failed to connect to jump host '%s': %w", node.ProxyJump, err)
+		}
+		// 封装：使用跳板机的 SSH 通道作为 Dialer
+		dialer = &SSHProxyDialer{Client: jumpNodeClient.sshClient}
+	}
+
+	return dialer, nil
+}
+
+func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, host models.Host, dialer Dialer, sshConfig *ssh.ClientConfig) (*ssh.Client, error) {
+	if host.Port == 0 {
+		host.Port = 22
+	}
+	targetAddr := fmt.Sprintf("%s:%d", host.Address, host.Port)
+	conn, err := dialer.DialContext(ctx, "tcp", targetAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to dial target '%s' (%s): %w", nodeName, targetAddr, err)
+	}
+
+	// 建立 SSH 会话
+	// 使用 NewClientConn 接管底层的 conn
+	ncc, chans, reqs, err := ssh.NewClientConn(conn, targetAddr, sshConfig)
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("ssh handshake failed for '%s': %w", nodeName, err)
+	}
+
+	return ssh.NewClient(ncc, chans, reqs), nil
 }
 
 // CloseAll 关闭所有缓存的连接 (在程序退出前调用)

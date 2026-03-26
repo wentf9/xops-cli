@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -17,17 +18,20 @@ import (
 )
 
 type SshOptions struct {
-	Host     string
-	Port     uint16
-	User     string
-	Password string
-	KeyFile  string
-	KeyPass  string
-	Sudo     bool
-	Alias    string
-	JumpHost string
-	Tags     []string
-	args     []string
+	Host           string
+	Port           uint16
+	User           string
+	Password       string
+	KeyFile        string
+	KeyPass        string
+	Sudo           bool
+	Alias          string
+	JumpHost       string
+	Tags           []string
+	LocalForwards  []string
+	RemoteForwards []string
+	NoCmd          bool
+	args           []string
 }
 
 func NewSshOptions() *SshOptions {
@@ -60,6 +64,9 @@ func NewCmdSsh() *cobra.Command {
 	cmd.Flags().StringVarP(&o.JumpHost, "jump", "j", "", i18n.T("flag_jump"))
 	cmd.Flags().StringVarP(&o.Alias, "alias", "a", "", i18n.T("flag_alias"))
 	cmd.Flags().StringSliceVarP(&o.Tags, "tag", "t", []string{}, i18n.T("flag_tag"))
+	cmd.Flags().StringSliceVarP(&o.LocalForwards, "local-forward", "L", []string{}, i18n.T("flag_local_forward"))
+	cmd.Flags().StringSliceVarP(&o.RemoteForwards, "remote-forward", "R", []string{}, i18n.T("flag_remote_forward"))
+	cmd.Flags().BoolVarP(&o.NoCmd, "no-cmd", "N", false, i18n.T("flag_no_cmd"))
 	cmd.MarkFlagsMutuallyExclusive("password", "key")
 	return cmd
 }
@@ -110,23 +117,15 @@ func (o *SshOptions) Run() error {
 
 	provider := config.NewProvider(cfg)
 
-	var nodeID string
-	updated := false
-	if nodeID = provider.Find(o.Host); nodeID != "" {
-		updated = update(nodeID, o, provider)
-	} else if nodeID = provider.Find(fmt.Sprintf("%s@%s:%d", o.User, o.Host, o.Port)); nodeID != "" {
-		updated = update(nodeID, o, provider)
-	} else {
-		updated = true
-		nodeID, err = o.createNewNode(provider)
-		if err != nil {
-			return err
-		}
+	nodeID, updated, err := o.resolveNode(provider)
+	if err != nil {
+		return err
 	}
 	connector := ssh.NewConnector(provider)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	client, err := connector.Connect(ctx, nodeID)
+	connectCtx, connectCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	idBefore, _ := provider.GetIdentity(nodeID)
+	client, err := connector.Connect(connectCtx, nodeID)
+	connectCancel()
 	if err != nil {
 		fmt.Printf("\n%s: %v\n", i18n.T("fw_connect_failed"), err)
 		fmt.Println(i18n.T("tui_press_enter"))
@@ -135,18 +134,114 @@ func (o *SshOptions) Run() error {
 		return fmt.Errorf("%s: %w", i18n.T("fw_connect_failed"), err)
 	}
 	defer func() { _ = client.Close() }()
-	if o.Sudo {
-		if err := client.ShellWithSudo(ctx); err != nil {
-			return fmt.Errorf("%s: %w", i18n.T("sudo_exec_failed"), err)
-		}
-	} else {
-		if err := client.Shell(ctx); err != nil {
-			return fmt.Errorf("%s: %w", i18n.T("ssh_err_shell"), err)
-		}
+	// connector.Connect 可能通过交互式回调获取到新密码并写入提供者，我们需要标记更新以便保存
+	if idAfter, _ := provider.GetIdentity(nodeID); idBefore.Password != idAfter.Password {
+		updated = true
 	}
 	if updated {
 		if err := configStore.Save(cfg); err != nil {
 			return fmt.Errorf("%s: %w", i18n.T("ssh_err_save_config"), err)
+		}
+	}
+
+	// Setup background context for tunnels and execution (runs until SigInt or command exit)
+	runCtx, runCancel := context.WithCancel(context.Background())
+	defer runCancel()
+
+	if err := o.startTunnels(runCtx, client); err != nil {
+		return err
+	}
+
+	if o.NoCmd {
+		fmt.Printf("SSH tunnels established to %s. Press Ctrl+C to exit.\n", nodeID)
+		<-runCtx.Done()
+		return nil
+	}
+
+	if o.Sudo {
+		if err := client.ShellWithSudo(runCtx); err != nil {
+			return fmt.Errorf("%s: %w", i18n.T("sudo_exec_failed"), err)
+		}
+	} else {
+		if err := client.Shell(runCtx); err != nil {
+			return fmt.Errorf("%s: %w", i18n.T("ssh_err_shell"), err)
+		}
+	}
+
+	return nil
+}
+
+// parseForwardArg parses standard SSH forward argument limits.
+// Expected format: [bind_address:]port:host:hostport
+// E.g: 8080:localhost:80 -> bind_address="127.0.0.1", port="8080", host="localhost", hostport="80"
+func parseForwardArg(arg string) (bindAddr, destAddr string, err error) {
+	parts := splitTunnels(arg)
+	if len(parts) < 3 || len(parts) > 4 {
+		return "", "", fmt.Errorf("invalid forward format '%s', expected [bind_address:]port:host:hostport", arg)
+	}
+	destPort := parts[len(parts)-1]
+	destHost := strings.Trim(parts[len(parts)-2], "[]")
+	destAddr = net.JoinHostPort(destHost, destPort)
+
+	if len(parts) == 3 {
+		bindAddr = net.JoinHostPort("127.0.0.1", parts[0])
+	} else {
+		bindHost := strings.Trim(parts[0], "[]")
+		bindAddr = net.JoinHostPort(bindHost, parts[1])
+	}
+	return bindAddr, destAddr, nil
+}
+
+func splitTunnels(s string) []string {
+	var parts []string
+	var current string
+	inBracket := false
+	for _, r := range s {
+		if r == '[' {
+			inBracket = true
+			current += string(r)
+		} else if r == ']' {
+			inBracket = false
+			current += string(r)
+		} else if r == ':' && !inBracket {
+			parts = append(parts, current)
+			current = ""
+		} else {
+			current += string(r)
+		}
+	}
+	parts = append(parts, current)
+	return parts
+}
+
+func (o *SshOptions) resolveNode(provider config.ConfigProvider) (string, bool, error) {
+	if nodeID := provider.Find(o.Host); nodeID != "" {
+		return nodeID, update(nodeID, o, provider), nil
+	}
+	if nodeID := provider.Find(fmt.Sprintf("%s@%s:%d", o.User, o.Host, o.Port)); nodeID != "" {
+		return nodeID, update(nodeID, o, provider), nil
+	}
+	nodeID, err := o.createNewNode(provider)
+	return nodeID, true, err
+}
+
+func (o *SshOptions) startTunnels(ctx context.Context, client *ssh.Client) error {
+	for _, lArg := range o.LocalForwards {
+		bAddr, dAddr, err := parseForwardArg(lArg)
+		if err != nil {
+			return err
+		}
+		if err := client.LocalForward(ctx, bAddr, dAddr); err != nil {
+			return fmt.Errorf("failed to setup local forward: %w", err)
+		}
+	}
+	for _, rArg := range o.RemoteForwards {
+		bAddr, dAddr, err := parseForwardArg(rArg)
+		if err != nil {
+			return err
+		}
+		if err := client.RemoteForward(ctx, bAddr, dAddr); err != nil {
+			return fmt.Errorf("failed to setup remote forward: %w", err)
 		}
 	}
 	return nil

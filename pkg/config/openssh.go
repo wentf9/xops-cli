@@ -45,6 +45,12 @@ func (p *OpenSSHParser) Find(alias string) (string, bool) {
 	if alias == "" {
 		return "", false
 	}
+	// xops 内部可能传入全名诸如 "user@host:port" 给 provider 检索，
+	// 这些复合物并不是原生的 ssh_config Host (除非极罕见被定义成这样)。
+	// 为了不妨碍后续拆分逻辑和别名正确分配，我们过滤掉含有 @ 和 : 的别名。
+	if strings.Contains(alias, "@") || strings.Contains(alias, ":") {
+		return "", false
+	}
 	return OpenSSHNodePrefix + alias, true
 }
 

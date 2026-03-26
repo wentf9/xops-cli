@@ -386,9 +386,15 @@ func (o *ScpOptions) connectSftpForPath(ctx context.Context, p PathInfo, specifi
 			logger.PrintError(i18n.Tf("save_config_failed", map[string]any{"Error": err}))
 		}
 	}
+	idBefore, _ := provider.GetIdentity(nodeId)
 	client, err := connector.Connect(ctx, nodeId)
 	if err != nil {
 		return "", nil, err
+	}
+	if idAfter, _ := provider.GetIdentity(nodeId); idBefore.Password != idAfter.Password {
+		if err := configStore.Save(cfg); err != nil {
+			logger.PrintError(i18n.Tf("save_config_failed", map[string]any{"Error": err}))
+		}
 	}
 	sftpCli, err := sftp.NewClient(client, sftp.WithThreadsPerFile(o.ThreadCount))
 	if err != nil {
@@ -479,14 +485,8 @@ func (o *ScpOptions) createNewNode(provider config.ConfigProvider, host, user st
 	}
 
 	if password == "" && o.KeyFile == "" {
-		pass, err := cmdutils.ReadPasswordFromTerminal(i18n.Tf("prompt_enter_password_for", map[string]any{"User": user, "Host": host}))
-		if err != nil {
-			return "", false, err
-		}
-		password = pass
-	}
-
-	if password != "" {
+		identity.AuthType = "auto"
+	} else if password != "" {
 		identity.Password = password
 		identity.AuthType = "password"
 	} else if o.KeyFile != "" {

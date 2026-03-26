@@ -80,9 +80,13 @@ func (o *SftpOptions) Run() error {
 	connector := ssh.NewConnector(provider)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	idBefore, _ := provider.GetIdentity(nodeID)
 	client, err := connector.Connect(ctx, nodeID)
 	if err != nil {
 		return fmt.Errorf("%s: %w", i18n.T("err_connect_failed"), err)
+	}
+	if idAfter, _ := provider.GetIdentity(nodeID); idBefore.Password != idAfter.Password {
+		updated = true
 	}
 	sftpClient, err := sftp.NewClient(
 		client,
@@ -142,12 +146,7 @@ func (o *SftpOptions) createNewNode(provider config.ConfigProvider) (string, err
 		User: strings.TrimSpace(o.User),
 	}
 	if o.Password == "" && o.KeyFile == "" {
-		pass, err := utils.ReadPasswordFromTerminal(i18n.T("prompt_enter_password"))
-		if err != nil {
-			return "", err
-		}
-		identity.Password = pass
-		identity.AuthType = "password"
+		identity.AuthType = "auto"
 	} else if o.Password != "" {
 		identity.Password = o.Password
 		identity.AuthType = "password"
