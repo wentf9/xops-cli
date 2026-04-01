@@ -2,7 +2,7 @@ package sftp
 
 import (
 	"context"
-	"errors"
+
 	"fmt"
 	"io"
 	"os"
@@ -11,7 +11,7 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/chzyer/readline"
+	"github.com/peterh/liner"
 	"github.com/schollz/progressbar/v3"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"golang.org/x/term"
@@ -19,77 +19,88 @@ import (
 
 // Shell 定义交互式 SFTP 环境
 type Shell struct {
-	client   *Client
-	cwd      string // 远程当前目录
-	localCwd string // 本地当前目录
-	rl       *readline.Instance
-	stderr   io.Writer
+	client      *Client
+	cwd         string
+	localCwd    string
+	line        *liner.State
+	historyFile string // 用于退出时保存历史
+	stdout      io.Writer
+	stderr      io.Writer
 }
 
 // NewShell 创建一个新的交互式 Shell
 func (c *Client) NewShell(stdin io.Reader, stdout, stderr io.Writer) (*Shell, error) {
-	// 获取初始远程目录
 	cwd, err := c.sftpClient.Getwd()
 	if err != nil {
 		cwd = "."
 	}
-
-	// 获取初始本地目录
 	localCwd, err := os.Getwd()
 	if err != nil {
 		localCwd = "."
 	}
 
-	// 创建 readline 实例
-	rl, err := readline.NewEx(&readline.Config{
-		Prompt:          fmt.Sprintf("sftp:%s> ", cwd),
-		InterruptPrompt: "^C",
-		EOFPrompt:       "exit",
-		HistoryFile:     "",  // 不持久化历史，可根据需要设置路径
-		AutoComplete:    nil, // 先设为 nil，创建 shell 后再绑定
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create readline: %w", err)
+	// 初始化 liner
+	line := liner.NewLiner()
+	line.SetCtrlCAborts(true) // 允许 Ctrl+C 中断提示
+
+	// 读取历史记录
+	homeDir, _ := os.UserHomeDir()
+	historyFile := ""
+	if homeDir != "" {
+		historyFile = filepath.Join(homeDir, ".xops_sftp_history")
+		if f, err := os.Open(historyFile); err == nil {
+			line.ReadHistory(f)
+			f.Close()
+		}
 	}
 
 	shell := &Shell{
-		client:   c,
-		cwd:      cwd,
-		localCwd: localCwd,
-		rl:       rl,
-		stderr:   stderr,
+		client:      c,
+		cwd:         cwd,
+		localCwd:    localCwd,
+		line:        line,
+		historyFile: historyFile,
+		stdout:      stdout,
+		stderr:      stderr,
 	}
 
-	// 绑定自动补全器
-	rl.Config.AutoComplete = &SftpCompleter{shell: shell}
+	// 绑定自动补全
+	line.SetWordCompleter(shell.wordCompleter)
 
 	return shell, nil
 }
 
 // Run 启动交互式循环 (REPL)
 func (s *Shell) Run(ctx context.Context) error {
-	defer func() { _ = s.rl.Close() }()
+	defer func() {
+		// 退出时保存历史记录
+		if s.historyFile != "" {
+			if f, err := os.Create(s.historyFile); err == nil {
+				s.line.WriteHistory(f)
+				f.Close()
+			}
+		}
+		_ = s.line.Close()
+	}()
 
 	for {
-		// 更新 prompt 显示当前远程目录
-		s.rl.SetPrompt(fmt.Sprintf("sftp:%s> ", s.cwd))
-
-		line, err := s.rl.Readline()
+		prompt := fmt.Sprintf("sftp:%s> ", s.cwd)
+		input, err := s.line.Prompt(prompt)
 		if err != nil {
-			// readline.ErrInterrupt 表示 Ctrl+C
-			// io.EOF 表示 Ctrl+D
-			if errors.Is(err, readline.ErrInterrupt) {
-				continue // 忽略中断，继续等待输入
+			if err == liner.ErrPromptAborted {
+				continue // 对应 Ctrl+C 拦截
 			}
-			return nil // EOF 或其他错误，退出
+			return nil // EOF 对应 Ctrl+D 或其他错误退出
 		}
 
-		line = strings.TrimSpace(line)
-		if line == "" {
+		input = strings.TrimSpace(input)
+		if input == "" {
 			continue
 		}
 
-		args := strings.Fields(line)
+		s.line.AppendHistory(input) // 动态加入历史
+
+		args := strings.Fields(input)
 		cmd := args[0]
 		params := args[1:]
 
@@ -110,26 +121,20 @@ func (s *Shell) dispatchCommand(ctx context.Context, cmd string, params []string
 		return true, nil
 	case "help", "?":
 		s.printHelp()
-	case "pwd":
-		_, _ = fmt.Fprintln(s.rl.Stdout(), s.cwd)
-	case "lpwd":
-		_, _ = fmt.Fprintln(s.rl.Stdout(), s.localCwd)
-	case "ls":
-		s.handleLs(params, false)
-	case "ll":
-		s.handleLs(params, true)
-	case "lls":
-		s.handleLocalLs(params, false)
-	case "lll":
-		s.handleLocalLs(params, true)
-	case "cd":
-		s.handleCd(params)
-	case "lcd":
-		s.handleLocalCd(params)
-	case "mkdir":
-		s.handleMkdir(params)
-	case "rm":
-		s.handleRm(params)
+	case "pwd", "lpwd":
+		s.handlePwd(cmd)
+	case "ls", "ll", "lls", "lll":
+		s.handleLsGroup(cmd, params)
+	case "cd", "lcd":
+		s.handleCdGroup(cmd, params)
+	case "mkdir", "lmkdir":
+		s.handleMkdirGroup(cmd, params)
+	case "rm", "lrm":
+		s.handleRmGroup(cmd, params)
+	case "cp", "lcp":
+		s.handleCpGroup(cmd, params)
+	case "mv", "lmv":
+		s.handleMvGroup(cmd, params)
 	case "get":
 		s.handleGet(ctx, params)
 	case "put":
@@ -138,6 +143,67 @@ func (s *Shell) dispatchCommand(ctx context.Context, cmd string, params []string
 		_, _ = fmt.Fprintf(s.stderr, "%s\n", i18n.Tf("sftp_shell_unknown_cmd", map[string]any{"Cmd": cmd}))
 	}
 	return false, nil
+}
+
+func (s *Shell) handlePwd(cmd string) {
+	if cmd == "pwd" {
+		_, _ = fmt.Fprintln(s.stdout, s.cwd)
+	} else {
+		_, _ = fmt.Fprintln(s.stdout, s.localCwd)
+	}
+}
+
+func (s *Shell) handleLsGroup(cmd string, params []string) {
+	switch cmd {
+	case "ls":
+		s.handleLs(params, false)
+	case "ll":
+		s.handleLs(params, true)
+	case "lls":
+		s.handleLocalLs(params, false)
+	case "lll":
+		s.handleLocalLs(params, true)
+	}
+}
+
+func (s *Shell) handleCdGroup(cmd string, params []string) {
+	if cmd == "cd" {
+		s.handleCd(params)
+	} else {
+		s.handleLocalCd(params)
+	}
+}
+
+func (s *Shell) handleMkdirGroup(cmd string, params []string) {
+	if cmd == "mkdir" {
+		s.handleMkdir(params)
+	} else {
+		s.handleLocalMkdir(params)
+	}
+}
+
+func (s *Shell) handleRmGroup(cmd string, params []string) {
+	if cmd == "rm" {
+		s.handleRm(params)
+	} else {
+		s.handleLocalRm(params)
+	}
+}
+
+func (s *Shell) handleCpGroup(cmd string, params []string) {
+	if cmd == "cp" {
+		s.handleCp(params)
+	} else {
+		s.handleLocalCp(params)
+	}
+}
+
+func (s *Shell) handleMvGroup(cmd string, params []string) {
+	if cmd == "mv" {
+		s.handleMv(params)
+	} else {
+		s.handleLocalMv(params)
+	}
 }
 
 // ================= 命令处理逻辑 =================
@@ -205,7 +271,7 @@ func (s *Shell) handleLs(args []string, long bool) {
 
 	if long {
 		// 详细列表模式 (类似 ls -l)
-		w := tabwriter.NewWriter(s.rl.Stdout(), 0, 0, 1, ' ', 0)
+		w := tabwriter.NewWriter(s.stdout, 0, 0, 1, ' ', 0)
 		for _, f := range files {
 			modTime := f.ModTime().Format("Jan 02 15:04")
 			size := formatBytes(f.Size())
@@ -243,7 +309,7 @@ func (s *Shell) handleLocalLs(args []string, long bool) {
 
 	if long {
 		// 详细列表模式
-		w := tabwriter.NewWriter(s.rl.Stdout(), 0, 0, 1, ' ', 0)
+		w := tabwriter.NewWriter(s.stdout, 0, 0, 1, ' ', 0)
 		for _, e := range entries {
 			info, err := e.Info()
 			if err != nil {
@@ -304,7 +370,7 @@ func (s *Shell) handleGet(ctx context.Context, args []string) {
 		}
 	}
 
-	_, _ = fmt.Fprintln(s.rl.Stdout(), i18n.Tf("sftp_shell_downloading", map[string]any{"Remote": remote, "Local": local}))
+	_, _ = fmt.Fprintln(s.stdout, i18n.Tf("sftp_shell_downloading", map[string]any{"Remote": remote, "Local": local}))
 
 	progress := s.createProgressBar(remote)
 
@@ -312,7 +378,7 @@ func (s *Shell) handleGet(ctx context.Context, args []string) {
 	if err != nil {
 		_, _ = fmt.Fprintf(s.stderr, "%s\n", i18n.Tf("sftp_shell_download_failed", map[string]any{"Error": err}))
 	} else {
-		_, _ = fmt.Fprintln(s.rl.Stdout(), i18n.T("sftp_shell_download_done"))
+		_, _ = fmt.Fprintln(s.stdout, i18n.T("sftp_shell_download_done"))
 	}
 }
 
@@ -349,7 +415,7 @@ func (s *Shell) handlePut(ctx context.Context, args []string) {
 		}
 	}
 
-	_, _ = fmt.Fprintln(s.rl.Stdout(), i18n.Tf("sftp_shell_uploading", map[string]any{"Local": local, "Remote": remote}))
+	_, _ = fmt.Fprintln(s.stdout, i18n.Tf("sftp_shell_uploading", map[string]any{"Local": local, "Remote": remote}))
 
 	// 计算本地文件大小以显示准确的进度条
 	var totalSize int64
@@ -363,13 +429,13 @@ func (s *Shell) handlePut(ctx context.Context, args []string) {
 	bar := progressbar.NewOptions64(
 		totalSize,
 		progressbar.OptionSetDescription("Uploading"),
-		progressbar.OptionSetWriter(s.rl.Stdout()), // 关键：使用 readline 的 stdout
+		progressbar.OptionSetWriter(s.stdout), // 关键：使用 readline 的 stdout
 		progressbar.OptionEnableColorCodes(true),
 		progressbar.OptionShowBytes(true),
 		progressbar.OptionSetWidth(30),
 		progressbar.OptionThrottle(65*time.Millisecond),
 		progressbar.OptionOnCompletion(func() {
-			_, _ = fmt.Fprint(s.rl.Stdout(), "\n")
+			_, _ = fmt.Fprint(s.stdout, "\n")
 		}),
 	)
 	callback := func(n int64) { _ = bar.Add64(n) }
@@ -378,7 +444,7 @@ func (s *Shell) handlePut(ctx context.Context, args []string) {
 	if err != nil {
 		_, _ = fmt.Fprintf(s.stderr, "%s\n", i18n.Tf("sftp_shell_upload_failed", map[string]any{"Error": err}))
 	} else {
-		_, _ = fmt.Fprintln(s.rl.Stdout(), i18n.T("sftp_shell_upload_done"))
+		_, _ = fmt.Fprintln(s.stdout, i18n.T("sftp_shell_upload_done"))
 	}
 }
 
@@ -393,12 +459,32 @@ func (s *Shell) handleMkdir(args []string) {
 	}
 }
 
+func (s *Shell) handleLocalMkdir(args []string) {
+	if len(args) < 1 {
+		_, _ = fmt.Fprintln(s.stderr, i18n.T("sftp_shell_lmkdir_usage"))
+		return
+	}
+	path := s.resolveLocalPath(args[0])
+	if err := os.Mkdir(path, 0755); err != nil {
+		_, _ = fmt.Fprintf(s.stderr, "lmkdir: %v\n", err)
+	}
+}
+
 func (s *Shell) handleRm(args []string) {
 	if len(args) < 1 {
 		_, _ = fmt.Fprintln(s.stderr, i18n.T("sftp_shell_rm_usage"))
 		return
 	}
 	path := s.resolvePath(args[0])
+
+	// 优先尝试使用远程命令以提高性能和递归支持
+	cmd := fmt.Sprintf("rm -rf '%s'", strings.ReplaceAll(path, "'", "'\\''"))
+	_, err := s.client.sshClient.Run(context.Background(), cmd)
+	if err == nil {
+		return
+	}
+
+	// 如果远程命令失败（可能因为无 shell 权限或非 Unix 环境），回退到 SFTP 协议操作
 	if err := s.client.sftpClient.Remove(path); err != nil {
 		// 尝试作为目录删除
 		if err2 := s.client.sftpClient.RemoveDirectory(path); err2 != nil {
@@ -407,24 +493,205 @@ func (s *Shell) handleRm(args []string) {
 	}
 }
 
+func (s *Shell) handleLocalRm(args []string) {
+	if len(args) < 1 {
+		_, _ = fmt.Fprintln(s.stderr, i18n.T("sftp_shell_lrm_usage"))
+		return
+	}
+	path := s.resolveLocalPath(args[0])
+	// 为了方便，lrm 直接支持递归删除
+	if err := os.RemoveAll(path); err != nil {
+		_, _ = fmt.Fprintf(s.stderr, "lrm: %v\n", err)
+	}
+}
+
+func (s *Shell) handleCp(args []string) {
+	if len(args) < 2 {
+		_, _ = fmt.Fprintln(s.stderr, i18n.T("sftp_shell_cp_usage"))
+		return
+	}
+	src := s.resolvePath(args[0])
+	dst := s.resolvePath(args[1])
+
+	// 优先尝试使用远程命令以实现高性能服务器端复制
+	cmd := fmt.Sprintf("cp -r '%s' '%s'", strings.ReplaceAll(src, "'", "'\\''"), strings.ReplaceAll(dst, "'", "'\\''"))
+	_, err := s.client.sshClient.Run(context.Background(), cmd)
+	if err == nil {
+		return
+	}
+
+	// 如果远程命令失败，回退到 SFTP 协议流式复制
+	// 虽然速度慢，但能保证在任何标准 SFTP 服务端工作
+	dstInfo, errStat := s.client.sftpClient.Stat(dst)
+	finalDst := dst
+	if errStat == nil && dstInfo.IsDir() {
+		finalDst = s.client.JoinPath(dst, filepath.Base(src))
+	}
+
+	if err := s.remoteCopySFTP(src, finalDst); err != nil {
+		_, _ = fmt.Fprintf(s.stderr, "cp: %v\n", err)
+	}
+}
+
+func (s *Shell) remoteCopySFTP(src, dst string) error {
+	srcFile, err := s.client.sftpClient.Open(src)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = srcFile.Close() }()
+
+	srcStat, err := srcFile.Stat()
+	if err != nil {
+		return err
+	}
+
+	if srcStat.IsDir() {
+		if err := s.client.sftpClient.MkdirAll(dst); err != nil {
+			return err
+		}
+		entries, err := s.client.sftpClient.ReadDir(src)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			subSrc := s.client.JoinPath(src, entry.Name())
+			subDst := s.client.JoinPath(dst, entry.Name())
+			if err := s.remoteCopySFTP(subSrc, subDst); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	dstFile, err := s.client.sftpClient.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = dstFile.Close() }()
+
+	_, err = io.Copy(dstFile, srcFile)
+	return err
+}
+
+func (s *Shell) handleMv(args []string) {
+	if len(args) < 2 {
+		_, _ = fmt.Fprintln(s.stderr, i18n.T("sftp_shell_mv_usage"))
+		return
+	}
+	src := s.resolvePath(args[0])
+	dst := s.resolvePath(args[1])
+
+	// 优先尝试使用远程命令
+	cmd := fmt.Sprintf("mv '%s' '%s'", strings.ReplaceAll(src, "'", "'\\''"), strings.ReplaceAll(dst, "'", "'\\''"))
+	_, err := s.client.sshClient.Run(context.Background(), cmd)
+	if err == nil {
+		return
+	}
+
+	// 如果远程命令失败，回退到 SFTP Rename (注意：SFTP Rename 通常不支持跨文件系统)
+	dstInfo, errStat := s.client.sftpClient.Stat(dst)
+	finalDst := dst
+	if errStat == nil && dstInfo.IsDir() {
+		finalDst = s.client.JoinPath(dst, filepath.Base(src))
+	}
+
+	if err := s.client.sftpClient.Rename(src, finalDst); err != nil {
+		_, _ = fmt.Fprintf(s.stderr, "mv: %v\n", err)
+	}
+}
+
+func (s *Shell) handleLocalCp(args []string) {
+	if len(args) < 2 {
+		_, _ = fmt.Fprintln(s.stderr, i18n.T("sftp_shell_lcp_usage"))
+		return
+	}
+	src := s.resolveLocalPath(args[0])
+	dst := s.resolveLocalPath(args[1])
+
+	// 检查目标是否是目录
+	dstInfo, err := os.Stat(dst)
+	if err == nil && dstInfo.IsDir() {
+		dst = filepath.Join(dst, filepath.Base(src))
+	}
+
+	if err := s.localCopy(src, dst); err != nil {
+		_, _ = fmt.Fprintf(s.stderr, "lcp: %v\n", err)
+	}
+}
+
+func (s *Shell) localCopy(src, dst string) error {
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+
+	if srcInfo.IsDir() {
+		if err := os.MkdirAll(dst, srcInfo.Mode()); err != nil {
+			return err
+		}
+		entries, err := os.ReadDir(src)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			subSrc := filepath.Join(src, entry.Name())
+			subDst := filepath.Join(dst, entry.Name())
+			if err := s.localCopy(subSrc, subDst); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = srcFile.Close() }()
+
+	dstFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = dstFile.Close() }()
+
+	_, err = io.Copy(dstFile, srcFile)
+	if err != nil {
+		return err
+	}
+	return os.Chmod(dst, srcInfo.Mode())
+}
+
+func (s *Shell) handleLocalMv(args []string) {
+	if len(args) < 2 {
+		_, _ = fmt.Fprintln(s.stderr, i18n.T("sftp_shell_lmv_usage"))
+		return
+	}
+	src := s.resolveLocalPath(args[0])
+	dst := s.resolveLocalPath(args[1])
+
+	// 检查目标是否是目录
+	dstInfo, err := os.Stat(dst)
+	if err == nil && dstInfo.IsDir() {
+		dst = filepath.Join(dst, filepath.Base(src))
+	}
+
+	if err := os.Rename(src, dst); err != nil {
+		_, _ = fmt.Fprintf(s.stderr, "lmv: %v\n", err)
+	}
+}
+
 func (s *Shell) printHelp() {
-	_, _ = fmt.Fprintln(s.rl.Stdout(), i18n.T("sftp_shell_help"))
+	_, _ = fmt.Fprintln(s.stdout, i18n.T("sftp_shell_help"))
 }
 
 func (s *Shell) askConfirmation(prompt string) bool {
-	// 关键：在询问前显式换行并刷新，防止提示被上一次命令的输出覆盖或吞掉
-	_, _ = fmt.Fprint(s.rl.Stdout(), "\n")
-
-	// 设置一个新的临时 prompt，这样 Readline 会自动渲染它并等待输入
-	origPrompt := s.rl.Config.Prompt
-	defer s.rl.SetPrompt(origPrompt)
-
-	s.rl.SetPrompt(fmt.Sprintf("%s [y/N]: ", prompt))
-	line, err := s.rl.Readline()
+	_, _ = fmt.Fprint(s.stdout, "\n")
+	input, err := s.line.Prompt(fmt.Sprintf("%s [y/N]: ", prompt))
 	if err != nil {
 		return false
 	}
-	response := strings.ToLower(strings.TrimSpace(line))
+	response := strings.ToLower(strings.TrimSpace(input))
 	return response == "y" || response == "yes"
 }
 
@@ -444,13 +711,13 @@ func (s *Shell) createProgressBar(remotePath string) ProgressCallback {
 	bar := progressbar.NewOptions64(
 		total,
 		progressbar.OptionSetDescription(description),
-		progressbar.OptionSetWriter(s.rl.Stdout()),
+		progressbar.OptionSetWriter(s.stdout),
 		progressbar.OptionEnableColorCodes(true),
 		progressbar.OptionShowBytes(true),
 		progressbar.OptionSetWidth(30),
 		progressbar.OptionThrottle(65*time.Millisecond),
 		progressbar.OptionOnCompletion(func() {
-			_, _ = fmt.Fprint(s.rl.Stdout(), "\n")
+			_, _ = fmt.Fprint(s.stdout, "\n")
 		}),
 	)
 	return func(n int64) { _ = bar.Add64(n) }
@@ -515,8 +782,8 @@ func (s *Shell) printColumns(names []string) {
 			}
 			name := names[idx]
 			// 使用固定宽度格式化，左对齐
-			_, _ = fmt.Fprintf(s.rl.Stdout(), "%-*s", colWidth, name)
+			_, _ = fmt.Fprintf(s.stdout, "%-*s", colWidth, name)
 		}
-		_, _ = fmt.Fprintln(s.rl.Stdout())
+		_, _ = fmt.Fprintln(s.stdout)
 	}
 }

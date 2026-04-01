@@ -463,8 +463,20 @@ sftp_shell_put_usage:
   other: "Usage: put <local_file> [remote_path]"
 sftp_shell_mkdir_usage:
   other: "Usage: mkdir <path>"
+sftp_shell_lmkdir_usage:
+  other: "Usage: lmkdir <path>"
 sftp_shell_rm_usage:
   other: "Usage: rm <path>"
+sftp_shell_lrm_usage:
+  other: "Usage: lrm <path>"
+sftp_shell_cp_usage:
+  other: "Usage: cp <src> <dest>"
+sftp_shell_lcp_usage:
+  other: "Usage: lcp <src> <dest>"
+sftp_shell_mv_usage:
+  other: "Usage: mv <src> <dest>"
+sftp_shell_lmv_usage:
+  other: "Usage: lmv <src> <dest>"
 sftp_shell_downloading:
   other: "Downloading {{.Remote}} -> {{.Local}}"
 sftp_shell_download_failed:
@@ -478,7 +490,7 @@ sftp_shell_upload_failed:
 sftp_shell_upload_done:
   other: "\nUpload complete"
 sftp_shell_help:
-  other: "\nAvailable commands:\n  cd <path>     Change remote directory\n  lcd <path>    Change local directory\n  pwd           Show remote current directory\n  lpwd          Show local current directory\n  ls [path]     List remote files (simple)\n  ll [path]     List remote files (detailed)\n  lls [path]    List local files (simple)\n  lll [path]    List local files (detailed)\n  get <remote> [local]  Download file or directory\n  put <local> [remote]  Upload file or directory\n  mkdir <path>  Create remote directory\n  rm <path>     Remove remote file or directory\n  exit/quit     Exit\n"
+  other: "\nAvailable commands:\n  cd <path>     Change remote directory\n  lcd <path>    Change local directory\n  pwd           Show remote current directory\n  lpwd          Show local current directory\n  ls [path]     List remote files (simple)\n  ll [path]     List remote files (detailed)\n  lls [path]    List local files (simple)\n  lll [path]    List local files (detailed)\n  get <remote> [local]  Download file or directory\n  put <local> [remote]  Upload file or directory\n  mkdir <path>  Create remote directory\n  lmkdir <path> Create local directory\n  rm <path>     Remove remote file or directory\n  lrm <path>    Remove local file or directory\n  cp <src> <dest> Copy remote file or directory\n  lcp <src> <dest> Copy local file or directory\n  mv <src> <dest> Move remote file or directory\n  lmv <src> <dest> Move local file or directory\n  exit/quit     Exit\n"
 
 # ---- tui ----
 tui_short:

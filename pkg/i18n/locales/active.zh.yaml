@@ -464,8 +464,20 @@ sftp_shell_put_usage:
   other: "用法: put <本地文件> [远程路径]"
 sftp_shell_mkdir_usage:
   other: "用法: mkdir <路径>"
+sftp_shell_lmkdir_usage:
+  other: "用法: lmkdir <路径>"
 sftp_shell_rm_usage:
   other: "用法: rm <路径>"
+sftp_shell_lrm_usage:
+  other: "用法: lrm <路径>"
+sftp_shell_cp_usage:
+  other: "用法: cp <源路径> <目标路径>"
+sftp_shell_lcp_usage:
+  other: "用法: lcp <源路径> <目标路径>"
+sftp_shell_mv_usage:
+  other: "用法: mv <源路径> <目标路径>"
+sftp_shell_lmv_usage:
+  other: "用法: lmv <源路径> <目标路径>"
 sftp_shell_downloading:
   other: "下载 {{.Remote}} -> {{.Local}}"
 sftp_shell_download_failed:
@@ -479,7 +491,7 @@ sftp_shell_upload_failed:
 sftp_shell_upload_done:
   other: "\n上传完成"
 sftp_shell_help:
-  other: "\n可用命令:\n  cd <path>     切换远程目录\n  lcd <path>    切换本地目录\n  pwd           显示远程当前目录\n  lpwd          显示本地当前目录\n  ls [path]     列出远程文件 (简洁模式)\n  ll [path]     列出远程文件 (详细模式)\n  lls [path]    列出本地文件 (简洁模式)\n  lll [path]    列出本地文件 (详细模式)\n  get <remote> [local]  下载文件或目录\n  put <local> [remote]  上传文件或目录\n  mkdir <path>  创建远程目录\n  rm <path>     删除远程文件或目录\n  exit/quit     退出\n"
+  other: "\n可用命令:\n  cd <path>     切换远程目录\n  lcd <path>    切换本地目录\n  pwd           显示远程当前目录\n  lpwd          显示本地当前目录\n  ls [path]     列出远程文件 (简洁模式)\n  ll [path]     列出远程文件 (详细模式)\n  lls [path]    列出本地文件 (简洁模式)\n  lll [path]    列出本地文件 (详细模式)\n  get <remote> [local]  下载文件或目录\n  put <local> [remote]  上传文件或目录\n  mkdir <path>  创建远程目录\n  lmkdir <path> 创建本地目录\n  rm <path>     删除远程文件或目录\n  lrm <path>    删除本地文件或目录\n  cp <src> <dest> 复制远程文件或目录\n  lcp <src> <dest> 复制本地文件或目录\n  mv <src> <dest> 移动远程文件或目录\n  lmv <src> <dest> 移动本地文件或目录\n  exit/quit     退出\n"
 
 # ---- tui ----
 tui_short:
