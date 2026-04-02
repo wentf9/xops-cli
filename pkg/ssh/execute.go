@@ -118,22 +118,12 @@ func (c *Client) RunInteractiveWithSudo(ctx context.Context, command string) err
 	go func() { _, _ = io.Copy(os.Stdout, stdout) }()
 	go func() { _, _ = io.Copy(os.Stderr, stderr) }()
 
-	done := make(chan struct{})
-	go func() {
-		_, _ = io.Copy(stdin, os.Stdin)
-		close(done)
-	}()
+	cancelStdin, stdinDone := copyStdinTo(stdin)
 
 	err = ignoreShellExitError(session.Wait())
 	_ = term.Restore(fdIn, oldState)
-	// 关键：通过设置 Stdin 的 Deadline 来中断阻塞的 Read，防止返回后 stdin 被吞字节
-	_ = os.Stdin.SetReadDeadline(time.Now())
-	// 加入 50ms 超时兜底，防止在不支持 Deadline 的系统（如 Windows）上永久阻塞
-	select {
-	case <-done:
-	case <-time.After(50 * time.Millisecond):
-	}
-	_ = os.Stdin.SetReadDeadline(time.Time{})
+	cancelStdin()
+	<-stdinDone
 
 	return err
 }
@@ -287,21 +277,12 @@ func (c *Client) ShellWithSudo(ctx context.Context) error {
 		go func() { _, _ = io.Copy(os.Stdout, stdout) }()
 		go func() { _, _ = io.Copy(os.Stderr, stderr) }()
 
-		done := make(chan struct{})
-		go func() {
-			_, _ = io.Copy(stdin, os.Stdin)
-			close(done)
-		}()
+		cancelStdin, stdinDone := copyStdinTo(stdin)
 
 		err = ignoreShellExitError(session.Wait())
 		_ = term.Restore(fdIn, oldState)
-		_ = os.Stdin.SetReadDeadline(time.Now())
-		// 加入 50ms 超时兜底，防止在不支持 Deadline 的系统（如 Windows）上永久阻塞
-		select {
-		case <-done:
-		case <-time.After(50 * time.Millisecond):
-		}
-		_ = os.Stdin.SetReadDeadline(time.Time{})
+		cancelStdin()
+		<-stdinDone
 		return err
 	}
 
@@ -310,22 +291,12 @@ func (c *Client) ShellWithSudo(ctx context.Context) error {
 	go func() { _, _ = io.Copy(os.Stdout, stdout) }()
 	go func() { _, _ = io.Copy(os.Stderr, stderr) }()
 
-	done := make(chan struct{})
-	go func() {
-		_, _ = io.Copy(stdin, os.Stdin)
-		close(done)
-	}()
+	cancelStdin, stdinDone := copyStdinTo(stdin)
 
 	err = ignoreShellExitError(session.Wait())
 	_ = term.Restore(fdIn, oldState)
-	// 关键：通过设置 Stdin 的 Deadline 来中断阻塞的 Read，防止返回后 stdin 被吞字节
-	_ = os.Stdin.SetReadDeadline(time.Now())
-	// 加入 50ms 超时兜底，防止在不支持 Deadline 的系统（如 Windows）上永久阻塞
-	select {
-	case <-done:
-	case <-time.After(50 * time.Millisecond):
-	}
-	_ = os.Stdin.SetReadDeadline(time.Time{})
+	cancelStdin()
+	<-stdinDone
 
 	return err
 }

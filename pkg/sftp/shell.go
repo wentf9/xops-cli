@@ -792,7 +792,7 @@ func (s *Shell) handleExec(ctx context.Context, args []string) {
 	_, _ = fmt.Fprintln(s.stdout, "")
 }
 
-// handleLexec 在本地执行命令，输出流式写入 shell 的 stdout/stderr
+// handleLexec 在本地执行命令，接管终端 I/O 以支持 vim 等交互式程序
 func (s *Shell) handleLexec(ctx context.Context, cmdStr string) {
 	if cmdStr == "" {
 		_, _ = fmt.Fprintln(s.stderr, i18n.T("sftp_shell_lexec_usage"))
@@ -804,10 +804,29 @@ func (s *Shell) handleLexec(ctx context.Context, cmdStr string) {
 	} else {
 		c = exec.CommandContext(ctx, "sh", "-c", cmdStr)
 	}
-	c.Stdout = s.stdout
-	c.Stderr = s.stderr
+	// 直接绑定终端，确保 vim/less 等交互式程序能正常读写
+	c.Stdin = os.Stdin
+	c.Stdout = os.Stdout
+	c.Stderr = os.Stderr
 	c.Dir = s.localCwd
-	if err := c.Run(); err != nil {
+
+	// liner 持有终端原始状态，运行前先将终端还原为普通模式，
+	// 退出后重新接管，避免 vim 退出后终端状态混乱
+	_ = s.line.Close()
+	err := c.Run()
+	s.line = liner.NewLiner()
+	s.line.SetCtrlCAborts(true)
+	s.line.SetTabCompletionStyle(liner.TabPrints)
+	s.line.SetWordCompleter(s.wordCompleter)
+	// 重新加载历史，避免本次执行覆盖了已有历史
+	if s.historyFile != "" {
+		if f, err := os.Open(s.historyFile); err == nil {
+			_, _ = s.line.ReadHistory(f)
+			_ = f.Close()
+		}
+	}
+
+	if err != nil {
 		_, _ = fmt.Fprintf(s.stderr, "lexec: %v\n", err)
 	}
 }
