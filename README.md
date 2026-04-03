@@ -1,208 +1,146 @@
-# XOps (XOps) 运维工具箱
+# 🚀 XOps CLI 
 
-xops (XOps) 是一个基于 Go 语言开发的命令行运维工具集，旨在简化日常的服务器管理工作。它集成了 SSH 连接管理、远程命令批量执行、文件传输、防火墙配置及网络工具等功能，并提供了基于标签的主机分组管理能力。
+<div align="center">
+  <h3>新一代 AI 驱动的全能运维命令行工具箱</h3>
+  
+  <p>
+    <img alt="Go Version" src="https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go" />
+    <img alt="License" src="https://img.shields.io/badge/License-MIT-blue.svg" />
+    <img alt="Platform" src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey" />
+  </p>
 
-## 🚀 核心功能
+[English](README_en.md) | [简体中文](README.md)
 
-- **主机管理 (Inventory)**: 支持对主机进行增删改查，提供别名和标签 (Tags) 分组功能。支持从 CSV 文件批量导入主机及其凭据。
-- **SSH 增强**: 快速连接远程主机，支持跳板机 (JumpHost)、Sudo 模式、ssh-agent 认证以及连接信息的自动保存。
-- **批量执行 (Exec)**: 支持在单台或多台主机（或按标签分组）上并行执行命令或本地脚本。
-- **文件传输 (SCP)**: 支持本地与远程、远程与远程之间的数据传输，支持按分组批量分发文件。
-- **防火墙管理 (Firewall)**: 自动识别并管理多种防火墙后端（firewalld, ufw, iptables, nftables）。
-- **实用工具**: 集成 DNS 查询、网络探测 (Ping/NC)、编码转换等常用运维工具。
-- **安全保障**: 配置文件中的敏感信息（如密码）采用对称加密存储。
-- **🤖 MCP 协议支持 (AI 增强)**: 内置 Model Context Protocol 服务端，让 AI Agent 可以原生调用本工具链的能力执行运维操作。
+</div>
 
-## 🛠️ 安装
+---
 
-### 环境要求
+**XOps CLI** 是一个基于 Go 语言开发的现代化命令行运维工具集，旨在简化并自动化日常的服务器管理工作。
 
-- Go 1.26 或更高版本
+除了传统的 SSH 管理和批量执行功能外，XOps 原生集成了 **Model Context Protocol (MCP)** 服务端，允许 AI Agent (如 Claude 等) 在安全护栏下直接与你的基础设施进行交互。它是连接 AI 助手与真实服务器环境的完美桥梁。
 
-### 编译
+### ✨ 核心特性
+
+- 🤖 **AI 原生 (MCP 服务端)**: 内置 Model Context Protocol 服务端，包含完整的安全护栏、风险评估和策略控制。让 AI 助手安全地替你管理服务器。
+- 🛡️ **SSH 增强与 TUI**: 完全兼容 OpenSSH (支持跳板机 JumpHost、隧道、Agent 转发)。内置精美的 **TUI (终端用户界面)**，并支持自动 Sudo 提权模式。
+- ⚡ **批量执行与传输**: 基于标签 (Tags) 对多台主机并行执行命令或本地脚本。内置 SCP/SFTP 支持，轻松实现文件批量分发。
+- 🗂️ **加密资产管理**: 本地统一管理主机、凭据 (Identity) 和标签，敏感信息(密码/私钥)采用 AES 加密存储。支持通过 CSV 模板批量导入导出。
+- 🌐 **网络与安全工具**: 集成 DNS 查询、Ping、Netcat (nc)、Base64/Hex 编码转换，以及统一的**防火墙管理器** (自动适配 firewalld, ufw, iptables, nftables)。
+- 🌍 **国际化 (i18n)**: 原生支持简体中文与英文，可根据环境自动切换。
+
+### 📦 安装指南
+
+**环境要求:** Go 1.26 或更高版本。
 
 ```bash
 git clone https://github.com/wentf9/xops-cli.git
 cd xops-cli
-go build -o xops ./cmd/cli/main.go
+make build
+# 或者手动编译: go build -o xops ./cmd/cli/main.go
 ```
 
-## 📖 快速上手
+### 🚀 快速上手
 
-### 1. 管理主机信息
-
+#### 1. 主机与资产管理
 ```bash
-# 批量从 CSV 文件导入主机 (支持识别表头: 主机, 端口, 别名, 用户, 密码, 私钥, 私钥密码)
-# 导入的同时可以将所有主机加入指定标签组
-xops inventory load hosts.csv -t web
-# 或者使用快捷入口
+# 从 CSV 文件批量导入主机，并打上 'web' 标签
 xops loadHost hosts.csv -t web
 
-# 导出 CSV 导入模板
-xops inventory load -T template.csv
-
-# 手动添加一台主机并打上 web 标签
+# 手动添加单台主机
 xops host add --name web-01 --address 192.168.1.10 --user root --tag web
 
-# 查看主机列表
+# 查看主机列表或标签
 xops host list
-
-# 查看所有标签分组
 xops host tags
 ```
 
-### 2. SSH 连接
-
+#### 2. SSH 连接与 TUI
 ```bash
-# 通过名称/别名直接连接（会自动保存连接信息）
+# 启动交互式 TUI 界面管理
+xops tui
+
+# 通过别名快速连接 (自动保存历史凭证)
 xops ssh web-01
 
-# OpenSSH 兼容风格连接
-xops ssh -l root -p 22 192.168.1.11
-xops ssh root@192.168.1.11
+# 兼容 OpenSSH 习惯：通过跳板机和私钥连接
+xops ssh -J jumphost -i ~/.ssh/id_rsa root@192.168.1.13
 
-# 通过跳板机连接（-J 兼容 OpenSSH）
-xops ssh -J jumphost root@192.168.1.12
-
-# 使用私钥认证（-i 兼容 OpenSSH）
-xops ssh -i ~/.ssh/id_rsa root@192.168.1.13
-
-# 建立本地端口转发隧道并挂起 (-L/-N 兼容 OpenSSH)
-xops ssh -L 8080:localhost:80 -N web-01
-
-# xops 增强功能：连接时指定分组标签
-xops ssh --tag db root@192.168.1.11
-
-# xops 增强功能：以 sudo 模式连接
+# 以 Sudo 模式连接
 xops ssh --sudo web-01
 ```
 
-### 3. 批量命令执行
-
+#### 3. 批量执行与文件分发
 ```bash
-# 对 web 分组的所有主机执行 uptime
-xops exec -t web -c "uptime"
+# 对 web 标签组的所有主机并行执行 uptime 命令
+xops exec --tag web -c "uptime"
 
-# 并行数设置为 5，执行本地脚本
-xops exec -t web --shell ./setup.sh --task 5
+# 将本地脚本在远程批量执行，并发数为 5
+xops exec --tag web --shell ./setup.sh --task 5
+
+# 批量分发配置文件到目标服务器
+xops scp ./config.conf --tag web --dest /etc/app/
 ```
 
-### 4. 文件传输
+#### 4. AI 与 MCP 集成 (赋予 AI 运维能力)
+XOps 内置了 **Model Context Protocol (MCP)** 服务端，让 **Claude** 等 AI 助手可以直接感知并操作你的服务器。
 
+**A. 启动 MCP 服务:**
 ```bash
-# 将本地文件上传到指定分组的远程目录
-xops scp ./config.conf -t web --dest /etc/app/
+xops mcp serve
 ```
 
-### 5. 防火墙操作
-
-```bash
-# 查看远程主机的防火墙规则
-xops firewall list -H web-01
-
-# 在远程主机上开放 80 端口
-xops firewall port 80 --proto tcp
-```
-
-### 6. AI Agent 集成 (MCP Server)
-
-使用支持 Model Context Protocol 的 AI Agent (如 Claude Desktop, Cursor, Cline 等) 可以直接调用本机配置的 `xops` 能力。
-只需在您的 MCP 客户端配置信息中加入以下内容：
-
+**B. 配置示例：集成到 Claude Desktop**
+在你的 `claude_desktop_config.json` 中添加以下内容，即可让 Claude 拥有执行运维任务的能力：
 ```json
 {
   "mcpServers": {
     "xops": {
-      "command": "/这里填入绝对路径/xops",
-      "args": ["mcp"]
+      "command": "/usr/local/bin/xops",
+      "args": ["mcp", "serve"]
     }
   }
 }
 ```
 
-配置完成后，您的 AI Agent 即可直接查询您的主机节点并自动帮您执行管理指令。
+**C. 安全护栏:**
+- **风险评估**: 自动分析 AI 请求的命令风险等级（如识别 `rm -rf` 等危险操作）。
+- **策略控制**: 支持配置只读模式或“先审批后执行”策略。
+- **全量审计**: 完整记录 AI 执行的每一条指令，确保过程透明可追溯。
 
-## 🌐 国际化 (i18n)
+#### 5. AI Agent 技能 (Skill) 集成
+XOps 提供开箱即用的 AI Agent 技能 (Skill)，让你的命令行 AI 助手一键获得强大的服务器运维和故障排查能力。
 
-xops 支持简体中文和英文两种界面语言，默认语言为中文。
+> [!CAUTION]
+> **⚠️ 风险提示**：本技能通过赋予 AI 助手执行 `xops` 命令的能力来工作。由于 AI 助手（如 Claude Code）是根据自然语言指令自主生成命令的，**本技能文件本身不包含强制性的服务端安全护栏**。在生产环境使用时，AI 可能会误执行高危命令（如 `rm -rf` 或重启服务）。请务必开启 AI 助手的“命令执行前确认”功能，并仔细审核 AI 计划执行的每一条指令。
 
-### 切换语言
+**安装技能:**
+由于不同大模型助手（Claude Code, Gemini CLI 等）的安装路径不一致，请使用通用的 `npx skills` 工具进行独立的技能安装。
 
-语言检测按以下优先级：`--lang` flag > `XOPS_LANG` 环境变量 > `LANG` 环境变量 > 默认中文
-
+首先，确保已经安装好 XOps CLI：
 ```bash
-# 方式一：通过 --lang flag（对当前命令生效）
-xops --lang en ssh web-01
-
-# 方式二：通过环境变量（对整个会话生效）
-export XOPS_LANG=en
-xops host list
+curl -sSL https://raw.githubusercontent.com/wentf9/xops-cli/main/install.sh | bash
 ```
 
-### 为翻译做贡献
-
-翻译文件位于 `pkg/i18n/locales/` 目录下：
-
-- `active.zh.yaml` — 简体中文
-- `active.en.yaml` — English
-
-如需添加新的翻译 key，请在两个文件中同时添加。翻译使用 [go-i18n](https://github.com/nicksnyder/go-i18n) 格式，支持 `{{.Var}}` 模板变量。
-
-## 🎨 ANSI 颜色输出
-
-在管道或重定向环境中，xops 会自动禁用 ANSI 转义序列，避免将控制字符写入文件或传递给下游命令。
-
-### 控制方式
-
-- **`--color=auto`**（默认）：自动检测 stdout/stderr 是否为 TTY，非 TTY 时禁用颜色
-- **`--color=never`**：强制禁用颜色
-- **`--color=always`**：强制启用颜色（如管道场景下仍需要颜色）
-- **`NO_COLOR` 环境变量**：非空时禁用颜色（符合 [no-color.org](https://no-color.org/) 约定）
-
-优先级：`--color` flag > `NO_COLOR` 环境变量 > TTY 自动检测
-
+然后，使用以下命令安装对应的 AI 扩展技能：
 ```bash
-# 管道场景下自动无颜色
-xops host list | less
-
-# 强制禁用颜色
-xops --color=never host list
-
-# 通过环境变量全局禁用
-export NO_COLOR=1
-xops host list
+npx skills add https://github.com/wentf9/xops-cli/main/skills/xops-agent
 ```
 
-## 📂 配置文件
+安装后，只需在 AI 助手中要求“帮我查看 web 服务器的状态”或“开放数据库主机的 3306 端口”，它便会自动调用 XOps 完成任务！
 
-工具默认将配置存储在用户家目录下的 `.xops` 文件夹中：
+## 🌍 国际化配置 / I18n
 
-- `~/.xops/xops_config.yaml`: 存储节点、主机及身份认证信息（敏感字段已加密）。
-- `~/.xops/secret.key`: 用于加解密的密钥文件，请务必妥善保管，首次运行时自动生成。
-- `~/.xops/audit.log`: MCP 护栏审计日志（JSON Lines 格式，记录 Agent 的所有工具调用）。
+你可以通过 `--lang` 参数强制指定语言，或者依赖系统环境变量自动识别。
 
-完整的配置项说明及示例请参考 [xops_config.example.yaml](xops_config.example.yaml)。
+```bash
+xops --lang en host list
+xops --lang zh host list
+```
 
-## 📅 规划与进度 (Roadmap)
+## 🤝 参与贡献 / Contributing
 
-当前项目核心运维能力已实现闭环，并正向着 AI Agent 原生运维工具箱的方向演进：
+请阅读 [AGENTS.md](./AGENTS.md) 了解详细的开发规范、编码约定和测试要求。
 
-- [x] **引入 MCP (Model Context Protocol) 核心支持** (`xops mcp`)
-  - [x] 工具：`xops_list_nodes` (查询本地节点)
-  - [x] 工具：`xops_ssh_run` (远程 SSH 命令执行)
-  - [x] 工具：`xops_read_file` / `xops_write_file` (SFTP 远程读写文件)
-  - [x] 工具：`xops_upload` / `xops_download` (SFTP 文件传输)
-  - [x] 工具：`xops_fs_ls` / `xops_fs_mkdir` / `xops_fs_touch` / `xops_fs_mv` / `xops_fs_rm` / `xops_fs_cp` (远程文件系统操作)
-- [x] **MCP 安全护栏** (`guardrail`)
-  - [x] 三级风险分类：Safe / Moderate / Dangerous
-  - [x] 命令黑名单（`rm -rf /`、`mkfs`、`dd`、fork bomb 等硬拦截）
-  - [x] 用户审批机制（MCP Elicitation 协议）
-  - [x] 客户端不支持 Elicitation 时的回退策略（兼容 Gemini CLI 等）
-  - [x] 节点级别策略覆盖（glob 模式，`prod-*` 更严格）
-  - [x] JSON Lines 审计日志
-  - [ ] 工具：接入网络探测能力 (Ping/DNS)
-  - [ ] 工具：接入防火墙规则管理能力
+## 📄 开源协议 / License
 
-## 📜 开源协议
-
-本项目采用 [LICENSE](LICENSE) 中所述的开源协议。
+本项目采用 MIT 开源协议 - 详情请参阅 [LICENSE](LICENSE) 文件。

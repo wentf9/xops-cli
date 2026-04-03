@@ -138,6 +138,7 @@ help:
 	@echo "  darwin-amd64    交叉编译 macOS (amd64) 版本"
 	@echo "  darwin-arm64    交叉编译 macOS (arm64) 版本"
 	@echo "  release         交叉编译所有支持的平台"
+	@echo "  install-skill   安装 Gemini CLI 技能"
 	@echo "  clean           清理构建文件"
 	@echo ""
 	@echo "Testing:"
@@ -146,3 +147,12 @@ help:
 	@echo "  test-cover      运行测试并生成覆盖率报告"
 	@echo "  bench           运行 ConcurrentMap 基准测试"
 	@echo "  stress          运行 ConcurrentMap 压力测试"
+
+# ==============================================================================
+# 安装扩展 (Extensions/Skills)
+# ==============================================================================
+install-skill:
+	@echo "Installing xops-agent skill to ~/.gemini/skills/..."
+	@mkdir -p ~/.gemini/skills/xops-agent
+	@cp -r skills/xops-agent/* ~/.gemini/skills/xops-agent/
+	@echo "Skill installed successfully!"
