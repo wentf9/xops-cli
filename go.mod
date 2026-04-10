@@ -8,7 +8,7 @@ require (
 	github.com/charmbracelet/huh v1.0.0
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/kevinburke/ssh_config v1.6.0
-	github.com/modelcontextprotocol/go-sdk v1.4.1
+	github.com/modelcontextprotocol/go-sdk v1.5.0
 	github.com/nicksnyder/go-i18n/v2 v2.6.1
 	github.com/peterh/liner v1.2.2
 	github.com/pkg/sftp v1.13.10
@@ -58,5 +58,5 @@ require (
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	golang.org/x/net v0.51.0 // indirect
-	golang.org/x/oauth2 v0.34.0 // indirect
+	golang.org/x/oauth2 v0.35.0 // indirect
 )
