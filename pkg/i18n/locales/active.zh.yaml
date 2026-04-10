@@ -700,3 +700,21 @@ exec_err_interactive_shell:
 # ---- encode additions ----
 encode_err_need_arg:
   other: "需要至少一个参数"
+
+# ---- forward ----
+forward_short:
+  other: "端口转发，将本地端口的 TCP/UDP 流量转发到远端地址"
+forward_long:
+  other: "端口转发，将本地端口的 TCP/UDP 流量转发到远端地址\n\t用法：\n\txops forward <listen-addr> <target-addr>\n\tlisten-addr 格式: [host:]port，例如 :8080 或 127.0.0.1:8080\n\ttarget-addr 格式: host:port，例如 192.168.1.10:80\n\t转发会持续运行直到按下 Ctrl+C"
+flag_forward_udp:
+  other: "使用 UDP 协议（默认 TCP）"
+forward_stopping:
+  other: "正在停止端口转发..."
+forward_err_args:
+  other: "需要指定监听地址和目标地址两个参数"
+forward_err_listen_addr:
+  other: "无效的监听地址 {{.Addr}}"
+forward_err_target_addr:
+  other: "无效的目标地址 {{.Addr}}"
+forward_err_port_required:
+  other: "必须指定端口"

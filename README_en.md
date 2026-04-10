@@ -119,12 +119,12 @@ Because different AI agents (Claude Code, Gemini CLI, etc.) use different skill 
 
 First, ensure you have installed the XOps CLI:
 ```bash
-curl -sSL https://raw.githubusercontent.com/wentf9/xops-cli/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/wentf9/xops-cli/master/install.sh | bash
 ```
 
 Then, run the following command to install the AI extension skill:
 ```bash
-npx skills add https://github.com/wentf9/xops-cli/main/skills/xops-agent
+npx skills add https://github.com/wentf9/xops-cli/master/skills/xops-agent
 ```
 
 Once installed, simply ask your AI assistant to "check the status of the web servers" or "open port 3306 on the database host," and it will automatically leverage XOps to complete the task!

@@ -87,6 +87,7 @@ func registerCommands(rootCmd *cobra.Command) {
 	rootCmd.AddCommand(newCmdSudo())
 	rootCmd.AddCommand(newCmdEncode())
 	rootCmd.AddCommand(newCmdLoadHost())
+	rootCmd.AddCommand(newCmdForward())
 }
 
 func newCmdVersion() *cobra.Command {

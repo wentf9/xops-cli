@@ -699,3 +699,21 @@ exec_err_interactive_shell:
 # ---- encode additions ----
 encode_err_need_arg:
   other: "Need at least one argument"
+
+# ---- forward ----
+forward_short:
+  other: "Port forwarding, forwards TCP/UDP traffic from a local port to a remote address"
+forward_long:
+  other: "Port forwarding, forwards TCP/UDP traffic from a local port to a remote address\n\tUsage:\n\txops forward <listen-addr> <target-addr>\n\tlisten-addr format: [host:]port, e.g. :8080 or 127.0.0.1:8080\n\ttarget-addr format: host:port, e.g. 192.168.1.10:80\n\tForwarding runs until Ctrl+C is pressed"
+flag_forward_udp:
+  other: "Use UDP protocol (default TCP)"
+forward_stopping:
+  other: "Stopping port forwarder..."
+forward_err_args:
+  other: "Two arguments required: listen-addr and target-addr"
+forward_err_listen_addr:
+  other: "Invalid listen address {{.Addr}}"
+forward_err_target_addr:
+  other: "Invalid target address {{.Addr}}"
+forward_err_port_required:
+  other: "port is required"
