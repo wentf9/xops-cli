@@ -568,7 +568,7 @@ func (o *ScpOptions) connectSftpForPath(ctx context.Context, p PathInfo, specifi
 	if err != nil {
 		return "", nil, err
 	}
-	if idAfter, _ := provider.GetIdentity(nodeId); idBefore.Password != idAfter.Password {
+	if idAfter, _ := provider.GetIdentity(nodeId); idBefore.Password != idAfter.Password || idBefore.Passphrase != idAfter.Passphrase {
 		if err := configStore.Save(cfg); err != nil {
 			logger.PrintError(i18n.Tf("save_config_failed", map[string]any{"Error": err}))
 		}

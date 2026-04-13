@@ -92,9 +92,9 @@ func (c *Connector) initializeConnection(ctx context.Context, nodeName string) (
 		return nil, err
 	}
 
-	// 认证并连接成功后，检查我们是否通过 "auto" 下的终端交互获取到了新密码。
-	// 如果 identity 对象被 buildSSHConfig 内部的回调赋予了密码，则把它写回提供者内存
-	if identity.Password != "" {
+	// 认证并连接成功后，检查我们是否通过 "auto" 下的终端交互获取到了新凭证（密码或密钥密码）。
+	// 如果 identity 对象被 buildSSHConfig 内部的回调赋予了凭证，则把它写回提供者内存
+	if identity.Password != "" || identity.Passphrase != "" {
 		c.Config.AddIdentity(node.IdentityRef, identity)
 		// 同时保证如果是首次建立的节点（例如 openssh: 前缀的节点），能被正确驻留在配置树内
 		c.Config.AddNode(nodeName, node)
@@ -189,6 +189,12 @@ func (c *Connector) buildSSHConfig(id *models.Identity, hostAddr string) (*ssh.C
 			if s != "" {
 				id.Password = s
 				id.AuthType = "password"
+			}
+		}, func(keyPath, passphrase string) {
+			if passphrase != "" {
+				id.KeyPath = keyPath
+				id.Passphrase = passphrase
+				id.AuthType = "key"
 			}
 		})
 		cleanup = autoCleanup

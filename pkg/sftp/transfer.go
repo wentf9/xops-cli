@@ -128,7 +128,7 @@ func (c *Client) prepareUploadFile(tempPath string, size int64) (int64, *sftp.Fi
 		}
 	}
 
-	if dstFile == nil && startOffset < size {
+	if dstFile == nil && (startOffset < size || size == 0) {
 		dstFile, err = c.sftpClient.Create(tempPath)
 		if err != nil {
 			return 0, nil, err
@@ -225,7 +225,7 @@ func (c *Client) prepareDownloadFile(tempPath string, size int64, mode os.FileMo
 		}
 	}
 
-	if dstFile == nil && startOffset < size {
+	if dstFile == nil && (startOffset < size || size == 0) {
 		dstFile, err = os.Create(tempPath)
 		if err != nil {
 			return 0, nil, err
@@ -399,8 +399,14 @@ func (c *Client) DownloadDirectory(ctx context.Context, remoteDir, localDir stri
 		localDest := filepath.Join(localDir, relPath)
 
 		if info.IsDir() {
-			_ = os.MkdirAll(localDest, info.Mode())
+			if err := os.MkdirAll(localDest, info.Mode()|0700); err != nil {
+				return err
+			}
 			continue
+		}
+
+		if err := os.MkdirAll(filepath.Dir(localDest), 0755); err != nil {
+			return err
 		}
 
 		loopPath := path

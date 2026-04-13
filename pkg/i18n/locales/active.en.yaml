@@ -69,6 +69,8 @@ flag_remote_forward:
   other: "Remote port forwarding [bind_address:]port:host:hostport"
 flag_no_cmd:
   other: "Do not execute a remote command (useful for just forwarding ports)"
+prompt_enter_passphrase:
+  other: "Enter passphrase for key '{{.Path}}': "
 prompt_enter_password:
   other: "Enter password: "
 prompt_enter_password_for:

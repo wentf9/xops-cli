@@ -139,7 +139,7 @@ func (o *SshOptions) Run() error {
 	}
 	defer func() { _ = client.Close() }()
 	// connector.Connect 可能通过交互式回调获取到新密码并写入提供者，我们需要标记更新以便保存
-	if idAfter, _ := provider.GetIdentity(nodeID); idBefore.Password != idAfter.Password {
+	if idAfter, _ := provider.GetIdentity(nodeID); idBefore.Password != idAfter.Password || idBefore.Passphrase != idAfter.Passphrase {
 		updated = true
 	}
 	if updated {
