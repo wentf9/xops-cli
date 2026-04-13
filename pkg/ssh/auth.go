@@ -1,6 +1,7 @@
 package ssh
 
 import (
+	"errors"
 	"net"
 	"os"
 
@@ -38,15 +39,19 @@ func (k *KeyAuth) GetMethod() (ssh.AuthMethod, error) {
 	}
 	var signer ssh.Signer
 	if k.Passphrase != "" {
-		signer, _ = ssh.ParsePrivateKeyWithPassphrase(keyData, []byte(k.Passphrase))
+		signer, err = ssh.ParsePrivateKeyWithPassphrase(keyData, []byte(k.Passphrase))
 	} else {
-		signer, _ = ssh.ParsePrivateKey(keyData)
+		signer, err = ssh.ParsePrivateKey(keyData)
+	}
+	if err != nil {
+		return nil, err
 	}
 	return ssh.PublicKeys(signer), nil
 }
 
 // BuildAutoAuthMethods 生成一个包含多种回退机制的 AuthMethod 链
-func BuildAutoAuthMethods(user, host string, passwordCallback func(string)) ([]ssh.AuthMethod, func()) {
+// passphraseCallback 在用户成功输入受密码保护的私钥密码后被调用，用于持久化
+func BuildAutoAuthMethods(user, host string, passwordCallback func(string), passphraseCallback func(keyPath, passphrase string)) ([]ssh.AuthMethod, func()) {
 	var methods []ssh.AuthMethod
 	var cleanup func()
 
@@ -62,13 +67,39 @@ func BuildAutoAuthMethods(user, host string, passwordCallback func(string)) ([]s
 	// Default Keys
 	defaultKeys := []string{"~/.ssh/id_rsa", "~/.ssh/id_ed25519", "~/.ssh/id_ecdsa", "~/.ssh/id_dsa"}
 	for _, p := range defaultKeys {
-		logger.Debugf("Checking default key: %s", expandHomeDir(p))
-		if _, err := os.Stat(expandHomeDir(p)); err == nil {
-			logger.Debugf("Found default key: %s", expandHomeDir(p))
-			keyAuth := &KeyAuth{Path: expandHomeDir(p)}
-			if m, err := keyAuth.GetMethod(); err == nil {
-				methods = append(methods, m)
-			}
+		keyPath := expandHomeDir(p)
+		logger.Debugf("Checking default key: %s", keyPath)
+		if _, err := os.Stat(keyPath); err != nil {
+			continue
+		}
+		logger.Debugf("Found default key: %s", keyPath)
+		keyData, err := os.ReadFile(keyPath)
+		if err != nil {
+			continue
+		}
+		signer, err := ssh.ParsePrivateKey(keyData)
+		if err == nil {
+			methods = append(methods, ssh.PublicKeys(signer))
+			continue
+		}
+		// Key requires a passphrase — prompt interactively
+		var pmErr *ssh.PassphraseMissingError
+		if errors.As(err, &pmErr) {
+			keyDataCopy := keyData
+			keyPathCopy := keyPath
+			methods = append(methods, ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
+				passphrase, err := cmdutil.ReadPasswordFromTerminal(
+					i18n.Tf("prompt_enter_passphrase", map[string]any{"Path": keyPathCopy}))
+				if err != nil {
+					return nil, err
+				}
+				s, err := ssh.ParsePrivateKeyWithPassphrase(keyDataCopy, []byte(passphrase))
+				if err != nil {
+					return nil, err
+				}
+				passphraseCallback(keyPathCopy, passphrase)
+				return []ssh.Signer{s}, nil
+			}))
 		}
 	}
 

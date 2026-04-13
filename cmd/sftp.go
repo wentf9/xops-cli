@@ -95,7 +95,7 @@ func (o *SftpOptions) Run() error {
 	if err != nil {
 		return fmt.Errorf("%s: %w", i18n.T("err_connect_failed"), err)
 	}
-	if idAfter, _ := provider.GetIdentity(nodeID); idBefore.Password != idAfter.Password {
+	if idAfter, _ := provider.GetIdentity(nodeID); idBefore.Password != idAfter.Password || idBefore.Passphrase != idAfter.Passphrase {
 		updated = true
 	}
 	sftpClient, err := sftp.NewClient(
