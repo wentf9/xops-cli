@@ -128,6 +128,7 @@ func (o *SshOptions) Run() error {
 	connector := ssh.NewConnector(provider)
 	connectCtx, connectCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	idBefore, _ := provider.GetIdentity(nodeID)
+	nodeBefore, _ := provider.GetNode(nodeID)
 	client, err := connector.Connect(connectCtx, nodeID)
 	connectCancel()
 	if err != nil {
@@ -138,8 +139,11 @@ func (o *SshOptions) Run() error {
 		return fmt.Errorf("%s: %w", i18n.T("fw_connect_failed"), err)
 	}
 	defer func() { _ = client.Close() }()
-	// connector.Connect 可能通过交互式回调获取到新密码并写入提供者，我们需要标记更新以便保存
+	// connector.Connect 可能通过交互式回调获取到新凭证并写入提供者，我们需要标记更新以便保存
 	if idAfter, _ := provider.GetIdentity(nodeID); idBefore.Password != idAfter.Password || idBefore.Passphrase != idAfter.Passphrase {
+		updated = true
+	}
+	if nodeAfter, _ := provider.GetNode(nodeID); nodeBefore.SuPwd != nodeAfter.SuPwd {
 		updated = true
 	}
 	if updated {
@@ -260,10 +264,7 @@ func updateNodeFields(node *models.Node, nodeID string, o *SshOptions, provider 
 			nodeUpdated = true
 		}
 	}
-	if o.Sudo {
-		node.SudoMode = models.SudoModeSudo
-		nodeUpdated = true
-	}
+
 	if o.Alias != "" {
 		// 检查别名是否已被其他节点使用
 		if existingNode := provider.FindAlias(o.Alias); existingNode != "" && existingNode != nodeID {

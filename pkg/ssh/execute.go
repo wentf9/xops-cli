@@ -235,6 +235,20 @@ func (c *Client) ShellWithSudo(ctx context.Context) error {
 	if c.node.SudoMode == models.SudoModeRoot {
 		return c.Shell(ctx)
 	}
+
+	// none 模式明确不支持提权
+	if c.node.SudoMode == models.SudoModeNone {
+		return fmt.Errorf("privilege escalation is not supported for this host (sudo_mode=none)")
+	}
+
+	// sudo/sudoer 模式：通过 sudo -S -p '' true 预检，可靠且无副作用
+	// su 模式不做预检：su -c 会跑 root login shell 初始化脚本，脚本错误会导致误报
+	if c.node.SudoMode == models.SudoModeSudo || c.node.SudoMode == models.SudoModeSudoer {
+		if _, err := c.runWithSudo(ctx, "true", c.identity.Password, nil); err != nil {
+			return fmt.Errorf("sudo access denied: %w", err)
+		}
+	}
+
 	session, err := c.sshClient.NewSession()
 	if err != nil {
 		return err

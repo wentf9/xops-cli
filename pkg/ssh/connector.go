@@ -9,7 +9,9 @@ import (
 	"path/filepath"
 	"time"
 
+	cmdutil "github.com/wentf9/xops-cli/cmd/utils"
 	"github.com/wentf9/xops-cli/pkg/config"
+	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/models"
 	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 	"golang.org/x/crypto/ssh"
@@ -72,6 +74,17 @@ func (c *Connector) initializeConnection(ctx context.Context, nodeName string) (
 	node, host, identity, err := c.fetchNodeConfig(nodeName)
 	if err != nil {
 		return nil, err
+	}
+
+	// SudoMode 为 su 时若未配置密码，交互式提示并写回 Provider（调用方负责持久化）
+	if node.SudoMode == models.SudoModeSu && node.SuPwd == "" {
+		suPwd, err := cmdutil.ReadPasswordFromTerminal(
+			i18n.Tf("prompt_su_password", map[string]any{"Node": nodeName}))
+		if err != nil {
+			return nil, fmt.Errorf("failed to read su password: %w", err)
+		}
+		node.SuPwd = suPwd
+		c.Config.AddNode(nodeName, node)
 	}
 
 	dialer, err := c.setupDialer(ctx, node)

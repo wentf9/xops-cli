@@ -439,6 +439,8 @@ flag_sudo_shell:
   other: "Enter root shell (similar to sudo -s)"
 prompt_sudo_password:
   other: "Enter sudo password (press Enter if none):"
+prompt_su_password:
+  other: "Enter su root password for {{.Node}}:"
 sudo_exec_failed:
   other: "Sudo execution failed: {{.Error}}"
 

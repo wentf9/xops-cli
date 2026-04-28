@@ -35,11 +35,10 @@ func (s *defaultStore) Load() (*Configuration, error) {
 		return &config, nil
 	}
 	// 2. yaml.Unmarshal
-	err = yaml.Unmarshal(data, &config)
-	if err != nil {
+	if err = yaml.Unmarshal(data, &config); err != nil {
 		return nil, err
 	}
-	// 初始化 Crypter
+	// 3. 初始化 Crypter 并解密敏感字段
 	key, err := crypto.LoadOrGenerateKey(s.KeyPath)
 	if err != nil {
 		return nil, err
@@ -48,30 +47,65 @@ func (s *defaultStore) Load() (*Configuration, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 3. 遍历 Identities，解密 Password/Passphrase 字段
-	for _, name := range config.Identities.Keys() {
-		identity, _ := config.Identities.Get(name)
-		// 处理 Password 字段
-		if identity.Password != "" && crypto.IsEncrypted(identity.Password) {
-			plain, err := crypter.Decrypt(identity.Password)
-			if err != nil {
-				// 记录日志或报错
-				continue
-			}
-			identity.Password = plain
-		}
-
-		// 处理 Key Passphrase 字段
-		if identity.Passphrase != "" && crypto.IsEncrypted(identity.Passphrase) {
-			plain, err := crypter.Decrypt(identity.Passphrase)
-			if err != nil {
-				continue
-			}
-			identity.Passphrase = plain
-		}
-		config.Identities.Set(name, identity)
+	migratedIdentities := decryptIdentities(crypter, &config)
+	migratedNodes := decryptNodes(crypter, &config)
+	// 若配置文件中存在明文敏感字段，立即加密回写（一次性迁移）
+	if migratedIdentities || migratedNodes {
+		_ = s.Save(&config)
 	}
 	return &config, nil
+}
+
+// decryptIdentities 解密所有 Identity 中的 Password 和 Passphrase 字段。
+// 返回 true 表示发现了明文值（需要触发迁移保存）。
+func decryptIdentities(crypter *crypto.Crypter, config *Configuration) (migrated bool) {
+	for _, name := range config.Identities.Keys() {
+		identity, _ := config.Identities.Get(name)
+		changed := false
+		if identity.Password != "" {
+			if crypto.IsEncrypted(identity.Password) {
+				if plain, err := crypter.Decrypt(identity.Password); err == nil {
+					identity.Password = plain
+					changed = true
+				}
+			} else {
+				migrated = true // 明文，需加密回写
+			}
+		}
+		if identity.Passphrase != "" {
+			if crypto.IsEncrypted(identity.Passphrase) {
+				if plain, err := crypter.Decrypt(identity.Passphrase); err == nil {
+					identity.Passphrase = plain
+					changed = true
+				}
+			} else {
+				migrated = true
+			}
+		}
+		if changed {
+			config.Identities.Set(name, identity)
+		}
+	}
+	return migrated
+}
+
+// decryptNodes 解密所有 Node 中的 SuPwd 字段。
+// 返回 true 表示发现了明文值（需要触发迁移保存）。
+func decryptNodes(crypter *crypto.Crypter, config *Configuration) (migrated bool) {
+	for _, name := range config.Nodes.Keys() {
+		node, _ := config.Nodes.Get(name)
+		if node.SuPwd != "" {
+			if crypto.IsEncrypted(node.SuPwd) {
+				if plain, err := crypter.Decrypt(node.SuPwd); err == nil {
+					node.SuPwd = plain
+					config.Nodes.Set(name, node)
+				}
+			} else {
+				migrated = true // 明文，需加密回写
+			}
+		}
+	}
+	return migrated
 }
 
 func (s *defaultStore) Save(cfg *Configuration) error {
@@ -87,58 +121,81 @@ func (s *defaultStore) Save(cfg *Configuration) error {
 		return err
 	}
 
-	// 记录原始值以便在保存后恢复，防止内存中被加密后的数据污染
-	originalPasswords := make(map[string]string)
-	originalPassphrases := make(map[string]string)
+	// 加密敏感字段，记录原始值，序列化后立即恢复（防止内存被污染）
+	origPasswords, origPassphrases := encryptIdentities(crypter, cfg)
+	origSuPwds := encryptNodes(crypter, cfg)
 
-	// 1. 遍历 Identities，加密敏感字段
-	for _, name := range cfg.Identities.Keys() {
-		identity, _ := cfg.Identities.Get(name)
-		// 处理 Password 字段
-		if identity.Password != "" && !crypto.IsEncrypted(identity.Password) {
-			originalPasswords[name] = identity.Password
-			enc, err := crypter.Encrypt(identity.Password)
-			if err != nil {
-				// 记录日志或报错
-				continue
-			}
-			identity.Password = enc
-		}
-
-		// 处理 Key Passphrase 字段
-		if identity.Passphrase != "" && !crypto.IsEncrypted(identity.Passphrase) {
-			originalPassphrases[name] = identity.Passphrase
-			enc, err := crypter.Encrypt(identity.Passphrase)
-			if err != nil {
-				continue
-			}
-			identity.Passphrase = enc
-		}
-		cfg.Identities.Set(name, identity)
-	}
-
-	// 2. yaml.Marshal
 	data, err := yaml.Marshal(cfg)
 
-	// 序列化后立即恢复内存中的明文
-	for name, plainPassword := range originalPasswords {
-		if identity, ok := cfg.Identities.Get(name); ok {
-			identity.Password = plainPassword
-			cfg.Identities.Set(name, identity)
-		}
-	}
-	for name, plainPassphrase := range originalPassphrases {
-		if identity, ok := cfg.Identities.Get(name); ok {
-			identity.Passphrase = plainPassphrase
-			cfg.Identities.Set(name, identity)
-		}
-	}
+	// 无论序列化是否成功都恢复内存中的明文
+	restoreIdentities(cfg, origPasswords, origPassphrases)
+	restoreNodes(cfg, origSuPwds)
 
 	if err != nil {
 		return err
 	}
-	// 3. 写入文件
 	return file.CreateFileRecursive(s.Path, data, 0600)
+}
+
+func encryptIdentities(crypter *crypto.Crypter, cfg *Configuration) (origPasswords, origPassphrases map[string]string) {
+	origPasswords = make(map[string]string)
+	origPassphrases = make(map[string]string)
+	for _, name := range cfg.Identities.Keys() {
+		identity, _ := cfg.Identities.Get(name)
+		if identity.Password != "" && !crypto.IsEncrypted(identity.Password) {
+			origPasswords[name] = identity.Password
+			if enc, err := crypter.Encrypt(identity.Password); err == nil {
+				identity.Password = enc
+			}
+		}
+		if identity.Passphrase != "" && !crypto.IsEncrypted(identity.Passphrase) {
+			origPassphrases[name] = identity.Passphrase
+			if enc, err := crypter.Encrypt(identity.Passphrase); err == nil {
+				identity.Passphrase = enc
+			}
+		}
+		cfg.Identities.Set(name, identity)
+	}
+	return origPasswords, origPassphrases
+}
+
+func encryptNodes(crypter *crypto.Crypter, cfg *Configuration) map[string]string {
+	origSuPwds := make(map[string]string)
+	for _, name := range cfg.Nodes.Keys() {
+		node, _ := cfg.Nodes.Get(name)
+		if node.SuPwd != "" && !crypto.IsEncrypted(node.SuPwd) {
+			origSuPwds[name] = node.SuPwd
+			if enc, err := crypter.Encrypt(node.SuPwd); err == nil {
+				node.SuPwd = enc
+				cfg.Nodes.Set(name, node)
+			}
+		}
+	}
+	return origSuPwds
+}
+
+func restoreIdentities(cfg *Configuration, origPasswords, origPassphrases map[string]string) {
+	for name, plain := range origPasswords {
+		if identity, ok := cfg.Identities.Get(name); ok {
+			identity.Password = plain
+			cfg.Identities.Set(name, identity)
+		}
+	}
+	for name, plain := range origPassphrases {
+		if identity, ok := cfg.Identities.Get(name); ok {
+			identity.Passphrase = plain
+			cfg.Identities.Set(name, identity)
+		}
+	}
+}
+
+func restoreNodes(cfg *Configuration, origSuPwds map[string]string) {
+	for name, plain := range origSuPwds {
+		if node, ok := cfg.Nodes.Get(name); ok {
+			node.SuPwd = plain
+			cfg.Nodes.Set(name, node)
+		}
+	}
 }
 
 // NewDefaultStore 创建一个默认的文件系统配置存储实例

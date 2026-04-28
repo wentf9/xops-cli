@@ -292,10 +292,12 @@ func (c *Client) maybeDetectSudoMode(ctx context.Context) {
 		return
 	}
 
-	// 3. 检查是否有密码，如果有则推测为普通 sudo
+	// 3. 测试密码 sudo 是否真正可用（避免用户有密码但不在 sudoers 中时误判）
 	if c.identity.Password != "" {
-		c.updateSudoMode(models.SudoModeSudo)
-		return
+		if _, err := c.runWithSudo(ctx, "true", c.identity.Password, nil); err == nil {
+			c.updateSudoMode(models.SudoModeSudo)
+			return
+		}
 	}
 
 	// 4. 检查是否有 su 密码

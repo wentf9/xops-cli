@@ -440,6 +440,8 @@ flag_sudo_shell:
   other: "直接进入 root 环境 (类似 sudo -s)"
 prompt_sudo_password:
   other: "请输入sudo密码(无密码请直接回车):"
+prompt_su_password:
+  other: "请输入 {{.Node}} 的 su root 密码:"
 sudo_exec_failed:
   other: "sudo执行失败: {{.Error}}"
 
