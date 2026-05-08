@@ -7,6 +7,7 @@
     <img alt="Go Version" src="https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go" />
     <img alt="License" src="https://img.shields.io/badge/License-MIT-blue.svg" />
     <img alt="Platform" src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey" />
+[![SafeSkill 50/100](https://img.shields.io/badge/SafeSkill-50%2F100_Use%20with%20Caution-orange)](https://safeskill.dev/scan/wentf9-xops-cli)
   </p>
 
 [English](README_en.md) | [简体中文](README.md)
