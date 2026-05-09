@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"time"
 )
 
 // LocalExecutor 本地执行器
@@ -71,46 +70,31 @@ func (e *LocalExecutor) InteractiveWithSudo(ctx context.Context, args []string) 
 		c.Stderr = os.Stderr
 		return c.Run()
 	}
-	var sudoArgs []string
-	if e.password != "" {
-		sudoArgs = append(sudoArgs, "-S", "-p", "")
-	}
-	sudoArgs = append(sudoArgs, "-s")
-	sudoArgs = append(sudoArgs, args...)
 
-	c := exec.CommandContext(ctx, "sudo", sudoArgs...)
-
+	// 如果有密码，先使用 sudo -v (validate) 注入密码到缓存中
 	if e.password != "" {
-		stdin, err := c.StdinPipe()
+		// sudo -v -S 从 stdin 读取密码并更新 sudo 缓存
+		vCmd := exec.CommandContext(ctx, "sudo", "-v", "-S", "-p", "")
+		vStdin, err := vCmd.StdinPipe()
 		if err != nil {
 			return err
 		}
-		c.Stdout = os.Stdout
-		c.Stderr = os.Stderr
-		if err := c.Start(); err != nil {
+		if err := vCmd.Start(); err != nil {
 			return err
 		}
-		// 注入密码
-		_, _ = stdin.Write([]byte(e.password + "\n"))
-		// 将本地标准输入转发给进程
-		done := make(chan struct{})
-		go func() {
-			_, _ = io.Copy(stdin, os.Stdin)
-			close(done)
-		}()
-
-		err = c.Wait()
-		// 关键：通过设置 Stdin 的 Deadline 来中断阻塞的 Read，防止返回后 stdin 被吞字节
-		_ = os.Stdin.SetReadDeadline(time.Now())
-		<-done
-		_ = os.Stdin.SetReadDeadline(time.Time{})
-
-		return err
-	} else {
-		// 无密码模式，直接连接标准流
-		c.Stdin = os.Stdin
-		c.Stdout = os.Stdout
-		c.Stderr = os.Stderr
-		return c.Run()
+		_, _ = vStdin.Write([]byte(e.password + "\n"))
+		_ = vStdin.Close()
+		_ = vCmd.Wait()
+		// 无论 sudo -v 是否成功（可能密码错），我们都继续下一步，让原生 sudo 处理
 	}
+
+	// 现在密码已经在缓存里（或者由用户手动输入），直接运行 sudo -s 并接管 TTY
+	// 这样可以获得完美的 shell 体验，不会有 stdin 转发导致的报错
+	sudoArgs := []string{"-s"}
+	sudoArgs = append(sudoArgs, args...)
+	c := exec.CommandContext(ctx, "sudo", sudoArgs...)
+	c.Stdin = os.Stdin
+	c.Stdout = os.Stdout
+	c.Stderr = os.Stderr
+	return c.Run()
 }

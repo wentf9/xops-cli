@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/wentf9/xops-cli/pkg/config"
+	"github.com/wentf9/xops-cli/pkg/models"
 	"golang.org/x/term"
 )
 
@@ -45,6 +46,72 @@ func GetLocalSudoPassword() string {
 		}
 	}
 	return ""
+}
+
+// SaveLocalSudoPassword 保存本地 sudo 密码到配置文件
+func SaveLocalSudoPassword(password string) error {
+	store, provider, cfg, err := GetConfigStore()
+	if err != nil {
+		return err
+	}
+
+	username := GetCurrentUser()
+	address := "localhost"
+
+	// 先尝试按 GetLocalSudoPassword 的优先级查找已有的 Node
+	nodeID := provider.Find("localhost")
+	if nodeID == "" {
+		nodeID = provider.Find("local")
+	}
+	if nodeID == "" {
+		nodeID = provider.Find(username)
+	}
+
+	if nodeID != "" {
+		// 如果找到了已有的 Node，更新其对应的 Identity 密码
+		if node, ok := cfg.Nodes.Get(nodeID); ok {
+			if identity, ok := cfg.Identities.Get(node.IdentityRef); ok {
+				identity.Password = password
+				cfg.Identities.Set(node.IdentityRef, identity)
+			} else {
+				// 有 Node 但 IdentityRef 失效的情况，补充 Identity
+				identityID := fmt.Sprintf("%s@local", username)
+				provider.AddIdentity(identityID, models.Identity{
+					User:     username,
+					Password: password,
+					AuthType: "password",
+				})
+				node.IdentityRef = identityID
+				cfg.Nodes.Set(nodeID, node)
+			}
+		}
+	} else {
+		// 全新创建
+		nodeID = fmt.Sprintf("%s@%s", username, address)
+		hostID := "localhost"
+		identityID := fmt.Sprintf("%s@local", username)
+
+		provider.AddHost(hostID, models.Host{
+			Address: "127.0.0.1",
+			Port:    22,
+			Alias:   []string{"localhost", "local"},
+		})
+
+		provider.AddIdentity(identityID, models.Identity{
+			User:     username,
+			Password: password,
+			AuthType: "password",
+		})
+
+		provider.AddNode(nodeID, models.Node{
+			Alias:       []string{"localhost", "local", username},
+			HostRef:     hostID,
+			IdentityRef: identityID,
+			SudoMode:    models.SudoModeSudo,
+		})
+	}
+
+	return store.Save(cfg)
 }
 
 // ParseAddr 解析 user@host:port 格式的字符串
