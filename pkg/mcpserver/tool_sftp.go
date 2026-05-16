@@ -133,8 +133,8 @@ type WriteFileOutput struct {
 }
 
 func writeFileHandler(ctx context.Context, req *mcp.CallToolRequest, input WriteFileInput) (*mcp.CallToolResult, WriteFileOutput, error) {
-	if input.NodeID == "" || input.Path == "" {
-		return nil, WriteFileOutput{}, fmt.Errorf("nodeID and path are required")
+	if input.NodeID == "" || input.Path == "" || input.Content == "" {
+		return nil, WriteFileOutput{}, fmt.Errorf("nodeID, path, and content are required")
 	}
 
 	sftpClient, connector, err := getSFTPClient(ctx, input.NodeID)

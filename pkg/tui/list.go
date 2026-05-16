@@ -1,12 +1,14 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
@@ -14,6 +16,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
+	"github.com/wentf9/xops-cli/pkg/ssh"
 )
 
 type nodeItem struct {
@@ -167,6 +170,7 @@ func newListModel(provider config.ConfigProvider) list.Model {
 			key.NewBinding(key.WithKeys("v"), key.WithHelp("v", i18n.T("tui_help_invert"))),
 			key.NewBinding(key.WithKeys("d"), key.WithHelp("d", i18n.T("tui_help_delete"))),
 			key.NewBinding(key.WithKeys("e"), key.WithHelp("e", i18n.T("tui_help_edit"))),
+			key.NewBinding(key.WithKeys("m"), key.WithHelp("m", "monitor")),
 			key.NewBinding(key.WithKeys("n"), key.WithHelp("n", i18n.T("tui_help_new"))),
 			key.NewBinding(key.WithKeys("g"), key.WithHelp("g", i18n.T("tui_help_tag"))),
 		}
@@ -241,6 +245,7 @@ func (m *Model) getKeyHandler(key string) (func() (Model, tea.Cmd), bool) {
 		"d":     m.handleDelete,
 		"n":     m.handleNew,
 		"e":     m.handleEdit,
+		"m":     m.handleMonitor,
 		"g":     m.handleTagAction,
 	}
 
@@ -390,6 +395,28 @@ func (m *Model) handleEdit() (Model, tea.Cmd) {
 		return *m, nil
 	}
 	return *m, nil
+}
+
+type monitorConnectedMsg struct {
+	nodeID string
+	client *ssh.Client
+	err    error
+}
+
+func (m *Model) handleMonitor() (Model, tea.Cmd) {
+	selected := m.list.SelectedItem()
+	if selected == nil {
+		return *m, nil
+	}
+	nodeID := selected.(*nodeItem).id
+	m.status = i18n.Tf("tui_monitor_connecting", map[string]any{"Node": nodeID})
+
+	return *m, func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		client, err := m.connector.Connect(ctx, nodeID)
+		return monitorConnectedMsg{nodeID: nodeID, client: client, err: err}
+	}
 }
 
 func (m *Model) handleTagAction() (Model, tea.Cmd) {

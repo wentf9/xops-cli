@@ -721,3 +721,26 @@ forward_err_target_addr:
   other: "Invalid target address {{.Addr}}"
 forward_err_port_required:
   other: "port is required"
+
+tui_monitor_error:
+  other: "Error fetching metrics: {{.Error}}"
+tui_monitor_fetching:
+  other: "Fetching metrics..."
+tui_monitor_header:
+  other: "Monitoring: {{.Node}} | Uptime: {{.Uptime}} | Load: {{.Load}}"
+tui_monitor_cpu:
+  other: "CPU Usage"
+tui_monitor_mem:
+  other: "Memory"
+tui_monitor_disk_parts:
+  other: "Disk Partitions"
+tui_monitor_disk:
+  other: "Disk ({{.Mount}})"
+tui_monitor_top_procs:
+  other: "Top Processes (PID STAT RSS COMMAND)"
+tui_monitor_footer:
+  other: "\nLast updated: {{.Time}} (Press 'q' or 'Esc' to back)"
+tui_help_monitor:
+  other: "monitor"
+tui_monitor_connecting:
+  other: "Connecting to {{.Node}}..."

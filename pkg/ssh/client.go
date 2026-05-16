@@ -70,6 +70,7 @@ func (c *Client) runRaw(ctx context.Context, wrappedCmd string) (string, error) 
 		return "", err
 	}
 	defer func() { _ = session.Close() }()
+
 	return startWithTimeout(ctx, session, wrappedCmd)
 }
 
@@ -82,8 +83,52 @@ func (c *Client) RunScript(ctx context.Context, scriptContent string) (string, e
 	defer func() { _ = session.Close() }()
 
 	session.Stdin = strings.NewReader(scriptContent)
-	// 使用 bash -l -s 从 stdin 读取脚本，以加载环境变量
 	return startWithTimeout(ctx, session, "bash -l -s")
+}
+
+// streamReader 包装 io.ReadCloser 以便在关闭时清理 SSH session
+type streamReader struct {
+	io.ReadCloser
+	session *ssh.Session
+}
+
+func (s *streamReader) Read(p []byte) (int, error) {
+	return s.ReadCloser.Read(p)
+}
+
+func (s *streamReader) Close() error {
+	err := s.ReadCloser.Close()
+	_ = s.session.Close() // 强制关闭 session
+	return err
+}
+
+// RunStream 执行命令并返回流式输出
+func (c *Client) RunStream(ctx context.Context, cmd string) (io.ReadCloser, error) {
+	session, err := c.sshClient.NewSession()
+	if err != nil {
+		return nil, err
+	}
+
+	stdout, err := session.StdoutPipe()
+	if err != nil {
+		_ = session.Close()
+		return nil, err
+	}
+
+	wrappedCmd := fmt.Sprintf("bash -c '%s'", strings.ReplaceAll(cmd, "'", "'\\''"))
+
+	if err := session.Start(wrappedCmd); err != nil {
+		_ = session.Close()
+		return nil, err
+	}
+
+	// 监听 Context 自动关闭
+	go func() {
+		<-ctx.Done()
+		_ = session.Close()
+	}()
+
+	return &streamReader{ReadCloser: io.NopCloser(stdout), session: session}, nil
 }
 
 func (c *Client) Shell(ctx context.Context) error {
