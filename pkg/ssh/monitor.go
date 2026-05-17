@@ -19,6 +19,7 @@ type DiskMetric struct {
 // SystemMetrics 给 TUI 展示用的整理后指标
 type SystemMetrics struct {
 	CPUUsage     float64
+	Cores        int
 	MemTotal     uint64
 	MemUsed      uint64
 	MemUsage     float64
@@ -131,12 +132,16 @@ type MetricsCollector struct {
 	lastTicks  *CPUTicks
 	lastProcs  map[int]procTick
 	coresCount int
+	SortBy     string // "cpu", "mem"
+	SortAsc    bool
 }
 
 func NewMetricsCollector(c *Client) *MetricsCollector {
 	return &MetricsCollector{
 		client:    c,
 		lastProcs: make(map[int]procTick),
+		SortBy:    "cpu",
+		SortAsc:   false,
 	}
 }
 
@@ -162,6 +167,7 @@ func (mc *MetricsCollector) NextFrame(ctx context.Context) (*SystemMetrics, erro
 	}
 
 	metrics := &SystemMetrics{}
+	metrics.Cores = mc.coresCount
 	currentProcs := make(map[int]procTick)
 	var currentTicks *CPUTicks
 
@@ -270,17 +276,33 @@ func (mc *MetricsCollector) processEOF(metrics *SystemMetrics, currentProcs map[
 		})
 	}
 
-	// Sort by CPU usage descending
+	// Sort based on preferences
 	sort.Slice(usages, func(i, j int) bool {
-		if usages[i].cpu == usages[j].cpu {
-			return usages[i].rssMB > usages[j].rssMB
+		var less bool
+		if mc.SortBy == "mem" {
+			if usages[i].rssMB == usages[j].rssMB {
+				less = usages[i].cpu < usages[j].cpu
+			} else {
+				less = usages[i].rssMB < usages[j].rssMB
+			}
+		} else {
+			// default: cpu
+			if usages[i].cpu == usages[j].cpu {
+				less = usages[i].rssMB < usages[j].rssMB
+			} else {
+				less = usages[i].cpu < usages[j].cpu
+			}
 		}
-		return usages[i].cpu > usages[j].cpu
+
+		if mc.SortAsc {
+			return less
+		}
+		return !less
 	})
 
-	// Pick top 5
-	limit := 5
-	if len(usages) < 5 {
+	// Pick top 10
+	limit := 10
+	if len(usages) < 10 {
 		limit = len(usages)
 	}
 	for i := 0; i < limit; i++ {

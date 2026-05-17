@@ -24,6 +24,7 @@ type monitorModel struct {
 	width     int
 	height    int
 	lastFetch time.Time
+	paused    bool
 }
 
 func newMonitorModel(nodeID string, client *ssh.Client) monitorModel {
@@ -66,8 +67,10 @@ func (m monitorModel) Update(msg tea.Msg) (monitorModel, tea.Cmd) {
 		m.metrics = msg
 		m.err = nil
 		m.lastFetch = time.Now()
-		// Auto trigger next frame
-		return m, m.fetchMetrics()
+		// Auto trigger next frame if not paused
+		if !m.paused {
+			return m, m.fetchMetrics()
+		}
 	case monitorErrorMsg:
 		m.err = msg
 	case tea.KeyMsg:
@@ -75,6 +78,19 @@ func (m monitorModel) Update(msg tea.Msg) (monitorModel, tea.Cmd) {
 		case "esc", "q":
 			m.collector.Close()
 			return m, nil // Will be handled by parent model to switch state
+		case "p", " ":
+			m.paused = !m.paused
+			if !m.paused {
+				return m, m.fetchMetrics()
+			}
+		case "s":
+			if m.collector.SortBy == "cpu" {
+				m.collector.SortBy = "mem"
+			} else {
+				m.collector.SortBy = "cpu"
+			}
+		case "o":
+			m.collector.SortAsc = !m.collector.SortAsc
 		}
 	}
 	return m, nil
@@ -90,7 +106,25 @@ func (m monitorModel) View() string {
 	}
 
 	// 基础布局：使用 Lipgloss 渲染简单的仪表盘
-	header := headerStyle.Render(i18n.Tf("tui_monitor_header", map[string]any{"Node": m.nodeID, "Uptime": m.metrics.Uptime, "Load": m.metrics.LoadAverage}))
+	statusInfo := ""
+	if m.paused {
+		statusInfo = " [" + i18n.T("tui_monitor_paused") + "]"
+	}
+
+	sortInfo := i18n.T("tui_monitor_sort_by_"+m.collector.SortBy)
+	orderKey := "tui_monitor_order_desc"
+	if m.collector.SortAsc {
+		orderKey = "tui_monitor_order_asc"
+	}
+	sortInfo += " | " + i18n.T(orderKey)
+
+	headerStr := i18n.Tf("tui_monitor_header", map[string]any{
+		"Node":   m.nodeID,
+		"Cores":  m.metrics.Cores,
+		"Uptime": m.metrics.Uptime,
+		"Load":   m.metrics.LoadAverage,
+	}) + statusInfo + "\n" + sortInfo
+	header := headerStyle.Render(headerStr)
 
 	// 左侧：进度条区域
 	cpuBar := renderProgressBar(i18n.T("tui_monitor_cpu"), m.metrics.CPUUsage)
@@ -150,8 +184,13 @@ func (m monitorModel) View() string {
 	}
 
 	footer := i18n.Tf("tui_monitor_footer", map[string]any{"Time": m.lastFetch.Format("15:04:05")})
+	helpStr := lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(
+		"\n[Space/P] " + i18n.T("tui_help_pause") +
+			" | [S] " + i18n.T("tui_help_sort") +
+			" | [O] " + i18n.T("tui_help_order"),
+	)
 
-	return lipgloss.JoinVertical(lipgloss.Left, header, "", content, footer)
+	return lipgloss.JoinVertical(lipgloss.Left, header, "", content, footer, helpStr)
 }
 
 func renderProgressBar(label string, percent float64) string {

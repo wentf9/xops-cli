@@ -727,7 +727,7 @@ tui_monitor_error:
 tui_monitor_fetching:
   other: "Fetching metrics..."
 tui_monitor_header:
-  other: "Monitoring: {{.Node}} | Uptime: {{.Uptime}} | Load: {{.Load}}"
+  other: "Monitoring: {{.Node}} | Cores: {{.Cores}} | Uptime: {{.Uptime}} | Load: {{.Load}}"
 tui_monitor_cpu:
   other: "CPU Usage"
 tui_monitor_mem:
@@ -737,10 +737,26 @@ tui_monitor_disk_parts:
 tui_monitor_disk:
   other: "Disk ({{.Mount}})"
 tui_monitor_top_procs:
-  other: "Top Processes (PID STAT RSS COMMAND)"
+  other: "Top Processes (PID STAT RSS %CPU COMMAND)"
 tui_monitor_footer:
   other: "\nLast updated: {{.Time}} (Press 'q' or 'Esc' to back)"
 tui_help_monitor:
   other: "monitor"
 tui_monitor_connecting:
   other: "Connecting to {{.Node}}..."
+tui_monitor_paused:
+  other: "PAUSED"
+tui_monitor_sort_by_cpu:
+  other: "Sort: CPU"
+tui_monitor_sort_by_mem:
+  other: "Sort: MEM"
+tui_monitor_order_desc:
+  other: "Order: DESC"
+tui_monitor_order_asc:
+  other: "Order: ASC"
+tui_help_pause:
+  other: "pause"
+tui_help_sort:
+  other: "sort"
+tui_help_order:
+  other: "order"

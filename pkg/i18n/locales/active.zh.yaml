@@ -728,7 +728,7 @@ tui_monitor_error:
 tui_monitor_fetching:
   other: "正在获取监控数据..."
 tui_monitor_header:
-  other: "监控: {{.Node}} | 运行时长: {{.Uptime}} | 负载: {{.Load}}"
+  other: "监控: {{.Node}} | 核心数: {{.Cores}} | 运行时长: {{.Uptime}} | 负载: {{.Load}}"
 tui_monitor_cpu:
   other: "CPU 使用率"
 tui_monitor_mem:
@@ -738,10 +738,26 @@ tui_monitor_disk_parts:
 tui_monitor_disk:
   other: "磁盘 ({{.Mount}})"
 tui_monitor_top_procs:
-  other: "Top 进程 (PID 状态 物理内存 进程名)"
+  other: "Top 进程 (PID 状态 物理内存 %CPU 进程名)"
 tui_monitor_footer:
   other: "\n最后更新: {{.Time}} (按 'q' 或 'Esc' 退出)"
 tui_help_monitor:
   other: "监控"
 tui_monitor_connecting:
   other: "正在连接到 {{.Node}}..."
+tui_monitor_paused:
+  other: "已暂停"
+tui_monitor_sort_by_cpu:
+  other: "排序: CPU"
+tui_monitor_sort_by_mem:
+  other: "排序: 内存"
+tui_monitor_order_desc:
+  other: "顺序: 降序"
+tui_monitor_order_asc:
+  other: "顺序: 升序"
+tui_help_pause:
+  other: "暂停"
+tui_help_sort:
+  other: "切换排序"
+tui_help_order:
+  other: "切换升降"
