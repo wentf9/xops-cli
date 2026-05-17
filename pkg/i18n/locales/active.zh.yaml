@@ -761,3 +761,23 @@ tui_help_sort:
   other: "切换排序"
 tui_help_order:
   other: "切换升降"
+
+# ---- log viewer ----
+tui_help_log:
+  other: "日志"
+tui_log_connecting:
+  other: "正在连接 {{.Node}} 获取日志..."
+tui_log_title:
+  other: "选择日志文件"
+tui_log_manual:
+  other: "📝 手动输入 (输入绝对路径)"
+tui_log_manual_prompt:
+  other: "请输入日志路径 (例如 /var/log/syslog):"
+tui_log_fetching:
+  other: "正在扫描日志文件..."
+tui_log_stream_header:
+  other: "日志: {{.File}} | 过滤: {{.Filter}} | 高亮: {{.Highlight}}"
+tui_log_stream_footer:
+  other: "\n按 '/' 搜索, 'f' 切换过滤, 'h' 切换高亮, 'q' 或 'Esc' 退出。"
+tui_log_search_prompt:
+  other: "搜索关键字: "

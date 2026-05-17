@@ -171,6 +171,7 @@ func newListModel(provider config.ConfigProvider) list.Model {
 			key.NewBinding(key.WithKeys("d"), key.WithHelp("d", i18n.T("tui_help_delete"))),
 			key.NewBinding(key.WithKeys("e"), key.WithHelp("e", i18n.T("tui_help_edit"))),
 			key.NewBinding(key.WithKeys("m"), key.WithHelp("m", "monitor")),
+			key.NewBinding(key.WithKeys("l"), key.WithHelp("l", i18n.T("tui_help_log"))),
 			key.NewBinding(key.WithKeys("n"), key.WithHelp("n", i18n.T("tui_help_new"))),
 			key.NewBinding(key.WithKeys("g"), key.WithHelp("g", i18n.T("tui_help_tag"))),
 		}
@@ -246,6 +247,7 @@ func (m *Model) getKeyHandler(key string) (func() (Model, tea.Cmd), bool) {
 		"n":     m.handleNew,
 		"e":     m.handleEdit,
 		"m":     m.handleMonitor,
+		"l":     m.handleLogSelect,
 		"g":     m.handleTagAction,
 	}
 
@@ -416,6 +418,22 @@ func (m *Model) handleMonitor() (Model, tea.Cmd) {
 		defer cancel()
 		client, err := m.connector.Connect(ctx, nodeID)
 		return monitorConnectedMsg{nodeID: nodeID, client: client, err: err}
+	}
+}
+
+func (m *Model) handleLogSelect() (Model, tea.Cmd) {
+	selected := m.list.SelectedItem()
+	if selected == nil {
+		return *m, nil
+	}
+	nodeID := selected.(*nodeItem).id
+	m.status = i18n.Tf("tui_log_connecting", map[string]any{"Node": nodeID})
+
+	return *m, func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		client, err := m.connector.Connect(ctx, nodeID)
+		return logScannerConnectedMsg{nodeID: nodeID, client: client, err: err}
 	}
 }
 

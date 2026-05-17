@@ -760,3 +760,23 @@ tui_help_sort:
   other: "sort"
 tui_help_order:
   other: "order"
+
+# ---- log viewer ----
+tui_help_log:
+  other: "log"
+tui_log_connecting:
+  other: "Connecting to {{.Node}} for logs..."
+tui_log_title:
+  other: "Select Log File"
+tui_log_manual:
+  other: "📝 Manual Input (Enter absolute path)"
+tui_log_manual_prompt:
+  other: "Enter log path (e.g. /var/log/syslog):"
+tui_log_fetching:
+  other: "Fetching log files..."
+tui_log_stream_header:
+  other: "Log: {{.File}} | Filter: {{.Filter}} | Highlight: {{.Highlight}}"
+tui_log_stream_footer:
+  other: "\nPress '/' to search, 'f' to toggle filter, 'h' to toggle highlight, 'q' or 'Esc' to exit."
+tui_log_search_prompt:
+  other: "Search keyword: "

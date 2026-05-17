@@ -111,7 +111,7 @@ func (m monitorModel) View() string {
 		statusInfo = " [" + i18n.T("tui_monitor_paused") + "]"
 	}
 
-	sortInfo := i18n.T("tui_monitor_sort_by_"+m.collector.SortBy)
+	sortInfo := i18n.T("tui_monitor_sort_by_" + m.collector.SortBy)
 	orderKey := "tui_monitor_order_desc"
 	if m.collector.SortAsc {
 		orderKey = "tui_monitor_order_asc"

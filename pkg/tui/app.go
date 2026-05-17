@@ -18,6 +18,8 @@ const (
 	viewForm
 	viewTagSelect
 	viewMonitor
+	viewLogSelect
+	viewLogStream
 )
 
 type Model struct {
@@ -29,6 +31,8 @@ type Model struct {
 	formState     *nodeFormState
 	tagForm       *huh.Form
 	monitor       monitorModel
+	logSelect     logSelectModel
+	logStreamer   logStreamerModel
 	tagMode       string // "add" or "remove"
 	selectedTags  []string
 	newTagsInput  string // 新标签输入
@@ -69,6 +73,19 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.monitor = newMonitorModel(msg.nodeID, msg.client)
 		m.state = viewMonitor
 		return m, m.monitor.Init()
+	case logScannerConnectedMsg:
+		if msg.err != nil {
+			m.status = errorStyle.Render(fmt.Sprintf("Connection failed: %v", msg.err))
+			return m, nil
+		}
+		m.status = ""
+		m.logSelect = newLogSelectModel(msg.nodeID, msg.client, m.lastSize)
+		m.state = viewLogSelect
+		return m, m.logSelect.Init()
+	case logFileSelectedMsg:
+		m.logStreamer = newLogStreamerModel(msg.client, msg.file, m.lastSize)
+		m.state = viewLogStream
+		return m, m.logStreamer.Init()
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
@@ -97,6 +114,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+//nolint:gocyclo
 func (m *Model) handleStateUpdate(msg tea.Msg) tea.Cmd {
 	var cmd tea.Cmd
 	oldState := m.state
@@ -118,6 +136,31 @@ func (m *Model) handleStateUpdate(msg tea.Msg) tea.Cmd {
 		var mCmd tea.Cmd
 		m.monitor, mCmd = m.monitor.Update(msg)
 		cmd = mCmd
+	case viewLogSelect:
+		if kmsg, ok := msg.(tea.KeyMsg); ok {
+			if (kmsg.String() == "esc" || kmsg.String() == "q") && !m.logSelect.isManual {
+				m.state = viewList
+				*m, _ = m.updateList(m.lastSize)
+				return nil
+			}
+		}
+		var lsCmd tea.Cmd
+		m.logSelect, lsCmd = m.logSelect.Update(msg)
+		cmd = lsCmd
+	case viewLogStream:
+		if kmsg, ok := msg.(tea.KeyMsg); ok {
+			if (kmsg.String() == "esc" || kmsg.String() == "q") && !m.logStreamer.isSearching {
+				if m.logStreamer.reader != nil {
+					_ = m.logStreamer.reader.Close()
+				}
+				m.state = viewLogSelect
+				m.logSelect.list.SetSize(m.lastSize.Width, m.lastSize.Height)
+				return nil
+			}
+		}
+		var lstCmd tea.Cmd
+		m.logStreamer, lstCmd = m.logStreamer.Update(msg)
+		cmd = lstCmd
 	}
 
 	// If we just switched from form to list, force a resize
@@ -147,6 +190,10 @@ func (m Model) View() string {
 		}
 	case viewMonitor:
 		s = m.monitor.View()
+	case viewLogSelect:
+		s = m.logSelect.View()
+	case viewLogStream:
+		s = m.logStreamer.View()
 	}
 
 	if m.status != "" {
