@@ -347,6 +347,16 @@ load_verify_failed:
   other: "[{{.Host}}] Verification failed: {{.Error}}"
 load_verify_success:
   other: "[{{.Host}}] Verified and saved"
+inventory_template_header:
+  other: "host,port,alias,user,password,key,keypass\n"
+inventory_export_template_failed:
+  other: "failed to export template: {{.Error}}"
+inventory_load_args_error:
+  other: "expected exactly 1 argument (CSV file path), but got {{.Count}} (or use -T to export template)"
+inventory_load_read_failed:
+  other: "failed to read CSV file: {{.Error}}"
+inventory_load_config_failed:
+  other: "failed to load config file: {{.Error}}"
 
 # ---- encode ----
 encode_short:
@@ -547,6 +557,8 @@ tui_form_sudo_mode:
   other: "Sudo Mode"
 tui_form_tags:
   other: "Tags (comma separated)"
+tui_form_help:
+  other: "ctrl+s: save • esc: back • tab/down: next • shift+tab/up: prev"
 tui_ssh_failed:
   other: "SSH connection failed: {{.Error}}"
 tui_press_enter:

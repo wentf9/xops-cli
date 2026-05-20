@@ -35,22 +35,22 @@ func NewCmdInventoryLoad() *cobra.Command {
 func RunInventoryLoad(cmdObj *cobra.Command, args []string) error {
 	// 如果指定了导出模板
 	if TemplateFile != "" {
-		header := "主机,端口,别名,用户,密码,私钥,私钥密码\n"
+		header := i18n.T("inventory_template_header")
 		err := os.WriteFile(TemplateFile, []byte(header), 0644)
 		if err != nil {
-			return fmt.Errorf("导出模板失败: %w", err)
+			return fmt.Errorf("%s", i18n.Tf("inventory_export_template_failed", map[string]any{"Error": err}))
 		}
 		logger.PrintSuccess(i18n.Tf("template_export_success", map[string]any{"Path": TemplateFile}))
 		return nil
 	}
 
 	if len(args) != 1 {
-		return fmt.Errorf("期望一个参数 (CSV文件路径), 但提供了 %d 个 (或使用 -T 导出模板)", len(args))
+		return fmt.Errorf("%s", i18n.Tf("inventory_load_args_error", map[string]any{"Count": len(args)}))
 	}
 	csvFile := args[0]
 	hosts, err := utils.ReadCSVFile(csvFile)
 	if err != nil {
-		return fmt.Errorf("读取CSV文件失败: %w", err)
+		return fmt.Errorf("%s", i18n.Tf("inventory_load_read_failed", map[string]any{"Error": err}))
 	}
 
 	return ExecuteLoadHost(hosts)
@@ -61,7 +61,7 @@ func ExecuteLoadHost(hosts []utils.HostInfo) error {
 	configStore := config.NewDefaultStore(configPath, keyPath)
 	cfg, err := configStore.Load()
 	if err != nil {
-		return fmt.Errorf("加载配置文件失败: %w", err)
+		return fmt.Errorf("%s", i18n.Tf("inventory_load_config_failed", map[string]any{"Error": err}))
 	}
 	provider := config.NewProvider(cfg)
 	connector := ssh.NewConnector(provider)

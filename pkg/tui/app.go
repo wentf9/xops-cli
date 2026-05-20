@@ -8,6 +8,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
 	"github.com/wentf9/xops-cli/pkg/config"
+	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/ssh"
 )
 
@@ -179,6 +180,7 @@ func (m Model) View() string {
 	case viewForm:
 		if m.form != nil {
 			s = m.form.View()
+			s += "\n\n" + statusStyle.Render(i18n.T("tui_form_help"))
 		} else {
 			s = "Form View (WIP)"
 		}

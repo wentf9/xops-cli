@@ -44,8 +44,9 @@ func (c *Connector) Connect(ctx context.Context, nodeName string) (*Client, erro
 		// 可选：检查连接是否存活（发送一个非阻塞的 KeepAlive 请求）
 		// 对于短生命周期的 CLI 工具，通常假设缓存的连接是可用的
 		node, _ := c.Config.GetNode(nodeName) // 重新获取配置以防更新，或者缓存 wrapper
-		host, _ := c.Config.GetHost(node.HostRef)
-		identity, _ := c.Config.GetIdentity(node.IdentityRef)
+		// GetHost 和 GetIdentity 的入参应为 nodeName (即 nodeID)，其内部会自动通过 HostRef/IdentityRef 关联获取
+		host, _ := c.Config.GetHost(nodeName)
+		identity, _ := c.Config.GetIdentity(nodeName)
 		return newClient(cachedClient, node, host, identity, c.Config, nodeName), nil
 	}
 	// 缓存未命中，开始建立新连接
@@ -56,8 +57,9 @@ func (c *Connector) Connect(ctx context.Context, nodeName string) (*Client, erro
 		// 双重检查：防止在进入 Do 之前那一瞬间，别的协程刚好把连接建立好了
 		if cachedClient, ok := c.clients.Get(nodeName); ok {
 			node, _ := c.Config.GetNode(nodeName)
-			host, _ := c.Config.GetHost(node.HostRef)
-			identity, _ := c.Config.GetIdentity(node.IdentityRef)
+			// GetHost 和 GetIdentity 的入参应为 nodeName (即 nodeID)，其内部会自动通过 HostRef/IdentityRef 关联获取
+			host, _ := c.Config.GetHost(nodeName)
+			identity, _ := c.Config.GetIdentity(nodeName)
 			return newClient(cachedClient, node, host, identity, c.Config, nodeName), nil
 		}
 

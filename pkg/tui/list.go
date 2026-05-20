@@ -383,18 +383,20 @@ func (m *Model) handleDelete() (Model, tea.Cmd) {
 }
 
 func (m *Model) handleNew() (Model, tea.Cmd) {
-	*m = m.initForm("")
+	var cmd tea.Cmd
+	*m, cmd = m.initForm("")
 	m.state = viewForm
-	return *m, nil
+	return *m, cmd
 }
 
 func (m *Model) handleEdit() (Model, tea.Cmd) {
 	selected := m.list.SelectedItem()
 	if selected != nil {
 		nodeID := selected.(*nodeItem).id
-		*m = m.initForm(nodeID)
+		var cmd tea.Cmd
+		*m, cmd = m.initForm(nodeID)
 		m.state = viewForm
-		return *m, nil
+		return *m, cmd
 	}
 	return *m, nil
 }

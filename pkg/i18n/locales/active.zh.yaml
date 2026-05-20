@@ -348,6 +348,16 @@ load_verify_failed:
   other: "[{{.Host}}] 验证失败: {{.Error}}"
 load_verify_success:
   other: "[{{.Host}}] 验证通过并已保存"
+inventory_template_header:
+  other: "主机,端口,别名,用户,密码,私钥,私钥密码\n"
+inventory_export_template_failed:
+  other: "导出模板失败: {{.Error}}"
+inventory_load_args_error:
+  other: "期望一个参数 (CSV文件路径), 但提供了 {{.Count}} 个 (或使用 -T 导出模板)"
+inventory_load_read_failed:
+  other: "读取CSV文件失败: {{.Error}}"
+inventory_load_config_failed:
+  other: "加载配置文件失败: {{.Error}}"
 
 # ---- encode ----
 encode_short:
@@ -548,6 +558,8 @@ tui_form_sudo_mode:
   other: "提权模式"
 tui_form_tags:
   other: "标签 (逗号分隔)"
+tui_form_help:
+  other: "ctrl+s: 保存 • esc: 返回 • tab/down: 下一项 • shift+tab/up: 上一项"
 tui_ssh_failed:
   other: "SSH 连接失败: {{.Error}}"
 tui_press_enter:

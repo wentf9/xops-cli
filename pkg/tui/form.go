@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
 	"github.com/wentf9/xops-cli/cmd/utils"
@@ -29,9 +30,35 @@ type nodeFormState struct {
 	tags       string
 }
 
-func (m *Model) initForm(nodeID string) Model {
+func (m *Model) initForm(nodeID string) (Model, tea.Cmd) {
 	state := m.newNodeFormState(nodeID)
 	m.formState = state
+
+	// 自定义快捷键以支持 Up/Down 切换
+	km := huh.NewDefaultKeyMap()
+	km.Input.Next = key.NewBinding(
+		key.WithKeys("tab", "down"),
+		key.WithHelp("tab/down", "next"),
+	)
+	km.Input.Prev = key.NewBinding(
+		key.WithKeys("shift+tab", "up"),
+		key.WithHelp("shift+tab/up", "prev"),
+	)
+
+	// 解绑 Select 字段的 Up/Down，改用横向 Left/Right 切换选项，并将上下键绑定到切换字段
+	km.Select.Next = key.NewBinding(
+		key.WithKeys("tab", "down"),
+		key.WithHelp("tab/down", "next"),
+	)
+	km.Select.Prev = key.NewBinding(
+		key.WithKeys("shift+tab", "up"),
+		key.WithHelp("shift+tab/up", "prev"),
+	)
+	km.Select.Up = key.NewBinding()
+	km.Select.Down = key.NewBinding()
+
+	// 计算合理高度（保留 3 行用于底部状态和 help 说明）
+	formHeight := max(m.lastSize.Height-3, 1)
 
 	m.form = huh.NewForm(
 		huh.NewGroup(
@@ -74,7 +101,8 @@ func (m *Model) initForm(nodeID string) Model {
 					huh.NewOption("Password", "password"),
 					huh.NewOption("Key File", "key"),
 				).
-				Value(&state.authType),
+				Value(&state.authType).
+				Inline(true),
 			huh.NewInput().
 				Title(i18n.T("tui_form_password")).
 				EchoMode(huh.EchoModePassword).
@@ -97,15 +125,20 @@ func (m *Model) initForm(nodeID string) Model {
 					huh.NewOption("Root", string(models.SudoModeRoot)),
 					huh.NewOption("None", string(models.SudoModeNone)),
 				).
-				Value(&state.sudoMode),
+				Value(&state.sudoMode).
+				Inline(true),
 			huh.NewInput().
 				Title(i18n.T("tui_form_tags")).
 				Value(&state.tags).
 				Validate(m.validateTags),
 		),
-	).WithTheme(huh.ThemeCharm()).WithWidth(m.lastSize.Width).WithHeight(m.lastSize.Height - 1)
-	m.form.Init()
-	return *m
+	).WithTheme(huh.ThemeCharm()).
+		WithKeyMap(km).
+		WithWidth(m.lastSize.Width).
+		WithHeight(formHeight)
+
+	cmd := m.form.Init()
+	return *m, cmd
 }
 
 func (m *Model) newNodeFormState(nodeID string) *nodeFormState {
@@ -152,7 +185,7 @@ func (m *Model) validateAliases(s string) error {
 		return nil
 	}
 	seen := make(map[string]bool)
-	for _, a := range strings.Split(s, ",") {
+	for a := range strings.SplitSeq(s, ",") {
 		a = strings.TrimSpace(a)
 		if a == "" {
 			continue
@@ -190,14 +223,46 @@ func (m *Model) validateTags(s string) error {
 	return nil
 }
 
+func (m *Model) validateFormState() error {
+	s := m.formState
+	if err := m.validateAliases(s.alias); err != nil {
+		return err
+	}
+	if strings.TrimSpace(s.user) == "" {
+		return errors.New(i18n.T("tui_validation_user_required"))
+	}
+	if strings.TrimSpace(s.address) == "" {
+		return errors.New(i18n.T("tui_validation_address_required"))
+	}
+	if _, err := strconv.Atoi(s.port); err != nil {
+		return errors.New(i18n.T("tui_validation_port_invalid"))
+	}
+	if err := m.validateTags(s.tags); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (m *Model) updateForm(msg tea.Msg) (Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		if m.form != nil {
-			m.form.WithWidth(msg.Width).WithHeight(msg.Height - 1)
+			formHeight := max(msg.Height-3, 1)
+			m.form.WithWidth(msg.Width).WithHeight(formHeight)
 		}
 		return *m, nil
 	case tea.KeyMsg:
+		if msg.String() == "ctrl+s" {
+			if err := m.validateFormState(); err != nil {
+				m.status = errorStyle.Render(err.Error())
+				return *m, nil
+			}
+			m.saveForm()
+			m.state = viewList
+			m.list = newListModel(m.provider) // refresh list
+			*m, _ = m.updateList(m.lastSize)
+			return *m, nil
+		}
 		if msg.String() == "esc" {
 			// cancel
 			m.state = viewList
@@ -278,11 +343,12 @@ func (m *Model) saveForm() {
 	node.Alias = splitComma(s.alias)
 	node.Tags = splitComma(s.tags)
 
-	// Delete old node if ID changed
+	// Add new node first, then clean up old node if ID changed.
+	// This ensures referenced Host/Identity aren't prematurely deleted by DeleteNode's reference counting check.
+	m.provider.AddNode(nodeID, node)
 	if s.isEdit && s.originalID != nodeID {
 		m.provider.DeleteNode(s.originalID)
 	}
-	m.provider.AddNode(nodeID, node)
 
 	err := m.configStore.Save(m.provider.GetConfig())
 	if err != nil {
