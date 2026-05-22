@@ -190,3 +190,59 @@ func TestListIdentities(t *testing.T) {
 		t.Errorf("ListIdentities() returned %d, want 1", len(ids))
 	}
 }
+
+func TestLocalNodeFiltering(t *testing.T) {
+	cfg := &Configuration{
+		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
+		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
+		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
+	}
+	// 1. 添加正常节点 (remote node)
+	cfg.Hosts.Set("host-remote", models.Host{Address: "192.168.1.10", Port: 22})
+	cfg.Identities.Set("id-remote", models.Identity{User: "remote-user", AuthType: "password"})
+	cfg.Nodes.Set("remote-node", models.Node{
+		HostRef:     "host-remote",
+		IdentityRef: "id-remote",
+		Tags:        []string{"web"},
+	})
+
+	// 2. 添加本地节点 (localhost node)
+	cfg.Hosts.Set("host-local", models.Host{Address: "127.0.0.1", Port: 22})
+	cfg.Identities.Set("id-local", models.Identity{User: "local-user", AuthType: "password"})
+	cfg.Nodes.Set("local-node", models.Node{
+		HostRef:     "host-local",
+		IdentityRef: "id-local",
+		Tags:        []string{"web"},
+	})
+
+	p := NewProvider(cfg)
+
+	// 验证 ListNodes
+	nodes := p.ListNodes()
+	if len(nodes) != 1 {
+		t.Errorf("ListNodes() returned %d nodes, want 1 (should exclude local node)", len(nodes))
+	}
+	if _, ok := nodes["remote-node"]; !ok {
+		t.Error("expected remote-node to be in ListNodes()")
+	}
+	if _, ok := nodes["local-node"]; ok {
+		t.Error("expected local-node to be excluded from ListNodes()")
+	}
+
+	// 验证 GetNodesByTag
+	taggedNodes := p.GetNodesByTag("web")
+	if len(taggedNodes) != 1 {
+		t.Errorf("GetNodesByTag() returned %d nodes, want 1", len(taggedNodes))
+	}
+	if _, ok := taggedNodes["local-node"]; ok {
+		t.Error("expected local-node to be excluded from GetNodesByTag()")
+	}
+
+	// 验证 Find 和 GetNode 依然保留单节点寻址能力
+	if got := p.Find("local-node"); got != "local-node" {
+		t.Errorf("Find('local-node') = %q, want 'local-node' (should preserve indexing)", got)
+	}
+	if _, ok := p.GetNode("local-node"); !ok {
+		t.Error("GetNode('local-node') failed, should preserve point-to-point query")
+	}
+}

@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/wentf9/xops-cli/pkg/models"
 	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
@@ -185,9 +186,22 @@ func (cp Provider) DeleteNode(nodeID string) {
 	}
 }
 
+func (cp Provider) isLocalNode(nodeID string) bool {
+	if node, ok := cp.cfg.Nodes.Get(nodeID); ok {
+		if host, ok := cp.cfg.Hosts.Get(node.HostRef); ok {
+			addr := strings.ToLower(strings.TrimSpace(host.Address))
+			return addr == "127.0.0.1" || addr == "localhost" || addr == "::1"
+		}
+	}
+	return false
+}
+
 func (cp Provider) ListNodes() map[string]models.Node {
 	nodes := make(map[string]models.Node)
 	for _, k := range cp.cfg.Nodes.Keys() {
+		if cp.isLocalNode(k) {
+			continue
+		}
 		if v, ok := cp.cfg.Nodes.Get(k); ok {
 			nodes[k] = v
 		}
@@ -198,6 +212,9 @@ func (cp Provider) ListNodes() map[string]models.Node {
 func (cp Provider) GetNodesByTag(tag string) map[string]models.Node {
 	result := make(map[string]models.Node)
 	for _, nodeID := range cp.cfg.Nodes.Keys() {
+		if cp.isLocalNode(nodeID) {
+			continue
+		}
 		node, _ := cp.cfg.Nodes.Get(nodeID)
 		if slices.Contains(node.Tags, tag) {
 			result[nodeID] = node
