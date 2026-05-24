@@ -24,6 +24,7 @@
 - 🤖 **AI 原生 (MCP 服务端)**: 内置 Model Context Protocol 服务端，包含完整的安全护栏、风险评估和策略控制。让 AI 助手安全地替你管理服务器。
 - 🛡️ **SSH 增强与 TUI**: 完全兼容 OpenSSH (支持跳板机 JumpHost、隧道、Agent 转发)。内置精美的 **TUI (终端用户界面)**，并支持自动 Sudo 提权模式。
 - ⚡ **批量执行与传输**: 基于标签 (Tags) 对多台主机并行执行命令或本地脚本。内置 SCP/SFTP 支持，轻松实现文件批量分发。
+- 🔄 **声明式任务编排 (Playbook)**: 支持 YAML 格式的任务编排，组合 shell、script、copy、ensure (幂等性状态收敛) 和 template 步骤，支持并发控制与失败策略。
 - 🗂️ **加密资产管理**: 本地统一管理主机、凭据 (Identity) 和标签，敏感信息(密码/私钥)采用 AES 加密存储。支持通过 CSV 模板批量导入导出。
 - 🌐 **网络与安全工具**: 集成 DNS 查询、Ping、Netcat (nc)、Base64/Hex 编码转换，以及统一的**防火墙管理器** (自动适配 firewalld, ufw, iptables, nftables)。
 - 🌍 **国际化 (i18n)**: 原生支持简体中文与英文，可根据环境自动切换。
@@ -81,7 +82,48 @@ xops exec --tag web --shell ./setup.sh --task 5
 xops scp ./config.conf --tag web --dest /etc/app/
 ```
 
-#### 4. AI 与 MCP 集成 (赋予 AI 运维能力)
+#### 4. 声明式任务编排 (Playbook)
+你可以编写 YAML 格式的 Playbook 实现流水线式的复杂部署任务。支持 shell、script、copy、ensure (状态期望收敛)、template 等操作。
+
+示例 Playbook `deploy.yaml`:
+```yaml
+name: deploy-web
+targets:
+  tags: [web]
+settings:
+  concurrency: 2
+  on_error: stop
+vars:
+  app_port: "8080"
+steps:
+  - name: "安装 nginx"
+    ensure:
+      check: "nginx -v"
+      action: "apt-get install -y nginx"
+    sudo: true
+  - name: "渲染并分发配置"
+    template:
+      src: "./nginx.conf.tmpl"
+      dest: "/etc/nginx/nginx.conf"
+    sudo: true
+  - name: "启动 nginx 服务"
+    shell: "systemctl start nginx"
+    sudo: true
+```
+
+执行 Playbook：
+```bash
+# 执行 Playbook 并覆盖/注入变量
+xops play deploy.yaml --var app_port=8081
+
+# 仅预览执行步骤（不实际执行）
+xops play deploy.yaml --dry-run
+
+# 限制执行到特定主机节点
+xops play deploy.yaml --limit web-01
+```
+
+#### 5. AI 与 MCP 集成 (赋予 AI 运维能力)
 XOps 内置了 **Model Context Protocol (MCP)** 服务端，让 **Claude** 等 AI 助手可以直接感知并操作你的服务器。
 
 **A. 启动 MCP 服务:**
@@ -107,7 +149,7 @@ xops mcp serve
 - **策略控制**: 支持配置只读模式或“先审批后执行”策略。
 - **全量审计**: 完整记录 AI 执行的每一条指令，确保过程透明可追溯。
 
-#### 5. AI Agent 技能 (Skill) 集成
+#### 6. AI Agent 技能 (Skill) 集成
 XOps 提供开箱即用的 AI Agent 技能 (Skill)，让你的命令行 AI 助手一键获得强大的服务器运维和故障排查能力。
 
 > [!CAUTION]

@@ -1,0 +1,92 @@
+# =============================================================================
+# XOps Playbook 示例 — Web 应用部署
+# 路径建议: ~/.xops/playbooks/deploy-web.yaml
+# 用法: xops play deploy-web.yaml --var app_version=2.1.0
+# =============================================================================
+
+name: deploy-web
+description: "将 Web 应用部署到所有生产 web 服务器"
+
+# 目标主机（三种方式任选其一或多个组合）
+targets:
+  tags: [web, prod]       # 按标签选择（推荐）
+  # nodes: [web-1, web-2] # 按节点名精确选择
+  # hosts: [192.168.1.10] # 按 IP 地址选择
+
+# 全局执行配置
+settings:
+  concurrency: 3          # 最大并行主机数（默认: 1）
+  sudo: false             # 全局是否提权
+  on_error: stop          # 失败策略: continue | stop | abort_all
+  timeout: 600s           # 整体超时限制
+
+# 变量定义（支持 {{ .VarName }} 模板替换）
+# CLI 通过 --var key=value 可覆盖这些值
+vars:
+  app_version: "2.0.0"
+  app_dir: "/opt/myapp"
+  app_user: "www-data"
+  config_src: "./configs/app.conf"
+  backup_dir: "/opt/backups"
+
+# 任务步骤（按顺序在每台主机上执行）
+steps:
+  # --- 步骤 1: 确保依赖已安装（幂等性）---
+  - name: "确保 nginx 已安装"
+    ensure:
+      check: "nginx -v"
+      action: "apt-get install -y nginx"
+    sudo: true
+
+  - name: "确保部署目录存在"
+    ensure:
+      check: "test -d {{ .app_dir }}"
+      action: "mkdir -p {{ .app_dir }} && chown {{ .app_user }} {{ .app_dir }}"
+    sudo: true
+
+  # --- 步骤 2: 备份旧版本 ---
+  - name: "备份当前版本"
+    shell: "cp -r {{ .app_dir }} {{ .backup_dir }}/app-$(date +%Y%m%d-%H%M%S) 2>/dev/null || true"
+    sudo: true
+    ignore_error: true    # 首次部署时目录可能不存在，忽略错误
+
+  # --- 步骤 3: 停止旧服务 ---
+  - name: "停止应用服务"
+    shell: "systemctl stop myapp"
+    sudo: true
+    ignore_error: true    # 服务可能未运行
+
+  # --- 步骤 4: 文件分发 ---
+  - name: "上传配置文件"
+    copy:
+      src: "{{ .config_src }}"
+      dest: "{{ .app_dir }}/app.conf"
+      mode: "0644"
+
+  - name: "上传应用包"
+    copy:
+      src: "./dist/myapp-{{ .app_version }}.tar.gz"
+      dest: "{{ .app_dir }}/myapp.tar.gz"
+
+  # --- 步骤 5: 运行部署脚本 ---
+  - name: "解压并安装"
+    script: "./scripts/install.sh"
+    sudo: true
+
+  # --- 步骤 6: 启动服务并验证 ---
+  - name: "启动应用服务"
+    shell: "systemctl start myapp"
+    sudo: true
+
+  - name: "验证服务已运行"
+    ensure:
+      check: "systemctl is-active myapp"
+      action: "systemctl restart myapp"
+    sudo: true
+    retries: 3            # 失败重试 3 次
+    retry_delay: 5s       # 每次等待 5 秒
+
+  - name: "健康检查"
+    shell: "curl -sf http://localhost:8080/health"
+    retries: 5
+    retry_delay: 10s

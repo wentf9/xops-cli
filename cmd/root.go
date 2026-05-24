@@ -79,6 +79,7 @@ func registerCommands(rootCmd *cobra.Command) {
 	rootCmd.AddCommand(NewCmdSftp())
 	rootCmd.AddCommand(NewCmdScp())
 	rootCmd.AddCommand(NewCmdExec())
+	rootCmd.AddCommand(NewCmdPlay())
 	rootCmd.AddCommand(NewCmdIdentity())
 	rootCmd.AddCommand(newCmdNc())
 	rootCmd.AddCommand(newCmdDns())

@@ -792,3 +792,49 @@ tui_log_stream_footer:
   other: "\nPress '/' to search, 'f' to toggle filter, 'h' to toggle highlight, 'q' or 'Esc' to exit."
 tui_log_search_prompt:
   other: "Search keyword: "
+
+# ---- play (playbook) ----
+play_short:
+  other: "Execute declarative orchestration tasks (Playbook)"
+play_long:
+  other: "Load and execute declarative orchestration tasks (Playbook) from a YAML file.\n\nSupports sequential multi-step and parallel multi-host execution. Step types:\n  shell    — Run a command on remote hosts\n  script   — Upload and execute a local script file\n  copy     — Upload a local file to remote hosts\n  ensure   — Idempotent state convergence: check first, run action if not satisfied\n  template — Render a Go template and upload\n\nExamples:\n  xops play deploy.yaml\n  xops play deploy.yaml --var version=2.1.0 --var env=prod\n  xops play deploy.yaml --concurrency 5\n  xops play deploy.yaml --dry-run\n  xops play deploy.yaml --limit web-1,web-2\n  xops play deploy                    # look up by name under ~/.xops/playbooks/"
+flag_play_var:
+  other: "Override or add a variable, format: key=value (repeatable)"
+flag_play_concurrency:
+  other: "Maximum concurrent hosts (overrides Playbook settings.concurrency)"
+flag_play_dry_run:
+  other: "Parse and preview Playbook steps without executing"
+flag_play_limit:
+  other: "Limit target nodes (comma-separated node names, overrides Playbook targets)"
+flag_play_sudo:
+  other: "Force global sudo (overrides Playbook settings.sudo)"
+play_loading:
+  other: "Loading Playbook: {{.Path}}"
+play_target_resolved:
+  other: "Resolved {{.Count}} target host(s)"
+play_step_running:
+  other: "[{{.Host}}] ▶ Running step: {{.Step}}"
+play_step_ok:
+  other: "[{{.Host}}] ✅ {{.Step}}"
+play_step_changed:
+  other: "[{{.Host}}] 🔄 {{.Step}} (changed)"
+play_step_skipped:
+  other: "[{{.Host}}] ⏭️  {{.Step}} (already satisfied, skipped)"
+play_step_failed:
+  other: "[{{.Host}}] ❌ {{.Step}}: {{.Error}}"
+play_dry_run:
+  other: "Dry Run mode — preview only, no execution"
+play_connect_failed:
+  other: "[{{.Host}}] Connection failed: {{.Error}}"
+play_warn_tag_empty:
+  other: "No nodes found for tag '{{.Tag}}'"
+play_err_no_file:
+  other: "No Playbook file specified"
+play_err_parse:
+  other: "Failed to parse Playbook"
+play_err_no_targets:
+  other: "No matching target hosts found, check your targets configuration"
+play_err_node_not_found:
+  other: "Node '{{.Node}}' not found, check the node name or add it via 'xops host'"
+play_err_some_failed:
+  other: "Some hosts failed, see report above"

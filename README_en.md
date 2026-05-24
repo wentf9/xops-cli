@@ -24,6 +24,7 @@ Beyond standard SSH and batch execution, XOps natively integrates the **Model Co
 - 🤖 **AI-Native (MCP Server)**: Built-in Model Context Protocol server with security guardrails, risk assessment, and policy controls. Let AI Agents manage your servers safely.
 - 🛡️ **Advanced SSH & TUI**: Fully OpenSSH-compatible (JumpHosts, Tunnels, Agent Forwarding). Includes a beautiful **Terminal UI (TUI)** for interactive management and an automated `sudo` mode.
 - ⚡ **Batch Execution & Transfer**: Run commands or local scripts in parallel across multiple servers using tags. Effortless file distribution with built-in SCP/SFTP.
+- 🔄 **Declarative Orchestration (Playbook)**: YAML-based task orchestration combining shell, script, copy, ensure (idempotent state convergence), and template steps, with concurrency control and error handling strategies.
 - 🗂️ **Encrypted Inventory**: Manage hosts, credentials (Identities), and tags with AES encryption. Supports bulk import/export via CSV.
 - 🌐 **Network & Sec Tools**: Integrated DNS lookup, Ping, Netcat (nc), Base64/Hex encoding, and a unified **Firewall Manager** (supports firewalld, ufw, iptables, nftables).
 - 🌍 **Built-in i18n**: Native support for English and Simplified Chinese.
@@ -82,7 +83,48 @@ xops exec --tag web --shell ./setup.sh --task 5
 xops scp ./config.conf --tag web --dest /etc/app/
 ```
 
-#### 4. AI & MCP Integration (Empower your AI Agent)
+#### 4. Declarative Orchestration (Playbook)
+You can write YAML-formatted Playbooks to execute complex, multi-stage deployment workflows. It supports shell, script, copy, ensure (idempotent state convergence), and template actions.
+
+Example Playbook `deploy.yaml`:
+```yaml
+name: deploy-web
+targets:
+  tags: [web]
+settings:
+  concurrency: 2
+  on_error: stop
+vars:
+  app_port: "8080"
+steps:
+  - name: "install nginx"
+    ensure:
+      check: "nginx -v"
+      action: "apt-get install -y nginx"
+    sudo: true
+  - name: "render and distribute configuration"
+    template:
+      src: "./nginx.conf.tmpl"
+      dest: "/etc/nginx/nginx.conf"
+    sudo: true
+  - name: "start nginx service"
+    shell: "systemctl start nginx"
+    sudo: true
+```
+
+Run a Playbook:
+```bash
+# Run a Playbook and override/inject variables
+xops play deploy.yaml --var app_port=8081
+
+# Preview tasks without execution (Dry Run)
+xops play deploy.yaml --dry-run
+
+# Limit execution to specific host nodes
+xops play deploy.yaml --limit web-01
+```
+
+#### 5. AI & MCP Integration (Empower your AI Agent)
 XOps features a built-in **Model Context Protocol (MCP)** server, allowing AI assistants like **Claude** to explore and manage your infrastructure under your control.
 
 **A. Start MCP Server:**
@@ -108,7 +150,7 @@ Add the following to your `claude_desktop_config.json` to let Claude use XOps:
 - **Policy Control**: Supports "Audit-only" or "Manual Approval" modes.
 - **Audit Logs**: Full transparency on what the AI is doing on your servers.
 
-#### 5. AI Agent Skill Integration
+#### 6. AI Agent Skill Integration
 XOps comes with an out-of-the-box AI Agent Skill, empowering your terminal-based AI assistant with robust server management and troubleshooting capabilities.
 
 > [!CAUTION]

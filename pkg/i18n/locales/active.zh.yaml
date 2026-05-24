@@ -793,3 +793,49 @@ tui_log_stream_footer:
   other: "\n按 '/' 搜索, 'f' 切换过滤, 'h' 切换高亮, 'q' 或 'Esc' 退出。"
 tui_log_search_prompt:
   other: "搜索关键字: "
+
+# ---- play (playbook) ----
+play_short:
+  other: "执行声明式编排任务 (Playbook)"
+play_long:
+  other: "从 YAML 文件加载并执行声明式编排任务 (Playbook)。\n\n支持多步骤顺序执行和多主机并行执行，步骤类型包括：\n  shell    — 在远程主机执行命令\n  script   — 上传并执行本地脚本文件\n  copy     — 上传本地文件到远程主机\n  ensure   — 幂等性状态收敛：先检查，不满足时执行修复\n  template — 渲染 Go 模板后上传\n\n用法示例:\n  xops play deploy.yaml\n  xops play deploy.yaml --var version=2.1.0 --var env=prod\n  xops play deploy.yaml --concurrency 5\n  xops play deploy.yaml --dry-run\n  xops play deploy.yaml --limit web-1,web-2\n  xops play deploy                    # 从 ~/.xops/playbooks/ 按名称查找"
+flag_play_var:
+  other: "覆盖或追加变量，格式: key=value（可多次指定）"
+flag_play_concurrency:
+  other: "最大并发主机数（覆盖 Playbook settings.concurrency）"
+flag_play_dry_run:
+  other: "仅解析并预览 Playbook 步骤，不实际执行"
+flag_play_limit:
+  other: "限制执行的目标节点（逗号分隔的节点名，覆盖 Playbook targets）"
+flag_play_sudo:
+  other: "强制全局提权执行（覆盖 Playbook settings.sudo）"
+play_loading:
+  other: "正在加载 Playbook: {{.Path}}"
+play_target_resolved:
+  other: "已解析 {{.Count}} 台目标主机"
+play_step_running:
+  other: "[{{.Host}}] ▶ 执行步骤: {{.Step}}"
+play_step_ok:
+  other: "[{{.Host}}] ✅ {{.Step}}"
+play_step_changed:
+  other: "[{{.Host}}] 🔄 {{.Step}} (已变更)"
+play_step_skipped:
+  other: "[{{.Host}}] ⏭️  {{.Step}} (已满足，跳过)"
+play_step_failed:
+  other: "[{{.Host}}] ❌ {{.Step}}: {{.Error}}"
+play_dry_run:
+  other: "Dry Run 模式 — 仅预览，不实际执行"
+play_connect_failed:
+  other: "[{{.Host}}] 连接失败: {{.Error}}"
+play_warn_tag_empty:
+  other: "标签 '{{.Tag}}' 下没有找到任何节点"
+play_err_no_file:
+  other: "未指定 Playbook 文件"
+play_err_parse:
+  other: "解析 Playbook 失败"
+play_err_no_targets:
+  other: "未找到匹配的目标主机，请检查 targets 配置"
+play_err_node_not_found:
+  other: "节点 '{{.Node}}' 不存在，请检查节点名称或先通过 xops host 命令添加"
+play_err_some_failed:
+  other: "部分主机执行失败，详见上方报告"
