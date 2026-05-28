@@ -4,9 +4,10 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"os"
 	"sync"
 	"time"
+
+	"github.com/wentf9/xops-cli/pkg/logger"
 )
 
 const udpSessionTimeout = 60 * time.Second
@@ -62,7 +63,7 @@ func (f *UDPForwarder) Run(ctx context.Context) error {
 
 	go f.reapSessions(derivedCtx)
 
-	fmt.Fprintf(os.Stderr, "[forward] UDP %s -> %s\n", f.listenAddr, f.targetAddr)
+	logger.Infof("UDP %s -> %s", f.listenAddr, f.targetAddr)
 
 	buf := make([]byte, 64*1024)
 	for {
@@ -91,7 +92,7 @@ func (f *UDPForwarder) forward(listener *net.UDPConn, clientAddr, targetAddr *ne
 		upstream, err := net.DialUDP("udp", nil, targetAddr)
 		if err != nil {
 			f.mu.Unlock()
-			fmt.Fprintf(os.Stderr, "[forward] UDP dial %s failed: %v\n", targetAddr, err)
+			logger.Warnf("UDP dial %s failed: %v", targetAddr, err)
 			return
 		}
 		sess = &udpSession{upstream: upstream, lastSeen: time.Now()}
@@ -105,7 +106,7 @@ func (f *UDPForwarder) forward(listener *net.UDPConn, clientAddr, targetAddr *ne
 
 	_, err := sess.upstream.Write(data)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[forward] UDP write to target failed: %v\n", err)
+		logger.Warnf("UDP write to target failed: %v", err)
 	}
 }
 

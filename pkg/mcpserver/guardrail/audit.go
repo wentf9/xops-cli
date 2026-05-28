@@ -2,12 +2,13 @@ package guardrail
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/wentf9/xops-cli/pkg/logger"
 )
 
 // AuditEntry is a single line in the audit log.
@@ -44,7 +45,7 @@ func (a *AuditLogger) Log(entry AuditEntry) {
 
 	data, err := json.Marshal(entry)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "audit logger: failed to marshal audit entry: %v\n", err)
+		logger.Warnf("audit logger: failed to marshal audit entry: %v", err)
 		return
 	}
 	data = append(data, '\n')
@@ -57,13 +58,13 @@ func (a *AuditLogger) Log(entry AuditEntry) {
 
 	f, err := os.OpenFile(a.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "audit logger: failed to open log file '%s': %v\n", a.path, err)
+		logger.Warnf("audit logger: failed to open log file '%s': %v", a.path, err)
 		return
 	}
 	defer func() { _ = f.Close() }()
 
 	if _, err := f.Write(data); err != nil {
-		fmt.Fprintf(os.Stderr, "audit logger: failed to write log: %v\n", err)
+		logger.Warnf("audit logger: failed to write log: %v", err)
 	}
 }
 

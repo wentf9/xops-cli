@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"sync"
+	"time"
+
+	"github.com/wentf9/xops-cli/pkg/logger"
 )
 
 // TCPForwarder listens on a local TCP address and forwards connections to a target address.
@@ -38,7 +40,7 @@ func (f *TCPForwarder) Run(ctx context.Context) error {
 		_ = listener.Close()
 	}()
 
-	fmt.Fprintf(os.Stderr, "[forward] TCP %s -> %s\n", f.listenAddr, f.targetAddr)
+	logger.Infof("TCP %s -> %s", f.listenAddr, f.targetAddr)
 
 	for {
 		conn, err := listener.Accept()
@@ -57,12 +59,30 @@ func (f *TCPForwarder) Run(ctx context.Context) error {
 func (f *TCPForwarder) handle(src net.Conn) {
 	defer func() { _ = src.Close() }()
 
-	dst, err := net.Dial("tcp", f.targetAddr)
+	if tcpConn, ok := src.(*net.TCPConn); ok {
+		if err := tcpConn.SetKeepAlive(true); err != nil {
+			logger.Warnf("failed to set keepalive on src: %v", err)
+		}
+		if err := tcpConn.SetKeepAlivePeriod(30 * time.Second); err != nil {
+			logger.Warnf("failed to set keepalive period on src: %v", err)
+		}
+	}
+
+	dst, err := net.DialTimeout("tcp", f.targetAddr, 10*time.Second)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[forward] TCP dial %s failed: %v\n", f.targetAddr, err)
+		logger.Warnf("TCP dial %s failed: %v", f.targetAddr, err)
 		return
 	}
 	defer func() { _ = dst.Close() }()
+
+	if tcpConn, ok := dst.(*net.TCPConn); ok {
+		if err := tcpConn.SetKeepAlive(true); err != nil {
+			logger.Warnf("failed to set keepalive on dst: %v", err)
+		}
+		if err := tcpConn.SetKeepAlivePeriod(30 * time.Second); err != nil {
+			logger.Warnf("failed to set keepalive period on dst: %v", err)
+		}
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)

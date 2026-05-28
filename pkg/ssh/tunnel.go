@@ -2,11 +2,12 @@ package ssh
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net"
-	"os"
 	"sync"
+	"time"
+
+	"github.com/wentf9/xops-cli/pkg/logger"
 )
 
 // LocalForward starts local port forwarding.
@@ -40,7 +41,7 @@ func (c *Client) handleLocalForward(localConn net.Conn, remoteAddr string) {
 
 	remoteConn, err := c.sshClient.Dial("tcp", remoteAddr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Local forwarding failed to dial remote %s: %v\n", remoteAddr, err)
+		logger.Warnf("local forwarding failed to dial remote %s: %v", remoteAddr, err)
 		return
 	}
 	defer func() { _ = remoteConn.Close() }()
@@ -77,9 +78,9 @@ func (c *Client) RemoteForward(ctx context.Context, remoteAddr, localAddr string
 func (c *Client) handleRemoteForward(remoteConn net.Conn, localAddr string) {
 	defer func() { _ = remoteConn.Close() }()
 
-	localConn, err := net.Dial("tcp", localAddr)
+	localConn, err := net.DialTimeout("tcp", localAddr, 5*time.Second)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Remote forwarding failed to dial local %s: %v\n", localAddr, err)
+		logger.Warnf("remote forwarding failed to dial local %s: %v", localAddr, err)
 		return
 	}
 	defer func() { _ = localConn.Close() }()
@@ -88,6 +89,23 @@ func (c *Client) handleRemoteForward(remoteConn net.Conn, localAddr string) {
 }
 
 func (c *Client) copyStream(conn1, conn2 net.Conn) {
+	if tcpConn, ok := conn1.(*net.TCPConn); ok {
+		if err := tcpConn.SetKeepAlive(true); err != nil {
+			logger.Warnf("tunnel: failed to set keepalive on conn1: %v", err)
+		}
+		if err := tcpConn.SetKeepAlivePeriod(30 * time.Second); err != nil {
+			logger.Warnf("tunnel: failed to set keepalive period on conn1: %v", err)
+		}
+	}
+	if tcpConn, ok := conn2.(*net.TCPConn); ok {
+		if err := tcpConn.SetKeepAlive(true); err != nil {
+			logger.Warnf("tunnel: failed to set keepalive on conn2: %v", err)
+		}
+		if err := tcpConn.SetKeepAlivePeriod(30 * time.Second); err != nil {
+			logger.Warnf("tunnel: failed to set keepalive period on conn2: %v", err)
+		}
+	}
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
