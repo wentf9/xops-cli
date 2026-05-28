@@ -1,4 +1,4 @@
-# 🚀 XOps CLI 
+# 🚀 XOps CLI
 
 <div align="center">
   <h3>A Next-Generation, AI-Ready IT Operations Toolkit</h3>
@@ -15,7 +15,7 @@
 
 ---
 
-**XOps CLI** is a powerful, modern CLI toolkit written in Go, designed to streamline and automate daily server management and IT operations. 
+**XOps CLI** is a powerful, modern CLI toolkit written in Go, designed to streamline and automate daily server management and IT operations.
 
 Beyond standard SSH and batch execution, XOps natively integrates the **Model Context Protocol (MCP)**, allowing AI Agents (like Claude) to directly interact with your infrastructure securely. It is the perfect bridge between AI assistants and your servers.
 
@@ -43,6 +43,7 @@ make build
 ### 🚀 Quick Start
 
 #### 1. Inventory & Tags
+
 ```bash
 # Import hosts from CSV and tag them as 'web'
 xops loadHost hosts.csv -t web
@@ -56,6 +57,7 @@ xops host tags
 ```
 
 #### 2. SSH & TUI
+
 ```bash
 # Launch interactive TUI
 xops tui
@@ -72,6 +74,7 @@ xops ssh --sudo web-01
 ```
 
 #### 3. Batch Execution & File Transfer
+
 ```bash
 # Execute 'uptime' on all 'web' servers
 xops exec --tag web -c "uptime"
@@ -84,9 +87,11 @@ xops scp ./config.conf --tag web --dest /etc/app/
 ```
 
 #### 4. Declarative Orchestration (Playbook)
+
 You can write YAML-formatted Playbooks to execute complex, multi-stage deployment workflows. It supports shell, script, copy, ensure (idempotent state convergence), and template actions.
 
 Example Playbook `deploy.yaml`:
+
 ```yaml
 name: deploy-web
 targets:
@@ -113,6 +118,7 @@ steps:
 ```
 
 Run a Playbook:
+
 ```bash
 # Run a Playbook and override/inject variables
 xops play deploy.yaml --var app_port=8081
@@ -125,15 +131,18 @@ xops play deploy.yaml --limit web-01
 ```
 
 #### 5. AI & MCP Integration (Empower your AI Agent)
+
 XOps features a built-in **Model Context Protocol (MCP)** server, allowing AI assistants like **Claude** to explore and manage your infrastructure under your control.
 
 **A. Start MCP Server:**
+
 ```bash
 xops mcp serve
 ```
 
 **B. Example: Configure Claude Desktop**
 Add the following to your `claude_desktop_config.json` to let Claude use XOps:
+
 ```json
 {
   "mcpServers": {
@@ -146,11 +155,13 @@ Add the following to your `claude_desktop_config.json` to let Claude use XOps:
 ```
 
 **C. Security & Guardrails:**
+
 - **Risk Analysis**: Automatically detects high-risk commands (e.g., `rm -rf /`).
 - **Policy Control**: Supports "Audit-only" or "Manual Approval" modes.
 - **Audit Logs**: Full transparency on what the AI is doing on your servers.
 
 #### 6. AI Agent Skill Integration
+
 XOps comes with an out-of-the-box AI Agent Skill, empowering your terminal-based AI assistant with robust server management and troubleshooting capabilities.
 
 > [!CAUTION]
@@ -160,11 +171,13 @@ XOps comes with an out-of-the-box AI Agent Skill, empowering your terminal-based
 Because different AI agents (Claude Code, Gemini CLI, etc.) use different skill installation directories, please use the generic `npx skills` tool for a standalone skill installation.
 
 First, ensure you have installed the XOps CLI:
+
 ```bash
 curl -sSL https://raw.githubusercontent.com/wentf9/xops-cli/master/install.sh | bash
 ```
 
 Then, run the following command to install the AI extension skill:
+
 ```bash
 npx skills add https://github.com/wentf9/xops-cli/master/skills/xops-agent
 ```

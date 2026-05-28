@@ -7,6 +7,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	cmdutil "github.com/wentf9/xops-cli/cmd/utils"
@@ -27,7 +29,11 @@ type Connector struct {
 	clients *concurrent.Map[string, *ssh.Client]
 	// singleflight 组，用来控制并发和去重
 	sf singleflight.Group
+	// 自动接受新的主机密钥
+	AcceptNewHostKey atomic.Bool
 }
+
+var hostKeyPromptMutex sync.Mutex
 
 // NewConnector 创建一个新的 Connector
 func NewConnector(cfg config.ConfigProvider) *Connector {
@@ -221,23 +227,11 @@ func (c *Connector) buildSSHConfig(id *models.Identity, hostAddr string) (*ssh.C
 		authMethods = append(authMethods, ssh.Password(id.Password))
 
 	case "key":
-		if id.KeyPath == "" {
-			return nil, nil, fmt.Errorf("auth type is key but key_path is empty")
-		}
-		keyBytes, err := os.ReadFile(expandHomeDir(id.KeyPath))
+		authMethod, err := buildKeyAuthMethod(id)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to read key file: %w", err)
+			return nil, nil, err
 		}
-		var signer ssh.Signer
-		if id.Passphrase != "" {
-			signer, err = ssh.ParsePrivateKeyWithPassphrase(keyBytes, []byte(id.Passphrase))
-		} else {
-			signer, err = ssh.ParsePrivateKey(keyBytes)
-		}
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to parse private key: %w", err)
-		}
-		authMethods = append(authMethods, ssh.PublicKeys(signer))
+		authMethods = append(authMethods, authMethod)
 
 	case "agent":
 		socket := os.Getenv("SSH_AUTH_SOCK")
@@ -256,12 +250,40 @@ func (c *Connector) buildSSHConfig(id *models.Identity, hostAddr string) (*ssh.C
 		return nil, nil, fmt.Errorf("unsupported auth type: %s", id.AuthType)
 	}
 
+	hostKeyCallback, err := c.getHostKeyCallback()
+	if err != nil {
+		if cleanup != nil {
+			cleanup()
+		}
+		return nil, nil, fmt.Errorf("get host key callback failed: %w", err)
+	}
+
 	return &ssh.ClientConfig{
 		User:            id.User,
 		Auth:            authMethods,
-		HostKeyCallback: getHostKeyCallback(),
+		HostKeyCallback: hostKeyCallback,
 		Timeout:         15 * time.Second,
 	}, cleanup, nil
+}
+
+func buildKeyAuthMethod(id *models.Identity) (ssh.AuthMethod, error) {
+	if id.KeyPath == "" {
+		return nil, fmt.Errorf("auth type is key but key_path is empty")
+	}
+	keyBytes, err := os.ReadFile(expandHomeDir(id.KeyPath))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read key file: %w", err)
+	}
+	var signer ssh.Signer
+	if id.Passphrase != "" {
+		signer, err = ssh.ParsePrivateKeyWithPassphrase(keyBytes, []byte(id.Passphrase))
+	} else {
+		signer, err = ssh.ParsePrivateKey(keyBytes)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse private key: %w", err)
+	}
+	return ssh.PublicKeys(signer), nil
 }
 
 // expandHomeDir 简单的路径处理辅助函数
@@ -275,21 +297,25 @@ func expandHomeDir(path string) string {
 	return path
 }
 
-func getHostKeyCallback() ssh.HostKeyCallback {
+func (c *Connector) getHostKeyCallback() (ssh.HostKeyCallback, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return ssh.InsecureIgnoreHostKey()
+		return nil, fmt.Errorf("get user home dir failed: %w", err)
 	}
 	knownHostsFile := filepath.Join(home, ".ssh", "known_hosts")
 
 	if _, err := os.Stat(knownHostsFile); os.IsNotExist(err) {
-		_ = os.MkdirAll(filepath.Dir(knownHostsFile), 0700)
-		_ = os.WriteFile(knownHostsFile, []byte(""), 0600)
+		if mkdirErr := os.MkdirAll(filepath.Dir(knownHostsFile), 0700); mkdirErr != nil {
+			return nil, fmt.Errorf("create .ssh directory failed: %w", mkdirErr)
+		}
+		if writeErr := os.WriteFile(knownHostsFile, []byte(""), 0600); writeErr != nil {
+			return nil, fmt.Errorf("create known_hosts file failed: %w", writeErr)
+		}
 	}
 
 	hostKeyCallback, err := knownhosts.New(knownHostsFile)
 	if err != nil {
-		return ssh.InsecureIgnoreHostKey()
+		return nil, fmt.Errorf("parse known_hosts file failed: %w", err)
 	}
 
 	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
@@ -298,8 +324,7 @@ func getHostKeyCallback() ssh.HostKeyCallback {
 			return nil
 		}
 
-		var keyErr *knownhosts.KeyError
-		if errors.As(err, &keyErr) {
+		if keyErr, ok := errors.AsType[*knownhosts.KeyError](err); ok {
 			if len(keyErr.Want) > 0 {
 				fmt.Printf("\n@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n" +
 					"@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n" +
@@ -308,27 +333,62 @@ func getHostKeyCallback() ssh.HostKeyCallback {
 				return err
 			}
 
-			// Unknown host
-			fmt.Printf("The authenticity of host '%s' can't be established.\n", hostname)
-			fingerprint := ssh.FingerprintSHA256(key)
-			fmt.Printf("%s key fingerprint is %s.\n", key.Type(), fingerprint)
-			fmt.Print("Are you sure you want to continue connecting (yes/no/[fingerprint])? ")
-
-			var response string
-			_, _ = fmt.Scanln(&response)
-			if response != "yes" && response != fingerprint {
-				return fmt.Errorf("host key verification failed")
+			if promptErr := c.promptHostKeyVerification(hostname, key); promptErr != nil {
+				return promptErr
 			}
 
-			// Append to known_hosts
-			f, err := os.OpenFile(knownHostsFile, os.O_APPEND|os.O_WRONLY, 0600)
-			if err == nil {
-				defer func() { _ = f.Close() }()
-				line := knownhosts.Line([]string{knownhosts.Normalize(hostname)}, key)
-				_, _ = f.WriteString(line + "\n")
-			}
-			return nil
+			return appendKnownHost(knownHostsFile, hostname, key)
 		}
 		return err
+	}, nil
+}
+
+func (c *Connector) promptHostKeyVerification(hostname string, key ssh.PublicKey) error {
+	if c.AcceptNewHostKey.Load() {
+		return nil
 	}
+
+	hostKeyPromptMutex.Lock()
+	defer hostKeyPromptMutex.Unlock()
+
+	// Double check after acquiring lock
+	if c.AcceptNewHostKey.Load() {
+		return nil
+	}
+
+	fmt.Printf("The authenticity of host '%s' can't be established.\n", hostname)
+	fingerprint := ssh.FingerprintSHA256(key)
+	fmt.Printf("%s key fingerprint is %s.\n", key.Type(), fingerprint)
+	fmt.Print("Are you sure you want to continue connecting (yes/no/all/[fingerprint])? ")
+
+	var response string
+	_, scanErr := fmt.Scanln(&response)
+	if scanErr != nil && scanErr.Error() != "unexpected newline" && scanErr.Error() != "EOF" {
+		return fmt.Errorf("read response failed: %w", scanErr)
+	}
+
+	if response == "all" {
+		c.AcceptNewHostKey.Store(true)
+	} else if response != "yes" && response != fingerprint {
+		return fmt.Errorf("host key verification failed")
+	}
+
+	return nil
+}
+
+func appendKnownHost(knownHostsFile, hostname string, key ssh.PublicKey) error {
+	hostKeyPromptMutex.Lock()
+	defer hostKeyPromptMutex.Unlock()
+
+	f, err := os.OpenFile(knownHostsFile, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return fmt.Errorf("open known_hosts file failed: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	line := knownhosts.Line([]string{knownhosts.Normalize(hostname)}, key)
+	if _, writeErr := f.WriteString(line + "\n"); writeErr != nil {
+		return fmt.Errorf("write known_hosts file failed: %w", writeErr)
+	}
+	return nil
 }

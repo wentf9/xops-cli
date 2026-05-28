@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
@@ -65,15 +66,21 @@ func ExecuteLoadHost(hosts []utils.HostInfo) error {
 	}
 	provider := config.NewProvider(cfg)
 	connector := ssh.NewConnector(provider)
+	// 批量导入时默认接受新的主机密钥，避免并发时大量询问
+	connector.AcceptNewHostKey.Store(true)
 	defer connector.CloseAll()
 
 	ctx := context.Background()
 	wp := pkgutils.NewWorkerPool(uint(len(hosts)))
+	var nodeMu sync.Mutex
 
 	for _, host := range hosts {
 		h := host // capture
 		wp.Execute(func() {
+			nodeMu.Lock()
 			nodeID, _, err := getOrCreateNode(provider, h)
+			nodeMu.Unlock()
+
 			if err != nil {
 				logger.PrintError(i18n.Tf("load_config_generate_failed", map[string]any{"Host": h.Host, "Error": err}))
 				return
