@@ -90,7 +90,7 @@ func (c *Client) RunInteractiveWithSudo(ctx context.Context, command string) err
 
 	oldState, err := term.MakeRaw(fdIn)
 	if err != nil {
-		return fmt.Errorf("can not set term to Raw: %w", err)
+		return fmt.Errorf("cannot set terminal to raw: %w", err)
 	}
 	defer func() { _ = term.Restore(fdIn, oldState) }()
 
@@ -275,12 +275,12 @@ func (c *Client) ShellWithSudo(ctx context.Context) error {
 	stderr, _ := session.StderrPipe()
 
 	if err := session.Shell(); err != nil {
-		return fmt.Errorf("start Shell failed: %w", err)
+		return fmt.Errorf("failed to start shell: %w", err)
 	}
 
 	oldState, err := term.MakeRaw(fdIn)
 	if err != nil {
-		return fmt.Errorf("can not set term to Raw : %w", err)
+		return fmt.Errorf("cannot set terminal to raw: %w", err)
 	}
 	defer func() { _ = term.Restore(fdIn, oldState) }()
 

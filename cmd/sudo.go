@@ -59,8 +59,7 @@ func newCmdSudo() *cobra.Command {
 			}
 
 			if err != nil {
-				logger.PrintError(i18n.Tf("sudo_exec_failed", map[string]any{"Error": err}))
-				return nil
+				return fmt.Errorf("%s", i18n.Tf("sudo_exec_failed", map[string]any{"Error": err}))
 			}
 
 			// 4. 执行成功后，如果是手动输入的密码，保存到配置文件

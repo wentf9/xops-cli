@@ -9,7 +9,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/models"
@@ -164,29 +163,19 @@ func (c *Client) Shell(ctx context.Context) error {
 
 	// 启动 Shell
 	if err := session.Shell(); err != nil {
-		return fmt.Errorf("start Shell failed: %w", err)
+		return fmt.Errorf("failed to start shell: %w", err)
 	}
 
 	// 设置本地终端为 Raw 模式
 	oldState, err := term.MakeRaw(fdIn)
 	if err != nil {
-		return fmt.Errorf("can not set term to Raw : %w", err)
+		return fmt.Errorf("cannot set terminal to raw: %w", err)
 	}
 	defer func() { _ = term.Restore(fdIn, oldState) }()
-	// ================= Windows 窗口大小自适应 =================
-	go func() {
-		lastW, lastH := width, height
-		ticker := time.NewTicker(1 * time.Second)
-		defer ticker.Stop()
 
-		for range ticker.C {
-			currW, currH, _ := term.GetSize(fdOut)
-			if currW != lastW || currH != lastH {
-				_ = session.WindowChange(currH, currW)
-				lastW, lastH = currW, currH
-			}
-		}
-	}()
+	derivedCtx, cancelResize := context.WithCancel(ctx)
+	defer cancelResize()
+	startWindowResizeLoop(derivedCtx, session, fdOut, width, height)
 	go func() { _, _ = io.Copy(os.Stdout, stdout) }()
 	go func() { _, _ = io.Copy(os.Stderr, stderr) }()
 
@@ -241,7 +230,7 @@ func (c *Client) RunInteractive(ctx context.Context, cmd string) error {
 
 	oldState, err := term.MakeRaw(fdIn)
 	if err != nil {
-		return fmt.Errorf("can not set term to Raw: %w", err)
+		return fmt.Errorf("cannot set terminal to raw: %w", err)
 	}
 	defer func() { _ = term.Restore(fdIn, oldState) }()
 
@@ -301,7 +290,7 @@ func (c *Client) RunInteractiveCmd(ctx context.Context, cmd string) error {
 
 	oldState, err := term.MakeRaw(fdIn)
 	if err != nil {
-		return fmt.Errorf("can not set term to Raw: %w", err)
+		return fmt.Errorf("cannot set terminal to raw: %w", err)
 	}
 	defer func() { _ = term.Restore(fdIn, oldState) }()
 

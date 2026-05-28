@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"sync"
 
@@ -36,16 +37,16 @@ func (s *defaultStore) Load() (*Configuration, error) {
 	}
 	// 2. yaml.Unmarshal
 	if err = yaml.Unmarshal(data, &config); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to unmarshal configuration: %w", err)
 	}
 	// 3. 初始化 Crypter 并解密敏感字段
 	key, err := crypto.LoadOrGenerateKey(s.KeyPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to load or generate decryption key: %w", err)
 	}
 	crypter, err := crypto.NewCrypter(key)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to initialize decrypter: %w", err)
 	}
 	migratedIdentities := decryptIdentities(crypter, &config)
 	migratedNodes := decryptNodes(crypter, &config)
@@ -114,11 +115,11 @@ func (s *defaultStore) Save(cfg *Configuration) error {
 	// 初始化 Crypter
 	key, err := crypto.LoadOrGenerateKey(s.KeyPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to load or generate encryption key: %w", err)
 	}
 	crypter, err := crypto.NewCrypter(key)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to initialize encrypter: %w", err)
 	}
 
 	// 加密敏感字段，记录原始值，序列化后立即恢复（防止内存被污染）
@@ -132,9 +133,12 @@ func (s *defaultStore) Save(cfg *Configuration) error {
 	restoreNodes(cfg, origSuPwds)
 
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to marshal configuration: %w", err)
 	}
-	return file.CreateFileRecursive(s.Path, data, 0600)
+	if err := file.CreateFileRecursive(s.Path, data, 0600); err != nil {
+		return fmt.Errorf("failed to write configuration file to %s: %w", s.Path, err)
+	}
+	return nil
 }
 
 func encryptIdentities(crypter *crypto.Crypter, cfg *Configuration) (origPasswords, origPassphrases map[string]string) {

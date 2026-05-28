@@ -2,6 +2,7 @@ package guardrail
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,6 +44,7 @@ func (a *AuditLogger) Log(entry AuditEntry) {
 
 	data, err := json.Marshal(entry)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "audit logger: failed to marshal audit entry: %v\n", err)
 		return
 	}
 	data = append(data, '\n')
@@ -55,10 +57,14 @@ func (a *AuditLogger) Log(entry AuditEntry) {
 
 	f, err := os.OpenFile(a.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "audit logger: failed to open log file '%s': %v\n", a.path, err)
 		return
 	}
 	defer func() { _ = f.Close() }()
-	_, _ = f.Write(data)
+
+	if _, err := f.Write(data); err != nil {
+		fmt.Fprintf(os.Stderr, "audit logger: failed to write log: %v\n", err)
+	}
 }
 
 func expandHome(path string) string {
