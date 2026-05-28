@@ -90,6 +90,7 @@ func (c *Client) RunScript(ctx context.Context, scriptContent string) (string, e
 type streamReader struct {
 	io.ReadCloser
 	session *ssh.Session
+	cancel  context.CancelFunc
 }
 
 func (s *streamReader) Read(p []byte) (int, error) {
@@ -97,6 +98,7 @@ func (s *streamReader) Read(p []byte) (int, error) {
 }
 
 func (s *streamReader) Close() error {
+	s.cancel()
 	err := s.ReadCloser.Close()
 	_ = s.session.Close() // 强制关闭 session
 	return err
@@ -122,13 +124,15 @@ func (c *Client) RunStream(ctx context.Context, cmd string) (io.ReadCloser, erro
 		return nil, err
 	}
 
+	derivedCtx, cancel := context.WithCancel(ctx)
+
 	// 监听 Context 自动关闭
 	go func() {
-		<-ctx.Done()
+		<-derivedCtx.Done()
 		_ = session.Close()
 	}()
 
-	return &streamReader{ReadCloser: io.NopCloser(stdout), session: session}, nil
+	return &streamReader{ReadCloser: io.NopCloser(stdout), session: session, cancel: cancel}, nil
 }
 
 func (c *Client) Shell(ctx context.Context) error {
@@ -241,7 +245,9 @@ func (c *Client) RunInteractive(ctx context.Context, cmd string) error {
 	}
 	defer func() { _ = term.Restore(fdIn, oldState) }()
 
-	startWindowResizeLoop(session, fdOut, width, height)
+	derivedCtx, cancelResize := context.WithCancel(ctx)
+	defer cancelResize()
+	startWindowResizeLoop(derivedCtx, session, fdOut, width, height)
 
 	// 使用交互式 Shell 获取完整的终端控制权 (支持基于 TTY 的程序如 top/vim 接收按键信号)
 	// 使用 exec 替换当前交互式 Shell，并在完成后自动结束 SSH 会话
@@ -299,7 +305,9 @@ func (c *Client) RunInteractiveCmd(ctx context.Context, cmd string) error {
 	}
 	defer func() { _ = term.Restore(fdIn, oldState) }()
 
-	startWindowResizeLoop(session, fdOut, width, height)
+	derivedCtx, cancelResize := context.WithCancel(ctx)
+	defer cancelResize()
+	startWindowResizeLoop(derivedCtx, session, fdOut, width, height)
 
 	go func() { _, _ = io.Copy(os.Stdout, stdout) }()
 	go func() { _, _ = io.Copy(os.Stderr, stderr) }()

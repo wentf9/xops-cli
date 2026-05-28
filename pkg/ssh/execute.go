@@ -94,7 +94,9 @@ func (c *Client) RunInteractiveWithSudo(ctx context.Context, command string) err
 	}
 	defer func() { _ = term.Restore(fdIn, oldState) }()
 
-	startWindowResizeLoop(session, fdOut, width, height)
+	derivedCtx, cancelResize := context.WithCancel(ctx)
+	defer cancelResize()
+	startWindowResizeLoop(derivedCtx, session, fdOut, width, height)
 
 	sudoCmd, password := c.getSudoParams()
 	// 使用 exec 替换掉普通用户的 shell，使得提权退出后直接关闭 SSH 会话
@@ -185,7 +187,7 @@ func (c *Client) runWithSu(command string, password string) (string, error) {
 	}
 
 	var outputBuf bytes.Buffer
-	passwordPromptFound := make(chan bool)
+	passwordPromptFound := make(chan bool, 1)
 
 	go processSuOutputForPassword(stdout, passwordPromptFound, &outputBuf)
 
@@ -282,7 +284,9 @@ func (c *Client) ShellWithSudo(ctx context.Context) error {
 	}
 	defer func() { _ = term.Restore(fdIn, oldState) }()
 
-	startWindowResizeLoop(session, fdOut, width, height)
+	derivedCtx, cancelResize := context.WithCancel(ctx)
+	defer cancelResize()
+	startWindowResizeLoop(derivedCtx, session, fdOut, width, height)
 
 	sudoCmd, password := c.getSudoParams()
 	_, _ = stdin.Write([]byte(sudoCmd + "\n"))
@@ -342,17 +346,22 @@ func (c *Client) getSudoParams() (string, string) {
 	}
 }
 
-func startWindowResizeLoop(session *ssh.Session, fdOut, width, height int) {
+func startWindowResizeLoop(ctx context.Context, session *ssh.Session, fdOut, width, height int) {
 	go func() {
 		lastW, lastH := width, height
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 
-		for range ticker.C {
-			currW, currH, _ := term.GetSize(fdOut)
-			if currW != lastW || currH != lastH {
-				_ = session.WindowChange(currH, currW)
-				lastW, lastH = currW, currH
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				currW, currH, _ := term.GetSize(fdOut)
+				if currW != lastW || currH != lastH {
+					_ = session.WindowChange(currH, currW)
+					lastW, lastH = currW, currH
+				}
 			}
 		}
 	}()
@@ -363,10 +372,10 @@ func handlePasswordHandshake(stdout io.Reader, stdin io.Writer, password string)
 	var outputHistory bytes.Buffer
 	done := make(chan struct{})
 
-	go func() {
-		time.Sleep(5 * time.Second)
+	timer := time.AfterFunc(5*time.Second, func() {
 		close(done)
-	}()
+	})
+	defer timer.Stop()
 
 HandshakeLoop:
 	for {

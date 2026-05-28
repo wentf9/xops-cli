@@ -36,10 +36,7 @@ func newMonitorModel(nodeID string, client *ssh.Client) monitorModel {
 
 func (m monitorModel) Init() tea.Cmd {
 	return func() tea.Msg {
-		ctx, cancel := context.WithCancel(context.Background())
-		// Ideally store cancel in a long-lived context holder, but we can rely on standard connection dropping on exit
-		_ = cancel
-		if err := m.collector.Start(ctx); err != nil {
+		if err := m.collector.Start(context.Background()); err != nil {
 			return monitorErrorMsg(err)
 		}
 		return m.fetchMetrics()()

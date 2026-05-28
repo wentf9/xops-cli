@@ -52,12 +52,15 @@ func (f *UDPForwarder) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to listen on %s: %w", f.listenAddr, err)
 	}
 
+	derivedCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	go func() {
-		<-ctx.Done()
+		<-derivedCtx.Done()
 		_ = listener.Close()
 	}()
 
-	go f.reapSessions(ctx)
+	go f.reapSessions(derivedCtx)
 
 	fmt.Fprintf(os.Stderr, "[forward] UDP %s -> %s\n", f.listenAddr, f.targetAddr)
 

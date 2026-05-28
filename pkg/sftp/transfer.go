@@ -264,10 +264,11 @@ type writeAtSeeker interface {
 }
 
 func (c *Client) parallelTransfer(ctx context.Context, src readAtSeeker, dst writeAtSeeker, startOffset, totalSize int64, progress ProgressCallback) error {
-	g, _ := errgroup.WithContext(ctx)
+	g, gCtx := errgroup.WithContext(ctx)
 	chunkSize := c.config.ChunkSize
 	sem := make(chan struct{}, c.config.ThreadsPerFile)
 
+Loop:
 	for offset := startOffset; offset < totalSize; offset += chunkSize {
 		currOffset := offset
 		currSize := chunkSize
@@ -275,9 +276,21 @@ func (c *Client) parallelTransfer(ctx context.Context, src readAtSeeker, dst wri
 			currSize = totalSize - currOffset
 		}
 
-		sem <- struct{}{}
+		select {
+		case sem <- struct{}{}:
+		case <-gCtx.Done():
+			break Loop
+		}
+
+		if gCtx.Err() != nil {
+			break Loop
+		}
+
 		g.Go(func() error {
 			defer func() { <-sem }()
+			if gCtx.Err() != nil {
+				return gCtx.Err()
+			}
 			buf := make([]byte, currSize)
 			n, err := src.ReadAt(buf, currOffset)
 			if err != nil && !errors.Is(err, io.EOF) {

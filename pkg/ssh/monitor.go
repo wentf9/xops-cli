@@ -134,6 +134,7 @@ type MetricsCollector struct {
 	coresCount int
 	SortBy     string // "cpu", "mem"
 	SortAsc    bool
+	cancel     context.CancelFunc
 }
 
 func NewMetricsCollector(c *Client) *MetricsCollector {
@@ -146,8 +147,11 @@ func NewMetricsCollector(c *Client) *MetricsCollector {
 }
 
 func (mc *MetricsCollector) Start(ctx context.Context) error {
-	stream, err := mc.client.RunStream(ctx, probeScript)
+	derivedCtx, cancel := context.WithCancel(ctx)
+	mc.cancel = cancel
+	stream, err := mc.client.RunStream(derivedCtx, probeScript)
 	if err != nil {
+		cancel()
 		return fmt.Errorf("failed to start stream: %w", err)
 	}
 	mc.stream = stream
@@ -156,6 +160,9 @@ func (mc *MetricsCollector) Start(ctx context.Context) error {
 }
 
 func (mc *MetricsCollector) Close() {
+	if mc.cancel != nil {
+		mc.cancel()
+	}
 	if mc.stream != nil {
 		_ = mc.stream.Close()
 	}

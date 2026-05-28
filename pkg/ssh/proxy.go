@@ -35,6 +35,12 @@ func (s *SSHProxyDialer) DialContext(ctx context.Context, network, addr string) 
 
 	select {
 	case <-ctx.Done():
+		go func() {
+			res := <-ch
+			if res.conn != nil {
+				_ = res.conn.Close()
+			}
+		}()
 		return nil, ctx.Err()
 	case res := <-ch:
 		if res.err != nil {
