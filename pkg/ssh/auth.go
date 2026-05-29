@@ -6,8 +6,6 @@ import (
 	"net"
 	"os"
 
-	cmdutil "github.com/wentf9/xops-cli/cmd/utils"
-	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
@@ -52,7 +50,7 @@ func (k *KeyAuth) GetMethod() (ssh.AuthMethod, error) {
 
 // BuildAutoAuthMethods 生成一个包含多种回退机制的 AuthMethod 链
 // passphraseCallback 在用户成功输入受密码保护的私钥密码后被调用，用于持久化
-func BuildAutoAuthMethods(user, host string, passwordCallback func(string), passphraseCallback func(keyPath, passphrase string)) ([]ssh.AuthMethod, func()) {
+func BuildAutoAuthMethods(user, host string, ui InteractionHandler, passwordCallback func(string), passphraseCallback func(keyPath, passphrase string)) ([]ssh.AuthMethod, func()) {
 	var methods []ssh.AuthMethod
 	var cleanup func()
 
@@ -90,10 +88,10 @@ func BuildAutoAuthMethods(user, host string, passwordCallback func(string), pass
 			keyDataCopy := keyData
 			keyPathCopy := keyPath
 			methods = append(methods, ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
-				passphrase, err := cmdutil.ReadPasswordFromTerminal(
-					i18n.Tf("prompt_enter_passphrase", map[string]any{"Path": keyPathCopy}))
+				prompt := fmt.Sprintf("Enter passphrase for key '%s': ", keyPathCopy)
+				passphrase, err := ui.PromptPassword(prompt)
 				if err != nil {
-					return nil, fmt.Errorf("failed to read passphrase from terminal: %w", err)
+					return nil, fmt.Errorf("failed to read passphrase: %w", err)
 				}
 				s, err := ssh.ParsePrivateKeyWithPassphrase(keyDataCopy, []byte(passphrase))
 				if err != nil {
@@ -109,9 +107,9 @@ func BuildAutoAuthMethods(user, host string, passwordCallback func(string), pass
 
 	// Password Fallback
 	methods = append(methods, ssh.RetryableAuthMethod(ssh.PasswordCallback(func() (string, error) {
-		password, err := cmdutil.ReadPasswordFromTerminal(i18n.T("prompt_enter_password"))
+		password, err := ui.PromptPassword(fmt.Sprintf("%s@%s's password: ", user, host))
 		if err != nil {
-			return "", fmt.Errorf("failed to read password from terminal: %w", err)
+			return "", fmt.Errorf("failed to read password: %w", err)
 		}
 		passwordCallback(password)
 		return password, nil

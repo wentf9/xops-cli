@@ -9,11 +9,11 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
 	"github.com/wentf9/xops-cli/pkg/models"
-	"github.com/wentf9/xops-cli/pkg/ssh"
 	pkgutils "github.com/wentf9/xops-cli/pkg/utils"
 )
 
@@ -65,7 +65,7 @@ func ExecuteLoadHost(hosts []utils.HostInfo) error {
 		return fmt.Errorf("%s", i18n.Tf("inventory_load_config_failed", map[string]any{"Error": err}))
 	}
 	provider := config.NewProvider(cfg)
-	connector := ssh.NewConnector(provider)
+	connector := adapter.NewConnector(provider)
 	// 批量导入时默认接受新的主机密钥，避免并发时大量询问
 	connector.AcceptNewHostKey.Store(true)
 	defer connector.CloseAll()

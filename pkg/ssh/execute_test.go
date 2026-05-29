@@ -5,35 +5,31 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/wentf9/xops-cli/pkg/models"
 )
 
 func TestGetSudoParams(t *testing.T) {
 	tests := []struct {
 		name        string
-		mode        models.SudoMode
+		mode        SudoMode
 		password    string
 		suPwd       string
 		expectedCmd string
 		expectedPwd string
 	}{
-		{"sudo mode", models.SudoModeSudo, "mypass", "", "sudo -i", "mypass"},
-		{"sudoer mode", models.SudoModeSudoer, "mypass", "", "sudo -i", ""},
-		{"su mode", models.SudoModeSu, "", "rootpass", "su -", "rootpass"},
-		{"root mode", models.SudoModeRoot, "", "", "", ""},
-		{"invalid mode", models.SudoMode("unknown"), "", "", "", ""},
-		{"empty mode", models.SudoModeNone, "", "", "", ""},
+		{"sudo mode", SudoModeSudo, "mypass", "", "sudo -i", "mypass"},
+		{"sudoer mode", SudoModeSudoer, "mypass", "", "sudo -i", ""},
+		{"su mode", SudoModeSu, "", "rootpass", "su -", "rootpass"},
+		{"root mode", SudoModeRoot, "", "", "", ""},
+		{"invalid mode", SudoMode("unknown"), "", "", "", ""},
+		{"empty mode", SudoModeNone, "", "", "", ""},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c := &Client{
-				node: models.Node{
+				cfg: &ClientConfig{
 					SudoMode: tt.mode,
 					SuPwd:    tt.suPwd,
-				},
-				identity: models.Identity{
 					Password: tt.password,
 				},
 			}

@@ -12,49 +12,47 @@ import (
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/term"
-
-	"github.com/wentf9/xops-cli/pkg/models"
 )
 
 func (c *Client) RunWithSudo(ctx context.Context, command string) (string, error) {
 	c.maybeDetectSudoMode(ctx)
 	wrappedCmd := fmt.Sprintf("bash -l -c '%s'", strings.ReplaceAll(command, "'", "'\\''"))
 
-	switch c.node.SudoMode {
-	case models.SudoModeRoot:
+	switch c.cfg.SudoMode {
+	case SudoModeRoot:
 		return c.Run(ctx, command)
-	case models.SudoModeSudo:
-		return c.runWithSudo(ctx, wrappedCmd, c.identity.Password, nil)
-	case models.SudoModeSudoer:
+	case SudoModeSudo:
+		return c.runWithSudo(ctx, wrappedCmd, c.cfg.Password, nil)
+	case SudoModeSudoer:
 		return c.runWithSudo(ctx, wrappedCmd, "", nil)
-	case models.SudoModeSu:
-		return c.runWithSu(ctx, command, c.node.SuPwd)
+	case SudoModeSu:
+		return c.runWithSu(ctx, command, c.cfg.SuPwd)
 	default:
-		return "", fmt.Errorf("unknown sudo mode: %s, please check config to set sudo mode", c.node.SudoMode)
+		return "", fmt.Errorf("unknown sudo mode: %s, please check config to set sudo mode", c.cfg.SudoMode)
 	}
 }
 
 // RunScriptWithSudo 提权执行脚本
 func (c *Client) RunScriptWithSudo(ctx context.Context, scriptContent string) (string, error) {
 	c.maybeDetectSudoMode(ctx)
-	switch c.node.SudoMode {
-	case models.SudoModeRoot:
+	switch c.cfg.SudoMode {
+	case SudoModeRoot:
 		return c.RunScript(ctx, scriptContent)
-	case models.SudoModeSudo:
-		return c.runWithSudo(ctx, "bash -l -s", c.identity.Password, strings.NewReader(scriptContent))
-	case models.SudoModeSudoer:
+	case SudoModeSudo:
+		return c.runWithSudo(ctx, "bash -l -s", c.cfg.Password, strings.NewReader(scriptContent))
+	case SudoModeSudoer:
 		return c.runWithSudo(ctx, "bash -l -s", "", strings.NewReader(scriptContent))
-	case models.SudoModeSu:
-		return c.runWithSu(ctx, fmt.Sprintf("bash -l -c '%s'", strings.ReplaceAll(scriptContent, "'", "'\\''")), c.node.SuPwd)
+	case SudoModeSu:
+		return c.runWithSu(ctx, fmt.Sprintf("bash -l -c '%s'", strings.ReplaceAll(scriptContent, "'", "'\\''")), c.cfg.SuPwd)
 	default:
-		return "", fmt.Errorf("unsupported sudo mode: %s", c.node.SudoMode)
+		return "", fmt.Errorf("unsupported sudo mode: %s", c.cfg.SudoMode)
 	}
 }
 
 // RunInteractiveWithSudo 在 PTY 环境下以提权方式执行单条交互式命令
 func (c *Client) RunInteractiveWithSudo(ctx context.Context, command string) error {
 	c.maybeDetectSudoMode(ctx)
-	if c.node.SudoMode == models.SudoModeRoot {
+	if c.cfg.SudoMode == SudoModeRoot {
 		return c.RunInteractive(ctx, command)
 	}
 
@@ -131,7 +129,7 @@ func (c *Client) RunInteractiveWithSudo(ctx context.Context, command string) err
 }
 
 func (c *Client) runWithSudo(ctx context.Context, command string, password string, extraStdin io.Reader) (string, error) {
-	if password == "" && c.node.SudoMode == models.SudoModeSudo {
+	if password == "" && c.cfg.SudoMode == SudoModeSudo {
 		return "", fmt.Errorf("sudo password is required but not provided")
 	}
 
@@ -252,19 +250,19 @@ func processSuOutputForPassword(stdout io.Reader, passwordPromptFound chan<- boo
 
 func (c *Client) ShellWithSudo(ctx context.Context) error {
 	c.maybeDetectSudoMode(ctx)
-	if c.node.SudoMode == models.SudoModeRoot {
+	if c.cfg.SudoMode == SudoModeRoot {
 		return c.Shell(ctx)
 	}
 
 	// none 模式明确不支持提权
-	if c.node.SudoMode == models.SudoModeNone {
+	if c.cfg.SudoMode == SudoModeNone {
 		return fmt.Errorf("privilege escalation is not supported for this host (sudo_mode=none)")
 	}
 
 	// sudo/sudoer 模式：通过 sudo -S -p '' true 预检，可靠且无副作用
 	// su 模式不做预检：su -c 会跑 root login shell 初始化脚本，脚本错误会导致误报
-	if c.node.SudoMode == models.SudoModeSudo || c.node.SudoMode == models.SudoModeSudoer {
-		if _, err := c.runWithSudo(ctx, "true", c.identity.Password, nil); err != nil {
+	if c.cfg.SudoMode == SudoModeSudo || c.cfg.SudoMode == SudoModeSudoer {
+		if _, err := c.runWithSudo(ctx, "true", c.cfg.Password, nil); err != nil {
 			return fmt.Errorf("sudo access denied: %w", err)
 		}
 	}
@@ -350,14 +348,14 @@ func ignoreShellExitError(err error) error {
 }
 
 func (c *Client) getSudoParams() (string, string) {
-	switch c.node.SudoMode {
-	case models.SudoModeSudo:
-		return "sudo -i", c.identity.Password
-	case models.SudoModeSudoer:
+	switch c.cfg.SudoMode {
+	case SudoModeSudo:
+		return "sudo -i", c.cfg.Password
+	case SudoModeSudoer:
 		return "sudo -i", ""
-	case models.SudoModeSu:
-		return "su -", c.node.SuPwd
-	case models.SudoModeRoot, "":
+	case SudoModeSu:
+		return "su -", c.cfg.SuPwd
+	case SudoModeRoot, "":
 		return "", ""
 	default:
 		return "", ""

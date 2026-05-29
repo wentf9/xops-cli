@@ -9,6 +9,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/mcpserver/guardrail"
 	"github.com/wentf9/xops-cli/pkg/sftp"
 	"github.com/wentf9/xops-cli/pkg/ssh"
@@ -50,7 +51,7 @@ func getSFTPClient(ctx context.Context, nodeID string) (*sftp.Client, *ssh.Conne
 		return nil, nil, fmt.Errorf("node '%s' not found", nodeID)
 	}
 
-	connector := ssh.NewConnector(provider)
+	connector := adapter.NewConnector(provider)
 
 	sshClient, err := connector.Connect(ctx, nodeID)
 	if err != nil {

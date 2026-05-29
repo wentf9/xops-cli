@@ -85,6 +85,9 @@ func (m *logStreamerModel) startStream() tea.Cmd {
 			for scanner.Scan() {
 				m.lineChan <- scanner.Text()
 			}
+			if err := scanner.Err(); err != nil {
+				m.lineChan <- fmt.Sprintf("error scanning log stream: %v", err)
+			}
 			m.lineChan <- "\x04EOF\x04"
 		}()
 

@@ -10,29 +10,21 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/wentf9/xops-cli/pkg/config"
-	"github.com/wentf9/xops-cli/pkg/models"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/term"
 )
 
 type Client struct {
 	sshClient *ssh.Client
-	node      models.Node
-	host      models.Host
-	identity  models.Identity
-	provider  config.ConfigProvider
-	nodeName  string
+	cfg       *ClientConfig
+	store     ConfigStore
 }
 
-func newClient(raw *ssh.Client, node models.Node, host models.Host, identity models.Identity, provider config.ConfigProvider, nodeName string) *Client {
+func newClient(raw *ssh.Client, cfg *ClientConfig, store ConfigStore) *Client {
 	return &Client{
 		sshClient: raw,
-		node:      node,
-		host:      host,
-		identity:  identity,
-		provider:  provider,
-		nodeName:  nodeName,
+		cfg:       cfg,
+		store:     store,
 	}
 }
 
@@ -46,9 +38,9 @@ func (c *Client) SSHClient() *ssh.Client {
 	return c.sshClient
 }
 
-// Node 返回当前连接对应的节点配置
-func (c *Client) Node() models.Node {
-	return c.node
+// Config 返回当前连接对应的节点配置
+func (c *Client) Config() *ClientConfig {
+	return c.cfg
 }
 
 func (c *Client) Run(ctx context.Context, cmd string) (string, error) {
@@ -313,7 +305,7 @@ func (c *Client) RunInteractiveCmd(ctx context.Context, cmd string) error {
 
 func (c *Client) maybeDetectSudoMode(ctx context.Context) {
 	// 如果已经有确定的 SudoMode，且不是 "auto" 或空，则不再探测
-	if c.node.SudoMode != "" && c.node.SudoMode != models.SudoModeAuto && c.node.SudoMode != models.SudoModeNone {
+	if c.cfg.SudoMode != "" && c.cfg.SudoMode != SudoModeAuto && c.cfg.SudoMode != SudoModeNone {
 		return
 	}
 
@@ -323,39 +315,39 @@ func (c *Client) maybeDetectSudoMode(ctx context.Context) {
 		// 稳健检查：只要最后一行输出是 0，即认为是 root
 		lines := strings.Split(strings.TrimSpace(out), "\n")
 		if len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "0" {
-			c.updateSudoMode(models.SudoModeRoot)
+			c.updateSudoMode(SudoModeRoot)
 			return
 		}
 	}
 
 	// 2. 探测是否有免密 sudo 权限
 	if _, err := c.RunWithoutLogin(ctx, "sudo -n true"); err == nil {
-		c.updateSudoMode(models.SudoModeSudoer)
+		c.updateSudoMode(SudoModeSudoer)
 		return
 	}
 
 	// 3. 测试密码 sudo 是否真正可用（避免用户有密码但不在 sudoers 中时误判）
-	if c.identity.Password != "" {
-		if _, err := c.runWithSudo(ctx, "true", c.identity.Password, nil); err == nil {
-			c.updateSudoMode(models.SudoModeSudo)
+	if c.cfg.Password != "" {
+		if _, err := c.runWithSudo(ctx, "true", c.cfg.Password, nil); err == nil {
+			c.updateSudoMode(SudoModeSudo)
 			return
 		}
 	}
 
 	// 4. 检查是否有 su 密码
-	if c.node.SuPwd != "" {
-		c.updateSudoMode(models.SudoModeSu)
+	if c.cfg.SuPwd != "" {
+		c.updateSudoMode(SudoModeSu)
 		return
 	}
 
 	// 默认兜底
-	c.updateSudoMode(models.SudoModeNone)
+	c.updateSudoMode(SudoModeNone)
 }
 
-func (c *Client) updateSudoMode(mode models.SudoMode) {
-	c.node.SudoMode = mode
-	if c.provider != nil && c.nodeName != "" {
-		c.provider.AddNode(c.nodeName, c.node)
+func (c *Client) updateSudoMode(mode SudoMode) {
+	c.cfg.SudoMode = mode
+	if c.store != nil && c.cfg.NodeID != "" {
+		_ = c.store.UpdateSudo(c.cfg.NodeID, mode, c.cfg.SuPwd)
 	}
 }
 

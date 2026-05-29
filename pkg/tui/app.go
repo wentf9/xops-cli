@@ -7,6 +7,7 @@ import (
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
+	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/ssh"
@@ -48,7 +49,7 @@ func NewModel(provider config.ConfigProvider, configStore config.Store) Model {
 	m := Model{
 		provider:    provider,
 		configStore: configStore,
-		connector:   ssh.NewConnector(provider),
+		connector:   adapter.NewConnector(provider),
 		state:       viewList,
 	}
 	m.list = newListModel(provider)

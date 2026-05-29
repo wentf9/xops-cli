@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/models"
 	"github.com/wentf9/xops-cli/pkg/playbook"
-	"github.com/wentf9/xops-cli/pkg/ssh"
 	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 )
 
@@ -105,7 +105,7 @@ func TestEngine_ResolveTargets(t *testing.T) {
 					{Name: "test-step", Shell: "echo"},
 				},
 			}
-			connector := ssh.NewConnector(provider)
+			connector := adapter.NewConnector(provider)
 			engine := playbook.NewEngine(pb, provider, connector)
 
 			// 我们通过调用 Run 来间接触发 resolveTargets
@@ -162,7 +162,7 @@ func TestEngine_NoTargets(t *testing.T) {
 			{Name: "test-step", Shell: "echo"},
 		},
 	}
-	connector := ssh.NewConnector(provider)
+	connector := adapter.NewConnector(provider)
 	engine := playbook.NewEngine(pb, provider, connector)
 
 	_, err := engine.Run(context.Background())
@@ -186,7 +186,7 @@ func TestEngine_Timeout(t *testing.T) {
 			{Name: "test-step", Shell: "sleep 1"},
 		},
 	}
-	connector := ssh.NewConnector(provider)
+	connector := adapter.NewConnector(provider)
 	engine := playbook.NewEngine(pb, provider, connector)
 
 	// 运行，由于超时极短，context 应该在执行中被超时取消
@@ -222,7 +222,7 @@ func TestEngine_OnErrorAbortAll(t *testing.T) {
 			{Name: "test-step", Shell: "echo"},
 		},
 	}
-	connector := ssh.NewConnector(provider)
+	connector := adapter.NewConnector(provider)
 	engine := playbook.NewEngine(pb, provider, connector)
 
 	report, err := engine.Run(context.Background())

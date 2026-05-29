@@ -7,9 +7,9 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/playbook"
-	"github.com/wentf9/xops-cli/pkg/ssh"
 )
 
 // PlayOptions 保存 xops play 命令的所有选项
@@ -86,7 +86,7 @@ func (o *PlayOptions) Run() error {
 		return fmt.Errorf("%s: %w", i18n.T("config_load_error"), err)
 	}
 
-	connector := ssh.NewConnector(provider)
+	connector := adapter.NewConnector(provider)
 	defer connector.CloseAll()
 
 	// 创建并运行引擎

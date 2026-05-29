@@ -13,6 +13,7 @@ import (
 	"github.com/schollz/progressbar/v3"
 	"github.com/spf13/cobra"
 	cmdutils "github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
@@ -156,7 +157,7 @@ func (o *ScpOptions) Run() error {
 		return fmt.Errorf("%s: %w", i18n.T("config_load_error"), err)
 	}
 	provider := config.NewProvider(cfg)
-	connector := ssh.NewConnector(provider)
+	connector := adapter.NewConnector(provider)
 	defer connector.CloseAll()
 
 	src := parsePath(o.Source)

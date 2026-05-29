@@ -11,10 +11,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	cmdutil "github.com/wentf9/xops-cli/cmd/utils"
-	"github.com/wentf9/xops-cli/pkg/config"
-	"github.com/wentf9/xops-cli/pkg/i18n"
-	"github.com/wentf9/xops-cli/pkg/models"
 	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
@@ -24,7 +20,8 @@ import (
 
 // Connector 负责创建 SSH 连接
 type Connector struct {
-	Config config.ConfigProvider
+	store ConfigStore
+	ui    InteractionHandler
 	// 连接池：缓存 nodeName -> *ssh.Client
 	clients *concurrent.Map[string, *ssh.Client]
 	// singleflight 组，用来控制并发和去重
@@ -36,9 +33,10 @@ type Connector struct {
 var hostKeyPromptMutex sync.Mutex
 
 // NewConnector 创建一个新的 Connector
-func NewConnector(cfg config.ConfigProvider) *Connector {
+func NewConnector(store ConfigStore, ui InteractionHandler) *Connector {
 	return &Connector{
-		Config:  cfg,
+		store:   store,
+		ui:      ui,
 		clients: concurrent.NewMap[string, *ssh.Client](concurrent.HashString),
 	}
 }
@@ -49,11 +47,11 @@ func (c *Connector) Connect(ctx context.Context, nodeName string) (*Client, erro
 	if cachedClient, ok := c.clients.Get(nodeName); ok {
 		// 可选：检查连接是否存活（发送一个非阻塞的 KeepAlive 请求）
 		// 对于短生命周期的 CLI 工具，通常假设缓存的连接是可用的
-		node, _ := c.Config.GetNode(nodeName) // 重新获取配置以防更新，或者缓存 wrapper
-		// GetHost 和 GetIdentity 的入参应为 nodeName (即 nodeID)，其内部会自动通过 HostRef/IdentityRef 关联获取
-		host, _ := c.Config.GetHost(nodeName)
-		identity, _ := c.Config.GetIdentity(nodeName)
-		return newClient(cachedClient, node, host, identity, c.Config, nodeName), nil
+		cfg, err := c.store.GetConfig(nodeName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch config for cached node '%s': %w", nodeName, err)
+		}
+		return newClient(cachedClient, cfg, c.store), nil
 	}
 	// 缓存未命中，开始建立新连接
 	// 【合并请求】使用 singleflight
@@ -70,28 +68,27 @@ func (c *Connector) Connect(ctx context.Context, nodeName string) (*Client, erro
 }
 
 func (c *Connector) initializeConnection(ctx context.Context, nodeName string) (*Client, error) {
-	node, host, identity, err := c.fetchNodeConfig(nodeName)
+	cfg, err := c.store.GetConfig(nodeName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch config for node '%s': %w", nodeName, err)
 	}
 
 	// SudoMode 为 su 时若未配置密码，交互式提示并写回 Provider（调用方负责持久化）
-	if node.SudoMode == models.SudoModeSu && node.SuPwd == "" {
-		suPwd, err := cmdutil.ReadPasswordFromTerminal(
-			i18n.Tf("prompt_su_password", map[string]any{"Node": nodeName}))
+	if cfg.SudoMode == SudoModeSu && cfg.SuPwd == "" {
+		suPwd, err := c.ui.PromptPassword(fmt.Sprintf("Enter su password for node %s: ", nodeName))
 		if err != nil {
 			return nil, fmt.Errorf("failed to read su password: %w", err)
 		}
-		node.SuPwd = suPwd
-		c.Config.AddNode(nodeName, node)
+		cfg.SuPwd = suPwd
+		_ = c.store.UpdateSudo(nodeName, cfg.SudoMode, suPwd)
 	}
 
-	dialer, err := c.setupDialer(ctx, node)
+	dialer, err := c.setupDialer(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to setup dialer: %w", err)
 	}
 
-	sshConfig, cleanup, err := c.buildSSHConfig(&identity, host.Address)
+	sshConfig, cleanup, err := c.buildSSHConfig(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build ssh config for '%s': %w", nodeName, err)
 	}
@@ -99,57 +96,29 @@ func (c *Connector) initializeConnection(ctx context.Context, nodeName string) (
 		defer cleanup()
 	}
 
-	rawClient, err := c.dialAndHandshake(ctx, nodeName, host, dialer, sshConfig)
+	rawClient, err := c.dialAndHandshake(ctx, nodeName, cfg, dialer, sshConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial and handshake: %w", err)
 	}
 
 	// 认证并连接成功后，检查我们是否通过 "auto" 下的终端交互获取到了新凭证（密码或密钥密码）。
-	// 如果 identity 对象被 buildSSHConfig 内部的回调赋予了凭证，则把它写回提供者内存
-	if identity.Password != "" || identity.Passphrase != "" {
-		c.Config.AddIdentity(node.IdentityRef, identity)
-		// 同时保证如果是首次建立的节点（例如 openssh: 前缀的节点），能被正确驻留在配置树内
-		c.Config.AddNode(nodeName, node)
-		c.Config.AddHost(node.HostRef, host)
+	if cfg.Password != "" || cfg.Passphrase != "" {
+		_ = c.store.UpdateAuth(nodeName, cfg.Password, cfg.KeyPath, cfg.Passphrase)
 	}
 
 	c.clients.Set(nodeName, rawClient)
-	// 7. 返回封装的 Client
-	return newClient(rawClient, node, host, identity, c.Config, nodeName), nil
+	// 返回封装的 Client
+	return newClient(rawClient, cfg, c.store), nil
 }
 
-func (c *Connector) fetchNodeConfig(nodeName string) (models.Node, models.Host, models.Identity, error) {
-	node, ok := c.Config.GetNode(nodeName)
-	if !ok {
-		return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("node not found '%s'", nodeName)
-	}
-
-	// 用户确认这里明确要求兼容传入 nodeName
-	host, ok := c.Config.GetHost(nodeName)
-	if !ok {
-		return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("host ref '%s' not found for node '%s'", node.HostRef, nodeName)
-	}
-
-	identity, ok := c.Config.GetIdentity(nodeName)
-	if !ok {
-		return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("identity ref '%s' not found for node '%s'", node.IdentityRef, nodeName)
-	}
-
-	return node, host, identity, nil
-}
-
-func (c *Connector) setupDialer(ctx context.Context, node models.Node) (Dialer, error) {
+func (c *Connector) setupDialer(ctx context.Context, cfg *ClientConfig) (Dialer, error) {
 	var dialer Dialer = &net.Dialer{Timeout: 10 * time.Second} // 默认直连
 
-	if node.ProxyJump != "" {
-		jumpHost := c.Config.Find(node.ProxyJump)
-		if jumpHost == "" {
-			jumpHost = node.ProxyJump
-		}
+	if cfg.ProxyJump != "" {
 		// 递归：连接跳板机
-		jumpNodeClient, err := c.Connect(ctx, jumpHost)
+		jumpNodeClient, err := c.Connect(ctx, cfg.ProxyJump)
 		if err != nil {
-			return nil, fmt.Errorf("failed to connect to jump host '%s': %w", node.ProxyJump, err)
+			return nil, fmt.Errorf("failed to connect to jump host '%s': %w", cfg.ProxyJump, err)
 		}
 		// 封装：使用跳板机的 SSH 通道作为 Dialer
 		dialer = &SSHProxyDialer{Client: jumpNodeClient.sshClient}
@@ -158,11 +127,11 @@ func (c *Connector) setupDialer(ctx context.Context, node models.Node) (Dialer, 
 	return dialer, nil
 }
 
-func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, host models.Host, dialer Dialer, sshConfig *ssh.ClientConfig) (*ssh.Client, error) {
-	if host.Port == 0 {
-		host.Port = 22
+func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, cfg *ClientConfig, dialer Dialer, sshConfig *ssh.ClientConfig) (*ssh.Client, error) {
+	if cfg.Port == 0 {
+		cfg.Port = 22
 	}
-	targetAddr := fmt.Sprintf("%s:%d", host.Address, host.Port)
+	targetAddr := fmt.Sprintf("%s:%d", cfg.Address, cfg.Port)
 	conn, err := dialer.DialContext(ctx, "tcp", targetAddr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial target '%s' (%s): %w", nodeName, targetAddr, err)
@@ -189,36 +158,36 @@ func (c *Connector) CloseAll() {
 }
 
 // buildSSHConfig 根据 Identity 模型构建 ssh.ClientConfig
-func (c *Connector) buildSSHConfig(id *models.Identity, hostAddr string) (*ssh.ClientConfig, func(), error) {
+func (c *Connector) buildSSHConfig(cfg *ClientConfig) (*ssh.ClientConfig, func(), error) {
 	var cleanup func()
 	authMethods := []ssh.AuthMethod{}
 
 	// 根据 AuthType 处理不同的认证方式
-	switch id.AuthType {
+	switch cfg.AuthType {
 	case "auto":
 		var autoCleanup func()
-		authMethods, autoCleanup = BuildAutoAuthMethods(id.User, hostAddr, func(s string) {
+		authMethods, autoCleanup = BuildAutoAuthMethods(cfg.User, cfg.Address, c.ui, func(s string) {
 			if s != "" {
-				id.Password = s
-				id.AuthType = "password"
+				cfg.Password = s
+				cfg.AuthType = "password"
 			}
 		}, func(keyPath, passphrase string) {
 			if passphrase != "" {
-				id.KeyPath = keyPath
-				id.Passphrase = passphrase
-				id.AuthType = "key"
+				cfg.KeyPath = keyPath
+				cfg.Passphrase = passphrase
+				cfg.AuthType = "key"
 			}
 		})
 		cleanup = autoCleanup
 
 	case "password":
-		if id.Password == "" {
+		if cfg.Password == "" {
 			return nil, nil, fmt.Errorf("auth type is password but password is empty")
 		}
-		authMethods = append(authMethods, ssh.Password(id.Password))
+		authMethods = append(authMethods, ssh.Password(cfg.Password))
 
 	case "key":
-		authMethod, err := buildKeyAuthMethod(id)
+		authMethod, err := buildKeyAuthMethod(cfg)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -238,7 +207,7 @@ func (c *Connector) buildSSHConfig(id *models.Identity, hostAddr string) (*ssh.C
 		cleanup = func() { _ = conn.Close() }
 
 	default:
-		return nil, nil, fmt.Errorf("unsupported auth type: %s", id.AuthType)
+		return nil, nil, fmt.Errorf("unsupported auth type: %s", cfg.AuthType)
 	}
 
 	hostKeyCallback, err := c.getHostKeyCallback()
@@ -250,24 +219,24 @@ func (c *Connector) buildSSHConfig(id *models.Identity, hostAddr string) (*ssh.C
 	}
 
 	return &ssh.ClientConfig{
-		User:            id.User,
+		User:            cfg.User,
 		Auth:            authMethods,
 		HostKeyCallback: hostKeyCallback,
 		Timeout:         15 * time.Second,
 	}, cleanup, nil
 }
 
-func buildKeyAuthMethod(id *models.Identity) (ssh.AuthMethod, error) {
-	if id.KeyPath == "" {
+func buildKeyAuthMethod(cfg *ClientConfig) (ssh.AuthMethod, error) {
+	if cfg.KeyPath == "" {
 		return nil, fmt.Errorf("auth type is key but key_path is empty")
 	}
-	keyBytes, err := os.ReadFile(expandHomeDir(id.KeyPath))
+	keyBytes, err := os.ReadFile(expandHomeDir(cfg.KeyPath))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read key file: %w", err)
 	}
 	var signer ssh.Signer
-	if id.Passphrase != "" {
-		signer, err = ssh.ParsePrivateKeyWithPassphrase(keyBytes, []byte(id.Passphrase))
+	if cfg.Passphrase != "" {
+		signer, err = ssh.ParsePrivateKeyWithPassphrase(keyBytes, []byte(cfg.Passphrase))
 	} else {
 		signer, err = ssh.ParsePrivateKey(keyBytes)
 	}
@@ -347,24 +316,16 @@ func (c *Connector) promptHostKeyVerification(hostname string, key ssh.PublicKey
 		return nil
 	}
 
-	fmt.Printf("The authenticity of host '%s' can't be established.\n", hostname)
 	fingerprint := ssh.FingerprintSHA256(key)
-	fmt.Printf("%s key fingerprint is %s.\n", key.Type(), fingerprint)
-	fmt.Print("Are you sure you want to continue connecting (yes/no/all/[fingerprint])? ")
-
-	var response string
-	_, scanErr := fmt.Scanln(&response)
-	if scanErr != nil && scanErr.Error() != "unexpected newline" && scanErr.Error() != "EOF" {
-		return fmt.Errorf("read response failed: %w", scanErr)
+	agreed, err := c.ui.ConfirmHostKey(hostname, fingerprint)
+	if err != nil {
+		return fmt.Errorf("read response failed: %w", err)
 	}
 
-	if response == "all" {
-		c.AcceptNewHostKey.Store(true)
-	} else if response != "yes" && response != fingerprint {
-		return fmt.Errorf("host key verification failed")
+	if agreed {
+		return nil
 	}
-
-	return nil
+	return fmt.Errorf("host key verification failed")
 }
 
 func appendKnownHost(knownHostsFile, hostname string, key ssh.PublicKey) error {

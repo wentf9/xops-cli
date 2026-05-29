@@ -4,73 +4,49 @@ import (
 	"context"
 	"testing"
 
-	"github.com/wentf9/xops-cli/pkg/config"
-	"github.com/wentf9/xops-cli/pkg/models"
-	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 	"golang.org/x/crypto/ssh"
 )
 
-func TestConnector_FetchNodeConfig(t *testing.T) {
-	cfg := &config.Configuration{
-		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
-		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
-		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
-	}
+type mockConfigStore struct {
+	cfg *ClientConfig
+}
 
-	cfg.Nodes.Set("node-1", models.Node{
-		HostRef:     "host-1",
-		IdentityRef: "id-1",
-	})
-	cfg.Hosts.Set("host-1", models.Host{
-		Address: "10.0.0.1",
-		Port:    22,
-	})
-	cfg.Identities.Set("id-1", models.Identity{
-		User:     "admin",
-		AuthType: "password",
-	})
+func (m *mockConfigStore) GetConfig(nodeID string) (*ClientConfig, error) {
+	return m.cfg, nil
+}
 
-	provider := config.NewProvider(cfg)
-	connector := NewConnector(provider)
+func (m *mockConfigStore) UpdateAuth(nodeID string, password, keyPath, passphrase string) error {
+	return nil
+}
 
-	node, host, identity, err := connector.fetchNodeConfig("node-1")
-	if err != nil {
-		t.Fatalf("fetchNodeConfig failed: %v", err)
-	}
+func (m *mockConfigStore) UpdateSudo(nodeID string, mode SudoMode, suPwd string) error {
+	return nil
+}
 
-	if node.HostRef != "host-1" || node.IdentityRef != "id-1" {
-		t.Errorf("unexpected node config: %+v", node)
-	}
-	if host.Address != "10.0.0.1" || host.Port != 22 {
-		t.Errorf("unexpected host config: %+v", host)
-	}
-	if identity.User != "admin" || identity.AuthType != "password" {
-		t.Errorf("unexpected identity config: %+v", identity)
-	}
+type mockUI struct{}
+
+func (m *mockUI) PromptPassword(prompt string) (string, error) {
+	return "mockpass", nil
+}
+
+func (m *mockUI) ConfirmHostKey(hostname string, fingerprint string) (bool, error) {
+	return true, nil
 }
 
 func TestConnector_Connect_Cached(t *testing.T) {
-	cfg := &config.Configuration{
-		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
-		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
-		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
+	store := &mockConfigStore{
+		cfg: &ClientConfig{
+			NodeID:   "node-1",
+			Address:  "10.0.0.1",
+			Port:     22,
+			User:     "admin",
+			AuthType: "password",
+			Password: "mockpassword",
+		},
 	}
+	ui := &mockUI{}
 
-	cfg.Nodes.Set("node-1", models.Node{
-		HostRef:     "host-1",
-		IdentityRef: "id-1",
-	})
-	cfg.Hosts.Set("host-1", models.Host{
-		Address: "10.0.0.1",
-		Port:    22,
-	})
-	cfg.Identities.Set("id-1", models.Identity{
-		User:     "admin",
-		AuthType: "password",
-	})
-
-	provider := config.NewProvider(cfg)
-	connector := NewConnector(provider)
+	connector := NewConnector(store, ui)
 
 	// 模拟已存在缓存连接
 	dummyClient := &ssh.Client{}
@@ -86,11 +62,11 @@ func TestConnector_Connect_Cached(t *testing.T) {
 		t.Fatal("expected non-nil client")
 	}
 
-	// 验证在缓存命中时，能否正确通过修复后的 GetHost/GetIdentity 方法拿到对应的真实配置
-	if client.host.Address != "10.0.0.1" {
-		t.Errorf("expected host address '10.0.0.1', got %q", client.host.Address)
+	// 验证在缓存命中时，配置是否正确附加
+	if client.cfg.Address != "10.0.0.1" {
+		t.Errorf("expected host address '10.0.0.1', got %q", client.cfg.Address)
 	}
-	if client.identity.User != "admin" {
-		t.Errorf("expected identity user 'admin', got %q", client.identity.User)
+	if client.cfg.User != "admin" {
+		t.Errorf("expected identity user 'admin', got %q", client.cfg.User)
 	}
 }

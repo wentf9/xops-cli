@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	cmdutils "github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/executor"
 	"github.com/wentf9/xops-cli/pkg/firewall"
@@ -112,7 +113,7 @@ func (o *FirewallOptions) runRemoteFirewalls(ctx context.Context, action func(fw
 		return err
 	}
 	provider := config.NewProvider(cfg)
-	connector := ssh.NewConnector(provider)
+	connector := adapter.NewConnector(provider)
 	defer connector.CloseAll()
 
 	var hosts []string

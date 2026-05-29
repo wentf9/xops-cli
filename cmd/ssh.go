@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/models"
@@ -125,7 +126,7 @@ func (o *SshOptions) Run() error {
 	if err != nil {
 		return err
 	}
-	connector := ssh.NewConnector(provider)
+	connector := adapter.NewConnector(provider)
 	connectCtx, connectCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	idBefore, _ := provider.GetIdentity(nodeID)
 	nodeBefore, _ := provider.GetNode(nodeID)

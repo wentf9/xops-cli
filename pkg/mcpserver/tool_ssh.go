@@ -6,9 +6,9 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/mcpserver/guardrail"
 	"github.com/wentf9/xops-cli/pkg/models"
-	"github.com/wentf9/xops-cli/pkg/ssh"
 )
 
 type ListNodesInput struct {
@@ -92,7 +92,7 @@ func sshRunHandler(ctx context.Context, req *mcp.CallToolRequest, input SshRunIn
 		return nil, SshRunOutput{}, fmt.Errorf("node '%s' not found", input.NodeID)
 	}
 
-	connector := ssh.NewConnector(provider)
+	connector := adapter.NewConnector(provider)
 	defer connector.CloseAll()
 
 	client, err := connector.Connect(ctx, input.NodeID)

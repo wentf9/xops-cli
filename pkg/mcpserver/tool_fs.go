@@ -7,9 +7,9 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/mcpserver/guardrail"
 	"github.com/wentf9/xops-cli/pkg/sftp"
-	"github.com/wentf9/xops-cli/pkg/ssh"
 )
 
 // ======================== LS ========================
@@ -42,7 +42,7 @@ func fsLsHandler(ctx context.Context, req *mcp.CallToolRequest, input FSListInpu
 		return nil, FSListOutput{}, fmt.Errorf("failed to load config: %w", err)
 	}
 
-	connector := ssh.NewConnector(provider)
+	connector := adapter.NewConnector(provider)
 	defer connector.CloseAll()
 
 	sshClient, err := connector.Connect(ctx, input.NodeID)
@@ -99,7 +99,7 @@ func fsMkdirHandler(ctx context.Context, req *mcp.CallToolRequest, input FSMkdir
 		return nil, FSBaseOutput{}, err
 	}
 
-	connector := ssh.NewConnector(provider)
+	connector := adapter.NewConnector(provider)
 	defer connector.CloseAll()
 
 	sshClient, err := connector.Connect(ctx, input.NodeID)
@@ -137,7 +137,7 @@ func fsTouchHandler(ctx context.Context, req *mcp.CallToolRequest, input FSTouch
 		return nil, FSBaseOutput{}, err
 	}
 
-	connector := ssh.NewConnector(provider)
+	connector := adapter.NewConnector(provider)
 	defer connector.CloseAll()
 
 	sshClient, err := connector.Connect(ctx, input.NodeID)
@@ -178,7 +178,7 @@ func fsMvHandler(ctx context.Context, req *mcp.CallToolRequest, input FSMvInput)
 		return nil, FSBaseOutput{}, err
 	}
 
-	connector := ssh.NewConnector(provider)
+	connector := adapter.NewConnector(provider)
 	defer connector.CloseAll()
 
 	sshClient, err := connector.Connect(ctx, input.NodeID)
@@ -216,7 +216,7 @@ func fsRmHandler(ctx context.Context, req *mcp.CallToolRequest, input FSRmInput)
 		return nil, FSBaseOutput{}, err
 	}
 
-	connector := ssh.NewConnector(provider)
+	connector := adapter.NewConnector(provider)
 	defer connector.CloseAll()
 
 	sshClient, err := connector.Connect(ctx, input.NodeID)
@@ -251,7 +251,7 @@ func fsCpHandler(ctx context.Context, req *mcp.CallToolRequest, input FSCpInput)
 		return nil, FSBaseOutput{}, err
 	}
 
-	connector := ssh.NewConnector(provider)
+	connector := adapter.NewConnector(provider)
 	defer connector.CloseAll()
 
 	sshClient, err := connector.Connect(ctx, input.NodeID)

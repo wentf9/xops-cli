@@ -10,11 +10,11 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/models"
 	"github.com/wentf9/xops-cli/pkg/sftp"
-	"github.com/wentf9/xops-cli/pkg/ssh"
 )
 
 type SftpOptions struct {
@@ -87,7 +87,7 @@ func (o *SftpOptions) Run() error {
 			return err
 		}
 	}
-	connector := ssh.NewConnector(provider)
+	connector := adapter.NewConnector(provider)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	idBefore, _ := provider.GetIdentity(nodeID)
