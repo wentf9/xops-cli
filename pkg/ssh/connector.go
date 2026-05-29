@@ -60,15 +60,6 @@ func (c *Connector) Connect(ctx context.Context, nodeName string) (*Client, erro
 	// 即使 100 个协程同时调 Connect(host)，Do 里面的函数只会执行一次
 	// 其他协程会阻塞在这里等待结果
 	result, err, _ := c.sf.Do(nodeName, func() (any, error) {
-		// 双重检查：防止在进入 Do 之前那一瞬间，别的协程刚好把连接建立好了
-		if cachedClient, ok := c.clients.Get(nodeName); ok {
-			node, _ := c.Config.GetNode(nodeName)
-			// GetHost 和 GetIdentity 的入参应为 nodeName (即 nodeID)，其内部会自动通过 HostRef/IdentityRef 关联获取
-			host, _ := c.Config.GetHost(nodeName)
-			identity, _ := c.Config.GetIdentity(nodeName)
-			return newClient(cachedClient, node, host, identity, c.Config, nodeName), nil
-		}
-
 		return c.initializeConnection(ctx, nodeName)
 	})
 	if err != nil {
@@ -81,7 +72,7 @@ func (c *Connector) Connect(ctx context.Context, nodeName string) (*Client, erro
 func (c *Connector) initializeConnection(ctx context.Context, nodeName string) (*Client, error) {
 	node, host, identity, err := c.fetchNodeConfig(nodeName)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to fetch config for node '%s': %w", nodeName, err)
 	}
 
 	// SudoMode 为 su 时若未配置密码，交互式提示并写回 Provider（调用方负责持久化）
@@ -97,7 +88,7 @@ func (c *Connector) initializeConnection(ctx context.Context, nodeName string) (
 
 	dialer, err := c.setupDialer(ctx, node)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to setup dialer: %w", err)
 	}
 
 	sshConfig, cleanup, err := c.buildSSHConfig(&identity, host.Address)
@@ -110,7 +101,7 @@ func (c *Connector) initializeConnection(ctx context.Context, nodeName string) (
 
 	rawClient, err := c.dialAndHandshake(ctx, nodeName, host, dialer, sshConfig)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to dial and handshake: %w", err)
 	}
 
 	// 认证并连接成功后，检查我们是否通过 "auto" 下的终端交互获取到了新凭证（密码或密钥密码）。

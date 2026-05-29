@@ -2,6 +2,7 @@ package ssh
 
 import (
 	"context"
+	"fmt"
 	"net"
 
 	"golang.org/x/crypto/ssh"
@@ -17,35 +18,9 @@ func (s *SSHProxyDialer) Dial(network, addr string) (net.Conn, error) {
 }
 
 func (s *SSHProxyDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	// ssh.Client.Dial 本身不支持 Context，
-	// 但我们可以简单的直接调用 Dial。
-	// 如果需要严格的超时控制，可以在外层使用带有超时的 Context 并在 Dial 完成后检查。
-
-	// 一个简单的异步实现以支持 Context 取消：
-	type result struct {
-		conn net.Conn
-		err  error
+	conn, err := s.Client.DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, fmt.Errorf("proxy dial failed: %w", err)
 	}
-	ch := make(chan result, 1)
-
-	go func() {
-		conn, err := s.Client.Dial(network, addr)
-		ch <- result{conn: conn, err: err}
-	}()
-
-	select {
-	case <-ctx.Done():
-		go func() {
-			res := <-ch
-			if res.conn != nil {
-				_ = res.conn.Close()
-			}
-		}()
-		return nil, ctx.Err()
-	case res := <-ch:
-		if res.err != nil {
-			return nil, res.err
-		}
-		return res.conn, nil
-	}
+	return conn, nil
 }

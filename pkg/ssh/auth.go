@@ -2,6 +2,7 @@ package ssh
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"os"
 
@@ -35,7 +36,7 @@ type KeyAuth struct {
 func (k *KeyAuth) GetMethod() (ssh.AuthMethod, error) {
 	keyData, err := os.ReadFile(k.Path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read key file %s: %w", k.Path, err)
 	}
 	var signer ssh.Signer
 	if k.Passphrase != "" {
@@ -44,7 +45,7 @@ func (k *KeyAuth) GetMethod() (ssh.AuthMethod, error) {
 		signer, err = ssh.ParsePrivateKey(keyData)
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to parse private key: %w", err)
 	}
 	return ssh.PublicKeys(signer), nil
 }
@@ -70,11 +71,13 @@ func BuildAutoAuthMethods(user, host string, passwordCallback func(string), pass
 		keyPath := expandHomeDir(p)
 		logger.Debugf("Checking default key: %s", keyPath)
 		if _, err := os.Stat(keyPath); err != nil {
+			logger.Debugf("Failed to stat key: %s, error: %v", keyPath, err)
 			continue
 		}
 		logger.Debugf("Found default key: %s", keyPath)
 		keyData, err := os.ReadFile(keyPath)
 		if err != nil {
+			logger.Debugf("Failed to read key: %s, error: %v", keyPath, err)
 			continue
 		}
 		signer, err := ssh.ParsePrivateKey(keyData)
@@ -83,23 +86,24 @@ func BuildAutoAuthMethods(user, host string, passwordCallback func(string), pass
 			continue
 		}
 		// Key requires a passphrase — prompt interactively
-		var pmErr *ssh.PassphraseMissingError
-		if errors.As(err, &pmErr) {
+		if _, ok := errors.AsType[*ssh.PassphraseMissingError](err); ok {
 			keyDataCopy := keyData
 			keyPathCopy := keyPath
 			methods = append(methods, ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
 				passphrase, err := cmdutil.ReadPasswordFromTerminal(
 					i18n.Tf("prompt_enter_passphrase", map[string]any{"Path": keyPathCopy}))
 				if err != nil {
-					return nil, err
+					return nil, fmt.Errorf("failed to read passphrase from terminal: %w", err)
 				}
 				s, err := ssh.ParsePrivateKeyWithPassphrase(keyDataCopy, []byte(passphrase))
 				if err != nil {
-					return nil, err
+					return nil, fmt.Errorf("failed to parse private key with passphrase: %w", err)
 				}
 				passphraseCallback(keyPathCopy, passphrase)
 				return []ssh.Signer{s}, nil
 			}))
+		} else {
+			logger.Debugf("Failed to parse key: %s, error: %v", keyPath, err)
 		}
 	}
 
@@ -107,7 +111,7 @@ func BuildAutoAuthMethods(user, host string, passwordCallback func(string), pass
 	methods = append(methods, ssh.RetryableAuthMethod(ssh.PasswordCallback(func() (string, error) {
 		password, err := cmdutil.ReadPasswordFromTerminal(i18n.T("prompt_enter_password"))
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("failed to read password from terminal: %w", err)
 		}
 		passwordCallback(password)
 		return password, nil

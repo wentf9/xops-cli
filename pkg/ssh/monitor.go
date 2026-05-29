@@ -180,8 +180,20 @@ func (mc *MetricsCollector) NextFrame(ctx context.Context) (*SystemMetrics, erro
 
 	for {
 		var msg streamMsg
-		if err := mc.decoder.Decode(&msg); err != nil {
-			return nil, err
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- mc.decoder.Decode(&msg)
+		}()
+
+		select {
+		case err := <-errCh:
+			if err != nil {
+				return nil, fmt.Errorf("decode stream message failed: %w", err)
+			}
+		case <-ctx.Done():
+			// Close stream to unblock Decode and prevent internal desync
+			mc.Close()
+			return nil, ctx.Err()
 		}
 
 		switch msg.Type {

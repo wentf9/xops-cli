@@ -28,7 +28,7 @@ func (c *Client) RunWithSudo(ctx context.Context, command string) (string, error
 	case models.SudoModeSudoer:
 		return c.runWithSudo(ctx, wrappedCmd, "", nil)
 	case models.SudoModeSu:
-		return c.runWithSu(command, c.node.SuPwd)
+		return c.runWithSu(ctx, command, c.node.SuPwd)
 	default:
 		return "", fmt.Errorf("unknown sudo mode: %s, please check config to set sudo mode", c.node.SudoMode)
 	}
@@ -45,7 +45,7 @@ func (c *Client) RunScriptWithSudo(ctx context.Context, scriptContent string) (s
 	case models.SudoModeSudoer:
 		return c.runWithSudo(ctx, "bash -l -s", "", strings.NewReader(scriptContent))
 	case models.SudoModeSu:
-		return c.runWithSu(fmt.Sprintf("bash -l -c '%s'", strings.ReplaceAll(scriptContent, "'", "'\\''")), c.node.SuPwd)
+		return c.runWithSu(ctx, fmt.Sprintf("bash -l -c '%s'", strings.ReplaceAll(scriptContent, "'", "'\\''")), c.node.SuPwd)
 	default:
 		return "", fmt.Errorf("unsupported sudo mode: %s", c.node.SudoMode)
 	}
@@ -61,7 +61,7 @@ func (c *Client) RunInteractiveWithSudo(ctx context.Context, command string) err
 	// 对于需要提权的场景，打开交互式 shell 后在 shell 内提权再执行命令
 	session, err := c.sshClient.NewSession()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create new session: %w", err)
 	}
 	defer func() { _ = session.Close() }()
 
@@ -137,7 +137,7 @@ func (c *Client) runWithSudo(ctx context.Context, command string, password strin
 
 	session, err := c.sshClient.NewSession()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to create new session: %w", err)
 	}
 	defer func() { _ = session.Close() }()
 
@@ -155,10 +155,10 @@ func (c *Client) runWithSudo(ctx context.Context, command string, password strin
 	return startWithTimeout(ctx, session, fullCmd)
 }
 
-func (c *Client) runWithSu(command string, password string) (string, error) {
+func (c *Client) runWithSu(ctx context.Context, command string, password string) (string, error) {
 	session, err := c.sshClient.NewSession()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to create new session: %w", err)
 	}
 	defer func() { _ = session.Close() }()
 
@@ -173,11 +173,11 @@ func (c *Client) runWithSu(command string, password string) (string, error) {
 
 	stdin, err := session.StdinPipe()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to create stdin pipe: %w", err)
 	}
 	stdout, err := session.StdoutPipe()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to create stdout pipe: %w", err)
 	}
 
 	cmd := fmt.Sprintf("export LC_ALL=C; su - root -c '%s'", strings.ReplaceAll(command, "'", "'\\''"))
@@ -199,9 +199,27 @@ func (c *Client) runWithSu(command string, password string) (string, error) {
 		}
 	case <-time.After(5 * time.Second):
 		return outputBuf.String(), fmt.Errorf("timeout waiting for password prompt")
+	case <-ctx.Done():
+		if killErr := session.Signal(ssh.SIGKILL); killErr != nil {
+			return outputBuf.String(), fmt.Errorf("failed to kill command after context done: %w", killErr)
+		}
+		return outputBuf.String(), ctx.Err()
 	}
 
-	err = session.Wait()
+	done := make(chan error, 1)
+	go func() {
+		done <- session.Wait()
+	}()
+
+	select {
+	case err = <-done:
+	case <-ctx.Done():
+		if killErr := session.Signal(ssh.SIGKILL); killErr != nil {
+			return outputBuf.String(), fmt.Errorf("failed to kill command after context done: %w", killErr)
+		}
+		return outputBuf.String(), ctx.Err()
+	}
+
 	cleanOutput := cleanSuOutput(outputBuf.String())
 	if err != nil {
 		return cleanOutput, fmt.Errorf("command execution failed: %w", err)
@@ -253,7 +271,7 @@ func (c *Client) ShellWithSudo(ctx context.Context) error {
 
 	session, err := c.sshClient.NewSession()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create new session: %w", err)
 	}
 	defer func() { _ = session.Close() }()
 	modes := ssh.TerminalModes{

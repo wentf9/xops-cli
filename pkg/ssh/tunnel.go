@@ -2,6 +2,7 @@ package ssh
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -15,7 +16,7 @@ import (
 func (c *Client) LocalForward(ctx context.Context, localAddr, remoteAddr string) error {
 	listener, err := net.Listen("tcp", localAddr)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to listen on local addr %s: %w", localAddr, err)
 	}
 
 	go func() {
@@ -54,7 +55,7 @@ func (c *Client) handleLocalForward(localConn net.Conn, remoteAddr string) {
 func (c *Client) RemoteForward(ctx context.Context, remoteAddr, localAddr string) error {
 	listener, err := c.sshClient.Listen("tcp", remoteAddr)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to listen on remote addr %s: %w", remoteAddr, err)
 	}
 
 	go func() {

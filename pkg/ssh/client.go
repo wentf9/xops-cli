@@ -66,7 +66,7 @@ func (c *Client) RunWithoutLogin(ctx context.Context, cmd string) (string, error
 func (c *Client) runRaw(ctx context.Context, wrappedCmd string) (string, error) {
 	session, err := c.sshClient.NewSession()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to create new session: %w", err)
 	}
 	defer func() { _ = session.Close() }()
 
@@ -77,7 +77,7 @@ func (c *Client) runRaw(ctx context.Context, wrappedCmd string) (string, error) 
 func (c *Client) RunScript(ctx context.Context, scriptContent string) (string, error) {
 	session, err := c.sshClient.NewSession()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to create new session: %w", err)
 	}
 	defer func() { _ = session.Close() }()
 
@@ -107,20 +107,20 @@ func (s *streamReader) Close() error {
 func (c *Client) RunStream(ctx context.Context, cmd string) (io.ReadCloser, error) {
 	session, err := c.sshClient.NewSession()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create new session: %w", err)
 	}
 
 	stdout, err := session.StdoutPipe()
 	if err != nil {
 		_ = session.Close()
-		return nil, err
+		return nil, fmt.Errorf("failed to create stdout pipe: %w", err)
 	}
 
 	wrappedCmd := fmt.Sprintf("bash -c '%s'", strings.ReplaceAll(cmd, "'", "'\\''"))
 
 	if err := session.Start(wrappedCmd); err != nil {
 		_ = session.Close()
-		return nil, err
+		return nil, fmt.Errorf("failed to start command: %w", err)
 	}
 
 	derivedCtx, cancel := context.WithCancel(ctx)
@@ -137,7 +137,7 @@ func (c *Client) RunStream(ctx context.Context, cmd string) (io.ReadCloser, erro
 func (c *Client) Shell(ctx context.Context) error {
 	session, err := c.sshClient.NewSession()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create new session: %w", err)
 	}
 	defer func() { _ = session.Close() }()
 	// 配置 PTY (终端模式)
@@ -201,7 +201,7 @@ func (c *Client) Shell(ctx context.Context) error {
 func (c *Client) RunInteractive(ctx context.Context, cmd string) error {
 	session, err := c.sshClient.NewSession()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create new session: %w", err)
 	}
 	defer func() { _ = session.Close() }()
 
@@ -261,7 +261,7 @@ func (c *Client) RunInteractive(ctx context.Context, cmd string) error {
 func (c *Client) RunInteractiveCmd(ctx context.Context, cmd string) error {
 	session, err := c.sshClient.NewSession()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create new session: %w", err)
 	}
 	defer func() { _ = session.Close() }()
 
