@@ -130,6 +130,7 @@ func (m *Model) handleStateUpdate(msg tea.Msg) tea.Cmd {
 	case viewMonitor:
 		if kmsg, ok := msg.(tea.KeyMsg); ok {
 			if kmsg.String() == "esc" || kmsg.String() == "q" {
+				m.monitor.collector.Close()
 				m.state = viewList
 				*m, _ = m.updateList(m.lastSize)
 				return nil

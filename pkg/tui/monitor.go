@@ -13,11 +13,19 @@ import (
 	"github.com/wentf9/xops-cli/pkg/ssh"
 )
 
-type monitorMsg *ssh.SystemMetrics
-type monitorErrorMsg error
+type monitorMsg struct {
+	sessionID int64
+	metrics   *ssh.SystemMetrics
+}
+
+type monitorErrorMsg struct {
+	sessionID int64
+	err       error
+}
 
 type monitorModel struct {
 	nodeID    string
+	sessionID int64
 	collector *ssh.MetricsCollector
 	metrics   *ssh.SystemMetrics
 	err       error
@@ -30,6 +38,7 @@ type monitorModel struct {
 func newMonitorModel(nodeID string, client *ssh.Client) monitorModel {
 	return monitorModel{
 		nodeID:    nodeID,
+		sessionID: time.Now().UnixNano(),
 		collector: ssh.NewMetricsCollector(client),
 	}
 }
@@ -37,7 +46,7 @@ func newMonitorModel(nodeID string, client *ssh.Client) monitorModel {
 func (m monitorModel) Init() tea.Cmd {
 	return func() tea.Msg {
 		if err := m.collector.Start(context.Background()); err != nil {
-			return monitorErrorMsg(err)
+			return monitorErrorMsg{sessionID: m.sessionID, err: err}
 		}
 		return m.fetchMetrics()()
 	}
@@ -49,9 +58,9 @@ func (m monitorModel) fetchMetrics() tea.Cmd {
 		ctx := context.Background()
 		metrics, err := m.collector.NextFrame(ctx)
 		if err != nil {
-			return monitorErrorMsg(err)
+			return monitorErrorMsg{sessionID: m.sessionID, err: err}
 		}
-		return monitorMsg(metrics)
+		return monitorMsg{sessionID: m.sessionID, metrics: metrics}
 	}
 }
 
@@ -61,7 +70,10 @@ func (m monitorModel) Update(msg tea.Msg) (monitorModel, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 	case monitorMsg:
-		m.metrics = msg
+		if msg.sessionID != m.sessionID {
+			return m, nil
+		}
+		m.metrics = msg.metrics
 		m.err = nil
 		m.lastFetch = time.Now()
 		// Auto trigger next frame if not paused
@@ -69,7 +81,10 @@ func (m monitorModel) Update(msg tea.Msg) (monitorModel, tea.Cmd) {
 			return m, m.fetchMetrics()
 		}
 	case monitorErrorMsg:
-		m.err = msg
+		if msg.sessionID != m.sessionID {
+			return m, nil
+		}
+		m.err = msg.err
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "esc", "q":
