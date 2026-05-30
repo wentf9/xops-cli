@@ -15,12 +15,12 @@ func NewSSHExecutor(client *ssh.Client) *SSHExecutor {
 	return &SSHExecutor{client: client}
 }
 
-func (e *SSHExecutor) Run(ctx context.Context, cmd string) (string, error) {
-	return e.client.Run(ctx, cmd)
+func (e *SSHExecutor) Run(ctx context.Context, cmd string, opts ...ssh.RunOption) (string, error) {
+	return e.client.Run(ctx, cmd, opts...)
 }
 
-func (e *SSHExecutor) RunWithSudo(ctx context.Context, cmd string) (string, error) {
-	return e.client.RunWithSudo(ctx, cmd)
+func (e *SSHExecutor) RunWithSudo(ctx context.Context, cmd string, opts ...ssh.RunOption) (string, error) {
+	return e.client.RunWithSudo(ctx, cmd, opts...)
 }
 
 func (e *SSHExecutor) InteractiveWithSudo(ctx context.Context, args []string) error {

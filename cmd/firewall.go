@@ -125,7 +125,7 @@ func (o *FirewallOptions) runRemoteFirewalls(ctx context.Context, action func(fw
 		if err != nil {
 			return fmt.Errorf("%s: %w", i18n.T("err_read_ifile"), err)
 		}
-		for _, line := range strings.Split(string(data), "\n") {
+		for line := range strings.SplitSeq(string(data), "\n") {
 			line = strings.TrimSpace(line)
 			if line != "" {
 				hosts = append(hosts, line)

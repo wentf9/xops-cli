@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+
+	"github.com/wentf9/xops-cli/pkg/ssh"
 )
 
 // LocalExecutor 本地执行器
@@ -18,9 +20,19 @@ func NewLocalExecutor(password string) *LocalExecutor {
 	return &LocalExecutor{password: password}
 }
 
-func (e *LocalExecutor) Run(ctx context.Context, cmd string) (string, error) {
+func (e *LocalExecutor) Run(ctx context.Context, cmd string, opts ...ssh.RunOption) (string, error) {
+	config := ssh.DefaultRunConfig()
+	for _, opt := range opts {
+		opt(config)
+	}
+
+	args := []string{"-c", cmd}
+	if config.LoginShell {
+		args = []string{"-l", "-c", cmd}
+	}
+
 	// 使用 bash -c 执行以支持复杂的 shell 语法
-	c := exec.CommandContext(ctx, "bash", "-c", cmd)
+	c := exec.CommandContext(ctx, "bash", args...)
 	out, err := c.CombinedOutput()
 	if err != nil {
 		return string(out), fmt.Errorf("command failed: %w, output: %s", err, string(out))
@@ -28,22 +40,33 @@ func (e *LocalExecutor) Run(ctx context.Context, cmd string) (string, error) {
 	return string(out), nil
 }
 
-func (e *LocalExecutor) RunWithSudo(ctx context.Context, cmd string) (string, error) {
+func (e *LocalExecutor) RunWithSudo(ctx context.Context, cmd string, opts ...ssh.RunOption) (string, error) {
+	config := ssh.DefaultRunConfig()
+	for _, opt := range opts {
+		opt(config)
+	}
+
 	if os.Getuid() == 0 {
-		return e.Run(ctx, cmd)
+		return e.Run(ctx, cmd, opts...)
 	}
 	if e.password == "" {
 		// 如果没密码，尝试无交互 sudo
 		if !strings.HasPrefix(cmd, "sudo") {
 			cmd = "sudo " + cmd
 		}
-		return e.Run(ctx, cmd)
+		return e.Run(ctx, cmd, opts...)
 	}
 
 	// 使用 sudo -S 从 stdin 读取密码
 	// -p '' 隐藏提示符
 	sudoCmd := fmt.Sprintf("sudo -S -p '' %s", cmd)
-	c := exec.CommandContext(ctx, "bash", "-c", sudoCmd)
+
+	args := []string{"-c", sudoCmd}
+	if config.LoginShell {
+		args = []string{"-l", "-c", sudoCmd}
+	}
+
+	c := exec.CommandContext(ctx, "bash", args...)
 
 	stdin, err := c.StdinPipe()
 	if err != nil {

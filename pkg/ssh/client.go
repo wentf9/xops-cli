@@ -65,9 +65,37 @@ func (c *Client) Config() *ClientConfig {
 	return c.cfg
 }
 
-func (c *Client) Run(ctx context.Context, cmd string) (string, error) {
-	// 使用 bash -l -c 执行，以加载完整的环境变量 (如 PATH)
-	wrappedCmd := fmt.Sprintf("bash -l -c '%s'", strings.ReplaceAll(cmd, "'", "'\\''"))
+type RunConfig struct {
+	LoginShell bool
+}
+
+type RunOption func(*RunConfig)
+
+func WithLoginShell(login bool) RunOption {
+	return func(c *RunConfig) {
+		c.LoginShell = login
+	}
+}
+
+func DefaultRunConfig() *RunConfig {
+	return &RunConfig{
+		LoginShell: true,
+	}
+}
+
+func (c *Client) Run(ctx context.Context, cmd string, opts ...RunOption) (string, error) {
+	config := DefaultRunConfig()
+	for _, opt := range opts {
+		opt(config)
+	}
+
+	var wrappedCmd string
+	if config.LoginShell {
+		// 使用 bash -l -c 执行，以加载完整的环境变量 (如 PATH)
+		wrappedCmd = fmt.Sprintf("bash -l -c '%s'", strings.ReplaceAll(cmd, "'", "'\\''"))
+	} else {
+		wrappedCmd = fmt.Sprintf("bash -c '%s'", strings.ReplaceAll(cmd, "'", "'\\''"))
+	}
 	return c.runRaw(ctx, wrappedCmd)
 }
 
@@ -88,7 +116,12 @@ func (c *Client) runRaw(ctx context.Context, wrappedCmd string) (string, error) 
 }
 
 // RunScript 执行 Shell 脚本内容
-func (c *Client) RunScript(ctx context.Context, scriptContent string) (string, error) {
+func (c *Client) RunScript(ctx context.Context, scriptContent string, opts ...RunOption) (string, error) {
+	config := DefaultRunConfig()
+	for _, opt := range opts {
+		opt(config)
+	}
+
 	session, err := c.sshClient.NewSession()
 	if err != nil {
 		return "", fmt.Errorf("failed to create new session: %w", err)
@@ -96,7 +129,12 @@ func (c *Client) RunScript(ctx context.Context, scriptContent string) (string, e
 	defer func() { _ = session.Close() }()
 
 	session.Stdin = strings.NewReader(scriptContent)
-	return startWithTimeout(ctx, session, "bash -l -s")
+
+	cmd := "bash -s"
+	if config.LoginShell {
+		cmd = "bash -l -s"
+	}
+	return startWithTimeout(ctx, session, cmd)
 }
 
 // streamReader 包装 io.ReadCloser 以便在关闭时清理 SSH session

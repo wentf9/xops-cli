@@ -145,6 +145,8 @@ flag_exec_shell:
   other: "Local shell script file"
 flag_exec_task:
   other: "Number of parallel hosts"
+flag_exec_no_login:
+  other: "Do not load login shell (prevents welcome messages/MOTD)"
 exec_connect_failed:
   other: "[{{.Host}}] Connection failed: {{.Error}}"
 exec_host_error:

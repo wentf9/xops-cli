@@ -23,15 +23,17 @@ type ExecOptions struct {
 	ShellFile   string
 	Command     string
 	Tag         string
-	TaskCount   int
-	SuPwd       string
-	Interactive bool
+	TaskCount    int
+	SuPwd        string
+	Interactive  bool
+	NoLoginShell bool
 }
 
 func NewExecOptions() *ExecOptions {
 	return &ExecOptions{
-		SshOptions: *NewSshOptions(),
-		TaskCount:  1,
+		SshOptions:   *NewSshOptions(),
+		TaskCount:    1,
+		NoLoginShell: false,
 	}
 }
 
@@ -71,6 +73,7 @@ func NewCmdExec() *cobra.Command {
 	cmd.Flags().StringVar(&o.ShellFile, "shell", "", i18n.T("flag_exec_shell"))
 	cmd.Flags().IntVar(&o.TaskCount, "task", 3, i18n.T("flag_exec_task"))
 	cmd.Flags().BoolVarP(&o.Interactive, "interactive", "x", false, i18n.T("flag_exec_interactive"))
+	cmd.Flags().BoolVar(&o.NoLoginShell, "no-login", false, i18n.T("flag_exec_no_login"))
 
 	cmd.MarkFlagsMutuallyExclusive("password", "identity")
 	cmd.MarkFlagsMutuallyExclusive("host", "ifile", "tag")
@@ -227,17 +230,19 @@ func (o *ExecOptions) Run() error {
 			var output string
 			var execErr error
 
+			runOpt := ssh.WithLoginShell(!o.NoLoginShell)
+
 			if isScript {
 				if o.Sudo {
-					output, execErr = client.RunScriptWithSudo(ctx, execCmd)
+					output, execErr = client.RunScriptWithSudo(ctx, execCmd, runOpt)
 				} else {
-					output, execErr = client.RunScript(ctx, execCmd)
+					output, execErr = client.RunScript(ctx, execCmd, runOpt)
 				}
 			} else {
 				if o.Sudo {
-					output, execErr = client.RunWithSudo(ctx, execCmd)
+					output, execErr = client.RunWithSudo(ctx, execCmd, runOpt)
 				} else {
-					output, execErr = client.Run(ctx, execCmd)
+					output, execErr = client.Run(ctx, execCmd, runOpt)
 				}
 			}
 

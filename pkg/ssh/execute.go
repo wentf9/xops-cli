@@ -13,13 +13,24 @@ import (
 	"golang.org/x/term"
 )
 
-func (c *Client) RunWithSudo(ctx context.Context, command string) (string, error) {
+func (c *Client) RunWithSudo(ctx context.Context, command string, opts ...RunOption) (string, error) {
+	config := DefaultRunConfig()
+	for _, opt := range opts {
+		opt(config)
+	}
+
 	c.maybeDetectSudoMode(ctx)
-	wrappedCmd := fmt.Sprintf("bash -l -c '%s'", strings.ReplaceAll(command, "'", "'\\''"))
+
+	var wrappedCmd string
+	if config.LoginShell {
+		wrappedCmd = fmt.Sprintf("bash -l -c '%s'", strings.ReplaceAll(command, "'", "'\\''"))
+	} else {
+		wrappedCmd = fmt.Sprintf("bash -c '%s'", strings.ReplaceAll(command, "'", "'\\''"))
+	}
 
 	switch c.cfg.SudoMode {
 	case SudoModeRoot:
-		return c.Run(ctx, command)
+		return c.Run(ctx, command, opts...)
 	case SudoModeSudo:
 		return c.runWithSudo(ctx, wrappedCmd, c.cfg.Password, nil)
 	case SudoModeSudoer:
@@ -32,17 +43,30 @@ func (c *Client) RunWithSudo(ctx context.Context, command string) (string, error
 }
 
 // RunScriptWithSudo 提权执行脚本
-func (c *Client) RunScriptWithSudo(ctx context.Context, scriptContent string) (string, error) {
+func (c *Client) RunScriptWithSudo(ctx context.Context, scriptContent string, opts ...RunOption) (string, error) {
+	config := DefaultRunConfig()
+	for _, opt := range opts {
+		opt(config)
+	}
+
 	c.maybeDetectSudoMode(ctx)
+
+	bashArgs := "bash -s"
+	bashCmd := fmt.Sprintf("bash -c '%s'", strings.ReplaceAll(scriptContent, "'", "'\\''"))
+	if config.LoginShell {
+		bashArgs = "bash -l -s"
+		bashCmd = fmt.Sprintf("bash -l -c '%s'", strings.ReplaceAll(scriptContent, "'", "'\\''"))
+	}
+
 	switch c.cfg.SudoMode {
 	case SudoModeRoot:
-		return c.RunScript(ctx, scriptContent)
+		return c.RunScript(ctx, scriptContent, opts...)
 	case SudoModeSudo:
-		return c.runWithSudo(ctx, "bash -l -s", c.cfg.Password, strings.NewReader(scriptContent))
+		return c.runWithSudo(ctx, bashArgs, c.cfg.Password, strings.NewReader(scriptContent))
 	case SudoModeSudoer:
-		return c.runWithSudo(ctx, "bash -l -s", "", strings.NewReader(scriptContent))
+		return c.runWithSudo(ctx, bashArgs, "", strings.NewReader(scriptContent))
 	case SudoModeSu:
-		return c.runWithSu(ctx, fmt.Sprintf("bash -l -c '%s'", strings.ReplaceAll(scriptContent, "'", "'\\''")), c.cfg.SuPwd)
+		return c.runWithSu(ctx, bashCmd, c.cfg.SuPwd)
 	default:
 		return "", fmt.Errorf("unsupported sudo mode: %s", c.cfg.SudoMode)
 	}

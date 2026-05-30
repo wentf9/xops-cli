@@ -3,6 +3,8 @@ package firewall
 import (
 	"context"
 	"fmt"
+
+	"github.com/wentf9/xops-cli/pkg/ssh"
 )
 
 // mockExecutor 记录接收到的命令并返回预设结果
@@ -21,7 +23,7 @@ func newMockExecutor() *mockExecutor {
 	}
 }
 
-func (m *mockExecutor) Run(ctx context.Context, cmd string) (string, error) {
+func (m *mockExecutor) Run(ctx context.Context, cmd string, opts ...ssh.RunOption) (string, error) {
 	m.lastCmd = cmd
 	if err, ok := m.errors[cmd]; ok {
 		return "", err
@@ -32,8 +34,8 @@ func (m *mockExecutor) Run(ctx context.Context, cmd string) (string, error) {
 	return "", fmt.Errorf("command not found: %s", cmd)
 }
 
-func (m *mockExecutor) RunWithSudo(ctx context.Context, cmd string) (string, error) {
-	return m.Run(ctx, cmd)
+func (m *mockExecutor) RunWithSudo(ctx context.Context, cmd string, opts ...ssh.RunOption) (string, error) {
+	return m.Run(ctx, cmd, opts...)
 }
 
 func (m *mockExecutor) InteractiveWithSudo(ctx context.Context, args []string) error {
