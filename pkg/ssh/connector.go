@@ -28,6 +28,10 @@ type Connector struct {
 	sf singleflight.Group
 	// 自动接受新的主机密钥
 	AcceptNewHostKey atomic.Bool
+	// PasswordPromptPattern 全局级自定义密码提示正则（可选）。
+	// 当节点的 ClientConfig.PasswordPromptPattern 为空时，使用此值；
+	// 两者均为空则使用内置的 DefaultPasswordPromptPattern。
+	PasswordPromptPattern string
 }
 
 var hostKeyPromptMutex sync.Mutex
@@ -51,7 +55,7 @@ func (c *Connector) Connect(ctx context.Context, nodeName string) (*Client, erro
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch config for cached node '%s': %w", nodeName, err)
 		}
-		return newClient(cachedClient, cfg, c.store), nil
+		return newClient(cachedClient, cfg, c.store, c.PasswordPromptPattern), nil
 	}
 	// 缓存未命中，开始建立新连接
 	// 【合并请求】使用 singleflight
@@ -108,7 +112,7 @@ func (c *Connector) initializeConnection(ctx context.Context, nodeName string) (
 
 	c.clients.Set(nodeName, rawClient)
 	// 返回封装的 Client
-	return newClient(rawClient, cfg, c.store), nil
+	return newClient(rawClient, cfg, c.store, c.PasswordPromptPattern), nil
 }
 
 func (c *Connector) setupDialer(ctx context.Context, cfg *ClientConfig) (Dialer, error) {

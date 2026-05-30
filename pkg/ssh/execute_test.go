@@ -1,10 +1,7 @@
 package ssh
 
 import (
-	"bytes"
-	"strings"
 	"testing"
-	"time"
 )
 
 func TestGetSudoParams(t *testing.T) {
@@ -45,34 +42,38 @@ func TestGetSudoParams(t *testing.T) {
 	}
 }
 
-func TestProcessSuOutputForPassword(t *testing.T) {
-	stdout := bytes.NewBufferString("some output\nPassword: ")
-	outputBuf := &bytes.Buffer{}
-	foundCh := make(chan bool, 1)
-
-	go processSuOutputForPassword(stdout, foundCh, outputBuf)
-
-	select {
-	case found := <-foundCh:
-		if !found {
-			t.Errorf("expected true, got false")
-		}
-	case <-time.After(1 * time.Second):
-		t.Fatal("timeout waiting for password prompt")
+func TestPasswordPromptRegex_TwoLayerFallback(t *testing.T) {
+	// 1. 节点级正则优先
+	c := newClient(nil, &ClientConfig{PasswordPromptPattern: `(?i)custom:`}, nil, `(?i)global:`)
+	re := c.passwordPromptRegex()
+	if !re.MatchString("Custom: ") {
+		t.Errorf("node-level pattern should have priority")
+	}
+	if re.MatchString("Global: ") {
+		t.Errorf("connector-level pattern should be overridden by node-level")
 	}
 
-	if !strings.Contains(outputBuf.String(), "Password:") {
-		t.Errorf("expected output buffer to contain 'Password:', got %q", outputBuf.String())
+	// 2. 节点级为空时回落到 Connector 全局级
+	c2 := newClient(nil, &ClientConfig{}, nil, `(?i)global:`)
+	re2 := c2.passwordPromptRegex()
+	if !re2.MatchString("Global: ") {
+		t.Errorf("connector-level pattern should be used when node-level is empty")
 	}
-}
 
-func TestHandlePasswordHandshake(t *testing.T) {
-	stdout := bytes.NewBufferString("some output\n[sudo] password for user: ")
-	stdin := &bytes.Buffer{}
+	// 3. 两者均为空时回落到内置默认
+	c3 := newClient(nil, &ClientConfig{}, nil, "")
+	re3 := c3.passwordPromptRegex()
+	if !re3.MatchString("Password: ") {
+		t.Errorf("default pattern should match 'Password:'")
+	}
+	if !re3.MatchString("密码：") {
+		t.Errorf("default pattern should match Chinese prompt")
+	}
 
-	handlePasswordHandshake(stdout, stdin, "mypassword")
-
-	if stdin.String() != "mypassword\n" {
-		t.Errorf("expected 'mypassword\\n', got %q", stdin.String())
+	// 4. 节点级正则无效时静默降级
+	c4 := newClient(nil, &ClientConfig{PasswordPromptPattern: `[invalid`}, nil, "")
+	re4 := c4.passwordPromptRegex()
+	if !re4.MatchString("Password: ") {
+		t.Errorf("should fall back to default when node-level pattern is invalid")
 	}
 }

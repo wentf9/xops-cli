@@ -1,7 +1,6 @@
 package ssh
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -79,11 +78,19 @@ func (c *Client) RunInteractiveWithSudo(ctx context.Context, command string) err
 	}
 
 	stdin, _ := session.StdinPipe()
-	stdout, _ := session.StdoutPipe()
-	stderr, _ := session.StderrPipe()
 
-	if err := session.Shell(); err != nil {
-		return fmt.Errorf("start shell failed: %w", err)
+	sudoCmd, password := c.getSudoParams()
+	expect := c.setupInteractiveExpect(session, stdin, password)
+	session.Stderr = os.Stderr
+
+	if sudoCmd != "" {
+		if err := session.Start(sudoCmd); err != nil {
+			return fmt.Errorf("start %s failed: %w", sudoCmd, err)
+		}
+	} else {
+		if err := session.Shell(); err != nil {
+			return fmt.Errorf("start shell failed: %w", err)
+		}
 	}
 
 	oldState, err := term.MakeRaw(fdIn)
@@ -96,14 +103,16 @@ func (c *Client) RunInteractiveWithSudo(ctx context.Context, command string) err
 	defer cancelResize()
 	startWindowResizeLoop(derivedCtx, session, fdOut, width, height)
 
-	sudoCmd, password := c.getSudoParams()
-	// 使用 exec 替换掉普通用户的 shell，使得提权退出后直接关闭 SSH 会话
-	if sudoCmd != "" {
-		_, _ = stdin.Write([]byte("exec " + sudoCmd + "\n"))
-	}
+	if expect != nil {
+		_ = expect.Wait(ctx, 5*time.Second)
 
-	if password != "" {
-		handlePasswordHandshake(stdout, stdin, password)
+		// 获取被拦截的输出，仅需清理密码行，不再有 sudo 回显
+		cleaned := expect.CleanOutput(c.passwordPromptRegex())
+		_, _ = os.Stdout.Write([]byte(cleaned))
+
+		// 握手结束后，将后续输出直接透传给终端，并停止无谓的累积
+		expect.SetAccumulate(false)
+		expect.SetTarget(os.Stdout)
 	}
 
 	// 提权完成后，给 Root Shell 留出 1 秒的初始化时间，
@@ -114,9 +123,6 @@ func (c *Client) RunInteractiveWithSudo(ctx context.Context, command string) err
 	// 使用 exec bash -c 替换掉提权后的 root shell
 	wrappedCmd := fmt.Sprintf("exec bash -c '%s'\n", strings.ReplaceAll(command, "'", "'\\''"))
 	_, _ = stdin.Write([]byte(wrappedCmd))
-
-	go func() { _, _ = io.Copy(os.Stdout, stdout) }()
-	go func() { _, _ = io.Copy(os.Stderr, stderr) }()
 
 	cancelStdin, stdinDone := copyStdinTo(stdin)
 
@@ -173,10 +179,13 @@ func (c *Client) runWithSu(ctx context.Context, command string, password string)
 	if err != nil {
 		return "", fmt.Errorf("failed to create stdin pipe: %w", err)
 	}
-	stdout, err := session.StdoutPipe()
-	if err != nil {
-		return "", fmt.Errorf("failed to create stdout pipe: %w", err)
-	}
+
+	expect := NewExpect(stdin, ExpectRule{
+		Pattern: c.passwordPromptRegex(),
+		Respond: StaticRespond(password),
+	})
+	expect.SetAccumulate(true)
+	session.Stdout = expect
 
 	cmd := fmt.Sprintf("export LC_ALL=C; su - root -c '%s'", strings.ReplaceAll(command, "'", "'\\''"))
 
@@ -184,24 +193,8 @@ func (c *Client) runWithSu(ctx context.Context, command string, password string)
 		return "", fmt.Errorf("failed to start command: %w", err)
 	}
 
-	var outputBuf bytes.Buffer
-	passwordPromptFound := make(chan bool, 1)
-
-	go processSuOutputForPassword(stdout, passwordPromptFound, &outputBuf)
-
-	select {
-	case <-passwordPromptFound:
-		_, err = stdin.Write([]byte(password + "\n"))
-		if err != nil {
-			return "", fmt.Errorf("failed to send password: %w", err)
-		}
-	case <-time.After(5 * time.Second):
-		return outputBuf.String(), fmt.Errorf("timeout waiting for password prompt")
-	case <-ctx.Done():
-		if killErr := session.Signal(ssh.SIGKILL); killErr != nil {
-			return outputBuf.String(), fmt.Errorf("failed to kill command after context done: %w", killErr)
-		}
-		return outputBuf.String(), ctx.Err()
+	if err := expect.Wait(ctx, 5*time.Second); err != nil {
+		return expect.Output(), fmt.Errorf("password handshake failed: %w", err)
 	}
 
 	done := make(chan error, 1)
@@ -213,39 +206,17 @@ func (c *Client) runWithSu(ctx context.Context, command string, password string)
 	case err = <-done:
 	case <-ctx.Done():
 		if killErr := session.Signal(ssh.SIGKILL); killErr != nil {
-			return outputBuf.String(), fmt.Errorf("failed to kill command after context done: %w", killErr)
+			return expect.Output(), fmt.Errorf("failed to kill command after context done: %w", killErr)
 		}
-		return outputBuf.String(), ctx.Err()
+		return expect.Output(), ctx.Err()
 	}
 
-	cleanOutput := cleanSuOutput(outputBuf.String())
+	cleanOutput := expect.CleanOutput(c.passwordPromptRegex())
 	if err != nil {
 		return cleanOutput, fmt.Errorf("command execution failed: %w", err)
 	}
 
 	return cleanOutput, nil
-}
-
-func processSuOutputForPassword(stdout io.Reader, passwordPromptFound chan<- bool, outputBuf *bytes.Buffer) {
-	buf := make([]byte, 1024)
-	found := false
-	for {
-		n, err := stdout.Read(buf)
-		if n > 0 {
-			chunk := buf[:n]
-			outputBuf.Write(chunk)
-			if !found && (strings.Contains(strings.ToLower(string(chunk)), "assword") || strings.Contains(string(chunk), "密码")) {
-				found = true
-				passwordPromptFound <- true
-			}
-		}
-		if err != nil {
-			if !found {
-				close(passwordPromptFound)
-			}
-			break
-		}
-	}
 }
 
 func (c *Client) ShellWithSudo(ctx context.Context) error {
@@ -287,11 +258,19 @@ func (c *Client) ShellWithSudo(ctx context.Context) error {
 		return fmt.Errorf("request for pty failed: %w", err)
 	}
 	stdin, _ := session.StdinPipe()
-	stdout, _ := session.StdoutPipe()
-	stderr, _ := session.StderrPipe()
 
-	if err := session.Shell(); err != nil {
-		return fmt.Errorf("failed to start shell: %w", err)
+	sudoCmd, password := c.getSudoParams()
+	expect := c.setupInteractiveExpect(session, stdin, password)
+	session.Stderr = os.Stderr
+
+	if sudoCmd != "" {
+		if err := session.Start(sudoCmd); err != nil {
+			return fmt.Errorf("start %s failed: %w", sudoCmd, err)
+		}
+	} else {
+		if err := session.Shell(); err != nil {
+			return fmt.Errorf("start shell failed: %w", err)
+		}
 	}
 
 	oldState, err := term.MakeRaw(fdIn)
@@ -304,26 +283,17 @@ func (c *Client) ShellWithSudo(ctx context.Context) error {
 	defer cancelResize()
 	startWindowResizeLoop(derivedCtx, session, fdOut, width, height)
 
-	sudoCmd, password := c.getSudoParams()
-	_, _ = stdin.Write([]byte(sudoCmd + "\n"))
+	if expect != nil {
+		_ = expect.Wait(ctx, 5*time.Second)
 
-	if password == "" {
-		go func() { _, _ = io.Copy(os.Stdout, stdout) }()
-		go func() { _, _ = io.Copy(os.Stderr, stderr) }()
+		// 提取、清洗并打印密码握手前的截留输出
+		cleaned := expect.CleanOutput(c.passwordPromptRegex())
+		_, _ = os.Stdout.Write([]byte(cleaned))
 
-		cancelStdin, stdinDone := copyStdinTo(stdin)
-
-		err = ignoreShellExitError(session.Wait())
-		_ = term.Restore(fdIn, oldState)
-		cancelStdin()
-		<-stdinDone
-		return err
+		// 将后续真实的 Shell 输出接入到当前终端
+		expect.SetAccumulate(false)
+		expect.SetTarget(os.Stdout)
 	}
-
-	handlePasswordHandshake(stdout, stdin, password)
-
-	go func() { _, _ = io.Copy(os.Stdout, stdout) }()
-	go func() { _, _ = io.Copy(os.Stderr, stderr) }()
 
 	cancelStdin, stdinDone := copyStdinTo(stdin)
 
@@ -383,50 +353,20 @@ func startWindowResizeLoop(ctx context.Context, session *ssh.Session, fdOut, wid
 	}()
 }
 
-func handlePasswordHandshake(stdout io.Reader, stdin io.Writer, password string) {
-	buf := make([]byte, 1024)
-	var outputHistory bytes.Buffer
-	done := make(chan struct{})
-
-	timer := time.AfterFunc(5*time.Second, func() {
-		close(done)
-	})
-	defer timer.Stop()
-
-HandshakeLoop:
-	for {
-		select {
-		case <-done:
-			break HandshakeLoop
-		default:
-			n, err := stdout.Read(buf)
-			if err != nil {
-				break HandshakeLoop
-			}
-			if n > 0 {
-				outputHistory.Write(buf[:n])
-				text := outputHistory.String()
-				if outputHistory.Len() > 500 {
-					outputHistory.Reset()
-				}
-				if strings.Contains(strings.ToLower(text), "assword") || strings.Contains(text, "密码") {
-					_, _ = stdin.Write([]byte(password + "\n"))
-					break HandshakeLoop
-				}
-			}
-		}
+// setupInteractiveExpect 配置并返回一个用于拦截登录输出的 Expect 状态机。
+func (c *Client) setupInteractiveExpect(session *ssh.Session, stdin io.Writer, password string) *Expect {
+	if password == "" {
+		session.Stdout = os.Stdout
+		return nil
 	}
-}
 
-func cleanSuOutput(raw string) string {
-	lines := strings.Split(raw, "\n")
-	var result []string
-	for _, line := range lines {
-		trimLine := strings.TrimSpace(line)
-		if strings.Contains(trimLine, "assword:") || trimLine == "" || strings.Contains(trimLine, "密码") {
-			continue
-		}
-		result = append(result, line)
-	}
-	return strings.Join(result, "\n")
+	rules := []ExpectRule{{
+		Pattern: c.passwordPromptRegex(),
+		Respond: StaticRespond(password),
+	}}
+
+	expect := NewExpect(stdin, rules...)
+	expect.SetAccumulate(true)
+	session.Stdout = expect
+	return expect
 }

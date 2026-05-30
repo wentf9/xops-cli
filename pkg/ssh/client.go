@@ -7,25 +7,47 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 
+	"github.com/wentf9/xops-cli/pkg/logger"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/term"
 )
 
 type Client struct {
-	sshClient *ssh.Client
-	cfg       *ClientConfig
-	store     ConfigStore
+	sshClient        *ssh.Client
+	cfg              *ClientConfig
+	store            ConfigStore
+	connectorPattern string         // Connector 全局级密码提示正则，当节点级为空时回落到此字段
+	promptRegex      *regexp.Regexp // 缓存预编译好的正则
 }
 
-func newClient(raw *ssh.Client, cfg *ClientConfig, store ConfigStore) *Client {
-	return &Client{
-		sshClient: raw,
-		cfg:       cfg,
-		store:     store,
+func newClient(raw *ssh.Client, cfg *ClientConfig, store ConfigStore, connectorPattern string) *Client {
+	c := &Client{
+		sshClient:        raw,
+		cfg:              cfg,
+		store:            store,
+		connectorPattern: connectorPattern,
 	}
+
+	pattern := cfg.PasswordPromptPattern
+	if pattern == "" {
+		pattern = connectorPattern
+	}
+	if pattern == "" {
+		pattern = DefaultPasswordPromptPattern
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		logger.Warnf("xops-cli ssh client:failed to compile password prompt regex: %v", err)
+		logger.Warn("xops-cli ssh client:failed to compile password prompt regex, trying default")
+		re = regexp.MustCompile(DefaultPasswordPromptPattern)
+	}
+	c.promptRegex = re
+
+	return c
 }
 
 // Close 关闭连接
@@ -396,4 +418,9 @@ func (w *synchronizedWriter) String() string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.b.String()
+}
+
+// passwordPromptRegex 返回当前节点的密码提示正则
+func (c *Client) passwordPromptRegex() *regexp.Regexp {
+	return c.promptRegex
 }

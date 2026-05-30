@@ -25,6 +25,9 @@ type ClientConfig struct {
 	SudoMode   SudoMode // "root", "sudo", "sudoer", "su", "none", "auto"
 	SuPwd      string
 	ProxyJump  string // 跳板机的 NodeID
+	// PasswordPromptPattern 自定义密码提示正则（节点级，可选）。
+	// 为空时回落到 Connector 的全局配置，再为空则使用内置的多语言默认模式。
+	PasswordPromptPattern string
 }
 
 // ConfigStore 定义底层如何获取配置以及如何回写探测到的新配置。
