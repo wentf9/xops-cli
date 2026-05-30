@@ -43,6 +43,9 @@ type Node struct {
 	// 提权配置
 	SudoMode SudoMode `yaml:"sudo_mode"` // 使用 SudoMode 枚举
 	SuPwd    string   `yaml:"su_pwd,omitempty"`
+
+	// 交互式拦截配置
+	PasswordPromptPattern string `yaml:"password_prompt_pattern,omitempty"` // 节点级自定义密码提示正则
 }
 
 // NodeFilter 用于批量操作时筛选节点

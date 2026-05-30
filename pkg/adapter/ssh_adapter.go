@@ -24,7 +24,11 @@ func NewSSHAdapter(cfgProvider config.ConfigProvider) *SSHAdapter {
 // NewConnector 是一个辅助方法，快速创建组装好 Adapter 的 ssh.Connector
 func NewConnector(cfgProvider config.ConfigProvider) *ssh.Connector {
 	adp := NewSSHAdapter(cfgProvider)
-	return ssh.NewConnector(adp, adp)
+	conn := ssh.NewConnector(adp, adp)
+	if cfg := cfgProvider.GetConfig(); cfg != nil {
+		conn.PasswordPromptPattern = cfg.PasswordPromptPattern
+	}
+	return conn
 }
 
 // GetConfig 获取底层 SSH 客户端需要的配置
@@ -45,17 +49,18 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 	}
 
 	return &ssh.ClientConfig{
-		NodeID:     nodeID,
-		Address:    host.Address,
-		Port:       int(host.Port),
-		User:       identity.User,
-		AuthType:   identity.AuthType,
-		Password:   identity.Password,
-		KeyPath:    identity.KeyPath,
-		Passphrase: identity.Passphrase,
-		SudoMode:   ssh.SudoMode(node.SudoMode),
-		SuPwd:      node.SuPwd,
-		ProxyJump:  node.ProxyJump,
+		NodeID:                nodeID,
+		Address:               host.Address,
+		Port:                  int(host.Port),
+		User:                  identity.User,
+		AuthType:              identity.AuthType,
+		Password:              identity.Password,
+		KeyPath:               identity.KeyPath,
+		Passphrase:            identity.Passphrase,
+		SudoMode:              ssh.SudoMode(node.SudoMode),
+		SuPwd:                 node.SuPwd,
+		ProxyJump:             node.ProxyJump,
+		PasswordPromptPattern: node.PasswordPromptPattern,
 	}, nil
 }
 

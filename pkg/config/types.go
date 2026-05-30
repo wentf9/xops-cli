@@ -7,10 +7,11 @@ import (
 
 // Configuration 对应 yaml 文件的顶层结构
 type Configuration struct {
-	Identities *concurrent.Map[string, models.Identity] `yaml:"identities"`
-	Hosts      *concurrent.Map[string, models.Host]     `yaml:"hosts"`
-	Nodes      *concurrent.Map[string, models.Node]     `yaml:"nodes"`
-	Guardrail  *GuardrailConfig                         `yaml:"guardrail,omitempty"`
+	Identities            *concurrent.Map[string, models.Identity] `yaml:"identities"`
+	Hosts                 *concurrent.Map[string, models.Host]     `yaml:"hosts"`
+	Nodes                 *concurrent.Map[string, models.Node]     `yaml:"nodes"`
+	Guardrail             *GuardrailConfig                         `yaml:"guardrail,omitempty"`
+	PasswordPromptPattern string                                   `yaml:"password_prompt_pattern,omitempty"` // 全局级自定义密码提示正则
 }
 
 // GuardrailConfig configures the MCP safety guardrail.

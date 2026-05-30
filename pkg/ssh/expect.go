@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"sync"
 	"time"
+
+	"github.com/wentf9/xops-cli/pkg/logger"
 )
 
 // DefaultPasswordPromptPattern 是内置的多语言密码提示正则，覆盖主流语言环境。
@@ -106,6 +108,8 @@ func (e *Expect) matchRulesLocked() {
 			break
 		}
 
+		logger.Debugf("Expect rule matched successfully. Pattern: %q", current.Pattern.String())
+
 		if current.Respond != nil {
 			response, err := current.Respond()
 			if err != nil {
@@ -147,6 +151,12 @@ func (e *Expect) Wait(ctx context.Context, timeout time.Duration) error {
 	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	e.mu.Lock()
+	if e.ruleIdx < len(e.rules) {
+		logger.Debugf("Expect waiting for rule match. Pattern: %q, Timeout: %s", e.rules[e.ruleIdx].Pattern.String(), timeout)
+	}
+	e.mu.Unlock()
+
 	select {
 	case <-e.matched:
 		e.mu.Lock()
@@ -158,8 +168,14 @@ func (e *Expect) Wait(ctx context.Context, timeout time.Duration) error {
 			return ctx.Err()
 		}
 		e.mu.Lock()
-		pattern := e.rules[e.ruleIdx].Pattern
+		var pattern string
+		if e.ruleIdx < len(e.rules) {
+			pattern = e.rules[e.ruleIdx].Pattern.String()
+		}
+		actual := e.outputBuf.String()
 		e.mu.Unlock()
+
+		logger.Debugf("Expect match timeout. Pattern: %q, Actual output received: %q", pattern, actual)
 		return fmt.Errorf("expect timeout after %s waiting for pattern: %s", timeout, pattern)
 	}
 }

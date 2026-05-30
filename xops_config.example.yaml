@@ -10,6 +10,12 @@
 # 每个条目是一个命名的认证配置，可被多个 Node 复用。
 # 密码/私钥密码字段在首次 save 后会被 AES 加密存储。
 # =============================================================================
+
+# 【可选】全局自定义密码提示正则，golang正则表达式格式。若非英语系统可在此处统一配置。
+# 此配置项在进入需要提权的交互式shell时匹配sudo密码提示词，如 `[sudo] user 的密码：`。  
+# 只有当发现目标机器给出的提权密码提示符不在内置列表中导致提权 Hang 住时，才需要使用此配置项进行覆盖定制。
+password_prompt_pattern: "(?i)password:"
+
 identities:
 
   # 使用 SSH 私钥认证
@@ -85,6 +91,7 @@ nodes:
       - web
       - prod
     sudo_mode: sudo                     # 提权方式: none | sudo | sudoer | su | root | auto
+    # password_prompt_pattern: "(?i)mot de passe:" # 【可选】节点级自定义密码提示正则，优先级高于全局配置
     alias:
       - frontend-1
 
