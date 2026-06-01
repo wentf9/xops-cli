@@ -1,7 +1,6 @@
 package ssh
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -9,7 +8,6 @@ import (
 	"os"
 	"regexp"
 	"strings"
-	"sync"
 
 	"github.com/wentf9/xops-cli/pkg/logger"
 	"golang.org/x/crypto/ssh"
@@ -66,7 +64,12 @@ func (c *Client) Config() *ClientConfig {
 }
 
 type RunConfig struct {
-	LoginShell bool
+	LoginShell   bool
+	OutMode      OutputMode
+	RingMaxBytes int
+	StreamPrefix string
+	StreamWriter io.Writer
+	OutFile      *os.File
 }
 
 type RunOption func(*RunConfig)
@@ -74,6 +77,34 @@ type RunOption func(*RunConfig)
 func WithLoginShell(login bool) RunOption {
 	return func(c *RunConfig) {
 		c.LoginShell = login
+	}
+}
+
+func WithOutputMode(mode OutputMode) RunOption {
+	return func(c *RunConfig) {
+		c.OutMode = mode
+	}
+}
+
+func WithRingBuffer(maxBytes int) RunOption {
+	return func(c *RunConfig) {
+		c.OutMode = OutputModeRingBuffer
+		c.RingMaxBytes = maxBytes
+	}
+}
+
+func WithStream(writer io.Writer, prefix string) RunOption {
+	return func(c *RunConfig) {
+		c.OutMode = OutputModeStream
+		c.StreamWriter = writer
+		c.StreamPrefix = prefix
+	}
+}
+
+func WithOutFile(file *os.File) RunOption {
+	return func(c *RunConfig) {
+		c.OutMode = OutputModeFile
+		c.OutFile = file
 	}
 }
 
@@ -96,23 +127,23 @@ func (c *Client) Run(ctx context.Context, cmd string, opts ...RunOption) (string
 	} else {
 		wrappedCmd = fmt.Sprintf("bash -c '%s'", strings.ReplaceAll(cmd, "'", "'\\''"))
 	}
-	return c.runRaw(ctx, wrappedCmd)
+	return c.runRaw(ctx, wrappedCmd, config)
 }
 
 // RunWithoutLogin 执行命令并在非登录 Shell 中运行，避免加载 profile 脚本产生干扰输出
 func (c *Client) RunWithoutLogin(ctx context.Context, cmd string) (string, error) {
 	wrappedCmd := fmt.Sprintf("bash -c '%s'", strings.ReplaceAll(cmd, "'", "'\\''"))
-	return c.runRaw(ctx, wrappedCmd)
+	return c.runRaw(ctx, wrappedCmd, DefaultRunConfig())
 }
 
-func (c *Client) runRaw(ctx context.Context, wrappedCmd string) (string, error) {
+func (c *Client) runRaw(ctx context.Context, wrappedCmd string, config *RunConfig) (string, error) {
 	session, err := c.sshClient.NewSession()
 	if err != nil {
 		return "", fmt.Errorf("failed to create new session: %w", err)
 	}
 	defer func() { _ = session.Close() }()
 
-	return startWithTimeout(ctx, session, wrappedCmd)
+	return startWithTimeout(ctx, session, wrappedCmd, config)
 }
 
 // RunScript 执行 Shell 脚本内容
@@ -134,7 +165,7 @@ func (c *Client) RunScript(ctx context.Context, scriptContent string, opts ...Ru
 	if config.LoginShell {
 		cmd = "bash -l -s"
 	}
-	return startWithTimeout(ctx, session, cmd)
+	return startWithTimeout(ctx, session, cmd, config)
 }
 
 // streamReader 包装 io.ReadCloser 以便在关闭时清理 SSH session
@@ -388,7 +419,7 @@ func (c *Client) maybeDetectSudoMode(ctx context.Context) {
 
 	// 3. 测试密码 sudo 是否真正可用（避免用户有密码但不在 sudoers 中时误判）
 	if c.cfg.Password != "" {
-		if _, err := c.runWithSudo(ctx, "true", c.cfg.Password, nil); err == nil {
+		if _, err := c.runWithSudo(ctx, "true", c.cfg.Password, nil, nil); err == nil {
 			c.updateSudoMode(SudoModeSudo)
 			return
 		}
@@ -411,10 +442,11 @@ func (c *Client) updateSudoMode(mode SudoMode) {
 	}
 }
 
-func startWithTimeout(ctx context.Context, session *ssh.Session, command string) (string, error) {
-	var b bytes.Buffer
-	var mu sync.Mutex
-	syncWriter := &synchronizedWriter{mu: &mu, b: &b}
+func startWithTimeout(ctx context.Context, session *ssh.Session, command string, config *RunConfig) (string, error) {
+	if config == nil {
+		config = DefaultRunConfig()
+	}
+	syncWriter := newOutputWriter(config)
 	session.Stdout = syncWriter
 	session.Stderr = syncWriter
 
@@ -439,23 +471,6 @@ func startWithTimeout(ctx context.Context, session *ssh.Session, command string)
 		}
 		return syncWriter.String(), ctx.Err()
 	}
-}
-
-type synchronizedWriter struct {
-	mu *sync.Mutex
-	b  *bytes.Buffer
-}
-
-func (w *synchronizedWriter) Write(p []byte) (n int, err error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.b.Write(p)
-}
-
-func (w *synchronizedWriter) String() string {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.b.String()
 }
 
 // passwordPromptRegex 返回当前节点的密码提示正则

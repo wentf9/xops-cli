@@ -147,6 +147,10 @@ flag_exec_task:
   other: "Number of parallel hosts"
 flag_exec_no_login:
   other: "Do not load login shell (prevents welcome messages/MOTD)"
+flag_exec_stream:
+  other: "Enable real-time stream output (adds host prefix in multi-host mode)"
+flag_exec_out_dir:
+  other: "Directory to save output to per-host log files"
 exec_connect_failed:
   other: "[{{.Host}}] Connection failed: {{.Error}}"
 exec_host_error:

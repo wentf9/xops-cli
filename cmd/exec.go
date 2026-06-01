@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
@@ -19,14 +21,16 @@ import (
 
 type ExecOptions struct {
 	SshOptions
-	HostFile    string
-	ShellFile   string
-	Command     string
-	Tag         string
+	HostFile     string
+	ShellFile    string
+	Command      string
+	Tag          string
 	TaskCount    int
 	SuPwd        string
 	Interactive  bool
 	NoLoginShell bool
+	Stream       bool
+	OutDir       string
 }
 
 func NewExecOptions() *ExecOptions {
@@ -74,10 +78,13 @@ func NewCmdExec() *cobra.Command {
 	cmd.Flags().IntVar(&o.TaskCount, "task", 3, i18n.T("flag_exec_task"))
 	cmd.Flags().BoolVarP(&o.Interactive, "interactive", "x", false, i18n.T("flag_exec_interactive"))
 	cmd.Flags().BoolVar(&o.NoLoginShell, "no-login", false, i18n.T("flag_exec_no_login"))
+	cmd.Flags().BoolVar(&o.Stream, "stream", false, i18n.T("flag_exec_stream"))
+	cmd.Flags().StringVar(&o.OutDir, "out-dir", "", i18n.T("flag_exec_out_dir"))
 
 	cmd.MarkFlagsMutuallyExclusive("password", "identity")
 	cmd.MarkFlagsMutuallyExclusive("host", "ifile", "tag")
 	cmd.MarkFlagsMutuallyExclusive("cmd", "shell")
+	cmd.MarkFlagsMutuallyExclusive("stream", "out-dir")
 
 	return cmd
 }
@@ -216,41 +223,22 @@ func (o *ExecOptions) Run() error {
 		return o.runInteractive(ctx, connector, tasks[0], execCmd, configStore, cfg)
 	}
 
+	// 落盘模式：在 Worker Pool 启动前一次性创建目录
+	if o.OutDir != "" {
+		if err := os.MkdirAll(o.OutDir, 0750); err != nil {
+			return fmt.Errorf("failed to create output directory %s: %w", o.OutDir, err)
+		}
+	}
+
+	// 流式模式下多个 goroutine 共享 os.Stdout，需要用 lockedWriter 保证写入原子性
+	var stdoutMu sync.Mutex
+
 	// 批量模式：原有逻辑
 	wp := pkgutils.NewWorkerPool(uint(o.TaskCount))
 	for _, task := range tasks {
 		t := task // capture range variable
 		wp.Execute(func() {
-			client, err := connector.Connect(ctx, t.nodeID)
-			if err != nil {
-				logger.PrintError(i18n.Tf("exec_connect_failed", map[string]any{"Host": t.host, "Error": err}))
-				return
-			}
-
-			var output string
-			var execErr error
-
-			runOpt := ssh.WithLoginShell(!o.NoLoginShell)
-
-			if isScript {
-				if o.Sudo {
-					output, execErr = client.RunScriptWithSudo(ctx, execCmd, runOpt)
-				} else {
-					output, execErr = client.RunScript(ctx, execCmd, runOpt)
-				}
-			} else {
-				if o.Sudo {
-					output, execErr = client.RunWithSudo(ctx, execCmd, runOpt)
-				} else {
-					output, execErr = client.Run(ctx, execCmd, runOpt)
-				}
-			}
-
-			if execErr != nil {
-				logger.PrintError(i18n.Tf("exec_result_error", map[string]any{"Host": t.host, "Output": output, "Error": execErr}))
-			} else {
-				logger.PrintSuccess(i18n.Tf("exec_result_success", map[string]any{"Host": t.host, "Output": output}))
-			}
+			o.executeTask(ctx, connector, t, execCmd, isScript, len(tasks), &stdoutMu)
 		})
 	}
 
@@ -315,6 +303,86 @@ func (o *ExecOptions) getOrCreateNode(provider config.ConfigProvider, addr utils
 	addr.Port = port
 	nodeID, err := o.execCreateNewNode(provider, addr)
 	return nodeID, true, err
+}
+
+func (o *ExecOptions) executeTask(ctx context.Context, connector *ssh.Connector, t execHostTask, execCmd string, isScript bool, totalTasks int, stdoutMu *sync.Mutex) {
+	client, err := connector.Connect(ctx, t.nodeID)
+	if err != nil {
+		logger.PrintError(i18n.Tf("exec_connect_failed", map[string]any{"Host": t.host, "Error": err}))
+		return
+	}
+
+	var output string
+	var execErr error
+
+	var runOpts []ssh.RunOption
+	runOpts = append(runOpts, ssh.WithLoginShell(!o.NoLoginShell))
+
+	if o.OutDir != "" {
+		// 清洗主机名，防止路径穿越
+		safeHost := sanitizeHostForFilename(t.host)
+		logFile := filepath.Join(o.OutDir, safeHost+".log")
+		f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err == nil {
+			defer func() { _ = f.Close() }()
+			runOpts = append(runOpts, ssh.WithOutFile(f))
+		}
+	} else if o.Stream || totalTasks == 1 {
+		prefix := ""
+		if totalTasks > 1 {
+			prefix = fmt.Sprintf("[%s] ", t.host)
+		}
+		// 使用 lockedWriter 包装 os.Stdout，防止多 goroutine 写入交错
+		runOpts = append(runOpts, ssh.WithStream(ssh.NewLockedWriter(stdoutMu, os.Stdout), prefix))
+	} else {
+		runOpts = append(runOpts, ssh.WithRingBuffer(5*1024*1024))
+	}
+
+	if isScript {
+		if o.Sudo {
+			output, execErr = client.RunScriptWithSudo(ctx, execCmd, runOpts...)
+		} else {
+			output, execErr = client.RunScript(ctx, execCmd, runOpts...)
+		}
+	} else {
+		if o.Sudo {
+			output, execErr = client.RunWithSudo(ctx, execCmd, runOpts...)
+		} else {
+			output, execErr = client.Run(ctx, execCmd, runOpts...)
+		}
+	}
+
+	if execErr != nil {
+		if output != "" {
+			logger.PrintError(i18n.Tf("exec_result_error", map[string]any{"Host": t.host, "Output": output, "Error": execErr}))
+		} else {
+			logger.PrintError(fmt.Sprintf("[%s] Executed with error: %v", t.host, execErr))
+		}
+	} else {
+		if output != "" {
+			logger.PrintSuccess(i18n.Tf("exec_result_success", map[string]any{"Host": t.host, "Output": output}))
+		} else {
+			if o.OutDir != "" {
+				safeHost := sanitizeHostForFilename(t.host)
+				logger.PrintSuccess(fmt.Sprintf("[%s] Executed successfully (output saved to %s)", t.host, filepath.Join(o.OutDir, safeHost+".log")))
+			} else {
+				logger.PrintSuccess(fmt.Sprintf("[%s] Executed successfully", t.host))
+			}
+		}
+	}
+}
+
+// sanitizeHostForFilename 清洗主机名，防止路径穿越攻击。
+// 移除目录分隔符和 ".." 等危险字符，仅保留文件名安全字符。
+func sanitizeHostForFilename(host string) string {
+	// 取 base 防止含路径分隔符
+	host = filepath.Base(host)
+	// 替换不安全字符
+	host = strings.ReplaceAll(host, "..", "_")
+	if host == "." || host == "" {
+		host = "unknown_host"
+	}
+	return host
 }
 
 func (o *ExecOptions) buildTasksFromTags(provider config.ConfigProvider) ([]execHostTask, error) {

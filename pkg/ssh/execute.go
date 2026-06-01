@@ -32,11 +32,11 @@ func (c *Client) RunWithSudo(ctx context.Context, command string, opts ...RunOpt
 	case SudoModeRoot:
 		return c.Run(ctx, command, opts...)
 	case SudoModeSudo:
-		return c.runWithSudo(ctx, wrappedCmd, c.cfg.Password, nil)
+		return c.runWithSudo(ctx, wrappedCmd, c.cfg.Password, nil, config)
 	case SudoModeSudoer:
-		return c.runWithSudo(ctx, wrappedCmd, "", nil)
+		return c.runWithSudo(ctx, wrappedCmd, "", nil, config)
 	case SudoModeSu:
-		return c.runWithSu(ctx, command, c.cfg.SuPwd)
+		return c.runWithSu(ctx, command, c.cfg.SuPwd, config)
 	default:
 		return "", fmt.Errorf("unknown sudo mode: %s, please check config to set sudo mode", c.cfg.SudoMode)
 	}
@@ -62,11 +62,11 @@ func (c *Client) RunScriptWithSudo(ctx context.Context, scriptContent string, op
 	case SudoModeRoot:
 		return c.RunScript(ctx, scriptContent, opts...)
 	case SudoModeSudo:
-		return c.runWithSudo(ctx, bashArgs, c.cfg.Password, strings.NewReader(scriptContent))
+		return c.runWithSudo(ctx, bashArgs, c.cfg.Password, strings.NewReader(scriptContent), config)
 	case SudoModeSudoer:
-		return c.runWithSudo(ctx, bashArgs, "", strings.NewReader(scriptContent))
+		return c.runWithSudo(ctx, bashArgs, "", strings.NewReader(scriptContent), config)
 	case SudoModeSu:
-		return c.runWithSu(ctx, bashCmd, c.cfg.SuPwd)
+		return c.runWithSu(ctx, bashCmd, c.cfg.SuPwd, config)
 	default:
 		return "", fmt.Errorf("unsupported sudo mode: %s", c.cfg.SudoMode)
 	}
@@ -158,7 +158,7 @@ func (c *Client) RunInteractiveWithSudo(ctx context.Context, command string) err
 	return err
 }
 
-func (c *Client) runWithSudo(ctx context.Context, command string, password string, extraStdin io.Reader) (string, error) {
+func (c *Client) runWithSudo(ctx context.Context, command string, password string, extraStdin io.Reader, config *RunConfig) (string, error) {
 	if password == "" && c.cfg.SudoMode == SudoModeSudo {
 		return "", fmt.Errorf("sudo password is required but not provided")
 	}
@@ -180,10 +180,10 @@ func (c *Client) runWithSudo(ctx context.Context, command string, password strin
 	}
 
 	fullCmd := fmt.Sprintf("sudo -S -p '' %s", command)
-	return startWithTimeout(ctx, session, fullCmd)
+	return startWithTimeout(ctx, session, fullCmd, config)
 }
 
-func (c *Client) runWithSu(ctx context.Context, command string, password string) (string, error) {
+func (c *Client) runWithSu(ctx context.Context, command string, password string, config *RunConfig) (string, error) {
 	session, err := c.sshClient.NewSession()
 	if err != nil {
 		return "", fmt.Errorf("failed to create new session: %w", err)
@@ -204,11 +204,18 @@ func (c *Client) runWithSu(ctx context.Context, command string, password string)
 		return "", fmt.Errorf("failed to create stdin pipe: %w", err)
 	}
 
+	if config == nil {
+		config = DefaultRunConfig()
+	}
+	syncWriter := newOutputWriter(config)
+
 	expect := NewExpect(stdin, ExpectRule{
 		Pattern: c.passwordPromptRegex(),
 		Respond: StaticRespond(password),
 	})
-	expect.SetAccumulate(true)
+	expect.SetTarget(syncWriter)
+	// 如果模式是全量收集，由于我们要手动处理密码提示过滤，需要让 expect 不自己收集全部
+	expect.SetAccumulate(false)
 	session.Stdout = expect
 
 	cmd := fmt.Sprintf("export LC_ALL=C; su - root -c '%s'", strings.ReplaceAll(command, "'", "'\\''"))
@@ -218,7 +225,7 @@ func (c *Client) runWithSu(ctx context.Context, command string, password string)
 	}
 
 	if err := expect.Wait(ctx, 5*time.Second); err != nil {
-		return expect.Output(), fmt.Errorf("password handshake failed: %w", err)
+		return syncWriter.String(), fmt.Errorf("password handshake failed: %w", err)
 	}
 
 	done := make(chan error, 1)
@@ -230,17 +237,24 @@ func (c *Client) runWithSu(ctx context.Context, command string, password string)
 	case err = <-done:
 	case <-ctx.Done():
 		if killErr := session.Signal(ssh.SIGKILL); killErr != nil {
-			return expect.Output(), fmt.Errorf("failed to kill command after context done: %w", killErr)
+			return syncWriter.String(), fmt.Errorf("failed to kill command after context done: %w", killErr)
 		}
-		return expect.Output(), ctx.Err()
+		return syncWriter.String(), ctx.Err()
 	}
 
-	cleanOutput := expect.CleanOutput(c.passwordPromptRegex())
 	if err != nil {
-		return cleanOutput, fmt.Errorf("command execution failed: %w", err)
+		return syncWriter.String(), fmt.Errorf("command execution failed: %w", err)
 	}
 
-	return cleanOutput, nil
+	output := syncWriter.String()
+	// 如果是字符串返回模式，尝试清理密码提示
+	if config.OutMode == OutputModeString || config.OutMode == OutputModeRingBuffer {
+		if c.passwordPromptRegex() != nil {
+			output = c.passwordPromptRegex().ReplaceAllString(output, "")
+		}
+	}
+
+	return output, nil
 }
 
 func (c *Client) ShellWithSudo(ctx context.Context) error {
@@ -257,7 +271,7 @@ func (c *Client) ShellWithSudo(ctx context.Context) error {
 	// sudo/sudoer 模式：通过 sudo -S -p '' true 预检，可靠且无副作用
 	// su 模式不做预检：su -c 会跑 root login shell 初始化脚本，脚本错误会导致误报
 	if c.cfg.SudoMode == SudoModeSudo || c.cfg.SudoMode == SudoModeSudoer {
-		if _, err := c.runWithSudo(ctx, "true", c.cfg.Password, nil); err != nil {
+		if _, err := c.runWithSudo(ctx, "true", c.cfg.Password, nil, nil); err != nil {
 			return fmt.Errorf("sudo access denied: %w", err)
 		}
 	}

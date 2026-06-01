@@ -148,6 +148,10 @@ flag_exec_task:
   other: "并行执行的主机数"
 flag_exec_no_login:
   other: "不加载登陆shell (用于避免欢迎信息/MOTD等干扰)"
+flag_exec_stream:
+  other: "启用实时流式输出 (多主机时自动添加主机前缀)"
+flag_exec_out_dir:
+  other: "将输出保存到指定目录的按主机命名的日志文件中"
 exec_connect_failed:
   other: "[{{.Host}}] 连接失败: {{.Error}}"
 exec_host_error:
