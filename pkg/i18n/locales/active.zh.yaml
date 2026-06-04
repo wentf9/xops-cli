@@ -57,6 +57,8 @@ flag_alias:
   other: "连接别名"
 flag_tag:
   other: "为节点添加标签(分组)"
+flag_ssh2socks:
+  other: "将SSH隧道封装为SOCKS5代理并在本地监听[listen]:port"
 flag_login:
   other: "SSH 登录用户名"
 flag_identity:

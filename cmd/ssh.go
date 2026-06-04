@@ -32,6 +32,7 @@ type SshOptions struct {
 	LocalForwards  []string
 	RemoteForwards []string
 	NoCmd          bool
+	Ssh2Socks      string
 	args           []string
 }
 
@@ -71,6 +72,7 @@ func NewCmdSsh() *cobra.Command {
 	cmd.Flags().BoolVar(&o.Sudo, "sudo", false, i18n.T("flag_sudo"))
 	cmd.Flags().StringVar(&o.Alias, "alias", "", i18n.T("flag_alias"))
 	cmd.Flags().StringSliceVar(&o.Tags, "tag", []string{}, i18n.T("flag_tag"))
+	cmd.Flags().StringVar(&o.Ssh2Socks, "ssh2socks", "", i18n.T("flag_ssh2socks"))
 
 	cmd.MarkFlagsMutuallyExclusive("password", "identity")
 	return cmd
@@ -251,6 +253,11 @@ func (o *SshOptions) startTunnels(ctx context.Context, client *ssh.Client) error
 		}
 		if err := client.RemoteForward(ctx, bAddr, dAddr); err != nil {
 			return fmt.Errorf("failed to setup remote forward: %w", err)
+		}
+	}
+	if o.Ssh2Socks != "" {
+		if err := client.Socks5Forward(ctx, o.Ssh2Socks); err != nil {
+			return fmt.Errorf("failed to setup SOCKS5 proxy: %w", err)
 		}
 	}
 	return nil
