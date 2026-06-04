@@ -57,8 +57,8 @@ flag_alias:
   other: "Connection alias"
 flag_tag:
   other: "Add tag (group) to node"
-flag_ssh2socks:
-  other: "Wrap SSH tunnel as a SOCKS5 proxy listening locally on [listen]:port"
+flag_dynamic_forward:
+  other: "Dynamic port forwarding (SOCKS5 proxy) listening locally on [bind_address:]port"
 flag_login:
   other: "SSH login username"
 flag_identity:

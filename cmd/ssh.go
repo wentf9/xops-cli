@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,7 +33,7 @@ type SshOptions struct {
 	LocalForwards  []string
 	RemoteForwards []string
 	NoCmd          bool
-	Ssh2Socks      string
+	DynamicForward string
 	args           []string
 }
 
@@ -64,6 +65,7 @@ func NewCmdSsh() *cobra.Command {
 	cmd.Flags().StringSliceVarP(&o.LocalForwards, "local-forward", "L", []string{}, i18n.T("flag_local_forward"))
 	cmd.Flags().StringSliceVarP(&o.RemoteForwards, "remote-forward", "R", []string{}, i18n.T("flag_remote_forward"))
 	cmd.Flags().BoolVarP(&o.NoCmd, "no-cmd", "N", false, i18n.T("flag_no_cmd"))
+	cmd.Flags().StringVarP(&o.DynamicForward, "dynamic-forward", "D", "", i18n.T("flag_dynamic_forward"))
 
 	// xops-enhanced flags (long-form only, no short flags to avoid OpenSSH conflicts)
 	cmd.Flags().StringVar(&o.Host, "host", "", i18n.T("flag_host"))
@@ -72,7 +74,6 @@ func NewCmdSsh() *cobra.Command {
 	cmd.Flags().BoolVar(&o.Sudo, "sudo", false, i18n.T("flag_sudo"))
 	cmd.Flags().StringVar(&o.Alias, "alias", "", i18n.T("flag_alias"))
 	cmd.Flags().StringSliceVar(&o.Tags, "tag", []string{}, i18n.T("flag_tag"))
-	cmd.Flags().StringVar(&o.Ssh2Socks, "ssh2socks", "", i18n.T("flag_ssh2socks"))
 
 	cmd.MarkFlagsMutuallyExclusive("password", "identity")
 	return cmd
@@ -255,12 +256,36 @@ func (o *SshOptions) startTunnels(ctx context.Context, client *ssh.Client) error
 			return fmt.Errorf("failed to setup remote forward: %w", err)
 		}
 	}
-	if o.Ssh2Socks != "" {
-		if err := client.Socks5Forward(ctx, o.Ssh2Socks); err != nil {
+	if o.DynamicForward != "" {
+		listenAddr, err := parseDynamicForwardArg(o.DynamicForward)
+		if err != nil {
+			return err
+		}
+		if err := client.Socks5Forward(ctx, listenAddr); err != nil {
 			return fmt.Errorf("failed to setup SOCKS5 proxy: %w", err)
 		}
 	}
 	return nil
+}
+
+func parseDynamicForwardArg(arg string) (string, error) {
+	// If only a port is specified (e.g. "1080")
+	if _, err := strconv.Atoi(arg); err == nil {
+		return net.JoinHostPort("127.0.0.1", arg), nil
+	}
+
+	host, port, err := net.SplitHostPort(arg)
+	if err != nil {
+		if strings.HasPrefix(arg, ":") {
+			return net.JoinHostPort("127.0.0.1", arg[1:]), nil
+		}
+		return "", fmt.Errorf("invalid dynamic forward format '%s', expected [bind_address:]port", arg)
+	}
+
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	return net.JoinHostPort(host, port), nil
 }
 
 func updateNodeFields(node *models.Node, nodeID string, o *SshOptions, provider config.ConfigProvider) bool {
