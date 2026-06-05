@@ -759,9 +759,11 @@ func (s *Shell) askConfirmation(prompt string) bool {
 
 // handleShell 进入远程交互式 shell（SSH PTY）
 func (s *Shell) handleShell(ctx context.Context) {
+	_ = s.line.Close()
 	if err := s.client.sshClient.Shell(ctx); err != nil {
 		_, _ = fmt.Fprintf(s.stderr, "shell: %v\n", err)
 	}
+	s.resetLiner()
 	_, _ = fmt.Fprintln(s.stdout, "")
 }
 
@@ -821,20 +823,23 @@ func (s *Shell) handleLexec(ctx context.Context, cmdStr string) {
 	// 退出后重新接管，避免 vim 退出后终端状态混乱
 	_ = s.line.Close()
 	err := c.Run()
+	s.resetLiner()
+
+	if err != nil {
+		_, _ = fmt.Fprintf(s.stderr, "lexec: %v\n", err)
+	}
+}
+
+func (s *Shell) resetLiner() {
 	s.line = liner.NewLiner()
 	s.line.SetCtrlCAborts(true)
 	s.line.SetTabCompletionStyle(liner.TabPrints)
 	s.line.SetWordCompleter(s.wordCompleter)
-	// 重新加载历史，避免本次执行覆盖了已有历史
 	if s.historyFile != "" {
 		if f, err := os.Open(s.historyFile); err == nil {
 			_, _ = s.line.ReadHistory(f)
 			_ = f.Close()
 		}
-	}
-
-	if err != nil {
-		_, _ = fmt.Fprintf(s.stderr, "lexec: %v\n", err)
 	}
 }
 
@@ -889,7 +894,7 @@ func (s *Shell) printColumns(names []string) {
 	rows := (len(names) + cols - 1) / cols
 
 	// 按列优先顺序输出
-	for row := 0; row < rows; row++ {
+	for row := range rows {
 		for col := 0; col < cols; col++ {
 			idx := col*rows + row
 			if idx >= len(names) {
