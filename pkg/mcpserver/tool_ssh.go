@@ -5,8 +5,6 @@ import (
 	"fmt"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/wentf9/xops-cli/cmd/utils"
-	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/mcpserver/guardrail"
 	"github.com/wentf9/xops-cli/pkg/models"
 )
@@ -31,7 +29,7 @@ type ListNodesOutput struct {
 }
 
 func listNodesHandler(ctx context.Context, req *mcp.CallToolRequest, input ListNodesInput) (*mcp.CallToolResult, ListNodesOutput, error) {
-	_, provider, _, err := utils.GetConfigStore()
+	provider, err := getMCPProvider()
 	if err != nil {
 		return nil, ListNodesOutput{}, fmt.Errorf("failed to load config: %w", err)
 	}
@@ -82,18 +80,10 @@ func sshRunHandler(ctx context.Context, req *mcp.CallToolRequest, input SshRunIn
 		return nil, SshRunOutput{}, fmt.Errorf("nodeID and command are required")
 	}
 
-	_, provider, _, err := utils.GetConfigStore()
+	connector, err := getMCPConnector()
 	if err != nil {
-		return nil, SshRunOutput{}, fmt.Errorf("failed to load config: %w", err)
+		return nil, SshRunOutput{}, err
 	}
-
-	_, ok := provider.GetNode(input.NodeID)
-	if !ok {
-		return nil, SshRunOutput{}, fmt.Errorf("node '%s' not found", input.NodeID)
-	}
-
-	connector := adapter.NewConnector(provider)
-	defer connector.CloseAll()
 
 	client, err := connector.Connect(ctx, input.NodeID)
 	if err != nil {

@@ -22,15 +22,8 @@ func NewCmdMcp() *cobra.Command {
 			// MCP server 必须完全静默，避免污染 stdout json-rpc 流
 			logger.SetLogLevel("none")
 
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-
-			sigCh := make(chan os.Signal, 1)
-			signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-			go func() {
-				<-sigCh
-				cancel()
-			}()
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
 
 			err := mcpserver.Serve(ctx)
 			if err != nil {

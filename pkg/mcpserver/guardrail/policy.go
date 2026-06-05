@@ -86,7 +86,9 @@ func (p *Policy) thresholdForNode(nodeID string) RiskLevel {
 }
 
 func (p *Policy) isPathProtected(paths []string) bool {
-	allProtected := append(sensitivePaths, p.cfg.ProtectedPaths...)
+	allProtected := make([]string, 0, len(sensitivePaths)+len(p.cfg.ProtectedPaths))
+	allProtected = append(allProtected, sensitivePaths...)
+	allProtected = append(allProtected, p.cfg.ProtectedPaths...)
 	for _, target := range paths {
 		cleaned := filepath.Clean(target)
 		for _, protected := range allProtected {

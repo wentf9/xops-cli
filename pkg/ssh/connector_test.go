@@ -2,6 +2,7 @@ package ssh
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"golang.org/x/crypto/ssh"
@@ -68,5 +69,58 @@ func TestConnector_Connect_Cached(t *testing.T) {
 	}
 	if client.cfg.User != "admin" {
 		t.Errorf("expected identity user 'admin', got %q", client.cfg.User)
+	}
+}
+
+type mockConn struct {
+	ssh.Conn
+	closeCalled bool
+}
+
+func (m *mockConn) SendRequest(name string, wantReply bool, payload []byte) (bool, []byte, error) {
+	return false, nil, fmt.Errorf("connection lost")
+}
+
+func (m *mockConn) Close() error {
+	m.closeCalled = true
+	return nil
+}
+
+func TestConnector_Connect_Reconnection(t *testing.T) {
+	store := &mockConfigStore{
+		cfg: &ClientConfig{
+			NodeID:   "node-1",
+			Address:  "127.0.0.1",
+			Port:     9999, // 使用一个不会有真实服务的端口
+			User:     "admin",
+			AuthType: "password",
+			Password: "mockpassword",
+		},
+	}
+	ui := &mockUI{}
+
+	connector := NewConnector(store, ui)
+
+	// 模拟已存在缓存连接，但该连接已经失效
+	mc := &mockConn{}
+	dummyClient := &ssh.Client{
+		Conn: mc,
+	}
+	connector.clients.Set("node-1", dummyClient)
+
+	ctx := context.Background()
+	_, err := connector.Connect(ctx, "node-1")
+	if err == nil {
+		t.Fatal("expected connect to fail because connection is stale and dial will fail")
+	}
+
+	// 验证连接是否已从缓存中移除
+	if _, ok := connector.clients.Get("node-1"); ok {
+		t.Error("expected node-1 to be evicted from clients cache")
+	}
+
+	// 验证旧连接是否被 Close
+	if !mc.closeCalled {
+		t.Error("expected stale client to be closed")
 	}
 }

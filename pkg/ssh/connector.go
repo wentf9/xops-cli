@@ -49,13 +49,23 @@ func NewConnector(store ConfigStore, ui InteractionHandler) *Connector {
 // 自动处理跳板机逻辑：如果节点配置了 ProxyJump，会递归建立连接
 func (c *Connector) Connect(ctx context.Context, nodeName string) (*Client, error) {
 	if cachedClient, ok := c.clients.Get(nodeName); ok {
-		// 可选：检查连接是否存活（发送一个非阻塞的 KeepAlive 请求）
-		// 对于短生命周期的 CLI 工具，通常假设缓存的连接是可用的
-		cfg, err := c.store.GetConfig(nodeName)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch config for cached node '%s': %w", nodeName, err)
+		isAlive := true
+		if cachedClient.Conn != nil {
+			_, _, err := cachedClient.SendRequest("keepalive@openssh.com", true, nil)
+			if err != nil {
+				isAlive = false
+			}
 		}
-		return newClient(cachedClient, cfg, c.store, c.PasswordPromptPattern), nil
+		if !isAlive {
+			c.clients.Remove(nodeName)
+			_ = cachedClient.Close()
+		} else {
+			cfg, err := c.store.GetConfig(nodeName)
+			if err != nil {
+				return nil, fmt.Errorf("failed to fetch config for cached node '%s': %w", nodeName, err)
+			}
+			return newClient(cachedClient, cfg, c.store, c.PasswordPromptPattern), nil
+		}
 	}
 	// 缓存未命中，开始建立新连接
 	// 【合并请求】使用 singleflight
