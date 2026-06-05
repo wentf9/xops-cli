@@ -54,7 +54,7 @@ func copyStdinTo(dst io.Writer) (cancel func(), done <-chan struct{}) {
 						return
 					}
 				}
-				if err != nil {
+				if n == 0 || err != nil {
 					return
 				}
 			}

@@ -65,3 +65,54 @@ func TestParseForwardArg(t *testing.T) {
 		})
 	}
 }
+
+func TestSshBackgroundValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		options *SshOptions
+		wantErr bool
+	}{
+		{
+			name: "BgRun without NoCmd",
+			options: &SshOptions{
+				BgRun: true,
+				NoCmd: false,
+				Host:  "127.0.0.1",
+				User:  "test",
+				Port:  22,
+			},
+			wantErr: true,
+		},
+		{
+			name: "BgRun with NoCmd",
+			options: &SshOptions{
+				BgRun: true,
+				NoCmd: true,
+				Host:  "127.0.0.1",
+				User:  "test",
+				Port:  22,
+			},
+			wantErr: false,
+		},
+		{
+			name: "Normal command without BgRun",
+			options: &SshOptions{
+				BgRun: false,
+				NoCmd: false,
+				Host:  "127.0.0.1",
+				User:  "test",
+				Port:  22,
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.options.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}

@@ -71,6 +71,12 @@ flag_remote_forward:
   other: "远程端口转发 [bind_address:]port:host:hostport"
 flag_no_cmd:
   other: "不执行远程命令 (通常与端口转发配合使用)"
+flag_background:
+  other: "在身份验证和端口转发建立后转入后台运行 (隐含 -n)"
+flag_stdin_redirect:
+  other: "将标准输入重定向到 /dev/null (防止后台进程读取终端输入)"
+ssh_err_background_requires_nocmd:
+  other: "后台执行 (-f) 必须与 -N (不执行远程命令) 选项配合使用"
 prompt_enter_passphrase:
   other: "请输入密钥 {{.Path}} 的密码: "
 prompt_enter_password:

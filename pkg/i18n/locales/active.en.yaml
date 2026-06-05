@@ -71,6 +71,12 @@ flag_remote_forward:
   other: "Remote port forwarding [bind_address:]port:host:hostport"
 flag_no_cmd:
   other: "Do not execute a remote command (useful for just forwarding ports)"
+flag_background:
+  other: "Requests ssh to go to background just before command execution (implies -n)"
+flag_stdin_redirect:
+  other: "Redirects stdin from /dev/null (prevents reading from stdin)"
+ssh_err_background_requires_nocmd:
+  other: "Background execution (-f) requires -N (no command) option"
 prompt_enter_passphrase:
   other: "Enter passphrase for key '{{.Path}}': "
 prompt_enter_password:

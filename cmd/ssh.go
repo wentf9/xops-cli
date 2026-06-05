@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -34,6 +35,8 @@ type SshOptions struct {
 	RemoteForwards []string
 	NoCmd          bool
 	DynamicForward string
+	BgRun          bool
+	StdinRedirect  bool
 	args           []string
 }
 
@@ -66,6 +69,8 @@ func NewCmdSsh() *cobra.Command {
 	cmd.Flags().StringSliceVarP(&o.RemoteForwards, "remote-forward", "R", []string{}, i18n.T("flag_remote_forward"))
 	cmd.Flags().BoolVarP(&o.NoCmd, "no-cmd", "N", false, i18n.T("flag_no_cmd"))
 	cmd.Flags().StringVarP(&o.DynamicForward, "dynamic-forward", "D", "", i18n.T("flag_dynamic_forward"))
+	cmd.Flags().BoolVarP(&o.BgRun, "background", "f", false, i18n.T("flag_background"))
+	cmd.Flags().BoolVarP(&o.StdinRedirect, "stdin-redirect", "n", false, i18n.T("flag_stdin_redirect"))
 
 	// xops-enhanced flags (long-form only, no short flags to avoid OpenSSH conflicts)
 	cmd.Flags().StringVar(&o.Host, "host", "", i18n.T("flag_host"))
@@ -83,10 +88,7 @@ func (o *SshOptions) Complete(cmd *cobra.Command, args []string) {
 	o.args = args
 }
 
-func (o *SshOptions) Validate() error {
-	if len(o.args) > 1 {
-		return errors.New(i18n.Tf("ssh_err_expected_one_arg", map[string]any{"Count": len(o.args)}))
-	}
+func (o *SshOptions) parseArgs() error {
 	if len(o.args) == 0 && o.Host == "" {
 		return errors.New(i18n.T("ssh_err_no_host"))
 	} else if len(o.args) == 1 {
@@ -104,6 +106,19 @@ func (o *SshOptions) Validate() error {
 			o.Port = p
 		}
 	}
+	return nil
+}
+
+func (o *SshOptions) Validate() error {
+	if len(o.args) > 1 {
+		return errors.New(i18n.Tf("ssh_err_expected_one_arg", map[string]any{"Count": len(o.args)}))
+	}
+	if o.BgRun && !o.NoCmd {
+		return errors.New(i18n.T("ssh_err_background_requires_nocmd"))
+	}
+	if err := o.parseArgs(); err != nil {
+		return err
+	}
 	if o.User == "" {
 		o.User = utils.GetCurrentUser()
 	}
@@ -117,6 +132,29 @@ func (o *SshOptions) Validate() error {
 }
 
 func (o *SshOptions) Run() error {
+	isChild := os.Getenv("XOPS_CLI_SSH_BG_CHILD") == "true"
+
+	// -n 功能：如果是非后台运行或已是后台子进程，且指定了 -n，直接重定向标准输入到 /dev/null
+	if o.StdinRedirect && (!o.BgRun || isChild) {
+		devNull, err := os.Open(os.DevNull)
+		if err == nil {
+			oldStdin := os.Stdin
+			os.Stdin = devNull
+			defer func() {
+				os.Stdin = oldStdin
+				_ = devNull.Close()
+			}()
+		}
+	}
+
+	if o.BgRun && !isChild {
+		return o.runParentDaemon()
+	}
+
+	return o.runConnection(isChild)
+}
+
+func (o *SshOptions) runParentDaemon() error {
 	configStore := config.NewDefaultStore(utils.GetConfigFilePath())
 	cfg, err := configStore.Load()
 	if err != nil {
@@ -136,6 +174,94 @@ func (o *SshOptions) Run() error {
 	client, err := connector.Connect(connectCtx, nodeID)
 	connectCancel()
 	if err != nil {
+		fmt.Printf("\n%s: %v\n", i18n.T("fw_connect_failed"), err)
+		fmt.Println(i18n.T("tui_press_enter"))
+		var b [1]byte
+		_, _ = os.Stdin.Read(b[:])
+		return fmt.Errorf("%s: %w", i18n.T("fw_connect_failed"), err)
+	}
+
+	// 无论如何，在 runParentDaemon 退出时，或者有任何 panic 发生时，确保 client 必被关闭
+	var clientClosed bool
+	defer func() {
+		if !clientClosed {
+			_ = client.Close()
+		}
+	}()
+
+	// 测试端口绑定/隧道是否正常工作
+	runCtx, runCancel := context.WithCancel(context.Background())
+	defer runCancel()
+	if err := o.startTunnels(runCtx, client); err != nil {
+		return err
+	}
+
+	// 验证无误，可以断开，接下来由后台进程重新连接
+	_ = client.Close()
+	clientClosed = true
+
+	// 保存最新的凭证信息
+	if idAfter, _ := provider.GetIdentity(nodeID); idBefore.Password != idAfter.Password || idBefore.Passphrase != idAfter.Passphrase {
+		updated = true
+	}
+	if nodeAfter, _ := provider.GetNode(nodeID); nodeBefore.SuPwd != nodeAfter.SuPwd {
+		updated = true
+	}
+	if updated {
+		if err := configStore.Save(cfg); err != nil {
+			return fmt.Errorf("%s: %w", i18n.T("ssh_err_save_config"), err)
+		}
+	}
+
+	// 启动后台子进程
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("failed to get executable path: %w", err)
+	}
+	cmd := exec.Command(exe, os.Args[1:]...)
+	cmd.Env = append(os.Environ(), "XOPS_CLI_SSH_BG_CHILD=true")
+
+	// 子进程的 stdin/stdout/stderr 均重定向到 /dev/null
+	devNull, err := os.Open(os.DevNull)
+	if err != nil {
+		return fmt.Errorf("failed to open /dev/null: %w", err)
+	}
+	defer func() { _ = devNull.Close() }()
+	cmd.Stdin = devNull
+	cmd.Stdout = devNull
+	cmd.Stderr = devNull
+
+	if err := startDaemonProcess(cmd); err != nil {
+		return fmt.Errorf("failed to start background daemon: %w", err)
+	}
+
+	return nil
+}
+
+func (o *SshOptions) runConnection(isChild bool) error {
+	configStore := config.NewDefaultStore(utils.GetConfigFilePath())
+	cfg, err := configStore.Load()
+	if err != nil {
+		return fmt.Errorf("%s: %w", i18n.T("ssh_err_load_config"), err)
+	}
+
+	provider := config.NewProvider(cfg)
+
+	nodeID, updated, err := o.resolveNode(provider)
+	if err != nil {
+		return err
+	}
+	connector := adapter.NewConnector(provider)
+	connectCtx, connectCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	idBefore, _ := provider.GetIdentity(nodeID)
+	nodeBefore, _ := provider.GetNode(nodeID)
+	client, err := connector.Connect(connectCtx, nodeID)
+	connectCancel()
+	if err != nil {
+		if isChild {
+			// 子进程静默退出或记录错误，不进行交互式阻塞
+			return fmt.Errorf("%s: %w", i18n.T("fw_connect_failed"), err)
+		}
 		fmt.Printf("\n%s: %v\n", i18n.T("fw_connect_failed"), err)
 		fmt.Println(i18n.T("tui_press_enter"))
 		var b [1]byte
@@ -165,21 +291,26 @@ func (o *SshOptions) Run() error {
 	}
 
 	if o.NoCmd {
-		fmt.Printf("SSH tunnels established to %s. Press Ctrl+C to exit.\n", nodeID)
+		if !isChild {
+			fmt.Printf("SSH tunnels established to %s. Press Ctrl+C to exit.\n", nodeID)
+		}
 		<-runCtx.Done()
 		return nil
 	}
 
+	return o.runShell(runCtx, client)
+}
+
+func (o *SshOptions) runShell(ctx context.Context, client *ssh.Client) error {
 	if o.Sudo {
-		if err := client.ShellWithSudo(runCtx); err != nil {
+		if err := client.ShellWithSudo(ctx); err != nil {
 			return fmt.Errorf("%s: %w", i18n.T("sudo_exec_failed"), err)
 		}
 	} else {
-		if err := client.Shell(runCtx); err != nil {
+		if err := client.Shell(ctx); err != nil {
 			return fmt.Errorf("%s: %w", i18n.T("ssh_err_shell"), err)
 		}
 	}
-
 	return nil
 }
 

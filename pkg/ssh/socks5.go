@@ -38,52 +38,22 @@ func (c *Client) Socks5Forward(ctx context.Context, listenAddr string) error {
 }
 
 func (c *Client) handleSocks5(ctx context.Context, conn net.Conn) {
+	done := make(chan struct{})
+	defer close(done)
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
+
 	defer func() { _ = conn.Close() }()
 
-	// Set deadline for greeting and request phases to avoid leakage
-	if err := conn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
-		logger.Warnf("socks5: failed to set connection deadline: %v", err)
-		return
-	}
-
-	// 1. Negotiation (Greeting)
-	if err := handleGreeting(conn); err != nil {
-		logger.Warnf("socks5: negotiation failed: %v", err)
-		return
-	}
-
-	// 2. Request phase
-	var buf [4]byte
-	if _, err := io.ReadFull(conn, buf[:4]); err != nil {
-		logger.Warnf("socks5: failed to read request header: %v", err)
-		return
-	}
-	if buf[0] != 0x05 {
-		logger.Warnf("socks5: unsupported request version: 0x%02x", buf[0])
-		return
-	}
-	if buf[1] != 0x01 { // CMD: CONNECT only
-		logger.Warnf("socks5: unsupported command: 0x%02x (only CONNECT is supported)", buf[1])
-		// Send reply: command not supported (0x07)
-		_, _ = conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		if cw, ok := conn.(interface{ CloseWrite() error }); ok {
-			_ = cw.CloseWrite()
-			// Wait a bit for client to read the response and close its end (up to 2 seconds)
-			_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-			var temp [1]byte
-			_, _ = conn.Read(temp[:])
-		}
-		return
-	}
-
-	atyp := buf[3]
-	destAddr, err := readSocks5Address(conn, atyp)
+	destAddr, err := handshakeAndParseRequest(conn)
 	if err != nil {
-		logger.Warnf("socks5: failed to read destination address: %v", err)
-		if atyp != 0x01 && atyp != 0x03 && atyp != 0x04 {
-			// Send reply: address type not supported (0x08)
-			_, _ = conn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		}
+		logger.Warnf("socks5: handshake failed: %v", err)
 		return
 	}
 
@@ -113,6 +83,51 @@ func (c *Client) handleSocks5(ctx context.Context, conn net.Conn) {
 
 	// 4. Data transfer
 	c.copyStream(conn, remoteConn)
+}
+
+func handshakeAndParseRequest(conn net.Conn) (string, error) {
+	// Set deadline for greeting and request phases to avoid leakage
+	if err := conn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
+		return "", fmt.Errorf("failed to set connection deadline: %w", err)
+	}
+
+	// 1. Negotiation (Greeting)
+	if err := handleGreeting(conn); err != nil {
+		return "", fmt.Errorf("negotiation failed: %w", err)
+	}
+
+	// 2. Request phase
+	var buf [4]byte
+	if _, err := io.ReadFull(conn, buf[:4]); err != nil {
+		return "", fmt.Errorf("failed to read request header: %w", err)
+	}
+	if buf[0] != 0x05 {
+		return "", fmt.Errorf("unsupported request version: 0x%02x", buf[0])
+	}
+	if buf[1] != 0x01 { // CMD: CONNECT only
+		// Send reply: command not supported (0x07)
+		_, _ = conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+			// Wait a bit for client to read the response and close its end (up to 2 seconds)
+			_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			var temp [1]byte
+			_, _ = conn.Read(temp[:])
+		}
+		return "", fmt.Errorf("unsupported command: 0x%02x (only CONNECT is supported)", buf[1])
+	}
+
+	atyp := buf[3]
+	destAddr, err := readSocks5Address(conn, atyp)
+	if err != nil {
+		if atyp != 0x01 && atyp != 0x03 && atyp != 0x04 {
+			// Send reply: address type not supported (0x08)
+			_, _ = conn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		}
+		return "", fmt.Errorf("failed to read destination address: %w", err)
+	}
+
+	return destAddr, nil
 }
 
 func handleGreeting(conn net.Conn) error {
