@@ -161,6 +161,10 @@ exec_result_error:
   other: "{{.Host}}\n------------\n{{.Output}}\nError: {{.Error}}"
 exec_result_success:
   other: "{{.Host}}\n------------\n{{.Output}}"
+exec_error_label:
+  other: "Error: {{.Error}}"
+exec_connect_failed_label:
+  other: "Connection failed: {{.Error}}"
 
 # ---- identity ----
 identity_short:

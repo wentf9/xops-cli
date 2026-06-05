@@ -308,7 +308,19 @@ func (o *ExecOptions) getOrCreateNode(provider config.ConfigProvider, addr utils
 func (o *ExecOptions) executeTask(ctx context.Context, connector *ssh.Connector, t execHostTask, execCmd string, isScript bool, totalTasks int, stdoutMu *sync.Mutex) {
 	client, err := connector.Connect(ctx, t.nodeID)
 	if err != nil {
-		logger.PrintError(i18n.Tf("exec_connect_failed", map[string]any{"Host": t.host, "Error": err}))
+		if logger.ColorEnabled() {
+			hostPart := logger.Cyan(fmt.Sprintf("[%s] ", t.host))
+			errLabel := i18n.Tf("exec_connect_failed_label", map[string]any{"Error": err})
+			if errLabel == "exec_connect_failed_label" {
+				errLabel = fmt.Sprintf("Connection failed: %v", err)
+			}
+			errPart := logger.Red(errLabel)
+			stdoutMu.Lock()
+			fmt.Fprintln(os.Stderr, hostPart+errPart)
+			stdoutMu.Unlock()
+		} else {
+			logger.PrintError(i18n.Tf("exec_connect_failed", map[string]any{"Host": t.host, "Error": err}))
+		}
 		return
 	}
 
@@ -330,7 +342,11 @@ func (o *ExecOptions) executeTask(ctx context.Context, connector *ssh.Connector,
 	} else if o.Stream || totalTasks == 1 {
 		prefix := ""
 		if totalTasks > 1 {
-			prefix = fmt.Sprintf("[%s] ", t.host)
+			if logger.ColorEnabled() {
+				prefix = logger.Cyan(fmt.Sprintf("[%s] ", t.host))
+			} else {
+				prefix = fmt.Sprintf("[%s] ", t.host)
+			}
 		}
 		// 使用 lockedWriter 包装 os.Stdout，防止多 goroutine 写入交错
 		runOpts = append(runOpts, ssh.WithStream(ssh.NewLockedWriter(stdoutMu, os.Stdout), prefix))
@@ -352,21 +368,68 @@ func (o *ExecOptions) executeTask(ctx context.Context, connector *ssh.Connector,
 		}
 	}
 
+	o.printTaskResult(t, output, execErr, stdoutMu)
+}
+
+func (o *ExecOptions) printTaskResult(t execHostTask, output string, execErr error, stdoutMu *sync.Mutex) {
 	if execErr != nil {
 		if output != "" {
-			logger.PrintError(i18n.Tf("exec_result_error", map[string]any{"Host": t.host, "Output": output, "Error": execErr}))
+			if logger.ColorEnabled() {
+				header := logger.Cyan(fmt.Sprintf("%s\n------------", t.host))
+				errLabel := i18n.Tf("exec_error_label", map[string]any{"Error": execErr})
+				if errLabel == "exec_error_label" {
+					errLabel = fmt.Sprintf("Error: %v", execErr)
+				}
+				errPart := logger.Red(errLabel)
+				stdoutMu.Lock()
+				fmt.Fprintf(os.Stderr, "%s\n%s\n%s\n", header, output, errPart)
+				stdoutMu.Unlock()
+			} else {
+				logger.PrintError(i18n.Tf("exec_result_error", map[string]any{"Host": t.host, "Output": output, "Error": execErr}))
+			}
 		} else {
-			logger.PrintError(fmt.Sprintf("[%s] Executed with error: %v", t.host, execErr))
+			if logger.ColorEnabled() {
+				hostPart := logger.Cyan(fmt.Sprintf("[%s] ", t.host))
+				errPart := logger.Red(fmt.Sprintf("Executed with error: %v", execErr))
+				stdoutMu.Lock()
+				fmt.Fprintln(os.Stderr, hostPart+errPart)
+				stdoutMu.Unlock()
+			} else {
+				logger.PrintError(fmt.Sprintf("[%s] Executed with error: %v", t.host, execErr))
+			}
 		}
 	} else {
 		if output != "" {
-			logger.PrintSuccess(i18n.Tf("exec_result_success", map[string]any{"Host": t.host, "Output": output}))
+			if logger.ColorEnabled() {
+				header := logger.Cyan(fmt.Sprintf("%s\n------------", t.host))
+				stdoutMu.Lock()
+				fmt.Printf("%s\n%s\n", header, output)
+				stdoutMu.Unlock()
+			} else {
+				logger.PrintSuccess(i18n.Tf("exec_result_success", map[string]any{"Host": t.host, "Output": output}))
+			}
 		} else {
 			if o.OutDir != "" {
 				safeHost := sanitizeHostForFilename(t.host)
-				logger.PrintSuccess(fmt.Sprintf("[%s] Executed successfully (output saved to %s)", t.host, filepath.Join(o.OutDir, safeHost+".log")))
+				if logger.ColorEnabled() {
+					hostPart := logger.Cyan(fmt.Sprintf("[%s] ", t.host))
+					successPart := logger.Green(fmt.Sprintf("Executed successfully (output saved to %s)", filepath.Join(o.OutDir, safeHost+".log")))
+					stdoutMu.Lock()
+					fmt.Println(hostPart + successPart)
+					stdoutMu.Unlock()
+				} else {
+					logger.PrintSuccess(fmt.Sprintf("[%s] Executed successfully (output saved to %s)", t.host, filepath.Join(o.OutDir, safeHost+".log")))
+				}
 			} else {
-				logger.PrintSuccess(fmt.Sprintf("[%s] Executed successfully", t.host))
+				if logger.ColorEnabled() {
+					hostPart := logger.Cyan(fmt.Sprintf("[%s] ", t.host))
+					successPart := logger.Green("Executed successfully")
+					stdoutMu.Lock()
+					fmt.Println(hostPart + successPart)
+					stdoutMu.Unlock()
+				} else {
+					logger.PrintSuccess(fmt.Sprintf("[%s] Executed successfully", t.host))
+				}
 			}
 		}
 	}

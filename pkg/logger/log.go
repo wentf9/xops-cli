@@ -22,6 +22,7 @@ const (
 	colorGreen  = "\033[32m"
 	colorYellow = "\033[33m"
 	colorBlue   = "\033[34m"
+	colorCyan   = "\033[36m"
 )
 
 // colorEnabled 控制是否输出 ANSI 转义序列
@@ -221,4 +222,44 @@ func PrintError(msg string) {
 // PrintErrorf 打印纯净错误信号 (带红色彩色文本修饰，输出给 stderr)
 func PrintErrorf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "%s%s%s\n", c(colorEnabled, colorRed), fmt.Sprintf(format, args...), c(colorEnabled, colorReset))
+}
+
+// Cyan 将文本包装为青色 ANSI 转义序列
+func Cyan(msg string) string {
+	if colorEnabled {
+		return colorCyan + msg + colorReset
+	}
+	return msg
+}
+
+// Blue 将文本包装为蓝色 ANSI 转义序列
+func Blue(msg string) string {
+	if colorEnabled {
+		return colorBlue + msg + colorReset
+	}
+	return msg
+}
+
+// Red 将文本包装为红色 ANSI 转义序列
+func Red(msg string) string {
+	if colorEnabled {
+		return colorRed + msg + colorReset
+	}
+	return msg
+}
+
+// Green 将文本包装为绿色 ANSI 转义序列
+func Green(msg string) string {
+	if colorEnabled {
+		return colorGreen + msg + colorReset
+	}
+	return msg
+}
+
+// Yellow 将文本包装为黄色 ANSI 转义序列
+func Yellow(msg string) string {
+	if colorEnabled {
+		return colorYellow + msg + colorReset
+	}
+	return msg
 }

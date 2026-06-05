@@ -112,3 +112,36 @@ func TestPrintError_NoANSIWhenDisabled(t *testing.T) {
 		t.Errorf("output should contain message, got %q", out)
 	}
 }
+
+func TestColorWrappers(t *testing.T) {
+	tests := []struct {
+		name string
+		f    func(string) string
+		code string
+	}{
+		{"Cyan", Cyan, "\033[36m"},
+		{"Blue", Blue, "\033[34m"},
+		{"Red", Red, "\033[31m"},
+		{"Green", Green, "\033[32m"},
+		{"Yellow", Yellow, "\033[33m"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name+"_Enabled", func(t *testing.T) {
+			SetColorMode("always")
+			res := tt.f("hello")
+			if !strings.HasPrefix(res, tt.code) || !strings.HasSuffix(res, "\033[0m") {
+				t.Errorf("%s(\"hello\") expected to be wrapped in %q, got %q", tt.name, tt.code, res)
+			}
+		})
+
+		t.Run(tt.name+"_Disabled", func(t *testing.T) {
+			SetColorMode("never")
+			res := tt.f("hello")
+			if res != "hello" {
+				t.Errorf("%s(\"hello\") expected \"hello\", got %q", tt.name, res)
+			}
+		})
+	}
+	SetColorMode("auto") // 还原默认
+}

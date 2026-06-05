@@ -162,6 +162,10 @@ exec_result_error:
   other: "{{.Host}}\n------------\n{{.Output}}\n错误: {{.Error}}"
 exec_result_success:
   other: "{{.Host}}\n------------\n{{.Output}}"
+exec_error_label:
+  other: "错误: {{.Error}}"
+exec_connect_failed_label:
+  other: "连接失败: {{.Error}}"
 
 # ---- identity ----
 identity_short:
