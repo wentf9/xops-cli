@@ -48,6 +48,17 @@ func NewConnector(store ConfigStore, ui InteractionHandler) *Connector {
 // Connect 根据节点名称建立 SSH 连接
 // 自动处理跳板机逻辑：如果节点配置了 ProxyJump，会递归建立连接
 func (c *Connector) Connect(ctx context.Context, nodeName string) (*Client, error) {
+	// 环路检测，防止 ProxyJump 循环依赖死锁
+	type contextKey string
+	const visitedNodesKey contextKey = "visited_nodes"
+	visited, _ := ctx.Value(visitedNodesKey).([]string)
+	for _, v := range visited {
+		if v == nodeName {
+			return nil, fmt.Errorf("proxy jump cycle detected: %s (path: %v)", nodeName, append(visited, nodeName))
+		}
+	}
+	ctx = context.WithValue(ctx, visitedNodesKey, append(append([]string(nil), visited...), nodeName))
+
 	if cachedClient, ok := c.clients.Get(nodeName); ok {
 		isAlive := true
 		if cachedClient.Conn != nil {

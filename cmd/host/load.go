@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
@@ -65,7 +66,7 @@ func ExecuteLoadHost(hosts []utils.HostInfo) error {
 		return fmt.Errorf("%s", i18n.Tf("inventory_load_config_failed", map[string]any{"Error": err}))
 	}
 	provider := config.NewProvider(cfg)
-	connector := adapter.NewConnector(provider)
+	connector := adapter.NewNonInteractiveConnector(provider)
 	// 批量导入时默认接受新的主机密钥，避免并发时大量询问
 	connector.AcceptNewHostKey.Store(true)
 	defer connector.CloseAll()
@@ -86,8 +87,10 @@ func ExecuteLoadHost(hosts []utils.HostInfo) error {
 				return
 			}
 
-			// 验证连接
-			client, err := connector.Connect(ctx, nodeID)
+			// 验证连接 (单次尝试最长 15 秒，避免网络卡死或死锁无限期阻塞)
+			connectCtx, cancelConnect := context.WithTimeout(ctx, 15*time.Second)
+			defer cancelConnect()
+			client, err := connector.Connect(connectCtx, nodeID)
 			if err != nil {
 				logger.PrintError(i18n.Tf("load_verify_failed", map[string]any{"Host": h.Host, "Error": err}))
 				return

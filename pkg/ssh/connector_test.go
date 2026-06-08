@@ -3,6 +3,7 @@ package ssh
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"golang.org/x/crypto/ssh"
@@ -123,4 +124,66 @@ func TestConnector_Connect_Reconnection(t *testing.T) {
 	if !mc.closeCalled {
 		t.Error("expected stale client to be closed")
 	}
+}
+
+func TestConnector_Connect_ProxyJumpCycle(t *testing.T) {
+	// 模拟一个形成了 ProxyJump 环的配置：node-1 依赖 node-2，node-2 依赖 node-1
+	cfg1 := &ClientConfig{
+		NodeID:    "node-1",
+		Address:   "127.0.0.1",
+		Port:      22,
+		User:      "admin",
+		AuthType:  "password",
+		Password:  "pass",
+		ProxyJump: "node-2",
+	}
+	cfg2 := &ClientConfig{
+		NodeID:    "node-2",
+		Address:   "127.0.0.2",
+		Port:      22,
+		User:      "admin",
+		AuthType:  "password",
+		Password:  "pass",
+		ProxyJump: "node-1",
+	}
+
+	store := &mockProxyJumpCycleStore{
+		cfgs: map[string]*ClientConfig{
+			"node-1": cfg1,
+			"node-2": cfg2,
+		},
+	}
+	ui := &mockUI{}
+
+	connector := NewConnector(store, ui)
+	ctx := context.Background()
+	_, err := connector.Connect(ctx, "node-1")
+	if err == nil {
+		t.Fatal("expected Connect to fail due to proxy jump cycle, got nil error")
+	}
+
+	// 验证错误消息中是否包含 "cycle detected"
+	expectedSub := "proxy jump cycle detected"
+	if !strings.Contains(err.Error(), expectedSub) {
+		t.Errorf("expected error message to contain %q, got %q", expectedSub, err.Error())
+	}
+}
+
+type mockProxyJumpCycleStore struct {
+	cfgs map[string]*ClientConfig
+}
+
+func (m *mockProxyJumpCycleStore) GetConfig(nodeID string) (*ClientConfig, error) {
+	if cfg, ok := m.cfgs[nodeID]; ok {
+		return cfg, nil
+	}
+	return nil, fmt.Errorf("node not found: %s", nodeID)
+}
+
+func (m *mockProxyJumpCycleStore) UpdateAuth(nodeID string, password, keyPath, passphrase string) error {
+	return nil
+}
+
+func (m *mockProxyJumpCycleStore) UpdateSudo(nodeID string, mode SudoMode, suPwd string) error {
+	return nil
 }

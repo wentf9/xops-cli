@@ -11,7 +11,8 @@ import (
 
 // SSHAdapter 实现 ssh.ConfigStore 和 ssh.InteractionHandler 接口，作为业务模型与底层 SSH 的防腐层
 type SSHAdapter struct {
-	cfgProvider config.ConfigProvider
+	cfgProvider    config.ConfigProvider
+	nonInteractive bool
 }
 
 // NewSSHAdapter 创建 SSH 适配器
@@ -21,9 +22,27 @@ func NewSSHAdapter(cfgProvider config.ConfigProvider) *SSHAdapter {
 	}
 }
 
+// NewNonInteractiveSSHAdapter 创建非交互式的 SSH 适配器
+func NewNonInteractiveSSHAdapter(cfgProvider config.ConfigProvider) *SSHAdapter {
+	return &SSHAdapter{
+		cfgProvider:    cfgProvider,
+		nonInteractive: true,
+	}
+}
+
 // NewConnector 是一个辅助方法，快速创建组装好 Adapter 的 ssh.Connector
 func NewConnector(cfgProvider config.ConfigProvider) *ssh.Connector {
 	adp := NewSSHAdapter(cfgProvider)
+	conn := ssh.NewConnector(adp, adp)
+	if cfg := cfgProvider.GetConfig(); cfg != nil {
+		conn.PasswordPromptPattern = cfg.PasswordPromptPattern
+	}
+	return conn
+}
+
+// NewNonInteractiveConnector 创建一个非交互式的 Connector，避免在批量操作中阻塞等待输入
+func NewNonInteractiveConnector(cfgProvider config.ConfigProvider) *ssh.Connector {
+	adp := NewNonInteractiveSSHAdapter(cfgProvider)
 	conn := ssh.NewConnector(adp, adp)
 	if cfg := cfgProvider.GetConfig(); cfg != nil {
 		conn.PasswordPromptPattern = cfg.PasswordPromptPattern
@@ -125,11 +144,17 @@ func (a *SSHAdapter) UpdateSudo(nodeID string, mode ssh.SudoMode, suPwd string) 
 
 // PromptPassword 通过命令行终端获取密码输入
 func (a *SSHAdapter) PromptPassword(prompt string) (string, error) {
+	if a.nonInteractive {
+		return "", fmt.Errorf("non-interactive mode: password prompt is disabled")
+	}
 	return cmdutil.ReadPasswordFromTerminal(prompt)
 }
 
 // ConfirmHostKey 通过命令行终端请求确认 HostKey
 func (a *SSHAdapter) ConfirmHostKey(hostname string, fingerprint string) (bool, error) {
+	if a.nonInteractive {
+		return false, fmt.Errorf("non-interactive mode: host key confirmation is disabled")
+	}
 	fmt.Printf("The authenticity of host '%s' can't be established.\n", hostname)
 	fmt.Printf("key fingerprint is %s.\n", fingerprint)
 	fmt.Print("Are you sure you want to continue connecting (yes/no)? ")
