@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -175,9 +176,7 @@ func (o *SshOptions) runParentDaemon() error {
 	connectCancel()
 	if err != nil {
 		fmt.Printf("\n%s: %v\n", i18n.T("fw_connect_failed"), err)
-		fmt.Println(i18n.T("tui_press_enter"))
-		var b [1]byte
-		_, _ = os.Stdin.Read(b[:])
+		promptPressEnterIfTUI(os.Stdin, os.Stdout)
 		return fmt.Errorf("%s: %w", i18n.T("fw_connect_failed"), err)
 	}
 
@@ -263,9 +262,7 @@ func (o *SshOptions) runConnection(isChild bool) error {
 			return fmt.Errorf("%s: %w", i18n.T("fw_connect_failed"), err)
 		}
 		fmt.Printf("\n%s: %v\n", i18n.T("fw_connect_failed"), err)
-		fmt.Println(i18n.T("tui_press_enter"))
-		var b [1]byte
-		_, _ = os.Stdin.Read(b[:])
+		promptPressEnterIfTUI(os.Stdin, os.Stdout)
 		return fmt.Errorf("%s: %w", i18n.T("fw_connect_failed"), err)
 	}
 	defer func() { _ = client.Close() }()
@@ -534,4 +531,15 @@ func update(nodeID string, o *SshOptions, provider config.ConfigProvider) bool {
 		provider.AddIdentity(node.IdentityRef, identity)
 	}
 	return nodeUpdated || identityUpdated
+}
+
+// TODO(refactor): TUI 渲染边界与环境变量污染
+// 这里的阻塞提示逻辑属于 TUI 层面的交互，目前交由子进程处理（依赖 XOPS_CLI_SSH_FROM_TUI 环境变量）并非最佳实践。
+// 后续重构建议：移除子进程中的阻塞提示，改为子进程出错即退，由外层的 TUI 框架拦截退出状态码并绘制错误提示信息。
+func promptPressEnterIfTUI(stdin io.Reader, stdout io.Writer) {
+	if os.Getenv("XOPS_CLI_SSH_FROM_TUI") == "true" {
+		_, _ = fmt.Fprintln(stdout, i18n.T("tui_press_enter"))
+		var b [1]byte
+		_, _ = stdin.Read(b[:])
+	}
 }

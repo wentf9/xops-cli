@@ -472,9 +472,13 @@ func (m *Model) handleTagAction() (Model, tea.Cmd) {
 
 type sshFinishedMsg struct{ err error }
 
+// TODO(refactor): TUI 框架的渲染边界与环境变量扩散
+// 目前通过注入 XOPS_CLI_SSH_FROM_TUI 环境变量，让 ssh 子进程在连接失败时阻塞等待回车。这可能导致环境变量被孙进程意外继承。
+// 遵循 BubbleTea 最佳实践，未来重构时应让子进程直接返回 exit error，由父进程 (TUI) 捕获后在 UI 层面渲染失败提示弹窗，而不是依赖子进程接管终端进行阻塞。
 func runSSH(nodeID string) tea.Cmd {
 	c := os.Args[0]
 	cmd := exec.Command(c, "ssh", nodeID)
+	cmd.Env = append(os.Environ(), "XOPS_CLI_SSH_FROM_TUI=true")
 	return tea.ExecProcess(cmd, func(err error) tea.Msg {
 		return sshFinishedMsg{err}
 	})

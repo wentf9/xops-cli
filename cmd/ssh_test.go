@@ -1,6 +1,9 @@
 package cmd
 
 import (
+	"bytes"
+	"os"
+	"strings"
 	"testing"
 )
 
@@ -112,6 +115,75 @@ func TestSshBackgroundValidation(t *testing.T) {
 			err := tt.options.Validate()
 			if (err != nil) != tt.wantErr {
 				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestPromptPressEnterIfTUI(t *testing.T) {
+	// Backup original env var
+	origEnv, exists := os.LookupEnv("XOPS_CLI_SSH_FROM_TUI")
+	defer func() {
+		if exists {
+			_ = os.Setenv("XOPS_CLI_SSH_FROM_TUI", origEnv)
+		} else {
+			_ = os.Unsetenv("XOPS_CLI_SSH_FROM_TUI")
+		}
+	}()
+
+	tests := []struct {
+		name          string
+		envVal        string
+		hasEnv        bool
+		stdinVal      string
+		wantOutput    bool
+		wantReadCount int
+	}{
+		{
+			name:          "From TUI: prints prompt and reads stdin",
+			envVal:        "true",
+			hasEnv:        true,
+			stdinVal:      "\n",
+			wantOutput:    true,
+			wantReadCount: 1,
+		},
+		{
+			name:          "Not from TUI: env not set, no prompt, no read",
+			hasEnv:        false,
+			wantOutput:    false,
+			wantReadCount: 0,
+		},
+		{
+			name:          "Not from TUI: env is false, no prompt, no read",
+			envVal:        "false",
+			hasEnv:        true,
+			wantOutput:    false,
+			wantReadCount: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.hasEnv {
+				_ = os.Setenv("XOPS_CLI_SSH_FROM_TUI", tt.envVal)
+			} else {
+				_ = os.Unsetenv("XOPS_CLI_SSH_FROM_TUI")
+			}
+
+			stdin := strings.NewReader(tt.stdinVal)
+			var stdout bytes.Buffer
+
+			promptPressEnterIfTUI(stdin, &stdout)
+
+			hasPrompt := stdout.Len() > 0
+			if hasPrompt != tt.wantOutput {
+				t.Errorf("expected output to be %v, got %v (output: %q)", tt.wantOutput, hasPrompt, stdout.String())
+			}
+
+			unreadLen := stdin.Len()
+			readCount := len(tt.stdinVal) - unreadLen
+			if readCount != tt.wantReadCount {
+				t.Errorf("expected to read %d bytes, read %d", tt.wantReadCount, readCount)
 			}
 		})
 	}
