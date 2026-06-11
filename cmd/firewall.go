@@ -203,7 +203,7 @@ func (o *FirewallOptions) executeOnSingleHost(ctx context.Context, h string, pro
 			return
 		}
 
-		exec := executor.NewSSHExecutor(client)
+		exec := executor.NewSSHExecutor(client, ssh.WithLoginShell(false))
 		fw, err := firewall.DetectFirewall(ctx, exec)
 		if err != nil {
 			logger.PrintError(i18n.Tf("fw_detect_failed", map[string]any{"Host": rawHost, "Error": err}))

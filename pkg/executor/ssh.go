@@ -8,19 +8,22 @@ import (
 
 // SSHExecutor 包装 ssh.Client 以满足 Executor 接口
 type SSHExecutor struct {
-	client *ssh.Client
+	client      *ssh.Client
+	defaultOpts []ssh.RunOption
 }
 
-func NewSSHExecutor(client *ssh.Client) *SSHExecutor {
-	return &SSHExecutor{client: client}
+func NewSSHExecutor(client *ssh.Client, opts ...ssh.RunOption) *SSHExecutor {
+	return &SSHExecutor{client: client, defaultOpts: opts}
 }
 
 func (e *SSHExecutor) Run(ctx context.Context, cmd string, opts ...ssh.RunOption) (string, error) {
-	return e.client.Run(ctx, cmd, opts...)
+	finalOpts := append(e.defaultOpts, opts...)
+	return e.client.Run(ctx, cmd, finalOpts...)
 }
 
 func (e *SSHExecutor) RunWithSudo(ctx context.Context, cmd string, opts ...ssh.RunOption) (string, error) {
-	return e.client.RunWithSudo(ctx, cmd, opts...)
+	finalOpts := append(e.defaultOpts, opts...)
+	return e.client.RunWithSudo(ctx, cmd, finalOpts...)
 }
 
 func (e *SSHExecutor) InteractiveWithSudo(ctx context.Context, args []string) error {
