@@ -269,6 +269,22 @@ fw_reload_failed:
   other: "[{{.Host}}] Failed to reload firewall: {{.Error}}"
 fw_local_reload_failed:
   other: "[LOCAL] Failed to reload firewall: {{.Error}}"
+fw_result_success:
+  other: "Success"
+fw_result_failed:
+  other: "Failed"
+fw_label_error:
+  other: "Error"
+fw_label_output:
+  other: "Output"
+fw_label_connect_failed:
+  other: "Connection failed"
+fw_label_detect_failed:
+  other: "Failed to detect firewall"
+fw_label_reload_failed:
+  other: "Failed to reload firewall"
+fw_err_node_not_found:
+  other: "No matching node config found, please add via inventory first"
 
 # ---- inventory (host) ----
 inventory_short:

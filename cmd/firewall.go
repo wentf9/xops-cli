@@ -6,6 +6,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 
 	cmdutils "github.com/wentf9/xops-cli/cmd/utils"
 	"github.com/wentf9/xops-cli/pkg/adapter"
@@ -94,13 +95,13 @@ func (o *FirewallOptions) runLocalFirewall(ctx context.Context, action func(fw f
 	}
 	out, err := action(fw)
 	if err != nil {
-		logger.PrintError(i18n.Tf("fw_action_failed", map[string]any{"Host": "LOCAL", "Error": err, "Output": out}))
+		printFwActionFailed(nil, "LOCAL", err, out)
 	} else {
-		logger.PrintSuccess(i18n.Tf("fw_action_success", map[string]any{"Host": "LOCAL", "FwName": fw.Name(), "Output": out}))
+		printFwSuccess(nil, "LOCAL", fw.Name(), out)
 	}
 	if o.Reload {
 		if _, err := fw.Reload(ctx); err != nil {
-			logger.PrintError(i18n.Tf("fw_local_reload_failed", map[string]any{"Error": err}))
+			printFwError(nil, "LOCAL", err, "fw_label_reload_failed", "fw_local_reload_failed")
 		}
 	}
 	return nil
@@ -155,9 +156,10 @@ func (o *FirewallOptions) runRemoteFirewalls(ctx context.Context, action func(fw
 		}
 	}
 
+	var stdoutMu sync.Mutex
 	wp := pkgutils.NewWorkerPool(uint(o.TaskCount))
 	for _, h := range finalHosts {
-		o.executeOnSingleHost(ctx, h, provider, connector, wp, action)
+		o.executeOnSingleHost(ctx, h, provider, connector, wp, action, &stdoutMu)
 	}
 
 	wp.Wait()
@@ -167,7 +169,7 @@ func (o *FirewallOptions) runRemoteFirewalls(ctx context.Context, action func(fw
 	return nil
 }
 
-func (o *FirewallOptions) executeOnSingleHost(ctx context.Context, h string, provider config.ConfigProvider, connector *ssh.Connector, wp pkgutils.WorkerPool, action func(fw firewall.Firewall) (string, error)) {
+func (o *FirewallOptions) executeOnSingleHost(ctx context.Context, h string, provider config.ConfigProvider, connector *ssh.Connector, wp pkgutils.WorkerPool, action func(fw firewall.Firewall) (string, error), stdoutMu *sync.Mutex) {
 	wp.Execute(func() {
 		rawHost := strings.TrimSpace(h)
 		if rawHost == "" {
@@ -193,33 +195,33 @@ func (o *FirewallOptions) executeOnSingleHost(ctx context.Context, h string, pro
 		}
 
 		if nodeID == "" {
-			logger.PrintError(i18n.Tf("fw_node_not_found", map[string]any{"User": u, "Host": hs, "Port": p}))
+			printFwNodeNotFound(stdoutMu, u, hs, p)
 			return
 		}
 
 		client, err := connector.Connect(ctx, nodeID)
 		if err != nil {
-			logger.PrintError(i18n.Tf("fw_connect_failed", map[string]any{"Host": rawHost, "Error": err}))
+			printFwError(stdoutMu, rawHost, err, "fw_label_connect_failed", "fw_connect_failed")
 			return
 		}
 
 		exec := executor.NewSSHExecutor(client, ssh.WithLoginShell(false))
 		fw, err := firewall.DetectFirewall(ctx, exec)
 		if err != nil {
-			logger.PrintError(i18n.Tf("fw_detect_failed", map[string]any{"Host": rawHost, "Error": err}))
+			printFwError(stdoutMu, rawHost, err, "fw_label_detect_failed", "fw_detect_failed")
 			return
 		}
 
 		out, err := action(fw)
 		if err != nil {
-			logger.PrintError(i18n.Tf("fw_action_failed", map[string]any{"Host": rawHost, "Error": err, "Output": out}))
+			printFwActionFailed(stdoutMu, rawHost, err, out)
 		} else {
-			logger.PrintSuccess(i18n.Tf("fw_action_success", map[string]any{"Host": rawHost, "FwName": fw.Name(), "Output": out}))
+			printFwSuccess(stdoutMu, rawHost, fw.Name(), out)
 		}
 
 		if o.Reload {
 			if _, err := fw.Reload(ctx); err != nil {
-				logger.PrintError(i18n.Tf("fw_reload_failed", map[string]any{"Host": rawHost, "Error": err}))
+				printFwError(stdoutMu, rawHost, err, "fw_label_reload_failed", "fw_reload_failed")
 			}
 		}
 	})
@@ -395,5 +397,80 @@ func newFirewallReloadCmd(fwOptions *FirewallOptions) *cobra.Command {
 				return fw.Reload(context.Background())
 			})
 		},
+	}
+}
+
+func printFwSuccess(mu *sync.Mutex, host string, fwName string, out string) {
+	if mu != nil {
+		mu.Lock()
+		defer mu.Unlock()
+	}
+
+	if logger.ColorEnabled() {
+		hostPart := logger.Cyan(fmt.Sprintf("[%s]", host))
+		successLabel := i18n.T("fw_result_success")
+		resultPart := logger.Green(fmt.Sprintf("%s (%s)", successLabel, fwName))
+		var outPart string
+		if out != "" {
+			outPart = "\n" + out
+		}
+		fmt.Printf("%s %s%s\n", hostPart, resultPart, outPart)
+	} else {
+		logger.PrintSuccess(i18n.Tf("fw_action_success", map[string]any{"Host": host, "FwName": fwName, "Output": out}))
+	}
+}
+
+func printFwActionFailed(mu *sync.Mutex, host string, err error, out string) {
+	if mu != nil {
+		mu.Lock()
+		defer mu.Unlock()
+	}
+
+	if logger.ColorEnabled() {
+		hostPart := logger.Cyan(fmt.Sprintf("[%s]", host))
+		failedLabel := i18n.T("fw_result_failed")
+		errorLabel := i18n.T("fw_label_error")
+		outputLabel := i18n.T("fw_label_output")
+		resultPart := logger.Red(failedLabel)
+		errPart := logger.Red(fmt.Sprintf("%s: %v", errorLabel, err))
+		var outPart string
+		if out != "" {
+			outPart = fmt.Sprintf("\n%s:\n%s", logger.Yellow(outputLabel), out)
+		}
+		fmt.Fprintf(os.Stderr, "%s %s: %s%s\n", hostPart, resultPart, errPart, outPart)
+	} else {
+		logger.PrintError(i18n.Tf("fw_action_failed", map[string]any{"Host": host, "Error": err, "Output": out}))
+	}
+}
+
+func printFwNodeNotFound(mu *sync.Mutex, u string, hs string, p uint16) {
+	if mu != nil {
+		mu.Lock()
+		defer mu.Unlock()
+	}
+
+	if logger.ColorEnabled() {
+		hostPart := logger.Cyan(fmt.Sprintf("[%s@%s:%d]", u, hs, p))
+		failedLabel := i18n.T("fw_result_failed")
+		errText := i18n.T("fw_err_node_not_found")
+		fmt.Fprintf(os.Stderr, "%s %s: %s\n", hostPart, logger.Red(failedLabel), logger.Red(errText))
+	} else {
+		logger.PrintError(i18n.Tf("fw_node_not_found", map[string]any{"User": u, "Host": hs, "Port": p}))
+	}
+}
+
+func printFwError(mu *sync.Mutex, host string, err error, labelKey string, fallbackTfKey string) {
+	if mu != nil {
+		mu.Lock()
+		defer mu.Unlock()
+	}
+
+	if logger.ColorEnabled() {
+		hostPart := logger.Cyan(fmt.Sprintf("[%s]", host))
+		failedLabel := i18n.T("fw_result_failed")
+		errLabel := i18n.T(labelKey)
+		fmt.Fprintf(os.Stderr, "%s %s: %s: %s\n", hostPart, logger.Red(failedLabel), logger.Red(errLabel), logger.Red(err.Error()))
+	} else {
+		logger.PrintError(i18n.Tf(fallbackTfKey, map[string]any{"Host": host, "Error": err}))
 	}
 }

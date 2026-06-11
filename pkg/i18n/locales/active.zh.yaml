@@ -270,6 +270,22 @@ fw_reload_failed:
   other: "[{{.Host}}] 重启防火墙失败: {{.Error}}"
 fw_local_reload_failed:
   other: "[LOCAL] 重启防火墙失败: {{.Error}}"
+fw_result_success:
+  other: "成功"
+fw_result_failed:
+  other: "失败"
+fw_label_error:
+  other: "错误"
+fw_label_output:
+  other: "输出"
+fw_label_connect_failed:
+  other: "连接失败"
+fw_label_detect_failed:
+  other: "探测防火墙失败"
+fw_label_reload_failed:
+  other: "重启防火墙失败"
+fw_err_node_not_found:
+  other: "未找到该主机匹配的节点配置，请先通过 inventory 添加"
 
 # ---- inventory (host) ----
 inventory_short:
