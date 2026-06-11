@@ -60,6 +60,7 @@ func newCmdFirewall() *cobra.Command {
 
 	cmd.PersistentFlags().StringVarP(&fwOptions.Host, "host", "H", "", i18n.T("flag_fw_host"))
 	cmd.PersistentFlags().StringVarP(&fwOptions.HostFile, "ifile", "I", "", i18n.T("flag_fw_ifile"))
+	cmd.PersistentFlags().StringSliceVarP(&fwOptions.Tags, "tags", "t", []string{}, i18n.T("flag_fw_tags"))
 	cmd.PersistentFlags().StringVarP(&fwOptions.User, "user", "u", "", i18n.T("flag_fw_user"))
 	cmd.PersistentFlags().StringVarP(&fwOptions.Password, "password", "w", "", i18n.T("flag_fw_password"))
 	cmd.PersistentFlags().IntVar(&fwOptions.TaskCount, "task", 1, i18n.T("flag_fw_task"))
@@ -74,7 +75,7 @@ func newCmdFirewall() *cobra.Command {
 
 func (o *FirewallOptions) RunOnHosts(ctx context.Context, action func(fw firewall.Firewall) (string, error)) error {
 	// 如果没有指定主机，默认本地模式
-	if o.Host == "" && o.HostFile == "" {
+	if o.Host == "" && o.HostFile == "" && len(o.Tags) == 0 {
 		return o.runLocalFirewall(ctx, action)
 	}
 	// 远程模式
@@ -118,7 +119,7 @@ func (o *FirewallOptions) runRemoteFirewalls(ctx context.Context, action func(fw
 
 	var hosts []string
 	if o.Host != "" {
-		hosts = strings.Split(o.Host, ",")
+		hosts = append(hosts, strings.Split(o.Host, ",")...)
 	}
 	if o.HostFile != "" {
 		data, err := os.ReadFile(o.HostFile)
@@ -132,9 +133,30 @@ func (o *FirewallOptions) runRemoteFirewalls(ctx context.Context, action func(fw
 			}
 		}
 	}
+	if len(o.Tags) > 0 {
+		for _, tag := range o.Tags {
+			nodes := provider.GetNodesByTag(tag)
+			for nodeID := range nodes {
+				hosts = append(hosts, nodeID)
+			}
+		}
+	}
+
+	uniqueHosts := make(map[string]bool)
+	var finalHosts []string
+	for _, h := range hosts {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			continue
+		}
+		if !uniqueHosts[h] {
+			uniqueHosts[h] = true
+			finalHosts = append(finalHosts, h)
+		}
+	}
 
 	wp := pkgutils.NewWorkerPool(uint(o.TaskCount))
-	for _, h := range hosts {
+	for _, h := range finalHosts {
 		o.executeOnSingleHost(ctx, h, provider, connector, wp, action)
 	}
 

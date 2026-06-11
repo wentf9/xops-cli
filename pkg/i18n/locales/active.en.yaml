@@ -239,6 +239,8 @@ flag_fw_host:
   other: "Target host(s) / alias, comma separated"
 flag_fw_ifile:
   other: "Host list file (one host/alias per line)"
+flag_fw_tags:
+  other: "Target tags, comma separated or specified multiple times"
 flag_fw_user:
   other: "SSH username"
 flag_fw_password:

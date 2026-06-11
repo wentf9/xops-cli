@@ -240,6 +240,8 @@ flag_fw_host:
   other: "目标主机/连接别名,多个用逗号分隔"
 flag_fw_ifile:
   other: "主机列表文件(每行一个主机名或别名)"
+flag_fw_tags:
+  other: "目标标签，多个标签可用逗号分隔或多次指定"
 flag_fw_user:
   other: "SSH用户名"
 flag_fw_password:
