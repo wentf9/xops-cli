@@ -257,23 +257,34 @@ func (c *Client) runWithSu(ctx context.Context, command string, password string,
 	return output, nil
 }
 
-func (c *Client) ShellWithSudo(ctx context.Context) error {
+func (c *Client) preCheckSudoMode(ctx context.Context) (isRoot bool, err error) {
 	c.maybeDetectSudoMode(ctx)
 	if c.cfg.SudoMode == SudoModeRoot {
-		return c.Shell(ctx)
+		return true, nil
 	}
 
 	// none 模式明确不支持提权
 	if c.cfg.SudoMode == SudoModeNone {
-		return fmt.Errorf("privilege escalation is not supported for this host (sudo_mode=none)")
+		return false, fmt.Errorf("privilege escalation is not supported for this host (sudo_mode=none)")
 	}
 
 	// sudo/sudoer 模式：通过 sudo -S -p '' true 预检，可靠且无副作用
 	// su 模式不做预检：su -c 会跑 root login shell 初始化脚本，脚本错误会导致误报
 	if c.cfg.SudoMode == SudoModeSudo || c.cfg.SudoMode == SudoModeSudoer {
 		if _, err := c.runWithSudo(ctx, "true", c.cfg.Password, nil, nil); err != nil {
-			return fmt.Errorf("sudo access denied: %w", err)
+			return false, fmt.Errorf("sudo access denied: %w", err)
 		}
+	}
+	return false, nil
+}
+
+func (c *Client) ShellWithSudo(ctx context.Context) error {
+	isRoot, err := c.preCheckSudoMode(ctx)
+	if err != nil {
+		return err
+	}
+	if isRoot {
+		return c.Shell(ctx)
 	}
 
 	session, err := c.sshClient.NewSession()
@@ -332,6 +343,18 @@ func (c *Client) ShellWithSudo(ctx context.Context) error {
 		expect.SetAccumulate(false)
 		expect.SetTarget(os.Stdout)
 	}
+
+	done := make(chan struct{})
+	defer close(done)
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = session.Signal(ssh.SIGKILL)
+			_ = session.Close()
+		case <-done:
+		}
+	}()
 
 	cancelStdin, stdinDone := copyStdinTo(stdin)
 

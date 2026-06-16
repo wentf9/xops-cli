@@ -52,11 +52,11 @@ func (f *TCPForwarder) Run(ctx context.Context) error {
 				return fmt.Errorf("accept error: %w", err)
 			}
 		}
-		go f.handle(conn)
+		go f.handle(ctx, conn)
 	}
 }
 
-func (f *TCPForwarder) handle(src net.Conn) {
+func (f *TCPForwarder) handle(ctx context.Context, src net.Conn) {
 	defer func() { _ = src.Close() }()
 
 	if tcpConn, ok := src.(*net.TCPConn); ok {
@@ -83,6 +83,18 @@ func (f *TCPForwarder) handle(src net.Conn) {
 			logger.Warnf("failed to set keepalive period on dst: %v", err)
 		}
 	}
+
+	done := make(chan struct{})
+	defer close(done)
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = src.Close()
+			_ = dst.Close()
+		case <-done:
+		}
+	}()
 
 	var wg sync.WaitGroup
 	wg.Add(2)

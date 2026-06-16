@@ -30,15 +30,26 @@ func (c *Client) LocalForward(ctx context.Context, localAddr, remoteAddr string)
 			if err != nil {
 				return // Context canceled or listener closed
 			}
-			go c.handleLocalForward(conn, remoteAddr)
+			go c.handleLocalForward(ctx, conn, remoteAddr)
 		}
 	}()
 
 	return nil
 }
 
-func (c *Client) handleLocalForward(localConn net.Conn, remoteAddr string) {
+func (c *Client) handleLocalForward(ctx context.Context, localConn net.Conn, remoteAddr string) {
 	defer func() { _ = localConn.Close() }()
+
+	done := make(chan struct{})
+	defer close(done)
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = localConn.Close()
+		case <-done:
+		}
+	}()
 
 	remoteConn, err := c.sshClient.Dial("tcp", remoteAddr)
 	if err != nil {
@@ -46,6 +57,14 @@ func (c *Client) handleLocalForward(localConn net.Conn, remoteAddr string) {
 		return
 	}
 	defer func() { _ = remoteConn.Close() }()
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = remoteConn.Close()
+		case <-done:
+		}
+	}()
 
 	c.copyStream(localConn, remoteConn)
 }
@@ -69,15 +88,26 @@ func (c *Client) RemoteForward(ctx context.Context, remoteAddr, localAddr string
 			if err != nil {
 				return
 			}
-			go c.handleRemoteForward(conn, localAddr)
+			go c.handleRemoteForward(ctx, conn, localAddr)
 		}
 	}()
 
 	return nil
 }
 
-func (c *Client) handleRemoteForward(remoteConn net.Conn, localAddr string) {
+func (c *Client) handleRemoteForward(ctx context.Context, remoteConn net.Conn, localAddr string) {
 	defer func() { _ = remoteConn.Close() }()
+
+	done := make(chan struct{})
+	defer close(done)
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = remoteConn.Close()
+		case <-done:
+		}
+	}()
 
 	localConn, err := net.DialTimeout("tcp", localAddr, 5*time.Second)
 	if err != nil {
@@ -85,6 +115,14 @@ func (c *Client) handleRemoteForward(remoteConn net.Conn, localAddr string) {
 		return
 	}
 	defer func() { _ = localConn.Close() }()
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = localConn.Close()
+		case <-done:
+		}
+	}()
 
 	c.copyStream(remoteConn, localConn)
 }

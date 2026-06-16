@@ -368,7 +368,11 @@ func (c *Client) UploadDirectory(ctx context.Context, localDir, remoteDir string
 		loopDest := remoteDest
 		loopInfo := info
 
-		sem <- struct{}{}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 		g.Go(func() error {
 			defer func() { <-sem }()
 			return c.UploadFile(ctx, loopPath, loopDest, loopInfo.Size(), loopInfo.Mode(), progress)
@@ -426,7 +430,13 @@ func (c *Client) DownloadDirectory(ctx context.Context, remoteDir, localDir stri
 		loopDest := localDest
 		loopInfo := info
 
-		sem <- struct{}{}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+		}
+		if ctx.Err() != nil {
+			break
+		}
 		g.Go(func() error {
 			defer func() { <-sem }()
 			return c.DownloadFile(ctx, loopPath, loopDest, loopInfo.Size(), loopInfo.Mode(), progress)

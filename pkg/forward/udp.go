@@ -61,6 +61,14 @@ func (f *UDPForwarder) Run(ctx context.Context) error {
 		_ = listener.Close()
 	}()
 
+	defer func() {
+		f.mu.Lock()
+		for _, sess := range f.sessions {
+			_ = sess.upstream.Close()
+		}
+		f.mu.Unlock()
+	}()
+
 	go f.reapSessions(derivedCtx)
 
 	logger.Infof("UDP %s -> %s", f.listenAddr, f.targetAddr)

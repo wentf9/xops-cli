@@ -104,3 +104,64 @@ func TestTCPForwarder_CtxCancel(t *testing.T) {
 		t.Fatal("Run did not exit after ctx cancel")
 	}
 }
+
+func TestTCPForwarder_ConnCleanupOnCancel(t *testing.T) {
+	echoAddr := startEchoServer(t)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("pre-alloc listen: %v", err)
+	}
+	forwardAddr := ln.Addr().String()
+	_ = ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	f := NewTCPForwarder(forwardAddr, echoAddr)
+	errCh := make(chan error, 1)
+	go func() { errCh <- f.Run(ctx) }()
+
+	// wait for forwarder to start
+	var conn net.Conn
+	for range 20 {
+		conn, err = net.DialTimeout("tcp", forwardAddr, 50*time.Millisecond)
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("connect to forwarder: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// Cancel context
+	cancel()
+
+	// Wait for connection to be closed by forwarder
+	errReadCh := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 1024)
+		_, err := conn.Read(buf)
+		errReadCh <- err
+	}()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("Run returned non-nil error after cancel: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not exit after ctx cancel")
+	}
+
+	select {
+	case err := <-errReadCh:
+		if err == nil {
+			t.Error("expected connection to be closed, but Read returned nil error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("connection was not closed by forwarder after cancel")
+	}
+}

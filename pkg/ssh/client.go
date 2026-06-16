@@ -262,6 +262,18 @@ func (c *Client) Shell(ctx context.Context) error {
 	go func() { _, _ = io.Copy(os.Stdout, stdout) }()
 	go func() { _, _ = io.Copy(os.Stderr, stderr) }()
 
+	done := make(chan struct{})
+	defer close(done)
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = session.Signal(ssh.SIGKILL)
+			_ = session.Close()
+		case <-done:
+		}
+	}()
+
 	// 启动协程处理用户输入
 	cancelStdin, stdinDone := copyStdinTo(stdin)
 
@@ -329,6 +341,18 @@ func (c *Client) RunInteractive(ctx context.Context, cmd string) error {
 	go func() { _, _ = io.Copy(os.Stdout, stdout) }()
 	go func() { _, _ = io.Copy(os.Stderr, stderr) }()
 
+	done := make(chan struct{})
+	defer close(done)
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = session.Signal(ssh.SIGKILL)
+			_ = session.Close()
+		case <-done:
+		}
+	}()
+
 	cancelStdin, stdinDone := copyStdinTo(stdin)
 
 	err = ignoreShellExitError(session.Wait())
@@ -383,6 +407,18 @@ func (c *Client) RunInteractiveCmd(ctx context.Context, cmd string) error {
 
 	go func() { _, _ = io.Copy(os.Stdout, stdout) }()
 	go func() { _, _ = io.Copy(os.Stderr, stderr) }()
+
+	done := make(chan struct{})
+	defer close(done)
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = session.Signal(ssh.SIGKILL)
+			_ = session.Close()
+		case <-done:
+		}
+	}()
 
 	cancelStdin, stdinDone := copyStdinTo(stdin)
 
