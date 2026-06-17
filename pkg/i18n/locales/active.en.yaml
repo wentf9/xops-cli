@@ -257,6 +257,8 @@ flag_fw_reload:
   other: "Reload after operation"
 flag_fw_zone:
   other: "Firewall zone (firewalld only)"
+flag_fw_clear:
+  other: "Clear all rules of this type"
 fw_node_not_found:
   other: "[{{.User}}@{{.Host}}:{{.Port}}] No matching node config found, please add via inventory first"
 fw_connect_failed:

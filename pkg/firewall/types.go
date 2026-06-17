@@ -43,6 +43,9 @@ type Firewall interface {
 	AddRule(ctx context.Context, rule Rule) (string, error)
 	RemoveRule(ctx context.Context, rule Rule) (string, error)
 	Reload(ctx context.Context) (string, error)
+	ClearPorts(ctx context.Context) (string, error)
+	ClearServices(ctx context.Context) (string, error)
+	ClearRules(ctx context.Context) (string, error)
 }
 
 // BackendError 定义防火墙后端错误

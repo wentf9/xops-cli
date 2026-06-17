@@ -299,3 +299,164 @@ func testIptablesIsOpen(t *testing.T) {
 		t.Errorf("Iptables expected error, got nil")
 	}
 }
+
+func TestClearRules(t *testing.T) {
+	t.Run("ufw", testUfwClear)
+	t.Run("firewalld", testFirewalldClear)
+	t.Run("nftables", testNftablesClear)
+	t.Run("iptables", testIptablesClear)
+}
+
+func testUfwClear(t *testing.T) {
+	exec := newMockExecutor()
+	exec.responses["ufw status numbered"] = `Status: active
+
+     To                         Action      From
+     --                         ------      ----
+[ 1] 80/tcp                     ALLOW IN    Anywhere
+[ 2] http                       ALLOW IN    Anywhere
+[ 3] 22/tcp                     ALLOW IN    192.168.1.100
+[ 4] 8080                       ALLOW IN    Anywhere
+`
+	exec.responses["ufw --force delete 1"] = "Deleted"
+	exec.responses["ufw --force delete 4"] = "Deleted"
+	exec.responses["ufw --force delete 2"] = "Deleted"
+	exec.responses["ufw --force delete 3"] = "Deleted"
+
+	b := NewUfwBackend(exec)
+
+	_, err := b.ClearPorts(context.Background())
+	if err != nil {
+		t.Fatalf("ClearPorts err: %v", err)
+	}
+	if exec.lastCmd != "ufw --force delete 1" {
+		t.Errorf("ClearPorts expected last cmd 'ufw --force delete 1', got: %s", exec.lastCmd)
+	}
+
+	_, err = b.ClearServices(context.Background())
+	if err != nil {
+		t.Fatalf("ClearServices err: %v", err)
+	}
+	if exec.lastCmd != "ufw --force delete 2" {
+		t.Errorf("ClearServices expected last cmd 'ufw --force delete 2', got: %s", exec.lastCmd)
+	}
+
+	_, err = b.ClearRules(context.Background())
+	if err != nil {
+		t.Fatalf("ClearRules err: %v", err)
+	}
+	if exec.lastCmd != "ufw --force delete 3" {
+		t.Errorf("ClearRules expected last cmd 'ufw --force delete 3', got: %s", exec.lastCmd)
+	}
+}
+
+func testFirewalldClear(t *testing.T) {
+	exec := newMockExecutor()
+	exec.responses["firewall-cmd --zone=public --list-ports"] = "80/tcp 8080/udp"
+	exec.responses["firewall-cmd --zone=public --list-services"] = "ssh http https"
+	exec.responses["firewall-cmd --zone=public --list-rich-rules"] = "rule family=\"ipv4\" source address=\"192.168.1.100\" accept\nrule family=\"ipv4\" source address=\"10.0.0.1\" drop"
+
+	exec.responses["firewall-cmd --permanent --zone=public --remove-port=80/tcp"] = "success"
+	exec.responses["firewall-cmd --permanent --zone=public --remove-port=8080/udp"] = "success"
+	exec.responses["firewall-cmd --permanent --zone=public --remove-service=http"] = "success"
+	exec.responses["firewall-cmd --permanent --zone=public --remove-service=https"] = "success"
+	exec.responses["firewall-cmd --permanent --zone=public --remove-rich-rule='rule family=\"ipv4\" source address=\"192.168.1.100\" accept'"] = "success"
+	exec.responses["firewall-cmd --permanent --zone=public --remove-rich-rule='rule family=\"ipv4\" source address=\"10.0.0.1\" drop'"] = "success"
+
+	b := NewFirewalldBackend(exec, "public")
+
+	_, err := b.ClearPorts(context.Background())
+	if err != nil {
+		t.Fatalf("ClearPorts err: %v", err)
+	}
+	if exec.lastCmd != "firewall-cmd --permanent --zone=public --remove-port=8080/udp" {
+		t.Errorf("ClearPorts expected last cmd, got: %s", exec.lastCmd)
+	}
+
+	_, err = b.ClearServices(context.Background())
+	if err != nil {
+		t.Fatalf("ClearServices err: %v", err)
+	}
+	if exec.lastCmd != "firewall-cmd --permanent --zone=public --remove-service=https" {
+		t.Errorf("ClearServices expected last cmd, got: %s", exec.lastCmd)
+	}
+
+	_, err = b.ClearRules(context.Background())
+	if err != nil {
+		t.Fatalf("ClearRules err: %v", err)
+	}
+	expected := "firewall-cmd --permanent --zone=public --remove-rich-rule='rule family=\"ipv4\" source address=\"10.0.0.1\" drop'"
+	if exec.lastCmd != expected {
+		t.Errorf("ClearRules expected last cmd '%s', got: '%s'", expected, exec.lastCmd)
+	}
+}
+
+func testNftablesClear(t *testing.T) {
+	exec := newMockExecutor()
+	exec.responses["nft -a list chain inet filter input"] = `table inet filter {
+    chain input {
+        type filter hook input priority filter; policy accept;
+        ip saddr 192.168.1.100 tcp dport 22 accept # handle 4
+        tcp dport 80 accept # handle 5
+    }
+}`
+	exec.responses["nft delete rule inet filter input handle 5"] = "success"
+	exec.responses["nft delete rule inet filter input handle 4"] = "success"
+
+	b := NewNftablesBackend(exec)
+
+	_, err := b.ClearPorts(context.Background())
+	if err != nil {
+		t.Fatalf("ClearPorts err: %v", err)
+	}
+	if exec.lastCmd != "nft delete rule inet filter input handle 5" {
+		t.Errorf("ClearPorts expected last cmd, got: %s", exec.lastCmd)
+	}
+
+	_, err = b.ClearRules(context.Background())
+	if err != nil {
+		t.Fatalf("ClearRules err: %v", err)
+	}
+	if exec.lastCmd != "nft delete rule inet filter input handle 4" {
+		t.Errorf("ClearRules expected last cmd, got: %s", exec.lastCmd)
+	}
+}
+
+func testIptablesClear(t *testing.T) {
+	exec := newMockExecutor()
+	exec.responses["iptables -L INPUT --line-numbers -n"] = `Chain INPUT (policy ACCEPT)
+num  target     prot opt source               destination
+1    ACCEPT     tcp  --  192.168.1.100        0.0.0.0/0            tcp dpt:22
+2    ACCEPT     tcp  --  0.0.0.0/0            0.0.0.0/0            tcp dpt:80
+3    ACCEPT     tcp  --  0.0.0.0/0            0.0.0.0/0            tcp dpt:http
+`
+	exec.responses["iptables -D INPUT 2"] = "success"
+	exec.responses["iptables -D INPUT 3"] = "success"
+	exec.responses["iptables -D INPUT 1"] = "success"
+
+	b := NewIptablesBackend(exec)
+
+	_, err := b.ClearPorts(context.Background())
+	if err != nil {
+		t.Fatalf("ClearPorts err: %v", err)
+	}
+	if exec.lastCmd != "iptables -D INPUT 2" {
+		t.Errorf("ClearPorts expected last cmd, got: %s", exec.lastCmd)
+	}
+
+	_, err = b.ClearServices(context.Background())
+	if err != nil {
+		t.Fatalf("ClearServices err: %v", err)
+	}
+	if exec.lastCmd != "iptables -D INPUT 3" {
+		t.Errorf("ClearServices expected last cmd, got: %s", exec.lastCmd)
+	}
+
+	_, err = b.ClearRules(context.Background())
+	if err != nil {
+		t.Fatalf("ClearRules err: %v", err)
+	}
+	if exec.lastCmd != "iptables -D INPUT 1" {
+		t.Errorf("ClearRules expected last cmd, got: %s", exec.lastCmd)
+	}
+}

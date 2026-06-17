@@ -78,3 +78,75 @@ func (b *NftablesBackend) RemoveRule(ctx context.Context, rule Rule) (string, er
 func (b *NftablesBackend) Reload(ctx context.Context) (string, error) {
 	return "", nil
 }
+
+func (b *NftablesBackend) ClearPorts(ctx context.Context) (string, error) {
+	return b.clearNftRulesByType(ctx, "port")
+}
+
+func (b *NftablesBackend) ClearServices(ctx context.Context) (string, error) {
+	return b.clearNftRulesByType(ctx, "service")
+}
+
+func (b *NftablesBackend) ClearRules(ctx context.Context) (string, error) {
+	return b.clearNftRulesByType(ctx, "rule")
+}
+
+func (b *NftablesBackend) clearNftRulesByType(ctx context.Context, ruleType string) (string, error) {
+	rulesStr, err := b.exec.RunWithSudo(ctx, "nft -a list chain inet filter input")
+	if err != nil {
+		return "", err
+	}
+
+	lines := strings.Split(rulesStr, "\n")
+	var handles []string
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.Contains(line, "handle ") {
+			continue
+		}
+		idx := strings.Index(line, "handle ")
+		handleNum := strings.TrimSpace(line[idx+len("handle "):])
+		fields := strings.Fields(handleNum)
+		if len(fields) > 0 {
+			handleNum = fields[0]
+		}
+
+		ruleContent := line[:idx]
+		hasSaddr := strings.Contains(ruleContent, "saddr")
+		hasDport := strings.Contains(ruleContent, "dport")
+
+		match := false
+		switch ruleType {
+		case "port":
+			if hasDport && !hasSaddr {
+				match = true
+			}
+		case "service":
+			match = false
+		case "rule":
+			if hasSaddr {
+				match = true
+			}
+		}
+
+		if match {
+			handles = append(handles, handleNum)
+		}
+	}
+
+	if len(handles) == 0 {
+		return "no rules found to clear\n", nil
+	}
+
+	var outBuilder strings.Builder
+	for i := len(handles) - 1; i >= 0; i-- {
+		cmd := fmt.Sprintf("nft delete rule inet filter input handle %s", handles[i])
+		out, err := b.exec.RunWithSudo(ctx, cmd)
+		outBuilder.WriteString(out)
+		if err != nil {
+			return outBuilder.String(), err
+		}
+	}
+	return outBuilder.String(), nil
+}

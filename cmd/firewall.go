@@ -63,7 +63,7 @@ func newCmdFirewall() *cobra.Command {
 
 	cmd.PersistentFlags().StringVarP(&fwOptions.Host, "host", "H", "", i18n.T("flag_fw_host"))
 	cmd.PersistentFlags().StringVarP(&fwOptions.HostFile, "ifile", "I", "", i18n.T("flag_fw_ifile"))
-	cmd.PersistentFlags().StringSliceVarP(&fwOptions.Tags, "tags", "t", []string{}, i18n.T("flag_fw_tags"))
+	cmd.PersistentFlags().StringSliceVarP(&fwOptions.Tags, "tag", "t", []string{}, i18n.T("flag_fw_tags"))
 	cmd.PersistentFlags().StringVarP(&fwOptions.User, "user", "u", "", i18n.T("flag_fw_user"))
 	cmd.PersistentFlags().StringVarP(&fwOptions.Password, "password", "w", "", i18n.T("flag_fw_password"))
 	cmd.PersistentFlags().IntVar(&fwOptions.TaskCount, "task", 1, i18n.T("flag_fw_task"))
@@ -271,11 +271,20 @@ func newFirewallListCmd(fwOptions *FirewallOptions) *cobra.Command {
 }
 
 func newFirewallPortCmd(fwOptions *FirewallOptions) *cobra.Command {
-	return &cobra.Command{
-		Use:   "port <ports>",
+	var clear bool
+	cmd := &cobra.Command{
+		Use:   "port [ports]",
 		Short: i18n.T("firewall_port_short"),
-		Args:  cobra.MinimumNArgs(1),
+		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if clear {
+				return fwOptions.RunOnHosts(context.Background(), func(fw firewall.Firewall) (string, error) {
+					return fw.ClearPorts(context.Background())
+				})
+			}
+			if len(args) < 1 {
+				return fmt.Errorf("accepts at least 1 arg(s), received %d", len(args))
+			}
 			return fwOptions.RunOnHosts(context.Background(), func(fw firewall.Firewall) (string, error) {
 				var finalOut strings.Builder
 				var allPorts []string
@@ -309,14 +318,25 @@ func newFirewallPortCmd(fwOptions *FirewallOptions) *cobra.Command {
 			})
 		},
 	}
+	cmd.Flags().BoolVar(&clear, "clear", false, i18n.T("flag_fw_clear"))
+	return cmd
 }
 
 func newFirewallServiceCmd(fwOptions *FirewallOptions) *cobra.Command {
-	return &cobra.Command{
-		Use:   "service <services>",
+	var clear bool
+	cmd := &cobra.Command{
+		Use:   "service [services]",
 		Short: i18n.T("firewall_service_short"),
-		Args:  cobra.MinimumNArgs(1),
+		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if clear {
+				return fwOptions.RunOnHosts(context.Background(), func(fw firewall.Firewall) (string, error) {
+					return fw.ClearServices(context.Background())
+				})
+			}
+			if len(args) < 1 {
+				return fmt.Errorf("accepts at least 1 arg(s), received %d", len(args))
+			}
 			return fwOptions.RunOnHosts(context.Background(), func(fw firewall.Firewall) (string, error) {
 				var finalOut strings.Builder
 				var allServices []string
@@ -349,14 +369,25 @@ func newFirewallServiceCmd(fwOptions *FirewallOptions) *cobra.Command {
 			})
 		},
 	}
+	cmd.Flags().BoolVar(&clear, "clear", false, i18n.T("flag_fw_clear"))
+	return cmd
 }
 
 func newFirewallRuleCmd(fwOptions *FirewallOptions) *cobra.Command {
+	var clear bool
 	cmd := &cobra.Command{
-		Use:   "rule [port] <source_ip>",
+		Use:   "rule [port] [source_ip]",
 		Short: i18n.T("firewall_rule_short"),
-		Args:  cobra.RangeArgs(1, 2),
+		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if clear {
+				return fwOptions.RunOnHosts(context.Background(), func(fw firewall.Firewall) (string, error) {
+					return fw.ClearRules(context.Background())
+				})
+			}
+			if len(args) < 1 || len(args) > 2 {
+				return fmt.Errorf("accepts between 1 and 2 arg(s), received %d", len(args))
+			}
 			var portStr, sourceStr string
 			if len(args) == 1 {
 				sourceStr = args[0]
@@ -414,6 +445,7 @@ func newFirewallRuleCmd(fwOptions *FirewallOptions) *cobra.Command {
 			})
 		},
 	}
+	cmd.Flags().BoolVar(&clear, "clear", false, i18n.T("flag_fw_clear"))
 	cmd.Flags().Bool("reject", false, "使用 REJECT")
 	cmd.Flags().Bool("drop", false, "使用 DROP")
 	return cmd

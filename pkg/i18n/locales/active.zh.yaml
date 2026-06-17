@@ -258,6 +258,8 @@ flag_fw_reload:
   other: "操作后是否重载"
 flag_fw_zone:
   other: "防火墙区域 (仅 firewalld)"
+flag_fw_clear:
+  other: "清空当前类型的全部规则"
 fw_node_not_found:
   other: "[{{.User}}@{{.Host}}:{{.Port}}] 未找到该主机匹配的节点配置，请先通过 inventory 添加"
 fw_connect_failed:

@@ -85,3 +85,100 @@ func (b *UfwBackend) buildRuleCmd(rule Rule, remove bool) string {
 
 	return cmd
 }
+
+func (b *UfwBackend) ClearPorts(ctx context.Context) (string, error) {
+	return b.clearUfwRulesByType(ctx, "port")
+}
+
+func (b *UfwBackend) ClearServices(ctx context.Context) (string, error) {
+	return b.clearUfwRulesByType(ctx, "service")
+}
+
+func (b *UfwBackend) ClearRules(ctx context.Context) (string, error) {
+	return b.clearUfwRulesByType(ctx, "rule")
+}
+
+func parseUfwAnywhere(fields []string, fromField string) bool {
+	if fromField == "Anywhere" || fromField == "(v6)" {
+		return true
+	}
+	if len(fields) >= 2 && fields[len(fields)-2] == "Anywhere" {
+		return true
+	}
+	return false
+}
+
+func parseUfwPort(toField string) bool {
+	if strings.Contains(toField, "/") {
+		return true
+	}
+	var val int
+	_, err := fmt.Sscanf(toField, "%d", &val)
+	return err == nil
+}
+
+func (b *UfwBackend) matchUfwRule(line string, ruleType string) (string, bool) {
+	if !strings.HasPrefix(line, "[") {
+		return "", false
+	}
+	endIdx := strings.Index(line, "]")
+	if endIdx == -1 {
+		return "", false
+	}
+	numStr := strings.TrimSpace(line[1:endIdx])
+	content := strings.TrimSpace(line[endIdx+1:])
+	fields := strings.Fields(content)
+	if len(fields) < 3 {
+		return "", false
+	}
+
+	toField := fields[0]
+	fromField := fields[len(fields)-1]
+
+	isAnywhere := parseUfwAnywhere(fields, fromField)
+	isPort := parseUfwPort(toField)
+
+	match := false
+	if ruleType == "port" && isPort && isAnywhere {
+		match = true
+	} else if ruleType == "service" && !isPort && isAnywhere {
+		if toField != "Anywhere" && toField != "Anywhere (v6)" {
+			match = true
+		}
+	} else if ruleType == "rule" && !isAnywhere {
+		match = true
+	}
+	return numStr, match
+}
+
+func (b *UfwBackend) clearUfwRulesByType(ctx context.Context, ruleType string) (string, error) {
+	rulesStr, err := b.ListRules(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	lines := strings.Split(rulesStr, "\n")
+	var nums []string
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if numStr, match := b.matchUfwRule(line, ruleType); match {
+			nums = append(nums, numStr)
+		}
+	}
+
+	if len(nums) == 0 {
+		return "no rules found to clear\n", nil
+	}
+
+	var outBuilder strings.Builder
+	for i := len(nums) - 1; i >= 0; i-- {
+		cmd := fmt.Sprintf("ufw --force delete %s", nums[i])
+		out, err := b.exec.RunWithSudo(ctx, cmd)
+		outBuilder.WriteString(out)
+		if err != nil {
+			return outBuilder.String(), err
+		}
+	}
+	return outBuilder.String(), nil
+}

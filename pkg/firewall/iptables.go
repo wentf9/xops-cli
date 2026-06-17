@@ -3,6 +3,7 @@ package firewall
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/wentf9/xops-cli/pkg/executor"
 )
@@ -79,4 +80,94 @@ func (b *IptablesBackend) buildRuleCmd(rule Rule, op string) string {
 	}
 	cmd += fmt.Sprintf(" -j %s", target)
 	return cmd
+}
+
+func (b *IptablesBackend) ClearPorts(ctx context.Context) (string, error) {
+	return b.clearIptablesRulesByType(ctx, "port")
+}
+
+func (b *IptablesBackend) ClearServices(ctx context.Context) (string, error) {
+	return b.clearIptablesRulesByType(ctx, "service")
+}
+
+func (b *IptablesBackend) ClearRules(ctx context.Context) (string, error) {
+	return b.clearIptablesRulesByType(ctx, "rule")
+}
+
+func parseIptablesPort(fields []string) (bool, bool) {
+	hasDpt := false
+	isPort := false
+	for _, f := range fields {
+		if strings.Contains(f, "dpt:") {
+			hasDpt = true
+			portStr := f[strings.Index(f, "dpt:")+len("dpt:"):]
+			isPort = true
+			for _, char := range portStr {
+				if (char < '0' || char > '9') && char != ':' {
+					isPort = false
+					break
+				}
+			}
+		}
+	}
+	return hasDpt, isPort
+}
+
+func (b *IptablesBackend) matchIptablesRule(fields []string, ruleType string) (string, bool) {
+	if len(fields) < 6 {
+		return "", false
+	}
+	numStr := fields[0]
+	var numVal int
+	if _, scanErr := fmt.Sscanf(numStr, "%d", &numVal); scanErr != nil {
+		return "", false
+	}
+
+	source := fields[4]
+	isAnywhere := source == "0.0.0.0/0" || source == "::/0"
+
+	hasDpt, isPort := parseIptablesPort(fields[5:])
+
+	match := false
+	if ruleType == "port" && hasDpt && isPort && isAnywhere {
+		match = true
+	} else if ruleType == "service" && hasDpt && !isPort && isAnywhere {
+		match = true
+	} else if ruleType == "rule" && !isAnywhere {
+		match = true
+	}
+	return numStr, match
+}
+
+func (b *IptablesBackend) clearIptablesRulesByType(ctx context.Context, ruleType string) (string, error) {
+	rulesStr, err := b.exec.RunWithSudo(ctx, "iptables -L INPUT --line-numbers -n")
+	if err != nil {
+		return "", err
+	}
+
+	lines := strings.Split(rulesStr, "\n")
+	var nums []string
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		fields := strings.Fields(line)
+		if numStr, match := b.matchIptablesRule(fields, ruleType); match {
+			nums = append(nums, numStr)
+		}
+	}
+
+	if len(nums) == 0 {
+		return "no rules found to clear\n", nil
+	}
+
+	var outBuilder strings.Builder
+	for i := len(nums) - 1; i >= 0; i-- {
+		cmd := fmt.Sprintf("iptables -D INPUT %s", nums[i])
+		out, err := b.exec.RunWithSudo(ctx, cmd)
+		outBuilder.WriteString(out)
+		if err != nil {
+			return outBuilder.String(), err
+		}
+	}
+	return outBuilder.String(), nil
 }

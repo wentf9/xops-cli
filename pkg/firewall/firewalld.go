@@ -117,3 +117,89 @@ func (b *FirewalldBackend) buildRuleArgs(rule Rule, remove bool) string {
 	}
 	return ""
 }
+
+func (b *FirewalldBackend) ClearPorts(ctx context.Context) (string, error) {
+	cmd := fmt.Sprintf("firewall-cmd --zone=%s --list-ports", b.zone)
+	portsStr, err := b.exec.RunWithSudo(ctx, cmd)
+	if err != nil {
+		return "", err
+	}
+	ports := strings.Fields(portsStr)
+	if len(ports) == 0 {
+		return "no ports found to clear\n", nil
+	}
+	var outBuilder strings.Builder
+	for _, p := range ports {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		removeCmd := fmt.Sprintf("firewall-cmd --permanent --zone=%s --remove-port=%s", b.zone, p)
+		out, err := b.exec.RunWithSudo(ctx, removeCmd)
+		outBuilder.WriteString(out)
+		if err != nil {
+			return outBuilder.String(), err
+		}
+	}
+	return outBuilder.String(), nil
+}
+
+func (b *FirewalldBackend) ClearServices(ctx context.Context) (string, error) {
+	cmd := fmt.Sprintf("firewall-cmd --zone=%s --list-services", b.zone)
+	servicesStr, err := b.exec.RunWithSudo(ctx, cmd)
+	if err != nil {
+		return "", err
+	}
+	services := strings.Fields(servicesStr)
+	if len(services) == 0 {
+		return "no services found to clear\n", nil
+	}
+
+	keepServices := map[string]bool{
+		"ssh":           true,
+		"dhcpv6-client": true,
+	}
+
+	var outBuilder strings.Builder
+	for _, s := range services {
+		s = strings.TrimSpace(s)
+		if s == "" || keepServices[s] {
+			continue
+		}
+		removeCmd := fmt.Sprintf("firewall-cmd --permanent --zone=%s --remove-service=%s", b.zone, s)
+		out, err := b.exec.RunWithSudo(ctx, removeCmd)
+		outBuilder.WriteString(out)
+		if err != nil {
+			return outBuilder.String(), err
+		}
+	}
+	return outBuilder.String(), nil
+}
+
+func (b *FirewalldBackend) ClearRules(ctx context.Context) (string, error) {
+	cmd := fmt.Sprintf("firewall-cmd --zone=%s --list-rich-rules", b.zone)
+	rulesStr, err := b.exec.RunWithSudo(ctx, cmd)
+	if err != nil {
+		return "", err
+	}
+	lines := strings.Split(rulesStr, "\n")
+	var outBuilder strings.Builder
+	hasRules := false
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		hasRules = true
+		removeCmd := fmt.Sprintf("firewall-cmd --permanent --zone=%s --remove-rich-rule='%s'", b.zone, line)
+		out, err := b.exec.RunWithSudo(ctx, removeCmd)
+		outBuilder.WriteString(out)
+		if err != nil {
+			return outBuilder.String(), err
+		}
+	}
+	if !hasRules {
+		return "no rich rules found to clear\n", nil
+	}
+	return outBuilder.String(), nil
+}
