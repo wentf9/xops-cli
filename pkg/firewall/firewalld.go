@@ -28,6 +28,17 @@ func (b *FirewalldBackend) Status(ctx context.Context) (string, error) {
 	return b.exec.RunWithSudo(ctx, "firewall-cmd --state")
 }
 
+func (b *FirewalldBackend) IsOpen(ctx context.Context) (bool, error) {
+	out, err := b.Status(ctx)
+	if err != nil {
+		if strings.Contains(out, "not running") || strings.Contains(err.Error(), "not running") {
+			return false, nil
+		}
+		return false, err
+	}
+	return strings.TrimSpace(out) == "running", nil
+}
+
 func (b *FirewalldBackend) Enable(ctx context.Context) (string, error) {
 	return b.exec.RunWithSudo(ctx, "systemctl enable --now firewalld")
 }

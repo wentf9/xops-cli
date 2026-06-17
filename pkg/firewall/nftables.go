@@ -3,6 +3,7 @@ package firewall
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/wentf9/xops-cli/pkg/executor"
 )
@@ -21,6 +22,20 @@ func (b *NftablesBackend) Name() string {
 
 func (b *NftablesBackend) Status(ctx context.Context) (string, error) {
 	return b.exec.RunWithSudo(ctx, "nft list ruleset")
+}
+
+func (b *NftablesBackend) IsOpen(ctx context.Context) (bool, error) {
+	out, err := b.exec.RunWithSudo(ctx, "systemctl is-active nftables")
+	if err != nil {
+		if strings.TrimSpace(out) == "inactive" || strings.Contains(err.Error(), "inactive") {
+			return false, nil
+		}
+		if strings.TrimSpace(out) == "unknown" {
+			return false, nil
+		}
+		return false, err
+	}
+	return strings.TrimSpace(out) == "active", nil
 }
 
 func (b *NftablesBackend) Enable(ctx context.Context) (string, error) {

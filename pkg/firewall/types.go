@@ -36,6 +36,7 @@ type Rule struct {
 type Firewall interface {
 	Name() string
 	Status(ctx context.Context) (string, error)
+	IsOpen(ctx context.Context) (bool, error)
 	Enable(ctx context.Context) (string, error)
 	Disable(ctx context.Context) (string, error)
 	ListRules(ctx context.Context) (string, error)

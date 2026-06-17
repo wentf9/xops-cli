@@ -1,6 +1,7 @@
 package firewall
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -223,5 +224,78 @@ func TestBackendError(t *testing.T) {
 	expected := "[ufw] firewall error: timeout"
 	if err.Error() != expected {
 		t.Errorf("Error() = %q, want %q", err.Error(), expected)
+	}
+}
+
+func TestIsOpen(t *testing.T) {
+	t.Run("ufw", testUfwIsOpen)
+	t.Run("firewalld", testFirewalldIsOpen)
+	t.Run("nftables", testNftablesIsOpen)
+	t.Run("iptables", testIptablesIsOpen)
+}
+
+func testUfwIsOpen(t *testing.T) {
+	exec := newMockExecutor()
+	exec.responses["ufw status"] = "Status: active\nTo                         Action      From\n--"
+	b := NewUfwBackend(exec)
+	open, err := b.IsOpen(context.Background())
+	if err != nil || !open {
+		t.Errorf("UFW expected open, got open=%v, err=%v", open, err)
+	}
+
+	exec.responses["ufw status"] = "Status: inactive"
+	open, err = b.IsOpen(context.Background())
+	if err != nil || open {
+		t.Errorf("UFW expected closed, got open=%v, err=%v", open, err)
+	}
+}
+
+func testFirewalldIsOpen(t *testing.T) {
+	exec := newMockExecutor()
+	exec.responses["firewall-cmd --state"] = "running\n"
+	b := NewFirewalldBackend(exec, "")
+	open, err := b.IsOpen(context.Background())
+	if err != nil || !open {
+		t.Errorf("Firewalld expected open, got open=%v, err=%v", open, err)
+	}
+
+	exec.errors["firewall-cmd --state"] = fmt.Errorf("command failed: exit status 2, output: not running\n")
+	exec.responses["firewall-cmd --state"] = "not running\n"
+	open, err = b.IsOpen(context.Background())
+	if err != nil || open {
+		t.Errorf("Firewalld expected closed, got open=%v, err=%v", open, err)
+	}
+}
+
+func testNftablesIsOpen(t *testing.T) {
+	exec := newMockExecutor()
+	exec.responses["systemctl is-active nftables"] = "active\n"
+	b := NewNftablesBackend(exec)
+	open, err := b.IsOpen(context.Background())
+	if err != nil || !open {
+		t.Errorf("Nftables expected open, got open=%v, err=%v", open, err)
+	}
+
+	exec.errors["systemctl is-active nftables"] = fmt.Errorf("command failed: exit status 3, output: inactive\n")
+	exec.responses["systemctl is-active nftables"] = "inactive\n"
+	open, err = b.IsOpen(context.Background())
+	if err != nil || open {
+		t.Errorf("Nftables expected closed, got open=%v, err=%v", open, err)
+	}
+}
+
+func testIptablesIsOpen(t *testing.T) {
+	exec := newMockExecutor()
+	exec.responses["iptables -L -n"] = "Chain INPUT (policy ACCEPT)"
+	b := NewIptablesBackend(exec)
+	open, err := b.IsOpen(context.Background())
+	if err != nil || !open {
+		t.Errorf("Iptables expected open, got open=%v, err=%v", open, err)
+	}
+
+	exec.errors["iptables -L -n"] = fmt.Errorf("permission denied")
+	_, err = b.IsOpen(context.Background())
+	if err == nil {
+		t.Errorf("Iptables expected error, got nil")
 	}
 }

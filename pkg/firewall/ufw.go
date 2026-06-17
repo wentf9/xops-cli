@@ -3,6 +3,7 @@ package firewall
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/wentf9/xops-cli/pkg/executor"
 )
@@ -21,6 +22,14 @@ func (b *UfwBackend) Name() string {
 
 func (b *UfwBackend) Status(ctx context.Context) (string, error) {
 	return b.exec.RunWithSudo(ctx, "ufw status")
+}
+
+func (b *UfwBackend) IsOpen(ctx context.Context) (bool, error) {
+	out, err := b.Status(ctx)
+	if err != nil {
+		return false, err
+	}
+	return strings.Contains(out, "Status: active"), nil
 }
 
 func (b *UfwBackend) Enable(ctx context.Context) (string, error) {

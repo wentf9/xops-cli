@@ -23,6 +23,14 @@ func (b *IptablesBackend) Status(ctx context.Context) (string, error) {
 	return b.exec.RunWithSudo(ctx, "iptables -L -n")
 }
 
+func (b *IptablesBackend) IsOpen(ctx context.Context) (bool, error) {
+	_, err := b.Status(ctx)
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (b *IptablesBackend) Enable(ctx context.Context) (string, error) {
 	return "iptables is always enabled if installed", nil
 }

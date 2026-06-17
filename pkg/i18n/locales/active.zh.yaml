@@ -236,6 +236,8 @@ firewall_rule_short:
   other: "管理复杂规则 (带源 IP)"
 firewall_reload_short:
   other: "重载防火墙"
+firewall_status_short:
+  other: "检查防火墙状态"
 flag_fw_host:
   other: "目标主机/连接别名,多个用逗号分隔"
 flag_fw_ifile:
@@ -286,6 +288,10 @@ fw_label_reload_failed:
   other: "重启防火墙失败"
 fw_err_node_not_found:
   other: "未找到该主机匹配的节点配置，请先通过 inventory 添加"
+fw_status_running:
+  other: "运行中"
+fw_status_not_running:
+  other: "未运行"
 
 # ---- inventory (host) ----
 inventory_short:

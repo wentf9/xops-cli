@@ -235,6 +235,8 @@ firewall_rule_short:
   other: "Manage complex rules (with source IP)"
 firewall_reload_short:
   other: "Reload firewall"
+firewall_status_short:
+  other: "Check firewall status"
 flag_fw_host:
   other: "Target host(s) / alias, comma separated"
 flag_fw_ifile:
@@ -285,6 +287,10 @@ fw_label_reload_failed:
   other: "Failed to reload firewall"
 fw_err_node_not_found:
   other: "No matching node config found, please add via inventory first"
+fw_status_running:
+  other: "running"
+fw_status_not_running:
+  other: "not running"
 
 # ---- inventory (host) ----
 inventory_short:
