@@ -25,6 +25,7 @@ type ExecOptions struct {
 	ShellFile    string
 	Command      string
 	Tag          string
+	Exclude      []string
 	TaskCount    int
 	SuPwd        string
 	Interactive  bool
@@ -74,6 +75,7 @@ func NewCmdExec() *cobra.Command {
 	cmd.Flags().StringVarP(&o.Command, "cmd", "c", "", i18n.T("flag_exec_cmd"))
 	cmd.Flags().StringVarP(&o.HostFile, "ifile", "I", "", i18n.T("flag_exec_ifile"))
 	cmd.Flags().StringVar(&o.Tag, "tag", "", i18n.T("flag_exec_tag"))
+	cmd.Flags().StringSliceVar(&o.Exclude, "exclude", nil, i18n.T("flag_exclude"))
 	cmd.Flags().StringVar(&o.ShellFile, "shell", "", i18n.T("flag_exec_shell"))
 	cmd.Flags().IntVar(&o.TaskCount, "task", 3, i18n.T("flag_exec_task"))
 	cmd.Flags().BoolVarP(&o.Interactive, "interactive", "x", false, i18n.T("flag_exec_interactive"))
@@ -216,6 +218,21 @@ func (o *ExecOptions) Run() error {
 
 	if errTask != nil {
 		return errTask
+	}
+
+	// 应用 --exclude 排除规则
+	if len(o.Exclude) > 0 {
+		excludes, err := utils.ResolveExcludes(provider, utils.ParseExcludeFlag(o.Exclude))
+		if err != nil {
+			return fmt.Errorf("%s: %w", i18n.T("exec_err_exclude"), err)
+		}
+		filtered := tasks[:0]
+		for _, t := range tasks {
+			if _, excluded := excludes[t.nodeID]; !excluded {
+				filtered = append(filtered, t)
+			}
+		}
+		tasks = filtered
 	}
 
 	// 交互模式：单主机 PTY 执行

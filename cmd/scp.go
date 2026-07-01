@@ -35,6 +35,7 @@ type ScpOptions struct {
 	Dest        string
 	HostFile    string
 	Tag         string
+	Exclude     []string
 }
 
 func NewScpOptions() *ScpOptions {
@@ -78,6 +79,7 @@ func NewCmdScp() *cobra.Command {
 	cmd.Flags().StringVar(&o.Dest, "dest", "", i18n.T("flag_scp_dest"))
 	cmd.Flags().StringVarP(&o.HostFile, "ifile", "I", "", i18n.T("flag_ifile"))
 	cmd.Flags().StringVar(&o.Tag, "tag", "", i18n.T("flag_scp_tag"))
+	cmd.Flags().StringSliceVar(&o.Exclude, "exclude", nil, i18n.T("flag_exclude"))
 	cmd.Flags().BoolVarP(&o.Progress, "progress", "v", false, i18n.T("flag_progress"))
 	cmd.Flags().BoolVarP(&o.Force, "force", "f", false, i18n.T("flag_force"))
 	cmd.Flags().BoolVarP(&o.NoOverwrite, "no-clobber", "n", false, i18n.T("flag_no_overwrite"))
@@ -430,6 +432,16 @@ func (o *ScpOptions) doRemoteToRemote(srcFile *pkgsftp.File, dstFile *pkgsftp.Fi
 }
 
 func (o *ScpOptions) runBatch(ctx context.Context, provider config.ConfigProvider, connector *ssh.Connector, configStore config.Store, cfg *config.Configuration) error {
+	// 解析 --exclude 排除规则（在 Worker Pool 启动前完成，确保无歧义）
+	var excludes map[string]struct{}
+	if len(o.Exclude) > 0 {
+		resolved, err := cmdutils.ResolveExcludes(provider, cmdutils.ParseExcludeFlag(o.Exclude))
+		if err != nil {
+			return fmt.Errorf("%s: %w", i18n.T("scp_err_exclude"), err)
+		}
+		excludes = resolved
+	}
+
 	wp := pkgutils.NewWorkerPool(uint(o.TaskCount))
 
 	if o.Tag != "" {
@@ -438,6 +450,11 @@ func (o *ScpOptions) runBatch(ctx context.Context, provider config.ConfigProvide
 			return fmt.Errorf("%s", i18n.Tf("err_tag_empty", map[string]any{"Tag": o.Tag}))
 		}
 		for nodeID := range nodes {
+			if excludes != nil {
+				if _, excluded := excludes[nodeID]; excluded {
+					continue
+				}
+			}
 			nid := nodeID // capture
 			hostObj, _ := provider.GetHost(nid)
 			identity, _ := provider.GetIdentity(nid)
@@ -463,6 +480,15 @@ func (o *ScpOptions) runBatch(ctx context.Context, provider config.ConfigProvide
 			if h.Port == 0 {
 				h.Port = o.Port
 			}
+			// 若主机已映射到已知节点且在排除集合中，则跳过
+			if excludes != nil {
+				if nid := provider.Find(h.Host); nid != "" {
+					if _, excluded := excludes[nid]; excluded {
+						continue
+					}
+				}
+			}
+			h := h // capture
 			wp.Execute(func() {
 				addr := PathInfo{Host: h.Host, User: h.User, Port: h.Port, IsRemote: true}
 				o.executeTransfer(ctx, h.Host, addr, h.Password, provider, connector, configStore, cfg)

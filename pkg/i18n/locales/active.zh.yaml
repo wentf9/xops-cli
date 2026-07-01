@@ -694,6 +694,8 @@ scp_err_stat_remote:
   other: "stat remote path failed"
 scp_err_no_host_addr:
   other: "主机地址不能为空"
+scp_err_exclude:
+  other: "解析排除规则失败"
 
 # ---- ping additions ----
 ping_err_resolve:
@@ -744,6 +746,8 @@ tag_err_duplicate_input:
 # ---- firewall additions ----
 fw_err_os_not_supported:
   other: "防火墙管理功能仅支持 Linux 系统 (当前系统为 {{.OS}})"
+fw_err_exclude:
+  other: "解析排除规则失败"
 
 # ---- exec additions ----
 exec_err_no_cmd:
@@ -756,6 +760,12 @@ exec_err_interactive_multi_host:
   other: "交互模式下仅支持指定单个主机"
 exec_err_interactive_shell:
   other: "交互模式下不支持执行脚本文件"
+exec_err_exclude:
+  other: "解析排除规则失败"
+
+# ---- common exclude flag ----
+flag_exclude:
+  other: "排除指定的主机(支持节点ID/别名/IP/User@Host，逗号分隔或多次指定)"
 
 # ---- encode additions ----
 encode_err_need_arg:

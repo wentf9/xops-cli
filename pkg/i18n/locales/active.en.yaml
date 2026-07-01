@@ -693,6 +693,8 @@ scp_err_stat_remote:
   other: "Failed to stat remote path"
 scp_err_no_host_addr:
   other: "Host address cannot be empty"
+scp_err_exclude:
+  other: "Failed to resolve exclude rules"
 
 # ---- ping additions ----
 ping_err_resolve:
@@ -743,6 +745,8 @@ tag_err_duplicate_input:
 # ---- firewall additions ----
 fw_err_os_not_supported:
   other: "Firewall management is only supported on Linux (current system is {{.OS}})"
+fw_err_exclude:
+  other: "Failed to resolve exclude rules"
 
 # ---- exec additions ----
 exec_err_no_cmd:
@@ -755,6 +759,12 @@ exec_err_interactive_multi_host:
   other: "Interactive mode only supports a single host"
 exec_err_interactive_shell:
   other: "Interactive mode does not support script files"
+exec_err_exclude:
+  other: "Failed to resolve exclude rules"
+
+# ---- common exclude flag ----
+flag_exclude:
+  other: "Exclude specified hosts (supports Node ID / alias / IP / User@Host, comma separated or specified multiple times)"
 
 # ---- encode additions ----
 encode_err_need_arg:

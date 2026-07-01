@@ -31,6 +31,7 @@ type FirewallOptions struct {
 	Action     firewall.Action
 	TaskCount  int
 	StatusOnly bool
+	Exclude    []string
 }
 
 func NewFirewallOptions() *FirewallOptions {
@@ -64,6 +65,7 @@ func newCmdFirewall() *cobra.Command {
 	cmd.PersistentFlags().StringVarP(&fwOptions.Host, "host", "H", "", i18n.T("flag_fw_host"))
 	cmd.PersistentFlags().StringVarP(&fwOptions.HostFile, "ifile", "I", "", i18n.T("flag_fw_ifile"))
 	cmd.PersistentFlags().StringSliceVarP(&fwOptions.Tags, "tag", "t", []string{}, i18n.T("flag_fw_tags"))
+	cmd.PersistentFlags().StringSliceVar(&fwOptions.Exclude, "exclude", nil, i18n.T("flag_exclude"))
 	cmd.PersistentFlags().StringVarP(&fwOptions.User, "user", "u", "", i18n.T("flag_fw_user"))
 	cmd.PersistentFlags().StringVarP(&fwOptions.Password, "password", "w", "", i18n.T("flag_fw_password"))
 	cmd.PersistentFlags().IntVar(&fwOptions.TaskCount, "task", 1, i18n.T("flag_fw_task"))
@@ -164,6 +166,25 @@ func (o *FirewallOptions) runRemoteFirewalls(ctx context.Context, action func(fw
 			uniqueHosts[h] = true
 			finalHosts = append(finalHosts, h)
 		}
+	}
+
+	// 应用 --exclude 排除规则
+	if len(o.Exclude) > 0 {
+		excludes, err := cmdutils.ResolveExcludes(provider, cmdutils.ParseExcludeFlag(o.Exclude))
+		if err != nil {
+			return fmt.Errorf("%s: %w", i18n.T("fw_err_exclude"), err)
+		}
+		filtered := finalHosts[:0]
+		for _, h := range finalHosts {
+			_, _, _, nodeID := o.resolveNodeID(h, provider)
+			if nodeID != "" {
+				if _, excluded := excludes[nodeID]; excluded {
+					continue
+				}
+			}
+			filtered = append(filtered, h)
+		}
+		finalHosts = filtered
 	}
 
 	var stdoutMu sync.Mutex
