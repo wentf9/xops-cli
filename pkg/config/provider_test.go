@@ -246,3 +246,38 @@ func TestLocalNodeFiltering(t *testing.T) {
 		t.Error("GetNode('local-node') failed, should preserve point-to-point query")
 	}
 }
+
+func TestAddNode_ClearStaleIndex(t *testing.T) {
+	cfg := &Configuration{
+		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
+		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
+		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
+	}
+	cfg.Hosts.Set("h1", models.Host{Address: "1.2.3.4", Port: 22})
+	cfg.Identities.Set("i1", models.Identity{User: "root", AuthType: "password"})
+	p := NewProvider(cfg)
+
+	// 1. 首次添加，带有一个别名 old-alias
+	node := models.Node{
+		HostRef:     "h1",
+		IdentityRef: "i1",
+		Alias:       []string{"old-alias"},
+	}
+	p.AddNode("n1", node)
+
+	if got := p.Find("old-alias"); got != "n1" {
+		t.Fatalf("Find('old-alias') = %q, want 'n1'", got)
+	}
+
+	// 2. 更新节点，别名变更为 new-alias
+	node.Alias = []string{"new-alias"}
+	p.AddNode("n1", node)
+
+	// 3. 验证新别名生效，旧别名失效
+	if got := p.Find("new-alias"); got != "n1" {
+		t.Errorf("Find('new-alias') = %q, want 'n1'", got)
+	}
+	if got := p.Find("old-alias"); got != "" {
+		t.Errorf("Find('old-alias') = %q, want empty after updating node alias", got)
+	}
+}

@@ -129,6 +129,12 @@ func (cp Provider) GetIdentity(nodeID string) (models.Identity, bool) {
 }
 
 func (cp Provider) AddNode(nodeID string, node models.Node) {
+	// 先从索引中删除所有原来指向此 nodeID 的键，以防字段（如 Alias, Address 等）更新后旧映射残留
+	for _, key := range cp.lookupIndex.Keys() {
+		if val, ok := cp.lookupIndex.Get(key); ok && val == nodeID {
+			cp.lookupIndex.Remove(key)
+		}
+	}
 	cp.cfg.Nodes.Set(nodeID, node)
 	cp.add(nodeID)
 }
