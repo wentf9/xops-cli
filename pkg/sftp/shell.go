@@ -449,6 +449,14 @@ func (s *Shell) handlePut(ctx context.Context, args []string) {
 		return
 	}
 	local := s.resolveLocalPath(args[0])
+
+	// 检查本地文件/目录是否存在
+	if _, err := os.Stat(local); err != nil {
+		errMsg := i18n.Tf("sftp_shell_upload_failed", map[string]any{"Error": err})
+		_, _ = fmt.Fprintf(s.stderr, "%s\n", strings.TrimPrefix(errMsg, "\n"))
+		return
+	}
+
 	var remote string
 
 	if len(args) > 1 {
@@ -480,12 +488,19 @@ func (s *Shell) handlePut(ctx context.Context, args []string) {
 
 	// 计算本地文件大小以显示准确的进度条
 	var totalSize int64
-	_ = filepath.Walk(local, func(_ string, info os.FileInfo, _ error) error {
-		if !info.IsDir() {
+	walkErr := filepath.Walk(local, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info != nil && !info.IsDir() {
 			totalSize += info.Size()
 		}
 		return nil
 	})
+	if walkErr != nil {
+		_, _ = fmt.Fprintf(s.stderr, "%s\n", i18n.Tf("sftp_shell_upload_failed", map[string]any{"Error": walkErr}))
+		return
+	}
 
 	bar := progressbar.NewOptions64(
 		totalSize,

@@ -488,7 +488,6 @@ func (o *ScpOptions) runBatch(ctx context.Context, provider config.ConfigProvide
 					}
 				}
 			}
-			h := h // capture
 			wp.Execute(func() {
 				addr := PathInfo{Host: h.Host, User: h.User, Port: h.Port, IsRemote: true}
 				o.executeTransfer(ctx, h.Host, addr, h.Password, provider, connector, configStore, cfg)

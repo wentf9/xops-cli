@@ -82,3 +82,30 @@ func TestDispatchCommand(t *testing.T) {
 		})
 	}
 }
+
+func TestHandlePut_NonExistentFile(t *testing.T) {
+	i18n.Init("zh")
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	s := &Shell{
+		cwd:      "/test/remote/dir",
+		localCwd: t.TempDir(),
+		stdout:   &stdout,
+		stderr:   &stderr,
+	}
+
+	exit, err := s.dispatchCommand(context.Background(), "put", []string{"nonexistent_file_xyz_123"})
+	if exit {
+		t.Error("expected exit to be false")
+	}
+	if err != nil {
+		t.Errorf("expected no error returned, got %v", err)
+	}
+
+	errout := stderr.String()
+	if !strings.Contains(errout, "上传失败") {
+		t.Errorf("expected stderr to contain '上传失败', got %q", errout)
+	}
+}
