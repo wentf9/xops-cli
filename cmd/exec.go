@@ -35,6 +35,11 @@ type ExecOptions struct {
 	OutDir       string
 
 	stdinScript bool
+
+	tempNodesMu    sync.Mutex
+	tempNodes      map[string]bool
+	savedTempNodes int
+	nodeUpdated    bool
 }
 
 func NewExecOptions() *ExecOptions {
@@ -207,6 +212,9 @@ func (o *ExecOptions) Run() error {
 		return fmt.Errorf("%s: %w", i18n.T("config_load_error"), err)
 	}
 	provider := config.NewProvider(cfg)
+	defer func() {
+		o.cleanUnusedTempNodes(provider)
+	}()
 	connector := adapter.NewConnector(provider)
 	defer connector.CloseAll()
 
@@ -282,8 +290,10 @@ func (o *ExecOptions) Run() error {
 	}
 
 	wp.Wait()
-	if err := configStore.Save(cfg); err != nil {
-		logger.PrintError(i18n.Tf("save_config_failed", map[string]any{"Error": err}))
+	if o.hasChanges() {
+		if err := configStore.Save(cfg); err != nil {
+			logger.PrintError(i18n.Tf("save_config_failed", map[string]any{"Error": err}))
+		}
 	}
 	return nil
 }
@@ -297,6 +307,9 @@ func (o *ExecOptions) runInteractive(
 	cfg *config.Configuration,
 ) error {
 	client, err := connector.Connect(ctx, task.nodeID)
+	if err == nil {
+		o.verifyTempNode(task.nodeID)
+	}
 	if err != nil {
 		return fmt.Errorf("%s: %w", i18n.Tf("exec_connect_failed", map[string]any{"Host": task.host, "Error": err}), err)
 	}
@@ -309,8 +322,10 @@ func (o *ExecOptions) runInteractive(
 		execErr = client.RunInteractive(ctx, cmd)
 	}
 
-	if saveErr := configStore.Save(cfg); saveErr != nil {
-		logger.PrintError(i18n.Tf("save_config_failed", map[string]any{"Error": saveErr}))
+	if o.hasChanges() {
+		if saveErr := configStore.Save(cfg); saveErr != nil {
+			logger.PrintError(i18n.Tf("save_config_failed", map[string]any{"Error": saveErr}))
+		}
 	}
 	return execErr
 }
@@ -334,6 +349,9 @@ func (o *ExecOptions) getOrCreateNode(provider config.ConfigProvider, addr utils
 
 	if nodeID != "" {
 		updated := o.updateNodeFromHostInfo(nodeID, provider, addr)
+		if updated {
+			o.nodeUpdated = true
+		}
 		return nodeID, updated, nil
 	}
 
@@ -341,11 +359,17 @@ func (o *ExecOptions) getOrCreateNode(provider config.ConfigProvider, addr utils
 	addr.User = user
 	addr.Port = port
 	nodeID, err := o.execCreateNewNode(provider, addr)
+	if err == nil {
+		o.addTempNode(nodeID)
+	}
 	return nodeID, true, err
 }
 
 func (o *ExecOptions) executeTask(ctx context.Context, connector *ssh.Connector, t execHostTask, execCmd string, isScript bool, totalTasks int, stdoutMu *sync.Mutex) {
 	client, err := connector.Connect(ctx, t.nodeID)
+	if err == nil {
+		o.verifyTempNode(t.nodeID)
+	}
 	if err != nil {
 		if logger.ColorEnabled() {
 			hostPart := logger.Cyan(fmt.Sprintf("[%s] ", t.host))
@@ -724,4 +748,37 @@ func (o *ExecOptions) updateNodeSudo(node *models.Node) bool {
 	}
 
 	return updated
+}
+
+func (o *ExecOptions) addTempNode(nodeID string) {
+	o.tempNodesMu.Lock()
+	defer o.tempNodesMu.Unlock()
+	if o.tempNodes == nil {
+		o.tempNodes = make(map[string]bool)
+	}
+	o.tempNodes[nodeID] = true
+}
+
+func (o *ExecOptions) verifyTempNode(nodeID string) {
+	o.tempNodesMu.Lock()
+	defer o.tempNodesMu.Unlock()
+	if o.tempNodes != nil && o.tempNodes[nodeID] {
+		delete(o.tempNodes, nodeID)
+		o.savedTempNodes++
+	}
+}
+
+func (o *ExecOptions) cleanUnusedTempNodes(provider config.ConfigProvider) {
+	o.tempNodesMu.Lock()
+	defer o.tempNodesMu.Unlock()
+	for nodeID := range o.tempNodes {
+		provider.DeleteNode(nodeID)
+	}
+	o.tempNodes = nil
+}
+
+func (o *ExecOptions) hasChanges() bool {
+	o.tempNodesMu.Lock()
+	defer o.tempNodesMu.Unlock()
+	return o.nodeUpdated || o.savedTempNodes > 0
 }
