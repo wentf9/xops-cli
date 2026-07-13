@@ -65,3 +65,23 @@ func TestExecStdinIgnoredWhenCmdProvided(t *testing.T) {
 		t.Error("expected stdinScript to be false when command is provided in args")
 	}
 }
+
+func TestExecCommandWithFlagsNotParsedAsXopsFlags(t *testing.T) {
+	c := NewCmdExec()
+	args := []string{"host-01", "ss", "-tlpn"}
+	err := c.Flags().Parse(args)
+	if err != nil {
+		t.Fatalf("expected Parse to succeed with interspersed false, got error: %v", err)
+	}
+
+	parsedArgs := c.Flags().Args()
+	expected := []string{"host-01", "ss", "-tlpn"}
+	if len(parsedArgs) != len(expected) {
+		t.Fatalf("expected %d arguments, got %d (%v)", len(expected), len(parsedArgs), parsedArgs)
+	}
+	for i, v := range expected {
+		if parsedArgs[i] != v {
+			t.Errorf("at index %d: expected %q, got %q", i, v, parsedArgs[i])
+		}
+	}
+}

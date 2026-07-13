@@ -188,3 +188,70 @@ func TestPromptPressEnterIfTUI(t *testing.T) {
 		})
 	}
 }
+
+func TestSshArgsCommandParsing(t *testing.T) {
+	o := NewSshOptions()
+	o.args = []string{"test-host", "echo", "hello", "world"}
+
+	err := o.Validate()
+	if err != nil {
+		t.Fatalf("expected Validate to succeed, got error: %v", err)
+	}
+
+	if o.Host != "test-host" {
+		t.Errorf("expected Host to be 'test-host', got %q", o.Host)
+	}
+
+	expectedCmd := "echo hello world"
+	if o.Command != expectedCmd {
+		t.Errorf("expected Command to be %q, got %q", expectedCmd, o.Command)
+	}
+}
+
+func TestSshStdinScriptDetection(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("failed to create pipe: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+	defer func() { _ = r.Close() }()
+
+	oldStdin := os.Stdin
+	defer func() { os.Stdin = oldStdin }()
+	os.Stdin = r
+
+	// 1. 正常管道输入
+	o1 := NewSshOptions()
+	o1.Complete(nil, []string{"test-host"})
+	if !o1.stdinScript {
+		t.Error("expected stdinScript to be true when stdin is a pipe")
+	}
+
+	// 2. 带有 StdinRedirect (-n) 时，即使 stdin 是管道，也应当忽略它作为 script
+	o2 := NewSshOptions()
+	o2.StdinRedirect = true
+	o2.Complete(nil, []string{"test-host"})
+	if o2.stdinScript {
+		t.Error("expected stdinScript to be false when StdinRedirect (-n) is enabled")
+	}
+}
+
+func TestSshCommandWithFlagsNotParsedAsXopsFlags(t *testing.T) {
+	c := NewCmdSsh()
+	args := []string{"host-01", "ss", "-tlpn"}
+	err := c.Flags().Parse(args)
+	if err != nil {
+		t.Fatalf("expected Parse to succeed with interspersed false, got error: %v", err)
+	}
+
+	parsedArgs := c.Flags().Args()
+	expected := []string{"host-01", "ss", "-tlpn"}
+	if len(parsedArgs) != len(expected) {
+		t.Fatalf("expected %d arguments, got %d (%v)", len(expected), len(parsedArgs), parsedArgs)
+	}
+	for i, v := range expected {
+		if parsedArgs[i] != v {
+			t.Errorf("at index %d: expected %q, got %q", i, v, parsedArgs[i])
+		}
+	}
+}

@@ -17,6 +17,7 @@ import (
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
+	"github.com/wentf9/xops-cli/pkg/logger"
 	"github.com/wentf9/xops-cli/pkg/models"
 	"github.com/wentf9/xops-cli/pkg/ssh"
 )
@@ -39,6 +40,9 @@ type SshOptions struct {
 	BgRun          bool
 	StdinRedirect  bool
 	args           []string
+
+	Command     string
+	stdinScript bool
 }
 
 func NewSshOptions() *SshOptions {
@@ -61,6 +65,7 @@ func NewCmdSsh() *cobra.Command {
 			return o.Run()
 		},
 	}
+	cmd.Flags().SetInterspersed(false)
 	// OpenSSH-compatible flags
 	cmd.Flags().Uint16VarP(&o.Port, "port", "p", 0, i18n.T("flag_port"))
 	cmd.Flags().StringVarP(&o.User, "login", "l", "", i18n.T("flag_login"))
@@ -87,12 +92,18 @@ func NewCmdSsh() *cobra.Command {
 
 func (o *SshOptions) Complete(cmd *cobra.Command, args []string) {
 	o.args = args
+	if !o.StdinRedirect {
+		stat, err := os.Stdin.Stat()
+		if err == nil && (stat.Mode()&os.ModeCharDevice) == 0 {
+			o.stdinScript = true
+		}
+	}
 }
 
 func (o *SshOptions) parseArgs() error {
 	if len(o.args) == 0 && o.Host == "" {
 		return errors.New(i18n.T("ssh_err_no_host"))
-	} else if len(o.args) == 1 {
+	} else if len(o.args) >= 1 {
 		u, h, p := utils.ParseAddr(o.args[0])
 		if h == "" && o.Host == "" {
 			return errors.New(i18n.T("ssh_err_invalid_host"))
@@ -111,14 +122,14 @@ func (o *SshOptions) parseArgs() error {
 }
 
 func (o *SshOptions) Validate() error {
+	if err := o.parseArgs(); err != nil {
+		return err
+	}
 	if len(o.args) > 1 {
-		return errors.New(i18n.Tf("ssh_err_expected_one_arg", map[string]any{"Count": len(o.args)}))
+		o.Command = strings.Join(o.args[1:], " ")
 	}
 	if o.BgRun && !o.NoCmd {
 		return errors.New(i18n.T("ssh_err_background_requires_nocmd"))
-	}
-	if err := o.parseArgs(); err != nil {
-		return err
 	}
 	if o.User == "" {
 		o.User = utils.GetCurrentUser()
@@ -293,6 +304,10 @@ func (o *SshOptions) runConnection(isChild bool) error {
 		}
 		<-runCtx.Done()
 		return nil
+	}
+
+	if o.Command != "" || o.stdinScript {
+		return o.runCommand(runCtx, client, o.Command)
 	}
 
 	return o.runShell(runCtx, client)
@@ -541,5 +556,43 @@ func promptPressEnterIfTUI(stdin io.Reader, stdout io.Writer) {
 		_, _ = fmt.Fprintln(stdout, i18n.T("tui_press_enter"))
 		var b [1]byte
 		_, _ = stdin.Read(b[:])
+	}
+}
+
+func (o *SshOptions) runCommand(ctx context.Context, client *ssh.Client, command string) error {
+	session, err := client.SSHClient().NewSession()
+	if err != nil {
+		return fmt.Errorf("failed to create new session: %w", err)
+	}
+	defer func() {
+		if closeErr := session.Close(); closeErr != nil && !errors.Is(closeErr, io.EOF) {
+			logger.Debugf("failed to close ssh session: %v", closeErr)
+		}
+	}()
+
+	session.Stdin = os.Stdin
+	session.Stdout = os.Stdout
+	session.Stderr = os.Stderr
+
+	var execCmd string
+	if command != "" {
+		execCmd = fmt.Sprintf("bash -c '%s'", strings.ReplaceAll(command, "'", "'\\''"))
+	} else {
+		execCmd = "bash"
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- session.Run(execCmd)
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		if closeErr := session.Close(); closeErr != nil {
+			return fmt.Errorf("context done: %w; session close failed: %w", ctx.Err(), closeErr)
+		}
+		return ctx.Err()
 	}
 }
