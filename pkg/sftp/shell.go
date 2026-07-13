@@ -256,7 +256,22 @@ func (s *Shell) handleCd(args []string) {
 	if len(args) == 0 {
 		return
 	}
-	target := s.resolvePath(args[0])
+	var target string
+	if hasWildcard(args[0]) {
+		matches, err := s.expandRemote(args[0])
+		if err != nil {
+			_, _ = fmt.Fprintf(s.stderr, "cd: %v\n", err)
+			return
+		}
+		single, err := classifyGlobResult(args[0], matches, true)
+		if err != nil {
+			_, _ = fmt.Fprintf(s.stderr, "cd: %v\n", err)
+			return
+		}
+		target = single[0]
+	} else {
+		target = s.resolvePath(args[0])
+	}
 
 	// 检查目录是否存在
 	info, err := s.client.sftpClient.Stat(target)
@@ -275,7 +290,22 @@ func (s *Shell) handleLocalCd(args []string) {
 	if len(args) == 0 {
 		return
 	}
-	target := s.resolveLocalPath(args[0])
+	var target string
+	if hasWildcard(args[0]) {
+		matches, err := s.expandLocal(args[0])
+		if err != nil {
+			_, _ = fmt.Fprintf(s.stderr, "lcd: %v\n", err)
+			return
+		}
+		single, err := classifyGlobResult(args[0], matches, true)
+		if err != nil {
+			_, _ = fmt.Fprintf(s.stderr, "lcd: %v\n", err)
+			return
+		}
+		target = single[0]
+	} else {
+		target = s.resolveLocalPath(args[0])
+	}
 	if err := os.Chdir(target); err != nil {
 		_, _ = fmt.Fprintf(s.stderr, "lcd: %v\n", err)
 		return
@@ -285,15 +315,46 @@ func (s *Shell) handleLocalCd(args []string) {
 }
 
 func (s *Shell) handleLs(args []string, long bool) {
+	if len(args) > 0 && hasWildcard(args[0]) {
+		matches, err := s.expandRemote(args[0])
+		if err != nil {
+			_, _ = fmt.Fprintf(s.stderr, "ls: %v\n", err)
+			return
+		}
+		multi := len(matches) > 1
+		for _, m := range matches {
+			if multi {
+				_, _ = fmt.Fprintf(s.stdout, "\n%s:\n", m)
+			}
+			s.listRemoteOne(m, long)
+		}
+		return
+	}
 	path := s.cwd
 	if len(args) > 0 {
 		path = s.resolvePath(args[0])
 	}
+	s.listRemoteOne(path, long)
+}
 
-	files, err := s.client.sftpClient.ReadDir(path)
+// listRemoteOne 列出单个远程路径的内容
+// path 为文件时直接显示该文件信息，为目录时列出其内容（与 bash ls 行为一致）
+func (s *Shell) listRemoteOne(path string, long bool) {
+	info, err := s.client.sftpClient.Stat(path)
 	if err != nil {
 		_, _ = fmt.Fprintf(s.stderr, "ls: %v\n", err)
 		return
+	}
+	var files []os.FileInfo
+	if info.IsDir() {
+		files, err = s.client.sftpClient.ReadDir(path)
+		if err != nil {
+			_, _ = fmt.Fprintf(s.stderr, "ls: %v\n", err)
+			return
+		}
+	} else {
+		// path 是文件，直接显示该文件自身
+		files = []os.FileInfo{info}
 	}
 
 	if long {
@@ -324,39 +385,74 @@ func (s *Shell) handleLs(args []string, long bool) {
 }
 
 func (s *Shell) handleLocalLs(args []string, long bool) {
+	if len(args) > 0 && hasWildcard(args[0]) {
+		matches, err := s.expandLocal(args[0])
+		if err != nil {
+			_, _ = fmt.Fprintf(s.stderr, "lls: %v\n", err)
+			return
+		}
+		multi := len(matches) > 1
+		for _, m := range matches {
+			if multi {
+				_, _ = fmt.Fprintf(s.stdout, "\n%s:\n", m)
+			}
+			s.listLocalOne(m, long)
+		}
+		return
+	}
 	path := s.localCwd
 	if len(args) > 0 {
 		path = s.resolveLocalPath(args[0])
 	}
-	entries, err := os.ReadDir(path)
+	s.listLocalOne(path, long)
+}
+
+// listLocalOne 列出单个本地路径的内容
+// path 为文件时直接显示该文件信息，为目录时列出其内容（与 bash ls 行为一致）
+func (s *Shell) listLocalOne(path string, long bool) {
+	info, err := os.Stat(path)
 	if err != nil {
 		_, _ = fmt.Fprintf(s.stderr, "lls: %v\n", err)
 		return
+	}
+	var infos []os.FileInfo
+	if info.IsDir() {
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			_, _ = fmt.Fprintf(s.stderr, "lls: %v\n", err)
+			return
+		}
+		for _, e := range entries {
+			ei, err := e.Info()
+			if err != nil {
+				continue
+			}
+			infos = append(infos, ei)
+		}
+	} else {
+		// path 是文件，直接显示该文件自身
+		infos = []os.FileInfo{info}
 	}
 
 	if long {
 		// 详细列表模式
 		w := tabwriter.NewWriter(s.stdout, 0, 0, 1, ' ', 0)
-		for _, e := range entries {
-			info, err := e.Info()
-			if err != nil {
-				continue
-			}
-			modTime := info.ModTime().Format("Jan 02 15:04")
-			size := formatBytes(info.Size())
-			name := e.Name()
-			if e.IsDir() {
+		for _, fi := range infos {
+			modTime := fi.ModTime().Format("Jan 02 15:04")
+			size := formatBytes(fi.Size())
+			name := fi.Name()
+			if fi.IsDir() {
 				name += string(filepath.Separator)
 			}
-			_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", info.Mode(), size, modTime, name)
+			_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", fi.Mode(), size, modTime, name)
 		}
 		_ = w.Flush()
 	} else {
 		// 简单列表模式 (多列输出)
-		names := make([]string, 0, len(entries))
-		for _, e := range entries {
-			name := e.Name()
-			if e.IsDir() {
+		names := make([]string, 0, len(infos))
+		for _, fi := range infos {
+			name := fi.Name()
+			if fi.IsDir() {
 				name += string(filepath.Separator)
 			}
 			names = append(names, name)
@@ -370,12 +466,43 @@ func (s *Shell) handleGet(ctx context.Context, args []string) {
 		_, _ = fmt.Fprintln(s.stderr, i18n.T("sftp_shell_get_usage"))
 		return
 	}
-	remote := s.resolvePath(args[0])
+	remotes, err := s.expandRemote(args[0])
+	if err != nil {
+		_, _ = fmt.Fprintf(s.stderr, "get: %v\n", err)
+		return
+	}
+
+	// 多源时：本地 dst 必须是已存在的目录或省略
+	if len(remotes) > 1 {
+		var localDir string
+		if len(args) > 1 {
+			localDir = s.resolveLocalPath(args[1])
+			info, statErr := os.Stat(localDir)
+			if statErr != nil || !info.IsDir() {
+				_, _ = fmt.Fprintln(s.stderr, i18n.T("sftp_shell_dest_must_be_dir"))
+				return
+			}
+		} else {
+			localDir = s.localCwd
+		}
+		for _, remote := range remotes {
+			localTarget := filepath.Join(localDir, filepath.Base(remote))
+			s.getSingle(ctx, remote, localTarget)
+		}
+		return
+	}
+
+	// 单源：保持原行为
+	remote := remotes[0]
 	local := filepath.Base(remote)
 	if len(args) > 1 {
 		local = s.resolveLocalPath(args[1])
 	}
+	s.getSingle(ctx, remote, local)
+}
 
+// getSingle 下载单个远程文件/目录到本地，含覆盖确认与进度条
+func (s *Shell) getSingle(ctx context.Context, remote, local string) {
 	// 检查目标文件是否已存在
 	if lStat, err := os.Stat(local); err == nil {
 		localDest := local
@@ -448,23 +575,53 @@ func (s *Shell) handlePut(ctx context.Context, args []string) {
 		_, _ = fmt.Fprintln(s.stderr, i18n.T("sftp_shell_put_usage"))
 		return
 	}
-	local := s.resolveLocalPath(args[0])
+	locals, err := s.expandLocal(args[0])
+	if err != nil {
+		_, _ = fmt.Fprintf(s.stderr, "put: %v\n", err)
+		return
+	}
 
-	// 检查本地文件/目录是否存在
-	if _, err := os.Stat(local); err != nil {
+	// 检查本地文件/目录是否存在（expandLocal 已展开，但单源无通配符时短路返回原路径，
+	// 此处保留 os.Stat 检查以维持原错误信息）
+	if _, err := os.Stat(locals[0]); err != nil {
 		errMsg := i18n.Tf("sftp_shell_upload_failed", map[string]any{"Error": err})
 		_, _ = fmt.Fprintf(s.stderr, "%s\n", strings.TrimPrefix(errMsg, "\n"))
 		return
 	}
 
-	var remote string
+	// 多源时：远程 dst 必须是已存在的目录或省略
+	if len(locals) > 1 {
+		var remoteDir string
+		if len(args) > 1 {
+			remoteDir = s.resolvePath(args[1])
+			info, statErr := s.client.sftpClient.Stat(remoteDir)
+			if statErr != nil || !info.IsDir() {
+				_, _ = fmt.Fprintln(s.stderr, i18n.T("sftp_shell_dest_must_be_dir"))
+				return
+			}
+		} else {
+			remoteDir = s.cwd
+		}
+		for _, local := range locals {
+			remoteTarget := s.client.JoinPath(remoteDir, filepath.Base(local))
+			s.putSingle(ctx, local, remoteTarget)
+		}
+		return
+	}
 
+	// 单源：保持原行为
+	local := locals[0]
+	var remote string
 	if len(args) > 1 {
 		remote = s.resolvePath(args[1])
 	} else {
 		remote = s.client.JoinPath(s.cwd, filepath.Base(local))
 	}
+	s.putSingle(ctx, local, remote)
+}
 
+// putSingle 上传单个本地文件/目录到远程，含覆盖确认与进度条
+func (s *Shell) putSingle(ctx context.Context, local, remote string) {
 	// 检查目标文件是否已存在
 	remoteStat, err := s.client.sftpClient.Stat(remote)
 	if err == nil && remoteStat.IsDir() {
@@ -552,19 +709,34 @@ func (s *Shell) handleRm(args []string) {
 		_, _ = fmt.Fprintln(s.stderr, i18n.T("sftp_shell_rm_usage"))
 		return
 	}
-	path := s.resolvePath(args[0])
-
-	// 优先尝试使用远程命令以提高性能和递归支持
-	cmd := fmt.Sprintf("rm -rf '%s'", strings.ReplaceAll(path, "'", "'\\''"))
-	_, err := s.client.sshClient.Run(context.Background(), cmd)
-	if err == nil {
+	paths, err := s.expandRemote(args[0])
+	if err != nil {
+		_, _ = fmt.Fprintf(s.stderr, "rm: %v\n", err)
 		return
 	}
+	// 含通配符时跳过 sshClient.Run 快捷路径，避免远程 shell 二次展开导致误删
+	useShellShortcut := !hasWildcard(args[0])
+	for _, p := range paths {
+		s.removeOne(p, useShellShortcut)
+	}
+}
 
-	// 如果远程命令失败（可能因为无 shell 权限或非 Unix 环境），回退到 SFTP 协议操作
-	if err := s.client.sftpClient.Remove(path); err != nil {
+// removeOne 删除单个远程路径
+// useShellShortcut 为 true 时优先尝试远程 shell 命令 (rm -rf)，
+// 失败回退到 SFTP 协议操作；为 false 时直接走 SFTP 协议
+func (s *Shell) removeOne(p string, useShellShortcut bool) {
+	if useShellShortcut {
+		cmd := fmt.Sprintf("rm -rf '%s'", strings.ReplaceAll(p, "'", "'\\''"))
+		_, err := s.client.sshClient.Run(context.Background(), cmd)
+		if err == nil {
+			return
+		}
+	}
+
+	// 回退到 SFTP 协议操作
+	if err := s.client.sftpClient.Remove(p); err != nil {
 		// 尝试作为目录删除
-		if err2 := s.client.sftpClient.RemoveDirectory(path); err2 != nil {
+		if err2 := s.client.sftpClient.RemoveDirectory(p); err2 != nil {
 			_, _ = fmt.Fprintf(s.stderr, "rm: %v\n", err)
 		}
 	}
@@ -575,10 +747,16 @@ func (s *Shell) handleLocalRm(args []string) {
 		_, _ = fmt.Fprintln(s.stderr, i18n.T("sftp_shell_lrm_usage"))
 		return
 	}
-	path := s.resolveLocalPath(args[0])
-	// 为了方便，lrm 直接支持递归删除
-	if err := os.RemoveAll(path); err != nil {
+	paths, err := s.expandLocal(args[0])
+	if err != nil {
 		_, _ = fmt.Fprintf(s.stderr, "lrm: %v\n", err)
+		return
+	}
+	for _, p := range paths {
+		// 为了方便，lrm 直接支持递归删除
+		if err := os.RemoveAll(p); err != nil {
+			_, _ = fmt.Fprintf(s.stderr, "lrm: %v\n", err)
+		}
 	}
 }
 
@@ -587,26 +765,35 @@ func (s *Shell) handleCp(args []string) {
 		_, _ = fmt.Fprintln(s.stderr, i18n.T("sftp_shell_cp_usage"))
 		return
 	}
-	src := s.resolvePath(args[0])
-	dst := s.resolvePath(args[1])
-
-	// 优先尝试使用远程命令以实现高性能服务器端复制
-	cmd := fmt.Sprintf("cp -r '%s' '%s'", strings.ReplaceAll(src, "'", "'\\''"), strings.ReplaceAll(dst, "'", "'\\''"))
-	_, err := s.client.sshClient.Run(context.Background(), cmd)
-	if err == nil {
+	srcs, err := s.expandRemote(args[0])
+	if err != nil {
+		_, _ = fmt.Fprintf(s.stderr, "cp: %v\n", err)
 		return
 	}
+	dst := s.resolvePath(args[1])
 
-	// 如果远程命令失败，回退到 SFTP 协议流式复制
-	// 虽然速度慢，但能保证在任何标准 SFTP 服务端工作
-	dstInfo, errStat := s.client.sftpClient.Stat(dst)
-	finalDst := dst
-	if errStat == nil && dstInfo.IsDir() {
-		finalDst = s.client.JoinPath(dst, filepath.Base(src))
+	// 含通配符时跳过 sshClient.Run 快捷路径，避免远程 shell 二次展开
+	if !hasWildcard(args[0]) && len(srcs) == 1 {
+		// 优先尝试使用远程命令以实现高性能服务器端复制
+		cmd := fmt.Sprintf("cp -r '%s' '%s'", strings.ReplaceAll(srcs[0], "'", "'\\''"), strings.ReplaceAll(dst, "'", "'\\''"))
+		if _, err := s.client.sshClient.Run(context.Background(), cmd); err == nil {
+			return
+		}
+		// 失败回退到 SFTP 协议流式复制
 	}
 
-	if err := s.remoteCopySFTP(src, finalDst); err != nil {
+	// 多源或快捷路径失败时走 SFTP 协议
+	dstInfo, errStat := s.client.sftpClient.Stat(dst)
+	dstIsDir := errStat == nil && dstInfo.IsDir()
+	finalDsts, err := resolveMultiSrc(srcs, dst, dstIsDir)
+	if err != nil {
 		_, _ = fmt.Fprintf(s.stderr, "cp: %v\n", err)
+		return
+	}
+	for i, src := range srcs {
+		if err := s.remoteCopySFTP(src, finalDsts[i]); err != nil {
+			_, _ = fmt.Fprintf(s.stderr, "cp: %v\n", err)
+		}
 	}
 }
 
@@ -655,25 +842,34 @@ func (s *Shell) handleMv(args []string) {
 		_, _ = fmt.Fprintln(s.stderr, i18n.T("sftp_shell_mv_usage"))
 		return
 	}
-	src := s.resolvePath(args[0])
-	dst := s.resolvePath(args[1])
-
-	// 优先尝试使用远程命令
-	cmd := fmt.Sprintf("mv '%s' '%s'", strings.ReplaceAll(src, "'", "'\\''"), strings.ReplaceAll(dst, "'", "'\\''"))
-	_, err := s.client.sshClient.Run(context.Background(), cmd)
-	if err == nil {
+	srcs, err := s.expandRemote(args[0])
+	if err != nil {
+		_, _ = fmt.Fprintf(s.stderr, "mv: %v\n", err)
 		return
 	}
+	dst := s.resolvePath(args[1])
 
-	// 如果远程命令失败，回退到 SFTP Rename (注意：SFTP Rename 通常不支持跨文件系统)
-	dstInfo, errStat := s.client.sftpClient.Stat(dst)
-	finalDst := dst
-	if errStat == nil && dstInfo.IsDir() {
-		finalDst = s.client.JoinPath(dst, filepath.Base(src))
+	// 含通配符时跳过 sshClient.Run 快捷路径，避免远程 shell 二次展开
+	if !hasWildcard(args[0]) && len(srcs) == 1 {
+		// 优先尝试使用远程命令
+		cmd := fmt.Sprintf("mv '%s' '%s'", strings.ReplaceAll(srcs[0], "'", "'\\''"), strings.ReplaceAll(dst, "'", "'\\''"))
+		if _, err := s.client.sshClient.Run(context.Background(), cmd); err == nil {
+			return
+		}
 	}
 
-	if err := s.client.sftpClient.Rename(src, finalDst); err != nil {
+	// 回退到 SFTP Rename (注意：SFTP Rename 通常不支持跨文件系统)
+	dstInfo, errStat := s.client.sftpClient.Stat(dst)
+	dstIsDir := errStat == nil && dstInfo.IsDir()
+	finalDsts, err := resolveMultiSrc(srcs, dst, dstIsDir)
+	if err != nil {
 		_, _ = fmt.Fprintf(s.stderr, "mv: %v\n", err)
+		return
+	}
+	for i, src := range srcs {
+		if err := s.client.sftpClient.Rename(src, finalDsts[i]); err != nil {
+			_, _ = fmt.Fprintf(s.stderr, "mv: %v\n", err)
+		}
 	}
 }
 
@@ -682,17 +878,25 @@ func (s *Shell) handleLocalCp(args []string) {
 		_, _ = fmt.Fprintln(s.stderr, i18n.T("sftp_shell_lcp_usage"))
 		return
 	}
-	src := s.resolveLocalPath(args[0])
+	srcs, err := s.expandLocal(args[0])
+	if err != nil {
+		_, _ = fmt.Fprintf(s.stderr, "lcp: %v\n", err)
+		return
+	}
 	dst := s.resolveLocalPath(args[1])
 
 	// 检查目标是否是目录
-	dstInfo, err := os.Stat(dst)
-	if err == nil && dstInfo.IsDir() {
-		dst = filepath.Join(dst, filepath.Base(src))
-	}
-
-	if err := s.localCopy(src, dst); err != nil {
+	dstInfo, errStat := os.Stat(dst)
+	dstIsDir := errStat == nil && dstInfo.IsDir()
+	finalDsts, err := resolveMultiSrcLocal(srcs, dst, dstIsDir)
+	if err != nil {
 		_, _ = fmt.Fprintf(s.stderr, "lcp: %v\n", err)
+		return
+	}
+	for i, src := range srcs {
+		if err := s.localCopy(src, finalDsts[i]); err != nil {
+			_, _ = fmt.Fprintf(s.stderr, "lcp: %v\n", err)
+		}
 	}
 }
 
@@ -744,17 +948,25 @@ func (s *Shell) handleLocalMv(args []string) {
 		_, _ = fmt.Fprintln(s.stderr, i18n.T("sftp_shell_lmv_usage"))
 		return
 	}
-	src := s.resolveLocalPath(args[0])
+	srcs, err := s.expandLocal(args[0])
+	if err != nil {
+		_, _ = fmt.Fprintf(s.stderr, "lmv: %v\n", err)
+		return
+	}
 	dst := s.resolveLocalPath(args[1])
 
 	// 检查目标是否是目录
-	dstInfo, err := os.Stat(dst)
-	if err == nil && dstInfo.IsDir() {
-		dst = filepath.Join(dst, filepath.Base(src))
-	}
-
-	if err := os.Rename(src, dst); err != nil {
+	dstInfo, errStat := os.Stat(dst)
+	dstIsDir := errStat == nil && dstInfo.IsDir()
+	finalDsts, err := resolveMultiSrcLocal(srcs, dst, dstIsDir)
+	if err != nil {
 		_, _ = fmt.Fprintf(s.stderr, "lmv: %v\n", err)
+		return
+	}
+	for i, src := range srcs {
+		if err := os.Rename(src, finalDsts[i]); err != nil {
+			_, _ = fmt.Fprintf(s.stderr, "lmv: %v\n", err)
+		}
 	}
 }
 
