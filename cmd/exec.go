@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,6 +33,8 @@ type ExecOptions struct {
 	NoLoginShell bool
 	Stream       bool
 	OutDir       string
+
+	stdinScript bool
 }
 
 func NewExecOptions() *ExecOptions {
@@ -145,12 +148,27 @@ func (o *ExecOptions) extractHostFromArgs(args []string) {
 func (o *ExecOptions) Complete(cmd *cobra.Command, args []string) {
 	o.args = args
 	if len(args) == 0 {
+		o.readStdinIfRequired()
 		return
 	}
 	if o.Command == "" && o.ShellFile == "" {
 		o.extractCommandFromArgs(args)
 	} else {
 		o.extractHostFromArgs(args)
+	}
+	o.readStdinIfRequired()
+}
+
+func (o *ExecOptions) readStdinIfRequired() {
+	if o.Command == "" && o.ShellFile == "" {
+		stat, err := os.Stdin.Stat()
+		if err == nil && (stat.Mode()&os.ModeCharDevice) == 0 {
+			content, err := io.ReadAll(os.Stdin)
+			if err == nil && len(content) > 0 {
+				o.Command = string(content)
+				o.stdinScript = true
+			}
+		}
 	}
 }
 
@@ -203,6 +221,9 @@ func (o *ExecOptions) Run() error {
 		isScript = true
 	} else {
 		execCmd = o.Command
+		if o.stdinScript {
+			isScript = true
+		}
 	}
 
 	ctx := context.Background()
