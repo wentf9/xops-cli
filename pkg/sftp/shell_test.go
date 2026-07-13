@@ -377,3 +377,205 @@ func TestLocalCdWildcardMultiple(t *testing.T) {
 		t.Errorf("expected stderr to contain multiple match error, got %q", errout)
 	}
 }
+
+func TestParseForceFlag(t *testing.T) {
+	tests := []struct {
+		args      []string
+		wantArgs  []string
+		wantForce bool
+	}{
+		{[]string{"file1"}, []string{"file1"}, false},
+		{[]string{"-f", "file1"}, []string{"file1"}, true},
+		{[]string{"file1", "-f"}, []string{"file1"}, true},
+		{[]string{"file1", "file2", "-f"}, []string{"file1", "file2"}, true},
+	}
+	for _, tt := range tests {
+		gotArgs, gotForce := parseForceFlag(tt.args)
+		if len(gotArgs) != len(tt.wantArgs) {
+			t.Errorf("parseForceFlag(%v) gotArgs = %v, want %v", tt.args, gotArgs, tt.wantArgs)
+		} else {
+			for i, v := range gotArgs {
+				if v != tt.wantArgs[i] {
+					t.Errorf("parseForceFlag(%v) gotArgs[%d] = %q, want %q", tt.args, i, v, tt.wantArgs[i])
+				}
+			}
+		}
+		if gotForce != tt.wantForce {
+			t.Errorf("parseForceFlag(%v) gotForce = %v, want %v", tt.args, gotForce, tt.wantForce)
+		}
+	}
+}
+
+func TestLocalRmWithConfirmation(t *testing.T) {
+	i18n.Init("zh")
+	dir := t.TempDir()
+
+	// 1. 测试没有 -f 且拒绝删除
+	file1 := filepath.Join(dir, "file1")
+	_ = os.WriteFile(file1, []byte("test1"), 0644)
+
+	s := &Shell{
+		localCwd: dir,
+		stdout:   &bytes.Buffer{},
+		stderr:   &bytes.Buffer{},
+		askConfirmHook: func(prompt string) bool {
+			return false // 拒绝确认
+		},
+	}
+	s.handleLocalRm([]string{"file1"})
+	if _, err := os.Stat(file1); os.IsNotExist(err) {
+		t.Error("expected file1 to still exist when confirmation is denied")
+	}
+
+	// 2. 测试没有 -f 且允许删除
+	s.askConfirmHook = func(prompt string) bool {
+		return true // 同意确认
+	}
+	s.handleLocalRm([]string{"file1"})
+	if _, err := os.Stat(file1); !os.IsNotExist(err) {
+		t.Error("expected file1 to be deleted when confirmation is granted")
+	}
+
+	// 3. 测试使用 -f 选项强制执行（无需确认，直接删除）
+	file2 := filepath.Join(dir, "file2")
+	_ = os.WriteFile(file2, []byte("test2"), 0644)
+	s.askConfirmHook = func(prompt string) bool {
+		t.Error("askConfirmHook should not be called when -f is provided")
+		return false
+	}
+	s.handleLocalRm([]string{"-f", "file2"})
+	if _, err := os.Stat(file2); !os.IsNotExist(err) {
+		t.Error("expected file2 to be deleted automatically with -f flag")
+	}
+}
+
+func TestLocalCpWithConfirmation(t *testing.T) {
+	i18n.Init("zh")
+	dir := t.TempDir()
+
+	srcFile := filepath.Join(dir, "src")
+	_ = os.WriteFile(srcFile, []byte("source_content"), 0644)
+
+	// 1. 目标不存在，不需要询问，直接复制
+	dstFile1 := filepath.Join(dir, "dst1")
+	s := &Shell{
+		localCwd: dir,
+		stdout:   &bytes.Buffer{},
+		stderr:   &bytes.Buffer{},
+		askConfirmHook: func(prompt string) bool {
+			t.Error("askConfirmHook should not be called when target does not exist")
+			return false
+		},
+	}
+	s.handleLocalCp([]string{"src", "dst1"})
+	data, err := os.ReadFile(dstFile1)
+	if err != nil || string(data) != "source_content" {
+		t.Errorf("failed to copy to non-existent dst1: %v", err)
+	}
+
+	// 2. 目标已存在，拒绝确认，不覆盖
+	_ = os.WriteFile(dstFile1, []byte("original_dst1"), 0644)
+	s.askConfirmHook = func(prompt string) bool {
+		return false // 拒绝确认
+	}
+	s.handleLocalCp([]string{"src", "dst1"})
+	data, _ = os.ReadFile(dstFile1)
+	if string(data) != "original_dst1" {
+		t.Error("expected dst1 content to not be overwritten when confirmation is denied")
+	}
+
+	// 3. 目标已存在，同意确认，覆盖
+	s.askConfirmHook = func(prompt string) bool {
+		return true // 同意确认
+	}
+	s.handleLocalCp([]string{"src", "dst1"})
+	data, _ = os.ReadFile(dstFile1)
+	if string(data) != "source_content" {
+		t.Error("expected dst1 content to be overwritten when confirmation is granted")
+	}
+
+	// 4. 目标已存在，有 -f 选项，直接覆盖且不进行询问
+	_ = os.WriteFile(dstFile1, []byte("original_dst1"), 0644)
+	s.askConfirmHook = func(prompt string) bool {
+		t.Error("askConfirmHook should not be called when -f is provided")
+		return false
+	}
+	s.handleLocalCp([]string{"-f", "src", "dst1"})
+	data, _ = os.ReadFile(dstFile1)
+	if string(data) != "source_content" {
+		t.Error("expected dst1 content to be overwritten with -f flag")
+	}
+}
+
+func TestLocalMvWithConfirmation(t *testing.T) {
+	i18n.Init("zh")
+	dir := t.TempDir()
+
+	// 1. 目标不存在，不需要询问，直接移动
+	srcFile1 := filepath.Join(dir, "src1")
+	_ = os.WriteFile(srcFile1, []byte("content1"), 0644)
+	dstFile1 := filepath.Join(dir, "dst1")
+
+	s := &Shell{
+		localCwd: dir,
+		stdout:   &bytes.Buffer{},
+		stderr:   &bytes.Buffer{},
+		askConfirmHook: func(prompt string) bool {
+			t.Error("askConfirmHook should not be called when target does not exist")
+			return false
+		},
+	}
+	s.handleLocalMv([]string{"src1", "dst1"})
+	if _, err := os.Stat(srcFile1); !os.IsNotExist(err) {
+		t.Error("src1 should be moved")
+	}
+	data, _ := os.ReadFile(dstFile1)
+	if string(data) != "content1" {
+		t.Errorf("dst1 has wrong content: %s", string(data))
+	}
+
+	// 2. 目标已存在，拒绝确认，不覆盖
+	srcFile2 := filepath.Join(dir, "src2")
+	_ = os.WriteFile(srcFile2, []byte("content2"), 0644)
+	_ = os.WriteFile(dstFile1, []byte("original_dst1"), 0644)
+	s.askConfirmHook = func(prompt string) bool {
+		return false // 拒绝确认
+	}
+	s.handleLocalMv([]string{"src2", "dst1"})
+	if _, err := os.Stat(srcFile2); err != nil {
+		t.Error("src2 should not be moved when confirmation is denied")
+	}
+	data, _ = os.ReadFile(dstFile1)
+	if string(data) != "original_dst1" {
+		t.Error("dst1 should not be overwritten when confirmation is denied")
+	}
+
+	// 3. 目标已存在，同意确认，覆盖
+	s.askConfirmHook = func(prompt string) bool {
+		return true // 同意确认
+	}
+	s.handleLocalMv([]string{"src2", "dst1"})
+	if _, err := os.Stat(srcFile2); !os.IsNotExist(err) {
+		t.Error("src2 should be moved when confirmation is granted")
+	}
+	data, _ = os.ReadFile(dstFile1)
+	if string(data) != "content2" {
+		t.Errorf("dst1 should be overwritten with content2, got: %s", string(data))
+	}
+
+	// 4. 目标已存在，有 -f 选项，直接覆盖
+	srcFile3 := filepath.Join(dir, "src3")
+	_ = os.WriteFile(srcFile3, []byte("content3"), 0644)
+	s.askConfirmHook = func(prompt string) bool {
+		t.Error("askConfirmHook should not be called when -f is provided")
+		return false
+	}
+	s.handleLocalMv([]string{"-f", "src3", "dst1"})
+	if _, err := os.Stat(srcFile3); !os.IsNotExist(err) {
+		t.Error("src3 should be moved automatically with -f flag")
+	}
+	data, _ = os.ReadFile(dstFile1)
+	if string(data) != "content3" {
+		t.Errorf("dst1 should be overwritten with content3, got: %s", string(data))
+	}
+}

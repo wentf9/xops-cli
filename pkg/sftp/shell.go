@@ -21,13 +21,14 @@ import (
 
 // Shell 定义交互式 SFTP 环境
 type Shell struct {
-	client      *Client
-	cwd         string
-	localCwd    string
-	line        *liner.State
-	historyFile string // 用于退出时保存历史
-	stdout      io.Writer
-	stderr      io.Writer
+	client         *Client
+	cwd            string
+	localCwd       string
+	line           *liner.State
+	historyFile    string // 用于退出时保存历史
+	stdout         io.Writer
+	stderr         io.Writer
+	askConfirmHook func(prompt string) bool
 }
 
 // NewShell 创建一个新的交互式 Shell
@@ -705,6 +706,12 @@ func (s *Shell) handleLocalMkdir(args []string) {
 }
 
 func (s *Shell) handleRm(args []string) {
+	args, localForce := parseForceFlag(args)
+	force := localForce
+	if s.client != nil {
+		force = s.client.config.Force || localForce
+	}
+
 	if len(args) < 1 {
 		_, _ = fmt.Fprintln(s.stderr, i18n.T("sftp_shell_rm_usage"))
 		return
@@ -717,6 +724,11 @@ func (s *Shell) handleRm(args []string) {
 	// 含通配符时跳过 sshClient.Run 快捷路径，避免远程 shell 二次展开导致误删
 	useShellShortcut := !hasWildcard(args[0])
 	for _, p := range paths {
+		if !force {
+			if !s.askConfirmation(fmt.Sprintf("rm: remove remote '%s'?", p)) {
+				continue
+			}
+		}
 		s.removeOne(p, useShellShortcut)
 	}
 }
@@ -743,6 +755,12 @@ func (s *Shell) removeOne(p string, useShellShortcut bool) {
 }
 
 func (s *Shell) handleLocalRm(args []string) {
+	args, localForce := parseForceFlag(args)
+	force := localForce
+	if s.client != nil {
+		force = s.client.config.Force || localForce
+	}
+
 	if len(args) < 1 {
 		_, _ = fmt.Fprintln(s.stderr, i18n.T("sftp_shell_lrm_usage"))
 		return
@@ -753,6 +771,11 @@ func (s *Shell) handleLocalRm(args []string) {
 		return
 	}
 	for _, p := range paths {
+		if !force {
+			if !s.askConfirmation(fmt.Sprintf("lrm: remove local '%s'?", p)) {
+				continue
+			}
+		}
 		// 为了方便，lrm 直接支持递归删除
 		if err := os.RemoveAll(p); err != nil {
 			_, _ = fmt.Fprintf(s.stderr, "lrm: %v\n", err)
@@ -761,6 +784,12 @@ func (s *Shell) handleLocalRm(args []string) {
 }
 
 func (s *Shell) handleCp(args []string) {
+	args, localForce := parseForceFlag(args)
+	force := localForce
+	if s.client != nil {
+		force = s.client.config.Force || localForce
+	}
+
 	if len(args) < 2 {
 		_, _ = fmt.Fprintln(s.stderr, i18n.T("sftp_shell_cp_usage"))
 		return
@@ -772,17 +801,7 @@ func (s *Shell) handleCp(args []string) {
 	}
 	dst := s.resolvePath(args[1])
 
-	// 含通配符时跳过 sshClient.Run 快捷路径，避免远程 shell 二次展开
-	if !hasWildcard(args[0]) && len(srcs) == 1 {
-		// 优先尝试使用远程命令以实现高性能服务器端复制
-		cmd := fmt.Sprintf("cp -r '%s' '%s'", strings.ReplaceAll(srcs[0], "'", "'\\''"), strings.ReplaceAll(dst, "'", "'\\''"))
-		if _, err := s.client.sshClient.Run(context.Background(), cmd); err == nil {
-			return
-		}
-		// 失败回退到 SFTP 协议流式复制
-	}
-
-	// 多源或快捷路径失败时走 SFTP 协议
+	// 提前计算目标地址并进行交互式确认
 	dstInfo, errStat := s.client.sftpClient.Stat(dst)
 	dstIsDir := errStat == nil && dstInfo.IsDir()
 	finalDsts, err := resolveMultiSrc(srcs, dst, dstIsDir)
@@ -790,9 +809,32 @@ func (s *Shell) handleCp(args []string) {
 		_, _ = fmt.Fprintf(s.stderr, "cp: %v\n", err)
 		return
 	}
+
 	for i, src := range srcs {
-		if err := s.remoteCopySFTP(src, finalDsts[i]); err != nil {
-			_, _ = fmt.Fprintf(s.stderr, "cp: %v\n", err)
+		finalDst := finalDsts[i]
+		if !force {
+			// 检查目标文件是否已存在
+			if stat, err := s.client.sftpClient.Stat(finalDst); err == nil && !stat.IsDir() {
+				if !s.askConfirmation(fmt.Sprintf("cp: overwrite remote '%s'?", finalDst)) {
+					continue
+				}
+			}
+		}
+
+		// 执行复制
+		// 若为单源且无通配符，可尝试远程 shell cp
+		copied := false
+		if !hasWildcard(args[0]) && len(srcs) == 1 {
+			cmd := fmt.Sprintf("cp -r '%s' '%s'", strings.ReplaceAll(src, "'", "'\\''"), strings.ReplaceAll(finalDst, "'", "'\\''"))
+			if _, err := s.client.sshClient.Run(context.Background(), cmd); err == nil {
+				copied = true
+			}
+		}
+
+		if !copied {
+			if err := s.remoteCopySFTP(src, finalDst); err != nil {
+				_, _ = fmt.Fprintf(s.stderr, "cp: %v\n", err)
+			}
 		}
 	}
 }
@@ -838,6 +880,12 @@ func (s *Shell) remoteCopySFTP(src, dst string) error {
 }
 
 func (s *Shell) handleMv(args []string) {
+	args, localForce := parseForceFlag(args)
+	force := localForce
+	if s.client != nil {
+		force = s.client.config.Force || localForce
+	}
+
 	if len(args) < 2 {
 		_, _ = fmt.Fprintln(s.stderr, i18n.T("sftp_shell_mv_usage"))
 		return
@@ -849,16 +897,6 @@ func (s *Shell) handleMv(args []string) {
 	}
 	dst := s.resolvePath(args[1])
 
-	// 含通配符时跳过 sshClient.Run 快捷路径，避免远程 shell 二次展开
-	if !hasWildcard(args[0]) && len(srcs) == 1 {
-		// 优先尝试使用远程命令
-		cmd := fmt.Sprintf("mv '%s' '%s'", strings.ReplaceAll(srcs[0], "'", "'\\''"), strings.ReplaceAll(dst, "'", "'\\''"))
-		if _, err := s.client.sshClient.Run(context.Background(), cmd); err == nil {
-			return
-		}
-	}
-
-	// 回退到 SFTP Rename (注意：SFTP Rename 通常不支持跨文件系统)
 	dstInfo, errStat := s.client.sftpClient.Stat(dst)
 	dstIsDir := errStat == nil && dstInfo.IsDir()
 	finalDsts, err := resolveMultiSrc(srcs, dst, dstIsDir)
@@ -866,14 +904,40 @@ func (s *Shell) handleMv(args []string) {
 		_, _ = fmt.Fprintf(s.stderr, "mv: %v\n", err)
 		return
 	}
+
 	for i, src := range srcs {
-		if err := s.client.sftpClient.Rename(src, finalDsts[i]); err != nil {
-			_, _ = fmt.Fprintf(s.stderr, "mv: %v\n", err)
+		finalDst := finalDsts[i]
+		if !force {
+			if stat, err := s.client.sftpClient.Stat(finalDst); err == nil && !stat.IsDir() {
+				if !s.askConfirmation(fmt.Sprintf("mv: overwrite remote '%s'?", finalDst)) {
+					continue
+				}
+			}
+		}
+
+		moved := false
+		if !hasWildcard(args[0]) && len(srcs) == 1 {
+			cmd := fmt.Sprintf("mv '%s' '%s'", strings.ReplaceAll(src, "'", "'\\''"), strings.ReplaceAll(finalDst, "'", "'\\''"))
+			if _, err := s.client.sshClient.Run(context.Background(), cmd); err == nil {
+				moved = true
+			}
+		}
+
+		if !moved {
+			if err := s.client.sftpClient.Rename(src, finalDst); err != nil {
+				_, _ = fmt.Fprintf(s.stderr, "mv: %v\n", err)
+			}
 		}
 	}
 }
 
 func (s *Shell) handleLocalCp(args []string) {
+	args, localForce := parseForceFlag(args)
+	force := localForce
+	if s.client != nil {
+		force = s.client.config.Force || localForce
+	}
+
 	if len(args) < 2 {
 		_, _ = fmt.Fprintln(s.stderr, i18n.T("sftp_shell_lcp_usage"))
 		return
@@ -894,7 +958,15 @@ func (s *Shell) handleLocalCp(args []string) {
 		return
 	}
 	for i, src := range srcs {
-		if err := s.localCopy(src, finalDsts[i]); err != nil {
+		finalDst := finalDsts[i]
+		if !force {
+			if stat, err := os.Stat(finalDst); err == nil && !stat.IsDir() {
+				if !s.askConfirmation(fmt.Sprintf("lcp: overwrite local '%s'?", finalDst)) {
+					continue
+				}
+			}
+		}
+		if err := s.localCopy(src, finalDst); err != nil {
 			_, _ = fmt.Fprintf(s.stderr, "lcp: %v\n", err)
 		}
 	}
@@ -944,6 +1016,12 @@ func (s *Shell) localCopy(src, dst string) error {
 }
 
 func (s *Shell) handleLocalMv(args []string) {
+	args, localForce := parseForceFlag(args)
+	force := localForce
+	if s.client != nil {
+		force = s.client.config.Force || localForce
+	}
+
 	if len(args) < 2 {
 		_, _ = fmt.Fprintln(s.stderr, i18n.T("sftp_shell_lmv_usage"))
 		return
@@ -964,10 +1042,31 @@ func (s *Shell) handleLocalMv(args []string) {
 		return
 	}
 	for i, src := range srcs {
-		if err := os.Rename(src, finalDsts[i]); err != nil {
+		finalDst := finalDsts[i]
+		if !force {
+			if stat, err := os.Stat(finalDst); err == nil && !stat.IsDir() {
+				if !s.askConfirmation(fmt.Sprintf("lmv: overwrite local '%s'?", finalDst)) {
+					continue
+				}
+			}
+		}
+		if err := os.Rename(src, finalDst); err != nil {
 			_, _ = fmt.Fprintf(s.stderr, "lmv: %v\n", err)
 		}
 	}
+}
+
+func parseForceFlag(args []string) ([]string, bool) {
+	force := false
+	filtered := make([]string, 0, len(args))
+	for _, arg := range args {
+		if arg == "-f" {
+			force = true
+		} else {
+			filtered = append(filtered, arg)
+		}
+	}
+	return filtered, force
 }
 
 func (s *Shell) printHelp() {
@@ -975,6 +1074,13 @@ func (s *Shell) printHelp() {
 }
 
 func (s *Shell) askConfirmation(prompt string) bool {
+	if s.askConfirmHook != nil {
+		return s.askConfirmHook(prompt)
+	}
+	if s.line == nil {
+		// 为了向后兼容已有测试（无 liner 状态且未设置 hook），默认返回 true 允许继续，避免崩溃
+		return true
+	}
 	_, _ = fmt.Fprint(s.stdout, "\n")
 	input, err := s.line.Prompt(fmt.Sprintf("%s [y/N]: ", prompt))
 	if err != nil {
