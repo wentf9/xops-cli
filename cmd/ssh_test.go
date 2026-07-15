@@ -238,20 +238,68 @@ func TestSshStdinScriptDetection(t *testing.T) {
 
 func TestSshCommandWithFlagsNotParsedAsXopsFlags(t *testing.T) {
 	c := NewCmdSsh()
+	// 模拟用户在子命令 ssh 之后的输入参数：host-01 ss -tlpn
 	args := []string{"host-01", "ss", "-tlpn"}
-	err := c.Flags().Parse(args)
+	processed := preprocessSubArgs(args, c)
+
+	// 验证确实在 host 后面插入了 "--"
+	expectedProcessed := []string{"host-01", "--", "ss", "-tlpn"}
+	if len(processed) != len(expectedProcessed) {
+		t.Fatalf("expected processed len %d, got %d", len(expectedProcessed), len(processed))
+	}
+	for i, v := range expectedProcessed {
+		if processed[i] != v {
+			t.Errorf("at index %d: expected %q, got %q", i, v, processed[i])
+		}
+	}
+
+	// 验证参数传递给 Cobra 解析后，能够正常保留所有位置参数
+	err := c.Flags().Parse(processed)
 	if err != nil {
-		t.Fatalf("expected Parse to succeed with interspersed false, got error: %v", err)
+		t.Fatalf("expected Parse to succeed after preprocessing, got error: %v", err)
 	}
 
 	parsedArgs := c.Flags().Args()
-	expected := []string{"host-01", "ss", "-tlpn"}
-	if len(parsedArgs) != len(expected) {
-		t.Fatalf("expected %d arguments, got %d (%v)", len(expected), len(parsedArgs), parsedArgs)
+	expectedArgs := []string{"host-01", "ss", "-tlpn"}
+	if len(parsedArgs) != len(expectedArgs) {
+		t.Fatalf("expected %d arguments, got %d (%v)", len(expectedArgs), len(parsedArgs), parsedArgs)
 	}
-	for i, v := range expected {
+	for i, v := range expectedArgs {
 		if parsedArgs[i] != v {
 			t.Errorf("at index %d: expected %q, got %q", i, v, parsedArgs[i])
 		}
+	}
+}
+
+func TestPreprocessArgsForSshSudoOption(t *testing.T) {
+	c := NewCmdSsh()
+	// 模拟用户输入：181 --sudo
+	args := []string{"181", "--sudo"}
+	processed := preprocessSubArgs(args, c)
+
+	// 由于 --sudo 是已知 flag，它不应该被预处理注入 "--"
+	expectedProcessed := []string{"181", "--sudo"}
+	if len(processed) != len(expectedProcessed) {
+		t.Fatalf("expected processed len %d, got %d", len(expectedProcessed), len(processed))
+	}
+	for i, v := range expectedProcessed {
+		if processed[i] != v {
+			t.Errorf("at index %d: expected %q, got %q", i, v, processed[i])
+		}
+	}
+
+	err := c.Flags().Parse(processed)
+	if err != nil {
+		t.Fatalf("expected Parse to succeed, got error: %v", err)
+	}
+
+	sudoVal, err := c.Flags().GetBool("sudo")
+	if err != nil || !sudoVal {
+		t.Errorf("expected sudo flag to be parsed as true, err: %v", err)
+	}
+
+	parsedArgs := c.Flags().Args()
+	if len(parsedArgs) != 1 || parsedArgs[0] != "181" {
+		t.Errorf("expected host '181' as the only position argument, got %v", parsedArgs)
 	}
 }

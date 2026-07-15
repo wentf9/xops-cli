@@ -71,18 +71,33 @@ func TestExecStdinIgnoredWhenCmdProvided(t *testing.T) {
 
 func TestExecCommandWithFlagsNotParsedAsXopsFlags(t *testing.T) {
 	c := NewCmdExec()
+	// 模拟用户在子命令 exec 之后的输入参数：host-01 ss -tlpn
 	args := []string{"host-01", "ss", "-tlpn"}
-	err := c.Flags().Parse(args)
+	processed := preprocessSubArgs(args, c)
+
+	// 验证确实在 host 后面插入了 "--"
+	expectedProcessed := []string{"host-01", "--", "ss", "-tlpn"}
+	if len(processed) != len(expectedProcessed) {
+		t.Fatalf("expected processed len %d, got %d", len(expectedProcessed), len(processed))
+	}
+	for i, v := range expectedProcessed {
+		if processed[i] != v {
+			t.Errorf("at index %d: expected %q, got %q", i, v, processed[i])
+		}
+	}
+
+	// 验证经过预处理的参数传递给 Cobra 解析后，能够正常保留所有位置参数
+	err := c.Flags().Parse(processed)
 	if err != nil {
-		t.Fatalf("expected Parse to succeed with interspersed false, got error: %v", err)
+		t.Fatalf("expected Parse to succeed after preprocessing, got error: %v", err)
 	}
 
 	parsedArgs := c.Flags().Args()
-	expected := []string{"host-01", "ss", "-tlpn"}
-	if len(parsedArgs) != len(expected) {
-		t.Fatalf("expected %d arguments, got %d (%v)", len(expected), len(parsedArgs), parsedArgs)
+	expectedArgs := []string{"host-01", "ss", "-tlpn"}
+	if len(parsedArgs) != len(expectedArgs) {
+		t.Fatalf("expected %d arguments, got %d (%v)", len(expectedArgs), len(parsedArgs), parsedArgs)
 	}
-	for i, v := range expected {
+	for i, v := range expectedArgs {
 		if parsedArgs[i] != v {
 			t.Errorf("at index %d: expected %q, got %q", i, v, parsedArgs[i])
 		}

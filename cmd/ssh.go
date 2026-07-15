@@ -65,7 +65,6 @@ func NewCmdSsh() *cobra.Command {
 			return o.Run()
 		},
 	}
-	cmd.Flags().SetInterspersed(false)
 	// OpenSSH-compatible flags
 	cmd.Flags().Uint16VarP(&o.Port, "port", "p", 0, i18n.T("flag_port"))
 	cmd.Flags().StringVarP(&o.User, "login", "l", "", i18n.T("flag_login"))
