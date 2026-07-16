@@ -196,6 +196,20 @@ xops --lang zh host list
 
 请阅读 [AGENTS.md](./AGENTS.md) 了解详细的开发规范、编码约定和测试要求。
 
+提交变更前请运行完整的本地质量门禁：
+
+```bash
+make verify
+```
+
+如需复现 GitHub Actions 使用的依赖整洁性检查、竞态检测、随机测试顺序和覆盖率生成，请运行：
+
+```bash
+make ci
+```
+
+CI 会在提交到 `master` 或向 `master` 提交 Pull Request 时自动执行全量构建、测试和 golangci-lint。
+
 ## 📄 开源协议 / License
 
 本项目采用 MIT 开源协议 - 详情请参阅 [LICENSE](LICENSE) 文件。

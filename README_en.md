@@ -197,6 +197,20 @@ xops --lang zh host list
 
 Please read the [AGENTS.md](./AGENTS.md) for detailed development standards, coding conventions, and testing requirements.  
 
+Run the complete local quality gate before submitting changes:
+
+```bash
+make verify
+```
+
+To reproduce the dependency tidiness check, race detection, randomized test order, and coverage generation used by GitHub Actions, run:
+
+```bash
+make ci
+```
+
+CI runs the full build, test suite, and golangci-lint on pushes to `master` and pull requests targeting `master`.
+
 ## 📄 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.  

@@ -38,7 +38,7 @@ endif
 # 编译命令
 # ==============================================================================
 
-.PHONY: all clean help build build-cli test test-race test-cover bench stress
+.PHONY: all clean help build build-cli test test-race test-cover lint verify ci bench stress
 .PHONY: windows windows-arm64 linux linux-arm64 darwin darwin-amd64 darwin-arm64
 
 default: all
@@ -104,16 +104,34 @@ clean:
 
 test:
 	@echo "Running tests..."
-	go test ./pkg/... -count=1
+	go test ./... -count=1
 
 test-race:
 	@echo "Running tests with race detector..."
-	go test ./pkg/... -race -count=1
+	go test ./... -race -shuffle=on -count=1
 
 test-cover:
 	@echo "Running tests with coverage..."
-	go test ./pkg/... -coverprofile=coverage.out
+	go test ./... -covermode=atomic -coverprofile=coverage.out
 	go tool cover -func=coverage.out
+
+lint:
+	@echo "Running golangci-lint..."
+	golangci-lint run ./...
+
+verify:
+	@echo "Verifying build, tests, and lint..."
+	go build ./...
+	go test ./...
+	golangci-lint run ./...
+
+ci:
+	@echo "Running CI checks..."
+	go mod tidy
+	git diff --exit-code -- go.mod go.sum
+	go build ./...
+	go test -race -shuffle=on -covermode=atomic -coverprofile=coverage.out ./...
+	golangci-lint run ./...
 
 bench:
 	@echo "Running benchmarks..."
@@ -145,6 +163,9 @@ help:
 	@echo "  test            运行单元测试"
 	@echo "  test-race       运行单元测试 (带 race 检测)"
 	@echo "  test-cover      运行测试并生成覆盖率报告"
+	@echo "  lint            运行 golangci-lint"
+	@echo "  verify          运行提交前构建、测试和 Lint 检查"
+	@echo "  ci              在本地复现 GitHub Actions CI 检查"
 	@echo "  bench           运行 ConcurrentMap 基准测试"
 	@echo "  stress          运行 ConcurrentMap 压力测试"
 
