@@ -62,6 +62,7 @@ func TestConnector_Connect_Cached(t *testing.T) {
 
 	if client == nil {
 		t.Fatal("expected non-nil client")
+		return
 	}
 
 	// 验证在缓存命中时，配置是否正确附加
