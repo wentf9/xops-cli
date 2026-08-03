@@ -4,9 +4,9 @@
 
 # ---- root ----
 root_short:
-  other: "xops (XOps) is a CLI toolkit for daily operations and development"
+  other: "Safely manage and automate remote hosts"
 root_long:
-  other: "xops (XOps) is a CLI toolkit\nproviding a variety of utilities to improve daily operations and development efficiency."
+  other: "XOps combines host inventory, SSH, batch execution, playbooks, and MCP guardrails to safely manage and automate remote hosts."
 version_short:
   other: "Print the version number"
 flag_version:
@@ -312,9 +312,9 @@ inventory_delete_short:
 inventory_tags_short:
   other: "List all tags with node counts"
 inventory_load_short:
-  other: "Load hosts and credentials from CSV and verify"
+  other: "Import hosts and credentials from CSV and verify"
 inventory_load_long:
-  other: "Load hosts, usernames, and passwords from a CSV file and save to config.\nSupported headers: host, port, alias, user, password, key, keypass\nEstablishes SSH connections to verify credentials."
+  other: "Import hosts, usernames, and passwords from a CSV file and save them to the configuration.\nSupported headers: host, port, alias, user, password, key, keypass\nEstablishes SSH connections to verify credentials."
 inventory_tag_add_short:
   other: "Add nodes to a tag group"
 inventory_tag_remove_short:
@@ -500,15 +500,39 @@ sudo_exec_failed:
 
 # ---- mcp ----
 mcp_short:
-  other: "Start MCP (Model Context Protocol) server"
+  other: "Manage the MCP (Model Context Protocol) server"
 mcp_long:
   other: "Start an MCP server via Stdio for Agent calls. All regular output and logs will be suppressed."
+mcp_serve_short:
+  other: "Start the MCP server over standard input and output"
+
+# ---- init ----
+init_short:
+  other: "Initialize local XOps configuration"
+init_long:
+  other: "Create the local configuration and encryption key, then import concrete Host entries from OpenSSH configuration. Initialization never connects to remote hosts or overwrites existing nodes."
+flag_init_ssh_config:
+  other: "OpenSSH configuration file to import"
+flag_init_skip_ssh_import:
+  other: "Do not import hosts from OpenSSH configuration"
+init_status_created:
+  other: "XOps initialization complete"
+init_status_existing:
+  other: "XOps configuration already exists; existing content was preserved"
+init_config_path:
+  other: "Configuration: {{.Path}}"
+init_key_path:
+  other: "Encryption key: {{.Path}}"
+init_import_summary:
+  other: "OpenSSH hosts: imported {{.Imported}}, skipped existing {{.Skipped}}"
+init_next_steps:
+  other: "Next: run 'xops host list' to view hosts, or 'xops host add --help' to add one"
 
 # ---- loadHost ----
 loadhost_short:
-  other: "Load hosts from CSV and verify (shortcut for inventory load)"
+  other: "Deprecated: use host import"
 loadhost_long:
-  other: "Load hosts, usernames, and passwords from a CSV file and save to config.\nThis command is a shortcut for 'inventory load'."
+  other: "This compatibility command is deprecated; use 'xops host import'."
 
 # ---- sftp shell ----
 sftp_shell_unknown_cmd:

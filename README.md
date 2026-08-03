@@ -1,7 +1,7 @@
 # 🚀 XOps CLI
 
 <div align="center">
-  <h3>新一代 AI 驱动的全能运维命令行工具箱</h3>
+  <h3>让 AI 在安全边界内管理远程主机</h3>
   
   <p>
     <img alt="Go Version" src="https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go" />
@@ -15,9 +15,7 @@
 
 ---
 
-**XOps CLI** 是一个基于 Go 语言开发的现代化命令行运维工具集，旨在简化并自动化日常的服务器管理工作。
-
-除了传统的 SSH 管理和批量执行功能外，XOps 原生集成了 **Model Context Protocol (MCP)** 服务端，允许 AI Agent (如 Claude 等) 在安全护栏下直接与你的基础设施进行交互。它是连接 AI 助手与真实服务器环境的完美桥梁。
+**XOps CLI** 统一管理主机资产、SSH、批量执行与 Playbook，并通过内置的 **Model Context Protocol (MCP)** 安全护栏，让 AI Agent 在可审批、可审计的边界内操作远程主机。
 
 ### ✨ 核心特性
 
@@ -31,7 +29,13 @@
 
 ### 📦 安装指南
 
-**环境要求:** Go 1.26 或更高版本。
+使用预编译版本安装（Linux/macOS）：
+
+```bash
+curl -sSL https://raw.githubusercontent.com/wentf9/xops-cli/master/install.sh | bash
+```
+
+从源码构建需要 Go 1.26 或更高版本：
 
 ```bash
 git clone https://github.com/wentf9/xops-cli.git
@@ -42,21 +46,37 @@ make build
 
 ### 🚀 快速上手
 
-#### 1. 主机与资产管理
+#### 1. 初始化
+
+```bash
+# 创建 ~/.xops/xops_config.yaml 和加密密钥
+# 默认导入 ~/.ssh/config 中不含通配符的 Host；不会连接远程主机
+xops init
+
+# 使用指定的 OpenSSH 配置，或完全跳过导入
+xops init --ssh-config ~/.ssh/config.work
+xops init --skip-ssh-import
+```
+
+该命令可重复执行，不会覆盖已有节点。初始化完成后可运行 `xops host list` 查看导入结果。
+
+#### 2. 主机与资产管理
 
 ```bash
 # 从 CSV 文件批量导入主机，并打上 'web' 标签
-xops loadHost hosts.csv -t web
+xops host import hosts.csv --tag web
 
 # 手动添加单台主机
-xops host add --name web-01 --address 192.168.1.10 --user root --tag web
+xops host add --address 192.168.1.10 --user root --key ~/.ssh/id_ed25519 --alias web-01 --tags web
 
 # 查看主机列表或标签
 xops host list
 xops host tags
 ```
 
-#### 2. SSH 连接与 TUI
+`inventory` 仍可作为 `host` 的兼容别名，`host load` 仍可作为 `host import` 的兼容别名；新脚本应使用上面的规范命令。
+
+#### 3. SSH 连接与 TUI
 
 ```bash
 # 启动交互式 TUI 界面管理
@@ -72,7 +92,7 @@ xops ssh -J jumphost -i ~/.ssh/id_rsa root@192.168.1.13
 xops ssh --sudo web-01
 ```
 
-#### 3. 批量执行与文件分发
+#### 4. 批量执行与文件分发
 
 ```bash
 # 对 web 标签组的所有主机并行执行 uptime 命令
@@ -85,7 +105,7 @@ xops exec --tag web --shell ./setup.sh --task 5
 xops scp ./config.conf --tag web --dest /etc/app/
 ```
 
-#### 4. 声明式任务编排 (Playbook)
+#### 5. 声明式任务编排 (Playbook)
 
 你可以编写 YAML 格式的 Playbook 实现流水线式的复杂部署任务。支持 shell、script、copy、ensure (状态期望收敛)、template 等操作。
 
@@ -129,7 +149,7 @@ xops play deploy.yaml --dry-run
 xops play deploy.yaml --limit web-01
 ```
 
-#### 5. AI 与 MCP 集成 (赋予 AI 运维能力)
+#### 6. AI 与 MCP 集成 (赋予 AI 运维能力)
 
 XOps 内置了 **Model Context Protocol (MCP)** 服务端，让 **Claude** 等 AI 助手可以直接感知并操作你的服务器。
 
@@ -159,7 +179,7 @@ xops mcp serve
 - **策略控制**: 支持配置只读模式或“先审批后执行”策略。
 - **全量审计**: 完整记录 AI 执行的每一条指令，确保过程透明可追溯。
 
-#### 6. AI Agent 技能 (Skill) 集成
+#### 7. AI Agent 技能 (Skill) 集成
 
 XOps 提供开箱即用的 AI Agent 技能 (Skill)，让你的命令行 AI 助手一键获得强大的服务器运维和故障排查能力。
 

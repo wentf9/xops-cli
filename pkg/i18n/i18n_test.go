@@ -36,7 +36,7 @@ func TestT_Chinese(t *testing.T) {
 	if got == "root_short" {
 		t.Errorf("expected translated string, got key %q", got)
 	}
-	if got != "xops(XOps)是一个命令行工具集,用于日常运维和开发工作" {
+	if got != "安全管理和自动化远程主机的命令行工具" {
 		t.Errorf("unexpected translation: %q", got)
 	}
 }
@@ -47,7 +47,7 @@ func TestT_English(t *testing.T) {
 	if got == "root_short" {
 		t.Errorf("expected translated string, got key %q", got)
 	}
-	expected := "xops (XOps) is a CLI toolkit for daily operations and development"
+	expected := "Safely manage and automate remote hosts"
 	if got != expected {
 		t.Errorf("expected %q, got %q", expected, got)
 	}
@@ -89,7 +89,7 @@ func TestSetLang(t *testing.T) {
 		t.Errorf("expected en after SetLang, got %s", Lang())
 	}
 	got := T("root_short")
-	if got == "xops(XOps)是一个命令行工具集,用于日常运维和开发工作" {
+	if got == "安全管理和自动化远程主机的命令行工具" {
 		t.Errorf("expected english after SetLang, got chinese")
 	}
 }

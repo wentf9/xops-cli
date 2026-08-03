@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -33,7 +34,10 @@ func (s *defaultStore) Load() (*Configuration, error) {
 	// 1. 读取文件
 	data, err := os.ReadFile(s.Path)
 	if err != nil {
-		return &config, nil
+		if errors.Is(err, os.ErrNotExist) {
+			return &config, nil
+		}
+		return nil, fmt.Errorf("failed to read configuration file %s: %w", s.Path, err)
 	}
 	// 2. yaml.Unmarshal
 	if err = yaml.Unmarshal(data, &config); err != nil {

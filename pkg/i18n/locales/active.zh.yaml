@@ -4,9 +4,9 @@
 
 # ---- root ----
 root_short:
-  other: "xops(XOps)是一个命令行工具集,用于日常运维和开发工作"
+  other: "安全管理和自动化远程主机的命令行工具"
 root_long:
-  other: "xops(XOps)是一个命令行工具集,\n提供了多种实用的命令行工具,旨在提高日常运维和开发工作的效率。"
+  other: "XOps 通过统一的主机资产、SSH、批量执行、Playbook 和 MCP 安全护栏，帮助用户安全管理和自动化远程主机。"
 version_short:
   other: "显示版本号"
 flag_version:
@@ -313,9 +313,9 @@ inventory_delete_short:
 inventory_tags_short:
   other: "列出所有标签及对应的节点数量"
 inventory_load_short:
-  other: "从CSV文件加载主机及凭据并验证保存"
+  other: "从 CSV 文件导入主机及凭据并验证保存"
 inventory_load_long:
-  other: "从CSV文件中加载主机、用户名和密码并保存到配置文件中。\n支持表头识别: 主机, 端口, 别名, 用户, 密码, 私钥, 私钥密码\n会建立SSH连接验证凭据的准确性。"
+  other: "从 CSV 文件导入主机、用户名和密码并保存到配置文件中。\n支持表头识别: 主机, 端口, 别名, 用户, 密码, 私钥, 私钥密码\n会建立 SSH 连接验证凭据的准确性。"
 inventory_tag_add_short:
   other: "将节点加入标签组"
 inventory_tag_remove_short:
@@ -501,15 +501,39 @@ sudo_exec_failed:
 
 # ---- mcp ----
 mcp_short:
-  other: "启动 MCP (Model Context Protocol) 服务端"
+  other: "管理 MCP (Model Context Protocol) 服务端"
 mcp_long:
   other: "以标准输入输出 (Stdio) 启动 MCP 服务端，供 Agent 调用。开启后所有常规业务输出与日志将会被屏蔽。"
+mcp_serve_short:
+  other: "通过标准输入输出启动 MCP 服务端"
+
+# ---- init ----
+init_short:
+  other: "初始化 XOps 本地配置"
+init_long:
+  other: "创建本地配置和加密密钥，并从 OpenSSH 配置导入明确的 Host 条目。初始化不会连接任何远程主机，也不会覆盖已有节点。"
+flag_init_ssh_config:
+  other: "要导入的 OpenSSH 配置文件"
+flag_init_skip_ssh_import:
+  other: "不从 OpenSSH 配置导入主机"
+init_status_created:
+  other: "XOps 初始化完成"
+init_status_existing:
+  other: "XOps 配置已存在，已保留现有内容"
+init_config_path:
+  other: "配置文件: {{.Path}}"
+init_key_path:
+  other: "加密密钥: {{.Path}}"
+init_import_summary:
+  other: "OpenSSH 主机: 导入 {{.Imported}}，跳过已有 {{.Skipped}}"
+init_next_steps:
+  other: "下一步: 运行 'xops host list' 查看主机，或运行 'xops host add --help' 添加主机"
 
 # ---- loadHost ----
 loadhost_short:
-  other: "从CSV文件加载主机及凭据并验证保存 (inventory load 的快捷入口)"
+  other: "已弃用：请使用 host import"
 loadhost_long:
-  other: "从CSV文件中加载主机、用户名和密码并保存到配置文件中。\n该命令是 'inventory load' 的快捷方式。"
+  other: "该兼容命令已弃用，请使用 'xops host import'。"
 
 # ---- sftp shell ----
 sftp_shell_unknown_cmd:

@@ -1,7 +1,7 @@
 # 🚀 XOps CLI
 
 <div align="center">
-  <h3>A Next-Generation, AI-Ready IT Operations Toolkit</h3>
+  <h3>Let AI manage remote hosts within explicit safety boundaries</h3>
   
   <p>
     <img alt="Go Version" src="https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go" />
@@ -15,9 +15,7 @@
 
 ---
 
-**XOps CLI** is a powerful, modern CLI toolkit written in Go, designed to streamline and automate daily server management and IT operations.
-
-Beyond standard SSH and batch execution, XOps natively integrates the **Model Context Protocol (MCP)**, allowing AI Agents (like Claude) to directly interact with your infrastructure securely. It is the perfect bridge between AI assistants and your servers.
+**XOps CLI** combines host inventory, SSH, batch execution, and Playbooks with built-in **Model Context Protocol (MCP)** guardrails, allowing AI Agents to operate remote hosts within approval and audit boundaries.
 
 ### ✨ Key Features
 
@@ -31,7 +29,13 @@ Beyond standard SSH and batch execution, XOps natively integrates the **Model Co
 
 ### 📦 Installation
 
-**Prerequisites:** Go 1.26 or higher.
+Install a pre-built binary on Linux or macOS:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/wentf9/xops-cli/master/install.sh | bash
+```
+
+Building from source requires Go 1.26 or higher:
 
 ```bash
 git clone https://github.com/wentf9/xops-cli.git
@@ -42,21 +46,37 @@ make build
 
 ### 🚀 Quick Start
 
-#### 1. Inventory & Tags
+#### 1. Initialize
+
+```bash
+# Create ~/.xops/xops_config.yaml and its encryption key.
+# Concrete Hosts from ~/.ssh/config are imported without connecting to them.
+xops init
+
+# Use another OpenSSH config, or skip the import entirely.
+xops init --ssh-config ~/.ssh/config.work
+xops init --skip-ssh-import
+```
+
+The command is idempotent and never overwrites existing nodes. Run `xops host list` to review the result.
+
+#### 2. Inventory & Tags
 
 ```bash
 # Import hosts from CSV and tag them as 'web'
-xops loadHost hosts.csv -t web
+xops host import hosts.csv --tag web
 
 # Add a single host manually
-xops host add --name web-01 --address 192.168.1.10 --user root --tag web
+xops host add --address 192.168.1.10 --user root --key ~/.ssh/id_ed25519 --alias web-01 --tags web
 
 # List all hosts or tags
 xops host list
 xops host tags
 ```
 
-#### 2. SSH & TUI
+`inventory` remains a compatibility alias for `host`, and `host load` remains an alias for `host import`. New scripts should use the canonical commands above.
+
+#### 3. SSH & TUI
 
 ```bash
 # Launch interactive TUI
@@ -73,7 +93,7 @@ xops ssh --sudo web-01
 
 ```
 
-#### 3. Batch Execution & File Transfer
+#### 4. Batch Execution & File Transfer
 
 ```bash
 # Execute 'uptime' on all 'web' servers
@@ -86,7 +106,7 @@ xops exec --tag web --shell ./setup.sh --task 5
 xops scp ./config.conf --tag web --dest /etc/app/
 ```
 
-#### 4. Declarative Orchestration (Playbook)
+#### 5. Declarative Orchestration (Playbook)
 
 You can write YAML-formatted Playbooks to execute complex, multi-stage deployment workflows. It supports shell, script, copy, ensure (idempotent state convergence), and template actions.
 
@@ -130,7 +150,7 @@ xops play deploy.yaml --dry-run
 xops play deploy.yaml --limit web-01
 ```
 
-#### 5. AI & MCP Integration (Empower your AI Agent)
+#### 6. AI & MCP Integration (Empower your AI Agent)
 
 XOps features a built-in **Model Context Protocol (MCP)** server, allowing AI assistants like **Claude** to explore and manage your infrastructure under your control.
 
@@ -160,7 +180,7 @@ Add the following to your `claude_desktop_config.json` to let Claude use XOps:
 - **Policy Control**: Supports "Audit-only" or "Manual Approval" modes.
 - **Audit Logs**: Full transparency on what the AI is doing on your servers.
 
-#### 6. AI Agent Skill Integration
+#### 7. AI Agent Skill Integration
 
 XOps comes with an out-of-the-box AI Agent Skill, empowering your terminal-based AI assistant with robust server management and troubleshooting capabilities.
 

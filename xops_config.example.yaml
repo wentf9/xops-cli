@@ -25,7 +25,7 @@ identities:
     key_path: ~/.ssh/id_ed25519         # 私钥文件路径
     passphrase: ""                      # 私钥密码（为空则无密码）
 
-  # 使用 SSH Agent 认证（无需指定密钥路径，由 SSH Agent 代理）（暂未实现）
+  # 使用 SSH Agent 认证（无需指定密钥路径，由 SSH Agent 代理）
   id-agent:
     user: ubuntu
     auth_type: agent

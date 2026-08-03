@@ -23,10 +23,12 @@ var Tag string
 
 func NewCmdInventoryLoad() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "load [csv_file]",
-		Short: i18n.T("inventory_load_short"),
-		Long:  i18n.T("inventory_load_long"),
-		RunE:  RunInventoryLoad,
+		Use:     "import [csv_file]",
+		Aliases: []string{"load"},
+		Short:   i18n.T("inventory_load_short"),
+		Long:    i18n.T("inventory_load_long"),
+		Args:    cobra.MaximumNArgs(1),
+		RunE:    RunInventoryLoad,
 	}
 
 	cmd.Flags().StringVarP(&TemplateFile, "template", "T", "", i18n.T("flag_inv_template"))
