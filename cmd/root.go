@@ -84,6 +84,7 @@ func initRootFlags(rootCmd *cobra.Command) {
 
 func registerCommands(rootCmd *cobra.Command) {
 	// 注册各子命令
+	rootCmd.AddCommand(NewCmdInit())
 	rootCmd.AddCommand(host.NewCmdInventory())
 	rootCmd.AddCommand(newCmdVersion())
 	rootCmd.AddCommand(NewCmdSsh())

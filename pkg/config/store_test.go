@@ -99,6 +99,15 @@ func TestLoad_EmptyFile(t *testing.T) {
 	}
 }
 
+func TestLoad_ReadFailure(t *testing.T) {
+	dir := t.TempDir()
+	store := NewDefaultStore(dir, filepath.Join(dir, "config.key"))
+
+	if _, err := store.Load(); err == nil {
+		t.Fatal("Load() error = nil, want read failure")
+	}
+}
+
 func TestSave_EncryptsPassword(t *testing.T) {
 	store, cfg := newTestStoreAndConfig(t)
 	s := store.(*defaultStore)

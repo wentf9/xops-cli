@@ -7,12 +7,13 @@ import (
 
 func NewCmdInventory() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:     "inventory",
-		Aliases: []string{"host", "hosts", "inv"},
+		Use:     "host",
+		Aliases: []string{"hosts", "inventory", "inv"},
 		Short:   i18n.T("inventory_short"),
 		Long:    i18n.T("inventory_long"),
-		Run: func(cmd *cobra.Command, args []string) {
-			_ = cmd.Help()
+		Args:    cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return cmd.Help()
 		},
 	}
 
@@ -31,8 +32,9 @@ func NewCmdInventoryTag() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "tag",
 		Short: i18n.T("inventory_tag_short"),
-		Run: func(cmd *cobra.Command, args []string) {
-			_ = cmd.Help()
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return cmd.Help()
 		},
 	}
 

@@ -8,10 +8,13 @@ import (
 
 func newCmdLoadHost() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "loadHost [csv_file]",
-		Short: i18n.T("loadhost_short"),
-		Long:  i18n.T("loadhost_long"),
-		RunE:  host.RunInventoryLoad,
+		Use:        "loadHost [csv_file]",
+		Short:      i18n.T("loadhost_short"),
+		Long:       i18n.T("loadhost_long"),
+		Args:       cobra.MaximumNArgs(1),
+		RunE:       host.RunInventoryLoad,
+		Hidden:     true,
+		Deprecated: "use 'xops host import' instead",
 	}
 
 	cmd.Flags().StringVarP(&host.TemplateFile, "template", "T", "", i18n.T("flag_inv_template"))

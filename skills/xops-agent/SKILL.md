@@ -13,7 +13,7 @@ Before attempting any operations, please run `xops --version` to check if the to
 If you receive a `command not found` error, instruct the user to execute the following installation command:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/wentf9/xops-cli/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/wentf9/xops-cli/master/install.sh | bash
 ```
 
 ## 🎯 Core Capabilities & Precise Command Usage
@@ -21,6 +21,10 @@ curl -sSL https://raw.githubusercontent.com/wentf9/xops-cli/main/install.sh | ba
 ### 1. Host & Asset Management (`xops host`)
 Manage the inventory of servers, credentials, and grouping tags.
 
+- **Initialize Local Configuration and Import OpenSSH Hosts**:
+  ```bash
+  xops init
+  ```
 - **List All Hosts**:
   ```bash
   xops host list
@@ -31,11 +35,11 @@ Manage the inventory of servers, credentials, and grouping tags.
   ```
 - **Add a New Host**:
   ```bash
-  xops host add --name "web-01" --address "192.168.1.10" --user "root" --password "your_pass" --tag "web"
+  xops host add --address "192.168.1.10" --user "root" --key ~/.ssh/id_ed25519 --alias "web-01" --tags "web"
   ```
-- **Batch Load Hosts from CSV**:
+- **Batch Import Hosts from CSV**:
   ```bash
-  xops loadHost hosts.csv --tag "production"
+  xops host import hosts.csv --tag "production"
   ```
 
 ### 2. Batch Execution (`xops exec`)
