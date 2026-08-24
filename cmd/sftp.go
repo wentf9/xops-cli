@@ -2,11 +2,11 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
-	"time"
-
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
@@ -15,6 +15,15 @@ import (
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/models"
 	"github.com/wentf9/xops-cli/pkg/sftp"
+	"github.com/wentf9/xops-cli/pkg/ssh"
+)
+
+// sftp shell 连接监控参数：
+// 心跳间隔 15s，与 OpenSSH ServerAliveInterval 默认推荐值一致；
+// 单次探测超时 10s，超时即判定网络不可达（覆盖网络黑洞场景）
+const (
+	sftpKeepAliveInterval = 15 * time.Second
+	sftpKeepAliveTimeout  = 10 * time.Second
 )
 
 type SftpOptions struct {
@@ -110,15 +119,45 @@ func (o *SftpOptions) Run() error {
 	}
 	defer func() { _ = sftpClient.Close() }()
 	defer func() { _ = client.Close() }()
+
+	// 连接监控：
+	// 1. KeepAlive 心跳探测网络黑洞型断连（探测失败或超时会关闭底层 SSH 连接）
+	// 2. Wait watcher 感知任何原因的连接关闭（服务端断开 / 心跳主动 Close），
+	//    连接断开后取消 runCtx 并提示用户，sftp shell 在下一次交互后自动退出
+	runCtx, runCancel := context.WithCancel(context.Background())
+	defer runCancel()
+
+	ssh.StartKeepAlive(runCtx, client.SSHClient(), sftpKeepAliveInterval, sftpKeepAliveTimeout, nil)
+
+	shellDone := make(chan struct{})
+	go func() {
+		waitErr := client.SSHClient().Wait()
+		select {
+		case <-shellDone:
+			// shell 已正常退出（用户输入 exit/bye），连接关闭属于预期清理，无需提示
+		case <-time.After(100 * time.Millisecond):
+			// shell 仍在运行，说明是异常断连
+			fmt.Fprintf(os.Stderr, "%s\n", i18n.Tf("sftp_conn_lost", map[string]any{"Error": waitErr}))
+			runCancel()
+		}
+	}()
+
 	// 启动 Shell
 	// 使用 os.Stdin, os.Stdout 绑定到当前终端
 	shell, err := sftpClient.NewShell(os.Stdin, os.Stdout, os.Stderr)
 	if err != nil {
+		close(shellDone)
 		return fmt.Errorf("%s: %w", i18n.T("sftp_shell_create_failed"), err)
 	}
-	if err := shell.Run(context.Background()); err != nil {
+	if err := shell.Run(runCtx); err != nil {
+		close(shellDone)
+		if errors.Is(err, context.Canceled) {
+			// 连接已断开，提示已由 watcher 打印，此处静默退出
+			return nil
+		}
 		return fmt.Errorf("%s: %w", i18n.T("sftp_shell_start_failed"), err)
 	}
+	close(shellDone)
 	if updated {
 		if err := configStore.Save(cfg); err != nil {
 			return fmt.Errorf("%s: %w", i18n.T("save_config_failed"), err)

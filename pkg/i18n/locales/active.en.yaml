@@ -581,6 +581,8 @@ sftp_shell_glob_multiple_cd:
   other: "cd: pattern '{{.Pattern}}' matched {{.Count}} paths, expected exactly one"
 sftp_shell_dest_must_be_dir:
   other: "destination must be an existing directory when expanding multiple sources"
+sftp_conn_lost:
+  other: "Connection lost: {{.Error}}\nPress Enter to exit sftp"
 sftp_shell_help:
   other: "\nAvailable commands:\n  cd <path>     Change remote directory\n  lcd <path>    Change local directory\n  pwd           Show remote current directory\n  lpwd          Show local current directory\n  ls [path]     List remote files (simple)\n  ll [path]     List remote files (detailed)\n  lls [path]    List local files (simple)\n  lll [path]    List local files (detailed)\n  get <remote> [local]  Download file or directory\n  put <local> [remote]  Upload file or directory\n  mkdir <path>  Create remote directory\n  lmkdir <path> Create local directory\n  rm <path>     Remove remote file or directory\n  lrm <path>    Remove local file or directory\n  cp <src> <dest> Copy remote file or directory\n  lcp <src> <dest> Copy local file or directory\n  mv <src> <dest> Move remote file or directory\n  lmv <src> <dest> Move local file or directory\n  exec <cmd>    Execute command on remote host\n  lexec <cmd>   Execute command locally\n  ! <cmd>       Execute command locally (shortcut)\n  shell         Enter interactive remote shell\n  lshell        Enter interactive local shell\n  exit/quit     Exit\n  Wildcards (*, ?, [...]) are supported in path arguments.\n"
 

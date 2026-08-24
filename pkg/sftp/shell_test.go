@@ -3,10 +3,12 @@ package sftp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/peterh/liner"
 	"github.com/wentf9/xops-cli/pkg/i18n"
@@ -375,6 +377,116 @@ func TestLocalCdWildcardMultiple(t *testing.T) {
 	errout := stderr.String()
 	if !strings.Contains(errout, "匹配到") || !strings.Contains(errout, "个路径") {
 		t.Errorf("expected stderr to contain multiple match error, got %q", errout)
+	}
+}
+
+// TestShellRun_ExitsOnContextCancel 验证连接断开（ctx 被取消）后，
+// shell 在下一次用户交互时返回 context.Canceled 而非继续 REPL 循环。
+// 测试通过管道替换 os.Stdin 驱动 liner 的 fallback 输入路径
+// （go test 环境无 TTY，liner.NewLiner 会置 inputRedirected=true）。
+func TestShellRun_ExitsOnContextCancel(t *testing.T) {
+	i18n.Init("zh")
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("failed to create pipe: %v", err)
+	}
+	oldStdin := os.Stdin
+	os.Stdin = r
+	defer func() {
+		os.Stdin = oldStdin
+		_ = r.Close()
+	}()
+
+	s := &Shell{
+		cwd:      "/test/remote/dir",
+		localCwd: t.TempDir(),
+		line:     liner.NewLiner(),
+		stdout:   &bytes.Buffer{},
+		stderr:   &bytes.Buffer{},
+	}
+	defer func() { _ = s.line.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- s.Run(ctx)
+	}()
+
+	// 模拟连接断开：watcher 检测到断连后取消 ctx
+	cancel()
+
+	// 用户按下回车（下一次交互），shell 应立即返回 context.Canceled
+	_, _ = w.WriteString("\n")
+	_ = w.Close()
+
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("expected context.Canceled, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("shell.Run did not return within 5s after ctx cancelled and enter pressed")
+	}
+}
+
+// TestShellRun_ContinuesOnCancelledPromptAbort 验证 Ctrl+C 中断提示时若连接正常，
+// shell 继续等待输入而非误退出（回归保护）
+func TestShellRun_ContinuesOnCancelledPromptAbort(t *testing.T) {
+	i18n.Init("zh")
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("failed to create pipe: %v", err)
+	}
+	oldStdin := os.Stdin
+	os.Stdin = r
+	defer func() {
+		os.Stdin = oldStdin
+		_ = r.Close()
+	}()
+
+	s := &Shell{
+		cwd:      "/test/remote/dir",
+		localCwd: t.TempDir(),
+		line:     liner.NewLiner(),
+		stdout:   &bytes.Buffer{},
+		stderr:   &bytes.Buffer{},
+	}
+	defer func() { _ = s.line.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- s.Run(ctx)
+	}()
+
+	// 连接正常时执行本地命令 lpwd，shell 不应退出
+	_, _ = w.WriteString("lpwd\n")
+	// 给 REPL 一点时间消费输入
+	time.Sleep(200 * time.Millisecond)
+
+	select {
+	case err := <-runDone:
+		t.Fatalf("shell.Run returned unexpectedly: %v", err)
+	default:
+		// 预期仍在运行
+	}
+
+	// 输入 exit 正常退出，Run 应返回 nil
+	_, _ = w.WriteString("exit\n")
+	_ = w.Close()
+
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Errorf("expected nil error on normal exit, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("shell.Run did not return within 5s after exit command")
 	}
 }
 

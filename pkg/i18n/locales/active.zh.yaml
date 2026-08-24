@@ -582,6 +582,8 @@ sftp_shell_glob_multiple_cd:
   other: "cd: 通配符 '{{.Pattern}}' 匹配到 {{.Count}} 个路径，期望恰好一个"
 sftp_shell_dest_must_be_dir:
   other: "扩展多个源路径时，目标必须是已存在的目录"
+sftp_conn_lost:
+  other: "连接已断开: {{.Error}}\n按回车键退出 sftp"
 sftp_shell_help:
   other: "\n可用命令:\n  cd <path>     切换远程目录\n  lcd <path>    切换本地目录\n  pwd           显示远程当前目录\n  lpwd          显示本地当前目录\n  ls [path]     列出远程文件 (简洁模式)\n  ll [path]     列出远程文件 (详细模式)\n  lls [path]    列出本地文件 (简洁模式)\n  lll [path]    列出本地文件 (详细模式)\n  get <remote> [local]  下载文件或目录\n  put <local> [remote]  上传文件或目录\n  mkdir <path>  创建远程目录\n  lmkdir <path> 创建本地目录\n  rm <path>     删除远程文件或目录\n  lrm <path>    删除本地文件或目录\n  cp <src> <dest> 复制远程文件或目录\n  lcp <src> <dest> 复制本地文件或目录\n  mv <src> <dest> 移动远程文件或目录\n  lmv <src> <dest> 移动本地文件或目录\n  exec <cmd>    在远程主机执行命令\n  lexec <cmd>   在本地执行命令\n  ! <cmd>       在本地执行命令 (快捷方式)\n  shell         进入远程交互式 shell\n  lshell        进入本地交互式 shell\n  exit/quit     退出\n  路径参数支持通配符 (*, ?, [...])\n"
 

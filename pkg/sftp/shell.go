@@ -92,9 +92,19 @@ func (s *Shell) Run(ctx context.Context) error {
 		input, err := s.line.Prompt(prompt)
 		if err != nil {
 			if errors.Is(err, liner.ErrPromptAborted) {
-				continue // 对应 Ctrl+C 拦截
+				// Ctrl+C 拦截：若连接已断开则直接退出，否则继续等待输入
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				continue
 			}
 			return nil // EOF 对应 Ctrl+D 或其他错误退出
+		}
+
+		// 连接已断开（keepalive 失败或服务端关闭）时不再执行命令，直接退出，
+		// 避免 dispatchCommand 触发必然失败的远程操作并刷出误导性错误
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
 
 		input = strings.TrimSpace(input)
@@ -143,7 +153,7 @@ func (s *Shell) dispatchCommand(ctx context.Context, cmd string, params []string
 	case "mkdir", "lmkdir":
 		s.handleMkdirGroup(cmd, params)
 	case "rm", "lrm":
-		s.handleRmGroup(cmd, params)
+		s.handleRmGroup(ctx, cmd, params)
 	default:
 		s.dispatchTransferCmd(ctx, cmd, params)
 	}
@@ -153,9 +163,9 @@ func (s *Shell) dispatchCommand(ctx context.Context, cmd string, params []string
 func (s *Shell) dispatchTransferCmd(ctx context.Context, cmd string, params []string) {
 	switch cmd {
 	case "cp", "lcp":
-		s.handleCpGroup(cmd, params)
+		s.handleCpGroup(ctx, cmd, params)
 	case "mv", "lmv":
-		s.handleMvGroup(cmd, params)
+		s.handleMvGroup(ctx, cmd, params)
 	case "shell":
 		s.handleShell(ctx)
 	case "lshell":
@@ -210,25 +220,25 @@ func (s *Shell) handleMkdirGroup(cmd string, params []string) {
 	}
 }
 
-func (s *Shell) handleRmGroup(cmd string, params []string) {
+func (s *Shell) handleRmGroup(ctx context.Context, cmd string, params []string) {
 	if cmd == "rm" {
-		s.handleRm(params)
+		s.handleRm(ctx, params)
 	} else {
 		s.handleLocalRm(params)
 	}
 }
 
-func (s *Shell) handleCpGroup(cmd string, params []string) {
+func (s *Shell) handleCpGroup(ctx context.Context, cmd string, params []string) {
 	if cmd == "cp" {
-		s.handleCp(params)
+		s.handleCp(ctx, params)
 	} else {
 		s.handleLocalCp(params)
 	}
 }
 
-func (s *Shell) handleMvGroup(cmd string, params []string) {
+func (s *Shell) handleMvGroup(ctx context.Context, cmd string, params []string) {
 	if cmd == "mv" {
-		s.handleMv(params)
+		s.handleMv(ctx, params)
 	} else {
 		s.handleLocalMv(params)
 	}
@@ -705,7 +715,7 @@ func (s *Shell) handleLocalMkdir(args []string) {
 	}
 }
 
-func (s *Shell) handleRm(args []string) {
+func (s *Shell) handleRm(ctx context.Context, args []string) {
 	args, localForce := parseForceFlag(args)
 	force := localForce
 	if s.client != nil {
@@ -729,17 +739,17 @@ func (s *Shell) handleRm(args []string) {
 				continue
 			}
 		}
-		s.removeOne(p, useShellShortcut)
+		s.removeOne(ctx, p, useShellShortcut)
 	}
 }
 
 // removeOne 删除单个远程路径
 // useShellShortcut 为 true 时优先尝试远程 shell 命令 (rm -rf)，
 // 失败回退到 SFTP 协议操作；为 false 时直接走 SFTP 协议
-func (s *Shell) removeOne(p string, useShellShortcut bool) {
+func (s *Shell) removeOne(ctx context.Context, p string, useShellShortcut bool) {
 	if useShellShortcut {
 		cmd := fmt.Sprintf("rm -rf '%s'", strings.ReplaceAll(p, "'", "'\\''"))
-		_, err := s.client.sshClient.Run(context.Background(), cmd)
+		_, err := s.client.sshClient.Run(ctx, cmd)
 		if err == nil {
 			return
 		}
@@ -783,7 +793,7 @@ func (s *Shell) handleLocalRm(args []string) {
 	}
 }
 
-func (s *Shell) handleCp(args []string) {
+func (s *Shell) handleCp(ctx context.Context, args []string) {
 	args, localForce := parseForceFlag(args)
 	force := localForce
 	if s.client != nil {
@@ -826,7 +836,7 @@ func (s *Shell) handleCp(args []string) {
 		copied := false
 		if !hasWildcard(args[0]) && len(srcs) == 1 {
 			cmd := fmt.Sprintf("cp -r '%s' '%s'", strings.ReplaceAll(src, "'", "'\\''"), strings.ReplaceAll(finalDst, "'", "'\\''"))
-			if _, err := s.client.sshClient.Run(context.Background(), cmd); err == nil {
+			if _, err := s.client.sshClient.Run(ctx, cmd); err == nil {
 				copied = true
 			}
 		}
@@ -879,7 +889,7 @@ func (s *Shell) remoteCopySFTP(src, dst string) error {
 	return err
 }
 
-func (s *Shell) handleMv(args []string) {
+func (s *Shell) handleMv(ctx context.Context, args []string) {
 	args, localForce := parseForceFlag(args)
 	force := localForce
 	if s.client != nil {
@@ -918,7 +928,7 @@ func (s *Shell) handleMv(args []string) {
 		moved := false
 		if !hasWildcard(args[0]) && len(srcs) == 1 {
 			cmd := fmt.Sprintf("mv '%s' '%s'", strings.ReplaceAll(src, "'", "'\\''"), strings.ReplaceAll(finalDst, "'", "'\\''"))
-			if _, err := s.client.sshClient.Run(context.Background(), cmd); err == nil {
+			if _, err := s.client.sshClient.Run(ctx, cmd); err == nil {
 				moved = true
 			}
 		}

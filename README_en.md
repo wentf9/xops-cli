@@ -21,7 +21,7 @@
 
 - 🤖 **AI-Native (MCP Server)**: Built-in Model Context Protocol server with security guardrails, risk assessment, and policy controls. Let AI Agents manage your servers safely.
 - 🛡️ **Advanced SSH & TUI**: Fully OpenSSH-compatible (JumpHosts, Tunnels, Agent Forwarding). Includes a beautiful **Terminal UI (TUI)** for interactive management and an automated `sudo` mode.
-- ⚡ **Batch Execution & Transfer**: Run commands or local scripts in parallel across multiple servers using tags. Effortless file distribution with built-in SCP/SFTP.
+- ⚡ **Batch Execution & Transfer**: Run commands or local scripts in parallel across multiple servers using tags. Effortless file distribution with built-in SCP/SFTP. The interactive SFTP shell features connection keepalive and automatic disconnect detection, exiting gracefully when the network drops.
 - 🔄 **Declarative Orchestration (Playbook)**: YAML-based task orchestration combining shell, script, copy, ensure (idempotent state convergence), and template steps, with concurrency control and error handling strategies.
 - 🗂️ **Encrypted Inventory**: Manage hosts, credentials (Identities), and tags with AES encryption. Supports bulk import/export via CSV.
 - 🌐 **Network & Sec Tools**: Integrated DNS lookup, Ping, Netcat (nc), Base64/Hex encoding, and a unified **Firewall Manager** (supports firewalld, ufw, iptables, nftables).

@@ -21,7 +21,7 @@
 
 - 🤖 **AI 原生 (MCP 服务端)**: 内置 Model Context Protocol 服务端，包含完整的安全护栏、风险评估和策略控制。让 AI 助手安全地替你管理服务器。
 - 🛡️ **SSH 增强与 TUI**: 完全兼容 OpenSSH (支持跳板机 JumpHost、隧道、Agent 转发)。内置精美的 **TUI (终端用户界面)**，并支持自动 Sudo 提权模式。
-- ⚡ **批量执行与传输**: 基于标签 (Tags) 对多台主机并行执行命令或本地脚本。内置 SCP/SFTP 支持，轻松实现文件批量分发。
+- ⚡ **批量执行与传输**: 基于标签 (Tags) 对多台主机并行执行命令或本地脚本。内置 SCP/SFTP 支持，轻松实现文件批量分发。交互式 SFTP shell 具备连接保活 (KeepAlive) 与断线自动检测，网络中断后自动退出。
 - 🔄 **声明式任务编排 (Playbook)**: 支持 YAML 格式的任务编排，组合 shell、script、copy、ensure (幂等性状态收敛) 和 template 步骤，支持并发控制与失败策略。
 - 🗂️ **加密资产管理**: 本地统一管理主机、凭据 (Identity) 和标签，敏感信息(密码/私钥)采用 AES 加密存储。支持通过 CSV 模板批量导入导出。
 - 🌐 **网络与安全工具**: 集成 DNS 查询、Ping、Netcat (nc)、Base64/Hex 编码转换，以及统一的**防火墙管理器** (自动适配 firewalld, ufw, iptables, nftables)。
