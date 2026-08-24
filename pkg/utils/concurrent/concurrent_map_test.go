@@ -261,3 +261,72 @@ func TestWithShardCount(t *testing.T) {
 		t.Errorf("custom shard count: Get(test) = (%d, %v), want (1, true)", v, ok)
 	}
 }
+
+func TestRemoveIfMatch(t *testing.T) {
+	m := newTestMap()
+	m.Set("k", 1)
+
+	// 值匹配：删除成功
+	if !RemoveIfMatch(m, "k", 1) {
+		t.Error("RemoveIfMatch with matching value should return true")
+	}
+	if _, ok := m.Get("k"); ok {
+		t.Error("key should be removed when value matches")
+	}
+
+	// 值不匹配：不删除
+	m.Set("k", 2)
+	if RemoveIfMatch(m, "k", 1) {
+		t.Error("RemoveIfMatch with stale value should return false")
+	}
+	if v, ok := m.Get("k"); !ok || v != 2 {
+		t.Errorf("current value must survive stale RemoveIfMatch, got (%d, %v)", v, ok)
+	}
+
+	// key 不存在：返回 false
+	if RemoveIfMatch(m, "absent", 1) {
+		t.Error("RemoveIfMatch on missing key should return false")
+	}
+}
+
+// TestRemoveIfMatch_ConcurrentReplace 验证条件删除与并发写入竞争时不会误删新值
+func TestRemoveIfMatch_ConcurrentReplace(t *testing.T) {
+	m := newTestMap()
+	const oldValue, newValue = 1, 2
+	m.Set("k", oldValue)
+
+	replaced := make(chan struct{})
+	removed := make(chan bool, 1)
+	go func() {
+		<-replaced // 确保并发写入完成后，再用旧值尝试条件删除
+		removed <- RemoveIfMatch(m, "k", oldValue)
+	}()
+
+	m.Set("k", newValue) // 模拟并发重连替换
+	close(replaced)
+
+	if <-removed {
+		t.Error("RemoveIfMatch must not delete when value was concurrently replaced")
+	}
+	if v, ok := m.Get("k"); !ok || v != newValue {
+		t.Errorf("expected new value %d to survive, got (%d, %v)", newValue, v, ok)
+	}
+}
+
+// TestRemoveIfMatch_ConcurrentStress 并发读写同一 key，配合 -race 验证无数据竞争
+func TestRemoveIfMatch_ConcurrentStress(t *testing.T) {
+	m := newTestMap()
+	var wg sync.WaitGroup
+	for i := range 100 {
+		wg.Add(2)
+		go func(v int) {
+			defer wg.Done()
+			m.Set("k", v)
+		}(i)
+		go func(v int) {
+			defer wg.Done()
+			RemoveIfMatch(m, "k", v)
+		}(i)
+	}
+	wg.Wait()
+}

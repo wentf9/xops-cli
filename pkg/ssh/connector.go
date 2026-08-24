@@ -32,6 +32,26 @@ type Connector struct {
 	// 当节点的 ClientConfig.PasswordPromptPattern 为空时，使用此值；
 	// 两者均为空则使用内置的 DefaultPasswordPromptPattern。
 	PasswordPromptPattern string
+
+	// kaMu 保护 keepAliveCfg 的启用/关闭（keepAlives 自带分片锁，无需 kaMu）
+	kaMu sync.Mutex
+	// keepAliveCfg 为 nil 表示未启用周期心跳（CLI 短生命周期命令默认不启用）
+	keepAliveCfg *keepAliveConfig
+	// keepAlives 心跳注册表：nodeName -> 运行中的心跳条目
+	keepAlives *concurrent.Map[string, *keepAliveEntry]
+}
+
+// keepAliveConfig 描述 Connector 级心跳配置（见 EnableKeepAlive）
+type keepAliveConfig struct {
+	ctx               context.Context // 根心跳 ctx，取消后级联终止所有 per-node 心跳
+	cancel            context.CancelFunc
+	interval, timeout time.Duration
+}
+
+// keepAliveEntry 单个连接的心跳注册条目
+type keepAliveEntry struct {
+	cancel context.CancelFunc // per-node ctx 的取消函数
+	client *ssh.Client        // 心跳目标，用于驱逐时指针比对防止误删新连接
 }
 
 var hostKeyPromptMutex sync.Mutex
@@ -39,9 +59,10 @@ var hostKeyPromptMutex sync.Mutex
 // NewConnector 创建一个新的 Connector
 func NewConnector(store ConfigStore, ui InteractionHandler) *Connector {
 	return &Connector{
-		store:   store,
-		ui:      ui,
-		clients: concurrent.NewMap[string, *ssh.Client](concurrent.HashString),
+		store:      store,
+		ui:         ui,
+		clients:    concurrent.NewMap[string, *ssh.Client](concurrent.HashString),
+		keepAlives: concurrent.NewMap[string, *keepAliveEntry](concurrent.HashString),
 	}
 }
 
@@ -132,8 +153,74 @@ func (c *Connector) initializeConnection(ctx context.Context, nodeName string) (
 	}
 
 	c.clients.Set(nodeName, rawClient)
+	c.startKeepAliveFor(nodeName, rawClient)
 	// 返回封装的 Client
 	return newClient(rawClient, cfg, c.store, c.PasswordPromptPattern), nil
+}
+
+// EnableKeepAlive 启用连接池周期心跳（opt-in，幂等）。
+// 启用后所有新入池的连接（含 ProxyJump 跳板机连接）会挂载周期性 keepalive 探测：
+// 探测失败或超时即关闭连接并从池中驱逐，下次 Connect 自动重建。
+// interval/timeout 传非正值时回退到 DefaultKeepAliveInterval/DefaultKeepAliveTimeout。
+// 生命周期绑定 CloseAll：调用 CloseAll 会级联终止全部心跳 goroutine；
+// CloseAll 之后心跳不会自动恢复（仅对启用后入池的连接生效，存量连接不补挂）。
+// 适用于 MCP server 等长驻进程；CLI 短生命周期命令无需启用（Connect 的缓存探测已兜底）。
+func (c *Connector) EnableKeepAlive(ctx context.Context, interval, timeout time.Duration) {
+	if interval <= 0 {
+		interval = DefaultKeepAliveInterval
+	}
+	if timeout <= 0 {
+		timeout = DefaultKeepAliveTimeout
+	}
+	c.kaMu.Lock()
+	defer c.kaMu.Unlock()
+	if c.keepAliveCfg != nil {
+		return
+	}
+	derivedCtx, cancel := context.WithCancel(ctx)
+	c.keepAliveCfg = &keepAliveConfig{
+		ctx:      derivedCtx,
+		cancel:   cancel,
+		interval: interval,
+		timeout:  timeout,
+	}
+}
+
+// startKeepAliveFor 为入池连接挂载心跳；未启用心跳时为 no-op。
+// 全程持有 kaMu：与 CloseAll（cancel 根 ctx + 清空注册表）完全互斥，
+// 杜绝"读到 cfg 后、写入注册表前"窗口内 CloseAll 先行清空导致的孤儿注册条目。
+// 同节点重连时先取消旧心跳，避免同一节点存在多个心跳 goroutine。
+// 锁序恒为 kaMu -> keepAlives 分片锁，evictDeadClient 不取 kaMu，无死锁风险
+func (c *Connector) startKeepAliveFor(nodeName string, client *ssh.Client) {
+	c.kaMu.Lock()
+	defer c.kaMu.Unlock()
+	cfg := c.keepAliveCfg
+	if cfg == nil {
+		return
+	}
+
+	// 终止同节点旧心跳（入池点在 singleflight 保护内，无并发冲突）
+	if old, ok := c.keepAlives.Pop(nodeName); ok {
+		old.cancel()
+	}
+
+	nodeCtx, cancel := context.WithCancel(cfg.ctx)
+	entry := &keepAliveEntry{
+		cancel: cancel,
+		client: client,
+	}
+	c.keepAlives.Set(nodeName, entry)
+	StartKeepAlive(nodeCtx, client, cfg.interval, cfg.timeout, func(error) {
+		c.evictDeadClient(nodeName, client, entry)
+	})
+}
+
+// evictDeadClient 心跳失败后的池驱逐（StartKeepAlive 已 Close 该连接）。
+// 使用 RemoveIfMatch 原子"比对并删除"：仅当池/注册表中仍是失败连接本人时才驱逐，
+// 防止"读取-比对-删除"间隙内并发重连写入新连接后被旧心跳误删
+func (c *Connector) evictDeadClient(nodeName string, dead *ssh.Client, entry *keepAliveEntry) {
+	concurrent.RemoveIfMatch(c.clients, nodeName, dead)
+	concurrent.RemoveIfMatch(c.keepAlives, nodeName, entry)
 }
 
 func (c *Connector) setupDialer(ctx context.Context, cfg *ClientConfig) (Dialer, error) {
@@ -175,6 +262,16 @@ func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, cfg *
 
 // CloseAll 关闭所有缓存的连接 (在程序退出前调用)
 func (c *Connector) CloseAll() {
+	// 先取消根心跳 ctx 级联终止全部心跳 goroutine，再清理注册表；
+	// Clear 在 clients.IterCb 之外调用，避免 concurrent.Map 分片死锁
+	c.kaMu.Lock()
+	if c.keepAliveCfg != nil {
+		c.keepAliveCfg.cancel()
+		c.keepAliveCfg = nil
+	}
+	c.kaMu.Unlock()
+	c.keepAlives.Clear()
+
 	c.clients.IterCb(func(name string, client *ssh.Client) bool {
 		_ = client.Close()
 		return true

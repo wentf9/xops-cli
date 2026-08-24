@@ -18,12 +18,10 @@ import (
 	"github.com/wentf9/xops-cli/pkg/ssh"
 )
 
-// sftp shell 连接监控参数：
-// 心跳间隔 15s，与 OpenSSH ServerAliveInterval 默认推荐值一致；
-// 单次探测超时 10s，超时即判定网络不可达（覆盖网络黑洞场景）
+// sftp shell 连接监控参数：复用 pkg/ssh 层默认值（定义见 keepalive.go）
 const (
-	sftpKeepAliveInterval = 15 * time.Second
-	sftpKeepAliveTimeout  = 10 * time.Second
+	sftpKeepAliveInterval = ssh.DefaultKeepAliveInterval
+	sftpKeepAliveTimeout  = ssh.DefaultKeepAliveTimeout
 )
 
 type SftpOptions struct {

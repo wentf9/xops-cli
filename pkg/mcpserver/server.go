@@ -80,6 +80,11 @@ func newMCPConnector(provider config.ConfigProvider) *ssh.Connector {
 	if cfg := provider.GetConfig(); cfg != nil {
 		conn.PasswordPromptPattern = cfg.PasswordPromptPattern
 	}
+	// MCP server 为长驻进程，启用周期心跳主动感知空闲连接断连并驱逐，
+	// 下次工具调用自动重建。传 Background 是因为 getMCPConnector 惰性创建
+	// 拿不到 Serve 的 ctx；Serve 的两条退出路径（signal 取消 / stdio EOF）
+	// 均会执行 Serve 末尾的 CloseAll，心跳清理由 CloseAll 兜底
+	conn.EnableKeepAlive(context.Background(), ssh.DefaultKeepAliveInterval, ssh.DefaultKeepAliveTimeout)
 	return conn
 }
 

@@ -291,6 +291,22 @@ func (m *Map[K, V]) Pop(key K) (V, bool) {
 	return val, ok
 }
 
+// RemoveIfMatch 原子的"比较并删除"：仅当 key 当前对应的值与 expected 相等（== 比较）时才删除。
+// 用于防止"读取-比对-删除"三步之间被并发写替换后误删新值的竞态。
+// 返回是否实际发生了删除。要求 V 可比较（如指针类型）
+func RemoveIfMatch[K comparable, V comparable](m *Map[K, V], key K, expected V) bool {
+	shard := m.getShard(key)
+	shard.Lock()
+	defer shard.Unlock()
+
+	current, ok := shard.items[key]
+	if !ok || current != expected {
+		return false
+	}
+	delete(shard.items, key)
+	return true
+}
+
 // Upsert 提供原子性的“读取-修改-回写”操作
 // cb: 回调函数，参数是 (是否存在, 旧值)。返回值将作为新值写入 Map。
 // 返回值: 最终写入 Map 的新值

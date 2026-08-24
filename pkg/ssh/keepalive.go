@@ -12,6 +12,13 @@ import (
 // errKeepaliveTimeout 心跳请求在超时时间内未收到服务器响应
 var errKeepaliveTimeout = errors.New("keepalive probe timed out")
 
+// 心跳默认参数：间隔 15s 对齐 OpenSSH ServerAliveInterval 推荐值；
+// 单次探测超时 10s，超时即判定网络不可达（覆盖网络黑洞场景）
+const (
+	DefaultKeepAliveInterval = 15 * time.Second
+	DefaultKeepAliveTimeout  = 10 * time.Second
+)
+
 // StartKeepAlive 开启一个协程，定期向 SSH Server 发送心跳
 // ctx: 用于控制协程退出的上下文
 // client: 目标 SSH 客户端
