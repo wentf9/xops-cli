@@ -13,6 +13,7 @@ func newKeepAliveTestConnector(t *testing.T, interval, timeout time.Duration) *C
 	t.Helper()
 	c := NewConnector(&mockConfigStore{}, &mockUI{})
 	c.EnableKeepAlive(context.Background(), interval, timeout)
+	t.Cleanup(c.CloseAll)
 	return c
 }
 
@@ -213,15 +214,13 @@ func TestConnector_EnableKeepAlive_Idempotent(t *testing.T) {
 	c.kaMu.Lock()
 	interval := c.keepAliveCfg.interval
 	timeout := c.keepAliveCfg.timeout
-	cancel := c.keepAliveCfg.cancel
 	c.kaMu.Unlock()
 
 	if interval != 15*time.Second || timeout != 10*time.Second {
 		t.Errorf("expected first EnableKeepAlive params to win (15s/10s), got %v/%v", interval, timeout)
 	}
 
-	// 取消根 ctx 释放资源
-	cancel()
+	c.CloseAll()
 }
 
 // TestConnector_EnableKeepAlive_DefaultsOnInvalidParams 验证非正参数回退到默认值
@@ -232,7 +231,6 @@ func TestConnector_EnableKeepAlive_DefaultsOnInvalidParams(t *testing.T) {
 	c.kaMu.Lock()
 	interval := c.keepAliveCfg.interval
 	timeout := c.keepAliveCfg.timeout
-	cancel := c.keepAliveCfg.cancel
 	c.kaMu.Unlock()
 
 	if interval != DefaultKeepAliveInterval {
@@ -241,7 +239,126 @@ func TestConnector_EnableKeepAlive_DefaultsOnInvalidParams(t *testing.T) {
 	if timeout != DefaultKeepAliveTimeout {
 		t.Errorf("expected timeout fallback to %v, got %v", DefaultKeepAliveTimeout, timeout)
 	}
-	cancel()
+	c.CloseAll()
+}
+
+func TestConnector_EnableKeepAlive_ContextCancelCleansStateAndAllowsReenable(t *testing.T) {
+	c := NewConnector(&mockConfigStore{}, &mockUI{})
+	rootCtx, cancelRoot := context.WithCancel(context.Background())
+	c.EnableKeepAlive(rootCtx, time.Hour, time.Second)
+
+	client := startHealthyServer(t)
+	c.clients.Set("node-1", client)
+	c.startKeepAliveFor("node-1", client)
+	if c.keepAlives.Count() != 1 {
+		t.Fatalf("expected one keepalive entry before cancellation, got %d", c.keepAlives.Count())
+	}
+
+	cancelRoot()
+	deadline := time.Now().Add(time.Second)
+	for {
+		c.kaMu.Lock()
+		cfgCleared := c.keepAliveCfg == nil
+		c.kaMu.Unlock()
+		if cfgCleared && c.keepAlives.Count() == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("keepalive state was not cleaned after root context cancellation")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	c.EnableKeepAlive(context.Background(), 2*time.Hour, 2*time.Second)
+	c.kaMu.Lock()
+	reenabled := c.keepAliveCfg != nil && c.keepAliveCfg.interval == 2*time.Hour
+	c.kaMu.Unlock()
+	if !reenabled {
+		t.Fatal("keepalive could not be re-enabled after root context cancellation")
+	}
+	c.startKeepAliveFor("node-1", client)
+	if c.keepAlives.Count() != 1 {
+		t.Fatalf("expected one keepalive entry after re-enable, got %d", c.keepAlives.Count())
+	}
+	c.CloseAll()
+}
+
+// TestConnector_Connect_CachedProbeHasTimeout 验证 Connect 的缓存探测复用心跳超时，
+// 不会因服务端不响应全局请求而无限阻塞。
+func TestConnector_Connect_CachedProbeHasTimeout(t *testing.T) {
+	listener, serverConfig := startKeepAliveTestSSHServer(t)
+	defer func() { _ = listener.Close() }()
+
+	requestSeen := make(chan struct{})
+	releaseServer := make(chan struct{})
+	defer close(releaseServer)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		sConn, _, reqs, err := ssh.NewServerConn(conn, serverConfig)
+		if err != nil {
+			_ = conn.Close()
+			return
+		}
+		defer func() { _ = sConn.Close() }()
+		for range reqs {
+			close(requestSeen)
+			<-releaseServer
+			return
+		}
+	}()
+
+	cachedClient := dialKeepAliveTestClient(t, listener.Addr().String())
+	store := &mockConfigStore{cfg: &ClientConfig{
+		NodeID:   "node-1",
+		Address:  "127.0.0.1",
+		Port:     1,
+		User:     "test",
+		AuthType: "password",
+		Password: "test",
+	}}
+	connector := NewConnector(store, &mockUI{})
+	connector.EnableKeepAlive(context.Background(), time.Hour, 100*time.Millisecond)
+	connector.clients.Set("node-1", cachedClient)
+	defer connector.CloseAll()
+
+	started := time.Now()
+	_, err := connector.Connect(context.Background(), "node-1")
+	if err == nil {
+		t.Fatal("expected reconnect to fail after cached probe timeout")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Errorf("cached probe exceeded bounded timeout: %v", elapsed)
+	}
+	select {
+	case <-requestSeen:
+	default:
+		t.Error("server did not observe cached keepalive probe")
+	}
+}
+
+func TestConnector_CloseAllConcurrentCallsAreIdempotent(t *testing.T) {
+	c := newKeepAliveTestConnector(t, time.Hour, time.Second)
+	client := startHealthyServer(t)
+	c.clients.Set("node-1", client)
+	c.startKeepAliveFor("node-1", client)
+
+	done := make(chan struct{}, 2)
+	for range 2 {
+		go func() {
+			c.CloseAll()
+			done <- struct{}{}
+		}()
+	}
+	for range 2 {
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("concurrent CloseAll call did not return")
+		}
+	}
 }
 
 // TestConnector_KeepAlive_StartAfterCloseAllIsNoop 验证 CloseAll 之后入池连接不再挂载心跳

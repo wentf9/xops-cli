@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -13,6 +14,7 @@ import (
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
+	"github.com/wentf9/xops-cli/pkg/logger"
 	"github.com/wentf9/xops-cli/pkg/models"
 	"github.com/wentf9/xops-cli/pkg/sftp"
 	"github.com/wentf9/xops-cli/pkg/ssh"
@@ -23,6 +25,15 @@ const (
 	sftpKeepAliveInterval = ssh.DefaultKeepAliveInterval
 	sftpKeepAliveTimeout  = ssh.DefaultKeepAliveTimeout
 )
+
+var errSFTPConnectionLost = errors.New("SSH connection lost")
+
+func sftpConnectionLostError(waitErr error) error {
+	if waitErr == nil {
+		return errSFTPConnectionLost
+	}
+	return fmt.Errorf("%w: %w", errSFTPConnectionLost, waitErr)
+}
 
 type SftpOptions struct {
 	SshOptions
@@ -102,6 +113,7 @@ func (o *SftpOptions) Run() error {
 	if err != nil {
 		return fmt.Errorf("%s: %w", i18n.T("err_connect_failed"), err)
 	}
+	defer connector.CloseAll()
 	if idAfter, _ := provider.GetIdentity(nodeID); idBefore.Password != idAfter.Password || idBefore.Passphrase != idAfter.Passphrase {
 		updated = true
 	}
@@ -115,27 +127,47 @@ func (o *SftpOptions) Run() error {
 	if err != nil {
 		return fmt.Errorf("%s: %w", i18n.T("err_connect_failed"), err)
 	}
-	defer func() { _ = sftpClient.Close() }()
-	defer func() { _ = client.Close() }()
-
 	// 连接监控：
 	// 1. KeepAlive 心跳探测网络黑洞型断连（探测失败或超时会关闭底层 SSH 连接）
 	// 2. Wait watcher 感知任何原因的连接关闭（服务端断开 / 心跳主动 Close），
-	//    连接断开后取消 runCtx 并提示用户，sftp shell 在下一次交互后自动退出
+	//    连接断开后取消 runCtx、唤醒交互 Prompt 并自动退出
 	runCtx, runCancel := context.WithCancel(context.Background())
 	defer runCancel()
 
-	ssh.StartKeepAlive(runCtx, client.SSHClient(), sftpKeepAliveInterval, sftpKeepAliveTimeout, nil)
-
+	keepAliveDone := ssh.StartKeepAlive(runCtx, client.SSHClient(), sftpKeepAliveInterval, sftpKeepAliveTimeout, nil)
 	shellDone := make(chan struct{})
+	watcherDone := make(chan struct{})
+	disconnectErr := make(chan error, 1)
+	var shellDoneOnce sync.Once
+	markShellDone := func() {
+		shellDoneOnce.Do(func() { close(shellDone) })
+	}
+	defer func() {
+		markShellDone()
+		runCancel()
+		if closeErr := sftpClient.Close(); closeErr != nil {
+			logger.Warnf("close SFTP client failed: %v", closeErr)
+		}
+		if closeErr := client.Close(); closeErr != nil {
+			logger.Warnf("close SSH client after SFTP shell failed: %v", closeErr)
+		}
+		<-keepAliveDone
+		<-watcherDone
+	}()
+
 	go func() {
+		defer close(watcherDone)
 		waitErr := client.SSHClient().Wait()
 		select {
 		case <-shellDone:
 			// shell 已正常退出（用户输入 exit/bye），连接关闭属于预期清理，无需提示
-		case <-time.After(100 * time.Millisecond):
+		default:
 			// shell 仍在运行，说明是异常断连
-			fmt.Fprintf(os.Stderr, "%s\n", i18n.Tf("sftp_conn_lost", map[string]any{"Error": waitErr}))
+			connectionErr := sftpConnectionLostError(waitErr)
+			disconnectErr <- connectionErr
+			if _, printErr := fmt.Fprintf(os.Stderr, "%s\n", i18n.Tf("sftp_conn_lost", map[string]any{"Error": connectionErr})); printErr != nil {
+				logger.Warnf("print SFTP disconnect notice failed: %v", printErr)
+			}
 			runCancel()
 		}
 	}()
@@ -144,18 +176,18 @@ func (o *SftpOptions) Run() error {
 	// 使用 os.Stdin, os.Stdout 绑定到当前终端
 	shell, err := sftpClient.NewShell(os.Stdin, os.Stdout, os.Stderr)
 	if err != nil {
-		close(shellDone)
+		markShellDone()
 		return fmt.Errorf("%s: %w", i18n.T("sftp_shell_create_failed"), err)
 	}
 	if err := shell.Run(runCtx); err != nil {
-		close(shellDone)
+		markShellDone()
 		if errors.Is(err, context.Canceled) {
-			// 连接已断开，提示已由 watcher 打印，此处静默退出
-			return nil
+			// runCtx 仅由连接 watcher 取消；错误已在取消前写入带缓冲通道。
+			return fmt.Errorf("%s: %w", i18n.T("sftp_shell_start_failed"), <-disconnectErr)
 		}
 		return fmt.Errorf("%s: %w", i18n.T("sftp_shell_start_failed"), err)
 	}
-	close(shellDone)
+	markShellDone()
 	if updated {
 		if err := configStore.Save(cfg); err != nil {
 			return fmt.Errorf("%s: %w", i18n.T("save_config_failed"), err)

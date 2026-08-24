@@ -76,7 +76,7 @@ func TestProbeWithTimeout_Success(t *testing.T) {
 	client := dialKeepAliveTestClient(t, listener.Addr().String())
 	defer func() { _ = client.Close() }()
 
-	err := probeWithTimeout(client, 2*time.Second)
+	err := probeWithTimeout(context.Background(), client, 2*time.Second)
 	if err != nil {
 		t.Errorf("expected nil error on healthy connection, got %v", err)
 	}
@@ -112,7 +112,7 @@ func TestProbeWithTimeout_Timeout(t *testing.T) {
 	client := dialKeepAliveTestClient(t, listener.Addr().String())
 	defer func() { _ = client.Close() }()
 
-	err := probeWithTimeout(client, 200*time.Millisecond)
+	err := probeWithTimeout(context.Background(), client, 200*time.Millisecond)
 	if err == nil {
 		t.Fatal("expected timeout error on unresponsive connection, got nil")
 	}
@@ -175,6 +175,9 @@ func TestStartKeepAlive_ContextCancel(t *testing.T) {
 	listener, serverConfig := startKeepAliveTestSSHServer(t)
 	defer func() { _ = listener.Close() }()
 
+	requestSeen := make(chan struct{})
+	releaseServer := make(chan struct{})
+	defer close(releaseServer)
 	go func() {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -186,7 +189,14 @@ func TestStartKeepAlive_ContextCancel(t *testing.T) {
 			return
 		}
 		defer func() { _ = sConn.Close() }()
-		go ssh.DiscardRequests(reqs)
+		go func() {
+			for req := range reqs {
+				close(requestSeen)
+				<-releaseServer
+				_ = req.Reply(true, nil)
+				return
+			}
+		}()
 		for range chans {
 		}
 	}()
@@ -197,17 +207,39 @@ func TestStartKeepAlive_ContextCancel(t *testing.T) {
 	fallbackCalled := make(chan error, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 
-	StartKeepAlive(ctx, client, 10*time.Second, 2*time.Second, func(err error) {
+	done := StartKeepAlive(ctx, client, 10*time.Millisecond, 2*time.Second, func(err error) {
 		fallbackCalled <- err
 	})
 
-	// 立即取消 ctx，心跳协程应在下个 tick 前退出
+	select {
+	case <-requestSeen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("keepalive request was not observed by server")
+	}
+
+	// 在 SendRequest 阻塞期间取消，必须关闭连接、退出 goroutine，且不触发失败回调。
 	cancel()
 
 	select {
-	case err := <-fallbackCalled:
-		t.Errorf("fallback should not be called after ctx cancel, got %v", err)
-	case <-time.After(300 * time.Millisecond):
-		// 预期路径：无回调
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("keepalive goroutine did not exit after context cancellation")
+	}
+	select {
+	case callbackErr := <-fallbackCalled:
+		t.Errorf("fallback should not be called after ctx cancel, got %v", callbackErr)
+	default:
+	}
+}
+
+func TestStartKeepAlive_DefaultsInvalidDurations(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	client := &ssh.Client{}
+	done := StartKeepAlive(ctx, client, 0, -time.Second, nil)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("keepalive goroutine did not exit with normalized durations")
 	}
 }

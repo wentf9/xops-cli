@@ -10,12 +10,14 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
 
-	"github.com/peterh/liner"
+	"github.com/chzyer/readline"
 	"github.com/schollz/progressbar/v3"
 	"github.com/wentf9/xops-cli/pkg/i18n"
+	"github.com/wentf9/xops-cli/pkg/logger"
 	"golang.org/x/term"
 )
 
@@ -24,15 +26,23 @@ type Shell struct {
 	client         *Client
 	cwd            string
 	localCwd       string
-	line           *liner.State
-	historyFile    string // 用于退出时保存历史
+	stdin          io.Reader
+	lineMu         sync.Mutex
+	line           *lineEditor
+	historyFile    string // readline 历史记录文件
 	stdout         io.Writer
 	stderr         io.Writer
 	askConfirmHook func(prompt string) bool
 }
 
-// NewShell 创建一个新的交互式 Shell
+// NewShell 创建一个新的交互式 Shell。
+// stdin 为 *os.File 时会复制文件描述符，使断线取消能够只关闭 Shell 自己的输入副本，
+// 不影响进程级标准输入或其他终端使用者；其他输入必须实现 io.ReadCloser，且其生命周期
+// 由 Shell 接管，以确保取消能够唤醒阻塞读取。
 func (c *Client) NewShell(stdin io.Reader, stdout, stderr io.Writer) (*Shell, error) {
+	if stdin == nil {
+		return nil, fmt.Errorf("SFTP shell stdin is nil")
+	}
 	cwd, err := c.sftpClient.Getwd()
 	if err != nil {
 		cwd = "."
@@ -42,63 +52,69 @@ func (c *Client) NewShell(stdin io.Reader, stdout, stderr io.Writer) (*Shell, er
 		localCwd = "."
 	}
 
-	// 初始化 liner
-	line := liner.NewLiner()
-	line.SetCtrlCAborts(true) // 允许 Ctrl+C 中断提示
-
-	// 读取历史记录
+	// readline 会按 HistoryFile 自动加载历史，写入由 Run 显式检查错误。
 	homeDir, _ := os.UserHomeDir()
 	historyFile := ""
 	if homeDir != "" {
 		historyFile = filepath.Join(homeDir, ".xops_sftp_history")
-		if f, err := os.Open(historyFile); err == nil {
-			_, _ = line.ReadHistory(f)
-			_ = f.Close()
-		}
 	}
 
 	shell := &Shell{
 		client:      c,
 		cwd:         cwd,
 		localCwd:    localCwd,
-		line:        line,
+		stdin:       stdin,
 		historyFile: historyFile,
 		stdout:      stdout,
 		stderr:      stderr,
 	}
-
-	// 绑定自动补全：TabPrints 模式 — 第一次 Tab 补全公共前缀，第二次 Tab 列出所有候选（bash 行为）
-	line.SetTabCompletionStyle(liner.TabPrints)
-	line.SetWordCompleter(shell.wordCompleter)
+	if err := shell.resetLineEditor(); err != nil {
+		return nil, err
+	}
 
 	return shell, nil
 }
 
 // Run 启动交互式循环 (REPL)
-func (s *Shell) Run(ctx context.Context) error {
-	defer func() {
-		// 退出时保存历史记录
-		if s.historyFile != "" {
-			if f, err := os.Create(s.historyFile); err == nil {
-				_, _ = s.line.WriteHistory(f)
-				_ = f.Close()
-			}
+func (s *Shell) Run(ctx context.Context) (runErr error) {
+	runDone := make(chan struct{})
+	watcherDone := make(chan error, 1)
+	go func() {
+		select {
+		case <-ctx.Done():
+			watcherDone <- s.interruptLineEditor()
+		case <-runDone:
+			watcherDone <- nil
 		}
-		_ = s.line.Close()
+	}()
+	defer func() {
+		close(runDone)
+		if watcherErr := <-watcherDone; watcherErr != nil {
+			runErr = combineShellErrors(runErr, fmt.Errorf("interrupt SFTP prompt failed: %w", watcherErr))
+		}
+		if closeErr := s.closeLineEditor(); closeErr != nil {
+			runErr = combineShellErrors(runErr, fmt.Errorf("close SFTP line editor failed: %w", closeErr))
+		}
 	}()
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		prompt := fmt.Sprintf("sftp:%s> ", s.cwd)
-		input, err := s.line.Prompt(prompt)
+		input, err := s.prompt(prompt)
 		if err != nil {
-			if errors.Is(err, liner.ErrPromptAborted) {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if errors.Is(err, readline.ErrInterrupt) {
 				// Ctrl+C 拦截：若连接已断开则直接退出，否则继续等待输入
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
 				continue
 			}
-			return nil // EOF 对应 Ctrl+D 或其他错误退出
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return fmt.Errorf("read SFTP prompt failed: %w", err)
 		}
 
 		// 连接已断开（keepalive 失败或服务端关闭）时不再执行命令，直接退出，
@@ -112,7 +128,9 @@ func (s *Shell) Run(ctx context.Context) error {
 			continue
 		}
 
-		s.line.AppendHistory(input) // 动态加入历史
+		if err := s.appendHistory(input); err != nil {
+			logger.Warnf("save SFTP shell history failed: %v", err)
+		}
 
 		// ! 前缀：本地执行快捷方式（如 `!ls` 或 `! ls -la`）
 		if strings.HasPrefix(input, "!") {
@@ -136,6 +154,13 @@ func (s *Shell) Run(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
+}
+
+func combineShellErrors(primary, secondary error) error {
+	if primary == nil {
+		return secondary
+	}
+	return fmt.Errorf("%w; %w", primary, secondary)
 }
 
 func (s *Shell) dispatchCommand(ctx context.Context, cmd string, params []string) (bool, error) {
@@ -1087,12 +1112,12 @@ func (s *Shell) askConfirmation(prompt string) bool {
 	if s.askConfirmHook != nil {
 		return s.askConfirmHook(prompt)
 	}
-	if s.line == nil {
-		// 为了向后兼容已有测试（无 liner 状态且未设置 hook），默认返回 true 允许继续，避免崩溃
+	if s.currentLineEditor() == nil {
+		// 为了向后兼容已有测试（无 line editor 且未设置 hook），默认返回 true 允许继续，避免崩溃
 		return true
 	}
 	_, _ = fmt.Fprint(s.stdout, "\n")
-	input, err := s.line.Prompt(fmt.Sprintf("%s [y/N]: ", prompt))
+	input, err := s.prompt(fmt.Sprintf("%s [y/N]: ", prompt))
 	if err != nil {
 		return false
 	}
@@ -1102,11 +1127,17 @@ func (s *Shell) askConfirmation(prompt string) bool {
 
 // handleShell 进入远程交互式 shell（SSH PTY）
 func (s *Shell) handleShell(ctx context.Context) {
-	_ = s.line.Close()
+	if err := s.closeLineEditor(); err != nil {
+		logger.Warnf("close SFTP line editor before remote shell failed: %v", err)
+	}
 	if err := s.client.sshClient.Shell(ctx); err != nil {
 		_, _ = fmt.Fprintf(s.stderr, "shell: %v\n", err)
 	}
-	s.resetLiner()
+	if ctx.Err() == nil {
+		if err := s.resetLineEditor(); err != nil {
+			logger.Warnf("restore SFTP line editor after remote shell failed: %v", err)
+		}
+	}
 	_, _ = fmt.Fprintln(s.stdout, "")
 }
 
@@ -1162,28 +1193,82 @@ func (s *Shell) handleLexec(ctx context.Context, cmdStr string) {
 	c.Stderr = os.Stderr
 	c.Dir = s.localCwd
 
-	// liner 持有终端原始状态，运行前先将终端还原为普通模式，
+	// line editor 持有终端原始状态，运行前先将终端还原为普通模式，
 	// 退出后重新接管，避免 vim 退出后终端状态混乱
-	_ = s.line.Close()
+	if err := s.closeLineEditor(); err != nil {
+		logger.Warnf("close SFTP line editor before local command failed: %v", err)
+	}
 	err := c.Run()
-	s.resetLiner()
+	if ctx.Err() == nil {
+		if resetErr := s.resetLineEditor(); resetErr != nil {
+			logger.Warnf("restore SFTP line editor after local command failed: %v", resetErr)
+		}
+	}
 
 	if err != nil {
 		_, _ = fmt.Fprintf(s.stderr, "lexec: %v\n", err)
 	}
 }
 
-func (s *Shell) resetLiner() {
-	s.line = liner.NewLiner()
-	s.line.SetCtrlCAborts(true)
-	s.line.SetTabCompletionStyle(liner.TabPrints)
-	s.line.SetWordCompleter(s.wordCompleter)
-	if s.historyFile != "" {
-		if f, err := os.Open(s.historyFile); err == nil {
-			_, _ = s.line.ReadHistory(f)
-			_ = f.Close()
+func (s *Shell) currentLineEditor() *lineEditor {
+	s.lineMu.Lock()
+	defer s.lineMu.Unlock()
+	return s.line
+}
+
+func (s *Shell) prompt(prompt string) (string, error) {
+	editor := s.currentLineEditor()
+	if editor == nil {
+		return "", fmt.Errorf("SFTP line editor is not initialized")
+	}
+	return editor.Prompt(prompt)
+}
+
+func (s *Shell) appendHistory(input string) error {
+	editor := s.currentLineEditor()
+	if editor == nil {
+		return fmt.Errorf("SFTP line editor is not initialized")
+	}
+	if err := editor.AppendHistory(input); err != nil {
+		return fmt.Errorf("append SFTP shell history failed: %w", err)
+	}
+	return nil
+}
+
+func (s *Shell) interruptLineEditor() error {
+	editor := s.currentLineEditor()
+	if editor == nil {
+		return nil
+	}
+	return editor.Interrupt()
+}
+
+func (s *Shell) closeLineEditor() error {
+	s.lineMu.Lock()
+	editor := s.line
+	s.line = nil
+	s.lineMu.Unlock()
+	if editor == nil {
+		return nil
+	}
+	return editor.Close()
+}
+
+func (s *Shell) resetLineEditor() error {
+	editor, err := newLineEditor(s.stdin, s.stdout, s.stderr, s.historyFile, s)
+	if err != nil {
+		return fmt.Errorf("initialize SFTP line editor failed: %w", err)
+	}
+	s.lineMu.Lock()
+	oldEditor := s.line
+	s.line = editor
+	s.lineMu.Unlock()
+	if oldEditor != nil {
+		if err := oldEditor.Close(); err != nil {
+			return fmt.Errorf("close replaced SFTP line editor failed: %w", err)
 		}
 	}
+	return nil
 }
 
 func formatBytes(bytes int64) string {

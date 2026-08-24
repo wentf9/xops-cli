@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/wentf9/xops-cli/pkg/logger"
 	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
@@ -32,6 +33,14 @@ type Connector struct {
 	// 当节点的 ClientConfig.PasswordPromptPattern 为空时，使用此值；
 	// 两者均为空则使用内置的 DefaultPasswordPromptPattern。
 	PasswordPromptPattern string
+	// lifecycleMu 与 connectWG 共同保证 CloseAll 和共享建连任务的生命周期有序：
+	// closed 置位后不再允许新任务登记或连接发布，CloseAll 等待所有已登记任务返回。
+	lifecycleMu     sync.Mutex
+	lifecycleCtx    context.Context
+	lifecycleCancel context.CancelFunc
+	closed          bool
+	closeDone       chan struct{}
+	connectWG       sync.WaitGroup
 
 	// kaMu 保护 keepAliveCfg 的启用/关闭（keepAlives 自带分片锁，无需 kaMu）
 	kaMu sync.Mutex
@@ -39,6 +48,8 @@ type Connector struct {
 	keepAliveCfg *keepAliveConfig
 	// keepAlives 心跳注册表：nodeName -> 运行中的心跳条目
 	keepAlives *concurrent.Map[string, *keepAliveEntry]
+	// keepAliveWG 覆盖配置 watcher 及已从注册表驱逐、但尚未完全返回的心跳 goroutine。
+	keepAliveWG sync.WaitGroup
 }
 
 // keepAliveConfig 描述 Connector 级心跳配置（见 EnableKeepAlive）
@@ -52,72 +63,196 @@ type keepAliveConfig struct {
 type keepAliveEntry struct {
 	cancel context.CancelFunc // per-node ctx 的取消函数
 	client *ssh.Client        // 心跳目标，用于驱逐时指针比对防止误删新连接
+	done   <-chan struct{}    // 心跳 goroutine 的退出通知
 }
 
 var hostKeyPromptMutex sync.Mutex
 
+// ErrConnectorClosed 表示 Connector 已执行 CloseAll，不能再建立或返回连接。
+var ErrConnectorClosed = errors.New("SSH connector is closed")
+
+const defaultSSHHandshakeTimeout = 10 * time.Second
+
 // NewConnector 创建一个新的 Connector
 func NewConnector(store ConfigStore, ui InteractionHandler) *Connector {
+	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
 	return &Connector{
-		store:      store,
-		ui:         ui,
-		clients:    concurrent.NewMap[string, *ssh.Client](concurrent.HashString),
-		keepAlives: concurrent.NewMap[string, *keepAliveEntry](concurrent.HashString),
+		store:           store,
+		ui:              ui,
+		clients:         concurrent.NewMap[string, *ssh.Client](concurrent.HashString),
+		lifecycleCtx:    lifecycleCtx,
+		lifecycleCancel: lifecycleCancel,
+		closeDone:       make(chan struct{}),
+		keepAlives:      concurrent.NewMap[string, *keepAliveEntry](concurrent.HashString),
 	}
 }
 
-// Connect 根据节点名称建立 SSH 连接
-// 自动处理跳板机逻辑：如果节点配置了 ProxyJump，会递归建立连接
-func (c *Connector) Connect(ctx context.Context, nodeName string) (*Client, error) {
-	// 环路检测，防止 ProxyJump 循环依赖死锁
-	type contextKey string
-	const visitedNodesKey contextKey = "visited_nodes"
-	visited, _ := ctx.Value(visitedNodesKey).([]string)
-	for _, v := range visited {
-		if v == nodeName {
-			return nil, fmt.Errorf("proxy jump cycle detected: %s (path: %v)", nodeName, append(visited, nodeName))
-		}
-	}
-	ctx = context.WithValue(ctx, visitedNodesKey, append(append([]string(nil), visited...), nodeName))
+type connectionPlanNode struct {
+	name string
+	cfg  *ClientConfig
+}
 
-	if cachedClient, ok := c.clients.Get(nodeName); ok {
-		isAlive := true
-		if cachedClient.Conn != nil {
-			_, _, err := cachedClient.SendRequest("keepalive@openssh.com", true, nil)
-			if err != nil {
-				isAlive = false
-			}
-		}
-		if !isAlive {
-			c.clients.Remove(nodeName)
-			_ = cachedClient.Close()
-		} else {
-			cfg, err := c.store.GetConfig(nodeName)
-			if err != nil {
-				return nil, fmt.Errorf("failed to fetch config for cached node '%s': %w", nodeName, err)
-			}
-			return newClient(cachedClient, cfg, c.store, c.PasswordPromptPattern), nil
-		}
+// Connect 根据节点名称建立 SSH 连接。
+// ProxyJump 链会先完整解析并检测环，再从最底层跳板机开始逐层建立连接。
+func (c *Connector) Connect(ctx context.Context, nodeName string) (*Client, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("connect context is nil")
 	}
-	// 缓存未命中，开始建立新连接
-	// 【合并请求】使用 singleflight
-	// 即使 100 个协程同时调 Connect(host)，Do 里面的函数只会执行一次
-	// 其他协程会阻塞在这里等待结果
-	result, err, _ := c.sf.Do(nodeName, func() (any, error) {
-		return c.initializeConnection(ctx, nodeName)
-	})
+	if err := c.ensureOpen(); err != nil {
+		return nil, err
+	}
+
+	plan, err := c.resolveConnectionPlan(ctx, nodeName)
 	if err != nil {
 		return nil, err
 	}
-	// 类型断言返回结果
-	return result.(*Client), nil
+
+	var connected *Client
+	for index := len(plan) - 1; index >= 0; index-- {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("connect node '%s' canceled: %w", nodeName, err)
+		}
+
+		planNode := plan[index]
+		var dialer Dialer = &net.Dialer{Timeout: defaultSSHHandshakeTimeout}
+		if planNode.cfg.ProxyJump != "" {
+			if connected == nil {
+				return nil, fmt.Errorf("resolved proxy jump '%s' for node '%s' has no client", planNode.cfg.ProxyJump, planNode.name)
+			}
+			dialer = &SSHProxyDialer{Client: connected.sshClient}
+		}
+
+		connected, err = c.connectPlannedNode(ctx, planNode, dialer)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return connected, nil
 }
 
-func (c *Connector) initializeConnection(ctx context.Context, nodeName string) (*Client, error) {
-	cfg, err := c.store.GetConfig(nodeName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch config for node '%s': %w", nodeName, err)
+func (c *Connector) ensureOpen() error {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	if c.closed {
+		return ErrConnectorClosed
 	}
+	return nil
+}
+
+func (c *Connector) resolveConnectionPlan(ctx context.Context, nodeName string) ([]connectionPlanNode, error) {
+	plan := make([]connectionPlanNode, 0, 2)
+	positions := make(map[string]int)
+	current := nodeName
+	for current != "" {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("resolve proxy jump chain for node '%s' canceled: %w", nodeName, err)
+		}
+		if cycleStart, ok := positions[current]; ok {
+			path := make([]string, 0, len(plan)-cycleStart+1)
+			for _, item := range plan[cycleStart:] {
+				path = append(path, item.name)
+			}
+			path = append(path, current)
+			return nil, fmt.Errorf("proxy jump cycle detected: %s (path: %v)", current, path)
+		}
+
+		cfg, err := c.store.GetConfig(current)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch config for node '%s': %w", current, err)
+		}
+		if cfg == nil {
+			return nil, fmt.Errorf("config for node '%s' is nil", current)
+		}
+		positions[current] = len(plan)
+		plan = append(plan, connectionPlanNode{name: current, cfg: cfg})
+		current = cfg.ProxyJump
+	}
+	return plan, nil
+}
+
+func (c *Connector) connectPlannedNode(ctx context.Context, planNode connectionPlanNode, dialer Dialer) (*Client, error) {
+	// 缓存复检、失效驱逐和重建位于同一个共享任务内。任务仅绑定 Connector 生命周期，
+	// 单个调用者取消只停止等待，不会关闭连接池中由其他调用者共享的连接。
+	resultCh := c.sf.DoChan(planNode.name, func() (any, error) {
+		sharedCtx, finish, err := c.beginSharedConnect()
+		if err != nil {
+			return nil, err
+		}
+		defer finish()
+		return c.connectNode(sharedCtx, planNode, dialer)
+	})
+
+	select {
+	case <-ctx.Done():
+		return nil, fmt.Errorf("connect node '%s' canceled: %w", planNode.name, ctx.Err())
+	case <-c.lifecycleCtx.Done():
+		return nil, ErrConnectorClosed
+	case result := <-resultCh:
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("connect node '%s' canceled: %w", planNode.name, err)
+		}
+		if result.Err != nil {
+			return nil, result.Err
+		}
+		client, ok := result.Val.(*Client)
+		if !ok || client == nil {
+			return nil, fmt.Errorf("shared connect for node '%s' returned invalid client", planNode.name)
+		}
+		return client, nil
+	}
+}
+
+func (c *Connector) beginSharedConnect() (context.Context, func(), error) {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	if c.closed {
+		return nil, nil, ErrConnectorClosed
+	}
+	c.connectWG.Add(1)
+	return c.lifecycleCtx, c.connectWG.Done, nil
+}
+
+func (c *Connector) connectNode(ctx context.Context, planNode connectionPlanNode, dialer Dialer) (*Client, error) {
+	nodeName := planNode.name
+	if cachedClient, ok := c.clients.Get(nodeName); ok {
+		if cachedClient.Conn == nil {
+			return c.wrapCachedClient(planNode.cfg, cachedClient), nil
+		}
+
+		if err := probeWithTimeout(ctx, cachedClient, c.keepAliveProbeTimeout()); err == nil {
+			return c.wrapCachedClient(planNode.cfg, cachedClient), nil
+		} else {
+			c.evictCachedClient(nodeName, cachedClient)
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("probe cached SSH connection for node '%s' failed: %w", nodeName, ctx.Err())
+			}
+		}
+	}
+
+	return c.initializeConnection(ctx, planNode, dialer)
+}
+
+func (c *Connector) wrapCachedClient(cfg *ClientConfig, cachedClient *ssh.Client) *Client {
+	return newClient(cachedClient, cfg, c.store, c.PasswordPromptPattern)
+}
+
+func (c *Connector) keepAliveProbeTimeout() time.Duration {
+	c.kaMu.Lock()
+	defer c.kaMu.Unlock()
+	if c.keepAliveCfg != nil {
+		return c.keepAliveCfg.timeout
+	}
+	return DefaultKeepAliveTimeout
+}
+
+func (c *Connector) evictCachedClient(nodeName string, stale *ssh.Client) {
+	concurrent.RemoveIfMatch(c.clients, nodeName, stale)
+	c.removeKeepAliveFor(nodeName, stale)
+}
+
+func (c *Connector) initializeConnection(ctx context.Context, planNode connectionPlanNode, dialer Dialer) (*Client, error) {
+	nodeName := planNode.name
+	cfg := planNode.cfg
 
 	// SudoMode 为 su 时若未配置密码，交互式提示并写回 Provider（调用方负责持久化）
 	if cfg.SudoMode == SudoModeSu && cfg.SuPwd == "" {
@@ -126,12 +261,9 @@ func (c *Connector) initializeConnection(ctx context.Context, nodeName string) (
 			return nil, fmt.Errorf("failed to read su password: %w", err)
 		}
 		cfg.SuPwd = suPwd
-		_ = c.store.UpdateSudo(nodeName, cfg.SudoMode, suPwd)
-	}
-
-	dialer, err := c.setupDialer(ctx, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("failed to setup dialer: %w", err)
+		if err := c.store.UpdateSudo(nodeName, cfg.SudoMode, suPwd); err != nil {
+			return nil, fmt.Errorf("failed to update sudo credentials for node '%s': %w", nodeName, err)
+		}
 	}
 
 	sshConfig, cleanup, err := c.buildSSHConfig(cfg)
@@ -142,35 +274,72 @@ func (c *Connector) initializeConnection(ctx context.Context, nodeName string) (
 		defer cleanup()
 	}
 
-	rawClient, err := c.dialAndHandshake(ctx, nodeName, cfg, dialer, sshConfig)
+	// 共享任务不继承任一调用者的 deadline，因此在网络阶段施加内部总超时；
+	// 这同时约束直连和 ProxyJump 的通道建立，避免共享任务无限占用 singleflight。
+	networkCtx, cancelNetwork := context.WithTimeout(ctx, defaultSSHHandshakeTimeout)
+	defer cancelNetwork()
+	rawClient, err := c.dialAndHandshake(networkCtx, nodeName, cfg, dialer, sshConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial and handshake: %w", err)
 	}
 
 	// 认证并连接成功后，检查我们是否通过 "auto" 下的终端交互获取到了新凭证（密码或密钥密码）。
 	if cfg.Password != "" || cfg.Passphrase != "" {
-		_ = c.store.UpdateAuth(nodeName, cfg.Password, cfg.KeyPath, cfg.Passphrase)
+		if err := c.store.UpdateAuth(nodeName, cfg.Password, cfg.KeyPath, cfg.Passphrase); err != nil {
+			if closeErr := rawClient.Close(); closeErr != nil {
+				return nil, fmt.Errorf("failed to update authentication for node '%s': %w; close unpublished SSH client failed: %w", nodeName, err, closeErr)
+			}
+			return nil, fmt.Errorf("failed to update authentication for node '%s': %w", nodeName, err)
+		}
 	}
 
-	c.clients.Set(nodeName, rawClient)
+	if err := c.publishClient(nodeName, rawClient); err != nil {
+		if closeErr := rawClient.Close(); closeErr != nil {
+			return nil, fmt.Errorf("%w; close unpublished SSH client failed: %w", err, closeErr)
+		}
+		return nil, err
+	}
 	c.startKeepAliveFor(nodeName, rawClient)
 	// 返回封装的 Client
 	return newClient(rawClient, cfg, c.store, c.PasswordPromptPattern), nil
+}
+
+func (c *Connector) publishClient(nodeName string, client *ssh.Client) error {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	if c.closed {
+		return ErrConnectorClosed
+	}
+	c.clients.Set(nodeName, client)
+	return nil
 }
 
 // EnableKeepAlive 启用连接池周期心跳（opt-in，幂等）。
 // 启用后所有新入池的连接（含 ProxyJump 跳板机连接）会挂载周期性 keepalive 探测：
 // 探测失败或超时即关闭连接并从池中驱逐，下次 Connect 自动重建。
 // interval/timeout 传非正值时回退到 DefaultKeepAliveInterval/DefaultKeepAliveTimeout。
-// 生命周期绑定 CloseAll：调用 CloseAll 会级联终止全部心跳 goroutine；
-// CloseAll 之后心跳不会自动恢复（仅对启用后入池的连接生效，存量连接不补挂）。
+// 生命周期同时绑定 ctx 与 CloseAll：任一方取消都会终止全部心跳 goroutine 并清理配置；
+// ctx 取消完成清理后允许再次启用，CloseAll 之后则不会恢复。
+// 仅对启用后入池的连接生效，存量连接不补挂。
 // 适用于 MCP server 等长驻进程；CLI 短生命周期命令无需启用（Connect 的缓存探测已兜底）。
 func (c *Connector) EnableKeepAlive(ctx context.Context, interval, timeout time.Duration) {
+	if ctx == nil {
+		logger.Warn("ignore EnableKeepAlive call with nil context")
+		return
+	}
+	if ctx.Err() != nil {
+		return
+	}
 	if interval <= 0 {
 		interval = DefaultKeepAliveInterval
 	}
 	if timeout <= 0 {
 		timeout = DefaultKeepAliveTimeout
+	}
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	if c.closed {
+		return
 	}
 	c.kaMu.Lock()
 	defer c.kaMu.Unlock()
@@ -178,12 +347,32 @@ func (c *Connector) EnableKeepAlive(ctx context.Context, interval, timeout time.
 		return
 	}
 	derivedCtx, cancel := context.WithCancel(ctx)
-	c.keepAliveCfg = &keepAliveConfig{
+	cfg := &keepAliveConfig{
 		ctx:      derivedCtx,
 		cancel:   cancel,
 		interval: interval,
 		timeout:  timeout,
 	}
+	c.keepAliveCfg = cfg
+	c.keepAliveWG.Add(1)
+	go c.watchKeepAliveConfig(cfg)
+}
+
+func (c *Connector) watchKeepAliveConfig(cfg *keepAliveConfig) {
+	defer c.keepAliveWG.Done()
+	<-cfg.ctx.Done()
+
+	c.kaMu.Lock()
+	defer c.kaMu.Unlock()
+	if c.keepAliveCfg != cfg {
+		return
+	}
+	c.keepAliveCfg = nil
+	c.keepAlives.IterCb(func(_ string, entry *keepAliveEntry) bool {
+		entry.cancel()
+		return true
+	})
+	c.keepAlives.Clear()
 }
 
 // startKeepAliveFor 为入池连接挂载心跳；未启用心跳时为 no-op。
@@ -195,7 +384,7 @@ func (c *Connector) startKeepAliveFor(nodeName string, client *ssh.Client) {
 	c.kaMu.Lock()
 	defer c.kaMu.Unlock()
 	cfg := c.keepAliveCfg
-	if cfg == nil {
+	if cfg == nil || cfg.ctx.Err() != nil {
 		return
 	}
 
@@ -210,9 +399,26 @@ func (c *Connector) startKeepAliveFor(nodeName string, client *ssh.Client) {
 		client: client,
 	}
 	c.keepAlives.Set(nodeName, entry)
-	StartKeepAlive(nodeCtx, client, cfg.interval, cfg.timeout, func(error) {
+	c.keepAliveWG.Add(1)
+	entry.done = StartKeepAlive(nodeCtx, client, cfg.interval, cfg.timeout, func(error) {
 		c.evictDeadClient(nodeName, client, entry)
 	})
+	go func() {
+		<-entry.done
+		c.keepAliveWG.Done()
+	}()
+}
+
+func (c *Connector) removeKeepAliveFor(nodeName string, client *ssh.Client) {
+	c.kaMu.Lock()
+	defer c.kaMu.Unlock()
+	entry, ok := c.keepAlives.Get(nodeName)
+	if !ok || entry.client != client {
+		return
+	}
+	if concurrent.RemoveIfMatch(c.keepAlives, nodeName, entry) {
+		entry.cancel()
+	}
 }
 
 // evictDeadClient 心跳失败后的池驱逐（StartKeepAlive 已 Close 该连接）。
@@ -221,22 +427,7 @@ func (c *Connector) startKeepAliveFor(nodeName string, client *ssh.Client) {
 func (c *Connector) evictDeadClient(nodeName string, dead *ssh.Client, entry *keepAliveEntry) {
 	concurrent.RemoveIfMatch(c.clients, nodeName, dead)
 	concurrent.RemoveIfMatch(c.keepAlives, nodeName, entry)
-}
-
-func (c *Connector) setupDialer(ctx context.Context, cfg *ClientConfig) (Dialer, error) {
-	var dialer Dialer = &net.Dialer{Timeout: 10 * time.Second} // 默认直连
-
-	if cfg.ProxyJump != "" {
-		// 递归：连接跳板机
-		jumpNodeClient, err := c.Connect(ctx, cfg.ProxyJump)
-		if err != nil {
-			return nil, fmt.Errorf("failed to connect to jump host '%s': %w", cfg.ProxyJump, err)
-		}
-		// 封装：使用跳板机的 SSH 通道作为 Dialer
-		dialer = &SSHProxyDialer{Client: jumpNodeClient.sshClient}
-	}
-
-	return dialer, nil
+	entry.cancel()
 }
 
 func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, cfg *ClientConfig, dialer Dialer, sshConfig *ssh.ClientConfig) (*ssh.Client, error) {
@@ -248,35 +439,126 @@ func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, cfg *
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial target '%s' (%s): %w", nodeName, targetAddr, err)
 	}
+	handshakeDeadline := time.Now().Add(defaultSSHHandshakeTimeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(handshakeDeadline) {
+		handshakeDeadline = ctxDeadline
+	}
+	if err := conn.SetDeadline(handshakeDeadline); err != nil {
+		if closeErr := conn.Close(); closeErr != nil {
+			return nil, fmt.Errorf(
+				"set SSH handshake deadline for '%s' failed: %w; close connection after deadline setup failed: %w",
+				nodeName,
+				err,
+				closeErr,
+			)
+		}
+		return nil, fmt.Errorf("set SSH handshake deadline for '%s' failed: %w", nodeName, err)
+	}
+	stopCancelClose := context.AfterFunc(ctx, func() {
+		if closeErr := conn.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			logger.Warnf("close SSH handshake connection after cancellation failed: %v", closeErr)
+		}
+	})
 
 	// 建立 SSH 会话
 	// 使用 NewClientConn 接管底层的 conn
 	ncc, chans, reqs, err := ssh.NewClientConn(conn, targetAddr, sshConfig)
 	if err != nil {
-		_ = conn.Close()
+		stopCancelClose()
+		closeErr := conn.Close()
+		if ctx.Err() != nil {
+			primaryErr := fmt.Errorf("SSH handshake canceled for '%s': %w", nodeName, ctx.Err())
+			return nil, combineSSHOperationErrors(primaryErr, wrapCloseError(closeErr, "close canceled SSH handshake connection"))
+		}
+		if closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			return nil, fmt.Errorf(
+				"ssh handshake failed for '%s': %w; close failed SSH handshake connection: %w",
+				nodeName,
+				err,
+				closeErr,
+			)
+		}
 		return nil, fmt.Errorf("ssh handshake failed for '%s': %w", nodeName, err)
+	}
+	stoppedCancelClose := stopCancelClose()
+	if ctx.Err() != nil || !stoppedCancelClose {
+		closeErr := ncc.Close()
+		cancelErr := ctx.Err()
+		if cancelErr == nil {
+			cancelErr = context.Canceled
+		}
+		primaryErr := fmt.Errorf("SSH handshake canceled for '%s': %w", nodeName, cancelErr)
+		return nil, combineSSHOperationErrors(primaryErr, wrapCloseError(closeErr, "close canceled SSH connection"))
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		if closeErr := ncc.Close(); closeErr != nil {
+			return nil, fmt.Errorf(
+				"clear SSH connection deadline for '%s' failed: %w; close SSH connection after clearing deadline failed: %w",
+				nodeName,
+				err,
+				closeErr,
+			)
+		}
+		return nil, fmt.Errorf("clear SSH connection deadline for '%s' failed: %w", nodeName, err)
 	}
 
 	return ssh.NewClient(ncc, chans, reqs), nil
 }
 
-// CloseAll 关闭所有缓存的连接 (在程序退出前调用)
+func wrapCloseError(err error, operation string) error {
+	if err == nil || errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	return fmt.Errorf("%s failed: %w", operation, err)
+}
+
+func combineSSHOperationErrors(primary, secondary error) error {
+	if secondary == nil {
+		return primary
+	}
+	return fmt.Errorf("%w; %w", primary, secondary)
+}
+
+// CloseAll 关闭所有缓存的连接并等待在途建连与心跳 goroutine 退出。
+// 调用后 Connector 进入永久关闭状态，后续 Connect 返回 ErrConnectorClosed。
 func (c *Connector) CloseAll() {
-	// 先取消根心跳 ctx 级联终止全部心跳 goroutine，再清理注册表；
-	// Clear 在 clients.IterCb 之外调用，避免 concurrent.Map 分片死锁
+	c.lifecycleMu.Lock()
+	if c.closed {
+		closeDone := c.closeDone
+		c.lifecycleMu.Unlock()
+		<-closeDone
+		return
+	}
+	c.closed = true
+	c.lifecycleCancel()
+	c.lifecycleMu.Unlock()
+
+	// closed 置位后不会再有新的 Connect 登记；等待在途 Connect 停止并拒绝发布。
+	c.connectWG.Wait()
+
+	// startKeepAliveFor 只可能由已结束的 Connect 调用，此处可完整取得并清空注册表。
 	c.kaMu.Lock()
 	if c.keepAliveCfg != nil {
 		c.keepAliveCfg.cancel()
 		c.keepAliveCfg = nil
 	}
-	c.kaMu.Unlock()
+	c.keepAlives.IterCb(func(_ string, entry *keepAliveEntry) bool {
+		entry.cancel()
+		return true
+	})
 	c.keepAlives.Clear()
+	c.kaMu.Unlock()
 
-	c.clients.IterCb(func(name string, client *ssh.Client) bool {
-		_ = client.Close()
+	c.clients.IterCb(func(_ string, client *ssh.Client) bool {
+		if err := client.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			// CloseAll 无错误返回值；记录关闭异常后仍需继续回收其余连接。
+			logger.Warnf("close pooled SSH client failed: %v", err)
+		}
 		return true
 	})
 	c.clients.Clear()
+	c.keepAliveWG.Wait()
+	close(c.closeDone)
 }
 
 // buildSSHConfig 根据 Identity 模型构建 ssh.ClientConfig

@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/peterh/liner"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 )
 
@@ -20,18 +19,10 @@ func TestDispatchCommand(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
-	// liner.NewLiner() 在非 TTY 环境下可能无法正常工作，
-	// 但由于 dispatchCommand 及其调用的具体 Handler 并不直接使用 line 成员（Run 和 askConfirmation 除外），
-	// 我们可以在测试中使用一个空的 liner 实例或 nil。
-	// 为了安全起见，这里创建一个 liner 实例并确保关闭。
-	line := liner.NewLiner()
-	defer func() { _ = line.Close() }()
-
 	tempDir := t.TempDir()
 	s := &Shell{
 		cwd:      "/test/remote/dir",
 		localCwd: tempDir,
-		line:     line,
 		stdout:   &stdout,
 		stderr:   &stderr,
 	}
@@ -381,9 +372,7 @@ func TestLocalCdWildcardMultiple(t *testing.T) {
 }
 
 // TestShellRun_ExitsOnContextCancel 验证连接断开（ctx 被取消）后，
-// shell 在下一次用户交互时返回 context.Canceled 而非继续 REPL 循环。
-// 测试通过管道替换 os.Stdin 驱动 liner 的 fallback 输入路径
-// （go test 环境无 TTY，liner.NewLiner 会置 inputRedirected=true）。
+// shell 无需等待下一次用户交互便返回 context.Canceled。
 func TestShellRun_ExitsOnContextCancel(t *testing.T) {
 	i18n.Init("zh")
 
@@ -391,21 +380,18 @@ func TestShellRun_ExitsOnContextCancel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create pipe: %v", err)
 	}
-	oldStdin := os.Stdin
-	os.Stdin = r
-	defer func() {
-		os.Stdin = oldStdin
-		_ = r.Close()
-	}()
+	defer func() { _ = r.Close() }()
 
 	s := &Shell{
 		cwd:      "/test/remote/dir",
 		localCwd: t.TempDir(),
-		line:     liner.NewLiner(),
+		stdin:    r,
 		stdout:   &bytes.Buffer{},
 		stderr:   &bytes.Buffer{},
 	}
-	defer func() { _ = s.line.Close() }()
+	if err := s.resetLineEditor(); err != nil {
+		t.Fatalf("create test line editor failed: %v", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -414,12 +400,19 @@ func TestShellRun_ExitsOnContextCancel(t *testing.T) {
 		runDone <- s.Run(ctx)
 	}()
 
-	// 模拟连接断开：watcher 检测到断连后取消 ctx
+	// 等待 Readline 确实阻塞在输入上，再模拟连接断开。
+	promptDeadline := time.Now().Add(2 * time.Second)
+	for {
+		editor := s.currentLineEditor()
+		if editor != nil && editor.instance.Terminal.IsReading() {
+			break
+		}
+		if time.Now().After(promptDeadline) {
+			t.Fatal("shell did not enter blocking prompt")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	cancel()
-
-	// 用户按下回车（下一次交互），shell 应立即返回 context.Canceled
-	_, _ = w.WriteString("\n")
-	_ = w.Close()
 
 	select {
 	case err := <-runDone:
@@ -427,8 +420,9 @@ func TestShellRun_ExitsOnContextCancel(t *testing.T) {
 			t.Errorf("expected context.Canceled, got %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("shell.Run did not return within 5s after ctx cancelled and enter pressed")
+		t.Fatal("shell.Run did not return within 5s after ctx cancellation")
 	}
+	_ = w.Close()
 }
 
 // TestShellRun_ContinuesOnCancelledPromptAbort 验证 Ctrl+C 中断提示时若连接正常，
@@ -440,21 +434,18 @@ func TestShellRun_ContinuesOnCancelledPromptAbort(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create pipe: %v", err)
 	}
-	oldStdin := os.Stdin
-	os.Stdin = r
-	defer func() {
-		os.Stdin = oldStdin
-		_ = r.Close()
-	}()
+	defer func() { _ = r.Close() }()
 
 	s := &Shell{
 		cwd:      "/test/remote/dir",
 		localCwd: t.TempDir(),
-		line:     liner.NewLiner(),
+		stdin:    r,
 		stdout:   &bytes.Buffer{},
 		stderr:   &bytes.Buffer{},
 	}
-	defer func() { _ = s.line.Close() }()
+	if err := s.resetLineEditor(); err != nil {
+		t.Fatalf("create test line editor failed: %v", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

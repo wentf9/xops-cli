@@ -6,9 +6,9 @@ import (
 	"strings"
 )
 
-// wordCompleter 实现 liner.WordCompleter 接口
+// wordCompleter 计算光标位置对应的命令或路径补全候选
 func (s *Shell) wordCompleter(line string, pos int) (head string, completions []string, tail string) {
-	// liner 传入的 pos 是 rune 位置，需要转换为字节位置来切分字符串
+	// line editor 传入的 pos 是 rune 位置，需要转换为字节位置来切分字符串
 	runes := []rune(line)
 	content := string(runes[:pos])
 	tail = string(runes[pos:])
@@ -82,7 +82,7 @@ func (s *Shell) completeRemotePath(partial string) []string {
 			if entry.IsDir() {
 				name += "/"
 			}
-			// 拼接上目录前缀供 liner 替换
+			// 拼接上目录前缀供 line editor 替换
 			if dir != s.cwd {
 				candidates = append(candidates, dir+name)
 			} else {

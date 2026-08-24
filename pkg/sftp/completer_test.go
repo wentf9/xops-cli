@@ -67,7 +67,7 @@ func TestWordCompleterRuneVsByte(t *testing.T) {
 	}
 
 	// "put 部署" has 6 runes but 10 bytes for "部署"
-	// liner passes pos=6 (rune count), not pos=14 (byte count)
+	// line editor passes pos=6 (rune count), not pos=14 (byte count)
 	line := "put 部署"
 	runePos := 6 // len([]rune("put 部署"))
 
@@ -86,6 +86,26 @@ func TestWordCompleterRuneVsByte(t *testing.T) {
 		runeSlice := string([]rune(line)[:runePos])
 		if byteSlice == runeSlice {
 			t.Error("expected byte-based and rune-based slicing to differ for Chinese text")
+		}
+	}
+}
+
+func TestShellCompleterReturnsUnreadSuffix(t *testing.T) {
+	s := &Shell{cwd: "/tmp", localCwd: "/tmp"}
+	completer := shellCompleter{shell: s}
+	candidates, offset := completer.Do([]rune("pu"), 2)
+	if offset != 2 {
+		t.Errorf("offset = %d, want 2", offset)
+	}
+	want := map[string]bool{"t": false}
+	for _, candidate := range candidates {
+		if _, ok := want[string(candidate)]; ok {
+			want[string(candidate)] = true
+		}
+	}
+	for candidate, found := range want {
+		if !found {
+			t.Errorf("missing completion suffix %q in %q", candidate, candidates)
 		}
 	}
 }
