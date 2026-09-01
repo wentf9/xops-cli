@@ -364,15 +364,27 @@ func (m *Map[K, V]) String() string {
 // 格式:
 // [Key] val
 // [Key] val
-func (m *Map[K, V]) Print(w io.Writer) {
-	_, _ = fmt.Fprintln(w, "--- ConcurrentMap Content ---")
+func (m *Map[K, V]) Print(w io.Writer) error {
+	if _, err := fmt.Fprintln(w, "--- ConcurrentMap Content ---"); err != nil {
+		return fmt.Errorf("write map header failed: %w", err)
+	}
 	count := 0
+	var iterErr error
 	m.IterCb(func(k K, v V) bool {
-		_, _ = fmt.Fprintf(w, "[%v] %v\n", k, v)
+		if _, err := fmt.Fprintf(w, "[%v] %v\n", k, v); err != nil {
+			iterErr = fmt.Errorf("write item %v failed: %w", k, err)
+			return false
+		}
 		count++
 		return true
 	})
-	_, _ = fmt.Fprintf(w, "--- Total: %d items ---\n", count)
+	if iterErr != nil {
+		return iterErr
+	}
+	if _, err := fmt.Fprintf(w, "--- Total: %d items ---\n", count); err != nil {
+		return fmt.Errorf("write map footer failed: %w", err)
+	}
+	return nil
 }
 
 // PrettyPrint 以格式化的 JSON 样式打印 (适合调试复杂结构)

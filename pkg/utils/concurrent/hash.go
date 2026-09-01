@@ -1,19 +1,19 @@
 package concurrent
 
-import (
-	"hash/fnv"
+const (
+	offset32 = 2166136261
+	prime32  = 16777619
 )
-
-// ==========================================
-// 字符串哈希 (String Hashing)
-// ==========================================
 
 // HashString 针对 string 类型的标准 FNV-1a 哈希算法
 // FNV 算法分布极其均匀，是处理字符串的标准选择
 func HashString(s string) uint32 {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(s))
-	return h.Sum32()
+	var hash uint32 = offset32
+	for i := 0; i < len(s); i++ {
+		hash ^= uint32(s[i])
+		hash *= prime32
+	}
+	return hash
 }
 
 // ==========================================

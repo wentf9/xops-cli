@@ -1,8 +1,11 @@
 package concurrent
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -329,4 +332,41 @@ func TestRemoveIfMatch_ConcurrentStress(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+type errWriter struct {
+	failAfter int
+	written   int
+}
+
+func (w *errWriter) Write(p []byte) (n int, err error) {
+	if w.written >= w.failAfter {
+		return 0, errors.New("simulated write error")
+	}
+	w.written += len(p)
+	return len(p), nil
+}
+
+func TestMap_Print(t *testing.T) {
+	m := newTestMap()
+	m.Set("k1", 100)
+	m.Set("k2", 200)
+
+	var buf bytes.Buffer
+	if err := m.Print(&buf); err != nil {
+		t.Fatalf("expected nil error on valid write, got %v", err)
+	}
+	output := buf.String()
+	if !strings.Contains(output, "--- ConcurrentMap Content ---") {
+		t.Errorf("expected header, got %s", output)
+	}
+	if !strings.Contains(output, "--- Total: 2 items ---") {
+		t.Errorf("expected total count, got %s", output)
+	}
+
+	// 验证写失败时返回错误
+	ew := &errWriter{failAfter: 5}
+	if err := m.Print(ew); err == nil {
+		t.Error("expected write error from Print with failing writer, got nil")
+	}
 }
