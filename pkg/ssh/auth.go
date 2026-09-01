@@ -1,6 +1,7 @@
 package ssh
 
 import (
+	"context"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -8,11 +9,26 @@ import (
 	"net"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/wentf9/xops-cli/pkg/logger"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
+
+const sshAgentDialTimeout = 5 * time.Second
+
+func dialSSHAgent(ctx context.Context, socket string) (net.Conn, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("ssh-agent dial context is nil")
+	}
+	dialer := net.Dialer{Timeout: sshAgentDialTimeout}
+	conn, err := dialer.DialContext(ctx, "unix", socket)
+	if err != nil {
+		return nil, fmt.Errorf("dial ssh-agent socket %q failed: %w", socket, err)
+	}
+	return conn, nil
+}
 
 // AuthMethod 定义获取 SSH 认证方法的接口
 type AuthMethod interface {
@@ -299,10 +315,13 @@ func BuildAutoAuthMethodsWithLogger(user, host string, ui InteractionHandler, pa
 
 	// SSH Agent
 	if socket := os.Getenv("SSH_AUTH_SOCK"); socket != "" {
-		if conn, err := net.Dial("unix", socket); err == nil {
+		conn, err := dialSSHAgent(context.Background(), socket)
+		if err == nil {
 			agentClient := agent.NewClient(conn)
 			methods = append(methods, ssh.PublicKeysCallback(agentClient.Signers))
 			cleanup = func() { debugCloseResource(l, conn, "ssh agent connection") }
+		} else {
+			l.Debugf("connect to ssh-agent failed: %v", err)
 		}
 	}
 

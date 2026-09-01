@@ -1,12 +1,48 @@
 package ssh
 
 import (
+	"context"
 	"errors"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestClient_ConfigReturnsConcurrentSnapshot(t *testing.T) {
+	original := &ClientConfig{NodeID: "node-1", SudoMode: SudoModeAuto}
+	cli := newClient(nil, nil, original, nil, "")
+	original.SudoMode = SudoModeRoot
+	if got := cli.Config().SudoMode; got != SudoModeAuto {
+		t.Fatalf("Config().SudoMode = %q, want independent snapshot %q", got, SudoModeAuto)
+	}
+
+	var wg sync.WaitGroup
+	for index := range 100 {
+		wg.Go(func() {
+			mode := SudoModeSudo
+			if index%2 == 0 {
+				mode = SudoModeSudoer
+			}
+			if err := cli.updateSudoMode(context.Background(), mode); err != nil {
+				t.Errorf("updateSudoMode() error = %v", err)
+			}
+		})
+		wg.Go(func() {
+			snapshot := cli.Config()
+			if snapshot == nil {
+				t.Error("Config() returned nil")
+				return
+			}
+			snapshot.SudoMode = SudoModeNone
+		})
+	}
+	wg.Wait()
+	if got := cli.Config().SudoMode; got != SudoModeSudo && got != SudoModeSudoer {
+		t.Fatalf("live SudoMode = %q, want a concurrently stored mode", got)
+	}
+}
 
 type mockInterruptConn struct {
 	net.Conn

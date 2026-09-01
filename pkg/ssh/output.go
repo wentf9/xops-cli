@@ -187,7 +187,7 @@ func (w *outputWriter) ringString() string {
 
 	var result []byte
 	if w.truncated {
-		result = append(result, []byte(fmt.Sprintf("... [Output truncated, exceeded %d bytes]\n", w.ringMaxBytes))...)
+		result = append(result, fmt.Appendf(nil, "... [Output truncated, exceeded %d bytes]\n", w.ringMaxBytes)...)
 	}
 
 	if w.ringLen < w.ringMaxBytes {

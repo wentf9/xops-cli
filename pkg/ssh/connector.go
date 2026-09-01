@@ -679,7 +679,7 @@ func (c *Connector) buildSSHConfig(cfg *ClientConfig) (*ssh.ClientConfig, func()
 		if socket == "" {
 			return nil, nil, ErrAgentNotAvailable
 		}
-		conn, err := net.Dial("unix", socket)
+		conn, err := dialSSHAgent(context.Background(), socket)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to connect to ssh-agent: %w", err)
 		}

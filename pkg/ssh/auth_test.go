@@ -1,16 +1,34 @@
 package ssh
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"golang.org/x/crypto/ssh"
 )
+
+func TestDialSSHAgent_RespectsCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	conn, err := dialSSHAgent(ctx, "unused-agent-socket")
+	if conn != nil {
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Fatalf("close unexpected ssh-agent connection failed: %v", closeErr)
+		}
+		t.Fatal("dialSSHAgent() returned a connection for canceled context")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("dialSSHAgent() error = %v, want context.Canceled", err)
+	}
+}
 
 type mockUIForTest struct {
 	passphrase string

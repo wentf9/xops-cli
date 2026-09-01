@@ -9,6 +9,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/wentf9/xops-cli/pkg/logger"
@@ -19,6 +20,8 @@ import (
 type Client struct {
 	sshClient        *ssh.Client
 	rootConn         net.Conn
+	cfgMu            sync.RWMutex
+	sudoMu           sync.Mutex
 	cfg              *ClientConfig
 	store            ConfigStore
 	connectorPattern string         // Connector 全局级密码提示正则，当节点级为空时回落到此字段
@@ -64,16 +67,17 @@ func newClientWithLogger(raw *ssh.Client, rootConn net.Conn, cfg *ClientConfig, 
 	if l == nil {
 		l = logger.NopLogger
 	}
+	clientConfig := *cfg
 	c := &Client{
 		sshClient:        raw,
 		rootConn:         rootConn,
-		cfg:              cfg,
+		cfg:              &clientConfig,
 		store:            store,
 		connectorPattern: connectorPattern,
 		logger:           l,
 	}
 
-	pattern := cfg.PasswordPromptPattern
+	pattern := clientConfig.PasswordPromptPattern
 	if pattern == "" {
 		pattern = connectorPattern
 	}
@@ -114,7 +118,8 @@ func (c *Client) Interrupt() error {
 		if closeErr := c.rootConn.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
 			errs = append(errs, fmt.Errorf("close root conn failed: %w", closeErr))
 		}
-	} else if c.sshClient != nil {
+	}
+	if c.sshClient != nil {
 		if closeErr := c.sshClient.Close(); closeErr != nil && !errors.Is(closeErr, io.EOF) && !errors.Is(closeErr, net.ErrClosed) {
 			errs = append(errs, fmt.Errorf("close ssh client failed: %w", closeErr))
 		}
@@ -129,9 +134,26 @@ func (c *Client) Close() error {
 
 // SSHClient 暴露底层的 ssh.Client (供高级操作使用，如 SCP)
 
-// Config 返回当前连接对应的节点配置
+// Config returns a snapshot of the node configuration. Mutating the returned
+// value never changes the live client configuration.
 func (c *Client) Config() *ClientConfig {
-	return c.cfg
+	cfg, ok := c.configSnapshot()
+	if !ok {
+		return nil
+	}
+	return &cfg
+}
+
+func (c *Client) configSnapshot() (ClientConfig, bool) {
+	if c == nil {
+		return ClientConfig{}, false
+	}
+	c.cfgMu.RLock()
+	defer c.cfgMu.RUnlock()
+	if c.cfg == nil {
+		return ClientConfig{}, false
+	}
+	return *c.cfg, true
 }
 
 type RunConfig struct {
@@ -144,6 +166,8 @@ type RunConfig struct {
 }
 
 type RunOption func(*RunConfig)
+
+const sessionShutdownTimeout = time.Second
 
 func WithLoginShell(login bool) RunOption {
 	return func(c *RunConfig) {
@@ -208,13 +232,13 @@ func (c *Client) RunWithoutLogin(ctx context.Context, cmd string) (string, error
 }
 
 func (c *Client) runRaw(ctx context.Context, wrappedCmd string, config *RunConfig) (output string, retErr error) {
-	session, err := c.sshClient.NewSession()
+	session, err := c.newSessionContext(ctx)
 	if err != nil {
 		return "", fmt.Errorf("failed to create new session: %w", err)
 	}
 	defer joinResourceCloseError(&retErr, session, "ssh command session")
 
-	return startWithTimeout(ctx, session, wrappedCmd, config)
+	return c.startWithTimeout(ctx, session, wrappedCmd, config)
 }
 
 // RunScript 执行 Shell 脚本内容
@@ -224,7 +248,7 @@ func (c *Client) RunScript(ctx context.Context, scriptContent string, opts ...Ru
 		opt(config)
 	}
 
-	session, err := c.sshClient.NewSession()
+	session, err := c.newSessionContext(ctx)
 	if err != nil {
 		return "", fmt.Errorf("failed to create new session: %w", err)
 	}
@@ -236,7 +260,7 @@ func (c *Client) RunScript(ctx context.Context, scriptContent string, opts ...Ru
 	if config.LoginShell {
 		cmd = "bash -l -s"
 	}
-	return startWithTimeout(ctx, session, cmd, config)
+	return c.startWithTimeout(ctx, session, cmd, config)
 }
 
 // streamReader 包装 io.ReadCloser 以便在关闭时清理 SSH session
@@ -262,7 +286,7 @@ func (s *streamReader) Close() error {
 
 // RunStream 执行命令并返回流式输出
 func (c *Client) RunStream(ctx context.Context, cmd string) (io.ReadCloser, error) {
-	session, err := c.sshClient.NewSession()
+	session, err := c.newSessionContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create new session: %w", err)
 	}
@@ -299,7 +323,7 @@ func (c *Client) ShellWithIO(ctx context.Context, streams InteractiveIO) (retErr
 	if err != nil {
 		return err
 	}
-	session, err := c.sshClient.NewSession()
+	session, err := c.newSessionContext(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to create new session: %w", err)
 	}
@@ -389,7 +413,7 @@ func (c *Client) ShellWithIO(ctx context.Context, streams InteractiveIO) (retErr
 
 // RunInteractive 在 PTY 环境下执行单条命令，支持交互式/流式命令 (如 tail -f, vim, top)
 func (c *Client) RunInteractive(ctx context.Context, cmd string) (retErr error) {
-	session, err := c.sshClient.NewSession()
+	session, err := c.newSessionContext(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to create new session: %w", err)
 	}
@@ -488,7 +512,7 @@ func (c *Client) RunInteractiveCmdWithIO(ctx context.Context, cmd string, stream
 	if err != nil {
 		return err
 	}
-	session, err := c.sshClient.NewSession()
+	session, err := c.newSessionContext(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to create new session: %w", err)
 	}
@@ -567,11 +591,20 @@ func (c *Client) RunInteractiveCmdWithIO(ctx context.Context, cmd string, stream
 }
 
 func (c *Client) maybeDetectSudoMode(ctx context.Context) error {
-	if c == nil || c.cfg == nil {
+	if ctx == nil {
+		return fmt.Errorf("sudo detection context is nil")
+	}
+	if c == nil {
+		return fmt.Errorf("ssh client or config is nil")
+	}
+	c.sudoMu.Lock()
+	defer c.sudoMu.Unlock()
+	cfg, ok := c.configSnapshot()
+	if !ok {
 		return fmt.Errorf("ssh client or config is nil")
 	}
 	// 如果已经有确定的 SudoMode，且不是 "auto" 或空，则不再探测
-	if c.cfg.SudoMode != "" && c.cfg.SudoMode != SudoModeAuto {
+	if cfg.SudoMode != "" && cfg.SudoMode != SudoModeAuto {
 		return nil
 	}
 	if c.sshClient == nil {
@@ -602,8 +635,8 @@ func (c *Client) maybeDetectSudoMode(ctx context.Context) error {
 	}
 
 	// 3. 测试密码 sudo 是否真正可用（避免用户有密码但不在 sudoers 中时误判）
-	if c.cfg.Password != "" {
-		if _, err := c.runWithSudo(ctx, "true", c.cfg.Password, nil, nil); err == nil {
+	if cfg.Password != "" {
+		if _, err := c.runWithSudo(ctx, "true", cfg.Password, nil, nil); err == nil {
 			return c.updateSudoMode(ctx, SudoModeSudo)
 		} else if err := ctx.Err(); err != nil {
 			return err
@@ -611,7 +644,7 @@ func (c *Client) maybeDetectSudoMode(ctx context.Context) error {
 	}
 
 	// 4. 检查是否有 su 密码
-	if c.cfg.SuPwd != "" {
+	if cfg.SuPwd != "" {
 		return c.updateSudoMode(ctx, SudoModeSu)
 	}
 
@@ -620,16 +653,28 @@ func (c *Client) maybeDetectSudoMode(ctx context.Context) error {
 }
 
 func (c *Client) updateSudoMode(ctx context.Context, mode SudoMode) error {
+	if c == nil {
+		return fmt.Errorf("ssh client is nil")
+	}
+	c.cfgMu.Lock()
+	if c.cfg == nil {
+		c.cfgMu.Unlock()
+		return fmt.Errorf("ssh client config is nil")
+	}
 	c.cfg.SudoMode = mode
-	if c.store != nil && c.cfg.NodeID != "" && c.cfg.SudoUpdateToken != "" {
-		if err := c.store.UpdateSudo(ctx, c.cfg.NodeID, c.cfg.SudoUpdateToken, mode, c.cfg.SuPwd); err != nil {
-			return fmt.Errorf("persist detected sudo mode for node %q failed: %w", c.cfg.NodeID, err)
+	nodeID := c.cfg.NodeID
+	updateToken := c.cfg.SudoUpdateToken
+	suPwd := c.cfg.SuPwd
+	c.cfgMu.Unlock()
+	if c.store != nil && nodeID != "" && updateToken != "" {
+		if err := c.store.UpdateSudo(ctx, nodeID, updateToken, mode, suPwd); err != nil {
+			return fmt.Errorf("persist detected sudo mode for node %q failed: %w", nodeID, err)
 		}
 	}
 	return nil
 }
 
-func startWithTimeout(ctx context.Context, session *ssh.Session, command string, config *RunConfig) (string, error) {
+func (c *Client) startWithTimeout(ctx context.Context, session *ssh.Session, command string, config *RunConfig) (string, error) {
 	if config == nil {
 		config = DefaultRunConfig()
 	}
@@ -653,10 +698,38 @@ func startWithTimeout(ctx context.Context, session *ssh.Session, command string,
 		}
 		return output, nil
 	case <-ctx.Done():
-		if killErr := session.Signal(ssh.SIGKILL); killErr != nil {
-			return syncWriter.String(), fmt.Errorf("failed to kill command after context done: %w", killErr)
+		return syncWriter.String(), c.closeCanceledSession(ctx, session, done)
+	}
+}
+
+// closeCanceledSession closes an individual SSH channel and joins its Wait
+// goroutine. If a broken transport leaves channel shutdown blocked, closing the
+// owned transport is the bounded fallback that guarantees both goroutines exit.
+func (c *Client) closeCanceledSession(ctx context.Context, session *ssh.Session, waitDone <-chan error) error {
+	shutdownDone := make(chan error, 1)
+	go func() {
+		closeErr := closeResource(session, "canceled SSH command session")
+		waitErr := <-waitDone
+		if waitErr != nil {
+			waitErr = fmt.Errorf("wait for canceled SSH command failed: %w", waitErr)
 		}
-		return syncWriter.String(), ctx.Err()
+		shutdownDone <- errors.Join(closeErr, waitErr)
+	}()
+
+	timer := time.NewTimer(sessionShutdownTimeout)
+	defer timer.Stop()
+	select {
+	case shutdownErr := <-shutdownDone:
+		return errors.Join(ctx.Err(), shutdownErr)
+	case <-timer.C:
+		interruptErr := c.Interrupt()
+		shutdownErr := <-shutdownDone
+		return errors.Join(
+			ctx.Err(),
+			fmt.Errorf("ssh command session shutdown timed out after %s", sessionShutdownTimeout),
+			interruptErr,
+			shutdownErr,
+		)
 	}
 }
 

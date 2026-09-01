@@ -266,26 +266,28 @@ func (o *ScpOptions) RunContext(ctx context.Context) (retErr error) {
 
 	// 1. 批量上传模式 (-H host1,host2 或 -I hostfile 或 --tag tag)
 	if o.Tag != "" || (o.Host != "" && strings.Contains(o.Host, ",")) || o.HostFile != "" {
-		return o.runBatch(ctx, provider, connector, configStore, cfg)
+		return o.runBatch(ctx, provider, connector)
 	}
 
 	// 2. 远程到远程
 	if src.IsRemote && dst.IsRemote {
-		return o.runRemoteToRemote(ctx, src, dst, provider, connector, configStore, cfg)
+		return o.runRemoteToRemote(ctx, src, dst, provider, connector)
 	}
 
 	// 3. 单主机上传/下载
 	if src.IsRemote {
-		return o.runDownload(ctx, src, o.Dest, provider, connector, configStore, cfg)
+		var localPath = o.Dest
+		return o.runDownload(ctx, src, localPath, provider, connector)
 	} else if dst.IsRemote {
-		return o.runUpload(ctx, o.Source, dst, provider, connector, configStore, cfg)
+		var localPath = o.Source
+		return o.runUpload(ctx, localPath, dst, provider, connector)
 	}
 
 	return fmt.Errorf("%s", i18n.T("scp_err_both_local"))
 }
 
-func (o *ScpOptions) runUpload(ctx context.Context, localPath string, dst PathInfo, provider config.ConfigProvider, connector *ssh.Connector, configStore config.Store, cfg *config.Configuration) (err error) {
-	_, sftpCli, err := o.connectSftpForPath(ctx, dst, "", provider, connector, configStore, cfg)
+func (o *ScpOptions) runUpload(ctx context.Context, localPath string, dst PathInfo, provider config.ConfigProvider, connector *ssh.Connector) (err error) {
+	_, sftpCli, err := o.connectSftpForPath(ctx, dst, "", provider, connector)
 	if err != nil {
 		return fmt.Errorf("connect upload destination failed: %w", err)
 	}
@@ -375,8 +377,8 @@ func (o *ScpOptions) runUpload(ctx context.Context, localPath string, dst PathIn
 	return errors.Join(uploadErr, progressErr)
 }
 
-func (o *ScpOptions) runDownload(ctx context.Context, src PathInfo, localPath string, provider config.ConfigProvider, connector *ssh.Connector, configStore config.Store, cfg *config.Configuration) (err error) {
-	_, sftpCli, err := o.connectSftpForPath(ctx, src, "", provider, connector, configStore, cfg)
+func (o *ScpOptions) runDownload(ctx context.Context, src PathInfo, localPath string, provider config.ConfigProvider, connector *ssh.Connector) (err error) {
+	_, sftpCli, err := o.connectSftpForPath(ctx, src, "", provider, connector)
 	if err != nil {
 		return fmt.Errorf("connect download source failed: %w", err)
 	}
@@ -463,14 +465,14 @@ func (o *ScpOptions) runDownload(ctx context.Context, src PathInfo, localPath st
 }
 
 //nolint:gocyclo
-func (o *ScpOptions) runRemoteToRemote(ctx context.Context, src, dst PathInfo, provider config.ConfigProvider, connector *ssh.Connector, configStore config.Store, cfg *config.Configuration) (retErr error) {
-	_, srcSftp, err := o.connectSftpForPath(ctx, src, "", provider, connector, configStore, cfg)
+func (o *ScpOptions) runRemoteToRemote(ctx context.Context, src, dst PathInfo, provider config.ConfigProvider, connector *ssh.Connector) (retErr error) {
+	_, srcSftp, err := o.connectSftpForPath(ctx, src, "", provider, connector)
 	if err != nil {
 		return fmt.Errorf("connect remote source failed: %w", err)
 	}
 	defer joinCloseError(&retErr, "source SFTP client", srcSftp.Close)
 
-	_, dstSftp, err := o.connectSftpForPath(ctx, dst, "", provider, connector, configStore, cfg)
+	_, dstSftp, err := o.connectSftpForPath(ctx, dst, "", provider, connector)
 	if err != nil {
 		return fmt.Errorf("connect remote destination failed: %w", err)
 	}
@@ -679,7 +681,7 @@ func (o *ScpOptions) doRemoteToRemote(ctx context.Context, srcSftp *sftp.Client,
 	return nil
 }
 
-func (o *ScpOptions) runBatch(ctx context.Context, provider config.ConfigProvider, connector *ssh.Connector, configStore config.Store, cfg *config.Configuration) error {
+func (o *ScpOptions) runBatch(ctx context.Context, provider config.ConfigProvider, connector *ssh.Connector) error {
 	// 解析 --exclude 排除规则（在 Worker Pool 启动前完成，确保无歧义）
 	var excludes map[string]struct{}
 	if len(o.Exclude) > 0 {
@@ -714,7 +716,7 @@ func (o *ScpOptions) runBatch(ctx context.Context, provider config.ConfigProvide
 			}
 			wp.Execute(func() {
 				addr := PathInfo{Host: hostObj.Address, User: identity.User, Port: hostObj.Port, IsRemote: true}
-				if tErr := o.executeTransfer(ctx, nid, addr, identity.Password, provider, connector, configStore, cfg); tErr != nil {
+				if tErr := o.executeTransfer(ctx, nid, addr, identity.Password, provider, connector); tErr != nil {
 					errMu.Lock()
 					transferErrs = append(transferErrs, fmt.Errorf("[%s] %w", nid, tErr))
 					errMu.Unlock()
@@ -753,7 +755,7 @@ func (o *ScpOptions) runBatch(ctx context.Context, provider config.ConfigProvide
 
 			wp.Execute(func() {
 				addr := PathInfo{Host: h.Host, User: h.User, Port: h.Port, IsRemote: true}
-				if tErr := o.executeTransfer(ctx, h.Host, addr, h.Password, provider, connector, configStore, cfg); tErr != nil {
+				if tErr := o.executeTransfer(ctx, h.Host, addr, h.Password, provider, connector); tErr != nil {
 					errMu.Lock()
 					transferErrs = append(transferErrs, fmt.Errorf("[%s] %w", h.Host, tErr))
 					errMu.Unlock()
@@ -766,8 +768,8 @@ func (o *ScpOptions) runBatch(ctx context.Context, provider config.ConfigProvide
 	return errors.Join(transferErrs...)
 }
 
-func (o *ScpOptions) executeTransfer(ctx context.Context, label string, addr PathInfo, specificPassword string, provider config.ConfigProvider, connector *ssh.Connector, configStore config.Store, cfg *config.Configuration) (err error) {
-	_, sftpCli, err := o.connectSftpForPath(ctx, addr, specificPassword, provider, connector, configStore, cfg)
+func (o *ScpOptions) executeTransfer(ctx context.Context, label string, addr PathInfo, specificPassword string, provider config.ConfigProvider, connector *ssh.Connector) (err error) {
+	_, sftpCli, err := o.connectSftpForPath(ctx, addr, specificPassword, provider, connector)
 	if err != nil {
 		return fmt.Errorf("connect failed: %w", err)
 	}
@@ -886,7 +888,7 @@ func (o *ScpOptions) prepareRemoteToRemoteFile(ctx context.Context, dstSftp *sft
 	return startOffset, dstFile, nil
 }
 
-func (o *ScpOptions) connectSftpForPath(ctx context.Context, p PathInfo, specificPassword string, provider config.ConfigProvider, connector *ssh.Connector, configStore config.Store, cfg *config.Configuration) (string, *sftp.Client, error) {
+func (o *ScpOptions) connectSftpForPath(ctx context.Context, p PathInfo, specificPassword string, provider config.ConfigProvider, connector *ssh.Connector) (string, *sftp.Client, error) {
 	nodeID, _, err := o.getOrCreateNodeForPath(ctx, provider, p, specificPassword)
 	if err != nil {
 		return "", nil, err

@@ -25,6 +25,7 @@ func (c *Client) RunWithSudo(ctx context.Context, command string, opts ...RunOpt
 	if err := c.maybeDetectSudoMode(ctx); err != nil {
 		return "", err
 	}
+	clientConfig, _ := c.configSnapshot()
 
 	var wrappedCmd string
 	if config.LoginShell {
@@ -33,17 +34,17 @@ func (c *Client) RunWithSudo(ctx context.Context, command string, opts ...RunOpt
 		wrappedCmd = fmt.Sprintf("bash -c '%s'", strings.ReplaceAll(command, "'", "'\\''"))
 	}
 
-	switch c.cfg.SudoMode {
+	switch clientConfig.SudoMode {
 	case SudoModeRoot:
 		return c.Run(ctx, command, opts...)
 	case SudoModeSudo:
-		return c.runWithSudo(ctx, wrappedCmd, c.cfg.Password, nil, config)
+		return c.runWithSudo(ctx, wrappedCmd, clientConfig.Password, nil, config)
 	case SudoModeSudoer:
 		return c.runWithSudo(ctx, wrappedCmd, "", nil, config)
 	case SudoModeSu:
-		return c.runWithSu(ctx, command, c.cfg.SuPwd, config)
+		return c.runWithSu(ctx, command, clientConfig.SuPwd, config)
 	default:
-		return "", fmt.Errorf("unknown sudo mode: %s, please check config to set sudo mode", c.cfg.SudoMode)
+		return "", fmt.Errorf("unknown sudo mode: %s, please check config to set sudo mode", clientConfig.SudoMode)
 	}
 }
 
@@ -57,6 +58,7 @@ func (c *Client) RunScriptWithSudo(ctx context.Context, scriptContent string, op
 	if err := c.maybeDetectSudoMode(ctx); err != nil {
 		return "", err
 	}
+	clientConfig, _ := c.configSnapshot()
 
 	bashArgs := "bash -s"
 	bashCmd := fmt.Sprintf("bash -c '%s'", strings.ReplaceAll(scriptContent, "'", "'\\''"))
@@ -65,17 +67,17 @@ func (c *Client) RunScriptWithSudo(ctx context.Context, scriptContent string, op
 		bashCmd = fmt.Sprintf("bash -l -c '%s'", strings.ReplaceAll(scriptContent, "'", "'\\''"))
 	}
 
-	switch c.cfg.SudoMode {
+	switch clientConfig.SudoMode {
 	case SudoModeRoot:
 		return c.RunScript(ctx, scriptContent, opts...)
 	case SudoModeSudo:
-		return c.runWithSudo(ctx, bashArgs, c.cfg.Password, strings.NewReader(scriptContent), config)
+		return c.runWithSudo(ctx, bashArgs, clientConfig.Password, strings.NewReader(scriptContent), config)
 	case SudoModeSudoer:
 		return c.runWithSudo(ctx, bashArgs, "", strings.NewReader(scriptContent), config)
 	case SudoModeSu:
-		return c.runWithSu(ctx, bashCmd, c.cfg.SuPwd, config)
+		return c.runWithSu(ctx, bashCmd, clientConfig.SuPwd, config)
 	default:
-		return "", fmt.Errorf("unsupported sudo mode: %s", c.cfg.SudoMode)
+		return "", fmt.Errorf("unsupported sudo mode: %s", clientConfig.SudoMode)
 	}
 }
 
@@ -84,7 +86,8 @@ func (c *Client) RunInteractiveWithSudo(ctx context.Context, command string) (re
 	if err := c.maybeDetectSudoMode(ctx); err != nil {
 		return err
 	}
-	if c.cfg.SudoMode == SudoModeRoot {
+	clientConfig, _ := c.configSnapshot()
+	if clientConfig.SudoMode == SudoModeRoot {
 		return c.RunInteractive(ctx, command)
 	}
 
@@ -183,7 +186,8 @@ func (c *Client) RunInteractiveWithSudo(ctx context.Context, command string) (re
 }
 
 func (c *Client) runWithSudo(ctx context.Context, command string, password string, extraStdin io.Reader, config *RunConfig) (output string, retErr error) {
-	if password == "" && c.cfg.SudoMode == SudoModeSudo {
+	clientConfig, _ := c.configSnapshot()
+	if password == "" && clientConfig.SudoMode == SudoModeSudo {
 		return "", fmt.Errorf("sudo password is required but not provided")
 	}
 
@@ -204,7 +208,7 @@ func (c *Client) runWithSudo(ctx context.Context, command string, password strin
 	}
 
 	fullCmd := fmt.Sprintf("sudo -S -p '' %s", command)
-	return startWithTimeout(ctx, session, fullCmd, config)
+	return c.startWithTimeout(ctx, session, fullCmd, config)
 }
 
 func (c *Client) runWithSu(ctx context.Context, command string, password string, config *RunConfig) (output string, retErr error) {
@@ -262,10 +266,7 @@ func (c *Client) runWithSu(ctx context.Context, command string, password string,
 	select {
 	case err = <-done:
 	case <-ctx.Done():
-		if killErr := session.Signal(ssh.SIGKILL); killErr != nil {
-			return syncWriter.String(), fmt.Errorf("failed to kill command after context done: %w", killErr)
-		}
-		return syncWriter.String(), ctx.Err()
+		return syncWriter.String(), c.closeCanceledSession(ctx, session, done)
 	}
 
 	if err != nil {
@@ -287,19 +288,20 @@ func (c *Client) preCheckSudoMode(ctx context.Context) (isRoot bool, err error) 
 	if err := c.maybeDetectSudoMode(ctx); err != nil {
 		return false, err
 	}
-	if c.cfg.SudoMode == SudoModeRoot {
+	clientConfig, _ := c.configSnapshot()
+	if clientConfig.SudoMode == SudoModeRoot {
 		return true, nil
 	}
 
 	// none 模式明确不支持提权
-	if c.cfg.SudoMode == SudoModeNone {
+	if clientConfig.SudoMode == SudoModeNone {
 		return false, fmt.Errorf("privilege escalation is not supported for this host (sudo_mode=none)")
 	}
 
 	// sudo/sudoer 模式：通过 sudo -S -p '' true 预检，可靠且无副作用
 	// su 模式不做预检：su -c 会跑 root login shell 初始化脚本，脚本错误会导致误报
-	if c.cfg.SudoMode == SudoModeSudo || c.cfg.SudoMode == SudoModeSudoer {
-		if _, err := c.runWithSudo(ctx, "true", c.cfg.Password, nil, nil); err != nil {
+	if clientConfig.SudoMode == SudoModeSudo || clientConfig.SudoMode == SudoModeSudoer {
+		if _, err := c.runWithSudo(ctx, "true", clientConfig.Password, nil, nil); err != nil {
 			return false, fmt.Errorf("sudo access denied: %w", err)
 		}
 	}
@@ -422,13 +424,14 @@ func ignoreShellExitError(err error) error {
 }
 
 func (c *Client) getSudoParams() (string, string) {
-	switch c.cfg.SudoMode {
+	clientConfig, _ := c.configSnapshot()
+	switch clientConfig.SudoMode {
 	case SudoModeSudo:
-		return "sudo -i", c.cfg.Password
+		return "sudo -i", clientConfig.Password
 	case SudoModeSudoer:
 		return "sudo -i", ""
 	case SudoModeSu:
-		return "su -", c.cfg.SuPwd
+		return "su -", clientConfig.SuPwd
 	case SudoModeRoot, "":
 		return "", ""
 	default:
@@ -498,7 +501,7 @@ func (c *Client) RunCommandWithInput(ctx context.Context, command string, input 
 // *os.File, or a finite in-memory *bytes.Buffer, *bytes.Reader, or
 // *strings.Reader. Use RunCommandWithInput for arbitrary finite input bytes.
 func (c *Client) RunCommandWithIO(ctx context.Context, command string, sudo bool, stdin io.Reader, stdout, stderr io.Writer) (retErr error) {
-	if c == nil || c.cfg == nil {
+	if _, ok := c.configSnapshot(); !ok {
 		return fmt.Errorf("ssh client or config is nil")
 	}
 	if err := validateCommandStdin(stdin); err != nil {
@@ -517,8 +520,9 @@ func (c *Client) RunCommandWithIO(ctx context.Context, command string, sudo bool
 	if err := c.maybeDetectSudoMode(ctx); err != nil {
 		return err
 	}
+	clientConfig, _ := c.configSnapshot()
 
-	switch c.cfg.SudoMode {
+	switch clientConfig.SudoMode {
 	case SudoModeRoot:
 		var rawCmd string
 		if command != "" {
@@ -536,7 +540,7 @@ func (c *Client) RunCommandWithIO(ctx context.Context, command string, sudo bool
 		}
 		return c.runRawCommandWithPayload(ctx, rawCmd, "", stdin, stdout, stderr)
 	case SudoModeSudo:
-		if c.cfg.Password == "" {
+		if clientConfig.Password == "" {
 			return fmt.Errorf("sudo password is required but not provided")
 		}
 		var rawCmd string
@@ -545,13 +549,13 @@ func (c *Client) RunCommandWithIO(ctx context.Context, command string, sudo bool
 		} else {
 			rawCmd = "sudo -S -p '' bash"
 		}
-		return c.runRawCommandWithPayload(ctx, rawCmd, c.cfg.Password+"\n", stdin, stdout, stderr)
+		return c.runRawCommandWithPayload(ctx, rawCmd, clientConfig.Password+"\n", stdin, stdout, stderr)
 	case SudoModeSu:
 		return c.runWithSuIO(ctx, command, stdin, stdout, stderr)
 	case SudoModeNone:
 		return fmt.Errorf("privilege escalation is not supported for this host (sudo_mode=none)")
 	default:
-		return fmt.Errorf("unknown sudo mode: %s, please check config to set sudo mode", c.cfg.SudoMode)
+		return fmt.Errorf("unknown sudo mode: %s, please check config to set sudo mode", clientConfig.SudoMode)
 	}
 }
 
@@ -660,8 +664,9 @@ func (c *Client) runWithSuIO(ctx context.Context, command string, stdin io.Reade
 	}
 
 	var payload string
-	if c.cfg.SuPwd != "" {
-		payload = c.cfg.SuPwd + "\n"
+	clientConfig, _ := c.configSnapshot()
+	if clientConfig.SuPwd != "" {
+		payload = clientConfig.SuPwd + "\n"
 	}
 
 	finishStdin, setupErr := setupStdinPipeline(stdin, stdinPipe, payload)
@@ -791,6 +796,12 @@ type subsystemSessionResult struct {
 }
 
 func (c *Client) newSessionContext(ctx context.Context) (*ssh.Session, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("create SSH session context is nil")
+	}
+	if c == nil || c.sshClient == nil {
+		return nil, fmt.Errorf("ssh client is not connected")
+	}
 	result := make(chan subsystemSessionResult, 1)
 	go func() {
 		session, err := c.sshClient.NewSession()

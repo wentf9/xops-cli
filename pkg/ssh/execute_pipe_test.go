@@ -316,6 +316,98 @@ func TestRunCommandWithIO_SudoCancellation(t *testing.T) {
 	goleak.VerifyNone(t, goleak.IgnoreCurrent())
 }
 
+func TestClient_RunCancellationJoinsSessionWait(t *testing.T) {
+	var serverWG sync.WaitGroup
+	listener, rawClient, clientConn := startHangingSSHServer(t, &serverWG)
+	cli := newClient(rawClient, clientConn, &ClientConfig{SudoMode: SudoModeNone}, nil, "test-node")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, runErr := cli.Run(ctx, "sleep 10")
+	if !errors.Is(runErr, context.DeadlineExceeded) {
+		t.Fatalf("Run() error = %v, want context.DeadlineExceeded", runErr)
+	}
+
+	if err := rawClient.Close(); err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+		t.Errorf("close SSH client failed: %v", err)
+	}
+	if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		t.Errorf("close SSH listener failed: %v", err)
+	}
+	if err := clientConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		t.Errorf("close SSH transport failed: %v", err)
+	}
+	serverWG.Wait()
+	goleak.VerifyNone(t, goleak.IgnoreCurrent())
+}
+
+func TestClient_RunCancellationInterruptsPendingSessionCreation(t *testing.T) {
+	var serverWG sync.WaitGroup
+	listener, serverConfig := startKeepAliveTestSSHServer(t)
+	var clientConn net.Conn
+	var cleanupOnce sync.Once
+	cleanup := func() {
+		cleanupOnce.Do(func() {
+			if clientConn != nil {
+				if err := clientConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+					t.Errorf("close stalled SSH transport failed: %v", err)
+				}
+			}
+			if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				t.Errorf("close stalled SSH listener failed: %v", err)
+			}
+			serverWG.Wait()
+		})
+	}
+	t.Cleanup(cleanup)
+	serverWG.Go(func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		serverConn, _, requests, handshakeErr := cryptoSSH.NewServerConn(conn, serverConfig)
+		if handshakeErr != nil {
+			if closeErr := conn.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+				t.Errorf("close failed test transport failed: %v", closeErr)
+			}
+			return
+		}
+		serverWG.Go(func() {
+			cryptoSSH.DiscardRequests(requests)
+		})
+		if waitErr := serverConn.Wait(); waitErr != nil && !errors.Is(waitErr, io.EOF) {
+			t.Logf("stalled SSH server wait returned: %v", waitErr)
+		}
+	})
+
+	var err error
+	clientConn, err = net.DialTimeout("tcp", listener.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatalf("dial stalled SSH server failed: %v", err)
+	}
+	clientConfig := &cryptoSSH.ClientConfig{
+		User:            "test",
+		Auth:            []cryptoSSH.AuthMethod{cryptoSSH.Password("test")},
+		HostKeyCallback: cryptoSSH.InsecureIgnoreHostKey(),
+	}
+	clientSSHConn, chans, requests, err := cryptoSSH.NewClientConn(clientConn, listener.Addr().String(), clientConfig)
+	if err != nil {
+		t.Fatalf("create stalled SSH client failed: %v", err)
+	}
+	rawClient := cryptoSSH.NewClient(clientSSHConn, chans, requests)
+	cli := newClient(rawClient, clientConn, &ClientConfig{SudoMode: SudoModeNone}, nil, "test-node")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, runErr := cli.Run(ctx, "true")
+	if !errors.Is(runErr, context.DeadlineExceeded) {
+		t.Fatalf("Run() error = %v, want context.DeadlineExceeded", runErr)
+	}
+
+	cleanup()
+	goleak.VerifyNone(t, goleak.IgnoreCurrent())
+}
+
 // TestClient_RunCommandWithInput 验证 RunCommandWithInput 便利方法与参数验证
 func TestClient_RunCommandWithInput(t *testing.T) {
 	cli := &Client{}

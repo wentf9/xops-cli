@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -66,20 +67,40 @@ func ncRunE(cmd *cobra.Command, args []string) error {
 	}
 
 	if port != 0 {
-		return ncListenMode(port, network)
+		return ncListenMode(cmd.Context(), port, network)
 	}
 	return ncConnectMode(args, network)
 }
 
-func ncListenMode(port uint16, network string) (retErr error) {
+func ncListenMode(ctx context.Context, port uint16, network string) (retErr error) {
+	if ctx == nil {
+		return fmt.Errorf("nc listen context is nil")
+	}
 	listener, err := net.Listen(network, fmt.Sprintf(":%d", port))
 	if err != nil {
 		return fmt.Errorf("%s: %w", i18n.Tf("nc_err_listen", map[string]any{"Port": port}), err)
 	}
+	cancellationClose := make(chan error, 1)
+	stopCancellation := context.AfterFunc(ctx, func() {
+		cancellationClose <- listener.Close()
+	})
 	defer func() {
-		if closeErr := listener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
-			retErr = errors.Join(retErr, fmt.Errorf("close listener failed: %w", closeErr))
+		var cancellationCloseErr error
+		if !stopCancellation() {
+			cancellationCloseErr = <-cancellationClose
 		}
+		closeErr := listener.Close()
+		if errors.Is(cancellationCloseErr, net.ErrClosed) {
+			cancellationCloseErr = nil
+		}
+		if errors.Is(closeErr, net.ErrClosed) {
+			closeErr = nil
+		}
+		retErr = errors.Join(
+			retErr,
+			wrapNCResourceError(cancellationCloseErr, "close canceled listener"),
+			wrapNCResourceError(closeErr, "close listener"),
+		)
 	}()
 
 	if err := ncPrintStderr(i18n.Tf("nc_listening", map[string]any{"Port": port})); err != nil {
@@ -87,6 +108,9 @@ func ncListenMode(port uint16, network string) (retErr error) {
 	}
 	conn, err := listener.Accept()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("nc listen canceled: %w", ctxErr)
+		}
 		return fmt.Errorf("%s: %w", i18n.T("nc_err_accept"), err)
 	}
 
@@ -94,6 +118,13 @@ func ncListenMode(port uint16, network string) (retErr error) {
 		return fmt.Errorf("%s: %w", i18n.T("nc_err_handle"), err)
 	}
 	return nil
+}
+
+func wrapNCResourceError(err error, operation string) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s failed: %w", operation, err)
 }
 
 func ncConnectMode(args []string, network string) (retErr error) {
