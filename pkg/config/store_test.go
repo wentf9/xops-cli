@@ -51,11 +51,13 @@ func TestTransactionStoreHonorsCancellationWhileWaitingForProcessLock(t *testing
 	if !ok {
 		t.Fatal("NewDefaultStore() did not return *defaultStore")
 	}
-	store.mu.Lock()
+	if err := store.gate.acquire(t.Context()); err != nil {
+		t.Fatalf("acquire test gate: %v", err)
+	}
 	release := make(chan struct{})
 	go func() {
 		<-release
-		store.mu.Unlock()
+		store.gate.release()
 	}()
 	t.Cleanup(func() { close(release) })
 

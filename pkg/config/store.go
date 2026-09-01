@@ -67,7 +67,7 @@ type PersistResult struct {
 type defaultStore struct {
 	Path        string
 	KeyPath     string // 用于加解密配置文件中的敏感字段
-	mu          sync.Mutex
+	gate        contextGate
 	writeFile   func(string, []byte, os.FileMode) error
 	atomicWrite func(string, []byte, os.FileMode) (PersistResult, error)
 }
@@ -76,23 +76,28 @@ const defaultConfigLockTimeout = 10 * time.Second
 
 var _ TransactionStore = (*defaultStore)(nil)
 
-// lockContext acquires a process-local mutex without making a context-aware
-// caller wait indefinitely behind an in-process transaction. The file lock
-// below remains responsible for cross-process serialization.
-func lockContext(ctx context.Context, mu *sync.Mutex) error {
+// contextGate serializes in-process configuration access while allowing a
+// waiting caller to leave immediately when its context is canceled.
+type contextGate struct {
+	once sync.Once
+	sema chan struct{}
+}
+
+func (g *contextGate) acquire(ctx context.Context) error {
 	if ctx == nil {
 		return fmt.Errorf("configuration lock context is nil")
 	}
-	for {
-		if mu.TryLock() {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(time.Millisecond):
-		}
+	g.once.Do(func() { g.sema = make(chan struct{}, 1) })
+	select {
+	case g.sema <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
+}
+
+func (g *contextGate) release() {
+	<-g.sema
 }
 
 // loadOrCreateKeyLocked loads the encryption key while the configuration lock
@@ -125,10 +130,12 @@ func (s *defaultStore) loadOrCreateKeyLocked(create bool) ([]byte, error) {
 }
 
 func (s *defaultStore) Load() (cfg *Configuration, retErr error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), defaultConfigLockTimeout)
 	defer cancel()
+	if err := s.gate.acquire(ctx); err != nil {
+		return nil, fmt.Errorf("acquire in-process configuration lock for load failed: %w", err)
+	}
+	defer s.gate.release()
 	lock, err := acquireConfigLock(ctx, s.Path)
 	if err != nil {
 		return nil, fmt.Errorf("acquire configuration lock for load failed: %w", err)
@@ -146,10 +153,10 @@ func (s *defaultStore) LoadSnapshot(ctx context.Context) (snapshot Snapshot, ret
 	if ctx == nil {
 		return Snapshot{}, fmt.Errorf("load configuration snapshot context is nil")
 	}
-	if err := lockContext(ctx, &s.mu); err != nil {
+	if err := s.gate.acquire(ctx); err != nil {
 		return Snapshot{}, fmt.Errorf("load configuration snapshot canceled before lock acquisition: %w", err)
 	}
-	defer s.mu.Unlock()
+	defer s.gate.release()
 	if err := ctx.Err(); err != nil {
 		return Snapshot{}, fmt.Errorf("load configuration snapshot canceled before lock acquisition: %w", err)
 	}
@@ -183,10 +190,10 @@ func (s *defaultStore) Transact(ctx context.Context, mutate func(Snapshot) (*Con
 	if mutate == nil {
 		return CommitResult{}, fmt.Errorf("configuration transaction mutation is nil")
 	}
-	if err := lockContext(ctx, &s.mu); err != nil {
+	if err := s.gate.acquire(ctx); err != nil {
 		return CommitResult{}, fmt.Errorf("configuration transaction canceled before lock acquisition: %w", err)
 	}
-	defer s.mu.Unlock()
+	defer s.gate.release()
 	if err := ctx.Err(); err != nil {
 		return CommitResult{}, fmt.Errorf("configuration transaction canceled before lock acquisition: %w", err)
 	}
@@ -362,10 +369,12 @@ func (s *defaultStore) Save(cfg *Configuration) error {
 }
 
 func (s *defaultStore) save(cfg *Configuration) (result PersistResult, retErr error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), defaultConfigLockTimeout)
 	defer cancel()
+	if err := s.gate.acquire(ctx); err != nil {
+		return PersistResult{}, fmt.Errorf("acquire in-process configuration lock for save failed: %w", err)
+	}
+	defer s.gate.release()
 	lock, err := acquireConfigLock(ctx, s.Path)
 	if err != nil {
 		return PersistResult{}, fmt.Errorf("acquire configuration lock for save failed: %w", err)
