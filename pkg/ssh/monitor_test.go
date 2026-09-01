@@ -1,8 +1,13 @@
 package ssh
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
 	"math"
 	"testing"
+	"time"
 )
 
 func TestFormatUptime(t *testing.T) {
@@ -11,6 +16,36 @@ func TestFormatUptime(t *testing.T) {
 	}
 	if formatUptime(90060) != "1 days, 01:01" {
 		t.Errorf("expected 1 days, 01:01, got %s", formatUptime(90060))
+	}
+}
+
+func TestMetricsCollectorCancellationClosesAndJoinsBlockedDecode(t *testing.T) {
+	reader, writer := io.Pipe()
+	collector := &MetricsCollector{
+		decoder:   json.NewDecoder(reader),
+		stream:    reader,
+		lastProcs: make(map[int]procTick),
+	}
+	defer func() {
+		if err := writer.Close(); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+			t.Errorf("close metrics test writer: %v", err)
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() {
+		_, err := collector.NextFrame(ctx)
+		result <- err
+	}()
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("NextFrame() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("NextFrame() did not return after cancellation")
 	}
 }
 

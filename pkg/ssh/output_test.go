@@ -2,11 +2,22 @@ package ssh
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"testing"
 )
+
+type failingOutputWriter struct {
+	written int
+	err     error
+}
+
+func (w failingOutputWriter) Write(p []byte) (int, error) {
+	return min(w.written, len(p)), w.err
+}
 
 func TestOutputWriter_StringMode(t *testing.T) {
 	config := &RunConfig{OutMode: OutputModeString}
@@ -166,6 +177,54 @@ func TestOutputWriter_StreamMode_PartialLines(t *testing.T) {
 	expected := "[h] partial\n[h] next\n"
 	if got != expected {
 		t.Fatalf("expected %q, got %q", expected, got)
+	}
+}
+
+func TestOutputWriter_StreamModeReturnsDestinationError(t *testing.T) {
+	wantErr := errors.New("destination unavailable")
+	w := newOutputWriter(&RunConfig{
+		OutMode:      OutputModeStream,
+		StreamWriter: failingOutputWriter{err: wantErr},
+	})
+
+	written, err := w.Write([]byte("output"))
+	if written != 0 {
+		t.Fatalf("Write() written = %d, want 0", written)
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Write() error = %v, want wrapped destination error", err)
+	}
+}
+
+func TestOutputWriter_StreamModeReturnsShortWrite(t *testing.T) {
+	w := newOutputWriter(&RunConfig{
+		OutMode:      OutputModeStream,
+		StreamWriter: failingOutputWriter{written: 2},
+	})
+
+	written, err := w.Write([]byte("output"))
+	if written != 2 {
+		t.Fatalf("Write() written = %d, want 2", written)
+	}
+	if !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("Write() error = %v, want io.ErrShortWrite", err)
+	}
+}
+
+func TestOutputWriter_PrefixedStreamReturnsPrefixError(t *testing.T) {
+	wantErr := errors.New("prefix destination unavailable")
+	w := newOutputWriter(&RunConfig{
+		OutMode:      OutputModeStream,
+		StreamWriter: failingOutputWriter{err: wantErr},
+		StreamPrefix: "[host] ",
+	})
+
+	written, err := w.Write([]byte("output"))
+	if written != 0 {
+		t.Fatalf("Write() written = %d, want 0", written)
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Write() error = %v, want wrapped prefix error", err)
 	}
 }
 

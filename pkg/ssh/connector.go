@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,7 +25,7 @@ type Connector struct {
 	store ConfigStore
 	ui    InteractionHandler
 	// 连接池：缓存 nodeName -> *ssh.Client
-	clients *concurrent.Map[string, *ssh.Client]
+	clients *concurrent.Map[string, *PooledClient]
 	// singleflight 组，用来控制并发和去重
 	sf singleflight.Group
 	// 自动接受新的主机密钥
@@ -40,6 +41,7 @@ type Connector struct {
 	lifecycleCancel context.CancelFunc
 	closed          bool
 	closeDone       chan struct{}
+	closeErr        error
 	connectWG       sync.WaitGroup
 
 	// kaMu 保护 keepAliveCfg 的启用/关闭（keepAlives 自带分片锁，无需 kaMu）
@@ -50,6 +52,7 @@ type Connector struct {
 	keepAlives *concurrent.Map[string, *keepAliveEntry]
 	// keepAliveWG 覆盖配置 watcher 及已从注册表驱逐、但尚未完全返回的心跳 goroutine。
 	keepAliveWG sync.WaitGroup
+	logger      logger.DebugLogger
 }
 
 // keepAliveConfig 描述 Connector 级心跳配置（见 EnableKeepAlive）
@@ -62,29 +65,43 @@ type keepAliveConfig struct {
 // keepAliveEntry 单个连接的心跳注册条目
 type keepAliveEntry struct {
 	cancel context.CancelFunc // per-node ctx 的取消函数
-	client *ssh.Client        // 心跳目标，用于驱逐时指针比对防止误删新连接
+	client *PooledClient      // 心跳目标，用于驱逐时指针比对防止误删新连接
 	done   <-chan struct{}    // 心跳 goroutine 的退出通知
 }
 
 var hostKeyPromptMutex sync.Mutex
 
 // ErrConnectorClosed 表示 Connector 已执行 CloseAll，不能再建立或返回连接。
-var ErrConnectorClosed = errors.New("SSH connector is closed")
+var ErrConnectorClosed = errors.New("ssh connector is closed")
 
 const defaultSSHHandshakeTimeout = 10 * time.Second
 
-// NewConnector 创建一个新的 Connector
-func NewConnector(store ConfigStore, ui InteractionHandler) *Connector {
+// NewConnector 创建一个新的 Connector，支持 Functional Options。
+func NewConnector(store ConfigStore, ui InteractionHandler, opts ...Option) *Connector {
 	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
-	return &Connector{
+	c := &Connector{
 		store:           store,
 		ui:              ui,
-		clients:         concurrent.NewMap[string, *ssh.Client](concurrent.HashString),
+		clients:         concurrent.NewMap[string, *PooledClient](concurrent.HashString),
 		lifecycleCtx:    lifecycleCtx,
 		lifecycleCancel: lifecycleCancel,
 		closeDone:       make(chan struct{}),
 		keepAlives:      concurrent.NewMap[string, *keepAliveEntry](concurrent.HashString),
+		logger:          logger.NopLogger,
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(c)
+		}
+	}
+	return c
+}
+
+func (c *Connector) getLogger() logger.DebugLogger {
+	if c != nil && c.logger != nil {
+		return c.logger
+	}
+	return logger.NopLogger
 }
 
 type connectionPlanNode struct {
@@ -153,7 +170,7 @@ func (c *Connector) resolveConnectionPlan(ctx context.Context, nodeName string) 
 				path = append(path, item.name)
 			}
 			path = append(path, current)
-			return nil, fmt.Errorf("proxy jump cycle detected: %s (path: %v)", current, path)
+			return nil, &ProxyCycleError{NodeID: current, Path: path}
 		}
 
 		cfg, err := c.store.GetConfig(current)
@@ -165,9 +182,51 @@ func (c *Connector) resolveConnectionPlan(ctx context.Context, nodeName string) 
 		}
 		positions[current] = len(plan)
 		plan = append(plan, connectionPlanNode{name: current, cfg: cfg})
+
+		jumps := splitProxyJumpChain(cfg.ProxyJump)
+		if len(jumps) > 1 {
+			for index := len(jumps) - 1; index >= 0; index-- {
+				jumpName := jumps[index]
+				if cycleStart, ok := positions[jumpName]; ok {
+					path := make([]string, 0, len(plan)-cycleStart+1)
+					for _, item := range plan[cycleStart:] {
+						path = append(path, item.name)
+					}
+					path = append(path, jumpName)
+					return nil, &ProxyCycleError{NodeID: jumpName, Path: path}
+				}
+				jumpCfg, jumpErr := c.store.GetConfig(jumpName)
+				if jumpErr != nil {
+					return nil, fmt.Errorf("fetch config for proxy jump %q failed: %w", jumpName, jumpErr)
+				}
+				if jumpCfg == nil {
+					return nil, fmt.Errorf("config for proxy jump %q is nil", jumpName)
+				}
+				cloned := *jumpCfg
+				if index > 0 {
+					cloned.ProxyJump = jumps[index-1]
+				} else {
+					cloned.ProxyJump = ""
+				}
+				positions[jumpName] = len(plan)
+				plan = append(plan, connectionPlanNode{name: jumpName, cfg: &cloned})
+			}
+			return plan, nil
+		}
 		current = cfg.ProxyJump
 	}
 	return plan, nil
+}
+
+func splitProxyJumpChain(proxyJump string) []string {
+	var jumps []string
+	for jump := range strings.SplitSeq(proxyJump, ",") {
+		jump = strings.TrimSpace(jump)
+		if jump != "" {
+			jumps = append(jumps, jump)
+		}
+	}
+	return jumps
 }
 
 func (c *Connector) connectPlannedNode(ctx context.Context, planNode connectionPlanNode, dialer Dialer) (*Client, error) {
@@ -215,11 +274,11 @@ func (c *Connector) beginSharedConnect() (context.Context, func(), error) {
 func (c *Connector) connectNode(ctx context.Context, planNode connectionPlanNode, dialer Dialer) (*Client, error) {
 	nodeName := planNode.name
 	if cachedClient, ok := c.clients.Get(nodeName); ok {
-		if cachedClient.Conn == nil {
+		if cachedClient.SSHClient.Conn == nil {
 			return c.wrapCachedClient(planNode.cfg, cachedClient), nil
 		}
 
-		if err := probeWithTimeout(ctx, cachedClient, c.keepAliveProbeTimeout()); err == nil {
+		if err := probeWithTimeout(ctx, cachedClient.SSHClient, c.keepAliveProbeTimeout()); err == nil {
 			return c.wrapCachedClient(planNode.cfg, cachedClient), nil
 		} else {
 			c.evictCachedClient(nodeName, cachedClient)
@@ -232,8 +291,8 @@ func (c *Connector) connectNode(ctx context.Context, planNode connectionPlanNode
 	return c.initializeConnection(ctx, planNode, dialer)
 }
 
-func (c *Connector) wrapCachedClient(cfg *ClientConfig, cachedClient *ssh.Client) *Client {
-	return newClient(cachedClient, cfg, c.store, c.PasswordPromptPattern)
+func (c *Connector) wrapCachedClient(cfg *ClientConfig, cachedClient *PooledClient) *Client {
+	return newClientWithLogger(cachedClient.SSHClient, cachedClient.RootConn, cfg, c.store, c.PasswordPromptPattern, c.getLogger())
 }
 
 func (c *Connector) keepAliveProbeTimeout() time.Duration {
@@ -245,7 +304,7 @@ func (c *Connector) keepAliveProbeTimeout() time.Duration {
 	return DefaultKeepAliveTimeout
 }
 
-func (c *Connector) evictCachedClient(nodeName string, stale *ssh.Client) {
+func (c *Connector) evictCachedClient(nodeName string, stale *PooledClient) {
 	concurrent.RemoveIfMatch(c.clients, nodeName, stale)
 	c.removeKeepAliveFor(nodeName, stale)
 }
@@ -261,8 +320,10 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 			return nil, fmt.Errorf("failed to read su password: %w", err)
 		}
 		cfg.SuPwd = suPwd
-		if err := c.store.UpdateSudo(nodeName, cfg.SudoMode, suPwd); err != nil {
-			return nil, fmt.Errorf("failed to update sudo credentials for node '%s': %w", nodeName, err)
+		if cfg.SudoUpdateToken != "" {
+			if err := c.store.UpdateSudo(ctx, nodeName, cfg.SudoUpdateToken, cfg.SudoMode, suPwd); err != nil {
+				return nil, fmt.Errorf("failed to update sudo credentials for node '%s': %w", nodeName, err)
+			}
 		}
 	}
 
@@ -278,33 +339,34 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 	// 这同时约束直连和 ProxyJump 的通道建立，避免共享任务无限占用 singleflight。
 	networkCtx, cancelNetwork := context.WithTimeout(ctx, defaultSSHHandshakeTimeout)
 	defer cancelNetwork()
-	rawClient, err := c.dialAndHandshake(networkCtx, nodeName, cfg, dialer, sshConfig)
+	rawClient, rootConn, err := c.dialAndHandshake(networkCtx, nodeName, cfg, dialer, sshConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial and handshake: %w", err)
 	}
 
 	// 认证并连接成功后，检查我们是否通过 "auto" 下的终端交互获取到了新凭证（密码或密钥密码）。
-	if cfg.Password != "" || cfg.Passphrase != "" {
-		if err := c.store.UpdateAuth(nodeName, cfg.Password, cfg.KeyPath, cfg.Passphrase); err != nil {
-			if closeErr := rawClient.Close(); closeErr != nil {
+	if (cfg.Password != "" || cfg.Passphrase != "") && cfg.AuthUpdateToken != "" {
+		if err := c.store.UpdateAuth(ctx, nodeName, cfg.AuthUpdateToken, cfg.Password, cfg.KeyPath, cfg.Passphrase); err != nil {
+			if closeErr := rootConn.Close(); closeErr != nil {
 				return nil, fmt.Errorf("failed to update authentication for node '%s': %w; close unpublished SSH client failed: %w", nodeName, err, closeErr)
 			}
 			return nil, fmt.Errorf("failed to update authentication for node '%s': %w", nodeName, err)
 		}
 	}
 
-	if err := c.publishClient(nodeName, rawClient); err != nil {
-		if closeErr := rawClient.Close(); closeErr != nil {
+	pooled := &PooledClient{SSHClient: rawClient, RootConn: rootConn}
+	if err := c.publishClient(nodeName, pooled); err != nil {
+		if closeErr := rootConn.Close(); closeErr != nil {
 			return nil, fmt.Errorf("%w; close unpublished SSH client failed: %w", err, closeErr)
 		}
 		return nil, err
 	}
-	c.startKeepAliveFor(nodeName, rawClient)
+	c.startKeepAliveFor(nodeName, pooled)
 	// 返回封装的 Client
-	return newClient(rawClient, cfg, c.store, c.PasswordPromptPattern), nil
+	return newClientWithLogger(rawClient, rootConn, cfg, c.store, c.PasswordPromptPattern, c.getLogger()), nil
 }
 
-func (c *Connector) publishClient(nodeName string, client *ssh.Client) error {
+func (c *Connector) publishClient(nodeName string, client *PooledClient) error {
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
 	if c.closed {
@@ -324,7 +386,7 @@ func (c *Connector) publishClient(nodeName string, client *ssh.Client) error {
 // 适用于 MCP server 等长驻进程；CLI 短生命周期命令无需启用（Connect 的缓存探测已兜底）。
 func (c *Connector) EnableKeepAlive(ctx context.Context, interval, timeout time.Duration) {
 	if ctx == nil {
-		logger.Warn("ignore EnableKeepAlive call with nil context")
+		c.getLogger().Debug("ignore EnableKeepAlive call with nil context")
 		return
 	}
 	if ctx.Err() != nil {
@@ -380,7 +442,7 @@ func (c *Connector) watchKeepAliveConfig(cfg *keepAliveConfig) {
 // 杜绝"读到 cfg 后、写入注册表前"窗口内 CloseAll 先行清空导致的孤儿注册条目。
 // 同节点重连时先取消旧心跳，避免同一节点存在多个心跳 goroutine。
 // 锁序恒为 kaMu -> keepAlives 分片锁，evictDeadClient 不取 kaMu，无死锁风险
-func (c *Connector) startKeepAliveFor(nodeName string, client *ssh.Client) {
+func (c *Connector) startKeepAliveFor(nodeName string, client *PooledClient) {
 	c.kaMu.Lock()
 	defer c.kaMu.Unlock()
 	cfg := c.keepAliveCfg
@@ -400,7 +462,7 @@ func (c *Connector) startKeepAliveFor(nodeName string, client *ssh.Client) {
 	}
 	c.keepAlives.Set(nodeName, entry)
 	c.keepAliveWG.Add(1)
-	entry.done = StartKeepAlive(nodeCtx, client, cfg.interval, cfg.timeout, func(error) {
+	entry.done = StartKeepAlive(nodeCtx, client.SSHClient, cfg.interval, cfg.timeout, func(error) {
 		c.evictDeadClient(nodeName, client, entry)
 	})
 	go func() {
@@ -409,7 +471,7 @@ func (c *Connector) startKeepAliveFor(nodeName string, client *ssh.Client) {
 	}()
 }
 
-func (c *Connector) removeKeepAliveFor(nodeName string, client *ssh.Client) {
+func (c *Connector) removeKeepAliveFor(nodeName string, client *PooledClient) {
 	c.kaMu.Lock()
 	defer c.kaMu.Unlock()
 	entry, ok := c.keepAlives.Get(nodeName)
@@ -424,39 +486,47 @@ func (c *Connector) removeKeepAliveFor(nodeName string, client *ssh.Client) {
 // evictDeadClient 心跳失败后的池驱逐（StartKeepAlive 已 Close 该连接）。
 // 使用 RemoveIfMatch 原子"比对并删除"：仅当池/注册表中仍是失败连接本人时才驱逐，
 // 防止"读取-比对-删除"间隙内并发重连写入新连接后被旧心跳误删
-func (c *Connector) evictDeadClient(nodeName string, dead *ssh.Client, entry *keepAliveEntry) {
+func (c *Connector) evictDeadClient(nodeName string, dead *PooledClient, entry *keepAliveEntry) {
 	concurrent.RemoveIfMatch(c.clients, nodeName, dead)
 	concurrent.RemoveIfMatch(c.keepAlives, nodeName, entry)
 	entry.cancel()
 }
 
-func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, cfg *ClientConfig, dialer Dialer, sshConfig *ssh.ClientConfig) (*ssh.Client, error) {
+func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, cfg *ClientConfig, dialer Dialer, sshConfig *ssh.ClientConfig) (*ssh.Client, net.Conn, error) {
 	if cfg.Port == 0 {
 		cfg.Port = 22
 	}
 	targetAddr := fmt.Sprintf("%s:%d", cfg.Address, cfg.Port)
 	conn, err := dialer.DialContext(ctx, "tcp", targetAddr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to dial target '%s' (%s): %w", nodeName, targetAddr, err)
+		return nil, nil, &ConnectionError{
+			NodeID:   nodeName,
+			Address:  cfg.Address,
+			Port:     cfg.Port,
+			AuthType: cfg.AuthType,
+			Err:      err,
+		}
 	}
 	handshakeDeadline := time.Now().Add(defaultSSHHandshakeTimeout)
 	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(handshakeDeadline) {
 		handshakeDeadline = ctxDeadline
 	}
 	if err := conn.SetDeadline(handshakeDeadline); err != nil {
-		if closeErr := conn.Close(); closeErr != nil {
-			return nil, fmt.Errorf(
-				"set SSH handshake deadline for '%s' failed: %w; close connection after deadline setup failed: %w",
-				nodeName,
-				err,
-				closeErr,
-			)
+		if !strings.Contains(err.Error(), "deadline not supported") {
+			if closeErr := conn.Close(); closeErr != nil {
+				return nil, nil, fmt.Errorf(
+					"set SSH handshake deadline for '%s' failed: %w; close connection after deadline setup failed: %w",
+					nodeName,
+					err,
+					closeErr,
+				)
+			}
+			return nil, nil, fmt.Errorf("set SSH handshake deadline for '%s' failed: %w", nodeName, err)
 		}
-		return nil, fmt.Errorf("set SSH handshake deadline for '%s' failed: %w", nodeName, err)
 	}
 	stopCancelClose := context.AfterFunc(ctx, func() {
 		if closeErr := conn.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
-			logger.Warnf("close SSH handshake connection after cancellation failed: %v", closeErr)
+			c.getLogger().Debugf("close SSH handshake connection after cancellation failed: %v", closeErr)
 		}
 	})
 
@@ -467,18 +537,18 @@ func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, cfg *
 		stopCancelClose()
 		closeErr := conn.Close()
 		if ctx.Err() != nil {
-			primaryErr := fmt.Errorf("SSH handshake canceled for '%s': %w", nodeName, ctx.Err())
-			return nil, combineSSHOperationErrors(primaryErr, wrapCloseError(closeErr, "close canceled SSH handshake connection"))
+			primaryErr := fmt.Errorf("ssh handshake canceled for '%s': %w", nodeName, ctx.Err())
+			return nil, nil, combineSSHOperationErrors(primaryErr, wrapCloseError(closeErr, "close canceled SSH handshake connection"))
 		}
 		if closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
-			return nil, fmt.Errorf(
+			return nil, nil, fmt.Errorf(
 				"ssh handshake failed for '%s': %w; close failed SSH handshake connection: %w",
 				nodeName,
-				err,
+				&HandshakeError{NodeID: nodeName, Err: err},
 				closeErr,
 			)
 		}
-		return nil, fmt.Errorf("ssh handshake failed for '%s': %w", nodeName, err)
+		return nil, nil, &HandshakeError{NodeID: nodeName, Err: err}
 	}
 	stoppedCancelClose := stopCancelClose()
 	if ctx.Err() != nil || !stoppedCancelClose {
@@ -487,22 +557,24 @@ func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, cfg *
 		if cancelErr == nil {
 			cancelErr = context.Canceled
 		}
-		primaryErr := fmt.Errorf("SSH handshake canceled for '%s': %w", nodeName, cancelErr)
-		return nil, combineSSHOperationErrors(primaryErr, wrapCloseError(closeErr, "close canceled SSH connection"))
+		primaryErr := fmt.Errorf("ssh handshake canceled for '%s': %w", nodeName, cancelErr)
+		return nil, nil, combineSSHOperationErrors(primaryErr, wrapCloseError(closeErr, "close canceled SSH connection"))
 	}
 	if err := conn.SetDeadline(time.Time{}); err != nil {
-		if closeErr := ncc.Close(); closeErr != nil {
-			return nil, fmt.Errorf(
-				"clear SSH connection deadline for '%s' failed: %w; close SSH connection after clearing deadline failed: %w",
-				nodeName,
-				err,
-				closeErr,
-			)
+		if !strings.Contains(err.Error(), "deadline not supported") {
+			if closeErr := ncc.Close(); closeErr != nil {
+				return nil, nil, fmt.Errorf(
+					"clear SSH connection deadline for '%s' failed: %w; close SSH connection after clearing deadline failed: %w",
+					nodeName,
+					err,
+					closeErr,
+				)
+			}
+			return nil, nil, fmt.Errorf("clear SSH connection deadline for '%s' failed: %w", nodeName, err)
 		}
-		return nil, fmt.Errorf("clear SSH connection deadline for '%s' failed: %w", nodeName, err)
 	}
 
-	return ssh.NewClient(ncc, chans, reqs), nil
+	return ssh.NewClient(ncc, chans, reqs), conn, nil
 }
 
 func wrapCloseError(err error, operation string) error {
@@ -521,13 +593,13 @@ func combineSSHOperationErrors(primary, secondary error) error {
 
 // CloseAll 关闭所有缓存的连接并等待在途建连与心跳 goroutine 退出。
 // 调用后 Connector 进入永久关闭状态，后续 Connect 返回 ErrConnectorClosed。
-func (c *Connector) CloseAll() {
+func (c *Connector) CloseAll() error {
 	c.lifecycleMu.Lock()
 	if c.closed {
 		closeDone := c.closeDone
 		c.lifecycleMu.Unlock()
 		<-closeDone
-		return
+		return c.closeErr
 	}
 	c.closed = true
 	c.lifecycleCancel()
@@ -549,16 +621,21 @@ func (c *Connector) CloseAll() {
 	c.keepAlives.Clear()
 	c.kaMu.Unlock()
 
-	c.clients.IterCb(func(_ string, client *ssh.Client) bool {
-		if err := client.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			// CloseAll 无错误返回值；记录关闭异常后仍需继续回收其余连接。
-			logger.Warnf("close pooled SSH client failed: %v", err)
+	var closeErrs []error
+	c.clients.IterCb(func(_ string, client *PooledClient) bool {
+		if err := client.SSHClient.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			closeErrs = append(closeErrs, err)
 		}
 		return true
 	})
 	c.clients.Clear()
 	c.keepAliveWG.Wait()
+
+	if len(closeErrs) > 0 {
+		c.closeErr = fmt.Errorf("close pooled SSH clients failed: %w", errors.Join(closeErrs...))
+	}
 	close(c.closeDone)
+	return c.closeErr
 }
 
 // buildSSHConfig 根据 Identity 模型构建 ssh.ClientConfig
@@ -570,7 +647,7 @@ func (c *Connector) buildSSHConfig(cfg *ClientConfig) (*ssh.ClientConfig, func()
 	switch cfg.AuthType {
 	case "auto":
 		var autoCleanup func()
-		authMethods, autoCleanup = BuildAutoAuthMethods(cfg.User, cfg.Address, c.ui, func(s string) {
+		authMethods, autoCleanup = BuildAutoAuthMethodsWithLogger(cfg.User, cfg.Address, c.ui, func(s string) {
 			if s != "" {
 				cfg.Password = s
 				cfg.AuthType = "password"
@@ -581,12 +658,12 @@ func (c *Connector) buildSSHConfig(cfg *ClientConfig) (*ssh.ClientConfig, func()
 				cfg.Passphrase = passphrase
 				cfg.AuthType = "key"
 			}
-		})
+		}, c.getLogger())
 		cleanup = autoCleanup
 
 	case "password":
 		if cfg.Password == "" {
-			return nil, nil, fmt.Errorf("auth type is password but password is empty")
+			return nil, nil, ErrPasswordRequired
 		}
 		authMethods = append(authMethods, ssh.Password(cfg.Password))
 
@@ -600,7 +677,7 @@ func (c *Connector) buildSSHConfig(cfg *ClientConfig) (*ssh.ClientConfig, func()
 	case "agent":
 		socket := os.Getenv("SSH_AUTH_SOCK")
 		if socket == "" {
-			return nil, nil, fmt.Errorf("auth type is agent but SSH_AUTH_SOCK is not set")
+			return nil, nil, ErrAgentNotAvailable
 		}
 		conn, err := net.Dial("unix", socket)
 		if err != nil {
@@ -608,7 +685,7 @@ func (c *Connector) buildSSHConfig(cfg *ClientConfig) (*ssh.ClientConfig, func()
 		}
 		agentClient := agent.NewClient(conn)
 		authMethods = append(authMethods, ssh.PublicKeysCallback(agentClient.Signers))
-		cleanup = func() { _ = conn.Close() }
+		cleanup = func() { debugCloseResource(c.getLogger(), conn, "ssh agent connection") }
 
 	default:
 		return nil, nil, fmt.Errorf("unsupported auth type: %s", cfg.AuthType)
@@ -632,7 +709,7 @@ func (c *Connector) buildSSHConfig(cfg *ClientConfig) (*ssh.ClientConfig, func()
 
 func buildKeyAuthMethod(cfg *ClientConfig) (ssh.AuthMethod, error) {
 	if cfg.KeyPath == "" {
-		return nil, fmt.Errorf("auth type is key but key_path is empty")
+		return nil, ErrKeyPathRequired
 	}
 	keyBytes, err := os.ReadFile(expandHomeDir(cfg.KeyPath))
 	if err != nil {
@@ -690,11 +767,7 @@ func (c *Connector) getHostKeyCallback() (ssh.HostKeyCallback, error) {
 
 		if keyErr, ok := errors.AsType[*knownhosts.KeyError](err); ok {
 			if len(keyErr.Want) > 0 {
-				fmt.Printf("\n@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n" +
-					"@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n" +
-					"@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n" +
-					"IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!\n")
-				return err
+				return fmt.Errorf("%w: remote host identification has changed for %s: %w", ErrHostKeyMismatch, hostname, err)
 			}
 
 			if promptErr := c.promptHostKeyVerification(hostname, key); promptErr != nil {
@@ -729,22 +802,32 @@ func (c *Connector) promptHostKeyVerification(hostname string, key ssh.PublicKey
 	if agreed {
 		return nil
 	}
-	return fmt.Errorf("host key verification failed")
+	return ErrHostKeyMismatch
 }
 
-func appendKnownHost(knownHostsFile, hostname string, key ssh.PublicKey) error {
+func appendKnownHost(knownHostsFile, hostname string, key ssh.PublicKey) (err error) {
 	hostKeyPromptMutex.Lock()
 	defer hostKeyPromptMutex.Unlock()
 
-	f, err := os.OpenFile(knownHostsFile, os.O_APPEND|os.O_WRONLY, 0600)
-	if err != nil {
-		return fmt.Errorf("open known_hosts file failed: %w", err)
+	f, openErr := os.OpenFile(knownHostsFile, os.O_APPEND|os.O_WRONLY, 0600)
+	if openErr != nil {
+		return fmt.Errorf("open known_hosts file failed: %w", openErr)
 	}
-	defer func() { _ = f.Close() }()
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("close known_hosts file failed: %w", closeErr)
+		}
+	}()
 
 	line := knownhosts.Line([]string{knownhosts.Normalize(hostname)}, key)
 	if _, writeErr := f.WriteString(line + "\n"); writeErr != nil {
 		return fmt.Errorf("write known_hosts file failed: %w", writeErr)
 	}
 	return nil
+}
+
+// PooledClient represents a pooled SSH client with its underlying connection
+type PooledClient struct {
+	SSHClient *ssh.Client
+	RootConn  net.Conn
 }

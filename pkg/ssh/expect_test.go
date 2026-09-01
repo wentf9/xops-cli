@@ -7,14 +7,16 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/wentf9/xops-cli/pkg/logger"
 )
 
 func TestExpect_PasswordPrompt_English(t *testing.T) {
 	var stdin bytes.Buffer
-	expect := NewExpect(&stdin, ExpectRule{
+	expect := NewExpectWithOptions(&stdin, []ExpectRule{{
 		Pattern: regexp.MustCompile(DefaultPasswordPromptPattern),
 		Respond: StaticRespond("mysecret"),
-	})
+	}}, WithExpectLogger(logger.DefaultLogger()))
 
 	_, err := expect.Write([]byte("Password: "))
 	if err != nil {

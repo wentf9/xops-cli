@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"errors"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -54,7 +55,11 @@ func dialKeepAliveTestClient(t *testing.T, addr string) *ssh.Client {
 // TestProbeWithTimeout_Success 验证正常连接上心跳探测在超时前返回 nil
 func TestProbeWithTimeout_Success(t *testing.T) {
 	listener, serverConfig := startKeepAliveTestSSHServer(t)
-	defer func() { _ = listener.Close() }()
+	defer func() {
+		if err := listener.Close(); err != nil {
+			fmt.Printf("Close failed: %v\n", err)
+		}
+	}()
 
 	go func() {
 		conn, err := listener.Accept()
@@ -63,10 +68,16 @@ func TestProbeWithTimeout_Success(t *testing.T) {
 		}
 		sConn, chans, reqs, err := ssh.NewServerConn(conn, serverConfig)
 		if err != nil {
-			_ = conn.Close()
+			if err := conn.Close(); err != nil {
+				fmt.Printf("Close failed: %v\n", err)
+			}
 			return
 		}
-		defer func() { _ = sConn.Close() }()
+		defer func() {
+			if err := sConn.Close(); err != nil {
+				fmt.Printf("Close failed: %v\n", err)
+			}
+		}()
 		go ssh.DiscardRequests(reqs)
 		for range chans {
 			// 不接受任何 channel，仅维持连接
@@ -74,7 +85,11 @@ func TestProbeWithTimeout_Success(t *testing.T) {
 	}()
 
 	client := dialKeepAliveTestClient(t, listener.Addr().String())
-	defer func() { _ = client.Close() }()
+	defer func() {
+		if err := client.Close(); err != nil {
+			fmt.Printf("Close failed: %v\n", err)
+		}
+	}()
 
 	err := probeWithTimeout(context.Background(), client, 2*time.Second)
 	if err != nil {
@@ -86,7 +101,11 @@ func TestProbeWithTimeout_Success(t *testing.T) {
 // 心跳探测按超时报错，且错误可用 errors.Is(errKeepaliveTimeout) 识别
 func TestProbeWithTimeout_Timeout(t *testing.T) {
 	listener, serverConfig := startKeepAliveTestSSHServer(t)
-	defer func() { _ = listener.Close() }()
+	defer func() {
+		if err := listener.Close(); err != nil {
+			fmt.Printf("Close failed: %v\n", err)
+		}
+	}()
 
 	// hang 挂起 goroutine，测试结束时关闭以放行 defer
 	hang := make(chan struct{})
@@ -98,10 +117,16 @@ func TestProbeWithTimeout_Timeout(t *testing.T) {
 		}
 		sConn, _, reqs, err := ssh.NewServerConn(conn, serverConfig)
 		if err != nil {
-			_ = conn.Close()
+			if err := conn.Close(); err != nil {
+				fmt.Printf("Close failed: %v\n", err)
+			}
 			return
 		}
-		defer func() { _ = sConn.Close() }()
+		defer func() {
+			if err := sConn.Close(); err != nil {
+				fmt.Printf("Close failed: %v\n", err)
+			}
+		}()
 		// 故意不消费 reqs：客户端的 keepalive (WantReply) 请求永远得不到响应，
 		// 模拟网络黑洞场景
 		<-hang
@@ -110,7 +135,11 @@ func TestProbeWithTimeout_Timeout(t *testing.T) {
 	}()
 
 	client := dialKeepAliveTestClient(t, listener.Addr().String())
-	defer func() { _ = client.Close() }()
+	defer func() {
+		if err := client.Close(); err != nil {
+			fmt.Printf("Close failed: %v\n", err)
+		}
+	}()
 
 	err := probeWithTimeout(context.Background(), client, 200*time.Millisecond)
 	if err == nil {
@@ -124,7 +153,11 @@ func TestProbeWithTimeout_Timeout(t *testing.T) {
 // TestStartKeepAlive_ClosesClientOnFailure 验证心跳失败时 StartKeepAlive 关闭连接并回调 fallback
 func TestStartKeepAlive_ClosesClientOnFailure(t *testing.T) {
 	listener, serverConfig := startKeepAliveTestSSHServer(t)
-	defer func() { _ = listener.Close() }()
+	defer func() {
+		if err := listener.Close(); err != nil {
+			fmt.Printf("Close failed: %v\n", err)
+		}
+	}()
 
 	serverClosed := make(chan struct{})
 	go func() {
@@ -134,12 +167,16 @@ func TestStartKeepAlive_ClosesClientOnFailure(t *testing.T) {
 		}
 		sConn, _, reqs, err := ssh.NewServerConn(conn, serverConfig)
 		if err != nil {
-			_ = conn.Close()
+			if err := conn.Close(); err != nil {
+				fmt.Printf("Close failed: %v\n", err)
+			}
 			return
 		}
 		go ssh.DiscardRequests(reqs)
 		// 握手完成即关闭服务端连接，模拟服务端断开
-		_ = sConn.Close()
+		if err := sConn.Close(); err != nil {
+			fmt.Printf("Close failed: %v\n", err)
+		}
 		close(serverClosed)
 	}()
 
@@ -173,7 +210,11 @@ func TestStartKeepAlive_ClosesClientOnFailure(t *testing.T) {
 // TestStartKeepAlive_ContextCancel 验证 ctx 取消后心跳协程退出且不触发 fallback
 func TestStartKeepAlive_ContextCancel(t *testing.T) {
 	listener, serverConfig := startKeepAliveTestSSHServer(t)
-	defer func() { _ = listener.Close() }()
+	defer func() {
+		if err := listener.Close(); err != nil {
+			fmt.Printf("Close failed: %v\n", err)
+		}
+	}()
 
 	requestSeen := make(chan struct{})
 	releaseServer := make(chan struct{})
@@ -185,10 +226,16 @@ func TestStartKeepAlive_ContextCancel(t *testing.T) {
 		}
 		sConn, chans, reqs, err := ssh.NewServerConn(conn, serverConfig)
 		if err != nil {
-			_ = conn.Close()
+			if err := conn.Close(); err != nil {
+				fmt.Printf("Close failed: %v\n", err)
+			}
 			return
 		}
-		defer func() { _ = sConn.Close() }()
+		defer func() {
+			if err := sConn.Close(); err != nil {
+				fmt.Printf("Close failed: %v\n", err)
+			}
+		}()
 		go func() {
 			for req := range reqs {
 				close(requestSeen)
@@ -202,7 +249,11 @@ func TestStartKeepAlive_ContextCancel(t *testing.T) {
 	}()
 
 	client := dialKeepAliveTestClient(t, listener.Addr().String())
-	defer func() { _ = client.Close() }()
+	defer func() {
+		if err := client.Close(); err != nil {
+			fmt.Printf("Close failed: %v\n", err)
+		}
+	}()
 
 	fallbackCalled := make(chan error, 1)
 	ctx, cancel := context.WithCancel(context.Background())

@@ -64,6 +64,7 @@ type lazySigner struct {
 	ui                 InteractionHandler
 	passphraseCallback func(string, string)
 	decryptedSigner    ssh.Signer
+	logger             logger.DebugLogger
 	mu                 sync.RWMutex
 }
 
@@ -120,21 +121,30 @@ func (s *lazySigner) getDecryptedSigner() (ssh.Signer, error) {
 	s.decryptedSigner = decSigner
 
 	// 成功输入密码短语解密后，自动保存公钥到对应文件
-	savePublicKey(s.keyPath, decSigner.PublicKey())
+	if err := savePublicKey(s.keyPath, decSigner.PublicKey()); err != nil {
+		l := s.logger
+		if l == nil {
+			l = logger.NopLogger
+		}
+		l.Debugf("save public key for %q failed: %v", s.keyPath, err)
+	}
 
 	s.passphraseCallback(s.keyPath, passphrase)
 	return decSigner, nil
 }
 
 // savePublicKey 自动将公钥以 authorized_keys 格式保存到对应的 .pub 文件中
-func savePublicKey(keyPath string, pubKey ssh.PublicKey) {
+func savePublicKey(keyPath string, pubKey ssh.PublicKey) error {
 	pubKeyPath := keyPath + ".pub"
 	if _, err := os.Stat(pubKeyPath); err == nil {
 		// 如果公钥文件已经存在，不需要重复保存
-		return
+		return nil
 	}
 	pubBytes := ssh.MarshalAuthorizedKey(pubKey)
-	_ = os.WriteFile(pubKeyPath, pubBytes, 0644)
+	if err := os.WriteFile(pubKeyPath, pubBytes, 0644); err != nil {
+		return fmt.Errorf("write public key %q failed: %w", pubKeyPath, err)
+	}
+	return nil
 }
 
 // parseOpenSSHPublicKeyFromEncryptedPrivate 从 OpenSSH 格式的加密私钥中直接提取明文存储的公钥数据
@@ -198,7 +208,10 @@ func parseOpenSSHPublicKeyFromEncryptedPrivate(keyData []byte) (ssh.PublicKey, e
 }
 
 // tryResolveKey 尝试解析特定路径的私钥
-func tryResolveKey(keyPath string, ui InteractionHandler, passphraseCallback func(string, string)) (ssh.Signer, ssh.AuthMethod, error) {
+func tryResolveKey(keyPath string, ui InteractionHandler, passphraseCallback func(string, string), l logger.DebugLogger) (ssh.Signer, ssh.AuthMethod, error) {
+	if l == nil {
+		l = logger.NopLogger
+	}
 	keyData, err := os.ReadFile(keyPath)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read key data failed: %w", err)
@@ -216,17 +229,19 @@ func tryResolveKey(keyPath string, ui InteractionHandler, passphraseCallback fun
 		var parseErr error
 		pubKey, _, _, _, parseErr = ssh.ParseAuthorizedKey(pubKeyData)
 		if parseErr != nil {
-			logger.Debugf("Failed to parse public key: %s, error: %v", pubKeyPath, parseErr)
+			l.Debugf("Failed to parse public key: %s, error: %v", pubKeyPath, parseErr)
 			pubKey = nil
 		}
 	} else {
 		// 尝试直接从 OpenSSH 格式的加密私钥中免密提取公钥数据
 		if extractedPubKey, extractErr := parseOpenSSHPublicKeyFromEncryptedPrivate(keyData); extractErr == nil {
 			pubKey = extractedPubKey
-			logger.Debugf("Extracted public key from OpenSSH private key without passphrase: %s", keyPath)
-			savePublicKey(keyPath, pubKey)
+			l.Debugf("Extracted public key from OpenSSH private key without passphrase: %s", keyPath)
+			if saveErr := savePublicKey(keyPath, pubKey); saveErr != nil {
+				l.Debugf("save extracted public key for %q failed: %v", keyPath, saveErr)
+			}
 		} else {
-			logger.Debugf("Failed to extract public key from OpenSSH key: %s, error: %v", keyPath, extractErr)
+			l.Debugf("Failed to extract public key from OpenSSH key: %s, error: %v", keyPath, extractErr)
 		}
 	}
 
@@ -237,6 +252,7 @@ func tryResolveKey(keyPath string, ui InteractionHandler, passphraseCallback fun
 			keyData:            keyData,
 			ui:                 ui,
 			passphraseCallback: passphraseCallback,
+			logger:             l,
 		}
 		return lazy, nil, nil
 	}
@@ -255,7 +271,9 @@ func tryResolveKey(keyPath string, ui InteractionHandler, passphraseCallback fun
 			if err != nil {
 				return nil, fmt.Errorf("failed to parse private key with passphrase: %w", err)
 			}
-			savePublicKey(keyPathCopy, s.PublicKey())
+			if saveErr := savePublicKey(keyPathCopy, s.PublicKey()); saveErr != nil {
+				l.Debugf("save public key for %q failed: %v", keyPathCopy, saveErr)
+			}
 			passphraseCallback(keyPathCopy, passphrase)
 			return []ssh.Signer{s}, nil
 		})
@@ -266,8 +284,16 @@ func tryResolveKey(keyPath string, ui InteractionHandler, passphraseCallback fun
 }
 
 // BuildAutoAuthMethods 生成一个包含多种回退机制的 AuthMethod 链
-// passphraseCallback 在用户成功输入受密码保护的私钥密码后被调用，用于持久化
 func BuildAutoAuthMethods(user, host string, ui InteractionHandler, passwordCallback func(string), passphraseCallback func(keyPath, passphrase string)) ([]ssh.AuthMethod, func()) {
+	return BuildAutoAuthMethodsWithLogger(user, host, ui, passwordCallback, passphraseCallback, logger.NopLogger)
+}
+
+// BuildAutoAuthMethodsWithLogger 生成一个包含多种回退机制的 AuthMethod 链，并注入 Logger
+// passphraseCallback 在用户成功输入受密码保护的私钥密码后被调用，用于持久化
+func BuildAutoAuthMethodsWithLogger(user, host string, ui InteractionHandler, passwordCallback func(string), passphraseCallback func(keyPath, passphrase string), l logger.DebugLogger) ([]ssh.AuthMethod, func()) {
+	if l == nil {
+		l = logger.NopLogger
+	}
 	var methods []ssh.AuthMethod
 	var cleanup func()
 
@@ -276,7 +302,7 @@ func BuildAutoAuthMethods(user, host string, ui InteractionHandler, passwordCall
 		if conn, err := net.Dial("unix", socket); err == nil {
 			agentClient := agent.NewClient(conn)
 			methods = append(methods, ssh.PublicKeysCallback(agentClient.Signers))
-			cleanup = func() { _ = conn.Close() }
+			cleanup = func() { debugCloseResource(l, conn, "ssh agent connection") }
 		}
 	}
 
@@ -285,20 +311,20 @@ func BuildAutoAuthMethods(user, host string, ui InteractionHandler, passwordCall
 	var signers []ssh.Signer
 	for _, p := range defaultKeys {
 		keyPath := expandHomeDir(p)
-		logger.Debugf("Checking default key: %s", keyPath)
+		l.Debugf("Checking default key: %s", keyPath)
 		if _, err := os.Stat(keyPath); err != nil {
 			if os.IsNotExist(err) {
-				logger.Debugf("Key file does not exist: %s", keyPath)
+				l.Debugf("Key file does not exist: %s", keyPath)
 			} else {
-				logger.Debugf("Failed to stat key: %s, error: %v", keyPath, err)
+				l.Debugf("Failed to stat key: %s, error: %v", keyPath, err)
 			}
 			continue
 		}
-		logger.Debugf("Found default key: %s", keyPath)
+		l.Debugf("Found default key: %s", keyPath)
 
-		signer, method, err := tryResolveKey(keyPath, ui, passphraseCallback)
+		signer, method, err := tryResolveKey(keyPath, ui, passphraseCallback, l)
 		if err != nil {
-			logger.Debugf("Failed to resolve key: %s, error: %v", keyPath, err)
+			l.Debugf("Failed to resolve key: %s, error: %v", keyPath, err)
 			continue
 		}
 		if signer != nil {

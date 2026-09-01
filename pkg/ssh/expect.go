@@ -39,16 +39,51 @@ type Expect struct {
 	Target        io.Writer // 匹配过程中和完成后的透传目标（用于交互式 Shell 实时显示）
 	err           error     // 记录执行 Respond 时可能出现的错误
 	matchOffset   int       // 记录已匹配内容的偏移量，避免截断缓冲导致历史丢失
+	logger        logger.DebugLogger
+}
+
+// ExpectOption 用于配置 Expect
+type ExpectOption func(*Expect)
+
+// WithExpectLogger 为 Expect 注入 DebugLogger（必须支持并发调用）
+func WithExpectLogger(l logger.DebugLogger) ExpectOption {
+	return func(e *Expect) {
+		if l != nil {
+			e.logger = l
+		} else {
+			e.logger = logger.NopLogger
+		}
+	}
 }
 
 // NewExpect 创建一个 Expect 实例。
 // writer 是自动响应的目标（例如 SSH 会话的 stdin）。
+// 该构造器保留原有的可变参数 API；需要注入可选依赖时使用 NewExpectWithOptions。
 func NewExpect(writer io.Writer, rules ...ExpectRule) *Expect {
-	return &Expect{
+	return NewExpectWithOptions(writer, rules)
+}
+
+// NewExpectWithOptions 创建一个支持显式依赖注入的 Expect 实例。
+func NewExpectWithOptions(writer io.Writer, rules []ExpectRule, opts ...ExpectOption) *Expect {
+	e := &Expect{
 		rules:   rules,
 		writer:  writer,
 		matched: make(chan struct{}),
+		logger:  logger.NopLogger,
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(e)
+		}
+	}
+	return e
+}
+
+func (e *Expect) getLogger() logger.DebugLogger {
+	if e != nil && e.logger != nil {
+		return e.logger
+	}
+	return logger.NopLogger
 }
 
 // SetTarget 设置透传目标，所有 Write 进来的数据都会原样写入 target。
@@ -108,7 +143,7 @@ func (e *Expect) matchRulesLocked() {
 			break
 		}
 
-		logger.Debugf("Expect rule matched successfully. Pattern: %q", current.Pattern.String())
+		e.getLogger().Debugf("Expect rule matched successfully. Pattern: %q", current.Pattern.String())
 
 		if current.Respond != nil {
 			response, err := current.Respond()
@@ -153,7 +188,7 @@ func (e *Expect) Wait(ctx context.Context, timeout time.Duration) error {
 
 	e.mu.Lock()
 	if e.ruleIdx < len(e.rules) {
-		logger.Debugf("Expect waiting for rule match. Pattern: %q, Timeout: %s", e.rules[e.ruleIdx].Pattern.String(), timeout)
+		e.getLogger().Debugf("Expect waiting for rule match. Pattern: %q, Timeout: %s", e.rules[e.ruleIdx].Pattern.String(), timeout)
 	}
 	e.mu.Unlock()
 
@@ -175,7 +210,7 @@ func (e *Expect) Wait(ctx context.Context, timeout time.Duration) error {
 		actual := e.outputBuf.String()
 		e.mu.Unlock()
 
-		logger.Debugf("Expect match timeout. Pattern: %q, Actual output received: %q", pattern, actual)
+		e.getLogger().Debugf("Expect match timeout. Pattern: %q, Actual output received: %q", pattern, actual)
 		return fmt.Errorf("expect timeout after %s waiting for pattern: %s", timeout, pattern)
 	}
 }

@@ -14,7 +14,11 @@ func startUDPEchoServer(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("udp echo listen: %v", err)
 	}
-	t.Cleanup(func() { _ = conn.Close() })
+	t.Cleanup(func() {
+		if err := conn.Close(); err != nil {
+			t.Logf("Close failed: %v", err)
+		}
+	})
 
 	go func() {
 		buf := make([]byte, 64*1024)
@@ -39,7 +43,9 @@ func TestUDPForwarder_ForwardsData(t *testing.T) {
 		t.Fatalf("pre-alloc udp: %v", err)
 	}
 	forwardAddr := tmp.LocalAddr().String()
-	_ = tmp.Close()
+	if err := tmp.Close(); err != nil {
+		t.Logf("Close failed: %v", err)
+	}
 
 	f := NewUDPForwarder(forwardAddr, echoAddr)
 	errCh := make(chan error, 1)
@@ -51,7 +57,11 @@ func TestUDPForwarder_ForwardsData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial forwarder: %v", err)
 	}
-	defer func() { _ = client.Close() }()
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Logf("Close failed: %v", err)
+		}
+	}()
 
 	msg := []byte("ping")
 	if _, err := client.Write(msg); err != nil {
@@ -77,10 +87,13 @@ func TestUDPForwarder_SessionReuse(t *testing.T) {
 		t.Fatalf("pre-alloc udp: %v", err)
 	}
 	forwardAddr := tmp.LocalAddr().String()
-	_ = tmp.Close()
+	if err := tmp.Close(); err != nil {
+		t.Logf("Close failed: %v", err)
+	}
 
 	f := NewUDPForwarder(forwardAddr, echoAddr)
-	go func() { _ = f.Run(t.Context()) }()
+	runErrCh := make(chan error, 1)
+	go func() { runErrCh <- f.Run(t.Context()) }()
 
 	time.Sleep(30 * time.Millisecond)
 
@@ -88,7 +101,11 @@ func TestUDPForwarder_SessionReuse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial forwarder: %v", err)
 	}
-	defer func() { _ = client.Close() }()
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Logf("Close failed: %v", err)
+		}
+	}()
 
 	// send multiple packets — all should reuse the same upstream session
 	for i := range 3 {
@@ -123,7 +140,9 @@ func TestUDPForwarder_CtxCancel(t *testing.T) {
 		t.Fatalf("pre-alloc udp: %v", err)
 	}
 	forwardAddr := tmp.LocalAddr().String()
-	_ = tmp.Close()
+	if err := tmp.Close(); err != nil {
+		t.Logf("Close failed: %v", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -152,7 +171,9 @@ func TestUDPForwarder_SessionCleanupOnCancel(t *testing.T) {
 		t.Fatalf("pre-alloc udp: %v", err)
 	}
 	forwardAddr := tmp.LocalAddr().String()
-	_ = tmp.Close()
+	if err := tmp.Close(); err != nil {
+		t.Logf("Close failed: %v", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -167,7 +188,11 @@ func TestUDPForwarder_SessionCleanupOnCancel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial forwarder: %v", err)
 	}
-	defer func() { _ = client.Close() }()
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Logf("Close failed: %v", err)
+		}
+	}()
 
 	msg := []byte("ping")
 	if _, err := client.Write(msg); err != nil {
@@ -204,10 +229,7 @@ func TestUDPForwarder_SessionCleanupOnCancel(t *testing.T) {
 		t.Fatal("Run did not exit after ctx cancel")
 	}
 
-	// 此时因为 upstream 已经被 Close 且 relay goroutine 应该已退出，session 数目应该立刻为 0
-	// 稍微等待下异步协程完成 defer 中的 delete 操作
-	time.Sleep(10 * time.Millisecond)
-
+	// Run 在返回前必须等待 relay 完成清理，因此无需额外 sleep。
 	f.mu.Lock()
 	sessionCountAfter := len(f.sessions)
 	f.mu.Unlock()

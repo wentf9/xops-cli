@@ -18,6 +18,23 @@ type mockConfigStore struct {
 	cfg *ClientConfig
 }
 
+type recordingConfigStore struct {
+	sudoUpdates atomic.Int32
+}
+
+func (s *recordingConfigStore) GetConfig(string) (*ClientConfig, error) {
+	return nil, errors.New("unexpected GetConfig call")
+}
+
+func (s *recordingConfigStore) UpdateAuth(context.Context, string, string, string, string, string) error {
+	return errors.New("unexpected UpdateAuth call")
+}
+
+func (s *recordingConfigStore) UpdateSudo(context.Context, string, string, SudoMode, string) error {
+	s.sudoUpdates.Add(1)
+	return nil
+}
+
 type coordinatedDeadConn struct {
 	ssh.Conn
 	requestCount atomic.Int32
@@ -70,13 +87,17 @@ func TestConnector_Connect_ConcurrentStaleProbeRunsOnce(t *testing.T) {
 		Password: "mockpassword",
 	}}
 	connector := NewConnector(store, &mockUI{})
-	defer connector.CloseAll()
+	defer func() {
+		if err := connector.CloseAll(); err != nil {
+			t.Logf("CloseAll failed: %v", err)
+		}
+	}()
 
 	deadConn := &coordinatedDeadConn{
 		requestSeen: make(chan struct{}),
 		release:     make(chan struct{}),
 	}
-	connector.clients.Set("node-1", &ssh.Client{Conn: deadConn})
+	connector.clients.Set("node-1", &PooledClient{SSHClient: &ssh.Client{Conn: deadConn}})
 
 	firstDone := make(chan error, 1)
 	secondDone := make(chan error, 1)
@@ -121,13 +142,17 @@ func TestConnector_Connect_CallerCancellationDoesNotCloseSharedClient(t *testing
 		Password: "mockpassword",
 	}}
 	connector := NewConnector(store, &mockUI{})
-	defer connector.CloseAll()
+	defer func() {
+		if err := connector.CloseAll(); err != nil {
+			t.Logf("CloseAll failed: %v", err)
+		}
+	}()
 
 	healthyConn := &coordinatedHealthyConn{
 		requestSeen: make(chan struct{}),
 		release:     make(chan struct{}),
 	}
-	connector.clients.Set("node-1", &ssh.Client{Conn: healthyConn})
+	connector.clients.Set("node-1", &PooledClient{SSHClient: &ssh.Client{Conn: healthyConn}})
 
 	firstCtx, cancelFirst := context.WithCancel(context.Background())
 	firstDone := make(chan error, 1)
@@ -175,7 +200,11 @@ func TestConnector_CloseAllCancelsInFlightHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen failed: %v", err)
 	}
-	defer func() { _ = listener.Close() }()
+	defer func() {
+		if err := listener.Close(); err != nil {
+			t.Logf("Close failed: %v", err)
+		}
+	}()
 	host, portText, err := net.SplitHostPort(listener.Addr().String())
 	if err != nil {
 		t.Fatalf("split listener address failed: %v", err)
@@ -210,14 +239,20 @@ func TestConnector_CloseAllCancelsInFlightHandshake(t *testing.T) {
 	var serverConn net.Conn
 	select {
 	case serverConn = <-accepted:
-		defer func() { _ = serverConn.Close() }()
+		defer func() {
+			if err := serverConn.Close(); err != nil {
+				t.Logf("Close failed: %v", err)
+			}
+		}()
 	case <-time.After(2 * time.Second):
 		t.Fatal("connector did not reach SSH handshake")
 	}
 
 	closeDone := make(chan struct{})
 	go func() {
-		connector.CloseAll()
+		if err := connector.CloseAll(); err != nil {
+			t.Logf("CloseAll failed: %v", err)
+		}
 		close(closeDone)
 	}()
 	select {
@@ -245,12 +280,39 @@ func (m *mockConfigStore) GetConfig(nodeID string) (*ClientConfig, error) {
 	return m.cfg, nil
 }
 
-func (m *mockConfigStore) UpdateAuth(nodeID string, password, keyPath, passphrase string) error {
+func (m *mockConfigStore) UpdateAuth(context.Context, string, string, string, string, string) error {
 	return nil
 }
 
-func (m *mockConfigStore) UpdateSudo(nodeID string, mode SudoMode, suPwd string) error {
+func (m *mockConfigStore) UpdateSudo(context.Context, string, string, SudoMode, string) error {
 	return nil
+}
+
+func TestClientUpdateSudoModeKeepsReadOnlyDiscoverySessionLocal(t *testing.T) {
+	store := &recordingConfigStore{}
+	client := newClient(nil, nil, &ClientConfig{NodeID: "openssh:remote", SudoMode: SudoModeAuto}, store, "")
+
+	if err := client.updateSudoMode(t.Context(), SudoModeSudo); err != nil {
+		t.Fatalf("updateSudoMode() error = %v", err)
+	}
+	if client.cfg.SudoMode != SudoModeSudo {
+		t.Fatalf("SudoMode = %q, want %q", client.cfg.SudoMode, SudoModeSudo)
+	}
+	if got := store.sudoUpdates.Load(); got != 0 {
+		t.Fatalf("UpdateSudo calls = %d, want 0 for session-local configuration", got)
+	}
+}
+
+func TestClientUpdateSudoModePersistsWhenSnapshotHasToken(t *testing.T) {
+	store := &recordingConfigStore{}
+	client := newClient(nil, nil, &ClientConfig{NodeID: "persisted", SudoMode: SudoModeAuto, SudoUpdateToken: "snapshot-token"}, store, "")
+
+	if err := client.updateSudoMode(t.Context(), SudoModeSudo); err != nil {
+		t.Fatalf("updateSudoMode() error = %v", err)
+	}
+	if got := store.sudoUpdates.Load(); got != 1 {
+		t.Fatalf("UpdateSudo calls = %d, want 1", got)
+	}
 }
 
 type mockUI struct{}
@@ -280,7 +342,7 @@ func TestConnector_Connect_Cached(t *testing.T) {
 
 	// 模拟已存在缓存连接
 	dummyClient := &ssh.Client{}
-	connector.clients.Set("node-1", dummyClient)
+	connector.clients.Set("node-1", &PooledClient{SSHClient: dummyClient})
 
 	ctx := context.Background()
 	client, err := connector.Connect(ctx, "node-1")
@@ -336,7 +398,7 @@ func TestConnector_Connect_Reconnection(t *testing.T) {
 	dummyClient := &ssh.Client{
 		Conn: mc,
 	}
-	connector.clients.Set("node-1", dummyClient)
+	connector.clients.Set("node-1", &PooledClient{SSHClient: dummyClient})
 
 	ctx := context.Background()
 	_, err := connector.Connect(ctx, "node-1")
@@ -412,8 +474,8 @@ func TestConnector_Connect_ResolvedProxyChainUsesRootClient(t *testing.T) {
 	}}
 	connector := NewConnector(store, &mockUI{})
 	// nil Conn 的客户端仅用于验证计划顺序和包装结果，不执行网络探测。
-	connector.clients.Set("target", &ssh.Client{})
-	connector.clients.Set("jump", &ssh.Client{})
+	connector.clients.Set("target", &PooledClient{SSHClient: &ssh.Client{}})
+	connector.clients.Set("jump", &PooledClient{SSHClient: &ssh.Client{}})
 
 	client, err := connector.Connect(context.Background(), "target")
 	if err != nil {
@@ -425,7 +487,9 @@ func TestConnector_Connect_ResolvedProxyChainUsesRootClient(t *testing.T) {
 
 	// 测试客户端没有底层 Conn，清空后再关闭 Connector，避免对无效 mock 执行 Close。
 	connector.clients.Clear()
-	connector.CloseAll()
+	if err := connector.CloseAll(); err != nil {
+		t.Logf("CloseAll failed: %v", err)
+	}
 }
 
 func TestConnector_Connect_ConcurrentProxyJumpCycleDoesNotDeadlock(t *testing.T) {
@@ -461,7 +525,9 @@ func TestConnector_Connect_ConcurrentProxyJumpCycleDoesNotDeadlock(t *testing.T)
 
 	closeDone := make(chan struct{})
 	go func() {
-		connector.CloseAll()
+		if err := connector.CloseAll(); err != nil {
+			t.Logf("CloseAll failed: %v", err)
+		}
 		close(closeDone)
 	}()
 	select {
@@ -475,6 +541,61 @@ type mockProxyJumpStore struct {
 	cfgs map[string]*ClientConfig
 }
 
+func TestConnector_ResolveConnectionPlan_MultiHopProxyJump(t *testing.T) {
+	store := &mockProxyJumpStore{cfgs: map[string]*ClientConfig{
+		"target":         {NodeID: "target", ProxyJump: "openssh:first, openssh:second"},
+		"openssh:first":  {NodeID: "openssh:first", ProxyJump: "ignored"},
+		"openssh:second": {NodeID: "openssh:second", ProxyJump: "ignored"},
+	}}
+	connector := NewConnector(store, nil)
+	t.Cleanup(func() {
+		if err := connector.CloseAll(); err != nil {
+			t.Errorf("close connector: %v", err)
+		}
+	})
+
+	plan, err := connector.resolveConnectionPlan(t.Context(), "target")
+	if err != nil {
+		t.Fatalf("resolveConnectionPlan failed: %v", err)
+	}
+	if len(plan) != 3 {
+		t.Fatalf("got %d plan nodes, want 3", len(plan))
+	}
+	if plan[0].name != "target" || plan[1].name != "openssh:second" || plan[2].name != "openssh:first" {
+		t.Fatalf("unexpected plan order: %q, %q, %q", plan[0].name, plan[1].name, plan[2].name)
+	}
+	if plan[1].cfg.ProxyJump != "openssh:first" {
+		t.Fatalf("second hop proxy is %q, want openssh:first", plan[1].cfg.ProxyJump)
+	}
+	if plan[2].cfg.ProxyJump != "" {
+		t.Fatalf("first hop proxy is %q, want direct connection", plan[2].cfg.ProxyJump)
+	}
+}
+
+func TestConnector_Connect_MultiHopProxyJump(t *testing.T) {
+	store := &mockProxyJumpStore{cfgs: map[string]*ClientConfig{
+		"target":         {NodeID: "target", ProxyJump: "openssh:first,openssh:second"},
+		"openssh:first":  {NodeID: "openssh:first"},
+		"openssh:second": {NodeID: "openssh:second"},
+	}}
+	connector := NewConnector(store, &mockUI{})
+	for nodeID := range store.cfgs {
+		connector.clients.Set(nodeID, &PooledClient{SSHClient: &ssh.Client{}})
+	}
+
+	client, err := connector.Connect(t.Context(), "target")
+	if err != nil {
+		t.Fatalf("connect multi-hop proxy chain failed: %v", err)
+	}
+	if client.cfg.NodeID != "target" {
+		t.Fatalf("got final node %q, want target", client.cfg.NodeID)
+	}
+	connector.clients.Clear()
+	if err := connector.CloseAll(); err != nil {
+		t.Errorf("close connector: %v", err)
+	}
+}
+
 func (m *mockProxyJumpStore) GetConfig(nodeID string) (*ClientConfig, error) {
 	if cfg, ok := m.cfgs[nodeID]; ok {
 		return cfg, nil
@@ -482,10 +603,10 @@ func (m *mockProxyJumpStore) GetConfig(nodeID string) (*ClientConfig, error) {
 	return nil, fmt.Errorf("node not found: %s", nodeID)
 }
 
-func (m *mockProxyJumpStore) UpdateAuth(nodeID string, password, keyPath, passphrase string) error {
+func (m *mockProxyJumpStore) UpdateAuth(context.Context, string, string, string, string, string) error {
 	return nil
 }
 
-func (m *mockProxyJumpStore) UpdateSudo(nodeID string, mode SudoMode, suPwd string) error {
+func (m *mockProxyJumpStore) UpdateSudo(context.Context, string, string, SudoMode, string) error {
 	return nil
 }

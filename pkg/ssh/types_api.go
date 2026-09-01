@@ -1,5 +1,7 @@
 package ssh
 
+import "context"
+
 // SudoMode 定义了 SSH 连接执行命令时的提权方式
 type SudoMode string
 
@@ -22,9 +24,15 @@ type ClientConfig struct {
 	Password   string
 	KeyPath    string
 	Passphrase string
-	SudoMode   SudoMode // "root", "sudo", "sudoer", "su", "none", "auto"
-	SuPwd      string
-	ProxyJump  string // 跳板机的 NodeID
+	// AuthUpdateToken conditionally authorizes persistence of discovered
+	// authentication values. An empty token makes discovery session-local.
+	AuthUpdateToken string
+	SudoMode        SudoMode // "root", "sudo", "sudoer", "su", "none", "auto"
+	SuPwd           string
+	// SudoUpdateToken conditionally authorizes persistence of discovered sudo
+	// values. An empty token makes discovery session-local.
+	SudoUpdateToken string
+	ProxyJump       string // 跳板机的 NodeID
 	// PasswordPromptPattern 自定义密码提示正则（节点级，可选）。
 	// 为空时回落到 Connector 的全局配置，再为空则使用内置的多语言默认模式。
 	PasswordPromptPattern string
@@ -36,10 +44,10 @@ type ConfigStore interface {
 	GetConfig(nodeID string) (*ClientConfig, error)
 
 	// UpdateAuth 在 "auto" 模式下探测到可用密码或私钥 passphrase 时，写回持久化存储
-	UpdateAuth(nodeID string, password, keyPath, passphrase string) error
+	UpdateAuth(ctx context.Context, nodeID, authUpdateToken, password, keyPath, passphrase string) error
 
 	// UpdateSudo 在探测到可用提权模式或接收到 su 密码时，写回持久化存储
-	UpdateSudo(nodeID string, mode SudoMode, suPwd string) error
+	UpdateSudo(ctx context.Context, nodeID, sudoUpdateToken string, mode SudoMode, suPwd string) error
 }
 
 // InteractionHandler 定义应用层（CLI 或 GUI）所需实现的交互式输入接口。

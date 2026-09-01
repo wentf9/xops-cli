@@ -3,7 +3,6 @@ package executor
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -67,16 +66,7 @@ func (e *LocalExecutor) RunWithSudo(ctx context.Context, cmd string, opts ...ssh
 	}
 
 	c := exec.CommandContext(ctx, "bash", args...)
-
-	stdin, err := c.StdinPipe()
-	if err != nil {
-		return "", err
-	}
-
-	go func() {
-		defer func() { _ = stdin.Close() }()
-		_, _ = io.WriteString(stdin, e.password+"\n")
-	}()
+	c.Stdin = strings.NewReader(e.password + "\n")
 
 	out, err := c.CombinedOutput()
 	if err != nil {
@@ -98,17 +88,10 @@ func (e *LocalExecutor) InteractiveWithSudo(ctx context.Context, args []string) 
 	if e.password != "" {
 		// sudo -v -S 从 stdin 读取密码并更新 sudo 缓存
 		vCmd := exec.CommandContext(ctx, "sudo", "-v", "-S", "-p", "")
-		vStdin, err := vCmd.StdinPipe()
-		if err != nil {
-			return err
+		vCmd.Stdin = strings.NewReader(e.password + "\n")
+		if err := vCmd.Run(); err != nil {
+			return fmt.Errorf("validate sudo password failed: %w", err)
 		}
-		if err := vCmd.Start(); err != nil {
-			return err
-		}
-		_, _ = vStdin.Write([]byte(e.password + "\n"))
-		_ = vStdin.Close()
-		_ = vCmd.Wait()
-		// 无论 sudo -v 是否成功（可能密码错），我们都继续下一步，让原生 sudo 处理
 	}
 
 	// 现在密码已经在缓存里（或者由用户手动输入），直接运行 sudo -s 并接管 TTY

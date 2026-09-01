@@ -4,10 +4,12 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // DiskMetric 存储单个分区的指标
@@ -81,6 +83,8 @@ type procTick struct {
 }
 
 type MetricsCollector struct {
+	mu         sync.Mutex
+	nextMu     sync.Mutex
 	client     *Client
 	decoder    *json.Decoder
 	stream     io.ReadCloser
@@ -90,6 +94,7 @@ type MetricsCollector struct {
 	SortBy     string // "cpu", "mem"
 	SortAsc    bool
 	cancel     context.CancelFunc
+	generation uint64
 }
 
 func NewMetricsCollector(c *Client) *MetricsCollector {
@@ -102,42 +107,92 @@ func NewMetricsCollector(c *Client) *MetricsCollector {
 }
 
 func (mc *MetricsCollector) Start(ctx context.Context) error {
+	if ctx == nil {
+		return fmt.Errorf("start metrics collector context is nil")
+	}
 	derivedCtx, cancel := context.WithCancel(ctx)
+	mc.mu.Lock()
+	if mc.cancel != nil || mc.stream != nil {
+		mc.mu.Unlock()
+		cancel()
+		return fmt.Errorf("metrics collector is already started")
+	}
+	mc.generation++
+	generation := mc.generation
 	mc.cancel = cancel
+	mc.mu.Unlock()
 
 	// 发送探针前，先探测系统平台
 	osName, err := mc.client.RunWithoutLogin(derivedCtx, "uname -s")
 	if err != nil {
-		cancel()
+		mc.finishStart(generation, cancel)
 		return fmt.Errorf("failed to detect OS platform: %w", err)
 	}
 	osName = strings.TrimSpace(osName)
 	if osName != "Linux" {
-		cancel()
+		mc.finishStart(generation, cancel)
 		return fmt.Errorf("dashboard monitoring is not supported on %s (Linux only)", osName)
 	}
 
 	stream, err := mc.client.RunStream(derivedCtx, probeScript)
 	if err != nil {
-		cancel()
+		mc.finishStart(generation, cancel)
 		return fmt.Errorf("failed to start stream: %w", err)
+	}
+	mc.mu.Lock()
+	if mc.generation != generation || mc.cancel == nil {
+		mc.mu.Unlock()
+		if closeErr := stream.Close(); closeErr != nil {
+			return errors.Join(context.Canceled, fmt.Errorf("close canceled metrics stream failed: %w", closeErr))
+		}
+		return context.Canceled
 	}
 	mc.stream = stream
 	mc.decoder = json.NewDecoder(stream)
+	mc.mu.Unlock()
 	return nil
 }
 
-func (mc *MetricsCollector) Close() {
-	if mc.cancel != nil {
-		mc.cancel()
+func (mc *MetricsCollector) finishStart(generation uint64, cancel context.CancelFunc) {
+	cancel()
+	mc.mu.Lock()
+	if mc.generation == generation {
+		mc.cancel = nil
 	}
-	if mc.stream != nil {
-		_ = mc.stream.Close()
+	mc.mu.Unlock()
+}
+
+func (mc *MetricsCollector) Close() error {
+	mc.mu.Lock()
+	mc.generation++
+	cancel := mc.cancel
+	stream := mc.stream
+	mc.cancel = nil
+	mc.stream = nil
+	mc.decoder = nil
+	mc.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
+	if stream == nil {
+		return nil
+	}
+	if err := stream.Close(); err != nil {
+		return fmt.Errorf("close metrics stream failed: %w", err)
+	}
+	return nil
 }
 
 func (mc *MetricsCollector) NextFrame(ctx context.Context) (*SystemMetrics, error) {
-	if mc.decoder == nil {
+	if ctx == nil {
+		return nil, fmt.Errorf("next metrics frame context is nil")
+	}
+	mc.nextMu.Lock()
+	defer mc.nextMu.Unlock()
+	mc.mu.Lock()
+	decoder := mc.decoder
+	mc.mu.Unlock()
+	if decoder == nil {
 		return nil, fmt.Errorf("collector not started")
 	}
 
@@ -150,7 +205,7 @@ func (mc *MetricsCollector) NextFrame(ctx context.Context) (*SystemMetrics, erro
 		var msg streamMsg
 		errCh := make(chan error, 1)
 		go func() {
-			errCh <- mc.decoder.Decode(&msg)
+			errCh <- decoder.Decode(&msg)
 		}()
 
 		select {
@@ -160,8 +215,12 @@ func (mc *MetricsCollector) NextFrame(ctx context.Context) (*SystemMetrics, erro
 			}
 		case <-ctx.Done():
 			// Close stream to unblock Decode and prevent internal desync
-			mc.Close()
-			return nil, ctx.Err()
+			closeErr := mc.Close()
+			decodeErr := <-errCh
+			if decodeErr != nil && !errors.Is(decodeErr, io.EOF) {
+				closeErr = errors.Join(closeErr, fmt.Errorf("decode stream message after cancellation failed: %w", decodeErr))
+			}
+			return nil, errors.Join(ctx.Err(), closeErr)
 		}
 
 		switch msg.Type {
@@ -263,10 +322,13 @@ func (mc *MetricsCollector) processEOF(metrics *SystemMetrics, currentProcs map[
 		})
 	}
 
+	mc.mu.Lock()
+	sortBy, sortAsc := mc.SortBy, mc.SortAsc
+	mc.mu.Unlock()
 	// Sort based on preferences
 	sort.Slice(usages, func(i, j int) bool {
 		var less bool
-		if mc.SortBy == "mem" {
+		if sortBy == "mem" {
 			if usages[i].rssMB == usages[j].rssMB {
 				less = usages[i].cpu < usages[j].cpu
 			} else {
@@ -281,7 +343,7 @@ func (mc *MetricsCollector) processEOF(metrics *SystemMetrics, currentProcs map[
 			}
 		}
 
-		if mc.SortAsc {
+		if sortAsc {
 			return less
 		}
 		return !less
@@ -299,6 +361,33 @@ func (mc *MetricsCollector) processEOF(metrics *SystemMetrics, currentProcs map[
 
 	mc.lastProcs = currentProcs
 	mc.lastTicks = currentTicks
+}
+
+// ToggleSortBy switches the display ordering without racing an in-flight
+// frame decode.
+func (mc *MetricsCollector) ToggleSortBy() {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	if mc.SortBy == "cpu" {
+		mc.SortBy = "mem"
+		return
+	}
+	mc.SortBy = "cpu"
+}
+
+// ToggleSortOrder reverses the display ordering without racing an in-flight
+// frame decode.
+func (mc *MetricsCollector) ToggleSortOrder() {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	mc.SortAsc = !mc.SortAsc
+}
+
+// SortConfig returns a stable snapshot of display ordering preferences.
+func (mc *MetricsCollector) SortConfig() (string, bool) {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	return mc.SortBy, mc.SortAsc
 }
 func formatUptime(uptime uint64) string {
 	days := uptime / 86400

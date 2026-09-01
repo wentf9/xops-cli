@@ -2,6 +2,8 @@ package ssh
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,7 +15,11 @@ func newKeepAliveTestConnector(t *testing.T, interval, timeout time.Duration) *C
 	t.Helper()
 	c := NewConnector(&mockConfigStore{}, &mockUI{})
 	c.EnableKeepAlive(context.Background(), interval, timeout)
-	t.Cleanup(c.CloseAll)
+	t.Cleanup(func() {
+		if err := c.CloseAll(); err != nil {
+			t.Logf("CloseAll failed: %v", err)
+		}
+	})
 	return c
 }
 
@@ -22,19 +28,33 @@ func newKeepAliveTestConnector(t *testing.T, interval, timeout time.Duration) *C
 func startHealthyServer(t *testing.T) *ssh.Client {
 	t.Helper()
 	listener, serverConfig := startKeepAliveTestSSHServer(t)
-	t.Cleanup(func() { _ = listener.Close() })
+	var wg sync.WaitGroup
+	t.Cleanup(func() {
+		if err := listener.Close(); err != nil {
+			fmt.Printf("Close failed: %v\n", err)
+		}
+		wg.Wait()
+	})
 
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		conn, err := listener.Accept()
 		if err != nil {
 			return
 		}
 		sConn, chans, reqs, err := ssh.NewServerConn(conn, serverConfig)
 		if err != nil {
-			_ = conn.Close()
+			if err := conn.Close(); err != nil {
+				fmt.Printf("Close failed: %v\n", err)
+			}
 			return
 		}
-		defer func() { _ = sConn.Close() }()
+		defer func() {
+			if err := sConn.Close(); err != nil {
+				fmt.Printf("Close failed: %v\n", err)
+			}
+		}()
 		go ssh.DiscardRequests(reqs)
 		for range chans {
 		}
@@ -46,7 +66,11 @@ func startHealthyServer(t *testing.T) *ssh.Client {
 // TestConnector_KeepAlive_EvictsDeadClient 验证连接死亡后心跳将其从池与注册表中驱逐
 func TestConnector_KeepAlive_EvictsDeadClient(t *testing.T) {
 	listener, serverConfig := startKeepAliveTestSSHServer(t)
-	defer func() { _ = listener.Close() }()
+	defer func() {
+		if err := listener.Close(); err != nil {
+			fmt.Printf("Close failed: %v\n", err)
+		}
+	}()
 
 	serverClosed := make(chan struct{})
 	go func() {
@@ -56,11 +80,15 @@ func TestConnector_KeepAlive_EvictsDeadClient(t *testing.T) {
 		}
 		sConn, _, reqs, err := ssh.NewServerConn(conn, serverConfig)
 		if err != nil {
-			_ = conn.Close()
+			if err := conn.Close(); err != nil {
+				fmt.Printf("Close failed: %v\n", err)
+			}
 			return
 		}
 		go ssh.DiscardRequests(reqs)
-		_ = sConn.Close() // 握手完成即关闭，模拟服务端断开
+		if err := sConn.Close(); err != nil {
+			fmt.Printf("Close failed: %v\n", err)
+		} // 握手完成即关闭，模拟服务端断开
 		close(serverClosed)
 	}()
 
@@ -68,8 +96,9 @@ func TestConnector_KeepAlive_EvictsDeadClient(t *testing.T) {
 	client := dialKeepAliveTestClient(t, listener.Addr().String())
 	<-serverClosed
 
-	c.clients.Set("node-1", client)
-	c.startKeepAliveFor("node-1", client)
+	pooled := &PooledClient{SSHClient: client}
+	c.clients.Set("node-1", pooled)
+	c.startKeepAliveFor("node-1", pooled)
 
 	// 轮询断言：心跳失败后池与注册表均被驱逐
 	deadline := time.Now().Add(3 * time.Second)
@@ -93,19 +122,31 @@ func TestConnector_KeepAlive_CloseAllStopsAll(t *testing.T) {
 
 	client1 := startHealthyServer(t)
 	client2 := startHealthyServer(t)
-	defer func() { _ = client1.Close() }()
-	defer func() { _ = client2.Close() }()
+	defer func() {
+		if err := client1.Close(); err != nil {
+			fmt.Printf("Close failed: %v\n", err)
+		}
+	}()
+	defer func() {
+		if err := client2.Close(); err != nil {
+			fmt.Printf("Close failed: %v\n", err)
+		}
+	}()
 
-	c.clients.Set("node-1", client1)
-	c.startKeepAliveFor("node-1", client1)
-	c.clients.Set("node-2", client2)
-	c.startKeepAliveFor("node-2", client2)
+	pooled1 := &PooledClient{SSHClient: client1}
+	c.clients.Set("node-1", pooled1)
+	c.startKeepAliveFor("node-1", pooled1)
+	pooled2 := &PooledClient{SSHClient: client2}
+	c.clients.Set("node-2", pooled2)
+	c.startKeepAliveFor("node-2", pooled2)
 
 	if c.keepAlives.Count() != 2 {
 		t.Fatalf("expected 2 keepalive entries before CloseAll, got %d", c.keepAlives.Count())
 	}
 
-	c.CloseAll()
+	if err := c.CloseAll(); err != nil {
+		t.Logf("CloseAll failed: %v", err)
+	}
 
 	if c.keepAlives.Count() != 0 {
 		t.Errorf("expected keepAlives registry cleared after CloseAll, got %d", c.keepAlives.Count())
@@ -130,30 +171,38 @@ func TestConnector_KeepAlive_DoesNotEvictReplacedClient(t *testing.T) {
 	c := newKeepAliveTestConnector(t, 50*time.Millisecond, time.Second)
 
 	newClient := startHealthyServer(t)
-	defer func() { _ = newClient.Close() }()
+	defer func() {
+		if err := newClient.Close(); err != nil {
+			fmt.Printf("Close failed: %v\n", err)
+		}
+	}()
 
 	// 池中已换成 newClient，旧连接 staleClient 的心跳失败回调不应误删
 	staleClient := startHealthyServer(t)
-	defer func() { _ = staleClient.Close() }()
+	defer func() {
+		if err := staleClient.Close(); err != nil {
+			fmt.Printf("Close failed: %v\n", err)
+		}
+	}()
 
-	c.clients.Set("node-1", newClient)
+	c.clients.Set("node-1", &PooledClient{SSHClient: newClient})
 	c.keepAlives.Set("node-1", &keepAliveEntry{
 		cancel: func() {},
-		client: newClient,
+		client: &PooledClient{SSHClient: newClient},
 	})
 
 	// 旧心跳的失败回调携带旧连接与旧注册条目（模拟探测失败与重连并发）
-	c.evictDeadClient("node-1", staleClient, &keepAliveEntry{
+	c.evictDeadClient("node-1", &PooledClient{SSHClient: staleClient}, &keepAliveEntry{
 		cancel: func() {},
-		client: staleClient,
+		client: &PooledClient{SSHClient: staleClient},
 	})
 
 	current, ok := c.clients.Get("node-1")
-	if !ok || current != newClient {
+	if !ok || current.SSHClient != newClient {
 		t.Error("expected new client to remain in pool after stale client eviction attempt")
 	}
 	entry, ok := c.keepAlives.Get("node-1")
-	if !ok || entry.client != newClient {
+	if !ok || entry.client.SSHClient != newClient {
 		t.Error("expected new keepalive entry to remain after stale client eviction attempt")
 	}
 }
@@ -164,13 +213,22 @@ func TestConnector_KeepAlive_ReconnectReplacesHeartbeat(t *testing.T) {
 
 	client1 := startHealthyServer(t)
 	client2 := startHealthyServer(t)
-	defer func() { _ = client1.Close() }()
-	defer func() { _ = client2.Close() }()
+	defer func() {
+		if err := client1.Close(); err != nil {
+			fmt.Printf("Close failed: %v\n", err)
+		}
+	}()
+	defer func() {
+		if err := client2.Close(); err != nil {
+			fmt.Printf("Close failed: %v\n", err)
+		}
+	}()
 
-	c.clients.Set("node-1", client1)
-	c.startKeepAliveFor("node-1", client1)
-	c.clients.Set("node-1", client2)
-	c.startKeepAliveFor("node-1", client2)
+	pooled1 := &PooledClient{SSHClient: client1}
+	c.clients.Set("node-1", pooled1)
+	c.startKeepAliveFor("node-1", pooled1)
+	c.clients.Set("node-1", &PooledClient{SSHClient: client2})
+	c.startKeepAliveFor("node-1", &PooledClient{SSHClient: client2})
 
 	if c.keepAlives.Count() != 1 {
 		t.Fatalf("expected exactly 1 keepalive entry after reconnect, got %d", c.keepAlives.Count())
@@ -179,12 +237,14 @@ func TestConnector_KeepAlive_ReconnectReplacesHeartbeat(t *testing.T) {
 	if !ok {
 		t.Fatal("expected keepalive entry for node-1")
 	}
-	if entry.client != client2 {
+	if entry.client.SSHClient != client2 {
 		t.Error("expected keepalive entry to point to the new client after reconnect")
 	}
 
 	// 清理由 CloseAll 兜底
-	c.CloseAll()
+	if err := c.CloseAll(); err != nil {
+		t.Logf("CloseAll failed: %v", err)
+	}
 }
 
 // TestConnector_KeepAlive_DisabledByDefault 验证未启用时 startKeepAliveFor 为 no-op，且 CloseAll 不 panic
@@ -192,17 +252,24 @@ func TestConnector_KeepAlive_DisabledByDefault(t *testing.T) {
 	c := NewConnector(&mockConfigStore{}, &mockUI{})
 
 	client := startHealthyServer(t)
-	defer func() { _ = client.Close() }()
+	defer func() {
+		if err := client.Close(); err != nil {
+			fmt.Printf("Close failed: %v\n", err)
+		}
+	}()
 
-	c.clients.Set("node-1", client)
-	c.startKeepAliveFor("node-1", client) // 未启用心跳，应无副作用
+	pooled := &PooledClient{SSHClient: client}
+	c.clients.Set("node-1", pooled)
+	c.startKeepAliveFor("node-1", pooled) // 未启用心跳，应无副作用
 
 	if c.keepAlives.Count() != 0 {
 		t.Errorf("expected no keepalive entries when disabled, got %d", c.keepAlives.Count())
 	}
 
 	// nil 防御：CloseAll 不应 panic
-	c.CloseAll()
+	if err := c.CloseAll(); err != nil {
+		t.Logf("CloseAll failed: %v", err)
+	}
 }
 
 // TestConnector_EnableKeepAlive_Idempotent 验证重复启用为 no-op，参数保持首次值
@@ -220,7 +287,9 @@ func TestConnector_EnableKeepAlive_Idempotent(t *testing.T) {
 		t.Errorf("expected first EnableKeepAlive params to win (15s/10s), got %v/%v", interval, timeout)
 	}
 
-	c.CloseAll()
+	if err := c.CloseAll(); err != nil {
+		t.Logf("CloseAll failed: %v", err)
+	}
 }
 
 // TestConnector_EnableKeepAlive_DefaultsOnInvalidParams 验证非正参数回退到默认值
@@ -239,7 +308,9 @@ func TestConnector_EnableKeepAlive_DefaultsOnInvalidParams(t *testing.T) {
 	if timeout != DefaultKeepAliveTimeout {
 		t.Errorf("expected timeout fallback to %v, got %v", DefaultKeepAliveTimeout, timeout)
 	}
-	c.CloseAll()
+	if err := c.CloseAll(); err != nil {
+		t.Logf("CloseAll failed: %v", err)
+	}
 }
 
 func TestConnector_EnableKeepAlive_ContextCancelCleansStateAndAllowsReenable(t *testing.T) {
@@ -248,8 +319,9 @@ func TestConnector_EnableKeepAlive_ContextCancelCleansStateAndAllowsReenable(t *
 	c.EnableKeepAlive(rootCtx, time.Hour, time.Second)
 
 	client := startHealthyServer(t)
-	c.clients.Set("node-1", client)
-	c.startKeepAliveFor("node-1", client)
+	pooled := &PooledClient{SSHClient: client}
+	c.clients.Set("node-1", pooled)
+	c.startKeepAliveFor("node-1", pooled)
 	if c.keepAlives.Count() != 1 {
 		t.Fatalf("expected one keepalive entry before cancellation, got %d", c.keepAlives.Count())
 	}
@@ -276,18 +348,24 @@ func TestConnector_EnableKeepAlive_ContextCancelCleansStateAndAllowsReenable(t *
 	if !reenabled {
 		t.Fatal("keepalive could not be re-enabled after root context cancellation")
 	}
-	c.startKeepAliveFor("node-1", client)
+	c.startKeepAliveFor("node-1", &PooledClient{SSHClient: client})
 	if c.keepAlives.Count() != 1 {
 		t.Fatalf("expected one keepalive entry after re-enable, got %d", c.keepAlives.Count())
 	}
-	c.CloseAll()
+	if err := c.CloseAll(); err != nil {
+		t.Logf("CloseAll failed: %v", err)
+	}
 }
 
 // TestConnector_Connect_CachedProbeHasTimeout 验证 Connect 的缓存探测复用心跳超时，
 // 不会因服务端不响应全局请求而无限阻塞。
 func TestConnector_Connect_CachedProbeHasTimeout(t *testing.T) {
 	listener, serverConfig := startKeepAliveTestSSHServer(t)
-	defer func() { _ = listener.Close() }()
+	defer func() {
+		if err := listener.Close(); err != nil {
+			fmt.Printf("Close failed: %v\n", err)
+		}
+	}()
 
 	requestSeen := make(chan struct{})
 	releaseServer := make(chan struct{})
@@ -299,10 +377,16 @@ func TestConnector_Connect_CachedProbeHasTimeout(t *testing.T) {
 		}
 		sConn, _, reqs, err := ssh.NewServerConn(conn, serverConfig)
 		if err != nil {
-			_ = conn.Close()
+			if err := conn.Close(); err != nil {
+				fmt.Printf("Close failed: %v\n", err)
+			}
 			return
 		}
-		defer func() { _ = sConn.Close() }()
+		defer func() {
+			if err := sConn.Close(); err != nil {
+				fmt.Printf("Close failed: %v\n", err)
+			}
+		}()
 		for range reqs {
 			close(requestSeen)
 			<-releaseServer
@@ -321,8 +405,12 @@ func TestConnector_Connect_CachedProbeHasTimeout(t *testing.T) {
 	}}
 	connector := NewConnector(store, &mockUI{})
 	connector.EnableKeepAlive(context.Background(), time.Hour, 100*time.Millisecond)
-	connector.clients.Set("node-1", cachedClient)
-	defer connector.CloseAll()
+	connector.clients.Set("node-1", &PooledClient{SSHClient: cachedClient})
+	defer func() {
+		if err := connector.CloseAll(); err != nil {
+			t.Logf("CloseAll failed: %v", err)
+		}
+	}()
 
 	started := time.Now()
 	_, err := connector.Connect(context.Background(), "node-1")
@@ -342,13 +430,16 @@ func TestConnector_Connect_CachedProbeHasTimeout(t *testing.T) {
 func TestConnector_CloseAllConcurrentCallsAreIdempotent(t *testing.T) {
 	c := newKeepAliveTestConnector(t, time.Hour, time.Second)
 	client := startHealthyServer(t)
-	c.clients.Set("node-1", client)
-	c.startKeepAliveFor("node-1", client)
+	pooled := &PooledClient{SSHClient: client}
+	c.clients.Set("node-1", pooled)
+	c.startKeepAliveFor("node-1", pooled)
 
 	done := make(chan struct{}, 2)
 	for range 2 {
 		go func() {
-			c.CloseAll()
+			if err := c.CloseAll(); err != nil {
+				t.Logf("CloseAll failed: %v", err)
+			}
 			done <- struct{}{}
 		}()
 	}
@@ -367,10 +458,16 @@ func TestConnector_KeepAlive_StartAfterCloseAllIsNoop(t *testing.T) {
 	c := newKeepAliveTestConnector(t, 50*time.Millisecond, time.Second)
 
 	client := startHealthyServer(t)
-	defer func() { _ = client.Close() }()
+	defer func() {
+		if err := client.Close(); err != nil {
+			fmt.Printf("Close failed: %v\n", err)
+		}
+	}()
 
-	c.CloseAll()
-	c.startKeepAliveFor("node-1", client)
+	if err := c.CloseAll(); err != nil {
+		t.Logf("CloseAll failed: %v", err)
+	}
+	c.startKeepAliveFor("node-1", &PooledClient{SSHClient: client})
 
 	if c.keepAlives.Count() != 0 {
 		t.Errorf("expected no keepalive entries after CloseAll, got %d", c.keepAlives.Count())

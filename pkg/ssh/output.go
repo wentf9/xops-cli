@@ -62,27 +62,41 @@ func newOutputWriter(config *RunConfig) *outputWriter {
 func (w *outputWriter) Write(p []byte) (n int, err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	n = len(p)
 
 	switch w.mode {
 	case OutputModeString:
-		_, _ = w.buf.Write(p)
+		return w.buf.Write(p)
 	case OutputModeRingBuffer:
 		w.writeRing(p)
+		return len(p), nil
 	case OutputModeStream:
-		if w.streamWriter != nil {
-			if len(w.streamPrefix) > 0 {
-				w.writePrefixStream(p)
-			} else {
-				_, _ = w.streamWriter.Write(p)
-			}
+		if w.streamWriter == nil {
+			return 0, fmt.Errorf("write SSH stream output failed: %w", io.ErrClosedPipe)
 		}
+		if len(w.streamPrefix) > 0 {
+			return w.writePrefixStream(p)
+		}
+		n, err = w.streamWriter.Write(p)
+		return validateOutputWrite(n, len(p), err, "write SSH stream output")
 	case OutputModeFile:
-		if w.outFile != nil {
-			_, _ = w.outFile.Write(p)
+		if w.outFile == nil {
+			return 0, fmt.Errorf("write SSH output file failed: %w", os.ErrInvalid)
 		}
+		n, err = w.outFile.Write(p)
+		return validateOutputWrite(n, len(p), err, "write SSH output file")
+	default:
+		return 0, fmt.Errorf("write SSH output failed: unsupported output mode %d", w.mode)
 	}
-	return n, nil
+}
+
+func validateOutputWrite(written, expected int, err error, operation string) (int, error) {
+	if err != nil {
+		return written, fmt.Errorf("%s failed: %w", operation, err)
+	}
+	if written != expected {
+		return written, fmt.Errorf("%s failed: %w", operation, io.ErrShortWrite)
+	}
+	return written, nil
 }
 
 // writeRing 将数据写入环形缓冲区。当数据量超过容量时，自动丢弃最旧的数据。
@@ -120,21 +134,33 @@ func (w *outputWriter) writeRing(p []byte) {
 
 // writePrefixStream 在流式输出中为每一行添加主机前缀。
 // 必须在持有 mu 锁的情况下调用。
-func (w *outputWriter) writePrefixStream(p []byte) {
+func (w *outputWriter) writePrefixStream(p []byte) (int, error) {
+	writtenTotal := 0
 	for len(p) > 0 {
 		if w.isNL {
-			_, _ = w.streamWriter.Write(w.streamPrefix)
+			written, err := w.streamWriter.Write(w.streamPrefix)
+			if _, writeErr := validateOutputWrite(written, len(w.streamPrefix), err, "write SSH stream prefix"); writeErr != nil {
+				return writtenTotal, writeErr
+			}
 			w.isNL = false
 		}
 		idx := bytes.IndexByte(p, '\n')
-		if idx == -1 {
-			_, _ = w.streamWriter.Write(p)
-			break
+		chunk := p
+		if idx >= 0 {
+			chunk = p[:idx+1]
 		}
-		_, _ = w.streamWriter.Write(p[:idx+1])
+		written, err := w.streamWriter.Write(chunk)
+		writtenTotal += written
+		if _, writeErr := validateOutputWrite(written, len(chunk), err, "write SSH stream output"); writeErr != nil {
+			return writtenTotal, writeErr
+		}
+		if idx == -1 {
+			return writtenTotal, nil
+		}
 		w.isNL = true
-		p = p[idx+1:]
+		p = p[len(chunk):]
 	}
+	return writtenTotal, nil
 }
 
 // String 返回收集到的输出内容。

@@ -26,7 +26,11 @@ func startMockTargetServer(t *testing.T) (net.Listener, string) {
 				return
 			}
 			go func(c net.Conn) {
-				defer func() { _ = c.Close() }()
+				defer func() {
+					if err := c.Close(); err != nil {
+						fmt.Printf("Close failed: %v", err)
+					}
+				}()
 				buf := make([]byte, 1024)
 				n, err := c.Read(buf)
 				if err != nil {
@@ -66,7 +70,9 @@ func startMockSSHServer(t *testing.T) net.Listener {
 			}
 			sConn, chans, reqs, err := ssh.NewServerConn(conn, sshConfig)
 			if err != nil {
-				_ = conn.Close()
+				if err := conn.Close(); err != nil {
+					fmt.Printf("Close failed: %v", err)
+				}
 				continue
 			}
 			go func() {
@@ -103,19 +109,37 @@ func handleMockSSHChannels(channels <-chan ssh.NewChannel) {
 		}
 		ch, reqs, err := newChan.Accept()
 		if err != nil {
-			_ = targetConn.Close()
+			if err := targetConn.Close(); err != nil {
+				fmt.Printf("Close failed: %v", err)
+			}
 			continue
 		}
 		go ssh.DiscardRequests(reqs)
 
 		go func() {
-			defer func() { _ = ch.Close() }()
-			defer func() { _ = targetConn.Close() }()
+			defer func() {
+				if err := ch.Close(); err != nil {
+					fmt.Printf("Close failed: %v", err)
+				}
+			}()
+			defer func() {
+				if err := targetConn.Close(); err != nil {
+					fmt.Printf("Close failed: %v", err)
+				}
+			}()
 			_, _ = io.Copy(ch, targetConn)
 		}()
 		go func() {
-			defer func() { _ = ch.Close() }()
-			defer func() { _ = targetConn.Close() }()
+			defer func() {
+				if err := ch.Close(); err != nil {
+					fmt.Printf("Close failed: %v", err)
+				}
+			}()
+			defer func() {
+				if err := targetConn.Close(); err != nil {
+					fmt.Printf("Close failed: %v", err)
+				}
+			}()
 			_, _ = io.Copy(targetConn, ch)
 		}()
 	}
@@ -166,11 +190,19 @@ func performSocks5HandshakeAndConnect(t *testing.T, socksConn net.Conn, targetAd
 func TestSocks5Forward(t *testing.T) {
 	// 1. Start target TCP server
 	targetListener, targetAddr := startMockTargetServer(t)
-	defer func() { _ = targetListener.Close() }()
+	defer func() {
+		if err := targetListener.Close(); err != nil {
+			fmt.Printf("Close failed: %v", err)
+		}
+	}()
 
 	// 2. Start SSH server
 	sshListener := startMockSSHServer(t)
-	defer func() { _ = sshListener.Close() }()
+	defer func() {
+		if err := sshListener.Close(); err != nil {
+			fmt.Printf("Close failed: %v", err)
+		}
+	}()
 
 	// 3. Connect as SSH client
 	sshClientConfig := &ssh.ClientConfig{
@@ -183,7 +215,11 @@ func TestSocks5Forward(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to dial ssh server: %v", err)
 	}
-	defer func() { _ = rawClient.Close() }()
+	defer func() {
+		if err := rawClient.Close(); err != nil {
+			fmt.Printf("Close failed: %v", err)
+		}
+	}()
 
 	client := &Client{
 		sshClient: rawClient,
@@ -195,21 +231,34 @@ func TestSocks5Forward(t *testing.T) {
 		t.Fatalf("failed to start socks listener: %v", err)
 	}
 	socksAddr := socksListener.Addr().String()
-	_ = socksListener.Close() // Close it to let Socks5Forward bind to it
+	if err := socksListener.Close(); err != nil {
+		fmt.Printf("Close failed: %v", err)
+	} // Close it to let Socks5Forward bind to it
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := client.Socks5Forward(ctx, socksAddr); err != nil {
+	forward, err := client.Socks5Forward(ctx, socksAddr)
+	if err != nil {
 		t.Fatalf("Socks5Forward failed: %v", err)
 	}
+	defer func() {
+		cancel()
+		if err := forward.Wait(); err != nil {
+			t.Errorf("wait for Socks5Forward failed: %v", err)
+		}
+	}()
 
 	// 5. Connect SOCKS5 client to socks5 address, and send request to targetAddr
 	socksConn, err := net.DialTimeout("tcp", socksAddr, 2*time.Second)
 	if err != nil {
 		t.Fatalf("failed to connect to socks5 server: %v", err)
 	}
-	defer func() { _ = socksConn.Close() }()
+	defer func() {
+		if err := socksConn.Close(); err != nil {
+			fmt.Printf("Close failed: %v", err)
+		}
+	}()
 
 	performSocks5HandshakeAndConnect(t, socksConn, targetAddr)
 
