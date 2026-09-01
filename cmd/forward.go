@@ -1,16 +1,15 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
 	"net"
-	"os"
 	"os/signal"
 	"syscall"
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/pkg/forward"
 	"github.com/wentf9/xops-cli/pkg/i18n"
+	"github.com/wentf9/xops-cli/pkg/logger"
 )
 
 func newCmdForward() *cobra.Command {
@@ -55,28 +54,38 @@ func validateForwardAddr(addr string) error {
 }
 
 func forwardRunE(cmd *cobra.Command, args []string) error {
-	udp, _ := cmd.Flags().GetBool("udp")
+	udp, err := cmd.Flags().GetBool("udp")
+	if err != nil {
+		return fmt.Errorf("read udp flag failed: %w", err)
+	}
 
 	listenAddr := args[0]
 	targetAddr := args[1]
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-	// graceful shutdown on SIGINT / SIGTERM
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		fmt.Fprintf(os.Stderr, "\n%s\n", i18n.T("forward_stopping"))
-		cancel()
-	}()
-
-	if udp {
-		f := forward.NewUDPForwarder(listenAddr, targetAddr)
-		return f.Run(ctx)
+	errHandler := func(err error) {
+		logger.Warnf("forward connection failed: %v", err)
 	}
 
-	f := forward.NewTCPForwarder(listenAddr, targetAddr)
-	return f.Run(ctx)
+	var runErr error
+	if udp {
+		f := forward.NewUDPForwarder(
+			listenAddr,
+			targetAddr,
+			forward.WithLogger(logger.DefaultLogger()),
+			forward.WithErrorHandler(errHandler),
+		)
+		runErr = f.Run(ctx)
+	} else {
+		f := forward.NewTCPForwarder(
+			listenAddr,
+			targetAddr,
+			forward.WithLogger(logger.DefaultLogger()),
+			forward.WithErrorHandler(errHandler),
+		)
+		runErr = f.Run(ctx)
+	}
+	return runErr
 }

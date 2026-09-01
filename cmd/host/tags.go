@@ -22,36 +22,27 @@ func NewCmdInventoryTagAdd() *cobra.Command {
 				return fmt.Errorf("标签名称不能为空")
 			}
 
-			store, provider, cfg, err := utils.GetConfigStore()
+			_, repository, _, err := utils.GetConfigStore()
 			if err != nil {
 				return err
 			}
 
-			updatedCount := 0
+			nodeIDs := make([]string, 0, len(nodeNames))
 			for _, query := range nodeNames {
-				name := provider.Find(strings.TrimSpace(query))
+				name, resolveErr := repository.ResolveSelector(strings.TrimSpace(query))
+				if resolveErr != nil {
+					return fmt.Errorf("resolve node %q for tag addition failed: %w", query, resolveErr)
+				}
 				if name == "" {
 					continue
 				}
-				if node, ok := provider.GetNode(name); ok {
-					exists := false
-					for _, t := range node.Tags {
-						if t == tagName {
-							exists = true
-							break
-						}
-					}
-					if !exists {
-						node.Tags = append(node.Tags, tagName)
-						provider.AddNode(name, node)
-						updatedCount++
-					}
-				}
+				nodeIDs = append(nodeIDs, name)
+			}
+			updatedCount, err := repository.UpdateNodeTagsContext(cmd.Context(), nodeIDs, []string{tagName}, true)
+			if err != nil {
+				return fmt.Errorf("add tag to selected nodes failed: %w", err)
 			}
 			if updatedCount > 0 {
-				if err := store.Save(cfg); err != nil {
-					return err
-				}
 				logger.PrintSuccess(i18n.Tf("tag_add_success", map[string]any{"Count": updatedCount, "Tag": tagName}))
 			}
 			return nil
@@ -71,37 +62,27 @@ func NewCmdInventoryTagRemove() *cobra.Command {
 				return fmt.Errorf("标签名称不能为空")
 			}
 
-			store, provider, cfg, err := utils.GetConfigStore()
+			_, repository, _, err := utils.GetConfigStore()
 			if err != nil {
 				return err
 			}
 
-			updatedCount := 0
+			nodeIDs := make([]string, 0, len(nodeNames))
 			for _, query := range nodeNames {
-				name := provider.Find(strings.TrimSpace(query))
+				name, resolveErr := repository.ResolveSelector(strings.TrimSpace(query))
+				if resolveErr != nil {
+					return fmt.Errorf("resolve node %q for tag removal failed: %w", query, resolveErr)
+				}
 				if name == "" {
 					continue
 				}
-				if node, ok := provider.GetNode(name); ok {
-					newTags, found := make([]string, 0), false
-					for _, t := range node.Tags {
-						if t == tagName {
-							found = true
-							continue
-						}
-						newTags = append(newTags, t)
-					}
-					if found {
-						node.Tags = newTags
-						provider.AddNode(name, node)
-						updatedCount++
-					}
-				}
+				nodeIDs = append(nodeIDs, name)
+			}
+			updatedCount, err := repository.UpdateNodeTagsContext(cmd.Context(), nodeIDs, []string{tagName}, false)
+			if err != nil {
+				return fmt.Errorf("remove tag from selected nodes failed: %w", err)
 			}
 			if updatedCount > 0 {
-				if err := store.Save(cfg); err != nil {
-					return err
-				}
 				logger.PrintSuccess(i18n.Tf("tag_remove_success", map[string]any{"Count": updatedCount, "Tag": tagName}))
 			}
 			return nil

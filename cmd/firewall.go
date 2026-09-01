@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -9,7 +10,6 @@ import (
 	"sync"
 
 	cmdutils "github.com/wentf9/xops-cli/cmd/utils"
-	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/executor"
 	"github.com/wentf9/xops-cli/pkg/firewall"
@@ -50,8 +50,8 @@ func newCmdFirewall() *cobra.Command {
 		Use:   "firewall",
 		Short: i18n.T("firewall_short"),
 		Long:  i18n.T("firewall_long"),
-		Run: func(cmd *cobra.Command, args []string) {
-			_ = cmd.Help()
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return cmd.Help()
 		},
 	}
 
@@ -91,45 +91,38 @@ func (o *FirewallOptions) runLocalFirewall(ctx context.Context, action func(fw f
 	if runtime.GOOS != "linux" {
 		return fmt.Errorf("%s", i18n.Tf("fw_err_os_not_supported", map[string]any{"OS": runtime.GOOS}))
 	}
-	pwd := cmdutils.GetLocalSudoPassword()
+	pwd, _, pwdErr := cmdutils.GetLocalSudoPassword()
+	if pwdErr != nil {
+		return fmt.Errorf("load local sudo password failed: %w", pwdErr)
+	}
 	exec := executor.NewLocalExecutor(pwd)
 	fw, err := firewall.DetectFirewall(ctx, exec)
 	if err != nil {
 		if o.StatusOnly {
 			printStatusOnly(nil, "LOCAL", "", "", err)
-			return nil
 		}
-		return err
+		return fmt.Errorf("detect firewall failed: %w", err)
 	}
 	out, err := action(fw)
 	if o.StatusOnly {
 		printStatusOnly(nil, "LOCAL", fw.Name(), out, err)
 	} else {
-		if err != nil {
-			printFwActionFailed(nil, "LOCAL", err, out)
-		} else {
+		if err == nil {
 			printFwSuccess(nil, "LOCAL", fw.Name(), out)
 		}
 	}
+	if err != nil {
+		return err
+	}
 	if o.Reload {
-		if _, err := fw.Reload(ctx); err != nil {
-			printFwError(nil, "LOCAL", err, "fw_label_reload_failed", "fw_local_reload_failed")
+		if _, reloadErr := fw.Reload(ctx); reloadErr != nil {
+			return reloadErr
 		}
 	}
 	return nil
 }
 
-func (o *FirewallOptions) runRemoteFirewalls(ctx context.Context, action func(fw firewall.Firewall) (string, error)) error {
-	configPath, keyPath := cmdutils.GetConfigFilePath()
-	configStore := config.NewDefaultStore(configPath, keyPath)
-	cfg, err := configStore.Load()
-	if err != nil {
-		return err
-	}
-	provider := config.NewProvider(cfg)
-	connector := adapter.NewConnector(provider)
-	defer connector.CloseAll()
-
+func (o *FirewallOptions) resolveTargetHosts(provider config.ConfigProvider) ([]string, error) {
 	var hosts []string
 	if o.Host != "" {
 		hosts = append(hosts, strings.Split(o.Host, ",")...)
@@ -137,7 +130,7 @@ func (o *FirewallOptions) runRemoteFirewalls(ctx context.Context, action func(fw
 	if o.HostFile != "" {
 		data, err := os.ReadFile(o.HostFile)
 		if err != nil {
-			return fmt.Errorf("%s: %w", i18n.T("err_read_ifile"), err)
+			return nil, fmt.Errorf("%s: %w", i18n.T("err_read_ifile"), err)
 		}
 		for line := range strings.SplitSeq(string(data), "\n") {
 			line = strings.TrimSpace(line)
@@ -149,6 +142,9 @@ func (o *FirewallOptions) runRemoteFirewalls(ctx context.Context, action func(fw
 	if len(o.Tags) > 0 {
 		for _, tag := range o.Tags {
 			nodes := provider.GetNodesByTag(tag)
+			if len(nodes) == 0 {
+				return nil, fmt.Errorf("%s", i18n.Tf("err_tag_empty", map[string]any{"Tag": tag}))
+			}
 			for nodeID := range nodes {
 				hosts = append(hosts, nodeID)
 			}
@@ -168,15 +164,17 @@ func (o *FirewallOptions) runRemoteFirewalls(ctx context.Context, action func(fw
 		}
 	}
 
-	// 应用 --exclude 排除规则
 	if len(o.Exclude) > 0 {
 		excludes, err := cmdutils.ResolveExcludes(provider, cmdutils.ParseExcludeFlag(o.Exclude))
 		if err != nil {
-			return fmt.Errorf("%s: %w", i18n.T("fw_err_exclude"), err)
+			return nil, fmt.Errorf("%s: %w", i18n.T("fw_err_exclude"), err)
 		}
 		filtered := finalHosts[:0]
 		for _, h := range finalHosts {
-			_, _, _, nodeID := o.resolveNodeID(h, provider)
+			_, _, _, nodeID, resolveErr := o.resolveNodeID(h, provider)
+			if resolveErr != nil {
+				return nil, fmt.Errorf("resolve excluded firewall node %q failed: %w", h, resolveErr)
+			}
 			if nodeID != "" {
 				if _, excluded := excludes[nodeID]; excluded {
 					continue
@@ -187,27 +185,71 @@ func (o *FirewallOptions) runRemoteFirewalls(ctx context.Context, action func(fw
 		finalHosts = filtered
 	}
 
-	var stdoutMu sync.Mutex
+	if len(finalHosts) == 0 {
+		return nil, fmt.Errorf("%s", i18n.T("err_no_nodes_found"))
+	}
+	return finalHosts, nil
+}
+
+func (o *FirewallOptions) runRemoteFirewalls(ctx context.Context, action func(fw firewall.Firewall) (string, error)) (retErr error) {
+	configPath, keyPath, pathErr := cmdutils.GetConfigFilePath()
+	if pathErr != nil {
+		return fmt.Errorf("get config file path failed: %w", pathErr)
+	}
+	configStore := config.NewDefaultStore(configPath, keyPath)
+	cfg, err := configStore.Load()
+	if err != nil {
+		return err
+	}
+	provider, err := config.NewRepository(cfg, configStore)
+	if err != nil {
+		return fmt.Errorf("create configuration repository: %w", err)
+	}
+	connector := newCLIConnector(provider, ssh.WithLogger(logger.DefaultLogger()))
+	defer func() {
+		joinConnectorCloseError(&retErr, connector)
+	}()
+
+	finalHosts, err := o.resolveTargetHosts(provider)
+	if err != nil {
+		return err
+	}
+
+	var (
+		stdoutMu sync.Mutex
+		errMu    sync.Mutex
+		fwErrs   []error
+	)
 	wp := pkgutils.NewWorkerPool(uint(o.TaskCount))
 	for _, h := range finalHosts {
-		o.executeOnSingleHost(ctx, h, provider, connector, wp, action, &stdoutMu)
+		o.executeOnSingleHost(ctx, h, provider, connector, wp, action, &stdoutMu, &errMu, &fwErrs)
 	}
 
 	wp.Wait()
-	if err := configStore.Save(cfg); err != nil {
-		logger.PrintError(i18n.Tf("save_config_failed", map[string]any{"Error": err}))
-	}
-	return nil
+	return errors.Join(fwErrs...)
 }
 
-func (o *FirewallOptions) resolveNodeID(rawHost string, provider config.ConfigProvider) (string, string, uint16, string) {
-	nodeID := provider.Find(rawHost)
-	u, hs, p := cmdutils.ParseAddr(rawHost)
+func (o *FirewallOptions) resolveNodeID(rawHost string, provider config.ConfigProvider) (string, string, uint16, string, error) {
+	nodeID, resolveErr := provider.ResolveSelector(rawHost)
+	if resolveErr != nil {
+		return "", "", 0, "", fmt.Errorf("resolve firewall host %q failed: %w", rawHost, resolveErr)
+	}
+	u, hs, p, err := cmdutils.ParseAddr(rawHost)
+	if err != nil {
+		if nodeID != "" {
+			return u, hs, p, nodeID, nil
+		}
+		return "", "", 0, "", fmt.Errorf("invalid host address %q: %w", rawHost, err)
+	}
 	if nodeID == "" {
 		if u == "" {
 			u = o.User
 			if u == "" {
-				u = cmdutils.GetCurrentUser()
+				var userErr error
+				u, userErr = cmdutils.GetCurrentUser()
+				if userErr != nil {
+					return "", "", 0, "", fmt.Errorf("get current user failed: %w", userErr)
+				}
 			}
 		}
 		if p == 0 {
@@ -216,47 +258,62 @@ func (o *FirewallOptions) resolveNodeID(rawHost string, provider config.ConfigPr
 				p = 22
 			}
 		}
-		nodeID = provider.Find(fmt.Sprintf("%s@%s:%d", u, hs, p))
-	}
-	return u, hs, p, nodeID
-}
-
-func (o *FirewallOptions) handleSingleHostError(stdoutMu *sync.Mutex, host string, err error, labelKey string, fallbackTfKey string, u string, hs string, p uint16) {
-	if o.StatusOnly {
-		printStatusOnly(stdoutMu, host, "", "", err)
-	} else {
-		if labelKey == "fw_label_node_not_found" {
-			printFwNodeNotFound(stdoutMu, u, hs, p)
-		} else {
-			printFwError(stdoutMu, host, err, labelKey, fallbackTfKey)
+		nodeID, resolveErr = provider.ResolveSelector(fmt.Sprintf("%s@%s:%d", u, hs, p))
+		if resolveErr != nil {
+			return "", "", 0, "", fmt.Errorf("resolve firewall address %q failed: %w", rawHost, resolveErr)
 		}
 	}
+	return u, hs, p, nodeID, nil
 }
 
-func (o *FirewallOptions) executeOnSingleHost(ctx context.Context, h string, provider config.ConfigProvider, connector *ssh.Connector, wp pkgutils.WorkerPool, action func(fw firewall.Firewall) (string, error), stdoutMu *sync.Mutex) {
+func (o *FirewallOptions) executeOnSingleHost(ctx context.Context, h string, provider config.ConfigProvider, connector *ssh.Connector, wp pkgutils.WorkerPool, action func(fw firewall.Firewall) (string, error), stdoutMu *sync.Mutex, errMu *sync.Mutex, fwErrs *[]error) {
 	wp.Execute(func() {
 		rawHost := strings.TrimSpace(h)
 		if rawHost == "" {
 			return
 		}
 
-		u, hs, p, nodeID := o.resolveNodeID(rawHost, provider)
+		_, _, _, nodeID, resolveErr := o.resolveNodeID(rawHost, provider)
+		if resolveErr != nil {
+			if o.StatusOnly {
+				printStatusOnly(stdoutMu, rawHost, "", "", resolveErr)
+			}
+			errMu.Lock()
+			*fwErrs = append(*fwErrs, fmt.Errorf("[%s] %w", rawHost, resolveErr))
+			errMu.Unlock()
+			return
+		}
 		if nodeID == "" {
 			err := fmt.Errorf("%s", i18n.T("fw_err_node_not_found"))
-			o.handleSingleHostError(stdoutMu, rawHost, err, "fw_label_node_not_found", "", u, hs, p)
+			if o.StatusOnly {
+				printStatusOnly(stdoutMu, rawHost, "", "", err)
+			}
+			errMu.Lock()
+			*fwErrs = append(*fwErrs, fmt.Errorf("[%s] %w", rawHost, err))
+			errMu.Unlock()
 			return
 		}
 
 		client, err := connector.Connect(ctx, nodeID)
 		if err != nil {
-			o.handleSingleHostError(stdoutMu, rawHost, err, "fw_label_connect_failed", "fw_connect_failed", "", "", 0)
+			if o.StatusOnly {
+				printStatusOnly(stdoutMu, rawHost, "", "", err)
+			}
+			errMu.Lock()
+			*fwErrs = append(*fwErrs, fmt.Errorf("[%s] %w", rawHost, err))
+			errMu.Unlock()
 			return
 		}
 
 		exec := executor.NewSSHExecutor(client, ssh.WithLoginShell(false))
 		fw, err := firewall.DetectFirewall(ctx, exec)
 		if err != nil {
-			o.handleSingleHostError(stdoutMu, rawHost, err, "fw_label_detect_failed", "fw_detect_failed", "", "", 0)
+			if o.StatusOnly {
+				printStatusOnly(stdoutMu, rawHost, "", "", err)
+			}
+			errMu.Lock()
+			*fwErrs = append(*fwErrs, fmt.Errorf("[%s] %w", rawHost, err))
+			errMu.Unlock()
 			return
 		}
 
@@ -264,16 +321,21 @@ func (o *FirewallOptions) executeOnSingleHost(ctx context.Context, h string, pro
 		if o.StatusOnly {
 			printStatusOnly(stdoutMu, rawHost, fw.Name(), out, err)
 		} else {
-			if err != nil {
-				printFwActionFailed(stdoutMu, rawHost, err, out)
-			} else {
+			if err == nil {
 				printFwSuccess(stdoutMu, rawHost, fw.Name(), out)
 			}
 		}
+		if err != nil {
+			errMu.Lock()
+			*fwErrs = append(*fwErrs, fmt.Errorf("[%s] %w", rawHost, err))
+			errMu.Unlock()
+		}
 
 		if o.Reload {
-			if _, err := fw.Reload(ctx); err != nil {
-				printFwError(stdoutMu, rawHost, err, "fw_label_reload_failed", "fw_reload_failed")
+			if _, reloadErr := fw.Reload(ctx); reloadErr != nil {
+				errMu.Lock()
+				*fwErrs = append(*fwErrs, fmt.Errorf("[%s] reload failed: %w", rawHost, reloadErr))
+				errMu.Unlock()
 			}
 		}
 	})
@@ -284,8 +346,8 @@ func newFirewallListCmd(fwOptions *FirewallOptions) *cobra.Command {
 		Use:   "list",
 		Short: i18n.T("firewall_list_short"),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return fwOptions.RunOnHosts(context.Background(), func(fw firewall.Firewall) (string, error) {
-				return fw.ListRules(context.Background())
+			return fwOptions.RunOnHosts(cmd.Context(), func(fw firewall.Firewall) (string, error) {
+				return fw.ListRules(cmd.Context())
 			})
 		},
 	}
@@ -299,14 +361,14 @@ func newFirewallPortCmd(fwOptions *FirewallOptions) *cobra.Command {
 		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if clear {
-				return fwOptions.RunOnHosts(context.Background(), func(fw firewall.Firewall) (string, error) {
-					return fw.ClearPorts(context.Background())
+				return fwOptions.RunOnHosts(cmd.Context(), func(fw firewall.Firewall) (string, error) {
+					return fw.ClearPorts(cmd.Context())
 				})
 			}
 			if len(args) < 1 {
 				return fmt.Errorf("accepts at least 1 arg(s), received %d", len(args))
 			}
-			return fwOptions.RunOnHosts(context.Background(), func(fw firewall.Firewall) (string, error) {
+			return fwOptions.RunOnHosts(cmd.Context(), func(fw firewall.Firewall) (string, error) {
 				var finalOut strings.Builder
 				var allPorts []string
 				for _, arg := range args {
@@ -326,9 +388,9 @@ func newFirewallPortCmd(fwOptions *FirewallOptions) *cobra.Command {
 					var out string
 					var err error
 					if fwOptions.Remove {
-						out, err = fw.RemoveRule(context.Background(), rule)
+						out, err = fw.RemoveRule(cmd.Context(), rule)
 					} else {
-						out, err = fw.AddRule(context.Background(), rule)
+						out, err = fw.AddRule(cmd.Context(), rule)
 					}
 					finalOut.WriteString(out)
 					if err != nil {
@@ -351,14 +413,14 @@ func newFirewallServiceCmd(fwOptions *FirewallOptions) *cobra.Command {
 		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if clear {
-				return fwOptions.RunOnHosts(context.Background(), func(fw firewall.Firewall) (string, error) {
-					return fw.ClearServices(context.Background())
+				return fwOptions.RunOnHosts(cmd.Context(), func(fw firewall.Firewall) (string, error) {
+					return fw.ClearServices(cmd.Context())
 				})
 			}
 			if len(args) < 1 {
 				return fmt.Errorf("accepts at least 1 arg(s), received %d", len(args))
 			}
-			return fwOptions.RunOnHosts(context.Background(), func(fw firewall.Firewall) (string, error) {
+			return fwOptions.RunOnHosts(cmd.Context(), func(fw firewall.Firewall) (string, error) {
 				var finalOut strings.Builder
 				var allServices []string
 				for _, arg := range args {
@@ -377,9 +439,9 @@ func newFirewallServiceCmd(fwOptions *FirewallOptions) *cobra.Command {
 					var out string
 					var err error
 					if fwOptions.Remove {
-						out, err = fw.RemoveRule(context.Background(), rule)
+						out, err = fw.RemoveRule(cmd.Context(), rule)
 					} else {
-						out, err = fw.AddRule(context.Background(), rule)
+						out, err = fw.AddRule(cmd.Context(), rule)
 					}
 					finalOut.WriteString(out)
 					if err != nil {
@@ -402,8 +464,8 @@ func newFirewallRuleCmd(fwOptions *FirewallOptions) *cobra.Command {
 		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if clear {
-				return fwOptions.RunOnHosts(context.Background(), func(fw firewall.Firewall) (string, error) {
-					return fw.ClearRules(context.Background())
+				return fwOptions.RunOnHosts(cmd.Context(), func(fw firewall.Firewall) (string, error) {
+					return fw.ClearRules(cmd.Context())
 				})
 			}
 			if len(args) < 1 || len(args) > 2 {
@@ -417,8 +479,14 @@ func newFirewallRuleCmd(fwOptions *FirewallOptions) *cobra.Command {
 				sourceStr = args[1]
 			}
 
-			reject, _ := cmd.Flags().GetBool("reject")
-			drop, _ := cmd.Flags().GetBool("drop")
+			reject, err := cmd.Flags().GetBool("reject")
+			if err != nil {
+				return fmt.Errorf("read firewall reject flag failed: %w", err)
+			}
+			drop, err := cmd.Flags().GetBool("drop")
+			if err != nil {
+				return fmt.Errorf("read firewall drop flag failed: %w", err)
+			}
 			action := firewall.ActionAllow
 			if reject {
 				action = firewall.ActionReject
@@ -426,7 +494,7 @@ func newFirewallRuleCmd(fwOptions *FirewallOptions) *cobra.Command {
 				action = firewall.ActionDrop
 			}
 
-			return fwOptions.RunOnHosts(context.Background(), func(fw firewall.Firewall) (string, error) {
+			return fwOptions.RunOnHosts(cmd.Context(), func(fw firewall.Firewall) (string, error) {
 				var finalOut strings.Builder
 				sources := strings.Split(sourceStr, ",")
 				var ports []string
@@ -452,9 +520,9 @@ func newFirewallRuleCmd(fwOptions *FirewallOptions) *cobra.Command {
 						var out string
 						var err error
 						if fwOptions.Remove {
-							out, err = fw.RemoveRule(context.Background(), rule)
+							out, err = fw.RemoveRule(cmd.Context(), rule)
 						} else {
-							out, err = fw.AddRule(context.Background(), rule)
+							out, err = fw.AddRule(cmd.Context(), rule)
 						}
 						finalOut.WriteString(out)
 						if err != nil {
@@ -477,8 +545,8 @@ func newFirewallReloadCmd(fwOptions *FirewallOptions) *cobra.Command {
 		Use:   "reload",
 		Short: i18n.T("firewall_reload_short"),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return fwOptions.RunOnHosts(context.Background(), func(fw firewall.Firewall) (string, error) {
-				return fw.Reload(context.Background())
+			return fwOptions.RunOnHosts(cmd.Context(), func(fw firewall.Firewall) (string, error) {
+				return fw.Reload(cmd.Context())
 			})
 		},
 	}
@@ -490,8 +558,8 @@ func newFirewallStatusCmd(fwOptions *FirewallOptions) *cobra.Command {
 		Short: i18n.T("firewall_status_short"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			fwOptions.StatusOnly = true
-			return fwOptions.RunOnHosts(context.Background(), func(fw firewall.Firewall) (string, error) {
-				open, err := fw.IsOpen(context.Background())
+			return fwOptions.RunOnHosts(cmd.Context(), func(fw firewall.Firewall) (string, error) {
+				open, err := fw.IsOpen(cmd.Context())
 				if err != nil {
 					return "", err
 				}
@@ -521,61 +589,6 @@ func printFwSuccess(mu *sync.Mutex, host string, fwName string, out string) {
 		fmt.Printf("%s %s%s\n", hostPart, resultPart, outPart)
 	} else {
 		logger.PrintSuccess(i18n.Tf("fw_action_success", map[string]any{"Host": host, "FwName": fwName, "Output": out}))
-	}
-}
-
-func printFwActionFailed(mu *sync.Mutex, host string, err error, out string) {
-	if mu != nil {
-		mu.Lock()
-		defer mu.Unlock()
-	}
-
-	if logger.ColorEnabled() {
-		hostPart := logger.Cyan(fmt.Sprintf("[%s]", host))
-		failedLabel := i18n.T("fw_result_failed")
-		errorLabel := i18n.T("fw_label_error")
-		outputLabel := i18n.T("fw_label_output")
-		resultPart := logger.Red(failedLabel)
-		errPart := logger.Red(fmt.Sprintf("%s: %v", errorLabel, err))
-		var outPart string
-		if out != "" {
-			outPart = fmt.Sprintf("\n%s:\n%s", logger.Yellow(outputLabel), out)
-		}
-		fmt.Fprintf(os.Stderr, "%s %s: %s%s\n", hostPart, resultPart, errPart, outPart)
-	} else {
-		logger.PrintError(i18n.Tf("fw_action_failed", map[string]any{"Host": host, "Error": err, "Output": out}))
-	}
-}
-
-func printFwNodeNotFound(mu *sync.Mutex, u string, hs string, p uint16) {
-	if mu != nil {
-		mu.Lock()
-		defer mu.Unlock()
-	}
-
-	if logger.ColorEnabled() {
-		hostPart := logger.Cyan(fmt.Sprintf("[%s@%s:%d]", u, hs, p))
-		failedLabel := i18n.T("fw_result_failed")
-		errText := i18n.T("fw_err_node_not_found")
-		fmt.Fprintf(os.Stderr, "%s %s: %s\n", hostPart, logger.Red(failedLabel), logger.Red(errText))
-	} else {
-		logger.PrintError(i18n.Tf("fw_node_not_found", map[string]any{"User": u, "Host": hs, "Port": p}))
-	}
-}
-
-func printFwError(mu *sync.Mutex, host string, err error, labelKey string, fallbackTfKey string) {
-	if mu != nil {
-		mu.Lock()
-		defer mu.Unlock()
-	}
-
-	if logger.ColorEnabled() {
-		hostPart := logger.Cyan(fmt.Sprintf("[%s]", host))
-		failedLabel := i18n.T("fw_result_failed")
-		errLabel := i18n.T(labelKey)
-		fmt.Fprintf(os.Stderr, "%s %s: %s: %s\n", hostPart, logger.Red(failedLabel), logger.Red(errLabel), logger.Red(err.Error()))
-	} else {
-		logger.PrintError(i18n.Tf(fallbackTfKey, map[string]any{"Host": host, "Error": err}))
 	}
 }
 

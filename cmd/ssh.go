@@ -10,11 +10,11 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
-	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
@@ -62,7 +62,7 @@ func NewCmdSsh() *cobra.Command {
 			if err := o.Validate(); err != nil {
 				return err
 			}
-			return o.Run()
+			return o.RunContext(cmd.Context())
 		},
 	}
 	// OpenSSH-compatible flags
@@ -103,7 +103,10 @@ func (o *SshOptions) parseArgs() error {
 	if len(o.args) == 0 && o.Host == "" {
 		return errors.New(i18n.T("ssh_err_no_host"))
 	} else if len(o.args) >= 1 {
-		u, h, p := utils.ParseAddr(o.args[0])
+		u, h, p, err := utils.ParseAddr(o.args[0])
+		if err != nil {
+			return err
+		}
 		if h == "" && o.Host == "" {
 			return errors.New(i18n.T("ssh_err_invalid_host"))
 		}
@@ -131,7 +134,11 @@ func (o *SshOptions) Validate() error {
 		return errors.New(i18n.T("ssh_err_background_requires_nocmd"))
 	}
 	if o.User == "" {
-		o.User = utils.GetCurrentUser()
+		var userErr error
+		o.User, userErr = utils.GetCurrentUser()
+		if userErr != nil {
+			return fmt.Errorf("get current user failed: %w", userErr)
+		}
 	}
 	if o.Port == 0 {
 		o.Port = 22
@@ -143,84 +150,91 @@ func (o *SshOptions) Validate() error {
 }
 
 func (o *SshOptions) Run() error {
+	return o.RunContext(context.Background())
+}
+
+// RunContext starts the SSH operation and propagates caller cancellation.
+func (o *SshOptions) RunContext(ctx context.Context) (err error) {
 	isChild := os.Getenv("XOPS_CLI_SSH_BG_CHILD") == "true"
 
 	// -n 功能：如果是非后台运行或已是后台子进程，且指定了 -n，直接重定向标准输入到 /dev/null
 	if o.StdinRedirect && (!o.BgRun || isChild) {
 		devNull, err := os.Open(os.DevNull)
-		if err == nil {
-			oldStdin := os.Stdin
-			os.Stdin = devNull
-			defer func() {
-				os.Stdin = oldStdin
-				_ = devNull.Close()
-			}()
+		if err != nil {
+			return fmt.Errorf("open %s for SSH stdin failed: %w", os.DevNull, err)
 		}
+		oldStdin := os.Stdin
+		os.Stdin = devNull
+		defer func() {
+			os.Stdin = oldStdin
+			if closeErr := devNull.Close(); closeErr != nil {
+				err = errors.Join(err, fmt.Errorf("close SSH stdin redirect failed: %w", closeErr))
+			}
+		}()
 	}
 
 	if o.BgRun && !isChild {
-		return o.runParentDaemon()
+		return o.runParentDaemon(ctx)
 	}
 
-	return o.runConnection(isChild)
+	return o.runConnection(ctx, isChild)
 }
 
-func (o *SshOptions) runParentDaemon() error {
-	configStore := config.NewDefaultStore(utils.GetConfigFilePath())
+func (o *SshOptions) runParentDaemon(ctx context.Context) (err error) {
+	configPath, keyPath, pathErr := utils.GetConfigFilePath()
+	if pathErr != nil {
+		return fmt.Errorf("get config file path failed: %w", pathErr)
+	}
+	configStore := config.NewDefaultStore(configPath, keyPath)
 	cfg, err := configStore.Load()
 	if err != nil {
 		return fmt.Errorf("%s: %w", i18n.T("ssh_err_load_config"), err)
 	}
 
-	provider := config.NewProvider(cfg)
+	provider, err := config.NewRepository(cfg, configStore)
+	if err != nil {
+		return fmt.Errorf("create configuration repository: %w", err)
+	}
 
-	nodeID, updated, err := o.resolveNode(provider)
+	nodeID, _, err := o.resolveNode(ctx, provider)
 	if err != nil {
 		return err
 	}
-	connector := adapter.NewConnector(provider)
-	connectCtx, connectCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	idBefore, _ := provider.GetIdentity(nodeID)
-	nodeBefore, _ := provider.GetNode(nodeID)
+	connector := newCLIConnector(provider, ssh.WithLogger(logger.DefaultLogger()))
+	connectCtx, connectCancel := context.WithTimeout(ctx, 10*time.Second)
 	client, err := connector.Connect(connectCtx, nodeID)
 	connectCancel()
 	if err != nil {
-		fmt.Printf("\n%s: %v\n", i18n.T("fw_connect_failed"), err)
-		promptPressEnterIfTUI(os.Stdin, os.Stdout)
-		return fmt.Errorf("%s: %w", i18n.T("fw_connect_failed"), err)
+		promptErr := promptPressEnterIfTUI(os.Stdin, os.Stdout)
+		return errors.Join(fmt.Errorf("%s: %w", i18n.T("fw_connect_failed"), err), promptErr)
 	}
 
 	// 无论如何，在 runParentDaemon 退出时，或者有任何 panic 发生时，确保 client 必被关闭
 	var clientClosed bool
 	defer func() {
 		if !clientClosed {
-			_ = client.Close()
+			if closeErr := client.Close(); closeErr != nil {
+				err = errors.Join(err, fmt.Errorf("close SSH daemon validation client failed: %w", closeErr))
+			}
 		}
 	}()
 
 	// 测试端口绑定/隧道是否正常工作
-	runCtx, runCancel := context.WithCancel(context.Background())
+	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
-	if err := o.startTunnels(runCtx, client); err != nil {
+	tunnels, err := o.startTunnels(runCtx, runCancel, client)
+	if err != nil {
 		return err
+	}
+	if closeErr := tunnels.Close(); closeErr != nil {
+		return fmt.Errorf("stop SSH daemon validation tunnels failed: %w", closeErr)
 	}
 
 	// 验证无误，可以断开，接下来由后台进程重新连接
-	_ = client.Close()
+	if err := client.Close(); err != nil {
+		return fmt.Errorf("close SSH daemon validation client failed: %w", err)
+	}
 	clientClosed = true
-
-	// 保存最新的凭证信息
-	if idAfter, _ := provider.GetIdentity(nodeID); idBefore.Password != idAfter.Password || idBefore.Passphrase != idAfter.Passphrase {
-		updated = true
-	}
-	if nodeAfter, _ := provider.GetNode(nodeID); nodeBefore.SuPwd != nodeAfter.SuPwd {
-		updated = true
-	}
-	if updated {
-		if err := configStore.Save(cfg); err != nil {
-			return fmt.Errorf("%s: %w", i18n.T("ssh_err_save_config"), err)
-		}
-	}
 
 	// 启动后台子进程
 	exe, err := os.Executable()
@@ -235,7 +249,11 @@ func (o *SshOptions) runParentDaemon() error {
 	if err != nil {
 		return fmt.Errorf("failed to open /dev/null: %w", err)
 	}
-	defer func() { _ = devNull.Close() }()
+	defer func() {
+		if closeErr := devNull.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close SSH daemon stdio redirect failed: %w", closeErr))
+		}
+	}()
 	cmd.Stdin = devNull
 	cmd.Stdout = devNull
 	cmd.Stderr = devNull
@@ -247,23 +265,28 @@ func (o *SshOptions) runParentDaemon() error {
 	return nil
 }
 
-func (o *SshOptions) runConnection(isChild bool) error {
-	configStore := config.NewDefaultStore(utils.GetConfigFilePath())
+func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error) {
+	configPath, keyPath, pathErr := utils.GetConfigFilePath()
+	if pathErr != nil {
+		return fmt.Errorf("get config file path failed: %w", pathErr)
+	}
+	configStore := config.NewDefaultStore(configPath, keyPath)
 	cfg, err := configStore.Load()
 	if err != nil {
 		return fmt.Errorf("%s: %w", i18n.T("ssh_err_load_config"), err)
 	}
 
-	provider := config.NewProvider(cfg)
+	provider, err := config.NewRepository(cfg, configStore)
+	if err != nil {
+		return fmt.Errorf("create configuration repository: %w", err)
+	}
 
-	nodeID, updated, err := o.resolveNode(provider)
+	nodeID, _, err := o.resolveNode(ctx, provider)
 	if err != nil {
 		return err
 	}
-	connector := adapter.NewConnector(provider)
-	connectCtx, connectCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	idBefore, _ := provider.GetIdentity(nodeID)
-	nodeBefore, _ := provider.GetNode(nodeID)
+	connector := newCLIConnector(provider, ssh.WithLogger(logger.DefaultLogger()))
+	connectCtx, connectCancel := context.WithTimeout(ctx, 10*time.Second)
 	client, err := connector.Connect(connectCtx, nodeID)
 	connectCancel()
 	if err != nil {
@@ -271,31 +294,27 @@ func (o *SshOptions) runConnection(isChild bool) error {
 			// 子进程静默退出或记录错误，不进行交互式阻塞
 			return fmt.Errorf("%s: %w", i18n.T("fw_connect_failed"), err)
 		}
-		fmt.Printf("\n%s: %v\n", i18n.T("fw_connect_failed"), err)
-		promptPressEnterIfTUI(os.Stdin, os.Stdout)
-		return fmt.Errorf("%s: %w", i18n.T("fw_connect_failed"), err)
+		promptErr := promptPressEnterIfTUI(os.Stdin, os.Stdout)
+		return errors.Join(fmt.Errorf("%s: %w", i18n.T("fw_connect_failed"), err), promptErr)
 	}
-	defer func() { _ = client.Close() }()
-	// connector.Connect 可能通过交互式回调获取到新凭证并写入提供者，我们需要标记更新以便保存
-	if idAfter, _ := provider.GetIdentity(nodeID); idBefore.Password != idAfter.Password || idBefore.Passphrase != idAfter.Passphrase {
-		updated = true
-	}
-	if nodeAfter, _ := provider.GetNode(nodeID); nodeBefore.SuPwd != nodeAfter.SuPwd {
-		updated = true
-	}
-	if updated {
-		if err := configStore.Save(cfg); err != nil {
-			return fmt.Errorf("%s: %w", i18n.T("ssh_err_save_config"), err)
+	defer func() {
+		if closeErr := client.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close SSH client failed: %w", closeErr))
 		}
-	}
-
+	}()
 	// Setup background context for tunnels and execution (runs until SigInt or command exit)
-	runCtx, runCancel := context.WithCancel(context.Background())
+	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
 
-	if err := o.startTunnels(runCtx, client); err != nil {
+	tunnels, err := o.startTunnels(runCtx, runCancel, client)
+	if err != nil {
 		return err
 	}
+	defer func() {
+		if closeErr := tunnels.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("stop SSH tunnels failed: %w", closeErr))
+		}
+	}()
 
 	if o.NoCmd {
 		if !isChild {
@@ -368,46 +387,115 @@ func splitTunnels(s string) []string {
 	return parts
 }
 
-func (o *SshOptions) resolveNode(provider config.ConfigProvider) (string, bool, error) {
-	if nodeID := provider.Find(o.Host); nodeID != "" {
-		return nodeID, update(nodeID, o, provider), nil
+func (o *SshOptions) resolveNode(ctx context.Context, provider *config.Repository) (string, bool, error) {
+	nodeID, err := provider.ResolveSelector(o.Host)
+	if err != nil {
+		return "", false, fmt.Errorf("resolve SSH host %q failed: %w", o.Host, err)
 	}
-	if nodeID := provider.Find(fmt.Sprintf("%s@%s:%d", o.User, o.Host, o.Port)); nodeID != "" {
-		return nodeID, update(nodeID, o, provider), nil
+	if nodeID != "" {
+		updated, err := update(ctx, nodeID, o, provider)
+		return nodeID, updated, err
 	}
-	nodeID, err := o.createNewNode(provider)
+	nodeID, err = provider.ResolveSelector(fmt.Sprintf("%s@%s:%d", o.User, o.Host, o.Port))
+	if err != nil {
+		return "", false, fmt.Errorf("resolve SSH address %q failed: %w", o.Host, err)
+	}
+	if nodeID != "" {
+		updated, err := update(ctx, nodeID, o, provider)
+		return nodeID, updated, err
+	}
+	nodeID, err = o.createNewNode(ctx, provider)
 	return nodeID, true, err
 }
 
-func (o *SshOptions) startTunnels(ctx context.Context, client *ssh.Client) error {
+type sshTunnelGroup struct {
+	cancel context.CancelFunc
+	done   sync.WaitGroup
+	errMu  sync.Mutex
+	err    error
+}
+
+func newSSHTunnelGroup(ctx context.Context, cancelParent context.CancelFunc) (*sshTunnelGroup, context.Context) {
+	tunnelCtx, cancel := context.WithCancel(ctx)
+	group := &sshTunnelGroup{cancel: cancel}
+	if cancelParent == nil {
+		cancelParent = func() {}
+	}
+	groupCancel := group.cancel
+	group.cancel = func() {
+		groupCancel()
+		cancelParent()
+	}
+	return group, tunnelCtx
+}
+
+func (g *sshTunnelGroup) Add(forward *ssh.Forward) {
+	g.done.Go(func() {
+		if err := forward.Wait(); err != nil {
+			g.errMu.Lock()
+			g.err = errors.Join(g.err, err)
+			g.errMu.Unlock()
+			g.cancel()
+		}
+	})
+}
+
+func (g *sshTunnelGroup) Close() error {
+	if g == nil {
+		return nil
+	}
+	g.cancel()
+	g.done.Wait()
+	g.errMu.Lock()
+	defer g.errMu.Unlock()
+	return g.err
+}
+
+func (o *SshOptions) startTunnels(ctx context.Context, cancelParent context.CancelFunc, client *ssh.Client) (*sshTunnelGroup, error) {
+	group, tunnelCtx := newSSHTunnelGroup(ctx, cancelParent)
+	fail := func(err error) (*sshTunnelGroup, error) {
+		return nil, errors.Join(err, group.Close())
+	}
 	for _, lArg := range o.LocalForwards {
 		bAddr, dAddr, err := parseForwardArg(lArg)
 		if err != nil {
-			return err
+			return fail(err)
 		}
-		if err := client.LocalForward(ctx, bAddr, dAddr); err != nil {
-			return fmt.Errorf("failed to setup local forward: %w", err)
+		forward, err := client.LocalForward(tunnelCtx, bAddr, dAddr, ssh.WithForwardErrorHandler(func(err error) {
+			logger.Warnf("ssh local forward connection failed: %v", err)
+		}))
+		if err != nil {
+			return fail(fmt.Errorf("setup local forward failed: %w", err))
 		}
+		group.Add(forward)
 	}
 	for _, rArg := range o.RemoteForwards {
 		bAddr, dAddr, err := parseForwardArg(rArg)
 		if err != nil {
-			return err
+			return fail(err)
 		}
-		if err := client.RemoteForward(ctx, bAddr, dAddr); err != nil {
-			return fmt.Errorf("failed to setup remote forward: %w", err)
+		forward, err := client.RemoteForward(tunnelCtx, bAddr, dAddr, ssh.WithForwardErrorHandler(func(err error) {
+			logger.Warnf("ssh remote forward connection failed: %v", err)
+		}))
+		if err != nil {
+			return fail(fmt.Errorf("setup remote forward failed: %w", err))
 		}
+		group.Add(forward)
 	}
 	if o.DynamicForward != "" {
 		listenAddr, err := parseDynamicForwardArg(o.DynamicForward)
 		if err != nil {
-			return err
+			return fail(err)
 		}
-		if err := client.Socks5Forward(ctx, listenAddr); err != nil {
-			return fmt.Errorf("failed to setup SOCKS5 proxy: %w", err)
+		forward, err := client.Socks5Forward(tunnelCtx, listenAddr, ssh.WithForwardErrorHandler(func(err error) {
+			logger.Warnf("ssh SOCKS5 forward connection failed: %v", err)
+		}))
+		if err != nil {
+			return fail(fmt.Errorf("setup SOCKS5 proxy failed: %w", err))
 		}
+		group.Add(forward)
 	}
-	return nil
+	return group, nil
 }
 
 func parseDynamicForwardArg(arg string) (string, error) {
@@ -430,10 +518,13 @@ func parseDynamicForwardArg(arg string) (string, error) {
 	return net.JoinHostPort(host, port), nil
 }
 
-func updateNodeFields(node *models.Node, nodeID string, o *SshOptions, provider config.ConfigProvider) bool {
+func updateNodeFields(node *models.Node, nodeID string, o *SshOptions, provider config.ConfigProvider) (bool, error) {
 	nodeUpdated := false
 	if o.JumpHost != "" {
-		jumpHost := provider.Find(o.JumpHost)
+		jumpHost, err := provider.ResolveSelector(o.JumpHost)
+		if err != nil {
+			return false, fmt.Errorf("resolve SSH proxy jump %q failed: %w", o.JumpHost, err)
+		}
 		if jumpHost != "" && jumpHost != node.ProxyJump {
 			node.ProxyJump = jumpHost
 			nodeUpdated = true
@@ -461,7 +552,7 @@ func updateNodeFields(node *models.Node, nodeID string, o *SshOptions, provider 
 			}
 		}
 	}
-	return nodeUpdated
+	return nodeUpdated, nil
 }
 
 func updateIdentityFields(identity *models.Identity, o *SshOptions) bool {
@@ -482,7 +573,7 @@ func updateIdentityFields(identity *models.Identity, o *SshOptions) bool {
 	return identityUpdated
 }
 
-func (o *SshOptions) createNewNode(provider config.ConfigProvider) (string, error) {
+func (o *SshOptions) createNewNode(ctx context.Context, provider *config.Repository) (string, error) {
 	nodeID := fmt.Sprintf("%s@%s:%d", o.User, o.Host, o.Port)
 	node := models.Node{
 		HostRef:     fmt.Sprintf("%s:%d", o.Host, o.Port),
@@ -492,7 +583,10 @@ func (o *SshOptions) createNewNode(provider config.ConfigProvider) (string, erro
 		Tags:        o.Tags,
 	}
 	if node.ProxyJump != "" {
-		jumpHost := provider.Find(node.ProxyJump)
+		jumpHost, err := provider.ResolveSelector(node.ProxyJump)
+		if err != nil {
+			return "", fmt.Errorf("resolve SSH proxy jump %q failed: %w", node.ProxyJump, err)
+		}
 		if jumpHost == "" {
 			return "", errors.New(i18n.Tf("ssh_err_jump_not_found", map[string]any{"Host": node.ProxyJump}))
 		}
@@ -522,76 +616,55 @@ func (o *SshOptions) createNewNode(provider config.ConfigProvider) (string, erro
 		identity.Passphrase = o.Passphrase
 		identity.AuthType = "key"
 	}
-	provider.AddHost(node.HostRef, hostObj)
-	provider.AddIdentity(node.IdentityRef, identity)
-	provider.AddNode(nodeID, node)
+	if _, err := provider.CreateNodeContext(ctx, nodeID, node, hostObj, identity); err != nil {
+		return "", fmt.Errorf("create SSH node %q failed: %w", nodeID, err)
+	}
 	return nodeID, nil
 }
 
-func update(nodeID string, o *SshOptions, provider config.ConfigProvider) bool {
+func update(ctx context.Context, nodeID string, o *SshOptions, provider *config.Repository) (bool, error) {
 	if o.Password == "" && o.IdentityFile == "" && o.JumpHost == "" && !o.Sudo && o.Alias == "" && len(o.Tags) == 0 {
-		return false
+		return false, nil
 	}
-	node, _ := provider.GetNode(nodeID)
-	identity, _ := provider.GetIdentity(nodeID)
+	ref, ok := provider.View().NodeRefs[nodeID]
+	if !ok {
+		return false, fmt.Errorf("resolve SSH node %q reference: %w", nodeID, config.ErrNodeNotFound)
+	}
+	node, host, identity, err := provider.Resolve(nodeID)
+	if err != nil {
+		return false, fmt.Errorf("resolve SSH node %q for update failed: %w", nodeID, err)
+	}
 
-	nodeUpdated := updateNodeFields(&node, nodeID, o, provider)
+	nodeUpdated, err := updateNodeFields(&node, nodeID, o, provider)
+	if err != nil {
+		return false, err
+	}
 	identityUpdated := updateIdentityFields(&identity, o)
 
-	if nodeUpdated {
-		provider.AddNode(nodeID, node)
+	if nodeUpdated || identityUpdated {
+		if err := provider.ReplaceNodeAtRefContext(ctx, ref, nodeID, node, host, identity); err != nil {
+			return false, fmt.Errorf("update SSH node %q failed: %w", nodeID, err)
+		}
 	}
-	if identityUpdated {
-		provider.AddIdentity(node.IdentityRef, identity)
-	}
-	return nodeUpdated || identityUpdated
+	return nodeUpdated || identityUpdated, nil
 }
 
 // TODO(refactor): TUI 渲染边界与环境变量污染
 // 这里的阻塞提示逻辑属于 TUI 层面的交互，目前交由子进程处理（依赖 XOPS_CLI_SSH_FROM_TUI 环境变量）并非最佳实践。
 // 后续重构建议：移除子进程中的阻塞提示，改为子进程出错即退，由外层的 TUI 框架拦截退出状态码并绘制错误提示信息。
-func promptPressEnterIfTUI(stdin io.Reader, stdout io.Writer) {
+func promptPressEnterIfTUI(stdin io.Reader, stdout io.Writer) error {
 	if os.Getenv("XOPS_CLI_SSH_FROM_TUI") == "true" {
-		_, _ = fmt.Fprintln(stdout, i18n.T("tui_press_enter"))
+		if _, err := fmt.Fprintln(stdout, i18n.T("tui_press_enter")); err != nil {
+			return fmt.Errorf("prompt press enter write failed: %w", err)
+		}
 		var b [1]byte
-		_, _ = stdin.Read(b[:])
+		if _, err := stdin.Read(b[:]); err != nil && !errors.Is(err, io.EOF) {
+			return fmt.Errorf("read press enter failed: %w", err)
+		}
 	}
+	return nil
 }
 
 func (o *SshOptions) runCommand(ctx context.Context, client *ssh.Client, command string) error {
-	session, err := client.SSHClient().NewSession()
-	if err != nil {
-		return fmt.Errorf("failed to create new session: %w", err)
-	}
-	defer func() {
-		if closeErr := session.Close(); closeErr != nil && !errors.Is(closeErr, io.EOF) {
-			logger.Debugf("failed to close ssh session: %v", closeErr)
-		}
-	}()
-
-	session.Stdin = os.Stdin
-	session.Stdout = os.Stdout
-	session.Stderr = os.Stderr
-
-	var execCmd string
-	if command != "" {
-		execCmd = fmt.Sprintf("bash -c '%s'", strings.ReplaceAll(command, "'", "'\\''"))
-	} else {
-		execCmd = "bash"
-	}
-
-	done := make(chan error, 1)
-	go func() {
-		done <- session.Run(execCmd)
-	}()
-
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		if closeErr := session.Close(); closeErr != nil {
-			return fmt.Errorf("context done: %w; session close failed: %w", ctx.Err(), closeErr)
-		}
-		return ctx.Err()
-	}
+	return client.RunCommandWithIO(ctx, command, o.Sudo, os.Stdin, os.Stdout, os.Stderr)
 }

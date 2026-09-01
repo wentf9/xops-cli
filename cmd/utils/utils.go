@@ -1,6 +1,8 @@
 package utils
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -11,79 +13,104 @@ import (
 
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/models"
+	pkgfile "github.com/wentf9/xops-cli/pkg/utils/file"
 	"golang.org/x/term"
 )
 
-// GetConfigStore 返回配置存储、Provider、配置对象及其可能发生的错误
-func GetConfigStore() (config.Store, config.ConfigProvider, *config.Configuration, error) {
-	configPath, keyPathCfg := GetConfigFilePath()
+// GetConfigStore returns the storage bootstrap handle, the sole durable
+// repository, and a defensive configuration snapshot.
+func GetConfigStore() (config.Store, *config.Repository, *config.Configuration, error) {
+	configPath, keyPathCfg, err := GetConfigFilePath()
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	configStore := config.NewDefaultStore(configPath, keyPathCfg)
 	cfg, err := configStore.Load()
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	return configStore, config.NewProvider(cfg), cfg, nil
+	repository, err := config.NewRepository(cfg, configStore)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("create configuration repository: %w", err)
+	}
+	return configStore, repository, repository.Snapshot(), nil
 }
 
-// GetLocalSudoPassword 尝试从配置文件中获取本地 sudo 密码
-func GetLocalSudoPassword() string {
-	_, provider, _, err := GetConfigStore()
+// GetLocalSudoPassword 尝试从配置文件中获取本地 sudo 密码，返回 (password, found, error)
+func GetLocalSudoPassword() (string, bool, error) {
+	configPath, keyPathCfg, err := GetConfigFilePath()
 	if err != nil {
-		return ""
+		return "", false, fmt.Errorf("get config file path failed: %w", err)
+	}
+	configStore := config.NewDefaultStore(configPath, keyPathCfg)
+	cfg, err := configStore.Load()
+	if err != nil {
+		return "", false, fmt.Errorf("load config failed: %w", err)
+	}
+	provider := config.NewProviderWithoutOpenSSH(cfg)
+
+	username, userErr := GetCurrentUser()
+	if userErr != nil {
+		return "", false, userErr
 	}
 
-	nodeID := provider.Find("localhost")
-	if nodeID == "" {
-		nodeID = provider.Find("local")
-	}
-	if nodeID == "" {
-		nodeID = provider.Find(GetCurrentUser())
+	nodeID, resolveErr := resolveFirstSelector(provider, "localhost", "local", username)
+	if resolveErr != nil {
+		return "", false, fmt.Errorf("resolve local sudo node: %w", resolveErr)
 	}
 
 	if nodeID != "" {
 		if id, ok := provider.GetIdentity(nodeID); ok {
-			return id.Password
+			return id.Password, true, nil
 		}
 	}
-	return ""
+	return "", false, nil
 }
 
 // SaveLocalSudoPassword 保存本地 sudo 密码到配置文件
 func SaveLocalSudoPassword(password string) error {
-	store, provider, cfg, err := GetConfigStore()
+	return SaveLocalSudoPasswordContext(context.Background(), password)
+}
+
+// SaveLocalSudoPasswordContext persists the local sudo password with caller
+// cancellation applied to the configuration transaction.
+func SaveLocalSudoPasswordContext(ctx context.Context, password string) error {
+	configPath, keyPathCfg, err := GetConfigFilePath()
+	if err != nil {
+		return fmt.Errorf("get config file path failed: %w", err)
+	}
+	store := config.NewDefaultStore(configPath, keyPathCfg)
+	cfg, err := store.Load()
+	if err != nil {
+		return fmt.Errorf("load config failed: %w", err)
+	}
+	repository, repositoryErr := config.NewRepositoryWithoutOpenSSH(cfg, store)
+	if repositoryErr != nil {
+		return fmt.Errorf("create configuration repository: %w", repositoryErr)
+	}
+
+	username, err := GetCurrentUser()
 	if err != nil {
 		return err
 	}
-
-	username := GetCurrentUser()
 	address := "localhost"
 
 	// 先尝试按 GetLocalSudoPassword 的优先级查找已有的 Node
-	nodeID := provider.Find("localhost")
-	if nodeID == "" {
-		nodeID = provider.Find("local")
-	}
-	if nodeID == "" {
-		nodeID = provider.Find(username)
+	view := repository.View()
+	nodeID, resolveErr := resolveFirstSelector(repository, "localhost", "local", username)
+	if resolveErr != nil {
+		return fmt.Errorf("resolve local sudo node: %w", resolveErr)
 	}
 
 	if nodeID != "" {
-		// 如果找到了已有的 Node，更新其对应的 Identity 密码
-		if node, ok := cfg.Nodes.Get(nodeID); ok {
-			if identity, ok := cfg.Identities.Get(node.IdentityRef); ok {
-				identity.Password = password
-				cfg.Identities.Set(node.IdentityRef, identity)
-			} else {
-				// 有 Node 但 IdentityRef 失效的情况，补充 Identity
-				identityID := fmt.Sprintf("%s@local", username)
-				provider.AddIdentity(identityID, models.Identity{
-					User:     username,
-					Password: password,
-					AuthType: "password",
-				})
-				node.IdentityRef = identityID
-				cfg.Nodes.Set(nodeID, node)
-			}
+		node, host, identity, resolveErr := repository.Resolve(nodeID)
+		if resolveErr != nil {
+			return fmt.Errorf("resolve local node %q for update: %w", nodeID, resolveErr)
+		}
+		identity.Password = password
+		identity.AuthType = "password"
+		if err := repository.ReplaceNodeAtRefContext(ctx, view.NodeRefs[nodeID], nodeID, node, host, identity); err != nil {
+			return fmt.Errorf("update local sudo password failed: %w", err)
 		}
 	} else {
 		// 全新创建
@@ -91,114 +118,186 @@ func SaveLocalSudoPassword(password string) error {
 		hostID := "localhost"
 		identityID := fmt.Sprintf("%s@local", username)
 
-		provider.AddHost(hostID, models.Host{
-			Address: "127.0.0.1",
-			Port:    22,
-			Alias:   []string{"localhost", "local"},
-		})
-
-		provider.AddIdentity(identityID, models.Identity{
-			User:     username,
-			Password: password,
-			AuthType: "password",
-		})
-
-		provider.AddNode(nodeID, models.Node{
+		if _, err := repository.CreateNodeContext(ctx, nodeID, models.Node{
 			Alias:       []string{"localhost", "local", username},
 			HostRef:     hostID,
 			IdentityRef: identityID,
 			SudoMode:    models.SudoModeSudo,
-		})
-	}
-
-	return store.Save(cfg)
-}
-
-// ParseAddr 解析 user@host:port 格式的字符串
-func ParseAddr(input string) (string, string, uint16) {
-	input = strings.TrimSpace(input)
-	var user, host string
-	var port uint16
-	if atIndex := strings.LastIndex(input, ":"); atIndex != -1 {
-		p := ParsePort(input[atIndex+1:])
-		if p != 0 {
-			port = p
-			input = strings.TrimSpace(input[:atIndex])
+		}, models.Host{
+			Address: "127.0.0.1",
+			Port:    22,
+			Alias:   []string{"localhost", "local"},
+		}, models.Identity{
+			User:     username,
+			Password: password,
+			AuthType: "password",
+		}); err != nil {
+			return fmt.Errorf("create local sudo node failed: %w", err)
 		}
 	}
-	if atIndex := strings.Index(input, "@"); atIndex != -1 {
-		user = strings.TrimSpace(input[:atIndex])
-		input = strings.TrimSpace(input[atIndex+1:])
-	}
-	host = strings.TrimSpace(input)
-	return user, host, port
+
+	return nil
 }
 
-// ParseHost 解析 host:port 格式的字符串
-func ParseHost(input string) (string, uint16) {
-	var host string
-	var port uint16
-	if atIndex := strings.Index(input, ":"); atIndex != -1 {
-		port = ParsePort(input[atIndex+1:])
-		input = input[:atIndex]
+func resolveFirstSelector(provider config.ConfigProvider, selectors ...string) (string, error) {
+	for _, selector := range selectors {
+		nodeID, err := provider.ResolveSelector(selector)
+		if err != nil {
+			return "", fmt.Errorf("resolve selector %q: %w", selector, err)
+		}
+		if nodeID != "" {
+			return nodeID, nil
+		}
 	}
-	host = input
-	return host, port
+	return "", nil
 }
 
 // ParsePort 解析端口字符串
-func ParsePort(input string) uint16 {
+func ParsePort(input string) (uint16, error) {
+	input = strings.TrimSpace(input)
 	if input == "" {
-		return 0
+		return 0, fmt.Errorf("port cannot be empty")
 	}
 	port64, err := strconv.ParseUint(input, 10, 16)
-	if err != nil {
-		return 0
+	if err != nil || port64 == 0 {
+		return 0, fmt.Errorf("invalid port %q: must be between 1 and 65535", input)
 	}
-	return uint16(port64)
+	return uint16(port64), nil
 }
 
-func GetCurrentUser() string {
+// ParseHost 解析 host:port 或 [ipv6]:port 或裸 ipv6 格式的字符串
+func ParseHost(input string) (string, uint16, error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", 0, fmt.Errorf("host cannot be empty")
+	}
+
+	if strings.HasSuffix(input, ":") {
+		return "", 0, fmt.Errorf("invalid host-port format %q: missing port after colon", input)
+	}
+
+	// 1. 尝试使用标准 net.SplitHostPort 拆分（适用于 host:port, 1.2.3.4:22, [::1]:22 等）
+	if h, pStr, err := net.SplitHostPort(input); err == nil {
+		port, pErr := ParsePort(pStr)
+		if pErr != nil {
+			return "", 0, pErr
+		}
+		h = strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(h), "]"), "[")
+		if h == "" {
+			return "", 0, fmt.Errorf("host cannot be empty")
+		}
+		return h, port, nil
+	}
+
+	// 2. 如果是带方括号的 IPv6 地址，如 [::1] 或 [2001:db8::1]
+	if strings.HasPrefix(input, "[") && strings.HasSuffix(input, "]") {
+		rawIP := input[1 : len(input)-1]
+		if ip := net.ParseIP(rawIP); ip != nil {
+			return rawIP, 0, nil
+		}
+		return "", 0, fmt.Errorf("invalid bracketed IPv6 address %q", input)
+	}
+	if strings.Contains(input, "[") || strings.Contains(input, "]") {
+		return "", 0, fmt.Errorf("malformed bracketed address %q", input)
+	}
+
+	// 3. 检查是否为不带方括号的裸 IPv6 地址，如 ::1 或 2001:db8::1
+	if ip := net.ParseIP(input); ip != nil {
+		return input, 0, nil
+	}
+
+	// 4. 如果包含冒号且不是有效 IP，说明格式错误
+	if strings.Contains(input, ":") {
+		return "", 0, fmt.Errorf("invalid address or host-port %q", input)
+	}
+
+	// 5. 普通主机名或 IPv4（未带端口）
+	return input, 0, nil
+}
+
+// ParseAddr 解析 [user@]host[:port] 格式的字符串，支持 IPv6
+func ParseAddr(input string) (user, host string, port uint16, err error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", "", 0, fmt.Errorf("address cannot be empty")
+	}
+
+	if atIndex := strings.Index(input, "@"); atIndex != -1 {
+		user = strings.TrimSpace(input[:atIndex])
+		rest := strings.TrimSpace(input[atIndex+1:])
+		if user == "" {
+			return "", "", 0, fmt.Errorf("invalid address %q: username before '@' cannot be empty", input)
+		}
+		if rest == "" {
+			return "", "", 0, fmt.Errorf("invalid address %q: host after '@' cannot be empty", input)
+		}
+		host, port, err = ParseHost(rest)
+		if err != nil {
+			return "", "", 0, err
+		}
+		return user, host, port, nil
+	}
+
+	host, port, err = ParseHost(input)
+	if err != nil {
+		return "", "", 0, err
+	}
+	return "", host, port, nil
+}
+
+// GetCurrentUser 获取当前用户名
+func GetCurrentUser() (string, error) {
 	currentUser, err := user.Current()
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("get current user failed: %w", err)
 	}
-	return currentUser.Username
+	return currentUser.Username, nil
 }
 
-func GetConfigFilePath() (configPath, keyPath string) {
-	user, err := user.Current()
+// GetConfigFilePath 获取默认配置与密钥路径
+func GetConfigFilePath() (configPath, keyPath string, err error) {
+	currUser, err := user.Current()
 	if err != nil {
-		return "", ""
+		return "", "", fmt.Errorf("get current user failed: %w", err)
 	}
-	return filepath.Join(user.HomeDir, ".xops", ConfigFileName), filepath.Join(user.HomeDir, ".xops", ConfigKeyName)
+	return filepath.Join(currUser.HomeDir, ".xops", ConfigFileName), filepath.Join(currUser.HomeDir, ".xops", ConfigKeyName), nil
 }
 
-func GetPasswordFilePath() string {
-	user, err := user.Current()
+// GetPasswordFilePath 获取默认密码本文件路径
+func GetPasswordFilePath() (string, error) {
+	currUser, err := user.Current()
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("get current user failed: %w", err)
 	}
-	return filepath.Join(user.HomeDir, ".xops", PasswordFileName)
+	return filepath.Join(currUser.HomeDir, ".xops", PasswordFileName), nil
 }
 
 // AskConfirmation 弹出提示，获取用户确认
-func AskConfirmation(prompt string) bool {
-	fmt.Printf("%s [y/N]: ", prompt)
+func AskConfirmation(prompt string) (bool, error) {
+	if _, err := fmt.Printf("%s [y/N]: ", prompt); err != nil {
+		return false, fmt.Errorf("write confirmation prompt failed: %w", err)
+	}
 	var response string
 	_, err := fmt.Scanln(&response)
 	if err != nil {
-		return false
+		if err.Error() == "unexpected newline" {
+			return false, nil
+		}
+		return false, fmt.Errorf("read confirmation response failed: %w", err)
 	}
 	response = strings.ToLower(strings.TrimSpace(response))
-	return response == "y" || response == "yes"
+	return response == "y" || response == "yes", nil
 }
 
 // ReadPasswordFromTerminal 从终端安全地读取密码
 func ReadPasswordFromTerminal(prompt string) (string, error) {
-	fmt.Print(prompt)
+	if _, err := fmt.Print(prompt); err != nil {
+		return "", fmt.Errorf("write prompt failed: %w", err)
+	}
 	password, err := term.ReadPassword(int(os.Stdin.Fd()))
-	fmt.Println()
+	if _, werr := fmt.Println(); werr != nil {
+		err = errors.Join(err, werr)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -221,35 +320,5 @@ func IsValidCIDR(cidrStr string) bool {
 // 支持 ~ 展开和相对路径转绝对路径
 // 如果路径已经是绝对路径，直接返回
 func ToAbsolutePath(path string) string {
-	if path == "" {
-		return path
-	}
-
-	// 处理 ~ 开头的路径
-	if len(path) > 0 && path[0] == '~' {
-		home, err := os.UserHomeDir()
-		if err == nil {
-			// 使用 filepath.Join 确保路径分隔符正确
-			rest := path[1:]
-			if len(rest) > 0 && (rest[0] == '/' || rest[0] == '\\') {
-				rest = rest[1:]
-			}
-			if rest == "" {
-				return home
-			}
-			return filepath.Join(home, rest)
-		}
-	}
-
-	// 如果已经是绝对路径，直接返回
-	if filepath.IsAbs(path) {
-		return path
-	}
-
-	// 将相对路径转换为绝对路径
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return path
-	}
-	return absPath
+	return pkgfile.ToAbsolutePath(path)
 }

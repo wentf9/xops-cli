@@ -1,8 +1,8 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
-	"os"
 	"sort"
 	"text/tabwriter"
 
@@ -20,8 +20,8 @@ func NewCmdIdentity() *cobra.Command {
 		Aliases: []string{"id", "auth"},
 		Short:   i18n.T("identity_short"),
 		Long:    i18n.T("identity_long"),
-		Run: func(cmd *cobra.Command, args []string) {
-			_ = cmd.Help()
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return cmd.Help()
 		},
 	}
 
@@ -47,16 +47,18 @@ func NewCmdIdentityEdit() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
-			configPath, keyPathCfg := utils.GetConfigFilePath()
-			configStore := config.NewDefaultStore(configPath, keyPathCfg)
-			cfg, err := configStore.Load()
+			_, repository, _, err := utils.GetConfigStore()
 			if err != nil {
 				return err
 			}
-
-			identity, ok := cfg.Identities.Get(name)
+			view := repository.View()
+			identity, ok := view.Configuration.Identities.Get(name)
 			if !ok {
 				return fmt.Errorf("%s", i18n.Tf("identity_err_not_found", map[string]any{"Name": name}))
+			}
+			ref, ok := view.IdentityRefs[name]
+			if !ok {
+				return fmt.Errorf("resolve identity %q reference: %w", name, config.ErrIdentityNotFound)
 			}
 
 			updated := false
@@ -83,12 +85,10 @@ func NewCmdIdentityEdit() *cobra.Command {
 			}
 
 			if updated {
-				provider := config.NewProvider(cfg)
-				provider.AddIdentity(name, identity)
-
-				if err := configStore.Save(cfg); err != nil {
-					return err
+				if _, err := repository.ReplaceIdentityAtRefContext(cmd.Context(), ref, identity); err != nil {
+					return fmt.Errorf("update identity %q failed: %w", name, err)
 				}
+
 				logger.PrintSuccess(i18n.Tf("identity_update_success", map[string]any{"Name": name}))
 			} else {
 				logger.PrintWarn(i18n.T("identity_no_changes"))
@@ -110,25 +110,32 @@ func NewCmdIdentityList() *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
 		Short: i18n.T("identity_list_short"),
-		Run: func(cmd *cobra.Command, args []string) {
-			configPath, keyPath := utils.GetConfigFilePath()
+		RunE: func(cmd *cobra.Command, args []string) error {
+			configPath, keyPath, pathErr := utils.GetConfigFilePath()
+			if pathErr != nil {
+				return fmt.Errorf("get config file path failed: %w", pathErr)
+			}
 			configStore := config.NewDefaultStore(configPath, keyPath)
 			cfg, err := configStore.Load()
 			if err != nil {
-				logger.PrintError(i18n.Tf("config_load_error", map[string]any{"Error": err}))
-				return
+				return fmt.Errorf("%s: %w", i18n.T("config_load_error"), err)
 			}
 
-			provider := config.NewProvider(cfg)
+			provider, repositoryErr := config.NewRepositoryWithoutOpenSSH(cfg, configStore)
+			if repositoryErr != nil {
+				return fmt.Errorf("create configuration repository: %w", repositoryErr)
+			}
 			identities := provider.ListIdentities()
 
 			if len(identities) == 0 {
 				logger.PrintWarn(i18n.T("identity_no_stored"))
-				return
+				return nil
 			}
 
-			w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-			_, _ = fmt.Fprintln(w, i18n.T("identity_list_header"))
+			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 3, ' ', 0)
+			if _, err := fmt.Fprintln(w, i18n.T("identity_list_header")); err != nil {
+				return fmt.Errorf("write identity list header failed: %w", err)
+			}
 
 			keys := make([]string, 0, len(identities))
 			for k := range identities {
@@ -146,14 +153,19 @@ func NewCmdIdentityList() *cobra.Command {
 					detail = "******"
 				}
 
-				_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\n",
+				if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\n",
 					name,
 					id.User,
 					id.AuthType,
 					detail,
-				)
+				); err != nil {
+					return fmt.Errorf("write identity %q failed: %w", name, err)
+				}
 			}
-			_ = w.Flush()
+			if err := w.Flush(); err != nil {
+				return fmt.Errorf("flush identity list failed: %w", err)
+			}
+			return nil
 		},
 	}
 }
@@ -175,19 +187,17 @@ func NewCmdIdentityAdd() *cobra.Command {
 				return fmt.Errorf("%s", i18n.T("identity_err_no_name"))
 			}
 
-			configPath, keyPathCfg := utils.GetConfigFilePath()
-			configStore := config.NewDefaultStore(configPath, keyPathCfg)
-			cfg, err := configStore.Load()
+			_, repository, _, err := utils.GetConfigStore()
 			if err != nil {
 				return err
 			}
 
-			if _, ok := cfg.Identities.Get(name); ok {
-				return fmt.Errorf("%s", i18n.Tf("identity_err_exists", map[string]any{"Name": name}))
-			}
-
 			if user == "" {
-				user = utils.GetCurrentUser()
+				var userErr error
+				user, userErr = utils.GetCurrentUser()
+				if userErr != nil {
+					return fmt.Errorf("get current user failed: %w", userErr)
+				}
 			}
 
 			identity := models.Identity{
@@ -210,11 +220,11 @@ func NewCmdIdentityAdd() *cobra.Command {
 				identity.AuthType = "password"
 			}
 
-			provider := config.NewProvider(cfg)
-			provider.AddIdentity(name, identity)
-
-			if err := configStore.Save(cfg); err != nil {
-				return fmt.Errorf("%s: %w", i18n.T("save_config_failed"), err)
+			if _, err := repository.CreateIdentityContext(cmd.Context(), name, identity); err != nil {
+				if errors.Is(err, config.ErrConfigConflict) {
+					return fmt.Errorf("%s", i18n.Tf("identity_err_exists", map[string]any{"Name": name}))
+				}
+				return fmt.Errorf("add identity %q failed: %w", name, err)
 			}
 
 			logger.PrintSuccess(i18n.Tf("identity_add_success", map[string]any{"Name": name}))
@@ -222,11 +232,11 @@ func NewCmdIdentityAdd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVarP(&name, "name", "n", "", i18n.T("flag_identity_name"))
-	cmd.Flags().StringVarP(&user, "user", "u", "", i18n.T("flag_identity_add_user"))
-	cmd.Flags().StringVarP(&password, "password", "p", "", i18n.T("flag_identity_add_password"))
-	cmd.Flags().StringVarP(&keyPath, "key", "k", "", i18n.T("flag_identity_add_key"))
-	cmd.Flags().StringVarP(&keyPass, "key-pass", "w", "", i18n.T("flag_identity_add_key_pass"))
+	cmd.Flags().StringVarP(&name, "name", "n", "", i18n.T("identity_flag_name"))
+	cmd.Flags().StringVarP(&user, "user", "u", "", i18n.T("identity_flag_user"))
+	cmd.Flags().StringVarP(&password, "password", "p", "", i18n.T("identity_flag_password"))
+	cmd.Flags().StringVarP(&keyPath, "key", "k", "", i18n.T("identity_flag_key"))
+	cmd.Flags().StringVarP(&keyPass, "key-pass", "K", "", i18n.T("identity_flag_key_pass"))
 
 	return cmd
 }
@@ -238,22 +248,21 @@ func NewCmdIdentityDelete() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
-			configPath, keyPath := utils.GetConfigFilePath()
-			configStore := config.NewDefaultStore(configPath, keyPath)
-			cfg, err := configStore.Load()
+			_, repository, _, err := utils.GetConfigStore()
 			if err != nil {
 				return err
 			}
-
-			provider := config.NewProvider(cfg)
-			if _, ok := cfg.Identities.Get(name); !ok {
+			view := repository.View()
+			if _, ok := view.Configuration.Identities.Get(name); !ok {
 				return fmt.Errorf("%s", i18n.Tf("identity_err_not_found", map[string]any{"Name": name}))
 			}
+			ref, ok := view.IdentityRefs[name]
+			if !ok {
+				return fmt.Errorf("resolve identity %q reference: %w", name, config.ErrIdentityNotFound)
+			}
 
-			provider.DeleteIdentity(name)
-
-			if err := configStore.Save(cfg); err != nil {
-				return err
+			if _, err := repository.DeleteIdentityAtRefContext(cmd.Context(), ref); err != nil {
+				return fmt.Errorf("delete identity %q failed: %w", name, err)
 			}
 
 			logger.PrintSuccess(i18n.Tf("identity_delete_success", map[string]any{"Name": name}))

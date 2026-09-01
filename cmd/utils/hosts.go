@@ -2,6 +2,7 @@ package utils
 
 import (
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -21,21 +22,27 @@ type HostInfo struct {
 }
 
 // ReadCSVFile 从指定路径读取CSV文件并解析为主机列表
-func ReadCSVFile(path string) ([]HostInfo, error) {
+func ReadCSVFile(path string) (hosts []HostInfo, err error) {
 	if filepath.IsLocal(path) {
-		if wd, err := os.Getwd(); err == nil {
-			path = filepath.Join(wd, path)
+		wd, getwdErr := os.Getwd()
+		if getwdErr != nil {
+			return nil, fmt.Errorf("resolve csv file %q failed: %w", path, getwdErr)
 		}
+		path = filepath.Join(wd, path)
 	}
 
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("CSV文件不存在: %w", err)
+			return nil, fmt.Errorf("csv file %q not found: %w", path, err)
 		}
-		return nil, fmt.Errorf("无法打开CSV文件: %w", err)
+		return nil, fmt.Errorf("open csv file %q failed: %w", path, err)
 	}
-	defer func() { _ = file.Close() }()
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close csv file %q failed: %w", path, closeErr))
+		}
+	}()
 
 	reader := csv.NewReader(file)
 	// 允许不一致的列数（可选，视CSV规范而定）
@@ -44,33 +51,37 @@ func ReadCSVFile(path string) ([]HostInfo, error) {
 	// 读取表头
 	header, err := reader.Read()
 	if err != nil {
-		return nil, fmt.Errorf("读取CSV表头失败: %w", err)
+		return nil, fmt.Errorf("read csv header failed: %w", err)
 	}
 
 	mapping := buildCSVMapping(header)
 
 	if mapping.host == -1 {
-		return nil, fmt.Errorf("CSV文件表头必须包含 '主机' 或 'IP' 列")
+		return nil, fmt.Errorf("csv header must contain host/ip column")
 	}
 
-	var hosts []HostInfo
+	rowNum := 1
 	for {
 		record, err := reader.Read()
 		if err == io.EOF {
 			break
 		}
+		rowNum++
 		if err != nil {
-			return nil, fmt.Errorf("读取CSV记录失败: %w", err)
+			return nil, fmt.Errorf("csv row %d: read record failed: %w", rowNum, err)
 		}
 
-		hostInfo := parseHostRecord(record, mapping)
-		if hostInfo != nil {
-			hosts = append(hosts, *hostInfo)
+		hostInfo, ok, parseErr := parseHostRecord(record, mapping)
+		if parseErr != nil {
+			return nil, fmt.Errorf("csv row %d: %w", rowNum, parseErr)
+		}
+		if ok {
+			hosts = append(hosts, hostInfo)
 		}
 	}
 
 	if len(hosts) == 0 {
-		return nil, fmt.Errorf("CSV文件中没有找到有效的主机信息")
+		return nil, fmt.Errorf("no valid host records found in csv file %q", path)
 	}
 
 	return hosts, nil
@@ -93,20 +104,23 @@ func ParseHosts(ip, hostFile, csvFile string) ([]HostInfo, error) {
 				hosts = append(hosts, strings.TrimSpace(p))
 			}
 		} else if hostFile != "" {
-			// 复用 ParseHost 逻辑而不是简单的正则替换，以确保格式一致
 			file, err := os.ReadFile(hostFile)
-			if err == nil {
-				lines := strings.Split(string(file), "\n")
-				for _, line := range lines {
-					line = strings.TrimSpace(line)
-					if line != "" {
-						hosts = append(hosts, line)
-					}
+			if err != nil {
+				return nil, fmt.Errorf("read host file %s failed: %w", hostFile, err)
+			}
+			lines := strings.Split(string(file), "\n")
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if line != "" {
+					hosts = append(hosts, line)
 				}
 			}
 		}
 		for _, host := range hosts {
-			u, h, p := ParseAddr(host)
+			u, h, p, err := ParseAddr(host)
+			if err != nil {
+				return nil, fmt.Errorf("invalid host address %q: %w", host, err)
+			}
 			HostsInfo = append(HostsInfo, HostInfo{
 				Host: h,
 				Port: p,
@@ -147,7 +161,20 @@ func buildCSVMapping(header []string) csvHostMapping {
 	}
 }
 
-func parseHostRecord(record []string, mapping csvHostMapping) *HostInfo {
+func isRecordEmpty(record []string) bool {
+	for _, field := range record {
+		if strings.TrimSpace(field) != "" {
+			return false
+		}
+	}
+	return true
+}
+
+func parseHostRecord(record []string, mapping csvHostMapping) (HostInfo, bool, error) {
+	if isRecordEmpty(record) {
+		return HostInfo{}, false, nil
+	}
+
 	getVal := func(idx int) string {
 		if idx != -1 && idx < len(record) {
 			return strings.TrimSpace(record[idx])
@@ -157,18 +184,23 @@ func parseHostRecord(record []string, mapping csvHostMapping) *HostInfo {
 
 	hostStr := getVal(mapping.host)
 	if hostStr == "" {
-		return nil
+		return HostInfo{}, false, fmt.Errorf("host field is required")
 	}
 
-	host, port := ParseHost(hostStr)
+	host, port, err := ParseHost(hostStr)
+	if err != nil {
+		return HostInfo{}, false, fmt.Errorf("parse host %q failed: %w", hostStr, err)
+	}
+
 	if pStr := getVal(mapping.port); pStr != "" {
-		var p uint16
-		if _, err := fmt.Sscanf(pStr, "%d", &p); err == nil && p != 0 {
-			port = p
+		p, parseErr := ParsePort(pStr)
+		if parseErr != nil {
+			return HostInfo{}, false, fmt.Errorf("parse port %q failed: %w", pStr, parseErr)
 		}
+		port = p
 	}
 
-	return &HostInfo{
+	return HostInfo{
 		Host:       host,
 		Port:       port,
 		Alias:      getVal(mapping.alias),
@@ -176,5 +208,5 @@ func parseHostRecord(record []string, mapping csvHostMapping) *HostInfo {
 		Password:   getVal(mapping.pass),
 		KeyPath:    getVal(mapping.key),
 		Passphrase: getVal(mapping.keyPass),
-	}
+	}, true, nil
 }

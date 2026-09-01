@@ -2,15 +2,52 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
-	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/i18n"
+	"github.com/wentf9/xops-cli/pkg/logger"
 	"github.com/wentf9/xops-cli/pkg/playbook"
+	"github.com/wentf9/xops-cli/pkg/ssh"
 )
+
+type cliEventListener struct{}
+
+func (cliEventListener) OnTargetsResolved(count int) {
+	logger.Info(i18n.Tf("play_target_resolved", map[string]any{"Count": count}))
+}
+
+func (cliEventListener) OnTagEmpty(tag string) {
+	logger.Warn(i18n.Tf("play_warn_tag_empty", map[string]any{"Tag": tag}))
+}
+
+func (cliEventListener) OnStepRunning(host, stepName string) {
+	logger.Info(i18n.Tf("play_step_running", map[string]any{
+		"Host": host, "Step": stepName,
+	}))
+}
+
+func (cliEventListener) OnStepResult(host, stepName string, r playbook.StepResult) {
+	switch r.Status {
+	case playbook.StatusOK, playbook.StatusChanged:
+		logger.PrintSuccess(i18n.Tf("play_step_ok", map[string]any{
+			"Host": host, "Step": stepName,
+		}))
+	case playbook.StatusSkipped:
+		logger.Info(i18n.Tf("play_step_skipped", map[string]any{
+			"Host": host, "Step": stepName,
+		}))
+	case playbook.StatusFailed:
+		logger.Info(i18n.Tf("play_step_failed", map[string]any{
+			"Host": host, "Step": stepName,
+		}))
+	}
+}
 
 // PlayOptions 保存 xops play 命令的所有选项
 type PlayOptions struct {
@@ -20,6 +57,7 @@ type PlayOptions struct {
 	DryRun      bool
 	Limit       string // 逗号分隔的节点名称，覆盖 Playbook 的 targets
 	Sudo        bool
+	Out         io.Writer
 }
 
 func NewPlayOptions() *PlayOptions {
@@ -35,7 +73,8 @@ func NewCmdPlay() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			o.FilePath = args[0]
-			return o.Run()
+			o.Out = cmd.OutOrStdout()
+			return o.RunContext(cmd.Context())
 		},
 	}
 
@@ -50,6 +89,12 @@ func NewCmdPlay() *cobra.Command {
 
 // Run 执行 Playbook。
 func (o *PlayOptions) Run() error {
+	return o.RunContext(context.Background())
+}
+
+// RunContext executes the Playbook and propagates caller cancellation through
+// target resolution, SSH connections, and step execution.
+func (o *PlayOptions) RunContext(ctx context.Context) (retErr error) {
 	// 解析 --var 选项
 	extraVars, err := parseVars(o.Vars)
 	if err != nil {
@@ -86,46 +131,98 @@ func (o *PlayOptions) Run() error {
 		return fmt.Errorf("%s: %w", i18n.T("config_load_error"), err)
 	}
 
-	connector := adapter.NewConnector(provider)
-	defer connector.CloseAll()
+	connector := newCLIConnector(provider, ssh.WithLogger(logger.DefaultLogger()))
+	defer func() {
+		joinConnectorCloseError(&retErr, connector)
+	}()
 
 	// 创建并运行引擎
-	engine := playbook.NewEngine(pb, provider, connector)
-	report, err := engine.Run(context.Background())
-	if err != nil {
-		return err
+	engine := playbook.NewEngine(pb, provider, connector, playbook.WithEventListener(cliEventListener{}))
+	report, runErr := engine.Run(ctx)
+	if runErr != nil && report == nil {
+		var targetErr *playbook.TargetNotFoundError
+		if errors.Is(runErr, playbook.ErrNoTargets) {
+			return fmt.Errorf("%s: %w", i18n.T("play_err_no_targets"), runErr)
+		} else if errors.As(runErr, &targetErr) {
+			return fmt.Errorf("%s: %w", i18n.Tf("play_err_node_not_found", map[string]any{"Node": targetErr.Target}), runErr)
+		}
+		return runErr
 	}
 
-	report.Print()
+	if err := report.RenderTo(o.outputWriter()); err != nil {
+		return fmt.Errorf("write playbook report failed: %w", err)
+	}
 
-	// 如果有失败的主机，以非零退出码退出
-	for _, h := range report.Hosts {
-		if h.Status != playbook.HostStatusSuccess {
-			return fmt.Errorf("%s", i18n.T("play_err_some_failed"))
-		}
+	executionErr := playbookExecutionError(report)
+	if runErr != nil || executionErr != nil {
+		return fmt.Errorf("%s: %w", i18n.T("play_err_some_failed"), errors.Join(runErr, executionErr))
 	}
 
 	return nil
 }
 
+func playbookExecutionError(report *playbook.Report) error {
+	if report == nil {
+		return nil
+	}
+
+	var executionErrs []error
+	for _, host := range report.Hosts {
+		hostHasDetailedError := false
+		for _, step := range host.Steps {
+			if step.Status != playbook.StatusFailed || step.Err == nil {
+				continue
+			}
+			hostHasDetailedError = true
+			executionErrs = append(executionErrs, fmt.Errorf("host %s step %s failed: %w", host.NodeID, step.StepName, step.Err))
+		}
+		if host.Status != playbook.HostStatusSuccess && !hostHasDetailedError {
+			executionErrs = append(executionErrs, fmt.Errorf("host %s execution %s", host.NodeID, host.Status))
+		}
+	}
+	return errors.Join(executionErrs...)
+}
+
 // printDryRun 在 Dry Run 模式下打印 Playbook 摘要。
 func (o *PlayOptions) printDryRun(pb *playbook.Playbook) error {
-	fmt.Printf("🔍 %s\n\n", i18n.T("play_dry_run"))
-	fmt.Printf("Playbook : %s\n", pb.Name)
-	if pb.Description != "" {
-		fmt.Printf("Desc     : %s\n", pb.Description)
+	w := o.outputWriter()
+	if _, err := fmt.Fprintf(w, "🔍 %s\n\n", i18n.T("play_dry_run")); err != nil {
+		return fmt.Errorf("write dry-run header failed: %w", err)
 	}
-	fmt.Printf("Targets  : tags=%v nodes=%v hosts=%v\n",
-		pb.Targets.Tags, pb.Targets.Nodes, pb.Targets.Hosts)
-	fmt.Printf("Settings : concurrency=%d, sudo=%v, on_error=%s\n",
-		pb.Settings.Concurrency, pb.Settings.Sudo, pb.Settings.OnError)
-	fmt.Printf("Steps    : %d\n\n", len(pb.Steps))
+	if _, err := fmt.Fprintf(w, "Playbook : %s\n", pb.Name); err != nil {
+		return fmt.Errorf("write dry-run playbook name failed: %w", err)
+	}
+	if pb.Description != "" {
+		if _, err := fmt.Fprintf(w, "Desc     : %s\n", pb.Description); err != nil {
+			return fmt.Errorf("write dry-run description failed: %w", err)
+		}
+	}
+	if _, err := fmt.Fprintf(w, "Targets  : tags=%v nodes=%v hosts=%v\n",
+		pb.Targets.Tags, pb.Targets.Nodes, pb.Targets.Hosts); err != nil {
+		return fmt.Errorf("write dry-run targets failed: %w", err)
+	}
+	if _, err := fmt.Fprintf(w, "Settings : concurrency=%d, sudo=%v, on_error=%s\n",
+		pb.Settings.Concurrency, pb.Settings.Sudo, pb.Settings.OnError); err != nil {
+		return fmt.Errorf("write dry-run settings failed: %w", err)
+	}
+	if _, err := fmt.Fprintf(w, "Steps    : %d\n\n", len(pb.Steps)); err != nil {
+		return fmt.Errorf("write dry-run step count failed: %w", err)
+	}
 
 	for i, s := range pb.Steps {
 		stepType := stepTypeName(s)
-		fmt.Printf("  [%d] %-20s (%s)\n", i+1, s.Name, stepType)
+		if _, err := fmt.Fprintf(w, "  [%d] %-20s (%s)\n", i+1, s.Name, stepType); err != nil {
+			return fmt.Errorf("write dry-run step failed: %w", err)
+		}
 	}
 	return nil
+}
+
+func (o *PlayOptions) outputWriter() io.Writer {
+	if o.Out != nil {
+		return o.Out
+	}
+	return os.Stdout
 }
 
 // stepTypeName 返回步骤的类型名称字符串。

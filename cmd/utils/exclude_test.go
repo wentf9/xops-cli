@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/wentf9/xops-cli/pkg/config"
@@ -38,7 +39,7 @@ func TestParseExcludeFlag(t *testing.T) {
 	}
 }
 
-func newTestProvider(nodes map[string]models.Node) config.ConfigProvider {
+func newTestProvider(nodes map[string]models.Node, hosts map[string]models.Host, identities map[string]models.Identity) *config.Provider {
 	cfg := &config.Configuration{
 		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
 		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
@@ -47,7 +48,13 @@ func newTestProvider(nodes map[string]models.Node) config.ConfigProvider {
 	for id, n := range nodes {
 		cfg.Nodes.Set(id, n)
 	}
-	return config.NewProvider(cfg)
+	for id, host := range hosts {
+		cfg.Hosts.Set(id, host)
+	}
+	for id, identity := range identities {
+		cfg.Identities.Set(id, identity)
+	}
+	return config.NewProviderWithoutOpenSSH(cfg)
 }
 
 func TestResolveExcludes(t *testing.T) {
@@ -66,16 +73,16 @@ func TestResolveExcludes(t *testing.T) {
 			Alias:       []string{"frontend-2"},
 		},
 	}
-	provider := newTestProvider(nodes)
-
-	// 补充 Host 和 Identity 以便 provider.Find() 能建立完整索引
-	provider.AddHost("host-web-1", models.Host{Address: "192.168.1.10", Port: 22})
-	provider.AddHost("host-web-2", models.Host{Address: "192.168.1.11", Port: 22})
-	provider.AddIdentity("id-web-1", models.Identity{User: "root"})
-	provider.AddIdentity("id-web-2", models.Identity{User: "root"})
-	// 重新 add node 以重建索引
-	provider.AddNode("web-01", nodes["web-01"])
-	provider.AddNode("web-02", nodes["web-02"])
+	provider := newTestProvider(nodes,
+		map[string]models.Host{
+			"host-web-1": {Address: "192.168.1.10", Port: 22},
+			"host-web-2": {Address: "192.168.1.11", Port: 22},
+		},
+		map[string]models.Identity{
+			"id-web-1": {User: "root"},
+			"id-web-2": {User: "root"},
+		},
+	)
 
 	t.Run("empty input returns nil", func(t *testing.T) {
 		got, err := ResolveExcludes(provider, nil)
@@ -148,4 +155,26 @@ func TestResolveExcludes(t *testing.T) {
 			t.Fatal("expected error for unmatched exclude, got nil")
 		}
 	})
+}
+
+func TestResolveFirstSelectorRejectsAmbiguousCandidate(t *testing.T) {
+	provider := newTestProvider(
+		map[string]models.Node{
+			"one": {HostRef: "host-one", IdentityRef: "identity-one"},
+			"two": {HostRef: "host-two", IdentityRef: "identity-two"},
+		},
+		map[string]models.Host{
+			"host-one": {Address: "shared.example", Port: 22},
+			"host-two": {Address: "shared.example", Port: 22},
+		},
+		map[string]models.Identity{
+			"identity-one": {User: "root"},
+			"identity-two": {User: "deploy"},
+		},
+	)
+
+	_, err := resolveFirstSelector(provider, "shared.example")
+	if !errors.Is(err, config.ErrAmbiguousNode) {
+		t.Fatalf("resolveFirstSelector() error = %v, want ErrAmbiguousNode", err)
+	}
 }

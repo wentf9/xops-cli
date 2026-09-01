@@ -4,6 +4,7 @@ Copyright © 2025 NAME HERE <EMAIL ADDRESS>
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"time"
@@ -23,24 +24,32 @@ func newCmdPing() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ip := args[0]
 
-			if resolve, err := net.ResolveIPAddr("ip", ip); err != nil {
+			resolveCtx, cancelResolve := context.WithTimeout(cmd.Context(), 5*time.Second)
+			resolved, err := net.DefaultResolver.LookupIPAddr(resolveCtx, ip)
+			cancelResolve()
+			if err != nil {
 				return fmt.Errorf("%s: %w", i18n.T("ping_err_resolve"), err)
-			} else {
-				logger.PrintInfo(i18n.Tf("ping_resolve_info", map[string]any{"Host": args[0], "IP": resolve.String()}))
-				ip = resolve.String()
 			}
+			if len(resolved) == 0 {
+				return fmt.Errorf("%s: no IP address returned", i18n.T("ping_err_resolve"))
+			}
+			logger.PrintInfo(i18n.Tf("ping_resolve_info", map[string]any{"Host": args[0], "IP": resolved[0].String()}))
+			ip = resolved[0].String()
 
 			if len(args) == 2 {
 				port := args[1]
 				address := net.JoinHostPort(ip, port)
 				logger.PrintInfo(i18n.Tf("ping_tcp_testing", map[string]any{"Address": address}))
 
-				conn, err := net.DialTimeout("tcp", address, 5*time.Second)
+				dialCtx, cancelDial := context.WithTimeout(cmd.Context(), 5*time.Second)
+				conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", address)
+				cancelDial()
 				if err != nil {
-					logger.PrintError(i18n.Tf("ping_port_closed", map[string]any{"IP": ip, "Port": port, "Error": err}))
-					return nil
+					return fmt.Errorf("port check failed on %s: %w", address, err)
 				}
-				_ = conn.Close()
+				if err := conn.Close(); err != nil {
+					return fmt.Errorf("close port check connection to %s failed: %w", address, err)
+				}
 				logger.PrintSuccess(i18n.Tf("ping_port_open", map[string]any{"IP": ip, "Port": port}))
 				return nil
 			}
@@ -67,7 +76,7 @@ func newCmdPing() *cobra.Command {
 				}))
 			}
 
-			return pinger.Run() // 此处会阻塞直到ping结束
+			return pinger.RunWithContext(cmd.Context())
 		},
 	}
 }

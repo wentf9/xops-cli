@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -27,8 +28,8 @@ func newCmdEncode() *cobra.Command {
 		Use:   "encode [command] [-d] args",
 		Short: i18n.T("encode_short"),
 		Long:  i18n.T("encode_long"),
-		Run: func(cmd *cobra.Command, args []string) {
-			_ = cmd.Help()
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return cmd.Help()
 		},
 	}
 
@@ -48,19 +49,26 @@ func newEncodeUrlCmd(opts *encodeOpts) *cobra.Command {
 		Short: i18n.T("url_short"),
 		Long:  i18n.T("url_long"),
 		Args:  func(cmd *cobra.Command, args []string) error { return argsValidator(args, &opts.stdinData) },
-		Run: func(cmd *cobra.Command, args []string) {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			args = prepareArgs(args, opts.stdinData)
-			for _, str := range args {
+			var decodeErrs []error
+			for i, str := range args {
 				if opts.isDecode {
-					if out, err := url.QueryUnescape(str); err != nil {
-						fmt.Fprintln(os.Stderr, err)
-					} else {
-						fmt.Println(out)
+					out, err := url.QueryUnescape(str)
+					if err != nil {
+						decodeErrs = append(decodeErrs, fmt.Errorf("decode url argument %d failed: %w", i+1, err))
+						continue
 					}
-				} else {
-					fmt.Println(url.QueryEscape(str))
+					if _, err := fmt.Fprintln(cmd.OutOrStdout(), out); err != nil {
+						return fmt.Errorf("write decoded url argument %d failed: %w", i+1, err)
+					}
+					continue
+				}
+				if _, err := fmt.Fprintln(cmd.OutOrStdout(), url.QueryEscape(str)); err != nil {
+					return fmt.Errorf("write encoded url argument %d failed: %w", i+1, err)
 				}
 			}
+			return errors.Join(decodeErrs...)
 		},
 	}
 }
@@ -71,34 +79,43 @@ func newEncodeBase64Cmd(opts *encodeOpts) *cobra.Command {
 		Short: i18n.T("base64_short"),
 		Long:  i18n.T("base64_long"),
 		Args:  func(cmd *cobra.Command, args []string) error { return argsValidator(args, &opts.stdinData) },
-		Run: func(cmd *cobra.Command, args []string) {
-			urlMode, _ := cmd.Flags().GetBool("url")
+		RunE: func(cmd *cobra.Command, args []string) error {
+			urlMode, err := cmd.Flags().GetBool("url")
+			if err != nil {
+				return fmt.Errorf("read url mode flag failed: %w", err)
+			}
 			args = prepareArgs(args, opts.stdinData)
 			if urlMode {
-				runBase64(args, opts.isDecode, base64.URLEncoding)
-			} else {
-				runBase64(args, opts.isDecode, base64.StdEncoding)
+				return runBase64(cmd.OutOrStdout(), args, opts.isDecode, base64.URLEncoding)
 			}
+			return runBase64(cmd.OutOrStdout(), args, opts.isDecode, base64.StdEncoding)
 		},
 	}
 	cmd.Flags().BoolP("url", "u", false, i18n.T("flag_base64_url"))
 	return cmd
 }
 
-func runBase64(args []string, isDecode bool, enc *base64.Encoding) {
+func runBase64(w io.Writer, args []string, isDecode bool, enc *base64.Encoding) error {
+	var decodeErrs []error
 	if isDecode {
-		for _, str := range args {
-			if out, err := enc.DecodeString(str); err != nil {
-				fmt.Fprintln(os.Stderr, err)
-			} else {
-				fmt.Println(string(out))
+		for i, str := range args {
+			out, err := enc.DecodeString(str)
+			if err != nil {
+				decodeErrs = append(decodeErrs, fmt.Errorf("decode base64 argument %d failed: %w", i+1, err))
+				continue
+			}
+			if _, err := fmt.Fprintln(w, string(out)); err != nil {
+				return fmt.Errorf("write decoded base64 argument %d failed: %w", i+1, err)
 			}
 		}
-	} else {
-		for _, str := range args {
-			fmt.Println(enc.EncodeToString([]byte(str)))
+		return errors.Join(decodeErrs...)
+	}
+	for i, str := range args {
+		if _, err := fmt.Fprintln(w, enc.EncodeToString([]byte(str))); err != nil {
+			return fmt.Errorf("write encoded base64 argument %d failed: %w", i+1, err)
 		}
 	}
+	return nil
 }
 
 func newEncodeUtf8Cmd(opts *encodeOpts) *cobra.Command {
@@ -107,19 +124,26 @@ func newEncodeUtf8Cmd(opts *encodeOpts) *cobra.Command {
 		Short: i18n.T("utf8_short"),
 		Long:  i18n.T("utf8_long"),
 		Args:  func(cmd *cobra.Command, args []string) error { return argsValidator(args, &opts.stdinData) },
-		Run: func(cmd *cobra.Command, args []string) {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			args = prepareArgs(args, opts.stdinData)
-			for _, str := range args {
+			var decodeErrs []error
+			for i, str := range args {
 				if opts.isDecode {
-					if out, err := utf8ToString(str); err != nil {
-						fmt.Fprintln(os.Stderr, err)
-					} else {
-						fmt.Println(out)
+					out, err := utf8ToString(str)
+					if err != nil {
+						decodeErrs = append(decodeErrs, fmt.Errorf("decode utf-8 argument %d failed: %w", i+1, err))
+						continue
 					}
-				} else {
-					fmt.Println(stringToUTF8(str))
+					if _, err := fmt.Fprintln(cmd.OutOrStdout(), out); err != nil {
+						return fmt.Errorf("write decoded utf-8 argument %d failed: %w", i+1, err)
+					}
+					continue
+				}
+				if _, err := fmt.Fprintln(cmd.OutOrStdout(), stringToUTF8(str)); err != nil {
+					return fmt.Errorf("write encoded utf-8 argument %d failed: %w", i+1, err)
 				}
 			}
+			return errors.Join(decodeErrs...)
 		},
 	}
 }
@@ -130,19 +154,26 @@ func newEncodeUnicodeCmd(opts *encodeOpts) *cobra.Command {
 		Short: i18n.T("unicode_short"),
 		Long:  i18n.T("unicode_long"),
 		Args:  func(cmd *cobra.Command, args []string) error { return argsValidator(args, &opts.stdinData) },
-		Run: func(cmd *cobra.Command, args []string) {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			args = prepareArgs(args, opts.stdinData)
-			for _, str := range args {
+			var decodeErrs []error
+			for i, str := range args {
 				if opts.isDecode {
-					if out, err := unicodeToString(str); err != nil {
-						fmt.Fprintln(os.Stderr, err)
-					} else {
-						fmt.Println(out)
+					out, err := unicodeToString(str)
+					if err != nil {
+						decodeErrs = append(decodeErrs, fmt.Errorf("decode unicode argument %d failed: %w", i+1, err))
+						continue
 					}
-				} else {
-					fmt.Println(stringToUnicode(str))
+					if _, err := fmt.Fprintln(cmd.OutOrStdout(), out); err != nil {
+						return fmt.Errorf("write decoded unicode argument %d failed: %w", i+1, err)
+					}
+					continue
+				}
+				if _, err := fmt.Fprintln(cmd.OutOrStdout(), stringToUnicode(str)); err != nil {
+					return fmt.Errorf("write encoded unicode argument %d failed: %w", i+1, err)
 				}
 			}
+			return errors.Join(decodeErrs...)
 		},
 	}
 }

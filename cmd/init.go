@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -25,6 +26,7 @@ type initResult struct {
 	configCreated bool
 	imported      int
 	skipped       int
+	issues        []config.ImportIssue
 }
 
 // NewInitOptions creates initialization options with the default OpenSSH path.
@@ -42,7 +44,7 @@ func NewCmdInit() *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			o.SSHConfigChanged = cmd.Flags().Changed("ssh-config")
-			result, err := o.Run()
+			result, err := o.RunContext(cmd.Context())
 			if err != nil {
 				return err
 			}
@@ -59,8 +61,18 @@ func NewCmdInit() *cobra.Command {
 // Run creates the local configuration and imports concrete OpenSSH hosts.
 // It never performs network operations and never overwrites existing nodes.
 func (o *InitOptions) Run() (initResult, error) {
+	return o.RunContext(context.Background())
+}
+
+// RunContext creates local configuration while preserving caller cancellation
+// through durable configuration writes.
+func (o *InitOptions) RunContext(ctx context.Context) (initResult, error) {
 	if o.ConfigPath == "" || o.KeyPath == "" {
-		o.ConfigPath, o.KeyPath = utils.GetConfigFilePath()
+		var pathErr error
+		o.ConfigPath, o.KeyPath, pathErr = utils.GetConfigFilePath()
+		if pathErr != nil {
+			return initResult{}, fmt.Errorf("resolve xops configuration paths: %w", pathErr)
+		}
 	}
 	if o.ConfigPath == "" || o.KeyPath == "" {
 		return initResult{}, fmt.Errorf("resolve xops configuration paths")
@@ -76,23 +88,35 @@ func (o *InitOptions) Run() (initResult, error) {
 	if err != nil {
 		return initResult{}, fmt.Errorf("load xops configuration: %w", err)
 	}
-	provider := config.NewProvider(cfg)
+	repository, repositoryErr := config.NewRepositoryWithoutOpenSSH(cfg, store)
+	if repositoryErr != nil {
+		return initResult{}, fmt.Errorf("create configuration repository: %w", repositoryErr)
+	}
 
 	result := initResult{configCreated: configCreated}
 	if !o.SkipSSHImport && o.SSHConfigPath != "" {
-		hosts, loadErr := loadOpenSSHHosts(o.SSHConfigPath, utils.GetCurrentUser())
+		currUser, userErr := utils.GetCurrentUser()
+		if userErr != nil {
+			return initResult{}, fmt.Errorf("get current user failed: %w", userErr)
+		}
+		hosts, loadErr := loadOpenSSHHosts(o.SSHConfigPath, currUser)
 		if loadErr != nil {
 			if !errors.Is(loadErr, os.ErrNotExist) || o.SSHConfigChanged {
 				return initResult{}, loadErr
 			}
 		} else {
-			result.imported, result.skipped = importOpenSSHHosts(provider, hosts)
+			importResult, importErr := repository.ImportOpenSSHHostsContext(ctx, hosts)
+			if importErr != nil {
+				return initResult{}, fmt.Errorf("import openssh hosts: %w", importErr)
+			}
+			result.imported = importResult.Imported
+			result.skipped = importResult.Skipped
+			result.issues = importResult.Issues
 		}
 	}
-
-	if result.configCreated || result.imported > 0 {
-		if err := store.Save(cfg); err != nil {
-			return initResult{}, fmt.Errorf("save xops configuration: %w", err)
+	if result.configCreated && result.imported == 0 {
+		if err := repository.InitializeContext(ctx); err != nil {
+			return initResult{}, fmt.Errorf("initialize xops configuration: %w", err)
 		}
 	}
 	return result, nil
@@ -117,6 +141,14 @@ func (o *InitOptions) printResult(cmd *cobra.Command, result initResult) error {
 		"Skipped":  result.skipped,
 	})); err != nil {
 		return fmt.Errorf("write openssh import summary: %w", err)
+	}
+	for _, issue := range result.issues {
+		if _, err := fmt.Fprintln(cmd.OutOrStdout(), i18n.Tf("init_import_issue", map[string]any{
+			"Name":  issue.Name,
+			"Error": issue.Err,
+		})); err != nil {
+			return fmt.Errorf("write openssh import issue: %w", err)
+		}
 	}
 	if _, err := fmt.Fprintln(cmd.OutOrStdout(), i18n.T("init_next_steps")); err != nil {
 		return fmt.Errorf("write initialization next steps: %w", err)
@@ -151,46 +183,6 @@ func loadOpenSSHHosts(path, defaultUser string) (hosts []config.OpenSSHHost, err
 		return nil, fmt.Errorf("load openssh configuration %q: %w", path, err)
 	}
 	return hosts, nil
-}
-
-func importOpenSSHHosts(provider config.ConfigProvider, hosts []config.OpenSSHHost) (imported, skipped int) {
-	added := make([]string, 0, len(hosts))
-	for _, item := range hosts {
-		if provider.Find(item.Name) != "" {
-			skipped++
-			continue
-		}
-
-		hostRef := "openssh-host:" + item.Name
-		identityRef := "openssh-identity:" + item.Name
-		item.Node.HostRef = hostRef
-		item.Node.IdentityRef = identityRef
-		provider.AddHost(hostRef, item.Host)
-		provider.AddIdentity(identityRef, item.Identity)
-		provider.AddNode(item.Name, item.Node)
-		added = append(added, item.Name)
-		imported++
-	}
-
-	for _, nodeID := range added {
-		node, ok := provider.GetNode(nodeID)
-		if !ok || node.ProxyJump == "" {
-			continue
-		}
-		if jumpNodeID := findProxyJumpNode(provider, node.ProxyJump); jumpNodeID != "" {
-			node.ProxyJump = jumpNodeID
-			provider.AddNode(nodeID, node)
-		}
-	}
-	return imported, skipped
-}
-
-func findProxyJumpNode(provider config.ConfigProvider, value string) string {
-	if nodeID := provider.Find(value); nodeID != "" {
-		return nodeID
-	}
-	_, host, _ := utils.ParseAddr(value)
-	return provider.Find(host)
 }
 
 func defaultSSHConfigPath() string {

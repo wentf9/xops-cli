@@ -5,6 +5,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/spf13/cobra"
 )
 
 func TestParseForwardArg(t *testing.T) {
@@ -173,7 +175,10 @@ func TestPromptPressEnterIfTUI(t *testing.T) {
 			stdin := strings.NewReader(tt.stdinVal)
 			var stdout bytes.Buffer
 
-			promptPressEnterIfTUI(stdin, &stdout)
+			err := promptPressEnterIfTUI(stdin, &stdout)
+			if err != nil {
+				t.Fatalf("unexpected error from promptPressEnterIfTUI: %v", err)
+			}
 
 			hasPrompt := stdout.Len() > 0
 			if hasPrompt != tt.wantOutput {
@@ -213,8 +218,16 @@ func TestSshStdinScriptDetection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create pipe: %v", err)
 	}
-	defer func() { _ = w.Close() }()
-	defer func() { _ = r.Close() }()
+	defer func() {
+		if err := w.Close(); err != nil {
+			t.Logf("Close failed: %v", err)
+		}
+	}()
+	defer func() {
+		if err := r.Close(); err != nil {
+			t.Logf("Close failed: %v", err)
+		}
+	}()
 
 	oldStdin := os.Stdin
 	defer func() { os.Stdin = oldStdin }()
@@ -301,5 +314,70 @@ func TestPreprocessArgsForSshSudoOption(t *testing.T) {
 	parsedArgs := c.Flags().Args()
 	if len(parsedArgs) != 1 || parsedArgs[0] != "181" {
 		t.Errorf("expected host '181' as the only position argument, got %v", parsedArgs)
+	}
+}
+
+func TestPreprocessArgsForSshSudoWithCommand(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		wantHost string
+		wantCmd  string
+		wantSudo bool
+	}{
+		{
+			name:     "181 --sudo ls /root",
+			args:     []string{"181", "--sudo", "ls", "/root"},
+			wantHost: "181",
+			wantCmd:  "ls /root",
+			wantSudo: true,
+		},
+		{
+			name:     "--sudo 181 ls /root",
+			args:     []string{"--sudo", "181", "ls", "/root"},
+			wantHost: "181",
+			wantCmd:  "ls /root",
+			wantSudo: true,
+		},
+		{
+			name:     "181 -p 22 --sudo cat /etc/hosts",
+			args:     []string{"181", "-p", "22", "--sudo", "cat", "/etc/hosts"},
+			wantHost: "181",
+			wantCmd:  "cat /etc/hosts",
+			wantSudo: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			o := NewSshOptions()
+			cmd := NewCmdSsh()
+			cmd.RunE = func(c *cobra.Command, args []string) error {
+				return nil
+			}
+
+			processed := preprocessSubArgs(tt.args, cmd)
+			if err := cmd.Flags().Parse(processed); err != nil {
+				t.Fatalf("Parse flags failed: %v", err)
+			}
+
+			o.Complete(cmd, cmd.Flags().Args())
+			if sudoVal, err := cmd.Flags().GetBool("sudo"); err == nil {
+				o.Sudo = sudoVal
+			}
+			if err := o.Validate(); err != nil {
+				t.Fatalf("Validate options failed: %v", err)
+			}
+
+			if o.Host != tt.wantHost {
+				t.Errorf("expected Host %q, got %q", tt.wantHost, o.Host)
+			}
+			if o.Command != tt.wantCmd {
+				t.Errorf("expected Command %q, got %q", tt.wantCmd, o.Command)
+			}
+			if o.Sudo != tt.wantSudo {
+				t.Errorf("expected Sudo %v, got %v", tt.wantSudo, o.Sudo)
+			}
+		})
 	}
 }

@@ -1,8 +1,12 @@
 package cmd
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/pkg/i18n"
@@ -15,20 +19,32 @@ func newCmdDns() *cobra.Command {
 		Short: i18n.T("dns_short"),
 		Long:  i18n.T("dns_long"),
 
-		Run: func(cmd *cobra.Command, args []string) {
-			wg := sync.WaitGroup{}
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var (
+				wg      sync.WaitGroup
+				errMu   sync.Mutex
+				dnsErrs []error
+			)
 			for _, domain := range args {
-				wg.Add(1)           // Add this line to correctly use WaitGroup
-				go func(d string) { // Pass domain as argument to goroutine to avoid loop variable capture
+				wg.Add(1)
+				go func(d string) {
 					defer wg.Done()
-					if resolve, err := net.ResolveIPAddr("ip", d); err != nil {
-						logger.PrintError(i18n.Tf("dns_resolve_error", map[string]any{"Domain": d, "Error": err}))
-					} else {
-						logger.PrintInfo(i18n.Tf("dns_resolve_info", map[string]any{"Domain": d, "IP": resolve.String()}))
+					lookupCtx, cancel := context.WithTimeout(cmd.Context(), 5*time.Second)
+					defer cancel()
+					resolved, err := net.DefaultResolver.LookupIPAddr(lookupCtx, d)
+					if err != nil {
+						errMu.Lock()
+						dnsErrs = append(dnsErrs, fmt.Errorf("resolve %q failed: %w", d, err))
+						errMu.Unlock()
+						return
+					}
+					for _, address := range resolved {
+						logger.PrintInfo(i18n.Tf("dns_resolve_info", map[string]any{"Domain": d, "IP": address.String()}))
 					}
 				}(domain)
 			}
 			wg.Wait()
+			return errors.Join(dnsErrs...)
 		},
 	}
 }

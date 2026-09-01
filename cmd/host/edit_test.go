@@ -5,57 +5,19 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
-	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/models"
-	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 )
 
-// mockProvider implements config.ConfigProvider for testing
+// mockProvider supplies the alias lookup required by applyNodeUpdates.
 type mockProvider struct {
-	nodes      map[string]models.Node
-	hosts      map[string]models.Host
-	identities map[string]models.Identity
+	aliases map[string]string
 }
 
 func newMockProvider() *mockProvider {
-	return &mockProvider{
-		nodes:      make(map[string]models.Node),
-		hosts:      make(map[string]models.Host),
-		identities: make(map[string]models.Identity),
-	}
+	return &mockProvider{aliases: make(map[string]string)}
 }
 
-func (m *mockProvider) GetNode(name string) (models.Node, bool) {
-	n, ok := m.nodes[name]
-	return n, ok
-}
-func (m *mockProvider) GetHost(name string) (models.Host, bool) {
-	h, ok := m.hosts[name]
-	return h, ok
-}
-func (m *mockProvider) GetIdentity(name string) (models.Identity, bool) {
-	i, ok := m.identities[name]
-	return i, ok
-}
-func (m *mockProvider) AddHost(name string, host models.Host) { m.hosts[name] = host }
-func (m *mockProvider) AddIdentity(name string, identity models.Identity) {
-	m.identities[name] = identity
-}
-func (m *mockProvider) AddNode(name string, node models.Node)           { m.nodes[name] = node }
-func (m *mockProvider) DeleteNode(name string)                          { delete(m.nodes, name) }
-func (m *mockProvider) ListNodes() map[string]models.Node               { return m.nodes }
-func (m *mockProvider) GetNodesByTag(tag string) map[string]models.Node { return nil }
-func (m *mockProvider) ListIdentities() map[string]models.Identity      { return m.identities }
-func (m *mockProvider) DeleteIdentity(name string)                      { delete(m.identities, name) }
-func (m *mockProvider) Find(input string) string                        { return "" }
-func (m *mockProvider) FindAlias(alias string) string                   { return "" }
-func (m *mockProvider) GetConfig() *config.Configuration {
-	return &config.Configuration{
-		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
-		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
-		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
-	}
-}
+func (m *mockProvider) FindAlias(alias string) string { return m.aliases[alias] }
 
 func TestApplyNodeUpdates(t *testing.T) {
 	host := &models.Host{Address: "old_ip", Port: 22}
@@ -87,7 +49,9 @@ func TestApplyNodeUpdates(t *testing.T) {
 	flags2 := &editFlags{
 		alias: []string{"new_alias"},
 	}
-	_ = cmd.Flags().Set("alias", "new_alias")
+	if err := cmd.Flags().Set("alias", "new_alias"); err != nil {
+		t.Fatalf("set alias flag: %v", err)
+	}
 	updated, nameChanged = applyNodeUpdates(cmd, provider, oldName, host, identity, node, flags2)
 	if !updated || nameChanged {
 		t.Errorf("expected updated=true, nameChanged=false, got %v/%v", updated, nameChanged)

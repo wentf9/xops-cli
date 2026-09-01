@@ -21,7 +21,7 @@
 
 - 🤖 **AI 原生 (MCP 服务端)**: 内置 Model Context Protocol 服务端，包含完整的安全护栏、风险评估和策略控制。长驻连接池通过有界心跳自动驱逐失效 SSH 连接，让 AI 助手安全、稳定地替你管理服务器。
 - 🛡️ **SSH 增强与 TUI**: 完全兼容 OpenSSH (支持跳板机 JumpHost、隧道、Agent 转发)。内置精美的 **TUI (终端用户界面)**，并支持自动 Sudo 提权模式。
-- ⚡ **批量执行与传输**: 基于标签 (Tags) 对多台主机并行执行命令或本地脚本。内置 SCP/SFTP 支持，轻松实现文件批量分发。交互式 SFTP shell 具备连接保活 (KeepAlive) 与断线自动检测，网络中断后会唤醒交互提示、自动退出并返回非零状态。
+- ⚡ **批量执行与传输**: 基于标签 (Tags) 对多台主机并行执行命令或本地脚本。内置 SCP/SFTP 支持，轻松实现文件批量分发。交互式 SFTP shell 具备连接保活 (KeepAlive) 与断线自动检测，网络中断后会唤醒交互提示、自动退出并返回非零状态。每个 shell 实例仅运行一次；关闭会取消并等待当前交互，再释放提示和 SFTP 资源。
 - 🔄 **声明式任务编排 (Playbook)**: 支持 YAML 格式的任务编排，组合 shell、script、copy、ensure (幂等性状态收敛) 和 template 步骤，支持并发控制与失败策略。
 - 🗂️ **加密资产管理**: 本地统一管理主机、凭据 (Identity) 和标签，敏感信息(密码/私钥)采用 AES 加密存储。支持通过 CSV 模板批量导入导出。
 - 🌐 **网络与安全工具**: 集成 DNS 查询、Ping、Netcat (nc)、Base64/Hex 编码转换，以及统一的**防火墙管理器** (自动适配 firewalld, ufw, iptables, nftables)。
@@ -136,6 +136,8 @@ steps:
     sudo: true
 ```
 
+`settings.on_error: abort_all` 会在任一主机连接失败或步骤失败时取消其他正在进行的主机任务；`continue` 仅让当前主机继续执行后续步骤。
+
 执行 Playbook：
 
 ```bash
@@ -229,6 +231,20 @@ make ci
 ```
 
 CI 会在提交到 `master` 或向 `master` 提交 Pull Request 时自动执行全量构建、测试和 golangci-lint。
+
+### 错误与日志边界
+
+- `pkg` 包只创建、包装并返回错误，不直接决定面向用户的错误展示；需要调试日志的组件通过 `logger.DebugLogger` 注入，未注入时使用空实现。
+- `cmd` 层是错误展示边界：Cobra 命令统一返回错误，由根命令按日志级别输出一次并设置退出状态。
+- 交互式 SFTP shell 位于 `cmd/sftpshell`，只负责命令解析、覆盖确认、进度与错误展示；`rm/cp/mv` 等文件操作统一通过 `pkg/sftp` 的 SFTP subsystem 能力执行。远端与本地复制都会保留符号链接本身（包括相对链接和悬空链接），不会跟随链接目标。
+- 密码输入、HostKey 确认和交互式终端 I/O 由 CLI/TUI 组合根注入；`pkg/adapter` 默认拒绝交互，`pkg/ssh` 提供调用方注入终端流的接口。
+- 长时间运行的 SSH、SFTP、转发和 Playbook 操作应使用调用方传入的 `context.Context`，确保取消信号能终止 I/O 和 goroutine。
+- 配置写入在本机文件系统上使用跨进程锁和原子替换。完整节点编辑与删除使用读取时的精确版本；标签操作按意图合并。对同一节点、Host 或 Identity 的冲突会返回 `ErrConfigConflict`，不会静默覆盖。节点编辑修改凭据时会创建私有 Identity 覆盖；只有 `identity edit` 会修改共享 Identity。若替换已应用但目录同步状态不确定，命令返回非零错误且不会自动重试或回滚。
+- SSH 连接从单个原子配置快照取得节点、主机、凭据及其条件写入令牌；OpenSSH 虚拟节点和只读配置源不带写入令牌，自动发现的凭据或提权方式只在当前会话使用。Repository 的所有写入都要求调用方传入可取消的 `context.Context`；TUI 保存、标签和删除操作通过异步状态机执行，避免阻塞界面或并发提交。
+- 节点选择器精确匹配节点 ID；地址或别名匹配多个节点时命令会返回歧义错误，不会任意选取目标。
+- SSH 本地、远端和 SOCKS5 转发返回可等待的生命周期对象；单个连接（包括 SOCKS5 握手和目标拨号）失败时仅告警并释放该连接，监听服务会继续运行；监听器或 SSH transport 失败才会结束转发。OpenSSH `ProxyJump` 支持逗号分隔的多跳以及 `[user@]host[:port]`。
+- MCP 服务必须由组合根通过 `mcpserver.WithConfigProvider` 注入已加载的配置；配置和 guardrail 校验失败会在创建全局运行状态前直接返回。
+- 扩展 Expect 规则时，保持兼容的 `ssh.NewExpect(writer, rules...)`；需要注入日志等选项时使用 `ssh.NewExpectWithOptions(writer, rules, opts...)`。
 
 ## 📄 开源协议 / License
 

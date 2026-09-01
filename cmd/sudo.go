@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
 	"strings"
 
@@ -28,15 +27,20 @@ func newCmdSudo() *cobra.Command {
 			isManual := false
 			if pwd == "" {
 				// 尝试从配置文件中联动
-				pwd = utils.GetLocalSudoPassword()
-			}
-			if pwd == "" {
-				p, err := utils.ReadPasswordFromTerminal(i18n.T("prompt_sudo_password"))
-				if err != nil {
-					return err
+				p, found, getErr := utils.GetLocalSudoPassword()
+				if getErr != nil {
+					logger.DefaultLogger().Debugf("get local sudo password failed: %v", getErr)
 				}
-				pwd = p
-				isManual = true
+				if found {
+					pwd = p
+				} else {
+					p, err := utils.ReadPasswordFromTerminal(i18n.T("prompt_sudo_password"))
+					if err != nil {
+						return err
+					}
+					pwd = p
+					isManual = true
+				}
 			}
 
 			// 2. 初始化执行器
@@ -47,11 +51,11 @@ func newCmdSudo() *cobra.Command {
 			var output string
 			if sudoShell || len(args) == 0 {
 				// 如果指定了 -s 或者没有任何参数，则进入交互式 shell
-				err = exec.InteractiveWithSudo(context.Background(), args)
+				err = exec.InteractiveWithSudo(cmd.Context(), args)
 			} else {
 				// 执行单条命令
 				fullCmd := strings.Join(args, " ")
-				output, err = exec.RunWithSudo(context.Background(), fullCmd)
+				output, err = exec.RunWithSudo(cmd.Context(), fullCmd)
 				if err == nil {
 					// sudo 输出保持纯净，因为直接展示目标机回显
 					logger.Print(output)
@@ -59,13 +63,13 @@ func newCmdSudo() *cobra.Command {
 			}
 
 			if err != nil {
-				return fmt.Errorf("%s", i18n.Tf("sudo_exec_failed", map[string]any{"Error": err}))
+				return fmt.Errorf("%s: %w", i18n.T("sudo_exec_failed"), err)
 			}
 
 			// 4. 执行成功后，如果是手动输入的密码，保存到配置文件
 			if isManual && pwd != "" {
-				if saveErr := utils.SaveLocalSudoPassword(pwd); saveErr != nil {
-					logger.Debug(fmt.Sprintf("Failed to save sudo password: %v", saveErr))
+				if saveErr := utils.SaveLocalSudoPasswordContext(cmd.Context(), pwd); saveErr != nil {
+					return fmt.Errorf("save local sudo password failed: %w", saveErr)
 				}
 			}
 

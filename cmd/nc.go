@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +13,12 @@ import (
 	cmdutils "github.com/wentf9/xops-cli/cmd/utils"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"golang.org/x/term"
+)
+
+const (
+	ncDialTimeout           = 10 * time.Second
+	ncNetworkIOWriteTimeout = 10 * time.Second
+	ncNetworkIOReadTimeout  = 60 * time.Second
 )
 
 func newCmdNc() *cobra.Command {
@@ -42,7 +49,8 @@ func ncArgsValidator(cmd *cobra.Command, args []string) error {
 	if net.ParseIP(args[0]) == nil {
 		return fmt.Errorf("%s", i18n.Tf("nc_err_invalid_ip", map[string]any{"IP": args[0]}))
 	}
-	if port := cmdutils.ParsePort(args[1]); port == 0 {
+	port, portErr := cmdutils.ParsePort(args[1])
+	if portErr != nil || port == 0 {
 		return fmt.Errorf("%s", i18n.Tf("nc_err_invalid_port", map[string]any{"Port": args[1]}))
 	}
 	return nil
@@ -63,14 +71,20 @@ func ncRunE(cmd *cobra.Command, args []string) error {
 	return ncConnectMode(args, network)
 }
 
-func ncListenMode(port uint16, network string) error {
+func ncListenMode(port uint16, network string) (retErr error) {
 	listener, err := net.Listen(network, fmt.Sprintf(":%d", port))
 	if err != nil {
 		return fmt.Errorf("%s: %w", i18n.Tf("nc_err_listen", map[string]any{"Port": port}), err)
 	}
-	defer func() { _ = listener.Close() }()
+	defer func() {
+		if closeErr := listener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			retErr = errors.Join(retErr, fmt.Errorf("close listener failed: %w", closeErr))
+		}
+	}()
 
-	_, _ = fmt.Fprint(os.Stderr, i18n.Tf("nc_listening", map[string]any{"Port": port}))
+	if err := ncPrintStderr(i18n.Tf("nc_listening", map[string]any{"Port": port})); err != nil {
+		return err
+	}
 	conn, err := listener.Accept()
 	if err != nil {
 		return fmt.Errorf("%s: %w", i18n.T("nc_err_accept"), err)
@@ -82,19 +96,24 @@ func ncListenMode(port uint16, network string) error {
 	return nil
 }
 
-func ncConnectMode(args []string, network string) error {
+func ncConnectMode(args []string, network string) (retErr error) {
 	addr := net.JoinHostPort(args[0], args[1])
-	conn, err := net.DialTimeout(network, addr, time.Second*10)
+	conn, err := net.DialTimeout(network, addr, ncDialTimeout)
 	if err != nil {
 		return fmt.Errorf("%s: %w", i18n.Tf("nc_err_connect", map[string]any{"Addr": addr}), err)
 	}
-	defer func() { _ = conn.Close() }()
+	defer func() {
+		if closeErr := conn.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			retErr = errors.Join(retErr, fmt.Errorf("close connection failed: %w", closeErr))
+		}
+	}()
 
-	_, _ = fmt.Fprint(os.Stderr, i18n.Tf("nc_connected", map[string]any{"Addr": addr}))
+	if err := ncPrintStderr(i18n.Tf("nc_connected", map[string]any{"Addr": addr})); err != nil {
+		return err
+	}
 
 	if term.IsTerminal(0) {
-		_, _ = fmt.Fprint(os.Stderr, i18n.T("nc_interactive_warning"))
-		return nil
+		return ncPrintStderr(i18n.T("nc_interactive_warning"))
 	}
 
 	return ncSendFromStdin(conn)
@@ -107,12 +126,15 @@ func ncSendFromStdin(conn net.Conn) error {
 	for {
 		n, err := reader.Read(buffer)
 		if n > 0 {
+			if dlErr := conn.SetWriteDeadline(time.Now().Add(ncNetworkIOWriteTimeout)); dlErr != nil {
+				return fmt.Errorf("set write deadline failed: %w", dlErr)
+			}
 			if _, writeErr := conn.Write(buffer[:n]); writeErr != nil {
 				return fmt.Errorf("%s: %w", i18n.T("nc_err_write_conn"), writeErr)
 			}
 		}
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 			return fmt.Errorf("%s: %w", i18n.T("nc_err_read_input"), err)
@@ -121,31 +143,50 @@ func ncSendFromStdin(conn net.Conn) error {
 	return nil
 }
 
-func handleConnection(conn net.Conn) error {
-	defer func() { _ = conn.Close() }()
+func handleConnection(conn net.Conn) (retErr error) {
+	defer func() {
+		if closeErr := conn.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			retErr = errors.Join(retErr, fmt.Errorf("close connection failed: %w", closeErr))
+		}
+	}()
 
 	clientAddr := conn.RemoteAddr().String()
-	_, _ = fmt.Fprint(os.Stderr, i18n.Tf("nc_new_connection", map[string]any{"Addr": clientAddr}))
-	_, _ = fmt.Fprint(os.Stderr, i18n.Tf("nc_request_content", map[string]any{"Addr": clientAddr}))
+	if err := ncPrintStderr(i18n.Tf("nc_new_connection", map[string]any{"Addr": clientAddr})); err != nil {
+		return err
+	}
+	if err := ncPrintStderr(i18n.Tf("nc_request_content", map[string]any{"Addr": clientAddr})); err != nil {
+		return err
+	}
 
 	writer := bufio.NewWriter(os.Stdout)
 	reader := bufio.NewReader(conn)
 	buffer := make([]byte, 1024*1024*10) // 10MB 缓冲区
 
 	for {
+		if dlErr := conn.SetReadDeadline(time.Now().Add(ncNetworkIOReadTimeout)); dlErr != nil {
+			return fmt.Errorf("set read deadline failed: %w", dlErr)
+		}
 		n, err := reader.Read(buffer)
 		if n > 0 {
 			if _, writeErr := writer.Write(buffer[:n]); writeErr != nil {
 				return fmt.Errorf("%s: %w", i18n.T("nc_err_write_out"), writeErr)
 			}
-			_ = writer.Flush()
+			if flushErr := writer.Flush(); flushErr != nil {
+				return fmt.Errorf("flush stdout failed: %w", flushErr)
+			}
 		}
 		if err != nil {
-			if err == io.EOF {
-				_, _ = fmt.Fprint(os.Stderr, i18n.Tf("nc_connection_closed", map[string]any{"Addr": clientAddr}))
-				return nil
+			if errors.Is(err, io.EOF) {
+				return ncPrintStderr(i18n.Tf("nc_connection_closed", map[string]any{"Addr": clientAddr}))
 			}
 			return fmt.Errorf("%s: %w", i18n.Tf("nc_err_conn_error", map[string]any{"Addr": clientAddr}), err)
 		}
 	}
+}
+
+func ncPrintStderr(msg string) error {
+	if _, err := fmt.Fprint(os.Stderr, msg); err != nil {
+		return fmt.Errorf("write stderr failed: %w", err)
+	}
+	return nil
 }

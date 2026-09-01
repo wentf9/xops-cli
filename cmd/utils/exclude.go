@@ -39,7 +39,10 @@ func ResolveExcludes(provider config.ConfigProvider, excludes []string) (map[str
 	resolved := make(map[string]struct{}, len(excludes))
 	var unmatched []string
 	for _, ex := range excludes {
-		nodeID := provider.Find(ex)
+		nodeID, err := provider.ResolveSelector(ex)
+		if err != nil {
+			return nil, fmt.Errorf("resolve excluded node %q failed: %w", ex, err)
+		}
 		if nodeID == "" {
 			unmatched = append(unmatched, ex)
 			continue

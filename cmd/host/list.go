@@ -2,7 +2,6 @@ package host
 
 import (
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -19,11 +18,10 @@ func NewCmdInventoryList() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: i18n.T("inventory_list_short"),
-		Run: func(cmd *cobra.Command, args []string) {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			_, provider, _, err := utils.GetConfigStore()
 			if err != nil {
-				logger.PrintError(i18n.Tf("config_load_error", map[string]any{"Error": err}))
-				return
+				return fmt.Errorf("load config failed: %w", err)
 			}
 
 			var nodes map[string]models.Node
@@ -39,11 +37,13 @@ func NewCmdInventoryList() *cobra.Command {
 				} else {
 					logger.PrintWarn(i18n.T("node_no_stored"))
 				}
-				return
+				return nil
 			}
 
-			w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-			_, _ = fmt.Fprintln(w, i18n.T("node_list_header"))
+			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 3, ' ', 0)
+			if _, err := fmt.Fprintln(w, i18n.T("node_list_header")); err != nil {
+				return fmt.Errorf("write node list header failed: %w", err)
+			}
 
 			keys := make([]string, 0, len(nodes))
 			for k := range nodes {
@@ -52,11 +52,12 @@ func NewCmdInventoryList() *cobra.Command {
 			sort.Strings(keys)
 
 			for _, nodeID := range keys {
-				node := nodes[nodeID]
-				host, _ := provider.GetHost(nodeID)
-				identity, _ := provider.GetIdentity(nodeID)
+				node, host, identity, resolveErr := provider.Resolve(nodeID)
+				if resolveErr != nil {
+					return fmt.Errorf("resolve node %q for listing failed: %w", nodeID, resolveErr)
+				}
 
-				_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 					nodeID,
 					strings.Join(node.Alias, ", "),
 					fmt.Sprintf("%s:%d", host.Address, host.Port),
@@ -64,9 +65,14 @@ func NewCmdInventoryList() *cobra.Command {
 					identity.AuthType,
 					node.ProxyJump,
 					strings.Join(node.Tags, ", "),
-				)
+				); err != nil {
+					return fmt.Errorf("write node %q failed: %w", nodeID, err)
+				}
 			}
-			_ = w.Flush()
+			if err := w.Flush(); err != nil {
+				return fmt.Errorf("flush node list failed: %w", err)
+			}
+			return nil
 		},
 	}
 	cmd.Flags().StringVarP(&tagFilter, "tag", "t", "", i18n.T("flag_inv_tag_filter"))
@@ -77,11 +83,10 @@ func NewCmdInventoryTags() *cobra.Command {
 	return &cobra.Command{
 		Use:   "tags",
 		Short: i18n.T("inventory_tags_short"),
-		Run: func(cmd *cobra.Command, args []string) {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			_, provider, _, err := utils.GetConfigStore()
 			if err != nil {
-				logger.PrintError(i18n.Tf("config_load_error", map[string]any{"Error": err}))
-				return
+				return fmt.Errorf("load config failed: %w", err)
 			}
 
 			nodes := provider.ListNodes()
@@ -94,11 +99,13 @@ func NewCmdInventoryTags() *cobra.Command {
 
 			if len(tagMap) == 0 {
 				logger.PrintWarn(i18n.T("tags_no_stored"))
-				return
+				return nil
 			}
 
-			w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-			_, _ = fmt.Fprintln(w, i18n.T("tags_list_header"))
+			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 3, ' ', 0)
+			if _, err := fmt.Fprintln(w, i18n.T("tags_list_header")); err != nil {
+				return fmt.Errorf("write tag list header failed: %w", err)
+			}
 
 			tags := make([]string, 0, len(tagMap))
 			for t := range tagMap {
@@ -107,9 +114,14 @@ func NewCmdInventoryTags() *cobra.Command {
 			sort.Strings(tags)
 
 			for _, t := range tags {
-				_, _ = fmt.Fprintf(w, "%s\t%d\n", t, tagMap[t])
+				if _, err := fmt.Fprintf(w, "%s\t%d\n", t, tagMap[t]); err != nil {
+					return fmt.Errorf("write tag %q failed: %w", t, err)
+				}
 			}
-			_ = w.Flush()
+			if err := w.Flush(); err != nil {
+				return fmt.Errorf("flush tag list failed: %w", err)
+			}
+			return nil
 		},
 	}
 }

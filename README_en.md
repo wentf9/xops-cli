@@ -21,7 +21,7 @@
 
 - 🤖 **AI-Native (MCP Server)**: Built-in Model Context Protocol server with security guardrails, risk assessment, and policy controls. Bounded heartbeats automatically evict dead SSH connections from the long-lived pool, keeping AI-driven server management safe and reliable.
 - 🛡️ **Advanced SSH & TUI**: Fully OpenSSH-compatible (JumpHosts, Tunnels, Agent Forwarding). Includes a beautiful **Terminal UI (TUI)** for interactive management and an automated `sudo` mode.
-- ⚡ **Batch Execution & Transfer**: Run commands or local scripts in parallel across multiple servers using tags. Effortless file distribution with built-in SCP/SFTP. The interactive SFTP shell detects disconnects, wakes the active prompt, exits automatically, and returns a non-zero status when the network drops.
+- ⚡ **Batch Execution & Transfer**: Run commands or local scripts in parallel across multiple servers using tags. Effortless file distribution with built-in SCP/SFTP. The interactive SFTP shell detects disconnects, wakes the active prompt, exits automatically, and returns a non-zero status when the network drops. Each shell instance runs once; closing it cancels and waits for the active interaction before releasing prompt and SFTP resources.
 - 🔄 **Declarative Orchestration (Playbook)**: YAML-based task orchestration combining shell, script, copy, ensure (idempotent state convergence), and template steps, with concurrency control and error handling strategies.
 - 🗂️ **Encrypted Inventory**: Manage hosts, credentials (Identities), and tags with AES encryption. Supports bulk import/export via CSV.
 - 🌐 **Network & Sec Tools**: Integrated DNS lookup, Ping, Netcat (nc), Base64/Hex encoding, and a unified **Firewall Manager** (supports firewalld, ufw, iptables, nftables).
@@ -137,6 +137,8 @@ steps:
     sudo: true
 ```
 
+`settings.on_error: abort_all` cancels the other in-flight host tasks when any host connection or step fails; `continue` only continues subsequent steps on the current host.
+
 Run a Playbook:
 
 ```bash
@@ -230,6 +232,20 @@ make ci
 ```
 
 CI runs the full build, test suite, and golangci-lint on pushes to `master` and pull requests targeting `master`.
+
+### Error and logging boundaries
+
+- Packages under `pkg` create, wrap, and return errors without deciding how user-facing failures are displayed. Components that need debug logs receive a `logger.DebugLogger`; the default is a no-op implementation.
+- The `cmd` layer is the error presentation boundary: Cobra commands return errors, and the root command logs each failure once and sets the exit status.
+- The interactive SFTP shell lives in `cmd/sftpshell` and owns command parsing, overwrite confirmation, progress, and error presentation. File operations such as `rm`, `cp`, and `mv` run exclusively through reusable `pkg/sftp` SFTP-subsystem capabilities. Remote and local copies preserve symbolic links, including relative and dangling links, without following their targets.
+- Password prompts, HostKey confirmation, and interactive terminal streams are injected by the CLI/TUI composition root; `pkg/adapter` rejects interaction by default, and `pkg/ssh` exposes APIs for caller-provided terminal streams.
+- Long-running SSH, SFTP, forwarding, and Playbook operations use the caller-provided `context.Context` so cancellation can stop I/O and goroutines.
+- Configuration writes use a cross-process lock and atomic replacement on the local filesystem. Full node edits and deletions use the exact version that was read, while tag operations merge intent. Conflicts on the same node, Host, or Identity return `ErrConfigConflict` instead of silently overwriting data. A node edit that changes credentials creates a private Identity override; only `identity edit` changes a shared Identity. If a replacement was applied but its directory-sync durability is uncertain, the command returns a nonzero error and never retries or rolls it back automatically.
+- SSH connections receive node, host, credentials, and conditional-write tokens from one atomic configuration snapshot. OpenSSH virtual nodes and read-only configuration sources have no write token, so discovered credentials or privilege mode remain session-local. Every Repository write requires caller-provided cancellable `context.Context`; TUI save, tag, and delete operations run through an asynchronous state machine to keep rendering responsive and prevent overlapping commits.
+- A node selector matches an exact node ID first. If an address or alias matches multiple nodes, the command returns an ambiguity error instead of choosing a target arbitrarily.
+- SSH local, remote, and SOCKS5 forwarding return waitable lifecycle objects. A failure in one connection, including a SOCKS5 handshake or target dial, only logs a warning and releases that connection; the listener continues running. Only listener or SSH transport failures end forwarding. OpenSSH `ProxyJump` supports comma-separated hops and `[user@]host[:port]` entries.
+- The composition root must inject fully loaded configuration into the MCP server with `mcpserver.WithConfigProvider`; configuration and guardrail validation failures are returned before global runtime state is initialized.
+- Use the compatible `ssh.NewExpect(writer, rules...)` API for ordinary Expect rules. Use `ssh.NewExpectWithOptions(writer, rules, opts...)` when injecting a logger or other options.
 
 ## 📄 License
 

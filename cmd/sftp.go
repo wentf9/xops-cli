@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/wentf9/xops-cli/cmd/sftpshell"
 	"github.com/wentf9/xops-cli/cmd/utils"
-	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
@@ -26,7 +26,7 @@ const (
 	sftpKeepAliveTimeout  = ssh.DefaultKeepAliveTimeout
 )
 
-var errSFTPConnectionLost = errors.New("SSH connection lost")
+var errSFTPConnectionLost = errors.New("ssh connection lost")
 
 func sftpConnectionLostError(waitErr error) error {
 	if waitErr == nil {
@@ -60,7 +60,7 @@ func NewCmdSftp() *cobra.Command {
 			if err := o.Validate(); err != nil {
 				return fmt.Errorf("%s: %w", i18n.T("err_invalid_args"), err)
 			}
-			return o.Run()
+			return o.RunContext(cmd.Context())
 		},
 	}
 	cmd.Flags().IntVar(&o.maxTask, "task", 0, i18n.T("flag_sftp_task"))
@@ -84,45 +84,68 @@ func NewCmdSftp() *cobra.Command {
 }
 
 func (o *SftpOptions) Run() error {
-	configStore := config.NewDefaultStore(utils.GetConfigFilePath())
+	return o.RunContext(context.Background())
+}
+
+// RunContext starts the interactive SFTP session and propagates caller cancellation.
+//
+//nolint:gocyclo
+func (o *SftpOptions) RunContext(ctx context.Context) (err error) {
+	configPath, keyPath, pathErr := utils.GetConfigFilePath()
+	if pathErr != nil {
+		return fmt.Errorf("get config file path failed: %w", pathErr)
+	}
+	configStore := config.NewDefaultStore(configPath, keyPath)
 	cfg, err := configStore.Load()
 	if err != nil {
 		return fmt.Errorf("%s: %w", i18n.T("config_load_error"), err)
 	}
 
-	provider := config.NewProvider(cfg)
+	provider, err := config.NewRepository(cfg, configStore)
+	if err != nil {
+		return fmt.Errorf("create configuration repository: %w", err)
+	}
 
 	var nodeID string
-	updated := false
-	if nodeID = provider.Find(o.Host); nodeID != "" {
-		updated = update(nodeID, &o.SshOptions, provider)
-	} else if nodeID = provider.Find(fmt.Sprintf("%s@%s:%d", o.User, o.Host, o.Port)); nodeID != "" {
-		updated = update(nodeID, &o.SshOptions, provider)
+	nodeID, err = provider.ResolveSelector(o.Host)
+	if err != nil {
+		return fmt.Errorf("resolve SFTP host %q failed: %w", o.Host, err)
+	}
+	if nodeID != "" {
+		_, err = update(ctx, nodeID, &o.SshOptions, provider)
 	} else {
-		updated = true
-		nodeID, err = o.createNewNode(provider)
+		nodeID, err = provider.ResolveSelector(fmt.Sprintf("%s@%s:%d", o.User, o.Host, o.Port))
 		if err != nil {
-			return err
+			return fmt.Errorf("resolve SFTP address %q failed: %w", o.Host, err)
+		}
+		if nodeID != "" {
+			_, err = update(ctx, nodeID, &o.SshOptions, provider)
+		} else {
+			nodeID, err = o.createNewNode(ctx, provider)
+			if err != nil {
+				return err
+			}
 		}
 	}
-	connector := adapter.NewConnector(provider)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	idBefore, _ := provider.GetIdentity(nodeID)
-	client, err := connector.Connect(ctx, nodeID)
+	if err != nil {
+		return err
+	}
+	connector := newCLIConnector(provider, ssh.WithLogger(logger.DefaultLogger()))
+	connectCtx, cancelConnect := context.WithTimeout(ctx, 10*time.Second)
+	client, err := connector.Connect(connectCtx, nodeID)
+	cancelConnect()
 	if err != nil {
 		return fmt.Errorf("%s: %w", i18n.T("err_connect_failed"), err)
 	}
-	defer connector.CloseAll()
-	if idAfter, _ := provider.GetIdentity(nodeID); idBefore.Password != idAfter.Password || idBefore.Passphrase != idAfter.Passphrase {
-		updated = true
-	}
+	defer func() {
+		joinConnectorCloseError(&err, connector)
+	}()
 	sftpClient, err := sftp.NewClient(
+		ctx,
 		client,
 		sftp.WithConcurrentFiles(o.maxTask),
 		sftp.WithThreadsPerFile(o.maxThread),
 		sftp.WithForce(o.force),
-		sftp.WithNoOverwrite(o.noOverwrite),
 	)
 	if err != nil {
 		return fmt.Errorf("%s: %w", i18n.T("err_connect_failed"), err)
@@ -131,7 +154,7 @@ func (o *SftpOptions) Run() error {
 	// 1. KeepAlive 心跳探测网络黑洞型断连（探测失败或超时会关闭底层 SSH 连接）
 	// 2. Wait watcher 感知任何原因的连接关闭（服务端断开 / 心跳主动 Close），
 	//    连接断开后取消 runCtx、唤醒交互 Prompt 并自动退出
-	runCtx, runCancel := context.WithCancel(context.Background())
+	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
 
 	keepAliveDone := ssh.StartKeepAlive(runCtx, client.SSHClient(), sftpKeepAliveInterval, sftpKeepAliveTimeout, nil)
@@ -146,10 +169,10 @@ func (o *SftpOptions) Run() error {
 		markShellDone()
 		runCancel()
 		if closeErr := sftpClient.Close(); closeErr != nil {
-			logger.Warnf("close SFTP client failed: %v", closeErr)
+			err = errors.Join(err, fmt.Errorf("close SFTP client failed: %w", closeErr))
 		}
 		if closeErr := client.Close(); closeErr != nil {
-			logger.Warnf("close SSH client after SFTP shell failed: %v", closeErr)
+			err = errors.Join(err, fmt.Errorf("close SSH client after SFTP shell failed: %w", closeErr))
 		}
 		<-keepAliveDone
 		<-watcherDone
@@ -165,38 +188,42 @@ func (o *SftpOptions) Run() error {
 			// shell 仍在运行，说明是异常断连
 			connectionErr := sftpConnectionLostError(waitErr)
 			disconnectErr <- connectionErr
-			if _, printErr := fmt.Fprintf(os.Stderr, "%s\n", i18n.Tf("sftp_conn_lost", map[string]any{"Error": connectionErr})); printErr != nil {
-				logger.Warnf("print SFTP disconnect notice failed: %v", printErr)
-			}
 			runCancel()
 		}
 	}()
 
 	// 启动 Shell
-	// 使用 os.Stdin, os.Stdout 绑定到当前终端
-	shell, err := sftpClient.NewShell(os.Stdin, os.Stdout, os.Stderr)
+	shell, err := sftpshell.New(ctx, sftpClient, client, os.Stdin, os.Stdout, os.Stderr, sftpshell.WithLogger(logger.DefaultLogger()), sftpshell.WithNoOverwrite(o.noOverwrite))
 	if err != nil {
 		markShellDone()
 		return fmt.Errorf("%s: %w", i18n.T("sftp_shell_create_failed"), err)
 	}
+	defer func() {
+		closeCtx, cancelClose := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancelClose()
+		if closeErr := shell.Close(closeCtx); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
+	}()
 	if err := shell.Run(runCtx); err != nil {
 		markShellDone()
 		if errors.Is(err, context.Canceled) {
-			// runCtx 仅由连接 watcher 取消；错误已在取消前写入带缓冲通道。
-			return fmt.Errorf("%s: %w", i18n.T("sftp_shell_start_failed"), <-disconnectErr)
+			select {
+			case connectionErr := <-disconnectErr:
+				return fmt.Errorf("%s: %w", i18n.T("sftp_shell_start_failed"), connectionErr)
+			default:
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return fmt.Errorf("%s: %w", i18n.T("sftp_shell_start_failed"), ctxErr)
+				}
+			}
 		}
 		return fmt.Errorf("%s: %w", i18n.T("sftp_shell_start_failed"), err)
 	}
 	markShellDone()
-	if updated {
-		if err := configStore.Save(cfg); err != nil {
-			return fmt.Errorf("%s: %w", i18n.T("save_config_failed"), err)
-		}
-	}
 	return nil
 }
 
-func (o *SftpOptions) createNewNode(provider config.ConfigProvider) (string, error) {
+func (o *SftpOptions) createNewNode(ctx context.Context, provider *config.Repository) (string, error) {
 	nodeID := fmt.Sprintf("%s@%s:%d", o.User, o.Host, o.Port)
 	node := models.Node{
 		HostRef:     fmt.Sprintf("%s:%d", o.Host, o.Port),
@@ -206,7 +233,10 @@ func (o *SftpOptions) createNewNode(provider config.ConfigProvider) (string, err
 		Tags:        o.Tags,
 	}
 	if node.ProxyJump != "" {
-		jumpHost := provider.Find(node.ProxyJump)
+		jumpHost, err := provider.ResolveSelector(node.ProxyJump)
+		if err != nil {
+			return "", fmt.Errorf("resolve SFTP proxy jump %q failed: %w", node.ProxyJump, err)
+		}
 		if jumpHost == "" {
 			return "", fmt.Errorf("%s", i18n.Tf("err_proxy_not_found", map[string]any{"Proxy": node.ProxyJump}))
 		}
@@ -236,8 +266,8 @@ func (o *SftpOptions) createNewNode(provider config.ConfigProvider) (string, err
 		identity.Passphrase = o.Passphrase
 		identity.AuthType = "key"
 	}
-	provider.AddHost(node.HostRef, hostObj)
-	provider.AddIdentity(node.IdentityRef, identity)
-	provider.AddNode(nodeID, node)
+	if _, err := provider.CreateNodeContext(ctx, nodeID, node, hostObj, identity); err != nil {
+		return "", fmt.Errorf("create SFTP node %q failed: %w", nodeID, err)
+	}
 	return nodeID, nil
 }

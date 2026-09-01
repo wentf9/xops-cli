@@ -2,12 +2,15 @@ package cmd
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 
 	"github.com/spf13/cobra"
+	"github.com/wentf9/xops-cli/cmd/utils"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
 	"github.com/wentf9/xops-cli/pkg/mcpserver"
@@ -38,15 +41,21 @@ func newCmdMCPServe() *cobra.Command {
 }
 
 func runMCPServer(cmd *cobra.Command, args []string) error {
-	// MCP server 必须完全静默，避免污染 stdout json-rpc 流
-	logger.SetLogLevel("none")
+	_, provider, _, err := utils.GetConfigStore()
+	if err != nil {
+		return fmt.Errorf("load mcp configuration failed: %w", err)
+	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	err := mcpserver.Serve(ctx)
+	err = mcpserver.Serve(
+		ctx,
+		mcpserver.WithConfigProvider(provider),
+		mcpserver.WithLogger(logger.DefaultLogger()),
+	)
 	if err != nil {
-		if strings.Contains(err.Error(), "EOF") || strings.Contains(err.Error(), "closing") {
+		if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) || errors.Is(err, context.Canceled) {
 			return nil
 		}
 		return err

@@ -42,7 +42,9 @@ func TestRunInventoryLoad_TemplateExport(t *testing.T) {
 	tempFilePath := filepath.Join(tempDir, "template.csv")
 
 	// 1. 测试中文环境下的导出表头
-	i18n.SetLang("zh")
+	if err := i18n.Init("zh"); err != nil {
+		t.Fatalf("init i18n zh failed: %v", err)
+	}
 	TemplateFile = tempFilePath // 设置全局变量
 	err := RunInventoryLoad(nil, nil)
 	if err != nil {

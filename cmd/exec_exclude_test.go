@@ -9,7 +9,9 @@ import (
 // TestExecExcludeFlagRegistered verifies the --exclude flag is properly registered
 // on the exec command and parses comma-separated / repeated values correctly.
 func TestExecExcludeFlagRegistered(t *testing.T) {
-	i18n.Init("zh")
+	if err := i18n.Init("zh"); err != nil {
+		t.Fatalf("i18n.Init failed: %v", err)
+	}
 	c := NewCmdExec()
 
 	flag := c.Flags().Lookup("exclude")

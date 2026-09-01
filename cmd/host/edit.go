@@ -26,39 +26,39 @@ func NewCmdInventoryEdit() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			query := args[0]
-			store, provider, cfg, err := utils.GetConfigStore()
+			_, repository, _, err := utils.GetConfigStore()
 			if err != nil {
 				return err
 			}
 
-			oldName := provider.Find(query)
+			view := repository.View()
+			oldName, resolveErr := repository.ResolveSelector(query)
+			if resolveErr != nil {
+				return fmt.Errorf("resolve node %q for editing failed: %w", query, resolveErr)
+			}
 			if oldName == "" {
 				return fmt.Errorf("节点 %s 不存在", query)
 			}
 
-			node, _ := provider.GetNode(oldName)
+			node, host, identity, resolveErr := repository.Resolve(oldName)
+			if resolveErr != nil {
+				return fmt.Errorf("resolve node %q for editing failed: %w", oldName, resolveErr)
+			}
 
-			host, _ := provider.GetHost(oldName)
-			identity, _ := provider.GetIdentity(oldName)
-
-			updated, nameChanged := applyNodeUpdates(cmd, provider, oldName, &host, &identity, &node, flags)
+			updated, nameChanged := applyNodeUpdates(cmd, repository, oldName, &host, &identity, &node, flags)
 
 			if updated {
 				newName := oldName
 				if nameChanged {
 					newName = fmt.Sprintf("%s@%s:%d", identity.User, host.Address, host.Port)
 					if newName != oldName {
-						if _, exists := provider.GetNode(newName); exists {
+						if _, exists := repository.GetNode(newName); exists {
 							return fmt.Errorf("修改后的节点名称 %s 已存在", newName)
 						}
-						provider.DeleteNode(oldName)
 					}
 				}
-				provider.AddHost(node.HostRef, host)
-				provider.AddIdentity(node.IdentityRef, identity)
-				provider.AddNode(newName, node)
-				if err := store.Save(cfg); err != nil {
-					return err
+				if err := repository.ReplaceNodeAtRefContext(cmd.Context(), view.NodeRefs[oldName], newName, node, host, identity); err != nil {
+					return fmt.Errorf("update node %q failed: %w", oldName, err)
 				}
 				logger.PrintSuccess(i18n.Tf("node_update_success", map[string]any{"Name": newName}))
 			} else {
@@ -79,7 +79,11 @@ func NewCmdInventoryEdit() *cobra.Command {
 	return cmd
 }
 
-func applyNodeUpdates(cmd *cobra.Command, provider config.ConfigProvider, oldName string, host *models.Host, identity *models.Identity, node *models.Node, flags *editFlags) (updated, nameChanged bool) {
+type aliasResolver interface {
+	FindAlias(string) string
+}
+
+func applyNodeUpdates(cmd *cobra.Command, provider aliasResolver, oldName string, host *models.Host, identity *models.Identity, node *models.Node, flags *editFlags) (updated, nameChanged bool) {
 	if flags.address != "" {
 		host.Address, updated, nameChanged = flags.address, true, true
 	}
@@ -120,18 +124,21 @@ func NewCmdInventoryDelete() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			query := args[0]
-			store, provider, cfg, err := utils.GetConfigStore()
+			_, repository, _, err := utils.GetConfigStore()
 			if err != nil {
 				return err
 			}
 
-			name := provider.Find(query)
+			view := repository.View()
+			name, resolveErr := repository.ResolveSelector(query)
+			if resolveErr != nil {
+				return fmt.Errorf("resolve node %q for deletion failed: %w", query, resolveErr)
+			}
 			if name == "" {
 				return fmt.Errorf("节点 %s 不存在", query)
 			}
-			provider.DeleteNode(name)
-			if err := store.Save(cfg); err != nil {
-				return err
+			if err := repository.DeleteNodesAtRefsContext(cmd.Context(), []config.NodeRef{view.NodeRefs[name]}); err != nil {
+				return fmt.Errorf("delete node %q failed: %w", name, err)
 			}
 			logger.PrintSuccess(i18n.Tf("node_delete_success", map[string]any{"Name": name}))
 			return nil

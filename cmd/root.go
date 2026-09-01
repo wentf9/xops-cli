@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
 	"strings"
 
@@ -12,7 +13,7 @@ import (
 	"github.com/wentf9/xops-cli/pkg/logger"
 )
 
-func Execute() {
+func Execute() error {
 	rootCmd := newRootCmd()
 
 	// 初始化 root 命令的 flags
@@ -31,36 +32,52 @@ func Execute() {
 		}
 	}
 
-	if err := rootCmd.Execute(); err != nil {
-		os.Exit(1)
-	}
+	return rootCmd.Execute()
 }
 
 func newRootCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "xops [command] [flags]",
-		Short: i18n.T("root_short"),
-		Long:  i18n.T("root_long"),
-		Run: func(cmd *cobra.Command, args []string) {
-			versionFlag, _ := cmd.Flags().GetBool("version")
+		Use:           "xops [command] [flags]",
+		Short:         i18n.T("root_short"),
+		Long:          i18n.T("root_long"),
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			versionFlag, err := cmd.Flags().GetBool("version")
+			if err != nil {
+				return fmt.Errorf("read version flag failed: %w", err)
+			}
 			if versionFlag {
 				version.PrintFullVersion()
-				os.Exit(0)
+				return nil
 			}
-			_ = cmd.Help()
-			os.Exit(0)
+			return cmd.Help()
 		},
-		PersistentPreRun: func(cmd *cobra.Command, args []string) {
-			if lang, _ := cmd.Flags().GetString("lang"); lang != "" {
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			lang, err := cmd.Flags().GetString("lang")
+			if err != nil {
+				return fmt.Errorf("read language flag failed: %w", err)
+			}
+			if lang != "" {
 				i18n.SetLang(lang)
 			}
 
-			if colorMode, _ := cmd.Flags().GetString("color"); colorMode != "" {
+			colorMode, err := cmd.Flags().GetString("color")
+			if err != nil {
+				return fmt.Errorf("read color flag failed: %w", err)
+			}
+			if colorMode != "" {
 				logger.SetColorMode(colorMode)
 			}
 
-			logLevel, _ := cmd.Flags().GetString("log-level")
-			debugFlag, _ := cmd.Flags().GetBool("debug")
+			logLevel, err := cmd.Flags().GetString("log-level")
+			if err != nil {
+				return fmt.Errorf("read log level flag failed: %w", err)
+			}
+			debugFlag, err := cmd.Flags().GetBool("debug")
+			if err != nil {
+				return fmt.Errorf("read debug flag failed: %w", err)
+			}
 
 			if debugFlag {
 				logLevel = "debug"
@@ -70,6 +87,7 @@ func newRootCmd() *cobra.Command {
 			if logLevel == "debug" {
 				logger.Debug(i18n.T("debug_mode_enabled"))
 			}
+			return nil
 		},
 	}
 }

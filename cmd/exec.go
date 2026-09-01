@@ -2,16 +2,17 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
-	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
@@ -37,9 +38,11 @@ type ExecOptions struct {
 	stdinScript bool
 
 	tempNodesMu    sync.Mutex
-	tempNodes      map[string]bool
+	tempNodes      map[string]config.NodeRef
 	savedTempNodes int
 	nodeUpdated    bool
+	stdout         io.Writer
+	stderr         io.Writer
 }
 
 func NewExecOptions() *ExecOptions {
@@ -57,11 +60,15 @@ func NewCmdExec() *cobra.Command {
 		Short: i18n.T("exec_short"),
 		Long:  i18n.T("exec_long"),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			o.Complete(cmd, args)
+			o.stdout = cmd.OutOrStdout()
+			o.stderr = cmd.ErrOrStderr()
+			if err := o.Complete(cmd, args); err != nil {
+				return err
+			}
 			if err := o.Validate(); err != nil {
 				return err
 			}
-			return o.Run()
+			return o.RunContext(cmd.Context())
 		},
 	}
 
@@ -99,18 +106,27 @@ func NewCmdExec() *cobra.Command {
 	return cmd
 }
 
-func (o *ExecOptions) extractCommandFromArgs(args []string) {
+func (o *ExecOptions) extractCommandFromArgs(args []string) error {
 	hostPart := args[0]
 	cmdIdx := 1
 	if o.Tag != "" {
 		o.Command = strings.Join(args, " ")
-		return
+		return nil
 	}
 	if len(args) > 1 && strings.HasPrefix(args[1], "@") {
 		hostPart = args[0] + args[1]
 		cmdIdx = 2
 	}
-	u, h, p := utils.ParseAddr(hostPart)
+	u, h, p, err := utils.ParseAddr(hostPart)
+	if err != nil {
+		if strings.Contains(hostPart, "@") || strings.Contains(hostPart, ":") {
+			return fmt.Errorf("invalid host address %q: %w", hostPart, err)
+		}
+		if o.Command == "" {
+			o.Command = strings.Join(args, " ")
+		}
+		return nil
+	}
 	if h != "" && (strings.Contains(hostPart, "@") || !strings.Contains(hostPart, " ")) {
 		if o.Host == "" {
 			o.Host = h
@@ -129,15 +145,19 @@ func (o *ExecOptions) extractCommandFromArgs(args []string) {
 			o.Command = strings.Join(args, " ")
 		}
 	}
+	return nil
 }
 
-func (o *ExecOptions) extractHostFromArgs(args []string) {
+func (o *ExecOptions) extractHostFromArgs(args []string) error {
 	if o.Host == "" && o.Tag == "" && len(args) > 0 {
 		hostPart := args[0]
 		if len(args) > 1 && strings.HasPrefix(args[1], "@") {
 			hostPart = args[0] + args[1]
 		}
-		u, h, p := utils.ParseAddr(hostPart)
+		u, h, p, err := utils.ParseAddr(hostPart)
+		if err != nil {
+			return fmt.Errorf("invalid host address %q: %w", hostPart, err)
+		}
 		if h != "" {
 			o.Host = h
 			if o.User == "" {
@@ -148,20 +168,26 @@ func (o *ExecOptions) extractHostFromArgs(args []string) {
 			}
 		}
 	}
+	return nil
 }
 
-func (o *ExecOptions) Complete(cmd *cobra.Command, args []string) {
+func (o *ExecOptions) Complete(cmd *cobra.Command, args []string) error {
 	o.args = args
 	if len(args) == 0 {
 		o.readStdinIfRequired()
-		return
+		return nil
 	}
+	var err error
 	if o.Command == "" && o.ShellFile == "" {
-		o.extractCommandFromArgs(args)
+		err = o.extractCommandFromArgs(args)
 	} else {
-		o.extractHostFromArgs(args)
+		err = o.extractHostFromArgs(args)
+	}
+	if err != nil {
+		return err
 	}
 	o.readStdinIfRequired()
+	return nil
 }
 
 func (o *ExecOptions) readStdinIfRequired() {
@@ -204,18 +230,37 @@ type execHostTask struct {
 }
 
 func (o *ExecOptions) Run() error {
-	configPath, keyPath := utils.GetConfigFilePath()
+	return o.RunContext(context.Background())
+}
+
+// RunContext executes the command on all selected hosts and propagates caller cancellation.
+//
+//nolint:gocyclo
+func (o *ExecOptions) RunContext(ctx context.Context) (retErr error) {
+	configPath, keyPath, pathErr := utils.GetConfigFilePath()
+	if pathErr != nil {
+		return fmt.Errorf("get config file path failed: %w", pathErr)
+	}
 	configStore := config.NewDefaultStore(configPath, keyPath)
 	cfg, err := configStore.Load()
 	if err != nil {
 		return fmt.Errorf("%s: %w", i18n.T("config_load_error"), err)
 	}
-	provider := config.NewProvider(cfg)
+	provider, err := config.NewRepository(cfg, configStore)
+	if err != nil {
+		return fmt.Errorf("create configuration repository: %w", err)
+	}
 	defer func() {
-		o.cleanUnusedTempNodes(provider)
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancelCleanup()
+		if cleanupErr := o.cleanUnusedTempNodesContext(cleanupCtx, provider); cleanupErr != nil {
+			retErr = errors.Join(retErr, cleanupErr)
+		}
 	}()
-	connector := adapter.NewConnector(provider)
-	defer connector.CloseAll()
+	connector := newCLIConnector(provider, ssh.WithLogger(logger.DefaultLogger()))
+	defer func() {
+		joinConnectorCloseError(&retErr, connector)
+	}()
 
 	// 准备执行内容
 	var execCmd string
@@ -234,15 +279,16 @@ func (o *ExecOptions) Run() error {
 		}
 	}
 
-	ctx := context.Background()
-
-	var tasks []execHostTask
-	var errTask error
+	var (
+		tasks    []execHostTask
+		hostErrs []error
+		errTask  error
+	)
 
 	if o.Tag != "" {
 		tasks, errTask = o.buildTasksFromTags(provider)
 	} else {
-		tasks, errTask = o.buildTasksFromHosts(provider)
+		tasks, hostErrs, errTask = o.buildTasksFromHosts(ctx, provider)
 	}
 
 	if errTask != nil {
@@ -264,9 +310,16 @@ func (o *ExecOptions) Run() error {
 		tasks = filtered
 	}
 
+	if len(tasks) == 0 {
+		if len(hostErrs) > 0 {
+			return errors.Join(hostErrs...)
+		}
+		return fmt.Errorf("%s", i18n.T("err_no_nodes_found"))
+	}
+
 	// 交互模式：单主机 PTY 执行
 	if o.Interactive {
-		return o.runInteractive(ctx, connector, tasks[0], execCmd, configStore, cfg)
+		return o.runInteractive(ctx, connector, tasks[0], execCmd)
 	}
 
 	// 落盘模式：在 Worker Pool 启动前一次性创建目录
@@ -278,23 +331,26 @@ func (o *ExecOptions) Run() error {
 
 	// 流式模式下多个 goroutine 共享 os.Stdout，需要用 lockedWriter 保证写入原子性
 	var stdoutMu sync.Mutex
+	var errMu sync.Mutex
+	var taskErrs []error
 
 	// 批量模式：原有逻辑
 	wp := pkgutils.NewWorkerPool(uint(o.TaskCount))
 	for _, task := range tasks {
 		t := task // capture range variable
 		wp.Execute(func() {
-			o.executeTask(ctx, connector, t, execCmd, isScript, len(tasks), &stdoutMu)
+			if taskErr := o.executeTask(ctx, connector, t, execCmd, isScript, len(tasks), &stdoutMu); taskErr != nil {
+				errMu.Lock()
+				taskErrs = append(taskErrs, taskErr)
+				errMu.Unlock()
+			}
 		})
 	}
 
 	wp.Wait()
-	if o.hasChanges() {
-		if err := configStore.Save(cfg); err != nil {
-			logger.PrintError(i18n.Tf("save_config_failed", map[string]any{"Error": err}))
-		}
-	}
-	return nil
+
+	allErrs := append(taskErrs, hostErrs...)
+	return errors.Join(allErrs...)
 }
 
 func (o *ExecOptions) runInteractive(
@@ -302,17 +358,19 @@ func (o *ExecOptions) runInteractive(
 	connector *ssh.Connector,
 	task execHostTask,
 	cmd string,
-	configStore config.Store,
-	cfg *config.Configuration,
-) error {
+) (retErr error) {
 	client, err := connector.Connect(ctx, task.nodeID)
 	if err == nil {
 		o.verifyTempNode(task.nodeID)
 	}
 	if err != nil {
-		return fmt.Errorf("%s: %w", i18n.Tf("exec_connect_failed", map[string]any{"Host": task.host, "Error": err}), err)
+		return fmt.Errorf("[%s] %s: %w", task.host, i18n.T("fw_connect_failed"), err)
 	}
-	defer func() { _ = client.Close() }()
+	defer func() {
+		if closeErr := client.Close(); closeErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("[%s] close ssh client failed: %w", task.host, closeErr))
+		}
+	}()
 
 	var execErr error
 	if o.Sudo {
@@ -321,33 +379,41 @@ func (o *ExecOptions) runInteractive(
 		execErr = client.RunInteractive(ctx, cmd)
 	}
 
-	if o.hasChanges() {
-		if saveErr := configStore.Save(cfg); saveErr != nil {
-			logger.PrintError(i18n.Tf("save_config_failed", map[string]any{"Error": saveErr}))
-		}
-	}
 	return execErr
 }
 
-func (o *ExecOptions) getOrCreateNode(provider config.ConfigProvider, addr utils.HostInfo) (string, bool, error) {
+func (o *ExecOptions) getOrCreateNode(ctx context.Context, repository *config.Repository, addr utils.HostInfo) (string, bool, error) {
 	host := strings.TrimSpace(addr.Host)
 	user := strings.TrimSpace(addr.User)
 	port := addr.Port
 
 	if user == "" {
-		user = utils.GetCurrentUser()
+		var userErr error
+		user, userErr = utils.GetCurrentUser()
+		if userErr != nil {
+			return "", false, fmt.Errorf("get current user failed: %w", userErr)
+		}
 	}
 	if port == 0 {
 		port = 22
 	}
 
-	nodeID := provider.Find(fmt.Sprintf("%s@%s:%d", user, host, port))
+	nodeID, err := repository.ResolveSelector(fmt.Sprintf("%s@%s:%d", user, host, port))
+	if err != nil {
+		return "", false, fmt.Errorf("resolve execution address %q failed: %w", host, err)
+	}
 	if nodeID == "" {
-		nodeID = provider.Find(host)
+		nodeID, err = repository.ResolveSelector(host)
+		if err != nil {
+			return "", false, fmt.Errorf("resolve execution host %q failed: %w", host, err)
+		}
 	}
 
 	if nodeID != "" {
-		updated := o.updateNodeFromHostInfo(nodeID, provider, addr)
+		updated, updateErr := o.updateNodeFromHostInfo(ctx, nodeID, repository, addr)
+		if updateErr != nil {
+			return "", false, updateErr
+		}
 		if updated {
 			o.nodeUpdated = true
 		}
@@ -357,33 +423,27 @@ func (o *ExecOptions) getOrCreateNode(provider config.ConfigProvider, addr utils
 	addr.Host = host
 	addr.User = user
 	addr.Port = port
-	nodeID, err := o.execCreateNewNode(provider, addr)
-	if err == nil {
-		o.addTempNode(nodeID)
+	nodeID, mutation, err := o.execCreateNewNode(ctx, repository, addr)
+	if shouldTrackTemporaryNode(mutation, err) {
+		o.addTempNode(mutation.Ref)
 	}
 	return nodeID, true, err
 }
 
-func (o *ExecOptions) executeTask(ctx context.Context, connector *ssh.Connector, t execHostTask, execCmd string, isScript bool, totalTasks int, stdoutMu *sync.Mutex) {
+// shouldTrackTemporaryNode admits only a successfully durable creation to the
+// cleanup set. An applied-but-undurable mutation is already authoritative in
+// the repository and must never be rolled back automatically.
+func shouldTrackTemporaryNode(mutation config.NodeMutation, createErr error) bool {
+	return createErr == nil && mutation.Outcome.Applied && mutation.Outcome.Durable && mutation.Ref.ID != ""
+}
+
+func (o *ExecOptions) executeTask(ctx context.Context, connector *ssh.Connector, t execHostTask, execCmd string, isScript bool, totalTasks int, stdoutMu *sync.Mutex) (retErr error) {
 	client, err := connector.Connect(ctx, t.nodeID)
 	if err == nil {
 		o.verifyTempNode(t.nodeID)
 	}
 	if err != nil {
-		if logger.ColorEnabled() {
-			hostPart := logger.Cyan(fmt.Sprintf("[%s] ", t.host))
-			errLabel := i18n.Tf("exec_connect_failed_label", map[string]any{"Error": err})
-			if errLabel == "exec_connect_failed_label" {
-				errLabel = fmt.Sprintf("Connection failed: %v", err)
-			}
-			errPart := logger.Red(errLabel)
-			stdoutMu.Lock()
-			fmt.Fprintln(os.Stderr, hostPart+errPart)
-			stdoutMu.Unlock()
-		} else {
-			logger.PrintError(i18n.Tf("exec_connect_failed", map[string]any{"Host": t.host, "Error": err}))
-		}
-		return
+		return fmt.Errorf("[%s] connect failed: %w", t.host, err)
 	}
 
 	var output string
@@ -396,11 +456,14 @@ func (o *ExecOptions) executeTask(ctx context.Context, connector *ssh.Connector,
 		// 清洗主机名，防止路径穿越
 		safeHost := sanitizeHostForFilename(t.host)
 		logFile := filepath.Join(o.OutDir, safeHost+".log")
-		f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err == nil {
-			defer func() { _ = f.Close() }()
-			runOpts = append(runOpts, ssh.WithOutFile(f))
+		f, openErr := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if openErr != nil {
+			return fmt.Errorf("[%s] open log file %s failed: %w", t.host, logFile, openErr)
 		}
+		defer func() {
+			joinExecLogCloseError(&retErr, f, t.host, logFile)
+		}()
+		runOpts = append(runOpts, ssh.WithOutFile(f))
 	} else if o.Stream || totalTasks == 1 {
 		prefix := ""
 		if totalTasks > 1 {
@@ -411,7 +474,7 @@ func (o *ExecOptions) executeTask(ctx context.Context, connector *ssh.Connector,
 			}
 		}
 		// 使用 lockedWriter 包装 os.Stdout，防止多 goroutine 写入交错
-		runOpts = append(runOpts, ssh.WithStream(ssh.NewLockedWriter(stdoutMu, os.Stdout), prefix))
+		runOpts = append(runOpts, ssh.WithStream(ssh.NewLockedWriter(stdoutMu, o.stdoutWriter()), prefix))
 	} else {
 		runOpts = append(runOpts, ssh.WithRingBuffer(5*1024*1024))
 	}
@@ -430,71 +493,79 @@ func (o *ExecOptions) executeTask(ctx context.Context, connector *ssh.Connector,
 		}
 	}
 
-	o.printTaskResult(t, output, execErr, stdoutMu)
+	printErr := o.printTaskResult(t, output, execErr, stdoutMu)
+	if execErr != nil {
+		return errors.Join(fmt.Errorf("[%s] %w", t.host, execErr), printErr)
+	}
+	return printErr
 }
 
-func (o *ExecOptions) printTaskResult(t execHostTask, output string, execErr error, stdoutMu *sync.Mutex) {
-	if execErr != nil {
-		if output != "" {
-			if logger.ColorEnabled() {
-				header := logger.Cyan(fmt.Sprintf("%s\n------------", t.host))
-				errLabel := i18n.Tf("exec_error_label", map[string]any{"Error": execErr})
-				if errLabel == "exec_error_label" {
-					errLabel = fmt.Sprintf("Error: %v", execErr)
-				}
-				errPart := logger.Red(errLabel)
-				stdoutMu.Lock()
-				fmt.Fprintf(os.Stderr, "%s\n%s\n%s\n", header, output, errPart)
-				stdoutMu.Unlock()
-			} else {
-				logger.PrintError(i18n.Tf("exec_result_error", map[string]any{"Host": t.host, "Output": output, "Error": execErr}))
-			}
-		} else {
-			if logger.ColorEnabled() {
-				hostPart := logger.Cyan(fmt.Sprintf("[%s] ", t.host))
-				errPart := logger.Red(fmt.Sprintf("Executed with error: %v", execErr))
-				stdoutMu.Lock()
-				fmt.Fprintln(os.Stderr, hostPart+errPart)
-				stdoutMu.Unlock()
-			} else {
-				logger.PrintError(fmt.Sprintf("[%s] Executed with error: %v", t.host, execErr))
-			}
-		}
-	} else {
-		if output != "" {
-			if logger.ColorEnabled() {
-				header := logger.Cyan(fmt.Sprintf("%s\n------------", t.host))
-				stdoutMu.Lock()
-				fmt.Printf("%s\n%s\n", header, output)
-				stdoutMu.Unlock()
-			} else {
-				logger.PrintSuccess(i18n.Tf("exec_result_success", map[string]any{"Host": t.host, "Output": output}))
-			}
-		} else {
-			if o.OutDir != "" {
-				safeHost := sanitizeHostForFilename(t.host)
-				if logger.ColorEnabled() {
-					hostPart := logger.Cyan(fmt.Sprintf("[%s] ", t.host))
-					successPart := logger.Green(fmt.Sprintf("Executed successfully (output saved to %s)", filepath.Join(o.OutDir, safeHost+".log")))
-					stdoutMu.Lock()
-					fmt.Println(hostPart + successPart)
-					stdoutMu.Unlock()
-				} else {
-					logger.PrintSuccess(fmt.Sprintf("[%s] Executed successfully (output saved to %s)", t.host, filepath.Join(o.OutDir, safeHost+".log")))
-				}
-			} else {
-				if logger.ColorEnabled() {
-					hostPart := logger.Cyan(fmt.Sprintf("[%s] ", t.host))
-					successPart := logger.Green("Executed successfully")
-					stdoutMu.Lock()
-					fmt.Println(hostPart + successPart)
-					stdoutMu.Unlock()
-				} else {
-					logger.PrintSuccess(fmt.Sprintf("[%s] Executed successfully", t.host))
-				}
-			}
-		}
+func joinExecLogCloseError(retErr *error, closer io.Closer, host, logFile string) {
+	if closeErr := closer.Close(); closeErr != nil {
+		*retErr = errors.Join(*retErr, fmt.Errorf("[%s] close log file %s failed: %w", host, logFile, closeErr))
 	}
+}
+
+func (o *ExecOptions) stdoutWriter() io.Writer {
+	if o.stdout != nil {
+		return o.stdout
+	}
+	return os.Stdout
+}
+
+func (o *ExecOptions) stderrWriter() io.Writer {
+	if o.stderr != nil {
+		return o.stderr
+	}
+	return os.Stderr
+}
+
+func writeExecResult(mu *sync.Mutex, writer io.Writer, format string, args ...any) error {
+	mu.Lock()
+	defer mu.Unlock()
+	if _, err := fmt.Fprintf(writer, format, args...); err != nil {
+		return fmt.Errorf("write command result failed: %w", err)
+	}
+	return nil
+}
+
+func (o *ExecOptions) printTaskResult(t execHostTask, output string, execErr error, stdoutMu *sync.Mutex) error {
+	if execErr != nil {
+		// 仅在有部分输出时将标准输出打印出来（错误本身交给根命令统一汇报）
+		if output != "" {
+			if logger.ColorEnabled() {
+				header := logger.Cyan(fmt.Sprintf("%s\n------------", t.host))
+				return writeExecResult(stdoutMu, o.stderrWriter(), "%s\n%s\n", header, output)
+			} else {
+				return writeExecResult(stdoutMu, o.stderrWriter(), "[%s]\n%s\n", t.host, output)
+			}
+		}
+		return nil
+	}
+	if output != "" {
+		if logger.ColorEnabled() {
+			header := logger.Cyan(fmt.Sprintf("%s\n------------", t.host))
+			return writeExecResult(stdoutMu, o.stdoutWriter(), "%s\n%s\n", header, output)
+		}
+		return writeExecResult(stdoutMu, o.stdoutWriter(), "%s\n", i18n.Tf("exec_result_success", map[string]any{"Host": t.host, "Output": output}))
+	}
+	if o.OutDir != "" {
+		safeHost := sanitizeHostForFilename(t.host)
+		message := fmt.Sprintf("[%s] Executed successfully (output saved to %s)", t.host, filepath.Join(o.OutDir, safeHost+".log"))
+		if logger.ColorEnabled() {
+			hostPart := logger.Cyan(fmt.Sprintf("[%s] ", t.host))
+			successPart := logger.Green(fmt.Sprintf("Executed successfully (output saved to %s)", filepath.Join(o.OutDir, safeHost+".log")))
+			message = hostPart + successPart
+		}
+		return writeExecResult(stdoutMu, o.stdoutWriter(), "%s\n", message)
+	}
+	message := fmt.Sprintf("[%s] Executed successfully", t.host)
+	if logger.ColorEnabled() {
+		hostPart := logger.Cyan(fmt.Sprintf("[%s] ", t.host))
+		successPart := logger.Green("Executed successfully")
+		message = hostPart + successPart
+	}
+	return writeExecResult(stdoutMu, o.stdoutWriter(), "%s\n", message)
 }
 
 // sanitizeHostForFilename 清洗主机名，防止路径穿越攻击。
@@ -517,8 +588,10 @@ func (o *ExecOptions) buildTasksFromTags(provider config.ConfigProvider) ([]exec
 		return nil, fmt.Errorf("%s", i18n.Tf("err_tag_empty", map[string]any{"Tag": o.Tag}))
 	}
 	for nodeID := range nodes {
-		hostObj, _ := provider.GetHost(nodeID)
-		identity, _ := provider.GetIdentity(nodeID)
+		_, hostObj, identity, resolveErr := provider.Resolve(nodeID)
+		if resolveErr != nil {
+			return nil, fmt.Errorf("resolve tagged node %q failed: %w", nodeID, resolveErr)
+		}
 		tasks = append(tasks, execHostTask{
 			nodeID: nodeID,
 			host:   hostObj.Address,
@@ -530,11 +603,12 @@ func (o *ExecOptions) buildTasksFromTags(provider config.ConfigProvider) ([]exec
 	return tasks, nil
 }
 
-func (o *ExecOptions) buildTasksFromHosts(provider config.ConfigProvider) ([]execHostTask, error) {
+func (o *ExecOptions) buildTasksFromHosts(ctx context.Context, repository *config.Repository) ([]execHostTask, []error, error) {
 	var tasks []execHostTask
+	var hostErrs []error
 	hosts, err := utils.ParseHosts(o.Host, o.HostFile, "")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	for _, h := range hosts {
 		if h.User == "" {
@@ -546,6 +620,9 @@ func (o *ExecOptions) buildTasksFromHosts(provider config.ConfigProvider) ([]exe
 		if h.Port == 0 {
 			h.Port = o.Port
 		}
+		if h.Alias == "" {
+			h.Alias = o.Alias
+		}
 		addr := utils.HostInfo{
 			Host:       h.Host,
 			Port:       h.Port,
@@ -555,9 +632,9 @@ func (o *ExecOptions) buildTasksFromHosts(provider config.ConfigProvider) ([]exe
 			KeyPath:    h.KeyPath,
 			Passphrase: h.Passphrase,
 		}
-		nodeID, _, err := o.getOrCreateNode(provider, addr)
+		nodeID, _, err := o.getOrCreateNode(ctx, repository, addr)
 		if err != nil {
-			logger.PrintError(i18n.Tf("exec_host_error", map[string]any{"Host": h.Host, "Error": err}))
+			hostErrs = append(hostErrs, fmt.Errorf("[%s] %w", h.Host, err))
 			continue
 		}
 		tasks = append(tasks, execHostTask{
@@ -568,10 +645,10 @@ func (o *ExecOptions) buildTasksFromHosts(provider config.ConfigProvider) ([]exe
 			pass:   h.Password,
 		})
 	}
-	return tasks, nil
+	return tasks, hostErrs, nil
 }
 
-func (o *ExecOptions) execCreateNewNode(provider config.ConfigProvider, addr utils.HostInfo) (string, error) {
+func (o *ExecOptions) execCreateNewNode(ctx context.Context, repository *config.Repository, addr utils.HostInfo) (string, config.NodeMutation, error) {
 	host := addr.Host
 	user := addr.User
 	port := addr.Port
@@ -590,25 +667,29 @@ func (o *ExecOptions) execCreateNewNode(provider config.ConfigProvider, addr uti
 		SuPwd:       o.SuPwd,
 	}
 
-	if err := o.setNodeAlias(provider, &node, addr.Alias); err != nil {
-		return "", err
+	if err := o.setNodeAlias(repository, &node, addr.Alias); err != nil {
+		return "", config.NodeMutation{}, err
 	}
 
 	if node.ProxyJump != "" {
-		jumpHost := provider.Find(node.ProxyJump)
+		jumpHost, err := repository.ResolveSelector(node.ProxyJump)
+		if err != nil {
+			return "", config.NodeMutation{}, fmt.Errorf("resolve execution proxy jump %q failed: %w", node.ProxyJump, err)
+		}
 		if jumpHost == "" {
-			return "", fmt.Errorf("%s", i18n.Tf("err_proxy_not_found", map[string]any{"Proxy": node.ProxyJump}))
+			return "", config.NodeMutation{}, fmt.Errorf("%s", i18n.Tf("err_proxy_not_found", map[string]any{"Proxy": node.ProxyJump}))
 		}
 		node.ProxyJump = jumpHost
 	}
 
 	identity := o.buildIdentity(addr)
 
-	provider.AddHost(node.HostRef, models.Host{Address: host, Port: port})
-	provider.AddIdentity(node.IdentityRef, identity)
-	provider.AddNode(nodeID, node)
+	mutation, err := repository.CreateNodeContext(ctx, nodeID, node, models.Host{Address: host, Port: port}, identity)
+	if err != nil {
+		return "", mutation, fmt.Errorf("create exec node %q failed: %w", nodeID, err)
+	}
 
-	return nodeID, nil
+	return nodeID, mutation, nil
 }
 
 // setNodeAlias sets the node alias with duplicate check
@@ -671,21 +752,29 @@ func appendExecAlias(slice []string, val string) ([]string, bool) {
 	return append(slice, val), true
 }
 
-func (o *ExecOptions) updateNodeFromHostInfo(nodeID string, provider config.ConfigProvider, addr utils.HostInfo) bool {
-	node, _ := provider.GetNode(nodeID)
-	identity, _ := provider.GetIdentity(nodeID)
+func (o *ExecOptions) updateNodeFromHostInfo(ctx context.Context, nodeID string, repository *config.Repository, addr utils.HostInfo) (bool, error) {
+	view := repository.View()
+	ref, ok := view.NodeRefs[nodeID]
+	if !ok {
+		return false, fmt.Errorf("resolve exec node %q reference: %w", nodeID, config.ErrNodeNotFound)
+	}
+	node, host, identity, err := repository.Resolve(nodeID)
+	if err != nil {
+		return false, fmt.Errorf("resolve exec node %q for update failed: %w", nodeID, err)
+	}
 	updated := false
 
 	updated = o.updateIdentity(&identity, addr) || updated
-	updated = o.updateNodeAlias(nodeID, &node, addr.Alias, provider) || updated
+	updated = o.updateNodeAlias(nodeID, &node, addr.Alias, repository) || updated
 	updated = o.updateNodeSudo(&node) || updated
 
 	if updated {
-		provider.AddNode(nodeID, node)
-		provider.AddIdentity(node.IdentityRef, identity)
+		if err := repository.ReplaceNodeAtRefContext(ctx, ref, nodeID, node, host, identity); err != nil {
+			return false, fmt.Errorf("update exec node %q failed: %w", nodeID, err)
+		}
 	}
 
-	return updated
+	return updated, nil
 }
 
 // updateIdentity updates identity credentials and returns true if changed
@@ -749,31 +838,94 @@ func (o *ExecOptions) updateNodeSudo(node *models.Node) bool {
 	return updated
 }
 
-func (o *ExecOptions) addTempNode(nodeID string) {
+func (o *ExecOptions) addTempNode(ref config.NodeRef) {
+	if ref.ID == "" {
+		return
+	}
 	o.tempNodesMu.Lock()
 	defer o.tempNodesMu.Unlock()
 	if o.tempNodes == nil {
-		o.tempNodes = make(map[string]bool)
+		o.tempNodes = make(map[string]config.NodeRef)
 	}
-	o.tempNodes[nodeID] = true
+	o.tempNodes[ref.ID] = ref
 }
 
 func (o *ExecOptions) verifyTempNode(nodeID string) {
 	o.tempNodesMu.Lock()
 	defer o.tempNodesMu.Unlock()
-	if o.tempNodes != nil && o.tempNodes[nodeID] {
+	if _, ok := o.tempNodes[nodeID]; ok {
 		delete(o.tempNodes, nodeID)
 		o.savedTempNodes++
 	}
 }
 
-func (o *ExecOptions) cleanUnusedTempNodes(provider config.ConfigProvider) {
-	o.tempNodesMu.Lock()
-	defer o.tempNodesMu.Unlock()
-	for nodeID := range o.tempNodes {
-		provider.DeleteNode(nodeID)
+type tempNodeDeleter interface {
+	DeleteNodeAtRefContext(context.Context, config.NodeRef) (config.MutationOutcome, error)
+}
+
+// putConfiguredNodeContext is retained for SCP's shared node preparation
+// path. It accepts only Repository and chooses a create-only or exact-ref
+// replacement transaction; there is deliberately no Provider fallback.
+func putConfiguredNodeContext(ctx context.Context, provider config.ConfigProvider, nodeID string, node models.Node, host models.Host, identity models.Identity) error {
+	repository, ok := provider.(*config.Repository)
+	if !ok {
+		return fmt.Errorf("configuration mutation requires repository")
 	}
+	if ref, exists := repository.View().NodeRefs[nodeID]; exists {
+		return repository.ReplaceNodeAtRefContext(ctx, ref, nodeID, node, host, identity)
+	}
+	_, err := repository.CreateNodeContext(ctx, nodeID, node, host, identity)
+	return err
+}
+
+type connectorCloser interface {
+	CloseAll() error
+}
+
+func joinConnectorCloseError(retErr *error, closer connectorCloser) {
+	if closeErr := closer.CloseAll(); closeErr != nil {
+		*retErr = errors.Join(*retErr, fmt.Errorf("close SSH connector failed: %w", closeErr))
+	}
+}
+
+// cleanUnusedTempNodes removes nodes that were created for this execution but
+// never reached a successful connection. It deliberately keeps repository I/O
+// outside tempNodesMu so a slow persistent store cannot block task bookkeeping.
+func (o *ExecOptions) cleanUnusedTempNodes(provider tempNodeDeleter) error {
+	return o.cleanUnusedTempNodesContext(context.Background(), provider)
+}
+
+func (o *ExecOptions) cleanUnusedTempNodesContext(ctx context.Context, provider tempNodeDeleter) error {
+	o.tempNodesMu.Lock()
+	pending := o.tempNodes
 	o.tempNodes = nil
+	o.tempNodesMu.Unlock()
+
+	failed := make(map[string]config.NodeRef)
+	var cleanupErr error
+	for nodeID, ref := range pending {
+		_, err := provider.DeleteNodeAtRefContext(ctx, ref)
+		if err != nil {
+			failed[nodeID] = ref
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete unused temporary node %q failed: %w", nodeID, err))
+		}
+	}
+	if len(failed) == 0 {
+		return cleanupErr
+	}
+
+	// Keep only failed deletions. Nodes added while cleanup was in progress are
+	// already in o.tempNodes and must remain pending as well.
+	o.tempNodesMu.Lock()
+	if o.tempNodes == nil {
+		o.tempNodes = make(map[string]config.NodeRef, len(failed))
+	}
+	for nodeID, ref := range failed {
+		o.tempNodes[nodeID] = ref
+	}
+	o.tempNodesMu.Unlock()
+
+	return cleanupErr
 }
 
 func (o *ExecOptions) hasChanges() bool {

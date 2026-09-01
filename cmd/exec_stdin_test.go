@@ -1,7 +1,10 @@
 package cmd
 
 import (
+	"context"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -22,8 +25,12 @@ func TestExecStdinRedirection(t *testing.T) {
 	os.Stdin = r
 
 	expectedCmd := "echo 'hello world' && hostname"
-	_, _ = w.Write([]byte(expectedCmd))
-	_ = w.Close()
+	if _, err := w.Write([]byte(expectedCmd)); err != nil {
+		t.Fatalf("write pipe failed: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Logf("Close failed: %v", err)
+	}
 
 	o := NewExecOptions()
 	cmd := &cobra.Command{}
@@ -31,7 +38,9 @@ func TestExecStdinRedirection(t *testing.T) {
 	// 在没有指定 Command 和 ShellFile，且 args 不包含命令时，
 	// 执行 Complete 应该自动从 stdin 读取内容并标记为 stdinScript
 	args := []string{"host-01"}
-	o.Complete(cmd, args)
+	if err := o.Complete(cmd, args); err != nil {
+		t.Fatalf("Complete failed: %v", err)
+	}
 
 	if o.Command != expectedCmd {
 		t.Errorf("expected Command to be %q, got %q", expectedCmd, o.Command)
@@ -51,15 +60,21 @@ func TestExecStdinIgnoredWhenCmdProvided(t *testing.T) {
 	defer func() { os.Stdin = oldStdin }()
 	os.Stdin = r
 
-	_, _ = w.Write([]byte("stdin command should be ignored"))
-	_ = w.Close()
+	if _, err := w.Write([]byte("stdin command should be ignored")); err != nil {
+		t.Fatalf("write pipe failed: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Logf("Close failed: %v", err)
+	}
 
 	o := NewExecOptions()
 	cmd := &cobra.Command{}
 
 	// 参数中明确提供了命令 "uname -a"
 	args := []string{"host-01", "uname -a"}
-	o.Complete(cmd, args)
+	if err := o.Complete(cmd, args); err != nil {
+		t.Fatalf("Complete failed: %v", err)
+	}
 
 	if o.Command != "uname -a" {
 		t.Errorf("expected Command to be %q, got %q", "uname -a", o.Command)
@@ -111,14 +126,21 @@ func TestExecNonExistingNodeNotPersisted(t *testing.T) {
 		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
 	}
-	provider := config.NewProvider(cfg)
+	store := config.NewDefaultStore(filepath.Join(t.TempDir(), "config.yaml"), filepath.Join(t.TempDir(), "config.key"))
+	if err := store.Save(cfg); err != nil {
+		t.Fatalf("initialize test configuration: %v", err)
+	}
+	provider, err := config.NewRepositoryWithoutOpenSSH(cfg, store)
+	if err != nil {
+		t.Fatalf("create test repository: %v", err)
+	}
 
 	o := NewExecOptions()
 	o.Host = "non-existing-host-12345"
 	o.Command = "ls"
 
 	// 1. 调用 buildTasksFromHosts，这会在内存中临时注册该节点
-	tasks, err := o.buildTasksFromHosts(provider)
+	tasks, _, err := o.buildTasksFromHosts(context.Background(), provider)
 	if err != nil {
 		t.Fatalf("expected buildTasksFromHosts to succeed, got: %v", err)
 	}
@@ -133,7 +155,9 @@ func TestExecNonExistingNodeNotPersisted(t *testing.T) {
 	}
 
 	// 2. 调用 cleanUnusedTempNodes，由于它从未连接成功验证，应当被清理删除
-	o.cleanUnusedTempNodes(provider)
+	if err := o.cleanUnusedTempNodes(provider); err != nil {
+		t.Fatalf("cleanUnusedTempNodes() failed: %v", err)
+	}
 
 	// 验证该节点已经被从 provider 中完全清除
 	if _, ok := provider.GetNode(nodeID); ok {
@@ -141,11 +165,13 @@ func TestExecNonExistingNodeNotPersisted(t *testing.T) {
 	}
 
 	// 3. 验证如果连接成功了（即从 tempNodes 移除了），它不应该被清理
-	tasks, _ = o.buildTasksFromHosts(provider)
+	tasks, _, _ = o.buildTasksFromHosts(context.Background(), provider)
 	newNodeID := tasks[0].nodeID
 
 	o.verifyTempNode(newNodeID) // 模拟连接成功将其验证并保留
-	o.cleanUnusedTempNodes(provider)
+	if err := o.cleanUnusedTempNodes(provider); err != nil {
+		t.Fatalf("cleanUnusedTempNodes() failed: %v", err)
+	}
 
 	if _, ok := provider.GetNode(newNodeID); !ok {
 		t.Error("expected successfully connected temporary node to remain in provider after cleanUnusedTempNodes")
@@ -168,18 +194,29 @@ func TestExecHasChangesDetection(t *testing.T) {
 
 	// 3. 验证当有成功连接的临时节点被添加时，hasChanges 返回 true
 	o3 := NewExecOptions()
-	o3.addTempNode("temp-01")
+	o3.addTempNode(config.NodeRef{ID: "temp-01"})
 	o3.verifyTempNode("temp-01") // 模拟连接成功
 	if !o3.hasChanges() {
-		t.Error("expected hasChanges to be true when savedTempNodes > 0")
+		t.Error("expected hasChanges to be true when temporary nodes are verified")
 	}
 
 	// 4. 验证当有临时节点但全部连接失败被清理后，hasChanges 依然返回 false
 	o4 := NewExecOptions()
-	o4.addTempNode("temp-02")
+	o4.addTempNode(config.NodeRef{ID: "temp-02"})
 	// 模拟清理（不调用 verifyTempNode 而是直接 cleanUnusedTempNodes）
 	// 这时 savedTempNodes 为 0，nodeUpdated 为 false
 	if o4.hasChanges() {
 		t.Error("expected hasChanges to be false when temporary nodes are not verified")
+	}
+}
+
+func TestExec_InvalidAddressArgs(t *testing.T) {
+	o := NewExecOptions()
+	err := o.Complete(nil, []string{"user@host:badport", "echo hello"})
+	if err == nil {
+		t.Fatal("expected error for invalid host port, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid host address") {
+		t.Errorf("expected invalid host address error, got: %v", err)
 	}
 }

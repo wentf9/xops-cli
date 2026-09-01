@@ -32,7 +32,7 @@ func NewCmdInventoryAdd() *cobra.Command {
 				return fmt.Errorf("必须指定主机地址 (--address)")
 			}
 
-			store, provider, cfg, err := utils.GetConfigStore()
+			_, repository, cfg, err := utils.GetConfigStore()
 			if err != nil {
 				return fmt.Errorf("加载配置文件失败: %w", err)
 			}
@@ -53,7 +53,11 @@ func NewCmdInventoryAdd() *cobra.Command {
 				identityRef = identityAlias
 			} else {
 				if user == "" {
-					user = utils.GetCurrentUser()
+					var userErr error
+					user, userErr = utils.GetCurrentUser()
+					if userErr != nil {
+						return fmt.Errorf("get current user failed: %w", userErr)
+					}
 				}
 				identity = models.Identity{User: user}
 				if keyPath != "" {
@@ -71,13 +75,13 @@ func NewCmdInventoryAdd() *cobra.Command {
 			}
 
 			name := fmt.Sprintf("%s@%s:%d", identity.User, address, port)
-			if _, ok := provider.GetNode(name); ok {
+			if _, ok := repository.GetNode(name); ok {
 				return fmt.Errorf("节点 %s 已存在", name)
 			}
 
 			// 检查别名是否已存在
 			for _, a := range alias {
-				if existingNode := provider.FindAlias(a); existingNode != "" {
+				if existingNode := repository.FindAlias(a); existingNode != "" {
 					return fmt.Errorf("%s", i18n.Tf("alias_err_exists", map[string]any{"Alias": a, "Node": existingNode}))
 				}
 			}
@@ -92,14 +96,8 @@ func NewCmdInventoryAdd() *cobra.Command {
 				SudoMode:    models.SudoModeAuto,
 			}
 
-			if identityAlias == "" {
-				provider.AddIdentity(identityRef, identity)
-			}
-			provider.AddHost(node.HostRef, hostObj)
-			provider.AddNode(name, node)
-
-			if err := store.Save(cfg); err != nil {
-				return fmt.Errorf("保存配置文件失败: %w", err)
+			if _, err := repository.CreateNodeContext(cmd.Context(), name, node, hostObj, identity); err != nil {
+				return fmt.Errorf("create node %q failed: %w", name, err)
 			}
 
 			logger.PrintSuccess(i18n.Tf("node_add_success", map[string]any{"Name": name}))
