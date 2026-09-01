@@ -1,13 +1,83 @@
 package config
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/wentf9/xops-cli/pkg/models"
 	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 )
 
-func newTestProvider() ConfigProvider {
+func TestProvider_ResolveRejectsMissingReferencedMaps(t *testing.T) {
+	nodes := concurrent.NewMap[string, models.Node](concurrent.HashString)
+	nodes.Set("node", models.Node{HostRef: "host", IdentityRef: "identity"})
+
+	provider := NewProviderWithoutOpenSSH(&Configuration{Nodes: nodes})
+	_, _, _, err := provider.Resolve("node")
+	if !errors.Is(err, ErrHostNotFound) {
+		t.Fatalf("got %v, want ErrHostNotFound", err)
+	}
+
+	hosts := concurrent.NewMap[string, models.Host](concurrent.HashString)
+	hosts.Set("host", models.Host{Address: "127.0.0.1", Port: 22})
+	provider = NewProviderWithoutOpenSSH(&Configuration{Nodes: nodes, Hosts: hosts})
+	_, _, _, err = provider.Resolve("node")
+	if !errors.Is(err, ErrIdentityNotFound) {
+		t.Fatalf("got %v, want ErrIdentityNotFound", err)
+	}
+}
+
+func TestProviderSnapshot_DefensiveCopy(t *testing.T) {
+	p := newTestProvider()
+	snapshot := p.Snapshot()
+	node, _ := snapshot.Nodes.Get("web-server")
+	host, _ := snapshot.Hosts.Get("host-web")
+	node.Alias[0] = "mutated-node-alias"
+	host.Alias[0] = "mutated-host-alias"
+	snapshot.Nodes.Set("web-server", node)
+	snapshot.Hosts.Set("host-web", host)
+
+	resolvedNode, resolvedHost, _, err := p.Resolve("web-server")
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if resolvedNode.Alias[0] != "ws1" {
+		t.Fatalf("node alias changed through snapshot: %q", resolvedNode.Alias[0])
+	}
+	if resolvedHost.Alias[0] != "web.example.com" {
+		t.Fatalf("host alias changed through snapshot: %q", resolvedHost.Alias[0])
+	}
+}
+
+func TestProviderResolveSelector_RejectsAmbiguousAddress(t *testing.T) {
+	cfg := &Configuration{
+		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
+		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
+		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
+	}
+	for _, nodeID := range []string{"root@host", "admin@host"} {
+		cfg.Hosts.Set(nodeID, models.Host{Address: "192.0.2.10", Port: 22})
+		cfg.Identities.Set(nodeID, models.Identity{User: nodeID[:len(nodeID)-5]})
+		cfg.Nodes.Set(nodeID, models.Node{HostRef: nodeID, IdentityRef: nodeID})
+	}
+	p := NewProviderWithoutOpenSSH(cfg)
+	if got := p.Find("192.0.2.10"); got != "" {
+		t.Fatalf("Find() = %q, want no implicit selection", got)
+	}
+	_, err := p.ResolveSelector("192.0.2.10")
+	var ambiguous *AmbiguousNodeError
+	if !errors.As(err, &ambiguous) {
+		t.Fatalf("ResolveSelector() error = %v, want AmbiguousNodeError", err)
+	}
+	if !errors.Is(err, ErrAmbiguousNode) {
+		t.Fatalf("ResolveSelector() error = %v, want ErrAmbiguousNode", err)
+	}
+	if len(ambiguous.Candidates) != 2 {
+		t.Fatalf("ambiguous candidates = %v, want two", ambiguous.Candidates)
+	}
+}
+
+func newTestProvider() *Provider {
 	cfg := &Configuration{
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
 		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
@@ -30,7 +100,7 @@ func newTestProvider() ConfigProvider {
 		Tags:        []string{"production", "web"},
 	})
 
-	return NewProvider(cfg)
+	return NewProviderWithoutOpenSSH(cfg)
 }
 
 func TestFind_ByNodeId(t *testing.T) {
@@ -83,7 +153,7 @@ func TestFind_NotFound(t *testing.T) {
 	}
 }
 
-func TestAddNode_UpdatesIndex(t *testing.T) {
+func TestProviderIndexesConfiguredNode(t *testing.T) {
 	cfg := &Configuration{
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
 		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
@@ -91,13 +161,12 @@ func TestAddNode_UpdatesIndex(t *testing.T) {
 	}
 	cfg.Hosts.Set("h1", models.Host{Address: "1.2.3.4", Port: 22})
 	cfg.Identities.Set("i1", models.Identity{User: "root", AuthType: "password"})
-	p := NewProvider(cfg)
-
-	p.AddNode("n1", models.Node{
+	cfg.Nodes.Set("n1", models.Node{
 		HostRef:     "h1",
 		IdentityRef: "i1",
 		Alias:       []string{"mynode"},
 	})
+	p := NewProviderWithoutOpenSSH(cfg)
 
 	if got := p.Find("mynode"); got != "n1" {
 		t.Errorf("Find('mynode') after AddNode = %q, want 'n1'", got)
@@ -107,25 +176,30 @@ func TestAddNode_UpdatesIndex(t *testing.T) {
 	}
 }
 
-func TestDeleteNode_CleansIndex(t *testing.T) {
-	p := newTestProvider()
+func TestRepositoryDeleteNodeUpdatesProviderIndex(t *testing.T) {
+	repository, err := NewRepositoryWithoutOpenSSH(newTestProvider().Snapshot(), &repositoryTestStore{result: PersistResult{Applied: true, Durable: true}})
+	if err != nil {
+		t.Fatalf("NewRepositoryWithoutOpenSSH() error = %v", err)
+	}
 
 	// 确认存在
-	if got := p.Find("ws1"); got != "web-server" {
+	if got := repository.Find("ws1"); got != "web-server" {
 		t.Fatalf("pre-check: Find('ws1') = %q, want 'web-server'", got)
 	}
 
-	p.DeleteNode("web-server")
+	if _, err := repository.DeleteNodeAtRefContext(t.Context(), repository.View().NodeRefs["web-server"]); err != nil {
+		t.Fatalf("DeleteNodeAtRefContext() error = %v", err)
+	}
 
-	if got := p.Find("web-server"); got != "" {
+	if got := repository.Find("web-server"); got != "" {
 		t.Errorf("Find('web-server') after delete = %q, want empty", got)
 	}
-	if got := p.Find("ws1"); got != "" {
+	if got := repository.Find("ws1"); got != "" {
 		t.Errorf("Find('ws1') after delete = %q, want empty", got)
 	}
 }
 
-func TestDeleteNode_CleansUnusedRefs(t *testing.T) {
+func TestRepositoryDeleteNodeCleansUnusedRefs(t *testing.T) {
 	cfg := &Configuration{
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
 		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
@@ -136,23 +210,30 @@ func TestDeleteNode_CleansUnusedRefs(t *testing.T) {
 	cfg.Nodes.Set("n1", models.Node{HostRef: "h1", IdentityRef: "i1"})
 	cfg.Nodes.Set("n2", models.Node{HostRef: "h1", IdentityRef: "i1"}) // n2 也引用 h1, i1
 
-	p := NewProvider(cfg)
+	repository, err := NewRepositoryWithoutOpenSSH(cfg, &repositoryTestStore{result: PersistResult{Applied: true, Durable: true}})
+	if err != nil {
+		t.Fatalf("NewRepositoryWithoutOpenSSH() error = %v", err)
+	}
 
 	// 1. 删除 n1，应该保留 h1, i1 (因为还有 n2 引用)
-	p.DeleteNode("n1")
-	if _, ok := cfg.Hosts.Get("h1"); !ok {
+	if _, err := repository.DeleteNodeAtRefContext(t.Context(), repository.View().NodeRefs["n1"]); err != nil {
+		t.Fatalf("DeleteNodeAtRefContext(n1) error = %v", err)
+	}
+	if _, ok := repository.Snapshot().Hosts.Get("h1"); !ok {
 		t.Error("expected h1 to be preserved as n2 still references it")
 	}
-	if _, ok := cfg.Identities.Get("i1"); !ok {
+	if _, ok := repository.Snapshot().Identities.Get("i1"); !ok {
 		t.Error("expected i1 to be preserved as n2 still references it")
 	}
 
 	// 2. 删除 n2，应该清理 h1, i1
-	p.DeleteNode("n2")
-	if _, ok := cfg.Hosts.Get("h1"); ok {
+	if _, err := repository.DeleteNodeAtRefContext(t.Context(), repository.View().NodeRefs["n2"]); err != nil {
+		t.Fatalf("DeleteNodeAtRefContext(n2) error = %v", err)
+	}
+	if _, ok := repository.Snapshot().Hosts.Get("h1"); ok {
 		t.Error("expected h1 to be cleaned as no more nodes reference it")
 	}
-	if _, ok := cfg.Identities.Get("i1"); ok {
+	if _, ok := repository.Snapshot().Identities.Get("i1"); ok {
 		t.Error("expected i1 to be cleaned as no more nodes reference it")
 	}
 }
@@ -215,7 +296,7 @@ func TestLocalNodeFiltering(t *testing.T) {
 		Tags:        []string{"web"},
 	})
 
-	p := NewProvider(cfg)
+	p := NewProviderWithoutOpenSSH(cfg)
 
 	// 验证 ListNodes
 	nodes := p.ListNodes()
@@ -247,7 +328,7 @@ func TestLocalNodeFiltering(t *testing.T) {
 	}
 }
 
-func TestAddNode_ClearStaleIndex(t *testing.T) {
+func TestRepositoryReplaceNodeClearsStaleIndex(t *testing.T) {
 	cfg := &Configuration{
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
 		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
@@ -255,29 +336,33 @@ func TestAddNode_ClearStaleIndex(t *testing.T) {
 	}
 	cfg.Hosts.Set("h1", models.Host{Address: "1.2.3.4", Port: 22})
 	cfg.Identities.Set("i1", models.Identity{User: "root", AuthType: "password"})
-	p := NewProvider(cfg)
-
-	// 1. 首次添加，带有一个别名 old-alias
+	// 1. 配置中存在带有旧别名的节点。
 	node := models.Node{
 		HostRef:     "h1",
 		IdentityRef: "i1",
 		Alias:       []string{"old-alias"},
 	}
-	p.AddNode("n1", node)
+	cfg.Nodes.Set("n1", node)
+	repository, err := NewRepositoryWithoutOpenSSH(cfg, &repositoryTestStore{result: PersistResult{Applied: true, Durable: true}})
+	if err != nil {
+		t.Fatalf("NewRepositoryWithoutOpenSSH() error = %v", err)
+	}
 
-	if got := p.Find("old-alias"); got != "n1" {
+	if got := repository.Find("old-alias"); got != "n1" {
 		t.Fatalf("Find('old-alias') = %q, want 'n1'", got)
 	}
 
 	// 2. 更新节点，别名变更为 new-alias
 	node.Alias = []string{"new-alias"}
-	p.AddNode("n1", node)
+	if err := repository.ReplaceNodeAtRefContext(t.Context(), repository.View().NodeRefs["n1"], "n1", node, models.Host{Address: "1.2.3.4", Port: 22}, models.Identity{User: "root", AuthType: "password"}); err != nil {
+		t.Fatalf("ReplaceNodeAtRefContext() error = %v", err)
+	}
 
 	// 3. 验证新别名生效，旧别名失效
-	if got := p.Find("new-alias"); got != "n1" {
+	if got := repository.Find("new-alias"); got != "n1" {
 		t.Errorf("Find('new-alias') = %q, want 'n1'", got)
 	}
-	if got := p.Find("old-alias"); got != "" {
+	if got := repository.Find("old-alias"); got != "" {
 		t.Errorf("Find('old-alias') = %q, want empty after updating node alias", got)
 	}
 }

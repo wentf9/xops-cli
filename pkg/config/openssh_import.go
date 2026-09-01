@@ -87,6 +87,11 @@ func openSSHHostFromConfig(cfg *ssh_config.Config, name, defaultUser string) (Op
 		proxyJump = ""
 	}
 
+	expandedKeyPath, err := expandHomeDir(keyPath)
+	if err != nil {
+		return OpenSSHHost{}, err
+	}
+
 	return OpenSSHHost{
 		Name: name,
 		Host: models.Host{
@@ -96,7 +101,7 @@ func openSSHHostFromConfig(cfg *ssh_config.Config, name, defaultUser string) (Op
 		Identity: models.Identity{
 			User:     user,
 			AuthType: "auto",
-			KeyPath:  expandHomeDir(keyPath),
+			KeyPath:  expandedKeyPath,
 		},
 		Node: models.Node{
 			Alias:     []string{name},

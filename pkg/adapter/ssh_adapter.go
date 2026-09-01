@@ -1,9 +1,9 @@
 package adapter
 
 import (
+	"context"
 	"fmt"
 
-	cmdutil "github.com/wentf9/xops-cli/cmd/utils"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/models"
 	"github.com/wentf9/xops-cli/pkg/ssh"
@@ -11,8 +11,7 @@ import (
 
 // SSHAdapter 实现 ssh.ConfigStore 和 ssh.InteractionHandler 接口，作为业务模型与底层 SSH 的防腐层
 type SSHAdapter struct {
-	cfgProvider    config.ConfigProvider
-	nonInteractive bool
+	cfgProvider config.ConfigProvider
 }
 
 // NewSSHAdapter 创建 SSH 适配器
@@ -24,149 +23,98 @@ func NewSSHAdapter(cfgProvider config.ConfigProvider) *SSHAdapter {
 
 // NewNonInteractiveSSHAdapter 创建非交互式的 SSH 适配器
 func NewNonInteractiveSSHAdapter(cfgProvider config.ConfigProvider) *SSHAdapter {
-	return &SSHAdapter{
-		cfgProvider:    cfgProvider,
-		nonInteractive: true,
-	}
+	return NewSSHAdapter(cfgProvider)
 }
 
-// NewConnector 是一个辅助方法，快速创建组装好 Adapter 的 ssh.Connector
-func NewConnector(cfgProvider config.ConfigProvider) *ssh.Connector {
+// NewConnector 是一个辅助方法，快速创建组装好 Adapter 的 ssh.Connector，支持传入 Option 进行显式注入配置。
+func NewConnector(cfgProvider config.ConfigProvider, opts ...ssh.Option) *ssh.Connector {
 	adp := NewSSHAdapter(cfgProvider)
-	conn := ssh.NewConnector(adp, adp)
-	if cfg := cfgProvider.GetConfig(); cfg != nil {
-		conn.PasswordPromptPattern = cfg.PasswordPromptPattern
-	}
-	return conn
+	return newConnector(adp, adp, opts...)
 }
 
-// NewNonInteractiveConnector 创建一个非交互式的 Connector，避免在批量操作中阻塞等待输入
-func NewNonInteractiveConnector(cfgProvider config.ConfigProvider) *ssh.Connector {
-	adp := NewNonInteractiveSSHAdapter(cfgProvider)
-	conn := ssh.NewConnector(adp, adp)
-	if cfg := cfgProvider.GetConfig(); cfg != nil {
-		conn.PasswordPromptPattern = cfg.PasswordPromptPattern
+// NewConnectorWithInteraction creates a connector with a presentation-layer
+// interaction handler supplied by the composition root.
+func NewConnectorWithInteraction(cfgProvider config.ConfigProvider, interaction ssh.InteractionHandler, opts ...ssh.Option) *ssh.Connector {
+	adp := NewSSHAdapter(cfgProvider)
+	if interaction == nil {
+		interaction = adp
 	}
-	return conn
+	return newConnector(adp, interaction, opts...)
+}
+
+func newConnector(adp *SSHAdapter, interaction ssh.InteractionHandler, opts ...ssh.Option) *ssh.Connector {
+	var finalOpts []ssh.Option
+	if cfg := adp.cfgProvider.Snapshot(); cfg != nil && cfg.PasswordPromptPattern != "" {
+		finalOpts = append(finalOpts, ssh.WithPasswordPromptPattern(cfg.PasswordPromptPattern))
+	}
+	finalOpts = append(finalOpts, opts...)
+	return ssh.NewConnector(adp, interaction, finalOpts...)
+}
+
+// NewNonInteractiveConnector 创建一个非交互式的 Connector，避免在批量操作中阻塞等待输入，支持传入 Option。
+func NewNonInteractiveConnector(cfgProvider config.ConfigProvider, opts ...ssh.Option) *ssh.Connector {
+	return NewConnector(cfgProvider, opts...)
 }
 
 // GetConfig 获取底层 SSH 客户端需要的配置
 func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
-	node, ok := a.cfgProvider.GetNode(nodeID)
-	if !ok {
-		return nil, fmt.Errorf("node not found '%s'", nodeID)
+	snapshot, err := a.cfgProvider.ResolveConnection(nodeID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve node %q failed: %w", nodeID, err)
 	}
-
-	host, ok := a.cfgProvider.GetHost(nodeID)
-	if !ok {
-		return nil, fmt.Errorf("host ref '%s' not found for node '%s'", node.HostRef, nodeID)
-	}
-
-	identity, ok := a.cfgProvider.GetIdentity(nodeID)
-	if !ok {
-		return nil, fmt.Errorf("identity ref '%s' not found for node '%s'", node.IdentityRef, nodeID)
+	var authUpdateToken, sudoUpdateToken string
+	if snapshot.UpdateRef != nil {
+		authUpdateToken = string(snapshot.UpdateRef.AuthVersion[:])
+		sudoUpdateToken = string(snapshot.UpdateRef.SudoVersion[:])
 	}
 
 	return &ssh.ClientConfig{
 		NodeID:                nodeID,
-		Address:               host.Address,
-		Port:                  int(host.Port),
-		User:                  identity.User,
-		AuthType:              identity.AuthType,
-		Password:              identity.Password,
-		KeyPath:               identity.KeyPath,
-		Passphrase:            identity.Passphrase,
-		SudoMode:              ssh.SudoMode(node.SudoMode),
-		SuPwd:                 node.SuPwd,
-		ProxyJump:             node.ProxyJump,
-		PasswordPromptPattern: node.PasswordPromptPattern,
+		Address:               snapshot.Host.Address,
+		Port:                  int(snapshot.Host.Port),
+		User:                  snapshot.Identity.User,
+		AuthType:              snapshot.Identity.AuthType,
+		Password:              snapshot.Identity.Password,
+		KeyPath:               snapshot.Identity.KeyPath,
+		Passphrase:            snapshot.Identity.Passphrase,
+		AuthUpdateToken:       authUpdateToken,
+		SudoMode:              ssh.SudoMode(snapshot.Node.SudoMode),
+		SuPwd:                 snapshot.Node.SuPwd,
+		SudoUpdateToken:       sudoUpdateToken,
+		ProxyJump:             snapshot.Node.ProxyJump,
+		PasswordPromptPattern: snapshot.Node.PasswordPromptPattern,
 	}, nil
 }
 
 // UpdateAuth 处理密码或私钥密码的回写
-func (a *SSHAdapter) UpdateAuth(nodeID string, password, keyPath, passphrase string) error {
-	node, ok := a.cfgProvider.GetNode(nodeID)
+func (a *SSHAdapter) UpdateAuth(ctx context.Context, nodeID, authUpdateToken, password, keyPath, passphrase string) error {
+	provider, ok := a.cfgProvider.(interface {
+		UpdateAuthAtVersionContext(context.Context, string, string, string, string, string) error
+	})
 	if !ok {
-		return fmt.Errorf("node not found '%s'", nodeID)
+		return fmt.Errorf("configuration provider does not support versioned authentication updates")
 	}
-	identity, ok := a.cfgProvider.GetIdentity(nodeID)
-	if !ok {
-		return fmt.Errorf("identity not found '%s'", nodeID)
-	}
-	host, ok := a.cfgProvider.GetHost(nodeID)
-	if !ok {
-		return fmt.Errorf("host not found '%s'", nodeID)
-	}
-
-	updated := false
-	if password != "" && identity.Password != password {
-		identity.Password = password
-		identity.AuthType = "password"
-		updated = true
-	}
-	if passphrase != "" && (identity.Passphrase != passphrase || identity.KeyPath != keyPath) {
-		identity.Passphrase = passphrase
-		identity.KeyPath = keyPath
-		identity.AuthType = "key"
-		updated = true
-	}
-
-	if updated {
-		a.cfgProvider.AddIdentity(node.IdentityRef, identity)
-		a.cfgProvider.AddNode(nodeID, node)
-		a.cfgProvider.AddHost(node.HostRef, host)
-	}
-	return nil
+	return provider.UpdateAuthAtVersionContext(ctx, nodeID, authUpdateToken, password, keyPath, passphrase)
 }
 
 // UpdateSudo 处理提权密码和模式的回写
-func (a *SSHAdapter) UpdateSudo(nodeID string, mode ssh.SudoMode, suPwd string) error {
-	node, ok := a.cfgProvider.GetNode(nodeID)
+func (a *SSHAdapter) UpdateSudo(ctx context.Context, nodeID, sudoUpdateToken string, mode ssh.SudoMode, suPwd string) error {
+	provider, ok := a.cfgProvider.(interface {
+		UpdateSudoAtVersionContext(context.Context, string, string, models.SudoMode, string) error
+	})
 	if !ok {
-		return fmt.Errorf("node not found '%s'", nodeID)
+		return fmt.Errorf("configuration provider does not support versioned sudo updates")
 	}
-
-	updated := false
-	if models.SudoMode(mode) != node.SudoMode && mode != "" {
-		node.SudoMode = models.SudoMode(mode)
-		updated = true
-	}
-	if suPwd != "" && node.SuPwd != suPwd {
-		node.SuPwd = suPwd
-		updated = true
-	}
-
-	if updated {
-		a.cfgProvider.AddNode(nodeID, node)
-	}
-	return nil
+	return provider.UpdateSudoAtVersionContext(ctx, nodeID, sudoUpdateToken, models.SudoMode(mode), suPwd)
 }
 
-// PromptPassword 通过命令行终端获取密码输入
+// PromptPassword rejects terminal interaction in the package layer. A CLI or
+// GUI must inject its own InteractionHandler at the composition root.
 func (a *SSHAdapter) PromptPassword(prompt string) (string, error) {
-	if a.nonInteractive {
-		return "", fmt.Errorf("non-interactive mode: password prompt is disabled")
-	}
-	return cmdutil.ReadPasswordFromTerminal(prompt)
+	return "", fmt.Errorf("non-interactive mode: password prompt is disabled")
 }
 
-// ConfirmHostKey 通过命令行终端请求确认 HostKey
+// ConfirmHostKey rejects terminal interaction in the package layer.
 func (a *SSHAdapter) ConfirmHostKey(hostname string, fingerprint string) (bool, error) {
-	if a.nonInteractive {
-		return false, fmt.Errorf("non-interactive mode: host key confirmation is disabled")
-	}
-	fmt.Printf("The authenticity of host '%s' can't be established.\n", hostname)
-	fmt.Printf("key fingerprint is %s.\n", fingerprint)
-	fmt.Print("Are you sure you want to continue connecting (yes/no)? ")
-
-	var response string
-	_, scanErr := fmt.Scanln(&response)
-	if scanErr != nil && scanErr.Error() != "unexpected newline" && scanErr.Error() != "EOF" {
-		return false, fmt.Errorf("read response failed: %w", scanErr)
-	}
-
-	if response == "yes" {
-		return true, nil
-	}
-	return false, nil
+	return false, fmt.Errorf("non-interactive mode: host key confirmation is disabled")
 }

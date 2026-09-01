@@ -3,252 +3,408 @@ package config
 import (
 	"fmt"
 	"slices"
+	"sort"
 	"strings"
+	"sync"
 
 	"github.com/wentf9/xops-cli/pkg/models"
 	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 )
 
-// Provider 提供了基础的配置查询和管理功能
+// Provider owns one coherent in-memory configuration snapshot. All reads see
+// one revision. Repository owns durable mutations and publishes new snapshots.
 type Provider struct {
+	mu          sync.RWMutex
 	cfg         *Configuration
-	lookupIndex *concurrent.Map[string, string]
+	lookupIndex map[string][]string
+	aliasIndex  map[string]string
 	openSSH     *OpenSSHParser
 }
 
-// NewProvider 创建一个新的配置提供者实例
-func NewProvider(cfg *Configuration) ConfigProvider {
-	provider := Provider{
-		cfg:         cfg,
-		lookupIndex: concurrent.NewMap[string, string](concurrent.HashString),
-		openSSH:     NewOpenSSHParser(),
+var _ ConfigProvider = (*Provider)(nil)
+
+// NewProvider creates a provider and loads the local OpenSSH configuration.
+func NewProvider(cfg *Configuration) (*Provider, error) {
+	openSSH, err := NewOpenSSHParser()
+	if err != nil {
+		return nil, fmt.Errorf("load openssh config failed: %w", err)
 	}
-	provider.init()
-	return provider
+	return newProvider(cfg, openSSH), nil
 }
 
-// Add 将主机及其所有标识符加入索引
-func (cp Provider) add(nodeID string) {
-	node, ok := cp.GetNode(nodeID)
-	if !ok {
-		return
+// NewProviderWithoutOpenSSH creates a provider without an OpenSSH fallback.
+func NewProviderWithoutOpenSSH(cfg *Configuration) *Provider {
+	return newProvider(cfg, &OpenSSHParser{cfg: nil})
+}
+
+// NewProviderWithOpenSSHParser creates a provider using parser as its OpenSSH
+// fallback. A nil parser disables the fallback.
+func NewProviderWithOpenSSHParser(cfg *Configuration, parser *OpenSSHParser) *Provider {
+	if parser == nil {
+		parser = &OpenSSHParser{cfg: nil}
 	}
+	return newProvider(cfg, parser)
+}
 
-	// 1. nodeID 映射 - 即使后续 Host/Identity 缺失，也要确保 nodeID 自身可查
-	cp.lookupIndex.Set(nodeID, nodeID)
-
-	// 2. 节点别名映射 - 仅依赖 node 本身
-	for _, a := range node.Alias {
-		if a != "" {
-			cp.lookupIndex.Set(a, nodeID)
-		}
-	}
-
-	identity, idOk := cp.GetIdentity(nodeID)
-	host, hostOk := cp.GetHost(nodeID)
-
-	// 如果缺少 Host 或 Identity，部分高级映射（如 IP 映射、User@Address 映射）无法建立
-	if !idOk || !hostOk {
-		return
-	}
-
-	address := host.Address
-	port := host.Port
-	user := identity.User
-
-	// 3. IP/地址 映射
-	cp.lookupIndex.Set(address, nodeID)
-
-	// 4. User@Address 映射
-	if user != "" {
-		cp.lookupIndex.Set(fmt.Sprintf("%s@%s", user, address), nodeID)
-		cp.lookupIndex.Set(fmt.Sprintf("%s@%s:%d", user, address, port), nodeID)
-	}
-
-	// 5. 补充节点别名的高级映射（User@Alias 等）
-	if user != "" {
-		for _, a := range node.Alias {
-			if a != "" {
-				cp.lookupIndex.Set(fmt.Sprintf("%s@%s", user, a), nodeID)
-				cp.lookupIndex.Set(fmt.Sprintf("%s@%s:%d", user, a, port), nodeID)
-			}
-		}
-	}
-
-	// 6. 主机别名映射
-	for _, a := range host.Alias {
-		if a == "" {
-			continue
-		}
-		cp.lookupIndex.Set(a, nodeID)
-		if user != "" {
-			cp.lookupIndex.Set(fmt.Sprintf("%s@%s", user, a), nodeID)
-			cp.lookupIndex.Set(fmt.Sprintf("%s@%s:%d", user, a, port), nodeID)
-		}
+func newProvider(cfg *Configuration, parser *OpenSSHParser) *Provider {
+	cloned := cloneConfiguration(cfg)
+	lookup, aliases, _ := buildIndexes(cloned, false)
+	return &Provider{
+		cfg:         cloned,
+		lookupIndex: lookup,
+		aliasIndex:  aliases,
+		openSSH:     parser,
 	}
 }
 
-// Find 匹配用户输入
-func (cp Provider) Find(input string) string {
-	// 1. 直接匹配
-	if nodeID, ok := cp.lookupIndex.Get(input); ok {
-		return nodeID
+// Snapshot returns a deep copy that callers may retain and mutate freely.
+func (p *Provider) Snapshot() *Configuration {
+	if p == nil {
+		return cloneConfiguration(nil)
 	}
-	return ""
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return cloneConfiguration(p.cfg)
 }
 
-// FindAlias 检查别名是否已存在，返回该别名所属的节点ID
-// 如果别名不存在，返回空字符串
-func (cp Provider) FindAlias(alias string) string {
-	if alias == "" {
+// Find is the legacy no-error selector helper. Ambiguous selectors deliberately
+// resolve to an empty string; callers that need diagnostics must use
+// ResolveSelector.
+func (p *Provider) Find(input string) string {
+	nodeID, err := p.ResolveSelector(input)
+	if err != nil {
 		return ""
 	}
-	// 针对别名冲突检测，只检查内部 xops 节点，不检查 ssh_config 兜底节点
-	if nodeID, ok := cp.lookupIndex.Get(alias); ok {
-		return nodeID
+	return nodeID
+}
+
+func (p *Provider) ResolveSelector(input string) (string, error) {
+	if p == nil {
+		return "", nil
 	}
-	return ""
-}
-
-func (cp Provider) GetNode(nodeID string) (models.Node, bool) {
-	return cp.cfg.Nodes.Get(nodeID)
-}
-
-func (cp Provider) GetHost(nodeID string) (models.Host, bool) {
-	if node, ok := cp.cfg.Nodes.Get(nodeID); ok {
-		return cp.cfg.Hosts.Get(node.HostRef)
+	p.mu.RLock()
+	if _, ok := p.cfg.Nodes.Get(input); ok {
+		p.mu.RUnlock()
+		return input, nil
 	}
-	return models.Host{}, false
-}
+	candidates := slices.Clone(p.lookupIndex[input])
+	p.mu.RUnlock()
 
-func (cp Provider) GetIdentity(nodeID string) (models.Identity, bool) {
-	if node, ok := cp.cfg.Nodes.Get(nodeID); ok {
-		return cp.cfg.Identities.Get(node.IdentityRef)
-	}
-	return models.Identity{}, false
-}
-
-func (cp Provider) AddNode(nodeID string, node models.Node) {
-	// 先从索引中删除所有原来指向此 nodeID 的键，以防字段（如 Alias, Address 等）更新后旧映射残留
-	for _, key := range cp.lookupIndex.Keys() {
-		if val, ok := cp.lookupIndex.Get(key); ok && val == nodeID {
-			cp.lookupIndex.Remove(key)
+	switch len(candidates) {
+	case 1:
+		return candidates[0], nil
+	case 0:
+		if p.openSSH != nil && p.openSSH.cfg != nil {
+			if nodeID, ok := p.openSSH.Find(input); ok {
+				return nodeID, nil
+			}
 		}
+		return "", nil
+	default:
+		return "", &AmbiguousNodeError{Selector: input, Candidates: candidates}
 	}
-	cp.cfg.Nodes.Set(nodeID, node)
-	cp.add(nodeID)
 }
 
-func (cp Provider) AddHost(hostID string, host models.Host) {
-	cp.cfg.Hosts.Set(hostID, host)
+func (p *Provider) FindAlias(alias string) string {
+	if p == nil || alias == "" {
+		return ""
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.aliasIndex[alias]
 }
 
-func (cp Provider) AddIdentity(identityID string, identity models.Identity) {
-	cp.cfg.Identities.Set(identityID, identity)
+// Resolve returns one internally consistent, defensive-copy configuration
+// triple. OpenSSH virtual nodes remain read-only fallbacks.
+func (p *Provider) Resolve(nodeID string) (models.Node, models.Host, models.Identity, error) {
+	if p == nil {
+		return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("config provider is nil")
+	}
+	p.mu.RLock()
+	if node, ok := p.cfg.Nodes.Get(nodeID); ok {
+		host, hostOK := p.cfg.Hosts.Get(node.HostRef)
+		identity, identityOK := p.cfg.Identities.Get(node.IdentityRef)
+		p.mu.RUnlock()
+		if !hostOK {
+			return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("host ref %q for node %q: %w", node.HostRef, nodeID, ErrHostNotFound)
+		}
+		if !identityOK {
+			return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("identity ref %q for node %q: %w", node.IdentityRef, nodeID, ErrIdentityNotFound)
+		}
+		return cloneNode(node), cloneHost(host), identity, nil
+	}
+	p.mu.RUnlock()
+
+	if strings.HasPrefix(nodeID, OpenSSHNodePrefix) {
+		if p.openSSH != nil && p.openSSH.cfg != nil {
+			return p.openSSH.GetVirtualNode(strings.TrimPrefix(nodeID, OpenSSHNodePrefix))
+		}
+		return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("openssh parser not initialized for %q", nodeID)
+	}
+	return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("node %q: %w", nodeID, ErrNodeNotFound)
 }
 
-func (cp Provider) DeleteNode(nodeID string) {
-	node, ok := cp.cfg.Nodes.Get(nodeID)
+// ResolveConnection returns a read-only connection snapshot. Provider does not
+// own durable mutations, so discovery values must remain session-local.
+func (p *Provider) ResolveConnection(nodeID string) (ConnectionSnapshot, error) {
+	node, host, identity, err := p.Resolve(nodeID)
+	if err != nil {
+		return ConnectionSnapshot{}, err
+	}
+	return ConnectionSnapshot{Node: node, Host: host, Identity: identity}, nil
+}
+
+func (p *Provider) GetNode(nodeID string) (models.Node, bool) {
+	if p == nil {
+		return models.Node{}, false
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	node, ok := p.cfg.Nodes.Get(nodeID)
+	return cloneNode(node), ok
+}
+
+func (p *Provider) GetHost(nodeID string) (models.Host, bool) {
+	if p == nil {
+		return models.Host{}, false
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	node, ok := p.cfg.Nodes.Get(nodeID)
 	if !ok {
-		return
+		return models.Host{}, false
 	}
-
-	hostRef := node.HostRef
-	identityRef := node.IdentityRef
-
-	// 1. 删除节点本身
-	cp.cfg.Nodes.Remove(nodeID)
-
-	// 2. 从索引中删除
-	for _, key := range cp.lookupIndex.Keys() {
-		if val, ok := cp.lookupIndex.Get(key); ok && val == nodeID {
-			cp.lookupIndex.Remove(key)
-		}
-	}
-
-	// 3. 检查 HostRef 和 IdentityRef 是否还在被其他节点引用
-	hostUsed := false
-	identityUsed := false
-	for _, k := range cp.cfg.Nodes.Keys() {
-		if n, ok := cp.cfg.Nodes.Get(k); ok {
-			if n.HostRef == hostRef {
-				hostUsed = true
-			}
-			if n.IdentityRef == identityRef {
-				identityUsed = true
-			}
-		}
-		if hostUsed && identityUsed {
-			break
-		}
-	}
-
-	// 如果不再被引用，则清理
-	if !hostUsed && hostRef != "" {
-		cp.cfg.Hosts.Remove(hostRef)
-	}
-	if !identityUsed && identityRef != "" {
-		cp.cfg.Identities.Remove(identityRef)
-	}
+	host, ok := p.cfg.Hosts.Get(node.HostRef)
+	return cloneHost(host), ok
 }
 
-func (cp Provider) isLocalNode(nodeID string) bool {
-	if node, ok := cp.cfg.Nodes.Get(nodeID); ok {
-		if host, ok := cp.cfg.Hosts.Get(node.HostRef); ok {
-			addr := strings.ToLower(strings.TrimSpace(host.Address))
-			return addr == "127.0.0.1" || addr == "localhost" || addr == "::1"
-		}
+func (p *Provider) GetIdentity(nodeID string) (models.Identity, bool) {
+	if p == nil {
+		return models.Identity{}, false
 	}
-	return false
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	node, ok := p.cfg.Nodes.Get(nodeID)
+	if !ok {
+		return models.Identity{}, false
+	}
+	identity, ok := p.cfg.Identities.Get(node.IdentityRef)
+	return identity, ok
 }
 
-func (cp Provider) ListNodes() map[string]models.Node {
-	nodes := make(map[string]models.Node)
-	for _, k := range cp.cfg.Nodes.Keys() {
-		if cp.isLocalNode(k) {
-			continue
-		}
-		if v, ok := cp.cfg.Nodes.Get(k); ok {
-			nodes[k] = v
-		}
-	}
-	return nodes
-}
-
-func (cp Provider) GetNodesByTag(tag string) map[string]models.Node {
+func (p *Provider) ListNodes() map[string]models.Node {
 	result := make(map[string]models.Node)
-	for _, nodeID := range cp.cfg.Nodes.Keys() {
-		if cp.isLocalNode(nodeID) {
+	if p == nil {
+		return result
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, nodeID := range p.cfg.Nodes.Keys() {
+		node, ok := p.cfg.Nodes.Get(nodeID)
+		if !ok || isLocalNode(p.cfg, node) {
 			continue
 		}
-		node, _ := cp.cfg.Nodes.Get(nodeID)
-		if slices.Contains(node.Tags, tag) {
-			result[nodeID] = node
+		result[nodeID] = cloneNode(node)
+	}
+	return result
+}
+
+func (p *Provider) GetNodesByTag(tag string) map[string]models.Node {
+	result := make(map[string]models.Node)
+	if p == nil {
+		return result
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, nodeID := range p.cfg.Nodes.Keys() {
+		node, ok := p.cfg.Nodes.Get(nodeID)
+		if !ok || isLocalNode(p.cfg, node) || !slices.Contains(node.Tags, tag) {
+			continue
+		}
+		result[nodeID] = cloneNode(node)
+	}
+	return result
+}
+
+func (p *Provider) ListIdentities() map[string]models.Identity {
+	result := make(map[string]models.Identity)
+	if p == nil {
+		return result
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, identityID := range p.cfg.Identities.Keys() {
+		if identity, ok := p.cfg.Identities.Get(identityID); ok {
+			result[identityID] = identity
 		}
 	}
 	return result
 }
 
-func (cp Provider) ListIdentities() map[string]models.Identity {
-	identities := make(map[string]models.Identity)
-	for _, k := range cp.cfg.Identities.Keys() {
-		if v, ok := cp.cfg.Identities.Get(k); ok {
-			identities[k] = v
+func isLocalNode(cfg *Configuration, node models.Node) bool {
+	host, ok := cfg.Hosts.Get(node.HostRef)
+	if !ok {
+		return false
+	}
+	address := strings.ToLower(strings.TrimSpace(host.Address))
+	return address == "127.0.0.1" || address == "localhost" || address == "::1"
+}
+
+func removeNodeAndUnusedRefs(cfg *Configuration, nodeID string) {
+	node, ok := cfg.Nodes.Get(nodeID)
+	if !ok {
+		return
+	}
+	cfg.Nodes.Remove(nodeID)
+	removeUnusedRefs(cfg, node.HostRef, node.IdentityRef)
+}
+
+func removeUnusedRefs(cfg *Configuration, hostRef, identityRef string) {
+	hostUsed, identityUsed := false, false
+	for _, id := range cfg.Nodes.Keys() {
+		other, exists := cfg.Nodes.Get(id)
+		if !exists {
+			continue
+		}
+		hostUsed = hostUsed || other.HostRef == hostRef
+		identityUsed = identityUsed || other.IdentityRef == identityRef
+	}
+	if !hostUsed && hostRef != "" {
+		cfg.Hosts.Remove(hostRef)
+	}
+	if !identityUsed && identityRef != "" {
+		cfg.Identities.Remove(identityRef)
+	}
+}
+
+func buildIndexes(cfg *Configuration, rejectAliasConflicts bool) (map[string][]string, map[string]string, error) {
+	lookup := make(map[string][]string)
+	aliases := make(map[string]string)
+	for _, nodeID := range cfg.Nodes.Keys() {
+		node, ok := cfg.Nodes.Get(nodeID)
+		if !ok {
+			continue
+		}
+		for _, alias := range node.Alias {
+			if err := addAlias(lookup, aliases, alias, nodeID, rejectAliasConflicts); err != nil {
+				return nil, nil, err
+			}
+		}
+		host, hostOK := cfg.Hosts.Get(node.HostRef)
+		identity, identityOK := cfg.Identities.Get(node.IdentityRef)
+		if !hostOK || !identityOK {
+			continue
+		}
+		addLookup(lookup, host.Address, nodeID)
+		for _, alias := range host.Alias {
+			if err := addAlias(lookup, aliases, alias, nodeID, rejectAliasConflicts); err != nil {
+				return nil, nil, err
+			}
+		}
+		if identity.User == "" {
+			continue
+		}
+		for _, address := range append(slices.Clone(host.Alias), host.Address) {
+			if address == "" {
+				continue
+			}
+			addLookup(lookup, fmt.Sprintf("%s@%s", identity.User, address), nodeID)
+			addLookup(lookup, fmt.Sprintf("%s@%s:%d", identity.User, address, host.Port), nodeID)
+		}
+		for _, alias := range node.Alias {
+			if alias == "" {
+				continue
+			}
+			addLookup(lookup, fmt.Sprintf("%s@%s", identity.User, alias), nodeID)
+			addLookup(lookup, fmt.Sprintf("%s@%s:%d", identity.User, alias, host.Port), nodeID)
 		}
 	}
-	return identities
-}
-
-func (cp Provider) DeleteIdentity(name string) {
-	cp.cfg.Identities.Remove(name)
-}
-
-func (cp Provider) init() {
-	for _, nodeID := range cp.cfg.Nodes.Keys() {
-		cp.add(nodeID)
+	for key := range lookup {
+		sort.Strings(lookup[key])
 	}
+	return lookup, aliases, nil
 }
 
-func (cp Provider) GetConfig() *Configuration {
-	return cp.cfg
+func addAlias(lookup map[string][]string, aliases map[string]string, alias, nodeID string, rejectConflict bool) error {
+	if alias == "" {
+		return nil
+	}
+	if existing, ok := aliases[alias]; ok && existing != nodeID {
+		if rejectConflict {
+			return fmt.Errorf("alias %q is already assigned to node %q", alias, existing)
+		}
+		delete(aliases, alias)
+		addLookup(lookup, alias, nodeID)
+		return nil
+	}
+	aliases[alias] = nodeID
+	addLookup(lookup, alias, nodeID)
+	return nil
+}
+
+func addLookup(lookup map[string][]string, key, nodeID string) {
+	if key == "" || slices.Contains(lookup[key], nodeID) {
+		return
+	}
+	lookup[key] = append(lookup[key], nodeID)
+}
+
+func cloneConfiguration(cfg *Configuration) *Configuration {
+	cloned := &Configuration{
+		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
+		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
+		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
+	}
+	if cfg == nil {
+		return cloned
+	}
+	cloned.PasswordPromptPattern = cfg.PasswordPromptPattern
+	cloned.Guardrail = cloneGuardrail(cfg.Guardrail)
+	if cfg.Nodes != nil {
+		for _, key := range cfg.Nodes.Keys() {
+			if node, ok := cfg.Nodes.Get(key); ok {
+				cloned.Nodes.Set(key, cloneNode(node))
+			}
+		}
+	}
+	if cfg.Hosts != nil {
+		for _, key := range cfg.Hosts.Keys() {
+			if host, ok := cfg.Hosts.Get(key); ok {
+				cloned.Hosts.Set(key, cloneHost(host))
+			}
+		}
+	}
+	if cfg.Identities != nil {
+		for _, key := range cfg.Identities.Keys() {
+			if identity, ok := cfg.Identities.Get(key); ok {
+				cloned.Identities.Set(key, identity)
+			}
+		}
+	}
+	return cloned
+}
+
+func cloneNode(node models.Node) models.Node {
+	node.Alias = slices.Clone(node.Alias)
+	node.Tags = slices.Clone(node.Tags)
+	return node
+}
+
+func cloneHost(host models.Host) models.Host {
+	host.Alias = slices.Clone(host.Alias)
+	return host
+}
+
+func cloneGuardrail(cfg *GuardrailConfig) *GuardrailConfig {
+	if cfg == nil {
+		return nil
+	}
+	cloned := *cfg
+	cloned.BlockedPatterns = slices.Clone(cfg.BlockedPatterns)
+	cloned.ProtectedPaths = slices.Clone(cfg.ProtectedPaths)
+	cloned.NodeOverrides = make(map[string]NodeGuardrailCfg, len(cfg.NodeOverrides))
+	for key, value := range cfg.NodeOverrides {
+		cloned.NodeOverrides[key] = value
+	}
+	return &cloned
 }
