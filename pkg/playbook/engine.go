@@ -2,13 +2,12 @@ package playbook
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/wentf9/xops-cli/pkg/config"
-	"github.com/wentf9/xops-cli/pkg/i18n"
-	"github.com/wentf9/xops-cli/pkg/logger"
 	"github.com/wentf9/xops-cli/pkg/ssh"
 	pkgutils "github.com/wentf9/xops-cli/pkg/utils"
 )
@@ -19,16 +18,39 @@ const defaultConcurrency = uint(1)
 type Engine struct {
 	pb        *Playbook
 	provider  config.ConfigProvider
-	connector *ssh.Connector
+	listener  EventListener
+	connect   func(context.Context, string) (*ssh.Client, error)
+	runStepFn func(context.Context, *ssh.Client, Step, bool) StepResult
 }
 
-// NewEngine 创建一个执行引擎实例。
-func NewEngine(pb *Playbook, provider config.ConfigProvider, connector *ssh.Connector) *Engine {
-	return &Engine{
-		pb:        pb,
-		provider:  provider,
-		connector: connector,
+// NewEngine 创建一个执行引擎实例，支持通过 EngineOption 注入不可变组件。
+func NewEngine(pb *Playbook, provider config.ConfigProvider, connector *ssh.Connector, opts ...EngineOption) *Engine {
+	e := &Engine{
+		pb:       pb,
+		provider: provider,
+		listener: NopEventListener,
 	}
+	if connector == nil {
+		e.connect = func(context.Context, string) (*ssh.Client, error) {
+			return nil, errors.New("playbook connector is nil")
+		}
+	} else {
+		e.connect = connector.Connect
+	}
+	e.runStepFn = e.runStep
+	for _, opt := range opts {
+		if opt != nil {
+			opt(e)
+		}
+	}
+	return e
+}
+
+func (e *Engine) getListener() EventListener {
+	if e != nil && e.listener != nil {
+		return e.listener
+	}
+	return NopEventListener
 }
 
 // Run 执行 Playbook，返回完整的执行报告。
@@ -38,10 +60,10 @@ func (e *Engine) Run(ctx context.Context) (*Report, error) {
 		return nil, err
 	}
 	if len(nodeIDs) == 0 {
-		return nil, fmt.Errorf("%s", i18n.T("play_err_no_targets"))
+		return nil, ErrNoTargets
 	}
 
-	logger.Info(i18n.Tf("play_target_resolved", map[string]any{"Count": len(nodeIDs)}))
+	e.getListener().OnTargetsResolved(len(nodeIDs))
 
 	report := &Report{
 		PlaybookName: e.pb.Name,
@@ -88,6 +110,12 @@ func (e *Engine) Run(ctx context.Context) (*Report, error) {
 
 	report.Hosts = reports
 	report.EndTime = time.Now()
+	if err := ctx.Err(); err != nil {
+		return report, fmt.Errorf("playbook execution canceled: %w", err)
+	}
+	if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+		return report, fmt.Errorf("playbook execution timed out: %w", runCtx.Err())
+	}
 	return report, nil
 }
 
@@ -107,7 +135,7 @@ func (e *Engine) resolveTargets() ([]string, error) {
 	for _, tag := range e.pb.Targets.Tags {
 		nodes := e.provider.GetNodesByTag(tag)
 		if len(nodes) == 0 {
-			logger.Warn(i18n.Tf("play_warn_tag_empty", map[string]any{"Tag": tag}))
+			e.getListener().OnTagEmpty(tag)
 			continue
 		}
 		for id := range nodes {
@@ -117,18 +145,24 @@ func (e *Engine) resolveTargets() ([]string, error) {
 
 	// 按节点名精确匹配
 	for _, name := range e.pb.Targets.Nodes {
-		id := e.provider.Find(name)
+		id, err := e.provider.ResolveSelector(name)
+		if err != nil {
+			return nil, fmt.Errorf("resolve playbook node target %q failed: %w", name, err)
+		}
 		if id == "" {
-			return nil, fmt.Errorf("%s", i18n.Tf("play_err_node_not_found", map[string]any{"Node": name}))
+			return nil, &TargetNotFoundError{Target: name}
 		}
 		addNode(id)
 	}
 
 	// 按主机地址/IP 匹配（临时即席主机，不要求在配置中存在）
 	for _, h := range e.pb.Targets.Hosts {
-		id := e.provider.Find(h)
+		id, err := e.provider.ResolveSelector(h)
+		if err != nil {
+			return nil, fmt.Errorf("resolve playbook host target %q failed: %w", h, err)
+		}
 		if id == "" {
-			return nil, fmt.Errorf("%s", i18n.Tf("play_err_node_not_found", map[string]any{"Node": h}))
+			return nil, &TargetNotFoundError{Target: h}
 		}
 		addNode(id)
 	}
@@ -139,25 +173,47 @@ func (e *Engine) resolveTargets() ([]string, error) {
 // runOnHost 在单台主机上顺序执行所有步骤。
 // cancel 用于 abort_all 策略时通知其他 goroutine。
 func (e *Engine) runOnHost(ctx context.Context, nodeID string, cancel context.CancelFunc, onError OnError) HostReport {
-	hostObj, _ := e.provider.GetHost(nodeID)
-	hostAddr := hostObj.Address
-
 	hr := HostReport{
 		NodeID: nodeID,
-		Host:   hostAddr,
 	}
 	start := time.Now()
-
-	client, err := e.connector.Connect(ctx, nodeID)
-	if err != nil {
-		logger.Error(i18n.Tf("play_connect_failed", map[string]any{"Host": hostAddr, "Error": err}))
+	_, hostObj, _, resolveErr := e.provider.Resolve(nodeID)
+	if resolveErr != nil {
 		hr.Status = HostStatusFailed
-		hr.Steps = append(hr.Steps, StepResult{
+		resolveStep := StepResult{
+			StepName: "<resolve>",
+			Status:   StatusFailed,
+			Err:      fmt.Errorf("resolve playbook target %q failed: %w", nodeID, resolveErr),
+		}
+		hr.Steps = append(hr.Steps, resolveStep)
+		hr.Duration = time.Since(start)
+		e.getListener().OnStepResult(nodeID, "<resolve>", resolveStep)
+		if onError == OnErrorAbortAll {
+			cancel()
+		}
+		return hr
+	}
+	hostAddr := hostObj.Address
+	hr.Host = hostAddr
+
+	client, err := e.connect(ctx, nodeID)
+	if err != nil {
+		if ctx.Err() != nil {
+			hr.Status = HostStatusAborted
+		} else {
+			hr.Status = HostStatusFailed
+			if onError == OnErrorAbortAll {
+				cancel()
+			}
+		}
+		connectStep := StepResult{
 			StepName: "<connect>",
 			Status:   StatusFailed,
 			Err:      err,
-		})
+		}
+		hr.Steps = append(hr.Steps, connectStep)
 		hr.Duration = time.Since(start)
+		e.getListener().OnStepResult(hostAddr, "<connect>", connectStep)
 		return hr
 	}
 
@@ -171,33 +227,32 @@ func (e *Engine) runOnHost(ctx context.Context, nodeID string, cancel context.Ca
 			break
 		}
 
-		logger.Info(i18n.Tf("play_step_running", map[string]any{
-			"Host": hostAddr,
-			"Step": step.Name,
-		}))
+		e.getListener().OnStepRunning(hostAddr, step.Name)
 
-		result := e.runStep(ctx, client, step, globalSudo)
+		result := e.runStepFn(ctx, client, step, globalSudo)
 		hr.Steps = append(hr.Steps, result)
 
-		// 打印步骤结果
-		e.printStepResult(hostAddr, step.Name, result)
+		// 触发步骤结果回调
+		e.getListener().OnStepResult(hostAddr, step.Name, result)
 
 		// 处理失败
 		if result.Status == StatusFailed {
 			if step.IgnoreError {
-				// 步骤级别忽略，继续
+				// 步骤级别显式忽略，继续且不污染主机成功状态
 				continue
 			}
 
+			// 任何非 IgnoreError 的失败步骤都必须将主机标记为 HostStatusFailed
+			hr.Status = HostStatusFailed
+
 			switch onError {
 			case OnErrorContinue:
-				// 继续下一步
+				// 继续执行后续步骤
+				continue
 			case OnErrorAbortAll:
-				hr.Status = HostStatusFailed
 				cancel() // 通知所有其他 goroutine 停止
 				return hr
 			default: // OnErrorStop
-				hr.Status = HostStatusFailed
 				hr.Duration = time.Since(start)
 				return hr
 			}
@@ -206,22 +261,4 @@ func (e *Engine) runOnHost(ctx context.Context, nodeID string, cancel context.Ca
 
 	hr.Duration = time.Since(start)
 	return hr
-}
-
-// printStepResult 根据步骤状态打印格式化日志。
-func (e *Engine) printStepResult(host, stepName string, r StepResult) {
-	switch r.Status {
-	case StatusOK, StatusChanged:
-		logger.PrintSuccess(i18n.Tf("play_step_ok", map[string]any{
-			"Host": host, "Step": stepName,
-		}))
-	case StatusSkipped:
-		logger.Info(i18n.Tf("play_step_skipped", map[string]any{
-			"Host": host, "Step": stepName,
-		}))
-	case StatusFailed:
-		logger.PrintError(i18n.Tf("play_step_failed", map[string]any{
-			"Host": host, "Step": stepName, "Error": r.Err,
-		}))
-	}
 }

@@ -20,12 +20,14 @@ import (
 )
 
 type nodeItem struct {
-	id       string
-	name     string
-	address  string
-	user     string
-	tags     string
-	selected bool
+	id         string
+	ref        config.NodeRef
+	name       string
+	address    string
+	user       string
+	tags       string
+	resolveErr error
+	selected   bool
 }
 
 // Title 只返回纯文本，样式的上色逻辑全部交给 Delegate 处理，以防止乱码。
@@ -37,6 +39,9 @@ func (i *nodeItem) Title() string {
 }
 
 func (i *nodeItem) Description() string {
+	if i.resolveErr != nil {
+		return fmt.Sprintf("invalid configuration: %v", i.resolveErr)
+	}
 	return fmt.Sprintf("%s@%s - [%s]", i.user, i.address, i.tags)
 }
 
@@ -102,8 +107,7 @@ func newListModel(provider config.ConfigProvider) list.Model {
 	var items []list.Item
 
 	for id, node := range nodes {
-		identity, _ := provider.GetIdentity(id)
-		host, _ := provider.GetHost(id)
+		_, host, identity, resolveErr := provider.Resolve(id)
 
 		name := id
 		if len(node.Alias) > 0 {
@@ -111,11 +115,12 @@ func newListModel(provider config.ConfigProvider) list.Model {
 		}
 
 		items = append(items, &nodeItem{
-			id:      id,
-			name:    name,
-			address: host.Address,
-			user:    identity.User,
-			tags:    strings.Join(node.Tags, ","),
+			id:         id,
+			name:       name,
+			address:    host.Address,
+			user:       identity.User,
+			tags:       strings.Join(node.Tags, ","),
+			resolveErr: resolveErr,
 		})
 	}
 
@@ -180,6 +185,18 @@ func newListModel(provider config.ConfigProvider) list.Model {
 	return l
 }
 
+// newListModelFromView builds both visible items and their revision from one
+// Repository view, so destructive actions validate precisely what was shown.
+func newListModelFromView(view config.ConfigView) list.Model {
+	model := newListModel(config.NewProviderWithoutOpenSSH(view.Configuration))
+	for _, item := range model.Items() {
+		if node, ok := item.(*nodeItem); ok {
+			node.ref = view.NodeRefs[node.id]
+		}
+	}
+	return model
+}
+
 func (m *Model) updateList(msg tea.Msg) (Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -188,7 +205,7 @@ func (m *Model) updateList(msg tea.Msg) (Model, tea.Cmd) {
 		if m.status != "" {
 			v += 3
 		}
-		m.list.SetSize(msg.Width-h, msg.Height-v)
+		m.list.SetSize(max(msg.Width-h, 1), max(msg.Height-v, 1))
 		return *m, nil
 
 	case tea.KeyMsg:
@@ -201,6 +218,9 @@ func (m *Model) updateList(msg tea.Msg) (Model, tea.Cmd) {
 }
 
 func (m *Model) handleKeyMsg(msg tea.KeyMsg) (Model, tea.Cmd) {
+	if m.mutationPending {
+		return *m, nil
+	}
 	if m.list.SettingFilter() {
 		var cmd tea.Cmd
 		m.list, cmd = m.list.Update(msg)
@@ -353,39 +373,36 @@ func (m *Model) handleDelete() (Model, tea.Cmd) {
 		}
 	}
 
-	var toDelete []string
+	var toDelete []config.NodeRef
 	all := m.list.Items()
 	for _, i := range all {
 		if ni, ok := i.(*nodeItem); ok && ni.selected && visibleMap[ni.id] {
-			toDelete = append(toDelete, ni.id)
+			toDelete = append(toDelete, ni.ref)
 		}
 	}
 
 	// 如果没有批量选中的，则删除当前悬停的这一项
 	if len(toDelete) == 0 {
 		if sel, ok := m.list.SelectedItem().(*nodeItem); ok {
-			toDelete = append(toDelete, sel.id)
+			toDelete = append(toDelete, sel.ref)
 		}
 	}
 
 	if len(toDelete) > 0 {
-		for _, id := range toDelete {
-			m.provider.DeleteNode(id)
-		}
-		_ = m.configStore.Save(m.provider.GetConfig())
-		// 设置状态消息
-		m.status = successStyle.Render(i18n.Tf("tui_status_deleted", map[string]any{"Count": len(toDelete)}))
-		// 刷新列表模型
-		m.list = newListModel(m.provider)
-		*m, _ = m.updateList(m.lastSize)
+		repository := m.repository
+		return *m, m.beginConfigurationMutation(configurationMutationDelete, "", len(toDelete), func(ctx context.Context) error {
+			return repository.DeleteNodesAtRefsContext(ctx, toDelete)
+		})
 	}
 	return *m, nil
 }
 
 func (m *Model) handleNew() (Model, tea.Cmd) {
 	var cmd tea.Cmd
-	*m, cmd = m.initForm("")
 	m.state = viewForm
+	m.formState = nil
+	m.formConflict = false
+	*m, cmd = m.initForm("")
 	return *m, cmd
 }
 
@@ -394,8 +411,10 @@ func (m *Model) handleEdit() (Model, tea.Cmd) {
 	if selected != nil {
 		nodeID := selected.(*nodeItem).id
 		var cmd tea.Cmd
-		*m, cmd = m.initForm(nodeID)
 		m.state = viewForm
+		m.formState = nil
+		m.formConflict = false
+		*m, cmd = m.initForm(nodeID)
 		return *m, cmd
 	}
 	return *m, nil
@@ -416,7 +435,7 @@ func (m *Model) handleMonitor() (Model, tea.Cmd) {
 	m.status = i18n.Tf("tui_monitor_connecting", map[string]any{"Node": nodeID})
 
 	return *m, func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		ctx, cancel := context.WithTimeout(m.ctx, 20*time.Second)
 		defer cancel()
 		client, err := m.connector.Connect(ctx, nodeID)
 		return monitorConnectedMsg{nodeID: nodeID, client: client, err: err}
@@ -432,7 +451,7 @@ func (m *Model) handleLogSelect() (Model, tea.Cmd) {
 	m.status = i18n.Tf("tui_log_connecting", map[string]any{"Node": nodeID})
 
 	return *m, func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		ctx, cancel := context.WithTimeout(m.ctx, 20*time.Second)
 		defer cancel()
 		client, err := m.connector.Connect(ctx, nodeID)
 		return logScannerConnectedMsg{nodeID: nodeID, client: client, err: err}

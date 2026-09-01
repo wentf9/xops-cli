@@ -15,13 +15,23 @@ import (
 	"github.com/wentf9/xops-cli/pkg/ssh"
 )
 
-type logLineMsg string
-type logStreamClosedMsg struct{ err error }
+type logLineMsg struct {
+	sessionID int64
+	line      string
+}
+type logStreamClosedMsg struct {
+	sessionID int64
+	err       error
+}
 type logStreamSessionMsg struct {
-	reader io.ReadCloser
+	sessionID int64
+	reader    io.ReadCloser
 }
 
 type logStreamerModel struct {
+	ctx       context.Context
+	cancel    context.CancelFunc
+	sessionID int64
 	file      string
 	client    *ssh.Client
 	reader    io.ReadCloser
@@ -41,13 +51,17 @@ type logStreamerModel struct {
 	err    error
 }
 
-func newLogStreamerModel(client *ssh.Client, file string, size tea.WindowSizeMsg) logStreamerModel {
+func newLogStreamerModel(ctx context.Context, sessionID int64, client *ssh.Client, file string, size tea.WindowSizeMsg) logStreamerModel {
 	ti := textinput.New()
 	ti.Placeholder = i18n.T("tui_log_search_prompt")
 
 	vp := viewport.New(size.Width, size.Height-3)
 
+	streamCtx, cancel := context.WithCancel(ctx)
 	return logStreamerModel{
+		ctx:       streamCtx,
+		cancel:    cancel,
+		sessionID: sessionID,
 		file:      file,
 		client:    client,
 		viewport:  vp,
@@ -75,34 +89,66 @@ func (m *logStreamerModel) startStream() tea.Cmd {
 			cmd = fmt.Sprintf("docker logs --tail 100 -f %s", container)
 		}
 
-		stdout, err := m.client.RunStream(context.Background(), cmd)
+		stdout, err := m.client.RunStream(m.ctx, cmd)
 		if err != nil {
-			return logStreamClosedMsg{err: err}
+			return logStreamClosedMsg{sessionID: m.sessionID, err: err}
 		}
 
 		go func() {
 			scanner := bufio.NewScanner(stdout)
 			for scanner.Scan() {
-				m.lineChan <- scanner.Text()
+				select {
+				case m.lineChan <- scanner.Text():
+				case <-m.ctx.Done():
+					return
+				}
 			}
 			if err := scanner.Err(); err != nil {
-				m.lineChan <- fmt.Sprintf("error scanning log stream: %v", err)
+				select {
+				case m.lineChan <- fmt.Sprintf("error scanning log stream: %v", err):
+				case <-m.ctx.Done():
+					return
+				}
 			}
-			m.lineChan <- "\x04EOF\x04"
+			select {
+			case m.lineChan <- "\x04EOF\x04":
+			case <-m.ctx.Done():
+			}
 		}()
 
-		return logStreamSessionMsg{reader: stdout}
+		return logStreamSessionMsg{sessionID: m.sessionID, reader: stdout}
 	}
 }
 
 func (m logStreamerModel) waitForLine() tea.Cmd {
 	return func() tea.Msg {
-		line := <-m.lineChan
-		if line == "\x04EOF\x04" {
-			return logStreamClosedMsg{err: nil}
+		var line string
+		select {
+		case line = <-m.lineChan:
+		case <-m.ctx.Done():
+			return logStreamClosedMsg{sessionID: m.sessionID, err: m.ctx.Err()}
 		}
-		return logLineMsg(line)
+		if line == "\x04EOF\x04" {
+			return logStreamClosedMsg{sessionID: m.sessionID}
+		}
+		return logLineMsg{sessionID: m.sessionID, line: line}
 	}
+}
+
+func (m *logStreamerModel) Close() error {
+	if m.cancel != nil {
+		m.cancel()
+		m.cancel = nil
+	}
+	if m.reader == nil {
+		return nil
+	}
+	reader := m.reader
+	m.reader = nil
+	if err := reader.Close(); err != nil {
+		return fmt.Errorf("close log stream failed: %w", err)
+	}
+	return nil
 }
 
 func (m logStreamerModel) Update(msg tea.Msg) (logStreamerModel, tea.Cmd) {
@@ -118,19 +164,26 @@ func (m logStreamerModel) Update(msg tea.Msg) (logStreamerModel, tea.Cmd) {
 		m.updateViewportContent()
 
 	case logStreamSessionMsg:
-		m.reader = msg.reader
+		if msg.sessionID == m.sessionID {
+			m.reader = msg.reader
+		}
 
 	case logLineMsg:
+		if msg.sessionID != m.sessionID {
+			return m, nil
+		}
 		if len(m.lines) >= m.maxLines {
 			m.lines = m.lines[1:]
 		}
-		m.lines = append(m.lines, string(msg))
+		m.lines = append(m.lines, msg.line)
 		m.updateViewportContent()
 		m.viewport.GotoBottom()
 		cmds = append(cmds, m.waitForLine())
 
 	case logStreamClosedMsg:
-		m.err = msg.err
+		if msg.sessionID == m.sessionID {
+			m.err = msg.err
+		}
 
 	case tea.KeyMsg:
 		if m.isSearching {
@@ -154,8 +207,8 @@ func (m logStreamerModel) Update(msg tea.Msg) (logStreamerModel, tea.Cmd) {
 
 		switch msg.String() {
 		case "esc", "q":
-			if m.reader != nil {
-				_ = m.reader.Close()
+			if err := m.Close(); err != nil {
+				m.err = err
 			}
 			// Let parent handle it to return
 		case "/":

@@ -524,7 +524,9 @@ init_config_path:
 init_key_path:
   other: "Encryption key: {{.Path}}"
 init_import_summary:
-  other: "OpenSSH hosts: imported {{.Imported}}, skipped existing {{.Skipped}}"
+  other: "OpenSSH hosts: imported {{.Imported}}, skipped {{.Skipped}}"
+init_import_issue:
+  other: "Skipped OpenSSH host {{.Name}}: {{.Error}}"
 init_next_steps:
   other: "Next: run 'xops host list' to view hosts, or 'xops host add --help' to add one"
 
@@ -601,6 +603,18 @@ tui_status_saved:
   other: "Node '{{.ID}}' saved"
 tui_status_save_failed:
   other: "Failed to save: {{.Error}}"
+tui_status_saving:
+  other: "Saving configuration..."
+tui_status_not_durable:
+  other: "Configuration was applied but is not durable: {{.Error}}"
+tui_status_conflict:
+  other: "Configuration changed concurrently; press r to reload before saving: {{.Error}}"
+tui_status_conflict_reload:
+  other: "Configuration changed concurrently; press r to reload before saving"
+tui_status_update_canceled:
+  other: "Configuration update canceled: {{.Error}}"
+tui_status_update_failed:
+  other: "Configuration update failed: {{.Error}}"
 tui_help_space:
   other: "select"
 tui_help_all:
@@ -907,7 +921,7 @@ play_step_changed:
 play_step_skipped:
   other: "[{{.Host}}] ⏭️  {{.Step}} (already satisfied, skipped)"
 play_step_failed:
-  other: "[{{.Host}}] ❌ {{.Step}}: {{.Error}}"
+  other: "[{{.Host}}] ❌ {{.Step}} failed"
 play_dry_run:
   other: "Dry Run mode — preview only, no execution"
 play_connect_failed:

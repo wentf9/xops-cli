@@ -146,6 +146,46 @@ func TestPolicyEvaluate_CustomBlockedPattern(t *testing.T) {
 	}
 }
 
+func TestValidateConfig(t *testing.T) {
+	validCfg := defaultTestConfig()
+	validCfg.BlockedPatterns = []string{"*.sh", "rm *"}
+	validCfg.NodeOverrides = map[string]config.NodeGuardrailCfg{
+		"prod-*": {ApprovalThreshold: "dangerous"},
+	}
+	if err := ValidateConfig(validCfg); err != nil {
+		t.Errorf("expected valid config to pass, got: %v", err)
+	}
+
+	invalidPatternCfg := defaultTestConfig()
+	invalidPatternCfg.BlockedPatterns = []string{"["}
+	if err := ValidateConfig(invalidPatternCfg); err == nil {
+		t.Error("expected error for invalid glob '[', got nil")
+	}
+
+	invalidNodeCfg := defaultTestConfig()
+	invalidNodeCfg.NodeOverrides = map[string]config.NodeGuardrailCfg{
+		"[": {ApprovalThreshold: "dangerous"},
+	}
+	if err := ValidateConfig(invalidNodeCfg); err == nil {
+		t.Error("expected error for invalid node override glob '[', got nil")
+	}
+}
+
+func TestPolicyEvaluate_MalformedPattern_FailClosed(t *testing.T) {
+	cfg := defaultTestConfig()
+	cfg.BlockedPatterns = []string{"["}
+	p := NewPolicy(cfg)
+
+	got := p.Evaluate(Safe, RiskInput{
+		ToolName: "xops_ssh_run",
+		Command:  "echo safe",
+		NodeID:   "test",
+	})
+	if got != Deny {
+		t.Errorf("malformed glob pattern in blocked list should fail-closed to Deny, got %v", got)
+	}
+}
+
 func TestClassify(t *testing.T) {
 	tests := []struct {
 		name  string

@@ -2,7 +2,7 @@ package playbook_test
 
 import (
 	"context"
-	"strings"
+	"errors"
 	"testing"
 	"time"
 
@@ -46,7 +46,7 @@ func createTestProvider() config.ConfigProvider {
 		Tags:        []string{"db", "prod"},
 	})
 
-	return config.NewProvider(cfg)
+	return config.NewProviderWithoutOpenSSH(cfg)
 }
 
 func TestEngine_ResolveTargets(t *testing.T) {
@@ -122,8 +122,8 @@ func TestEngine_ResolveTargets(t *testing.T) {
 				// 如果 err 不是 nil，但我们预期没有解析错误，
 				// 我们需要确保 err 不是解析错误，而是连接错误。
 				// 在 resolveTargets 成功后，如果 len(nodeIDs) > 0 且 connector 连不上，会返回包含 Hosts 报告的 report，err 为 nil。
-				// 如果 len(nodeIDs) == 0，Run 会返回 play_err_no_targets 错误。
-				if strings.Contains(err.Error(), "no targets") {
+				// 如果 len(nodeIDs) == 0，Run 会返回 playbook.ErrNoTargets 错误。
+				if errors.Is(err, playbook.ErrNoTargets) {
 					t.Fatalf("resolveTargets resolved 0 nodes: %v", err)
 				}
 			}
@@ -191,8 +191,8 @@ func TestEngine_Timeout(t *testing.T) {
 
 	// 运行，由于超时极短，context 应该在执行中被超时取消
 	report, err := engine.Run(context.Background())
-	if err != nil {
-		t.Fatalf("Run returned error: %v", err)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run error = %v, want context.DeadlineExceeded", err)
 	}
 
 	if len(report.Hosts) != 1 {
@@ -246,5 +246,69 @@ func TestEngine_OnErrorAbortAll(t *testing.T) {
 	// 至少有一个节点是 failed，且应该有至少一个节点被 aborted 或者是 failed。
 	if failedCount == 0 {
 		t.Error("expected at least one failed host connection")
+	}
+}
+
+type testEventListener struct {
+	onTargetsResolvedCalled bool
+	stepResults             []playbook.StepResult
+	hosts                   []string
+}
+
+func (l *testEventListener) OnTargetsResolved(count int) {
+	l.onTargetsResolvedCalled = true
+}
+
+func (l *testEventListener) OnTagEmpty(tag string) {}
+
+func (l *testEventListener) OnStepRunning(host, stepName string) {}
+
+func (l *testEventListener) OnStepResult(host string, stepName string, result playbook.StepResult) {
+	l.hosts = append(l.hosts, host)
+	l.stepResults = append(l.stepResults, result)
+}
+
+func TestEngine_ConnectFailure_TriggersEventListener(t *testing.T) {
+	provider := createTestProvider()
+	pb := &playbook.Playbook{
+		Name: "test-connect-failure",
+		Targets: playbook.Targets{
+			Nodes: []string{"web-1"},
+		},
+		Steps: []playbook.Step{
+			{Name: "step-1", Shell: "echo ok"},
+		},
+	}
+
+	listener := &testEventListener{}
+	connector := adapter.NewConnector(provider)
+	engine := playbook.NewEngine(pb, provider, connector, playbook.WithEventListener(listener))
+
+	report, err := engine.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run returned unexpected error: %v", err)
+	}
+
+	if !listener.onTargetsResolvedCalled {
+		t.Error("expected OnTargetsResolved to be called")
+	}
+
+	if len(listener.stepResults) != 1 {
+		t.Fatalf("expected 1 step result event, got %d", len(listener.stepResults))
+	}
+
+	res := listener.stepResults[0]
+	if res.StepName != "<connect>" {
+		t.Errorf("expected step name '<connect>', got %q", res.StepName)
+	}
+	if res.Status != playbook.StatusFailed {
+		t.Errorf("expected status Failed, got %v", res.Status)
+	}
+	if res.Err == nil {
+		t.Error("expected non-nil error in StepResult for connect failure")
+	}
+
+	if len(report.Hosts) != 1 || report.Hosts[0].Status != playbook.HostStatusFailed {
+		t.Errorf("expected host report status to be Failed")
 	}
 }

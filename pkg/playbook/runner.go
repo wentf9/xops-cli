@@ -3,12 +3,14 @@ package playbook
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
 	"text/template"
 	"time"
 
+	pkgsftp "github.com/pkg/sftp"
 	"github.com/wentf9/xops-cli/pkg/sftp"
 	"github.com/wentf9/xops-cli/pkg/ssh"
 )
@@ -117,15 +119,19 @@ func (e *Engine) runScript(ctx context.Context, client *ssh.Client, scriptPath s
 }
 
 // runCopy 将本地文件上传到远程主机。
-func (e *Engine) runCopy(ctx context.Context, client *ssh.Client, spec *CopySpec) StepResult {
-	sftpCli, err := sftp.NewClient(client, sftp.WithForce(true))
+func (e *Engine) runCopy(ctx context.Context, client *ssh.Client, spec *CopySpec) (result StepResult) {
+	sftpCli, err := sftp.NewClient(ctx, client, sftp.WithForce(true))
 	if err != nil {
 		return StepResult{
 			Status: StatusFailed,
 			Err:    fmt.Errorf("create sftp client: %w", err),
 		}
 	}
-	defer func() { _ = sftpCli.Close() }()
+	defer func() {
+		if closeErr := sftpCli.Close(); closeErr != nil {
+			result = failStepResult(result, fmt.Errorf("close sftp client: %w", closeErr))
+		}
+	}()
 
 	if err := sftpCli.Upload(ctx, spec.Src, spec.Dest, nil); err != nil {
 		return StepResult{
@@ -136,7 +142,7 @@ func (e *Engine) runCopy(ctx context.Context, client *ssh.Client, spec *CopySpec
 
 	// 如果指定了文件权限，chmod 远程文件
 	if spec.Mode != "" {
-		if err := applyRemoteMode(sftpCli, spec.Dest, spec.Mode); err != nil {
+		if err := applyRemoteMode(ctx, sftpCli, spec.Dest, spec.Mode); err != nil {
 			return StepResult{
 				Status: StatusFailed,
 				Err:    fmt.Errorf("chmod %q: %w", spec.Dest, err),
@@ -148,12 +154,14 @@ func (e *Engine) runCopy(ctx context.Context, client *ssh.Client, spec *CopySpec
 }
 
 // applyRemoteMode 对远程文件设置权限。
-func applyRemoteMode(c *sftp.Client, remotePath, mode string) error {
+func applyRemoteMode(ctx context.Context, c *sftp.Client, remotePath, mode string) error {
 	perm, err := strconv.ParseUint(mode, 8, 32)
 	if err != nil {
 		return fmt.Errorf("invalid mode %q: %w", mode, err)
 	}
-	return c.SFTPClient().Chmod(remotePath, os.FileMode(perm))
+	return c.Do(ctx, func(client *pkgsftp.Client) error {
+		return client.Chmod(remotePath, os.FileMode(perm))
+	})
 }
 
 // runEnsure 执行幂等性状态收敛：先 check，不满足时执行 action，再验证。
@@ -211,7 +219,7 @@ func (e *Engine) runEnsure(ctx context.Context, client *ssh.Client, spec *Ensure
 }
 
 // runTemplate 将本地 Go 模板文件渲染后上传到远程主机。
-func (e *Engine) runTemplate(ctx context.Context, client *ssh.Client, spec *CopySpec, _ bool) StepResult {
+func (e *Engine) runTemplate(ctx context.Context, client *ssh.Client, spec *CopySpec, _ bool) (result StepResult) {
 	srcData, err := os.ReadFile(spec.Src)
 	if err != nil {
 		return StepResult{
@@ -244,9 +252,16 @@ func (e *Engine) runTemplate(ctx context.Context, client *ssh.Client, spec *Copy
 			Err:    fmt.Errorf("create temp file: %w", err),
 		}
 	}
+	tmpFileOpen := true
 	defer func() {
-		_ = tmpFile.Close()
-		_ = os.Remove(tmpFile.Name())
+		if tmpFileOpen {
+			if closeErr := tmpFile.Close(); closeErr != nil {
+				result = failStepResult(result, fmt.Errorf("close temp file: %w", closeErr))
+			}
+		}
+		if removeErr := os.Remove(tmpFile.Name()); removeErr != nil {
+			result = failStepResult(result, fmt.Errorf("remove temp file: %w", removeErr))
+		}
 	}()
 
 	if _, err := tmpFile.Write(buf.Bytes()); err != nil {
@@ -255,7 +270,14 @@ func (e *Engine) runTemplate(ctx context.Context, client *ssh.Client, spec *Copy
 			Err:    fmt.Errorf("write temp file: %w", err),
 		}
 	}
-	_ = tmpFile.Close()
+	if err := tmpFile.Close(); err != nil {
+		tmpFileOpen = false
+		return StepResult{
+			Status: StatusFailed,
+			Err:    fmt.Errorf("close temp file: %w", err),
+		}
+	}
+	tmpFileOpen = false
 
 	// 复用 runCopy 完成上传
 	return e.runCopy(ctx, client, &CopySpec{
@@ -263,4 +285,13 @@ func (e *Engine) runTemplate(ctx context.Context, client *ssh.Client, spec *Copy
 		Dest: spec.Dest,
 		Mode: spec.Mode,
 	})
+}
+
+func failStepResult(result StepResult, err error) StepResult {
+	if err == nil {
+		return result
+	}
+	result.Status = StatusFailed
+	result.Err = errors.Join(result.Err, err)
+	return result
 }

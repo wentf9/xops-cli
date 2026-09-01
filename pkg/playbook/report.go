@@ -2,6 +2,8 @@ package playbook
 
 import (
 	"fmt"
+	"io"
+	"os"
 	"strings"
 	"time"
 )
@@ -77,14 +79,24 @@ func (r *Report) Duration() time.Duration {
 	return r.EndTime.Sub(r.StartTime)
 }
 
-// Print 将格式化的执行报告输出到 stdout。
-func (r *Report) Print() {
+// RenderTo writes the formatted execution report to w.
+func (r *Report) RenderTo(w io.Writer) error {
 	separator := strings.Repeat("═", 60)
-	fmt.Println()
-	fmt.Println(separator)
-	fmt.Printf("PLAYBOOK RECAP — %s\n", r.PlaybookName)
-	fmt.Println(separator)
-	fmt.Println()
+	if _, err := fmt.Fprintln(w); err != nil {
+		return fmt.Errorf("write report spacing failed: %w", err)
+	}
+	if _, err := fmt.Fprintln(w, separator); err != nil {
+		return fmt.Errorf("write report separator failed: %w", err)
+	}
+	if _, err := fmt.Fprintf(w, "PLAYBOOK RECAP — %s\n", r.PlaybookName); err != nil {
+		return fmt.Errorf("write report title failed: %w", err)
+	}
+	if _, err := fmt.Fprintln(w, separator); err != nil {
+		return fmt.Errorf("write report separator failed: %w", err)
+	}
+	if _, err := fmt.Fprintln(w); err != nil {
+		return fmt.Errorf("write report spacing failed: %w", err)
+	}
 
 	var successCount, failedCount int
 	for _, h := range r.Hosts {
@@ -96,15 +108,29 @@ func (r *Report) Print() {
 		} else {
 			successCount++
 		}
-		fmt.Printf("  %-30s ok=%-3d changed=%-3d skipped=%-3d failed=%-3d %s\n",
-			h.Host, ok, changed, skipped, failed, statusIcon)
+		if _, err := fmt.Fprintf(w, "  %-30s ok=%-3d changed=%-3d skipped=%-3d failed=%-3d %s\n",
+			h.Host, ok, changed, skipped, failed, statusIcon); err != nil {
+			return fmt.Errorf("write host report failed: %w", err)
+		}
 	}
 
-	fmt.Println()
+	if _, err := fmt.Fprintln(w); err != nil {
+		return fmt.Errorf("write report spacing failed: %w", err)
+	}
 	total := len(r.Hosts)
-	fmt.Printf("Duration: %-10s | Hosts: %-4d | Success: %-4d | Failed: %d\n",
+	if _, err := fmt.Fprintf(w, "Duration: %-10s | Hosts: %-4d | Success: %-4d | Failed: %d\n",
 		r.Duration().Round(time.Millisecond),
 		total, successCount, failedCount,
-	)
-	fmt.Println(separator)
+	); err != nil {
+		return fmt.Errorf("write report summary failed: %w", err)
+	}
+	if _, err := fmt.Fprintln(w, separator); err != nil {
+		return fmt.Errorf("write report separator failed: %w", err)
+	}
+	return nil
+}
+
+// Print writes the report to stdout.
+func (r *Report) Print() error {
+	return r.RenderTo(os.Stdout)
 }

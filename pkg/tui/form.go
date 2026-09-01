@@ -1,22 +1,27 @@
 package tui
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
-	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/models"
+	fileutil "github.com/wentf9/xops-cli/pkg/utils/file"
 )
 
 type nodeFormState struct {
 	isEdit     bool
 	originalID string
+	revision   uint64
+	ref        config.NodeRef
 
 	alias      string
 	user       string
@@ -31,8 +36,17 @@ type nodeFormState struct {
 }
 
 func (m *Model) initForm(nodeID string) (Model, tea.Cmd) {
-	state := m.newNodeFormState(nodeID)
-	m.formState = state
+	state := m.formState
+	if state == nil {
+		var err error
+		state, err = m.newNodeFormState(nodeID)
+		if err != nil {
+			m.status = errorStyle.Render(err.Error())
+			m.state = viewList
+			return *m, nil
+		}
+		m.formState = state
+	}
 
 	// 自定义快捷键以支持 Up/Down 切换
 	km := huh.NewDefaultKeyMap()
@@ -141,22 +155,34 @@ func (m *Model) initForm(nodeID string) (Model, tea.Cmd) {
 	return *m, cmd
 }
 
-func (m *Model) newNodeFormState(nodeID string) *nodeFormState {
+func (m *Model) newNodeFormState(nodeID string) (*nodeFormState, error) {
+	view := m.repository.View()
 	state := &nodeFormState{
 		port:     "22",
 		authType: "password",
 		sudoMode: string(models.SudoModeAuto),
+		revision: view.Revision,
 	}
 
 	if nodeID == "" {
-		return state
+		return state, nil
 	}
 
 	state.isEdit = true
 	state.originalID = nodeID
-	node, _ := m.provider.GetNode(nodeID)
-	host, _ := m.provider.GetHost(nodeID)
-	identity, _ := m.provider.GetIdentity(nodeID)
+	state.ref = view.NodeRefs[nodeID]
+	node, ok := view.Configuration.Nodes.Get(nodeID)
+	if !ok {
+		return nil, fmt.Errorf("resolve node %q for editing: %w", nodeID, config.ErrNodeNotFound)
+	}
+	host, ok := view.Configuration.Hosts.Get(node.HostRef)
+	if !ok {
+		return nil, fmt.Errorf("resolve node %q host %q for editing: %w", nodeID, node.HostRef, config.ErrHostNotFound)
+	}
+	identity, ok := view.Configuration.Identities.Get(node.IdentityRef)
+	if !ok {
+		return nil, fmt.Errorf("resolve node %q identity %q for editing: %w", nodeID, node.IdentityRef, config.ErrIdentityNotFound)
+	}
 
 	if len(node.Alias) > 0 {
 		state.alias = strings.Join(node.Alias, ",")
@@ -177,7 +203,7 @@ func (m *Model) newNodeFormState(nodeID string) *nodeFormState {
 		state.sudoMode = string(models.SudoModeAuto)
 	}
 	state.tags = strings.Join(node.Tags, ",")
-	return state
+	return state, nil
 }
 
 func (m *Model) validateAliases(s string) error {
@@ -195,7 +221,7 @@ func (m *Model) validateAliases(s string) error {
 		}
 		seen[a] = true
 
-		if existingNode := m.provider.FindAlias(a); existingNode != "" {
+		if existingNode := m.repository.FindAlias(a); existingNode != "" {
 			if m.formState.isEdit && existingNode == m.formState.originalID {
 				continue
 			}
@@ -244,6 +270,9 @@ func (m *Model) validateFormState() error {
 }
 
 func (m *Model) updateForm(msg tea.Msg) (Model, tea.Cmd) {
+	if m.mutationPending {
+		return *m, nil
+	}
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		if m.form != nil {
@@ -252,16 +281,25 @@ func (m *Model) updateForm(msg tea.Msg) (Model, tea.Cmd) {
 		}
 		return *m, nil
 	case tea.KeyMsg:
+		if m.formConflict {
+			if msg.String() != "r" {
+				m.status = errorStyle.Render(i18n.T("tui_status_conflict_reload"))
+				return *m, nil
+			}
+			nodeID := m.formState.originalID
+			m.formState = nil
+			m.formConflict = false
+			return m.initForm(nodeID)
+		}
 		if msg.String() == "ctrl+s" {
+			if m.mutationPending {
+				return *m, nil
+			}
 			if err := m.validateFormState(); err != nil {
 				m.status = errorStyle.Render(err.Error())
 				return *m, nil
 			}
-			m.saveForm()
-			m.state = viewList
-			m.list = newListModel(m.provider) // refresh list
-			*m, _ = m.updateList(m.lastSize)
-			return *m, nil
+			return *m, m.saveFormCmd()
 		}
 		if msg.String() == "esc" {
 			// cancel
@@ -269,25 +307,19 @@ func (m *Model) updateForm(msg tea.Msg) (Model, tea.Cmd) {
 			return *m, nil
 		}
 	}
-
 	form, cmd := m.form.Update(msg)
 	if f, ok := form.(*huh.Form); ok {
 		m.form = f
 	}
 
 	if m.form.State == huh.StateCompleted {
-		m.saveForm()
-		m.state = viewList
-		m.list = newListModel(m.provider) // refresh list
-		// 应用窗口大小
-		*m, _ = m.updateList(m.lastSize)
-		return *m, nil
+		return *m, m.saveFormCmd()
 	}
 
 	return *m, cmd
 }
 
-func (m *Model) saveForm() {
+func (m *Model) saveFormCmd() tea.Cmd {
 	s := m.formState
 
 	port, _ := strconv.Atoi(s.port)
@@ -297,15 +329,28 @@ func (m *Model) saveForm() {
 	hostID := fmt.Sprintf("%s:%d", s.address, port)
 	nodeID := fmt.Sprintf("%s@%s:%d", s.user, s.address, port)
 
+	view := m.repository.View()
+	// The read and conditional write are tied to the same revision. This keeps
+	// fields which the form does not own intact without overwriting a concurrent
+	// edit made after the form was opened.
+	var node models.Node
+	if s.isEdit {
+		var ok bool
+		node, ok = view.Configuration.Nodes.Get(s.originalID)
+		if !ok {
+			m.status = errorStyle.Render(fmt.Sprintf("resolve node %q before saving: %v", s.originalID, config.ErrNodeNotFound))
+			return nil
+		}
+	}
+
 	// Standardize key path
 	absKeyPath := ""
 	if s.authType == "key" && s.keyPath != "" {
-		absKeyPath = utils.ToAbsolutePath(s.keyPath)
+		absKeyPath = fileutil.ToAbsolutePath(s.keyPath)
 	}
 
-	// 1. Save Identity
-	// Try to get existing identity to preserve any extra fields
-	identity, _ := m.provider.GetConfig().Identities.Get(identityID)
+	// Try to get existing identity to preserve any extra fields.
+	identity, _ := view.Configuration.Identities.Get(identityID)
 	identity.User = s.user
 	identity.AuthType = s.authType
 	if s.authType == "password" {
@@ -317,45 +362,36 @@ func (m *Model) saveForm() {
 		identity.Passphrase = s.passphrase
 		identity.Password = ""
 	}
-	m.provider.AddIdentity(identityID, identity)
-
-	// 2. Save Host
-	// Try to get existing host to preserve any extra fields (like Host.Alias)
-	host, _ := m.provider.GetConfig().Hosts.Get(hostID)
+	// Try to get existing host to preserve any extra fields (like Host.Alias).
+	host, _ := view.Configuration.Hosts.Get(hostID)
 	host.Address = s.address
 	host.Port = uint16(port)
-	m.provider.AddHost(hostID, host)
-
-	// 3. Save Node
-	var node models.Node
-	if s.isEdit {
-		// Load existing node from original ID to preserve ProxyJump, SuPwd, etc.
-		node, _ = m.provider.GetNode(s.originalID)
-	} else {
-		// If not edit, check if nodeID already exists to avoid blind overwrite
-		node, _ = m.provider.GetNode(nodeID)
-	}
-
-	// Update fields from form
 	node.HostRef = hostID
 	node.IdentityRef = identityID
 	node.SudoMode = models.SudoMode(s.sudoMode)
 	node.Alias = splitComma(s.alias)
 	node.Tags = splitComma(s.tags)
 
-	// Add new node first, then clean up old node if ID changed.
-	// This ensures referenced Host/Identity aren't prematurely deleted by DeleteNode's reference counting check.
-	m.provider.AddNode(nodeID, node)
-	if s.isEdit && s.originalID != nodeID {
-		m.provider.DeleteNode(s.originalID)
-	}
-
-	err := m.configStore.Save(m.provider.GetConfig())
-	if err != nil {
-		m.status = errorStyle.Render(i18n.Tf("tui_status_save_failed", map[string]any{"Error": err}))
+	var run func(context.Context) error
+	repository := m.repository
+	if s.isEdit {
+		ref := s.ref
+		if ref.ID == "" {
+			// Tests and non-interactive callers that construct form state directly do
+			// not have a displayed ref. The normal TUI path always captures it when
+			// the form opens; this fallback preserves that internal construction path.
+			ref = view.NodeRefs[s.originalID]
+		}
+		run = func(ctx context.Context) error {
+			return repository.ReplaceNodeAtRefContext(ctx, ref, nodeID, node, host, identity)
+		}
 	} else {
-		m.status = successStyle.Render(i18n.Tf("tui_status_saved", map[string]any{"ID": nodeID}))
+		run = func(ctx context.Context) error {
+			_, err := repository.CreateNodeContext(ctx, nodeID, node, host, identity)
+			return err
+		}
 	}
+	return m.beginConfigurationMutation(configurationMutationForm, nodeID, 0, run)
 }
 
 // splitComma parses a comma-separated string into a slice of trimmed strings
@@ -374,9 +410,16 @@ func splitComma(s string) []string {
 }
 
 // getAllTags 获取所有现有标签
-func (m *Model) getAllTags() []string {
+func getAllTags(cfg *config.Configuration) []string {
 	tagSet := make(map[string]bool)
-	for _, node := range m.provider.ListNodes() {
+	if cfg == nil || cfg.Nodes == nil {
+		return nil
+	}
+	for _, nodeID := range cfg.Nodes.Keys() {
+		node, exists := cfg.Nodes.Get(nodeID)
+		if !exists {
+			continue
+		}
 		for _, tag := range node.Tags {
 			tagSet[tag] = true
 		}
@@ -389,7 +432,7 @@ func (m *Model) getAllTags() []string {
 }
 
 // getSelectedNodeIDs 获取勾选的节点 ID
-func (m *Model) getSelectedNodeIDs() []string {
+func (m *Model) getSelectedNodeRefs() []config.NodeRef {
 	visibleItems := m.list.VisibleItems()
 	visibleMap := make(map[string]bool)
 	for _, item := range visibleItems {
@@ -398,22 +441,33 @@ func (m *Model) getSelectedNodeIDs() []string {
 		}
 	}
 
-	var ids []string
+	var refs []config.NodeRef
 	all := m.list.Items()
 	for _, i := range all {
 		if ni, ok := i.(*nodeItem); ok && ni.selected && visibleMap[ni.id] {
-			ids = append(ids, ni.id)
+			refs = append(refs, ni.ref)
 		}
 	}
-	return ids
+	return refs
 }
 
 // initTagSelectForm 初始化标签选择表单
 func (m *Model) initTagSelectForm() Model {
-	existingTags := m.getAllTags()
+	view := m.repository.View()
 	m.selectedTags = []string{}
 	m.tagMode = "add"
 	m.newTagsInput = ""
+	m.tagRevision = view.Revision
+	updated, _ := m.rebuildTagSelectForm()
+	return updated
+}
+
+// rebuildTagSelectForm recreates Huh's completed form while retaining the
+// user's in-memory tag draft. It is used after an asynchronous write fails.
+func (m *Model) rebuildTagSelectForm() (Model, tea.Cmd) {
+	view := m.repository.View()
+	existingTags := getAllTags(view.Configuration)
+	m.tagRevision = view.Revision
 
 	// 构建标签选项
 	var tagOpts []huh.Option[string]
@@ -457,12 +511,14 @@ func (m *Model) initTagSelectForm() Model {
 			),
 		).WithTheme(huh.ThemeCharm()).WithWidth(m.lastSize.Width).WithHeight(m.lastSize.Height - 1)
 	}
-	m.tagForm.Init()
-	return *m
+	return *m, m.tagForm.Init()
 }
 
 // updateTagSelect 处理标签选择视图的更新
 func (m *Model) updateTagSelect(msg tea.Msg) (Model, tea.Cmd) {
+	if m.mutationPending {
+		return *m, nil
+	}
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		if m.tagForm != nil {
@@ -476,18 +532,19 @@ func (m *Model) updateTagSelect(msg tea.Msg) (Model, tea.Cmd) {
 			return *m, nil
 		}
 	}
-
 	form, cmd := m.tagForm.Update(msg)
 	if f, ok := form.(*huh.Form); ok {
 		m.tagForm = f
 	}
 
 	if m.tagForm.State == huh.StateCompleted {
-		m.applyTagChanges()
-		m.state = viewList
-		m.list = newListModel(m.provider)
-		*m, _ = m.updateList(m.lastSize)
-		return *m, nil
+		cmd := m.applyTagChangesCmd()
+		if cmd == nil {
+			m.state = viewList
+			m.refreshList()
+			*m, _ = m.updateList(m.lastSize)
+		}
+		return *m, cmd
 	}
 
 	return *m, cmd
@@ -514,69 +571,38 @@ func (m *Model) mergeTags() map[string]bool {
 	return tags
 }
 
-// addTagsToNode 为节点添加标签
-func addTagsToNode(node *models.Node, tags map[string]bool) {
-	existing := make(map[string]bool)
-	for _, t := range node.Tags {
-		existing[t] = true
-	}
-	for tag := range tags {
-		if !existing[tag] {
-			node.Tags = append(node.Tags, tag)
-		}
-	}
-}
-
-// removeTagsFromNode 从节点移除标签
-func removeTagsFromNode(node *models.Node, tags map[string]bool) {
-	var newTags []string
-	for _, t := range node.Tags {
-		if !tags[t] {
-			newTags = append(newTags, t)
-		}
-	}
-	node.Tags = newTags
-}
-
-// applyTagChanges 应用标签变更
-func (m *Model) applyTagChanges() {
-	selectedNodeIDs := m.getSelectedNodeIDs()
-	if len(selectedNodeIDs) == 0 {
-		return
+// applyTagChangesCmd applies tags in a bounded asynchronous configuration transaction.
+func (m *Model) applyTagChangesCmd() tea.Cmd {
+	selectedNodeRefs := m.getSelectedNodeRefs()
+	if len(selectedNodeRefs) == 0 {
+		return nil
 	}
 
 	tagsToApply := m.mergeTags()
 	if len(tagsToApply) == 0 {
-		return
+		return nil
 	}
 
-	updatedCount := 0
-	for _, nodeID := range selectedNodeIDs {
-		node, ok := m.provider.GetNode(nodeID)
-		if !ok {
-			continue
-		}
-
-		if m.tagMode == "add" {
-			addTagsToNode(&node, tagsToApply)
-		} else {
-			removeTagsFromNode(&node, tagsToApply)
-		}
-
-		m.provider.AddNode(nodeID, node)
-		updatedCount++
+	tags := make([]string, 0, len(tagsToApply))
+	for tag := range tagsToApply {
+		tags = append(tags, tag)
 	}
-
-	m.updateTagStatus(updatedCount)
+	sort.Strings(tags)
+	nodeIDs := make([]string, 0, len(selectedNodeRefs))
+	for _, ref := range selectedNodeRefs {
+		nodeIDs = append(nodeIDs, ref.ID)
+	}
+	add := m.tagMode == "add"
+	repository := m.repository
+	return m.beginConfigurationMutation(configurationMutationTags, "", len(selectedNodeRefs), func(ctx context.Context) error {
+		_, err := repository.UpdateNodeTagsContext(ctx, nodeIDs, tags, add)
+		return err
+	})
 }
 
 // updateTagStatus 更新标签操作状态
 func (m *Model) updateTagStatus(count int) {
 	if count == 0 {
-		return
-	}
-	if err := m.configStore.Save(m.provider.GetConfig()); err != nil {
-		m.status = errorStyle.Render(i18n.Tf("tui_status_save_failed", map[string]any{"Error": err}))
 		return
 	}
 	if m.tagMode == "add" {

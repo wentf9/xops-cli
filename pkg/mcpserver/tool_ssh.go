@@ -42,9 +42,11 @@ func listNodesHandler(ctx context.Context, req *mcp.CallToolRequest, input ListN
 	}
 
 	var nodes []NodeInfo
-	for nodeID, node := range nodeMap {
-		host, _ := provider.GetHost(nodeID)
-		identity, _ := provider.GetIdentity(nodeID)
+	for nodeID := range nodeMap {
+		node, host, identity, resolveErr := provider.Resolve(nodeID)
+		if resolveErr != nil {
+			return nil, ListNodesOutput{}, fmt.Errorf("resolve MCP node %q failed: %w", nodeID, resolveErr)
+		}
 
 		nodes = append(nodes, NodeInfo{
 			ID:        nodeID,

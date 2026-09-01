@@ -3,9 +3,12 @@ package mcpserver
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	pkgsftp "github.com/pkg/sftp"
 	"github.com/wentf9/xops-cli/pkg/mcpserver/guardrail"
 	"github.com/wentf9/xops-cli/pkg/sftp"
 )
@@ -30,7 +33,7 @@ type FSListOutput struct {
 	Status string     `json:"status" jsonschema:"Operation status"`
 }
 
-func fsLsHandler(ctx context.Context, req *mcp.CallToolRequest, input FSListInput) (*mcp.CallToolResult, FSListOutput, error) {
+func fsLsHandler(ctx context.Context, req *mcp.CallToolRequest, input FSListInput) (_ *mcp.CallToolResult, _ FSListOutput, handlerErr error) {
 	if input.NodeID == "" || input.Path == "" {
 		return nil, FSListOutput{}, fmt.Errorf("nodeID and path are required")
 	}
@@ -45,13 +48,18 @@ func fsLsHandler(ctx context.Context, req *mcp.CallToolRequest, input FSListInpu
 		return nil, FSListOutput{}, fmt.Errorf("failed to connect to ssh: %w", err)
 	}
 
-	sftpClient, err := sftp.NewClient(sshClient)
+	sftpClient, err := sftp.NewClient(ctx, sshClient)
 	if err != nil {
 		return nil, FSListOutput{}, fmt.Errorf("failed to create sftp client: %w", err)
 	}
-	defer func() { _ = sftpClient.Close() }()
+	defer joinCloseError(&handlerErr, sftpClient, "sftp client")
 
-	infos, err := sftpClient.SFTPClient().ReadDir(input.Path)
+	var infos []os.FileInfo
+	err = sftpClient.Do(ctx, func(c *pkgsftp.Client) error {
+		var readErr error
+		infos, readErr = c.ReadDir(input.Path)
+		return readErr
+	})
 	if err != nil {
 		return nil, FSListOutput{}, fmt.Errorf("ls failed: %w", err)
 	}
@@ -84,7 +92,7 @@ type FSBaseOutput struct {
 	Status string `json:"status" jsonschema:"Operation status"`
 }
 
-func fsMkdirHandler(ctx context.Context, req *mcp.CallToolRequest, input FSMkdirInput) (*mcp.CallToolResult, FSBaseOutput, error) {
+func fsMkdirHandler(ctx context.Context, req *mcp.CallToolRequest, input FSMkdirInput) (_ *mcp.CallToolResult, _ FSBaseOutput, handlerErr error) {
 	if input.NodeID == "" || input.Path == "" {
 		return nil, FSBaseOutput{}, fmt.Errorf("nodeID and path are required")
 	}
@@ -99,13 +107,15 @@ func fsMkdirHandler(ctx context.Context, req *mcp.CallToolRequest, input FSMkdir
 		return nil, FSBaseOutput{}, err
 	}
 
-	sftpClient, err := sftp.NewClient(sshClient)
+	sftpClient, err := sftp.NewClient(ctx, sshClient)
 	if err != nil {
 		return nil, FSBaseOutput{}, err
 	}
-	defer func() { _ = sftpClient.Close() }()
+	defer joinCloseError(&handlerErr, sftpClient, "sftp client")
 
-	if err := sftpClient.SFTPClient().MkdirAll(input.Path); err != nil {
+	if err := sftpClient.Do(ctx, func(c *pkgsftp.Client) error {
+		return c.MkdirAll(input.Path)
+	}); err != nil {
 		return nil, FSBaseOutput{}, fmt.Errorf("mkdir failed: %w", err)
 	}
 
@@ -119,7 +129,7 @@ type FSTouchInput struct {
 	Path   string `json:"path" jsonschema:"Absolute path to the file to create"`
 }
 
-func fsTouchHandler(ctx context.Context, req *mcp.CallToolRequest, input FSTouchInput) (*mcp.CallToolResult, FSBaseOutput, error) {
+func fsTouchHandler(ctx context.Context, req *mcp.CallToolRequest, input FSTouchInput) (_ *mcp.CallToolResult, _ FSBaseOutput, handlerErr error) {
 	if input.NodeID == "" || input.Path == "" {
 		return nil, FSBaseOutput{}, fmt.Errorf("nodeID and path are required")
 	}
@@ -134,17 +144,21 @@ func fsTouchHandler(ctx context.Context, req *mcp.CallToolRequest, input FSTouch
 		return nil, FSBaseOutput{}, err
 	}
 
-	sftpClient, err := sftp.NewClient(sshClient)
+	sftpClient, err := sftp.NewClient(ctx, sshClient)
 	if err != nil {
 		return nil, FSBaseOutput{}, err
 	}
-	defer func() { _ = sftpClient.Close() }()
+	defer joinCloseError(&handlerErr, sftpClient, "sftp client")
 
-	file, err := sftpClient.SFTPClient().Create(input.Path)
-	if err != nil {
+	if err := sftpClient.Do(ctx, func(c *pkgsftp.Client) error {
+		file, err := c.Create(input.Path)
+		if err == nil {
+			return file.Close()
+		}
+		return err
+	}); err != nil {
 		return nil, FSBaseOutput{}, fmt.Errorf("touch failed: %w", err)
 	}
-	_ = file.Close()
 
 	return nil, FSBaseOutput{Status: "success"}, nil
 }
@@ -157,7 +171,7 @@ type FSMvInput struct {
 	New    string `json:"newPath" jsonschema:"New absolute destination path"`
 }
 
-func fsMvHandler(ctx context.Context, req *mcp.CallToolRequest, input FSMvInput) (*mcp.CallToolResult, FSBaseOutput, error) {
+func fsMvHandler(ctx context.Context, req *mcp.CallToolRequest, input FSMvInput) (_ *mcp.CallToolResult, _ FSBaseOutput, handlerErr error) {
 	if input.NodeID == "" || input.Old == "" || input.New == "" {
 		return nil, FSBaseOutput{}, fmt.Errorf("nodeID, oldPath and newPath are required")
 	}
@@ -172,13 +186,15 @@ func fsMvHandler(ctx context.Context, req *mcp.CallToolRequest, input FSMvInput)
 		return nil, FSBaseOutput{}, err
 	}
 
-	sftpClient, err := sftp.NewClient(sshClient)
+	sftpClient, err := sftp.NewClient(ctx, sshClient)
 	if err != nil {
 		return nil, FSBaseOutput{}, err
 	}
-	defer func() { _ = sftpClient.Close() }()
+	defer joinCloseError(&handlerErr, sftpClient, "sftp client")
 
-	if err := sftpClient.SFTPClient().Rename(input.Old, input.New); err != nil {
+	if err := sftpClient.Do(ctx, func(c *pkgsftp.Client) error {
+		return c.Rename(input.Old, input.New)
+	}); err != nil {
 		return nil, FSBaseOutput{}, fmt.Errorf("mv failed: %w", err)
 	}
 
@@ -207,7 +223,7 @@ func fsRmHandler(ctx context.Context, req *mcp.CallToolRequest, input FSRmInput)
 		return nil, FSBaseOutput{}, err
 	}
 
-	cmd := fmt.Sprintf("rm -rf '%s'", input.Path)
+	cmd := fmt.Sprintf("rm -rf %s", escapePosix(input.Path))
 	output, err := sshClient.Run(ctx, cmd)
 	if err != nil {
 		return nil, FSBaseOutput{}, fmt.Errorf("rm failed: %w, output: %s", err, output)
@@ -239,7 +255,7 @@ func fsCpHandler(ctx context.Context, req *mcp.CallToolRequest, input FSCpInput)
 		return nil, FSBaseOutput{}, err
 	}
 
-	cmd := fmt.Sprintf("cp -r '%s' '%s'", input.Src, input.Dest)
+	cmd := fmt.Sprintf("cp -r %s %s", escapePosix(input.Src), escapePosix(input.Dest))
 	output, err := sshClient.Run(ctx, cmd)
 	if err != nil {
 		return nil, FSBaseOutput{}, fmt.Errorf("cp failed: %w, output: %s", err, output)
@@ -337,4 +353,8 @@ func RegisterFS(server *mcp.Server, g *guardrail.Guardrail) {
 			fsCpHandler,
 		),
 	)
+}
+
+func escapePosix(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }

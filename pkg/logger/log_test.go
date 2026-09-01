@@ -45,7 +45,9 @@ func TestPrintInfo_NoANSIWhenDisabled(t *testing.T) {
 
 	PrintInfo("test message")
 
-	_ = w.Close()
+	if err := w.Close(); err != nil {
+		t.Logf("Close failed: %v", err)
+	}
 	os.Stdout = old
 
 	var buf bytes.Buffer
@@ -72,7 +74,9 @@ func TestPrintInfo_ANSIWhenEnabled(t *testing.T) {
 
 	PrintInfo("test message")
 
-	_ = w.Close()
+	if err := w.Close(); err != nil {
+		t.Logf("Close failed: %v", err)
+	}
 	os.Stdout = old
 
 	var buf bytes.Buffer
@@ -99,7 +103,9 @@ func TestPrintError_NoANSIWhenDisabled(t *testing.T) {
 
 	PrintError("error message")
 
-	_ = w.Close()
+	if err := w.Close(); err != nil {
+		t.Logf("Close failed: %v", err)
+	}
 	os.Stderr = old
 
 	var buf bytes.Buffer

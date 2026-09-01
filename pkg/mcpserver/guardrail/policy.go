@@ -1,6 +1,7 @@
 package guardrail
 
 import (
+	"fmt"
 	"path/filepath"
 
 	"github.com/wentf9/xops-cli/pkg/config"
@@ -39,6 +40,24 @@ func DefaultGuardrailConfig() *config.GuardrailConfig {
 	}
 }
 
+// ValidateConfig checks if all glob patterns in the config are syntactically valid.
+func ValidateConfig(cfg *config.GuardrailConfig) error {
+	if cfg == nil {
+		return nil
+	}
+	for _, pattern := range cfg.BlockedPatterns {
+		if _, err := filepath.Match(pattern, ""); err != nil {
+			return fmt.Errorf("invalid blocked pattern %q: %w", pattern, err)
+		}
+	}
+	for pattern := range cfg.NodeOverrides {
+		if _, err := filepath.Match(pattern, ""); err != nil {
+			return fmt.Errorf("invalid node override pattern %q: %w", pattern, err)
+		}
+	}
+	return nil
+}
+
 // Policy evaluates tool invocations against configurable rules.
 type Policy struct {
 	cfg *config.GuardrailConfig
@@ -46,6 +65,9 @@ type Policy struct {
 
 // NewPolicy creates a policy engine from config.
 func NewPolicy(cfg *config.GuardrailConfig) *Policy {
+	if cfg == nil {
+		cfg = DefaultGuardrailConfig()
+	}
 	return &Policy{cfg: cfg}
 }
 
@@ -60,7 +82,9 @@ func (p *Policy) Evaluate(risk RiskLevel, input RiskInput) Decision {
 	}
 
 	for _, pattern := range p.cfg.BlockedPatterns {
-		if matched, _ := filepath.Match(pattern, input.Command); matched {
+		matched, err := filepath.Match(pattern, input.Command)
+		if err != nil || matched {
+			// Fail-closed: deny if pattern matches or if pattern matching produces an error
 			return Deny
 		}
 	}
@@ -78,7 +102,12 @@ func (p *Policy) Evaluate(risk RiskLevel, input RiskInput) Decision {
 
 func (p *Policy) thresholdForNode(nodeID string) RiskLevel {
 	for pattern, override := range p.cfg.NodeOverrides {
-		if matched, _ := filepath.Match(pattern, nodeID); matched {
+		matched, err := filepath.Match(pattern, nodeID)
+		if err != nil {
+			// Fail-closed: use lowest threshold (strictest approval) on pattern error
+			return Safe
+		}
+		if matched {
 			return ParseRiskLevel(override.ApprovalThreshold)
 		}
 	}

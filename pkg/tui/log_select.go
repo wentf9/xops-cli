@@ -40,6 +40,7 @@ func (i logSelectItem) Description() string { return i.description }
 func (i logSelectItem) FilterValue() string { return i.title }
 
 type logSelectModel struct {
+	ctx       context.Context
 	nodeID    string
 	client    *ssh.Client
 	list      list.Model
@@ -51,7 +52,7 @@ type logSelectModel struct {
 	height    int
 }
 
-func newLogSelectModel(nodeID string, client *ssh.Client, size tea.WindowSizeMsg) logSelectModel {
+func newLogSelectModel(ctx context.Context, nodeID string, client *ssh.Client, size tea.WindowSizeMsg) logSelectModel {
 	ti := textinput.New()
 	ti.Placeholder = i18n.T("tui_log_manual_prompt")
 	ti.Focus()
@@ -62,6 +63,7 @@ func newLogSelectModel(nodeID string, client *ssh.Client, size tea.WindowSizeMsg
 	l.SetShowStatusBar(false)
 
 	return logSelectModel{
+		ctx:       ctx,
 		nodeID:    nodeID,
 		client:    client,
 		list:      l,
@@ -76,7 +78,7 @@ func (m logSelectModel) Init() tea.Cmd {
 	return tea.Batch(
 		textinput.Blink,
 		func() tea.Msg {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			ctx, cancel := context.WithTimeout(m.ctx, 10*time.Second)
 			defer cancel()
 
 			cmd := `find /var/log -type f -name "*.log" 2>/dev/null | head -n 50`

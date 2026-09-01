@@ -525,7 +525,9 @@ init_config_path:
 init_key_path:
   other: "加密密钥: {{.Path}}"
 init_import_summary:
-  other: "OpenSSH 主机: 导入 {{.Imported}}，跳过已有 {{.Skipped}}"
+  other: "OpenSSH 主机: 导入 {{.Imported}}，跳过 {{.Skipped}}"
+init_import_issue:
+  other: "跳过 OpenSSH 主机 {{.Name}}：{{.Error}}"
 init_next_steps:
   other: "下一步: 运行 'xops host list' 查看主机，或运行 'xops host add --help' 添加主机"
 
@@ -602,6 +604,18 @@ tui_status_saved:
   other: "节点 '{{.ID}}' 已保存"
 tui_status_save_failed:
   other: "保存失败: {{.Error}}"
+tui_status_saving:
+  other: "正在保存配置..."
+tui_status_not_durable:
+  other: "配置已应用但尚未持久化: {{.Error}}"
+tui_status_conflict:
+  other: "配置已被并发修改；请按 r 重新加载后再保存: {{.Error}}"
+tui_status_conflict_reload:
+  other: "配置已被并发修改；请按 r 重新加载后再保存"
+tui_status_update_canceled:
+  other: "配置更新已取消: {{.Error}}"
+tui_status_update_failed:
+  other: "配置更新失败: {{.Error}}"
 tui_help_space:
   other: "选择"
 tui_help_all:
@@ -908,7 +922,7 @@ play_step_changed:
 play_step_skipped:
   other: "[{{.Host}}] ⏭️  {{.Step}} (已满足，跳过)"
 play_step_failed:
-  other: "[{{.Host}}] ❌ {{.Step}}: {{.Error}}"
+  other: "[{{.Host}}] ❌ {{.Step}} 执行失败"
 play_dry_run:
   other: "Dry Run 模式 — 仅预览，不实际执行"
 play_connect_failed:

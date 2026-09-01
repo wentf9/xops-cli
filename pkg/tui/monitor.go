@@ -24,6 +24,7 @@ type monitorErrorMsg struct {
 }
 
 type monitorModel struct {
+	ctx       context.Context
 	nodeID    string
 	sessionID int64
 	collector *ssh.MetricsCollector
@@ -35,8 +36,9 @@ type monitorModel struct {
 	paused    bool
 }
 
-func newMonitorModel(nodeID string, client *ssh.Client) monitorModel {
+func newMonitorModel(ctx context.Context, nodeID string, client *ssh.Client) monitorModel {
 	return monitorModel{
+		ctx:       ctx,
 		nodeID:    nodeID,
 		sessionID: time.Now().UnixNano(),
 		collector: ssh.NewMetricsCollector(client),
@@ -45,7 +47,7 @@ func newMonitorModel(nodeID string, client *ssh.Client) monitorModel {
 
 func (m monitorModel) Init() tea.Cmd {
 	return func() tea.Msg {
-		if err := m.collector.Start(context.Background()); err != nil {
+		if err := m.collector.Start(m.ctx); err != nil {
 			return monitorErrorMsg{sessionID: m.sessionID, err: err}
 		}
 		return m.fetchMetrics()()
@@ -55,8 +57,7 @@ func (m monitorModel) Init() tea.Cmd {
 func (m monitorModel) fetchMetrics() tea.Cmd {
 	return func() tea.Msg {
 		// Do not timeout NextFrame, it blocks for 2 seconds remotely by design
-		ctx := context.Background()
-		metrics, err := m.collector.NextFrame(ctx)
+		metrics, err := m.collector.NextFrame(m.ctx)
 		if err != nil {
 			return monitorErrorMsg{sessionID: m.sessionID, err: err}
 		}
@@ -88,7 +89,9 @@ func (m monitorModel) Update(msg tea.Msg) (monitorModel, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "esc", "q":
-			m.collector.Close()
+			if err := m.collector.Close(); err != nil {
+				m.err = err
+			}
 			return m, nil // Will be handled by parent model to switch state
 		case "p", " ":
 			m.paused = !m.paused
@@ -96,13 +99,9 @@ func (m monitorModel) Update(msg tea.Msg) (monitorModel, tea.Cmd) {
 				return m, m.fetchMetrics()
 			}
 		case "s":
-			if m.collector.SortBy == "cpu" {
-				m.collector.SortBy = "mem"
-			} else {
-				m.collector.SortBy = "cpu"
-			}
+			m.collector.ToggleSortBy()
 		case "o":
-			m.collector.SortAsc = !m.collector.SortAsc
+			m.collector.ToggleSortOrder()
 		}
 	}
 	return m, nil
@@ -123,9 +122,10 @@ func (m monitorModel) View() string {
 		statusInfo = " [" + i18n.T("tui_monitor_paused") + "]"
 	}
 
-	sortInfo := i18n.T("tui_monitor_sort_by_" + m.collector.SortBy)
+	sortBy, sortAsc := m.collector.SortConfig()
+	sortInfo := i18n.T("tui_monitor_sort_by_" + sortBy)
 	orderKey := "tui_monitor_order_desc"
-	if m.collector.SortAsc {
+	if sortAsc {
 		orderKey = "tui_monitor_order_asc"
 	}
 	sortInfo += " | " + i18n.T(orderKey)

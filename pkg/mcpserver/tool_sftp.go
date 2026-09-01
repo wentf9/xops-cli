@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	pkgsftp "github.com/pkg/sftp"
 	"github.com/wentf9/xops-cli/pkg/mcpserver/guardrail"
 	"github.com/wentf9/xops-cli/pkg/sftp"
 )
@@ -51,7 +52,7 @@ func getSFTPClient(ctx context.Context, nodeID string) (*sftp.Client, error) {
 
 	// TODO(optimization): Consider caching/pooling *sftp.Client instances per node to avoid
 	// creating and closing SFTP subsystems (SSH channel negotiation + SFTP handshake) on every call.
-	sftpClient, err := sftp.NewClient(sshClient)
+	sftpClient, err := sftp.NewClient(ctx, sshClient)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create sftp client: %w", err)
 	}
@@ -59,56 +60,88 @@ func getSFTPClient(ctx context.Context, nodeID string) (*sftp.Client, error) {
 	return sftpClient, nil
 }
 
-func readFileHandler(ctx context.Context, req *mcp.CallToolRequest, input ReadFileInput) (*mcp.CallToolResult, ReadFileOutput, error) {
-	if input.NodeID == "" || input.Path == "" {
-		return nil, ReadFileOutput{}, fmt.Errorf("nodeID and path are required")
+type remoteFile interface {
+	io.Reader
+	io.Seeker
+	Stat() (os.FileInfo, error)
+	Close() error
+}
+
+func readOpenedRemoteFile(file remoteFile, input ReadFileInput) (output ReadFileOutput, retErr error) {
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil && !errors.Is(closeErr, io.EOF) {
+			retErr = errors.Join(retErr, fmt.Errorf("close remote file failed: %w", closeErr))
+		}
+	}()
+
+	if input.Offset < 0 {
+		return ReadFileOutput{}, fmt.Errorf("offset cannot be negative: %d", input.Offset)
+	}
+	if input.Limit < 0 {
+		return ReadFileOutput{}, fmt.Errorf("limit cannot be negative: %d", input.Limit)
 	}
 
 	limit := input.Limit
-	if limit <= 0 {
+	if limit == 0 {
 		limit = defaultReadLimit
 	}
 	if limit > 100*1024 {
 		limit = 100 * 1024 // cap at 100KB to prevent memory/context explosion
 	}
 
-	sftpClient, err := getSFTPClient(ctx, input.NodeID)
-	if err != nil {
-		return nil, ReadFileOutput{}, err
-	}
-	defer func() { _ = sftpClient.Close() }()
-
-	file, err := sftpClient.SFTPClient().Open(input.Path)
-	if err != nil {
-		return nil, ReadFileOutput{}, fmt.Errorf("failed to open remote file: %w", err)
-	}
-	defer func() { _ = file.Close() }()
-
-	stat, err := file.Stat()
-	if err != nil {
-		return nil, ReadFileOutput{}, fmt.Errorf("failed to stat file: %w", err)
+	stat, statErr := file.Stat()
+	if statErr != nil {
+		return ReadFileOutput{}, fmt.Errorf("failed to stat file: %w", statErr)
 	}
 
 	if input.Offset > 0 {
-		if _, err := file.Seek(input.Offset, io.SeekStart); err != nil {
-			return nil, ReadFileOutput{}, fmt.Errorf("failed to seek: %w", err)
+		if _, seekErr := file.Seek(input.Offset, io.SeekStart); seekErr != nil {
+			return ReadFileOutput{}, fmt.Errorf("failed to seek: %w", seekErr)
 		}
 	}
 
-	buf := make([]byte, limit)
-	n, readErr := file.Read(buf)
-	if readErr != nil && !errors.Is(readErr, io.EOF) {
-		return nil, ReadFileOutput{}, fmt.Errorf("failed to read file: %w", readErr)
+	limitedReader := io.LimitReader(file, limit)
+	buf, readErr := io.ReadAll(limitedReader)
+	if readErr != nil {
+		return ReadFileOutput{}, fmt.Errorf("failed to read file: %w", readErr)
 	}
 
-	isEOF := errors.Is(readErr, io.EOF) || int64(n) < limit || (input.Offset+int64(n)) >= stat.Size()
+	n := int64(len(buf))
+	isEOF := n < limit || (input.Offset+n) >= stat.Size()
 
-	return nil, ReadFileOutput{
-		Content: string(buf[:n]),
+	return ReadFileOutput{
+		Content: string(buf),
 		EOF:     isEOF,
 		Size:    stat.Size(),
 		Status:  "success",
 	}, nil
+}
+
+func readFileHandler(ctx context.Context, req *mcp.CallToolRequest, input ReadFileInput) (_ *mcp.CallToolResult, _ ReadFileOutput, handlerErr error) {
+	if input.NodeID == "" || input.Path == "" {
+		return nil, ReadFileOutput{}, fmt.Errorf("nodeID and path are required")
+	}
+
+	sftpClient, err := getSFTPClient(ctx, input.NodeID)
+	if err != nil {
+		return nil, ReadFileOutput{}, err
+	}
+	defer joinCloseError(&handlerErr, sftpClient, "sftp client")
+
+	var output ReadFileOutput
+	if err := sftpClient.Do(ctx, func(c *pkgsftp.Client) (retErr error) {
+		file, openErr := c.Open(input.Path)
+		if openErr != nil {
+			return fmt.Errorf("failed to open remote file: %w", openErr)
+		}
+		var readErr error
+		output, readErr = readOpenedRemoteFile(file, input)
+		return readErr
+	}); err != nil {
+		return nil, ReadFileOutput{}, err
+	}
+
+	return nil, output, nil
 }
 
 type WriteFileInput struct {
@@ -123,7 +156,7 @@ type WriteFileOutput struct {
 	Status       string `json:"status" jsonschema:"Operation status"`
 }
 
-func writeFileHandler(ctx context.Context, req *mcp.CallToolRequest, input WriteFileInput) (*mcp.CallToolResult, WriteFileOutput, error) {
+func writeFileHandler(ctx context.Context, req *mcp.CallToolRequest, input WriteFileInput) (_ *mcp.CallToolResult, _ WriteFileOutput, handlerErr error) {
 	if input.NodeID == "" || input.Path == "" || input.Content == "" {
 		return nil, WriteFileOutput{}, fmt.Errorf("nodeID, path, and content are required")
 	}
@@ -132,7 +165,7 @@ func writeFileHandler(ctx context.Context, req *mcp.CallToolRequest, input Write
 	if err != nil {
 		return nil, WriteFileOutput{}, err
 	}
-	defer func() { _ = sftpClient.Close() }()
+	defer joinCloseError(&handlerErr, sftpClient, "sftp client")
 
 	flags := os.O_WRONLY | os.O_CREATE
 	if input.Append {
@@ -141,15 +174,26 @@ func writeFileHandler(ctx context.Context, req *mcp.CallToolRequest, input Write
 		flags |= os.O_TRUNC
 	}
 
-	file, err := sftpClient.SFTPClient().OpenFile(input.Path, flags)
-	if err != nil {
-		return nil, WriteFileOutput{}, fmt.Errorf("failed to open remote file for writing: %w", err)
-	}
-	defer func() { _ = file.Close() }()
+	var n int
+	if err := sftpClient.Do(ctx, func(c *pkgsftp.Client) (retErr error) {
+		file, openErr := c.OpenFile(input.Path, flags)
+		if openErr != nil {
+			return fmt.Errorf("failed to open remote file for writing: %w", openErr)
+		}
+		// Merge close error into the named return.
+		defer func() {
+			if closeErr := file.Close(); closeErr != nil && !errors.Is(closeErr, io.EOF) {
+				retErr = errors.Join(retErr, fmt.Errorf("close remote file failed: %w", closeErr))
+			}
+		}()
 
-	n, err := file.Write([]byte(input.Content))
-	if err != nil {
-		return nil, WriteFileOutput{}, fmt.Errorf("failed to write file: %w", err)
+		n, retErr = file.Write([]byte(input.Content))
+		if retErr != nil {
+			return fmt.Errorf("failed to write file: %w", retErr)
+		}
+		return nil
+	}); err != nil {
+		return nil, WriteFileOutput{}, err
 	}
 
 	return nil, WriteFileOutput{
@@ -158,7 +202,7 @@ func writeFileHandler(ctx context.Context, req *mcp.CallToolRequest, input Write
 	}, nil
 }
 
-func uploadFileHandler(ctx context.Context, req *mcp.CallToolRequest, input TransferFileInput) (*mcp.CallToolResult, TransferFileOutput, error) {
+func uploadFileHandler(ctx context.Context, req *mcp.CallToolRequest, input TransferFileInput) (_ *mcp.CallToolResult, _ TransferFileOutput, handlerErr error) {
 	if input.NodeID == "" || input.LocalPath == "" || input.RemotePath == "" {
 		return nil, TransferFileOutput{}, fmt.Errorf("nodeID, localPath, and remotePath are required")
 	}
@@ -167,7 +211,7 @@ func uploadFileHandler(ctx context.Context, req *mcp.CallToolRequest, input Tran
 	if err != nil {
 		return nil, TransferFileOutput{}, err
 	}
-	defer func() { _ = sftpClient.Close() }()
+	defer joinCloseError(&handlerErr, sftpClient, "sftp client")
 
 	if err := sftpClient.Upload(ctx, input.LocalPath, input.RemotePath, nil); err != nil {
 		return nil, TransferFileOutput{}, fmt.Errorf("upload failed: %w", err)
@@ -176,7 +220,7 @@ func uploadFileHandler(ctx context.Context, req *mcp.CallToolRequest, input Tran
 	return nil, TransferFileOutput{Status: "success"}, nil
 }
 
-func downloadFileHandler(ctx context.Context, req *mcp.CallToolRequest, input TransferFileInput) (*mcp.CallToolResult, TransferFileOutput, error) {
+func downloadFileHandler(ctx context.Context, req *mcp.CallToolRequest, input TransferFileInput) (_ *mcp.CallToolResult, _ TransferFileOutput, handlerErr error) {
 	if input.NodeID == "" || input.LocalPath == "" || input.RemotePath == "" {
 		return nil, TransferFileOutput{}, fmt.Errorf("nodeID, localPath, and remotePath are required")
 	}
@@ -185,7 +229,7 @@ func downloadFileHandler(ctx context.Context, req *mcp.CallToolRequest, input Tr
 	if err != nil {
 		return nil, TransferFileOutput{}, err
 	}
-	defer func() { _ = sftpClient.Close() }()
+	defer joinCloseError(&handlerErr, sftpClient, "sftp client")
 
 	if err := sftpClient.Download(ctx, input.RemotePath, input.LocalPath, nil); err != nil {
 		return nil, TransferFileOutput{}, fmt.Errorf("download failed: %w", err)
