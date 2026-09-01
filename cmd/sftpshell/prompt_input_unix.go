@@ -1,6 +1,6 @@
 //go:build !windows
 
-package sftp
+package sftpshell
 
 import (
 	"errors"

@@ -1,7 +1,6 @@
-package sftp
+package sftpshell
 
 import (
-	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -38,14 +37,12 @@ func TestHasWildcard(t *testing.T) {
 }
 
 func TestExpandLocal(t *testing.T) {
-	i18n.Init("zh")
+	if err := i18n.Init("zh"); err != nil {
+		t.Fatalf("i18n.Init failed: %v", err)
+	}
 	dir := t.TempDir()
 	for _, name := range []string{"a.go", "b.go", "c.txt"} {
-		f, err := os.Create(filepath.Join(dir, name))
-		if err != nil {
-			t.Fatal(err)
-		}
-		_ = f.Close()
+		writeTestFile(t, filepath.Join(dir, name), nil)
 	}
 	s := &Shell{localCwd: dir}
 
@@ -96,7 +93,9 @@ func TestExpandLocal(t *testing.T) {
 }
 
 func TestClassifyGlobResult(t *testing.T) {
-	i18n.Init("zh")
+	if err := i18n.Init("zh"); err != nil {
+		t.Fatalf("i18n.Init failed: %v", err)
+	}
 	tests := []struct {
 		name         string
 		pattern      string
@@ -125,7 +124,9 @@ func TestClassifyGlobResult(t *testing.T) {
 }
 
 func TestResolveMultiSrcLocal(t *testing.T) {
-	i18n.Init("zh")
+	if err := i18n.Init("zh"); err != nil {
+		t.Fatalf("i18n.Init failed: %v", err)
+	}
 
 	t.Run("single src dst not dir", func(t *testing.T) {
 		got, err := resolveMultiSrcLocal([]string{"/a/b.go"}, "/dst/b.go", false)
@@ -179,7 +180,7 @@ func TestResolveMultiSrcLocal(t *testing.T) {
 }
 
 func TestResolveMultiSrc(t *testing.T) {
-	i18n.Init("zh")
+	initTestI18n(t)
 
 	t.Run("single src dst not dir", func(t *testing.T) {
 		got, err := resolveMultiSrc([]string{"/a/b.go"}, "/dst/b.go", false)

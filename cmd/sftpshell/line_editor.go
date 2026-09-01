@@ -1,11 +1,12 @@
-package sftp
+package sftpshell
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
-	"runtime"
 	"sync"
-	"sync/atomic"
+	"time"
 
 	"github.com/chzyer/readline"
 )
@@ -15,12 +16,18 @@ type lineEditor struct {
 	input      promptInput
 	inputOnce  sync.Once
 	inputErr   error
-	promptUsed atomic.Bool
+	ready      chan struct{}
+	promptMu   sync.Mutex
+	promptDone chan struct{}
+	closing    bool
 	closeOnce  sync.Once
 	closeErr   error
 }
 
-func newLineEditor(stdin io.Reader, stdout, stderr io.Writer, historyFile string, shell *Shell) (*lineEditor, error) {
+func newLineEditor(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer, historyFile string, shell *Shell) (*lineEditor, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("line editor context is nil")
+	}
 	input, err := duplicatePromptInput(stdin)
 	if err != nil {
 		return nil, fmt.Errorf("duplicate prompt input failed: %w", err)
@@ -46,13 +53,81 @@ func newLineEditor(stdin io.Reader, stdout, stderr io.Writer, historyFile string
 		}
 		return nil, fmt.Errorf("create line editor failed: %w", err)
 	}
-	return &lineEditor{instance: instance, input: input}, nil
+	editor := &lineEditor{instance: instance, input: input, ready: make(chan struct{})}
+	go editor.waitForTerminalReader(ctx)
+	return editor, nil
 }
 
-func (e *lineEditor) Prompt(prompt string) (string, error) {
-	e.promptUsed.Store(true)
+// waitForTerminalReader establishes that readline's internal terminal
+// goroutine has registered itself before Close is allowed to call into it.
+// readline v1.5.1 registers its WaitGroup inside that goroutine; closing any
+// earlier races with Wait. The editor owns this short-lived goroutine; Close
+// waits for ready before touching readline and cancellation interrupts its
+// input so the goroutine has a bounded exit path.
+func (e *lineEditor) waitForTerminalReader(ctx context.Context) {
+	e.instance.Terminal.KickRead()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	ctxDone := ctx.Done()
+	for !e.instance.Terminal.IsReading() {
+		select {
+		case <-ctxDone:
+			// resetLineEditor observes cancellation and calls Close, which
+			// interrupts the input. Keep waiting until readline has registered
+			// its WaitGroup so that Close cannot race its internal Add call.
+			ctxDone = nil
+		case <-ticker.C:
+		}
+	}
+	close(e.ready)
+}
+
+func (e *lineEditor) Prompt(ctx context.Context, prompt string) (result string, retErr error) {
+	if ctx == nil {
+		return "", fmt.Errorf("sftp line editor prompt context is nil")
+	}
+	done, err := e.beginPrompt()
+	if err != nil {
+		return "", err
+	}
+	defer e.endPrompt(done)
+	interruptDone := make(chan error, 1)
+	stopInterrupt := context.AfterFunc(ctx, func() {
+		interruptDone <- e.Interrupt()
+	})
+	defer func() {
+		if !stopInterrupt() {
+			if interruptErr := <-interruptDone; interruptErr != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("interrupt SFTP line editor prompt failed: %w", interruptErr))
+			}
+		}
+	}()
 	e.instance.SetPrompt(prompt)
-	return e.instance.Readline()
+	result, err = e.instance.Readline()
+	return result, errors.Join(retErr, err)
+}
+
+func (e *lineEditor) beginPrompt() (chan struct{}, error) {
+	e.promptMu.Lock()
+	defer e.promptMu.Unlock()
+	if e.closing {
+		return nil, fmt.Errorf("sftp line editor is closed")
+	}
+	if e.promptDone != nil {
+		return nil, fmt.Errorf("sftp line editor already has an active prompt")
+	}
+	done := make(chan struct{})
+	e.promptDone = done
+	return done, nil
+}
+
+func (e *lineEditor) endPrompt(done chan struct{}) {
+	e.promptMu.Lock()
+	if e.promptDone == done {
+		e.promptDone = nil
+		close(done)
+	}
+	e.promptMu.Unlock()
 }
 
 func (e *lineEditor) AppendHistory(input string) error {
@@ -70,14 +145,14 @@ func (e *lineEditor) Interrupt() error {
 
 func (e *lineEditor) Close() error {
 	e.closeOnce.Do(func() {
+		<-e.ready
+		e.promptMu.Lock()
+		e.closing = true
+		promptDone := e.promptDone
+		e.promptMu.Unlock()
 		inputErr := e.Interrupt()
-		// chzyer/readline 在 terminal goroutine 内登记 WaitGroup。若编辑器从未进入
-		// Prompt，先 KickRead 并等待其完成登记，避免 Close 与 Add 并发。
-		if !e.promptUsed.Load() {
-			e.instance.Terminal.KickRead()
-			for !e.instance.Terminal.IsReading() {
-				runtime.Gosched()
-			}
+		if promptDone != nil {
+			<-promptDone
 		}
 		editorErr := e.instance.Close()
 		closeInputErr := e.input.Close()
@@ -128,7 +203,11 @@ type shellCompleter struct {
 }
 
 func (c shellCompleter) Do(line []rune, pos int) ([][]rune, int) {
-	head, completions, _ := c.shell.wordCompleter(string(line), pos)
+	// readline invokes completion without a request context. Give this bounded
+	// callback its own context instead of retaining Run's context in the editor.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	head, completions, _ := c.shell.wordCompleter(ctx, string(line), pos)
 	typedRunes := line[len([]rune(head)):pos]
 	candidates := make([][]rune, 0, len(completions))
 	for _, completion := range completions {

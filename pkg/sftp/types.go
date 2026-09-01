@@ -17,7 +17,6 @@ type TransferConfig struct {
 	ResumeMinSize   int64
 	TempSuffix      string
 	Force           bool
-	NoOverwrite     bool
 }
 
 func DefaultConfig() TransferConfig {
@@ -29,7 +28,6 @@ func DefaultConfig() TransferConfig {
 		ResumeMinSize:   DefaultResumeMinSize,
 		TempSuffix:      DefaultTempSuffix,
 		Force:           false,
-		NoOverwrite:     false,
 	}
 }
 

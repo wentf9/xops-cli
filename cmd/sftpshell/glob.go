@@ -1,11 +1,13 @@
-package sftp
+package sftpshell
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"path"
 	"path/filepath"
 
+	pkgsftp "github.com/pkg/sftp"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 )
 
@@ -45,12 +47,23 @@ func (s *Shell) expandLocal(pattern string) ([]string, error) {
 // sftp.Client.Glob 基于绝对路径，相对模式先用 s.resolvePath 解析
 // 无通配符时直接返回 [resolved]
 // 展开结果为空时返回 sftp_shell_glob_no_match 错误
-func (s *Shell) expandRemote(pattern string) ([]string, error) {
+func (s *Shell) expandRemote(ctx context.Context, pattern string) ([]string, error) {
 	resolved := s.resolvePath(pattern)
 	if !hasWildcard(pattern) {
 		return []string{resolved}, nil
 	}
-	matches, err := s.client.sftpClient.Glob(resolved)
+	cli, release, err := s.acquireClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	var matches []string
+	err = cli.Do(ctx, func(c *pkgsftp.Client) error {
+		var globErr error
+		matches, globErr = c.Glob(resolved)
+		return globErr
+	})
 	if err != nil {
 		// sftp.Glob 仅返回 ErrBadPattern
 		return nil, fmt.Errorf("expand remote pattern %q failed: %w", pattern, err)

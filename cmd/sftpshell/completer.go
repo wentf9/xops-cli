@@ -1,13 +1,17 @@
-package sftp
+package sftpshell
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
+
+	pkgsftp "github.com/pkg/sftp"
 )
 
 // wordCompleter 计算光标位置对应的命令或路径补全候选
-func (s *Shell) wordCompleter(line string, pos int) (head string, completions []string, tail string) {
+func (s *Shell) wordCompleter(ctx context.Context, line string, pos int) (head string, completions []string, tail string) {
 	// line editor 传入的 pos 是 rune 位置，需要转换为字节位置来切分字符串
 	runes := []rune(line)
 	content := string(runes[:pos])
@@ -42,7 +46,7 @@ func (s *Shell) wordCompleter(line string, pos int) (head string, completions []
 
 	switch cmd {
 	case "cd", "ls", "ll", "get", "mkdir", "rm", "cp", "mv":
-		completions = s.completeRemotePath(partial)
+		completions = s.completeRemotePath(ctx, partial)
 	case "lcd", "lls", "lll", "put", "lmkdir", "lrm", "lcp", "lmv":
 		completions = s.completeLocalPath(partial)
 	}
@@ -51,10 +55,18 @@ func (s *Shell) wordCompleter(line string, pos int) (head string, completions []
 }
 
 // completeRemotePath 补全远程路径
-func (s *Shell) completeRemotePath(partial string) []string {
-	if s.client == nil {
+func (s *Shell) completeRemotePath(ctx context.Context, partial string) []string {
+	if ctx == nil {
 		return nil
 	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	cli, release, err := s.acquireClient(ctx)
+	if err != nil {
+		return nil
+	}
+	defer release()
 
 	var dir, prefix string
 	if lastSlash := strings.LastIndex(partial, "/"); lastSlash >= 0 {
@@ -67,10 +79,15 @@ func (s *Shell) completeRemotePath(partial string) []string {
 
 	targetDir := dir
 	if !strings.HasPrefix(targetDir, "/") {
-		targetDir = s.client.JoinPath(s.cwd, targetDir)
+		targetDir = cli.JoinPath(s.cwd, targetDir)
 	}
 
-	entries, err := s.client.sftpClient.ReadDir(targetDir)
+	var entries []os.FileInfo
+	err = cli.Do(ctx, func(c *pkgsftp.Client) error {
+		var readErr error
+		entries, readErr = c.ReadDir(targetDir)
+		return readErr
+	})
 	if err != nil {
 		return nil
 	}
