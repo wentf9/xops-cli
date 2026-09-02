@@ -559,6 +559,28 @@ func (c *Client) RunCommandWithIO(ctx context.Context, command string, sudo bool
 	}
 }
 
+// startCommandWithStdinPipeline starts the remote command before performing any
+// stdin write. Some SSH servers advertise a zero channel window until they
+// receive the exec request, so writing an initial sudo or su password before
+// startCommand returns can deadlock in SSH flow control.
+func startCommandWithStdinPipeline(
+	startCommand func() error,
+	stdin io.Reader,
+	stdinPipe io.WriteCloser,
+	initialPayload string,
+) (finishStdin func() error, err error) {
+	if startCommand == nil {
+		return nil, fmt.Errorf("start SSH command function is nil")
+	}
+	if err := validateCommandStdin(stdin); err != nil {
+		return nil, err
+	}
+	if err := startCommand(); err != nil {
+		return nil, err
+	}
+	return setupStdinPipeline(stdin, stdinPipe, initialPayload)
+}
+
 func setupStdinPipeline(stdin io.Reader, stdinPipe io.WriteCloser, initialPayload string) (finishStdin func() error, err error) {
 	if stdinPipe == nil {
 		return func() error { return nil }, nil
@@ -602,7 +624,20 @@ func (c *Client) runRawCommandWithPayload(ctx context.Context, rawCmd, initialPa
 		return fmt.Errorf("open session stdin pipe failed: %w", pipeErr)
 	}
 
-	finishStdin, setupErr := setupStdinPipeline(stdin, stdinPipe, initialPayload)
+	session.Stdout = stdout
+	session.Stderr = stderr
+
+	finishStdin, setupErr := startCommandWithStdinPipeline(
+		func() error {
+			if err := session.Start(rawCmd); err != nil {
+				return fmt.Errorf("start session command failed: %w", err)
+			}
+			return nil
+		},
+		stdin,
+		stdinPipe,
+		initialPayload,
+	)
 	if setupErr != nil {
 		return setupErr
 	}
@@ -611,13 +646,6 @@ func (c *Client) runRawCommandWithPayload(ctx context.Context, rawCmd, initialPa
 			retErr = errors.Join(retErr, finishErr)
 		}
 	}()
-
-	session.Stdout = stdout
-	session.Stderr = stderr
-
-	if err := session.Start(rawCmd); err != nil {
-		return fmt.Errorf("start session command failed: %w", err)
-	}
 
 	done := make(chan error, 1)
 	go func() {
@@ -669,16 +697,6 @@ func (c *Client) runWithSuIO(ctx context.Context, command string, stdin io.Reade
 		payload = clientConfig.SuPwd + "\n"
 	}
 
-	finishStdin, setupErr := setupStdinPipeline(stdin, stdinPipe, payload)
-	if setupErr != nil {
-		return setupErr
-	}
-	defer func() {
-		if finishErr := finishStdin(); finishErr != nil {
-			retErr = errors.Join(retErr, finishErr)
-		}
-	}()
-
 	session.Stdout = stdout
 	session.Stderr = stderr
 
@@ -689,9 +707,25 @@ func (c *Client) runWithSuIO(ctx context.Context, command string, stdin io.Reade
 		cmd = "export LC_ALL=C; su - root"
 	}
 
-	if err := session.Start(cmd); err != nil {
-		return fmt.Errorf("failed to start su session: %w", err)
+	finishStdin, setupErr := startCommandWithStdinPipeline(
+		func() error {
+			if err := session.Start(cmd); err != nil {
+				return fmt.Errorf("failed to start su session: %w", err)
+			}
+			return nil
+		},
+		stdin,
+		stdinPipe,
+		payload,
+	)
+	if setupErr != nil {
+		return setupErr
 	}
+	defer func() {
+		if finishErr := finishStdin(); finishErr != nil {
+			retErr = errors.Join(retErr, finishErr)
+		}
+	}()
 
 	done := make(chan error, 1)
 	go func() {

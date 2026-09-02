@@ -40,6 +40,46 @@ func (m *mockWriteCloser) Close() error {
 	return nil
 }
 
+type startAwareWriteCloser struct {
+	started *atomic.Bool
+	bytes.Buffer
+}
+
+func (w *startAwareWriteCloser) Write(p []byte) (int, error) {
+	if !w.started.Load() {
+		return 0, errors.New("stdin write attempted before command start")
+	}
+	return w.Buffer.Write(p)
+}
+
+func (w *startAwareWriteCloser) Close() error {
+	return nil
+}
+
+func TestStartCommandWithStdinPipeline_StartsCommandBeforeInitialPayload(t *testing.T) {
+	var started atomic.Bool
+	stdinPipe := &startAwareWriteCloser{started: &started}
+
+	finishStdin, err := startCommandWithStdinPipeline(
+		func() error {
+			started.Store(true)
+			return nil
+		},
+		nil,
+		stdinPipe,
+		"sudo-password\n",
+	)
+	if err != nil {
+		t.Fatalf("startCommandWithStdinPipeline() error = %v", err)
+	}
+	if finishStdin == nil {
+		t.Fatal("startCommandWithStdinPipeline() returned nil finish function")
+	}
+	if got := stdinPipe.String(); got != "sudo-password\n" {
+		t.Fatalf("stdin payload = %q, want %q", got, "sudo-password\n")
+	}
+}
+
 // TestPipeCommandStdin_CancelIdempotency 验证 stopAndWait 函数幂等性
 func TestPipeCommandStdin_CancelIdempotency(t *testing.T) {
 	reader := strings.NewReader("hello")
