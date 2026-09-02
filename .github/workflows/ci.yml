@@ -47,6 +47,30 @@ jobs:
           path: coverage.out
           if-no-files-found: error
 
+  windows-test:
+    name: Windows Build and Test
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Build all packages
+        run: go build ./...
+
+      - name: Run Windows tests
+        run: go test -race -shuffle=on -count=1 ./...
+
+      - name: Run Windows ConPTY integration test
+        run: go test -race -tags=integration -run '^TestWindowsLineEditorConPTY$' -count=1 ./cmd/sftpshell
+
   lint:
     name: Lint
     runs-on: ubuntu-latest

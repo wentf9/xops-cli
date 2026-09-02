@@ -12,16 +12,17 @@ import (
 )
 
 type lineEditor struct {
-	instance   *readline.Instance
-	input      promptInput
-	inputOnce  sync.Once
-	inputErr   error
-	ready      chan struct{}
-	promptMu   sync.Mutex
-	promptDone chan struct{}
-	closing    bool
-	closeOnce  sync.Once
-	closeErr   error
+	instance    *readline.Instance
+	input       promptInput
+	inputOnce   sync.Once
+	inputErr    error
+	platform    *lineEditorPlatform
+	promptMu    sync.Mutex
+	promptDone  chan struct{}
+	readStarted bool
+	closing     bool
+	closeOnce   sync.Once
+	closeErr    error
 }
 
 func newLineEditor(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer, historyFile string, shell *Shell) (*lineEditor, error) {
@@ -33,7 +34,8 @@ func newLineEditor(ctx context.Context, stdin io.Reader, stdout, stderr io.Write
 		return nil, fmt.Errorf("duplicate prompt input failed: %w", err)
 	}
 
-	instance, err := readline.NewEx(&readline.Config{
+	platform := newLineEditorPlatform(stdin)
+	config := &readline.Config{
 		HistoryFile:            historyFile,
 		DisableAutoSaveHistory: true,
 		InterruptPrompt:        "^C",
@@ -42,7 +44,9 @@ func newLineEditor(ctx context.Context, stdin io.Reader, stdout, stderr io.Write
 		Stdout:                 stdout,
 		Stderr:                 stderr,
 		AutoComplete:           shellCompleter{shell: shell},
-	})
+	}
+	platform.configure(config)
+	instance, err := readline.NewEx(config)
 	if err != nil {
 		if closeErr := input.Close(); closeErr != nil {
 			return nil, fmt.Errorf(
@@ -53,33 +57,9 @@ func newLineEditor(ctx context.Context, stdin io.Reader, stdout, stderr io.Write
 		}
 		return nil, fmt.Errorf("create line editor failed: %w", err)
 	}
-	editor := &lineEditor{instance: instance, input: input, ready: make(chan struct{})}
-	go editor.waitForTerminalReader(ctx)
+	editor := &lineEditor{instance: instance, input: input, platform: platform}
+	platform.start(ctx, instance)
 	return editor, nil
-}
-
-// waitForTerminalReader establishes that readline's internal terminal
-// goroutine has registered itself before Close is allowed to call into it.
-// readline v1.5.1 registers its WaitGroup inside that goroutine; closing any
-// earlier races with Wait. The editor owns this short-lived goroutine; Close
-// waits for ready before touching readline and cancellation interrupts its
-// input so the goroutine has a bounded exit path.
-func (e *lineEditor) waitForTerminalReader(ctx context.Context) {
-	e.instance.Terminal.KickRead()
-	ticker := time.NewTicker(time.Millisecond)
-	defer ticker.Stop()
-	ctxDone := ctx.Done()
-	for !e.instance.Terminal.IsReading() {
-		select {
-		case <-ctxDone:
-			// resetLineEditor observes cancellation and calls Close, which
-			// interrupts the input. Keep waiting until readline has registered
-			// its WaitGroup so that Close cannot race its internal Add call.
-			ctxDone = nil
-		case <-ticker.C:
-		}
-	}
-	close(e.ready)
 }
 
 func (e *lineEditor) Prompt(ctx context.Context, prompt string) (result string, retErr error) {
@@ -91,6 +71,9 @@ func (e *lineEditor) Prompt(ctx context.Context, prompt string) (result string, 
 		return "", err
 	}
 	defer e.endPrompt(done)
+	if err := e.platform.preparePrompt(); err != nil {
+		return "", err
+	}
 	interruptDone := make(chan error, 1)
 	stopInterrupt := context.AfterFunc(ctx, func() {
 		interruptDone <- e.Interrupt()
@@ -103,8 +86,9 @@ func (e *lineEditor) Prompt(ctx context.Context, prompt string) (result string, 
 		}
 	}()
 	e.instance.SetPrompt(prompt)
+	e.markPromptReadStarted()
 	result, err = e.instance.Readline()
-	return result, errors.Join(retErr, err)
+	return result, errors.Join(retErr, e.platform.finishPrompt(err))
 }
 
 func (e *lineEditor) beginPrompt() (chan struct{}, error) {
@@ -119,6 +103,12 @@ func (e *lineEditor) beginPrompt() (chan struct{}, error) {
 	done := make(chan struct{})
 	e.promptDone = done
 	return done, nil
+}
+
+func (e *lineEditor) markPromptReadStarted() {
+	e.promptMu.Lock()
+	e.readStarted = true
+	e.promptMu.Unlock()
 }
 
 func (e *lineEditor) endPrompt(done chan struct{}) {
@@ -145,7 +135,7 @@ func (e *lineEditor) Interrupt() error {
 
 func (e *lineEditor) Close() error {
 	e.closeOnce.Do(func() {
-		<-e.ready
+		e.platform.waitBeforeClose()
 		e.promptMu.Lock()
 		e.closing = true
 		promptDone := e.promptDone
@@ -154,6 +144,10 @@ func (e *lineEditor) Close() error {
 		if promptDone != nil {
 			<-promptDone
 		}
+		e.promptMu.Lock()
+		readStarted := e.readStarted
+		e.promptMu.Unlock()
+		e.platform.prepareInstanceClose(e.instance, readStarted)
 		editorErr := e.instance.Close()
 		closeInputErr := e.input.Close()
 		switch {

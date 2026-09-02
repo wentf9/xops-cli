@@ -56,3 +56,33 @@ func TestLineEditorCloseInterruptsActivePrompt(t *testing.T) {
 		t.Fatal("active prompt did not return after closing the line editor")
 	}
 }
+
+func TestLineEditorCloseBeforePrompt(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create input pipe failed: %v", err)
+	}
+	defer closeTestResource(t, reader)
+	defer closeTestResource(t, writer)
+
+	shell := &Shell{cwd: "/", localCwd: t.TempDir()}
+	editor, err := newLineEditor(context.Background(), reader, &bytes.Buffer{}, &bytes.Buffer{}, "", shell)
+	if err != nil {
+		t.Fatalf("create line editor failed: %v", err)
+	}
+	closed := make(chan error, 1)
+	go func() {
+		closed <- editor.Close()
+	}()
+	select {
+	case closeErr := <-closed:
+		if closeErr != nil {
+			t.Errorf("close line editor failed: %v", closeErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("closing a line editor before Prompt blocked")
+	}
+	if err := editor.Close(); err != nil {
+		t.Fatalf("second close line editor failed: %v", err)
+	}
+}
