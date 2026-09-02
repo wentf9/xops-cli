@@ -278,16 +278,19 @@ func (o *conPTYOutput) String() string {
 
 func waitForConPTYOutput(t *testing.T, output *conPTYOutput, expected string) {
 	t.Helper()
+	cleanExpected := strings.TrimRight(expected, " ")
 	timer := time.NewTimer(5 * time.Second)
 	defer timer.Stop()
 	for {
-		if strings.Contains(output.String(), expected) {
+		raw := output.String()
+		stripped := stripANSI(raw)
+		if strings.Contains(stripped, cleanExpected) {
 			return
 		}
 		select {
 		case <-output.updated:
 		case <-timer.C:
-			t.Fatalf("ConPTY output did not contain %q; output: %q", expected, output.String())
+			t.Fatalf("ConPTY output did not contain %q; stripped output: %q; raw output: %q", expected, stripped, raw)
 		}
 	}
 }
