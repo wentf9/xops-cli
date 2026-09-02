@@ -23,11 +23,11 @@ func TestCreateFileRecursive(t *testing.T) {
 		t.Errorf("content = %q, want 'hello world'", string(got))
 	}
 
-	// 验证权限
-	info, _ := os.Stat(filePath)
-	if perm := info.Mode().Perm(); perm != 0644 {
-		t.Errorf("permissions = %o, want 0644", perm)
+	info, err := os.Stat(filePath)
+	if err != nil {
+		t.Fatalf("stat created file failed: %v", err)
 	}
+	assertRequestedFileMode(t, info, 0644)
 }
 
 func TestCreateFileRecursive_EmptyContent(t *testing.T) {

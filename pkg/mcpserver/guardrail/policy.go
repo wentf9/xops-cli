@@ -2,7 +2,9 @@ package guardrail
 
 import (
 	"fmt"
+	"path"
 	"path/filepath"
+	"strings"
 
 	"github.com/wentf9/xops-cli/pkg/config"
 )
@@ -119,9 +121,8 @@ func (p *Policy) isPathProtected(paths []string) bool {
 	allProtected = append(allProtected, sensitivePaths...)
 	allProtected = append(allProtected, p.cfg.ProtectedPaths...)
 	for _, target := range paths {
-		cleaned := filepath.Clean(target)
 		for _, protected := range allProtected {
-			if cleaned == protected || matchesUnder(cleaned, protected) {
+			if matchesUnder(target, protected) {
 				return true
 			}
 		}
@@ -129,10 +130,18 @@ func (p *Policy) isPathProtected(paths []string) bool {
 	return false
 }
 
-func matchesUnder(path, prefix string) bool {
-	prefix = filepath.Clean(prefix)
-	if len(path) > len(prefix) && path[:len(prefix)] == prefix && path[len(prefix)] == '/' {
+func matchesUnder(target, prefix string) bool {
+	target = normalizeRemotePath(target)
+	prefix = normalizeRemotePath(prefix)
+	if target == prefix {
 		return true
 	}
-	return false
+	if prefix == "/" {
+		return strings.HasPrefix(target, "/")
+	}
+	return strings.HasPrefix(target, prefix+"/")
+}
+
+func normalizeRemotePath(value string) string {
+	return path.Clean(strings.ReplaceAll(value, `\`, "/"))
 }

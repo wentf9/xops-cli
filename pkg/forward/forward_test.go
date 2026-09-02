@@ -94,77 +94,36 @@ func TestTCPForwarder_ErrorHandler(t *testing.T) {
 }
 
 func TestUDPForwarder_ErrorHandler(t *testing.T) {
-	l, err := net.ListenPacket("udp", "127.0.0.1:0")
+	upstream, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
-		t.Fatalf("listen packet failed: %v", err)
+		t.Fatalf("listen UDP upstream failed: %v", err)
 	}
-	listenAddr := l.LocalAddr().String()
-	if err := l.Close(); err != nil {
-		t.Logf("Close failed: %v", err)
+	if err := upstream.Close(); err != nil {
+		t.Fatalf("close UDP upstream failed: %v", err)
 	}
 
-	var (
-		errMu       sync.Mutex
-		receivedErr error
-		errWG       sync.WaitGroup
-	)
-	errWG.Add(1)
-
+	errCh := make(chan error, 1)
 	errHandler := func(err error) {
-		errMu.Lock()
-		if receivedErr == nil {
-			receivedErr = err
-			errWG.Done()
+		select {
+		case errCh <- err:
+		default:
 		}
-		errMu.Unlock()
 	}
 
-	// 目标为 0.0.0.0:0（端口 0 在 UDP Write 时必触发系统错误）
-	targetAddr := "0.0.0.0:0"
-	f := NewUDPForwarder(listenAddr, targetAddr,
-		WithErrorHandler(errHandler),
-	)
+	f := NewUDPForwarder("unused", "unused", WithErrorHandler(errHandler))
+	clientAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
+	f.sessions[clientAddr.String()] = &udpSession{upstream: upstream, lastSeen: time.Now()}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	runErrCh := make(chan error, 1)
-	go func() {
-		runErrCh <- f.Run(ctx)
-	}()
-
-	time.Sleep(50 * time.Millisecond)
-
-	clientConn, err := net.Dial("udp", listenAddr)
-	if err != nil {
-		t.Fatalf("dial forwarder failed: %v", err)
-	}
-	defer func() {
-		if err := clientConn.Close(); err != nil {
-			t.Logf("Close failed: %v", err)
-		}
-	}()
-
-	_, writeErr := clientConn.Write([]byte("test data"))
-	if writeErr != nil {
-		t.Fatalf("client write failed: %v", writeErr)
-	}
-
-	done := make(chan struct{})
-	go func() {
-		errWG.Wait()
-		close(done)
-	}()
+	var workers sync.WaitGroup
+	f.forward(t.Context(), &workers, nil, clientAddr, &net.UDPAddr{}, []byte("test data"))
 
 	select {
-	case <-done:
-		errMu.Lock()
-		defer errMu.Unlock()
-		if receivedErr == nil {
-			t.Fatal("expected non-nil error reported to ErrorHandler")
+	case receivedErr := <-errCh:
+		if !strings.Contains(receivedErr.Error(), "set udp target write deadline failed") {
+			t.Fatalf("ErrorHandler error = %v, want write deadline context", receivedErr)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for UDP ErrorHandler to be triggered")
+	default:
+		t.Fatal("expected UDP forwarding error to be reported to ErrorHandler")
 	}
 }
 

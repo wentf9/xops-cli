@@ -131,6 +131,32 @@ func TestPolicyEvaluate_ProtectedPath(t *testing.T) {
 	}
 }
 
+func TestMatchesUnder(t *testing.T) {
+	tests := []struct {
+		name      string
+		target    string
+		protected string
+		want      bool
+	}{
+		{name: "exact path", target: "/etc", protected: "/etc", want: true},
+		{name: "child path", target: "/etc/passwd", protected: "/etc", want: true},
+		{name: "clean traversal", target: "/tmp/../etc/passwd", protected: "/etc", want: true},
+		{name: "trailing separator", target: "/etc/passwd", protected: "/etc/", want: true},
+		{name: "windows separators", target: `\etc\passwd`, protected: "/etc", want: true},
+		{name: "sibling prefix", target: "/etc2/passwd", protected: "/etc", want: false},
+		{name: "protected root", target: "/var/lib/data", protected: "/", want: true},
+		{name: "relative outside root", target: "var/lib/data", protected: "/", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := matchesUnder(tt.target, tt.protected); got != tt.want {
+				t.Errorf("matchesUnder(%q, %q) = %t, want %t", tt.target, tt.protected, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestPolicyEvaluate_CustomBlockedPattern(t *testing.T) {
 	cfg := defaultTestConfig()
 	cfg.BlockedPatterns = []string{"*dangerous*"}

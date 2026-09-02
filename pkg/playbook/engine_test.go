@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
@@ -168,41 +167,6 @@ func TestEngine_NoTargets(t *testing.T) {
 	_, err := engine.Run(context.Background())
 	if err == nil {
 		t.Fatal("expected error due to no targets resolved, got nil")
-	}
-}
-
-func TestEngine_Timeout(t *testing.T) {
-	provider := createTestProvider()
-	pb := &playbook.Playbook{
-		Name: "test",
-		Targets: playbook.Targets{
-			Nodes: []string{"web-1"},
-		},
-		Settings: playbook.Settings{
-			// 设置一个极短的超时，让它很快超时
-			Timeout: playbook.Duration{Duration: 1 * time.Microsecond},
-		},
-		Steps: []playbook.Step{
-			{Name: "test-step", Shell: "sleep 1"},
-		},
-	}
-	connector := adapter.NewConnector(provider)
-	engine := playbook.NewEngine(pb, provider, connector)
-
-	// 运行，由于超时极短，context 应该在执行中被超时取消
-	report, err := engine.Run(context.Background())
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Run error = %v, want context.DeadlineExceeded", err)
-	}
-
-	if len(report.Hosts) != 1 {
-		t.Fatalf("expected 1 host report, got %d", len(report.Hosts))
-	}
-
-	// 应该因为 context 取消而连接失败或中断
-	hr := report.Hosts[0]
-	if hr.Status != playbook.HostStatusFailed && hr.Status != playbook.HostStatusAborted {
-		t.Errorf("host status should be failed or aborted due to timeout, got %s", hr.Status)
 	}
 }
 

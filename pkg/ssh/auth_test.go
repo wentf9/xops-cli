@@ -35,6 +35,14 @@ type mockUIForTest struct {
 	called     bool
 }
 
+func setTestHome(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir)
+	return dir
+}
+
 func (m *mockUIForTest) PromptPassword(prompt string) (string, error) {
 	m.called = true
 	return m.passphrase, nil
@@ -108,13 +116,7 @@ func TestLazySigner(t *testing.T) {
 	pemData, sshPub := generateTestEncryptedKey(t, passphrase)
 
 	// 使用临时文件模拟 keyPath 路径，以便测试自动保存公钥的功能
-	tempDir, err := os.MkdirTemp("", "lazy-signer-test")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer func() {
-		_ = os.RemoveAll(tempDir)
-	}()
+	tempDir := t.TempDir()
 
 	keyPath := filepath.Join(tempDir, "id_rsa")
 
@@ -195,15 +197,7 @@ func TestParseOpenSSHPublicKeyFromEncryptedPrivate(t *testing.T) {
 
 func TestBuildAutoAuthMethods_LazySigner_OpenSSH(t *testing.T) {
 	// 创建一个临时目录来存放 SSH 密钥
-	tempDir, err := os.MkdirTemp("", "ssh-auth-test-openssh")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer func() {
-		_ = os.RemoveAll(tempDir)
-	}()
-
-	t.Setenv("HOME", tempDir)
+	tempDir := setTestHome(t)
 
 	sshDir := filepath.Join(tempDir, ".ssh")
 	if err := os.MkdirAll(sshDir, 0700); err != nil {
@@ -262,15 +256,7 @@ func TestBuildAutoAuthMethods_LazySigner_OpenSSH(t *testing.T) {
 
 func TestBuildAutoAuthMethods_LazySigner_PEMFallback(t *testing.T) {
 	// 创建一个临时目录来存放 SSH 密钥
-	tempDir, err := os.MkdirTemp("", "ssh-auth-test-pem")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer func() {
-		_ = os.RemoveAll(tempDir)
-	}()
-
-	t.Setenv("HOME", tempDir)
+	tempDir := setTestHome(t)
 
 	sshDir := filepath.Join(tempDir, ".ssh")
 	if err := os.MkdirAll(sshDir, 0700); err != nil {

@@ -230,7 +230,7 @@ make verify
 make ci
 ```
 
-CI 会在提交到 `master` 或向 `master` 提交 Pull Request 时自动执行全量构建、测试和 golangci-lint。
+CI 会在提交到 `master` 或向 `master` 提交 Pull Request 时自动执行 Linux 全量构建、测试和 golangci-lint，同时执行 Windows 全量测试与 ConPTY 集成测试。
 
 ### 错误与日志边界
 

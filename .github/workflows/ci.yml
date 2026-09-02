@@ -69,6 +69,7 @@ jobs:
         run: go test -race -shuffle=on -count=1 ./...
 
       - name: Run Windows ConPTY integration test
+        if: ${{ !cancelled() }}
         run: go test -race -tags=integration -run '^TestWindowsLineEditorConPTY$' -count=1 ./cmd/sftpshell
 
   lint:
