@@ -131,15 +131,13 @@ func (o *SftpOptions) RunContext(ctx context.Context) (err error) {
 		return err
 	}
 	connector := newCLIConnector(provider, ssh.WithLogger(logger.DefaultLogger()))
-	connectCtx, cancelConnect := context.WithTimeout(ctx, 10*time.Second)
-	client, err := connector.Connect(connectCtx, nodeID)
-	cancelConnect()
-	if err != nil {
-		return fmt.Errorf("%s: %w", i18n.T("err_connect_failed"), err)
-	}
 	defer func() {
 		joinConnectorCloseError(&err, connector)
 	}()
+	client, err := connector.Connect(ctx, nodeID)
+	if err != nil {
+		return fmt.Errorf("%s: %w", i18n.T("err_connect_failed"), err)
+	}
 	sftpClient, err := sftp.NewClient(
 		ctx,
 		client,

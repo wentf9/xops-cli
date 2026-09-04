@@ -36,11 +36,11 @@ func (subsystemTestStore) UpdateSudo(context.Context, string, string, projectssh
 
 type subsystemTestInteraction struct{}
 
-func (subsystemTestInteraction) PromptPassword(string) (string, error) {
+func (subsystemTestInteraction) PromptSecret(context.Context, projectssh.SecretRequest) (string, error) {
 	return "test-password", nil
 }
 
-func (subsystemTestInteraction) ConfirmHostKey(string, string) (bool, error) {
+func (subsystemTestInteraction) ConfirmHostKey(context.Context, projectssh.HostKeyConfirmation) (bool, error) {
 	return true, nil
 }
 
@@ -66,7 +66,7 @@ func TestClient_InterruptClosesOnlyOwnSFTPSubsystem(t *testing.T) {
 			Password: "test-password",
 			SudoMode: projectssh.SudoModeNone,
 		}},
-		subsystemTestInteraction{},
+		projectssh.WithInteractionHandler(subsystemTestInteraction{}),
 	)
 	connector.AcceptNewHostKey.Store(true)
 	t.Cleanup(func() {
@@ -147,7 +147,7 @@ func TestNewClient_CanceledSubsystemSetupKeepsSSHTransportOpen(t *testing.T) {
 			Password: "test-password",
 			SudoMode: projectssh.SudoModeNone,
 		}},
-		subsystemTestInteraction{},
+		projectssh.WithInteractionHandler(subsystemTestInteraction{}),
 	)
 	connector.AcceptNewHostKey.Store(true)
 	t.Cleanup(func() {

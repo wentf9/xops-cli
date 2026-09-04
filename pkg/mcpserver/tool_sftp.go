@@ -40,24 +40,7 @@ type ReadFileOutput struct {
 }
 
 func getSFTPClient(ctx context.Context, nodeID string) (*sftp.Client, error) {
-	connector, err := getMCPConnector()
-	if err != nil {
-		return nil, err
-	}
-
-	sshClient, err := connector.Connect(ctx, nodeID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to ssh: %w", err)
-	}
-
-	// TODO(optimization): Consider caching/pooling *sftp.Client instances per node to avoid
-	// creating and closing SFTP subsystems (SSH channel negotiation + SFTP handshake) on every call.
-	sftpClient, err := sftp.NewClient(ctx, sshClient)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create sftp client: %w", err)
-	}
-
-	return sftpClient, nil
+	return getMCPSFTPClient(ctx, nodeID)
 }
 
 type remoteFile interface {

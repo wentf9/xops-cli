@@ -10,7 +10,6 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	pkgsftp "github.com/pkg/sftp"
 	"github.com/wentf9/xops-cli/pkg/mcpserver/guardrail"
-	"github.com/wentf9/xops-cli/pkg/sftp"
 )
 
 // ======================== LS ========================
@@ -38,19 +37,9 @@ func fsLsHandler(ctx context.Context, req *mcp.CallToolRequest, input FSListInpu
 		return nil, FSListOutput{}, fmt.Errorf("nodeID and path are required")
 	}
 
-	connector, err := getMCPConnector()
+	sftpClient, err := getMCPSFTPClient(ctx, input.NodeID)
 	if err != nil {
 		return nil, FSListOutput{}, err
-	}
-
-	sshClient, err := connector.Connect(ctx, input.NodeID)
-	if err != nil {
-		return nil, FSListOutput{}, fmt.Errorf("failed to connect to ssh: %w", err)
-	}
-
-	sftpClient, err := sftp.NewClient(ctx, sshClient)
-	if err != nil {
-		return nil, FSListOutput{}, fmt.Errorf("failed to create sftp client: %w", err)
 	}
 	defer joinCloseError(&handlerErr, sftpClient, "sftp client")
 
@@ -97,17 +86,7 @@ func fsMkdirHandler(ctx context.Context, req *mcp.CallToolRequest, input FSMkdir
 		return nil, FSBaseOutput{}, fmt.Errorf("nodeID and path are required")
 	}
 
-	connector, err := getMCPConnector()
-	if err != nil {
-		return nil, FSBaseOutput{}, err
-	}
-
-	sshClient, err := connector.Connect(ctx, input.NodeID)
-	if err != nil {
-		return nil, FSBaseOutput{}, err
-	}
-
-	sftpClient, err := sftp.NewClient(ctx, sshClient)
+	sftpClient, err := getMCPSFTPClient(ctx, input.NodeID)
 	if err != nil {
 		return nil, FSBaseOutput{}, err
 	}
@@ -134,17 +113,7 @@ func fsTouchHandler(ctx context.Context, req *mcp.CallToolRequest, input FSTouch
 		return nil, FSBaseOutput{}, fmt.Errorf("nodeID and path are required")
 	}
 
-	connector, err := getMCPConnector()
-	if err != nil {
-		return nil, FSBaseOutput{}, err
-	}
-
-	sshClient, err := connector.Connect(ctx, input.NodeID)
-	if err != nil {
-		return nil, FSBaseOutput{}, err
-	}
-
-	sftpClient, err := sftp.NewClient(ctx, sshClient)
+	sftpClient, err := getMCPSFTPClient(ctx, input.NodeID)
 	if err != nil {
 		return nil, FSBaseOutput{}, err
 	}
@@ -176,17 +145,7 @@ func fsMvHandler(ctx context.Context, req *mcp.CallToolRequest, input FSMvInput)
 		return nil, FSBaseOutput{}, fmt.Errorf("nodeID, oldPath and newPath are required")
 	}
 
-	connector, err := getMCPConnector()
-	if err != nil {
-		return nil, FSBaseOutput{}, err
-	}
-
-	sshClient, err := connector.Connect(ctx, input.NodeID)
-	if err != nil {
-		return nil, FSBaseOutput{}, err
-	}
-
-	sftpClient, err := sftp.NewClient(ctx, sshClient)
+	sftpClient, err := getMCPSFTPClient(ctx, input.NodeID)
 	if err != nil {
 		return nil, FSBaseOutput{}, err
 	}
@@ -213,12 +172,7 @@ func fsRmHandler(ctx context.Context, req *mcp.CallToolRequest, input FSRmInput)
 		return nil, FSBaseOutput{}, fmt.Errorf("nodeID and path are required")
 	}
 
-	connector, err := getMCPConnector()
-	if err != nil {
-		return nil, FSBaseOutput{}, err
-	}
-
-	sshClient, err := connector.Connect(ctx, input.NodeID)
+	sshClient, err := connectMCPNode(ctx, input.NodeID)
 	if err != nil {
 		return nil, FSBaseOutput{}, err
 	}
@@ -245,12 +199,7 @@ func fsCpHandler(ctx context.Context, req *mcp.CallToolRequest, input FSCpInput)
 		return nil, FSBaseOutput{}, fmt.Errorf("nodeID, srcPath and destPath are required")
 	}
 
-	connector, err := getMCPConnector()
-	if err != nil {
-		return nil, FSBaseOutput{}, err
-	}
-
-	sshClient, err := connector.Connect(ctx, input.NodeID)
+	sshClient, err := connectMCPNode(ctx, input.NodeID)
 	if err != nil {
 		return nil, FSBaseOutput{}, err
 	}

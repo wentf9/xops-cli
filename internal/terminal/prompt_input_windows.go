@@ -1,8 +1,9 @@
 //go:build windows
 
-package sftpshell
+package terminal
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -39,11 +40,12 @@ type windowsConsolePromptReader struct {
 	pending     []byte
 }
 
-func duplicatePromptInput(input io.Reader) (promptInput, error) {
+// DuplicatePromptInput duplicates an input stream and equips it with an interrupt mechanism for Windows.
+func DuplicatePromptInput(input io.Reader) (PromptInput, error) {
 	file, ok := input.(*os.File)
 	if !ok {
 		if closer, hasCloser := input.(io.ReadCloser); hasCloser {
-			return &closablePromptInput{ReadCloser: closer}, nil
+			return &ClosablePromptInput{ReadCloser: closer}, nil
 		}
 		return nil, fmt.Errorf("prompt input must be an *os.File or io.ReadCloser")
 	}
@@ -102,10 +104,6 @@ func (i *windowsPromptInput) Read(buffer []byte) (int, error) {
 }
 
 func readWindowsConsoleEvent(handle, cancelEvent windows.Handle) (coninput.EventRecord, error) {
-	// A console input handle is signaled while unread records are available.
-	// Waiting on a separate cancellation event keeps ReadConsoleInputW itself
-	// non-blocking and lets Interrupt wake the reader without touching process
-	// stdin. Put cancellation first so shutdown wins if both handles are ready.
 	woken, err := windows.WaitForMultipleObjects(
 		[]windows.Handle{cancelEvent, handle},
 		false,
@@ -169,6 +167,18 @@ func (r *windowsConsolePromptReader) copyPending(buffer []byte) int {
 }
 
 func (r *windowsConsolePromptReader) translateKeyEvent(key coninput.KeyEventRecord) []byte {
+	single := r.translateSingleKeyEvent(key)
+	if len(single) == 0 {
+		return []byte{}
+	}
+	repeat := int(key.RepeatCount)
+	if repeat <= 1 {
+		return single
+	}
+	return bytes.Repeat(single, repeat)
+}
+
+func (r *windowsConsolePromptReader) translateSingleKeyEvent(key coninput.KeyEventRecord) []byte {
 	if !key.KeyDown {
 		r.releaseModifier(key.VirtualKeyCode)
 		return []byte{}

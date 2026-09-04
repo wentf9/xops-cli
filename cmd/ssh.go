@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
@@ -201,9 +200,10 @@ func (o *SshOptions) runParentDaemon(ctx context.Context) (err error) {
 		return err
 	}
 	connector := newCLIConnector(provider, ssh.WithLogger(logger.DefaultLogger()))
-	connectCtx, connectCancel := context.WithTimeout(ctx, 10*time.Second)
-	client, err := connector.Connect(connectCtx, nodeID)
-	connectCancel()
+	defer func() {
+		joinConnectorCloseError(&err, connector)
+	}()
+	client, err := connector.Connect(ctx, nodeID)
 	if err != nil {
 		promptErr := promptPressEnterIfTUI(os.Stdin, os.Stdout)
 		return errors.Join(fmt.Errorf("%s: %w", i18n.T("fw_connect_failed"), err), promptErr)
@@ -286,9 +286,10 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 		return err
 	}
 	connector := newCLIConnector(provider, ssh.WithLogger(logger.DefaultLogger()))
-	connectCtx, connectCancel := context.WithTimeout(ctx, 10*time.Second)
-	client, err := connector.Connect(connectCtx, nodeID)
-	connectCancel()
+	defer func() {
+		joinConnectorCloseError(&err, connector)
+	}()
+	client, err := connector.Connect(ctx, nodeID)
 	if err != nil {
 		if isChild {
 			// 子进程静默退出或记录错误，不进行交互式阻塞

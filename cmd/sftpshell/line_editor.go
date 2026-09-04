@@ -9,11 +9,12 @@ import (
 	"time"
 
 	"github.com/chzyer/readline"
+	"github.com/wentf9/xops-cli/internal/terminal"
 )
 
 type lineEditor struct {
 	instance    *readline.Instance
-	input       promptInput
+	input       terminal.PromptInput
 	inputOnce   sync.Once
 	inputErr    error
 	platform    *lineEditorPlatform
@@ -29,7 +30,7 @@ func newLineEditor(ctx context.Context, stdin io.Reader, stdout, stderr io.Write
 	if ctx == nil {
 		return nil, fmt.Errorf("line editor context is nil")
 	}
-	input, err := duplicatePromptInput(stdin)
+	input, err := terminal.DuplicatePromptInput(stdin)
 	if err != nil {
 		return nil, fmt.Errorf("duplicate prompt input failed: %w", err)
 	}
@@ -168,28 +169,6 @@ func (e *lineEditor) Close() error {
 		}
 	})
 	return e.closeErr
-}
-
-type promptInput interface {
-	io.ReadCloser
-	Interrupt() error
-}
-
-type closablePromptInput struct {
-	io.ReadCloser
-	once sync.Once
-	err  error
-}
-
-func (i *closablePromptInput) Interrupt() error {
-	i.once.Do(func() {
-		i.err = i.ReadCloser.Close()
-	})
-	return i.err
-}
-
-func (i *closablePromptInput) Close() error {
-	return i.Interrupt()
 }
 
 type shellCompleter struct {

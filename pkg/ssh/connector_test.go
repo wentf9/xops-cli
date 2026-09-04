@@ -2,11 +2,14 @@ package ssh
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"errors"
 	"fmt"
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -86,7 +89,7 @@ func TestConnector_Connect_ConcurrentStaleProbeRunsOnce(t *testing.T) {
 		AuthType: "password",
 		Password: "mockpassword",
 	}}
-	connector := NewConnector(store, &mockUI{})
+	connector := NewConnector(store, WithInteractionHandler(&mockUI{}))
 	defer func() {
 		if err := connector.CloseAll(); err != nil {
 			t.Logf("CloseAll failed: %v", err)
@@ -141,7 +144,7 @@ func TestConnector_Connect_CallerCancellationDoesNotCloseSharedClient(t *testing
 		AuthType: "password",
 		Password: "mockpassword",
 	}}
-	connector := NewConnector(store, &mockUI{})
+	connector := NewConnector(store, WithInteractionHandler(&mockUI{}))
 	defer func() {
 		if err := connector.CloseAll(); err != nil {
 			t.Logf("CloseAll failed: %v", err)
@@ -222,7 +225,7 @@ func TestConnector_CloseAllCancelsInFlightHandshake(t *testing.T) {
 		AuthType: "password",
 		Password: "mockpassword",
 	}}
-	connector := NewConnector(store, &mockUI{})
+	connector := NewConnector(store, WithInteractionHandler(&mockUI{}))
 	accepted := make(chan net.Conn, 1)
 	go func() {
 		conn, acceptErr := listener.Accept()
@@ -315,13 +318,22 @@ func TestClientUpdateSudoModePersistsWhenSnapshotHasToken(t *testing.T) {
 	}
 }
 
-type mockUI struct{}
+type mockUI struct {
+	lastSecretReq  SecretRequest
+	lastConfirmReq HostKeyConfirmation
+}
 
-func (m *mockUI) PromptPassword(prompt string) (string, error) {
+func (m *mockUI) PromptSecret(ctx context.Context, req SecretRequest) (string, error) {
+	if m != nil {
+		m.lastSecretReq = req
+	}
 	return "mockpass", nil
 }
 
-func (m *mockUI) ConfirmHostKey(hostname string, fingerprint string) (bool, error) {
+func (m *mockUI) ConfirmHostKey(ctx context.Context, req HostKeyConfirmation) (bool, error) {
+	if m != nil {
+		m.lastConfirmReq = req
+	}
 	return true, nil
 }
 
@@ -338,7 +350,7 @@ func TestConnector_Connect_Cached(t *testing.T) {
 	}
 	ui := &mockUI{}
 
-	connector := NewConnector(store, ui)
+	connector := NewConnector(store, WithInteractionHandler(ui))
 
 	// 模拟已存在缓存连接
 	dummyClient := &ssh.Client{}
@@ -391,7 +403,7 @@ func TestConnector_Connect_Reconnection(t *testing.T) {
 	}
 	ui := &mockUI{}
 
-	connector := NewConnector(store, ui)
+	connector := NewConnector(store, WithInteractionHandler(ui))
 
 	// 模拟已存在缓存连接，但该连接已经失效
 	mc := &mockConn{}
@@ -446,7 +458,7 @@ func TestConnector_Connect_ProxyJumpCycle(t *testing.T) {
 	}
 	ui := &mockUI{}
 
-	connector := NewConnector(store, ui)
+	connector := NewConnector(store, WithInteractionHandler(ui))
 	ctx := context.Background()
 	_, err := connector.Connect(ctx, "node-1")
 	if err == nil {
@@ -472,7 +484,7 @@ func TestConnector_Connect_ResolvedProxyChainUsesRootClient(t *testing.T) {
 			Address: "192.0.2.20",
 		},
 	}}
-	connector := NewConnector(store, &mockUI{})
+	connector := NewConnector(store, WithInteractionHandler(&mockUI{}))
 	// nil Conn 的客户端仅用于验证计划顺序和包装结果，不执行网络探测。
 	connector.clients.Set("target", &PooledClient{SSHClient: &ssh.Client{}})
 	connector.clients.Set("jump", &PooledClient{SSHClient: &ssh.Client{}})
@@ -503,7 +515,7 @@ func TestConnector_Connect_ConcurrentProxyJumpCycleDoesNotDeadlock(t *testing.T)
 			ProxyJump: "node-1",
 		},
 	}}
-	connector := NewConnector(store, &mockUI{})
+	connector := NewConnector(store, WithInteractionHandler(&mockUI{}))
 
 	results := make(chan error, 2)
 	for _, nodeName := range []string{"node-1", "node-2"} {
@@ -547,7 +559,7 @@ func TestConnector_ResolveConnectionPlan_MultiHopProxyJump(t *testing.T) {
 		"openssh:first":  {NodeID: "openssh:first", ProxyJump: "ignored"},
 		"openssh:second": {NodeID: "openssh:second", ProxyJump: "ignored"},
 	}}
-	connector := NewConnector(store, nil)
+	connector := NewConnector(store)
 	t.Cleanup(func() {
 		if err := connector.CloseAll(); err != nil {
 			t.Errorf("close connector: %v", err)
@@ -578,7 +590,7 @@ func TestConnector_Connect_MultiHopProxyJump(t *testing.T) {
 		"openssh:first":  {NodeID: "openssh:first"},
 		"openssh:second": {NodeID: "openssh:second"},
 	}}
-	connector := NewConnector(store, &mockUI{})
+	connector := NewConnector(store, WithInteractionHandler(&mockUI{}))
 	for nodeID := range store.cfgs {
 		connector.clients.Set(nodeID, &PooledClient{SSHClient: &ssh.Client{}})
 	}
@@ -609,4 +621,422 @@ func (m *mockProxyJumpStore) UpdateAuth(context.Context, string, string, string,
 
 func (m *mockProxyJumpStore) UpdateSudo(context.Context, string, string, SudoMode, string) error {
 	return nil
+}
+
+func TestConnector_DefaultFailClosed_RejectsInteraction(t *testing.T) {
+	store := &mockConfigStore{
+		cfg: &ClientConfig{
+			NodeID:   "su-node",
+			Address:  "127.0.0.1",
+			Port:     22,
+			User:     "user",
+			AuthType: "password",
+			Password: "pwd",
+			SudoMode: SudoModeSu,
+			SuPwd:    "",
+		},
+	}
+	// 不传入任何 interaction handler，默认使用 rejectInteraction
+	connector := NewConnector(store)
+	t.Cleanup(func() {
+		if closeErr := connector.CloseAll(); closeErr != nil {
+			t.Errorf("close connector failed: %v", closeErr)
+		}
+	})
+
+	_, err := connector.initializeConnection(context.Background(), connectionPlanNode{name: "su-node", cfg: store.cfg}, nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, ErrInteractionRequired) {
+		t.Fatalf("expected ErrInteractionRequired, got: %v", err)
+	}
+}
+
+func TestConnector_DefaultFailClosed_RejectsHostKey(t *testing.T) {
+	connector := NewConnector(&mockConfigStore{})
+	t.Cleanup(func() {
+		if closeErr := connector.CloseAll(); closeErr != nil {
+			t.Errorf("close connector failed: %v", closeErr)
+		}
+	})
+
+	_, sshPub := generateTestEncryptedKey(t, "unused")
+
+	promptErr := connector.promptHostKeyVerification(context.Background(), "unknown-host", nil, sshPub)
+	if promptErr == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(promptErr, ErrInteractionRequired) {
+		t.Fatalf("expected ErrInteractionRequired, got: %v", promptErr)
+	}
+}
+
+func TestConnector_CloseAll_WakesWaitingInteraction(t *testing.T) {
+	promptEntered := make(chan struct{})
+	blockingPrompter := &blockingTestPrompter{
+		promptFunc: func(ctx context.Context, req SecretRequest) (string, error) {
+			close(promptEntered)
+			<-ctx.Done()
+			return "", ctx.Err()
+		},
+	}
+
+	store := &mockConfigStore{
+		cfg: &ClientConfig{
+			NodeID:   "su-node",
+			Address:  "127.0.0.1",
+			Port:     22,
+			User:     "user",
+			AuthType: "password",
+			Password: "pwd",
+			SudoMode: SudoModeSu,
+			SuPwd:    "",
+		},
+	}
+
+	connector := NewConnector(store, WithSecretPrompter(blockingPrompter))
+
+	connectErr := make(chan error, 1)
+	go func() {
+		_, err := connector.Connect(context.Background(), "su-node")
+		connectErr <- err
+	}()
+
+	select {
+	case <-promptEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("interaction was not entered")
+	}
+
+	if err := connector.CloseAll(); err != nil {
+		t.Fatalf("CloseAll failed: %v", err)
+	}
+
+	select {
+	case err := <-connectErr:
+		if err == nil {
+			t.Fatal("expected connect error after CloseAll, got nil")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("connect did not wake up after CloseAll")
+	}
+}
+
+type blockingTestPrompter struct {
+	promptFunc func(ctx context.Context, req SecretRequest) (string, error)
+}
+
+func (p *blockingTestPrompter) PromptSecret(ctx context.Context, req SecretRequest) (string, error) {
+	if p.promptFunc != nil {
+		return p.promptFunc(ctx, req)
+	}
+	return "", nil
+}
+
+func startTestSSHPasswordServer(t *testing.T, expectedPassword string) (string, int) {
+	t.Helper()
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("failed to generate private key: %v", err)
+	}
+	signer, err := ssh.NewSignerFromKey(privateKey)
+	if err != nil {
+		t.Fatalf("failed to create signer: %v", err)
+	}
+
+	serverConfig := &ssh.ServerConfig{
+		PasswordCallback: func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+			if string(password) == expectedPassword {
+				return nil, nil
+			}
+			return nil, errors.New("wrong password")
+		},
+	}
+	serverConfig.AddHostKey(signer)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start test listener: %v", err)
+	}
+
+	var serverWG sync.WaitGroup
+	serverErrCh := make(chan error, 4)
+
+	serverWG.Add(1)
+	go func() {
+		defer serverWG.Done()
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			if !errors.Is(acceptErr, net.ErrClosed) {
+				serverErrCh <- fmt.Errorf("accept server conn failed: %w", acceptErr)
+			}
+			return
+		}
+		defer func() {
+			if closeErr := conn.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+				serverErrCh <- fmt.Errorf("close server conn failed: %w", closeErr)
+			}
+		}()
+		sConn, chans, reqs, srvErr := ssh.NewServerConn(conn, serverConfig)
+		if srvErr != nil {
+			if !errors.Is(srvErr, net.ErrClosed) {
+				serverErrCh <- fmt.Errorf("new server conn failed: %w", srvErr)
+			}
+			return
+		}
+		defer func() {
+			if closeErr := sConn.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+				serverErrCh <- fmt.Errorf("close server ssh conn failed: %w", closeErr)
+			}
+		}()
+		var reqWG sync.WaitGroup
+		reqWG.Add(1)
+		go func() {
+			defer reqWG.Done()
+			ssh.DiscardRequests(reqs)
+		}()
+		for range chans {
+		}
+		reqWG.Wait()
+	}()
+
+	t.Cleanup(func() {
+		if closeErr := listener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			t.Errorf("close listener failed: %v", closeErr)
+		}
+		serverWG.Wait()
+		close(serverErrCh)
+		for sErr := range serverErrCh {
+			t.Errorf("server error: %v", sErr)
+		}
+	})
+
+	host, portStr, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatalf("split host port: %v", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("parse host port failed: %v", err)
+	}
+
+	return host, port
+}
+
+func TestConnector_InteractionExceedsNetworkTimeout_Succeeds(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+	t.Setenv("USERPROFILE", tempHome)
+
+	host, port := startTestSSHPasswordServer(t, "secret123")
+
+	store := &mockConfigStore{
+		cfg: &ClientConfig{
+			NodeID:   "test-node",
+			Address:  host,
+			Port:     port,
+			User:     "tester",
+			AuthType: "auto", // 会触发 PromptSecret
+		},
+	}
+
+	networkTimeout := 100 * time.Millisecond
+	interactionDelay := 250 * time.Millisecond // 250ms > 100ms 网络超时，但 < 2s 交互超时
+
+	delayPrompter := &testDelayPrompter{
+		delay:      interactionDelay,
+		passphrase: "secret123",
+	}
+
+	connector := NewConnector(
+		store,
+		WithSecretPrompter(delayPrompter),
+		WithHandshakeTimeout(networkTimeout),
+		WithInteractionTimeout(2*time.Second),
+	)
+	connector.AcceptNewHostKey.Store(true)
+	t.Cleanup(func() {
+		if closeErr := connector.CloseAll(); closeErr != nil {
+			t.Errorf("close connector failed: %v", closeErr)
+		}
+	})
+
+	client, err := connector.Connect(context.Background(), "test-node")
+	if err != nil {
+		t.Fatalf("expected connect to succeed even when interaction delay (%v) > network timeout (%v), got err: %v",
+			interactionDelay, networkTimeout, err)
+	}
+	if client == nil {
+		t.Fatal("expected non-nil client")
+	}
+	if closeErr := client.Close(); closeErr != nil {
+		t.Errorf("close client failed: %v", closeErr)
+	}
+}
+
+type testDelayPrompter struct {
+	delay      time.Duration
+	passphrase string
+	err        error
+	onPrompt   func()
+}
+
+func (p *testDelayPrompter) PromptSecret(ctx context.Context, req SecretRequest) (string, error) {
+	if p.onPrompt != nil {
+		p.onPrompt()
+	}
+	if p.err != nil {
+		return "", p.err
+	}
+	select {
+	case <-time.After(p.delay):
+		return p.passphrase, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func TestConnector_HandshakeTimeout_ReturnsDeadlineExceeded(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+	t.Setenv("USERPROFILE", tempHome)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start test listener: %v", err)
+	}
+
+	var serverWG sync.WaitGroup
+	serverErrCh := make(chan error, 4)
+
+	serverWG.Add(1)
+	go func() {
+		defer serverWG.Done()
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			if !errors.Is(acceptErr, net.ErrClosed) {
+				serverErrCh <- fmt.Errorf("accept conn failed: %w", acceptErr)
+			}
+			return
+		}
+		defer func() {
+			if closeErr := conn.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+				serverErrCh <- fmt.Errorf("close conn failed: %w", closeErr)
+			}
+		}()
+		buf := make([]byte, 1024)
+		for {
+			if _, readErr := conn.Read(buf); readErr != nil {
+				return
+			}
+		}
+	}()
+
+	t.Cleanup(func() {
+		if closeErr := listener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			t.Errorf("close listener failed: %v", closeErr)
+		}
+		serverWG.Wait()
+		close(serverErrCh)
+		for sErr := range serverErrCh {
+			t.Errorf("server error: %v", sErr)
+		}
+	})
+
+	host, portStr, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatalf("split host port: %v", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("parse host port failed: %v", err)
+	}
+
+	store := &mockConfigStore{
+		cfg: &ClientConfig{
+			NodeID:   "hang-node",
+			Address:  host,
+			Port:     port,
+			User:     "tester",
+			AuthType: "password",
+			Password: "pwd",
+		},
+	}
+
+	handshakeTimeout := 100 * time.Millisecond
+	connector := NewConnector(
+		store,
+		WithHandshakeTimeout(handshakeTimeout),
+	)
+	t.Cleanup(func() {
+		if closeErr := connector.CloseAll(); closeErr != nil {
+			t.Errorf("close connector failed: %v", closeErr)
+		}
+	})
+
+	_, connectErr := connector.Connect(context.Background(), "hang-node")
+	if connectErr == nil {
+		t.Fatal("expected connect to fail on handshake timeout, got nil")
+	}
+	if !errors.Is(connectErr, context.DeadlineExceeded) {
+		t.Fatalf("expected connect error to wrap context.DeadlineExceeded, got: %v", connectErr)
+	}
+}
+
+type blockingTestDialer struct {
+	dialEntered chan struct{}
+}
+
+func (d *blockingTestDialer) Dial(network, addr string) (net.Conn, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (d *blockingTestDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if d.dialEntered != nil {
+		close(d.dialEntered)
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestConnector_DialTimeout_ReturnsDeadlineExceeded(t *testing.T) {
+	dialEntered := make(chan struct{})
+	fakeDialer := &blockingTestDialer{dialEntered: dialEntered}
+
+	store := &mockConfigStore{
+		cfg: &ClientConfig{
+			NodeID:   "dial-hang-node",
+			Address:  "127.0.0.1",
+			Port:     22,
+			User:     "tester",
+			AuthType: "password",
+			Password: "pwd",
+		},
+	}
+
+	handshakeTimeout := 50 * time.Millisecond
+	connector := NewConnector(
+		store,
+		WithDialer(fakeDialer),
+		WithHandshakeTimeout(handshakeTimeout),
+	)
+	t.Cleanup(func() {
+		if closeErr := connector.CloseAll(); closeErr != nil {
+			t.Errorf("close connector failed: %v", closeErr)
+		}
+	})
+
+	_, connectErr := connector.Connect(context.Background(), "dial-hang-node")
+	if connectErr == nil {
+		t.Fatal("expected connect to fail on dial timeout, got nil")
+	}
+
+	var connErr *ConnectionError
+	if !errors.As(connectErr, &connErr) {
+		t.Fatalf("expected ConnectionError, got: %T (%v)", connectErr, connectErr)
+	}
+	if !errors.Is(connectErr, context.DeadlineExceeded) {
+		t.Fatalf("expected connect error to wrap context.DeadlineExceeded, got: %v", connectErr)
+	}
 }

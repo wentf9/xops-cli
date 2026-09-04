@@ -82,14 +82,9 @@ func sshRunHandler(ctx context.Context, req *mcp.CallToolRequest, input SshRunIn
 		return nil, SshRunOutput{}, fmt.Errorf("nodeID and command are required")
 	}
 
-	connector, err := getMCPConnector()
+	client, err := connectMCPNode(ctx, input.NodeID)
 	if err != nil {
 		return nil, SshRunOutput{}, err
-	}
-
-	client, err := connector.Connect(ctx, input.NodeID)
-	if err != nil {
-		return nil, SshRunOutput{}, fmt.Errorf("failed to connect to node: %w", err)
 	}
 
 	var output string

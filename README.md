@@ -236,8 +236,11 @@ CI 会在提交到 `master` 或向 `master` 提交 Pull Request 时自动执行 
 
 - `pkg` 包只创建、包装并返回错误，不直接决定面向用户的错误展示；需要调试日志的组件通过 `logger.DebugLogger` 注入，未注入时使用空实现。
 - `cmd` 层是错误展示边界：Cobra 命令统一返回错误，由根命令按日志级别输出一次并设置退出状态。
-- 交互式 SFTP shell 位于 `cmd/sftpshell`，只负责命令解析、覆盖确认、进度与错误展示；`rm/cp/mv` 等文件操作统一通过 `pkg/sftp` 的 SFTP subsystem 能力执行。远端与本地复制都会保留符号链接本身（包括相对链接和悬空链接），不会跟随链接目标。
-- 密码输入、HostKey 确认和交互式终端 I/O 由 CLI/TUI 组合根注入；`pkg/adapter` 默认拒绝交互，`pkg/ssh` 提供调用方注入终端流的接口。
+- 交互与安全边界采用“pkg/ssh 定义端口、组合根注入策略、终端组件负责 I/O”的三层架构：
+  - `pkg/ssh` 定义机密提示（`SecretPrompter`）与主机密钥确认（`HostKeyConfirmer`）接口及语义请求结构，决定何时需要凭据，不生成展示文案、不直接访问 stdin/stdout，默认采用 fail-closed 策略返回 `ErrInteractionRequired`，防止非交互或自动化调用延迟崩溃；支持通过 `WithInteractionTimeout` 设置交互超时，生命周期取消与建连中断能即时终止交互。
+  - `internal/terminal` 封装跨平台可取消终端输入（Unix poll 管道、Windows CancelIoEx），确保在取消、报错与成功路径下可靠恢复终端回显模式，不泄漏文件描述符与 goroutine。
+  - CLI/TUI 组合根注入语义提示文案（通过 i18n 国际化翻译）、隐藏输入，并通过容量为 1 的可取消通道（Prompt Gate）确保并发多节点建连时密码与 HostKey 提示绝对串行化，错误与日志绝不包含凭据。
+  - MCP 服务端默认运行在非交互模式下，遇到未授权凭据或未知 HostKey 时返回清晰明确的 `ErrInteractionRequired` 错误提示，防止阻塞 Stdio 破坏 JSON-RPC 帧。
 - 长时间运行的 SSH、SFTP、转发和 Playbook 操作应使用调用方传入的 `context.Context`，确保取消信号能终止 I/O 和 goroutine。
 - 配置写入在本机文件系统上使用跨进程锁和原子替换。完整节点编辑与删除使用读取时的精确版本；标签操作按意图合并。对同一节点、Host 或 Identity 的冲突会返回 `ErrConfigConflict`，不会静默覆盖。节点编辑修改凭据时会创建私有 Identity 覆盖；只有 `identity edit` 会修改共享 Identity。若替换已应用但目录同步状态不确定，命令返回非零错误且不会自动重试或回滚。
 - SSH 连接从单个原子配置快照取得节点、主机、凭据及其条件写入令牌；OpenSSH 虚拟节点和只读配置源不带写入令牌，自动发现的凭据或提权方式只在当前会话使用。Repository 的所有写入都要求调用方传入可取消的 `context.Context`；TUI 保存、标签和删除操作通过异步状态机执行，避免阻塞界面或并发提交。

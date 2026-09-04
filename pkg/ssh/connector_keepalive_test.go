@@ -13,7 +13,7 @@ import (
 // newKeepAliveTestConnector 创建启用了心跳的 Connector（白盒测试辅助）
 func newKeepAliveTestConnector(t *testing.T, interval, timeout time.Duration) *Connector {
 	t.Helper()
-	c := NewConnector(&mockConfigStore{}, &mockUI{})
+	c := NewConnector(&mockConfigStore{}, WithInteractionHandler(&mockUI{}))
 	c.EnableKeepAlive(context.Background(), interval, timeout)
 	t.Cleanup(func() {
 		if err := c.CloseAll(); err != nil {
@@ -249,7 +249,7 @@ func TestConnector_KeepAlive_ReconnectReplacesHeartbeat(t *testing.T) {
 
 // TestConnector_KeepAlive_DisabledByDefault 验证未启用时 startKeepAliveFor 为 no-op，且 CloseAll 不 panic
 func TestConnector_KeepAlive_DisabledByDefault(t *testing.T) {
-	c := NewConnector(&mockConfigStore{}, &mockUI{})
+	c := NewConnector(&mockConfigStore{}, WithInteractionHandler(&mockUI{}))
 
 	client := startHealthyServer(t)
 	defer func() {
@@ -274,7 +274,7 @@ func TestConnector_KeepAlive_DisabledByDefault(t *testing.T) {
 
 // TestConnector_EnableKeepAlive_Idempotent 验证重复启用为 no-op，参数保持首次值
 func TestConnector_EnableKeepAlive_Idempotent(t *testing.T) {
-	c := NewConnector(&mockConfigStore{}, &mockUI{})
+	c := NewConnector(&mockConfigStore{}, WithInteractionHandler(&mockUI{}))
 	c.EnableKeepAlive(context.Background(), 15*time.Second, 10*time.Second)
 	c.EnableKeepAlive(context.Background(), time.Second, time.Second)
 
@@ -294,7 +294,7 @@ func TestConnector_EnableKeepAlive_Idempotent(t *testing.T) {
 
 // TestConnector_EnableKeepAlive_DefaultsOnInvalidParams 验证非正参数回退到默认值
 func TestConnector_EnableKeepAlive_DefaultsOnInvalidParams(t *testing.T) {
-	c := NewConnector(&mockConfigStore{}, &mockUI{})
+	c := NewConnector(&mockConfigStore{}, WithInteractionHandler(&mockUI{}))
 	c.EnableKeepAlive(context.Background(), 0, -time.Second)
 
 	c.kaMu.Lock()
@@ -314,7 +314,7 @@ func TestConnector_EnableKeepAlive_DefaultsOnInvalidParams(t *testing.T) {
 }
 
 func TestConnector_EnableKeepAlive_ContextCancelCleansStateAndAllowsReenable(t *testing.T) {
-	c := NewConnector(&mockConfigStore{}, &mockUI{})
+	c := NewConnector(&mockConfigStore{}, WithInteractionHandler(&mockUI{}))
 	rootCtx, cancelRoot := context.WithCancel(context.Background())
 	c.EnableKeepAlive(rootCtx, time.Hour, time.Second)
 
@@ -403,7 +403,7 @@ func TestConnector_Connect_CachedProbeHasTimeout(t *testing.T) {
 		AuthType: "password",
 		Password: "test",
 	}}
-	connector := NewConnector(store, &mockUI{})
+	connector := NewConnector(store, WithInteractionHandler(&mockUI{}))
 	connector.EnableKeepAlive(context.Background(), time.Hour, 100*time.Millisecond)
 	connector.clients.Set("node-1", &PooledClient{SSHClient: cachedClient})
 	defer func() {

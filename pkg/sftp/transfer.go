@@ -392,16 +392,7 @@ func (c *Client) downloadFile(ctx context.Context, remotePath, localPath string,
 		if statErr != nil {
 			return fmt.Errorf("stat local temporary file failed: %w", statErr)
 		}
-		if err := c.writeDownloadTemporaryFile(
-			ctx,
-			srcFile,
-			dstFile,
-			tempPath,
-			startOffset,
-			size,
-			mode,
-			progress,
-		); err != nil {
+		if err := c.writeDownloadTemporaryFile(ctx, srcFile, dstFile, startOffset, size, mode, progress); err != nil {
 			return err
 		}
 	}
@@ -445,15 +436,7 @@ func (c *Client) downloadFile(ctx context.Context, remotePath, localPath string,
 	return nil
 }
 
-func (c *Client) writeDownloadTemporaryFile(
-	ctx context.Context,
-	srcFile *sftp.File,
-	dstFile *os.File,
-	tempPath string,
-	startOffset, size int64,
-	mode os.FileMode,
-	progress ProgressCallback,
-) (retErr error) {
+func (c *Client) writeDownloadTemporaryFile(ctx context.Context, srcFile *sftp.File, dstFile *os.File, startOffset, size int64, mode os.FileMode, progress ProgressCallback) (retErr error) {
 	defer func() {
 		if dstFile != nil {
 			retErr = errors.Join(retErr, closeTransferResource(dstFile, "local temporary file"))

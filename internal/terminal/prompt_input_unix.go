@@ -1,6 +1,6 @@
 //go:build !windows
 
-package sftpshell
+package terminal
 
 import (
 	"errors"
@@ -24,11 +24,12 @@ type pollPromptInput struct {
 
 const promptPollTimeoutMilliseconds = 1000
 
-func duplicatePromptInput(input io.Reader) (promptInput, error) {
+// DuplicatePromptInput duplicates an input stream and equips it with an interrupt pipe.
+func DuplicatePromptInput(input io.Reader) (PromptInput, error) {
 	file, ok := input.(*os.File)
 	if !ok {
 		if closer, hasCloser := input.(io.ReadCloser); hasCloser {
-			return &closablePromptInput{ReadCloser: closer}, nil
+			return &ClosablePromptInput{ReadCloser: closer}, nil
 		}
 		return nil, fmt.Errorf("prompt input must be an *os.File or io.ReadCloser")
 	}

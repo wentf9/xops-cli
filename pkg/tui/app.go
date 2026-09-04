@@ -188,10 +188,14 @@ func NewModel(repository *config.Repository, opts ...ModelOption) (Model, error)
 			opt(&cfg)
 		}
 	}
-	connector := adapter.NewConnector(repository, ssh.WithLogger(cfg.logger))
-	if cfg.interaction != nil {
-		connector = adapter.NewConnectorWithInteraction(repository, cfg.interaction, ssh.WithLogger(cfg.logger))
+	var connOpts []ssh.Option
+	if cfg.logger != nil {
+		connOpts = append(connOpts, ssh.WithLogger(cfg.logger))
 	}
+	if cfg.interaction != nil {
+		connOpts = append(connOpts, ssh.WithInteractionHandler(cfg.interaction))
+	}
+	connector := adapter.NewConnector(repository, connOpts...)
 	view := repository.View()
 	lifecycleCtx, lifecycleCancel := context.WithCancel(cfg.ctx)
 	m := Model{

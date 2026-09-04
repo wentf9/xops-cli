@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/wentf9/xops-cli/pkg/config"
+	"github.com/wentf9/xops-cli/pkg/ssh"
 )
 
 type errorCloser struct {
@@ -50,5 +51,26 @@ func TestJoinCloseErrorPreservesPrimaryAndCloseErrors(t *testing.T) {
 
 	if !errors.Is(err, primaryErr) || !errors.Is(err, closeErr) {
 		t.Fatalf("expected both errors to be preserved, got %v", err)
+	}
+}
+
+func TestFormatMCPError(t *testing.T) {
+	err := FormatMCPError(ssh.ErrInteractionRequired)
+	if err == nil {
+		t.Fatal("expected formatted error, got nil")
+	}
+	if !errors.Is(err, ssh.ErrInteractionRequired) {
+		t.Fatalf("expected wrapped ErrInteractionRequired, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "prompts are disabled in MCP mode") {
+		t.Fatalf("expected clear prompt disabled message, got: %v", err)
+	}
+
+	otherErr := errors.New("other error")
+	if !errors.Is(FormatMCPError(otherErr), otherErr) {
+		t.Fatalf("expected other error to be preserved, got: %v", FormatMCPError(otherErr))
+	}
+	if FormatMCPError(nil) != nil {
+		t.Fatal("expected nil for nil error")
 	}
 }

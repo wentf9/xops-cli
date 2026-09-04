@@ -33,6 +33,7 @@ func TestDialSSHAgent_RespectsCanceledContext(t *testing.T) {
 type mockUIForTest struct {
 	passphrase string
 	called     bool
+	lastReq    SecretRequest
 }
 
 func setTestHome(t *testing.T) string {
@@ -43,12 +44,13 @@ func setTestHome(t *testing.T) string {
 	return dir
 }
 
-func (m *mockUIForTest) PromptPassword(prompt string) (string, error) {
+func (m *mockUIForTest) PromptSecret(ctx context.Context, req SecretRequest) (string, error) {
 	m.called = true
+	m.lastReq = req
 	return m.passphrase, nil
 }
 
-func (m *mockUIForTest) ConfirmHostKey(hostname string, fingerprint string) (bool, error) {
+func (m *mockUIForTest) ConfirmHostKey(ctx context.Context, req HostKeyConfirmation) (bool, error) {
 	return true, nil
 }
 
@@ -122,10 +124,10 @@ func TestLazySigner(t *testing.T) {
 
 	ui := &mockUIForTest{passphrase: passphrase}
 	lazy := &lazySigner{
-		pubKey:  sshPub,
-		keyPath: keyPath,
-		keyData: pemData,
-		ui:      ui,
+		pubKey:   sshPub,
+		keyPath:  keyPath,
+		keyData:  pemData,
+		prompter: ui,
 		passphraseCallback: func(path, pass string) {
 			if path != keyPath || pass != passphrase {
 				t.Errorf("unexpected callback parameters: %s, %s", path, pass)
@@ -138,7 +140,7 @@ func TestLazySigner(t *testing.T) {
 		t.Errorf("expected public key type %s, got %s", sshPub.Type(), lazy.PublicKey().Type())
 	}
 	if ui.called {
-		t.Error("PromptPassword was unexpectedly called during PublicKey()")
+		t.Error("PromptSecret was unexpectedly called during PublicKey()")
 	}
 
 	// 验证 Sign 方法触发密码输入，且签名成功
@@ -224,6 +226,7 @@ func TestBuildAutoAuthMethods_LazySigner_OpenSSH(t *testing.T) {
 	passphraseCalled := false
 
 	methods, cleanup := BuildAutoAuthMethods(
+		t.Context(),
 		"testuser",
 		"127.0.0.1",
 		ui,
@@ -277,6 +280,7 @@ func TestBuildAutoAuthMethods_LazySigner_PEMFallback(t *testing.T) {
 	passphraseCalled := false
 
 	methods, cleanup := BuildAutoAuthMethods(
+		t.Context(),
 		"testuser",
 		"127.0.0.1",
 		ui,

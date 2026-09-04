@@ -1,6 +1,6 @@
 //go:build windows
 
-package sftpshell
+package terminal
 
 import (
 	"errors"
@@ -29,7 +29,7 @@ func TestWindowsPromptInputInterruptsPendingRead(t *testing.T) {
 		}
 	}()
 
-	input, err := duplicatePromptInput(reader)
+	input, err := DuplicatePromptInput(reader)
 	if err != nil {
 		t.Fatalf("duplicate prompt input failed: %v", err)
 	}
@@ -104,6 +104,64 @@ func TestWindowsConsolePromptReaderPreservesPartialUTF8Rune(t *testing.T) {
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("translated Unicode key = %v, want %v", got, want)
+	}
+}
+
+func TestWindowsConsolePromptReaderExpandsRepeatCount(t *testing.T) {
+	tests := []struct {
+		name  string
+		event coninput.KeyEventRecord
+		want  []byte
+	}{
+		{
+			name:  "repeated ascii char",
+			event: coninput.KeyEventRecord{KeyDown: true, Char: 'x', RepeatCount: 3},
+			want:  []byte("xxx"),
+		},
+		{
+			name:  "repeated unicode char",
+			event: coninput.KeyEventRecord{KeyDown: true, Char: '中', RepeatCount: 2},
+			want:  []byte("中中"),
+		},
+		{
+			name:  "repeated backspace 8",
+			event: coninput.KeyEventRecord{KeyDown: true, Char: 8, RepeatCount: 4},
+			want:  []byte{8, 8, 8, 8},
+		},
+		{
+			name:  "repeated backspace 127",
+			event: coninput.KeyEventRecord{KeyDown: true, Char: 127, RepeatCount: 2},
+			want:  []byte{127, 127},
+		},
+		{
+			name:  "repeated navigation key",
+			event: coninput.KeyEventRecord{KeyDown: true, VirtualKeyCode: coninput.VK_LEFT, RepeatCount: 3},
+			want:  []byte{readline.CharBackward, readline.CharBackward, readline.CharBackward},
+		},
+		{
+			name:  "repeat count 0 produces single",
+			event: coninput.KeyEventRecord{KeyDown: true, Char: 'z', RepeatCount: 0},
+			want:  []byte("z"),
+		},
+		{
+			name:  "repeat count 1 produces single",
+			event: coninput.KeyEventRecord{KeyDown: true, Char: 'y', RepeatCount: 1},
+			want:  []byte("y"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reader := newTestWindowsConsolePromptReader([]coninput.EventRecord{tt.event})
+			buffer := make([]byte, len(tt.want)+10)
+			read, err := reader.Read(buffer)
+			if err != nil {
+				t.Fatalf("read failed: %v", err)
+			}
+			if !slices.Equal(buffer[:read], tt.want) {
+				t.Fatalf("got %v (%q), want %v (%q)", buffer[:read], string(buffer[:read]), tt.want, string(tt.want))
+			}
+		})
 	}
 }
 

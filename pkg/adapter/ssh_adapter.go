@@ -9,7 +9,7 @@ import (
 	"github.com/wentf9/xops-cli/pkg/ssh"
 )
 
-// SSHAdapter 实现 ssh.ConfigStore 和 ssh.InteractionHandler 接口，作为业务模型与底层 SSH 的防腐层
+// SSHAdapter 实现 ssh.ConfigStore 接口，作为业务模型与底层 SSH 的防腐层
 type SSHAdapter struct {
 	cfgProvider config.ConfigProvider
 }
@@ -29,26 +29,27 @@ func NewNonInteractiveSSHAdapter(cfgProvider config.ConfigProvider) *SSHAdapter 
 // NewConnector 是一个辅助方法，快速创建组装好 Adapter 的 ssh.Connector，支持传入 Option 进行显式注入配置。
 func NewConnector(cfgProvider config.ConfigProvider, opts ...ssh.Option) *ssh.Connector {
 	adp := NewSSHAdapter(cfgProvider)
-	return newConnector(adp, adp, opts...)
+	return newConnector(adp, opts...)
 }
 
 // NewConnectorWithInteraction creates a connector with a presentation-layer
 // interaction handler supplied by the composition root.
 func NewConnectorWithInteraction(cfgProvider config.ConfigProvider, interaction ssh.InteractionHandler, opts ...ssh.Option) *ssh.Connector {
-	adp := NewSSHAdapter(cfgProvider)
-	if interaction == nil {
-		interaction = adp
+	var finalOpts []ssh.Option
+	if interaction != nil {
+		finalOpts = append(finalOpts, ssh.WithInteractionHandler(interaction))
 	}
-	return newConnector(adp, interaction, opts...)
+	finalOpts = append(finalOpts, opts...)
+	return NewConnector(cfgProvider, finalOpts...)
 }
 
-func newConnector(adp *SSHAdapter, interaction ssh.InteractionHandler, opts ...ssh.Option) *ssh.Connector {
+func newConnector(adp *SSHAdapter, opts ...ssh.Option) *ssh.Connector {
 	var finalOpts []ssh.Option
 	if cfg := adp.cfgProvider.Snapshot(); cfg != nil && cfg.PasswordPromptPattern != "" {
 		finalOpts = append(finalOpts, ssh.WithPasswordPromptPattern(cfg.PasswordPromptPattern))
 	}
 	finalOpts = append(finalOpts, opts...)
-	return ssh.NewConnector(adp, interaction, finalOpts...)
+	return ssh.NewConnector(adp, finalOpts...)
 }
 
 // NewNonInteractiveConnector 创建一个非交互式的 Connector，避免在批量操作中阻塞等待输入，支持传入 Option。
@@ -106,15 +107,4 @@ func (a *SSHAdapter) UpdateSudo(ctx context.Context, nodeID, sudoUpdateToken str
 		return fmt.Errorf("configuration provider does not support versioned sudo updates")
 	}
 	return provider.UpdateSudoAtVersionContext(ctx, nodeID, sudoUpdateToken, models.SudoMode(mode), suPwd)
-}
-
-// PromptPassword rejects terminal interaction in the package layer. A CLI or
-// GUI must inject its own InteractionHandler at the composition root.
-func (a *SSHAdapter) PromptPassword(prompt string) (string, error) {
-	return "", fmt.Errorf("non-interactive mode: password prompt is disabled")
-}
-
-// ConfirmHostKey rejects terminal interaction in the package layer.
-func (a *SSHAdapter) ConfirmHostKey(hostname string, fingerprint string) (bool, error) {
-	return false, fmt.Errorf("non-interactive mode: host key confirmation is disabled")
 }

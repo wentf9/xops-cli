@@ -74,10 +74,12 @@ func (k *KeyAuth) GetMethod() (ssh.AuthMethod, error) {
 var _ ssh.Signer = (*lazySigner)(nil)
 
 type lazySigner struct {
+	ctx                context.Context
+	timeout            time.Duration
 	pubKey             ssh.PublicKey
 	keyPath            string
 	keyData            []byte
-	ui                 InteractionHandler
+	prompter           SecretPrompter
 	passphraseCallback func(string, string)
 	decryptedSigner    ssh.Signer
 	logger             logger.DebugLogger
@@ -116,9 +118,23 @@ func (s *lazySigner) getDecryptedSigner() (ssh.Signer, error) {
 	}
 	s.mu.RUnlock()
 
-	// 将交互式的 PromptPassword 移到锁的外部，防止阻塞其他协程
-	prompt := fmt.Sprintf("Enter passphrase for key '%s': ", s.keyPath)
-	passphrase, err := s.ui.PromptPassword(prompt)
+	req := SecretRequest{
+		Kind:    SecretKindPrivateKeyPassphrase,
+		KeyPath: s.keyPath,
+	}
+	promptCtx := s.ctx
+	var cancel context.CancelFunc
+	if promptCtx == nil {
+		promptCtx = context.Background()
+	}
+	timeout := s.timeout
+	if timeout <= 0 {
+		timeout = DefaultInteractionTimeout
+	}
+	promptCtx, cancel = context.WithTimeout(promptCtx, timeout)
+	defer cancel()
+
+	passphrase, err := s.prompter.PromptSecret(promptCtx, req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read passphrase: %w", err)
 	}
@@ -224,9 +240,12 @@ func parseOpenSSHPublicKeyFromEncryptedPrivate(keyData []byte) (ssh.PublicKey, e
 }
 
 // tryResolveKey 尝试解析特定路径的私钥
-func tryResolveKey(keyPath string, ui InteractionHandler, passphraseCallback func(string, string), l logger.DebugLogger) (ssh.Signer, ssh.AuthMethod, error) {
+func tryResolveKey(ctx context.Context, timeout time.Duration, keyPath string, prompter SecretPrompter, passphraseCallback func(string, string), l logger.DebugLogger) (ssh.Signer, ssh.AuthMethod, error) {
 	if l == nil {
 		l = logger.NopLogger
+	}
+	if prompter == nil {
+		prompter = rejectInteraction{}
 	}
 	keyData, err := os.ReadFile(keyPath)
 	if err != nil {
@@ -263,10 +282,12 @@ func tryResolveKey(keyPath string, ui InteractionHandler, passphraseCallback fun
 
 	if pubKey != nil {
 		lazy := &lazySigner{
+			ctx:                ctx,
+			timeout:            timeout,
 			pubKey:             pubKey,
 			keyPath:            keyPath,
 			keyData:            keyData,
-			ui:                 ui,
+			prompter:           prompter,
 			passphraseCallback: passphraseCallback,
 			logger:             l,
 		}
@@ -278,8 +299,23 @@ func tryResolveKey(keyPath string, ui InteractionHandler, passphraseCallback fun
 		keyDataCopy := keyData
 		keyPathCopy := keyPath
 		method := ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
-			prompt := fmt.Sprintf("Enter passphrase for key '%s': ", keyPathCopy)
-			passphrase, err := ui.PromptPassword(prompt)
+			req := SecretRequest{
+				Kind:    SecretKindPrivateKeyPassphrase,
+				KeyPath: keyPathCopy,
+			}
+			promptCtx := ctx
+			var cancel context.CancelFunc
+			if promptCtx == nil {
+				promptCtx = context.Background()
+			}
+			t := timeout
+			if t <= 0 {
+				t = DefaultInteractionTimeout
+			}
+			promptCtx, cancel = context.WithTimeout(promptCtx, t)
+			defer cancel()
+
+			passphrase, err := prompter.PromptSecret(promptCtx, req)
 			if err != nil {
 				return nil, fmt.Errorf("failed to read passphrase: %w", err)
 			}
@@ -300,22 +336,25 @@ func tryResolveKey(keyPath string, ui InteractionHandler, passphraseCallback fun
 }
 
 // BuildAutoAuthMethods 生成一个包含多种回退机制的 AuthMethod 链
-func BuildAutoAuthMethods(user, host string, ui InteractionHandler, passwordCallback func(string), passphraseCallback func(keyPath, passphrase string)) ([]ssh.AuthMethod, func()) {
-	return BuildAutoAuthMethodsWithLogger(user, host, ui, passwordCallback, passphraseCallback, logger.NopLogger)
+func BuildAutoAuthMethods(ctx context.Context, user, host string, prompter SecretPrompter, passwordCallback func(string), passphraseCallback func(keyPath, passphrase string)) ([]ssh.AuthMethod, func()) {
+	return BuildAutoAuthMethodsWithLogger(ctx, user, host, prompter, DefaultInteractionTimeout, passwordCallback, passphraseCallback, logger.NopLogger)
 }
 
 // BuildAutoAuthMethodsWithLogger 生成一个包含多种回退机制的 AuthMethod 链，并注入 Logger
 // passphraseCallback 在用户成功输入受密码保护的私钥密码后被调用，用于持久化
-func BuildAutoAuthMethodsWithLogger(user, host string, ui InteractionHandler, passwordCallback func(string), passphraseCallback func(keyPath, passphrase string), l logger.DebugLogger) ([]ssh.AuthMethod, func()) {
+func BuildAutoAuthMethodsWithLogger(ctx context.Context, user, host string, prompter SecretPrompter, timeout time.Duration, passwordCallback func(string), passphraseCallback func(keyPath, passphrase string), l logger.DebugLogger) ([]ssh.AuthMethod, func()) {
 	if l == nil {
 		l = logger.NopLogger
+	}
+	if prompter == nil {
+		prompter = rejectInteraction{}
 	}
 	var methods []ssh.AuthMethod
 	var cleanup func()
 
 	// SSH Agent
 	if socket := os.Getenv("SSH_AUTH_SOCK"); socket != "" {
-		conn, err := dialSSHAgent(context.Background(), socket)
+		conn, err := dialSSHAgent(ctx, socket)
 		if err == nil {
 			agentClient := agent.NewClient(conn)
 			methods = append(methods, ssh.PublicKeysCallback(agentClient.Signers))
@@ -341,7 +380,7 @@ func BuildAutoAuthMethodsWithLogger(user, host string, ui InteractionHandler, pa
 		}
 		l.Debugf("Found default key: %s", keyPath)
 
-		signer, method, err := tryResolveKey(keyPath, ui, passphraseCallback, l)
+		signer, method, err := tryResolveKey(ctx, timeout, keyPath, prompter, passphraseCallback, l)
 		if err != nil {
 			l.Debugf("Failed to resolve key: %s, error: %v", keyPath, err)
 			continue
@@ -360,7 +399,24 @@ func BuildAutoAuthMethodsWithLogger(user, host string, ui InteractionHandler, pa
 
 	// Password Fallback
 	methods = append(methods, ssh.RetryableAuthMethod(ssh.PasswordCallback(func() (string, error) {
-		password, err := ui.PromptPassword(fmt.Sprintf("%s@%s's password: ", user, host))
+		req := SecretRequest{
+			Kind: SecretKindLoginPassword,
+			User: user,
+			Host: host,
+		}
+		promptCtx := ctx
+		var cancel context.CancelFunc
+		if promptCtx == nil {
+			promptCtx = context.Background()
+		}
+		t := timeout
+		if t <= 0 {
+			t = DefaultInteractionTimeout
+		}
+		promptCtx, cancel = context.WithTimeout(promptCtx, t)
+		defer cancel()
+
+		password, err := prompter.PromptSecret(promptCtx, req)
 		if err != nil {
 			return "", fmt.Errorf("failed to read password: %w", err)
 		}

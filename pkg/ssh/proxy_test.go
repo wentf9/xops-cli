@@ -198,9 +198,11 @@ func TestProxyJump_Integration(t *testing.T) {
 		},
 	}
 
-	connector := NewConnector(store, &mockUI{})
+	connector := NewConnector(store, WithInteractionHandler(&mockUI{}))
 	t.Cleanup(func() {
-		_ = connector.CloseAll()
+		if closeErr := connector.CloseAll(); closeErr != nil {
+			t.Errorf("close connector failed: %v", closeErr)
+		}
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -307,9 +309,11 @@ func TestProxyJump_HandshakeTimeout(t *testing.T) {
 			},
 		},
 	}
-	connector := NewConnector(store, &mockUI{})
+	connector := NewConnector(store, WithInteractionHandler(&mockUI{}))
 	t.Cleanup(func() {
-		_ = connector.CloseAll()
+		if closeErr := connector.CloseAll(); closeErr != nil {
+			t.Errorf("close connector failed: %v", closeErr)
+		}
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)

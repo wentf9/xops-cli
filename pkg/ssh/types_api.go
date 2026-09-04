@@ -50,11 +50,45 @@ type ConfigStore interface {
 	UpdateSudo(ctx context.Context, nodeID, sudoUpdateToken string, mode SudoMode, suPwd string) error
 }
 
-// InteractionHandler 定义应用层（CLI 或 GUI）所需实现的交互式输入接口。
-type InteractionHandler interface {
-	// PromptPassword 提示用户输入密码（例如常规密码或 su 密码）
-	PromptPassword(prompt string) (string, error)
+// SecretKind 标识需要交互输入的机密类型
+type SecretKind uint8
 
-	// ConfirmHostKey 提示用户确认未知的 HostKey，返回是否同意连接
-	ConfirmHostKey(hostname string, fingerprint string) (bool, error)
+const (
+	SecretKindUnknown SecretKind = iota
+	SecretKindLoginPassword
+	SecretKindPrivateKeyPassphrase
+	SecretKindSuPassword
+)
+
+// SecretRequest 描述向用户请求机密的上下文信息（严禁携带已有密码）
+type SecretRequest struct {
+	Kind    SecretKind
+	NodeID  string
+	User    string
+	Host    string
+	KeyPath string
+}
+
+// HostKeyConfirmation 描述主机密钥指纹确认请求
+type HostKeyConfirmation struct {
+	Hostname      string
+	RemoteAddress string
+	Algorithm     string
+	Fingerprint   string
+}
+
+// SecretPrompter 负责提示用户输入敏感凭据（如密码、私钥密码短语等）
+type SecretPrompter interface {
+	PromptSecret(ctx context.Context, request SecretRequest) (string, error)
+}
+
+// HostKeyConfirmer 负责提示用户确认未知的主机密钥
+type HostKeyConfirmer interface {
+	ConfirmHostKey(ctx context.Context, request HostKeyConfirmation) (bool, error)
+}
+
+// InteractionHandler 组合了机密提示与主机密钥确认接口
+type InteractionHandler interface {
+	SecretPrompter
+	HostKeyConfirmer
 }

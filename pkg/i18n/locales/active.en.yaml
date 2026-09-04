@@ -85,6 +85,8 @@ prompt_enter_password_for:
   other: "Enter password for {{.User}}@{{.Host}}: "
 prompt_enter_user_password:
   other: "Enter password for user {{.User}}: "
+prompt_host_key_confirm:
+  other: "The authenticity of host '{{.Hostname}}' can't be established.\n{{.Algorithm}}key fingerprint is {{.Fingerprint}}.\nAre you sure you want to continue connecting (yes/no)? "
 
 # ---- scp ----
 scp_short:

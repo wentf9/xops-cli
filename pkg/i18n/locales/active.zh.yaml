@@ -85,6 +85,8 @@ prompt_enter_password_for:
   other: "请输入 {{.User}}@{{.Host}} 的密码: "
 prompt_enter_user_password:
   other: "请输入用户 {{.User}} 的密码: "
+prompt_host_key_confirm:
+  other: "无法确认主机 '{{.Hostname}}' 的真实性。\n{{.Algorithm}}密钥指纹为 {{.Fingerprint}}。\n确定要继续连接吗 (yes/no)? "
 
 # ---- scp ----
 scp_short:

@@ -1,11 +1,14 @@
 package adapter
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/models"
+	"github.com/wentf9/xops-cli/pkg/ssh"
 	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 )
 
@@ -16,33 +19,39 @@ func (adapterTestStore) Load() (*config.Configuration, error) { return nil, nil 
 func (adapterTestStore) Save(*config.Configuration) error { return nil }
 
 func TestSSHAdapter_NonInteractive(t *testing.T) {
-	// 创建一个空配置
+	nodeMap := concurrent.NewMap[string, models.Node](concurrent.HashString)
+	hostMap := concurrent.NewMap[string, models.Host](concurrent.HashString)
+	identityMap := concurrent.NewMap[string, models.Identity](concurrent.HashString)
+
+	hostMap.Set("host-1", models.Host{Address: "127.0.0.1", Port: 22})
+	identityMap.Set("id-1", models.Identity{User: "root", AuthType: "password", Password: "pwd"})
+
+	nodeMap.Set("node-su", models.Node{
+		HostRef:     "host-1",
+		IdentityRef: "id-1",
+		SudoMode:    models.SudoModeSu,
+	})
+
 	cfg := &config.Configuration{
-		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
-		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
-		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
+		Nodes:      nodeMap,
+		Identities: identityMap,
+		Hosts:      hostMap,
 	}
 	provider := config.NewProviderWithoutOpenSSH(cfg)
 
-	// 创建非交互式 adapter
-	adp := NewNonInteractiveSSHAdapter(provider)
+	// 创建非交互式 connector，验证默认策略返回 ErrInteractionRequired
+	conn := NewConnector(provider)
+	if conn == nil {
+		t.Fatal("expected connector to be created, got nil")
+	}
+	defer func() { _ = conn.CloseAll() }()
 
-	// 验证 PromptPassword
-	pwd, err := adp.PromptPassword("Enter password:")
+	_, err := conn.Connect(context.Background(), "node-su")
 	if err == nil {
-		t.Error("expected error from PromptPassword in non-interactive mode, got nil")
+		t.Fatal("expected interaction required error, got nil")
 	}
-	if pwd != "" {
-		t.Errorf("expected empty password, got %q", pwd)
-	}
-
-	// 验证 ConfirmHostKey
-	confirmed, err := adp.ConfirmHostKey("127.0.0.1", "sha256-fingerprint")
-	if err == nil {
-		t.Error("expected error from ConfirmHostKey in non-interactive mode, got nil")
-	}
-	if confirmed {
-		t.Error("expected confirmed to be false in non-interactive mode")
+	if !errors.Is(err, ssh.ErrInteractionRequired) {
+		t.Fatalf("expected ssh.ErrInteractionRequired, got: %v", err)
 	}
 }
 
