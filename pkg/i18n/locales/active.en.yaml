@@ -34,7 +34,7 @@ build_time_label:
 ssh_short:
   other: "Connect to a remote host via SSH"
 ssh_long:
-  other: "Connect to a remote host via SSH and open an interactive terminal.\n\nUsage examples (OpenSSH-compatible):\n  xops ssh user@host[:port]\n  xops ssh -l user -p 22 -i ~/.ssh/id_rsa hostname\n  xops ssh -J jumphost hostname\n  xops ssh -L 8080:localhost:80 -N hostname\n\nxops enhanced options:\n  xops ssh --host web-01                # Connect by alias/name\n  xops ssh --sudo hostname              # Connect with sudo mode\n  xops ssh --alias myserver hostname    # Save connection alias\n  xops ssh --tag web hostname           # Add tag to node\n\nUser and host are required, port defaults to 22.\nWhen provided via flags, flag values override positional arguments.\nIf no password is specified via --password, it will be read from the terminal or a saved config.\nPasswords of successful connections are encrypted and stored at ~/.xops_passwords.json"
+  other: "Connect to a remote host via SSH and open an interactive terminal.\n\nUsage examples (OpenSSH-compatible):\n  xops ssh user@host[:port]\n  xops ssh -l user -p 22 -i ~/.ssh/id_rsa hostname\n  xops ssh -J bastion.example.com hostname # Direct jump (supports FQDN/IP/host:port)\n  xops ssh -J jumphost hostname            # Alias jump (requires saved node/alias)\n  xops ssh -L 8080:localhost:80 -N hostname\n\nxops enhanced options:\n  xops ssh --host web-01                # Connect by alias/name\n  xops ssh --sudo hostname              # Connect with sudo mode\n  xops ssh --alias myserver hostname    # Save connection alias\n  xops ssh --tag web hostname           # Add tag to node\n\nConnection Target Semantics:\n  Explicit user and port participate fully in matching and will never be silently overridden by existing nodes.\n  Connecting as a new user to an existing host automatically reuses the existing Host, strictly isolates Identity credentials, and inherits unique host ProxyJump.\n  ProxyJump (-J) resolution strategy: Prioritizes saved Node, Alias, or ~/.ssh/config Host; direct jump targets explicitly require Node/Alias, FQDN, IP, or host:port; single-label hostnames without port must be configured as a Node/Alias first.\n  Passwords of successful connections are encrypted and stored in config."
 flag_host:
   other: "Target host / connection alias"
 flag_hosts:
@@ -52,7 +52,7 @@ flag_key_pass:
 flag_sudo:
   other: "Request sudo privileges"
 flag_jump:
-  other: "Jump host address [user@]host[:port]"
+  other: "Jump host address, supports Node/Alias, FQDN, IP, or [user@]host[:port]"
 flag_alias:
   other: "Connection alias"
 flag_tag:
@@ -92,7 +92,7 @@ prompt_host_key_confirm:
 scp_short:
   other: "Transfer files between local and remote hosts"
 scp_long:
-  other: "Transfer files between local and remote hosts with parallel multi-host support.\n\nUsage examples (OpenSSH-compatible):\n  xops scp -i ~/.ssh/id_rsa local_path user@host:remote_path\n  xops scp local_path user@host:remote_path\n  xops scp user@host:remote_path local_path\n  xops scp user1@host1:path1 user2@host2:path2\n\nBatch transfer (xops enhanced):\n  xops scp local_path --dest remote_path --host host1,host2\n  xops scp local_path --dest remote_path --tag web\n\nFlag values override positional arguments.\nIf no password is specified, it will be read from the terminal or saved config.\nWhen using --tag, other host specification methods are ignored."
+  other: "Transfer files between local and remote hosts with parallel multi-host support.\n\nUsage examples (OpenSSH-compatible):\n  xops scp -i ~/.ssh/id_rsa local_path user@host:remote_path\n  xops scp local_path user@host:remote_path\n  xops scp user@host:remote_path local_path\n  xops scp user1@host1:path1 user2@host2:path2\n\nBatch transfer (xops enhanced):\n  xops scp local_path --dest remote_path --host host1,host2\n  xops scp local_path --dest remote_path --tag web\n\nConnection Target Semantics:\n  Explicit user/port in remote paths participate fully in matching, automatically reuse existing Host records, and strictly isolate Identity credentials.\n  When using --tag, other host specification methods are ignored."
 flag_scp_src:
   other: "Source path (batch mode)"
 flag_scp_dest:
@@ -130,7 +130,7 @@ scp_save_config_failed:
 sftp_short:
   other: "Connect to a remote host via SFTP"
 sftp_long:
-  other: "Connect to a remote host via SFTP and open an interactive terminal.\n\nUsage examples (OpenSSH-compatible):\n  xops sftp user@host[:port]\n  xops sftp -i ~/.ssh/id_rsa user@host\n  xops sftp -J jumphost user@host\n\nUser and host are required, port defaults to 22.\nIf no password is specified, it will be read from the terminal or saved config."
+  other: "Connect to a remote host via SFTP and open an interactive terminal.\n\nUsage examples (OpenSSH-compatible):\n  xops sftp user@host[:port]\n  xops sftp -i ~/.ssh/id_rsa user@host\n  xops sftp -J bastion.example.com user@host # Direct jump (supports FQDN/IP/host:port)\n  xops sftp -J jumphost user@host            # Alias jump (requires saved node/alias)\n\nConnection Target Semantics:\n  Explicit user and port participate fully in matching, automatically reuse existing Host records, strictly isolate Identity credentials, and inherit unique host ProxyJump.\n  ProxyJump (-J) resolution strategy: Prioritizes saved Node, Alias, or ~/.ssh/config Host; direct jump targets explicitly require Node/Alias, FQDN, IP, or host:port; single-label hostnames without port must be configured as a Node/Alias first.\n  If no password is specified, it will be read from the terminal or saved config."
 flag_sftp_task:
   other: "Max concurrent file downloads"
 flag_sftp_thread:
@@ -140,7 +140,7 @@ flag_sftp_thread:
 exec_short:
   other: "Execute commands on one or more remote hosts"
 exec_long:
-  other: "Execute commands on one or more remote hosts. Supports batch execution and privilege escalation.\n\nUsage examples (OpenSSH-compatible):\n  xops exec -l root -p 22 192.168.1.11 \"uptime\"\n  xops exec -i ~/.ssh/id_rsa -J jumphost 192.168.1.11 \"df -h\"\n  xops exec root@192.168.1.11 \"uptime\"\n\nBatch execution:\n  xops exec --host host1,host2 -c \"uptime\"\n  xops exec --tag web -c \"uptime\"\n  xops exec -I hosts.txt --shell script.sh\n\nFlag values override positional arguments.\nWhen using --tag, other host specification methods are ignored."
+  other: "Execute commands on one or more remote hosts. Supports batch execution and privilege escalation.\n\nUsage examples (OpenSSH-compatible):\n  xops exec -l root -p 22 192.168.1.11 \"uptime\"\n  xops exec -i ~/.ssh/id_rsa -J bastion.example.com 192.168.1.11 \"df -h\"\n  xops exec root@192.168.1.11 \"uptime\"\n\nBatch execution:\n  xops exec --host host1,host2 -c \"uptime\"\n  xops exec --tag web -c \"uptime\"\n  xops exec -I hosts.txt --shell script.sh\n\nConnection Target Semantics:\n  Explicit user and port prioritize full-target matching, automatically reuse existing Host records, strictly isolate Identity credentials, consistent with ssh/sftp/scp.\n  ProxyJump (-J) resolution strategy: Prioritizes saved Node, Alias, or ~/.ssh/config Host; direct jump targets explicitly require Node/Alias, FQDN, IP, or host:port; single-label hostnames without port must be configured as a Node/Alias first.\n  When using --tag, other host specification methods are ignored."
 flag_exec_sudo:
   other: "Execute with sudo"
 flag_exec_su_pwd:
@@ -696,7 +696,7 @@ ssh_err_invalid_host:
 ssh_err_alias_invalid:
   other: "Alias cannot contain '@' or ':'"
 ssh_err_jump_not_found:
-  other: "Jump host {{.Host}} not found, please save jump host info first"
+  other: "Jump host {{.Host}} not found (direct jumps require Node/Alias, FQDN, IP, or host:port)"
 ssh_err_load_config:
   other: "Failed to load config file: {{.Error}}"
 ssh_err_save_config:

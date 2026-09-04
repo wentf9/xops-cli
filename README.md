@@ -85,8 +85,13 @@ xops tui
 # 通过别名快速连接 (自动保存历史凭证)
 xops ssh web-01
 
-# 兼容 OpenSSH 习惯：通过跳板机和私钥连接
-xops ssh -J jumphost -i ~/.ssh/id_rsa root@192.168.1.13
+# 显式指定新用户连接同一主机 (自动复用已有 Host，独立隔离凭证，自动继承 ProxyJump)
+xops ssh test@10.238.221.181
+xops ssh test@web-01
+
+# 兼容 OpenSSH 习惯：通过跳板机和私钥连接 (直连跳板支持 FQDN/IP/host:port；单标签跳板需预先配置为 Node/Alias)
+xops ssh -J bastion.example.com -i ~/.ssh/id_rsa root@192.168.1.13 # 直连跳板 (FQDN 或 10.0.0.1 或 jumphost:22)
+xops ssh -J jumphost -i ~/.ssh/id_rsa root@192.168.1.13            # 别名跳板 (jumphost 为已有节点/别名)
 
 # 以 Sudo 模式连接
 xops ssh --sudo web-01
@@ -245,7 +250,7 @@ CI 会在提交到 `master` 或向 `master` 提交 Pull Request 时自动执行 
 - 配置写入在本机文件系统上使用跨进程锁和原子替换。完整节点编辑与删除使用读取时的精确版本；标签操作按意图合并。对同一节点、Host 或 Identity 的冲突会返回 `ErrConfigConflict`，不会静默覆盖。节点编辑修改凭据时会创建私有 Identity 覆盖；只有 `identity edit` 会修改共享 Identity。若替换已应用但目录同步状态不确定，命令返回非零错误且不会自动重试或回滚。
 - SSH 连接从单个原子配置快照取得节点、主机、凭据及其条件写入令牌；OpenSSH 虚拟节点和只读配置源不带写入令牌，自动发现的凭据或提权方式只在当前会话使用。Repository 的所有写入都要求调用方传入可取消的 `context.Context`；TUI 保存、标签和删除操作通过异步状态机执行，避免阻塞界面或并发提交。
 - 节点选择器精确匹配节点 ID；地址或别名匹配多个节点时命令会返回歧义错误，不会任意选取目标。
-- SSH 本地、远端和 SOCKS5 转发返回可等待的生命周期对象；单个连接（包括 SOCKS5 握手和目标拨号）失败时仅告警并释放该连接，监听服务会继续运行；监听器或 SSH transport 失败才会结束转发。OpenSSH `ProxyJump` 支持逗号分隔的多跳以及 `[user@]host[:port]`。
+- SSH 本地、远端和 SOCKS5 转发返回可等待的生命周期对象；单个连接（包括 SOCKS5 握手和目标拨号）失败时仅告警并释放该连接，监听服务会继续运行；监听器或 SSH transport 失败才会结束转发。OpenSSH `ProxyJump` 支持逗号分隔的多跳以及 `[user@]host[:port]`。跳板解析策略：优先匹配已有 Node、Alias 或 `~/.ssh/config` 中的 Host；直连跳板明确要求使用 Node/Alias、FQDN（含点域名如 `bastion.example.com`）、IP 地址或带端口的 `host:port`（如 `jumphost:22`），未加端口的单标签主机名必须预先配置为 Node/Alias，防止别名拼写错误产生静默误连。
 - MCP 服务必须由组合根通过 `mcpserver.WithConfigProvider` 注入已加载的配置；配置和 guardrail 校验失败会在创建全局运行状态前直接返回。
 - 扩展 Expect 规则时，保持兼容的 `ssh.NewExpect(writer, rules...)`；需要注入日志等选项时使用 `ssh.NewExpectWithOptions(writer, rules, opts...)`。
 

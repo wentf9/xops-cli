@@ -382,52 +382,58 @@ func (o *ExecOptions) runInteractive(
 	return execErr
 }
 
-func (o *ExecOptions) getOrCreateNode(ctx context.Context, repository *config.Repository, addr utils.HostInfo) (string, bool, error) {
-	host := strings.TrimSpace(addr.Host)
-	user := strings.TrimSpace(addr.User)
-	port := addr.Port
-
-	if user == "" {
-		var userErr error
-		user, userErr = utils.GetCurrentUser()
-		if userErr != nil {
-			return "", false, fmt.Errorf("get current user failed: %w", userErr)
-		}
+func (o *ExecOptions) getOrCreateNode(ctx context.Context, repository *config.Repository, target config.ConnectionTarget, addr utils.HostInfo) (string, bool, error) {
+	password := addr.Password
+	if password == "" && o.Password != "" {
+		password = o.Password
 	}
-	if port == 0 {
-		port = 22
+	identityFile := addr.KeyPath
+	if identityFile == "" {
+		identityFile = o.IdentityFile
+	}
+	passphrase := addr.Passphrase
+	if passphrase == "" {
+		passphrase = o.Passphrase
+	}
+	alias := addr.Alias
+	if alias == "" {
+		alias = o.Alias
 	}
 
-	nodeID, err := repository.ResolveSelector(fmt.Sprintf("%s@%s:%d", user, host, port))
+	sudoMode := models.SudoModeAuto
+	if o.Sudo {
+		sudoMode = models.SudoModeSudo
+	}
+	suPwd := o.SuPwd
+
+	res, err := repository.EnsureNodeContext(ctx, config.EnsureNodeOptions{
+		Target:       target,
+		Password:     password,
+		IdentityFile: identityFile,
+		Passphrase:   passphrase,
+		Alias:        alias,
+		SudoMode:     sudoMode,
+		SuPwd:        suPwd,
+	})
 	if err != nil {
-		return "", false, fmt.Errorf("resolve execution address %q failed: %w", host, err)
-	}
-	if nodeID == "" {
-		nodeID, err = repository.ResolveSelector(host)
-		if err != nil {
-			return "", false, fmt.Errorf("resolve execution host %q failed: %w", host, err)
-		}
+		return "", false, err
 	}
 
-	if nodeID != "" {
-		updated, updateErr := o.updateNodeFromHostInfo(ctx, nodeID, repository, addr)
-		if updateErr != nil {
-			return "", false, updateErr
+	if res.Created {
+		if shouldTrackTemporaryNode(res.Mutation, nil) {
+			o.addTempNode(res.Mutation.Ref)
 		}
-		if updated {
-			o.nodeUpdated = true
-		}
-		return nodeID, updated, nil
+		return res.NodeID, true, nil
 	}
 
-	addr.Host = host
-	addr.User = user
-	addr.Port = port
-	nodeID, mutation, err := o.execCreateNewNode(ctx, repository, addr)
-	if shouldTrackTemporaryNode(mutation, err) {
-		o.addTempNode(mutation.Ref)
+	updated, updateErr := o.updateNodeFromHostInfo(ctx, res.NodeID, repository, addr)
+	if updateErr != nil {
+		return "", false, updateErr
 	}
-	return nodeID, true, err
+	if updated {
+		o.nodeUpdated = true
+	}
+	return res.NodeID, updated, nil
 }
 
 // shouldTrackTemporaryNode admits only a successfully durable creation to the
@@ -611,28 +617,47 @@ func (o *ExecOptions) buildTasksFromHosts(ctx context.Context, repository *confi
 		return nil, nil, err
 	}
 	for _, h := range hosts {
-		if h.User == "" {
-			h.User = o.User
+		hasUser := o.User != "" || h.User != ""
+		user := o.User
+		if user == "" {
+			user = h.User
 		}
-		if h.Password == "" {
-			h.Password = o.Password
+
+		hasPort := o.Port != 0 || h.Port != 0
+		port := o.Port
+		if port == 0 {
+			port = h.Port
 		}
-		if h.Port == 0 {
-			h.Port = o.Port
+
+		password := h.Password
+		if password == "" {
+			password = o.Password
 		}
-		if h.Alias == "" {
-			h.Alias = o.Alias
+		alias := h.Alias
+		if alias == "" {
+			alias = o.Alias
 		}
+
+		target := config.ConnectionTarget{
+			Selector:     strings.TrimSpace(h.Host),
+			User:         strings.TrimSpace(user),
+			HasUser:      hasUser,
+			Port:         port,
+			HasPort:      hasPort,
+			ProxyJump:    o.JumpHost,
+			HasProxyJump: o.JumpHost != "",
+		}
+
 		addr := utils.HostInfo{
 			Host:       h.Host,
-			Port:       h.Port,
-			User:       h.User,
-			Password:   h.Password,
-			Alias:      h.Alias,
+			Port:       port,
+			User:       user,
+			Password:   password,
+			Alias:      alias,
 			KeyPath:    h.KeyPath,
 			Passphrase: h.Passphrase,
 		}
-		nodeID, _, err := o.getOrCreateNode(ctx, repository, addr)
+		nodeID, _, err := o.getOrCreateNode(ctx, repository, target, addr)
 		if err != nil {
 			hostErrs = append(hostErrs, fmt.Errorf("[%s] %w", h.Host, err))
 			continue
@@ -640,104 +665,12 @@ func (o *ExecOptions) buildTasksFromHosts(ctx context.Context, repository *confi
 		tasks = append(tasks, execHostTask{
 			nodeID: nodeID,
 			host:   h.Host,
-			port:   h.Port,
-			user:   h.User,
-			pass:   h.Password,
+			port:   port,
+			user:   user,
+			pass:   password,
 		})
 	}
 	return tasks, hostErrs, nil
-}
-
-func (o *ExecOptions) execCreateNewNode(ctx context.Context, repository *config.Repository, addr utils.HostInfo) (string, config.NodeMutation, error) {
-	host := addr.Host
-	user := addr.User
-	port := addr.Port
-
-	nodeID := fmt.Sprintf("%s@%s:%d", user, host, port)
-	sudoMode := models.SudoModeNone
-	if o.Sudo {
-		sudoMode = models.SudoModeSudo
-	}
-
-	node := models.Node{
-		HostRef:     fmt.Sprintf("%s:%d", host, port),
-		IdentityRef: fmt.Sprintf("%s@%s", user, host),
-		ProxyJump:   o.JumpHost,
-		SudoMode:    sudoMode,
-		SuPwd:       o.SuPwd,
-	}
-
-	if err := o.setNodeAlias(repository, &node, addr.Alias); err != nil {
-		return "", config.NodeMutation{}, err
-	}
-
-	if node.ProxyJump != "" {
-		jumpHost, err := repository.ResolveSelector(node.ProxyJump)
-		if err != nil {
-			return "", config.NodeMutation{}, fmt.Errorf("resolve execution proxy jump %q failed: %w", node.ProxyJump, err)
-		}
-		if jumpHost == "" {
-			return "", config.NodeMutation{}, fmt.Errorf("%s", i18n.Tf("err_proxy_not_found", map[string]any{"Proxy": node.ProxyJump}))
-		}
-		node.ProxyJump = jumpHost
-	}
-
-	identity := o.buildIdentity(addr)
-
-	mutation, err := repository.CreateNodeContext(ctx, nodeID, node, models.Host{Address: host, Port: port}, identity)
-	if err != nil {
-		return "", mutation, fmt.Errorf("create exec node %q failed: %w", nodeID, err)
-	}
-
-	return nodeID, mutation, nil
-}
-
-// setNodeAlias sets the node alias with duplicate check
-func (o *ExecOptions) setNodeAlias(provider config.ConfigProvider, node *models.Node, alias string) error {
-	aliasToSet := alias
-	if aliasToSet == "" {
-		aliasToSet = o.Alias
-	}
-	if aliasToSet == "" {
-		return nil
-	}
-	if existingNode := provider.FindAlias(aliasToSet); existingNode != "" {
-		return fmt.Errorf("%s", i18n.Tf("alias_err_exists", map[string]any{"Alias": aliasToSet, "Node": existingNode}))
-	}
-	node.Alias = []string{aliasToSet}
-	return nil
-}
-
-// buildIdentity creates an identity from the given parameters
-func (o *ExecOptions) buildIdentity(addr utils.HostInfo) models.Identity {
-	identity := models.Identity{User: addr.User}
-
-	password := addr.Password
-	if password == "" && o.Password != "" {
-		password = o.Password
-	}
-
-	keyPath := addr.KeyPath
-	if keyPath == "" {
-		keyPath = o.IdentityFile
-	}
-	keyPass := addr.Passphrase
-	if keyPass == "" {
-		keyPass = o.Passphrase
-	}
-
-	if password == "" && keyPath == "" {
-		identity.AuthType = "auto"
-	} else if password != "" {
-		identity.Password = password
-		identity.AuthType = "password"
-	} else if keyPath != "" {
-		identity.KeyPath = utils.ToAbsolutePath(keyPath)
-		identity.Passphrase = keyPass
-		identity.AuthType = "key"
-	}
-
-	return identity
 }
 
 func appendExecAlias(slice []string, val string) ([]string, bool) {
@@ -767,6 +700,17 @@ func (o *ExecOptions) updateNodeFromHostInfo(ctx context.Context, nodeID string,
 	updated = o.updateIdentity(&identity, addr) || updated
 	updated = o.updateNodeAlias(nodeID, &node, addr.Alias, repository) || updated
 	updated = o.updateNodeSudo(&node) || updated
+
+	if o.JumpHost != "" {
+		jumpHost, jumpErr := repository.ResolveProxyJumpChain(o.JumpHost)
+		if jumpErr != nil {
+			return false, fmt.Errorf("resolve exec proxy jump %q failed: %w", o.JumpHost, jumpErr)
+		}
+		if jumpHost != "" && jumpHost != node.ProxyJump {
+			node.ProxyJump = jumpHost
+			updated = true
+		}
+	}
 
 	if updated {
 		if err := repository.ReplaceNodeAtRefContext(ctx, ref, nodeID, node, host, identity); err != nil {

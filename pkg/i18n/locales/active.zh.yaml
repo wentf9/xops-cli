@@ -34,7 +34,7 @@ build_time_label:
 ssh_short:
   other: "通过SSH连接到指定主机"
 ssh_long:
-  other: "通过SSH连接到指定主机并提供交互式终端。\n\n用法示例（兼容 OpenSSH 风格）:\n  xops ssh user@host[:port]\n  xops ssh -l user -p 22 -i ~/.ssh/id_rsa hostname\n  xops ssh -J jumphost hostname\n  xops ssh -L 8080:localhost:80 -N hostname\n\nxops 增强选项:\n  xops ssh --host web-01                # 按别名/名称连接\n  xops ssh --sudo hostname              # 以 sudo 模式连接\n  xops ssh --alias myserver hostname    # 保存连接别名\n  xops ssh --tag web hostname           # 为节点添加标签\n\n用户和主机为必选参数,端口默认为22。\n通过flags提供主机和用户信息时会忽略参数提供的信息。\n如果未通过--password选项显式提供密码,将会从终端输入或通过保存的密码文件读取密码。\n成功登录过的用户和主机组合的密码将会保存到密码文件中。\n密码采用对称加密算法加密保存,密码文件位置为~/.xops_passwords.json"
+  other: "通过SSH连接到指定主机并提供交互式终端。\n\n用法示例（兼容 OpenSSH 风格）:\n  xops ssh user@host[:port]\n  xops ssh -l user -p 22 -i ~/.ssh/id_rsa hostname\n  xops ssh -J bastion.example.com hostname # 直连跳板 (支持 FQDN/IP/host:port)\n  xops ssh -J jumphost hostname            # 别名跳板 (需预先保存为节点/别名)\n  xops ssh -L 8080:localhost:80 -N hostname\n\nxops 增强选项:\n  xops ssh --host web-01                # 按别名/名称连接\n  xops ssh --sudo hostname              # 以 sudo 模式连接\n  xops ssh --alias myserver hostname    # 保存连接别名\n  xops ssh --tag web hostname           # 为节点添加标签\n\n连接目标语义说明:\n  显式指定的 user 和 port 完整参与匹配，绝不被已有节点静默覆盖。\n  显式新用户连接已有主机时，自动复用已有 Host，独立隔离凭证(Identity)，并自动继承主机的唯一 ProxyJump。\n  跳板机(-J/ProxyJump)解析策略：优先匹配已有 Node、Alias 或 ~/.ssh/config Host；直连跳板明确要求使用 Node/Alias、FQDN、IP 或 host:port；未加端口的单标签主机名须先配置为 Node/Alias。\n  如果未通过--password选项显式提供密码,将会从终端输入或通过保存的密码文件读取密码。\n  成功登录过的用户和主机组合的密码将会保存到密码文件中。"
 flag_host:
   other: "目标主机/连接别名"
 flag_hosts:
@@ -52,7 +52,7 @@ flag_key_pass:
 flag_sudo:
   other: "是否请求sudo权限"
 flag_jump:
-  other: "跳板机地址[user@]host[:port]"
+  other: "跳板机地址，支持 Node/Alias、FQDN、IP 或 [user@]host[:port]"
 flag_alias:
   other: "连接别名"
 flag_tag:
@@ -92,7 +92,7 @@ prompt_host_key_confirm:
 scp_short:
   other: "在本地和远程主机之间传输文件"
 scp_long:
-  other: "在本地和远程主机之间传输文件，支持多台主机并行传输。\n\n用法示例（兼容 OpenSSH 风格）:\n  xops scp -i ~/.ssh/id_rsa local_path user@host:remote_path\n  xops scp local_path user@host:remote_path\n  xops scp user@host:remote_path local_path\n  xops scp user1@host1:path1 user2@host2:path2\n\n批量传输 (xops 增强):\n  xops scp local_path --dest remote_path --host host1,host2\n  xops scp local_path --dest remote_path --tag web\n\n通过flags提供主机和用户信息时会覆盖参数提供的信息。\n如果未通过--password选项显式提供密码，将会从终端输入或通过保存的配置文件读取。\n使用 --tag 时会忽略其他主机指定方式。"
+  other: "在本地和远程主机之间传输文件，支持多台主机并行传输。\n\n用法示例（兼容 OpenSSH 风格）:\n  xops scp -i ~/.ssh/id_rsa local_path user@host:remote_path\n  xops scp local_path user@host:remote_path\n  xops scp user@host:remote_path local_path\n  xops scp user1@host1:path1 user2@host2:path2\n\n批量传输 (xops 增强):\n  xops scp local_path --dest remote_path --host host1,host2\n  xops scp local_path --dest remote_path --tag web\n\n连接目标语义说明:\n  远程路径中的显式 user/port 完整参与匹配，自动复用已有 Host 并严格隔离 Identity 凭证。\n  通过 flags 提供主机和用户信息时会覆盖参数提供的信息。\n  使用 --tag 时会忽略其他主机指定方式。"
 flag_scp_src:
   other: "源路径 (批量模式使用)"
 flag_scp_dest:
@@ -120,7 +120,7 @@ prompt_overwrite:
 sftp_short:
   other: "通过sftp连接到指定主机"
 sftp_long:
-  other: "通过sftp连接到指定主机并提供交互式终端。\n\n用法示例（兼容 OpenSSH 风格）:\n  xops sftp user@host[:port]\n  xops sftp -i ~/.ssh/id_rsa user@host\n  xops sftp -J jumphost user@host\n\n用户和主机为必选参数,端口默认为22。\n如果未通过--password选项显式提供密码,将会从终端输入或通过保存的密码文件读取密码。"
+  other: "通过sftp连接到指定主机并提供交互式终端。\n\n用法示例（兼容 OpenSSH 风格）:\n  xops sftp user@host[:port]\n  xops sftp -i ~/.ssh/id_rsa user@host\n  xops sftp -J bastion.example.com user@host # 直连跳板 (支持 FQDN/IP/host:port)\n  xops sftp -J jumphost user@host            # 别名跳板 (需预先保存为节点/别名)\n\n连接目标语义说明:\n  显式指定的 user 和 port 完整参与匹配，自动复用已有 Host 并严格隔离 Identity 凭证，继承相同主机的 ProxyJump。\n  跳板机(-J/ProxyJump)解析策略：优先匹配已有 Node、Alias 或 ~/.ssh/config Host；直连跳板明确要求使用 Node/Alias、FQDN、IP 或 host:port；未加端口的单标签主机名须先配置为 Node/Alias。\n  如果未通过--password选项显式提供密码,将会从终端输入或通过保存的密码文件读取密码。"
 flag_sftp_task:
   other: "同时传输的文件数"
 flag_sftp_thread:
@@ -141,7 +141,7 @@ scp_save_config_failed:
 exec_short:
   other: "对一个或多个远程主机执行命令"
 exec_long:
-  other: "对一个或多个远程主机执行命令。支持批量执行和提权。\n\n用法示例（兼容 OpenSSH 风格）:\n  xops exec -l root -p 22 192.168.1.11 \"uptime\"\n  xops exec -i ~/.ssh/id_rsa -J jumphost 192.168.1.11 \"df -h\"\n  xops exec root@192.168.1.11 \"uptime\"\n\n批量执行:\n  xops exec --host host1,host2 -c \"uptime\"\n  xops exec --tag web -c \"uptime\"\n  xops exec -I hosts.txt --shell script.sh\n\n通过flags提供主机和用户信息时会覆盖参数提供的信息。\n使用 --tag 时会忽略其他主机指定方式。"
+  other: "对一个或多个远程主机执行命令。支持批量执行和提权。\n\n用法示例（兼容 OpenSSH 风格）:\n  xops exec -l root -p 22 192.168.1.11 \"uptime\"\n  xops exec -i ~/.ssh/id_rsa -J bastion.example.com 192.168.1.11 \"df -h\"\n  xops exec root@192.168.1.11 \"uptime\"\n\n批量执行:\n  xops exec --host host1,host2 -c \"uptime\"\n  xops exec --tag web -c \"uptime\"\n  xops exec -I hosts.txt --shell script.sh\n\n连接目标语义说明:\n  显式指定的 user 和 port 优先完整匹配，自动复用已有 Host 并严格隔离 Identity，与 ssh/sftp/scp 行为一致。\n  跳板机(-J/ProxyJump)解析策略：优先匹配已有 Node、Alias 或 ~/.ssh/config Host；直连跳板明确要求使用 Node/Alias、FQDN、IP 或 host:port；未加端口的单标签主机名须先配置为 Node/Alias。\n  使用 --tag 时会忽略其他主机指定方式。"
 flag_exec_sudo:
   other: "使用sudo执行"
 flag_exec_su_pwd:
@@ -697,7 +697,7 @@ ssh_err_invalid_host:
 ssh_err_alias_invalid:
   other: "别名中不可含有<@>或<:>符号"
 ssh_err_jump_not_found:
-  other: "跳板机 {{.Host}} 信息不存在,请先保存跳板机信息"
+  other: "跳板机 {{.Host}} 信息不存在 (直连跳板请使用 Node/Alias、FQDN、IP 或 host:port)"
 ssh_err_load_config:
   other: "加载配置文件失败: {{.Error}}"
 ssh_err_save_config:

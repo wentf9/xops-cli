@@ -84,8 +84,36 @@ func (p *OpenSSHParser) Find(alias string) (string, bool) {
 	return OpenSSHNodePrefix + alias, true
 }
 
+// HasHost 检查 alias 是否在 ssh_config 中显式定义了具体的 Host 模式（排除仅通配符匹配）。
+func (p *OpenSSHParser) HasHost(alias string) bool {
+	if p == nil || p.cfg == nil || alias == "" {
+		return false
+	}
+	cleanAlias := strings.TrimPrefix(alias, OpenSSHNodePrefix)
+	lookupAlias, _, _, err := parseOpenSSHHostSpec(cleanAlias)
+	if err != nil {
+		lookupAlias = cleanAlias
+	}
+	for _, block := range p.cfg.Hosts {
+		hasConcrete := false
+		for _, pattern := range block.Patterns {
+			if isConcreteSSHHost(pattern.String()) {
+				hasConcrete = true
+				break
+			}
+		}
+		if hasConcrete && block.Matches(lookupAlias) {
+			return true
+		}
+	}
+	return false
+}
+
 // GetVirtualNode 根据 alias 从 ssh_config 生成运行时的内存 Node / Host / Identity
 func (p *OpenSSHParser) GetVirtualNode(alias string) (models.Node, models.Host, models.Identity, error) {
+	if p == nil {
+		p = &OpenSSHParser{cfg: nil}
+	}
 	lookupAlias, userOverride, portOverride, err := parseOpenSSHHostSpec(alias)
 	if err != nil {
 		return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("parse openssh host %q failed: %w", alias, err)
@@ -95,13 +123,17 @@ func (p *OpenSSHParser) GetVirtualNode(alias string) (models.Node, models.Host, 
 	if err != nil {
 		return models.Node{}, models.Host{}, models.Identity{}, err
 	}
-	defUser, userErr := getCurrentUser()
-	if userErr != nil {
-		return models.Node{}, models.Host{}, models.Identity{}, userErr
-	}
-	user, err := p.getVal(lookupAlias, "User", defUser)
+	userVal, err := p.getVal(lookupAlias, "User", "")
 	if err != nil {
 		return models.Node{}, models.Host{}, models.Identity{}, err
+	}
+	user := userVal
+	if user == "" {
+		defUser, userErr := getCurrentUser()
+		if userErr != nil {
+			return models.Node{}, models.Host{}, models.Identity{}, userErr
+		}
+		user = defUser
 	}
 	portStr, err := p.getVal(lookupAlias, "Port", "22")
 	if err != nil {
@@ -136,22 +168,7 @@ func (p *OpenSSHParser) GetVirtualNode(alias string) (models.Node, models.Host, 
 	if err != nil {
 		return models.Node{}, models.Host{}, models.Identity{}, err
 	}
-	if proxyJump != "" {
-		if strings.EqualFold(strings.TrimSpace(proxyJump), "none") {
-			proxyJump = ""
-		} else {
-			hops := strings.Split(proxyJump, ",")
-			var parsedHops []string
-			for _, rawHop := range hops {
-				hop := strings.TrimSpace(rawHop)
-				if hop == "" || strings.EqualFold(hop, "none") {
-					continue
-				}
-				parsedHops = append(parsedHops, OpenSSHNodePrefix+hop)
-			}
-			proxyJump = strings.Join(parsedHops, ",")
-		}
-	}
+	proxyJump = parseOpenSSHProxyJump(proxyJump)
 
 	hostRef := fmt.Sprintf("%s:%d", hostName, port)
 	identityRef := fmt.Sprintf("%s@%s", user, hostName)
@@ -272,4 +289,20 @@ func expandHomeDir(path string) (string, error) {
 		return filepath.Join(home, path[1:]), nil
 	}
 	return path, nil
+}
+
+func parseOpenSSHProxyJump(raw string) string {
+	if raw == "" || strings.EqualFold(strings.TrimSpace(raw), "none") {
+		return ""
+	}
+	hops := strings.Split(raw, ",")
+	var parsedHops []string
+	for _, rawHop := range hops {
+		hop := strings.TrimSpace(rawHop)
+		if hop == "" || strings.EqualFold(hop, "none") {
+			continue
+		}
+		parsedHops = append(parsedHops, OpenSSHNodePrefix+hop)
+	}
+	return strings.Join(parsedHops, ",")
 }
