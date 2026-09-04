@@ -114,6 +114,13 @@ func (p *Provider) FindAlias(alias string) string {
 	return p.aliasIndex[alias]
 }
 
+func (p *Provider) ResolveProxyJumpChain(jumpChain string) (string, error) {
+	if p == nil {
+		return "", nil
+	}
+	return ResolveProxyJumpChainWithConfig(p.Snapshot(), p.openSSH, jumpChain)
+}
+
 // Resolve returns one internally consistent, defensive-copy configuration
 // triple. OpenSSH virtual nodes remain read-only fallbacks.
 func (p *Provider) Resolve(nodeID string) (models.Node, models.Host, models.Identity, error) {
@@ -136,10 +143,11 @@ func (p *Provider) Resolve(nodeID string) (models.Node, models.Host, models.Iden
 	p.mu.RUnlock()
 
 	if strings.HasPrefix(nodeID, OpenSSHNodePrefix) {
-		if p.openSSH != nil && p.openSSH.cfg != nil {
-			return p.openSSH.GetVirtualNode(strings.TrimPrefix(nodeID, OpenSSHNodePrefix))
+		parser := p.openSSH
+		if parser == nil {
+			parser = &OpenSSHParser{cfg: nil}
 		}
-		return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("openssh parser not initialized for %q", nodeID)
+		return parser.GetVirtualNode(strings.TrimPrefix(nodeID, OpenSSHNodePrefix))
 	}
 	return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("node %q: %w", nodeID, ErrNodeNotFound)
 }

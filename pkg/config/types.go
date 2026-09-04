@@ -54,6 +54,7 @@ type ConfigProvider interface {
 	Find(input string) string
 	ResolveSelector(input string) (string, error)
 	FindAlias(alias string) string
+	ResolveProxyJumpChain(jumpChain string) (string, error)
 	Snapshot() *Configuration
 }
 

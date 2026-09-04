@@ -19,7 +19,6 @@ import (
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
-	"github.com/wentf9/xops-cli/pkg/models"
 	"github.com/wentf9/xops-cli/pkg/sftp"
 	"github.com/wentf9/xops-cli/pkg/ssh"
 	pkgutils "github.com/wentf9/xops-cli/pkg/utils"
@@ -910,23 +909,11 @@ func (o *ScpOptions) connectSftpForPath(ctx context.Context, p PathInfo, specifi
 }
 
 func (o *ScpOptions) resolvePathInfo(path PathInfo) (string, string, uint16, error) {
-	host := path.Host
-	user := path.User
-	port := path.Port
-
-	if host == "" && o.Host != "" && !strings.Contains(o.Host, ",") {
-		host = o.Host
+	target, err := o.resolveTargetForPath(path)
+	if err != nil {
+		return "", "", 0, err
 	}
-	if user == "" && o.User != "" {
-		user = o.User
-	}
-	if port == 0 && o.Port != 0 {
-		port = o.Port
-	}
-
-	if host == "" {
-		return "", "", 0, fmt.Errorf("%s", i18n.T("scp_err_no_host_addr"))
-	}
+	user := target.User
 	if user == "" {
 		var userErr error
 		user, userErr = cmdutils.GetCurrentUser()
@@ -934,68 +921,62 @@ func (o *ScpOptions) resolvePathInfo(path PathInfo) (string, string, uint16, err
 			return "", "", 0, fmt.Errorf("get current user failed: %w", userErr)
 		}
 	}
+	port := target.Port
 	if port == 0 {
 		port = 22
 	}
+	return target.Selector, user, port, nil
+}
 
-	return strings.TrimSpace(host), strings.TrimSpace(user), port, nil
+func (o *ScpOptions) resolveTargetForPath(path PathInfo) (config.ConnectionTarget, error) {
+	host := path.Host
+	if host == "" && o.Host != "" && !strings.Contains(o.Host, ",") {
+		host = o.Host
+	}
+	if host == "" {
+		return config.ConnectionTarget{}, fmt.Errorf("%s", i18n.T("scp_err_no_host_addr"))
+	}
+
+	hasUser := false
+	var user string
+	if o.User != "" {
+		hasUser = true
+		user = o.User
+	} else if path.User != "" {
+		hasUser = true
+		user = path.User
+	}
+
+	hasPort := false
+	var port uint16
+	if o.Port != 0 {
+		hasPort = true
+		port = o.Port
+	} else if path.Port != 0 {
+		hasPort = true
+		port = path.Port
+	}
+
+	return config.ConnectionTarget{
+		Selector:     strings.TrimSpace(host),
+		User:         strings.TrimSpace(user),
+		HasUser:      hasUser,
+		Port:         port,
+		HasPort:      hasPort,
+		ProxyJump:    o.JumpHost,
+		HasProxyJump: o.JumpHost != "",
+	}, nil
 }
 
 func (o *ScpOptions) getOrCreateNodeForPath(ctx context.Context, provider config.ConfigProvider, path PathInfo, specificPassword string) (string, bool, error) {
-	host, user, port, err := o.resolvePathInfo(path)
+	repo, ok := provider.(*config.Repository)
+	if !ok {
+		return "", false, fmt.Errorf("provider does not support node mutation")
+	}
+
+	target, err := o.resolveTargetForPath(path)
 	if err != nil {
 		return "", false, err
-	}
-
-	nodeID, err := provider.ResolveSelector(host)
-	if err != nil {
-		return "", false, fmt.Errorf("resolve SCP host %q failed: %w", host, err)
-	}
-	if nodeID == "" {
-		nodeID, err = provider.ResolveSelector(fmt.Sprintf("%s@%s:%d", user, host, port))
-		if err != nil {
-			return "", false, fmt.Errorf("resolve SCP address %q failed: %w", host, err)
-		}
-	}
-
-	if nodeID != "" {
-		updated, updateErr := o.updateNode(ctx, nodeID, provider, specificPassword)
-		return nodeID, updated, updateErr
-	}
-
-	return o.createNewNode(ctx, provider, host, user, port, specificPassword)
-}
-
-func (o *ScpOptions) createNewNode(ctx context.Context, provider config.ConfigProvider, host, user string, port uint16, specificPassword string) (string, bool, error) {
-	nodeID := fmt.Sprintf("%s@%s:%d", user, host, port)
-	node := models.Node{
-		HostRef:     fmt.Sprintf("%s:%d", host, port),
-		IdentityRef: fmt.Sprintf("%s@%s", user, host),
-		ProxyJump:   o.JumpHost,
-		SudoMode:    models.SudoModeAuto,
-	}
-
-	if node.ProxyJump != "" {
-		jumpHost, err := provider.ResolveSelector(node.ProxyJump)
-		if err != nil {
-			return "", false, fmt.Errorf("resolve SCP proxy jump %q failed: %w", node.ProxyJump, err)
-		}
-		if jumpHost == "" {
-			return "", false, fmt.Errorf("%s", i18n.Tf("err_proxy_not_found", map[string]any{"Proxy": node.ProxyJump}))
-		}
-		node.ProxyJump = jumpHost
-	}
-
-	if o.Alias != "" {
-		// 检查别名是否已存在
-		if existingNode := provider.FindAlias(o.Alias); existingNode != "" {
-			return "", false, fmt.Errorf("%s", i18n.Tf("alias_err_exists", map[string]any{"Alias": o.Alias, "Node": existingNode}))
-		}
-		node.Alias = append(node.Alias, strings.TrimSpace(o.Alias))
-	}
-
-	identity := models.Identity{
-		User: user,
 	}
 
 	password := specificPassword
@@ -1003,22 +984,23 @@ func (o *ScpOptions) createNewNode(ctx context.Context, provider config.ConfigPr
 		password = o.Password
 	}
 
-	if password == "" && o.IdentityFile == "" {
-		identity.AuthType = "auto"
-	} else if password != "" {
-		identity.Password = password
-		identity.AuthType = "password"
-	} else if o.IdentityFile != "" {
-		identity.KeyPath = cmdutils.ToAbsolutePath(o.IdentityFile)
-		identity.Passphrase = o.Passphrase
-		identity.AuthType = "key"
+	res, err := repo.EnsureNodeContext(ctx, config.EnsureNodeOptions{
+		Target:       target,
+		Password:     password,
+		IdentityFile: o.IdentityFile,
+		Passphrase:   o.Passphrase,
+		Alias:        o.Alias,
+	})
+	if err != nil {
+		return "", false, err
 	}
 
-	if err := putConfiguredNodeContext(ctx, provider, nodeID, node, models.Host{Address: host, Port: port}, identity); err != nil {
-		return "", false, fmt.Errorf("create scp node %q failed: %w", nodeID, err)
+	if res.Created {
+		return res.NodeID, true, nil
 	}
 
-	return nodeID, true, nil
+	updated, updateErr := o.updateNode(ctx, res.NodeID, provider, specificPassword)
+	return res.NodeID, updated, updateErr
 }
 
 func (o *ScpOptions) updateNode(ctx context.Context, nodeID string, provider config.ConfigProvider, specificPassword string) (bool, error) {
@@ -1051,6 +1033,17 @@ func (o *ScpOptions) updateNode(ctx context.Context, nodeID string, provider con
 	if o.Passphrase != "" {
 		if identity.Passphrase != o.Passphrase {
 			identity.Passphrase = o.Passphrase
+			updated = true
+		}
+	}
+
+	if o.JumpHost != "" {
+		jumpHost, jumpErr := provider.ResolveProxyJumpChain(o.JumpHost)
+		if jumpErr != nil {
+			return false, fmt.Errorf("resolve SCP proxy jump %q failed: %w", o.JumpHost, jumpErr)
+		}
+		if jumpHost != "" && jumpHost != node.ProxyJump {
+			node.ProxyJump = jumpHost
 			updated = true
 		}
 	}

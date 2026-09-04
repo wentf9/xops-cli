@@ -5,30 +5,70 @@ import (
 )
 
 func TestResolvePathInfo(t *testing.T) {
-	o := NewScpOptions()
-	o.Host = "default_host"
-	o.User = "default_user"
-	o.Port = 2222
-
 	tests := []struct {
 		name     string
+		optHost  string
+		optUser  string
+		optPort  uint16
 		path     PathInfo
 		wantHost string
 		wantUser string
 		wantPort uint16
 		wantErr  bool
 	}{
-		{"full override", PathInfo{Host: "h1", User: "u1", Port: 22}, "h1", "u1", 22, false},
-		{"partial flag fallback", PathInfo{}, "default_host", "default_user", 2222, false},
-		{"empty host error", PathInfo{}, "", "", 0, true},
+		{
+			name:     "flags override path info",
+			optHost:  "default_host",
+			optUser:  "default_user",
+			optPort:  2222,
+			path:     PathInfo{Host: "h1", User: "u1", Port: 22},
+			wantHost: "h1",
+			wantUser: "default_user",
+			wantPort: 2222,
+			wantErr:  false,
+		},
+		{
+			name:     "path info used when flags empty",
+			optHost:  "default_host",
+			optUser:  "",
+			optPort:  0,
+			path:     PathInfo{Host: "h1", User: "u1", Port: 22},
+			wantHost: "h1",
+			wantUser: "u1",
+			wantPort: 22,
+			wantErr:  false,
+		},
+		{
+			name:     "flags provide fallback when path empty",
+			optHost:  "default_host",
+			optUser:  "default_user",
+			optPort:  2222,
+			path:     PathInfo{},
+			wantHost: "default_host",
+			wantUser: "default_user",
+			wantPort: 2222,
+			wantErr:  false,
+		},
+		{
+			name:     "empty host error",
+			optHost:  "",
+			optUser:  "",
+			optPort:  0,
+			path:     PathInfo{},
+			wantHost: "",
+			wantUser: "",
+			wantPort: 0,
+			wantErr:  true,
+		},
 	}
 
-	for i, tt := range tests {
+	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if i == 2 {
-				// clear default_host to trigger error
-				o.Host = ""
-			}
+			o := NewScpOptions()
+			o.Host = tt.optHost
+			o.User = tt.optUser
+			o.Port = tt.optPort
+
 			h, u, p, err := o.resolvePathInfo(tt.path)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("expected error %v, got %v", tt.wantErr, err)

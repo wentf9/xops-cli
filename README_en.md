@@ -85,8 +85,13 @@ xops tui
 # Connect by alias (auto-saves connection details)
 xops ssh web-01
 
-# OpenSSH-style with JumpHost and Identity file
-xops ssh -J jumphost -i ~/.ssh/id_rsa root@192.168.1.13
+# Connect with explicit user (reuses existing Host, strictly isolates Identity, inherits ProxyJump)
+xops ssh test@10.238.221.181
+xops ssh test@web-01
+
+# OpenSSH-style with JumpHost and Identity file (direct jump requires FQDN/IP/host:port; single-label requires saved Node/Alias)
+xops ssh -J bastion.example.com -i ~/.ssh/id_rsa root@192.168.1.13 # Direct jump (FQDN, 10.0.0.1, or jumphost:22)
+xops ssh -J jumphost -i ~/.ssh/id_rsa root@192.168.1.13            # Alias jump (jumphost as existing node/alias)
 
 # Connect and enter sudo shell
 xops ssh --sudo web-01
@@ -246,7 +251,7 @@ CI runs the full build, test suite, and golangci-lint on pushes to `master` and 
 - Configuration writes use a cross-process lock and atomic replacement on the local filesystem. Full node edits and deletions use the exact version that was read, while tag operations merge intent. Conflicts on the same node, Host, or Identity return `ErrConfigConflict` instead of silently overwriting data. A node edit that changes credentials creates a private Identity override; only `identity edit` changes a shared Identity. If a replacement was applied but its directory-sync durability is uncertain, the command returns a nonzero error and never retries or rolls it back automatically.
 - SSH connections receive node, host, credentials, and conditional-write tokens from one atomic configuration snapshot. OpenSSH virtual nodes and read-only configuration sources have no write token, so discovered credentials or privilege mode remain session-local. Every Repository write requires caller-provided cancellable `context.Context`; TUI save, tag, and delete operations run through an asynchronous state machine to keep rendering responsive and prevent overlapping commits.
 - A node selector matches an exact node ID first. If an address or alias matches multiple nodes, the command returns an ambiguity error instead of choosing a target arbitrarily.
-- SSH local, remote, and SOCKS5 forwarding return waitable lifecycle objects. A failure in one connection, including a SOCKS5 handshake or target dial, only logs a warning and releases that connection; the listener continues running. Only listener or SSH transport failures end forwarding. OpenSSH `ProxyJump` supports comma-separated hops and `[user@]host[:port]` entries.
+- SSH local, remote, and SOCKS5 forwarding return waitable lifecycle objects. A failure in one connection, including a SOCKS5 handshake or target dial, only logs a warning and releases that connection; the listener continues running. Only listener or SSH transport failures end forwarding. OpenSSH `ProxyJump` supports comma-separated hops and `[user@]host[:port]` entries. Jump host resolution strategy: prioritizes saved Node, Alias, or Host in `~/.ssh/config`; direct jump targets explicitly require Node/Alias, FQDN (contains a dot, e.g. `bastion.example.com`), IP address, or `host:port` (e.g. `jumphost:22`). Single-label hostnames without port must be configured as a Node/Alias first to prevent silent misconnections on alias typos.
 - The composition root must inject fully loaded configuration into the MCP server with `mcpserver.WithConfigProvider`; configuration and guardrail validation failures are returned before global runtime state is initialized.
 - Use the compatible `ssh.NewExpect(writer, rules...)` API for ordinary Expect rules. Use `ssh.NewExpectWithOptions(writer, rules, opts...)` when injecting a logger or other options.
 

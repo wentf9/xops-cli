@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -15,7 +14,6 @@ import (
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
-	"github.com/wentf9/xops-cli/pkg/models"
 	"github.com/wentf9/xops-cli/pkg/sftp"
 	"github.com/wentf9/xops-cli/pkg/ssh"
 )
@@ -107,26 +105,7 @@ func (o *SftpOptions) RunContext(ctx context.Context) (err error) {
 	}
 
 	var nodeID string
-	nodeID, err = provider.ResolveSelector(o.Host)
-	if err != nil {
-		return fmt.Errorf("resolve SFTP host %q failed: %w", o.Host, err)
-	}
-	if nodeID != "" {
-		_, err = update(ctx, nodeID, &o.SshOptions, provider)
-	} else {
-		nodeID, err = provider.ResolveSelector(fmt.Sprintf("%s@%s:%d", o.User, o.Host, o.Port))
-		if err != nil {
-			return fmt.Errorf("resolve SFTP address %q failed: %w", o.Host, err)
-		}
-		if nodeID != "" {
-			_, err = update(ctx, nodeID, &o.SshOptions, provider)
-		} else {
-			nodeID, err = o.createNewNode(ctx, provider)
-			if err != nil {
-				return err
-			}
-		}
-	}
+	nodeID, _, err = o.resolveNode(ctx, provider)
 	if err != nil {
 		return err
 	}
@@ -219,53 +198,4 @@ func (o *SftpOptions) RunContext(ctx context.Context) (err error) {
 	}
 	markShellDone()
 	return nil
-}
-
-func (o *SftpOptions) createNewNode(ctx context.Context, provider *config.Repository) (string, error) {
-	nodeID := fmt.Sprintf("%s@%s:%d", o.User, o.Host, o.Port)
-	node := models.Node{
-		HostRef:     fmt.Sprintf("%s:%d", o.Host, o.Port),
-		IdentityRef: fmt.Sprintf("%s@%s", o.User, o.Host),
-		ProxyJump:   o.JumpHost,
-		SudoMode:    models.SudoModeAuto,
-		Tags:        o.Tags,
-	}
-	if node.ProxyJump != "" {
-		jumpHost, err := provider.ResolveSelector(node.ProxyJump)
-		if err != nil {
-			return "", fmt.Errorf("resolve SFTP proxy jump %q failed: %w", node.ProxyJump, err)
-		}
-		if jumpHost == "" {
-			return "", fmt.Errorf("%s", i18n.Tf("err_proxy_not_found", map[string]any{"Proxy": node.ProxyJump}))
-		}
-		node.ProxyJump = jumpHost
-	}
-	hostObj := models.Host{
-		Address: strings.TrimSpace(o.Host),
-		Port:    o.Port,
-	}
-	if o.Alias != "" {
-		// 检查别名是否已存在
-		if existingNode := provider.FindAlias(o.Alias); existingNode != "" {
-			return "", fmt.Errorf("%s", i18n.Tf("alias_err_exists", map[string]any{"Alias": o.Alias, "Node": existingNode}))
-		}
-		node.Alias = append(node.Alias, strings.TrimSpace(o.Alias))
-	}
-	identity := models.Identity{
-		User: strings.TrimSpace(o.User),
-	}
-	if o.Password == "" && o.IdentityFile == "" {
-		identity.AuthType = "auto"
-	} else if o.Password != "" {
-		identity.Password = o.Password
-		identity.AuthType = "password"
-	} else if o.IdentityFile != "" {
-		identity.KeyPath = utils.ToAbsolutePath(o.IdentityFile)
-		identity.Passphrase = o.Passphrase
-		identity.AuthType = "key"
-	}
-	if _, err := provider.CreateNodeContext(ctx, nodeID, node, hostObj, identity); err != nil {
-		return "", fmt.Errorf("create SFTP node %q failed: %w", nodeID, err)
-	}
-	return nodeID, nil
 }

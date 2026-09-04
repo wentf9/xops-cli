@@ -40,6 +40,8 @@ type SshOptions struct {
 	StdinRedirect  bool
 	args           []string
 
+	Target config.ConnectionTarget
+
 	Command     string
 	stdinScript bool
 }
@@ -99,25 +101,53 @@ func (o *SshOptions) Complete(cmd *cobra.Command, args []string) {
 }
 
 func (o *SshOptions) parseArgs() error {
-	if len(o.args) == 0 && o.Host == "" {
+	hasUser := false
+	var finalUser string
+	hasPort := false
+	var finalPort uint16
+	finalHost := o.Host
+
+	if o.User != "" {
+		hasUser = true
+		finalUser = o.User
+	}
+	if o.Port != 0 {
+		hasPort = true
+		finalPort = o.Port
+	}
+
+	if len(o.args) == 0 && finalHost == "" {
 		return errors.New(i18n.T("ssh_err_no_host"))
 	} else if len(o.args) >= 1 {
 		u, h, p, err := utils.ParseAddr(o.args[0])
 		if err != nil {
 			return err
 		}
-		if h == "" && o.Host == "" {
-			return errors.New(i18n.T("ssh_err_invalid_host"))
+		if finalHost == "" && h != "" {
+			finalHost = h
 		}
-		if o.Host == "" {
-			o.Host = h
+		if !hasUser && u != "" {
+			hasUser = true
+			finalUser = u
 		}
-		if o.User == "" {
-			o.User = u
+		if !hasPort && p != 0 {
+			hasPort = true
+			finalPort = p
 		}
-		if o.Port == 0 {
-			o.Port = p
-		}
+	}
+
+	o.Host = finalHost
+	o.User = finalUser
+	o.Port = finalPort
+
+	o.Target = config.ConnectionTarget{
+		Selector:     finalHost,
+		User:         finalUser,
+		HasUser:      hasUser,
+		Port:         finalPort,
+		HasPort:      hasPort,
+		ProxyJump:    o.JumpHost,
+		HasProxyJump: o.JumpHost != "",
 	}
 	return nil
 }
@@ -131,16 +161,6 @@ func (o *SshOptions) Validate() error {
 	}
 	if o.BgRun && !o.NoCmd {
 		return errors.New(i18n.T("ssh_err_background_requires_nocmd"))
-	}
-	if o.User == "" {
-		var userErr error
-		o.User, userErr = utils.GetCurrentUser()
-		if userErr != nil {
-			return fmt.Errorf("get current user failed: %w", userErr)
-		}
-	}
-	if o.Port == 0 {
-		o.Port = 22
 	}
 	if strings.Contains(o.Alias, "@") || strings.Contains(o.Alias, ":") {
 		return errors.New(i18n.T("ssh_err_alias_invalid"))
@@ -389,24 +409,32 @@ func splitTunnels(s string) []string {
 }
 
 func (o *SshOptions) resolveNode(ctx context.Context, provider *config.Repository) (string, bool, error) {
-	nodeID, err := provider.ResolveSelector(o.Host)
+	var defaultUser string
+	if !o.Target.HasUser {
+		var err error
+		defaultUser, err = utils.GetCurrentUser()
+		if err != nil {
+			return "", false, fmt.Errorf("get current user failed: %w", err)
+		}
+	}
+
+	res, err := provider.EnsureNodeContext(ctx, config.EnsureNodeOptions{
+		Target:       o.Target,
+		DefaultUser:  defaultUser,
+		Password:     o.Password,
+		IdentityFile: o.IdentityFile,
+		Passphrase:   o.Passphrase,
+		Alias:        o.Alias,
+		Tags:         o.Tags,
+	})
 	if err != nil {
-		return "", false, fmt.Errorf("resolve SSH host %q failed: %w", o.Host, err)
+		return "", false, err
 	}
-	if nodeID != "" {
-		updated, err := update(ctx, nodeID, o, provider)
-		return nodeID, updated, err
+	if res.Created {
+		return res.NodeID, true, nil
 	}
-	nodeID, err = provider.ResolveSelector(fmt.Sprintf("%s@%s:%d", o.User, o.Host, o.Port))
-	if err != nil {
-		return "", false, fmt.Errorf("resolve SSH address %q failed: %w", o.Host, err)
-	}
-	if nodeID != "" {
-		updated, err := update(ctx, nodeID, o, provider)
-		return nodeID, updated, err
-	}
-	nodeID, err = o.createNewNode(ctx, provider)
-	return nodeID, true, err
+	updated, err := update(ctx, res.NodeID, o, provider)
+	return res.NodeID, updated, err
 }
 
 type sshTunnelGroup struct {
@@ -522,7 +550,7 @@ func parseDynamicForwardArg(arg string) (string, error) {
 func updateNodeFields(node *models.Node, nodeID string, o *SshOptions, provider config.ConfigProvider) (bool, error) {
 	nodeUpdated := false
 	if o.JumpHost != "" {
-		jumpHost, err := provider.ResolveSelector(o.JumpHost)
+		jumpHost, err := provider.ResolveProxyJumpChain(o.JumpHost)
 		if err != nil {
 			return false, fmt.Errorf("resolve SSH proxy jump %q failed: %w", o.JumpHost, err)
 		}
@@ -572,55 +600,6 @@ func updateIdentityFields(identity *models.Identity, o *SshOptions) bool {
 		identityUpdated = true
 	}
 	return identityUpdated
-}
-
-func (o *SshOptions) createNewNode(ctx context.Context, provider *config.Repository) (string, error) {
-	nodeID := fmt.Sprintf("%s@%s:%d", o.User, o.Host, o.Port)
-	node := models.Node{
-		HostRef:     fmt.Sprintf("%s:%d", o.Host, o.Port),
-		IdentityRef: fmt.Sprintf("%s@%s", o.User, o.Host),
-		ProxyJump:   o.JumpHost,
-		SudoMode:    models.SudoModeAuto,
-		Tags:        o.Tags,
-	}
-	if node.ProxyJump != "" {
-		jumpHost, err := provider.ResolveSelector(node.ProxyJump)
-		if err != nil {
-			return "", fmt.Errorf("resolve SSH proxy jump %q failed: %w", node.ProxyJump, err)
-		}
-		if jumpHost == "" {
-			return "", errors.New(i18n.Tf("ssh_err_jump_not_found", map[string]any{"Host": node.ProxyJump}))
-		}
-		node.ProxyJump = jumpHost
-	}
-	hostObj := models.Host{
-		Address: strings.TrimSpace(o.Host),
-		Port:    o.Port,
-	}
-	if o.Alias != "" {
-		// 检查别名是否已存在
-		if existingNode := provider.FindAlias(o.Alias); existingNode != "" {
-			return "", fmt.Errorf("%s", i18n.Tf("alias_err_exists", map[string]any{"Alias": o.Alias, "Node": existingNode}))
-		}
-		node.Alias = append(node.Alias, strings.TrimSpace(o.Alias))
-	}
-	identity := models.Identity{
-		User: strings.TrimSpace(o.User),
-	}
-	if o.Password == "" && o.IdentityFile == "" {
-		identity.AuthType = "auto"
-	} else if o.Password != "" {
-		identity.Password = o.Password
-		identity.AuthType = "password"
-	} else if o.IdentityFile != "" {
-		identity.KeyPath = utils.ToAbsolutePath(o.IdentityFile)
-		identity.Passphrase = o.Passphrase
-		identity.AuthType = "key"
-	}
-	if _, err := provider.CreateNodeContext(ctx, nodeID, node, hostObj, identity); err != nil {
-		return "", fmt.Errorf("create SSH node %q failed: %w", nodeID, err)
-	}
-	return nodeID, nil
 }
 
 func update(ctx context.Context, nodeID string, o *SshOptions, provider *config.Repository) (bool, error) {
