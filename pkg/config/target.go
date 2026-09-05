@@ -172,7 +172,7 @@ func (r *Repository) ensureBareTargetInTransaction(
 				return nil
 			}
 		}
-		canonicalInfo, resolveErr := r.resolveCanonicalTargetInfo(cfg, lookup, aliases, selector)
+		canonicalInfo, resolveErr := r.resolveCanonicalTargetInfo(cfg, lookup, aliases, selector, opts.Target)
 		if resolveErr != nil {
 			return resolveErr
 		}
@@ -196,7 +196,7 @@ func (r *Repository) ensureExplicitTargetInTransaction(
 	createdNode *bool,
 ) error {
 	target := opts.Target
-	canonicalInfo, resolveErr := r.resolveCanonicalTargetInfo(cfg, lookup, aliases, selector)
+	canonicalInfo, resolveErr := r.resolveCanonicalTargetInfo(cfg, lookup, aliases, selector, target)
 	if resolveErr != nil {
 		return resolveErr
 	}
@@ -259,7 +259,7 @@ func (r *Repository) findExistingNodeFast(target ConnectionTarget, explicitDefau
 		return r.findBareNodeFast(snapshot, lookup, aliases, selector)
 	}
 
-	canonicalInfo, err := r.resolveCanonicalTargetInfo(snapshot, lookup, aliases, selector)
+	canonicalInfo, err := r.resolveCanonicalTargetInfo(snapshot, lookup, aliases, selector, target)
 	if err != nil {
 		return "", true, err
 	}
@@ -334,7 +334,7 @@ func findMatchingNodes(snapshot *Configuration, user, addr string, port uint16) 
 }
 
 // resolveCanonicalTargetInfo extracts canonical address, port, identity and proxy details.
-func (r *Repository) resolveCanonicalTargetInfo(cfg *Configuration, lookup map[string][]string, aliases map[string]string, selector string) (canonicalTargetInfo, error) {
+func (r *Repository) resolveCanonicalTargetInfo(cfg *Configuration, lookup map[string][]string, aliases map[string]string, selector string, target ConnectionTarget) (canonicalTargetInfo, error) {
 	// 1. Direct Node ID match
 	if node, exists := cfg.Nodes.Get(selector); exists {
 		if host, hostExists := cfg.Hosts.Get(node.HostRef); hostExists {
@@ -363,7 +363,7 @@ func (r *Repository) resolveCanonicalTargetInfo(cfg *Configuration, lookup map[s
 
 	// 3. Lookup match
 	if candidates := lookup[selector]; len(candidates) > 0 {
-		return resolveLookupCandidates(cfg, selector, candidates)
+		return resolveLookupCandidates(cfg, selector, candidates, target)
 	}
 
 	// 4. OpenSSH configuration match
@@ -389,20 +389,53 @@ func (r *Repository) resolveCanonicalTargetInfo(cfg *Configuration, lookup map[s
 	return canonicalTargetInfo{Address: clean, Port: 22}, nil
 }
 
-func resolveLookupCandidates(cfg *Configuration, selector string, candidates []string) (canonicalTargetInfo, error) {
-	if len(candidates) == 1 {
-		if node, ok := cfg.Nodes.Get(candidates[0]); ok {
-			if host, hostExists := cfg.Hosts.Get(node.HostRef); hostExists {
-				clean := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(host.Address), "]"), "[")
-				var defUser string
-				if ident, identExists := cfg.Identities.Get(node.IdentityRef); identExists {
-					defUser = ident.User
-				}
-				return canonicalTargetInfo{Address: clean, Port: host.Port, DefaultUser: defUser}, nil
-			}
-		}
+func filterCandidatesByExplicitTarget(cfg *Configuration, candidates []string, target ConnectionTarget) []string {
+	if !target.HasPort && !target.HasUser {
+		return slices.Clone(candidates)
 	}
+	filtered := make([]string, 0, len(candidates))
+	for _, cid := range candidates {
+		node, ok := cfg.Nodes.Get(cid)
+		if !ok {
+			continue
+		}
+		host, hostExists := cfg.Hosts.Get(node.HostRef)
+		if !hostExists {
+			continue
+		}
+		var user string
+		if ident, identExists := cfg.Identities.Get(node.IdentityRef); identExists {
+			user = ident.User
+		}
+		if target.HasPort && host.Port != target.Port {
+			continue
+		}
+		if target.HasUser && user != target.User {
+			continue
+		}
+		filtered = append(filtered, cid)
+	}
+	return filtered
+}
 
+func resolveCandidateNodeInfo(cfg *Configuration, candidateID string) (canonicalTargetInfo, bool) {
+	node, ok := cfg.Nodes.Get(candidateID)
+	if !ok {
+		return canonicalTargetInfo{}, false
+	}
+	host, hostExists := cfg.Hosts.Get(node.HostRef)
+	if !hostExists {
+		return canonicalTargetInfo{}, false
+	}
+	clean := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(host.Address), "]"), "[")
+	var defUser string
+	if ident, identExists := cfg.Identities.Get(node.IdentityRef); identExists {
+		defUser = ident.User
+	}
+	return canonicalTargetInfo{Address: clean, Port: host.Port, DefaultUser: defUser}, true
+}
+
+func resolveConsistentCandidates(cfg *Configuration, selector string, candidates []string) (canonicalTargetInfo, error) {
 	var firstAddr string
 	var firstPort uint16
 	var firstUser string
@@ -453,6 +486,92 @@ func resolveLookupCandidates(cfg *Configuration, selector string, candidates []s
 		}, nil
 	}
 	return canonicalTargetInfo{}, &AmbiguousNodeError{Selector: selector, Candidates: slices.Clone(candidates)}
+}
+
+func resolveCandidateAddressFallback(cfg *Configuration, selector string, candidates []string, target ConnectionTarget) (canonicalTargetInfo, error) {
+	var firstAddr string
+	var firstPort uint16
+	var firstUser string
+	initialized := false
+	addrConsistent := true
+	portConsistent := true
+	userConsistent := true
+
+	for _, cid := range candidates {
+		node, ok := cfg.Nodes.Get(cid)
+		if !ok {
+			continue
+		}
+		host, hostExists := cfg.Hosts.Get(node.HostRef)
+		if !hostExists {
+			continue
+		}
+		var user string
+		if ident, identExists := cfg.Identities.Get(node.IdentityRef); identExists {
+			user = ident.User
+		}
+		clean := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(host.Address), "]"), "[")
+		if !initialized {
+			firstAddr = clean
+			firstPort = host.Port
+			firstUser = user
+			initialized = true
+		} else {
+			if firstAddr != clean {
+				addrConsistent = false
+				break
+			}
+			if firstPort != host.Port {
+				portConsistent = false
+			}
+			if firstUser != user {
+				userConsistent = false
+			}
+		}
+	}
+
+	if !initialized || !addrConsistent {
+		return canonicalTargetInfo{}, &AmbiguousNodeError{Selector: selector, Candidates: slices.Clone(candidates)}
+	}
+
+	effectivePort := target.Port
+	if !target.HasPort {
+		if !portConsistent {
+			return canonicalTargetInfo{}, &AmbiguousNodeError{Selector: selector, Candidates: slices.Clone(candidates)}
+		}
+		effectivePort = firstPort
+		if effectivePort == 0 {
+			effectivePort = 22
+		}
+	}
+
+	var defUser string
+	if target.HasUser {
+		defUser = target.User
+	} else if userConsistent {
+		defUser = firstUser
+	}
+
+	return canonicalTargetInfo{
+		Address:              firstAddr,
+		Port:                 effectivePort,
+		DefaultUser:          defUser,
+		AmbiguousDefaultUser: !target.HasUser && !userConsistent,
+		AmbiguousCandidates:  slices.Clone(candidates),
+	}, nil
+}
+
+func resolveLookupCandidates(cfg *Configuration, selector string, candidates []string, target ConnectionTarget) (canonicalTargetInfo, error) {
+	filtered := filterCandidatesByExplicitTarget(cfg, candidates, target)
+	if len(filtered) == 1 {
+		if info, ok := resolveCandidateNodeInfo(cfg, filtered[0]); ok {
+			return info, nil
+		}
+	}
+	if len(filtered) > 1 {
+		return resolveConsistentCandidates(cfg, selector, filtered)
+	}
+	return resolveCandidateAddressFallback(cfg, selector, candidates, target)
 }
 
 // createNodeInTransaction performs the atomic creation of Host, Identity, and Node.
@@ -677,50 +796,239 @@ func ResolveProxyJumpChainWithConfig(cfg *Configuration, openSSH *OpenSSHParser,
 	return strings.Join(resolvedHops, ","), nil
 }
 
-// resolveSingleJumpHopWithConfig resolves a single jump hop selector to a canonical node ID or OpenSSH node.
-// Resolution strategy:
-// 1. Existing Node ID
-// 2. Existing Alias
-// 3. Existing Host address/selector lookup
-// 4. OpenSSH Host defined in ~/.ssh/config
-// 5. Direct jump target: explicitly requires Node/Alias, FQDN (contains '.'), IP, or [user@]host:port.
-// Single-label hostnames without port/user cannot be used as direct jumps to avoid silent misconnections on alias typos.
-func resolveSingleJumpHopWithConfig(cfg *Configuration, openSSH *OpenSSHParser, hop string) (string, error) {
+// resolveHopExactNodeMatch checks whether hop directly matches a node ID, alias, or unique lookup candidate.
+func resolveHopExactNodeMatch(cfg *Configuration, lookup map[string][]string, aliases map[string]string, hop string) (string, bool, error) {
 	if _, ok := cfg.Nodes.Get(hop); ok {
-		return hop, nil
-	}
-	lookup, aliases, err := buildIndexes(cfg, false)
-	if err != nil {
-		return "", fmt.Errorf("build indexes for jump resolution failed: %w", err)
+		return hop, true, nil
 	}
 	if nid, ok := aliases[hop]; ok && nid != "" {
-		return nid, nil
+		return nid, true, nil
 	}
 	if candidates := lookup[hop]; len(candidates) == 1 {
-		return candidates[0], nil
+		return candidates[0], true, nil
 	} else if len(candidates) > 1 {
-		return "", &AmbiguousNodeError{Selector: hop, Candidates: slices.Clone(candidates)}
+		return "", true, &AmbiguousNodeError{Selector: hop, Candidates: slices.Clone(candidates)}
 	}
+	return "", false, nil
+}
 
-	cleanHop := strings.TrimPrefix(hop, OpenSSHNodePrefix)
-	if openSSH != nil && openSSH.cfg != nil {
-		if openSSH.HasHost(cleanHop) {
-			if _, _, _, vErr := openSSH.GetVirtualNode(cleanHop); vErr != nil {
-				return "", fmt.Errorf("resolve openssh jump %q: %w", cleanHop, vErr)
-			}
-			return OpenSSHNodePrefix + cleanHop, nil
+func collectHostCandidates(cfg *Configuration, lookup map[string][]string, aliases map[string]string, host string) []string {
+	if nid, ok := aliases[host]; ok && nid != "" {
+		return []string{nid}
+	}
+	if cands := lookup[host]; len(cands) > 0 {
+		return slices.Clone(cands)
+	}
+	if _, ok := cfg.Nodes.Get(host); ok {
+		return []string{host}
+	}
+	return nil
+}
+
+func filterHostCandidates(cfg *Configuration, candidates []string, hopUser string, hopPort uint16) []string {
+	var matched []string
+	for _, cid := range candidates {
+		node, ok := cfg.Nodes.Get(cid)
+		if !ok {
+			continue
 		}
+		h, hok := cfg.Hosts.Get(node.HostRef)
+		ident, iok := cfg.Identities.Get(node.IdentityRef)
+		if !hok || !iok {
+			continue
+		}
+		if hopPort != 0 && h.Port != hopPort {
+			continue
+		}
+		if hopUser != "" && ident.User != hopUser {
+			continue
+		}
+		matched = append(matched, cid)
+	}
+	return matched
+}
+
+func resolveHopAddressFromCandidates(cfg *Configuration, hostCandidates []string) (string, bool) {
+	var firstAddr string
+	for _, cid := range hostCandidates {
+		node, ok := cfg.Nodes.Get(cid)
+		if !ok {
+			continue
+		}
+		h, hok := cfg.Hosts.Get(node.HostRef)
+		if !hok {
+			continue
+		}
+		clean := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(h.Address), "]"), "[")
+		if firstAddr == "" {
+			firstAddr = clean
+		} else if firstAddr != clean {
+			return "", false
+		}
+	}
+	return firstAddr, true
+}
+
+func resolveHopPortFromCandidates(cfg *Configuration, hostCandidates []string) (uint16, bool) {
+	var firstPort uint16
+	for _, cid := range hostCandidates {
+		node, ok := cfg.Nodes.Get(cid)
+		if !ok {
+			continue
+		}
+		h, hok := cfg.Hosts.Get(node.HostRef)
+		if !hok {
+			continue
+		}
+		if firstPort == 0 {
+			firstPort = h.Port
+		} else if firstPort != h.Port {
+			return 0, false
+		}
+	}
+	return firstPort, true
+}
+
+func resolveHopAddressFallback(cfg *Configuration, hop, hopUser string, hopPort uint16, hostCandidates []string) (string, error) {
+	firstAddr, consistent := resolveHopAddressFromCandidates(cfg, hostCandidates)
+	if !consistent {
+		return "", &AmbiguousNodeError{Selector: hop, Candidates: slices.Clone(hostCandidates)}
+	}
+	if firstAddr == "" {
+		return "", errors.New(i18n.Tf("ssh_err_jump_not_found", map[string]any{"Host": hop}))
+	}
+	effectivePort := hopPort
+	if effectivePort == 0 {
+		candPort, portConsistent := resolveHopPortFromCandidates(cfg, hostCandidates)
+		if !portConsistent {
+			return "", &AmbiguousNodeError{Selector: hop, Candidates: slices.Clone(hostCandidates)}
+		}
+		if candPort != 0 {
+			effectivePort = candPort
+		} else {
+			effectivePort = 22
+		}
+	}
+	var matchingNodes []string
+	for _, nid := range cfg.Nodes.Keys() {
+		n, ok := cfg.Nodes.Get(nid)
+		if !ok {
+			continue
+		}
+		h, hok := cfg.Hosts.Get(n.HostRef)
+		ident, iok := cfg.Identities.Get(n.IdentityRef)
+		if hok && iok {
+			cleanHostAddr := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(h.Address), "]"), "[")
+			if cleanHostAddr == firstAddr && h.Port == effectivePort {
+				if hopUser == "" || ident.User == hopUser {
+					matchingNodes = append(matchingNodes, nid)
+				}
+			}
+		}
+	}
+	slices.Sort(matchingNodes)
+	switch len(matchingNodes) {
+	case 1:
+		return matchingNodes[0], nil
+	case 0:
+		var resolvedSpec string
+		if hopUser != "" {
+			resolvedSpec = FormatNodeID(hopUser, firstAddr, effectivePort)
+		} else {
+			resolvedSpec = FormatHostPort(firstAddr, effectivePort)
+		}
+		if isDirectJumpTarget(resolvedSpec) {
+			return OpenSSHNodePrefix + resolvedSpec, nil
+		}
+		return "", errors.New(i18n.Tf("ssh_err_jump_not_found", map[string]any{"Host": hop}))
+	default:
+		return "", &AmbiguousNodeError{Selector: hop, Candidates: matchingNodes}
+	}
+}
+
+func resolveHopFromHostCandidates(cfg *Configuration, hop, hopUser string, hopPort uint16, hostCandidates []string) (string, error) {
+	matched := filterHostCandidates(cfg, hostCandidates, hopUser, hopPort)
+	switch len(matched) {
+	case 1:
+		return matched[0], nil
+	case 0:
+		return resolveHopAddressFallback(cfg, hop, hopUser, hopPort, hostCandidates)
+	default:
+		return "", &AmbiguousNodeError{Selector: hop, Candidates: slices.Clone(matched)}
+	}
+}
+
+// resolveOpenSSHJumpHop handles jump targets that are explicitly prefixed with OpenSSHNodePrefix.
+func resolveOpenSSHJumpHop(openSSH *OpenSSHParser, hop string) (string, error) {
+	cleanHop := strings.TrimPrefix(hop, OpenSSHNodePrefix)
+	if openSSH != nil && openSSH.cfg != nil && openSSH.HasHost(cleanHop) {
+		if _, _, _, vErr := openSSH.GetVirtualNode(cleanHop); vErr != nil {
+			return "", fmt.Errorf("resolve openssh jump %q: %w", cleanHop, vErr)
+		}
+		return OpenSSHNodePrefix + cleanHop, nil
 	}
 
 	if isDirectJumpTarget(cleanHop) {
-		_, _, _, parseErr := parseOpenSSHHostSpec(cleanHop)
-		if parseErr != nil {
+		if _, _, _, parseErr := parseOpenSSHHostSpec(cleanHop); parseErr != nil {
 			return "", fmt.Errorf("invalid jump host address %q: %w", cleanHop, parseErr)
 		}
 		return OpenSSHNodePrefix + cleanHop, nil
 	}
 
 	return "", errors.New(i18n.Tf("ssh_err_jump_not_found", map[string]any{"Host": hop}))
+}
+
+// resolveLocalOrDirectJumpHop handles jump targets with unspecified origin (local first, then OpenSSH, then direct).
+func resolveLocalOrDirectJumpHop(cfg *Configuration, openSSH *OpenSSHParser, hop string) (string, error) {
+	lookup, aliases, err := buildIndexes(cfg, false)
+	if err != nil {
+		return "", fmt.Errorf("build indexes for jump resolution failed: %w", err)
+	}
+	if exact, matched, matchErr := resolveHopExactNodeMatch(cfg, lookup, aliases, hop); matched {
+		return exact, matchErr
+	}
+
+	hopHost, hopUser, hopPort, parseErr := parseOpenSSHHostSpec(hop)
+	if parseErr == nil && hopHost != "" {
+		hostCandidates := collectHostCandidates(cfg, lookup, aliases, hopHost)
+		if len(hostCandidates) > 0 {
+			return resolveHopFromHostCandidates(cfg, hop, hopUser, hopPort, hostCandidates)
+		}
+	}
+
+	if openSSH != nil && openSSH.cfg != nil && openSSH.HasHost(hop) {
+		if _, _, _, vErr := openSSH.GetVirtualNode(hop); vErr != nil {
+			return "", fmt.Errorf("resolve openssh jump %q: %w", hop, vErr)
+		}
+		return OpenSSHNodePrefix + hop, nil
+	}
+
+	if isDirectJumpTarget(hop) {
+		if parseErr != nil {
+			return "", fmt.Errorf("invalid jump host address %q: %w", hop, parseErr)
+		}
+		return OpenSSHNodePrefix + hop, nil
+	}
+
+	return "", errors.New(i18n.Tf("ssh_err_jump_not_found", map[string]any{"Host": hop}))
+}
+
+// resolveSingleJumpHopWithConfig resolves a single jump hop selector to a canonical node ID or OpenSSH node.
+// Resolution strategy:
+//  1. Explicit OpenSSH targets (prefixed with OpenSSHNodePrefix): OpenSSH config host or direct jump target only.
+//  2. Unspecified origin:
+//     a. Existing Node ID
+//     b. Existing Alias
+//     c. Existing Host address/selector lookup
+//     d. OpenSSH Host defined in ~/.ssh/config
+//     e. Direct jump target: explicitly requires Node/Alias, FQDN (contains '.'), IP, or [user@]host:port.
+//
+// Single-label hostnames without port/user cannot be used as direct jumps to avoid silent misconnections on alias typos.
+func resolveSingleJumpHopWithConfig(cfg *Configuration, openSSH *OpenSSHParser, hop string) (string, error) {
+	if strings.HasPrefix(hop, OpenSSHNodePrefix) {
+		return resolveOpenSSHJumpHop(openSSH, hop)
+	}
+	return resolveLocalOrDirectJumpHop(cfg, openSSH, hop)
 }
 
 func isDirectJumpTarget(cleanHop string) bool {

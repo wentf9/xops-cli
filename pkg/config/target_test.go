@@ -1364,3 +1364,584 @@ func TestEnsureNodeContext_DirectConnectionAndProxyJumpConflict(t *testing.T) {
 		t.Errorf("expected error containing 'ambiguous proxy jump', got %v", err)
 	}
 }
+
+func TestResolveProxyJumpChain_SavedAliasWithPort(t *testing.T) {
+	ctx := context.Background()
+
+	cfg := cloneConfiguration(nil)
+	cfg.Hosts.Set("10.0.0.5:22", models.Host{Address: "10.0.0.5", Port: 22, Alias: []string{"bastion"}})
+	cfg.Identities.Set("root@10.0.0.5", models.Identity{User: "root", AuthType: "auto"})
+	cfg.Nodes.Set("root@10.0.0.5:22", models.Node{
+		HostRef:     "10.0.0.5:22",
+		IdentityRef: "root@10.0.0.5",
+		Alias:       []string{"bastion"},
+	})
+
+	store := &repositoryTestStore{result: PersistResult{Applied: true, Durable: true}}
+	repo, err := NewRepositoryWithoutOpenSSH(cfg, store)
+	if err != nil {
+		t.Fatalf("failed to create repo: %v", err)
+	}
+
+	t.Run("jump_with_alias_and_matching_port", func(t *testing.T) {
+		resolved, rErr := repo.ResolveProxyJumpChain("bastion:22")
+		if rErr != nil {
+			t.Fatalf("ResolveProxyJumpChain failed: %v", rErr)
+		}
+		expectedNodeID := "root@10.0.0.5:22"
+		if resolved != expectedNodeID {
+			t.Errorf("expected resolved jump %q, got %q", expectedNodeID, resolved)
+		}
+	})
+
+	t.Run("jump_with_bare_alias", func(t *testing.T) {
+		resolved, rErr := repo.ResolveProxyJumpChain("bastion")
+		if rErr != nil {
+			t.Fatalf("ResolveProxyJumpChain failed: %v", rErr)
+		}
+		expectedNodeID := "root@10.0.0.5:22"
+		if resolved != expectedNodeID {
+			t.Errorf("expected resolved jump %q, got %q", expectedNodeID, resolved)
+		}
+	})
+
+	t.Run("jump_with_matching_user_alias_and_port", func(t *testing.T) {
+		resolved, rErr := repo.ResolveProxyJumpChain("root@bastion:22")
+		if rErr != nil {
+			t.Fatalf("ResolveProxyJumpChain failed: %v", rErr)
+		}
+		expectedNodeID := "root@10.0.0.5:22"
+		if resolved != expectedNodeID {
+			t.Errorf("expected resolved jump %q, got %q", expectedNodeID, resolved)
+		}
+	})
+
+	t.Run("jump_with_different_user_uses_canonical_address", func(t *testing.T) {
+		resolved, rErr := repo.ResolveProxyJumpChain("user2@bastion:22")
+		if rErr != nil {
+			t.Fatalf("ResolveProxyJumpChain failed: %v", rErr)
+		}
+		expectedDirect := OpenSSHNodePrefix + "user2@10.0.0.5:22"
+		if resolved != expectedDirect {
+			t.Errorf("expected resolved jump %q, got %q", expectedDirect, resolved)
+		}
+	})
+
+	t.Run("jump_with_different_port_uses_canonical_address", func(t *testing.T) {
+		resolved, rErr := repo.ResolveProxyJumpChain("bastion:2222")
+		if rErr != nil {
+			t.Fatalf("ResolveProxyJumpChain failed: %v", rErr)
+		}
+		expectedDirect := OpenSSHNodePrefix + "10.0.0.5:2222"
+		if resolved != expectedDirect {
+			t.Errorf("expected resolved jump %q, got %q", expectedDirect, resolved)
+		}
+	})
+
+	t.Run("ensure_node_inherits_resolved_jump_alias_with_port", func(t *testing.T) {
+		target := ConnectionTarget{
+			Selector:     "10.0.0.100",
+			User:         "root",
+			HasUser:      true,
+			ProxyJump:    "bastion:22",
+			HasProxyJump: true,
+		}
+		res, eErr := repo.EnsureNodeContext(ctx, EnsureNodeOptions{Target: target})
+		if eErr != nil {
+			t.Fatalf("EnsureNodeContext failed: %v", eErr)
+		}
+		snap := repo.Snapshot()
+		node, ok := snap.Nodes.Get(res.NodeID)
+		if !ok {
+			t.Fatalf("node %q not found", res.NodeID)
+		}
+		expectedNodeID := "root@10.0.0.5:22"
+		if node.ProxyJump != expectedNodeID {
+			t.Errorf("expected node ProxyJump %q, got %q", expectedNodeID, node.ProxyJump)
+		}
+	})
+}
+
+func TestEnsureNodeContext_MultiPortDisambiguation(t *testing.T) {
+	ctx := context.Background()
+
+	cfg := cloneConfiguration(nil)
+	cfg.Hosts.Set("10.0.0.1:22", models.Host{Address: "10.0.0.1", Port: 22})
+	cfg.Hosts.Set("10.0.0.1:2222", models.Host{Address: "10.0.0.1", Port: 2222})
+	cfg.Identities.Set("root@10.0.0.1", models.Identity{User: "root", AuthType: "auto"})
+	cfg.Identities.Set("root@10.0.0.1:2222", models.Identity{User: "root", AuthType: "auto"})
+	cfg.Nodes.Set("root@10.0.0.1:22", models.Node{
+		HostRef:     "10.0.0.1:22",
+		IdentityRef: "root@10.0.0.1",
+	})
+	cfg.Nodes.Set("root@10.0.0.1:2222", models.Node{
+		HostRef:     "10.0.0.1:2222",
+		IdentityRef: "root@10.0.0.1:2222",
+	})
+
+	store := &repositoryTestStore{result: PersistResult{Applied: true, Durable: true}}
+	repo, err := NewRepositoryWithoutOpenSSH(cfg, store)
+	if err != nil {
+		t.Fatalf("failed to create repo: %v", err)
+	}
+
+	t.Run("explicit_port_2222_resolves_without_ambiguity", func(t *testing.T) {
+		target := ConnectionTarget{
+			Selector: "10.0.0.1",
+			User:     "root",
+			HasUser:  true,
+			Port:     2222,
+			HasPort:  true,
+		}
+		res, eErr := repo.EnsureNodeContext(ctx, EnsureNodeOptions{Target: target})
+		if eErr != nil {
+			t.Fatalf("EnsureNodeContext failed: %v", eErr)
+		}
+		if res.Created {
+			t.Fatalf("expected existing node, but was created")
+		}
+		if res.NodeID != "root@10.0.0.1:2222" {
+			t.Errorf("got %q, want root@10.0.0.1:2222", res.NodeID)
+		}
+	})
+
+	t.Run("explicit_port_22_resolves_without_ambiguity", func(t *testing.T) {
+		target := ConnectionTarget{
+			Selector: "10.0.0.1",
+			User:     "root",
+			HasUser:  true,
+			Port:     22,
+			HasPort:  true,
+		}
+		res, eErr := repo.EnsureNodeContext(ctx, EnsureNodeOptions{Target: target})
+		if eErr != nil {
+			t.Fatalf("EnsureNodeContext failed: %v", eErr)
+		}
+		if res.Created {
+			t.Fatalf("expected existing node, but was created")
+		}
+		if res.NodeID != "root@10.0.0.1:22" {
+			t.Errorf("got %q, want root@10.0.0.1:22", res.NodeID)
+		}
+	})
+
+	t.Run("explicit_port_only_resolves_unique_candidate", func(t *testing.T) {
+		target := ConnectionTarget{
+			Selector: "10.0.0.1",
+			Port:     2222,
+			HasPort:  true,
+		}
+		res, eErr := repo.EnsureNodeContext(ctx, EnsureNodeOptions{Target: target})
+		if eErr != nil {
+			t.Fatalf("EnsureNodeContext failed: %v", eErr)
+		}
+		if res.Created {
+			t.Fatalf("expected existing node, but was created")
+		}
+		if res.NodeID != "root@10.0.0.1:2222" {
+			t.Errorf("got %q, want root@10.0.0.1:2222", res.NodeID)
+		}
+	})
+
+	t.Run("bare_address_multi_port_returns_ambiguous", func(t *testing.T) {
+		target := ConnectionTarget{
+			Selector: "10.0.0.1",
+		}
+		_, eErr := repo.EnsureNodeContext(ctx, EnsureNodeOptions{Target: target})
+		if eErr == nil {
+			t.Fatalf("expected AmbiguousNodeError, got nil")
+		}
+		var ambErr *AmbiguousNodeError
+		if !errors.As(eErr, &ambErr) {
+			t.Fatalf("expected *AmbiguousNodeError, got %T: %v", eErr, eErr)
+		}
+		if len(ambErr.Candidates) != 2 {
+			t.Errorf("expected 2 ambiguous candidates, got %d", len(ambErr.Candidates))
+		}
+	})
+
+	t.Run("new_port_creates_node_without_ambiguity", func(t *testing.T) {
+		target := ConnectionTarget{
+			Selector: "10.0.0.1",
+			User:     "root",
+			HasUser:  true,
+			Port:     3333,
+			HasPort:  true,
+		}
+		res, eErr := repo.EnsureNodeContext(ctx, EnsureNodeOptions{Target: target})
+		if eErr != nil {
+			t.Fatalf("EnsureNodeContext failed: %v", eErr)
+		}
+		if !res.Created {
+			t.Fatalf("expected new node to be created")
+		}
+		if res.NodeID != "root@10.0.0.1:3333" {
+			t.Errorf("got %q, want root@10.0.0.1:3333", res.NodeID)
+		}
+	})
+}
+
+func TestEnsureNodeContext_ChangeUserPreservesPortAndProxyJump(t *testing.T) {
+	ctx := context.Background()
+	cfg := cloneConfiguration(nil)
+	cfg.Hosts.Set("10.0.0.5:2222", models.Host{Address: "10.0.0.5", Port: 2222})
+	cfg.Identities.Set("root@10.0.0.5:2222", models.Identity{User: "root", AuthType: "auto"})
+	cfg.Nodes.Set("root@10.0.0.5:2222", models.Node{
+		HostRef:     "10.0.0.5:2222",
+		IdentityRef: "root@10.0.0.5:2222",
+		ProxyJump:   "upstream",
+	})
+
+	store := &repositoryTestStore{result: PersistResult{Applied: true, Durable: true}}
+	repo, err := NewRepositoryWithoutOpenSSH(cfg, store)
+	if err != nil {
+		t.Fatalf("failed to create repo: %v", err)
+	}
+
+	target := ConnectionTarget{
+		Selector: "10.0.0.5",
+		User:     "test",
+		HasUser:  true,
+	}
+	res, eErr := repo.EnsureNodeContext(ctx, EnsureNodeOptions{Target: target})
+	if eErr != nil {
+		t.Fatalf("EnsureNodeContext failed: %v", eErr)
+	}
+	if !res.Created {
+		t.Fatalf("expected new node to be created")
+	}
+	expectedNodeID := "test@10.0.0.5:2222"
+	if res.NodeID != expectedNodeID {
+		t.Errorf("expected node ID %q, got %q", expectedNodeID, res.NodeID)
+	}
+
+	snap := repo.Snapshot()
+	node, ok := snap.Nodes.Get(res.NodeID)
+	if !ok {
+		t.Fatalf("node %s not found in snapshot", res.NodeID)
+	}
+	if node.ProxyJump != "upstream" {
+		t.Errorf("expected inherited ProxyJump 'upstream', got %q", node.ProxyJump)
+	}
+	host, hok := snap.Hosts.Get(node.HostRef)
+	if !hok {
+		t.Fatalf("host %s not found", node.HostRef)
+	}
+	if host.Port != 2222 {
+		t.Errorf("expected host port 2222, got %d", host.Port)
+	}
+}
+
+func TestEnsureNodeContext_ChangeUserWithMultiPortReturnsAmbiguous(t *testing.T) {
+	ctx := context.Background()
+	cfg := cloneConfiguration(nil)
+	cfg.Hosts.Set("10.0.0.5:22", models.Host{Address: "10.0.0.5", Port: 22})
+	cfg.Hosts.Set("10.0.0.5:2222", models.Host{Address: "10.0.0.5", Port: 2222})
+	cfg.Identities.Set("root@10.0.0.5:22", models.Identity{User: "root", AuthType: "auto"})
+	cfg.Identities.Set("root@10.0.0.5:2222", models.Identity{User: "root", AuthType: "auto"})
+	cfg.Nodes.Set("root@10.0.0.5:22", models.Node{
+		HostRef:     "10.0.0.5:22",
+		IdentityRef: "root@10.0.0.5:22",
+	})
+	cfg.Nodes.Set("root@10.0.0.5:2222", models.Node{
+		HostRef:     "10.0.0.5:2222",
+		IdentityRef: "root@10.0.0.5:2222",
+		ProxyJump:   "upstream",
+	})
+
+	store := &repositoryTestStore{result: PersistResult{Applied: true, Durable: true}}
+	repo, err := NewRepositoryWithoutOpenSSH(cfg, store)
+	if err != nil {
+		t.Fatalf("failed to create repo: %v", err)
+	}
+
+	target := ConnectionTarget{
+		Selector: "10.0.0.5",
+		User:     "test",
+		HasUser:  true,
+	}
+	_, eErr := repo.EnsureNodeContext(ctx, EnsureNodeOptions{Target: target})
+	if eErr == nil {
+		t.Fatalf("expected AmbiguousNodeError, got nil")
+	}
+	var ambErr *AmbiguousNodeError
+	if !errors.As(eErr, &ambErr) {
+		t.Fatalf("expected *AmbiguousNodeError, got %T: %v", eErr, eErr)
+	}
+	if len(ambErr.Candidates) != 2 {
+		t.Errorf("expected 2 candidates, got %d", len(ambErr.Candidates))
+	}
+}
+
+func TestEnsureNodeContext_ChangeUserMultiNodeSamePort(t *testing.T) {
+	ctx := context.Background()
+	cfg := cloneConfiguration(nil)
+	cfg.Hosts.Set("10.0.0.5:2222", models.Host{Address: "10.0.0.5", Port: 2222})
+	cfg.Identities.Set("root@10.0.0.5:2222", models.Identity{User: "root", AuthType: "auto"})
+	cfg.Identities.Set("admin@10.0.0.5:2222", models.Identity{User: "admin", AuthType: "auto"})
+	cfg.Nodes.Set("root@10.0.0.5:2222", models.Node{
+		HostRef:     "10.0.0.5:2222",
+		IdentityRef: "root@10.0.0.5:2222",
+		ProxyJump:   "upstream",
+	})
+	cfg.Nodes.Set("admin@10.0.0.5:2222", models.Node{
+		HostRef:     "10.0.0.5:2222",
+		IdentityRef: "admin@10.0.0.5:2222",
+		ProxyJump:   "upstream",
+	})
+
+	store := &repositoryTestStore{result: PersistResult{Applied: true, Durable: true}}
+	repo, err := NewRepositoryWithoutOpenSSH(cfg, store)
+	if err != nil {
+		t.Fatalf("failed to create repo: %v", err)
+	}
+
+	target := ConnectionTarget{
+		Selector: "10.0.0.5",
+		User:     "test",
+		HasUser:  true,
+	}
+	res, eErr := repo.EnsureNodeContext(ctx, EnsureNodeOptions{Target: target})
+	if eErr != nil {
+		t.Fatalf("EnsureNodeContext failed: %v", eErr)
+	}
+	if !res.Created {
+		t.Fatalf("expected new node to be created")
+	}
+	if res.NodeID != "test@10.0.0.5:2222" {
+		t.Errorf("expected test@10.0.0.5:2222, got %s", res.NodeID)
+	}
+	snap := repo.Snapshot()
+	node, _ := snap.Nodes.Get(res.NodeID)
+	if node.ProxyJump != "upstream" {
+		t.Errorf("expected ProxyJump 'upstream', got %q", node.ProxyJump)
+	}
+}
+
+func TestEnsureNodeContext_ChangeUserExplicitPortOverrides(t *testing.T) {
+	ctx := context.Background()
+	cfg := cloneConfiguration(nil)
+	cfg.Hosts.Set("10.0.0.5:2222", models.Host{Address: "10.0.0.5", Port: 2222})
+	cfg.Identities.Set("root@10.0.0.5:2222", models.Identity{User: "root", AuthType: "auto"})
+	cfg.Nodes.Set("root@10.0.0.5:2222", models.Node{
+		HostRef:     "10.0.0.5:2222",
+		IdentityRef: "root@10.0.0.5:2222",
+		ProxyJump:   "upstream",
+	})
+
+	store := &repositoryTestStore{result: PersistResult{Applied: true, Durable: true}}
+	repo, err := NewRepositoryWithoutOpenSSH(cfg, store)
+	if err != nil {
+		t.Fatalf("failed to create repo: %v", err)
+	}
+
+	target := ConnectionTarget{
+		Selector: "10.0.0.5",
+		User:     "test",
+		HasUser:  true,
+		Port:     22,
+		HasPort:  true,
+	}
+	res, eErr := repo.EnsureNodeContext(ctx, EnsureNodeOptions{Target: target})
+	if eErr != nil {
+		t.Fatalf("EnsureNodeContext failed: %v", eErr)
+	}
+	if !res.Created {
+		t.Fatalf("expected new node to be created")
+	}
+	if res.NodeID != "test@10.0.0.5:22" {
+		t.Errorf("expected test@10.0.0.5:22, got %s", res.NodeID)
+	}
+	snap := repo.Snapshot()
+	node, _ := snap.Nodes.Get(res.NodeID)
+	// ProxyJump should not be inherited because port 22 does not match port 2222
+	if node.ProxyJump != "" {
+		t.Errorf("expected empty ProxyJump, got %q", node.ProxyJump)
+	}
+}
+
+func setupBastionJumpRepo(t *testing.T) *Repository {
+	t.Helper()
+	cfg := cloneConfiguration(nil)
+	cfg.Hosts.Set("10.0.0.5:2222", models.Host{Address: "10.0.0.5", Port: 2222})
+	cfg.Identities.Set("root@10.0.0.5:2222", models.Identity{User: "root", AuthType: "auto"})
+	cfg.Nodes.Set("root@10.0.0.5:2222", models.Node{
+		HostRef:     "10.0.0.5:2222",
+		IdentityRef: "root@10.0.0.5:2222",
+		Alias:       []string{"bastion"},
+	})
+	store := &repositoryTestStore{result: PersistResult{Applied: true, Durable: true}}
+	repo, err := NewRepositoryWithoutOpenSSH(cfg, store)
+	if err != nil {
+		t.Fatalf("failed to create repo: %v", err)
+	}
+	return repo
+}
+
+func TestResolveProxyJumpChain_AliasUserOverridePreservesPort(t *testing.T) {
+	repo := setupBastionJumpRepo(t)
+	resolved, rErr := repo.ResolveProxyJumpChain("another@bastion")
+	if rErr != nil {
+		t.Fatalf("ResolveProxyJumpChain failed: %v", rErr)
+	}
+	expectedDirect := OpenSSHNodePrefix + "another@10.0.0.5:2222"
+	if resolved != expectedDirect {
+		t.Errorf("expected resolved jump %q, got %q", expectedDirect, resolved)
+	}
+}
+
+func TestResolveProxyJumpChain_AliasUserOverrideMatchesExistingNode(t *testing.T) {
+	cfg := cloneConfiguration(nil)
+	cfg.Hosts.Set("10.0.0.5:2222", models.Host{Address: "10.0.0.5", Port: 2222})
+	cfg.Identities.Set("root@10.0.0.5:2222", models.Identity{User: "root", AuthType: "auto"})
+	cfg.Identities.Set("another@10.0.0.5:2222", models.Identity{User: "another", AuthType: "auto"})
+	cfg.Nodes.Set("root@10.0.0.5:2222", models.Node{
+		HostRef:     "10.0.0.5:2222",
+		IdentityRef: "root@10.0.0.5:2222",
+		Alias:       []string{"bastion"},
+	})
+	cfg.Nodes.Set("another@10.0.0.5:2222", models.Node{
+		HostRef:     "10.0.0.5:2222",
+		IdentityRef: "another@10.0.0.5:2222",
+	})
+	store := &repositoryTestStore{result: PersistResult{Applied: true, Durable: true}}
+	repo, rErr := NewRepositoryWithoutOpenSSH(cfg, store)
+	if rErr != nil {
+		t.Fatalf("failed to create repo: %v", rErr)
+	}
+
+	resolved, rErr := repo.ResolveProxyJumpChain("another@bastion")
+	if rErr != nil {
+		t.Fatalf("ResolveProxyJumpChain failed: %v", rErr)
+	}
+	expectedNode := "another@10.0.0.5:2222"
+	if resolved != expectedNode {
+		t.Errorf("expected resolved jump %q, got %q", expectedNode, resolved)
+	}
+}
+
+func TestResolveProxyJumpChain_UserOverrideWithMultiPortHostReturnsAmbiguous(t *testing.T) {
+	cfg := cloneConfiguration(nil)
+	cfg.Hosts.Set("10.0.0.5:22", models.Host{Address: "10.0.0.5", Port: 22})
+	cfg.Hosts.Set("10.0.0.5:2222", models.Host{Address: "10.0.0.5", Port: 2222})
+	cfg.Identities.Set("root@10.0.0.5:22", models.Identity{User: "root", AuthType: "auto"})
+	cfg.Identities.Set("root@10.0.0.5:2222", models.Identity{User: "root", AuthType: "auto"})
+	cfg.Nodes.Set("root@10.0.0.5:22", models.Node{
+		HostRef:     "10.0.0.5:22",
+		IdentityRef: "root@10.0.0.5:22",
+	})
+	cfg.Nodes.Set("root@10.0.0.5:2222", models.Node{
+		HostRef:     "10.0.0.5:2222",
+		IdentityRef: "root@10.0.0.5:2222",
+	})
+	store := &repositoryTestStore{result: PersistResult{Applied: true, Durable: true}}
+	repo, rErr := NewRepositoryWithoutOpenSSH(cfg, store)
+	if rErr != nil {
+		t.Fatalf("failed to create repo: %v", rErr)
+	}
+
+	_, rErr = repo.ResolveProxyJumpChain("another@10.0.0.5")
+	if rErr == nil {
+		t.Fatalf("expected AmbiguousNodeError, got nil")
+	}
+	var ambErr *AmbiguousNodeError
+	if !errors.As(rErr, &ambErr) {
+		t.Fatalf("expected *AmbiguousNodeError, got %T: %v", rErr, rErr)
+	}
+	if len(ambErr.Candidates) != 2 {
+		t.Errorf("expected 2 ambiguous candidates, got %d", len(ambErr.Candidates))
+	}
+}
+
+func TestResolveProxyJumpChain_AliasUserOverrideWithExplicitPort(t *testing.T) {
+	repo := setupBastionJumpRepo(t)
+	resolved, rErr := repo.ResolveProxyJumpChain("another@bastion:3333")
+	if rErr != nil {
+		t.Fatalf("ResolveProxyJumpChain failed: %v", rErr)
+	}
+	expectedDirect := OpenSSHNodePrefix + "another@10.0.0.5:3333"
+	if resolved != expectedDirect {
+		t.Errorf("expected resolved jump %q, got %q", expectedDirect, resolved)
+	}
+}
+
+func setupOpenSSHAndLocalAliasConflictRepo(t *testing.T) (*Repository, *OpenSSHParser) {
+	t.Helper()
+	sshConfig := `
+Host remote
+    HostName 10.0.0.10
+    ProxyJump bastion
+
+Host bastion
+    HostName 10.0.0.20
+    Port 22
+`
+	parser, pErr := NewOpenSSHParserFromReader(strings.NewReader(sshConfig))
+	if pErr != nil {
+		t.Fatalf("failed to create openssh parser: %v", pErr)
+	}
+
+	cfg := cloneConfiguration(nil)
+	cfg.Hosts.Set("10.0.0.99:22", models.Host{Address: "10.0.0.99", Port: 22})
+	cfg.Identities.Set("root@10.0.0.99", models.Identity{User: "root", AuthType: "auto"})
+	cfg.Nodes.Set("root@10.0.0.99:22", models.Node{
+		HostRef:     "10.0.0.99:22",
+		IdentityRef: "root@10.0.0.99",
+		Alias:       []string{"bastion"},
+	})
+
+	store := &repositoryTestStore{result: PersistResult{Applied: true, Durable: true}}
+	repo, rErr := NewRepositoryWithOpenSSHParser(cfg, store, parser)
+	if rErr != nil {
+		t.Fatalf("failed to create repo: %v", rErr)
+	}
+	return repo, parser
+}
+
+func TestResolveProxyJumpChain_OpenSSHJumpNotOverriddenByLocalAlias(t *testing.T) {
+	repo, _ := setupOpenSSHAndLocalAliasConflictRepo(t)
+
+	// Explicitly prefixed with openssh: must resolve to OpenSSH host, never local alias
+	resolved, err := repo.ResolveProxyJumpChain("openssh:bastion")
+	if err != nil {
+		t.Fatalf("ResolveProxyJumpChain(openssh:bastion) failed: %v", err)
+	}
+	expected := OpenSSHNodePrefix + "bastion"
+	if resolved != expected {
+		t.Errorf("expected %q, got %q (must not be overridden by local node)", expected, resolved)
+	}
+
+	// Unspecified origin: local alias takes priority
+	resolvedLocal, lErr := repo.ResolveProxyJumpChain("bastion")
+	if lErr != nil {
+		t.Fatalf("ResolveProxyJumpChain(bastion) failed: %v", lErr)
+	}
+	expectedLocal := "root@10.0.0.99:22"
+	if resolvedLocal != expectedLocal {
+		t.Errorf("expected %q, got %q (unspecified origin must prioritize local alias)", expectedLocal, resolvedLocal)
+	}
+}
+
+func TestEnsureNodeContext_OpenSSHInheritedJumpNotOverriddenByLocalAlias(t *testing.T) {
+	ctx := context.Background()
+	repo, _ := setupOpenSSHAndLocalAliasConflictRepo(t)
+
+	target := ConnectionTarget{
+		Selector: "remote",
+		User:     "test",
+		HasUser:  true,
+	}
+	res, err := repo.EnsureNodeContext(ctx, EnsureNodeOptions{Target: target})
+	if err != nil {
+		t.Fatalf("EnsureNodeContext failed: %v", err)
+	}
+	snap := repo.Snapshot()
+	node, ok := snap.Nodes.Get(res.NodeID)
+	if !ok {
+		t.Fatalf("node %s not found", res.NodeID)
+	}
+	expectedJump := OpenSSHNodePrefix + "bastion"
+	if node.ProxyJump != expectedJump {
+		t.Errorf("expected inherited ProxyJump %q, got %q (must not be local node root@10.0.0.99:22)", expectedJump, node.ProxyJump)
+	}
+}
