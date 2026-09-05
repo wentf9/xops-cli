@@ -22,7 +22,9 @@ import (
 
 // Connector 负责创建 SSH 连接
 type Connector struct {
-	store              ConfigStore
+	provider           ConnectionProvider
+	secretResolver     SecretResolver
+	credentialRecorder CredentialRecorder
 	secretPrompter     SecretPrompter
 	hostKeyConfirmer   HostKeyConfirmer
 	interactionTimeout time.Duration
@@ -92,16 +94,52 @@ func (rejectInteraction) ConfirmHostKey(context.Context, HostKeyConfirmation) (b
 	return false, ErrInteractionRequired
 }
 
+// rejectSecretResolver 是默认的 fail-closed 机密解析实现。
+type rejectSecretResolver struct{}
+
+func (rejectSecretResolver) ResolveSecret(ctx context.Context, req SecretRequest) ([]byte, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return nil, ErrInteractionRequired
+}
+
+// nopCredentialRecorder 是默认的空操作凭据记录实现。
+type nopCredentialRecorder struct{}
+
+func (nopCredentialRecorder) UpdateAuth(ctx context.Context, nodeID, authUpdateToken, password, keyPath, passphrase string) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (nopCredentialRecorder) UpdateSudo(ctx context.Context, nodeID, sudoUpdateToken string, mode SudoMode, suPwd string) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 const (
 	defaultSSHHandshakeTimeout = 10 * time.Second
 	DefaultInteractionTimeout  = 2 * time.Minute
 )
 
 // NewConnector 创建一个新的 Connector，支持 Functional Options。
-func NewConnector(store ConfigStore, opts ...Option) *Connector {
+// 支持接收 ConnectionProvider 或兼容的 ConfigStore。
+func NewConnector(provider ConnectionProvider, opts ...Option) *Connector {
 	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
 	c := &Connector{
-		store:              store,
+		provider:           provider,
+		secretResolver:     rejectSecretResolver{},
+		credentialRecorder: nopCredentialRecorder{},
 		secretPrompter:     rejectInteraction{},
 		hostKeyConfirmer:   rejectInteraction{},
 		interactionTimeout: DefaultInteractionTimeout,
@@ -111,6 +149,12 @@ func NewConnector(store ConfigStore, opts ...Option) *Connector {
 		closeDone:          make(chan struct{}),
 		keepAlives:         concurrent.NewMap[string, *keepAliveEntry](concurrent.HashString),
 		logger:             logger.NopLogger,
+	}
+	if resolver, ok := provider.(SecretResolver); ok {
+		c.secretResolver = resolver
+	}
+	if recorder, ok := provider.(CredentialRecorder); ok {
+		c.credentialRecorder = recorder
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -217,7 +261,7 @@ func (c *Connector) resolveConnectionPlan(ctx context.Context, nodeName string) 
 			return nil, &ProxyCycleError{NodeID: current, Path: path}
 		}
 
-		cfg, err := c.store.GetConfig(current)
+		cfg, err := c.provider.GetConfig(current)
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch config for node '%s': %w", current, err)
 		}
@@ -239,7 +283,7 @@ func (c *Connector) resolveConnectionPlan(ctx context.Context, nodeName string) 
 					path = append(path, jumpName)
 					return nil, &ProxyCycleError{NodeID: jumpName, Path: path}
 				}
-				jumpCfg, jumpErr := c.store.GetConfig(jumpName)
+				jumpCfg, jumpErr := c.provider.GetConfig(jumpName)
 				if jumpErr != nil {
 					return nil, fmt.Errorf("fetch config for proxy jump %q failed: %w", jumpName, jumpErr)
 				}
@@ -336,7 +380,7 @@ func (c *Connector) connectNode(ctx context.Context, planNode connectionPlanNode
 }
 
 func (c *Connector) wrapCachedClient(cfg *ClientConfig, cachedClient *PooledClient) *Client {
-	return newClientWithLogger(cachedClient.SSHClient, cachedClient.RootConn, cfg, c.store, c.PasswordPromptPattern, c.getLogger())
+	return newClientWithLogger(cachedClient.SSHClient, cachedClient.RootConn, cfg, c.credentialRecorder, c.PasswordPromptPattern, c.getLogger())
 }
 
 func (c *Connector) keepAliveProbeTimeout() time.Duration {
@@ -353,27 +397,81 @@ func (c *Connector) evictCachedClient(nodeName string, stale *PooledClient) {
 	c.removeKeepAliveFor(nodeName, stale)
 }
 
+func (c *Connector) resolveSecret(req SecretRequest) ([]byte, error) {
+	if c.secretResolver == nil {
+		return nil, ErrInteractionRequired
+	}
+	timeout := c.getHandshakeTimeout()
+	if timeout <= 0 {
+		timeout = defaultSSHHandshakeTimeout
+	}
+	ctx, cancel := context.WithTimeout(c.lifecycleCtx, timeout)
+	defer cancel()
+
+	return c.secretResolver.ResolveSecret(ctx, req)
+}
+
+func (c *Connector) resolveAndPromptSuPassword(ctx context.Context, nodeName string, cfg *ClientConfig) error {
+	if cfg.SudoMode != SudoModeSu || cfg.SuPwd != "" {
+		return nil
+	}
+
+	// 优先尝试 SecretResolver 解析（使用受生命周期控制和握手超时的有界 context，并绑定快照版本）
+	resolved, err := c.resolveSecret(SecretRequest{
+		Kind:         SecretKindSuPassword,
+		NodeID:       nodeName,
+		User:         cfg.User,
+		Host:         cfg.Address,
+		VersionToken: cfg.SudoUpdateToken,
+	})
+	if err == nil && len(resolved) > 0 {
+		cfg.SuPwd = string(resolved)
+		return nil
+	} else if err != nil && !errors.Is(err, ErrInteractionRequired) {
+		return fmt.Errorf("resolve su password for node %q failed: %w", nodeName, err)
+	}
+
+	// 若仍未配置，交互式提示并写回 Provider（调用方负责持久化）
+	promptCtx, cancel := c.interactionContext(ctx)
+	suPwd, err := c.secretPrompter.PromptSecret(promptCtx, SecretRequest{
+		Kind:         SecretKindSuPassword,
+		NodeID:       nodeName,
+		User:         cfg.User,
+		Host:         cfg.Address,
+		VersionToken: cfg.SudoUpdateToken,
+	})
+	cancel()
+	if err != nil {
+		return fmt.Errorf("failed to read su password: %w", err)
+	}
+	cfg.SuPwd = suPwd
+	if cfg.SudoUpdateToken != "" {
+		if err := c.credentialRecorder.UpdateSudo(ctx, nodeName, cfg.SudoUpdateToken, cfg.SudoMode, suPwd); err != nil {
+			return fmt.Errorf("failed to update sudo credentials for node '%s': %w", nodeName, err)
+		}
+	}
+	return nil
+}
+
+func (c *Connector) recordAuthUpdate(ctx context.Context, nodeName string, cfg *ClientConfig, rootConn net.Conn) error {
+	if (cfg.Password == "" && cfg.Passphrase == "") || cfg.AuthUpdateToken == "" {
+		return nil
+	}
+	if err := c.credentialRecorder.UpdateAuth(ctx, nodeName, cfg.AuthUpdateToken, cfg.Password, cfg.KeyPath, cfg.Passphrase); err != nil {
+		if closeErr := rootConn.Close(); closeErr != nil {
+			return fmt.Errorf("failed to update authentication for node '%s': %w; close unpublished SSH client failed: %w", nodeName, err, closeErr)
+		}
+		return fmt.Errorf("failed to update authentication for node '%s': %w", nodeName, err)
+	}
+	return nil
+}
+
 func (c *Connector) initializeConnection(ctx context.Context, planNode connectionPlanNode, dialer Dialer) (*Client, error) {
 	nodeName := planNode.name
 	cfg := planNode.cfg
 
-	// SudoMode 为 su 时若未配置密码，交互式提示并写回 Provider（调用方负责持久化）
-	if cfg.SudoMode == SudoModeSu && cfg.SuPwd == "" {
-		promptCtx, cancel := c.interactionContext(ctx)
-		suPwd, err := c.secretPrompter.PromptSecret(promptCtx, SecretRequest{
-			Kind:   SecretKindSuPassword,
-			NodeID: nodeName,
-		})
-		cancel()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read su password: %w", err)
-		}
-		cfg.SuPwd = suPwd
-		if cfg.SudoUpdateToken != "" {
-			if err := c.store.UpdateSudo(ctx, nodeName, cfg.SudoUpdateToken, cfg.SudoMode, suPwd); err != nil {
-				return nil, fmt.Errorf("failed to update sudo credentials for node '%s': %w", nodeName, err)
-			}
-		}
+	if err := c.resolveAndPromptSuPassword(ctx, nodeName, cfg); err != nil {
+		return nil, err
 	}
 
 	coordinator := newHandshakeCoordinator(ctx, c.getHandshakeTimeout())
@@ -395,13 +493,8 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 	}
 
 	// 认证并连接成功后，检查我们是否通过 "auto" 下的终端交互获取到了新凭证（密码或密钥密码）。
-	if (cfg.Password != "" || cfg.Passphrase != "") && cfg.AuthUpdateToken != "" {
-		if err := c.store.UpdateAuth(ctx, nodeName, cfg.AuthUpdateToken, cfg.Password, cfg.KeyPath, cfg.Passphrase); err != nil {
-			if closeErr := rootConn.Close(); closeErr != nil {
-				return nil, fmt.Errorf("failed to update authentication for node '%s': %w; close unpublished SSH client failed: %w", nodeName, err, closeErr)
-			}
-			return nil, fmt.Errorf("failed to update authentication for node '%s': %w", nodeName, err)
-		}
+	if err := c.recordAuthUpdate(ctx, nodeName, cfg, rootConn); err != nil {
+		return nil, err
 	}
 
 	pooled := &PooledClient{SSHClient: rawClient, RootConn: rootConn}
@@ -413,7 +506,7 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 	}
 	c.startKeepAliveFor(nodeName, pooled)
 	// 返回封装的 Client
-	return newClientWithLogger(rawClient, rootConn, cfg, c.store, c.PasswordPromptPattern, c.getLogger()), nil
+	return newClientWithLogger(rawClient, rootConn, cfg, c.credentialRecorder, c.PasswordPromptPattern, c.getLogger()), nil
 }
 
 func (c *Connector) publishClient(nodeName string, client *PooledClient) error {
@@ -757,6 +850,60 @@ func (c *Connector) CloseAll() error {
 	return c.closeErr
 }
 
+func (c *Connector) resolvePasswordAuth(cfg *ClientConfig) (ssh.AuthMethod, error) {
+	if cfg.Password == "" {
+		secret, err := c.resolveSecret(SecretRequest{
+			Kind:         SecretKindLoginPassword,
+			NodeID:       cfg.NodeID,
+			User:         cfg.User,
+			Host:         cfg.Address,
+			VersionToken: cfg.AuthUpdateToken,
+		})
+		if err == nil && len(secret) > 0 {
+			cfg.Password = string(secret)
+		} else if err != nil && !errors.Is(err, ErrInteractionRequired) {
+			return nil, fmt.Errorf("resolve login password failed: %w", err)
+		}
+	}
+	if cfg.Password == "" {
+		return nil, ErrPasswordRequired
+	}
+	return ssh.Password(cfg.Password), nil
+}
+
+func (c *Connector) resolveKeyAuth(cfg *ClientConfig) (ssh.AuthMethod, error) {
+	if cfg.Passphrase == "" {
+		secret, err := c.resolveSecret(SecretRequest{
+			Kind:         SecretKindPrivateKeyPassphrase,
+			NodeID:       cfg.NodeID,
+			User:         cfg.User,
+			Host:         cfg.Address,
+			KeyPath:      cfg.KeyPath,
+			VersionToken: cfg.AuthUpdateToken,
+		})
+		if err == nil && len(secret) > 0 {
+			cfg.Passphrase = string(secret)
+		} else if err != nil && !errors.Is(err, ErrInteractionRequired) {
+			return nil, fmt.Errorf("resolve private key passphrase failed: %w", err)
+		}
+	}
+	return buildKeyAuthMethod(cfg)
+}
+
+func (c *Connector) resolveAgentAuth(ctx context.Context) (ssh.AuthMethod, func(), error) {
+	socket := os.Getenv("SSH_AUTH_SOCK")
+	if socket == "" {
+		return nil, nil, ErrAgentNotAvailable
+	}
+	conn, err := dialSSHAgent(ctx, socket)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to connect to ssh-agent: %w", err)
+	}
+	agentClient := agent.NewClient(conn)
+	cleanup := func() { debugCloseResource(c.getLogger(), conn, "ssh agent connection") }
+	return ssh.PublicKeysCallback(agentClient.Signers), cleanup, nil
+}
+
 // buildSSHConfig 根据 Identity 模型构建 ssh.ClientConfig
 func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coordinator *handshakeCoordinator) (*ssh.ClientConfig, func(), error) {
 	var cleanup func()
@@ -773,46 +920,60 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 	// 根据 AuthType 处理不同的认证方式
 	switch cfg.AuthType {
 	case "auto":
+		var failClosed func(error)
+		if coordinator != nil {
+			failClosed = coordinator.FailClosed
+		}
 		var autoCleanup func()
-		authMethods, autoCleanup = BuildAutoAuthMethodsWithLogger(ctx, cfg.User, cfg.Address, prompter, c.interactionTimeout, func(s string) {
-			if s != "" {
-				cfg.Password = s
-				cfg.AuthType = "password"
-			}
-		}, func(keyPath, passphrase string) {
-			if passphrase != "" {
-				cfg.KeyPath = keyPath
-				cfg.Passphrase = passphrase
-				cfg.AuthType = "key"
-			}
-		}, c.getLogger())
+		authMethods, autoCleanup = BuildAutoAuthMethodsWithOptions(ctx, AutoAuthOptions{
+			LifecycleCtx:       c.lifecycleCtx,
+			NodeID:             cfg.NodeID,
+			User:               cfg.User,
+			Host:               cfg.Address,
+			VersionToken:       cfg.AuthUpdateToken,
+			Resolver:           c.secretResolver,
+			Prompter:           prompter,
+			HandshakeTimeout:   c.getHandshakeTimeout(),
+			InteractionTimeout: c.interactionTimeout,
+			FailClosed:         failClosed,
+			PasswordCallback: func(s string) {
+				if s != "" {
+					cfg.Password = s
+					cfg.AuthType = "password"
+				}
+			},
+			PassphraseCallback: func(keyPath, passphrase string) {
+				if passphrase != "" {
+					cfg.KeyPath = keyPath
+					cfg.Passphrase = passphrase
+					cfg.AuthType = "key"
+				}
+			},
+			Logger: c.getLogger(),
+		})
 		cleanup = autoCleanup
 
 	case "password":
-		if cfg.Password == "" {
-			return nil, nil, ErrPasswordRequired
-		}
-		authMethods = append(authMethods, ssh.Password(cfg.Password))
-
-	case "key":
-		authMethod, err := buildKeyAuthMethod(cfg)
+		method, err := c.resolvePasswordAuth(cfg)
 		if err != nil {
 			return nil, nil, err
 		}
-		authMethods = append(authMethods, authMethod)
+		authMethods = append(authMethods, method)
+
+	case "key":
+		method, err := c.resolveKeyAuth(cfg)
+		if err != nil {
+			return nil, nil, err
+		}
+		authMethods = append(authMethods, method)
 
 	case "agent":
-		socket := os.Getenv("SSH_AUTH_SOCK")
-		if socket == "" {
-			return nil, nil, ErrAgentNotAvailable
-		}
-		conn, err := dialSSHAgent(ctx, socket)
+		method, agentCleanup, err := c.resolveAgentAuth(ctx)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to connect to ssh-agent: %w", err)
+			return nil, nil, err
 		}
-		agentClient := agent.NewClient(conn)
-		authMethods = append(authMethods, ssh.PublicKeysCallback(agentClient.Signers))
-		cleanup = func() { debugCloseResource(c.getLogger(), conn, "ssh agent connection") }
+		authMethods = append(authMethods, method)
+		cleanup = agentCleanup
 
 	default:
 		return nil, nil, fmt.Errorf("unsupported auth type: %s", cfg.AuthType)

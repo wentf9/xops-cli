@@ -1,6 +1,9 @@
 package ssh
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // SudoMode 定义了 SSH 连接执行命令时的提权方式
 type SudoMode string
@@ -38,16 +41,32 @@ type ClientConfig struct {
 	PasswordPromptPattern string
 }
 
-// ConfigStore 定义底层如何获取配置以及如何回写探测到的新配置。
-type ConfigStore interface {
+// ConnectionProvider 提供指定节点的底层连接配置。
+type ConnectionProvider interface {
 	// GetConfig 获取指定 nodeID 的连接配置
 	GetConfig(nodeID string) (*ClientConfig, error)
+}
 
-	// UpdateAuth 在 "auto" 模式下探测到可用密码或私钥 passphrase 时，写回持久化存储
+// SecretResolver 解析指定节点认证或提权所需机密。
+type SecretResolver interface {
+	// ResolveSecret 根据机密请求解析并返回机密字节
+	ResolveSecret(ctx context.Context, req SecretRequest) ([]byte, error)
+}
+
+// CredentialRecorder 负责将探测或交互获得的新凭据写回持久化存储。
+type CredentialRecorder interface {
+	// UpdateAuth 在探测到可用密码或私钥 passphrase 时，写回持久化存储
 	UpdateAuth(ctx context.Context, nodeID, authUpdateToken, password, keyPath, passphrase string) error
 
 	// UpdateSudo 在探测到可用提权模式或接收到 su 密码时，写回持久化存储
 	UpdateSudo(ctx context.Context, nodeID, sudoUpdateToken string, mode SudoMode, suPwd string) error
+}
+
+// ConfigStore 聚合 ConnectionProvider 和 CredentialRecorder 接口。
+// Deprecated: 请优先使用拆分后的小接口 ConnectionProvider, SecretResolver, CredentialRecorder。
+type ConfigStore interface {
+	ConnectionProvider
+	CredentialRecorder
 }
 
 // SecretKind 标识需要交互输入的机密类型
@@ -60,13 +79,17 @@ const (
 	SecretKindSuPassword
 )
 
-// SecretRequest 描述向用户请求机密的上下文信息（严禁携带已有密码）
+// ErrSnapshotMismatch 表示连接快照与当前配置版本或目标不匹配
+var ErrSnapshotMismatch = errors.New("connection snapshot mismatch")
+
+// SecretRequest 描述向解析器或用户请求机密的上下文信息（严禁携带已有密码）
 type SecretRequest struct {
-	Kind    SecretKind
-	NodeID  string
-	User    string
-	Host    string
-	KeyPath string
+	Kind         SecretKind
+	NodeID       string
+	User         string
+	Host         string
+	KeyPath      string
+	VersionToken string
 }
 
 // HostKeyConfirmation 描述主机密钥指纹确认请求

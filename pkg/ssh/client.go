@@ -23,7 +23,7 @@ type Client struct {
 	cfgMu            sync.RWMutex
 	sudoMu           sync.Mutex
 	cfg              *ClientConfig
-	store            ConfigStore
+	recorder         CredentialRecorder
 	connectorPattern string         // Connector 全局级密码提示正则，当节点级为空时回落到此字段
 	promptRegex      *regexp.Regexp // 缓存预编译好的正则
 	logger           logger.DebugLogger
@@ -59,11 +59,11 @@ func validateInteractiveIO(streams InteractiveIO) (int, int, error) {
 	return fdIn, fdOut, nil
 }
 
-func newClient(raw *ssh.Client, rootConn net.Conn, cfg *ClientConfig, store ConfigStore, connectorPattern string) *Client {
-	return newClientWithLogger(raw, rootConn, cfg, store, connectorPattern, logger.NopLogger)
+func newClient(raw *ssh.Client, rootConn net.Conn, cfg *ClientConfig, recorder CredentialRecorder, connectorPattern string) *Client {
+	return newClientWithLogger(raw, rootConn, cfg, recorder, connectorPattern, logger.NopLogger)
 }
 
-func newClientWithLogger(raw *ssh.Client, rootConn net.Conn, cfg *ClientConfig, store ConfigStore, connectorPattern string, l logger.DebugLogger) *Client {
+func newClientWithLogger(raw *ssh.Client, rootConn net.Conn, cfg *ClientConfig, recorder CredentialRecorder, connectorPattern string, l logger.DebugLogger) *Client {
 	if l == nil {
 		l = logger.NopLogger
 	}
@@ -72,7 +72,7 @@ func newClientWithLogger(raw *ssh.Client, rootConn net.Conn, cfg *ClientConfig, 
 		sshClient:        raw,
 		rootConn:         rootConn,
 		cfg:              &clientConfig,
-		store:            store,
+		recorder:         recorder,
 		connectorPattern: connectorPattern,
 		logger:           l,
 	}
@@ -666,8 +666,8 @@ func (c *Client) updateSudoMode(ctx context.Context, mode SudoMode) error {
 	updateToken := c.cfg.SudoUpdateToken
 	suPwd := c.cfg.SuPwd
 	c.cfgMu.Unlock()
-	if c.store != nil && nodeID != "" && updateToken != "" {
-		if err := c.store.UpdateSudo(ctx, nodeID, updateToken, mode, suPwd); err != nil {
+	if c.recorder != nil && nodeID != "" && updateToken != "" {
+		if err := c.recorder.UpdateSudo(ctx, nodeID, updateToken, mode, suPwd); err != nil {
 			return fmt.Errorf("persist detected sudo mode for node %q failed: %w", nodeID, err)
 		}
 	}

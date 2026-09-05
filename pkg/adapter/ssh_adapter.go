@@ -9,10 +9,17 @@ import (
 	"github.com/wentf9/xops-cli/pkg/ssh"
 )
 
-// SSHAdapter 实现 ssh.ConfigStore 接口，作为业务模型与底层 SSH 的防腐层
+// SSHAdapter 实现 ssh.ConnectionProvider, ssh.SecretResolver, ssh.CredentialRecorder 接口，作为业务模型与底层 SSH 的防腐层
 type SSHAdapter struct {
 	cfgProvider config.ConfigProvider
 }
+
+var (
+	_ ssh.ConnectionProvider = (*SSHAdapter)(nil)
+	_ ssh.SecretResolver     = (*SSHAdapter)(nil)
+	_ ssh.CredentialRecorder = (*SSHAdapter)(nil)
+	_ ssh.ConfigStore        = (*SSHAdapter)(nil)
+)
 
 // NewSSHAdapter 创建 SSH 适配器
 func NewSSHAdapter(cfgProvider config.ConfigProvider) *SSHAdapter {
@@ -107,4 +114,67 @@ func (a *SSHAdapter) UpdateSudo(ctx context.Context, nodeID, sudoUpdateToken str
 		return fmt.Errorf("configuration provider does not support versioned sudo updates")
 	}
 	return provider.UpdateSudoAtVersionContext(ctx, nodeID, sudoUpdateToken, models.SudoMode(mode), suPwd)
+}
+
+// ResolveSecret 从当前配置模型解析认证或提权所需机密，并严格校验与连接快照的一致性
+func (a *SSHAdapter) ResolveSecret(ctx context.Context, req ssh.SecretRequest) ([]byte, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	if a.cfgProvider == nil {
+		return nil, fmt.Errorf("configuration provider is nil")
+	}
+	snapshot, err := a.cfgProvider.ResolveConnection(req.NodeID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve node %q failed: %w", req.NodeID, err)
+	}
+
+	// 1. 版本一致性校验：若请求携带了 VersionToken，必须与当前快照的版本严格匹配
+	if req.VersionToken != "" {
+		var currentVersion string
+		if snapshot.UpdateRef != nil {
+			switch req.Kind {
+			case ssh.SecretKindLoginPassword, ssh.SecretKindPrivateKeyPassphrase:
+				currentVersion = string(snapshot.UpdateRef.AuthVersion[:])
+			case ssh.SecretKindSuPassword:
+				currentVersion = string(snapshot.UpdateRef.SudoVersion[:])
+			}
+		}
+		if currentVersion != req.VersionToken {
+			return nil, fmt.Errorf("%w: version mismatch for node %q: expected %q, got %q",
+				ssh.ErrSnapshotMismatch, req.NodeID, req.VersionToken, currentVersion)
+		}
+	}
+
+	// 2. 目标主机与用户一致性校验：防止节点目标地址或用户名发生变动时将新机密用于旧目标
+	if req.Host != "" && snapshot.Host.Address != req.Host {
+		return nil, fmt.Errorf("%w: host address changed for node %q: expected %q, got %q",
+			ssh.ErrSnapshotMismatch, req.NodeID, req.Host, snapshot.Host.Address)
+	}
+	if req.User != "" && snapshot.Identity.User != req.User {
+		return nil, fmt.Errorf("%w: user changed for node %q: expected %q, got %q",
+			ssh.ErrSnapshotMismatch, req.NodeID, req.User, snapshot.Identity.User)
+	}
+
+	switch req.Kind {
+	case ssh.SecretKindLoginPassword:
+		if snapshot.Identity.Password == "" {
+			return nil, ssh.ErrInteractionRequired
+		}
+		return []byte(snapshot.Identity.Password), nil
+	case ssh.SecretKindPrivateKeyPassphrase:
+		if snapshot.Identity.Passphrase == "" {
+			return nil, ssh.ErrInteractionRequired
+		}
+		return []byte(snapshot.Identity.Passphrase), nil
+	case ssh.SecretKindSuPassword:
+		if snapshot.Node.SuPwd == "" {
+			return nil, ssh.ErrInteractionRequired
+		}
+		return []byte(snapshot.Node.SuPwd), nil
+	default:
+		return nil, fmt.Errorf("unsupported secret kind: %v", req.Kind)
+	}
 }

@@ -86,3 +86,34 @@ func WithDialer(dialer Dialer) Option {
 		c.baseDialer = dialer
 	}
 }
+
+// WithSecretResolver 配置机密解析器（传 nil 时回退到默认 fail-closed resolver）
+func WithSecretResolver(resolver SecretResolver) Option {
+	return func(c *Connector) {
+		if resolver != nil {
+			c.secretResolver = resolver
+		} else {
+			c.secretResolver = rejectSecretResolver{}
+		}
+	}
+}
+
+// WithCredentialRecorder 配置凭据写回记录器（传 nil 时回退到默认 nop recorder）
+func WithCredentialRecorder(recorder CredentialRecorder) Option {
+	return func(c *Connector) {
+		if recorder != nil {
+			c.credentialRecorder = recorder
+		} else {
+			c.credentialRecorder = nopCredentialRecorder{}
+		}
+	}
+}
+
+// WithConnectionProvider 配置连接配置提供者
+func WithConnectionProvider(provider ConnectionProvider) Option {
+	return func(c *Connector) {
+		if provider != nil {
+			c.provider = provider
+		}
+	}
+}
