@@ -42,6 +42,7 @@ type standaloneSecretResolver struct {
 	resolveCalls    int
 	passphraseCalls int
 	passwordCalls   int
+	suCalls         int
 	customErr       error
 	kindErrors      map[SecretKind]error
 }
@@ -60,6 +61,8 @@ func (r *standaloneSecretResolver) ResolveSecret(ctx context.Context, req Secret
 		r.passphraseCalls++
 	case SecretKindLoginPassword:
 		r.passwordCalls++
+	case SecretKindSuPassword:
+		r.suCalls++
 	}
 	if err, ok := r.kindErrors[req.Kind]; ok && err != nil {
 		return nil, err
@@ -82,20 +85,20 @@ type standaloneCredentialRecorder struct {
 	lastSudoPwd string
 }
 
-func (c *standaloneCredentialRecorder) UpdateAuth(ctx context.Context, nodeID, authUpdateToken, password, keyPath, passphrase string) error {
+func (c *standaloneCredentialRecorder) UpdateAuth(ctx context.Context, nodeID, authUpdateToken, password, keyPath, passphrase string) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.authCalls++
 	c.lastAuthPwd = password
-	return nil
+	return authUpdateToken, nil
 }
 
-func (c *standaloneCredentialRecorder) UpdateSudo(ctx context.Context, nodeID, sudoUpdateToken string, mode SudoMode, suPwd string) error {
+func (c *standaloneCredentialRecorder) UpdateSudo(ctx context.Context, nodeID, sudoUpdateToken string, mode SudoMode, suPwd string) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.sudoCalls++
 	c.lastSudoPwd = suPwd
-	return nil
+	return sudoUpdateToken, nil
 }
 
 // 编译期确认独立实现没有实现不需要的接口
@@ -287,17 +290,41 @@ func TestPortSplit_IndependentPorts_CollaborateSuccessfully(t *testing.T) {
 		t.Fatal("expected client, got nil")
 	}
 
-	// 验证 SecretResolver 确实被调用
+	// 验证阶段 2：建连时仅解析登录机密，提权机密不提前预读
 	resolver.mu.Lock()
-	calls := resolver.resolveCalls
+	passCalls := resolver.passwordCalls
+	suCalls := resolver.suCalls
 	resolver.mu.Unlock()
-	if calls < 2 {
-		t.Fatalf("expected at least 2 SecretResolver calls (login + su), got: %d", calls)
+
+	if passCalls != 1 {
+		t.Fatalf("expected 1 login password call on connect, got: %d", passCalls)
+	}
+	if suCalls != 0 {
+		t.Fatalf("expected 0 su password calls on connect, got: %d", suCalls)
 	}
 
-	// 验证 Client 内部持有了 suPwd
-	if client.cfg.SuPwd != "resolved-su-pwd" {
-		t.Fatalf("expected client SuPwd to be 'resolved-su-pwd', got %q", client.cfg.SuPwd)
+	// 登录成功后 Client 绝不保留 AuthMaterial 与 SuPwd
+	if client.Config().Password != "" {
+		t.Fatalf("expected client Password to be empty, got %q", client.Config().Password)
+	}
+	if client.Config().SuPwd != "" {
+		t.Fatalf("expected client SuPwd to be empty, got %q", client.Config().SuPwd)
+	}
+	if client.AuthMaterial() != nil {
+		t.Fatal("expected client AuthMaterial to be nil")
+	}
+
+	// 提权时按命令解析机密
+	priv, err := client.resolvePrivilegeMaterial(ctx, SecretKindSuPassword)
+	if err != nil {
+		t.Fatalf("resolvePrivilegeMaterial failed: %v", err)
+	}
+	if string(priv.Password) != "resolved-su-pwd" {
+		t.Fatalf("expected resolved su password 'resolved-su-pwd', got %q", string(priv.Password))
+	}
+	priv.Zero()
+	if len(priv.Password) != 0 {
+		t.Fatal("expected priv.Password to be nil after Zero")
 	}
 }
 

@@ -99,7 +99,7 @@ func sshRunHandler(ctx context.Context, req *mcp.CallToolRequest, input SshRunIn
 	errStr := ""
 	status := "success"
 	if execErr != nil {
-		errStr = execErr.Error()
+		errStr = FormatMCPError(execErr).Error()
 		status = "failed"
 	}
 

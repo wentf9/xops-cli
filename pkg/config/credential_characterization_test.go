@@ -233,7 +233,7 @@ func TestCharacterization_Repository_SharedIdentity_UpdateAuthCreatesPrivateCopy
 
 	// node-1 触发凭据写回
 	ctx := t.Context()
-	err = repo.UpdateAuthAtVersionContext(ctx, "node-1", authVersion, node1NewPassword, "", "")
+	_, err = repo.UpdateAuthAtVersionContext(ctx, "node-1", authVersion, node1NewPassword, "", "")
 	if err != nil {
 		t.Fatalf("UpdateAuthAtVersionContext failed: %v", err)
 	}

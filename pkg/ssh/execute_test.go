@@ -2,6 +2,7 @@ package ssh
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net"
 	"strings"
@@ -30,15 +31,21 @@ func TestGetSudoParams(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := &Client{
-				cfg: &ClientConfig{
-					SudoMode: tt.mode,
-					SuPwd:    tt.suPwd,
-					Password: tt.password,
-				},
-			}
+			c := newClient(nil, nil, &ClientConfig{
+				SudoMode: tt.mode,
+				SuPwd:    tt.suPwd,
+				Password: tt.password,
+			}, nil, "")
 
-			cmd, pwd := c.getSudoParams()
+			cmd, priv, err := c.resolveSudoParams(context.Background())
+			if err != nil {
+				t.Fatalf("resolveSudoParams failed: %v", err)
+			}
+			var pwd string
+			if priv != nil {
+				defer priv.Zero()
+				pwd = string(priv.Password)
+			}
 			if cmd != tt.expectedCmd {
 				t.Errorf("expected cmd %q, got %q", tt.expectedCmd, cmd)
 			}
@@ -89,21 +96,21 @@ func TestRunCommandWithIO_ErrorBranches(t *testing.T) {
 	ctx := t.Context()
 
 	// 1. None 模式报错
-	cNone := &Client{cfg: &ClientConfig{SudoMode: SudoModeNone}}
+	cNone := newClient(nil, nil, &ClientConfig{SudoMode: SudoModeNone}, nil, "")
 	err := cNone.RunCommandWithIO(ctx, "ls", true, nil, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "privilege escalation is not supported") {
 		t.Errorf("expected privilege escalation not supported error, got %v", err)
 	}
 
 	// 2. Sudo 模式且无密码报错
-	cSudoNoPwd := &Client{cfg: &ClientConfig{SudoMode: SudoModeSudo, Password: ""}}
+	cSudoNoPwd := newClient(nil, nil, &ClientConfig{SudoMode: SudoModeSudo, Password: ""}, nil, "")
 	err = cSudoNoPwd.RunCommandWithIO(ctx, "ls", true, nil, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "sudo password is required") {
 		t.Errorf("expected sudo password required error, got %v", err)
 	}
 
 	// 3. 未知模式报错
-	cUnknown := &Client{cfg: &ClientConfig{SudoMode: SudoMode("unknown_mode")}}
+	cUnknown := newClient(nil, nil, &ClientConfig{SudoMode: SudoMode("unknown_mode")}, nil, "")
 	err = cUnknown.RunCommandWithIO(ctx, "ls", true, nil, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "unknown sudo mode") {
 		t.Errorf("expected unknown sudo mode error, got %v", err)

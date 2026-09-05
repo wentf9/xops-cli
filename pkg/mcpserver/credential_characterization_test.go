@@ -46,6 +46,9 @@ func startTestSSHServerForMCP(t *testing.T) (string, cryptossh.PublicKey, func()
 
 	serverConfig := &cryptossh.ServerConfig{
 		PasswordCallback: func(conn cryptossh.ConnMetadata, password []byte) (*cryptossh.Permissions, error) {
+			if string(password) == "injected-node-flow-login-pwd-9999" {
+				return nil, nil
+			}
 			return nil, errors.New("unauthorized: password prompt required")
 		},
 	}
@@ -410,18 +413,24 @@ func TestCharacterization_MCP_FailClosedOnInteractionRequired_DoesNotLeakSecrets
 
 	allSecrets := []string{injectedLoginPassword, injectedPassphraseSecret, injectedSuSecret}
 
-	// 1. 测试 Pre-connect 阶段由于提权交互导致的 fail-closed
-	_, err = connectMCPNode(ctx, "node-su-prompt")
-	if err == nil {
-		t.Fatal("expected interaction required error for node-su-prompt, got nil")
+	// 1. 测试提权执行阶段由于提权交互导致的 fail-closed（阶段 2：提权机密按命令按需解析）
+	client, err := connectMCPNode(ctx, "node-su-prompt")
+	if err != nil {
+		t.Fatalf("connectMCPNode failed: %v", err)
 	}
-	if !errors.Is(err, ssh.ErrInteractionRequired) {
-		t.Fatalf("expected ssh.ErrInteractionRequired, got: %v", err)
+	_, runErrSu := client.RunWithSudo(ctx, "uname -a")
+	if runErrSu == nil {
+		t.Fatal("expected interaction required error for node-su-prompt with sudo, got nil")
 	}
-	if !strings.Contains(err.Error(), "prompts are disabled in MCP mode") {
-		t.Fatalf("expected prompt disabled error message, got: %v", err)
+	if !errors.Is(runErrSu, ssh.ErrInteractionRequired) {
+		t.Fatalf("expected ssh.ErrInteractionRequired, got: %v", runErrSu)
 	}
-	testleak.AssertNoSecretInError(t, err, allSecrets...)
+	formattedErr := FormatMCPError(runErrSu)
+	if !strings.Contains(formattedErr.Error(), "prompts are disabled in MCP mode") {
+		t.Fatalf("expected prompt disabled error message, got: %v", formattedErr)
+	}
+	testleak.AssertNoSecretInError(t, runErrSu, allSecrets...)
+	testleak.AssertNoSecretInError(t, formattedErr, allSecrets...)
 
 	// 2. 测试 Handshake 阶段由于 auto 密码交互提示导致的 fail-closed
 	_, errHandshake := connectMCPNode(ctx, "node-handshake-prompt")

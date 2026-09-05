@@ -109,22 +109,22 @@ func (rejectSecretResolver) ResolveSecret(ctx context.Context, req SecretRequest
 // nopCredentialRecorder 是默认的空操作凭据记录实现。
 type nopCredentialRecorder struct{}
 
-func (nopCredentialRecorder) UpdateAuth(ctx context.Context, nodeID, authUpdateToken, password, keyPath, passphrase string) error {
+func (nopCredentialRecorder) UpdateAuth(ctx context.Context, nodeID, authUpdateToken, password, keyPath, passphrase string) (string, error) {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
-			return err
+			return "", err
 		}
 	}
-	return nil
+	return authUpdateToken, nil
 }
 
-func (nopCredentialRecorder) UpdateSudo(ctx context.Context, nodeID, sudoUpdateToken string, mode SudoMode, suPwd string) error {
+func (nopCredentialRecorder) UpdateSudo(ctx context.Context, nodeID, sudoUpdateToken string, mode SudoMode, suPwd string) (string, error) {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
-			return err
+			return "", err
 		}
 	}
-	return nil
+	return sudoUpdateToken, nil
 }
 
 const (
@@ -235,6 +235,13 @@ func (c *Connector) getHandshakeTimeout() time.Duration {
 	return defaultSSHHandshakeTimeout
 }
 
+func (c *Connector) getInteractionTimeout() time.Duration {
+	if c.interactionTimeout > 0 {
+		return c.interactionTimeout
+	}
+	return DefaultInteractionTimeout
+}
+
 func (c *Connector) ensureOpen() error {
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
@@ -268,10 +275,15 @@ func (c *Connector) resolveConnectionPlan(ctx context.Context, nodeName string) 
 		if cfg == nil {
 			return nil, fmt.Errorf("config for node '%s' is nil", current)
 		}
+		nodeCfg := *cfg
+		if !nodeCfg.HasOriginalProxyJump {
+			nodeCfg.OriginalProxyJump = nodeCfg.ProxyJump
+			nodeCfg.HasOriginalProxyJump = true
+		}
 		positions[current] = len(plan)
-		plan = append(plan, connectionPlanNode{name: current, cfg: cfg})
+		plan = append(plan, connectionPlanNode{name: current, cfg: &nodeCfg})
 
-		jumps := splitProxyJumpChain(cfg.ProxyJump)
+		jumps := splitProxyJumpChain(nodeCfg.ProxyJump)
 		if len(jumps) > 1 {
 			for index := len(jumps) - 1; index >= 0; index-- {
 				jumpName := jumps[index]
@@ -291,6 +303,8 @@ func (c *Connector) resolveConnectionPlan(ctx context.Context, nodeName string) 
 					return nil, fmt.Errorf("config for proxy jump %q is nil", jumpName)
 				}
 				cloned := *jumpCfg
+				cloned.OriginalProxyJump = jumpCfg.ProxyJump
+				cloned.HasOriginalProxyJump = true
 				if index > 0 {
 					cloned.ProxyJump = jumps[index-1]
 				} else {
@@ -380,7 +394,19 @@ func (c *Connector) connectNode(ctx context.Context, planNode connectionPlanNode
 }
 
 func (c *Connector) wrapCachedClient(cfg *ClientConfig, cachedClient *PooledClient) *Client {
-	return newClientWithLogger(cachedClient.SSHClient, cachedClient.RootConn, cfg, c.credentialRecorder, c.PasswordPromptPattern, c.getLogger())
+	return newClientWithComponents(
+		cachedClient.SSHClient,
+		cachedClient.RootConn,
+		cfg,
+		c.provider,
+		c.secretResolver,
+		c.secretPrompter,
+		c.credentialRecorder,
+		c.PasswordPromptPattern,
+		c.getHandshakeTimeout(),
+		c.getInteractionTimeout(),
+		c.getLogger(),
+	)
 }
 
 func (c *Connector) keepAliveProbeTimeout() time.Duration {
@@ -411,73 +437,31 @@ func (c *Connector) resolveSecret(req SecretRequest) ([]byte, error) {
 	return c.secretResolver.ResolveSecret(ctx, req)
 }
 
-func (c *Connector) resolveAndPromptSuPassword(ctx context.Context, nodeName string, cfg *ClientConfig) error {
-	if cfg.SudoMode != SudoModeSu || cfg.SuPwd != "" {
-		return nil
-	}
-
-	// 优先尝试 SecretResolver 解析（使用受生命周期控制和握手超时的有界 context，并绑定快照版本）
-	resolved, err := c.resolveSecret(SecretRequest{
-		Kind:         SecretKindSuPassword,
-		NodeID:       nodeName,
-		User:         cfg.User,
-		Host:         cfg.Address,
-		VersionToken: cfg.SudoUpdateToken,
-	})
-	if err == nil && len(resolved) > 0 {
-		cfg.SuPwd = string(resolved)
-		return nil
-	} else if err != nil && !errors.Is(err, ErrInteractionRequired) {
-		return fmt.Errorf("resolve su password for node %q failed: %w", nodeName, err)
-	}
-
-	// 若仍未配置，交互式提示并写回 Provider（调用方负责持久化）
-	promptCtx, cancel := c.interactionContext(ctx)
-	suPwd, err := c.secretPrompter.PromptSecret(promptCtx, SecretRequest{
-		Kind:         SecretKindSuPassword,
-		NodeID:       nodeName,
-		User:         cfg.User,
-		Host:         cfg.Address,
-		VersionToken: cfg.SudoUpdateToken,
-	})
-	cancel()
-	if err != nil {
-		return fmt.Errorf("failed to read su password: %w", err)
-	}
-	cfg.SuPwd = suPwd
-	if cfg.SudoUpdateToken != "" {
-		if err := c.credentialRecorder.UpdateSudo(ctx, nodeName, cfg.SudoUpdateToken, cfg.SudoMode, suPwd); err != nil {
-			return fmt.Errorf("failed to update sudo credentials for node '%s': %w", nodeName, err)
-		}
-	}
-	return nil
-}
-
-func (c *Connector) recordAuthUpdate(ctx context.Context, nodeName string, cfg *ClientConfig, rootConn net.Conn) error {
+func (c *Connector) recordAuthUpdate(ctx context.Context, nodeName string, cfg *ClientConfig, rootConn net.Conn) (string, error) {
 	if (cfg.Password == "" && cfg.Passphrase == "") || cfg.AuthUpdateToken == "" {
-		return nil
+		return cfg.AuthUpdateToken, nil
 	}
-	if err := c.credentialRecorder.UpdateAuth(ctx, nodeName, cfg.AuthUpdateToken, cfg.Password, cfg.KeyPath, cfg.Passphrase); err != nil {
+	committedToken, err := c.credentialRecorder.UpdateAuth(ctx, nodeName, cfg.AuthUpdateToken, cfg.Password, cfg.KeyPath, cfg.Passphrase)
+	if err != nil {
 		if closeErr := rootConn.Close(); closeErr != nil {
-			return fmt.Errorf("failed to update authentication for node '%s': %w; close unpublished SSH client failed: %w", nodeName, err, closeErr)
+			return "", fmt.Errorf("failed to update authentication for node '%s': %w; close unpublished SSH client failed: %w", nodeName, err, closeErr)
 		}
-		return fmt.Errorf("failed to update authentication for node '%s': %w", nodeName, err)
+		return "", fmt.Errorf("failed to update authentication for node '%s': %w", nodeName, err)
 	}
-	return nil
+	return committedToken, nil
 }
 
 func (c *Connector) initializeConnection(ctx context.Context, planNode connectionPlanNode, dialer Dialer) (*Client, error) {
 	nodeName := planNode.name
 	cfg := planNode.cfg
 
-	if err := c.resolveAndPromptSuPassword(ctx, nodeName, cfg); err != nil {
-		return nil, err
-	}
-
 	coordinator := newHandshakeCoordinator(ctx, c.getHandshakeTimeout())
 	defer coordinator.Close()
 
-	sshConfig, cleanup, err := c.buildSSHConfig(ctx, cfg, coordinator)
+	var discoveredAuth bool
+	sshConfig, cleanup, err := c.buildSSHConfig(ctx, cfg, coordinator, func() {
+		discoveredAuth = true
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to build ssh config for '%s': %w", nodeName, err)
 	}
@@ -493,9 +477,27 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 	}
 
 	// 认证并连接成功后，检查我们是否通过 "auto" 下的终端交互获取到了新凭证（密码或密钥密码）。
-	if err := c.recordAuthUpdate(ctx, nodeName, cfg, rootConn); err != nil {
+	oldAuthToken := cfg.AuthUpdateToken
+	hasAuthUpdate := discoveredAuth && oldAuthToken != ""
+	var committedAuthToken string
+	if hasAuthUpdate {
+		var err error
+		committedAuthToken, err = c.recordAuthUpdate(ctx, nodeName, cfg, rootConn)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// [P1] 认证写回可能更新了 Repository 的认证版本（如 auto 认证交互记录了新密码/私钥密码），
+	// 必须从底层 provider 重新刷新 cfg 中的最新版本令牌并校验目标与版本推进兼容性。
+	if err := c.syncAuthTokensAfterConnection(nodeName, cfg, committedAuthToken, hasAuthUpdate, rootConn); err != nil {
 		return nil, err
 	}
+
+	// 连接与凭证记录完成后，立即抹除单次握手使用的明文机密，防止敏感材料残留在池化 Client 中
+	cfg.Password = ""
+	cfg.Passphrase = ""
+	cfg.SuPwd = ""
 
 	pooled := &PooledClient{SSHClient: rawClient, RootConn: rootConn}
 	if err := c.publishClient(nodeName, pooled); err != nil {
@@ -505,8 +507,20 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 		return nil, err
 	}
 	c.startKeepAliveFor(nodeName, pooled)
-	// 返回封装的 Client
-	return newClientWithLogger(rawClient, rootConn, cfg, c.credentialRecorder, c.PasswordPromptPattern, c.getLogger()), nil
+	// 返回封装的 Client，注入组件，且 Client 不持有 AuthMaterial
+	return newClientWithComponents(
+		rawClient,
+		rootConn,
+		cfg,
+		c.provider,
+		c.secretResolver,
+		c.secretPrompter,
+		c.credentialRecorder,
+		c.PasswordPromptPattern,
+		c.getHandshakeTimeout(),
+		c.getInteractionTimeout(),
+		c.getLogger(),
+	), nil
 }
 
 func (c *Connector) publishClient(nodeName string, client *PooledClient) error {
@@ -516,6 +530,53 @@ func (c *Connector) publishClient(nodeName string, client *PooledClient) error {
 		return ErrConnectorClosed
 	}
 	c.clients.Set(nodeName, client)
+	return nil
+}
+
+func (c *Connector) syncAuthTokensAfterConnection(nodeName string, cfg *ClientConfig, committedAuthToken string, hasAuthUpdate bool, rootConn net.Conn) error {
+	if c.provider == nil {
+		return nil
+	}
+	newCfg, err := c.provider.GetConfig(nodeName)
+	if err != nil {
+		if hasAuthUpdate {
+			if closeErr := rootConn.Close(); closeErr != nil {
+				return fmt.Errorf("reload config for node %q after auth update failed: %w; close unpublished SSH client failed: %w", nodeName, err, closeErr)
+			}
+			return fmt.Errorf("reload config for node %q after auth update failed: %w", nodeName, err)
+		}
+		return nil
+	}
+	if newCfg == nil {
+		return nil
+	}
+
+	// [P1] 校验完整连接目标（Address, Port, User, KeyPath, ProxyJump）是否仍然与当前已建立的连接一致
+	if err := validateTargetCompatibility(cfg.ToConnectionConfig(), newCfg); err != nil {
+		if closeErr := rootConn.Close(); closeErr != nil {
+			return fmt.Errorf("incompatible target update for node %q during connection setup: %w; close unpublished SSH client failed: %w", nodeName, err, closeErr)
+		}
+		return fmt.Errorf("incompatible target update for node %q during connection setup: %w", nodeName, err)
+	}
+
+	// [P1] 校验刷新版本与本次写回的对应关系：必须严格等于本次事务实际提交的版本，拒绝采纳后续无关更新，且允许幂等未变
+	if hasAuthUpdate {
+		if committedAuthToken != "" && newCfg.AuthUpdateToken != committedAuthToken {
+			if closeErr := rootConn.Close(); closeErr != nil {
+				return fmt.Errorf("%w: auth version mismatch after update for node %q (expected %q, got %q); close unpublished SSH client failed: %w",
+					ErrSnapshotMismatch, nodeName, committedAuthToken, newCfg.AuthUpdateToken, closeErr)
+			}
+			return fmt.Errorf("%w: auth version mismatch after update for node %q (expected %q, got %q)",
+				ErrSnapshotMismatch, nodeName, committedAuthToken, newCfg.AuthUpdateToken)
+		}
+		cfg.AuthUpdateToken = newCfg.AuthUpdateToken
+		if newCfg.HasOriginalProxyJump {
+			cfg.OriginalProxyJump = newCfg.OriginalProxyJump
+			cfg.HasOriginalProxyJump = true
+		} else if newCfg.OriginalProxyJump != "" {
+			cfg.OriginalProxyJump = newCfg.OriginalProxyJump
+		}
+	}
 	return nil
 }
 
@@ -703,6 +764,12 @@ func (c *Connector) handleHandshakeFailure(ctx context.Context, coordinator *han
 }
 
 func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, cfg *ClientConfig, dialer Dialer, sshConfig *ssh.ClientConfig, coordinator *handshakeCoordinator) (*ssh.Client, net.Conn, error) {
+	if dialer == nil {
+		dialer = c.baseDialer
+	}
+	if dialer == nil {
+		dialer = &net.Dialer{Timeout: c.getHandshakeTimeout()}
+	}
 	if cfg.Port == 0 {
 		cfg.Port = 22
 	}
@@ -857,8 +924,12 @@ func (c *Connector) resolvePasswordAuth(cfg *ClientConfig) (ssh.AuthMethod, erro
 			NodeID:       cfg.NodeID,
 			User:         cfg.User,
 			Host:         cfg.Address,
+			Port:         cfg.Port,
 			VersionToken: cfg.AuthUpdateToken,
 		})
+		if len(secret) > 0 {
+			defer zeroBytes(secret)
+		}
 		if err == nil && len(secret) > 0 {
 			cfg.Password = string(secret)
 		} else if err != nil && !errors.Is(err, ErrInteractionRequired) {
@@ -872,22 +943,26 @@ func (c *Connector) resolvePasswordAuth(cfg *ClientConfig) (ssh.AuthMethod, erro
 }
 
 func (c *Connector) resolveKeyAuth(cfg *ClientConfig) (ssh.AuthMethod, error) {
+	var secret []byte
 	if cfg.Passphrase == "" {
-		secret, err := c.resolveSecret(SecretRequest{
+		var err error
+		secret, err = c.resolveSecret(SecretRequest{
 			Kind:         SecretKindPrivateKeyPassphrase,
 			NodeID:       cfg.NodeID,
 			User:         cfg.User,
 			Host:         cfg.Address,
+			Port:         cfg.Port,
 			KeyPath:      cfg.KeyPath,
 			VersionToken: cfg.AuthUpdateToken,
 		})
-		if err == nil && len(secret) > 0 {
-			cfg.Passphrase = string(secret)
-		} else if err != nil && !errors.Is(err, ErrInteractionRequired) {
+		if len(secret) > 0 {
+			defer zeroBytes(secret)
+		}
+		if err != nil && !errors.Is(err, ErrInteractionRequired) {
 			return nil, fmt.Errorf("resolve private key passphrase failed: %w", err)
 		}
 	}
-	return buildKeyAuthMethod(cfg)
+	return buildKeyAuthMethod(cfg, secret)
 }
 
 func (c *Connector) resolveAgentAuth(ctx context.Context) (ssh.AuthMethod, func(), error) {
@@ -905,7 +980,7 @@ func (c *Connector) resolveAgentAuth(ctx context.Context) (ssh.AuthMethod, func(
 }
 
 // buildSSHConfig 根据 Identity 模型构建 ssh.ClientConfig
-func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coordinator *handshakeCoordinator) (*ssh.ClientConfig, func(), error) {
+func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coordinator *handshakeCoordinator, onAuthDiscovered func()) (*ssh.ClientConfig, func(), error) {
 	var cleanup func()
 	authMethods := []ssh.AuthMethod{}
 
@@ -930,6 +1005,7 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 			NodeID:             cfg.NodeID,
 			User:               cfg.User,
 			Host:               cfg.Address,
+			Port:               cfg.Port,
 			VersionToken:       cfg.AuthUpdateToken,
 			Resolver:           c.secretResolver,
 			Prompter:           prompter,
@@ -940,6 +1016,9 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 				if s != "" {
 					cfg.Password = s
 					cfg.AuthType = "password"
+					if onAuthDiscovered != nil {
+						onAuthDiscovered()
+					}
 				}
 			},
 			PassphraseCallback: func(keyPath, passphrase string) {
@@ -947,6 +1026,9 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 					cfg.KeyPath = keyPath
 					cfg.Passphrase = passphrase
 					cfg.AuthType = "key"
+					if onAuthDiscovered != nil {
+						onAuthDiscovered()
+					}
 				}
 			},
 			Logger: c.getLogger(),
@@ -1000,17 +1082,30 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 	}, cleanup, nil
 }
 
-func buildKeyAuthMethod(cfg *ClientConfig) (ssh.AuthMethod, error) {
-	if cfg.KeyPath == "" {
+func buildKeyAuthMethod(cfg *ClientConfig, extraPassphrase []byte) (ssh.AuthMethod, error) {
+	// [P2] 在函数最入口处接管 passphrase 并注册所有出口（包括失败路径）的清零清理
+	var passBytes []byte
+	if len(extraPassphrase) > 0 {
+		passBytes = extraPassphrase
+	} else if cfg != nil && cfg.Passphrase != "" {
+		passBytes = []byte(cfg.Passphrase)
+		cfg.Passphrase = ""
+	}
+	if len(passBytes) > 0 {
+		defer zeroBytes(passBytes)
+	}
+
+	if cfg == nil || cfg.KeyPath == "" {
 		return nil, ErrKeyPathRequired
 	}
 	keyBytes, err := os.ReadFile(expandHomeDir(cfg.KeyPath))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read key file: %w", err)
 	}
+
 	var signer ssh.Signer
-	if cfg.Passphrase != "" {
-		signer, err = ssh.ParsePrivateKeyWithPassphrase(keyBytes, []byte(cfg.Passphrase))
+	if len(passBytes) > 0 {
+		signer, err = ssh.ParsePrivateKeyWithPassphrase(keyBytes, passBytes)
 	} else {
 		signer, err = ssh.ParsePrivateKey(keyBytes)
 	}

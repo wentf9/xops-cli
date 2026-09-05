@@ -261,7 +261,7 @@ func TestRepositoryUpdateAuthAtVersionRejectsConcurrentCredentialEdit(t *testing
 		t.Fatalf("replace shared identity: %v", err)
 	}
 
-	err = repository.UpdateAuthAtVersionContext(t.Context(), "web-server", authVersion, "discovered-password", "", "")
+	_, err = repository.UpdateAuthAtVersionContext(t.Context(), "web-server", authVersion, "discovered-password", "", "")
 	if !errors.Is(err, ErrConfigConflict) {
 		t.Fatalf("UpdateAuthAtVersionContext() error = %v, want ErrConfigConflict", err)
 	}
@@ -299,7 +299,7 @@ func TestRepositoryUpdateAuthAtVersionCopiesSharedIdentity(t *testing.T) {
 		t.Fatal("ResolveConnection() returned no update reference for persisted node")
 	}
 	authVersion := string(connection.UpdateRef.AuthVersion[:])
-	if err := repository.UpdateAuthAtVersionContext(t.Context(), "web-server", authVersion, "discovered-password", "", ""); err != nil {
+	if _, err := repository.UpdateAuthAtVersionContext(t.Context(), "web-server", authVersion, "discovered-password", "", ""); err != nil {
 		t.Fatalf("UpdateAuthAtVersionContext() error = %v", err)
 	}
 	updated, _, updatedIdentity, err := repository.Resolve("web-server")
@@ -340,7 +340,7 @@ func TestRepositoryUpdateAuthAtVersionRejectsIdentityRebinding(t *testing.T) {
 	if err := repository.ReplaceNodeAtRefContext(t.Context(), repository.View().NodeRefs["web-server"], "web-server", node, host, identity); err != nil {
 		t.Fatalf("ReplaceNodeAtRefContext() error = %v", err)
 	}
-	if err := repository.UpdateAuthAtVersionContext(t.Context(), "web-server", authVersion, "discovered-password", "", ""); !errors.Is(err, ErrConfigConflict) {
+	if _, err := repository.UpdateAuthAtVersionContext(t.Context(), "web-server", authVersion, "discovered-password", "", ""); !errors.Is(err, ErrConfigConflict) {
 		t.Fatalf("UpdateAuthAtVersionContext() error = %v, want ErrConfigConflict", err)
 	}
 }
@@ -588,7 +588,7 @@ func TestRepositoryUpdateAuthContextHonorsCanceledLockWait(t *testing.T) {
 		t.Fatal("ResolveConnection() returned no update reference for persisted node")
 	}
 	authVersion := string(connection.UpdateRef.AuthVersion[:])
-	err = repository.UpdateAuthAtVersionContext(ctx, "n1", authVersion, "new-password", "", "")
+	_, err = repository.UpdateAuthAtVersionContext(ctx, "n1", authVersion, "new-password", "", "")
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("UpdateAuthContext() error = %v, want context.Canceled", err)
 	}

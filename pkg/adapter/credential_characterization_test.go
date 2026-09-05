@@ -102,7 +102,7 @@ func TestCharacterization_SSHAdapter_GetConfig_CarriesPlaintextAndTokens(t *test
 	// 3. 验证 UpdateAuth 回写新凭据
 	const updatedPassword = "adapter-new-password"
 	ctx := t.Context()
-	err = adapter.UpdateAuth(ctx, "node-target", clientCfg.AuthUpdateToken, updatedPassword, "", "")
+	_, err = adapter.UpdateAuth(ctx, "node-target", clientCfg.AuthUpdateToken, updatedPassword, "", "")
 	if err != nil {
 		t.Fatalf("adapter.UpdateAuth failed: %v", err)
 	}

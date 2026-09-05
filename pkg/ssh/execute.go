@@ -25,7 +25,7 @@ func (c *Client) RunWithSudo(ctx context.Context, command string, opts ...RunOpt
 	if err := c.maybeDetectSudoMode(ctx); err != nil {
 		return "", err
 	}
-	clientConfig, _ := c.configSnapshot()
+	connCfg := c.ConnectionConfig()
 
 	var wrappedCmd string
 	if config.LoginShell {
@@ -34,17 +34,27 @@ func (c *Client) RunWithSudo(ctx context.Context, command string, opts ...RunOpt
 		wrappedCmd = fmt.Sprintf("bash -c '%s'", strings.ReplaceAll(command, "'", "'\\''"))
 	}
 
-	switch clientConfig.SudoMode {
+	switch connCfg.SudoMode {
 	case SudoModeRoot:
 		return c.Run(ctx, command, opts...)
-	case SudoModeSudo:
-		return c.runWithSudo(ctx, wrappedCmd, clientConfig.Password, nil, config)
 	case SudoModeSudoer:
-		return c.runWithSudo(ctx, wrappedCmd, "", nil, config)
+		return c.runWithSudo(ctx, wrappedCmd, nil, nil, config)
+	case SudoModeSudo:
+		priv, err := c.resolvePrivilegeMaterial(ctx, SecretKindLoginPassword)
+		if err != nil {
+			return "", err
+		}
+		defer priv.Zero()
+		return c.runWithSudo(ctx, wrappedCmd, priv.Password, nil, config)
 	case SudoModeSu:
-		return c.runWithSu(ctx, command, clientConfig.SuPwd, config)
+		priv, err := c.resolvePrivilegeMaterial(ctx, SecretKindSuPassword)
+		if err != nil {
+			return "", err
+		}
+		defer priv.Zero()
+		return c.runWithSu(ctx, command, priv.Password, config)
 	default:
-		return "", fmt.Errorf("unknown sudo mode: %s, please check config to set sudo mode", clientConfig.SudoMode)
+		return "", fmt.Errorf("unknown sudo mode: %s, please check config to set sudo mode", connCfg.SudoMode)
 	}
 }
 
@@ -58,7 +68,7 @@ func (c *Client) RunScriptWithSudo(ctx context.Context, scriptContent string, op
 	if err := c.maybeDetectSudoMode(ctx); err != nil {
 		return "", err
 	}
-	clientConfig, _ := c.configSnapshot()
+	connCfg := c.ConnectionConfig()
 
 	bashArgs := "bash -s"
 	bashCmd := fmt.Sprintf("bash -c '%s'", strings.ReplaceAll(scriptContent, "'", "'\\''"))
@@ -67,17 +77,27 @@ func (c *Client) RunScriptWithSudo(ctx context.Context, scriptContent string, op
 		bashCmd = fmt.Sprintf("bash -l -c '%s'", strings.ReplaceAll(scriptContent, "'", "'\\''"))
 	}
 
-	switch clientConfig.SudoMode {
+	switch connCfg.SudoMode {
 	case SudoModeRoot:
 		return c.RunScript(ctx, scriptContent, opts...)
-	case SudoModeSudo:
-		return c.runWithSudo(ctx, bashArgs, clientConfig.Password, strings.NewReader(scriptContent), config)
 	case SudoModeSudoer:
-		return c.runWithSudo(ctx, bashArgs, "", strings.NewReader(scriptContent), config)
+		return c.runWithSudo(ctx, bashArgs, nil, strings.NewReader(scriptContent), config)
+	case SudoModeSudo:
+		priv, err := c.resolvePrivilegeMaterial(ctx, SecretKindLoginPassword)
+		if err != nil {
+			return "", err
+		}
+		defer priv.Zero()
+		return c.runWithSudo(ctx, bashArgs, priv.Password, strings.NewReader(scriptContent), config)
 	case SudoModeSu:
-		return c.runWithSu(ctx, bashCmd, clientConfig.SuPwd, config)
+		priv, err := c.resolvePrivilegeMaterial(ctx, SecretKindSuPassword)
+		if err != nil {
+			return "", err
+		}
+		defer priv.Zero()
+		return c.runWithSu(ctx, bashCmd, priv.Password, config)
 	default:
-		return "", fmt.Errorf("unsupported sudo mode: %s", clientConfig.SudoMode)
+		return "", fmt.Errorf("unsupported sudo mode: %s", connCfg.SudoMode)
 	}
 }
 
@@ -86,8 +106,8 @@ func (c *Client) RunInteractiveWithSudo(ctx context.Context, command string) (re
 	if err := c.maybeDetectSudoMode(ctx); err != nil {
 		return err
 	}
-	clientConfig, _ := c.configSnapshot()
-	if clientConfig.SudoMode == SudoModeRoot {
+	connCfg := c.ConnectionConfig()
+	if connCfg.SudoMode == SudoModeRoot {
 		return c.RunInteractive(ctx, command)
 	}
 
@@ -118,7 +138,17 @@ func (c *Client) RunInteractiveWithSudo(ctx context.Context, command string) (re
 		return fmt.Errorf("create interactive sudo stdin pipe failed: %w", err)
 	}
 
-	sudoCmd, password := c.getSudoParams()
+	sudoCmd, priv, err := c.resolveSudoParams(ctx)
+	if err != nil {
+		return err
+	}
+	if priv != nil {
+		defer priv.Zero()
+	}
+	var password string
+	if priv != nil {
+		password = string(priv.Password)
+	}
 	expect := c.setupInteractiveExpect(session, stdin, password)
 	session.Stderr = os.Stderr
 
@@ -185,9 +215,9 @@ func (c *Client) RunInteractiveWithSudo(ctx context.Context, command string) (re
 	return errors.Join(err, cancelErr, stdinErr)
 }
 
-func (c *Client) runWithSudo(ctx context.Context, command string, password string, extraStdin io.Reader, config *RunConfig) (output string, retErr error) {
-	clientConfig, _ := c.configSnapshot()
-	if password == "" && clientConfig.SudoMode == SudoModeSudo {
+func (c *Client) runWithSudo(ctx context.Context, command string, password []byte, extraStdin io.Reader, config *RunConfig) (output string, retErr error) {
+	connCfg := c.ConnectionConfig()
+	if len(password) == 0 && connCfg.SudoMode == SudoModeSudo {
 		return "", fmt.Errorf("sudo password is required but not provided")
 	}
 
@@ -197,11 +227,12 @@ func (c *Client) runWithSudo(ctx context.Context, command string, password strin
 	}
 	defer joinResourceCloseError(&retErr, session, "sudo session")
 
-	if password != "" {
+	if len(password) > 0 {
+		pwdStr := string(password) + "\n"
 		if extraStdin != nil {
-			session.Stdin = io.MultiReader(strings.NewReader(password+"\n"), extraStdin)
+			session.Stdin = io.MultiReader(strings.NewReader(pwdStr), extraStdin)
 		} else {
-			session.Stdin = strings.NewReader(password + "\n")
+			session.Stdin = strings.NewReader(pwdStr)
 		}
 	} else if extraStdin != nil {
 		session.Stdin = extraStdin
@@ -211,7 +242,7 @@ func (c *Client) runWithSudo(ctx context.Context, command string, password strin
 	return c.startWithTimeout(ctx, session, fullCmd, config)
 }
 
-func (c *Client) runWithSu(ctx context.Context, command string, password string, config *RunConfig) (output string, retErr error) {
+func (c *Client) runWithSu(ctx context.Context, command string, password []byte, config *RunConfig) (output string, retErr error) {
 	session, err := c.newSessionContext(ctx)
 	if err != nil {
 		return "", fmt.Errorf("failed to create new session: %w", err)
@@ -240,7 +271,7 @@ func (c *Client) runWithSu(ctx context.Context, command string, password string,
 	expect := NewExpectWithOptions(stdin, []ExpectRule{
 		{
 			Pattern: c.passwordPromptRegex(),
-			Respond: StaticRespond(password),
+			Respond: StaticRespond(string(password)),
 		},
 	}, WithExpectLogger(c.getLogger()))
 	expect.SetTarget(syncWriter)
@@ -301,13 +332,23 @@ func (c *Client) preCheckSudoMode(ctx context.Context) (isRoot bool, err error) 
 	// sudo/sudoer 模式：通过 sudo -S -p '' true 预检，可靠且无副作用
 	// su 模式不做预检：su -c 会跑 root login shell 初始化脚本，脚本错误会导致误报
 	if clientConfig.SudoMode == SudoModeSudo || clientConfig.SudoMode == SudoModeSudoer {
-		if _, err := c.runWithSudo(ctx, "true", clientConfig.Password, nil, nil); err != nil {
+		var pwdBytes []byte
+		if clientConfig.SudoMode == SudoModeSudo {
+			priv, err := c.resolvePrivilegeMaterial(ctx, SecretKindLoginPassword)
+			if err != nil {
+				return false, err
+			}
+			defer priv.Zero()
+			pwdBytes = priv.Password
+		}
+		if _, err := c.runWithSudo(ctx, "true", pwdBytes, nil, nil); err != nil {
 			return false, fmt.Errorf("sudo access denied: %w", err)
 		}
 	}
 	return false, nil
 }
 
+//nolint:gocyclo // ShellWithSudo orchestrates terminal raw mode, pty sizing, expect interaction and window resizing.
 func (c *Client) ShellWithSudo(ctx context.Context) (retErr error) {
 	isRoot, err := c.preCheckSudoMode(ctx)
 	if err != nil {
@@ -341,7 +382,17 @@ func (c *Client) ShellWithSudo(ctx context.Context) (retErr error) {
 		return fmt.Errorf("create sudo shell stdin pipe failed: %w", err)
 	}
 
-	sudoCmd, password := c.getSudoParams()
+	sudoCmd, priv, err := c.resolveSudoParams(ctx)
+	if err != nil {
+		return err
+	}
+	if priv != nil {
+		defer priv.Zero()
+	}
+	var password string
+	if priv != nil {
+		password = string(priv.Password)
+	}
 	expect := c.setupInteractiveExpect(session, stdin, password)
 	session.Stderr = os.Stderr
 
@@ -423,19 +474,27 @@ func ignoreShellExitError(err error) error {
 	return err
 }
 
-func (c *Client) getSudoParams() (string, string) {
-	clientConfig, _ := c.configSnapshot()
-	switch clientConfig.SudoMode {
+func (c *Client) resolveSudoParams(ctx context.Context) (string, *PrivilegeMaterial, error) {
+	connCfg := c.ConnectionConfig()
+	switch connCfg.SudoMode {
 	case SudoModeSudo:
-		return "sudo -i", clientConfig.Password
+		priv, err := c.resolvePrivilegeMaterial(ctx, SecretKindLoginPassword)
+		if err != nil {
+			return "", nil, err
+		}
+		return "sudo -i", priv, nil
 	case SudoModeSudoer:
-		return "sudo -i", ""
+		return "sudo -i", nil, nil
 	case SudoModeSu:
-		return "su -", clientConfig.SuPwd
+		priv, err := c.resolvePrivilegeMaterial(ctx, SecretKindSuPassword)
+		if err != nil {
+			return "", nil, err
+		}
+		return "su -", priv, nil
 	case SudoModeRoot, "":
-		return "", ""
+		return "", nil, nil
 	default:
-		return "", ""
+		return "", nil, nil
 	}
 }
 
@@ -540,16 +599,18 @@ func (c *Client) RunCommandWithIO(ctx context.Context, command string, sudo bool
 		}
 		return c.runRawCommandWithPayload(ctx, rawCmd, "", stdin, stdout, stderr)
 	case SudoModeSudo:
-		if clientConfig.Password == "" {
-			return fmt.Errorf("sudo password is required but not provided")
+		priv, err := c.resolvePrivilegeMaterial(ctx, SecretKindLoginPassword)
+		if err != nil {
+			return fmt.Errorf("sudo password is required but not provided: %w", err)
 		}
+		defer priv.Zero()
 		var rawCmd string
 		if command != "" {
 			rawCmd = fmt.Sprintf("sudo -S -p '' bash -c '%s'", strings.ReplaceAll(command, "'", "'\\''"))
 		} else {
 			rawCmd = "sudo -S -p '' bash"
 		}
-		return c.runRawCommandWithPayload(ctx, rawCmd, clientConfig.Password+"\n", stdin, stdout, stderr)
+		return c.runRawCommandWithPayload(ctx, rawCmd, string(priv.Password)+"\n", stdin, stdout, stderr)
 	case SudoModeSu:
 		return c.runWithSuIO(ctx, command, stdin, stdout, stderr)
 	case SudoModeNone:
@@ -691,11 +752,16 @@ func (c *Client) runWithSuIO(ctx context.Context, command string, stdin io.Reade
 		return fmt.Errorf("failed to open session stdin pipe: %w", err)
 	}
 
-	var payload string
-	clientConfig, _ := c.configSnapshot()
-	if clientConfig.SuPwd != "" {
-		payload = clientConfig.SuPwd + "\n"
+	priv, err := c.resolvePrivilegeMaterial(ctx, SecretKindSuPassword)
+	if err != nil {
+		return fmt.Errorf("resolve su password failed: %w", err)
 	}
+	if len(priv.Password) == 0 {
+		priv.Zero()
+		return fmt.Errorf("su password is required but empty")
+	}
+	defer priv.Zero()
+	payload := string(priv.Password) + "\n"
 
 	session.Stdout = stdout
 	session.Stderr = stderr

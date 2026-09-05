@@ -969,12 +969,13 @@ func (r *Repository) InitializeContext(ctx context.Context) error {
 // match the connection snapshot. A shared identity is copied for the current
 // node before discovery is persisted, so runtime discovery cannot mutate a
 // reusable template for unrelated nodes.
-func (r *Repository) UpdateAuthAtVersionContext(ctx context.Context, nodeID, authVersion, password, keyPath, passphrase string) error {
+func (r *Repository) UpdateAuthAtVersionContext(ctx context.Context, nodeID, authVersion, password, keyPath, passphrase string) (string, error) {
 	expected, err := versionFromString(authVersion)
 	if err != nil {
-		return fmt.Errorf("update authentication for node %q: %w", nodeID, err)
+		return "", fmt.Errorf("update authentication for node %q: %w", nodeID, err)
 	}
-	return r.commitContext(ctx, anyRevision, func(cfg *Configuration) error {
+	committedToken := authVersion
+	err = r.commitContext(ctx, anyRevision, func(cfg *Configuration) error {
 		current, err := nodeAuthVersion(cfg, nodeID)
 		if err != nil || current != expected {
 			return fmt.Errorf("authentication for node %q changed during connection: %w", nodeID, ErrConfigConflict)
@@ -1000,6 +1001,7 @@ func (r *Repository) UpdateAuthAtVersionContext(ctx context.Context, nodeID, aut
 			changed = true
 		}
 		if !changed {
+			committedToken = authVersion
 			return nil
 		}
 		if countNodeReferences(cfg, func(candidate models.Node) bool {
@@ -1009,18 +1011,28 @@ func (r *Repository) UpdateAuthAtVersionContext(ctx context.Context, nodeID, aut
 			cfg.Nodes.Set(nodeID, node)
 		}
 		cfg.Identities.Set(node.IdentityRef, identity)
+		newVer, err := nodeAuthVersion(cfg, nodeID)
+		if err != nil {
+			return err
+		}
+		committedToken = string(newVer[:])
 		return nil
 	})
+	if err != nil {
+		return "", err
+	}
+	return committedToken, nil
 }
 
 // UpdateSudoAtVersionContext updates only sudo fields that still match the
 // connection snapshot. It may merge with unrelated node or identity changes.
-func (r *Repository) UpdateSudoAtVersionContext(ctx context.Context, nodeID, sudoVersion string, mode models.SudoMode, suPwd string) error {
+func (r *Repository) UpdateSudoAtVersionContext(ctx context.Context, nodeID, sudoVersion string, mode models.SudoMode, suPwd string) (string, error) {
 	expected, err := versionFromString(sudoVersion)
 	if err != nil {
-		return fmt.Errorf("update sudo for node %q: %w", nodeID, err)
+		return "", fmt.Errorf("update sudo for node %q: %w", nodeID, err)
 	}
-	return r.commitContext(ctx, anyRevision, func(cfg *Configuration) error {
+	committedToken := sudoVersion
+	err = r.commitContext(ctx, anyRevision, func(cfg *Configuration) error {
 		current, err := nodeSudoVersion(cfg, nodeID)
 		if err != nil || current != expected {
 			return fmt.Errorf("sudo settings for node %q changed during connection: %w", nodeID, ErrConfigConflict)
@@ -1029,15 +1041,31 @@ func (r *Repository) UpdateSudoAtVersionContext(ctx context.Context, nodeID, sud
 		if !ok {
 			return fmt.Errorf("resolve node %q for sudo update: %w", nodeID, ErrNodeNotFound)
 		}
-		if mode != "" {
+		changed := false
+		if mode != "" && node.SudoMode != mode {
 			node.SudoMode = mode
+			changed = true
 		}
-		if suPwd != "" {
+		if suPwd != "" && node.SuPwd != suPwd {
 			node.SuPwd = suPwd
+			changed = true
+		}
+		if !changed {
+			committedToken = sudoVersion
+			return nil
 		}
 		cfg.Nodes.Set(nodeID, node)
+		newVer, err := nodeSudoVersion(cfg, nodeID)
+		if err != nil {
+			return err
+		}
+		committedToken = string(newVer[:])
 		return nil
 	})
+	if err != nil {
+		return "", err
+	}
+	return committedToken, nil
 }
 
 func (r *Repository) Resolve(nodeID string) (models.Node, models.Host, models.Identity, error) {

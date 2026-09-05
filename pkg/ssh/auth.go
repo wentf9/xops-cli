@@ -79,6 +79,7 @@ type autoSecretProvider struct {
 	nodeID             string
 	user               string
 	host               string
+	port               int
 	versionToken       string
 	resolver           SecretResolver
 	prompter           SecretPrompter
@@ -114,6 +115,7 @@ func (p *autoSecretProvider) resolveOrPrompt(req SecretRequest) (string, error) 
 	req.NodeID = p.nodeID
 	req.User = p.user
 	req.Host = p.host
+	req.Port = p.port
 	req.VersionToken = p.versionToken
 
 	// 1. 若注入了 resolver，优先使用 resolver 解析
@@ -130,6 +132,9 @@ func (p *autoSecretProvider) resolveOrPrompt(req SecretRequest) (string, error) 
 		defer cancel()
 
 		secret, err := p.resolver.ResolveSecret(resCtx, req)
+		if len(secret) > 0 {
+			defer zeroBytes(secret)
+		}
 		if err == nil && len(secret) > 0 {
 			return string(secret), nil
 		}
@@ -233,6 +238,9 @@ func (s *lazySigner) getDecryptedSigner() (ssh.Signer, error) {
 		return nil, fmt.Errorf("failed to read passphrase: %w", err)
 	}
 
+	passBytes := []byte(passphrase)
+	defer zeroBytes(passBytes)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// 双重检查，防止在等待用户输入期间其他协程已经解密成功
@@ -240,7 +248,7 @@ func (s *lazySigner) getDecryptedSigner() (ssh.Signer, error) {
 		return s.decryptedSigner, nil
 	}
 
-	decSigner, err := ssh.ParsePrivateKeyWithPassphrase(s.keyData, []byte(passphrase))
+	decSigner, err := ssh.ParsePrivateKeyWithPassphrase(s.keyData, passBytes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse private key with passphrase: %w", err)
 	}
@@ -255,7 +263,9 @@ func (s *lazySigner) getDecryptedSigner() (ssh.Signer, error) {
 		l.Debugf("save public key for %q failed: %v", s.keyPath, err)
 	}
 
-	s.passphraseCallback(s.keyPath, passphrase)
+	if s.passphraseCallback != nil {
+		s.passphraseCallback(s.keyPath, passphrase)
+	}
 	return decSigner, nil
 }
 
@@ -395,7 +405,9 @@ func tryResolveKey(keyPath string, secProvider *autoSecretProvider, passphraseCa
 			if err != nil {
 				return nil, fmt.Errorf("failed to read passphrase: %w", err)
 			}
-			s, err := ssh.ParsePrivateKeyWithPassphrase(keyDataCopy, []byte(passphrase))
+			passBytes := []byte(passphrase)
+			defer zeroBytes(passBytes)
+			s, err := ssh.ParsePrivateKeyWithPassphrase(keyDataCopy, passBytes)
 			if err != nil {
 				return nil, fmt.Errorf("failed to parse private key with passphrase: %w", err)
 			}
@@ -419,6 +431,7 @@ type AutoAuthOptions struct {
 	NodeID             string
 	User               string
 	Host               string
+	Port               int
 	VersionToken       string
 	Resolver           SecretResolver
 	Prompter           SecretPrompter
@@ -469,6 +482,7 @@ func BuildAutoAuthMethodsWithOptions(ctx context.Context, opts AutoAuthOptions) 
 		nodeID:             opts.NodeID,
 		user:               opts.User,
 		host:               opts.Host,
+		port:               opts.Port,
 		versionToken:       opts.VersionToken,
 		resolver:           opts.Resolver,
 		prompter:           prompter,

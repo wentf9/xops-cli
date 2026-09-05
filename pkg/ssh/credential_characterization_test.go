@@ -34,24 +34,27 @@ func (s *characterizationRecordingStore) GetConfig(nodeID string) (*ClientConfig
 	return &cp, nil
 }
 
-func (s *characterizationRecordingStore) UpdateAuth(ctx context.Context, nodeID, authUpdateToken, password, keyPath, passphrase string) error {
+func (s *characterizationRecordingStore) UpdateAuth(ctx context.Context, nodeID, authUpdateToken, password, keyPath, passphrase string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.updateCalls++
 	s.lastPassword = password
 	s.lastToken = authUpdateToken
 	if s.updateErr != nil {
-		return s.updateErr
+		return "", s.updateErr
 	}
+	committedToken := authUpdateToken
 	if s.cfg != nil {
 		s.cfg.Password = password
 		s.cfg.AuthType = "password"
+		committedToken = authUpdateToken + "-updated"
+		s.cfg.AuthUpdateToken = committedToken
 	}
-	return nil
+	return committedToken, nil
 }
 
-func (s *characterizationRecordingStore) UpdateSudo(ctx context.Context, nodeID, sudoUpdateToken string, mode SudoMode, suPwd string) error {
-	return nil
+func (s *characterizationRecordingStore) UpdateSudo(ctx context.Context, nodeID, sudoUpdateToken string, mode SudoMode, suPwd string) (string, error) {
+	return sudoUpdateToken, nil
 }
 
 type testAutoInteractionHandler struct {

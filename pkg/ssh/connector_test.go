@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -29,13 +30,13 @@ func (s *recordingConfigStore) GetConfig(string) (*ClientConfig, error) {
 	return nil, errors.New("unexpected GetConfig call")
 }
 
-func (s *recordingConfigStore) UpdateAuth(context.Context, string, string, string, string, string) error {
-	return errors.New("unexpected UpdateAuth call")
+func (s *recordingConfigStore) UpdateAuth(context.Context, string, string, string, string, string) (string, error) {
+	return "", errors.New("unexpected UpdateAuth call")
 }
 
-func (s *recordingConfigStore) UpdateSudo(context.Context, string, string, SudoMode, string) error {
+func (s *recordingConfigStore) UpdateSudo(_ context.Context, _ string, sudoUpdateToken string, _ SudoMode, _ string) (string, error) {
 	s.sudoUpdates.Add(1)
-	return nil
+	return sudoUpdateToken, nil
 }
 
 type coordinatedDeadConn struct {
@@ -283,12 +284,12 @@ func (m *mockConfigStore) GetConfig(nodeID string) (*ClientConfig, error) {
 	return m.cfg, nil
 }
 
-func (m *mockConfigStore) UpdateAuth(context.Context, string, string, string, string, string) error {
-	return nil
+func (m *mockConfigStore) UpdateAuth(_ context.Context, _ string, authUpdateToken, _, _, _ string) (string, error) {
+	return authUpdateToken, nil
 }
 
-func (m *mockConfigStore) UpdateSudo(context.Context, string, string, SudoMode, string) error {
-	return nil
+func (m *mockConfigStore) UpdateSudo(_ context.Context, _ string, sudoUpdateToken string, _ SudoMode, _ string) (string, error) {
+	return sudoUpdateToken, nil
 }
 
 func TestClientUpdateSudoModeKeepsReadOnlyDiscoverySessionLocal(t *testing.T) {
@@ -298,8 +299,8 @@ func TestClientUpdateSudoModeKeepsReadOnlyDiscoverySessionLocal(t *testing.T) {
 	if err := client.updateSudoMode(t.Context(), SudoModeSudo); err != nil {
 		t.Fatalf("updateSudoMode() error = %v", err)
 	}
-	if client.cfg.SudoMode != SudoModeSudo {
-		t.Fatalf("SudoMode = %q, want %q", client.cfg.SudoMode, SudoModeSudo)
+	if client.Config().SudoMode != SudoModeSudo {
+		t.Fatalf("SudoMode = %q, want %q", client.Config().SudoMode, SudoModeSudo)
 	}
 	if got := store.sudoUpdates.Load(); got != 0 {
 		t.Fatalf("UpdateSudo calls = %d, want 0 for session-local configuration", got)
@@ -368,11 +369,11 @@ func TestConnector_Connect_Cached(t *testing.T) {
 	}
 
 	// 验证在缓存命中时，配置是否正确附加
-	if client.cfg.Address != "10.0.0.1" {
-		t.Errorf("expected host address '10.0.0.1', got %q", client.cfg.Address)
+	if client.Config().Address != "10.0.0.1" {
+		t.Errorf("expected host address '10.0.0.1', got %q", client.Config().Address)
 	}
-	if client.cfg.User != "admin" {
-		t.Errorf("expected identity user 'admin', got %q", client.cfg.User)
+	if client.Config().User != "admin" {
+		t.Errorf("expected identity user 'admin', got %q", client.Config().User)
 	}
 }
 
@@ -493,8 +494,8 @@ func TestConnector_Connect_ResolvedProxyChainUsesRootClient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("connect resolved proxy chain failed: %v", err)
 	}
-	if client.cfg.NodeID != "target" || client.cfg.ProxyJump != "jump" {
-		t.Fatalf("expected target client after resolving proxy chain, got %+v", client.cfg)
+	if client.Config().NodeID != "target" || client.Config().ProxyJump != "jump" {
+		t.Fatalf("expected target client after resolving proxy chain, got %+v", client.Config())
 	}
 
 	// 测试客户端没有底层 Conn，清空后再关闭 Connector，避免对无效 mock 执行 Close。
@@ -584,6 +585,88 @@ func TestConnector_ResolveConnectionPlan_MultiHopProxyJump(t *testing.T) {
 	}
 }
 
+func TestConnector_ResolveConnectionPlan_MultiHopProxyJump_CompatibilityCheck(t *testing.T) {
+	firstJumpCfg := &ClientConfig{
+		NodeID:    "openssh:first",
+		Address:   "192.168.1.1",
+		Port:      22,
+		User:      "jumpuser",
+		ProxyJump: "ignored", // 配置库中首跳配置了 ignored
+	}
+	secondJumpCfg := &ClientConfig{
+		NodeID:    "openssh:second",
+		Address:   "192.168.1.2",
+		Port:      22,
+		User:      "jumpuser",
+		ProxyJump: "",
+	}
+	targetCfg := &ClientConfig{
+		NodeID:    "target",
+		Address:   "192.168.1.3",
+		Port:      22,
+		User:      "targetuser",
+		ProxyJump: "openssh:first, openssh:second",
+	}
+
+	store := &mockProxyJumpStore{cfgs: map[string]*ClientConfig{
+		"target":         targetCfg,
+		"openssh:first":  firstJumpCfg,
+		"openssh:second": secondJumpCfg,
+	}}
+	connector := NewConnector(store)
+	t.Cleanup(func() {
+		_ = connector.CloseAll()
+	})
+
+	plan, err := connector.resolveConnectionPlan(t.Context(), "target")
+	if err != nil {
+		t.Fatalf("resolveConnectionPlan failed: %v", err)
+	}
+
+	// 验证计划节点与校验
+	// plan[2] 是首跳 openssh:first，执行态 ProxyJump 被重写为 ""，但原始快照保留为 "ignored"
+	if plan[2].name != "openssh:first" {
+		t.Fatalf("plan[2] name = %q, want openssh:first", plan[2].name)
+	}
+	if plan[2].cfg.ProxyJump != "" {
+		t.Fatalf("plan[2] runtime ProxyJump = %q, want empty", plan[2].cfg.ProxyJump)
+	}
+	if plan[2].cfg.OriginalProxyJump != "ignored" {
+		t.Fatalf("plan[2] OriginalProxyJump = %q, want ignored", plan[2].cfg.OriginalProxyJump)
+	}
+
+	// [P2] 核心断言：配置完全未变时，首跳执行态快照与 store 中原始配置校验必须成功，绝不误报 "expected \"\", got \"ignored\""
+	freshFirstCfg, err := store.GetConfig("openssh:first")
+	if err != nil {
+		t.Fatalf("GetConfig openssh:first failed: %v", err)
+	}
+	if err := validateTargetCompatibility(plan[2].cfg.ToConnectionConfig(), freshFirstCfg); err != nil {
+		t.Fatalf("validateTargetCompatibility unexpectedly failed for first hop: %v", err)
+	}
+
+	// 同样验证第二跳
+	freshSecondCfg, err := store.GetConfig("openssh:second")
+	if err != nil {
+		t.Fatalf("GetConfig openssh:second failed: %v", err)
+	}
+	if err := validateTargetCompatibility(plan[1].cfg.ToConnectionConfig(), freshSecondCfg); err != nil {
+		t.Fatalf("validateTargetCompatibility unexpectedly failed for second hop: %v", err)
+	}
+
+	// 验证真正被外部篡改时会被拦截
+	tamperedFirstCfg := *freshFirstCfg
+	tamperedFirstCfg.ProxyJump = "tampered-jump"
+	tamperedFirstCfg.OriginalProxyJump = "tampered-jump"
+	tamperedFirstCfg.HasOriginalProxyJump = true
+	tamperedErr := validateTargetCompatibility(plan[2].cfg.ToConnectionConfig(), &tamperedFirstCfg)
+	if tamperedErr == nil {
+		t.Fatal("expected validateTargetCompatibility to fail when proxy jump tampered, got nil")
+	}
+	if !errors.Is(tamperedErr, ErrSnapshotMismatch) {
+		t.Fatalf("expected ErrSnapshotMismatch when proxy jump tampered, got: %v", tamperedErr)
+	}
+}
+
 func TestConnector_Connect_MultiHopProxyJump(t *testing.T) {
 	store := &mockProxyJumpStore{cfgs: map[string]*ClientConfig{
 		"target":         {NodeID: "target", ProxyJump: "openssh:first,openssh:second"},
@@ -599,8 +682,8 @@ func TestConnector_Connect_MultiHopProxyJump(t *testing.T) {
 	if err != nil {
 		t.Fatalf("connect multi-hop proxy chain failed: %v", err)
 	}
-	if client.cfg.NodeID != "target" {
-		t.Fatalf("got final node %q, want target", client.cfg.NodeID)
+	if client.Config().NodeID != "target" {
+		t.Fatalf("got final node %q, want target", client.Config().NodeID)
 	}
 	connector.clients.Clear()
 	if err := connector.CloseAll(); err != nil {
@@ -615,41 +698,53 @@ func (m *mockProxyJumpStore) GetConfig(nodeID string) (*ClientConfig, error) {
 	return nil, fmt.Errorf("node not found: %s", nodeID)
 }
 
-func (m *mockProxyJumpStore) UpdateAuth(context.Context, string, string, string, string, string) error {
-	return nil
+func (m *mockProxyJumpStore) UpdateAuth(_ context.Context, _ string, authUpdateToken, _, _, _ string) (string, error) {
+	return authUpdateToken, nil
 }
 
-func (m *mockProxyJumpStore) UpdateSudo(context.Context, string, string, SudoMode, string) error {
-	return nil
+func (m *mockProxyJumpStore) UpdateSudo(_ context.Context, _ string, sudoUpdateToken string, _ SudoMode, _ string) (string, error) {
+	return sudoUpdateToken, nil
 }
 
 func TestConnector_DefaultFailClosed_RejectsInteraction(t *testing.T) {
+	setTestHome(t)
+	t.Setenv("SSH_AUTH_SOCK", "")
+	host, port := startTestSSHPasswordServer(t, "expected-pwd")
 	store := &mockConfigStore{
 		cfg: &ClientConfig{
 			NodeID:   "su-node",
-			Address:  "127.0.0.1",
-			Port:     22,
-			User:     "user",
-			AuthType: "password",
-			Password: "pwd",
+			Address:  host,
+			Port:     port,
+			User:     "testuser",
+			AuthType: "auto",
 			SudoMode: SudoModeSu,
-			SuPwd:    "",
 		},
 	}
 	// 不传入任何 interaction handler，默认使用 rejectInteraction
 	connector := NewConnector(store)
+	connector.AcceptNewHostKey.Store(true)
 	t.Cleanup(func() {
 		if closeErr := connector.CloseAll(); closeErr != nil {
 			t.Errorf("close connector failed: %v", closeErr)
 		}
 	})
 
-	_, err := connector.initializeConnection(context.Background(), connectionPlanNode{name: "su-node", cfg: store.cfg}, nil)
+	_, err := connector.Connect(context.Background(), "su-node")
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
 	if !errors.Is(err, ErrInteractionRequired) {
 		t.Fatalf("expected ErrInteractionRequired, got: %v", err)
+	}
+
+	// 验证 Client 在默认无交互 handler 下提权同样失败关闭
+	client := newClientWithComponents(nil, nil, store.cfg, connector.provider, connector.secretResolver, connector.secretPrompter, connector.credentialRecorder, "", connector.getHandshakeTimeout(), connector.getInteractionTimeout(), nil)
+	_, privErr := client.resolvePrivilegeMaterial(context.Background(), SecretKindSuPassword)
+	if privErr == nil {
+		t.Fatal("expected error on privilege resolution without handler, got nil")
+	}
+	if !errors.Is(privErr, ErrInteractionRequired) {
+		t.Fatalf("expected ErrInteractionRequired on privilege resolution, got: %v", privErr)
 	}
 }
 
@@ -673,6 +768,9 @@ func TestConnector_DefaultFailClosed_RejectsHostKey(t *testing.T) {
 }
 
 func TestConnector_CloseAll_WakesWaitingInteraction(t *testing.T) {
+	setTestHome(t)
+	t.Setenv("SSH_AUTH_SOCK", "")
+	host, port := startTestSSHPasswordServer(t, "expected-pwd")
 	promptEntered := make(chan struct{})
 	blockingPrompter := &blockingTestPrompter{
 		promptFunc: func(ctx context.Context, req SecretRequest) (string, error) {
@@ -685,17 +783,16 @@ func TestConnector_CloseAll_WakesWaitingInteraction(t *testing.T) {
 	store := &mockConfigStore{
 		cfg: &ClientConfig{
 			NodeID:   "su-node",
-			Address:  "127.0.0.1",
-			Port:     22,
-			User:     "user",
-			AuthType: "password",
-			Password: "pwd",
+			Address:  host,
+			Port:     port,
+			User:     "testuser",
+			AuthType: "auto",
 			SudoMode: SudoModeSu,
-			SuPwd:    "",
 		},
 	}
 
 	connector := NewConnector(store, WithSecretPrompter(blockingPrompter))
+	connector.AcceptNewHostKey.Store(true)
 
 	connectErr := make(chan error, 1)
 	go func() {
@@ -734,6 +831,7 @@ func (p *blockingTestPrompter) PromptSecret(ctx context.Context, req SecretReque
 	return "", nil
 }
 
+//nolint:gocyclo // Test helper for startTestSSHPasswordServer
 func startTestSSHPasswordServer(t *testing.T, expectedPassword string) (string, int) {
 	t.Helper()
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -780,7 +878,7 @@ func startTestSSHPasswordServer(t *testing.T, expectedPassword string) (string, 
 		}()
 		sConn, chans, reqs, srvErr := ssh.NewServerConn(conn, serverConfig)
 		if srvErr != nil {
-			if !errors.Is(srvErr, net.ErrClosed) {
+			if !errors.Is(srvErr, net.ErrClosed) && !errors.Is(srvErr, io.EOF) && !strings.Contains(srvErr.Error(), "no auth passed yet") && !strings.Contains(srvErr.Error(), "use of closed network connection") {
 				serverErrCh <- fmt.Errorf("new server conn failed: %w", srvErr)
 			}
 			return

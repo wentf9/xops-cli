@@ -213,8 +213,8 @@ func TestProxyJump_Integration(t *testing.T) {
 		t.Fatalf("Connect failed: %v", err)
 	}
 
-	if client.cfg.NodeID != "target" {
-		t.Errorf("expected target client, got %s", client.cfg.NodeID)
+	if client.Config().NodeID != "target" {
+		t.Errorf("expected target client, got %s", client.Config().NodeID)
 	}
 }
 
