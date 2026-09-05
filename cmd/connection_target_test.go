@@ -485,3 +485,389 @@ func TestCommands_ExistingNode_ProxyJumpChainUpdate(t *testing.T) {
 		}
 	})
 }
+
+func setupMultiPortRepository(t *testing.T) *config.Repository {
+	t.Helper()
+	cfg, err := config.NewProvider(nil)
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+	snapshot := cfg.Snapshot()
+	snapshot.Hosts.Set("10.0.0.1:22", models.Host{Address: "10.0.0.1", Port: 22})
+	snapshot.Hosts.Set("10.0.0.1:2222", models.Host{Address: "10.0.0.1", Port: 2222})
+	snapshot.Identities.Set("root@10.0.0.1", models.Identity{User: "root", AuthType: "auto"})
+	snapshot.Identities.Set("root@10.0.0.1:2222", models.Identity{User: "root", AuthType: "auto"})
+	snapshot.Nodes.Set("root@10.0.0.1:22", models.Node{
+		HostRef:     "10.0.0.1:22",
+		IdentityRef: "root@10.0.0.1",
+	})
+	snapshot.Nodes.Set("root@10.0.0.1:2222", models.Node{
+		HostRef:     "10.0.0.1:2222",
+		IdentityRef: "root@10.0.0.1:2222",
+	})
+
+	store := &memoryStore{cfg: snapshot}
+	repo, err := config.NewRepositoryWithoutOpenSSH(snapshot, store)
+	if err != nil {
+		t.Fatalf("failed to create repo: %v", err)
+	}
+	return repo
+}
+
+func TestCommands_Consistency_MultiPortDisambiguation(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("ssh_explicit_port_2222_resolves_existing_node", func(t *testing.T) {
+		repo := setupMultiPortRepository(t)
+		sshOpt := NewSshOptions()
+		sshOpt.args = []string{"root@10.0.0.1:2222"}
+		if err := sshOpt.Validate(); err != nil {
+			t.Fatalf("validate failed: %v", err)
+		}
+		nodeID, created, err := sshOpt.resolveNode(ctx, repo)
+		if err != nil {
+			t.Fatalf("resolveNode failed: %v", err)
+		}
+		if created || nodeID != "root@10.0.0.1:2222" {
+			t.Errorf("got nodeID=%q, created=%v, want root@10.0.0.1:2222, false", nodeID, created)
+		}
+	})
+
+	t.Run("sftp_explicit_port_2222_resolves_existing_node", func(t *testing.T) {
+		repo := setupMultiPortRepository(t)
+		sftpOpt := NewSftpOptions()
+		sftpOpt.args = []string{"root@10.0.0.1:2222"}
+		if err := sftpOpt.Validate(); err != nil {
+			t.Fatalf("validate failed: %v", err)
+		}
+		nodeID, created, err := sftpOpt.resolveNode(ctx, repo)
+		if err != nil {
+			t.Fatalf("resolveNode failed: %v", err)
+		}
+		if created || nodeID != "root@10.0.0.1:2222" {
+			t.Errorf("got nodeID=%q, created=%v, want root@10.0.0.1:2222, false", nodeID, created)
+		}
+	})
+
+	t.Run("scp_explicit_port_2222_resolves_existing_node", func(t *testing.T) {
+		repo := setupMultiPortRepository(t)
+		scpOpt := NewScpOptions()
+		nodeID, created, err := scpOpt.getOrCreateNodeForPath(ctx, repo, PathInfo{Host: "10.0.0.1", User: "root", Port: 2222}, "")
+		if err != nil {
+			t.Fatalf("getOrCreateNodeForPath failed: %v", err)
+		}
+		if created || nodeID != "root@10.0.0.1:2222" {
+			t.Errorf("got nodeID=%q, created=%v, want root@10.0.0.1:2222, false", nodeID, created)
+		}
+	})
+
+	t.Run("exec_explicit_port_2222_resolves_existing_node", func(t *testing.T) {
+		repo := setupMultiPortRepository(t)
+		execOpt := NewExecOptions()
+		execOpt.Host = "root@10.0.0.1:2222"
+		tasks, hostErrs, err := execOpt.buildTasksFromHosts(ctx, repo)
+		if err != nil || len(hostErrs) > 0 {
+			t.Fatalf("buildTasksFromHosts failed: err=%v, hostErrs=%v", err, hostErrs)
+		}
+		if len(tasks) != 1 {
+			t.Fatalf("expected 1 task, got %d", len(tasks))
+		}
+		if tasks[0].nodeID != "root@10.0.0.1:2222" {
+			t.Errorf("got task nodeID=%q, want root@10.0.0.1:2222", tasks[0].nodeID)
+		}
+	})
+}
+
+func TestCommands_Consistency_SavedAliasWithPortProxyJump(t *testing.T) {
+	ctx := context.Background()
+
+	setupBastionRepo := func(t *testing.T) *config.Repository {
+		t.Helper()
+		cfg, err := config.NewProvider(nil)
+		if err != nil {
+			t.Fatalf("failed to create provider: %v", err)
+		}
+		snapshot := cfg.Snapshot()
+		snapshot.Hosts.Set("10.0.0.5:22", models.Host{Address: "10.0.0.5", Port: 22, Alias: []string{"bastion"}})
+		snapshot.Identities.Set("root@10.0.0.5", models.Identity{User: "root", AuthType: "auto"})
+		snapshot.Nodes.Set("root@10.0.0.5:22", models.Node{
+			HostRef:     "10.0.0.5:22",
+			IdentityRef: "root@10.0.0.5",
+			Alias:       []string{"bastion"},
+		})
+		store := &memoryStore{cfg: snapshot}
+		repo, rErr := config.NewRepositoryWithoutOpenSSH(snapshot, store)
+		if rErr != nil {
+			t.Fatalf("failed to create repo: %v", rErr)
+		}
+		return repo
+	}
+
+	t.Run("ssh_jump_bastion_port_resolves_to_saved_node", func(t *testing.T) {
+		repo := setupBastionRepo(t)
+		sshOpt := NewSshOptions()
+		sshOpt.JumpHost = "bastion:22"
+		sshOpt.args = []string{"test@10.238.221.181"}
+		if err := sshOpt.Validate(); err != nil {
+			t.Fatalf("validate failed: %v", err)
+		}
+		nodeID, _, err := sshOpt.resolveNode(ctx, repo)
+		if err != nil {
+			t.Fatalf("resolveNode failed: %v", err)
+		}
+		snap := repo.Snapshot()
+		node, ok := snap.Nodes.Get(nodeID)
+		if !ok {
+			t.Fatalf("node %s not found", nodeID)
+		}
+		if node.ProxyJump != "root@10.0.0.5:22" {
+			t.Errorf("got ProxyJump=%q, want root@10.0.0.5:22", node.ProxyJump)
+		}
+	})
+
+	t.Run("exec_jump_bastion_port_resolves_to_saved_node", func(t *testing.T) {
+		repo := setupBastionRepo(t)
+		execOpt := NewExecOptions()
+		execOpt.JumpHost = "bastion:22"
+		execOpt.Host = "test@10.238.221.181"
+		tasks, hostErrs, err := execOpt.buildTasksFromHosts(ctx, repo)
+		if err != nil || len(hostErrs) > 0 {
+			t.Fatalf("buildTasksFromHosts failed: err=%v, hostErrs=%v", err, hostErrs)
+		}
+		if len(tasks) != 1 {
+			t.Fatalf("expected 1 task, got %d", len(tasks))
+		}
+		snap := repo.Snapshot()
+		node, ok := snap.Nodes.Get(tasks[0].nodeID)
+		if !ok {
+			t.Fatalf("node %s not found", tasks[0].nodeID)
+		}
+		if node.ProxyJump != "root@10.0.0.5:22" {
+			t.Errorf("got ProxyJump=%q, want root@10.0.0.5:22", node.ProxyJump)
+		}
+	})
+}
+
+func setupNonDefaultPortWithProxyJumpRepo(t *testing.T) *config.Repository {
+	t.Helper()
+	cfg, err := config.NewProvider(nil)
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+	snapshot := cfg.Snapshot()
+	snapshot.Hosts.Set("10.0.0.5:2222", models.Host{Address: "10.0.0.5", Port: 2222})
+	snapshot.Identities.Set("root@10.0.0.5:2222", models.Identity{User: "root", AuthType: "auto"})
+	snapshot.Nodes.Set("root@10.0.0.5:2222", models.Node{
+		HostRef:     "10.0.0.5:2222",
+		IdentityRef: "root@10.0.0.5:2222",
+		ProxyJump:   "upstream",
+		Alias:       []string{"bastion"},
+	})
+	store := &memoryStore{cfg: snapshot}
+	repo, rErr := config.NewRepositoryWithoutOpenSSH(snapshot, store)
+	if rErr != nil {
+		t.Fatalf("failed to create repo: %v", rErr)
+	}
+	return repo
+}
+
+func TestCommands_SSH_ChangeUserPreservesPortAndProxyJump(t *testing.T) {
+	ctx := context.Background()
+	repo := setupNonDefaultPortWithProxyJumpRepo(t)
+	sshOpt := NewSshOptions()
+	sshOpt.args = []string{"test@10.0.0.5"}
+	if err := sshOpt.Validate(); err != nil {
+		t.Fatalf("validate failed: %v", err)
+	}
+	nodeID, created, err := sshOpt.resolveNode(ctx, repo)
+	if err != nil {
+		t.Fatalf("resolveNode failed: %v", err)
+	}
+	if !created || nodeID != "test@10.0.0.5:2222" {
+		t.Errorf("got nodeID=%q, created=%v, want test@10.0.0.5:2222, true", nodeID, created)
+	}
+	snap := repo.Snapshot()
+	node, ok := snap.Nodes.Get(nodeID)
+	if !ok {
+		t.Fatalf("node %s not found", nodeID)
+	}
+	if node.ProxyJump != "upstream" {
+		t.Errorf("got ProxyJump=%q, want upstream", node.ProxyJump)
+	}
+}
+
+func TestCommands_SFTP_ChangeUserPreservesPortAndProxyJump(t *testing.T) {
+	ctx := context.Background()
+	repo := setupNonDefaultPortWithProxyJumpRepo(t)
+	sftpOpt := NewSftpOptions()
+	sftpOpt.args = []string{"test@10.0.0.5"}
+	if err := sftpOpt.Validate(); err != nil {
+		t.Fatalf("validate failed: %v", err)
+	}
+	nodeID, created, err := sftpOpt.resolveNode(ctx, repo)
+	if err != nil {
+		t.Fatalf("resolveNode failed: %v", err)
+	}
+	if !created || nodeID != "test@10.0.0.5:2222" {
+		t.Errorf("got nodeID=%q, created=%v, want test@10.0.0.5:2222, true", nodeID, created)
+	}
+	snap := repo.Snapshot()
+	node, ok := snap.Nodes.Get(nodeID)
+	if !ok {
+		t.Fatalf("node %s not found", nodeID)
+	}
+	if node.ProxyJump != "upstream" {
+		t.Errorf("got ProxyJump=%q, want upstream", node.ProxyJump)
+	}
+}
+
+func TestCommands_SCP_ChangeUserPreservesPortAndProxyJump(t *testing.T) {
+	ctx := context.Background()
+	repo := setupNonDefaultPortWithProxyJumpRepo(t)
+	scpOpt := NewScpOptions()
+	nodeID, created, err := scpOpt.getOrCreateNodeForPath(ctx, repo, PathInfo{Host: "10.0.0.5", User: "test"}, "")
+	if err != nil {
+		t.Fatalf("getOrCreateNodeForPath failed: %v", err)
+	}
+	if !created || nodeID != "test@10.0.0.5:2222" {
+		t.Errorf("got nodeID=%q, created=%v, want test@10.0.0.5:2222, true", nodeID, created)
+	}
+	snap := repo.Snapshot()
+	node, ok := snap.Nodes.Get(nodeID)
+	if !ok {
+		t.Fatalf("node %s not found", nodeID)
+	}
+	if node.ProxyJump != "upstream" {
+		t.Errorf("got ProxyJump=%q, want upstream", node.ProxyJump)
+	}
+}
+
+func TestCommands_Exec_ChangeUserPreservesPortAndProxyJump(t *testing.T) {
+	ctx := context.Background()
+	repo := setupNonDefaultPortWithProxyJumpRepo(t)
+	execOpt := NewExecOptions()
+	execOpt.Host = "test@10.0.0.5"
+	tasks, hostErrs, err := execOpt.buildTasksFromHosts(ctx, repo)
+	if err != nil || len(hostErrs) > 0 {
+		t.Fatalf("buildTasksFromHosts failed: err=%v, hostErrs=%v", err, hostErrs)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("expected 1 task, got %d", len(tasks))
+	}
+	if tasks[0].nodeID != "test@10.0.0.5:2222" {
+		t.Errorf("got task nodeID=%q, want test@10.0.0.5:2222", tasks[0].nodeID)
+	}
+	snap := repo.Snapshot()
+	node, ok := snap.Nodes.Get(tasks[0].nodeID)
+	if !ok {
+		t.Fatalf("node %s not found", tasks[0].nodeID)
+	}
+	if node.ProxyJump != "upstream" {
+		t.Errorf("got ProxyJump=%q, want upstream", node.ProxyJump)
+	}
+}
+
+func TestCommands_JumpAliasUserOverridePreservesPort(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("ssh_jump_alias_override_user_preserves_port", func(t *testing.T) {
+		repo := setupNonDefaultPortWithProxyJumpRepo(t)
+		sshOpt := NewSshOptions()
+		sshOpt.JumpHost = "another@bastion"
+		sshOpt.args = []string{"test@10.238.221.181"}
+		if err := sshOpt.Validate(); err != nil {
+			t.Fatalf("validate failed: %v", err)
+		}
+		nodeID, _, err := sshOpt.resolveNode(ctx, repo)
+		if err != nil {
+			t.Fatalf("resolveNode failed: %v", err)
+		}
+		snap := repo.Snapshot()
+		node, ok := snap.Nodes.Get(nodeID)
+		if !ok {
+			t.Fatalf("node %s not found", nodeID)
+		}
+		expectedJump := config.OpenSSHNodePrefix + "another@10.0.0.5:2222"
+		if node.ProxyJump != expectedJump {
+			t.Errorf("got ProxyJump=%q, want %q", node.ProxyJump, expectedJump)
+		}
+	})
+
+	t.Run("exec_jump_alias_override_user_preserves_port", func(t *testing.T) {
+		repo := setupNonDefaultPortWithProxyJumpRepo(t)
+		execOpt := NewExecOptions()
+		execOpt.JumpHost = "another@bastion"
+		execOpt.Host = "test@10.238.221.181"
+		tasks, hostErrs, err := execOpt.buildTasksFromHosts(ctx, repo)
+		if err != nil || len(hostErrs) > 0 {
+			t.Fatalf("buildTasksFromHosts failed: err=%v, hostErrs=%v", err, hostErrs)
+		}
+		if len(tasks) != 1 {
+			t.Fatalf("expected 1 task, got %d", len(tasks))
+		}
+		snap := repo.Snapshot()
+		node, ok := snap.Nodes.Get(tasks[0].nodeID)
+		if !ok {
+			t.Fatalf("node %s not found", tasks[0].nodeID)
+		}
+		expectedJump := config.OpenSSHNodePrefix + "another@10.0.0.5:2222"
+		if node.ProxyJump != expectedJump {
+			t.Errorf("got ProxyJump=%q, want %q", node.ProxyJump, expectedJump)
+		}
+	})
+}
+
+func TestCommands_SSH_OpenSSHJumpNotOverriddenByLocalAlias(t *testing.T) {
+	ctx := context.Background()
+	sshConfig := `
+Host remote
+    HostName 10.0.0.10
+    ProxyJump bastion
+
+Host bastion
+    HostName 10.0.0.20
+    Port 22
+`
+	parser, pErr := config.NewOpenSSHParserFromReader(strings.NewReader(sshConfig))
+	if pErr != nil {
+		t.Fatalf("failed to create openssh parser: %v", pErr)
+	}
+
+	cfg, err := config.NewProvider(nil)
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+	snapshot := cfg.Snapshot()
+	snapshot.Hosts.Set("10.0.0.99:22", models.Host{Address: "10.0.0.99", Port: 22})
+	snapshot.Identities.Set("root@10.0.0.99", models.Identity{User: "root", AuthType: "auto"})
+	snapshot.Nodes.Set("root@10.0.0.99:22", models.Node{
+		HostRef:     "10.0.0.99:22",
+		IdentityRef: "root@10.0.0.99",
+		Alias:       []string{"bastion"},
+	})
+
+	store := &memoryStore{cfg: snapshot}
+	repo, rErr := config.NewRepositoryWithOpenSSHParser(snapshot, store, parser)
+	if rErr != nil {
+		t.Fatalf("failed to create repo: %v", rErr)
+	}
+
+	sshOpt := NewSshOptions()
+	sshOpt.args = []string{"test@remote"}
+	if err := sshOpt.Validate(); err != nil {
+		t.Fatalf("validate failed: %v", err)
+	}
+	nodeID, _, err := sshOpt.resolveNode(ctx, repo)
+	if err != nil {
+		t.Fatalf("resolveNode failed: %v", err)
+	}
+	snap := repo.Snapshot()
+	node, ok := snap.Nodes.Get(nodeID)
+	if !ok {
+		t.Fatalf("node %s not found", nodeID)
+	}
+	expectedJump := config.OpenSSHNodePrefix + "bastion"
+	if node.ProxyJump != expectedJump {
+		t.Errorf("got ProxyJump=%q, want %q (must not be local node root@10.0.0.99:22)", node.ProxyJump, expectedJump)
+	}
+}
