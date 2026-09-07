@@ -31,6 +31,46 @@ log_skip() {
     SKIP_COUNT=$((SKIP_COUNT + 1))
 }
 
+# ==============================================================================
+# run_go_test: 执行指定的 Go 测试，严格根据退出码判定，并杜绝无匹配测试计为通过
+# 参数:
+#   $1: 测试项描述 (description)
+#   $2: Go 包路径 (package)
+#   $3: 测试正则模式 (run_regex)
+#   $@: 可选环境变量 (如 DBUS_SESSION_BUS_ADDRESS= ...)
+# ==============================================================================
+run_go_test() {
+    local desc="$1"
+    local pkg="$2"
+    local run_regex="$3"
+    shift 3
+
+    local out status=0
+    # 严格捕获真实退出码，绝不通过 || true 丢弃
+    out=$(env "$@" go test -v -run "$run_regex" "$pkg" 2>&1) || status=$?
+
+    # 1. 退出码校验：非 0 即失败
+    if [ "$status" -ne 0 ]; then
+        log_fail "$desc (failed with exit code $status): $out"
+        return
+    fi
+
+    # 2. 避免“没有匹配测试”被计为通过：
+    # go test -v 在真正匹配并成功运行每个测试时，必定输出 "--- PASS: <TestName>"
+    if ! echo "$out" | grep -q -- "--- PASS:"; then
+        log_fail "$desc (no tests were executed or matched regex '$run_regex'): $out"
+        return
+    fi
+
+    # 3. 避免一组测试中部分失败被遗漏：严禁存在 "--- FAIL:"
+    if echo "$out" | grep -q -- "--- FAIL:"; then
+        log_fail "$desc (found failed subtests in output): $out"
+        return
+    fi
+
+    log_pass "$desc"
+}
+
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 log_info "Running native credential persistence verification on OS: $OS"
 
@@ -55,39 +95,39 @@ log_info "Executable built at $EXE_PATH"
 log_info "--- Stage 1: Common Helper Protocol Boundaries ---"
 
 # Test 1.1: 拒绝未知主版本 (失败关闭)
+STATUS=0
 OUT=$(printf '{"protocolVersion": 99, "storeID": "s", "itemID": "k"}' | \
-    XOPS_CREDENTIAL_HELPER_SYSTEM=1 "$EXE_PATH" get 2>&1 || true)
-if echo "$OUT" | grep -q "unsupported protocol version"; then
+    XOPS_CREDENTIAL_HELPER_SYSTEM=1 "$EXE_PATH" get 2>&1) || STATUS=$?
+if [ "$STATUS" -ne 0 ] && echo "$OUT" | grep -q "unsupported protocol version"; then
     log_pass "Helper protocol strictly rejects unknown version (fail-closed)"
 else
-    log_fail "Unknown protocol version was not rejected: $OUT"
+    log_fail "Unknown protocol version was not rejected: $OUT (exit code: $STATUS)"
 fi
 
 # Test 1.2: 拒绝多余的 JSON 对象
+STATUS=0
 OUT=$(printf '{"protocolVersion": 1, "storeID": "s", "itemID": "k"}{"protocolVersion": 1}' | \
-    XOPS_CREDENTIAL_HELPER_SYSTEM=1 "$EXE_PATH" get 2>&1 || true)
-if echo "$OUT" | grep -q "unexpected multiple JSON objects"; then
+    XOPS_CREDENTIAL_HELPER_SYSTEM=1 "$EXE_PATH" get 2>&1) || STATUS=$?
+if [ "$STATUS" -ne 0 ] && echo "$OUT" | grep -q "unexpected multiple JSON objects"; then
     log_pass "Helper protocol strictly rejects multiple JSON objects"
 else
-    log_fail "Multiple JSON objects were not rejected: $OUT"
+    log_fail "Multiple JSON objects were not rejected: $OUT (exit code: $STATUS)"
 fi
 
 # Test 1.3: 拒绝空引用
+STATUS=0
 OUT=$(printf '{"protocolVersion": 1, "storeID": "", "itemID": "k"}' | \
-    XOPS_CREDENTIAL_HELPER_SYSTEM=1 "$EXE_PATH" get 2>&1 || true)
-if echo "$OUT" | grep -q "storeID and itemID cannot be empty"; then
+    XOPS_CREDENTIAL_HELPER_SYSTEM=1 "$EXE_PATH" get 2>&1) || STATUS=$?
+if [ "$STATUS" -ne 0 ] && echo "$OUT" | grep -q "storeID and itemID cannot be empty"; then
     log_pass "Helper protocol strictly rejects empty storeID"
 else
-    log_fail "Empty storeID was not rejected: $OUT"
+    log_fail "Empty storeID was not rejected: $OUT (exit code: $STATUS)"
 fi
 
 # Test 1.4: 校验 Go 协议与未知错误码脱敏测试
-OUT=$(go test -v -run "TestInternalSystemHelperProtocolValidation|TestUnknownErrorCodeDoesNotExposeKnownSecret" ./internal/credentialhelper 2>&1 || true)
-if echo "$OUT" | grep -q "PASS"; then
-    log_pass "Internal helper protocol validation and secret redacting verified via Go tests"
-else
-    log_fail "Internal helper protocol Go tests failed: $OUT"
-fi
+run_go_test "Internal helper protocol validation and secret redacting verified via Go tests" \
+    ./internal/credentialhelper \
+    "^TestInternalSystemHelperProtocolValidation$|^TestUnknownErrorCodeDoesNotExposeKnownSecret$"
 
 # ------------------------------------------------------------------------------
 # 2. 平台特定原生凭据库与隔离机制验证
@@ -99,28 +139,20 @@ case "$OS" in
         log_info "Executing Linux-specific verification (Secret Service & Headless)"
 
         # 2.1 Headless 环境前置拒绝验证 (Fail-closed)
-        OUT=$(DBUS_SESSION_BUS_ADDRESS= DISPLAY= WAYLAND_DISPLAY= go test -v -run TestCheckSystemAvailability_HeadlessDetection ./internal/credentialhelper 2>&1 || true)
-        if echo "$OUT" | grep -q "PASS"; then
-            log_pass "Headless environment without D-Bus correctly fails closed"
-        else
-            log_fail "Headless detection failed: $OUT"
-        fi
+        run_go_test "Headless environment without D-Bus correctly fails closed" \
+            ./internal/credentialhelper \
+            "^TestCheckSystemAvailability_HeadlessDetection$" \
+            DBUS_SESSION_BUS_ADDRESS= DISPLAY= WAYLAND_DISPLAY=
 
         # 2.2 D-Bus 连接故障不误报 NotFound
-        OUT=$(go test -v -run TestSystemStoreLinuxDBusFailureNotReportedAsNotFound ./internal/credentialhelper 2>&1 || true)
-        if echo "$OUT" | grep -q "PASS"; then
-            log_pass "D-Bus connection failure mapped to ErrCredentialStoreUnavailable, not NotFound"
-        else
-            log_fail "D-Bus failure was misreported: $OUT"
-        fi
+        run_go_test "D-Bus connection failure mapped to ErrCredentialStoreUnavailable, not NotFound" \
+            ./internal/credentialhelper \
+            "^TestSystemStoreLinuxDBusFailureNotReportedAsNotFound$"
 
         # 2.3 64KB 输出截断拒收验证
-        OUT=$(go test -v -run TestProcessRunHugeOutput ./internal/credentialhelper 2>&1 || true)
-        if echo "$OUT" | grep -q "PASS"; then
-            log_pass "Linux native store strictly rejects oversized outputs (>64KB)"
-        else
-            log_fail "Oversized output rejection failed: $OUT"
-        fi
+        run_go_test "Linux native store strictly rejects oversized outputs (>64KB)" \
+            ./internal/credentialhelper \
+            "^TestProcessRunHugeOutput$"
 
         log_skip "Skipping macOS and Windows native tests on Linux host"
         ;;
@@ -129,41 +161,47 @@ case "$OS" in
         log_info "Executing macOS-specific verification (Keychain Services via purego C API)"
 
         # 2.1 运行 macOS 原生单元注入测试 (包含重试错误传播)
-        OUT=$(go test -v -run TestDarwinNativeHelper ./internal/credentialhelper 2>&1 || true)
-        if echo "$OUT" | grep -q "PASS"; then
-            log_pass "macOS Security framework C API hooks (find/add/mod/delete & duplicate retry error propagation) passed"
-        else
-            log_fail "macOS Security framework tests failed: $OUT"
-        fi
+        run_go_test "macOS Security framework C API hooks (find/add/mod/delete & duplicate retry error propagation) passed" \
+            ./internal/credentialhelper \
+            "^TestDarwinNativeHelper"
 
         # 2.2 验证原始字节、不可打印二进制与尾随换行无损往返
         TEST_VAL="secret-payload\n\n\x00\x01\x02\xff"
         B64_IN=$(printf "%b" "$TEST_VAL" | base64 | tr -d '\r\n')
         
         # Store
-        if printf '{"protocolVersion": 1, "storeID": "test-sys", "itemID": "bin-key", "secret": "%s"}' "$B64_IN" | \
-            XOPS_CREDENTIAL_HELPER_SYSTEM=1 "$EXE_PATH" store; then
+        STATUS=0
+        OUT=$(printf '{"protocolVersion": 1, "storeID": "test-sys", "itemID": "bin-key", "secret": "%s"}' "$B64_IN" | \
+            XOPS_CREDENTIAL_HELPER_SYSTEM=1 "$EXE_PATH" store 2>&1) || STATUS=$?
+        if [ "$STATUS" -eq 0 ]; then
             log_pass "macOS Keychain native store succeeded"
         else
-            log_fail "macOS Keychain native store failed"
+            log_fail "macOS Keychain native store failed (exit code: $STATUS): $OUT"
         fi
         
         # Get
+        STATUS=0
         GET_OUT=$(printf '{"protocolVersion": 1, "storeID": "test-sys", "itemID": "bin-key"}' | \
-            XOPS_CREDENTIAL_HELPER_SYSTEM=1 "$EXE_PATH" get)
-        B64_OUT=$(echo "$GET_OUT" | grep -o '"secret":"[^"]*"' | cut -d'"' -f4)
-        if [ "$B64_IN" = "$B64_OUT" ]; then
-            log_pass "macOS byte-exact roundtrip (including trailing newlines and binary zeroes) verified"
+            XOPS_CREDENTIAL_HELPER_SYSTEM=1 "$EXE_PATH" get 2>&1) || STATUS=$?
+        if [ "$STATUS" -ne 0 ]; then
+            log_fail "macOS Keychain native get failed (exit code: $STATUS): $GET_OUT"
         else
-            log_fail "macOS roundtrip mismatch: expected $B64_IN, got $B64_OUT"
+            B64_OUT=$(echo "$GET_OUT" | grep -o '"secret":"[^"]*"' | cut -d'"' -f4)
+            if [ "$B64_IN" = "$B64_OUT" ]; then
+                log_pass "macOS byte-exact roundtrip (including trailing newlines and binary zeroes) verified"
+            else
+                log_fail "macOS roundtrip mismatch: expected $B64_IN, got $B64_OUT"
+            fi
         fi
 
         # Erase
-        if printf '{"protocolVersion": 1, "storeID": "test-sys", "itemID": "bin-key"}' | \
-            XOPS_CREDENTIAL_HELPER_SYSTEM=1 "$EXE_PATH" erase; then
+        STATUS=0
+        OUT=$(printf '{"protocolVersion": 1, "storeID": "test-sys", "itemID": "bin-key"}' | \
+            XOPS_CREDENTIAL_HELPER_SYSTEM=1 "$EXE_PATH" erase 2>&1) || STATUS=$?
+        if [ "$STATUS" -eq 0 ]; then
             log_pass "macOS Keychain native erase succeeded"
         else
-            log_fail "macOS Keychain native erase failed"
+            log_fail "macOS Keychain native erase failed (exit code: $STATUS): $OUT"
         fi
 
         log_skip "Skipping Linux and Windows native tests on macOS host"
@@ -173,41 +211,47 @@ case "$OS" in
         log_info "Executing Windows-specific verification (Win32 Credential Manager & Job Object)"
 
         # 2.1 运行 Windows 原生单元与集成测试 (包含 Job Object 挂起创建与树终止)
-        OUT=$(go test -v -run "TestWindowsNative|TestProcessRunTimeoutAndCancel" ./internal/credentialhelper 2>&1 || true)
-        if echo "$OUT" | grep -q "PASS"; then
-            log_pass "Windows Win32 CredReadW/WriteW/DeleteW and Job Object tree termination passed"
-        else
-            log_fail "Windows native tests failed: $OUT"
-        fi
+        run_go_test "Windows Win32 CredReadW/WriteW/DeleteW and Job Object tree termination passed" \
+            ./internal/credentialhelper \
+            "^TestWindowsNative|^TestProcessRunTimeoutAndCancel$"
 
         # 2.2 验证受控 Helper 真实端到端往返
         TEST_VAL="windows-secret-data\n\n\x00\x01\x02"
         B64_IN=$(printf "%b" "$TEST_VAL" | base64 | tr -d '\r\n')
 
         # Store
-        if printf '{"protocolVersion": 1, "storeID": "win-sys", "itemID": "k1", "secret": "%s"}' "$B64_IN" | \
-            XOPS_CREDENTIAL_HELPER_SYSTEM=1 "$EXE_PATH" store; then
+        STATUS=0
+        OUT=$(printf '{"protocolVersion": 1, "storeID": "win-sys", "itemID": "k1", "secret": "%s"}' "$B64_IN" | \
+            XOPS_CREDENTIAL_HELPER_SYSTEM=1 "$EXE_PATH" store 2>&1) || STATUS=$?
+        if [ "$STATUS" -eq 0 ]; then
             log_pass "Windows Credential Manager native store succeeded"
         else
-            log_fail "Windows Credential Manager native store failed"
+            log_fail "Windows Credential Manager native store failed (exit code: $STATUS): $OUT"
         fi
 
         # Get
+        STATUS=0
         GET_OUT=$(printf '{"protocolVersion": 1, "storeID": "win-sys", "itemID": "k1"}' | \
-            XOPS_CREDENTIAL_HELPER_SYSTEM=1 "$EXE_PATH" get)
-        B64_OUT=$(echo "$GET_OUT" | grep -o '"secret":"[^"]*"' | cut -d'"' -f4)
-        if [ "$B64_IN" = "$B64_OUT" ]; then
-            log_pass "Windows byte-exact roundtrip verified"
+            XOPS_CREDENTIAL_HELPER_SYSTEM=1 "$EXE_PATH" get 2>&1) || STATUS=$?
+        if [ "$STATUS" -ne 0 ]; then
+            log_fail "Windows Credential Manager native get failed (exit code: $STATUS): $GET_OUT"
         else
-            log_fail "Windows roundtrip mismatch: expected $B64_IN, got $B64_OUT"
+            B64_OUT=$(echo "$GET_OUT" | grep -o '"secret":"[^"]*"' | cut -d'"' -f4)
+            if [ "$B64_IN" = "$B64_OUT" ]; then
+                log_pass "Windows byte-exact roundtrip verified"
+            else
+                log_fail "Windows roundtrip mismatch: expected $B64_IN, got $B64_OUT"
+            fi
         fi
 
         # Erase
-        if printf '{"protocolVersion": 1, "storeID": "win-sys", "itemID": "k1"}' | \
-            XOPS_CREDENTIAL_HELPER_SYSTEM=1 "$EXE_PATH" erase; then
+        STATUS=0
+        OUT=$(printf '{"protocolVersion": 1, "storeID": "win-sys", "itemID": "k1"}' | \
+            XOPS_CREDENTIAL_HELPER_SYSTEM=1 "$EXE_PATH" erase 2>&1) || STATUS=$?
+        if [ "$STATUS" -eq 0 ]; then
             log_pass "Windows Credential Manager native erase succeeded"
         else
-            log_fail "Windows Credential Manager native erase failed"
+            log_fail "Windows Credential Manager native erase failed (exit code: $STATUS): $OUT"
         fi
 
         log_skip "Skipping Linux and macOS native tests on Windows host"
