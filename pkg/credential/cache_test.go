@@ -490,3 +490,137 @@ func TestFailedPutStillInvalidatesConcurrentRead(t *testing.T) {
 		t.Fatal("failed Put left a concurrent read cached despite unknown write outcome")
 	}
 }
+
+// TestFetchQueueContinuousSuccessAndFailure 验证连续读取完成/失败后队列与活跃令牌严格同步回收
+func TestFetchQueueContinuousSuccessAndFailure(t *testing.T) {
+	// 1. 连续失败读取
+	cFail := NewCache(CacheOptions{Capacity: 2, DefaultTTL: time.Minute})
+	csFail := NewCachedSource(&dummyStore{
+		dummySource: dummySource{
+			getFn: func(context.Context, Ref) (Secret, error) {
+				return Secret{}, ErrCredentialNotFound
+			},
+		},
+	}, cFail)
+
+	for i := range 1000 {
+		sec, err := csFail.Get(t.Context(), Ref{StoreID: "s", ItemID: fmt.Sprint(i)})
+		sec.Zero()
+		if err == nil {
+			t.Fatal("expected backend miss")
+		}
+	}
+	queueLen := reflect.ValueOf(cFail).Elem().FieldByName("generationKeys").Len()
+	if queueLen != 0 || cFail.ActiveFetchesCount() != 0 {
+		t.Fatalf("after 1000 failed reads: active=%d, queueLen=%d, want 0", cFail.ActiveFetchesCount(), queueLen)
+	}
+
+	// 2. 连续成功读取
+	cSucc := NewCache(CacheOptions{Capacity: 5, DefaultTTL: time.Minute})
+	csSucc := NewCachedSource(&dummyStore{
+		dummySource: dummySource{
+			getFn: func(_ context.Context, r Ref) (Secret, error) {
+				return NewSecret([]byte("val-" + r.ItemID)), nil
+			},
+		},
+	}, cSucc)
+
+	for i := range 500 {
+		sec, err := csSucc.Get(t.Context(), Ref{StoreID: "s", ItemID: fmt.Sprint(i)})
+		if err != nil {
+			t.Fatalf("expected success, got: %v", err)
+		}
+		sec.Zero()
+	}
+	queueLen = reflect.ValueOf(cSucc).Elem().FieldByName("generationKeys").Len()
+	if queueLen != 0 || cSucc.ActiveFetchesCount() != 0 {
+		t.Fatalf("after 500 successful reads: active=%d, queueLen=%d, want 0", cSucc.ActiveFetchesCount(), queueLen)
+	}
+}
+
+// TestFetchQueueDuplicateRefStartFetch 验证同一引用重复读取时队列不重复堆叠，且旧令牌被覆盖
+func TestFetchQueueDuplicateRefStartFetch(t *testing.T) {
+	c := NewCache(CacheOptions{Capacity: 4, DefaultTTL: time.Minute})
+	ref := Ref{StoreID: "s", ItemID: "duplicate-key"}
+
+	// 连续对同一引用启动 5 次读取
+	tokens := make([]FetchToken, 5)
+	for i := 0; i < 5; i++ {
+		tokens[i] = c.StartFetch(ref)
+	}
+
+	// 验证队列中该 key 仅出现一次，活跃令牌数量也仅为 1
+	queueLen := reflect.ValueOf(c).Elem().FieldByName("generationKeys").Len()
+	if queueLen != 1 || c.ActiveFetchesCount() != 1 {
+		t.Fatalf("duplicate ref in queue: active=%d, queueLen=%d, want 1", c.ActiveFetchesCount(), queueLen)
+	}
+
+	// 前 4 个旧令牌回填均应被拒绝
+	for i := 0; i < 4; i++ {
+		sec := NewSecret([]byte("stale"))
+		c.PutIfMatch(ref, sec, tokens[i])
+		sec.Zero()
+		if _, found := c.Get(ref); found {
+			t.Fatalf("stale token %d successfully backfilled cache", i)
+		}
+	}
+	// 队列与 map 依然保持 1 项
+	if c.ActiveFetchesCount() != 1 {
+		t.Fatalf("expected active fetch count to remain 1 after rejected puts, got %d", c.ActiveFetchesCount())
+	}
+
+	// 第 5 个最新令牌回填成功，并清理活跃项
+	finalSec := NewSecret([]byte("latest"))
+	c.PutIfMatch(ref, finalSec, tokens[4])
+	finalSec.Zero()
+
+	got, found := c.Get(ref)
+	defer got.Zero()
+	if !found || string(got.Value) != "latest" {
+		t.Fatalf("expected latest secret cached, got found=%v, val=%s", found, string(got.Value))
+	}
+	if c.ActiveFetchesCount() != 0 {
+		t.Fatalf("expected 0 active fetches after successful put, got %d", c.ActiveFetchesCount())
+	}
+	queueLen = reflect.ValueOf(c).Elem().FieldByName("generationKeys").Len()
+	if queueLen != 0 {
+		t.Fatalf("expected 0 queue items after successful put, got %d", queueLen)
+	}
+}
+
+// TestFetchQueueEvictionWithStaleHistory 验证历史失效项之后触发淘汰，严格遵守容量上限
+func TestFetchQueueEvictionWithStaleHistory(t *testing.T) {
+	const capVal = 3
+	c := NewCache(CacheOptions{Capacity: capVal, DefaultTTL: time.Minute})
+
+	// 启动 3 次读取，填满活跃容量
+	ref1 := Ref{StoreID: "s", ItemID: "k1"}
+	ref2 := Ref{StoreID: "s", ItemID: "k2"}
+	ref3 := Ref{StoreID: "s", ItemID: "k3"}
+	c.StartFetch(ref1)
+	c.StartFetch(ref2)
+	c.StartFetch(ref3)
+
+	if active := c.ActiveFetchesCount(); active != capVal {
+		t.Fatalf("expected %d active fetches, got %d", capVal, active)
+	}
+
+	// 主动 Invalidate 其中一项
+	c.Invalidate(ref2)
+	if active := c.ActiveFetchesCount(); active != 2 {
+		t.Fatalf("expected 2 active fetches after invalidate, got %d", active)
+	}
+
+	// 连续启动 20 次新读取，验证活跃令牌和队列长度始终不超过容量上限
+	for i := 0; i < 20; i++ {
+		c.StartFetch(Ref{StoreID: "s", ItemID: fmt.Sprintf("extra-%d", i)})
+		active := c.ActiveFetchesCount()
+		queueLen := reflect.ValueOf(c).Elem().FieldByName("generationKeys").Len()
+		if active > capVal || queueLen > capVal {
+			t.Fatalf("step %d exceeded capacity: active=%d, queueLen=%d, capacity=%d", i, active, queueLen, capVal)
+		}
+		if active != queueLen {
+			t.Fatalf("step %d active (%d) != queueLen (%d)", i, active, queueLen)
+		}
+	}
+}

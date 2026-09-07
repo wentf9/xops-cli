@@ -123,11 +123,23 @@ func (c *Cache) StartFetch(ref Ref) FetchToken {
 	c.nextFetchToken++
 	tokenVal := c.nextFetchToken
 
-	// 限制 generations 容量不超过 cache capacity，防止未完成的在途读取无限积累
-	if len(c.generations) >= c.capacity && len(c.generationKeys) > 0 {
-		oldest := c.generationKeys[0]
-		c.generationKeys = c.generationKeys[1:]
-		delete(c.generations, oldest)
+	// 若同一引用重复发起读取，先从队列中移除旧记录，防止同一 key 重复堆叠
+	if _, exists := c.generations[key]; exists {
+		c.removeGenerationKeyLocked(key)
+	}
+
+	// 循环淘汰，直到活跃令牌数严格小于 capacity，同时驱逐陈旧队列项
+	for len(c.generations) >= c.capacity {
+		if len(c.generationKeys) > 0 {
+			oldest := c.generationKeys[0]
+			c.generationKeys = c.generationKeys[1:]
+			delete(c.generations, oldest)
+		} else {
+			for k := range c.generations {
+				delete(c.generations, k)
+				break
+			}
+		}
 	}
 
 	c.generations[key] = tokenVal
@@ -137,6 +149,20 @@ func (c *Cache) StartFetch(ref Ref) FetchToken {
 		token:      tokenVal,
 		clearEpoch: c.globalClearEpoch,
 	}
+}
+
+func (c *Cache) removeGenerationKeyLocked(key string) {
+	n := 0
+	for _, k := range c.generationKeys {
+		if k != key {
+			c.generationKeys[n] = k
+			n++
+		}
+	}
+	for i := n; i < len(c.generationKeys); i++ {
+		c.generationKeys[i] = ""
+	}
+	c.generationKeys = c.generationKeys[:n]
 }
 
 // CancelFetch 在读取底层存储失败时，主动释放在途读取令牌。
@@ -154,6 +180,7 @@ func (c *Cache) CancelFetch(ref Ref, ft FetchToken) {
 
 	if cur, exists := c.generations[key]; exists && cur == ft.token {
 		delete(c.generations, key)
+		c.removeGenerationKeyLocked(key)
 	}
 }
 
@@ -172,6 +199,7 @@ func (c *Cache) Put(ref Ref, secret Secret) {
 
 	// 写入时废弃该 key 的任何在途旧读取
 	delete(c.generations, key)
+	c.removeGenerationKeyLocked(key)
 	c.putLocked(key, secret)
 }
 
@@ -201,6 +229,7 @@ func (c *Cache) PutIfMatch(ref Ref, secret Secret, ft FetchToken) {
 
 	// 消费令牌并执行安全回填
 	delete(c.generations, key)
+	c.removeGenerationKeyLocked(key)
 	c.putLocked(key, secret)
 }
 
@@ -247,6 +276,7 @@ func (c *Cache) Invalidate(ref Ref) {
 	defer c.mu.Unlock()
 
 	delete(c.generations, key)
+	c.removeGenerationKeyLocked(key)
 	if entry, exists := c.entries[key]; exists {
 		c.removeEntryLocked(entry)
 	}
@@ -262,6 +292,9 @@ func (c *Cache) Clear() {
 
 	c.globalClearEpoch++
 	c.generations = make(map[string]uint64)
+	for i := range c.generationKeys {
+		c.generationKeys[i] = ""
+	}
 	c.generationKeys = c.generationKeys[:0]
 
 	curr := c.head
