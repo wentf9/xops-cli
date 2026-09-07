@@ -357,6 +357,11 @@ func addLookup(lookup map[string][]string, key, nodeID string) {
 	lookup[key] = append(lookup[key], nodeID)
 }
 
+// Snapshot 返回当前配置的防御性深拷贝副本。
+func (c *Configuration) Snapshot() *Configuration {
+	return cloneConfiguration(c)
+}
+
 func cloneConfiguration(cfg *Configuration) *Configuration {
 	cloned := &Configuration{
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
@@ -366,6 +371,8 @@ func cloneConfiguration(cfg *Configuration) *Configuration {
 	if cfg == nil {
 		return cloned
 	}
+	cloned.SchemaVersion = cfg.SchemaVersion
+	cloned.Credential = cfg.Credential.Clone()
 	cloned.PasswordPromptPattern = cfg.PasswordPromptPattern
 	cloned.Guardrail = cloneGuardrail(cfg.Guardrail)
 	if cfg.Nodes != nil {
@@ -385,7 +392,7 @@ func cloneConfiguration(cfg *Configuration) *Configuration {
 	if cfg.Identities != nil {
 		for _, key := range cfg.Identities.Keys() {
 			if identity, ok := cfg.Identities.Get(key); ok {
-				cloned.Identities.Set(key, identity)
+				cloned.Identities.Set(key, cloneIdentity(identity))
 			}
 		}
 	}
@@ -395,7 +402,20 @@ func cloneConfiguration(cfg *Configuration) *Configuration {
 func cloneNode(node models.Node) models.Node {
 	node.Alias = slices.Clone(node.Alias)
 	node.Tags = slices.Clone(node.Tags)
+	if node.PrivilegePasswordRef != nil {
+		node.PrivilegePasswordRef = node.PrivilegePasswordRef.Clone()
+	}
 	return node
+}
+
+func cloneIdentity(identity models.Identity) models.Identity {
+	if identity.LoginPasswordRef != nil {
+		identity.LoginPasswordRef = identity.LoginPasswordRef.Clone()
+	}
+	if identity.PassphraseRef != nil {
+		identity.PassphraseRef = identity.PassphraseRef.Clone()
+	}
+	return identity
 }
 
 func cloneHost(host models.Host) models.Host {

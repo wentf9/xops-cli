@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
 	"gopkg.in/yaml.v3"
 )
@@ -263,12 +264,24 @@ func nodeAuthVersion(cfg *Configuration, nodeID string) (Version, error) {
 		return Version{}, fmt.Errorf("resolve identity %q authentication version: %w", node.IdentityRef, ErrIdentityNotFound)
 	}
 	data, err := yaml.Marshal(struct {
-		IdentityRef string `yaml:"identity_ref"`
-		AuthType    string `yaml:"auth_type"`
-		Password    string `yaml:"password"`
-		KeyPath     string `yaml:"key_path"`
-		Passphrase  string `yaml:"passphrase"`
-	}{node.IdentityRef, identity.AuthType, identity.Password, identity.KeyPath, identity.Passphrase})
+		IdentityRef      string          `yaml:"identity_ref"`
+		AuthType         string          `yaml:"auth_type"`
+		Password         string          `yaml:"password"`
+		KeyPath          string          `yaml:"key_path"`
+		Passphrase       string          `yaml:"passphrase"`
+		KeyFingerprint   string          `yaml:"key_fingerprint,omitempty"`
+		LoginPasswordRef *credential.Ref `yaml:"login_password_ref,omitempty"`
+		PassphraseRef    *credential.Ref `yaml:"passphrase_ref,omitempty"`
+	}{
+		IdentityRef:      node.IdentityRef,
+		AuthType:         identity.AuthType,
+		Password:         identity.Password,
+		KeyPath:          identity.KeyPath,
+		Passphrase:       identity.Passphrase,
+		KeyFingerprint:   identity.KeyFingerprint,
+		LoginPasswordRef: identity.LoginPasswordRef,
+		PassphraseRef:    identity.PassphraseRef,
+	})
 	if err != nil {
 		return Version{}, fmt.Errorf("serialize node %q authentication version: %w", nodeID, err)
 	}
@@ -284,9 +297,14 @@ func nodeSudoVersion(cfg *Configuration, nodeID string) (Version, error) {
 		return Version{}, fmt.Errorf("resolve node %q sudo version: %w", nodeID, ErrNodeNotFound)
 	}
 	data, err := yaml.Marshal(struct {
-		Mode  models.SudoMode `yaml:"mode"`
-		SuPwd string          `yaml:"su_pwd"`
-	}{node.SudoMode, node.SuPwd})
+		Mode                 models.SudoMode `yaml:"mode"`
+		SuPwd                string          `yaml:"su_pwd"`
+		PrivilegePasswordRef *credential.Ref `yaml:"privilege_password_ref,omitempty"`
+	}{
+		Mode:                 node.SudoMode,
+		SuPwd:                node.SuPwd,
+		PrivilegePasswordRef: node.PrivilegePasswordRef,
+	})
 	if err != nil {
 		return Version{}, fmt.Errorf("serialize node %q sudo version: %w", nodeID, err)
 	}

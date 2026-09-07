@@ -7,6 +7,8 @@ import (
 
 // Configuration 对应 yaml 文件的顶层结构
 type Configuration struct {
+	SchemaVersion         int                                      `yaml:"schema_version,omitempty"`
+	Credential            *CredentialConfig                        `yaml:"credential,omitempty"`
 	Identities            *concurrent.Map[string, models.Identity] `yaml:"identities"`
 	Hosts                 *concurrent.Map[string, models.Host]     `yaml:"hosts"`
 	Nodes                 *concurrent.Map[string, models.Node]     `yaml:"nodes"`
