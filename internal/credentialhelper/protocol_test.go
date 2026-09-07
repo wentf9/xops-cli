@@ -132,3 +132,20 @@ func TestDecodeResponseEmptyAndMalformed(t *testing.T) {
 		t.Fatalf("expected error on malformed json")
 	}
 }
+
+func TestUnknownErrorCodeDoesNotExposeKnownSecret(t *testing.T) {
+	rawJSON := `{"code": "p@ssword-secret!", "message": "diagnostic"}`
+	resp, err := DecodeResponse(strings.NewReader(rawJSON))
+	if resp == nil {
+		t.Fatalf("expected non-nil response")
+	}
+	if err == nil {
+		t.Fatalf("expected error on unknown error code")
+	}
+	if strings.Contains(err.Error(), "p@ssword-secret!") {
+		t.Fatalf("unknown error code leaked into error message: %v", err)
+	}
+	if !errors.Is(err, credential.ErrCredentialStoreUnavailable) {
+		t.Fatalf("expected ErrCredentialStoreUnavailable for unknown error code, got: %v", err)
+	}
+}

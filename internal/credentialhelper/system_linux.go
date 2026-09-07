@@ -72,7 +72,14 @@ func (s *linuxNativeStore) Get(ctx context.Context, ref credential.Ref) (credent
 		if strings.Contains(stderrLower, "locked") {
 			return credential.Secret{}, fmt.Errorf("%w: %s", credential.ErrCredentialStoreLocked, stderr)
 		}
-		return credential.Secret{}, credential.ErrCredentialNotFound
+		if stderr != "" {
+			return credential.Secret{}, fmt.Errorf("%w: secret-tool lookup failed: %s", credential.ErrCredentialStoreUnavailable, stderr)
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return credential.Secret{}, credential.ErrCredentialNotFound
+		}
+		return credential.Secret{}, fmt.Errorf("%w: secret-tool lookup failed: %w", credential.ErrCredentialStoreUnavailable, err)
 	}
 
 	if len(stdout) == 0 {
@@ -99,6 +106,9 @@ func (s *linuxNativeStore) Put(ctx context.Context, ref credential.Ref, secret c
 		if strings.Contains(strings.ToLower(stderr), "locked") {
 			return fmt.Errorf("%w: %s", credential.ErrCredentialStoreLocked, stderr)
 		}
+		if stderr != "" {
+			return fmt.Errorf("%w: secret-tool store failed: %s", credential.ErrCredentialStoreUnavailable, stderr)
+		}
 		return fmt.Errorf("secret-tool store failed: %w", err)
 	}
 	return nil
@@ -109,13 +119,19 @@ func (s *linuxNativeStore) Delete(ctx context.Context, ref credential.Ref) error
 		return credential.ErrCredentialStoreReadOnly
 	}
 	args := []string{"clear", "xops-store", ref.StoreID, "xops-item", ref.ItemID}
-	_, _, err := s.execCmd(ctx, args, nil)
+	_, stderr, err := s.execCmd(ctx, args, nil)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return context.Canceled
 		}
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, credential.ErrCredentialStoreUnavailable) || errors.Is(err, credential.ErrCredentialStoreLocked) {
 			return err
+		}
+		if strings.Contains(strings.ToLower(stderr), "locked") {
+			return fmt.Errorf("%w: %s", credential.ErrCredentialStoreLocked, stderr)
+		}
+		if stderr != "" {
+			return fmt.Errorf("%w: secret-tool clear failed: %s", credential.ErrCredentialStoreUnavailable, stderr)
 		}
 		return fmt.Errorf("secret-tool clear failed: %w", err)
 	}

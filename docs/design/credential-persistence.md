@@ -385,19 +385,22 @@ pkg 层只包装并返回。允许记录 StoreID、操作、耗时、结果分�
   - **权限不足/无会话**：系统返回 `ERROR_ACCESS_DENIED (5)` 或 `ERROR_NO_SUCH_LOGON_SESSION (1312)`，映射为 `credential.ErrCredentialAccessDenied`；
   - **超时与取消**：设置 50ms 超时并注入模拟延迟，宿主在 50ms 内触发 `KillTree`，Job Object 立即销毁进程树并返回 `ErrCredentialStoreUnavailable`，管道无挂死。
 
-### 16.2 macOS 原生平台验证 (Keychain Services)
+### 16.2 macOS 原生平台验证 (Keychain Services & Security Framework)
 
 - **验证环境**：macOS Sonoma 14.5 (Darwin 23.5.0, Apple Silicon arm64) / macOS Sequoia 15.0。
-- **调用路径与机密防泄露隔离**：
-  - 基于系统内置 `/usr/bin/security` 工具，服务标识为 `xops:<storeID>`，账户标识为 `<itemID>`。
-  - **纠错与 argv 机密防泄漏落地方案**：此前在宿主使用 `security add-generic-password ... -w <secret>` 会直接将凭据原文暴露在进程列表（`ps aux`）的命令行参数中。本实现彻底整改：
-    1. 宿主通过受控 Helper 的 stdin 管道传递 JSON 请求报文（`secret` 字段 Base64 编码），宿主自身及派生 helper 的 argv 中仅包含受控动作参数（如 `store`），严禁包含机密；
-    2. Helper 内部调用 `/usr/bin/security -i`（交互式模式），通过 stdin 管道向 security 发送经过引号与反斜杠转义的存储指令，argv 仅为 `["/usr/bin/security", "-i"]`，彻底杜绝系统进程列表中密码泄露。
-- **换行符保留与错误映射**：
-  - **纠错与尾随换行保护**：此前使用 `TrimRight(..., "\r\n")` 导致末尾换行丢失。根据凭据保真原则，完整保留所有输出字节与尾随换行（如 `synthetic\n\n` 原样返回 Base64 编码），严禁随意剔除；空字节输出映射为 `ErrCredentialNotFound`；
-  - **未找到条目**：退出状态码 `44` (`errSecItemNotFound`) 或 stderr 提示 `The specified item could not be found`，映射为 `credential.ErrCredentialNotFound`；
-  - **锁定与未授权**：stderr 提示 `locked`、`user interaction is not allowed` 或状态码映射为 `credential.ErrCredentialStoreLocked`；
-  - **超限拒绝**：输出超过 64KB (`MaxResponseBytes`) 时，明确拒绝并返回 `ErrCredentialStoreUnavailable`。
+- **命令行工具缺陷与认知纠偏**：
+  - 此前设计尝试调用 Apple `/usr/bin/security` CLI 工具，经深入分析 Apple 源码确认存在两大无法修复的原生缺陷：
+    1. **读取缺陷 (不可打印转码与追加换行)**：在 Apple 官方实现 [`SecurityTool/macOS/keychain_find.c`](https://github.com/apple-oss-distributions/Security/blob/main/SecurityTool/macOS/keychain_find.c#L387) 中，`print_password` 在输出末尾无条件强制打印换行符 `\n`，且遇到不可打印字节会自动转为十六进制文本。若使用 `security -w` 读取，普通密码 `abc` 必变成 `abc\n`，二进制机密根本无法保证往返一致；
+    2. **写入缺陷 (换行指令注入与行长硬编码)**：在 Apple 官方实现 [`SecurityTool/macOS/security.c`](https://github.com/apple-oss-distributions/Security/blob/main/SecurityTool/macOS/security.c) 中，交互式模式 `-i` 使用固定 1024 字节单行缓冲区并按换行符 `\n` 解释下一条指令。机密中若包含换行符，换行后续内容会被作为独立命令解析执行，存在严重的命令注入与数据截断损坏风险。
+- **原生 API 落地架构 (纯 Go 动态桥接 Security Framework)**：
+  - 为彻底解决上述问题，本实现坚决摒弃 `security` 命令行文本拼接，在受控 Helper 内部通过纯 Go 动态加载机制（`purego`）直接调用 macOS 原生 Security Framework C API：
+    - 读取：`SecKeychainFindGenericPassword` 取得原始内存指针与字节长度，通过 `unsafe.Slice` 取得原始二进制副本后调用 `SecKeychainItemFreeContent`，零文本编码、零额外换行，100% 保证二进制往返一致性；
+    - 写入：`SecKeychainAddGenericPassword` / `SecKeychainItemModifyAttributesAndData` 直接接收原始机密字节指针与长度，彻底消除 argv 参数暴露与换行注入；
+    - 删除：`SecKeychainFindGenericPassword` 检索 `itemRef`，随后调用 `SecKeychainItemDelete` 并通过 `CFRelease` 释放非托管引用。
+- **错误代码映射与保真度**：
+  - 目标未找到：`errSecItemNotFound (-25300)` 映射为 `credential.ErrCredentialNotFound`；
+  - 密钥库锁定或拒绝交互：`errSecAuthFailed (-25293)` / `errSecInteractionNotAllowed (-25308)` 映射为 `credential.ErrCredentialStoreLocked`；
+  - 成功返回：原样字节完整 Base64 编码，无任何 `TrimRight` 截断。
 
 ### 16.3 Linux 原生平台验证 (Secret Service & Headless 检测)
 
@@ -407,6 +410,10 @@ pkg 层只包装并返回。允许记录 StoreID、操作、耗时、结果分�
   - 存储属性标签：`xops-store = <storeID>`、`xops-item = <itemID>`，展示标签为 `xops:<storeID>/<itemID>`；秘密通过 stdin 管道输入，严禁进入命令行参数。
 - **Headless 与环境前置检测**：
   - **Fail-closed 前置检测**：在无桌面 D-Bus 会话（如 SSH 远程会话、Docker 容器、CI/CD 环境）中，调用 Secret Service 会因无 Session Bus 或无法弹出 Unlock 提示导致无限阻塞。`checkPlatformSystemAvailability` 检测环境变量 `DBUS_SESSION_BUS_ADDRESS`、`DISPLAY` 和 `WAYLAND_DISPLAY`，三者皆空时立即 fail-closed 返回 `ErrCredentialStoreUnavailable`，防止挂死；
+  - **故障分类精准化 (杜绝误报 NotFound)**：
+    - 此前当 D-Bus 连接故障退出时，未捕获的错误被盲目降级为 `NotFound`；
+    - 本实现严格区分：只有在 `secret-tool` 明确返回空结果或退出码 1 且 stderr 为空时，才判定为 `ErrCredentialNotFound`；
+    - 凡 stderr 提示 `Cannot connect to D-Bus` 或其他底层服务故障，坚决映射为 `ErrCredentialStoreUnavailable`；
   - **语义保留与取消优先**：在 `Get` / `Put` / `Delete` 流程中，优先保留 `context.Canceled`、`context.DeadlineExceeded` 以及 `ErrCredentialStoreUnavailable`，禁止将取消或超时错误降级吞咽为 `ErrCredentialNotFound`；
   - **输出超限拒绝**：严格检查 `stdoutLimiter.total > MaxResponseBytes`（64KB），一旦输出被截断立即报错拒绝，杜绝截断数据作为有效凭据返回。
 
@@ -415,10 +422,23 @@ pkg 层只包装并返回。允许记录 StoreID、操作、耗时、结果分�
 - **等待上限与管道排空**：
   - 设置 `DefaultProcessWaitDelay = 50ms`，配合各平台的进程树强制终止（Linux/Darwin 进程组 `killProcessGroup`，Windows `TerminateJobObject`），当父进程提前退出但派生孙进程继承 stdout 管道时，`cmd.WaitDelay` 超时后强制关闭管道，消除了外部 helper 挂起导致的死锁；
   - **禁止忽略 WaitDelay 错误**：取消/超时或孙进程挂起触发 `exec.ErrWaitDelay` 时，严格向上层报告错误，禁止在管道强制截断后误判为成功。
-- **诊断信息清洗与脱敏**：
-  - 在 helper 协议通信与子进程输出层统一通过 `SanitizeDiagnostic` 进行清洗：
-    1. 自动对错误回显及 stderr 中的请求敏感信息（包含 Base64 编码载荷、原始机密明文）进行精确替换为 `[REDACTED]`；
-    2. 匹配 16 位以上疑似 Base64 随机串进行脱敏；
-    3. 限制错误文本最大长度（256 字符），防止内存膨胀与日志注入攻击；
-  - `MapErrorCode` 将 helper 返回的受控代码统一映射为标准哨兵错误，且对返回的消息进行脱敏，杜绝逆向泄露已知秘密。
+- **启动后错误路径的完整生命周期清理 (Windows)**：
+  - 在 Windows `startProcessSession` 中，一旦 `cmd.Start()` 成功，在 `OpenProcess`、`AssignProcessToJobObject` 或 `resumeProcessMainThread` 发生任何异常时，必须无条件执行 `TerminateJobObject` -> `cmd.Process.Kill()` -> `cmd.Wait()` -> `CloseHandle`，确保回收进程句柄、I/O 管道与读取 Goroutine，彻底消除资源泄露隐患。
+- **协议层严格校验与失败关闭**：
+  - 内部受控 Helper 严格执行边界输入校验：
+    1. 限制请求大小（`LimitReader(os.Stdin, MaxResponseBytes+1)`），超出 64KB 立即拒绝；
+    2. 拒绝多余的 JSON 对象与尾随数据；
+    3. 校验协议主版本（非 `ProtocolVersion=1` 立即失败关闭）；
+    4. 校验 `Ref` 合法性（StoreID 与 ItemID 严禁为空或含注入字符）；
+    5. 未知操作指令（Action）严格拒绝；
+- **诊断信息清洗与未知 Code 脱敏**：
+  - `MapErrorCode` 将未知错误代码统一映射为固定的 `ErrCredentialStoreUnavailable: unrecognized error code`，禁止在返回错误中回显未知的 `code` 字符串，杜绝利用错误代码逆向嗅探请求凭据；
+  - 在 helper 协议通信与子进程输出层统一通过 `SanitizeDiagnostic` 进行清洗，自动屏蔽 Base64 载荷（匹配 16 字符以上 Base64）与请求机密明文为 `[REDACTED]`。
+
+### 16.5 自动化回归脚本与执行证据
+
+仓库已提供自动化跨平台验证脚本 [`scripts/verify_native_platform.sh`](file:///home/wuyue/xops-cli/scripts/verify_native_platform.sh) 及对应的单元回归测试用例：
+- `TestInternalSystemHelperProtocolValidation`：覆盖非法主版本、多余 JSON、空 Ref、非法 Base64 的失败关闭行为；
+- `TestSystemStoreLinuxDBusFailureNotReportedAsNotFound`：覆盖 D-Bus 连接故障映射为 `ErrCredentialStoreUnavailable` 的分类准确性；
+- `TestUnknownErrorCodeDoesNotExposeKnownSecret`：覆盖未知 Code 字段不回显敏感机密的脱敏机制。
 

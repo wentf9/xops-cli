@@ -57,32 +57,31 @@ func startProcessSession(cmd *exec.Cmd) (*processSession, error) {
 		return nil, fmt.Errorf("start suspended process: %w", err)
 	}
 
-	hProcess, openErr := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
-	if openErr != nil {
+	cleanupOnError := func() {
+		_ = windows.TerminateJobObject(job, 1)
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
 		}
+		_ = cmd.Wait()
 		_ = windows.CloseHandle(job)
+	}
+
+	hProcess, openErr := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
+	if openErr != nil {
+		cleanupOnError()
 		return nil, fmt.Errorf("open process for job assignment: %w", openErr)
 	}
 
 	assignErr := windows.AssignProcessToJobObject(job, hProcess)
 	_ = windows.CloseHandle(hProcess)
 	if assignErr != nil {
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-		_ = windows.CloseHandle(job)
+		cleanupOnError()
 		return nil, fmt.Errorf("assign process to job object: %w", assignErr)
 	}
 
 	// 绑定完成后恢复子进程主线程执行
 	if resumeErr := resumeProcessMainThread(cmd.Process.Pid); resumeErr != nil {
-		_ = windows.TerminateJobObject(job, 1)
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-		_ = windows.CloseHandle(job)
+		cleanupOnError()
 		return nil, fmt.Errorf("resume process main thread: %w", resumeErr)
 	}
 

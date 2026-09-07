@@ -4,13 +4,92 @@ package credentialhelper
 
 import (
 	"encoding/base64"
-	"errors"
 	"fmt"
-	"os/exec"
-	"strings"
+	"sync"
+	"unsafe"
 
+	"github.com/ebitengine/purego"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
+
+const (
+	errSecSuccess               int32 = 0
+	errSecItemNotFound          int32 = -25300
+	errSecDuplicateItem         int32 = -25299
+	errSecAuthFailed            int32 = -25293
+	errSecInteractionNotAllowed int32 = -25308
+)
+
+var (
+	darwinKeychainInitOnce sync.Once
+	darwinKeychainInitErr  error
+
+	secKeychainFindGenericPassword func(
+		keychain uintptr,
+		serviceLength uint32,
+		service *byte,
+		accountLength uint32,
+		account *byte,
+		passwordLength *uint32,
+		passwordData *unsafe.Pointer,
+		itemRef *uintptr,
+	) int32
+
+	secKeychainItemFreeContent func(
+		attrList uintptr,
+		data unsafe.Pointer,
+	) int32
+
+	secKeychainAddGenericPassword func(
+		keychain uintptr,
+		serviceLength uint32,
+		service *byte,
+		accountLength uint32,
+		account *byte,
+		passwordLength uint32,
+		passwordData unsafe.Pointer,
+		itemRef *uintptr,
+	) int32
+
+	secKeychainItemModifyAttributesAndData func(
+		itemRef uintptr,
+		attrList uintptr,
+		length uint32,
+		data unsafe.Pointer,
+	) int32
+
+	secKeychainItemDelete func(
+		itemRef uintptr,
+	) int32
+
+	cfRelease func(
+		cf uintptr,
+	)
+)
+
+func initDarwinKeychainAPIs() error {
+	darwinKeychainInitOnce.Do(func() {
+		secHandle, err := purego.Dlopen("/System/Library/Frameworks/Security.framework/Security", purego.RTLD_GLOBAL)
+		if err != nil {
+			darwinKeychainInitErr = fmt.Errorf("dlopen Security framework: %w", err)
+			return
+		}
+
+		cfHandle, err := purego.Dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", purego.RTLD_GLOBAL)
+		if err != nil {
+			darwinKeychainInitErr = fmt.Errorf("dlopen CoreFoundation framework: %w", err)
+			return
+		}
+
+		purego.RegisterLibFunc(&secKeychainFindGenericPassword, secHandle, "SecKeychainFindGenericPassword")
+		purego.RegisterLibFunc(&secKeychainItemFreeContent, secHandle, "SecKeychainItemFreeContent")
+		purego.RegisterLibFunc(&secKeychainAddGenericPassword, secHandle, "SecKeychainAddGenericPassword")
+		purego.RegisterLibFunc(&secKeychainItemModifyAttributesAndData, secHandle, "SecKeychainItemModifyAttributesAndData")
+		purego.RegisterLibFunc(&secKeychainItemDelete, secHandle, "SecKeychainItemDelete")
+		purego.RegisterLibFunc(&cfRelease, cfHandle, "CFRelease")
+	})
+	return darwinKeychainInitErr
+}
 
 func newNativeSystemStore(storeID string, cfg SystemStoreConfig) (credential.Store, error) {
 	cmdPath, args, env, err := resolveControlledSystemHelper()
@@ -33,32 +112,69 @@ func handlePlatformSystemHelper(action Action, req *Request) (*Response, int) {
 		return &Response{Code: "unavailable", Message: "nil request"}, 1
 	}
 
+	if err := initDarwinKeychainAPIs(); err != nil {
+		return &Response{Code: "unavailable", Message: err.Error()}, 1
+	}
+
 	service := fmt.Sprintf("xops:%s", req.StoreID)
 	account := req.ItemID
 
+	serviceBytes := []byte(service)
+	accountBytes := []byte(account)
+
+	var servicePtr *byte
+	if len(serviceBytes) > 0 {
+		servicePtr = &serviceBytes[0]
+	}
+	var accountPtr *byte
+	if len(accountBytes) > 0 {
+		accountPtr = &accountBytes[0]
+	}
+
 	switch action {
 	case ActionGet:
-		cmd := exec.Command("/usr/bin/security", "find-generic-password", "-s", service, "-a", account, "-w")
-		stdout, err := cmd.Output()
-		if err != nil {
-			var exitErr *exec.ExitError
-			if errors.As(err, &exitErr) && exitErr.ExitCode() == 44 {
-				return &Response{Code: "not-found", Message: "credential not found"}, 1
-			}
-			return &Response{Code: "locked", Message: "keychain locked or denied"}, 1
+		var pwLen uint32
+		var pwData unsafe.Pointer
+		var itemRef uintptr
+
+		status := secKeychainFindGenericPassword(
+			0,
+			uint32(len(serviceBytes)),
+			servicePtr,
+			uint32(len(accountBytes)),
+			accountPtr,
+			&pwLen,
+			&pwData,
+			&itemRef,
+		)
+		if itemRef != 0 {
+			defer cfRelease(itemRef)
 		}
 
-		if len(stdout) > MaxResponseBytes {
-			return &Response{Code: "unavailable", Message: "keychain output exceeded limit"}, 1
+		if status == errSecItemNotFound {
+			return &Response{Code: "not-found", Message: "credential not found"}, 1
+		}
+		if status == errSecAuthFailed || status == errSecInteractionNotAllowed {
+			return &Response{Code: "locked", Message: "keychain locked or user interaction not allowed"}, 1
+		}
+		if status != errSecSuccess {
+			return &Response{Code: "unavailable", Message: fmt.Sprintf("SecKeychainFindGenericPassword failed with status %d", status)}, 1
+		}
+		if pwData == nil {
+			return &Response{Code: "not-found", Message: "empty credential"}, 1
+		}
+		defer secKeychainItemFreeContent(0, pwData)
+
+		if pwLen > MaxResponseBytes {
+			return &Response{Code: "unavailable", Message: fmt.Sprintf("credential size %d exceeds limit", pwLen)}, 1
 		}
 
-		// 严禁 TrimRight，完整保留末尾换行和所有字节
-		if len(stdout) == 0 {
-			return &Response{Code: "not-found", Message: "empty secret"}, 1
-		}
+		rawBytes := unsafe.Slice((*byte)(pwData), pwLen)
+		copied := make([]byte, pwLen)
+		copy(copied, rawBytes)
 
 		return &Response{
-			Secret: base64.StdEncoding.EncodeToString(stdout),
+			Secret: base64.StdEncoding.EncodeToString(copied),
 		}, 0
 
 	case ActionStore:
@@ -70,50 +186,106 @@ func handlePlatformSystemHelper(action Action, req *Request) (*Response, int) {
 			return &Response{Code: "unavailable", Message: "invalid base64 secret"}, 1
 		}
 
-		// 秘密严禁进入命令行参数：通过 security 交互模式 (-i) 的 stdin 传递指令，避免 ps 泄露
-		cmd := exec.Command("/usr/bin/security", "-i")
-		var stdinBuf strings.Builder
-		stdinBuf.WriteString("add-generic-password -s ")
-		stdinBuf.WriteString(escapeArg(service))
-		stdinBuf.WriteString(" -a ")
-		stdinBuf.WriteString(escapeArg(account))
-		stdinBuf.WriteString(" -w ")
-		stdinBuf.WriteString(escapeArg(string(secretBytes)))
-		stdinBuf.WriteString(" -U\n")
-		cmd.Stdin = strings.NewReader(stdinBuf.String())
+		var secretPtr unsafe.Pointer
+		if len(secretBytes) > 0 {
+			secretPtr = unsafe.Pointer(&secretBytes[0])
+		}
 
-		if err := cmd.Run(); err != nil {
-			return &Response{Code: "locked", Message: "failed to save to keychain"}, 1
+		// 检查是否存在同名条目
+		var existingItemRef uintptr
+		findStatus := secKeychainFindGenericPassword(
+			0,
+			uint32(len(serviceBytes)),
+			servicePtr,
+			uint32(len(accountBytes)),
+			accountPtr,
+			nil,
+			nil,
+			&existingItemRef,
+		)
+		if findStatus == errSecSuccess && existingItemRef != 0 {
+			defer cfRelease(existingItemRef)
+			modStatus := secKeychainItemModifyAttributesAndData(
+				existingItemRef,
+				0,
+				uint32(len(secretBytes)),
+				secretPtr,
+			)
+			if modStatus == errSecAuthFailed || modStatus == errSecInteractionNotAllowed {
+				return &Response{Code: "locked", Message: "keychain locked or update denied"}, 1
+			}
+			if modStatus != errSecSuccess {
+				return &Response{Code: "unavailable", Message: fmt.Sprintf("SecKeychainItemModifyAttributesAndData failed: %d", modStatus)}, 1
+			}
+			return &Response{}, 0
+		}
+
+		var newItemRef uintptr
+		addStatus := secKeychainAddGenericPassword(
+			0,
+			uint32(len(serviceBytes)),
+			servicePtr,
+			uint32(len(accountBytes)),
+			accountPtr,
+			uint32(len(secretBytes)),
+			secretPtr,
+			&newItemRef,
+		)
+		if newItemRef != 0 {
+			defer cfRelease(newItemRef)
+		}
+		if addStatus == errSecDuplicateItem {
+			// 若并发写入导致冲突，再次更新
+			var retryItemRef uintptr
+			if secKeychainFindGenericPassword(0, uint32(len(serviceBytes)), servicePtr, uint32(len(accountBytes)), accountPtr, nil, nil, &retryItemRef) == errSecSuccess && retryItemRef != 0 {
+				defer cfRelease(retryItemRef)
+				_ = secKeychainItemModifyAttributesAndData(retryItemRef, 0, uint32(len(secretBytes)), secretPtr)
+			}
+			return &Response{}, 0
+		}
+		if addStatus == errSecAuthFailed || addStatus == errSecInteractionNotAllowed {
+			return &Response{Code: "locked", Message: "keychain locked or add denied"}, 1
+		}
+		if addStatus != errSecSuccess {
+			return &Response{Code: "unavailable", Message: fmt.Sprintf("SecKeychainAddGenericPassword failed: %d", addStatus)}, 1
 		}
 		return &Response{}, 0
 
 	case ActionErase:
-		cmd := exec.Command("/usr/bin/security", "delete-generic-password", "-s", service, "-a", account)
-		if err := cmd.Run(); err != nil {
-			var exitErr *exec.ExitError
-			if errors.As(err, &exitErr) && exitErr.ExitCode() == 44 {
-				return &Response{Code: "not-found", Message: "credential not found"}, 1
-			}
-			return &Response{Code: "unavailable", Message: "failed to delete from keychain"}, 1
+		var itemRef uintptr
+		status := secKeychainFindGenericPassword(
+			0,
+			uint32(len(serviceBytes)),
+			servicePtr,
+			uint32(len(accountBytes)),
+			accountPtr,
+			nil,
+			nil,
+			&itemRef,
+		)
+		if status == errSecItemNotFound {
+			return &Response{Code: "not-found", Message: "credential not found"}, 1
+		}
+		if status != errSecSuccess {
+			return &Response{Code: "unavailable", Message: fmt.Sprintf("find item failed: %d", status)}, 1
+		}
+		defer cfRelease(itemRef)
+
+		delStatus := secKeychainItemDelete(itemRef)
+		if delStatus == errSecItemNotFound {
+			return &Response{Code: "not-found", Message: "credential not found"}, 1
+		}
+		if delStatus == errSecAuthFailed || delStatus == errSecInteractionNotAllowed {
+			return &Response{Code: "locked", Message: "keychain locked"}, 1
+		}
+		if delStatus != errSecSuccess {
+			return &Response{Code: "unavailable", Message: fmt.Sprintf("SecKeychainItemDelete failed: %d", delStatus)}, 1
 		}
 		return &Response{}, 0
 
 	default:
 		return &Response{Code: "unavailable", Message: "unsupported action"}, 1
 	}
-}
-
-func escapeArg(s string) string {
-	var buf strings.Builder
-	buf.WriteByte('"')
-	for _, r := range s {
-		if r == '"' || r == '\\' {
-			buf.WriteByte('\\')
-		}
-		buf.WriteRune(r)
-	}
-	buf.WriteByte('"')
-	return buf.String()
 }
 
 func checkPlatformSystemAvailability() error {

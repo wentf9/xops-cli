@@ -2,11 +2,15 @@ package credentialhelper
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
@@ -183,4 +187,100 @@ func TestControlledSystemHelperResolution(t *testing.T) {
 	}
 	_ = args
 	_ = env
+}
+
+func TestSystemStoreLinuxDBusFailureNotReportedAsNotFound(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("skipping linux-specific test on non-linux")
+	}
+
+	fakeScript := filepath.Join(t.TempDir(), "secret-tool")
+	scriptContent := "#!/bin/sh\nprintf 'Cannot connect to D-Bus session bus' >&2\nexit 1\n"
+	if err := os.WriteFile(fakeScript, []byte(scriptContent), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", filepath.Dir(fakeScript)+":"+origPath)
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/fake-bus")
+
+	store, err := newNativeSystemStore("system", SystemStoreConfig{Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = store.Get(context.Background(), credential.Ref{StoreID: "system", ItemID: "k"})
+	if errors.Is(err, credential.ErrCredentialNotFound) {
+		t.Fatalf("expected ErrCredentialStoreUnavailable on DBus failure, but got ErrCredentialNotFound: %v", err)
+	}
+	if !errors.Is(err, credential.ErrCredentialStoreUnavailable) {
+		t.Fatalf("expected ErrCredentialStoreUnavailable, got: %v", err)
+	}
+}
+
+func TestInternalSystemHelperProtocolValidation(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name       string
+		action     string
+		input      string
+		wantSubstr string
+	}{
+		{
+			name:       "invalid protocol version",
+			action:     "get",
+			input:      `{"protocolVersion": 99, "storeID": "s", "itemID": "k"}`,
+			wantSubstr: "unsupported protocol version",
+		},
+		{
+			name:       "multiple JSON responses",
+			action:     "get",
+			input:      `{"protocolVersion": 1, "storeID": "s", "itemID": "k"}{"protocolVersion": 1}`,
+			wantSubstr: "unexpected multiple JSON objects",
+		},
+		{
+			name:       "empty ref store ID",
+			action:     "get",
+			input:      `{"protocolVersion": 1, "storeID": "", "itemID": "k"}`,
+			wantSubstr: "storeID and itemID cannot be empty",
+		},
+		{
+			name:       "invalid store action empty secret",
+			action:     "store",
+			input:      `{"protocolVersion": 1, "storeID": "s", "itemID": "k", "secret": ""}`,
+			wantSubstr: "secret is empty",
+		},
+		{
+			name:       "invalid store action invalid base64",
+			action:     "store",
+			input:      `{"protocolVersion": 1, "storeID": "s", "itemID": "k", "secret": "not-valid-base64!@#"}`,
+			wantSubstr: "invalid base64 secret",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command(exe, tc.action)
+			cmd.Env = append(os.Environ(), internalHelperEnvVar+"=1")
+			cmd.Stdin = strings.NewReader(tc.input)
+			out, runErr := cmd.Output()
+			if runErr == nil {
+				t.Fatalf("expected helper process to exit non-zero on validation failure")
+			}
+			var resp Response
+			if err := json.Unmarshal(out, &resp); err != nil {
+				t.Fatalf("failed to parse helper json response: %v (raw: %s)", err, string(out))
+			}
+			if resp.Code != "unavailable" {
+				t.Fatalf("expected code 'unavailable', got %q", resp.Code)
+			}
+			if !strings.Contains(resp.Message, tc.wantSubstr) {
+				t.Fatalf("expected message to contain %q, got %q", tc.wantSubstr, resp.Message)
+			}
+		})
+	}
 }

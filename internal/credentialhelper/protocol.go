@@ -91,7 +91,7 @@ func MapErrorCode(code, message string) error {
 	case "read-only":
 		baseErr = credential.ErrCredentialStoreReadOnly
 	default:
-		baseErr = fmt.Errorf("credential helper error (%s)", code)
+		baseErr = fmt.Errorf("%w: credential helper returned unrecognized error code", credential.ErrCredentialStoreUnavailable)
 	}
 
 	trimmedMsg := strings.TrimSpace(message)

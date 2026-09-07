@@ -9,6 +9,7 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/charmbracelet/x/conpty v0.2.0
 	github.com/chzyer/readline v1.5.1
+	github.com/ebitengine/purego v0.11.0
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f
 	github.com/kevinburke/ssh_config v1.6.0
 	github.com/modelcontextprotocol/go-sdk v1.7.0
