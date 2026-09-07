@@ -4,6 +4,7 @@ package credentialhelper
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"unsafe"
 
@@ -48,14 +49,98 @@ func newNativeSystemStore(storeID string, cfg SystemStoreConfig) (credential.Sto
 		return nil, fmt.Errorf("resolve controlled system helper: %w", err)
 	}
 
+	mergedEnv := append([]string{}, env...)
+	mergedEnv = append(mergedEnv, cfg.Env...)
+
 	opts := ProcessOptions{
 		Command: cmdPath,
 		Args:    args,
-		Env:     env,
+		Env:     mergedEnv,
 		Timeout: cfg.Timeout,
 	}
 
 	return NewHelperStore(storeID, opts, cfg.ReadOnly)
+}
+
+func windowsActionGet(targetPtr *uint16) (*Response, int) {
+	var credPtr *windowsCredential
+	r1, _, lastErr := procCredReadW.Call(
+		uintptr(unsafe.Pointer(targetPtr)),
+		uintptr(credTypeGeneric),
+		0,
+		uintptr(unsafe.Pointer(&credPtr)),
+	)
+	if r1 == 0 {
+		var errno windows.Errno
+		if errors.As(lastErr, &errno) && errno == errorNotFound {
+			return &Response{Code: "not-found", Message: "credential not found"}, 1
+		}
+		if errors.As(lastErr, &errno) && (errno == errorAccessDenied || errno == errorNoSuchLogonSession) {
+			return &Response{Code: "denied", Message: "access denied"}, 1
+		}
+		return &Response{Code: "unavailable", Message: lastErr.Error()}, 1
+	}
+	defer func() {
+		_, _, _ = procCredFree.Call(uintptr(unsafe.Pointer(credPtr)))
+	}()
+
+	if credPtr.CredentialBlobSize == 0 || credPtr.CredentialBlob == nil {
+		return &Response{Code: "not-found", Message: "credential empty"}, 1
+	}
+
+	blob := unsafe.Slice(credPtr.CredentialBlob, credPtr.CredentialBlobSize)
+	return &Response{
+		Secret: base64.StdEncoding.EncodeToString(blob),
+	}, 0
+}
+
+func windowsActionStore(targetPtr *uint16, rawSecret string) (*Response, int) {
+	if rawSecret == "" {
+		return &Response{Code: "unavailable", Message: "secret is empty"}, 1
+	}
+	secretBytes, err := base64.StdEncoding.DecodeString(rawSecret)
+	if err != nil {
+		return &Response{Code: "unavailable", Message: "invalid base64 secret"}, 1
+	}
+
+	var blobPtr *byte
+	if len(secretBytes) > 0 {
+		blobPtr = &secretBytes[0]
+	}
+
+	cred := windowsCredential{
+		Flags:              0,
+		Type:               credTypeGeneric,
+		TargetName:         targetPtr,
+		Persist:            credPersistLocalMachine,
+		CredentialBlobSize: uint32(len(secretBytes)),
+		CredentialBlob:     blobPtr,
+	}
+
+	r1, _, lastErr := procCredWriteW.Call(
+		uintptr(unsafe.Pointer(&cred)),
+		0,
+	)
+	if r1 == 0 {
+		return &Response{Code: "unavailable", Message: lastErr.Error()}, 1
+	}
+	return &Response{}, 0
+}
+
+func windowsActionErase(targetPtr *uint16) (*Response, int) {
+	r1, _, lastErr := procCredDeleteW.Call(
+		uintptr(unsafe.Pointer(targetPtr)),
+		uintptr(credTypeGeneric),
+		0,
+	)
+	if r1 == 0 {
+		var errno windows.Errno
+		if errors.As(lastErr, &errno) && errno == errorNotFound {
+			return &Response{Code: "not-found", Message: "credential not found"}, 1
+		}
+		return &Response{Code: "unavailable", Message: lastErr.Error()}, 1
+	}
+	return &Response{}, 0
 }
 
 func handlePlatformSystemHelper(action Action, req *Request) (*Response, int) {
@@ -71,79 +156,11 @@ func handlePlatformSystemHelper(action Action, req *Request) (*Response, int) {
 
 	switch action {
 	case ActionGet:
-		var credPtr *windowsCredential
-		r1, _, lastErr := procCredReadW.Call(
-			uintptr(unsafe.Pointer(targetPtr)),
-			uintptr(credTypeGeneric),
-			0,
-			uintptr(unsafe.Pointer(&credPtr)),
-		)
-		if r1 == 0 {
-			if errno, ok := lastErr.(windows.Errno); ok && errno == errorNotFound {
-				return &Response{Code: "not-found", Message: "credential not found"}, 1
-			}
-			if errno, ok := lastErr.(windows.Errno); ok && (errno == errorAccessDenied || errno == errorNoSuchLogonSession) {
-				return &Response{Code: "denied", Message: "access denied"}, 1
-			}
-			return &Response{Code: "unavailable", Message: lastErr.Error()}, 1
-		}
-		defer procCredFree.Call(uintptr(unsafe.Pointer(credPtr)))
-
-		if credPtr.CredentialBlobSize == 0 || credPtr.CredentialBlob == nil {
-			return &Response{Code: "not-found", Message: "credential empty"}, 1
-		}
-
-		blob := unsafe.Slice(credPtr.CredentialBlob, credPtr.CredentialBlobSize)
-		return &Response{
-			Secret: base64.StdEncoding.EncodeToString(blob),
-		}, 0
-
+		return windowsActionGet(targetPtr)
 	case ActionStore:
-		if req.Secret == "" {
-			return &Response{Code: "unavailable", Message: "secret is empty"}, 1
-		}
-		secretBytes, err := base64.StdEncoding.DecodeString(req.Secret)
-		if err != nil {
-			return &Response{Code: "unavailable", Message: "invalid base64 secret"}, 1
-		}
-
-		var blobPtr *byte
-		if len(secretBytes) > 0 {
-			blobPtr = &secretBytes[0]
-		}
-
-		cred := windowsCredential{
-			Flags:              0,
-			Type:               credTypeGeneric,
-			TargetName:         targetPtr,
-			Persist:            credPersistLocalMachine,
-			CredentialBlobSize: uint32(len(secretBytes)),
-			CredentialBlob:     blobPtr,
-		}
-
-		r1, _, lastErr := procCredWriteW.Call(
-			uintptr(unsafe.Pointer(&cred)),
-			0,
-		)
-		if r1 == 0 {
-			return &Response{Code: "unavailable", Message: lastErr.Error()}, 1
-		}
-		return &Response{}, 0
-
+		return windowsActionStore(targetPtr, req.Secret)
 	case ActionErase:
-		r1, _, lastErr := procCredDeleteW.Call(
-			uintptr(unsafe.Pointer(targetPtr)),
-			uintptr(credTypeGeneric),
-			0,
-		)
-		if r1 == 0 {
-			if errno, ok := lastErr.(windows.Errno); ok && errno == errorNotFound {
-				return &Response{Code: "not-found", Message: "credential not found"}, 1
-			}
-			return &Response{Code: "unavailable", Message: lastErr.Error()}, 1
-		}
-		return &Response{}, 0
-
+		return windowsActionErase(targetPtr)
 	default:
 		return &Response{Code: "unavailable", Message: "unsupported action"}, 1
 	}

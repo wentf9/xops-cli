@@ -10,11 +10,15 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"time"
 
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
-const internalHelperEnvVar = "XOPS_CREDENTIAL_HELPER_SYSTEM"
+const (
+	internalHelperEnvVar  = "XOPS_CREDENTIAL_HELPER_SYSTEM"
+	testBlockSignalEnvVar = "XOPS_TEST_SYSTEM_HELPER_BLOCK_SIGNAL"
+)
 
 func init() {
 	if os.Getenv(internalHelperEnvVar) == "1" {
@@ -75,6 +79,11 @@ func runInternalSystemHelper() {
 		if _, err := base64.StdEncoding.DecodeString(req.Secret); err != nil {
 			sendHelperErrorAndExit("unavailable", fmt.Sprintf("invalid base64 secret in request: %v", err))
 		}
+	}
+
+	if blockSignal := os.Getenv(testBlockSignalEnvVar); blockSignal != "" {
+		_ = os.WriteFile(blockSignal, []byte("ready\n"), 0600)
+		time.Sleep(10 * time.Second)
 	}
 
 	resp, code := handlePlatformSystemHelper(action, &req)

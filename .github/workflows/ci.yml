@@ -5,6 +5,13 @@ on:
     branches: [master]
   pull_request:
     branches: [master]
+  workflow_dispatch:
+    inputs:
+      debug_enabled:
+        type: boolean
+        description: 'Run with tmate SSH session on failure'
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -71,6 +78,34 @@ jobs:
       - name: Run Windows ConPTY integration test
         if: ${{ !cancelled() }}
         run: go test -race -tags=integration -run '^TestWindowsLineEditorConPTY$' -count=1 ./cmd/sftpshell
+
+  macos-test:
+    name: macOS Build and Test
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Build all packages
+        run: go build ./...
+
+      - name: Run macOS tests
+        run: go test -race -shuffle=on -count=1 ./...
+
+      - name: Run Native Platform Verification Script
+        run: ./scripts/verify_native_platform.sh
+
+      - name: Setup tmate debug session on failure
+        if: ${{ failure() && github.event_name == 'workflow_dispatch' && inputs.debug_enabled }}
+        uses: mxschmitt/action-tmate@v3
 
   lint:
     name: Lint

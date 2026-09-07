@@ -31,10 +31,12 @@ func newNativeSystemStore(storeID string, cfg SystemStoreConfig) (credential.Sto
 	toolPath, err := exec.LookPath("secret-tool")
 	if err != nil {
 		if cmdPath, args, env, helperErr := resolveControlledSystemHelper(); helperErr == nil {
+			mergedEnv := append([]string{}, env...)
+			mergedEnv = append(mergedEnv, cfg.Env...)
 			opts := ProcessOptions{
 				Command: cmdPath,
 				Args:    args,
-				Env:     env,
+				Env:     mergedEnv,
 				Timeout: cfg.Timeout,
 			}
 			return NewHelperStore(storeID, opts, cfg.ReadOnly)

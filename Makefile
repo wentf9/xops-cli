@@ -168,6 +168,17 @@ help:
 	@echo "  ci              在本地复现 GitHub Actions CI 检查"
 	@echo "  bench           运行 ConcurrentMap 基准测试"
 	@echo "  stress          运行 ConcurrentMap 压力测试"
+	@echo ""
+	@echo "macOS Virtualization (Docker-OSX):"
+	@echo "  macos-vm-check  检查本地 KVM 与虚拟化环境"
+	@echo "  macos-vm-up     启动本地 macOS 虚拟机容器"
+	@echo "  macos-vm-down   停止本地 macOS 虚拟机容器"
+	@echo "  macos-vm-status 查看虚拟机容器状态"
+	@echo "  macos-vm-wait   等待虚拟机客体 SSH 服务就绪"
+	@echo "  macos-vm-ssh    SSH 连接到虚拟机终端"
+	@echo "  macos-vm-setup-go 在客体安装/检查 Go 1.26+ 工具链"
+	@echo "  macos-vm-sync   同步代码至虚拟机 ~/xops-cli"
+	@echo "  macos-vm-test   在虚拟机中执行原生验收测试"
 
 # ==============================================================================
 # 安装扩展 (Extensions/Skills)
@@ -177,3 +188,36 @@ install-skill:
 	@mkdir -p ~/.gemini/skills/xops-agent
 	@cp -r skills/xops-agent/* ~/.gemini/skills/xops-agent/
 	@echo "Skill installed successfully!"
+
+# ==============================================================================
+# 本地 macOS 虚拟机验证 (Docker-OSX / KVM)
+# ==============================================================================
+.PHONY: macos-vm-check macos-vm-up macos-vm-down macos-vm-status macos-vm-wait macos-vm-ssh macos-vm-setup-go macos-vm-sync macos-vm-test
+
+macos-vm-check:
+	@./deploy/macos-vm/manage.sh check
+
+macos-vm-up:
+	@./deploy/macos-vm/manage.sh up
+
+macos-vm-down:
+	@./deploy/macos-vm/manage.sh down
+
+macos-vm-status:
+	@./deploy/macos-vm/manage.sh status
+
+macos-vm-wait:
+	@./deploy/macos-vm/manage.sh wait-ready
+
+macos-vm-ssh:
+	@./deploy/macos-vm/manage.sh ssh
+
+macos-vm-setup-go:
+	@./deploy/macos-vm/manage.sh setup-go
+
+macos-vm-sync:
+	@./deploy/macos-vm/manage.sh sync
+
+macos-vm-test:
+	@./deploy/macos-vm/manage.sh test
+

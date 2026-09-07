@@ -10,3 +10,4 @@ coverage.out
 CLAUDE.md
 .claude/
 ROADMAP.md
+deploy/macos-vm/id_ed25519*

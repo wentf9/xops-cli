@@ -1,0 +1,39 @@
+services:
+  macos:
+    image: ${DOCKER_OSX_IMAGE:-sickcodes/docker-osx:latest}
+    container_name: xops-macos-vm
+    restart: "no"
+    stdin_open: true
+    tty: true
+    devices:
+      - /dev/kvm:/dev/kvm
+    cap_add:
+      - SYS_ADMIN
+      - NET_ADMIN
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 10022 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 60s
+    ports:
+      # SSH port: 50922 on host -> 10022 on container -> 22 on macOS
+      - "${MACOS_SSH_PORT:-50922}:10022"
+      # VNC port: 5999 on host -> 5901 on container (QEMU built-in VNC server: :1)
+      - "${MACOS_VNC_PORT:-5999}:5901"
+    environment:
+      # Allocated RAM in GB (minimum 6, recommended 8+)
+      - RAM=${MACOS_RAM:-8}
+      # Allocated CPU cores / threads
+      - SMP=${MACOS_SMP:-4}
+      - CORES=${MACOS_CORES:-4}
+      # Display configuration (default to QEMU internal VNC on :1, override as needed)
+      - EXTRA=${MACOS_EXTRA:--vnc 0.0.0.0:1}
+      - GENERATE_UNIQUE=true
+    volumes:
+      # Persistent macOS VM disk storage
+      - macos_disk_data:/home/arch/OSX-KVM/
+
+volumes:
+  macos_disk_data:
+    name: xops_macos_disk_data

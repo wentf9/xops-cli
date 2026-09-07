@@ -8,5 +8,9 @@
 - [凭据持久化详细设计](design/credential-persistence.md)
 - [凭据持久化实施计划](plans/credential-persistence-implementation.md)
 
+## 跨平台验证
+
+- [macOS 兼容性验证指南](macos-verification.md)
+
 当前文档描述的是待实施方案，不代表相关代码已经完成。开始实现前，应先确认 ADR
 中的决策门，并保持结构重构、行为变更和兼容性清理分别提交。

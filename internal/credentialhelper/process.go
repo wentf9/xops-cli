@@ -71,7 +71,7 @@ func Run(ctx context.Context, opts ProcessOptions, action Action, req *Request) 
 	if err != nil {
 		if execCtx.Err() != nil {
 			if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
-				return nil, fmt.Errorf("%w: credential helper timed out after %v", credential.ErrCredentialStoreUnavailable, timeout)
+				return nil, fmt.Errorf("%w: credential helper timed out after %v: %w", credential.ErrCredentialStoreUnavailable, timeout, execCtx.Err())
 			}
 			return nil, fmt.Errorf("credential helper canceled: %w", execCtx.Err())
 		}
@@ -107,7 +107,7 @@ func Run(ctx context.Context, opts ProcessOptions, action Action, req *Request) 
 	if execCtx.Err() != nil {
 		_ = session.KillTree()
 		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
-			return nil, fmt.Errorf("%w: credential helper timed out after %v", credential.ErrCredentialStoreUnavailable, timeout)
+			return nil, fmt.Errorf("%w: credential helper timed out after %v: %w", credential.ErrCredentialStoreUnavailable, timeout, execCtx.Err())
 		}
 		return nil, fmt.Errorf("credential helper canceled: %w", execCtx.Err())
 	}

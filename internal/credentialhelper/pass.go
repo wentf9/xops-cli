@@ -235,7 +235,7 @@ func (p *PassStore) executePassCmd(ctx context.Context, args []string, stdinData
 	if err != nil {
 		if execCtx.Err() != nil {
 			if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
-				return nil, "", fmt.Errorf("%w: pass command timed out after %v", credential.ErrCredentialStoreUnavailable, timeout)
+				return nil, "", fmt.Errorf("%w: pass command timed out after %v: %w", credential.ErrCredentialStoreUnavailable, timeout, execCtx.Err())
 			}
 			return nil, "", fmt.Errorf("pass command canceled: %w", execCtx.Err())
 		}
@@ -270,7 +270,7 @@ func (p *PassStore) executePassCmd(ctx context.Context, args []string, stdinData
 	if execCtx.Err() != nil {
 		_ = session.KillTree()
 		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
-			return nil, sanitizedStderr, fmt.Errorf("%w: pass command timed out after %v", credential.ErrCredentialStoreUnavailable, timeout)
+			return nil, sanitizedStderr, fmt.Errorf("%w: pass command timed out after %v: %w", credential.ErrCredentialStoreUnavailable, timeout, execCtx.Err())
 		}
 		return nil, sanitizedStderr, fmt.Errorf("pass command canceled: %w", execCtx.Err())
 	}
