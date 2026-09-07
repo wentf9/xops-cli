@@ -74,9 +74,9 @@ func SanitizeDiagnostic(raw string, sensitive ...string) string {
 }
 
 // MapErrorCode 将 helper 协议返回的错误代码映射为系统标准的凭据哨兵错误。
-func MapErrorCode(code, msg string) error {
+// 优先返回受控哨兵错误分类，避免将 helper 返回的任意非受控诊断文本拼接入错误导致已知请求机密泄漏。
+func MapErrorCode(code, message string) error {
 	trimmedCode := strings.ToLower(strings.TrimSpace(code))
-	sanitizedMsg := SanitizeDiagnostic(msg)
 
 	var baseErr error
 	switch trimmedCode {
@@ -91,14 +91,12 @@ func MapErrorCode(code, msg string) error {
 	case "read-only":
 		baseErr = credential.ErrCredentialStoreReadOnly
 	default:
-		if sanitizedMsg != "" {
-			return fmt.Errorf("credential helper error (%s): %s", code, sanitizedMsg)
-		}
-		return fmt.Errorf("credential helper error (%s)", code)
+		baseErr = fmt.Errorf("credential helper error (%s)", code)
 	}
 
-	if sanitizedMsg != "" {
-		return fmt.Errorf("%w: %s", baseErr, sanitizedMsg)
+	trimmedMsg := strings.TrimSpace(message)
+	if trimmedMsg != "" {
+		return fmt.Errorf("%w: %s", baseErr, trimmedMsg)
 	}
 	return baseErr
 }

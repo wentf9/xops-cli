@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/wentf9/xops-cli/pkg/credential"
@@ -241,18 +242,22 @@ func (p *PassStore) executePassCmd(ctx context.Context, args []string, stdinData
 		_ = session.Close()
 	}()
 
-	done := make(chan struct{})
-	defer close(done)
+	cancelDone := make(chan struct{})
+	var cancelWg sync.WaitGroup
+	cancelWg.Add(1)
 
 	go func() {
+		defer cancelWg.Done()
 		select {
 		case <-execCtx.Done():
 			_ = session.KillTree()
-		case <-done:
+		case <-cancelDone:
 		}
 	}()
 
 	runErr := cmd.Wait()
+	close(cancelDone)
+	cancelWg.Wait()
 
 	sanitizedStderr := SanitizeDiagnostic(stderrLimiter.buf.String(), string(stdinData))
 
@@ -273,7 +278,7 @@ func (p *PassStore) executePassCmd(ctx context.Context, args []string, stdinData
 		return nil, sanitizedStderr, fmt.Errorf("%w: pass executable not found: %s", credential.ErrCredentialStoreUnavailable, p.command)
 	}
 
-	if runErr != nil && !errors.Is(runErr, exec.ErrWaitDelay) {
+	if runErr != nil {
 		if sanitizedStderr != "" {
 			return nil, sanitizedStderr, fmt.Errorf("%w: %s", runErr, sanitizedStderr)
 		}

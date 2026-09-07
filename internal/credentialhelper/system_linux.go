@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/wentf9/xops-cli/pkg/credential"
@@ -29,6 +30,15 @@ func newNativeSystemStore(storeID string, cfg SystemStoreConfig) (credential.Sto
 
 	toolPath, err := exec.LookPath("secret-tool")
 	if err != nil {
+		if cmdPath, args, env, helperErr := resolveControlledSystemHelper(); helperErr == nil {
+			opts := ProcessOptions{
+				Command: cmdPath,
+				Args:    args,
+				Env:     env,
+				Timeout: cfg.Timeout,
+			}
+			return NewHelperStore(storeID, opts, cfg.ReadOnly)
+		}
 		return nil, fmt.Errorf("%w: secret-tool executable not found in PATH and no external helper configured", credential.ErrCredentialStoreUnavailable)
 	}
 
@@ -52,7 +62,14 @@ func (s *linuxNativeStore) Get(ctx context.Context, ref credential.Ref) (credent
 	args := []string{"lookup", "xops-store", ref.StoreID, "xops-item", ref.ItemID}
 	stdout, stderr, err := s.execCmd(ctx, args, nil)
 	if err != nil {
-		if strings.Contains(strings.ToLower(stderr), "locked") {
+		if errors.Is(err, context.Canceled) {
+			return credential.Secret{}, context.Canceled
+		}
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, credential.ErrCredentialStoreUnavailable) || errors.Is(err, credential.ErrCredentialStoreLocked) {
+			return credential.Secret{}, err
+		}
+		stderrLower := strings.ToLower(stderr)
+		if strings.Contains(stderrLower, "locked") {
 			return credential.Secret{}, fmt.Errorf("%w: %s", credential.ErrCredentialStoreLocked, stderr)
 		}
 		return credential.Secret{}, credential.ErrCredentialNotFound
@@ -73,6 +90,12 @@ func (s *linuxNativeStore) Put(ctx context.Context, ref credential.Ref, secret c
 	args := []string{"store", "--label=" + label, "xops-store", ref.StoreID, "xops-item", ref.ItemID}
 	_, stderr, err := s.execCmd(ctx, args, secret.Value)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return context.Canceled
+		}
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, credential.ErrCredentialStoreUnavailable) || errors.Is(err, credential.ErrCredentialStoreLocked) {
+			return err
+		}
 		if strings.Contains(strings.ToLower(stderr), "locked") {
 			return fmt.Errorf("%w: %s", credential.ErrCredentialStoreLocked, stderr)
 		}
@@ -88,6 +111,12 @@ func (s *linuxNativeStore) Delete(ctx context.Context, ref credential.Ref) error
 	args := []string{"clear", "xops-store", ref.StoreID, "xops-item", ref.ItemID}
 	_, _, err := s.execCmd(ctx, args, nil)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return context.Canceled
+		}
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, credential.ErrCredentialStoreUnavailable) || errors.Is(err, credential.ErrCredentialStoreLocked) {
+			return err
+		}
 		return fmt.Errorf("secret-tool clear failed: %w", err)
 	}
 	return nil
@@ -128,29 +157,46 @@ func (s *linuxNativeStore) execCmd(ctx context.Context, args []string, stdinData
 		_ = session.Close()
 	}()
 
-	done := make(chan struct{})
-	defer close(done)
+	cancelDone := make(chan struct{})
+	var cancelWg sync.WaitGroup
+	cancelWg.Add(1)
 
 	go func() {
+		defer cancelWg.Done()
 		select {
 		case <-execCtx.Done():
 			_ = session.KillTree()
-		case <-done:
+		case <-cancelDone:
 		}
 	}()
 
 	runErr := cmd.Wait()
+	close(cancelDone)
+	cancelWg.Wait()
+
 	sanitizedStderr := SanitizeDiagnostic(stderrLimiter.buf.String(), string(stdinData))
 
 	if execCtx.Err() != nil {
 		_ = session.KillTree()
+		if errors.Is(execCtx.Err(), context.Canceled) {
+			return nil, sanitizedStderr, context.Canceled
+		}
 		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
 			return nil, sanitizedStderr, fmt.Errorf("%w: secret-tool timed out after %v", credential.ErrCredentialStoreUnavailable, timeout)
 		}
-		return nil, sanitizedStderr, fmt.Errorf("secret-tool canceled: %w", execCtx.Err())
+		return nil, sanitizedStderr, execCtx.Err()
 	}
 
-	if runErr != nil && !errors.Is(runErr, exec.ErrWaitDelay) {
+	// 严格检查 stdout 输出上限
+	if stdoutLimiter.total > MaxResponseBytes {
+		return nil, sanitizedStderr, fmt.Errorf("%w: secret-tool output exceeded maximum limit of %d bytes", credential.ErrCredentialStoreUnavailable, MaxResponseBytes)
+	}
+
+	if runErr != nil && isNotFoundErr(runErr) {
+		return nil, sanitizedStderr, fmt.Errorf("%w: %w", credential.ErrCredentialStoreUnavailable, runErr)
+	}
+
+	if runErr != nil {
 		return nil, sanitizedStderr, runErr
 	}
 
@@ -163,4 +209,8 @@ func checkPlatformSystemAvailability() error {
 		return fmt.Errorf("%w: system credential store unavailable in headless environment without D-Bus session", credential.ErrCredentialStoreUnavailable)
 	}
 	return nil
+}
+
+func handlePlatformSystemHelper(action Action, req *Request) (*Response, int) {
+	return &Response{Code: "unavailable", Message: "native helper protocol on linux not implemented directly, uses secret-tool"}, 1
 }

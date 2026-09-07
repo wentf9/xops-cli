@@ -3,10 +3,8 @@
 package credentialhelper
 
 import (
-	"context"
+	"encoding/base64"
 	"fmt"
-	"sync"
-	"time"
 	"unsafe"
 
 	"github.com/wentf9/xops-cli/pkg/credential"
@@ -44,128 +42,111 @@ type windowsCredential struct {
 	UserName           *uint16
 }
 
-type windowsNativeStore struct {
-	storeID  string
-	readOnly bool
-	timeout  time.Duration
-	mu       sync.RWMutex
-}
-
 func newNativeSystemStore(storeID string, cfg SystemStoreConfig) (credential.Store, error) {
-	return &windowsNativeStore{
-		storeID:  storeID,
-		readOnly: cfg.ReadOnly,
-		timeout:  cfg.Timeout,
-	}, nil
-}
-
-func (w *windowsNativeStore) StoreID() string {
-	return w.storeID
-}
-
-func (w *windowsNativeStore) IsReadOnly() bool {
-	return w.readOnly
-}
-
-func (w *windowsNativeStore) targetName(ref credential.Ref) string {
-	return fmt.Sprintf("xops:%s/%s", ref.StoreID, ref.ItemID)
-}
-
-func (w *windowsNativeStore) Get(ctx context.Context, ref credential.Ref) (credential.Secret, error) {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-
-	targetPtr, err := windows.UTF16PtrFromString(w.targetName(ref))
+	cmdPath, args, env, err := resolveControlledSystemHelper()
 	if err != nil {
-		return credential.Secret{}, fmt.Errorf("invalid target name: %w", err)
+		return nil, fmt.Errorf("resolve controlled system helper: %w", err)
 	}
 
-	var credPtr *windowsCredential
-	r1, _, lastErr := procCredReadW.Call(
-		uintptr(unsafe.Pointer(targetPtr)),
-		uintptr(credTypeGeneric),
-		0,
-		uintptr(unsafe.Pointer(&credPtr)),
-	)
-	if r1 == 0 {
-		if errno, ok := lastErr.(windows.Errno); ok && errno == errorNotFound {
-			return credential.Secret{}, credential.ErrCredentialNotFound
-		}
-		if errno, ok := lastErr.(windows.Errno); ok && (errno == errorAccessDenied || errno == errorNoSuchLogonSession) {
-			return credential.Secret{}, credential.ErrCredentialAccessDenied
-		}
-		return credential.Secret{}, fmt.Errorf("CredReadW failed: %w", lastErr)
-	}
-	defer procCredFree.Call(uintptr(unsafe.Pointer(credPtr)))
-
-	if credPtr.CredentialBlobSize == 0 || credPtr.CredentialBlob == nil {
-		return credential.Secret{}, credential.ErrCredentialNotFound
+	opts := ProcessOptions{
+		Command: cmdPath,
+		Args:    args,
+		Env:     env,
+		Timeout: cfg.Timeout,
 	}
 
-	blob := unsafe.Slice(credPtr.CredentialBlob, credPtr.CredentialBlobSize)
-	return credential.NewSecret(blob), nil
+	return NewHelperStore(storeID, opts, cfg.ReadOnly)
 }
 
-func (w *windowsNativeStore) Put(ctx context.Context, ref credential.Ref, secret credential.Secret) error {
-	if w.readOnly {
-		return credential.ErrCredentialStoreReadOnly
+func handlePlatformSystemHelper(action Action, req *Request) (*Response, int) {
+	if req == nil {
+		return &Response{Code: "unavailable", Message: "nil request"}, 1
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
 
-	targetPtr, err := windows.UTF16PtrFromString(w.targetName(ref))
+	targetName := fmt.Sprintf("xops:%s/%s", req.StoreID, req.ItemID)
+	targetPtr, err := windows.UTF16PtrFromString(targetName)
 	if err != nil {
-		return fmt.Errorf("invalid target name: %w", err)
+		return &Response{Code: "unavailable", Message: err.Error()}, 1
 	}
 
-	var blobPtr *byte
-	if len(secret.Value) > 0 {
-		blobPtr = &secret.Value[0]
-	}
-
-	cred := windowsCredential{
-		Flags:              0,
-		Type:               credTypeGeneric,
-		TargetName:         targetPtr,
-		Persist:            credPersistLocalMachine,
-		CredentialBlobSize: uint32(len(secret.Value)),
-		CredentialBlob:     blobPtr,
-	}
-
-	r1, _, lastErr := procCredWriteW.Call(
-		uintptr(unsafe.Pointer(&cred)),
-		0,
-	)
-	if r1 == 0 {
-		return fmt.Errorf("CredWriteW failed: %w", lastErr)
-	}
-	return nil
-}
-
-func (w *windowsNativeStore) Delete(ctx context.Context, ref credential.Ref) error {
-	if w.readOnly {
-		return credential.ErrCredentialStoreReadOnly
-	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	targetPtr, err := windows.UTF16PtrFromString(w.targetName(ref))
-	if err != nil {
-		return fmt.Errorf("invalid target name: %w", err)
-	}
-
-	r1, _, lastErr := procCredDeleteW.Call(
-		uintptr(unsafe.Pointer(targetPtr)),
-		uintptr(credTypeGeneric),
-		0,
-	)
-	if r1 == 0 {
-		if errno, ok := lastErr.(windows.Errno); ok && errno == errorNotFound {
-			return credential.ErrCredentialNotFound
+	switch action {
+	case ActionGet:
+		var credPtr *windowsCredential
+		r1, _, lastErr := procCredReadW.Call(
+			uintptr(unsafe.Pointer(targetPtr)),
+			uintptr(credTypeGeneric),
+			0,
+			uintptr(unsafe.Pointer(&credPtr)),
+		)
+		if r1 == 0 {
+			if errno, ok := lastErr.(windows.Errno); ok && errno == errorNotFound {
+				return &Response{Code: "not-found", Message: "credential not found"}, 1
+			}
+			if errno, ok := lastErr.(windows.Errno); ok && (errno == errorAccessDenied || errno == errorNoSuchLogonSession) {
+				return &Response{Code: "denied", Message: "access denied"}, 1
+			}
+			return &Response{Code: "unavailable", Message: lastErr.Error()}, 1
 		}
-		return fmt.Errorf("CredDeleteW failed: %w", lastErr)
+		defer procCredFree.Call(uintptr(unsafe.Pointer(credPtr)))
+
+		if credPtr.CredentialBlobSize == 0 || credPtr.CredentialBlob == nil {
+			return &Response{Code: "not-found", Message: "credential empty"}, 1
+		}
+
+		blob := unsafe.Slice(credPtr.CredentialBlob, credPtr.CredentialBlobSize)
+		return &Response{
+			Secret: base64.StdEncoding.EncodeToString(blob),
+		}, 0
+
+	case ActionStore:
+		if req.Secret == "" {
+			return &Response{Code: "unavailable", Message: "secret is empty"}, 1
+		}
+		secretBytes, err := base64.StdEncoding.DecodeString(req.Secret)
+		if err != nil {
+			return &Response{Code: "unavailable", Message: "invalid base64 secret"}, 1
+		}
+
+		var blobPtr *byte
+		if len(secretBytes) > 0 {
+			blobPtr = &secretBytes[0]
+		}
+
+		cred := windowsCredential{
+			Flags:              0,
+			Type:               credTypeGeneric,
+			TargetName:         targetPtr,
+			Persist:            credPersistLocalMachine,
+			CredentialBlobSize: uint32(len(secretBytes)),
+			CredentialBlob:     blobPtr,
+		}
+
+		r1, _, lastErr := procCredWriteW.Call(
+			uintptr(unsafe.Pointer(&cred)),
+			0,
+		)
+		if r1 == 0 {
+			return &Response{Code: "unavailable", Message: lastErr.Error()}, 1
+		}
+		return &Response{}, 0
+
+	case ActionErase:
+		r1, _, lastErr := procCredDeleteW.Call(
+			uintptr(unsafe.Pointer(targetPtr)),
+			uintptr(credTypeGeneric),
+			0,
+		)
+		if r1 == 0 {
+			if errno, ok := lastErr.(windows.Errno); ok && errno == errorNotFound {
+				return &Response{Code: "not-found", Message: "credential not found"}, 1
+			}
+			return &Response{Code: "unavailable", Message: lastErr.Error()}, 1
+		}
+		return &Response{}, 0
+
+	default:
+		return &Response{Code: "unavailable", Message: "unsupported action"}, 1
 	}
-	return nil
 }
 
 func checkPlatformSystemAvailability() error {

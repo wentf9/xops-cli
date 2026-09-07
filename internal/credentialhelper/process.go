@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/wentf9/xops-cli/pkg/credential"
@@ -77,18 +78,22 @@ func Run(ctx context.Context, opts ProcessOptions, action Action, req *Request) 
 		_ = session.Close()
 	}()
 
-	done := make(chan struct{})
-	defer close(done)
+	cancelDone := make(chan struct{})
+	var cancelWg sync.WaitGroup
+	cancelWg.Add(1)
 
 	go func() {
+		defer cancelWg.Done()
 		select {
 		case <-execCtx.Done():
 			_ = session.KillTree()
-		case <-done:
+		case <-cancelDone:
 		}
 	}()
 
 	runErr := cmd.Wait()
+	close(cancelDone)
+	cancelWg.Wait()
 
 	sensitive := collectSensitiveTokens(req)
 	sanitizedStderr := SanitizeDiagnostic(stderrLimiter.buf.String(), sensitive...)
@@ -109,7 +114,7 @@ func Run(ctx context.Context, opts ProcessOptions, action Action, req *Request) 
 		return nil, fmt.Errorf("%w: credential helper executable not found: %s", credential.ErrCredentialStoreUnavailable, opts.Command)
 	}
 
-	return parseOutputResponse(stdoutLimiter, runErr, sanitizedStderr)
+	return parseOutputResponse(stdoutLimiter, runErr, sanitizedStderr, sensitive)
 }
 
 func buildProcessCmd(execCtx context.Context, opts ProcessOptions, action Action, req *Request, timeout time.Duration) (*exec.Cmd, *limitedBuffer, *limitedBuffer, error) {
@@ -153,13 +158,16 @@ func collectSensitiveTokens(req *Request) []string {
 	return sensitive
 }
 
-func parseOutputResponse(stdoutLimiter *limitedBuffer, runErr error, sanitizedStderr string) (*Response, error) {
+func parseOutputResponse(stdoutLimiter *limitedBuffer, runErr error, sanitizedStderr string, sensitive []string) (*Response, error) {
 	if stdoutLimiter.buf.Len() > 0 {
 		resp, parseErr := DecodeResponse(&stdoutLimiter.buf)
+		if resp != nil && strings.TrimSpace(resp.Message) != "" {
+			resp.Message = SanitizeDiagnostic(resp.Message, sensitive...)
+		}
+		if resp != nil && strings.TrimSpace(resp.Code) != "" {
+			return resp, MapErrorCode(resp.Code, resp.Message)
+		}
 		if parseErr != nil {
-			if resp != nil && strings.TrimSpace(resp.Code) != "" {
-				return resp, parseErr
-			}
 			if runErr != nil {
 				if sanitizedStderr != "" {
 					return nil, fmt.Errorf("credential helper failed (%w): %s", runErr, sanitizedStderr)
@@ -169,10 +177,7 @@ func parseOutputResponse(stdoutLimiter *limitedBuffer, runErr error, sanitizedSt
 			return nil, parseErr
 		}
 
-		if runErr != nil && !errors.Is(runErr, exec.ErrWaitDelay) {
-			if strings.TrimSpace(resp.Code) != "" {
-				return resp, MapErrorCode(resp.Code, resp.Message)
-			}
+		if runErr != nil {
 			if sanitizedStderr != "" {
 				return nil, fmt.Errorf("credential helper failed with exit code (%w): %s", runErr, sanitizedStderr)
 			}

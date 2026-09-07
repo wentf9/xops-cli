@@ -172,3 +172,15 @@ func TestSystemStoreNativeStoreUnavailableInHeadless(t *testing.T) {
 		t.Fatalf("expected ErrCredentialStoreUnavailable, got: %v", err)
 	}
 }
+
+func TestControlledSystemHelperResolution(t *testing.T) {
+	cmdPath, args, env, err := resolveControlledSystemHelper()
+	if err != nil {
+		t.Fatalf("resolveControlledSystemHelper failed: %v", err)
+	}
+	if cmdPath == "" {
+		t.Fatal("expected non-empty helper command path")
+	}
+	_ = args
+	_ = env
+}

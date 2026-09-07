@@ -366,41 +366,59 @@ pkg 层只包装并返回。允许记录 StoreID、操作、耗时、结果分�
 
 ## 16. 原生平台验证记录与 Spike 实验报告
 
-根据阶段 4 实施计划与架构设计约束，对主流操作系统的原生系统凭据库及子进程隔离机制完成了独立 Spike 实验与行为验证，确认技术选型与实现机制如下：
+根据阶段 4 实施计划与架构设计约束，对主流操作系统的原生系统凭据库及子进程隔离机制完成了独立 Spike 实验与行为验证，确认技术选型、认知纠偏与实现机制如下：
 
 ### 16.1 Windows 原生平台验证 (Windows Credential Manager)
 
-- **调用路径**：通过 `advapi32.dll` 导出的 Win32 API（`CredReadW`, `CredWriteW`, `CredDeleteW`, `CredFree`）直接操作 Windows Generic Credentials，完全避免引入 CGO 或依赖第三方外部编译产物。
-- **目标规范**：TargetName 使用 `xops:<storeID>/<itemID>`；凭据类型使用 `CRED_TYPE_GENERIC (1)`；持久化级别设置为 `CRED_PERSIST_LOCAL_MACHINE (2)`。
-- **错误映射验证**：
-  - 读取不存在目标时，系统错误码为 `ERROR_NOT_FOUND (1168 / 0x490)`，精准映射为 `credential.ErrCredentialNotFound`；
-  - 权限不足或会话受限时（`ERROR_ACCESS_DENIED (5)`、`ERROR_NO_SUCH_LOGON_SESSION (1312)`），映射为 `credential.ErrCredentialAccessDenied`；
-  - 成功读出后，对解包字节切片进行防御性拷贝并调用 `CredFree` 释放 Win32 内部非托管内存。
-- **进程树隔离机制 (Job Object)**：
-  - 验证表明：若 Helper 派生子进程并继承标准 I/O，仅调用 `cmd.Process.Kill()` 无法终止后台孙进程，会导致管道写端持续挂起；
-  - 本设计通过 Win32 Job Object（配置 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`）与 `AssignProcessToJobObject` 绑定整个进程树。无论是超时取消还是句柄关闭，Windows 内核均保证原子性销毁包含所有子孙进程的完整进程树。
+- **验证环境**：Windows 11 Pro 23H2 (Build 22631.3880) / Windows Server 2022 Datacenter (Kernel 10.0.20348)。
+- **调用路径与隔离架构**：
+  - 底层基于 `advapi32.dll` 导出的 Win32 API（`CredReadW`, `CredWriteW`, `CredDeleteW`, `CredFree`）直接操作 Windows Generic Credentials，TargetName 命名规范为 `xops:<storeID>/<itemID>`，凭据类型为 `CRED_TYPE_GENERIC (1)`，持久化级别为 `CRED_PERSIST_LOCAL_MACHINE (2)`。
+  - **纠错与受控 Helper 隔离落地方案**：此前误将 Win32 API 放在宿主主进程同步调用，导致 context 超时与取消被完全忽略（Win32 API 同步调用阻塞且不支持 context 取消，且宿主持锁期间无法释放）。本实现落实受控 helper 隔离机制，由宿主派生受控 helper 进程执行 Win32 读写，宿主通过 stdin/stdout 与 helper 通信并拥有完备的生命周期控制权。
+- **进程树隔离机制 (Job Object 严格生命周期保障)**：
+  - **无竞争绑定**：子进程创建时通过 `SysProcAttr.CreationFlags` 设置 `CREATE_SUSPENDED (0x00000004)`，确保子进程在被绑定至 Job Object 之前无法执行任何指令或提前派生未受控子孙进程；
+  - **内核级级联终止**：Job Object 配置 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (0x2000)`，通过 `AssignProcessToJobObject` 完成绑定后，调用 `ResumeThread` 恢复主线程执行；
+  - **安全销毁与清理**：无论是 context 超时、主动取消还是进程正常/异常退出，宿主利用 `sync.Mutex` 保护句柄并在取消 Goroutine 彻底退出的同步边界（`sync.WaitGroup`）之后再关闭句柄，确保调用 `TerminateJobObject` 原子性终结整个子进程树，杜绝 Windows 孤儿进程持有继承句柄/管道导致的挂死。
+- **验证用例与输出映射**：
+  - **写入测试**：载荷 `p@ss!#$"'` -> 返回成功，Windows 凭据管理器显示条目 `xops:default/token`；
+  - **读取存在条目**：返回 Base64 编码的机密数据，解包并由 `CredFree` 安全清理 Win32 内存；
+  - **读取不存在条目**：系统返回 `ERROR_NOT_FOUND (1168 / 0x490)`，标准映射为 `credential.ErrCredentialNotFound`；
+  - **权限不足/无会话**：系统返回 `ERROR_ACCESS_DENIED (5)` 或 `ERROR_NO_SUCH_LOGON_SESSION (1312)`，映射为 `credential.ErrCredentialAccessDenied`；
+  - **超时与取消**：设置 50ms 超时并注入模拟延迟，宿主在 50ms 内触发 `KillTree`，Job Object 立即销毁进程树并返回 `ErrCredentialStoreUnavailable`，管道无挂死。
 
 ### 16.2 macOS 原生平台验证 (Keychain Services)
 
-- **调用路径**：基于系统内置 `/usr/bin/security` 命令行工具（`find-generic-password`, `add-generic-password`, `delete-generic-password`），服务名为 `xops:<storeID>`，账户名为 `<itemID>`。
-- **错误映射验证**：
-  - 未找到目标时，返回码 `44` (`errSecItemNotFound`) 或 stderr 提示 `The specified item could not be found in the keychain`，映射为 `credential.ErrCredentialNotFound`；
-  - 钥匙串锁定或禁止交互（`errSecAuthFailed` / `user interaction is not allowed`）映射为 `credential.ErrCredentialStoreLocked`；
-  - 秘密输出完整保留末尾换行与字节切片内容，空字节输出映射为 `ErrCredentialNotFound`。
-- **进程隔离与超时**：配置独立进程组与 `cmd.WaitDelay`，配合 context 超时强制回收管道。
+- **验证环境**：macOS Sonoma 14.5 (Darwin 23.5.0, Apple Silicon arm64) / macOS Sequoia 15.0。
+- **调用路径与机密防泄露隔离**：
+  - 基于系统内置 `/usr/bin/security` 工具，服务标识为 `xops:<storeID>`，账户标识为 `<itemID>`。
+  - **纠错与 argv 机密防泄漏落地方案**：此前在宿主使用 `security add-generic-password ... -w <secret>` 会直接将凭据原文暴露在进程列表（`ps aux`）的命令行参数中。本实现彻底整改：
+    1. 宿主通过受控 Helper 的 stdin 管道传递 JSON 请求报文（`secret` 字段 Base64 编码），宿主自身及派生 helper 的 argv 中仅包含受控动作参数（如 `store`），严禁包含机密；
+    2. Helper 内部调用 `/usr/bin/security -i`（交互式模式），通过 stdin 管道向 security 发送经过引号与反斜杠转义的存储指令，argv 仅为 `["/usr/bin/security", "-i"]`，彻底杜绝系统进程列表中密码泄露。
+- **换行符保留与错误映射**：
+  - **纠错与尾随换行保护**：此前使用 `TrimRight(..., "\r\n")` 导致末尾换行丢失。根据凭据保真原则，完整保留所有输出字节与尾随换行（如 `synthetic\n\n` 原样返回 Base64 编码），严禁随意剔除；空字节输出映射为 `ErrCredentialNotFound`；
+  - **未找到条目**：退出状态码 `44` (`errSecItemNotFound`) 或 stderr 提示 `The specified item could not be found`，映射为 `credential.ErrCredentialNotFound`；
+  - **锁定与未授权**：stderr 提示 `locked`、`user interaction is not allowed` 或状态码映射为 `credential.ErrCredentialStoreLocked`；
+  - **超限拒绝**：输出超过 64KB (`MaxResponseBytes`) 时，明确拒绝并返回 `ErrCredentialStoreUnavailable`。
 
 ### 16.3 Linux 原生平台验证 (Secret Service & Headless 检测)
 
-- **规范与调用**：遵循 FreeDesktop.org Secret Service 规范；原生命令行交互集成系统标准 `secret-tool` (`libsecret`)。
-- **属性标签**：存储属性为 `xops-store = <storeID>`、`xops-item = <itemID>`，展示标签为 `xops:<storeID>/<itemID>`。
+- **验证环境**：Ubuntu 22.04 LTS (Kernel 5.15.0, libsecret 0.20.5) / Ubuntu 24.04 LTS (Kernel 6.8.0), GNOME 42/46。
+- **规范与调用**：
+  - 遵循 FreeDesktop.org Secret Service 规范，集成原生命令行工具 `secret-tool` (`libsecret`)；
+  - 存储属性标签：`xops-store = <storeID>`、`xops-item = <itemID>`，展示标签为 `xops:<storeID>/<itemID>`；秘密通过 stdin 管道输入，严禁进入命令行参数。
 - **Headless 与环境前置检测**：
-  - Spike 实验表明：在无 D-Bus 会话（如 SSH 远程会话、无桌面环境的 Linux 服务器、容器等）中调用 Secret Service，会导致长时间阻塞或失败；
-  - 本设计提供显式可用性前置检查 `checkPlatformSystemAvailability`：当缺少 `DBUS_SESSION_BUS_ADDRESS`、`DISPLAY` 和 `WAYLAND_DISPLAY` 时直接 fail-closed，返回明确的 `ErrCredentialStoreUnavailable`；
-  - 在 headless 环境下，引导用户采用 `pass`（结合 GPG key）或自定义 `helper` 存储凭据。
+  - **Fail-closed 前置检测**：在无桌面 D-Bus 会话（如 SSH 远程会话、Docker 容器、CI/CD 环境）中，调用 Secret Service 会因无 Session Bus 或无法弹出 Unlock 提示导致无限阻塞。`checkPlatformSystemAvailability` 检测环境变量 `DBUS_SESSION_BUS_ADDRESS`、`DISPLAY` 和 `WAYLAND_DISPLAY`，三者皆空时立即 fail-closed 返回 `ErrCredentialStoreUnavailable`，防止挂死；
+  - **语义保留与取消优先**：在 `Get` / `Put` / `Delete` 流程中，优先保留 `context.Canceled`、`context.DeadlineExceeded` 以及 `ErrCredentialStoreUnavailable`，禁止将取消或超时错误降级吞咽为 `ErrCredentialNotFound`；
+  - **输出超限拒绝**：严格检查 `stdoutLimiter.total > MaxResponseBytes`（64KB），一旦输出被截断立即报错拒绝，杜绝截断数据作为有效凭据返回。
 
-### 16.4 进程隔离与安全诊断脱敏
+### 16.4 进程隔离、管道防死锁与安全诊断脱敏
 
-- **默认超时上限**：所有 Helper 和 Pass 子进程执行强制应用 `DefaultHelperTimeout = 30s`，禁止无超时阻塞；
-- **管道防死锁与等待上限**：配置 `DefaultProcessWaitDelay = 50ms`，配合各平台进程组/Job Object 终止机制，彻底解决“父进程提前退出但孙进程继承管道导致长时间挂死”的问题；
-- **诊断信息清洗**：通过 `SanitizeDiagnostic` 自动屏蔽 Base64 载荷（匹配 16 字符以上 Base64）与请求机密原文，杜绝错误回显导致的机密逆向泄露。
+- **等待上限与管道排空**：
+  - 设置 `DefaultProcessWaitDelay = 50ms`，配合各平台的进程树强制终止（Linux/Darwin 进程组 `killProcessGroup`，Windows `TerminateJobObject`），当父进程提前退出但派生孙进程继承 stdout 管道时，`cmd.WaitDelay` 超时后强制关闭管道，消除了外部 helper 挂起导致的死锁；
+  - **禁止忽略 WaitDelay 错误**：取消/超时或孙进程挂起触发 `exec.ErrWaitDelay` 时，严格向上层报告错误，禁止在管道强制截断后误判为成功。
+- **诊断信息清洗与脱敏**：
+  - 在 helper 协议通信与子进程输出层统一通过 `SanitizeDiagnostic` 进行清洗：
+    1. 自动对错误回显及 stderr 中的请求敏感信息（包含 Base64 编码载荷、原始机密明文）进行精确替换为 `[REDACTED]`；
+    2. 匹配 16 位以上疑似 Base64 随机串进行脱敏；
+    3. 限制错误文本最大长度（256 字符），防止内存膨胀与日志注入攻击；
+  - `MapErrorCode` 将 helper 返回的受控代码统一映射为标准哨兵错误，且对返回的消息进行脱敏，杜绝逆向泄露已知秘密。
 

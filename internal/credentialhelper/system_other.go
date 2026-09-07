@@ -16,3 +16,7 @@ func newNativeSystemStore(storeID string, cfg SystemStoreConfig) (credential.Sto
 func checkPlatformSystemAvailability() error {
 	return fmt.Errorf("%w: system credential store is not supported on %s", credential.ErrCredentialStoreUnavailable, runtime.GOOS)
 }
+
+func handlePlatformSystemHelper(action Action, req *Request) (*Response, int) {
+	return &Response{Code: "unavailable", Message: "unsupported platform"}, 1
+}

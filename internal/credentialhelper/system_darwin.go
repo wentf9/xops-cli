@@ -3,163 +3,117 @@
 package credentialhelper
 
 import (
-	"bytes"
-	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
-	"time"
 
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
-type darwinNativeStore struct {
-	storeID  string
-	toolPath string
-	timeout  time.Duration
-	readOnly bool
-}
-
 func newNativeSystemStore(storeID string, cfg SystemStoreConfig) (credential.Store, error) {
-	toolPath, err := exec.LookPath("/usr/bin/security")
+	cmdPath, args, env, err := resolveControlledSystemHelper()
 	if err != nil {
-		toolPath, err = exec.LookPath("security")
+		return nil, fmt.Errorf("resolve controlled system helper: %w", err)
+	}
+
+	opts := ProcessOptions{
+		Command: cmdPath,
+		Args:    args,
+		Env:     env,
+		Timeout: cfg.Timeout,
+	}
+
+	return NewHelperStore(storeID, opts, cfg.ReadOnly)
+}
+
+func handlePlatformSystemHelper(action Action, req *Request) (*Response, int) {
+	if req == nil {
+		return &Response{Code: "unavailable", Message: "nil request"}, 1
+	}
+
+	service := fmt.Sprintf("xops:%s", req.StoreID)
+	account := req.ItemID
+
+	switch action {
+	case ActionGet:
+		cmd := exec.Command("/usr/bin/security", "find-generic-password", "-s", service, "-a", account, "-w")
+		stdout, err := cmd.Output()
 		if err != nil {
-			return nil, fmt.Errorf("%w: macOS security command not found", credential.ErrCredentialStoreUnavailable)
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) && exitErr.ExitCode() == 44 {
+				return &Response{Code: "not-found", Message: "credential not found"}, 1
+			}
+			return &Response{Code: "locked", Message: "keychain locked or denied"}, 1
 		}
-	}
 
-	return &darwinNativeStore{
-		storeID:  storeID,
-		toolPath: toolPath,
-		timeout:  cfg.Timeout,
-		readOnly: cfg.ReadOnly,
-	}, nil
+		if len(stdout) > MaxResponseBytes {
+			return &Response{Code: "unavailable", Message: "keychain output exceeded limit"}, 1
+		}
+
+		// 严禁 TrimRight，完整保留末尾换行和所有字节
+		if len(stdout) == 0 {
+			return &Response{Code: "not-found", Message: "empty secret"}, 1
+		}
+
+		return &Response{
+			Secret: base64.StdEncoding.EncodeToString(stdout),
+		}, 0
+
+	case ActionStore:
+		if req.Secret == "" {
+			return &Response{Code: "unavailable", Message: "secret is empty"}, 1
+		}
+		secretBytes, err := base64.StdEncoding.DecodeString(req.Secret)
+		if err != nil {
+			return &Response{Code: "unavailable", Message: "invalid base64 secret"}, 1
+		}
+
+		// 秘密严禁进入命令行参数：通过 security 交互模式 (-i) 的 stdin 传递指令，避免 ps 泄露
+		cmd := exec.Command("/usr/bin/security", "-i")
+		var stdinBuf strings.Builder
+		stdinBuf.WriteString("add-generic-password -s ")
+		stdinBuf.WriteString(escapeArg(service))
+		stdinBuf.WriteString(" -a ")
+		stdinBuf.WriteString(escapeArg(account))
+		stdinBuf.WriteString(" -w ")
+		stdinBuf.WriteString(escapeArg(string(secretBytes)))
+		stdinBuf.WriteString(" -U\n")
+		cmd.Stdin = strings.NewReader(stdinBuf.String())
+
+		if err := cmd.Run(); err != nil {
+			return &Response{Code: "locked", Message: "failed to save to keychain"}, 1
+		}
+		return &Response{}, 0
+
+	case ActionErase:
+		cmd := exec.Command("/usr/bin/security", "delete-generic-password", "-s", service, "-a", account)
+		if err := cmd.Run(); err != nil {
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) && exitErr.ExitCode() == 44 {
+				return &Response{Code: "not-found", Message: "credential not found"}, 1
+			}
+			return &Response{Code: "unavailable", Message: "failed to delete from keychain"}, 1
+		}
+		return &Response{}, 0
+
+	default:
+		return &Response{Code: "unavailable", Message: "unsupported action"}, 1
+	}
 }
 
-func (s *darwinNativeStore) StoreID() string {
-	return s.storeID
-}
-
-func (s *darwinNativeStore) IsReadOnly() bool {
-	return s.readOnly
-}
-
-func (s *darwinNativeStore) Get(ctx context.Context, ref credential.Ref) (credential.Secret, error) {
-	service := fmt.Sprintf("xops:%s", ref.StoreID)
-	account := ref.ItemID
-	args := []string{"find-generic-password", "-s", service, "-a", account, "-w"}
-	stdout, stderr, err := s.execCmd(ctx, args)
-	if err != nil {
-		stderrLower := strings.ToLower(stderr)
-		if strings.Contains(stderrLower, "could not be found") || strings.Contains(stderrLower, "44") {
-			return credential.Secret{}, credential.ErrCredentialNotFound
+func escapeArg(s string) string {
+	var buf strings.Builder
+	buf.WriteByte('"')
+	for _, r := range s {
+		if r == '"' || r == '\\' {
+			buf.WriteByte('\\')
 		}
-		if strings.Contains(stderrLower, "locked") || strings.Contains(stderrLower, "user interaction is not allowed") {
-			return credential.Secret{}, credential.ErrCredentialStoreLocked
-		}
-		return credential.Secret{}, fmt.Errorf("keychain find failed: %w", err)
+		buf.WriteRune(r)
 	}
-
-	secVal := bytes.TrimRight(stdout, "\r\n")
-	if len(secVal) == 0 {
-		return credential.Secret{}, credential.ErrCredentialNotFound
-	}
-	return credential.NewSecret(secVal), nil
-}
-
-func (s *darwinNativeStore) Put(ctx context.Context, ref credential.Ref, secret credential.Secret) error {
-	if s.readOnly {
-		return credential.ErrCredentialStoreReadOnly
-	}
-	service := fmt.Sprintf("xops:%s", ref.StoreID)
-	account := ref.ItemID
-	args := []string{"add-generic-password", "-s", service, "-a", account, "-w", string(secret.Value), "-U"}
-	_, stderr, err := s.execCmd(ctx, args)
-	if err != nil {
-		stderrLower := strings.ToLower(stderr)
-		if strings.Contains(stderrLower, "locked") {
-			return fmt.Errorf("%w: %s", credential.ErrCredentialStoreLocked, stderr)
-		}
-		return fmt.Errorf("keychain add failed: %w", err)
-	}
-	return nil
-}
-
-func (s *darwinNativeStore) Delete(ctx context.Context, ref credential.Ref) error {
-	if s.readOnly {
-		return credential.ErrCredentialStoreReadOnly
-	}
-	service := fmt.Sprintf("xops:%s", ref.StoreID)
-	account := ref.ItemID
-	args := []string{"delete-generic-password", "-s", service, "-a", account}
-	_, stderr, err := s.execCmd(ctx, args)
-	if err != nil {
-		stderrLower := strings.ToLower(stderr)
-		if strings.Contains(stderrLower, "could not be found") || strings.Contains(stderrLower, "44") {
-			return credential.ErrCredentialNotFound
-		}
-		return fmt.Errorf("keychain delete failed: %w", err)
-	}
-	return nil
-}
-
-func (s *darwinNativeStore) execCmd(ctx context.Context, args []string) ([]byte, string, error) {
-	timeout := s.timeout
-	if timeout <= 0 {
-		timeout = DefaultHelperTimeout
-	}
-	execCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(execCtx, s.toolPath, args...)
-	waitDelay := DefaultProcessWaitDelay
-	if timeout < waitDelay {
-		waitDelay = timeout
-	}
-	cmd.WaitDelay = waitDelay
-
-	stdoutLimiter := &limitedBuffer{limit: MaxResponseBytes}
-	stderrLimiter := &limitedBuffer{limit: MaxStderrBytes}
-	cmd.Stdout = stdoutLimiter
-	cmd.Stderr = stderrLimiter
-
-	session, err := startProcessSession(cmd)
-	if err != nil {
-		return nil, "", err
-	}
-	defer func() {
-		_ = session.Close()
-	}()
-
-	done := make(chan struct{})
-	defer close(done)
-
-	go func() {
-		select {
-		case <-execCtx.Done():
-			_ = session.KillTree()
-		case <-done:
-		}
-	}()
-
-	runErr := cmd.Wait()
-	sanitizedStderr := SanitizeDiagnostic(stderrLimiter.buf.String())
-
-	if execCtx.Err() != nil {
-		_ = session.KillTree()
-		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
-			return nil, sanitizedStderr, fmt.Errorf("%w: security command timed out after %v", credential.ErrCredentialStoreUnavailable, timeout)
-		}
-		return nil, sanitizedStderr, fmt.Errorf("security command canceled: %w", execCtx.Err())
-	}
-
-	if runErr != nil && !errors.Is(runErr, exec.ErrWaitDelay) {
-		return nil, sanitizedStderr, runErr
-	}
-
-	return stdoutLimiter.buf.Bytes(), sanitizedStderr, nil
+	buf.WriteByte('"')
+	return buf.String()
 }
 
 func checkPlatformSystemAvailability() error {
