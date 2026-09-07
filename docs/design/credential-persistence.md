@@ -400,7 +400,10 @@ pkg 层只包装并返回。允许记录 StoreID、操作、耗时、结果分�
 - **错误代码映射与保真度**：
   - 目标未找到：`errSecItemNotFound (-25300)` 映射为 `credential.ErrCredentialNotFound`；
   - 密钥库锁定或拒绝交互：`errSecAuthFailed (-25293)` / `errSecInteractionNotAllowed (-25308)` 映射为 `credential.ErrCredentialStoreLocked`；
-  - 成功返回：原样字节完整 Base64 编码，无任何 `TrimRight` 截断。
+  - 成功返回：原样字节完整 Base64 编码，无任何 `TrimRight` 截断；
+  - **并发写入冲突与重试错误传播 (无吞咽保证)**：
+    - 当并发写入发生冲突返回 `errSecDuplicateItem (-25299)` 时，受控 Helper 触发重试查询并更新；
+    - 严禁忽略重试阶段的错误：若重试查找条目返回 `errSecAuthFailed` / `errSecInteractionNotAllowed` 或修改数据返回锁定/拒绝，必须向上传播 `Code: "locked"`；若发生其他底层异常，必须向上传播 `Code: "unavailable"`，彻底杜绝“旧值未覆盖或已锁定却向调用方报告成功”的严重缺陷。
 
 ### 16.3 Linux 原生平台验证 (Secret Service & Headless 检测)
 
@@ -437,8 +440,18 @@ pkg 层只包装并返回。允许记录 StoreID、操作、耗时、结果分�
 
 ### 16.5 自动化回归脚本与执行证据
 
-仓库已提供自动化跨平台验证脚本 [`scripts/verify_native_platform.sh`](file:///home/wuyue/xops-cli/scripts/verify_native_platform.sh) 及对应的单元回归测试用例：
-- `TestInternalSystemHelperProtocolValidation`：覆盖非法主版本、多余 JSON、空 Ref、非法 Base64 的失败关闭行为；
-- `TestSystemStoreLinuxDBusFailureNotReportedAsNotFound`：覆盖 D-Bus 连接故障映射为 `ErrCredentialStoreUnavailable` 的分类准确性；
-- `TestUnknownErrorCodeDoesNotExposeKnownSecret`：覆盖未知 Code 字段不回显敏感机密的脱敏机制。
+仓库已提供自动化跨平台验证脚本 [`scripts/verify_native_platform.sh`](file:///home/wuyue/xops-cli/scripts/verify_native_platform.sh) 及各平台原生集成与回归测试：
+- **严格验收断言**：脚本会根据当前 OS 运行真实二进制读写及 Go 平台测试，非目标平台明确标记为 `[SKIP]`，拒绝任何无条件标记 PASS 的虚假通过；
+- **macOS 测试集**（`system_darwin_test.go`）：
+  - `TestDarwinNativeHelper_DuplicateConflictRetryFindLocked`：验证并发写入重试查询被锁定报错并传播；
+  - `TestDarwinNativeHelper_DuplicateConflictRetryModDenied`：验证并发写入重试修改被拒绝报错并传播；
+  - `TestDarwinNativeHelper_DuplicateConflictRetryModError`：验证并发写入重试底层系统错误传播；
+  - `TestDarwinNativeHelper_DuplicateConflictRetrySuccess`：验证重试成功更新路径；
+- **Windows 测试集**（`system_windows_test.go`）：
+  - `TestWindowsNativeHelper_DirectRoundtrip`：验证原生 `handlePlatformSystemHelper` 读写/擦除；
+  - `TestWindowsNativeSystemStore_Integration`：验证原生 `newNativeSystemStore` 端到端往返与二进制保真度；
+- **通用及 Linux 测试集**（`system_test.go`）：
+  - `TestInternalSystemHelperProtocolValidation`：覆盖非法主版本、多余 JSON、空 Ref、非法 Base64 的失败关闭行为；
+  - `TestSystemStoreLinuxDBusFailureNotReportedAsNotFound`：覆盖 D-Bus 连接故障映射为 `ErrCredentialStoreUnavailable` 的分类准确性；
+  - `TestUnknownErrorCodeDoesNotExposeKnownSecret`：覆盖未知 Code 字段不回显敏感机密的脱敏机制。
 

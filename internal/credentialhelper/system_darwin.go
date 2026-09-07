@@ -235,11 +235,37 @@ func handlePlatformSystemHelper(action Action, req *Request) (*Response, int) {
 			defer cfRelease(newItemRef)
 		}
 		if addStatus == errSecDuplicateItem {
-			// 若并发写入导致冲突，再次更新
+			// 若并发写入导致冲突，再次重试查询并更新，严禁忽略错误
 			var retryItemRef uintptr
-			if secKeychainFindGenericPassword(0, uint32(len(serviceBytes)), servicePtr, uint32(len(accountBytes)), accountPtr, nil, nil, &retryItemRef) == errSecSuccess && retryItemRef != 0 {
-				defer cfRelease(retryItemRef)
-				_ = secKeychainItemModifyAttributesAndData(retryItemRef, 0, uint32(len(secretBytes)), secretPtr)
+			retryFindStatus := secKeychainFindGenericPassword(
+				0,
+				uint32(len(serviceBytes)),
+				servicePtr,
+				uint32(len(accountBytes)),
+				accountPtr,
+				nil,
+				nil,
+				&retryItemRef,
+			)
+			if retryFindStatus == errSecAuthFailed || retryFindStatus == errSecInteractionNotAllowed {
+				return &Response{Code: "locked", Message: "keychain locked or query denied during retry"}, 1
+			}
+			if retryFindStatus != errSecSuccess || retryItemRef == 0 {
+				return &Response{Code: "unavailable", Message: fmt.Sprintf("failed to query existing item after duplicate conflict: %d", retryFindStatus)}, 1
+			}
+			defer cfRelease(retryItemRef)
+
+			retryModStatus := secKeychainItemModifyAttributesAndData(
+				retryItemRef,
+				0,
+				uint32(len(secretBytes)),
+				secretPtr,
+			)
+			if retryModStatus == errSecAuthFailed || retryModStatus == errSecInteractionNotAllowed {
+				return &Response{Code: "locked", Message: "keychain locked or update denied during retry"}, 1
+			}
+			if retryModStatus != errSecSuccess {
+				return &Response{Code: "unavailable", Message: fmt.Sprintf("SecKeychainItemModifyAttributesAndData failed during retry: %d", retryModStatus)}, 1
 			}
 			return &Response{}, 0
 		}
