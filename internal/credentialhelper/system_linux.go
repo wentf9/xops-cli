@@ -162,8 +162,14 @@ func (s *linuxNativeStore) execCmd(ctx context.Context, args []string, stdinData
 	cmd.Stdout = stdoutLimiter
 	cmd.Stderr = stderrLimiter
 
-	session, err := startProcessSession(cmd)
+	session, err := startProcessSession(execCtx, cmd)
 	if err != nil {
+		if execCtx.Err() != nil {
+			if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
+				return nil, "", fmt.Errorf("%w: system helper timed out after %v", credential.ErrCredentialStoreUnavailable, timeout)
+			}
+			return nil, "", fmt.Errorf("system helper canceled: %w", execCtx.Err())
+		}
 		if isNotFoundErr(err) {
 			return nil, "", fmt.Errorf("%w: %w", credential.ErrCredentialStoreUnavailable, err)
 		}

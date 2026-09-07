@@ -67,8 +67,14 @@ func Run(ctx context.Context, opts ProcessOptions, action Action, req *Request) 
 		return nil, err
 	}
 
-	session, err := startProcessSession(cmd)
+	session, err := startProcessSession(execCtx, cmd)
 	if err != nil {
+		if execCtx.Err() != nil {
+			if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
+				return nil, fmt.Errorf("%w: credential helper timed out after %v", credential.ErrCredentialStoreUnavailable, timeout)
+			}
+			return nil, fmt.Errorf("credential helper canceled: %w", execCtx.Err())
+		}
 		if isNotFoundErr(err) {
 			return nil, fmt.Errorf("%w: credential helper executable not found: %s", credential.ErrCredentialStoreUnavailable, opts.Command)
 		}

@@ -231,8 +231,14 @@ func (p *PassStore) executePassCmd(ctx context.Context, args []string, stdinData
 	cmd.Stdout = stdoutLimiter
 	cmd.Stderr = stderrLimiter
 
-	session, err := startProcessSession(cmd)
+	session, err := startProcessSession(execCtx, cmd)
 	if err != nil {
+		if execCtx.Err() != nil {
+			if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
+				return nil, "", fmt.Errorf("%w: pass command timed out after %v", credential.ErrCredentialStoreUnavailable, timeout)
+			}
+			return nil, "", fmt.Errorf("pass command canceled: %w", execCtx.Err())
+		}
 		if isNotFoundErr(err) {
 			return nil, "", fmt.Errorf("%w: pass executable not found: %s", credential.ErrCredentialStoreUnavailable, p.command)
 		}

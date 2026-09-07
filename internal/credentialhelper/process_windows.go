@@ -3,6 +3,7 @@
 package credentialhelper
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"sync"
@@ -20,7 +21,7 @@ type processSession struct {
 	closed bool
 }
 
-func startProcessSession(cmd *exec.Cmd) (*processSession, error) {
+func startProcessSession(ctx context.Context, cmd *exec.Cmd) (*processSession, error) {
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create job object: %w", err)
@@ -81,7 +82,7 @@ func startProcessSession(cmd *exec.Cmd) (*processSession, error) {
 	}
 
 	// 绑定完成后恢复子进程主线程执行
-	if resumeErr := resumeProcessMainThread(cmd.Process.Pid); resumeErr != nil {
+	if resumeErr := resumeProcessMainThread(ctx, cmd.Process.Pid); resumeErr != nil {
 		cleanupOnError()
 		return nil, fmt.Errorf("resume process main thread: %w", resumeErr)
 	}
@@ -92,9 +93,12 @@ func startProcessSession(cmd *exec.Cmd) (*processSession, error) {
 	}, nil
 }
 
-func resumeProcessMainThread(pid int) error {
+func resumeProcessMainThread(ctx context.Context, pid int) error {
 	deadline := time.Now().Add(1 * time.Second)
 	for {
+		if ctx != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
 		resumed, err := tryResumeProcessThreads(pid)
 		if err != nil {
 			return err
@@ -105,7 +109,15 @@ func resumeProcessMainThread(pid int) error {
 		if time.Now().After(deadline) {
 			break
 		}
-		time.Sleep(5 * time.Millisecond)
+		if ctx != nil {
+			select {
+			case <-time.After(5 * time.Millisecond):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		} else {
+			time.Sleep(5 * time.Millisecond)
+		}
 	}
 	return fmt.Errorf("main thread not found for process %d", pid)
 }

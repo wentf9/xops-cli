@@ -3,6 +3,7 @@
 package credentialhelper
 
 import (
+	"context"
 	"os/exec"
 	"syscall"
 )
@@ -12,7 +13,7 @@ type processSession struct {
 	pgid int
 }
 
-func startProcessSession(cmd *exec.Cmd) (*processSession, error) {
+func startProcessSession(_ context.Context, cmd *exec.Cmd) (*processSession, error) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
