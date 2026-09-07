@@ -258,3 +258,79 @@ func TestJournalReopenAcrossStages(t *testing.T) {
 		t.Fatalf("stage 4 remove verification failed: got %+v, err %v", pending, err)
 	}
 }
+
+func TestJournalDirectorySyncFailure(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewJournalStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mockErr := errors.New("simulated dir sync error")
+	entry := &JournalEntry{
+		ID:          "sync-fail-1",
+		Op:          OpCreate,
+		NewRef:      &Ref{StoreID: "s", ItemID: "k"},
+		BaseVersion: "base1",
+	}
+
+	// 1. RecordIntent 目录同步失败
+	store.syncDirFn = func(string) error {
+		return mockErr
+	}
+	err = store.RecordIntent(entry)
+	if !errors.Is(err, mockErr) {
+		t.Fatalf("expected simulated sync error on RecordIntent, got: %v", err)
+	}
+
+	// 恢复同步，成功写入 Intent
+	store.syncDirFn = nil
+	if err := store.RecordIntent(entry); err != nil {
+		t.Fatalf("RecordIntent failed: %v", err)
+	}
+
+	// 2. MarkCommitted 目录同步失败
+	store.syncDirFn = func(string) error {
+		return mockErr
+	}
+	err = store.MarkCommitted("sync-fail-1")
+	if !errors.Is(err, mockErr) {
+		t.Fatalf("expected simulated sync error on MarkCommitted, got: %v", err)
+	}
+
+	// 恢复同步，成功标记 Committed
+	store.syncDirFn = nil
+	if err := store.MarkCommitted("sync-fail-1"); err != nil {
+		t.Fatalf("MarkCommitted failed: %v", err)
+	}
+
+	// 3. MarkCleanup 目录同步失败
+	store.syncDirFn = func(string) error {
+		return mockErr
+	}
+	err = store.MarkCleanup("sync-fail-1")
+	if !errors.Is(err, mockErr) {
+		t.Fatalf("expected simulated sync error on MarkCleanup, got: %v", err)
+	}
+
+	// 恢复同步，成功标记 Cleanup
+	store.syncDirFn = nil
+	if err := store.MarkCleanup("sync-fail-1"); err != nil {
+		t.Fatalf("MarkCleanup failed: %v", err)
+	}
+
+	// 4. Remove 目录同步失败
+	store.syncDirFn = func(string) error {
+		return mockErr
+	}
+	err = store.Remove("sync-fail-1")
+	if !errors.Is(err, mockErr) {
+		t.Fatalf("expected simulated sync error on Remove, got: %v", err)
+	}
+
+	// 恢复同步，成功删除
+	store.syncDirFn = nil
+	if err := store.Remove("sync-fail-1"); err != nil {
+		t.Fatalf("Remove failed: %v", err)
+	}
+}

@@ -21,17 +21,26 @@ type cacheEntry struct {
 	next      *cacheEntry
 }
 
+// FetchToken 标识单次在途读取的栅栏令牌，防止过时数据回填。
+type FetchToken struct {
+	token      uint64
+	clearEpoch uint64
+}
+
 // Cache 提供有界的内存凭据缓存，采用 LRU 淘汰与惰性过期（lazy expiration）机制。
 // 本缓存不启动任何后台清理 Goroutine，确保零资源泄漏。
 type Cache struct {
-	mu          sync.Mutex
-	capacity    int
-	defaultTTL  time.Duration
-	entries     map[string]*cacheEntry
-	generations map[string]uint64
-	head        *cacheEntry // 最近使用的项
-	tail        *cacheEntry // 最久未使用的项
-	nowFunc     func() time.Time
+	mu               sync.Mutex
+	capacity         int
+	defaultTTL       time.Duration
+	entries          map[string]*cacheEntry
+	generations      map[string]uint64
+	generationKeys   []string
+	globalClearEpoch uint64
+	nextFetchToken   uint64
+	head             *cacheEntry // 最近使用的项
+	tail             *cacheEntry // 最久未使用的项
+	nowFunc          func() time.Time
 }
 
 // CacheOptions 包含初始化凭据缓存的可选参数。
@@ -58,11 +67,12 @@ func NewCache(opts CacheOptions) *Cache {
 		nowFn = time.Now
 	}
 	return &Cache{
-		capacity:    capVal,
-		defaultTTL:  ttlVal,
-		entries:     make(map[string]*cacheEntry),
-		generations: make(map[string]uint64),
-		nowFunc:     nowFn,
+		capacity:       capVal,
+		defaultTTL:     ttlVal,
+		entries:        make(map[string]*cacheEntry),
+		generations:    make(map[string]uint64),
+		generationKeys: make([]string, 0, capVal),
+		nowFunc:        nowFn,
 	}
 }
 
@@ -97,19 +107,54 @@ func (c *Cache) Get(ref Ref) (Secret, bool) {
 	return entry.secret.Clone(), true
 }
 
-// StartFetch 获取指定引用的当前版本号（generation），作为在途读取的栅栏令牌。
-func (c *Cache) StartFetch(ref Ref) uint64 {
+// StartFetch 获取指定引用的当前在途读取令牌。
+func (c *Cache) StartFetch(ref Ref) FetchToken {
 	if c == nil || c.capacity <= 0 || c.defaultTTL <= 0 {
-		return 0
+		return FetchToken{}
 	}
 	key := ref.String()
 	if key == "" {
-		return 0
+		return FetchToken{}
 	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.generations[key]
+
+	c.nextFetchToken++
+	tokenVal := c.nextFetchToken
+
+	// 限制 generations 容量不超过 cache capacity，防止未完成的在途读取无限积累
+	if len(c.generations) >= c.capacity && len(c.generationKeys) > 0 {
+		oldest := c.generationKeys[0]
+		c.generationKeys = c.generationKeys[1:]
+		delete(c.generations, oldest)
+	}
+
+	c.generations[key] = tokenVal
+	c.generationKeys = append(c.generationKeys, key)
+
+	return FetchToken{
+		token:      tokenVal,
+		clearEpoch: c.globalClearEpoch,
+	}
+}
+
+// CancelFetch 在读取底层存储失败时，主动释放在途读取令牌。
+func (c *Cache) CancelFetch(ref Ref, ft FetchToken) {
+	if c == nil || ft.token == 0 {
+		return
+	}
+	key := ref.String()
+	if key == "" {
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if cur, exists := c.generations[key]; exists && cur == ft.token {
+		delete(c.generations, key)
+	}
 }
 
 // Put 将凭据写入缓存。
@@ -125,15 +170,14 @@ func (c *Cache) Put(ref Ref, secret Secret) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// 主动 Put 会使当前世代递增，废弃在途旧 Get
-	c.generations[key]++
+	// 写入时废弃该 key 的任何在途旧读取
+	delete(c.generations, key)
 	c.putLocked(key, secret)
 }
 
-// PutIfMatch 只有当缓存条目的 generation 仍等于 expectedGen 时才写入缓存。
-// 若在读取期间发生了 Invalidate/Delete/Clear，将安全放弃回填。
-func (c *Cache) PutIfMatch(ref Ref, secret Secret, expectedGen uint64) {
-	if c == nil || c.capacity <= 0 || c.defaultTTL <= 0 {
+// PutIfMatch 只有当缓存条目的令牌完全匹配且未发生 Clear/Invalidate 时才写入缓存。
+func (c *Cache) PutIfMatch(ref Ref, secret Secret, ft FetchToken) {
+	if c == nil || c.capacity <= 0 || c.defaultTTL <= 0 || ft.token == 0 {
 		return
 	}
 	key := ref.String()
@@ -144,9 +188,19 @@ func (c *Cache) PutIfMatch(ref Ref, secret Secret, expectedGen uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.generations[key] != expectedGen {
+	// 栅栏 1：在途期间若发生过 Clear，全局代数变更，拒绝回填
+	if ft.clearEpoch != c.globalClearEpoch {
 		return
 	}
+
+	// 栅栏 2：在途期间若发生过 Invalidate/Delete/Put，活跃令牌不匹配或已清除，拒绝回填
+	curToken, exists := c.generations[key]
+	if !exists || curToken != ft.token {
+		return
+	}
+
+	// 消费令牌并执行安全回填
+	delete(c.generations, key)
 	c.putLocked(key, secret)
 }
 
@@ -179,7 +233,7 @@ func (c *Cache) putLocked(key string, secret Secret) {
 	c.entries[key] = entry
 }
 
-// Invalidate 使指定引用的缓存条目立即失效，递增其 generation 栅栏，并清零内存。
+// Invalidate 使指定引用的缓存条目立即失效，清除在途读取令牌，并清零内存。
 func (c *Cache) Invalidate(ref Ref) {
 	if c == nil {
 		return
@@ -192,13 +246,13 @@ func (c *Cache) Invalidate(ref Ref) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.generations[key]++
+	delete(c.generations, key)
 	if entry, exists := c.entries[key]; exists {
 		c.removeEntryLocked(entry)
 	}
 }
 
-// Clear 清空全部缓存条目，递增所有 generation，并对所有机密字节执行 Zero 清零。
+// Clear 清空全部缓存条目，递增全局清空代数使所有在途读取作废，回收全部活跃元数据，并对所有机密字节执行 Zero 清零。
 func (c *Cache) Clear() {
 	if c == nil {
 		return
@@ -206,9 +260,9 @@ func (c *Cache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	for k := range c.generations {
-		c.generations[k]++
-	}
+	c.globalClearEpoch++
+	c.generations = make(map[string]uint64)
+	c.generationKeys = c.generationKeys[:0]
 
 	curr := c.head
 	for curr != nil {
@@ -231,6 +285,16 @@ func (c *Cache) Len() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.entries)
+}
+
+// ActiveFetchesCount 返回当前正在跟踪的在途读取令牌数量（用于有界性测试）。
+func (c *Cache) ActiveFetchesCount() int {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.generations)
 }
 
 func (c *Cache) calculateExpiry(now time.Time, backendExp *time.Time) (time.Time, bool) {
@@ -308,7 +372,7 @@ func NewCachedSource(source Source, cache *Cache) *CachedSource {
 	}
 }
 
-// Get 优先从缓存获取凭据；未命中时在锁外调用底层存储，使用 generation 栅栏防并发回填。
+// Get 优先从缓存获取凭据；未命中时在锁外调用底层存储，使用令牌栅栏防并发回填。
 func (cs *CachedSource) Get(ctx context.Context, ref Ref) (Secret, error) {
 	if cs == nil || cs.underlying == nil {
 		return Secret{}, fmt.Errorf("cached source is not initialized")
@@ -320,19 +384,22 @@ func (cs *CachedSource) Get(ctx context.Context, ref Ref) (Secret, error) {
 		}
 	}
 
-	var fetchToken uint64
+	var ft FetchToken
 	if cs.cache != nil {
-		fetchToken = cs.cache.StartFetch(ref)
+		ft = cs.cache.StartFetch(ref)
 	}
 
 	// 必须在锁外调用底层存储 I/O
 	sec, err := cs.underlying.Get(ctx, ref)
 	if err != nil {
+		if cs.cache != nil {
+			cs.cache.CancelFetch(ref, ft)
+		}
 		return Secret{}, err
 	}
 
 	if cs.cache != nil {
-		cs.cache.PutIfMatch(ref, sec, fetchToken)
+		cs.cache.PutIfMatch(ref, sec, ft)
 	}
 
 	return sec.Clone(), nil
@@ -356,7 +423,8 @@ func NewCachedStore(store Store, cache *Cache) *CachedStore {
 }
 
 // Put 向底层存储写入凭据。
-// 写入前后均使缓存失效，绝不提前缓存输入值，确保后续写后读回校验（Get）能穿透到底层后端。
+// 无论成功还是遇到错误，在退出时都严格执行 Invalidate，防止在途并发读取将过时数据留在缓存中；
+// 同时不在 Put 内部提前回填缓存，确保随后的写后读回校验（Get）能穿透到底层后端。
 func (cs *CachedStore) Put(ctx context.Context, ref Ref, secret Secret) error {
 	if cs == nil || cs.underlyingStore == nil {
 		return fmt.Errorf("cached store is not initialized")
@@ -364,21 +432,14 @@ func (cs *CachedStore) Put(ctx context.Context, ref Ref, secret Secret) error {
 
 	if cs.cache != nil {
 		cs.cache.Invalidate(ref)
+		defer cs.cache.Invalidate(ref)
 	}
 
 	// 锁外执行底层存储写入
-	if err := cs.underlyingStore.Put(ctx, ref, secret); err != nil {
-		return err
-	}
-
-	// 写入完成后再次显式失效，强制随后的写后读回直达后端
-	if cs.cache != nil {
-		cs.cache.Invalidate(ref)
-	}
-	return nil
+	return cs.underlyingStore.Put(ctx, ref, secret)
 }
 
-// Delete 从底层存储删除凭据，并立即使缓存项失效。
+// Delete 从底层存储删除凭据，并在退出时严格保证缓存失效。
 func (cs *CachedStore) Delete(ctx context.Context, ref Ref) error {
 	if cs == nil || cs.underlyingStore == nil {
 		return fmt.Errorf("cached store is not initialized")
@@ -386,12 +447,9 @@ func (cs *CachedStore) Delete(ctx context.Context, ref Ref) error {
 
 	if cs.cache != nil {
 		cs.cache.Invalidate(ref)
+		defer cs.cache.Invalidate(ref)
 	}
 
 	// 锁外执行底层存储删除
-	err := cs.underlyingStore.Delete(ctx, ref)
-	if cs.cache != nil {
-		cs.cache.Invalidate(ref)
-	}
-	return err
+	return cs.underlyingStore.Delete(ctx, ref)
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -372,5 +373,120 @@ func TestZeroTTLDoesNotRetainSecrets(t *testing.T) {
 	defer sec.Zero()
 	if found {
 		t.Fatal("zero TTL retained secret after one year")
+	}
+}
+
+func TestClearFencesFirstInflightRead(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	backend := &dummyStore{
+		dummySource: dummySource{
+			getFn: func(ctx context.Context, _ Ref) (Secret, error) {
+				close(started)
+				select {
+				case <-release:
+					return NewSecret([]byte("synthetic")), nil
+				case <-ctx.Done():
+					return Secret{}, ctx.Err()
+				}
+			},
+		},
+	}
+	c := NewCache(CacheOptions{Capacity: 1, DefaultTTL: time.Minute})
+	cs := NewCachedSource(backend, c)
+	ref := Ref{StoreID: "s", ItemID: "first"}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		sec, err := cs.Get(ctx, ref)
+		sec.Zero()
+		done <- err
+	}()
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	c.Clear()
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	sec, found := c.Get(ref)
+	defer sec.Zero()
+	if found {
+		t.Fatal("first inflight read repopulated the cache after Clear")
+	}
+}
+
+func TestGenerationMetadataIsBounded(t *testing.T) {
+	for _, capacity := range []int{1, 0} {
+		t.Run(fmt.Sprintf("capacity_%d", capacity), func(t *testing.T) {
+			c := NewCache(CacheOptions{Capacity: capacity, DefaultTTL: time.Minute})
+			for i := range 10000 {
+				c.Invalidate(Ref{StoreID: "s", ItemID: fmt.Sprint(i)})
+			}
+			c.Clear()
+			count := reflect.ValueOf(c).Elem().FieldByName("generations").Len()
+			if count > 64 {
+				t.Fatalf("capacity=%d, entries=%d, retained generation keys=%d after Clear", capacity, c.Len(), count)
+			}
+		})
+	}
+}
+
+type failedPutStoreForTest struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (*failedPutStoreForTest) Get(context.Context, Ref) (Secret, error) {
+	return NewSecret([]byte("old-synthetic")), nil
+}
+
+func (s *failedPutStoreForTest) Put(ctx context.Context, _ Ref, _ Secret) error {
+	close(s.started)
+	select {
+	case <-s.release:
+		return ErrCredentialStoreUnavailable
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (*failedPutStoreForTest) Delete(context.Context, Ref) error {
+	return nil
+}
+
+func TestFailedPutStillInvalidatesConcurrentRead(t *testing.T) {
+	b := &failedPutStoreForTest{started: make(chan struct{}), release: make(chan struct{})}
+	c := NewCache(CacheOptions{Capacity: 1, DefaultTTL: time.Minute})
+	cs := NewCachedStore(b, c)
+	ref := Ref{StoreID: "s", ItemID: "existing"}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- cs.Put(ctx, ref, NewSecret([]byte("new-synthetic")))
+	}()
+	select {
+	case <-b.started:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	sec, err := cs.Get(ctx, ref)
+	sec.Zero()
+	close(b.release)
+	putErr := <-done
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(putErr, ErrCredentialStoreUnavailable) {
+		t.Fatal(putErr)
+	}
+	sec, found := c.Get(ref)
+	defer sec.Zero()
+	if found {
+		t.Fatal("failed Put left a concurrent read cached despite unknown write outcome")
 	}
 }

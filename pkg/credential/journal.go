@@ -105,8 +105,9 @@ func validateJournalID(id string) error {
 
 // JournalStore 管理非敏感凭据恢复日志文件的持久化与扫描。
 type JournalStore struct {
-	dir string
-	mu  sync.Mutex
+	dir       string
+	mu        sync.Mutex
+	syncDirFn func(dir string) error
 }
 
 // NewJournalStore 创建一个日志存储管理器，确保目录存在且权限为 0700。
@@ -340,6 +341,9 @@ func (s *JournalStore) atomicWriteLocked(entry *JournalEntry) error {
 }
 
 func (s *JournalStore) syncDirLocked() error {
+	if s.syncDirFn != nil {
+		return s.syncDirFn(s.dir)
+	}
 	if runtime.GOOS == "windows" {
 		return nil
 	}
