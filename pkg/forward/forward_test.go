@@ -37,6 +37,15 @@ func TestTCPForwarder_ErrorHandler(t *testing.T) {
 		t.Logf("Close failed: %v", err)
 	} // 释放端口供 Forwarder 使用
 
+	targetListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve target address failed: %v", err)
+	}
+	targetAddr := targetListener.Addr().String()
+	if err := targetListener.Close(); err != nil {
+		t.Fatalf("close reserved target address failed: %v", err)
+	}
+
 	var (
 		errMu       sync.Mutex
 		receivedErr error
@@ -53,12 +62,11 @@ func TestTCPForwarder_ErrorHandler(t *testing.T) {
 		errMu.Unlock()
 	}
 
-	targetAddr := "127.0.0.1:59999"
 	f := NewTCPForwarder(listenAddr, targetAddr,
 		WithErrorHandler(errHandler),
 	)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	runErrCh := make(chan error, 1)
@@ -66,14 +74,23 @@ func TestTCPForwarder_ErrorHandler(t *testing.T) {
 		runErrCh <- f.Run(ctx)
 	}()
 
-	time.Sleep(50 * time.Millisecond)
-
-	conn, err := net.Dial("tcp", listenAddr)
-	if err == nil {
+	var conn net.Conn
+	dialDeadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(dialDeadline) {
+		conn, err = net.DialTimeout("tcp", listenAddr, 50*time.Millisecond)
+		if err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("connect to forwarder failed: %v", err)
+	}
+	defer func() {
 		if err := conn.Close(); err != nil {
 			t.Logf("Close failed: %v", err)
 		}
-	}
+	}()
 
 	done := make(chan struct{})
 	go func() {
@@ -88,7 +105,7 @@ func TestTCPForwarder_ErrorHandler(t *testing.T) {
 		if receivedErr == nil {
 			t.Fatal("expected non-nil error reported to ErrorHandler")
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("timeout waiting for TCP ErrorHandler to be triggered")
 	}
 }

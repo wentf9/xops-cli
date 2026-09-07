@@ -902,6 +902,14 @@ func TestLocalCpWithConfirmation(t *testing.T) {
 
 func TestCopyLocal_PreservesSymbolicLinks(t *testing.T) {
 	dir := t.TempDir()
+	probeTarget := filepath.Join(dir, "probe-target.txt")
+	probeLink := filepath.Join(dir, "probe-link")
+	writeTestFile(t, probeTarget, []byte("probe"))
+	if err := os.Symlink("probe-target.txt", probeLink); err != nil {
+		t.Skipf("skipping symlink test: symlinks not supported or privilege not held: %v", err)
+	}
+	_ = os.Remove(probeLink)
+
 	target := filepath.Join(dir, "target.txt")
 	writeTestFile(t, target, []byte("target"))
 

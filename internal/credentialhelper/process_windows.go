@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -92,9 +93,27 @@ func startProcessSession(cmd *exec.Cmd) (*processSession, error) {
 }
 
 func resumeProcessMainThread(pid int) error {
+	deadline := time.Now().Add(1 * time.Second)
+	for {
+		resumed, err := tryResumeProcessThreads(pid)
+		if err != nil {
+			return err
+		}
+		if resumed {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return fmt.Errorf("main thread not found for process %d", pid)
+}
+
+func tryResumeProcessThreads(pid int) (bool, error) {
 	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
 	if err != nil {
-		return err
+		return false, fmt.Errorf("create thread snapshot: %w", err)
 	}
 	defer func() {
 		_ = windows.CloseHandle(snap)
@@ -103,23 +122,27 @@ func resumeProcessMainThread(pid int) error {
 	var te windows.ThreadEntry32
 	te.Size = uint32(unsafe.Sizeof(te))
 	if err := windows.Thread32First(snap, &te); err != nil {
-		return err
+		return false, nil
 	}
+	found := false
 	for {
 		if te.OwnerProcessID == uint32(pid) {
 			hThread, err := windows.OpenThread(windows.THREAD_SUSPEND_RESUME, false, te.ThreadID)
 			if err != nil {
-				return err
+				return false, fmt.Errorf("open thread %d: %w", te.ThreadID, err)
 			}
-			_, resumeErr := windows.ResumeThread(hThread)
+			prevCount, resumeErr := windows.ResumeThread(hThread)
 			_ = windows.CloseHandle(hThread)
-			return resumeErr
+			if resumeErr != nil && prevCount == 0xFFFFFFFF {
+				return false, fmt.Errorf("resume thread %d: %w", te.ThreadID, resumeErr)
+			}
+			found = true
 		}
 		if err := windows.Thread32Next(snap, &te); err != nil {
 			break
 		}
 	}
-	return fmt.Errorf("main thread not found for process %d", pid)
+	return found, nil
 }
 
 func (s *processSession) KillTree() error {
