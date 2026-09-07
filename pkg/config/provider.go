@@ -138,7 +138,7 @@ func (p *Provider) Resolve(nodeID string) (models.Node, models.Host, models.Iden
 		if !identityOK {
 			return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("identity ref %q for node %q: %w", node.IdentityRef, nodeID, ErrIdentityNotFound)
 		}
-		return cloneNode(node), cloneHost(host), identity, nil
+		return cloneNode(node), cloneHost(host), cloneIdentity(identity), nil
 	}
 	p.mu.RUnlock()
 
@@ -197,7 +197,7 @@ func (p *Provider) GetIdentity(nodeID string) (models.Identity, bool) {
 		return models.Identity{}, false
 	}
 	identity, ok := p.cfg.Identities.Get(node.IdentityRef)
-	return identity, ok
+	return cloneIdentity(identity), ok
 }
 
 func (p *Provider) ListNodes() map[string]models.Node {
@@ -243,7 +243,7 @@ func (p *Provider) ListIdentities() map[string]models.Identity {
 	defer p.mu.RUnlock()
 	for _, identityID := range p.cfg.Identities.Keys() {
 		if identity, ok := p.cfg.Identities.Get(identityID); ok {
-			result[identityID] = identity
+			result[identityID] = cloneIdentity(identity)
 		}
 	}
 	return result

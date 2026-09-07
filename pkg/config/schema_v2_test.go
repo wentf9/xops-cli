@@ -491,3 +491,119 @@ nodes:
 		}
 	}
 }
+
+func TestStrictStoreFields(t *testing.T) {
+	const baseYAML = `schema_version: 2
+credential:
+  default_store: s
+  stores:
+    s:
+      type: system
+      timeout: 5s
+      cache_ttl: 0s
+      read_ony: true
+identities:
+  u:
+    user: root
+    auth_type: password
+hosts:
+  h: {address: 192.0.2.1, port: 22}
+nodes:
+  n: {host_ref: h, identity_ref: u}
+`
+	_, err := UnmarshalV2([]byte(baseYAML))
+	if err == nil {
+		t.Fatal("unknown store field silently accepted")
+	}
+	if !errors.Is(err, ErrSchemaValidation) {
+		t.Fatalf("expected ErrSchemaValidation, got: %v", err)
+	}
+}
+
+func TestPassphraseNeedsFingerprint(t *testing.T) {
+	// 缺失 key_fingerprint
+	missingFP := `schema_version: 2
+credential:
+  default_store: s
+  stores:
+    s:
+      type: system
+      timeout: 5s
+      cache_ttl: 0s
+identities:
+  u:
+    user: root
+    auth_type: key
+    key_path: /synthetic/key
+    passphrase_ref: {store_id: s, item_id: original}
+hosts:
+  h: {address: 192.0.2.1, port: 22}
+nodes:
+  n: {host_ref: h, identity_ref: u}
+`
+	_, err := UnmarshalV2([]byte(missingFP))
+	if err == nil {
+		t.Fatal("passphrase reference accepted without key fingerprint")
+	}
+	if !errors.Is(err, ErrSchemaValidation) {
+		t.Fatalf("expected ErrSchemaValidation, got: %v", err)
+	}
+
+	// 带有非法空格的 key_fingerprint
+	badFP := `schema_version: 2
+credential:
+  default_store: s
+  stores:
+    s:
+      type: system
+      timeout: 5s
+      cache_ttl: 0s
+identities:
+  u:
+    user: root
+    auth_type: key
+    key_path: /synthetic/key
+    key_fingerprint: "SHA256: bad fingerprint"
+    passphrase_ref: {store_id: s, item_id: original}
+hosts:
+  h: {address: 192.0.2.1, port: 22}
+nodes:
+  n: {host_ref: h, identity_ref: u}
+`
+	_, err = UnmarshalV2([]byte(badFP))
+	if err == nil {
+		t.Fatal("passphrase reference accepted with bad key fingerprint")
+	}
+	if !errors.Is(err, ErrSchemaValidation) {
+		t.Fatalf("expected ErrSchemaValidation, got: %v", err)
+	}
+
+	// 合法 key_fingerprint
+	validFP := `schema_version: 2
+credential:
+  default_store: s
+  stores:
+    s:
+      type: system
+      timeout: 5s
+      cache_ttl: 0s
+identities:
+  u:
+    user: root
+    auth_type: key
+    key_path: /synthetic/key
+    key_fingerprint: "SHA256:validFingerprintString12345"
+    passphrase_ref: {store_id: s, item_id: original}
+hosts:
+  h: {address: 192.0.2.1, port: 22}
+nodes:
+  n: {host_ref: h, identity_ref: u}
+`
+	cfg, err := UnmarshalV2([]byte(validFP))
+	if err != nil {
+		t.Fatalf("valid passphrase config rejected: %v", err)
+	}
+	if cfg.Identities["u"].KeyFingerprint != "SHA256:validFingerprintString12345" {
+		t.Fatalf("unexpected key_fingerprint: %q", cfg.Identities["u"].KeyFingerprint)
+	}
+}

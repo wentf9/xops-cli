@@ -152,3 +152,109 @@ func TestJournalCorrupted(t *testing.T) {
 		t.Fatalf("expected ErrJournalCorrupted on ListPending, got: %v", err)
 	}
 }
+
+func TestJournalIDStaysWithinDirectory(t *testing.T) {
+	root := t.TempDir()
+	journalDir := filepath.Join(root, "journals")
+	s, err := NewJournalStore(journalDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	victim := filepath.Join(root, "victim.json")
+	if err := os.WriteFile(victim, []byte("synthetic file"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove("x/../../victim"); err == nil {
+		t.Fatal("Remove should reject path-escaping ID")
+	}
+	if _, err := os.Stat(victim); os.IsNotExist(err) {
+		t.Fatal("Remove deleted a file outside the journal directory")
+	}
+
+	// 尝试通过逃逸 ID 记录或读取
+	badEntry := &JournalEntry{
+		ID:     "../../escape",
+		Op:     OpCreate,
+		NewRef: &Ref{StoreID: "s", ItemID: "k"},
+	}
+	if err := s.RecordIntent(badEntry); err == nil {
+		t.Fatal("RecordIntent should reject path-escaping ID")
+	}
+	if _, err := s.Get("../../escape"); err == nil {
+		t.Fatal("Get should reject path-escaping ID")
+	}
+}
+
+func TestJournalReopenAcrossStages(t *testing.T) {
+	dir := t.TempDir()
+	store1, err := NewJournalStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entry := &JournalEntry{
+		ID:          "reopen-test-1",
+		Op:          OpRotate,
+		OldRef:      &Ref{StoreID: "s", ItemID: "old"},
+		NewRef:      &Ref{StoreID: "s", ItemID: "new"},
+		BaseVersion: "base123",
+	}
+
+	// 阶段 1：写入 Intent
+	if err := store1.RecordIntent(entry); err != nil {
+		t.Fatal(err)
+	}
+
+	// 新建实例 2：读取并验证
+	store2, err := NewJournalStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got1, err := store2.Get("reopen-test-1")
+	if err != nil || got1.Stage != StageIntent {
+		t.Fatalf("stage 1 verification failed: got %+v, err %v", got1, err)
+	}
+
+	// 阶段 2：推进到 Committed
+	if err := store2.MarkCommitted("reopen-test-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 新建实例 3：读取并验证
+	store3, err := NewJournalStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got2, err := store3.Get("reopen-test-1")
+	if err != nil || got2.Stage != StageCommitted {
+		t.Fatalf("stage 2 verification failed: got %+v, err %v", got2, err)
+	}
+
+	// 阶段 3：推进到 Cleanup
+	if err := store3.MarkCleanup("reopen-test-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 新建实例 4：扫描并验证
+	store4, err := NewJournalStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store4.ListPending()
+	if err != nil || len(pending) != 1 || pending[0].Stage != StageCleanup {
+		t.Fatalf("stage 3 pending list failed: got %+v, err %v", pending, err)
+	}
+
+	// 移除后在新建实例 5 中确认空
+	if err := store4.Remove("reopen-test-1"); err != nil {
+		t.Fatal(err)
+	}
+	store5, err := NewJournalStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err = store5.ListPending()
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("stage 4 remove verification failed: got %+v, err %v", pending, err)
+	}
+}

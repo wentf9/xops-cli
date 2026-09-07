@@ -44,11 +44,35 @@ type rawStoreConfig struct {
 	ReadOnly bool      `yaml:"read_only,omitempty"`
 }
 
-// UnmarshalYAML 自定义反序列化，支持 "5s"、"10m" 格式的超时与缓存 TTL 配置。
+// UnmarshalYAML 自定义反序列化，支持 "5s"、"10m" 格式的超时与缓存 TTL 配置，并严格校验未知字段。
 func (s *StoreConfig) UnmarshalYAML(value *yaml.Node) error {
+	if value == nil {
+		return fmt.Errorf("%w: store config node is nil", ErrSchemaValidation)
+	}
+	if value.Kind != yaml.MappingNode {
+		return fmt.Errorf("%w: expected mapping for store config", ErrSchemaValidation)
+	}
+
+	knownFields := map[string]struct{}{
+		"type":      {},
+		"timeout":   {},
+		"cache_ttl": {},
+		"prefix":    {},
+		"command":   {},
+		"args":      {},
+		"read_only": {},
+	}
+
+	for i := 0; i < len(value.Content); i += 2 {
+		fieldName := value.Content[i].Value
+		if _, ok := knownFields[fieldName]; !ok {
+			return fmt.Errorf("%w: unknown field %q in store configuration", ErrSchemaValidation, fieldName)
+		}
+	}
+
 	var raw rawStoreConfig
 	if err := value.Decode(&raw); err != nil {
-		return err
+		return fmt.Errorf("%w: decode store config: %w", ErrSchemaValidation, err)
 	}
 
 	s.Type = raw.Type
@@ -240,6 +264,14 @@ func validateIdentityRefs(idName string, id IdentityV2, stores map[string]StoreC
 			if _, ok := stores[id.PassphraseRef.StoreID]; !ok {
 				return fmt.Errorf("%w: identity %q passphrase_ref store %q not configured",
 					ErrSchemaValidation, idName, id.PassphraseRef.StoreID)
+			}
+			if strings.TrimSpace(id.KeyFingerprint) == "" {
+				return fmt.Errorf("%w: identity %q with passphrase_ref must specify key_fingerprint",
+					ErrSchemaValidation, idName)
+			}
+			if strings.ContainsAny(id.KeyFingerprint, " \t\r\n\x00") {
+				return fmt.Errorf("%w: identity %q has invalid key_fingerprint %q",
+					ErrSchemaValidation, idName, id.KeyFingerprint)
 			}
 		}
 	}

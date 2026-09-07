@@ -340,7 +340,7 @@ func (r *Repository) ResolveConnection(nodeID string) (ConnectionSnapshot, error
 		return ConnectionSnapshot{
 			Node:     cloneNode(node),
 			Host:     cloneHost(host),
-			Identity: identity,
+			Identity: cloneIdentity(identity),
 			UpdateRef: &ConnectionUpdateRef{
 				AuthVersion: authVersion,
 				SudoVersion: sudoVersion,

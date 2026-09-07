@@ -57,8 +57,8 @@ func (j *JournalEntry) Validate() error {
 	if j == nil {
 		return fmt.Errorf("%w: entry is nil", ErrJournalCorrupted)
 	}
-	if strings.TrimSpace(j.ID) == "" {
-		return fmt.Errorf("%w: entry ID cannot be empty", ErrJournalCorrupted)
+	if err := validateJournalID(j.ID); err != nil {
+		return err
 	}
 	switch j.Op {
 	case OpRotate, OpDelete, OpCreate:
@@ -83,6 +83,26 @@ func (j *JournalEntry) Validate() error {
 	return nil
 }
 
+func isJournalIDRune(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_'
+}
+
+func validateJournalID(id string) error {
+	trimmed := strings.TrimSpace(id)
+	if trimmed == "" {
+		return fmt.Errorf("%w: journal ID cannot be empty", ErrJournalCorrupted)
+	}
+	if len(id) > 128 {
+		return fmt.Errorf("%w: journal ID %q too long (max 128 chars)", ErrJournalCorrupted, id)
+	}
+	for _, r := range id {
+		if !isJournalIDRune(r) {
+			return fmt.Errorf("%w: journal ID %q contains invalid characters", ErrJournalCorrupted, id)
+		}
+	}
+	return nil
+}
+
 // JournalStore 管理非敏感凭据恢复日志文件的持久化与扫描。
 type JournalStore struct {
 	dir string
@@ -94,11 +114,15 @@ func NewJournalStore(dir string) (*JournalStore, error) {
 	if strings.TrimSpace(dir) == "" {
 		return nil, fmt.Errorf("journal directory cannot be empty")
 	}
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve journal directory: %w", err)
+	}
+	if err := os.MkdirAll(absDir, 0700); err != nil {
 		return nil, fmt.Errorf("create journal directory: %w", err)
 	}
 	return &JournalStore{
-		dir: dir,
+		dir: absDir,
 	}, nil
 }
 
@@ -111,8 +135,16 @@ func GenerateJournalID() string {
 	return "j-" + hex.EncodeToString(b)
 }
 
-func (s *JournalStore) entryFilePath(id string) string {
-	return filepath.Join(s.dir, fmt.Sprintf("journal-%s.json", id))
+func (s *JournalStore) entryFilePath(id string) (string, error) {
+	if err := validateJournalID(id); err != nil {
+		return "", err
+	}
+	targetPath := filepath.Clean(filepath.Join(s.dir, fmt.Sprintf("journal-%s.json", id)))
+	rel, err := filepath.Rel(s.dir, targetPath)
+	if err != nil || strings.HasPrefix(rel, "..") || rel == "." {
+		return "", fmt.Errorf("%w: journal ID %q escapes storage directory", ErrJournalCorrupted, id)
+	}
+	return targetPath, nil
 }
 
 // RecordIntent 记录操作意图。如果 entry.ID 为空，将自动生成唯一 ID。
@@ -144,6 +176,10 @@ func (s *JournalStore) MarkCleanup(id string) error {
 }
 
 func (s *JournalStore) updateStage(id string, stage Stage) error {
+	if err := validateJournalID(id); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -159,21 +195,34 @@ func (s *JournalStore) updateStage(id string, stage Stage) error {
 
 // Get 获取指定 ID 的日志项。
 func (s *JournalStore) Get(id string) (*JournalEntry, error) {
+	if err := validateJournalID(id); err != nil {
+		return nil, err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.readEntryLocked(id)
 }
 
-// Remove 成功完成清理或补偿后删除日志条目。
+// Remove 成功完成清理或补偿后删除日志条目，并同步目录以保证 durability。
 func (s *JournalStore) Remove(id string) error {
+	if err := validateJournalID(id); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	p := s.entryFilePath(id)
+	p, err := s.entryFilePath(id)
+	if err != nil {
+		return err
+	}
 	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove journal entry %q: %w", id, err)
 	}
-	s.syncDirLocked()
+	if err := s.syncDirLocked(); err != nil {
+		return fmt.Errorf("sync journal directory after remove %q: %w", id, err)
+	}
 	return nil
 }
 
@@ -195,9 +244,11 @@ func (s *JournalStore) ListPending() ([]JournalEntry, error) {
 		name := de.Name()
 		if strings.HasPrefix(name, "journal-") && strings.HasSuffix(name, ".json") {
 			id := strings.TrimSuffix(strings.TrimPrefix(name, "journal-"), ".json")
+			if err := validateJournalID(id); err != nil {
+				return nil, fmt.Errorf("%w: journal filename contains invalid ID %q", ErrJournalCorrupted, id)
+			}
 			entry, err := s.readEntryLocked(id)
 			if err != nil {
-				// 格式损坏的 entry
 				return nil, err
 			}
 			results = append(results, *entry)
@@ -207,7 +258,10 @@ func (s *JournalStore) ListPending() ([]JournalEntry, error) {
 }
 
 func (s *JournalStore) readEntryLocked(id string) (*JournalEntry, error) {
-	p := s.entryFilePath(id)
+	p, err := s.entryFilePath(id)
+	if err != nil {
+		return nil, err
+	}
 	data, err := os.ReadFile(p)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -222,6 +276,9 @@ func (s *JournalStore) readEntryLocked(id string) (*JournalEntry, error) {
 	}
 	if err := entry.Validate(); err != nil {
 		return nil, err
+	}
+	if entry.ID != id {
+		return nil, fmt.Errorf("%w: journal ID mismatch (filename %q vs content %q)", ErrJournalCorrupted, id, entry.ID)
 	}
 	return &entry, nil
 }
@@ -242,7 +299,10 @@ func (s *JournalStore) atomicWriteLocked(entry *JournalEntry) error {
 		return fmt.Errorf("serialize journal entry %q: %w", entry.ID, err)
 	}
 
-	destPath := s.entryFilePath(entry.ID)
+	destPath, err := s.entryFilePath(entry.ID)
+	if err != nil {
+		return err
+	}
 	tmpPath := fmt.Sprintf("%s.tmp.%d", destPath, time.Now().UnixNano())
 
 	// 权限 0600
@@ -273,20 +333,32 @@ func (s *JournalStore) atomicWriteLocked(entry *JournalEntry) error {
 		return fmt.Errorf("atomically rename journal file: %w", err)
 	}
 
-	s.syncDirLocked()
+	if err := s.syncDirLocked(); err != nil {
+		return fmt.Errorf("ensure journal file durability: %w", err)
+	}
 	return nil
 }
 
-func (s *JournalStore) syncDirLocked() {
+func (s *JournalStore) syncDirLocked() error {
 	if runtime.GOOS == "windows" {
-		return
+		return nil
 	}
 	df, err := os.Open(s.dir)
 	if err != nil {
-		return
+		return fmt.Errorf("open journal directory for sync: %w", err)
 	}
-	defer func() {
-		_ = df.Close()
-	}()
-	_ = df.Sync()
+	var syncErr, closeErr error
+	if err := df.Sync(); err != nil {
+		syncErr = fmt.Errorf("sync journal directory: %w", err)
+	}
+	if err := df.Close(); err != nil {
+		closeErr = fmt.Errorf("close journal directory: %w", err)
+	}
+	if syncErr != nil {
+		return syncErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return nil
 }

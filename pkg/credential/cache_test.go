@@ -196,32 +196,41 @@ func TestCachedSourceAndStore(t *testing.T) {
 		t.Errorf("expected 1 put call, got %d", putCalls)
 	}
 
-	// 首次 Get 应直接命中 Put 写入的缓存，不穿透到底层
+	// Put 后缓存失效，首次 Get 必须穿透到底层进行真实读回校验
 	got, err := cachedStore.Get(ctx, ref)
 	if err != nil || string(got.Value) != "val1" {
 		t.Fatalf("unexpected get result: %v", string(got.Value))
 	}
-	if getCalls != 0 {
-		t.Errorf("expected 0 getCalls, got %d", getCalls)
+	if getCalls != 1 {
+		t.Errorf("expected 1 getCall on readback passthrough, got %d", getCalls)
 	}
 
-	// 主动 Invalidate 后再次 Get，触发底层 Get 并重新填充缓存
+	// 读回完成后已填充缓存，再次 Get 应命中缓存
+	got, err = cachedStore.Get(ctx, ref)
+	if err != nil || string(got.Value) != "val1" {
+		t.Fatalf("unexpected cached get result: %v", string(got.Value))
+	}
+	if getCalls != 1 {
+		t.Errorf("expected getCalls to remain 1 on hit, got %d", getCalls)
+	}
+
+	// 主动 Invalidate 后再次 Get，触发底层读取
 	cache.Invalidate(ref)
 	got, err = cachedStore.Get(ctx, ref)
 	if err != nil || string(got.Value) != "val1" {
 		t.Fatalf("unexpected get after invalidate: %v", string(got.Value))
 	}
-	if getCalls != 1 {
-		t.Errorf("expected 1 getCall after invalidate, got %d", getCalls)
+	if getCalls != 2 {
+		t.Errorf("expected 2 getCalls after invalidate, got %d", getCalls)
 	}
 
-	// 再次 Get，应命中缓存，getCalls 仍为 1
+	// 再次 Get，应命中缓存，getCalls 仍为 2
 	_, err = cachedStore.Get(ctx, ref)
 	if err != nil {
 		t.Fatalf("cached get failed: %v", err)
 	}
-	if getCalls != 1 {
-		t.Errorf("expected getCalls to remain 1, got %d", getCalls)
+	if getCalls != 2 {
+		t.Errorf("expected getCalls to remain 2, got %d", getCalls)
 	}
 
 	// Delete 后缓存失效，底层也被删除
@@ -269,4 +278,99 @@ func TestCacheConcurrency(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+func TestWriteReadbackMustReachBackend(t *testing.T) {
+	ctx := context.Background()
+	backend := &dummyStore{
+		dummySource: dummySource{
+			getFn: func(_ context.Context, _ Ref) (Secret, error) {
+				return Secret{}, ErrCredentialNotFound
+			},
+		},
+		putFn: func(_ context.Context, _ Ref, _ Secret) error {
+			return nil
+		},
+	}
+	cs := NewCachedStore(backend, NewCache(CacheOptions{Capacity: 64, DefaultTTL: time.Minute}))
+	ref := Ref{StoreID: "s", ItemID: "new"}
+	if err := cs.Put(ctx, ref, NewSecret([]byte("synthetic"))); err != nil {
+		t.Fatal(err)
+	}
+	got, err := cs.Get(ctx, ref)
+	defer got.Zero()
+	if !errors.Is(err, ErrCredentialNotFound) {
+		t.Fatalf("readback hid missing backend item: err=%v", err)
+	}
+}
+
+func TestDeleteMustFenceInflightGet(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	backend := &dummyStore{
+		dummySource: dummySource{
+			getFn: func(ctx context.Context, _ Ref) (Secret, error) {
+				close(started)
+				select {
+				case <-release:
+					return NewSecret([]byte("deleted-synthetic")), nil
+				case <-ctx.Done():
+					return Secret{}, ctx.Err()
+				}
+			},
+		},
+		deleteFn: func(_ context.Context, _ Ref) error {
+			return nil
+		},
+	}
+	cache := NewCache(CacheOptions{Capacity: 64, DefaultTTL: time.Minute})
+	cs := NewCachedStore(backend, cache)
+	ref := Ref{StoreID: "s", ItemID: "old"}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		sec, err := cs.Get(ctx, ref)
+		sec.Zero()
+		done <- err
+	}()
+
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+
+	if err := cs.Delete(ctx, ref); err != nil {
+		close(release)
+		<-done
+		t.Fatal(err)
+	}
+	close(release)
+
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	sec, found := cache.Get(ref)
+	defer sec.Zero()
+	if found {
+		t.Fatal("inflight Get repopulated cache after Delete completed")
+	}
+}
+
+func TestZeroTTLDoesNotRetainSecrets(t *testing.T) {
+	now := time.Now()
+	c := NewCache(CacheOptions{
+		Capacity:   64,
+		DefaultTTL: 0,
+		NowFunc:    func() time.Time { return now },
+	})
+	ref := Ref{StoreID: "s", ItemID: "zero"}
+	c.Put(ref, NewSecret([]byte("synthetic")))
+	now = now.Add(365 * 24 * time.Hour)
+	sec, found := c.Get(ref)
+	defer sec.Zero()
+	if found {
+		t.Fatal("zero TTL retained secret after one year")
+	}
 }
