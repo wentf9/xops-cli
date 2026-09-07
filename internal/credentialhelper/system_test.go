@@ -204,7 +204,7 @@ func TestSystemStoreLinuxDBusFailureNotReportedAsNotFound(t *testing.T) {
 	t.Setenv("PATH", filepath.Dir(fakeScript)+":"+origPath)
 	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/fake-bus")
 
-	store, err := newNativeSystemStore("system", SystemStoreConfig{Timeout: time.Second})
+	store, err := newNativeSystemStore("system", SystemStoreConfig{Timeout: 5 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}

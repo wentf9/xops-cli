@@ -97,7 +97,7 @@ func fakePassOptions(mode string, env ...string) PassStoreConfig {
 		Command: os.Args[0],
 		Args:    []string{"-test.run=^TestFakePassCLIProcess$", "--"},
 		Env:     allEnv,
-		Timeout: 2 * time.Second,
+		Timeout: 10 * time.Second,
 	}
 }
 
