@@ -1,0 +1,292 @@
+package credential
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+)
+
+// OperationType 定义凭据事务操作类型。
+type OperationType string
+
+const (
+	// OpRotate 表示凭据轮换操作（旧引用切换为新引用）。
+	OpRotate OperationType = "rotate"
+	// OpDelete 表示凭据删除操作（删除现有引用及后端机密）。
+	OpDelete OperationType = "delete"
+	// OpCreate 表示新增凭据操作。
+	OpCreate OperationType = "create"
+)
+
+// Stage 定义凭据事务日志所处的阶段。
+type Stage string
+
+const (
+	// StageIntent 表示事务意图已记录，新凭据已写入但配置尚未原子提交。
+	StageIntent Stage = "intent"
+	// StageCommitted 表示配置变更已持久化生效，旧凭据待清理。
+	StageCommitted Stage = "committed"
+	// StageCleanup 表示旧凭据清理失败，留待稍后后台 GC。
+	StageCleanup Stage = "cleanup"
+)
+
+// JournalEntry 记录凭据操作的恢复状态。
+// 【安全红线】本结构严禁包含任何机密明文或可逆密文字节，仅记录非敏感的引用元数据与阶段。
+type JournalEntry struct {
+	ID          string        `json:"id"`
+	Op          OperationType `json:"op"`
+	Stage       Stage         `json:"stage"`
+	OldRef      *Ref          `json:"oldRef,omitempty"`
+	NewRef      *Ref          `json:"newRef,omitempty"`
+	BaseVersion string        `json:"baseVersion,omitempty"`
+	TargetNode  string        `json:"targetNode,omitempty"`
+	TargetKind  Kind          `json:"targetKind,omitempty"`
+	CreatedAt   time.Time     `json:"createdAt"`
+	UpdatedAt   time.Time     `json:"updatedAt"`
+}
+
+// Validate 校验 JournalEntry 基础合法性。
+func (j *JournalEntry) Validate() error {
+	if j == nil {
+		return fmt.Errorf("%w: entry is nil", ErrJournalCorrupted)
+	}
+	if strings.TrimSpace(j.ID) == "" {
+		return fmt.Errorf("%w: entry ID cannot be empty", ErrJournalCorrupted)
+	}
+	switch j.Op {
+	case OpRotate, OpDelete, OpCreate:
+	default:
+		return fmt.Errorf("%w: invalid operation %q", ErrJournalCorrupted, string(j.Op))
+	}
+	switch j.Stage {
+	case StageIntent, StageCommitted, StageCleanup:
+	default:
+		return fmt.Errorf("%w: invalid stage %q", ErrJournalCorrupted, string(j.Stage))
+	}
+	if j.OldRef != nil {
+		if err := j.OldRef.Validate(); err != nil {
+			return fmt.Errorf("%w: oldRef invalid: %w", ErrJournalCorrupted, err)
+		}
+	}
+	if j.NewRef != nil {
+		if err := j.NewRef.Validate(); err != nil {
+			return fmt.Errorf("%w: newRef invalid: %w", ErrJournalCorrupted, err)
+		}
+	}
+	return nil
+}
+
+// JournalStore 管理非敏感凭据恢复日志文件的持久化与扫描。
+type JournalStore struct {
+	dir string
+	mu  sync.Mutex
+}
+
+// NewJournalStore 创建一个日志存储管理器，确保目录存在且权限为 0700。
+func NewJournalStore(dir string) (*JournalStore, error) {
+	if strings.TrimSpace(dir) == "" {
+		return nil, fmt.Errorf("journal directory cannot be empty")
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, fmt.Errorf("create journal directory: %w", err)
+	}
+	return &JournalStore{
+		dir: dir,
+	}, nil
+}
+
+// GenerateJournalID 生成全局唯一的随机日志 ID。
+func GenerateJournalID() string {
+	b := make([]byte, 12)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("j-%d", time.Now().UnixNano())
+	}
+	return "j-" + hex.EncodeToString(b)
+}
+
+func (s *JournalStore) entryFilePath(id string) string {
+	return filepath.Join(s.dir, fmt.Sprintf("journal-%s.json", id))
+}
+
+// RecordIntent 记录操作意图。如果 entry.ID 为空，将自动生成唯一 ID。
+func (s *JournalStore) RecordIntent(entry *JournalEntry) error {
+	if entry == nil {
+		return fmt.Errorf("journal entry is nil")
+	}
+	if entry.ID == "" {
+		entry.ID = GenerateJournalID()
+	}
+	entry.Stage = StageIntent
+	now := time.Now().UTC()
+	if entry.CreatedAt.IsZero() {
+		entry.CreatedAt = now
+	}
+	entry.UpdatedAt = now
+
+	return s.save(entry)
+}
+
+// MarkCommitted 将日志状态推进至 StageCommitted（配置已持久化提交）。
+func (s *JournalStore) MarkCommitted(id string) error {
+	return s.updateStage(id, StageCommitted)
+}
+
+// MarkCleanup 将日志状态推进至 StageCleanup（清理失败，标记待 GC）。
+func (s *JournalStore) MarkCleanup(id string) error {
+	return s.updateStage(id, StageCleanup)
+}
+
+func (s *JournalStore) updateStage(id string, stage Stage) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entry, err := s.readEntryLocked(id)
+	if err != nil {
+		return err
+	}
+	entry.Stage = stage
+	entry.UpdatedAt = time.Now().UTC()
+
+	return s.atomicWriteLocked(entry)
+}
+
+// Get 获取指定 ID 的日志项。
+func (s *JournalStore) Get(id string) (*JournalEntry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.readEntryLocked(id)
+}
+
+// Remove 成功完成清理或补偿后删除日志条目。
+func (s *JournalStore) Remove(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	p := s.entryFilePath(id)
+	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove journal entry %q: %w", id, err)
+	}
+	s.syncDirLocked()
+	return nil
+}
+
+// ListPending 扫描并返回所有未完成的日志条目（按创建时间升序排列）。
+func (s *JournalStore) ListPending() ([]JournalEntry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return nil, fmt.Errorf("read journal directory: %w", err)
+	}
+
+	var results []JournalEntry
+	for _, de := range entries {
+		if de.IsDir() {
+			continue
+		}
+		name := de.Name()
+		if strings.HasPrefix(name, "journal-") && strings.HasSuffix(name, ".json") {
+			id := strings.TrimSuffix(strings.TrimPrefix(name, "journal-"), ".json")
+			entry, err := s.readEntryLocked(id)
+			if err != nil {
+				// 格式损坏的 entry
+				return nil, err
+			}
+			results = append(results, *entry)
+		}
+	}
+	return results, nil
+}
+
+func (s *JournalStore) readEntryLocked(id string) (*JournalEntry, error) {
+	p := s.entryFilePath(id)
+	data, err := os.ReadFile(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("%w: journal entry %q not found", ErrCredentialNotFound, id)
+		}
+		return nil, fmt.Errorf("read journal entry %q: %w", id, err)
+	}
+
+	var entry JournalEntry
+	if err := json.Unmarshal(data, &entry); err != nil {
+		return nil, fmt.Errorf("%w: parse journal entry %q: %w", ErrJournalCorrupted, id, err)
+	}
+	if err := entry.Validate(); err != nil {
+		return nil, err
+	}
+	return &entry, nil
+}
+
+func (s *JournalStore) save(entry *JournalEntry) error {
+	if err := entry.Validate(); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.atomicWriteLocked(entry)
+}
+
+func (s *JournalStore) atomicWriteLocked(entry *JournalEntry) error {
+	data, err := json.MarshalIndent(entry, "", "  ")
+	if err != nil {
+		return fmt.Errorf("serialize journal entry %q: %w", entry.ID, err)
+	}
+
+	destPath := s.entryFilePath(entry.ID)
+	tmpPath := fmt.Sprintf("%s.tmp.%d", destPath, time.Now().UnixNano())
+
+	// 权限 0600
+	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("create journal temp file: %w", err)
+	}
+
+	var writeErr error
+	if _, err := f.Write(data); err != nil {
+		writeErr = fmt.Errorf("write journal temp file: %w", err)
+	} else if err := f.Sync(); err != nil {
+		writeErr = fmt.Errorf("sync journal temp file: %w", err)
+	}
+
+	if closeErr := f.Close(); closeErr != nil && writeErr == nil {
+		writeErr = fmt.Errorf("close journal temp file: %w", closeErr)
+	}
+
+	if writeErr != nil {
+		_ = os.Remove(tmpPath)
+		return writeErr
+	}
+
+	// 原子替换
+	if err := os.Rename(tmpPath, destPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("atomically rename journal file: %w", err)
+	}
+
+	s.syncDirLocked()
+	return nil
+}
+
+func (s *JournalStore) syncDirLocked() {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	df, err := os.Open(s.dir)
+	if err != nil {
+		return
+	}
+	defer func() {
+		_ = df.Close()
+	}()
+	_ = df.Sync()
+}
