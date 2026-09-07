@@ -57,7 +57,7 @@ func TestFakePassCLIProcess(t *testing.T) {
 				_, _ = fmt.Fprintf(os.Stderr, "Error: %s is not in the password store.\n", itemPath)
 				os.Exit(1)
 			}
-			_, _ = fmt.Fprintln(os.Stdout, val)
+			_, _ = io.WriteString(os.Stdout, val)
 			os.Exit(0)
 		case "insert":
 			stdinBytes, _ := io.ReadAll(os.Stdin)

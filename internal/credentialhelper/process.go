@@ -3,6 +3,7 @@ package credentialhelper
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
@@ -12,6 +13,12 @@ import (
 
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
+
+// DefaultHelperTimeout 是 credential helper 进程执行的默认超时时间。
+const DefaultHelperTimeout = 30 * time.Second
+
+// DefaultProcessWaitDelay 是主进程退出后等待继承管道的子孙进程排空的最大窗口。
+const DefaultProcessWaitDelay = 50 * time.Millisecond
 
 // ProcessOptions 包含启动子进程 credential helper 的选项。
 type ProcessOptions struct {
@@ -46,13 +53,66 @@ func Run(ctx context.Context, opts ProcessOptions, action Action, req *Request) 
 		return nil, fmt.Errorf("credential helper command is empty")
 	}
 
-	execCtx := ctx
-	var cancel context.CancelFunc
-	if opts.Timeout > 0 {
-		execCtx, cancel = context.WithTimeout(ctx, opts.Timeout)
-		defer cancel()
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = DefaultHelperTimeout
 	}
 
+	execCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	cmd, stdoutLimiter, stderrLimiter, err := buildProcessCmd(execCtx, opts, action, req, timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	session, err := startProcessSession(cmd)
+	if err != nil {
+		if isNotFoundErr(err) {
+			return nil, fmt.Errorf("%w: credential helper executable not found: %s", credential.ErrCredentialStoreUnavailable, opts.Command)
+		}
+		return nil, fmt.Errorf("start credential helper failed: %w", err)
+	}
+	defer func() {
+		_ = session.Close()
+	}()
+
+	done := make(chan struct{})
+	defer close(done)
+
+	go func() {
+		select {
+		case <-execCtx.Done():
+			_ = session.KillTree()
+		case <-done:
+		}
+	}()
+
+	runErr := cmd.Wait()
+
+	sensitive := collectSensitiveTokens(req)
+	sanitizedStderr := SanitizeDiagnostic(stderrLimiter.buf.String(), sensitive...)
+
+	if execCtx.Err() != nil {
+		_ = session.KillTree()
+		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
+			return nil, fmt.Errorf("%w: credential helper timed out after %v", credential.ErrCredentialStoreUnavailable, timeout)
+		}
+		return nil, fmt.Errorf("credential helper canceled: %w", execCtx.Err())
+	}
+
+	if stdoutLimiter.total > MaxResponseBytes {
+		return nil, fmt.Errorf("%w: credential helper response exceeded maximum limit of %d bytes", credential.ErrCredentialStoreUnavailable, MaxResponseBytes)
+	}
+
+	if runErr != nil && isNotFoundErr(runErr) {
+		return nil, fmt.Errorf("%w: credential helper executable not found: %s", credential.ErrCredentialStoreUnavailable, opts.Command)
+	}
+
+	return parseOutputResponse(stdoutLimiter, runErr, sanitizedStderr)
+}
+
+func buildProcessCmd(execCtx context.Context, opts ProcessOptions, action Action, req *Request, timeout time.Duration) (*exec.Cmd, *limitedBuffer, *limitedBuffer, error) {
 	args := make([]string, 0, len(opts.Args)+1)
 	args = append(args, opts.Args...)
 	args = append(args, string(action))
@@ -61,12 +121,16 @@ func Run(ctx context.Context, opts ProcessOptions, action Action, req *Request) 
 	if len(opts.Env) > 0 {
 		cmd.Env = append(os.Environ(), opts.Env...)
 	}
-	configureProcessIsolation(cmd)
 
-	// 序列化请求到 stdin 缓冲
+	waitDelay := DefaultProcessWaitDelay
+	if timeout < waitDelay {
+		waitDelay = timeout
+	}
+	cmd.WaitDelay = waitDelay
+
 	var stdinBuf bytes.Buffer
 	if err := EncodeRequest(&stdinBuf, req); err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	cmd.Stdin = &stdinBuf
 
@@ -75,47 +139,52 @@ func Run(ctx context.Context, opts ProcessOptions, action Action, req *Request) 
 	cmd.Stdout = stdoutLimiter
 	cmd.Stderr = stderrLimiter
 
-	runErr := cmd.Run()
+	return cmd, stdoutLimiter, stderrLimiter, nil
+}
 
-	// 优先检查超时或取消
-	if execCtx.Err() != nil {
-		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
-			return nil, fmt.Errorf("%w: credential helper timed out after %v", credential.ErrCredentialStoreUnavailable, opts.Timeout)
+func collectSensitiveTokens(req *Request) []string {
+	var sensitive []string
+	if req != nil && req.Secret != "" {
+		sensitive = append(sensitive, req.Secret)
+		if decoded, decErr := base64.StdEncoding.DecodeString(req.Secret); decErr == nil && len(decoded) > 0 {
+			sensitive = append(sensitive, string(decoded))
 		}
-		return nil, fmt.Errorf("credential helper canceled: %w", execCtx.Err())
 	}
+	return sensitive
+}
 
-	// 检查 stdout 超限
-	if stdoutLimiter.total > MaxResponseBytes {
-		return nil, fmt.Errorf("credential helper response exceeded maximum limit of %d bytes", MaxResponseBytes)
-	}
-
-	// 若 stdout 有输出，先尝试解码（无论子进程退出码是否为 0，因为部分 helper 在报错时以非 0 退出并输出 JSON 错误）
+func parseOutputResponse(stdoutLimiter *limitedBuffer, runErr error, sanitizedStderr string) (*Response, error) {
 	if stdoutLimiter.buf.Len() > 0 {
 		resp, parseErr := DecodeResponse(&stdoutLimiter.buf)
 		if parseErr != nil {
-			// 若返回了标准协议错误代码（如 not-found, locked 等），优先向上传播该语义错误
 			if resp != nil && strings.TrimSpace(resp.Code) != "" {
 				return resp, parseErr
 			}
-			// 若无法解析出有效 JSON，且进程退出报错
 			if runErr != nil {
-				stderrMsg := formatStderr(stderrLimiter.buf.String())
-				if stderrMsg != "" {
-					return nil, fmt.Errorf("credential helper failed (%w): %s", runErr, stderrMsg)
+				if sanitizedStderr != "" {
+					return nil, fmt.Errorf("credential helper failed (%w): %s", runErr, sanitizedStderr)
 				}
 				return nil, fmt.Errorf("credential helper failed: %w", runErr)
 			}
 			return nil, parseErr
 		}
+
+		if runErr != nil && !errors.Is(runErr, exec.ErrWaitDelay) {
+			if strings.TrimSpace(resp.Code) != "" {
+				return resp, MapErrorCode(resp.Code, resp.Message)
+			}
+			if sanitizedStderr != "" {
+				return nil, fmt.Errorf("credential helper failed with exit code (%w): %s", runErr, sanitizedStderr)
+			}
+			return nil, fmt.Errorf("credential helper failed with exit code: %w", runErr)
+		}
+
 		return resp, nil
 	}
 
-	// stdout 为空且报错
 	if runErr != nil {
-		stderrMsg := formatStderr(stderrLimiter.buf.String())
-		if stderrMsg != "" {
-			return nil, fmt.Errorf("credential helper failed (%w): %s", runErr, stderrMsg)
+		if sanitizedStderr != "" {
+			return nil, fmt.Errorf("credential helper failed (%w): %s", runErr, sanitizedStderr)
 		}
 		return nil, fmt.Errorf("credential helper failed: %w", runErr)
 	}
@@ -123,10 +192,15 @@ func Run(ctx context.Context, opts ProcessOptions, action Action, req *Request) 
 	return nil, fmt.Errorf("empty response from credential helper")
 }
 
-func formatStderr(raw string) string {
-	msg := strings.TrimSpace(raw)
-	if len(msg) > 512 {
-		return msg[:512] + "..."
+func isNotFoundErr(err error) bool {
+	if err == nil {
+		return false
 	}
-	return msg
+	if errors.Is(err, exec.ErrNotFound) || os.IsNotExist(err) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no such file or directory") ||
+		strings.Contains(msg, "executable file not found") ||
+		strings.Contains(msg, "cannot find the file")
 }

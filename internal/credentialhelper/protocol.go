@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 	"time"
 
@@ -52,10 +53,30 @@ type Response struct {
 	Message   string     `json:"message,omitempty"`
 }
 
+var base64Regex = regexp.MustCompile(`[A-Za-z0-9+/=]{16,}`)
+
+// SanitizeDiagnostic 对错误和诊断信息进行脱敏处理，屏蔽可疑 Base64 与长敏感字符串。
+func SanitizeDiagnostic(raw string, sensitive ...string) string {
+	msg := strings.TrimSpace(raw)
+	if msg == "" {
+		return ""
+	}
+	for _, s := range sensitive {
+		if s != "" {
+			msg = strings.ReplaceAll(msg, s, "[REDACTED]")
+		}
+	}
+	msg = base64Regex.ReplaceAllString(msg, "[REDACTED]")
+	if len(msg) > 256 {
+		return msg[:256] + "..."
+	}
+	return msg
+}
+
 // MapErrorCode 将 helper 协议返回的错误代码映射为系统标准的凭据哨兵错误。
 func MapErrorCode(code, msg string) error {
 	trimmedCode := strings.ToLower(strings.TrimSpace(code))
-	trimmedMsg := strings.TrimSpace(msg)
+	sanitizedMsg := SanitizeDiagnostic(msg)
 
 	var baseErr error
 	switch trimmedCode {
@@ -70,14 +91,14 @@ func MapErrorCode(code, msg string) error {
 	case "read-only":
 		baseErr = credential.ErrCredentialStoreReadOnly
 	default:
-		if trimmedMsg != "" {
-			return fmt.Errorf("credential helper error (%s): %s", code, trimmedMsg)
+		if sanitizedMsg != "" {
+			return fmt.Errorf("credential helper error (%s): %s", code, sanitizedMsg)
 		}
 		return fmt.Errorf("credential helper error (%s)", code)
 	}
 
-	if trimmedMsg != "" {
-		return fmt.Errorf("%w: %s", baseErr, trimmedMsg)
+	if sanitizedMsg != "" {
+		return fmt.Errorf("%w: %s", baseErr, sanitizedMsg)
 	}
 	return baseErr
 }
@@ -97,7 +118,7 @@ func EncodeRequest(w io.Writer, req *Request) error {
 	return nil
 }
 
-// DecodeResponse 从 reader 读取并反序列化响应 JSON，严格限制最大字节数并校验 Base64。
+// DecodeResponse 从 reader 读取并反序列化响应 JSON，严格限制最大字节数、强制唯一响应并校验 Base64。
 func DecodeResponse(r io.Reader) (*Response, error) {
 	limitedReader := io.LimitReader(r, MaxResponseBytes+1)
 	data, err := io.ReadAll(limitedReader)
@@ -115,6 +136,12 @@ func DecodeResponse(r io.Reader) (*Response, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	if err := dec.Decode(&resp); err != nil {
 		return nil, fmt.Errorf("parse credential helper response: %w", err)
+	}
+
+	// 强制要求 stdout 只能包含一个合法的 JSON 响应，拒绝第二个 JSON 或尾随非空白内容
+	var trailing json.RawMessage
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("unexpected multiple JSON responses or trailing content in helper output")
 	}
 
 	// 若存在错误响应 code，直接映射返回对应错误

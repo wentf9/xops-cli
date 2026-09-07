@@ -62,13 +62,18 @@ func NewPassStore(storeID string, cfg PassStoreConfig) (*PassStore, error) {
 		prefix = DefaultPassPrefix
 	}
 
+	timeout := cfg.Timeout
+	if timeout <= 0 {
+		timeout = DefaultHelperTimeout
+	}
+
 	ps := &PassStore{
 		storeID:  storeID,
 		prefix:   prefix,
 		command:  cmdName,
 		args:     cfg.Args,
 		env:      cfg.Env,
-		timeout:  cfg.Timeout,
+		timeout:  timeout,
 		readOnly: cfg.ReadOnly,
 	}
 
@@ -79,7 +84,7 @@ func NewPassStore(storeID string, cfg PassStoreConfig) (*PassStore, error) {
 			Command: cmdName,
 			Args:    cfg.Args,
 			Env:     cfg.Env,
-			Timeout: cfg.Timeout,
+			Timeout: timeout,
 		}
 		hs, err := NewHelperStore(storeID, opts, cfg.ReadOnly)
 		if err != nil {
@@ -128,30 +133,15 @@ func (p *PassStore) Get(ctx context.Context, ref credential.Ref) (credential.Sec
 
 	stdout, stderr, err := p.executePassCmd(ctx, args, nil)
 	if err != nil {
-		stderrLower := strings.ToLower(stderr)
-		if strings.Contains(stderrLower, "is not in the password store") || strings.Contains(stderrLower, "not found") {
-			return credential.Secret{}, credential.ErrCredentialNotFound
-		}
-		if strings.Contains(stderrLower, "decryption failed") || strings.Contains(stderrLower, "pinentry") {
-			return credential.Secret{}, credential.ErrCredentialStoreLocked
-		}
-		if strings.Contains(stderrLower, "no secret key") || strings.Contains(stderrLower, "gpg") {
-			return credential.Secret{}, credential.ErrCredentialStoreUnavailable
-		}
-		return credential.Secret{}, fmt.Errorf("pass show failed: %w", err)
+		return credential.Secret{}, mapPassError("show", err, stderr)
 	}
 
-	// 截取第一行或非空内容
-	content := bytes.TrimRight(stdout, "\r\n")
-	if len(content) == 0 {
+	// 严禁 TrimRight 去除尾随换行，完整保留原始秘密字节
+	if len(stdout) == 0 {
 		return credential.Secret{}, credential.ErrCredentialNotFound
 	}
 
-	sec := credential.NewSecret(content)
-	// 清零临时读出的字节数组
-	for i := range content {
-		content[i] = 0
-	}
+	sec := credential.NewSecret(stdout)
 	return sec, nil
 }
 
@@ -176,9 +166,9 @@ func (p *PassStore) Put(ctx context.Context, ref credential.Ref, secret credenti
 	args = append(args, p.args...)
 	args = append(args, "insert", "-m", "-f", itemPath)
 
-	_, _, err := p.executePassCmd(ctx, args, secret.Value)
+	_, stderr, err := p.executePassCmd(ctx, args, secret.Value)
 	if err != nil {
-		return fmt.Errorf("pass insert failed: %w", err)
+		return mapPassError("insert", err, stderr)
 	}
 	return nil
 }
@@ -204,26 +194,32 @@ func (p *PassStore) Delete(ctx context.Context, ref credential.Ref) error {
 	args = append(args, p.args...)
 	args = append(args, "rm", "-f", itemPath)
 
-	_, _, err := p.executePassCmd(ctx, args, nil)
+	_, stderr, err := p.executePassCmd(ctx, args, nil)
 	if err != nil {
-		return fmt.Errorf("pass rm failed: %w", err)
+		return mapPassError("rm", err, stderr)
 	}
 	return nil
 }
 
 func (p *PassStore) executePassCmd(ctx context.Context, args []string, stdinData []byte) ([]byte, string, error) {
-	execCtx := ctx
-	var cancel context.CancelFunc
-	if p.timeout > 0 {
-		execCtx, cancel = context.WithTimeout(ctx, p.timeout)
-		defer cancel()
+	timeout := p.timeout
+	if timeout <= 0 {
+		timeout = DefaultHelperTimeout
 	}
+
+	execCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
 	cmd := exec.CommandContext(execCtx, p.command, args...)
 	if len(p.env) > 0 {
 		cmd.Env = append(os.Environ(), p.env...)
 	}
-	configureProcessIsolation(cmd)
+
+	waitDelay := DefaultProcessWaitDelay
+	if timeout < waitDelay {
+		waitDelay = timeout
+	}
+	cmd.WaitDelay = waitDelay
 
 	if len(stdinData) > 0 {
 		cmd.Stdin = bytes.NewReader(stdinData)
@@ -234,21 +230,84 @@ func (p *PassStore) executePassCmd(ctx context.Context, args []string, stdinData
 	cmd.Stdout = stdoutLimiter
 	cmd.Stderr = stderrLimiter
 
-	err := cmd.Run()
-	if execCtx.Err() != nil {
-		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
-			return nil, "", fmt.Errorf("%w: pass command timed out after %v", credential.ErrCredentialStoreUnavailable, p.timeout)
-		}
-		return nil, "", fmt.Errorf("pass command canceled: %w", execCtx.Err())
-	}
-
-	stderrStr := formatStderr(stderrLimiter.buf.String())
+	session, err := startProcessSession(cmd)
 	if err != nil {
-		if stderrStr != "" {
-			return nil, stderrStr, fmt.Errorf("%w: %s", err, stderrStr)
+		if isNotFoundErr(err) {
+			return nil, "", fmt.Errorf("%w: pass executable not found: %s", credential.ErrCredentialStoreUnavailable, p.command)
 		}
-		return nil, "", err
+		return nil, "", fmt.Errorf("start pass command failed: %w", err)
+	}
+	defer func() {
+		_ = session.Close()
+	}()
+
+	done := make(chan struct{})
+	defer close(done)
+
+	go func() {
+		select {
+		case <-execCtx.Done():
+			_ = session.KillTree()
+		case <-done:
+		}
+	}()
+
+	runErr := cmd.Wait()
+
+	sanitizedStderr := SanitizeDiagnostic(stderrLimiter.buf.String(), string(stdinData))
+
+	if execCtx.Err() != nil {
+		_ = session.KillTree()
+		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
+			return nil, sanitizedStderr, fmt.Errorf("%w: pass command timed out after %v", credential.ErrCredentialStoreUnavailable, timeout)
+		}
+		return nil, sanitizedStderr, fmt.Errorf("pass command canceled: %w", execCtx.Err())
 	}
 
-	return stdoutLimiter.buf.Bytes(), stderrStr, nil
+	// 严格检查 stdout 输出上限
+	if stdoutLimiter.total > MaxResponseBytes {
+		return nil, sanitizedStderr, fmt.Errorf("%w: pass command output exceeded maximum limit of %d bytes", credential.ErrCredentialStoreUnavailable, MaxResponseBytes)
+	}
+
+	if runErr != nil && isNotFoundErr(runErr) {
+		return nil, sanitizedStderr, fmt.Errorf("%w: pass executable not found: %s", credential.ErrCredentialStoreUnavailable, p.command)
+	}
+
+	if runErr != nil && !errors.Is(runErr, exec.ErrWaitDelay) {
+		if sanitizedStderr != "" {
+			return nil, sanitizedStderr, fmt.Errorf("%w: %s", runErr, sanitizedStderr)
+		}
+		return nil, sanitizedStderr, runErr
+	}
+
+	return stdoutLimiter.buf.Bytes(), sanitizedStderr, nil
+}
+
+func mapPassError(action string, err error, stderr string) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, credential.ErrCredentialStoreUnavailable) ||
+		errors.Is(err, credential.ErrCredentialStoreLocked) ||
+		errors.Is(err, credential.ErrCredentialNotFound) ||
+		errors.Is(err, credential.ErrCredentialAccessDenied) ||
+		errors.Is(err, credential.ErrCredentialStoreReadOnly) {
+		return err
+	}
+
+	stderrLower := strings.ToLower(stderr)
+	errLower := strings.ToLower(err.Error())
+	combined := stderrLower + " " + errLower
+
+	if strings.Contains(combined, "is not in the password store") || strings.Contains(combined, "not found") {
+		return fmt.Errorf("%w: %w", credential.ErrCredentialNotFound, err)
+	}
+	if strings.Contains(combined, "decryption failed") || strings.Contains(combined, "pinentry") || strings.Contains(combined, "inappropriate ioctl for device") {
+		return fmt.Errorf("%w: %w", credential.ErrCredentialStoreLocked, err)
+	}
+	if strings.Contains(combined, "no secret key") || strings.Contains(combined, "gpg") || isNotFoundErr(err) {
+		return fmt.Errorf("%w: %w", credential.ErrCredentialStoreUnavailable, err)
+	}
+
+	return fmt.Errorf("pass %s failed: %w", action, err)
 }

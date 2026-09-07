@@ -9,8 +9,8 @@ import (
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
-func resolveDefaultSystemHelper() (string, error) {
-	return "", fmt.Errorf("%w: system credential store is not supported on %s", credential.ErrCredentialStoreUnavailable, runtime.GOOS)
+func newNativeSystemStore(storeID string, cfg SystemStoreConfig) (credential.Store, error) {
+	return nil, fmt.Errorf("%w: system credential store is not supported on %s", credential.ErrCredentialStoreUnavailable, runtime.GOOS)
 }
 
 func checkPlatformSystemAvailability() error {

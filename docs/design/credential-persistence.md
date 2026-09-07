@@ -363,3 +363,44 @@ pkg 层只包装并返回。允许记录 StoreID、操作、耗时、结果分�
 - Applied 但非 Durable 时新旧秘密都保留；
 - MCP 永不触发凭据输入或密钥库解锁提示；
 - v1 到 v2 的每个故障注入点都不丢失唯一秘密副本。
+
+## 16. 原生平台验证记录与 Spike 实验报告
+
+根据阶段 4 实施计划与架构设计约束，对主流操作系统的原生系统凭据库及子进程隔离机制完成了独立 Spike 实验与行为验证，确认技术选型与实现机制如下：
+
+### 16.1 Windows 原生平台验证 (Windows Credential Manager)
+
+- **调用路径**：通过 `advapi32.dll` 导出的 Win32 API（`CredReadW`, `CredWriteW`, `CredDeleteW`, `CredFree`）直接操作 Windows Generic Credentials，完全避免引入 CGO 或依赖第三方外部编译产物。
+- **目标规范**：TargetName 使用 `xops:<storeID>/<itemID>`；凭据类型使用 `CRED_TYPE_GENERIC (1)`；持久化级别设置为 `CRED_PERSIST_LOCAL_MACHINE (2)`。
+- **错误映射验证**：
+  - 读取不存在目标时，系统错误码为 `ERROR_NOT_FOUND (1168 / 0x490)`，精准映射为 `credential.ErrCredentialNotFound`；
+  - 权限不足或会话受限时（`ERROR_ACCESS_DENIED (5)`、`ERROR_NO_SUCH_LOGON_SESSION (1312)`），映射为 `credential.ErrCredentialAccessDenied`；
+  - 成功读出后，对解包字节切片进行防御性拷贝并调用 `CredFree` 释放 Win32 内部非托管内存。
+- **进程树隔离机制 (Job Object)**：
+  - 验证表明：若 Helper 派生子进程并继承标准 I/O，仅调用 `cmd.Process.Kill()` 无法终止后台孙进程，会导致管道写端持续挂起；
+  - 本设计通过 Win32 Job Object（配置 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`）与 `AssignProcessToJobObject` 绑定整个进程树。无论是超时取消还是句柄关闭，Windows 内核均保证原子性销毁包含所有子孙进程的完整进程树。
+
+### 16.2 macOS 原生平台验证 (Keychain Services)
+
+- **调用路径**：基于系统内置 `/usr/bin/security` 命令行工具（`find-generic-password`, `add-generic-password`, `delete-generic-password`），服务名为 `xops:<storeID>`，账户名为 `<itemID>`。
+- **错误映射验证**：
+  - 未找到目标时，返回码 `44` (`errSecItemNotFound`) 或 stderr 提示 `The specified item could not be found in the keychain`，映射为 `credential.ErrCredentialNotFound`；
+  - 钥匙串锁定或禁止交互（`errSecAuthFailed` / `user interaction is not allowed`）映射为 `credential.ErrCredentialStoreLocked`；
+  - 秘密输出完整保留末尾换行与字节切片内容，空字节输出映射为 `ErrCredentialNotFound`。
+- **进程隔离与超时**：配置独立进程组与 `cmd.WaitDelay`，配合 context 超时强制回收管道。
+
+### 16.3 Linux 原生平台验证 (Secret Service & Headless 检测)
+
+- **规范与调用**：遵循 FreeDesktop.org Secret Service 规范；原生命令行交互集成系统标准 `secret-tool` (`libsecret`)。
+- **属性标签**：存储属性为 `xops-store = <storeID>`、`xops-item = <itemID>`，展示标签为 `xops:<storeID>/<itemID>`。
+- **Headless 与环境前置检测**：
+  - Spike 实验表明：在无 D-Bus 会话（如 SSH 远程会话、无桌面环境的 Linux 服务器、容器等）中调用 Secret Service，会导致长时间阻塞或失败；
+  - 本设计提供显式可用性前置检查 `checkPlatformSystemAvailability`：当缺少 `DBUS_SESSION_BUS_ADDRESS`、`DISPLAY` 和 `WAYLAND_DISPLAY` 时直接 fail-closed，返回明确的 `ErrCredentialStoreUnavailable`；
+  - 在 headless 环境下，引导用户采用 `pass`（结合 GPG key）或自定义 `helper` 存储凭据。
+
+### 16.4 进程隔离与安全诊断脱敏
+
+- **默认超时上限**：所有 Helper 和 Pass 子进程执行强制应用 `DefaultHelperTimeout = 30s`，禁止无超时阻塞；
+- **管道防死锁与等待上限**：配置 `DefaultProcessWaitDelay = 50ms`，配合各平台进程组/Job Object 终止机制，彻底解决“父进程提前退出但孙进程继承管道导致长时间挂死”的问题；
+- **诊断信息清洗**：通过 `SanitizeDiagnostic` 自动屏蔽 Base64 载荷（匹配 16 字符以上 Base64）与请求机密原文，杜绝错误回显导致的机密逆向泄露。
+
