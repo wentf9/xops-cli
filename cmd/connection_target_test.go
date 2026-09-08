@@ -48,6 +48,14 @@ func setupTestRepository(t *testing.T) *config.Repository {
 		Alias:       []string{"web-01"},
 		Tags:        []string{"production"},
 	})
+	// 显式指定 none store，防止在 CI headless Linux 环境（无 D-Bus）中
+	// credentialConfigOrDefault 尝试初始化 system store 失败
+	snapshot.Credential = &config.CredentialConfig{
+		DefaultStore: "none",
+		Stores: map[string]config.StoreConfig{
+			"none": {Type: config.StoreTypeNone},
+		},
+	}
 
 	store := &memoryStore{cfg: snapshot}
 	repo, err := config.NewRepositoryWithoutOpenSSH(snapshot, store)

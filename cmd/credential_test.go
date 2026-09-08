@@ -157,6 +157,13 @@ func TestCredentialGC(t *testing.T) {
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
 		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
 		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
+		// 显式指定 none store，防止在 CI headless Linux 环境（无 D-Bus）中尝试初始化 system store 失败
+		Credential: &config.CredentialConfig{
+			DefaultStore: "none",
+			Stores: map[string]config.StoreConfig{
+				"none": {Type: config.StoreTypeNone},
+			},
+		},
 	}
 	if err := store.Save(cfg); err != nil {
 		t.Fatalf("failed to save test config: %v", err)
