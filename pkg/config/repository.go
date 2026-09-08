@@ -1149,3 +1149,309 @@ func validateConfiguration(cfg *Configuration) error {
 	}
 	return nil
 }
+
+// UpdateNodeCredentialRefAtVersionContext updates the specified credential reference on a node.
+// If the node shares an identity with other nodes, updating authentication credentials (KindLoginPassword or KindPassphrase)
+// automatically forks a private identity for the node, preserving shared templates for other nodes.
+func (r *Repository) UpdateNodeCredentialRefAtVersionContext(
+	ctx context.Context,
+	nodeID string,
+	expectedVersion string,
+	kind credential.Kind,
+	newRef *credential.Ref,
+) (MutationOutcome, string, error) {
+	if err := kind.Validate(); err != nil {
+		return MutationOutcome{}, "", err
+	}
+	if newRef != nil {
+		if err := newRef.Validate(); err != nil {
+			return MutationOutcome{}, "", err
+		}
+	}
+
+	var committedVersion string
+	commitResult, err := r.commitResultContext(ctx, anyRevision, func(cfg *Configuration) error {
+		switch kind {
+		case credential.KindLoginPassword, credential.KindPassphrase:
+			ver, updateErr := updateNodeAuthCredentialRef(cfg, nodeID, expectedVersion, kind, newRef)
+			if updateErr != nil {
+				return updateErr
+			}
+			committedVersion = ver
+			return nil
+
+		case credential.KindPrivilegePassword:
+			ver, updateErr := updateNodeSudoCredentialRef(cfg, nodeID, expectedVersion, newRef)
+			if updateErr != nil {
+				return updateErr
+			}
+			committedVersion = ver
+			return nil
+
+		default:
+			return fmt.Errorf("%w: unsupported credential kind %q", credential.ErrInvalidRef, kind)
+		}
+	})
+
+	if err != nil {
+		if commitResult.Applied {
+			return MutationOutcome{Applied: true, Durable: false}, committedVersion, err
+		}
+		return MutationOutcome{Applied: false, Durable: false}, "", err
+	}
+	return MutationOutcome{Applied: true, Durable: commitResult.Durable}, committedVersion, nil
+}
+
+func updateNodeAuthCredentialRef(
+	cfg *Configuration,
+	nodeID string,
+	expectedVersion string,
+	kind credential.Kind,
+	newRef *credential.Ref,
+) (string, error) {
+	node, ok := cfg.Nodes.Get(nodeID)
+	if !ok {
+		return "", fmt.Errorf("resolve node %q for credential update: %w", nodeID, ErrNodeNotFound)
+	}
+
+	currentVer, verErr := nodeAuthVersion(cfg, nodeID)
+	if verErr != nil {
+		return "", verErr
+	}
+	if expectedVersion != "" {
+		expected, expErr := versionFromString(expectedVersion)
+		if expErr != nil {
+			return "", fmt.Errorf("node %q auth expected version invalid: %w", nodeID, expErr)
+		}
+		if currentVer != expected {
+			return "", fmt.Errorf("authentication for node %q changed: %w", nodeID, ErrConfigConflict)
+		}
+	}
+
+	identity, ok := cfg.Identities.Get(node.IdentityRef)
+	if !ok {
+		return "", fmt.Errorf("resolve identity %q for node %q: %w", node.IdentityRef, nodeID, ErrIdentityNotFound)
+	}
+
+	// 检查是否共享：若有多个节点引用该 Identity，分裂出私有副本
+	if countNodeReferences(cfg, func(candidate models.Node) bool {
+		return candidate.IdentityRef == node.IdentityRef
+	}) > 1 {
+		node.IdentityRef = privateIdentityReference(cfg, nodeID)
+		cfg.Nodes.Set(nodeID, node)
+	}
+
+	if kind == credential.KindLoginPassword {
+		identity.LoginPasswordRef = newRef.Clone()
+		identity.Password = ""
+		if newRef != nil && !newRef.IsEmpty() {
+			identity.AuthType = "password"
+		}
+	} else {
+		identity.PassphraseRef = newRef.Clone()
+		identity.Passphrase = ""
+		if newRef != nil && !newRef.IsEmpty() {
+			identity.AuthType = "key"
+		}
+	}
+
+	cfg.Identities.Set(node.IdentityRef, identity)
+
+	newVer, verErr := nodeAuthVersion(cfg, nodeID)
+	if verErr != nil {
+		return "", verErr
+	}
+	return string(newVer[:]), nil
+}
+
+func updateNodeSudoCredentialRef(
+	cfg *Configuration,
+	nodeID string,
+	expectedVersion string,
+	newRef *credential.Ref,
+) (string, error) {
+	node, ok := cfg.Nodes.Get(nodeID)
+	if !ok {
+		return "", fmt.Errorf("resolve node %q for credential update: %w", nodeID, ErrNodeNotFound)
+	}
+
+	currentVer, verErr := nodeSudoVersion(cfg, nodeID)
+	if verErr != nil {
+		return "", verErr
+	}
+	if expectedVersion != "" {
+		expected, expErr := versionFromString(expectedVersion)
+		if expErr != nil {
+			return "", fmt.Errorf("node %q sudo expected version invalid: %w", nodeID, expErr)
+		}
+		if currentVer != expected {
+			return "", fmt.Errorf("sudo settings for node %q changed: %w", nodeID, ErrConfigConflict)
+		}
+	}
+
+	node.PrivilegePasswordRef = newRef.Clone()
+	node.SuPwd = ""
+	cfg.Nodes.Set(nodeID, node)
+
+	newVer, verErr := nodeSudoVersion(cfg, nodeID)
+	if verErr != nil {
+		return "", verErr
+	}
+	return string(newVer[:]), nil
+}
+
+// UpdateIdentityCredentialRefAtVersionContext updates the specified credential reference directly on an identity.
+func (r *Repository) UpdateIdentityCredentialRefAtVersionContext(
+	ctx context.Context,
+	identityID string,
+	expectedVersion string,
+	kind credential.Kind,
+	newRef *credential.Ref,
+) (MutationOutcome, string, error) {
+	if err := kind.Validate(); err != nil {
+		return MutationOutcome{}, "", err
+	}
+	if kind != credential.KindLoginPassword && kind != credential.KindPassphrase {
+		return MutationOutcome{}, "", fmt.Errorf("invalid credential kind %q for identity: only login_password and passphrase supported", kind)
+	}
+	if newRef != nil {
+		if err := newRef.Validate(); err != nil {
+			return MutationOutcome{}, "", err
+		}
+	}
+
+	var committedVersion string
+	commitResult, err := r.commitResultContext(ctx, anyRevision, func(cfg *Configuration) error {
+		identity, ok := cfg.Identities.Get(identityID)
+		if !ok {
+			return fmt.Errorf("resolve identity %q for credential update: %w", identityID, ErrIdentityNotFound)
+		}
+
+		currentVer, verErr := identityEntityVersion(cfg, identityID)
+		if verErr != nil {
+			return verErr
+		}
+		if expectedVersion != "" {
+			expected, expErr := versionFromString(expectedVersion)
+			if expErr != nil {
+				return fmt.Errorf("identity %q expected version invalid: %w", identityID, expErr)
+			}
+			if currentVer != expected {
+				return fmt.Errorf("identity %q changed: %w", identityID, ErrConfigConflict)
+			}
+		}
+
+		if kind == credential.KindLoginPassword {
+			identity.LoginPasswordRef = newRef.Clone()
+			identity.Password = ""
+			if newRef != nil && !newRef.IsEmpty() {
+				identity.AuthType = "password"
+			}
+		} else {
+			identity.PassphraseRef = newRef.Clone()
+			identity.Passphrase = ""
+			if newRef != nil && !newRef.IsEmpty() {
+				identity.AuthType = "key"
+			}
+		}
+
+		cfg.Identities.Set(identityID, identity)
+
+		newVer, verErr := identityEntityVersion(cfg, identityID)
+		if verErr != nil {
+			return verErr
+		}
+		committedVersion = string(newVer[:])
+		return nil
+	})
+
+	if err != nil {
+		if commitResult.Applied {
+			return MutationOutcome{Applied: true, Durable: false}, committedVersion, err
+		}
+		return MutationOutcome{Applied: false, Durable: false}, "", err
+	}
+	return MutationOutcome{Applied: true, Durable: commitResult.Durable}, committedVersion, nil
+}
+
+// CheckRefUnreferenced checks whether the given credential reference is unreferenced anywhere
+// in the latest active configuration snapshot.
+func (r *Repository) CheckRefUnreferenced(ctx context.Context, ref credential.Ref) (bool, error) {
+	if ref.IsEmpty() {
+		return true, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	snapshot := r.provider.Snapshot()
+	if snapshot == nil {
+		return true, nil
+	}
+
+	if snapshot.Identities != nil {
+		for _, k := range snapshot.Identities.Keys() {
+			id, ok := snapshot.Identities.Get(k)
+			if !ok {
+				continue
+			}
+			if id.LoginPasswordRef != nil && *id.LoginPasswordRef == ref {
+				return false, nil
+			}
+			if id.PassphraseRef != nil && *id.PassphraseRef == ref {
+				return false, nil
+			}
+		}
+	}
+
+	if snapshot.Nodes != nil {
+		for _, k := range snapshot.Nodes.Keys() {
+			node, ok := snapshot.Nodes.Get(k)
+			if !ok {
+				continue
+			}
+			if node.PrivilegePasswordRef != nil && *node.PrivilegePasswordRef == ref {
+				return false, nil
+			}
+		}
+	}
+
+	return true, nil
+}
+
+// RepositoryConfigUpdater adapts a Repository to satisfy credential.ConfigUpdater.
+type RepositoryConfigUpdater struct {
+	repo *Repository
+}
+
+// NewRepositoryConfigUpdater creates a new RepositoryConfigUpdater.
+func NewRepositoryConfigUpdater(repo *Repository) *RepositoryConfigUpdater {
+	return &RepositoryConfigUpdater{repo: repo}
+}
+
+// ApplyCredentialRefAtVersion commits a credential reference mutation to the repository.
+func (u *RepositoryConfigUpdater) ApplyCredentialRefAtVersion(
+	ctx context.Context,
+	target credential.Target,
+	expectedVersion string,
+	newRef *credential.Ref,
+) (credential.MutationOutcome, string, error) {
+	if target.NodeID != "" {
+		outcome, newVer, err := u.repo.UpdateNodeCredentialRefAtVersionContext(ctx, target.NodeID, expectedVersion, target.Kind, newRef)
+		return credential.MutationOutcome{Applied: outcome.Applied, Durable: outcome.Durable}, newVer, err
+	}
+	if target.IdentityID != "" {
+		outcome, newVer, err := u.repo.UpdateIdentityCredentialRefAtVersionContext(ctx, target.IdentityID, expectedVersion, target.Kind, newRef)
+		return credential.MutationOutcome{Applied: outcome.Applied, Durable: outcome.Durable}, newVer, err
+	}
+	return credential.MutationOutcome{}, "", fmt.Errorf("target must specify nodeID or identityID")
+}
+
+// CheckRefUnreferenced checks whether the reference is unreferenced in the configuration.
+func (u *RepositoryConfigUpdater) CheckRefUnreferenced(ctx context.Context, ref credential.Ref) (bool, error) {
+	return u.repo.CheckRefUnreferenced(ctx, ref)
+}
+
+// AsConfigUpdater returns the credential.ConfigUpdater adapter for the repository.
+func (r *Repository) AsConfigUpdater() credential.ConfigUpdater {
+	return NewRepositoryConfigUpdater(r)
+}
