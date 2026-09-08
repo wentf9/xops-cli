@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/wentf9/xops-cli/pkg/config"
+	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
 	"github.com/wentf9/xops-cli/pkg/ssh"
 	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
@@ -25,6 +26,35 @@ type adapterTestStore struct{}
 func (adapterTestStore) Load() (*config.Configuration, error) { return nil, nil }
 
 func (adapterTestStore) Save(*config.Configuration) error { return nil }
+
+type adapterCredentialStore struct {
+	mu   sync.Mutex
+	data map[string]credential.Secret
+}
+
+func (s *adapterCredentialStore) Get(_ context.Context, ref credential.Ref) (credential.Secret, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	secret, ok := s.data[ref.ItemID]
+	if !ok {
+		return credential.Secret{}, credential.ErrCredentialNotFound
+	}
+	return credential.NewSecret(secret.Value), nil
+}
+
+func (s *adapterCredentialStore) Put(_ context.Context, ref credential.Ref, secret credential.Secret) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data[ref.ItemID] = credential.NewSecret(secret.Value)
+	return nil
+}
+
+func (s *adapterCredentialStore) Delete(_ context.Context, ref credential.Ref) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.data, ref.ItemID)
+	return nil
+}
 
 func setTestHome(t *testing.T) string {
 	t.Helper()
@@ -153,6 +183,89 @@ Host remote-app
 	}
 	if clientConfig.AuthUpdateToken != "" || clientConfig.SudoUpdateToken != "" {
 		t.Fatalf("virtual OpenSSH node must not carry persistence tokens: %+v", clientConfig)
+	}
+}
+
+func TestSSHAdapterSessionAuthOverrideUsesAutoAuth(t *testing.T) {
+	cfg := &config.Configuration{
+		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
+		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
+		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
+	}
+	cfg.Nodes.Set("node", models.Node{HostRef: "host", IdentityRef: "identity"})
+	cfg.Hosts.Set("host", models.Host{Address: "192.0.2.1", Port: 22})
+	cfg.Identities.Set("identity", models.Identity{User: "root", AuthType: "password"})
+
+	adapter := NewSSHAdapter(config.NewProviderWithoutOpenSSH(cfg), WithSessionAuthOverride("node", SessionAuth{
+		Password: "session-password",
+		KeyPath:  "/tmp/session-key",
+	}))
+	clientCfg, err := adapter.GetConfig("node")
+	if err != nil {
+		t.Fatalf("GetConfig() error = %v", err)
+	}
+	if clientCfg.AuthType != "auto" {
+		t.Fatalf("AuthType = %q, want auto so successful authentication can be recorded", clientCfg.AuthType)
+	}
+	if clientCfg.KeyPath != "/tmp/session-key" {
+		t.Fatalf("KeyPath = %q, want session override", clientCfg.KeyPath)
+	}
+}
+
+func TestSSHAdapterSessionPasswordRememberedAfterSuccessfulConnection(t *testing.T) {
+	setTestHome(t)
+	host, port, stopServer := startAdapterPrivilegeSSHServer(t, "session-password", "")
+	t.Cleanup(stopServer)
+
+	cfg := &config.Configuration{
+		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
+		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
+		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
+		Credential: &config.CredentialConfig{DefaultStore: "memory"},
+	}
+	cfg.Nodes.Set("node", models.Node{HostRef: "host", IdentityRef: "identity"})
+	cfg.Hosts.Set("host", models.Host{Address: host, Port: uint16(port)})
+	cfg.Identities.Set("identity", models.Identity{User: "root", AuthType: "auto"})
+	repository, err := config.NewRepositoryWithoutOpenSSH(cfg, adapterTestStore{})
+	if err != nil {
+		t.Fatalf("create repository: %v", err)
+	}
+	store := &adapterCredentialStore{data: make(map[string]credential.Secret)}
+	registry := credential.NewRegistry()
+	if err := registry.Register("memory", store); err != nil {
+		t.Fatalf("register store: %v", err)
+	}
+	journal, err := credential.NewJournalStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("create journal store: %v", err)
+	}
+	service, err := credential.NewService(registry, journal, repository.AsConfigUpdater(), nil)
+	if err != nil {
+		t.Fatalf("create credential service: %v", err)
+	}
+	connector := NewConnectorWithAdapterOptions(repository, []Option{
+		WithCredentialService(service),
+		WithSessionAuthOverride("node", SessionAuth{Password: "session-password", Remember: true}),
+	})
+	connector.AcceptNewHostKey.Store(true)
+	t.Cleanup(func() { _ = connector.CloseAll() })
+	if _, err := connector.Connect(t.Context(), "node"); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	snapshot, err := repository.ResolveConnection("node")
+	if err != nil {
+		t.Fatalf("resolve updated node: %v", err)
+	}
+	if snapshot.Identity.LoginPasswordRef == nil {
+		t.Fatal("successful remembered session password did not create a reference")
+	}
+	secret, err := store.Get(t.Context(), *snapshot.Identity.LoginPasswordRef)
+	if err != nil {
+		t.Fatalf("read saved password: %v", err)
+	}
+	defer secret.Zero()
+	if string(secret.Value) != "session-password" {
+		t.Fatalf("saved password = %q", secret.Value)
 	}
 }
 

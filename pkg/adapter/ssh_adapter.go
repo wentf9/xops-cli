@@ -14,6 +14,7 @@ import (
 type SessionAuth struct {
 	Password   string
 	Passphrase string
+	KeyPath    string
 	SuPwd      string
 	Remember   bool
 }
@@ -202,10 +203,18 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 	if override, ok := a.getSessionOverride(nodeID); ok {
 		if override.Password != "" {
 			cfg.Password = override.Password
-			cfg.AuthType = "password"
 		}
 		if override.Passphrase != "" {
 			cfg.Passphrase = override.Passphrase
+		}
+		if override.KeyPath != "" {
+			cfg.KeyPath = override.KeyPath
+		}
+		// Route explicit session material through auto authentication. This lets
+		// the connector record it after a successful handshake when requested,
+		// while still keeping it out of the configuration before that point.
+		if override.Password != "" || override.Passphrase != "" || override.KeyPath != "" {
+			cfg.AuthType = "auto"
 		}
 		if override.SuPwd != "" {
 			cfg.SuPwd = override.SuPwd

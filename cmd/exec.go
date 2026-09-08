@@ -260,6 +260,7 @@ type execHostTask struct {
 	user       string
 	pass       string
 	passphrase string
+	keyPath    string
 }
 
 func (o *ExecOptions) Run() error {
@@ -327,7 +328,12 @@ func (o *ExecOptions) RunContext(ctx context.Context) (retErr error) {
 	if optErr != nil {
 		return optErr
 	}
-	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
+	var connector *ssh.Connector
+	if o.Interactive {
+		connector = newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
+	} else {
+		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
+	}
 	defer func() {
 		joinConnectorCloseError(&retErr, connector)
 	}()
@@ -421,12 +427,18 @@ func (o *ExecOptions) runInteractive(
 
 func (o *ExecOptions) buildAdapterOptions(tasks []execHostTask, cfg *config.Configuration, repository *config.Repository) ([]adapter.Option, error) {
 	var adpOpts []adapter.Option
-	rememberAny := false
+	if !o.Interactive {
+		// Batch execution must fail closed instead of waiting for a terminal
+		// prompt, and must never record automatically discovered credentials.
+		adpOpts = append(adpOpts, adapter.WithNonInteractive(true))
+	}
+	remember := o.shouldRememberCredential("batch execution")
+	// A global policy applies to proxy-jump nodes, which do not have a task
+	// specific override. Explicit task credentials remain scoped to their target.
+	adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{Remember: remember}))
 	for _, task := range tasks {
-		shouldRemember := utils.ShouldRememberCredential(o.Remember, task.host)
-		rememberAny = rememberAny || shouldRemember
 		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(task.nodeID, adapter.SessionAuth{
-			Password: task.pass, Passphrase: task.passphrase, SuPwd: o.SuPwd, Remember: shouldRemember,
+			Password: task.pass, Passphrase: task.passphrase, KeyPath: task.keyPath, SuPwd: o.SuPwd, Remember: remember,
 		}))
 	}
 	if reg, regErr := utils.GetCredentialRegistry(cfg); regErr != nil {
@@ -434,7 +446,7 @@ func (o *ExecOptions) buildAdapterOptions(tasks []execHostTask, cfg *config.Conf
 	} else if reg != nil {
 		adpOpts = append(adpOpts, adapter.WithCredentialSource(reg))
 	}
-	if rememberAny {
+	if remember {
 		service, err := utils.GetCredentialService(repository, cfg)
 		if err != nil {
 			return nil, fmt.Errorf("initialize credential persistence: %w", err)
@@ -442,6 +454,13 @@ func (o *ExecOptions) buildAdapterOptions(tasks []execHostTask, cfg *config.Conf
 		adpOpts = append(adpOpts, adapter.WithCredentialService(service))
 	}
 	return adpOpts, nil
+}
+
+func (o *ExecOptions) shouldRememberCredential(target string) bool {
+	if !o.Interactive {
+		return false
+	}
+	return utils.ShouldRememberCredential(o.Remember, target)
 }
 
 func (o *ExecOptions) getOrCreateNode(ctx context.Context, repository *config.Repository, target config.ConnectionTarget, addr utils.HostInfo) (string, bool, error) {
@@ -655,6 +674,10 @@ func (o *ExecOptions) buildTasksFromTags(provider config.ConfigProvider) ([]exec
 			password = o.Password
 		}
 		passphrase := o.Passphrase
+		keyPath := ""
+		if o.IdentityFile != "" {
+			keyPath = utils.ToAbsolutePath(o.IdentityFile)
+		}
 		tasks = append(tasks, execHostTask{
 			nodeID:     nodeID,
 			host:       hostObj.Address,
@@ -662,6 +685,7 @@ func (o *ExecOptions) buildTasksFromTags(provider config.ConfigProvider) ([]exec
 			user:       identity.User,
 			pass:       password,
 			passphrase: passphrase,
+			keyPath:    keyPath,
 		})
 	}
 	return tasks, nil
@@ -695,6 +719,10 @@ func (o *ExecOptions) buildTasksFromHosts(ctx context.Context, repository *confi
 		if passphrase == "" {
 			passphrase = o.Passphrase
 		}
+		keyPath := h.KeyPath
+		if keyPath == "" {
+			keyPath = o.IdentityFile
+		}
 		alias := h.Alias
 		if alias == "" {
 			alias = o.Alias
@@ -716,8 +744,8 @@ func (o *ExecOptions) buildTasksFromHosts(ctx context.Context, repository *confi
 			User:       user,
 			Password:   password,
 			Alias:      alias,
-			KeyPath:    h.KeyPath,
-			Passphrase: h.Passphrase,
+			KeyPath:    keyPath,
+			Passphrase: passphrase,
 		}
 		nodeID, _, err := o.getOrCreateNode(ctx, repository, target, addr)
 		if err != nil {
@@ -731,6 +759,7 @@ func (o *ExecOptions) buildTasksFromHosts(ctx context.Context, repository *confi
 			user:       user,
 			pass:       password,
 			passphrase: passphrase,
+			keyPath:    utils.ToAbsolutePath(keyPath),
 		})
 	}
 	return tasks, hostErrs, nil
@@ -759,7 +788,7 @@ func (o *ExecOptions) updateNodeFromHostInfo(ctx context.Context, nodeID string,
 		return false, fmt.Errorf("resolve exec node %q for update failed: %w", nodeID, err)
 	}
 	updated := false
-	shouldRemember := utils.ShouldRememberCredential(o.Remember, addr.Host)
+	shouldRemember := o.shouldRememberCredential(addr.Host)
 	if shouldRemember {
 		updated = o.updateIdentity(&identity, addr) || updated
 		updated = o.updateNodeSudo(&node) || updated

@@ -327,11 +327,15 @@ func (o *SshOptions) runParentDaemon(ctx context.Context) (err error) {
 func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuration, repository *config.Repository) ([]adapter.Option, error) {
 	var adpOpts []adapter.Option
 	shouldRemember := utils.ShouldRememberCredential(o.Remember, o.Target.Selector)
+	// The global policy also covers ProxyJump nodes. The target-specific override
+	// below carries its explicit session material without leaking it to jumps.
+	adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{Remember: shouldRemember}))
 	// 总是注入 SessionAuthOverride（即使密码为空），以便 UpdateAuth / UpdateSudo
 	// 能根据 Remember 策略决定是否将交互提示获得的密码回写配置，而不是绕过策略检查。
 	adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, adapter.SessionAuth{
 		Password:   o.Password,
 		Passphrase: o.Passphrase,
+		KeyPath:    utils.ToAbsolutePath(o.IdentityFile),
 		Remember:   shouldRemember,
 	}))
 	if reg, regErr := utils.GetCredentialRegistry(cfg); regErr != nil {

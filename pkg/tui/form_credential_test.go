@@ -415,6 +415,21 @@ func TestNodeFormCredentialDelete_ServiceFailurePreservesReference(t *testing.T)
 	}
 }
 
+func TestNodeFormCredentialDelete_RemovesLegacyPlaintext(t *testing.T) {
+	repo := newTestRepository(t, newFormCredentialTestConfiguration("legacy-password"))
+	model := newPasswordReplaceFormModel(repo, newFormCredentialTestService(t, repo, newMemoryCredentialStore()), "")
+	model.formState.passwordAction = "delete"
+	completeConfigurationMutation(t, model, model.saveFormCmd())
+
+	snapshot, err := repo.ResolveConnection(formCredentialTestNodeID)
+	if err != nil {
+		t.Fatalf("resolve connection: %v", err)
+	}
+	if snapshot.Identity.Password != "" {
+		t.Fatalf("legacy password = %q, want empty after delete", snapshot.Identity.Password)
+	}
+}
+
 const formCredentialTestNodeID = "user@192.168.1.50:22"
 
 func newFormCredentialTestConfiguration(password string) *config.Configuration {

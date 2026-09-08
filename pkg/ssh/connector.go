@@ -1012,8 +1012,13 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 			HandshakeTimeout:   c.getHandshakeTimeout(),
 			InteractionTimeout: c.interactionTimeout,
 			FailClosed:         failClosed,
+			KeyPath:            cfg.KeyPath,
 			PasswordCallback: func(s string) {
 				if s != "" {
+					// Authentication methods are tried in order. If a key was
+					// attempted first but failed, only the password that follows it
+					// may be persisted after a successful handshake.
+					cfg.Passphrase = ""
 					cfg.Password = s
 					cfg.AuthType = "password"
 					if onAuthDiscovered != nil {
@@ -1023,6 +1028,10 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 			},
 			PassphraseCallback: func(keyPath, passphrase string) {
 				if passphrase != "" {
+					// This key attempt precedes password fallback. Clear an
+					// untried session password so a successful key login cannot
+					// persist credentials that were never authenticated.
+					cfg.Password = ""
 					cfg.KeyPath = keyPath
 					cfg.Passphrase = passphrase
 					cfg.AuthType = "key"

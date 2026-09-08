@@ -5,7 +5,9 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509"
 	"encoding/binary"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net"
@@ -554,6 +556,107 @@ func TestPlaintextLifetime_PassphraseReleasedAfterSignerCreation(t *testing.T) {
 	}
 	if !allZero {
 		t.Errorf("expected passphrase slice to be wiped with zeroBytes, got: %q", string(passphraseBytes))
+	}
+}
+
+func TestAutoAuth_UsesExplicitKeyPath(t *testing.T) {
+	tempHome := setTestHome(t)
+	t.Setenv("SSH_AUTH_SOCK", "")
+
+	const passphrase = "explicit-key-passphrase"
+	keyPEM, pubKey := generateTestEncryptedKey(t, passphrase)
+	keyPath := filepath.Join(tempHome, "non-default-key")
+	if err := os.WriteFile(keyPath, keyPEM, 0600); err != nil {
+		t.Fatalf("write explicit key: %v", err)
+	}
+	host, port, cleanup := startLifetimeTestSSHServer(t, "", pubKey)
+	defer cleanup()
+
+	resolver := newProbeSecretResolver()
+	resolver.setSecret(SecretKindPrivateKeyPassphrase, []byte(passphrase))
+	provider := &standaloneConnectionProvider{cfg: &ClientConfig{
+		NodeID: "explicit-key", Address: host, Port: port, User: "testuser", AuthType: "auto", KeyPath: keyPath,
+	}}
+	connector := NewConnector(provider, WithSecretResolver(resolver))
+	connector.AcceptNewHostKey.Store(true)
+	t.Cleanup(func() { _ = connector.CloseAll() })
+
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	if _, err := connector.Connect(ctx, "explicit-key"); err != nil {
+		t.Fatalf("connect with explicit key in auto mode: %v", err)
+	}
+}
+
+func TestAutoAuth_KeySuccessDoesNotRecordUntriedPassword(t *testing.T) {
+	tempHome := setTestHome(t)
+	t.Setenv("SSH_AUTH_SOCK", "")
+
+	const passphrase = "key-only-passphrase"
+	keyPEM, pubKey := generateTestEncryptedKey(t, passphrase)
+	keyPath := filepath.Join(tempHome, "key-only")
+	if err := os.WriteFile(keyPath, keyPEM, 0600); err != nil {
+		t.Fatalf("write explicit key: %v", err)
+	}
+	host, port, cleanup := startLifetimeTestSSHServer(t, "valid-password", pubKey)
+	defer cleanup()
+
+	store := &characterizationRecordingStore{cfg: &ClientConfig{
+		NodeID: "key-only", Address: host, Port: port, User: "testuser", AuthType: "auto", KeyPath: keyPath,
+		Password: "untried-password", AuthUpdateToken: "token-v1",
+	}}
+	resolver := newProbeSecretResolver()
+	resolver.setSecret(SecretKindPrivateKeyPassphrase, []byte(passphrase))
+	resolver.setSecret(SecretKindLoginPassword, []byte("untried-password"))
+	connector := NewConnector(store, WithSecretResolver(resolver))
+	connector.AcceptNewHostKey.Store(true)
+	t.Cleanup(func() { _ = connector.CloseAll() })
+
+	if _, err := connector.Connect(t.Context(), "key-only"); err != nil {
+		t.Fatalf("connect with explicit key: %v", err)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.lastPassword != "" {
+		t.Fatalf("recorded an untried password %q after key authentication", store.lastPassword)
+	}
+}
+
+func TestAutoAuth_ExplicitKeyPrecedesEncryptedDefaultKey(t *testing.T) {
+	tempHome := setTestHome(t)
+	t.Setenv("SSH_AUTH_SOCK", "")
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate selected key: %v", err)
+	}
+	publicKey, err := ssh.NewPublicKey(&privateKey.PublicKey)
+	if err != nil {
+		t.Fatalf("create selected public key: %v", err)
+	}
+	selectedKeyPath := filepath.Join(tempHome, "selected-key")
+	selectedKey := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)})
+	if err := os.WriteFile(selectedKeyPath, selectedKey, 0600); err != nil {
+		t.Fatalf("write selected key: %v", err)
+	}
+	defaultKey, _ := generateTestEncryptedKey(t, "unrelated-passphrase")
+	defaultKeyPath := filepath.Join(tempHome, ".ssh", "id_rsa")
+	if err := os.MkdirAll(filepath.Dir(defaultKeyPath), 0700); err != nil {
+		t.Fatalf("create default key directory: %v", err)
+	}
+	if err := os.WriteFile(defaultKeyPath, defaultKey, 0600); err != nil {
+		t.Fatalf("write unrelated default key: %v", err)
+	}
+	host, port, cleanup := startLifetimeTestSSHServer(t, "unused-password", publicKey)
+	defer cleanup()
+
+	provider := &standaloneConnectionProvider{cfg: &ClientConfig{
+		NodeID: "selected-key", Address: host, Port: port, User: "testuser", AuthType: "auto", KeyPath: selectedKeyPath,
+	}}
+	connector := NewConnector(provider)
+	connector.AcceptNewHostKey.Store(true)
+	t.Cleanup(func() { _ = connector.CloseAll() })
+	if _, err := connector.Connect(t.Context(), "selected-key"); err != nil {
+		t.Fatalf("explicit key was blocked by unrelated default key: %v", err)
 	}
 }
 

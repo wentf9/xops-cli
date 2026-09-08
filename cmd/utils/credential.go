@@ -39,6 +39,12 @@ func GetCredentialRegistry(cfg *config.Configuration) (*credential.Registry, err
 	if cfg == nil {
 		return nil, fmt.Errorf("configuration is nil")
 	}
+	// A configuration without a credential section has no references to resolve.
+	// Do not eagerly initialize the platform keyring: session-only connections
+	// must work in headless environments where that keyring is unavailable.
+	if cfg.Credential == nil {
+		return nil, nil
+	}
 	return config.BuildRegistryFromConfig(credentialConfigOrDefault(cfg))
 }
 

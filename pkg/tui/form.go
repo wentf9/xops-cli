@@ -504,8 +504,16 @@ func (s *nodeFormState) applyIdentityCredentials(identity *models.Identity, absK
 			identity.Password = s.existingPlainPassword
 			identity.LoginPasswordRef = s.existingPasswordRef
 		case "delete":
-			identity.Password = s.existingPlainPassword
-			identity.LoginPasswordRef = s.existingPasswordRef.Clone()
+			if s.existingPasswordRef != nil {
+				// Keep the reference until credential.Service completes its
+				// transactional delete. This preserves a usable configuration if
+				// the store operation fails.
+				identity.Password = s.existingPlainPassword
+				identity.LoginPasswordRef = s.existingPasswordRef.Clone()
+			} else {
+				identity.Password = ""
+				identity.LoginPasswordRef = nil
+			}
 		case "replace":
 			// The secret is committed by credential.Service after this metadata
 			// update. Keep the previous ref until that transaction succeeds, so a
@@ -523,8 +531,13 @@ func (s *nodeFormState) applyIdentityCredentials(identity *models.Identity, absK
 			identity.Passphrase = s.existingPlainPassphrase
 			identity.PassphraseRef = s.existingPassphraseRef
 		case "delete":
-			identity.Passphrase = s.existingPlainPassphrase
-			identity.PassphraseRef = s.existingPassphraseRef.Clone()
+			if s.existingPassphraseRef != nil {
+				identity.Passphrase = s.existingPlainPassphrase
+				identity.PassphraseRef = s.existingPassphraseRef.Clone()
+			} else {
+				identity.Passphrase = ""
+				identity.PassphraseRef = nil
+			}
 		case "replace":
 			identity.Passphrase = s.existingPlainPassphrase
 			identity.PassphraseRef = s.existingPassphraseRef.Clone()

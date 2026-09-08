@@ -440,6 +440,128 @@ func TestCommands_ExecTagUsesExplicitSessionCredentials(t *testing.T) {
 	}
 }
 
+func TestCommands_SSHSessionOnlyDoesNotInitializeSystemStore(t *testing.T) {
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "")
+	t.Setenv("DISPLAY", "")
+	t.Setenv("WAYLAND_DISPLAY", "")
+
+	repo := setupTestRepository(t)
+	cfg := repo.Snapshot()
+	cfg.Credential = nil
+	o := NewSshOptions()
+	o.Remember = "never"
+	if _, err := o.buildAdapterOptions("iaas@10.238.221.181:22", cfg, repo); err != nil {
+		t.Fatalf("build session-only options: %v", err)
+	}
+}
+
+func TestCommands_SSHRememberNeverCoversProxyJump(t *testing.T) {
+	repo := setupTestRepository(t)
+	o := NewSshOptions()
+	o.Remember = "never"
+	opts, err := o.buildAdapterOptions("final-node", repo.Snapshot(), repo)
+	if err != nil {
+		t.Fatalf("build adapter options: %v", err)
+	}
+	adp := adapter.NewSSHAdapter(repo, opts...)
+	jumpID := "iaas@10.238.221.181:22"
+	clientCfg, err := adp.GetConfig(jumpID)
+	if err != nil {
+		t.Fatalf("resolve jump config: %v", err)
+	}
+	if _, err := adp.UpdateAuth(t.Context(), jumpID, clientCfg.AuthUpdateToken, "jump-secret", "", ""); err != nil {
+		t.Fatalf("update jump auth: %v", err)
+	}
+	snapshot, err := repo.ResolveConnection(jumpID)
+	if err != nil {
+		t.Fatalf("resolve jump node: %v", err)
+	}
+	if snapshot.Identity.Password == "jump-secret" {
+		t.Fatal("--remember=never persisted a ProxyJump password")
+	}
+}
+
+func TestCommands_SSHSessionOnlyUsesSelectedKey(t *testing.T) {
+	repo := setupTestRepository(t)
+	o := NewSshOptions()
+	o.Remember = "never"
+	o.IdentityFile = "/tmp/session-only-key"
+	o.Target = config.ConnectionTarget{Selector: "10.238.221.181", User: "iaas", HasUser: true}
+	nodeID, _, err := o.resolveNode(t.Context(), repo)
+	if err != nil {
+		t.Fatalf("resolve node: %v", err)
+	}
+	opts, err := o.buildAdapterOptions(nodeID, repo.Snapshot(), repo)
+	if err != nil {
+		t.Fatalf("build adapter options: %v", err)
+	}
+	clientCfg, err := adapter.NewSSHAdapter(repo, opts...).GetConfig(nodeID)
+	if err != nil {
+		t.Fatalf("get connection config: %v", err)
+	}
+	if clientCfg.KeyPath != o.IdentityFile {
+		t.Fatalf("KeyPath = %q, want %q", clientCfg.KeyPath, o.IdentityFile)
+	}
+}
+
+func TestCommands_ExecBatchNeverPromptsOrRecords(t *testing.T) {
+	o := NewExecOptions()
+	o.Remember = utils.RememberPolicyAlways
+	if o.shouldRememberCredential("node") {
+		t.Fatal("batch execution must ignore --remember and remain session-only")
+	}
+}
+
+func TestCommands_ExecRememberNeverCoversProxyJump(t *testing.T) {
+	repo := setupTestRepository(t)
+	o := NewExecOptions()
+	o.Interactive = true
+	o.Remember = utils.RememberPolicyNever
+	opts, err := o.buildAdapterOptions([]execHostTask{{nodeID: "final-node", host: "final"}}, repo.Snapshot(), repo)
+	if err != nil {
+		t.Fatalf("build adapter options: %v", err)
+	}
+	adp := adapter.NewSSHAdapter(repo, opts...)
+	jumpID := "iaas@10.238.221.181:22"
+	clientCfg, err := adp.GetConfig(jumpID)
+	if err != nil {
+		t.Fatalf("resolve jump config: %v", err)
+	}
+	if _, err := adp.UpdateAuth(t.Context(), jumpID, clientCfg.AuthUpdateToken, "jump-secret", "", ""); err != nil {
+		t.Fatalf("update jump auth: %v", err)
+	}
+	snapshot, err := repo.ResolveConnection(jumpID)
+	if err != nil {
+		t.Fatalf("resolve jump node: %v", err)
+	}
+	if snapshot.Identity.Password == "jump-secret" {
+		t.Fatal("--remember=never persisted an exec ProxyJump password")
+	}
+}
+
+func TestCommands_ExecUsesSelectedSessionKey(t *testing.T) {
+	repo := setupTestRepository(t)
+	o := NewExecOptions()
+	o.Host = "iaas@10.238.221.181"
+	o.IdentityFile = "/tmp/selected-session-key"
+	o.Remember = utils.RememberPolicyNever
+	tasks, hostErrs, err := o.buildTasksFromHosts(t.Context(), repo)
+	if err != nil || len(hostErrs) != 0 {
+		t.Fatalf("build tasks: err=%v hostErrs=%v", err, hostErrs)
+	}
+	opts, err := o.buildAdapterOptions(tasks, repo.Snapshot(), repo)
+	if err != nil {
+		t.Fatalf("build adapter options: %v", err)
+	}
+	clientCfg, err := adapter.NewSSHAdapter(repo, opts...).GetConfig(tasks[0].nodeID)
+	if err != nil {
+		t.Fatalf("get connection config: %v", err)
+	}
+	if clientCfg.KeyPath != o.IdentityFile {
+		t.Fatalf("KeyPath = %q, want %q", clientCfg.KeyPath, o.IdentityFile)
+	}
+}
+
 func TestCommands_SCP_FlagPrecedence(t *testing.T) {
 	ctx := context.Background()
 

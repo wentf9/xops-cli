@@ -438,6 +438,7 @@ type AutoAuthOptions struct {
 	HandshakeTimeout   time.Duration
 	InteractionTimeout time.Duration
 	FailClosed         func(error)
+	KeyPath            string
 	PasswordCallback   func(string)
 	PassphraseCallback func(keyPath, passphrase string)
 	Logger             logger.DebugLogger
@@ -506,11 +507,21 @@ func BuildAutoAuthMethodsWithOptions(ctx context.Context, opts AutoAuthOptions) 
 		}
 	}
 
-	// Default Keys
-	defaultKeys := []string{"~/.ssh/id_rsa", "~/.ssh/id_ed25519", "~/.ssh/id_ecdsa", "~/.ssh/id_dsa"}
+	// Prefer the caller-selected key, then fall back to the usual default keys.
+	// This keeps auto authentication compatible with explicit -i selection.
+	keyPaths := []string{opts.KeyPath}
+	keyPaths = append(keyPaths, "~/.ssh/id_rsa", "~/.ssh/id_ed25519", "~/.ssh/id_ecdsa", "~/.ssh/id_dsa")
+	seenKeyPaths := make(map[string]struct{}, len(keyPaths))
 	var signers []ssh.Signer
-	for _, p := range defaultKeys {
+	for _, p := range keyPaths {
 		keyPath := expandHomeDir(p)
+		if keyPath == "" {
+			continue
+		}
+		if _, seen := seenKeyPaths[keyPath]; seen {
+			continue
+		}
+		seenKeyPaths[keyPath] = struct{}{}
 		l.Debugf("Checking default key: %s", keyPath)
 		if _, err := os.Stat(keyPath); err != nil {
 			if os.IsNotExist(err) {
@@ -528,7 +539,14 @@ func BuildAutoAuthMethodsWithOptions(ctx context.Context, opts AutoAuthOptions) 
 			continue
 		}
 		if signer != nil {
-			signers = append(signers, signer)
+			if opts.KeyPath != "" && keyPath == expandHomeDir(opts.KeyPath) {
+				// An explicitly selected key must be attempted before any
+				// default key. In particular, a default encrypted key must not
+				// trigger an unrelated passphrase request first.
+				methods = append(methods, ssh.PublicKeys(signer))
+			} else {
+				signers = append(signers, signer)
+			}
 		}
 		if method != nil {
 			methods = append(methods, method)
