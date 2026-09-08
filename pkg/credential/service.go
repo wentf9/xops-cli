@@ -60,6 +60,9 @@ type ConfigUpdater interface {
 
 	// CheckRefUnreferenced 检查指定 ref 在当前最新已生效配置中是否已完全解绑（全局无任何引用）。
 	CheckRefUnreferenced(ctx context.Context, ref Ref) (bool, error)
+
+	// ConfirmRefDurable 从底层权威持久化存储重新检查指定 target 的凭据引用是否已持久化生效（Durable）。
+	ConfirmRefDurable(ctx context.Context, target Target, ref *Ref) (bool, error)
 }
 
 // CleanupError 表示新凭据与新配置已经权威且持久化生效，但在删除旧凭据时失败。
@@ -85,6 +88,7 @@ const (
 	RecoveryActionCommittedCleaned  RecoveryAction = "committed_cleaned_old_ref"
 	RecoveryActionScheduledForGC    RecoveryAction = "scheduled_for_gc"
 	RecoveryActionRemovedNoOp       RecoveryAction = "removed_noop"
+	RecoveryActionSkippedActive     RecoveryAction = "skipped_active"
 )
 
 // RecoveryResult 记录单条恢复操作的结果详情。
@@ -103,6 +107,7 @@ type Service struct {
 	config   ConfigUpdater
 	cache    *Cache
 	mu       sync.Mutex
+	activeTx sync.Map // map[string]struct{} 跟踪本进程当前正在活跃执行的事务 ID
 }
 
 // NewService 创建双存储写入协调服务。
@@ -209,6 +214,15 @@ func (s *Service) cleanupOldRefOnRotate(ctx context.Context, entryID string, old
 	return nil
 }
 
+func (s *Service) compensateNewRef(ctx context.Context, entryID string, store Store, newRef Ref, origErr error) error {
+	delErr := store.Delete(context.WithoutCancel(ctx), newRef)
+	if delErr != nil && !errors.Is(delErr, ErrCredentialNotFound) {
+		return errors.Join(origErr, fmt.Errorf("compensate delete new ref %s failed: %w", newRef, delErr))
+	}
+	_ = s.journal.Remove(entryID)
+	return origErr
+}
+
 // Rotate 执行凭据轮换事务：
 // 1. 创建 journal intent，记录旧 ref、新 ref、配置前置版本和阶段；
 // 2. Put(newRef, secret)；
@@ -239,15 +253,28 @@ func (s *Service) Rotate(
 		ItemID:  GenerateItemID(),
 	}
 
+	entryID := GenerateJournalID()
+	s.activeTx.Store(entryID, struct{}{})
+	defer s.activeTx.Delete(entryID)
+
+	lock, lockErr := s.journal.AcquireEntryLock(entryID)
+	if lockErr != nil {
+		return nil, "", fmt.Errorf("acquire transaction lock: %w", lockErr)
+	}
+	defer func() {
+		_ = lock.Close()
+	}()
+
 	entry := &JournalEntry{
-		ID:          GenerateJournalID(),
-		Op:          OpRotate,
-		Stage:       StageIntent,
-		OldRef:      oldRef.Clone(),
-		NewRef:      newRef.Clone(),
-		BaseVersion: expectedVersion,
-		TargetNode:  target.TargetIdentifier(),
-		TargetKind:  target.Kind,
+		ID:             entryID,
+		Op:             OpRotate,
+		Stage:          StageIntent,
+		OldRef:         oldRef.Clone(),
+		NewRef:         newRef.Clone(),
+		BaseVersion:    expectedVersion,
+		TargetNode:     target.NodeID,
+		TargetIdentity: target.IdentityID,
+		TargetKind:     target.Kind,
 	}
 	if oldRef == nil || oldRef.IsEmpty() {
 		entry.Op = OpCreate
@@ -257,22 +284,20 @@ func (s *Service) Rotate(
 	}
 
 	if err := s.putAndVerifySecret(ctx, store, newRef, secret); err != nil {
-		_ = store.Delete(context.WithoutCancel(ctx), newRef)
-		_ = s.journal.Remove(entry.ID)
-		return nil, "", err
+		return nil, "", s.compensateNewRef(ctx, entry.ID, store, newRef, err)
 	}
 
 	outcome, newVersion, casErr := s.config.ApplyCredentialRefAtVersion(ctx, target, expectedVersion, &newRef)
 	if casErr != nil {
 		if !outcome.Applied {
-			_ = store.Delete(context.WithoutCancel(ctx), newRef)
-			_ = s.journal.Remove(entry.ID)
-			return nil, "", casErr
+			return nil, "", s.compensateNewRef(ctx, entry.ID, store, newRef, casErr)
 		}
-		_ = s.journal.MarkCommitted(entry.ID)
+		// 配置在快照已应用但落盘失败（!outcome.Durable），推进至 StageAppliedUncertain，绝不能标为 StageCommitted，也不删除旧凭据
+		_ = s.journal.MarkAppliedUncertain(entry.ID)
 		return &newRef, newVersion, casErr
 	}
 
+	// 持久化提交成功，推进至 StageCommitted
 	_ = s.journal.MarkCommitted(entry.ID)
 
 	if err := s.cleanupOldRefOnRotate(ctx, entry.ID, oldRef); err != nil {
@@ -316,16 +341,29 @@ func (s *Service) Delete(
 		return "", fmt.Errorf("%w: cannot delete empty reference", ErrInvalidRef)
 	}
 
+	entryID := GenerateJournalID()
+	s.activeTx.Store(entryID, struct{}{})
+	defer s.activeTx.Delete(entryID)
+
+	lock, lockErr := s.journal.AcquireEntryLock(entryID)
+	if lockErr != nil {
+		return "", fmt.Errorf("acquire transaction lock: %w", lockErr)
+	}
+	defer func() {
+		_ = lock.Close()
+	}()
+
 	// 1. 记录 journal intent
 	entry := &JournalEntry{
-		ID:          GenerateJournalID(),
-		Op:          OpDelete,
-		Stage:       StageIntent,
-		OldRef:      refToDelete.Clone(),
-		NewRef:      nil,
-		BaseVersion: expectedVersion,
-		TargetNode:  target.TargetIdentifier(),
-		TargetKind:  target.Kind,
+		ID:             entryID,
+		Op:             OpDelete,
+		Stage:          StageIntent,
+		OldRef:         refToDelete.Clone(),
+		NewRef:         nil,
+		BaseVersion:    expectedVersion,
+		TargetNode:     target.NodeID,
+		TargetIdentity: target.IdentityID,
+		TargetKind:     target.Kind,
 	}
 	if err := s.journal.RecordIntent(entry); err != nil {
 		return "", fmt.Errorf("record journal intent: %w", err)
@@ -339,8 +377,8 @@ func (s *Service) Delete(
 			_ = s.journal.Remove(entry.ID)
 			return "", casErr
 		}
-		// Applied 但非 Durable，记录 StageCommitted，不删除后端机密，返回 durability 错误
-		_ = s.journal.MarkCommitted(entry.ID)
+		// Applied 但非 Durable，记录 StageAppliedUncertain，绝不能标为 StageCommitted，绝不删除后端凭据
+		_ = s.journal.MarkAppliedUncertain(entry.ID)
 		return newVersion, casErr
 	}
 
@@ -382,6 +420,7 @@ func (s *Service) Delete(
 
 // Recover 扫描未决的恢复日志条目并执行自动恢复或补偿：
 // - StageIntent: 检查 NewRef 是否在配置中生效；若未生效，清理孤儿 NewRef 并删除日志；若已生效，推进至 StageCommitted；
+// - StageAppliedUncertain: 重新从底层权威存储确认配置是否 Durable，若已持久化则推进至 StageCommitted，否则保持新旧凭据；
 // - StageCommitted / StageCleanup: 确认 OldRef 已无引用后尝试删除后端条目，成功则删除日志，失败则保持/推进 StageCleanup。
 func (s *Service) Recover(ctx context.Context) ([]RecoveryResult, error) {
 	s.mu.Lock()
@@ -407,18 +446,78 @@ func (s *Service) recoverSingleEntry(ctx context.Context, entry JournalEntry) Re
 		Stage:   entry.Stage,
 	}
 
-	if entry.Stage == StageIntent {
+	// 1. 检查同进程活跃事务
+	if _, active := s.activeTx.Load(entry.ID); active {
+		res.Action = RecoveryActionSkippedActive
+		return res
+	}
+
+	// 2. 检查跨进程排他锁：若被外部活跃进程持有，跳过
+	lock, err := s.journal.TryLockEntry(entry.ID)
+	if err != nil {
+		if errors.Is(err, ErrLockContended) {
+			res.Action = RecoveryActionSkippedActive
+			return res
+		}
+		res.Action = RecoveryActionScheduledForGC
+		res.Err = fmt.Errorf("try lock entry: %w", err)
+		return res
+	}
+	defer func() {
+		_ = lock.Close()
+	}()
+
+	// 3. 根据阶段进行处理
+	switch entry.Stage {
+	case StageIntent:
 		completed := s.recoverIntentStage(ctx, &entry, &res)
 		if completed {
 			return res
 		}
-	}
-
-	if entry.Stage == StageCommitted || entry.Stage == StageCleanup {
+		if entry.Stage == StageCommitted {
+			s.recoverCommittedOrCleanupStage(ctx, &entry, &res)
+		}
+	case StageAppliedUncertain:
+		completed := s.recoverAppliedUncertainStage(ctx, &entry, &res)
+		if completed {
+			return res
+		}
+		if entry.Stage == StageCommitted {
+			s.recoverCommittedOrCleanupStage(ctx, &entry, &res)
+		}
+	case StageCommitted, StageCleanup:
 		s.recoverCommittedOrCleanupStage(ctx, &entry, &res)
 	}
 
 	return res
+}
+
+func (s *Service) recoverAppliedUncertainStage(ctx context.Context, entry *JournalEntry, res *RecoveryResult) bool {
+	target := entry.Target()
+	var expectedRef *Ref
+	if entry.Op == OpRotate || entry.Op == OpCreate {
+		expectedRef = entry.NewRef
+	}
+
+	durable, err := s.config.ConfirmRefDurable(ctx, target, expectedRef)
+	if err != nil {
+		res.Err = fmt.Errorf("confirm durability for entry %s: %w", entry.ID, err)
+		res.Action = RecoveryActionScheduledForGC
+		return true
+	}
+	if !durable {
+		res.Action = RecoveryActionScheduledForGC
+		res.Err = fmt.Errorf("credential mutation for target %s is not durable in authoritative config", target.TargetIdentifier())
+		return true
+	}
+
+	if err := s.journal.MarkCommitted(entry.ID); err != nil {
+		res.Err = fmt.Errorf("mark committed after durability confirmed: %w", err)
+		res.Action = RecoveryActionScheduledForGC
+		return true
+	}
+	entry.Stage = StageCommitted
+	return false
 }
 
 func (s *Service) recoverIntentStage(ctx context.Context, entry *JournalEntry, res *RecoveryResult) bool {
@@ -432,6 +531,7 @@ func (s *Service) recoverIntentWithNewRef(ctx context.Context, entry *JournalEnt
 	unref, err := s.config.CheckRefUnreferenced(ctx, *entry.NewRef)
 	if err != nil {
 		res.Err = fmt.Errorf("check new ref: %w", err)
+		res.Action = RecoveryActionScheduledForGC
 		return true
 	}
 	if unref {
@@ -454,6 +554,20 @@ func (s *Service) recoverIntentWithNewRef(ctx context.Context, entry *JournalEnt
 		return true
 	}
 
+	// 新凭据在配置中存在，进一步确认权威存储中是否 Durable
+	durable, confErr := s.config.ConfirmRefDurable(ctx, entry.Target(), entry.NewRef)
+	if confErr != nil {
+		res.Err = fmt.Errorf("confirm new ref durability: %w", confErr)
+		res.Action = RecoveryActionScheduledForGC
+		return true
+	}
+	if !durable {
+		_ = s.journal.MarkAppliedUncertain(entry.ID)
+		entry.Stage = StageAppliedUncertain
+		res.Action = RecoveryActionScheduledForGC
+		return true
+	}
+
 	_ = s.journal.MarkCommitted(entry.ID)
 	entry.Stage = StageCommitted
 	return false
@@ -468,9 +582,22 @@ func (s *Service) recoverIntentWithoutNewRef(ctx context.Context, entry *Journal
 	unref, err := s.config.CheckRefUnreferenced(ctx, *entry.OldRef)
 	if err != nil {
 		res.Err = fmt.Errorf("check old ref for delete: %w", err)
+		res.Action = RecoveryActionScheduledForGC
 		return true
 	}
 	if unref {
+		durable, confErr := s.config.ConfirmRefDurable(ctx, entry.Target(), nil)
+		if confErr != nil {
+			res.Err = fmt.Errorf("confirm delete durability: %w", confErr)
+			res.Action = RecoveryActionScheduledForGC
+			return true
+		}
+		if !durable {
+			_ = s.journal.MarkAppliedUncertain(entry.ID)
+			entry.Stage = StageAppliedUncertain
+			res.Action = RecoveryActionScheduledForGC
+			return true
+		}
 		_ = s.journal.MarkCommitted(entry.ID)
 		entry.Stage = StageCommitted
 		return false
@@ -490,6 +617,7 @@ func (s *Service) recoverCommittedOrCleanupStage(ctx context.Context, entry *Jou
 	unref, err := s.config.CheckRefUnreferenced(ctx, *entry.OldRef)
 	if err != nil {
 		res.Err = fmt.Errorf("check old ref unreferenced: %w", err)
+		res.Action = RecoveryActionScheduledForGC
 		return
 	}
 	if !unref {

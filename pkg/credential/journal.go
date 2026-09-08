@@ -31,6 +31,9 @@ type Stage string
 const (
 	// StageIntent 表示事务意图已记录，新凭据已写入但配置尚未原子提交。
 	StageIntent Stage = "intent"
+	// StageAppliedUncertain 表示配置变更已在快照应用，但父目录落盘同步不确定（Durability 失败）。
+	// 在此阶段，新旧凭据均保留，绝不能删除旧凭据，也绝不能补偿删除新凭据。
+	StageAppliedUncertain Stage = "applied_uncertain"
 	// StageCommitted 表示配置变更已持久化生效，旧凭据待清理。
 	StageCommitted Stage = "committed"
 	// StageCleanup 表示旧凭据清理失败，留待稍后后台 GC。
@@ -40,16 +43,29 @@ const (
 // JournalEntry 记录凭据操作的恢复状态。
 // 【安全红线】本结构严禁包含任何机密明文或可逆密文字节，仅记录非敏感的引用元数据与阶段。
 type JournalEntry struct {
-	ID          string        `json:"id"`
-	Op          OperationType `json:"op"`
-	Stage       Stage         `json:"stage"`
-	OldRef      *Ref          `json:"oldRef,omitempty"`
-	NewRef      *Ref          `json:"newRef,omitempty"`
-	BaseVersion string        `json:"baseVersion,omitempty"`
-	TargetNode  string        `json:"targetNode,omitempty"`
-	TargetKind  Kind          `json:"targetKind,omitempty"`
-	CreatedAt   time.Time     `json:"createdAt"`
-	UpdatedAt   time.Time     `json:"updatedAt"`
+	ID             string        `json:"id"`
+	Op             OperationType `json:"op"`
+	Stage          Stage         `json:"stage"`
+	OldRef         *Ref          `json:"oldRef,omitempty"`
+	NewRef         *Ref          `json:"newRef,omitempty"`
+	BaseVersion    string        `json:"baseVersion,omitempty"`
+	TargetNode     string        `json:"targetNode,omitempty"`
+	TargetIdentity string        `json:"targetIdentity,omitempty"`
+	TargetKind     Kind          `json:"targetKind,omitempty"`
+	CreatedAt      time.Time     `json:"createdAt"`
+	UpdatedAt      time.Time     `json:"updatedAt"`
+}
+
+// Target 返回与该日志条目关联的目标标识。
+func (j *JournalEntry) Target() Target {
+	if j == nil {
+		return Target{}
+	}
+	return Target{
+		NodeID:     j.TargetNode,
+		IdentityID: j.TargetIdentity,
+		Kind:       j.TargetKind,
+	}
 }
 
 // Validate 校验 JournalEntry 基础合法性。
@@ -66,7 +82,7 @@ func (j *JournalEntry) Validate() error {
 		return fmt.Errorf("%w: invalid operation %q", ErrJournalCorrupted, string(j.Op))
 	}
 	switch j.Stage {
-	case StageIntent, StageCommitted, StageCleanup:
+	case StageIntent, StageAppliedUncertain, StageCommitted, StageCleanup:
 	default:
 		return fmt.Errorf("%w: invalid stage %q", ErrJournalCorrupted, string(j.Stage))
 	}
@@ -166,6 +182,11 @@ func (s *JournalStore) RecordIntent(entry *JournalEntry) error {
 	return s.save(entry)
 }
 
+// MarkAppliedUncertain 将日志状态推进至 StageAppliedUncertain（配置已应用但持久化不确定）。
+func (s *JournalStore) MarkAppliedUncertain(id string) error {
+	return s.updateStage(id, StageAppliedUncertain)
+}
+
 // MarkCommitted 将日志状态推进至 StageCommitted（配置已持久化提交）。
 func (s *JournalStore) MarkCommitted(id string) error {
 	return s.updateStage(id, StageCommitted)
@@ -174,6 +195,43 @@ func (s *JournalStore) MarkCommitted(id string) error {
 // MarkCleanup 将日志状态推进至 StageCleanup（清理失败，标记待 GC）。
 func (s *JournalStore) MarkCleanup(id string) error {
 	return s.updateStage(id, StageCleanup)
+}
+
+func (s *JournalStore) lockFilePath(id string) (string, error) {
+	if err := validateJournalID(id); err != nil {
+		return "", err
+	}
+	targetPath := filepath.Clean(filepath.Join(s.dir, fmt.Sprintf("journal-%s.lock", id)))
+	rel, err := filepath.Rel(s.dir, targetPath)
+	if err != nil || strings.HasPrefix(rel, "..") || rel == "." {
+		return "", fmt.Errorf("%w: journal ID %q escapes storage directory", ErrJournalCorrupted, id)
+	}
+	return targetPath, nil
+}
+
+// AcquireEntryLock 获取指定日志条目的排他文件锁。若已被持有，返回 ErrLockContended。
+func (s *JournalStore) AcquireEntryLock(id string) (*EntryLock, error) {
+	lockPath, err := s.lockFilePath(id)
+	if err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open lock file %q: %w", lockPath, err)
+	}
+	if err := tryLockFile(file); err != nil {
+		_ = file.Close()
+		if isLockContended(err) {
+			return nil, ErrLockContended
+		}
+		return nil, fmt.Errorf("lock file %q: %w", lockPath, err)
+	}
+	return &EntryLock{path: lockPath, file: file}, nil
+}
+
+// TryLockEntry 尝试非阻塞获取日志条目排他锁，用于判定是否为活跃进程持有的在途事务。
+func (s *JournalStore) TryLockEntry(id string) (*EntryLock, error) {
+	return s.AcquireEntryLock(id)
 }
 
 func (s *JournalStore) updateStage(id string, stage Stage) error {
@@ -220,6 +278,9 @@ func (s *JournalStore) Remove(id string) error {
 	}
 	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove journal entry %q: %w", id, err)
+	}
+	if lockPath, err := s.lockFilePath(id); err == nil {
+		_ = os.Remove(lockPath)
 	}
 	if err := s.syncDirLocked(); err != nil {
 		return fmt.Errorf("sync journal directory after remove %q: %w", id, err)

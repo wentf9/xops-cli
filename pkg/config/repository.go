@@ -1383,39 +1383,153 @@ func (r *Repository) CheckRefUnreferenced(ctx context.Context, ref credential.Re
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	snapshot := r.provider.Snapshot()
-	if snapshot == nil {
-		return true, nil
+
+	r.commitMu.Lock()
+	defer r.commitMu.Unlock()
+
+	// 从持久化存储重新加载最新权威配置，防止读到过期的进程内缓存
+	var diskCfg *Configuration
+	if ts, ok := r.store.(TransactionStore); ok {
+		snap, err := ts.LoadSnapshot(ctx)
+		if err != nil {
+			return false, fmt.Errorf("reload configuration snapshot for ref check: %w", err)
+		}
+		diskCfg = snap.Configuration
+	} else if r.store != nil {
+		cfg, err := r.store.Load()
+		if err != nil {
+			return false, fmt.Errorf("load configuration for ref check: %w", err)
+		}
+		diskCfg = cfg
 	}
 
-	if snapshot.Identities != nil {
-		for _, k := range snapshot.Identities.Keys() {
-			id, ok := snapshot.Identities.Get(k)
+	// 检查磁盘权威快照中是否仍然包含该引用
+	if diskCfg != nil && isRefReferencedIn(diskCfg, ref) {
+		return false, nil
+	}
+
+	// 检查内存快照中是否仍然包含该引用（防止未落盘但已应用的状态被误判）
+	memCfg := r.provider.Snapshot()
+	if memCfg != nil && isRefReferencedIn(memCfg, ref) {
+		return false, nil
+	}
+
+	return true, nil
+}
+
+func isRefReferencedIn(cfg *Configuration, ref credential.Ref) bool {
+	if cfg == nil {
+		return false
+	}
+	if cfg.Identities != nil {
+		for _, k := range cfg.Identities.Keys() {
+			id, ok := cfg.Identities.Get(k)
 			if !ok {
 				continue
 			}
 			if id.LoginPasswordRef != nil && *id.LoginPasswordRef == ref {
-				return false, nil
+				return true
 			}
 			if id.PassphraseRef != nil && *id.PassphraseRef == ref {
-				return false, nil
+				return true
 			}
 		}
 	}
 
-	if snapshot.Nodes != nil {
-		for _, k := range snapshot.Nodes.Keys() {
-			node, ok := snapshot.Nodes.Get(k)
+	if cfg.Nodes != nil {
+		for _, k := range cfg.Nodes.Keys() {
+			node, ok := cfg.Nodes.Get(k)
 			if !ok {
 				continue
 			}
 			if node.PrivilegePasswordRef != nil && *node.PrivilegePasswordRef == ref {
-				return false, nil
+				return true
 			}
 		}
 	}
 
-	return true, nil
+	return false
+}
+
+func equalRef(actual, expected *credential.Ref) bool {
+	if expected == nil {
+		return actual == nil
+	}
+	return actual != nil && *actual == *expected
+}
+
+func confirmNodeRefDurable(diskCfg *Configuration, target credential.Target, ref *credential.Ref) bool {
+	node, ok := diskCfg.Nodes.Get(target.NodeID)
+	if !ok {
+		return false
+	}
+	switch target.Kind {
+	case credential.KindPrivilegePassword:
+		return equalRef(node.PrivilegePasswordRef, ref)
+	case credential.KindLoginPassword:
+		identity, ok := diskCfg.Identities.Get(node.IdentityRef)
+		if !ok {
+			return false
+		}
+		return equalRef(identity.LoginPasswordRef, ref)
+	case credential.KindPassphrase:
+		identity, ok := diskCfg.Identities.Get(node.IdentityRef)
+		if !ok {
+			return false
+		}
+		return equalRef(identity.PassphraseRef, ref)
+	}
+	return false
+}
+
+func confirmIdentityRefDurable(diskCfg *Configuration, target credential.Target, ref *credential.Ref) bool {
+	identity, ok := diskCfg.Identities.Get(target.IdentityID)
+	if !ok {
+		return false
+	}
+	switch target.Kind {
+	case credential.KindLoginPassword:
+		return equalRef(identity.LoginPasswordRef, ref)
+	case credential.KindPassphrase:
+		return equalRef(identity.PassphraseRef, ref)
+	}
+	return false
+}
+
+// ConfirmRefDurable 从底层权威持久化存储重新检查指定 target 的凭据引用是否已持久化生效（Durable）。
+func (r *Repository) ConfirmRefDurable(ctx context.Context, target credential.Target, ref *credential.Ref) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	r.commitMu.Lock()
+	defer r.commitMu.Unlock()
+
+	var diskCfg *Configuration
+	if ts, ok := r.store.(TransactionStore); ok {
+		snap, err := ts.LoadSnapshot(ctx)
+		if err != nil {
+			return false, fmt.Errorf("reload configuration snapshot for durability check: %w", err)
+		}
+		diskCfg = snap.Configuration
+	} else if r.store != nil {
+		cfg, err := r.store.Load()
+		if err != nil {
+			return false, fmt.Errorf("load configuration for durability check: %w", err)
+		}
+		diskCfg = cfg
+	}
+	if diskCfg == nil {
+		return false, fmt.Errorf("authoritative configuration unavailable")
+	}
+
+	if target.NodeID != "" {
+		return confirmNodeRefDurable(diskCfg, target, ref), nil
+	}
+	if target.IdentityID != "" {
+		return confirmIdentityRefDurable(diskCfg, target, ref), nil
+	}
+
+	return false, nil
 }
 
 // RepositoryConfigUpdater adapts a Repository to satisfy credential.ConfigUpdater.
@@ -1437,18 +1551,33 @@ func (u *RepositoryConfigUpdater) ApplyCredentialRefAtVersion(
 ) (credential.MutationOutcome, string, error) {
 	if target.NodeID != "" {
 		outcome, newVer, err := u.repo.UpdateNodeCredentialRefAtVersionContext(ctx, target.NodeID, expectedVersion, target.Kind, newRef)
-		return credential.MutationOutcome{Applied: outcome.Applied, Durable: outcome.Durable}, newVer, err
+		return credential.MutationOutcome{Applied: outcome.Applied, Durable: outcome.Durable}, newVer, adaptConfigError(err)
 	}
 	if target.IdentityID != "" {
 		outcome, newVer, err := u.repo.UpdateIdentityCredentialRefAtVersionContext(ctx, target.IdentityID, expectedVersion, target.Kind, newRef)
-		return credential.MutationOutcome{Applied: outcome.Applied, Durable: outcome.Durable}, newVer, err
+		return credential.MutationOutcome{Applied: outcome.Applied, Durable: outcome.Durable}, newVer, adaptConfigError(err)
 	}
 	return credential.MutationOutcome{}, "", fmt.Errorf("target must specify nodeID or identityID")
+}
+
+func adaptConfigError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrConfigConflict) {
+		return fmt.Errorf("%w: %w", credential.ErrConfigConflict, err)
+	}
+	return err
 }
 
 // CheckRefUnreferenced checks whether the reference is unreferenced in the configuration.
 func (u *RepositoryConfigUpdater) CheckRefUnreferenced(ctx context.Context, ref credential.Ref) (bool, error) {
 	return u.repo.CheckRefUnreferenced(ctx, ref)
+}
+
+// ConfirmRefDurable checks whether the reference has become durable in authoritative storage.
+func (u *RepositoryConfigUpdater) ConfirmRefDurable(ctx context.Context, target credential.Target, ref *credential.Ref) (bool, error) {
+	return u.repo.ConfirmRefDurable(ctx, target, ref)
 }
 
 // AsConfigUpdater returns the credential.ConfigUpdater adapter for the repository.

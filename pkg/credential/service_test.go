@@ -81,13 +81,14 @@ func (m *memoryStore) Ping(_ context.Context) error {
 }
 
 type mockConfigUpdater struct {
-	mu             sync.Mutex
-	activeRefs     map[Ref]bool
-	version        string
-	applyErr       error
-	applyOutcome   MutationOutcome
-	applyHook      func(target Target, expectedVersion string, newRef *Ref) (MutationOutcome, string, error)
-	checkUnrefHook func(ref Ref) (bool, error)
+	mu                 sync.Mutex
+	activeRefs         map[Ref]bool
+	version            string
+	applyErr           error
+	applyOutcome       MutationOutcome
+	applyHook          func(target Target, expectedVersion string, newRef *Ref) (MutationOutcome, string, error)
+	checkUnrefHook     func(ref Ref) (bool, error)
+	confirmDurableHook func(target Target, ref *Ref) (bool, error)
 }
 
 func newMockConfigUpdater() *mockConfigUpdater {
@@ -130,6 +131,19 @@ func (m *mockConfigUpdater) CheckRefUnreferenced(_ context.Context, ref Ref) (bo
 	}
 	isRef, ok := m.activeRefs[ref]
 	return !ok || !isRef, nil
+}
+
+func (m *mockConfigUpdater) ConfirmRefDurable(_ context.Context, target Target, ref *Ref) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.confirmDurableHook != nil {
+		return m.confirmDurableHook(target, ref)
+	}
+	if ref == nil {
+		return true, nil
+	}
+	isRef, ok := m.activeRefs[*ref]
+	return ok && isRef, nil
 }
 
 func setupTestService(t *testing.T) (*Service, *memoryStore, *mockConfigUpdater, *JournalStore, *Cache) {
@@ -484,7 +498,7 @@ func TestService_FaultInjection_AppliedButParentDirSyncFailed(t *testing.T) {
 		t.Fatalf("expected newRef to be returned on DurabilityError")
 	}
 
-	// 【核心红线断言】：Applied 但非 Durable 时，新凭据绝不能被补偿删除！
+	// 【核心红线断言 1】：Applied 但非 Durable 时，新凭据绝不能被补偿删除！
 	store.mu.Lock()
 	_, exists := store.data[newRef.ItemID]
 	store.mu.Unlock()
@@ -492,13 +506,44 @@ func TestService_FaultInjection_AppliedButParentDirSyncFailed(t *testing.T) {
 		t.Fatalf("new credential must NOT be deleted when config is Applied")
 	}
 
-	// Journal 必须被推进到 StageCommitted
+	// 【核心红线断言 2】：Journal 必须被推进到 StageAppliedUncertain，严禁标记为 StageCommitted！
 	entries, err := journal.ListPending()
 	if err != nil || len(entries) != 1 {
 		t.Fatalf("expected 1 journal entry, got %d", len(entries))
 	}
-	if entries[0].Stage != StageCommitted {
-		t.Fatalf("expected journal stage committed, got %s", entries[0].Stage)
+	if entries[0].Stage != StageAppliedUncertain {
+		t.Fatalf("expected journal stage applied_uncertain, got %s", entries[0].Stage)
+	}
+
+	// 模拟 GC 执行：此时 ConfirmRefDurable 为 false（磁盘落盘尚未确认），新旧凭据均保留
+	cfg.confirmDurableHook = func(t Target, r *Ref) (bool, error) {
+		return false, nil
+	}
+	results, err := svc.Recover(ctx)
+	if err != nil {
+		t.Fatalf("Recover failed: %v", err)
+	}
+	if len(results) != 1 || results[0].Action != RecoveryActionScheduledForGC {
+		t.Fatalf("expected RecoveryActionScheduledForGC, got %+v", results)
+	}
+	// 新凭据依然保留在 Store
+	store.mu.Lock()
+	_, stillExists := store.data[newRef.ItemID]
+	store.mu.Unlock()
+	if !stillExists {
+		t.Fatalf("new credential must still be preserved when durability is uncertain")
+	}
+
+	// 当 ConfirmRefDurable 确认为 true 时，GC 推进 StageCommitted
+	cfg.confirmDurableHook = func(t Target, r *Ref) (bool, error) {
+		return true, nil
+	}
+	results2, err := svc.Recover(ctx)
+	if err != nil {
+		t.Fatalf("Recover 2 failed: %v", err)
+	}
+	if len(results2) != 1 {
+		t.Fatalf("expected 1 recovery result, got %d", len(results2))
 	}
 }
 
@@ -783,5 +828,291 @@ func TestService_FaultInjection_Recover_CrashAtIntent_OpDelete(t *testing.T) {
 	// refB 应从 Store 中被删除
 	if _, err := store.Get(ctx, refB); !errors.Is(err, ErrCredentialNotFound) {
 		t.Fatalf("refB must be deleted from store")
+	}
+}
+
+func TestService_ActiveTransaction_GCDoesNotDeleteInflight(t *testing.T) {
+	svc, store, cfg, _, _ := setupTestService(t)
+	ctx := context.Background()
+
+	target := Target{NodeID: "node-inflight", Kind: KindLoginPassword}
+	startedCh := make(chan struct{})
+	blockCh := make(chan struct{})
+
+	cfg.applyHook = func(_ Target, _ string, _ *Ref) (MutationOutcome, string, error) {
+		close(startedCh) // 通知测试：凭据已写入 Store，正停在 CAS 提交之前
+		<-blockCh        // 阻塞当前事务，使其处于活跃中途状态
+		return MutationOutcome{Applied: true, Durable: true}, "v-done", nil
+	}
+
+	createDone := make(chan struct{})
+	var (
+		newRef *Ref
+		ver    string
+		txErr  error
+	)
+	go func() {
+		defer close(createDone)
+		newRef, ver, txErr = svc.Create(ctx, target, "v-initial", "test-store", Secret{Value: []byte("inflight-val")})
+	}()
+
+	// 等待事务写入 Store 并准备 CAS
+	select {
+	case <-startedCh:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for transaction to start")
+	}
+
+	// 验证凭据此时已经在 Store 中
+	store.mu.Lock()
+	if len(store.data) != 1 {
+		store.mu.Unlock()
+		close(blockCh)
+		t.Fatalf("expected new secret in store before CAS commit")
+	}
+	var inFlightItemID string
+	for id := range store.data {
+		inFlightItemID = id
+	}
+	store.mu.Unlock()
+
+	// 并发执行 GC / Recover
+	results, err := svc.Recover(ctx)
+	if err != nil {
+		close(blockCh)
+		t.Fatalf("Recover failed: %v", err)
+	}
+
+	// 【核心红线断言 1】：活跃事务必须被识别并跳过，绝不能当成孤儿事务清理！
+	if len(results) != 1 {
+		close(blockCh)
+		t.Fatalf("expected 1 recovery result, got %d", len(results))
+	}
+	if results[0].Action != RecoveryActionSkippedActive {
+		close(blockCh)
+		t.Fatalf("expected Action to be RecoveryActionSkippedActive, got: %s", results[0].Action)
+	}
+
+	// 【核心红线断言 2】：Store 中的新凭据绝不能被 GC 删除！
+	store.mu.Lock()
+	_, exists := store.data[inFlightItemID]
+	store.mu.Unlock()
+	if !exists {
+		close(blockCh)
+		t.Fatalf("CRITICAL BUG: GC deleted credential of inflight transaction!")
+	}
+
+	// 放行活跃事务继续完成
+	close(blockCh)
+	select {
+	case <-createDone:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for Create to complete")
+	}
+
+	if txErr != nil || newRef == nil || ver == "" {
+		t.Fatalf("Create failed unexpectedly: %v", txErr)
+	}
+}
+
+func TestService_FaultInjection_CompensateFailure_RetainsJournal(t *testing.T) {
+	svc, store, cfg, journal, _ := setupTestService(t)
+	ctx := context.Background()
+
+	// 模拟 CAS 冲突（Applied: false）
+	casErr := fmt.Errorf("%w: version mismatch", ErrConfigConflict)
+	cfg.applyErr = casErr
+	cfg.applyOutcome = MutationOutcome{Applied: false, Durable: false}
+
+	// 模拟补偿删除新凭据时后端 Store 出错
+	storeCompensateErr := errors.New("store network connection refused during delete")
+	store.delErr = storeCompensateErr
+
+	target := Target{NodeID: "node-fail", Kind: KindLoginPassword}
+	_, _, err := svc.Create(ctx, target, "version-1", "test-store", Secret{Value: []byte("val")})
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+
+	// 【核心红线断言 1】：返回的错误必须合并原始 CAS 错误与补偿错误
+	if !errors.Is(err, casErr) {
+		t.Fatalf("expected error to wrap original casErr, got %v", err)
+	}
+
+	// 【核心红线断言 2】：补偿失败时，绝不能移除 journal，必须保留以便后续 GC 介入！
+	entries, listErr := journal.ListPending()
+	if listErr != nil {
+		t.Fatalf("ListPending failed: %v", listErr)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected journal entry to be retained when compensation fails, got %d", len(entries))
+	}
+	if entries[0].Stage != StageIntent {
+		t.Fatalf("expected entry to remain at StageIntent, got %s", entries[0].Stage)
+	}
+
+	// 修复 Store 错误后，再次运行 Recover，孤儿凭据被成功补偿清理
+	store.delErr = nil
+	results, recErr := svc.Recover(ctx)
+	if recErr != nil {
+		t.Fatalf("Recover failed: %v", recErr)
+	}
+	if len(results) != 1 || results[0].Action != RecoveryActionCompensatedNewRef {
+		t.Fatalf("expected RecoveryActionCompensatedNewRef, got %+v", results)
+	}
+
+	// Journal 最终被移除
+	entriesAfter, _ := journal.ListPending()
+	if len(entriesAfter) != 0 {
+		t.Fatalf("expected journal to be cleared after recovery, got %d", len(entriesAfter))
+	}
+}
+
+func TestService_Rotate_AppliedUncertain_BothCredentialsPreserved(t *testing.T) {
+	svc, store, cfg, journal, _ := setupTestService(t)
+	ctx := context.Background()
+
+	oldRef := Ref{StoreID: "test-store", ItemID: "old-secret-item"}
+	_ = store.Put(ctx, oldRef, Secret{Value: []byte("old-val")})
+	cfg.activeRefs[oldRef] = true
+
+	// 模拟 Applied=true, Durable=false
+	durErr := errors.New("fsync failed")
+	cfg.applyErr = durErr
+	cfg.applyOutcome = MutationOutcome{Applied: true, Durable: false}
+
+	target := Target{NodeID: "node-rotate", Kind: KindLoginPassword}
+	newRef, _, err := svc.Rotate(ctx, target, "version-1", &oldRef, "test-store", Secret{Value: []byte("new-val")})
+	if !errors.Is(err, durErr) {
+		t.Fatalf("expected durErr, got %v", err)
+	}
+	if newRef == nil {
+		t.Fatalf("expected newRef to be returned")
+	}
+
+	// 【断言 1】：Stage 必须是 StageAppliedUncertain
+	entries, _ := journal.ListPending()
+	if len(entries) != 1 || entries[0].Stage != StageAppliedUncertain {
+		t.Fatalf("expected StageAppliedUncertain, got %+v", entries)
+	}
+
+	// 【断言 2】：新旧两份凭据都必须保留在 Store
+	store.mu.Lock()
+	_, oldExists := store.data[oldRef.ItemID]
+	_, newExists := store.data[newRef.ItemID]
+	store.mu.Unlock()
+	if !oldExists || !newExists {
+		t.Fatalf("both old and new credentials must be preserved in store, old=%v, new=%v", oldExists, newExists)
+	}
+
+	// 【断言 3】：GC 扫描时若 ConfirmRefDurable 为 false，绝对不能删除旧凭据
+	cfg.confirmDurableHook = func(_ Target, _ *Ref) (bool, error) {
+		return false, nil
+	}
+	results, recErr := svc.Recover(ctx)
+	if recErr != nil {
+		t.Fatalf("Recover failed: %v", recErr)
+	}
+	if len(results) != 1 || results[0].Action != RecoveryActionScheduledForGC {
+		t.Fatalf("expected RecoveryActionScheduledForGC, got %+v", results)
+	}
+	store.mu.Lock()
+	_, oldStillExists := store.data[oldRef.ItemID]
+	store.mu.Unlock()
+	if !oldStillExists {
+		t.Fatalf("old credential must NOT be deleted while durability is uncertain!")
+	}
+
+	// 【断言 4】：当底层持久化确认成功后，GC 推进 StageCommitted 并清理旧凭据
+	cfg.confirmDurableHook = func(_ Target, _ *Ref) (bool, error) {
+		return true, nil
+	}
+	cfg.activeRefs[oldRef] = false // 旧引用已解除
+
+	results2, recErr2 := svc.Recover(ctx)
+	if recErr2 != nil {
+		t.Fatalf("Recover 2 failed: %v", recErr2)
+	}
+	if len(results2) != 1 || results2[0].Action != RecoveryActionCommittedCleaned {
+		t.Fatalf("expected RecoveryActionCommittedCleaned, got %+v", results2)
+	}
+
+	// 旧凭据被清理，新凭据保留
+	store.mu.Lock()
+	_, oldFinalExists := store.data[oldRef.ItemID]
+	_, newFinalExists := store.data[newRef.ItemID]
+	store.mu.Unlock()
+	if oldFinalExists {
+		t.Fatalf("old credential should be cleaned up after durability confirmation")
+	}
+	if !newFinalExists {
+		t.Fatalf("new credential must still be preserved")
+	}
+}
+
+func TestService_Delete_AppliedUncertain_PreservesCredential(t *testing.T) {
+	svc, store, cfg, journal, _ := setupTestService(t)
+	ctx := context.Background()
+
+	ref := Ref{StoreID: "test-store", ItemID: "del-secret-item"}
+	_ = store.Put(ctx, ref, Secret{Value: []byte("val")})
+	cfg.activeRefs[ref] = true
+
+	// 模拟 Delete 过程中 Applied=true, Durable=false
+	durErr := errors.New("parent directory sync error")
+	cfg.applyErr = durErr
+	cfg.applyOutcome = MutationOutcome{Applied: true, Durable: false}
+
+	target := Target{NodeID: "node-del", Kind: KindLoginPassword}
+	_, err := svc.Delete(ctx, target, "version-1", ref)
+	if !errors.Is(err, durErr) {
+		t.Fatalf("expected durErr, got %v", err)
+	}
+
+	// 【断言 1】：Stage 必须是 StageAppliedUncertain
+	entries, _ := journal.ListPending()
+	if len(entries) != 1 || entries[0].Stage != StageAppliedUncertain {
+		t.Fatalf("expected StageAppliedUncertain, got %+v", entries)
+	}
+
+	// 【断言 2】：后端凭据绝不能被物理删除！
+	store.mu.Lock()
+	_, exists := store.data[ref.ItemID]
+	store.mu.Unlock()
+	if !exists {
+		t.Fatalf("credential must NOT be deleted from store when delete durability is uncertain!")
+	}
+
+	// 【断言 3】：Recover 在 ConfirmRefDurable 为 false 时不执行删除
+	cfg.confirmDurableHook = func(_ Target, _ *Ref) (bool, error) {
+		return false, nil
+	}
+	results, recErr := svc.Recover(ctx)
+	if recErr != nil {
+		t.Fatalf("Recover failed: %v", recErr)
+	}
+	if len(results) != 1 || results[0].Action != RecoveryActionScheduledForGC {
+		t.Fatalf("expected RecoveryActionScheduledForGC, got %+v", results)
+	}
+
+	// 【断言 4】：当持久化确认成功且配置中已无引用，Recover 清理后端凭据
+	cfg.confirmDurableHook = func(_ Target, _ *Ref) (bool, error) {
+		return true, nil
+	}
+	cfg.activeRefs[ref] = false
+
+	results2, recErr2 := svc.Recover(ctx)
+	if recErr2 != nil {
+		t.Fatalf("Recover 2 failed: %v", recErr2)
+	}
+	if len(results2) != 1 || results2[0].Action != RecoveryActionCommittedCleaned {
+		t.Fatalf("expected RecoveryActionCommittedCleaned, got %+v", results2)
+	}
+
+	store.mu.Lock()
+	_, stillExists := store.data[ref.ItemID]
+	store.mu.Unlock()
+	if stillExists {
+		t.Fatalf("credential should be deleted after durability confirmed")
 	}
 }

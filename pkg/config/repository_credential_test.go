@@ -3,6 +3,7 @@ package config
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/wentf9/xops-cli/pkg/credential"
@@ -423,5 +424,118 @@ func TestRepository_AsConfigUpdater(t *testing.T) {
 	unref, err = updater.CheckRefUnreferenced(ctx, *ref)
 	if err != nil || !unref {
 		t.Fatalf("expected unreferenced after deletion, got unref=%v, err=%v", unref, err)
+	}
+}
+
+func TestRepositoryConfigUpdater_CASConflict_ErrorContract(t *testing.T) {
+	store := &mockPersistStore{result: PersistResult{Applied: true, Durable: true}}
+	repo, err := NewRepositoryWithoutOpenSSH(newTestProvider().Snapshot(), store)
+	if err != nil {
+		t.Fatalf("NewRepositoryWithoutOpenSSH failed: %v", err)
+	}
+	ctx := context.Background()
+
+	if err := createIdentity(repo, "id-contract", models.Identity{User: "user1"}); err != nil {
+		t.Fatalf("create identity failed: %v", err)
+	}
+	if err := createNode(repo, "node-contract", models.Node{IdentityRef: "id-contract", HostRef: "h1"}, models.Host{Address: "1.1.1.1", Port: 22}, models.Identity{User: "user1"}); err != nil {
+		t.Fatalf("create node failed: %v", err)
+	}
+
+	updater := repo.AsConfigUpdater()
+	wrongVersion := string(make([]byte, 32))
+	targetNode := credential.Target{
+		NodeID: "node-contract",
+		Kind:   credential.KindLoginPassword,
+	}
+	ref := &credential.Ref{StoreID: "system", ItemID: "item-cas"}
+
+	outcome, _, err := updater.ApplyCredentialRefAtVersion(ctx, targetNode, wrongVersion, ref)
+	if err == nil {
+		t.Fatalf("expected error on CAS mismatch, got nil")
+	}
+	if outcome.Applied {
+		t.Fatalf("expected outcome.Applied == false on CAS conflict")
+	}
+
+	// 【核心契约验证】：必须同时满足 errors.Is(err, credential.ErrConfigConflict) 和 errors.Is(err, ErrConfigConflict)
+	if !errors.Is(err, credential.ErrConfigConflict) {
+		t.Fatalf("expected errors.Is(err, credential.ErrConfigConflict) to be true, got: %v", err)
+	}
+	if !errors.Is(err, ErrConfigConflict) {
+		t.Fatalf("expected errors.Is(err, config.ErrConfigConflict) to be true, got: %v", err)
+	}
+}
+
+type memoryPersistStore struct {
+	mu      sync.Mutex
+	cfg     *Configuration
+	loadErr error
+}
+
+func (m *memoryPersistStore) Load() (*Configuration, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.loadErr != nil {
+		return nil, m.loadErr
+	}
+	return cloneConfiguration(m.cfg), nil
+}
+
+func (m *memoryPersistStore) Save(c *Configuration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cfg = cloneConfiguration(c)
+	return nil
+}
+
+func (m *memoryPersistStore) save(c *Configuration) (PersistResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cfg = cloneConfiguration(c)
+	return PersistResult{Applied: true, Durable: true}, nil
+}
+
+func TestRepository_CheckRefUnreferenced_ReloadsDiskConfiguration(t *testing.T) {
+	diskStore := &memoryPersistStore{cfg: cloneConfiguration(nil)}
+	repo, err := NewRepositoryWithoutOpenSSH(newTestProvider().Snapshot(), diskStore)
+	if err != nil {
+		t.Fatalf("NewRepositoryWithoutOpenSSH failed: %v", err)
+	}
+	ctx := context.Background()
+
+	ref := credential.Ref{StoreID: "system", ItemID: "item-disk-ref"}
+
+	// 初始状态下未引用
+	unref, err := repo.CheckRefUnreferenced(ctx, ref)
+	if err != nil || !unref {
+		t.Fatalf("expected initially unreferenced, got unref=%v, err=%v", unref, err)
+	}
+
+	// 模拟外部并发写入：直接在底层持久化 store 中注入对该 ref 的引用（repo 内存快照中没有）
+	diskStore.mu.Lock()
+	diskStore.cfg.Identities.Set("external-id", models.Identity{
+		User:             "ext-user",
+		LoginPasswordRef: &ref,
+	})
+	diskStore.mu.Unlock()
+
+	// 重新调用 repo.CheckRefUnreferenced：必须从磁盘重新加载最新权威配置，发现被引用，返回 unref = false
+	unref, err = repo.CheckRefUnreferenced(ctx, ref)
+	if err != nil {
+		t.Fatalf("CheckRefUnreferenced failed: %v", err)
+	}
+	if unref {
+		t.Fatalf("expected unref == false because authoritative disk configuration holds reference!")
+	}
+
+	// 模拟磁盘加载失败：必须返回错误，严禁放行删除
+	diskStore.mu.Lock()
+	diskStore.loadErr = errors.New("disk I/O error")
+	diskStore.mu.Unlock()
+
+	_, err = repo.CheckRefUnreferenced(ctx, ref)
+	if err == nil {
+		t.Fatalf("expected error when disk configuration fails to load, got nil")
 	}
 }
