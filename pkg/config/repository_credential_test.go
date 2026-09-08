@@ -11,20 +11,52 @@ import (
 )
 
 type mockPersistStore struct {
-	result PersistResult
-	err    error
+	mu      sync.Mutex
+	cfg     *Configuration
+	result  PersistResult
+	err     error
+	syncErr error
 }
 
 func (m *mockPersistStore) Load() (*Configuration, error) {
-	return cloneConfiguration(nil), nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return cloneConfiguration(m.cfg), nil
 }
 
-func (m *mockPersistStore) Save(*Configuration) error {
+func (m *mockPersistStore) Save(c *Configuration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cfg = cloneConfiguration(c)
 	return m.err
 }
 
-func (m *mockPersistStore) save(*Configuration) (PersistResult, error) {
+func (m *mockPersistStore) save(c *Configuration) (PersistResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cfg = cloneConfiguration(c)
 	return m.result, m.err
+}
+
+func (m *mockPersistStore) IsDurable() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.result.Durable
+}
+
+func (m *mockPersistStore) Sync(context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.syncErr != nil {
+		return m.syncErr
+	}
+	if !m.result.Durable {
+		if m.err != nil {
+			return m.err
+		}
+		return errors.New("storage durability sync not completed")
+	}
+	return nil
 }
 
 func TestRepository_UpdateNodeCredentialRef_SharedIdentityFork(t *testing.T) {
@@ -537,5 +569,115 @@ func TestRepository_CheckRefUnreferenced_ReloadsDiskConfiguration(t *testing.T) 
 	_, err = repo.CheckRefUnreferenced(ctx, ref)
 	if err == nil {
 		t.Fatalf("expected error when disk configuration fails to load, got nil")
+	}
+}
+
+func TestRepository_ConfirmRefDurable_RequiresStorageSync(t *testing.T) {
+	store := &mockPersistStore{result: PersistResult{Applied: true, Durable: true}}
+	repo, err := NewRepositoryWithoutOpenSSH(newTestProvider().Snapshot(), store)
+	if err != nil {
+		t.Fatalf("NewRepositoryWithoutOpenSSH failed: %v", err)
+	}
+	ctx := context.Background()
+
+	if err := createIdentity(repo, "id-sync", models.Identity{User: "user1"}); err != nil {
+		t.Fatalf("create identity failed: %v", err)
+	}
+	if err := createNode(repo, "node-sync", models.Node{IdentityRef: "id-sync", HostRef: "h1"}, models.Host{Address: "1.1.1.1", Port: 22}, models.Identity{User: "user1"}); err != nil {
+		t.Fatalf("create node failed: %v", err)
+	}
+
+	target := credential.Target{NodeID: "node-sync", Kind: credential.KindLoginPassword}
+	newRef := &credential.Ref{StoreID: "system", ItemID: "item-sync"}
+
+	// 1. 注入 Applied=true, Durable=false（rename 成功但目录 sync 失败）
+	durErr := errors.New("directory sync failed")
+	store.result = PersistResult{Applied: true, Durable: false}
+	store.err = durErr
+
+	// 执行写入，返回 DurabilityError
+	updater := repo.AsConfigUpdater()
+	outcome, _, err := updater.ApplyCredentialRefAtVersion(ctx, target, "", newRef)
+	if err == nil {
+		t.Fatalf("expected DurabilityError, got nil")
+	}
+	if !outcome.Applied || outcome.Durable {
+		t.Fatalf("expected Applied=true, Durable=false, got %+v", outcome)
+	}
+
+	// 【核心红线断言 1】：即使配置中已可读到该引用，由于持久化层未完成同步，ConfirmRefDurable 绝对不能返回 true！
+	durable, confErr := updater.ConfirmRefDurable(ctx, target, newRef)
+	if durable {
+		t.Fatalf("ConfirmRefDurable must NOT return true when storage durability sync failed!")
+	}
+	if confErr == nil {
+		t.Fatalf("expected error when storage durability sync is incomplete, got nil")
+	}
+
+	// 2. 模拟持久化层成功完成文件/目录同步
+	store.result = PersistResult{Applied: true, Durable: true}
+	store.err = nil
+
+	// 【核心红线断言 2】：持久化层同步成功后，方可确认 Durable
+	durable, confErr = updater.ConfirmRefDurable(ctx, target, newRef)
+	if confErr != nil {
+		t.Fatalf("ConfirmRefDurable failed unexpectedly: %v", confErr)
+	}
+	if !durable {
+		t.Fatalf("expected ConfirmRefDurable to return true after storage sync succeeded")
+	}
+}
+
+func TestRepository_CheckRefUnreferenced_MultipleRepositoriesStaleSnapshot(t *testing.T) {
+	// 共享底层的持久化 Store
+	sharedStore := &memoryPersistStore{cfg: cloneConfiguration(nil)}
+
+	repo1, err := NewRepositoryWithoutOpenSSH(newTestProvider().Snapshot(), sharedStore)
+	if err != nil {
+		t.Fatalf("NewRepositoryWithoutOpenSSH repo1 failed: %v", err)
+	}
+
+	ctx := context.Background()
+	oldRef := credential.Ref{StoreID: "system", ItemID: "old-ref-stale"}
+	newRef := credential.Ref{StoreID: "system", ItemID: "new-ref-active"}
+
+	sharedIdentity := models.Identity{User: "user1", LoginPasswordRef: &oldRef}
+	if err := createIdentity(repo1, "id-shared", sharedIdentity); err != nil {
+		t.Fatalf("create identity failed: %v", err)
+	}
+	if err := createNode(repo1, "node-shared", models.Node{IdentityRef: "id-shared", HostRef: "h1"}, models.Host{Address: "1.1.1.1", Port: 22}, sharedIdentity); err != nil {
+		t.Fatalf("create node failed: %v", err)
+	}
+
+	// 此时创建 repo2（模拟另一个进程或并发实例），两者的内存快照此时均包含 oldRef
+	repo2, err := NewRepositoryWithoutOpenSSH(repo1.provider.Snapshot(), sharedStore)
+	if err != nil {
+		t.Fatalf("NewRepositoryWithoutOpenSSH repo2 failed: %v", err)
+	}
+
+	// repo1 执行轮换，将引用更新为 newRef 并持久化落盘
+	target := credential.Target{NodeID: "node-shared", Kind: credential.KindLoginPassword}
+	outcome, _, err := repo1.AsConfigUpdater().ApplyCredentialRefAtVersion(ctx, target, "", &newRef)
+	if err != nil || !outcome.Durable {
+		t.Fatalf("ApplyCredentialRefAtVersion on repo1 failed: %v", err)
+	}
+
+	// 验证磁盘上权威配置中已无 oldRef 引用
+	sharedStore.mu.Lock()
+	diskHasOld := isRefReferencedIn(sharedStore.cfg, oldRef)
+	sharedStore.mu.Unlock()
+	if diskHasOld {
+		t.Fatalf("disk configuration should no longer have oldRef")
+	}
+
+	// 此时 repo2 的内存快照仍然是旧的（包含 oldRef）
+	// 【核心红线断言】：repo2 必须识别到本进程没有未落盘修改，磁盘权威配置已无 oldRef，
+	// 内存快照中的引用属于过期快照（stale snapshot），返回 unref == true，绝不能误判为仍然引用！
+	unref, err := repo2.CheckRefUnreferenced(ctx, oldRef)
+	if err != nil {
+		t.Fatalf("CheckRefUnreferenced on repo2 failed: %v", err)
+	}
+	if !unref {
+		t.Fatalf("CRITICAL BUG: stale in-memory snapshot caused CheckRefUnreferenced to return false when authoritative disk removed the reference!")
 	}
 }

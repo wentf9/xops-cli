@@ -621,8 +621,9 @@ func (s *Service) recoverCommittedOrCleanupStage(ctx context.Context, entry *Jou
 		return
 	}
 	if !unref {
-		_ = s.journal.Remove(entry.ID)
-		res.Action = RecoveryActionRemovedNoOp
+		_ = s.journal.MarkCleanup(entry.ID)
+		res.Action = RecoveryActionScheduledForGC
+		res.Err = fmt.Errorf("old ref %s is still referenced or durability is uncertain", entry.OldRef)
 		return
 	}
 

@@ -64,6 +64,11 @@ type PersistResult struct {
 	Durable bool
 }
 
+// Syncer 表示支持显式刷新文件与目录至持久介质的存储。
+type Syncer interface {
+	Sync(ctx context.Context) error
+}
+
 type defaultStore struct {
 	Path        string
 	KeyPath     string // 用于加解密配置文件中的敏感字段
@@ -74,7 +79,21 @@ type defaultStore struct {
 
 const defaultConfigLockTimeout = 10 * time.Second
 
-var _ TransactionStore = (*defaultStore)(nil)
+var (
+	_ TransactionStore = (*defaultStore)(nil)
+	_ Syncer           = (*defaultStore)(nil)
+)
+
+func (s *defaultStore) Sync(ctx context.Context) error {
+	if s == nil || s.Path == "" {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	dir := filepath.Dir(s.Path)
+	return syncParentDirectory(dir)
+}
 
 // contextGate serializes in-process configuration access while allowing a
 // waiting caller to leave immediately when its context is canceled.

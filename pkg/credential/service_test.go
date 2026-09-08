@@ -1116,3 +1116,77 @@ func TestService_Delete_AppliedUncertain_PreservesCredential(t *testing.T) {
 		t.Fatalf("credential should be deleted after durability confirmed")
 	}
 }
+
+func TestService_FaultInjection_Recover_CommittedStage_UncertainRetainsJournal(t *testing.T) {
+	svc, store, cfg, journal, _ := setupTestService(t)
+	ctx := context.Background()
+
+	oldRef := Ref{StoreID: "test-store", ItemID: "old-committed-item"}
+	_ = store.Put(ctx, oldRef, Secret{Value: []byte("old-val")})
+
+	// 初始状态下仍处于被引用状态（模拟共享凭据或旧快照未刷新）
+	cfg.activeRefs[oldRef] = true
+
+	entry := &JournalEntry{
+		ID:        GenerateJournalID(),
+		Op:        OpRotate,
+		Stage:     StageCommitted,
+		OldRef:    &oldRef,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	if err := journal.RecordIntent(entry); err != nil {
+		t.Fatalf("RecordIntent failed: %v", err)
+	}
+	if err := journal.MarkCommitted(entry.ID); err != nil {
+		t.Fatalf("MarkCommitted failed: %v", err)
+	}
+
+	// 执行 Recover：由于 oldRef 仍被引用，绝对不能作为 NoOp 删除 journal！
+	results, err := svc.Recover(ctx)
+	if err != nil {
+		t.Fatalf("Recover failed: %v", err)
+	}
+	if len(results) != 1 || results[0].Action != RecoveryActionScheduledForGC {
+		t.Fatalf("expected RecoveryActionScheduledForGC, got %+v", results)
+	}
+
+	// 【核心红线断言 1】：Journal 必须被保留，绝不能被提前丢弃！
+	entries, _ := journal.ListPending()
+	if len(entries) != 1 {
+		t.Fatalf("CRITICAL BUG: cleanup journal was discarded while unref was false, len=%d", len(entries))
+	}
+	if entries[0].Stage != StageCleanup {
+		t.Fatalf("expected stage to advance to StageCleanup, got %s", entries[0].Stage)
+	}
+
+	// 【核心红线断言 2】：Store 中的旧凭据也绝不能被删除
+	store.mu.Lock()
+	_, exists := store.data[oldRef.ItemID]
+	store.mu.Unlock()
+	if !exists {
+		t.Fatalf("old credential must not be deleted while still referenced")
+	}
+
+	// 当引用真正解除后，再次运行 Recover，完成清理并移除 journal
+	cfg.activeRefs[oldRef] = false
+	results2, err := svc.Recover(ctx)
+	if err != nil {
+		t.Fatalf("Recover 2 failed: %v", err)
+	}
+	if len(results2) != 1 || results2[0].Action != RecoveryActionCommittedCleaned {
+		t.Fatalf("expected RecoveryActionCommittedCleaned, got %+v", results2)
+	}
+
+	// 此时 journal 和凭据均已清除
+	entriesAfter, _ := journal.ListPending()
+	if len(entriesAfter) != 0 {
+		t.Fatalf("journal should be removed after cleanup, len=%d", len(entriesAfter))
+	}
+	store.mu.Lock()
+	_, stillExistsAfter := store.data[oldRef.ItemID]
+	store.mu.Unlock()
+	if stillExistsAfter {
+		t.Fatalf("old credential should be deleted after unreferenced")
+	}
+}

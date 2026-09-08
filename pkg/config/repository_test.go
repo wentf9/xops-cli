@@ -44,6 +44,24 @@ func (s *repositoryTestStore) save(*Configuration) (PersistResult, error) {
 	return s.result, s.err
 }
 
+func (s *repositoryTestStore) IsDurable() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.result.Durable
+}
+
+func (s *repositoryTestStore) Sync(context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.result.Durable {
+		if s.err != nil {
+			return s.err
+		}
+		return errors.New("parent directory sync not completed")
+	}
+	return nil
+}
+
 func TestRepository_DoesNotPublishPreReplaceFailure(t *testing.T) {
 	store := &repositoryTestStore{err: errRepositoryPersist}
 	repository, err := NewRepositoryWithoutOpenSSH(newTestProvider().Snapshot(), store)

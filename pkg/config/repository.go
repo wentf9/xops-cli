@@ -95,11 +95,12 @@ type ImportResult struct {
 // configuration state and serializes the complete clone-validate-persist-
 // publish sequence. It intentionally does not expose its Store.
 type Repository struct {
-	commitMu   sync.Mutex
-	provider   *Provider
-	store      Store
-	revision   atomic.Uint64
-	openSSHErr error
+	commitMu          sync.Mutex
+	provider          *Provider
+	store             Store
+	revision          atomic.Uint64
+	openSSHErr        error
+	hasUndurableWrite atomic.Bool
 }
 
 var _ ConfigProvider = (*Repository)(nil)
@@ -473,11 +474,14 @@ func (r *Repository) commitResultContext(ctx context.Context, expectedRevision u
 	}
 
 	if err != nil {
+		r.hasUndurableWrite.Store(true)
 		return commitResult, &DurabilityError{Err: err}
 	}
 	if !result.Durable {
+		r.hasUndurableWrite.Store(true)
 		return commitResult, &DurabilityError{Err: fmt.Errorf("configuration store returned an incomplete durability result")}
 	}
+	r.hasUndurableWrite.Store(false)
 	return commitResult, nil
 }
 
@@ -499,11 +503,14 @@ func (r *Repository) commitTransactionResult(ctx context.Context, store Transact
 	r.publish(updated, lookup, aliases)
 	result.Snapshot.Configuration = cloneConfiguration(updated)
 	if err != nil {
+		r.hasUndurableWrite.Store(true)
 		return result, &DurabilityError{Err: err}
 	}
 	if !result.Durable {
+		r.hasUndurableWrite.Store(true)
 		return result, &DurabilityError{Err: fmt.Errorf("configuration transaction returned an incomplete durability result")}
 	}
+	r.hasUndurableWrite.Store(false)
 	return result, nil
 }
 
@@ -1376,6 +1383,40 @@ func (r *Repository) UpdateIdentityCredentialRefAtVersionContext(
 
 // CheckRefUnreferenced checks whether the given credential reference is unreferenced anywhere
 // in the latest active configuration snapshot.
+func (r *Repository) loadDiskConfigLocked(ctx context.Context) (*Configuration, error) {
+	if ts, ok := r.store.(TransactionStore); ok {
+		snap, err := ts.LoadSnapshot(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return snap.Configuration, nil
+	}
+	if r.store != nil {
+		return r.store.Load()
+	}
+	return nil, nil
+}
+
+func (r *Repository) syncStoreLocked(ctx context.Context) error {
+	if syncer, ok := r.store.(Syncer); ok {
+		if err := syncer.Sync(ctx); err != nil {
+			return err
+		}
+	} else if ds, ok := r.store.(*defaultStore); ok {
+		if err := ds.Sync(ctx); err != nil {
+			return err
+		}
+	} else if dc, ok := r.store.(interface{ IsDurable() bool }); ok {
+		if !dc.IsDurable() {
+			return fmt.Errorf("authoritative storage is not durable")
+		}
+	} else if r.hasUndurableWrite.Load() {
+		return fmt.Errorf("unconfirmed durability write remains pending")
+	}
+	return nil
+}
+
+// CheckRefUnreferenced checks whether the reference is unreferenced in authoritative storage.
 func (r *Repository) CheckRefUnreferenced(ctx context.Context, ref credential.Ref) (bool, error) {
 	if ref.IsEmpty() {
 		return true, nil
@@ -1387,31 +1428,34 @@ func (r *Repository) CheckRefUnreferenced(ctx context.Context, ref credential.Re
 	r.commitMu.Lock()
 	defer r.commitMu.Unlock()
 
-	// 从持久化存储重新加载最新权威配置，防止读到过期的进程内缓存
-	var diskCfg *Configuration
-	if ts, ok := r.store.(TransactionStore); ok {
-		snap, err := ts.LoadSnapshot(ctx)
-		if err != nil {
-			return false, fmt.Errorf("reload configuration snapshot for ref check: %w", err)
-		}
-		diskCfg = snap.Configuration
-	} else if r.store != nil {
-		cfg, err := r.store.Load()
-		if err != nil {
-			return false, fmt.Errorf("load configuration for ref check: %w", err)
-		}
-		diskCfg = cfg
+	// 1. 从持久化存储重新加载最新权威配置
+	diskCfg, err := r.loadDiskConfigLocked(ctx)
+	if err != nil {
+		return false, fmt.Errorf("reload configuration snapshot for ref check: %w", err)
 	}
 
-	// 检查磁盘权威快照中是否仍然包含该引用
+	// 2. 检查磁盘权威快照中是否仍然包含该引用
 	if diskCfg != nil && isRefReferencedIn(diskCfg, ref) {
 		return false, nil
 	}
 
-	// 检查内存快照中是否仍然包含该引用（防止未落盘但已应用的状态被误判）
-	memCfg := r.provider.Snapshot()
-	if memCfg != nil && isRefReferencedIn(memCfg, ref) {
-		return false, nil
+	// 3. 区分过期快照与真正未确认持久化的状态：
+	// 仅当本进程处于真正未确认持久化的写入状态（Applied=true, Durable=false）时，
+	// 内存快照中的引用才代表未落盘的新增引用；
+	// 若本进程无未落盘写入，而磁盘权威配置已无该引用，则内存中若有该引用纯属过期快照（stale snapshot）。
+	if r.hasUndurableWrite.Load() {
+		memCfg := r.provider.Snapshot()
+		if memCfg != nil && isRefReferencedIn(memCfg, ref) {
+			return false, nil
+		}
+	} else if diskCfg != nil {
+		memCfg := r.provider.Snapshot()
+		if memCfg != nil && isRefReferencedIn(memCfg, ref) {
+			// 检测到过期快照，以磁盘权威配置主动刷新内存快照
+			if lookup, aliases, err := buildIndexes(diskCfg, false); err == nil {
+				r.publish(diskCfg, lookup, aliases)
+			}
+		}
 	}
 
 	return true, nil
@@ -1504,32 +1548,33 @@ func (r *Repository) ConfirmRefDurable(ctx context.Context, target credential.Ta
 	r.commitMu.Lock()
 	defer r.commitMu.Unlock()
 
-	var diskCfg *Configuration
-	if ts, ok := r.store.(TransactionStore); ok {
-		snap, err := ts.LoadSnapshot(ctx)
-		if err != nil {
-			return false, fmt.Errorf("reload configuration snapshot for durability check: %w", err)
-		}
-		diskCfg = snap.Configuration
-	} else if r.store != nil {
-		cfg, err := r.store.Load()
-		if err != nil {
-			return false, fmt.Errorf("load configuration for durability check: %w", err)
-		}
-		diskCfg = cfg
+	// 1. 先从底层权威存储读取最新配置并比对引用
+	diskCfg, err := r.loadDiskConfigLocked(ctx)
+	if err != nil {
+		return false, fmt.Errorf("reload configuration snapshot for durability check: %w", err)
 	}
 	if diskCfg == nil {
 		return false, fmt.Errorf("authoritative configuration unavailable")
 	}
 
+	var matched bool
 	if target.NodeID != "" {
-		return confirmNodeRefDurable(diskCfg, target, ref), nil
+		matched = confirmNodeRefDurable(diskCfg, target, ref)
+	} else if target.IdentityID != "" {
+		matched = confirmIdentityRefDurable(diskCfg, target, ref)
 	}
-	if target.IdentityID != "" {
-		return confirmIdentityRefDurable(diskCfg, target, ref), nil
+	if !matched {
+		return false, nil
 	}
 
-	return false, nil
+	// 2. 引用在配置中已匹配，必须在持久化层重新完成文件/目录同步，真正确认 Durable
+	if err := r.syncStoreLocked(ctx); err != nil {
+		// 持久化层未能成功完成同步，不能确认 Durable，返回 false 阻止删除旧凭据
+		return false, fmt.Errorf("complete storage durability sync failed: %w", err)
+	}
+
+	r.hasUndurableWrite.Store(false)
+	return true, nil
 }
 
 // RepositoryConfigUpdater adapts a Repository to satisfy credential.ConfigUpdater.
