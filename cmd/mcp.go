@@ -53,7 +53,9 @@ func runMCPServer(cmd *cobra.Command, args []string) error {
 		mcpserver.WithConfigProvider(provider),
 		mcpserver.WithLogger(logger.DefaultLogger()),
 	}
-	if reg, regErr := utils.GetCredentialRegistry(cfg); regErr == nil && reg != nil {
+	if reg, regErr := utils.GetCredentialRegistry(cfg); regErr != nil {
+		return fmt.Errorf("initialize credential resolver: %w", regErr)
+	} else if reg != nil {
 		serveOpts = append(serveOpts, mcpserver.WithCredentialRegistry(reg))
 	}
 

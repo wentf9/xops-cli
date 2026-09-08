@@ -254,11 +254,12 @@ func (o *ExecOptions) Validate() error {
 }
 
 type execHostTask struct {
-	nodeID string
-	host   string
-	port   uint16
-	user   string
-	pass   string
+	nodeID     string
+	host       string
+	port       uint16
+	user       string
+	pass       string
+	passphrase string
 }
 
 func (o *ExecOptions) Run() error {
@@ -322,7 +323,10 @@ func (o *ExecOptions) RunContext(ctx context.Context) (retErr error) {
 		return errTask
 	}
 
-	adpOpts := o.buildAdapterOptions(tasks, cfg)
+	adpOpts, optErr := o.buildAdapterOptions(tasks, cfg, provider)
+	if optErr != nil {
+		return optErr
+	}
 	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
 	defer func() {
 		joinConnectorCloseError(&retErr, connector)
@@ -415,37 +419,35 @@ func (o *ExecOptions) runInteractive(
 	return execErr
 }
 
-func (o *ExecOptions) buildAdapterOptions(tasks []execHostTask, cfg *config.Configuration) []adapter.Option {
+func (o *ExecOptions) buildAdapterOptions(tasks []execHostTask, cfg *config.Configuration, repository *config.Repository) ([]adapter.Option, error) {
 	var adpOpts []adapter.Option
-	if o.Password != "" || o.Passphrase != "" || o.SuPwd != "" {
-		for _, task := range tasks {
-			shouldRemember := utils.ShouldRememberCredential(o.Remember, task.host)
-			adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(task.nodeID, adapter.SessionAuth{
-				Password:   o.Password,
-				Passphrase: o.Passphrase,
-				SuPwd:      o.SuPwd,
-				Remember:   shouldRemember,
-			}))
-		}
+	rememberAny := false
+	for _, task := range tasks {
+		shouldRemember := utils.ShouldRememberCredential(o.Remember, task.host)
+		rememberAny = rememberAny || shouldRemember
+		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(task.nodeID, adapter.SessionAuth{
+			Password: task.pass, Passphrase: task.passphrase, SuPwd: o.SuPwd, Remember: shouldRemember,
+		}))
 	}
-	if reg, regErr := utils.GetCredentialRegistry(cfg); regErr == nil && reg != nil {
+	if reg, regErr := utils.GetCredentialRegistry(cfg); regErr != nil {
+		return nil, fmt.Errorf("initialize credential resolver: %w", regErr)
+	} else if reg != nil {
 		adpOpts = append(adpOpts, adapter.WithCredentialSource(reg))
 	}
-	return adpOpts
+	if rememberAny {
+		service, err := utils.GetCredentialService(repository, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("initialize credential persistence: %w", err)
+		}
+		adpOpts = append(adpOpts, adapter.WithCredentialService(service))
+	}
+	return adpOpts, nil
 }
 
 func (o *ExecOptions) getOrCreateNode(ctx context.Context, repository *config.Repository, target config.ConnectionTarget, addr utils.HostInfo) (string, bool, error) {
-	password := addr.Password
-	if password == "" && o.Password != "" {
-		password = o.Password
-	}
 	identityFile := addr.KeyPath
 	if identityFile == "" {
 		identityFile = o.IdentityFile
-	}
-	passphrase := addr.Passphrase
-	if passphrase == "" {
-		passphrase = o.Passphrase
 	}
 	alias := addr.Alias
 	if alias == "" {
@@ -456,26 +458,14 @@ func (o *ExecOptions) getOrCreateNode(ctx context.Context, repository *config.Re
 	if o.Sudo {
 		sudoMode = models.SudoModeSudo
 	}
-	suPwd := o.SuPwd
-
-	shouldRemember := utils.ShouldRememberCredential(o.Remember, target.Selector)
-	passwordToSave := ""
-	passphraseToSave := ""
-	suPwdToSave := ""
-	if shouldRemember {
-		passwordToSave = password
-		passphraseToSave = passphrase
-		suPwdToSave = suPwd
-	}
-
 	res, err := repository.EnsureNodeContext(ctx, config.EnsureNodeOptions{
 		Target:       target,
-		Password:     passwordToSave,
+		Password:     "",
 		IdentityFile: identityFile,
-		Passphrase:   passphraseToSave,
+		Passphrase:   "",
 		Alias:        alias,
 		SudoMode:     sudoMode,
-		SuPwd:        suPwdToSave,
+		SuPwd:        "",
 	})
 	if err != nil {
 		return "", false, err
@@ -660,12 +650,18 @@ func (o *ExecOptions) buildTasksFromTags(provider config.ConfigProvider) ([]exec
 		if resolveErr != nil {
 			return nil, fmt.Errorf("resolve tagged node %q failed: %w", nodeID, resolveErr)
 		}
+		password := identity.Password
+		if o.Password != "" {
+			password = o.Password
+		}
+		passphrase := o.Passphrase
 		tasks = append(tasks, execHostTask{
-			nodeID: nodeID,
-			host:   hostObj.Address,
-			port:   hostObj.Port,
-			user:   identity.User,
-			pass:   identity.Password,
+			nodeID:     nodeID,
+			host:       hostObj.Address,
+			port:       hostObj.Port,
+			user:       identity.User,
+			pass:       password,
+			passphrase: passphrase,
 		})
 	}
 	return tasks, nil
@@ -694,6 +690,10 @@ func (o *ExecOptions) buildTasksFromHosts(ctx context.Context, repository *confi
 		password := h.Password
 		if password == "" {
 			password = o.Password
+		}
+		passphrase := h.Passphrase
+		if passphrase == "" {
+			passphrase = o.Passphrase
 		}
 		alias := h.Alias
 		if alias == "" {
@@ -725,11 +725,12 @@ func (o *ExecOptions) buildTasksFromHosts(ctx context.Context, repository *confi
 			continue
 		}
 		tasks = append(tasks, execHostTask{
-			nodeID: nodeID,
-			host:   h.Host,
-			port:   port,
-			user:   user,
-			pass:   password,
+			nodeID:     nodeID,
+			host:       h.Host,
+			port:       port,
+			user:       user,
+			pass:       password,
+			passphrase: passphrase,
 		})
 	}
 	return tasks, hostErrs, nil
@@ -790,16 +791,16 @@ func (o *ExecOptions) updateIdentity(identity *models.Identity, addr utils.HostI
 	updated := false
 
 	if addr.Password != "" {
-		if identity.Password != addr.Password || identity.AuthType != "password" {
-			identity.Password = addr.Password
+		// Secret persistence is handled by adapter + credential.Service after
+		// store write/readback/CAS. Do not copy it into the configuration.
+		if identity.AuthType != "password" {
 			identity.AuthType = "password"
 			updated = true
 		}
 	} else if addr.KeyPath != "" {
 		absKeyPath := utils.ToAbsolutePath(addr.KeyPath)
-		if identity.KeyPath != absKeyPath || identity.Passphrase != addr.Passphrase || identity.AuthType != "key" {
+		if identity.KeyPath != absKeyPath || identity.AuthType != "key" {
 			identity.KeyPath = absKeyPath
-			identity.Passphrase = addr.Passphrase
 			identity.AuthType = "key"
 			updated = true
 		}
@@ -835,11 +836,6 @@ func (o *ExecOptions) updateNodeSudo(node *models.Node) bool {
 
 	if sudoMode != models.SudoModeNone && node.SudoMode != sudoMode {
 		node.SudoMode = sudoMode
-		updated = true
-	}
-
-	if o.SuPwd != "" && node.SuPwd != o.SuPwd {
-		node.SuPwd = o.SuPwd
 		updated = true
 	}
 

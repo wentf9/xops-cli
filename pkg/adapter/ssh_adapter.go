@@ -57,13 +57,34 @@ func WithNonInteractive(nonInteractive bool) Option {
 	}
 }
 
+// WithCredentialRecording controls persistence of secrets discovered during a
+// connection. Interactive UIs use false and persist only through their
+// explicit credential form actions.
+func WithCredentialRecording(enabled bool) Option {
+	return func(a *SSHAdapter) {
+		a.credentialRecording = enabled
+	}
+}
+
 // SSHAdapter 实现 ssh.ConnectionProvider, ssh.SecretResolver, ssh.CredentialRecorder 接口，作为业务模型与底层 SSH 的防腐层
 type SSHAdapter struct {
-	cfgProvider        config.ConfigProvider
-	credentialResolver CredentialResolver
-	sessionOverrides   map[string]SessionAuth
-	globalSessionAuth  *SessionAuth
-	nonInteractive     bool
+	cfgProvider         config.ConfigProvider
+	credentialResolver  CredentialResolver
+	credentialService   *credential.Service
+	sessionOverrides    map[string]SessionAuth
+	globalSessionAuth   *SessionAuth
+	nonInteractive      bool
+	credentialRecording bool
+}
+
+// WithCredentialService injects the transactional writer used when an
+// interactive connection is explicitly allowed to remember a discovered
+// secret.  Secrets must never be written through the legacy configuration
+// fields.
+func WithCredentialService(service *credential.Service) Option {
+	return func(a *SSHAdapter) {
+		a.credentialService = service
+	}
 }
 
 var (
@@ -76,8 +97,9 @@ var (
 // NewSSHAdapter 创建 SSH 适配器
 func NewSSHAdapter(cfgProvider config.ConfigProvider, opts ...Option) *SSHAdapter {
 	adp := &SSHAdapter{
-		cfgProvider:      cfgProvider,
-		sessionOverrides: make(map[string]SessionAuth),
+		cfgProvider:         cfgProvider,
+		sessionOverrides:    make(map[string]SessionAuth),
+		credentialRecording: true,
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -199,17 +221,63 @@ func (a *SSHAdapter) UpdateAuth(ctx context.Context, nodeID, authUpdateToken, pa
 		// 非交互模式禁止写回自动发现的秘密
 		return authUpdateToken, nil
 	}
+	if !a.credentialRecording {
+		return authUpdateToken, nil
+	}
 	if override, ok := a.getSessionOverride(nodeID); ok && !override.Remember {
 		// 显式指定 session-only 覆盖，不写回持久化配置
 		return authUpdateToken, nil
 	}
-	provider, ok := a.cfgProvider.(interface {
-		UpdateAuthAtVersionContext(context.Context, string, string, string, string, string) (string, error)
-	})
-	if !ok {
-		return "", fmt.Errorf("configuration provider does not support versioned authentication updates")
+	if a.credentialService == nil {
+		// Backward compatibility for embedders that intentionally use the
+		// legacy ConfigStore API. All xops CLI composition roots inject a
+		// credential service, so they never take this plaintext path.
+		provider, ok := a.cfgProvider.(interface {
+			UpdateAuthAtVersionContext(context.Context, string, string, string, string, string) (string, error)
+		})
+		if !ok {
+			return "", fmt.Errorf("configuration provider does not support versioned authentication updates")
+		}
+		return provider.UpdateAuthAtVersionContext(ctx, nodeID, authUpdateToken, password, keyPath, passphrase)
 	}
-	return provider.UpdateAuthAtVersionContext(ctx, nodeID, authUpdateToken, password, keyPath, passphrase)
+	snapshot, err := a.cfgProvider.ResolveConnection(nodeID)
+	if err != nil {
+		return "", fmt.Errorf("resolve node %q for remembered authentication: %w", nodeID, err)
+	}
+	version := authUpdateToken
+	if password != "" {
+		ref, nextVersion, rotateErr := a.credentialService.Rotate(ctx,
+			credential.Target{NodeID: nodeID, Kind: credential.KindLoginPassword},
+			version, snapshot.Identity.LoginPasswordRef, a.defaultStoreID(), credential.Secret{Value: []byte(password)})
+		if rotateErr != nil {
+			return "", fmt.Errorf("persist remembered login password: %w", rotateErr)
+		}
+		_ = ref
+		version = nextVersion
+	}
+	if passphrase != "" {
+		// The first rotation may have advanced the auth version; resolve the
+		// latest snapshot before rotating the independent passphrase ref.
+		snapshot, err = a.cfgProvider.ResolveConnection(nodeID)
+		if err != nil {
+			return "", fmt.Errorf("refresh node %q before persisting passphrase: %w", nodeID, err)
+		}
+		_, nextVersion, rotateErr := a.credentialService.Rotate(ctx,
+			credential.Target{NodeID: nodeID, Kind: credential.KindPassphrase},
+			version, snapshot.Identity.PassphraseRef, a.defaultStoreID(), credential.Secret{Value: []byte(passphrase)})
+		if rotateErr != nil {
+			return "", fmt.Errorf("persist remembered private-key passphrase: %w", rotateErr)
+		}
+		version = nextVersion
+	}
+	return version, nil
+}
+
+func (a *SSHAdapter) defaultStoreID() string {
+	if cfg := a.cfgProvider.Snapshot(); cfg != nil && cfg.Credential != nil {
+		return cfg.Credential.DefaultStore
+	}
+	return "system"
 }
 
 // UpdateSudo 处理提权密码和模式的回写并返回本次提交后的新提权令牌
@@ -218,9 +286,25 @@ func (a *SSHAdapter) UpdateSudo(ctx context.Context, nodeID, sudoUpdateToken str
 		// 非交互模式禁止写回自动发现的秘密
 		return sudoUpdateToken, nil
 	}
+	if !a.credentialRecording {
+		return sudoUpdateToken, nil
+	}
 	if override, ok := a.getSessionOverride(nodeID); ok && !override.Remember {
 		// 显式指定 session-only 覆盖，不写回持久化配置
 		return sudoUpdateToken, nil
+	}
+	if a.credentialService != nil && suPwd != "" {
+		snapshot, err := a.cfgProvider.ResolveConnection(nodeID)
+		if err != nil {
+			return "", fmt.Errorf("resolve node %q for remembered privilege password: %w", nodeID, err)
+		}
+		_, version, rotateErr := a.credentialService.Rotate(ctx,
+			credential.Target{NodeID: nodeID, Kind: credential.KindPrivilegePassword},
+			sudoUpdateToken, snapshot.Node.PrivilegePasswordRef, a.defaultStoreID(), credential.Secret{Value: []byte(suPwd)})
+		if rotateErr != nil {
+			return "", fmt.Errorf("persist remembered privilege password: %w", rotateErr)
+		}
+		return version, nil
 	}
 	provider, ok := a.cfgProvider.(interface {
 		UpdateSudoAtVersionContext(context.Context, string, string, models.SudoMode, string) (string, error)
@@ -273,8 +357,12 @@ func (a *SSHAdapter) resolveLoginPassword(
 	if hasOverride && override.Password != "" {
 		return []byte(override.Password), nil
 	}
-	if snapshot.Identity.LoginPasswordRef != nil && !snapshot.Identity.LoginPasswordRef.IsEmpty() && a.credentialResolver != nil {
-		sec, err := a.credentialResolver.Resolve(ctx, *snapshot.Identity.LoginPasswordRef)
+	if ref := snapshot.Identity.LoginPasswordRef; ref != nil && !ref.IsEmpty() {
+		if a.credentialResolver == nil {
+			return nil, fmt.Errorf("login password ref %q/%q is configured but no credential resolver is available: %w",
+				ref.StoreID, ref.ItemID, credential.ErrCredentialStoreUnavailable)
+		}
+		sec, err := a.credentialResolver.Resolve(ctx, *ref)
 		if err != nil {
 			return nil, fmt.Errorf("get login password from store: %w", err)
 		}
@@ -295,8 +383,12 @@ func (a *SSHAdapter) resolvePassphrase(
 	if hasOverride && override.Passphrase != "" {
 		return []byte(override.Passphrase), nil
 	}
-	if snapshot.Identity.PassphraseRef != nil && !snapshot.Identity.PassphraseRef.IsEmpty() && a.credentialResolver != nil {
-		sec, err := a.credentialResolver.Resolve(ctx, *snapshot.Identity.PassphraseRef)
+	if ref := snapshot.Identity.PassphraseRef; ref != nil && !ref.IsEmpty() {
+		if a.credentialResolver == nil {
+			return nil, fmt.Errorf("passphrase ref %q/%q is configured but no credential resolver is available: %w",
+				ref.StoreID, ref.ItemID, credential.ErrCredentialStoreUnavailable)
+		}
+		sec, err := a.credentialResolver.Resolve(ctx, *ref)
 		if err != nil {
 			return nil, fmt.Errorf("get passphrase from store: %w", err)
 		}
@@ -317,8 +409,12 @@ func (a *SSHAdapter) resolveSuPassword(
 	if hasOverride && override.SuPwd != "" {
 		return []byte(override.SuPwd), nil
 	}
-	if snapshot.Node.PrivilegePasswordRef != nil && !snapshot.Node.PrivilegePasswordRef.IsEmpty() && a.credentialResolver != nil {
-		sec, err := a.credentialResolver.Resolve(ctx, *snapshot.Node.PrivilegePasswordRef)
+	if ref := snapshot.Node.PrivilegePasswordRef; ref != nil && !ref.IsEmpty() {
+		if a.credentialResolver == nil {
+			return nil, fmt.Errorf("privilege password ref %q/%q is configured but no credential resolver is available: %w",
+				ref.StoreID, ref.ItemID, credential.ErrCredentialStoreUnavailable)
+		}
+		sec, err := a.credentialResolver.Resolve(ctx, *ref)
 		if err != nil {
 			return nil, fmt.Errorf("get su password from store: %w", err)
 		}

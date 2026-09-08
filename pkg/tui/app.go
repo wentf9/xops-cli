@@ -217,6 +217,10 @@ func NewModel(repository *config.Repository, opts ...ModelOption) (Model, error)
 	if cfg.credentialRegistry != nil {
 		adpOpts = append(adpOpts, adapter.WithCredentialSource(cfg.credentialRegistry))
 	}
+	if cfg.credentialService != nil {
+		adpOpts = append(adpOpts, adapter.WithCredentialService(cfg.credentialService))
+	}
+	adpOpts = append(adpOpts, adapter.WithCredentialRecording(false))
 	connector := adapter.NewConnectorWithAdapterOptions(repository, adpOpts, connOpts...)
 	view := repository.View()
 	lifecycleCtx, lifecycleCancel := context.WithCancel(cfg.ctx)

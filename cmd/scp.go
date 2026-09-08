@@ -279,15 +279,20 @@ func (o *ScpOptions) RunContext(ctx context.Context) (retErr error) {
 		return fmt.Errorf("create configuration repository: %w", err)
 	}
 	var adpOpts []adapter.Option
-	if o.Password != "" || o.Passphrase != "" {
-		shouldRemember := cmdutils.ShouldRememberCredential(o.Remember, o.Host)
-		adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{
-			Password:   o.Password,
-			Passphrase: o.Passphrase,
-			Remember:   shouldRemember,
-		}))
+	shouldRemember := cmdutils.ShouldRememberCredential(o.Remember, o.Host)
+	adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{
+		Password: o.Password, Passphrase: o.Passphrase, Remember: shouldRemember,
+	}))
+	if shouldRemember {
+		service, serviceErr := cmdutils.GetCredentialService(provider, cfg)
+		if serviceErr != nil {
+			return fmt.Errorf("initialize credential persistence: %w", serviceErr)
+		}
+		adpOpts = append(adpOpts, adapter.WithCredentialService(service))
 	}
-	if reg, regErr := cmdutils.GetCredentialRegistry(cfg); regErr == nil && reg != nil {
+	if reg, regErr := cmdutils.GetCredentialRegistry(cfg); regErr != nil {
+		return fmt.Errorf("initialize credential resolver: %w", regErr)
+	} else if reg != nil {
 		adpOpts = append(adpOpts, adapter.WithCredentialSource(reg))
 	}
 	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
@@ -1024,24 +1029,12 @@ func (o *ScpOptions) getOrCreateNodeForPath(ctx context.Context, provider config
 		return "", false, err
 	}
 
-	password := specificPassword
-	if password == "" && o.Password != "" {
-		password = o.Password
-	}
-
 	shouldRemember := cmdutils.ShouldRememberCredential(o.Remember, target.Selector)
-	passwordToSave := ""
-	passphraseToSave := ""
-	if shouldRemember {
-		passwordToSave = password
-		passphraseToSave = o.Passphrase
-	}
-
 	res, err := repo.EnsureNodeContext(ctx, config.EnsureNodeOptions{
 		Target:       target,
-		Password:     passwordToSave,
+		Password:     "",
 		IdentityFile: o.IdentityFile,
-		Passphrase:   passphraseToSave,
+		Passphrase:   "",
 		Alias:        o.Alias,
 	})
 	if err != nil {
@@ -1093,8 +1086,7 @@ func (o *ScpOptions) updateNodeAuth(identity *models.Identity, specificPassword 
 
 	if shouldRemember {
 		if password != "" {
-			if identity.Password != password || identity.AuthType != "password" {
-				identity.Password = password
+			if identity.AuthType != "password" {
 				identity.AuthType = "password"
 				updated = true
 			}
@@ -1107,10 +1099,6 @@ func (o *ScpOptions) updateNodeAuth(identity *models.Identity, specificPassword 
 			}
 		}
 
-		if o.Passphrase != "" && identity.Passphrase != o.Passphrase {
-			identity.Passphrase = o.Passphrase
-			updated = true
-		}
 	} else if o.IdentityFile != "" {
 		absKeyPath := cmdutils.ToAbsolutePath(o.IdentityFile)
 		if identity.KeyPath != absKeyPath || identity.AuthType != "key" {

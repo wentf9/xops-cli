@@ -16,6 +16,24 @@ type memoryCredentialStore struct {
 	data map[string]credential.Secret
 }
 
+type failingCredentialStore struct {
+	*memoryCredentialStore
+	failPut bool
+	onPut   func() error
+}
+
+func (s *failingCredentialStore) Put(ctx context.Context, ref credential.Ref, secret credential.Secret) error {
+	if s.failPut {
+		return credential.ErrCredentialStoreUnavailable
+	}
+	if s.onPut != nil {
+		if err := s.onPut(); err != nil {
+			return err
+		}
+	}
+	return s.memoryCredentialStore.Put(ctx, ref, secret)
+}
+
 func newMemoryCredentialStore() *memoryCredentialStore {
 	return &memoryCredentialStore{
 		data: make(map[string]credential.Secret),
@@ -45,6 +63,7 @@ func TestNodeFormState_NoSecretBackfilling(t *testing.T) {
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
 		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
 		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
+		Credential: &config.CredentialConfig{DefaultStore: "mem"},
 	}
 
 	nodeID := "user1@192.168.1.10:22"
@@ -122,7 +141,7 @@ func TestNodeFormState_KeepPreservesExistingCredentials(t *testing.T) {
 		Port:    22,
 	})
 	existingRef := &credential.Ref{
-		StoreID: "system",
+		StoreID: "mem",
 		ItemID:  "item-keep-test",
 	}
 	cfg.Identities.Set("user2@192.168.1.20", models.Identity{
@@ -132,8 +151,12 @@ func TestNodeFormState_KeepPreservesExistingCredentials(t *testing.T) {
 	})
 
 	repo := newTestRepository(t, cfg)
+	memStore := newMemoryCredentialStore()
+	memStore.data[existingRef.ItemID] = credential.NewSecret([]byte("delete-me"))
+	service := newFormCredentialTestService(t, repo, memStore)
 	m := &Model{
-		repository: repo,
+		repository:        repo,
+		credentialService: service,
 		formState: &nodeFormState{
 			isEdit:              true,
 			originalID:          nodeID,
@@ -148,7 +171,11 @@ func TestNodeFormState_KeepPreservesExistingCredentials(t *testing.T) {
 		},
 	}
 
-	completeConfigurationMutation(t, m, m.saveFormCmd())
+	if cmd := m.saveFormCmd(); cmd != nil {
+		cmd()
+	} else {
+		t.Fatal("expected configuration mutation command")
+	}
 
 	updatedIdent, ok := repo.View().Configuration.Identities.Get("user2@192.168.1.20")
 	if !ok {
@@ -164,6 +191,7 @@ func TestNodeFormState_DeleteRemovesCredentials(t *testing.T) {
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
 		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
 		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
+		Credential: &config.CredentialConfig{DefaultStore: "mem"},
 	}
 
 	nodeID := "user3@192.168.1.30:22"
@@ -177,7 +205,7 @@ func TestNodeFormState_DeleteRemovesCredentials(t *testing.T) {
 		Port:    22,
 	})
 	existingRef := &credential.Ref{
-		StoreID: "system",
+		StoreID: "mem",
 		ItemID:  "item-delete-test",
 	}
 	cfg.Identities.Set("user3@192.168.1.30", models.Identity{
@@ -187,8 +215,12 @@ func TestNodeFormState_DeleteRemovesCredentials(t *testing.T) {
 	})
 
 	repo := newTestRepository(t, cfg)
+	memStore := newMemoryCredentialStore()
+	memStore.data[existingRef.ItemID] = credential.NewSecret([]byte("delete-me"))
+	service := newFormCredentialTestService(t, repo, memStore)
 	m := &Model{
-		repository: repo,
+		repository:        repo,
+		credentialService: service,
 		formState: &nodeFormState{
 			isEdit:              true,
 			originalID:          nodeID,
@@ -203,7 +235,11 @@ func TestNodeFormState_DeleteRemovesCredentials(t *testing.T) {
 		},
 	}
 
-	completeConfigurationMutation(t, m, m.saveFormCmd())
+	if cmd := m.saveFormCmd(); cmd != nil {
+		cmd()
+	} else {
+		t.Fatal("expected configuration mutation command")
+	}
 
 	updatedIdent, ok := repo.View().Configuration.Identities.Get("user3@192.168.1.30")
 	if !ok {
@@ -302,4 +338,120 @@ func TestNodeFormState_ReplaceCredentialsWithService(t *testing.T) {
 	if string(sec.Value) != "brand_new_secret" {
 		t.Errorf("expected secret value 'brand_new_secret', got %q", string(sec.Value))
 	}
+}
+
+func TestNodeFormCredentialReplace_FailurePreservesLegacySecret(t *testing.T) {
+	cfg := newFormCredentialTestConfiguration("legacy-password")
+	repo := newTestRepository(t, cfg)
+	store := &failingCredentialStore{memoryCredentialStore: newMemoryCredentialStore(), failPut: true}
+	service := newFormCredentialTestService(t, repo, store)
+	m := newPasswordReplaceFormModel(repo, service, "new-password")
+	if cmd := m.saveFormCmd(); cmd != nil {
+		cmd()
+	} else {
+		t.Fatal("expected configuration mutation command")
+	}
+
+	snapshot, err := repo.ResolveConnection(formCredentialTestNodeID)
+	if err != nil {
+		t.Fatalf("resolve connection failed: %v", err)
+	}
+	if snapshot.Identity.Password != "legacy-password" {
+		t.Fatalf("legacy password = %q, want preserved value", snapshot.Identity.Password)
+	}
+}
+
+func TestNodeFormCredentialReplace_RejectsConcurrentCredentialMutation(t *testing.T) {
+	cfg := newFormCredentialTestConfiguration("")
+	repo := newTestRepository(t, cfg)
+	store := &failingCredentialStore{memoryCredentialStore: newMemoryCredentialStore()}
+	concurrentRef := credential.Ref{StoreID: "mem", ItemID: "concurrent-item"}
+	store.onPut = func() error {
+		_, _, err := repo.UpdateNodeCredentialRefAtVersionContext(t.Context(), formCredentialTestNodeID, "", credential.KindLoginPassword, &concurrentRef)
+		return err
+	}
+	service := newFormCredentialTestService(t, repo, store)
+	m := newPasswordReplaceFormModel(repo, service, "new-password")
+	if cmd := m.saveFormCmd(); cmd != nil {
+		cmd()
+	} else {
+		t.Fatal("expected configuration mutation command")
+	}
+
+	snapshot, err := repo.ResolveConnection(formCredentialTestNodeID)
+	if err != nil {
+		t.Fatalf("resolve connection failed: %v", err)
+	}
+	if snapshot.Identity.LoginPasswordRef == nil || *snapshot.Identity.LoginPasswordRef != concurrentRef {
+		t.Fatalf("credential reference = %v, want concurrent ref %v", snapshot.Identity.LoginPasswordRef, concurrentRef)
+	}
+}
+
+func TestNodeFormCredentialDelete_ServiceFailurePreservesReference(t *testing.T) {
+	cfg := newFormCredentialTestConfiguration("")
+	oldRef := credential.Ref{StoreID: "mem", ItemID: "old-item"}
+	identity, _ := cfg.Identities.Get("user@192.168.1.50")
+	identity.LoginPasswordRef = oldRef.Clone()
+	cfg.Identities.Set("user@192.168.1.50", identity)
+	repo := newTestRepository(t, cfg)
+	m := newPasswordReplaceFormModel(repo, nil, "")
+	m.formState.passwordAction = "delete"
+	m.formState.existingPasswordRef = oldRef.Clone()
+
+	cmd := m.saveFormCmd()
+	if cmd == nil {
+		t.Fatal("expected configuration mutation command")
+	}
+	msg, ok := cmd().(configurationMutationMsg)
+	if !ok || msg.err == nil {
+		t.Fatalf("delete without credential service = %#v, want error", msg)
+	}
+	snapshot, err := repo.ResolveConnection(formCredentialTestNodeID)
+	if err != nil {
+		t.Fatalf("resolve connection failed: %v", err)
+	}
+	if snapshot.Identity.LoginPasswordRef == nil || *snapshot.Identity.LoginPasswordRef != oldRef {
+		t.Fatalf("credential ref = %v, want preserved %v", snapshot.Identity.LoginPasswordRef, oldRef)
+	}
+}
+
+const formCredentialTestNodeID = "user@192.168.1.50:22"
+
+func newFormCredentialTestConfiguration(password string) *config.Configuration {
+	cfg := &config.Configuration{
+		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
+		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
+		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
+		Credential: &config.CredentialConfig{DefaultStore: "mem"},
+	}
+	cfg.Nodes.Set(formCredentialTestNodeID, models.Node{HostRef: "192.168.1.50:22", IdentityRef: "user@192.168.1.50", SudoMode: models.SudoModeAuto})
+	cfg.Hosts.Set("192.168.1.50:22", models.Host{Address: "192.168.1.50", Port: 22})
+	cfg.Identities.Set("user@192.168.1.50", models.Identity{User: "user", AuthType: "password", Password: password})
+	return cfg
+}
+
+func newFormCredentialTestService(t *testing.T, repo *config.Repository, store credential.Store) *credential.Service {
+	t.Helper()
+	registry := credential.NewRegistry()
+	if err := registry.Register("mem", store); err != nil {
+		t.Fatalf("register credential store: %v", err)
+	}
+	journal, err := credential.NewJournalStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("create journal store: %v", err)
+	}
+	service, err := credential.NewService(registry, journal, repo.AsConfigUpdater(), nil)
+	if err != nil {
+		t.Fatalf("create credential service: %v", err)
+	}
+	return service
+}
+
+func newPasswordReplaceFormModel(repo *config.Repository, service *credential.Service, password string) *Model {
+	snapshot, _ := repo.ResolveConnection(formCredentialTestNodeID)
+	return &Model{repository: repo, credentialService: service, formState: &nodeFormState{
+		isEdit: true, originalID: formCredentialTestNodeID, user: "user", address: "192.168.1.50", port: "22",
+		authType: "password", password: password, passwordAction: "replace", existingPlainPassword: snapshot.Identity.Password,
+		existingPasswordRef: snapshot.Identity.LoginPasswordRef.Clone(), sudoMode: "auto",
+	}}
 }

@@ -133,10 +133,12 @@ func (o *PlayOptions) RunContext(ctx context.Context) (retErr error) {
 	}
 
 	adpOpts := []adapter.Option{adapter.WithNonInteractive(true)}
-	if reg, regErr := utils.GetCredentialRegistry(cfg); regErr == nil && reg != nil {
+	if reg, regErr := utils.GetCredentialRegistry(cfg); regErr != nil {
+		return fmt.Errorf("initialize credential resolver: %w", regErr)
+	} else if reg != nil {
 		adpOpts = append(adpOpts, adapter.WithCredentialSource(reg))
 	}
-	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
+	connector := newNonInteractiveConnector(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
 	defer func() {
 		joinConnectorCloseError(&retErr, connector)
 	}()

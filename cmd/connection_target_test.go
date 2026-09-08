@@ -5,8 +5,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/models"
+	"github.com/wentf9/xops-cli/pkg/ssh"
 )
 
 type memoryStore struct {
@@ -333,8 +336,99 @@ func TestCommands_Exec_SudoAndSuPwd(t *testing.T) {
 	if node.SudoMode != models.SudoModeSudo {
 		t.Errorf("expected SudoMode=%q, got %q", models.SudoModeSudo, node.SudoMode)
 	}
-	if node.SuPwd != "mySuperSecretPassword" {
-		t.Errorf("expected SuPwd='mySuperSecretPassword', got %q", node.SuPwd)
+	if node.SuPwd != "" {
+		t.Errorf("expected discovered sudo password to remain session-only, got %q", node.SuPwd)
+	}
+}
+
+func TestCommands_ExistingNodeCredentialsStayOutOfConfiguration(t *testing.T) {
+	repo := setupTestRepository(t)
+	sshOpt := NewSshOptions()
+	sshOpt.Remember = "always"
+	sshOpt.Password = "new-synthetic-password"
+	sshOpt.Target = config.ConnectionTarget{Selector: "10.238.221.181", User: "iaas", HasUser: true}
+
+	nodeID, _, err := sshOpt.resolveNode(t.Context(), repo)
+	if err != nil {
+		t.Fatalf("resolveNode failed: %v", err)
+	}
+	snapshot, err := repo.ResolveConnection(nodeID)
+	if err != nil {
+		t.Fatalf("resolve connection failed: %v", err)
+	}
+	if snapshot.Identity.Password == sshOpt.Password {
+		t.Fatal("SSH option password was persisted in configuration")
+	}
+
+	execOpt := NewExecOptions()
+	execOpt.Remember = "always"
+	execOpt.SuPwd = "new-synthetic-sudo-password"
+	if _, err := execOpt.updateNodeFromHostInfo(t.Context(), nodeID, repo, utils.HostInfo{Host: "10.238.221.181"}); err != nil {
+		t.Fatalf("updateNodeFromHostInfo failed: %v", err)
+	}
+	snapshot, err = repo.ResolveConnection(nodeID)
+	if err != nil {
+		t.Fatalf("resolve connection after exec update failed: %v", err)
+	}
+	if snapshot.Node.SuPwd == execOpt.SuPwd {
+		t.Fatal("exec sudo password was persisted in configuration")
+	}
+}
+
+func TestCommands_ExecUsesPerHostSessionPassword(t *testing.T) {
+	repo := setupTestRepository(t)
+	execOpt := NewExecOptions()
+	execOpt.Remember = "never"
+	tasks := []execHostTask{{
+		nodeID: "iaas@10.238.221.181:22",
+		host:   "10.238.221.181",
+		pass:   "per-host-password",
+	}}
+	opts, err := execOpt.buildAdapterOptions(tasks, repo.Snapshot(), repo)
+	if err != nil {
+		t.Fatalf("build adapter options: %v", err)
+	}
+	secret, err := adapter.NewSSHAdapter(repo, opts...).ResolveSecret(t.Context(), ssh.SecretRequest{
+		NodeID: tasks[0].nodeID,
+		Kind:   ssh.SecretKindLoginPassword,
+	})
+	if err != nil {
+		t.Fatalf("resolve session secret: %v", err)
+	}
+	if string(secret) != tasks[0].pass {
+		t.Fatalf("resolved password = %q, want per-host session password", secret)
+	}
+}
+
+func TestCommands_ExecTagUsesExplicitSessionCredentials(t *testing.T) {
+	repo := setupTestRepository(t)
+	execOpt := NewExecOptions()
+	execOpt.Tag = "production"
+	execOpt.Password = "tag-password"
+	execOpt.Passphrase = "tag-passphrase"
+	execOpt.Remember = "never"
+	tasks, err := execOpt.buildTasksFromTags(repo)
+	if err != nil {
+		t.Fatalf("build tag tasks: %v", err)
+	}
+	opts, err := execOpt.buildAdapterOptions(tasks, repo.Snapshot(), repo)
+	if err != nil {
+		t.Fatalf("build adapter options: %v", err)
+	}
+	adapter := adapter.NewSSHAdapter(repo, opts...)
+	password, err := adapter.ResolveSecret(t.Context(), ssh.SecretRequest{NodeID: tasks[0].nodeID, Kind: ssh.SecretKindLoginPassword})
+	if err != nil {
+		t.Fatalf("resolve tag password: %v", err)
+	}
+	if string(password) != execOpt.Password {
+		t.Fatalf("tag password = %q, want explicit password", password)
+	}
+	passphrase, err := adapter.ResolveSecret(t.Context(), ssh.SecretRequest{NodeID: tasks[0].nodeID, Kind: ssh.SecretKindPrivateKeyPassphrase})
+	if err != nil {
+		t.Fatalf("resolve tag passphrase: %v", err)
+	}
+	if string(passphrase) != execOpt.Passphrase {
+		t.Fatalf("tag passphrase = %q, want explicit passphrase", passphrase)
 	}
 }
 

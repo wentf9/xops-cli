@@ -48,6 +48,12 @@ func newCLIConnectorWithAdapterOptions(provider config.ConfigProvider, adpOpts [
 	return adapter.NewConnectorWithAdapterOptions(provider, adpOpts, opts...)
 }
 
+// newNonInteractiveConnector 创建不安装任何交互提示器的非交互式连接器，
+// 适用于 Playbook、MCP 等批处理场景，确保缺少凭据时立即 fail-closed 而非等待终端输入。
+func newNonInteractiveConnector(provider config.ConfigProvider, adpOpts []adapter.Option, opts ...ssh.Option) *ssh.Connector {
+	return adapter.NewConnectorWithAdapterOptions(provider, adpOpts, opts...)
+}
+
 func (h *cliInteractionHandler) acquireGate(ctx context.Context) (func(), error) {
 	if h == nil || h.promptGate == nil {
 		return nil, fmt.Errorf("cli prompt gate is not initialized")

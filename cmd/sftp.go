@@ -123,7 +123,10 @@ func (o *SftpOptions) RunContext(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	adpOpts := o.buildAdapterOptions(nodeID, cfg)
+	adpOpts, optErr := o.buildAdapterOptions(nodeID, cfg, provider)
+	if optErr != nil {
+		return optErr
+	}
 	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
 	defer func() {
 		joinConnectorCloseError(&err, connector)

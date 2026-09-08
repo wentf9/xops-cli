@@ -454,17 +454,19 @@ func (m *Model) saveFormCmd() tea.Cmd {
 			ref = view.NodeRefs[s.originalID]
 		}
 		run = func(ctx context.Context) error {
-			if err := repository.ReplaceNodeAtRefContext(ctx, ref, nodeID, node, host, identity); err != nil {
+			authVersion, err := repository.ReplaceNodeAtRefWithAuthVersionContext(ctx, ref, nodeID, node, host, identity)
+			if err != nil {
 				return err
 			}
-			return m.syncCredentialsToStore(ctx, identityID, s, pwdAction, passAction)
+			return m.syncCredentialsToStore(ctx, nodeID, authVersion, s, pwdAction, passAction)
 		}
 	} else {
 		run = func(ctx context.Context) error {
-			if _, err := repository.CreateNodeContext(ctx, nodeID, node, host, identity); err != nil {
+			mutation, err := repository.CreateNodeContext(ctx, nodeID, node, host, identity)
+			if err != nil {
 				return err
 			}
-			return m.syncCredentialsToStore(ctx, identityID, s, pwdAction, passAction)
+			return m.syncCredentialsToStore(ctx, nodeID, mutation.AuthVersion, s, pwdAction, passAction)
 		}
 	}
 	return m.beginConfigurationMutation(configurationMutationForm, nodeID, 0, run)
@@ -502,11 +504,14 @@ func (s *nodeFormState) applyIdentityCredentials(identity *models.Identity, absK
 			identity.Password = s.existingPlainPassword
 			identity.LoginPasswordRef = s.existingPasswordRef
 		case "delete":
-			identity.Password = ""
-			identity.LoginPasswordRef = nil
+			identity.Password = s.existingPlainPassword
+			identity.LoginPasswordRef = s.existingPasswordRef.Clone()
 		case "replace":
-			identity.Password = s.password
-			identity.LoginPasswordRef = nil
+			// The secret is committed by credential.Service after this metadata
+			// update. Keep the previous ref until that transaction succeeds, so a
+			// store failure leaves a usable, secret-free configuration.
+			identity.Password = s.existingPlainPassword
+			identity.LoginPasswordRef = s.existingPasswordRef.Clone()
 		}
 	} else {
 		identity.KeyPath = absKeyPath
@@ -518,59 +523,51 @@ func (s *nodeFormState) applyIdentityCredentials(identity *models.Identity, absK
 			identity.Passphrase = s.existingPlainPassphrase
 			identity.PassphraseRef = s.existingPassphraseRef
 		case "delete":
-			identity.Passphrase = ""
-			identity.PassphraseRef = nil
+			identity.Passphrase = s.existingPlainPassphrase
+			identity.PassphraseRef = s.existingPassphraseRef.Clone()
 		case "replace":
-			identity.Passphrase = s.passphrase
-			identity.PassphraseRef = nil
+			identity.Passphrase = s.existingPlainPassphrase
+			identity.PassphraseRef = s.existingPassphraseRef.Clone()
 		}
 	}
 	return pwdAction, passAction
 }
 
-func (m *Model) syncCredentialsToStore(ctx context.Context, identityID string, s *nodeFormState, pwdAction, passAction string) error {
+func (m *Model) syncCredentialsToStore(ctx context.Context, nodeID, authVersion string, s *nodeFormState, pwdAction, passAction string) error {
 	if m.credentialService == nil {
+		if m.repository.Snapshot().Credential != nil && ((s.authType == "password" && (pwdAction == "replace" || pwdAction == "delete")) ||
+			(s.authType == "key" && (passAction == "replace" || passAction == "delete"))) {
+			return errors.New("credential service is unavailable")
+		}
 		return nil
 	}
 	credSvc := m.credentialService
 	cfg := m.repository.Snapshot()
-	targetStore := ""
+	targetStore := "system"
 	if cfg != nil && cfg.Credential != nil {
 		targetStore = cfg.Credential.DefaultStore
 	}
 
-	switch s.authType {
-	case "password":
-		target := credential.Target{
-			IdentityID: identityID,
-			Kind:       credential.KindLoginPassword,
+	if s.authType == "password" {
+		return syncFormCredential(ctx, credSvc, nodeID, credential.KindLoginPassword, authVersion, pwdAction, s.existingPasswordRef, targetStore, s.password)
+	}
+	if s.authType == "key" {
+		return syncFormCredential(ctx, credSvc, nodeID, credential.KindPassphrase, authVersion, passAction, s.existingPassphraseRef, targetStore, s.passphrase)
+	}
+	return nil
+}
+
+func syncFormCredential(ctx context.Context, service *credential.Service, nodeID string, kind credential.Kind, version, action string, oldRef *credential.Ref, storeID, value string) error {
+	target := credential.Target{NodeID: nodeID, Kind: kind}
+	if action == "replace" && value != "" {
+		if _, _, err := service.Rotate(ctx, target, version, oldRef, storeID, credential.Secret{Value: []byte(value)}); err != nil {
+			return fmt.Errorf("save %s to credential store: %w", kind, err)
 		}
-		if pwdAction == "replace" && s.password != "" {
-			_, _, err := credSvc.Rotate(ctx, target, "", s.existingPasswordRef, targetStore, credential.Secret{Value: []byte(s.password)})
-			if err != nil {
-				return fmt.Errorf("save password to credential store: %w", err)
-			}
-		} else if pwdAction == "delete" && s.existingPasswordRef != nil {
-			_, err := credSvc.Delete(ctx, target, "", *s.existingPasswordRef)
-			if err != nil {
-				return fmt.Errorf("delete password from credential store: %w", err)
-			}
-		}
-	case "key":
-		targetPass := credential.Target{
-			IdentityID: identityID,
-			Kind:       credential.KindPassphrase,
-		}
-		if passAction == "replace" && s.passphrase != "" {
-			_, _, err := credSvc.Rotate(ctx, targetPass, "", s.existingPassphraseRef, targetStore, credential.Secret{Value: []byte(s.passphrase)})
-			if err != nil {
-				return fmt.Errorf("save passphrase to credential store: %w", err)
-			}
-		} else if passAction == "delete" && s.existingPassphraseRef != nil {
-			_, err := credSvc.Delete(ctx, targetPass, "", *s.existingPassphraseRef)
-			if err != nil {
-				return fmt.Errorf("delete passphrase from credential store: %w", err)
-			}
+		return nil
+	}
+	if action == "delete" && oldRef != nil {
+		if _, err := service.Delete(ctx, target, version, *oldRef); err != nil {
+			return fmt.Errorf("delete %s from credential store: %w", kind, err)
 		}
 	}
 	return nil

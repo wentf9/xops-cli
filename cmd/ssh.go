@@ -254,7 +254,10 @@ func (o *SshOptions) runParentDaemon(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	adpOpts := o.buildAdapterOptions(nodeID, cfg)
+	adpOpts, optErr := o.buildAdapterOptions(nodeID, cfg, provider)
+	if optErr != nil {
+		return optErr
+	}
 	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
 	defer func() {
 		joinConnectorCloseError(&err, connector)
@@ -321,20 +324,29 @@ func (o *SshOptions) runParentDaemon(ctx context.Context) (err error) {
 	return nil
 }
 
-func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuration) []adapter.Option {
+func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuration, repository *config.Repository) ([]adapter.Option, error) {
 	var adpOpts []adapter.Option
 	shouldRemember := utils.ShouldRememberCredential(o.Remember, o.Target.Selector)
-	if o.Password != "" || o.Passphrase != "" {
-		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, adapter.SessionAuth{
-			Password:   o.Password,
-			Passphrase: o.Passphrase,
-			Remember:   shouldRemember,
-		}))
-	}
-	if reg, regErr := utils.GetCredentialRegistry(cfg); regErr == nil && reg != nil {
+	// 总是注入 SessionAuthOverride（即使密码为空），以便 UpdateAuth / UpdateSudo
+	// 能根据 Remember 策略决定是否将交互提示获得的密码回写配置，而不是绕过策略检查。
+	adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, adapter.SessionAuth{
+		Password:   o.Password,
+		Passphrase: o.Passphrase,
+		Remember:   shouldRemember,
+	}))
+	if reg, regErr := utils.GetCredentialRegistry(cfg); regErr != nil {
+		return nil, fmt.Errorf("initialize credential resolver: %w", regErr)
+	} else if reg != nil {
 		adpOpts = append(adpOpts, adapter.WithCredentialSource(reg))
 	}
-	return adpOpts
+	if shouldRemember {
+		service, err := utils.GetCredentialService(repository, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("initialize credential persistence: %w", err)
+		}
+		adpOpts = append(adpOpts, adapter.WithCredentialService(service))
+	}
+	return adpOpts, nil
 }
 
 func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error) {
@@ -357,7 +369,10 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 	if err != nil {
 		return err
 	}
-	adpOpts := o.buildAdapterOptions(nodeID, cfg)
+	adpOpts, optErr := o.buildAdapterOptions(nodeID, cfg, provider)
+	if optErr != nil {
+		return optErr
+	}
 	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
 	defer func() {
 		joinConnectorCloseError(&err, connector)
@@ -472,19 +487,13 @@ func (o *SshOptions) resolveNode(ctx context.Context, provider *config.Repositor
 	}
 
 	shouldRemember := utils.ShouldRememberCredential(o.Remember, o.Target.Selector)
-	passwordToSave := ""
-	passphraseToSave := ""
-	if shouldRemember {
-		passwordToSave = o.Password
-		passphraseToSave = o.Passphrase
-	}
 
 	res, err := provider.EnsureNodeContext(ctx, config.EnsureNodeOptions{
 		Target:       o.Target,
 		DefaultUser:  defaultUser,
-		Password:     passwordToSave,
+		Password:     "",
 		IdentityFile: o.IdentityFile,
-		Passphrase:   passphraseToSave,
+		Passphrase:   "",
 		Alias:        o.Alias,
 		Tags:         o.Tags,
 	})
@@ -648,16 +657,13 @@ func updateNodeFields(node *models.Node, nodeID string, o *SshOptions, provider 
 func updateIdentityFields(identity *models.Identity, o *SshOptions) bool {
 	identityUpdated := false
 	if o.Password != "" {
-		identity.Password = o.Password
-		identity.AuthType = "password"
-		identityUpdated = true
+		if identity.AuthType != "password" {
+			identity.AuthType = "password"
+			identityUpdated = true
+		}
 	} else if o.IdentityFile != "" {
 		identity.KeyPath = utils.ToAbsolutePath(o.IdentityFile)
 		identity.AuthType = "key"
-		identityUpdated = true
-	}
-	if o.Passphrase != "" {
-		identity.Passphrase = o.Passphrase
 		identityUpdated = true
 	}
 	return identityUpdated

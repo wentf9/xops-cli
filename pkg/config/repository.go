@@ -71,8 +71,9 @@ type MutationOutcome struct {
 // NodeMutation is returned by node creation even when persistence reports a
 // durability failure. Ref must be used for later conditional cleanup.
 type NodeMutation struct {
-	Ref     NodeRef
-	Outcome MutationOutcome
+	Ref         NodeRef
+	AuthVersion string
+	Outcome     MutationOutcome
 }
 
 // ImportIssue records one OpenSSH host that could not be imported without
@@ -633,6 +634,11 @@ func (r *Repository) CreateNodeContext(ctx context.Context, nodeID string, node 
 		return mutation, errors.Join(err, fmt.Errorf("resolve applied node %q version: %w", nodeID, versionErr))
 	}
 	mutation.Ref = NodeRef{ID: nodeID, Version: version}
+	authVersion, authVersionErr := nodeAuthVersion(result.Snapshot.Configuration, nodeID)
+	if authVersionErr != nil {
+		return mutation, errors.Join(err, fmt.Errorf("resolve applied node %q authentication version: %w", nodeID, authVersionErr))
+	}
+	mutation.AuthVersion = string(authVersion[:])
 	return mutation, err
 }
 
@@ -677,17 +683,23 @@ func privateIdentityReference(cfg *Configuration, nodeID string) string {
 // ReplaceNodeAtRefContext replaces a node bundle only if the original bundle
 // still equals the one the caller displayed.
 func (r *Repository) ReplaceNodeAtRefContext(ctx context.Context, ref NodeRef, nodeID string, node models.Node, host models.Host, identity models.Identity) error {
-	return r.replaceNodeContext(ctx, ref, nodeID, node, host, identity)
+	_, err := r.ReplaceNodeAtRefWithAuthVersionContext(ctx, ref, nodeID, node, host, identity)
+	return err
 }
 
-func (r *Repository) replaceNodeContext(ctx context.Context, ref NodeRef, nodeID string, node models.Node, host models.Host, identity models.Identity) error {
+// ReplaceNodeAtRefWithAuthVersionContext replaces a node bundle and returns
+// the authentication version produced by that same committed mutation.
+//
+//nolint:gocyclo // replacement preserves host and identity copy-on-write invariants in one CAS transaction
+func (r *Repository) ReplaceNodeAtRefWithAuthVersionContext(ctx context.Context, ref NodeRef, nodeID string, node models.Node, host models.Host, identity models.Identity) (string, error) {
 	if nodeID == "" {
-		return fmt.Errorf("node ID is empty")
+		return "", fmt.Errorf("node ID is empty")
 	}
 	if ref.ID == "" {
-		return fmt.Errorf("replace node %q without a versioned reference: %w", nodeID, ErrConfigConflict)
+		return "", fmt.Errorf("replace node %q without a versioned reference: %w", nodeID, ErrConfigConflict)
 	}
-	return r.commitContext(ctx, anyRevision, func(cfg *Configuration) error {
+	var authVersion string
+	err := r.commitContext(ctx, anyRevision, func(cfg *Configuration) error {
 		oldNodeID := ref.ID
 		var oldNode models.Node
 		if oldNodeID != "" {
@@ -735,8 +747,14 @@ func (r *Repository) replaceNodeContext(ctx context.Context, ref NodeRef, nodeID
 		} else if oldNodeID != "" {
 			removeUnusedRefs(cfg, oldNode.HostRef, oldNode.IdentityRef)
 		}
+		version, versionErr := nodeAuthVersion(cfg, nodeID)
+		if versionErr != nil {
+			return versionErr
+		}
+		authVersion = string(version[:])
 		return nil
 	})
+	return authVersion, err
 }
 
 // DeleteNodeAtRefContext removes one node only if its complete bundle still

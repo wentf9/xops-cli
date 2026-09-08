@@ -36,10 +36,23 @@ func ValidateRememberPolicy(policy string) error {
 
 // GetCredentialRegistry 根据配置构建只读凭据注册表（若未配置返回 nil）
 func GetCredentialRegistry(cfg *config.Configuration) (*credential.Registry, error) {
-	if cfg == nil || cfg.Credential == nil {
-		return nil, nil
+	if cfg == nil {
+		return nil, fmt.Errorf("configuration is nil")
 	}
-	return config.BuildRegistryFromConfig(cfg.Credential)
+	return config.BuildRegistryFromConfig(credentialConfigOrDefault(cfg))
+}
+
+func credentialConfigOrDefault(cfg *config.Configuration) *config.CredentialConfig {
+	if cfg.Credential != nil {
+		return cfg.Credential
+	}
+	return &config.CredentialConfig{
+		DefaultStore:     "system",
+		RememberPrompted: RememberPolicyAsk,
+		Stores: map[string]config.StoreConfig{
+			"system": {Type: config.StoreTypeSystem, Timeout: 5 * time.Second},
+		},
+	}
 }
 
 // GetCredentialService 根据配置和存储仓库实例化凭据服务
@@ -51,19 +64,7 @@ func GetCredentialService(repo *config.Repository, cfg *config.Configuration) (*
 		return nil, fmt.Errorf("configuration is nil")
 	}
 
-	credCfg := cfg.Credential
-	if credCfg == nil {
-		credCfg = &config.CredentialConfig{
-			DefaultStore:     "system",
-			RememberPrompted: RememberPolicyAsk,
-			Stores: map[string]config.StoreConfig{
-				"system": {
-					Type:    config.StoreTypeSystem,
-					Timeout: 5 * time.Second,
-				},
-			},
-		}
-	}
+	credCfg := credentialConfigOrDefault(cfg)
 
 	registry, err := config.BuildRegistryFromConfig(credCfg)
 	if err != nil {

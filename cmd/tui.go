@@ -39,8 +39,14 @@ func NewCmdTui() *cobra.Command {
 				return fmt.Errorf("create configuration repository: %w", err)
 			}
 
-			credSvc, _ := utils.GetCredentialService(repository, cfg)
-			credReg, _ := utils.GetCredentialRegistry(cfg)
+			credSvc, credErr := utils.GetCredentialService(repository, cfg)
+			if credErr != nil {
+				return fmt.Errorf("initialize credential persistence: %w", credErr)
+			}
+			credReg, regErr := utils.GetCredentialRegistry(cfg)
+			if regErr != nil {
+				return fmt.Errorf("initialize credential resolver: %w", regErr)
+			}
 
 			model, err := tui.NewModel(
 				repository,
