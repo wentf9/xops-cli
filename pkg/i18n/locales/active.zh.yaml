@@ -642,10 +642,20 @@ tui_form_auth_type:
   other: "认证方式"
 tui_form_password:
   other: "密码"
+tui_form_password_action:
+  other: "密码操作"
 tui_form_key_path:
   other: "私钥路径"
 tui_form_key_pass:
   other: "私钥密码"
+tui_form_passphrase_action:
+  other: "私钥密码操作"
+tui_action_keep:
+  other: "保留现有"
+tui_action_replace:
+  other: "修改替换"
+tui_action_delete:
+  other: "删除"
 tui_form_sudo_mode:
   other: "提权模式"
 tui_form_tags:

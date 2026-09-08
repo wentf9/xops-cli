@@ -39,11 +39,16 @@ func NewCmdTui() *cobra.Command {
 				return fmt.Errorf("create configuration repository: %w", err)
 			}
 
+			credSvc, _ := utils.GetCredentialService(repository, cfg)
+			credReg, _ := utils.GetCredentialRegistry(cfg)
+
 			model, err := tui.NewModel(
 				repository,
 				tui.WithContext(ctx),
 				tui.WithLogger(logger.DefaultLogger()),
 				tui.WithInteractionHandler(newCLIInteractionHandler()),
+				tui.WithCredentialService(credSvc),
+				tui.WithCredentialRegistry(credReg),
 			)
 			if err != nil {
 				return fmt.Errorf("create TUI model: %w", err)

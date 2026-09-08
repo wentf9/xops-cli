@@ -641,10 +641,20 @@ tui_form_auth_type:
   other: "Auth Type"
 tui_form_password:
   other: "Password"
+tui_form_password_action:
+  other: "Password Action"
 tui_form_key_path:
-  other: "Key File Path"
+  other: "Private Key Path"
 tui_form_key_pass:
   other: "Key Passphrase"
+tui_form_passphrase_action:
+  other: "Passphrase Action"
+tui_action_keep:
+  other: "Keep"
+tui_action_replace:
+  other: "Replace"
+tui_action_delete:
+  other: "Delete"
 tui_form_sudo_mode:
   other: "Sudo Mode"
 tui_form_tags:

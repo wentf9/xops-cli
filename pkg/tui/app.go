@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/huh"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
+	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
 	"github.com/wentf9/xops-cli/pkg/ssh"
@@ -29,31 +30,32 @@ const (
 )
 
 type Model struct {
-	ctx              context.Context
-	repository       *config.Repository
-	connector        *ssh.Connector
-	list             list.Model
-	form             *huh.Form
-	formState        *nodeFormState
-	tagForm          *huh.Form
-	monitor          monitorModel
-	logSelect        logSelectModel
-	logStreamer      logStreamerModel
-	logSessionID     int64
-	tagMode          string // "add" or "remove"
-	selectedTags     []string
-	newTagsInput     string // 新标签输入
-	listRevision     uint64
-	tagRevision      uint64
-	state            viewState
-	status           string
-	lastSize         tea.WindowSizeMsg
-	deletePending    bool
-	mutationPending  bool
-	mutation         *configurationMutation
-	lifecycleCancel  context.CancelFunc
-	statusGeneration uint64
-	formConflict     bool
+	ctx               context.Context
+	repository        *config.Repository
+	connector         *ssh.Connector
+	list              list.Model
+	form              *huh.Form
+	formState         *nodeFormState
+	tagForm           *huh.Form
+	monitor           monitorModel
+	logSelect         logSelectModel
+	logStreamer       logStreamerModel
+	logSessionID      int64
+	tagMode           string // "add" or "remove"
+	selectedTags      []string
+	newTagsInput      string // 新标签输入
+	listRevision      uint64
+	tagRevision       uint64
+	state             viewState
+	status            string
+	lastSize          tea.WindowSizeMsg
+	deletePending     bool
+	mutationPending   bool
+	mutation          *configurationMutation
+	lifecycleCancel   context.CancelFunc
+	statusGeneration  uint64
+	formConflict      bool
+	credentialService *credential.Service
 }
 
 const configMutationTimeout = 10 * time.Second
@@ -146,9 +148,11 @@ func (m *configurationMutation) close() error {
 type ModelOption func(*modelConfig)
 
 type modelConfig struct {
-	logger      logger.DebugLogger
-	ctx         context.Context
-	interaction ssh.InteractionHandler
+	logger             logger.DebugLogger
+	ctx                context.Context
+	interaction        ssh.InteractionHandler
+	credentialService  *credential.Service
+	credentialRegistry *credential.Registry
 }
 
 // WithInteractionHandler injects presentation-owned SSH prompts into the TUI.
@@ -176,6 +180,20 @@ func WithContext(ctx context.Context) ModelOption {
 	}
 }
 
+// WithCredentialService injects the credential service used for secure secret management.
+func WithCredentialService(svc *credential.Service) ModelOption {
+	return func(cfg *modelConfig) {
+		cfg.credentialService = svc
+	}
+}
+
+// WithCredentialRegistry injects the credential registry used to resolve stored secrets for SSH.
+func WithCredentialRegistry(reg *credential.Registry) ModelOption {
+	return func(cfg *modelConfig) {
+		cfg.credentialRegistry = reg
+	}
+}
+
 // NewModel initializes the TUI model. Package components use a no-op logger
 // unless the CLI composition root explicitly supplies one with WithLogger.
 func NewModel(repository *config.Repository, opts ...ModelOption) (Model, error) {
@@ -195,16 +213,21 @@ func NewModel(repository *config.Repository, opts ...ModelOption) (Model, error)
 	if cfg.interaction != nil {
 		connOpts = append(connOpts, ssh.WithInteractionHandler(cfg.interaction))
 	}
-	connector := adapter.NewConnector(repository, connOpts...)
+	var adpOpts []adapter.Option
+	if cfg.credentialRegistry != nil {
+		adpOpts = append(adpOpts, adapter.WithCredentialSource(cfg.credentialRegistry))
+	}
+	connector := adapter.NewConnectorWithAdapterOptions(repository, adpOpts, connOpts...)
 	view := repository.View()
 	lifecycleCtx, lifecycleCancel := context.WithCancel(cfg.ctx)
 	m := Model{
-		ctx:             lifecycleCtx,
-		lifecycleCancel: lifecycleCancel,
-		repository:      repository,
-		connector:       connector,
-		state:           viewList,
-		listRevision:    view.Revision,
+		ctx:               lifecycleCtx,
+		lifecycleCancel:   lifecycleCancel,
+		repository:        repository,
+		credentialService: cfg.credentialService,
+		connector:         connector,
+		state:             viewList,
+		listRevision:      view.Revision,
 	}
 	m.list = newListModelFromView(view)
 	return m, nil
