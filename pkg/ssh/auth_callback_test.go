@@ -53,6 +53,7 @@ func writeAuthTestPrivateKey(t *testing.T, path string) ssh.Signer {
 	return signer
 }
 
+//nolint:gocyclo // Test-only SSH handshake harness intentionally centralizes transport setup, teardown, and error propagation.
 func runAuthCallbackHandshake(t *testing.T, authCallback ssh.ClientAuthCallback, acceptedKey ssh.PublicKey, acceptedPassword string) (retErr error) {
 	t.Helper()
 

@@ -485,7 +485,7 @@ func TestCommands_SSHSessionOnlyUsesSelectedKey(t *testing.T) {
 	repo := setupTestRepository(t)
 	o := NewSshOptions()
 	o.Remember = "never"
-	o.IdentityFile = "/tmp/session-only-key"
+	o.IdentityFile = t.TempDir()
 	o.Target = config.ConnectionTarget{Selector: "10.238.221.181", User: "iaas", HasUser: true}
 	nodeID, _, err := o.resolveNode(t.Context(), repo)
 	if err != nil {
@@ -543,7 +543,7 @@ func TestCommands_ExecUsesSelectedSessionKey(t *testing.T) {
 	repo := setupTestRepository(t)
 	o := NewExecOptions()
 	o.Host = "iaas@10.238.221.181"
-	o.IdentityFile = "/tmp/selected-session-key"
+	o.IdentityFile = t.TempDir()
 	o.Remember = utils.RememberPolicyNever
 	tasks, hostErrs, err := o.buildTasksFromHosts(t.Context(), repo)
 	if err != nil || len(hostErrs) != 0 {
