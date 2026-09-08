@@ -21,4 +21,3 @@ func unlockFile(file *os.File) error {
 func isLockContended(err error) bool {
 	return errors.Is(err, windows.ERROR_LOCK_VIOLATION) || errors.Is(err, windows.ERROR_SHARING_VIOLATION)
 }
-

@@ -982,6 +982,7 @@ func (c *Connector) resolveAgentAuth(ctx context.Context) (ssh.AuthMethod, func(
 // buildSSHConfig 根据 Identity 模型构建 ssh.ClientConfig
 func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coordinator *handshakeCoordinator, onAuthDiscovered func()) (*ssh.ClientConfig, func(), error) {
 	var cleanup func()
+	var authCallback ssh.ClientAuthCallback
 	authMethods := []ssh.AuthMethod{}
 
 	prompter := c.secretPrompter
@@ -999,8 +1000,7 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 		if coordinator != nil {
 			failClosed = coordinator.FailClosed
 		}
-		var autoCleanup func()
-		authMethods, autoCleanup = BuildAutoAuthMethodsWithOptions(ctx, AutoAuthOptions{
+		plan := buildAutoAuthPlan(ctx, AutoAuthOptions{
 			LifecycleCtx:       c.lifecycleCtx,
 			NodeID:             cfg.NodeID,
 			User:               cfg.User,
@@ -1015,9 +1015,9 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 			KeyPath:            cfg.KeyPath,
 			PasswordCallback: func(s string) {
 				if s != "" {
-					// Authentication methods are tried in order. If a key was
-					// attempted first but failed, only the password that follows it
-					// may be persisted after a successful handshake.
+					// Auto candidates are tried in order. If key authentication
+					// failed, only the password actually requested afterwards may
+					// be persisted after a successful handshake.
 					cfg.Passphrase = ""
 					cfg.Password = s
 					cfg.AuthType = "password"
@@ -1028,7 +1028,7 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 			},
 			PassphraseCallback: func(keyPath, passphrase string) {
 				if passphrase != "" {
-					// This key attempt precedes password fallback. Clear an
+					// This key candidate precedes password fallback. Clear an
 					// untried session password so a successful key login cannot
 					// persist credentials that were never authenticated.
 					cfg.Password = ""
@@ -1042,7 +1042,8 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 			},
 			Logger: c.getLogger(),
 		})
-		cleanup = autoCleanup
+		authCallback = plan.authCallback
+		cleanup = plan.cleanup
 
 	case "password":
 		method, err := c.resolvePasswordAuth(cfg)
@@ -1086,6 +1087,7 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 	return &ssh.ClientConfig{
 		User:            cfg.User,
 		Auth:            authMethods,
+		AuthCallback:    authCallback,
 		HostKeyCallback: hostKeyCallback,
 		Timeout:         clientTimeout,
 	}, cleanup, nil

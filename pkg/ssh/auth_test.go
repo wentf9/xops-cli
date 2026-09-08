@@ -197,16 +197,15 @@ func TestParseOpenSSHPublicKeyFromEncryptedPrivate(t *testing.T) {
 	}
 }
 
-func TestBuildAutoAuthMethods_LazySigner_OpenSSH(t *testing.T) {
-	// 创建一个临时目录来存放 SSH 密钥
+func TestBuildAutoAuthPlan_LazySigner_OpenSSH(t *testing.T) {
 	tempDir := setTestHome(t)
+	t.Setenv("SSH_AUTH_SOCK", "")
 
 	sshDir := filepath.Join(tempDir, ".ssh")
 	if err := os.MkdirAll(sshDir, 0700); err != nil {
 		t.Fatalf("failed to create .ssh dir: %v", err)
 	}
 
-	// 生成公钥
 	_, sshPub := generateTestEncryptedKey(t, "secret123")
 	headerData := marshalOpenSSHPrivateKeyHeaderForTest(sshPub)
 	block := &pem.Block{
@@ -215,51 +214,40 @@ func TestBuildAutoAuthMethods_LazySigner_OpenSSH(t *testing.T) {
 	}
 	pemData := pem.EncodeToMemory(block)
 
-	// 写入临时私钥文件 id_rsa (不生成 .pub 文件，测试免密提取公钥)
 	keyPath := filepath.Join(sshDir, "id_rsa")
 	if err := os.WriteFile(keyPath, pemData, 0600); err != nil {
 		t.Fatalf("failed to write private key: %v", err)
 	}
 
 	ui := &mockUIForTest{passphrase: "secret123"}
-	passwordCalled := false
-	passphraseCalled := false
+	plan := buildAutoAuthPlan(t.Context(), AutoAuthOptions{
+		LifecycleCtx: t.Context(),
+		User:         "testuser",
+		Host:         "127.0.0.1",
+		Prompter:     ui,
+	})
+	if plan.cleanup != nil {
+		t.Cleanup(plan.cleanup)
+	}
 
-	methods, cleanup := BuildAutoAuthMethods(
-		t.Context(),
-		"testuser",
-		"127.0.0.1",
-		ui,
-		func(pass string) { passwordCalled = true },
-		func(path, pass string) { passphraseCalled = true },
-	)
-	defer func() {
-		if cleanup != nil {
-			cleanup()
-		}
-	}()
-
-	// 验证不需要密码交互，就已经自动生成了 .pub 文件
 	pubKeyPath := keyPath + ".pub"
 	if _, err := os.Stat(pubKeyPath); err != nil {
 		t.Errorf("expected public key file to be auto-extracted and saved: %v", err)
 	}
-
 	if ui.called {
-		t.Error("PromptPassword was unexpectedly called during BuildAutoAuthMethods")
+		t.Error("PromptSecret was unexpectedly called during buildAutoAuthPlan")
 	}
-
-	if len(methods) < 2 {
-		t.Fatalf("expected at least 2 methods, got %d", len(methods))
+	if len(plan.candidates) != 2 {
+		t.Fatalf("expected default key and password candidates, got %d", len(plan.candidates))
 	}
-
-	_ = passwordCalled
-	_ = passphraseCalled
+	if plan.candidates[0].protocol != autoAuthProtocolPublicKey {
+		t.Fatalf("first candidate protocol = %q, want %q", plan.candidates[0].protocol, autoAuthProtocolPublicKey)
+	}
 }
 
-func TestBuildAutoAuthMethods_LazySigner_PEMFallback(t *testing.T) {
-	// 创建一个临时目录来存放 SSH 密钥
+func TestBuildAutoAuthPlan_LazySigner_PEMFallback(t *testing.T) {
 	tempDir := setTestHome(t)
+	t.Setenv("SSH_AUTH_SOCK", "")
 
 	sshDir := filepath.Join(tempDir, ".ssh")
 	if err := os.MkdirAll(sshDir, 0700); err != nil {
@@ -268,52 +256,33 @@ func TestBuildAutoAuthMethods_LazySigner_PEMFallback(t *testing.T) {
 
 	passphrase := "secret123"
 	pemData, _ := generateTestEncryptedKey(t, passphrase)
-
-	// 写入 PEM 加密私钥到 id_rsa (同样不生成 .pub 文件，测试回退到 PublicKeysCallback)
 	keyPath := filepath.Join(sshDir, "id_rsa")
 	if err := os.WriteFile(keyPath, pemData, 0600); err != nil {
 		t.Fatalf("failed to write private key: %v", err)
 	}
 
 	ui := &mockUIForTest{passphrase: passphrase}
-	passwordCalled := false
-	passphraseCalled := false
+	plan := buildAutoAuthPlan(t.Context(), AutoAuthOptions{
+		LifecycleCtx: t.Context(),
+		User:         "testuser",
+		Host:         "127.0.0.1",
+		Prompter:     ui,
+	})
+	if plan.cleanup != nil {
+		t.Cleanup(plan.cleanup)
+	}
 
-	methods, cleanup := BuildAutoAuthMethods(
-		t.Context(),
-		"testuser",
-		"127.0.0.1",
-		ui,
-		func(pass string) { passwordCalled = true },
-		func(path, pass string) { passphraseCalled = true },
-	)
-	defer func() {
-		if cleanup != nil {
-			cleanup()
-		}
-	}()
-
-	// 验证在 BuildAutoAuthMethods 调用完毕且未执行认证时，没有触发密码输入，也没有生成 .pub 文件
 	pubKeyPath := keyPath + ".pub"
 	if _, err := os.Stat(pubKeyPath); err == nil {
-		t.Error("expected public key file not to be saved yet")
+		t.Error("expected public key file not to be saved before the PEM candidate is attempted")
 	}
 	if ui.called {
-		t.Error("PromptPassword was unexpectedly called")
+		t.Error("PromptSecret was unexpectedly called during buildAutoAuthPlan")
 	}
-
-	// 模拟执行 PublicKeysCallback，应该要弹框密码，解密并自动生成 .pub 文件
-	for _, m := range methods {
-		// 回退方法的 PublicKeysCallback 会被注册为独立的 AuthMethod
-		// 我们可以通过在这个 callback 返回时校验来模拟
-		// 这里的 PublicKeysCallback 的执行行为会在客户端执行认证时发生
-		// 既然 methods 中包含了这个 callback 方法，我们可以利用它来进行测试
-		// 但因为 Go 的 ssh 包没有公开接口，我们可以直接找出来并执行它以做测试
-		// 为了在不依赖私有结构的前提下测试它：我们实际上知道它一定在 methods 里面。
-		// 我们直接在代码里做一次模拟测试
-		_ = m
+	if len(plan.candidates) != 2 {
+		t.Fatalf("expected PEM key and password candidates, got %d", len(plan.candidates))
 	}
-
-	_ = passwordCalled
-	_ = passphraseCalled
+	if plan.candidates[0].protocol != autoAuthProtocolPublicKey {
+		t.Fatalf("first candidate protocol = %q, want %q", plan.candidates[0].protocol, autoAuthProtocolPublicKey)
+	}
 }
