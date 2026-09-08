@@ -51,12 +51,6 @@ func stubDarwinAPIs(t *testing.T) *darwinKeychainAPI {
 			}
 			return errSecSuccess
 		},
-		copyDomainSearchList: func(_ uint32, searchList *uintptr) int32 {
-			if searchList != nil {
-				*searchList = 0x3000
-			}
-			return errSecSuccess
-		},
 		keychainGetStatus: func(_ uintptr, status *uint32) int32 {
 			if status != nil {
 				*status = kSecUnlockStateStatus // 默认解锁
@@ -73,6 +67,12 @@ func stubDarwinAPIs(t *testing.T) *darwinKeychainAPI {
 			return 0
 		},
 		cfRelease: func(_ uintptr) {},
+	}
+	mock.copyDomainSearchList = func(_ uint32, searchList *uintptr) int32 {
+		if mock.copySearchList != nil {
+			return mock.copySearchList(searchList)
+		}
+		return errSecSuccess
 	}
 
 	setDarwinMockAPI(mock)
