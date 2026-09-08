@@ -1398,25 +1398,66 @@ func (r *Repository) loadDiskConfigLocked(ctx context.Context) (*Configuration, 
 }
 
 func (r *Repository) syncStoreLocked(ctx context.Context) error {
-	if syncer, ok := r.store.(Syncer); ok {
-		if err := syncer.Sync(ctx); err != nil {
-			return err
-		}
-	} else if ds, ok := r.store.(*defaultStore); ok {
-		if err := ds.Sync(ctx); err != nil {
-			return err
-		}
-	} else if dc, ok := r.store.(interface{ IsDurable() bool }); ok {
+	hasSynced := false
+
+	// 1. 如果底层存储支持报告耐久性状态（如共享存储或具备状态跟踪的存储）
+	if dc, ok := r.store.(DurabilityChecker); ok {
 		if !dc.IsDurable() {
-			return fmt.Errorf("authoritative storage is not durable")
+			if syncer, ok := r.store.(Syncer); ok {
+				if err := syncer.Sync(ctx); err != nil {
+					return fmt.Errorf("storage durability sync failed: %w", err)
+				}
+				hasSynced = true
+			}
+			if !dc.IsDurable() {
+				return fmt.Errorf("authoritative storage remains undurable")
+			}
 		}
-	} else if r.hasUndurableWrite.Load() {
-		return fmt.Errorf("unconfirmed durability write remains pending")
+	} else if dcAnon, ok := r.store.(interface{ IsDurable() bool }); ok {
+		if !dcAnon.IsDurable() {
+			if syncer, ok := r.store.(Syncer); ok {
+				if err := syncer.Sync(ctx); err != nil {
+					return fmt.Errorf("storage durability sync failed: %w", err)
+				}
+				hasSynced = true
+			}
+			if !dcAnon.IsDurable() {
+				return fmt.Errorf("authoritative storage remains undurable")
+			}
+		}
 	}
+
+	// 2. 无论是否已检查状态，只要存储实现了 Syncer 接口且尚未同步，必须执行物理介质同步
+	if !hasSynced {
+		if syncer, ok := r.store.(Syncer); ok {
+			if err := syncer.Sync(ctx); err != nil {
+				return fmt.Errorf("storage syncer failed: %w", err)
+			}
+			hasSynced = true
+		} else if ds, ok := r.store.(*defaultStore); ok {
+			if err := ds.Sync(ctx); err != nil {
+				return fmt.Errorf("default store sync failed: %w", err)
+			}
+			hasSynced = true
+		}
+	}
+
+	// 3. 若存储层未实现任何持久化同步或耐久性检查接口，且当前实例记录了未决耐久写入，说明无法确认持久化
+	if !hasSynced {
+		if _, ok := r.store.(interface{ IsDurable() bool }); !ok {
+			if r.hasUndurableWrite.Load() {
+				return fmt.Errorf("unconfirmed durability write remains pending in current instance")
+			}
+		}
+	}
+
+	// 存储层已成功完成持久化同步，重置本实例未决写入标记
+	r.hasUndurableWrite.Store(false)
 	return nil
 }
 
-// CheckRefUnreferenced checks whether the reference is unreferenced in authoritative storage.
+// CheckRefUnreferenced checks whether the reference is unreferenced in authoritative storage
+// and confirms that this unreferenced state has been durably persisted across processes.
 func (r *Repository) CheckRefUnreferenced(ctx context.Context, ref credential.Ref) (bool, error) {
 	if ref.IsEmpty() {
 		return true, nil
@@ -1458,6 +1499,13 @@ func (r *Repository) CheckRefUnreferenced(ctx context.Context, ref credential.Re
 		}
 	}
 
+	// 4. 【核心红线保障】：磁盘权威配置中虽无引用，但该状态必须在跨进程存储层确认已完成持久化同步（Durable）。
+	// 若底层存储同步失败或仍处于未持久化状态，绝不能确认解绑，防止因跨 Repository 实例的未 Durable 解绑导致凭据被 GC 提前删除！
+	if err := r.syncStoreLocked(ctx); err != nil {
+		return false, fmt.Errorf("verify ref unreferenced durability in storage failed: %w", err)
+	}
+
+	r.hasUndurableWrite.Store(false)
 	return true, nil
 }
 

@@ -1,10 +1,13 @@
 package config
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
@@ -503,6 +506,8 @@ type memoryPersistStore struct {
 	mu      sync.Mutex
 	cfg     *Configuration
 	loadErr error
+	result  *PersistResult
+	syncErr error
 }
 
 func (m *memoryPersistStore) Load() (*Configuration, error) {
@@ -525,7 +530,31 @@ func (m *memoryPersistStore) save(c *Configuration) (PersistResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.cfg = cloneConfiguration(c)
+	if m.result != nil {
+		return *m.result, m.syncErr
+	}
 	return PersistResult{Applied: true, Durable: true}, nil
+}
+
+func (m *memoryPersistStore) IsDurable() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.result != nil {
+		return m.result.Durable
+	}
+	return true
+}
+
+func (m *memoryPersistStore) Sync(context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.syncErr != nil {
+		return m.syncErr
+	}
+	if m.result != nil && !m.result.Durable {
+		return errors.New("storage durability sync failed")
+	}
+	return nil
 }
 
 func TestRepository_CheckRefUnreferenced_ReloadsDiskConfiguration(t *testing.T) {
@@ -680,4 +709,242 @@ func TestRepository_CheckRefUnreferenced_MultipleRepositoriesStaleSnapshot(t *te
 	if !unref {
 		t.Fatalf("CRITICAL BUG: stale in-memory snapshot caused CheckRefUnreferenced to return false when authoritative disk removed the reference!")
 	}
+}
+
+type inMemoryCredStore struct {
+	mu   sync.Mutex
+	data map[string][]byte
+}
+
+func (s *inMemoryCredStore) Get(_ context.Context, ref credential.Ref) (credential.Secret, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, ok := s.data[ref.ItemID]
+	if !ok {
+		return credential.Secret{}, credential.ErrCredentialNotFound
+	}
+	return credential.Secret{Value: bytes.Clone(v)}, nil
+}
+
+func (s *inMemoryCredStore) Put(_ context.Context, ref credential.Ref, sec credential.Secret) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data[ref.ItemID] = bytes.Clone(sec.Value)
+	return nil
+}
+
+func (s *inMemoryCredStore) Delete(_ context.Context, ref credential.Ref) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.data[ref.ItemID]; !ok {
+		return credential.ErrCredentialNotFound
+	}
+	delete(s.data, ref.ItemID)
+	return nil
+}
+
+func setupSharedNodesAndIdentities(t *testing.T, repo *Repository, oldRef credential.Ref) {
+	t.Helper()
+	identityA := models.Identity{User: "userA", LoginPasswordRef: &oldRef}
+	if err := createIdentity(repo, "id-A", identityA); err != nil {
+		t.Fatalf("create id-A failed: %v", err)
+	}
+	identityB := models.Identity{User: "userB", LoginPasswordRef: &oldRef}
+	if err := createIdentity(repo, "id-B", identityB); err != nil {
+		t.Fatalf("create id-B failed: %v", err)
+	}
+	if err := createNode(repo, "node-A", models.Node{IdentityRef: "id-A", HostRef: "h1"}, models.Host{Address: "1.1.1.1", Port: 22}, identityA); err != nil {
+		t.Fatalf("create node-A failed: %v", err)
+	}
+	if err := createNode(repo, "node-B", models.Node{IdentityRef: "id-B", HostRef: "h2"}, models.Host{Address: "1.1.1.2", Port: 22}, identityB); err != nil {
+		t.Fatalf("create node-B failed: %v", err)
+	}
+}
+
+func setupTestCredentialEnvironment(
+	t *testing.T,
+	repo *Repository,
+	oldRef, newRef credential.Ref,
+) (*credential.Service, *inMemoryCredStore, *credential.JournalStore) {
+	t.Helper()
+	credStore := &inMemoryCredStore{data: map[string][]byte{
+		oldRef.ItemID: []byte("old-secret-content"),
+		newRef.ItemID: []byte("new-secret-content"),
+	}}
+	reg := credential.NewRegistry()
+	if err := reg.Register("mock-store", credStore); err != nil {
+		t.Fatalf("reg.Register failed: %v", err)
+	}
+	journalStore, err := credential.NewJournalStore(filepath.Join(t.TempDir(), "journals"))
+	if err != nil {
+		t.Fatalf("NewJournalStore failed: %v", err)
+	}
+
+	cleanupEntry := &credential.JournalEntry{
+		ID:         credential.GenerateJournalID(),
+		Op:         credential.OpRotate,
+		Stage:      credential.StageCleanup,
+		TargetNode: "node-A",
+		TargetKind: credential.KindLoginPassword,
+		NewRef:     &newRef,
+		OldRef:     &oldRef,
+		CreatedAt:  time.Now(),
+		UpdatedAt:  time.Now(),
+	}
+	if err := journalStore.RecordIntent(cleanupEntry); err != nil {
+		t.Fatalf("RecordIntent failed: %v", err)
+	}
+	if err := journalStore.MarkCleanup(cleanupEntry.ID); err != nil {
+		t.Fatalf("MarkCleanup failed: %v", err)
+	}
+
+	svcA, err := credential.NewService(reg, journalStore, repo.AsConfigUpdater(), nil)
+	if err != nil {
+		t.Fatalf("NewService svcA failed: %v", err)
+	}
+	return svcA, credStore, journalStore
+}
+
+func assertGCBlockedUnderUndurableStorage(
+	t *testing.T,
+	ctx context.Context,
+	svcA *credential.Service,
+	repoA *Repository,
+	oldRef credential.Ref,
+	credStore *inMemoryCredStore,
+	journalStore *credential.JournalStore,
+) {
+	t.Helper()
+	// 【核心红线测试 1】：CheckRefUnreferenced 必须在存储层核验持久化，由于 sync 失败，必须返回 false 和错误！
+	unref, checkErr := repoA.CheckRefUnreferenced(ctx, oldRef)
+	if unref {
+		t.Fatalf("CRITICAL BUG: repoA.CheckRefUnreferenced must NOT return true when storage durability sync failed!")
+	}
+	if checkErr == nil {
+		t.Fatalf("expected checkErr when storage sync failed, got nil")
+	}
+
+	// 【核心红线测试 2】：svcA.Recover 执行 GC，绝不能删除旧凭据，绝不能丢弃清理 journal！
+	res, err := svcA.Recover(ctx)
+	if err != nil {
+		t.Fatalf("svcA.Recover failed: %v", err)
+	}
+	if len(res) != 1 || res[0].Action != credential.RecoveryActionScheduledForGC {
+		t.Fatalf("expected RecoveryActionScheduledForGC, got %+v", res)
+	}
+
+	// 【核心红线断言 3】：旧凭据绝对不能被删除！
+	credStore.mu.Lock()
+	_, oldStillExists := credStore.data[oldRef.ItemID]
+	credStore.mu.Unlock()
+	if !oldStillExists {
+		t.Fatalf("CRITICAL DISASTER: old credential was DELETED while durability was uncertain across repositories!")
+	}
+
+	// 【核心红线断言 4】：待清理 journal 绝对不能被丢弃！
+	pendingEntries, _ := journalStore.ListPending()
+	if len(pendingEntries) != 1 {
+		t.Fatalf("CRITICAL DISASTER: cleanup journal was discarded while durability was uncertain, count=%d", len(pendingEntries))
+	}
+	if pendingEntries[0].Stage != credential.StageCleanup {
+		t.Fatalf("expected stage to be preserved as StageCleanup, got %s", pendingEntries[0].Stage)
+	}
+}
+
+func assertGCCleansUpAfterDurabilityConfirmed(
+	t *testing.T,
+	ctx context.Context,
+	svcA *credential.Service,
+	oldRef credential.Ref,
+	credStore *inMemoryCredStore,
+	journalStore *credential.JournalStore,
+) {
+	t.Helper()
+	res, err := svcA.Recover(ctx)
+	if err != nil {
+		t.Fatalf("svcA.Recover failed: %v", err)
+	}
+	if len(res) != 1 || res[0].Action != credential.RecoveryActionCommittedCleaned {
+		t.Fatalf("expected RecoveryActionCommittedCleaned, got %+v", res)
+	}
+
+	credStore.mu.Lock()
+	_, oldStillExistsAfter := credStore.data[oldRef.ItemID]
+	credStore.mu.Unlock()
+	if oldStillExistsAfter {
+		t.Fatalf("old credential should be deleted after durability confirmed")
+	}
+
+	pendingAfter, _ := journalStore.ListPending()
+	if len(pendingAfter) != 0 {
+		t.Fatalf("journal should be removed after cleanup, count=%d", len(pendingAfter))
+	}
+}
+
+func TestCrossRepository_UndurableUnbind_PreservesCredentialAndJournalDuringGC(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. 共享底层存储，模拟跨进程/跨实例存储层
+	sharedStore := &memoryPersistStore{cfg: cloneConfiguration(nil)}
+
+	repoA, err := NewRepositoryWithoutOpenSSH(newTestProvider().Snapshot(), sharedStore)
+	if err != nil {
+		t.Fatalf("NewRepositoryWithoutOpenSSH repoA failed: %v", err)
+	}
+
+	oldRef := credential.Ref{StoreID: "mock-store", ItemID: "old-shared-secret"}
+	newRefA := credential.Ref{StoreID: "mock-store", ItemID: "new-secret-nodeA"}
+
+	setupSharedNodesAndIdentities(t, repoA, oldRef)
+
+	// 2. 模拟 node-A 已经完成了轮换，更新为 newRefA，旧凭据 oldRef 进入待清理 journal
+	targetA := credential.Target{NodeID: "node-A", Kind: credential.KindLoginPassword}
+	outcomeA, _, err := repoA.AsConfigUpdater().ApplyCredentialRefAtVersion(ctx, targetA, "", &newRefA)
+	if err != nil || !outcomeA.Durable {
+		t.Fatalf("ApplyCredentialRefAtVersion on repoA failed: %v", err)
+	}
+
+	// 此时创建 repoB（模拟另一个进程或并发实例启动，其快照同步自共享存储中的最新状态）
+	repoB, err := NewRepositoryWithoutOpenSSH(repoA.provider.Snapshot(), sharedStore)
+	if err != nil {
+		t.Fatalf("NewRepositoryWithoutOpenSSH repoB failed: %v", err)
+	}
+
+	svcA, credStore, journalStore := setupTestCredentialEnvironment(t, repoA, oldRef, newRefA)
+
+	// 执行初始 GC：此时 node-B 依然引用 oldRef，必须保留凭据和 journal
+	res1, err := svcA.Recover(ctx)
+	if err != nil || len(res1) != 1 || res1[0].Action != credential.RecoveryActionScheduledForGC {
+		t.Fatalf("expected initial GC to schedule for GC, got res=%+v err=%v", res1, err)
+	}
+
+	// 3. 模拟步骤 2：Repository B 解除最后一个引用（解绑 node-B 对 oldRef 的引用）
+	// rename 成功（配置已更新，不再包含 oldRef），但目录 sync 失败！
+	targetB := credential.Target{NodeID: "node-B", Kind: credential.KindLoginPassword}
+	sharedStore.mu.Lock()
+	sharedStore.result = &PersistResult{Applied: true, Durable: false}
+	sharedStore.syncErr = errors.New("parent directory sync failed")
+	sharedStore.mu.Unlock()
+
+	outcomeB, _, err := repoB.AsConfigUpdater().ApplyCredentialRefAtVersion(ctx, targetB, "", nil)
+	if err == nil {
+		t.Fatalf("expected DurabilityError for repoB mutation, got nil")
+	}
+	if !outcomeB.Applied || outcomeB.Durable {
+		t.Fatalf("expected Applied=true, Durable=false for repoB mutation, got %+v", outcomeB)
+	}
+
+	// 4. 模拟步骤 3：Repository A 执行 GC（自身没有 hasUndurableWrite 标记）
+	if repoA.hasUndurableWrite.Load() {
+		t.Fatalf("repoA must NOT have hasUndurableWrite set")
+	}
+	assertGCBlockedUnderUndurableStorage(t, ctx, svcA, repoA, oldRef, credStore, journalStore)
+
+	// 5. 模拟存储层完成持久化同步（恢复 Durable 状态）
+	sharedStore.mu.Lock()
+	sharedStore.result = &PersistResult{Applied: true, Durable: true}
+	sharedStore.syncErr = nil
+	sharedStore.mu.Unlock()
+
+	assertGCCleansUpAfterDurabilityConfirmed(t, ctx, svcA, oldRef, credStore, journalStore)
 }

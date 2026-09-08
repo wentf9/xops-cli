@@ -69,6 +69,11 @@ type Syncer interface {
 	Sync(ctx context.Context) error
 }
 
+// DurabilityChecker 表示支持查询存储持久介质是否已真正耐久落盘的接口。
+type DurabilityChecker interface {
+	IsDurable() bool
+}
+
 type defaultStore struct {
 	Path        string
 	KeyPath     string // 用于加解密配置文件中的敏感字段
@@ -80,9 +85,14 @@ type defaultStore struct {
 const defaultConfigLockTimeout = 10 * time.Second
 
 var (
-	_ TransactionStore = (*defaultStore)(nil)
-	_ Syncer           = (*defaultStore)(nil)
+	_ TransactionStore  = (*defaultStore)(nil)
+	_ Syncer            = (*defaultStore)(nil)
+	_ DurabilityChecker = (*defaultStore)(nil)
 )
+
+func (s *defaultStore) IsDurable() bool {
+	return true
+}
 
 func (s *defaultStore) Sync(ctx context.Context) error {
 	if s == nil || s.Path == "" {
@@ -91,6 +101,17 @@ func (s *defaultStore) Sync(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := s.gate.acquire(ctx); err != nil {
+		return fmt.Errorf("acquire in-process configuration lock for sync failed: %w", err)
+	}
+	defer s.gate.release()
+	lock, err := acquireConfigLock(ctx, s.Path)
+	if err != nil {
+		return fmt.Errorf("acquire configuration lock for sync failed: %w", err)
+	}
+	defer func() {
+		_ = lock.Close()
+	}()
 	dir := filepath.Dir(s.Path)
 	return syncParentDirectory(dir)
 }
