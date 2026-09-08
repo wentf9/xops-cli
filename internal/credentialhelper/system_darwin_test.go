@@ -51,6 +51,12 @@ func stubDarwinAPIs(t *testing.T) *darwinKeychainAPI {
 			}
 			return errSecSuccess
 		},
+		copyDomainSearchList: func(_ uint32, searchList *uintptr) int32 {
+			if searchList != nil {
+				*searchList = 0x3000
+			}
+			return errSecSuccess
+		},
 		keychainGetStatus: func(_ uintptr, status *uint32) int32 {
 			if status != nil {
 				*status = kSecUnlockStateStatus // 默认解锁
@@ -1181,7 +1187,7 @@ func setupIsolatedDarwinKeychain(t *testing.T, securityBin, keychainName, keycha
 	}
 	origDefault := parseKeychainPath(string(origDefOut))
 
-	origListOut, err := exec.Command(securityBin, "list-keychains").CombinedOutput()
+	origListOut, err := exec.Command(securityBin, "list-keychains", "-d", "user").CombinedOutput()
 	if err != nil {
 		t.Fatalf("query list-keychains failed: %v (%s)", err, origListOut)
 	}
@@ -1202,7 +1208,7 @@ func setupIsolatedDarwinKeychain(t *testing.T, securityBin, keychainName, keycha
 		}
 		if len(origKeychains) > 0 {
 			var restoreArgs []string
-			restoreArgs = append(restoreArgs, "list-keychains", "-s")
+			restoreArgs = append(restoreArgs, "list-keychains", "-d", "user", "-s")
 			restoreArgs = append(restoreArgs, origKeychains...)
 			if out, err := exec.Command(securityBin, restoreArgs...).CombinedOutput(); err != nil {
 				t.Errorf("cleanup restore list-keychains failed: %v (%s)", err, out)
@@ -1234,14 +1240,7 @@ func setupIsolatedDarwinKeychain(t *testing.T, securityBin, keychainName, keycha
 	if out, err := exec.Command(securityBin, "default-keychain", "-s", keychainPath).CombinedOutput(); err != nil {
 		t.Fatalf("set default-keychain failed: %v (%s)", err, out)
 	}
-	var listArgs []string
-	listArgs = append(listArgs, "list-keychains", "-s", keychainPath)
-	for _, k := range origKeychains {
-		if k != keychainPath {
-			listArgs = append(listArgs, k)
-		}
-	}
-	if out, err := exec.Command(securityBin, listArgs...).CombinedOutput(); err != nil {
+	if out, err := exec.Command(securityBin, "list-keychains", "-d", "user", "-s", keychainPath).CombinedOutput(); err != nil {
 		t.Fatalf("set list-keychains failed: %v (%s)", err, out)
 	}
 
@@ -1384,7 +1383,7 @@ func TestDarwinNativeSystemStore_MultiKeychainLockClassification(t *testing.T) {
 	secondaryPath := setupSecondaryTestKeychain(t, securityBin, "xops_multi_secondary.keychain", secondaryPass)
 
 	// 配置搜索列表包含两者: primaryPath, secondaryPath
-	if out, err := exec.Command(securityBin, "list-keychains", "-s", primaryPath, secondaryPath).CombinedOutput(); err != nil {
+	if out, err := exec.Command(securityBin, "list-keychains", "-d", "user", "-s", primaryPath, secondaryPath).CombinedOutput(); err != nil {
 		t.Fatalf("set search list to include both keychains failed: %v (%s)", err, out)
 	}
 
@@ -1531,7 +1530,7 @@ func TestDarwinNativeSystemStore_MultiKeychainTargetUnlockedACLDeniedWithUnrelat
 	secondaryPath := setupSecondaryTestKeychain(t, securityBin, "xops_rev_secondary.keychain", secondaryPass)
 
 	// 配置搜索列表包含两者: [primaryPath, secondaryPath]
-	if out, err := exec.Command(securityBin, "list-keychains", "-s", primaryPath, secondaryPath).CombinedOutput(); err != nil {
+	if out, err := exec.Command(securityBin, "list-keychains", "-d", "user", "-s", primaryPath, secondaryPath).CombinedOutput(); err != nil {
 		t.Fatalf("set search list to include both keychains failed: %v (%s)", err, out)
 	}
 

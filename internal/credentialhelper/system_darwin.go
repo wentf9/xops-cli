@@ -22,6 +22,8 @@ const (
 	errSecInteractionNotAllowed int32 = -25308
 
 	kSecUnlockStateStatus uint32 = 1
+
+	kSecPreferencesDomainUser uint32 = 0
 )
 
 type darwinKeychainAPI struct {
@@ -73,6 +75,11 @@ type darwinKeychainAPI struct {
 	) int32
 
 	copySearchList func(
+		searchList *uintptr,
+	) int32
+
+	copyDomainSearchList func(
+		domain uint32,
 		searchList *uintptr,
 	) int32
 
@@ -134,6 +141,7 @@ func getDarwinKeychainAPI() (*darwinKeychainAPI, error) {
 		purego.RegisterLibFunc(&apis.itemDelete, secHandle, "SecKeychainItemDelete")
 		purego.RegisterLibFunc(&apis.itemCopyKeychain, secHandle, "SecKeychainItemCopyKeychain")
 		purego.RegisterLibFunc(&apis.copySearchList, secHandle, "SecKeychainCopySearchList")
+		purego.RegisterLibFunc(&apis.copyDomainSearchList, secHandle, "SecKeychainCopyDomainSearchList")
 		purego.RegisterLibFunc(&apis.keychainGetStatus, secHandle, "SecKeychainGetStatus")
 		purego.RegisterLibFunc(&apis.cfArrayGetCount, cfHandle, "CFArrayGetCount")
 		purego.RegisterLibFunc(&apis.cfArrayGetValueAtIndex, cfHandle, "CFArrayGetValueAtIndex")
@@ -197,12 +205,24 @@ type darwinSearchKeychains struct {
 }
 
 func getSearchKeychains(apis *darwinKeychainAPI) darwinSearchKeychains {
-	if apis == nil || apis.copySearchList == nil || apis.cfArrayGetCount == nil || apis.cfArrayGetValueAtIndex == nil {
+	if apis == nil || apis.cfArrayGetCount == nil || apis.cfArrayGetValueAtIndex == nil {
 		return darwinSearchKeychains{keychains: []uintptr{0}}
 	}
 
 	var searchList uintptr
-	if res := apis.copySearchList(&searchList); res != errSecSuccess || searchList == 0 {
+	// 优先查询当前用户首选域 (User Domain) 的钥匙串搜索列表，
+	// 避免合并列表中包含系统级钥匙串（如 /Library/Keychains/System.keychain，非 root 环境下通常处于锁定状态）导致全库误判为锁定
+	if apis.copyDomainSearchList != nil {
+		if res := apis.copyDomainSearchList(kSecPreferencesDomainUser, &searchList); res == errSecSuccess && searchList != 0 {
+			// 成功获取用户域搜索列表
+		} else if apis.copySearchList != nil {
+			_ = apis.copySearchList(&searchList)
+		}
+	} else if apis.copySearchList != nil {
+		_ = apis.copySearchList(&searchList)
+	}
+
+	if searchList == 0 {
 		return darwinSearchKeychains{keychains: []uintptr{0}}
 	}
 

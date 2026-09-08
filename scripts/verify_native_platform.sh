@@ -210,7 +210,7 @@ case "$OS" in
                 if [ -n "$p" ]; then
                     ORIG_KEYCHAINS+=("$p")
                 fi
-            done < <(security list-keychains 2>/dev/null || true)
+            done < <(security list-keychains -d user 2>/dev/null || true)
         fi
 
         cleanup_darwin_test_keychain() {
@@ -224,7 +224,7 @@ case "$OS" in
                     fi
                 fi
                 if [ ${#ORIG_KEYCHAINS[@]} -gt 0 ]; then
-                    if ! security list-keychains -s "${ORIG_KEYCHAINS[@]}"; then
+                    if ! security list-keychains -d user -s "${ORIG_KEYCHAINS[@]}"; then
                         log_fail "Failed to restore original keychain search list"
                         cleanup_failed=1
                     fi
@@ -262,14 +262,8 @@ case "$OS" in
             if ! security default-keychain -s "$TEST_KEYCHAIN"; then
                 log_fail "Failed to set default test keychain: $TEST_KEYCHAIN"
             fi
-            if [ ${#ORIG_KEYCHAINS[@]} -gt 0 ]; then
-                if ! security list-keychains -s "$TEST_KEYCHAIN" "${ORIG_KEYCHAINS[@]}"; then
-                    log_fail "Failed to configure test keychain search list"
-                fi
-            else
-                if ! security list-keychains -s "$TEST_KEYCHAIN"; then
-                    log_fail "Failed to configure test keychain search list"
-                fi
+            if ! security list-keychains -d user -s "$TEST_KEYCHAIN"; then
+                log_fail "Failed to configure test keychain search list"
             fi
             log_info "Configured isolated test keychain: $TEST_KEYCHAIN"
         fi
@@ -355,11 +349,7 @@ case "$OS" in
             if security create-keychain -p "$KEYCHAIN_PASS" "$TEST_KEYCHAIN_SEC"; then
                 if security unlock-keychain -p "$KEYCHAIN_PASS" "$TEST_KEYCHAIN_SEC" && \
                    security set-keychain-settings -t 3600 -l "$TEST_KEYCHAIN_SEC"; then
-                    if [ ${#ORIG_KEYCHAINS[@]} -gt 0 ]; then
-                        security list-keychains -s "$TEST_KEYCHAIN" "$TEST_KEYCHAIN_SEC" "${ORIG_KEYCHAINS[@]}"
-                    else
-                        security list-keychains -s "$TEST_KEYCHAIN" "$TEST_KEYCHAIN_SEC"
-                    fi
+                    security list-keychains -d user -s "$TEST_KEYCHAIN" "$TEST_KEYCHAIN_SEC"
 
                     MULTI_ITEM="mac-multi-key-$$-$(date +%s)"
                     # 使用 -A 显式授权所有应用（包括 helper）访问，杜绝未授权 ACL 导致初次读取失败
@@ -410,11 +400,7 @@ case "$OS" in
                     fi
 
                     # 恢复主测试钥匙串搜索列表
-                    if [ ${#ORIG_KEYCHAINS[@]} -gt 0 ]; then
-                        security list-keychains -s "$TEST_KEYCHAIN" "${ORIG_KEYCHAINS[@]}" || true
-                    else
-                        security list-keychains -s "$TEST_KEYCHAIN" || true
-                    fi
+                    security list-keychains -d user -s "$TEST_KEYCHAIN" || true
                 fi
                 security delete-keychain "$TEST_KEYCHAIN_SEC" 2>/dev/null || true
             fi
@@ -428,11 +414,7 @@ case "$OS" in
                     security lock-keychain "$TEST_KEYCHAIN_SEC" || true
 
                     # 配置搜索列表包含主库和已锁定的次级库
-                    if [ ${#ORIG_KEYCHAINS[@]} -gt 0 ]; then
-                        security list-keychains -s "$TEST_KEYCHAIN" "$TEST_KEYCHAIN_SEC" "${ORIG_KEYCHAINS[@]}"
-                    else
-                        security list-keychains -s "$TEST_KEYCHAIN" "$TEST_KEYCHAIN_SEC"
-                    fi
+                    security list-keychains -d user -s "$TEST_KEYCHAIN" "$TEST_KEYCHAIN_SEC"
 
                     REV_ITEM="mac-rev-key-$$-$(date +%s)"
                     if security add-generic-password -s "xops:test-sys" -a "$REV_ITEM" -w "rev-secret" -T /usr/bin/false "$TEST_KEYCHAIN"; then
@@ -448,11 +430,7 @@ case "$OS" in
                     fi
 
                     # 恢复主测试钥匙串搜索列表
-                    if [ ${#ORIG_KEYCHAINS[@]} -gt 0 ]; then
-                        security list-keychains -s "$TEST_KEYCHAIN" "${ORIG_KEYCHAINS[@]}" || true
-                    else
-                        security list-keychains -s "$TEST_KEYCHAIN" || true
-                    fi
+                    security list-keychains -d user -s "$TEST_KEYCHAIN" || true
                 fi
                 security delete-keychain "$TEST_KEYCHAIN_SEC" 2>/dev/null || true
             fi

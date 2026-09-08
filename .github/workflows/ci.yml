@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches:
+      - master
+      - 'feat/**'
+      - 'feature/**'
   pull_request:
     branches: [master]
   workflow_dispatch:
@@ -97,11 +100,25 @@ jobs:
       - name: Build all packages
         run: go build ./...
 
+      - name: Set up macOS Keychain
+        run: |
+          KEYCHAIN_PATH="$HOME/Library/Keychains/ci.keychain-db"
+          security create-keychain -p "" "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security unlock-keychain -p "" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+
       - name: Run macOS tests
         run: go test -race -shuffle=on -count=1 ./...
 
       - name: Run Native Platform Verification Script
         run: ./scripts/verify_native_platform.sh
+
+      - name: Clean up macOS Keychain
+        if: always()
+        run: |
+          security delete-keychain "$HOME/Library/Keychains/ci.keychain-db" || true
 
       - name: Setup tmate debug session on failure
         if: ${{ failure() && github.event_name == 'workflow_dispatch' && inputs.debug_enabled }}
