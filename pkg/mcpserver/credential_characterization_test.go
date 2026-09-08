@@ -180,7 +180,7 @@ func TestCharacterization_MCP_ListNodes_DoesNotLeakPlaintextCredentials(t *testi
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
 
-	conn := newMCPConnector(ctx, provider, bufLogger)
+	conn := newMCPConnector(ctx, provider, bufLogger, nil)
 	t.Cleanup(func() {
 		_ = conn.CloseAll()
 	})
@@ -259,7 +259,7 @@ func TestCharacterization_MCP_FailClosedOnMissingCredential_DoesNotLeakSecrets(t
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
 
-	conn := newMCPConnector(ctx, provider, bufLogger)
+	conn := newMCPConnector(ctx, provider, bufLogger, nil)
 	t.Cleanup(func() {
 		_ = conn.CloseAll()
 	})
@@ -392,7 +392,7 @@ func TestCharacterization_MCP_FailClosedOnInteractionRequired_DoesNotLeakSecrets
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
-	conn := newMCPConnector(ctx, provider, bufLogger)
+	conn := newMCPConnector(ctx, provider, bufLogger, nil)
 	t.Cleanup(func() {
 		_ = conn.CloseAll()
 	})

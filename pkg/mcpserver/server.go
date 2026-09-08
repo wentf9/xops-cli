@@ -27,8 +27,9 @@ func FormatMCPError(err error) error {
 }
 
 type serverConfig struct {
-	logger   logger.DebugLogger
-	provider config.ConfigProvider
+	logger             logger.DebugLogger
+	provider           config.ConfigProvider
+	credentialRegistry adapter.CredentialResolver
 }
 
 // Option configures the MCP server runtime.
@@ -48,6 +49,15 @@ func WithLogger(l logger.DebugLogger) Option {
 func WithConfigProvider(provider config.ConfigProvider) Option {
 	return func(c *serverConfig) {
 		c.provider = provider
+	}
+}
+
+// WithCredentialRegistry injects a credential registry so MCP connections can
+// resolve stored secrets. When set, the MCP connector is configured with
+// WithCredentialSource so SSH nodes can authenticate without interactive prompts.
+func WithCredentialRegistry(r adapter.CredentialResolver) Option {
+	return func(c *serverConfig) {
+		c.credentialRegistry = r
 	}
 }
 
@@ -77,17 +87,22 @@ func getMCPProvider() (config.ConfigProvider, error) {
 
 // newMCPConnector creates a connector pre-configured to reject all interactive prompts,
 // avoiding blocking stdin/stdout and breaking JSON-RPC framing.
-func newMCPConnector(ctx context.Context, provider config.ConfigProvider, l logger.DebugLogger) *ssh.Connector {
-	var opts []ssh.Option
+// When credentialRegistry is non-nil, stored credentials are resolved automatically.
+func newMCPConnector(ctx context.Context, provider config.ConfigProvider, l logger.DebugLogger, credentialRegistry adapter.CredentialResolver) *ssh.Connector {
+	var sshOpts []ssh.Option
 	if l != nil {
-		opts = append(opts, ssh.WithLogger(l))
+		sshOpts = append(sshOpts, ssh.WithLogger(l))
 	} else {
-		opts = append(opts, ssh.WithLogger(logger.NopLogger))
+		sshOpts = append(sshOpts, ssh.WithLogger(logger.NopLogger))
 	}
 	if cfg := provider.Snapshot(); cfg != nil && cfg.PasswordPromptPattern != "" {
-		opts = append(opts, ssh.WithPasswordPromptPattern(cfg.PasswordPromptPattern))
+		sshOpts = append(sshOpts, ssh.WithPasswordPromptPattern(cfg.PasswordPromptPattern))
 	}
-	conn := adapter.NewConnector(provider, opts...)
+	adpOpts := []adapter.Option{adapter.WithNonInteractive(true)}
+	if credentialRegistry != nil {
+		adpOpts = append(adpOpts, adapter.WithCredentialSource(credentialRegistry))
+	}
+	conn := adapter.NewConnectorWithAdapterOptions(provider, adpOpts, sshOpts...)
 	conn.EnableKeepAlive(ctx, ssh.DefaultKeepAliveInterval, ssh.DefaultKeepAliveTimeout)
 	return conn
 }
@@ -150,7 +165,7 @@ func Serve(ctx context.Context, opts ...Option) (retErr error) {
 		return retErr
 	}
 	mcpProvider = cfg.provider
-	mcpConnector = newMCPConnector(ctx, cfg.provider, cfg.logger)
+	mcpConnector = newMCPConnector(ctx, cfg.provider, cfg.logger, cfg.credentialRegistry)
 	mcpMu.Unlock()
 	defer func() {
 		mcpMu.Lock()

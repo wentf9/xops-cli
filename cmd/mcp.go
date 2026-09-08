@@ -41,7 +41,7 @@ func newCmdMCPServe() *cobra.Command {
 }
 
 func runMCPServer(cmd *cobra.Command, args []string) error {
-	_, provider, _, err := utils.GetConfigStore()
+	_, provider, cfg, err := utils.GetConfigStore()
 	if err != nil {
 		return fmt.Errorf("load mcp configuration failed: %w", err)
 	}
@@ -49,11 +49,15 @@ func runMCPServer(cmd *cobra.Command, args []string) error {
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	err = mcpserver.Serve(
-		ctx,
+	serveOpts := []mcpserver.Option{
 		mcpserver.WithConfigProvider(provider),
 		mcpserver.WithLogger(logger.DefaultLogger()),
-	)
+	}
+	if reg, regErr := utils.GetCredentialRegistry(cfg); regErr == nil && reg != nil {
+		serveOpts = append(serveOpts, mcpserver.WithCredentialRegistry(reg))
+	}
+
+	err = mcpserver.Serve(ctx, serveOpts...)
 	if err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) || errors.Is(err, context.Canceled) {
 			return nil
