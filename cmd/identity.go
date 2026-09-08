@@ -3,15 +3,19 @@ package cmd
 import (
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"sort"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
 	"github.com/wentf9/xops-cli/pkg/config"
+	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
 	"github.com/wentf9/xops-cli/pkg/models"
+	"golang.org/x/term"
 )
 
 func NewCmdIdentity() *cobra.Command {
@@ -29,6 +33,7 @@ func NewCmdIdentity() *cobra.Command {
 	cmd.AddCommand(NewCmdIdentityAdd())
 	cmd.AddCommand(NewCmdIdentityEdit())
 	cmd.AddCommand(NewCmdIdentityDelete())
+	cmd.AddCommand(NewCmdIdentityCredential())
 
 	return cmd
 }
@@ -269,4 +274,184 @@ func NewCmdIdentityDelete() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// NewCmdIdentityCredential 创建 identity credential 子命令
+func NewCmdIdentityCredential() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "credential",
+		Aliases: []string{"cred"},
+		Short:   i18n.T("identity_credential_short"),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return cmd.Help()
+		},
+	}
+
+	cmd.AddCommand(newCmdIdentityCredentialSet())
+	cmd.AddCommand(newCmdIdentityCredentialDelete())
+	return cmd
+}
+
+func newCmdIdentityCredentialSet() *cobra.Command {
+	var (
+		kindStr       string
+		storeID       string
+		passwordStdin bool
+	)
+
+	cmd := &cobra.Command{
+		Use:   "set [name]",
+		Short: i18n.T("identity_credential_set_short"),
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := args[0]
+			kind := credential.Kind(kindStr)
+			if kind != credential.KindLoginPassword && kind != credential.KindPassphrase {
+				return fmt.Errorf("invalid credential kind %q: must be login_password or passphrase", kindStr)
+			}
+
+			_, repo, cfg, err := utils.GetConfigStore()
+			if err != nil {
+				return err
+			}
+
+			view := repo.View()
+			ident, ok := view.Configuration.Identities.Get(name)
+			if !ok {
+				return fmt.Errorf("%s", i18n.Tf("identity_err_not_found", map[string]any{"Name": name}))
+			}
+			ref, ok := view.IdentityRefs[name]
+			if !ok {
+				return fmt.Errorf("resolve identity %q reference: %w", name, config.ErrIdentityNotFound)
+			}
+
+			secretStr, err := resolveSecretInput(cmd.InOrStdin(), passwordStdin, kindStr)
+			if err != nil {
+				return err
+			}
+
+			targetStore := storeID
+			if targetStore == "" {
+				if cfg.Credential != nil && cfg.Credential.DefaultStore != "" {
+					targetStore = cfg.Credential.DefaultStore
+				} else {
+					targetStore = "system"
+				}
+			}
+
+			var oldRef *credential.Ref
+			if kind == credential.KindLoginPassword {
+				oldRef = ident.LoginPasswordRef
+			} else {
+				oldRef = ident.PassphraseRef
+			}
+
+			svc, err := utils.GetCredentialService(repo, cfg)
+			if err != nil {
+				return fmt.Errorf("initialize credential service: %w", err)
+			}
+
+			target := credential.Target{
+				IdentityID: name,
+				Kind:       kind,
+			}
+			newRef, _, err := svc.Rotate(
+				cmd.Context(),
+				target,
+				string(ref.Version[:]),
+				oldRef,
+				targetStore,
+				credential.Secret{Value: []byte(secretStr)},
+			)
+			if err != nil {
+				return fmt.Errorf("rotate credential in store failed: %w", err)
+			}
+
+			logger.PrintSuccessf("Set credential for identity %q (kind: %s, store: %s, itemID: %s)", name, kindStr, targetStore, newRef.ItemID)
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&kindStr, "kind", "login_password", i18n.T("flag_credential_kind"))
+	cmd.Flags().StringVar(&storeID, "store", "", i18n.T("flag_credential_store"))
+	cmd.Flags().BoolVar(&passwordStdin, "password-stdin", false, i18n.T("flag_password_stdin"))
+	return cmd
+}
+
+func resolveSecretInput(r io.Reader, stdin bool, kindStr string) (string, error) {
+	if stdin {
+		return utils.ReadSecretFromReader(r)
+	}
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		prompt := fmt.Sprintf("Enter %s: ", kindStr)
+		return utils.ReadPasswordFromTerminal(prompt)
+	}
+	return "", errors.New("terminal is not interactive, please provide secret via --password-stdin")
+}
+
+func newCmdIdentityCredentialDelete() *cobra.Command {
+	var kindStr string
+
+	cmd := &cobra.Command{
+		Use:   "delete [name]",
+		Short: i18n.T("identity_credential_delete_short"),
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := args[0]
+			kind := credential.Kind(kindStr)
+			if kind != credential.KindLoginPassword && kind != credential.KindPassphrase {
+				return fmt.Errorf("invalid credential kind %q: must be login_password or passphrase", kindStr)
+			}
+
+			_, repo, cfg, err := utils.GetConfigStore()
+			if err != nil {
+				return err
+			}
+
+			view := repo.View()
+			ident, ok := view.Configuration.Identities.Get(name)
+			if !ok {
+				return fmt.Errorf("%s", i18n.Tf("identity_err_not_found", map[string]any{"Name": name}))
+			}
+			ref, ok := view.IdentityRefs[name]
+			if !ok {
+				return fmt.Errorf("resolve identity %q reference: %w", name, config.ErrIdentityNotFound)
+			}
+
+			var oldRef *credential.Ref
+			if kind == credential.KindLoginPassword {
+				oldRef = ident.LoginPasswordRef
+			} else {
+				oldRef = ident.PassphraseRef
+			}
+
+			target := credential.Target{
+				IdentityID: name,
+				Kind:       kind,
+			}
+
+			svc, err := utils.GetCredentialService(repo, cfg)
+			if err != nil {
+				return fmt.Errorf("initialize credential service: %w", err)
+			}
+
+			if oldRef != nil && !oldRef.IsEmpty() {
+				if _, err := svc.Delete(cmd.Context(), target, string(ref.Version[:]), *oldRef); err != nil {
+					return fmt.Errorf("delete credential for identity %q: %w", name, err)
+				}
+			} else {
+				// 没有持久化引用，但可能存在明文，清空明文
+				updater := repo.AsConfigUpdater()
+				if _, _, err := updater.ApplyCredentialRefAtVersion(cmd.Context(), target, string(ref.Version[:]), nil); err != nil {
+					return fmt.Errorf("clear credential for identity %q: %w", name, err)
+				}
+			}
+
+			logger.PrintSuccessf("Successfully deleted %s credential for identity %q", kindStr, name)
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&kindStr, "kind", "login_password", i18n.T("flag_credential_kind"))
+	return cmd
 }

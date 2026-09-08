@@ -16,9 +16,11 @@ import (
 	"github.com/schollz/progressbar/v3"
 	"github.com/spf13/cobra"
 	cmdutils "github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
+	"github.com/wentf9/xops-cli/pkg/models"
 	"github.com/wentf9/xops-cli/pkg/sftp"
 	"github.com/wentf9/xops-cli/pkg/ssh"
 	pkgutils "github.com/wentf9/xops-cli/pkg/utils"
@@ -54,7 +56,15 @@ func NewCmdScp() *cobra.Command {
 		Short: i18n.T("scp_short"),
 		Long:  i18n.T("scp_long"),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			o.Complete(cmd, args)
+			if cmd.Flags().Changed("password") {
+				cmdutils.WarnFlagDeprecated("password", "--password-stdin or 'xops identity credential set'")
+			}
+			if cmd.Flags().Changed("passphrase") {
+				cmdutils.WarnFlagDeprecated("passphrase", "--passphrase-stdin or 'xops identity credential set'")
+			}
+			if err := o.Complete(cmd, args); err != nil {
+				return err
+			}
 			if err := o.Validate(); err != nil {
 				return err
 			}
@@ -72,7 +82,10 @@ func NewCmdScp() *cobra.Command {
 	// xops-enhanced flags (long-form only, no short flags to avoid OpenSSH conflicts)
 	cmd.Flags().StringVar(&o.Host, "host", "", i18n.T("flag_hosts"))
 	cmd.Flags().StringVar(&o.Password, "password", "", i18n.T("flag_password"))
+	cmd.Flags().BoolVar(&o.PasswordStdin, "password-stdin", false, i18n.T("flag_password_stdin"))
 	cmd.Flags().StringVar(&o.Passphrase, "passphrase", "", i18n.T("flag_passphrase"))
+	cmd.Flags().BoolVar(&o.PassphraseStdin, "passphrase-stdin", false, i18n.T("flag_passphrase_stdin"))
+	cmd.Flags().StringVar(&o.Remember, "remember", cmdutils.RememberPolicyAsk, i18n.T("flag_remember"))
 	cmd.Flags().StringVar(&o.Alias, "alias", "", i18n.T("flag_alias"))
 
 	// scp-specific flags
@@ -88,13 +101,29 @@ func NewCmdScp() *cobra.Command {
 	cmd.Flags().IntVar(&o.ThreadCount, "thread", 4, i18n.T("flag_thread"))
 
 	cmd.MarkFlagsMutuallyExclusive("password", "identity")
+	cmd.MarkFlagsMutuallyExclusive("password", "password-stdin")
+	cmd.MarkFlagsMutuallyExclusive("passphrase", "passphrase-stdin")
 	cmd.MarkFlagsMutuallyExclusive("host", "ifile", "tag")
 	cmd.MarkFlagsMutuallyExclusive("force", "no-clobber")
 	return cmd
 }
 
-func (o *ScpOptions) Complete(_ *cobra.Command, args []string) {
+func (o *ScpOptions) Complete(_ *cobra.Command, args []string) error {
 	o.args = args
+	if o.PasswordStdin {
+		pwd, err := cmdutils.ReadSecretFromStdin()
+		if err != nil {
+			return fmt.Errorf("read password from stdin: %w", err)
+		}
+		o.Password = pwd
+	}
+	if o.PassphraseStdin {
+		pass, err := cmdutils.ReadSecretFromStdin()
+		if err != nil {
+			return fmt.Errorf("read passphrase from stdin: %w", err)
+		}
+		o.Passphrase = pass
+	}
 	if len(args) == 2 {
 		if o.Source == "" {
 			o.Source = args[0]
@@ -107,9 +136,13 @@ func (o *ScpOptions) Complete(_ *cobra.Command, args []string) {
 			o.Source = args[0]
 		}
 	}
+	return nil
 }
 
 func (o *ScpOptions) Validate() error {
+	if err := cmdutils.ValidateRememberPolicy(o.Remember); err != nil {
+		return err
+	}
 	if o.Source == "" {
 		return fmt.Errorf("%s", i18n.T("scp_err_no_src"))
 	}
@@ -245,7 +278,19 @@ func (o *ScpOptions) RunContext(ctx context.Context) (retErr error) {
 	if err != nil {
 		return fmt.Errorf("create configuration repository: %w", err)
 	}
-	connector := newCLIConnector(provider, ssh.WithLogger(logger.DefaultLogger()))
+	var adpOpts []adapter.Option
+	if o.Password != "" || o.Passphrase != "" {
+		shouldRemember := cmdutils.ShouldRememberCredential(o.Remember, o.Host)
+		adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{
+			Password:   o.Password,
+			Passphrase: o.Passphrase,
+			Remember:   shouldRemember,
+		}))
+	}
+	if reg, regErr := cmdutils.GetCredentialRegistry(cfg); regErr == nil && reg != nil {
+		adpOpts = append(adpOpts, adapter.WithCredentialSource(reg))
+	}
+	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
 	defer func() {
 		joinConnectorCloseError(&retErr, connector)
 	}()
@@ -984,11 +1029,19 @@ func (o *ScpOptions) getOrCreateNodeForPath(ctx context.Context, provider config
 		password = o.Password
 	}
 
+	shouldRemember := cmdutils.ShouldRememberCredential(o.Remember, target.Selector)
+	passwordToSave := ""
+	passphraseToSave := ""
+	if shouldRemember {
+		passwordToSave = password
+		passphraseToSave = o.Passphrase
+	}
+
 	res, err := repo.EnsureNodeContext(ctx, config.EnsureNodeOptions{
 		Target:       target,
-		Password:     password,
+		Password:     passwordToSave,
 		IdentityFile: o.IdentityFile,
-		Passphrase:   o.Passphrase,
+		Passphrase:   passphraseToSave,
 		Alias:        o.Alias,
 	})
 	if err != nil {
@@ -999,43 +1052,17 @@ func (o *ScpOptions) getOrCreateNodeForPath(ctx context.Context, provider config
 		return res.NodeID, true, nil
 	}
 
-	updated, updateErr := o.updateNode(ctx, res.NodeID, provider, specificPassword)
+	updated, updateErr := o.updateNode(ctx, res.NodeID, provider, specificPassword, shouldRemember)
 	return res.NodeID, updated, updateErr
 }
 
-func (o *ScpOptions) updateNode(ctx context.Context, nodeID string, provider config.ConfigProvider, specificPassword string) (bool, error) {
+func (o *ScpOptions) updateNode(ctx context.Context, nodeID string, provider config.ConfigProvider, specificPassword string, shouldRemember bool) (bool, error) {
 	node, host, identity, err := provider.Resolve(nodeID)
 	if err != nil {
 		return false, fmt.Errorf("resolve scp node %q for update failed: %w", nodeID, err)
 	}
-	updated := false
 
-	password := specificPassword
-	if password == "" && o.Password != "" {
-		password = o.Password
-	}
-
-	if password != "" {
-		if identity.Password != password || identity.AuthType != "password" {
-			identity.Password = password
-			identity.AuthType = "password"
-			updated = true
-		}
-	} else if o.IdentityFile != "" {
-		absKeyPath := cmdutils.ToAbsolutePath(o.IdentityFile)
-		if identity.KeyPath != absKeyPath || identity.AuthType != "key" {
-			identity.KeyPath = absKeyPath
-			identity.AuthType = "key"
-			updated = true
-		}
-	}
-
-	if o.Passphrase != "" {
-		if identity.Passphrase != o.Passphrase {
-			identity.Passphrase = o.Passphrase
-			updated = true
-		}
-	}
+	updated := o.updateNodeAuth(&identity, specificPassword, shouldRemember)
 
 	if o.JumpHost != "" {
 		jumpHost, jumpErr := provider.ResolveProxyJumpChain(o.JumpHost)
@@ -1055,6 +1082,45 @@ func (o *ScpOptions) updateNode(ctx context.Context, nodeID string, provider con
 	}
 
 	return updated, nil
+}
+
+func (o *ScpOptions) updateNodeAuth(identity *models.Identity, specificPassword string, shouldRemember bool) bool {
+	updated := false
+	password := specificPassword
+	if password == "" && o.Password != "" {
+		password = o.Password
+	}
+
+	if shouldRemember {
+		if password != "" {
+			if identity.Password != password || identity.AuthType != "password" {
+				identity.Password = password
+				identity.AuthType = "password"
+				updated = true
+			}
+		} else if o.IdentityFile != "" {
+			absKeyPath := cmdutils.ToAbsolutePath(o.IdentityFile)
+			if identity.KeyPath != absKeyPath || identity.AuthType != "key" {
+				identity.KeyPath = absKeyPath
+				identity.AuthType = "key"
+				updated = true
+			}
+		}
+
+		if o.Passphrase != "" && identity.Passphrase != o.Passphrase {
+			identity.Passphrase = o.Passphrase
+			updated = true
+		}
+	} else if o.IdentityFile != "" {
+		absKeyPath := cmdutils.ToAbsolutePath(o.IdentityFile)
+		if identity.KeyPath != absKeyPath || identity.AuthType != "key" {
+			identity.KeyPath = absKeyPath
+			identity.AuthType = "key"
+			updated = true
+		}
+	}
+
+	return updated
 }
 
 func (o *ScpOptions) validateRemoteRelayResumePrefix(ctx context.Context, srcFile, dstFile *pkgsftp.File, startOffset int64) error {

@@ -941,3 +941,43 @@ play_err_node_not_found:
   other: "节点 '{{.Node}}' 不存在，请检查节点名称或先通过 xops host 命令添加"
 play_err_some_failed:
   other: "部分主机执行失败，详见上方报告"
+
+# ---- credential ----
+credential_short:
+  other: "安全凭据管理（密钥库与垃圾回收）"
+credential_long:
+  other: "管理已配置的安全凭据存储（Secret Stores）、运行密钥库健康诊断以及执行孤儿凭据垃圾回收。"
+credential_store_short:
+  other: "管理已配置的安全存储库"
+credential_store_list_short:
+  other: "列出所有已配置的安全存储及其状态"
+credential_doctor_short:
+  other: "探测系统密钥库支持与已配置存储的连通性"
+credential_doctor_long:
+  other: "诊断当前操作系统密钥库支持情况（Linux Secret Service / macOS Keychain / Windows Credential Manager / pass），并验证配置文件中所有已配置 Store 的连通性与健康状态。"
+credential_doctor_healthy:
+  other: "所有已配置凭据存储均健康且可用！"
+credential_gc_short:
+  other: "回收未被任何节点引用的孤儿凭据与清理残留 Journal"
+credential_gc_long:
+  other: "安全扫描凭据持久化日志与未引用的孤儿凭据，执行安全垃圾回收。默认具备 24 小时宽限期防护。"
+credential_gc_no_pending:
+  other: "没有发现需要回收的孤儿凭据或待清理 Journal"
+credential_gc_completed:
+  other: "凭据垃圾回收完成，成功回收 %d 条记录"
+identity_credential_short:
+  other: "管理指定身份的持久化机密（支持安全外部密钥库）"
+identity_credential_set_short:
+  other: "为指定身份设置持久化机密（写入安全密钥库）"
+identity_credential_delete_short:
+  other: "删除指定身份的持久化机密引用"
+flag_credential_kind:
+  other: "凭据机密类型 (login_password, passphrase)"
+flag_credential_store:
+  other: "目标凭据存储 ID（留空使用默认 Store）"
+flag_password_stdin:
+  other: "从标准输入 (stdin) 安全读取密码，避免在进程参数中暴露明文"
+flag_passphrase_stdin:
+  other: "从标准输入 (stdin) 安全读取私钥密码，避免在进程参数中暴露明文"
+flag_remember:
+  other: "凭据记住策略: ask (默认询问), always (持久化保存), never (仅会话内存)"

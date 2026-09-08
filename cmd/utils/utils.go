@@ -256,6 +256,9 @@ func GetCurrentUser() (string, error) {
 
 // GetConfigFilePath 获取默认配置与密钥路径
 func GetConfigFilePath() (configPath, keyPath string, err error) {
+	if cfgDir := os.Getenv("XOPS_CONFIG_DIR"); cfgDir != "" {
+		return filepath.Join(cfgDir, ConfigFileName), filepath.Join(cfgDir, ConfigKeyName), nil
+	}
 	currUser, err := user.Current()
 	if err != nil {
 		return "", "", fmt.Errorf("get current user failed: %w", err)
@@ -265,6 +268,9 @@ func GetConfigFilePath() (configPath, keyPath string, err error) {
 
 // GetPasswordFilePath 获取默认密码本文件路径
 func GetPasswordFilePath() (string, error) {
+	if cfgDir := os.Getenv("XOPS_CONFIG_DIR"); cfgDir != "" {
+		return filepath.Join(cfgDir, PasswordFileName), nil
+	}
 	currUser, err := user.Current()
 	if err != nil {
 		return "", fmt.Errorf("get current user failed: %w", err)

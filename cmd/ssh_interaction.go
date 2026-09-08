@@ -40,8 +40,12 @@ func newCLIInteractionHandlerWithStreams(stdin io.Reader, stdout io.Writer) *cli
 }
 
 func newCLIConnector(provider config.ConfigProvider, opts ...ssh.Option) *ssh.Connector {
+	return newCLIConnectorWithAdapterOptions(provider, nil, opts...)
+}
+
+func newCLIConnectorWithAdapterOptions(provider config.ConfigProvider, adpOpts []adapter.Option, opts ...ssh.Option) *ssh.Connector {
 	opts = append([]ssh.Option{ssh.WithInteractionHandler(newCLIInteractionHandler())}, opts...)
-	return adapter.NewConnector(provider, opts...)
+	return adapter.NewConnectorWithAdapterOptions(provider, adpOpts, opts...)
 }
 
 func (h *cliInteractionHandler) acquireGate(ctx context.Context) (func(), error) {

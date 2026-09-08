@@ -13,6 +13,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
@@ -62,6 +63,15 @@ func NewCmdExec() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			o.stdout = cmd.OutOrStdout()
 			o.stderr = cmd.ErrOrStderr()
+			if cmd.Flags().Changed("password") {
+				utils.WarnFlagDeprecated("password", "--password-stdin or 'xops identity credential set'")
+			}
+			if cmd.Flags().Changed("passphrase") {
+				utils.WarnFlagDeprecated("passphrase", "--passphrase-stdin or 'xops identity credential set'")
+			}
+			if cmd.Flags().Changed("suPwd") {
+				utils.WarnFlagDeprecated("suPwd", "'xops identity credential set' or secure stores")
+			}
 			if err := o.Complete(cmd, args); err != nil {
 				return err
 			}
@@ -81,7 +91,10 @@ func NewCmdExec() *cobra.Command {
 	// xops-enhanced flags (long-form only, no short flags to avoid OpenSSH conflicts)
 	cmd.Flags().StringVar(&o.Host, "host", "", i18n.T("flag_hosts"))
 	cmd.Flags().StringVar(&o.Password, "password", "", i18n.T("flag_password"))
+	cmd.Flags().BoolVar(&o.PasswordStdin, "password-stdin", false, i18n.T("flag_password_stdin"))
 	cmd.Flags().StringVar(&o.Passphrase, "passphrase", "", i18n.T("flag_passphrase"))
+	cmd.Flags().BoolVar(&o.PassphraseStdin, "passphrase-stdin", false, i18n.T("flag_passphrase_stdin"))
+	cmd.Flags().StringVar(&o.Remember, "remember", utils.RememberPolicyAsk, i18n.T("flag_remember"))
 	cmd.Flags().StringVar(&o.Alias, "alias", "", i18n.T("flag_alias"))
 	cmd.Flags().BoolVar(&o.Sudo, "sudo", false, i18n.T("flag_exec_sudo"))
 	cmd.Flags().StringVar(&o.SuPwd, "suPwd", "", i18n.T("flag_exec_su_pwd"))
@@ -99,6 +112,8 @@ func NewCmdExec() *cobra.Command {
 	cmd.Flags().StringVar(&o.OutDir, "out-dir", "", i18n.T("flag_exec_out_dir"))
 
 	cmd.MarkFlagsMutuallyExclusive("password", "identity")
+	cmd.MarkFlagsMutuallyExclusive("password", "password-stdin")
+	cmd.MarkFlagsMutuallyExclusive("passphrase", "passphrase-stdin")
 	cmd.MarkFlagsMutuallyExclusive("host", "ifile", "tag")
 	cmd.MarkFlagsMutuallyExclusive("cmd", "shell")
 	cmd.MarkFlagsMutuallyExclusive("stream", "out-dir")
@@ -173,6 +188,20 @@ func (o *ExecOptions) extractHostFromArgs(args []string) error {
 
 func (o *ExecOptions) Complete(cmd *cobra.Command, args []string) error {
 	o.args = args
+	if o.PasswordStdin {
+		pwd, err := utils.ReadSecretFromStdin()
+		if err != nil {
+			return fmt.Errorf("read password from stdin: %w", err)
+		}
+		o.Password = pwd
+	}
+	if o.PassphraseStdin {
+		pass, err := utils.ReadSecretFromStdin()
+		if err != nil {
+			return fmt.Errorf("read passphrase from stdin: %w", err)
+		}
+		o.Passphrase = pass
+	}
 	if len(args) == 0 {
 		o.readStdinIfRequired()
 		return nil
@@ -204,6 +233,9 @@ func (o *ExecOptions) readStdinIfRequired() {
 }
 
 func (o *ExecOptions) Validate() error {
+	if err := utils.ValidateRememberPolicy(o.Remember); err != nil {
+		return err
+	}
 	if o.Command == "" && o.ShellFile == "" {
 		return fmt.Errorf("%s", i18n.T("exec_err_no_cmd"))
 	}
@@ -257,11 +289,6 @@ func (o *ExecOptions) RunContext(ctx context.Context) (retErr error) {
 			retErr = errors.Join(retErr, cleanupErr)
 		}
 	}()
-	connector := newCLIConnector(provider, ssh.WithLogger(logger.DefaultLogger()))
-	defer func() {
-		joinConnectorCloseError(&retErr, connector)
-	}()
-
 	// 准备执行内容
 	var execCmd string
 	var isScript bool
@@ -294,6 +321,12 @@ func (o *ExecOptions) RunContext(ctx context.Context) (retErr error) {
 	if errTask != nil {
 		return errTask
 	}
+
+	adpOpts := o.buildAdapterOptions(tasks, cfg)
+	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
+	defer func() {
+		joinConnectorCloseError(&retErr, connector)
+	}()
 
 	// 应用 --exclude 排除规则
 	if len(o.Exclude) > 0 {
@@ -382,6 +415,25 @@ func (o *ExecOptions) runInteractive(
 	return execErr
 }
 
+func (o *ExecOptions) buildAdapterOptions(tasks []execHostTask, cfg *config.Configuration) []adapter.Option {
+	var adpOpts []adapter.Option
+	if o.Password != "" || o.Passphrase != "" || o.SuPwd != "" {
+		for _, task := range tasks {
+			shouldRemember := utils.ShouldRememberCredential(o.Remember, task.host)
+			adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(task.nodeID, adapter.SessionAuth{
+				Password:   o.Password,
+				Passphrase: o.Passphrase,
+				SuPwd:      o.SuPwd,
+				Remember:   shouldRemember,
+			}))
+		}
+	}
+	if reg, regErr := utils.GetCredentialRegistry(cfg); regErr == nil && reg != nil {
+		adpOpts = append(adpOpts, adapter.WithCredentialSource(reg))
+	}
+	return adpOpts
+}
+
 func (o *ExecOptions) getOrCreateNode(ctx context.Context, repository *config.Repository, target config.ConnectionTarget, addr utils.HostInfo) (string, bool, error) {
 	password := addr.Password
 	if password == "" && o.Password != "" {
@@ -406,14 +458,24 @@ func (o *ExecOptions) getOrCreateNode(ctx context.Context, repository *config.Re
 	}
 	suPwd := o.SuPwd
 
+	shouldRemember := utils.ShouldRememberCredential(o.Remember, target.Selector)
+	passwordToSave := ""
+	passphraseToSave := ""
+	suPwdToSave := ""
+	if shouldRemember {
+		passwordToSave = password
+		passphraseToSave = passphrase
+		suPwdToSave = suPwd
+	}
+
 	res, err := repository.EnsureNodeContext(ctx, config.EnsureNodeOptions{
 		Target:       target,
-		Password:     password,
+		Password:     passwordToSave,
 		IdentityFile: identityFile,
-		Passphrase:   passphrase,
+		Passphrase:   passphraseToSave,
 		Alias:        alias,
 		SudoMode:     sudoMode,
-		SuPwd:        suPwd,
+		SuPwd:        suPwdToSave,
 	})
 	if err != nil {
 		return "", false, err
@@ -696,10 +758,12 @@ func (o *ExecOptions) updateNodeFromHostInfo(ctx context.Context, nodeID string,
 		return false, fmt.Errorf("resolve exec node %q for update failed: %w", nodeID, err)
 	}
 	updated := false
-
-	updated = o.updateIdentity(&identity, addr) || updated
+	shouldRemember := utils.ShouldRememberCredential(o.Remember, addr.Host)
+	if shouldRemember {
+		updated = o.updateIdentity(&identity, addr) || updated
+		updated = o.updateNodeSudo(&node) || updated
+	}
 	updated = o.updateNodeAlias(nodeID, &node, addr.Alias, repository) || updated
-	updated = o.updateNodeSudo(&node) || updated
 
 	if o.JumpHost != "" {
 		jumpHost, jumpErr := repository.ResolveProxyJumpChain(o.JumpHost)

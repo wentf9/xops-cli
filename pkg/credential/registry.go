@@ -1,6 +1,7 @@
 package credential
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"sync"
@@ -107,4 +108,16 @@ func (r *Registry) List() []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// Resolve 根据 Ref 中的 StoreID 查找对应的凭据源并读取凭据
+func (r *Registry) Resolve(ctx context.Context, ref Ref) (Secret, error) {
+	if err := ref.Validate(); err != nil {
+		return Secret{}, err
+	}
+	source, err := r.Get(ref.StoreID)
+	if err != nil {
+		return Secret{}, err
+	}
+	return source.Get(ctx, ref)
 }

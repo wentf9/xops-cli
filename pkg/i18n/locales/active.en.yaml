@@ -940,3 +940,43 @@ play_err_node_not_found:
   other: "Node '{{.Node}}' not found, check the node name or add it via 'xops host'"
 play_err_some_failed:
   other: "Some hosts failed, see report above"
+
+# ---- credential ----
+credential_short:
+  other: "Manage secure credentials (secret stores and garbage collection)"
+credential_long:
+  other: "Manage configured secure credential stores, run diagnostic health checks, and perform orphaned credential garbage collection."
+credential_store_short:
+  other: "Manage configured secure secret stores"
+credential_store_list_short:
+  other: "List all configured secret stores and their status"
+credential_doctor_short:
+  other: "Probe system keystore capabilities and test configured stores"
+credential_doctor_long:
+  other: "Probe current OS keystore support (Linux Secret Service / macOS Keychain / Windows Credential Manager / pass) and verify the connectivity and health of all configured Stores."
+credential_doctor_healthy:
+  other: "All configured credential stores are healthy and accessible!"
+credential_gc_short:
+  other: "Garbage collect unreferenced orphan credentials and pending journals"
+credential_gc_long:
+  other: "Safely scan credential journals and unreferenced orphan credentials to perform garbage collection. Protected by a 24-hour grace period."
+credential_gc_no_pending:
+  other: "No pending journals or unreferenced orphan credentials found"
+credential_gc_completed:
+  other: "Credential garbage collection completed, successfully reclaimed %d items"
+identity_credential_short:
+  other: "Manage persistent credentials for an identity in secure keystores"
+identity_credential_set_short:
+  other: "Set persistent credential for an identity in a secure store"
+identity_credential_delete_short:
+  other: "Delete persistent credential reference for an identity"
+flag_credential_kind:
+  other: "Credential secret kind (login_password, passphrase)"
+flag_credential_store:
+  other: "Target credential store ID (leave empty for default store)"
+flag_password_stdin:
+  other: "Read password securely from stdin to avoid exposure in command arguments"
+flag_passphrase_stdin:
+  other: "Read passphrase securely from stdin to avoid exposure in command arguments"
+flag_remember:
+  other: "Credential persistence policy: ask (prompt), always (persist), never (session-only)"

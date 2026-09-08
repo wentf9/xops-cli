@@ -14,6 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
@@ -22,23 +23,26 @@ import (
 )
 
 type SshOptions struct {
-	Host           string
-	Port           uint16
-	User           string
-	Password       string
-	IdentityFile   string
-	Passphrase     string
-	Sudo           bool
-	Alias          string
-	JumpHost       string
-	Tags           []string
-	LocalForwards  []string
-	RemoteForwards []string
-	NoCmd          bool
-	DynamicForward string
-	BgRun          bool
-	StdinRedirect  bool
-	args           []string
+	Host            string
+	Port            uint16
+	User            string
+	Password        string
+	PasswordStdin   bool
+	IdentityFile    string
+	Passphrase      string
+	PassphraseStdin bool
+	Remember        string
+	Sudo            bool
+	Alias           string
+	JumpHost        string
+	Tags            []string
+	LocalForwards   []string
+	RemoteForwards  []string
+	NoCmd           bool
+	DynamicForward  string
+	BgRun           bool
+	StdinRedirect   bool
+	args            []string
 
 	Target config.ConnectionTarget
 
@@ -59,7 +63,15 @@ func NewCmdSsh() *cobra.Command {
 		Short: i18n.T("ssh_short"),
 		Long:  i18n.T("ssh_long"),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			o.Complete(cmd, args)
+			if cmd.Flags().Changed("password") {
+				utils.WarnFlagDeprecated("password", "--password-stdin or 'xops identity credential set'")
+			}
+			if cmd.Flags().Changed("passphrase") {
+				utils.WarnFlagDeprecated("passphrase", "--passphrase-stdin or 'xops identity credential set'")
+			}
+			if err := o.Complete(cmd, args); err != nil {
+				return err
+			}
 			if err := o.Validate(); err != nil {
 				return err
 			}
@@ -81,23 +93,43 @@ func NewCmdSsh() *cobra.Command {
 	// xops-enhanced flags (long-form only, no short flags to avoid OpenSSH conflicts)
 	cmd.Flags().StringVar(&o.Host, "host", "", i18n.T("flag_host"))
 	cmd.Flags().StringVar(&o.Password, "password", "", i18n.T("flag_password"))
+	cmd.Flags().BoolVar(&o.PasswordStdin, "password-stdin", false, i18n.T("flag_password_stdin"))
 	cmd.Flags().StringVar(&o.Passphrase, "passphrase", "", i18n.T("flag_passphrase"))
+	cmd.Flags().BoolVar(&o.PassphraseStdin, "passphrase-stdin", false, i18n.T("flag_passphrase_stdin"))
+	cmd.Flags().StringVar(&o.Remember, "remember", utils.RememberPolicyAsk, i18n.T("flag_remember"))
 	cmd.Flags().BoolVar(&o.Sudo, "sudo", false, i18n.T("flag_sudo"))
 	cmd.Flags().StringVar(&o.Alias, "alias", "", i18n.T("flag_alias"))
 	cmd.Flags().StringSliceVar(&o.Tags, "tag", []string{}, i18n.T("flag_tag"))
 
 	cmd.MarkFlagsMutuallyExclusive("password", "identity")
+	cmd.MarkFlagsMutuallyExclusive("password", "password-stdin")
+	cmd.MarkFlagsMutuallyExclusive("passphrase", "passphrase-stdin")
 	return cmd
 }
 
-func (o *SshOptions) Complete(cmd *cobra.Command, args []string) {
+func (o *SshOptions) Complete(cmd *cobra.Command, args []string) error {
 	o.args = args
+	if o.PasswordStdin {
+		pwd, err := utils.ReadSecretFromStdin()
+		if err != nil {
+			return fmt.Errorf("read password from stdin: %w", err)
+		}
+		o.Password = pwd
+	}
+	if o.PassphraseStdin {
+		pass, err := utils.ReadSecretFromStdin()
+		if err != nil {
+			return fmt.Errorf("read passphrase from stdin: %w", err)
+		}
+		o.Passphrase = pass
+	}
 	if !o.StdinRedirect {
 		stat, err := os.Stdin.Stat()
 		if err == nil && (stat.Mode()&os.ModeCharDevice) == 0 {
 			o.stdinScript = true
 		}
 	}
+	return nil
 }
 
 func (o *SshOptions) parseArgs() error {
@@ -153,6 +185,9 @@ func (o *SshOptions) parseArgs() error {
 }
 
 func (o *SshOptions) Validate() error {
+	if err := utils.ValidateRememberPolicy(o.Remember); err != nil {
+		return err
+	}
 	if err := o.parseArgs(); err != nil {
 		return err
 	}
@@ -219,7 +254,8 @@ func (o *SshOptions) runParentDaemon(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	connector := newCLIConnector(provider, ssh.WithLogger(logger.DefaultLogger()))
+	adpOpts := o.buildAdapterOptions(nodeID, cfg)
+	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
 	defer func() {
 		joinConnectorCloseError(&err, connector)
 	}()
@@ -285,6 +321,22 @@ func (o *SshOptions) runParentDaemon(ctx context.Context) (err error) {
 	return nil
 }
 
+func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuration) []adapter.Option {
+	var adpOpts []adapter.Option
+	shouldRemember := utils.ShouldRememberCredential(o.Remember, o.Target.Selector)
+	if o.Password != "" || o.Passphrase != "" {
+		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, adapter.SessionAuth{
+			Password:   o.Password,
+			Passphrase: o.Passphrase,
+			Remember:   shouldRemember,
+		}))
+	}
+	if reg, regErr := utils.GetCredentialRegistry(cfg); regErr == nil && reg != nil {
+		adpOpts = append(adpOpts, adapter.WithCredentialSource(reg))
+	}
+	return adpOpts
+}
+
 func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error) {
 	configPath, keyPath, pathErr := utils.GetConfigFilePath()
 	if pathErr != nil {
@@ -305,7 +357,8 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 	if err != nil {
 		return err
 	}
-	connector := newCLIConnector(provider, ssh.WithLogger(logger.DefaultLogger()))
+	adpOpts := o.buildAdapterOptions(nodeID, cfg)
+	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
 	defer func() {
 		joinConnectorCloseError(&err, connector)
 	}()
@@ -418,12 +471,20 @@ func (o *SshOptions) resolveNode(ctx context.Context, provider *config.Repositor
 		}
 	}
 
+	shouldRemember := utils.ShouldRememberCredential(o.Remember, o.Target.Selector)
+	passwordToSave := ""
+	passphraseToSave := ""
+	if shouldRemember {
+		passwordToSave = o.Password
+		passphraseToSave = o.Passphrase
+	}
+
 	res, err := provider.EnsureNodeContext(ctx, config.EnsureNodeOptions{
 		Target:       o.Target,
 		DefaultUser:  defaultUser,
-		Password:     o.Password,
+		Password:     passwordToSave,
 		IdentityFile: o.IdentityFile,
-		Passphrase:   o.Passphrase,
+		Passphrase:   passphraseToSave,
 		Alias:        o.Alias,
 		Tags:         o.Tags,
 	})
@@ -433,7 +494,7 @@ func (o *SshOptions) resolveNode(ctx context.Context, provider *config.Repositor
 	if res.Created {
 		return res.NodeID, true, nil
 	}
-	updated, err := update(ctx, res.NodeID, o, provider)
+	updated, err := update(ctx, res.NodeID, o, provider, shouldRemember)
 	return res.NodeID, updated, err
 }
 
@@ -602,7 +663,7 @@ func updateIdentityFields(identity *models.Identity, o *SshOptions) bool {
 	return identityUpdated
 }
 
-func update(ctx context.Context, nodeID string, o *SshOptions, provider *config.Repository) (bool, error) {
+func update(ctx context.Context, nodeID string, o *SshOptions, provider *config.Repository, shouldRemember bool) (bool, error) {
 	if o.Password == "" && o.IdentityFile == "" && o.JumpHost == "" && !o.Sudo && o.Alias == "" && len(o.Tags) == 0 {
 		return false, nil
 	}
@@ -619,7 +680,10 @@ func update(ctx context.Context, nodeID string, o *SshOptions, provider *config.
 	if err != nil {
 		return false, err
 	}
-	identityUpdated := updateIdentityFields(&identity, o)
+	identityUpdated := false
+	if shouldRemember {
+		identityUpdated = updateIdentityFields(&identity, o)
+	}
 
 	if nodeUpdated || identityUpdated {
 		if err := provider.ReplaceNodeAtRefContext(ctx, ref, nodeID, node, host, identity); err != nil {

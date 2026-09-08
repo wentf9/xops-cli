@@ -113,6 +113,7 @@ func registerCommands(rootCmd *cobra.Command) {
 	rootCmd.AddCommand(NewCmdExec())
 	rootCmd.AddCommand(NewCmdPlay())
 	rootCmd.AddCommand(NewCmdIdentity())
+	rootCmd.AddCommand(NewCmdCredential())
 	rootCmd.AddCommand(newCmdNc())
 	rootCmd.AddCommand(newCmdDns())
 	rootCmd.AddCommand(newCmdPing())
