@@ -1190,3 +1190,123 @@ func TestService_FaultInjection_Recover_CommittedStage_UncertainRetainsJournal(t
 		t.Fatalf("old credential should be deleted after unreferenced")
 	}
 }
+
+func TestService_Recover_CleanupStage_AllowsConfigurationEvolution(t *testing.T) {
+	svc, store, cfg, journal, _ := setupTestService(t)
+	ctx := context.Background()
+
+	refA := Ref{StoreID: "test-store", ItemID: "ref-A"}
+	refB := Ref{StoreID: "test-store", ItemID: "ref-B"}
+	refC := Ref{StoreID: "test-store", ItemID: "ref-C"}
+
+	_ = store.Put(ctx, refA, Secret{Value: []byte("val-A")})
+	_ = store.Put(ctx, refB, Secret{Value: []byte("val-B")})
+	_ = store.Put(ctx, refC, Secret{Value: []byte("val-C")})
+
+	// 1. A -> B 轮换成功，但在清理 A 时失败，留下清理 A 的 cleanup journal（Target 关联 node-1，NewRef 为 refB）
+	entryA := &JournalEntry{
+		ID:         GenerateJournalID(),
+		Op:         OpRotate,
+		Stage:      StageCleanup,
+		TargetNode: "node-1",
+		TargetKind: KindLoginPassword,
+		NewRef:     &refB,
+		OldRef:     &refA,
+		CreatedAt:  time.Now(),
+		UpdatedAt:  time.Now(),
+	}
+	if err := journal.RecordIntent(entryA); err != nil {
+		t.Fatalf("RecordIntent failed: %v", err)
+	}
+	if err := journal.MarkCleanup(entryA.ID); err != nil {
+		t.Fatalf("MarkCleanup failed: %v", err)
+	}
+
+	// 2. 随后目标继续演进：B -> C 再次轮换并持久化成功（当前配置中活跃引用为 refC，refA 和 refB 均无引用）
+	cfg.activeRefs[refA] = false
+	cfg.activeRefs[refB] = false
+	cfg.activeRefs[refC] = true
+
+	// 3. GC 检查第一条 journal：即使当前引用已演进为 refC 而非 refB，
+	// 只要当前权威配置中旧引用 refA 已持久化解除，必须顺利完成清理！
+	results, err := svc.Recover(ctx)
+	if err != nil {
+		t.Fatalf("Recover failed: %v", err)
+	}
+	if len(results) != 1 || results[0].Action != RecoveryActionCommittedCleaned {
+		t.Fatalf("expected RecoveryActionCommittedCleaned, got %+v", results)
+	}
+
+	// 验证旧凭据 refA 已被删除
+	store.mu.Lock()
+	_, existsA := store.data[refA.ItemID]
+	_, existsB := store.data[refB.ItemID]
+	_, existsC := store.data[refC.ItemID]
+	store.mu.Unlock()
+	if existsA {
+		t.Fatalf("refA must be deleted during GC even if config evolved to refC")
+	}
+	if !existsB || !existsC {
+		t.Fatalf("refB and refC must remain intact")
+	}
+
+	// 验证 journal 已移除
+	entries, _ := journal.ListPending()
+	if len(entries) != 0 {
+		t.Fatalf("cleanup journal should be removed, got %d entries", len(entries))
+	}
+}
+
+func TestService_Recover_CleanupStage_AllowsTargetDeletion(t *testing.T) {
+	svc, store, cfg, journal, _ := setupTestService(t)
+	ctx := context.Background()
+
+	refOld := Ref{StoreID: "test-store", ItemID: "ref-target-deleted"}
+	refNew := Ref{StoreID: "test-store", ItemID: "ref-new-temp"}
+	_ = store.Put(ctx, refOld, Secret{Value: []byte("val-old")})
+	_ = store.Put(ctx, refNew, Secret{Value: []byte("val-new")})
+
+	// 1. 存在一条待清理 refOld 的 journal
+	entry := &JournalEntry{
+		ID:         GenerateJournalID(),
+		Op:         OpRotate,
+		Stage:      StageCleanup,
+		TargetNode: "node-to-delete",
+		TargetKind: KindLoginPassword,
+		NewRef:     &refNew,
+		OldRef:     &refOld,
+		CreatedAt:  time.Now(),
+		UpdatedAt:  time.Now(),
+	}
+	if err := journal.RecordIntent(entry); err != nil {
+		t.Fatalf("RecordIntent failed: %v", err)
+	}
+	if err := journal.MarkCleanup(entry.ID); err != nil {
+		t.Fatalf("MarkCleanup failed: %v", err)
+	}
+
+	// 2. 模拟目标节点被彻底删除，配置中既无 refOld 也无 refNew
+	cfg.activeRefs[refOld] = false
+	cfg.activeRefs[refNew] = false
+
+	// 3. GC 执行：旧引用 refOld 已完全解绑，顺利完成清理并删除 journal
+	results, err := svc.Recover(ctx)
+	if err != nil {
+		t.Fatalf("Recover failed: %v", err)
+	}
+	if len(results) != 1 || results[0].Action != RecoveryActionCommittedCleaned {
+		t.Fatalf("expected RecoveryActionCommittedCleaned, got %+v", results)
+	}
+
+	store.mu.Lock()
+	_, existsOld := store.data[refOld.ItemID]
+	store.mu.Unlock()
+	if existsOld {
+		t.Fatalf("refOld must be deleted during GC after target was deleted")
+	}
+
+	entries, _ := journal.ListPending()
+	if len(entries) != 0 {
+		t.Fatalf("journal should be removed after cleanup, got %d entries", len(entries))
+	}
+}

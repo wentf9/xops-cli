@@ -614,29 +614,9 @@ func (s *Service) recoverCommittedOrCleanupStage(ctx context.Context, entry *Jou
 		return
 	}
 
-	// 1. 若当前日志记录包含明确的目标配置项（Target），先确认该 Target 的配置耐久性
-	target := entry.Target()
-	if target.NodeID != "" || target.IdentityID != "" {
-		var expectedRef *Ref
-		if entry.Op == OpRotate || entry.Op == OpCreate {
-			expectedRef = entry.NewRef
-		}
-		durable, confErr := s.config.ConfirmRefDurable(ctx, target, expectedRef)
-		if confErr != nil {
-			_ = s.journal.MarkCleanup(entry.ID)
-			res.Action = RecoveryActionScheduledForGC
-			res.Err = fmt.Errorf("confirm durability for target %s before cleanup: %w", target.TargetIdentifier(), confErr)
-			return
-		}
-		if !durable {
-			_ = s.journal.MarkCleanup(entry.ID)
-			res.Action = RecoveryActionScheduledForGC
-			res.Err = fmt.Errorf("target %s mutation is not durable before cleanup", target.TargetIdentifier())
-			return
-		}
-	}
-
-	// 2. 检查旧凭据是否已在跨进程存储层完全解绑且持久化（Durable）
+	// 检查旧凭据是否已在跨进程存储层完全解绑且持久化（Durable）
+	// 注意：对 committed/cleanup 阶段，配置可能已经继续演进（例如再次轮换为新凭据或目标被删除），
+	// 应以当前权威配置中旧引用已持久化解除作为清理依据，而不是要求历史 NewRef 仍为当前值。
 	unref, err := s.config.CheckRefUnreferenced(ctx, *entry.OldRef)
 	if err != nil {
 		_ = s.journal.MarkCleanup(entry.ID)

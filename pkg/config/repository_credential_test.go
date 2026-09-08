@@ -948,3 +948,94 @@ func TestCrossRepository_UndurableUnbind_PreservesCredentialAndJournalDuringGC(t
 
 	assertGCCleansUpAfterDurabilityConfirmed(t, ctx, svcA, oldRef, credStore, journalStore)
 }
+
+func TestCrossRepository_CleanupStage_AllowsConfigurationEvolution(t *testing.T) {
+	ctx := context.Background()
+	sharedStore := &memoryPersistStore{cfg: cloneConfiguration(nil)}
+	repo, err := NewRepositoryWithoutOpenSSH(newTestProvider().Snapshot(), sharedStore)
+	if err != nil {
+		t.Fatalf("NewRepositoryWithoutOpenSSH failed: %v", err)
+	}
+
+	refA := credential.Ref{StoreID: "mock-store", ItemID: "cred-A"}
+	refB := credential.Ref{StoreID: "mock-store", ItemID: "cred-B"}
+	refC := credential.Ref{StoreID: "mock-store", ItemID: "cred-C"}
+
+	// 1. 初始化 node-1 引用 refA
+	identity := models.Identity{User: "u1", LoginPasswordRef: &refA}
+	if err := createIdentity(repo, "id-1", identity); err != nil {
+		t.Fatalf("create identity failed: %v", err)
+	}
+	if err := createNode(repo, "node-1", models.Node{IdentityRef: "id-1", HostRef: "h1"}, models.Host{Address: "1.1.1.1", Port: 22}, identity); err != nil {
+		t.Fatalf("create node failed: %v", err)
+	}
+
+	// 2. 轮换 node-1 为 refB，持久化成功
+	target := credential.Target{NodeID: "node-1", Kind: credential.KindLoginPassword}
+	outcome, _, err := repo.AsConfigUpdater().ApplyCredentialRefAtVersion(ctx, target, "", &refB)
+	if err != nil || !outcome.Durable {
+		t.Fatalf("ApplyCredentialRefAtVersion to refB failed: %v", err)
+	}
+
+	// 3. 设置凭据服务，模拟删除 refA 失败留下一条 cleanup journal
+	credStore := &inMemoryCredStore{data: map[string][]byte{
+		refA.ItemID: []byte("val-A"),
+		refB.ItemID: []byte("val-B"),
+		refC.ItemID: []byte("val-C"),
+	}}
+	reg := credential.NewRegistry()
+	if err := reg.Register("mock-store", credStore); err != nil {
+		t.Fatalf("reg.Register failed: %v", err)
+	}
+	journalStore, err := credential.NewJournalStore(filepath.Join(t.TempDir(), "journals"))
+	if err != nil {
+		t.Fatalf("NewJournalStore failed: %v", err)
+	}
+
+	entryA := &credential.JournalEntry{
+		ID:         credential.GenerateJournalID(),
+		Op:         credential.OpRotate,
+		Stage:      credential.StageCleanup,
+		TargetNode: "node-1",
+		TargetKind: credential.KindLoginPassword,
+		NewRef:     &refB,
+		OldRef:     &refA,
+		CreatedAt:  time.Now(),
+		UpdatedAt:  time.Now(),
+	}
+	_ = journalStore.RecordIntent(entryA)
+	_ = journalStore.MarkCleanup(entryA.ID)
+
+	svc, err := credential.NewService(reg, journalStore, repo.AsConfigUpdater(), nil)
+	if err != nil {
+		t.Fatalf("NewService failed: %v", err)
+	}
+
+	// 4. 再次轮换 node-1 为 refC（配置演进，权威配置中当前引用为 refC）
+	outcomeC, _, err := repo.AsConfigUpdater().ApplyCredentialRefAtVersion(ctx, target, "", &refC)
+	if err != nil || !outcomeC.Durable {
+		t.Fatalf("ApplyCredentialRefAtVersion to refC failed: %v", err)
+	}
+
+	// 5. GC 执行：即使当前目标引用已演进为 refC 而非 refB，
+	// 只要权威配置中旧引用 refA 已持久化解除，GC 必须顺利清理 refA！
+	res, err := svc.Recover(ctx)
+	if err != nil {
+		t.Fatalf("svc.Recover failed: %v", err)
+	}
+	if len(res) != 1 || res[0].Action != credential.RecoveryActionCommittedCleaned {
+		t.Fatalf("expected RecoveryActionCommittedCleaned, got %+v", res)
+	}
+
+	credStore.mu.Lock()
+	_, existsA := credStore.data[refA.ItemID]
+	credStore.mu.Unlock()
+	if existsA {
+		t.Fatalf("refA must be deleted during GC after config evolved to refC")
+	}
+
+	entries, _ := journalStore.ListPending()
+	if len(entries) != 0 {
+		t.Fatalf("cleanup journal should be removed, got %d", len(entries))
+	}
+}
