@@ -2,7 +2,9 @@ package config
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
 	"time"
@@ -321,6 +323,11 @@ func UnmarshalV2(data []byte) (*ConfigurationV2, error) {
 	decoder.KnownFields(true)
 	if err := decoder.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("%w: decode yaml: %w", ErrSchemaValidation, err)
+	}
+
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("%w: trailing YAML documents", ErrSchemaValidation)
 	}
 
 	if err := ValidateV2(&cfg); err != nil {

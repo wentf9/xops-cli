@@ -34,6 +34,8 @@ func NewCmdCredential() *cobra.Command {
 	cmd.AddCommand(newCmdCredentialStore())
 	cmd.AddCommand(newCmdCredentialDoctor())
 	cmd.AddCommand(newCmdCredentialGC())
+	cmd.AddCommand(newCmdCredentialMigrate())
+	cmd.AddCommand(newCmdCredentialFinalizeMigration())
 
 	return cmd
 }

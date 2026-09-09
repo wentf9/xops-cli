@@ -364,6 +364,11 @@ func newCmdIdentityCredentialSet() *cobra.Command {
 				IdentityID: name,
 				Kind:       kind,
 			}
+			target.KeyPath = ident.KeyPath
+			target, err = config.BindPrivateKeyFingerprint(cfg, target, []byte(secretStr))
+			if err != nil {
+				return err
+			}
 			newRef, _, err := svc.Rotate(
 				cmd.Context(),
 				target,

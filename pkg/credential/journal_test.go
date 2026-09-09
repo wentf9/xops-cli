@@ -349,3 +349,21 @@ func TestJournalDirectorySyncFailure(t *testing.T) {
 		t.Fatalf("Remove failed: %v", err)
 	}
 }
+
+func TestJournalPreservesKeyFingerprint(t *testing.T) {
+	store, err := NewJournalStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := &JournalEntry{ID: GenerateJournalID(), Op: OpCreate, Stage: StageIntent, TargetIdentity: "identity", TargetKind: KindPassphrase, KeyPath: "/key", KeyFingerprint: "SHA256:public-fingerprint", NewRef: &Ref{StoreID: "store", ItemID: "item"}}
+	if err := store.RecordIntent(entry); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := store.ListPending()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Target().KeyFingerprint != entry.KeyFingerprint {
+		t.Fatal("recovery lost key fingerprint")
+	}
+}

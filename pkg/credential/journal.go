@@ -53,6 +53,7 @@ type JournalEntry struct {
 	TargetIdentity           string        `json:"targetIdentity,omitempty"`
 	TargetKind               Kind          `json:"targetKind,omitempty"`
 	KeyPath                  string        `json:"keyPath,omitempty"`
+	KeyFingerprint           string        `json:"keyFingerprint,omitempty"`
 	AuthType                 string        `json:"authType,omitempty"`
 	ClearKeyPath             bool          `json:"clearKeyPath,omitempty"`
 	ClearLegacyLoginPassword bool          `json:"clearLegacyLoginPassword,omitempty"`
@@ -71,6 +72,7 @@ func (j *JournalEntry) Target() Target {
 		IdentityID:               j.TargetIdentity,
 		Kind:                     j.TargetKind,
 		KeyPath:                  j.KeyPath,
+		KeyFingerprint:           j.KeyFingerprint,
 		AuthType:                 j.AuthType,
 		ClearKeyPath:             j.ClearKeyPath,
 		ClearLegacyLoginPassword: j.ClearLegacyLoginPassword,

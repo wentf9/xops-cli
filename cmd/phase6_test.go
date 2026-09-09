@@ -25,7 +25,7 @@ func phase6Config(t *testing.T, storeCfg config.StoreConfig) config.Store {
 	t.Setenv("TEST_IDENTITY_HELPER", "1")
 	t.Setenv("TEST_HELPER_DATA_FILE", filepath.Join(dir, "helper-data"))
 	cfg := &config.Configuration{
-		SchemaVersion: 2,
+		SchemaVersion: 1,
 		Nodes:         concurrent.NewMap[string, models.Node](concurrent.HashString),
 		Hosts:         concurrent.NewMap[string, models.Host](concurrent.HashString),
 		Identities:    concurrent.NewMap[string, models.Identity](concurrent.HashString),

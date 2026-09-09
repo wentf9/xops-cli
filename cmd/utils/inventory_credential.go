@@ -65,6 +65,11 @@ func PrepareInventoryCredential(repo *config.Repository, target credential.Targe
 			return nil, err
 		}
 	}
+	var bindErr error
+	target, bindErr = config.BindPrivateKeyFingerprint(cfg, target, []byte(value))
+	if bindErr != nil {
+		return nil, bindErr
+	}
 	if updater == nil {
 		updater = repo.AsConfigUpdater()
 	}

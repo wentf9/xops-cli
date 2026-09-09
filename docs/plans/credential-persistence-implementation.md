@@ -258,6 +258,10 @@ xops credential finalize-migration
 
 测试必须在每一步注入失败和崩溃，并验证至少存在一个可恢复的秘密副本。
 
+实现入口：`pkg/config/CredentialMigrator` 直接读取旧文件；相邻的 0600 备份和
+非敏感迁移状态支持重试。已迁移 v2 的严格读写路径不创建旧 key；新安装默认切换仍留在
+阶段 8。使用与恢复说明见 [显式迁移指南](../credential-migration.md)。
+
 建议提交：
 
 ```text

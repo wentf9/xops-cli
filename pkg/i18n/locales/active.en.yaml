@@ -993,3 +993,21 @@ flag_remember:
 
 warn_flag_deprecated:
   other: "Flag --{{.Flag}} is deprecated and will be removed in the next stable release. Use {{.Replacement}}."
+
+credential_migrate_short:
+  other: "Migrate legacy credentials to references"
+
+credential_migrate_long:
+  other: "Back up legacy configuration and key, write and verify credentials, then atomically commit schema v2. Rerun the same command after interruption. Old materials remain until finalize-migration."
+
+credential_migrate_to:
+  other: "Configured writable destination store ID"
+
+credential_migrate_dry_run:
+  other: "Validate and preview without writing files or credentials"
+
+credential_finalize_short:
+  other: "Remove legacy materials after migration validation"
+
+credential_finalize_long:
+  other: "Explicitly confirm connection validation. Recheck current v2 references, then delete the migration backup and old keys. This removes automatic rollback materials and is resumable after interruption."

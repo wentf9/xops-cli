@@ -315,6 +315,17 @@ func (s *defaultStore) loadLocked() (*Configuration, error) {
 		}
 		return nil, fmt.Errorf("failed to read configuration file %s: %w", s.Path, err)
 	}
+	version, err := DetectSchemaVersion(data)
+	if err != nil {
+		return nil, err
+	}
+	if version == 2 {
+		dto, err := UnmarshalV2(data)
+		if err != nil {
+			return nil, err
+		}
+		return FromV2(dto)
+	}
 	// 2. yaml.Unmarshal
 	if err = yaml.Unmarshal(data, &configuration); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal configuration: %w", err)
@@ -431,6 +442,20 @@ func (s *defaultStore) saveLocked(cfg *Configuration) (PersistResult, error) {
 	if cfg == nil {
 		return PersistResult{}, fmt.Errorf("configuration is nil")
 	}
+	if cfg.SchemaVersion == 2 {
+		dto, err := cfg.ToV2()
+		if err != nil {
+			return PersistResult{}, err
+		}
+		data, err := yaml.Marshal(dto)
+		if err != nil {
+			return PersistResult{}, fmt.Errorf("encode schema v2: %w", err)
+		}
+		return s.writeConfigurationBytes(data)
+	}
+	if cfg.SchemaVersion != 0 && cfg.SchemaVersion != 1 {
+		return PersistResult{}, ErrUnsupportedSchemaVersion
+	}
 	// 初始化 Crypter
 	key, err := s.loadOrCreateKeyLocked(true)
 	if err != nil {
@@ -457,6 +482,10 @@ func (s *defaultStore) saveLocked(cfg *Configuration) (PersistResult, error) {
 	if err != nil {
 		return PersistResult{}, fmt.Errorf("failed to marshal configuration: %w", err)
 	}
+	return s.writeConfigurationBytes(data)
+}
+
+func (s *defaultStore) writeConfigurationBytes(data []byte) (PersistResult, error) {
 	writeFile := s.writeFile
 	if writeFile != nil {
 		if err := writeFile(s.Path, data, 0600); err != nil {

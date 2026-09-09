@@ -27,7 +27,8 @@ type Target struct {
 	Kind       Kind   `json:"kind"`
 	// KeyPath is the non-secret private-key path to commit atomically with a
 	// passphrase reference. It is ignored for other credential kinds.
-	KeyPath string `json:"keyPath,omitempty"`
+	KeyPath        string `json:"keyPath,omitempty"`
+	KeyFingerprint string `json:"keyFingerprint,omitempty"`
 	// AuthType and ClearKeyPath let a deletion transaction switch
 	// authentication metadata atomically with removing an obsolete reference.
 	AuthType     string `json:"authType,omitempty"`
@@ -288,6 +289,7 @@ func (s *Service) Rotate(
 		TargetIdentity:           target.IdentityID,
 		TargetKind:               target.Kind,
 		KeyPath:                  target.KeyPath,
+		KeyFingerprint:           target.KeyFingerprint,
 		AuthType:                 target.AuthType,
 		ClearKeyPath:             target.ClearKeyPath,
 		ClearLegacyLoginPassword: target.ClearLegacyLoginPassword,
@@ -382,6 +384,7 @@ func (s *Service) Delete(
 		TargetIdentity:           target.IdentityID,
 		TargetKind:               target.Kind,
 		KeyPath:                  target.KeyPath,
+		KeyFingerprint:           target.KeyFingerprint,
 		AuthType:                 target.AuthType,
 		ClearKeyPath:             target.ClearKeyPath,
 		ClearLegacyLoginPassword: target.ClearLegacyLoginPassword,

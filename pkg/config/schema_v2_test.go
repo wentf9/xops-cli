@@ -607,3 +607,10 @@ nodes:
 		t.Fatalf("unexpected key_fingerprint: %q", cfg.Identities["u"].KeyFingerprint)
 	}
 }
+
+func TestSchemaV2RejectsTrailingDocument(t *testing.T) {
+	data := []byte("schema_version: 2\ncredential: {stores: {}}\nidentities: {}\nhosts: {}\nnodes: {}\n---\npassword: must-not-be-ignored\n")
+	if _, err := UnmarshalV2(data); !errors.Is(err, ErrSchemaValidation) {
+		t.Fatalf("trailing document accepted: %v", err)
+	}
+}

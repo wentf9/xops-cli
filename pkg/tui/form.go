@@ -633,13 +633,21 @@ func (m *Model) syncCredentialsToStore(ctx context.Context, nodeID, authVersion 
 		targetStore = cfg.Credential.DefaultStore
 	}
 
+	keyFingerprint := ""
+	if s.authType == "key" && actions.passphrase == "replace" {
+		target, err := config.BindPrivateKeyFingerprint(cfg, credential.Target{Kind: credential.KindPassphrase, KeyPath: actions.keyPath}, []byte(s.passphrase))
+		if err != nil {
+			return err
+		}
+		keyFingerprint = target.KeyFingerprint
+	}
 	version := authVersion
 	var err error
 	switch s.authType {
 	case "password":
-		version, err = syncFormCredential(ctx, credSvc, nodeID, credential.KindLoginPassword, authVersion, actions.password, s.existingPasswordRef, targetStore, s.password, "", s.authType, actions.clearKeyPath, actions.clearLegacyLoginPassword, actions.clearLegacyPassphrase)
+		version, err = syncFormCredential(ctx, credSvc, nodeID, credential.KindLoginPassword, authVersion, actions.password, s.existingPasswordRef, targetStore, s.password, "", s.authType, keyFingerprint, actions.clearKeyPath, actions.clearLegacyLoginPassword, actions.clearLegacyPassphrase)
 	case "key":
-		version, err = syncFormCredential(ctx, credSvc, nodeID, credential.KindPassphrase, authVersion, actions.passphrase, s.existingPassphraseRef, targetStore, s.passphrase, actions.keyPath, s.authType, actions.clearKeyPath, actions.clearLegacyLoginPassword, actions.clearLegacyPassphrase)
+		version, err = syncFormCredential(ctx, credSvc, nodeID, credential.KindPassphrase, authVersion, actions.passphrase, s.existingPassphraseRef, targetStore, s.passphrase, actions.keyPath, s.authType, keyFingerprint, actions.clearKeyPath, actions.clearLegacyLoginPassword, actions.clearLegacyPassphrase)
 	}
 	if err != nil {
 		return err
@@ -653,8 +661,8 @@ func (m *Model) syncCredentialsToStore(ctx context.Context, nodeID, authVersion 
 	return nil
 }
 
-func syncFormCredential(ctx context.Context, service *credential.Service, nodeID string, kind credential.Kind, version, action string, oldRef *credential.Ref, storeID, value, keyPath, authType string, clearKeyPath, clearLegacyLoginPassword, clearLegacyPassphrase bool) (string, error) {
-	target := credential.Target{NodeID: nodeID, Kind: kind, KeyPath: keyPath, AuthType: authType, ClearKeyPath: clearKeyPath, ClearLegacyLoginPassword: clearLegacyLoginPassword, ClearLegacyPassphrase: clearLegacyPassphrase}
+func syncFormCredential(ctx context.Context, service *credential.Service, nodeID string, kind credential.Kind, version, action string, oldRef *credential.Ref, storeID, value, keyPath, authType, keyFingerprint string, clearKeyPath, clearLegacyLoginPassword, clearLegacyPassphrase bool) (string, error) {
+	target := credential.Target{NodeID: nodeID, Kind: kind, KeyPath: keyPath, KeyFingerprint: keyFingerprint, AuthType: authType, ClearKeyPath: clearKeyPath, ClearLegacyLoginPassword: clearLegacyLoginPassword, ClearLegacyPassphrase: clearLegacyPassphrase}
 	if action == "replace" && value != "" {
 		_, nextVersion, err := service.Rotate(ctx, target, version, oldRef, storeID, credential.Secret{Value: []byte(value)})
 		if err != nil {

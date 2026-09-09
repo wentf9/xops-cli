@@ -287,8 +287,12 @@ func (a *SSHAdapter) UpdateAuth(ctx context.Context, nodeID, authUpdateToken, pa
 		if err != nil {
 			return "", fmt.Errorf("refresh node %q before persisting passphrase: %w", nodeID, err)
 		}
+		target, err := config.BindPrivateKeyFingerprint(a.cfgProvider.Snapshot(), credential.Target{NodeID: nodeID, Kind: credential.KindPassphrase, KeyPath: keyPath}, []byte(passphrase))
+		if err != nil {
+			return "", err
+		}
 		_, nextVersion, rotateErr := a.credentialService.Rotate(ctx,
-			credential.Target{NodeID: nodeID, Kind: credential.KindPassphrase, KeyPath: keyPath},
+			target,
 			version, snapshot.Identity.PassphraseRef, a.defaultStoreID(), credential.Secret{Value: []byte(passphrase)})
 		if rotateErr != nil {
 			return "", fmt.Errorf("persist remembered private-key passphrase: %w", rotateErr)

@@ -994,3 +994,21 @@ flag_remember:
 
 warn_flag_deprecated:
   other: "参数 --{{.Flag}} 已弃用，将在下一个正式版本删除。请使用 {{.Replacement}}。"
+
+credential_migrate_short:
+  other: "显式迁移旧凭据为引用"
+
+credential_migrate_long:
+  other: "备份旧配置与 key，写入并读回凭据后原子提交 Schema v2。中断后可重跑同一命令；旧材料保留至显式 finalize-migration。"
+
+credential_migrate_to:
+  other: "已配置的可写目标 Store ID"
+
+credential_migrate_dry_run:
+  other: "校验并预览，不写入文件或凭据"
+
+credential_finalize_short:
+  other: "验证迁移后删除旧备份和加密 key"
+
+credential_finalize_long:
+  other: "显式确认已验证迁移后的连接。重新检查当前 v2 引用后删除迁移备份和旧 key；删除后不再保留自动回滚材料，中断后可重跑。"
