@@ -272,7 +272,7 @@ func (a *SSHAdapter) UpdateAuth(ctx context.Context, nodeID, authUpdateToken, pa
 			return "", fmt.Errorf("refresh node %q before persisting passphrase: %w", nodeID, err)
 		}
 		_, nextVersion, rotateErr := a.credentialService.Rotate(ctx,
-			credential.Target{NodeID: nodeID, Kind: credential.KindPassphrase},
+			credential.Target{NodeID: nodeID, Kind: credential.KindPassphrase, KeyPath: keyPath},
 			version, snapshot.Identity.PassphraseRef, a.defaultStoreID(), credential.Secret{Value: []byte(passphrase)})
 		if rotateErr != nil {
 			return "", fmt.Errorf("persist remembered private-key passphrase: %w", rotateErr)

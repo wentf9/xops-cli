@@ -25,6 +25,18 @@ type Target struct {
 	NodeID     string `json:"nodeID,omitempty"`
 	IdentityID string `json:"identityID,omitempty"`
 	Kind       Kind   `json:"kind"`
+	// KeyPath is the non-secret private-key path to commit atomically with a
+	// passphrase reference. It is ignored for other credential kinds.
+	KeyPath string `json:"keyPath,omitempty"`
+	// AuthType and ClearKeyPath let a deletion transaction switch
+	// authentication metadata atomically with removing an obsolete reference.
+	AuthType     string `json:"authType,omitempty"`
+	ClearKeyPath bool   `json:"clearKeyPath,omitempty"`
+	// ClearLegacyLoginPassword and ClearLegacyPassphrase clear only the legacy
+	// plaintext fields while retaining any reference for a later cleanup
+	// transaction.
+	ClearLegacyLoginPassword bool `json:"clearLegacyLoginPassword,omitempty"`
+	ClearLegacyPassphrase    bool `json:"clearLegacyPassphrase,omitempty"`
 }
 
 // Validate 校验 Target 的完整性与合法性。
@@ -266,15 +278,20 @@ func (s *Service) Rotate(
 	}()
 
 	entry := &JournalEntry{
-		ID:             entryID,
-		Op:             OpRotate,
-		Stage:          StageIntent,
-		OldRef:         oldRef.Clone(),
-		NewRef:         newRef.Clone(),
-		BaseVersion:    expectedVersion,
-		TargetNode:     target.NodeID,
-		TargetIdentity: target.IdentityID,
-		TargetKind:     target.Kind,
+		ID:                       entryID,
+		Op:                       OpRotate,
+		Stage:                    StageIntent,
+		OldRef:                   oldRef.Clone(),
+		NewRef:                   newRef.Clone(),
+		BaseVersion:              expectedVersion,
+		TargetNode:               target.NodeID,
+		TargetIdentity:           target.IdentityID,
+		TargetKind:               target.Kind,
+		KeyPath:                  target.KeyPath,
+		AuthType:                 target.AuthType,
+		ClearKeyPath:             target.ClearKeyPath,
+		ClearLegacyLoginPassword: target.ClearLegacyLoginPassword,
+		ClearLegacyPassphrase:    target.ClearLegacyPassphrase,
 	}
 	if oldRef == nil || oldRef.IsEmpty() {
 		entry.Op = OpCreate
@@ -355,15 +372,20 @@ func (s *Service) Delete(
 
 	// 1. 记录 journal intent
 	entry := &JournalEntry{
-		ID:             entryID,
-		Op:             OpDelete,
-		Stage:          StageIntent,
-		OldRef:         refToDelete.Clone(),
-		NewRef:         nil,
-		BaseVersion:    expectedVersion,
-		TargetNode:     target.NodeID,
-		TargetIdentity: target.IdentityID,
-		TargetKind:     target.Kind,
+		ID:                       entryID,
+		Op:                       OpDelete,
+		Stage:                    StageIntent,
+		OldRef:                   refToDelete.Clone(),
+		NewRef:                   nil,
+		BaseVersion:              expectedVersion,
+		TargetNode:               target.NodeID,
+		TargetIdentity:           target.IdentityID,
+		TargetKind:               target.Kind,
+		KeyPath:                  target.KeyPath,
+		AuthType:                 target.AuthType,
+		ClearKeyPath:             target.ClearKeyPath,
+		ClearLegacyLoginPassword: target.ClearLegacyLoginPassword,
+		ClearLegacyPassphrase:    target.ClearLegacyPassphrase,
 	}
 	if err := s.journal.RecordIntent(entry); err != nil {
 		return "", fmt.Errorf("record journal intent: %w", err)

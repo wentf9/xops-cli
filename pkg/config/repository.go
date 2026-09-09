@@ -1185,6 +1185,37 @@ func (r *Repository) UpdateNodeCredentialRefAtVersionContext(
 	kind credential.Kind,
 	newRef *credential.Ref,
 ) (MutationOutcome, string, error) {
+	return r.UpdateNodeCredentialRefWithMetadataAtVersionContext(ctx, nodeID, expectedVersion, kind, newRef, "", "", false, false, false)
+}
+
+// UpdateNodeCredentialRefWithKeyPathAtVersionContext atomically updates a
+// node credential reference and, for a private-key passphrase, its non-secret
+// key path. An empty keyPath leaves the existing path unchanged.
+func (r *Repository) UpdateNodeCredentialRefWithKeyPathAtVersionContext(
+	ctx context.Context,
+	nodeID string,
+	expectedVersion string,
+	kind credential.Kind,
+	newRef *credential.Ref,
+	keyPath string,
+) (MutationOutcome, string, error) {
+	return r.UpdateNodeCredentialRefWithMetadataAtVersionContext(ctx, nodeID, expectedVersion, kind, newRef, keyPath, "", false, false, false)
+}
+
+// UpdateNodeCredentialRefWithMetadataAtVersionContext atomically updates a
+// node credential reference with non-secret authentication metadata.
+func (r *Repository) UpdateNodeCredentialRefWithMetadataAtVersionContext(
+	ctx context.Context,
+	nodeID string,
+	expectedVersion string,
+	kind credential.Kind,
+	newRef *credential.Ref,
+	keyPath string,
+	authType string,
+	clearKeyPath bool,
+	clearLegacyLoginPassword bool,
+	clearLegacyPassphrase bool,
+) (MutationOutcome, string, error) {
 	if err := kind.Validate(); err != nil {
 		return MutationOutcome{}, "", err
 	}
@@ -1198,7 +1229,7 @@ func (r *Repository) UpdateNodeCredentialRefAtVersionContext(
 	commitResult, err := r.commitResultContext(ctx, anyRevision, func(cfg *Configuration) error {
 		switch kind {
 		case credential.KindLoginPassword, credential.KindPassphrase:
-			ver, updateErr := updateNodeAuthCredentialRef(cfg, nodeID, expectedVersion, kind, newRef)
+			ver, updateErr := updateNodeAuthCredentialRef(cfg, nodeID, expectedVersion, kind, newRef, keyPath, authType, clearKeyPath, clearLegacyLoginPassword, clearLegacyPassphrase)
 			if updateErr != nil {
 				return updateErr
 			}
@@ -1233,6 +1264,11 @@ func updateNodeAuthCredentialRef(
 	expectedVersion string,
 	kind credential.Kind,
 	newRef *credential.Ref,
+	keyPath string,
+	authType string,
+	clearKeyPath bool,
+	clearLegacyLoginPassword bool,
+	clearLegacyPassphrase bool,
 ) (string, error) {
 	node, ok := cfg.Nodes.Get(nodeID)
 	if !ok {
@@ -1278,6 +1314,21 @@ func updateNodeAuthCredentialRef(
 		if newRef != nil && !newRef.IsEmpty() {
 			identity.AuthType = "key"
 		}
+	}
+	if keyPath != "" {
+		identity.KeyPath = keyPath
+	}
+	if authType != "" {
+		identity.AuthType = authType
+	}
+	if clearKeyPath {
+		identity.KeyPath = ""
+	}
+	if clearLegacyLoginPassword {
+		identity.Password = ""
+	}
+	if clearLegacyPassphrase {
+		identity.Passphrase = ""
 	}
 
 	cfg.Identities.Set(node.IdentityRef, identity)
@@ -1661,7 +1712,7 @@ func (u *RepositoryConfigUpdater) ApplyCredentialRefAtVersion(
 	newRef *credential.Ref,
 ) (credential.MutationOutcome, string, error) {
 	if target.NodeID != "" {
-		outcome, newVer, err := u.repo.UpdateNodeCredentialRefAtVersionContext(ctx, target.NodeID, expectedVersion, target.Kind, newRef)
+		outcome, newVer, err := u.repo.UpdateNodeCredentialRefWithMetadataAtVersionContext(ctx, target.NodeID, expectedVersion, target.Kind, newRef, target.KeyPath, target.AuthType, target.ClearKeyPath, target.ClearLegacyLoginPassword, target.ClearLegacyPassphrase)
 		return credential.MutationOutcome{Applied: outcome.Applied, Durable: outcome.Durable}, newVer, adaptConfigError(err)
 	}
 	if target.IdentityID != "" {

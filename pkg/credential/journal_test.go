@@ -80,6 +80,21 @@ func TestJournalLifecycle(t *testing.T) {
 	}
 }
 
+func TestJournalTarget_PreservesCredentialMetadata(t *testing.T) {
+	entry := &JournalEntry{
+		TargetNode:               "node-a",
+		TargetKind:               KindPassphrase,
+		KeyPath:                  "/home/test/.ssh/id_ed25519",
+		ClearLegacyLoginPassword: true,
+		ClearLegacyPassphrase:    true,
+	}
+
+	target := entry.Target()
+	if target.KeyPath != entry.KeyPath || !target.ClearLegacyLoginPassword || !target.ClearLegacyPassphrase {
+		t.Fatalf("credential metadata mismatch: %+v", target)
+	}
+}
+
 func TestJournalFilePermissionsAndNonSensitive(t *testing.T) {
 	tempDir := t.TempDir()
 	store, err := NewJournalStore(tempDir)

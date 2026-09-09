@@ -269,6 +269,53 @@ func TestSSHAdapterSessionPasswordRememberedAfterSuccessfulConnection(t *testing
 	}
 }
 
+func TestSSHAdapterRememberedPassphrasePersistsKeyPath(t *testing.T) {
+	cfg := &config.Configuration{
+		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
+		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
+		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
+		Credential: &config.CredentialConfig{DefaultStore: "memory"},
+	}
+	cfg.Nodes.Set("node", models.Node{HostRef: "host", IdentityRef: "identity"})
+	cfg.Hosts.Set("host", models.Host{Address: "127.0.0.1", Port: 22})
+	cfg.Identities.Set("identity", models.Identity{User: "root", AuthType: "auto"})
+	repository, err := config.NewRepositoryWithoutOpenSSH(cfg, adapterTestStore{})
+	if err != nil {
+		t.Fatalf("create repository: %v", err)
+	}
+	store := &adapterCredentialStore{data: make(map[string]credential.Secret)}
+	registry := credential.NewRegistry()
+	if err := registry.Register("memory", store); err != nil {
+		t.Fatalf("register store: %v", err)
+	}
+	journal, err := credential.NewJournalStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("create journal store: %v", err)
+	}
+	service, err := credential.NewService(registry, journal, repository.AsConfigUpdater(), nil)
+	if err != nil {
+		t.Fatalf("create credential service: %v", err)
+	}
+	adapter := NewSSHAdapter(repository, WithCredentialService(service))
+	connection, err := adapter.GetConfig("node")
+	if err != nil {
+		t.Fatalf("get node config: %v", err)
+	}
+	if _, err := adapter.UpdateAuth(t.Context(), "node", connection.AuthUpdateToken, "", "/tmp/discovered-key", "passphrase"); err != nil {
+		t.Fatalf("remember passphrase: %v", err)
+	}
+	snapshot, err := repository.ResolveConnection("node")
+	if err != nil {
+		t.Fatalf("resolve remembered node: %v", err)
+	}
+	if snapshot.Identity.KeyPath != "/tmp/discovered-key" {
+		t.Fatalf("key path = %q, want discovered path", snapshot.Identity.KeyPath)
+	}
+	if snapshot.Identity.PassphraseRef == nil {
+		t.Fatal("passphrase reference was not persisted")
+	}
+}
+
 func TestSSHAdapterRejectsEmptyPersistenceToken(t *testing.T) {
 	cfg := &config.Configuration{
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),

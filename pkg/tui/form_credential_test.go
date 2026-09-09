@@ -3,6 +3,9 @@ package tui
 import (
 	"bytes"
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -358,6 +361,215 @@ func TestNodeFormCredentialReplace_FailurePreservesLegacySecret(t *testing.T) {
 	}
 	if snapshot.Identity.Password != "legacy-password" {
 		t.Fatalf("legacy password = %q, want preserved value", snapshot.Identity.Password)
+	}
+}
+
+func TestNodeFormCredentialSwitchToKey_FailurePreservesPasswordAuthentication(t *testing.T) {
+	cfg := newFormCredentialTestConfiguration("")
+	oldRef := credential.Ref{StoreID: "mem", ItemID: "old-password"}
+	identity, _ := cfg.Identities.Get("user@192.168.1.50")
+	identity.LoginPasswordRef = oldRef.Clone()
+	cfg.Identities.Set("user@192.168.1.50", identity)
+	repo := newTestRepository(t, cfg)
+	service := newFormCredentialTestService(t, repo, &failingCredentialStore{memoryCredentialStore: newMemoryCredentialStore(), failPut: true})
+
+	m := newPasswordReplaceFormModel(repo, service, "")
+	m.formState.authType = "key"
+	m.formState.keyPath = filepath.Join(t.TempDir(), "replacement-key")
+	m.formState.passphrase = "replacement-passphrase"
+	m.formState.passphraseAction = "replace"
+	m.formState.existingPasswordRef = oldRef.Clone()
+
+	msg, ok := m.saveFormCmd()().(configurationMutationMsg)
+	if !ok || msg.err == nil {
+		t.Fatalf("save result = %#v, want credential store error", msg)
+	}
+	snapshot, err := repo.ResolveConnection(formCredentialTestNodeID)
+	if err != nil {
+		t.Fatalf("resolve connection after failed save: %v", err)
+	}
+	if snapshot.Identity.AuthType != "password" {
+		t.Fatalf("auth type after failed save = %q, want password", snapshot.Identity.AuthType)
+	}
+	if snapshot.Identity.LoginPasswordRef == nil || *snapshot.Identity.LoginPasswordRef != oldRef {
+		t.Fatalf("password reference after failed save = %v, want %v", snapshot.Identity.LoginPasswordRef, oldRef)
+	}
+}
+
+func TestNodeFormCredentialSwitchToKey_CompletesAtomically(t *testing.T) {
+	cfg := newFormCredentialTestConfiguration("")
+	oldRef := credential.Ref{StoreID: "mem", ItemID: "old-password"}
+	identity, _ := cfg.Identities.Get("user@192.168.1.50")
+	identity.LoginPasswordRef = oldRef.Clone()
+	cfg.Identities.Set("user@192.168.1.50", identity)
+	repo := newTestRepository(t, cfg)
+	store := newMemoryCredentialStore()
+	if err := store.Put(t.Context(), oldRef, credential.Secret{Value: []byte("old-password")}); err != nil {
+		t.Fatalf("seed password reference: %v", err)
+	}
+	service := newFormCredentialTestService(t, repo, store)
+
+	m := newPasswordReplaceFormModel(repo, service, "")
+	m.formState.authType = "key"
+	m.formState.keyPath = filepath.Join(t.TempDir(), "replacement-key")
+	m.formState.passphrase = "replacement-passphrase"
+	m.formState.passphraseAction = "replace"
+	m.formState.existingPasswordRef = oldRef.Clone()
+
+	msg, ok := m.saveFormCmd()().(configurationMutationMsg)
+	if !ok || msg.err != nil {
+		t.Fatalf("save result = %#v, want success", msg)
+	}
+	snapshot, err := repo.ResolveConnection(formCredentialTestNodeID)
+	if err != nil {
+		t.Fatalf("resolve connection after save: %v", err)
+	}
+	if snapshot.Identity.AuthType != "key" || snapshot.Identity.KeyPath != m.formState.keyPath {
+		t.Fatalf("updated key authentication = %#v , want key with path %s", snapshot.Identity, m.formState.keyPath)
+	}
+	if snapshot.Identity.LoginPasswordRef != nil || snapshot.Identity.PassphraseRef == nil {
+		t.Fatalf("updated credential references = %#v", snapshot.Identity)
+	}
+	if _, err := store.Get(t.Context(), oldRef); !errors.Is(err, credential.ErrCredentialNotFound) {
+		t.Fatalf("old password remains after replacement: %v", err)
+	}
+}
+
+func TestNodeFormCredentialSwitchToKey_ClearsLegacyPassword(t *testing.T) {
+	repo := newTestRepository(t, newFormCredentialTestConfiguration("legacy-password"))
+	service := newFormCredentialTestService(t, repo, newMemoryCredentialStore())
+	m := newPasswordReplaceFormModel(repo, service, "")
+	m.formState.authType = "key"
+	m.formState.keyPath = filepath.Join(t.TempDir(), "replacement-key")
+	m.formState.passphrase = "replacement-passphrase"
+	m.formState.passphraseAction = "replace"
+
+	msg, ok := m.saveFormCmd()().(configurationMutationMsg)
+	if !ok || msg.err != nil {
+		t.Fatalf("save result = %#v, want success", msg)
+	}
+	snapshot, err := repo.ResolveConnection(formCredentialTestNodeID)
+	if err != nil {
+		t.Fatalf("resolve connection after save: %v", err)
+	}
+	if snapshot.Identity.Password != "" {
+		t.Fatal("successful key switch retained legacy password plaintext")
+	}
+}
+
+func TestNodeFormCredentialKeyReplacement_FailurePreservesOriginalKeyPath(t *testing.T) {
+	cfg := newFormCredentialTestConfiguration("")
+	originalKeyPath := filepath.Join(t.TempDir(), "original-key")
+	originalRef := credential.Ref{StoreID: "mem", ItemID: "original-passphrase"}
+	identity, _ := cfg.Identities.Get("user@192.168.1.50")
+	identity.AuthType = "key"
+	identity.KeyPath = originalKeyPath
+	identity.PassphraseRef = originalRef.Clone()
+	cfg.Identities.Set("user@192.168.1.50", identity)
+	repo := newTestRepository(t, cfg)
+	service := newFormCredentialTestService(t, repo, &failingCredentialStore{memoryCredentialStore: newMemoryCredentialStore(), failPut: true})
+
+	m := newPasswordReplaceFormModel(repo, service, "")
+	m.formState.authType = "key"
+	m.formState.keyPath = filepath.Join(t.TempDir(), "replacement-key")
+	m.formState.passphrase = "replacement-passphrase"
+	m.formState.passphraseAction = "replace"
+	m.formState.existingPassphraseRef = originalRef.Clone()
+
+	msg, ok := m.saveFormCmd()().(configurationMutationMsg)
+	if !ok || msg.err == nil {
+		t.Fatalf("save result = %#v, want credential store error", msg)
+	}
+	snapshot, err := repo.ResolveConnection(formCredentialTestNodeID)
+	if err != nil {
+		t.Fatalf("resolve connection after failed save: %v", err)
+	}
+	if snapshot.Identity.KeyPath != originalKeyPath {
+		t.Fatalf("key path after failed replacement = %q, want %q", snapshot.Identity.KeyPath, originalKeyPath)
+	}
+	if snapshot.Identity.PassphraseRef == nil || *snapshot.Identity.PassphraseRef != originalRef {
+		t.Fatalf("passphrase reference after failed replacement = %v, want %v", snapshot.Identity.PassphraseRef, originalRef)
+	}
+}
+
+func TestNodeFormCredentialSwitchToUnencryptedKey_CleansOldReference(t *testing.T) {
+	cfg := newFormCredentialTestConfiguration("")
+	oldRef := credential.Ref{StoreID: "mem", ItemID: "old-password"}
+	identity, _ := cfg.Identities.Get("user@192.168.1.50")
+	identity.LoginPasswordRef = oldRef.Clone()
+	cfg.Identities.Set("user@192.168.1.50", identity)
+	repo := newTestRepository(t, cfg)
+	store := newMemoryCredentialStore()
+	if err := store.Put(t.Context(), oldRef, credential.Secret{Value: []byte("old-password")}); err != nil {
+		t.Fatalf("seed password reference: %v", err)
+	}
+	m := newPasswordReplaceFormModel(repo, newFormCredentialTestService(t, repo, store), "")
+	m.formState.authType = "key"
+	keyPath := filepath.Join(t.TempDir(), "unencrypted-key")
+	m.formState.keyPath = keyPath
+	m.formState.passphraseAction = "keep"
+
+	msg, ok := m.saveFormCmd()().(configurationMutationMsg)
+	if !ok || msg.err != nil {
+		t.Fatalf("save result = %#v, want success", msg)
+	}
+	if _, err := store.Get(t.Context(), oldRef); !errors.Is(err, credential.ErrCredentialNotFound) {
+		t.Fatalf("old password remains after unencrypted-key switch: %v", err)
+	}
+	snapshot, err := repo.ResolveConnection(formCredentialTestNodeID)
+	if err != nil {
+		t.Fatalf("resolve connection after unencrypted-key switch: %v", err)
+	}
+	if snapshot.Identity.AuthType != "key" || snapshot.Identity.KeyPath != keyPath {
+		t.Fatalf("updated key authentication = %#v", snapshot.Identity)
+	}
+}
+
+func TestNodeFormCredentialSwitchToUnencryptedKey_JournalFailurePreservesReference(t *testing.T) {
+	cfg := newFormCredentialTestConfiguration("")
+	oldRef := credential.Ref{StoreID: "mem", ItemID: "old-password"}
+	identity, _ := cfg.Identities.Get("user@192.168.1.50")
+	identity.LoginPasswordRef = oldRef.Clone()
+	cfg.Identities.Set("user@192.168.1.50", identity)
+	repo := newTestRepository(t, cfg)
+	store := newMemoryCredentialStore()
+	if err := store.Put(t.Context(), oldRef, credential.Secret{Value: []byte("old-password")}); err != nil {
+		t.Fatalf("seed password reference: %v", err)
+	}
+	registry := credential.NewRegistry()
+	if err := registry.Register("mem", store); err != nil {
+		t.Fatalf("register credential store: %v", err)
+	}
+	journalDir := filepath.Join(t.TempDir(), "journal")
+	journal, err := credential.NewJournalStore(journalDir)
+	if err != nil {
+		t.Fatalf("create journal store: %v", err)
+	}
+	service, err := credential.NewService(registry, journal, repo.AsConfigUpdater(), nil)
+	if err != nil {
+		t.Fatalf("create credential service: %v", err)
+	}
+	if err := os.Remove(journalDir); err != nil {
+		t.Fatalf("remove journal directory: %v", err)
+	}
+	if err := os.WriteFile(journalDir, []byte("blocked"), 0o600); err != nil {
+		t.Fatalf("block journal directory: %v", err)
+	}
+
+	m := newPasswordReplaceFormModel(repo, service, "")
+	m.formState.authType = "key"
+	m.formState.keyPath = filepath.Join(t.TempDir(), "unencrypted-key")
+	m.formState.passphraseAction = "keep"
+	msg, ok := m.saveFormCmd()().(configurationMutationMsg)
+	if !ok || msg.err == nil {
+		t.Fatalf("save result = %#v, want journal error", msg)
+	}
+	snapshot, err := repo.ResolveConnection(formCredentialTestNodeID)
+	if err != nil {
+		t.Fatalf("resolve connection after failed save: %v", err)
+	}
+	if snapshot.Identity.LoginPasswordRef == nil || *snapshot.Identity.LoginPasswordRef != oldRef {
+		t.Fatalf("password reference after failed save = %v, want %v", snapshot.Identity.LoginPasswordRef, oldRef)
 	}
 }
 

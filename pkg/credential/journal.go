@@ -43,17 +43,22 @@ const (
 // JournalEntry 记录凭据操作的恢复状态。
 // 【安全红线】本结构严禁包含任何机密明文或可逆密文字节，仅记录非敏感的引用元数据与阶段。
 type JournalEntry struct {
-	ID             string        `json:"id"`
-	Op             OperationType `json:"op"`
-	Stage          Stage         `json:"stage"`
-	OldRef         *Ref          `json:"oldRef,omitempty"`
-	NewRef         *Ref          `json:"newRef,omitempty"`
-	BaseVersion    string        `json:"baseVersion,omitempty"`
-	TargetNode     string        `json:"targetNode,omitempty"`
-	TargetIdentity string        `json:"targetIdentity,omitempty"`
-	TargetKind     Kind          `json:"targetKind,omitempty"`
-	CreatedAt      time.Time     `json:"createdAt"`
-	UpdatedAt      time.Time     `json:"updatedAt"`
+	ID                       string        `json:"id"`
+	Op                       OperationType `json:"op"`
+	Stage                    Stage         `json:"stage"`
+	OldRef                   *Ref          `json:"oldRef,omitempty"`
+	NewRef                   *Ref          `json:"newRef,omitempty"`
+	BaseVersion              string        `json:"baseVersion,omitempty"`
+	TargetNode               string        `json:"targetNode,omitempty"`
+	TargetIdentity           string        `json:"targetIdentity,omitempty"`
+	TargetKind               Kind          `json:"targetKind,omitempty"`
+	KeyPath                  string        `json:"keyPath,omitempty"`
+	AuthType                 string        `json:"authType,omitempty"`
+	ClearKeyPath             bool          `json:"clearKeyPath,omitempty"`
+	ClearLegacyLoginPassword bool          `json:"clearLegacyLoginPassword,omitempty"`
+	ClearLegacyPassphrase    bool          `json:"clearLegacyPassphrase,omitempty"`
+	CreatedAt                time.Time     `json:"createdAt"`
+	UpdatedAt                time.Time     `json:"updatedAt"`
 }
 
 // Target 返回与该日志条目关联的目标标识。
@@ -62,9 +67,14 @@ func (j *JournalEntry) Target() Target {
 		return Target{}
 	}
 	return Target{
-		NodeID:     j.TargetNode,
-		IdentityID: j.TargetIdentity,
-		Kind:       j.TargetKind,
+		NodeID:                   j.TargetNode,
+		IdentityID:               j.TargetIdentity,
+		Kind:                     j.TargetKind,
+		KeyPath:                  j.KeyPath,
+		AuthType:                 j.AuthType,
+		ClearKeyPath:             j.ClearKeyPath,
+		ClearLegacyLoginPassword: j.ClearLegacyLoginPassword,
+		ClearLegacyPassphrase:    j.ClearLegacyPassphrase,
 	}
 }
 

@@ -46,6 +46,19 @@ type nodeFormState struct {
 	existingPlainPassphrase string
 }
 
+type formCredentialActions struct {
+	password   string
+	passphrase string
+	// cleanupRef is the old authentication method's reference. It is removed
+	// only after the replacement credential has been committed successfully.
+	cleanupKind              credential.Kind
+	cleanupRef               *credential.Ref
+	keyPath                  string
+	clearKeyPath             bool
+	clearLegacyLoginPassword bool
+	clearLegacyPassphrase    bool
+}
+
 func (m *Model) initForm(nodeID string) (Model, tea.Cmd) {
 	state := m.formState
 	if state == nil {
@@ -429,9 +442,16 @@ func (m *Model) saveFormCmd() tea.Cmd {
 		absKeyPath = fileutil.ToAbsolutePath(s.keyPath)
 	}
 
-	// Try to get existing identity to preserve any extra fields.
-	identity, _ := view.Configuration.Identities.Get(identityID)
-	pwdAction, passAction := s.applyIdentityCredentials(&identity, absKeyPath)
+	// Preserve the actual identity referenced by an edited node. The canonical
+	// ID is only suitable for a new node or a deliberate rename.
+	identity, ok := view.Configuration.Identities.Get(identityID)
+	if s.isEdit && node.IdentityRef != "" {
+		identity, ok = view.Configuration.Identities.Get(node.IdentityRef)
+	}
+	if !ok {
+		identity = models.Identity{}
+	}
+	actions := s.applyIdentityCredentials(&identity, absKeyPath)
 
 	// Try to get existing host to preserve any extra fields (like Host.Alias).
 	host, _ := view.Configuration.Hosts.Get(hostID)
@@ -458,7 +478,7 @@ func (m *Model) saveFormCmd() tea.Cmd {
 			if err != nil {
 				return err
 			}
-			return m.syncCredentialsToStore(ctx, nodeID, authVersion, s, pwdAction, passAction)
+			return m.syncCredentialsToStore(ctx, nodeID, authVersion, s, actions)
 		}
 	} else {
 		run = func(ctx context.Context) error {
@@ -466,40 +486,90 @@ func (m *Model) saveFormCmd() tea.Cmd {
 			if err != nil {
 				return err
 			}
-			return m.syncCredentialsToStore(ctx, nodeID, mutation.AuthVersion, s, pwdAction, passAction)
+			return m.syncCredentialsToStore(ctx, nodeID, mutation.AuthVersion, s, actions)
 		}
 	}
 	return m.beginConfigurationMutation(configurationMutationForm, nodeID, 0, run)
 }
 
-func (s *nodeFormState) applyIdentityCredentials(identity *models.Identity, absKeyPath string) (pwdAction string, passAction string) {
+//nolint:gocyclo // credential actions and cross-authentication transitions must stay in one atomic state calculation
+func (s *nodeFormState) applyIdentityCredentials(identity *models.Identity, absKeyPath string) formCredentialActions {
+	actions := formCredentialActions{keyPath: absKeyPath}
+	previousAuthType := identity.AuthType
 	identity.User = s.user
-	identity.AuthType = s.authType
 
-	pwdAction = s.passwordAction
-	if pwdAction == "" {
+	actions.password = s.passwordAction
+	if actions.password == "" {
 		if s.password != "" {
-			pwdAction = "replace"
+			actions.password = "replace"
 		} else {
-			pwdAction = "keep"
+			actions.password = "keep"
 		}
 	}
 
-	passAction = s.passphraseAction
-	if passAction == "" {
+	actions.passphrase = s.passphraseAction
+	if actions.passphrase == "" {
 		if s.passphrase != "" {
-			passAction = "replace"
+			actions.passphrase = "replace"
 		} else {
-			passAction = "keep"
+			actions.passphrase = "keep"
+		}
+	}
+
+	// A credential store write occurs after this metadata mutation. Keep the
+	// previous authentication usable until that write atomically installs the
+	// new reference and key path.
+	credentialReplacement := (s.authType == "password" && actions.password == "replace" && s.password != "") ||
+		(s.authType == "key" && actions.passphrase == "replace" && s.passphrase != "")
+	previousRef := (*credential.Ref)(nil)
+	switch previousAuthType {
+	case "password":
+		previousRef = identity.LoginPasswordRef
+	case "key":
+		previousRef = identity.PassphraseRef
+	}
+	deferSwitch := previousAuthType != s.authType && (credentialReplacement || previousRef != nil)
+	deferKeyPath := previousAuthType == "key" && s.authType == "key" && credentialReplacement
+	deferCredentialMetadata := deferSwitch || deferKeyPath
+	identity.AuthType = s.authType
+	if deferSwitch {
+		identity.AuthType = previousAuthType
+		if previousAuthType == "password" {
+			actions.cleanupKind = credential.KindLoginPassword
+			actions.cleanupRef = identity.LoginPasswordRef.Clone()
+		} else {
+			actions.cleanupKind = credential.KindPassphrase
+			actions.cleanupRef = identity.PassphraseRef.Clone()
+		}
+	}
+	if deferSwitch && previousAuthType == "key" && s.authType == "password" {
+		actions.clearKeyPath = true
+	}
+	if previousAuthType != s.authType {
+		switch previousAuthType {
+		case "password":
+			actions.cleanupKind = credential.KindLoginPassword
+			actions.cleanupRef = identity.LoginPasswordRef.Clone()
+			if deferSwitch && identity.Password != "" {
+				actions.clearLegacyLoginPassword = true
+			}
+		case "key":
+			actions.cleanupKind = credential.KindPassphrase
+			actions.cleanupRef = identity.PassphraseRef.Clone()
+			if deferSwitch && identity.Passphrase != "" {
+				actions.clearLegacyPassphrase = true
+			}
 		}
 	}
 
 	if s.authType == "password" {
-		identity.KeyPath = ""
-		identity.Passphrase = ""
-		identity.PassphraseRef = nil
+		if !deferCredentialMetadata {
+			identity.KeyPath = ""
+			identity.Passphrase = ""
+			identity.PassphraseRef = nil
+		}
 
-		switch pwdAction {
+		switch actions.password {
 		case "keep":
 			identity.Password = s.existingPlainPassword
 			identity.LoginPasswordRef = s.existingPasswordRef
@@ -522,11 +592,13 @@ func (s *nodeFormState) applyIdentityCredentials(identity *models.Identity, absK
 			identity.LoginPasswordRef = s.existingPasswordRef.Clone()
 		}
 	} else {
-		identity.KeyPath = absKeyPath
-		identity.Password = ""
-		identity.LoginPasswordRef = nil
+		if !deferCredentialMetadata {
+			identity.KeyPath = absKeyPath
+			identity.Password = ""
+			identity.LoginPasswordRef = nil
+		}
 
-		switch passAction {
+		switch actions.passphrase {
 		case "keep":
 			identity.Passphrase = s.existingPlainPassphrase
 			identity.PassphraseRef = s.existingPassphraseRef
@@ -543,13 +615,13 @@ func (s *nodeFormState) applyIdentityCredentials(identity *models.Identity, absK
 			identity.PassphraseRef = s.existingPassphraseRef.Clone()
 		}
 	}
-	return pwdAction, passAction
+	return actions
 }
 
-func (m *Model) syncCredentialsToStore(ctx context.Context, nodeID, authVersion string, s *nodeFormState, pwdAction, passAction string) error {
+func (m *Model) syncCredentialsToStore(ctx context.Context, nodeID, authVersion string, s *nodeFormState, actions formCredentialActions) error {
 	if m.credentialService == nil {
-		if m.repository.Snapshot().Credential != nil && ((s.authType == "password" && (pwdAction == "replace" || pwdAction == "delete")) ||
-			(s.authType == "key" && (passAction == "replace" || passAction == "delete"))) {
+		if m.repository.Snapshot().Credential != nil && ((s.authType == "password" && (actions.password == "replace" || actions.password == "delete")) ||
+			(s.authType == "key" && (actions.passphrase == "replace" || actions.passphrase == "delete"))) {
 			return errors.New("credential service is unavailable")
 		}
 		return nil
@@ -561,29 +633,43 @@ func (m *Model) syncCredentialsToStore(ctx context.Context, nodeID, authVersion 
 		targetStore = cfg.Credential.DefaultStore
 	}
 
-	if s.authType == "password" {
-		return syncFormCredential(ctx, credSvc, nodeID, credential.KindLoginPassword, authVersion, pwdAction, s.existingPasswordRef, targetStore, s.password)
+	version := authVersion
+	var err error
+	switch s.authType {
+	case "password":
+		version, err = syncFormCredential(ctx, credSvc, nodeID, credential.KindLoginPassword, authVersion, actions.password, s.existingPasswordRef, targetStore, s.password, "", s.authType, actions.clearKeyPath, actions.clearLegacyLoginPassword, actions.clearLegacyPassphrase)
+	case "key":
+		version, err = syncFormCredential(ctx, credSvc, nodeID, credential.KindPassphrase, authVersion, actions.passphrase, s.existingPassphraseRef, targetStore, s.passphrase, actions.keyPath, s.authType, actions.clearKeyPath, actions.clearLegacyLoginPassword, actions.clearLegacyPassphrase)
 	}
-	if s.authType == "key" {
-		return syncFormCredential(ctx, credSvc, nodeID, credential.KindPassphrase, authVersion, passAction, s.existingPassphraseRef, targetStore, s.passphrase)
+	if err != nil {
+		return err
+	}
+	if actions.cleanupRef != nil {
+		target := credential.Target{NodeID: nodeID, Kind: actions.cleanupKind, KeyPath: actions.keyPath, AuthType: s.authType, ClearKeyPath: actions.clearKeyPath, ClearLegacyLoginPassword: actions.clearLegacyLoginPassword, ClearLegacyPassphrase: actions.clearLegacyPassphrase}
+		if _, err := credSvc.Delete(ctx, target, version, *actions.cleanupRef); err != nil {
+			return fmt.Errorf("remove replaced %s from credential store: %w", actions.cleanupKind, err)
+		}
 	}
 	return nil
 }
 
-func syncFormCredential(ctx context.Context, service *credential.Service, nodeID string, kind credential.Kind, version, action string, oldRef *credential.Ref, storeID, value string) error {
-	target := credential.Target{NodeID: nodeID, Kind: kind}
+func syncFormCredential(ctx context.Context, service *credential.Service, nodeID string, kind credential.Kind, version, action string, oldRef *credential.Ref, storeID, value, keyPath, authType string, clearKeyPath, clearLegacyLoginPassword, clearLegacyPassphrase bool) (string, error) {
+	target := credential.Target{NodeID: nodeID, Kind: kind, KeyPath: keyPath, AuthType: authType, ClearKeyPath: clearKeyPath, ClearLegacyLoginPassword: clearLegacyLoginPassword, ClearLegacyPassphrase: clearLegacyPassphrase}
 	if action == "replace" && value != "" {
-		if _, _, err := service.Rotate(ctx, target, version, oldRef, storeID, credential.Secret{Value: []byte(value)}); err != nil {
-			return fmt.Errorf("save %s to credential store: %w", kind, err)
+		_, nextVersion, err := service.Rotate(ctx, target, version, oldRef, storeID, credential.Secret{Value: []byte(value)})
+		if err != nil {
+			return "", fmt.Errorf("save %s to credential store: %w", kind, err)
 		}
-		return nil
+		return nextVersion, nil
 	}
 	if action == "delete" && oldRef != nil {
-		if _, err := service.Delete(ctx, target, version, *oldRef); err != nil {
-			return fmt.Errorf("delete %s from credential store: %w", kind, err)
+		nextVersion, err := service.Delete(ctx, target, version, *oldRef)
+		if err != nil {
+			return "", fmt.Errorf("delete %s from credential store: %w", kind, err)
 		}
+		return nextVersion, nil
 	}
-	return nil
+	return version, nil
 }
 
 // splitComma parses a comma-separated string into a slice of trimmed strings
