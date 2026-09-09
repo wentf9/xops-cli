@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	cmdutils "github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/executor"
 	"github.com/wentf9/xops-cli/pkg/firewall"
@@ -91,7 +92,7 @@ func (o *FirewallOptions) runLocalFirewall(ctx context.Context, action func(fw f
 	if runtime.GOOS != "linux" {
 		return fmt.Errorf("%s", i18n.Tf("fw_err_os_not_supported", map[string]any{"OS": runtime.GOOS}))
 	}
-	pwd, _, pwdErr := cmdutils.GetLocalSudoPassword()
+	pwd, _, pwdErr := cmdutils.GetLocalSudoPasswordContext(ctx)
 	if pwdErr != nil {
 		return fmt.Errorf("load local sudo password failed: %w", pwdErr)
 	}
@@ -205,7 +206,10 @@ func (o *FirewallOptions) runRemoteFirewalls(ctx context.Context, action func(fw
 	if err != nil {
 		return fmt.Errorf("create configuration repository: %w", err)
 	}
-	connector := newCLIConnector(provider, ssh.WithLogger(logger.DefaultLogger()))
+	connector, err := o.credentialConnector(provider, cfg)
+	if err != nil {
+		return err
+	}
 	defer func() {
 		joinConnectorCloseError(&retErr, connector)
 	}()
@@ -227,6 +231,27 @@ func (o *FirewallOptions) runRemoteFirewalls(ctx context.Context, action func(fw
 
 	wp.Wait()
 	return errors.Join(fwErrs...)
+}
+
+// credentialConnector shares SSH's lazy resolver and deferred remember policy.
+// Batch firewall operations use the non-interactive backend contract.
+func (o *FirewallOptions) credentialConnector(provider *config.Repository, cfg *config.Configuration, opts ...ssh.Option) (*ssh.Connector, error) {
+	batch := o.HostFile != "" || len(o.Tags) > 0 || strings.Contains(o.Host, ",")
+	sshOptions := o.SshOptions
+	if batch {
+		sshOptions.Remember = cmdutils.RememberPolicyNever
+	}
+	adpOpts, err := sshOptions.buildAdapterOptions("", cfg, provider)
+	if err != nil {
+		return nil, fmt.Errorf("initialize firewall credentials: %w", err)
+	}
+	opts = append([]ssh.Option{ssh.WithLogger(logger.DefaultLogger())}, opts...)
+	if batch {
+		adpOpts = append(adpOpts, adapter.WithNonInteractive(true))
+		return newNonInteractiveConnector(provider, adpOpts, opts...), nil
+	}
+	opts = append(opts, ssh.WithInteractionHandler(sshOptions.interaction))
+	return newCLIConnectorWithAdapterOptions(provider, adpOpts, opts...), nil
 }
 
 func (o *FirewallOptions) resolveNodeID(rawHost string, provider config.ConfigProvider) (string, string, uint16, string, error) {

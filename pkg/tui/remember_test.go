@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/wentf9/xops-cli/pkg/adapter"
+	"github.com/wentf9/xops-cli/pkg/config"
 )
 
 func TestTUIRememberPolicy(t *testing.T) {
@@ -14,6 +15,7 @@ func TestTUIRememberPolicy(t *testing.T) {
 		confirm, answer, wantStored bool
 		wantCalls                   int
 		confirmErr                  error
+		disabled                    string
 	}{
 		{name: "never", policy: "never", confirm: true},
 		{name: "always", policy: "always", wantStored: true},
@@ -21,10 +23,25 @@ func TestTUIRememberPolicy(t *testing.T) {
 		{name: "ask declined", policy: "ask", confirm: true, wantCalls: 1},
 		{name: "ask unavailable", policy: "ask"},
 		{name: "ask canceled", policy: "ask", confirm: true, wantCalls: 1, confirmErr: context.Canceled},
+		{name: "v1 without credential config", policy: "ask", confirm: true, answer: true, disabled: "missing"},
+		{name: "no default store", policy: "ask", confirm: true, answer: true, disabled: "default"},
+		{name: "none", policy: "ask", confirm: true, answer: true, disabled: "none"},
+		{name: "read only", policy: "ask", confirm: true, answer: true, disabled: "readonly"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := newFormCredentialTestConfiguration("")
 			cfg.Credential.RememberPrompted = tc.policy
+			cfg.Credential.Stores = map[string]config.StoreConfig{"mem": {Type: config.StoreTypeHelper}}
+			switch tc.disabled {
+			case "missing":
+				cfg.Credential = nil
+			case "default":
+				cfg.Credential.DefaultStore = ""
+			case "none":
+				cfg.Credential.Stores["mem"] = config.StoreConfig{Type: config.StoreTypeNone}
+			case "readonly":
+				cfg.Credential.Stores["mem"] = config.StoreConfig{Type: config.StoreTypeHelper, ReadOnly: true}
+			}
 			repo := newTestRepository(t, cfg)
 			service := newFormCredentialTestService(t, repo, newMemoryCredentialStore())
 			mc := modelConfig{credentialService: service}

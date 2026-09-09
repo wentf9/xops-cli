@@ -127,7 +127,7 @@ func (o *SftpOptions) RunContext(ctx context.Context) (err error) {
 	if optErr != nil {
 		return optErr
 	}
-	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
+	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithInteractionHandler(o.interaction))
 	defer func() {
 		joinConnectorCloseError(&err, connector)
 	}()

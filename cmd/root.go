@@ -87,7 +87,7 @@ func newRootCmd() *cobra.Command {
 			if logLevel == "debug" {
 				logger.Debug(i18n.T("debug_mode_enabled"))
 			}
-			return nil
+			return warnLegacyConfiguration(cmd)
 		},
 	}
 }

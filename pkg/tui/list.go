@@ -390,8 +390,9 @@ func (m *Model) handleDelete() (Model, tea.Cmd) {
 
 	if len(toDelete) > 0 {
 		repository := m.repository
+		service := m.credentialService
 		return *m, m.beginConfigurationMutation(configurationMutationDelete, "", len(toDelete), func(ctx context.Context) error {
-			return repository.DeleteNodesAtRefsContext(ctx, toDelete)
+			return repository.DeleteNodesWithCredentialsContext(ctx, toDelete, service)
 		})
 	}
 	return *m, nil

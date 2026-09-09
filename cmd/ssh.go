@@ -23,6 +23,7 @@ import (
 )
 
 type SshOptions struct {
+	interaction     *cliInteractionHandler
 	Host            string
 	Port            uint16
 	User            string
@@ -258,14 +259,14 @@ func (o *SshOptions) runParentDaemon(ctx context.Context) (err error) {
 	if optErr != nil {
 		return optErr
 	}
-	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
+	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithInteractionHandler(o.interaction))
 	defer func() {
 		joinConnectorCloseError(&err, connector)
 	}()
 	client, err := connector.Connect(ctx, nodeID)
 	if err != nil {
 		promptErr := promptPressEnterIfTUI(os.Stdin, os.Stdout)
-		return errors.Join(fmt.Errorf("%s: %w", i18n.T("fw_connect_failed"), err), promptErr)
+		return errors.Join(sshConnectionError(nodeID, err), promptErr)
 	}
 
 	// 无论如何，在 runParentDaemon 退出时，或者有任何 panic 发生时，确保 client 必被关闭
@@ -325,8 +326,10 @@ func (o *SshOptions) runParentDaemon(ctx context.Context) (err error) {
 }
 
 func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuration, repository *config.Repository) ([]adapter.Option, error) {
-	var adpOpts []adapter.Option
-	shouldRemember := utils.ShouldRememberCredential(utils.EffectiveRememberPolicy(o.Remember, cfg), o.Target.Selector)
+	if o.interaction == nil {
+		o.interaction = newCLIInteractionHandler()
+	}
+	shouldRemember, adpOpts := o.interaction.rememberOptions(utils.EffectiveRememberPolicy(o.Remember, cfg), cfg)
 	// The global policy also covers ProxyJump nodes. The target-specific override
 	// below carries its explicit session material without leaking it to jumps.
 	adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{Remember: shouldRemember}))
@@ -377,7 +380,7 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 	if optErr != nil {
 		return optErr
 	}
-	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
+	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithInteractionHandler(o.interaction))
 	defer func() {
 		joinConnectorCloseError(&err, connector)
 	}()
@@ -385,10 +388,10 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 	if err != nil {
 		if isChild {
 			// 子进程静默退出或记录错误，不进行交互式阻塞
-			return fmt.Errorf("%s: %w", i18n.T("fw_connect_failed"), err)
+			return sshConnectionError(nodeID, err)
 		}
 		promptErr := promptPressEnterIfTUI(os.Stdin, os.Stdout)
-		return errors.Join(fmt.Errorf("%s: %w", i18n.T("fw_connect_failed"), err), promptErr)
+		return errors.Join(sshConnectionError(nodeID, err), promptErr)
 	}
 	defer func() {
 		if closeErr := client.Close(); closeErr != nil {
@@ -422,6 +425,10 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 	}
 
 	return o.runShell(runCtx, client)
+}
+
+func sshConnectionError(nodeID string, err error) error {
+	return fmt.Errorf("[%s] %s: %w", nodeID, i18n.T("ssh_connection_failed_label"), err)
 }
 
 func (o *SshOptions) runShell(ctx context.Context, client *ssh.Client) error {

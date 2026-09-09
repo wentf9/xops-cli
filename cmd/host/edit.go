@@ -148,7 +148,11 @@ func NewCmdInventoryDelete() *cobra.Command {
 			if name == "" {
 				return fmt.Errorf("节点 %s 不存在", query)
 			}
-			if err := repository.DeleteNodesAtRefsContext(cmd.Context(), []config.NodeRef{view.NodeRefs[name]}); err != nil {
+			service, err := utils.GetCredentialService(repository, view.Configuration)
+			if err != nil {
+				return err
+			}
+			if err := repository.DeleteNodesWithCredentialsContext(cmd.Context(), []config.NodeRef{view.NodeRefs[name]}, service); err != nil {
 				return fmt.Errorf("delete node %q failed: %w", name, err)
 			}
 			logger.PrintSuccess(i18n.Tf("node_delete_success", map[string]any{"Name": name}))

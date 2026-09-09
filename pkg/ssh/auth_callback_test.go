@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -153,6 +154,19 @@ func runAuthCallbackHandshake(t *testing.T, authCallback ssh.ClientAuthCallback,
 		return fmt.Errorf("test SSH server handshake failed: %w", serverErr)
 	}
 	return nil
+}
+
+func TestAutoAuthReportsPublicKeyOnlyServerWithoutLocalKeys(t *testing.T) {
+	setTestHome(t)
+	t.Setenv("SSH_AUTH_SOCK", "")
+	plan := buildAutoAuthPlan(t.Context(), AutoAuthOptions{LifecycleCtx: t.Context()})
+	if plan.cleanup != nil {
+		defer plan.cleanup()
+	}
+	err := runAuthCallbackHandshake(t, plan.authCallback, newAuthTestSigner(t).PublicKey(), "")
+	if err == nil || !strings.Contains(err.Error(), "publickey") || !strings.Contains(err.Error(), "no matching local key") {
+		t.Fatalf("unhelpful authentication error: %v", err)
+	}
 }
 
 func TestSequentialAuthCallback_EmptyAgentDoesNotMaskExplicitKey(t *testing.T) {

@@ -510,10 +510,13 @@ mcp_serve_short:
   other: "通过标准输入输出启动 MCP 服务端"
 
 # ---- init ----
+tui_status_cleanup_pending:
+  other: "配置变更已生效，凭据清理待重试。请运行 'xops credential gc'：{{.Error}}"
+
 init_short:
   other: "初始化 XOps 本地配置"
 init_long:
-  other: "创建本地配置和加密密钥，并从 OpenSSH 配置导入明确的 Host 条目。初始化不会连接任何远程主机，也不会覆盖已有节点。"
+  other: "创建 Schema v2 配置，默认关闭凭据持久化（none），并从 OpenSSH 配置导入明确的 Host 条目。新安装不创建加密密钥。初始化不会连接任何远程主机，也不会覆盖已有节点。"
 flag_init_ssh_config:
   other: "要导入的 OpenSSH 配置文件"
 flag_init_skip_ssh_import:
@@ -524,8 +527,10 @@ init_status_existing:
   other: "XOps 配置已存在，已保留现有内容"
 init_config_path:
   other: "配置文件: {{.Path}}"
-init_key_path:
-  other: "加密密钥: {{.Path}}"
+init_credential_policy:
+  other: "凭据: none（仅当前会话）。无桌面环境请配置 pass 或 external helper；桌面环境请先配置 system 并运行 'xops credential doctor'，仅在探测通过后将其设为默认。"
+legacy_config_warning:
+  other: "警告: Schema v1 已弃用，自 Schema v2 默认切换的正式版本起保留两个正式发布周期的兼容期。请先运行 'xops credential migrate --dry-run --to <store>'；验证迁移并显式执行 finalize-migration 前，请保留旧配置和 secret.key。"
 init_import_summary:
   other: "OpenSSH 主机: 导入 {{.Imported}}，跳过 {{.Skipped}}"
 init_import_issue:
@@ -714,6 +719,8 @@ ssh_err_save_config:
   other: "保存配置文件失败: {{.Error}}"
 ssh_err_connect:
   other: "连接失败: {{.Error}}"
+ssh_connection_failed_label:
+  other: "连接失败"
 ssh_err_shell:
   other: "SSH shell 失败: {{.Error}}"
 

@@ -23,6 +23,9 @@ const (
 	OpDelete OperationType = "delete"
 	// OpCreate 表示新增凭据操作。
 	OpCreate OperationType = "create"
+	// OpAssetDelete tracks cleanup after an atomic inventory deletion. Recovery
+	// checks global reference reachability because the target entity is gone.
+	OpAssetDelete OperationType = "asset_delete"
 )
 
 // Stage 定义凭据事务日志所处的阶段。
@@ -89,7 +92,7 @@ func (j *JournalEntry) Validate() error {
 		return err
 	}
 	switch j.Op {
-	case OpRotate, OpDelete, OpCreate:
+	case OpRotate, OpDelete, OpCreate, OpAssetDelete:
 	default:
 		return fmt.Errorf("%w: invalid operation %q", ErrJournalCorrupted, string(j.Op))
 	}
@@ -107,6 +110,9 @@ func (j *JournalEntry) Validate() error {
 		if err := j.NewRef.Validate(); err != nil {
 			return fmt.Errorf("%w: newRef invalid: %w", ErrJournalCorrupted, err)
 		}
+	}
+	if j.Op == OpAssetDelete && (j.OldRef == nil || j.OldRef.IsEmpty() || j.NewRef != nil) {
+		return fmt.Errorf("%w: asset deletion requires only a nonempty old reference", ErrJournalCorrupted)
 	}
 	return nil
 }

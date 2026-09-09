@@ -244,6 +244,16 @@ func (a *SSHAdapter) UpdateAuth(ctx context.Context, nodeID, authUpdateToken, pa
 		// 显式指定 session-only 覆盖，不写回持久化配置
 		return authUpdateToken, nil
 	}
+	if password != "" || passphrase != "" {
+		var err error
+		password, passphrase, err = a.newAuthenticationMaterial(ctx, nodeID, password, keyPath, passphrase)
+		if err != nil {
+			return "", err
+		}
+		if password == "" && passphrase == "" {
+			return authUpdateToken, nil
+		}
+	}
 	if a.rememberConfirmation != nil && (password != "" || passphrase != "") {
 		ok, err := a.rememberConfirmation(ctx, nodeID)
 		if err != nil {
@@ -265,6 +275,10 @@ func (a *SSHAdapter) UpdateAuth(ctx context.Context, nodeID, authUpdateToken, pa
 		}
 		return provider.UpdateAuthAtVersionContext(ctx, nodeID, authUpdateToken, password, keyPath, passphrase)
 	}
+	return a.persistAuthentication(ctx, nodeID, authUpdateToken, password, keyPath, passphrase)
+}
+
+func (a *SSHAdapter) persistAuthentication(ctx context.Context, nodeID, authUpdateToken, password, keyPath, passphrase string) (string, error) {
 	snapshot, err := a.cfgProvider.ResolveConnection(nodeID)
 	if err != nil {
 		return "", fmt.Errorf("resolve node %q for remembered authentication: %w", nodeID, err)
@@ -321,6 +335,19 @@ func (a *SSHAdapter) UpdateSudo(ctx context.Context, nodeID, sudoUpdateToken str
 	if override, ok := a.getSessionOverride(nodeID); ok && !override.Remember {
 		// 显式指定 session-only 覆盖，不写回持久化配置
 		return sudoUpdateToken, nil
+	}
+	if a.credentialService != nil && suPwd != "" {
+		snapshot, err := a.cfgProvider.ResolveConnection(nodeID)
+		if err != nil {
+			return "", fmt.Errorf("resolve privilege before recording: %w", err)
+		}
+		same, err := a.unchangedSecret(ctx, snapshot.Node.PrivilegePasswordRef, suPwd)
+		if err != nil {
+			return "", err
+		}
+		if same {
+			suPwd = ""
+		}
 	}
 	if a.rememberConfirmation != nil && suPwd != "" {
 		ok, err := a.rememberConfirmation(ctx, nodeID)

@@ -23,7 +23,7 @@
 - 🛡️ **SSH 增强与 TUI**: 完全兼容 OpenSSH (支持跳板机 JumpHost、隧道、Agent 转发)。内置精美的 **TUI (终端用户界面)**，并支持自动 Sudo 提权模式。
 - ⚡ **批量执行与传输**: 基于标签 (Tags) 对多台主机并行执行命令或本地脚本。内置 SCP/SFTP 支持，轻松实现文件批量分发。交互式 SFTP shell 具备连接保活 (KeepAlive) 与断线自动检测，网络中断后会唤醒交互提示、自动退出并返回非零状态。每个 shell 实例仅运行一次；关闭会取消并等待当前交互，再释放提示和 SFTP 资源。
 - 🔄 **声明式任务编排 (Playbook)**: 支持 YAML 格式的任务编排，组合 shell、script、copy、ensure (幂等性状态收敛) 和 template 步骤，支持并发控制与失败策略。
-- 🗂️ **加密资产管理**: 本地统一管理主机、凭据 (Identity) 和标签，旧配置的密码/passphrase 采用 AES 加密存储，可显式迁移为外部凭据库引用（Schema v2）。支持通过 CSV 模板批量导入导出。
+- 🗂️ **资产与凭据管理**: 本地统一管理主机、凭据 (Identity) 和标签，新安装默认 Schema v2，仅保存凭据库引用，不创建加密 key；旧 AES 配置可显式迁移。支持通过 CSV 模板批量导入导出。
 - 🌐 **网络与安全工具**: 集成 DNS 查询、Ping、Netcat (nc)、Base64/Hex 编码转换，以及统一的**防火墙管理器** (自动适配 firewalld, ufw, iptables, nftables)。
 - 🌍 **国际化 (i18n)**: 原生支持简体中文与英文，可根据环境自动切换。
 
@@ -49,7 +49,7 @@ make build
 #### 1. 初始化
 
 ```bash
-# 创建 ~/.xops/xops_config.yaml 和加密密钥
+# 创建 Schema v2 配置 ~/.xops/xops_config.yaml（不创建加密密钥）
 # 默认导入 ~/.ssh/config 中不含通配符的 Host；不会连接远程主机
 xops init
 
@@ -59,6 +59,15 @@ xops init --skip-ssh-import
 ```
 
 该命令可重复执行，不会覆盖已有节点。初始化完成后可运行 `xops host list` 查看导入结果。
+
+新安装默认 `credential.default_store: none`、`remember_prompted: ask`，不保存会话密码，
+也不创建 `secret.key`。无桌面环境请显式配置 `pass` 或 external（`type: helper`）；
+桌面环境先配置 `system` 并运行 `xops credential doctor`，探测通过后再设为默认。
+doctor 仅验证非交互读取链路，不保证写权限；当前 Linux secret-tool 无法禁止解锁提示，
+因此不会通过此探测。示例见 [配置文件](xops_config.example.yaml)。
+
+Schema v1 自默认切换版本起保留两个正式发布周期，普通命令向 stderr 输出弃用告警。
+兼容期内旧读取和 AES 写入仍保留；请按[迁移指南](docs/credential-migration.md)显式迁移。
 
 #### 2. 主机与资产管理
 

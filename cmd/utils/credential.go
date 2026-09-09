@@ -150,7 +150,13 @@ func EffectiveRememberPolicy(override string, cfg *config.Configuration) string 
 	return policy
 }
 
-// ShouldRememberCredential 判断是否应该持久化保存该凭据
+// ShouldRememberConfiguredCredential skips confirmation when persistence is
+// disabled or no writable default store is configured, without probing stores.
+func ShouldRememberConfiguredCredential(policy, targetName string, cfg *config.Configuration) bool {
+	return cfg.CanRememberCredentials() && ShouldRememberCredential(policy, targetName)
+}
+
+// ShouldRememberCredential applies the policy, asking only on a terminal.
 func ShouldRememberCredential(policy string, targetName string) bool {
 	p := strings.ToLower(strings.TrimSpace(policy))
 	switch p {

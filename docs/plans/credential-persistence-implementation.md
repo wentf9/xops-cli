@@ -270,6 +270,27 @@ feat: migrate encrypted credentials to configured stores
 
 ## 11. 阶段 8：默认切换和兼容清理
 
+当前进度：默认切换首批实现（2026-09-09），兼容清理尚未执行。
+
+- 已实现：缺失配置的 Store 加载返回 v2 + none + ask；init、首次资产写入及
+  OpenSSH 导入使用此默认值，新安装不创建 `secret.key`。
+- 已实现：init 提示 headless 使用 pass/external、桌面在 doctor 探测通过后选择
+  system。初始化不探测、不自动启用后端。Linux secret-tool 仍按非交互契约失败关闭。
+- 已实现：普通 CLI（含 TUI/MCP 入口）在 stderr 输出 v1 弃用告警；迁移和 finalize
+  绕过普通 schema 检查，版本/帮助等独立命令不依赖配置。
+- 已实现：本地 sudo/firewall 按需读取引用，本地 sudo 保存接入 v2 凭据服务和
+  remember 策略，none 不保存；首次节点元数据和引用在后端读回成功后原子创建。
+  覆盖首次保存锁定/不可用、重试、创建冲突、轮换和取消；未 Applied 的失败不改变
+  配置，Applied 非 Durable 保留完整创建和秘密并报告错误。
+- 命令核对补齐：CSV 导入验证的 Registry 注入、v2 导入凭据事务，以及 CLI/TUI
+  资产删除的 asset_delete 恢复日志与无引用凭据清理。GC 未完成时返回失败；
+  共享引用、提交耐久性、进程崩溃恢复和异步 TUI 删除均有回归覆盖。
+- 发布门：以首次包含默认切换的正式版本为 R，R 与下一正式版本保留 v1 运行兼容；
+  再下一正式版本拒绝普通 v1 加载，并移除 AES 写入及旧 key 自动创建路径。
+  R 的具体版本号由正式发布时登记，开发构建及日期不计作发布周期。
+- 待兼容期结束：拒绝 v1、删除兼容 AES 写入路径；迁移器及显式 finalize 继续保留。
+  目前旧 v1 的读取、明文自动加密和 AES 保存仍属于兼容路径，不能宣称已彻底清理。
+
 - 新安装写 Schema v2；
 - 桌面仅在 doctor 通过后建议 system；
 - headless 保持 none，提示 pass/external；

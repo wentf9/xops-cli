@@ -1,14 +1,28 @@
 # =============================================================================
 # XOps 示例配置文件
 # 路径: ~/.xops/xops_config.yaml
-# 密钥: ~/.xops/secret.key (自动生成，用于加密密码字段)
+# Schema v2 仅保存凭据引用，不创建 secret.key。
 # =============================================================================
-
+schema_version: 2
+credential:
+  default_store: none
+  remember_prompted: ask
+  stores:
+    none:
+      type: none
+    # headless 可显式配置并选择 ops-pass；external 使用 type: helper。
+    # ops-pass:
+    #   type: pass
+    #   timeout: 15s
+    # 桌面仅在 xops credential doctor 探测通过后选择 system。
+    # system:
+    #   type: system
+    #   timeout: 5s
 
 # =============================================================================
 # identities — 认证身份信息
 # 每个条目是一个命名的认证配置，可被多个 Node 复用。
-# 密码/私钥密码字段在首次 save 后会被 AES 加密存储。
+# 使用 identity credential set 写入已配置后端，自动生成引用；不要手写秘密值。
 # =============================================================================
 
 # 【可选】全局自定义密码提示正则，golang正则表达式格式。若非英语系统可在此处统一配置。
@@ -23,7 +37,6 @@ identities:
     user: ubuntu                        # 远程登录用户名
     auth_type: key                      # 认证方式: key | password | agent
     key_path: ~/.ssh/id_ed25519         # 私钥文件路径
-    passphrase: ""                      # 私钥密码（为空则无密码）
 
   # 使用 SSH Agent 认证（无需指定密钥路径，由 SSH Agent 代理）
   id-agent:
@@ -34,14 +47,14 @@ identities:
   id-password:
     user: root
     auth_type: password
-    password: "your-password-here"      # 密码为加密项，必须通过命令行添加
+    # 尚无引用：交互连接时输入密码；非交互调用失败关闭。
 
-  # 带私钥密码的认证
+  # 私钥认证（如需口令，通过 identity credential set 设置）
   id-key-with-passphrase:
     user: deploy
     auth_type: key
     key_path: ~/.ssh/deploy_rsa
-    passphrase: "my-key-passphrase"     # 密码为加密项，必须通过命令行添加
+    # 设置口令后自动生成 passphrase_ref 和 key_fingerprint。
 
 
 # =============================================================================
@@ -139,7 +152,7 @@ nodes:
     tags:
       - legacy
     sudo_mode: su
-    su_pwd: "root-password"             # su 所需的 root 密码，保存后自动加密
+    # 提权密码通过凭据服务保存为 privilege_password_ref，不填写 su_pwd。
 
   # 开发环境节点（宽松策略）
   dev-box:

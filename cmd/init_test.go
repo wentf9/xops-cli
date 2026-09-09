@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -46,8 +48,10 @@ func TestInitOptions_RunCreatesConfigAndImportsOpenSSH(t *testing.T) {
 	if app.ProxyJump != "jump" {
 		t.Errorf("app ProxyJump = %q, want jump", app.ProxyJump)
 	}
-	if _, err := os.Stat(o.KeyPath); err != nil {
-		t.Fatalf("secret key was not created: %v", err)
+	assertInitCredentialDefaults(t, cfg, o.KeyPath)
+	before, err := os.ReadFile(o.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	result, err = o.Run()
@@ -56,6 +60,20 @@ func TestInitOptions_RunCreatesConfigAndImportsOpenSSH(t *testing.T) {
 	}
 	if result.configCreated || result.imported != 0 || result.skipped != 2 {
 		t.Fatalf("second Run() result = %#v, want idempotent skips", result)
+	}
+	after, err := os.ReadFile(o.ConfigPath)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("repeated initialization changed existing v2 configuration: %v", err)
+	}
+}
+
+func assertInitCredentialDefaults(t *testing.T, cfg *config.Configuration, keyPath string) {
+	t.Helper()
+	if cfg.SchemaVersion != 2 || cfg.Credential == nil || cfg.Credential.DefaultStore != "none" {
+		t.Fatal("new installation must use schema v2 with none")
+	}
+	if _, err := os.Stat(keyPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("new installation created a legacy key: %v", err)
 	}
 }
 

@@ -782,10 +782,15 @@ func (r *Repository) DeleteNodeAtRefContext(ctx context.Context, ref NodeRef) (M
 // DeleteNodesAtRefsContext removes nodes only when every selected node bundle
 // still matches its displayed version. Unrelated configuration updates may merge.
 func (r *Repository) DeleteNodesAtRefsContext(ctx context.Context, refs []NodeRef) error {
+	_, err := r.deleteNodesAtRefsWithOutcome(ctx, refs)
+	return err
+}
+
+func (r *Repository) deleteNodesAtRefsWithOutcome(ctx context.Context, refs []NodeRef) (MutationOutcome, error) {
 	if len(refs) == 0 {
-		return nil
+		return MutationOutcome{}, nil
 	}
-	return r.commitContext(ctx, anyRevision, func(cfg *Configuration) error {
+	result, err := r.commitResultContext(ctx, anyRevision, func(cfg *Configuration) error {
 		if err := ensureNodeRefs(cfg, refs); err != nil {
 			return err
 		}
@@ -799,6 +804,7 @@ func (r *Repository) DeleteNodesAtRefsContext(ctx context.Context, refs []NodeRe
 		}
 		return nil
 	})
+	return MutationOutcome{Applied: result.Applied, Durable: result.Durable}, err
 }
 
 // UpdateNodeTagsContext applies one tag operation to all nodes in a single

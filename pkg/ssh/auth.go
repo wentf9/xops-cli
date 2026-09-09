@@ -480,6 +480,7 @@ func newSequentialAuthCallback(candidates []autoAuthCandidate, secProvider *auto
 	}
 
 	next := 0
+	selected := false
 	return func(ctx *ssh.ClientAuthContext) (ssh.AuthMethod, error) {
 		if secProvider != nil {
 			if err := secProvider.terminalError(); err != nil {
@@ -497,9 +498,13 @@ func newSequentialAuthCallback(candidates []autoAuthCandidate, secProvider *auto
 			}
 
 			l.Debugf("Trying SSH auth candidate: %s", candidate.label)
+			selected = true
 			return candidate.method, nil
 		}
 
+		if !selected {
+			return nil, fmt.Errorf("server permits SSH authentication methods %v, but no matching local key, agent or password method is available", ctx.AllowedMethods)
+		}
 		return nil, nil
 	}
 }

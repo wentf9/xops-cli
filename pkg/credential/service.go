@@ -493,6 +493,14 @@ func (s *Service) recoverSingleEntry(ctx context.Context, entry JournalEntry) Re
 	}()
 
 	// 3. 根据阶段进行处理
+	if entry.Op == OpAssetDelete {
+		res.Err = s.cleanupAssetReference(ctx, entry)
+		res.Action = RecoveryActionCommittedCleaned
+		if res.Err != nil {
+			res.Action = RecoveryActionScheduledForGC
+		}
+		return res
+	}
 	switch entry.Stage {
 	case StageIntent:
 		completed := s.recoverIntentStage(ctx, &entry, &res)

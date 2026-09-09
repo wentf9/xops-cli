@@ -509,10 +509,13 @@ mcp_serve_short:
   other: "Start the MCP server over standard input and output"
 
 # ---- init ----
+tui_status_cleanup_pending:
+  other: "Configuration applied; credential cleanup is pending. Retry with 'xops credential gc': {{.Error}}"
+
 init_short:
   other: "Initialize local XOps configuration"
 init_long:
-  other: "Create the local configuration and encryption key, then import concrete Host entries from OpenSSH configuration. Initialization never connects to remote hosts or overwrites existing nodes."
+  other: "Create a Schema v2 configuration with credential persistence disabled (none), then import concrete Host entries from OpenSSH configuration. No encryption key is created for new installations. Initialization never connects to remote hosts or overwrites existing nodes."
 flag_init_ssh_config:
   other: "OpenSSH configuration file to import"
 flag_init_skip_ssh_import:
@@ -523,8 +526,10 @@ init_status_existing:
   other: "XOps configuration already exists; existing content was preserved"
 init_config_path:
   other: "Configuration: {{.Path}}"
-init_key_path:
-  other: "Encryption key: {{.Path}}"
+init_credential_policy:
+  other: "Credentials: none (session only). For headless use, configure pass or an external helper. For desktop use, configure system and run 'xops credential doctor'; select it as default only after its probe passes."
+legacy_config_warning:
+  other: "Warning: Schema v1 is deprecated and supported for two official release cycles starting with the Schema v2 default release. Run 'xops credential migrate --dry-run --to <store>' before migrating; retain the old configuration and secret.key until verification and explicit finalize-migration."
 init_import_summary:
   other: "OpenSSH hosts: imported {{.Imported}}, skipped {{.Skipped}}"
 init_import_issue:
@@ -713,6 +718,8 @@ ssh_err_save_config:
   other: "Failed to save config file: {{.Error}}"
 ssh_err_connect:
   other: "Connection failed: {{.Error}}"
+ssh_connection_failed_label:
+  other: "Connection failed"
 ssh_err_shell:
   other: "SSH shell failed: {{.Error}}"
 

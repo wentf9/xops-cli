@@ -289,11 +289,16 @@ func (m *Model) handleConfigurationMutation(msg configurationMutationMsg) (tea.M
 	m.mutationPending = false
 	if msg.err != nil {
 		var durabilityErr *config.DurabilityError
+		var cleanupErr *credential.CleanupError
 		switch {
 		case errors.As(msg.err, &durabilityErr):
 			m.refreshList()
 			m.state = viewList
 			m.status = errorStyle.Render(i18n.Tf("tui_status_not_durable", map[string]any{"Error": msg.err}))
+		case errors.As(msg.err, &cleanupErr):
+			m.refreshList()
+			m.state = viewList
+			m.status = errorStyle.Render(i18n.Tf("tui_status_cleanup_pending", map[string]any{"Error": msg.err}))
 		case errors.Is(msg.err, config.ErrConfigConflict):
 			m.formConflict = msg.kind == configurationMutationForm
 			m.status = errorStyle.Render(i18n.Tf("tui_status_conflict", map[string]any{"Error": msg.err}))
@@ -558,10 +563,11 @@ func credentialAdapterOptions(repository *config.Repository, cfg modelConfig) []
 		adpOpts = append(adpOpts, adapter.WithCredentialService(cfg.credentialService))
 	}
 	policy := "ask"
-	if snapshot := repository.Snapshot(); snapshot.Credential != nil && snapshot.Credential.RememberPrompted != "" {
+	snapshot := repository.Snapshot()
+	if snapshot.Credential != nil && snapshot.Credential.RememberPrompted != "" {
 		policy = snapshot.Credential.RememberPrompted
 	}
-	recording := cfg.credentialService != nil && (policy == "always" || (policy == "ask" && cfg.rememberConfirmation != nil))
+	recording := snapshot.CanRememberCredentials() && cfg.credentialService != nil && (policy == "always" || (policy == "ask" && cfg.rememberConfirmation != nil))
 	adpOpts = append(adpOpts, adapter.WithCredentialRecording(recording))
 	if policy == "ask" {
 		adpOpts = append(adpOpts, adapter.WithRememberConfirmation(cfg.rememberConfirmation))

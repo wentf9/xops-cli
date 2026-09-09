@@ -79,6 +79,12 @@ type Identity struct {
 
 ## 4. 配置结构
 
+阶段 8 默认切换后，缺失配置从 Schema v2 开始，所有平台默认 `none` 和
+`remember_prompted: ask`，新安装不创建 `secret.key`。init 不访问后端，提示 headless
+显式配置 pass/external；桌面用户须在 system 的 doctor 探测通过后自行选择默认 Store。
+现有 v1 在 ADR 规定的两个正式发布周期内保留原兼容行为，普通命令仅向 stderr 告警；
+迁移和 finalize 不经过普通命令的 schema 检查。以下是用户显式配置后端后的示例。
+
 ```yaml
 schema_version: 2
 
@@ -268,6 +274,12 @@ YAML 与凭据后端不能形成单一 ACID 事务。所有操作使用新 ref �
 
 ### 删除
 
+资产删除（host delete、identity delete 和 TUI）先记录逐引用的 `asset_delete`
+journal，再一次性 CAS 删除资产。GC 对这类日志检查全局引用及其持久化状态，
+不再要求被删除的实体存在。共享引用保留；Applied 非 Durable 时不得清理秘密。
+清理失败返回 CleanupError 并保留日志，TUI 显示配置已生效且清理待重试。
+普通 credential gc 若仍有失败条目，返回非零结果。
+
 1. Repository 先删除配置引用并 durable；
 2. 重新加载当前配置，确认没有任何引用；
 3. 删除 Store 项；
@@ -298,6 +310,12 @@ journal 使用 `0600` 和原子替换，只记录 refs、操作类型、配置�
 
 ## 12. 调用方行为
 
+命令入口逐项核对和待完善项见[命令凭据接入核对](../credential-command-audit.md)。
+
+Schema v2 的 CSV 导入使用非交互凭据服务，秘密写入/读回后才原子提交整行元数据与
+引用；现有节点使用完整编辑版本 CAS。验证 SSH 连接发生在提交之后，验证失败不会
+回滚已提交的资产。未配置可写默认 Store 时拒绝导入秘密。兼容 loadHost 共用此路径。
+
 ### CLI
 
 - 废弃将秘密直接放入 argv 的 `--password`、`--passphrase`、`--suPwd`；
@@ -307,6 +325,16 @@ journal 使用 `0600` 和原子替换，只记录 refs、操作类型、配置�
 - 错误由 cmd 层统一展示一次。
 
 阶段 6 接入约束：
+
+- 阶段 8 补齐本地 sudo/firewall：本地身份的登录密码引用按需读取并透传 context，
+  后端错误直接返回。sudo 成功后的保存遵循 remember 策略，none 仅当前会话；
+  v2 显式保存走凭据服务，首次保存先写入并读回验证秘密，再在一个配置事务中创建
+  节点、主机、身份与凭据引用；创建冲突时不覆盖已有资产。后端或配置提交未 Applied
+  时配置保持不变；Applied 但非 Durable 时保留整次创建与秘密，返回耐久性错误，
+  不回滚。既有节点通过同一凭据服务轮换引用。
+- 远程 firewall 复用 SSH 的 Registry、CredentialService 和认证成功后的 remember
+  确认策略，读取所有凭据引用（包括跳板机与提权）。单目标允许交互；逗号多目标、
+  主机文件或标签批处理使用非交互连接器，禁止解锁提示及自动记录秘密。
 
 - `identity add/edit`、`host add/edit` 的兼容 `--password`、`--key-pass` 参数
   发出弃用告警，秘密通过 CredentialService 写入；不再写入旧 AES 密码字段。
@@ -322,7 +350,13 @@ journal 使用 `0600` 和原子替换，只记录 refs、操作类型、配置�
   重试；新连接不再读取旧引用。其他节点仍引用的共享秘密不会被物理删除。
   新私钥仍需口令时必须显式提供 `--key-pass`，不能静默丢弃已有引用。
 - `--remember` 的优先级为显式参数、`credential.remember_prompted`、`ask`。
-  `ask` 在节点解析时不提问，连接命令组装时只询问一次；无终端时不保存。
+  `ask` 在节点解析和连接命令组装时不提问，仅在认证成功、确有新凭据需要保存时
+  确认；无终端时不保存。auto 认证返回的秘密与现有引用内容相同时不询问、不轮换，
+  私钥口令还需匹配 KeyPath。`y` 和 `yes` 均表示同意。
+  已迁移 v2 的引用立即生效，此行为不依赖是否执行 finalize-migration。
+  自动保存还要求已配置可写的默认 Store：v1 未配置 credential/default_store、
+  默认 none、默认库缺失或只读时，CLI/TUI 不询问是否保存，凭据仅用于当前会话。
+  此检查不探测后端；已配置可写后端在实际保存时锁定或不可用仍返回原错误。
 - `credential doctor` 使用随机探测 ItemID 执行带超时的非交互 Get，成功或
   not-found 表示读取链路可用；locked、denied、unavailable 均失败。
   不写入探测秘密，不承诺写入权限或每个实际条目的 ACL 可用。

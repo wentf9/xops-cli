@@ -275,7 +275,11 @@ func NewCmdIdentityDelete() *cobra.Command {
 				return fmt.Errorf("resolve identity %q reference: %w", name, config.ErrIdentityNotFound)
 			}
 
-			if _, err := repository.DeleteIdentityAtRefContext(cmd.Context(), ref); err != nil {
+			service, err := utils.GetCredentialService(repository, view.Configuration)
+			if err != nil {
+				return err
+			}
+			if err := repository.DeleteIdentityWithCredentialsContext(cmd.Context(), ref, service); err != nil {
 				return fmt.Errorf("delete identity %q failed: %w", name, err)
 			}
 

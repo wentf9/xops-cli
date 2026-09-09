@@ -23,6 +23,7 @@ import (
 )
 
 type ExecOptions struct {
+	interaction *cliInteractionHandler
 	SshOptions
 	HostFile     string
 	ShellFile    string
@@ -330,7 +331,7 @@ func (o *ExecOptions) RunContext(ctx context.Context) (retErr error) {
 	}
 	var connector *ssh.Connector
 	if o.Interactive {
-		connector = newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
+		connector = newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithInteractionHandler(o.interaction))
 	} else {
 		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
 	}
@@ -426,13 +427,16 @@ func (o *ExecOptions) runInteractive(
 }
 
 func (o *ExecOptions) buildAdapterOptions(tasks []execHostTask, cfg *config.Configuration, repository *config.Repository) ([]adapter.Option, error) {
-	var adpOpts []adapter.Option
+	if o.interaction == nil {
+		o.interaction = newCLIInteractionHandler()
+	}
+	remember, adpOpts := o.interaction.rememberOptions(utils.EffectiveRememberPolicy(o.Remember, cfg), cfg)
 	if !o.Interactive {
+		remember = false
 		// Batch execution must fail closed instead of waiting for a terminal
 		// prompt, and must never record automatically discovered credentials.
 		adpOpts = append(adpOpts, adapter.WithNonInteractive(true))
 	}
-	remember := o.shouldRememberCredential("execution", cfg)
 	// A global policy applies to proxy-jump nodes, which do not have a task
 	// specific override. Explicit task credentials remain scoped to their target.
 	adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{Remember: remember}))
@@ -460,7 +464,7 @@ func (o *ExecOptions) shouldRememberCredential(target string, cfg *config.Config
 	if !o.Interactive {
 		return false
 	}
-	return utils.ShouldRememberCredential(utils.EffectiveRememberPolicy(o.Remember, cfg), target)
+	return utils.ShouldRememberConfiguredCredential(utils.EffectiveRememberPolicy(o.Remember, cfg), target, cfg)
 }
 
 func (o *ExecOptions) getOrCreateNode(ctx context.Context, repository *config.Repository, target config.ConnectionTarget, addr utils.HostInfo) (string, bool, error) {

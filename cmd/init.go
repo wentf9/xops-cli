@@ -133,8 +133,10 @@ func (o *InitOptions) printResult(cmd *cobra.Command, result initResult) error {
 	if _, err := fmt.Fprintln(cmd.OutOrStdout(), i18n.Tf("init_config_path", map[string]any{"Path": o.ConfigPath})); err != nil {
 		return fmt.Errorf("write configuration path: %w", err)
 	}
-	if _, err := fmt.Fprintln(cmd.OutOrStdout(), i18n.Tf("init_key_path", map[string]any{"Path": o.KeyPath})); err != nil {
-		return fmt.Errorf("write key path: %w", err)
+	if result.configCreated {
+		if _, err := fmt.Fprintln(cmd.OutOrStdout(), i18n.T("init_credential_policy")); err != nil {
+			return fmt.Errorf("write credential policy: %w", err)
+		}
 	}
 	if _, err := fmt.Fprintln(cmd.OutOrStdout(), i18n.Tf("init_import_summary", map[string]any{
 		"Imported": result.imported,

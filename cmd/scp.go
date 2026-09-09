@@ -1140,9 +1140,10 @@ func (o *ScpOptions) validateRemoteRelayResumePrefix(ctx context.Context, srcFil
 var errPrefixMismatch = errors.New("resume prefix mismatch")
 
 func (o *ScpOptions) credentialConnector(provider *config.Repository, cfg *config.Configuration) (*ssh.Connector, error) {
-	var adpOpts []adapter.Option
+	interaction := newCLIInteractionHandler()
+	shouldRemember, adpOpts := interaction.rememberOptions(cmdutils.EffectiveRememberPolicy(o.Remember, cfg), cfg)
 	batch := o.Tag != "" || strings.Contains(o.Host, ",") || o.HostFile != ""
-	shouldRemember := !batch && cmdutils.ShouldRememberCredential(cmdutils.EffectiveRememberPolicy(o.Remember, cfg), o.Host)
+	shouldRemember = !batch && shouldRemember
 	if batch {
 		adpOpts = append(adpOpts, adapter.WithNonInteractive(true))
 	}
@@ -1165,7 +1166,7 @@ func (o *ScpOptions) credentialConnector(provider *config.Repository, cfg *confi
 	if batch {
 		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
 	} else {
-		connector = newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
+		connector = newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithInteractionHandler(interaction))
 	}
 	return connector, nil
 }

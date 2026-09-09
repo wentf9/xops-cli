@@ -87,7 +87,22 @@ xops credential finalize-migration
 已迁移的 v2 通过独立的严格读取/保存路径运行，不再读取或创建 `secret.key`，也不允许
 重新写入密码字段。CLI、TUI 和认证成功后的 passphrase 写回会在配置事务外校验私钥，
 将公钥指纹与新引用一起提交并记录到恢复日志，满足 v2 对 passphrase 的绑定要求。
-新安装的默认格式和普通 v1 的兼容周期仍属于阶段 8，本阶段未切换。
+阶段 8 已将新安装默认切换为 v2 + none，不创建旧 key。普通 v1 命令向 stderr 输出
+弃用告警（MCP stdout 不受影响），自首次包含默认切换的正式版本起保留两个正式发布
+周期。兼容期内旧 AES 读写和 key 创建仍保留；到期后普通命令拒绝 v1，迁移命令继续
+可用。具体发布门见[实施计划](plans/credential-persistence-implementation.md)。
+
+## 首次连接与认证排查
+
+`default_store: none` 仅禁用秘密持久化，不禁止登记节点元数据。SSH 当前先登记新
+节点，再尝试连接，因此端口错误、主机密钥拒绝或认证失败后仍可能留下节点；节点
+存在不表示连接验证成功。确认无用后可用 `xops host delete <节点ID>` 显式删除。
+
+若系统 `ssh -vvv` 显示 `Authentications that can continue: publickey`，服务端仅允许
+公钥认证。全新环境必须提供相应私钥或 SSH agent，且公钥已获服务端授权，例如：
+`xops ssh root@10.0.0.4:3922 -i /path/to/private_key`。迁移、设置 default_store 或
+finalize 都不会改变服务端认证策略；客户端不能在此情况下改用密码认证。
+没有匹配认证候选时，XOps 会报告服务端允许的方法；主机密钥确认接受 `y`/`yes`。
 
 ## 验证覆盖
 

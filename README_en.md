@@ -23,7 +23,7 @@
 - 🛡️ **Advanced SSH & TUI**: Fully OpenSSH-compatible (JumpHosts, Tunnels, Agent Forwarding). Includes a beautiful **Terminal UI (TUI)** for interactive management and an automated `sudo` mode.
 - ⚡ **Batch Execution & Transfer**: Run commands or local scripts in parallel across multiple servers using tags. Effortless file distribution with built-in SCP/SFTP. The interactive SFTP shell detects disconnects, wakes the active prompt, exits automatically, and returns a non-zero status when the network drops. Each shell instance runs once; closing it cancels and waits for the active interaction before releasing prompt and SFTP resources.
 - 🔄 **Declarative Orchestration (Playbook)**: YAML-based task orchestration combining shell, script, copy, ensure (idempotent state convergence), and template steps, with concurrency control and error handling strategies.
-- 🗂️ **Encrypted Inventory**: Manage hosts, credentials (Identities), and tags with legacy AES encryption or explicitly migrated credential references (Schema v2). Supports bulk import/export via CSV.
+- 🗂️ **Inventory and Credentials**: Manage hosts, credentials (Identities), and tags. New installations default to Schema v2 credential references without creating an encryption key; legacy AES configurations support explicit migration. Supports bulk import/export via CSV.
 - 🌐 **Network & Sec Tools**: Integrated DNS lookup, Ping, Netcat (nc), Base64/Hex encoding, and a unified **Firewall Manager** (supports firewalld, ufw, iptables, nftables).
 - 🌍 **Built-in i18n**: Native support for English and Simplified Chinese.
 
@@ -49,7 +49,7 @@ make build
 #### 1. Initialize
 
 ```bash
-# Create ~/.xops/xops_config.yaml and its encryption key.
+# Create Schema v2 ~/.xops/xops_config.yaml without an encryption key.
 # Concrete Hosts from ~/.ssh/config are imported without connecting to them.
 xops init
 
@@ -59,6 +59,18 @@ xops init --skip-ssh-import
 ```
 
 The command is idempotent and never overwrites existing nodes. Run `xops host list` to review the result.
+
+New installations use `credential.default_store: none` and `remember_prompted: ask`,
+keep passwords session-local, and do not create `secret.key`. On headless systems,
+explicitly configure `pass` or an external store (`type: helper`). On desktops,
+configure `system`, run `xops credential doctor`, and select it as default only after
+its probe passes. Doctor checks non-interactive reads, not write permissions; the
+current Linux secret-tool cannot suppress unlock prompts and fails this probe.
+See the [example configuration](xops_config.example.yaml).
+
+Schema v1 remains supported for two official release cycles starting with the default
+switch release, with deprecation warnings on stderr. Legacy AES reads and writes remain
+during that window; follow the [migration guide](docs/credential-migration.md) to migrate explicitly.
 
 #### 2. Inventory & Tags
 

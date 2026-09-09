@@ -12,11 +12,13 @@ import (
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/ssh"
+	"golang.org/x/term"
 )
 
 type cliInteractionHandler struct {
-	promptGate chan struct{}
-	terminal   terminal.Prompter
+	canRemember bool
+	promptGate  chan struct{}
+	terminal    terminal.Prompter
 }
 
 var _ ssh.InteractionHandler = (*cliInteractionHandler)(nil)
@@ -25,8 +27,9 @@ func newCLIInteractionHandler() *cliInteractionHandler {
 	gate := make(chan struct{}, 1)
 	gate <- struct{}{}
 	return &cliInteractionHandler{
-		promptGate: gate,
-		terminal:   terminal.NewPrompter(os.Stdin, os.Stdout),
+		canRemember: term.IsTerminal(int(os.Stdin.Fd())),
+		promptGate:  gate,
+		terminal:    terminal.NewPrompter(os.Stdin, os.Stdout),
 	}
 }
 
@@ -34,13 +37,21 @@ func newCLIInteractionHandlerWithStreams(stdin io.Reader, stdout io.Writer) *cli
 	gate := make(chan struct{}, 1)
 	gate <- struct{}{}
 	return &cliInteractionHandler{
-		promptGate: gate,
-		terminal:   terminal.NewPrompter(stdin, stdout),
+		canRemember: true,
+		promptGate:  gate,
+		terminal:    terminal.NewPrompter(stdin, stdout),
 	}
 }
 
-func newCLIConnector(provider config.ConfigProvider, opts ...ssh.Option) *ssh.Connector {
-	return newCLIConnectorWithAdapterOptions(provider, nil, opts...)
+// rememberOptions configures deferred confirmation; constructing a connector
+// must never ask to save credentials it has not yet used or discovered.
+func (h *cliInteractionHandler) rememberOptions(policy string, cfg *config.Configuration) (bool, []adapter.Option) {
+	enabled := cfg.CanRememberCredentials() && (policy == "always" || (policy == "ask" && h.canRemember))
+	var opts []adapter.Option
+	if enabled && policy == "ask" {
+		opts = append(opts, adapter.WithRememberConfirmation(h.confirmRemember))
+	}
+	return enabled, opts
 }
 
 func newCLIConnectorWithAdapterOptions(provider config.ConfigProvider, adpOpts []adapter.Option, opts ...ssh.Option) *ssh.Connector {
@@ -101,7 +112,8 @@ func (h *cliInteractionHandler) ConfirmHostKey(ctx context.Context, request ssh.
 	if err != nil {
 		return false, fmt.Errorf("read host key confirmation failed: %w", err)
 	}
-	return strings.EqualFold(strings.TrimSpace(response), "yes"), nil
+	response = strings.TrimSpace(response)
+	return strings.EqualFold(response, "yes") || strings.EqualFold(response, "y"), nil
 }
 
 func formatSecretPrompt(req ssh.SecretRequest) string {
@@ -169,5 +181,6 @@ func (h *cliInteractionHandler) confirmRemember(ctx context.Context, nodeID stri
 	if err != nil {
 		return false, fmt.Errorf("read credential persistence decision: %w", err)
 	}
-	return strings.EqualFold(strings.TrimSpace(answer), "yes"), nil
+	answer = strings.TrimSpace(answer)
+	return strings.EqualFold(answer, "yes") || strings.EqualFold(answer, "y"), nil
 }

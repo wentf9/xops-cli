@@ -16,6 +16,16 @@ type Configuration struct {
 	PasswordPromptPattern string                                   `yaml:"password_prompt_pattern,omitempty"` // 全局级自定义密码提示正则
 }
 
+// CanRememberCredentials checks configured write capability without accessing a
+// backend. Missing configuration means none, including for legacy v1 files.
+func (c *Configuration) CanRememberCredentials() bool {
+	if c == nil || c.Credential == nil || c.Credential.DefaultStore == "" {
+		return false
+	}
+	store, ok := c.Credential.Stores[c.Credential.DefaultStore]
+	return ok && store.Type != StoreTypeNone && !store.ReadOnly
+}
+
 // GuardrailConfig configures the MCP safety guardrail.
 type GuardrailConfig struct {
 	Enabled           bool                        `yaml:"enabled"`

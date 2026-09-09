@@ -304,9 +304,11 @@ func newCmdCredentialGC() *cobra.Command {
 				return fmt.Errorf("write gc header failed: %w", err)
 			}
 
+			var cleanupErr error
 			for _, r := range results {
 				status := "OK"
 				if r.Err != nil {
+					cleanupErr = errors.Join(cleanupErr, r.Err)
 					status = fmt.Sprintf("ERR: %v", r.Err)
 				}
 				if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
@@ -320,6 +322,9 @@ func newCmdCredentialGC() *cobra.Command {
 				return err
 			}
 
+			if cleanupErr != nil {
+				return fmt.Errorf("credential garbage collection remains incomplete: %w", cleanupErr)
+			}
 			logger.PrintSuccessf(i18n.T("credential_gc_completed"), len(results))
 			return nil
 		},

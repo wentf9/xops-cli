@@ -27,9 +27,9 @@ func newCmdSudo() *cobra.Command {
 			isManual := false
 			if pwd == "" {
 				// 尝试从配置文件中联动
-				p, found, getErr := utils.GetLocalSudoPassword()
+				p, found, getErr := utils.GetLocalSudoPasswordContext(cmd.Context())
 				if getErr != nil {
-					logger.DefaultLogger().Debugf("get local sudo password failed: %v", getErr)
+					return fmt.Errorf("get local sudo password failed: %w", getErr)
 				}
 				if found {
 					pwd = p
@@ -66,9 +66,9 @@ func newCmdSudo() *cobra.Command {
 				return fmt.Errorf("%s: %w", i18n.T("sudo_exec_failed"), err)
 			}
 
-			// 4. 执行成功后，如果是手动输入的密码，保存到配置文件
+			// Apply the configured remember policy after successful authentication.
 			if isManual && pwd != "" {
-				if saveErr := utils.SaveLocalSudoPasswordContext(cmd.Context(), pwd); saveErr != nil {
+				if saveErr := utils.RememberLocalSudoPassword(cmd.Context(), pwd); saveErr != nil {
 					return fmt.Errorf("save local sudo password failed: %w", saveErr)
 				}
 			}

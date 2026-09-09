@@ -481,6 +481,34 @@ func TestCommands_SSHRememberNeverCoversProxyJump(t *testing.T) {
 	}
 }
 
+func TestCommands_SSHLegacyWithoutStoreKeepsDiscoveredCredentialsInSession(t *testing.T) {
+	repo := setupTestRepository(t)
+	cfg := repo.Snapshot()
+	cfg.Credential = nil
+	o := NewSshOptions()
+	// No override: v1 defaults to ask, but has nowhere to save the answer.
+	opts, err := o.buildAdapterOptions("final-node", cfg, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adp := adapter.NewSSHAdapter(repo, opts...)
+	nodeID := "iaas@10.238.221.181:22"
+	before, err := repo.ResolveConnection(nodeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adp.UpdateAuth(t.Context(), nodeID, string(before.UpdateRef.AuthVersion[:]), "session-secret", "", ""); err != nil {
+		t.Fatalf("disabled persistence attempted a write: %v", err)
+	}
+	after, err := repo.ResolveConnection(nodeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Identity.Password != before.Identity.Password || after.Identity.LoginPasswordRef != nil {
+		t.Fatal("legacy authentication was changed without a writable default store")
+	}
+}
+
 func TestCommands_SSHSessionOnlyUsesSelectedKey(t *testing.T) {
 	repo := setupTestRepository(t)
 	o := NewSshOptions()
