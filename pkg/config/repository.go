@@ -700,52 +700,8 @@ func (r *Repository) ReplaceNodeAtRefWithAuthVersionContext(ctx context.Context,
 	}
 	var authVersion string
 	err := r.commitContext(ctx, anyRevision, func(cfg *Configuration) error {
-		oldNodeID := ref.ID
-		var oldNode models.Node
-		if oldNodeID != "" {
-			if err := ensureNodeRefs(cfg, []NodeRef{ref}); err != nil {
-				return err
-			}
-			var exists bool
-			oldNode, exists = cfg.Nodes.Get(oldNodeID)
-			if !exists {
-				return fmt.Errorf("resolve node %q for replacement: %w", oldNodeID, ErrNodeNotFound)
-			}
-			if existingHost, exists := cfg.Hosts.Get(node.HostRef); exists && !reflect.DeepEqual(existingHost, host) {
-				hostReferences := countNodeReferences(cfg, func(candidate models.Node) bool {
-					return candidate.HostRef == node.HostRef
-				})
-				if oldNode.HostRef == node.HostRef {
-					hostReferences--
-				}
-				if hostReferences > 0 {
-					node.HostRef = privateHostReference(cfg, nodeID)
-				}
-			}
-			if existingIdentity, exists := cfg.Identities.Get(node.IdentityRef); exists && !reflect.DeepEqual(existingIdentity, identity) {
-				identityReferences := countNodeReferences(cfg, func(candidate models.Node) bool {
-					return candidate.IdentityRef == node.IdentityRef
-				})
-				if oldNode.IdentityRef == node.IdentityRef {
-					identityReferences--
-				}
-				if identityReferences > 0 {
-					node.IdentityRef = privateIdentityReference(cfg, nodeID)
-				}
-			}
-		}
-		if oldNodeID != "" && oldNodeID != nodeID {
-			if _, exists := cfg.Nodes.Get(nodeID); exists {
-				return fmt.Errorf("rename node %q to %q: destination already exists", oldNodeID, nodeID)
-			}
-		}
-		cfg.Hosts.Set(node.HostRef, cloneHost(host))
-		cfg.Identities.Set(node.IdentityRef, identity)
-		cfg.Nodes.Set(nodeID, cloneNode(node))
-		if oldNodeID != "" && oldNodeID != nodeID {
-			removeNodeAndUnusedRefs(cfg, oldNodeID)
-		} else if oldNodeID != "" {
-			removeUnusedRefs(cfg, oldNode.HostRef, oldNode.IdentityRef)
+		if err := replaceNodeAtRef(cfg, ref, nodeID, node, host, identity); err != nil {
+			return err
 		}
 		version, versionErr := nodeAuthVersion(cfg, nodeID)
 		if versionErr != nil {
@@ -755,6 +711,59 @@ func (r *Repository) ReplaceNodeAtRefWithAuthVersionContext(ctx context.Context,
 		return nil
 	})
 	return authVersion, err
+}
+
+// replaceNodeAtRef mutates a transaction-local snapshot. Both ordinary edits
+// and credential transactions use the same conflict and shared-reference rules.
+func replaceNodeAtRef(cfg *Configuration, ref NodeRef, nodeID string, node models.Node, host models.Host, identity models.Identity) error {
+	oldNodeID := ref.ID
+	var oldNode models.Node
+	if oldNodeID != "" {
+		if err := ensureNodeRefs(cfg, []NodeRef{ref}); err != nil {
+			return err
+		}
+		var exists bool
+		oldNode, exists = cfg.Nodes.Get(oldNodeID)
+		if !exists {
+			return fmt.Errorf("resolve node %q for replacement: %w", oldNodeID, ErrNodeNotFound)
+		}
+		if existingHost, exists := cfg.Hosts.Get(node.HostRef); exists && !reflect.DeepEqual(existingHost, host) {
+			hostReferences := countNodeReferences(cfg, func(candidate models.Node) bool {
+				return candidate.HostRef == node.HostRef
+			})
+			if oldNode.HostRef == node.HostRef {
+				hostReferences--
+			}
+			if hostReferences > 0 {
+				node.HostRef = privateHostReference(cfg, nodeID)
+			}
+		}
+		if existingIdentity, exists := cfg.Identities.Get(node.IdentityRef); exists && !reflect.DeepEqual(existingIdentity, identity) {
+			identityReferences := countNodeReferences(cfg, func(candidate models.Node) bool {
+				return candidate.IdentityRef == node.IdentityRef
+			})
+			if oldNode.IdentityRef == node.IdentityRef {
+				identityReferences--
+			}
+			if identityReferences > 0 {
+				node.IdentityRef = privateIdentityReference(cfg, nodeID)
+			}
+		}
+	}
+	if oldNodeID != "" && oldNodeID != nodeID {
+		if _, exists := cfg.Nodes.Get(nodeID); exists {
+			return fmt.Errorf("rename node %q to %q: destination already exists", oldNodeID, nodeID)
+		}
+	}
+	cfg.Hosts.Set(node.HostRef, cloneHost(host))
+	cfg.Identities.Set(node.IdentityRef, identity)
+	cfg.Nodes.Set(nodeID, cloneNode(node))
+	if oldNodeID != "" && oldNodeID != nodeID {
+		removeNodeAndUnusedRefs(cfg, oldNodeID)
+	} else if oldNodeID != "" {
+		removeUnusedRefs(cfg, oldNode.HostRef, oldNode.IdentityRef)
+	}
+	return nil
 }
 
 // DeleteNodeAtRefContext removes one node only if its complete bundle still
@@ -1384,6 +1393,12 @@ func (r *Repository) UpdateIdentityCredentialRefAtVersionContext(
 	kind credential.Kind,
 	newRef *credential.Ref,
 ) (MutationOutcome, string, error) {
+	return r.updateIdentityCredentialRefAtVersionContext(ctx, credential.Target{IdentityID: identityID, Kind: kind}, expectedVersion, newRef)
+}
+
+func (r *Repository) updateIdentityCredentialRefAtVersionContext(ctx context.Context, target credential.Target, expectedVersion string, newRef *credential.Ref) (MutationOutcome, string, error) {
+	identityID, kind := target.IdentityID, target.Kind
+
 	if err := kind.Validate(); err != nil {
 		return MutationOutcome{}, "", err
 	}
@@ -1430,6 +1445,8 @@ func (r *Repository) UpdateIdentityCredentialRefAtVersionContext(
 				identity.AuthType = "key"
 			}
 		}
+
+		applyIdentityCredentialMetadata(&identity, target)
 
 		cfg.Identities.Set(identityID, identity)
 
@@ -1716,7 +1733,7 @@ func (u *RepositoryConfigUpdater) ApplyCredentialRefAtVersion(
 		return credential.MutationOutcome{Applied: outcome.Applied, Durable: outcome.Durable}, newVer, adaptConfigError(err)
 	}
 	if target.IdentityID != "" {
-		outcome, newVer, err := u.repo.UpdateIdentityCredentialRefAtVersionContext(ctx, target.IdentityID, expectedVersion, target.Kind, newRef)
+		outcome, newVer, err := u.repo.updateIdentityCredentialRefAtVersionContext(ctx, target, expectedVersion, newRef)
 		return credential.MutationOutcome{Applied: outcome.Applied, Durable: outcome.Durable}, newVer, adaptConfigError(err)
 	}
 	return credential.MutationOutcome{}, "", fmt.Errorf("target must specify nodeID or identityID")
@@ -1745,4 +1762,22 @@ func (u *RepositoryConfigUpdater) ConfirmRefDurable(ctx context.Context, target 
 // AsConfigUpdater returns the credential.ConfigUpdater adapter for the repository.
 func (r *Repository) AsConfigUpdater() credential.ConfigUpdater {
 	return NewRepositoryConfigUpdater(r)
+}
+
+func applyIdentityCredentialMetadata(identity *models.Identity, target credential.Target) {
+	if target.KeyPath != "" {
+		identity.KeyPath = target.KeyPath
+	}
+	if target.AuthType != "" {
+		identity.AuthType = target.AuthType
+	}
+	if target.ClearKeyPath {
+		identity.KeyPath = ""
+	}
+	if target.ClearLegacyLoginPassword {
+		identity.Password = ""
+	}
+	if target.ClearLegacyPassphrase {
+		identity.Passphrase = ""
+	}
 }

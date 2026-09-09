@@ -141,6 +141,10 @@ func (s *linuxNativeStore) Delete(ctx context.Context, ref credential.Ref) error
 }
 
 func (s *linuxNativeStore) execCmd(ctx context.Context, args []string, stdinData []byte) ([]byte, string, error) {
+	if credential.InteractionDisabled(ctx) {
+		return nil, "", fmt.Errorf("%w: secret-tool cannot guarantee prompt-free access; configure a non-interactive helper", credential.ErrCredentialStoreUnavailable)
+	}
+
 	timeout := s.timeout
 	if timeout <= 0 {
 		timeout = DefaultHelperTimeout

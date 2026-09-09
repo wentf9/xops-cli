@@ -628,7 +628,7 @@ func (m *Model) syncCredentialsToStore(ctx context.Context, nodeID, authVersion 
 	}
 	credSvc := m.credentialService
 	cfg := m.repository.Snapshot()
-	targetStore := "system"
+	targetStore := "none"
 	if cfg != nil && cfg.Credential != nil {
 		targetStore = cfg.Credential.DefaultStore
 	}

@@ -96,7 +96,7 @@ func NewCmdSsh() *cobra.Command {
 	cmd.Flags().BoolVar(&o.PasswordStdin, "password-stdin", false, i18n.T("flag_password_stdin"))
 	cmd.Flags().StringVar(&o.Passphrase, "passphrase", "", i18n.T("flag_passphrase"))
 	cmd.Flags().BoolVar(&o.PassphraseStdin, "passphrase-stdin", false, i18n.T("flag_passphrase_stdin"))
-	cmd.Flags().StringVar(&o.Remember, "remember", utils.RememberPolicyAsk, i18n.T("flag_remember"))
+	cmd.Flags().StringVar(&o.Remember, "remember", "", i18n.T("flag_remember"))
 	cmd.Flags().BoolVar(&o.Sudo, "sudo", false, i18n.T("flag_sudo"))
 	cmd.Flags().StringVar(&o.Alias, "alias", "", i18n.T("flag_alias"))
 	cmd.Flags().StringSliceVar(&o.Tags, "tag", []string{}, i18n.T("flag_tag"))
@@ -326,7 +326,7 @@ func (o *SshOptions) runParentDaemon(ctx context.Context) (err error) {
 
 func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuration, repository *config.Repository) ([]adapter.Option, error) {
 	var adpOpts []adapter.Option
-	shouldRemember := utils.ShouldRememberCredential(o.Remember, o.Target.Selector)
+	shouldRemember := utils.ShouldRememberCredential(utils.EffectiveRememberPolicy(o.Remember, cfg), o.Target.Selector)
 	// The global policy also covers ProxyJump nodes. The target-specific override
 	// below carries its explicit session material without leaking it to jumps.
 	adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{Remember: shouldRemember}))
@@ -490,7 +490,7 @@ func (o *SshOptions) resolveNode(ctx context.Context, provider *config.Repositor
 		}
 	}
 
-	shouldRemember := utils.ShouldRememberCredential(o.Remember, o.Target.Selector)
+	shouldRemember := utils.EffectiveRememberPolicy(o.Remember, provider.Snapshot()) == utils.RememberPolicyAlways
 
 	res, err := provider.EnsureNodeContext(ctx, config.EnsureNodeOptions{
 		Target:       o.Target,

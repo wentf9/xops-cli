@@ -94,7 +94,7 @@ func NewCmdExec() *cobra.Command {
 	cmd.Flags().BoolVar(&o.PasswordStdin, "password-stdin", false, i18n.T("flag_password_stdin"))
 	cmd.Flags().StringVar(&o.Passphrase, "passphrase", "", i18n.T("flag_passphrase"))
 	cmd.Flags().BoolVar(&o.PassphraseStdin, "passphrase-stdin", false, i18n.T("flag_passphrase_stdin"))
-	cmd.Flags().StringVar(&o.Remember, "remember", utils.RememberPolicyAsk, i18n.T("flag_remember"))
+	cmd.Flags().StringVar(&o.Remember, "remember", "", i18n.T("flag_remember"))
 	cmd.Flags().StringVar(&o.Alias, "alias", "", i18n.T("flag_alias"))
 	cmd.Flags().BoolVar(&o.Sudo, "sudo", false, i18n.T("flag_exec_sudo"))
 	cmd.Flags().StringVar(&o.SuPwd, "suPwd", "", i18n.T("flag_exec_su_pwd"))
@@ -432,7 +432,7 @@ func (o *ExecOptions) buildAdapterOptions(tasks []execHostTask, cfg *config.Conf
 		// prompt, and must never record automatically discovered credentials.
 		adpOpts = append(adpOpts, adapter.WithNonInteractive(true))
 	}
-	remember := o.shouldRememberCredential("batch execution")
+	remember := o.shouldRememberCredential("execution", cfg)
 	// A global policy applies to proxy-jump nodes, which do not have a task
 	// specific override. Explicit task credentials remain scoped to their target.
 	adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{Remember: remember}))
@@ -456,11 +456,11 @@ func (o *ExecOptions) buildAdapterOptions(tasks []execHostTask, cfg *config.Conf
 	return adpOpts, nil
 }
 
-func (o *ExecOptions) shouldRememberCredential(target string) bool {
+func (o *ExecOptions) shouldRememberCredential(target string, cfg *config.Configuration) bool {
 	if !o.Interactive {
 		return false
 	}
-	return utils.ShouldRememberCredential(o.Remember, target)
+	return utils.ShouldRememberCredential(utils.EffectiveRememberPolicy(o.Remember, cfg), target)
 }
 
 func (o *ExecOptions) getOrCreateNode(ctx context.Context, repository *config.Repository, target config.ConnectionTarget, addr utils.HostInfo) (string, bool, error) {
@@ -788,7 +788,7 @@ func (o *ExecOptions) updateNodeFromHostInfo(ctx context.Context, nodeID string,
 		return false, fmt.Errorf("resolve exec node %q for update failed: %w", nodeID, err)
 	}
 	updated := false
-	shouldRemember := o.shouldRememberCredential(addr.Host)
+	shouldRemember := o.Interactive && utils.EffectiveRememberPolicy(o.Remember, repository.Snapshot()) == utils.RememberPolicyAlways
 	if shouldRemember {
 		updated = o.updateIdentity(&identity, addr) || updated
 		updated = o.updateNodeSudo(&node) || updated

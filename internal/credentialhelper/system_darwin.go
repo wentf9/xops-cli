@@ -357,10 +357,11 @@ func newNativeSystemStore(storeID string, cfg SystemStoreConfig) (credential.Sto
 	mergedEnv = append(mergedEnv, cfg.Env...)
 
 	opts := ProcessOptions{
-		Command: cmdPath,
-		Args:    args,
-		Env:     mergedEnv,
-		Timeout: cfg.Timeout,
+		NonInteractive: true,
+		Command:        cmdPath,
+		Args:           args,
+		Env:            mergedEnv,
+		Timeout:        cfg.Timeout,
 	}
 
 	return NewHelperStore(storeID, opts, cfg.ReadOnly)

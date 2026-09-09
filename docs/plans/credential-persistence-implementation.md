@@ -213,6 +213,15 @@ feat: coordinate credential and configuration updates
 - 统一错误映射；
 - 默认禁止记录自动发现的秘密。
 
+阶段 6 回归验收补充：旧 identity/host 参数不得写回密码字段；none 拒绝保存；后端失败
+保留编辑前认证；doctor 对缺失 helper、locked、denied 返回失败；配置 remember 策略
+被 CLI/TUI 采用；无 D-Bus 时仍可构造 TUI；非交互策略传到全部秘密种类，pass 禁止
+pinentry，未声明非交互能力的 helper 和 Linux secret-tool 在调用前失败关闭。
+
+编辑事务还需覆盖：同时更改用户名、地址、端口与密码时，后端失败后配置逐字节不变；
+并发元数据修改导致整个编辑 CAS 失败；无口令私钥切换解除旧 passphrase 引用；
+清理失败后的新 Service 可仅凭 journal 恢复，且不删除其他节点仍引用的秘密。
+
 建议按文件冲突关系顺序实施，CLI 与 TUI 可在核心接口稳定后并行，MCP 和 SSH Adapter
 应顺序实施。
 

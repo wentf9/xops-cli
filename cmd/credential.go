@@ -2,7 +2,9 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"github.com/wentf9/xops-cli/pkg/credential"
 	"os"
 	"os/exec"
 	"runtime"
@@ -62,14 +64,10 @@ func newCmdCredentialStoreList() *cobra.Command {
 			credCfg := cfg.Credential
 			if credCfg == nil {
 				credCfg = &config.CredentialConfig{
-					DefaultStore:     "system",
+					DefaultStore:     "none",
 					RememberPrompted: utils.RememberPolicyAsk,
 					Stores: map[string]config.StoreConfig{
-						"system": {
-							Type:     config.StoreTypeSystem,
-							Timeout:  5 * time.Second,
-							CacheTTL: 0,
-						},
+						"none": {Type: config.StoreTypeNone},
 					},
 				}
 			}
@@ -220,7 +218,7 @@ func runDoctorChecks(ctx context.Context) []DoctorCheckItem {
 	return items
 }
 
-func checkConfiguredStores(_ context.Context) []DoctorCheckItem {
+func checkConfiguredStores(ctx context.Context) []DoctorCheckItem {
 	var items []DoctorCheckItem
 	_, _, cfg, err := utils.GetConfigStore()
 	if err != nil {
@@ -237,7 +235,7 @@ func checkConfiguredStores(_ context.Context) []DoctorCheckItem {
 		items = append(items, DoctorCheckItem{
 			Name:    "Configured Stores",
 			Status:  "OK",
-			Message: "no custom credential stores defined, using default system store",
+			Message: "no credential stores configured; persistence is disabled (none)",
 		})
 		return items
 	}
@@ -252,11 +250,22 @@ func checkConfiguredStores(_ context.Context) []DoctorCheckItem {
 			})
 			continue
 		}
-		_ = st
+		if storeCfg.Type == config.StoreTypeNone {
+			items = append(items, DoctorCheckItem{Name: fmt.Sprintf("Store: %s", storeID), Status: "OK", Message: "persistence disabled (none)"})
+			continue
+		}
+		probeCtx, cancel := context.WithTimeout(credential.WithoutInteraction(ctx), 5*time.Second)
+		secret, probeErr := st.Get(probeCtx, credential.Ref{StoreID: storeID, ItemID: "doctor-" + credential.GenerateItemID()})
+		clear(secret.Value)
+		cancel()
+		if probeErr != nil && !errors.Is(probeErr, credential.ErrCredentialNotFound) {
+			items = append(items, DoctorCheckItem{Name: fmt.Sprintf("Store: %s", storeID), Status: "FAIL", Message: probeErr.Error()})
+			continue
+		}
 		items = append(items, DoctorCheckItem{
 			Name:    fmt.Sprintf("Store: %s", storeID),
 			Status:  "OK",
-			Message: fmt.Sprintf("type=%s, ready", storeCfg.Type),
+			Message: fmt.Sprintf("type=%s, non-interactive read probe passed; write access not tested", storeCfg.Type),
 		})
 	}
 	return items

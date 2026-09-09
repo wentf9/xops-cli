@@ -39,6 +39,7 @@ const (
 
 // Request 表示通过 stdin 传递给 helper 的请求 JSON 载荷。
 type Request struct {
+	NonInteractive  bool   `json:"nonInteractive,omitempty"`
 	ProtocolVersion int    `json:"protocolVersion"`
 	StoreID         string `json:"storeID"`
 	ItemID          string `json:"itemID"`

@@ -148,11 +148,18 @@ func (m *configurationMutation) close() error {
 type ModelOption func(*modelConfig)
 
 type modelConfig struct {
-	logger             logger.DebugLogger
-	ctx                context.Context
-	interaction        ssh.InteractionHandler
-	credentialService  *credential.Service
-	credentialRegistry *credential.Registry
+	rememberConfirmation func(context.Context, string) (bool, error)
+	logger               logger.DebugLogger
+	ctx                  context.Context
+	interaction          ssh.InteractionHandler
+	credentialService    *credential.Service
+	credentialRegistry   *credential.Registry
+}
+
+// WithRememberConfirmation supplies the UI decision for remember_prompted: ask.
+// Without a confirmer, ask remains session-only.
+func WithRememberConfirmation(confirm func(context.Context, string) (bool, error)) ModelOption {
+	return func(cfg *modelConfig) { cfg.rememberConfirmation = confirm }
 }
 
 // WithInteractionHandler injects presentation-owned SSH prompts into the TUI.
@@ -213,14 +220,7 @@ func NewModel(repository *config.Repository, opts ...ModelOption) (Model, error)
 	if cfg.interaction != nil {
 		connOpts = append(connOpts, ssh.WithInteractionHandler(cfg.interaction))
 	}
-	var adpOpts []adapter.Option
-	if cfg.credentialRegistry != nil {
-		adpOpts = append(adpOpts, adapter.WithCredentialSource(cfg.credentialRegistry))
-	}
-	if cfg.credentialService != nil {
-		adpOpts = append(adpOpts, adapter.WithCredentialService(cfg.credentialService))
-	}
-	adpOpts = append(adpOpts, adapter.WithCredentialRecording(false))
+	adpOpts := credentialAdapterOptions(repository, cfg)
 	connector := adapter.NewConnectorWithAdapterOptions(repository, adpOpts, connOpts...)
 	view := repository.View()
 	lifecycleCtx, lifecycleCancel := context.WithCancel(cfg.ctx)
@@ -547,4 +547,24 @@ func (m Model) View() string {
 	}
 
 	return appStyle.Render(s)
+}
+
+func credentialAdapterOptions(repository *config.Repository, cfg modelConfig) []adapter.Option {
+	var adpOpts []adapter.Option
+	if cfg.credentialRegistry != nil {
+		adpOpts = append(adpOpts, adapter.WithCredentialSource(cfg.credentialRegistry))
+	}
+	if cfg.credentialService != nil {
+		adpOpts = append(adpOpts, adapter.WithCredentialService(cfg.credentialService))
+	}
+	policy := "ask"
+	if snapshot := repository.Snapshot(); snapshot.Credential != nil && snapshot.Credential.RememberPrompted != "" {
+		policy = snapshot.Credential.RememberPrompted
+	}
+	recording := cfg.credentialService != nil && (policy == "always" || (policy == "ask" && cfg.rememberConfirmation != nil))
+	adpOpts = append(adpOpts, adapter.WithCredentialRecording(recording))
+	if policy == "ask" {
+		adpOpts = append(adpOpts, adapter.WithRememberConfirmation(cfg.rememberConfirmation))
+	}
+	return adpOpts
 }

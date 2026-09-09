@@ -14,11 +14,12 @@ const DefaultSystemHelperCommand = "xops-credential-system"
 
 // SystemStoreConfig 包含系统密钥库后端的配置选项。
 type SystemStoreConfig struct {
-	Command  string
-	Args     []string
-	Env      []string
-	Timeout  time.Duration
-	ReadOnly bool
+	NonInteractive bool
+	Command        string
+	Args           []string
+	Env            []string
+	Timeout        time.Duration
+	ReadOnly       bool
 }
 
 // SystemStore 封装操作系统原生密钥库或外部 helper 的凭据存储。
@@ -44,10 +45,11 @@ func NewSystemStore(storeID string, cfg SystemStoreConfig) (*SystemStore, error)
 	// 若显式配置了外部 command，遵循 Helper 协议代理调用
 	if strings.TrimSpace(cfg.Command) != "" {
 		opts := ProcessOptions{
-			Command: cfg.Command,
-			Args:    cfg.Args,
-			Env:     cfg.Env,
-			Timeout: timeout,
+			NonInteractive: cfg.NonInteractive,
+			Command:        cfg.Command,
+			Args:           cfg.Args,
+			Env:            cfg.Env,
+			Timeout:        timeout,
 		}
 		hs, err := NewHelperStore(storeID, opts, cfg.ReadOnly)
 		if err != nil {

@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
@@ -53,16 +52,21 @@ func credentialConfigOrDefault(cfg *config.Configuration) *config.CredentialConf
 		return cfg.Credential
 	}
 	return &config.CredentialConfig{
-		DefaultStore:     "system",
+		DefaultStore:     "none",
 		RememberPrompted: RememberPolicyAsk,
 		Stores: map[string]config.StoreConfig{
-			"system": {Type: config.StoreTypeSystem, Timeout: 5 * time.Second},
+			"none": {Type: config.StoreTypeNone},
 		},
 	}
 }
 
 // GetCredentialService 根据配置和存储仓库实例化凭据服务
 func GetCredentialService(repo *config.Repository, cfg *config.Configuration) (*credential.Service, error) {
+	return getCredentialService(repo, cfg, nil)
+}
+
+func getCredentialService(repo *config.Repository, cfg *config.Configuration, updater credential.ConfigUpdater) (*credential.Service, error) {
+
 	if repo == nil {
 		return nil, fmt.Errorf("configuration repository is nil")
 	}
@@ -94,7 +98,10 @@ func GetCredentialService(repo *config.Repository, cfg *config.Configuration) (*
 	if err != nil {
 		return nil, fmt.Errorf("initialize journal store: %w", err)
 	}
-	return credential.NewService(registry, journalStore, repo.AsConfigUpdater(), nil)
+	if updater == nil {
+		updater = repo.AsConfigUpdater()
+	}
+	return credential.NewService(registry, journalStore, updater, nil)
 }
 
 // ReadSecretFromReader 从指定的 Reader 流读取机密并去除末尾的换行符
@@ -125,10 +132,22 @@ func WarnFlagDeprecated(flagName, replacement string) {
 		"Flag":        flagName,
 		"Replacement": replacement,
 	})
-	if msg == "" {
-		msg = fmt.Sprintf("Flag --%s is deprecated and will be removed in a future release. Please use %s.", flagName, replacement)
+	if msg == "" || msg == "warn_flag_deprecated" {
+		msg = fmt.Sprintf("Flag --%s is deprecated and will be removed in the next stable release. Please use %s.", flagName, replacement)
 	}
 	logger.PrintWarn(msg)
+}
+
+// EffectiveRememberPolicy applies command override, configuration, then ask.
+func EffectiveRememberPolicy(override string, cfg *config.Configuration) string {
+	policy := strings.ToLower(strings.TrimSpace(override))
+	if policy == "" && cfg != nil && cfg.Credential != nil {
+		policy = cfg.Credential.RememberPrompted
+	}
+	if policy == "" {
+		return RememberPolicyAsk
+	}
+	return policy
 }
 
 // ShouldRememberCredential 判断是否应该持久化保存该凭据
@@ -149,7 +168,7 @@ func ShouldRememberCredential(policy string, targetName string) bool {
 		}
 		return ok
 	case "":
-		return true
+		return ShouldRememberCredential(RememberPolicyAsk, targetName)
 	default:
 		return false
 	}

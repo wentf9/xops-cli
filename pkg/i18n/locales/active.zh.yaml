@@ -964,9 +964,9 @@ credential_store_list_short:
 credential_doctor_short:
   other: "探测系统密钥库支持与已配置存储的连通性"
 credential_doctor_long:
-  other: "诊断当前操作系统密钥库支持情况（Linux Secret Service / macOS Keychain / Windows Credential Manager / pass），并验证配置文件中所有已配置 Store 的连通性与健康状态。"
+  other: "对已配置存储执行带超时的非交互读取探测；helper 缺失、存储锁定或权限拒绝时失败。不写入秘密，不验证写入权限。"
 credential_doctor_healthy:
-  other: "所有已配置凭据存储均健康且可用！"
+  other: "已配置存储通过非交互读取检查；未验证写入权限"
 credential_gc_short:
   other: "回收未被任何节点引用的孤儿凭据与清理残留 Journal"
 credential_gc_long:
@@ -990,4 +990,7 @@ flag_password_stdin:
 flag_passphrase_stdin:
   other: "从标准输入 (stdin) 安全读取私钥密码，避免在进程参数中暴露明文"
 flag_remember:
-  other: "凭据记住策略: ask (默认询问), always (持久化保存), never (仅会话内存)"
+  other: "凭据保存策略: ask、always、never；未指定时继承 credential.remember_prompted，再默认 ask；批处理不保存"
+
+warn_flag_deprecated:
+  other: "参数 --{{.Flag}} 已弃用，将在下一个正式版本删除。请使用 {{.Replacement}}。"

@@ -23,10 +23,12 @@ const DefaultProcessWaitDelay = 50 * time.Millisecond
 
 // ProcessOptions 包含启动子进程 credential helper 的选项。
 type ProcessOptions struct {
-	Command string
-	Args    []string
-	Env     []string
-	Timeout time.Duration
+	// NonInteractive declares that the helper honors the nonInteractive request field.
+	NonInteractive bool
+	Command        string
+	Args           []string
+	Env            []string
+	Timeout        time.Duration
 }
 
 type limitedBuffer struct {
@@ -50,6 +52,18 @@ func (l *limitedBuffer) Write(p []byte) (n int, err error) {
 
 // Run 启动 credential helper 子进程，传递 stdin 并解析 stdout 响应。
 func Run(ctx context.Context, opts ProcessOptions, action Action, req *Request) (*Response, error) {
+	if req == nil {
+		return nil, fmt.Errorf("credential helper request is nil")
+	}
+	if credential.InteractionDisabled(ctx) {
+		if !opts.NonInteractive {
+			return nil, fmt.Errorf("%w: helper does not declare non-interactive support", credential.ErrCredentialStoreUnavailable)
+		}
+		copyReq := *req
+		copyReq.NonInteractive = true
+		req = &copyReq
+	}
+
 	if strings.TrimSpace(opts.Command) == "" {
 		return nil, fmt.Errorf("credential helper command is empty")
 	}

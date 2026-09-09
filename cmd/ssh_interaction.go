@@ -21,7 +21,7 @@ type cliInteractionHandler struct {
 
 var _ ssh.InteractionHandler = (*cliInteractionHandler)(nil)
 
-func newCLIInteractionHandler() ssh.InteractionHandler {
+func newCLIInteractionHandler() *cliInteractionHandler {
 	gate := make(chan struct{}, 1)
 	gate <- struct{}{}
 	return &cliInteractionHandler{
@@ -156,4 +156,18 @@ func formatHostKeyPrompt(req ssh.HostKeyConfirmation) string {
 		return fmt.Sprintf("The authenticity of host '%s' can't be established.\n%skey fingerprint is %s.\nAre you sure you want to continue connecting (yes/no)? ", req.Hostname, algo, req.Fingerprint)
 	}
 	return text
+}
+
+// confirmRemember shares the cancellable terminal prompt gate with SSH prompts.
+func (h *cliInteractionHandler) confirmRemember(ctx context.Context, nodeID string) (bool, error) {
+	release, err := h.acquireGate(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer release()
+	answer, err := h.terminal.ReadLine(ctx, fmt.Sprintf("Save credential for %q? (yes/no): ", nodeID))
+	if err != nil {
+		return false, fmt.Errorf("read credential persistence decision: %w", err)
+	}
+	return strings.EqualFold(strings.TrimSpace(answer), "yes"), nil
 }

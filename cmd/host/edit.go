@@ -6,6 +6,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
 	"github.com/wentf9/xops-cli/pkg/config"
+	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
 	"github.com/wentf9/xops-cli/pkg/models"
@@ -25,6 +26,7 @@ func NewCmdInventoryEdit() *cobra.Command {
 		Short: i18n.T("inventory_edit_short"),
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			utils.WarnInventorySecretFlags(cmd)
 			query := args[0]
 			_, repository, _, err := utils.GetConfigStore()
 			if err != nil {
@@ -47,23 +49,35 @@ func NewCmdInventoryEdit() *cobra.Command {
 
 			updated, nameChanged := applyNodeUpdates(cmd, repository, oldName, &host, &identity, &node, flags)
 
-			if updated {
-				newName := oldName
-				if nameChanged {
-					newName = fmt.Sprintf("%s@%s:%d", identity.User, host.Address, host.Port)
-					if newName != oldName {
-						if _, exists := repository.GetNode(newName); exists {
-							return fmt.Errorf("修改后的节点名称 %s 已存在", newName)
-						}
-					}
+			newName := oldName
+			if nameChanged {
+				newName = fmt.Sprintf("%s@%s:%d", identity.User, host.Address, host.Port)
+			}
+			if newName != oldName {
+				if _, exists := repository.GetNode(newName); exists {
+					return fmt.Errorf("node %q already exists", newName)
 				}
-				if err := repository.ReplaceNodeAtRefContext(cmd.Context(), view.NodeRefs[oldName], newName, node, host, identity); err != nil {
+			}
+			write, err := utils.PrepareInventoryCredential(repository, credential.Target{NodeID: newName}, identity, flags.password, flags.keyPass, flags.keyPath, repository.NodeCredentialEdit(view.NodeRefs[oldName], newName, node, host, identity))
+			if err != nil {
+				return err
+			}
+			defer write.Clear()
+			if updated || write != nil {
+				if write != nil {
+					ref := view.NodeRefs[oldName]
+					if err := write.Save(cmd.Context(), string(ref.Version[:])); err != nil {
+						return err
+					}
+				} else if err := repository.ReplaceNodeAtRefContext(cmd.Context(), view.NodeRefs[oldName], newName, node, host, identity); err != nil {
 					return fmt.Errorf("update node %q failed: %w", oldName, err)
 				}
+
 				logger.PrintSuccess(i18n.Tf("node_update_success", map[string]any{"Name": newName}))
 			} else {
 				logger.PrintWarn(i18n.T("node_no_changes"))
 			}
+
 			return nil
 		},
 	}
@@ -93,14 +107,11 @@ func applyNodeUpdates(cmd *cobra.Command, provider aliasResolver, oldName string
 	if flags.user != "" {
 		identity.User, updated, nameChanged = flags.user, true, true
 	}
-	if flags.keyPath != "" {
-		identity.KeyPath, identity.AuthType, identity.Password, updated = utils.ToAbsolutePath(flags.keyPath), "key", "", true
-	} else if flags.password != "" {
-		identity.Password, identity.AuthType, identity.KeyPath, updated = flags.password, "password", "", true
+	// Secret replacements commit authentication metadata with the new ref.
+	if flags.keyPath != "" && flags.keyPass == "" && flags.password == "" {
+		identity.KeyPath, identity.AuthType, updated = utils.ToAbsolutePath(flags.keyPath), "key", true
 	}
-	if flags.keyPass != "" {
-		identity.Passphrase, updated = flags.keyPass, true
-	}
+
 	if cmd.Flags().Changed("alias") {
 		// 检查别名是否已被其他节点使用
 		for _, a := range flags.alias {

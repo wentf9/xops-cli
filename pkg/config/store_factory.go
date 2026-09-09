@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/wentf9/xops-cli/internal/credentialhelper"
@@ -27,9 +28,10 @@ func BuildStore(storeID string, cfg StoreConfig) (credential.Store, error) {
 			return nil, fmt.Errorf("%w: helper store %q requires non-empty command", ErrSchemaValidation, storeID)
 		}
 		opts := credentialhelper.ProcessOptions{
-			Command: cfg.Command,
-			Args:    cfg.Args,
-			Timeout: cfg.Timeout,
+			Command:        cfg.Command,
+			NonInteractive: cfg.NonInteractive,
+			Args:           cfg.Args,
+			Timeout:        cfg.Timeout,
 		}
 		baseStore, err = credentialhelper.NewHelperStore(storeID, opts, cfg.ReadOnly)
 		if err != nil {
@@ -38,11 +40,12 @@ func BuildStore(storeID string, cfg StoreConfig) (credential.Store, error) {
 
 	case StoreTypePass:
 		passCfg := credentialhelper.PassStoreConfig{
-			Prefix:   cfg.Prefix,
-			Command:  cfg.Command,
-			Args:     cfg.Args,
-			Timeout:  cfg.Timeout,
-			ReadOnly: cfg.ReadOnly,
+			Prefix:         cfg.Prefix,
+			Command:        cfg.Command,
+			NonInteractive: cfg.NonInteractive,
+			Args:           cfg.Args,
+			Timeout:        cfg.Timeout,
+			ReadOnly:       cfg.ReadOnly,
 		}
 		baseStore, err = credentialhelper.NewPassStore(storeID, passCfg)
 		if err != nil {
@@ -51,10 +54,11 @@ func BuildStore(storeID string, cfg StoreConfig) (credential.Store, error) {
 
 	case StoreTypeSystem:
 		sysCfg := credentialhelper.SystemStoreConfig{
-			Command:  cfg.Command,
-			Args:     cfg.Args,
-			Timeout:  cfg.Timeout,
-			ReadOnly: cfg.ReadOnly,
+			Command:        cfg.Command,
+			NonInteractive: cfg.NonInteractive,
+			Args:           cfg.Args,
+			Timeout:        cfg.Timeout,
+			ReadOnly:       cfg.ReadOnly,
 		}
 		baseStore, err = credentialhelper.NewSystemStore(storeID, sysCfg)
 		if err != nil {
@@ -85,10 +89,11 @@ func BuildRegistryFromConfig(credCfg *CredentialConfig) (*credential.Registry, e
 
 	reg := credential.NewRegistry()
 	for storeID, storeCfg := range credCfg.Stores {
-		st, err := BuildStore(storeID, storeCfg)
-		if err != nil {
-			return nil, fmt.Errorf("build store %q: %w", storeID, err)
+		if err := validateStoreConfig(storeID, storeCfg); err != nil {
+			return nil, err
 		}
+		storeCfg.Args = slices.Clone(storeCfg.Args)
+		st := &lazyStore{storeID: storeID, config: storeCfg}
 		if err := reg.Register(storeID, st); err != nil {
 			return nil, fmt.Errorf("register store %q: %w", storeID, err)
 		}

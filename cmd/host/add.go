@@ -5,6 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
 	"github.com/wentf9/xops-cli/pkg/models"
@@ -28,6 +29,7 @@ func NewCmdInventoryAdd() *cobra.Command {
 		Use:   "add",
 		Short: i18n.T("inventory_add_short"),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			utils.WarnInventorySecretFlags(cmd)
 			if address == "" {
 				return fmt.Errorf("必须指定主机地址 (--address)")
 			}
@@ -61,15 +63,15 @@ func NewCmdInventoryAdd() *cobra.Command {
 				}
 				identity = models.Identity{User: user}
 				if keyPath != "" {
-					identity.KeyPath, identity.Passphrase, identity.AuthType = utils.ToAbsolutePath(keyPath), keyPass, "key"
+					identity.KeyPath, identity.AuthType = utils.ToAbsolutePath(keyPath), "key"
 				} else if password != "" {
-					identity.Password, identity.AuthType = password, "password"
+					identity.AuthType = "password"
 				} else {
 					pass, err := utils.ReadPasswordFromTerminal(i18n.Tf("prompt_enter_user_password", map[string]any{"User": user}))
 					if err != nil {
 						return err
 					}
-					identity.Password, identity.AuthType = pass, "password"
+					password, identity.AuthType = pass, "password"
 				}
 				identityRef = fmt.Sprintf("%s@%s", identity.User, address)
 			}
@@ -96,8 +98,17 @@ func NewCmdInventoryAdd() *cobra.Command {
 				SudoMode:    models.SudoModeAuto,
 			}
 
-			if _, err := repository.CreateNodeContext(cmd.Context(), name, node, hostObj, identity); err != nil {
+			write, err := utils.PrepareInventoryCredential(repository, credential.Target{NodeID: name}, identity, password, keyPass, keyPath, nil)
+			if err != nil {
+				return err
+			}
+			defer write.Clear()
+			mutation, err := repository.CreateNodeContext(cmd.Context(), name, node, hostObj, identity)
+			if err != nil {
 				return fmt.Errorf("create node %q failed: %w", name, err)
+			}
+			if err := write.Save(cmd.Context(), mutation.AuthVersion); err != nil {
+				return err
 			}
 
 			logger.PrintSuccess(i18n.Tf("node_add_success", map[string]any{"Name": name}))
@@ -116,5 +127,6 @@ func NewCmdInventoryAdd() *cobra.Command {
 	cmd.Flags().StringSliceVarP(&tags, "tags", "t", []string{}, i18n.T("flag_inv_tags"))
 	cmd.Flags().StringVarP(&jump, "jump", "j", "", i18n.T("flag_inv_jump"))
 
+	cmd.MarkFlagsMutuallyExclusive("identity", "password", "key-pass")
 	return cmd
 }

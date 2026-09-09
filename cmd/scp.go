@@ -85,7 +85,7 @@ func NewCmdScp() *cobra.Command {
 	cmd.Flags().BoolVar(&o.PasswordStdin, "password-stdin", false, i18n.T("flag_password_stdin"))
 	cmd.Flags().StringVar(&o.Passphrase, "passphrase", "", i18n.T("flag_passphrase"))
 	cmd.Flags().BoolVar(&o.PassphraseStdin, "passphrase-stdin", false, i18n.T("flag_passphrase_stdin"))
-	cmd.Flags().StringVar(&o.Remember, "remember", cmdutils.RememberPolicyAsk, i18n.T("flag_remember"))
+	cmd.Flags().StringVar(&o.Remember, "remember", "", i18n.T("flag_remember"))
 	cmd.Flags().StringVar(&o.Alias, "alias", "", i18n.T("flag_alias"))
 
 	// scp-specific flags
@@ -278,24 +278,11 @@ func (o *ScpOptions) RunContext(ctx context.Context) (retErr error) {
 	if err != nil {
 		return fmt.Errorf("create configuration repository: %w", err)
 	}
-	var adpOpts []adapter.Option
-	shouldRemember := cmdutils.ShouldRememberCredential(o.Remember, o.Host)
-	adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{
-		Password: o.Password, Passphrase: o.Passphrase, Remember: shouldRemember,
-	}))
-	if shouldRemember {
-		service, serviceErr := cmdutils.GetCredentialService(provider, cfg)
-		if serviceErr != nil {
-			return fmt.Errorf("initialize credential persistence: %w", serviceErr)
-		}
-		adpOpts = append(adpOpts, adapter.WithCredentialService(service))
+	connector, err := o.credentialConnector(provider, cfg)
+	if err != nil {
+		return err
 	}
-	if reg, regErr := cmdutils.GetCredentialRegistry(cfg); regErr != nil {
-		return fmt.Errorf("initialize credential resolver: %w", regErr)
-	} else if reg != nil {
-		adpOpts = append(adpOpts, adapter.WithCredentialSource(reg))
-	}
-	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
+
 	defer func() {
 		joinConnectorCloseError(&retErr, connector)
 	}()
@@ -1029,7 +1016,7 @@ func (o *ScpOptions) getOrCreateNodeForPath(ctx context.Context, provider config
 		return "", false, err
 	}
 
-	shouldRemember := cmdutils.ShouldRememberCredential(o.Remember, target.Selector)
+	shouldRemember := cmdutils.EffectiveRememberPolicy(o.Remember, provider.Snapshot()) == cmdutils.RememberPolicyAlways
 	res, err := repo.EnsureNodeContext(ctx, config.EnsureNodeOptions{
 		Target:       target,
 		Password:     "",
@@ -1151,3 +1138,34 @@ func (o *ScpOptions) validateRemoteRelayResumePrefix(ctx context.Context, srcFil
 }
 
 var errPrefixMismatch = errors.New("resume prefix mismatch")
+
+func (o *ScpOptions) credentialConnector(provider *config.Repository, cfg *config.Configuration) (*ssh.Connector, error) {
+	var adpOpts []adapter.Option
+	batch := o.Tag != "" || strings.Contains(o.Host, ",") || o.HostFile != ""
+	shouldRemember := !batch && cmdutils.ShouldRememberCredential(cmdutils.EffectiveRememberPolicy(o.Remember, cfg), o.Host)
+	if batch {
+		adpOpts = append(adpOpts, adapter.WithNonInteractive(true))
+	}
+	adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{
+		Password: o.Password, Passphrase: o.Passphrase, Remember: shouldRemember,
+	}))
+	if shouldRemember {
+		service, serviceErr := cmdutils.GetCredentialService(provider, cfg)
+		if serviceErr != nil {
+			return nil, fmt.Errorf("initialize credential persistence: %w", serviceErr)
+		}
+		adpOpts = append(adpOpts, adapter.WithCredentialService(service))
+	}
+	if reg, regErr := cmdutils.GetCredentialRegistry(cfg); regErr != nil {
+		return nil, fmt.Errorf("initialize credential resolver: %w", regErr)
+	} else if reg != nil {
+		adpOpts = append(adpOpts, adapter.WithCredentialSource(reg))
+	}
+	var connector *ssh.Connector
+	if batch {
+		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
+	} else {
+		connector = newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
+	}
+	return connector, nil
+}

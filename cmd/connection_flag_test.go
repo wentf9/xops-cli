@@ -40,8 +40,8 @@ func TestConnectionFlagsRegistration(t *testing.T) {
 			if remember == nil {
 				t.Fatalf("%s missing --remember flag", tc.name)
 			}
-			if remember.DefValue != cmdutils.RememberPolicyAsk {
-				t.Errorf("%s --remember default value = %q, want %q", tc.name, remember.DefValue, cmdutils.RememberPolicyAsk)
+			if remember.DefValue != "" {
+				t.Errorf("%s --remember default value = %q, want %q", tc.name, remember.DefValue, "inherit configuration")
 			}
 		})
 	}
@@ -70,10 +70,11 @@ func TestShouldRememberCredential(t *testing.T) {
 	if cmdutils.ShouldRememberCredential(cmdutils.RememberPolicyNever, "host1") {
 		t.Errorf("never policy should return false")
 	}
-	// 空字符串为旧代码兼容，应默认返回 true
-	if !cmdutils.ShouldRememberCredential("", "host1") {
-		t.Errorf("empty policy should return true for backward compatibility")
+	// Empty flags inherit configuration; without configuration they remain ask.
+	if got := cmdutils.EffectiveRememberPolicy("", nil); got != "ask" {
+		t.Fatalf("default policy = %q", got)
 	}
+
 }
 
 func TestFlagsMutuallyExclusive(t *testing.T) {

@@ -60,7 +60,7 @@ func TestApplyNodeUpdates(t *testing.T) {
 		t.Errorf("alias did not update to new_alias")
 	}
 
-	// Test 3: Password change
+	// Secret flags must not publish plaintext or change authentication metadata.
 	flags3 := &editFlags{
 		password: "new_password",
 	}
@@ -68,7 +68,7 @@ func TestApplyNodeUpdates(t *testing.T) {
 	if !updated || nameChanged {
 		t.Errorf("expected updated=true, nameChanged=false, got %v/%v", updated, nameChanged)
 	}
-	if identity.Password != "new_password" || identity.AuthType != "password" {
-		t.Errorf("Test 3 fields did not update correctly")
+	if identity.Password != "" || identity.AuthType != "" {
+		t.Errorf("secret replacement changed inventory before credential transaction")
 	}
 }

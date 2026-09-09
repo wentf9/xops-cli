@@ -51,6 +51,7 @@ func NewCmdIdentityEdit() *cobra.Command {
 		Short: i18n.T("identity_edit_short"),
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			utils.WarnInventorySecretFlags(cmd)
 			name := args[0]
 			_, repository, _, err := utils.GetConfigStore()
 			if err != nil {
@@ -72,31 +73,27 @@ func NewCmdIdentityEdit() *cobra.Command {
 				updated = true
 			}
 
-			if keyPath != "" {
-				identity.KeyPath = utils.ToAbsolutePath(keyPath)
-				identity.AuthType = "key"
-				identity.Password = "" // 切换到密钥时清空密码
-				updated = true
-			} else if password != "" {
-				identity.Password = password
-				identity.AuthType = "password"
-				identity.KeyPath = "" // 切换到密码时清空密钥路径
-				updated = true
+			write, err := utils.PrepareInventoryCredential(repository, credential.Target{IdentityID: name}, identity, password, keyPass, keyPath, repository.IdentityCredentialEdit(ref, identity))
+			if err != nil {
+				return err
 			}
+			defer write.Clear()
 
-			if keyPass != "" {
-				identity.Passphrase = keyPass
-				updated = true
-			}
-
-			if updated {
+			if updated && write == nil {
 				if _, err := repository.ReplaceIdentityAtRefContext(cmd.Context(), ref, identity); err != nil {
 					return fmt.Errorf("update identity %q failed: %w", name, err)
 				}
 
-				logger.PrintSuccess(i18n.Tf("identity_update_success", map[string]any{"Name": name}))
-			} else {
+				ref = repository.View().IdentityRefs[name]
+			} else if write == nil {
 				logger.PrintWarn(i18n.T("identity_no_changes"))
+			}
+
+			if err := write.Save(cmd.Context(), string(ref.Version[:])); err != nil {
+				return err
+			}
+			if updated || write != nil {
+				logger.PrintSuccess(i18n.Tf("identity_update_success", map[string]any{"Name": name}))
 			}
 
 			return nil
@@ -188,6 +185,7 @@ func NewCmdIdentityAdd() *cobra.Command {
 		Use:   "add",
 		Short: i18n.T("identity_add_short"),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			utils.WarnInventorySecretFlags(cmd)
 			if name == "" {
 				return fmt.Errorf("%s", i18n.T("identity_err_no_name"))
 			}
@@ -211,25 +209,36 @@ func NewCmdIdentityAdd() *cobra.Command {
 
 			if keyPath != "" {
 				identity.KeyPath = utils.ToAbsolutePath(keyPath)
-				identity.Passphrase = keyPass
+				// Passphrase is saved through CredentialService after metadata creation.
 				identity.AuthType = "key"
 			} else if password != "" {
-				identity.Password = password
+				// Password is never published in the inventory.
 				identity.AuthType = "password"
 			} else {
 				pass, err := utils.ReadPasswordFromTerminal(i18n.Tf("prompt_enter_user_password", map[string]any{"User": user}))
 				if err != nil {
 					return err
 				}
-				identity.Password = pass
+				password = pass
 				identity.AuthType = "password"
 			}
+
+			write, err := utils.PrepareInventoryCredential(repository, credential.Target{IdentityID: name}, identity, password, keyPass, keyPath, nil)
+			if err != nil {
+				return err
+			}
+			defer write.Clear()
 
 			if _, err := repository.CreateIdentityContext(cmd.Context(), name, identity); err != nil {
 				if errors.Is(err, config.ErrConfigConflict) {
 					return fmt.Errorf("%s", i18n.Tf("identity_err_exists", map[string]any{"Name": name}))
 				}
 				return fmt.Errorf("add identity %q failed: %w", name, err)
+			}
+
+			ref := repository.View().IdentityRefs[name]
+			if err := write.Save(cmd.Context(), string(ref.Version[:])); err != nil {
+				return err
 			}
 
 			logger.PrintSuccess(i18n.Tf("identity_add_success", map[string]any{"Name": name}))
@@ -335,7 +344,7 @@ func newCmdIdentityCredentialSet() *cobra.Command {
 				if cfg.Credential != nil && cfg.Credential.DefaultStore != "" {
 					targetStore = cfg.Credential.DefaultStore
 				} else {
-					targetStore = "system"
+					targetStore = "none"
 				}
 			}
 

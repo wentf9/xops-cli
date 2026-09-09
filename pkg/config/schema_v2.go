@@ -25,23 +25,25 @@ const (
 
 // StoreConfig 描述单个凭据存储后端的连接与运行配置。
 type StoreConfig struct {
-	Type     StoreType     `yaml:"type"`
-	Timeout  time.Duration `yaml:"timeout"`
-	CacheTTL time.Duration `yaml:"cache_ttl"`
-	Prefix   string        `yaml:"prefix,omitempty"`
-	Command  string        `yaml:"command,omitempty"`
-	Args     []string      `yaml:"args,omitempty"`
-	ReadOnly bool          `yaml:"read_only,omitempty"`
+	Type           StoreType     `yaml:"type"`
+	Timeout        time.Duration `yaml:"timeout"`
+	CacheTTL       time.Duration `yaml:"cache_ttl"`
+	Prefix         string        `yaml:"prefix,omitempty"`
+	Command        string        `yaml:"command,omitempty"`
+	Args           []string      `yaml:"args,omitempty"`
+	NonInteractive bool          `yaml:"non_interactive,omitempty"`
+	ReadOnly       bool          `yaml:"read_only,omitempty"`
 }
 
 type rawStoreConfig struct {
-	Type     StoreType `yaml:"type"`
-	Timeout  string    `yaml:"timeout"`
-	CacheTTL string    `yaml:"cache_ttl"`
-	Prefix   string    `yaml:"prefix,omitempty"`
-	Command  string    `yaml:"command,omitempty"`
-	Args     []string  `yaml:"args,omitempty"`
-	ReadOnly bool      `yaml:"read_only,omitempty"`
+	Type           StoreType `yaml:"type"`
+	Timeout        string    `yaml:"timeout"`
+	CacheTTL       string    `yaml:"cache_ttl"`
+	Prefix         string    `yaml:"prefix,omitempty"`
+	Command        string    `yaml:"command,omitempty"`
+	Args           []string  `yaml:"args,omitempty"`
+	NonInteractive bool      `yaml:"non_interactive,omitempty"`
+	ReadOnly       bool      `yaml:"read_only,omitempty"`
 }
 
 // UnmarshalYAML 自定义反序列化，支持 "5s"、"10m" 格式的超时与缓存 TTL 配置，并严格校验未知字段。
@@ -54,13 +56,14 @@ func (s *StoreConfig) UnmarshalYAML(value *yaml.Node) error {
 	}
 
 	knownFields := map[string]struct{}{
-		"type":      {},
-		"timeout":   {},
-		"cache_ttl": {},
-		"prefix":    {},
-		"command":   {},
-		"args":      {},
-		"read_only": {},
+		"type":            {},
+		"timeout":         {},
+		"cache_ttl":       {},
+		"prefix":          {},
+		"command":         {},
+		"args":            {},
+		"read_only":       {},
+		"non_interactive": {},
 	}
 
 	for i := 0; i < len(value.Content); i += 2 {
@@ -80,6 +83,7 @@ func (s *StoreConfig) UnmarshalYAML(value *yaml.Node) error {
 	s.Command = raw.Command
 	s.Args = slices.Clone(raw.Args)
 	s.ReadOnly = raw.ReadOnly
+	s.NonInteractive = raw.NonInteractive
 
 	if strings.TrimSpace(raw.Timeout) != "" {
 		d, err := time.ParseDuration(raw.Timeout)

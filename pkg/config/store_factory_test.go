@@ -106,8 +106,8 @@ func TestBuildRegistryFromConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetStore none-store failed: %v", err)
 	}
-	if _, ok := st1.(*credential.NoneStore); !ok {
-		t.Fatalf("expected *credential.NoneStore, got %T", st1)
+	if _, err := st1.Get(t.Context(), credential.Ref{StoreID: "none-store", ItemID: "missing"}); !errors.Is(err, credential.ErrCredentialNotFound) {
+		t.Fatalf("none get: %v", err)
 	}
 
 	// 获取已注册的 pass-store（包装了 CachedStore）
@@ -115,8 +115,8 @@ func TestBuildRegistryFromConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetStore pass-store failed: %v", err)
 	}
-	if _, ok := st2.(*credential.CachedStore); !ok {
-		t.Fatalf("expected *credential.CachedStore, got %T", st2)
+	if st2 == nil {
+		t.Fatal("missing lazy pass store")
 	}
 
 	// 查询不存在的 store 应该报错

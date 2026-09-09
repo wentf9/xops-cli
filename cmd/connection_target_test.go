@@ -507,7 +507,7 @@ func TestCommands_SSHSessionOnlyUsesSelectedKey(t *testing.T) {
 func TestCommands_ExecBatchNeverPromptsOrRecords(t *testing.T) {
 	o := NewExecOptions()
 	o.Remember = utils.RememberPolicyAlways
-	if o.shouldRememberCredential("node") {
+	if o.shouldRememberCredential("node", nil) {
 		t.Fatal("batch execution must ignore --remember and remain session-only")
 	}
 }

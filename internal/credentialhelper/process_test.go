@@ -30,6 +30,13 @@ func TestHelperProcess(t *testing.T) {
 	}
 
 	switch mode {
+	case "non_interactive":
+		var req Request
+		if err := json.NewDecoder(os.Stdin).Decode(&req); err != nil || !req.NonInteractive {
+			os.Exit(98)
+		}
+		fmt.Println(`{"code":"locked"}`)
+		os.Exit(1)
 	case "echo":
 		handleEchoHelper(os.Args[len(os.Args)-1])
 	case "storage_file":
@@ -278,5 +285,24 @@ func TestProcessSecretNotInArgvOrError(t *testing.T) {
 	}
 	if resp == nil {
 		t.Fatalf("expected response")
+	}
+}
+
+func TestHelperNonInteractiveContract(t *testing.T) {
+	ctx := credential.WithoutInteraction(t.Context())
+	req := &Request{ProtocolVersion: ProtocolVersion, StoreID: "store", ItemID: "item"}
+	// An undeclared helper must be rejected before even attempting execution.
+	_, err := Run(ctx, ProcessOptions{Command: "does-not-exist"}, ActionGet, req)
+	if !errors.Is(err, credential.ErrCredentialStoreUnavailable) || !strings.Contains(err.Error(), "does not declare") {
+		t.Fatalf("untrusted non-interactive helper: %v", err)
+	}
+	opts := fakeHelperOptions("non_interactive")
+	opts.NonInteractive = true
+	_, err = Run(ctx, opts, ActionGet, req)
+	if !errors.Is(err, credential.ErrCredentialStoreLocked) {
+		t.Fatalf("helper did not receive nonInteractive: %v", err)
+	}
+	if req.NonInteractive {
+		t.Fatal("caller request was mutated")
 	}
 }

@@ -963,9 +963,9 @@ credential_store_list_short:
 credential_doctor_short:
   other: "Probe system keystore capabilities and test configured stores"
 credential_doctor_long:
-  other: "Probe current OS keystore support (Linux Secret Service / macOS Keychain / Windows Credential Manager / pass) and verify the connectivity and health of all configured Stores."
+  other: "Run bounded, non-interactive read probes against configured stores. Missing helpers, locked stores and denied access fail. No secrets are written; write access is not tested."
 credential_doctor_healthy:
-  other: "All configured credential stores are healthy and accessible!"
+  other: "Configured stores passed non-interactive read checks; write access was not tested"
 credential_gc_short:
   other: "Garbage collect unreferenced orphan credentials and pending journals"
 credential_gc_long:
@@ -989,4 +989,7 @@ flag_password_stdin:
 flag_passphrase_stdin:
   other: "Read passphrase securely from stdin to avoid exposure in command arguments"
 flag_remember:
-  other: "Credential persistence policy: ask (prompt), always (persist), never (session-only)"
+  other: "Credential persistence policy: ask, always, never; inherits credential.remember_prompted, then ask; batch mode never saves"
+
+warn_flag_deprecated:
+  other: "Flag --{{.Flag}} is deprecated and will be removed in the next stable release. Use {{.Replacement}}."

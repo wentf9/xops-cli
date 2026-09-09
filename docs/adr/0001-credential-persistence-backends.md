@@ -45,6 +45,11 @@ XOps 同时存在 CLI、TUI、MCP、Playbook 和批处理调用方。部分调�
 - 非交互调用方：默认 `remember_prompted: never`。
 - 禁止密钥库失败后自动回退到明文、Base64 或旧加密文件。
 
+非交互要求覆盖后端解锁，不只是 SSH 提示器。自定义 helper 需显式声明
+`non_interactive: true` 并遵守请求中的 `nonInteractive` 契约；无法保证禁止提示的
+后端必须在启动前失败关闭。当前 Linux 原生 secret-tool 路径受此限制，自动化使用
+pass、agent 或已声明支持的 helper。Store 初始化推迟至实际访问，普通浏览不受影响。
+
 ## 后端集合
 
 | 类型 | 用途 | 是否持久化 | 说明 |

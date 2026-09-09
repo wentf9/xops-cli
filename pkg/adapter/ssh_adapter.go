@@ -67,15 +67,22 @@ func WithCredentialRecording(enabled bool) Option {
 	}
 }
 
+// WithRememberConfirmation injects a presentation-owned decision made only
+// after authentication succeeds and before a newly discovered secret is saved.
+func WithRememberConfirmation(confirm func(context.Context, string) (bool, error)) Option {
+	return func(a *SSHAdapter) { a.rememberConfirmation = confirm }
+}
+
 // SSHAdapter 实现 ssh.ConnectionProvider, ssh.SecretResolver, ssh.CredentialRecorder 接口，作为业务模型与底层 SSH 的防腐层
 type SSHAdapter struct {
-	cfgProvider         config.ConfigProvider
-	credentialResolver  CredentialResolver
-	credentialService   *credential.Service
-	sessionOverrides    map[string]SessionAuth
-	globalSessionAuth   *SessionAuth
-	nonInteractive      bool
-	credentialRecording bool
+	cfgProvider          config.ConfigProvider
+	credentialResolver   CredentialResolver
+	credentialService    *credential.Service
+	sessionOverrides     map[string]SessionAuth
+	globalSessionAuth    *SessionAuth
+	nonInteractive       bool
+	credentialRecording  bool
+	rememberConfirmation func(context.Context, string) (bool, error)
 }
 
 // WithCredentialService injects the transactional writer used when an
@@ -237,6 +244,15 @@ func (a *SSHAdapter) UpdateAuth(ctx context.Context, nodeID, authUpdateToken, pa
 		// 显式指定 session-only 覆盖，不写回持久化配置
 		return authUpdateToken, nil
 	}
+	if a.rememberConfirmation != nil && (password != "" || passphrase != "") {
+		ok, err := a.rememberConfirmation(ctx, nodeID)
+		if err != nil {
+			return "", fmt.Errorf("confirm credential persistence: %w", err)
+		}
+		if !ok {
+			return authUpdateToken, nil
+		}
+	}
 	if a.credentialService == nil {
 		// Backward compatibility for embedders that intentionally use the
 		// legacy ConfigStore API. All xops CLI composition roots inject a
@@ -286,7 +302,7 @@ func (a *SSHAdapter) defaultStoreID() string {
 	if cfg := a.cfgProvider.Snapshot(); cfg != nil && cfg.Credential != nil {
 		return cfg.Credential.DefaultStore
 	}
-	return "system"
+	return "none"
 }
 
 // UpdateSudo 处理提权密码和模式的回写并返回本次提交后的新提权令牌
@@ -301,6 +317,15 @@ func (a *SSHAdapter) UpdateSudo(ctx context.Context, nodeID, sudoUpdateToken str
 	if override, ok := a.getSessionOverride(nodeID); ok && !override.Remember {
 		// 显式指定 session-only 覆盖，不写回持久化配置
 		return sudoUpdateToken, nil
+	}
+	if a.rememberConfirmation != nil && suPwd != "" {
+		ok, err := a.rememberConfirmation(ctx, nodeID)
+		if err != nil {
+			return "", fmt.Errorf("confirm privilege credential persistence: %w", err)
+		}
+		if !ok {
+			return sudoUpdateToken, nil
+		}
 	}
 	if a.credentialService != nil && suPwd != "" {
 		snapshot, err := a.cfgProvider.ResolveConnection(nodeID)
@@ -326,6 +351,12 @@ func (a *SSHAdapter) UpdateSudo(ctx context.Context, nodeID, sudoUpdateToken str
 
 // ResolveSecret 从当前配置模型解析认证或提权所需机密，并严格校验与连接快照的一致性
 func (a *SSHAdapter) ResolveSecret(ctx context.Context, req ssh.SecretRequest) ([]byte, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("secret resolution context is nil")
+	}
+	if a.nonInteractive {
+		ctx = credential.WithoutInteraction(ctx)
+	}
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
 			return nil, err

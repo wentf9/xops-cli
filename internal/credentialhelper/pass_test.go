@@ -36,6 +36,12 @@ func TestFakePassCLIProcess(t *testing.T) {
 	}
 
 	switch mode {
+	case "no_pinentry":
+		if os.Getenv("PASSWORD_STORE_GPG_OPTS") != "--batch --no-tty --pinentry-mode error" {
+			os.Exit(98)
+		}
+		fmt.Fprintln(os.Stderr, "gpg: decryption failed: pinentry error")
+		os.Exit(2)
 	case "storage_file":
 		filePath := os.Getenv("PASS_STORAGE_FILE")
 		dataMap := make(map[string]string)
@@ -208,4 +214,16 @@ func TestPassStoreHelperProtocolDelegation(t *testing.T) {
 		t.Fatalf("got %s, want pass-data", string(got.Value))
 	}
 	got.Zero()
+}
+
+func TestPassNonInteractiveDisablesPinentry(t *testing.T) {
+	opts := fakePassOptions("no_pinentry", "PASSWORD_STORE_GPG_OPTS=--pinentry-mode ask")
+	store, err := NewPassStore("pass", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.Get(credential.WithoutInteraction(t.Context()), credential.Ref{StoreID: "pass", ItemID: "item"})
+	if !errors.Is(err, credential.ErrCredentialStoreLocked) {
+		t.Fatalf("non-interactive pass: %v", err)
+	}
 }

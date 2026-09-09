@@ -48,11 +48,13 @@ func NewCmdTui() *cobra.Command {
 				return fmt.Errorf("initialize credential resolver: %w", regErr)
 			}
 
+			interaction := newCLIInteractionHandler()
 			model, err := tui.NewModel(
 				repository,
 				tui.WithContext(ctx),
 				tui.WithLogger(logger.DefaultLogger()),
-				tui.WithInteractionHandler(newCLIInteractionHandler()),
+				tui.WithInteractionHandler(interaction),
+				tui.WithRememberConfirmation(interaction.confirmRemember),
 				tui.WithCredentialService(credSvc),
 				tui.WithCredentialRegistry(credReg),
 			)

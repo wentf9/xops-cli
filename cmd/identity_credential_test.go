@@ -26,6 +26,10 @@ func init() {
 
 func runTestIdentityHelper() {
 	action := os.Args[len(os.Args)-1]
+	if code := os.Getenv("TEST_HELPER_ERROR_CODE"); code != "" {
+		fmt.Printf("{\"code\":%q}\n", code)
+		os.Exit(1)
+	}
 	dataFile := os.Getenv("TEST_HELPER_DATA_FILE")
 	if dataFile == "" {
 		_, _ = fmt.Fprintf(os.Stderr, "missing TEST_HELPER_DATA_FILE")
@@ -38,7 +42,7 @@ func runTestIdentityHelper() {
 	}
 
 	type reqT struct {
-		ItemID string `json:"item_id"`
+		ItemID string `json:"itemID"`
 		Secret string `json:"secret"`
 	}
 	var req reqT

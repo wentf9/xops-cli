@@ -25,6 +25,7 @@ const (
 
 // PassStoreConfig 描述 pass 凭据存储配置。
 type PassStoreConfig struct {
+	NonInteractive   bool
 	Prefix           string
 	Command          string
 	Args             []string
@@ -82,10 +83,11 @@ func NewPassStore(storeID string, cfg PassStoreConfig) (*PassStore, error) {
 	baseCmd := filepath.Base(cmdName)
 	if cfg.IsHelperProtocol || strings.HasPrefix(baseCmd, "xops-credential-") || baseCmd == "pass-helper" {
 		opts := ProcessOptions{
-			Command: cmdName,
-			Args:    cfg.Args,
-			Env:     cfg.Env,
-			Timeout: timeout,
+			NonInteractive: cfg.NonInteractive,
+			Command:        cmdName,
+			Args:           cfg.Args,
+			Env:            cfg.Env,
+			Timeout:        timeout,
 		}
 		hs, err := NewHelperStore(storeID, opts, cfg.ReadOnly)
 		if err != nil {
@@ -212,9 +214,7 @@ func (p *PassStore) executePassCmd(ctx context.Context, args []string, stdinData
 	defer cancel()
 
 	cmd := exec.CommandContext(execCtx, p.command, args...)
-	if len(p.env) > 0 {
-		cmd.Env = append(os.Environ(), p.env...)
-	}
+	cmd.Env = passCommandEnv(ctx, p.env)
 
 	waitDelay := DefaultProcessWaitDelay
 	if timeout < waitDelay {
@@ -321,4 +321,22 @@ func mapPassError(action string, err error, stderr string) error {
 	}
 
 	return fmt.Errorf("pass %s failed: %w", action, err)
+}
+
+// passCommandEnv overrides inherited GPG interaction options for automation.
+func passCommandEnv(ctx context.Context, extra []string) []string {
+	if !credential.InteractionDisabled(ctx) {
+		if len(extra) == 0 {
+			return nil
+		}
+		return append(os.Environ(), extra...)
+	}
+	env := append(os.Environ(), extra...)
+	filtered := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		if !strings.HasPrefix(entry, "PASSWORD_STORE_GPG_OPTS=") {
+			filtered = append(filtered, entry)
+		}
+	}
+	return append(filtered, "PASSWORD_STORE_GPG_OPTS=--batch --no-tty --pinentry-mode error")
 }

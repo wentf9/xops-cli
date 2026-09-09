@@ -306,10 +306,36 @@ journal 使用 `0600` 和原子替换，只记录 refs、操作类型、配置�
 - `--remember=ask|always|never` 显式控制保存；
 - 错误由 cmd 层统一展示一次。
 
+阶段 6 接入约束：
+
+- `identity add/edit`、`host add/edit` 的兼容 `--password`、`--key-pass` 参数
+  发出弃用告警，秘密通过 CredentialService 写入；不再写入旧 AES 密码字段。
+  未配置可写默认 Store（包括 `none`）时拒绝保存，不自动启用 system。
+- 新建操作先提交无秘密的节点或身份元数据，再保存凭据；后端失败时返回错误，
+  可能留下无凭据的元数据供重试。编辑操作将整次编辑（用户名、地址、端口、节点重命名、
+  别名及认证配置）与新引用放入同一配置事务，使用编辑时的完整实体版本进行 CAS。
+  写入后端、读回或 CAS 失败均不提前提交部分编辑；共享 Host/Identity 按原有规则创建
+  节点私有副本。Applied 但非 Durable 时保留已应用的整次编辑和新旧秘密，不回滚。
+- `identity edit --key`、`host edit --key` 未提供 `--key-pass` 时先校验新私钥确实
+  无需口令，再通过凭据删除事务解除旧 passphrase 引用，并与整个编辑一起提交。
+  旧后端锁定或拒绝清理时，配置已切换，命令返回 CleanupError 并保留恢复日志供 GC
+  重试；新连接不再读取旧引用。其他节点仍引用的共享秘密不会被物理删除。
+  新私钥仍需口令时必须显式提供 `--key-pass`，不能静默丢弃已有引用。
+- `--remember` 的优先级为显式参数、`credential.remember_prompted`、`ask`。
+  `ask` 在节点解析时不提问，连接命令组装时只询问一次；无终端时不保存。
+- `credential doctor` 使用随机探测 ItemID 执行带超时的非交互 Get，成功或
+  not-found 表示读取链路可用；locked、denied、unavailable 均失败。
+  不写入探测秘密，不承诺写入权限或每个实际条目的 ACL 可用。
+
 ### TUI
 
 编辑页面只显示 `stored in <StoreID>`，不读取和回填旧秘密。秘密字段使用明确的
 `keep`、`replace`、`delete` 操作，不能再用空字符串区分状态。
+
+Registry 延迟到实际读写时初始化 Store，初始化失败允许稍后重试；启动和普通元数据
+编辑不依赖系统密钥库可用。显式表单保存仍在异步状态机内完成。
+自动发现秘密遵循 `remember_prompted`：`always` 保存，`never` 仅当前会话，
+`ask` 在认证成功后由调用方注入的确认器询问；没有确认器时不保存。
 
 ### MCP、Playbook 与批处理
 
@@ -318,6 +344,32 @@ journal 使用 `0600` 和原子替换，只记录 refs、操作类型、配置�
 - 推荐 `agent` 或可非交互读取的 external Store；
 - 未配置、锁定或不可用都返回类型化错误；
 - 默认不记录自动发现的凭据。
+
+非交互策略沿 SecretResolver 传到后端，不能仅通过移除 SSH 提示器实现：
+
+- 原生 pass 读取强制 `--batch --no-tty --pinentry-mode error`；GPG agent 未解锁时
+  返回 locked，不启动 pinentry。
+- macOS 受控 helper 禁止 Keychain UI，Windows 原生 Credential API 不弹解锁框。
+- Linux 当前的 `secret-tool lookup` 不能保证禁止解锁提示，因此非交互请求在启动
+  secret-tool 前返回 unavailable。自动化应选择 pass、agent 或支持非交互的 helper。
+- 自定义 helper 必须在 Store 配置中显式声明 `non_interactive: true`，并遵守
+  协议请求的 `nonInteractive: true`：禁止终端、GUI 和任何解锁提示。未声明时，
+  非交互访问在启动 helper 前失败关闭；该声明是管理员对所配置 helper 的契约确认。
+  `doctor` 同样要求此契约。该配置项不影响普通交互调用。
+
+示例：
+
+```yaml
+credential:
+  default_store: vault
+  remember_prompted: never
+  stores:
+    vault:
+      type: helper
+      command: /usr/local/bin/xops-credential-vault
+      timeout: 5s
+      non_interactive: true
+```
 
 ## 13. 安全模型
 
@@ -454,4 +506,3 @@ pkg 层只包装并返回。允许记录 StoreID、操作、耗时、结果分�
   - `TestInternalSystemHelperProtocolValidation`：覆盖非法主版本、多余 JSON、空 Ref、非法 Base64 的失败关闭行为；
   - `TestSystemStoreLinuxDBusFailureNotReportedAsNotFound`：覆盖 D-Bus 连接故障映射为 `ErrCredentialStoreUnavailable` 的分类准确性；
   - `TestUnknownErrorCodeDoesNotExposeKnownSecret`：覆盖未知 Code 字段不回显敏感机密的脱敏机制。
-
