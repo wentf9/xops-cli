@@ -61,6 +61,9 @@ func (s *linuxNativeStore) IsReadOnly() bool {
 }
 
 func (s *linuxNativeStore) Get(ctx context.Context, ref credential.Ref) (credential.Secret, error) {
+	if credential.InteractionDisabled(ctx) {
+		return s.getWithoutPrompt(ctx, ref)
+	}
 	args := []string{"lookup", "xops-store", ref.StoreID, "xops-item", ref.ItemID}
 	stdout, stderr, err := s.execCmd(ctx, args, nil)
 	if err != nil {

@@ -11,6 +11,7 @@ require (
 	github.com/chzyer/readline v1.5.1
 	github.com/ebitengine/purego v0.11.0
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f
+	github.com/godbus/dbus/v5 v5.2.2
 	github.com/kevinburke/ssh_config v1.6.0
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/nicksnyder/go-i18n/v2 v2.6.1

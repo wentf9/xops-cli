@@ -110,7 +110,7 @@ credential:
       read_only: true
 ```
 
-`command` 不能是 shell 字符串；它表示一个固定可执行文件，`args` 是独立参数数组。
+`command` 不能是 shell 字符串；该字段表示一个固定可执行文件，`args` 是独立参数数组。
 配置加载时验证超时、TTL、Store 名称和命令路径，但不主动读取秘密。
 
 ## 5. 包与接口
@@ -291,8 +291,8 @@ journal，再一次性 CAS 删除资产。GC 对这类日志检查全局引用�
 | --- | --- | --- |
 | Put 前或 Put 失败 | 旧配置、旧 ref | 清除 intent |
 | 读回校验失败 | 旧配置、旧 ref | 尝试删除新 ref |
-| 配置 CAS 冲突 | 旧/其他进程的新配置 | 删除本次新 ref |
-| 配置未 Applied | 旧配置 | 删除本次新 ref |
+| 配置 CAS 冲突 | 旧/其他进程的新配置 | 删除新 ref |
+| 配置未 Applied | 旧配置 | 删除新 ref |
 | Applied 但非 Durable | 新旧都保留 | 返回 durability error，不补偿 |
 | 旧 ref 删除失败 | 新配置、新 ref | 返回 cleanup error，稍后 GC |
 
@@ -384,8 +384,13 @@ Registry 延迟到实际读写时初始化 Store，初始化失败允许稍后�
 - 原生 pass 读取强制 `--batch --no-tty --pinentry-mode error`；GPG agent 未解锁时
   返回 locked，不启动 pinentry。
 - macOS 受控 helper 禁止 Keychain UI，Windows 原生 Credential API 不弹解锁框。
-- Linux 当前的 `secret-tool lookup` 不能保证禁止解锁提示，因此非交互请求在启动
-  secret-tool 前返回 unavailable。自动化应选择 pass、agent 或支持非交互的 helper。
+- Linux 非交互 Get 直接调用 Secret Service 的 SearchItems/OpenSession/GetSecret，
+  仅访问已解锁条目，不调用 Unlock/Prompt，不自动启动服务。锁定返回 locked，
+  缺失返回 not-found，D-Bus/服务不可用返回 unavailable；读取期间重新锁定也不会回退。
+  连接使用显式 DBUS_SESSION_BUS_ADDRESS 的本地 Unix socket，设置操作总 deadline，
+  结束关闭会话与独占连接。plain 会话只用于本地受用户会话保护的总线，不接受 TCP。
+  交互操作仍用 secret-tool；非交互 Put/Delete 仍在启动 secret-tool 前拒绝。
+  exec 的 -x 仅用于远端交互命令，普通 exec 可以读取已有的已解锁凭据。
 - 自定义 helper 必须在 Store 配置中显式声明 `non_interactive: true`，并遵守
   协议请求的 `nonInteractive: true`：禁止终端、GUI 和任何解锁提示。未声明时，
   非交互访问在启动 helper 前失败关闭；该声明是管理员对所配置 helper 的契约确认。
@@ -459,7 +464,7 @@ pkg 层只包装并返回。允许记录 StoreID、操作、耗时、结果分�
 - **验证环境**：Windows 11 Pro 23H2 (Build 22631.3880) / Windows Server 2022 Datacenter (Kernel 10.0.20348)。
 - **调用路径与隔离架构**：
   - 底层基于 `advapi32.dll` 导出的 Win32 API（`CredReadW`, `CredWriteW`, `CredDeleteW`, `CredFree`）直接操作 Windows Generic Credentials，TargetName 命名规范为 `xops:<storeID>/<itemID>`，凭据类型为 `CRED_TYPE_GENERIC (1)`，持久化级别为 `CRED_PERSIST_LOCAL_MACHINE (2)`。
-  - **纠错与受控 Helper 隔离落地方案**：此前误将 Win32 API 放在宿主主进程同步调用，导致 context 超时与取消被完全忽略（Win32 API 同步调用阻塞且不支持 context 取消，且宿主持锁期间无法释放）。本实现落实受控 helper 隔离机制，由宿主派生受控 helper 进程执行 Win32 读写，宿主通过 stdin/stdout 与 helper 通信并拥有完备的生命周期控制权。
+  - **纠错与受控 Helper 隔离落地方案**：此前误将 Win32 API 放在宿主主进程同步调用，导致 context 超时与取消被完全忽略（Win32 API 同步调用阻塞且不支持 context 取消，且宿主持锁期间无法释放）。实现采用受控 helper 隔离机制，由宿主派生受控 helper 进程执行 Win32 读写，宿主通过 stdin/stdout 与 helper 通信并拥有完备的生命周期控制权。
 - **进程树隔离机制 (Job Object 严格生命周期保障)**：
   - **无竞争绑定**：子进程创建时通过 `SysProcAttr.CreationFlags` 设置 `CREATE_SUSPENDED (0x00000004)`，确保子进程在被绑定至 Job Object 之前无法执行任何指令或提前派生未受控子孙进程；
   - **内核级级联终止**：Job Object 配置 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (0x2000)`，通过 `AssignProcessToJobObject` 完成绑定后，调用 `ResumeThread` 恢复主线程执行；
@@ -475,13 +480,13 @@ pkg 层只包装并返回。允许记录 StoreID、操作、耗时、结果分�
 
 - **验证环境**：macOS Sonoma 14.5 (Darwin 23.5.0, Apple Silicon arm64) / macOS Sequoia 15.0。
 - **命令行工具缺陷与认知纠偏**：
-  - 此前设计尝试调用 Apple `/usr/bin/security` CLI 工具，经深入分析 Apple 源码确认存在两大无法修复的原生缺陷：
+  - 此前设计尝试调用 Apple `/usr/bin/security` CLI 工具，Apple 源码分析确认两项接口限制：
     1. **读取缺陷 (不可打印转码与追加换行)**：在 Apple 官方实现 [`SecurityTool/macOS/keychain_find.c`](https://github.com/apple-oss-distributions/Security/blob/main/SecurityTool/macOS/keychain_find.c#L387) 中，`print_password` 在输出末尾无条件强制打印换行符 `\n`，且遇到不可打印字节会自动转为十六进制文本。若使用 `security -w` 读取，普通密码 `abc` 必变成 `abc\n`，二进制机密根本无法保证往返一致；
     2. **写入缺陷 (换行指令注入与行长硬编码)**：在 Apple 官方实现 [`SecurityTool/macOS/security.c`](https://github.com/apple-oss-distributions/Security/blob/main/SecurityTool/macOS/security.c) 中，交互式模式 `-i` 使用固定 1024 字节单行缓冲区并按换行符 `\n` 解释下一条指令。机密中若包含换行符，换行后续内容会被作为独立命令解析执行，存在严重的命令注入与数据截断损坏风险。
 - **原生 API 落地架构 (纯 Go 动态桥接 Security Framework)**：
-  - 为彻底解决上述问题，本实现坚决摒弃 `security` 命令行文本拼接，在受控 Helper 内部通过纯 Go 动态加载机制（`purego`）直接调用 macOS 原生 Security Framework C API：
-    - 读取：`SecKeychainFindGenericPassword` 取得原始内存指针与字节长度，通过 `unsafe.Slice` 取得原始二进制副本后调用 `SecKeychainItemFreeContent`，零文本编码、零额外换行，100% 保证二进制往返一致性；
-    - 写入：`SecKeychainAddGenericPassword` / `SecKeychainItemModifyAttributesAndData` 直接接收原始机密字节指针与长度，彻底消除 argv 参数暴露与换行注入；
+  - 为彻底解决上述问题，实现不采用 `security` 命令行文本拼接，在受控 Helper 内部通过纯 Go 动态加载机制（`purego`）直接调用 macOS 原生 Security Framework C API：
+    - 读取：`SecKeychainFindGenericPassword` 取得原始内存指针与字节长度，通过 `unsafe.Slice` 取得原始二进制副本后调用 `SecKeychainItemFreeContent`，零文本编码、零额外换行，二进制往返由回归测试验证；
+    - 写入：`SecKeychainAddGenericPassword` / `SecKeychainItemModifyAttributesAndData` 直接接收原始机密字节指针与长度，消除 argv 参数暴露与换行注入；
     - 删除：`SecKeychainFindGenericPassword` 检索 `itemRef`，随后调用 `SecKeychainItemDelete` 并通过 `CFRelease` 释放非托管引用。
 - **错误代码映射与保真度**：
   - 目标未找到：`errSecItemNotFound (-25300)` 映射为 `credential.ErrCredentialNotFound`；
@@ -489,7 +494,7 @@ pkg 层只包装并返回。允许记录 StoreID、操作、耗时、结果分�
   - 成功返回：原样字节完整 Base64 编码，无任何 `TrimRight` 截断；
   - **并发写入冲突与重试错误传播 (无吞咽保证)**：
     - 当并发写入发生冲突返回 `errSecDuplicateItem (-25299)` 时，受控 Helper 触发重试查询并更新；
-    - 严禁忽略重试阶段的错误：若重试查找条目返回 `errSecAuthFailed` / `errSecInteractionNotAllowed` 或修改数据返回锁定/拒绝，必须向上传播 `Code: "locked"`；若发生其他底层异常，必须向上传播 `Code: "unavailable"`，彻底杜绝“旧值未覆盖或已锁定却向调用方报告成功”的严重缺陷。
+    - 严禁忽略重试阶段的错误：若重试查找条目返回 `errSecAuthFailed` / `errSecInteractionNotAllowed` 或修改数据返回锁定/拒绝，必须向上传播 `Code: "locked"`；若发生其他底层异常，必须向上传播 `Code: "unavailable"`，避免“旧值未覆盖或已锁定却向调用方报告成功”的严重缺陷。
 
 ### 16.3 Linux 原生平台验证 (Secret Service & Headless 检测)
 
@@ -501,8 +506,8 @@ pkg 层只包装并返回。允许记录 StoreID、操作、耗时、结果分�
   - **Fail-closed 前置检测**：在无桌面 D-Bus 会话（如 SSH 远程会话、Docker 容器、CI/CD 环境）中，调用 Secret Service 会因无 Session Bus 或无法弹出 Unlock 提示导致无限阻塞。`checkPlatformSystemAvailability` 检测环境变量 `DBUS_SESSION_BUS_ADDRESS`、`DISPLAY` 和 `WAYLAND_DISPLAY`，三者皆空时立即 fail-closed 返回 `ErrCredentialStoreUnavailable`，防止挂死；
   - **故障分类精准化 (杜绝误报 NotFound)**：
     - 此前当 D-Bus 连接故障退出时，未捕获的错误被盲目降级为 `NotFound`；
-    - 本实现严格区分：只有在 `secret-tool` 明确返回空结果或退出码 1 且 stderr 为空时，才判定为 `ErrCredentialNotFound`；
-    - 凡 stderr 提示 `Cannot connect to D-Bus` 或其他底层服务故障，坚决映射为 `ErrCredentialStoreUnavailable`；
+    - 实现区分：只有在 `secret-tool` 明确返回空结果或退出码 1 且 stderr 为空时，才判定为 `ErrCredentialNotFound`；
+    - 凡 stderr 提示 `Cannot connect to D-Bus` 或其他底层服务故障，映射为 `ErrCredentialStoreUnavailable`；
   - **语义保留与取消优先**：在 `Get` / `Put` / `Delete` 流程中，优先保留 `context.Canceled`、`context.DeadlineExceeded` 以及 `ErrCredentialStoreUnavailable`，禁止将取消或超时错误降级吞咽为 `ErrCredentialNotFound`；
   - **输出超限拒绝**：严格检查 `stdoutLimiter.total > MaxResponseBytes`（64KB），一旦输出被截断立即报错拒绝，杜绝截断数据作为有效凭据返回。
 
@@ -512,7 +517,7 @@ pkg 层只包装并返回。允许记录 StoreID、操作、耗时、结果分�
   - 设置 `DefaultProcessWaitDelay = 50ms`，配合各平台的进程树强制终止（Linux/Darwin 进程组 `killProcessGroup`，Windows `TerminateJobObject`），当父进程提前退出但派生孙进程继承 stdout 管道时，`cmd.WaitDelay` 超时后强制关闭管道，消除了外部 helper 挂起导致的死锁；
   - **禁止忽略 WaitDelay 错误**：取消/超时或孙进程挂起触发 `exec.ErrWaitDelay` 时，严格向上层报告错误，禁止在管道强制截断后误判为成功。
 - **启动后错误路径的完整生命周期清理 (Windows)**：
-  - 在 Windows `startProcessSession` 中，一旦 `cmd.Start()` 成功，在 `OpenProcess`、`AssignProcessToJobObject` 或 `resumeProcessMainThread` 发生任何异常时，必须无条件执行 `TerminateJobObject` -> `cmd.Process.Kill()` -> `cmd.Wait()` -> `CloseHandle`，确保回收进程句柄、I/O 管道与读取 Goroutine，彻底消除资源泄露隐患。
+  - 在 Windows `startProcessSession` 中，一旦 `cmd.Start()` 成功，在 `OpenProcess`、`AssignProcessToJobObject` 或 `resumeProcessMainThread` 发生任何异常时，必须无条件执行 `TerminateJobObject` -> `cmd.Process.Kill()` -> `cmd.Wait()` -> `CloseHandle`，确保回收进程句柄、I/O 管道与读取 Goroutine，消除资源泄露隐患。
 - **协议层严格校验与失败关闭**：
   - 内部受控 Helper 严格执行边界输入校验：
     1. 限制请求大小（`LimitReader(os.Stdin, MaxResponseBytes+1)`），超出 64KB 立即拒绝；
@@ -526,7 +531,7 @@ pkg 层只包装并返回。允许记录 StoreID、操作、耗时、结果分�
 
 ### 16.5 自动化回归脚本与执行证据
 
-仓库已提供自动化跨平台验证脚本 [`scripts/verify_native_platform.sh`](file:///home/wuyue/xops-cli/scripts/verify_native_platform.sh) 及各平台原生集成与回归测试：
+仓库已提供自动化跨平台验证脚本 [`scripts/verify_native_platform.sh`](../../scripts/verify_native_platform.sh) 及各平台原生集成与回归测试：
 - **严格验收断言**：脚本会根据当前 OS 运行真实二进制读写及 Go 平台测试，非目标平台明确标记为 `[SKIP]`，拒绝任何无条件标记 PASS 的虚假通过；
 - **macOS 测试集**（`system_darwin_test.go`）：
   - `TestDarwinNativeHelper_DuplicateConflictRetryFindLocked`：验证并发写入重试查询被锁定报错并传播；
