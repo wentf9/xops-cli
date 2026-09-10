@@ -50,6 +50,14 @@ jobs:
       - name: Run tests
         run: go test -race -shuffle=on -covermode=atomic -coverprofile=coverage.out ./...
 
+      - name: Run offline credential business integration tests
+        env:
+          GORACE: atexit_sleep_ms=0
+        run: |
+          umask 077
+          go test -tags=integration -race -shuffle=on -count=1 -timeout=120s \
+            -run '^(TestEncrypted|TestOffline)' ./pkg/config ./cmd
+
       - name: Upload coverage
         uses: actions/upload-artifact@v7
         with:

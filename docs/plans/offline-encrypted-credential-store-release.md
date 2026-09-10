@@ -43,6 +43,22 @@ Python、测试校验器和容器工具仅用于验收，不属于 XOps 运行�
 
 ## 复验命令
 
+### CI 业务回归
+
+现有 Linux 测试任务已增加离线凭据业务集成步骤，执行 pkg/config 和 cmd 中的
+TestEncrypted、TestOffline 测试，覆盖配置校验、引用解析、会话策略、迁移/finalize
+及管理命令。启用 race、随机测试顺序和 120 秒测试超时。
+
+```sh
+umask 077
+GORACE=atexit_sleep_ms=0 go test -tags=integration -race -shuffle=on \
+  -count=1 -timeout=120s -run '^(TestEncrypted|TestOffline)' ./pkg/config ./cmd
+```
+
+CI 未增加文件系统矩阵、挂载、网络隔离、KDF 硬限额或 KVM 断电任务。
+
+### 本地完整验收
+
 ```sh
 go build ./...
 go test ./...

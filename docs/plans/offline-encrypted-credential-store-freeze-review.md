@@ -85,6 +85,6 @@ XOPS_TEST_CLI_PATH=<absolute-candidate-cli> GORACE=atexit_sleep_ms=0 \
 和[三种文件系统共 42 个 KVM 断电恢复点](offline-encrypted-credential-store-filesystems.md)。
 后端去重修复使用配置/调用链回归及实际 CLI 演练验证。
 
-工程复核不替代第三方安全认证。普通 CI 未包含完整离线库 integration 矩阵，
-其结果不能单独证明全部部署验证完成。冻结范围与兼容性规则见
+工程复核不替代第三方安全认证。CI 已接入离线凭据配置与命令业务集成测试，
+不执行存储可靠性矩阵，其结果不能单独证明全部部署验证完成。冻结范围与兼容性规则见
 [v1 冻结记录](../design/offline-encrypted-credential-store-v1-freeze.md)。
