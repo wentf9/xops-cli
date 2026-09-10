@@ -30,6 +30,7 @@ const (
 )
 
 type Model struct {
+	vaultControl      func(context.Context, bool) error
 	ctx               context.Context
 	repository        *config.Repository
 	connector         *ssh.Connector
@@ -148,6 +149,7 @@ func (m *configurationMutation) close() error {
 type ModelOption func(*modelConfig)
 
 type modelConfig struct {
+	vaultControl         func(context.Context, bool) error
 	rememberConfirmation func(context.Context, string) (bool, error)
 	logger               logger.DebugLogger
 	ctx                  context.Context
@@ -225,6 +227,7 @@ func NewModel(repository *config.Repository, opts ...ModelOption) (Model, error)
 	view := repository.View()
 	lifecycleCtx, lifecycleCancel := context.WithCancel(cfg.ctx)
 	m := Model{
+		vaultControl:      cfg.vaultControl,
 		ctx:               lifecycleCtx,
 		lifecycleCancel:   lifecycleCancel,
 		repository:        repository,
@@ -425,6 +428,21 @@ func (m *Model) handleAsyncMessage(msg tea.Msg) (bool, tea.Cmd) {
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if result, ok := msg.(vaultControlResult); ok {
+		m.status = "Vault action completed"
+		if result.err != nil {
+			m.status = "Vault action failed: " + result.err.Error()
+		}
+		return m, nil
+	}
+	if key, ok := msg.(tea.KeyMsg); ok && m.state == viewList && m.vaultControl != nil {
+		if key.String() == "ctrl+l" {
+			return m, m.vaultCommand(false)
+		}
+		if key.String() == "ctrl+u" {
+			return m, m.vaultCommand(true)
+		}
+	}
 	if handled, cmd := m.handleAsyncMessage(msg); handled {
 		return m, cmd
 	}

@@ -67,5 +67,9 @@ func commandCredentialMigrator() (*config.CredentialMigrator, error) {
 	if err != nil {
 		return nil, err
 	}
-	return config.NewCredentialMigrator(path, key)
+	m, err := config.NewCredentialMigrator(path, key)
+	if err != nil {
+		return nil, err
+	}
+	return m.WithRegistryFactory(utils.BuildCredentialRegistry), nil
 }

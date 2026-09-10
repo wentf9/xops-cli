@@ -44,7 +44,7 @@ func GetCredentialRegistry(cfg *config.Configuration) (*credential.Registry, err
 	if cfg.Credential == nil {
 		return nil, nil
 	}
-	return config.BuildRegistryFromConfig(credentialConfigOrDefault(cfg))
+	return BuildCredentialRegistry(credentialConfigOrDefault(cfg))
 }
 
 func credentialConfigOrDefault(cfg *config.Configuration) *config.CredentialConfig {
@@ -76,7 +76,7 @@ func getCredentialService(repo *config.Repository, cfg *config.Configuration, up
 
 	credCfg := credentialConfigOrDefault(cfg)
 
-	registry, err := config.BuildRegistryFromConfig(credCfg)
+	registry, err := BuildCredentialRegistry(credCfg)
 	if err != nil {
 		return nil, fmt.Errorf("build credential registry: %w", err)
 	}

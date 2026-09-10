@@ -20,6 +20,8 @@ func BuildStore(storeID string, cfg StoreConfig) (credential.Store, error) {
 	var err error
 
 	switch cfg.Type {
+	case StoreTypeEncryptedFile:
+		return nil, fmt.Errorf("%w: encrypted-file requires an owned credential runtime", credential.ErrCredentialStoreUnavailable)
 	case StoreTypeNone:
 		baseStore = credential.NewNoneStore()
 
@@ -87,13 +89,24 @@ func BuildRegistryFromConfig(credCfg *CredentialConfig) (*credential.Registry, e
 		return nil, fmt.Errorf("credential config is nil")
 	}
 
+	return buildRegistry(credCfg, nil)
+}
+
+func buildRegistry(credCfg *CredentialConfig, files *EncryptedRuntime) (*credential.Registry, error) {
 	reg := credential.NewRegistry()
 	for storeID, storeCfg := range credCfg.Stores {
 		if err := validateStoreConfig(storeID, storeCfg); err != nil {
 			return nil, err
 		}
 		storeCfg.Args = slices.Clone(storeCfg.Args)
-		st := &lazyStore{storeID: storeID, config: storeCfg}
+		var st credential.Store = &lazyStore{storeID: storeID, config: storeCfg}
+		if storeCfg.Type == StoreTypeEncryptedFile && files != nil {
+			var err error
+			st, err = files.backend(storeID, storeCfg)
+			if err != nil {
+				return nil, err
+			}
+		}
 		if err := reg.Register(storeID, st); err != nil {
 			return nil, fmt.Errorf("register store %q: %w", storeID, err)
 		}

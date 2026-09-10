@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
 	"github.com/wentf9/xops-cli/pkg/mcpserver"
@@ -59,7 +60,7 @@ func runMCPServer(cmd *cobra.Command, args []string) error {
 		serveOpts = append(serveOpts, mcpserver.WithCredentialRegistry(reg))
 	}
 
-	err = mcpserver.Serve(ctx, serveOpts...)
+	err = mcpserver.Serve(credential.WithoutInteraction(ctx), serveOpts...)
 	if err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) || errors.Is(err, context.Canceled) {
 			return nil

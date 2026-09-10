@@ -6,11 +6,18 @@ import (
 	"strings"
 
 	"github.com/wentf9/xops-cli/cmd"
+	"github.com/wentf9/xops-cli/internal/kdfhelper"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == kdfhelper.PrivateArgument {
+		if len(os.Args) != 2 {
+			os.Exit(1)
+		}
+		os.Exit(kdfhelper.ServeFiles(os.Stdin, os.Stdout))
+	}
 	// 提前解析 --lang 参数，在命令构造前设置语言
 	// 解决 Cobra --help 跳过 PersistentPreRun 导致语言设置不生效的问题
 	lang := parseLangFromArgs(os.Args[1:])

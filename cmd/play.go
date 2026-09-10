@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/wentf9/xops-cli/pkg/credential"
 	"io"
 	"os"
 	"strings"
@@ -96,6 +97,7 @@ func (o *PlayOptions) Run() error {
 // RunContext executes the Playbook and propagates caller cancellation through
 // target resolution, SSH connections, and step execution.
 func (o *PlayOptions) RunContext(ctx context.Context) (retErr error) {
+	ctx = credential.WithoutInteraction(ctx)
 	// 解析 --var 选项
 	extraVars, err := parseVars(o.Vars)
 	if err != nil {

@@ -63,6 +63,9 @@ func decodeMigrationLegacy(data []byte) (*Configuration, error) {
 }
 
 func (m *CredentialMigrator) migrationRegistry(cfg *CredentialConfig, destination string) (*credential.Registry, error) {
+	if err := m.protectBackendKeys(cfg); err != nil {
+		return nil, err
+	}
 	if cfg == nil {
 		return nil, fmt.Errorf("configure a credential store before migration")
 	}

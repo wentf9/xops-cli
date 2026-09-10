@@ -19,14 +19,21 @@ import (
 type StoreType string
 
 const (
-	StoreTypeSystem StoreType = "system"
-	StoreTypePass   StoreType = "pass"
-	StoreTypeHelper StoreType = "helper"
-	StoreTypeNone   StoreType = "none"
+	StoreTypeSystem        StoreType = "system"
+	StoreTypePass          StoreType = "pass"
+	StoreTypeHelper        StoreType = "helper"
+	StoreTypeNone          StoreType = "none"
+	StoreTypeEncryptedFile StoreType = "encrypted-file"
 )
 
 // StoreConfig 描述单个凭据存储后端的连接与运行配置。
 type StoreConfig struct {
+	Path           string        `yaml:"path,omitempty"`
+	Unlock         string        `yaml:"unlock,omitempty"`
+	KeyFile        string        `yaml:"key_file,omitempty"`
+	UnlockIdleTTL  time.Duration `yaml:"unlock_idle_ttl,omitempty"`
+	PromptTimeout  time.Duration `yaml:"prompt_timeout,omitempty"`
+	UnlockTimeout  time.Duration `yaml:"unlock_timeout,omitempty"`
 	Type           StoreType     `yaml:"type"`
 	Timeout        time.Duration `yaml:"timeout"`
 	CacheTTL       time.Duration `yaml:"cache_ttl"`
@@ -38,6 +45,12 @@ type StoreConfig struct {
 }
 
 type rawStoreConfig struct {
+	Path           string    `yaml:"path,omitempty"`
+	Unlock         string    `yaml:"unlock,omitempty"`
+	KeyFile        string    `yaml:"key_file,omitempty"`
+	UnlockIdleTTL  *string   `yaml:"unlock_idle_ttl,omitempty"`
+	PromptTimeout  *string   `yaml:"prompt_timeout,omitempty"`
+	UnlockTimeout  *string   `yaml:"unlock_timeout,omitempty"`
 	Type           StoreType `yaml:"type"`
 	Timeout        string    `yaml:"timeout"`
 	CacheTTL       string    `yaml:"cache_ttl"`
@@ -58,7 +71,7 @@ func (s *StoreConfig) UnmarshalYAML(value *yaml.Node) error {
 	}
 
 	knownFields := map[string]struct{}{
-		"type":            {},
+		"type": {}, "path": {}, "unlock": {}, "key_file": {}, "unlock_idle_ttl": {}, "prompt_timeout": {}, "unlock_timeout": {},
 		"timeout":         {},
 		"cache_ttl":       {},
 		"prefix":          {},
@@ -80,6 +93,8 @@ func (s *StoreConfig) UnmarshalYAML(value *yaml.Node) error {
 		return fmt.Errorf("%w: decode store config: %w", ErrSchemaValidation, err)
 	}
 
+	*s = StoreConfig{}
+	s.Path, s.Unlock, s.KeyFile = raw.Path, raw.Unlock, raw.KeyFile
 	s.Type = raw.Type
 	s.Prefix = raw.Prefix
 	s.Command = raw.Command
@@ -103,7 +118,7 @@ func (s *StoreConfig) UnmarshalYAML(value *yaml.Node) error {
 		s.CacheTTL = d
 	}
 
-	return nil
+	return s.decodeFileDurations(raw, value)
 }
 
 // CredentialConfig 描述 Schema v2 顶层的凭据全局配置。
@@ -225,11 +240,14 @@ func validateStoreConfig(storeID string, storeCfg StoreConfig) error {
 	}
 
 	switch storeCfg.Type {
-	case StoreTypeSystem, StoreTypePass, StoreTypeHelper, StoreTypeNone:
+	case StoreTypeSystem, StoreTypePass, StoreTypeHelper, StoreTypeNone, StoreTypeEncryptedFile:
 	default:
 		return fmt.Errorf("%w: store %q has invalid type %q", ErrSchemaValidation, storeID, storeCfg.Type)
 	}
 
+	if err := validateFileStoreIdentity(storeID, storeCfg); err != nil {
+		return err
+	}
 	if storeCfg.Type == StoreTypeHelper {
 		if strings.TrimSpace(storeCfg.Command) == "" {
 			return fmt.Errorf("%w: helper store %q requires non-empty command", ErrSchemaValidation, storeID)
@@ -251,7 +269,7 @@ func validateStoreConfig(storeID string, storeCfg StoreConfig) error {
 
 func validateIdentityRefs(idName string, id IdentityV2, stores map[string]StoreConfig) error {
 	if id.LoginPasswordRef != nil {
-		if err := id.LoginPasswordRef.Validate(); err != nil {
+		if err := validateConfiguredRef(*id.LoginPasswordRef, stores); err != nil {
 			return fmt.Errorf("%w: identity %q login_password_ref invalid: %w", ErrSchemaValidation, idName, err)
 		}
 		if !id.LoginPasswordRef.IsEmpty() {
@@ -263,7 +281,7 @@ func validateIdentityRefs(idName string, id IdentityV2, stores map[string]StoreC
 	}
 
 	if id.PassphraseRef != nil {
-		if err := id.PassphraseRef.Validate(); err != nil {
+		if err := validateConfiguredRef(*id.PassphraseRef, stores); err != nil {
 			return fmt.Errorf("%w: identity %q passphrase_ref invalid: %w", ErrSchemaValidation, idName, err)
 		}
 		if !id.PassphraseRef.IsEmpty() {
@@ -297,7 +315,7 @@ func validateNodeRefs(nodeName string, node NodeV2, cfg *ConfigurationV2) error 
 	}
 
 	if node.PrivilegePasswordRef != nil {
-		if err := node.PrivilegePasswordRef.Validate(); err != nil {
+		if err := validateConfiguredRef(*node.PrivilegePasswordRef, cfg.Credential.Stores); err != nil {
 			return fmt.Errorf("%w: node %q privilege_password_ref invalid: %w", ErrSchemaValidation, nodeName, err)
 		}
 		if !node.PrivilegePasswordRef.IsEmpty() {

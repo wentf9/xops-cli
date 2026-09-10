@@ -179,6 +179,8 @@ func newListModel(provider config.ConfigProvider) list.Model {
 			key.NewBinding(key.WithKeys("l"), key.WithHelp("l", i18n.T("tui_help_log"))),
 			key.NewBinding(key.WithKeys("n"), key.WithHelp("n", i18n.T("tui_help_new"))),
 			key.NewBinding(key.WithKeys("g"), key.WithHelp("g", i18n.T("tui_help_tag"))),
+			key.NewBinding(key.WithKeys("ctrl+l"), key.WithHelp("ctrl+l", "lock vaults")),
+			key.NewBinding(key.WithKeys("ctrl+u"), key.WithHelp("ctrl+u", "unlock default vault")),
 		}
 	}
 

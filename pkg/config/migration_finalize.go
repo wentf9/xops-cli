@@ -205,6 +205,9 @@ func (m *CredentialMigrator) Finalize(ctx context.Context) (report MigrationRepo
 		if err := syncMigrationConfiguration(m.path); err != nil {
 			return err
 		}
+		if err := m.protectFinalizationKeys(current); err != nil {
+			return err
+		}
 		return m.finalizeFiles(state)
 	})
 	if err != nil {

@@ -1,0 +1,145 @@
+package config
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"sync"
+
+	"github.com/wentf9/xops-cli/internal/credentialfile"
+	"github.com/wentf9/xops-cli/pkg/credential"
+)
+
+// EncryptedRuntime is an explicitly owned composition-root resource. Close must
+// be awaited before exit or configuration replacement. Registries borrow it.
+type EncryptedRuntime struct {
+	vaults     *credentialfile.Runtime
+	configPath string
+	mu         sync.Mutex
+	stores     map[string]*encryptedBackend
+}
+
+// NewEncryptedRuntime binds path resolution and terminal interaction for one owner.
+func NewEncryptedRuntime(ctx context.Context, configPath string, prompt credentialfile.PromptProvider) *EncryptedRuntime {
+	return &EncryptedRuntime{vaults: credentialfile.NewRuntime(ctx, prompt, nil), configPath: configPath, stores: make(map[string]*encryptedBackend)}
+}
+
+// Close cancels and reaps all sessions, stores and KDF children.
+func (r *EncryptedRuntime) Close() error { return r.vaults.Close() }
+
+// Vaults exposes maintenance operations on the same process-owned runtime.
+func (r *EncryptedRuntime) Vaults() *credentialfile.Runtime { return r.vaults }
+
+// Registry builds lazy sources. File stores use only Runtime's revision-aware
+// cache, never the generic credential cache decorator.
+func (r *EncryptedRuntime) Registry(cfg *CredentialConfig) (*credential.Registry, error) {
+	if cfg == nil {
+		return BuildRegistryFromConfig(cfg)
+	}
+	return buildRegistry(cfg, r)
+}
+
+func (r *EncryptedRuntime) backend(id string, cfg StoreConfig) (*encryptedBackend, error) {
+	cfg, err := ResolveFileStore(cfg, r.configPath)
+	if err != nil {
+		return nil, err
+	}
+	encoded, err := json.Marshal(struct {
+		ID     string
+		Config StoreConfig
+	}{id, cfg})
+	if err != nil {
+		return nil, err
+	}
+	key := string(encoded)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	b := r.stores[key]
+	if b == nil {
+		b = &encryptedBackend{owner: r, id: id, cfg: cfg, gate: make(chan struct{}, 1)}
+		r.stores[key] = b
+	}
+	return b, nil
+}
+
+// Store opens a configured file store without unlocking it. Failed opens retry.
+func (r *EncryptedRuntime) Store(ctx context.Context, id string, cfg StoreConfig) (*credentialfile.Store, error) {
+	b, err := r.backend(id, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return b.open(ctx)
+}
+
+type encryptedBackend struct {
+	owner *EncryptedRuntime
+	id    string
+	cfg   StoreConfig
+	gate  chan struct{}
+	store *credentialfile.Store
+}
+
+func (b *encryptedBackend) open(ctx context.Context) (*credentialfile.Store, error) {
+	select {
+	case b.gate <- struct{}{}:
+	case <-ctx.Done():
+		return nil, context.Cause(ctx)
+	}
+	defer func() { <-b.gate }()
+	if b.store != nil {
+		return b.store, nil
+	}
+	s, err := b.owner.vaults.OpenStore(ctx, b.cfg.Path, b.id, credentialfile.Options{ReadOnly: b.cfg.ReadOnly, Timeout: b.cfg.Timeout}, credentialfile.SessionOptions{
+		Mode: b.cfg.Unlock, KeyFile: b.cfg.KeyFile, IdleTTL: b.cfg.UnlockIdleTTL, CacheTTL: b.cfg.CacheTTL, PromptTimeout: b.cfg.PromptTimeout, UnlockTimeout: b.cfg.UnlockTimeout, NonInteractive: b.cfg.NonInteractive,
+	})
+	if err != nil {
+		return nil, err
+	}
+	b.store = s
+	return s, nil
+}
+func (b *encryptedBackend) Get(ctx context.Context, ref credential.Ref) (credential.Secret, error) {
+	s, err := b.open(ctx)
+	if err != nil {
+		return credential.Secret{}, err
+	}
+	return s.Get(ctx, ref)
+}
+func (b *encryptedBackend) Put(ctx context.Context, ref credential.Ref, secret credential.Secret) error {
+	s, err := b.open(ctx)
+	if err != nil {
+		return err
+	}
+	return s.Put(ctx, ref, secret)
+}
+func (b *encryptedBackend) Delete(ctx context.Context, ref credential.Ref) error {
+	s, err := b.open(ctx)
+	if err != nil {
+		return err
+	}
+	return s.Delete(ctx, ref)
+}
+
+// Lock revokes all sessions already opened by this owner. Unopened stores have no keys.
+func (r *EncryptedRuntime) Lock(ctx context.Context) error {
+	r.mu.Lock()
+	backends := make([]*encryptedBackend, 0, len(r.stores))
+	for _, b := range r.stores {
+		backends = append(backends, b)
+	}
+	r.mu.Unlock()
+	var err error
+	for _, b := range backends {
+		select {
+		case b.gate <- struct{}{}:
+		case <-ctx.Done():
+			return errors.Join(err, context.Cause(ctx))
+		}
+		s := b.store
+		<-b.gate
+		if s != nil {
+			err = errors.Join(err, s.Lock(ctx))
+		}
+	}
+	return err
+}

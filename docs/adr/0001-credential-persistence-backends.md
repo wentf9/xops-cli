@@ -114,3 +114,10 @@ TUI、MCP 和 Playbook 重建握手状态会复制状态机并引入错误的临
 R 和下一正式版本保留普通 v1 运行并输出弃用告警，再下一正式版本结束兼容。
 具体 R 版本号在发布时登记，开发构建不消耗兼容周期。默认切换时不提前删除旧 v1
 所需的 AES 写入与 key 创建；兼容结束后统一移除，迁移器始终可用。
+
+## 后续后端扩展
+
+ADR-0002 的 `encrypted-file` 已在阶段 E 接入，采用内置密码学和受控 KDF 子进程，
+不经通用 Credential Helper。默认后端仍为 none，启用需显式配置；首版仅开放
+Linux amd64/ext4，正式发布验收仍待阶段 F。使用与恢复见
+[离线库指南](../offline-encrypted-credentials.md)。

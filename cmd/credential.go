@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/wentf9/xops-cli/internal/credentialfile"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"os"
 	"os/exec"
@@ -50,6 +51,9 @@ func newCmdCredentialStore() *cobra.Command {
 	}
 
 	cmd.AddCommand(newCmdCredentialStoreList())
+	for _, op := range []string{"init", "inspect", "rewrap", "reencrypt", "resume", "restore", "clone", "prune"} {
+		cmd.AddCommand(newOfflineStoreCommand(op))
+	}
 	return cmd
 }
 
@@ -243,6 +247,10 @@ func checkConfiguredStores(ctx context.Context) []DoctorCheckItem {
 	}
 
 	for storeID, storeCfg := range credCfg.Stores {
+		if storeCfg.Type == config.StoreTypeEncryptedFile {
+			items = append(items, checkOfflineDoctor(ctx, storeID, storeCfg))
+			continue
+		}
 		st, buildErr := config.BuildStore(storeID, storeCfg)
 		if buildErr != nil {
 			items = append(items, DoctorCheckItem{
@@ -329,4 +337,32 @@ func newCmdCredentialGC() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func checkOfflineDoctor(ctx context.Context, id string, cfg config.StoreConfig) DoctorCheckItem {
+	item := DoctorCheckItem{Name: "Store: " + id, Status: "FAIL"}
+	path, _, err := utils.GetConfigFilePath()
+	if err != nil {
+		item.Message = err.Error()
+		return item
+	}
+	cfg, err = config.ResolveFileStore(cfg, path)
+	if err != nil {
+		item.Message = err.Error()
+		return item
+	}
+	work, cancel := context.WithTimeout(credential.WithoutInteraction(ctx), cfg.Timeout)
+	defer cancel()
+	s, err := credentialfile.Open(work, cfg.Path, id, credentialfile.Options{ReadOnly: true})
+	if err == nil {
+		_, err = s.Inspect(work, false)
+		err = errors.Join(err, s.Close())
+	}
+	if err != nil {
+		item.Message = offlineErrorCode(err)
+		return item
+	}
+	item.Status = "WARN"
+	item.Message = "encrypted-file metadata available; locked/unverified, no unlock or write probe performed"
+	return item
 }

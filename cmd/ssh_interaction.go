@@ -10,6 +10,7 @@ import (
 	"github.com/wentf9/xops-cli/internal/terminal"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
+	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/ssh"
 	"golang.org/x/term"
@@ -23,13 +24,14 @@ type cliInteractionHandler struct {
 
 var _ ssh.InteractionHandler = (*cliInteractionHandler)(nil)
 
+var commandPromptGate = func() chan struct{} { gate := make(chan struct{}, 1); gate <- struct{}{}; return gate }()
+
 func newCLIInteractionHandler() *cliInteractionHandler {
-	gate := make(chan struct{}, 1)
-	gate <- struct{}{}
+	gate := commandPromptGate
 	return &cliInteractionHandler{
 		canRemember: term.IsTerminal(int(os.Stdin.Fd())),
 		promptGate:  gate,
-		terminal:    terminal.NewPrompter(os.Stdin, os.Stdout),
+		terminal:    terminal.NewPrompter(os.Stdin, os.Stderr),
 	}
 }
 
@@ -183,4 +185,21 @@ func (h *cliInteractionHandler) confirmRemember(ctx context.Context, nodeID stri
 	}
 	answer = strings.TrimSpace(answer)
 	return strings.EqualFold(answer, "yes") || strings.EqualFold(answer, "y"), nil
+}
+
+// Password supplies only hidden terminal input, sharing the SSH prompt gate.
+func (h *cliInteractionHandler) Password(ctx context.Context, id string) ([]byte, error) {
+	if h == nil || !h.canRemember || credential.InteractionDisabled(ctx) {
+		return nil, credential.ErrCredentialStoreLocked
+	}
+	release, err := h.acquireGate(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	value, err := h.terminal.ReadSecret(ctx, fmt.Sprintf("Master password for %s: ", id))
+	if err != nil {
+		return nil, err
+	}
+	return []byte(value), nil
 }

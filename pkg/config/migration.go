@@ -284,3 +284,11 @@ func (m *CredentialMigrator) registryForPlan(cfg *CredentialConfig, state *migra
 	}
 	return m.migrationRegistry(cfg, "")
 }
+
+// WithRegistryFactory injects the composition owner's stores without reading input files.
+func (m *CredentialMigrator) WithRegistryFactory(factory func(*CredentialConfig) (*credential.Registry, error)) *CredentialMigrator {
+	if factory != nil {
+		m.registry = factory
+	}
+	return m
+}

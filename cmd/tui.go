@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
 	"github.com/wentf9/xops-cli/pkg/config"
+	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
 	"github.com/wentf9/xops-cli/pkg/tui"
@@ -51,12 +53,34 @@ func NewCmdTui() *cobra.Command {
 			interaction := newCLIInteractionHandler()
 			model, err := tui.NewModel(
 				repository,
-				tui.WithContext(ctx),
+				tui.WithContext(credential.WithoutInteraction(ctx)),
 				tui.WithLogger(logger.DefaultLogger()),
 				tui.WithInteractionHandler(interaction),
 				tui.WithRememberConfirmation(interaction.confirmRemember),
 				tui.WithCredentialService(credSvc),
 				tui.WithCredentialRegistry(credReg),
+				tui.WithVaultControl(func(work context.Context, unlock bool) error {
+					owner, err := utils.CredentialRuntime()
+					if err != nil {
+						return err
+					}
+					if !unlock {
+						return owner.Lock(work)
+					}
+					if cfg.Credential == nil {
+						return fmt.Errorf("no default offline store configured")
+					}
+					id := cfg.Credential.DefaultStore
+					selected, err := offlineConfig(cfg, id, configPath)
+					if err != nil {
+						return err
+					}
+					s, err := owner.Store(work, id, selected)
+					if err != nil {
+						return err
+					}
+					return s.Unlock(ctx)
+				}),
 			)
 			if err != nil {
 				return fmt.Errorf("create TUI model: %w", err)
