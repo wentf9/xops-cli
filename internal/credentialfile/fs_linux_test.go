@@ -4,34 +4,86 @@ package credentialfile
 
 import (
 	"errors"
-	"strings"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"golang.org/x/sys/unix"
 )
 
-func TestMountIdentityRequiresExt4AndDeviceMatch(t *testing.T) {
-	for _, tc := range []struct {
-		name, line string
-		valid      bool
-	}{
-		{"ext4", "82 67 8:32 / / rw - ext4 /dev/sdc rw\n", true},
-		{"ext3", "82 67 8:32 / / rw - ext3 /dev/sdc rw\n", false},
-		{"wrong_device", "82 67 8:33 / / rw - ext4 /dev/sdc rw\n", false},
-		{"wrong_mount", "83 67 8:32 / / rw - ext4 /dev/sdc rw\n", false},
-		{"missing_type", "82 67 8:32 / / rw -\n", false},
-		{"overlay", "82 67 8:32 / / rw - overlay overlay rw\n", false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			err := matchMount(strings.NewReader(tc.line), 82, unix.Mkdev(8, 32))
-			if (err == nil) != tc.valid {
-				t.Fatalf("mount validation: %v", err)
+func TestVaultRootDoesNotRequireFilesystemAllowlist(t *testing.T) {
+	// /dev/shm is deliberately outside the ext4/XFS/Btrfs validation matrix.
+	// Acceptance here is a policy regression test, not a durability claim.
+	path, err := os.MkdirTemp("/dev/shm", "xops-filesystem-policy-")
+	if err != nil {
+		t.Skipf("shared-memory test directory unavailable: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(path); err != nil {
+			t.Error(err)
+		}
+	})
+	root, err := createVaultRoot(t.Context(), filepath.Join(path, "vault"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := root.file.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	reopened, err := openRoot(t.Context(), filepath.Join(path, "vault"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := reopened.file.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	if root.mount != reopened.mount || root.id != reopened.id {
+		t.Fatal("unstable directory identity")
+	}
+}
+
+func TestChildStillRequiresSameDeviceAndMount(t *testing.T) {
+	path := t.TempDir()
+	if err := os.Chmod(path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	root, err := openRoot(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := root.file.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	for _, changeDevice := range []bool{false, true} {
+		parent := *root
+		if changeDevice {
+			parent.id.dev++
+		} else {
+			parent.mount++
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		child, err := newDirectory(file, &parent)
+		if child != nil {
+			if closeErr := child.file.Close(); closeErr != nil {
+				t.Error(closeErr)
 			}
-			if !tc.valid && !errors.Is(err, ErrUnsupported) {
-				t.Fatal(err)
-			}
-		})
+		}
+		if !errors.Is(err, ErrUnsupported) {
+			t.Fatalf("cross-mount directory accepted: %v", err)
+		}
+		if _, err := file.Stat(); !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("rejected handle leaked: %v", err)
+		}
 	}
 }
 

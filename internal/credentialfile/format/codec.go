@@ -1,4 +1,4 @@
-// Package format implements the draft offline-vault binary formats.
+// Package format implements the frozen v1 offline-vault binary formats.
 // It performs no file I/O, prompting, KDF work or persistence. Callers must reserve
 // nonce budgets and manage key lifetimes before using encryption primitives.
 package format
@@ -12,7 +12,8 @@ import (
 )
 
 const (
-	// Version is the draft container version, not a compatibility guarantee yet.
+	// Version identifies the frozen v1 container layout. Incompatible layouts
+	// require a new version; existing suite identifiers must not be reassigned.
 	Version = 1
 	// MaxIDBytes bounds each identifier without changing other stores' contracts.
 	MaxIDBytes = 1024

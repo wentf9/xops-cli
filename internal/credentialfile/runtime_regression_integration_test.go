@@ -338,7 +338,7 @@ func TestOpenedStoreOutlivesOpeningRequest(t *testing.T) {
 	defer cancel()
 	s, err := r.OpenStore(ctx, f.root, "offline", Options{}, o)
 	if errors.Is(err, ErrUnsupported) {
-		t.Skip("ext4 required")
+		t.Skip("required filesystem operations unavailable")
 	}
 	if err != nil {
 		t.Fatal(err)

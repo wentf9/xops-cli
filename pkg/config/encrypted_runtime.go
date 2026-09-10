@@ -2,9 +2,9 @@ package config
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"sync"
+	"time"
 
 	"github.com/wentf9/xops-cli/internal/credentialfile"
 	"github.com/wentf9/xops-cli/pkg/credential"
@@ -16,12 +16,20 @@ type EncryptedRuntime struct {
 	vaults     *credentialfile.Runtime
 	configPath string
 	mu         sync.Mutex
-	stores     map[string]*encryptedBackend
+	stores     map[encryptedBackendKey]*encryptedBackend
+}
+
+// A comparable key preserves the exact bytes of Linux paths and StoreIDs.
+// JSON encoding would collapse distinct invalid UTF-8 strings to U+FFFD.
+type encryptedBackendKey struct {
+	id, path, unlock, keyFile                                string
+	timeout, idleTTL, cacheTTL, promptTimeout, unlockTimeout time.Duration
+	readOnly, nonInteractive                                 bool
 }
 
 // NewEncryptedRuntime binds path resolution and terminal interaction for one owner.
 func NewEncryptedRuntime(ctx context.Context, configPath string, prompt credentialfile.PromptProvider) *EncryptedRuntime {
-	return &EncryptedRuntime{vaults: credentialfile.NewRuntime(ctx, prompt, nil), configPath: configPath, stores: make(map[string]*encryptedBackend)}
+	return &EncryptedRuntime{vaults: credentialfile.NewRuntime(ctx, prompt, nil), configPath: configPath, stores: make(map[encryptedBackendKey]*encryptedBackend)}
 }
 
 // Close cancels and reaps all sessions, stores and KDF children.
@@ -44,14 +52,12 @@ func (r *EncryptedRuntime) backend(id string, cfg StoreConfig) (*encryptedBacken
 	if err != nil {
 		return nil, err
 	}
-	encoded, err := json.Marshal(struct {
-		ID     string
-		Config StoreConfig
-	}{id, cfg})
-	if err != nil {
-		return nil, err
+	key := encryptedBackendKey{
+		id: id, path: cfg.Path, unlock: cfg.Unlock, keyFile: cfg.KeyFile,
+		timeout: cfg.Timeout, idleTTL: cfg.UnlockIdleTTL, cacheTTL: cfg.CacheTTL,
+		promptTimeout: cfg.PromptTimeout, unlockTimeout: cfg.UnlockTimeout,
+		readOnly: cfg.ReadOnly, nonInteractive: cfg.NonInteractive,
 	}
-	key := string(encoded)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	b := r.stores[key]

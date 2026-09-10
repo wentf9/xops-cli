@@ -379,7 +379,7 @@ func TestFileStoreReadOnlyAndCanceledCalls(t *testing.T) {
 	f := makeFixture(t)
 	s, err := Open(t.Context(), f.root, "offline", Options{Keys: f.keys, ReadOnly: true})
 	if errors.Is(err, ErrUnsupported) {
-		t.Skip("ext4 required")
+		t.Skip("required filesystem operations unavailable")
 	}
 	if err != nil {
 		t.Fatal(err)

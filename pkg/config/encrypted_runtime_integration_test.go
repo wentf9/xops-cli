@@ -108,7 +108,7 @@ func (fileTestDeriver) Derive(context.Context, kdfhelper.Request) ([]byte, error
 func TestEncryptedRuntimeNonInteractivePromptCache(t *testing.T) {
 	dir := t.TempDir()
 	prompt := &fileTestPrompt{}
-	owner := &EncryptedRuntime{vaults: credentialfile.NewRuntime(t.Context(), prompt, fileTestDeriver{}), stores: make(map[string]*encryptedBackend)}
+	owner := &EncryptedRuntime{vaults: credentialfile.NewRuntime(t.Context(), prompt, fileTestDeriver{}), stores: make(map[encryptedBackendKey]*encryptedBackend)}
 	t.Cleanup(func() {
 		if err := owner.Close(); err != nil {
 			t.Error(err)

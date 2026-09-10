@@ -1,12 +1,13 @@
 # 离线凭据库格式与 KDF 协议 v1
 
-- 状态：实施规格已采纳，格式基础与工程安全评估已完成，尚未冻结，不用于真实秘密
+- 状态：格式与 KDF 协议 v1 已冻结（2026-09-10），未发布
 - 评估：[阶段 A 密码学安全评估](offline-encrypted-credential-store-security.md)
 - 上位：[ADR-0002](../adr/0002-offline-encrypted-credential-store.md)
 - 总体：[详细设计](offline-encrypted-credential-store.md)
+- 冻结记录：[范围与兼容性规则](offline-encrypted-credential-store-v1-freeze.md)；依据[最终工程审查](../plans/offline-encrypted-credential-store-freeze-review.md)
 
-本文件的精确编码已采纳为实施基线，编号尚未冻结，冻结后不得复用。没有完整且独立
-核对的测试向量前不得宣布格式稳定。所有随机材料来自 crypto/rand，失败直接退出。
+本文件的精确编码与既有编号已冻结，编号不得复用。独立测试向量已重新生成并逐字节
+核对一致；不兼容修改遵守冻结记录的版本演进规则。所有随机材料来自 crypto/rand，失败直接退出。
 
 ## 1. 编码规则与注册表
 
@@ -30,7 +31,8 @@ LP(x) = u16(len(x)) || x；字段依表顺序连接，无对齐、无 padding、
 不同用途使用独立编号空间；只能按明确文件类型解释，不根据一个 suite 值猜文件类型。
 magic 表达类型，不能代替认证。公开字段暴露条目数量、身份和长度，不承诺元数据隐藏。
 
-所有磁盘容器使用以下 16 字节前缀：
+meta、item、CURRENT、budget 四种磁盘容器使用以下 16 字节前缀；维护 state
+与 manifest 使用第 6 节各自的编码：
 
 | 偏移 | 长度 | 字段 |
 | --- | --- | --- |
@@ -235,9 +237,9 @@ stderr 最多保留 4096 字节，不回显，超过后立即取消。stdout 超
 错误优先级：调用取消/超时 → 协议违规 → 已验证错误帧/进程失败 → 合法成功；
 保留辅助收尾错误，不因丢失 EOF 或异常退出掩盖主 context 原因。
 
-## 8. 编码核验与冻结门
+## 8. 编码核验与冻结依据
 
-冻结时至少提交以下独立复核向量：
+v1 冻结已核对以下独立复核向量：
 
 1. 固定公开口令、salt、vault ID、StoreID、DEK、nonce 的主口令 meta 完整 hex。
 2. 固定公开密钥文件的 HKDF info、派生密钥与包裹结果。
@@ -247,13 +249,13 @@ stderr 最多保留 4096 字节，不回显，超过后立即取消。stdout 超
 
 阶段 A 已通过独立 Python cryptography/系统 libargon2 生成公开固定向量，位于
 `internal/credentialfile/format/testdata`，Go 测试核对完整编码与结果；不能把
-自实现编码器输出当独立证据。向量和工程安全评估分别记录，详见[实施进度](../plans/offline-encrypted-credential-store-implementation.md)；它们不代表完整后端或第三方审计通过。
+自实现编码器输出当独立证据。向量和工程安全评估分别记录，详见[实施进度](../plans/offline-encrypted-credential-store-implementation.md)；这些验证不代表完整后端或第三方审计通过。
 
 可直接核对的长度样例：S=7、I=32 时，主口令 meta header=99、整文件=147；
 密钥文件 meta header=115、整文件=163；条目 header=106；budget header=67、
 整文件=99；CURRENT=80；P=24 时 KDF 请求=72，成功响应=49、错误响应=17。
 
-资源测试不得使用真实秘密或运行中的 vpsc 做破坏性实验。12 字节随机 nonce 的
+资源测试不得使用真实秘密或运行中的 受限资源测试环境 做破坏性实验。12 字节随机 nonce 的
 2^20 次上限只提供碰撞概率预算，配套评估已纳入总认证块数、消息长度、认证失败
 尝试、多密钥聚合及 HMAC/派生域分离；实现或上限改变时必须重新计算与审查。
 
@@ -267,7 +269,7 @@ OpRewrap/OpReencrypt + Committed，Source 绑定旧修订完整端点，Target �
 每次新发布验证旧证书并重签；prune 读取旧 meta 时再次比较 Source.MetaHash。
 
 未发布目标重建时，可保留 abandoned-<20位目标修订>.state，内容为该目标的原事务，
-以原源端 MAC 验证废弃目标身份；它只建立清理来源，不授权发布该目标。
+以原源端 MAC 验证废弃目标身份；该记录只建立清理来源，不授权发布该目标。
 清理使用独立 OpPrune 事务，最多 256 个 CleanupRevisions；完成后归档为
 revisions/<current>/prune-<operationID>。CURRENT、meta、item、budget 和 MAC 的
 字节编码、算法与参数均未改变。

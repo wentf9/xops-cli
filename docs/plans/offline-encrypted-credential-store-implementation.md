@@ -2,10 +2,13 @@
 
 - 更新：2026-09-10
 - 依据：[详细设计](../design/offline-encrypted-credential-store.md)、[格式规格](../design/offline-encrypted-credential-store-format.md)
-- 总状态：阶段 A–E 已实现并完成本地验证；格式尚未冻结，部署级发布验收属于 F
-- 本轮补缺：确定性边界测试与[密码学工程安全评估](../design/offline-encrypted-credential-store-security.md)已补齐，供阶段 A 验收复核
+- 状态：阶段 A–F 已实现，部署与审查通过，格式与接口 v1 已冻结（2026-09-10）
+- 验证记录：[原生部署与 KVM 断电验收](offline-encrypted-credential-store-deployment.md)
+- 文件系统策略：取消类型白名单，主流本地 ext4/XFS/Btrfs 已完成回归及 42 个 KVM 断电点，见[兼容性记录](offline-encrypted-credential-store-filesystems.md)
+- 冻结状态：[最终工程审查](offline-encrypted-credential-store-freeze-review.md)通过，原始字节身份去重问题已修复；[正式冻结记录](../design/offline-encrypted-credential-store-v1-freeze.md)已生效，尚未发布
+- 边界验证：确定性边界测试与[密码学工程安全评估](../design/offline-encrypted-credential-store-security.md)已补齐，供阶段 A 验收复核
 
-## 阶段 A 本次交付
+## 阶段 A 实现
 
 `internal/credentialfile/format` 提供不接触文件系统的格式与密码学原语：
 
@@ -20,7 +23,7 @@
 阶段 A 交付时 `internal/kdfhelper` 仅提供请求/响应编解码与材料清零；阶段 C 已
 新增私有执行入口，见下文。格式包仍不创建库、生成随机材料、读取配置或注册 Store。
 SealMeta/SealItem 是显式 nonce 的低层原语，调用方必须先生成新随机材料并满足
-持久化预算；不能把这批函数直接当作可写后端使用。
+持久化预算；这些原语不作为可写后端直接使用。
 
 测试数据位于 format/testdata/vectors.json。生成脚本使用 Python cryptography
 和系统 libargon2，独立于 Go 编码器；Go 测试直接读取已提交的固定结果，不要求
@@ -42,7 +45,6 @@ state 向量验证双端 MAC/编码，目标 meta 摘要为公开占位输入的
   预算上限、时间溢出、秘密独占与清零、清单集合边界。
 
 测试可重跑，短时 fuzz 不是穷尽证明；Go race 不等于进程/文件生命周期验收。
-新增源代码没有接入现有命令，不改变现有 Store 行为。本次未访问服务器或真实凭据。
 
 ## 阶段 A 评审缺口补齐
 
@@ -54,31 +56,30 @@ state 向量验证双端 MAC/编码，目标 meta 摘要为公开占位输入的
 - 工程安全评估涵盖 GCM 分组数、nonce 事件、伪造尝试、保守组合模型、多密钥、
   重包裹 salt、口令猜测及 HKDF/HMAC/摘要绑定；使用当前实际头部大小的有理数
   测试重算数值。独立只读复核未发现明确计算错误，不等同第三方安全认证。
-- 本轮没有改变生产算法、加密预算或已分配字节布局；未新增自动锁死策略。
+- 验证覆盖固定算法、加密预算和已分配字节布局。
 
 ## 待完成阶段
 
 | 阶段 | 当前状态 | 后续内容 |
 | --- | --- | --- |
-| A 冻结审查 | 本轮评审缺口已补齐 | 工程安全评估和边界测试已完成，最终验收后再冻结格式 |
-| B 文件层 | 基础实现及本地原生测试完成 | 安全打开、ext4 识别、跨进程锁、预算耐久预留、Put/Get/Delete；部署级断电验收仍待后续阶段 |
+| A 冻结审查 | v1 已正式冻结 | 独立向量已固定，格式/协议及配置/CLI 契约的兼容性规则已记录 |
+| B 文件层 | 实现及部署验证完成 | 安全打开、句柄/挂载身份、跨进程锁、预算耐久预留、Put/Get/Delete；F 已补充主流文件系统 KVM 断电验收 |
 | C KDF 与会话 | 实现及本地验证完成 | 私有进程、Runtime/租约/缓存/idle lock、队列和 Linux 内存限额；正式组合根接入留到 E |
 | D 维护 | 已实现，完成本地验证 | Init/Rewrap/Reencrypt/Resume/Restore/Clone/Prune；故障恢复、源清单、共享预算与清理边界 |
 | E 配置与调用方 | 已实现，完成本地验证 | Schema/Registry、组合根 Runtime、CLI/TUI/MCP/迁移/GC |
-| F 发布 | 本地验收完成，部署级验证待完成 | 离线单二进制、备份演练、独立审查与全量检查已完成；非 WSL 部署与断电证据待补 |
+| F 发布 | 部署验收与冻结完成，正式发布待完成 | 验收证据已齐备；剩余候选提交、产物绑定和发布检查 |
 
-vpsc 原探针 salt 文本实际 17 字节，原记录错误已修正。格式 v1 独立向量使用
+受限资源探针 salt 文本实际 17 字节，原记录错误已修正。格式 v1 独立向量使用
 严格的 16 字节 salt；原性能数据不能当格式 v1 或完整 helper 的验收证据。
 
-## 阶段 B 本次交付
+## 阶段 B 实现
 
-`internal/credentialfile` 新增已有库的 Open/Get/Put/Delete/Close，仍未加入配置
-工厂或 CLI，不提供初始化/迁移真实秘密的入口。Open 不创建目录或锁文件。
-解锁通过注入的 KeySource 完成：它必须认证完整 meta 并返回独占 DEK 副本，
+`internal/credentialfile` 实现已有库的 Open/Get/Put/Delete/Close。Open 不创建目录或锁文件。
+解锁通过注入的 KeySource 完成：KeySource 必须认证完整 meta 并返回独占 DEK 副本，
 文件层使用后清零；nil 返回 locked。阶段 C 已通过 Runtime 路径加入会话、租约和交付栅栏。
 
-文件访问仅在 Linux amd64、已识别的 ext4 上开放：fstatfs 与 statx mount ID、
-mountinfo 类型和设备号一起核对。目录句柄逐级 O_NOFOLLOW 打开，严格检查
+Linux amd64 文件访问保留 statx mount ID 与设备号校验，不按文件系统类型限制访问。
+目录句柄逐级 O_NOFOLLOW 打开，严格检查
 所有者、0700/0600、普通文件、单硬链接与挂载边界；目录权限在操作时重新检查。
 不支持的平台编译为显式 unsupported 实现，未因交叉编译成功宣布可用。
 
@@ -98,7 +99,7 @@ Applied=true/Durable=true。若只有预算完成，错误标记 budget，不能
 已经保存。独立复核发现的这两处取消/收尾边界遗漏均已修复并有定向测试。
 
 阶段 B 后续评审发现的临时文件残留问题已修复：原先 openat 创建成功但权限等
-校验失败时，调用方尚未注册路径清理。现在将句柄打开与文件校验分离，创建成功
+校验失败时，路径清理未注册。修复将句柄打开与文件校验分离，创建成功
 立即注册关闭、unlink 和目录 sync，再做校验；普通已存在文件的 open 禁止创建。
 在独立测试子进程内设置受限 umask，覆盖 budget 与 item 临时文件校验失败，
 确认无残留、恢复 umask 后可直接重试且预算不退还；O_EXCL 同名冲突不会删除
@@ -108,7 +109,7 @@ Applied=true/Durable=true。若只有预算完成，错误标记 budget，不能
 
 - 环境：Linux 6.18.35.2-microsoft-standard-WSL2、amd64、ext4，Go 1.26.7。
 - 使用 `-tags=integration` 的临时库，goleak 检查、原生文件系统调用及真实子进程
-  退出；没有接触 vpsc、服务器配置或真实秘密。
+  退出验证。测试数据与生产配置隔离。
 - 故障矩阵覆盖预算/条目的写入、file sync、发布、dir sync，ENOSPC、随机源失败、
   原语不支持、意外目标存在、取消及关闭错误。
 - 多句柄和独立进程验证同值幂等、不同条目预算串行；进程在持锁和各发布阶段
@@ -125,19 +126,7 @@ go test -tags=integration -race -count=5 ./internal/credentialfile
 golangci-lint run --build-tags=integration ./internal/credentialfile/...
 ```
 
-### 明确保留的后续工作
-
-- 进程退出测试不是断电测试；WSL2/ext4 证据不替代最终部署 VM/磁盘的耐久性验收。
-- 当前 transactions 下任何条目都保守阻止修改，读取 CURRENT 仍允许；阶段 D
-  需验证终态并归档/清理已完成事务，不能直接放过无法认证的状态。
-- 临时文件残留返回 maintenance-required，阶段 B 不猜测预算或自动删除现场；
-  实际 resume/restore/prune 由阶段 D 实现。
-- Go Options 的零超时表示构造默认值；阶段 E 的严格 YAML 解码仍须区分省略与
-  显式零，显式零按设计拒绝。
-- 原始 KeySource 路径仍是阶段 B 的低层接口；正式后端必须使用阶段 C 的 Runtime
-  路径，不能用独占 DEK 副本替代会话失效协议。
-
-## 阶段 C 本次交付
+## 阶段 C 实现
 
 ### 私有 KDF 执行器
 
@@ -194,7 +183,7 @@ golangci-lint run --build-tags=integration ./internal/credentialfile/...
 ### 资源和原生证据
 
 默认不提权、不依赖 systemd、不修改系统配置。可观察的 MemAvailable 与 cgroup
-祖先 memory.max/current 取已知最小余量；96 MiB 为本轮 Linux 实测后的保守启动
+祖先 memory.max/current 取已知最小余量；96 MiB 为 Linux 实测后的保守启动
 预检门槛（64 MiB 工作区加 32 MiB 余量），不是硬限制或对并发变化的保证。
 Capabilities 标记是否有观测信息；无法完整观察的部署不能据此宣称内存一定充足。
 
@@ -211,11 +200,11 @@ memory.max=134217728、memory.swap.max=0。子进程加入成功前不发送 KDF
 | 2 | 0.19 | 79088 | 一致 |
 | 3 | 0.20 | 79088 | 一致 |
 
-这里未施加 10% CPU 配额，不能直接与 vpsc 限流结果比较；三个样本不是性能
-显著性结论。实际二进制还在本地 128 MiB 私有 cgroup 下成功派生；超量测试只
+冷派生测量未设置 CPU 配额，与受限资源测量不构成直接性能比较；三个样本未进行
+显著性检验。实际二进制还在本地 128 MiB 私有 cgroup 下成功派生；超量测试只
 对另一个受同样限额保护的测试 helper 分配内存，确认内核终止及资源错误，未影响
 其他进程的配置或限额。原测试进程位于 init.scope，无法直接迁移到委派子树，
-因此用临时用户级 systemd unit 运行监督测试；unit 与私有子组均回收，不涉及 vpsc。
+监督测试使用用户级 systemd unit，unit 与私有子组均完成回收。
 
 父进程死亡测试在独立 supervisor 中设置 subreaper，确认 worker 收到 SIGKILL
 并由 supervisor 回收，避免把僵尸进程留给共享测试进程。三次 integration race
@@ -229,17 +218,16 @@ golangci-lint run --build-tags=integration ./internal/credentialfile/... ./inter
 ```
 
 委派内存测试在没有权限的普通环境会明确 skip，不能把 skip 当作硬限额验收。
-本轮另外在可迁移的用户级 unit 内执行 TestRunnerDelegatedMemoryLimit 并通过。
-正式 CLI/TUI/MCP 的 Runtime 组合根、初始化和维护命令仍分别属于阶段 E、D。
+另外在可迁移的用户级 unit 内执行 TestRunnerDelegatedMemoryLimit 并通过。
+CLI/TUI/MCP 的 Runtime 组合根及维护命令已分别完成接入。
 
 
-## 阶段 D 本次交付
+## 阶段 D 实现
 
 ### 管理 API 与事务
 
 - Runtime.Init 仅创建不存在或安全空根；拒绝覆盖 CURRENT。Store 提供 Rewrap、
-  Reencrypt、Resume、ResumeFrom、Clone、Restore、Prune。CLI/YAML 工厂接入仍在
-  阶段 E，本阶段不注册默认后端、不改配置或服务器密码。
+  Reencrypt、Resume、ResumeFrom、Clone、Restore、Prune，并已完成 CLI/YAML 工厂接入。
 - Wrapping 显式传入目标模式、借用的口令或安全 key-file 路径。新口令至少十二个
   Unicode 字符，KDF 参数固定。KDF 在文件锁外执行；持锁后复核状态与 CURRENT。
   SessionOptions.NonInteractive、调用 Context 和 Runtime 的非交互约束均保留。
@@ -266,7 +254,7 @@ golangci-lint run --build-tags=integration ./internal/credentialfile/... ./inter
 
 - Clone 使用新 VaultID 和显式目标 StoreID，保留 ItemID。Restore 保持原身份、
   使用比源更高的代次与修订；required 参数由调用方提供可信备份配置中的引用，
-  缺失或无法认证的引用阻止发布。本阶段不自行加载或改写 YAML。
+  缺失或无法认证的引用阻止发布。存储 API 不自行加载或改写 YAML。
 - 两者要求新目标；通过物理祖先检查拒绝同根、祖先或后代目录。双根锁按
   (device, inode) 排序，取代设计初稿的路径排序，避免别名造成锁顺序不一致。
 - 源允许以只读条目句柄使用，但源根必须可写维护标记；停写备份应先复制到隔离
@@ -294,9 +282,9 @@ golangci-lint run --build-tags=integration ./internal/credentialfile/... ./inter
 - 首次 intent 耐久之前的孤立目录保持 maintenance-required，不能自动 Resume 或
   prune；需要人工检查原现场或从可信备份向新根恢复。初始化重建中未形成可认证
   提交关系的废弃目录同样保留。不把“存在目标文件”当成完整事务或清理授权。
-- 进程退出测试不等同断电测试。首版仍只支持已验证的 Linux amd64/ext4；
-  Windows/macOS 保留 unsupported API。没有访问 vpsc、真实凭据或修改服务器状态。
-- 本轮 race 校验发现既有 idle 测试把 40ms 期限用于磁盘准备阶段，慢 fsync 会让
+- 进程退出和 KVM 断电分别验证。Linux amd64 的 ext4/XFS/Btrfs 已通过兼容性测试；
+  Windows/macOS 保留 unsupported API。
+- race 校验发现既有 idle 测试把 40ms 期限用于磁盘准备阶段，慢 fsync 会让
   Put 正确返回租约失效。测试改为准备完成后启动短期限，再验证真实 timer 清零；
   未放宽生产超时。
 
@@ -325,7 +313,7 @@ go test -tags=integration -race -count=3 ./internal/credentialfile ./internal/kd
   当前条目数量检查预算下限。归档后允许正常 Put/Delete，因此不要求当前条目集合
   与历史提交清单一致。测试覆盖四种预算异常时保留源镜像，以及正常增删后的恢复。
 
-## 阶段 E 本次交付
+## 阶段 E 实现
 
 - Schema 增加 encrypted-file 与 path/unlock/key_file 和三种会话期限；YAML 区分
   省略与显式零，保留旧后端默认语义；路径相对于实际配置文件，局部引用长度预检。
@@ -342,23 +330,21 @@ go test -tags=integration -race -count=3 ./internal/credentialfile ./internal/kd
   等待完成先前清零，再原子注册租约。保留 Lock 取消及收尾等待语义。
 - 测试覆盖配置零值/错误字段/长度界限、路径基准、缓存与锁定、非交互冷/热会话、
   CLI 初始化/检查/轮换/恢复/克隆/prune、JSON、错误选项、迁移/finalize，以及 TUI
-  控制回调。全部使用公开测试材料和本地临时库，没有访问 vpsc。
-- 使用与备份操作说明见 [离线库指南](../offline-encrypted-credentials.md)。本轮不
-  冻结格式，不宣称子进程退出实验等同真实断电验证；阶段 F 仍未完成。
+  控制回调。测试采用公开材料与隔离库。
+- 使用与备份操作说明已记录于[离线库指南](../offline-encrypted-credentials.md)。
 
 ### 阶段 E 验证结果
 
 - 全仓 go build、go test、golangci-lint，以及全仓 integration 标签 lint 通过。
 - credentialfile/kdfhelper/config/tui 三轮 integration race 通过；cmd 三轮 race
-  初次合并运行达到 240s 总时限，关闭测试进程的 race 默认退出等待后单独复跑
-  `GORACE=atexit_sleep_ms=0 go test -tags=integration -race -count=3 ./cmd -timeout=180s`
-  通过（约 124s）。未更改生产超时或放宽断言。
-- 最后增加的共享注册表/非交互适配器测试单独两轮 race 通过。
+  使用 `GORACE=atexit_sleep_ms=0` 移除测试子进程的退出等待后，三轮测试在
+  180s 测试期限内通过（约 124s）。
+- 共享注册表/非交互适配器测试两轮 race 通过。
 - 真实 XOps 二进制在临时私有 ext4 目录完成 key-file 初始化、检查、重加密、
   resume 和 prune；伪终端完成主口令初始化、认证检查和重加密，确认输入不回显。
   无终端主口令访问返回 locked；v2 命令路径未生成 legacy secret.key。
 - Windows amd64、Darwin arm64 的 CLI 交叉编译通过，仅证明 unsupported API
-  组合完整，不构成这些平台的运行支持声明。没有提交或推送代码。
+  组合完整，不构成平台原生运行支持。
 
 ### 阶段 E 评审修复
 
@@ -373,7 +359,7 @@ go test -tags=integration -race -count=3 ./internal/credentialfile ./internal/kd
   Init 与损坏状态。实际二进制从原失败现场取得隐藏源主口令，通过真实 KDF 完成
   跨库恢复；所有测试材料公开，仅在本地临时目录运行。
 
-## 阶段 F 本次交付
+## 阶段 F 实现
 
 - 增加标准库 Python 驱动的离线单二进制/停写备份恢复验收脚本；实际在独立网络与
   mount namespace 执行，空 PATH 下完成 key-file、主口令 KDF、恢复后写入和清理。
@@ -381,8 +367,7 @@ go test -tags=integration -race -count=3 ./internal/credentialfile ./internal/kd
   预算下的旧修订及事务。新增回归与独立原复现均通过。
 - 补充支持矩阵、二进制和测试向量哈希、复跑命令及证据边界。详见
   [发布验收记录](offline-encrypted-credential-store-release.md)。
-- 当前仅有 WSL2 Linux/ext4 证据，非 WSL 部署验证及真实断电实验未执行，格式未
-  宣布冻结，没有提交、推送或发布，也没有访问 vpsc。
+- 已完成原生桌面和无桌面环境验证、三种文件系统的 42 个 KVM 断电点及 v1 冻结。
 
 ### 阶段 F 演练校验补缺
 

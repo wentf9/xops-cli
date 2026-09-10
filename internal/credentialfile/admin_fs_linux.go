@@ -104,11 +104,7 @@ func createVaultRoot(ctx context.Context, path string) (root *directory, err err
 		return nil, err
 	}
 	defer closeFile(&err, parent)
-	st, err := inspect(parent)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := checkExt4(parent, st); err != nil {
+	if _, err := mountID(parent); err != nil {
 		return nil, err
 	}
 	created := false

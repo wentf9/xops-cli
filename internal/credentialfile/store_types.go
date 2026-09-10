@@ -10,8 +10,9 @@ import (
 )
 
 var (
-	// ErrUnsupported indicates a platform or filesystem without verified semantics.
-	ErrUnsupported = errors.New("offline vault platform or filesystem is unsupported")
+	// ErrUnsupported indicates an unimplemented platform, unavailable filesystem
+	// operation or a directory crossing the vault's device/mount boundary.
+	ErrUnsupported = errors.New("offline vault platform or required filesystem operation is unsupported")
 	// ErrConflict indicates an immutable item already exists with a different value.
 	ErrConflict = errors.New("offline credential item conflict")
 	// ErrRevisionChanged indicates publication changed while unlocking.

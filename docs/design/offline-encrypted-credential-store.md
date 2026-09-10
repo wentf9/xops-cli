@@ -1,11 +1,11 @@
 # 内置离线加密凭据库详细设计
 
 - 日期：2026-09-10
-- 状态：设计已采纳，阶段 A–E 已实现，配置与命令已接入；格式冻结与验收待完成，上位约束来自 [ADR-0002](../adr/0002-offline-encrypted-credential-store.md)
+- 状态：设计已采纳，阶段 A–F 与冻结审查已完成，格式/接口 v1 已冻结，未发布；见[冻结记录](offline-encrypted-credential-store-v1-freeze.md)，上位约束来自 [ADR-0002](../adr/0002-offline-encrypted-credential-store.md)
 - 进度：[实施记录](../plans/offline-encrypted-credential-store-implementation.md)
 - 工程安全评估：[阶段 A 分析与假设](offline-encrypted-credential-store-security.md)
 - 配套：[格式与内部协议 v1](offline-encrypted-credential-store-format.md)
-- 证据：[vpsc KDF 初测](../adr/0002-kdf-measurement-vpsc.md)
+- 证据：[受限资源环境 KDF 测量](../adr/0002-kdf-measurement.md)
 
 ## 1. 目标与交付边界
 
@@ -13,12 +13,13 @@
 及无 pass/GPG 的机器上保存秘密。配置仍只包含 CredentialRef，普通新安装默认 none。
 本设计不实现跨进程解锁服务、在线一致性备份、秘密撤销或可信抗回滚。
 
-首个正式支持目标为 Linux amd64、本地 ext4。支持声明以原生故障验收为前提；
-Windows、macOS 和其他文件系统暂返回 unsupported。vpsc 不用于 OOM、故障注入
+首个正式支持平台为 Linux amd64，文件系统可靠性由部署者保证，不按文件系统类型
+拒绝访问。ext4、XFS、Btrfs 为主流本地文件系统验收范围，网络及特殊文件系统不做
+专项适配或可靠性承诺。Windows、macOS 暂返回 unsupported。受限资源测试环境 不用于 OOM、故障注入
 或存储破坏实验。Go 维持 1.26+，使用标准库和已存在的 x/crypto、x/sys 依赖。
 
-文中新增类型、字段、编号与命令选项已采纳为实施基线，不代表当前 API 或已冻结格式。
-具体编码补全不得削弱 ADR 的安全约束；独立审查和测试向量通过后才冻结格式。
+文中格式、配置字段与命令选项已按冻结记录确认为 v1 契约；内部类型与实现组织可继续
+重构，但不得破坏已冻结行为或削弱 ADR 的安全约束。
 
 ### 1.1 实施前确认记录
 
@@ -39,7 +40,7 @@ Windows、macOS 和其他文件系统暂返回 unsupported。vpsc 不用于 OOM�
 
 ## 2. 当前代码接入点
 
-以下根据当前工作区代码核对，不以旧设计文档推断实现状态：
+实现接入点如下：
 
 | 当前实现 | 接入要求 |
 | --- | --- |
@@ -53,8 +54,8 @@ Windows、macOS 和其他文件系统暂返回 unsupported。vpsc 不用于 OOM�
 | `internal/credentialhelper` | 复用／抽取进程组和 Job 机制，不复用 JSON 协议或原样 stderr 诊断 |
 | `cmd/cli/main.go` | 私有 KDF 分流先于 i18n.Init 和 cmd.Execute；检查依赖包 init 无输出和配置访问 |
 
-新增后端拟位于 `internal/credentialfile`，格式、文件事务、维护操作与 Store 在该包内；
-私有协议执行器拟位于 `internal/kdfhelper`。进程启动机制若抽取为公共内部包，必须
+后端位于 `internal/credentialfile`，格式、文件事务、维护操作与 Store 在该包内；
+私有协议执行器位于 `internal/kdfhelper`。进程启动机制若抽取为公共内部包，必须
 给原 helper 路径跑回归测试，不以复制未审查代码代替复用。
 
 ## 3. 所有权与依赖注入
@@ -64,7 +65,7 @@ Windows、macOS 和其他文件系统暂返回 unsupported。vpsc 不用于 OOM�
 BuildRegistryFromConfig 保持兼容：没有 Runtime 时 encrypted-file 延迟访问报
 unavailable，不能私建无人回收的全局 Runtime。原有后端行为不变。
 
-拟议职责接口（名称在实现中保持 Go 缩写惯例）：
+职责分工（名称在实现中保持 Go 缩写惯例）：
 
 | 对象 | 职责及所有者 |
 | --- | --- |
@@ -152,10 +153,10 @@ Runtime 负责等待已执行的回调。失效 epoch 同时阻止在途请求�
 
 ## 6. Linux 文件访问与锁
 
-只对已验收的 Linux amd64/ext4 开放访问；对打开后的目录句柄做 fstatfs、权限与
-所有者检查，不能依赖路径字符串判断文件系统。ext4 识别还需区分共享 magic 的
-旧文件系统：以 statx 的 mount ID 对应当前进程 /proc/self/mountinfo 的 ext4 类型，
-再与打开句柄的设备号核对；缺少能力或无法一致确认时拒绝，不凭 magic 放行。
+Linux amd64 不设置文件系统类型白名单，不通过 fstatfs magic 或 mountinfo 名称判断
+是否允许访问。打开后的句柄仍检查权限、所有者、设备号和 statx mount ID；库内子目录
+必须与根保持同一设备及挂载，避免跨挂载替换与清理越界。缺少必要操作能力时返回
+明确错误；不把“类型允许”当作耐久性证明，也不因取消白名单而降低路径或同步要求。
 
 根及子目录 0700，库文件 0600，所有者为当前有效用户；密钥文件按 ADR 允许 root
 所有的 0400/0600。安全打开使用目录句柄相对路径及 O_NOFOLLOW、O_CLOEXEC，
@@ -196,7 +197,7 @@ Delete：由 Service 已确认全局解除引用且 Durable 后调用；Store �
 并校验预算/目标身份，删除后同步目录。目标不存在也同步必要父目录后成功。
 保持现有 asset_delete 恢复语义，不依赖被删除实体仍在配置中。
 
-拟新增 StoreDurabilityError，携带 Op、Applied、Durable、Cause，保留 errors.Is/As；
+使用 credentialfile.DurabilityError，携带 Op、Applied、Durable、Cause，保留 errors.Is/As；
 Applied 为真不代表配置已提交。任何 Put 错误阻止 Service 配置 CAS，保留 intent；
 清理错误保留上层 journal。不能导入 pkg/config.DurabilityError 造成层次循环依赖。
 
@@ -271,7 +272,7 @@ prune 默认只给计划，--apply 时在独占锁下重新计算；不得删除
 
 ## 9. KDF 运行与资源
 
-固定 Argon2id 65536 KiB/t=3/p=1/32 字节。私有参数拟为 __xops_kdf_v1，只允许
+固定 Argon2id 65536 KiB/t=3/p=1/32 字节。私有参数为 __xops_kdf_v1，只允许
 精确参数组合；直接调用 os.Executable 指向的可信二进制，不经过 shell/PATH 搜索。
 不继承配置环境变量，stdin 单请求后 EOF，stdout 单响应后 EOF，stderr 有界排空。
 读取、写入和取消任务均加入等待组；任何协议超量立即取消进程，不等满 timeout。
@@ -284,12 +285,14 @@ prune 默认只给计划，--apply 时在独占锁下重新计算；不得删除
 Linux 可用已委派 cgroup v2 时在开始 KDF 前设置 memory.max 与 memory.swap.max，
 只有验证设置生效才称硬限制；没有委派权限不调用 sudo/systemd-run、不修改系统
 配置，报告 hard_limit=false，以固定工作参数、单并发和部署配额约束。需要硬保证
-的部署必须先提供可用机制；128 MiB 仍为待验收预算，不把 GOMEMLIMIT 当硬限制。
+的部署必须先提供可用机制；128 MiB 硬限额已通过真实 CLI 原生验收，见
+[部署记录](../plans/offline-encrypted-credential-store-deployment.md)。不把 GOMEMLIMIT 当硬限制。
 不把测试使用的 CPUQuota=10% 自动变为产品默认，避免人为拖长正常解锁。
 
 预检读取可用的 MemAvailable 和当前 cgroup 祖先的有限 memory.max/current，取
-可解释的最小余量。已知低于工作内存加已测 helper 开销则拒绝；开销余量未验收前
-不冻结数字。无法读取指标须在能力报告中说明，不宣称预检通过，不尝试危险的大内存探测。
+可解释的最小余量。当前实现以 96 MiB（64 MiB 工作区加 32 MiB 余量）作为启动
+预检门槛；预检不是硬限额，也不能保证观测后资源不变。无法读取指标须在能力报告中
+说明，不宣称预检通过，不尝试危险的大内存探测。
 跨平台硬限制、macOS 父进程回收留在支持该平台前完成，不以降级实现宣布支持。
 
 ## 10. CLI 与调用方接入
@@ -325,11 +328,13 @@ CLI 非零退出机制，不另造与项目冲突的退出码；--json 返回稳
 ## 11. 错误契约
 
 复用 ErrCredentialStoreLocked/Unavailable、ErrCredentialAccessDenied、ErrCredentialNotFound、
-ErrCredentialStoreReadOnly、ErrInvalidRef。新增后端稳定错误种类建议为 Corrupt、
-Unsupported、Conflict、RevisionChanged、ResourceBusy、ResourceExhausted、
-KeyUsageExhausted、MaintenanceRequired，以及 StoreDurabilityError。
-这些错误通过包级类型或 sentinel 暴露，config/cmd 不根据字符串判断；确切命名在
-实现评审确定，语义按 ADR 不变。context.Cause 与取消/超时必须可 errors.Is 识别。
+ErrCredentialStoreReadOnly、ErrInvalidRef。格式层以 format.ErrCorrupt/ErrIdentity/
+ErrUnsupported 分类，Store 层使用 ErrUnsupported、ErrConflict、ErrRevisionChanged、
+ErrResourceBusy、ErrKeyUsageExhausted、ErrMaintenanceRequired、ErrClosed，KDF 资源
+错误为 kdfhelper.ErrResource；耐久性结果使用 credentialfile.DurabilityError。
+这些错误通过包级类型或 sentinel 暴露，config/cmd 不根据字符串判断。
+context.Cause 与取消/超时必须可 errors.Is 识别。CLI 的 code 与 outcome 契约见
+[冻结前审查记录](../plans/offline-encrypted-credential-store-freeze-review.md)。
 包裹认证失败不区分坏口令与坏密文；条目认证失败是 corrupt，不返回 not-found。
 
 ## 12. 实施阶段与验收
@@ -337,11 +342,11 @@ KeyUsageExhausted、MaintenanceRequired，以及 StoreDurabilityError。
 | 阶段 | 交付 | 必须通过的验收 |
 | --- | --- | --- |
 | A 格式冻结 | 编码器/解析器、测试向量、字段上限 | 独立向量、fuzz、整数边界、AAD 替换、整体 GCM 审查 |
-| B 文件层 | 安全路径、读写锁、预算、Put/Get/Delete | ext4 子进程退出、并发、sync 失败、无覆盖、预算不回退 |
+| B 文件层 | 安全路径、读写锁、预算、Put/Get/Delete | ext4/XFS/Btrfs 子进程退出、并发、sync 失败、无覆盖、预算不回退 |
 | C KDF/会话 | 协议、受控进程、缓存及锁定 | 管道超量、结果后失败退出、取消竞争、timer/租约回收、内存实测 |
 | D 维护 | init/rewrap/reencrypt/resume/restore/clone/prune | 上表每个故障点、源清单变化、同 DEK 预算共享、旧目录清理 |
 | E 配置/调用方 | 类型、工厂、Runtime、命令与迁移 | 全调用链非交互、缓存不绕过修订、配置缺省/显式零、原后端回归 |
-| F 发布 | 用户指南、支持矩阵 | 原生 ext4、离线单二进制、备份演练、build/test/race/lint |
+| F 发布 | 用户指南、验证矩阵 | 主流本地文件系统、离线单二进制、备份演练、build/test/race/lint |
 
 每阶段核心逻辑必须有对应测试，不在真实凭据上做首次迁移。故障注入同时覆盖
 模拟 FileOps 错误与真实子进程退出，后者不等同断电耐久性；必要时使用隔离 VM
@@ -349,13 +354,15 @@ KeyUsageExhausted、MaintenanceRequired，以及 StoreDurabilityError。
 
 ## 13. 冻结前审查项
 
-本方案行为选择已采纳，以下是待完成的评审/验证门，不是待用户决策或已通过事项：
+本方案行为选择已采纳，以下审查项已逐项对应实现与证据，结果见
+[冻结前审查记录](../plans/offline-encrypted-credential-store-freeze-review.md)。
+审查已闭环，格式/接口 v1 已按[冻结记录](offline-encrypted-credential-store-v1-freeze.md)正式冻结：
 
 - 1024 字节局部 ID 上限、哈希文件名与现有导入/迁移契约相容性。
 - Secret.ExpiresAt 的编码范围、常量时间值比较与过期行为回归。
 - 格式/内部协议精确字节和独立完整测试向量、预算/状态 MAC 及 GCM 总安全界限。
 - 源/目标材料与模式转换配置更新间隙，resume 不绕过套件和交互策略。
-- Linux ext4 可靠识别、fsync 原语及 cgroup 能力报告；完整 helper 的内存与超时验收。
+- Linux 句柄/挂载身份、主流本地文件系统 fsync 原语及 cgroup 能力报告；完整 helper 的内存与超时验收。
 - 跨平台 ACL、父进程退出和目录耐久性证据未完成前，不扩展首版支持矩阵。
 
 

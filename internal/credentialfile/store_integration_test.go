@@ -100,7 +100,7 @@ func (f fixture) open(t *testing.T, ops fileOps) *Store {
 	t.Helper()
 	s, err := openStore(t.Context(), f.root, "offline", Options{Keys: f.keys, Timeout: 2 * time.Second}, ops)
 	if errors.Is(err, ErrUnsupported) {
-		t.Skipf("native ext4 required: %v", err)
+		t.Skipf("required filesystem operations unavailable: %v", err)
 	}
 	if err != nil {
 		t.Fatal(err)

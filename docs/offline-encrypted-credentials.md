@@ -1,8 +1,11 @@
 # 离线加密凭据库
 
-`encrypted-file` 已接入配置、命令和凭据引用调用链。当前实现只开放 Linux amd64
-本地 ext4；其他系统或文件系统明确返回 unsupported。本地阶段 F 验收已完成；部署级验证与正式支持
-声明仍待完成，见[发布验收记录](plans/offline-encrypted-credential-store-release.md)。默认后端仍为 none，启用必须显式配置，不会自动降级到其他后端。
+`encrypted-file` 已接入配置、命令和凭据引用调用链。当前实现开放 Linux amd64，
+不按文件系统类型限制访问；由用户选择能可靠提供锁、原子替换和文件/目录同步的存储。
+ext4、XFS、Btrfs 是主流本地文件系统的验证范围，不是准入白名单。
+Windows/macOS 等未实现平台仍返回 unsupported；实际文件操作不受支持或同步失败时
+明确报错，不省略必要操作。阶段 F 本地、原生部署及隔离 KVM
+断电验收已完成；[格式与接口 v1 已冻结](design/offline-encrypted-credential-store-v1-freeze.md)，发布状态为未发布。默认后端仍为 none，启用必须显式配置，不会自动降级到其他后端。
 
 ## 配置
 
@@ -30,9 +33,9 @@ credential:
 cache_ttl 可以为零，表示禁用条目缓存。command、args、prefix 不能用于该后端。
 
 无人值守配置使用 `unlock: key-file` 和 `key_file: /run/credentials/xops.key`，
-并可设置 `non_interactive: true`。密钥文件必须为 32 字节，属于当前用户且权限
-0600；库目录必须私有，不能用符号链接或硬链接替代受保护文件。管理员负责通过
-受控方式准备、交付及备份密钥文件，XOps 不生成或删除它。
+并可设置 `non_interactive: true`。密钥文件必须为 32 字节，属于当前用户或 root，权限
+为 0400 或 0600；库目录必须私有，不能用符号链接或硬链接替代受保护文件。管理员负责通过
+受控方式准备、交付及备份密钥文件，XOps 不生成或删除密钥文件。
 
 主口令仅通过隐藏终端输入，不支持口令 argv 或环境变量。新口令至少十二个 Unicode
 字符，初始化与重包裹会二次确认。key-file 与 prompt 不能同时配置。

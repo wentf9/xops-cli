@@ -100,7 +100,7 @@ func TestMaintenanceInit(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "new")
 	result, err := r.Init(t.Context(), path, "offline", material)
 	if errors.Is(err, ErrUnsupported) {
-		t.Skip("ext4 required")
+		t.Skip("required filesystem operations unavailable")
 	}
 	if err != nil {
 		t.Fatal(err)

@@ -59,7 +59,7 @@ func runtimeStore(t *testing.T, r *Runtime, f fixture, o SessionOptions) *Store 
 	t.Helper()
 	s, err := r.OpenStore(t.Context(), f.root, "offline", Options{Timeout: 2 * time.Second}, o)
 	if errors.Is(err, ErrUnsupported) {
-		t.Skip("ext4 required")
+		t.Skip("required filesystem operations unavailable")
 	}
 	if err != nil {
 		t.Fatal(err)

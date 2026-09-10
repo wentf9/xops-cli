@@ -41,7 +41,8 @@ type Store struct {
 
 var _ credential.Store = (*Store)(nil)
 
-// Open opens only an existing private vault on Linux amd64/ext4. It never creates
+// Open opens an existing private vault on Linux amd64. The caller selects
+// storage with reliable locking, atomic publication and sync semantics. It never creates
 // directories, keys, locks or configuration. ctx governs the store's lifetime.
 func Open(ctx context.Context, path, storeID string, options Options) (*Store, error) {
 	return openStore(ctx, path, storeID, options, fileOps{})

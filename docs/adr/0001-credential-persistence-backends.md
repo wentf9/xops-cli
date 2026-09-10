@@ -11,7 +11,7 @@
 编辑表单和 SSH 客户端配置都可能长期持有明文。
 
 该方案能够避免配置文件直接出现明文，但配置密文与解密密钥通常位于同一用户目录，
-无法充分抵御整个用户目录被复制、同用户恶意进程或运行时内存泄露。它也无法自然接入
+无法充分抵御整个用户目录被复制、同用户恶意进程或运行时内存泄露。该结构也无法直接接入
 Windows Credential Manager、macOS Keychain、Linux Secret Service、`pass` 或远程
 Secret Manager。
 
@@ -47,8 +47,10 @@ XOps 同时存在 CLI、TUI、MCP、Playbook 和批处理调用方。部分调�
 
 非交互要求覆盖后端解锁，不只是 SSH 提示器。自定义 helper 需显式声明
 `non_interactive: true` 并遵守请求中的 `nonInteractive` 契约；无法保证禁止提示的
-后端必须在启动前失败关闭。当前 Linux 原生 secret-tool 路径受此限制，自动化使用
-pass、agent 或已声明支持的 helper。Store 初始化推迟至实际访问，普通浏览不受影响。
+后端必须在启动前失败关闭。Linux system 的非交互读取直接通过本地 Secret Service
+D-Bus 获取已解锁的凭据，不调用 Unlock/Prompt；锁定返回 locked，缺失返回 not-found。
+交互读取及写入仍使用 secret-tool，非交互写入/删除仍拒绝。Store 初始化推迟至实际访问，
+普通浏览不受影响。exec 的 -x 控制远端终端交互，不是读取已有凭据的开关。
 
 ## 后端集合
 
@@ -57,6 +59,7 @@ pass、agent 或已声明支持的 helper。Store 初始化推迟至实际访问
 | `system` | 桌面用户 | 是 | Keychain、Credential Manager、Secret Service |
 | `pass` | 无桌面 Linux | 是 | 使用 GPG/`pass`，解锁由 GPG agent 管理 |
 | `external` | Vault、1Password、企业系统 | 由后端决定 | 通常只读，可返回过期时间 |
+| `encrypted-file` | 离线 Linux | 是 | 内置封套加密，主口令或独立密钥文件解锁；格式与接口 v1 已冻结 |
 | `none` | 每次输入 | 否 | 非交互调用方失败关闭 |
 | `legacy-file` | 迁移旧配置 | 是 | 仅兼容读取和迁移，不接受新写入 |
 

@@ -3,7 +3,6 @@
 package credentialfile
 
 import (
-	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -12,7 +11,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"github.com/wentf9/xops-cli/internal/credentialfile/format"
@@ -97,58 +95,6 @@ func mountID(file *os.File) (uint64, error) {
 	return st.Mnt_id, nil
 }
 
-func checkExt4(file *os.File, st unix.Stat_t) (id uint64, err error) {
-	var fs unix.Statfs_t
-	if err := unix.Fstatfs(int(file.Fd()), &fs); err != nil {
-		return 0, fmt.Errorf("identify vault filesystem: %w", err)
-	}
-	if fs.Type != unix.EXT4_SUPER_MAGIC {
-		return 0, ErrUnsupported
-	}
-	id, err = mountID(file)
-	if err != nil {
-		return 0, err
-	}
-	f, err := os.Open("/proc/self/mountinfo")
-	if err != nil {
-		return 0, fmt.Errorf("read mount information: %w", errors.Join(ErrUnsupported, err))
-	}
-	defer func() { err = errors.Join(err, f.Close()) }()
-	return id, matchMount(f, id, st.Dev)
-}
-
-func matchMount(r io.Reader, id, dev uint64) error {
-	scan := bufio.NewScanner(io.LimitReader(r, 4*1024*1024+1))
-	scan.Buffer(make([]byte, 4096), 64*1024)
-	for scan.Scan() {
-		fields := strings.Fields(scan.Text())
-		if len(fields) < 10 {
-			continue
-		}
-		mount, err := strconv.ParseUint(fields[0], 10, 64)
-		if err != nil || mount != id {
-			continue
-		}
-		want := fmt.Sprintf("%d:%d", unix.Major(dev), unix.Minor(dev))
-		if fields[2] != want {
-			return ErrUnsupported
-		}
-		for i := 6; i+1 < len(fields); i++ {
-			if fields[i] == "-" {
-				if fields[i+1] == "ext4" {
-					return nil
-				}
-				return ErrUnsupported
-			}
-		}
-		return ErrUnsupported
-	}
-	if err := scan.Err(); err != nil {
-		return fmt.Errorf("parse mount information: %w", errors.Join(ErrUnsupported, err))
-	}
-	return ErrUnsupported
-}
-
 func newDirectory(file *os.File, root *directory) (d *directory, err error) {
 	defer func() {
 		if err != nil {
@@ -162,14 +108,11 @@ func newDirectory(file *os.File, root *directory) (d *directory, err error) {
 	if err := validatePrivate(st, true); err != nil {
 		return nil, err
 	}
-	var mount uint64
-	if root == nil {
-		mount, err = checkExt4(file, st)
-	} else {
-		mount, err = mountID(file)
-		if err == nil && (st.Dev != root.id.dev || mount != root.mount) {
-			err = ErrUnsupported
-		}
+	// Filesystem reliability belongs to the deployment. Keep handle/mount
+	// identity checks, but do not admit or reject storage by filesystem name.
+	mount, err := mountID(file)
+	if err == nil && root != nil && (st.Dev != root.id.dev || mount != root.mount) {
+		err = ErrUnsupported
 	}
 	if err != nil {
 		return nil, err
