@@ -52,14 +52,14 @@ xops credential finalize-migration
 | `xops_config.yaml.migration.lock` | 防止同一配置的迁移与 finalize 并发执行 |
 
 原 `secret.key` 和备份一直保留到显式 finalize。既有备份内容不同或权限不符合要求时，
-迁移不会覆盖它。Windows 的实际文件访问控制仍由当前目录的 ACL 决定。
+迁移不会覆盖已存在的文件。Windows 的实际文件访问控制仍由当前目录的 ACL 决定。
 
 每个秘密先分配随机不可变引用并写入状态文件，再写后端并读回比较。进程中断或后端
 返回不确定结果时，重跑同一 `migrate --to ...` 命令会复用已记录引用：已写入且内容一致
 的条目不会重复覆盖。任何失败都不会自动删除旧配置、旧 key 或迁移备份。
 
 后端 I/O 不持有配置锁。最后提交 v2 时重新比较源文件和旧 key 的版本；发生 CAS 冲突，
-不会覆盖其他进程的修改，并保留备份与待迁移引用。需先处理并发修改，再恢复到本次
+不会覆盖其他进程的修改，并保留备份与待迁移引用。需先处理并发修改，再恢复到
 迁移记录的源文件/key 版本后重跑；程序不会擅自回滚或合并这些修改。
 
 提交后会重新读取 v2、检查 metadata-only 快照、引用可读性和迁移值一致性。目录同步
@@ -72,7 +72,7 @@ xops credential finalize-migration
 ## finalize 的含义
 
 `finalize-migration` 本身就是用户完成实际连接验证后的显式确认，不会被迁移命令自动
-调用。它会：
+调用。该命令执行以下操作：
 
 1. 重新读取当前有效的 v2 配置，不要求非秘密配置仍与迁移当天完全相同；
 2. 不使用缓存地读取全部当前引用；仍沿用迁移引用的秘密，还会与旧副本比较；
@@ -100,7 +100,7 @@ xops credential finalize-migration
 
 若系统 `ssh -vvv` 显示 `Authentications that can continue: publickey`，服务端仅允许
 公钥认证。全新环境必须提供相应私钥或 SSH agent，且公钥已获服务端授权，例如：
-`xops ssh root@10.0.0.4:3922 -i /path/to/private_key`。迁移、设置 default_store 或
+`xops ssh root@192.0.2.10:22 -i /path/to/private_key`。迁移、设置 default_store 或
 finalize 都不会改变服务端认证策略；客户端不能在此情况下改用密码认证。
 没有匹配认证候选时，XOps 会报告服务端允许的方法；主机密钥确认接受 `y`/`yes`。
 

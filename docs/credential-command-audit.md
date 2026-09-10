@@ -1,7 +1,7 @@
 # 阶段 8 命令凭据接入核对（2026-09-09）
 
 范围：根命令注册表及其子命令，检查引用解析、交互边界、秘密写入和资产删除。
-未访问真实用户凭据库或远程主机；自动化使用隔离配置、fake helper 和 loopback。
+自动化验证使用隔离配置、fake helper 和 loopback。
 
 | 入口 | 读取与写入路径 | 核对结果 |
 | --- | --- | --- |
@@ -14,7 +14,7 @@
 | tui | Registry、CredentialService、异步编辑与确认器 | 已接入，资产删除含恢复日志与后端清理 |
 | sudo、本地 firewall | 本地身份引用按需读取；sudo 遵循 remember | 已接入 |
 | host add/edit、identity add/edit | 凭据服务和版本化编辑 | 已接入；新增失败可保留无秘密元数据，遵循阶段 6 约定 |
-| host import/load、loadHost | 非交互 Registry；v2 CSV 秘密经凭据服务 | 本次修复；逐行原子创建/编辑，验证连接失败保留已提交资产 |
+| host import/load、loadHost | 非交互 Registry；v2 CSV 秘密经凭据服务 | 缺陷修复；逐行原子创建/编辑，验证连接失败保留已提交资产 |
 | host list/tags/tag、identity list | 配置元数据 | 不读取后端秘密 |
 | host delete、identity delete、TUI 资产删除 | 版本化配置删除 + asset_delete journal | 已修复后端清理缺口，见下文 |
 | identity credential set/delete | 凭据服务显式写入/解除引用/清理 | 已接入 |
@@ -23,11 +23,11 @@
 | init | 配置初始化及 OpenSSH 元数据导入 | v2 + none；不访问凭据库 |
 | version/help、nc/dns/ping/encode/forward | 版本信息或网络/编码工具 | 无 SSH 凭据消费；forward 是普通 TCP/UDP 转发 |
 
-## 本次修复
+## 缺陷修复
 
 CSV 导入曾使用未注入 Registry 的验证连接器，且将密码/passphrase 写入配置字段。
-v2 导入现在先写入并读回后端秘密，再一次提交节点/身份和引用；编辑使用完整节点版本
-CAS。未配置可写默认 Store 时拒绝导入秘密，不留下本次创建的元数据。全部后端访问
+v2 导入先写入并读回后端秘密，再一次提交节点/身份和引用；编辑使用完整节点版本
+CAS。未配置可写默认 Store 时拒绝导入秘密，不留下该操作创建的元数据。全部后端访问
 传递非交互策略，不启动解锁提示。v1 的 AES 导入仅在既定兼容周期内保留。
 
 ## 资产删除清理（已修复）
@@ -44,5 +44,5 @@ Applied 非 Durable 时保留秘密和日志；配置 durable 后再检查全局
 恢复根据当前持久化引用是否存在做决定，不要求已经删除的节点或身份仍存在。
 测试覆盖各类失败、进程提交前后退出、fresh service 恢复、共享引用和 TUI 异步删除。
 
-修复前已经删除资产且未记录 journal 的历史孤立条目无法由当前 GC 自动发现；本次
+修复前已经删除资产且未记录 journal 的历史孤立条目无法由当前 GC 自动发现；
 修复不会猜测或删除真实后端中的这些条目。需要根据旧备份或后端管理工具人工核对。

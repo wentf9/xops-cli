@@ -2,7 +2,7 @@
 
 <div align="center">
   <h3>让 AI 在安全边界内管理远程主机</h3>
-  
+
   <p>
     <img alt="Go Version" src="https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go" />
     <img alt="License" src="https://img.shields.io/badge/License-MIT-blue.svg" />
@@ -19,8 +19,8 @@
 
 ### ✨ 核心特性
 
-- 🤖 **AI 原生 (MCP 服务端)**: 内置 Model Context Protocol 服务端，包含完整的安全护栏、风险评估和策略控制。长驻连接池通过有界心跳自动驱逐失效 SSH 连接，让 AI 助手安全、稳定地替你管理服务器。
-- 🛡️ **SSH 增强与 TUI**: 完全兼容 OpenSSH (支持跳板机 JumpHost、隧道、Agent 转发)。内置精美的 **TUI (终端用户界面)**，并支持自动 Sudo 提权模式。
+- 🤖 **AI 原生 (MCP 服务端)**: 内置 Model Context Protocol 服务端，包含完整的安全护栏、风险评估和策略控制。长驻连接池通过有界心跳自动驱逐失效 SSH 连接，支持 AI 助手在连接生命周期约束下管理服务器。
+- 🛡️ **SSH 增强与 TUI**: 完全兼容 OpenSSH (支持跳板机 JumpHost、隧道、Agent 转发)。内置 **TUI (终端用户界面)**，并支持自动 Sudo 提权模式。
 - ⚡ **批量执行与传输**: 基于标签 (Tags) 对多台主机并行执行命令或本地脚本。内置 SCP/SFTP 支持，轻松实现文件批量分发。交互式 SFTP shell 具备连接保活 (KeepAlive) 与断线自动检测，网络中断后会唤醒交互提示、自动退出并返回非零状态。每个 shell 实例仅运行一次；关闭会取消并等待当前交互，再释放提示和 SFTP 资源。
 - 🔄 **声明式任务编排 (Playbook)**: 支持 YAML 格式的任务编排，组合 shell、script、copy、ensure (幂等性状态收敛) 和 template 步骤，支持并发控制与失败策略。
 - 🗂️ **资产与凭据管理**: 本地统一管理主机、凭据 (Identity) 和标签，新安装默认 Schema v2，仅保存凭据库引用，不创建加密 key；旧 AES 配置可显式迁移。支持通过 CSV 模板批量导入导出。
@@ -63,8 +63,12 @@ xops init --skip-ssh-import
 新安装默认 `credential.default_store: none`、`remember_prompted: ask`，不保存会话密码，
 也不创建 `secret.key`。无桌面环境请显式配置 `pass` 或 external（`type: helper`）；
 桌面环境先配置 `system` 并运行 `xops credential doctor`，探测通过后再设为默认。
-doctor 仅验证非交互读取链路，不保证写权限；当前 Linux secret-tool 无法禁止解锁提示，
-因此不会通过此探测。示例见 [配置文件](xops_config.example.yaml)。
+doctor 仅验证非交互读取链路，不保证写权限；Linux system 使用 Secret Service
+直接读取已解锁凭据，不弹出解锁提示。示例见 [配置文件](xops_config.example.yaml)。
+
+Linux amd64 还可显式配置[内置离线加密凭据库](docs/offline-encrypted-credentials.md)。
+离线库不按文件系统类型限制访问，存储可靠性由用户保证；ext4、XFS、Btrfs 已完成兼容性验证。
+[格式与配置/CLI 接口 v1 已冻结](docs/design/offline-encrypted-credential-store-v1-freeze.md)，发布状态为未发布。
 
 Schema v1 自默认切换版本起保留两个正式发布周期，普通命令向 stderr 输出弃用告警。
 兼容期内旧读取和 AES 写入仍保留；请按[迁移指南](docs/credential-migration.md)显式迁移。
@@ -76,7 +80,7 @@ Schema v1 自默认切换版本起保留两个正式发布周期，普通命令�
 xops host import hosts.csv --tag web
 
 # 手动添加单台主机
-xops host add --address 192.168.1.10 --user root --key ~/.ssh/id_ed25519 --alias web-01 --tags web
+xops host add --address 192.0.2.10 --user root --key ~/.ssh/id_ed25519 --alias web-01 --tags web
 
 # 查看主机列表或标签
 xops host list
@@ -95,12 +99,12 @@ xops tui
 xops ssh web-01
 
 # 显式指定新用户连接同一主机 (自动复用已有 Host，独立隔离凭证，自动继承 ProxyJump)
-xops ssh test@10.238.221.181
+xops ssh test@192.0.2.20
 xops ssh test@web-01
 
 # 兼容 OpenSSH 习惯：通过跳板机和私钥连接 (直连跳板支持 FQDN/IP/host:port；单标签跳板需预先配置为 Node/Alias)
-xops ssh -J bastion.example.com -i ~/.ssh/id_rsa root@192.168.1.13 # 直连跳板 (FQDN 或 10.0.0.1 或 jumphost:22)
-xops ssh -J jumphost -i ~/.ssh/id_rsa root@192.168.1.13            # 别名跳板 (jumphost 为已有节点/别名)
+xops ssh -J bastion.example.com -i ~/.ssh/id_rsa root@192.0.2.13 # 直连跳板 (FQDN 或 192.0.2.1 或 jumphost:22)
+xops ssh -J jumphost -i ~/.ssh/id_rsa root@192.0.2.13            # 别名跳板 (jumphost 为已有节点/别名)
 
 # 以 Sudo 模式连接
 xops ssh --sudo web-01
@@ -119,9 +123,13 @@ xops exec --tag web --shell ./setup.sh --task 5
 xops scp ./config.conf --tag web --dest /etc/app/
 ```
 
+普通 `exec` 可以读取 Linux 桌面密钥库中已解锁的现有凭据，无需 `-x`。
+`-x` 用于需要远端终端交互的命令（如 `top`、`vim`）；普通批处理不会弹出解锁提示。
+密钥库锁定时返回 `locked`，需先在桌面解锁；执行进程须能访问该桌面的 D-Bus 会话。
+
 #### 5. 声明式任务编排 (Playbook)
 
-你可以编写 YAML 格式的 Playbook 实现流水线式的复杂部署任务。支持 shell、script、copy、ensure (状态期望收敛)、template 等操作。
+Playbook 使用 YAML 描述部署任务。支持 shell、script、copy、ensure (状态期望收敛)、template 等操作。
 
 示例 Playbook `deploy.yaml`:
 
@@ -165,9 +173,9 @@ xops play deploy.yaml --dry-run
 xops play deploy.yaml --limit web-01
 ```
 
-#### 6. AI 与 MCP 集成 (赋予 AI 运维能力)
+#### 6. AI 与 MCP 集成
 
-XOps 内置了 **Model Context Protocol (MCP)** 服务端，让 **Claude** 等 AI 助手可以直接感知并操作你的服务器。
+XOps 内置了 **Model Context Protocol (MCP)** 服务端，支持 **Claude** 等 MCP 客户端查询和操作服务器。
 
 **A. 启动 MCP 服务:**
 
@@ -176,7 +184,7 @@ xops mcp serve
 ```
 
 **B. 配置示例：集成到 Claude Desktop**
-在你的 `claude_desktop_config.json` 中添加以下内容，即可让 Claude 拥有执行运维任务的能力：
+`claude_desktop_config.json` 配置示例：
 
 ```json
 {
@@ -197,31 +205,31 @@ xops mcp serve
 
 #### 7. AI Agent 技能 (Skill) 集成
 
-XOps 提供开箱即用的 AI Agent 技能 (Skill)，让你的命令行 AI 助手一键获得强大的服务器运维和故障排查能力。
+XOps 提供 AI Agent Skill，封装服务器管理和故障排查所需的 CLI 操作说明。
 
 > [!CAUTION]
-> **⚠️ 风险提示**：本技能通过赋予 AI 助手执行 `xops` 命令的能力来工作。由于 AI 助手（如 Claude Code）是根据自然语言指令自主生成命令的，**本技能文件本身不包含强制性的服务端安全护栏**。在生产环境使用时，AI 可能会误执行高危命令（如 `rm -rf` 或重启服务）。请务必开启 AI 助手的“命令执行前确认”功能，并仔细审核 AI 计划执行的每一条指令。
+> **⚠️ 风险提示**：本技能通过赋予 AI 助手执行 `xops` 命令的能力来工作。由于 AI 助手（如 Claude Code）是根据自然语言指令自主生成命令的，**本技能文件本身不包含强制性的服务端安全护栏**。在生产环境使用时，AI 可能会误执行高危命令（如 `rm -rf` 或重启服务）。生产使用需要启用命令执行确认并审核指令。
 
 **安装技能:**
-由于不同大模型助手（Claude Code, Gemini CLI 等）的安装路径不一致，请使用通用的 `npx skills` 工具进行独立的技能安装。
+不同客户端的技能目录不同，安装命令使用通用的 `npx skills` 工具。
 
-首先，确保已经安装好 XOps CLI：
+XOps CLI 安装命令：
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/wentf9/xops-cli/master/install.sh | bash
 ```
 
-然后，使用以下命令安装对应的 AI 扩展技能：
+Skill 安装命令：
 
 ```bash
 npx skills add https://github.com/wentf9/xops-cli/master/skills/xops-agent
 ```
 
-安装后，只需在 AI 助手中要求“帮我查看 web 服务器的状态”或“开放数据库主机的 3306 端口”，它便会自动调用 XOps 完成任务！
+Skill 包含主机状态查询和防火墙管理的调用说明。
 
 ## 🌍 国际化配置 / I18n
 
-你可以通过 `--lang` 参数强制指定语言，或者依赖系统环境变量自动识别。
+语言由 `--lang` 参数指定，未指定时根据系统环境识别。
 
 ```bash
 xops --lang en host list
@@ -230,9 +238,9 @@ xops --lang zh host list
 
 ## 🤝 参与贡献 / Contributing
 
-请阅读 [AGENTS.md](./AGENTS.md) 了解详细的开发规范、编码约定和测试要求。
+开发规范、编码约定和测试要求见 [AGENTS.md](./AGENTS.md)。
 
-提交变更前请运行完整的本地质量门禁：
+本地质量检查命令：
 
 ```bash
 make verify
@@ -266,4 +274,4 @@ CI 会在提交到 `master` 或向 `master` 提交 Pull Request 时自动执行 
 
 ## 📄 开源协议 / License
 
-本项目采用 MIT 开源协议 - 详情请参阅 [LICENSE](LICENSE) 文件。
+项目采用 MIT 开源协议，详见 [LICENSE](LICENSE) 文件。

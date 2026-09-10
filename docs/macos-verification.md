@@ -1,6 +1,6 @@
 # macOS 跨平台兼容性验证指南
 
-本文档为无 macOS 物理机环境下的开发者提供阶段四（凭据持久化系统后端）的 macOS 兼容性验收方案，覆盖自动化 CI 验证、真实 Keychain 关键场景断言、本地 KVM 容器虚拟化以及秒级交叉编译自查。
+本文档为无 macOS 物理机环境下的开发者提供阶段四（凭据持久化系统后端）的 macOS 兼容性验收方案，覆盖自动化 CI 验证、真实 Keychain 关键场景断言、本地 KVM 容器虚拟化以及交叉编译检查。
 
 ---
 
@@ -46,13 +46,13 @@
 ```bash
 ssh xxxxxxxx@sfo2.tmate.io
 ```
-复制该命令即可直接在本地终端连入该 macOS 虚拟机，享受完整的终端环境与 `sudo` 权限，直接定位 Keychain 或系统 API 调用问题。
+复制该命令即可直接在本地终端连入该 macOS 虚拟机，使用终端定位 Keychain 或系统 API 调用问题。
 
 ---
 
 ## 3. 方案二：本地 KVM 容器虚拟化（Docker-OSX）
 
-对于无网络或需离线反复快速验证的场景，本项目在 `deploy/macos-vm/` 下提供了基于 QEMU/KVM 加速的 Docker-OSX 配置，宿主机无需安装完整 Hackintosh，直接通过 Docker 容器化运行真实 macOS 系统。
+对于无网络或需离线反复快速验证的场景，仓库在 `deploy/macos-vm/` 下提供了基于 QEMU/KVM 加速的 Docker-OSX 配置，宿主机无需安装完整 Hackintosh，直接通过 Docker 容器化运行真实 macOS 系统。
 
 ### 3.1 前置条件与工具链要求
 - **系统环境**：Linux 宿主机且 CPU 开启硬件虚拟化支持（`/dev/kvm` 存在并可读写）。
@@ -78,7 +78,7 @@ make macos-vm-status
 # 4. 轮询等待虚拟机客体 SSH 服务就绪并自动建立公钥免密授权 (智能区分端口连通与认证就绪)
 make macos-vm-wait
 
-# 5. SSH 连接登录虚拟机交互终端 (默认账号: user, 密码: alpine)
+# 5. SSH 连接登录虚拟机交互终端 (使用预配置的客体账户)
 make macos-vm-ssh
 
 # 6. 在虚拟机客体内检查/自动安装 Go 1.26+ 工具链
@@ -98,13 +98,13 @@ make macos-vm-down
 - **防闪退配置**：[`deploy/macos-vm/docker-compose.yml`](../deploy/macos-vm/docker-compose.yml) 显式配置了 `stdin_open: true` 与 `tty: true`，防止后台守护进程在关闭 stdin 时触发容器无限重启。
 - **健康检查与智能等待**：配置了 TCP `10022` 端口的健康检查；`manage.sh wait-ready` 先探测 TCP 端口就绪，随后区分服务未启动与密码/公钥认证未就绪，并自动通过 Python PTY 完成首次公钥分发，打通完全无人值守的免密通道。
 - **端口连通与客体状态辨析**：宿主机 `50922` 端口是由 QEMU 用户态网络栈（SLiRP）在容器内监听并转发至客体 `22` 端口。初次冷启动使用全新格式化的空白虚拟磁盘（`mac_hdd_ng.img`）时，系统处于 macOS 恢复安装器（BaseSystem）阶段，此时客体操作系统尚未写入磁盘，客体内部尚未运行 SSH 服务，因此连接会被切断（Connection closed by remote host）。若需本地完整离线运行，可通过 VNC（端口 `5999`）进入恢复环境完成首次系统安装，或直接挂载已预装的磁盘镜像。
-- **源码严格镜像同步**：[`deploy/macos-vm/manage.sh`](../deploy/macos-vm/manage.sh) 同步时强制应用 `rsync --delete`（或 tar 清空覆盖），彻底杜绝因分支切换或文件重命名产生的新旧源码混合残留。
+- **源码严格镜像同步**：[`deploy/macos-vm/manage.sh`](../deploy/macos-vm/manage.sh) 同步时强制应用 `rsync --delete`（或 tar 清空覆盖），避免因分支切换或文件重命名产生的新旧源码混合残留。
 
 ---
 
 ## 4. 方案三：本地快速交叉编译检查
 
-在日常编码与重构过程中，可在本地 Linux 终端瞬间执行交叉编译，提前拦截平台专有代码（如 `internal/credentialhelper/system_darwin.go`）的语法、Build Tag 及类型匹配错误：
+在日常编码与重构过程中，可在本地 Linux 终端执行交叉编译，提前拦截平台专有代码（如 `internal/credentialhelper/system_darwin.go`）的语法、Build Tag 及类型匹配错误：
 
 ```bash
 # 验证 macOS Intel (amd64) 编译
