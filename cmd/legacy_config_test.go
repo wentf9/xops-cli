@@ -9,9 +9,24 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+	"github.com/wentf9/xops-cli/pkg/i18n"
 )
 
+// initCredentialPolicyTestI18n mirrors CLI startup so text assertions do not
+// depend on another test loading translations first.
+func initCredentialPolicyTestI18n(t *testing.T) {
+	t.Helper()
+	previousLang := i18n.Lang()
+	if err := i18n.Init("en"); err != nil {
+		t.Fatalf("initialize credential policy test translations: %v", err)
+	}
+	if previousLang != "" {
+		t.Cleanup(func() { i18n.SetLang(previousLang) })
+	}
+}
+
 func TestLegacyWarningPolicy(t *testing.T) {
+	initCredentialPolicyTestI18n(t)
 	for _, tc := range []struct {
 		name string
 		data string
@@ -69,6 +84,7 @@ func TestLegacyWarningPolicy(t *testing.T) {
 }
 
 func TestInitReportsV2CredentialPolicy(t *testing.T) {
+	initCredentialPolicyTestI18n(t)
 	setupTestEnvironment(t)
 	root := newRootCmd()
 	initRootFlags(root)
