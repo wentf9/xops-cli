@@ -1,4 +1,4 @@
-//go:build linux && amd64
+//go:build (linux || darwin || windows) && (amd64 || arm64)
 
 package credentialfile
 
@@ -13,8 +13,8 @@ import (
 	"strconv"
 	"strings"
 
+	unix "github.com/wentf9/xops-cli/internal/vaultsys"
 	"github.com/wentf9/xops-cli/pkg/credential"
-	"golang.org/x/sys/unix"
 )
 
 func (d *directory) mkdir(ctx context.Context, name string, existing bool, ops fileOps) (child *directory, err error) {
@@ -38,11 +38,11 @@ func (d *directory) mkdir(ctx context.Context, name string, existing bool, ops f
 	child, err = d.child(name)
 	if err != nil {
 		if created {
-			err = errors.Join(err, unix.Unlinkat(int(d.file.Fd()), name, unix.AT_REMOVEDIR), d.file.Sync())
+			err = errors.Join(err, unix.Unlinkat(int(d.file.Fd()), name, unix.AT_REMOVEDIR), unix.SyncFile(d.file))
 		}
 		return nil, err
 	}
-	if err := ops.step(ctx, "admin:mkdir-sync", d.file.Sync); err != nil {
+	if err := ops.step(ctx, "admin:mkdir-sync", func() error { return unix.SyncFile(d.file) }); err != nil {
 		return nil, errors.Join(err, child.file.Close())
 	}
 	return child, nil
@@ -116,11 +116,11 @@ func createVaultRoot(ctx context.Context, path string) (root *directory, err err
 	root, err = openRoot(ctx, path)
 	if err != nil {
 		if created {
-			err = errors.Join(err, unix.Unlinkat(int(parent.Fd()), filepath.Base(path), unix.AT_REMOVEDIR), parent.Sync())
+			err = errors.Join(err, unix.Unlinkat(int(parent.Fd()), filepath.Base(path), unix.AT_REMOVEDIR), unix.SyncFile(parent))
 		}
 		return nil, err
 	}
-	if err := parent.Sync(); err != nil {
+	if err := unix.SyncFile(parent); err != nil {
 		return nil, errors.Join(err, root.file.Close())
 	}
 	return root, nil
@@ -139,17 +139,17 @@ func ensureVaultLock(ctx context.Context, root *directory, ops fileOps) (err err
 	defer func() {
 		closeFile(&err, f)
 		if !valid {
-			err = errors.Join(err, unix.Unlinkat(int(root.file.Fd()), "vault.lock", 0), root.file.Sync())
+			err = errors.Join(err, unix.Unlinkat(int(root.file.Fd()), "vault.lock", 0), unix.SyncFile(root.file))
 		}
 	}()
 	if err := root.validateFile(f); err != nil {
 		return err
 	}
 	valid = true
-	if err := ops.step(ctx, "admin:lock-file-sync", f.Sync); err != nil {
+	if err := ops.step(ctx, "admin:lock-file-sync", func() error { return unix.SyncFile(f) }); err != nil {
 		return err
 	}
-	return ops.step(ctx, "admin:lock-dir-sync", root.file.Sync)
+	return ops.step(ctx, "admin:lock-dir-sync", func() error { return unix.SyncFile(root.file) })
 }
 
 func unlinkFile(ctx context.Context, d *directory, name string, ops fileOps) error {
@@ -163,7 +163,7 @@ func unlinkFile(ctx context.Context, d *directory, name string, ops fileOps) err
 	if err != nil {
 		return err
 	}
-	return ops.step(ctx, "admin:unlink-sync", d.file.Sync)
+	return ops.step(ctx, "admin:unlink-sync", func() error { return unix.SyncFile(d.file) })
 }
 
 func parseOperationID(name string) (id [16]byte, err error) {

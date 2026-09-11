@@ -1,4 +1,4 @@
-//go:build linux && amd64
+//go:build (linux || darwin || windows) && (amd64 || arm64)
 
 package credentialfile
 
@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	unix "github.com/wentf9/xops-cli/internal/vaultsys"
 	"os"
 	"sort"
 	"strings"
@@ -446,7 +447,7 @@ func (s *Store) resumeArchived(ctx context.Context, source *Store, target Wrappi
 	if err := parent.pending(ctx, true); err != nil {
 		return result, err
 	}
-	if err := errors.Join(parent.file.Sync(), rev.file.Sync()); err != nil {
+	if err := errors.Join(unix.SyncFile(parent.file), unix.SyncFile(rev.file)); err != nil {
 		return result, err
 	}
 	if err := s.finishArchivedSource(ctx, source, tx, key); err != nil {
@@ -482,7 +483,7 @@ func (s *Store) finishArchivedSource(ctx context.Context, source *Store, tx form
 		if err != nil {
 			return err
 		}
-		return errors.Join(parent.file.Sync(), parent.file.Close())
+		return errors.Join(unix.SyncFile(parent.file), parent.file.Close())
 	}
 	return nil
 }

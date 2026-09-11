@@ -1,4 +1,4 @@
-//go:build linux && amd64
+//go:build (linux || darwin || windows) && (amd64 || arm64)
 
 package credentialfile
 
@@ -14,8 +14,8 @@ import (
 	"strings"
 
 	"github.com/wentf9/xops-cli/internal/credentialfile/format"
+	unix "github.com/wentf9/xops-cli/internal/vaultsys"
 	"github.com/wentf9/xops-cli/pkg/credential"
-	"golang.org/x/sys/unix"
 )
 
 type fileID struct {
@@ -84,17 +84,6 @@ func validatePrivate(st unix.Stat_t, dir bool) error {
 	return nil
 }
 
-func mountID(file *os.File) (uint64, error) {
-	var st unix.Statx_t
-	if err := unix.Statx(int(file.Fd()), "", unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW, unix.STATX_MNT_ID, &st); err != nil {
-		return 0, fmt.Errorf("identify vault mount: %w", errors.Join(ErrUnsupported, err))
-	}
-	if st.Mask&unix.STATX_MNT_ID == 0 {
-		return 0, ErrUnsupported
-	}
-	return st.Mnt_id, nil
-}
-
 func newDirectory(file *os.File, root *directory) (d *directory, err error) {
 	defer func() {
 		if err != nil {
@@ -132,7 +121,7 @@ func walkDirectory(ctx context.Context, path string) (_ *os.File, err error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return nil, fmt.Errorf("vault path must be a clean absolute private directory")
 	}
-	f, err := os.Open("/")
+	f, err := os.Open(filepath.VolumeName(path) + string(filepath.Separator))
 	if err != nil {
 		return nil, err
 	}
@@ -141,8 +130,8 @@ func walkDirectory(ctx context.Context, path string) (_ *os.File, err error) {
 			err = errors.Join(err, f.Close())
 		}
 	}()
-	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
-	if path == "/" {
+	parts := strings.Split(strings.TrimPrefix(strings.TrimPrefix(path, filepath.VolumeName(path)), string(filepath.Separator)), string(filepath.Separator))
+	if path == filepath.VolumeName(path)+string(filepath.Separator) {
 		parts = nil
 	}
 	for _, part := range parts {
@@ -330,10 +319,10 @@ func (d *directory) syncExisting(ctx context.Context, name, scope string, ops fi
 			err = errors.Join(err, ops.before(scope+":close"))
 		}
 	}()
-	if err := ops.step(ctx, scope+":file-sync", f.Sync); err != nil {
+	if err := ops.step(ctx, scope+":file-sync", func() error { return unix.SyncFile(f) }); err != nil {
 		return false, err
 	}
-	if err := ops.step(ctx, scope+":dir-sync", d.file.Sync); err != nil {
+	if err := ops.step(ctx, scope+":dir-sync", func() error { return unix.SyncFile(d.file) }); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -358,7 +347,7 @@ func (d *directory) write(ctx context.Context, name string, data []byte, replace
 			err = errors.Join(err, ops.before(scope+":close"))
 		}
 		if !published {
-			err = errors.Join(err, unix.Unlinkat(int(d.file.Fd()), temp, 0), d.file.Sync())
+			err = errors.Join(err, unix.Unlinkat(int(d.file.Fd()), temp, 0), unix.SyncFile(d.file))
 		}
 		if err != nil && out.applied {
 			err = &DurabilityError{Op: scope, Applied: out.applied, Durable: out.durable, Cause: err}
@@ -376,15 +365,11 @@ func (d *directory) write(ctx context.Context, name string, data []byte, replace
 	}); err != nil {
 		return out, err
 	}
-	if err := ops.step(ctx, scope+":file-sync", f.Sync); err != nil {
+	if err := ops.step(ctx, scope+":file-sync", func() error { return unix.SyncFile(f) }); err != nil {
 		return out, err
 	}
 	if err := ops.step(ctx, scope+":publish", func() error {
-		flags := uint(unix.RENAME_NOREPLACE)
-		if replace {
-			flags = 0
-		}
-		return unix.Renameat2(int(d.file.Fd()), temp, int(d.file.Fd()), name, flags)
+		return renameVaultEntry(int(d.file.Fd()), temp, int(d.file.Fd()), name, !replace)
 	}); err != nil {
 		if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EOPNOTSUPP) {
 			err = errors.Join(ErrUnsupported, err)
@@ -393,7 +378,7 @@ func (d *directory) write(ctx context.Context, name string, data []byte, replace
 	}
 	published = true
 	out.applied = true
-	if err := ops.step(ctx, scope+":dir-sync", d.file.Sync); err != nil {
+	if err := ops.step(ctx, scope+":dir-sync", func() error { return unix.SyncFile(d.file) }); err != nil {
 		return out, err
 	}
 	out.durable = true

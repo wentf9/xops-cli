@@ -1,4 +1,4 @@
-//go:build linux && amd64
+//go:build (linux || darwin || windows) && (amd64 || arm64)
 
 package credentialfile
 
@@ -16,8 +16,8 @@ import (
 	"time"
 
 	"github.com/wentf9/xops-cli/internal/credentialfile/format"
+	unix "github.com/wentf9/xops-cli/internal/vaultsys"
 	"github.com/wentf9/xops-cli/pkg/credential"
-	"golang.org/x/sys/unix"
 )
 
 // Store owns a verified root handle. Close cancels and waits for active operations.
@@ -562,7 +562,7 @@ func (s *Store) Delete(ctx context.Context, ref credential.Ref) error {
 			return mapAccess(err)
 		}
 		o.outcome.applied = true
-		if err := s.ops.step(ctx, "delete:dir-sync", o.items.file.Sync); err != nil {
+		if err := s.ops.step(ctx, "delete:dir-sync", func() error { return unix.SyncFile(o.items.file) }); err != nil {
 			return &DurabilityError{Op: "delete", Applied: true, Cause: err}
 		}
 		o.outcome.durable = true

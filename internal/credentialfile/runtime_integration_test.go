@@ -1,4 +1,4 @@
-//go:build integration && linux && amd64
+//go:build integration && (linux || darwin || windows) && (amd64 || arm64)
 
 package credentialfile
 
@@ -192,7 +192,7 @@ func TestRuntimeWaitersCancelIndependently(t *testing.T) {
 
 func TestRuntimeIdleExpiryAndKeyFileRecheck(t *testing.T) {
 	f := makeFixture(t)
-	keyPath := filepath.Join(t.TempDir(), "key")
+	keyPath := filepath.Join(platformTempDir(t), "key")
 	writeFixtureFile(t, keyPath, f.data["file_key"])
 	r := testRuntime(t, nil, nil)
 	s := runtimeStore(t, r, f, SessionOptions{Mode: "key-file", KeyFile: keyPath, IdleTTL: time.Minute, CacheTTL: time.Minute})
@@ -349,7 +349,7 @@ func TestRuntimeUnlockFailureAllowsRetry(t *testing.T) {
 
 func TestRuntimeRevisionInvalidatesWarmKey(t *testing.T) {
 	f := makeFixture(t)
-	path := filepath.Join(t.TempDir(), "key")
+	path := filepath.Join(platformTempDir(t), "key")
 	writeFixtureFile(t, path, f.data["file_key"])
 	r := testRuntime(t, nil, nil)
 	s := runtimeStore(t, r, f, SessionOptions{Mode: "key-file", KeyFile: path})
@@ -386,7 +386,7 @@ func TestRuntimeRevisionInvalidatesWarmKey(t *testing.T) {
 
 func TestRuntimePolicyConflictAndClose(t *testing.T) {
 	f := makeFixture(t)
-	path := filepath.Join(t.TempDir(), "key")
+	path := filepath.Join(platformTempDir(t), "key")
 	writeFixtureFile(t, path, f.data["file_key"])
 	r := testRuntime(t, nil, nil)
 	o := SessionOptions{Mode: "key-file", KeyFile: path}
@@ -440,7 +440,7 @@ func TestRuntimeDerivationDeadlineClearsLateKey(t *testing.T) {
 
 func TestRuntimeExplicitUnlockIsProcessLocal(t *testing.T) {
 	f := makeFixture(t)
-	path := filepath.Join(t.TempDir(), "key")
+	path := filepath.Join(platformTempDir(t), "key")
 	writeFixtureFile(t, path, f.data["file_key"])
 	r := testRuntime(t, nil, nil)
 	s := runtimeStore(t, r, f, SessionOptions{Mode: "key-file", KeyFile: path})
@@ -481,7 +481,7 @@ func TestRuntimeRootNoninteractiveCannotBeOverridden(t *testing.T) {
 
 func TestRuntimeLockCancelsLeaseBeforeDelivery(t *testing.T) {
 	f := makeFixture(t)
-	keyPath := filepath.Join(t.TempDir(), "key")
+	keyPath := filepath.Join(platformTempDir(t), "key")
 	writeFixtureFile(t, keyPath, f.data["file_key"])
 	r := testRuntime(t, nil, nil)
 	s := runtimeStore(t, r, f, SessionOptions{Mode: "key-file", KeyFile: keyPath})
@@ -506,7 +506,7 @@ func TestRuntimeLockCancelsLeaseBeforeDelivery(t *testing.T) {
 
 func TestRuntimeCacheChecksActualCiphertext(t *testing.T) {
 	f := makeFixture(t)
-	keyPath := filepath.Join(t.TempDir(), "key")
+	keyPath := filepath.Join(platformTempDir(t), "key")
 	writeFixtureFile(t, keyPath, f.data["file_key"])
 	r := testRuntime(t, nil, nil)
 	s := runtimeStore(t, r, f, SessionOptions{Mode: "key-file", KeyFile: keyPath, CacheTTL: time.Minute})

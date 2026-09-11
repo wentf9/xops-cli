@@ -1,0 +1,46 @@
+name: Offline vault native compatibility
+
+on:
+  push:
+    branches: [work/offline-vault-compatibility]
+  pull_request:
+    paths:
+      - 'internal/credentialfile/**'
+      - 'internal/vaultsys/**'
+      - 'internal/kdfhelper/**'
+      - 'scripts/offline-platform-verify/**'
+      - '.github/workflows/offline-compatibility.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: offline-compatibility-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-latest, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      GOMAXPROCS: '2'
+      GOFLAGS: '-p=2'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: go build ./...
+      - name: Native unit tests
+        run: go test -race -parallel 2 ./internal/credentialfile ./internal/kdfhelper ./internal/vaultsys
+      - name: Native vault and real KDF helper
+        run: go run ./scripts/offline-platform-verify
+      - name: Native operations and process-crash recovery
+        run: go test -race -parallel 2 -tags=integration -run 'Test(Store|Runtime|Maintenance)' ./internal/credentialfile

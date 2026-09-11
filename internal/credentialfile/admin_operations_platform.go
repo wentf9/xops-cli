@@ -1,4 +1,4 @@
-//go:build linux && amd64
+//go:build (linux || darwin || windows) && (amd64 || arm64)
 
 package credentialfile
 
@@ -47,7 +47,7 @@ func (s *Store) upgrade(ctx context.Context, target Wrapping, newKey bool) (resu
 	}
 	var m *maintenance
 	defer func() { finishMaintenance(m, a, &result, &err) }()
-	seed, err := prepareWrapping(a.ctx, a.runtime(), target, a.pub.current.VaultID, s.storeID, s.ops)
+	seed, err := prepareNewWrapping(a.ctx, a.runtime(), target, a.pub.current.VaultID, s.storeID, s.ops, s.root)
 	if err != nil {
 		return result, err
 	}
@@ -137,6 +137,9 @@ func (r *Runtime) Init(ctx context.Context, path, id string, target Wrapping) (M
 }
 
 func (r *Runtime) initialize(ctx context.Context, path, id string, target Wrapping, ops fileOps) (result MaintenanceResult, err error) {
+	if err := validateWrappingKeyLocation(path, target); err != nil {
+		return result, err
+	}
 	if err := (credential.Ref{StoreID: id, ItemID: "validate"}).Validate(); err != nil {
 		return result, err
 	}
@@ -151,11 +154,6 @@ func (r *Runtime) initialize(ctx context.Context, path, id string, target Wrappi
 	if err := ops.randomBytes(vault[:]); err != nil {
 		return result, err
 	}
-	seed, err := prepareWrapping(work, r, target, vault, id, ops)
-	if err != nil {
-		return result, err
-	}
-	defer seed.close()
 	root, err := createVaultRoot(work, path)
 	if err != nil {
 		return result, err
@@ -179,6 +177,11 @@ func (r *Runtime) initialize(ctx context.Context, path, id string, target Wrappi
 	if err := emptyVault(work, s.root); err != nil {
 		return result, err
 	}
+	seed, err := prepareNewWrapping(work, r, target, vault, id, ops, s.root)
+	if err != nil {
+		return result, err
+	}
+	defer seed.close()
 	if err := layout(work, s.root, ops); err != nil {
 		return result, err
 	}

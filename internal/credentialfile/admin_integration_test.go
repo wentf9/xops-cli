@@ -1,4 +1,4 @@
-//go:build integration && linux && amd64
+//go:build integration && (linux || darwin || windows) && (amd64 || arm64)
 
 package credentialfile
 
@@ -15,7 +15,7 @@ import (
 
 func adminMaterial(t *testing.T, f fixture) Wrapping {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "key")
+	path := filepath.Join(platformTempDir(t), "key")
 	writeFixtureFile(t, path, f.data["file_key"])
 	return Wrapping{Mode: "key-file", KeyFile: path}
 }
@@ -97,7 +97,7 @@ func TestMaintenanceInit(t *testing.T) {
 	f := makeFixture(t)
 	material := adminMaterial(t, f)
 	r := testRuntime(t, nil, nil)
-	path := filepath.Join(t.TempDir(), "new")
+	path := filepath.Join(platformTempDir(t), "new")
 	result, err := r.Init(t.Context(), path, "offline", material)
 	if errors.Is(err, ErrUnsupported) {
 		t.Skip("required filesystem operations unavailable")
@@ -133,7 +133,7 @@ func TestMaintenanceTransfer(t *testing.T) {
 			if err := s.Put(t.Context(), f.ref, secret); err != nil {
 				t.Fatal(err)
 			}
-			path := filepath.Join(t.TempDir(), "destination")
+			path := filepath.Join(platformTempDir(t), "destination")
 			id := "offline"
 			var result MaintenanceResult
 			var err error
@@ -326,5 +326,43 @@ func TestMaintenancePruneResume(t *testing.T) {
 				t.Fatalf("result %+v", result)
 			}
 		})
+	}
+}
+
+func TestMaintenanceNewWrappingGeneratesKey(t *testing.T) {
+	f := makeFixture(t)
+	s := f.open(t, fileOps{})
+	key := filepath.Join(platformTempDir(t), "new.key")
+	material := Wrapping{Mode: "key-file", KeyFile: key}
+	if _, err := s.Rewrap(t.Context(), material); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := readKeyFile(t.Context(), key)
+	defer clear(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, err := s.publication(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dek, err := unlockWrapping(t.Context(), nil, material, pub.data)
+	defer clear(dek)
+	if err != nil {
+		t.Fatal("generated wrapping key cannot unlock", err)
+	}
+	runtime := testRuntime(t, nil, nil)
+	reopened, err := runtime.OpenStore(t.Context(), f.root, "offline", Options{}, SessionOptions{Mode: "key-file", KeyFile: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := Wrapping{Mode: "key-file", KeyFile: filepath.Join(platformTempDir(t), "clone.key")}
+	if _, err := reopened.Clone(t.Context(), filepath.Join(platformTempDir(t), "copy"), "copy", target); err != nil {
+		t.Fatal(err)
+	}
+	rawTarget, err := readKeyFile(t.Context(), target.KeyFile)
+	defer clear(rawTarget)
+	if err != nil {
+		t.Fatal(err)
 	}
 }

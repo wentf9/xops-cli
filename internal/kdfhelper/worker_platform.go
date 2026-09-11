@@ -1,21 +1,24 @@
-//go:build linux && amd64
+//go:build (linux || darwin || windows) && (amd64 || arm64)
 
 package kdfhelper
 
 import (
 	"encoding/binary"
-	"errors"
 	"io"
 	"os"
 	"time"
 
 	"golang.org/x/crypto/argon2"
-	"golang.org/x/sys/unix"
 )
 
 // ServeFiles is the private process entry. It accepts only bounded pipes and
 // returns an exit code without logging, loading configuration or printing secrets.
 func ServeFiles(in, out *os.File) (code int) {
+	stop, err := startParentGuard()
+	if err != nil {
+		return 1
+	}
+	defer stop()
 	input, err := pollablePipe(in)
 	if err != nil {
 		return 1
@@ -43,31 +46,10 @@ func ServeFiles(in, out *os.File) (code int) {
 		timeout = duration
 	}
 	deadline := time.Now().Add(timeout)
-	if err := input.SetReadDeadline(deadline); err != nil {
-		return 1
-	}
-	if err := output.SetWriteDeadline(deadline); err != nil {
+	if err := setWorkerDeadlines(input, output, deadline); err != nil {
 		return 1
 	}
 	return serve(input, output)
-}
-
-func pollablePipe(f *os.File) (*os.File, error) {
-	st, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if st.Mode()&os.ModeNamedPipe == 0 {
-		return nil, ErrProtocol
-	}
-	fd, err := unix.FcntlInt(f.Fd(), unix.F_DUPFD_CLOEXEC, 0)
-	if err != nil {
-		return nil, err
-	}
-	if err := unix.SetNonblock(fd, true); err != nil {
-		return nil, errors.Join(err, unix.Close(fd))
-	}
-	return os.NewFile(uintptr(fd), "private-kdf-pipe"), nil
 }
 
 func serve(in io.Reader, out io.Writer) int {

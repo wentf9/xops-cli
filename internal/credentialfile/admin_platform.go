@@ -1,4 +1,4 @@
-//go:build linux && amd64
+//go:build (linux || darwin || windows) && (amd64 || arm64)
 
 package credentialfile
 
@@ -25,6 +25,21 @@ type wrappingSeed struct {
 }
 
 func (w *wrappingSeed) close() { clear(w.key); w.key = nil }
+
+func prepareNewWrapping(ctx context.Context, r *Runtime, material Wrapping, vault [16]byte, id string, ops fileOps, roots ...*directory) (*wrappingSeed, error) {
+	if material.Mode == "key-file" {
+		if len(material.Password) != 0 || material.KeyFile == "" {
+			return nil, fmt.Errorf("key-file wrapping requires only key_file")
+		}
+		if err := validateKeyParent(ctx, material.KeyFile, roots); err != nil {
+			return nil, err
+		}
+		if err := ensureWrappingKeyFile(ctx, material.KeyFile, ops); err != nil {
+			return nil, fmt.Errorf("prepare wrapping key file: %w", err)
+		}
+	}
+	return prepareWrapping(ctx, r, material, vault, id, ops)
+}
 
 func prepareWrapping(ctx context.Context, r *Runtime, material Wrapping, vault [16]byte, id string, ops fileOps) (*wrappingSeed, error) {
 	if len(id) == 0 || len(id) > format.MaxIDBytes {

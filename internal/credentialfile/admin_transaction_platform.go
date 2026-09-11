@@ -1,4 +1,4 @@
-//go:build linux && amd64
+//go:build (linux || darwin || windows) && (amd64 || arm64)
 
 package credentialfile
 
@@ -16,7 +16,7 @@ import (
 	"strings"
 
 	"github.com/wentf9/xops-cli/internal/credentialfile/format"
-	"golang.org/x/sys/unix"
+	unix "github.com/wentf9/xops-cli/internal/vaultsys"
 )
 
 type maintenance struct {
@@ -234,7 +234,7 @@ func (m *maintenance) build() error {
 	}
 	m.tx.Target.ManifestRoot, m.tx.Target.ItemCount = run.root, run.items
 	for _, d := range []*directory{m.items, m.revision, m.budget} {
-		if err := m.store.ops.step(m.a.ctx, "admin:target-sync", d.file.Sync); err != nil {
+		if err := m.store.ops.step(m.a.ctx, "admin:target-sync", func() error { return unix.SyncFile(d.file) }); err != nil {
 			return err
 		}
 	}
@@ -356,10 +356,10 @@ func (m *maintenance) publish() error {
 	if err := m.writeCleanupCertificates(); err != nil {
 		return err
 	}
-	if err := m.items.file.Sync(); err != nil {
+	if err := unix.SyncFile(m.items.file); err != nil {
 		return err
 	}
-	if err := m.revision.file.Sync(); err != nil {
+	if err := unix.SyncFile(m.revision.file); err != nil {
 		return err
 	}
 	if err := m.a.check(); err != nil {
@@ -409,12 +409,12 @@ func (m *maintenance) archive() (err error) {
 	}
 	defer closeFile(&err, parent.file)
 	err = m.store.ops.step(m.a.ctx, "admin:archive", func() error {
-		return unix.Renameat2(int(parent.file.Fd()), operationName(m.tx.OperationID), int(m.revision.file.Fd()), "commit", unix.RENAME_NOREPLACE)
+		return renameVaultEntry(int(parent.file.Fd()), operationName(m.tx.OperationID), int(m.revision.file.Fd()), "commit", true)
 	})
 	if err != nil {
 		return err
 	}
-	if err := errors.Join(parent.file.Sync(), m.revision.file.Sync()); err != nil {
+	if err := errors.Join(unix.SyncFile(parent.file), unix.SyncFile(m.revision.file)); err != nil {
 		return err
 	}
 	if m.sourceMarker != nil {
@@ -445,7 +445,7 @@ func (m *maintenance) removeSourceMarker() (err error) {
 	if err != nil {
 		return err
 	}
-	return parent.file.Sync()
+	return unix.SyncFile(parent.file)
 }
 
 func removeManifestFiles(ctx context.Context, d *directory, prefix string, ops fileOps) error {

@@ -51,7 +51,7 @@ func newCmdCredentialStore() *cobra.Command {
 	}
 
 	cmd.AddCommand(newCmdCredentialStoreList())
-	for _, op := range []string{"init", "inspect", "rewrap", "reencrypt", "resume", "restore", "clone", "prune"} {
+	for _, op := range []string{"init", "probe", "inspect", "rewrap", "reencrypt", "resume", "restore", "clone", "prune"} {
 		cmd.AddCommand(newOfflineStoreCommand(op))
 	}
 	return cmd

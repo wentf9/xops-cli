@@ -1,4 +1,4 @@
-//go:build linux && amd64
+//go:build (linux || darwin || windows) && (amd64 || arm64)
 
 package credentialfile
 
@@ -13,7 +13,7 @@ import (
 	"strings"
 
 	"github.com/wentf9/xops-cli/internal/credentialfile/format"
-	"golang.org/x/sys/unix"
+	unix "github.com/wentf9/xops-cli/internal/vaultsys"
 )
 
 // Prune defaults to a read-only plan. Apply revalidates provenance and records intent.
@@ -139,9 +139,9 @@ func (m *maintenance) prune() error {
 		return err
 	}
 	e := m.store.ops.step(m.a.ctx, "admin:prune-archive", func() error {
-		return unix.Renameat2(int(parent.file.Fd()), operationName(m.tx.OperationID), int(m.revision.file.Fd()), "prune-"+operationName(m.tx.OperationID), unix.RENAME_NOREPLACE)
+		return renameVaultEntry(int(parent.file.Fd()), operationName(m.tx.OperationID), int(m.revision.file.Fd()), "prune-"+operationName(m.tx.OperationID), true)
 	})
-	err = errors.Join(e, parent.file.Sync(), m.revision.file.Sync(), parent.file.Close())
+	err = errors.Join(e, unix.SyncFile(parent.file), unix.SyncFile(m.revision.file), parent.file.Close())
 	if err == nil {
 		m.result.Durable = true
 	}
@@ -244,7 +244,7 @@ func generationRetained(ctx context.Context, root *directory, removed, gen uint6
 func removeFlatDirectory(ctx context.Context, parent *directory, name string, allowed func(string) bool, ops fileOps) (err error) {
 	dir, err := parent.child(name)
 	if errors.Is(err, os.ErrNotExist) {
-		return parent.file.Sync()
+		return unix.SyncFile(parent.file)
 	}
 	if err != nil {
 		return err
@@ -272,7 +272,7 @@ func removeDirectory(ctx context.Context, parent *directory, name string, ops fi
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return ops.step(ctx, "admin:rmdir-sync", parent.file.Sync)
+	return ops.step(ctx, "admin:rmdir-sync", func() error { return unix.SyncFile(parent.file) })
 }
 func canonicalOperationDirectory(name, prefix string) bool {
 	if !strings.HasPrefix(name, prefix) {

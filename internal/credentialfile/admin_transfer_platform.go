@@ -1,4 +1,4 @@
-//go:build linux && amd64
+//go:build (linux || darwin || windows) && (amd64 || arm64)
 
 package credentialfile
 
@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 
 	"github.com/wentf9/xops-cli/internal/credentialfile/format"
+	unix "github.com/wentf9/xops-cli/internal/vaultsys"
 	"github.com/wentf9/xops-cli/pkg/credential"
-	"golang.org/x/sys/unix"
 )
 
 // Clone creates an independent vault, preserving ItemIDs under the explicit target StoreID.
@@ -26,6 +26,9 @@ func (s *Store) Restore(ctx context.Context, path string, target Wrapping, requi
 }
 
 func (s *Store) transfer(ctx context.Context, path, id string, target Wrapping, required []credential.Ref, op format.Operation) (result MaintenanceResult, err error) {
+	if err := validateWrappingKeyLocation(path, target); err != nil {
+		return result, err
+	}
 	if err := (credential.Ref{StoreID: id, ItemID: "validate"}).Validate(); err != nil {
 		return result, err
 	}
@@ -41,11 +44,6 @@ func (s *Store) transfer(ctx context.Context, path, id string, target Wrapping, 
 			return result, err
 		}
 	}
-	seed, err := prepareWrapping(a.ctx, a.runtime(), target, vault, id, s.ops)
-	if err != nil {
-		return result, err
-	}
-	defer seed.close()
 	dest, err := createTransferTarget(a, path, id)
 	if err != nil {
 		return result, err
@@ -64,6 +62,11 @@ func (s *Store) transfer(ctx context.Context, path, id string, target Wrapping, 
 	if err := emptyVault(a.ctx, dest.root); err != nil {
 		return result, err
 	}
+	seed, err := prepareNewWrapping(a.ctx, a.runtime(), target, vault, id, s.ops, s.root, dest.root)
+	if err != nil {
+		return result, err
+	}
+	defer seed.close()
 	current, err := s.publication(a.ctx)
 	if err != nil {
 		return result, err

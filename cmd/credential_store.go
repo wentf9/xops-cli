@@ -26,16 +26,23 @@ type storeCommandOptions struct {
 }
 
 type storeCommandResult struct {
-	Code       string                           `json:"code"`
-	Op         string                           `json:"op"`
-	Outcome    credentialfile.MaintenanceResult `json:"outcome"`
-	Inspection *credentialfile.Inspection       `json:"inspection,omitempty"`
-	Revisions  []uint64                         `json:"revisions,omitempty"`
+	Compatibility *credentialfile.CompatibilityReport `json:"compatibility,omitempty"`
+	Code          string                              `json:"code"`
+	Op            string                              `json:"op"`
+	Outcome       credentialfile.MaintenanceResult    `json:"outcome"`
+	Inspection    *credentialfile.Inspection          `json:"inspection,omitempty"`
+	Revisions     []uint64                            `json:"revisions,omitempty"`
 }
 
 func newOfflineStoreCommand(op string) *cobra.Command {
 	o := &storeCommandOptions{timeout: 30 * time.Minute}
 	cmd := &cobra.Command{Use: op + " <storeID>", Short: "Offline encrypted store: " + op, Args: cobra.ExactArgs(1), SilenceErrors: true, SilenceUsage: true}
+	switch op {
+	case "probe":
+		cmd.Long = "Probe locking, exclusive publication, atomic replacement and synchronization using temporary test data. No credentials are read or written. The report names the tested directory; this is not a power-loss certification."
+	case "init", "rewrap", "reencrypt", "clone", "restore":
+		cmd.Long = "For new key-file wrapping material, a missing configured key_file is generated as 32 random bytes with mode 0600. Existing valid key files are reused without changes. The parent directory must exist. Unlock and resume require the original key file."
+	}
 	cmd.RunE = func(cmd *cobra.Command, args []string) error { return runOfflineStore(cmd, op, args[0], o) }
 	cmd.Flags().BoolVar(&o.json, "json", false, "Print metadata-only JSON result")
 	switch op {
@@ -149,6 +156,17 @@ func offlineConfig(cfg *config.Configuration, id, path string) (config.StoreConf
 }
 
 func (w *offlineCommand) run(op string, result *storeCommandResult) (err error) {
+	if op == "probe" {
+		report, err := credentialfile.ProbeCompatibility(w.ctx, w.selected.Path)
+		result.Compatibility = &report
+		if err != nil {
+			return err
+		}
+		if !w.options.json {
+			_, err = fmt.Fprintf(w.cmd.OutOrStdout(), "platform=%s directory=%s checks=%v\n", report.Platform, report.Directory, report.Checks)
+		}
+		return err
+	}
 	if op == "init" {
 		material, err := w.material(w.selected, w.id, true)
 		if err != nil {

@@ -1,4 +1,4 @@
-//go:build integration && linux && amd64
+//go:build integration && (linux || darwin || windows) && (amd64 || arm64)
 
 package credentialfile
 

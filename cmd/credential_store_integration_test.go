@@ -251,3 +251,36 @@ func TestOfflineRegistryComposition(t *testing.T) {
 		t.Fatal("resolver fell back after key removal")
 	}
 }
+
+func TestOfflineStoreInitGeneratesConfiguredKey(t *testing.T) {
+	dir := t.TempDir()
+	key := filepath.Join(dir, "generated.key")
+	phase6Config(t, config.StoreConfig{Type: config.StoreTypeEncryptedFile, Path: filepath.Join(dir, "vault"), Unlock: "key-file", KeyFile: key})
+	if _, err := executeOfflineJSON(t, "init"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(data)
+	info, err := os.Stat(key)
+	if err != nil || len(data) != 32 || info.Mode().Perm() != 0600 {
+		t.Fatal("invalid auto-generated key file")
+	}
+	if _, err := executeOfflineJSON(t, "inspect", "--verify"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(key); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := executeOfflineJSON(t, "inspect", "--verify"); err == nil {
+		t.Fatal("missing unlock key accepted")
+	}
+	if _, err := executeOfflineJSON(t, "init"); err == nil {
+		t.Fatal("existing vault reinitialized")
+	}
+	if _, err := os.Stat(key); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("missing original key was replaced")
+	}
+}

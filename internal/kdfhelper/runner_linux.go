@@ -1,4 +1,4 @@
-//go:build linux && amd64
+//go:build linux && (amd64 || arm64)
 
 package kdfhelper
 
@@ -121,33 +121,6 @@ func (r Runner) run(ctx context.Context, req Request, executable string, args []
 	return processResponse(stdout.data, errors.Join(waitErr, writeErr, killErr, closeErr, resourceErr))
 }
 
-func withCause(err, cause error) error {
-	if cause != nil && !errors.Is(err, cause) {
-		return errors.Join(err, cause)
-	}
-	return err
-}
-
-func processTimeout(ctx context.Context, configured time.Duration) (time.Duration, error) {
-	if err := context.Cause(ctx); err != nil {
-		return 0, err
-	}
-	if configured < 0 {
-		return 0, ErrProtocol
-	}
-	if configured > 0 {
-		return configured, nil
-	}
-	if deadline, ok := ctx.Deadline(); ok {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return 0, context.DeadlineExceeded
-		}
-		return remaining, nil
-	}
-	return 30 * time.Second, nil
-}
-
 func limitFailure(path string) error {
 	if path == "" {
 		return nil
@@ -170,31 +143,6 @@ func limitFailure(path string) error {
 		}
 	}
 	return nil
-}
-
-func processResponse(data []byte, processErr error) ([]byte, error) {
-	response, err := ParseResponse(data)
-	if err != nil {
-		return nil, errors.Join(err, processErr)
-	}
-	if response.Status != Success {
-		response.Zero()
-		kind := ErrProcess
-		switch response.Status {
-		case InvalidRequest:
-			kind = ErrProtocol
-		case UnsupportedVersion:
-			kind = ErrUnsupported
-		case ResourceFailure:
-			kind = ErrResource
-		}
-		return nil, errors.Join(kind, processErr)
-	}
-	if processErr != nil {
-		response.Zero()
-		return nil, errors.Join(ErrProcess, processErr)
-	}
-	return response.Key, nil
 }
 
 func finishProcessGroup(cmd *exec.Cmd, cancel context.CancelCauseFunc) error {
@@ -268,35 +216,14 @@ func memorySnapshot() (available uint64, observed bool) {
 			}
 		}
 	}
-	b, err = os.ReadFile("/proc/self/cgroup")
-	if err != nil {
-		return available, observed
-	}
-	for _, line := range strings.Split(string(b), "\n") {
-		if !strings.HasPrefix(line, "0::/") {
-			continue
-		}
-		relative := strings.TrimPrefix(line, "0::/")
-		if relative != "" && (filepath.Clean(relative) != relative || strings.HasPrefix(relative, "..")) {
-			continue
-		}
-		root := "/sys/fs/cgroup"
-		path := filepath.Join(root, relative)
-		for {
-			maximum, maxErr := os.ReadFile(filepath.Join(path, "memory.max"))
-			current, curErr := os.ReadFile(filepath.Join(path, "memory.current"))
-			if maxErr == nil && curErr == nil {
-				if free, ok := cgroupRemaining(string(maximum), string(current)); ok && (!observed || free < available) {
-					available = free
-					observed = true
-				}
-			}
-			if path == root {
-				break
-			}
-			path = filepath.Dir(path)
+	groups, groupErr := os.ReadFile("/proc/self/cgroup")
+	mounts, mountErr := os.ReadFile("/proc/self/mountinfo")
+	if groupErr == nil && mountErr == nil {
+		if free, ok := cgroupMemoryAvailable(string(groups), string(mounts), os.ReadFile); ok && (!observed || free < available) {
+			available, observed = free, true
 		}
 	}
+
 	return available, observed
 }
 

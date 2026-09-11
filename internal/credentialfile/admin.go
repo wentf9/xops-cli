@@ -3,7 +3,9 @@ package credentialfile
 import "github.com/wentf9/xops-cli/internal/credentialfile/format"
 
 // Wrapping supplies explicit maintenance material. Password is borrowed only for
-// the call and never logged. KeyFile is read securely; it is never generated or deleted.
+// the call and never logged. New wrapping material may create a missing KeyFile
+// as 32 random bytes with mode 0600; existing files are validated and reused.
+// Unlock and resume require the original file. Published key files are never deleted.
 type Wrapping struct {
 	Mode     string
 	Password []byte

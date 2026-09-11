@@ -1,4 +1,4 @@
-//go:build integration && linux && amd64
+//go:build integration && (linux || darwin || windows) && (amd64 || arm64)
 
 package credentialfile
 
@@ -64,7 +64,7 @@ func writeFixtureFile(t *testing.T, path string, b []byte) {
 
 func makeFixture(t *testing.T) fixture {
 	t.Helper()
-	f := fixture{root: t.TempDir(), data: fixtureData(t), ref: credential.Ref{StoreID: "offline", ItemID: "test-item"}}
+	f := fixture{root: platformTempDir(t), data: fixtureData(t), ref: credential.Ref{StoreID: "offline", ItemID: "test-item"}}
 	if err := os.Chmod(f.root, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -357,4 +357,15 @@ func TestFileStoreRandomFailureConsumesOnlyReservedBudget(t *testing.T) {
 	if _, err := os.Stat(f.itemPath(t, f.ref)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("unexpected item: %v", err)
 	}
+}
+
+// macOS exposes its temporary directory through a trusted system symlink. Tests
+// canonicalize their own freshly-created directory before exercising no-follow.
+func platformTempDir(t *testing.T) string {
+	t.Helper()
+	path, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return path
 }

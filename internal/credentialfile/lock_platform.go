@@ -1,4 +1,4 @@
-//go:build linux && amd64
+//go:build (linux || darwin || windows) && (amd64 || arm64)
 
 package credentialfile
 
@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
+	unix "github.com/wentf9/xops-cli/internal/vaultsys"
 	"golang.org/x/sync/semaphore"
-	"golang.org/x/sys/unix"
 )
 
 const gateCapacity = math.MaxInt32

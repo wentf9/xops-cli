@@ -1,4 +1,4 @@
-//go:build linux && amd64
+//go:build (linux || darwin || windows) && (amd64 || arm64)
 
 package credentialfile
 
@@ -10,15 +10,15 @@ import (
 	"path/filepath"
 	"strings"
 
+	unix "github.com/wentf9/xops-cli/internal/vaultsys"
 	"github.com/wentf9/xops-cli/pkg/credential"
-	"golang.org/x/sys/unix"
 )
 
 func readKeyFile(ctx context.Context, path string) (key []byte, err error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path || path == "/" {
 		return nil, credential.ErrCredentialAccessDenied
 	}
-	f, err := os.Open("/")
+	f, err := os.Open(filepath.VolumeName(path) + string(filepath.Separator))
 	if err != nil {
 		return nil, err
 	}
@@ -29,7 +29,7 @@ func readKeyFile(ctx context.Context, path string) (key []byte, err error) {
 			key = nil
 		}
 	}()
-	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	parts := strings.Split(strings.TrimPrefix(strings.TrimPrefix(path, filepath.VolumeName(path)), string(filepath.Separator)), string(filepath.Separator))
 	for i, part := range parts {
 		if err := context.Cause(ctx); err != nil {
 			return nil, err
