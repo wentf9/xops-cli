@@ -46,7 +46,7 @@ func (o fileOps) step(ctx context.Context, name string, fn func() error) error {
 		}
 	}
 	if err := fn(); err != nil {
-		return err
+		return fmt.Errorf("%s: %w", name, err)
 	}
 	if o.after != nil {
 		o.after(name)

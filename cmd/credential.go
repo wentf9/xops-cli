@@ -387,10 +387,10 @@ func checkOfflineDoctor(ctx context.Context, id string, cfg config.StoreConfig) 
 		err = errors.Join(err, s.Close())
 	}
 	if err != nil {
-		item.Message = offlineErrorCode(err)
+		item.Message = fmt.Sprintf("%s: %v", offlineErrorCode(err), err)
 		return item
 	}
 	item.Status = "WARN"
-	item.Message = "encrypted-file metadata available; locked/unverified, no unlock or write probe performed"
+	item.Message = "encrypted-file metadata available; locked/unverified, no unlock or write probe performed; use credential store probe for filesystem capability checks"
 	return item
 }

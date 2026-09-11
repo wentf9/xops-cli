@@ -177,11 +177,9 @@ func securityMode(handle windows.Handle, directory bool) (uint32, uint32, error)
 	if err != nil {
 		return 0, 0, err
 	}
-	uid := uint32(0)
-	if owner.String() == sid {
-		uid = ^uint32(0)
-	} else if owner.String() != "S-1-5-18" && owner.String() != "S-1-5-32-544" {
-		return 0, 0, os.ErrPermission
+	uid, err := windowsOwnerID(owner, sid)
+	if err != nil {
+		return 0, 0, err
 	}
 	acl, _, err := descriptor.DACL()
 	if err != nil {
@@ -333,4 +331,25 @@ func RenameEntry(fromFD int, from string, toFD int, to string, exclusive bool) e
 
 func trustedSID(trustee, current string) bool {
 	return trustee == current || trustee == "S-1-5-18" || trustee == "S-1-5-32-544" || trustee == "S-1-3-4"
+}
+
+func windowsOwnerID(owner *windows.SID, sid string) (uint32, error) {
+	uid := uint32(1) // unknown owners remain observable but never pass private checks
+	if owner.String() == sid {
+		uid = ^uint32(0)
+	} else if owner.String() == "S-1-5-32-544" {
+		elevated, e := windows.Token(0).IsMember(owner)
+		if e != nil {
+			return 0, e
+		}
+		if elevated {
+			uid = ^uint32(0)
+		} else {
+			uid = 0
+		}
+	} else if owner.String() == "S-1-5-18" {
+		uid = 0
+	}
+
+	return uid, nil
 }

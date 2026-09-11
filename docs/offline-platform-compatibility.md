@@ -15,8 +15,8 @@ building for a target is not evidence that its runtime semantics work.
 - cgroup memory observation supports both v1 and v2, including mounted subtrees.
 
 `xops credential store probe <storeID>` tests operations in a disposable private
-sibling directory. It does not initialize the configured vault or read secrets.
-A separately-mounted vault must have its own filesystem capabilities verified.
+directory on the target filesystem (or its parent when not yet initialized). It does not initialize the configured vault or read secrets.
+An existing vault is locked during the probe; separately-mounted targets are checked on their own filesystem.
 
 The native verification program checks key-file creation, missing-key rejection,
 real password derivation, rewrap, clone, reencrypt and deletion. Integration tests

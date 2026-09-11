@@ -52,6 +52,11 @@ func Fstat(fd int, st *Stat_t) error {
 		return err
 	}
 	*st = normalizeStat(raw)
+	bits, err := aclPermissionBits(fd)
+	if err != nil {
+		return err
+	}
+	st.Mode |= bits
 	return nil
 }
 func Fstatat(fd int, name string, st *Stat_t, flags int) error {

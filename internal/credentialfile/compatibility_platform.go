@@ -14,17 +14,16 @@ import (
 	unix "github.com/wentf9/xops-cli/internal/vaultsys"
 )
 
-// ProbeCompatibility uses a temporary private sibling directory, leaving vault
-// contents and key files untouched. An existing vault mounted separately must
-// be probed through its own directory by the caller.
+// ProbeCompatibility tests the actual target filesystem in a private scratch
+// directory. Existing vaults are locked while probing; an absent target uses
+// its parent. Credential contents and key files are never read or changed.
 func ProbeCompatibility(ctx context.Context, path string) (report CompatibilityReport, err error) {
 	report.Platform = runtime.GOOS + "/" + runtime.GOARCH
-	parentPath := filepath.Dir(path)
-	parent, err := walkDirectory(ctx, parentPath)
+	parent, parentPath, release, err := openProbeDirectory(ctx, path)
 	if err != nil {
-		return report, fmt.Errorf("open compatibility probe parent: %w", err)
+		return report, err
 	}
-	defer closeFile(&err, parent)
+	defer func() { err = errors.Join(err, release()); closeFile(&err, parent) }()
 	report.Directory = parentPath
 	var random [16]byte
 	if err := (fileOps{}).randomBytes(random[:]); err != nil {
@@ -66,6 +65,30 @@ func ProbeCompatibility(ctx context.Context, path string) (report CompatibilityR
 	}
 	report.Checks = append(report.Checks, "file lock exclusion and release")
 	return report, nil
+}
+
+func openProbeDirectory(ctx context.Context, path string) (*os.File, string, func() error, error) {
+	root, err := openRoot(ctx, path)
+	if errors.Is(err, os.ErrNotExist) {
+		parentPath := filepath.Dir(path)
+		parent, e := walkDirectory(ctx, parentPath)
+		return parent, parentPath, func() error { return nil }, e
+	}
+	if err != nil {
+		return nil, "", nil, fmt.Errorf("open probe target: %w", err)
+	}
+	store, err := Open(ctx, path, "compatibility-probe", Options{ReadOnly: true})
+	if errors.Is(err, os.ErrNotExist) {
+		return root.file, path, func() error { return nil }, nil
+	}
+	if err != nil {
+		return nil, "", nil, errors.Join(err, root.file.Close())
+	}
+	lock, err := store.lock(ctx, true)
+	if err != nil {
+		return nil, "", nil, errors.Join(err, store.Close(), root.file.Close())
+	}
+	return root.file, path, func() error { return errors.Join(lock.close(), store.Close()) }, nil
 }
 
 func probeFilePublication(ctx context.Context, dir *directory) error {
