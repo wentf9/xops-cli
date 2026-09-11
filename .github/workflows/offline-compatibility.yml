@@ -49,12 +49,14 @@ jobs:
           go-version-file: go.mod
           architecture: ${{ matrix.arch }}
       - name: Report native platform
-        run: go env GOOS GOARCH
+        run: go env GOOS GOARCH CGO_ENABLED
       - name: Build
         run: go build ./...
       - name: Native unit tests
         run: go test ${{ env.RACE_FLAGS }} -parallel 2 ./internal/credentialfile ./internal/kdfhelper ./internal/vaultsys
-      - name: Native vault and real KDF helper
+      - name: Native vault and real KDF helper (release configuration)
+        env:
+          CGO_ENABLED: '0'
         run: go run ./scripts/offline-platform-verify
       - name: Native operations and process-crash recovery
         run: go test ${{ env.RACE_FLAGS }} -parallel 2 -tags=integration -run 'Test(Store|Runtime|Maintenance)' ./internal/credentialfile
