@@ -6,8 +6,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"gopkg.in/yaml.v3"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -291,5 +293,169 @@ func TestEncryptedFinalizeProtectsChangedKeyConfiguration(t *testing.T) {
 		if _, err := os.Stat(file); err != nil {
 			t.Fatal("cleanup deleted protected material", err)
 		}
+	}
+}
+
+func TestEncryptedRuntimeInitializesOnlyOnWrite(t *testing.T) {
+	dir := t.TempDir()
+	owner := NewEncryptedRuntime(t.Context(), filepath.Join(dir, "config.yaml"), nil)
+	t.Cleanup(func() {
+		if err := owner.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	registry, err := owner.Registry(DefaultCredentialConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := registry.GetStore("file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := credential.Ref{StoreID: "file", ItemID: "lazy-write"}
+	if secret, err := store.Get(t.Context(), ref); err == nil {
+		secret.Zero()
+		t.Fatal("read unexpectedly succeeded")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("read created files: %v", err)
+	}
+	value := credential.NewSecret([]byte("test-only-value"))
+	defer value.Zero()
+	if err := store.Put(t.Context(), ref, value); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(t.Context(), ref)
+	defer got.Zero()
+	if err != nil || !bytes.Equal(got.Value, value.Value) {
+		t.Fatalf("read saved value: %v", err)
+	}
+	if err := owner.Lock(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	key := filepath.Join(dir, "credentials.key")
+	if err := os.Remove(key); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(t.Context(), ref, value); err == nil {
+		t.Fatal("write with lost key succeeded")
+	}
+	if _, err := os.Stat(key); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("lost key replaced: %v", err)
+	}
+}
+
+func TestEncryptedRuntimeConcurrentFirstWrite(t *testing.T) {
+	dir := t.TempDir()
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Go(func() {
+			owner := NewEncryptedRuntime(t.Context(), filepath.Join(dir, "config.yaml"), nil)
+			defer func() {
+				if err := owner.Close(); err != nil {
+					t.Error(err)
+				}
+			}()
+			registry, err := owner.Registry(DefaultCredentialConfig())
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			store, err := registry.GetStore("file")
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			value := credential.NewSecret([]byte("concurrent-test-value"))
+			defer value.Zero()
+			if err := store.Put(t.Context(), credential.Ref{StoreID: "file", ItemID: "concurrent"}, value); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	wg.Wait()
+}
+
+func TestEncryptedRuntimeReadOnlyDoesNotInitialize(t *testing.T) {
+	dir := t.TempDir()
+	owner := NewEncryptedRuntime(t.Context(), filepath.Join(dir, "config.yaml"), nil)
+	t.Cleanup(func() {
+		if err := owner.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	cfg := DefaultCredentialConfig()
+	file := cfg.Stores["file"]
+	file.ReadOnly = true
+	cfg.Stores["file"] = file
+	registry, err := owner.Registry(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := registry.GetStore("file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := credential.NewSecret([]byte("must-not-persist"))
+	defer value.Zero()
+	if err := store.Put(t.Context(), credential.Ref{StoreID: "file", ItemID: "read-only"}, value); err == nil {
+		t.Fatal("read-only write accepted")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("read-only write created files: %v", err)
+	}
+}
+
+func TestEncryptedRuntimeAutomaticLegacyUpgrade(t *testing.T) {
+	m, _, raw := migrationFixture(t)
+	// Remove only the backend selection; retain encrypted legacy values and key.
+	var data map[string]any
+	if err := yaml.Unmarshal(raw, &data); err != nil {
+		t.Fatal(err)
+	}
+	delete(data, "credential")
+	raw, err := yaml.Marshal(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(m.path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	owner := NewEncryptedRuntime(t.Context(), m.path, nil)
+	t.Cleanup(func() {
+		if err := owner.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	m.WithRegistryFactory(owner.Registry)
+	report, err := m.AutoMigrate(t.Context())
+	if err != nil || !report.Verified || report.Store != "file" {
+		t.Fatalf("automatic offline upgrade: %+v, %v", report, err)
+	}
+	cfg, err := NewDefaultStore(m.path, m.keyPath).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, ok := cfg.Identities.Get("ops")
+	if !ok || id.LoginPasswordRef == nil || id.Password != "" {
+		t.Fatal("legacy secret not replaced with reference")
+	}
+	registry, err := owner.Registry(cfg.Credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret, err := registry.Resolve(t.Context(), *id.LoginPasswordRef)
+	defer secret.Zero()
+	if err != nil || string(secret.Value) != "login-password" {
+		t.Fatalf("migrated secret: %v", err)
+	}
+	if _, err := os.Stat(m.keyPath); err != nil {
+		t.Fatal("legacy key removed", err)
+	}
+	backup, err := os.ReadFile(m.backupPath())
+	if err != nil || !bytes.Equal(backup, raw) {
+		t.Fatal("source backup not retained")
 	}
 }

@@ -7,7 +7,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -641,6 +643,9 @@ func startAdapterPrivilegeSSHServer(t *testing.T, expectedLoginPwd, expectedSuPw
 									n, _ := channel.Read(buf)
 									inPwd := strings.TrimSpace(string(buf[:n]))
 									if inPwd == expectedSuPwd {
+										if !adapterPrivilegeSignal(t, channel, cmd, false) {
+											return
+										}
 										_, _ = channel.Write([]byte("mock-su-success\n"))
 										_, _ = channel.SendRequest("exit-status", false, []byte{0, 0, 0, 0})
 									} else {
@@ -650,10 +655,16 @@ func startAdapterPrivilegeSSHServer(t *testing.T, expectedLoginPwd, expectedSuPw
 									_ = channel.CloseWrite()
 									return
 								} else if strings.Contains(cmd, "sudo") {
+									if !adapterPrivilegeSignal(t, channel, cmd, true) {
+										return
+									}
 									buf := make([]byte, 128)
 									n, _ := channel.Read(buf)
 									inPwd := strings.TrimSpace(string(buf[:n]))
 									if inPwd == expectedLoginPwd {
+										if !adapterPrivilegeSignal(t, channel, cmd, false) {
+											return
+										}
 										_, _ = channel.Write([]byte("mock-sudo-success\n"))
 										_, _ = channel.SendRequest("exit-status", false, []byte{0, 0, 0, 0})
 									} else {
@@ -1395,4 +1406,40 @@ func TestSSHAdapter_RealRepository_CrossKind_SudoUpdate_PreservesAuthSnapshot_Re
 	if !errors.Is(secretErr, ssh.ErrSnapshotMismatch) {
 		t.Fatalf("expected ErrSnapshotMismatch in error chain, got: %v", secretErr)
 	}
+}
+
+func adapterPrivilegeSignal(t *testing.T, channel cryptossh.Channel, command string, prompt bool) bool {
+	t.Helper()
+	if !strings.Contains(command, "[xops-ready-") {
+		return true
+	}
+	prefix := "[xops-ready-"
+	if prompt {
+		prefix = "[xops-password-"
+	}
+	start := strings.Index(command, prefix)
+	if start < 0 {
+		return true
+	}
+	end := strings.Index(command[start:], "]")
+	if end < 0 {
+		t.Error("invalid protocol frame")
+		return false
+	}
+	token := command[start : start+end+1]
+	if !prompt && token == "[xops-ready-%s]" {
+		nonce := regexp.MustCompile(`[A-Z2-7]{26,}`).FindString(command[start:])
+		token = "[xops-ready-" + nonce + "]"
+	}
+	if _, err := io.WriteString(channel.Stderr(), token); err != nil {
+		t.Error(err)
+		return false
+	}
+	if !prompt {
+		if _, err := io.Copy(io.Discard, channel); err != nil {
+			t.Error(err)
+			return false
+		}
+	}
+	return true
 }

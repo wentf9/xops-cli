@@ -18,4 +18,4 @@ xops ssh deploy@web-01
 xops ssh audit@192.0.2.10
 ```
 
-使用 `xops identity --help` 查看身份管理操作，或运行 `xops tui` 进入终端管理界面。不要将密码放入共享命令记录或文档示例。
+使用 `xops identity --help` 查看身份管理操作，或运行 `xops tui` 进入[终端管理界面](./tui)。不要将密码放入共享命令记录或文档示例。

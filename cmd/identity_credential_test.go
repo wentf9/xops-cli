@@ -25,6 +25,12 @@ func init() {
 }
 
 func runTestIdentityHelper() {
+	if path := os.Getenv("TEST_HELPER_CALL_FILE"); path != "" {
+		if err := os.WriteFile(path, []byte("called"), 0600); err != nil {
+			fmt.Fprintln(os.Stderr, "record test helper invocation failed")
+			os.Exit(1)
+		}
+	}
 	action := os.Args[len(os.Args)-1]
 	if code := os.Getenv("TEST_HELPER_ERROR_CODE"); code != "" {
 		fmt.Printf("{\"code\":%q}\n", code)

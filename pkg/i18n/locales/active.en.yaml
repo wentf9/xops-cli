@@ -527,7 +527,7 @@ init_status_existing:
 init_config_path:
   other: "Configuration: {{.Path}}"
 init_credential_policy:
-  other: "Credentials: none (session only). For headless use, configure pass or an external helper. For desktop use, configure system and run 'xops credential doctor'; select it as default only after its probe passes."
+  other: "Credentials: encrypted-file + key-file, remembering verified credentials by default; offline storage is prepared on first save. Advanced users may manually configure system, pass, or helper. Use --remember never to disable saving and automatic migration for this invocation."
 legacy_config_warning:
   other: "Warning: Schema v1 is deprecated and supported for two official release cycles starting with the Schema v2 default release. Run 'xops credential migrate --dry-run --to <store>' before migrating; retain the old configuration and secret.key until verification and explicit finalize-migration."
 init_import_summary:
@@ -1002,10 +1002,10 @@ warn_flag_deprecated:
   other: "Flag --{{.Flag}} is deprecated and will be removed in the next stable release. Use {{.Replacement}}."
 
 credential_migrate_short:
-  other: "Migrate legacy credentials to references"
+  other: "Upgrade legacy credentials or migrate v2 backends"
 
 credential_migrate_long:
-  other: "Back up legacy configuration and key, write and verify credentials, then atomically commit schema v2. Rerun the same command after interruption. Old materials remain until finalize-migration."
+  other: "Upgrade v1 or copy v2 references to a destination backend. Write and verify before switching configuration; v2 also updates the default store. Rerun after interruption. Source credentials remain; finalize-migration only cleans v1 legacy material."
 
 credential_migrate_to:
   other: "Configured writable destination store ID"
@@ -1021,3 +1021,28 @@ credential_finalize_long:
 
 credential_doctor_warnings:
   other: "Credential checks completed with warnings; review WARN details. Write access was not tested"
+
+credential_auto_migration_failed:
+  other: "Automatic credential migration did not complete; the existing configuration and recovery materials were retained"
+credential_auto_migration_complete:
+  other: "Credentials migrated automatically; validate your connections before running xops credential finalize-migration"
+
+credential_read_retry:
+  other: "Stored credential cannot be read; enter it temporarily. Existing credentials will not be overwritten"
+credential_save_failed_connected:
+  other: "Connected, but credential persistence was not confirmed; you may need to enter it again next time"
+
+prompt_remote_sudo_password:
+  other: "Enter sudo password for {{.Node}}: "
+
+tui_connection_failed:
+  other: "Connection failed: {{.Error}}"
+
+tui_credential_saving_unavailable:
+  other: "Automatic saving is unavailable. Connections can still use session credentials. Check credential directory permissions and restart the TUI."
+
+tui_credential_not_saved:
+  other: "Credential persistence was not confirmed. The connection remains usable; you may need to enter credentials next time."
+
+credential_migrate_restart:
+  other: "Archive the previous v2 migration plan and start from the current configuration; retain all credentials"

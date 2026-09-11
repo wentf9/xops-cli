@@ -13,15 +13,16 @@ import (
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
-func TestLocalSudoNewInstallDoesNotPersist(t *testing.T) {
+func TestLocalSudoExplicitNoneDoesNotPersist(t *testing.T) {
 	dir := setupTestEnvironment(t)
+	configureSessionOnlyCredential(t)
 	if err := utils.RememberLocalSudoPassword(t.Context(), "session-secret"); err != nil {
 		t.Fatal(err)
 	}
 	if err := utils.SaveLocalSudoPasswordContext(t.Context(), "session-secret"); !errors.Is(err, credential.ErrCredentialStoreReadOnly) {
 		t.Fatalf("explicit none write must fail before metadata creation: %v", err)
 	}
-	for _, name := range []string{"xops_config.yaml", "secret.key"} {
+	for _, name := range []string{"credentials", "credentials.key", "secret.key"} {
 		if _, err := os.Stat(filepath.Join(dir, name)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("session-only sudo created %s: %v", name, err)
 		}
@@ -131,5 +132,22 @@ func TestLocalSudoV2CredentialLifecycle(t *testing.T) {
 	}
 	if _, err := os.Stat(key); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("local sudo created legacy key: %v", err)
+	}
+}
+
+func configureSessionOnlyCredential(t *testing.T) {
+	t.Helper()
+	path, key, err := utils.GetConfigFilePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := config.NewDefaultStore(path, key)
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Credential = &config.CredentialConfig{DefaultStore: "none", RememberPrompted: "never", Stores: map[string]config.StoreConfig{"none": {Type: config.StoreTypeNone}}}
+	if err := store.Save(cfg); err != nil {
+		t.Fatal(err)
 	}
 }

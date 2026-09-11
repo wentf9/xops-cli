@@ -69,8 +69,8 @@ func TestInitOptions_RunCreatesConfigAndImportsOpenSSH(t *testing.T) {
 
 func assertInitCredentialDefaults(t *testing.T, cfg *config.Configuration, keyPath string) {
 	t.Helper()
-	if cfg.SchemaVersion != 2 || cfg.Credential == nil || cfg.Credential.DefaultStore != "none" {
-		t.Fatal("new installation must use schema v2 with none")
+	if cfg.SchemaVersion != 2 || cfg.Credential == nil || cfg.Credential.DefaultStore != "file" {
+		t.Fatal("new installation must use schema v2 with offline file store")
 	}
 	if _, err := os.Stat(keyPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("new installation created a legacy key: %v", err)

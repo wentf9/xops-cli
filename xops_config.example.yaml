@@ -5,9 +5,14 @@
 # =============================================================================
 schema_version: 2
 credential:
-  default_store: none
-  remember_prompted: ask
+  default_store: file
+  remember_prompted: always
   stores:
+    file:
+      type: encrypted-file
+      path: credentials
+      unlock: key-file
+      key_file: credentials.key
     none:
       type: none
     # headless 可显式配置并选择 ops-pass；external 使用 type: helper。

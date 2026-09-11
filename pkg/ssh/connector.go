@@ -443,6 +443,9 @@ func (c *Connector) recordAuthUpdate(ctx context.Context, nodeName string, cfg *
 	}
 	committedToken, err := c.credentialRecorder.UpdateAuth(ctx, nodeName, cfg.AuthUpdateToken, cfg.Password, cfg.KeyPath, cfg.Passphrase)
 	if err != nil {
+		if reportCredentialFailure(ctx, c.secretPrompter, "save", err) {
+			return "", errCredentialNotSaved
+		}
 		if closeErr := rootConn.Close(); closeErr != nil {
 			return "", fmt.Errorf("failed to update authentication for node '%s': %w; close unpublished SSH client failed: %w", nodeName, err, closeErr)
 		}
@@ -454,6 +457,7 @@ func (c *Connector) recordAuthUpdate(ctx context.Context, nodeName string, cfg *
 func (c *Connector) initializeConnection(ctx context.Context, planNode connectionPlanNode, dialer Dialer) (*Client, error) {
 	nodeName := planNode.name
 	cfg := planNode.cfg
+	originalKeyPath := cfg.KeyPath
 
 	coordinator := newHandshakeCoordinator(ctx, c.getHandshakeTimeout())
 	defer coordinator.Close()
@@ -480,18 +484,30 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 	oldAuthToken := cfg.AuthUpdateToken
 	hasAuthUpdate := discoveredAuth && oldAuthToken != ""
 	var committedAuthToken string
+	recordingFailed := false
 	if hasAuthUpdate {
 		var err error
 		committedAuthToken, err = c.recordAuthUpdate(ctx, nodeName, cfg, rootConn)
-		if err != nil {
+		if errors.Is(err, errCredentialNotSaved) {
+			recordingFailed = true
+			hasAuthUpdate = false
+		} else if err != nil {
 			return nil, err
 		}
 	}
 
 	// [P1] 认证写回可能更新了 Repository 的认证版本（如 auto 认证交互记录了新密码/私钥密码），
 	// 必须从底层 provider 重新刷新 cfg 中的最新版本令牌并校验目标与版本推进兼容性。
-	if err := c.syncAuthTokensAfterConnection(nodeName, cfg, committedAuthToken, hasAuthUpdate, rootConn); err != nil {
+	if err := c.syncConnectionAfterRecording(nodeName, cfg, committedAuthToken, hasAuthUpdate, recordingFailed, originalKeyPath, rootConn); err != nil {
 		return nil, err
+	}
+
+	if recordingFailed {
+		// The write may have applied without durable confirmation. Keep the
+		// authenticated connection, but never authorize subsequent writes using
+		// either stale tokens or an unrelated refreshed configuration version.
+		cfg.AuthUpdateToken = ""
+		cfg.SudoUpdateToken = ""
 	}
 
 	// 连接与凭证记录完成后，立即抹除单次握手使用的明文机密，防止敏感材料残留在池化 Client 中
@@ -533,7 +549,7 @@ func (c *Connector) publishClient(nodeName string, client *PooledClient) error {
 	return nil
 }
 
-func (c *Connector) syncAuthTokensAfterConnection(nodeName string, cfg *ClientConfig, committedAuthToken string, hasAuthUpdate bool, rootConn net.Conn) error {
+func (c *Connector) syncAuthTokensAfterConnection(nodeName string, cfg *ClientConfig, committedAuthToken string, hasAuthUpdate bool, rootConn net.Conn, originalKeyPaths ...string) error {
 	if c.provider == nil {
 		return nil
 	}
@@ -550,6 +566,8 @@ func (c *Connector) syncAuthTokensAfterConnection(nodeName string, cfg *ClientCo
 	if newCfg == nil {
 		return nil
 	}
+
+	reconcileFailedWriteKeyPath(cfg, newCfg, originalKeyPaths)
 
 	// [P1] 校验完整连接目标（Address, Port, User, KeyPath, ProxyJump）是否仍然与当前已建立的连接一致
 	if err := validateTargetCompatibility(cfg.ToConnectionConfig(), newCfg); err != nil {
@@ -986,7 +1004,9 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 	authMethods := []ssh.AuthMethod{}
 
 	prompter := c.secretPrompter
+	authCtx := c.lifecycleCtx
 	if coordinator != nil {
+		authCtx = coordinator.Context()
 		prompter = &coordinatingPrompter{
 			prompter:    c.secretPrompter,
 			coordinator: coordinator,
@@ -1001,7 +1021,7 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 			failClosed = coordinator.FailClosed
 		}
 		plan := buildAutoAuthPlan(ctx, AutoAuthOptions{
-			LifecycleCtx:       c.lifecycleCtx,
+			LifecycleCtx:       authCtx,
 			NodeID:             cfg.NodeID,
 			User:               cfg.User,
 			Host:               cfg.Address,
@@ -1012,6 +1032,7 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 			HandshakeTimeout:   c.getHandshakeTimeout(),
 			InteractionTimeout: c.interactionTimeout,
 			FailClosed:         failClosed,
+			RecoveryPrompter:   credentialRecoveryPrompter(c.secretPrompter),
 			KeyPath:            cfg.KeyPath,
 			PasswordCallback: func(s string) {
 				if s != "" {
@@ -1046,6 +1067,10 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 		cleanup = plan.cleanup
 
 	case "password":
+		if credentialRecoveryPrompter(c.secretPrompter) != nil {
+			authMethods = append(authMethods, c.recoverablePasswordAuth(authCtx, cfg, prompter, onAuthDiscovered))
+			break
+		}
 		method, err := c.resolvePasswordAuth(cfg)
 		if err != nil {
 			return nil, nil, err
@@ -1053,6 +1078,15 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 		authMethods = append(authMethods, method)
 
 	case "key":
+		if credentialRecoveryPrompter(c.secretPrompter) != nil {
+			method, closeKey, err := c.recoverableKeyAuth(authCtx, cfg, prompter, onAuthDiscovered)
+			if err != nil {
+				return nil, nil, err
+			}
+			authMethods = append(authMethods, method)
+			cleanup = closeKey
+			break
+		}
 		method, err := c.resolveKeyAuth(cfg)
 		if err != nil {
 			return nil, nil, err
@@ -1245,4 +1279,19 @@ func appendKnownHost(knownHostsFile, hostname string, key ssh.PublicKey) (err er
 type PooledClient struct {
 	SSHClient *ssh.Client
 	RootConn  net.Conn
+}
+
+func (c *Connector) syncConnectionAfterRecording(node string, cfg *ClientConfig, token string, updated, failed bool, originalKeyPath string, root net.Conn) error {
+	if failed {
+		return c.syncAuthTokensAfterConnection(node, cfg, token, updated, root, originalKeyPath)
+	}
+	return c.syncAuthTokensAfterConnection(node, cfg, token, updated, root)
+}
+
+func reconcileFailedWriteKeyPath(cfg, latest *ClientConfig, original []string) {
+	// A failed write may retain the original path or publish the discovered one.
+	// An unrelated path must still fail normal target compatibility checks.
+	if len(original) == 1 && latest.KeyPath == original[0] {
+		cfg.KeyPath = latest.KeyPath
+	}
 }

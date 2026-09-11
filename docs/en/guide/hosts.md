@@ -18,4 +18,4 @@ xops ssh deploy@web-01
 xops ssh audit@192.0.2.10
 ```
 
-Use `xops identity --help` for identity operations, or `xops tui` for the terminal management interface. Keep passwords out of shared command histories and documentation examples.
+Use `xops identity --help` for identity operations, or `xops tui` for the [terminal management interface](./tui). Keep passwords out of shared command histories and documentation examples.

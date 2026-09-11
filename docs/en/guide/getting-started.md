@@ -29,7 +29,7 @@ xops init --ssh-config ~/.ssh/config.work
 xops init --skip-ssh-import
 ```
 
-New configurations use Schema v2 with the `none` credential store. Session passwords are not persisted and no `secret.key` is created. Read [Credential storage](./credentials) before enabling persistence.
+New configurations use Schema v2 with store `file` (encrypted-file + key-file), prepared on first save without creating a legacy `secret.key`. The complete experience is still being implemented; see [Credential storage](./credentials).
 
 ## First connection
 

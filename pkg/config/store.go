@@ -314,11 +314,7 @@ func (s *defaultStore) loadLocked() (*Configuration, error) {
 			// Only absent configurations receive new-install defaults. Existing
 			// v1 files retain their compatibility behavior until explicit migration.
 			configuration.SchemaVersion = 2
-			configuration.Credential = &CredentialConfig{
-				DefaultStore:     "none",
-				RememberPrompted: "ask",
-				Stores:           map[string]StoreConfig{"none": {Type: StoreTypeNone}},
-			}
+			configuration.Credential = DefaultCredentialConfig()
 			return &configuration, nil
 		}
 		return nil, fmt.Errorf("failed to read configuration file %s: %w", s.Path, err)

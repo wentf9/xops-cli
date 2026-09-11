@@ -44,3 +44,8 @@ func (*Store) Restore(context.Context, string, Wrapping, []credential.Ref) (Main
 
 // Prune refuses unsupported platforms.
 func (*Store) Prune(context.Context, bool) (PruneResult, error) { return PruneResult{}, ErrUnsupported }
+
+// EnsureInitialized is unavailable on unsupported platforms.
+func (*Runtime) EnsureInitialized(context.Context, string, string, Wrapping) (MaintenanceResult, error) {
+	return MaintenanceResult{}, ErrUnsupported
+}

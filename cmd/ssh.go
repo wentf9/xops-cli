@@ -710,9 +710,8 @@ func update(ctx context.Context, nodeID string, o *SshOptions, provider *config.
 	return nodeUpdated || identityUpdated, nil
 }
 
-// TODO(refactor): TUI 渲染边界与环境变量污染
-// 这里的阻塞提示逻辑属于 TUI 层面的交互，目前交由子进程处理（依赖 XOPS_CLI_SSH_FROM_TUI 环境变量）并非最佳实践。
-// 后续重构建议：移除子进程中的阻塞提示，改为子进程出错即退，由外层的 TUI 框架拦截退出状态码并绘制错误提示信息。
+// Legacy launchers may still request this pause. The current TUI uses owned
+// in-process SSH sessions and displays errors after restoring its terminal.
 func promptPressEnterIfTUI(stdin io.Reader, stdout io.Writer) error {
 	if os.Getenv("XOPS_CLI_SSH_FROM_TUI") == "true" {
 		if _, err := fmt.Fprintln(stdout, i18n.T("tui_press_enter")); err != nil {

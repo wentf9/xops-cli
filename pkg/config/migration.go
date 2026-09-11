@@ -12,19 +12,22 @@ import (
 
 // MigrationOptions selects an explicitly configured writable destination.
 type MigrationOptions struct {
-	ToStore string
-	DryRun  bool
+	ToStore   string
+	DryRun    bool
+	Restart   bool
+	automatic bool
 }
 
 // MigrationReport contains metadata only. It never returns decoded secrets.
 type MigrationReport struct {
-	Store         string
-	Credentials   int
-	BackupPath    string
-	BackupKeyPath string
-	DryRun        bool
-	Verified      bool
-	Finalized     bool
+	Store            string
+	Credentials      int
+	BackupPath       string
+	BackupKeyPath    string
+	DryRun           bool
+	Verified         bool
+	Finalized        bool
+	BackendMigration bool
 }
 
 // CredentialMigrator operates directly on files, never publishing legacy
@@ -52,7 +55,7 @@ func NewCredentialMigrator(configPath, keyPath string) (*CredentialMigrator, err
 		return nil, err
 	}
 	m := &CredentialMigrator{path: path, keyPath: key, write: atomicWriteFile, registry: BuildRegistryFromConfig}
-	for _, reserved := range []string{path, m.statePath(), m.backupPath(), m.backupKeyPath(), path + ".lock", path + ".migration.lock"} {
+	for _, reserved := range []string{path, m.backendStatePath(), m.statePath(), m.backupPath(), m.backupKeyPath(), path + ".lock", path + ".migration.lock"} {
 		if key == reserved {
 			return nil, fmt.Errorf("migration key path overlaps configuration or recovery artifacts")
 		}
@@ -72,8 +75,11 @@ func (m *CredentialMigrator) report(state *migrationState, dryRun bool) Migratio
 // Migrate preserves all old materials until an explicit Finalize call. A failed
 // or interrupted run can reuse the recorded immutable refs on the next run.
 func (m *CredentialMigrator) Migrate(ctx context.Context, opts MigrationOptions) (report MigrationReport, retErr error) {
-	if ctx == nil || opts.ToStore == "" {
+	if ctx == nil || (opts.ToStore == "" && !opts.automatic) {
 		return report, fmt.Errorf("migration requires context and destination store")
+	}
+	if opts.Restart && (opts.DryRun || opts.automatic) {
+		return report, fmt.Errorf("restart requires an explicit non-dry-run v2 migration")
 	}
 	if opts.DryRun {
 		return m.dryRun(ctx, opts)
@@ -83,16 +89,57 @@ func (m *CredentialMigrator) Migrate(ctx context.Context, opts MigrationOptions)
 		return report, err
 	}
 	defer func() { retErr = errors.Join(retErr, lock.Close()) }()
+	return m.migrateLocked(ctx, opts)
+}
+
+func (m *CredentialMigrator) migrateLocked(ctx context.Context, opts MigrationOptions) (report MigrationReport, retErr error) {
+	rawV2, err := readMigrationFile(m.path)
+	if err != nil {
+		return report, err
+	}
+	defer clear(rawV2)
+	version, err := DetectSchemaVersion(rawV2)
+	if err != nil {
+		return report, err
+	}
+	if opts.Restart && version != 2 {
+		return report, fmt.Errorf("restart requires schema v2")
+	}
 	state, err := m.loadState()
 	if err != nil {
 		return report, err
 	}
+	if version == 2 && !opts.automatic {
+		return m.migrateV2Source(ctx, opts, state, rawV2)
+	}
+	return m.resumeLegacyMigration(ctx, opts, state)
+}
+
+func (m *CredentialMigrator) migrateV2Source(ctx context.Context, opts MigrationOptions, state *migrationState, raw []byte) (MigrationReport, error) {
+	if state != nil && state.Phase != "verified" && state.Phase != "complete" {
+		if state.Phase == "finalizing" {
+			return MigrationReport{}, fmt.Errorf("finish legacy finalization before backend migration")
+		}
+		if state.Store != opts.ToStore {
+			return MigrationReport{}, fmt.Errorf("resume legacy migration to %q before backend migration", state.Store)
+		}
+		return m.finishVerification(ctx, state, raw)
+	}
+	return m.migrateBackend(ctx, opts, raw)
+}
+
+func (m *CredentialMigrator) resumeLegacyMigration(ctx context.Context, opts MigrationOptions, state *migrationState) (report MigrationReport, retErr error) {
 	raw, key, err := m.readInputs(ctx)
 	if err != nil {
 		return report, err
 	}
 	defer clear(raw)
 	defer clear(key)
+	opts, err = automaticMigrationOptions(raw, opts)
+	if err != nil || opts.ToStore == "" {
+		return report, err
+	}
+
 	if state != nil && state.Store != opts.ToStore {
 		return report, fmt.Errorf("migration already targets store %q", state.Store)
 	}
@@ -208,6 +255,13 @@ func (m *CredentialMigrator) dryRun(ctx context.Context, opts MigrationOptions) 
 		return MigrationReport{}, err
 	}
 	defer clear(raw)
+	version, err := DetectSchemaVersion(raw)
+	if err != nil {
+		return MigrationReport{}, err
+	}
+	if version == 2 {
+		return m.dryRunBackend(ctx, opts, raw)
+	}
 	key, err := readMigrationFile(m.keyPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return MigrationReport{}, err
@@ -291,4 +345,43 @@ func (m *CredentialMigrator) WithRegistryFactory(factory func(*CredentialConfig)
 		m.registry = factory
 	}
 	return m
+}
+
+// AutoMigrate upgrades eligible legacy configurations to their selected store.
+// A zero report means the configuration was absent, already v2, or opted out.
+// Call only from normal usage paths; never from inspection or dry-run commands.
+func (m *CredentialMigrator) AutoMigrate(ctx context.Context) (MigrationReport, error) {
+	raw, err := readMigrationFile(m.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return MigrationReport{}, nil
+	}
+	if err != nil {
+		return MigrationReport{}, err
+	}
+	defer clear(raw)
+	opts, err := automaticMigrationOptions(raw, MigrationOptions{automatic: true})
+	if err != nil || opts.ToStore == "" {
+		return MigrationReport{}, err
+	}
+	return m.Migrate(ctx, opts)
+}
+
+func automaticMigrationOptions(raw []byte, opts MigrationOptions) (MigrationOptions, error) {
+	if !opts.automatic {
+		return opts, nil
+	}
+	opts.ToStore = ""
+	version, err := DetectSchemaVersion(raw)
+	if err != nil || version != 1 {
+		return opts, err
+	}
+	cfg, err := decodeMigrationLegacy(raw)
+	if err != nil {
+		return opts, err
+	}
+	defer clearMigrationConfiguration(cfg)
+	if cfg.Credential.RememberPrompted != "never" && cfg.CanRememberCredentials() {
+		opts.ToStore = cfg.Credential.DefaultStore
+	}
+	return opts, nil
 }

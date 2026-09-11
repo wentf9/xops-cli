@@ -528,7 +528,7 @@ init_status_existing:
 init_config_path:
   other: "配置文件: {{.Path}}"
 init_credential_policy:
-  other: "凭据: none（仅当前会话）。无桌面环境请配置 pass 或 external helper；桌面环境请先配置 system 并运行 'xops credential doctor'，仅在探测通过后将其设为默认。"
+  other: "凭据: encrypted-file + key-file，默认自动记住验证成功的凭据；首次保存时准备离线库。system、pass 和 helper 仅需高级用户手动配置。使用 --remember never 可禁用本次保存和自动迁移。"
 legacy_config_warning:
   other: "警告: Schema v1 已弃用，自 Schema v2 默认切换的正式版本起保留两个正式发布周期的兼容期。请先运行 'xops credential migrate --dry-run --to <store>'；验证迁移并显式执行 finalize-migration 前，请保留旧配置和 secret.key。"
 init_import_summary:
@@ -1003,10 +1003,10 @@ warn_flag_deprecated:
   other: "参数 --{{.Flag}} 已弃用，将在下一个正式版本删除。请使用 {{.Replacement}}。"
 
 credential_migrate_short:
-  other: "显式迁移旧凭据为引用"
+  other: "升级旧凭据或迁移 v2 凭据后端"
 
 credential_migrate_long:
-  other: "备份旧配置与 key，写入并读回凭据后原子提交 Schema v2。中断后可重跑同一命令；旧材料保留至显式 finalize-migration。"
+  other: "升级 v1，或复制 v2 引用到目标后端。写入并读回验证后原子切换配置；v2 同时更新默认库。中断后重跑同一命令。源凭据保留；finalize-migration 仅清理 v1 旧材料。"
 
 credential_migrate_to:
   other: "已配置的可写目标 Store ID"
@@ -1022,3 +1022,28 @@ credential_finalize_long:
 
 credential_doctor_warnings:
   other: "凭据检查存在警告，请查看 WARN 详情；未验证写入权限"
+
+credential_auto_migration_failed:
+  other: "凭据自动迁移未完成，已保留现有配置和恢复材料"
+credential_auto_migration_complete:
+  other: "凭据已自动迁移；请验证实际连接后再执行 xops credential finalize-migration 清理旧材料"
+
+credential_read_retry:
+  other: "已保存凭据无法读取，请临时输入；原有凭据不会被覆盖"
+credential_save_failed_connected:
+  other: "连接已成功，但凭据未确认保存；下次可能需要重新输入"
+
+prompt_remote_sudo_password:
+  other: "请输入 {{.Node}} 的 sudo 提权密码: "
+
+tui_connection_failed:
+  other: "连接失败: {{.Error}}"
+
+tui_credential_saving_unavailable:
+  other: "自动保存暂不可用；仍可连接，但新输入的凭据不会保存。请检查凭据目录权限后重新启动 TUI。"
+
+tui_credential_not_saved:
+  other: "本次凭据未确认保存；连接可继续使用，下次可能需要重新输入。"
+
+credential_migrate_restart:
+  other: "归档此前的 v2 迁移计划并按当前配置重新规划，保留全部凭据"

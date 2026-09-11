@@ -20,3 +20,9 @@ golangci-lint run ./...
 - [凭据实现设计](https://github.com/wentf9/xops-cli/blob/master/docs/development/archive/design/credential-persistence.md)
 
 历史实施记录反映当时的验证范围，不自动代表当前所有平台已经验证。文档贡献流程见[文档维护](./docs)。
+
+## 已确认、待实现的设计
+
+- [凭据零配置体验设计](./credential-experience-design)
+- [凭据体验实施计划](./credential-experience-plan)
+- [更新说明草案](./credential-experience-release)

@@ -107,7 +107,10 @@ func (a *AuthMaterial) Zero() {
 
 // PrivilegeMaterial 包含单次提权 (sudo/su) 所需的敏感机密材料。
 type PrivilegeMaterial struct {
-	Password []byte
+	Password      []byte
+	confirmedSave func(context.Context, []byte) error
+	deferSave     bool
+	verified      bool
 }
 
 // Zero 清零敏感字节切片并清空引用。
@@ -117,6 +120,7 @@ func (p *PrivilegeMaterial) Zero() {
 	}
 	zeroBytes(p.Password)
 	p.Password = nil
+	p.confirmedSave = nil
 }
 
 // zeroBytes 将切片中的所有敏感字节清零。
@@ -162,6 +166,7 @@ const (
 	SecretKindLoginPassword
 	SecretKindPrivateKeyPassphrase
 	SecretKindSuPassword
+	SecretKindSudoPassword
 )
 
 // ErrSnapshotMismatch 表示连接快照与当前配置版本或目标不匹配

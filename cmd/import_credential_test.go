@@ -120,6 +120,7 @@ func TestImportVerificationResolvesExistingRef(t *testing.T) {
 
 func TestV2ImportNoneRejectsSecretBeforeCreation(t *testing.T) {
 	setupTestEnvironment(t)
+	configureSessionOnlyCredential(t)
 	err := hostcmd.ExecuteLoadHostContext(t.Context(), []utils.HostInfo{{Host: "127.0.0.2", User: "imported", Password: "csv-secret"}})
 	if !errors.Is(err, credential.ErrCredentialStoreReadOnly) {
 		t.Fatalf("none import: %v", err)

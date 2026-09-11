@@ -12,12 +12,15 @@ import (
 func TestTUIRememberPolicy(t *testing.T) {
 	for _, tc := range []struct {
 		name, policy                string
+		override                    string
 		confirm, answer, wantStored bool
 		wantCalls                   int
 		confirmErr                  error
 		disabled                    string
 	}{
 		{name: "never", policy: "never", confirm: true},
+		{name: "invocation never", policy: "always", override: "never"},
+		{name: "invocation always", policy: "never", override: "always", wantStored: true},
 		{name: "always", policy: "always", wantStored: true},
 		{name: "ask accepted", policy: "ask", confirm: true, answer: true, wantStored: true, wantCalls: 1},
 		{name: "ask declined", policy: "ask", confirm: true, wantCalls: 1},
@@ -44,7 +47,7 @@ func TestTUIRememberPolicy(t *testing.T) {
 			}
 			repo := newTestRepository(t, cfg)
 			service := newFormCredentialTestService(t, repo, newMemoryCredentialStore())
-			mc := modelConfig{credentialService: service}
+			mc := modelConfig{credentialService: service, rememberPolicy: tc.override}
 			calls := 0
 			if tc.confirm {
 				mc.rememberConfirmation = func(context.Context, string) (bool, error) { calls++; return tc.answer, tc.confirmErr }

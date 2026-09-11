@@ -27,6 +27,8 @@ func newCmdCredentialMigrate() *cobra.Command {
 			}
 			if report.DryRun {
 				_, err = fmt.Fprintf(cmd.OutOrStdout(), "Dry run: %d credentials would migrate to %s; no files or credentials written\n", report.Credentials, report.Store)
+			} else if report.BackendMigration {
+				_, err = fmt.Fprintf(cmd.OutOrStdout(), "Verified backend migration: %d credentials migrated to %s; default store updated\nConfiguration backup: %s\nSource credentials retained; finalize-migration only cleans legacy v1 materials\n", report.Credentials, report.Store, report.BackupPath)
 			} else {
 				_, err = fmt.Fprintf(cmd.OutOrStdout(), "Verified schema v2: %d credentials migrated to %s\nLegacy backup: %s\nValidate your connections, then run xops credential finalize-migration\n", report.Credentials, report.Store, report.BackupPath)
 			}
@@ -38,6 +40,7 @@ func newCmdCredentialMigrate() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&opts.ToStore, "to", "", i18n.T("credential_migrate_to"))
 	cmd.Flags().BoolVar(&opts.DryRun, "dry-run", false, i18n.T("credential_migrate_dry_run"))
+	cmd.Flags().BoolVar(&opts.Restart, "restart", false, i18n.T("credential_migrate_restart"))
 	return cmd
 }
 

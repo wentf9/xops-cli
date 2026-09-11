@@ -111,6 +111,9 @@ func newRootCmd() *cobra.Command {
 			if logLevel == "debug" {
 				logger.Debug(i18n.T("debug_mode_enabled"))
 			}
+			if err := autoMigrateConfiguration(cmd); err != nil {
+				return err
+			}
 			return warnLegacyConfiguration(cmd)
 		},
 	}

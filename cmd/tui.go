@@ -12,18 +12,21 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
 	"github.com/wentf9/xops-cli/pkg/config"
-	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
 	"github.com/wentf9/xops-cli/pkg/tui"
 )
 
 func NewCmdTui() *cobra.Command {
+	var remember string
 	cmd := &cobra.Command{
 		Use:   "tui",
 		Short: i18n.T("tui_short"),
 		Long:  i18n.T("tui_long"),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := utils.ValidateRememberPolicy(remember); err != nil {
+				return err
+			}
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 
@@ -43,7 +46,10 @@ func NewCmdTui() *cobra.Command {
 
 			credSvc, credErr := utils.GetCredentialService(repository, cfg)
 			if credErr != nil {
-				return fmt.Errorf("initialize credential persistence: %w", credErr)
+				// Saving failure must not prevent session-only connections. The
+				// TUI reports unavailable saving and keeps explicit edits closed.
+				logger.DefaultLogger().Debugf("initialize TUI credential persistence: %v", credErr)
+				credSvc = nil
 			}
 			credReg, regErr := utils.GetCredentialRegistry(cfg)
 			if regErr != nil {
@@ -53,11 +59,13 @@ func NewCmdTui() *cobra.Command {
 			interaction := newCLIInteractionHandler()
 			model, err := tui.NewModel(
 				repository,
-				tui.WithContext(credential.WithoutInteraction(ctx)),
+				tui.WithContext(ctx),
 				tui.WithLogger(logger.DefaultLogger()),
 				tui.WithInteractionHandler(interaction),
 				tui.WithRememberConfirmation(interaction.confirmRemember),
+				tui.WithRememberPolicy(remember),
 				tui.WithCredentialService(credSvc),
+				tui.WithCredentialPersistenceUnavailable(credErr != nil),
 				tui.WithCredentialRegistry(credReg),
 				tui.WithVaultControl(func(work context.Context, unlock bool) error {
 					owner, err := utils.CredentialRuntime()
@@ -79,7 +87,7 @@ func NewCmdTui() *cobra.Command {
 					if err != nil {
 						return err
 					}
-					return s.Unlock(ctx)
+					return s.Unlock(work)
 				}),
 			)
 			if err != nil {
@@ -98,5 +106,6 @@ func NewCmdTui() *cobra.Command {
 			return errors.Join(runErr, closeErr)
 		},
 	}
+	cmd.Flags().StringVar(&remember, "remember", "", i18n.T("flag_remember"))
 	return cmd
 }

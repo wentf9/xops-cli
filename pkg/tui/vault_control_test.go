@@ -7,6 +7,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/wentf9/xops-cli/pkg/config"
+	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
 func TestVaultControlLockAndFailure(t *testing.T) {
@@ -41,5 +42,24 @@ func TestVaultControlLockAndFailure(t *testing.T) {
 	m.Update(result)
 	if m.status == "" {
 		t.Fatal("no lock result status")
+	}
+}
+
+func TestVaultUnlockUsesReleasedTerminalContext(t *testing.T) {
+	var disabled bool
+	model, err := NewModel(newTestRepository(t, &config.Configuration{}), WithContext(t.Context()), WithVaultControl(func(ctx context.Context, _ bool) error { disabled = credential.InteractionDisabled(ctx); return nil }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := model.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := model.runVaultControl(true); err != nil || disabled {
+		t.Fatal("explicit unlock could not use its released terminal")
+	}
+	if err := model.runVaultControl(false); err != nil || !disabled {
+		t.Fatal("background lock was allowed to prompt")
 	}
 }

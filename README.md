@@ -23,7 +23,7 @@
 - 🛡️ **SSH 增强与 TUI**: 完全兼容 OpenSSH (支持跳板机 JumpHost、隧道、Agent 转发)。内置 **TUI (终端用户界面)**，并支持自动 Sudo 提权模式。
 - ⚡ **批量执行与传输**: 基于标签 (Tags) 对多台主机并行执行命令或本地脚本。内置 SCP/SFTP 支持，轻松实现文件批量分发。交互式 SFTP shell 具备连接保活 (KeepAlive) 与断线自动检测，网络中断后会唤醒交互提示、自动退出并返回非零状态。每个 shell 实例仅运行一次；关闭会取消并等待当前交互，再释放提示和 SFTP 资源。
 - 🔄 **声明式任务编排 (Playbook)**: 支持 YAML 格式的任务编排，组合 shell、script、copy、ensure (幂等性状态收敛) 和 template 步骤，支持并发控制与失败策略。
-- 🗂️ **资产与凭据管理**: 本地统一管理主机、凭据 (Identity) 和标签，新安装默认 Schema v2，仅保存凭据库引用，不创建加密 key；旧 AES 配置可显式迁移。支持通过 CSV 模板批量导入导出。
+- 🗂️ **资产与凭据管理**: 本地统一管理主机、凭据 (Identity) 和标签，新安装默认离线库和 Schema v2 凭据引用，首次保存自动准备 key-file；旧 AES 配置自动升级，也可显式迁移。支持通过 CSV 模板批量导入导出。
 - 🌐 **网络与安全工具**: 集成 DNS 查询、Ping、Netcat (nc)、Base64/Hex 编码转换，以及统一的**防火墙管理器** (自动适配 firewalld, ufw, iptables, nftables)。
 - 🌍 **国际化 (i18n)**: 原生支持简体中文与英文，可根据环境自动切换。
 
@@ -60,9 +60,9 @@ xops init --skip-ssh-import
 
 该命令可重复执行，不会覆盖已有节点。初始化完成后可运行 `xops host list` 查看导入结果。
 
-新安装默认 `credential.default_store: none`、`remember_prompted: ask`，不保存会话密码，
-也不创建 `secret.key`。无桌面环境请显式配置 `pass` 或 external（`type: helper`）；
-桌面环境先配置 `system` 并运行 `xops credential doctor`，探测通过后再设为默认。
+新安装默认 `credential.default_store: file`、`remember_prompted: always`，使用内置离线库和 key-file，首次保存时初始化，不创建旧版 `secret.key`。
+其他后端由高级用户手动配置。单次 `--remember never` 或全局 `remember_prompted: never` 禁止保存及自动迁移。
+通用后端迁移已实现，见[迁移指南](docs/guide/migration.md)；最终平台验收尚未完成。
 doctor 仅验证非交互读取链路，不保证写权限；Linux system 使用 Secret Service
 直接读取已解锁凭据，不弹出解锁提示。示例见 [配置文件](xops_config.example.yaml)。
 
@@ -71,7 +71,7 @@ Linux、Windows 和 macOS 的 64 位平台还可显式配置[内置离线加密�
 [格式与配置/CLI 接口 v1 已冻结](docs/development/archive/design/offline-encrypted-credential-store-v1-freeze.md)，发布状态为未发布。
 
 Schema v1 自默认切换版本起保留两个正式发布周期，普通命令向 stderr 输出弃用告警。
-兼容期内旧读取和 AES 写入仍保留；请按[迁移指南](docs/development/archive/credential-migration.md)显式迁移。
+符合条件的旧配置在正常使用时自动升级并保留旧材料；关闭自动保存时不自动升级。显式迁移及后端切换见[迁移指南](docs/guide/migration.md)。
 
 #### 2. 主机与资产管理
 

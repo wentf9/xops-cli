@@ -136,7 +136,18 @@ func (r *Runtime) Init(ctx context.Context, path, id string, target Wrapping) (M
 	return r.initialize(ctx, path, id, target, fileOps{})
 }
 
-func (r *Runtime) initialize(ctx context.Context, path, id string, target Wrapping, ops fileOps) (result MaintenanceResult, err error) {
+// EnsureInitialized prepares an empty store for a write or reuses a published
+// store. Existing CURRENT is checked under the vault lock before key creation.
+// Incomplete transactions require explicit recovery; no material is replaced.
+func (r *Runtime) EnsureInitialized(ctx context.Context, path, id string, target Wrapping) (MaintenanceResult, error) {
+	return r.initializeForWrite(ctx, path, id, target, fileOps{}, true)
+}
+
+func (r *Runtime) initialize(ctx context.Context, path, id string, target Wrapping, ops fileOps) (MaintenanceResult, error) {
+	return r.initializeForWrite(ctx, path, id, target, ops, false)
+}
+
+func (r *Runtime) initializeForWrite(ctx context.Context, path, id string, target Wrapping, ops fileOps, allowExisting bool) (result MaintenanceResult, err error) {
 	if err := validateWrappingKeyLocation(path, target); err != nil {
 		return result, err
 	}
@@ -174,8 +185,8 @@ func (r *Runtime) initialize(ctx context.Context, path, id string, target Wrappi
 	if err != nil {
 		return result, err
 	}
-	if err := emptyVault(work, s.root); err != nil {
-		return result, err
+	if done, checkErr := initializedOrEmpty(work, s.root, allowExisting); done {
+		return result, checkErr
 	}
 	seed, err := prepareNewWrapping(work, r, target, vault, id, ops, s.root)
 	if err != nil {
@@ -298,4 +309,13 @@ func (a *administration) checkSharedBudget() (err error) {
 	}
 	_, err = format.OpenBudget(b, a.key, a.pub.current.VaultID, a.pub.current.Generation, a.store.storeID)
 	return err
+}
+
+// initializedOrEmpty runs while the caller holds the exclusive vault lock.
+func initializedOrEmpty(ctx context.Context, root *directory, allowExisting bool) (bool, error) {
+	err := emptyVault(ctx, root)
+	if allowExisting && errors.Is(err, ErrConflict) {
+		return true, nil
+	}
+	return err != nil, err
 }

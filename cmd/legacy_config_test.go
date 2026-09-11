@@ -50,6 +50,8 @@ func TestLegacyWarningPolicy(t *testing.T) {
 				}
 			}
 			root := newRootCmd()
+			// Test the read-only warning independently of operational auto-migration.
+			root.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error { return warnLegacyConfiguration(cmd) }
 			initRootFlags(root)
 			registerCommands(root)
 			leaf, _, err := root.Find(tc.args)
@@ -96,7 +98,7 @@ func TestInitReportsV2CredentialPolicy(t *testing.T) {
 	if err := root.Execute(); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"none", "pass", "helper", "system", "doctor"} {
+	for _, want := range []string{"encrypted-file", "key-file", "pass", "helper", "system"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("initialization omitted credential guidance %q", want)
 		}

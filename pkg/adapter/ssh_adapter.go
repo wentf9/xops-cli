@@ -59,8 +59,8 @@ func WithNonInteractive(nonInteractive bool) Option {
 }
 
 // WithCredentialRecording controls persistence of secrets discovered during a
-// connection. Interactive UIs use false and persist only through their
-// explicit credential form actions.
+// connection. Composition roots apply remember policy and terminal ownership;
+// explicit credential form actions use the service independently.
 func WithCredentialRecording(enabled bool) Option {
 	return func(a *SSHAdapter) {
 		a.credentialRecording = enabled
@@ -336,6 +336,24 @@ func (a *SSHAdapter) UpdateSudo(ctx context.Context, nodeID, sudoUpdateToken str
 		// 显式指定 session-only 覆盖，不写回持久化配置
 		return sudoUpdateToken, nil
 	}
+	return a.updateRecordedSudo(ctx, nodeID, sudoUpdateToken, mode, suPwd)
+}
+
+func (a *SSHAdapter) updateRecordedSudo(ctx context.Context, nodeID, sudoUpdateToken string, mode ssh.SudoMode, suPwd string) (string, error) {
+	if mode == ssh.SudoModeSudo {
+		snapshot, err := a.cfgProvider.ResolveConnection(nodeID)
+		if err != nil {
+			return "", fmt.Errorf("resolve privilege binding: %w", err)
+		}
+		if snapshot.Node.SudoMode != models.SudoModeSudo && snapshot.Node.PrivilegePasswordRef != nil {
+			// Auto detection must not reinterpret an existing su reference as
+			// a sudo password or overwrite it with a different credential kind.
+			if suPwd == "" {
+				return sudoUpdateToken, nil
+			}
+			return "", fmt.Errorf("existing privilege reference is not bound to sudo")
+		}
+	}
 	if a.credentialService != nil && suPwd != "" {
 		snapshot, err := a.cfgProvider.ResolveConnection(nodeID)
 		if err != nil {
@@ -412,6 +430,13 @@ func (a *SSHAdapter) ResolveSecret(ctx context.Context, req ssh.SecretRequest) (
 		return a.resolveLoginPassword(ctx, snapshot, hasOverride, override)
 	case ssh.SecretKindPrivateKeyPassphrase:
 		return a.resolvePassphrase(ctx, snapshot, hasOverride, override)
+	case ssh.SecretKindSudoPassword:
+		// Legacy SuPwd belongs to su and must never be tried as a sudo login
+		// password. Only an explicit override or a sudo-bound v2 ref qualifies.
+		if (hasOverride && override.SuPwd != "") || (snapshot.Node.SudoMode == models.SudoModeSudo && snapshot.Node.PrivilegePasswordRef != nil) {
+			return a.resolveSuPassword(ctx, snapshot, hasOverride, override)
+		}
+		return nil, ssh.ErrInteractionRequired
 	case ssh.SecretKindSuPassword:
 		return a.resolveSuPassword(ctx, snapshot, hasOverride, override)
 	default:
@@ -505,7 +530,7 @@ func validateSecretRequestSnapshot(snapshot config.ConnectionSnapshot, req ssh.S
 			switch req.Kind {
 			case ssh.SecretKindLoginPassword, ssh.SecretKindPrivateKeyPassphrase:
 				currentVersion = string(snapshot.UpdateRef.AuthVersion[:])
-			case ssh.SecretKindSuPassword:
+			case ssh.SecretKindSuPassword, ssh.SecretKindSudoPassword:
 				currentVersion = string(snapshot.UpdateRef.SudoVersion[:])
 			}
 		}

@@ -48,6 +48,9 @@ func decodeMigrationLegacy(data []byte) (*Configuration, error) {
 	cfg := cloneConfiguration(nil)
 	cfg.SchemaVersion = dto.SchemaVersion
 	cfg.Credential = dto.Credential
+	if cfg.Credential == nil {
+		cfg.Credential = DefaultCredentialConfig()
+	}
 	cfg.Guardrail = dto.Guardrail
 	cfg.PasswordPromptPattern = dto.PasswordPromptPattern
 	for name, id := range dto.Identities {
@@ -264,6 +267,13 @@ func (m *CredentialMigrator) transferSecrets(ctx context.Context, registry *cred
 	store, err := registry.GetStore(state.Store)
 	if err != nil {
 		return err
+	}
+	// Resumption checks read the target before writing. Prepare an empty offline
+	// destination only in this mutation path, never during migration dry-run.
+	if backend, ok := store.(*encryptedBackend); ok && len(state.Entries) != 0 {
+		if err := backend.prepareWrite(ctx); err != nil {
+			return err
+		}
 	}
 	for i, entry := range state.Entries {
 		if err := ctx.Err(); err != nil {

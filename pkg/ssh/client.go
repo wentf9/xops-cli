@@ -46,7 +46,7 @@ func (r *compatSecretResolver) ResolveSecret(ctx context.Context, req SecretRequ
 		}
 	}
 	switch req.Kind {
-	case SecretKindLoginPassword:
+	case SecretKindLoginPassword, SecretKindSudoPassword:
 		if r.password != "" {
 			return []byte(r.password), nil
 		}
@@ -458,7 +458,8 @@ func (c *Client) ShellWithIO(ctx context.Context, streams InteractiveIO) (retErr
 
 	derivedCtx, cancelResize := context.WithCancel(ctx)
 	defer cancelResize()
-	startWindowResizeLoop(derivedCtx, session, fdOut, width, height, c.getLogger())
+	stopResize := startWindowResizeLoop(derivedCtx, session, fdOut, width, height, c.getLogger(), c.Interrupt)
+	defer func() { retErr = errors.Join(retErr, stopResize()) }()
 	waitOutput := copySessionOutput(stdout, stderr, streams.Stdout, streams.Stderr)
 
 	done := make(chan struct{})
@@ -563,7 +564,8 @@ func (c *Client) RunInteractiveCmdWithIO(ctx context.Context, cmd string, stream
 
 	derivedCtx, cancelResize := context.WithCancel(ctx)
 	defer cancelResize()
-	startWindowResizeLoop(derivedCtx, session, fdOut, width, height, c.getLogger())
+	stopResize := startWindowResizeLoop(derivedCtx, session, fdOut, width, height, c.getLogger(), c.Interrupt)
+	defer func() { retErr = errors.Join(retErr, stopResize()) }()
 
 	waitOutput := copySessionOutput(stdout, stderr, streams.Stdout, streams.Stderr)
 
@@ -619,7 +621,7 @@ func (c *Client) recordPrivilegeSecret(ctx context.Context, kind SecretKind, con
 				return err
 			}
 		}
-	case SecretKindSuPassword:
+	case SecretKindSuPassword, SecretKindSudoPassword:
 		oldToken := connCfg.SudoUpdateToken
 		if oldToken != "" {
 			committedToken, recErr := c.recorder.UpdateSudo(ctx, connCfg.NodeID, oldToken, connCfg.SudoMode, pwd)
@@ -634,7 +636,7 @@ func (c *Client) recordPrivilegeSecret(ctx context.Context, kind SecretKind, con
 	return nil
 }
 
-func (c *Client) resolvePrivilegeMaterial(ctx context.Context, kind SecretKind) (*PrivilegeMaterial, error) {
+func (c *Client) resolvePrivilegeMaterial(ctx context.Context, kind SecretKind, forcePrompt ...bool) (*PrivilegeMaterial, error) {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -647,7 +649,7 @@ func (c *Client) resolvePrivilegeMaterial(ctx context.Context, kind SecretKind) 
 	switch kind {
 	case SecretKindLoginPassword, SecretKindPrivateKeyPassphrase:
 		versionToken = connCfg.AuthUpdateToken
-	case SecretKindSuPassword:
+	case SecretKindSuPassword, SecretKindSudoPassword:
 		versionToken = connCfg.SudoUpdateToken
 	}
 
@@ -666,8 +668,9 @@ func (c *Client) resolvePrivilegeMaterial(ctx context.Context, kind SecretKind) 
 	defer cancelResolve()
 
 	// 1. 优先尝试 SecretResolver 解析
-	if c.resolver != nil {
-		secretBytes, err := c.resolver.ResolveSecret(resolveCtx, req)
+	promptOnly := len(forcePrompt) > 0 && forcePrompt[0]
+	if c.resolver != nil && !promptOnly {
+		secretBytes, err := c.resolvePrivilegeCandidate(resolveCtx, req, connCfg.AuthUpdateToken)
 		if len(secretBytes) > 0 {
 			// [P2] 立即安排原始切片在函数退出时清零，覆盖成功、错误与交互回退等所有路径
 			defer zeroBytes(secretBytes)
@@ -677,7 +680,7 @@ func (c *Client) resolvePrivilegeMaterial(ctx context.Context, kind SecretKind) 
 			copy(matBytes, secretBytes)
 			return &PrivilegeMaterial{Password: matBytes}, nil
 		}
-		if err != nil && !errors.Is(err, ErrInteractionRequired) {
+		if err != nil && !errors.Is(err, ErrInteractionRequired) && !reportCredentialFailure(ctx, c.prompter, "read", err) {
 			// [P1] 后端故障直接终止并保留错误链
 			return nil, fmt.Errorf("resolve privilege secret failed: %w", err)
 		}
@@ -697,15 +700,17 @@ func (c *Client) resolvePrivilegeMaterial(ctx context.Context, kind SecretKind) 
 		return nil, fmt.Errorf("prompt privilege secret failed: %w", err)
 	}
 
-	pwdBytes := []byte(pwd)
-
-	// [P1] 区分凭据种类和写回接口，并传播写回失败
-	if err := c.recordPrivilegeSecret(ctx, kind, connCfg, pwd); err != nil {
-		zeroBytes(pwdBytes)
-		return nil, err
+	if kind == SecretKindSudoPassword {
+		connCfg.SudoMode = SudoModeSudo
 	}
-
-	return &PrivilegeMaterial{Password: pwdBytes}, nil
+	if kind == SecretKindSuPassword {
+		connCfg.SudoMode = SudoModeSu
+	}
+	material := &PrivilegeMaterial{Password: []byte(pwd)}
+	material.confirmedSave = func(work context.Context, value []byte) error {
+		return c.recordPrivilegeSecret(work, kind, connCfg, string(value))
+	}
+	return material, nil
 }
 
 func (c *Client) maybeDetectSudoMode(ctx context.Context) error {
@@ -750,11 +755,12 @@ func (c *Client) maybeDetectSudoMode(ctx context.Context) error {
 	}
 
 	// 3. 测试密码 sudo 是否真正可用（按命令解析登录密码，使用完毕立即清零）
-	priv, err := c.resolvePrivilegeMaterial(ctx, SecretKindLoginPassword)
+	priv, err := c.resolvePrivilegeMaterial(ctx, SecretKindSudoPassword)
 	if err == nil {
 		defer priv.Zero()
-		if _, testErr := c.runWithSudo(ctx, "true", priv.Password, nil, nil); testErr == nil {
-			return c.updateSudoMode(ctx, SudoModeSudo)
+		priv.deferSave = true
+		if _, testErr := c.runWithSudo(ctx, "true", priv.Password, nil, nil, priv); testErr == nil {
+			return c.confirmDetectedSudo(ctx, priv)
 		} else if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
@@ -763,6 +769,16 @@ func (c *Client) maybeDetectSudoMode(ctx context.Context) error {
 		if !errors.Is(err, ErrInteractionRequired) {
 			return fmt.Errorf("resolve login password for sudo probe failed: %w", err)
 		}
+	}
+
+	if credentialRecoveryPrompter(c.prompter) != nil {
+		// Do not prompt for a su candidate merely to detect its presence and
+		// discard it. The actual operation obtains and verifies it once. This
+		// unverified mode choice stays local to the connection.
+		c.cfgMu.Lock()
+		c.connCfg.SudoMode = SudoModeSu
+		c.cfgMu.Unlock()
+		return nil
 	}
 
 	// 4. 检查是否有 su 密码（按命令解析 su 密码，使用完毕立即清零）
@@ -863,13 +879,16 @@ func (c *Client) refreshConnectionTokens(kind tokenRefreshKind, committedToken s
 	return nil
 }
 
-func (c *Client) startWithTimeout(ctx context.Context, session *ssh.Session, command string, config *RunConfig) (string, error) {
+func (c *Client) startWithTimeout(ctx context.Context, session *ssh.Session, command string, config *RunConfig, stderrWrappers ...func(io.Writer) io.Writer) (string, error) {
 	if config == nil {
 		config = DefaultRunConfig()
 	}
 	syncWriter := newOutputWriter(config)
 	session.Stdout = syncWriter
 	session.Stderr = syncWriter
+	for _, wrap := range stderrWrappers {
+		session.Stderr = wrap(session.Stderr)
+	}
 
 	if err := session.Start(command); err != nil {
 		return "", fmt.Errorf("failed to start command: %w", err)
@@ -881,13 +900,16 @@ func (c *Client) startWithTimeout(ctx context.Context, session *ssh.Session, com
 
 	select {
 	case err := <-done:
+		err = errors.Join(err, flushPrivilegePrompt(session.Stderr))
 		output := syncWriter.String()
 		if err != nil {
 			return output, fmt.Errorf("failed to run command: %w, output: %s", err, output)
 		}
 		return output, nil
 	case <-ctx.Done():
-		return syncWriter.String(), c.closeCanceledSession(ctx, session, done)
+		closeErr := c.closeCanceledSession(ctx, session, done)
+		flushErr := flushPrivilegePrompt(session.Stderr)
+		return syncWriter.String(), errors.Join(closeErr, flushErr)
 	}
 }
 

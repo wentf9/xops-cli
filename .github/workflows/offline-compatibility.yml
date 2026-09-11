@@ -7,6 +7,9 @@ on:
     paths:
       - '.gitattributes'
       - 'pkg/ssh/**'
+      - 'pkg/config/**'
+      - 'pkg/credential/**'
+      - 'pkg/credentialhelper/**'
       - 'go.mod'
       - 'go.sum'
       - 'cmd/credential*.go'
@@ -67,3 +70,5 @@ jobs:
         run: go run ./scripts/offline-platform-verify
       - name: Native operations and process-crash recovery
         run: go test ${{ env.RACE_FLAGS }} -parallel 2 -count=1 -tags=integration ./internal/credentialfile/...
+      - name: Native backend migration with offline key-file reuse
+        run: go test ${{ env.RACE_FLAGS }} -parallel 2 -count=1 -tags=integration ./pkg/config -run TestBackendMigrationOfflineRoundTrip

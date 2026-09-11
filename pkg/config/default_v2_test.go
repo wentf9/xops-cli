@@ -18,7 +18,7 @@ func TestNewInstallationDefaultsToV2(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.SchemaVersion != 2 || cfg.Credential == nil || cfg.Credential.DefaultStore != "none" || cfg.Credential.RememberPrompted != "ask" || cfg.Credential.Stores["none"].Type != StoreTypeNone {
+	if cfg.SchemaVersion != 2 || cfg.Credential == nil || cfg.Credential.DefaultStore != "file" || cfg.Credential.RememberPrompted != "always" || cfg.Credential.Stores["file"].Type != StoreTypeEncryptedFile {
 		t.Fatal("missing v2 new-install defaults")
 	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {

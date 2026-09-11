@@ -1,9 +1,11 @@
 package ssh
 
 import (
+	"bufio"
 	"bytes"
-	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -12,47 +14,15 @@ import (
 	cryptoSSH "golang.org/x/crypto/ssh"
 )
 
-func TestGetSudoParams(t *testing.T) {
-	tests := []struct {
-		name        string
-		mode        SudoMode
-		password    string
-		suPwd       string
-		expectedCmd string
-		expectedPwd string
-	}{
-		{"sudo mode", SudoModeSudo, "mypass", "", "sudo -i", "mypass"},
-		{"sudoer mode", SudoModeSudoer, "mypass", "", "sudo -i", ""},
-		{"su mode", SudoModeSu, "", "rootpass", "su -", "rootpass"},
-		{"root mode", SudoModeRoot, "", "", "", ""},
-		{"invalid mode", SudoMode("unknown"), "", "", "", ""},
-		{"empty mode", SudoModeNone, "", "", "", ""},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c := newClient(nil, nil, &ClientConfig{
-				SudoMode: tt.mode,
-				SuPwd:    tt.suPwd,
-				Password: tt.password,
-			}, nil, "")
-
-			cmd, priv, err := c.resolveSudoParams(context.Background())
-			if err != nil {
-				t.Fatalf("resolveSudoParams failed: %v", err)
-			}
-			var pwd string
-			if priv != nil {
-				defer priv.Zero()
-				pwd = string(priv.Password)
-			}
-			if cmd != tt.expectedCmd {
-				t.Errorf("expected cmd %q, got %q", tt.expectedCmd, cmd)
-			}
-			if pwd != tt.expectedPwd {
-				t.Errorf("expected pwd %q, got %q", tt.expectedPwd, pwd)
-			}
-		})
+func TestInteractivePrivilegeRejectsUnsupportedModes(t *testing.T) {
+	for _, mode := range []SudoMode{SudoModeNone, "unknown"} {
+		client := newClient(nil, nil, &ClientConfig{SudoMode: mode}, nil, "")
+		if err := client.RunInteractiveWithSudoIO(t.Context(), "command", InteractiveIO{}); err == nil {
+			t.Fatal("unsupported interactive command mode accepted")
+		}
+		if err := client.ShellWithSudoIO(t.Context(), InteractiveIO{}); err == nil {
+			t.Fatal("unsupported interactive shell mode accepted")
+		}
 	}
 }
 
@@ -144,27 +114,24 @@ func handleMockSSHSession(channel cryptoSSH.Channel, requests <-chan *cryptoSSH.
 			}
 			_ = req.Reply(true, nil)
 
-			readDone := make(chan struct{})
-			go func() {
-				var buf bytes.Buffer
-				stdinBuf := make([]byte, 1024)
-				for {
-					n, err := channel.Read(stdinBuf)
-					if n > 0 {
-						buf.Write(stdinBuf[:n])
-					}
-					if err != nil {
-						rec.stdinEOF = true
-						break
-					}
-				}
-				rec.stdin = buf.String()
-				close(readDone)
-			}()
-			select {
-			case <-readDone:
-			case <-time.After(2 * time.Second):
+			type readResult struct {
+				text string
+				err  error
 			}
+			readDone := make(chan readResult, 1)
+			go func() { text, err := readMockPrivilegeInput(channel, rec.cmd); readDone <- readResult{text, err} }()
+			var result readResult
+			select {
+			case result = <-readDone:
+			case <-time.After(2 * time.Second):
+				closeErr := channel.Close()
+				result = <-readDone
+				if closeErr != nil && !errors.Is(closeErr, io.EOF) {
+					result.err = errors.Join(result.err, closeErr)
+				}
+			}
+			rec.stdin, rec.stdinEOF = result.text, result.err == nil
+
 			recordedCh <- rec
 
 			_, _ = channel.Write([]byte("mock_output\n"))
@@ -284,9 +251,8 @@ func TestRunCommandWithIO_MockServer(t *testing.T) {
 			t.Fatalf("RunCommandWithIO failed: %v", err)
 		}
 		rec := <-recordedCh
-		expectedCmd := "sudo -S -p '' bash -c 'ls /root'"
-		if rec.cmd != expectedCmd {
-			t.Errorf("expected command %q, got %q", expectedCmd, rec.cmd)
+		if !strings.HasPrefix(rec.cmd, "sudo -S -p ") || protocolToken(rec.cmd, "[xops-ready-") == "" || !strings.Contains(rec.cmd, "ls /root") {
+			t.Fatalf("missing gated sudo command: %q", rec.cmd)
 		}
 		if !strings.HasPrefix(rec.stdin, "secret_password\n") {
 			t.Errorf("expected stdin to start with password, got %q", rec.stdin)
@@ -323,9 +289,8 @@ func TestRunCommandWithIO_MockServer(t *testing.T) {
 			t.Fatalf("RunCommandWithIO failed: %v", err)
 		}
 		rec := <-recordedCh
-		expectedCmd := "export LC_ALL=C; su - root -c 'cat /etc/shadow'"
-		if rec.cmd != expectedCmd {
-			t.Errorf("expected command %q, got %q", expectedCmd, rec.cmd)
+		if !strings.HasPrefix(rec.cmd, "export LC_ALL=C; su - root -c ") || protocolToken(rec.cmd, "[xops-ready-") == "" || !strings.Contains(rec.cmd, "cat /etc/shadow") {
+			t.Fatalf("missing gated su command: %q", rec.cmd)
 		}
 		expectedStdin := "root_password\nuser_payload\n"
 		if rec.stdin != expectedStdin {
@@ -335,4 +300,35 @@ func TestRunCommandWithIO_MockServer(t *testing.T) {
 			t.Error("expected su stdin EOF")
 		}
 	})
+}
+
+func readMockPrivilegeInput(channel cryptoSSH.Channel, command string) (string, error) {
+	reader := bufio.NewReader(channel)
+	prefix := ""
+	if ready := protocolToken(command, "[xops-ready-"); ready != "" {
+		prompt := protocolToken(command, "[xops-password-")
+		if strings.Contains(command, "su - root") {
+			prompt = "Password: "
+		}
+		if _, err := io.WriteString(channel.Stderr(), prompt); err != nil {
+			return "", err
+		}
+		value, err := reader.ReadString('\n')
+		if err != nil {
+			return value, err
+		}
+		prefix = value
+		if _, err := io.WriteString(channel.Stderr(), ready); err != nil {
+			return prefix, err
+		}
+		ack, err := reader.ReadString('\n')
+		if err != nil {
+			return prefix, err
+		}
+		if strings.TrimSpace(ack) != protocolToken(command, "[xops-continue-") {
+			return prefix, errors.New("invalid readiness acknowledgement")
+		}
+	}
+	data, err := io.ReadAll(reader)
+	return prefix + string(data), err
 }

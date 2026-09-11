@@ -20,6 +20,7 @@ type cliInteractionHandler struct {
 	canRemember bool
 	promptGate  chan struct{}
 	terminal    terminal.Prompter
+	output      io.Writer
 }
 
 var _ ssh.InteractionHandler = (*cliInteractionHandler)(nil)
@@ -32,6 +33,7 @@ func newCLIInteractionHandler() *cliInteractionHandler {
 		canRemember: term.IsTerminal(int(os.Stdin.Fd())),
 		promptGate:  gate,
 		terminal:    terminal.NewPrompter(os.Stdin, os.Stderr),
+		output:      os.Stderr,
 	}
 }
 
@@ -42,6 +44,7 @@ func newCLIInteractionHandlerWithStreams(stdin io.Reader, stdout io.Writer) *cli
 		canRemember: true,
 		promptGate:  gate,
 		terminal:    terminal.NewPrompter(stdin, stdout),
+		output:      stdout,
 	}
 }
 
@@ -145,6 +148,12 @@ func formatSecretPrompt(req ssh.SecretRequest) string {
 			return text
 		}
 		return fmt.Sprintf("Enter passphrase for key '%s': ", req.KeyPath)
+	case ssh.SecretKindSudoPassword:
+		text := i18n.Tf("prompt_remote_sudo_password", map[string]any{"Node": req.NodeID})
+		if text != "prompt_remote_sudo_password" {
+			return text
+		}
+		return fmt.Sprintf("Enter sudo password for %s: ", req.NodeID)
 	case ssh.SecretKindSuPassword:
 		text := i18n.Tf("prompt_su_password", map[string]any{"Node": req.NodeID})
 		if text != "prompt_su_password" {
@@ -203,3 +212,24 @@ func (h *cliInteractionHandler) Password(ctx context.Context, id string) ([]byte
 	}
 	return []byte(value), nil
 }
+
+// ReportCredentialFailure keeps operational notices out of protocol stdout.
+func (h *cliInteractionHandler) ReportCredentialFailure(ctx context.Context, operation string) error {
+	if h == nil || !h.canRemember || h.output == nil {
+		return ssh.ErrInteractionRequired
+	}
+	release, err := h.acquireGate(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	key := "credential_read_retry"
+	if operation == "save" {
+		key = "credential_save_failed_connected"
+	}
+	_, err = fmt.Fprintln(h.output, i18n.T(key))
+	return err
+}
+
+// CredentialRecoveryAllowed requires an actual interactive input capability.
+func (h *cliInteractionHandler) CredentialRecoveryAllowed() bool { return h != nil && h.canRemember }

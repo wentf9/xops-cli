@@ -2,6 +2,7 @@ package ssh
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -87,6 +88,7 @@ type autoSecretProvider struct {
 	handshakeTimeout   time.Duration
 	interactionTimeout time.Duration
 	failClosed         func(error)
+	recoveryPrompter   SecretPrompter
 
 	mu          sync.RWMutex
 	terminalErr error
@@ -111,6 +113,10 @@ func (p *autoSecretProvider) terminalError() error {
 }
 
 func (p *autoSecretProvider) resolveOrPrompt(req SecretRequest) (string, error) {
+	return p.resolveOrPromptAttempt(req, false)
+}
+
+func (p *autoSecretProvider) resolveOrPromptAttempt(req SecretRequest, retry bool) (string, error) {
 	p.mu.RLock()
 	if p.terminalErr != nil {
 		termErr := p.terminalErr
@@ -126,7 +132,7 @@ func (p *autoSecretProvider) resolveOrPrompt(req SecretRequest) (string, error) 
 	req.VersionToken = p.versionToken
 
 	// 1. 若注入了 resolver，优先使用 resolver 解析
-	if p.resolver != nil {
+	if p.resolver != nil && !retry {
 		timeout := p.handshakeTimeout
 		if timeout <= 0 {
 			timeout = defaultSSHHandshakeTimeout
@@ -145,7 +151,7 @@ func (p *autoSecretProvider) resolveOrPrompt(req SecretRequest) (string, error) 
 		if err == nil && len(secret) > 0 {
 			return string(secret), nil
 		}
-		if err != nil && !errors.Is(err, ErrInteractionRequired) {
+		if err != nil && !errors.Is(err, ErrInteractionRequired) && !reportCredentialFailure(baseCtx, p.recoveryPrompter, "read", err) {
 			// 严格传播后端故障！标记整个认证流程终止并触发 FailClosed，禁止任何后续认证方法和交互！
 			p.markTerminalError(err)
 			return "", fmt.Errorf("resolve secret failed: %w", err)
@@ -177,6 +183,9 @@ func (p *autoSecretProvider) resolveOrPrompt(req SecretRequest) (string, error) 
 
 	val, err := p.prompter.PromptSecret(promptCtx, req)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			p.markTerminalError(err)
+		}
 		return "", fmt.Errorf("prompt secret failed: %w", err)
 	}
 	return val, nil
@@ -226,38 +235,18 @@ func (s *lazySigner) getDecryptedSigner() (ssh.Signer, error) {
 	}
 	s.mu.RUnlock()
 
-	var passphrase string
-	var err error
-	if s.secProvider != nil {
-		passphrase, err = s.secProvider.resolveOrPrompt(SecretRequest{
-			Kind:    SecretKindPrivateKeyPassphrase,
-			KeyPath: s.keyPath,
-		})
-	} else if s.prompter != nil {
-		passphrase, err = s.prompter.PromptSecret(context.Background(), SecretRequest{
-			Kind:    SecretKindPrivateKeyPassphrase,
-			KeyPath: s.keyPath,
-		})
-	} else {
-		return nil, ErrInteractionRequired
+	provider := s.secProvider
+	if provider == nil {
+		provider = &autoSecretProvider{prompter: s.prompter}
 	}
+	decSigner, passphrase, err := provider.decryptPrivateKey(s.keyData, s.keyPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read passphrase: %w", err)
+		return nil, err
 	}
-
-	passBytes := []byte(passphrase)
-	defer zeroBytes(passBytes)
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// 双重检查，防止在等待用户输入期间其他协程已经解密成功
 	if s.decryptedSigner != nil {
 		return s.decryptedSigner, nil
-	}
-
-	decSigner, err := ssh.ParsePrivateKeyWithPassphrase(s.keyData, passBytes)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse private key with passphrase: %w", err)
 	}
 	s.decryptedSigner = decSigner
 
@@ -407,20 +396,9 @@ func resolveKeyAuthMethod(keyPath string, secProvider *autoSecretProvider, passp
 		keyDataCopy := keyData
 		keyPathCopy := keyPath
 		return ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
-			passphrase, resolveErr := secProvider.resolveOrPrompt(SecretRequest{
-				Kind:    SecretKindPrivateKeyPassphrase,
-				KeyPath: keyPathCopy,
-			})
-			if resolveErr != nil {
-				return nil, fmt.Errorf("failed to read passphrase: %w", resolveErr)
-			}
-
-			passBytes := []byte(passphrase)
-			defer zeroBytes(passBytes)
-
-			resolvedSigner, parseErr := ssh.ParsePrivateKeyWithPassphrase(keyDataCopy, passBytes)
+			resolvedSigner, passphrase, parseErr := secProvider.decryptPrivateKey(keyDataCopy, keyPathCopy)
 			if parseErr != nil {
-				return nil, fmt.Errorf("failed to parse private key with passphrase: %w", parseErr)
+				return nil, parseErr
 			}
 			if saveErr := savePublicKey(keyPathCopy, resolvedSigner.PublicKey()); saveErr != nil {
 				l.Debugf("save public key for %q failed: %v", keyPathCopy, saveErr)
@@ -448,6 +426,7 @@ type AutoAuthOptions struct {
 	HandshakeTimeout   time.Duration
 	InteractionTimeout time.Duration
 	FailClosed         func(error)
+	RecoveryPrompter   SecretPrompter
 	KeyPath            string
 	PasswordCallback   func(string)
 	PassphraseCallback func(keyPath, passphrase string)
@@ -537,6 +516,7 @@ func buildAutoAuthPlan(ctx context.Context, opts AutoAuthOptions) autoAuthPlan {
 		handshakeTimeout:   opts.HandshakeTimeout,
 		interactionTimeout: opts.InteractionTimeout,
 		failClosed:         opts.FailClosed,
+		recoveryPrompter:   opts.RecoveryPrompter,
 	}
 
 	var candidates []autoAuthCandidate
@@ -605,10 +585,13 @@ func buildAutoAuthPlan(ctx context.Context, opts AutoAuthOptions) autoAuthPlan {
 		addKey(path, "default key")
 	}
 
+	passwordAttempts := 0
 	passwordMethod := ssh.RetryableAuthMethod(ssh.PasswordCallback(func() (string, error) {
-		password, err := secProvider.resolveOrPrompt(SecretRequest{
+		retry := passwordAttempts > 0 && opts.RecoveryPrompter != nil
+		passwordAttempts++
+		password, err := secProvider.resolveOrPromptAttempt(SecretRequest{
 			Kind: SecretKindLoginPassword,
-		})
+		}, retry)
 		if err != nil {
 			return "", fmt.Errorf("failed to read password: %w", err)
 		}
@@ -629,4 +612,23 @@ func buildAutoAuthPlan(ctx context.Context, opts AutoAuthOptions) autoAuthPlan {
 		authCallback: newSequentialAuthCallback(candidates, secProvider, l),
 		cleanup:      cleanup,
 	}
+}
+
+func (p *autoSecretProvider) decryptPrivateKey(data []byte, path string) (ssh.Signer, string, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		passphrase, err := p.resolveOrPromptAttempt(SecretRequest{Kind: SecretKindPrivateKeyPassphrase, KeyPath: path}, attempt > 0)
+		if err != nil {
+			return nil, "", fmt.Errorf("read private key passphrase: %w", err)
+		}
+		material := []byte(passphrase)
+		signer, err := ssh.ParsePrivateKeyWithPassphrase(data, material)
+		zeroBytes(material)
+		if err == nil {
+			return signer, passphrase, nil
+		}
+		if p.recoveryPrompter == nil || !errors.Is(err, x509.IncorrectPasswordError) || attempt == 2 {
+			return nil, "", fmt.Errorf("decrypt private key: %w", err)
+		}
+	}
+	return nil, "", ErrInteractionRequired
 }

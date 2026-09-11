@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -112,7 +113,7 @@ func startLifetimeTestSSHServer(t *testing.T, expectedPassword string, expectedP
 }
 
 //nolint:gocyclo // Test helper managing mock SSH server lifecycle and channel events
-func startLifetimeTestSSHServerWithRecorder(t *testing.T, expectedPassword string, expectedPub ssh.PublicKey) *lifetimeSSHServer {
+func startLifetimeTestSSHServerWithRecorder(t *testing.T, expectedPassword string, expectedPub ssh.PublicKey, verifyPrivilege ...bool) *lifetimeSSHServer {
 	t.Helper()
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -232,7 +233,23 @@ func startLifetimeTestSSHServerWithRecorder(t *testing.T, expectedPassword strin
 								if strings.Contains(cmd, "su -") {
 									_, _ = channel.Write([]byte("Password: "))
 									buf := make([]byte, 128)
-									_, _ = channel.Read(buf)
+									n, readErr := channel.Read(buf)
+									if len(verifyPrivilege) > 0 && verifyPrivilege[0] && (readErr != nil || strings.TrimSpace(string(buf[:n])) != expectedPassword) {
+										if _, err := channel.SendRequest("exit-status", false, []byte{0, 0, 0, 1}); err != nil {
+											t.Error(err)
+										}
+										return
+									}
+									if ready := protocolToken(cmd, "[xops-ready-"); ready != "" {
+										if _, err := io.WriteString(channel.Stderr(), ready); err != nil {
+											t.Error(err)
+											return
+										}
+										if _, err := io.Copy(io.Discard, channel); err != nil {
+											t.Error(err)
+											return
+										}
+									}
 									_, _ = channel.Write([]byte("mock-su-success\n"))
 									_, _ = channel.SendRequest("exit-status", false, []byte{0, 0, 0, 0})
 									_ = channel.CloseWrite()
@@ -243,8 +260,33 @@ func startLifetimeTestSSHServerWithRecorder(t *testing.T, expectedPassword strin
 									_ = channel.CloseWrite()
 									return
 								} else if strings.Contains(cmd, "sudo") {
+									if (len(verifyPrivilege) > 0 && verifyPrivilege[0]) || protocolToken(cmd, "[xops-ready-") != "" {
+										if start := strings.Index(cmd, "[xops-password-"); start >= 0 {
+											end := strings.Index(cmd[start:], "]")
+											if _, err := io.WriteString(channel.Stderr(), cmd[start:start+end+1]); err != nil {
+												t.Error(err)
+												return
+											}
+										}
+									}
 									buf := make([]byte, 128)
-									_, _ = channel.Read(buf)
+									n, readErr := channel.Read(buf)
+									if len(verifyPrivilege) > 0 && verifyPrivilege[0] && (readErr != nil || strings.TrimSpace(string(buf[:n])) != expectedPassword) {
+										if _, err := channel.SendRequest("exit-status", false, []byte{0, 0, 0, 1}); err != nil {
+											t.Error(err)
+										}
+										return
+									}
+									if ready := protocolToken(cmd, "[xops-ready-"); ready != "" {
+										if _, err := io.WriteString(channel.Stderr(), ready); err != nil {
+											t.Error(err)
+											return
+										}
+										if _, err := io.Copy(io.Discard, channel); err != nil {
+											t.Error(err)
+											return
+										}
+									}
 									_, _ = channel.Write([]byte("mock-sudo-success\n"))
 									_, _ = channel.SendRequest("exit-status", false, []byte{0, 0, 0, 0})
 									_ = channel.CloseWrite()
@@ -921,7 +963,9 @@ func (p *probeSecretPrompter) PromptSecret(ctx context.Context, req SecretReques
 	return p.returnSecret, nil
 }
 
-// TestPlaintextLifetime_PromptSecret_DispatchesCorrectRecorderAndUpdate 验证提示取得凭据时区分写回接口且传播失败
+// TestPlaintextLifetime_PromptSecret_DispatchesCorrectRecorderAndUpdate verifies that
+// local input is not saved without a remote exchange; confirmed write failures
+// still propagate when no interactive recovery reporter is installed.
 func TestPlaintextLifetime_PromptSecret_DispatchesCorrectRecorderAndUpdate(t *testing.T) {
 	setTestHome(t)
 	t.Setenv("SSH_AUTH_SOCK", "")
@@ -930,7 +974,7 @@ func TestPlaintextLifetime_PromptSecret_DispatchesCorrectRecorderAndUpdate(t *te
 	host, port, cleanup := startLifetimeTestSSHServer(t, expectedPwd, nil)
 	defer cleanup()
 
-	// 1. 测试 sudo 模式提示登录密码：只调用 UpdateAuth，绝不调用 UpdateSudo
+	// 1. The server does not request a sudo password; no secret may be saved.
 	recorder := &testRecorder{}
 	provider := &trackingProvider{
 		cfg: &ClientConfig{
@@ -982,18 +1026,12 @@ func TestPlaintextLifetime_PromptSecret_DispatchesCorrectRecorderAndUpdate(t *te
 	lastAuthPass := recorder.lastAuthPass
 	recorder.mu.Unlock()
 
-	// 登录密码建连一次 + 提权一次，或建连已提示提权再次提示
-	if authCalls == 0 {
-		t.Errorf("expected UpdateAuth to be called for login password, got %d", authCalls)
-	}
-	if sudoCalls != 0 {
-		t.Errorf("expected UpdateSudo NOT to be called for login password, got %d", sudoCalls)
-	}
-	if lastAuthPass != expectedPwd {
-		t.Errorf("expected recorded password %q, got %q", expectedPwd, lastAuthPass)
+	// The protocol now observes the remote password exchange before saving.
+	if authCalls != 0 || sudoCalls != 1 || lastAuthPass != "" {
+		t.Fatal("verified sudo password did not use the independent recorder")
 	}
 
-	// 2. 测试写回失败时错误正确传播，且不继续
+	// 2. A write failure after verified su execution preserves the error chain.
 	failRecorder := &testRecorder{
 		sudoErr: errors.New("db writeback failed"),
 	}

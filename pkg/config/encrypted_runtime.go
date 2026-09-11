@@ -111,7 +111,23 @@ func (b *encryptedBackend) Get(ctx context.Context, ref credential.Ref) (credent
 	}
 	return s.Get(ctx, ref)
 }
+func (b *encryptedBackend) prepareWrite(ctx context.Context) error {
+	// EnsureInitialized takes the native vault lock and checks CURRENT/transactions before
+	// preparing a key. Existing stores must never generate replacement keys.
+	// Reads, probes, and read-only stores do not enter this initialization path.
+	if b.cfg.Unlock == "key-file" && !b.cfg.ReadOnly {
+		_, err := b.owner.vaults.EnsureInitialized(ctx, b.cfg.Path, b.id, credentialfile.Wrapping{Mode: "key-file", KeyFile: b.cfg.KeyFile})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (b *encryptedBackend) Put(ctx context.Context, ref credential.Ref, secret credential.Secret) error {
+	if err := b.prepareWrite(ctx); err != nil {
+		return err
+	}
 	s, err := b.open(ctx)
 	if err != nil {
 		return err

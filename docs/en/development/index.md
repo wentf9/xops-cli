@@ -20,3 +20,9 @@ Historical engineering records are grouped under `docs/development/archive/`. Th
 - [Credential implementation design](https://github.com/wentf9/xops-cli/blob/master/docs/development/archive/design/credential-persistence.md)
 
 Historical implementation records describe validation at the time; they do not imply current validation on every platform. See [Writing documentation](./docs) for contribution instructions.
+
+## Accepted design, pending implementation
+
+- [Zero-configuration credential design](./credential-experience-design)
+- [Credential experience implementation plan](./credential-experience-plan)
+- [Release-note draft](./credential-experience-release)

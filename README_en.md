@@ -23,7 +23,7 @@
 - 🛡️ **Advanced SSH & TUI**: Fully OpenSSH-compatible (JumpHosts, Tunnels, Agent Forwarding). Includes a **Terminal UI (TUI)** for interactive management and an automated `sudo` mode.
 - ⚡ **Batch Execution & Transfer**: Run commands or local scripts in parallel across multiple servers using tags. Effortless file distribution with built-in SCP/SFTP. The interactive SFTP shell detects disconnects, wakes the active prompt, exits automatically, and returns a non-zero status when the network drops. Each shell instance runs once; closing a shell cancels and waits for the active interaction before releasing prompt and SFTP resources.
 - 🔄 **Declarative Orchestration (Playbook)**: YAML-based task orchestration combining shell, script, copy, ensure (idempotent state convergence), and template steps, with concurrency control and error handling strategies.
-- 🗂️ **Inventory and Credentials**: Manage hosts, credentials (Identities), and tags. New installations default to Schema v2 credential references without creating an encryption key; legacy AES configurations support explicit migration. Supports bulk import/export via CSV.
+- 🗂️ **Inventory and Credentials**: Manage hosts, credentials (Identities), and tags. New installations use offline storage and Schema v2 references, preparing a key-file on first save; legacy AES configurations support automatic upgrades and explicit migration. Supports bulk import/export via CSV.
 - 🌐 **Network & Sec Tools**: Integrated DNS lookup, Ping, Netcat (nc), Base64/Hex encoding, and a unified **Firewall Manager** (supports firewalld, ufw, iptables, nftables).
 - 🌍 **Built-in i18n**: Native support for English and Simplified Chinese.
 
@@ -60,11 +60,11 @@ xops init --skip-ssh-import
 
 The command is idempotent and never overwrites existing nodes. Run `xops host list` to review the result.
 
-New installations use `credential.default_store: none` and `remember_prompted: ask`,
-keep passwords session-local, and do not create `secret.key`. On headless systems,
-explicitly configure `pass` or an external store (`type: helper`). On desktops,
-the `system` backend is configured and checked with `xops credential doctor`
-before being selected as the default. Doctor checks non-interactive reads, not write permissions;
+New installations use `credential.default_store: file` and `remember_prompted: always`,
+with the built-in offline store and key-file initialized on first save, without a legacy `secret.key`.
+Other backends require manual selection. `--remember never` or global `remember_prompted: never` disables saving and automatic migration.
+General backend migration is implemented; see the [migration guide](docs/en/guide/migration.md). Final platform validation remains pending.
+Doctor checks non-interactive reads, not write permissions;
 Linux system reads unlocked credentials directly through Secret Service without unlock prompts.
 See the [example configuration](xops_config.example.yaml).
 
@@ -74,8 +74,7 @@ Compatibility testing covers ext4, XFS, and Btrfs.
 The [v1 format and configuration/CLI contract are frozen](docs/development/archive/design/offline-encrypted-credential-store-v1-freeze.md); the release status is unpublished.
 
 Schema v1 remains supported for two official release cycles starting with the default
-switch release, with deprecation warnings on stderr. Legacy AES reads and writes remain
-during that window; follow the [migration guide](docs/development/archive/credential-migration.md) to migrate explicitly.
+switch release, with deprecation warnings on stderr. Eligible legacy configurations upgrade automatically during normal use and retain old material. Disabling automatic saving also disables automatic upgrades. See the [migration guide](docs/en/guide/migration.md) for explicit migration and backend switching.
 
 #### 2. Inventory & Tags
 

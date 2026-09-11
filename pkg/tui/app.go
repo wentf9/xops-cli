@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,33 +31,36 @@ const (
 )
 
 type Model struct {
-	vaultControl      func(context.Context, bool) error
-	ctx               context.Context
-	repository        *config.Repository
-	connector         *ssh.Connector
-	list              list.Model
-	form              *huh.Form
-	formState         *nodeFormState
-	tagForm           *huh.Form
-	monitor           monitorModel
-	logSelect         logSelectModel
-	logStreamer       logStreamerModel
-	logSessionID      int64
-	tagMode           string // "add" or "remove"
-	selectedTags      []string
-	newTagsInput      string // 新标签输入
-	listRevision      uint64
-	tagRevision       uint64
-	state             viewState
-	status            string
-	lastSize          tea.WindowSizeMsg
-	deletePending     bool
-	mutationPending   bool
-	mutation          *configurationMutation
-	lifecycleCancel   context.CancelFunc
-	statusGeneration  uint64
-	formConflict      bool
-	credentialService *credential.Service
+	terminalConnection *terminalConnection
+	terminalContext    context.Context
+	connectionConfig   modelConfig
+	vaultControl       func(context.Context, bool) error
+	ctx                context.Context
+	repository         *config.Repository
+	connector          *ssh.Connector
+	list               list.Model
+	form               *huh.Form
+	formState          *nodeFormState
+	tagForm            *huh.Form
+	monitor            monitorModel
+	logSelect          logSelectModel
+	logStreamer        logStreamerModel
+	logSessionID       int64
+	tagMode            string // "add" or "remove"
+	selectedTags       []string
+	newTagsInput       string // 新标签输入
+	listRevision       uint64
+	tagRevision        uint64
+	state              viewState
+	status             string
+	lastSize           tea.WindowSizeMsg
+	deletePending      bool
+	mutationPending    bool
+	mutation           *configurationMutation
+	lifecycleCancel    context.CancelFunc
+	statusGeneration   uint64
+	formConflict       bool
+	credentialService  *credential.Service
 }
 
 const configMutationTimeout = 10 * time.Second
@@ -149,22 +153,32 @@ func (m *configurationMutation) close() error {
 type ModelOption func(*modelConfig)
 
 type modelConfig struct {
-	vaultControl         func(context.Context, bool) error
-	rememberConfirmation func(context.Context, string) (bool, error)
-	logger               logger.DebugLogger
-	ctx                  context.Context
-	interaction          ssh.InteractionHandler
-	credentialService    *credential.Service
-	credentialRegistry   *credential.Registry
+	rememberPolicy         string
+	persistenceUnavailable bool
+	vaultControl           func(context.Context, bool) error
+	rememberConfirmation   func(context.Context, string) (bool, error)
+	logger                 logger.DebugLogger
+	ctx                    context.Context
+	interaction            ssh.InteractionHandler
+	credentialService      *credential.Service
+	credentialRegistry     *credential.Registry
+}
+
+// WithRememberPolicy overrides automatic recording for this TUI invocation.
+// Explicit credential form edits remain available under never.
+func WithRememberPolicy(policy string) ModelOption {
+	return func(cfg *modelConfig) { cfg.rememberPolicy = policy }
 }
 
 // WithRememberConfirmation supplies the UI decision for remember_prompted: ask.
-// Without a confirmer, ask remains session-only.
+// Without a confirmer, ask remains session-only. The callback runs with the
+// terminal released and must respect context cancellation.
 func WithRememberConfirmation(confirm func(context.Context, string) (bool, error)) ModelOption {
 	return func(cfg *modelConfig) { cfg.rememberConfirmation = confirm }
 }
 
-// WithInteractionHandler injects presentation-owned SSH prompts into the TUI.
+// WithInteractionHandler injects SSH prompts run while Bubble Tea has released
+// its terminal. Handlers must not wait on the paused TUI event loop.
 func WithInteractionHandler(interaction ssh.InteractionHandler) ModelOption {
 	return func(cfg *modelConfig) {
 		cfg.interaction = interaction
@@ -196,6 +210,12 @@ func WithCredentialService(svc *credential.Service) ModelOption {
 	}
 }
 
+// WithCredentialPersistenceUnavailable keeps connections usable when the CLI
+// cannot initialize automatic saving. Explicit credential edits still fail.
+func WithCredentialPersistenceUnavailable(unavailable bool) ModelOption {
+	return func(cfg *modelConfig) { cfg.persistenceUnavailable = unavailable }
+}
+
 // WithCredentialRegistry injects the credential registry used to resolve stored secrets for SSH.
 func WithCredentialRegistry(reg *credential.Registry) ModelOption {
 	return func(cfg *modelConfig) {
@@ -215,20 +235,18 @@ func NewModel(repository *config.Repository, opts ...ModelOption) (Model, error)
 			opt(&cfg)
 		}
 	}
-	var connOpts []ssh.Option
-	if cfg.logger != nil {
-		connOpts = append(connOpts, ssh.WithLogger(cfg.logger))
+	policy := tuiRememberPolicy(repository.Snapshot(), cfg)
+	if policy != "always" && policy != "ask" && policy != "never" {
+		return Model{}, fmt.Errorf("invalid TUI remember policy %q", policy)
 	}
-	if cfg.interaction != nil {
-		connOpts = append(connOpts, ssh.WithInteractionHandler(cfg.interaction))
-	}
-	adpOpts := credentialAdapterOptions(repository, cfg)
-	connector := adapter.NewConnectorWithAdapterOptions(repository, adpOpts, connOpts...)
+	connector, _ := newTerminalConnector(repository, cfg)
 	view := repository.View()
 	lifecycleCtx, lifecycleCancel := context.WithCancel(cfg.ctx)
 	m := Model{
+		terminalContext:   lifecycleCtx,
+		connectionConfig:  cfg,
 		vaultControl:      cfg.vaultControl,
-		ctx:               lifecycleCtx,
+		ctx:               credential.WithoutInteraction(lifecycleCtx),
 		lifecycleCancel:   lifecycleCancel,
 		repository:        repository,
 		credentialService: cfg.credentialService,
@@ -237,6 +255,9 @@ func NewModel(repository *config.Repository, opts ...ModelOption) (Model, error)
 		listRevision:      view.Revision,
 	}
 	m.list = newListModelFromView(view)
+	if automaticSavingUnavailable(repository, cfg) {
+		m.status = i18n.T("tui_credential_saving_unavailable")
+	}
 	return m, nil
 }
 
@@ -352,6 +373,11 @@ func (m *Model) Close() error {
 	if m.lifecycleCancel != nil {
 		m.lifecycleCancel()
 	}
+	if m.terminalConnection != nil {
+		if err := m.terminalConnection.Close(); err != nil {
+			closeErrs = append(closeErrs, fmt.Errorf("close terminal connection: %w", err))
+		}
+	}
 	if m.mutation != nil {
 		if err := m.mutation.close(); err != nil {
 			closeErrs = append(closeErrs, fmt.Errorf("wait for configuration mutation: %w", err))
@@ -382,6 +408,8 @@ type tickMsg struct {
 // events and view dispatch.
 func (m *Model) handleAsyncMessage(msg tea.Msg) (bool, tea.Cmd) {
 	switch msg := msg.(type) {
+	case terminalConnectionResult:
+		return true, m.handleTerminalConnection(msg)
 	case monitorConnectedMsg:
 		if msg.err != nil {
 			m.status = errorStyle.Render(fmt.Sprintf("Connection failed: %v", msg.err))
@@ -389,6 +417,7 @@ func (m *Model) handleAsyncMessage(msg tea.Msg) (bool, tea.Cmd) {
 		}
 		m.status = ""
 		m.monitor = newMonitorModel(m.ctx, msg.nodeID, msg.client)
+		m.monitor.width, m.monitor.height = m.lastSize.Width, m.lastSize.Height
 		m.state = viewMonitor
 		return true, m.monitor.Init()
 	case logScannerConnectedMsg:
@@ -428,20 +457,17 @@ func (m *Model) handleAsyncMessage(msg tea.Msg) (bool, tea.Cmd) {
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	if result, ok := msg.(vaultControlResult); ok {
-		m.status = "Vault action completed"
-		if result.err != nil {
-			m.status = "Vault action failed: " + result.err.Error()
+	if _, ok := msg.(tickMsg); ok && m.terminalConnection != nil {
+		return m, nil
+	}
+	if key, ok := msg.(tea.KeyMsg); ok && m.terminalConnection != nil {
+		if key.String() == "ctrl+c" {
+			return m, tea.Quit
 		}
 		return m, nil
 	}
-	if key, ok := msg.(tea.KeyMsg); ok && m.state == viewList && m.vaultControl != nil {
-		if key.String() == "ctrl+l" {
-			return m, m.vaultCommand(false)
-		}
-		if key.String() == "ctrl+u" {
-			return m, m.vaultCommand(true)
-		}
+	if handled, cmd := m.handleVaultMessage(msg); handled {
+		return m, cmd
 	}
 	if handled, cmd := m.handleAsyncMessage(msg); handled {
 		return m, cmd
@@ -580,15 +606,23 @@ func credentialAdapterOptions(repository *config.Repository, cfg modelConfig) []
 	if cfg.credentialService != nil {
 		adpOpts = append(adpOpts, adapter.WithCredentialService(cfg.credentialService))
 	}
-	policy := "ask"
 	snapshot := repository.Snapshot()
-	if snapshot.Credential != nil && snapshot.Credential.RememberPrompted != "" {
-		policy = snapshot.Credential.RememberPrompted
-	}
+	policy := tuiRememberPolicy(snapshot, cfg)
 	recording := snapshot.CanRememberCredentials() && cfg.credentialService != nil && (policy == "always" || (policy == "ask" && cfg.rememberConfirmation != nil))
 	adpOpts = append(adpOpts, adapter.WithCredentialRecording(recording))
 	if policy == "ask" {
 		adpOpts = append(adpOpts, adapter.WithRememberConfirmation(cfg.rememberConfirmation))
 	}
 	return adpOpts
+}
+
+func tuiRememberPolicy(snapshot *config.Configuration, cfg modelConfig) string {
+	policy := strings.ToLower(strings.TrimSpace(cfg.rememberPolicy))
+	if policy == "" && snapshot.Credential != nil {
+		policy = snapshot.Credential.RememberPrompted
+	}
+	if policy == "" {
+		return "ask"
+	}
+	return policy
 }
