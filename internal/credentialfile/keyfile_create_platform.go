@@ -123,7 +123,7 @@ func syncWrappingKeyFile(ctx context.Context, parent *os.File, name string, ops 
 	}
 	// Existing manual files and retries after a publication sync failure must be
 	// durable before any vault metadata is allowed to depend on their key.
-	if err := ops.step(ctx, "key-file:sync", func() error { return unix.SyncFile(file) }); err != nil {
+	if err := ops.step(ctx, "key-file:sync", func() error { return unix.SyncKeyFile(file) }); err != nil {
 		return err
 	}
 	return ops.step(ctx, "key-file:directory-sync", func() error { return unix.SyncFile(parent) })

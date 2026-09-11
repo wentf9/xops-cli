@@ -353,3 +353,22 @@ func windowsOwnerID(owner *windows.SID, sid string) (uint32, error) {
 
 	return uid, nil
 }
+
+// A read-only pre-provisioned key is an input, not a vault-owned writable file.
+// Newly generated keys always use SyncFile before atomic publication.
+func SyncKeyFile(file *os.File) error {
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(windows.Handle(file.Fd()), &info); err != nil {
+		return err
+	}
+	if info.FileAttributes&windows.FILE_ATTRIBUTE_READONLY != 0 {
+		return nil
+	}
+	err := SyncFile(file)
+	// This path only imports an existing, validated key. ACL-read-only keys and
+	// keys on read-only media must not require write access merely to be reused.
+	if errors.Is(err, windows.ERROR_ACCESS_DENIED) || errors.Is(err, windows.ERROR_WRITE_PROTECT) {
+		return nil
+	}
+	return err
+}

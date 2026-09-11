@@ -50,3 +50,5 @@ func Mkdirat(fd int, name string, mode uint32) error { return unix.Mkdirat(fd, n
 func Unlinkat(fd int, name string, flags int) error  { return unix.Unlinkat(fd, name, flags) }
 func Flock(fd, flags int) error                      { return unix.Flock(fd, flags) }
 func SyncFile(file *os.File) error                   { return file.Sync() }
+
+func SyncKeyFile(file *os.File) error { return SyncFile(file) }

@@ -75,3 +75,5 @@ func SyncFile(file *os.File) error                   { return file.Sync() }
 func normalizeStat(st unix.Stat_t) Stat_t {
 	return Stat_t{Dev: uint64(st.Dev), Ino: st.Ino, Nlink: uint64(st.Nlink), Mode: uint32(st.Mode), Uid: st.Uid, Size: st.Size}
 }
+
+func SyncKeyFile(file *os.File) error { return SyncFile(file) }
