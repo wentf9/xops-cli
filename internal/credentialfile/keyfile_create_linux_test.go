@@ -66,7 +66,11 @@ func TestEnsureWrappingKeyRejectsInvalidExisting(t *testing.T) {
 			case "short":
 				err = os.WriteFile(path, []byte("short"), 0600)
 			case "permissions":
-				err = os.WriteFile(path, original, 0644)
+				err = os.WriteFile(path, original, 0600)
+				if err == nil {
+					// Set the invalid mode explicitly, independent of the process umask.
+					err = os.Chmod(path, 0644)
+				}
 			case "symlink":
 				err = os.Symlink(target, path)
 			case "hardlink":

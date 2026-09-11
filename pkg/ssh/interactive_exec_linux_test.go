@@ -8,6 +8,8 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
+	"regexp"
 	"slices"
 	"strconv"
 	"testing"
@@ -26,6 +28,27 @@ func TestRunInteractiveSudoerUsesExecWithPTY(t *testing.T) {
 }
 
 func testInteractiveExecRequest(t *testing.T, sudo bool, wantCommand string) {
+	t.Helper()
+	// Replacing process-wide terminal streams must not race with other tests.
+	const childEnv = "XOPS_INTERACTIVE_EXEC_TEST"
+	if os.Getenv(childEnv) != t.Name() {
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		executable, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.CommandContext(ctx, executable, "-test.run=^"+regexp.QuoteMeta(t.Name())+"$", "-test.timeout=20s")
+		cmd.Env = append(os.Environ(), childEnv+"="+t.Name())
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("isolated interactive test: %v\n%s", err, output)
+		}
+		return
+	}
+	testInteractiveExecRequestInProcess(t, sudo, wantCommand)
+}
+
+func testInteractiveExecRequestInProcess(t *testing.T, sudo bool, wantCommand string) {
 	t.Helper()
 	master, err := os.OpenFile("/dev/ptmx", os.O_RDWR|unix.O_NOCTTY, 0600)
 	if err != nil {

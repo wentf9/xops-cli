@@ -1,0 +1,2 @@
+# Frozen vectors are hashed as bytes; preserve LF even with core.autocrlf=true.
+/internal/credentialfile/format/testdata/vectors.json text eol=lf

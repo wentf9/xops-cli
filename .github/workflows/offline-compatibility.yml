@@ -5,6 +5,8 @@ on:
     branches: [work/offline-vault-compatibility]
   pull_request:
     paths:
+      - '.gitattributes'
+      - 'pkg/ssh/**'
       - 'go.mod'
       - 'go.sum'
       - 'cmd/credential*.go'
@@ -44,6 +46,11 @@ jobs:
       RACE_FLAGS: ${{ matrix.race }}
     steps:
       - uses: actions/checkout@v7
+      - name: Exercise Windows CRLF checkout of frozen vectors
+        if: runner.os == 'Windows'
+        run: |
+          git config core.autocrlf true
+          git checkout-index --force internal/credentialfile/format/testdata/vectors.json
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
@@ -52,11 +59,11 @@ jobs:
         run: go env GOOS GOARCH CGO_ENABLED
       - name: Build
         run: go build ./...
-      - name: Native unit tests
-        run: go test ${{ env.RACE_FLAGS }} -parallel 2 ./internal/credentialfile ./internal/kdfhelper ./internal/vaultsys
+      - name: Full native shuffled tests
+        run: go test ${{ env.RACE_FLAGS }} -parallel 2 -shuffle=on ./...
       - name: Native vault and real KDF helper (release configuration)
         env:
           CGO_ENABLED: '0'
         run: go run ./scripts/offline-platform-verify
       - name: Native operations and process-crash recovery
-        run: go test ${{ env.RACE_FLAGS }} -parallel 2 -tags=integration -run 'Test(Store|Runtime|Maintenance)' ./internal/credentialfile
+        run: go test ${{ env.RACE_FLAGS }} -parallel 2 -count=1 -tags=integration ./internal/credentialfile/...
