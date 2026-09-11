@@ -202,3 +202,21 @@ func TestSecretServiceRejectsInvalidValues(t *testing.T) {
 		})
 	}
 }
+
+func TestSecretServiceAvailabilityDiagnostics(t *testing.T) {
+	for _, tc := range []struct{ name, message string }{
+		{"org.freedesktop.DBus.Error.NameHasNoOwner", "do not auto-start"},
+		{"org.freedesktop.DBus.Error.ServiceUnknown", "do not auto-start"},
+		{"org.freedesktop.DBus.Error.AccessDenied", "access denied"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := secretServiceError(t.Context(), "search items", dbus.Error{Name: tc.name, Body: []any{"secret-must-not-leak"}})
+			if !errors.Is(err, credential.ErrCredentialStoreUnavailable) || !strings.Contains(err.Error(), tc.message) {
+				t.Fatalf("missing actionable diagnosis: %v", err)
+			}
+			if strings.Contains(err.Error(), "secret-must-not-leak") {
+				t.Fatal("service error body leaked")
+			}
+		})
+	}
+}

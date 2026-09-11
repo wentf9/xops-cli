@@ -971,7 +971,7 @@ credential_store_list_short:
 credential_doctor_short:
   other: "探测系统密钥库支持与已配置存储的连通性"
 credential_doctor_long:
-  other: "对已配置存储执行带超时的非交互读取探测；helper 缺失、存储锁定或权限拒绝时失败。不写入秘密，不验证写入权限。"
+  other: "对已配置存储及隐式 system 迁移目标执行带超时的非交互读取探测。已配置存储失败时报错；未配置的系统存储不可用时显示警告。不写入秘密，不验证写入权限。"
 credential_doctor_healthy:
   other: "已配置存储通过非交互读取检查；未验证写入权限"
 credential_gc_short:
@@ -1019,3 +1019,6 @@ credential_finalize_short:
 
 credential_finalize_long:
   other: "显式确认已验证迁移后的连接。重新检查当前 v2 引用后删除迁移备份和旧 key；删除后不再保留自动回滚材料，中断后可重跑。"
+
+credential_doctor_warnings:
+  other: "凭据检查存在警告，请查看 WARN 详情；未验证写入权限"

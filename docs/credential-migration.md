@@ -111,3 +111,16 @@ finalize 删除边界；包含实际子进程退出后由新进程恢复的测�
 结果不确定/读回不一致、CAS 冲突、Applied 非 Durable、备份冲突、缺失 key、
 未知字段、keyless plaintext、agent-only 及 finalize 失败的回归测试。
 测试均使用隔离文件和 fake 后端，不操作用户的真实凭据库。
+
+### Linux 系统存储排障
+
+Linux 原生系统存储需要 `secret-tool`（Debian/Ubuntu 安装 `libsecret-tools`）及可用的用户会话 Secret Service。
+缺少 `secret-tool` 时，只允许回退到 PATH 中的外部 `xops-credential-system`；不会调用未实现的 Linux 内置 helper。
+
+迁移前可运行 `xops credential doctor`。即使旧配置没有声明 system 存储，doctor 也会对隐式迁移目标执行带超时的非交互读取探测，而非仅检查 D-Bus 环境变量。
+已配置存储探测失败显示 `FAIL` 并返回非零退出码；未配置的可选系统存储不可用显示 `WARN`，不影响其他已配置后端，但不会显示全部通过的成功提示。
+这些探测不写入凭据，不保证写入权限或交互解锁成功；实际迁移仍通过写入和读回验证持久化结果。
+
+安装工具后若 doctor 提示 `org.freedesktop.secrets is not running or unavailable`，表示当前用户会话中的 Secret Service 尚未运行或不可用。
+doctor 的非交互读取使用 D-Bus `NoAutoStart`，不会自动启动服务或弹出解锁窗口；需要先启动桌面密钥环服务后重试。
+交互路径下的迁移 dry-run 使用 `secret-tool`，可能通过 D-Bus 激活服务，因此可能出现首次 doctor 失败、dry-run 成功后 doctor 也通过的情况。

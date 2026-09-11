@@ -111,7 +111,16 @@ func (c *Client) RunInteractiveWithSudo(ctx context.Context, command string) (re
 		return c.RunInteractive(ctx, command)
 	}
 
-	// 对于需要提权的场景，打开交互式 shell 后在 shell 内提权再执行命令
+	sudoCommand, err := interactivePrivilegeCommand(connCfg.SudoMode, command)
+	if err != nil {
+		return err
+	}
+	if connCfg.SudoMode == SudoModeSudoer {
+		return c.RunInteractiveCmd(ctx, sudoCommand)
+	}
+
+	// Password authentication still uses the PTY, but the target command is
+	// supplied in the exec request instead of injected into a root shell.
 	session, err := c.newSessionContext(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to create new session: %w", err)
@@ -138,7 +147,7 @@ func (c *Client) RunInteractiveWithSudo(ctx context.Context, command string) (re
 		return fmt.Errorf("create interactive sudo stdin pipe failed: %w", err)
 	}
 
-	sudoCmd, priv, err := c.resolveSudoParams(ctx)
+	_, priv, err := c.resolveSudoParams(ctx)
 	if err != nil {
 		return err
 	}
@@ -152,14 +161,8 @@ func (c *Client) RunInteractiveWithSudo(ctx context.Context, command string) (re
 	expect := c.setupInteractiveExpect(session, stdin, password)
 	session.Stderr = os.Stderr
 
-	if sudoCmd != "" {
-		if err := session.Start(sudoCmd); err != nil {
-			return fmt.Errorf("start %s failed: %w", sudoCmd, err)
-		}
-	} else {
-		if err := session.Shell(); err != nil {
-			return fmt.Errorf("start shell failed: %w", err)
-		}
+	if err := session.Start(sudoCommand); err != nil {
+		return fmt.Errorf("start interactive privileged command failed: %w", err)
 	}
 
 	oldState, err := term.MakeRaw(fdIn)
@@ -181,26 +184,9 @@ func (c *Client) RunInteractiveWithSudo(ctx context.Context, command string) (re
 			return fmt.Errorf("complete interactive sudo authentication failed: %w", err)
 		}
 
-		// 获取被拦截的输出，仅需清理密码行，不再有 sudo 回显
-		cleaned := expect.CleanOutput(c.passwordPromptRegex())
-		if _, err := io.WriteString(os.Stdout, cleaned); err != nil {
+		if err := expect.streamAfterAuthentication(os.Stdout); err != nil {
 			return fmt.Errorf("write interactive sudo output failed: %w", err)
 		}
-
-		// 握手结束后，将后续输出直接透传给终端，并停止无谓的累积
-		expect.SetAccumulate(false)
-		expect.SetTarget(os.Stdout)
-	}
-
-	// 提权完成后，给 Root Shell 留出 1 秒的初始化时间，
-	// 防止 sudo 或 su 的 tcflush(清空终端缓冲区) 机制吃掉我们随后立刻发出的指令。
-	time.Sleep(1 * time.Second)
-
-	// 提权完成后发送目标命令
-	// 使用 exec bash -c 替换掉提权后的 root shell
-	wrappedCmd := fmt.Sprintf("exec bash -c '%s'\n", strings.ReplaceAll(command, "'", "'\\''"))
-	if _, err := io.WriteString(stdin, wrappedCmd); err != nil {
-		return fmt.Errorf("write interactive sudo command failed: %w", err)
 	}
 
 	cancelStdin, stdinDone, err := copyStdinTo(os.Stdin, stdin)
@@ -213,6 +199,20 @@ func (c *Client) RunInteractiveWithSudo(ctx context.Context, command string) (re
 	stdinErr := <-stdinDone
 
 	return errors.Join(err, cancelErr, stdinErr)
+}
+
+// Commands travel in the SSH exec request, never through echoed PTY input.
+func interactivePrivilegeCommand(mode SudoMode, command string) (string, error) {
+	quoted := "'" + strings.ReplaceAll(command, "'", "'\\''") + "'"
+	switch mode {
+	case SudoModeSudo, SudoModeSudoer:
+		return "sudo -i -- bash -c " + quoted, nil
+	case SudoModeSu:
+		bashCommand := "exec bash -c " + quoted
+		return "su - root -c '" + strings.ReplaceAll(bashCommand, "'", "'\\''") + "'", nil
+	default:
+		return "", fmt.Errorf("interactive privilege escalation is unsupported for sudo mode %q", mode)
+	}
 }
 
 func (c *Client) runWithSudo(ctx context.Context, command string, password []byte, extraStdin io.Reader, config *RunConfig) (output string, retErr error) {

@@ -139,7 +139,11 @@ func newCmdCredentialDoctor() *cobra.Command {
 			}
 
 			hasFail := false
+			hasWarn := false
 			for _, it := range items {
+				if it.Status == "WARN" {
+					hasWarn = true
+				}
 				if it.Status == "FAIL" {
 					hasFail = true
 				}
@@ -153,6 +157,10 @@ func newCmdCredentialDoctor() *cobra.Command {
 
 			if hasFail {
 				return fmt.Errorf("credential doctor detected issues with system or configured stores")
+			}
+			if hasWarn {
+				_, err := fmt.Fprintln(cmd.OutOrStdout(), i18n.T("credential_doctor_warnings"))
+				return err
 			}
 			logger.PrintSuccess(i18n.T("credential_doctor_healthy"))
 			return nil
@@ -199,7 +207,7 @@ func runDoctorChecks(ctx context.Context) []DoctorCheckItem {
 			items = append(items, DoctorCheckItem{
 				Name:    "Linux Secret Service D-Bus",
 				Status:  "OK",
-				Message: fmt.Sprintf("D-Bus session bus detected: %s", dbusVal),
+				Message: fmt.Sprintf("D-Bus address configured (service availability not yet verified): %s", dbusVal),
 			})
 		} else {
 			items = append(items, DoctorCheckItem{
@@ -243,42 +251,62 @@ func checkConfiguredStores(ctx context.Context) []DoctorCheckItem {
 			Status:  "OK",
 			Message: "no credential stores configured; persistence is disabled (none)",
 		})
+		items = append(items, checkUnconfiguredSystemStore(ctx))
 		return items
 	}
 
+	_, hasSystem := credCfg.Stores["system"]
+	if !hasSystem {
+		items = append(items, checkUnconfiguredSystemStore(ctx))
+	}
 	for storeID, storeCfg := range credCfg.Stores {
 		if storeCfg.Type == config.StoreTypeEncryptedFile {
 			items = append(items, checkOfflineDoctor(ctx, storeID, storeCfg))
 			continue
 		}
-		st, buildErr := config.BuildStore(storeID, storeCfg)
-		if buildErr != nil {
-			items = append(items, DoctorCheckItem{
-				Name:    fmt.Sprintf("Store: %s", storeID),
-				Status:  "FAIL",
-				Message: buildErr.Error(),
-			})
-			continue
-		}
-		if storeCfg.Type == config.StoreTypeNone {
-			items = append(items, DoctorCheckItem{Name: fmt.Sprintf("Store: %s", storeID), Status: "OK", Message: "persistence disabled (none)"})
-			continue
-		}
-		probeCtx, cancel := context.WithTimeout(credential.WithoutInteraction(ctx), 5*time.Second)
-		secret, probeErr := st.Get(probeCtx, credential.Ref{StoreID: storeID, ItemID: "doctor-" + credential.GenerateItemID()})
-		clear(secret.Value)
-		cancel()
-		if probeErr != nil && !errors.Is(probeErr, credential.ErrCredentialNotFound) {
-			items = append(items, DoctorCheckItem{Name: fmt.Sprintf("Store: %s", storeID), Status: "FAIL", Message: probeErr.Error()})
-			continue
-		}
-		items = append(items, DoctorCheckItem{
-			Name:    fmt.Sprintf("Store: %s", storeID),
-			Status:  "OK",
-			Message: fmt.Sprintf("type=%s, non-interactive read probe passed; write access not tested", storeCfg.Type),
-		})
+		items = append(items, checkDoctorStore(ctx, storeID, storeCfg))
 	}
 	return items
+}
+
+// checkUnconfiguredSystemStore also checks the implicit migration destination.
+// An optional backend failure is a warning; configured backend failures are fatal.
+func checkUnconfiguredSystemStore(ctx context.Context) DoctorCheckItem {
+	item := checkDoctorStore(ctx, "system", config.StoreConfig{Type: config.StoreTypeSystem})
+	item.Name = "Unconfigured system store (migration destination)"
+	if item.Status == "FAIL" {
+		item.Status = "WARN"
+	}
+	return item
+}
+
+func checkDoctorStore(ctx context.Context, storeID string, cfg config.StoreConfig) DoctorCheckItem {
+	item := DoctorCheckItem{Name: "Store: " + storeID, Status: "FAIL"}
+	st, err := config.BuildStore(storeID, cfg)
+	if err != nil {
+		item.Message = err.Error()
+		return item
+	}
+	if cfg.Type == config.StoreTypeNone {
+		item.Status = "OK"
+		item.Message = "persistence disabled (none)"
+		return item
+	}
+	timeout := 5 * time.Second
+	if cfg.Timeout > 0 && cfg.Timeout < timeout {
+		timeout = cfg.Timeout
+	}
+	probeCtx, cancel := context.WithTimeout(credential.WithoutInteraction(ctx), timeout)
+	defer cancel()
+	secret, err := st.Get(probeCtx, credential.Ref{StoreID: storeID, ItemID: "doctor-" + credential.GenerateItemID()})
+	clear(secret.Value)
+	if err != nil && !errors.Is(err, credential.ErrCredentialNotFound) {
+		item.Message = err.Error()
+		return item
+	}
+	item.Status = "OK"
+	item.Message = fmt.Sprintf("type=%s, non-interactive read probe passed; write access not tested", cfg.Type)
+	return item
 }
 
 func newCmdCredentialGC() *cobra.Command {

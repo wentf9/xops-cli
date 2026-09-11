@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -116,6 +117,11 @@ func TestCredentialStoreList(t *testing.T) {
 }
 
 func TestCredentialDoctor(t *testing.T) {
+	initCredentialPolicyTestI18n(t)
+	if runtime.GOOS == "linux" {
+		t.Setenv("PATH", t.TempDir())
+		t.Setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent/bus")
+	}
 	_ = setupTestEnvironment(t)
 
 	cfgPath, keyPath, err := utils.GetConfigFilePath()
@@ -141,6 +147,9 @@ func TestCredentialDoctor(t *testing.T) {
 	// doctor 命令执行系统密钥库探测，不应 panic 或崩溃
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute credential doctor failed: %v", err)
+	}
+	if runtime.GOOS == "linux" && (!strings.Contains(buf.String(), "WARN") || !strings.Contains(buf.String(), "libsecret-tools") || !strings.Contains(buf.String(), "completed with warnings")) {
+		t.Fatalf("doctor missed unavailable implicit migration destination: %s", buf.String())
 	}
 }
 

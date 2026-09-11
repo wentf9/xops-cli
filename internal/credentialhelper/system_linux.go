@@ -30,18 +30,18 @@ func newNativeSystemStore(storeID string, cfg SystemStoreConfig) (credential.Sto
 
 	toolPath, err := exec.LookPath("secret-tool")
 	if err != nil {
-		if cmdPath, args, env, helperErr := resolveControlledSystemHelper(); helperErr == nil {
-			mergedEnv := append([]string{}, env...)
-			mergedEnv = append(mergedEnv, cfg.Env...)
+		// Linux has no built-in helper implementation. Only an installed
+		// external helper can replace secret-tool.
+		if cmdPath, helperErr := exec.LookPath(DefaultSystemHelperCommand); helperErr == nil {
 			opts := ProcessOptions{
-				Command: cmdPath,
-				Args:    args,
-				Env:     mergedEnv,
-				Timeout: cfg.Timeout,
+				NonInteractive: cfg.NonInteractive,
+				Command:        cmdPath,
+				Env:            cfg.Env,
+				Timeout:        cfg.Timeout,
 			}
 			return NewHelperStore(storeID, opts, cfg.ReadOnly)
 		}
-		return nil, fmt.Errorf("%w: secret-tool executable not found in PATH and no external helper configured", credential.ErrCredentialStoreUnavailable)
+		return nil, fmt.Errorf("%w: secret-tool executable not found in PATH; install libsecret-tools (Debian/Ubuntu) or provide xops-credential-system", credential.ErrCredentialStoreUnavailable)
 	}
 
 	return &linuxNativeStore{

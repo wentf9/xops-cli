@@ -495,93 +495,12 @@ func (c *Client) ShellWithIO(ctx context.Context, streams InteractiveIO) (retErr
 	return errors.Join(err, cancelErr, stdinErr, waitOutput())
 }
 
-// RunInteractive 在 PTY 环境下执行单条命令，支持交互式/流式命令 (如 tail -f, vim, top)
-func (c *Client) RunInteractive(ctx context.Context, cmd string) (retErr error) {
-	session, err := c.newSessionContext(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to create new session: %w", err)
-	}
-	defer joinResourceCloseError(&retErr, session, "interactive ssh command session")
-
-	modes := ssh.TerminalModes{
-		ssh.ECHO:          1,
-		ssh.TTY_OP_ISPEED: 14400,
-		ssh.TTY_OP_OSPEED: 14400,
-	}
-	fdIn := int(os.Stdin.Fd())
-	fdOut := int(os.Stdout.Fd())
-	width, height, err := term.GetSize(fdOut)
-	if err != nil {
-		width, height = 80, 40
-	}
-	if err := session.RequestPty("xterm-256color", height, width, modes); err != nil {
-		return fmt.Errorf("request for pty failed: %w", err)
-	}
-
-	stdin, err := session.StdinPipe()
-	if err != nil {
-		return fmt.Errorf("create SSH stdin pipe failed: %w", err)
-	}
-	stdout, err := session.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("create SSH stdout pipe failed: %w", err)
-	}
-	stderr, err := session.StderrPipe()
-	if err != nil {
-		return fmt.Errorf("create SSH stderr pipe failed: %w", err)
-	}
-
-	if err := session.Shell(); err != nil {
-		return fmt.Errorf("start shell failed: %w", err)
-	}
-
-	oldState, err := term.MakeRaw(fdIn)
-	if err != nil {
-		return fmt.Errorf("cannot set terminal to raw: %w", err)
-	}
-	defer func() {
-		if restoreErr := term.Restore(fdIn, oldState); restoreErr != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("restore terminal failed: %w", restoreErr))
-		}
-	}()
-
-	derivedCtx, cancelResize := context.WithCancel(ctx)
-	defer cancelResize()
-	startWindowResizeLoop(derivedCtx, session, fdOut, width, height, c.getLogger())
-
-	// 使用交互式 Shell 获取完整的终端控制权 (支持基于 TTY 的程序如 top/vim 接收按键信号)
-	// 使用 exec 替换当前交互式 Shell，并在完成后自动结束 SSH 会话
-	wrappedCmd := fmt.Sprintf("exec bash -c '%s'\n", strings.ReplaceAll(cmd, "'", "'\\''"))
-	if _, err := io.WriteString(stdin, wrappedCmd); err != nil {
-		return fmt.Errorf("write interactive SSH command failed: %w", err)
-	}
-
-	waitOutput := copySessionOutput(stdout, stderr, os.Stdout, os.Stderr)
-
-	done := make(chan struct{})
-	defer close(done)
-
-	go func() {
-		select {
-		case <-ctx.Done():
-			if signalErr := session.Signal(ssh.SIGKILL); signalErr != nil {
-				c.getLogger().Debugf("signal canceled interactive SSH command failed: %v", signalErr)
-			}
-			debugCloseResource(c.getLogger(), session, "canceled interactive ssh command session")
-		case <-done:
-		}
-	}()
-
-	cancelStdin, stdinDone, err := copyStdinTo(os.Stdin, stdin)
-	if err != nil {
-		return err
-	}
-
-	err = ignoreShellExitError(session.Wait())
-	cancelErr := cancelStdin()
-	stdinErr := <-stdinDone
-
-	return errors.Join(err, cancelErr, stdinErr, waitOutput())
+// RunInteractive runs one command in a PTY using an SSH exec request.
+// A non-interactive login bash loads the login environment without starting a
+// prompt or writing the command through the terminal's echoed input stream.
+func (c *Client) RunInteractive(ctx context.Context, cmd string) error {
+	wrappedCmd := fmt.Sprintf("bash -l -c '%s'", strings.ReplaceAll(cmd, "'", "'\\''"))
+	return c.RunInteractiveCmd(ctx, wrappedCmd)
 }
 
 // RunInteractiveCmd 在 PTY 环境下直接执行命令（通过 SSH exec 通道，不启动交互式 shell），

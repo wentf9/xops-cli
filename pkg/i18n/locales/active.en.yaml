@@ -970,7 +970,7 @@ credential_store_list_short:
 credential_doctor_short:
   other: "Probe system keystore capabilities and test configured stores"
 credential_doctor_long:
-  other: "Run bounded, non-interactive read probes against configured stores. Missing helpers, locked stores and denied access fail. No secrets are written; write access is not tested."
+  other: "Run bounded, non-interactive read probes against configured stores and the implicit system migration destination. Configured store failures are fatal; an unavailable unconfigured system store produces a warning. No secrets are written; write access is not tested."
 credential_doctor_healthy:
   other: "Configured stores passed non-interactive read checks; write access was not tested"
 credential_gc_short:
@@ -1018,3 +1018,6 @@ credential_finalize_short:
 
 credential_finalize_long:
   other: "Explicitly confirm connection validation. Recheck current v2 references, then delete the migration backup and old keys. This removes automatic rollback materials and is resumable after interruption."
+
+credential_doctor_warnings:
+  other: "Credential checks completed with warnings; review WARN details. Write access was not tested"

@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"unicode/utf16"
 
 	"github.com/chzyer/readline"
 	"github.com/erikgeiser/coninput"
@@ -32,16 +33,28 @@ type windowsPromptInput struct {
 type windowsConsoleEventReader func(windows.Handle, windows.Handle) (coninput.EventRecord, error)
 
 type windowsConsolePromptReader struct {
-	handle      windows.Handle
-	cancelEvent windows.Handle
-	readEvent   windowsConsoleEventReader
-	ctrlKey     bool
-	altKey      bool
-	pending     []byte
+	handle        windows.Handle
+	cancelEvent   windows.Handle
+	readEvent     windowsConsoleEventReader
+	interactive   bool
+	ctrlKey       bool
+	altKey        bool
+	pending       []byte
+	highSurrogate rune
 }
 
 // DuplicatePromptInput duplicates an input stream and equips it with an interrupt mechanism for Windows.
 func DuplicatePromptInput(input io.Reader) (PromptInput, error) {
+	return duplicateWindowsInput(input, false)
+}
+
+// DuplicateInteractiveInput preserves terminal key sequences for SSH PTY input,
+// using an owned handle and a cancellation event instead of reading os.Stdin.
+func DuplicateInteractiveInput(input *os.File) (PromptInput, error) {
+	return duplicateWindowsInput(input, true)
+}
+
+func duplicateWindowsInput(input io.Reader, interactive bool) (PromptInput, error) {
 	file, ok := input.(*os.File)
 	if !ok {
 		if closer, hasCloser := input.(io.ReadCloser); hasCloser {
@@ -78,6 +91,7 @@ func DuplicatePromptInput(input io.Reader) (PromptInput, error) {
 		}
 		promptInput.cancelEvent = cancelEvent
 		promptInput.console = &windowsConsolePromptReader{
+			interactive: interactive,
 			handle:      duplicate,
 			cancelEvent: cancelEvent,
 			readEvent:   readWindowsConsoleEvent,
@@ -179,6 +193,19 @@ func (r *windowsConsolePromptReader) translateKeyEvent(key coninput.KeyEventReco
 }
 
 func (r *windowsConsolePromptReader) translateSingleKeyEvent(key coninput.KeyEventRecord) []byte {
+	if r.interactive {
+		if key.KeyDown && key.Char >= 0xd800 && key.Char <= 0xdbff {
+			r.highSurrogate = key.Char
+			return nil
+		}
+		if key.KeyDown && r.highSurrogate != 0 {
+			if key.Char >= 0xdc00 && key.Char <= 0xdfff {
+				key.Char = utf16.DecodeRune(r.highSurrogate, key.Char)
+			}
+			r.highSurrogate = 0
+		}
+		return translateInteractiveKey(key)
+	}
 	if !key.KeyDown {
 		r.releaseModifier(key.VirtualKeyCode)
 		return []byte{}
@@ -244,9 +271,12 @@ func (i *windowsPromptInput) Interrupt() error {
 		i.interrupted = true
 		i.stateMu.Unlock()
 
-		var signalErr error
 		if i.cancelEvent != 0 {
-			signalErr = windows.SetEvent(i.cancelEvent)
+			// Keep both waited-on handles alive until every reader has exited.
+			if err := windows.SetEvent(i.cancelEvent); err != nil {
+				i.interruptErr = fmt.Errorf("signal prompt input cancellation failed: %w", err)
+			}
+			return
 		}
 		handle := windows.Handle(i.file.Fd())
 		cancelErr := windows.CancelIoEx(handle, nil)
@@ -254,9 +284,6 @@ func (i *windowsPromptInput) Interrupt() error {
 			cancelErr = nil
 		}
 		closeErr := i.file.Close()
-		if signalErr != nil {
-			i.interruptErr = fmt.Errorf("signal prompt input cancellation failed: %w", signalErr)
-		}
 		if cancelErr != nil {
 			i.interruptErr = appendWindowsPromptInputError(i.interruptErr, "cancel prompt input failed", cancelErr)
 		}
@@ -276,6 +303,11 @@ func (i *windowsPromptInput) Close() error {
 			closeEventErr = windows.CloseHandle(i.cancelEvent)
 		}
 		i.closeErr = interruptErr
+		if i.console != nil {
+			if err := i.file.Close(); err != nil {
+				i.closeErr = appendWindowsPromptInputError(i.closeErr, "close console input failed", err)
+			}
+		}
 		if closeEventErr != nil {
 			i.closeErr = appendWindowsPromptInputError(
 				i.closeErr,
@@ -292,4 +324,48 @@ func appendWindowsPromptInputError(combined error, action string, err error) err
 		return fmt.Errorf("%s: %w", action, err)
 	}
 	return fmt.Errorf("%w; %s: %w", combined, action, err)
+}
+
+// Interactive PTYs expect escape sequences, not readline's editing controls.
+func translateInteractiveKey(key coninput.KeyEventRecord) []byte {
+	if !key.KeyDown {
+		return nil
+	}
+	if key.Char != 0 {
+		value := []byte(string(key.Char))
+		// AltGr produces text and must not be interpreted as an Alt shortcut.
+		alt := key.ControlKeyState&(coninput.LEFT_ALT_PRESSED|coninput.RIGHT_ALT_PRESSED) != 0
+		ctrl := key.ControlKeyState&(coninput.LEFT_CTRL_PRESSED|coninput.RIGHT_CTRL_PRESSED) != 0
+		if alt && !ctrl {
+			return append([]byte{0x1b}, value...)
+		}
+		return value
+	}
+	if key.VirtualKeyCode == coninput.VK_SPACE && key.ControlKeyState&(coninput.LEFT_CTRL_PRESSED|coninput.RIGHT_CTRL_PRESSED) != 0 {
+		return []byte{0}
+	}
+	switch key.VirtualKeyCode {
+	case coninput.VK_UP:
+		return []byte("\x1b[A")
+	case coninput.VK_DOWN:
+		return []byte("\x1b[B")
+	case coninput.VK_RIGHT:
+		return []byte("\x1b[C")
+	case coninput.VK_LEFT:
+		return []byte("\x1b[D")
+	case coninput.VK_HOME:
+		return []byte("\x1b[H")
+	case coninput.VK_END:
+		return []byte("\x1b[F")
+	case coninput.VK_INSERT:
+		return []byte("\x1b[2~")
+	case coninput.VK_DELETE:
+		return []byte("\x1b[3~")
+	case coninput.VK_PRIOR:
+		return []byte("\x1b[5~")
+	case coninput.VK_NEXT:
+		return []byte("\x1b[6~")
+	default:
+		return nil
+	}
 }

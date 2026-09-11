@@ -135,8 +135,15 @@ func secretServiceError(ctx context.Context, operation string, err error) error 
 		return fmt.Errorf("secret service %s: %w", operation, context.DeadlineExceeded)
 	}
 	var busErr dbus.Error
-	if errors.As(err, &busErr) && busErr.Name == "org.freedesktop.Secret.Error.IsLocked" {
-		return fmt.Errorf("secret service %s: %w", operation, credential.ErrCredentialStoreLocked)
+	if errors.As(err, &busErr) {
+		switch busErr.Name {
+		case "org.freedesktop.Secret.Error.IsLocked":
+			return fmt.Errorf("secret service %s: %w", operation, credential.ErrCredentialStoreLocked)
+		case "org.freedesktop.DBus.Error.NameHasNoOwner", "org.freedesktop.DBus.Error.ServiceUnknown":
+			return fmt.Errorf("secret service %s: %w: org.freedesktop.secrets is not running or unavailable on the session bus; non-interactive probes do not auto-start it; start your desktop keyring service and retry", operation, credential.ErrCredentialStoreUnavailable)
+		case "org.freedesktop.DBus.Error.AccessDenied":
+			return fmt.Errorf("secret service %s: %w: session bus access denied", operation, credential.ErrCredentialStoreUnavailable)
+		}
 	}
 	// Service error bodies may contain secrets. Do not include them in diagnostics.
 	return fmt.Errorf("secret service %s: %w", operation, credential.ErrCredentialStoreUnavailable)
