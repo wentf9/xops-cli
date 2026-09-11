@@ -24,11 +24,11 @@
 
 ## 验证设施
 
-- [离线演练脚本](../../scripts/verify_offline_vault.py)：驱动真实 CLI，检查空 PATH、网络隔离、归档不变和恢复后写入。
-- [原值校验器](../../scripts/offline-vault-verify/main.go)：通过原配置引用调用 Get，比较公开测试值，不输出秘密。
-- [恢复反例测试](../../scripts/test_offline_vault_drill.py)：覆盖成功恢复、条目删除和密文篡改。
-- [原生容器验证](../../scripts/validation/run-container.sh)：在指定测试文件系统中执行离线演练与四包 integration race。
-- [KVM 驱动](../../scripts/validation/verify_powercut.py)：在受控断电点终止测试 VM，重启测试盘并验证恢复。
+- [离线演练脚本](../../../../scripts/verify_offline_vault.py)：驱动真实 CLI，检查空 PATH、网络隔离、归档不变和恢复后写入。
+- [原值校验器](../../../../scripts/offline-vault-verify/main.go)：通过原配置引用调用 Get，比较公开测试值，不输出秘密。
+- [恢复反例测试](../../../../scripts/test_offline_vault_drill.py)：覆盖成功恢复、条目删除和密文篡改。
+- [原生容器验证](../../../../scripts/validation/run-container.sh)：在指定测试文件系统中执行离线演练与四包 integration race。
+- [KVM 驱动](../../../../scripts/validation/verify_powercut.py)：在受控断电点终止测试 VM，重启测试盘并验证恢复。
 
 Python、测试校验器和容器工具仅用于验收，不属于 XOps 运行依赖。
 

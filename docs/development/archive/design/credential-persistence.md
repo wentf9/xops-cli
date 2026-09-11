@@ -531,7 +531,7 @@ pkg 层只包装并返回。允许记录 StoreID、操作、耗时、结果分�
 
 ### 16.5 自动化回归脚本与执行证据
 
-仓库已提供自动化跨平台验证脚本 [`scripts/verify_native_platform.sh`](../../scripts/verify_native_platform.sh) 及各平台原生集成与回归测试：
+仓库已提供自动化跨平台验证脚本 [`scripts/verify_native_platform.sh`](../../../../scripts/verify_native_platform.sh) 及各平台原生集成与回归测试：
 - **严格验收断言**：脚本会根据当前 OS 运行真实二进制读写及 Go 平台测试，非目标平台明确标记为 `[SKIP]`，拒绝任何无条件标记 PASS 的虚假通过；
 - **macOS 测试集**（`system_darwin_test.go`）：
   - `TestDarwinNativeHelper_DuplicateConflictRetryFindLocked`：验证并发写入重试查询被锁定报错并传播；

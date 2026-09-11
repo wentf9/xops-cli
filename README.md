@@ -66,12 +66,12 @@ xops init --skip-ssh-import
 doctor 仅验证非交互读取链路，不保证写权限；Linux system 使用 Secret Service
 直接读取已解锁凭据，不弹出解锁提示。示例见 [配置文件](xops_config.example.yaml)。
 
-Linux amd64 还可显式配置[内置离线加密凭据库](docs/offline-encrypted-credentials.md)。
+Linux、Windows 和 macOS 的 64 位平台还可显式配置[内置离线加密凭据库](docs/development/archive/offline-encrypted-credentials.md)。
 离线库不按文件系统类型限制访问，存储可靠性由用户保证；ext4、XFS、Btrfs 已完成兼容性验证。
-[格式与配置/CLI 接口 v1 已冻结](docs/design/offline-encrypted-credential-store-v1-freeze.md)，发布状态为未发布。
+[格式与配置/CLI 接口 v1 已冻结](docs/development/archive/design/offline-encrypted-credential-store-v1-freeze.md)，发布状态为未发布。
 
 Schema v1 自默认切换版本起保留两个正式发布周期，普通命令向 stderr 输出弃用告警。
-兼容期内旧读取和 AES 写入仍保留；请按[迁移指南](docs/credential-migration.md)显式迁移。
+兼容期内旧读取和 AES 写入仍保留；请按[迁移指南](docs/development/archive/credential-migration.md)显式迁移。
 
 #### 2. 主机与资产管理
 

@@ -19,3 +19,12 @@ updates:
     labels:
       - "ci"
       - "dependencies"
+
+  # 文档站依赖
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"

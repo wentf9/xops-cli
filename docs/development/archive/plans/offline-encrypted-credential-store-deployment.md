@@ -43,9 +43,9 @@ systemd 父 service 的 Memory peak 不包含独立 KDF 子组，不能用于推
 
 ## 断电验证
 
-[host 驱动](../../scripts/validation/verify_powercut.py)、
-[guest init](../../scripts/validation/vm-init.sh)和
-[测试入口](../../internal/credentialfile/powercut_integration_test.go)完成跨启动恢复验证。
+[host 驱动](../../../../scripts/validation/verify_powercut.py)、
+[guest init](../../../../scripts/validation/vm-init.sh)和
+[测试入口](../../../../internal/credentialfile/powercut_integration_test.go)完成跨启动恢复验证。
 故障注入入口仅在 integration,vaultpowercut 测试标签下编译。
 
 1. 在新测试盘初始化库、保存公开原值并重加密，正常同步关机形成基线。
@@ -58,8 +58,8 @@ systemd 父 service 的 Memory peak 不包含独立 KDF 子组，不能用于推
 
 ## 验证设施
 
-原生测试使用 [Dockerfile](../../scripts/validation/Dockerfile) 和
-[容器脚本](../../scripts/validation/run-container.sh)。测试包保留各包所需的相对
+原生测试使用 [Dockerfile](../../../../scripts/validation/Dockerfile) 和
+[容器脚本](../../../../scripts/validation/run-container.sh)。测试包保留各包所需的相对
 工作目录、固定向量和示例配置。静态 CLI 在空 PATH 下运行；glibc 仅供 race
 测试程序使用，Python 仅用于驱动演练。
 

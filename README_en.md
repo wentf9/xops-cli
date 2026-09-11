@@ -68,14 +68,14 @@ before being selected as the default. Doctor checks non-interactive reads, not w
 Linux system reads unlocked credentials directly through Secret Service without unlock prompts.
 See the [example configuration](xops_config.example.yaml).
 
-Linux amd64 also provides an explicit [offline encrypted credential store](docs/offline-encrypted-credentials.md).
+64-bit Linux, Windows, and macOS also provide an explicit [offline encrypted credential store](docs/development/archive/offline-encrypted-credentials.md).
 The offline store does not restrict access by filesystem type; users are responsible for storage reliability.
 Compatibility testing covers ext4, XFS, and Btrfs.
-The [v1 format and configuration/CLI contract are frozen](docs/design/offline-encrypted-credential-store-v1-freeze.md); the release status is unpublished.
+The [v1 format and configuration/CLI contract are frozen](docs/development/archive/design/offline-encrypted-credential-store-v1-freeze.md); the release status is unpublished.
 
 Schema v1 remains supported for two official release cycles starting with the default
 switch release, with deprecation warnings on stderr. Legacy AES reads and writes remain
-during that window; follow the [migration guide](docs/credential-migration.md) to migrate explicitly.
+during that window; follow the [migration guide](docs/development/archive/credential-migration.md) to migrate explicitly.
 
 #### 2. Inventory & Tags
 

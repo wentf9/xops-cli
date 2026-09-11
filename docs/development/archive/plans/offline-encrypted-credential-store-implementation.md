@@ -78,7 +78,7 @@ state 向量验证双端 MAC/编码，目标 meta 摘要为公开占位输入的
 解锁通过注入的 KeySource 完成：KeySource 必须认证完整 meta 并返回独占 DEK 副本，
 文件层使用后清零；nil 返回 locked。阶段 C 已通过 Runtime 路径加入会话、租约和交付栅栏。
 
-Linux amd64 文件访问保留 statx mount ID 与设备号校验，不按文件系统类型限制访问。
+Linux amd64 文件访问保留 挂载 ID（优先 statx，旧内核使用 /proc/self/fdinfo） 与设备号校验，不按文件系统类型限制访问。
 目录句柄逐级 O_NOFOLLOW 打开，严格检查
 所有者、0700/0600、普通文件、单硬链接与挂载边界；目录权限在操作时重新检查。
 不支持的平台编译为显式 unsupported 实现，未因交叉编译成功宣布可用。

@@ -10,7 +10,7 @@
 删除 fstatfs magic 和 mountinfo 文件系统名称判定。初始化与已有库打开均不按
 类型拒绝访问。部署环境负责保证锁、原子发布及文件/目录同步的可靠性。
 
-安全逐级打开、0700/0600 权限、所有者、文件类型、设备号、statx mount ID 和
+安全逐级打开、0700/0600 权限、所有者、文件类型、设备号、挂载 ID（优先 statx，旧内核使用 /proc/self/fdinfo） 和
 库内同挂载检查保持有效。flock、RENAME_NOREPLACE 和同步操作继续执行，
 操作不受支持或失败时返回明确错误。文件格式和加密算法保持不变。
 
@@ -52,10 +52,10 @@ tmpfs 初始化、打开和公开值演练通过，用于确认访问策略不�
 
 ## 设施与检查
 
-[容器脚本](../../scripts/validation/run-container.sh)按 ext4/xfs/btrfs 参数选择测试镜像；
+[容器脚本](../../../../scripts/validation/run-container.sh)按 ext4/xfs/btrfs 参数选择测试镜像；
 参数范围仅定义测试矩阵。容器串行启动，避免 loop 设备节点创建时序影响测试设施。
 
-[KVM 驱动](../../scripts/validation/verify_powercut.py)通过 --filesystem 选择目标类型。
+[KVM 驱动](../../../../scripts/validation/verify_powercut.py)通过 --filesystem 选择目标类型。
 guest 使用对应类型挂载独立磁盘；XFS 模块与 guest 内核版本匹配。
 
 ```sh

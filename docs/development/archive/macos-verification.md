@@ -6,7 +6,7 @@
 
 ## 1. 阶段四 macOS 关键验收场景与实现
 
-根据 [`docs/plans/credential-persistence-implementation.md`](plans/credential-persistence-implementation.md) 与 [`docs/design/credential-persistence.md`](design/credential-persistence.md) 第 16 节的架构设计，macOS 平台凭据系统基于原生 Security Framework C API，并严格通过以下真实场景验收：
+根据 [`docs/development/archive/plans/credential-persistence-implementation.md`](plans/credential-persistence-implementation.md) 与 [`docs/development/archive/design/credential-persistence.md`](design/credential-persistence.md) 第 16 节的架构设计，macOS 平台凭据系统基于原生 Security Framework C API，并严格通过以下真实场景验收：
 
 | 验收场景 | 关键风险与行为要求 | 自动化覆盖与测试断言 |
 | :--- | :--- | :--- |
@@ -29,14 +29,14 @@
 
 ## 2. 方案一：GitHub Actions 自动化 CI 与交互式 SSH 调试（推荐）
 
-项目在 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) 中配置了 `macos-test` 自动化任务，运行于 GitHub 官方提供的 `macos-latest`（Apple Silicon 环境）上。
+项目在 [`.github/workflows/ci.yml`](../../../.github/workflows/ci.yml) 中配置了 `macos-test` 自动化任务，运行于 GitHub 官方提供的 `macos-latest`（Apple Silicon 环境）上。
 
 ### 2.1 自动执行流程
 每次推送至 `master` 或提交 PR 时，GitHub Actions 会自动：
 1. 检出代码并配置 Go 环境；
 2. 编译所有包：`go build ./...`；
 3. 运行含数据竞争检测的全量单元测试：`go test -race -shuffle=on -count=1 ./...`（自动执行 `system_darwin_test.go` 中的真实 API 往返、运行中超时/取消、签名访问拒绝及独立钥匙串锁/解锁集成测试）；
-4. 执行原生平台验收脚本：[`./scripts/verify_native_platform.sh`](../scripts/verify_native_platform.sh)，该脚本动态创建独立测试钥匙串，执行带超时边界的真实凭据写入、更新读回、锁定拒绝、解锁恢复及删除后 not-found 断言。
+4. 执行原生平台验收脚本：[`./scripts/verify_native_platform.sh`](../../../scripts/verify_native_platform.sh)，该脚本动态创建独立测试钥匙串，执行带超时边界的真实凭据写入、更新读回、锁定拒绝、解锁恢复及删除后 not-found 断言。
 
 ### 2.2 故障排查与 tmate 交互式 SSH 远程终端
 当 CI 测试失败或需要登录 macOS 终端手动单步调试时，可以通过 GitHub Web 界面的 **Run workflow** 手动触发流水线，并勾选：
@@ -95,10 +95,10 @@ make macos-vm-down
 ```
 
 ### 3.3 容器驻留、生命周期与认证保障
-- **防闪退配置**：[`deploy/macos-vm/docker-compose.yml`](../deploy/macos-vm/docker-compose.yml) 显式配置了 `stdin_open: true` 与 `tty: true`，防止后台守护进程在关闭 stdin 时触发容器无限重启。
+- **防闪退配置**：[`deploy/macos-vm/docker-compose.yml`](../../../deploy/macos-vm/docker-compose.yml) 显式配置了 `stdin_open: true` 与 `tty: true`，防止后台守护进程在关闭 stdin 时触发容器无限重启。
 - **健康检查与智能等待**：配置了 TCP `10022` 端口的健康检查；`manage.sh wait-ready` 先探测 TCP 端口就绪，随后区分服务未启动与密码/公钥认证未就绪，并自动通过 Python PTY 完成首次公钥分发，打通完全无人值守的免密通道。
 - **端口连通与客体状态辨析**：宿主机 `50922` 端口是由 QEMU 用户态网络栈（SLiRP）在容器内监听并转发至客体 `22` 端口。初次冷启动使用全新格式化的空白虚拟磁盘（`mac_hdd_ng.img`）时，系统处于 macOS 恢复安装器（BaseSystem）阶段，此时客体操作系统尚未写入磁盘，客体内部尚未运行 SSH 服务，因此连接会被切断（Connection closed by remote host）。若需本地完整离线运行，可通过 VNC（端口 `5999`）进入恢复环境完成首次系统安装，或直接挂载已预装的磁盘镜像。
-- **源码严格镜像同步**：[`deploy/macos-vm/manage.sh`](../deploy/macos-vm/manage.sh) 同步时强制应用 `rsync --delete`（或 tar 清空覆盖），避免因分支切换或文件重命名产生的新旧源码混合残留。
+- **源码严格镜像同步**：[`deploy/macos-vm/manage.sh`](../../../deploy/macos-vm/manage.sh) 同步时强制应用 `rsync --delete`（或 tar 清空覆盖），避免因分支切换或文件重命名产生的新旧源码混合残留。
 
 ---
 
