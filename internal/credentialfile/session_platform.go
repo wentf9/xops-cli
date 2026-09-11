@@ -24,9 +24,10 @@ type unlockTask struct {
 	meta    format.Meta
 }
 type lockWork struct {
-	done   chan struct{}
-	task   *unlockTask
-	leases []*keyLease
+	refresh bool
+	done    chan struct{}
+	task    *unlockTask
+	leases  []*keyLease
 }
 type session struct {
 	runtime  *Runtime
@@ -99,7 +100,7 @@ func (s *session) beginLockLocked(force bool) <-chan struct{} {
 	s.deadline = time.Time{}
 	s.cache.Clear()
 	clear(s.digests)
-	w := &lockWork{done: make(chan struct{}), task: s.task}
+	w := &lockWork{done: make(chan struct{}), task: s.task, refresh: !force}
 	if s.task != nil {
 		s.task.cancel(credential.ErrCredentialStoreLocked)
 	}
@@ -110,6 +111,19 @@ func (s *session) beginLockLocked(force bool) <-chan struct{} {
 	s.locking = w
 	s.notify()
 	return w.done
+}
+
+// Internal publication/expiry revocation is waitable by subsequent readers.
+// Explicit user locks retain fail-closed behavior while their leases drain.
+func (s *session) beginRefreshLocked() <-chan struct{} {
+	if s.locking != nil {
+		return s.locking.done
+	}
+	done := s.beginLockLocked(true)
+	if s.locking != nil {
+		s.locking.refresh = true
+	}
+	return done
 }
 
 func (s *session) run() {
@@ -302,19 +316,22 @@ func (s *session) startAcquire(ctx context.Context, hash [32]byte, metadata []by
 		return nil, nil, nil, ErrClosed
 	}
 	if s.locking != nil {
+		if s.locking.refresh {
+			return nil, nil, s.locking.done, nil
+		}
 		return nil, nil, nil, credential.ErrCredentialStoreLocked
 	}
 	if s.staleLocked(m, hash) {
 		return nil, nil, nil, ErrRevisionChanged
 	}
 	if (len(s.key) > 0 || s.task != nil) && s.hash != hash {
-		return nil, nil, s.beginLockLocked(true), nil
+		return nil, nil, s.beginRefreshLocked(), nil
 	}
 	if len(s.key) == 32 && time.Now().Before(s.deadline) {
 		return s.leaseLocked(ctx), nil, nil, nil
 	}
 	if len(s.key) > 0 {
-		return nil, nil, s.beginLockLocked(true), nil
+		return nil, nil, s.beginRefreshLocked(), nil
 	}
 	if s.options.Mode == "prompt" && s.promptForbidden(ctx) {
 		return nil, nil, nil, credential.ErrCredentialStoreLocked

@@ -357,7 +357,7 @@ func (m *maintenance) acceptPublication() {
 		return
 	}
 	s.accepted = publicationIdentity{vault: ep.VaultID, revision: ep.Revision, generation: ep.Generation, hash: ep.MetaHash}
-	s.beginLockLocked(true)
+	s.beginRefreshLocked()
 }
 
 // lockMaintenanceGuard waits for prior revocation without holding the mutex.

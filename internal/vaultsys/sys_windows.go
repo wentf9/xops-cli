@@ -72,12 +72,15 @@ func nativeError(err error) error {
 }
 
 func Openat(fd int, name string, flags int, mode uint32) (int, error) {
-	if name == ".." {
+	if name == "." || name == ".." {
 		path, err := handlePath(fd)
 		if err != nil {
 			return -1, err
 		}
-		parent, err := windows.UTF16PtrFromString(filepath.Dir(path))
+		if name == ".." {
+			path = filepath.Dir(path)
+		}
+		parent, err := windows.UTF16PtrFromString(path)
 		if err != nil {
 			return -1, err
 		}

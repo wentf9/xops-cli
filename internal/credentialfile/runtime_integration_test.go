@@ -531,3 +531,49 @@ func TestRuntimeCacheChecksActualCiphertext(t *testing.T) {
 		t.Fatalf("cache ignored mutation: %v", err)
 	}
 }
+
+func TestRuntimeReadWaitsForMaintenanceRevocation(t *testing.T) {
+	f := makeFixture(t)
+	material := adminMaterial(t, f)
+	r := testRuntime(t, nil, nil)
+	s := runtimeStore(t, r, f, SessionOptions{Mode: "key-file", KeyFile: material.KeyFile})
+	value := credential.NewSecret([]byte("public-revocation-value"))
+	defer value.Zero()
+	if err := s.Put(t.Context(), f.ref, value); err != nil {
+		t.Fatal(err)
+	}
+	pub, err := s.publication(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := s.session.acquire(t.Context(), pub.data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := false
+	defer func() {
+		if !released {
+			lease.release()
+		}
+	}()
+	if _, err := s.Reencrypt(t.Context(), material); err != nil {
+		t.Fatal(err)
+	}
+	readDone := make(chan error, 1)
+	go func() { got, err := s.Get(t.Context(), f.ref); got.Zero(); readDone <- err }()
+	select {
+	case err := <-readDone:
+		t.Fatalf("read did not wait for revocation: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	lease.release()
+	released = true
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("read did not resume after maintenance revocation")
+	}
+}

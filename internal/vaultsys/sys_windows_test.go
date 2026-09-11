@@ -60,3 +60,39 @@ func TestWindowsPrivateACLRejectsPublicRead(t *testing.T) {
 		t.Fatal("public-read ACL accepted as private")
 	}
 }
+
+func TestWindowsDirectoryDotOpensForEnumeration(t *testing.T) {
+	root, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := root.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	fd, err := Openat(int(root.Fd()), ".", O_RDONLY|O_DIRECTORY|O_NOFOLLOW, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := os.NewFile(uintptr(fd), "directory-enumeration")
+	defer func() {
+		if err := directory.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	entries, err := directory.ReadDir(-1)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("directory enumeration: %v", err)
+	}
+	var original, reopened Stat_t
+	if err := Fstat(int(root.Fd()), &original); err != nil {
+		t.Fatal(err)
+	}
+	if err := Fstat(fd, &reopened); err != nil {
+		t.Fatal(err)
+	}
+	if original.Ino != reopened.Ino || original.Dev != reopened.Dev {
+		t.Fatal("dot opened a different directory")
+	}
+}

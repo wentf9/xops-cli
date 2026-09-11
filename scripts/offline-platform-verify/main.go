@@ -34,6 +34,12 @@ func main() {
 }
 
 func verify() (err error) {
+	stage := "prepare"
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("%s: %w", stage, err)
+		}
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	temporary, err := os.MkdirTemp("", "xops-platform-")
@@ -79,6 +85,7 @@ func verify() (err error) {
 	if err = os.Rename(key+".backup", key); err != nil {
 		return err
 	}
+	stage = "unlock restored key"
 	if err = store.Unlock(ctx); err != nil {
 		return err
 	}
@@ -101,6 +108,12 @@ func verify() (err error) {
 }
 
 func verifyClone(ctx context.Context, runtime *credentialfile.Runtime, store *credentialfile.Store, root string, ref credential.Ref, value []byte) (err error) {
+	stage := "clone"
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("%s: %w", stage, err)
+		}
+	}()
 	clonePath, cloneKey := filepath.Join(root, "clone"), filepath.Join(root, "clone.key")
 	target := credentialfile.Wrapping{Mode: "key-file", KeyFile: cloneKey}
 	if _, err = store.Clone(ctx, clonePath, "copy", target); err != nil {
@@ -114,12 +127,14 @@ func verifyClone(ctx context.Context, runtime *credentialfile.Runtime, store *cr
 	if err = checkValue(ctx, clone, cloneRef, value); err != nil {
 		return err
 	}
+	stage = "reencrypt clone"
 	if _, err = clone.Reencrypt(ctx, target); err != nil {
 		return fmt.Errorf("reencrypt: %w", err)
 	}
 	if err = checkValue(ctx, clone, cloneRef, value); err != nil {
 		return err
 	}
+	stage = "delete clone value"
 	if err = clone.Delete(ctx, cloneRef); err != nil {
 		return err
 	}
