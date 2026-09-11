@@ -124,8 +124,11 @@ func aclEntryBits(api *darwinACLAPI, entry uintptr) (uint32, error) {
 func getDarwinACL(api *darwinACLAPI, fd int) (uintptr, unix.Errno) {
 	for range 8 {
 		value, _, status := purego.SyscallN(api.getFD, uintptr(fd), 0x100)
-		if value != 0 || unix.Errno(status) != unix.EINTR {
-			return value, unix.Errno(status)
+		// libc errno is a 32-bit int. The FFI return slot is uintptr-sized;
+		// upper bits are not part of the error code on 64-bit Darwin.
+		code := unix.Errno(uint32(status))
+		if value != 0 || code != unix.EINTR {
+			return value, code
 		}
 	}
 	return 0, unix.EINTR
