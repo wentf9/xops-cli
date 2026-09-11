@@ -177,6 +177,9 @@ func securityMode(handle windows.Handle, directory bool) (uint32, uint32, error)
 	if err != nil {
 		return 0, 0, err
 	}
+	if owner == nil {
+		return 0, 0, os.ErrPermission
+	}
 	uid, err := windowsOwnerID(owner, sid)
 	if err != nil {
 		return 0, 0, err

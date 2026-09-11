@@ -7,15 +7,13 @@ import (
 	"fmt"
 	"golang.org/x/sys/unix"
 	"os"
-	"runtime"
 	"sync"
 
 	"github.com/ebitengine/purego"
 )
 
 type darwinACLAPI struct {
-	errno func() *int32
-	getFD func(int32, uint32) uintptr
+	getFD uintptr
 	valid func(uintptr) int32
 	entry func(uintptr, int32, *uintptr) int32
 	tag   func(uintptr, *uint32) int32
@@ -32,11 +30,15 @@ var loadDarwinACL = sync.OnceValues(func() (*darwinACLAPI, error) {
 		return nil, err
 	}
 	api := &darwinACLAPI{}
+	api.getFD, err = purego.Dlsym(lib, "acl_get_fd_np")
+	if err != nil {
+		return nil, errors.Join(err, purego.Dlclose(lib))
+	}
 	for _, binding := range []struct {
 		name   string
 		target any
 	}{
-		{"__error", &api.errno}, {"acl_get_fd_np", &api.getFD}, {"acl_valid", &api.valid}, {"acl_get_entry", &api.entry},
+		{"acl_valid", &api.valid}, {"acl_get_entry", &api.entry},
 		{"acl_get_tag_type", &api.tag}, {"acl_get_permset_mask_np", &api.mask},
 		{"acl_get_flagset_np", &api.flags}, {"acl_get_flag_np", &api.flag}, {"acl_free", &api.free},
 	} {
@@ -57,17 +59,12 @@ func aclPermissionBits(fd int) (bits uint32, err error) {
 	if err != nil {
 		return 0, fmt.Errorf("load macOS ACL API: %w", err)
 	}
-	runtime.LockOSThread()
-	errno := api.errno()
-	*errno = 0
-	acl := api.getFD(int32(fd), 0x100)
-	status := unix.Errno(*errno)
-	runtime.UnlockOSThread()
+	acl, status := getDarwinACL(api, fd)
 	if acl == 0 {
 		if status == unix.ENOENT || status == unix.ENOTSUP {
 			return 0, nil
 		}
-		return 0, fmt.Errorf("read macOS file ACL: %w", errors.Join(os.ErrPermission, status))
+		return 0, fmt.Errorf("read macOS file ACL: %w", status)
 	}
 	defer func() {
 		if api.free(acl) != 0 {
@@ -120,4 +117,16 @@ func aclEntryBits(api *darwinACLAPI, entry uintptr) (uint32, error) {
 		bits |= 0022
 	}
 	return bits, nil
+}
+
+// Capture errno in the same native call. Reading thread-local errno after
+// returning through Go can observe an unrelated runtime/library operation.
+func getDarwinACL(api *darwinACLAPI, fd int) (uintptr, unix.Errno) {
+	for range 8 {
+		value, _, status := purego.SyscallN(api.getFD, uintptr(fd), 0x100)
+		if value != 0 || unix.Errno(status) != unix.EINTR {
+			return value, unix.Errno(status)
+		}
+	}
+	return 0, unix.EINTR
 }

@@ -133,6 +133,11 @@ func validateWrappingKeyLocation(vaultPath string, material Wrapping) error {
 	if material.Mode != "key-file" {
 		return nil
 	}
+	// Windows keys may intentionally live on another drive/share. Physical
+	// ancestor checks still run after opening the paths, including aliases.
+	if filepath.IsAbs(vaultPath) && filepath.IsAbs(material.KeyFile) && !strings.EqualFold(filepath.VolumeName(vaultPath), filepath.VolumeName(material.KeyFile)) {
+		return nil
+	}
 	relative, err := filepath.Rel(vaultPath, material.KeyFile)
 	if err != nil {
 		return fmt.Errorf("resolve wrapping key location: %w", err)
