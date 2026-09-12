@@ -8,6 +8,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/wentf9/xops-cli/pkg/config"
+	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
 func TestConfigurationMutationCmdPropagatesParentCancellation(t *testing.T) {
@@ -100,6 +101,7 @@ func TestHandleConfigurationMutationClassifiesTerminalErrors(t *testing.T) {
 		{name: "conflict", err: config.ErrConfigConflict, wantState: viewForm, wantText: "tui_status_conflict"},
 		{name: "canceled", err: context.Canceled, wantState: viewForm, wantText: "canceled"},
 		{name: "durability", err: &config.DurabilityError{Err: errors.New("sync directory")}, wantState: viewList, wantText: "tui_status_not_durable"},
+		{name: "cleanup", err: &credential.CleanupError{Err: context.Canceled}, wantState: viewList, wantText: "tui_status_cleanup_pending"},
 		{name: "ordinary failure", err: errors.New("write failed"), wantState: viewForm, wantText: "failed"},
 	}
 

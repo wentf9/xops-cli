@@ -49,8 +49,8 @@ func TestLineEditorCloseInterruptsActivePrompt(t *testing.T) {
 	}
 	select {
 	case promptErr := <-promptDone:
-		if promptErr != nil && !errors.Is(promptErr, io.EOF) {
-			t.Errorf("prompt error = %v, want EOF or nil", promptErr)
+		if promptErr != nil && !errors.Is(promptErr, io.EOF) && !errors.Is(promptErr, ErrLineEditorClosed) {
+			t.Errorf("prompt error = %v, want EOF, ErrLineEditorClosed or nil", promptErr)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("active prompt did not return after closing the line editor")

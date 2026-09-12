@@ -1,9 +1,16 @@
 package cmd
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/pkg/config"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -13,7 +20,24 @@ import (
 	"github.com/wentf9/xops-cli/pkg/logger"
 )
 
-func Execute() error {
+func Execute() (err error) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	path, _, err := utils.GetConfigFilePath()
+	if err != nil {
+		return err
+	}
+	path, err = filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	owner := config.NewEncryptedRuntime(ctx, path, newCLIInteractionHandler())
+	defer func() { err = errors.Join(err, owner.Close()) }()
+	detach, err := utils.InstallCredentialRuntime(owner)
+	if err != nil {
+		return err
+	}
+	defer detach()
 	rootCmd := newRootCmd()
 
 	// 初始化 root 命令的 flags
@@ -32,7 +56,7 @@ func Execute() error {
 		}
 	}
 
-	return rootCmd.Execute()
+	return rootCmd.ExecuteContext(ctx)
 }
 
 func newRootCmd() *cobra.Command {
@@ -87,7 +111,10 @@ func newRootCmd() *cobra.Command {
 			if logLevel == "debug" {
 				logger.Debug(i18n.T("debug_mode_enabled"))
 			}
-			return nil
+			if err := autoMigrateConfiguration(cmd); err != nil {
+				return err
+			}
+			return warnLegacyConfiguration(cmd)
 		},
 	}
 }
@@ -113,6 +140,7 @@ func registerCommands(rootCmd *cobra.Command) {
 	rootCmd.AddCommand(NewCmdExec())
 	rootCmd.AddCommand(NewCmdPlay())
 	rootCmd.AddCommand(NewCmdIdentity())
+	rootCmd.AddCommand(NewCmdCredential())
 	rootCmd.AddCommand(newCmdNc())
 	rootCmd.AddCommand(newCmdDns())
 	rootCmd.AddCommand(newCmdPing())

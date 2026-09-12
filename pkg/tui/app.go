@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/charmbracelet/huh"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
+	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
 	"github.com/wentf9/xops-cli/pkg/ssh"
@@ -29,31 +31,36 @@ const (
 )
 
 type Model struct {
-	ctx              context.Context
-	repository       *config.Repository
-	connector        *ssh.Connector
-	list             list.Model
-	form             *huh.Form
-	formState        *nodeFormState
-	tagForm          *huh.Form
-	monitor          monitorModel
-	logSelect        logSelectModel
-	logStreamer      logStreamerModel
-	logSessionID     int64
-	tagMode          string // "add" or "remove"
-	selectedTags     []string
-	newTagsInput     string // 新标签输入
-	listRevision     uint64
-	tagRevision      uint64
-	state            viewState
-	status           string
-	lastSize         tea.WindowSizeMsg
-	deletePending    bool
-	mutationPending  bool
-	mutation         *configurationMutation
-	lifecycleCancel  context.CancelFunc
-	statusGeneration uint64
-	formConflict     bool
+	terminalConnection *terminalConnection
+	terminalContext    context.Context
+	connectionConfig   modelConfig
+	vaultControl       func(context.Context, bool) error
+	ctx                context.Context
+	repository         *config.Repository
+	connector          *ssh.Connector
+	list               list.Model
+	form               *huh.Form
+	formState          *nodeFormState
+	tagForm            *huh.Form
+	monitor            monitorModel
+	logSelect          logSelectModel
+	logStreamer        logStreamerModel
+	logSessionID       int64
+	tagMode            string // "add" or "remove"
+	selectedTags       []string
+	newTagsInput       string // 新标签输入
+	listRevision       uint64
+	tagRevision        uint64
+	state              viewState
+	status             string
+	lastSize           tea.WindowSizeMsg
+	deletePending      bool
+	mutationPending    bool
+	mutation           *configurationMutation
+	lifecycleCancel    context.CancelFunc
+	statusGeneration   uint64
+	formConflict       bool
+	credentialService  *credential.Service
 }
 
 const configMutationTimeout = 10 * time.Second
@@ -146,12 +153,32 @@ func (m *configurationMutation) close() error {
 type ModelOption func(*modelConfig)
 
 type modelConfig struct {
-	logger      logger.DebugLogger
-	ctx         context.Context
-	interaction ssh.InteractionHandler
+	rememberPolicy         string
+	persistenceUnavailable bool
+	vaultControl           func(context.Context, bool) error
+	rememberConfirmation   func(context.Context, string) (bool, error)
+	logger                 logger.DebugLogger
+	ctx                    context.Context
+	interaction            ssh.InteractionHandler
+	credentialService      *credential.Service
+	credentialRegistry     *credential.Registry
 }
 
-// WithInteractionHandler injects presentation-owned SSH prompts into the TUI.
+// WithRememberPolicy overrides automatic recording for this TUI invocation.
+// Explicit credential form edits remain available under never.
+func WithRememberPolicy(policy string) ModelOption {
+	return func(cfg *modelConfig) { cfg.rememberPolicy = policy }
+}
+
+// WithRememberConfirmation supplies the UI decision for remember_prompted: ask.
+// Without a confirmer, ask remains session-only. The callback runs with the
+// terminal released and must respect context cancellation.
+func WithRememberConfirmation(confirm func(context.Context, string) (bool, error)) ModelOption {
+	return func(cfg *modelConfig) { cfg.rememberConfirmation = confirm }
+}
+
+// WithInteractionHandler injects SSH prompts run while Bubble Tea has released
+// its terminal. Handlers must not wait on the paused TUI event loop.
 func WithInteractionHandler(interaction ssh.InteractionHandler) ModelOption {
 	return func(cfg *modelConfig) {
 		cfg.interaction = interaction
@@ -176,6 +203,26 @@ func WithContext(ctx context.Context) ModelOption {
 	}
 }
 
+// WithCredentialService injects the credential service used for secure secret management.
+func WithCredentialService(svc *credential.Service) ModelOption {
+	return func(cfg *modelConfig) {
+		cfg.credentialService = svc
+	}
+}
+
+// WithCredentialPersistenceUnavailable keeps connections usable when the CLI
+// cannot initialize automatic saving. Explicit credential edits still fail.
+func WithCredentialPersistenceUnavailable(unavailable bool) ModelOption {
+	return func(cfg *modelConfig) { cfg.persistenceUnavailable = unavailable }
+}
+
+// WithCredentialRegistry injects the credential registry used to resolve stored secrets for SSH.
+func WithCredentialRegistry(reg *credential.Registry) ModelOption {
+	return func(cfg *modelConfig) {
+		cfg.credentialRegistry = reg
+	}
+}
+
 // NewModel initializes the TUI model. Package components use a no-op logger
 // unless the CLI composition root explicitly supplies one with WithLogger.
 func NewModel(repository *config.Repository, opts ...ModelOption) (Model, error) {
@@ -188,25 +235,29 @@ func NewModel(repository *config.Repository, opts ...ModelOption) (Model, error)
 			opt(&cfg)
 		}
 	}
-	var connOpts []ssh.Option
-	if cfg.logger != nil {
-		connOpts = append(connOpts, ssh.WithLogger(cfg.logger))
+	policy := tuiRememberPolicy(repository.Snapshot(), cfg)
+	if policy != "always" && policy != "ask" && policy != "never" {
+		return Model{}, fmt.Errorf("invalid TUI remember policy %q", policy)
 	}
-	if cfg.interaction != nil {
-		connOpts = append(connOpts, ssh.WithInteractionHandler(cfg.interaction))
-	}
-	connector := adapter.NewConnector(repository, connOpts...)
+	connector, _ := newTerminalConnector(repository, cfg)
 	view := repository.View()
 	lifecycleCtx, lifecycleCancel := context.WithCancel(cfg.ctx)
 	m := Model{
-		ctx:             lifecycleCtx,
-		lifecycleCancel: lifecycleCancel,
-		repository:      repository,
-		connector:       connector,
-		state:           viewList,
-		listRevision:    view.Revision,
+		terminalContext:   lifecycleCtx,
+		connectionConfig:  cfg,
+		vaultControl:      cfg.vaultControl,
+		ctx:               credential.WithoutInteraction(lifecycleCtx),
+		lifecycleCancel:   lifecycleCancel,
+		repository:        repository,
+		credentialService: cfg.credentialService,
+		connector:         connector,
+		state:             viewList,
+		listRevision:      view.Revision,
 	}
 	m.list = newListModelFromView(view)
+	if automaticSavingUnavailable(repository, cfg) {
+		m.status = i18n.T("tui_credential_saving_unavailable")
+	}
 	return m, nil
 }
 
@@ -262,11 +313,16 @@ func (m *Model) handleConfigurationMutation(msg configurationMutationMsg) (tea.M
 	m.mutationPending = false
 	if msg.err != nil {
 		var durabilityErr *config.DurabilityError
+		var cleanupErr *credential.CleanupError
 		switch {
 		case errors.As(msg.err, &durabilityErr):
 			m.refreshList()
 			m.state = viewList
 			m.status = errorStyle.Render(i18n.Tf("tui_status_not_durable", map[string]any{"Error": msg.err}))
+		case errors.As(msg.err, &cleanupErr):
+			m.refreshList()
+			m.state = viewList
+			m.status = errorStyle.Render(i18n.Tf("tui_status_cleanup_pending", map[string]any{"Error": msg.err}))
 		case errors.Is(msg.err, config.ErrConfigConflict):
 			m.formConflict = msg.kind == configurationMutationForm
 			m.status = errorStyle.Render(i18n.Tf("tui_status_conflict", map[string]any{"Error": msg.err}))
@@ -317,6 +373,11 @@ func (m *Model) Close() error {
 	if m.lifecycleCancel != nil {
 		m.lifecycleCancel()
 	}
+	if m.terminalConnection != nil {
+		if err := m.terminalConnection.Close(); err != nil {
+			closeErrs = append(closeErrs, fmt.Errorf("close terminal connection: %w", err))
+		}
+	}
 	if m.mutation != nil {
 		if err := m.mutation.close(); err != nil {
 			closeErrs = append(closeErrs, fmt.Errorf("wait for configuration mutation: %w", err))
@@ -347,6 +408,8 @@ type tickMsg struct {
 // events and view dispatch.
 func (m *Model) handleAsyncMessage(msg tea.Msg) (bool, tea.Cmd) {
 	switch msg := msg.(type) {
+	case terminalConnectionResult:
+		return true, m.handleTerminalConnection(msg)
 	case monitorConnectedMsg:
 		if msg.err != nil {
 			m.status = errorStyle.Render(fmt.Sprintf("Connection failed: %v", msg.err))
@@ -354,6 +417,7 @@ func (m *Model) handleAsyncMessage(msg tea.Msg) (bool, tea.Cmd) {
 		}
 		m.status = ""
 		m.monitor = newMonitorModel(m.ctx, msg.nodeID, msg.client)
+		m.monitor.width, m.monitor.height = m.lastSize.Width, m.lastSize.Height
 		m.state = viewMonitor
 		return true, m.monitor.Init()
 	case logScannerConnectedMsg:
@@ -393,6 +457,18 @@ func (m *Model) handleAsyncMessage(msg tea.Msg) (bool, tea.Cmd) {
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if _, ok := msg.(tickMsg); ok && m.terminalConnection != nil {
+		return m, nil
+	}
+	if key, ok := msg.(tea.KeyMsg); ok && m.terminalConnection != nil {
+		if key.String() == "ctrl+c" {
+			return m, tea.Quit
+		}
+		return m, nil
+	}
+	if handled, cmd := m.handleVaultMessage(msg); handled {
+		return m, cmd
+	}
 	if handled, cmd := m.handleAsyncMessage(msg); handled {
 		return m, cmd
 	}
@@ -520,4 +596,33 @@ func (m Model) View() string {
 	}
 
 	return appStyle.Render(s)
+}
+
+func credentialAdapterOptions(repository *config.Repository, cfg modelConfig) []adapter.Option {
+	var adpOpts []adapter.Option
+	if cfg.credentialRegistry != nil {
+		adpOpts = append(adpOpts, adapter.WithCredentialSource(cfg.credentialRegistry))
+	}
+	if cfg.credentialService != nil {
+		adpOpts = append(adpOpts, adapter.WithCredentialService(cfg.credentialService))
+	}
+	snapshot := repository.Snapshot()
+	policy := tuiRememberPolicy(snapshot, cfg)
+	recording := snapshot.CanRememberCredentials() && cfg.credentialService != nil && (policy == "always" || (policy == "ask" && cfg.rememberConfirmation != nil))
+	adpOpts = append(adpOpts, adapter.WithCredentialRecording(recording))
+	if policy == "ask" {
+		adpOpts = append(adpOpts, adapter.WithRememberConfirmation(cfg.rememberConfirmation))
+	}
+	return adpOpts
+}
+
+func tuiRememberPolicy(snapshot *config.Configuration, cfg modelConfig) string {
+	policy := strings.ToLower(strings.TrimSpace(cfg.rememberPolicy))
+	if policy == "" && snapshot.Credential != nil {
+		policy = snapshot.Credential.RememberPrompted
+	}
+	if policy == "" {
+		return "ask"
+	}
+	return policy
 }

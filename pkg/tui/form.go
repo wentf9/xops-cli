@@ -12,6 +12,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
 	"github.com/wentf9/xops-cli/pkg/config"
+	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/models"
 	fileutil "github.com/wentf9/xops-cli/pkg/utils/file"
@@ -33,6 +34,29 @@ type nodeFormState struct {
 	passphrase string
 	sudoMode   string
 	tags       string
+
+	// 凭据状态与操作
+	passwordAction          string // "keep", "replace", "delete"
+	passwordStoreStatus     string // "stored in <StoreID>", "legacy plaintext", "not set"
+	passphraseAction        string // "keep", "replace", "delete"
+	passphraseStoreStatus   string // "stored in <StoreID>", "legacy plaintext", "not set"
+	existingPasswordRef     *credential.Ref
+	existingPassphraseRef   *credential.Ref
+	existingPlainPassword   string
+	existingPlainPassphrase string
+}
+
+type formCredentialActions struct {
+	password   string
+	passphrase string
+	// cleanupRef is the old authentication method's reference. It is removed
+	// only after the replacement credential has been committed successfully.
+	cleanupKind              credential.Kind
+	cleanupRef               *credential.Ref
+	keyPath                  string
+	clearKeyPath             bool
+	clearLegacyLoginPassword bool
+	clearLegacyPassphrase    bool
 }
 
 func (m *Model) initForm(nodeID string) (Model, tea.Cmd) {
@@ -74,78 +98,115 @@ func (m *Model) initForm(nodeID string) (Model, tea.Cmd) {
 	// 计算合理高度（保留 3 行用于底部状态和 help 说明）
 	formHeight := max(m.lastSize.Height-3, 1)
 
+	var fields []huh.Field
+	fields = append(fields,
+		// 基本信息
+		huh.NewInput().
+			Title(i18n.T("tui_form_alias")).
+			Value(&state.alias).
+			Validate(m.validateAliases),
+		huh.NewInput().
+			Title(i18n.T("tui_form_user")).
+			Value(&state.user).
+			Validate(func(s string) error {
+				if strings.TrimSpace(s) == "" {
+					return errors.New(i18n.T("tui_validation_user_required"))
+				}
+				return nil
+			}),
+		huh.NewInput().
+			Title(i18n.T("tui_form_address")).
+			Value(&state.address).
+			Validate(func(s string) error {
+				if strings.TrimSpace(s) == "" {
+					return errors.New(i18n.T("tui_validation_address_required"))
+				}
+				return nil
+			}),
+		huh.NewInput().
+			Title(i18n.T("tui_form_port")).
+			Value(&state.port).
+			Validate(func(s string) error {
+				if _, err := strconv.Atoi(s); err != nil {
+					return errors.New(i18n.T("tui_validation_port_invalid"))
+				}
+				return nil
+			}),
+		// 认证信息
+		huh.NewSelect[string]().
+			Title(i18n.T("tui_form_auth_type")).
+			Options(
+				huh.NewOption("Password", "password"),
+				huh.NewOption("Key File", "key"),
+			).
+			Value(&state.authType).
+			Inline(true),
+	)
+
+	if state.isEdit {
+		fields = append(fields,
+			huh.NewSelect[string]().
+				Title(fmt.Sprintf("%s (%s)", i18n.T("tui_form_password_action"), state.passwordStoreStatus)).
+				Options(
+					huh.NewOption(i18n.T("tui_action_keep"), "keep"),
+					huh.NewOption(i18n.T("tui_action_replace"), "replace"),
+					huh.NewOption(i18n.T("tui_action_delete"), "delete"),
+				).
+				Value(&state.passwordAction).
+				Inline(true),
+		)
+	}
+
+	fields = append(fields,
+		huh.NewInput().
+			Title(i18n.T("tui_form_password")).
+			EchoMode(huh.EchoModePassword).
+			Value(&state.password),
+		huh.NewInput().
+			Title(i18n.T("tui_form_key_path")).
+			Value(&state.keyPath),
+	)
+
+	if state.isEdit {
+		fields = append(fields,
+			huh.NewSelect[string]().
+				Title(fmt.Sprintf("%s (%s)", i18n.T("tui_form_passphrase_action"), state.passphraseStoreStatus)).
+				Options(
+					huh.NewOption(i18n.T("tui_action_keep"), "keep"),
+					huh.NewOption(i18n.T("tui_action_replace"), "replace"),
+					huh.NewOption(i18n.T("tui_action_delete"), "delete"),
+				).
+				Value(&state.passphraseAction).
+				Inline(true),
+		)
+	}
+
+	fields = append(fields,
+		huh.NewInput().
+			Title(i18n.T("tui_form_key_pass")).
+			EchoMode(huh.EchoModePassword).
+			Value(&state.passphrase),
+		// 其他设置
+		huh.NewSelect[string]().
+			Title(i18n.T("tui_form_sudo_mode")).
+			Options(
+				huh.NewOption("Auto", string(models.SudoModeAuto)),
+				huh.NewOption("Sudo", string(models.SudoModeSudo)),
+				huh.NewOption("Su", string(models.SudoModeSu)),
+				huh.NewOption("Sudoer", string(models.SudoModeSudoer)),
+				huh.NewOption("Root", string(models.SudoModeRoot)),
+				huh.NewOption("None", string(models.SudoModeNone)),
+			).
+			Value(&state.sudoMode).
+			Inline(true),
+		huh.NewInput().
+			Title(i18n.T("tui_form_tags")).
+			Value(&state.tags).
+			Validate(m.validateTags),
+	)
+
 	m.form = huh.NewForm(
-		huh.NewGroup(
-			// 基本信息
-			huh.NewInput().
-				Title(i18n.T("tui_form_alias")).
-				Value(&state.alias).
-				Validate(m.validateAliases),
-			huh.NewInput().
-				Title(i18n.T("tui_form_user")).
-				Value(&state.user).
-				Validate(func(s string) error {
-					if strings.TrimSpace(s) == "" {
-						return errors.New(i18n.T("tui_validation_user_required"))
-					}
-					return nil
-				}),
-			huh.NewInput().
-				Title(i18n.T("tui_form_address")).
-				Value(&state.address).
-				Validate(func(s string) error {
-					if strings.TrimSpace(s) == "" {
-						return errors.New(i18n.T("tui_validation_address_required"))
-					}
-					return nil
-				}),
-			huh.NewInput().
-				Title(i18n.T("tui_form_port")).
-				Value(&state.port).
-				Validate(func(s string) error {
-					if _, err := strconv.Atoi(s); err != nil {
-						return errors.New(i18n.T("tui_validation_port_invalid"))
-					}
-					return nil
-				}),
-			// 认证信息
-			huh.NewSelect[string]().
-				Title(i18n.T("tui_form_auth_type")).
-				Options(
-					huh.NewOption("Password", "password"),
-					huh.NewOption("Key File", "key"),
-				).
-				Value(&state.authType).
-				Inline(true),
-			huh.NewInput().
-				Title(i18n.T("tui_form_password")).
-				EchoMode(huh.EchoModePassword).
-				Value(&state.password),
-			huh.NewInput().
-				Title(i18n.T("tui_form_key_path")).
-				Value(&state.keyPath),
-			huh.NewInput().
-				Title(i18n.T("tui_form_key_pass")).
-				EchoMode(huh.EchoModePassword).
-				Value(&state.passphrase),
-			// 其他设置
-			huh.NewSelect[string]().
-				Title(i18n.T("tui_form_sudo_mode")).
-				Options(
-					huh.NewOption("Auto", string(models.SudoModeAuto)),
-					huh.NewOption("Sudo", string(models.SudoModeSudo)),
-					huh.NewOption("Su", string(models.SudoModeSu)),
-					huh.NewOption("Sudoer", string(models.SudoModeSudoer)),
-					huh.NewOption("Root", string(models.SudoModeRoot)),
-					huh.NewOption("None", string(models.SudoModeNone)),
-				).
-				Value(&state.sudoMode).
-				Inline(true),
-			huh.NewInput().
-				Title(i18n.T("tui_form_tags")).
-				Value(&state.tags).
-				Validate(m.validateTags),
-		),
+		huh.NewGroup(fields...),
 	).WithTheme(huh.ThemeCharm()).
 		WithKeyMap(km).
 		WithWidth(m.lastSize.Width).
@@ -165,6 +226,10 @@ func (m *Model) newNodeFormState(nodeID string) (*nodeFormState, error) {
 	}
 
 	if nodeID == "" {
+		state.passwordAction = "replace"
+		state.passwordStoreStatus = "not set"
+		state.passphraseAction = "replace"
+		state.passphraseStoreStatus = "not set"
 		return state, nil
 	}
 
@@ -195,9 +260,37 @@ func (m *Model) newNodeFormState(nodeID string) (*nodeFormState, error) {
 	} else if identity.KeyPath != "" {
 		state.authType = "key"
 	}
-	state.password = identity.Password
+
+	// 追踪凭据 Store 状态，默认 keep，绝对不回填秘密明文
+	if identity.LoginPasswordRef != nil && !identity.LoginPasswordRef.IsEmpty() {
+		state.passwordStoreStatus = fmt.Sprintf("stored in %s", identity.LoginPasswordRef.StoreID)
+		state.existingPasswordRef = identity.LoginPasswordRef.Clone()
+		state.passwordAction = "keep"
+	} else if identity.Password != "" {
+		state.passwordStoreStatus = "legacy plaintext"
+		state.existingPlainPassword = identity.Password
+		state.passwordAction = "keep"
+	} else {
+		state.passwordStoreStatus = "not set"
+		state.passwordAction = "keep"
+	}
+
+	if identity.PassphraseRef != nil && !identity.PassphraseRef.IsEmpty() {
+		state.passphraseStoreStatus = fmt.Sprintf("stored in %s", identity.PassphraseRef.StoreID)
+		state.existingPassphraseRef = identity.PassphraseRef.Clone()
+		state.passphraseAction = "keep"
+	} else if identity.Passphrase != "" {
+		state.passphraseStoreStatus = "legacy plaintext"
+		state.existingPlainPassphrase = identity.Passphrase
+		state.passphraseAction = "keep"
+	} else {
+		state.passphraseStoreStatus = "not set"
+		state.passphraseAction = "keep"
+	}
+
+	state.password = ""
 	state.keyPath = identity.KeyPath
-	state.passphrase = identity.Passphrase
+	state.passphrase = ""
 	state.sudoMode = string(node.SudoMode)
 	if state.sudoMode == "" {
 		state.sudoMode = string(models.SudoModeAuto)
@@ -349,19 +442,17 @@ func (m *Model) saveFormCmd() tea.Cmd {
 		absKeyPath = fileutil.ToAbsolutePath(s.keyPath)
 	}
 
-	// Try to get existing identity to preserve any extra fields.
-	identity, _ := view.Configuration.Identities.Get(identityID)
-	identity.User = s.user
-	identity.AuthType = s.authType
-	if s.authType == "password" {
-		identity.Password = s.password
-		identity.KeyPath = ""
-		identity.Passphrase = ""
-	} else {
-		identity.KeyPath = absKeyPath
-		identity.Passphrase = s.passphrase
-		identity.Password = ""
+	// Preserve the actual identity referenced by an edited node. The canonical
+	// ID is only suitable for a new node or a deliberate rename.
+	identity, ok := view.Configuration.Identities.Get(identityID)
+	if s.isEdit && node.IdentityRef != "" {
+		identity, ok = view.Configuration.Identities.Get(node.IdentityRef)
 	}
+	if !ok {
+		identity = models.Identity{}
+	}
+	actions := s.applyIdentityCredentials(&identity, absKeyPath)
+
 	// Try to get existing host to preserve any extra fields (like Host.Alias).
 	host, _ := view.Configuration.Hosts.Get(hostID)
 	host.Address = s.address
@@ -383,15 +474,210 @@ func (m *Model) saveFormCmd() tea.Cmd {
 			ref = view.NodeRefs[s.originalID]
 		}
 		run = func(ctx context.Context) error {
-			return repository.ReplaceNodeAtRefContext(ctx, ref, nodeID, node, host, identity)
+			authVersion, err := repository.ReplaceNodeAtRefWithAuthVersionContext(ctx, ref, nodeID, node, host, identity)
+			if err != nil {
+				return err
+			}
+			return m.syncCredentialsToStore(ctx, nodeID, authVersion, s, actions)
 		}
 	} else {
 		run = func(ctx context.Context) error {
-			_, err := repository.CreateNodeContext(ctx, nodeID, node, host, identity)
-			return err
+			mutation, err := repository.CreateNodeContext(ctx, nodeID, node, host, identity)
+			if err != nil {
+				return err
+			}
+			return m.syncCredentialsToStore(ctx, nodeID, mutation.AuthVersion, s, actions)
 		}
 	}
 	return m.beginConfigurationMutation(configurationMutationForm, nodeID, 0, run)
+}
+
+//nolint:gocyclo // credential actions and cross-authentication transitions must stay in one atomic state calculation
+func (s *nodeFormState) applyIdentityCredentials(identity *models.Identity, absKeyPath string) formCredentialActions {
+	actions := formCredentialActions{keyPath: absKeyPath}
+	previousAuthType := identity.AuthType
+	identity.User = s.user
+
+	actions.password = s.passwordAction
+	if actions.password == "" {
+		if s.password != "" {
+			actions.password = "replace"
+		} else {
+			actions.password = "keep"
+		}
+	}
+
+	actions.passphrase = s.passphraseAction
+	if actions.passphrase == "" {
+		if s.passphrase != "" {
+			actions.passphrase = "replace"
+		} else {
+			actions.passphrase = "keep"
+		}
+	}
+
+	// A credential store write occurs after this metadata mutation. Keep the
+	// previous authentication usable until that write atomically installs the
+	// new reference and key path.
+	credentialReplacement := (s.authType == "password" && actions.password == "replace" && s.password != "") ||
+		(s.authType == "key" && actions.passphrase == "replace" && s.passphrase != "")
+	previousRef := (*credential.Ref)(nil)
+	switch previousAuthType {
+	case "password":
+		previousRef = identity.LoginPasswordRef
+	case "key":
+		previousRef = identity.PassphraseRef
+	}
+	deferSwitch := previousAuthType != s.authType && (credentialReplacement || previousRef != nil)
+	deferKeyPath := previousAuthType == "key" && s.authType == "key" && credentialReplacement
+	deferCredentialMetadata := deferSwitch || deferKeyPath
+	identity.AuthType = s.authType
+	if deferSwitch {
+		identity.AuthType = previousAuthType
+		if previousAuthType == "password" {
+			actions.cleanupKind = credential.KindLoginPassword
+			actions.cleanupRef = identity.LoginPasswordRef.Clone()
+		} else {
+			actions.cleanupKind = credential.KindPassphrase
+			actions.cleanupRef = identity.PassphraseRef.Clone()
+		}
+	}
+	if deferSwitch && previousAuthType == "key" && s.authType == "password" {
+		actions.clearKeyPath = true
+	}
+	if previousAuthType != s.authType {
+		switch previousAuthType {
+		case "password":
+			actions.cleanupKind = credential.KindLoginPassword
+			actions.cleanupRef = identity.LoginPasswordRef.Clone()
+			if deferSwitch && identity.Password != "" {
+				actions.clearLegacyLoginPassword = true
+			}
+		case "key":
+			actions.cleanupKind = credential.KindPassphrase
+			actions.cleanupRef = identity.PassphraseRef.Clone()
+			if deferSwitch && identity.Passphrase != "" {
+				actions.clearLegacyPassphrase = true
+			}
+		}
+	}
+
+	if s.authType == "password" {
+		if !deferCredentialMetadata {
+			identity.KeyPath = ""
+			identity.Passphrase = ""
+			identity.PassphraseRef = nil
+		}
+
+		switch actions.password {
+		case "keep":
+			identity.Password = s.existingPlainPassword
+			identity.LoginPasswordRef = s.existingPasswordRef
+		case "delete":
+			if s.existingPasswordRef != nil {
+				// Keep the reference until credential.Service completes its
+				// transactional delete. This preserves a usable configuration if
+				// the store operation fails.
+				identity.Password = s.existingPlainPassword
+				identity.LoginPasswordRef = s.existingPasswordRef.Clone()
+			} else {
+				identity.Password = ""
+				identity.LoginPasswordRef = nil
+			}
+		case "replace":
+			// The secret is committed by credential.Service after this metadata
+			// update. Keep the previous ref until that transaction succeeds, so a
+			// store failure leaves a usable, secret-free configuration.
+			identity.Password = s.existingPlainPassword
+			identity.LoginPasswordRef = s.existingPasswordRef.Clone()
+		}
+	} else {
+		if !deferCredentialMetadata {
+			identity.KeyPath = absKeyPath
+			identity.Password = ""
+			identity.LoginPasswordRef = nil
+		}
+
+		switch actions.passphrase {
+		case "keep":
+			identity.Passphrase = s.existingPlainPassphrase
+			identity.PassphraseRef = s.existingPassphraseRef
+		case "delete":
+			if s.existingPassphraseRef != nil {
+				identity.Passphrase = s.existingPlainPassphrase
+				identity.PassphraseRef = s.existingPassphraseRef.Clone()
+			} else {
+				identity.Passphrase = ""
+				identity.PassphraseRef = nil
+			}
+		case "replace":
+			identity.Passphrase = s.existingPlainPassphrase
+			identity.PassphraseRef = s.existingPassphraseRef.Clone()
+		}
+	}
+	return actions
+}
+
+func (m *Model) syncCredentialsToStore(ctx context.Context, nodeID, authVersion string, s *nodeFormState, actions formCredentialActions) error {
+	if m.credentialService == nil {
+		if m.repository.Snapshot().Credential != nil && ((s.authType == "password" && (actions.password == "replace" || actions.password == "delete")) ||
+			(s.authType == "key" && (actions.passphrase == "replace" || actions.passphrase == "delete"))) {
+			return errors.New("credential service is unavailable")
+		}
+		return nil
+	}
+	credSvc := m.credentialService
+	cfg := m.repository.Snapshot()
+	targetStore := "none"
+	if cfg != nil && cfg.Credential != nil {
+		targetStore = cfg.Credential.DefaultStore
+	}
+
+	keyFingerprint := ""
+	if s.authType == "key" && actions.passphrase == "replace" {
+		target, err := config.BindPrivateKeyFingerprint(cfg, credential.Target{Kind: credential.KindPassphrase, KeyPath: actions.keyPath}, []byte(s.passphrase))
+		if err != nil {
+			return err
+		}
+		keyFingerprint = target.KeyFingerprint
+	}
+	version := authVersion
+	var err error
+	switch s.authType {
+	case "password":
+		version, err = syncFormCredential(ctx, credSvc, nodeID, credential.KindLoginPassword, authVersion, actions.password, s.existingPasswordRef, targetStore, s.password, "", s.authType, keyFingerprint, actions.clearKeyPath, actions.clearLegacyLoginPassword, actions.clearLegacyPassphrase)
+	case "key":
+		version, err = syncFormCredential(ctx, credSvc, nodeID, credential.KindPassphrase, authVersion, actions.passphrase, s.existingPassphraseRef, targetStore, s.passphrase, actions.keyPath, s.authType, keyFingerprint, actions.clearKeyPath, actions.clearLegacyLoginPassword, actions.clearLegacyPassphrase)
+	}
+	if err != nil {
+		return err
+	}
+	if actions.cleanupRef != nil {
+		target := credential.Target{NodeID: nodeID, Kind: actions.cleanupKind, KeyPath: actions.keyPath, AuthType: s.authType, ClearKeyPath: actions.clearKeyPath, ClearLegacyLoginPassword: actions.clearLegacyLoginPassword, ClearLegacyPassphrase: actions.clearLegacyPassphrase}
+		if _, err := credSvc.Delete(ctx, target, version, *actions.cleanupRef); err != nil {
+			return fmt.Errorf("remove replaced %s from credential store: %w", actions.cleanupKind, err)
+		}
+	}
+	return nil
+}
+
+func syncFormCredential(ctx context.Context, service *credential.Service, nodeID string, kind credential.Kind, version, action string, oldRef *credential.Ref, storeID, value, keyPath, authType, keyFingerprint string, clearKeyPath, clearLegacyLoginPassword, clearLegacyPassphrase bool) (string, error) {
+	target := credential.Target{NodeID: nodeID, Kind: kind, KeyPath: keyPath, KeyFingerprint: keyFingerprint, AuthType: authType, ClearKeyPath: clearKeyPath, ClearLegacyLoginPassword: clearLegacyLoginPassword, ClearLegacyPassphrase: clearLegacyPassphrase}
+	if action == "replace" && value != "" {
+		_, nextVersion, err := service.Rotate(ctx, target, version, oldRef, storeID, credential.Secret{Value: []byte(value)})
+		if err != nil {
+			return "", fmt.Errorf("save %s to credential store: %w", kind, err)
+		}
+		return nextVersion, nil
+	}
+	if action == "delete" && oldRef != nil {
+		nextVersion, err := service.Delete(ctx, target, version, *oldRef)
+		if err != nil {
+			return "", fmt.Errorf("delete %s from credential store: %w", kind, err)
+		}
+		return nextVersion, nil
+	}
+	return version, nil
 }
 
 // splitComma parses a comma-separated string into a slice of trimmed strings

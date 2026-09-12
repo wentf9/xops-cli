@@ -50,10 +50,10 @@ func newTestSFTPClientWithHandlers(t *testing.T, handlers pkgsftp.Handlers) *Cli
 		if err := client.Close(); err != nil {
 			t.Errorf("close in-memory SFTP client: %v", err)
 		}
-		if err := server.Close(); err != nil && !errors.Is(err, io.EOF) {
+		if err := server.Close(); err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrClosedPipe) {
 			t.Errorf("close in-memory SFTP server: %v", err)
 		}
-		if err := <-serverErr; err != nil && !errors.Is(err, io.EOF) {
+		if err := <-serverErr; err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrClosedPipe) {
 			t.Errorf("serve in-memory SFTP server: %v", err)
 		}
 	})

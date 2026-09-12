@@ -5,8 +5,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/models"
+	"github.com/wentf9/xops-cli/pkg/ssh"
 )
 
 type memoryStore struct {
@@ -45,6 +48,14 @@ func setupTestRepository(t *testing.T) *config.Repository {
 		Alias:       []string{"web-01"},
 		Tags:        []string{"production"},
 	})
+	// 显式指定 none store，防止在 CI headless Linux 环境（无 D-Bus）中
+	// credentialConfigOrDefault 尝试初始化 system store 失败
+	snapshot.Credential = &config.CredentialConfig{
+		DefaultStore: "none",
+		Stores: map[string]config.StoreConfig{
+			"none": {Type: config.StoreTypeNone},
+		},
+	}
 
 	store := &memoryStore{cfg: snapshot}
 	repo, err := config.NewRepositoryWithoutOpenSSH(snapshot, store)
@@ -333,8 +344,249 @@ func TestCommands_Exec_SudoAndSuPwd(t *testing.T) {
 	if node.SudoMode != models.SudoModeSudo {
 		t.Errorf("expected SudoMode=%q, got %q", models.SudoModeSudo, node.SudoMode)
 	}
-	if node.SuPwd != "mySuperSecretPassword" {
-		t.Errorf("expected SuPwd='mySuperSecretPassword', got %q", node.SuPwd)
+	if node.SuPwd != "" {
+		t.Errorf("expected discovered sudo password to remain session-only, got %q", node.SuPwd)
+	}
+}
+
+func TestCommands_ExistingNodeCredentialsStayOutOfConfiguration(t *testing.T) {
+	repo := setupTestRepository(t)
+	sshOpt := NewSshOptions()
+	sshOpt.Remember = "always"
+	sshOpt.Password = "new-synthetic-password"
+	sshOpt.Target = config.ConnectionTarget{Selector: "10.238.221.181", User: "iaas", HasUser: true}
+
+	nodeID, _, err := sshOpt.resolveNode(t.Context(), repo)
+	if err != nil {
+		t.Fatalf("resolveNode failed: %v", err)
+	}
+	snapshot, err := repo.ResolveConnection(nodeID)
+	if err != nil {
+		t.Fatalf("resolve connection failed: %v", err)
+	}
+	if snapshot.Identity.Password == sshOpt.Password {
+		t.Fatal("SSH option password was persisted in configuration")
+	}
+
+	execOpt := NewExecOptions()
+	execOpt.Remember = "always"
+	execOpt.SuPwd = "new-synthetic-sudo-password"
+	if _, err := execOpt.updateNodeFromHostInfo(t.Context(), nodeID, repo, utils.HostInfo{Host: "10.238.221.181"}); err != nil {
+		t.Fatalf("updateNodeFromHostInfo failed: %v", err)
+	}
+	snapshot, err = repo.ResolveConnection(nodeID)
+	if err != nil {
+		t.Fatalf("resolve connection after exec update failed: %v", err)
+	}
+	if snapshot.Node.SuPwd == execOpt.SuPwd {
+		t.Fatal("exec sudo password was persisted in configuration")
+	}
+}
+
+func TestCommands_ExecUsesPerHostSessionPassword(t *testing.T) {
+	repo := setupTestRepository(t)
+	execOpt := NewExecOptions()
+	execOpt.Remember = "never"
+	tasks := []execHostTask{{
+		nodeID: "iaas@10.238.221.181:22",
+		host:   "10.238.221.181",
+		pass:   "per-host-password",
+	}}
+	opts, err := execOpt.buildAdapterOptions(tasks, repo.Snapshot(), repo)
+	if err != nil {
+		t.Fatalf("build adapter options: %v", err)
+	}
+	secret, err := adapter.NewSSHAdapter(repo, opts...).ResolveSecret(t.Context(), ssh.SecretRequest{
+		NodeID: tasks[0].nodeID,
+		Kind:   ssh.SecretKindLoginPassword,
+	})
+	if err != nil {
+		t.Fatalf("resolve session secret: %v", err)
+	}
+	if string(secret) != tasks[0].pass {
+		t.Fatalf("resolved password = %q, want per-host session password", secret)
+	}
+}
+
+func TestCommands_ExecTagUsesExplicitSessionCredentials(t *testing.T) {
+	repo := setupTestRepository(t)
+	execOpt := NewExecOptions()
+	execOpt.Tag = "production"
+	execOpt.Password = "tag-password"
+	execOpt.Passphrase = "tag-passphrase"
+	execOpt.Remember = "never"
+	tasks, err := execOpt.buildTasksFromTags(repo)
+	if err != nil {
+		t.Fatalf("build tag tasks: %v", err)
+	}
+	opts, err := execOpt.buildAdapterOptions(tasks, repo.Snapshot(), repo)
+	if err != nil {
+		t.Fatalf("build adapter options: %v", err)
+	}
+	adapter := adapter.NewSSHAdapter(repo, opts...)
+	password, err := adapter.ResolveSecret(t.Context(), ssh.SecretRequest{NodeID: tasks[0].nodeID, Kind: ssh.SecretKindLoginPassword})
+	if err != nil {
+		t.Fatalf("resolve tag password: %v", err)
+	}
+	if string(password) != execOpt.Password {
+		t.Fatalf("tag password = %q, want explicit password", password)
+	}
+	passphrase, err := adapter.ResolveSecret(t.Context(), ssh.SecretRequest{NodeID: tasks[0].nodeID, Kind: ssh.SecretKindPrivateKeyPassphrase})
+	if err != nil {
+		t.Fatalf("resolve tag passphrase: %v", err)
+	}
+	if string(passphrase) != execOpt.Passphrase {
+		t.Fatalf("tag passphrase = %q, want explicit passphrase", passphrase)
+	}
+}
+
+func TestCommands_SSHSessionOnlyDoesNotInitializeSystemStore(t *testing.T) {
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "")
+	t.Setenv("DISPLAY", "")
+	t.Setenv("WAYLAND_DISPLAY", "")
+
+	repo := setupTestRepository(t)
+	cfg := repo.Snapshot()
+	cfg.Credential = nil
+	o := NewSshOptions()
+	o.Remember = "never"
+	if _, err := o.buildAdapterOptions("iaas@10.238.221.181:22", cfg, repo); err != nil {
+		t.Fatalf("build session-only options: %v", err)
+	}
+}
+
+func TestCommands_SSHRememberNeverCoversProxyJump(t *testing.T) {
+	repo := setupTestRepository(t)
+	o := NewSshOptions()
+	o.Remember = "never"
+	opts, err := o.buildAdapterOptions("final-node", repo.Snapshot(), repo)
+	if err != nil {
+		t.Fatalf("build adapter options: %v", err)
+	}
+	adp := adapter.NewSSHAdapter(repo, opts...)
+	jumpID := "iaas@10.238.221.181:22"
+	clientCfg, err := adp.GetConfig(jumpID)
+	if err != nil {
+		t.Fatalf("resolve jump config: %v", err)
+	}
+	if _, err := adp.UpdateAuth(t.Context(), jumpID, clientCfg.AuthUpdateToken, "jump-secret", "", ""); err != nil {
+		t.Fatalf("update jump auth: %v", err)
+	}
+	snapshot, err := repo.ResolveConnection(jumpID)
+	if err != nil {
+		t.Fatalf("resolve jump node: %v", err)
+	}
+	if snapshot.Identity.Password == "jump-secret" {
+		t.Fatal("--remember=never persisted a ProxyJump password")
+	}
+}
+
+func TestCommands_SSHLegacyWithoutStoreKeepsDiscoveredCredentialsInSession(t *testing.T) {
+	repo := setupTestRepository(t)
+	cfg := repo.Snapshot()
+	cfg.Credential = nil
+	o := NewSshOptions()
+	// No override: v1 defaults to ask, but has nowhere to save the answer.
+	opts, err := o.buildAdapterOptions("final-node", cfg, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adp := adapter.NewSSHAdapter(repo, opts...)
+	nodeID := "iaas@10.238.221.181:22"
+	before, err := repo.ResolveConnection(nodeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adp.UpdateAuth(t.Context(), nodeID, string(before.UpdateRef.AuthVersion[:]), "session-secret", "", ""); err != nil {
+		t.Fatalf("disabled persistence attempted a write: %v", err)
+	}
+	after, err := repo.ResolveConnection(nodeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Identity.Password != before.Identity.Password || after.Identity.LoginPasswordRef != nil {
+		t.Fatal("legacy authentication was changed without a writable default store")
+	}
+}
+
+func TestCommands_SSHSessionOnlyUsesSelectedKey(t *testing.T) {
+	repo := setupTestRepository(t)
+	o := NewSshOptions()
+	o.Remember = "never"
+	o.IdentityFile = t.TempDir()
+	o.Target = config.ConnectionTarget{Selector: "10.238.221.181", User: "iaas", HasUser: true}
+	nodeID, _, err := o.resolveNode(t.Context(), repo)
+	if err != nil {
+		t.Fatalf("resolve node: %v", err)
+	}
+	opts, err := o.buildAdapterOptions(nodeID, repo.Snapshot(), repo)
+	if err != nil {
+		t.Fatalf("build adapter options: %v", err)
+	}
+	clientCfg, err := adapter.NewSSHAdapter(repo, opts...).GetConfig(nodeID)
+	if err != nil {
+		t.Fatalf("get connection config: %v", err)
+	}
+	if clientCfg.KeyPath != o.IdentityFile {
+		t.Fatalf("KeyPath = %q, want %q", clientCfg.KeyPath, o.IdentityFile)
+	}
+}
+
+func TestCommands_ExecBatchNeverPromptsOrRecords(t *testing.T) {
+	o := NewExecOptions()
+	o.Remember = utils.RememberPolicyAlways
+	if o.shouldRememberCredential("node", nil) {
+		t.Fatal("batch execution must ignore --remember and remain session-only")
+	}
+}
+
+func TestCommands_ExecRememberNeverCoversProxyJump(t *testing.T) {
+	repo := setupTestRepository(t)
+	o := NewExecOptions()
+	o.Interactive = true
+	o.Remember = utils.RememberPolicyNever
+	opts, err := o.buildAdapterOptions([]execHostTask{{nodeID: "final-node", host: "final"}}, repo.Snapshot(), repo)
+	if err != nil {
+		t.Fatalf("build adapter options: %v", err)
+	}
+	adp := adapter.NewSSHAdapter(repo, opts...)
+	jumpID := "iaas@10.238.221.181:22"
+	clientCfg, err := adp.GetConfig(jumpID)
+	if err != nil {
+		t.Fatalf("resolve jump config: %v", err)
+	}
+	if _, err := adp.UpdateAuth(t.Context(), jumpID, clientCfg.AuthUpdateToken, "jump-secret", "", ""); err != nil {
+		t.Fatalf("update jump auth: %v", err)
+	}
+	snapshot, err := repo.ResolveConnection(jumpID)
+	if err != nil {
+		t.Fatalf("resolve jump node: %v", err)
+	}
+	if snapshot.Identity.Password == "jump-secret" {
+		t.Fatal("--remember=never persisted an exec ProxyJump password")
+	}
+}
+
+func TestCommands_ExecUsesSelectedSessionKey(t *testing.T) {
+	repo := setupTestRepository(t)
+	o := NewExecOptions()
+	o.Host = "iaas@10.238.221.181"
+	o.IdentityFile = t.TempDir()
+	o.Remember = utils.RememberPolicyNever
+	tasks, hostErrs, err := o.buildTasksFromHosts(t.Context(), repo)
+	if err != nil || len(hostErrs) != 0 {
+		t.Fatalf("build tasks: err=%v hostErrs=%v", err, hostErrs)
+	}
+	opts, err := o.buildAdapterOptions(tasks, repo.Snapshot(), repo)
+	if err != nil {
+		t.Fatalf("build adapter options: %v", err)
+	}
+	clientCfg, err := adapter.NewSSHAdapter(repo, opts...).GetConfig(tasks[0].nodeID)
+	if err != nil {
+		t.Fatalf("get connection config: %v", err)
+	}
+	if clientCfg.KeyPath != o.IdentityFile {
+		t.Fatalf("KeyPath = %q, want %q", clientCfg.KeyPath, o.IdentityFile)
 	}
 }
 

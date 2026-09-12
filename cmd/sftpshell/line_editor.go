@@ -12,6 +12,9 @@ import (
 	"github.com/wentf9/xops-cli/internal/terminal"
 )
 
+// ErrLineEditorClosed 表示 SFTP 行编辑器已经关闭。
+var ErrLineEditorClosed = errors.New("sftp line editor is closed")
+
 type lineEditor struct {
 	instance    *readline.Instance
 	input       terminal.PromptInput
@@ -96,7 +99,7 @@ func (e *lineEditor) beginPrompt() (chan struct{}, error) {
 	e.promptMu.Lock()
 	defer e.promptMu.Unlock()
 	if e.closing {
-		return nil, fmt.Errorf("sftp line editor is closed")
+		return nil, ErrLineEditorClosed
 	}
 	if e.promptDone != nil {
 		return nil, fmt.Errorf("sftp line editor already has an active prompt")

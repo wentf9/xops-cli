@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/wentf9/xops-cli/pkg/credential"
 	"io"
 	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
 	"github.com/wentf9/xops-cli/pkg/playbook"
@@ -95,6 +97,7 @@ func (o *PlayOptions) Run() error {
 // RunContext executes the Playbook and propagates caller cancellation through
 // target resolution, SSH connections, and step execution.
 func (o *PlayOptions) RunContext(ctx context.Context) (retErr error) {
+	ctx = credential.WithoutInteraction(ctx)
 	// 解析 --var 选项
 	extraVars, err := parseVars(o.Vars)
 	if err != nil {
@@ -125,13 +128,19 @@ func (o *PlayOptions) RunContext(ctx context.Context) (retErr error) {
 		return o.printDryRun(pb)
 	}
 
-	// 加载配置与 SSH 连接器
-	_, provider, _, err := utils.GetConfigStore()
+	// 加载配置与 SSH 连接器（Playbook 为批处理模式，禁止交互式密码提示）
+	_, provider, cfg, err := utils.GetConfigStore()
 	if err != nil {
 		return fmt.Errorf("%s: %w", i18n.T("config_load_error"), err)
 	}
 
-	connector := newCLIConnector(provider, ssh.WithLogger(logger.DefaultLogger()))
+	adpOpts := []adapter.Option{adapter.WithNonInteractive(true)}
+	if reg, regErr := utils.GetCredentialRegistry(cfg); regErr != nil {
+		return fmt.Errorf("initialize credential resolver: %w", regErr)
+	} else if reg != nil {
+		adpOpts = append(adpOpts, adapter.WithCredentialSource(reg))
+	}
+	connector := newNonInteractiveConnector(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
 	defer func() {
 		joinConnectorCloseError(&retErr, connector)
 	}()

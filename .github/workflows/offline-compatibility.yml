@@ -1,0 +1,114 @@
+name: Offline vault native compatibility
+
+on:
+  push:
+    branches: [work/offline-vault-compatibility, feat/credential-persistence]
+  pull_request:
+    paths:
+      - '.gitattributes'
+      - 'pkg/ssh/**'
+      - 'pkg/config/**'
+      - 'pkg/credential/**'
+      - 'internal/credentialhelper/**'
+      - 'internal/terminal/**'
+      - 'pkg/adapter/**'
+      - 'pkg/tui/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'cmd/**'
+      - 'internal/credentialfile/**'
+      - 'internal/vaultsys/**'
+      - 'internal/kdfhelper/**'
+      - 'scripts/offline-platform-verify/**'
+      - '.github/workflows/offline-compatibility.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: offline-compatibility-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - { os: macos-15, arch: arm64, race: '-race' }
+          - { os: macos-15-intel, arch: amd64, race: '-race' }
+          - { os: ubuntu-24.04, arch: amd64, race: '-race' }
+          - { os: ubuntu-24.04-arm, arch: arm64, race: '-race' }
+          - { os: windows-latest, arch: amd64, race: '-race' }
+          - { os: windows-11-arm, arch: arm64, race: '' }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      GOMAXPROCS: '2'
+      GOFLAGS: '-p=2'
+      GORACE: atexit_sleep_ms=0
+      RACE_FLAGS: ${{ matrix.race }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Exercise Windows CRLF checkout of frozen vectors
+        if: runner.os == 'Windows'
+        run: |
+          git config core.autocrlf true
+          git checkout-index --force internal/credentialfile/format/testdata/vectors.json
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          architecture: ${{ matrix.arch }}
+      - name: Report native platform
+        run: go env GOOS GOARCH CGO_ENABLED
+      - name: Build
+        run: go build ./...
+      - name: Full native shuffled tests
+        run: go test ${{ env.RACE_FLAGS }} -parallel 2 -shuffle=on ./...
+      - name: Native vault and real KDF helper (release configuration)
+        env:
+          CGO_ENABLED: '0'
+        run: go run ./scripts/offline-platform-verify
+      - name: Native operations and process-crash recovery
+        run: go test ${{ env.RACE_FLAGS }} -parallel 2 -count=1 -tags=integration ./internal/credentialfile/...
+      - name: Native credential initialization, recovery and migration
+        run: go test ${{ env.RACE_FLAGS }} -parallel 2 -count=1 -tags=integration ./pkg/config ./pkg/ssh -run '^(TestEncrypted|TestBackendMigration|TestRecoveryCorruptOfflineVault)'
+      - name: Windows ConPTY integration
+        if: runner.os == 'Windows'
+        run: go test ${{ env.RACE_FLAGS }} -count=1 -tags=integration ./cmd/sftpshell -run '^TestWindowsLineEditorConPTY$'
+      - name: Provision Linux Secret Service
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dbus-x11 gnome-keyring libsecret-tools
+      - name: Native Linux system migration round-trip
+        if: runner.os == 'Linux'
+        env:
+          XOPS_TEST_NATIVE_MIGRATION: '1'
+        run: |
+          export XDG_DATA_HOME="$RUNNER_TEMP/xops-native-data"
+          export XDG_RUNTIME_DIR="$(mktemp -d)"
+          trap 'rm -rf "$XDG_RUNTIME_DIR"' EXIT
+          dbus-run-session -- bash -e -c '
+            printf "%s" "public-ci-keyring-password" | gnome-keyring-daemon --unlock --components=secrets
+            go test ${{ env.RACE_FLAGS }} -count=1 -tags=integration ./pkg/config -run "^TestBackendMigrationNativeSystemRoundTrip$"
+          '
+      - name: Provision macOS test Keychain
+        id: native_keychain
+        if: runner.os == 'macOS'
+        run: |
+          security create-keychain -p "" "$RUNNER_TEMP/xops-native.keychain-db"
+          security default-keychain -s "$RUNNER_TEMP/xops-native.keychain-db"
+          security unlock-keychain -p "" "$RUNNER_TEMP/xops-native.keychain-db"
+          security set-keychain-settings -lut 21600 "$RUNNER_TEMP/xops-native.keychain-db"
+          security list-keychains -d user -s "$RUNNER_TEMP/xops-native.keychain-db"
+      - name: Native Windows and macOS system migration round-trip
+        if: runner.os != 'Linux'
+        env:
+          XOPS_TEST_NATIVE_MIGRATION: '1'
+        run: go test ${{ env.RACE_FLAGS }} -count=1 -tags=integration ./pkg/config -run '^TestBackendMigrationNativeSystemRoundTrip$'
+      - name: Remove macOS test Keychain
+        if: always() && runner.os == 'macOS' && steps.native_keychain.outcome == 'success'
+        run: security delete-keychain "$RUNNER_TEMP/xops-native.keychain-db"

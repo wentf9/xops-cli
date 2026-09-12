@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
 	"github.com/wentf9/xops-cli/pkg/mcpserver"
@@ -41,7 +42,7 @@ func newCmdMCPServe() *cobra.Command {
 }
 
 func runMCPServer(cmd *cobra.Command, args []string) error {
-	_, provider, _, err := utils.GetConfigStore()
+	_, provider, cfg, err := utils.GetConfigStore()
 	if err != nil {
 		return fmt.Errorf("load mcp configuration failed: %w", err)
 	}
@@ -49,11 +50,17 @@ func runMCPServer(cmd *cobra.Command, args []string) error {
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	err = mcpserver.Serve(
-		ctx,
+	serveOpts := []mcpserver.Option{
 		mcpserver.WithConfigProvider(provider),
 		mcpserver.WithLogger(logger.DefaultLogger()),
-	)
+	}
+	if reg, regErr := utils.GetCredentialRegistry(cfg); regErr != nil {
+		return fmt.Errorf("initialize credential resolver: %w", regErr)
+	} else if reg != nil {
+		serveOpts = append(serveOpts, mcpserver.WithCredentialRegistry(reg))
+	}
+
+	err = mcpserver.Serve(credential.WithoutInteraction(ctx), serveOpts...)
 	if err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) || errors.Is(err, context.Canceled) {
 			return nil

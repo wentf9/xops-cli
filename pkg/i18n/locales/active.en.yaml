@@ -498,7 +498,7 @@ prompt_sudo_password:
 prompt_su_password:
   other: "Enter su root password for {{.Node}}:"
 sudo_exec_failed:
-  other: "Sudo execution failed: {{.Error}}"
+  other: "Sudo execution failed"
 
 # ---- mcp ----
 mcp_short:
@@ -509,10 +509,13 @@ mcp_serve_short:
   other: "Start the MCP server over standard input and output"
 
 # ---- init ----
+tui_status_cleanup_pending:
+  other: "Configuration applied; credential cleanup is pending. Retry with 'xops credential gc': {{.Error}}"
+
 init_short:
   other: "Initialize local XOps configuration"
 init_long:
-  other: "Create the local configuration and encryption key, then import concrete Host entries from OpenSSH configuration. Initialization never connects to remote hosts or overwrites existing nodes."
+  other: "Create a Schema v2 configuration with credential persistence disabled (none), then import concrete Host entries from OpenSSH configuration. No encryption key is created for new installations. Initialization never connects to remote hosts or overwrites existing nodes."
 flag_init_ssh_config:
   other: "OpenSSH configuration file to import"
 flag_init_skip_ssh_import:
@@ -523,8 +526,10 @@ init_status_existing:
   other: "XOps configuration already exists; existing content was preserved"
 init_config_path:
   other: "Configuration: {{.Path}}"
-init_key_path:
-  other: "Encryption key: {{.Path}}"
+init_credential_policy:
+  other: "Credentials: encrypted-file + key-file, remembering verified credentials by default; offline storage is prepared on first save. Advanced users may manually configure system, pass, or helper. Use --remember never to disable saving and automatic migration for this invocation."
+legacy_config_warning:
+  other: "Warning: Schema v1 is deprecated and supported for two official release cycles starting with the Schema v2 default release. Run 'xops credential migrate --dry-run --to <store>' before migrating; retain the old configuration and secret.key until verification and explicit finalize-migration."
 init_import_summary:
   other: "OpenSSH hosts: imported {{.Imported}}, skipped {{.Skipped}}"
 init_import_issue:
@@ -641,10 +646,20 @@ tui_form_auth_type:
   other: "Auth Type"
 tui_form_password:
   other: "Password"
+tui_form_password_action:
+  other: "Password Action"
 tui_form_key_path:
-  other: "Key File Path"
+  other: "Private Key Path"
 tui_form_key_pass:
   other: "Key Passphrase"
+tui_form_passphrase_action:
+  other: "Passphrase Action"
+tui_action_keep:
+  other: "Keep"
+tui_action_replace:
+  other: "Replace"
+tui_action_delete:
+  other: "Delete"
 tui_form_sudo_mode:
   other: "Sudo Mode"
 tui_form_tags:
@@ -703,6 +718,8 @@ ssh_err_save_config:
   other: "Failed to save config file: {{.Error}}"
 ssh_err_connect:
   other: "Connection failed: {{.Error}}"
+ssh_connection_failed_label:
+  other: "Connection failed"
 ssh_err_shell:
   other: "SSH shell failed: {{.Error}}"
 
@@ -940,3 +957,95 @@ play_err_node_not_found:
   other: "Node '{{.Node}}' not found, check the node name or add it via 'xops host'"
 play_err_some_failed:
   other: "Some hosts failed, see report above"
+
+# ---- credential ----
+credential_short:
+  other: "Manage secure credentials (secret stores and garbage collection)"
+credential_long:
+  other: "Manage configured secure credential stores, run diagnostic health checks, and perform orphaned credential garbage collection."
+credential_store_short:
+  other: "Manage configured secure secret stores"
+credential_store_list_short:
+  other: "List all configured secret stores and their status"
+credential_doctor_short:
+  other: "Probe system keystore capabilities and test configured stores"
+credential_doctor_long:
+  other: "Run bounded, non-interactive read probes against configured stores and the implicit system migration destination. Configured store failures are fatal; an unavailable unconfigured system store produces a warning. No secrets are written; write access is not tested."
+credential_doctor_healthy:
+  other: "Configured stores passed non-interactive read checks; write access was not tested"
+credential_gc_short:
+  other: "Garbage collect unreferenced orphan credentials and pending journals"
+credential_gc_long:
+  other: "Safely scan credential journals and unreferenced orphan credentials to perform garbage collection. Protected by a 24-hour grace period."
+credential_gc_no_pending:
+  other: "No pending journals or unreferenced orphan credentials found"
+credential_gc_completed:
+  other: "Credential garbage collection completed, successfully reclaimed %d items"
+identity_credential_short:
+  other: "Manage persistent credentials for an identity in secure keystores"
+identity_credential_set_short:
+  other: "Set persistent credential for an identity in a secure store"
+identity_credential_delete_short:
+  other: "Delete persistent credential reference for an identity"
+flag_credential_kind:
+  other: "Credential secret kind (login_password, passphrase)"
+flag_credential_store:
+  other: "Target credential store ID (leave empty for default store)"
+flag_password_stdin:
+  other: "Read password securely from stdin to avoid exposure in command arguments"
+flag_passphrase_stdin:
+  other: "Read passphrase securely from stdin to avoid exposure in command arguments"
+flag_remember:
+  other: "Credential persistence policy: ask, always, never; inherits credential.remember_prompted, then ask; batch mode never saves"
+
+warn_flag_deprecated:
+  other: "Flag --{{.Flag}} is deprecated and will be removed in the next stable release. Use {{.Replacement}}."
+
+credential_migrate_short:
+  other: "Upgrade legacy credentials or migrate v2 backends"
+
+credential_migrate_long:
+  other: "Upgrade v1 or copy v2 references to a destination backend. Write and verify before switching configuration; v2 also updates the default store. Rerun after interruption. Source credentials remain; finalize-migration only cleans v1 legacy material."
+
+credential_migrate_to:
+  other: "Configured writable destination store ID"
+
+credential_migrate_dry_run:
+  other: "Validate and preview without writing files or credentials"
+
+credential_finalize_short:
+  other: "Remove legacy materials after migration validation"
+
+credential_finalize_long:
+  other: "Explicitly confirm connection validation. Recheck current v2 references, then delete the migration backup and old keys. This removes automatic rollback materials and is resumable after interruption."
+
+credential_doctor_warnings:
+  other: "Credential checks completed with warnings; review WARN details. Write access was not tested"
+
+credential_auto_migration_failed:
+  other: "Automatic credential migration did not complete; the existing configuration and recovery materials were retained"
+credential_auto_migration_complete:
+  other: "Credentials migrated automatically; validate your connections before running xops credential finalize-migration"
+
+credential_read_retry:
+  other: "Stored credential cannot be read; enter it temporarily. Existing credentials will not be overwritten"
+credential_save_failed_connected:
+  other: "Connected, but credential persistence was not confirmed; you may need to enter it again next time"
+
+prompt_remote_sudo_password:
+  other: "Enter sudo password for {{.Node}}: "
+
+tui_connection_failed:
+  other: "Connection failed: {{.Error}}"
+
+tui_credential_saving_unavailable:
+  other: "Automatic saving is unavailable. Connections can still use session credentials. Check credential directory permissions and restart the TUI."
+
+tui_credential_not_saved:
+  other: "Credential persistence was not confirmed. The connection remains usable; you may need to enter credentials next time."
+
+credential_migrate_restart:
+  other: "Archive the previous v2 migration plan and start from the current configuration; retain all credentials"
+
+credential_save_unavailable:
+  other: "Automatic credential saving is unavailable; continuing without saving credentials"

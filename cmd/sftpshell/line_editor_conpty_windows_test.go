@@ -4,7 +4,9 @@ package sftpshell
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"github.com/wentf9/xops-cli/internal/terminal"
 	"io"
 	"os"
 	"strings"
@@ -44,6 +46,12 @@ func TestWindowsLineEditorConPTY(t *testing.T) {
 
 	harness := newConPTYHarness(t)
 	harness.start()
+
+	waitForConPTYOutput(t, harness.output, "HOST_KEY_TRUST (yes/no)? ")
+	writeConPTYInput(t, harness.pty, "yes")
+	waitForConPTYOutput(t, harness.output, "HOST_KEY_TRUST (yes/no)? yes")
+	writeConPTYInput(t, harness.pty, "\r")
+	waitForConPTYOutput(t, harness.output, "HOST_KEY_ACCEPTED")
 
 	waitForConPTYOutput(t, harness.output, "SFTP_PROMPT_1> ")
 	writeConPTYInput(t, harness.pty, "pwd")
@@ -185,6 +193,16 @@ func waitForConPTYProcess(ctx context.Context, process *os.Process) (*os.Process
 }
 
 func runWindowsLineEditorConPTYHelper(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	answer, err := terminal.NewPrompter(os.Stdin, os.Stdout).ReadLine(ctx, "HOST_KEY_TRUST (yes/no)? ")
+	if err != nil || answer != "yes" {
+		t.Fatalf("host key confirmation: %q, %v", answer, err)
+	}
+	if _, err := fmt.Fprint(os.Stdout, "HOST_KEY_ACCEPTED\r\n"); err != nil {
+		t.Fatal(err)
+	}
+
 	shell := &Shell{
 		cwd:      "/",
 		localCwd: t.TempDir(),
@@ -193,6 +211,7 @@ func runWindowsLineEditorConPTYHelper(t *testing.T) {
 		stderr:   os.Stderr,
 	}
 	exerciseConPTYLineEditor(t, shell)
+	exerciseConPTYInteractiveCancellation(t)
 	if _, err := fmt.Fprint(os.Stdout, "\r\nHANDOFF_EDITOR_CLOSED\r\n"); err != nil {
 		t.Fatalf("write handoff close marker failed: %v", err)
 	}
@@ -303,5 +322,28 @@ func writeConPTYInput(t *testing.T, writer io.Writer, input string) {
 	}
 	if written != len(input) {
 		t.Fatalf("ConPTY input bytes written = %d, want %d", written, len(input))
+	}
+}
+
+// Returning from an idle interactive command must leave the first character of
+// the following SFTP prompt for the new line editor, even after repeated handoffs.
+func exerciseConPTYInteractiveCancellation(t *testing.T) {
+	t.Helper()
+	for range 3 {
+		input, err := terminal.DuplicateInteractiveInput(os.Stdin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() { var b [1]byte; _, err := input.Read(b[:]); done <- err }()
+		if err := input.Interrupt(); err != nil {
+			t.Error(err)
+		}
+		if err := input.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-done; !errors.Is(err, io.EOF) {
+			t.Fatalf("canceled interactive read: %v", err)
+		}
 	}
 }

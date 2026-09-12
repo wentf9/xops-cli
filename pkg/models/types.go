@@ -1,12 +1,17 @@
 package models
 
+import "github.com/wentf9/xops-cli/pkg/credential"
+
 // Identity 定义认证信息
 type Identity struct {
-	User       string `yaml:"user"`
-	KeyPath    string `yaml:"key_path,omitempty"`
-	Passphrase string `yaml:"passphrase,omitempty"` // 私钥密码
-	Password   string `yaml:"password,omitempty"`   // 登录密码
-	AuthType   string `yaml:"auth_type"`            // "key", "password", "agent"
+	User             string          `yaml:"user"`
+	KeyPath          string          `yaml:"key_path,omitempty"`
+	KeyFingerprint   string          `yaml:"key_fingerprint,omitempty"`
+	Passphrase       string          `yaml:"passphrase,omitempty"` // 私钥密码（Schema v1）
+	Password         string          `yaml:"password,omitempty"`   // 登录密码（Schema v1）
+	AuthType         string          `yaml:"auth_type"`            // "key", "password", "agent", "auto"
+	LoginPasswordRef *credential.Ref `yaml:"login_password_ref,omitempty"`
+	PassphraseRef    *credential.Ref `yaml:"passphrase_ref,omitempty"`
 }
 
 // Host 定义网络连接信息
@@ -41,8 +46,9 @@ type Node struct {
 	ProxyJump string `yaml:"proxy_jump,omitempty"` // 指向另一个 Node 的 Name
 
 	// 提权配置
-	SudoMode SudoMode `yaml:"sudo_mode"` // 使用 SudoMode 枚举
-	SuPwd    string   `yaml:"su_pwd,omitempty"`
+	SudoMode             SudoMode        `yaml:"sudo_mode"` // 使用 SudoMode 枚举
+	SuPwd                string          `yaml:"su_pwd,omitempty"`
+	PrivilegePasswordRef *credential.Ref `yaml:"privilege_password_ref,omitempty"`
 
 	// 交互式拦截配置
 	PasswordPromptPattern string `yaml:"password_prompt_pattern,omitempty"` // 节点级自定义密码提示正则

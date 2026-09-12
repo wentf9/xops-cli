@@ -36,10 +36,11 @@ func debugCloseResource(l logger.DebugLogger, closer io.Closer, resource string)
 func copySessionOutput(stdout, stderr io.Reader, stdoutWriter, stderrWriter io.Writer) func() error {
 	errCh := make(chan error, 2)
 	var wg sync.WaitGroup
+	var outputMu sync.Mutex
 
 	copyOne := func(name string, dst io.Writer, src io.Reader) {
 		wg.Go(func() {
-			_, err := io.Copy(dst, src)
+			_, err := io.Copy(serializedSessionOutput{mu: &outputMu, target: dst}, src)
 			if err != nil {
 				err = fmt.Errorf("copy SSH %s failed: %w", name, err)
 			}
@@ -53,4 +54,18 @@ func copySessionOutput(stdout, stderr io.Reader, stdoutWriter, stderrWriter io.W
 		wg.Wait()
 		return errors.Join(<-errCh, <-errCh)
 	}
+}
+
+// Serialize writes, not reads: holding a lock for an entire io.Copy can deadlock
+// when the remote command fills the other SSH stream before closing this one.
+// Hiding ReaderFrom also prevents an underlying buffer from bypassing the lock.
+type serializedSessionOutput struct {
+	mu     *sync.Mutex
+	target io.Writer
+}
+
+func (w serializedSessionOutput) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.target.Write(data)
 }

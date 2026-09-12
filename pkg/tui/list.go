@@ -4,11 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
-	"os/exec"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
@@ -179,6 +176,8 @@ func newListModel(provider config.ConfigProvider) list.Model {
 			key.NewBinding(key.WithKeys("l"), key.WithHelp("l", i18n.T("tui_help_log"))),
 			key.NewBinding(key.WithKeys("n"), key.WithHelp("n", i18n.T("tui_help_new"))),
 			key.NewBinding(key.WithKeys("g"), key.WithHelp("g", i18n.T("tui_help_tag"))),
+			key.NewBinding(key.WithKeys("ctrl+l"), key.WithHelp("ctrl+l", "lock vaults")),
+			key.NewBinding(key.WithKeys("ctrl+u"), key.WithHelp("ctrl+u", "unlock default vault")),
 		}
 	}
 
@@ -290,7 +289,7 @@ func (m *Model) handleEnter() (Model, tea.Cmd) {
 	selected := m.list.SelectedItem()
 	if selected != nil {
 		nodeID := selected.(*nodeItem).id
-		return *m, runSSH(nodeID)
+		return *m, m.beginTerminalConnection(terminalShell, nodeID)
 	}
 	return *m, nil
 }
@@ -390,8 +389,9 @@ func (m *Model) handleDelete() (Model, tea.Cmd) {
 
 	if len(toDelete) > 0 {
 		repository := m.repository
+		service := m.credentialService
 		return *m, m.beginConfigurationMutation(configurationMutationDelete, "", len(toDelete), func(ctx context.Context) error {
-			return repository.DeleteNodesAtRefsContext(ctx, toDelete)
+			return repository.DeleteNodesWithCredentialsContext(ctx, toDelete, service)
 		})
 	}
 	return *m, nil
@@ -434,12 +434,7 @@ func (m *Model) handleMonitor() (Model, tea.Cmd) {
 	nodeID := selected.(*nodeItem).id
 	m.status = i18n.Tf("tui_monitor_connecting", map[string]any{"Node": nodeID})
 
-	return *m, func() tea.Msg {
-		ctx, cancel := context.WithTimeout(m.ctx, 20*time.Second)
-		defer cancel()
-		client, err := m.connector.Connect(ctx, nodeID)
-		return monitorConnectedMsg{nodeID: nodeID, client: client, err: err}
-	}
+	return *m, m.beginTerminalConnection(terminalMonitor, nodeID)
 }
 
 func (m *Model) handleLogSelect() (Model, tea.Cmd) {
@@ -450,12 +445,7 @@ func (m *Model) handleLogSelect() (Model, tea.Cmd) {
 	nodeID := selected.(*nodeItem).id
 	m.status = i18n.Tf("tui_log_connecting", map[string]any{"Node": nodeID})
 
-	return *m, func() tea.Msg {
-		ctx, cancel := context.WithTimeout(m.ctx, 20*time.Second)
-		defer cancel()
-		client, err := m.connector.Connect(ctx, nodeID)
-		return logScannerConnectedMsg{nodeID: nodeID, client: client, err: err}
-	}
+	return *m, m.beginTerminalConnection(terminalLogs, nodeID)
 }
 
 func (m *Model) handleTagAction() (Model, tea.Cmd) {
@@ -487,18 +477,4 @@ func (m *Model) handleTagAction() (Model, tea.Cmd) {
 	*m = m.initTagSelectForm()
 	m.state = viewTagSelect
 	return *m, nil
-}
-
-type sshFinishedMsg struct{ err error }
-
-// TODO(refactor): TUI 框架的渲染边界与环境变量扩散
-// 目前通过注入 XOPS_CLI_SSH_FROM_TUI 环境变量，让 ssh 子进程在连接失败时阻塞等待回车。这可能导致环境变量被孙进程意外继承。
-// 遵循 BubbleTea 最佳实践，未来重构时应让子进程直接返回 exit error，由父进程 (TUI) 捕获后在 UI 层面渲染失败提示弹窗，而不是依赖子进程接管终端进行阻塞。
-func runSSH(nodeID string) tea.Cmd {
-	c := os.Args[0]
-	cmd := exec.Command(c, "ssh", nodeID)
-	cmd.Env = append(os.Environ(), "XOPS_CLI_SSH_FROM_TUI=true")
-	return tea.ExecProcess(cmd, func(err error) tea.Msg {
-		return sshFinishedMsg{err}
-	})
 }

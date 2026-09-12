@@ -18,15 +18,44 @@ import (
 )
 
 type Client struct {
-	sshClient        *ssh.Client
-	rootConn         net.Conn
-	cfgMu            sync.RWMutex
-	sudoMu           sync.Mutex
-	cfg              *ClientConfig
-	store            ConfigStore
-	connectorPattern string         // Connector 全局级密码提示正则，当节点级为空时回落到此字段
-	promptRegex      *regexp.Regexp // 缓存预编译好的正则
-	logger           logger.DebugLogger
+	sshClient          *ssh.Client
+	rootConn           net.Conn
+	cfgMu              sync.RWMutex
+	sudoMu             sync.Mutex
+	connCfg            ConnectionConfig
+	provider           ConnectionProvider
+	resolver           SecretResolver
+	prompter           SecretPrompter
+	recorder           CredentialRecorder
+	connectorPattern   string         // Connector 全局级密码提示正则，当节点级为空时回落到此字段
+	promptRegex        *regexp.Regexp // 缓存预编译好的正则
+	logger             logger.DebugLogger
+	handshakeTimeout   time.Duration
+	interactionTimeout time.Duration
+}
+
+type compatSecretResolver struct {
+	password string
+	suPwd    string
+}
+
+func (r *compatSecretResolver) ResolveSecret(ctx context.Context, req SecretRequest) ([]byte, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	switch req.Kind {
+	case SecretKindLoginPassword, SecretKindSudoPassword:
+		if r.password != "" {
+			return []byte(r.password), nil
+		}
+	case SecretKindSuPassword:
+		if r.suPwd != "" {
+			return []byte(r.suPwd), nil
+		}
+	}
+	return nil, ErrInteractionRequired
 }
 
 // InteractiveIO supplies the terminal streams used by an interactive SSH
@@ -59,25 +88,56 @@ func validateInteractiveIO(streams InteractiveIO) (int, int, error) {
 	return fdIn, fdOut, nil
 }
 
-func newClient(raw *ssh.Client, rootConn net.Conn, cfg *ClientConfig, store ConfigStore, connectorPattern string) *Client {
-	return newClientWithLogger(raw, rootConn, cfg, store, connectorPattern, logger.NopLogger)
+func newClient(raw *ssh.Client, rootConn net.Conn, cfg *ClientConfig, recorder CredentialRecorder, connectorPattern string) *Client {
+	return newClientWithLogger(raw, rootConn, cfg, recorder, connectorPattern, logger.NopLogger)
 }
 
-func newClientWithLogger(raw *ssh.Client, rootConn net.Conn, cfg *ClientConfig, store ConfigStore, connectorPattern string, l logger.DebugLogger) *Client {
+func newClientWithLogger(raw *ssh.Client, rootConn net.Conn, cfg *ClientConfig, recorder CredentialRecorder, connectorPattern string, l logger.DebugLogger) *Client {
+	return newClientWithComponents(raw, rootConn, cfg, nil, nil, nil, recorder, connectorPattern, 0, 0, l)
+}
+
+func newClientWithComponents(
+	raw *ssh.Client,
+	rootConn net.Conn,
+	cfg *ClientConfig,
+	provider ConnectionProvider,
+	resolver SecretResolver,
+	prompter SecretPrompter,
+	recorder CredentialRecorder,
+	connectorPattern string,
+	handshakeTimeout time.Duration,
+	interactionTimeout time.Duration,
+	l logger.DebugLogger,
+) *Client {
 	if l == nil {
 		l = logger.NopLogger
 	}
-	clientConfig := *cfg
-	c := &Client{
-		sshClient:        raw,
-		rootConn:         rootConn,
-		cfg:              &clientConfig,
-		store:            store,
-		connectorPattern: connectorPattern,
-		logger:           l,
+	var connCfg ConnectionConfig
+	if cfg != nil {
+		connCfg = cfg.ToConnectionConfig()
+	}
+	if resolver == nil && cfg != nil && (cfg.Password != "" || cfg.SuPwd != "") {
+		resolver = &compatSecretResolver{
+			password: cfg.Password,
+			suPwd:    cfg.SuPwd,
+		}
 	}
 
-	pattern := clientConfig.PasswordPromptPattern
+	c := &Client{
+		sshClient:          raw,
+		rootConn:           rootConn,
+		connCfg:            connCfg,
+		provider:           provider,
+		resolver:           resolver,
+		prompter:           prompter,
+		recorder:           recorder,
+		connectorPattern:   connectorPattern,
+		logger:             l,
+		handshakeTimeout:   handshakeTimeout,
+		interactionTimeout: interactionTimeout,
+	}
+
+	pattern := connCfg.PasswordPromptPattern
 	if pattern == "" {
 		pattern = connectorPattern
 	}
@@ -132,10 +192,9 @@ func (c *Client) Close() error {
 	return c.sshClient.Close()
 }
 
-// SSHClient 暴露底层的 ssh.Client (供高级操作使用，如 SCP)
-
 // Config returns a snapshot of the node configuration. Mutating the returned
-// value never changes the live client configuration.
+// value never changes the live client configuration. The snapshot contains no
+// plaintext secrets (Password, Passphrase, SuPwd are always empty).
 func (c *Client) Config() *ClientConfig {
 	cfg, ok := c.configSnapshot()
 	if !ok {
@@ -150,10 +209,35 @@ func (c *Client) configSnapshot() (ClientConfig, bool) {
 	}
 	c.cfgMu.RLock()
 	defer c.cfgMu.RUnlock()
-	if c.cfg == nil {
-		return ClientConfig{}, false
+	return ClientConfig{
+		NodeID:                c.connCfg.NodeID,
+		Address:               c.connCfg.Address,
+		Port:                  c.connCfg.Port,
+		User:                  c.connCfg.User,
+		AuthType:              c.connCfg.AuthType,
+		KeyPath:               c.connCfg.KeyPath,
+		AuthUpdateToken:       c.connCfg.AuthUpdateToken,
+		SudoMode:              c.connCfg.SudoMode,
+		SudoUpdateToken:       c.connCfg.SudoUpdateToken,
+		ProxyJump:             c.connCfg.ProxyJump,
+		PasswordPromptPattern: c.connCfg.PasswordPromptPattern,
+	}, true
+}
+
+// ConnectionConfig returns a copy of the live connection configuration.
+func (c *Client) ConnectionConfig() ConnectionConfig {
+	if c == nil {
+		return ConnectionConfig{}
 	}
-	return *c.cfg, true
+	c.cfgMu.RLock()
+	defer c.cfgMu.RUnlock()
+	return c.connCfg
+}
+
+// AuthMaterial returns authentication material held by the client.
+// Connected and pooled clients retain no AuthMaterial, always returning nil.
+func (c *Client) AuthMaterial() *AuthMaterial {
+	return nil
 }
 
 type RunConfig struct {
@@ -374,7 +458,8 @@ func (c *Client) ShellWithIO(ctx context.Context, streams InteractiveIO) (retErr
 
 	derivedCtx, cancelResize := context.WithCancel(ctx)
 	defer cancelResize()
-	startWindowResizeLoop(derivedCtx, session, fdOut, width, height, c.getLogger())
+	stopResize := startWindowResizeLoop(derivedCtx, session, fdOut, width, height, c.getLogger(), c.Interrupt)
+	defer func() { retErr = errors.Join(retErr, stopResize()) }()
 	waitOutput := copySessionOutput(stdout, stderr, streams.Stdout, streams.Stderr)
 
 	done := make(chan struct{})
@@ -411,93 +496,12 @@ func (c *Client) ShellWithIO(ctx context.Context, streams InteractiveIO) (retErr
 	return errors.Join(err, cancelErr, stdinErr, waitOutput())
 }
 
-// RunInteractive 在 PTY 环境下执行单条命令，支持交互式/流式命令 (如 tail -f, vim, top)
-func (c *Client) RunInteractive(ctx context.Context, cmd string) (retErr error) {
-	session, err := c.newSessionContext(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to create new session: %w", err)
-	}
-	defer joinResourceCloseError(&retErr, session, "interactive ssh command session")
-
-	modes := ssh.TerminalModes{
-		ssh.ECHO:          1,
-		ssh.TTY_OP_ISPEED: 14400,
-		ssh.TTY_OP_OSPEED: 14400,
-	}
-	fdIn := int(os.Stdin.Fd())
-	fdOut := int(os.Stdout.Fd())
-	width, height, err := term.GetSize(fdOut)
-	if err != nil {
-		width, height = 80, 40
-	}
-	if err := session.RequestPty("xterm-256color", height, width, modes); err != nil {
-		return fmt.Errorf("request for pty failed: %w", err)
-	}
-
-	stdin, err := session.StdinPipe()
-	if err != nil {
-		return fmt.Errorf("create SSH stdin pipe failed: %w", err)
-	}
-	stdout, err := session.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("create SSH stdout pipe failed: %w", err)
-	}
-	stderr, err := session.StderrPipe()
-	if err != nil {
-		return fmt.Errorf("create SSH stderr pipe failed: %w", err)
-	}
-
-	if err := session.Shell(); err != nil {
-		return fmt.Errorf("start shell failed: %w", err)
-	}
-
-	oldState, err := term.MakeRaw(fdIn)
-	if err != nil {
-		return fmt.Errorf("cannot set terminal to raw: %w", err)
-	}
-	defer func() {
-		if restoreErr := term.Restore(fdIn, oldState); restoreErr != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("restore terminal failed: %w", restoreErr))
-		}
-	}()
-
-	derivedCtx, cancelResize := context.WithCancel(ctx)
-	defer cancelResize()
-	startWindowResizeLoop(derivedCtx, session, fdOut, width, height, c.getLogger())
-
-	// 使用交互式 Shell 获取完整的终端控制权 (支持基于 TTY 的程序如 top/vim 接收按键信号)
-	// 使用 exec 替换当前交互式 Shell，并在完成后自动结束 SSH 会话
-	wrappedCmd := fmt.Sprintf("exec bash -c '%s'\n", strings.ReplaceAll(cmd, "'", "'\\''"))
-	if _, err := io.WriteString(stdin, wrappedCmd); err != nil {
-		return fmt.Errorf("write interactive SSH command failed: %w", err)
-	}
-
-	waitOutput := copySessionOutput(stdout, stderr, os.Stdout, os.Stderr)
-
-	done := make(chan struct{})
-	defer close(done)
-
-	go func() {
-		select {
-		case <-ctx.Done():
-			if signalErr := session.Signal(ssh.SIGKILL); signalErr != nil {
-				c.getLogger().Debugf("signal canceled interactive SSH command failed: %v", signalErr)
-			}
-			debugCloseResource(c.getLogger(), session, "canceled interactive ssh command session")
-		case <-done:
-		}
-	}()
-
-	cancelStdin, stdinDone, err := copyStdinTo(os.Stdin, stdin)
-	if err != nil {
-		return err
-	}
-
-	err = ignoreShellExitError(session.Wait())
-	cancelErr := cancelStdin()
-	stdinErr := <-stdinDone
-
-	return errors.Join(err, cancelErr, stdinErr, waitOutput())
+// RunInteractive runs one command in a PTY using an SSH exec request.
+// A non-interactive login bash loads the login environment without starting a
+// prompt or writing the command through the terminal's echoed input stream.
+func (c *Client) RunInteractive(ctx context.Context, cmd string) error {
+	wrappedCmd := fmt.Sprintf("bash -l -c '%s'", strings.ReplaceAll(cmd, "'", "'\\''"))
+	return c.RunInteractiveCmd(ctx, wrappedCmd)
 }
 
 // RunInteractiveCmd 在 PTY 环境下直接执行命令（通过 SSH exec 通道，不启动交互式 shell），
@@ -560,7 +564,8 @@ func (c *Client) RunInteractiveCmdWithIO(ctx context.Context, cmd string, stream
 
 	derivedCtx, cancelResize := context.WithCancel(ctx)
 	defer cancelResize()
-	startWindowResizeLoop(derivedCtx, session, fdOut, width, height, c.getLogger())
+	stopResize := startWindowResizeLoop(derivedCtx, session, fdOut, width, height, c.getLogger(), c.Interrupt)
+	defer func() { retErr = errors.Join(retErr, stopResize()) }()
 
 	waitOutput := copySessionOutput(stdout, stderr, streams.Stdout, streams.Stderr)
 
@@ -590,6 +595,124 @@ func (c *Client) RunInteractiveCmdWithIO(ctx context.Context, cmd string, stream
 	return errors.Join(err, cancelErr, stdinErr, waitOutput())
 }
 
+func withTimeoutOrDefault(ctx context.Context, timeout, defaultTimeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		timeout = defaultTimeout
+	}
+	if ctx != nil {
+		return context.WithTimeout(ctx, timeout)
+	}
+	return context.WithTimeout(context.Background(), timeout)
+}
+
+func (c *Client) recordPrivilegeSecret(ctx context.Context, kind SecretKind, connCfg ConnectionConfig, pwd string) error {
+	if c.recorder == nil {
+		return nil
+	}
+	switch kind {
+	case SecretKindLoginPassword:
+		oldToken := connCfg.AuthUpdateToken
+		if oldToken != "" {
+			committedToken, recErr := c.recorder.UpdateAuth(ctx, connCfg.NodeID, oldToken, pwd, connCfg.KeyPath, "")
+			if recErr != nil {
+				return fmt.Errorf("record login password failed: %w", recErr)
+			}
+			if err := c.refreshConnectionTokens(tokenRefreshKindAuth, committedToken); err != nil {
+				return err
+			}
+		}
+	case SecretKindSuPassword, SecretKindSudoPassword:
+		oldToken := connCfg.SudoUpdateToken
+		if oldToken != "" {
+			committedToken, recErr := c.recorder.UpdateSudo(ctx, connCfg.NodeID, oldToken, connCfg.SudoMode, pwd)
+			if recErr != nil {
+				return fmt.Errorf("record su password failed: %w", recErr)
+			}
+			if err := c.refreshConnectionTokens(tokenRefreshKindSudo, committedToken); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (c *Client) resolvePrivilegeMaterial(ctx context.Context, kind SecretKind, forcePrompt ...bool) (*PrivilegeMaterial, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	connCfg := c.ConnectionConfig()
+
+	// [P1] 根据机密种类选择对应的版本令牌：登录密码校验 AuthUpdateToken，提权密码校验 SudoUpdateToken
+	var versionToken string
+	switch kind {
+	case SecretKindLoginPassword, SecretKindPrivateKeyPassphrase:
+		versionToken = connCfg.AuthUpdateToken
+	case SecretKindSuPassword, SecretKindSudoPassword:
+		versionToken = connCfg.SudoUpdateToken
+	}
+
+	req := SecretRequest{
+		Kind:         kind,
+		NodeID:       connCfg.NodeID,
+		User:         connCfg.User,
+		Host:         connCfg.Address,
+		Port:         connCfg.Port,
+		KeyPath:      connCfg.KeyPath,
+		VersionToken: versionToken,
+	}
+
+	// [P2] 施加有界解析超时，同时保留调用方 Context 的取消信号
+	resolveCtx, cancelResolve := withTimeoutOrDefault(ctx, c.handshakeTimeout, defaultSSHHandshakeTimeout)
+	defer cancelResolve()
+
+	// 1. 优先尝试 SecretResolver 解析
+	promptOnly := len(forcePrompt) > 0 && forcePrompt[0]
+	if c.resolver != nil && !promptOnly {
+		secretBytes, err := c.resolvePrivilegeCandidate(resolveCtx, req, connCfg.AuthUpdateToken)
+		if len(secretBytes) > 0 {
+			// [P2] 立即安排原始切片在函数退出时清零，覆盖成功、错误与交互回退等所有路径
+			defer zeroBytes(secretBytes)
+		}
+		if err == nil && len(secretBytes) > 0 {
+			matBytes := make([]byte, len(secretBytes))
+			copy(matBytes, secretBytes)
+			return &PrivilegeMaterial{Password: matBytes}, nil
+		}
+		if err != nil && !errors.Is(err, ErrInteractionRequired) && !reportCredentialFailure(ctx, c.prompter, "read", err) {
+			// [P1] 后端故障直接终止并保留错误链
+			return nil, fmt.Errorf("resolve privilege secret failed: %w", err)
+		}
+	}
+
+	// 2. resolver 缺失或返回 ErrInteractionRequired 时，降级到 prompter 交互提示
+	if c.prompter == nil {
+		return nil, ErrInteractionRequired
+	}
+
+	// [P2] 施加有界交互超时，同时保留调用方 Context 的取消信号
+	promptCtx, cancelPrompt := withTimeoutOrDefault(ctx, c.interactionTimeout, DefaultInteractionTimeout)
+	defer cancelPrompt()
+
+	pwd, err := c.prompter.PromptSecret(promptCtx, req)
+	if err != nil {
+		return nil, fmt.Errorf("prompt privilege secret failed: %w", err)
+	}
+
+	if kind == SecretKindSudoPassword {
+		connCfg.SudoMode = SudoModeSudo
+	}
+	if kind == SecretKindSuPassword {
+		connCfg.SudoMode = SudoModeSu
+	}
+	material := &PrivilegeMaterial{Password: []byte(pwd)}
+	material.confirmedSave = func(work context.Context, value []byte) error {
+		return c.recordPrivilegeSecret(work, kind, connCfg, string(value))
+	}
+	return material, nil
+}
+
 func (c *Client) maybeDetectSudoMode(ctx context.Context) error {
 	if ctx == nil {
 		return fmt.Errorf("sudo detection context is nil")
@@ -599,12 +722,9 @@ func (c *Client) maybeDetectSudoMode(ctx context.Context) error {
 	}
 	c.sudoMu.Lock()
 	defer c.sudoMu.Unlock()
-	cfg, ok := c.configSnapshot()
-	if !ok {
-		return fmt.Errorf("ssh client or config is nil")
-	}
+	connCfg := c.ConnectionConfig()
 	// 如果已经有确定的 SudoMode，且不是 "auto" 或空，则不再探测
-	if cfg.SudoMode != "" && cfg.SudoMode != SudoModeAuto {
+	if connCfg.SudoMode != "" && connCfg.SudoMode != SudoModeAuto {
 		return nil
 	}
 	if c.sshClient == nil {
@@ -634,18 +754,43 @@ func (c *Client) maybeDetectSudoMode(ctx context.Context) error {
 		return err
 	}
 
-	// 3. 测试密码 sudo 是否真正可用（避免用户有密码但不在 sudoers 中时误判）
-	if cfg.Password != "" {
-		if _, err := c.runWithSudo(ctx, "true", cfg.Password, nil, nil); err == nil {
-			return c.updateSudoMode(ctx, SudoModeSudo)
-		} else if err := ctx.Err(); err != nil {
-			return err
+	// 3. 测试密码 sudo 是否真正可用（按命令解析登录密码，使用完毕立即清零）
+	priv, err := c.resolvePrivilegeMaterial(ctx, SecretKindSudoPassword)
+	if err == nil {
+		defer priv.Zero()
+		priv.deferSave = true
+		if _, testErr := c.runWithSudo(ctx, "true", priv.Password, nil, nil, priv); testErr == nil {
+			return c.confirmDetectedSudo(ctx, priv)
+		} else if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+	} else {
+		// [P1] 只有当明确需要交互时（未预置密码），探测才跳过；非取消类的后端故障必须终止并保留错误链
+		if !errors.Is(err, ErrInteractionRequired) {
+			return fmt.Errorf("resolve login password for sudo probe failed: %w", err)
 		}
 	}
 
-	// 4. 检查是否有 su 密码
-	if cfg.SuPwd != "" {
+	if credentialRecoveryPrompter(c.prompter) != nil {
+		// Do not prompt for a su candidate merely to detect its presence and
+		// discard it. The actual operation obtains and verifies it once. This
+		// unverified mode choice stays local to the connection.
+		c.cfgMu.Lock()
+		c.connCfg.SudoMode = SudoModeSu
+		c.cfgMu.Unlock()
+		return nil
+	}
+
+	// 4. 检查是否有 su 密码（按命令解析 su 密码，使用完毕立即清零）
+	privSu, errSu := c.resolvePrivilegeMaterial(ctx, SecretKindSuPassword)
+	if errSu == nil {
+		privSu.Zero()
 		return c.updateSudoMode(ctx, SudoModeSu)
+	} else {
+		// [P1] 同样，只有当明确需要交互时才跳过；后端故障必须终止并保留错误链
+		if !errors.Is(errSu, ErrInteractionRequired) {
+			return fmt.Errorf("resolve su password for probe failed: %w", errSu)
+		}
 	}
 
 	// 默认兜底
@@ -657,30 +802,95 @@ func (c *Client) updateSudoMode(ctx context.Context, mode SudoMode) error {
 		return fmt.Errorf("ssh client is nil")
 	}
 	c.cfgMu.Lock()
-	if c.cfg == nil {
-		c.cfgMu.Unlock()
-		return fmt.Errorf("ssh client config is nil")
-	}
-	c.cfg.SudoMode = mode
-	nodeID := c.cfg.NodeID
-	updateToken := c.cfg.SudoUpdateToken
-	suPwd := c.cfg.SuPwd
+	c.connCfg.SudoMode = mode
+	nodeID := c.connCfg.NodeID
+	updateToken := c.connCfg.SudoUpdateToken
 	c.cfgMu.Unlock()
-	if c.store != nil && nodeID != "" && updateToken != "" {
-		if err := c.store.UpdateSudo(ctx, nodeID, updateToken, mode, suPwd); err != nil {
+	if c.recorder != nil && nodeID != "" && updateToken != "" {
+		committedToken, err := c.recorder.UpdateSudo(ctx, nodeID, updateToken, mode, "")
+		if err != nil {
 			return fmt.Errorf("persist detected sudo mode for node %q failed: %w", nodeID, err)
+		}
+		// [P1] 成功持久化提权模式后，刷新连接快照中的最新版本令牌并校验兼容性
+		if err := c.refreshConnectionTokens(tokenRefreshKindSudo, committedToken); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-func (c *Client) startWithTimeout(ctx context.Context, session *ssh.Session, command string, config *RunConfig) (string, error) {
+// refreshConnectionTokens 从底层 ConnectionProvider 刷新最新的版本令牌并校验目标与版本兼容性
+func (c *Client) refreshConnectionTokens(kind tokenRefreshKind, committedToken string) error {
+	if c == nil || c.provider == nil {
+		return nil
+	}
+	c.cfgMu.RLock()
+	curCfg := c.connCfg
+	nodeID := curCfg.NodeID
+	c.cfgMu.RUnlock()
+	if nodeID == "" {
+		return nil
+	}
+
+	newCfg, err := c.provider.GetConfig(nodeID)
+	if err != nil {
+		return fmt.Errorf("reload config for node %q failed: %w", nodeID, err)
+	}
+	if newCfg == nil {
+		return fmt.Errorf("%w: config not found for node %q", ErrSnapshotMismatch, nodeID)
+	}
+
+	// [P1] 校验完整连接目标（Address, Port, User, KeyPath, ProxyJump）是否仍然与当前已建立的连接一致
+	if err := validateTargetCompatibility(curCfg, newCfg); err != nil {
+		return fmt.Errorf("incompatible target update for node %q: %w", nodeID, err)
+	}
+
+	// [P1] 校验刷新版本与本次写回的对应关系：必须严格等于本次事务实际提交的版本，拒绝采纳后续无关更新，且允许幂等未变
+	switch kind {
+	case tokenRefreshKindAuth:
+		if committedToken != "" && newCfg.AuthUpdateToken != committedToken {
+			return fmt.Errorf("%w: auth version mismatch after update for node %q (expected %q, got %q)",
+				ErrSnapshotMismatch, nodeID, committedToken, newCfg.AuthUpdateToken)
+		}
+	case tokenRefreshKindSudo:
+		if committedToken != "" && newCfg.SudoUpdateToken != committedToken {
+			return fmt.Errorf("%w: sudo version mismatch after update for node %q (expected %q, got %q)",
+				ErrSnapshotMismatch, nodeID, committedToken, newCfg.SudoUpdateToken)
+		}
+	}
+
+	c.cfgMu.Lock()
+	switch kind {
+	case tokenRefreshKindAuth:
+		c.connCfg.AuthUpdateToken = newCfg.AuthUpdateToken
+	case tokenRefreshKindSudo:
+		c.connCfg.SudoUpdateToken = newCfg.SudoUpdateToken
+		// A no-save recorder returns the unchanged token. Do not overwrite
+		// verified session-local discovery with the repository's old mode.
+		if shouldRefreshSudoMode(curCfg, newCfg) {
+			c.connCfg.SudoMode = newCfg.SudoMode
+		}
+	}
+	if newCfg.HasOriginalProxyJump {
+		c.connCfg.OriginalProxyJump = newCfg.OriginalProxyJump
+		c.connCfg.HasOriginalProxyJump = true
+	} else if newCfg.OriginalProxyJump != "" {
+		c.connCfg.OriginalProxyJump = newCfg.OriginalProxyJump
+	}
+	c.cfgMu.Unlock()
+	return nil
+}
+
+func (c *Client) startWithTimeout(ctx context.Context, session *ssh.Session, command string, config *RunConfig, stderrWrappers ...func(io.Writer) io.Writer) (string, error) {
 	if config == nil {
 		config = DefaultRunConfig()
 	}
 	syncWriter := newOutputWriter(config)
 	session.Stdout = syncWriter
 	session.Stderr = syncWriter
+	for _, wrap := range stderrWrappers {
+		session.Stderr = wrap(session.Stderr)
+	}
 
 	if err := session.Start(command); err != nil {
 		return "", fmt.Errorf("failed to start command: %w", err)
@@ -692,13 +902,16 @@ func (c *Client) startWithTimeout(ctx context.Context, session *ssh.Session, com
 
 	select {
 	case err := <-done:
+		err = errors.Join(err, flushPrivilegePrompt(session.Stderr))
 		output := syncWriter.String()
 		if err != nil {
 			return output, fmt.Errorf("failed to run command: %w, output: %s", err, output)
 		}
 		return output, nil
 	case <-ctx.Done():
-		return syncWriter.String(), c.closeCanceledSession(ctx, session, done)
+		closeErr := c.closeCanceledSession(ctx, session, done)
+		flushErr := flushPrivilegePrompt(session.Stderr)
+		return syncWriter.String(), errors.Join(closeErr, flushErr)
 	}
 }
 
@@ -740,4 +953,10 @@ func (c *Client) passwordPromptRegex() *regexp.Regexp {
 
 func (c *Client) SSHClient() *ssh.Client {
 	return c.sshClient
+}
+
+// Keep verified session-local discovery when a recorder intentionally does not
+// advance the credential version (for example, remember=never).
+func shouldRefreshSudoMode(current ConnectionConfig, next *ClientConfig) bool {
+	return next.SudoMode != "" && (next.SudoUpdateToken != current.SudoUpdateToken || current.SudoMode == "" || current.SudoMode == SudoModeAuto)
 }

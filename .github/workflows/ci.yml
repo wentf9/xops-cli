@@ -2,9 +2,19 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches:
+      - master
+      - 'feat/**'
+      - 'feature/**'
   pull_request:
     branches: [master]
+  workflow_dispatch:
+    inputs:
+      debug_enabled:
+        type: boolean
+        description: 'Run with tmate SSH session on failure'
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -40,6 +50,26 @@ jobs:
       - name: Run tests
         run: go test -race -shuffle=on -covermode=atomic -coverprofile=coverage.out ./...
 
+      - name: Run native password sudo PTY regression
+        env:
+          XOPS_TEST_NATIVE_SUDO_PASSWORD: public-ci-sudo-password
+        run: |
+          go test -race -c -o /tmp/xops-sudo-ci.test ./pkg/ssh
+          sudo useradd --create-home --shell /bin/bash xops-sudo-ci
+          trap 'sudo rm -f /etc/sudoers.d/xops-sudo-ci /tmp/xops-sudo-ci.test; sudo userdel --remove xops-sudo-ci' EXIT
+          printf 'xops-sudo-ci:%s\n' "$XOPS_TEST_NATIVE_SUDO_PASSWORD" | sudo chpasswd
+          printf '%s\n' 'Defaults:xops-sudo-ci timestamp_timeout=0' 'xops-sudo-ci ALL=(root) PASSWD: ALL' | sudo tee /etc/sudoers.d/xops-sudo-ci >/dev/null
+          sudo chmod 440 /etc/sudoers.d/xops-sudo-ci
+          sudo -u xops-sudo-ci env XOPS_TEST_NATIVE_SUDO_PASSWORD="$XOPS_TEST_NATIVE_SUDO_PASSWORD" /tmp/xops-sudo-ci.test -test.run '^TestPrivilegeNativePasswordSudoPTY$' -test.count=1 -test.timeout=30s -test.v
+
+      - name: Run offline credential business integration tests
+        env:
+          GORACE: atexit_sleep_ms=0
+        run: |
+          umask 077
+          go test -tags=integration -race -shuffle=on -count=1 -timeout=120s \
+            -run '^(TestEncrypted|TestOffline)' ./pkg/config ./cmd
+
       - name: Upload coverage
         uses: actions/upload-artifact@v7
         with:
@@ -71,6 +101,48 @@ jobs:
       - name: Run Windows ConPTY integration test
         if: ${{ !cancelled() }}
         run: go test -race -tags=integration -run '^TestWindowsLineEditorConPTY$' -count=1 ./cmd/sftpshell
+
+  macos-test:
+    name: macOS Build and Test
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Build all packages
+        run: go build ./...
+
+      - name: Set up macOS Keychain
+        run: |
+          KEYCHAIN_PATH="$HOME/Library/Keychains/ci.keychain-db"
+          security create-keychain -p "" "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security unlock-keychain -p "" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+
+      - name: Run macOS tests
+        run: go test -race -shuffle=on -count=1 ./...
+
+      - name: Run Native Platform Verification Script
+        run: ./scripts/verify_native_platform.sh
+
+      - name: Clean up macOS Keychain
+        if: always()
+        run: |
+          security delete-keychain "$HOME/Library/Keychains/ci.keychain-db" || true
+
+      - name: Setup tmate debug session on failure
+        if: ${{ failure() && github.event_name == 'workflow_dispatch' && inputs.debug_enabled }}
+        uses: mxschmitt/action-tmate@v3
 
   lint:
     name: Lint

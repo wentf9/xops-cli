@@ -106,7 +106,7 @@ func TestPipeCommandStdin_CancelIdempotency(t *testing.T) {
 // TestRunCommandWithIO_RejectsUncancelableStdin verifies that an arbitrary
 // blocking reader cannot start a command and leak a copy goroutine.
 func TestRunCommandWithIO_RejectsUncancelableStdin(t *testing.T) {
-	c := &Client{cfg: &ClientConfig{SudoMode: SudoModeNone}}
+	c := newClient(nil, nil, &ClientConfig{SudoMode: SudoModeNone}, nil, "")
 	callerReader := &mockCloser{Reader: strings.NewReader("some stdin")}
 	var stdout, stderr bytes.Buffer
 

@@ -14,6 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
@@ -22,23 +23,27 @@ import (
 )
 
 type SshOptions struct {
-	Host           string
-	Port           uint16
-	User           string
-	Password       string
-	IdentityFile   string
-	Passphrase     string
-	Sudo           bool
-	Alias          string
-	JumpHost       string
-	Tags           []string
-	LocalForwards  []string
-	RemoteForwards []string
-	NoCmd          bool
-	DynamicForward string
-	BgRun          bool
-	StdinRedirect  bool
-	args           []string
+	interaction     *cliInteractionHandler
+	Host            string
+	Port            uint16
+	User            string
+	Password        string
+	PasswordStdin   bool
+	IdentityFile    string
+	Passphrase      string
+	PassphraseStdin bool
+	Remember        string
+	Sudo            bool
+	Alias           string
+	JumpHost        string
+	Tags            []string
+	LocalForwards   []string
+	RemoteForwards  []string
+	NoCmd           bool
+	DynamicForward  string
+	BgRun           bool
+	StdinRedirect   bool
+	args            []string
 
 	Target config.ConnectionTarget
 
@@ -59,7 +64,15 @@ func NewCmdSsh() *cobra.Command {
 		Short: i18n.T("ssh_short"),
 		Long:  i18n.T("ssh_long"),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			o.Complete(cmd, args)
+			if cmd.Flags().Changed("password") {
+				utils.WarnFlagDeprecated("password", "--password-stdin or 'xops identity credential set'")
+			}
+			if cmd.Flags().Changed("passphrase") {
+				utils.WarnFlagDeprecated("passphrase", "--passphrase-stdin or 'xops identity credential set'")
+			}
+			if err := o.Complete(cmd, args); err != nil {
+				return err
+			}
 			if err := o.Validate(); err != nil {
 				return err
 			}
@@ -81,23 +94,43 @@ func NewCmdSsh() *cobra.Command {
 	// xops-enhanced flags (long-form only, no short flags to avoid OpenSSH conflicts)
 	cmd.Flags().StringVar(&o.Host, "host", "", i18n.T("flag_host"))
 	cmd.Flags().StringVar(&o.Password, "password", "", i18n.T("flag_password"))
+	cmd.Flags().BoolVar(&o.PasswordStdin, "password-stdin", false, i18n.T("flag_password_stdin"))
 	cmd.Flags().StringVar(&o.Passphrase, "passphrase", "", i18n.T("flag_passphrase"))
+	cmd.Flags().BoolVar(&o.PassphraseStdin, "passphrase-stdin", false, i18n.T("flag_passphrase_stdin"))
+	cmd.Flags().StringVar(&o.Remember, "remember", "", i18n.T("flag_remember"))
 	cmd.Flags().BoolVar(&o.Sudo, "sudo", false, i18n.T("flag_sudo"))
 	cmd.Flags().StringVar(&o.Alias, "alias", "", i18n.T("flag_alias"))
 	cmd.Flags().StringSliceVar(&o.Tags, "tag", []string{}, i18n.T("flag_tag"))
 
 	cmd.MarkFlagsMutuallyExclusive("password", "identity")
+	cmd.MarkFlagsMutuallyExclusive("password", "password-stdin")
+	cmd.MarkFlagsMutuallyExclusive("passphrase", "passphrase-stdin")
 	return cmd
 }
 
-func (o *SshOptions) Complete(cmd *cobra.Command, args []string) {
+func (o *SshOptions) Complete(cmd *cobra.Command, args []string) error {
 	o.args = args
+	if o.PasswordStdin {
+		pwd, err := utils.ReadSecretFromStdin()
+		if err != nil {
+			return fmt.Errorf("read password from stdin: %w", err)
+		}
+		o.Password = pwd
+	}
+	if o.PassphraseStdin {
+		pass, err := utils.ReadSecretFromStdin()
+		if err != nil {
+			return fmt.Errorf("read passphrase from stdin: %w", err)
+		}
+		o.Passphrase = pass
+	}
 	if !o.StdinRedirect {
 		stat, err := os.Stdin.Stat()
 		if err == nil && (stat.Mode()&os.ModeCharDevice) == 0 {
 			o.stdinScript = true
 		}
 	}
+	return nil
 }
 
 func (o *SshOptions) parseArgs() error {
@@ -153,6 +186,9 @@ func (o *SshOptions) parseArgs() error {
 }
 
 func (o *SshOptions) Validate() error {
+	if err := utils.ValidateRememberPolicy(o.Remember); err != nil {
+		return err
+	}
 	if err := o.parseArgs(); err != nil {
 		return err
 	}
@@ -219,14 +255,18 @@ func (o *SshOptions) runParentDaemon(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	connector := newCLIConnector(provider, ssh.WithLogger(logger.DefaultLogger()))
+	adpOpts, optErr := o.buildAdapterOptions(nodeID, cfg, provider)
+	if optErr != nil {
+		return optErr
+	}
+	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithInteractionHandler(o.interaction))
 	defer func() {
 		joinConnectorCloseError(&err, connector)
 	}()
 	client, err := connector.Connect(ctx, nodeID)
 	if err != nil {
 		promptErr := promptPressEnterIfTUI(os.Stdin, os.Stdout)
-		return errors.Join(fmt.Errorf("%s: %w", i18n.T("fw_connect_failed"), err), promptErr)
+		return errors.Join(sshConnectionError(nodeID, err), promptErr)
 	}
 
 	// 无论如何，在 runParentDaemon 退出时，或者有任何 panic 发生时，确保 client 必被关闭
@@ -285,6 +325,37 @@ func (o *SshOptions) runParentDaemon(ctx context.Context) (err error) {
 	return nil
 }
 
+func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuration, repository *config.Repository) ([]adapter.Option, error) {
+	if o.interaction == nil {
+		o.interaction = newCLIInteractionHandler()
+	}
+	shouldRemember, adpOpts := o.interaction.rememberOptions(utils.EffectiveRememberPolicy(o.Remember, cfg), cfg)
+	// The global policy also covers ProxyJump nodes. The target-specific override
+	// below carries its explicit session material without leaking it to jumps.
+	adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{Remember: shouldRemember}))
+	// 总是注入 SessionAuthOverride（即使密码为空），以便 UpdateAuth / UpdateSudo
+	// 能根据 Remember 策略决定是否将交互提示获得的密码回写配置，而不是绕过策略检查。
+	adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, adapter.SessionAuth{
+		Password:   o.Password,
+		Passphrase: o.Passphrase,
+		KeyPath:    utils.ToAbsolutePath(o.IdentityFile),
+		Remember:   shouldRemember,
+	}))
+	if reg, regErr := utils.GetCredentialRegistry(cfg); regErr != nil {
+		return nil, fmt.Errorf("initialize credential resolver: %w", regErr)
+	} else if reg != nil {
+		adpOpts = append(adpOpts, adapter.WithCredentialSource(reg))
+	}
+	if shouldRemember {
+		persistence, err := o.interaction.automaticPersistenceOptions(repository, cfg)
+		if err != nil {
+			return nil, err
+		}
+		adpOpts = append(adpOpts, persistence...)
+	}
+	return adpOpts, nil
+}
+
 func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error) {
 	configPath, keyPath, pathErr := utils.GetConfigFilePath()
 	if pathErr != nil {
@@ -305,7 +376,11 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 	if err != nil {
 		return err
 	}
-	connector := newCLIConnector(provider, ssh.WithLogger(logger.DefaultLogger()))
+	adpOpts, optErr := o.buildAdapterOptions(nodeID, cfg, provider)
+	if optErr != nil {
+		return optErr
+	}
+	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithInteractionHandler(o.interaction))
 	defer func() {
 		joinConnectorCloseError(&err, connector)
 	}()
@@ -313,10 +388,10 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 	if err != nil {
 		if isChild {
 			// 子进程静默退出或记录错误，不进行交互式阻塞
-			return fmt.Errorf("%s: %w", i18n.T("fw_connect_failed"), err)
+			return sshConnectionError(nodeID, err)
 		}
 		promptErr := promptPressEnterIfTUI(os.Stdin, os.Stdout)
-		return errors.Join(fmt.Errorf("%s: %w", i18n.T("fw_connect_failed"), err), promptErr)
+		return errors.Join(sshConnectionError(nodeID, err), promptErr)
 	}
 	defer func() {
 		if closeErr := client.Close(); closeErr != nil {
@@ -350,6 +425,10 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 	}
 
 	return o.runShell(runCtx, client)
+}
+
+func sshConnectionError(nodeID string, err error) error {
+	return fmt.Errorf("[%s] %s: %w", nodeID, i18n.T("ssh_connection_failed_label"), err)
 }
 
 func (o *SshOptions) runShell(ctx context.Context, client *ssh.Client) error {
@@ -418,12 +497,14 @@ func (o *SshOptions) resolveNode(ctx context.Context, provider *config.Repositor
 		}
 	}
 
+	shouldRemember := utils.EffectiveRememberPolicy(o.Remember, provider.Snapshot()) == utils.RememberPolicyAlways
+
 	res, err := provider.EnsureNodeContext(ctx, config.EnsureNodeOptions{
 		Target:       o.Target,
 		DefaultUser:  defaultUser,
-		Password:     o.Password,
+		Password:     "",
 		IdentityFile: o.IdentityFile,
-		Passphrase:   o.Passphrase,
+		Passphrase:   "",
 		Alias:        o.Alias,
 		Tags:         o.Tags,
 	})
@@ -433,7 +514,7 @@ func (o *SshOptions) resolveNode(ctx context.Context, provider *config.Repositor
 	if res.Created {
 		return res.NodeID, true, nil
 	}
-	updated, err := update(ctx, res.NodeID, o, provider)
+	updated, err := update(ctx, res.NodeID, o, provider, shouldRemember)
 	return res.NodeID, updated, err
 }
 
@@ -587,22 +668,19 @@ func updateNodeFields(node *models.Node, nodeID string, o *SshOptions, provider 
 func updateIdentityFields(identity *models.Identity, o *SshOptions) bool {
 	identityUpdated := false
 	if o.Password != "" {
-		identity.Password = o.Password
-		identity.AuthType = "password"
-		identityUpdated = true
+		if identity.AuthType != "password" {
+			identity.AuthType = "password"
+			identityUpdated = true
+		}
 	} else if o.IdentityFile != "" {
 		identity.KeyPath = utils.ToAbsolutePath(o.IdentityFile)
 		identity.AuthType = "key"
 		identityUpdated = true
 	}
-	if o.Passphrase != "" {
-		identity.Passphrase = o.Passphrase
-		identityUpdated = true
-	}
 	return identityUpdated
 }
 
-func update(ctx context.Context, nodeID string, o *SshOptions, provider *config.Repository) (bool, error) {
+func update(ctx context.Context, nodeID string, o *SshOptions, provider *config.Repository, shouldRemember bool) (bool, error) {
 	if o.Password == "" && o.IdentityFile == "" && o.JumpHost == "" && !o.Sudo && o.Alias == "" && len(o.Tags) == 0 {
 		return false, nil
 	}
@@ -619,7 +697,10 @@ func update(ctx context.Context, nodeID string, o *SshOptions, provider *config.
 	if err != nil {
 		return false, err
 	}
-	identityUpdated := updateIdentityFields(&identity, o)
+	identityUpdated := false
+	if shouldRemember {
+		identityUpdated = updateIdentityFields(&identity, o)
+	}
 
 	if nodeUpdated || identityUpdated {
 		if err := provider.ReplaceNodeAtRefContext(ctx, ref, nodeID, node, host, identity); err != nil {
@@ -629,9 +710,8 @@ func update(ctx context.Context, nodeID string, o *SshOptions, provider *config.
 	return nodeUpdated || identityUpdated, nil
 }
 
-// TODO(refactor): TUI 渲染边界与环境变量污染
-// 这里的阻塞提示逻辑属于 TUI 层面的交互，目前交由子进程处理（依赖 XOPS_CLI_SSH_FROM_TUI 环境变量）并非最佳实践。
-// 后续重构建议：移除子进程中的阻塞提示，改为子进程出错即退，由外层的 TUI 框架拦截退出状态码并绘制错误提示信息。
+// Legacy launchers may still request this pause. The current TUI uses owned
+// in-process SSH sessions and displays errors after restoring its terminal.
 func promptPressEnterIfTUI(stdin io.Reader, stdout io.Writer) error {
 	if os.Getenv("XOPS_CLI_SSH_FROM_TUI") == "true" {
 		if _, err := fmt.Fprintln(stdout, i18n.T("tui_press_enter")); err != nil {

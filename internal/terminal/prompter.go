@@ -52,17 +52,35 @@ func (p *stdPrompter) ReadLine(ctx context.Context, prompt string) (lineResult s
 		}
 	}()
 
-	lineResult, retErr = p.readLineLoop(ctx, input)
+	lineResult, retErr = p.readPromptLine(ctx, input)
 	return lineResult, retErr
 }
 
 func (p *stdPrompter) readLineLoop(ctx context.Context, input PromptInput) (string, error) {
+	return p.readLineLoopMode(ctx, input, false)
+}
+
+// Console event readers bypass cooked-mode echo and return CR for Enter.
+// Stream readers retain their existing CRLF handling and never echo input.
+func (p *stdPrompter) readLineLoopMode(ctx context.Context, input PromptInput, echo bool) (string, error) {
 	var line bytes.Buffer
+	echoWriter := promptLineEcho{writer: p.stdout}
 	buf := make([]byte, 1)
 	for {
 		n, readErr := input.Read(buf)
 		if n > 0 {
-			switch processReadLineByte(buf[0], &line) {
+			b := buf[0]
+			before := line.Len()
+			if echo && b == '\r' {
+				b = '\n'
+			}
+			action := processReadLineByte(b, &line)
+			if echo {
+				if err := echoWriter.write(b, action, before, line.Len()); err != nil {
+					return "", err
+				}
+			}
+			switch action {
 			case secretActionDone:
 				return line.String(), nil
 			case secretActionCanceled:
@@ -88,6 +106,37 @@ func (p *stdPrompter) readLineLoop(ctx context.Context, input PromptInput) (stri
 			return "", fmt.Errorf("read line failed: %w", readErr)
 		}
 	}
+}
+
+// promptLineEcho emits complete UTF-8 characters for Windows console writers.
+type promptLineEcho struct {
+	writer  io.Writer
+	pending []byte
+}
+
+func (e *promptLineEcho) write(b byte, action secretByteAction, before, after int) error {
+	if e.writer == nil {
+		return nil
+	}
+	var output string
+	switch {
+	case action == secretActionDone:
+		output = "\r\n"
+	case (b == 8 || b == 127) && after < before:
+		output = "\b \b"
+	case after > before:
+		e.pending = append(e.pending, b)
+		if utf8.FullRune(e.pending) {
+			output = string(e.pending)
+			e.pending = e.pending[:0]
+		}
+	}
+	if output != "" {
+		if _, err := io.WriteString(e.writer, output); err != nil {
+			return fmt.Errorf("echo prompt input failed: %w", err)
+		}
+	}
+	return nil
 }
 
 func (p *stdPrompter) ReadSecret(ctx context.Context, prompt string) (secretResult string, retErr error) {

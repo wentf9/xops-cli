@@ -3,6 +3,7 @@ package ssh
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -25,7 +26,7 @@ func (c *Client) RunWithSudo(ctx context.Context, command string, opts ...RunOpt
 	if err := c.maybeDetectSudoMode(ctx); err != nil {
 		return "", err
 	}
-	clientConfig, _ := c.configSnapshot()
+	connCfg := c.ConnectionConfig()
 
 	var wrappedCmd string
 	if config.LoginShell {
@@ -34,17 +35,17 @@ func (c *Client) RunWithSudo(ctx context.Context, command string, opts ...RunOpt
 		wrappedCmd = fmt.Sprintf("bash -c '%s'", strings.ReplaceAll(command, "'", "'\\''"))
 	}
 
-	switch clientConfig.SudoMode {
+	switch connCfg.SudoMode {
 	case SudoModeRoot:
 		return c.Run(ctx, command, opts...)
-	case SudoModeSudo:
-		return c.runWithSudo(ctx, wrappedCmd, clientConfig.Password, nil, config)
 	case SudoModeSudoer:
-		return c.runWithSudo(ctx, wrappedCmd, "", nil, config)
+		return c.runWithSudo(ctx, wrappedCmd, nil, nil, config)
+	case SudoModeSudo:
+		return c.runPrivilegeWithConfig(ctx, connCfg.SudoMode, wrappedCmd, nil, config)
 	case SudoModeSu:
-		return c.runWithSu(ctx, command, clientConfig.SuPwd, config)
+		return c.runPrivilegeWithConfig(ctx, connCfg.SudoMode, command, nil, config)
 	default:
-		return "", fmt.Errorf("unknown sudo mode: %s, please check config to set sudo mode", clientConfig.SudoMode)
+		return "", fmt.Errorf("unknown sudo mode: %s, please check config to set sudo mode", connCfg.SudoMode)
 	}
 }
 
@@ -58,7 +59,7 @@ func (c *Client) RunScriptWithSudo(ctx context.Context, scriptContent string, op
 	if err := c.maybeDetectSudoMode(ctx); err != nil {
 		return "", err
 	}
-	clientConfig, _ := c.configSnapshot()
+	connCfg := c.ConnectionConfig()
 
 	bashArgs := "bash -s"
 	bashCmd := fmt.Sprintf("bash -c '%s'", strings.ReplaceAll(scriptContent, "'", "'\\''"))
@@ -67,127 +68,65 @@ func (c *Client) RunScriptWithSudo(ctx context.Context, scriptContent string, op
 		bashCmd = fmt.Sprintf("bash -l -c '%s'", strings.ReplaceAll(scriptContent, "'", "'\\''"))
 	}
 
-	switch clientConfig.SudoMode {
+	switch connCfg.SudoMode {
 	case SudoModeRoot:
 		return c.RunScript(ctx, scriptContent, opts...)
-	case SudoModeSudo:
-		return c.runWithSudo(ctx, bashArgs, clientConfig.Password, strings.NewReader(scriptContent), config)
 	case SudoModeSudoer:
-		return c.runWithSudo(ctx, bashArgs, "", strings.NewReader(scriptContent), config)
+		return c.runWithSudo(ctx, bashArgs, nil, strings.NewReader(scriptContent), config)
+	case SudoModeSudo:
+		return c.runPrivilegeWithConfig(ctx, connCfg.SudoMode, bashArgs, strings.NewReader(scriptContent), config)
 	case SudoModeSu:
-		return c.runWithSu(ctx, bashCmd, clientConfig.SuPwd, config)
+		return c.runPrivilegeWithConfig(ctx, connCfg.SudoMode, bashCmd, nil, config)
 	default:
-		return "", fmt.Errorf("unsupported sudo mode: %s", clientConfig.SudoMode)
+		return "", fmt.Errorf("unsupported sudo mode: %s", connCfg.SudoMode)
 	}
 }
 
 // RunInteractiveWithSudo 在 PTY 环境下以提权方式执行单条交互式命令
-func (c *Client) RunInteractiveWithSudo(ctx context.Context, command string) (retErr error) {
+func (c *Client) RunInteractiveWithSudo(ctx context.Context, command string) error {
+	return c.RunInteractiveWithSudoIO(ctx, command, defaultInteractiveIO())
+}
+
+// RunInteractiveWithSudoIO uses an authenticated terminal handoff before
+// consuming caller input. The injected streams avoid process-global I/O changes.
+func (c *Client) RunInteractiveWithSudoIO(ctx context.Context, command string, streams InteractiveIO) error {
 	if err := c.maybeDetectSudoMode(ctx); err != nil {
 		return err
 	}
-	clientConfig, _ := c.configSnapshot()
-	if clientConfig.SudoMode == SudoModeRoot {
-		return c.RunInteractive(ctx, command)
-	}
-
-	// 对于需要提权的场景，打开交互式 shell 后在 shell 内提权再执行命令
-	session, err := c.newSessionContext(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to create new session: %w", err)
-	}
-	defer joinResourceCloseError(&retErr, session, "interactive sudo session")
-
-	modes := ssh.TerminalModes{
-		ssh.ECHO:          1,
-		ssh.TTY_OP_ISPEED: 14400,
-		ssh.TTY_OP_OSPEED: 14400,
-	}
-	fdIn := int(os.Stdin.Fd())
-	fdOut := int(os.Stdout.Fd())
-	width, height, err := term.GetSize(fdOut)
-	if err != nil {
-		width, height = 80, 40
-	}
-	if err := session.RequestPty("xterm-256color", height, width, modes); err != nil {
-		return fmt.Errorf("request for pty failed: %w", err)
-	}
-
-	stdin, err := session.StdinPipe()
-	if err != nil {
-		return fmt.Errorf("create interactive sudo stdin pipe failed: %w", err)
-	}
-
-	sudoCmd, password := c.getSudoParams()
-	expect := c.setupInteractiveExpect(session, stdin, password)
-	session.Stderr = os.Stderr
-
-	if sudoCmd != "" {
-		if err := session.Start(sudoCmd); err != nil {
-			return fmt.Errorf("start %s failed: %w", sudoCmd, err)
+	mode := c.ConnectionConfig().SudoMode
+	switch mode {
+	case SudoModeRoot:
+		return c.RunInteractiveCmdWithIO(ctx, "bash -l -c "+shellQuote(command), streams)
+	case SudoModeSudoer:
+		wrapped, err := interactivePrivilegeCommand(mode, command)
+		if err != nil {
+			return err
 		}
-	} else {
-		if err := session.Shell(); err != nil {
-			return fmt.Errorf("start shell failed: %w", err)
-		}
+		return c.RunInteractiveCmdWithIO(ctx, wrapped, streams)
+	case SudoModeSudo, SudoModeSu:
+		return c.runInteractivePrivilege(ctx, mode, "exec bash -c "+shellQuote(command), streams)
+	default:
+		return fmt.Errorf("interactive privilege escalation is unsupported for sudo mode %q", mode)
 	}
-
-	oldState, err := term.MakeRaw(fdIn)
-	if err != nil {
-		return fmt.Errorf("cannot set terminal to raw: %w", err)
-	}
-	defer func() {
-		if restoreErr := term.Restore(fdIn, oldState); restoreErr != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("restore terminal failed: %w", restoreErr))
-		}
-	}()
-
-	derivedCtx, cancelResize := context.WithCancel(ctx)
-	defer cancelResize()
-	startWindowResizeLoop(derivedCtx, session, fdOut, width, height, c.getLogger())
-
-	if expect != nil {
-		if err := expect.Wait(ctx, 5*time.Second); err != nil {
-			return fmt.Errorf("complete interactive sudo authentication failed: %w", err)
-		}
-
-		// 获取被拦截的输出，仅需清理密码行，不再有 sudo 回显
-		cleaned := expect.CleanOutput(c.passwordPromptRegex())
-		if _, err := io.WriteString(os.Stdout, cleaned); err != nil {
-			return fmt.Errorf("write interactive sudo output failed: %w", err)
-		}
-
-		// 握手结束后，将后续输出直接透传给终端，并停止无谓的累积
-		expect.SetAccumulate(false)
-		expect.SetTarget(os.Stdout)
-	}
-
-	// 提权完成后，给 Root Shell 留出 1 秒的初始化时间，
-	// 防止 sudo 或 su 的 tcflush(清空终端缓冲区) 机制吃掉我们随后立刻发出的指令。
-	time.Sleep(1 * time.Second)
-
-	// 提权完成后发送目标命令
-	// 使用 exec bash -c 替换掉提权后的 root shell
-	wrappedCmd := fmt.Sprintf("exec bash -c '%s'\n", strings.ReplaceAll(command, "'", "'\\''"))
-	if _, err := io.WriteString(stdin, wrappedCmd); err != nil {
-		return fmt.Errorf("write interactive sudo command failed: %w", err)
-	}
-
-	cancelStdin, stdinDone, err := copyStdinTo(os.Stdin, stdin)
-	if err != nil {
-		return err
-	}
-
-	err = ignoreShellExitError(session.Wait())
-	cancelErr := cancelStdin()
-	stdinErr := <-stdinDone
-
-	return errors.Join(err, cancelErr, stdinErr)
 }
 
-func (c *Client) runWithSudo(ctx context.Context, command string, password string, extraStdin io.Reader, config *RunConfig) (output string, retErr error) {
-	clientConfig, _ := c.configSnapshot()
-	if password == "" && clientConfig.SudoMode == SudoModeSudo {
+// Commands travel in the SSH exec request, never through echoed PTY input.
+func interactivePrivilegeCommand(mode SudoMode, command string) (string, error) {
+	quoted := "'" + strings.ReplaceAll(command, "'", "'\\''") + "'"
+	switch mode {
+	case SudoModeSudo, SudoModeSudoer:
+		return "sudo -i -- bash -c " + shellQuote(sudoLoginScript(command)), nil
+	case SudoModeSu:
+		bashCommand := "exec bash -c " + quoted
+		return "su - root -c '" + strings.ReplaceAll(bashCommand, "'", "'\\''") + "'", nil
+	default:
+		return "", fmt.Errorf("interactive privilege escalation is unsupported for sudo mode %q", mode)
+	}
+}
+
+func (c *Client) runWithSudo(ctx context.Context, command string, password []byte, extraStdin io.Reader, config *RunConfig, material ...*PrivilegeMaterial) (output string, retErr error) {
+	connCfg := c.ConnectionConfig()
+	if len(password) == 0 && connCfg.SudoMode == SudoModeSudo {
 		return "", fmt.Errorf("sudo password is required but not provided")
 	}
 
@@ -197,218 +136,55 @@ func (c *Client) runWithSudo(ctx context.Context, command string, password strin
 	}
 	defer joinResourceCloseError(&retErr, session, "sudo session")
 
-	if password != "" {
+	if len(password) > 0 {
+		pwdStr := string(password) + "\n"
 		if extraStdin != nil {
-			session.Stdin = io.MultiReader(strings.NewReader(password+"\n"), extraStdin)
+			session.Stdin = io.MultiReader(strings.NewReader(pwdStr), extraStdin)
 		} else {
-			session.Stdin = strings.NewReader(password + "\n")
+			session.Stdin = strings.NewReader(pwdStr)
 		}
 	} else if extraStdin != nil {
 		session.Stdin = extraStdin
 	}
 
 	fullCmd := fmt.Sprintf("sudo -S -p '' %s", command)
-	return c.startWithTimeout(ctx, session, fullCmd, config)
-}
-
-func (c *Client) runWithSu(ctx context.Context, command string, password string, config *RunConfig) (output string, retErr error) {
-	session, err := c.newSessionContext(ctx)
-	if err != nil {
-		return "", fmt.Errorf("failed to create new session: %w", err)
+	if len(material) == 0 || material[0] == nil || material[0].confirmedSave == nil {
+		return c.startWithTimeout(ctx, session, fullCmd, config)
 	}
-	defer joinResourceCloseError(&retErr, session, "su session")
-
-	modes := ssh.TerminalModes{
-		ssh.ECHO:          0,
-		ssh.TTY_OP_ISPEED: 14400,
-		ssh.TTY_OP_OSPEED: 14400,
-	}
-	if err := session.RequestPty("xterm", 80, 40, modes); err != nil {
-		return "", fmt.Errorf("request for pty failed: %w", err)
-	}
-
-	stdin, err := session.StdinPipe()
-	if err != nil {
-		return "", fmt.Errorf("failed to create stdin pipe: %w", err)
-	}
-
-	if config == nil {
-		config = DefaultRunConfig()
-	}
-	syncWriter := newOutputWriter(config)
-
-	expect := NewExpectWithOptions(stdin, []ExpectRule{
-		{
-			Pattern: c.passwordPromptRegex(),
-			Respond: StaticRespond(password),
-		},
-	}, WithExpectLogger(c.getLogger()))
-	expect.SetTarget(syncWriter)
-	// 如果模式是全量收集，由于我们要手动处理密码提示过滤，需要让 expect 不自己收集全部
-	expect.SetAccumulate(false)
-	session.Stdout = expect
-
-	cmd := fmt.Sprintf("export LC_ALL=C; su - root -c '%s'", strings.ReplaceAll(command, "'", "'\\''"))
-
-	if err := session.Start(cmd); err != nil {
-		return "", fmt.Errorf("failed to start command: %w", err)
-	}
-
-	if err := expect.Wait(ctx, 5*time.Second); err != nil {
-		return syncWriter.String(), fmt.Errorf("password handshake failed: %w", err)
-	}
-
-	done := make(chan error, 1)
-	go func() {
-		done <- session.Wait()
-	}()
-
-	select {
-	case err = <-done:
-	case <-ctx.Done():
-		return syncWriter.String(), c.closeCanceledSession(ctx, session, done)
-	}
-
-	if err != nil {
-		return syncWriter.String(), fmt.Errorf("command execution failed: %w", err)
-	}
-
-	output = syncWriter.String()
-	// 如果是字符串返回模式，尝试清理密码提示
-	if config.OutMode == OutputModeString || config.OutMode == OutputModeRingBuffer {
-		if c.passwordPromptRegex() != nil {
-			output = c.passwordPromptRegex().ReplaceAllString(output, "")
+	prompt := "[xops-password-" + rand.Text() + "]"
+	observer := &privilegePromptWriter{marker: []byte(prompt)}
+	fullCmd = fmt.Sprintf("sudo -S -p '%s' %s", prompt, command)
+	output, err = c.startWithTimeout(ctx, session, fullCmd, config, func(target io.Writer) io.Writer { observer.target = target; return observer })
+	if err == nil && observer.observed {
+		material[0].verified = true
+		if !material[0].deferSave {
+			err = c.confirmPrivilege(ctx, material[0])
 		}
 	}
-
-	return output, nil
+	return output, err
 }
 
-func (c *Client) preCheckSudoMode(ctx context.Context) (isRoot bool, err error) {
+// ShellWithSudo opens an interactive privileged shell using the default streams.
+func (c *Client) ShellWithSudo(ctx context.Context) error {
+	return c.ShellWithSudoIO(ctx, defaultInteractiveIO())
+}
+
+// ShellWithSudoIO authenticates before switching the local terminal to raw mode.
+func (c *Client) ShellWithSudoIO(ctx context.Context, streams InteractiveIO) error {
 	if err := c.maybeDetectSudoMode(ctx); err != nil {
-		return false, err
-	}
-	clientConfig, _ := c.configSnapshot()
-	if clientConfig.SudoMode == SudoModeRoot {
-		return true, nil
-	}
-
-	// none 模式明确不支持提权
-	if clientConfig.SudoMode == SudoModeNone {
-		return false, fmt.Errorf("privilege escalation is not supported for this host (sudo_mode=none)")
-	}
-
-	// sudo/sudoer 模式：通过 sudo -S -p '' true 预检，可靠且无副作用
-	// su 模式不做预检：su -c 会跑 root login shell 初始化脚本，脚本错误会导致误报
-	if clientConfig.SudoMode == SudoModeSudo || clientConfig.SudoMode == SudoModeSudoer {
-		if _, err := c.runWithSudo(ctx, "true", clientConfig.Password, nil, nil); err != nil {
-			return false, fmt.Errorf("sudo access denied: %w", err)
-		}
-	}
-	return false, nil
-}
-
-func (c *Client) ShellWithSudo(ctx context.Context) (retErr error) {
-	isRoot, err := c.preCheckSudoMode(ctx)
-	if err != nil {
 		return err
 	}
-	if isRoot {
-		return c.Shell(ctx)
+	mode := c.ConnectionConfig().SudoMode
+	switch mode {
+	case SudoModeRoot:
+		return c.ShellWithIO(ctx, streams)
+	case SudoModeSudoer:
+		return c.RunInteractiveCmdWithIO(ctx, "sudo -i", streams)
+	case SudoModeSudo, SudoModeSu:
+		return c.runInteractivePrivilege(ctx, mode, `exec "${SHELL:-/bin/bash}"`, streams)
+	default:
+		return fmt.Errorf("privilege escalation is not supported for this host (sudo_mode=%s)", mode)
 	}
-
-	session, err := c.newSessionContext(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to create new session: %w", err)
-	}
-	defer joinResourceCloseError(&retErr, session, "sudo shell session")
-	modes := ssh.TerminalModes{
-		ssh.ECHO:          1,
-		ssh.TTY_OP_ISPEED: 14400,
-		ssh.TTY_OP_OSPEED: 14400,
-	}
-	fdIn := int(os.Stdin.Fd())
-	fdOut := int(os.Stdout.Fd())
-	width, height, err := term.GetSize(fdOut)
-	if err != nil {
-		width, height = 80, 40
-	}
-	if err := session.RequestPty("xterm-256color", height, width, modes); err != nil {
-		return fmt.Errorf("request for pty failed: %w", err)
-	}
-	stdin, err := session.StdinPipe()
-	if err != nil {
-		return fmt.Errorf("create sudo shell stdin pipe failed: %w", err)
-	}
-
-	sudoCmd, password := c.getSudoParams()
-	expect := c.setupInteractiveExpect(session, stdin, password)
-	session.Stderr = os.Stderr
-
-	if sudoCmd != "" {
-		if err := session.Start(sudoCmd); err != nil {
-			return fmt.Errorf("start %s failed: %w", sudoCmd, err)
-		}
-	} else {
-		if err := session.Shell(); err != nil {
-			return fmt.Errorf("start shell failed: %w", err)
-		}
-	}
-
-	oldState, err := term.MakeRaw(fdIn)
-	if err != nil {
-		return fmt.Errorf("cannot set terminal to raw: %w", err)
-	}
-	defer func() {
-		if restoreErr := term.Restore(fdIn, oldState); restoreErr != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("restore terminal failed: %w", restoreErr))
-		}
-	}()
-
-	derivedCtx, cancelResize := context.WithCancel(ctx)
-	defer cancelResize()
-	startWindowResizeLoop(derivedCtx, session, fdOut, width, height, c.getLogger())
-
-	if expect != nil {
-		if err := expect.Wait(ctx, 5*time.Second); err != nil {
-			return fmt.Errorf("complete sudo shell authentication failed: %w", err)
-		}
-
-		// 提取、清洗并打印密码握手前的截留输出
-		cleaned := expect.CleanOutput(c.passwordPromptRegex())
-		if _, err := io.WriteString(os.Stdout, cleaned); err != nil {
-			return fmt.Errorf("write sudo shell output failed: %w", err)
-		}
-
-		// 将后续真实的 Shell 输出接入到当前终端
-		expect.SetAccumulate(false)
-		expect.SetTarget(os.Stdout)
-	}
-
-	done := make(chan struct{})
-	defer close(done)
-
-	go func() {
-		select {
-		case <-ctx.Done():
-			if signalErr := session.Signal(ssh.SIGKILL); signalErr != nil {
-				c.getLogger().Debugf("signal canceled sudo shell session failed: %v", signalErr)
-			}
-			debugCloseResource(c.getLogger(), session, "canceled sudo shell session")
-		case <-done:
-		}
-	}()
-
-	cancelStdin, stdinDone, err := copyStdinTo(os.Stdin, stdin)
-	if err != nil {
-		return err
-	}
-
-	err = ignoreShellExitError(session.Wait())
-	cancelErr := cancelStdin()
-	stdinErr := <-stdinDone
-
-	return errors.Join(err, cancelErr, stdinErr)
 }
 
 // ignoreShellExitError 忽略交互式 shell 的 ExitError
@@ -423,24 +199,11 @@ func ignoreShellExitError(err error) error {
 	return err
 }
 
-func (c *Client) getSudoParams() (string, string) {
-	clientConfig, _ := c.configSnapshot()
-	switch clientConfig.SudoMode {
-	case SudoModeSudo:
-		return "sudo -i", clientConfig.Password
-	case SudoModeSudoer:
-		return "sudo -i", ""
-	case SudoModeSu:
-		return "su -", clientConfig.SuPwd
-	case SudoModeRoot, "":
-		return "", ""
-	default:
-		return "", ""
-	}
-}
-
-func startWindowResizeLoop(ctx context.Context, session *ssh.Session, fdOut, width, height int, l logger.DebugLogger) {
+func startWindowResizeLoop(ctx context.Context, session *ssh.Session, fdOut, width, height int, l logger.DebugLogger, interrupt func() error) func() error {
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		lastW, lastH := width, height
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
@@ -465,24 +228,20 @@ func startWindowResizeLoop(ctx context.Context, session *ssh.Session, fdOut, wid
 			}
 		}
 	}()
-}
-
-// setupInteractiveExpect 配置并返回一个用于拦截登录输出的 Expect 状态机。
-func (c *Client) setupInteractiveExpect(session *ssh.Session, stdin io.Writer, password string) *Expect {
-	if password == "" {
-		session.Stdout = os.Stdout
-		return nil
+	return func() error {
+		cancel()
+		timer := time.NewTimer(sessionShutdownTimeout)
+		defer timer.Stop()
+		select {
+		case <-done:
+			return nil
+		case <-timer.C:
+			err := interrupt()
+			<-done
+			return errors.Join(fmt.Errorf("window resize worker shutdown timed out"), err)
+		}
 	}
 
-	rules := []ExpectRule{{
-		Pattern: c.passwordPromptRegex(),
-		Respond: StaticRespond(password),
-	}}
-
-	expect := NewExpectWithOptions(stdin, rules, WithExpectLogger(c.getLogger()))
-	expect.SetAccumulate(true)
-	session.Stdout = expect
-	return expect
 }
 
 // RunCommandWithInput executes a command (or interactive bash when command is empty) using finite byte input.
@@ -539,19 +298,12 @@ func (c *Client) RunCommandWithIO(ctx context.Context, command string, sudo bool
 			rawCmd = "sudo -S -p '' bash"
 		}
 		return c.runRawCommandWithPayload(ctx, rawCmd, "", stdin, stdout, stderr)
-	case SudoModeSudo:
-		if clientConfig.Password == "" {
-			return fmt.Errorf("sudo password is required but not provided")
-		}
-		var rawCmd string
+	case SudoModeSudo, SudoModeSu:
+		inner := "exec bash"
 		if command != "" {
-			rawCmd = fmt.Sprintf("sudo -S -p '' bash -c '%s'", strings.ReplaceAll(command, "'", "'\\''"))
-		} else {
-			rawCmd = "sudo -S -p '' bash"
+			inner = "bash -c " + shellQuote(command)
 		}
-		return c.runRawCommandWithPayload(ctx, rawCmd, clientConfig.Password+"\n", stdin, stdout, stderr)
-	case SudoModeSu:
-		return c.runWithSuIO(ctx, command, stdin, stdout, stderr)
+		return c.runPrivilegeOperation(ctx, clientConfig.SudoMode, inner, stdin, stdout, stderr)
 	case SudoModeNone:
 		return fmt.Errorf("privilege escalation is not supported for this host (sudo_mode=none)")
 	default:
@@ -666,88 +418,6 @@ func (c *Client) runRawCommandWithPayload(ctx context.Context, rawCmd, initialPa
 	}
 }
 
-//nolint:gocyclo
-func (c *Client) runWithSuIO(ctx context.Context, command string, stdin io.Reader, stdout, stderr io.Writer) (retErr error) {
-	if c == nil || c.sshClient == nil {
-		return fmt.Errorf("ssh client is not connected")
-	}
-	session, err := c.newSessionContext(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to create new session: %w", err)
-	}
-	defer joinResourceCloseError(&retErr, session, "ssh command session")
-
-	modes := ssh.TerminalModes{
-		ssh.ECHO:          0,
-		ssh.TTY_OP_ISPEED: 14400,
-		ssh.TTY_OP_OSPEED: 14400,
-	}
-	if err := session.RequestPty("xterm", 80, 40, modes); err != nil {
-		return fmt.Errorf("request for pty failed: %w", err)
-	}
-
-	stdinPipe, err := session.StdinPipe()
-	if err != nil {
-		return fmt.Errorf("failed to open session stdin pipe: %w", err)
-	}
-
-	var payload string
-	clientConfig, _ := c.configSnapshot()
-	if clientConfig.SuPwd != "" {
-		payload = clientConfig.SuPwd + "\n"
-	}
-
-	session.Stdout = stdout
-	session.Stderr = stderr
-
-	var cmd string
-	if command != "" {
-		cmd = fmt.Sprintf("export LC_ALL=C; su - root -c '%s'", strings.ReplaceAll(command, "'", "'\\''"))
-	} else {
-		cmd = "export LC_ALL=C; su - root"
-	}
-
-	finishStdin, setupErr := startCommandWithStdinPipeline(
-		func() error {
-			if err := session.Start(cmd); err != nil {
-				return fmt.Errorf("failed to start su session: %w", err)
-			}
-			return nil
-		},
-		stdin,
-		stdinPipe,
-		payload,
-	)
-	if setupErr != nil {
-		return setupErr
-	}
-	defer func() {
-		if finishErr := finishStdin(); finishErr != nil {
-			retErr = errors.Join(retErr, finishErr)
-		}
-	}()
-
-	done := make(chan error, 1)
-	go func() {
-		done <- session.Wait()
-	}()
-
-	select {
-	case err := <-done:
-		if err != nil {
-			return fmt.Errorf("su session command failed: %w", err)
-		}
-		return nil
-	case <-ctx.Done():
-		interruptErr := c.Interrupt()
-		finishErr := finishStdin()
-		<-done
-		return errors.Join(ctx.Err(), interruptErr, finishErr)
-	}
-}
-
-// pipeCommandStdin pipes stdin to dst in a goroutine and returns a stopAndWait
-// function that stops copying and waits for the goroutine to finish.
 func pipeCommandStdin(stdin io.Reader, dst io.WriteCloser) (stopAndWait func() error, err error) {
 	if stdin == nil {
 		return nil, nil

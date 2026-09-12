@@ -13,6 +13,7 @@ import (
 	"github.com/wentf9/xops-cli/cmd/utils"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
+	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
 	"github.com/wentf9/xops-cli/pkg/models"
@@ -70,6 +71,7 @@ func ExecuteLoadHost(hosts []utils.HostInfo) error {
 // ExecuteLoadHostContext imports hosts and propagates caller cancellation to
 // every connection attempt.
 func ExecuteLoadHostContext(ctx context.Context, hosts []utils.HostInfo) (retErr error) {
+	ctx = credential.WithoutInteraction(ctx)
 	configPath, keyPath, pathErr := utils.GetConfigFilePath()
 	if pathErr != nil {
 		return fmt.Errorf("get config file path failed: %w", pathErr)
@@ -83,7 +85,15 @@ func ExecuteLoadHostContext(ctx context.Context, hosts []utils.HostInfo) (retErr
 	if err != nil {
 		return fmt.Errorf("create configuration repository: %w", err)
 	}
-	connector := adapter.NewNonInteractiveConnector(provider, ssh.WithLogger(logger.DefaultLogger()))
+	registry, err := utils.GetCredentialRegistry(cfg)
+	if err != nil {
+		return fmt.Errorf("initialize import credential resolver: %w", err)
+	}
+	adpOpts := []adapter.Option{adapter.WithNonInteractive(true)}
+	if registry != nil {
+		adpOpts = append(adpOpts, adapter.WithCredentialSource(registry))
+	}
+	connector := adapter.NewConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
 	// 批量导入时默认接受新的主机密钥，避免并发时大量询问
 	connector.AcceptNewHostKey.Store(true)
 	defer func() {
@@ -195,13 +205,24 @@ func getOrCreateNode(ctx context.Context, provider *config.Repository, addr util
 	}
 
 	if addr.Password != "" {
-		identity.Password = addr.Password
 		identity.AuthType = "password"
 	} else if addr.KeyPath != "" {
 		identity.KeyPath = utils.ToAbsolutePath(addr.KeyPath)
-		identity.Passphrase = addr.Passphrase
 		identity.AuthType = "key"
 	}
+	if provider.Snapshot().SchemaVersion == 2 && (addr.Password != "" || addr.Passphrase != "") {
+		updater := provider.NodeCredentialCreate(nodeID, node, models.Host{Address: host, Port: port}, identity)
+		write, err := utils.PrepareInventoryCredential(provider, credential.Target{NodeID: nodeID}, identity, addr.Password, addr.Passphrase, addr.KeyPath, updater)
+		if err != nil {
+			return "", false, err
+		}
+		defer write.Clear()
+		if err := write.Save(credential.WithoutInteraction(ctx), ""); err != nil {
+			return "", false, err
+		}
+		return nodeID, true, nil
+	}
+	updateLegacyImportAuth(&identity, addr)
 
 	if _, err := provider.CreateNodeContext(ctx, nodeID, node, models.Host{Address: host, Port: port}, identity); err != nil {
 		return "", false, fmt.Errorf("create imported node %q failed: %w", nodeID, err)
@@ -222,20 +243,8 @@ func updateNodeFromHostInfo(ctx context.Context, nodeID string, provider *config
 	updated := false
 
 	// 更新密码或密钥
-	if addr.Password != "" {
-		if identity.Password != addr.Password || identity.AuthType != "password" {
-			identity.Password = addr.Password
-			identity.AuthType = "password"
-			updated = true
-		}
-	} else if addr.KeyPath != "" {
-		absKeyPath := utils.ToAbsolutePath(addr.KeyPath)
-		if identity.KeyPath != absKeyPath || identity.Passphrase != addr.Passphrase || identity.AuthType != "key" {
-			identity.KeyPath = absKeyPath
-			identity.Passphrase = addr.Passphrase
-			identity.AuthType = "key"
-			updated = true
-		}
+	if provider.Snapshot().SchemaVersion != 2 {
+		updated = updateLegacyImportAuth(&identity, addr)
 	}
 
 	// 更新别名
@@ -261,6 +270,18 @@ func updateNodeFromHostInfo(ctx context.Context, nodeID string, provider *config
 		}
 	}
 
+	if provider.Snapshot().SchemaVersion == 2 && (addr.Password != "" || addr.Passphrase != "" || addr.KeyPath != "") {
+		updater := provider.NodeCredentialEdit(ref, nodeID, node, host, identity)
+		write, err := utils.PrepareInventoryCredential(provider, credential.Target{NodeID: nodeID}, identity, addr.Password, addr.Passphrase, addr.KeyPath, updater)
+		if err != nil {
+			return false, err
+		}
+		defer write.Clear()
+		if err := write.Save(credential.WithoutInteraction(ctx), string(ref.Version[:])); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
 	if updated {
 		if err := provider.ReplaceNodeAtRefContext(ctx, ref, nodeID, node, host, identity); err != nil {
 			return false, fmt.Errorf("update imported node %q failed: %w", nodeID, err)
@@ -268,6 +289,22 @@ func updateNodeFromHostInfo(ctx context.Context, nodeID string, provider *config
 	}
 
 	return updated, nil
+}
+
+// updateLegacyImportAuth is retained only for the v1 release compatibility window.
+func updateLegacyImportAuth(identity *models.Identity, addr utils.HostInfo) bool {
+	if addr.Password != "" {
+		changed := identity.Password != addr.Password || identity.AuthType != "password"
+		identity.Password, identity.AuthType = addr.Password, "password"
+		return changed
+	}
+	if addr.KeyPath != "" {
+		path := utils.ToAbsolutePath(addr.KeyPath)
+		changed := identity.KeyPath != path || identity.Passphrase != addr.Passphrase || identity.AuthType != "key"
+		identity.KeyPath, identity.Passphrase, identity.AuthType = path, addr.Passphrase, "key"
+		return changed
+	}
+	return false
 }
 
 func appendUnique(slice []string, val string) ([]string, bool) {

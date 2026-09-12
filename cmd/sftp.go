@@ -54,7 +54,15 @@ func NewCmdSftp() *cobra.Command {
 		Short: i18n.T("sftp_short"),
 		Long:  i18n.T("sftp_long"),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			o.Complete(cmd, args)
+			if cmd.Flags().Changed("password") {
+				utils.WarnFlagDeprecated("password", "--password-stdin or 'xops identity credential set'")
+			}
+			if cmd.Flags().Changed("passphrase") {
+				utils.WarnFlagDeprecated("passphrase", "--passphrase-stdin or 'xops identity credential set'")
+			}
+			if err := o.Complete(cmd, args); err != nil {
+				return err
+			}
 			if err := o.Validate(); err != nil {
 				return fmt.Errorf("%s: %w", i18n.T("err_invalid_args"), err)
 			}
@@ -71,12 +79,18 @@ func NewCmdSftp() *cobra.Command {
 	cmd.Flags().StringVarP(&o.JumpHost, "jump", "J", "", i18n.T("flag_jump"))
 
 	// xops-enhanced flags (long-form only, no short flags to avoid OpenSSH conflicts)
+	cmd.Flags().StringVar(&o.Host, "host", "", i18n.T("flag_host"))
 	cmd.Flags().StringVar(&o.Password, "password", "", i18n.T("flag_password"))
+	cmd.Flags().BoolVar(&o.PasswordStdin, "password-stdin", false, i18n.T("flag_password_stdin"))
 	cmd.Flags().StringVar(&o.Passphrase, "passphrase", "", i18n.T("flag_passphrase"))
+	cmd.Flags().BoolVar(&o.PassphraseStdin, "passphrase-stdin", false, i18n.T("flag_passphrase_stdin"))
+	cmd.Flags().StringVar(&o.Remember, "remember", "", i18n.T("flag_remember"))
 	cmd.Flags().StringVar(&o.Alias, "alias", "", i18n.T("flag_alias"))
 	cmd.Flags().StringSliceVar(&o.Tags, "tag", []string{}, i18n.T("flag_tag"))
 
 	cmd.MarkFlagsMutuallyExclusive("password", "identity")
+	cmd.MarkFlagsMutuallyExclusive("password", "password-stdin")
+	cmd.MarkFlagsMutuallyExclusive("passphrase", "passphrase-stdin")
 	cmd.MarkFlagsMutuallyExclusive("force", "no-clobber")
 	return cmd
 }
@@ -109,7 +123,11 @@ func (o *SftpOptions) RunContext(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	connector := newCLIConnector(provider, ssh.WithLogger(logger.DefaultLogger()))
+	adpOpts, optErr := o.buildAdapterOptions(nodeID, cfg, provider)
+	if optErr != nil {
+		return optErr
+	}
+	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithInteractionHandler(o.interaction))
 	defer func() {
 		joinConnectorCloseError(&err, connector)
 	}()

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -17,11 +18,15 @@ import (
 )
 
 func NewCmdTui() *cobra.Command {
+	var remember string
 	cmd := &cobra.Command{
 		Use:   "tui",
 		Short: i18n.T("tui_short"),
 		Long:  i18n.T("tui_long"),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := utils.ValidateRememberPolicy(remember); err != nil {
+				return err
+			}
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 
@@ -39,11 +44,51 @@ func NewCmdTui() *cobra.Command {
 				return fmt.Errorf("create configuration repository: %w", err)
 			}
 
+			credSvc, credErr := utils.GetCredentialService(repository, cfg)
+			if credErr != nil {
+				// Saving failure must not prevent session-only connections. The
+				// TUI reports unavailable saving and keeps explicit edits closed.
+				logger.DefaultLogger().Debugf("initialize TUI credential persistence: %v", credErr)
+				credSvc = nil
+			}
+			credReg, regErr := utils.GetCredentialRegistry(cfg)
+			if regErr != nil {
+				return fmt.Errorf("initialize credential resolver: %w", regErr)
+			}
+
+			interaction := newCLIInteractionHandler()
 			model, err := tui.NewModel(
 				repository,
 				tui.WithContext(ctx),
 				tui.WithLogger(logger.DefaultLogger()),
-				tui.WithInteractionHandler(newCLIInteractionHandler()),
+				tui.WithInteractionHandler(interaction),
+				tui.WithRememberConfirmation(interaction.confirmRemember),
+				tui.WithRememberPolicy(remember),
+				tui.WithCredentialService(credSvc),
+				tui.WithCredentialPersistenceUnavailable(credErr != nil),
+				tui.WithCredentialRegistry(credReg),
+				tui.WithVaultControl(func(work context.Context, unlock bool) error {
+					owner, err := utils.CredentialRuntime()
+					if err != nil {
+						return err
+					}
+					if !unlock {
+						return owner.Lock(work)
+					}
+					if cfg.Credential == nil {
+						return fmt.Errorf("no default offline store configured")
+					}
+					id := cfg.Credential.DefaultStore
+					selected, err := offlineConfig(cfg, id, configPath)
+					if err != nil {
+						return err
+					}
+					s, err := owner.Store(work, id, selected)
+					if err != nil {
+						return err
+					}
+					return s.Unlock(work)
+				}),
 			)
 			if err != nil {
 				return fmt.Errorf("create TUI model: %w", err)
@@ -61,5 +106,6 @@ func NewCmdTui() *cobra.Command {
 			return errors.Join(runErr, closeErr)
 		},
 	}
+	cmd.Flags().StringVar(&remember, "remember", "", i18n.T("flag_remember"))
 	return cmd
 }

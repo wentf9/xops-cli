@@ -215,3 +215,48 @@ func closeWindowsTestHandle(t *testing.T, handle windows.Handle) {
 		t.Errorf("close Windows test handle failed: %v", err)
 	}
 }
+
+func TestWindowsInteractiveInputPreservesTerminalKeys(t *testing.T) {
+	tests := []struct {
+		name string
+		key  coninput.KeyEventRecord
+		want string
+	}{
+		{"up", coninput.KeyEventRecord{KeyDown: true, VirtualKeyCode: coninput.VK_UP}, "\x1b[A"},
+		{"delete", coninput.KeyEventRecord{KeyDown: true, VirtualKeyCode: coninput.VK_DELETE}, "\x1b[3~"},
+		{"control C", coninput.KeyEventRecord{KeyDown: true, Char: 3}, "\x03"},
+		{"unicode", coninput.KeyEventRecord{KeyDown: true, Char: '界'}, "界"},
+		{"repeat", coninput.KeyEventRecord{KeyDown: true, Char: 'x', RepeatCount: 3}, "xxx"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reader := newTestWindowsConsolePromptReader([]coninput.EventRecord{coninput.FocusEventRecord{}, coninput.KeyEventRecord{KeyDown: false, Char: 'z'}, tt.key})
+			reader.interactive = true
+			var got []byte
+			for len(got) < len(tt.want) {
+				var b [1]byte
+				n, err := reader.Read(b[:])
+				if err != nil {
+					t.Fatal(err)
+				}
+				got = append(got, b[:n]...)
+			}
+			if string(got) != tt.want {
+				t.Fatalf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWindowsInteractiveInputDecodesSurrogatePair(t *testing.T) {
+	reader := newTestWindowsConsolePromptReader([]coninput.EventRecord{
+		coninput.KeyEventRecord{KeyDown: true, Char: 0xd83d},
+		coninput.KeyEventRecord{KeyDown: true, Char: 0xde00},
+	})
+	reader.interactive = true
+	var buf [4]byte
+	n, err := reader.Read(buf[:])
+	if err != nil || string(buf[:n]) != "😀" {
+		t.Fatalf("surrogate pair: %q, %v", buf[:n], err)
+	}
+}

@@ -366,3 +366,54 @@ func TestRepositoryReplaceNodeClearsStaleIndex(t *testing.T) {
 		t.Errorf("Find('old-alias') = %q, want empty after updating node alias", got)
 	}
 }
+
+func TestProviderIdentityCopies(t *testing.T) {
+	baseYAML := `schema_version: 2
+credential:
+  default_store: s
+  stores:
+    s:
+      type: system
+      timeout: 5s
+      cache_ttl: 0s
+identities:
+  u:
+    user: root
+    auth_type: password
+    login_password_ref: {store_id: s, item_id: original}
+hosts:
+  h: {address: 192.0.2.1, port: 22}
+nodes:
+  n: {host_ref: h, identity_ref: u}
+`
+	for _, method := range []string{"GetIdentity", "Resolve", "ListIdentities"} {
+		t.Run(method, func(t *testing.T) {
+			v2, err := UnmarshalV2([]byte(baseYAML))
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := FromV2(v2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p := NewProviderWithoutOpenSSH(cfg)
+			switch method {
+			case "GetIdentity":
+				id, _ := p.GetIdentity("n")
+				id.LoginPasswordRef.ItemID = "changed"
+			case "Resolve":
+				_, _, id, err := p.Resolve("n")
+				if err != nil {
+					t.Fatal(err)
+				}
+				id.LoginPasswordRef.ItemID = "changed"
+			case "ListIdentities":
+				p.ListIdentities()["u"].LoginPasswordRef.ItemID = "changed"
+			}
+			id, _ := p.Snapshot().Identities.Get("u")
+			if id.LoginPasswordRef.ItemID != "original" {
+				t.Fatal("caller mutation changed Provider internal reference")
+			}
+		})
+	}
+}

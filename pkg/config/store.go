@@ -64,6 +64,16 @@ type PersistResult struct {
 	Durable bool
 }
 
+// Syncer 表示支持显式刷新文件与目录至持久介质的存储。
+type Syncer interface {
+	Sync(ctx context.Context) error
+}
+
+// DurabilityChecker 表示支持查询存储持久介质是否已真正耐久落盘的接口。
+type DurabilityChecker interface {
+	IsDurable() bool
+}
+
 type defaultStore struct {
 	Path        string
 	KeyPath     string // 用于加解密配置文件中的敏感字段
@@ -74,7 +84,37 @@ type defaultStore struct {
 
 const defaultConfigLockTimeout = 10 * time.Second
 
-var _ TransactionStore = (*defaultStore)(nil)
+var (
+	_ TransactionStore  = (*defaultStore)(nil)
+	_ Syncer            = (*defaultStore)(nil)
+	_ DurabilityChecker = (*defaultStore)(nil)
+)
+
+func (s *defaultStore) IsDurable() bool {
+	return true
+}
+
+func (s *defaultStore) Sync(ctx context.Context) error {
+	if s == nil || s.Path == "" {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := s.gate.acquire(ctx); err != nil {
+		return fmt.Errorf("acquire in-process configuration lock for sync failed: %w", err)
+	}
+	defer s.gate.release()
+	lock, err := acquireConfigLock(ctx, s.Path)
+	if err != nil {
+		return fmt.Errorf("acquire configuration lock for sync failed: %w", err)
+	}
+	defer func() {
+		_ = lock.Close()
+	}()
+	dir := filepath.Dir(s.Path)
+	return syncParentDirectory(dir)
+}
 
 // contextGate serializes in-process configuration access while allowing a
 // waiting caller to leave immediately when its context is canceled.
@@ -271,9 +311,24 @@ func (s *defaultStore) loadLocked() (*Configuration, error) {
 	data, err := os.ReadFile(s.Path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
+			// Only absent configurations receive new-install defaults. Existing
+			// v1 files retain their compatibility behavior until explicit migration.
+			configuration.SchemaVersion = 2
+			configuration.Credential = DefaultCredentialConfig()
 			return &configuration, nil
 		}
 		return nil, fmt.Errorf("failed to read configuration file %s: %w", s.Path, err)
+	}
+	version, err := DetectSchemaVersion(data)
+	if err != nil {
+		return nil, err
+	}
+	if version == 2 {
+		dto, err := UnmarshalV2(data)
+		if err != nil {
+			return nil, err
+		}
+		return FromV2(dto)
 	}
 	// 2. yaml.Unmarshal
 	if err = yaml.Unmarshal(data, &configuration); err != nil {
@@ -391,6 +446,20 @@ func (s *defaultStore) saveLocked(cfg *Configuration) (PersistResult, error) {
 	if cfg == nil {
 		return PersistResult{}, fmt.Errorf("configuration is nil")
 	}
+	if cfg.SchemaVersion == 2 {
+		dto, err := cfg.ToV2()
+		if err != nil {
+			return PersistResult{}, err
+		}
+		data, err := yaml.Marshal(dto)
+		if err != nil {
+			return PersistResult{}, fmt.Errorf("encode schema v2: %w", err)
+		}
+		return s.writeConfigurationBytes(data)
+	}
+	if cfg.SchemaVersion != 0 && cfg.SchemaVersion != 1 {
+		return PersistResult{}, ErrUnsupportedSchemaVersion
+	}
 	// 初始化 Crypter
 	key, err := s.loadOrCreateKeyLocked(true)
 	if err != nil {
@@ -417,6 +486,10 @@ func (s *defaultStore) saveLocked(cfg *Configuration) (PersistResult, error) {
 	if err != nil {
 		return PersistResult{}, fmt.Errorf("failed to marshal configuration: %w", err)
 	}
+	return s.writeConfigurationBytes(data)
+}
+
+func (s *defaultStore) writeConfigurationBytes(data []byte) (PersistResult, error) {
 	writeFile := s.writeFile
 	if writeFile != nil {
 		if err := writeFile(s.Path, data, 0600); err != nil {

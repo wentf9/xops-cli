@@ -10,3 +10,10 @@ coverage.out
 CLAUDE.md
 .claude/
 ROADMAP.md
+deploy/macos-vm/id_ed25519*
+# Documentation toolchain and generated pages
+node_modules/
+docs/.vitepress/cache/
+docs/.vitepress/dist/
+docs/reference/commands/
+docs/en/reference/commands/

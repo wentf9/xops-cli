@@ -235,7 +235,9 @@ func TestSshStdinScriptDetection(t *testing.T) {
 
 	// 1. 正常管道输入
 	o1 := NewSshOptions()
-	o1.Complete(nil, []string{"test-host"})
+	if err := o1.Complete(nil, []string{"test-host"}); err != nil {
+		t.Fatalf("o1.Complete failed: %v", err)
+	}
 	if !o1.stdinScript {
 		t.Error("expected stdinScript to be true when stdin is a pipe")
 	}
@@ -243,7 +245,9 @@ func TestSshStdinScriptDetection(t *testing.T) {
 	// 2. 带有 StdinRedirect (-n) 时，即使 stdin 是管道，也应当忽略它作为 script
 	o2 := NewSshOptions()
 	o2.StdinRedirect = true
-	o2.Complete(nil, []string{"test-host"})
+	if err := o2.Complete(nil, []string{"test-host"}); err != nil {
+		t.Fatalf("o2.Complete failed: %v", err)
+	}
 	if o2.stdinScript {
 		t.Error("expected stdinScript to be false when StdinRedirect (-n) is enabled")
 	}
@@ -361,7 +365,9 @@ func TestPreprocessArgsForSshSudoWithCommand(t *testing.T) {
 				t.Fatalf("Parse flags failed: %v", err)
 			}
 
-			o.Complete(cmd, cmd.Flags().Args())
+			if err := o.Complete(cmd, cmd.Flags().Args()); err != nil {
+				t.Fatalf("Complete options failed: %v", err)
+			}
 			if sudoVal, err := cmd.Flags().GetBool("sudo"); err == nil {
 				o.Sudo = sudoVal
 			}

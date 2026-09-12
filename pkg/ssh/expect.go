@@ -249,3 +249,25 @@ func StaticRespond(s string) func() (string, error) {
 		return s, nil
 	}
 }
+
+// streamAfterAuthentication atomically drains buffered output and enables
+// streaming, so a fast command cannot lose output during the handoff. Only the
+// matched authentication prefix is cleaned; subsequent command output is intact.
+func (e *Expect) streamAfterAuthentication(target io.Writer) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	data := e.outputBuf.Bytes()
+	// Drop the authentication line, including labels such as "[sudo]".
+	// Data after the matched prompt belongs to command output and is untouched.
+	prefix := data[:bytes.LastIndexByte(data[:e.matchOffset], '\n')+1]
+	if _, err := target.Write(prefix); err != nil {
+		return fmt.Errorf("write authentication output failed: %w", err)
+	}
+	if _, err := target.Write(data[e.matchOffset:]); err != nil {
+		return fmt.Errorf("write buffered command output failed: %w", err)
+	}
+	e.outputBuf.Reset()
+	e.accumulateAll = false
+	e.Target = target
+	return nil
+}

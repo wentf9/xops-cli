@@ -1,8 +1,8 @@
 # 🚀 XOps CLI
 
 <div align="center">
-  <h3>Let AI manage remote hosts within explicit safety boundaries</h3>
-  
+  <h3>Remote host management with explicit safety boundaries</h3>
+
   <p>
     <img alt="Go Version" src="https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go" />
     <img alt="License" src="https://img.shields.io/badge/License-MIT-blue.svg" />
@@ -20,10 +20,10 @@
 ### ✨ Key Features
 
 - 🤖 **AI-Native (MCP Server)**: Built-in Model Context Protocol server with security guardrails, risk assessment, and policy controls. Bounded heartbeats automatically evict dead SSH connections from the long-lived pool, keeping AI-driven server management safe and reliable.
-- 🛡️ **Advanced SSH & TUI**: Fully OpenSSH-compatible (JumpHosts, Tunnels, Agent Forwarding). Includes a beautiful **Terminal UI (TUI)** for interactive management and an automated `sudo` mode.
-- ⚡ **Batch Execution & Transfer**: Run commands or local scripts in parallel across multiple servers using tags. Effortless file distribution with built-in SCP/SFTP. The interactive SFTP shell detects disconnects, wakes the active prompt, exits automatically, and returns a non-zero status when the network drops. Each shell instance runs once; closing it cancels and waits for the active interaction before releasing prompt and SFTP resources.
+- 🛡️ **Advanced SSH & TUI**: Fully OpenSSH-compatible (JumpHosts, Tunnels, Agent Forwarding). Includes a **Terminal UI (TUI)** for interactive management and an automated `sudo` mode.
+- ⚡ **Batch Execution & Transfer**: Run commands or local scripts in parallel across multiple servers using tags. Effortless file distribution with built-in SCP/SFTP. The interactive SFTP shell detects disconnects, wakes the active prompt, exits automatically, and returns a non-zero status when the network drops. Each shell instance runs once; closing a shell cancels and waits for the active interaction before releasing prompt and SFTP resources.
 - 🔄 **Declarative Orchestration (Playbook)**: YAML-based task orchestration combining shell, script, copy, ensure (idempotent state convergence), and template steps, with concurrency control and error handling strategies.
-- 🗂️ **Encrypted Inventory**: Manage hosts, credentials (Identities), and tags with AES encryption. Supports bulk import/export via CSV.
+- 🗂️ **Inventory and Credentials**: Manage hosts, credentials (Identities), and tags. New installations use offline storage and Schema v2 references, preparing a key-file on first save; legacy AES configurations support automatic upgrades and explicit migration. Supports bulk import/export via CSV.
 - 🌐 **Network & Sec Tools**: Integrated DNS lookup, Ping, Netcat (nc), Base64/Hex encoding, and a unified **Firewall Manager** (supports firewalld, ufw, iptables, nftables).
 - 🌍 **Built-in i18n**: Native support for English and Simplified Chinese.
 
@@ -49,7 +49,7 @@ make build
 #### 1. Initialize
 
 ```bash
-# Create ~/.xops/xops_config.yaml and its encryption key.
+# Create Schema v2 ~/.xops/xops_config.yaml without an encryption key.
 # Concrete Hosts from ~/.ssh/config are imported without connecting to them.
 xops init
 
@@ -60,6 +60,22 @@ xops init --skip-ssh-import
 
 The command is idempotent and never overwrites existing nodes. Run `xops host list` to review the result.
 
+New installations use `credential.default_store: file` and `remember_prompted: always`,
+with the built-in offline store and key-file initialized on first save, without a legacy `secret.key`.
+Other backends require manual selection. `--remember never` or global `remember_prompted: never` disables saving and automatic migration.
+General backend migration is implemented; see the [migration guide](docs/en/guide/migration.md). Final platform validation remains pending.
+Doctor checks non-interactive reads, not write permissions;
+Linux system reads unlocked credentials directly through Secret Service without unlock prompts.
+See the [example configuration](xops_config.example.yaml).
+
+64-bit Linux, Windows, and macOS also provide an explicit [offline encrypted credential store](docs/development/archive/offline-encrypted-credentials.md).
+The offline store does not restrict access by filesystem type; users are responsible for storage reliability.
+Compatibility testing covers ext4, XFS, and Btrfs.
+The [v1 format and configuration/CLI contract are frozen](docs/development/archive/design/offline-encrypted-credential-store-v1-freeze.md); the release status is unpublished.
+
+Schema v1 remains supported for two official release cycles starting with the default
+switch release, with deprecation warnings on stderr. Eligible legacy configurations upgrade automatically during normal use and retain old material. Disabling automatic saving also disables automatic upgrades. See the [migration guide](docs/en/guide/migration.md) for explicit migration and backend switching.
+
 #### 2. Inventory & Tags
 
 ```bash
@@ -67,7 +83,7 @@ The command is idempotent and never overwrites existing nodes. Run `xops host li
 xops host import hosts.csv --tag web
 
 # Add a single host manually
-xops host add --address 192.168.1.10 --user root --key ~/.ssh/id_ed25519 --alias web-01 --tags web
+xops host add --address 192.0.2.10 --user root --key ~/.ssh/id_ed25519 --alias web-01 --tags web
 
 # List all hosts or tags
 xops host list
@@ -86,12 +102,12 @@ xops tui
 xops ssh web-01
 
 # Connect with explicit user (reuses existing Host, strictly isolates Identity, inherits ProxyJump)
-xops ssh test@10.238.221.181
+xops ssh test@192.0.2.20
 xops ssh test@web-01
 
 # OpenSSH-style with JumpHost and Identity file (direct jump requires FQDN/IP/host:port; single-label requires saved Node/Alias)
-xops ssh -J bastion.example.com -i ~/.ssh/id_rsa root@192.168.1.13 # Direct jump (FQDN, 10.0.0.1, or jumphost:22)
-xops ssh -J jumphost -i ~/.ssh/id_rsa root@192.168.1.13            # Alias jump (jumphost as existing node/alias)
+xops ssh -J bastion.example.com -i ~/.ssh/id_rsa root@192.0.2.13 # Direct jump (FQDN, 192.0.2.1, or jumphost:22)
+xops ssh -J jumphost -i ~/.ssh/id_rsa root@192.0.2.13            # Alias jump (jumphost as existing node/alias)
 
 # Connect and enter sudo shell
 xops ssh --sudo web-01
@@ -111,9 +127,14 @@ xops exec --tag web --shell ./setup.sh --task 5
 xops scp ./config.conf --tag web --dest /etc/app/
 ```
 
+Ordinary `exec` can read existing unlocked credentials from the Linux desktop keyring without `-x`.
+Use `-x` for commands requiring an interactive remote terminal, such as `top` or `vim`.
+Batch execution never prompts to unlock the keyring: a locked item returns `locked`.
+Access to locked items requires desktop unlock. The calling process requires access to the desktop D-Bus session.
+
 #### 5. Declarative Orchestration (Playbook)
 
-You can write YAML-formatted Playbooks to execute complex, multi-stage deployment workflows. It supports shell, script, copy, ensure (idempotent state convergence), and template actions.
+YAML Playbooks support multi-stage deployment workflows with shell, script, copy, ensure, and template actions.
 
 Example Playbook `deploy.yaml`:
 
@@ -157,9 +178,9 @@ xops play deploy.yaml --dry-run
 xops play deploy.yaml --limit web-01
 ```
 
-#### 6. AI & MCP Integration (Empower your AI Agent)
+#### 6. AI & MCP Integration
 
-XOps features a built-in **Model Context Protocol (MCP)** server, allowing AI assistants like **Claude** to explore and manage your infrastructure under your control.
+XOps features a built-in **Model Context Protocol (MCP)** server, supporting infrastructure queries and operations through MCP clients such as **Claude**.
 
 **A. Start MCP Server:**
 
@@ -168,13 +189,13 @@ xops mcp serve
 ```
 
 **B. Example: Configure Claude Desktop**
-Add the following to your `claude_desktop_config.json` to let Claude use XOps:
+Example `claude_desktop_config.json` configuration:
 
 ```json
 {
   "mcpServers": {
     "xops": {
-      "command": "/usr/local/bin/xops", 
+      "command": "/usr/local/bin/xops",
       "args": ["mcp", "serve"]
     }
   }
@@ -185,35 +206,35 @@ Add the following to your `claude_desktop_config.json` to let Claude use XOps:
 
 - **Risk Analysis**: Automatically detects high-risk commands (e.g., `rm -rf /`).
 - **Policy Control**: Supports "Audit-only" or "Manual Approval" modes.
-- **Audit Logs**: Full transparency on what the AI is doing on your servers.
+- **Audit Logs**: Records command execution for auditing.
 
 #### 7. AI Agent Skill Integration
 
-XOps comes with an out-of-the-box AI Agent Skill, empowering your terminal-based AI assistant with robust server management and troubleshooting capabilities.
+XOps provides an AI Agent Skill documenting CLI operations for server management and troubleshooting.
 
 > [!CAUTION]
-> **⚠️ Risk Warning**: This skill works by granting AI assistants the ability to execute `xops` commands. Since AI assistants (e.g., Claude Code) generate commands autonomously based on natural language, **this skill file itself does not contain mandatory server-side security guardrails**. When used in production, the AI may inadvertently execute high-risk commands. Always enable the "confirm before execution" feature of your AI assistant and carefully review every command it plans to run.
+> **⚠️ Risk Warning**: This skill works by granting AI assistants the ability to execute `xops` commands. Since AI assistants (e.g., Claude Code) generate commands autonomously based on natural language, **this skill file itself does not contain mandatory server-side security guardrails**. When used in production, the AI may inadvertently execute high-risk commands. Production use requires command confirmation and review.
 
 **Install the Skill:**
-Because different AI agents (Claude Code, Gemini CLI, etc.) use different skill installation directories, please use the generic `npx skills` tool for a standalone skill installation.
+The generic `npx skills` installer supports clients with different skill directories.
 
-First, ensure you have installed the XOps CLI:
+XOps CLI installation:
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/wentf9/xops-cli/master/install.sh | bash
 ```
 
-Then, run the following command to install the AI extension skill:
+Skill installation:
 
 ```bash
 npx skills add https://github.com/wentf9/xops-cli/master/skills/xops-agent
 ```
 
-Once installed, simply ask your AI assistant to "check the status of the web servers" or "open port 3306 on the database host," and it will automatically leverage XOps to complete the task!
+The skill documents host inspection and firewall management operations.
 
 ## 🌍 I18n
 
-You can force the language using the `--lang` flag or set your system locale.  
+The `--lang` flag selects the language; the system locale supplies the default.
 
 ```bash
 xops --lang en host list
@@ -222,7 +243,7 @@ xops --lang zh host list
 
 ## 🤝 Contributing
 
-Please read the [AGENTS.md](./AGENTS.md) for detailed development standards, coding conventions, and testing requirements.  
+Development standards, coding conventions, and testing requirements are documented in [AGENTS.md](./AGENTS.md).
 
 Run the complete local quality gate before submitting changes:
 
@@ -243,12 +264,13 @@ CI runs the full build, test suite, and golangci-lint on pushes to `master` and 
 - Packages under `pkg` create, wrap, and return errors without deciding how user-facing failures are displayed. Components that need debug logs receive a `logger.DebugLogger`; the default is a no-op implementation.
 - The `cmd` layer is the error presentation boundary: Cobra commands return errors, and the root command logs each failure once and sets the exit status.
 - Interactive and security boundaries follow a three-tier architecture: "pkg/ssh defines ports, composition root injects policy, terminal component owns I/O":
-  - `pkg/ssh` defines `SecretPrompter` and `HostKeyConfirmer` interfaces with semantic request objects, determining when credentials are required without generating user-facing copy or touching stdin/stdout directly. It defaults to a fail-closed policy returning `ErrInteractionRequired`, preventing non-interactive or automated calls from crashing unexpectedly. It supports configurable timeouts via `WithInteractionTimeout` and immediately aborts interaction when connection/lifecycle contexts are canceled.
+  - `pkg/ssh` defines `SecretPrompter` and `HostKeyConfirmer` interfaces with semantic request objects, determining when credentials are required without generating user-facing copy or touching stdin/stdout directly. The connector defaults to a fail-closed policy returning `ErrInteractionRequired`, preventing non-interactive or automated calls from crashing unexpectedly. The interface supports configurable timeouts via `WithInteractionTimeout` and immediately aborts interaction when connection/lifecycle contexts are canceled.
   - `internal/terminal` encapsulates cross-platform cancellable terminal I/O (Unix poll/pipe, Windows CancelIoEx), guaranteeing raw mode restoration and avoiding descriptor or goroutine leaks.
   - The CLI/TUI composition root injects localized prompts (via i18n), performs masked secret inputs, and serializes concurrent multi-node credential prompts with a cancellable Prompt Gate channel. Neither errors nor logs contain credentials.
   - The MCP server operates in non-interactive mode by default, translating `ErrInteractionRequired` into clean MCP error responses to avoid blocking stdio and breaking JSON-RPC framing.
 - Long-running SSH, SFTP, forwarding, and Playbook operations use the caller-provided `context.Context` so cancellation can stop I/O and goroutines.
-- Configuration writes use a cross-process lock and atomic replacement on the local filesystem. Full node edits and deletions use the exact version that was read, while tag operations merge intent. Conflicts on the same node, Host, or Identity return `ErrConfigConflict` instead of silently overwriting data. A node edit that changes credentials creates a private Identity override; only `identity edit` changes a shared Identity. If a replacement was applied but its directory-sync durability is uncertain, the command returns a nonzero error and never retries or rolls it back automatically.
+- Credential migration: preview with `xops credential migrate --dry-run --to <store>`, then run `xops credential migrate --to <store>`. After validating connections, explicitly run `xops credential finalize-migration` to remove the legacy backup and key. Interrupted operations can be rerun; migrated v2 configurations no longer depend on the legacy key.
+- Configuration writes use a cross-process lock and atomic replacement on the local filesystem. Full node edits and deletions use the exact version that was read, while tag operations merge intent. Conflicts on the same node, Host, or Identity return `ErrConfigConflict` instead of silently overwriting data. A node edit that changes credentials creates a private Identity override; only `identity edit` changes a shared Identity. If a replacement was applied but directory-sync durability remains uncertain, the command returns a nonzero error without automatic retry or rollback.
 - SSH connections receive node, host, credentials, and conditional-write tokens from one atomic configuration snapshot. OpenSSH virtual nodes and read-only configuration sources have no write token, so discovered credentials or privilege mode remain session-local. Every Repository write requires caller-provided cancellable `context.Context`; TUI save, tag, and delete operations run through an asynchronous state machine to keep rendering responsive and prevent overlapping commits.
 - A node selector matches an exact node ID first. If an address or alias matches multiple nodes, the command returns an ambiguity error instead of choosing a target arbitrarily.
 - SSH local, remote, and SOCKS5 forwarding return waitable lifecycle objects. A failure in one connection, including a SOCKS5 handshake or target dial, only logs a warning and releases that connection; the listener continues running. Only listener or SSH transport failures end forwarding. OpenSSH `ProxyJump` supports comma-separated hops and `[user@]host[:port]` entries. Jump host resolution strategy: prioritizes saved Node, Alias, or Host in `~/.ssh/config`; direct jump targets explicitly require Node/Alias, FQDN (contains a dot, e.g. `bastion.example.com`), IP address, or `host:port` (e.g. `jumphost:22`). Single-label hostnames without port must be configured as a Node/Alias first to prevent silent misconnections on alias typos.
@@ -257,4 +279,4 @@ CI runs the full build, test suite, and golangci-lint on pushes to `master` and 
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.  
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

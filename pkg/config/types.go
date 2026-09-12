@@ -7,11 +7,23 @@ import (
 
 // Configuration 对应 yaml 文件的顶层结构
 type Configuration struct {
+	SchemaVersion         int                                      `yaml:"schema_version,omitempty"`
+	Credential            *CredentialConfig                        `yaml:"credential,omitempty"`
 	Identities            *concurrent.Map[string, models.Identity] `yaml:"identities"`
 	Hosts                 *concurrent.Map[string, models.Host]     `yaml:"hosts"`
 	Nodes                 *concurrent.Map[string, models.Node]     `yaml:"nodes"`
 	Guardrail             *GuardrailConfig                         `yaml:"guardrail,omitempty"`
 	PasswordPromptPattern string                                   `yaml:"password_prompt_pattern,omitempty"` // 全局级自定义密码提示正则
+}
+
+// CanRememberCredentials checks configured write capability without accessing a
+// backend. Missing configuration means none, including for legacy v1 files.
+func (c *Configuration) CanRememberCredentials() bool {
+	if c == nil || c.Credential == nil || c.Credential.DefaultStore == "" {
+		return false
+	}
+	store, ok := c.Credential.Stores[c.Credential.DefaultStore]
+	return ok && store.Type != StoreTypeNone && !store.ReadOnly
 }
 
 // GuardrailConfig configures the MCP safety guardrail.

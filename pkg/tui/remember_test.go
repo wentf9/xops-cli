@@ -1,0 +1,73 @@
+package tui
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/wentf9/xops-cli/pkg/adapter"
+	"github.com/wentf9/xops-cli/pkg/config"
+)
+
+func TestTUIRememberPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name, policy                string
+		override                    string
+		confirm, answer, wantStored bool
+		wantCalls                   int
+		confirmErr                  error
+		disabled                    string
+	}{
+		{name: "never", policy: "never", confirm: true},
+		{name: "invocation never", policy: "always", override: "never"},
+		{name: "invocation always", policy: "never", override: "always", wantStored: true},
+		{name: "always", policy: "always", wantStored: true},
+		{name: "ask accepted", policy: "ask", confirm: true, answer: true, wantStored: true, wantCalls: 1},
+		{name: "ask declined", policy: "ask", confirm: true, wantCalls: 1},
+		{name: "ask unavailable", policy: "ask"},
+		{name: "ask canceled", policy: "ask", confirm: true, wantCalls: 1, confirmErr: context.Canceled},
+		{name: "v1 without credential config", policy: "ask", confirm: true, answer: true, disabled: "missing"},
+		{name: "no default store", policy: "ask", confirm: true, answer: true, disabled: "default"},
+		{name: "none", policy: "ask", confirm: true, answer: true, disabled: "none"},
+		{name: "read only", policy: "ask", confirm: true, answer: true, disabled: "readonly"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := newFormCredentialTestConfiguration("")
+			cfg.Credential.RememberPrompted = tc.policy
+			cfg.Credential.Stores = map[string]config.StoreConfig{"mem": {Type: config.StoreTypeHelper}}
+			switch tc.disabled {
+			case "missing":
+				cfg.Credential = nil
+			case "default":
+				cfg.Credential.DefaultStore = ""
+			case "none":
+				cfg.Credential.Stores["mem"] = config.StoreConfig{Type: config.StoreTypeNone}
+			case "readonly":
+				cfg.Credential.Stores["mem"] = config.StoreConfig{Type: config.StoreTypeHelper, ReadOnly: true}
+			}
+			repo := newTestRepository(t, cfg)
+			service := newFormCredentialTestService(t, repo, newMemoryCredentialStore())
+			mc := modelConfig{credentialService: service, rememberPolicy: tc.override}
+			calls := 0
+			if tc.confirm {
+				mc.rememberConfirmation = func(context.Context, string) (bool, error) { calls++; return tc.answer, tc.confirmErr }
+			}
+			adp := adapter.NewSSHAdapter(repo, credentialAdapterOptions(repo, mc)...)
+			snapshot, err := repo.ResolveConnection(formCredentialTestNodeID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = adp.UpdateAuth(t.Context(), formCredentialTestNodeID, string(snapshot.UpdateRef.AuthVersion[:]), "fixture-secret", "", "")
+			if !errors.Is(err, tc.confirmErr) {
+				t.Fatalf("record authentication = %v", err)
+			}
+			got, err := repo.ResolveConnection(formCredentialTestNodeID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (got.Identity.LoginPasswordRef != nil) != tc.wantStored || got.Identity.Password != "" || calls != tc.wantCalls {
+				t.Fatalf("stored=%v, confirmation calls=%d", got.Identity.LoginPasswordRef != nil, calls)
+			}
+		})
+	}
+}

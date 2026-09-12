@@ -26,12 +26,12 @@ func (s subsystemTestStore) GetConfig(string) (*projectssh.ClientConfig, error) 
 	return s.config, nil
 }
 
-func (subsystemTestStore) UpdateAuth(context.Context, string, string, string, string, string) error {
-	return nil
+func (subsystemTestStore) UpdateAuth(_ context.Context, _ string, authUpdateToken, _, _, _ string) (string, error) {
+	return authUpdateToken, nil
 }
 
-func (subsystemTestStore) UpdateSudo(context.Context, string, string, projectssh.SudoMode, string) error {
-	return nil
+func (subsystemTestStore) UpdateSudo(_ context.Context, _ string, sudoUpdateToken string, _ projectssh.SudoMode, _ string) (string, error) {
+	return sudoUpdateToken, nil
 }
 
 type subsystemTestInteraction struct{}

@@ -2,12 +2,14 @@ package ssh
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"slices"
 	"sync"
 	"time"
 
@@ -73,12 +75,127 @@ func (k *KeyAuth) GetMethod() (ssh.AuthMethod, error) {
 
 var _ ssh.Signer = (*lazySigner)(nil)
 
+// autoSecretProvider 统一管理 auto 认证中的机密解析与交互降级
+type autoSecretProvider struct {
+	lifecycleCtx       context.Context
+	nodeID             string
+	user               string
+	host               string
+	port               int
+	versionToken       string
+	resolver           SecretResolver
+	prompter           SecretPrompter
+	handshakeTimeout   time.Duration
+	interactionTimeout time.Duration
+	failClosed         func(error)
+	recoveryPrompter   SecretPrompter
+
+	mu          sync.RWMutex
+	terminalErr error
+}
+
+func (p *autoSecretProvider) markTerminalError(err error) {
+	p.mu.Lock()
+	if p.terminalErr == nil {
+		p.terminalErr = err
+	}
+	p.mu.Unlock()
+
+	if p.failClosed != nil {
+		p.failClosed(err)
+	}
+}
+
+func (p *autoSecretProvider) terminalError() error {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.terminalErr
+}
+
+func (p *autoSecretProvider) resolveOrPrompt(req SecretRequest) (string, error) {
+	return p.resolveOrPromptAttempt(req, false)
+}
+
+func (p *autoSecretProvider) resolveOrPromptAttempt(req SecretRequest, retry bool) (string, error) {
+	p.mu.RLock()
+	if p.terminalErr != nil {
+		termErr := p.terminalErr
+		p.mu.RUnlock()
+		return "", termErr
+	}
+	p.mu.RUnlock()
+
+	req.NodeID = p.nodeID
+	req.User = p.user
+	req.Host = p.host
+	req.Port = p.port
+	req.VersionToken = p.versionToken
+
+	// 1. 若注入了 resolver，优先使用 resolver 解析
+	if p.resolver != nil && !retry {
+		timeout := p.handshakeTimeout
+		if timeout <= 0 {
+			timeout = defaultSSHHandshakeTimeout
+		}
+		baseCtx := p.lifecycleCtx
+		if baseCtx == nil {
+			baseCtx = context.Background()
+		}
+		resCtx, cancel := context.WithTimeout(baseCtx, timeout)
+		defer cancel()
+
+		secret, err := p.resolver.ResolveSecret(resCtx, req)
+		if len(secret) > 0 {
+			defer zeroBytes(secret)
+		}
+		if err == nil && len(secret) > 0 {
+			return string(secret), nil
+		}
+		if err != nil && !errors.Is(err, ErrInteractionRequired) && !reportCredentialFailure(baseCtx, p.recoveryPrompter, "read", err) {
+			// 严格传播后端故障！标记整个认证流程终止并触发 FailClosed，禁止任何后续认证方法和交互！
+			p.markTerminalError(err)
+			return "", fmt.Errorf("resolve secret failed: %w", err)
+		}
+	}
+
+	p.mu.RLock()
+	if p.terminalErr != nil {
+		termErr := p.terminalErr
+		p.mu.RUnlock()
+		return "", termErr
+	}
+	p.mu.RUnlock()
+
+	// 2. resolver 明确缺失（ErrInteractionRequired 或 nil resolver）时，按规则降级到交互 prompter
+	if p.prompter == nil {
+		return "", ErrInteractionRequired
+	}
+	timeout := p.interactionTimeout
+	if timeout <= 0 {
+		timeout = DefaultInteractionTimeout
+	}
+	baseCtx := p.lifecycleCtx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	promptCtx, cancel := context.WithTimeout(baseCtx, timeout)
+	defer cancel()
+
+	val, err := p.prompter.PromptSecret(promptCtx, req)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			p.markTerminalError(err)
+		}
+		return "", fmt.Errorf("prompt secret failed: %w", err)
+	}
+	return val, nil
+}
+
 type lazySigner struct {
-	ctx                context.Context
-	timeout            time.Duration
 	pubKey             ssh.PublicKey
 	keyPath            string
 	keyData            []byte
+	secProvider        *autoSecretProvider
 	prompter           SecretPrompter
 	passphraseCallback func(string, string)
 	decryptedSigner    ssh.Signer
@@ -118,37 +235,18 @@ func (s *lazySigner) getDecryptedSigner() (ssh.Signer, error) {
 	}
 	s.mu.RUnlock()
 
-	req := SecretRequest{
-		Kind:    SecretKindPrivateKeyPassphrase,
-		KeyPath: s.keyPath,
+	provider := s.secProvider
+	if provider == nil {
+		provider = &autoSecretProvider{prompter: s.prompter}
 	}
-	promptCtx := s.ctx
-	var cancel context.CancelFunc
-	if promptCtx == nil {
-		promptCtx = context.Background()
-	}
-	timeout := s.timeout
-	if timeout <= 0 {
-		timeout = DefaultInteractionTimeout
-	}
-	promptCtx, cancel = context.WithTimeout(promptCtx, timeout)
-	defer cancel()
-
-	passphrase, err := s.prompter.PromptSecret(promptCtx, req)
+	decSigner, passphrase, err := provider.decryptPrivateKey(s.keyData, s.keyPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read passphrase: %w", err)
+		return nil, err
 	}
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// 双重检查，防止在等待用户输入期间其他协程已经解密成功
 	if s.decryptedSigner != nil {
 		return s.decryptedSigner, nil
-	}
-
-	decSigner, err := ssh.ParsePrivateKeyWithPassphrase(s.keyData, []byte(passphrase))
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse private key with passphrase: %w", err)
 	}
 	s.decryptedSigner = decSigner
 
@@ -161,7 +259,9 @@ func (s *lazySigner) getDecryptedSigner() (ssh.Signer, error) {
 		l.Debugf("save public key for %q failed: %v", s.keyPath, err)
 	}
 
-	s.passphraseCallback(s.keyPath, passphrase)
+	if s.passphraseCallback != nil {
+		s.passphraseCallback(s.keyPath, passphrase)
+	}
 	return decSigner, nil
 }
 
@@ -239,25 +339,24 @@ func parseOpenSSHPublicKeyFromEncryptedPrivate(keyData []byte) (ssh.PublicKey, e
 	return ssh.ParsePublicKey(pubKeyData)
 }
 
-// tryResolveKey 尝试解析特定路径的私钥
-func tryResolveKey(ctx context.Context, timeout time.Duration, keyPath string, prompter SecretPrompter, passphraseCallback func(string, string), l logger.DebugLogger) (ssh.Signer, ssh.AuthMethod, error) {
+// resolveKeyAuthMethod 将单个私钥路径解析为一个独立的 publickey 认证候选。
+// 对能够免密获得公钥的加密私钥继续使用 lazySigner，仅在服务器接受公钥后才请求 passphrase。
+func resolveKeyAuthMethod(keyPath string, secProvider *autoSecretProvider, passphraseCallback func(string, string), l logger.DebugLogger) (ssh.AuthMethod, error) {
 	if l == nil {
 		l = logger.NopLogger
 	}
-	if prompter == nil {
-		prompter = rejectInteraction{}
-	}
 	keyData, err := os.ReadFile(keyPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read key data failed: %w", err)
-	}
-	signer, err := ssh.ParsePrivateKey(keyData)
-	if err == nil {
-		return signer, nil, nil
+		return nil, fmt.Errorf("read key data failed: %w", err)
 	}
 
-	// 私钥解析失败，可能是因为被密码保护了，也可能格式损坏
-	// 无论何种错误，均优先尝试免密读取或从私钥提取公钥以开启延时加载 (lazySigner)
+	signer, err := ssh.ParsePrivateKey(keyData)
+	if err == nil {
+		return ssh.PublicKeys(signer), nil
+	}
+
+	// 私钥解析失败，可能是因为被密码保护了，也可能格式损坏。
+	// 优先尝试免密读取 .pub，或直接从 OpenSSH 私钥中提取明文公钥，以保持 lazy 解密。
 	var pubKey ssh.PublicKey
 	pubKeyPath := keyPath + ".pub"
 	if pubKeyData, readErr := os.ReadFile(pubKeyPath); readErr == nil {
@@ -268,7 +367,6 @@ func tryResolveKey(ctx context.Context, timeout time.Duration, keyPath string, p
 			pubKey = nil
 		}
 	} else {
-		// 尝试直接从 OpenSSH 格式的加密私钥中免密提取公钥数据
 		if extractedPubKey, extractErr := parseOpenSSHPublicKeyFromEncryptedPrivate(keyData); extractErr == nil {
 			pubKey = extractedPubKey
 			l.Debugf("Extracted public key from OpenSSH private key without passphrase: %s", keyPath)
@@ -282,147 +380,255 @@ func tryResolveKey(ctx context.Context, timeout time.Duration, keyPath string, p
 
 	if pubKey != nil {
 		lazy := &lazySigner{
-			ctx:                ctx,
-			timeout:            timeout,
 			pubKey:             pubKey,
 			keyPath:            keyPath,
 			keyData:            keyData,
-			prompter:           prompter,
+			secProvider:        secProvider,
 			passphraseCallback: passphraseCallback,
 			logger:             l,
 		}
-		return lazy, nil, nil
+		return ssh.PublicKeys(lazy), nil
 	}
 
-	// 如果真的没有提取到公钥，且报错确是 PassphraseMissingError，则回退到原本的 PublicKeysCallback
+	// 传统 PEM 等格式无法在解密前取得公钥。仍然把解密动作留在 PublicKeysCallback 中，
+	// 这样只有轮到这个 candidate 时才会请求 passphrase。
 	if _, ok := errors.AsType[*ssh.PassphraseMissingError](err); ok {
 		keyDataCopy := keyData
 		keyPathCopy := keyPath
-		method := ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
-			req := SecretRequest{
-				Kind:    SecretKindPrivateKeyPassphrase,
-				KeyPath: keyPathCopy,
+		return ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
+			resolvedSigner, passphrase, parseErr := secProvider.decryptPrivateKey(keyDataCopy, keyPathCopy)
+			if parseErr != nil {
+				return nil, parseErr
 			}
-			promptCtx := ctx
-			var cancel context.CancelFunc
-			if promptCtx == nil {
-				promptCtx = context.Background()
-			}
-			t := timeout
-			if t <= 0 {
-				t = DefaultInteractionTimeout
-			}
-			promptCtx, cancel = context.WithTimeout(promptCtx, t)
-			defer cancel()
-
-			passphrase, err := prompter.PromptSecret(promptCtx, req)
-			if err != nil {
-				return nil, fmt.Errorf("failed to read passphrase: %w", err)
-			}
-			s, err := ssh.ParsePrivateKeyWithPassphrase(keyDataCopy, []byte(passphrase))
-			if err != nil {
-				return nil, fmt.Errorf("failed to parse private key with passphrase: %w", err)
-			}
-			if saveErr := savePublicKey(keyPathCopy, s.PublicKey()); saveErr != nil {
+			if saveErr := savePublicKey(keyPathCopy, resolvedSigner.PublicKey()); saveErr != nil {
 				l.Debugf("save public key for %q failed: %v", keyPathCopy, saveErr)
 			}
-			passphraseCallback(keyPathCopy, passphrase)
-			return []ssh.Signer{s}, nil
-		})
-		return nil, method, nil
+			if passphraseCallback != nil {
+				passphraseCallback(keyPathCopy, passphrase)
+			}
+			return []ssh.Signer{resolvedSigner}, nil
+		}), nil
 	}
 
-	return nil, nil, err
+	return nil, err
 }
 
-// BuildAutoAuthMethods 生成一个包含多种回退机制的 AuthMethod 链
-func BuildAutoAuthMethods(ctx context.Context, user, host string, prompter SecretPrompter, passwordCallback func(string), passphraseCallback func(keyPath, passphrase string)) ([]ssh.AuthMethod, func()) {
-	return BuildAutoAuthMethodsWithLogger(ctx, user, host, prompter, DefaultInteractionTimeout, passwordCallback, passphraseCallback, logger.NopLogger)
+// AutoAuthOptions 封装 auto 认证的完整上下文选项。
+type AutoAuthOptions struct {
+	LifecycleCtx       context.Context
+	NodeID             string
+	User               string
+	Host               string
+	Port               int
+	VersionToken       string
+	Resolver           SecretResolver
+	Prompter           SecretPrompter
+	HandshakeTimeout   time.Duration
+	InteractionTimeout time.Duration
+	FailClosed         func(error)
+	RecoveryPrompter   SecretPrompter
+	KeyPath            string
+	PasswordCallback   func(string)
+	PassphraseCallback func(keyPath, passphrase string)
+	Logger             logger.DebugLogger
 }
 
-// BuildAutoAuthMethodsWithLogger 生成一个包含多种回退机制的 AuthMethod 链，并注入 Logger
-// passphraseCallback 在用户成功输入受密码保护的私钥密码后被调用，用于持久化
-func BuildAutoAuthMethodsWithLogger(ctx context.Context, user, host string, prompter SecretPrompter, timeout time.Duration, passwordCallback func(string), passphraseCallback func(keyPath, passphrase string), l logger.DebugLogger) ([]ssh.AuthMethod, func()) {
+const (
+	autoAuthProtocolPublicKey = "publickey"
+	autoAuthProtocolPassword  = "password"
+)
+
+type autoAuthCandidate struct {
+	protocol string
+	label    string
+	method   ssh.AuthMethod
+}
+
+type autoAuthPlan struct {
+	candidates   []autoAuthCandidate
+	authCallback ssh.ClientAuthCallback
+	cleanup      func()
+}
+
+// newSequentialAuthCallback 按候选顺序驱动认证。
+// ClientConfig.Auth 只会尝试同一 RFC 4252 method 的第一个实例，因此 auto 模式必须通过
+// AuthCallback 显式推进多个 publickey candidate。
+func newSequentialAuthCallback(candidates []autoAuthCandidate, secProvider *autoSecretProvider, l logger.DebugLogger) ssh.ClientAuthCallback {
 	if l == nil {
 		l = logger.NopLogger
 	}
+
+	next := 0
+	selected := false
+	return func(ctx *ssh.ClientAuthContext) (ssh.AuthMethod, error) {
+		if secProvider != nil {
+			if err := secProvider.terminalError(); err != nil {
+				return nil, err
+			}
+		}
+
+		for next < len(candidates) {
+			candidate := candidates[next]
+			next++
+
+			if !slices.Contains(ctx.AllowedMethods, candidate.protocol) {
+				l.Debugf("Skipping SSH auth candidate %q: server allows %v", candidate.label, ctx.AllowedMethods)
+				continue
+			}
+
+			l.Debugf("Trying SSH auth candidate: %s", candidate.label)
+			selected = true
+			return candidate.method, nil
+		}
+
+		if !selected {
+			return nil, fmt.Errorf("server permits SSH authentication methods %v, but no matching local key, agent or password method is available", ctx.AllowedMethods)
+		}
+		return nil, nil
+	}
+}
+
+// buildAutoAuthPlan 构建 auto 认证计划。候选优先级为：
+// 显式 -i 私钥 -> SSH agent -> 默认私钥 -> password。
+func buildAutoAuthPlan(ctx context.Context, opts AutoAuthOptions) autoAuthPlan {
+	l := opts.Logger
+	if l == nil {
+		l = logger.NopLogger
+	}
+	prompter := opts.Prompter
 	if prompter == nil {
 		prompter = rejectInteraction{}
 	}
-	var methods []ssh.AuthMethod
-	var cleanup func()
-
-	// SSH Agent
-	if socket := os.Getenv("SSH_AUTH_SOCK"); socket != "" {
-		conn, err := dialSSHAgent(ctx, socket)
-		if err == nil {
-			agentClient := agent.NewClient(conn)
-			methods = append(methods, ssh.PublicKeysCallback(agentClient.Signers))
-			cleanup = func() { debugCloseResource(l, conn, "ssh agent connection") }
-		} else {
-			l.Debugf("connect to ssh-agent failed: %v", err)
-		}
+	lifecycleCtx := opts.LifecycleCtx
+	if lifecycleCtx == nil {
+		lifecycleCtx = ctx
 	}
 
-	// Default Keys
-	defaultKeys := []string{"~/.ssh/id_rsa", "~/.ssh/id_ed25519", "~/.ssh/id_ecdsa", "~/.ssh/id_dsa"}
-	var signers []ssh.Signer
-	for _, p := range defaultKeys {
-		keyPath := expandHomeDir(p)
-		l.Debugf("Checking default key: %s", keyPath)
+	secProvider := &autoSecretProvider{
+		lifecycleCtx:       lifecycleCtx,
+		nodeID:             opts.NodeID,
+		user:               opts.User,
+		host:               opts.Host,
+		port:               opts.Port,
+		versionToken:       opts.VersionToken,
+		resolver:           opts.Resolver,
+		prompter:           prompter,
+		handshakeTimeout:   opts.HandshakeTimeout,
+		interactionTimeout: opts.InteractionTimeout,
+		failClosed:         opts.FailClosed,
+		recoveryPrompter:   opts.RecoveryPrompter,
+	}
+
+	var candidates []autoAuthCandidate
+	var cleanup func()
+	seenKeyPaths := make(map[string]struct{})
+
+	addKey := func(path, label string) {
+		keyPath := expandHomeDir(path)
+		if keyPath == "" {
+			return
+		}
+		if _, seen := seenKeyPaths[keyPath]; seen {
+			return
+		}
+		seenKeyPaths[keyPath] = struct{}{}
+
+		l.Debugf("Checking SSH key: %s", keyPath)
 		if _, err := os.Stat(keyPath); err != nil {
 			if os.IsNotExist(err) {
 				l.Debugf("Key file does not exist: %s", keyPath)
 			} else {
 				l.Debugf("Failed to stat key: %s, error: %v", keyPath, err)
 			}
-			continue
+			return
 		}
-		l.Debugf("Found default key: %s", keyPath)
 
-		signer, method, err := tryResolveKey(ctx, timeout, keyPath, prompter, passphraseCallback, l)
+		method, err := resolveKeyAuthMethod(keyPath, secProvider, opts.PassphraseCallback, l)
 		if err != nil {
 			l.Debugf("Failed to resolve key: %s, error: %v", keyPath, err)
-			continue
+			return
 		}
-		if signer != nil {
-			signers = append(signers, signer)
-		}
-		if method != nil {
-			methods = append(methods, method)
+
+		candidates = append(candidates, autoAuthCandidate{
+			protocol: autoAuthProtocolPublicKey,
+			label:    label + ": " + keyPath,
+			method:   method,
+		})
+	}
+
+	// 显式身份必须优先于任何自动发现来源。
+	if opts.KeyPath != "" {
+		addKey(opts.KeyPath, "explicit key")
+	}
+
+	if socket := os.Getenv("SSH_AUTH_SOCK"); socket != "" {
+		conn, err := dialSSHAgent(ctx, socket)
+		if err == nil {
+			agentClient := agent.NewClient(conn)
+			candidates = append(candidates, autoAuthCandidate{
+				protocol: autoAuthProtocolPublicKey,
+				label:    "ssh-agent",
+				method:   ssh.PublicKeysCallback(agentClient.Signers),
+			})
+			cleanup = func() { debugCloseResource(l, conn, "ssh agent connection") }
+		} else {
+			l.Debugf("connect to ssh-agent failed: %v", err)
 		}
 	}
 
-	if len(signers) > 0 {
-		methods = append(methods, ssh.PublicKeys(signers...))
+	for _, path := range []string{
+		"~/.ssh/id_ed25519",
+		"~/.ssh/id_ecdsa",
+		"~/.ssh/id_rsa",
+		"~/.ssh/id_dsa",
+	} {
+		addKey(path, "default key")
 	}
 
-	// Password Fallback
-	methods = append(methods, ssh.RetryableAuthMethod(ssh.PasswordCallback(func() (string, error) {
-		req := SecretRequest{
+	passwordAttempts := 0
+	passwordMethod := ssh.RetryableAuthMethod(ssh.PasswordCallback(func() (string, error) {
+		retry := passwordAttempts > 0 && opts.RecoveryPrompter != nil
+		passwordAttempts++
+		password, err := secProvider.resolveOrPromptAttempt(SecretRequest{
 			Kind: SecretKindLoginPassword,
-			User: user,
-			Host: host,
-		}
-		promptCtx := ctx
-		var cancel context.CancelFunc
-		if promptCtx == nil {
-			promptCtx = context.Background()
-		}
-		t := timeout
-		if t <= 0 {
-			t = DefaultInteractionTimeout
-		}
-		promptCtx, cancel = context.WithTimeout(promptCtx, t)
-		defer cancel()
-
-		password, err := prompter.PromptSecret(promptCtx, req)
+		}, retry)
 		if err != nil {
 			return "", fmt.Errorf("failed to read password: %w", err)
 		}
-		passwordCallback(password)
+		if opts.PasswordCallback != nil {
+			opts.PasswordCallback(password)
+		}
 		return password, nil
-	}), 3))
+	}), 3)
 
-	return methods, cleanup
+	candidates = append(candidates, autoAuthCandidate{
+		protocol: autoAuthProtocolPassword,
+		label:    "password",
+		method:   passwordMethod,
+	})
+
+	return autoAuthPlan{
+		candidates:   candidates,
+		authCallback: newSequentialAuthCallback(candidates, secProvider, l),
+		cleanup:      cleanup,
+	}
+}
+
+func (p *autoSecretProvider) decryptPrivateKey(data []byte, path string) (ssh.Signer, string, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		passphrase, err := p.resolveOrPromptAttempt(SecretRequest{Kind: SecretKindPrivateKeyPassphrase, KeyPath: path}, attempt > 0)
+		if err != nil {
+			return nil, "", fmt.Errorf("read private key passphrase: %w", err)
+		}
+		material := []byte(passphrase)
+		signer, err := ssh.ParsePrivateKeyWithPassphrase(data, material)
+		zeroBytes(material)
+		if err == nil {
+			return signer, passphrase, nil
+		}
+		if p.recoveryPrompter == nil || !errors.Is(err, x509.IncorrectPasswordError) || attempt == 2 {
+			return nil, "", fmt.Errorf("decrypt private key: %w", err)
+		}
+	}
+	return nil, "", ErrInteractionRequired
 }

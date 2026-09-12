@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
 	"gopkg.in/yaml.v3"
 )
@@ -70,8 +71,9 @@ type MutationOutcome struct {
 // NodeMutation is returned by node creation even when persistence reports a
 // durability failure. Ref must be used for later conditional cleanup.
 type NodeMutation struct {
-	Ref     NodeRef
-	Outcome MutationOutcome
+	Ref         NodeRef
+	AuthVersion string
+	Outcome     MutationOutcome
 }
 
 // ImportIssue records one OpenSSH host that could not be imported without
@@ -94,11 +96,12 @@ type ImportResult struct {
 // configuration state and serializes the complete clone-validate-persist-
 // publish sequence. It intentionally does not expose its Store.
 type Repository struct {
-	commitMu   sync.Mutex
-	provider   *Provider
-	store      Store
-	revision   atomic.Uint64
-	openSSHErr error
+	commitMu          sync.Mutex
+	provider          *Provider
+	store             Store
+	revision          atomic.Uint64
+	openSSHErr        error
+	hasUndurableWrite atomic.Bool
 }
 
 var _ ConfigProvider = (*Repository)(nil)
@@ -263,12 +266,24 @@ func nodeAuthVersion(cfg *Configuration, nodeID string) (Version, error) {
 		return Version{}, fmt.Errorf("resolve identity %q authentication version: %w", node.IdentityRef, ErrIdentityNotFound)
 	}
 	data, err := yaml.Marshal(struct {
-		IdentityRef string `yaml:"identity_ref"`
-		AuthType    string `yaml:"auth_type"`
-		Password    string `yaml:"password"`
-		KeyPath     string `yaml:"key_path"`
-		Passphrase  string `yaml:"passphrase"`
-	}{node.IdentityRef, identity.AuthType, identity.Password, identity.KeyPath, identity.Passphrase})
+		IdentityRef      string          `yaml:"identity_ref"`
+		AuthType         string          `yaml:"auth_type"`
+		Password         string          `yaml:"password"`
+		KeyPath          string          `yaml:"key_path"`
+		Passphrase       string          `yaml:"passphrase"`
+		KeyFingerprint   string          `yaml:"key_fingerprint,omitempty"`
+		LoginPasswordRef *credential.Ref `yaml:"login_password_ref,omitempty"`
+		PassphraseRef    *credential.Ref `yaml:"passphrase_ref,omitempty"`
+	}{
+		IdentityRef:      node.IdentityRef,
+		AuthType:         identity.AuthType,
+		Password:         identity.Password,
+		KeyPath:          identity.KeyPath,
+		Passphrase:       identity.Passphrase,
+		KeyFingerprint:   identity.KeyFingerprint,
+		LoginPasswordRef: identity.LoginPasswordRef,
+		PassphraseRef:    identity.PassphraseRef,
+	})
 	if err != nil {
 		return Version{}, fmt.Errorf("serialize node %q authentication version: %w", nodeID, err)
 	}
@@ -284,9 +299,14 @@ func nodeSudoVersion(cfg *Configuration, nodeID string) (Version, error) {
 		return Version{}, fmt.Errorf("resolve node %q sudo version: %w", nodeID, ErrNodeNotFound)
 	}
 	data, err := yaml.Marshal(struct {
-		Mode  models.SudoMode `yaml:"mode"`
-		SuPwd string          `yaml:"su_pwd"`
-	}{node.SudoMode, node.SuPwd})
+		Mode                 models.SudoMode `yaml:"mode"`
+		SuPwd                string          `yaml:"su_pwd"`
+		PrivilegePasswordRef *credential.Ref `yaml:"privilege_password_ref,omitempty"`
+	}{
+		Mode:                 node.SudoMode,
+		SuPwd:                node.SuPwd,
+		PrivilegePasswordRef: node.PrivilegePasswordRef,
+	})
 	if err != nil {
 		return Version{}, fmt.Errorf("serialize node %q sudo version: %w", nodeID, err)
 	}
@@ -322,7 +342,7 @@ func (r *Repository) ResolveConnection(nodeID string) (ConnectionSnapshot, error
 		return ConnectionSnapshot{
 			Node:     cloneNode(node),
 			Host:     cloneHost(host),
-			Identity: identity,
+			Identity: cloneIdentity(identity),
 			UpdateRef: &ConnectionUpdateRef{
 				AuthVersion: authVersion,
 				SudoVersion: sudoVersion,
@@ -455,11 +475,14 @@ func (r *Repository) commitResultContext(ctx context.Context, expectedRevision u
 	}
 
 	if err != nil {
+		r.hasUndurableWrite.Store(true)
 		return commitResult, &DurabilityError{Err: err}
 	}
 	if !result.Durable {
+		r.hasUndurableWrite.Store(true)
 		return commitResult, &DurabilityError{Err: fmt.Errorf("configuration store returned an incomplete durability result")}
 	}
+	r.hasUndurableWrite.Store(false)
 	return commitResult, nil
 }
 
@@ -481,11 +504,14 @@ func (r *Repository) commitTransactionResult(ctx context.Context, store Transact
 	r.publish(updated, lookup, aliases)
 	result.Snapshot.Configuration = cloneConfiguration(updated)
 	if err != nil {
+		r.hasUndurableWrite.Store(true)
 		return result, &DurabilityError{Err: err}
 	}
 	if !result.Durable {
+		r.hasUndurableWrite.Store(true)
 		return result, &DurabilityError{Err: fmt.Errorf("configuration transaction returned an incomplete durability result")}
 	}
+	r.hasUndurableWrite.Store(false)
 	return result, nil
 }
 
@@ -608,6 +634,11 @@ func (r *Repository) CreateNodeContext(ctx context.Context, nodeID string, node 
 		return mutation, errors.Join(err, fmt.Errorf("resolve applied node %q version: %w", nodeID, versionErr))
 	}
 	mutation.Ref = NodeRef{ID: nodeID, Version: version}
+	authVersion, authVersionErr := nodeAuthVersion(result.Snapshot.Configuration, nodeID)
+	if authVersionErr != nil {
+		return mutation, errors.Join(err, fmt.Errorf("resolve applied node %q authentication version: %w", nodeID, authVersionErr))
+	}
+	mutation.AuthVersion = string(authVersion[:])
 	return mutation, err
 }
 
@@ -652,66 +683,87 @@ func privateIdentityReference(cfg *Configuration, nodeID string) string {
 // ReplaceNodeAtRefContext replaces a node bundle only if the original bundle
 // still equals the one the caller displayed.
 func (r *Repository) ReplaceNodeAtRefContext(ctx context.Context, ref NodeRef, nodeID string, node models.Node, host models.Host, identity models.Identity) error {
-	return r.replaceNodeContext(ctx, ref, nodeID, node, host, identity)
+	_, err := r.ReplaceNodeAtRefWithAuthVersionContext(ctx, ref, nodeID, node, host, identity)
+	return err
 }
 
-func (r *Repository) replaceNodeContext(ctx context.Context, ref NodeRef, nodeID string, node models.Node, host models.Host, identity models.Identity) error {
+// ReplaceNodeAtRefWithAuthVersionContext replaces a node bundle and returns
+// the authentication version produced by that same committed mutation.
+//
+//nolint:gocyclo // replacement preserves host and identity copy-on-write invariants in one CAS transaction
+func (r *Repository) ReplaceNodeAtRefWithAuthVersionContext(ctx context.Context, ref NodeRef, nodeID string, node models.Node, host models.Host, identity models.Identity) (string, error) {
 	if nodeID == "" {
-		return fmt.Errorf("node ID is empty")
+		return "", fmt.Errorf("node ID is empty")
 	}
 	if ref.ID == "" {
-		return fmt.Errorf("replace node %q without a versioned reference: %w", nodeID, ErrConfigConflict)
+		return "", fmt.Errorf("replace node %q without a versioned reference: %w", nodeID, ErrConfigConflict)
 	}
-	return r.commitContext(ctx, anyRevision, func(cfg *Configuration) error {
-		oldNodeID := ref.ID
-		var oldNode models.Node
-		if oldNodeID != "" {
-			if err := ensureNodeRefs(cfg, []NodeRef{ref}); err != nil {
-				return err
-			}
-			var exists bool
-			oldNode, exists = cfg.Nodes.Get(oldNodeID)
-			if !exists {
-				return fmt.Errorf("resolve node %q for replacement: %w", oldNodeID, ErrNodeNotFound)
-			}
-			if existingHost, exists := cfg.Hosts.Get(node.HostRef); exists && !reflect.DeepEqual(existingHost, host) {
-				hostReferences := countNodeReferences(cfg, func(candidate models.Node) bool {
-					return candidate.HostRef == node.HostRef
-				})
-				if oldNode.HostRef == node.HostRef {
-					hostReferences--
-				}
-				if hostReferences > 0 {
-					node.HostRef = privateHostReference(cfg, nodeID)
-				}
-			}
-			if existingIdentity, exists := cfg.Identities.Get(node.IdentityRef); exists && !reflect.DeepEqual(existingIdentity, identity) {
-				identityReferences := countNodeReferences(cfg, func(candidate models.Node) bool {
-					return candidate.IdentityRef == node.IdentityRef
-				})
-				if oldNode.IdentityRef == node.IdentityRef {
-					identityReferences--
-				}
-				if identityReferences > 0 {
-					node.IdentityRef = privateIdentityReference(cfg, nodeID)
-				}
-			}
+	var authVersion string
+	err := r.commitContext(ctx, anyRevision, func(cfg *Configuration) error {
+		if err := replaceNodeAtRef(cfg, ref, nodeID, node, host, identity); err != nil {
+			return err
 		}
-		if oldNodeID != "" && oldNodeID != nodeID {
-			if _, exists := cfg.Nodes.Get(nodeID); exists {
-				return fmt.Errorf("rename node %q to %q: destination already exists", oldNodeID, nodeID)
-			}
+		version, versionErr := nodeAuthVersion(cfg, nodeID)
+		if versionErr != nil {
+			return versionErr
 		}
-		cfg.Hosts.Set(node.HostRef, cloneHost(host))
-		cfg.Identities.Set(node.IdentityRef, identity)
-		cfg.Nodes.Set(nodeID, cloneNode(node))
-		if oldNodeID != "" && oldNodeID != nodeID {
-			removeNodeAndUnusedRefs(cfg, oldNodeID)
-		} else if oldNodeID != "" {
-			removeUnusedRefs(cfg, oldNode.HostRef, oldNode.IdentityRef)
-		}
+		authVersion = string(version[:])
 		return nil
 	})
+	return authVersion, err
+}
+
+// replaceNodeAtRef mutates a transaction-local snapshot. Both ordinary edits
+// and credential transactions use the same conflict and shared-reference rules.
+func replaceNodeAtRef(cfg *Configuration, ref NodeRef, nodeID string, node models.Node, host models.Host, identity models.Identity) error {
+	oldNodeID := ref.ID
+	var oldNode models.Node
+	if oldNodeID != "" {
+		if err := ensureNodeRefs(cfg, []NodeRef{ref}); err != nil {
+			return err
+		}
+		var exists bool
+		oldNode, exists = cfg.Nodes.Get(oldNodeID)
+		if !exists {
+			return fmt.Errorf("resolve node %q for replacement: %w", oldNodeID, ErrNodeNotFound)
+		}
+		if existingHost, exists := cfg.Hosts.Get(node.HostRef); exists && !reflect.DeepEqual(existingHost, host) {
+			hostReferences := countNodeReferences(cfg, func(candidate models.Node) bool {
+				return candidate.HostRef == node.HostRef
+			})
+			if oldNode.HostRef == node.HostRef {
+				hostReferences--
+			}
+			if hostReferences > 0 {
+				node.HostRef = privateHostReference(cfg, nodeID)
+			}
+		}
+		if existingIdentity, exists := cfg.Identities.Get(node.IdentityRef); exists && !reflect.DeepEqual(existingIdentity, identity) {
+			identityReferences := countNodeReferences(cfg, func(candidate models.Node) bool {
+				return candidate.IdentityRef == node.IdentityRef
+			})
+			if oldNode.IdentityRef == node.IdentityRef {
+				identityReferences--
+			}
+			if identityReferences > 0 {
+				node.IdentityRef = privateIdentityReference(cfg, nodeID)
+			}
+		}
+	}
+	if oldNodeID != "" && oldNodeID != nodeID {
+		if _, exists := cfg.Nodes.Get(nodeID); exists {
+			return fmt.Errorf("rename node %q to %q: destination already exists", oldNodeID, nodeID)
+		}
+	}
+	cfg.Hosts.Set(node.HostRef, cloneHost(host))
+	cfg.Identities.Set(node.IdentityRef, identity)
+	cfg.Nodes.Set(nodeID, cloneNode(node))
+	if oldNodeID != "" && oldNodeID != nodeID {
+		removeNodeAndUnusedRefs(cfg, oldNodeID)
+	} else if oldNodeID != "" {
+		removeUnusedRefs(cfg, oldNode.HostRef, oldNode.IdentityRef)
+	}
+	return nil
 }
 
 // DeleteNodeAtRefContext removes one node only if its complete bundle still
@@ -730,10 +782,15 @@ func (r *Repository) DeleteNodeAtRefContext(ctx context.Context, ref NodeRef) (M
 // DeleteNodesAtRefsContext removes nodes only when every selected node bundle
 // still matches its displayed version. Unrelated configuration updates may merge.
 func (r *Repository) DeleteNodesAtRefsContext(ctx context.Context, refs []NodeRef) error {
+	_, err := r.deleteNodesAtRefsWithOutcome(ctx, refs)
+	return err
+}
+
+func (r *Repository) deleteNodesAtRefsWithOutcome(ctx context.Context, refs []NodeRef) (MutationOutcome, error) {
 	if len(refs) == 0 {
-		return nil
+		return MutationOutcome{}, nil
 	}
-	return r.commitContext(ctx, anyRevision, func(cfg *Configuration) error {
+	result, err := r.commitResultContext(ctx, anyRevision, func(cfg *Configuration) error {
 		if err := ensureNodeRefs(cfg, refs); err != nil {
 			return err
 		}
@@ -747,6 +804,7 @@ func (r *Repository) DeleteNodesAtRefsContext(ctx context.Context, refs []NodeRe
 		}
 		return nil
 	})
+	return MutationOutcome{Applied: result.Applied, Durable: result.Durable}, err
 }
 
 // UpdateNodeTagsContext applies one tag operation to all nodes in a single
@@ -969,12 +1027,13 @@ func (r *Repository) InitializeContext(ctx context.Context) error {
 // match the connection snapshot. A shared identity is copied for the current
 // node before discovery is persisted, so runtime discovery cannot mutate a
 // reusable template for unrelated nodes.
-func (r *Repository) UpdateAuthAtVersionContext(ctx context.Context, nodeID, authVersion, password, keyPath, passphrase string) error {
+func (r *Repository) UpdateAuthAtVersionContext(ctx context.Context, nodeID, authVersion, password, keyPath, passphrase string) (string, error) {
 	expected, err := versionFromString(authVersion)
 	if err != nil {
-		return fmt.Errorf("update authentication for node %q: %w", nodeID, err)
+		return "", fmt.Errorf("update authentication for node %q: %w", nodeID, err)
 	}
-	return r.commitContext(ctx, anyRevision, func(cfg *Configuration) error {
+	committedToken := authVersion
+	err = r.commitContext(ctx, anyRevision, func(cfg *Configuration) error {
 		current, err := nodeAuthVersion(cfg, nodeID)
 		if err != nil || current != expected {
 			return fmt.Errorf("authentication for node %q changed during connection: %w", nodeID, ErrConfigConflict)
@@ -1000,6 +1059,7 @@ func (r *Repository) UpdateAuthAtVersionContext(ctx context.Context, nodeID, aut
 			changed = true
 		}
 		if !changed {
+			committedToken = authVersion
 			return nil
 		}
 		if countNodeReferences(cfg, func(candidate models.Node) bool {
@@ -1009,18 +1069,28 @@ func (r *Repository) UpdateAuthAtVersionContext(ctx context.Context, nodeID, aut
 			cfg.Nodes.Set(nodeID, node)
 		}
 		cfg.Identities.Set(node.IdentityRef, identity)
+		newVer, err := nodeAuthVersion(cfg, nodeID)
+		if err != nil {
+			return err
+		}
+		committedToken = string(newVer[:])
 		return nil
 	})
+	if err != nil {
+		return "", err
+	}
+	return committedToken, nil
 }
 
 // UpdateSudoAtVersionContext updates only sudo fields that still match the
 // connection snapshot. It may merge with unrelated node or identity changes.
-func (r *Repository) UpdateSudoAtVersionContext(ctx context.Context, nodeID, sudoVersion string, mode models.SudoMode, suPwd string) error {
+func (r *Repository) UpdateSudoAtVersionContext(ctx context.Context, nodeID, sudoVersion string, mode models.SudoMode, suPwd string) (string, error) {
 	expected, err := versionFromString(sudoVersion)
 	if err != nil {
-		return fmt.Errorf("update sudo for node %q: %w", nodeID, err)
+		return "", fmt.Errorf("update sudo for node %q: %w", nodeID, err)
 	}
-	return r.commitContext(ctx, anyRevision, func(cfg *Configuration) error {
+	committedToken := sudoVersion
+	err = r.commitContext(ctx, anyRevision, func(cfg *Configuration) error {
 		current, err := nodeSudoVersion(cfg, nodeID)
 		if err != nil || current != expected {
 			return fmt.Errorf("sudo settings for node %q changed during connection: %w", nodeID, ErrConfigConflict)
@@ -1029,15 +1099,31 @@ func (r *Repository) UpdateSudoAtVersionContext(ctx context.Context, nodeID, sud
 		if !ok {
 			return fmt.Errorf("resolve node %q for sudo update: %w", nodeID, ErrNodeNotFound)
 		}
-		if mode != "" {
+		changed := false
+		if mode != "" && node.SudoMode != mode {
 			node.SudoMode = mode
+			changed = true
 		}
-		if suPwd != "" {
+		if suPwd != "" && node.SuPwd != suPwd {
 			node.SuPwd = suPwd
+			changed = true
+		}
+		if !changed {
+			committedToken = sudoVersion
+			return nil
 		}
 		cfg.Nodes.Set(nodeID, node)
+		newVer, err := nodeSudoVersion(cfg, nodeID)
+		if err != nil {
+			return err
+		}
+		committedToken = string(newVer[:])
 		return nil
 	})
+	if err != nil {
+		return "", err
+	}
+	return committedToken, nil
 }
 
 func (r *Repository) Resolve(nodeID string) (models.Node, models.Host, models.Identity, error) {
@@ -1102,4 +1188,624 @@ func validateConfiguration(cfg *Configuration) error {
 		}
 	}
 	return nil
+}
+
+// UpdateNodeCredentialRefAtVersionContext updates the specified credential reference on a node.
+// If the node shares an identity with other nodes, updating authentication credentials (KindLoginPassword or KindPassphrase)
+// automatically forks a private identity for the node, preserving shared templates for other nodes.
+func (r *Repository) UpdateNodeCredentialRefAtVersionContext(
+	ctx context.Context,
+	nodeID string,
+	expectedVersion string,
+	kind credential.Kind,
+	newRef *credential.Ref,
+) (MutationOutcome, string, error) {
+	return r.UpdateNodeCredentialRefWithMetadataAtVersionContext(ctx, nodeID, expectedVersion, kind, newRef, "", "", false, false, false)
+}
+
+// UpdateNodeCredentialRefWithKeyPathAtVersionContext atomically updates a
+// node credential reference and, for a private-key passphrase, its non-secret
+// key path. An empty keyPath leaves the existing path unchanged.
+func (r *Repository) UpdateNodeCredentialRefWithKeyPathAtVersionContext(
+	ctx context.Context,
+	nodeID string,
+	expectedVersion string,
+	kind credential.Kind,
+	newRef *credential.Ref,
+	keyPath string,
+) (MutationOutcome, string, error) {
+	return r.UpdateNodeCredentialRefWithMetadataAtVersionContext(ctx, nodeID, expectedVersion, kind, newRef, keyPath, "", false, false, false)
+}
+
+// UpdateNodeCredentialRefWithMetadataAtVersionContext atomically updates a
+// node credential reference with non-secret authentication metadata.
+func (r *Repository) UpdateNodeCredentialRefWithMetadataAtVersionContext(
+	ctx context.Context,
+	nodeID string,
+	expectedVersion string,
+	kind credential.Kind,
+	newRef *credential.Ref,
+	keyPath string,
+	authType string,
+	clearKeyPath bool,
+	clearLegacyLoginPassword bool,
+	clearLegacyPassphrase bool,
+) (MutationOutcome, string, error) {
+	return r.updateNodeCredentialTargetAtVersion(ctx, credential.Target{NodeID: nodeID, Kind: kind, KeyPath: keyPath, AuthType: authType, ClearKeyPath: clearKeyPath, ClearLegacyLoginPassword: clearLegacyLoginPassword, ClearLegacyPassphrase: clearLegacyPassphrase}, expectedVersion, newRef)
+}
+
+func (r *Repository) updateNodeCredentialTargetAtVersion(ctx context.Context, target credential.Target, expectedVersion string, newRef *credential.Ref) (MutationOutcome, string, error) {
+	nodeID, kind := target.NodeID, target.Kind
+
+	if err := kind.Validate(); err != nil {
+		return MutationOutcome{}, "", err
+	}
+	if newRef != nil {
+		if err := newRef.Validate(); err != nil {
+			return MutationOutcome{}, "", err
+		}
+	}
+
+	var committedVersion string
+	commitResult, err := r.commitResultContext(ctx, anyRevision, func(cfg *Configuration) error {
+		switch kind {
+		case credential.KindLoginPassword, credential.KindPassphrase:
+			ver, updateErr := updateNodeAuthCredentialTarget(cfg, target, expectedVersion, newRef)
+			if updateErr != nil {
+				return updateErr
+			}
+			committedVersion = ver
+			return nil
+
+		case credential.KindPrivilegePassword:
+			ver, updateErr := updateNodeSudoCredentialRef(cfg, nodeID, expectedVersion, newRef)
+			if updateErr != nil {
+				return updateErr
+			}
+			committedVersion = ver
+			return nil
+
+		default:
+			return fmt.Errorf("%w: unsupported credential kind %q", credential.ErrInvalidRef, kind)
+		}
+	})
+
+	if err != nil {
+		if commitResult.Applied {
+			return MutationOutcome{Applied: true, Durable: false}, committedVersion, err
+		}
+		return MutationOutcome{Applied: false, Durable: false}, "", err
+	}
+	return MutationOutcome{Applied: true, Durable: commitResult.Durable}, committedVersion, nil
+}
+
+func updateNodeAuthCredentialRef(
+	cfg *Configuration,
+	nodeID string,
+	expectedVersion string,
+	kind credential.Kind,
+	newRef *credential.Ref,
+	keyPath string,
+	authType string,
+	clearKeyPath bool,
+	clearLegacyLoginPassword bool,
+	clearLegacyPassphrase bool,
+) (string, error) {
+	node, ok := cfg.Nodes.Get(nodeID)
+	if !ok {
+		return "", fmt.Errorf("resolve node %q for credential update: %w", nodeID, ErrNodeNotFound)
+	}
+
+	currentVer, verErr := nodeAuthVersion(cfg, nodeID)
+	if verErr != nil {
+		return "", verErr
+	}
+	if expectedVersion != "" {
+		expected, expErr := versionFromString(expectedVersion)
+		if expErr != nil {
+			return "", fmt.Errorf("node %q auth expected version invalid: %w", nodeID, expErr)
+		}
+		if currentVer != expected {
+			return "", fmt.Errorf("authentication for node %q changed: %w", nodeID, ErrConfigConflict)
+		}
+	}
+
+	identity, ok := cfg.Identities.Get(node.IdentityRef)
+	if !ok {
+		return "", fmt.Errorf("resolve identity %q for node %q: %w", node.IdentityRef, nodeID, ErrIdentityNotFound)
+	}
+
+	// 检查是否共享：若有多个节点引用该 Identity，分裂出私有副本
+	if countNodeReferences(cfg, func(candidate models.Node) bool {
+		return candidate.IdentityRef == node.IdentityRef
+	}) > 1 {
+		node.IdentityRef = privateIdentityReference(cfg, nodeID)
+		cfg.Nodes.Set(nodeID, node)
+	}
+
+	if kind == credential.KindLoginPassword {
+		identity.LoginPasswordRef = newRef.Clone()
+		identity.Password = ""
+		if newRef != nil && !newRef.IsEmpty() {
+			identity.AuthType = "password"
+		}
+	} else {
+		identity.PassphraseRef = newRef.Clone()
+		identity.Passphrase = ""
+		if newRef != nil && !newRef.IsEmpty() {
+			identity.AuthType = "key"
+		}
+	}
+	if keyPath != "" {
+		identity.KeyPath = keyPath
+	}
+	if authType != "" {
+		identity.AuthType = authType
+	}
+	if clearKeyPath {
+		identity.KeyPath = ""
+	}
+	if clearLegacyLoginPassword {
+		identity.Password = ""
+	}
+	if clearLegacyPassphrase {
+		identity.Passphrase = ""
+	}
+
+	cfg.Identities.Set(node.IdentityRef, identity)
+
+	newVer, verErr := nodeAuthVersion(cfg, nodeID)
+	if verErr != nil {
+		return "", verErr
+	}
+	return string(newVer[:]), nil
+}
+
+func updateNodeSudoCredentialRef(
+	cfg *Configuration,
+	nodeID string,
+	expectedVersion string,
+	newRef *credential.Ref,
+) (string, error) {
+	node, ok := cfg.Nodes.Get(nodeID)
+	if !ok {
+		return "", fmt.Errorf("resolve node %q for credential update: %w", nodeID, ErrNodeNotFound)
+	}
+
+	currentVer, verErr := nodeSudoVersion(cfg, nodeID)
+	if verErr != nil {
+		return "", verErr
+	}
+	if expectedVersion != "" {
+		expected, expErr := versionFromString(expectedVersion)
+		if expErr != nil {
+			return "", fmt.Errorf("node %q sudo expected version invalid: %w", nodeID, expErr)
+		}
+		if currentVer != expected {
+			return "", fmt.Errorf("sudo settings for node %q changed: %w", nodeID, ErrConfigConflict)
+		}
+	}
+
+	node.PrivilegePasswordRef = newRef.Clone()
+	node.SuPwd = ""
+	cfg.Nodes.Set(nodeID, node)
+
+	newVer, verErr := nodeSudoVersion(cfg, nodeID)
+	if verErr != nil {
+		return "", verErr
+	}
+	return string(newVer[:]), nil
+}
+
+// UpdateIdentityCredentialRefAtVersionContext updates the specified credential reference directly on an identity.
+func (r *Repository) UpdateIdentityCredentialRefAtVersionContext(
+	ctx context.Context,
+	identityID string,
+	expectedVersion string,
+	kind credential.Kind,
+	newRef *credential.Ref,
+) (MutationOutcome, string, error) {
+	return r.updateIdentityCredentialRefAtVersionContext(ctx, credential.Target{IdentityID: identityID, Kind: kind}, expectedVersion, newRef)
+}
+
+func (r *Repository) updateIdentityCredentialRefAtVersionContext(ctx context.Context, target credential.Target, expectedVersion string, newRef *credential.Ref) (MutationOutcome, string, error) {
+	identityID, kind := target.IdentityID, target.Kind
+
+	if err := kind.Validate(); err != nil {
+		return MutationOutcome{}, "", err
+	}
+	if kind != credential.KindLoginPassword && kind != credential.KindPassphrase {
+		return MutationOutcome{}, "", fmt.Errorf("invalid credential kind %q for identity: only login_password and passphrase supported", kind)
+	}
+	if newRef != nil {
+		if err := newRef.Validate(); err != nil {
+			return MutationOutcome{}, "", err
+		}
+	}
+
+	var committedVersion string
+	commitResult, err := r.commitResultContext(ctx, anyRevision, func(cfg *Configuration) error {
+		identity, ok := cfg.Identities.Get(identityID)
+		if !ok {
+			return fmt.Errorf("resolve identity %q for credential update: %w", identityID, ErrIdentityNotFound)
+		}
+
+		currentVer, verErr := identityEntityVersion(cfg, identityID)
+		if verErr != nil {
+			return verErr
+		}
+		if expectedVersion != "" {
+			expected, expErr := versionFromString(expectedVersion)
+			if expErr != nil {
+				return fmt.Errorf("identity %q expected version invalid: %w", identityID, expErr)
+			}
+			if currentVer != expected {
+				return fmt.Errorf("identity %q changed: %w", identityID, ErrConfigConflict)
+			}
+		}
+
+		if kind == credential.KindLoginPassword {
+			identity.LoginPasswordRef = newRef.Clone()
+			identity.Password = ""
+			if newRef != nil && !newRef.IsEmpty() {
+				identity.AuthType = "password"
+			}
+		} else {
+			identity.PassphraseRef = newRef.Clone()
+			identity.Passphrase = ""
+			if newRef != nil && !newRef.IsEmpty() {
+				identity.AuthType = "key"
+			}
+		}
+
+		applyIdentityCredentialMetadata(&identity, target)
+
+		cfg.Identities.Set(identityID, identity)
+
+		newVer, verErr := identityEntityVersion(cfg, identityID)
+		if verErr != nil {
+			return verErr
+		}
+		committedVersion = string(newVer[:])
+		return nil
+	})
+
+	if err != nil {
+		if commitResult.Applied {
+			return MutationOutcome{Applied: true, Durable: false}, committedVersion, err
+		}
+		return MutationOutcome{Applied: false, Durable: false}, "", err
+	}
+	return MutationOutcome{Applied: true, Durable: commitResult.Durable}, committedVersion, nil
+}
+
+// CheckRefUnreferenced checks whether the given credential reference is unreferenced anywhere
+// in the latest active configuration snapshot.
+func (r *Repository) loadDiskConfigLocked(ctx context.Context) (*Configuration, error) {
+	if ts, ok := r.store.(TransactionStore); ok {
+		snap, err := ts.LoadSnapshot(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return snap.Configuration, nil
+	}
+	if r.store != nil {
+		return r.store.Load()
+	}
+	return nil, nil
+}
+
+func (r *Repository) syncStoreLocked(ctx context.Context) error {
+	hasSynced := false
+
+	// 1. 如果底层存储支持报告耐久性状态（如共享存储或具备状态跟踪的存储）
+	if dc, ok := r.store.(DurabilityChecker); ok {
+		if !dc.IsDurable() {
+			if syncer, ok := r.store.(Syncer); ok {
+				if err := syncer.Sync(ctx); err != nil {
+					return fmt.Errorf("storage durability sync failed: %w", err)
+				}
+				hasSynced = true
+			}
+			if !dc.IsDurable() {
+				return fmt.Errorf("authoritative storage remains undurable")
+			}
+		}
+	} else if dcAnon, ok := r.store.(interface{ IsDurable() bool }); ok {
+		if !dcAnon.IsDurable() {
+			if syncer, ok := r.store.(Syncer); ok {
+				if err := syncer.Sync(ctx); err != nil {
+					return fmt.Errorf("storage durability sync failed: %w", err)
+				}
+				hasSynced = true
+			}
+			if !dcAnon.IsDurable() {
+				return fmt.Errorf("authoritative storage remains undurable")
+			}
+		}
+	}
+
+	// 2. 无论是否已检查状态，只要存储实现了 Syncer 接口且尚未同步，必须执行物理介质同步
+	if !hasSynced {
+		if syncer, ok := r.store.(Syncer); ok {
+			if err := syncer.Sync(ctx); err != nil {
+				return fmt.Errorf("storage syncer failed: %w", err)
+			}
+			hasSynced = true
+		} else if ds, ok := r.store.(*defaultStore); ok {
+			if err := ds.Sync(ctx); err != nil {
+				return fmt.Errorf("default store sync failed: %w", err)
+			}
+			hasSynced = true
+		}
+	}
+
+	// 3. 若存储层未实现任何持久化同步或耐久性检查接口，且当前实例记录了未决耐久写入，说明无法确认持久化
+	if !hasSynced {
+		if _, ok := r.store.(interface{ IsDurable() bool }); !ok {
+			if r.hasUndurableWrite.Load() {
+				return fmt.Errorf("unconfirmed durability write remains pending in current instance")
+			}
+		}
+	}
+
+	// 存储层已成功完成持久化同步，重置本实例未决写入标记
+	r.hasUndurableWrite.Store(false)
+	return nil
+}
+
+// CheckRefUnreferenced checks whether the reference is unreferenced in authoritative storage
+// and confirms that this unreferenced state has been durably persisted across processes.
+func (r *Repository) CheckRefUnreferenced(ctx context.Context, ref credential.Ref) (bool, error) {
+	if ref.IsEmpty() {
+		return true, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
+	r.commitMu.Lock()
+	defer r.commitMu.Unlock()
+
+	// 1. 从持久化存储重新加载最新权威配置
+	diskCfg, err := r.loadDiskConfigLocked(ctx)
+	if err != nil {
+		return false, fmt.Errorf("reload configuration snapshot for ref check: %w", err)
+	}
+
+	// 2. 检查磁盘权威快照中是否仍然包含该引用
+	if diskCfg != nil && isRefReferencedIn(diskCfg, ref) {
+		return false, nil
+	}
+
+	// 3. 区分过期快照与真正未确认持久化的状态：
+	// 仅当本进程处于真正未确认持久化的写入状态（Applied=true, Durable=false）时，
+	// 内存快照中的引用才代表未落盘的新增引用；
+	// 若本进程无未落盘写入，而磁盘权威配置已无该引用，则内存中若有该引用纯属过期快照（stale snapshot）。
+	if r.hasUndurableWrite.Load() {
+		memCfg := r.provider.Snapshot()
+		if memCfg != nil && isRefReferencedIn(memCfg, ref) {
+			return false, nil
+		}
+	} else if diskCfg != nil {
+		memCfg := r.provider.Snapshot()
+		if memCfg != nil && isRefReferencedIn(memCfg, ref) {
+			// 检测到过期快照，以磁盘权威配置主动刷新内存快照
+			if lookup, aliases, err := buildIndexes(diskCfg, false); err == nil {
+				r.publish(diskCfg, lookup, aliases)
+			}
+		}
+	}
+
+	// 4. 【核心红线保障】：磁盘权威配置中虽无引用，但该状态必须在跨进程存储层确认已完成持久化同步（Durable）。
+	// 若底层存储同步失败或仍处于未持久化状态，绝不能确认解绑，防止因跨 Repository 实例的未 Durable 解绑导致凭据被 GC 提前删除！
+	if err := r.syncStoreLocked(ctx); err != nil {
+		return false, fmt.Errorf("verify ref unreferenced durability in storage failed: %w", err)
+	}
+
+	r.hasUndurableWrite.Store(false)
+	return true, nil
+}
+
+func isRefReferencedIn(cfg *Configuration, ref credential.Ref) bool {
+	if cfg == nil {
+		return false
+	}
+	if cfg.Identities != nil {
+		for _, k := range cfg.Identities.Keys() {
+			id, ok := cfg.Identities.Get(k)
+			if !ok {
+				continue
+			}
+			if id.LoginPasswordRef != nil && *id.LoginPasswordRef == ref {
+				return true
+			}
+			if id.PassphraseRef != nil && *id.PassphraseRef == ref {
+				return true
+			}
+		}
+	}
+
+	if cfg.Nodes != nil {
+		for _, k := range cfg.Nodes.Keys() {
+			node, ok := cfg.Nodes.Get(k)
+			if !ok {
+				continue
+			}
+			if node.PrivilegePasswordRef != nil && *node.PrivilegePasswordRef == ref {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func equalRef(actual, expected *credential.Ref) bool {
+	if expected == nil {
+		return actual == nil
+	}
+	return actual != nil && *actual == *expected
+}
+
+func confirmNodeRefDurable(diskCfg *Configuration, target credential.Target, ref *credential.Ref) bool {
+	node, ok := diskCfg.Nodes.Get(target.NodeID)
+	if !ok {
+		return false
+	}
+	switch target.Kind {
+	case credential.KindPrivilegePassword:
+		return equalRef(node.PrivilegePasswordRef, ref)
+	case credential.KindLoginPassword:
+		identity, ok := diskCfg.Identities.Get(node.IdentityRef)
+		if !ok {
+			return false
+		}
+		return equalRef(identity.LoginPasswordRef, ref)
+	case credential.KindPassphrase:
+		identity, ok := diskCfg.Identities.Get(node.IdentityRef)
+		if !ok {
+			return false
+		}
+		return equalRef(identity.PassphraseRef, ref)
+	}
+	return false
+}
+
+func confirmIdentityRefDurable(diskCfg *Configuration, target credential.Target, ref *credential.Ref) bool {
+	identity, ok := diskCfg.Identities.Get(target.IdentityID)
+	if !ok {
+		return false
+	}
+	switch target.Kind {
+	case credential.KindLoginPassword:
+		return equalRef(identity.LoginPasswordRef, ref)
+	case credential.KindPassphrase:
+		return equalRef(identity.PassphraseRef, ref)
+	}
+	return false
+}
+
+// ConfirmRefDurable 从底层权威持久化存储重新检查指定 target 的凭据引用是否已持久化生效（Durable）。
+func (r *Repository) ConfirmRefDurable(ctx context.Context, target credential.Target, ref *credential.Ref) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	r.commitMu.Lock()
+	defer r.commitMu.Unlock()
+
+	// 1. 先从底层权威存储读取最新配置并比对引用
+	diskCfg, err := r.loadDiskConfigLocked(ctx)
+	if err != nil {
+		return false, fmt.Errorf("reload configuration snapshot for durability check: %w", err)
+	}
+	if diskCfg == nil {
+		return false, fmt.Errorf("authoritative configuration unavailable")
+	}
+
+	var matched bool
+	if target.NodeID != "" {
+		matched = confirmNodeRefDurable(diskCfg, target, ref)
+	} else if target.IdentityID != "" {
+		matched = confirmIdentityRefDurable(diskCfg, target, ref)
+	}
+	if !matched {
+		return false, nil
+	}
+
+	// 2. 引用在配置中已匹配，必须在持久化层重新完成文件/目录同步，真正确认 Durable
+	if err := r.syncStoreLocked(ctx); err != nil {
+		// 持久化层未能成功完成同步，不能确认 Durable，返回 false 阻止删除旧凭据
+		return false, fmt.Errorf("complete storage durability sync failed: %w", err)
+	}
+
+	r.hasUndurableWrite.Store(false)
+	return true, nil
+}
+
+// RepositoryConfigUpdater adapts a Repository to satisfy credential.ConfigUpdater.
+type RepositoryConfigUpdater struct {
+	repo *Repository
+}
+
+// NewRepositoryConfigUpdater creates a new RepositoryConfigUpdater.
+func NewRepositoryConfigUpdater(repo *Repository) *RepositoryConfigUpdater {
+	return &RepositoryConfigUpdater{repo: repo}
+}
+
+// ApplyCredentialRefAtVersion commits a credential reference mutation to the repository.
+func (u *RepositoryConfigUpdater) ApplyCredentialRefAtVersion(
+	ctx context.Context,
+	target credential.Target,
+	expectedVersion string,
+	newRef *credential.Ref,
+) (credential.MutationOutcome, string, error) {
+	if target.NodeID != "" {
+		outcome, newVer, err := u.repo.updateNodeCredentialTargetAtVersion(ctx, target, expectedVersion, newRef)
+		return credential.MutationOutcome{Applied: outcome.Applied, Durable: outcome.Durable}, newVer, adaptConfigError(err)
+	}
+	if target.IdentityID != "" {
+		outcome, newVer, err := u.repo.updateIdentityCredentialRefAtVersionContext(ctx, target, expectedVersion, newRef)
+		return credential.MutationOutcome{Applied: outcome.Applied, Durable: outcome.Durable}, newVer, adaptConfigError(err)
+	}
+	return credential.MutationOutcome{}, "", fmt.Errorf("target must specify nodeID or identityID")
+}
+
+func adaptConfigError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrConfigConflict) {
+		return fmt.Errorf("%w: %w", credential.ErrConfigConflict, err)
+	}
+	return err
+}
+
+// CheckRefUnreferenced checks whether the reference is unreferenced in the configuration.
+func (u *RepositoryConfigUpdater) CheckRefUnreferenced(ctx context.Context, ref credential.Ref) (bool, error) {
+	return u.repo.CheckRefUnreferenced(ctx, ref)
+}
+
+// ConfirmRefDurable checks whether the reference has become durable in authoritative storage.
+func (u *RepositoryConfigUpdater) ConfirmRefDurable(ctx context.Context, target credential.Target, ref *credential.Ref) (bool, error) {
+	return u.repo.ConfirmRefDurable(ctx, target, ref)
+}
+
+// AsConfigUpdater returns the credential.ConfigUpdater adapter for the repository.
+func (r *Repository) AsConfigUpdater() credential.ConfigUpdater {
+	return NewRepositoryConfigUpdater(r)
+}
+
+func applyIdentityCredentialMetadata(identity *models.Identity, target credential.Target) {
+	if target.KeyFingerprint != "" {
+		identity.KeyFingerprint = target.KeyFingerprint
+	}
+	if target.KeyPath != "" {
+		identity.KeyPath = target.KeyPath
+	}
+	if target.AuthType != "" {
+		identity.AuthType = target.AuthType
+	}
+	if target.ClearKeyPath {
+		identity.KeyPath = ""
+	}
+	if target.ClearLegacyLoginPassword {
+		identity.Password = ""
+	}
+	if target.ClearLegacyPassphrase {
+		identity.Passphrase = ""
+	}
+}
+
+func updateNodeAuthCredentialTarget(cfg *Configuration, target credential.Target, expectedVersion string, newRef *credential.Ref) (string, error) {
+	version, err := updateNodeAuthCredentialRef(cfg, target.NodeID, expectedVersion, target.Kind, newRef, target.KeyPath, target.AuthType, target.ClearKeyPath, target.ClearLegacyLoginPassword, target.ClearLegacyPassphrase)
+	if err != nil || target.KeyFingerprint == "" {
+		return version, err
+	}
+	node, _ := cfg.Nodes.Get(target.NodeID)
+	identity, _ := cfg.Identities.Get(node.IdentityRef)
+	identity.KeyFingerprint = target.KeyFingerprint
+	cfg.Identities.Set(node.IdentityRef, identity)
+	next, err := nodeAuthVersion(cfg, target.NodeID)
+	return string(next[:]), err
 }

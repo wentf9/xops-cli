@@ -38,6 +38,11 @@ func GetConfigStore() (config.Store, *config.Repository, *config.Configuration, 
 
 // GetLocalSudoPassword 尝试从配置文件中获取本地 sudo 密码，返回 (password, found, error)
 func GetLocalSudoPassword() (string, bool, error) {
+	return GetLocalSudoPasswordContext(context.Background())
+}
+
+// GetLocalSudoPasswordContext resolves v2 references on demand with cancellation.
+func GetLocalSudoPasswordContext(ctx context.Context) (string, bool, error) {
 	configPath, keyPathCfg, err := GetConfigFilePath()
 	if err != nil {
 		return "", false, fmt.Errorf("get config file path failed: %w", err)
@@ -61,7 +66,22 @@ func GetLocalSudoPassword() (string, bool, error) {
 
 	if nodeID != "" {
 		if id, ok := provider.GetIdentity(nodeID); ok {
-			return id.Password, true, nil
+			if id.LoginPasswordRef != nil && !id.LoginPasswordRef.IsEmpty() {
+				registry, err := GetCredentialRegistry(cfg)
+				if err != nil {
+					return "", false, err
+				}
+				if registry == nil {
+					return "", false, fmt.Errorf("local sudo credential registry is missing")
+				}
+				secret, err := registry.Resolve(ctx, *id.LoginPasswordRef)
+				defer clear(secret.Value)
+				if err != nil {
+					return "", false, fmt.Errorf("resolve local sudo credential: %w", err)
+				}
+				return string(secret.Value), true, nil
+			}
+			return id.Password, id.Password != "", nil
 		}
 	}
 	return "", false, nil
@@ -92,6 +112,9 @@ func SaveLocalSudoPasswordContext(ctx context.Context, password string) error {
 	username, err := GetCurrentUser()
 	if err != nil {
 		return err
+	}
+	if cfg.SchemaVersion == 2 {
+		return saveLocalSudoCredential(ctx, repository, username, password)
 	}
 	address := "localhost"
 
@@ -256,6 +279,9 @@ func GetCurrentUser() (string, error) {
 
 // GetConfigFilePath 获取默认配置与密钥路径
 func GetConfigFilePath() (configPath, keyPath string, err error) {
+	if cfgDir := os.Getenv("XOPS_CONFIG_DIR"); cfgDir != "" {
+		return filepath.Join(cfgDir, ConfigFileName), filepath.Join(cfgDir, ConfigKeyName), nil
+	}
 	currUser, err := user.Current()
 	if err != nil {
 		return "", "", fmt.Errorf("get current user failed: %w", err)
@@ -265,6 +291,9 @@ func GetConfigFilePath() (configPath, keyPath string, err error) {
 
 // GetPasswordFilePath 获取默认密码本文件路径
 func GetPasswordFilePath() (string, error) {
+	if cfgDir := os.Getenv("XOPS_CONFIG_DIR"); cfgDir != "" {
+		return filepath.Join(cfgDir, PasswordFileName), nil
+	}
 	currUser, err := user.Current()
 	if err != nil {
 		return "", fmt.Errorf("get current user failed: %w", err)

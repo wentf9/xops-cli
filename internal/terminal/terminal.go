@@ -10,6 +10,8 @@ import (
 )
 
 // Prompter provides interruptible terminal input for lines and secrets.
+// ReadLine echoes console text and accepts Enter on Windows; ReadSecret never
+// echoes secret input. Redirected streams are read without terminal echo.
 type Prompter interface {
 	ReadLine(ctx context.Context, prompt string) (string, error)
 	ReadSecret(ctx context.Context, prompt string) (string, error)
