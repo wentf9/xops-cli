@@ -32,7 +32,7 @@ jobs:
           cache: true
       - run: npm ci
       - run: npm run docs:build
-      - uses: actions/upload-pages-artifact@v4
+      - uses: actions/upload-pages-artifact@v5
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
         with:
           path: docs/.vitepress/dist
