@@ -98,7 +98,12 @@ func makeFixture(t *testing.T) fixture {
 
 func (f fixture) open(t *testing.T, ops fileOps) *Store {
 	t.Helper()
-	s, err := openStore(t.Context(), f.root, "offline", Options{Keys: f.keys, Timeout: 2 * time.Second}, ops)
+	return f.openWithTimeout(t, ops, 2*time.Second)
+}
+
+func (f fixture) openWithTimeout(t *testing.T, ops fileOps, timeout time.Duration) *Store {
+	t.Helper()
+	s, err := openStore(t.Context(), f.root, "offline", Options{Keys: f.keys, Timeout: timeout}, ops)
 	if errors.Is(err, ErrUnsupported) {
 		t.Skipf("required filesystem operations unavailable: %v", err)
 	}
@@ -281,7 +286,12 @@ func TestFileStoreRetriesConfirmDurability(t *testing.T) {
 
 func TestFileStoreConcurrentHandles(t *testing.T) {
 	f := makeFixture(t)
-	a, b := f.open(t, fileOps{}), f.open(t, fileOps{})
+	// Twelve writers serialize durable budget/item publication under one lock.
+	// Windows race runners can spend more than two seconds in that queue.
+	// This is a correctness test, not a filesystem latency benchmark.
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	a, b := f.openWithTimeout(t, fileOps{}, 30*time.Second), f.openWithTimeout(t, fileOps{}, 30*time.Second)
 	secret := credential.NewSecret([]byte("public-shared-secret"))
 	defer secret.Zero()
 	errs := make(chan error, 12)
@@ -292,7 +302,7 @@ func TestFileStoreConcurrentHandles(t *testing.T) {
 			if i%2 == 0 {
 				s = b
 			}
-			errs <- s.Put(t.Context(), f.ref, secret)
+			errs <- s.Put(ctx, f.ref, secret)
 		})
 	}
 	wg.Wait()
@@ -314,7 +324,7 @@ func TestFileStoreConcurrentHandles(t *testing.T) {
 			if i%2 == 0 {
 				s = b
 			}
-			distinctErrors <- s.Put(t.Context(), ref, secret)
+			distinctErrors <- s.Put(ctx, ref, secret)
 		})
 	}
 	wg.Wait()
@@ -324,6 +334,12 @@ func TestFileStoreConcurrentHandles(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	for i := range 12 {
+		ref := f.ref
+		ref.ItemID = fmt.Sprintf("item-%d", i)
+		assertConcurrentItem(t, ctx, b, ref, secret.Value)
+	}
+	assertConcurrentItem(t, ctx, b, f.ref, secret.Value)
 	if n := f.budget(t).Consumed; n != 16 {
 		t.Fatalf("lost concurrent reservations: %d", n)
 	}
@@ -368,4 +384,13 @@ func platformTempDir(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func assertConcurrentItem(t *testing.T, ctx context.Context, store *Store, ref credential.Ref, want []byte) {
+	t.Helper()
+	got, err := store.Get(ctx, ref)
+	defer got.Zero()
+	if err != nil || !bytes.Equal(got.Value, want) {
+		t.Fatalf("read concurrent item %q: err=%v, value matches=%t", ref.ItemID, err, bytes.Equal(got.Value, want))
+	}
 }
