@@ -1,6 +1,6 @@
 # Command reference
 
-The [complete command list](./commands/) is generated from CLI help built from the current source tree, including translated descriptions, options, and subcommands.
+The [complete command list](./commands/) provides command usage, options, and subcommands.
 
 | Task | Commands |
 | --- | --- |

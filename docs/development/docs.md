@@ -22,7 +22,7 @@ CLI 参考在构建前从源码生成，输出目录为 `reference/commands/` �
 
 中文页面位于根路径，英文镜像位于 `en/`；两种语言保持相同文件名。修改指南时同时更新两种语言。`npm run docs:check` 检查目录对齐与生成器测试；VitePress 构建检查站内链接。自动检查不能判断译文是否准确。
 
-不要手工编辑自动命令参考，应修改 CLI 中的 i18n 文案和帮助信息。现有 ADR、设计及实施记录归集于 `docs/development/archive/`，通过开发资料链接访问，不作为未翻译的英文用户手册展示。
+不要手工编辑自动命令参考，应修改 CLI 中的 i18n 文案和帮助信息。开发资料保留在仓库的 `docs/development/` 和 `docs/en/development/` 中，不参与用户文档站点构建或站内搜索。面向用户的操作说明应放入双语使用指南。
 
 ## GitHub Pages
 

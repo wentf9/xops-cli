@@ -1,68 +1,83 @@
 # 凭据存储
 
-::: info 实施中（未发布）
-当前工作分支已实现默认离线配置和 v1 自动升级；SSH 认证恢复已实现，TUI 认证与自动保存已接入，通用 v2 后端迁移已实现，最终六平台原生验收仍待完成。详见[实施进度](../development/credential-experience-plan)。
-:::
+XOps 将登录密码、私钥解锁口令和提权密码保存在凭据库中，配置文件只记录它们的引用。新安装默认使用内置离线加密库，无需先安装系统密钥环或外部工具。
 
-Schema v2 在配置中保存 `CredentialRef`，不保存明文密码。新安装默认使用 `file`（`encrypted-file`、`unlock: key-file`），策略为 `remember_prompted: always`。库目录 `credentials/` 与密钥 `credentials.key` 相对配置文件定位。单次 `--remember never` 或全局 `remember_prompted: never` 禁止保存及自动迁移；已有显式后端保持不变。
+本文描述当前源码中的功能；已安装版本的选项以 `xops credential --help` 为准。
 
-| 后端 | 适用环境 | 前置要求 |
+## 默认保存行为
+
+首次保存凭据时，XOps 在配置文件所在目录创建 `credentials/` 和密钥文件 `credentials.key`。默认配置下，它们位于 `~/.xops/`。密码只有在认证成功后才会自动保存，私钥口令还需要成功解锁对应私钥。
+
+`credential.remember_prompted` 控制提示输入的凭据是否保存：
+
+| 值 | 行为 |
+| --- | --- |
+| `always`（默认） | 验证成功后自动保存 |
+| `ask` | 验证成功后询问是否保存 |
+| `never` | 仅用于当前连接，不自动保存 |
+
+连接时可以临时覆盖，不修改全局设置：
+
+```bash
+xops ssh --remember never web-01
+xops tui --remember ask
+```
+
+`never` 同时禁止自动升级旧配置，但不阻止手动提交凭据表单或显式执行迁移。已有配置中明确选择的存储和保存策略会保留。
+
+## 选择存储
+
+| 后端类型 | 用途 | 前置要求 |
 | --- | --- | --- |
-| `none` | 临时交互会话 | 不持久化秘密 |
-| `system` | 桌面操作系统 | 系统密钥库可访问、已解锁 |
-| `pass` | Linux 运维环境 | pass、GPG 及已有密码库 |
-| `helper` | 外部凭据系统 | 实现 XOps helper 协议 |
-| `encrypted-file` | 默认离线库 | Linux、Windows、macOS 64 位平台，独立解锁和恢复流程 |
+| `encrypted-file` | 内置离线加密库，默认存储 | Linux、Windows 或 macOS 的 amd64/arm64 平台 |
+| `system` | 操作系统密钥库 | 系统密钥库可访问、已解锁 |
+| `pass` | 使用现有 pass 密码库 | pass、GPG 及已初始化的密码库 |
+| `helper` | 接入外部凭据服务 | 支持 XOps 凭据协议的外部程序 |
+| `none` | 临时交互会话 | 不持久化凭据 |
 
-配置示例见 [xops_config.example.yaml](https://github.com/wentf9/xops-cli/blob/master/xops_config.example.yaml)。先配置并检查后端，再设为默认：
+默认配置中的 `file` 是存储名称，`encrypted-file` 是后端类型：
+
+```yaml
+credential:
+  default_store: file
+  remember_prompted: always
+  stores:
+    file:
+      type: encrypted-file
+      path: credentials
+      unlock: key-file
+      key_file: credentials.key
+```
+
+相对路径均以配置文件所在目录为基准。其他后端配置见[配置示例](https://github.com/wentf9/xops-cli/blob/master/xops_config.example.yaml)。检查已配置的存储：
 
 ```bash
 xops credential store list
 xops credential doctor
 ```
 
-配置引用无法读取时，具备交互能力的 CLI 可以提示后临时输入；不静默切换后端，也不覆盖无法读取的原记录。MCP、批处理等无交互路径明确报错，不弹出解锁提示。
+`doctor` 检查非交互读取是否可用，不会初始化离线库或弹出解锁提示，也不证明存储目录具有写权限。更换后端时请按[迁移指南](./migration)操作；只修改 `default_store` 不会搬迁已有凭据。
 
-## Linux system
+### Linux 系统密钥库
 
-需要 `secret-tool`（Ubuntu/Debian 包名 `libsecret-tools`）、用户 D-Bus 会话以及 Secret Service。doctor 不自动启动服务，也不解锁密钥库。服务未启动时先启动桌面密钥环服务，再重试。
+`system` 需要 `secret-tool`（Ubuntu/Debian 包名为 `libsecret-tools`）、用户 D-Bus 会话和 Secret Service。先启动桌面密钥环服务并解锁，再运行 XOps。普通 `exec` 可以读取已解锁的凭据，不需要 `-x`；批处理和 MCP 不会弹出解锁窗口。
 
-## 离线库
+## 认证失败与临时输入
 
-key-file 离线库首次写入时自动初始化，读取、doctor、dry-run 不初始化；已有库丢失密钥或存在中断事务时必须恢复，不能生成替代密钥。主口令模式继续使用显式初始化和解锁。格式/接口 v1 已冻结，但冻结不等于正式版本已发布。请先阅读[现有离线库操作手册](https://github.com/wentf9/xops-cli/blob/master/docs/development/archive/offline-encrypted-credentials.md)，不要把库文件和恢复材料放在同一备份位置。
+在交互式连接中，服务器拒绝密码后可重新输入，总计最多尝试三次。私钥口令错误也最多尝试三次；私钥文件损坏时应修复或更换文件。
 
-doctor 是有限的非交互读取检查，不证明写权限；离线库的元数据检查也不代表已经解锁或完成完整性验证。
+凭据库锁定、不可用、损坏或原记录无法读取时，支持交互的连接可以提示您临时输入。XOps 不会用临时输入覆盖无法读取的记录，也不会自动替换损坏的库或丢失的密钥。MCP 和批处理等非交互操作会报错，需要先恢复凭据访问。
 
-### 自动或手动准备 key-file
+SSH 认证成功后，即使自动保存失败，本次连接仍可使用。请根据提示检查配置和目录权限；新输入的凭据可能需要在下次连接时重新输入。
 
-配置 `unlock: key-file` 和 `key_file` 后，运行 `xops credential store init <storeID>`：文件不存在时自动生成 32 字节随机密钥（权限 0600），已有合规文件直接复用。rewrap、clone、restore 等准备新包裹材料的操作也支持此行为。父目录需已存在；初始化及跨库操作的 key_file 必须放在目标库目录之外。
+## 提权密码
 
-可手动生成后再初始化，例如 Bash 中：
+SSH 登录与 sudo/su 提权分别验证。登录成功不代表提权成功；sudo 密码单独保存，不会覆盖登录密码。免密或已有有效授权缓存的 sudo 不要求输入密码。
 
-```bash
-(umask 077; set -C; openssl rand 32 > ~/.xops/offline.key)
-```
+提权密码验证成功后，即使命令本身失败，密码仍可按策略保存，命令仍返回失败状态。密码最多尝试三次；可能已经开始执行的命令不会为了重试认证而自动重跑。交互式提权需要远端具备 Bash 和 `stty`。
 
-已有文件仍须满足长度、权限、所有者和非链接要求，非法文件不会被自动修复或覆盖。读、解锁、doctor 和 resume 不生成替代密钥，丢失原密钥必须恢复备份。已生成密钥不会因后续操作失败而被删除，重试会复用；请独立备份。
+## 备份与恢复
 
-初始化前可使用 `xops credential store probe <storeID>` 检查目标文件系统的实际操作能力，详见[兼容性矩阵](../development/compatibility)。
+请同时备份配置文件、整个凭据库目录和对应解锁材料，并将密钥备份与库文件备份分开保管。仅备份配置文件无法恢复密码。读取、检查和解锁不会创建替代密钥；已有库的密钥丢失时，需要找回原密钥备份。
 
-## SSH 认证恢复（实施中，未发布）
-
-交互式 CLI 的 password/auto 认证在服务器拒绝密码后允许重输，总计最多三次认证尝试；每次重试直接请求新输入，不反复读取失效的旧密码。key/auto 认证只有口令错误才重试解锁，总计最多三次；私钥格式损坏不会反复提示。新密码只在 SSH 握手成功后交给保存流程，私钥口令还必须实际解锁对应私钥成功。
-
-已保存凭据缺失、锁定、不可用或访问被拒绝时，允许交互临时输入。快照不匹配、取消和超时不进入该恢复路径。没有交互能力的调用保持明确报错。
-
-SSH 握手成功后保存失败，会给出提示并保留连接；该连接的认证和提权写回令牌被禁用，避免用不确定的配置版本继续覆盖凭据。不会因此覆盖无法读取的原记录。网络目标发生不兼容变化时仍拒绝发布连接。
-
-SSH 握手和提权各自验证，不能将 SSH 握手成功视为提权成功。TUI 行为见 [TUI 指南](./tui)，剩余平台门禁见实施计划。
-
-## 提权凭据（未发布）
-
-普通命令、脚本和流式 IO 已区分 sudo/su 认证结果与用户命令退出码。密码验证成功后，即使命令失败仍可保存；命令错误继续返回调用者。交互密码最多尝试三次，已经可能开始的用户命令不会被自动重跑。
-
-密码与命令输入分阶段发送。缓存或免密 sudo 的交互调用不会索要密码，也不会把密码混入 stdin。错误密码不保存；sudo 密码独立保存，不覆盖登录记录，也不误用旧 SuPwd。
-
-独立交互式 PTY shell/exec 也支持有界认证重输。密码输入完成前不切换本地 raw 模式，远端恢复回显后才发送键盘输入；退出时先停止读取器与尺寸监听，再恢复终端模式。远端交接使用 Bash 和 stty。剩余验收门禁见[实施进度](../development/credential-experience-plan)。
-
-离线库内容损坏时，交互入口也允许临时输入；原始错误仍保留，损坏材料和密钥不会被自动替换。SSH、交互 exec 和单目标 SCP 若无法初始化保存服务（例如日志目录不可写），会提示并关闭当次全部自动写回，继续尝试连接；非交互入口仍报错。单次或全局 never 不初始化保存服务、不显示保存失败提示。
+初始化、主口令模式、密钥轮换和恢复步骤见[离线凭据库](./offline-store)。

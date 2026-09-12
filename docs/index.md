@@ -18,7 +18,7 @@ features:
   - title: SSH 与 SFTP
     details: 跳板机、交互终端、文件传输与 sudo/su 提权。
   - title: 凭据管理
-    details: 配置仅保存凭据引用，显式选择存储后端与迁移流程。
+    details: 默认离线加密保存凭据，支持系统密钥库和存储迁移。
   - title: 自动化
     details: 批量命令、声明式 Playbook 与 MCP 集成。
 ---

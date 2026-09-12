@@ -22,7 +22,7 @@ CLI reference pages are generated from source before building into `reference/co
 
 Chinese pages use the root path; English mirrors them under `en/` with identical filenames. Update both languages when editing guides. `npm run docs:check` checks path parity and generator tests; the VitePress build checks internal links. Automated checks do not assess translation accuracy.
 
-Do not edit generated command pages. Update CLI i18n strings and help instead. Existing ADRs, designs, and implementation records are grouped under `docs/development/archive/` and are linked as engineering records, not presented as untranslated English user guides.
+Do not edit generated command pages. Update CLI i18n strings and help instead. Engineering records remain in `docs/development/` and `docs/en/development/` for repository readers. These directories are excluded from the published user documentation and site search. User instructions belong in the bilingual guides.
 
 ## GitHub Pages
 

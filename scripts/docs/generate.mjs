@@ -26,8 +26,8 @@ try {
       const filename = ['xops', ...parts].join('-');
       index.push(`- [\`${name}\`](./${filename})`);
       const note = language === 'zh'
-        ? '由当前源码的 Cobra 帮助自动生成，请勿手动编辑。参数以安装版本的 `--help` 为准。'
-        : 'Generated from Cobra help in the current source tree. Do not edit. Use `--help` for your installed version.';
+        ? '以下列出命令用法和可用选项。已安装版本支持的参数以 `--help` 为准。'
+        : 'Command usage and available options are listed below. Check `--help` for options supported by your installed version.';
       writeFileSync(join(output, `${filename}.md`), `---\neditLink: false\nlastUpdated: false\n---\n\n# ${name}\n\n${note}\n\n~~~text\n${help}\n~~~\n`);
       for (const child of childCommands(help)) visit([...parts, child]);
     };

@@ -18,7 +18,7 @@ features:
   - title: SSH and SFTP
     details: Jump hosts, interactive terminals, file transfer and privilege escalation.
   - title: Credentials
-    details: Reference-based configuration with explicit storage and migration.
+    details: Offline encrypted credential storage by default, with system keyring and migration support.
   - title: Automation
     details: Batch commands, declarative playbooks and MCP integrations.
 ---

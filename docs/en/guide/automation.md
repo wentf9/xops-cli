@@ -26,9 +26,11 @@ xops play --help
 ## MCP
 
 ```bash
-xops mcp --help
+xops mcp serve
 ```
 
-MCP exposes host operations to AI clients with policy, approval, and audit controls. Enabling MCP does not mean all commands should be allowed. Non-interactive paths require credentials accessible without prompting. Repair an unavailable configured backend instead of bypassing the failure.
+MCP exposes host operations to AI clients. Set the client command to the full path of `xops` and its arguments to `["mcp", "serve"]`. Configure approval thresholds, blocked commands, protected paths, and audit logs in the configuration file's `guardrail` section.
 
-See the [MCP reference](../reference/commands/xops-mcp) for subcommands and options, and [Development](../development/) for architectural background.
+Prepare credentials and verified host keys before starting; MCP does not display terminal authentication or unlock prompts. If credentials are unavailable, check storage with `xops credential doctor` and restore access.
+
+See the [MCP reference](../reference/commands/xops-mcp) for subcommands and options.

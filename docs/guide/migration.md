@@ -1,8 +1,6 @@
 # 凭据迁移
 
-::: info 未发布
-默认离线库、自动升级和 v2 后端迁移已在工作分支实现；最终六平台原生验收仍待完成。详见[实施进度](../development/credential-experience-plan)。
-:::
+本指南描述当前源码中的迁移功能；已安装版本支持的选项以 `xops credential migrate --help` 为准。
 
 ## 自动升级旧配置
 
@@ -64,7 +62,7 @@ xops credential migrate --dry-run --to file
 xops credential migrate --to file
 ```
 
-原 key-file 存在时直接使用。只有确认是新库时才允许生成密钥；已有库丢失密钥或存在未完成的库事务时，应先按[离线库恢复手册](https://github.com/wentf9/xops-cli/blob/master/docs/development/archive/offline-encrypted-credentials.md)恢复。
+原 key-file 存在时直接使用。只有确认是新库时才允许生成密钥；已有库丢失密钥或存在未完成的库事务时，应先按[离线库恢复指南](./offline-store#备份与恢复)恢复。
 
 ## 中断、冲突与保留材料
 

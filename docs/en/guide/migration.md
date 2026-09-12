@@ -1,8 +1,6 @@
 # Credential migration
 
-::: info Unreleased
-Default offline storage, automatic upgrades, and v2 backend migration are implemented in the working branch. Final native validation on all six platforms remains pending. See [implementation progress](../development/credential-experience-plan).
-:::
+This guide describes the current source. Check `xops credential migrate --help` for your installed version.
 
 ## Automatic legacy upgrades
 
@@ -64,7 +62,7 @@ xops credential migrate --dry-run --to file
 xops credential migrate --to file
 ```
 
-An existing key-file is reused. Key generation is allowed only for a confirmed new vault. If an existing vault has lost its key or has an unfinished vault transaction, first follow the [offline recovery manual](https://github.com/wentf9/xops-cli/blob/master/docs/development/archive/offline-encrypted-credentials.md).
+An existing key-file is reused. Key generation is allowed only for a confirmed new vault. If an existing vault has lost its key or has an unfinished vault transaction, first follow the [offline recovery guide](./offline-store#backup-and-recovery).
 
 ## Interruptions, conflicts, and retained material
 

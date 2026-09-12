@@ -29,7 +29,7 @@ xops init --ssh-config ~/.ssh/config.work
 xops init --skip-ssh-import
 ```
 
-新配置使用 Schema v2，默认凭据存储为 `file`（encrypted-file + key-file），首次保存时准备离线库，不创建旧版 `secret.key`。完整体验仍在实施中，请阅读[凭据存储](./credentials)。
+新安装默认使用离线加密凭据库，首次保存验证成功的密码时自动创建库和密钥文件。保存策略和备份方法见[凭据存储](./credentials)。
 
 ## 第一次连接
 

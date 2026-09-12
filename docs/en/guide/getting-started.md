@@ -29,7 +29,7 @@ xops init --ssh-config ~/.ssh/config.work
 xops init --skip-ssh-import
 ```
 
-New configurations use Schema v2 with store `file` (encrypted-file + key-file), prepared on first save without creating a legacy `secret.key`. The complete experience is still being implemented; see [Credential storage](./credentials).
+New installations use an offline encrypted credential store. The store and key file are created when a verified password is first saved. See [credential storage](./credentials) for saving policies and backups.
 
 ## First connection
 

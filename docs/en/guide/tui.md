@@ -1,14 +1,10 @@
-# TUI credentials
-
-::: info Unreleased
-This page describes the working branch. Final native-platform acceptance is pending.
-:::
+# Terminal interface (TUI)
 
 ```bash
 xops tui
 ```
 
-New installations use the offline credential store with key-file. Enter opens SSH, `m` opens monitoring, and `l` opens log selection. The UI releases its terminal before host-fingerprint, password, or private-key passphrase prompts. Successful authentication records credential references according to the remember policy. Returning to the UI preserves filtering, checked items, and the selected node while refreshing updated references.
+New installations use the offline credential store with key-file. Enter opens SSH, `m` opens monitoring, and `l` opens log selection. Follow the prompts to verify the host fingerprint and enter a password or private-key passphrase. Verified credentials are saved according to your policy. Returning to the UI preserves your filter, checked items, and current selection.
 
 Automatic saving covers authentication prompts initiated and successfully verified by XOps. Background monitoring and log collection cannot open authentication/unlock prompts or automatically write credentials.
 
@@ -24,10 +20,19 @@ This also disables automatic migration for that invocation without changing glob
 
 A save failure retains the connection, and a persistence warning remains visible after the UI resumes. If automatic persistence cannot initialize at startup, connections remain available with an explicit warning that new credentials cannot be saved. Fix configuration or credential-directory permissions and restart the TUI. Passing read-only doctor checks does not establish write permissions.
 
-## Terminal and connection ownership
+## Common actions
 
-Connection, monitoring, and log entry points authenticate only after the UI releases its terminal. SSH sessions run in-process and share the form's configuration repository; they no longer depend on a child process waiting for Enter. Errors return to the TUI status area.
+| Key | Action |
+| --- | --- |
+| `Enter` | Open SSH for the current node |
+| `/` | Filter nodes |
+| `Space` | Select or deselect a node |
+| `n` / `e` | Add or edit a node |
+| `g` | Manage tags |
+| `m` / `l` | Open monitoring or log selection |
+| `Ctrl+L` | Lock offline stores opened by this process |
+| `Ctrl+U` | Unlock the default offline store |
 
-Each user-initiated connection action creates a fresh connector and closes the preceding one, preventing reuse of a previous target after TUI edits. Monitoring and logs may retain authenticated connections, with prompting and automatic writeback disabled after terminal handoff. Cancellation and shutdown wait for pending authentication and input work to stop.
+Authentication prompts appear before entering SSH, monitoring, or logs. Password input is hidden. Connection errors appear in the status area. Editing a target takes effect on the next connection.
 
-`Ctrl+L` locks the process's offline vault sessions. `Ctrl+U` releases the terminal before unlocking the default vault. Background operations remain non-interactive.
+Background monitoring and log collection do not prompt for passwords. If credentials become unavailable, return to the list, unlock the store or fix the credentials, then open the operation again.

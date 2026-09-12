@@ -1,7 +1,7 @@
 # 🚀 XOps CLI
 
 <div align="center">
-  <h3>让 AI 在安全边界内管理远程主机</h3>
+  <h3>在终端中管理远程主机</h3>
 
   <p>
     <img alt="Go Version" src="https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go" />
@@ -15,15 +15,19 @@
 
 ---
 
-**XOps CLI** 统一管理主机资产、SSH、批量执行与 Playbook，并通过内置的 **Model Context Protocol (MCP)** 安全护栏，让 AI Agent 在可审批、可审计的边界内操作远程主机。
+**XOps CLI** 在一个终端工具中提供主机管理、SSH 连接、文件传输、批量执行和 Playbook 任务编排，也可通过 **Model Context Protocol (MCP)** 接入 AI 客户端，配置操作审批和审计。
+
+[使用指南](https://wentf9.github.io/xops-cli/) · [命令参考](https://wentf9.github.io/xops-cli/reference/) · [故障排查](docs/troubleshooting/index.md)
+
+文档随当前源码更新，可能包含尚未发布的改动。已安装版本支持的选项以 `xops <command> --help` 为准。
 
 ### ✨ 核心特性
 
-- 🤖 **AI 原生 (MCP 服务端)**: 内置 Model Context Protocol 服务端，包含完整的安全护栏、风险评估和策略控制。长驻连接池通过有界心跳自动驱逐失效 SSH 连接，支持 AI 助手在连接生命周期约束下管理服务器。
-- 🛡️ **SSH 增强与 TUI**: 完全兼容 OpenSSH (支持跳板机 JumpHost、隧道、Agent 转发)。内置 **TUI (终端用户界面)**，并支持自动 Sudo 提权模式。
-- ⚡ **批量执行与传输**: 基于标签 (Tags) 对多台主机并行执行命令或本地脚本。内置 SCP/SFTP 支持，轻松实现文件批量分发。交互式 SFTP shell 具备连接保活 (KeepAlive) 与断线自动检测，网络中断后会唤醒交互提示、自动退出并返回非零状态。每个 shell 实例仅运行一次；关闭会取消并等待当前交互，再释放提示和 SFTP 资源。
+- 🤖 **AI 原生 (MCP 服务端)**: 内置 Model Context Protocol 服务端，支持命令风险评估、审批和审计。
+- 🛡️ **SSH 增强与 TUI**: 支持导入 OpenSSH 配置、跳板机、隧道和 SSH Agent 转发。内置 **TUI (终端用户界面)**，并支持自动 Sudo 提权模式。
+- ⚡ **批量执行与传输**: 基于标签 (Tags) 对多台主机并行执行命令或本地脚本。内置 SCP/SFTP 支持，轻松实现文件批量分发。交互式 SFTP shell 会在连接中断后提示并退出，返回非零状态。
 - 🔄 **声明式任务编排 (Playbook)**: 支持 YAML 格式的任务编排，组合 shell、script、copy、ensure (幂等性状态收敛) 和 template 步骤，支持并发控制与失败策略。
-- 🗂️ **资产与凭据管理**: 本地统一管理主机、凭据 (Identity) 和标签，新安装默认离线库和 Schema v2 凭据引用，首次保存自动准备 key-file；旧 AES 配置自动升级，也可显式迁移。支持通过 CSV 模板批量导入导出。
+- 🗂️ **资产与凭据管理**: 本地统一管理主机、凭据 (Identity) 和标签，支持将验证成功的密码保存到离线加密库或其他已配置的凭据存储。支持通过 CSV 模板批量导入导出。
 - 🌐 **网络与安全工具**: 集成 DNS 查询、Ping、Netcat (nc)、Base64/Hex 编码转换，以及统一的**防火墙管理器** (自动适配 firewalld, ufw, iptables, nftables)。
 - 🌍 **国际化 (i18n)**: 原生支持简体中文与英文，可根据环境自动切换。
 
@@ -60,18 +64,9 @@ xops init --skip-ssh-import
 
 该命令可重复执行，不会覆盖已有节点。初始化完成后可运行 `xops host list` 查看导入结果。
 
-新安装默认 `credential.default_store: file`、`remember_prompted: always`，使用内置离线库和 key-file，首次保存时初始化，不创建旧版 `secret.key`。
-其他后端由高级用户手动配置。单次 `--remember never` 或全局 `remember_prompted: never` 禁止保存及自动迁移。
-通用后端迁移已实现，见[迁移指南](docs/guide/migration.md)；最终平台验收尚未完成。
-doctor 仅验证非交互读取链路，不保证写权限；Linux system 使用 Secret Service
-直接读取已解锁凭据，不弹出解锁提示。示例见 [配置文件](xops_config.example.yaml)。
+新安装默认将验证成功的密码和私钥口令保存在内置离线加密库中，首次保存时自动创建凭据库和密钥文件。连接时加上 `--remember never` 可关闭本次自动保存；在配置中设置 `credential.remember_prompted: never` 可全局关闭。
 
-Linux、Windows 和 macOS 的 64 位平台还可显式配置[内置离线加密凭据库](docs/development/archive/offline-encrypted-credentials.md)。
-离线库不按文件系统类型限制访问，存储可靠性由用户保证；ext4、XFS、Btrfs 已完成兼容性验证。
-[格式与配置/CLI 接口 v1 已冻结](docs/development/archive/design/offline-encrypted-credential-store-v1-freeze.md)，发布状态为未发布。
-
-Schema v1 自默认切换版本起保留两个正式发布周期，普通命令向 stderr 输出弃用告警。
-符合条件的旧配置在正常使用时自动升级并保留旧材料；关闭自动保存时不自动升级。显式迁移及后端切换见[迁移指南](docs/guide/migration.md)。
+存储选择与备份方法见[凭据存储](docs/guide/credentials.md)，旧配置升级和更换存储位置见[凭据迁移](docs/guide/migration.md)。
 
 #### 2. 主机与资产管理
 
@@ -95,7 +90,7 @@ xops host tags
 # 启动交互式 TUI 界面管理
 xops tui
 
-# 通过别名快速连接 (自动保存历史凭证)
+# 通过别名快速连接
 xops ssh web-01
 
 # 显式指定新用户连接同一主机 (自动复用已有 Host，独立隔离凭证，自动继承 ProxyJump)
@@ -200,8 +195,8 @@ xops mcp serve
 **C. 安全护栏:**
 
 - **风险评估**: 自动分析 AI 请求的命令风险等级（如识别 `rm -rf` 等危险操作）。
-- **策略控制**: 支持配置只读模式或“先审批后执行”策略。
-- **全量审计**: 完整记录 AI 执行的每一条指令，确保过程透明可追溯。
+- **策略控制**: 支持配置审批阈值、禁止执行的命令和受保护路径。
+- **审计日志**: 记录 MCP 工具调用及处理结果，便于追踪操作。
 
 #### 7. AI Agent 技能 (Skill) 集成
 
@@ -235,42 +230,6 @@ Skill 包含主机状态查询和防火墙管理的调用说明。
 xops --lang en host list
 xops --lang zh host list
 ```
-
-## 🤝 参与贡献 / Contributing
-
-开发规范、编码约定和测试要求见 [AGENTS.md](./AGENTS.md)。
-
-本地质量检查命令：
-
-```bash
-make verify
-```
-
-如需复现 GitHub Actions 使用的依赖整洁性检查、竞态检测、随机测试顺序和覆盖率生成，请运行：
-
-```bash
-make ci
-```
-
-CI 会在提交到 `master` 或向 `master` 提交 Pull Request 时自动执行 Linux 全量构建、测试和 golangci-lint，同时执行 Windows 全量测试与 ConPTY 集成测试。
-
-### 错误与日志边界
-
-- `pkg` 包只创建、包装并返回错误，不直接决定面向用户的错误展示；需要调试日志的组件通过 `logger.DebugLogger` 注入，未注入时使用空实现。
-- `cmd` 层是错误展示边界：Cobra 命令统一返回错误，由根命令按日志级别输出一次并设置退出状态。
-- 交互与安全边界采用“pkg/ssh 定义端口、组合根注入策略、终端组件负责 I/O”的三层架构：
-  - `pkg/ssh` 定义机密提示（`SecretPrompter`）与主机密钥确认（`HostKeyConfirmer`）接口及语义请求结构，决定何时需要凭据，不生成展示文案、不直接访问 stdin/stdout，默认采用 fail-closed 策略返回 `ErrInteractionRequired`，防止非交互或自动化调用延迟崩溃；支持通过 `WithInteractionTimeout` 设置交互超时，生命周期取消与建连中断能即时终止交互。
-  - `internal/terminal` 封装跨平台可取消终端输入（Unix poll 管道、Windows CancelIoEx），确保在取消、报错与成功路径下可靠恢复终端回显模式，不泄漏文件描述符与 goroutine。
-  - CLI/TUI 组合根注入语义提示文案（通过 i18n 国际化翻译）、隐藏输入，并通过容量为 1 的可取消通道（Prompt Gate）确保并发多节点建连时密码与 HostKey 提示绝对串行化，错误与日志绝不包含凭据。
-  - MCP 服务端默认运行在非交互模式下，遇到未授权凭据或未知 HostKey 时返回清晰明确的 `ErrInteractionRequired` 错误提示，防止阻塞 Stdio 破坏 JSON-RPC 帧。
-- 长时间运行的 SSH、SFTP、转发和 Playbook 操作应使用调用方传入的 `context.Context`，确保取消信号能终止 I/O 和 goroutine。
-- 凭据迁移：先运行 `xops credential migrate --dry-run --to <store>`，再运行 `xops credential migrate --to <store>`。验证连接后显式执行 `xops credential finalize-migration` 删除旧配置备份和 key；中断后可重跑原命令。已迁移的 v2 不再依赖旧加密 key。
-- 配置写入在本机文件系统上使用跨进程锁和原子替换。完整节点编辑与删除使用读取时的精确版本；标签操作按意图合并。对同一节点、Host 或 Identity 的冲突会返回 `ErrConfigConflict`，不会静默覆盖。节点编辑修改凭据时会创建私有 Identity 覆盖；只有 `identity edit` 会修改共享 Identity。若替换已应用但目录同步状态不确定，命令返回非零错误且不会自动重试或回滚。
-- SSH 连接从单个原子配置快照取得节点、主机、凭据及其条件写入令牌；OpenSSH 虚拟节点和只读配置源不带写入令牌，自动发现的凭据或提权方式只在当前会话使用。Repository 的所有写入都要求调用方传入可取消的 `context.Context`；TUI 保存、标签和删除操作通过异步状态机执行，避免阻塞界面或并发提交。
-- 节点选择器精确匹配节点 ID；地址或别名匹配多个节点时命令会返回歧义错误，不会任意选取目标。
-- SSH 本地、远端和 SOCKS5 转发返回可等待的生命周期对象；单个连接（包括 SOCKS5 握手和目标拨号）失败时仅告警并释放该连接，监听服务会继续运行；监听器或 SSH transport 失败才会结束转发。OpenSSH `ProxyJump` 支持逗号分隔的多跳以及 `[user@]host[:port]`。跳板解析策略：优先匹配已有 Node、Alias 或 `~/.ssh/config` 中的 Host；直连跳板明确要求使用 Node/Alias、FQDN（含点域名如 `bastion.example.com`）、IP 地址或带端口的 `host:port`（如 `jumphost:22`），未加端口的单标签主机名必须预先配置为 Node/Alias，防止别名拼写错误产生静默误连。
-- MCP 服务必须由组合根通过 `mcpserver.WithConfigProvider` 注入已加载的配置；配置和 guardrail 校验失败会在创建全局运行状态前直接返回。
-- 扩展 Expect 规则时，保持兼容的 `ssh.NewExpect(writer, rules...)`；需要注入日志等选项时使用 `ssh.NewExpectWithOptions(writer, rules, opts...)`。
 
 ## 📄 开源协议 / License
 

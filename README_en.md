@@ -1,7 +1,7 @@
 # 🚀 XOps CLI
 
 <div align="center">
-  <h3>Remote host management with explicit safety boundaries</h3>
+  <h3>Manage remote hosts from your terminal</h3>
 
   <p>
     <img alt="Go Version" src="https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go" />
@@ -15,66 +15,21 @@
 
 ---
 
-**XOps CLI** combines host inventory, SSH, batch execution, and Playbooks with built-in **Model Context Protocol (MCP)** guardrails, allowing AI Agents to operate remote hosts within approval and audit boundaries.
+**XOps CLI** combines host management, SSH connections, file transfers, batch execution, and Playbooks in one terminal tool. Its **Model Context Protocol (MCP)** server also connects to AI clients with configurable approvals and auditing.
+
+[User guide](https://wentf9.github.io/xops-cli/en/) · [Command reference](https://wentf9.github.io/xops-cli/en/reference/) · [Troubleshooting](docs/en/troubleshooting/index.md)
+
+Documentation follows the current source and may include changes not yet released. Check `xops <command> --help` for options supported by your installed version.
 
 ### ✨ Key Features
 
-- 🤖 **AI-Native (MCP Server)**: Built-in Model Context Protocol server with security guardrails, risk assessment, and policy controls. Bounded heartbeats automatically evict dead SSH connections from the long-lived pool, keeping AI-driven server management safe and reliable.
-- 🛡️ **Advanced SSH & TUI**: Fully OpenSSH-compatible (JumpHosts, Tunnels, Agent Forwarding). Includes a **Terminal UI (TUI)** for interactive management and an automated `sudo` mode.
-- ⚡ **Batch Execution & Transfer**: Run commands or local scripts in parallel across multiple servers using tags. Effortless file distribution with built-in SCP/SFTP. The interactive SFTP shell detects disconnects, wakes the active prompt, exits automatically, and returns a non-zero status when the network drops. Each shell instance runs once; closing a shell cancels and waits for the active interaction before releasing prompt and SFTP resources.
+- 🤖 **AI-Native (MCP Server)**: Built-in Model Context Protocol server with security guardrails, risk assessment, and policy controls.
+- 🛡️ **Advanced SSH & TUI**: Supports OpenSSH configuration imports, jump hosts, tunnels, and agent forwarding. Includes a **Terminal UI (TUI)** for interactive management and an automated `sudo` mode.
+- ⚡ **Batch Execution & Transfer**: Run commands or local scripts in parallel across multiple servers using tags. Effortless file distribution with built-in SCP/SFTP. The interactive SFTP shell reports connection loss and exits with a non-zero status.
 - 🔄 **Declarative Orchestration (Playbook)**: YAML-based task orchestration combining shell, script, copy, ensure (idempotent state convergence), and template steps, with concurrency control and error handling strategies.
-- 🗂️ **Inventory and Credentials**: Manage hosts, credentials (Identities), and tags. New installations use offline storage and Schema v2 references, preparing a key-file on first save; legacy AES configurations support automatic upgrades and explicit migration. Supports bulk import/export via CSV.
-- 🌐 **Network & Sec Tools**: Integrated DNS lookup, Ping, Netcat (nc), Base64/Hex encoding, and a unified **Firewall Manager** (supports firewalld, ufw, iptables, nftables).
-- 🌍 **Built-in i18n**: Native support for English and Simplified Chinese.
+- 🗂️ **Inventory and Credentials**: Manage hosts, credentials (Identities), and tags. New installations save verified passwords and private-key passphrases in the built-in offline encrypted store. The store and its key file are created on first save. Use `--remember never` to disable automatic saving for a connection, or set `credential.remember_prompted: never` in your configuration to disable it globally.
 
-### 📦 Installation
-
-Install a pre-built binary on Linux or macOS:
-
-```bash
-curl -sSL https://raw.githubusercontent.com/wentf9/xops-cli/master/install.sh | bash
-```
-
-Building from source requires Go 1.26 or higher:
-
-```bash
-git clone https://github.com/wentf9/xops-cli.git
-cd xops-cli
-make build
-# or run manually: go build -o xops ./cmd/cli/main.go
-```
-
-### 🚀 Quick Start
-
-#### 1. Initialize
-
-```bash
-# Create Schema v2 ~/.xops/xops_config.yaml without an encryption key.
-# Concrete Hosts from ~/.ssh/config are imported without connecting to them.
-xops init
-
-# Use another OpenSSH config, or skip the import entirely.
-xops init --ssh-config ~/.ssh/config.work
-xops init --skip-ssh-import
-```
-
-The command is idempotent and never overwrites existing nodes. Run `xops host list` to review the result.
-
-New installations use `credential.default_store: file` and `remember_prompted: always`,
-with the built-in offline store and key-file initialized on first save, without a legacy `secret.key`.
-Other backends require manual selection. `--remember never` or global `remember_prompted: never` disables saving and automatic migration.
-General backend migration is implemented; see the [migration guide](docs/en/guide/migration.md). Final platform validation remains pending.
-Doctor checks non-interactive reads, not write permissions;
-Linux system reads unlocked credentials directly through Secret Service without unlock prompts.
-See the [example configuration](xops_config.example.yaml).
-
-64-bit Linux, Windows, and macOS also provide an explicit [offline encrypted credential store](docs/development/archive/offline-encrypted-credentials.md).
-The offline store does not restrict access by filesystem type; users are responsible for storage reliability.
-Compatibility testing covers ext4, XFS, and Btrfs.
-The [v1 format and configuration/CLI contract are frozen](docs/development/archive/design/offline-encrypted-credential-store-v1-freeze.md); the release status is unpublished.
-
-Schema v1 remains supported for two official release cycles starting with the default
-switch release, with deprecation warnings on stderr. Eligible legacy configurations upgrade automatically during normal use and retain old material. Disabling automatic saving also disables automatic upgrades. See the [migration guide](docs/en/guide/migration.md) for explicit migration and backend switching.
+See [credential storage](docs/en/guide/credentials.md) for storage options and backups, and [credential migration](docs/en/guide/migration.md) to upgrade an older configuration or switch stores.
 
 #### 2. Inventory & Tags
 
@@ -98,7 +53,7 @@ xops host tags
 # Launch interactive TUI
 xops tui
 
-# Connect by alias (auto-saves connection details)
+# Connect by alias
 xops ssh web-01
 
 # Connect with explicit user (reuses existing Host, strictly isolates Identity, inherits ProxyJump)
@@ -205,7 +160,7 @@ Example `claude_desktop_config.json` configuration:
 **C. Security & Guardrails:**
 
 - **Risk Analysis**: Automatically detects high-risk commands (e.g., `rm -rf /`).
-- **Policy Control**: Supports "Audit-only" or "Manual Approval" modes.
+- **Policy Control**: Configurable approval thresholds, blocked commands, and protected paths.
 - **Audit Logs**: Records command execution for auditing.
 
 #### 7. AI Agent Skill Integration
@@ -240,42 +195,6 @@ The `--lang` flag selects the language; the system locale supplies the default.
 xops --lang en host list
 xops --lang zh host list
 ```
-
-## 🤝 Contributing
-
-Development standards, coding conventions, and testing requirements are documented in [AGENTS.md](./AGENTS.md).
-
-Run the complete local quality gate before submitting changes:
-
-```bash
-make verify
-```
-
-To reproduce the dependency tidiness check, race detection, randomized test order, and coverage generation used by GitHub Actions, run:
-
-```bash
-make ci
-```
-
-CI runs the full build, test suite, and golangci-lint on pushes to `master` and pull requests targeting `master`.
-
-### Error and logging boundaries
-
-- Packages under `pkg` create, wrap, and return errors without deciding how user-facing failures are displayed. Components that need debug logs receive a `logger.DebugLogger`; the default is a no-op implementation.
-- The `cmd` layer is the error presentation boundary: Cobra commands return errors, and the root command logs each failure once and sets the exit status.
-- Interactive and security boundaries follow a three-tier architecture: "pkg/ssh defines ports, composition root injects policy, terminal component owns I/O":
-  - `pkg/ssh` defines `SecretPrompter` and `HostKeyConfirmer` interfaces with semantic request objects, determining when credentials are required without generating user-facing copy or touching stdin/stdout directly. The connector defaults to a fail-closed policy returning `ErrInteractionRequired`, preventing non-interactive or automated calls from crashing unexpectedly. The interface supports configurable timeouts via `WithInteractionTimeout` and immediately aborts interaction when connection/lifecycle contexts are canceled.
-  - `internal/terminal` encapsulates cross-platform cancellable terminal I/O (Unix poll/pipe, Windows CancelIoEx), guaranteeing raw mode restoration and avoiding descriptor or goroutine leaks.
-  - The CLI/TUI composition root injects localized prompts (via i18n), performs masked secret inputs, and serializes concurrent multi-node credential prompts with a cancellable Prompt Gate channel. Neither errors nor logs contain credentials.
-  - The MCP server operates in non-interactive mode by default, translating `ErrInteractionRequired` into clean MCP error responses to avoid blocking stdio and breaking JSON-RPC framing.
-- Long-running SSH, SFTP, forwarding, and Playbook operations use the caller-provided `context.Context` so cancellation can stop I/O and goroutines.
-- Credential migration: preview with `xops credential migrate --dry-run --to <store>`, then run `xops credential migrate --to <store>`. After validating connections, explicitly run `xops credential finalize-migration` to remove the legacy backup and key. Interrupted operations can be rerun; migrated v2 configurations no longer depend on the legacy key.
-- Configuration writes use a cross-process lock and atomic replacement on the local filesystem. Full node edits and deletions use the exact version that was read, while tag operations merge intent. Conflicts on the same node, Host, or Identity return `ErrConfigConflict` instead of silently overwriting data. A node edit that changes credentials creates a private Identity override; only `identity edit` changes a shared Identity. If a replacement was applied but directory-sync durability remains uncertain, the command returns a nonzero error without automatic retry or rollback.
-- SSH connections receive node, host, credentials, and conditional-write tokens from one atomic configuration snapshot. OpenSSH virtual nodes and read-only configuration sources have no write token, so discovered credentials or privilege mode remain session-local. Every Repository write requires caller-provided cancellable `context.Context`; TUI save, tag, and delete operations run through an asynchronous state machine to keep rendering responsive and prevent overlapping commits.
-- A node selector matches an exact node ID first. If an address or alias matches multiple nodes, the command returns an ambiguity error instead of choosing a target arbitrarily.
-- SSH local, remote, and SOCKS5 forwarding return waitable lifecycle objects. A failure in one connection, including a SOCKS5 handshake or target dial, only logs a warning and releases that connection; the listener continues running. Only listener or SSH transport failures end forwarding. OpenSSH `ProxyJump` supports comma-separated hops and `[user@]host[:port]` entries. Jump host resolution strategy: prioritizes saved Node, Alias, or Host in `~/.ssh/config`; direct jump targets explicitly require Node/Alias, FQDN (contains a dot, e.g. `bastion.example.com`), IP address, or `host:port` (e.g. `jumphost:22`). Single-label hostnames without port must be configured as a Node/Alias first to prevent silent misconnections on alias typos.
-- The composition root must inject fully loaded configuration into the MCP server with `mcpserver.WithConfigProvider`; configuration and guardrail validation failures are returned before global runtime state is initialized.
-- Use the compatible `ssh.NewExpect(writer, rules...)` API for ordinary Expect rules. Use `ssh.NewExpectWithOptions(writer, rules, opts...)` when injecting a logger or other options.
 
 ## 📄 License
 

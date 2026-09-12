@@ -26,9 +26,11 @@ xops play --help
 ## MCP
 
 ```bash
-xops mcp --help
+xops mcp serve
 ```
 
-MCP 将主机操作提供给 AI 客户端，配合策略、审批与审计控制使用。不要因为启用了 MCP 就默认允许全部命令。无交互路径需要可非交互访问的凭据；配置的引用不可用时应修复凭据后端，而非绕过失败。
+MCP 将主机操作提供给 AI 客户端。将客户端的启动命令设为 `xops` 的完整路径，参数设为 `["mcp", "serve"]`。在配置文件的 `guardrail` 中可设置审批阈值、禁止执行的命令、受保护路径和审计日志。
 
-子命令与配置参数见 [MCP 命令参考](../reference/commands/xops-mcp)，开发背景见[开发资料](../development/)。
+运行前准备好凭据和已确认的主机密钥；MCP 不会显示终端认证或解锁提示。凭据不可用时，先用 `xops credential doctor` 检查存储，并恢复访问。
+
+子命令与配置参数见 [MCP 命令参考](../reference/commands/xops-mcp)。

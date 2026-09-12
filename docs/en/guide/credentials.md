@@ -1,68 +1,83 @@
 # Credential storage
 
-::: info Implementation in progress (unreleased)
-Default offline configuration and automatic v1 upgrades are implemented in the working branch. SSH authentication recovery is now implemented; TUI authentication and automatic saving are integrated; general v2 backend migration is implemented; final native validation remains pending. See [implementation progress](../development/credential-experience-plan).
-:::
+XOps keeps login passwords, private-key passphrases, and privilege passwords in credential stores. Configuration files contain references to those credentials. New installations use the built-in offline encrypted store without requiring a system keyring or external tools.
 
-Schema v2 stores `CredentialRef` references in configuration instead of plaintext passwords. New installations use store `file` (`encrypted-file`, `unlock: key-file`) with `remember_prompted: always`. Paths `credentials/` and `credentials.key` are relative to the configuration file. Use `--remember never` for one invocation or `remember_prompted: never` globally to disable saving and automatic upgrades. Existing explicit backend choices remain unchanged.
+This page describes the current source. Check `xops credential --help` for options available in your installed version.
 
-| Backend | Intended environment | Requirements |
+## Default saving behavior
+
+On first save, XOps creates `credentials/` and the key file `credentials.key` beside the configuration file, under `~/.xops/` with the default configuration. Passwords are saved automatically only after successful authentication. Private-key passphrases must also successfully unlock their key.
+
+`credential.remember_prompted` controls whether prompted credentials are saved:
+
+| Value | Behavior |
+| --- | --- |
+| `always` (default) | Save after successful authentication |
+| `ask` | Ask whether to save after authentication |
+| `never` | Use for the current connection without automatic saving |
+
+Override the policy for a single invocation without changing your configuration:
+
+```bash
+xops ssh --remember never web-01
+xops tui --remember ask
+```
+
+`never` also disables automatic legacy upgrades. It does not block explicit credential-form submissions or migration commands. Explicit storage and saving policies in existing configurations are preserved.
+
+## Choose a store
+
+| Backend type | Purpose | Requirements |
 | --- | --- | --- |
-| `none` | Temporary interactive sessions | No secret persistence |
-| `system` | Desktop operating systems | Accessible, unlocked OS credential store |
-| `pass` | Linux administration | pass, GPG, and an initialized password store |
-| `helper` | External credential systems | An implementation of the XOps helper protocol |
-| `encrypted-file` | Default offline storage | 64-bit Linux, Windows, and macOS with separate unlock and recovery procedures |
+| `encrypted-file` | Built-in offline encryption, the default | Linux, Windows, or macOS on amd64/arm64 |
+| `system` | Operating system credential store | An accessible, unlocked system store |
+| `pass` | An existing pass password store | pass, GPG, and an initialized store |
+| `helper` | An external credential service | An external program supporting the XOps credential protocol |
+| `none` | Temporary interactive sessions | No credential persistence |
 
-See [xops_config.example.yaml](https://github.com/wentf9/xops-cli/blob/master/xops_config.example.yaml). Configure and check a backend before making it the default:
+In the default configuration, `file` is the store name and `encrypted-file` is its backend type:
+
+```yaml
+credential:
+  default_store: file
+  remember_prompted: always
+  stores:
+    file:
+      type: encrypted-file
+      path: credentials
+      unlock: key-file
+      key_file: credentials.key
+```
+
+Relative paths resolve beside the configuration file. See the [configuration example](https://github.com/wentf9/xops-cli/blob/master/xops_config.example.yaml) for other backends. Check configured stores with:
 
 ```bash
 xops credential store list
 xops credential doctor
 ```
 
-Interactive CLI paths may report an unreadable reference and request temporary input without switching backends or overwriting the unreadable record. Non-interactive paths such as MCP and batch execution return errors without unlock prompts.
+`doctor` checks non-interactive reads. It does not initialize offline stores, prompt for unlocking, or establish write permissions. Follow the [migration guide](./migration) to switch stores; changing `default_store` alone does not move existing credentials.
 
-## Linux system backend
+### Linux system keyring
 
-Requires `secret-tool` (`libsecret-tools` on Ubuntu/Debian), a user D-Bus session, and Secret Service. Doctor does not auto-start the service or unlock the store. Start your desktop keyring service before retrying if it is inactive.
+The `system` backend requires `secret-tool` (`libsecret-tools` on Ubuntu/Debian), a user D-Bus session, and Secret Service. Start and unlock the desktop keyring before running XOps. Ordinary `exec` can read unlocked credentials without `-x`. Batch execution and MCP never open unlock dialogs.
 
-## Offline storage
+## Authentication failures and temporary input
 
-Key-file stores initialize on first write. Reads, doctor, and dry-run do not initialize. Lost keys and interrupted transactions require recovery, never replacement keys. Prompt-based stores retain explicit initialization and unlocking. Its v1 format/API is frozen, which does not mean a stable release has been published. Read the [existing offline store manual (Chinese)](https://github.com/wentf9/xops-cli/blob/master/docs/development/archive/offline-encrypted-credentials.md) first. Keep recovery material separate from store-file backups.
+Interactive connections allow new input after a rejected password, with at most three attempts. Incorrect private-key passphrases also allow up to three attempts. Repair or replace a damaged private-key file before retrying.
 
-Doctor performs bounded non-interactive read checks, not write authorization checks. Offline metadata inspection does not imply an unlocked or fully verified store.
+If a credential store is locked, unavailable, damaged, or cannot read a record, an interactive connection can request temporary input. XOps does not overwrite unreadable records with that input or automatically replace damaged stores or lost keys. Non-interactive operations, including MCP and batch execution, return an error until credential access is restored.
 
-### Automatic or manual key files
+If automatic saving fails after SSH authentication, the connection remains usable. Check the reported configuration or directory-permission problem. You may need to enter the credentials again next time.
 
-With `unlock: key-file` and `key_file` configured, run `xops credential store init <storeID>`. A missing file is generated as 32 random bytes with mode 0600; an existing valid file is reused. Operations preparing new wrapping material, including rewrap, clone, and restore, support the same behavior. The parent directory must exist. Initialization and cross-vault operations require the key file outside the destination vault directory.
+## Privilege passwords
 
-You can also create the file manually before initialization. In Bash:
+SSH login and sudo/su authentication are verified separately. Successful login does not establish successful escalation. Sudo passwords are stored separately from login passwords. Passwordless sudo and sudo with a valid authorization cache do not request a password.
 
-```bash
-(umask 077; set -C; openssl rand 32 > ~/.xops/offline.key)
-```
+A verified privilege password can be saved according to policy even if the command itself fails; the command still reports failure. Password retries are limited to three attempts. Commands that may already have started are not automatically repeated to retry authentication. Interactive escalation requires Bash and `stty` on the remote host.
 
-Existing files must pass length, permission, ownership, and non-link checks. Invalid files are never repaired or overwritten automatically. Reads, unlock, doctor, and resume do not generate replacement keys: restore the original from backup if lost. A generated key survives later operation failures and is reused on retry. Back it up separately.
+## Backup and recovery
 
-Run `xops credential store probe <storeID>` before initialization to check filesystem operations. See the [compatibility matrix](../development/compatibility).
+Back up the configuration file, the entire credential-store directory, and the corresponding unlock material. Keep key backups separate from store backups. Configuration alone cannot restore passwords. Reading, inspecting, and unlocking never create replacement keys; a lost key for an existing store requires the original key backup.
 
-## SSH authentication recovery (in progress, unreleased)
-
-Interactive CLI password/auto authentication permits new input after server rejection, with at most three authentication attempts. Retries prompt directly instead of repeatedly reading an invalid stored password. Key/auto decryption retries only incorrect passphrases, at most three times; corrupt key formats do not repeatedly prompt. Passwords reach persistence only after a successful SSH handshake; passphrases must also have actually decrypted the corresponding key.
-
-Missing, locked, unavailable, or inaccessible stored credentials allow temporary interactive input. Snapshot mismatches, cancellation, and timeouts do not enter this recovery path. Calls without interaction capability return errors.
-
-If saving fails after SSH authentication, a notice is displayed and the connection remains usable. Authentication and privilege writeback tokens are disabled for that connection so uncertain configuration versions cannot authorize later overwrites. Unreadable existing records are not overwritten. Incompatible network target changes still prevent connection publication.
-
-SSH and privilege authentication are verified independently. Successful SSH authentication does not prove successful privilege escalation; TUI behavior is described in the [TUI guide](./tui), with remaining platform gates in the implementation plan.
-
-## Privilege credentials (unreleased)
-
-Commands, scripts, and streaming IO distinguish successful sudo/su authentication from the user command's exit code. A verified password may be saved even when the command fails; the command's error still returns to the caller. Interactive password retries are limited to three attempts, and a command that might have started is not automatically repeated.
-
-Passwords and command input are sent in separate phases. Passwordless/cached interactive sudo does not request or inject a password into stdin. Incorrect passwords are not saved. Sudo updates do not overwrite login records or reuse legacy SuPwd.
-
-Interactive PTY shell/exec use the same bounded authentication retries. Password entry happens before local raw mode; keyboard input is forwarded only after remote echo is restored. The stdin reader and resize worker stop before terminal mode restoration. The remote handoff uses Bash and stty. See [implementation progress](../development/credential-experience-plan) for the remaining acceptance gates.
-
-Corrupt offline data also permits temporary interactive input. The original error is retained, and damaged material and keys are not automatically replaced. If SSH, interactive exec, or single-target SCP cannot initialize persistence (for example, an unwritable journal directory), they report it, disable all automatic recording for that connection, and continue connecting. Non-interactive initialization still fails closed. A per-command or global never policy neither initializes persistence nor displays a saving-failure notice.
+See [offline credential storage](./offline-store) for initialization, master passwords, key rotation, and recovery.
