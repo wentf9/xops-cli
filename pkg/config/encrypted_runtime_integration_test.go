@@ -19,7 +19,7 @@ import (
 )
 
 func TestEncryptedRuntimeRegistry(t *testing.T) {
-	dir := t.TempDir()
+	dir := physicalCredentialTestDir(t)
 	key := filepath.Join(dir, "key")
 	if err := os.WriteFile(key, bytes.Repeat([]byte{42}, 32), 0600); err != nil {
 		t.Fatal(err)
@@ -108,7 +108,7 @@ func (fileTestDeriver) Derive(context.Context, kdfhelper.Request) ([]byte, error
 }
 
 func TestEncryptedRuntimeNonInteractivePromptCache(t *testing.T) {
-	dir := t.TempDir()
+	dir := physicalCredentialTestDir(t)
 	prompt := &fileTestPrompt{}
 	owner := &EncryptedRuntime{vaults: credentialfile.NewRuntime(t.Context(), prompt, fileTestDeriver{}), stores: make(map[encryptedBackendKey]*encryptedBackend)}
 	t.Cleanup(func() {
@@ -297,7 +297,7 @@ func TestEncryptedFinalizeProtectsChangedKeyConfiguration(t *testing.T) {
 }
 
 func TestEncryptedRuntimeInitializesOnlyOnWrite(t *testing.T) {
-	dir := t.TempDir()
+	dir := physicalCredentialTestDir(t)
 	owner := NewEncryptedRuntime(t.Context(), filepath.Join(dir, "config.yaml"), nil)
 	t.Cleanup(func() {
 		if err := owner.Close(); err != nil {
@@ -347,7 +347,7 @@ func TestEncryptedRuntimeInitializesOnlyOnWrite(t *testing.T) {
 }
 
 func TestEncryptedRuntimeConcurrentFirstWrite(t *testing.T) {
-	dir := t.TempDir()
+	dir := physicalCredentialTestDir(t)
 	var wg sync.WaitGroup
 	for range 2 {
 		wg.Go(func() {
@@ -378,7 +378,7 @@ func TestEncryptedRuntimeConcurrentFirstWrite(t *testing.T) {
 }
 
 func TestEncryptedRuntimeReadOnlyDoesNotInitialize(t *testing.T) {
-	dir := t.TempDir()
+	dir := physicalCredentialTestDir(t)
 	owner := NewEncryptedRuntime(t.Context(), filepath.Join(dir, "config.yaml"), nil)
 	t.Cleanup(func() {
 		if err := owner.Close(); err != nil {

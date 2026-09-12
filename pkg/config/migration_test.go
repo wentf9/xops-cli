@@ -73,7 +73,7 @@ func (s *migrationTestStore) Delete(context.Context, credential.Ref) error {
 
 func migrationFixture(t *testing.T) (*CredentialMigrator, *migrationTestStore, []byte) {
 	t.Helper()
-	dir := t.TempDir()
+	dir := physicalCredentialTestDir(t)
 	keyPath := filepath.Join(dir, "id_ed25519")
 	_, private, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -535,4 +535,15 @@ func TestMigrationPreservesV1ReferencesAndCompletesFingerprint(t *testing.T) {
 	if _, err := m.Finalize(t.Context()); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// macOS exposes its temporary directory through /var -> /private/var.
+// Vault tests must use the physical path without weakening symlink rejection.
+func physicalCredentialTestDir(t *testing.T) string {
+	t.Helper()
+	path, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return path
 }

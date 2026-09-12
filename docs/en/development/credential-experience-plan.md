@@ -104,3 +104,5 @@ SSH, interactive exec, and single-target SCP now permit session-only use when pe
 The six-platform workflow includes configuration initialization/migration, real corrupt-vault recovery, and Windows ConPTY checks. The native system-backend round-trip requires XOPS_TEST_NATIVE_MIGRATION=1: CI provisions an isolated Linux Secret Service and temporary macOS Keychain, and uses Windows Credential Manager. Random test references exercise three credential purposes, source retention and key-file reuse; system test credentials are cleaned afterward. A skip without a provisioned service is not native acceptance evidence.
 
 These gates do not replace complete Windows/macOS TUI and privilege-terminal experience acceptance or prove physical power-loss recovery. Release still requires checking results for the final candidate commit.
+
+Native credential fixtures use physical temporary paths so the macOS /var symlink does not trigger path rejection. Production vaults still reject symlink directories. Keychain cleanup runs only after successful test-keychain provisioning.

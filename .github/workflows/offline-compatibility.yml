@@ -37,12 +37,12 @@ jobs:
       max-parallel: 2
       matrix:
         include:
+          - { os: macos-15, arch: arm64, race: '-race' }
+          - { os: macos-15-intel, arch: amd64, race: '-race' }
           - { os: ubuntu-24.04, arch: amd64, race: '-race' }
           - { os: ubuntu-24.04-arm, arch: arm64, race: '-race' }
           - { os: windows-latest, arch: amd64, race: '-race' }
           - { os: windows-11-arm, arch: arm64, race: '' }
-          - { os: macos-15, arch: arm64, race: '-race' }
-          - { os: macos-15-intel, arch: amd64, race: '-race' }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     env:
@@ -96,6 +96,7 @@ jobs:
             go test ${{ env.RACE_FLAGS }} -count=1 -tags=integration ./pkg/config -run "^TestBackendMigrationNativeSystemRoundTrip$"
           '
       - name: Provision macOS test Keychain
+        id: native_keychain
         if: runner.os == 'macOS'
         run: |
           security create-keychain -p "" "$RUNNER_TEMP/xops-native.keychain-db"
@@ -109,5 +110,5 @@ jobs:
           XOPS_TEST_NATIVE_MIGRATION: '1'
         run: go test ${{ env.RACE_FLAGS }} -count=1 -tags=integration ./pkg/config -run '^TestBackendMigrationNativeSystemRoundTrip$'
       - name: Remove macOS test Keychain
-        if: always() && runner.os == 'macOS'
+        if: always() && runner.os == 'macOS' && steps.native_keychain.outcome == 'success'
         run: security delete-keychain "$RUNNER_TEMP/xops-native.keychain-db"

@@ -22,7 +22,11 @@ import (
 // generic unavailable error. Corruption must allow only temporary input.
 func TestRecoveryCorruptOfflineVault(t *testing.T) {
 	setTestHome(t)
-	dir := t.TempDir()
+	// Use a physical path: macOS /var is a symlink, which vaults reject.
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	owner := config.NewEncryptedRuntime(t.Context(), filepath.Join(dir, "config.yaml"), nil)
 	defer func() {
 		if err := owner.Close(); err != nil {

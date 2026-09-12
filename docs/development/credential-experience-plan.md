@@ -104,3 +104,5 @@ CLI 自动保存服务初始化失败时，SSH、交互 exec、单目标 SCP 与
 六平台工作流增加配置层初始化/迁移、真实损坏库恢复和 Windows ConPTY 检查。新增原生系统后端往返测试需显式设置 XOPS_TEST_NATIVE_MIGRATION=1：CI 为 Linux 启动隔离 Secret Service，为 macOS 创建临时 Keychain，Windows 使用 Credential Manager。测试使用随机测试引用，读回三类凭据、保留源引用并验证 key-file 复用，结束后清理测试系统凭据。未配置服务时的 skip 不算原生验收通过。
 
 这些门禁不替代完整的 Windows/macOS TUI 与提权终端体验验收，也不证明物理断电恢复。发布前仍须核对最终提交的运行结果。
+
+原生凭据测试使用临时目录的真实路径，避免 macOS 的 /var 符号链接误触发路径拒绝；生产环境仍严格拒绝符号链接目录。Keychain 清理仅在测试钥匙串创建成功后执行。
