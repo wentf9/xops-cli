@@ -115,10 +115,10 @@ func TestDispatchCommand(t *testing.T) {
 		{"lpwd command", "lpwd", nil, false, false, tempDir},
 		{"help command", "help", nil, false, false, "可用命令:"},
 		{"lmkdir command", "lmkdir", []string{"test_dir"}, false, false, ""},
-		{"lcp command", "lcp", []string{"test_file", "test_file_cp"}, false, false, ""},
-		{"lmv command", "lmv", []string{"test_file_cp", "test_file_mv"}, false, false, ""},
+		{"lcp command", "lcp", []string{"test_file", "test_file_cp"}, false, true, ""},
+		{"lmv command", "lmv", []string{"test_file_cp", "test_file_mv"}, false, true, ""},
 		{"lrm command", "lrm", []string{"-f", "test_dir"}, false, false, ""},
-		{"unknown command", "unknown_cmd", nil, false, false, "未知命令: unknown_cmd"},
+		{"unknown command", "unknown_cmd", nil, false, true, "未知命令: unknown_cmd"},
 	}
 
 	for _, tt := range tests {
@@ -136,7 +136,10 @@ func TestDispatchCommand(t *testing.T) {
 
 			// Validate outputs
 			out := stdout.String()
-			errout := stderr.String()
+			errout := ""
+			if err != nil {
+				errout = err.Error()
+			}
 
 			if tt.name == "unknown command" {
 				if !strings.Contains(errout, tt.wantOutput) {
@@ -168,11 +171,11 @@ func TestHandlePut_NonExistentFile(t *testing.T) {
 	if exit {
 		t.Error("expected exit to be false")
 	}
-	if err != nil {
-		t.Errorf("expected no error returned, got %v", err)
+	if err == nil {
+		t.Fatal("expected command error")
 	}
 
-	errout := stderr.String()
+	errout := err.Error()
 	if !strings.Contains(errout, "上传失败") {
 		t.Errorf("expected stderr to contain '上传失败', got %q", errout)
 	}
@@ -268,10 +271,10 @@ func TestLocalLsWildcardNoMatch(t *testing.T) {
 	if exit {
 		t.Error("expected exit to be false")
 	}
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
+	if err == nil {
+		t.Fatal("expected command error")
 	}
-	errout := stderr.String()
+	errout := err.Error()
 	if !strings.Contains(errout, "未找到匹配项") {
 		t.Errorf("expected stderr to contain '未找到匹配项', got %q", errout)
 	}
@@ -401,10 +404,10 @@ func TestLocalCpWildcardDestNotDir(t *testing.T) {
 	if exit {
 		t.Error("expected exit to be false")
 	}
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
+	if err == nil {
+		t.Fatal("expected command error")
 	}
-	errout := stderr.String()
+	errout := err.Error()
 	if !strings.Contains(errout, "目标必须是已存在的目录") {
 		t.Errorf("expected stderr to contain dest_must_be_dir message, got %q", errout)
 	}
@@ -436,10 +439,10 @@ func TestLocalCdWildcardMultiple(t *testing.T) {
 	if exit {
 		t.Error("expected exit to be false")
 	}
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
+	if err == nil {
+		t.Fatal("expected command error")
 	}
-	errout := stderr.String()
+	errout := err.Error()
 	if !strings.Contains(errout, "匹配到") || !strings.Contains(errout, "个路径") {
 		t.Errorf("expected stderr to contain multiple match error, got %q", errout)
 	}
@@ -815,7 +818,9 @@ func TestLocalRmWithConfirmation(t *testing.T) {
 			return false // 拒绝确认
 		},
 	}
-	s.handleLocalRm(t.Context(), []string{"file1"})
+	if err := s.handleLocalRm(t.Context(), []string{"file1"}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := os.Stat(file1); os.IsNotExist(err) {
 		t.Error("expected file1 to still exist when confirmation is denied")
 	}
@@ -824,7 +829,9 @@ func TestLocalRmWithConfirmation(t *testing.T) {
 	s.askConfirmHook = func(prompt string) bool {
 		return true // 同意确认
 	}
-	s.handleLocalRm(t.Context(), []string{"file1"})
+	if err := s.handleLocalRm(t.Context(), []string{"file1"}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := os.Stat(file1); !os.IsNotExist(err) {
 		t.Error("expected file1 to be deleted when confirmation is granted")
 	}
@@ -836,7 +843,9 @@ func TestLocalRmWithConfirmation(t *testing.T) {
 		t.Error("askConfirmHook should not be called when -f is provided")
 		return false
 	}
-	s.handleLocalRm(t.Context(), []string{"-f", "file2"})
+	if err := s.handleLocalRm(t.Context(), []string{"-f", "file2"}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := os.Stat(file2); !os.IsNotExist(err) {
 		t.Error("expected file2 to be deleted automatically with -f flag")
 	}
@@ -860,7 +869,9 @@ func TestLocalCpWithConfirmation(t *testing.T) {
 			return false
 		},
 	}
-	s.handleLocalCp(t.Context(), []string{"src", "dst1"})
+	if err := s.handleLocalCp(t.Context(), []string{"src", "dst1"}); err != nil {
+		t.Fatal(err)
+	}
 	data, err := os.ReadFile(dstFile1)
 	if err != nil || string(data) != "source_content" {
 		t.Errorf("failed to copy to non-existent dst1: %v", err)
@@ -871,7 +882,9 @@ func TestLocalCpWithConfirmation(t *testing.T) {
 	s.askConfirmHook = func(prompt string) bool {
 		return false // 拒绝确认
 	}
-	s.handleLocalCp(t.Context(), []string{"src", "dst1"})
+	if err := s.handleLocalCp(t.Context(), []string{"src", "dst1"}); err != nil {
+		t.Fatal(err)
+	}
 	data = readTestFile(t, dstFile1)
 	if string(data) != "original_dst1" {
 		t.Error("expected dst1 content to not be overwritten when confirmation is denied")
@@ -881,7 +894,9 @@ func TestLocalCpWithConfirmation(t *testing.T) {
 	s.askConfirmHook = func(prompt string) bool {
 		return true // 同意确认
 	}
-	s.handleLocalCp(t.Context(), []string{"src", "dst1"})
+	if err := s.handleLocalCp(t.Context(), []string{"src", "dst1"}); err != nil {
+		t.Fatal(err)
+	}
 	data = readTestFile(t, dstFile1)
 	if string(data) != "source_content" {
 		t.Error("expected dst1 content to be overwritten when confirmation is granted")
@@ -893,7 +908,9 @@ func TestLocalCpWithConfirmation(t *testing.T) {
 		t.Error("askConfirmHook should not be called when -f is provided")
 		return false
 	}
-	s.handleLocalCp(t.Context(), []string{"-f", "src", "dst1"})
+	if err := s.handleLocalCp(t.Context(), []string{"-f", "src", "dst1"}); err != nil {
+		t.Fatal(err)
+	}
 	data = readTestFile(t, dstFile1)
 	if string(data) != "source_content" {
 		t.Error("expected dst1 content to be overwritten with -f flag")
@@ -978,7 +995,9 @@ func TestLocalMvWithConfirmation(t *testing.T) {
 			return false
 		},
 	}
-	s.handleLocalMv(t.Context(), []string{"src1", "dst1"})
+	if err := s.handleLocalMv(t.Context(), []string{"src1", "dst1"}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := os.Stat(srcFile1); !os.IsNotExist(err) {
 		t.Error("src1 should be moved")
 	}
@@ -994,7 +1013,9 @@ func TestLocalMvWithConfirmation(t *testing.T) {
 	s.askConfirmHook = func(prompt string) bool {
 		return false // 拒绝确认
 	}
-	s.handleLocalMv(t.Context(), []string{"src2", "dst1"})
+	if err := s.handleLocalMv(t.Context(), []string{"src2", "dst1"}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := os.Stat(srcFile2); err != nil {
 		t.Error("src2 should not be moved when confirmation is denied")
 	}
@@ -1007,7 +1028,9 @@ func TestLocalMvWithConfirmation(t *testing.T) {
 	s.askConfirmHook = func(prompt string) bool {
 		return true // 同意确认
 	}
-	s.handleLocalMv(t.Context(), []string{"src2", "dst1"})
+	if err := s.handleLocalMv(t.Context(), []string{"src2", "dst1"}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := os.Stat(srcFile2); !os.IsNotExist(err) {
 		t.Error("src2 should be moved when confirmation is granted")
 	}
@@ -1023,7 +1046,9 @@ func TestLocalMvWithConfirmation(t *testing.T) {
 		t.Error("askConfirmHook should not be called when -f is provided")
 		return false
 	}
-	s.handleLocalMv(t.Context(), []string{"-f", "src3", "dst1"})
+	if err := s.handleLocalMv(t.Context(), []string{"-f", "src3", "dst1"}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := os.Stat(srcFile3); !os.IsNotExist(err) {
 		t.Error("src3 should be moved automatically with -f flag")
 	}

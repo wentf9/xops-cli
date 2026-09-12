@@ -1,5 +1,9 @@
 # Command execution
 
+With targets selected by `--host`, `--ifile`/`-I`, or `--tag`, the first positional argument starts the remote command; do not repeat a positional host. `ssh --host` likewise preserves the complete positional command. Both `xops exec --host web-01 uname -a` and `xops ssh --host web-01 uname -a` execute `uname -a`.
+
+Global flags may appear before or after the subcommand, for example `xops --color never exec --host web-01 uname -a`. SSH/exec preserve arguments after the remote command begins. Use `--` to disambiguate, for example `xops exec --host web-01 -- echo --help`.
+
 ## Regular and batch execution
 
 ```bash

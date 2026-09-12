@@ -1,5 +1,9 @@
 # Playbook 与 MCP
 
+`--var key=value` 覆盖 YAML 同名变量，并统一用于步骤字段和外部 template 文件；CLI 新增变量也可用于模板，空值是有效覆盖。不存在的变量报错，不递归展开变量值。
+
+MCP 审批要求确认表单中的 `approved=true`。新协议通过 InputRequests 多轮请求完成审批，凭证绑定会话和完整工具参数，两分钟后失效且只能消费一次；旧协议使用 elicitation。仅明确不支持审批时采用配置的 fallback，协议错误、拒绝、取消或超时均不放行。审批请求和最终执行分别记入审计。
+
 ## Playbook
 
 Playbook 使用 YAML 组合 shell、script、copy、ensure 和 template 步骤。将以下内容保存为 `check-hosts.yaml`，先用只读任务验证目标选择和凭据：

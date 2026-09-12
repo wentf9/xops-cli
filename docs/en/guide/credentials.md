@@ -1,5 +1,7 @@
 # Credential storage
 
+`credential doctor` reports WARN (not initialized) for an automatically initialized offline store with no credential references and neither vault nor key present. This does not cause failure or create files. Missing referenced stores, partial initialization and unsafe paths still fail. Readable metadata does not imply verified decryption or write access.
+
 XOps keeps login passwords, private-key passphrases, and privilege passwords in credential stores. Configuration files contain references to those credentials. New installations use the built-in offline encrypted store without requiring a system keyring or external tools.
 
 This page describes the current source. Check `xops credential --help` for options available in your installed version.

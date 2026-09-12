@@ -58,7 +58,10 @@ func NewSshOptions() *SshOptions {
 }
 
 func NewCmdSsh() *cobra.Command {
-	o := NewSshOptions()
+	return newCmdSshWithOptions(NewSshOptions())
+}
+
+func newCmdSshWithOptions(o *SshOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "ssh [user@]host[:port]",
 		Short: i18n.T("ssh_short"),
@@ -151,7 +154,7 @@ func (o *SshOptions) parseArgs() error {
 
 	if len(o.args) == 0 && finalHost == "" {
 		return errors.New(i18n.T("ssh_err_no_host"))
-	} else if len(o.args) >= 1 {
+	} else if finalHost == "" && len(o.args) >= 1 {
 		u, h, p, err := utils.ParseAddr(o.args[0])
 		if err != nil {
 			return err
@@ -189,11 +192,17 @@ func (o *SshOptions) Validate() error {
 	if err := utils.ValidateRememberPolicy(o.Remember); err != nil {
 		return err
 	}
+	// A flag-selected target leaves every positional token for the command.
+	// Determine the boundary before parseArgs fills Host from a positional target.
+	commandArgs := o.args
+	if o.Host == "" && len(commandArgs) > 0 {
+		commandArgs = commandArgs[1:]
+	}
 	if err := o.parseArgs(); err != nil {
 		return err
 	}
-	if len(o.args) > 1 {
-		o.Command = strings.Join(o.args[1:], " ")
+	if len(commandArgs) > 0 {
+		o.Command = strings.Join(commandArgs, " ")
 	}
 	if o.BgRun && !o.NoCmd {
 		return errors.New(i18n.T("ssh_err_background_requires_nocmd"))

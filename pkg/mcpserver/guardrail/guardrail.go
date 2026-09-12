@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/wentf9/xops-cli/pkg/config"
@@ -19,6 +20,8 @@ type Guardrail struct {
 	policy           *Policy
 	audit            AuditWriter
 	noElicitFallback string
+	approvalMu       sync.Mutex
+	pendingApprovals map[string]pendingApproval
 }
 
 // New creates a Guardrail from configuration. If cfg is nil, defaults are used.
@@ -99,13 +102,21 @@ func WithGuardrail[In, Out any](
 			return nil, zero, denyErr
 
 		case NeedApproval:
-			if err := RequestApproval(ctx, req.Session, risk, ri, g.noElicitFallback); err != nil {
+			pending, err := g.requestToolApproval(ctx, req, risk, ri, input)
+			if err != nil {
 				entry.Outcome = "denied"
 				entry.Error = err.Error()
 				if auditErr := g.audit.Log(entry); auditErr != nil {
 					return nil, zero, errors.Join(err, fmt.Errorf("audit log failed: %w", auditErr))
 				}
 				return nil, zero, err
+			}
+			if pending != nil {
+				entry.Outcome = "approval_requested"
+				if err := g.audit.Log(entry); err != nil {
+					return nil, zero, fmt.Errorf("audit approval request failed: %w", err)
+				}
+				return pending, zero, nil
 			}
 			entry.Decision = "approved"
 		}

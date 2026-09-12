@@ -130,7 +130,7 @@ scp_save_config_failed:
 sftp_short:
   other: "Connect to a remote host via SFTP"
 sftp_long:
-  other: "Connect to a remote host via SFTP and open an interactive terminal.\n\nUsage examples (OpenSSH-compatible):\n  xops sftp user@host[:port]\n  xops sftp -i ~/.ssh/id_rsa user@host\n  xops sftp -J bastion.example.com user@host # Direct jump (supports FQDN/IP/host:port)\n  xops sftp -J jumphost user@host            # Alias jump (requires saved node/alias)\n\nConnection Target Semantics:\n  Explicit user and port participate fully in matching, automatically reuse existing Host records, strictly isolate Identity credentials, and inherit unique host ProxyJump.\n  ProxyJump (-J) resolution strategy: Prioritizes saved Node, Alias, or ~/.ssh/config Host; direct jump targets explicitly require Node/Alias, FQDN, IP, or host:port; single-label hostnames without port must be configured as a Node/Alias first.\n  If no password is specified, it will be read from the terminal or saved config."
+  other: "Connect to a remote host via SFTP and open an interactive terminal.\n\nUsage examples (OpenSSH-compatible):\n  xops sftp user@host[:port]\n  xops sftp -i ~/.ssh/id_rsa user@host\n  xops sftp -J bastion.example.com user@host # Direct jump (supports FQDN/IP/host:port)\n  xops sftp -J jumphost user@host            # Alias jump (requires saved node/alias)\n\nConnection Target Semantics:\n  Explicit user and port participate fully in matching, automatically reuse existing Host records, strictly isolate Identity credentials, and inherit unique host ProxyJump.\n  ProxyJump (-J) resolution strategy: Prioritizes saved Node, Alias, or ~/.ssh/config Host; direct jump targets explicitly require Node/Alias, FQDN, IP, or host:port; single-label hostnames without port must be configured as a Node/Alias first.\n  If no password is specified, it will be read from the terminal or saved config.\n\nPiped or file input automatically uses batch mode: stop with a nonzero status on the first failure, without history or interactive credential/confirmation prompts. Batch exec uses no PTY; exec/lexec receive EOF on stdin. shell/lshell require an interactive terminal."
 flag_sftp_task:
   other: "Max concurrent file downloads"
 flag_sftp_thread:
@@ -515,7 +515,7 @@ tui_status_cleanup_pending:
 init_short:
   other: "Initialize local XOps configuration"
 init_long:
-  other: "Create a Schema v2 configuration with credential persistence disabled (none), then import concrete Host entries from OpenSSH configuration. No encryption key is created for new installations. Initialization never connects to remote hosts or overwrites existing nodes."
+  other: "Create a Schema v2 configuration with a lazily initialized offline encrypted credential store, then import concrete OpenSSH Host entries. The store and key are created on the first save of a verified credential. Initialization never connects to remote hosts or overwrites existing nodes."
 flag_init_ssh_config:
   other: "OpenSSH configuration file to import"
 flag_init_skip_ssh_import:

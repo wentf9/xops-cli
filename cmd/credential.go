@@ -18,6 +18,7 @@ import (
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
+	"github.com/wentf9/xops-cli/pkg/models"
 )
 
 // NewCmdCredential 创建凭据管理根命令
@@ -261,7 +262,7 @@ func checkConfiguredStores(ctx context.Context) []DoctorCheckItem {
 	}
 	for storeID, storeCfg := range credCfg.Stores {
 		if storeCfg.Type == config.StoreTypeEncryptedFile {
-			items = append(items, checkOfflineDoctor(ctx, storeID, storeCfg))
+			items = append(items, checkOfflineDoctor(ctx, storeID, storeCfg, cfg))
 			continue
 		}
 		items = append(items, checkDoctorStore(ctx, storeID, storeCfg))
@@ -367,7 +368,7 @@ func newCmdCredentialGC() *cobra.Command {
 	}
 }
 
-func checkOfflineDoctor(ctx context.Context, id string, cfg config.StoreConfig) DoctorCheckItem {
+func checkOfflineDoctor(ctx context.Context, id string, cfg config.StoreConfig, configuration *config.Configuration) DoctorCheckItem {
 	item := DoctorCheckItem{Name: "Store: " + id, Status: "FAIL"}
 	path, _, err := utils.GetConfigFilePath()
 	if err != nil {
@@ -381,6 +382,18 @@ func checkOfflineDoctor(ctx context.Context, id string, cfg config.StoreConfig) 
 	}
 	work, cancel := context.WithTimeout(credential.WithoutInteraction(ctx), cfg.Timeout)
 	defer cancel()
+	if cfg.Unlock == "key-file" && !cfg.ReadOnly && !storeHasReferences(configuration, id) {
+		layout, layoutErr := credentialfile.InspectLayout(work, cfg.Path, cfg.KeyFile)
+		if layoutErr != nil {
+			item.Message = fmt.Sprintf("inspect offline layout: %v", layoutErr)
+			return item
+		}
+		if !layout.Vault && !layout.Key {
+			item.Status = "WARN"
+			item.Message = "encrypted-file not initialized; first successful credential save prepares the store; no unlock or write probe performed"
+			return item
+		}
+	}
 	s, err := credentialfile.Open(work, cfg.Path, id, credentialfile.Options{ReadOnly: true})
 	if err == nil {
 		_, err = s.Inspect(work, false)
@@ -393,4 +406,32 @@ func checkOfflineDoctor(ctx context.Context, id string, cfg config.StoreConfig) 
 	item.Status = "WARN"
 	item.Message = "encrypted-file metadata available; locked/unverified, no unlock or write probe performed; use credential store probe for filesystem capability checks"
 	return item
+}
+
+func storeHasReferences(cfg *config.Configuration, id string) bool {
+	if cfg == nil {
+		return true
+	}
+	found := false
+	if cfg.Identities != nil {
+		cfg.Identities.IterCb(func(_ string, identity models.Identity) bool {
+			for _, ref := range []*credential.Ref{identity.LoginPasswordRef, identity.PassphraseRef} {
+				if ref != nil && ref.StoreID == id {
+					found = true
+					return false
+				}
+			}
+			return true
+		})
+	}
+	if cfg.Nodes != nil {
+		cfg.Nodes.IterCb(func(_ string, node models.Node) bool {
+			if node.PrivilegePasswordRef != nil && node.PrivilegePasswordRef.StoreID == id {
+				found = true
+				return false
+			}
+			return true
+		})
+	}
+	return found
 }

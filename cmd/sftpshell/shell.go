@@ -53,6 +53,7 @@ type Shell struct {
 	askConfirmHook  func(prompt string) bool
 	logger          logger.DebugLogger
 	noOverwrite     bool
+	batch           bool // Non-terminal command input: stop at the first failure.
 	transferConfig  sftp.TransferConfig
 	newClientFn     clientFactory
 	newLineEditorFn lineEditorFactory
@@ -573,6 +574,7 @@ func New(ctx context.Context, client *sftp.Client, sshClient *ssh.Client, stdin 
 		logger:         logger.NopLogger,
 		transferConfig: client.Config(),
 		state:          shellCreated,
+		batch:          !terminalInput(stdin),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -599,7 +601,7 @@ func New(ctx context.Context, client *sftp.Client, sshClient *ssh.Client, stdin 
 		shell.getLogger().Debugf("resolve SFTP history directory failed: %v", err)
 	}
 	historyFile := ""
-	if homeDir != "" {
+	if homeDir != "" && !shell.batch {
 		historyFile = filepath.Join(homeDir, ".xops_sftp_history")
 	}
 	shell.cwd = cwd
@@ -620,6 +622,15 @@ func (s *Shell) Run(ctx context.Context) (runErr error) {
 		return err
 	}
 	defer s.endRun()
+	readCommand := func() (string, error) { return s.prompt(runCtx, fmt.Sprintf("sftp:%s> ", s.cwd)) }
+	if s.batch {
+		read, closeInput, err := batchCommandReader(runCtx, s.stdin)
+		if err != nil {
+			return err
+		}
+		readCommand = read
+		defer func() { runErr = errors.Join(runErr, closeInput()) }()
+	}
 	defer func() {
 		if closeErr := s.closeLineEditor(); closeErr != nil {
 			runErr = combineShellErrors(runErr, fmt.Errorf("close SFTP line editor failed: %w", closeErr))
@@ -630,8 +641,7 @@ func (s *Shell) Run(ctx context.Context) (runErr error) {
 		if err := runCtx.Err(); err != nil {
 			return err
 		}
-		prompt := fmt.Sprintf("sftp:%s> ", s.cwd)
-		input, err := s.prompt(runCtx, prompt)
+		input, err := readCommand()
 		if err != nil {
 			if runCtx.Err() != nil {
 				return runCtx.Err()
@@ -657,7 +667,7 @@ func (s *Shell) Run(ctx context.Context) (runErr error) {
 			continue
 		}
 
-		if err := s.appendHistory(input); err != nil {
+		if err := s.saveCommandHistory(input); err != nil {
 			s.getLogger().Debugf("save SFTP shell history failed: %v", err)
 		}
 
@@ -665,7 +675,9 @@ func (s *Shell) Run(ctx context.Context) (runErr error) {
 		if strings.HasPrefix(input, "!") {
 			localCmd := strings.TrimSpace(input[1:])
 			if localCmd != "" {
-				s.handleLexec(runCtx, localCmd)
+				if err := s.reportCommandError(s.handleLexec(runCtx, localCmd)); err != nil {
+					return err
+				}
 			}
 			if displayErr := s.takeDisplayError(); displayErr != nil {
 				return displayErr
@@ -683,13 +695,22 @@ func (s *Shell) Run(ctx context.Context) (runErr error) {
 		// execution to avoid misleading errors from a broken client.
 		if requiresRemote(cmd) {
 			if err := s.ensureClient(runCtx); err != nil {
+				if s.batch {
+					return fmt.Errorf("restore sftp client failed: %w", err)
+				}
 				s.fprintfStderr("restore sftp client failed: %v\n", err)
+				if outputErr := s.takeDisplayError(); outputErr != nil {
+					return outputErr
+				}
 				continue
 			}
 		}
 
 		exit, err := s.dispatchCommand(runCtx, cmd, params)
-		if err != nil {
+		if err := s.reportCommandError(err); err != nil {
+			return err
+		}
+		if err := s.takeDisplayError(); err != nil {
 			return err
 		}
 		if exit {
@@ -741,25 +762,59 @@ func combineShellErrors(primary, secondary error) error {
 }
 
 func (s *Shell) dispatchCommand(ctx context.Context, cmd string, params []string) (bool, error) {
+	var err error
 	switch cmd {
 	case "exit", "quit", "bye":
 		return true, nil
 	case "help", "?":
 		s.printHelp()
 	case "pwd", "lpwd":
-		s.handlePwd(cmd)
+		err = s.handlePwd(cmd)
 	case "ls", "ll", "lls", "lll":
-		s.handleLsGroup(ctx, cmd, params)
+		err = s.handleLsGroup(ctx, cmd, params)
 	case "cd", "lcd":
-		s.handleCdGroup(ctx, cmd, params)
+		err = s.handleCdGroup(ctx, cmd, params)
 	case "mkdir", "lmkdir":
-		s.handleMkdirGroup(ctx, cmd, params)
+		err = s.handleMkdirGroup(ctx, cmd, params)
 	case "rm", "lrm":
-		s.handleRmGroup(ctx, cmd, params)
+		err = s.handleRmGroup(ctx, cmd, params)
 	default:
-		s.dispatchTransferCmd(ctx, cmd, params)
+		err = s.dispatchTransferCmd(ctx, cmd, params)
 	}
-	return false, s.takeDisplayError()
+	if outputErr := s.takeDisplayError(); outputErr != nil {
+		return false, errors.Join(err, &shellOutputError{outputErr})
+	}
+	return false, err
+}
+
+type shellOutputError struct{ error }
+
+func (e *shellOutputError) Unwrap() error { return e.error }
+
+// reportCommandError applies session policy without hiding failures inside
+// individual operations. Output failures remain fatal in either mode.
+func (s *Shell) reportCommandError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var outputErr *shellOutputError
+	if s.batch || errors.As(err, &outputErr) {
+		return err
+	}
+	s.fprintfStderr("%v\n", err)
+	return s.takeDisplayError()
+}
+
+func terminalInput(reader io.Reader) bool {
+	f, ok := reader.(*os.File)
+	return ok && term.IsTerminal(int(f.Fd()))
+}
+
+func (s *Shell) saveCommandHistory(input string) error {
+	if s.batch {
+		return nil
+	}
+	return s.appendHistory(input)
 }
 
 func (s *Shell) recordDisplayError(err error) {
@@ -803,12 +858,6 @@ func (s *Shell) fprintfStderr(format string, args ...any) {
 	}
 }
 
-func (s *Shell) fprintlnStderr(args ...any) {
-	if _, err := fmt.Fprintln(s.stderr, args...); err != nil {
-		s.recordDisplayError(fmt.Errorf("write SFTP shell diagnostic failed: %w", err))
-	}
-}
-
 // isPureLocalCmd reports whether cmd operates only on the local filesystem or
 // terminates the shell. These commands must never be gated behind a remote
 // health-check so that users can still exit or work locally even when the
@@ -837,88 +886,140 @@ func requiresRemote(cmd string) bool {
 	return !isPureLocalCmd(cmd)
 }
 
-func (s *Shell) dispatchTransferCmd(ctx context.Context, cmd string, params []string) {
+func (s *Shell) dispatchTransferCmd(ctx context.Context, cmd string, params []string) error {
 	switch cmd {
 	case "cp", "lcp":
-		s.handleCpGroup(ctx, cmd, params)
+		if err := s.handleCpGroup(ctx, cmd, params); err != nil {
+			return err
+		}
 	case "mv", "lmv":
-		s.handleMvGroup(ctx, cmd, params)
+		if err := s.handleMvGroup(ctx, cmd, params); err != nil {
+			return err
+		}
 	case "shell":
-		s.handleShell(ctx)
+		if err := s.handleShell(ctx); err != nil {
+			return err
+		}
 	case "lshell":
-		s.handleLshell(ctx)
+		if err := s.handleLshell(ctx); err != nil {
+			return err
+		}
 	case "exec":
-		s.handleExec(ctx, params)
+		if err := s.handleExec(ctx, params); err != nil {
+			return err
+		}
 	case "lexec":
-		s.handleLexec(ctx, strings.Join(params, " "))
+		if err := s.handleLexec(ctx, strings.Join(params, " ")); err != nil {
+			return err
+		}
 	case "get":
-		s.handleGet(ctx, params)
+		if err := s.handleGet(ctx, params); err != nil {
+			return err
+		}
 	case "put":
-		s.handlePut(ctx, params)
+		if err := s.handlePut(ctx, params); err != nil {
+			return err
+		}
 	default:
-		s.fprintfStderr("%s\n", i18n.Tf("sftp_shell_unknown_cmd", map[string]any{"Cmd": cmd}))
+		return fmt.Errorf("%s", i18n.Tf("sftp_shell_unknown_cmd", map[string]any{"Cmd": cmd}))
 	}
+	return nil
 }
 
-func (s *Shell) handlePwd(cmd string) {
+func (s *Shell) handlePwd(cmd string) error {
 	if cmd == "pwd" {
 		s.fprintlnStdout(s.cwd)
 	} else {
 		s.fprintlnStdout(s.localCwd)
 	}
+	return nil
 }
 
-func (s *Shell) handleLsGroup(ctx context.Context, cmd string, params []string) {
+func (s *Shell) handleLsGroup(ctx context.Context, cmd string, params []string) error {
 	switch cmd {
 	case "ls":
-		s.handleLs(ctx, params, false)
+		if err := s.handleLs(ctx, params, false); err != nil {
+			return err
+		}
 	case "ll":
-		s.handleLs(ctx, params, true)
+		if err := s.handleLs(ctx, params, true); err != nil {
+			return err
+		}
 	case "lls":
-		s.handleLocalLs(params, false)
+		if err := s.handleLocalLs(params, false); err != nil {
+			return err
+		}
 	case "lll":
-		s.handleLocalLs(params, true)
+		if err := s.handleLocalLs(params, true); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
-func (s *Shell) handleCdGroup(ctx context.Context, cmd string, params []string) {
+func (s *Shell) handleCdGroup(ctx context.Context, cmd string, params []string) error {
 	if cmd == "cd" {
-		s.handleCd(ctx, params)
+		if err := s.handleCd(ctx, params); err != nil {
+			return err
+		}
 	} else {
-		s.handleLocalCd(params)
+		if err := s.handleLocalCd(params); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
-func (s *Shell) handleMkdirGroup(ctx context.Context, cmd string, params []string) {
+func (s *Shell) handleMkdirGroup(ctx context.Context, cmd string, params []string) error {
 	if cmd == "mkdir" {
-		s.handleMkdir(ctx, params)
+		if err := s.handleMkdir(ctx, params); err != nil {
+			return err
+		}
 	} else {
-		s.handleLocalMkdir(params)
+		if err := s.handleLocalMkdir(params); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
-func (s *Shell) handleRmGroup(ctx context.Context, cmd string, params []string) {
+func (s *Shell) handleRmGroup(ctx context.Context, cmd string, params []string) error {
 	if cmd == "rm" {
-		s.handleRm(ctx, params)
+		if err := s.handleRm(ctx, params); err != nil {
+			return err
+		}
 	} else {
-		s.handleLocalRm(ctx, params)
+		if err := s.handleLocalRm(ctx, params); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
-func (s *Shell) handleCpGroup(ctx context.Context, cmd string, params []string) {
+func (s *Shell) handleCpGroup(ctx context.Context, cmd string, params []string) error {
 	if cmd == "cp" {
-		s.handleCp(ctx, params)
+		if err := s.handleCp(ctx, params); err != nil {
+			return err
+		}
 	} else {
-		s.handleLocalCp(ctx, params)
+		if err := s.handleLocalCp(ctx, params); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
-func (s *Shell) handleMvGroup(ctx context.Context, cmd string, params []string) {
+func (s *Shell) handleMvGroup(ctx context.Context, cmd string, params []string) error {
 	if cmd == "mv" {
-		s.handleMv(ctx, params)
+		if err := s.handleMv(ctx, params); err != nil {
+			return err
+		}
 	} else {
-		s.handleLocalMv(ctx, params)
+		if err := s.handleLocalMv(ctx, params); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // ================= 命令处理逻辑 =================
@@ -945,21 +1046,19 @@ func (s *Shell) resolveLocalPath(p string) string {
 	return filepath.Join(s.localCwd, p)
 }
 
-func (s *Shell) handleCd(ctx context.Context, args []string) {
+func (s *Shell) handleCd(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return
+		return nil
 	}
 	var target string
 	if hasWildcard(args[0]) {
 		matches, err := s.expandRemote(ctx, args[0])
 		if err != nil {
-			s.fprintfStderr("cd: %v\n", err)
-			return
+			return fmt.Errorf("cd: %w", err)
 		}
 		single, err := classifyGlobResult(args[0], matches, true)
 		if err != nil {
-			s.fprintfStderr("cd: %v\n", err)
-			return
+			return fmt.Errorf("cd: %w", err)
 		}
 		target = single[0]
 	} else {
@@ -969,86 +1068,85 @@ func (s *Shell) handleCd(ctx context.Context, args []string) {
 	// 检查目录是否存在
 	info, exists, err := s.remoteStat(ctx, target, true)
 	if err != nil || !exists {
-		s.fprintfStderr("cd: %v\n", err)
-		return
+		return fmt.Errorf("cd: %w", err)
 	}
 	if !info.IsDir() {
-		s.fprintfStderr("%s\n", i18n.Tf("sftp_shell_cd_not_dir", map[string]any{"Path": args[0]}))
-		return
+		return fmt.Errorf("%s", i18n.Tf("sftp_shell_cd_not_dir", map[string]any{"Path": args[0]}))
 	}
 	s.cwd = target
+	return nil
 }
 
-func (s *Shell) handleLocalCd(args []string) {
+func (s *Shell) handleLocalCd(args []string) error {
 	if len(args) == 0 {
-		return
+		return nil
 	}
 	var target string
 	if hasWildcard(args[0]) {
 		matches, err := s.expandLocal(args[0])
 		if err != nil {
-			s.fprintfStderr("lcd: %v\n", err)
-			return
+			return fmt.Errorf("lcd: %w", err)
 		}
 		single, err := classifyGlobResult(args[0], matches, true)
 		if err != nil {
-			s.fprintfStderr("lcd: %v\n", err)
-			return
+			return fmt.Errorf("lcd: %w", err)
 		}
 		target = single[0]
 	} else {
 		target = s.resolveLocalPath(args[0])
 	}
 	if err := os.Chdir(target); err != nil {
-		s.fprintfStderr("lcd: %v\n", err)
-		return
+		return fmt.Errorf("lcd: %w", err)
 	}
 	// 更新本地当前目录
 	localCwd, err := os.Getwd()
 	if err != nil {
-		s.fprintfStderr("lcd: resolve current directory failed: %v\n", err)
-		return
+		return fmt.Errorf("lcd: resolve current directory failed: %w", err)
 	}
 	s.localCwd = localCwd
+	return nil
 }
 
-func (s *Shell) handleLs(ctx context.Context, args []string, long bool) {
+func (s *Shell) handleLs(ctx context.Context, args []string, long bool) error {
 	if len(args) > 0 && hasWildcard(args[0]) {
 		matches, err := s.expandRemote(ctx, args[0])
 		if err != nil {
-			s.fprintfStderr("ls: %v\n", err)
-			return
+			return fmt.Errorf("ls: %w", err)
 		}
 		multi := len(matches) > 1
 		for _, m := range matches {
 			if multi {
 				s.fprintfStdout("\n%s:\n", m)
 			}
-			s.listRemoteOne(ctx, m, long)
+			if err := s.listRemoteOne(ctx, m, long); err != nil {
+				return err
+			}
 		}
-		return
+		return nil
 	}
 	path := s.cwd
 	if len(args) > 0 {
 		path = s.resolvePath(args[0])
 	}
-	s.listRemoteOne(ctx, path, long)
+	return s.listRemoteOne(ctx, path, long)
 }
 
 // listRemoteOne 列出单个远程路径的内容
 // path 为文件时直接显示该文件信息，为目录时列出其内容（与 bash ls 行为一致）
-func (s *Shell) listRemoteOne(ctx context.Context, path string, long bool) {
+// Listing errors are returned to the session's interactive/batch policy.
+func (s *Shell) listRemoteOne(ctx context.Context, path string, long bool) error {
 	info, exists, err := s.remoteStat(ctx, path, true)
-	if err != nil || !exists {
-		s.fprintfStderr("ls: %v\n", err)
-		return
+	if err != nil {
+		return fmt.Errorf("ls %q: %w", path, err)
+	}
+	if !exists {
+		return fmt.Errorf("ls %q: %w", path, os.ErrNotExist)
 	}
 	var files []os.FileInfo
 	if info.IsDir() {
 		cli, release, err := s.acquireClient(ctx)
 		if err != nil {
-			s.fprintfStderr("ls: %v\n", err)
-			return
+			return fmt.Errorf("ls %q: %w", path, err)
 		}
 		defer release()
 
@@ -1058,8 +1156,7 @@ func (s *Shell) listRemoteOne(ctx context.Context, path string, long bool) {
 			return readErr
 		})
 		if err != nil {
-			s.fprintfStderr("ls: %v\n", err)
-			return
+			return fmt.Errorf("read remote directory %q: %w", path, err)
 		}
 	} else {
 		// path 是文件，直接显示该文件自身
@@ -1096,50 +1193,50 @@ func (s *Shell) listRemoteOne(ctx context.Context, path string, long bool) {
 		}
 		s.printColumns(names)
 	}
+	return nil
 }
 
-func (s *Shell) handleLocalLs(args []string, long bool) {
+func (s *Shell) handleLocalLs(args []string, long bool) error {
 	if len(args) > 0 && hasWildcard(args[0]) {
 		matches, err := s.expandLocal(args[0])
 		if err != nil {
-			s.fprintfStderr("lls: %v\n", err)
-			return
+			return fmt.Errorf("lls: %w", err)
 		}
 		multi := len(matches) > 1
 		for _, m := range matches {
 			if multi {
 				s.fprintfStdout("\n%s:\n", m)
 			}
-			s.listLocalOne(m, long)
+			if err := s.listLocalOne(m, long); err != nil {
+				return err
+			}
 		}
-		return
+		return nil
 	}
 	path := s.localCwd
 	if len(args) > 0 {
 		path = s.resolveLocalPath(args[0])
 	}
-	s.listLocalOne(path, long)
+	return s.listLocalOne(path, long)
 }
 
 // listLocalOne 列出单个本地路径的内容
 // path 为文件时直接显示该文件信息，为目录时列出其内容（与 bash ls 行为一致）
-func (s *Shell) listLocalOne(path string, long bool) {
+// Listing errors are returned to the session's interactive/batch policy.
+func (s *Shell) listLocalOne(path string, long bool) error {
 	info, err := os.Stat(path)
 	if err != nil {
-		s.fprintfStderr("lls: %v\n", err)
-		return
+		return fmt.Errorf("lls %q: %w", path, err)
 	}
 	var infos []os.FileInfo
 	if info.IsDir() {
 		entries, err := os.ReadDir(path)
 		if err != nil {
-			s.fprintfStderr("lls: %v\n", err)
-			return
+			return fmt.Errorf("read local directory %q: %w", path, err)
 		}
 		infos, err = localDirectoryInfos(path, entries)
 		if err != nil {
-			s.fprintfStderr("lls: %v\n", err)
-			return
+			return fmt.Errorf("list local directory %q: %w", path, err)
 		}
 	} else {
 		// path 是文件，直接显示该文件自身
@@ -1176,6 +1273,7 @@ func (s *Shell) listLocalOne(path string, long bool) {
 		}
 		s.printColumns(names)
 	}
+	return nil
 }
 
 func localDirectoryInfos(directory string, entries []os.DirEntry) ([]os.FileInfo, error) {
@@ -1190,15 +1288,13 @@ func localDirectoryInfos(directory string, entries []os.DirEntry) ([]os.FileInfo
 	return infos, nil
 }
 
-func (s *Shell) handleGet(ctx context.Context, args []string) {
+func (s *Shell) handleGet(ctx context.Context, args []string) error {
 	if len(args) < 1 {
-		s.fprintlnStderr(i18n.T("sftp_shell_get_usage"))
-		return
+		return fmt.Errorf("%s", i18n.T("sftp_shell_get_usage"))
 	}
 	remotes, err := s.expandRemote(ctx, args[0])
 	if err != nil {
-		s.fprintfStderr("get: %v\n", err)
-		return
+		return fmt.Errorf("get: %w", err)
 	}
 
 	// 多源时：本地 dst 必须是已存在的目录或省略
@@ -1208,21 +1304,21 @@ func (s *Shell) handleGet(ctx context.Context, args []string) {
 			localDir = s.resolveLocalPath(args[1])
 			info, exists, statErr := inspectPath(os.Stat, localDir)
 			if statErr != nil {
-				s.fprintfStderr("get: %v\n", statErr)
-				return
+				return fmt.Errorf("get: %w", statErr)
 			}
 			if !exists || !info.IsDir() {
-				s.fprintlnStderr(i18n.T("sftp_shell_dest_must_be_dir"))
-				return
+				return fmt.Errorf("%s", i18n.T("sftp_shell_dest_must_be_dir"))
 			}
 		} else {
 			localDir = s.localCwd
 		}
 		for _, remote := range remotes {
 			localTarget := filepath.Join(localDir, filepath.Base(remote))
-			s.getSingle(ctx, remote, localTarget)
+			if err := s.getSingle(ctx, remote, localTarget); err != nil {
+				return err
+			}
 		}
-		return
+		return nil
 	}
 
 	// 单源：保持原行为
@@ -1231,47 +1327,45 @@ func (s *Shell) handleGet(ctx context.Context, args []string) {
 	if len(args) > 1 {
 		local = s.resolveLocalPath(args[1])
 	}
-	s.getSingle(ctx, remote, local)
+	if err := s.getSingle(ctx, remote, local); err != nil {
+		return err
+	}
+	return nil
 }
 
 // getSingle 下载单个远程文件/目录到本地，含覆盖确认与进度条
-func (s *Shell) getSingle(ctx context.Context, remote, local string) {
+func (s *Shell) getSingle(ctx context.Context, remote, local string) error {
 	cli, release, err := s.acquireClient(ctx)
 	if err != nil {
-		s.fprintfStderr("get: %v\n", err)
-		return
+		return fmt.Errorf("get: %w", err)
 	}
 	defer release()
 
 	clientToUse := cli
 	info, exists, statErr := s.remoteStat(ctx, remote, true)
 	if statErr != nil {
-		s.fprintfStderr("get: %v\n", statErr)
-		return
+		return fmt.Errorf("get: %w", statErr)
 	}
 	if !exists {
-		s.fprintfStderr("get: remote source %q does not exist\n", remote)
-		return
+		return fmt.Errorf("get: remote source %q does not exist", remote)
 	}
 
 	// 检查目标文件是否已存在
 	localDest, destinationExists, statErr := resolveLocalDownloadDestination(local, remote)
 	if statErr != nil {
-		s.fprintfStderr("get: %v\n", statErr)
-		return
+		return fmt.Errorf("get: %w", statErr)
 	}
 	if destinationExists {
 		if s.noOverwrite {
-			return
+			return nil
 		}
 		if !cli.Config().Force {
 			confirmed, confirmErr := s.askConfirmation(ctx, i18n.Tf("prompt_overwrite", map[string]any{"Path": localDest}))
 			if confirmErr != nil {
-				s.recordDisplayError(confirmErr)
-				return
+				return confirmErr
 			}
 			if !confirmed {
-				return
+				return nil
 			}
 			clientToUse = cli.WithForce(true)
 		}
@@ -1297,8 +1391,7 @@ func (s *Shell) getSingle(ctx context.Context, remote, local string) {
 			return walker.Err()
 		})
 		if walkErr != nil {
-			s.fprintfStderr("get: walk remote source failed: %v\n", walkErr)
-			return
+			return fmt.Errorf("get: walk remote source failed: %w", walkErr)
 		}
 	} else {
 		totalSize = info.Size()
@@ -1332,10 +1425,11 @@ func (s *Shell) getSingle(ctx context.Context, remote, local string) {
 		s.recordDisplayError(fmt.Errorf("finish download progress failed: %w", finishErr))
 	}
 	if dlErr != nil {
-		s.fprintfStderr("%s\n", i18n.Tf("sftp_shell_download_failed", map[string]any{"Error": dlErr}))
+		return fmt.Errorf("download failed: %w", dlErr)
 	} else {
 		s.fprintlnStdout(i18n.T("sftp_shell_download_done"))
 	}
+	return nil
 }
 
 func resolveLocalDownloadDestination(localPath, remotePath string) (string, bool, error) {
@@ -1354,23 +1448,20 @@ func resolveLocalDownloadDestination(localPath, remotePath string) (string, bool
 	return localDestination, destinationExists, nil
 }
 
-func (s *Shell) handlePut(ctx context.Context, args []string) {
+func (s *Shell) handlePut(ctx context.Context, args []string) error {
 	if len(args) < 1 {
-		s.fprintlnStderr(i18n.T("sftp_shell_put_usage"))
-		return
+		return fmt.Errorf("%s", i18n.T("sftp_shell_put_usage"))
 	}
 	locals, err := s.expandLocal(args[0])
 	if err != nil {
-		s.fprintfStderr("put: %v\n", err)
-		return
+		return fmt.Errorf("put: %w", err)
 	}
 
 	// 检查本地文件/目录是否存在（expandLocal 已展开，但单源无通配符时短路返回原路径，
 	// 此处保留 os.Stat 检查以维持原错误信息）
 	if _, err := os.Stat(locals[0]); err != nil {
 		errMsg := i18n.Tf("sftp_shell_upload_failed", map[string]any{"Error": err})
-		s.fprintfStderr("%s\n", strings.TrimPrefix(errMsg, "\n"))
-		return
+		return fmt.Errorf("%s: %w", strings.TrimSpace(errMsg), err)
 	}
 
 	// 多源时：远程 dst 必须是已存在的目录或省略
@@ -1380,21 +1471,21 @@ func (s *Shell) handlePut(ctx context.Context, args []string) {
 			remoteDir = s.resolvePath(args[1])
 			info, exists, statErr := s.remoteStat(ctx, remoteDir, true)
 			if statErr != nil {
-				s.fprintfStderr("put: %v\n", statErr)
-				return
+				return fmt.Errorf("put: %w", statErr)
 			}
 			if !exists || !info.IsDir() {
-				s.fprintlnStderr(i18n.T("sftp_shell_dest_must_be_dir"))
-				return
+				return fmt.Errorf("%s", i18n.T("sftp_shell_dest_must_be_dir"))
 			}
 		} else {
 			remoteDir = s.cwd
 		}
 		for _, local := range locals {
 			remoteTarget := s.resolvePath(path.Join(remoteDir, filepath.Base(local)))
-			s.putSingle(ctx, local, remoteTarget)
+			if err := s.putSingle(ctx, local, remoteTarget); err != nil {
+				return err
+			}
 		}
-		return
+		return nil
 	}
 
 	// 单源：保持原行为
@@ -1405,15 +1496,17 @@ func (s *Shell) handlePut(ctx context.Context, args []string) {
 	} else {
 		remote = s.resolvePath(filepath.Base(local))
 	}
-	s.putSingle(ctx, local, remote)
+	if err := s.putSingle(ctx, local, remote); err != nil {
+		return err
+	}
+	return nil
 }
 
 // putSingle 上传单个本地文件/目录到远程，含覆盖确认与进度条
-func (s *Shell) putSingle(ctx context.Context, local, remote string) {
+func (s *Shell) putSingle(ctx context.Context, local, remote string) error {
 	cli, release, err := s.acquireClient(ctx)
 	if err != nil {
-		s.fprintfStderr("put: %v\n", err)
-		return
+		return fmt.Errorf("put: %w", err)
 	}
 	defer release()
 
@@ -1421,29 +1514,26 @@ func (s *Shell) putSingle(ctx context.Context, local, remote string) {
 	// 检查目标文件是否已存在
 	remoteStat, remoteExists, statErr := s.remoteStat(ctx, remote, true)
 	if statErr != nil {
-		s.fprintfStderr("put: %v\n", statErr)
-		return
+		return fmt.Errorf("put: %w", statErr)
 	}
 	if remoteExists && remoteStat.IsDir() {
 		remote = cli.JoinPath(remote, filepath.Base(local))
 	}
 	_, destinationExists, statErr := s.remoteStat(ctx, remote, false)
 	if statErr != nil {
-		s.fprintfStderr("put: %v\n", statErr)
-		return
+		return fmt.Errorf("put: %w", statErr)
 	}
 	if destinationExists {
 		if s.noOverwrite {
-			return
+			return nil
 		}
 		if !cli.Config().Force {
 			confirmed, confirmErr := s.askConfirmation(ctx, i18n.Tf("prompt_overwrite", map[string]any{"Path": remote}))
 			if confirmErr != nil {
-				s.recordDisplayError(confirmErr)
-				return
+				return confirmErr
 			}
 			if !confirmed {
-				return
+				return nil
 			}
 			clientToUse = cli.WithForce(true)
 		}
@@ -1463,8 +1553,7 @@ func (s *Shell) putSingle(ctx context.Context, local, remote string) {
 		return nil
 	})
 	if walkErr != nil {
-		s.fprintfStderr("%s\n", i18n.Tf("sftp_shell_upload_failed", map[string]any{"Error": walkErr}))
-		return
+		return fmt.Errorf("upload failed: %w", walkErr)
 	}
 
 	bar := progressbar.NewOptions64(
@@ -1490,104 +1579,101 @@ func (s *Shell) putSingle(ctx context.Context, local, remote string) {
 		s.recordDisplayError(fmt.Errorf("finish upload progress failed: %w", finishErr))
 	}
 	if uploadErr != nil {
-		s.fprintfStderr("%s\n", i18n.Tf("sftp_shell_upload_failed", map[string]any{"Error": uploadErr}))
+		return fmt.Errorf("upload failed: %w", uploadErr)
 	} else {
 		s.fprintlnStdout(i18n.T("sftp_shell_upload_done"))
 	}
+	return nil
 }
 
-func (s *Shell) handleMkdir(ctx context.Context, args []string) {
+func (s *Shell) handleMkdir(ctx context.Context, args []string) error {
 	if len(args) < 1 {
-		s.fprintlnStderr(i18n.T("sftp_shell_mkdir_usage"))
-		return
+		return fmt.Errorf("%s", i18n.T("sftp_shell_mkdir_usage"))
 	}
 	path := s.resolvePath(args[0])
 	cli, release, err := s.acquireClient(ctx)
 	if err != nil {
-		s.fprintfStderr("mkdir: %v\n", err)
-		return
+		return fmt.Errorf("mkdir: %w", err)
 	}
 	defer release()
 
 	if err := cli.Do(ctx, func(client *pkgsftp.Client) error {
 		return client.Mkdir(path)
 	}); err != nil {
-		s.fprintfStderr("mkdir: %v\n", err)
+		return fmt.Errorf("mkdir: %w", err)
 	}
+	return nil
 }
 
-func (s *Shell) handleLocalMkdir(args []string) {
+func (s *Shell) handleLocalMkdir(args []string) error {
 	if len(args) < 1 {
-		s.fprintlnStderr(i18n.T("sftp_shell_lmkdir_usage"))
-		return
+		return fmt.Errorf("%s", i18n.T("sftp_shell_lmkdir_usage"))
 	}
 	path := s.resolveLocalPath(args[0])
 	if err := os.Mkdir(path, 0755); err != nil {
-		s.fprintfStderr("lmkdir: %v\n", err)
+		return fmt.Errorf("lmkdir: %w", err)
 	}
+	return nil
 }
 
-func (s *Shell) handleRm(ctx context.Context, args []string) {
+func (s *Shell) handleRm(ctx context.Context, args []string) error {
 	args, localForce := parseForceFlag(args)
 	force := s.clientConfig().Force || localForce
 
 	if len(args) < 1 {
-		s.fprintlnStderr(i18n.T("sftp_shell_rm_usage"))
-		return
+		return fmt.Errorf("%s", i18n.T("sftp_shell_rm_usage"))
 	}
 	paths, err := s.expandRemote(ctx, args[0])
 	if err != nil {
-		s.fprintfStderr("rm: %v\n", err)
-		return
+		return fmt.Errorf("rm: %w", err)
 	}
 	for _, p := range paths {
 		if !force {
 			confirmed, confirmErr := s.askConfirmation(ctx, fmt.Sprintf("rm: remove remote '%s'?", p))
 			if confirmErr != nil {
-				s.recordDisplayError(confirmErr)
-				return
+				return confirmErr
 			}
 			if !confirmed {
 				continue
 			}
 		}
-		s.removeOne(ctx, p)
+		if err := s.removeOne(ctx, p); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // removeOne 删除单个远程路径
-func (s *Shell) removeOne(ctx context.Context, p string) {
+func (s *Shell) removeOne(ctx context.Context, p string) error {
 	cli, release, err := s.acquireClient(ctx)
 	if err != nil {
-		s.fprintfStderr("rm: %v\n", err)
-		return
+		return fmt.Errorf("rm: %w", err)
 	}
 	defer release()
 
 	if err := cli.RemoveAll(ctx, p); err != nil {
-		s.fprintfStderr("rm: %v\n", err)
+		return fmt.Errorf("rm: %w", err)
 	}
+	return nil
 }
 
-func (s *Shell) handleLocalRm(ctx context.Context, args []string) {
+func (s *Shell) handleLocalRm(ctx context.Context, args []string) error {
 	args, localForce := parseForceFlag(args)
 	force := s.clientConfig().Force || localForce
 
 	if len(args) < 1 {
-		s.fprintlnStderr(i18n.T("sftp_shell_lrm_usage"))
-		return
+		return fmt.Errorf("%s", i18n.T("sftp_shell_lrm_usage"))
 	}
 	paths, err := s.expandLocal(args[0])
 	if err != nil {
-		s.fprintfStderr("lrm: %v\n", err)
-		return
+		return fmt.Errorf("lrm: %w", err)
 	}
 	for _, p := range paths {
 		if !force {
 			confirmed, confirmErr := s.askConfirmation(ctx, fmt.Sprintf("lrm: remove local '%s'?", p))
 			if confirmErr != nil {
-				s.recordDisplayError(confirmErr)
-				return
+				return confirmErr
 			}
 			if !confirmed {
 				continue
@@ -1595,37 +1681,34 @@ func (s *Shell) handleLocalRm(ctx context.Context, args []string) {
 		}
 		// 为了方便，lrm 直接支持递归删除
 		if err := os.RemoveAll(p); err != nil {
-			s.fprintfStderr("lrm: %v\n", err)
+			return fmt.Errorf("lrm: %w", err)
 		}
 	}
+	return nil
 }
 
 //nolint:gocyclo
-func (s *Shell) handleCp(ctx context.Context, args []string) {
+func (s *Shell) handleCp(ctx context.Context, args []string) error {
 	args, localForce := parseForceFlag(args)
 	force := s.clientConfig().Force || localForce
 
 	if len(args) < 2 {
-		s.fprintlnStderr(i18n.T("sftp_shell_cp_usage"))
-		return
+		return fmt.Errorf("%s", i18n.T("sftp_shell_cp_usage"))
 	}
 	srcs, err := s.expandRemote(ctx, args[0])
 	if err != nil {
-		s.fprintfStderr("cp: %v\n", err)
-		return
+		return fmt.Errorf("cp: %w", err)
 	}
 	dst := s.resolvePath(args[1])
 
 	// 提前计算目标地址并进行交互式确认
 	dstIsDir, statErr := s.remotePathIsDirectory(ctx, dst)
 	if statErr != nil {
-		s.fprintfStderr("cp: %v\n", statErr)
-		return
+		return fmt.Errorf("cp: %w", statErr)
 	}
 	finalDsts, err := resolveMultiSrc(srcs, dst, dstIsDir)
 	if err != nil {
-		s.fprintfStderr("cp: %v\n", err)
-		return
+		return fmt.Errorf("cp: %w", err)
 	}
 
 	for i, src := range srcs {
@@ -1633,8 +1716,7 @@ func (s *Shell) handleCp(ctx context.Context, args []string) {
 		if !force {
 			skip, confirmErr := s.shouldSkipRemoteOverwrite(ctx, "cp", finalDst)
 			if confirmErr != nil {
-				s.recordDisplayError(confirmErr)
-				return
+				return confirmErr
 			}
 			if skip {
 				continue
@@ -1642,9 +1724,10 @@ func (s *Shell) handleCp(ctx context.Context, args []string) {
 		}
 
 		if err := s.remoteCopySFTP(ctx, src, finalDst); err != nil {
-			s.fprintfStderr("cp: %v\n", err)
+			return fmt.Errorf("cp: %w", err)
 		}
 	}
+	return nil
 }
 
 func (s *Shell) remoteCopySFTP(ctx context.Context, src, dst string) error {
@@ -1656,30 +1739,26 @@ func (s *Shell) remoteCopySFTP(ctx context.Context, src, dst string) error {
 	return cli.RemoteCopy(ctx, src, dst)
 }
 
-func (s *Shell) handleMv(ctx context.Context, args []string) {
+func (s *Shell) handleMv(ctx context.Context, args []string) error {
 	args, localForce := parseForceFlag(args)
 	force := s.clientConfig().Force || localForce
 
 	if len(args) < 2 {
-		s.fprintlnStderr(i18n.T("sftp_shell_mv_usage"))
-		return
+		return fmt.Errorf("%s", i18n.T("sftp_shell_mv_usage"))
 	}
 	srcs, err := s.expandRemote(ctx, args[0])
 	if err != nil {
-		s.fprintfStderr("mv: %v\n", err)
-		return
+		return fmt.Errorf("mv: %w", err)
 	}
 	dst := s.resolvePath(args[1])
 
 	dstIsDir, statErr := s.remotePathIsDirectory(ctx, dst)
 	if statErr != nil {
-		s.fprintfStderr("mv: %v\n", statErr)
-		return
+		return fmt.Errorf("mv: %w", statErr)
 	}
 	finalDsts, err := resolveMultiSrc(srcs, dst, dstIsDir)
 	if err != nil {
-		s.fprintfStderr("mv: %v\n", err)
-		return
+		return fmt.Errorf("mv: %w", err)
 	}
 
 	for i, src := range srcs {
@@ -1687,8 +1766,7 @@ func (s *Shell) handleMv(ctx context.Context, args []string) {
 		if !force {
 			skip, confirmErr := s.shouldSkipRemoteOverwrite(ctx, "mv", finalDst)
 			if confirmErr != nil {
-				s.recordDisplayError(confirmErr)
-				return
+				return confirmErr
 			}
 			if skip {
 				continue
@@ -1697,51 +1775,46 @@ func (s *Shell) handleMv(ctx context.Context, args []string) {
 
 		cli, release, acquireErr := s.acquireClient(ctx)
 		if acquireErr != nil {
-			s.fprintfStderr("mv: %v\n", acquireErr)
-			return
+			return fmt.Errorf("mv: %w", acquireErr)
 		}
 		renameErr := cli.Rename(ctx, src, finalDst)
 		release()
 		if renameErr != nil {
-			s.fprintfStderr("mv: %v\n", renameErr)
+			return fmt.Errorf("mv: %w", renameErr)
 		}
 	}
+	return nil
 }
 
-func (s *Shell) handleLocalCp(ctx context.Context, args []string) {
+func (s *Shell) handleLocalCp(ctx context.Context, args []string) error {
 	args, localForce := parseForceFlag(args)
 	force := s.clientConfig().Force || localForce
 
 	if len(args) < 2 {
-		s.fprintlnStderr(i18n.T("sftp_shell_lcp_usage"))
-		return
+		return fmt.Errorf("%s", i18n.T("sftp_shell_lcp_usage"))
 	}
 	srcs, err := s.expandLocal(args[0])
 	if err != nil {
-		s.fprintfStderr("lcp: %v\n", err)
-		return
+		return fmt.Errorf("lcp: %w", err)
 	}
 	dst := s.resolveLocalPath(args[1])
 
 	// 检查目标是否是目录
 	dstInfo, dstExists, statErr := inspectPath(os.Stat, dst)
 	if statErr != nil {
-		s.fprintfStderr("lcp: %v\n", statErr)
-		return
+		return fmt.Errorf("lcp: %w", statErr)
 	}
 	dstIsDir := dstExists && dstInfo.IsDir()
 	finalDsts, err := resolveMultiSrcLocal(srcs, dst, dstIsDir)
 	if err != nil {
-		s.fprintfStderr("lcp: %v\n", err)
-		return
+		return fmt.Errorf("lcp: %w", err)
 	}
 	for i, src := range srcs {
 		finalDst := finalDsts[i]
 		if !force {
 			_, exists, statErr := inspectPath(os.Lstat, finalDst)
 			if statErr != nil {
-				s.fprintfStderr("lcp: %v\n", statErr)
-				return
+				return fmt.Errorf("lcp: %w", statErr)
 			}
 			if exists {
 				if s.noOverwrite {
@@ -1749,8 +1822,7 @@ func (s *Shell) handleLocalCp(ctx context.Context, args []string) {
 				}
 				confirmed, confirmErr := s.askConfirmation(ctx, fmt.Sprintf("lcp: overwrite local '%s'?", finalDst))
 				if confirmErr != nil {
-					s.recordDisplayError(confirmErr)
-					return
+					return confirmErr
 				}
 				if !confirmed {
 					continue
@@ -1758,9 +1830,10 @@ func (s *Shell) handleLocalCp(ctx context.Context, args []string) {
 			}
 		}
 		if err := copyLocal(src, finalDst); err != nil {
-			s.fprintfStderr("lcp: %v\n", err)
+			return fmt.Errorf("lcp: %w", err)
 		}
 	}
+	return nil
 }
 
 func copyLocal(src, dst string) error {
@@ -1851,40 +1924,35 @@ func copyLocalFile(src, dst string) (retErr error) {
 	return nil
 }
 
-func (s *Shell) handleLocalMv(ctx context.Context, args []string) {
+func (s *Shell) handleLocalMv(ctx context.Context, args []string) error {
 	args, localForce := parseForceFlag(args)
 	force := s.clientConfig().Force || localForce
 
 	if len(args) < 2 {
-		s.fprintlnStderr(i18n.T("sftp_shell_lmv_usage"))
-		return
+		return fmt.Errorf("%s", i18n.T("sftp_shell_lmv_usage"))
 	}
 	srcs, err := s.expandLocal(args[0])
 	if err != nil {
-		s.fprintfStderr("lmv: %v\n", err)
-		return
+		return fmt.Errorf("lmv: %w", err)
 	}
 	dst := s.resolveLocalPath(args[1])
 
 	// 检查目标是否是目录
 	dstInfo, dstExists, statErr := inspectPath(os.Stat, dst)
 	if statErr != nil {
-		s.fprintfStderr("lmv: %v\n", statErr)
-		return
+		return fmt.Errorf("lmv: %w", statErr)
 	}
 	dstIsDir := dstExists && dstInfo.IsDir()
 	finalDsts, err := resolveMultiSrcLocal(srcs, dst, dstIsDir)
 	if err != nil {
-		s.fprintfStderr("lmv: %v\n", err)
-		return
+		return fmt.Errorf("lmv: %w", err)
 	}
 	for i, src := range srcs {
 		finalDst := finalDsts[i]
 		if !force {
 			_, exists, statErr := inspectPath(os.Lstat, finalDst)
 			if statErr != nil {
-				s.fprintfStderr("lmv: %v\n", statErr)
-				return
+				return fmt.Errorf("lmv: %w", statErr)
 			}
 			if exists {
 				if s.noOverwrite {
@@ -1892,8 +1960,7 @@ func (s *Shell) handleLocalMv(ctx context.Context, args []string) {
 				}
 				confirmed, confirmErr := s.askConfirmation(ctx, fmt.Sprintf("lmv: overwrite local '%s'?", finalDst))
 				if confirmErr != nil {
-					s.recordDisplayError(confirmErr)
-					return
+					return confirmErr
 				}
 				if !confirmed {
 					continue
@@ -1901,9 +1968,10 @@ func (s *Shell) handleLocalMv(ctx context.Context, args []string) {
 			}
 		}
 		if err := os.Rename(src, finalDst); err != nil {
-			s.fprintfStderr("lmv: %v\n", err)
+			return fmt.Errorf("lmv: %w", err)
 		}
 	}
+	return nil
 }
 
 type pathStatFunc func(string) (os.FileInfo, error)
@@ -2011,6 +2079,9 @@ func (s *Shell) printHelp() {
 }
 
 func (s *Shell) askConfirmation(ctx context.Context, prompt string) (bool, error) {
+	if s.batch {
+		return false, fmt.Errorf("confirmation required in batch mode; use an explicit force or no-clobber option")
+	}
 	if s.askConfirmHook != nil {
 		return s.askConfirmHook(prompt), nil
 	}
@@ -2027,27 +2098,31 @@ func (s *Shell) askConfirmation(ctx context.Context, prompt string) (bool, error
 }
 
 // handleShell 进入远程交互式 shell（SSH PTY）
-func (s *Shell) handleShell(ctx context.Context) {
+func (s *Shell) handleShell(ctx context.Context) error {
+	if s.batch {
+		return fmt.Errorf("shell requires an interactive terminal")
+	}
 	if err := s.closeLineEditor(); err != nil {
-		s.recordDisplayError(fmt.Errorf("close SFTP line editor before remote shell failed: %w", err))
-		return
+		return fmt.Errorf("close SFTP line editor before remote shell failed: %w", err)
 	}
 	streams, err := s.interactiveIO()
 	if err != nil {
-		s.recordDisplayError(err)
-		return
+		return err
 	}
 	if err := s.sshClient.ShellWithIO(ctx, streams); err != nil {
-		s.fprintfStderr("shell: %v\n", err)
+		return fmt.Errorf("shell: %w", err)
 	}
 	s.fprintlnStdout("")
+	return nil
 }
 
 // handleLshell 进入本地交互式 shell
-func (s *Shell) handleLshell(ctx context.Context) {
+func (s *Shell) handleLshell(ctx context.Context) error {
+	if s.batch {
+		return fmt.Errorf("lshell requires an interactive terminal")
+	}
 	if err := s.closeLineEditor(); err != nil {
-		s.recordDisplayError(fmt.Errorf("close SFTP line editor before local shell failed: %w", err))
-		return
+		return fmt.Errorf("close SFTP line editor before local shell failed: %w", err)
 	}
 	shellBin := os.Getenv("SHELL")
 	if shellBin == "" {
@@ -2062,39 +2137,43 @@ func (s *Shell) handleLshell(ctx context.Context) {
 	c.Stderr = s.stderr
 	c.Dir = s.localCwd
 	if err := c.Run(); err != nil {
-		s.fprintfStderr("lshell: %v\n", err)
+		return fmt.Errorf("lshell: %w", err)
 	}
 	s.fprintlnStdout("")
+	return nil
 }
 
 // handleExec 在远程主机上执行命令，分配 PTY 以支持 vim/top 等交互式程序
-func (s *Shell) handleExec(ctx context.Context, args []string) {
+func (s *Shell) handleExec(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		s.fprintlnStderr(i18n.T("sftp_shell_exec_usage"))
-		return
+		return fmt.Errorf("%s", i18n.T("sftp_shell_exec_usage"))
 	}
 	escapedCwd := strings.ReplaceAll(s.cwd, "'", "'\\''")
 	cmdStr := fmt.Sprintf("cd '%s' && %s", escapedCwd, strings.Join(args, " "))
+	if s.batch {
+		if err := s.sshClient.RunCommandWithIO(ctx, cmdStr, false, strings.NewReader(""), s.stdout, s.stderr); err != nil {
+			return fmt.Errorf("exec failed: %w", err)
+		}
+		return nil
+	}
 	if err := s.closeLineEditor(); err != nil {
-		s.recordDisplayError(fmt.Errorf("close SFTP line editor before remote command failed: %w", err))
-		return
+		return fmt.Errorf("close SFTP line editor before remote command failed: %w", err)
 	}
 	streams, err := s.interactiveIO()
 	if err != nil {
-		s.recordDisplayError(err)
-		return
+		return err
 	}
 	if err := s.sshClient.RunInteractiveCmdWithIO(ctx, cmdStr, streams); err != nil {
-		s.fprintfStderr("exec: %v\n", err)
+		return fmt.Errorf("exec: %w", err)
 	}
 	s.fprintlnStdout("")
+	return nil
 }
 
 // handleLexec 在本地执行命令，接管终端 I/O 以支持 vim 等交互式程序
-func (s *Shell) handleLexec(ctx context.Context, cmdStr string) {
+func (s *Shell) handleLexec(ctx context.Context, cmdStr string) error {
 	if cmdStr == "" {
-		s.fprintlnStderr(i18n.T("sftp_shell_lexec_usage"))
-		return
+		return fmt.Errorf("%s", i18n.T("sftp_shell_lexec_usage"))
 	}
 	var c *exec.Cmd
 	if runtime.GOOS == "windows" {
@@ -2104,6 +2183,9 @@ func (s *Shell) handleLexec(ctx context.Context, cmdStr string) {
 	}
 	// 直接绑定终端，确保 vim/less 等交互式程序能正常读写
 	c.Stdin = s.stdin
+	if s.batch {
+		c.Stdin = strings.NewReader("")
+	}
 	c.Stdout = s.stdout
 	c.Stderr = s.stderr
 	c.Dir = s.localCwd
@@ -2111,13 +2193,13 @@ func (s *Shell) handleLexec(ctx context.Context, cmdStr string) {
 	// line editor 持有终端原始状态，运行前先将终端还原为普通模式，
 	// 退出后重新接管，避免 vim 退出后终端状态混乱
 	if err := s.closeLineEditor(); err != nil {
-		s.recordDisplayError(fmt.Errorf("close SFTP line editor before local command failed: %w", err))
-		return
+		return fmt.Errorf("close SFTP line editor before local command failed: %w", err)
 	}
 	err := c.Run()
 	if err != nil {
-		s.fprintfStderr("lexec: %v\n", err)
+		return fmt.Errorf("lexec: %w", err)
 	}
+	return nil
 }
 
 func (s *Shell) interactiveIO() (ssh.InteractiveIO, error) {

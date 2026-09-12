@@ -120,7 +120,7 @@ prompt_overwrite:
 sftp_short:
   other: "通过sftp连接到指定主机"
 sftp_long:
-  other: "通过sftp连接到指定主机并提供交互式终端。\n\n用法示例（兼容 OpenSSH 风格）:\n  xops sftp user@host[:port]\n  xops sftp -i ~/.ssh/id_rsa user@host\n  xops sftp -J bastion.example.com user@host # 直连跳板 (支持 FQDN/IP/host:port)\n  xops sftp -J jumphost user@host            # 别名跳板 (需预先保存为节点/别名)\n\n连接目标语义说明:\n  显式指定的 user 和 port 完整参与匹配，自动复用已有 Host 并严格隔离 Identity 凭证，继承相同主机的 ProxyJump。\n  跳板机(-J/ProxyJump)解析策略：优先匹配已有 Node、Alias 或 ~/.ssh/config Host；直连跳板明确要求使用 Node/Alias、FQDN、IP 或 host:port；未加端口的单标签主机名须先配置为 Node/Alias。\n  如果未通过--password选项显式提供密码,将会从终端输入或通过保存的密码文件读取密码。"
+  other: "通过sftp连接到指定主机并提供交互式终端。\n\n用法示例（兼容 OpenSSH 风格）:\n  xops sftp user@host[:port]\n  xops sftp -i ~/.ssh/id_rsa user@host\n  xops sftp -J bastion.example.com user@host # 直连跳板 (支持 FQDN/IP/host:port)\n  xops sftp -J jumphost user@host            # 别名跳板 (需预先保存为节点/别名)\n\n连接目标语义说明:\n  显式指定的 user 和 port 完整参与匹配，自动复用已有 Host 并严格隔离 Identity 凭证，继承相同主机的 ProxyJump。\n  跳板机(-J/ProxyJump)解析策略：优先匹配已有 Node、Alias 或 ~/.ssh/config Host；直连跳板明确要求使用 Node/Alias、FQDN、IP 或 host:port；未加端口的单标签主机名须先配置为 Node/Alias。\n  如果未通过--password选项显式提供密码,将会从终端输入或通过保存的密码文件读取密码。\n\n管道或文件输入自动使用批处理模式：首个命令失败立即退出并返回非零，不记录历史，不交互询问凭据或确认。批处理 exec 不使用 PTY，exec/lexec 的标准输入为 EOF；shell/lshell 仅用于交互终端。"
 flag_sftp_task:
   other: "同时传输的文件数"
 flag_sftp_thread:
@@ -516,7 +516,7 @@ tui_status_cleanup_pending:
 init_short:
   other: "初始化 XOps 本地配置"
 init_long:
-  other: "创建 Schema v2 配置，默认关闭凭据持久化（none），并从 OpenSSH 配置导入明确的 Host 条目。新安装不创建加密密钥。初始化不会连接任何远程主机，也不会覆盖已有节点。"
+  other: "创建 Schema v2 配置，默认使用延迟初始化的离线加密凭据库，并从 OpenSSH 配置导入明确的 Host 条目。首次保存验证成功的凭据时创建库和密钥。初始化不会连接任何远程主机，也不会覆盖已有节点。"
 flag_init_ssh_config:
   other: "要导入的 OpenSSH 配置文件"
 flag_init_skip_ssh_import:

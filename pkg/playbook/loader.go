@@ -173,9 +173,8 @@ func (p *Playbook) renderVars(extraVars map[string]string) error {
 		vars[k] = v
 	}
 
-	if len(vars) == 0 {
-		return nil
-	}
+	// Keep the effective variables for runtime template steps as well as loading.
+	p.Vars = vars
 
 	r := &varRenderer{vars: vars}
 	for i := range p.Steps {

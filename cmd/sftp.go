@@ -11,11 +11,14 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/sftpshell"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
+	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
 	"github.com/wentf9/xops-cli/pkg/sftp"
 	"github.com/wentf9/xops-cli/pkg/ssh"
+	"golang.org/x/term"
 )
 
 // sftp shell 连接监控参数：复用 pkg/ssh 层默认值（定义见 keepalive.go）
@@ -103,6 +106,12 @@ func (o *SftpOptions) Run() error {
 //
 //nolint:gocyclo
 func (o *SftpOptions) RunContext(ctx context.Context) (err error) {
+	batch := !term.IsTerminal(int(os.Stdin.Fd()))
+	connectionOptions := o.SshOptions
+	if batch {
+		ctx = credential.WithoutInteraction(ctx)
+		connectionOptions.Remember = "never"
+	}
 	configPath, keyPath, pathErr := utils.GetConfigFilePath()
 	if pathErr != nil {
 		return fmt.Errorf("get config file path failed: %w", pathErr)
@@ -119,15 +128,21 @@ func (o *SftpOptions) RunContext(ctx context.Context) (err error) {
 	}
 
 	var nodeID string
-	nodeID, _, err = o.resolveNode(ctx, provider)
+	nodeID, _, err = connectionOptions.resolveNode(ctx, provider)
 	if err != nil {
 		return err
 	}
-	adpOpts, optErr := o.buildAdapterOptions(nodeID, cfg, provider)
+	adpOpts, optErr := connectionOptions.buildAdapterOptions(nodeID, cfg, provider)
 	if optErr != nil {
 		return optErr
 	}
-	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithInteractionHandler(o.interaction))
+	var connector *ssh.Connector
+	if batch {
+		adpOpts = append(adpOpts, adapter.WithNonInteractive(true))
+		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
+	} else {
+		connector = newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithInteractionHandler(connectionOptions.interaction))
+	}
 	defer func() {
 		joinConnectorCloseError(&err, connector)
 	}()

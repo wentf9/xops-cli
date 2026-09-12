@@ -2,9 +2,12 @@ package guardrail
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -24,19 +27,47 @@ func RequestApproval(ctx context.Context, session *mcp.ServerSession, risk RiskL
 	if session == nil {
 		return fmt.Errorf("guardrail: no session available, cannot request approval")
 	}
-
-	msg := buildApprovalMessage(risk, input)
-
-	result, err := session.Elicit(ctx, &mcp.ElicitParams{
-		Message: msg,
-	})
-	if err != nil {
-		return applyFallback(err, risk, fallback)
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("guardrail: approval cancelled: %w", err)
 	}
+	initialized := session.InitializeParams()
+	if initialized == nil {
+		return fmt.Errorf("guardrail: approval session is not initialized")
+	}
+	if initialized.Capabilities == nil || initialized.Capabilities.Elicitation == nil ||
+		(initialized.Capabilities.Elicitation.Form == nil && initialized.Capabilities.Elicitation.URL != nil) {
+		return applyFallback(fmt.Errorf("client does not support form approval"), risk, fallback)
+	}
+	approvalCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
 
+	result, err := session.Elicit(approvalCtx, approvalParams(risk, input))
+	if err != nil {
+		var rpcErr *jsonrpc.Error
+		if approvalCtx.Err() == nil && errors.As(err, &rpcErr) && rpcErr.Code == jsonrpc.CodeMethodNotFound {
+			return applyFallback(err, risk, fallback)
+		}
+		return fmt.Errorf("guardrail: approval request failed (operation denied): %w", err)
+	}
+	return interpretApproval(result)
+}
+
+func approvalParams(risk RiskLevel, input RiskInput) *mcp.ElicitParams {
+	return &mcp.ElicitParams{Mode: "form", Message: buildApprovalMessage(risk, input), RequestedSchema: map[string]any{
+		"type": "object", "properties": map[string]any{"approved": map[string]any{"type": "boolean", "title": "Approve this operation", "default": false}}, "required": []string{"approved"},
+	}}
+}
+
+func interpretApproval(result *mcp.ElicitResult) error {
+	if result == nil {
+		return fmt.Errorf("guardrail: empty approval response, denying")
+	}
 	switch result.Action {
 	case "accept":
-		return nil
+		if approved, ok := result.Content["approved"].(bool); ok && approved {
+			return nil
+		}
+		return fmt.Errorf("guardrail: approval was not explicitly granted")
 	case "decline":
 		return fmt.Errorf("guardrail: operation explicitly declined by user")
 	case "cancel":

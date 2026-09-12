@@ -56,7 +56,10 @@ func NewExecOptions() *ExecOptions {
 }
 
 func NewCmdExec() *cobra.Command {
-	o := NewExecOptions()
+	return newCmdExecWithOptions(NewExecOptions())
+}
+
+func newCmdExecWithOptions(o *ExecOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "exec [flags] [command]",
 		Short: i18n.T("exec_short"),
@@ -125,7 +128,7 @@ func NewCmdExec() *cobra.Command {
 func (o *ExecOptions) extractCommandFromArgs(args []string) error {
 	hostPart := args[0]
 	cmdIdx := 1
-	if o.Tag != "" {
+	if o.Host != "" || o.HostFile != "" || o.Tag != "" {
 		o.Command = strings.Join(args, " ")
 		return nil
 	}
@@ -165,7 +168,7 @@ func (o *ExecOptions) extractCommandFromArgs(args []string) error {
 }
 
 func (o *ExecOptions) extractHostFromArgs(args []string) error {
-	if o.Host == "" && o.Tag == "" && len(args) > 0 {
+	if o.Host == "" && o.HostFile == "" && o.Tag == "" && len(args) > 0 {
 		hostPart := args[0]
 		if len(args) > 1 && strings.HasPrefix(args[1], "@") {
 			hostPart = args[0] + args[1]
