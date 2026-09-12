@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/wentf9/xops-cli/cmd/utils"
 	"github.com/wentf9/xops-cli/internal/terminal"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
@@ -233,3 +234,20 @@ func (h *cliInteractionHandler) ReportCredentialFailure(ctx context.Context, ope
 
 // CredentialRecoveryAllowed requires an actual interactive input capability.
 func (h *cliInteractionHandler) CredentialRecoveryAllowed() bool { return h != nil && h.canRemember }
+
+// automaticPersistenceOptions permits session-only interactive connections when
+// the journal/service cannot be prepared. Explicitly disable recording so the
+// adapter cannot fall back to legacy configuration writes without a service.
+func (h *cliInteractionHandler) automaticPersistenceOptions(repo *config.Repository, cfg *config.Configuration) ([]adapter.Option, error) {
+	service, err := utils.GetCredentialService(repo, cfg)
+	if err == nil {
+		return []adapter.Option{adapter.WithCredentialService(service)}, nil
+	}
+	if !h.CredentialRecoveryAllowed() || h.output == nil {
+		return nil, fmt.Errorf("initialize credential persistence: %w", err)
+	}
+	if _, writeErr := fmt.Fprintln(h.output, i18n.T("credential_save_unavailable")); writeErr != nil {
+		return nil, fmt.Errorf("report unavailable credential persistence: %w", writeErr)
+	}
+	return []adapter.Option{adapter.WithCredentialRecording(false)}, nil
+}

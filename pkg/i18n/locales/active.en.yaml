@@ -1046,3 +1046,6 @@ tui_credential_not_saved:
 
 credential_migrate_restart:
   other: "Archive the previous v2 migration plan and start from the current configuration; retain all credentials"
+
+credential_save_unavailable:
+  other: "Automatic credential saving is unavailable; continuing without saving credentials"

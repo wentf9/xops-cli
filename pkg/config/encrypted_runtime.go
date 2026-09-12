@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/wentf9/xops-cli/internal/credentialfile"
+	"github.com/wentf9/xops-cli/internal/credentialfile/format"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -109,7 +110,15 @@ func (b *encryptedBackend) Get(ctx context.Context, ref credential.Ref) (credent
 	if err != nil {
 		return credential.Secret{}, err
 	}
-	return s.Get(ctx, ref)
+	secret, err := s.Get(ctx, ref)
+	// Expose offline data failures through the backend-neutral read contract.
+	// Keep the cause for diagnostics; callers may allow temporary interactive
+	// input, but must not treat corruption as a missing credential or initialize
+	// a replacement vault. Writes retain their original fail-closed behavior.
+	if errors.Is(err, format.ErrCorrupt) {
+		err = errors.Join(credential.ErrCredentialStoreUnavailable, err)
+	}
+	return secret, err
 }
 func (b *encryptedBackend) prepareWrite(ctx context.Context) error {
 	// EnsureInitialized takes the native vault lock and checks CURRENT/transactions before

@@ -1140,7 +1140,10 @@ func (o *ScpOptions) validateRemoteRelayResumePrefix(ctx context.Context, srcFil
 var errPrefixMismatch = errors.New("resume prefix mismatch")
 
 func (o *ScpOptions) credentialConnector(provider *config.Repository, cfg *config.Configuration) (*ssh.Connector, error) {
-	interaction := newCLIInteractionHandler()
+	return o.credentialConnectorWithInteraction(provider, cfg, newCLIInteractionHandler())
+}
+
+func (o *ScpOptions) credentialConnectorWithInteraction(provider *config.Repository, cfg *config.Configuration, interaction *cliInteractionHandler) (*ssh.Connector, error) {
 	shouldRemember, adpOpts := interaction.rememberOptions(cmdutils.EffectiveRememberPolicy(o.Remember, cfg), cfg)
 	batch := o.Tag != "" || strings.Contains(o.Host, ",") || o.HostFile != ""
 	shouldRemember = !batch && shouldRemember
@@ -1151,11 +1154,11 @@ func (o *ScpOptions) credentialConnector(provider *config.Repository, cfg *confi
 		Password: o.Password, Passphrase: o.Passphrase, Remember: shouldRemember,
 	}))
 	if shouldRemember {
-		service, serviceErr := cmdutils.GetCredentialService(provider, cfg)
+		persistence, serviceErr := interaction.automaticPersistenceOptions(provider, cfg)
 		if serviceErr != nil {
-			return nil, fmt.Errorf("initialize credential persistence: %w", serviceErr)
+			return nil, serviceErr
 		}
-		adpOpts = append(adpOpts, adapter.WithCredentialService(service))
+		adpOpts = append(adpOpts, persistence...)
 	}
 	if reg, regErr := cmdutils.GetCredentialRegistry(cfg); regErr != nil {
 		return nil, fmt.Errorf("initialize credential resolver: %w", regErr)

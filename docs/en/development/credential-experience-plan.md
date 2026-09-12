@@ -1,6 +1,6 @@
 # Credential experience implementation plan
 
-Status: not yet executed. Writing this plan does not complete any implementation item. Based on the [accepted experience decisions](./credential-experience-design).
+Status: core implementation and review fixes are complete. Final acceptance requires native evidence tied to the candidate commit. Based on the [accepted experience decisions](./credential-experience-design).
 
 ## Phase 1: Entry points and configuration contract
 
@@ -93,3 +93,14 @@ General v2 backend migration is implemented; final six-platform native acceptanc
 `credential migrate --to <store>` supports both v1 upgrades and v2 backend migration. V2 deduplicates current references, copies into new references, compares values and expiry metadata on read-back, and switches all references and the default store with configuration CAS. Never policies do not block explicit migration. Source credentials remain; legacy v1 material and v2 records are separate. Rerun after interruption; explicit `--restart` archives the previous plan and replans after concurrent edits without rollback or credential deletion.
 
 Tests cover shared references, three credential kinds, offline round-trips and key-file reuse, read-only dry-run, interruption recovery, configuration conflicts and restart, corrupt destinations, uncertain writes, and v1 backup retention. Offline runtime evidence here comes from local Linux; final six-platform native acceptance remains separate. See the [migration guide](../guide/migration).
+
+
+### Review fixes and native verification gates
+
+Offline corruption retains its original cause while exposing the backend-neutral unavailable classification. Interactive input may recover temporarily; non-interactive and canceled requests fail closed. A real corrupt-vault test covers successful authentication, keeping the connection after a failed save, and preserving the key and damaged CURRENT.
+
+SSH, interactive exec, and single-target SCP now permit session-only use when persistence initialization fails, as TUI already does. All automatic recording is explicitly disabled to prevent legacy configuration writes. Regression tests cover always/ask/never, non-interactive boundaries, notice-output failure, and unchanged configuration.
+
+The six-platform workflow includes configuration initialization/migration, real corrupt-vault recovery, and Windows ConPTY checks. The native system-backend round-trip requires XOPS_TEST_NATIVE_MIGRATION=1: CI provisions an isolated Linux Secret Service and temporary macOS Keychain, and uses Windows Credential Manager. Random test references exercise three credential purposes, source retention and key-file reuse; system test credentials are cleaned afterward. A skip without a provisioned service is not native acceptance evidence.
+
+These gates do not replace complete Windows/macOS TUI and privilege-terminal experience acceptance or prove physical power-loss recovery. Release still requires checking results for the final candidate commit.

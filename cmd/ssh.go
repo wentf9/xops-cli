@@ -347,11 +347,11 @@ func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuratio
 		adpOpts = append(adpOpts, adapter.WithCredentialSource(reg))
 	}
 	if shouldRemember {
-		service, err := utils.GetCredentialService(repository, cfg)
+		persistence, err := o.interaction.automaticPersistenceOptions(repository, cfg)
 		if err != nil {
-			return nil, fmt.Errorf("initialize credential persistence: %w", err)
+			return nil, err
 		}
-		adpOpts = append(adpOpts, adapter.WithCredentialService(service))
+		adpOpts = append(adpOpts, persistence...)
 	}
 	return adpOpts, nil
 }

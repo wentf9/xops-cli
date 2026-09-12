@@ -1047,3 +1047,6 @@ tui_credential_not_saved:
 
 credential_migrate_restart:
   other: "归档此前的 v2 迁移计划并按当前配置重新规划，保留全部凭据"
+
+credential_save_unavailable:
+  other: "自动凭据保存不可用；本次连接将不保存凭据"
