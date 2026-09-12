@@ -132,3 +132,37 @@ func TestClient_Interrupt_NilConn(t *testing.T) {
 		t.Errorf("expected nil error for empty client, got %v", err)
 	}
 }
+
+func TestDetectedSudoModeSurvivesNoSaveRecorder(t *testing.T) {
+	for _, conflict := range []bool{false, true} {
+		provider := &trackingProvider{cfg: &ClientConfig{
+			NodeID: "test", Address: "127.0.0.1", Port: 22, User: "test",
+			SudoMode: SudoModeAuto, SudoUpdateToken: "sudo-old",
+		}}
+		recorder := &testRecorder{sudoCommittedToken: "sudo-old"}
+		if conflict {
+			recorder.onUpdateSudo = func() {
+				provider.mu.Lock()
+				defer provider.mu.Unlock()
+				provider.cfg.SudoUpdateToken = "concurrent-change"
+			}
+		}
+		client := newClientWithComponents(nil, nil, provider.cfg, provider, nil, nil, recorder, "", time.Second, time.Second, nil)
+		err := client.updateSudoMode(t.Context(), SudoModeSudo)
+		if conflict {
+			if !errors.Is(err, ErrSnapshotMismatch) {
+				t.Fatalf("no-save discovery bypassed version conflict: %v", err)
+			}
+			continue
+		}
+		if err != nil || client.ConnectionConfig().SudoMode != SudoModeSudo {
+			t.Fatalf("verified local sudo mode was discarded: %v", err)
+		}
+		if err := client.recordPrivilegeSecret(t.Context(), SecretKindSudoPassword, client.ConnectionConfig(), "verified-test-password"); err != nil || client.ConnectionConfig().SudoMode != SudoModeSudo {
+			t.Fatalf("no-save password confirmation discarded local discovery: %v", err)
+		}
+		if provider.cfg.SudoMode != SudoModeAuto || client.ConnectionConfig().SudoUpdateToken != "sudo-old" {
+			t.Fatal("no-save discovery changed persistent mode or token")
+		}
+	}
+}

@@ -13,6 +13,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -143,6 +145,27 @@ func TestInteractivePrivilegePTYRestoresModeAndFirstInput(t *testing.T) {
 }
 
 func TestPrivilegeRemotePTYEnablesEchoAfterAcknowledgement(t *testing.T) {
+	testPrivilegeRemotePTYHandoff(t, false, "")
+}
+
+func TestPrivilegeSudoLoginPTYHandoff(t *testing.T) {
+	testPrivilegeRemotePTYHandoff(t, true, "")
+}
+
+// CI runs this as a dedicated unprivileged user with password-required sudo.
+func TestPrivilegeNativePasswordSudoPTY(t *testing.T) {
+	password := os.Getenv("XOPS_TEST_NATIVE_SUDO_PASSWORD")
+	if password == "" {
+		t.Skip("requires a disposable user with password-required sudo")
+	}
+	if os.Geteuid() == 0 {
+		t.Fatal("native password-sudo regression must not run as root")
+	}
+	testPrivilegeRemotePTYHandoff(t, true, password)
+}
+
+func testPrivilegeRemotePTYHandoff(t *testing.T, sudoLogin bool, password string) {
+	t.Helper()
 	t.Setenv("BASH_ENV", "")
 	bash, err := exec.LookPath("bash")
 	if err != nil {
@@ -161,8 +184,23 @@ func TestPrivilegeRemotePTYEnablesEchoAfterAcknowledgement(t *testing.T) {
 	exchange.terminal = &privilegeTerminal{}
 	exchange.terminalToken = "[xops-terminal-test]"
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	command := exec.CommandContext(ctx, bash, "-c", exchange.body("printf user-output"))
+	script := exchange.body("printf user-output")
+	if sudoLogin {
+		exchange.mode = SudoModeSudo
+		userCommand := `xops_output=user-output; printf '%s' "$xops_output"`
+		if password != "" {
+			userCommand = `test "$(id -u)" = 0 && ` + userCommand
+		}
+		script = exchange.command(userCommand)
+		if password == "" {
+			script = sudoLoginTestPrelude + script
+		}
+	}
+	command := exec.CommandContext(ctx, bash, "-c", script)
 	command.Stdin, command.Stdout, command.Stderr = slave, slave, slave
+	if password != "" {
+		command.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0}
+	}
 	if err := command.Start(); err != nil {
 		cancel()
 		t.Fatal(err)
@@ -179,9 +217,28 @@ func TestPrivilegeRemotePTYEnablesEchoAfterAcknowledgement(t *testing.T) {
 	if err := master.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
+	verifyPrivilegePTYHandoff(t, master, slave, exchange, password)
+	err = <-done
+	joined = true
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func verifyPrivilegePTYHandoff(t *testing.T, master, slave *os.File, exchange *privilegeExchange, password string) {
+	t.Helper()
 	reader := bufio.NewReader(master)
+	if password != "" {
+		prompt, err := reader.ReadString(']')
+		if err != nil || !strings.HasSuffix(prompt, exchange.promptToken) {
+			t.Fatalf("native sudo did not request a password: %v", err)
+		}
+		if _, err := fmt.Fprintln(master, password); err != nil {
+			t.Fatal(err)
+		}
+	}
 	ready, err := reader.ReadString(']')
-	if err != nil || ready != exchange.readyToken {
+	if err != nil || strings.TrimSpace(ready) != exchange.readyToken {
 		t.Fatalf("readiness: %q, %v", ready, err)
 	}
 	if _, err := fmt.Fprintln(master, exchange.ackToken); err != nil {
@@ -192,7 +249,9 @@ func TestPrivilegeRemotePTYEnablesEchoAfterAcknowledgement(t *testing.T) {
 		t.Fatalf("acknowledgement echoed or terminal not ready: %q, %v", handoff, err)
 	}
 	after, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
-	if err != nil || after.Lflag&unix.ECHO == 0 {
+	// Native sudo with use_pty owns a separate inner terminal. Its successful
+	// handoff confirms stty echo there; the outer slave can remain in raw mode.
+	if err != nil || (password == "" && after.Lflag&unix.ECHO == 0) {
 		t.Fatalf("remote terminal echo not restored: %v", err)
 	}
 	output := make([]byte, len("user-output"))
@@ -201,10 +260,5 @@ func TestPrivilegeRemotePTYEnablesEchoAfterAcknowledgement(t *testing.T) {
 	}
 	if string(output) != "user-output" {
 		t.Fatalf("unexpected command output: %q", output)
-	}
-	err = <-done
-	joined = true
-	if err != nil {
-		t.Fatal(err)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	cryptoSSH "golang.org/x/crypto/ssh"
 	"golang.org/x/term"
@@ -92,4 +93,23 @@ func (e *privilegeExchange) outputReady() bool {
 	default:
 		return false
 	}
+}
+
+// sudo -i concatenates argv for the target login shell and deliberately leaves
+// dollar signs unescaped. Ordinary shellQuote only protects the first shell;
+// variables in the Bash script would otherwise expand before that script runs.
+// Transport dollar-bearing scripts as an ANSI-C literal, decoded by the inner
+// Bash. The sole unencoded dollar introduces that literal, not a variable.
+func sudoLoginScript(script string) string {
+	if !strings.Contains(script, "$") {
+		return script
+	}
+	escaped := strings.NewReplacer(
+		"\\", "\\\\",
+		"'", "\\'",
+		"$", "\\x24",
+		"\n", "\\n",
+		"\r", "\\r",
+	).Replace(script)
+	return "eval $'" + escaped + "'"
 }

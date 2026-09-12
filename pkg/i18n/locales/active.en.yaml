@@ -498,7 +498,7 @@ prompt_sudo_password:
 prompt_su_password:
   other: "Enter su root password for {{.Node}}:"
 sudo_exec_failed:
-  other: "Sudo execution failed: {{.Error}}"
+  other: "Sudo execution failed"
 
 # ---- mcp ----
 mcp_short:

@@ -499,7 +499,7 @@ prompt_sudo_password:
 prompt_su_password:
   other: "请输入 {{.Node}} 的 su root 密码:"
 sudo_exec_failed:
-  other: "sudo执行失败: {{.Error}}"
+  other: "sudo执行失败"
 
 # ---- mcp ----
 mcp_short:

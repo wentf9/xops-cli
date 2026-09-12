@@ -34,3 +34,14 @@ func TestSSHConnectionErrorHasNoUnboundTemplateFields(t *testing.T) {
 		t.Fatalf("malformed connection error: %v", err)
 	}
 }
+
+func TestSudoFailureLabelHasNoUnboundTemplateFields(t *testing.T) {
+	initCredentialPolicyTestI18n(t)
+	for _, lang := range []string{"zh", "en"} {
+		i18n.SetLang(lang)
+		label := i18n.T("sudo_exec_failed")
+		if label == "sudo_exec_failed" || strings.Contains(label, "<no value>") || strings.Contains(label, "{{") {
+			t.Fatalf("malformed sudo error label for %s: %q", lang, label)
+		}
+	}
+}

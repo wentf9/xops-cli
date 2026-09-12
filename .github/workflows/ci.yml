@@ -50,6 +50,18 @@ jobs:
       - name: Run tests
         run: go test -race -shuffle=on -covermode=atomic -coverprofile=coverage.out ./...
 
+      - name: Run native password sudo PTY regression
+        env:
+          XOPS_TEST_NATIVE_SUDO_PASSWORD: public-ci-sudo-password
+        run: |
+          go test -race -c -o /tmp/xops-sudo-ci.test ./pkg/ssh
+          sudo useradd --create-home --shell /bin/bash xops-sudo-ci
+          trap 'sudo rm -f /etc/sudoers.d/xops-sudo-ci /tmp/xops-sudo-ci.test; sudo userdel --remove xops-sudo-ci' EXIT
+          printf 'xops-sudo-ci:%s\n' "$XOPS_TEST_NATIVE_SUDO_PASSWORD" | sudo chpasswd
+          printf '%s\n' 'Defaults:xops-sudo-ci timestamp_timeout=0' 'xops-sudo-ci ALL=(root) PASSWD: ALL' | sudo tee /etc/sudoers.d/xops-sudo-ci >/dev/null
+          sudo chmod 440 /etc/sudoers.d/xops-sudo-ci
+          sudo -u xops-sudo-ci env XOPS_TEST_NATIVE_SUDO_PASSWORD="$XOPS_TEST_NATIVE_SUDO_PASSWORD" /tmp/xops-sudo-ci.test -test.run '^TestPrivilegeNativePasswordSudoPTY$' -test.count=1 -test.timeout=30s -test.v
+
       - name: Run offline credential business integration tests
         env:
           GORACE: atexit_sleep_ms=0

@@ -115,7 +115,7 @@ func interactivePrivilegeCommand(mode SudoMode, command string) (string, error) 
 	quoted := "'" + strings.ReplaceAll(command, "'", "'\\''") + "'"
 	switch mode {
 	case SudoModeSudo, SudoModeSudoer:
-		return "sudo -i -- bash -c " + quoted, nil
+		return "sudo -i -- bash -c " + shellQuote(sudoLoginScript(command)), nil
 	case SudoModeSu:
 		bashCommand := "exec bash -c " + quoted
 		return "su - root -c '" + strings.ReplaceAll(bashCommand, "'", "'\\''") + "'", nil

@@ -64,6 +64,7 @@ func (e *privilegeExchange) command(command string) string {
 	prefix := "sudo -S -p "
 	if e.terminal != nil {
 		prefix = "sudo -i -S -p "
+		body = sudoLoginScript(body)
 	}
 	return prefix + shellQuote(e.promptToken) + " -- bash -c " + shellQuote(body)
 }

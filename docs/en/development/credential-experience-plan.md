@@ -106,3 +106,9 @@ The six-platform workflow includes configuration initialization/migration, real 
 These gates do not replace complete Windows/macOS TUI and privilege-terminal experience acceptance or prove physical power-loss recovery. Release still requires checking results for the final candidate commit.
 
 Native credential fixtures use physical temporary paths so the macOS /var symlink does not trigger path rejection. Production vaults still reject symlink directories. Keychain cleanup runs only after successful test-keychain provisioning.
+
+### Password sudo login-terminal regression
+
+Dollar-bearing scripts are decoded by the inner Bash so sudo -i cannot expand handshake variables prematurely. The target user's login environment is retained, and acknowledgement is compared only after remote input is read. Interactive sudo exec uses the same protection; password verification, the acknowledgement gate and single execution remain intact. Under never/session-only policies, verified privilege discovery stays in the connection while target/version conflict checks still run.
+
+In addition to parsing and PTY regressions, Linux CI provisions a dedicated password-required sudo user and exercises real sudo -i with use_pty, password verification, terminal handoff and root command execution. A disposable Ubuntu 24.04 / sudo 1.9.15p5 container also verifies the complete CLI entering and exiting a root shell. The sudo error label no longer contains an unbound template parameter.

@@ -865,7 +865,9 @@ func (c *Client) refreshConnectionTokens(kind tokenRefreshKind, committedToken s
 		c.connCfg.AuthUpdateToken = newCfg.AuthUpdateToken
 	case tokenRefreshKindSudo:
 		c.connCfg.SudoUpdateToken = newCfg.SudoUpdateToken
-		if newCfg.SudoMode != "" {
+		// A no-save recorder returns the unchanged token. Do not overwrite
+		// verified session-local discovery with the repository's old mode.
+		if shouldRefreshSudoMode(curCfg, newCfg) {
 			c.connCfg.SudoMode = newCfg.SudoMode
 		}
 	}
@@ -951,4 +953,10 @@ func (c *Client) passwordPromptRegex() *regexp.Regexp {
 
 func (c *Client) SSHClient() *ssh.Client {
 	return c.sshClient
+}
+
+// Keep verified session-local discovery when a recorder intentionally does not
+// advance the credential version (for example, remember=never).
+func shouldRefreshSudoMode(current ConnectionConfig, next *ClientConfig) bool {
+	return next.SudoMode != "" && (next.SudoUpdateToken != current.SudoUpdateToken || current.SudoMode == "" || current.SudoMode == SudoModeAuto)
 }
