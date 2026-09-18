@@ -13,7 +13,7 @@ require (
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f
 	github.com/godbus/dbus/v5 v5.2.2
 	github.com/kevinburke/ssh_config v1.6.0
-	github.com/modelcontextprotocol/go-sdk v1.7.0
+	github.com/modelcontextprotocol/go-sdk v1.8.0
 	github.com/nicksnyder/go-i18n/v2 v2.6.1
 	github.com/pkg/sftp v1.13.11
 	github.com/prometheus-community/pro-bing v0.9.1
