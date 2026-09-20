@@ -10,7 +10,7 @@ import (
 	"github.com/wentf9/xops-cli/internal/terminal"
 )
 
-// Batch input does not instantiate readline or own a terminal. Interrupting
+// Batch input does not instantiate an interactive editor or own a terminal. Interrupting
 // the duplicated input wakes Scanner on cancellation without closing stdin.
 func batchCommandReader(ctx context.Context, input io.Reader) (func() (string, error), func() error, error) {
 	owned, err := terminal.DuplicatePromptInput(input)

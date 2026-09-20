@@ -3,59 +3,33 @@
 package sftpshell
 
 import (
+	tea "charm.land/bubbletea/v2"
 	"context"
+	"github.com/charmbracelet/x/term"
+	"github.com/charmbracelet/x/termios"
+	"github.com/wentf9/xops-cli/internal/terminal"
 	"io"
-	"time"
-
-	"github.com/chzyer/readline"
 )
 
-type lineEditorPlatform struct {
-	ready chan struct{}
+func duplicateEditorInput(input io.Reader) (terminal.PromptInput, error) {
+	return terminal.DuplicatePromptInput(input)
 }
 
-func newLineEditorPlatform(io.Reader) *lineEditorPlatform {
-	return &lineEditorPlatform{ready: make(chan struct{})}
-}
+// Bubble Tea receives SIGWINCH directly on Unix.
+func watchEditorSize(context.Context, io.Writer, func(tea.Msg)) func() { return func() {} }
 
-func (*lineEditorPlatform) configure(*readline.Config) {}
-
-func (p *lineEditorPlatform) start(ctx context.Context, instance *readline.Instance) {
-	go p.waitForTerminalReader(ctx, instance)
-}
-
-// waitForTerminalReader establishes that readline's internal terminal
-// goroutine has registered itself before Close is allowed to call into it.
-// readline v1.5.1 registers its WaitGroup inside that goroutine; closing any
-// earlier races with Wait. Unix keeps the existing eager read because its
-// cancellable prompt input does not alter terminal echo before Prompt.
-func (p *lineEditorPlatform) waitForTerminalReader(ctx context.Context, instance *readline.Instance) {
-	instance.Terminal.KickRead()
-	ticker := time.NewTicker(time.Millisecond)
-	defer ticker.Stop()
-	ctxDone := ctx.Done()
-	for !instance.Terminal.IsReading() {
-		select {
-		case <-ctxDone:
-			// The owner calls Close after cancellation. Keep waiting until
-			// readline has registered its WaitGroup so Close cannot race Add.
-			ctxDone = nil
-		case <-ticker.C:
-		}
+// With an externally managed input stream Bubble Tea renders for cooked
+// output. Keep newline processing enabled while disabling input echo/editing.
+func makeEditorRaw(fd uintptr) error {
+	if _, err := term.MakeRaw(fd); err != nil {
+		return err
 	}
-	close(p.ready)
+	state, err := termios.GetTermios(int(fd))
+	if err != nil {
+		return err
+	}
+	// Darwin uses uint64 speeds; Linux uses uint32.
+	//nolint:unconvert
+	return termios.SetTermios(int(fd), uint32(state.Ispeed), uint32(state.Ospeed), nil, nil,
+		map[termios.O]bool{termios.OPOST: true, termios.ONLCR: true}, nil, nil)
 }
-
-func (*lineEditorPlatform) preparePrompt() error {
-	return nil
-}
-
-func (*lineEditorPlatform) finishPrompt(err error) error {
-	return err
-}
-
-func (p *lineEditorPlatform) waitBeforeClose() {
-	<-p.ready
-}
-
-func (*lineEditorPlatform) prepareInstanceClose(*readline.Instance, bool) {}

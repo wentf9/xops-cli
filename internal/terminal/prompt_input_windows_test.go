@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/chzyer/readline"
 	"github.com/erikgeiser/coninput"
 	"golang.org/x/sys/windows"
 )
@@ -65,10 +64,10 @@ func TestWindowsConsolePromptReaderTranslatesNavigationKeys(t *testing.T) {
 		key  coninput.VirtualKeyCode
 		want byte
 	}{
-		{name: "left", key: coninput.VK_LEFT, want: readline.CharBackward},
-		{name: "right", key: coninput.VK_RIGHT, want: readline.CharForward},
-		{name: "previous history", key: coninput.VK_UP, want: readline.CharPrev},
-		{name: "next history", key: coninput.VK_DOWN, want: readline.CharNext},
+		{name: "left", key: coninput.VK_LEFT, want: 0x02},
+		{name: "right", key: coninput.VK_RIGHT, want: 0x06},
+		{name: "previous history", key: coninput.VK_UP, want: 0x10},
+		{name: "next history", key: coninput.VK_DOWN, want: 0x0e},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -136,7 +135,7 @@ func TestWindowsConsolePromptReaderExpandsRepeatCount(t *testing.T) {
 		{
 			name:  "repeated navigation key",
 			event: coninput.KeyEventRecord{KeyDown: true, VirtualKeyCode: coninput.VK_LEFT, RepeatCount: 3},
-			want:  []byte{readline.CharBackward, readline.CharBackward, readline.CharBackward},
+			want:  []byte{0x02, 0x02, 0x02},
 		},
 		{
 			name:  "repeat count 0 produces single",
@@ -223,6 +222,8 @@ func TestWindowsInteractiveInputPreservesTerminalKeys(t *testing.T) {
 		want string
 	}{
 		{"up", coninput.KeyEventRecord{KeyDown: true, VirtualKeyCode: coninput.VK_UP}, "\x1b[A"},
+		{"shift tab", coninput.KeyEventRecord{KeyDown: true, Char: '\t', ControlKeyState: coninput.SHIFT_PRESSED}, "\x1b[Z"},
+		{"control D", coninput.KeyEventRecord{KeyDown: true, Char: 4}, "\x04"},
 		{"delete", coninput.KeyEventRecord{KeyDown: true, VirtualKeyCode: coninput.VK_DELETE}, "\x1b[3~"},
 		{"control C", coninput.KeyEventRecord{KeyDown: true, Char: 3}, "\x03"},
 		{"unicode", coninput.KeyEventRecord{KeyDown: true, Char: '界'}, "界"},

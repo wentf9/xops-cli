@@ -2,6 +2,7 @@ package sftpshell
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,9 +12,12 @@ import (
 )
 
 // wordCompleter 计算光标位置对应的命令或路径补全候选
-func (s *Shell) wordCompleter(ctx context.Context, line string, pos int) (head string, completions []string, tail string) {
+func (s *Shell) wordCompleter(ctx context.Context, line string, pos int) (head string, completions []string, tail string, err error) {
 	// line editor 传入的 pos 是 rune 位置，需要转换为字节位置来切分字符串
 	runes := []rune(line)
+	if pos < 0 || pos > len(runes) {
+		return "", nil, "", fmt.Errorf("completion cursor out of range")
+	}
 	content := string(runes[:pos])
 	tail = string(runes[pos:])
 
@@ -25,13 +29,13 @@ func (s *Shell) wordCompleter(ctx context.Context, line string, pos int) (head s
 				completions = append(completions, c)
 			}
 		}
-		return "", completions, tail
+		return "", completions, tail, nil
 	}
 
 	// 场景2：补全命令参数
 	parts := strings.Fields(content)
 	if len(parts) < 1 {
-		return line, nil, ""
+		return line, nil, "", nil
 	}
 
 	cmd := parts[0]
@@ -46,25 +50,25 @@ func (s *Shell) wordCompleter(ctx context.Context, line string, pos int) (head s
 
 	switch cmd {
 	case "cd", "ls", "ll", "get", "mkdir", "rm", "cp", "mv":
-		completions = s.completeRemotePath(ctx, partial)
+		completions, err = s.completeRemotePath(ctx, partial)
 	case "lcd", "lls", "lll", "put", "lmkdir", "lrm", "lcp", "lmv":
-		completions = s.completeLocalPath(partial)
+		completions, err = s.completeLocalPath(partial)
 	}
 
-	return head, completions, tail
+	return head, completions, tail, err
 }
 
 // completeRemotePath 补全远程路径
-func (s *Shell) completeRemotePath(ctx context.Context, partial string) []string {
+func (s *Shell) completeRemotePath(ctx context.Context, partial string) ([]string, error) {
 	if ctx == nil {
-		return nil
+		return nil, fmt.Errorf("completion context is nil")
 	}
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
 	cli, release, err := s.acquireClient(ctx)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	defer release()
 
@@ -89,7 +93,10 @@ func (s *Shell) completeRemotePath(ctx context.Context, partial string) []string
 		return readErr
 	})
 	if err != nil {
-		return nil
+		if isContextError(err) {
+			s.invalidateClient(cli)
+		}
+		return nil, err
 	}
 
 	var candidates []string
@@ -107,14 +114,14 @@ func (s *Shell) completeRemotePath(ctx context.Context, partial string) []string
 			}
 		}
 	}
-	return candidates
+	return candidates, nil
 }
 
 // completeLocalPath 补全本地路径
-func (s *Shell) completeLocalPath(partial string) []string {
+func (s *Shell) completeLocalPath(partial string) ([]string, error) {
 	var dir, prefix string
 	sep := string(filepath.Separator)
-	if lastSep := strings.LastIndex(partial, sep); lastSep >= 0 {
+	if lastSep := strings.LastIndexAny(partial, "/"+sep); lastSep >= 0 {
 		dir = partial[:lastSep+1]
 		prefix = partial[lastSep+1:]
 	} else {
@@ -122,9 +129,13 @@ func (s *Shell) completeLocalPath(partial string) []string {
 		prefix = partial
 	}
 
-	entries, err := os.ReadDir(dir)
+	targetDir := dir
+	if s.localCwd != "" && !filepath.IsAbs(targetDir) {
+		targetDir = filepath.Join(s.localCwd, targetDir)
+	}
+	entries, err := os.ReadDir(targetDir)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 
 	var candidates []string
@@ -141,5 +152,10 @@ func (s *Shell) completeLocalPath(partial string) []string {
 			}
 		}
 	}
-	return candidates
+	return candidates, nil
+}
+
+func (s *Shell) completeLine(ctx context.Context, line string, pos int) completionResult {
+	head, candidates, tail, err := s.wordCompleter(ctx, line, pos)
+	return completionResult{head: head, candidates: candidates, tail: tail, err: err}
 }

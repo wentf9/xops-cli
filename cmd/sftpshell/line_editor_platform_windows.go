@@ -3,146 +3,55 @@
 package sftpshell
 
 import (
+	tea "charm.land/bubbletea/v2"
 	"context"
 	"fmt"
+	"github.com/charmbracelet/x/term"
+	"github.com/wentf9/xops-cli/internal/terminal"
 	"io"
 	"os"
-	"sync"
 	"time"
-
-	"github.com/chzyer/readline"
-	"golang.org/x/sys/windows"
-	"golang.org/x/term"
 )
 
-type consoleModeGetter func(windows.Handle, *uint32) error
-type consoleModeSetter func(windows.Handle, uint32) error
-
-type windowsConsoleMode struct {
-	mu           sync.Mutex
-	handle       windows.Handle
-	getMode      consoleModeGetter
-	setMode      consoleModeSetter
-	originalMode uint32
-	raw          bool
-	promptErr    error
+func duplicateEditorInput(input io.Reader) (terminal.PromptInput, error) {
+	if file, ok := input.(*os.File); ok {
+		return terminal.DuplicateInteractiveInput(file)
+	}
+	return terminal.DuplicatePromptInput(input)
 }
 
-type lineEditorPlatform struct {
-	consoleMode *windowsConsoleMode
+// Windows has no SIGWINCH. Poll only while a prompt owns the console; the
+// native input reader remains dedicated to keyboard events and cancellation.
+func watchEditorSize(ctx context.Context, output io.Writer, send func(tea.Msg)) func() {
+	file, ok := output.(interface{ Fd() uintptr })
+	if !ok || !term.IsTerminal(file.Fd()) {
+		return func() {}
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		width, height := 0, 0
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				w, h, err := term.GetSize(file.Fd())
+				if err != nil {
+					send(editorInputEnded{err: fmt.Errorf("read terminal size failed: %w", err)})
+					return
+				}
+				if w != width || h != height {
+					width, height = w, h
+					send(tea.WindowSizeMsg{Width: w, Height: h})
+				}
+			}
+		}
+	}()
+	return func() { cancel(); <-done }
 }
 
-func newLineEditorPlatform(input io.Reader) *lineEditorPlatform {
-	file, ok := input.(*os.File)
-	if !ok || !term.IsTerminal(int(file.Fd())) {
-		return &lineEditorPlatform{}
-	}
-	return &lineEditorPlatform{
-		consoleMode: &windowsConsoleMode{
-			handle:  windows.Handle(file.Fd()),
-			getMode: windows.GetConsoleMode,
-			setMode: windows.SetConsoleMode,
-		},
-	}
-}
-
-func (p *lineEditorPlatform) configure(config *readline.Config) {
-	config.FuncMakeRaw = p.enterRawMode
-	config.FuncExitRaw = p.exitRawMode
-}
-
-func (*lineEditorPlatform) start(context.Context, *readline.Instance) {}
-
-func (p *lineEditorPlatform) preparePrompt() error {
-	if p.consoleMode == nil {
-		return nil
-	}
-	p.consoleMode.mu.Lock()
-	p.consoleMode.promptErr = nil
-	p.consoleMode.mu.Unlock()
-	return p.enterRawMode()
-}
-
-func (p *lineEditorPlatform) enterRawMode() error {
-	if p.consoleMode == nil {
-		return nil
-	}
-	mode := p.consoleMode
-	mode.mu.Lock()
-	defer mode.mu.Unlock()
-	if mode.raw {
-		return nil
-	}
-	var current uint32
-	if err := mode.getMode(mode.handle, &current); err != nil {
-		return mode.recordError("get Windows console mode failed", err)
-	}
-	raw := current &^ (windows.ENABLE_ECHO_INPUT | windows.ENABLE_LINE_INPUT | windows.ENABLE_PROCESSED_INPUT)
-	if err := mode.setMode(mode.handle, raw); err != nil {
-		return mode.recordError("enable Windows console raw mode failed", err)
-	}
-	mode.originalMode = current
-	mode.raw = true
-	return nil
-}
-
-func (p *lineEditorPlatform) exitRawMode() error {
-	if p.consoleMode == nil {
-		return nil
-	}
-	mode := p.consoleMode
-	mode.mu.Lock()
-	defer mode.mu.Unlock()
-	if !mode.raw {
-		return nil
-	}
-	if err := mode.setMode(mode.handle, mode.originalMode); err != nil {
-		return mode.recordError("restore Windows console mode failed", err)
-	}
-	mode.raw = false
-	return nil
-}
-
-func (m *windowsConsoleMode) recordError(action string, err error) error {
-	wrapped := fmt.Errorf("%s: %w", action, err)
-	if m.promptErr == nil {
-		m.promptErr = wrapped
-		return wrapped
-	}
-	m.promptErr = fmt.Errorf("%w; %w", m.promptErr, wrapped)
-	return wrapped
-}
-
-func (p *lineEditorPlatform) finishPrompt(promptErr error) error {
-	if p.consoleMode == nil {
-		return promptErr
-	}
-	p.consoleMode.mu.Lock()
-	modeErr := p.consoleMode.promptErr
-	p.consoleMode.promptErr = nil
-	p.consoleMode.mu.Unlock()
-	switch {
-	case promptErr != nil && modeErr != nil:
-		return fmt.Errorf("%w; %w", promptErr, modeErr)
-	case promptErr != nil:
-		return promptErr
-	default:
-		return modeErr
-	}
-}
-
-func (*lineEditorPlatform) waitBeforeClose() {}
-
-// prepareInstanceClose starts readline's terminal reader only when no Prompt
-// ever did. The prompt input is already interrupted at this point, so the read
-// cannot consume cooked console input, but it does let readline register its
-// internal WaitGroup before Instance.Close waits on it.
-func (*lineEditorPlatform) prepareInstanceClose(instance *readline.Instance, readStarted bool) {
-	if readStarted {
-		return
-	}
-	instance.Terminal.KickRead()
-	for !instance.Terminal.IsReading() {
-		time.Sleep(time.Millisecond)
-	}
-}
+func makeEditorRaw(fd uintptr) error { _, err := term.MakeRaw(fd); return err }

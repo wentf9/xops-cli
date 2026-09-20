@@ -13,7 +13,7 @@ func TestWordCompleter_CommandCompletion(t *testing.T) {
 	s := &Shell{cwd: "/home/user"}
 
 	// 输入 "ex" 时应补全到 "exec" 和 "exit"
-	head, completions, tail := s.wordCompleter(context.Background(), "ex", 2)
+	head, completions, tail, _ := s.wordCompleter(context.Background(), "ex", 2)
 	if head != "" {
 		t.Errorf("head should be empty for command completion, got %q", head)
 	}
@@ -36,7 +36,7 @@ func TestWordCompleter_CommandCompletion(t *testing.T) {
 func TestWordCompleter_NoCompletionForUnknown(t *testing.T) {
 	s := &Shell{cwd: "/home/user"}
 
-	_, completions, _ := s.wordCompleter(context.Background(), "zzz", 3)
+	_, completions, _, _ := s.wordCompleter(context.Background(), "zzz", 3)
 	if len(completions) != 0 {
 		t.Errorf("expected no completions for unknown prefix, got %v", completions)
 	}
@@ -46,7 +46,7 @@ func TestWordCompleter_NoCompletionForUnknown(t *testing.T) {
 func TestWordCompleter_AllCommandsCompletable(t *testing.T) {
 	s := &Shell{cwd: "/home/user"}
 
-	_, completions, _ := s.wordCompleter(context.Background(), "", 0)
+	_, completions, _, _ := s.wordCompleter(context.Background(), "", 0)
 	if len(completions) == 0 {
 		t.Error("expected completions for empty prefix")
 	}
@@ -67,7 +67,10 @@ func TestCompleteLocalPath_BasicPrefix(t *testing.T) {
 	s := &Shell{}
 
 	// 目录 "." 下以不可能存在的前缀过滤，应返回空列表
-	candidates := s.completeLocalPath("__nonexistent_prefix_xyz__")
+	candidates, err := s.completeLocalPath("__nonexistent_prefix_xyz__")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(candidates) > 0 {
 		t.Error("expected no candidates for nonexistent prefix")
 	}
@@ -79,7 +82,7 @@ func TestWordCompleter_RuneBytePosition(t *testing.T) {
 
 	input := "cd 目"
 	runeLen := len([]rune(input))
-	head, _, tail := s.wordCompleter(context.Background(), input, runeLen)
+	head, _, tail, _ := s.wordCompleter(context.Background(), input, runeLen)
 	// tail 应为空（光标在末尾）
 	if tail != "" {
 		t.Errorf("tail should be empty when cursor at end, got %q", tail)
@@ -108,7 +111,10 @@ func TestCompleteLocalPath_DirSuffix(t *testing.T) {
 	sep := string(filepath.Separator)
 	prefix := filepath.Join(tmpDir, "") + sep
 
-	candidates := s.completeLocalPath(prefix)
+	candidates, err := s.completeLocalPath(prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(candidates) < 2 {
 		t.Fatalf("expected at least 2 candidates in temp dir, got %d: %v", len(candidates), candidates)
 	}
@@ -157,6 +163,31 @@ func TestIsPureLocalCmd(t *testing.T) {
 		}
 		if !requiresRemote(c) {
 			t.Errorf("expected requiresRemote(%q) = true", c)
+		}
+	}
+}
+
+func TestCompleteLocalPathUsesShellDirectory(t *testing.T) {
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, "unique-local-file"), []byte("content"))
+	shell := &Shell{localCwd: dir}
+	result := shell.completeLine(t.Context(), "put unique-", len("put unique-"))
+	if result.err != nil || len(result.candidates) != 1 || result.candidates[0] != "unique-local-file" {
+		t.Fatalf("completion = %+v", result)
+	}
+}
+
+func TestCompletionErrorsAndCursorValidation(t *testing.T) {
+	shell := &Shell{localCwd: t.TempDir()}
+	for _, line := range []string{"get missing", "put missing-directory/file"} {
+		result := shell.completeLine(t.Context(), line, len(line))
+		if result.err == nil {
+			t.Fatalf("missing completion error for %q", line)
+		}
+	}
+	for _, pos := range []int{-1, 100} {
+		if result := shell.completeLine(t.Context(), "get ", pos); result.err == nil {
+			t.Fatal("invalid cursor accepted")
 		}
 	}
 }

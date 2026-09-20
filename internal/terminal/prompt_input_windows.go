@@ -11,7 +11,6 @@ import (
 	"sync"
 	"unicode/utf16"
 
-	"github.com/chzyer/readline"
 	"github.com/erikgeiser/coninput"
 	"golang.org/x/sys/windows"
 	"golang.org/x/term"
@@ -218,7 +217,7 @@ func (r *windowsConsolePromptReader) translateSingleKeyEvent(key coninput.KeyEve
 		char = translateCtrlKey(char)
 	}
 	if r.altKey {
-		return append([]byte{readline.CharEsc}, []byte(string(char))...)
+		return append([]byte{0x1b}, []byte(string(char))...)
 	}
 	return []byte(string(char))
 }
@@ -239,13 +238,13 @@ func (r *windowsConsolePromptReader) translateControlKey(key coninput.VirtualKey
 	case coninput.VK_LMENU, coninput.VK_RMENU, coninput.VK_MENU:
 		r.altKey = true
 	case coninput.VK_LEFT:
-		return []byte{readline.CharBackward}
+		return []byte{0x02}
 	case coninput.VK_RIGHT:
-		return []byte{readline.CharForward}
+		return []byte{0x06}
 	case coninput.VK_UP:
-		return []byte{readline.CharPrev}
+		return []byte{0x10}
 	case coninput.VK_DOWN:
-		return []byte{readline.CharNext}
+		return []byte{0x0e}
 	}
 	return []byte{}
 }
@@ -253,13 +252,13 @@ func (r *windowsConsolePromptReader) translateControlKey(key coninput.VirtualKey
 func translateCtrlKey(char rune) rune {
 	switch char {
 	case 'A':
-		return readline.CharLineStart
+		return 0x01
 	case 'E':
-		return readline.CharLineEnd
+		return 0x05
 	case 'R':
-		return readline.CharBckSearch
+		return 0x12
 	case 'S':
-		return readline.CharFwdSearch
+		return 0x13
 	default:
 		return char
 	}
@@ -326,10 +325,13 @@ func appendWindowsPromptInputError(combined error, action string, err error) err
 	return fmt.Errorf("%w; %s: %w", combined, action, err)
 }
 
-// Interactive PTYs expect escape sequences, not readline's editing controls.
+// Interactive PTYs expect escape sequences, not line-editing control characters.
 func translateInteractiveKey(key coninput.KeyEventRecord) []byte {
 	if !key.KeyDown {
 		return nil
+	}
+	if key.Char == '\t' && key.ControlKeyState&coninput.SHIFT_PRESSED != 0 {
+		return []byte("\x1b[Z")
 	}
 	if key.Char != 0 {
 		value := []byte(string(key.Char))

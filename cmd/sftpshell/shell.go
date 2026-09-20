@@ -15,7 +15,6 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/chzyer/readline"
 	pkgsftp "github.com/pkg/sftp"
 	"github.com/schollz/progressbar/v3"
 	"github.com/wentf9/xops-cli/pkg/i18n"
@@ -29,6 +28,7 @@ import (
 type Shell struct {
 	clientMu        sync.RWMutex
 	client          *sftp.Client
+	clientInvalid   bool
 	clientUses      map[*sftp.Client]*clientUse
 	clientChange    *clientChange
 	closed          bool
@@ -44,10 +44,12 @@ type Shell struct {
 	localCwd        string
 	stdin           io.Reader
 	lineMu          sync.Mutex
+	editorStateMu   sync.Mutex
+	editorState     *editorSession
 	line            *lineEditor
 	displayMu       sync.Mutex
 	displayErr      error
-	historyFile     string // readline 历史记录文件
+	historyFile     string // SFTP command history file
 	stdout          io.Writer
 	stderr          io.Writer
 	askConfirmHook  func(prompt string) bool
@@ -162,14 +164,19 @@ func (s *Shell) refreshClient(
 			}
 		}
 
-		probeCtx, cancelProbe := context.WithTimeout(ctx, shellNetworkOperationTimeout)
-		err := oldClient.Do(probeCtx, func(c *pkgsftp.Client) error {
-			_, e := c.Getwd()
-			return e
-		})
-		cancelProbe()
-		if err == nil {
-			return nil
+		s.clientMu.RLock()
+		invalid := s.client == oldClient && s.clientInvalid
+		s.clientMu.RUnlock()
+		if !invalid {
+			probeCtx, cancelProbe := context.WithTimeout(ctx, shellNetworkOperationTimeout)
+			err := oldClient.Do(probeCtx, func(c *pkgsftp.Client) error {
+				_, e := c.Getwd()
+				return e
+			})
+			cancelProbe()
+			if err == nil {
+				return nil
+			}
 		}
 
 		cfg = oldClient.Config()
@@ -177,11 +184,12 @@ func (s *Shell) refreshClient(
 		s.transferConfig = cfg
 		if s.client == oldClient {
 			s.client = nil
+			s.clientInvalid = false
 		}
 		s.clientMu.Unlock()
 
 		if closeErr := oldClient.Close(); closeErr != nil {
-			return fmt.Errorf("close old SFTP client after failed health probe: %w", closeErr)
+			return fmt.Errorf("close retired SFTP client: %w", closeErr)
 		}
 	}
 
@@ -220,6 +228,7 @@ func (s *Shell) refreshClient(
 		return fmt.Errorf("sftp shell was closed while reconnecting")
 	}
 	s.client = newCli
+	s.clientInvalid = false
 	s.transferConfig = newCli.Config()
 	s.clientMu.Unlock()
 	return nil
@@ -270,7 +279,7 @@ func (s *Shell) acquireClient(ctx context.Context) (*sftp.Client, func(), error)
 			}
 
 			s.clientMu.Lock()
-			if !s.closed && s.clientChange == nil && s.client != nil {
+			if !s.closed && s.clientChange == nil && s.client != nil && !s.clientInvalid {
 				cli, release := s.registerClientLeaseLocked()
 				s.clientMu.Unlock()
 				return cli, release, nil
@@ -278,7 +287,7 @@ func (s *Shell) acquireClient(ctx context.Context) (*sftp.Client, func(), error)
 			s.clientMu.Unlock()
 			continue
 		}
-		if s.client != nil {
+		if s.client != nil && !s.clientInvalid {
 			cli, release := s.registerClientLeaseLocked()
 			s.clientMu.Unlock()
 			return cli, release, nil
@@ -314,6 +323,17 @@ func (s *Shell) acquireClient(ctx context.Context) (*sftp.Client, func(), error)
 			return nil, nil, err
 		}
 		return cli, release, nil
+	}
+}
+
+// invalidateClient retires this generation before its canceled operation
+// releases its lease. The normal refresh path drains all outstanding leases,
+// closes the old subsystem, and creates a replacement for the next acquisition.
+func (s *Shell) invalidateClient(cli *sftp.Client) {
+	s.clientMu.Lock()
+	defer s.clientMu.Unlock()
+	if s.client == cli {
+		s.clientInvalid = true
 	}
 }
 
@@ -643,10 +663,14 @@ func (s *Shell) Run(ctx context.Context) (runErr error) {
 		}
 		input, err := readCommand()
 		if err != nil {
+			var cleanup *promptCleanupError
+			if errors.As(err, &cleanup) {
+				return err
+			}
 			if runCtx.Err() != nil {
 				return runCtx.Err()
 			}
-			if errors.Is(err, readline.ErrInterrupt) {
+			if errors.Is(err, ErrPromptInterrupted) {
 				// Ctrl+C 拦截：若连接已断开则直接退出，否则继续等待输入
 				continue
 			}
@@ -668,7 +692,7 @@ func (s *Shell) Run(ctx context.Context) (runErr error) {
 		}
 
 		if err := s.saveCommandHistory(input); err != nil {
-			s.getLogger().Debugf("save SFTP shell history failed: %v", err)
+			s.fprintfStderr("save SFTP shell history failed: %v\n", err)
 		}
 
 		// ! 前缀：本地执行快捷方式（如 `!ls` 或 `! ls -la`）
@@ -798,8 +822,12 @@ func (s *Shell) reportCommandError(err error) error {
 		return nil
 	}
 	var outputErr *shellOutputError
-	if s.batch || errors.As(err, &outputErr) {
+	var cleanupErr *promptCleanupError
+	if s.batch || errors.As(err, &outputErr) || errors.As(err, &cleanupErr) {
 		return err
+	}
+	if errors.Is(err, ErrPromptInterrupted) {
+		return nil
 	}
 	s.fprintfStderr("%v\n", err)
 	return s.takeDisplayError()
@@ -1559,7 +1587,7 @@ func (s *Shell) putSingle(ctx context.Context, local, remote string) error {
 	bar := progressbar.NewOptions64(
 		totalSize,
 		progressbar.OptionSetDescription("Uploading"),
-		progressbar.OptionSetWriter(s.stdout), // 关键：使用 readline 的 stdout
+		progressbar.OptionSetWriter(s.stdout), // Use the shell output stream
 		progressbar.OptionEnableColorCodes(true),
 		progressbar.OptionShowBytes(true),
 		progressbar.OptionSetWidth(30),
@@ -2085,11 +2113,12 @@ func (s *Shell) askConfirmation(ctx context.Context, prompt string) (bool, error
 	if s.askConfirmHook != nil {
 		return s.askConfirmHook(prompt), nil
 	}
-	if s.currentLineEditor() == nil {
+	editor := s.currentLineEditor()
+	if editor == nil {
 		return false, fmt.Errorf("sftp line editor is not initialized")
 	}
 	s.fprintStdout("\n")
-	input, err := s.promptExisting(ctx, fmt.Sprintf("%s [y/N]: ", prompt))
+	input, err := editor.prompt(ctx, promptOptions{text: fmt.Sprintf("%s [y/N]: ", prompt), confirmation: true})
 	if err != nil {
 		return false, fmt.Errorf("read SFTP confirmation failed: %w", err)
 	}

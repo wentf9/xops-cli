@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"github.com/wentf9/xops-cli/internal/terminal"
+	"github.com/wentf9/xops-cli/pkg/i18n"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -22,9 +24,11 @@ import (
 const conPTYHelperEnvironment = "XOPS_SFTP_CONPTY_HELPER"
 
 type conPTYOutput struct {
-	mu      sync.Mutex
-	data    []byte
-	updated chan struct{}
+	mu        sync.Mutex
+	data      []byte
+	screen    string
+	screenErr error
+	updated   chan struct{}
 }
 
 type conPTYHarness struct {
@@ -54,6 +58,9 @@ func TestWindowsLineEditorConPTY(t *testing.T) {
 	waitForConPTYOutput(t, harness.output, "HOST_KEY_ACCEPTED")
 
 	waitForConPTYOutput(t, harness.output, "SFTP_PROMPT_1> ")
+	if err := harness.pty.Resize(72, 24); err != nil {
+		t.Fatal(err)
+	}
 	writeConPTYInput(t, harness.pty, "pwd")
 	waitForConPTYOutput(t, harness.output, "SFTP_PROMPT_1> pwd")
 	writeConPTYInput(t, harness.pty, "\r")
@@ -61,6 +68,35 @@ func TestWindowsLineEditorConPTY(t *testing.T) {
 	waitForConPTYOutput(t, harness.output, "SFTP_HISTORY> ")
 	writeConPTYInput(t, harness.pty, "\x1b[A")
 	waitForConPTYOutput(t, harness.output, "SFTP_HISTORY> pwd")
+	writeConPTYInput(t, harness.pty, "\r")
+	for i, keys := range []string{"\x1b[3~pwd\r", "abc\x01\x1b[3~\r", "\x1b[200~ls\nexit\x1b[201~\r", "\x03", "\x04"} {
+		waitForConPTYOutput(t, harness.output, fmt.Sprintf("SFTP_KEYS_%d>", i))
+		writeConPTYInput(t, harness.pty, keys)
+	}
+	waitForConPTYOutput(t, harness.output, "SFTP_AHEAD_0>")
+	writeConPTYInput(t, harness.pty, "pwd\rhelp\r")
+	waitForConPTYOutput(t, harness.output, "SFTP_SEARCH>")
+	writeConPTYInput(t, harness.pty, "\x12\x1b[200~needle\x1b[201~")
+	waitForConPTYOutput(t, harness.output, "SFTP_SEARCH> get needle")
+	writeConPTYInput(t, harness.pty, "\r\r")
+	waitForConPTYOutput(t, harness.output, "lcp: overwrite local")
+	writeConPTYInput(t, harness.pty, "\x03")
+	waitForConPTYOutput(t, harness.output, "SFTP_PAGES>")
+	writeConPTYInput(t, harness.pty, "put bin\t")
+	waitForConPTYOutput(t, harness.output, "Page 1/3, 80 items")
+	for _, step := range []struct{ keys, selected, page string }{
+		{"\x1b[6~", "bin036\\", "2/3"},
+		{"\x1b[6~", "bin072\\", "3/3"},
+		{"\x1b[5~", "bin036\\", "2/3"},
+		{"\x1b[Z", "bin035\\", "1/3"},
+		{"\t", "bin036\\", "2/3"},
+	} {
+		writeConPTYInput(t, harness.pty, step.keys)
+		waitForConPTYOutput(t, harness.output, "SFTP_PAGES> put "+step.selected)
+		waitForConPTYOutput(t, harness.output, "Page "+step.page)
+	}
+	writeConPTYInput(t, harness.pty, "\r\t")
+	waitForConPTYOutput(t, harness.output, "SFTP_PAGES> put bin036\\tool.txt")
 	writeConPTYInput(t, harness.pty, "\r")
 	waitForConPTYOutput(t, harness.output, "HANDOFF_EDITOR_CLOSED")
 	waitForConPTYOutput(t, harness.output, "sftp:/> ")
@@ -193,6 +229,9 @@ func waitForConPTYProcess(ctx context.Context, process *os.Process) (*os.Process
 }
 
 func runWindowsLineEditorConPTYHelper(t *testing.T) {
+	if err := i18n.Init("en"); err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	answer, err := terminal.NewPrompter(os.Stdin, os.Stdout).ReadLine(ctx, "HOST_KEY_TRUST (yes/no)? ")
@@ -230,6 +269,21 @@ func exerciseConPTYLineEditor(t *testing.T, shell *Shell) {
 	if err != nil {
 		t.Fatalf("create line editor failed: %v", err)
 	}
+	inputHandle := windows.Handle(os.Stdin.Fd())
+	var originalMode uint32
+	if err := windows.GetConsoleMode(inputHandle, &originalMode); err != nil {
+		t.Fatal(err)
+	}
+	checkMode := func() {
+		t.Helper()
+		var current uint32
+		if err := windows.GetConsoleMode(inputHandle, &current); err != nil {
+			t.Fatal(err)
+		}
+		if current != originalMode {
+			t.Fatalf("console mode = %#x, want %#x", current, originalMode)
+		}
+	}
 	closed := false
 	defer func() {
 		if closed {
@@ -246,6 +300,7 @@ func exerciseConPTYLineEditor(t *testing.T, shell *Shell) {
 	if line != "pwd" {
 		t.Fatalf("first prompt result = %q, want pwd", line)
 	}
+	checkMode()
 	if err := editor.AppendHistory(line); err != nil {
 		t.Fatalf("append prompt history failed: %v", err)
 	}
@@ -259,6 +314,55 @@ func exerciseConPTYLineEditor(t *testing.T, shell *Shell) {
 	if historyLine != line {
 		t.Fatalf("history prompt result = %q, want %q", historyLine, line)
 	}
+	for i, expected := range []struct {
+		line string
+		err  error
+	}{
+		{"pwd", nil}, {"bc", nil}, {"ls exit", nil}, {"", ErrPromptInterrupted}, {"", io.EOF},
+	} {
+		line, err := editor.Prompt(t.Context(), fmt.Sprintf("SFTP_KEYS_%d> ", i))
+		if line != expected.line || !errors.Is(err, expected.err) {
+			t.Fatalf("key round %d: %q, %v", i, line, err)
+		}
+		checkMode()
+	}
+	for i, want := range []string{"pwd", "help"} {
+		line, err := editor.Prompt(t.Context(), fmt.Sprintf("SFTP_AHEAD_%d> ", i))
+		if err != nil || line != want {
+			t.Fatalf("type-ahead %d=%q, err=%v", i, line, err)
+		}
+		checkMode()
+	}
+	for _, command := range []string{"get needle", "rm other"} {
+		if err := editor.AppendHistory(command); err != nil {
+			t.Fatal(err)
+		}
+	}
+	searched, searchErr := editor.Prompt(t.Context(), "SFTP_SEARCH> ")
+	if searchErr != nil || searched != "get needle" {
+		t.Fatalf("pasted search=%q, error=%v", searched, searchErr)
+	}
+	checkMode()
+	exerciseConPTYConfirmationInterrupt(t, editor)
+	checkMode()
+	for i := range 80 {
+		if err := os.Mkdir(filepath.Join(shell.localCwd, fmt.Sprintf("bin%03d", i)), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeTestFile(t, filepath.Join(shell.localCwd, "bin036", "tool.txt"), []byte("test"))
+	completed, completeErr := editor.Prompt(t.Context(), "SFTP_PAGES> ")
+	if completeErr != nil || completed != "put "+filepath.Join("bin036", "tool.txt") {
+		t.Fatalf("paged completion=%q, error=%v", completed, completeErr)
+	}
+	checkMode()
+	cancelCtx, cancelPrompt := context.WithTimeout(t.Context(), 150*time.Millisecond)
+	_, cancelErr := editor.Prompt(cancelCtx, "SFTP_CANCEL> ")
+	cancelPrompt()
+	if !errors.Is(cancelErr, context.DeadlineExceeded) {
+		t.Fatalf("canceled prompt = %v", cancelErr)
+	}
+	checkMode()
 	if err := editor.Close(); err != nil {
 		t.Fatalf("close line editor failed: %v", err)
 	}
@@ -282,6 +386,7 @@ func readConPTYOutput(reader io.Reader, output *conPTYOutput, done chan<- error)
 func (o *conPTYOutput) Append(data []byte) {
 	o.mu.Lock()
 	o.data = append(o.data, data...)
+	o.screen, o.screenErr = terminalScreen(string(o.data), 100, 30)
 	o.mu.Unlock()
 	select {
 	case o.updated <- struct{}{}:
@@ -303,6 +408,13 @@ func waitForConPTYOutput(t *testing.T, output *conPTYOutput, expected string) {
 	for {
 		raw := output.String()
 		stripped := stripANSI(raw)
+		output.mu.Lock()
+		stripped += "\n" + output.screen
+		screenErr := output.screenErr
+		output.mu.Unlock()
+		if screenErr != nil {
+			t.Fatal(screenErr)
+		}
 		if strings.Contains(stripped, cleanExpected) {
 			return
 		}
@@ -345,5 +457,32 @@ func exerciseConPTYInteractiveCancellation(t *testing.T) {
 		if err := <-done; !errors.Is(err, io.EOF) {
 			t.Fatalf("canceled interactive read: %v", err)
 		}
+	}
+}
+
+func exerciseConPTYConfirmationInterrupt(t *testing.T, editor *lineEditor) {
+	t.Helper()
+	dir := t.TempDir()
+	for _, name := range []string{"src", "dst"} {
+		if err := os.Mkdir(filepath.Join(dir, name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeTestFile(t, filepath.Join(dir, "src", "a"), []byte("a"))
+	writeTestFile(t, filepath.Join(dir, "src", "b"), []byte("b"))
+	writeTestFile(t, filepath.Join(dir, "dst", "a"), []byte("original"))
+	shell := &Shell{localCwd: dir, stdout: os.Stdout, stderr: os.Stderr, line: editor}
+	err := shell.handleLocalCp(t.Context(), []string{"src/*", "dst"})
+	if !errors.Is(err, ErrPromptInterrupted) {
+		t.Fatalf("overwrite interruption=%v", err)
+	}
+	if err := shell.reportCommandError(err); err != nil {
+		t.Fatalf("REPL cannot resume: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "dst", "b")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("later file was copied: %v", err)
+	}
+	if got := string(readTestFile(t, filepath.Join(dir, "dst", "a"))); got != "original" {
+		t.Fatal("first file was overwritten")
 	}
 }

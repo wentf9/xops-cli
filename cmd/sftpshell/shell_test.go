@@ -33,15 +33,10 @@ func closeTestResource(t *testing.T, closer io.Closer) {
 	}
 }
 
-// verifyNoShellGoroutineLeak excludes readline's process-global SIGWINCH
-// dispatcher. readline starts it once and exposes no shutdown API; every
-// project-owned goroutine remains subject to goleak verification.
-func verifyNoShellGoroutineLeak(t *testing.T) {
+func verifyNoShellGoroutineLeak(t *testing.T) func() {
 	t.Helper()
-	goleak.VerifyNone(t,
-		goleak.IgnoreCurrent(),
-		goleak.IgnoreTopFunction("github.com/chzyer/readline.DefaultOnWidthChanged.func1.1"),
-	)
+	baseline := goleak.IgnoreCurrent()
+	return func() { goleak.VerifyNone(t, baseline) }
 }
 
 func writeTestFile(t *testing.T, path string, data []byte) {
@@ -451,7 +446,7 @@ func TestLocalCdWildcardMultiple(t *testing.T) {
 // TestShellRun_ExitsOnContextCancel 验证连接断开（ctx 被取消）后，
 // shell 无需等待下一次用户交互便返回 context.Canceled。
 func TestShellRun_ExitsOnContextCancel(t *testing.T) {
-	defer verifyNoShellGoroutineLeak(t)
+	defer verifyNoShellGoroutineLeak(t)()
 	initTestI18n(t)
 
 	r, w, err := os.Pipe()
@@ -474,11 +469,11 @@ func TestShellRun_ExitsOnContextCancel(t *testing.T) {
 		runDone <- s.Run(ctx)
 	}()
 
-	// 等待 Readline 确实阻塞在输入上，再模拟连接断开。
+	// 等待行编辑器确实进入输入阶段，再模拟连接断开。
 	promptDeadline := time.Now().Add(2 * time.Second)
 	for {
 		editor := s.currentLineEditor()
-		if editor != nil && editor.instance.Terminal.IsReading() {
+		if editor != nil && editor.isReading() {
 			break
 		}
 		if time.Now().After(promptDeadline) {
@@ -579,7 +574,7 @@ func TestShellRun_RejectsConcurrentRun(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		editor := s.currentLineEditor()
-		if editor != nil && editor.instance.Terminal.IsReading() {
+		if editor != nil && editor.isReading() {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -604,7 +599,7 @@ func TestShellRun_RejectsConcurrentRun(t *testing.T) {
 }
 
 func TestShellClose_CancelsActiveRunAndPreventsRestart(t *testing.T) {
-	defer verifyNoShellGoroutineLeak(t)
+	defer verifyNoShellGoroutineLeak(t)()
 
 	reader, writer, err := os.Pipe()
 	if err != nil {
@@ -628,7 +623,7 @@ func TestShellClose_CancelsActiveRunAndPreventsRestart(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		editor := shell.currentLineEditor()
-		if editor != nil && editor.instance.Terminal.IsReading() {
+		if editor != nil && editor.isReading() {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -1255,7 +1250,7 @@ func TestShell_ConcurrentAcquireAndReconnect(t *testing.T) {
 		// 2. 并发补全
 		go func() {
 			defer wg.Done()
-			_ = s.completeRemotePath(context.Background(), "sub")
+			_, _ = s.completeRemotePath(context.Background(), "sub")
 		}()
 
 		// 3. 并发重连
@@ -1406,4 +1401,85 @@ func TestAcquireClient_AllowsConcurrentLeases(t *testing.T) {
 	}
 	releaseSecond()
 	releaseFirst()
+}
+
+func TestAcquireClientRefreshesInvalidGeneration(t *testing.T) {
+	old, fresh := &sftp.Client{}, &sftp.Client{}
+	sftp.WithForce(true)(old)
+	sftp.WithConcurrentFiles(7)(old)
+	created := make(chan struct{})
+	shell := &Shell{client: old, sshClient: &ssh.Client{}, newClientFn: func(_ context.Context, _ *ssh.Client, opts ...sftp.Option) (*sftp.Client, error) {
+		for _, opt := range opts {
+			opt(fresh)
+		}
+		close(created)
+		return fresh, nil
+	}}
+	_, release, err := shell.acquireClient(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	shell.invalidateClient(old)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	type result struct {
+		client  *sftp.Client
+		release func()
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() { client, release, err := shell.acquireClient(ctx); done <- result{client, release, err} }()
+	for {
+		shell.clientMu.RLock()
+		changing := shell.clientChange != nil
+		shell.clientMu.RUnlock()
+		if changing {
+			break
+		}
+		if ctx.Err() != nil {
+			t.Fatal(ctx.Err())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-created:
+		t.Fatal("refreshed before the old lease drained")
+	default:
+	}
+	release()
+	got := <-done
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	defer got.release()
+	if got.client != fresh || !fresh.Config().Force || fresh.Config().ConcurrentFiles != 7 {
+		t.Fatal("replacement did not preserve transfer configuration")
+	}
+	// Cancellation from an old generation must not retire the replacement.
+	shell.invalidateClient(old)
+	again, releaseAgain, err := shell.acquireClient(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseAgain()
+	if again != fresh {
+		t.Fatal("late invalidation replaced the current generation")
+	}
+}
+
+func TestReportCommandInterruptionKeepsCleanupFailuresFatal(t *testing.T) {
+	shell := &Shell{stdout: io.Discard, stderr: io.Discard}
+	if err := shell.reportCommandError(fmt.Errorf("confirmation: %w", ErrPromptInterrupted)); err != nil {
+		t.Fatal(err)
+	}
+	failure := errors.New("terminal restore failed")
+	err := &promptCleanupError{errors.Join(ErrPromptInterrupted, failure)}
+	if got := shell.reportCommandError(err); !errors.Is(got, failure) {
+		t.Fatalf("cleanup failure swallowed: %v", got)
+	}
+	shell.batch = true
+	if got := shell.reportCommandError(ErrPromptInterrupted); !errors.Is(got, ErrPromptInterrupted) {
+		t.Fatal("batch error swallowed")
+	}
 }
