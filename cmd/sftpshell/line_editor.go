@@ -128,8 +128,12 @@ func (e *lineEditor) prompt(ctx context.Context, options promptOptions) (line st
 	worker := newCompletionWorker(ctx, e.complete)
 	defer worker.Close()
 	model := newEditorModel(options, e.history.Lines(), worker.Schedule)
+	size := selectEditorTerminal(e.stdout, e.stdin)
 	opts := []tea.ProgramOption{
 		tea.WithContext(ctx), tea.WithInput(nil), tea.WithOutput(output),
+		tea.WithWindowSize(size.width, size.height),
+		// The root context owns SIGINT/SIGTERM and joins prompt cleanup.
+		tea.WithoutSignalHandler(),
 	}
 	if file, ok := e.stdout.(terminalFile); ok {
 		opts = append(opts, tea.WithOutput(&editorFileOutput{editorOutput: output, file: file}))
@@ -140,7 +144,7 @@ func (e *lineEditor) prompt(ctx context.Context, options promptOptions) (line st
 	program := tea.NewProgram(model, opts...)
 	worker.Start(program.Send)
 	stopEvents := startEditorEvents(ctx, input, e.session, program.Send)
-	stopResize := watchEditorSize(ctx, e.stdout, program.Send)
+	stopResize := watchEditorSize(ctx, size, program.Send)
 	interruptDone := make(chan struct{})
 	stop := context.AfterFunc(ctx, func() { input.Interrupt(); close(interruptDone) })
 	defer func() {
@@ -160,6 +164,11 @@ func (e *lineEditor) prompt(ctx context.Context, options promptOptions) (line st
 		return "", fmt.Errorf("run SFTP prompt failed: %w", runErr)
 	}
 	final := result.(*editorModel)
+	// Rendering has finished and cleared the edit area. Write once through the
+	// checked output so even commands taller than the screen reach scrollback.
+	if _, err := io.WriteString(output, final.transcript()); err != nil {
+		return "", fmt.Errorf("write SFTP command echo failed: %w", err)
+	}
 	return final.input.Value(), final.err
 }
 

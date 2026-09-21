@@ -53,14 +53,9 @@ func newEditorModel(options promptOptions, history []string, schedule completion
 func (m *editorModel) Init() tea.Cmd { return nil }
 func (m *editorModel) View() tea.View {
 	if m.done {
-		suffix := ""
-		if errors.Is(m.err, ErrPromptInterrupted) {
-			suffix = "^C"
-		}
-		if errors.Is(m.err, io.EOF) {
-			suffix = "^D"
-		}
-		return tea.NewView(ansi.Hardwrap(m.options.text+m.input.Value()+suffix, max(1, m.width), true) + "\n")
+		// The runner writes the transcript after the renderer has stopped.
+		// A final View would clip commands taller than the terminal.
+		return tea.NewView("")
 	}
 	input, cursor := m.inputView()
 	text := m.promptPrefix + input
@@ -75,6 +70,19 @@ func (m *editorModel) View() tea.View {
 	view.Cursor = cursor
 	return view
 }
+
+// transcript is regular output, so the terminal can wrap and scroll all of it.
+func (m *editorModel) transcript() string {
+	suffix := ""
+	if errors.Is(m.err, ErrPromptInterrupted) {
+		suffix = "^C"
+	}
+	if errors.Is(m.err, io.EOF) {
+		suffix = "^D"
+	}
+	return m.options.text + m.input.Value() + suffix + "\n"
+}
+
 func (m *editorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if delivery, ok := msg.(editorDelivery); ok {
 		if m.done {

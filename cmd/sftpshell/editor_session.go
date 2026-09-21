@@ -6,8 +6,6 @@ import (
 	"io"
 	"os"
 	"sync"
-
-	tea "charm.land/bubbletea/v2"
 )
 
 // Session state outlives individual prompt programs and terminal handoffs.
@@ -15,8 +13,7 @@ import (
 type editorSession struct {
 	history *commandHistory
 	prompt  sync.Mutex
-	mu      sync.Mutex
-	pending []tea.Msg
+	decoder editorDecoder
 }
 
 func (s *Shell) getEditorSession(historyFile string, stderr io.Writer) (*editorSession, error) {
@@ -44,20 +41,4 @@ func (s *Shell) getEditorSession(historyFile string, stderr io.Writer) (*editorS
 	}
 	s.editorState = &editorSession{history: history}
 	return s.editorState, nil
-}
-
-func (s *editorSession) takeInput() []tea.Msg {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	pending := s.pending
-	s.pending = nil
-	return pending
-}
-func (s *editorSession) retainInput(events []tea.Msg) {
-	if len(events) == 0 {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.pending = append(s.pending, events...)
 }

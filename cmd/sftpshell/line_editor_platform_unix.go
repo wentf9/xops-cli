@@ -9,14 +9,40 @@ import (
 	"github.com/charmbracelet/x/termios"
 	"github.com/wentf9/xops-cli/internal/terminal"
 	"io"
+	"os"
+	"os/signal"
+	"syscall"
 )
 
 func duplicateEditorInput(input io.Reader) (terminal.PromptInput, error) {
 	return terminal.DuplicatePromptInput(input)
 }
 
-// Bubble Tea receives SIGWINCH directly on Unix.
-func watchEditorSize(context.Context, io.Writer, func(tea.Msg)) func() { return func() {} }
+// Watch the selected terminal even when Bubble Tea has no terminal output.
+func watchEditorSize(ctx context.Context, size editorTerminalSize, send func(tea.Msg)) func() {
+	if size.file == nil {
+		return func() {}
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	changed := make(chan os.Signal, 1)
+	signal.Notify(changed, syscall.SIGWINCH)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer signal.Stop(changed)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-changed:
+				if !size.update(send) {
+					return
+				}
+			}
+		}
+	}()
+	return func() { cancel(); <-done }
+}
 
 // With an externally managed input stream Bubble Tea renders for cooked
 // output. Keep newline processing enabled while disabling input echo/editing.

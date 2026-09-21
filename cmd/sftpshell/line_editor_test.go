@@ -332,3 +332,40 @@ func TestLineEditorCloseReleasesSession(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+type editorEchoFailWriter struct {
+	transcript string
+	err        error
+}
+
+func (w editorEchoFailWriter) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), w.transcript) {
+		return 0, w.err
+	}
+	return len(p), nil
+}
+
+func TestLineEditorTranscriptOutputFailure(t *testing.T) {
+	for _, tt := range []struct{ name, input, echo string }{
+		{"submit", "pwd\r", "ECHO> pwd\n"},
+		{"interrupt", "\x03", "ECHO> ^C\n"},
+		{"EOF", "\x04", "ECHO> ^D\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			failure := errors.New("transcript output rejected")
+			input := &finalChunkReader{data: []byte(tt.input)}
+			editor, err := newLineEditor(t.Context(), input, editorEchoFailWriter{tt.echo, failure}, io.Discard, "", &Shell{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closeTestResource(t, editor)
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
+			_, err = editor.Prompt(ctx, "ECHO> ")
+			var cleanup *promptCleanupError
+			if !errors.Is(err, failure) || !errors.As(err, &cleanup) {
+				t.Fatalf("transcript failure lost: %v", err)
+			}
+		})
+	}
+}

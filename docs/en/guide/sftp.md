@@ -32,7 +32,9 @@ Check target directory permissions and avoid overwriting files unintentionally. 
 
 ## Interactive input and shortcuts
 
-The SFTP prompt supports line editing, command history, and local and remote path completion. Long commands scroll horizontally within the input area. Cursor positions use visible display cells, including wide characters, combining marks, and emoji, and adjust when the terminal is resized. Commands typed ahead are read in order by subsequent prompts instead of being discarded when the preceding command is submitted.
+The SFTP prompt supports line editing, command history, and local and remote path completion. Long commands scroll horizontally within the input area. On submission, the entire command is echoed into terminal scrollback, including commands longer than one screen. Cursor positions use visible display cells, including wide characters, combining marks, and emoji, and adjust when the terminal is resized. Commands typed ahead are read in order by subsequent prompts instead of being discarded when the preceding command is submitted.
+
+UTF-8 characters and bracketed pastes split across prompts are preserved too; newlines inside a paste never submit a command. When stdin is a terminal and stdout is piped through a tool such as `tee`, command prompts, edited text, and confirmation questions remain visible using the input terminal dimensions and updating when that terminal is resized.
 
 | Key | Behavior |
 | --- | --- |
@@ -56,6 +58,6 @@ Pasted newlines and tabs become spaces, and control characters are removed. Past
 
 If the history or lock file is unavailable at startup, a warning is displayed and the shell uses session-only history. Readable existing entries remain available, but this fallback does not write to disk. Normally, command history is stored in `~/.xops_sftp_history`, retaining up to 500 recent entries and ignoring empty input and consecutive duplicates. Confirmation answers and batch commands are not recorded. Confirmation prompts disable command completion and history browsing. History write failures are reported while retaining the command in the current session. Once writing recovers, pending entries are merged with disk history, retaining the most recent 500 entries.
 
-Before executing commands or entering a local/remote interactive program, the prompt stops reading and restores the terminal. The SFTP prompt resumes when the program finishes. Connection loss or cancellation ends pending input and completion tasks.
+Before executing commands or entering a local/remote interactive program, the prompt stops reading and restores the terminal. The SFTP prompt resumes when the program finishes. Connection loss or cancellation ends pending input and completion tasks. External SIGINT or SIGTERM ends the session after pending prompt tasks stop and terminal state is restored.
 
 At an overwrite or removal confirmation, answering `n` skips only the current item; Ctrl+C stops the rest of the command and returns to the prompt. File operations already completed are not rolled back.
