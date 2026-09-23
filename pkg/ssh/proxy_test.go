@@ -216,6 +216,15 @@ func TestProxyJump_Integration(t *testing.T) {
 	if client.Config().NodeID != "target" {
 		t.Errorf("expected target client, got %s", client.Config().NodeID)
 	}
+
+	// A tunneled client's transport is an SSH channel. Once closed, closing
+	// it again returns EOF; pool cleanup must still succeed in this state.
+	if err := client.Close(); err != nil {
+		t.Fatalf("close target client failed: %v", err)
+	}
+	if err := client.sshClient.Close(); !errors.Is(err, io.EOF) {
+		t.Fatalf("close already closed proxy channel = %v, want EOF", err)
+	}
 }
 
 func TestProxyJump_HandshakeTimeout(t *testing.T) {

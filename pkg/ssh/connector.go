@@ -923,7 +923,8 @@ func (c *Connector) CloseAll() error {
 
 	var closeErrs []error
 	c.clients.IterCb(func(_ string, client *PooledClient) bool {
-		if err := client.SSHClient.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		// ProxyJump transports return EOF when their SSH channel is already closed.
+		if err := closeResource(client.SSHClient, "pooled SSH client"); err != nil {
 			closeErrs = append(closeErrs, err)
 		}
 		return true
