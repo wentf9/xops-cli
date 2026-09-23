@@ -132,11 +132,14 @@ func runForwardListener(ctx context.Context, listener net.Listener, options forw
 				break
 			}
 			handlers.Go(func() {
-				if err := handle(runCtx, conn); err != nil && runCtx.Err() == nil {
+				if err := handleForwardConnection(runCtx, conn, handle); err != nil && runCtx.Err() == nil {
 					options.onConnectionError(err)
 				}
 			})
 		}
+		// Stop accepted connections before joining handlers, including a SOCKS5
+		// client that has not finished sending its greeting.
+		cancel()
 		var cancellationCloseErr error
 		if !stopCancellation() {
 			cancellationCloseErr = <-cancellationClose
@@ -146,6 +149,19 @@ func runForwardListener(ctx context.Context, listener net.Listener, options forw
 		forward.err = errors.Join(acceptErr, closeErr)
 	}()
 	return forward
+}
+
+func handleForwardConnection(ctx context.Context, conn net.Conn, handle func(context.Context, net.Conn) error) (retErr error) {
+	closed := make(chan error, 1)
+	stopClose := context.AfterFunc(ctx, func() {
+		closed <- closeResource(conn, "canceled forwarding client connection")
+	})
+	defer func() {
+		if !stopClose() {
+			retErr = errors.Join(retErr, <-closed)
+		}
+	}()
+	return handle(ctx, conn)
 }
 
 func (c *Client) dialSSH(ctx context.Context, network, addr string) (net.Conn, error) {

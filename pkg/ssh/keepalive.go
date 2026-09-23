@@ -26,7 +26,15 @@ const (
 // timeout: 单次心跳等待响应的超时时间 (建议 5s - 15s)，超时视为连接已断开
 // fallback: 可选的回调函数，用于在心跳失败后执行,心跳失败时会关闭连接
 // 返回的通道在心跳 goroutine 完全退出后关闭，调用方可据此等待资源回收。
+// client.Close 必须能解除本地 I/O 阻塞；嵌套 ProxyJump 使用 Connector.EnableKeepAlive
+// 或 Client.Wait，由连接所有者提供最外层传输的中断路径。
 func StartKeepAlive(ctx context.Context, client *ssh.Client, interval, timeout time.Duration, fallback func(err error)) <-chan struct{} {
+	return startKeepAlive(ctx, client, interval, timeout, fallback, func() error {
+		return closeResource(client, "SSH client after keepalive")
+	})
+}
+
+func startKeepAlive(ctx context.Context, client *ssh.Client, interval, timeout time.Duration, fallback func(error), interrupt func() error) <-chan struct{} {
 	done := make(chan struct{})
 	if interval <= 0 {
 		interval = DefaultKeepAliveInterval
@@ -47,7 +55,7 @@ func StartKeepAlive(ctx context.Context, client *ssh.Client, interval, timeout t
 				return
 			case <-ticker.C:
 				// 发送心跳请求
-				if err := probeWithTimeout(ctx, client, timeout); err != nil {
+				if err := probeWithTimeoutAndInterrupt(ctx, client, timeout, interrupt); err != nil {
 					if ctx.Err() != nil {
 						return
 					}
@@ -67,6 +75,14 @@ func StartKeepAlive(ctx context.Context, client *ssh.Client, interval, timeout t
 // SendRequest 本身无法取消，因此探测失败、超时或 ctx 取消时都会关闭 Client，
 // 既驱动所有使用者及时失败，也确保内部探测 goroutine 有确定的退出路径。
 func probeWithTimeout(ctx context.Context, client *ssh.Client, timeout time.Duration) error {
+	return probeWithTimeoutAndInterrupt(ctx, client, timeout, func() error {
+		return closeResource(client, "SSH client after keepalive")
+	})
+}
+
+// interrupt must release transport reads and writes without a peer response.
+// Connector-owned ProxyJump clients provide the outermost transport's abort path.
+func probeWithTimeoutAndInterrupt(ctx context.Context, client *ssh.Client, timeout time.Duration, interrupt func() error) error {
 	if timeout <= 0 {
 		timeout = DefaultKeepAliveTimeout
 	}
@@ -84,8 +100,8 @@ func probeWithTimeout(ctx context.Context, client *ssh.Client, timeout time.Dura
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	terminateProbe := func(probeErr error) error {
-		closeErr := client.Close()
-		// ssh.Client.Close 解除 SendRequest 阻塞；等待结果可确保探测 goroutine 已退出。
+		closeErr := interrupt()
+		// Abort the transport before joining the pending request.
 		<-done
 		if closeErr != nil {
 			return fmt.Errorf("%w; close SSH client after keepalive failed: %w", probeErr, closeErr)
@@ -97,17 +113,12 @@ func probeWithTimeout(ctx context.Context, client *ssh.Client, timeout time.Dura
 		if r.err == nil {
 			return nil
 		}
-		return closeAfterProbeFailure(client, fmt.Errorf("ssh keepalive request failed: %w", r.err))
+		// The request has already returned. A closed target can be replaced
+		// over a healthy jump, so do not abort the shared root in this case.
+		return errors.Join(fmt.Errorf("ssh keepalive request failed: %w", r.err), closeResource(client, "SSH client after keepalive"))
 	case <-timer.C:
 		return terminateProbe(fmt.Errorf("ssh keepalive: %w", errKeepaliveTimeout))
 	case <-ctx.Done():
 		return terminateProbe(fmt.Errorf("ssh keepalive canceled: %w", ctx.Err()))
 	}
-}
-
-func closeAfterProbeFailure(client *ssh.Client, probeErr error) error {
-	if err := client.Close(); err != nil {
-		return fmt.Errorf("%w; close SSH client after keepalive failed: %w", probeErr, err)
-	}
-	return probeErr
 }

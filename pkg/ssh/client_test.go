@@ -61,7 +61,8 @@ func (m *mockInterruptConn) Close() error {
 	return m.closeErr
 }
 
-// TestClient_Interrupt_SynchronousAndSafe verifies that Interrupt calls SetDeadline and Close synchronously without spawning detached goroutines.
+// Interrupt closes the physical transport without injecting a timeout that can
+// race with Close and be reported later by nested SSH clients.
 func TestClient_Interrupt_SynchronousAndSafe(t *testing.T) {
 	conn := &mockInterruptConn{}
 	cli := &Client{rootConn: conn}
@@ -71,8 +72,8 @@ func TestClient_Interrupt_SynchronousAndSafe(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if !conn.deadlineCalled.Load() {
-		t.Error("expected SetDeadline to be called")
+	if conn.deadlineCalled.Load() {
+		t.Error("Interrupt must not manufacture a deadline error")
 	}
 	if !conn.closedCalled.Load() {
 		t.Error("expected Close to be called")

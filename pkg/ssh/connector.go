@@ -187,6 +187,8 @@ type connectionPlanNode struct {
 	cfg  *ClientConfig
 }
 
+var errProxyTransportClosed = errors.New("proxy transport generation is closed")
+
 // Connect 根据节点名称建立 SSH 连接。
 // ProxyJump 链会先完整解析并检测环，再从最底层跳板机开始逐层建立连接。
 func (c *Connector) Connect(ctx context.Context, nodeName string) (*Client, error) {
@@ -202,10 +204,29 @@ func (c *Connector) Connect(ctx context.Context, nodeName string) (*Client, erro
 		return nil, err
 	}
 
+	// A downstream probe can invalidate the jump clients already visited in
+	// this plan. Restart outside singleflight, so no node task waits recursively
+	// for another node task. Bound restarts even under repeated concurrent loss.
+	rebuildLimit := len(plan) - 1
+	for rebuilds := 0; ; rebuilds++ {
+		client, err := c.connectPlan(ctx, plan)
+		if !errors.Is(err, errProxyTransportClosed) || rebuilds >= rebuildLimit {
+			return client, err
+		}
+		// Successful handshakes clear session secrets and may update credential
+		// tokens. Resolve a fresh plan rather than reusing mutated configs.
+		plan, err = c.resolveConnectionPlan(ctx, nodeName)
+		if err != nil {
+			return nil, err
+		}
+	}
+}
+
+func (c *Connector) connectPlan(ctx context.Context, plan []connectionPlanNode) (*Client, error) {
 	var connected *Client
 	for index := len(plan) - 1; index >= 0; index-- {
 		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("connect node '%s' canceled: %w", nodeName, err)
+			return nil, fmt.Errorf("connect node '%s' canceled: %w", plan[0].name, err)
 		}
 
 		planNode := plan[index]
@@ -217,9 +238,10 @@ func (c *Connector) Connect(ctx context.Context, nodeName string) (*Client, erro
 			if connected == nil {
 				return nil, fmt.Errorf("resolved proxy jump '%s' for node '%s' has no client", planNode.cfg.ProxyJump, planNode.name)
 			}
-			dialer = &SSHProxyDialer{Client: connected.sshClient}
+			dialer = &SSHProxyDialer{Client: connected.sshClient, RootConn: connected.rootConn}
 		}
 
+		var err error
 		connected, err = c.connectPlannedNode(ctx, planNode, dialer)
 		if err != nil {
 			return nil, err
@@ -375,14 +397,16 @@ func (c *Connector) beginSharedConnect() (context.Context, func(), error) {
 
 func (c *Connector) connectNode(ctx context.Context, planNode connectionPlanNode, dialer Dialer) (*Client, error) {
 	nodeName := planNode.name
+	var probeErr error
 	if cachedClient, ok := c.clients.Get(nodeName); ok {
 		if cachedClient.SSHClient.Conn == nil {
 			return c.wrapCachedClient(planNode.cfg, cachedClient), nil
 		}
 
-		if err := probeWithTimeout(ctx, cachedClient.SSHClient, c.keepAliveProbeTimeout()); err == nil {
+		if err := probeWithTimeoutAndInterrupt(ctx, cachedClient.SSHClient, c.keepAliveProbeTimeout(), cachedClient.interrupt); err == nil {
 			return c.wrapCachedClient(planNode.cfg, cachedClient), nil
 		} else {
+			probeErr = err
 			c.evictCachedClient(nodeName, cachedClient)
 			if ctx.Err() != nil {
 				return nil, fmt.Errorf("probe cached SSH connection for node '%s' failed: %w", nodeName, ctx.Err())
@@ -390,7 +414,15 @@ func (c *Connector) connectNode(ctx context.Context, planNode connectionPlanNode
 		}
 	}
 
-	return c.initializeConnection(ctx, planNode, dialer)
+	if proxy, ok := dialer.(*SSHProxyDialer); ok && proxy.transportClosed() {
+		return nil, fmt.Errorf("rebuild proxy chain for '%s': %w", nodeName, errors.Join(errProxyTransportClosed, probeErr))
+	}
+	client, err := c.initializeConnection(ctx, planNode, dialer)
+	// Another caller can invalidate the same root after the check above.
+	if proxy, ok := dialer.(*SSHProxyDialer); err != nil && ok && proxy.transportClosed() && ctx.Err() == nil {
+		return nil, fmt.Errorf("rebuild proxy chain for '%s': %w", nodeName, errors.Join(errProxyTransportClosed, err))
+	}
+	return client, err
 }
 
 func (c *Connector) wrapCachedClient(cfg *ClientConfig, cachedClient *PooledClient) *Client {
@@ -518,7 +550,11 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 	cfg.Passphrase = ""
 	cfg.SuPwd = ""
 
-	pooled := &PooledClient{SSHClient: rawClient, RootConn: rootConn}
+	transportRoot := rootConn
+	if proxy, ok := dialer.(*SSHProxyDialer); ok && proxy.RootConn != nil {
+		transportRoot = proxy.RootConn
+	}
+	pooled := &PooledClient{SSHClient: rawClient, RootConn: transportRoot}
 	if err := c.publishClient(nodeName, pooled); err != nil {
 		if closeErr := rootConn.Close(); closeErr != nil {
 			return nil, fmt.Errorf("%w; close unpublished SSH client failed: %w", err, closeErr)
@@ -529,7 +565,7 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 	// 返回封装的 Client，注入组件，且 Client 不持有 AuthMaterial
 	return newClientWithComponents(
 		rawClient,
-		rootConn,
+		transportRoot,
 		cfg,
 		c.provider,
 		c.secretResolver,
@@ -687,9 +723,9 @@ func (c *Connector) startKeepAliveFor(nodeName string, client *PooledClient) {
 	}
 	c.keepAlives.Set(nodeName, entry)
 	c.keepAliveWG.Add(1)
-	entry.done = StartKeepAlive(nodeCtx, client.SSHClient, cfg.interval, cfg.timeout, func(error) {
+	entry.done = startKeepAlive(nodeCtx, client.SSHClient, cfg.interval, cfg.timeout, func(error) {
 		c.evictDeadClient(nodeName, client, entry)
-	})
+	}, client.interrupt)
 	go func() {
 		<-entry.done
 		c.keepAliveWG.Done()
@@ -814,6 +850,9 @@ func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, cfg *
 			Err:      dialErr,
 		}
 	}
+	if _, proxied := dialer.(*SSHProxyDialer); !proxied {
+		conn = &physicalSSHConn{Conn: conn}
+	}
 	if err := c.initHandshakeDeadline(ctx, conn, nodeName, coordinator); err != nil {
 		return nil, nil, err
 	}
@@ -923,8 +962,8 @@ func (c *Connector) CloseAll() error {
 
 	var closeErrs []error
 	c.clients.IterCb(func(_ string, client *PooledClient) bool {
-		// ProxyJump transports return EOF when their SSH channel is already closed.
-		if err := closeResource(client.SSHClient, "pooled SSH client"); err != nil {
+		// Close the physical transport before nested channels can block on writes.
+		if err := client.interrupt(); err != nil {
 			closeErrs = append(closeErrs, err)
 		}
 		return true
@@ -1279,10 +1318,15 @@ func appendKnownHost(knownHostsFile, hostname string, key ssh.PublicKey) (err er
 	return nil
 }
 
-// PooledClient represents a pooled SSH client with its underlying connection
+// PooledClient retains the outermost transport, including for ProxyJump clients.
+// Interrupting it also terminates other clients sharing that transport.
 type PooledClient struct {
 	SSHClient *ssh.Client
 	RootConn  net.Conn
+}
+
+func (c *PooledClient) interrupt() error {
+	return interruptSSHTransport(c.RootConn, c.SSHClient)
 }
 
 // A confirmation failure must close the authenticated but unpublished client.

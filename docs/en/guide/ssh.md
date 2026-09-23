@@ -37,3 +37,5 @@ xops ssh -D 1080 -N web-01
 ```
 
 Tunnels close when the session ends. See [Troubleshooting](../troubleshooting/) for connection, host key, and credential issues.
+
+With `-L`, `-R`, `-D`, or `-N`, XOps monitors the SSH connection. A lost connection closes the forwarding listeners and returns a failure status. Silent network loss is detected by SSH keepalive requests every 15 seconds, with a 10-second timeout per probe. Connections are not automatically reestablished; rerun the command after connectivity returns.

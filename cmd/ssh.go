@@ -549,8 +549,12 @@ func newSSHTunnelGroup(ctx context.Context, cancelParent context.CancelFunc) (*s
 }
 
 func (g *sshTunnelGroup) Add(forward *ssh.Forward) {
+	g.addWait(forward.Wait)
+}
+
+func (g *sshTunnelGroup) addWait(wait func() error) {
 	g.done.Go(func() {
-		if err := forward.Wait(); err != nil {
+		if err := wait(); err != nil {
 			g.errMu.Lock()
 			g.err = errors.Join(g.err, err)
 			g.errMu.Unlock()
@@ -572,6 +576,9 @@ func (g *sshTunnelGroup) Close() error {
 
 func (o *SshOptions) startTunnels(ctx context.Context, cancelParent context.CancelFunc, client *ssh.Client) (*sshTunnelGroup, error) {
 	group, tunnelCtx := newSSHTunnelGroup(ctx, cancelParent)
+	if o.NoCmd || len(o.LocalForwards) > 0 || len(o.RemoteForwards) > 0 || o.DynamicForward != "" {
+		group.addWait(func() error { return client.Wait(tunnelCtx) })
+	}
 	fail := func(err error) (*sshTunnelGroup, error) {
 		return nil, errors.Join(err, group.Close())
 	}

@@ -162,26 +162,26 @@ func (c *Client) getLogger() logger.DebugLogger {
 }
 
 // Interrupt closes the underlying transport forcefully and synchronously.
-// It sets an immediate deadline on rootConn and closes the network connection,
-// unblocking any concurrent I/O operations without spawning background goroutines.
+// Closing the physical connection unblocks I/O without relying on a peer reply
+// or manufacturing deadline errors in the SSH transport.
+// For ProxyJump this closes the outermost transport and all clients sharing it.
 func (c *Client) Interrupt() error {
 	if c == nil {
 		return nil
 	}
+	return interruptSSHTransport(c.rootConn, c.sshClient)
+}
+
+func interruptSSHTransport(root net.Conn, client *ssh.Client) error {
 	var errs []error
-	if c.rootConn != nil {
-		if deadliner, ok := c.rootConn.(interface{ SetDeadline(t time.Time) error }); ok {
-			if err := deadliner.SetDeadline(time.Now()); err != nil {
-				errs = append(errs, fmt.Errorf("set deadline failed: %w", err))
-			}
-		}
-		if closeErr := c.rootConn.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
-			errs = append(errs, fmt.Errorf("close root conn failed: %w", closeErr))
+	if root != nil {
+		if err := closeResource(root, "root SSH transport"); err != nil {
+			errs = append(errs, err)
 		}
 	}
-	if c.sshClient != nil {
-		if closeErr := c.sshClient.Close(); closeErr != nil && !errors.Is(closeErr, io.EOF) && !errors.Is(closeErr, net.ErrClosed) {
-			errs = append(errs, fmt.Errorf("close ssh client failed: %w", closeErr))
+	if client != nil {
+		if err := closeResource(client, "SSH client"); err != nil {
+			errs = append(errs, err)
 		}
 	}
 
@@ -189,7 +189,7 @@ func (c *Client) Interrupt() error {
 }
 
 func (c *Client) Close() error {
-	return c.sshClient.Close()
+	return closeResource(c.sshClient, "SSH transport")
 }
 
 // Config returns a snapshot of the node configuration. Mutating the returned
