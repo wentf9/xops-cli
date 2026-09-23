@@ -40,18 +40,20 @@ func NewCmdIdentity() *cobra.Command {
 
 func NewCmdIdentityEdit() *cobra.Command {
 	var (
-		user     string
-		password string
-		keyPath  string
-		keyPass  string
+		user    string
+		keyPath string
 	)
 
+	secretInput := &utils.InventorySecretInput{}
 	cmd := &cobra.Command{
 		Use:   "edit [name]",
 		Short: i18n.T("identity_edit_short"),
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			utils.WarnInventorySecretFlags(cmd)
+			password, keyPass, err := secretInput.Read(cmd)
+			if err != nil {
+				return err
+			}
 			name := args[0]
 			_, repository, _, err := utils.GetConfigStore()
 			if err != nil {
@@ -101,10 +103,9 @@ func NewCmdIdentityEdit() *cobra.Command {
 	}
 
 	cmd.Flags().StringVarP(&user, "user", "u", "", i18n.T("flag_identity_user"))
-	cmd.Flags().StringVarP(&password, "password", "p", "", i18n.T("flag_identity_password"))
 	cmd.Flags().StringVarP(&keyPath, "key", "k", "", i18n.T("flag_identity_key"))
-	cmd.Flags().StringVarP(&keyPass, "key-pass", "w", "", i18n.T("flag_identity_key_pass"))
 
+	secretInput.RegisterFlags(cmd)
 	return cmd
 }
 
@@ -174,18 +175,20 @@ func NewCmdIdentityList() *cobra.Command {
 
 func NewCmdIdentityAdd() *cobra.Command {
 	var (
-		name     string
-		user     string
-		password string
-		keyPath  string
-		keyPass  string
+		name    string
+		user    string
+		keyPath string
 	)
 
+	secretInput := &utils.InventorySecretInput{}
 	cmd := &cobra.Command{
 		Use:   "add",
 		Short: i18n.T("identity_add_short"),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			utils.WarnInventorySecretFlags(cmd)
+			password, keyPass, err := secretInput.Read(cmd)
+			if err != nil {
+				return err
+			}
 			if name == "" {
 				return fmt.Errorf("%s", i18n.T("identity_err_no_name"))
 			}
@@ -201,6 +204,10 @@ func NewCmdIdentityAdd() *cobra.Command {
 				if userErr != nil {
 					return fmt.Errorf("get current user failed: %w", userErr)
 				}
+			}
+
+			if keyPass != "" && keyPath == "" {
+				return fmt.Errorf("private-key path is required for a passphrase (--key)")
 			}
 
 			identity := models.Identity{
@@ -248,10 +255,9 @@ func NewCmdIdentityAdd() *cobra.Command {
 
 	cmd.Flags().StringVarP(&name, "name", "n", "", i18n.T("identity_flag_name"))
 	cmd.Flags().StringVarP(&user, "user", "u", "", i18n.T("identity_flag_user"))
-	cmd.Flags().StringVarP(&password, "password", "p", "", i18n.T("identity_flag_password"))
 	cmd.Flags().StringVarP(&keyPath, "key", "k", "", i18n.T("identity_flag_key"))
-	cmd.Flags().StringVarP(&keyPass, "key-pass", "K", "", i18n.T("identity_flag_key_pass"))
 
+	secretInput.RegisterFlags(cmd)
 	return cmd
 }
 

@@ -56,12 +56,6 @@ func NewCmdScp() *cobra.Command {
 		Short: i18n.T("scp_short"),
 		Long:  i18n.T("scp_long"),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if cmd.Flags().Changed("password") {
-				cmdutils.WarnFlagDeprecated("password", "--password-stdin or 'xops identity credential set'")
-			}
-			if cmd.Flags().Changed("passphrase") {
-				cmdutils.WarnFlagDeprecated("passphrase", "--passphrase-stdin or 'xops identity credential set'")
-			}
 			if err := o.Complete(cmd, args); err != nil {
 				return err
 			}
@@ -81,9 +75,7 @@ func NewCmdScp() *cobra.Command {
 
 	// xops-enhanced flags (long-form only, no short flags to avoid OpenSSH conflicts)
 	cmd.Flags().StringVar(&o.Host, "host", "", i18n.T("flag_hosts"))
-	cmd.Flags().StringVar(&o.Password, "password", "", i18n.T("flag_password"))
 	cmd.Flags().BoolVar(&o.PasswordStdin, "password-stdin", false, i18n.T("flag_password_stdin"))
-	cmd.Flags().StringVar(&o.Passphrase, "passphrase", "", i18n.T("flag_passphrase"))
 	cmd.Flags().BoolVar(&o.PassphraseStdin, "passphrase-stdin", false, i18n.T("flag_passphrase_stdin"))
 	cmd.Flags().StringVar(&o.Remember, "remember", "", i18n.T("flag_remember"))
 	cmd.Flags().StringVar(&o.Alias, "alias", "", i18n.T("flag_alias"))
@@ -100,9 +92,6 @@ func NewCmdScp() *cobra.Command {
 	cmd.Flags().IntVar(&o.TaskCount, "task", 3, i18n.T("flag_task"))
 	cmd.Flags().IntVar(&o.ThreadCount, "thread", 4, i18n.T("flag_thread"))
 
-	cmd.MarkFlagsMutuallyExclusive("password", "identity")
-	cmd.MarkFlagsMutuallyExclusive("password", "password-stdin")
-	cmd.MarkFlagsMutuallyExclusive("passphrase", "passphrase-stdin")
 	cmd.MarkFlagsMutuallyExclusive("host", "ifile", "tag")
 	cmd.MarkFlagsMutuallyExclusive("force", "no-clobber")
 	return cmd

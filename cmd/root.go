@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/wentf9/xops-cli/cmd/host"
 	"github.com/wentf9/xops-cli/cmd/version"
 	"github.com/wentf9/xops-cli/pkg/i18n"
@@ -49,7 +50,7 @@ func Execute() (err error) {
 }
 
 func newRootCmd() *cobra.Command {
-	return &cobra.Command{
+	root := &cobra.Command{
 		Use:           "xops [command] [flags]",
 		Short:         i18n.T("root_short"),
 		Long:          i18n.T("root_long"),
@@ -106,6 +107,16 @@ func newRootCmd() *cobra.Command {
 			return warnLegacyConfiguration(cmd)
 		},
 	}
+	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
+		var unknown *pflag.NotExistError
+		if errors.As(err, &unknown) && unknown.GetSpecifiedShortnames() != "" {
+			// pflag includes the whole shorthand token, which may contain the
+			// value of a removed credential flag such as -Psecret or -P=secret.
+			return fmt.Errorf("unknown shorthand flag: %q", unknown.GetSpecifiedName())
+		}
+		return err
+	})
+	return root
 }
 
 func initRootFlags(rootCmd *cobra.Command) {
@@ -136,7 +147,6 @@ func registerCommands(rootCmd *cobra.Command) {
 	rootCmd.AddCommand(newCmdFirewall())
 	rootCmd.AddCommand(newCmdSudo())
 	rootCmd.AddCommand(newCmdEncode())
-	rootCmd.AddCommand(newCmdLoadHost())
 	rootCmd.AddCommand(newCmdForward())
 }
 

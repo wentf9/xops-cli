@@ -34,7 +34,7 @@ func setupFirewallCredential(t *testing.T) {
 	if err := store.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
-	if err := executePhase6(t, NewCmdIdentity(), "edit", "admin", "--password", "firewall-secret"); err != nil {
+	if err := executePhase6WithInput(t, NewCmdIdentity(), "firewall-secret\n", "edit", "admin", "--password-stdin"); err != nil {
 		t.Fatal(err)
 	}
 }

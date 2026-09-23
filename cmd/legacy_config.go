@@ -23,7 +23,7 @@ func warnLegacyConfiguration(cmd *cobra.Command) error {
 		top = top.Parent()
 	}
 	switch top.Name() {
-	case "init", "host", "identity", "credential", "ssh", "sftp", "scp", "exec", "tui", "mcp", "play", "sudo", "firewall", "forward", "loadHost":
+	case "init", "host", "identity", "credential", "ssh", "sftp", "scp", "exec", "tui", "mcp", "play", "sudo", "firewall", "forward":
 	default:
 		return nil
 	}

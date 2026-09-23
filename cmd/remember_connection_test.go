@@ -23,7 +23,7 @@ func TestConnectionAskOnlyForNewCredential(t *testing.T) {
 	if err := store.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
-	if err := executePhase6(t, NewCmdIdentity(), "edit", "admin", "--password", "stored-secret"); err != nil {
+	if err := executePhase6WithInput(t, NewCmdIdentity(), "stored-secret\n", "edit", "admin", "--password-stdin"); err != nil {
 		t.Fatal(err)
 	}
 	// Each iteration builds a fresh adapter, as with separate CLI invocations.
@@ -80,7 +80,7 @@ func TestConnectionAskDetectsReplacedKeyAtSamePath(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := inventoryTestPrivateKey(t, true)
-	if err := executePhase6(t, NewCmdIdentity(), "edit", "admin", "--key", key, "--key-pass", "key-password"); err != nil {
+	if err := executePhase6WithInput(t, NewCmdIdentity(), "key-password\n", "edit", "admin", "--key", key, "--passphrase-stdin"); err != nil {
 		t.Fatal(err)
 	}
 	for _, replaced := range []bool{false, true} {

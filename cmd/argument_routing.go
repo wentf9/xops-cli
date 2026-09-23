@@ -94,10 +94,7 @@ func preprocessSubArgs(args []string, cmd *cobra.Command) []string {
 		}
 		if strings.HasPrefix(args[i], "-") {
 			n, names, ok := routingFlag(cmd, args[i])
-			if !ok {
-				if target {
-					return separateRemoteArgs(args, i)
-				}
+			if !ok { // Unknown local flags must fail before starting a remote command.
 				return append([]string(nil), args...)
 			}
 			for _, name := range names {

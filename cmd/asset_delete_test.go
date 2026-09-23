@@ -96,7 +96,7 @@ func TestAssetDeletionRetainsSharedCredential(t *testing.T) {
 
 func TestIdentityDeleteCleansStoredCredential(t *testing.T) {
 	setupFirewallCredential(t)
-	if err := executePhase6(t, NewCmdIdentity(), "add", "--name", "orphan", "--user", "ops", "--password", "identity-secret"); err != nil {
+	if err := executePhase6WithInput(t, NewCmdIdentity(), "identity-secret\n", "add", "--name", "orphan", "--user", "ops", "--password-stdin"); err != nil {
 		t.Fatal(err)
 	}
 	_, _, cfg, err := utils.GetConfigStore()

@@ -54,21 +54,21 @@ func executePhase6(t *testing.T, cmd *cobra.Command, args ...string) error {
 	return cmd.Execute()
 }
 
-func TestInventoryCompatibilityFlagsUseCredentialStore(t *testing.T) {
+func TestInventoryStdinUsesCredentialStore(t *testing.T) {
 	for _, tc := range []struct {
 		name           string
 		newCmd         func() *cobra.Command
 		args           []string
 		identity, node string
 	}{
-		{"identity add", NewCmdIdentity, []string{"add", "--name", "new", "--user", "admin", "--password", "fixture-secret"}, "new", ""},
-		{"identity edit", NewCmdIdentity, []string{"edit", "admin", "--password", "fixture-secret"}, "admin", ""},
-		{"host add", hostcmd.NewCmdInventoryAdd, []string{"--skip-verify", "--address", "127.0.0.2", "--user", "admin", "--password", "fixture-secret"}, "", "admin@127.0.0.2:22"},
-		{"host edit", hostcmd.NewCmdInventoryEdit, []string{"node", "--password", "fixture-secret"}, "", "node"},
+		{"identity add", NewCmdIdentity, []string{"add", "--name", "new", "--user", "admin", "--password-stdin"}, "new", ""},
+		{"identity edit", NewCmdIdentity, []string{"edit", "admin", "--password-stdin"}, "admin", ""},
+		{"host add", hostcmd.NewCmdInventoryAdd, []string{"--skip-verify", "--address", "127.0.0.2", "--user", "admin", "--password-stdin"}, "", "admin@127.0.0.2:22"},
+		{"host edit", hostcmd.NewCmdInventoryEdit, []string{"node", "--password-stdin"}, "", "node"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := phase6Config(t, config.StoreConfig{Type: config.StoreTypeHelper, Command: os.Args[0]})
-			if err := executePhase6(t, tc.newCmd(), tc.args...); err != nil {
+			if err := executePhase6WithInput(t, tc.newCmd(), "fixture-secret\n", tc.args...); err != nil {
 				t.Fatal(err)
 			}
 			cfg, err := store.Load()
@@ -116,7 +116,7 @@ func TestInventoryCompatibilityFlagsUseCredentialStore(t *testing.T) {
 
 func TestInventoryNoneRejectsSecretBeforeMutation(t *testing.T) {
 	store := phase6Config(t, config.StoreConfig{Type: config.StoreTypeNone})
-	err := executePhase6(t, NewCmdIdentity(), "add", "--name", "new", "--password", "fixture-secret")
+	err := executePhase6WithInput(t, NewCmdIdentity(), "fixture-secret\n", "add", "--name", "new", "--password-stdin")
 	if !errors.Is(err, credential.ErrCredentialStoreReadOnly) {
 		t.Fatalf("none write = %v", err)
 	}
@@ -131,7 +131,7 @@ func TestInventoryNoneRejectsSecretBeforeMutation(t *testing.T) {
 
 func TestIdentityCredentialFailurePreservesAuthentication(t *testing.T) {
 	store := phase6Config(t, config.StoreConfig{Type: config.StoreTypeHelper, Command: os.Args[0]})
-	if err := executePhase6(t, NewCmdIdentity(), "edit", "admin", "--password", "old-secret"); err != nil {
+	if err := executePhase6WithInput(t, NewCmdIdentity(), "old-secret\n", "edit", "admin", "--password-stdin"); err != nil {
 		t.Fatal(err)
 	}
 	before, err := store.Load()
@@ -140,7 +140,7 @@ func TestIdentityCredentialFailurePreservesAuthentication(t *testing.T) {
 	}
 	old, _ := before.Identities.Get("admin")
 	t.Setenv("TEST_HELPER_ERROR_CODE", "locked")
-	err = executePhase6(t, NewCmdIdentity(), "edit", "admin", "--key", "replacement-key", "--key-pass", "new-secret")
+	err = executePhase6WithInput(t, NewCmdIdentity(), "new-secret\n", "edit", "admin", "--key", "replacement-key", "--passphrase-stdin")
 	if !errors.Is(err, credential.ErrCredentialStoreLocked) {
 		t.Fatalf("locked write = %v", err)
 	}
@@ -256,7 +256,7 @@ func TestSSHRememberUsesConfiguredPolicyAndExplicitOverride(t *testing.T) {
 
 func TestHostCredentialReplacementPreservesSharedIdentity(t *testing.T) {
 	store := phase6Config(t, config.StoreConfig{Type: config.StoreTypeHelper, Command: os.Args[0]})
-	if err := executePhase6(t, NewCmdIdentity(), "edit", "admin", "--password", "shared-secret"); err != nil {
+	if err := executePhase6WithInput(t, NewCmdIdentity(), "shared-secret\n", "edit", "admin", "--password-stdin"); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := store.Load()
@@ -268,7 +268,7 @@ func TestHostCredentialReplacementPreservesSharedIdentity(t *testing.T) {
 	if err := store.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
-	if err := executePhase6(t, hostcmd.NewCmdInventoryEdit(), "node", "--password", "private-secret"); err != nil {
+	if err := executePhase6WithInput(t, hostcmd.NewCmdInventoryEdit(), "private-secret\n", "node", "--password-stdin"); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err = store.Load()
@@ -297,7 +297,7 @@ func TestHostCredentialReplacementPreservesSharedIdentity(t *testing.T) {
 
 func TestBatchSCPRefusesHelperWithoutNonInteractiveContract(t *testing.T) {
 	store := phase6Config(t, config.StoreConfig{Type: config.StoreTypeHelper, Command: os.Args[0]})
-	if err := executePhase6(t, NewCmdIdentity(), "edit", "admin", "--password", "fixture-secret"); err != nil {
+	if err := executePhase6WithInput(t, NewCmdIdentity(), "fixture-secret\n", "edit", "admin", "--password-stdin"); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := store.Load()
@@ -332,8 +332,8 @@ func TestInventoryPassphraseReplacementClearsLegacySecrets(t *testing.T) {
 		newCmd func() *cobra.Command
 		args   []string
 	}{
-		{"identity", NewCmdIdentity, []string{"edit", "admin", "--key", "fixture-key", "--key-pass", "fixture-passphrase"}},
-		{"host", hostcmd.NewCmdInventoryEdit, []string{"node", "--key", "fixture-key", "--key-pass", "fixture-passphrase"}},
+		{"identity", NewCmdIdentity, []string{"edit", "admin", "--key", "fixture-key", "--passphrase-stdin"}},
+		{"host", hostcmd.NewCmdInventoryEdit, []string{"node", "--key", "fixture-key", "--passphrase-stdin"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := phase6Config(t, config.StoreConfig{Type: config.StoreTypeHelper, Command: os.Args[0]})
@@ -345,7 +345,7 @@ func TestInventoryPassphraseReplacementClearsLegacySecrets(t *testing.T) {
 			if err := store.Save(cfg); err != nil {
 				t.Fatal(err)
 			}
-			if err := executePhase6(t, tc.newCmd(), tc.args...); err != nil {
+			if err := executePhase6WithInput(t, tc.newCmd(), "fixture-passphrase\n", tc.args...); err != nil {
 				t.Fatal(err)
 			}
 			cfg, err = store.Load()
@@ -371,4 +371,10 @@ func TestInventoryPassphraseReplacementClearsLegacySecrets(t *testing.T) {
 			}
 		})
 	}
+}
+
+func executePhase6WithInput(t *testing.T, cmd *cobra.Command, input string, args ...string) error {
+	t.Helper()
+	cmd.SetIn(strings.NewReader(input))
+	return executePhase6(t, cmd, args...)
 }

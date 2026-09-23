@@ -34,7 +34,7 @@ build_time_label:
 ssh_short:
   other: "Connect to a remote host via SSH"
 ssh_long:
-  other: "Connect to a remote host via SSH and open an interactive terminal.\n\nUsage examples (OpenSSH-compatible):\n  xops ssh user@host[:port]\n  xops ssh -l user -p 22 -i ~/.ssh/id_rsa hostname\n  xops ssh -J bastion.example.com hostname # Direct jump (supports FQDN/IP/host:port)\n  xops ssh -J jumphost hostname            # Alias jump (requires saved node/alias)\n  xops ssh -L 8080:localhost:80 -N hostname\n\nxops enhanced options:\n  xops ssh --host web-01                # Connect by alias/name\n  xops ssh --sudo hostname              # Connect with sudo mode\n  xops ssh --alias myserver hostname    # Save connection alias\n  xops ssh --tag web hostname           # Add tag to node\n\nConnection Target Semantics:\n  Explicit user and port participate fully in matching and will never be silently overridden by existing nodes.\n  Connecting as a new user to an existing host automatically reuses the existing Host, strictly isolates Identity credentials, and inherits unique host ProxyJump.\n  ProxyJump (-J) resolution strategy: Prioritizes saved Node, Alias, or ~/.ssh/config Host; direct jump targets explicitly require Node/Alias, FQDN, IP, or host:port; single-label hostnames without port must be configured as a Node/Alias first.\n  Passwords of successful connections are encrypted and stored in config."
+  other: "Connect to a remote host via SSH and open an interactive terminal.\n\nUsage examples (OpenSSH-compatible):\n  xops ssh user@host[:port]\n  xops ssh -l user -p 22 -i ~/.ssh/id_rsa hostname\n  xops ssh -J bastion.example.com hostname # Direct jump (supports FQDN/IP/host:port)\n  xops ssh -J jumphost hostname            # Alias jump (requires saved node/alias)\n  xops ssh -L 8080:localhost:80 -N hostname\n\nxops enhanced options:\n  xops ssh --host web-01                # Connect by alias/name\n  xops ssh --sudo hostname              # Connect with sudo mode\n  xops ssh --alias myserver hostname    # Save connection alias\n  xops ssh --tag web hostname           # Add tag to node\n\nConnection Target Semantics:\n  Explicit user and port participate fully in matching and will never be silently overridden by existing nodes.\n  Connecting as a new user to an existing host automatically reuses the existing Host, strictly isolates Identity credentials, and inherits unique host ProxyJump.\n  ProxyJump (-J) resolution strategy: Prioritizes saved Node, Alias, or ~/.ssh/config Host; direct jump targets explicitly require Node/Alias, FQDN, IP, or host:port; single-label hostnames without port must be configured as a Node/Alias first.\n  Passwords can be supplied through --password-stdin, secure terminal prompts, or configured credential stores. Verified credentials are saved according to the remember policy."
 flag_host:
   other: "Target host / connection alias"
 flag_hosts:
@@ -43,12 +43,8 @@ flag_port:
   other: "SSH port"
 flag_user:
   other: "SSH username"
-flag_password:
-  other: "SSH password"
 flag_key:
   other: "SSH private key file path"
-flag_key_pass:
-  other: "SSH private key passphrase"
 flag_sudo:
   other: "Request sudo privileges"
 flag_jump:
@@ -63,8 +59,6 @@ flag_login:
   other: "SSH login username"
 flag_identity:
   other: "SSH identity (private key) file path"
-flag_passphrase:
-  other: "SSH private key passphrase"
 flag_local_forward:
   other: "Local port forwarding [bind_address:]port:host:hostport"
 flag_remote_forward:
@@ -130,7 +124,7 @@ scp_save_config_failed:
 sftp_short:
   other: "Connect to a remote host via SFTP"
 sftp_long:
-  other: "Connect to a remote host via SFTP and open an interactive terminal.\n\nUsage examples (OpenSSH-compatible):\n  xops sftp user@host[:port]\n  xops sftp -i ~/.ssh/id_rsa user@host\n  xops sftp -J bastion.example.com user@host # Direct jump (supports FQDN/IP/host:port)\n  xops sftp -J jumphost user@host            # Alias jump (requires saved node/alias)\n\nConnection Target Semantics:\n  Explicit user and port participate fully in matching, automatically reuse existing Host records, strictly isolate Identity credentials, and inherit unique host ProxyJump.\n  ProxyJump (-J) resolution strategy: Prioritizes saved Node, Alias, or ~/.ssh/config Host; direct jump targets explicitly require Node/Alias, FQDN, IP, or host:port; single-label hostnames without port must be configured as a Node/Alias first.\n  If no password is specified, it will be read from the terminal or saved config.\n\nPiped or file input automatically uses batch mode: stop with a nonzero status on the first failure, without history or interactive credential/confirmation prompts. Batch exec uses no PTY; exec/lexec receive EOF on stdin. shell/lshell require an interactive terminal."
+  other: "Connect to a remote host via SFTP and open an interactive terminal.\n\nUsage examples (OpenSSH-compatible):\n  xops sftp user@host[:port]\n  xops sftp -i ~/.ssh/id_rsa user@host\n  xops sftp -J bastion.example.com user@host # Direct jump (supports FQDN/IP/host:port)\n  xops sftp -J jumphost user@host            # Alias jump (requires saved node/alias)\n\nConnection Target Semantics:\n  Explicit user and port participate fully in matching, automatically reuse existing Host records, strictly isolate Identity credentials, and inherit unique host ProxyJump.\n  ProxyJump (-J) resolution strategy: Prioritizes saved Node, Alias, or ~/.ssh/config Host; direct jump targets explicitly require Node/Alias, FQDN, IP, or host:port; single-label hostnames without port must be configured as a Node/Alias first.\n  Passwords can be supplied through --password-stdin, secure terminal prompts, or configured credential stores.\n\nPiped or file input automatically uses batch mode: stop with a nonzero status on the first failure, without history or interactive credential/confirmation prompts. Batch exec uses no PTY; exec/lexec receive EOF on stdin. shell/lshell require an interactive terminal."
 flag_sftp_task:
   other: "Max concurrent file downloads"
 flag_sftp_thread:
@@ -143,8 +137,6 @@ exec_long:
   other: "Execute commands on one or more remote hosts. Supports batch execution and privilege escalation.\n\nUsage examples (OpenSSH-compatible):\n  xops exec -l root -p 22 192.168.1.11 \"uptime\"\n  xops exec -i ~/.ssh/id_rsa -J bastion.example.com 192.168.1.11 \"df -h\"\n  xops exec root@192.168.1.11 \"uptime\"\n\nBatch execution:\n  xops exec --host host1,host2 -c \"uptime\"\n  xops exec --tag web -c \"uptime\"\n  xops exec -I hosts.txt --shell script.sh\n\nConnection Target Semantics:\n  Explicit user and port prioritize full-target matching, automatically reuse existing Host records, strictly isolate Identity credentials, consistent with ssh/sftp/scp.\n  ProxyJump (-J) resolution strategy: Prioritizes saved Node, Alias, or ~/.ssh/config Host; direct jump targets explicitly require Node/Alias, FQDN, IP, or host:port; single-label hostnames without port must be configured as a Node/Alias first.\n  When using --tag, other host specification methods are ignored."
 flag_exec_sudo:
   other: "Execute with sudo"
-flag_exec_su_pwd:
-  other: "Password for su to root"
 flag_exec_cmd:
   other: "Command to execute"
 flag_exec_ifile:
@@ -189,22 +181,14 @@ identity_delete_short:
   other: "Delete an authentication template"
 flag_identity_user:
   other: "Modify username"
-flag_identity_password:
-  other: "Modify password"
 flag_identity_key:
   other: "Modify private key path"
-flag_identity_key_pass:
-  other: "Modify private key passphrase"
 flag_identity_name:
   other: "Authentication template alias"
 flag_identity_add_user:
   other: "Username"
-flag_identity_add_password:
-  other: "Password"
 flag_identity_add_key:
   other: "Private key path"
-flag_identity_add_key_pass:
-  other: "Private key passphrase"
 identity_list_header:
   other: "Alias/Name\tUser\tAuth Type\tDetails"
 identity_update_success:
@@ -247,8 +231,6 @@ flag_fw_tags:
   other: "Target tags, comma separated or specified multiple times"
 flag_fw_user:
   other: "SSH username"
-flag_fw_password:
-  other: "SSH password"
 flag_fw_task:
   other: "Number of parallel tasks"
 flag_fw_proto:
@@ -327,12 +309,8 @@ flag_inv_port:
   other: "SSH port"
 flag_inv_user:
   other: "SSH username"
-flag_inv_password:
-  other: "SSH password"
 flag_inv_key:
   other: "SSH private key path"
-flag_inv_key_pass:
-  other: "SSH private key passphrase"
 flag_inv_identity:
   other: "Use a saved authentication template alias"
 flag_inv_alias:
@@ -353,12 +331,8 @@ flag_inv_edit_port:
   other: "Modify SSH port"
 flag_inv_edit_user:
   other: "Modify SSH username"
-flag_inv_edit_password:
-  other: "Modify SSH password"
 flag_inv_edit_key:
   other: "Modify SSH private key path"
-flag_inv_edit_key_pass:
-  other: "Modify private key passphrase"
 flag_inv_edit_alias:
   other: "Modify node alias"
 flag_inv_edit_jump:
@@ -537,11 +511,6 @@ init_import_issue:
 init_next_steps:
   other: "Next: run 'xops host list' to view hosts, or 'xops host add --help' to add one"
 
-# ---- loadHost ----
-loadhost_short:
-  other: "Deprecated: use host import"
-loadhost_long:
-  other: "This compatibility command is deprecated; use 'xops host import'."
 
 # ---- sftp shell ----
 sftp_shell_unknown_cmd:
@@ -1000,8 +969,6 @@ flag_passphrase_stdin:
 flag_remember:
   other: "Credential persistence policy: ask, always, never; inherits credential.remember_prompted, then ask; batch mode never saves"
 
-warn_flag_deprecated:
-  other: "Flag --{{.Flag}} is deprecated and will be removed in the next stable release. Use {{.Replacement}}."
 
 credential_migrate_short:
   other: "Upgrade legacy credentials or migrate v2 backends"

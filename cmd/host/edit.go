@@ -20,13 +20,18 @@ type editFlags struct {
 
 func NewCmdInventoryEdit() *cobra.Command {
 	flags := &editFlags{}
+	secretInput := &utils.InventorySecretInput{}
 
 	cmd := &cobra.Command{
 		Use:   "edit [node_id]",
 		Short: i18n.T("inventory_edit_short"),
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			utils.WarnInventorySecretFlags(cmd)
+			var err error
+			flags.password, flags.keyPass, err = secretInput.Read(cmd)
+			if err != nil {
+				return err
+			}
 			query := args[0]
 			_, repository, _, err := utils.GetConfigStore()
 			if err != nil {
@@ -85,11 +90,10 @@ func NewCmdInventoryEdit() *cobra.Command {
 	cmd.Flags().StringVarP(&flags.address, "address", "H", "", i18n.T("flag_inv_edit_address"))
 	cmd.Flags().Uint16VarP(&flags.port, "port", "p", 0, i18n.T("flag_inv_edit_port"))
 	cmd.Flags().StringVarP(&flags.user, "user", "u", "", i18n.T("flag_inv_edit_user"))
-	cmd.Flags().StringVarP(&flags.password, "password", "P", "", i18n.T("flag_inv_edit_password"))
 	cmd.Flags().StringVarP(&flags.keyPath, "key", "k", "", i18n.T("flag_inv_edit_key"))
-	cmd.Flags().StringVarP(&flags.keyPass, "key-pass", "w", "", i18n.T("flag_inv_edit_key_pass"))
 	cmd.Flags().StringSliceVarP(&flags.alias, "alias", "a", []string{}, i18n.T("flag_inv_edit_alias"))
 	cmd.Flags().StringVarP(&flags.jump, "jump", "j", "", i18n.T("flag_inv_edit_jump"))
+	secretInput.RegisterFlags(cmd)
 	return cmd
 }
 

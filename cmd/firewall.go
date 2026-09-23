@@ -68,7 +68,6 @@ func newCmdFirewall() *cobra.Command {
 	cmd.PersistentFlags().StringSliceVarP(&fwOptions.Tags, "tag", "t", []string{}, i18n.T("flag_fw_tags"))
 	cmd.PersistentFlags().StringSliceVar(&fwOptions.Exclude, "exclude", nil, i18n.T("flag_exclude"))
 	cmd.PersistentFlags().StringVarP(&fwOptions.User, "user", "u", "", i18n.T("flag_fw_user"))
-	cmd.PersistentFlags().StringVarP(&fwOptions.Password, "password", "w", "", i18n.T("flag_fw_password"))
 	cmd.PersistentFlags().IntVar(&fwOptions.TaskCount, "task", 1, i18n.T("flag_fw_task"))
 
 	cmd.PersistentFlags().StringVar(&fwOptions.Protocol, "proto", "tcp", i18n.T("flag_fw_proto"))

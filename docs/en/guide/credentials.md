@@ -85,3 +85,9 @@ A verified privilege password can be saved according to policy even if the comma
 Back up the configuration file, the entire credential-store directory, and the corresponding unlock material. Keep key backups separate from store backups. Configuration alone cannot restore passwords. Reading, inspecting, and unlocking never create replacement keys; a lost key for an existing store requires the original key backup.
 
 See [offline credential storage](./offline-store) for initialization, master passwords, key rotation, and recovery.
+
+## Removed plaintext flags
+
+`--password`, `--passphrase`, and `--suPwd` are no longer accepted. SSH, SFTP, SCP, and exec support `--password-stdin` and `--passphrase-stdin`; interactive connections can also use secure prompts or stored credentials. Sudo/su passwords use secure prompts or configured credential stores. Firewall commands no longer accept `--password/-w`; configure identity credentials before unattended execution. For asset commands, see [host and identity management](./hosts#removed-credential-arguments).
+
+For SSH and exec, unknown flags before the remote command are rejected. Remote command arguments remain unchanged after the command name or an explicit `--` separator.

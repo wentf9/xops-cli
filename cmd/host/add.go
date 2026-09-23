@@ -21,9 +21,7 @@ func newCmdInventoryAdd(verify inventoryVerifier) *cobra.Command {
 		address       string
 		port          uint16
 		user          string
-		password      string
 		keyPath       string
-		keyPass       string
 		identityAlias string
 		alias         []string
 		tags          []string
@@ -31,12 +29,16 @@ func newCmdInventoryAdd(verify inventoryVerifier) *cobra.Command {
 		skipVerify    bool
 	)
 
+	secretInput := &utils.InventorySecretInput{}
 	cmd := &cobra.Command{
 		Use:   "add",
 		Short: i18n.T("inventory_add_short"),
 		Long:  i18n.T("inventory_add_long"),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			utils.WarnInventorySecretFlags(cmd)
+			password, keyPass, err := secretInput.Read(cmd)
+			if err != nil {
+				return err
+			}
 			if address == "" {
 				return fmt.Errorf("必须指定主机地址 (--address)")
 			}
@@ -50,6 +52,10 @@ func newCmdInventoryAdd(verify inventoryVerifier) *cobra.Command {
 				port = 22
 			}
 
+			if keyPass != "" && keyPath == "" {
+				return fmt.Errorf("private-key path is required for a passphrase (--key)")
+			}
+
 			var identity models.Identity
 			var identityRef string
 
@@ -61,26 +67,9 @@ func newCmdInventoryAdd(verify inventoryVerifier) *cobra.Command {
 				}
 				identityRef = identityAlias
 			} else {
-				if user == "" {
-					var userErr error
-					user, userErr = utils.GetCurrentUser()
-					if userErr != nil {
-						return fmt.Errorf("get current user failed: %w", userErr)
-					}
-				}
-				identity = models.Identity{User: user}
-				if keyPath != "" {
-					identity.KeyPath, identity.AuthType = utils.ToAbsolutePath(keyPath), "key"
-				} else if password != "" {
-					identity.AuthType = "password"
-				} else if skipVerify {
-					identity.AuthType = "auto"
-				} else {
-					pass, err := utils.ReadPasswordFromTerminal(i18n.Tf("prompt_enter_user_password", map[string]any{"User": user}))
-					if err != nil {
-						return err
-					}
-					password, identity.AuthType = pass, "password"
+				identity, password, err = newInventoryIdentity(user, password, keyPath, skipVerify)
+				if err != nil {
+					return err
 				}
 				identityRef = fmt.Sprintf("%s@%s", identity.User, address)
 			}
@@ -136,16 +125,15 @@ func newCmdInventoryAdd(verify inventoryVerifier) *cobra.Command {
 	cmd.Flags().StringVarP(&address, "address", "H", "", i18n.T("flag_inv_address"))
 	cmd.Flags().Uint16VarP(&port, "port", "p", 22, i18n.T("flag_inv_port"))
 	cmd.Flags().StringVarP(&user, "user", "u", "", i18n.T("flag_inv_user"))
-	cmd.Flags().StringVarP(&password, "password", "P", "", i18n.T("flag_inv_password"))
 	cmd.Flags().StringVarP(&keyPath, "key", "k", "", i18n.T("flag_inv_key"))
-	cmd.Flags().StringVarP(&keyPass, "key-pass", "w", "", i18n.T("flag_inv_key_pass"))
 	cmd.Flags().StringVarP(&identityAlias, "identity", "I", "", i18n.T("flag_inv_identity"))
 	cmd.Flags().StringSliceVarP(&alias, "alias", "a", []string{}, i18n.T("flag_inv_alias"))
 	cmd.Flags().StringSliceVarP(&tags, "tags", "t", []string{}, i18n.T("flag_inv_tags"))
 	cmd.Flags().StringVarP(&jump, "jump", "j", "", i18n.T("flag_inv_jump"))
 	cmd.Flags().BoolVar(&skipVerify, "skip-verify", false, i18n.T("flag_skip_verify"))
 
-	cmd.MarkFlagsMutuallyExclusive("identity", "password", "key-pass")
+	secretInput.RegisterFlags(cmd)
+	cmd.MarkFlagsMutuallyExclusive("identity", "password-stdin", "passphrase-stdin")
 	return cmd
 }
 
@@ -156,4 +144,31 @@ func validateNewNodeAliases(repo *config.Repository, aliases []string) error {
 		}
 	}
 	return nil
+}
+
+// newInventoryIdentity keeps prompted and stdin credentials outside the model.
+func newInventoryIdentity(user, password, keyPath string, skipVerify bool) (models.Identity, string, error) {
+	if user == "" {
+		var err error
+		user, err = utils.GetCurrentUser()
+		if err != nil {
+			return models.Identity{}, "", fmt.Errorf("get current user failed: %w", err)
+		}
+	}
+	identity := models.Identity{User: user}
+	switch {
+	case keyPath != "":
+		identity.KeyPath, identity.AuthType = utils.ToAbsolutePath(keyPath), "key"
+	case password != "":
+		identity.AuthType = "password"
+	case skipVerify:
+		identity.AuthType = "auto"
+	default:
+		pass, err := utils.ReadPasswordFromTerminal(i18n.Tf("prompt_enter_user_password", map[string]any{"User": user}))
+		if err != nil {
+			return models.Identity{}, "", err
+		}
+		password, identity.AuthType = pass, "password"
+	}
+	return identity, password, nil
 }

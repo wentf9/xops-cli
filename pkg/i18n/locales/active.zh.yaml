@@ -34,7 +34,7 @@ build_time_label:
 ssh_short:
   other: "通过SSH连接到指定主机"
 ssh_long:
-  other: "通过SSH连接到指定主机并提供交互式终端。\n\n用法示例（兼容 OpenSSH 风格）:\n  xops ssh user@host[:port]\n  xops ssh -l user -p 22 -i ~/.ssh/id_rsa hostname\n  xops ssh -J bastion.example.com hostname # 直连跳板 (支持 FQDN/IP/host:port)\n  xops ssh -J jumphost hostname            # 别名跳板 (需预先保存为节点/别名)\n  xops ssh -L 8080:localhost:80 -N hostname\n\nxops 增强选项:\n  xops ssh --host web-01                # 按别名/名称连接\n  xops ssh --sudo hostname              # 以 sudo 模式连接\n  xops ssh --alias myserver hostname    # 保存连接别名\n  xops ssh --tag web hostname           # 为节点添加标签\n\n连接目标语义说明:\n  显式指定的 user 和 port 完整参与匹配，绝不被已有节点静默覆盖。\n  显式新用户连接已有主机时，自动复用已有 Host，独立隔离凭证(Identity)，并自动继承主机的唯一 ProxyJump。\n  跳板机(-J/ProxyJump)解析策略：优先匹配已有 Node、Alias 或 ~/.ssh/config Host；直连跳板明确要求使用 Node/Alias、FQDN、IP 或 host:port；未加端口的单标签主机名须先配置为 Node/Alias。\n  如果未通过--password选项显式提供密码,将会从终端输入或通过保存的密码文件读取密码。\n  成功登录过的用户和主机组合的密码将会保存到密码文件中。"
+  other: "通过SSH连接到指定主机并提供交互式终端。\n\n用法示例（兼容 OpenSSH 风格）:\n  xops ssh user@host[:port]\n  xops ssh -l user -p 22 -i ~/.ssh/id_rsa hostname\n  xops ssh -J bastion.example.com hostname # 直连跳板 (支持 FQDN/IP/host:port)\n  xops ssh -J jumphost hostname            # 别名跳板 (需预先保存为节点/别名)\n  xops ssh -L 8080:localhost:80 -N hostname\n\nxops 增强选项:\n  xops ssh --host web-01                # 按别名/名称连接\n  xops ssh --sudo hostname              # 以 sudo 模式连接\n  xops ssh --alias myserver hostname    # 保存连接别名\n  xops ssh --tag web hostname           # 为节点添加标签\n\n连接目标语义说明:\n  显式指定的 user 和 port 完整参与匹配，绝不被已有节点静默覆盖。\n  显式新用户连接已有主机时，自动复用已有 Host，独立隔离凭证(Identity)，并自动继承主机的唯一 ProxyJump。\n  跳板机(-J/ProxyJump)解析策略：优先匹配已有 Node、Alias 或 ~/.ssh/config Host；直连跳板明确要求使用 Node/Alias、FQDN、IP 或 host:port；未加端口的单标签主机名须先配置为 Node/Alias。\n  密码可通过 --password-stdin、安全终端提示或已配置的凭据库提供。\n  通过验证的凭据将按 remember 策略保存到凭据库。"
 flag_host:
   other: "目标主机/连接别名"
 flag_hosts:
@@ -43,12 +43,8 @@ flag_port:
   other: "SSH端口"
 flag_user:
   other: "SSH用户名"
-flag_password:
-  other: "SSH密码"
 flag_key:
   other: "SSH私钥文件路径"
-flag_key_pass:
-  other: "SSH私钥密码"
 flag_sudo:
   other: "是否请求sudo权限"
 flag_jump:
@@ -63,8 +59,6 @@ flag_login:
   other: "SSH 登录用户名"
 flag_identity:
   other: "SSH 身份(私钥)文件路径"
-flag_passphrase:
-  other: "SSH 私钥密码短语"
 flag_local_forward:
   other: "本地端口转发 [bind_address:]port:host:hostport"
 flag_remote_forward:
@@ -120,7 +114,7 @@ prompt_overwrite:
 sftp_short:
   other: "通过sftp连接到指定主机"
 sftp_long:
-  other: "通过sftp连接到指定主机并提供交互式终端。\n\n用法示例（兼容 OpenSSH 风格）:\n  xops sftp user@host[:port]\n  xops sftp -i ~/.ssh/id_rsa user@host\n  xops sftp -J bastion.example.com user@host # 直连跳板 (支持 FQDN/IP/host:port)\n  xops sftp -J jumphost user@host            # 别名跳板 (需预先保存为节点/别名)\n\n连接目标语义说明:\n  显式指定的 user 和 port 完整参与匹配，自动复用已有 Host 并严格隔离 Identity 凭证，继承相同主机的 ProxyJump。\n  跳板机(-J/ProxyJump)解析策略：优先匹配已有 Node、Alias 或 ~/.ssh/config Host；直连跳板明确要求使用 Node/Alias、FQDN、IP 或 host:port；未加端口的单标签主机名须先配置为 Node/Alias。\n  如果未通过--password选项显式提供密码,将会从终端输入或通过保存的密码文件读取密码。\n\n管道或文件输入自动使用批处理模式：首个命令失败立即退出并返回非零，不记录历史，不交互询问凭据或确认。批处理 exec 不使用 PTY，exec/lexec 的标准输入为 EOF；shell/lshell 仅用于交互终端。"
+  other: "通过sftp连接到指定主机并提供交互式终端。\n\n用法示例（兼容 OpenSSH 风格）:\n  xops sftp user@host[:port]\n  xops sftp -i ~/.ssh/id_rsa user@host\n  xops sftp -J bastion.example.com user@host # 直连跳板 (支持 FQDN/IP/host:port)\n  xops sftp -J jumphost user@host            # 别名跳板 (需预先保存为节点/别名)\n\n连接目标语义说明:\n  显式指定的 user 和 port 完整参与匹配，自动复用已有 Host 并严格隔离 Identity 凭证，继承相同主机的 ProxyJump。\n  跳板机(-J/ProxyJump)解析策略：优先匹配已有 Node、Alias 或 ~/.ssh/config Host；直连跳板明确要求使用 Node/Alias、FQDN、IP 或 host:port；未加端口的单标签主机名须先配置为 Node/Alias。\n  密码可通过 --password-stdin、安全终端提示或已配置的凭据库提供。\n\n管道或文件输入自动使用批处理模式：首个命令失败立即退出并返回非零，不记录历史，不交互询问凭据或确认。批处理 exec 不使用 PTY，exec/lexec 的标准输入为 EOF；shell/lshell 仅用于交互终端。"
 flag_sftp_task:
   other: "同时传输的文件数"
 flag_sftp_thread:
@@ -144,8 +138,6 @@ exec_long:
   other: "对一个或多个远程主机执行命令。支持批量执行和提权。\n\n用法示例（兼容 OpenSSH 风格）:\n  xops exec -l root -p 22 192.168.1.11 \"uptime\"\n  xops exec -i ~/.ssh/id_rsa -J bastion.example.com 192.168.1.11 \"df -h\"\n  xops exec root@192.168.1.11 \"uptime\"\n\n批量执行:\n  xops exec --host host1,host2 -c \"uptime\"\n  xops exec --tag web -c \"uptime\"\n  xops exec -I hosts.txt --shell script.sh\n\n连接目标语义说明:\n  显式指定的 user 和 port 优先完整匹配，自动复用已有 Host 并严格隔离 Identity，与 ssh/sftp/scp 行为一致。\n  跳板机(-J/ProxyJump)解析策略：优先匹配已有 Node、Alias 或 ~/.ssh/config Host；直连跳板明确要求使用 Node/Alias、FQDN、IP 或 host:port；未加端口的单标签主机名须先配置为 Node/Alias。\n  使用 --tag 时会忽略其他主机指定方式。"
 flag_exec_sudo:
   other: "使用sudo执行"
-flag_exec_su_pwd:
-  other: "su切换root的密码"
 flag_exec_cmd:
   other: "要执行的命令"
 flag_exec_ifile:
@@ -190,22 +182,14 @@ identity_delete_short:
   other: "删除一个认证信息模板"
 flag_identity_user:
   other: "修改用户名"
-flag_identity_password:
-  other: "修改密码"
 flag_identity_key:
   other: "修改私钥路径"
-flag_identity_key_pass:
-  other: "修改私钥密码"
 flag_identity_name:
   other: "认证信息别名"
 flag_identity_add_user:
   other: "用户名"
-flag_identity_add_password:
-  other: "密码"
 flag_identity_add_key:
   other: "私钥路径"
-flag_identity_add_key_pass:
-  other: "私钥密码"
 identity_list_header:
   other: "别名/名称\t用户\t认证方式\t详细信息"
 identity_update_success:
@@ -248,8 +232,6 @@ flag_fw_tags:
   other: "目标标签，多个标签可用逗号分隔或多次指定"
 flag_fw_user:
   other: "SSH用户名"
-flag_fw_password:
-  other: "SSH密码"
 flag_fw_task:
   other: "并行任务数"
 flag_fw_proto:
@@ -328,12 +310,8 @@ flag_inv_port:
   other: "SSH 端口"
 flag_inv_user:
   other: "SSH 用户名"
-flag_inv_password:
-  other: "SSH 密码"
 flag_inv_key:
   other: "SSH 私钥路径"
-flag_inv_key_pass:
-  other: "SSH 私钥密码"
 flag_inv_identity:
   other: "使用已保存的认证模板别名"
 flag_inv_alias:
@@ -354,12 +332,8 @@ flag_inv_edit_port:
   other: "修改 SSH 端口"
 flag_inv_edit_user:
   other: "修改 SSH 用户名"
-flag_inv_edit_password:
-  other: "修改 SSH 密码"
 flag_inv_edit_key:
   other: "修改 SSH 私钥路径"
-flag_inv_edit_key_pass:
-  other: "修改私钥密码"
 flag_inv_edit_alias:
   other: "修改节点别名"
 flag_inv_edit_jump:
@@ -538,11 +512,6 @@ init_import_issue:
 init_next_steps:
   other: "下一步: 运行 'xops host list' 查看主机，或运行 'xops host add --help' 添加主机"
 
-# ---- loadHost ----
-loadhost_short:
-  other: "已弃用：请使用 host import"
-loadhost_long:
-  other: "该兼容命令已弃用，请使用 'xops host import'。"
 
 # ---- sftp shell ----
 sftp_shell_unknown_cmd:
@@ -1001,8 +970,6 @@ flag_passphrase_stdin:
 flag_remember:
   other: "凭据保存策略: ask、always、never；未指定时继承 credential.remember_prompted，再默认 ask；批处理不保存"
 
-warn_flag_deprecated:
-  other: "参数 --{{.Flag}} 已弃用，将在下一个正式版本删除。请使用 {{.Replacement}}。"
 
 credential_migrate_short:
   other: "升级旧凭据或迁移 v2 凭据后端"

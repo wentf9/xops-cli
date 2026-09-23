@@ -6,7 +6,6 @@ import (
 	sshcrypto "golang.org/x/crypto/ssh"
 	"os"
 
-	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
@@ -108,19 +107,6 @@ func (w *InventoryCredentialWrite) Save(ctx context.Context, version string) err
 	return nil
 }
 
-// WarnInventorySecretFlags covers both identity and host compatibility flags.
-func WarnInventorySecretFlags(cmd *cobra.Command) {
-	for _, flag := range []string{"password", "key-pass"} {
-		if cmd.Flags().Changed(flag) {
-			replacement := "identity credential set --password-stdin"
-			if flag == "key-pass" {
-				replacement = "identity credential set --kind passphrase --password-stdin"
-			}
-			WarnFlagDeprecated(flag, replacement)
-		}
-	}
-}
-
 func validateInventoryCredentialStore(cfg *config.CredentialConfig) error {
 	store, ok := cfg.Stores[cfg.DefaultStore]
 	if !ok {
@@ -141,7 +127,7 @@ func validateUnencryptedKey(path string) error {
 	}
 	defer clear(data)
 	if _, err := sshcrypto.ParsePrivateKey(data); err != nil {
-		return fmt.Errorf("replacement key must be an unencrypted private key, or supply --key-pass: %w", err)
+		return fmt.Errorf("replacement key must be an unencrypted private key, or supply --passphrase-stdin: %w", err)
 	}
 	return nil
 }

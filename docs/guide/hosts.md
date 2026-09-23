@@ -28,7 +28,7 @@ xops host import hosts.csv --skip-verify
 xops host import hosts.csv --save-on-verify-failure
 ```
 
-两个选项互斥，也适用于 `host load`、`inventory import` 和旧命令 `loadHost`。验证失败会返回非零退出码，包括指定 `--save-on-verify-failure` 的情况；取消操作不会强制保存。跳过验证只跳过连接检查，配置和凭据存储的有效性检查仍会执行。
+两个选项互斥，也适用于 `host load` 和 `inventory import`。验证失败会返回非零退出码，包括指定 `--save-on-verify-failure` 的情况；取消操作不会强制保存。跳过验证只跳过连接检查，配置和凭据存储的有效性检查仍会执行。
 
 ## 单节点添加
 
@@ -48,3 +48,11 @@ xops ssh audit@192.0.2.10
 ```
 
 使用 `xops identity --help` 查看身份管理操作，或运行 `xops tui` 进入[终端管理界面](./tui)。不要将密码放入共享命令记录或文档示例。
+
+## 已删除的凭据参数
+
+`host add|edit` 和 `identity add|edit` 已删除明文参数 `--password`、`--key-pass` 及其短参数。登录密码改用 `--password-stdin`，私钥口令改用 `--passphrase-stdin`。这两个选项互斥，`--password-stdin` 也不能与 `--key` 同时使用。`host add` 的两个标准输入选项均不能与 `--identity` 同时使用。
+
+例如，`xops identity edit admin --password-stdin` 从标准输入读取新密码；`xops host edit web --key ~/.ssh/id_ed25519 --passphrase-stdin` 从标准输入读取私钥口令。通过可信管道或文件重定向提供输入，避免将凭据值写入命令参数和 Shell 历史。空输入会在保存资产变更前被拒绝。编辑时省略这些选项会保留现有凭据，但切换认证方式或私钥时会相应更新凭据引用。
+
+交互式密码提示和 `xops identity credential set` 仍可使用。旧命令 `loadHost` 已删除，请改用 `xops host import`。

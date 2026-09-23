@@ -27,12 +27,12 @@ func TestInventoryCombinedEditFailureLeavesConfigurationUnchanged(t *testing.T) 
 		command func() *cobra.Command
 		args    []string
 	}{
-		{"identity", NewCmdIdentity, []string{"edit", "admin", "--user", "changed", "--password", "new-secret"}},
-		{"host", hostcmd.NewCmdInventoryEdit, []string{"node", "--user", "changed", "--address", "127.0.0.2", "--port", "2222", "--alias", "renamed", "--password", "new-secret"}},
+		{"identity", NewCmdIdentity, []string{"edit", "admin", "--user", "changed", "--password-stdin"}},
+		{"host", hostcmd.NewCmdInventoryEdit, []string{"node", "--user", "changed", "--address", "127.0.0.2", "--port", "2222", "--alias", "renamed", "--password-stdin"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			phase6Config(t, config.StoreConfig{Type: config.StoreTypeHelper, Command: os.Args[0]})
-			if err := executePhase6(t, NewCmdIdentity(), "edit", "admin", "--password", "old-secret"); err != nil {
+			if err := executePhase6WithInput(t, NewCmdIdentity(), "old-secret\n", "edit", "admin", "--password-stdin"); err != nil {
 				t.Fatal(err)
 			}
 			path, _, err := utils.GetConfigFilePath()
@@ -44,7 +44,7 @@ func TestInventoryCombinedEditFailureLeavesConfigurationUnchanged(t *testing.T) 
 				t.Fatal(err)
 			}
 			t.Setenv("TEST_HELPER_ERROR_CODE", "locked")
-			if err := executePhase6(t, tc.command(), tc.args...); !errors.Is(err, credential.ErrCredentialStoreLocked) {
+			if err := executePhase6WithInput(t, tc.command(), "new-secret\n", tc.args...); !errors.Is(err, credential.ErrCredentialStoreLocked) {
 				t.Fatalf("locked edit: %v", err)
 			}
 			after, err := os.ReadFile(path)
@@ -60,7 +60,7 @@ func TestInventoryCombinedEditFailureLeavesConfigurationUnchanged(t *testing.T) 
 
 func TestHostCombinedCredentialEditRenamesAtomicallyAndPreservesSharedRecords(t *testing.T) {
 	store := phase6Config(t, config.StoreConfig{Type: config.StoreTypeHelper, Command: os.Args[0]})
-	if err := executePhase6(t, NewCmdIdentity(), "edit", "admin", "--password", "old-secret"); err != nil {
+	if err := executePhase6WithInput(t, NewCmdIdentity(), "old-secret\n", "edit", "admin", "--password-stdin"); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := store.Load()
@@ -72,7 +72,7 @@ func TestHostCombinedCredentialEditRenamesAtomicallyAndPreservesSharedRecords(t 
 	if err := store.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
-	if err := executePhase6(t, hostcmd.NewCmdInventoryEdit(), "node", "--user", "changed", "--address", "127.0.0.2", "--port", "2222", "--alias", "renamed", "--password", "new-secret"); err != nil {
+	if err := executePhase6WithInput(t, hostcmd.NewCmdInventoryEdit(), "new-secret\n", "node", "--user", "changed", "--address", "127.0.0.2", "--port", "2222", "--alias", "renamed", "--password-stdin"); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err = store.Load()
@@ -144,7 +144,7 @@ func TestInventoryUnencryptedKeySwitchUnlinksLockedPassphraseAndRecoversCleanup(
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := phase6Config(t, config.StoreConfig{Type: config.StoreTypeHelper, Command: os.Args[0]})
-			if err := executePhase6(t, NewCmdIdentity(), "edit", "admin", "--key", "old-key", "--key-pass", "old-passphrase"); err != nil {
+			if err := executePhase6WithInput(t, NewCmdIdentity(), "old-passphrase\n", "edit", "admin", "--key", "old-key", "--passphrase-stdin"); err != nil {
 				t.Fatal(err)
 			}
 			cfg, err := store.Load()
@@ -225,7 +225,7 @@ func TestInventoryUnencryptedKeyWithoutStoredPassphraseNeedsNoWritableStore(t *t
 
 func TestHostUnencryptedKeyKeepsSharedPassphrase(t *testing.T) {
 	store := phase6Config(t, config.StoreConfig{Type: config.StoreTypeHelper, Command: os.Args[0]})
-	if err := executePhase6(t, NewCmdIdentity(), "edit", "admin", "--key", "old-key", "--key-pass", "shared-passphrase"); err != nil {
+	if err := executePhase6WithInput(t, NewCmdIdentity(), "shared-passphrase\n", "edit", "admin", "--key", "old-key", "--passphrase-stdin"); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := store.Load()

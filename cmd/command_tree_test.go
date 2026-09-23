@@ -37,12 +37,8 @@ func TestCommandTreeUsesCanonicalCommands(t *testing.T) {
 		t.Errorf("mcp serve command name = %q, want serve", mcpServeCmd.Name())
 	}
 
-	legacyCmd, _, err := root.Find([]string{"loadHost"})
-	if err != nil {
-		t.Fatalf("find legacy loadHost command: %v", err)
-	}
-	if !legacyCmd.Hidden || legacyCmd.Deprecated == "" {
-		t.Errorf("legacy loadHost command should be hidden and deprecated")
+	if _, _, err := root.Find([]string{"loadHost"}); err == nil {
+		t.Fatal("removed loadHost command is still registered")
 	}
 }
 

@@ -10,8 +10,6 @@ import (
 
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
-	"github.com/wentf9/xops-cli/pkg/i18n"
-	"github.com/wentf9/xops-cli/pkg/logger"
 	"golang.org/x/term"
 )
 
@@ -124,18 +122,6 @@ func ReadSecretFromReader(r io.Reader) (string, error) {
 // ReadSecretFromStdin 从标准输入流读取机密并去除末尾的换行符
 func ReadSecretFromStdin() (string, error) {
 	return ReadSecretFromReader(os.Stdin)
-}
-
-// WarnFlagDeprecated 输出统一的 CLI 参数废弃警告
-func WarnFlagDeprecated(flagName, replacement string) {
-	msg := i18n.Tf("warn_flag_deprecated", map[string]any{
-		"Flag":        flagName,
-		"Replacement": replacement,
-	})
-	if msg == "" || msg == "warn_flag_deprecated" {
-		msg = fmt.Sprintf("Flag --%s is deprecated and will be removed in the next stable release. Please use %s.", flagName, replacement)
-	}
-	logger.PrintWarn(msg)
 }
 
 // EffectiveRememberPolicy applies command override, configuration, then ask.

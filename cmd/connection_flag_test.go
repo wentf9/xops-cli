@@ -76,26 +76,3 @@ func TestShouldRememberCredential(t *testing.T) {
 	}
 
 }
-
-func TestFlagsMutuallyExclusive(t *testing.T) {
-	// 测试 --password 与 --password-stdin 互斥
-	sshCmd := NewCmdSsh()
-	sshCmd.SetArgs([]string{"myhost", "--password", "secret", "--password-stdin"})
-	if err := sshCmd.Execute(); err == nil {
-		t.Errorf("expected error when both --password and --password-stdin are provided, got nil")
-	}
-
-	// 测试 --passphrase 与 --passphrase-stdin 互斥
-	sftpCmd := NewCmdSftp()
-	sftpCmd.SetArgs([]string{"myhost", "--passphrase", "secret", "--passphrase-stdin"})
-	if err := sftpCmd.Execute(); err == nil {
-		t.Errorf("expected error when both --passphrase and --passphrase-stdin are provided, got nil")
-	}
-}
-
-func TestWarnFlagDeprecated(t *testing.T) {
-	// 验证 WarnFlagDeprecated 不会发生 panic
-	cmdutils.WarnFlagDeprecated("password", "--password-stdin")
-	cmdutils.WarnFlagDeprecated("passphrase", "--passphrase-stdin")
-	cmdutils.WarnFlagDeprecated("suPwd", "secure prompt")
-}

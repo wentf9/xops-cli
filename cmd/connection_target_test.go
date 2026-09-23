@@ -322,14 +322,13 @@ func TestCommands_SSH_FlagPrecedence(t *testing.T) {
 	})
 }
 
-func TestCommands_Exec_SudoAndSuPwd(t *testing.T) {
+func TestCommands_Exec_Sudo(t *testing.T) {
 	ctx := context.Background()
 	repo := setupTestRepository(t)
 
 	execOpt := NewExecOptions()
 	execOpt.Host = "test@10.238.221.181"
 	execOpt.Sudo = true
-	execOpt.SuPwd = "mySuperSecretPassword"
 
 	tasks, hostErrs, err := execOpt.buildTasksFromHosts(ctx, repo)
 	if err != nil || len(hostErrs) > 0 {
@@ -372,7 +371,6 @@ func TestCommands_ExistingNodeCredentialsStayOutOfConfiguration(t *testing.T) {
 
 	execOpt := NewExecOptions()
 	execOpt.Remember = "always"
-	execOpt.SuPwd = "new-synthetic-sudo-password"
 	if _, err := execOpt.updateNodeFromHostInfo(t.Context(), nodeID, repo, utils.HostInfo{Host: "10.238.221.181"}); err != nil {
 		t.Fatalf("updateNodeFromHostInfo failed: %v", err)
 	}
@@ -380,7 +378,7 @@ func TestCommands_ExistingNodeCredentialsStayOutOfConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve connection after exec update failed: %v", err)
 	}
-	if snapshot.Node.SuPwd == execOpt.SuPwd {
+	if snapshot.Node.SuPwd != "" {
 		t.Fatal("exec sudo password was persisted in configuration")
 	}
 }

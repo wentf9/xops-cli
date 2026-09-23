@@ -15,7 +15,7 @@ import (
 )
 
 func TestV2PassphraseCLIIncludesKeyFingerprint(t *testing.T) {
-	for _, name := range []string{"identity add", "identity edit", "identity credential set", "host edit", "recorder"} {
+	for _, name := range []string{"identity add", "identity edit", "identity credential set", "host add", "host edit", "recorder"} {
 		t.Run(name, func(t *testing.T) {
 			store := phase6Config(t, config.StoreConfig{Type: config.StoreTypeHelper, Command: os.Args[0]})
 			cfg, err := store.Load()
@@ -45,23 +45,27 @@ func TestV2PassphraseCLIIncludesKeyFingerprint(t *testing.T) {
 			switch name {
 			case "identity add":
 				cmd = NewCmdIdentity()
-				args = []string{"add", "--name", "new", "--user", "user", "--key", path, "--key-pass", "key-password"}
+				args = []string{"add", "--name", "new", "--user", "user", "--key", path, "--passphrase-stdin"}
 				targetIdentity = "new"
 			case "identity edit":
 				cmd = NewCmdIdentity()
-				args = []string{"edit", "admin", "--key", path, "--key-pass", "key-password"}
+				args = []string{"edit", "admin", "--key", path, "--passphrase-stdin"}
 			case "identity credential set":
 				cmd = NewCmdIdentity()
 				cmd.SetIn(strings.NewReader("key-password\n"))
 				args = []string{"credential", "set", "admin", "--kind", "passphrase", "--password-stdin"}
+			case "host add":
+				cmd = hostcmd.NewCmdInventoryAdd()
+				args = []string{"--skip-verify", "--address", "127.0.0.2", "--user", "user", "--key", path, "--passphrase-stdin"}
+				targetIdentity = "user@127.0.0.2"
 			case "host edit":
 				cmd = hostcmd.NewCmdInventoryEdit()
-				args = []string{"node", "--key", path, "--key-pass", "key-password"}
+				args = []string{"node", "--key", path, "--passphrase-stdin"}
 			case "recorder":
 				recordV2Passphrase(t, cfg, store, path)
 			}
 			if cmd != nil {
-				if err := executePhase6(t, cmd, args...); err != nil {
+				if err := executePhase6WithInput(t, cmd, "key-password\n", args...); err != nil {
 					t.Fatal(err)
 				}
 			}

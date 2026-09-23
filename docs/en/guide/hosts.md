@@ -28,7 +28,7 @@ xops host import hosts.csv --skip-verify
 xops host import hosts.csv --save-on-verify-failure
 ```
 
-The two options are mutually exclusive. They also apply to `host load`, `inventory import`, and the legacy `loadHost` command. A verification failure returns a nonzero exit status, including when `--save-on-verify-failure` is used. Cancellation never forces a save. Skipping verification only skips the connection check; configuration and credential-store validation still run.
+The two options are mutually exclusive. They also apply to `host load` and `inventory import`. A verification failure returns a nonzero exit status, including when `--save-on-verify-failure` is used. Cancellation never forces a save. Skipping verification only skips the connection check; configuration and credential-store validation still run.
 
 ## Adding one node
 
@@ -48,3 +48,11 @@ xops ssh audit@192.0.2.10
 ```
 
 Use `xops identity --help` for identity operations, or `xops tui` for the [terminal management interface](./tui). Keep passwords out of shared command histories and documentation examples.
+
+## Removed credential arguments
+
+The plaintext arguments `--password` and `--key-pass`, including their short forms, have been removed from `host add|edit` and `identity add|edit`. Use `--password-stdin` for login passwords or `--passphrase-stdin` for private-key passphrases. These two options are mutually exclusive; `--password-stdin` cannot be combined with `--key`. With `host add`, neither stdin option can be combined with `--identity`.
+
+For example, `xops identity edit admin --password-stdin` reads the replacement password from standard input; `xops host edit web --key ~/.ssh/id_ed25519 --passphrase-stdin` reads the key passphrase. Supply input through a trusted pipe or redirected file, keeping secret values out of command arguments and shell history. Empty input is rejected before inventory changes are saved. Omitting these flags on edits preserves the existing credentials unless the authentication method or key is changed.
+
+Interactive password prompts and `xops identity credential set` remain available. The legacy `loadHost` command has been removed; use `xops host import`.

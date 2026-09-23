@@ -30,7 +30,6 @@ type ExecOptions struct {
 	Tag          string
 	Exclude      []string
 	TaskCount    int
-	SuPwd        string
 	Interactive  bool
 	NoLoginShell bool
 	Stream       bool
@@ -62,15 +61,6 @@ func newCmdExecWithOptions(o *ExecOptions) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			o.stdout = cmd.OutOrStdout()
 			o.stderr = cmd.ErrOrStderr()
-			if cmd.Flags().Changed("password") {
-				utils.WarnFlagDeprecated("password", "--password-stdin or 'xops identity credential set'")
-			}
-			if cmd.Flags().Changed("passphrase") {
-				utils.WarnFlagDeprecated("passphrase", "--passphrase-stdin or 'xops identity credential set'")
-			}
-			if cmd.Flags().Changed("suPwd") {
-				utils.WarnFlagDeprecated("suPwd", "'xops identity credential set' or secure stores")
-			}
 			if err := o.Complete(cmd, args); err != nil {
 				return err
 			}
@@ -89,14 +79,11 @@ func newCmdExecWithOptions(o *ExecOptions) *cobra.Command {
 
 	// xops-enhanced flags (long-form only, no short flags to avoid OpenSSH conflicts)
 	cmd.Flags().StringVar(&o.Host, "host", "", i18n.T("flag_hosts"))
-	cmd.Flags().StringVar(&o.Password, "password", "", i18n.T("flag_password"))
 	cmd.Flags().BoolVar(&o.PasswordStdin, "password-stdin", false, i18n.T("flag_password_stdin"))
-	cmd.Flags().StringVar(&o.Passphrase, "passphrase", "", i18n.T("flag_passphrase"))
 	cmd.Flags().BoolVar(&o.PassphraseStdin, "passphrase-stdin", false, i18n.T("flag_passphrase_stdin"))
 	cmd.Flags().StringVar(&o.Remember, "remember", "", i18n.T("flag_remember"))
 	cmd.Flags().StringVar(&o.Alias, "alias", "", i18n.T("flag_alias"))
 	cmd.Flags().BoolVar(&o.Sudo, "sudo", false, i18n.T("flag_exec_sudo"))
-	cmd.Flags().StringVar(&o.SuPwd, "suPwd", "", i18n.T("flag_exec_su_pwd"))
 
 	// exec-specific flags
 	cmd.Flags().StringVarP(&o.Command, "cmd", "c", "", i18n.T("flag_exec_cmd"))
@@ -110,9 +97,6 @@ func newCmdExecWithOptions(o *ExecOptions) *cobra.Command {
 	cmd.Flags().BoolVar(&o.Stream, "stream", false, i18n.T("flag_exec_stream"))
 	cmd.Flags().StringVar(&o.OutDir, "out-dir", "", i18n.T("flag_exec_out_dir"))
 
-	cmd.MarkFlagsMutuallyExclusive("password", "identity")
-	cmd.MarkFlagsMutuallyExclusive("password", "password-stdin")
-	cmd.MarkFlagsMutuallyExclusive("passphrase", "passphrase-stdin")
 	cmd.MarkFlagsMutuallyExclusive("host", "ifile", "tag")
 	cmd.MarkFlagsMutuallyExclusive("cmd", "shell")
 	cmd.MarkFlagsMutuallyExclusive("stream", "out-dir")
@@ -430,7 +414,7 @@ func (o *ExecOptions) buildAdapterOptions(tasks []execHostTask, cfg *config.Conf
 	adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{Remember: remember}))
 	for _, task := range tasks {
 		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(task.nodeID, adapter.SessionAuth{
-			Password: task.pass, Passphrase: task.passphrase, KeyPath: task.keyPath, SuPwd: o.SuPwd, Remember: remember,
+			Password: task.pass, Passphrase: task.passphrase, KeyPath: task.keyPath, Remember: remember,
 		}))
 	}
 	if reg, regErr := utils.GetCredentialRegistry(cfg); regErr != nil {
