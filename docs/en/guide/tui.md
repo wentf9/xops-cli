@@ -30,7 +30,13 @@ A save failure retains the connection, and a persistence warning remains visible
 
 The new-node form selects verification by default. On submission, it verifies SSH authentication before saving. If verification fails, the TUI reports the reason and asks whether to save anyway. Press `y` to save; Enter, `n`, or Esc leaves the node unsaved and returns to the form for correction. Ctrl+C during verification cancels the operation.
 
+While awaiting that decision, the interface prioritizes the question and `[y/N]` over editing shortcut help. Completed forms give their space to the failure details. Saving uses the submitted values; resizing the terminal during a save does not change the credentials being saved.
+
 For an offline addition, explicitly select **Skip verification and save** in the **Verify before saving** field. This skips only the connection check; configuration and credential-store validation still run. Editing an existing node keeps its existing save behavior.
+
+Press `Ctrl+S` to save a node form or `Esc` to return to the list. If an alias belongs to another node, the error remains visible below the form. Entered values are retained for correction and retry. Footer messages wrap to the terminal width while preserving space for the focused input. Long messages show an ellipsis; enlarge the terminal to see the full text.
+
+Validation errors triggered by Tab or arrow-key navigation appear in the same feedback area. When feedback appears or the terminal is resized, the form adjusts its scroll position to keep the focused input visible, including the final Tags field.
 
 | Key | Action |
 | --- | --- |

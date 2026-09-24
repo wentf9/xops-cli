@@ -484,7 +484,8 @@ func (m *Model) handleAsyncMessage(msg tea.Msg) (bool, tea.Cmd) {
 	}
 }
 
-func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *Model) Update(msg tea.Msg) (_ tea.Model, cmd tea.Cmd) {
+	defer func() { cmd = tea.Batch(cmd, m.resizeNodeForm()) }()
 	if background, ok := msg.(tea.BackgroundColorMsg); ok {
 		m.backgroundColor = &background
 		m.applyNodeListTheme()
@@ -526,7 +527,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	cmd := m.handleStateUpdate(msg)
+	cmd = m.handleStateUpdate(msg)
 
 	// If status was just set, start a timer to clear it
 	// 但如果是删除确认状态，我们不希望它自动消失
@@ -606,10 +607,13 @@ func (m Model) View() tea.View {
 	case viewForm:
 		if m.form != nil {
 			s = m.form.View()
-			s += "\n\n" + statusStyle.Render(i18n.T("tui_form_help"))
 		} else {
 			s = "Form View (WIP)"
 		}
+		if s != "" {
+			s += "\n\n"
+		}
+		s += m.formFooter()
 	case viewTagSelect:
 		if m.tagForm != nil {
 			s = m.tagForm.View()
@@ -624,7 +628,7 @@ func (m Model) View() tea.View {
 		s = m.logStreamer.View()
 	}
 
-	if m.status != "" {
+	if m.status != "" && m.state != viewForm {
 		s += "\n\n" + statusStyle.Render(m.status)
 	}
 
@@ -662,7 +666,7 @@ func tuiRememberPolicy(snapshot *config.Configuration, cfg modelConfig) string {
 	return policy
 }
 
-// Confirmation prompts remain visible until the user explicitly answers.
+// Form feedback and confirmation prompts remain visible while awaiting input.
 func (m *Model) statusCanExpire() bool {
-	return !m.deletePending && !m.mutationPending && m.formVerifyErr == nil
+	return m.state != viewForm && !m.deletePending && !m.mutationPending && m.formVerifyErr == nil
 }

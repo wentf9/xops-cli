@@ -64,6 +64,7 @@ type formCredentialActions struct {
 func (m *Model) initForm(nodeID string) (Model, tea.Cmd) {
 	state := m.formState
 	if state == nil {
+		m.status = ""
 		var err error
 		state, err = m.newNodeFormState(nodeID)
 		if err != nil {
@@ -96,9 +97,6 @@ func (m *Model) initForm(nodeID string) (Model, tea.Cmd) {
 	)
 	km.Select.Up = key.NewBinding()
 	km.Select.Down = key.NewBinding()
-
-	// 计算合理高度（保留 3 行用于底部状态和 help 说明）
-	formHeight := max(m.lastSize.Height-3, 1)
 
 	var fields []huh.Field
 	fields = append(fields,
@@ -218,11 +216,11 @@ func (m *Model) initForm(nodeID string) (Model, tea.Cmd) {
 		huh.NewGroup(fields...),
 	).WithTheme(huh.ThemeFunc(formTheme)).
 		WithKeyMap(km).
-		WithWidth(m.lastSize.Width).
-		WithHeight(formHeight)
+		// Field errors share the bounded application footer with save errors.
+		WithShowErrors(false)
 
 	cmd := m.initEmbeddedForm(m.form)
-	return *m, cmd
+	return *m, tea.Batch(cmd, m.resizeNodeForm())
 }
 
 // Forms opened after terminal discovery still need the v2 background message
@@ -391,10 +389,6 @@ func (m *Model) updateForm(msg tea.Msg) (Model, tea.Cmd) {
 	}
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		if m.form != nil {
-			formHeight := max(msg.Height-3, 1)
-			m.form.WithWidth(msg.Width).WithHeight(formHeight)
-		}
 		return *m, nil
 	case tea.KeyPressMsg:
 		if m.formConflict {
@@ -436,7 +430,11 @@ func (m *Model) updateForm(msg tea.Msg) (Model, tea.Cmd) {
 }
 
 func (m *Model) saveFormCmd() tea.Cmd {
-	s := m.formState
+	// Huh may write bound values while processing layout updates. Background
+	// verification and persistence own a snapshot of exactly what was submitted.
+	s := *m.formState
+	s.existingPasswordRef = s.existingPasswordRef.Clone()
+	s.existingPassphraseRef = s.existingPassphraseRef.Clone()
 
 	port, _ := strconv.Atoi(s.port)
 
@@ -488,6 +486,7 @@ func (m *Model) saveFormCmd() tea.Cmd {
 
 	var run func(context.Context) error
 	repository := m.repository
+	credentialService := m.credentialService
 	if s.isEdit {
 		ref := s.ref
 		if ref.ID == "" {
@@ -501,7 +500,7 @@ func (m *Model) saveFormCmd() tea.Cmd {
 			if err != nil {
 				return err
 			}
-			return m.syncCredentialsToStore(ctx, nodeID, authVersion, s, actions)
+			return syncCredentialsToStore(ctx, repository, credentialService, nodeID, authVersion, s, actions)
 		}
 	} else {
 		run = func(ctx context.Context) error {
@@ -509,7 +508,7 @@ func (m *Model) saveFormCmd() tea.Cmd {
 			if err != nil {
 				return err
 			}
-			return m.syncCredentialsToStore(ctx, nodeID, mutation.AuthVersion, s, actions)
+			return syncCredentialsToStore(ctx, repository, credentialService, nodeID, mutation.AuthVersion, s, actions)
 		}
 	}
 	if !s.isEdit && !s.skipVerify {
@@ -669,16 +668,15 @@ func (s *nodeFormState) applyIdentityCredentials(identity *models.Identity, absK
 	return actions
 }
 
-func (m *Model) syncCredentialsToStore(ctx context.Context, nodeID, authVersion string, s *nodeFormState, actions formCredentialActions) error {
-	if m.credentialService == nil {
-		if m.repository.Snapshot().Credential != nil && ((s.authType == "password" && (actions.password == "replace" || actions.password == "delete")) ||
+func syncCredentialsToStore(ctx context.Context, repository *config.Repository, credSvc *credential.Service, nodeID, authVersion string, s nodeFormState, actions formCredentialActions) error {
+	if credSvc == nil {
+		if repository.Snapshot().Credential != nil && ((s.authType == "password" && (actions.password == "replace" || actions.password == "delete")) ||
 			(s.authType == "key" && (actions.passphrase == "replace" || actions.passphrase == "delete"))) {
 			return errors.New("credential service is unavailable")
 		}
 		return nil
 	}
-	credSvc := m.credentialService
-	cfg := m.repository.Snapshot()
+	cfg := repository.Snapshot()
 	targetStore := "none"
 	if cfg != nil && cfg.Credential != nil {
 		targetStore = cfg.Credential.DefaultStore
