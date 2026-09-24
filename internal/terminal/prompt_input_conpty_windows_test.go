@@ -265,7 +265,7 @@ func newVTConsole(t *testing.T) (*conpty.ConPty, *vtOutput) {
 		}
 		select {
 		case err := <-readDone:
-			if err != nil && !errors.Is(err, os.ErrClosed) && !errors.Is(err, windows.ERROR_BROKEN_PIPE) {
+			if !isVTOutputCloseError(err) {
 				t.Errorf("read ConPTY output: %v", err)
 			}
 		case <-time.After(2 * time.Second):
@@ -274,6 +274,41 @@ func newVTConsole(t *testing.T) (*conpty.ConPty, *vtOutput) {
 	})
 
 	return console, output
+}
+
+// Only use this after closing the owned ConPTY. Its reader calls ReadFile
+// directly, so a read racing with CloseHandle can return ERROR_INVALID_HANDLE
+// instead of os.ErrClosed or ERROR_BROKEN_PIPE.
+func isVTOutputCloseError(err error) bool {
+	return err == nil || errors.Is(err, os.ErrClosed) ||
+		errors.Is(err, windows.ERROR_BROKEN_PIPE) || errors.Is(err, windows.ERROR_INVALID_HANDLE)
+}
+
+func TestWindowsConPTYOutputClosedHandle(t *testing.T) {
+	console, err := conpty.New(100, 30, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := console.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := console.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Force the next iteration of the output-copy loop to run after Close,
+	// without depending on the scheduler to reproduce the cleanup race.
+	_, err = io.Copy(io.Discard, console)
+	if !errors.Is(err, windows.ERROR_INVALID_HANDLE) {
+		t.Fatalf("read closed ConPTY: got %v, want ERROR_INVALID_HANDLE", err)
+	}
+	if !isVTOutputCloseError(err) {
+		t.Fatalf("closed ConPTY output was treated as a failure: %v", err)
+	}
+	if isVTOutputCloseError(windows.ERROR_ACCESS_DENIED) {
+		t.Fatal("unexpected output read errors must remain failures")
+	}
 }
 
 func waitVTStage(t *testing.T, ctx context.Context, marker, want string, output *vtOutput) {

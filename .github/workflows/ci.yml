@@ -120,7 +120,7 @@ jobs:
 
       - name: Run Windows terminal input ConPTY integration test
         if: ${{ !cancelled() }}
-        run: go test -race -tags=integration -run '^TestWindowsInteractiveInputConPTY$' -count=1 -timeout=60s ./internal/terminal
+        run: go test -race -tags=integration -run '^TestWindows(InteractiveInputConPTY|ConPTYOutputClosedHandle)$' -count=1 -timeout=60s ./internal/terminal
 
   macos-test:
     name: macOS Build and Test
