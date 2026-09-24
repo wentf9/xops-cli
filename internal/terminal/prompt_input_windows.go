@@ -18,6 +18,8 @@ import (
 
 type windowsPromptInput struct {
 	file          *os.File
+	handle        windows.Handle
+	pipe          bool
 	console       *windowsConsolePromptReader
 	cancelEvent   windows.Handle
 	stateMu       sync.Mutex
@@ -29,7 +31,16 @@ type windowsPromptInput struct {
 	closeErr      error
 }
 
-type windowsConsoleEventReader func(windows.Handle, windows.Handle) (coninput.EventRecord, error)
+// Match the Windows OpenSSH input batch size. A batch is a byte-stream chunk,
+// not an ANSI message boundary; consumers must tolerate split sequences.
+const windowsConsoleInputBatchSize = 1024
+
+type windowsConsoleEvents struct {
+	records []coninput.EventRecord
+	mode    uint32
+}
+
+type windowsConsoleEventReader func(windows.Handle, windows.Handle, int) (windowsConsoleEvents, error)
 
 type windowsConsolePromptReader struct {
 	handle        windows.Handle
@@ -75,8 +86,13 @@ func duplicateWindowsInput(input io.Reader, interactive bool) (PromptInput, erro
 		return nil, err
 	}
 	promptFile := os.NewFile(uintptr(duplicate), file.Name())
-	promptInput := &windowsPromptInput{file: promptFile}
-	if term.IsTerminal(int(file.Fd())) {
+	fileType, err := windows.GetFileType(duplicate)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("inspect duplicated prompt input failed: %w", err), promptFile.Close())
+	}
+	isConsole := term.IsTerminal(int(duplicate))
+	promptInput := &windowsPromptInput{file: promptFile, handle: duplicate, pipe: fileType == windows.FILE_TYPE_PIPE}
+	if isConsole || promptInput.pipe {
 		cancelEvent, err := windows.CreateEvent(nil, 1, 0, nil)
 		if err != nil {
 			if closeErr := promptFile.Close(); closeErr != nil {
@@ -89,11 +105,13 @@ func duplicateWindowsInput(input io.Reader, interactive bool) (PromptInput, erro
 			return nil, fmt.Errorf("create prompt input cancellation event failed: %w", err)
 		}
 		promptInput.cancelEvent = cancelEvent
+	}
+	if isConsole {
 		promptInput.console = &windowsConsolePromptReader{
 			interactive: interactive,
 			handle:      duplicate,
-			cancelEvent: cancelEvent,
-			readEvent:   readWindowsConsoleEvent,
+			cancelEvent: promptInput.cancelEvent,
+			readEvent:   readWindowsConsoleEvents,
 			pending:     []byte{},
 		}
 	}
@@ -113,35 +131,48 @@ func (i *windowsPromptInput) Read(buffer []byte) (int, error) {
 	if i.console != nil {
 		return i.console.Read(buffer)
 	}
+	if i.pipe {
+		return i.readPipe(buffer)
+	}
 	return i.file.Read(buffer)
 }
 
-func readWindowsConsoleEvent(handle, cancelEvent windows.Handle) (coninput.EventRecord, error) {
+func readWindowsConsoleEvents(handle, cancelEvent windows.Handle, limit int) (windowsConsoleEvents, error) {
 	woken, err := windows.WaitForMultipleObjects(
 		[]windows.Handle{cancelEvent, handle},
 		false,
 		windows.INFINITE,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("wait for Windows console input failed: %w", err)
+		return windowsConsoleEvents{}, fmt.Errorf("wait for Windows console input failed: %w", err)
 	}
 	switch woken {
 	case windows.WAIT_OBJECT_0:
-		return nil, io.EOF
+		return windowsConsoleEvents{}, io.EOF
 	case windows.WAIT_OBJECT_0 + 1:
 	default:
-		return nil, fmt.Errorf("wait for Windows console input returned unexpected result %d", woken)
+		return windowsConsoleEvents{}, fmt.Errorf("wait for Windows console input returned unexpected result %d", woken)
 	}
 
-	records := []coninput.InputRecord{{}}
+	// Read the mode here rather than when duplicating the handle: the SFTP
+	// editor creates its reader before enabling raw/VT input.
+	var mode uint32
+	if err := windows.GetConsoleMode(handle, &mode); err != nil {
+		return windowsConsoleEvents{}, fmt.Errorf("read Windows console input mode failed: %w", err)
+	}
+	records := make([]coninput.InputRecord, limit)
 	read, err := coninput.ReadConsoleInput(handle, records)
 	if err != nil {
-		return nil, err
+		return windowsConsoleEvents{}, err
 	}
 	if read == 0 {
-		return nil, nil
+		return windowsConsoleEvents{}, nil
 	}
-	return records[0].Unwrap(), nil
+	events := make([]coninput.EventRecord, read)
+	for index := range events {
+		events[index] = records[index].Unwrap()
+	}
+	return windowsConsoleEvents{records: events, mode: mode}, nil
 }
 
 func (r *windowsConsolePromptReader) Read(buffer []byte) (int, error) {
@@ -151,19 +182,30 @@ func (r *windowsConsolePromptReader) Read(buffer []byte) (int, error) {
 	if len(r.pending) > 0 {
 		return r.copyPending(buffer), nil
 	}
+	// Forward available console input in batches, without adding a timer or
+	// parsing ANSI sequences. Plain prompts retain single-event reads to avoid
+	// consuming the next prompt's input.
+	limit := 1
+	if r.interactive {
+		limit = windowsConsoleInputBatchSize
+	}
 	for {
-		event, err := r.readEvent(r.handle, r.cancelEvent)
+		events, err := r.readEvent(r.handle, r.cancelEvent, limit)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return 0, err
 			}
 			return 0, fmt.Errorf("read Windows console input event failed: %w", err)
 		}
-		key, ok := event.(coninput.KeyEventRecord)
-		if !ok {
-			continue
+		for _, event := range events.records {
+			if key, ok := event.(coninput.KeyEventRecord); ok {
+				if r.interactive && events.mode&windows.ENABLE_VIRTUAL_TERMINAL_INPUT != 0 {
+					r.appendVTKey(key)
+				} else {
+					r.pending = append(r.pending, r.translateKeyEvent(key)...)
+				}
+			}
 		}
-		r.pending = r.translateKeyEvent(key)
 		if len(r.pending) > 0 {
 			return r.copyPending(buffer), nil
 		}
@@ -271,14 +313,14 @@ func (i *windowsPromptInput) Interrupt() error {
 		i.stateMu.Unlock()
 
 		if i.cancelEvent != 0 {
-			// Keep both waited-on handles alive until every reader has exited.
+			// Console and pipe readers observe a persistent cancellation event;
+			// keep the handles alive until every admitted reader has exited.
 			if err := windows.SetEvent(i.cancelEvent); err != nil {
 				i.interruptErr = fmt.Errorf("signal prompt input cancellation failed: %w", err)
 			}
 			return
 		}
-		handle := windows.Handle(i.file.Fd())
-		cancelErr := windows.CancelIoEx(handle, nil)
+		cancelErr := windows.CancelIoEx(i.handle, nil)
 		if errors.Is(cancelErr, windows.ERROR_NOT_FOUND) || errors.Is(cancelErr, windows.ERROR_INVALID_HANDLE) {
 			cancelErr = nil
 		}
@@ -302,9 +344,9 @@ func (i *windowsPromptInput) Close() error {
 			closeEventErr = windows.CloseHandle(i.cancelEvent)
 		}
 		i.closeErr = interruptErr
-		if i.console != nil {
+		if i.cancelEvent != 0 {
 			if err := i.file.Close(); err != nil {
-				i.closeErr = appendWindowsPromptInputError(i.closeErr, "close console input failed", err)
+				i.closeErr = appendWindowsPromptInputError(i.closeErr, "close prompt input failed", err)
 			}
 		}
 		if closeEventErr != nil {

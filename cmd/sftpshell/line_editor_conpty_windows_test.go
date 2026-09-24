@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -22,14 +21,6 @@ import (
 )
 
 const conPTYHelperEnvironment = "XOPS_SFTP_CONPTY_HELPER"
-
-type conPTYOutput struct {
-	mu        sync.Mutex
-	data      []byte
-	screen    string
-	screenErr error
-	updated   chan struct{}
-}
 
 type conPTYHarness struct {
 	t               *testing.T
@@ -58,9 +49,7 @@ func TestWindowsLineEditorConPTY(t *testing.T) {
 	waitForConPTYOutput(t, harness.output, "HOST_KEY_ACCEPTED")
 
 	waitForConPTYOutput(t, harness.output, "SFTP_PROMPT_1> ")
-	if err := harness.pty.Resize(72, 24); err != nil {
-		t.Fatal(err)
-	}
+	harness.resize(72, 24)
 	writeConPTYInput(t, harness.pty, "pwd")
 	waitForConPTYOutput(t, harness.output, "SFTP_PROMPT_1> pwd")
 	writeConPTYInput(t, harness.pty, "\r")
@@ -142,11 +131,21 @@ func newConPTYHarness(t *testing.T) *conPTYHarness {
 	harness := &conPTYHarness{
 		t:        t,
 		pty:      pty,
-		output:   &conPTYOutput{updated: make(chan struct{}, 1)},
+		output:   newConPTYOutput(100, 30),
 		readDone: make(chan error, 1),
 	}
 	t.Cleanup(harness.cleanup)
 	return harness
+}
+
+// Record the resize before ConPTY can emit a redraw. Some Windows builds
+// do not include an in-band size report in the output stream.
+func (h *conPTYHarness) resize(cols, rows int) {
+	h.t.Helper()
+	h.output.Resize(cols, rows)
+	if err := h.pty.Resize(cols, rows); err != nil {
+		h.t.Fatal(err)
+	}
 }
 
 func (h *conPTYHarness) start() {
@@ -314,6 +313,33 @@ func exerciseConPTYLineEditor(t *testing.T, shell *Shell) {
 	if historyLine != line {
 		t.Fatalf("history prompt result = %q, want %q", historyLine, line)
 	}
+	exerciseConPTYEditingKeys(t, editor, checkMode)
+	for i := range 80 {
+		if err := os.Mkdir(filepath.Join(shell.localCwd, fmt.Sprintf("bin%03d", i)), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeTestFile(t, filepath.Join(shell.localCwd, "bin036", "tool.txt"), []byte("test"))
+	completed, completeErr := editor.Prompt(t.Context(), "SFTP_PAGES> ")
+	if completeErr != nil || completed != "put "+filepath.Join("bin036", "tool.txt") {
+		t.Fatalf("paged completion=%q, error=%v", completed, completeErr)
+	}
+	checkMode()
+	cancelCtx, cancelPrompt := context.WithTimeout(t.Context(), 150*time.Millisecond)
+	_, cancelErr := editor.Prompt(cancelCtx, "SFTP_CANCEL> ")
+	cancelPrompt()
+	if !errors.Is(cancelErr, context.DeadlineExceeded) {
+		t.Fatalf("canceled prompt = %v", cancelErr)
+	}
+	checkMode()
+	if err := editor.Close(); err != nil {
+		t.Fatalf("close line editor failed: %v", err)
+	}
+	closed = true
+}
+
+func exerciseConPTYEditingKeys(t *testing.T, editor *lineEditor, checkMode func()) {
+	t.Helper()
 	for i, expected := range []struct {
 		line string
 		err  error
@@ -345,28 +371,6 @@ func exerciseConPTYLineEditor(t *testing.T, shell *Shell) {
 	checkMode()
 	exerciseConPTYConfirmationInterrupt(t, editor)
 	checkMode()
-	for i := range 80 {
-		if err := os.Mkdir(filepath.Join(shell.localCwd, fmt.Sprintf("bin%03d", i)), 0o700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	writeTestFile(t, filepath.Join(shell.localCwd, "bin036", "tool.txt"), []byte("test"))
-	completed, completeErr := editor.Prompt(t.Context(), "SFTP_PAGES> ")
-	if completeErr != nil || completed != "put "+filepath.Join("bin036", "tool.txt") {
-		t.Fatalf("paged completion=%q, error=%v", completed, completeErr)
-	}
-	checkMode()
-	cancelCtx, cancelPrompt := context.WithTimeout(t.Context(), 150*time.Millisecond)
-	_, cancelErr := editor.Prompt(cancelCtx, "SFTP_CANCEL> ")
-	cancelPrompt()
-	if !errors.Is(cancelErr, context.DeadlineExceeded) {
-		t.Fatalf("canceled prompt = %v", cancelErr)
-	}
-	checkMode()
-	if err := editor.Close(); err != nil {
-		t.Fatalf("close line editor failed: %v", err)
-	}
-	closed = true
 }
 
 func readConPTYOutput(reader io.Reader, output *conPTYOutput, done chan<- error) {
@@ -381,23 +385,6 @@ func readConPTYOutput(reader io.Reader, output *conPTYOutput, done chan<- error)
 			return
 		}
 	}
-}
-
-func (o *conPTYOutput) Append(data []byte) {
-	o.mu.Lock()
-	o.data = append(o.data, data...)
-	o.screen, o.screenErr = terminalScreen(string(o.data), 100, 30)
-	o.mu.Unlock()
-	select {
-	case o.updated <- struct{}{}:
-	default:
-	}
-}
-
-func (o *conPTYOutput) String() string {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return string(o.data)
 }
 
 func waitForConPTYOutput(t *testing.T, output *conPTYOutput, expected string) {

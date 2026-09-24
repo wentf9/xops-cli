@@ -42,7 +42,8 @@ func copyStdinTo(src *os.File, dst io.Writer) (cancel func() error, done <-chan 
 			doneCh <- copyErr
 			close(doneCh)
 		}()
-		buf := make([]byte, 1024)
+		// Room for a 1024-record VT console batch after UTF-8 conversion.
+		buf := make([]byte, 4096)
 		for {
 			n, readErr := input.Read(buf)
 			if ctx.Err() != nil {

@@ -17,7 +17,8 @@ import (
 // preserve ordinary cursor movement/erasure so assertions check the screen.
 var terminalExtensions = regexp.MustCompile(`\x1b\[[><=][0-9;:]*[um]|\x1b\[\?[0-9;]*\$p`)
 
-// ConPTY emits an in-band window resize before redrawing at the new size.
+// Some ConPTY versions emit an in-band window resize before redrawing.
+// Harnesses also record explicit resize requests for versions that do not.
 // Replaying at the initial dimensions misplaces absolute cursor updates after
 // wrapping or scrolling, which can hide a correctly rendered completion line.
 var terminalResizes = regexp.MustCompile(`\x1b\[8;([1-9][0-9]*);([1-9][0-9]*)t`)

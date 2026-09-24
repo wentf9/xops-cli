@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"slices"
 	"testing"
 	"time"
@@ -17,47 +16,14 @@ import (
 )
 
 func TestWindowsPromptInputInterruptsPendingRead(t *testing.T) {
-	reader, writer, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("create pipe failed: %v", err)
-	}
-	defer func() {
-		if closeErr := reader.Close(); closeErr != nil {
-			t.Logf("close source reader failed: %v", closeErr)
-		}
-		if closeErr := writer.Close(); closeErr != nil {
-			t.Logf("close source writer failed: %v", closeErr)
-		}
-	}()
-
-	input, err := DuplicatePromptInput(reader)
-	if err != nil {
-		t.Fatalf("duplicate prompt input failed: %v", err)
-	}
+	input, _, _ := newWindowsPipeTestInput(t)
 	readDone := make(chan error, 1)
 	go func() {
-		buffer := make([]byte, 1)
-		_, readErr := input.Read(buffer)
-		readDone <- readErr
+		var buffer [1]byte
+		_, err := input.Read(buffer[:])
+		readDone <- err
 	}()
-
-	if err := input.Interrupt(); err != nil {
-		t.Fatalf("interrupt prompt input failed: %v", err)
-	}
-	select {
-	case readErr := <-readDone:
-		if readErr == nil {
-			t.Fatal("pending read unexpectedly succeeded")
-		}
-		if !errors.Is(readErr, io.EOF) {
-			t.Logf("pending read returned platform error after cancellation: %v", readErr)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("pending prompt read was not interrupted")
-	}
-	if err := input.Close(); err != nil {
-		t.Fatalf("close prompt input failed: %v", err)
-	}
+	interruptWindowsPipeTestInput(t, input, readDone)
 }
 
 func TestWindowsConsolePromptReaderTranslatesNavigationKeys(t *testing.T) {
@@ -180,7 +146,7 @@ func TestReadWindowsConsoleEventReturnsWhenCanceled(t *testing.T) {
 
 	readDone := make(chan error, 1)
 	go func() {
-		_, readErr := readWindowsConsoleEvent(inputEvent, cancelEvent)
+		_, readErr := readWindowsConsoleEvents(inputEvent, cancelEvent, windowsConsoleInputBatchSize)
 		readDone <- readErr
 	}()
 	if err := windows.SetEvent(cancelEvent); err != nil {
@@ -201,12 +167,48 @@ func newTestWindowsConsolePromptReader(events []coninput.EventRecord) *windowsCo
 	return &windowsConsolePromptReader{
 		handle:      windows.Handle(1),
 		cancelEvent: windows.Handle(2),
-		readEvent: func(windows.Handle, windows.Handle) (coninput.EventRecord, error) {
-			event := events[next]
-			next++
-			return event, nil
+		readEvent: func(_, _ windows.Handle, limit int) (windowsConsoleEvents, error) {
+			if next == len(events) {
+				return windowsConsoleEvents{}, io.EOF
+			}
+			end := min(next+limit, len(events))
+			batch := events[next:end]
+			next = end
+			return windowsConsoleEvents{records: batch}, nil
 		},
 		pending: []byte{},
+	}
+}
+
+func TestWindowsInteractiveInputBatchesVTSequences(t *testing.T) {
+	for _, sequence := range []string{"\x1b[30;1R", "\x1b[O", "\x1b[A", "\x1b[B", "\x1b[200~paste\x1b[201~"} {
+		t.Run(fmt.Sprintf("%q", sequence), func(t *testing.T) {
+			events := []coninput.EventRecord{coninput.FocusEventRecord{}}
+			for _, char := range sequence {
+				events = append(events, coninput.KeyEventRecord{KeyDown: true, Char: char})
+			}
+			reader := newTestWindowsConsolePromptReader(events)
+			reader.interactive = true
+			buffer := make([]byte, 1024)
+			n, err := reader.Read(buffer)
+			if err != nil || string(buffer[:n]) != sequence {
+				t.Fatalf("queued VT input split: read %q, err=%v, want %q in one read", buffer[:n], err, sequence)
+			}
+		})
+	}
+}
+
+func TestWindowsPromptInputDoesNotReadAhead(t *testing.T) {
+	reader := newTestWindowsConsolePromptReader([]coninput.EventRecord{
+		coninput.KeyEventRecord{KeyDown: true, Char: '\r'},
+		coninput.KeyEventRecord{KeyDown: true, Char: 'x'},
+	})
+	buffer := make([]byte, 1024)
+	for _, want := range []string{"\r", "x"} {
+		n, err := reader.Read(buffer)
+		if err != nil || string(buffer[:n]) != want {
+			t.Fatalf("prompt read %q, err=%v, want %q", buffer[:n], err, want)
+		}
 	}
 }
 

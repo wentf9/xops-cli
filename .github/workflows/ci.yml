@@ -118,6 +118,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: go test -race -tags=integration -run '^TestWindowsLineEditorConPTY$' -count=1 ./cmd/sftpshell
 
+      - name: Run Windows terminal input ConPTY integration test
+        if: ${{ !cancelled() }}
+        run: go test -race -tags=integration -run '^TestWindowsInteractiveInputConPTY$' -count=1 -timeout=60s ./internal/terminal
+
   macos-test:
     name: macOS Build and Test
     runs-on: macos-latest
