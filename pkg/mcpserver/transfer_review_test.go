@@ -9,11 +9,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	pkgsftp "github.com/pkg/sftp"
+	sshfx "github.com/pkg/sftp/v2/encoding/ssh/filexfer"
 	"github.com/wentf9/xops-cli/pkg/mcpserver/transfer"
 )
 
@@ -24,21 +26,37 @@ func (w diskCreationWriter) Filewrite(req *pkgsftp.Request) (io.WriterAt, error)
 	if !flags.Creat || !flags.Excl || !flags.Write {
 		return nil, errors.New("exclusive write flags missing")
 	}
-	// Model a target with umask 022, checking permissions before returning the
-	// handle (before the client's journal confirmation or any subsequent chmod).
-	mode := os.FileMode(0666)
-	if len(req.Attrs) == 4 {
-		mode = os.FileMode(binary.BigEndian.Uint32(req.Attrs))
+	// Require private permissions in the initial OPEN on every platform.
+	// Checking only a later chmod would miss an already-open public handle.
+	if len(req.Attrs) != 4 || binary.BigEndian.Uint32(req.Attrs) != 0600 {
+		return nil, errors.New("initial OPEN must request mode 0600")
 	}
+	// Model a POSIX target with umask 022 where the host supports those bits.
+	mode := os.FileMode(binary.BigEndian.Uint32(req.Attrs))
 	file, err := os.OpenFile(filepath.Join(w.directory, "temporary"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode&^0022)
 	if err != nil {
 		return nil, err
 	}
 	info, err := file.Stat()
-	if err != nil || info.Mode().Perm() != 0600 {
-		return nil, errors.Join(err, errors.New("temporary was public at creation"), file.Close())
+	if err == nil {
+		err = checkDiskCreationPermissions(info)
+	}
+	if err != nil {
+		return nil, errors.Join(err, file.Close())
 	}
 	return file, nil
+}
+
+func checkDiskCreationPermissions(info os.FileInfo) error {
+	if !info.Mode().IsRegular() {
+		return errors.New("temporary is not a regular file")
+	}
+	// Windows FileMode reports the read-only attribute as 0444/0666, not ACLs
+	// or POSIX permissions. The wire-level OPEN assertion above still applies.
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
+		return errors.New("temporary POSIX permissions are not 0600")
+	}
+	return nil
 }
 func TestUploadTemporaryPrivateAtCreation(t *testing.T) {
 	dir := t.TempDir()
@@ -57,8 +75,8 @@ func TestUploadTemporaryPrivateAtCreation(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if info.Mode().Perm() != 0600 {
-			return errors.New("nonprivate file before journal confirmation")
+		if err := checkDiskCreationPermissions(info); err != nil {
+			return err
 		}
 		confirmed = true
 		return nil
@@ -190,5 +208,43 @@ func TestPartialCopyHandlesDataWithEOFAndShortInput(t *testing.T) {
 		} else if !errors.Is(err, io.ErrUnexpectedEOF) {
 			t.Fatalf("short source accepted: %v", err)
 		}
+	}
+}
+
+func TestUploadTemporaryRejectsUnsafeCreationRequests(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		mode  *uint32
+		flags uint32
+	}{
+		{name: "missing permissions", flags: sshfx.FlagWrite | sshfx.FlagCreate | sshfx.FlagExclusive},
+		{name: "public read", mode: new(uint32(0644)), flags: sshfx.FlagWrite | sshfx.FlagCreate | sshfx.FlagExclusive},
+		{name: "public write", mode: new(uint32(0666)), flags: sshfx.FlagWrite | sshfx.FlagCreate | sshfx.FlagExclusive},
+		{name: "not exclusive", mode: new(uint32(0600)), flags: sshfx.FlagWrite | sshfx.FlagCreate},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			directory := t.TempDir()
+			request := &pkgsftp.Request{Filepath: "/temporary", Flags: tc.flags}
+			if tc.mode != nil {
+				request.Attrs = make([]byte, 4)
+				binary.BigEndian.PutUint32(request.Attrs, *tc.mode)
+			}
+			handle, err := (diskCreationWriter{directory}).Filewrite(request)
+			if handle != nil {
+				if closer, ok := handle.(io.Closer); ok {
+					closeTransferTestResource(t, closer)
+				}
+			}
+			if err == nil {
+				t.Fatal("unsafe creation request accepted")
+			}
+			entries, err := os.ReadDir(directory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 0 {
+				t.Fatal("unsafe request created a file before being rejected")
+			}
+		})
 	}
 }
