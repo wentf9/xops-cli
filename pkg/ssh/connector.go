@@ -944,8 +944,23 @@ func (c *Connector) CloseAll() error {
 	c.lifecycleCancel()
 	c.lifecycleMu.Unlock()
 
-	// closed 置位后不会再有新的 Connect 登记；等待在途 Connect 停止并拒绝发布。
+	// Closing forbids new publication. Snapshot the existing clients without
+	// holding map locks during network cleanup, then interrupt their physical
+	// transports BEFORE joining connection workers. A downstream handshake can
+	// otherwise remain blocked in a ProxyJump channel after context cancellation.
+	var pooledClients []*PooledClient
+	c.clients.IterCb(func(_ string, client *PooledClient) bool {
+		pooledClients = append(pooledClients, client)
+		return true
+	})
+	var closeErrs []error
+	for _, client := range pooledClients {
+		if err := client.interrupt(); err != nil {
+			closeErrs = append(closeErrs, err)
+		}
+	}
 	c.connectWG.Wait()
+	c.clients.Clear()
 
 	// startKeepAliveFor 只可能由已结束的 Connect 调用，此处可完整取得并清空注册表。
 	c.kaMu.Lock()
@@ -960,15 +975,6 @@ func (c *Connector) CloseAll() error {
 	c.keepAlives.Clear()
 	c.kaMu.Unlock()
 
-	var closeErrs []error
-	c.clients.IterCb(func(_ string, client *PooledClient) bool {
-		// Close the physical transport before nested channels can block on writes.
-		if err := client.interrupt(); err != nil {
-			closeErrs = append(closeErrs, err)
-		}
-		return true
-	})
-	c.clients.Clear()
 	c.keepAliveWG.Wait()
 
 	if len(closeErrs) > 0 {

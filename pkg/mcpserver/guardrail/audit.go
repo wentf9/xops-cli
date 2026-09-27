@@ -17,6 +17,7 @@ type AuditEntry struct {
 	OperationID string    `json:"op_id"`
 	Tool        string    `json:"tool"`
 	NodeID      string    `json:"node,omitempty"`
+	NodeIDs     []string  `json:"nodes,omitempty"`
 	Command     string    `json:"command,omitempty"`
 	Paths       []string  `json:"paths,omitempty"`
 	RiskLevel   string    `json:"risk"`

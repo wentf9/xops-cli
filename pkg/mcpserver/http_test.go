@@ -139,6 +139,18 @@ func TestHTTPRuntimeProtocolAndLocalFileBoundary(t *testing.T) {
 		if tool.Name == "xops_upload" || tool.Name == "xops_download" {
 			t.Fatalf("HTTP exposed server-local file tool %q", tool.Name)
 		}
+		if strings.HasPrefix(tool.Name, "xops_tunnel_") {
+			t.Fatalf("HTTP exposed stdio tunnel tool %q", tool.Name)
+		}
+	}
+	if r.tunnels != nil {
+		t.Fatal("HTTP initialized a tunnel manager")
+	}
+	for _, name := range []string{"xops_tunnel_create", "xops_tunnel_list", "xops_tunnel_status", "xops_tunnel_stop"} {
+		result, callErr := client.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: map[string]any{}})
+		if callErr == nil && !result.IsError {
+			t.Fatalf("HTTP accepted unregistered tool %s", name)
+		}
 	}
 }
 

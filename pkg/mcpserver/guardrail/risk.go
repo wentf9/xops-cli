@@ -1,5 +1,7 @@
 package guardrail
 
+import "net/netip"
+
 // RiskLevel represents the danger level of a tool invocation.
 type RiskLevel int
 
@@ -39,12 +41,15 @@ func ParseRiskLevel(s string) RiskLevel {
 // RiskInput carries contextual information about a single tool invocation
 // for risk assessment.
 type RiskInput struct {
-	ToolName string
-	NodeID   string
-	Command  string   // populated only for ssh_run
-	Paths    []string // file/directory paths involved
-	Sudo     bool     // whether sudo is requested
-	Details  string   // deferred-operation size, digest and overwrite information
+	ToolName   string
+	NodeID     string
+	NodeIDs    []string // additional canonical nodes covered by a batch operation
+	Command    string   // populated only for ssh_run
+	Paths      []string // file/directory paths involved
+	Sudo       bool     // whether sudo is requested
+	Details    string   // deferred-operation size, digest and overwrite information
+	TunnelMode string   // local or remote SSH forwarding
+	ListenHost string   // normalized IP literal, never resolved through DNS
 }
 
 // toolBaseRisk maps tool names to their static (baseline) risk level.
@@ -56,6 +61,10 @@ var toolBaseRisk = map[string]RiskLevel{
 	"xops_prepare_download": Safe,
 	"xops_transfer_status":  Safe,
 	"xops_transfer_cancel":  Safe,
+	"xops_tunnel_list":      Safe,
+	"xops_tunnel_status":    Safe,
+	"xops_tunnel_stop":      Moderate,
+	"xops_tunnel_create":    Dangerous,
 
 	"xops_write_file":     Moderate,
 	"xops_upload":         Moderate,
@@ -82,6 +91,11 @@ func Classify(input RiskInput) RiskLevel {
 			base = AnalyzeCommand(input.Command)
 		}
 		if input.Sudo && base < Moderate {
+			base = Moderate
+		}
+	}
+	if input.ToolName == "xops_tunnel_create" && input.TunnelMode == "local" {
+		if addr, err := netip.ParseAddr(input.ListenHost); err == nil && addr.Unmap().IsLoopback() {
 			base = Moderate
 		}
 	}

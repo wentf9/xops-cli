@@ -306,3 +306,73 @@ func TestSSH_DialSSHContextCancel(t *testing.T) {
 		t.Fatal("expected error on canceled context dial, got nil")
 	}
 }
+
+func TestForwardAddressAndConnectionLimit(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	entered := make(chan struct{}, 2)
+	rejected := make(chan error, 2)
+	forward := runForwardListener(ctx, listener, forwardOptions{maxConnections: 1, onConnectionError: func(err error) { rejected <- err }},
+		func(ctx context.Context, conn net.Conn) error {
+			defer closeTestResource(t, conn)
+			entered <- struct{}{}
+			<-ctx.Done()
+			return nil
+		})
+	defer func() {
+		cancel()
+		if err := forward.Wait(); err != nil {
+			t.Error(err)
+		}
+	}()
+	if forward.Addr().String() != listener.Addr().String() || strings.HasSuffix(forward.Addr().String(), ":0") {
+		t.Fatal("allocated address unavailable")
+	}
+	first, err := net.DialTimeout("tcp", forward.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeTestResource(t, first)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("first handler missing")
+	}
+	second, err := net.DialTimeout("tcp", forward.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeTestResource(t, second)
+	select {
+	case err := <-rejected:
+		if !strings.Contains(err.Error(), "limit reached") {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("excess connection accepted")
+	}
+	if err := second.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("excess connection not closed: %v", err)
+	}
+	cancel()
+	select {
+	case <-forward.Done():
+	case <-time.After(time.Second):
+		t.Fatal("listener did not finish")
+	}
+	if err := forward.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	probe, err := net.Listen("tcp", forward.Addr().String())
+	if err != nil {
+		t.Fatal("listener not released:", err)
+	}
+	closeTestResource(t, probe)
+}

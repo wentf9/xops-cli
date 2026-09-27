@@ -86,8 +86,10 @@ func WithGuardrail[In, Out any](
 			OperationID: opID,
 			Tool:        toolName,
 			NodeID:      ri.NodeID,
+			NodeIDs:     ri.NodeIDs,
 			Command:     ri.Command,
 			Paths:       ri.Paths,
+			Details:     ri.Details,
 			RiskLevel:   risk.String(),
 			Decision:    decision.String(),
 		}

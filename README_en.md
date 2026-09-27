@@ -185,6 +185,8 @@ xops mcp serve
 
 LAN clients (Codex / Antigravity CLI) can use `xops mcp serve --transport http`. See the [HTTP MCP guide](docs/en/guide/mcp-http.md) for authentication, streamed file transfers and client limitations.
 
+Stdio provides tools to create, inspect and stop SSH `-L/-R` tunnels. See [MCP SSH tunnels](docs/en/guide/mcp-tunnels.md).
+
 **B. Example: Integrate with Claude Desktop**
 
 Example configuration for `claude_desktop_config.json`:

@@ -15,7 +15,16 @@ import (
 type Forward struct {
 	done chan struct{}
 	err  error
+	addr net.Addr
 }
+
+// Addr returns the listener address, including a server-allocated port. For
+// remote forwarding, the SSH server's GatewayPorts policy controls exposure;
+// the returned host is not proof of the server's effective bind interfaces.
+func (f *Forward) Addr() net.Addr { return f.addr }
+
+// Done closes after the listener and all accepted connections have stopped.
+func (f *Forward) Done() <-chan struct{} { return f.done }
 
 // ForwardOption configures how a forwarding listener reports connection-level
 // failures. These failures never stop the listener.
@@ -23,6 +32,14 @@ type ForwardOption func(*forwardOptions)
 
 type forwardOptions struct {
 	onConnectionError func(error)
+	maxConnections    int
+}
+
+// WithForwardConnectionLimit bounds concurrent accepted connections. Excess
+// connections are closed immediately. Nonpositive values leave the default
+// unlimited behavior unchanged.
+func WithForwardConnectionLimit(limit int) ForwardOption {
+	return func(options *forwardOptions) { options.maxConnections = max(0, limit) }
 }
 
 // WithForwardErrorHandler receives errors isolated to one accepted
@@ -52,7 +69,7 @@ func (c *Client) LocalForward(ctx context.Context, localAddr, remoteAddr string,
 	if ctx == nil {
 		return nil, fmt.Errorf("local forward context is nil")
 	}
-	listener, err := net.Listen("tcp", localAddr)
+	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", localAddr)
 	if err != nil {
 		return nil, fmt.Errorf("listen on local address %s failed: %w", localAddr, err)
 	}
@@ -110,7 +127,7 @@ func (c *Client) forwardOptions(opts ...ForwardOption) forwardOptions {
 }
 
 func runForwardListener(ctx context.Context, listener net.Listener, options forwardOptions, handle func(context.Context, net.Conn) error) *Forward {
-	forward := &Forward{done: make(chan struct{})}
+	forward := &Forward{done: make(chan struct{}), addr: listener.Addr()}
 	go func() {
 		defer close(forward.done)
 		runCtx, cancel := context.WithCancel(ctx)
@@ -122,6 +139,10 @@ func runForwardListener(ctx context.Context, listener net.Listener, options forw
 		})
 
 		var handlers sync.WaitGroup
+		var slots chan struct{}
+		if options.maxConnections > 0 {
+			slots = make(chan struct{}, options.maxConnections)
+		}
 		var acceptErr error
 		for {
 			conn, err := listener.Accept()
@@ -131,7 +152,18 @@ func runForwardListener(ctx context.Context, listener net.Listener, options forw
 				}
 				break
 			}
+			if slots != nil {
+				select {
+				case slots <- struct{}{}:
+				default:
+					options.onConnectionError(errors.Join(errors.New("forward connection limit reached"), closeResource(conn, "excess forwarding connection")))
+					continue
+				}
+			}
 			handlers.Go(func() {
+				if slots != nil {
+					defer func() { <-slots }()
+				}
 				if err := handleForwardConnection(runCtx, conn, handle); err != nil && runCtx.Err() == nil {
 					options.onConnectionError(err)
 				}

@@ -1,15 +1,17 @@
 package guardrail
 
 import (
-	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"slices"
 	"testing"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 func TestDeferredAuthorizationDoesNotReportExecution(t *testing.T) {
 	g := New(defaultTestConfig())
 	audit := &fakeAuditWriter{}
 	g.SetAuditWriter(audit)
-	risk := RiskInput{ToolName: "xops_prepare_upload", NodeID: "fixture", Paths: []string{"/tmp/file"}, Details: "size=3; overwrite=false"}
+	risk := RiskInput{ToolName: "xops_prepare_upload", NodeID: "fixture", NodeIDs: []string{"first", "second"}, Paths: []string{"/tmp/file"}, Details: "size=3; overwrite=false"}
 	op, pending, err := g.Authorize(t.Context(), &mcp.CallToolRequest{}, risk, struct{ Size int }{3})
 	if err != nil || pending != nil || op == "" {
 		t.Fatalf("authorization: op=%q pending=%+v err=%v", op, pending, err)
@@ -24,7 +26,7 @@ func TestDeferredAuthorizationDoesNotReportExecution(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, entry := range audit.entries {
-		if entry.OperationID != op || entry.Details != risk.Details {
+		if entry.OperationID != op || entry.Details != risk.Details || !slices.Equal(entry.NodeIDs, risk.NodeIDs) {
 			t.Fatalf("deferred audit lost identity/details: %+v", entry)
 		}
 	}

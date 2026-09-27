@@ -39,4 +39,6 @@ Prepare credentials and verified host keys before starting; MCP does not display
 
 See the [MCP reference](../reference/commands/xops-mcp) for subcommands and options.
 
+Stdio also provides [SSH tunnel tools](mcp-tunnels) to create, inspect and stop local (`-L`) and remote (`-R`) forwards.
+
 [LAN HTTP setup, client file transfers and recovery](mcp-http).

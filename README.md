@@ -185,6 +185,8 @@ xops mcp serve
 
 局域网 Codex / Antigravity CLI 可使用 `xops mcp serve --transport http`。认证、流式文件传输与客户端限制见 [HTTP MCP 指南](docs/guide/mcp-http.md)。
 
+stdio 模式提供 SSH `-L/-R` 隧道的创建、查询和停止工具，使用方法见 [MCP SSH 隧道](docs/guide/mcp-tunnels.md)。
+
 **B. 配置示例：集成到 Claude Desktop**
 `claude_desktop_config.json` 配置示例：
 

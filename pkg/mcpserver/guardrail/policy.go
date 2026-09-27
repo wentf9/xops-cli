@@ -99,10 +99,22 @@ func (p *Policy) Evaluate(risk RiskLevel, input RiskInput) Decision {
 	if risk >= threshold {
 		return NeedApproval
 	}
+	// Batch operations must satisfy both their existing scope policy and every
+	// covered node. One approval covers the complete, bound node set.
+	for _, nodeID := range input.NodeIDs {
+		if risk >= p.thresholdForNode(nodeID) {
+			return NeedApproval
+		}
+	}
 	return Allow
 }
 
 func (p *Policy) thresholdForNode(nodeID string) RiskLevel {
+	// An absent node selects the global policy. In particular, "*" must
+	// only override actual nodes, never the threshold of an unfiltered query.
+	if nodeID == "" {
+		return ParseRiskLevel(p.cfg.ApprovalThreshold)
+	}
 	for pattern, override := range p.cfg.NodeOverrides {
 		matched, err := filepath.Match(pattern, nodeID)
 		if err != nil {

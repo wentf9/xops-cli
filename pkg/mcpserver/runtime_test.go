@@ -111,6 +111,7 @@ func TestRuntimeToolsAndShutdownAreIsolated(t *testing.T) {
 		"xops_read_file": true, "xops_write_file": true, "xops_upload": true, "xops_download": true,
 		"xops_fs_ls": true, "xops_fs_mkdir": true, "xops_fs_touch": true,
 		"xops_fs_mv": true, "xops_fs_rm": true, "xops_fs_cp": true,
+		"xops_tunnel_create": true, "xops_tunnel_list": true, "xops_tunnel_status": true, "xops_tunnel_stop": true,
 	}
 	for _, tool := range result.Tools {
 		if !want[tool.Name] {

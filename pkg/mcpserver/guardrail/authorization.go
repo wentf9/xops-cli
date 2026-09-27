@@ -27,7 +27,7 @@ func (g *Guardrail) Authorize(ctx context.Context, req *mcp.CallToolRequest, inp
 	}
 	risk := Classify(input)
 	decision := g.policy.Evaluate(risk, input)
-	entry := AuditEntry{OperationID: opID, Tool: input.ToolName, NodeID: input.NodeID, Paths: input.Paths,
+	entry := AuditEntry{OperationID: opID, Tool: input.ToolName, NodeID: input.NodeID, NodeIDs: input.NodeIDs, Paths: input.Paths,
 		Command: input.Command, Details: input.Details, RiskLevel: risk.String(), Decision: decision.String()}
 	if decision == Deny {
 		entry.Outcome = "denied"
@@ -58,7 +58,7 @@ func (g *Guardrail) Authorize(ctx context.Context, req *mcp.CallToolRequest, inp
 // RecordAuthorized records a phase of an already-authorized immutable task.
 // It grants no permissions and is not a replacement for Authorize.
 func (g *Guardrail) RecordAuthorized(operationID string, input RiskInput, outcome string, cause error) error {
-	entry := AuditEntry{OperationID: operationID, Tool: input.ToolName, NodeID: input.NodeID, Paths: input.Paths,
+	entry := AuditEntry{OperationID: operationID, Tool: input.ToolName, NodeID: input.NodeID, NodeIDs: input.NodeIDs, Paths: input.Paths,
 		RiskLevel: Classify(input).String(), Details: input.Details, Decision: "authorized", Outcome: outcome}
 	if cause != nil {
 		entry.Error = cause.Error()

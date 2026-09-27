@@ -12,5 +12,7 @@ func (r *Runtime) registerTools(server *mcp.Server, g *guardrail.Guardrail) {
 	r.registerFS(server, g)
 	if r.http != nil {
 		r.registerTransfers(server)
+	} else {
+		r.registerTunnels(server)
 	}
 }

@@ -99,6 +99,9 @@ func buildApprovalMessage(risk RiskLevel, input RiskInput) string {
 	if input.NodeID != "" {
 		fmt.Fprintf(&b, "Node:  %s\n", input.NodeID)
 	}
+	if len(input.NodeIDs) > 0 {
+		fmt.Fprintf(&b, "Nodes: %s\n", strings.Join(input.NodeIDs, ", "))
+	}
 	if input.Command != "" {
 		fmt.Fprintf(&b, "Command: %s\n", input.Command)
 	}

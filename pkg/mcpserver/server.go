@@ -14,6 +14,7 @@ import (
 	"github.com/wentf9/xops-cli/pkg/logger"
 	"github.com/wentf9/xops-cli/pkg/mcpserver/guardrail"
 	"github.com/wentf9/xops-cli/pkg/mcpserver/transfer"
+	"github.com/wentf9/xops-cli/pkg/mcpserver/tunnel"
 	"github.com/wentf9/xops-cli/pkg/sftp"
 	"github.com/wentf9/xops-cli/pkg/ssh"
 )
@@ -83,6 +84,8 @@ type Runtime struct {
 	logger         logger.DebugLogger
 	initializeGate chan struct{}
 	recoveryDone   <-chan struct{}
+	tunnels        *tunnel.Manager
+	tunnelProvider config.ConfigProvider
 }
 
 func (r *Runtime) getMCPConnector() (*ssh.Connector, error) {
@@ -109,6 +112,12 @@ func (r *Runtime) getMCPProvider() (config.ConfigProvider, error) {
 // avoiding blocking stdin/stdout and breaking JSON-RPC framing.
 // When credentialRegistry is non-nil, stored credentials are resolved automatically.
 func newMCPConnector(ctx context.Context, provider config.ConfigProvider, l logger.DebugLogger, credentialRegistry adapter.CredentialResolver) *ssh.Connector {
+	conn := newNonInteractiveMCPConnector(provider, l, credentialRegistry)
+	conn.EnableKeepAlive(ctx, ssh.DefaultKeepAliveInterval, ssh.DefaultKeepAliveTimeout)
+	return conn
+}
+
+func newNonInteractiveMCPConnector(provider config.ConfigProvider, l logger.DebugLogger, credentialRegistry adapter.CredentialResolver) *ssh.Connector {
 	var sshOpts []ssh.Option
 	if l != nil {
 		sshOpts = append(sshOpts, ssh.WithLogger(l))
@@ -122,9 +131,7 @@ func newMCPConnector(ctx context.Context, provider config.ConfigProvider, l logg
 	if credentialRegistry != nil {
 		adpOpts = append(adpOpts, adapter.WithCredentialSource(credentialRegistry))
 	}
-	conn := adapter.NewConnectorWithAdapterOptions(provider, adpOpts, sshOpts...)
-	conn.EnableKeepAlive(ctx, ssh.DefaultKeepAliveInterval, ssh.DefaultKeepAliveTimeout)
-	return conn
+	return adapter.NewConnectorWithAdapterOptions(provider, adpOpts, sshOpts...)
 }
 
 // connectMCPNode connects to an SSH node using this runtime’s MCP connector,
@@ -213,6 +220,7 @@ func NewRuntime(ctx context.Context, opts ...Option) (*Runtime, error) {
 		r.transfers = manager
 	}
 	r.connector = newMCPConnector(runtimeCtx, cfg.provider, cfg.logger, cfg.credentialRegistry)
+	r.initializeTunnels(cfg)
 	serverOptions := &mcp.ServerOptions{
 		Capabilities: &mcp.ServerCapabilities{Tools: &mcp.ToolCapabilities{ListChanged: true}},
 	}
@@ -254,6 +262,11 @@ func (r *Runtime) Close() error {
 		}
 		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(r.ctx), duration)
 		defer cancel()
+		if r.tunnels != nil {
+			if err := r.tunnels.Shutdown(shutdownCtx); err != nil {
+				r.closeErr = errors.Join(r.closeErr, fmt.Errorf("close MCP tunnels: %w", err))
+			}
+		}
 		if r.recoveryDone != nil {
 			select {
 			case <-r.recoveryDone:

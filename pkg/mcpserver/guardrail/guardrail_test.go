@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -37,7 +38,7 @@ func TestWithGuardrail_TwoPhaseAudit(t *testing.T) {
 	}
 
 	wrapped := WithGuardrail(g, "xops_list_nodes", func(in dummyInput) RiskInput {
-		return RiskInput{ToolName: "xops_list_nodes", Command: in.Command}
+		return RiskInput{ToolName: "xops_list_nodes", Command: in.Command, Details: "tunnelID=example", NodeIDs: []string{"first", "second"}}
 	}, handler)
 
 	_, out, err := wrapped(context.Background(), &mcp.CallToolRequest{}, dummyInput{Command: "ls"})
@@ -68,6 +69,14 @@ func TestWithGuardrail_TwoPhaseAudit(t *testing.T) {
 	}
 	if entries[1].Outcome != "executed" {
 		t.Errorf("expected second entry outcome 'executed', got %q", entries[1].Outcome)
+	}
+	if entries[0].Details != "tunnelID=example" || entries[1].Details != "tunnelID=example" {
+		t.Fatal("audit omitted operation details")
+	}
+	for _, entry := range entries {
+		if !slices.Equal(entry.NodeIDs, []string{"first", "second"}) {
+			t.Fatal("audit omitted batch nodes")
+		}
 	}
 }
 

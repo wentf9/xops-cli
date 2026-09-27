@@ -103,6 +103,40 @@ func TestPolicyEvaluate_NodeOverride(t *testing.T) {
 	}
 }
 
+func TestPolicyEvaluateBatchNodes(t *testing.T) {
+	cfg := defaultTestConfig()
+	cfg.NodeOverrides = map[string]config.NodeGuardrailCfg{"restricted-*": {ApprovalThreshold: "safe"}}
+	p := NewPolicy(cfg)
+	for _, tc := range []struct {
+		nodes []string
+		want  Decision
+	}{
+		{nil, Allow}, {[]string{"public"}, Allow},
+		{[]string{"public", "restricted-a"}, NeedApproval},
+		{[]string{"restricted-a", "public"}, NeedApproval},
+		{[]string{"restricted-a", "restricted-b"}, NeedApproval},
+	} {
+		input := RiskInput{ToolName: "xops_tunnel_list", NodeIDs: tc.nodes}
+		if got := p.Evaluate(Safe, input); got != tc.want {
+			t.Errorf("nodes=%v decision=%s, want %s", tc.nodes, got, tc.want)
+		}
+	}
+	input := RiskInput{ToolName: "xops_tunnel_list", NodeIDs: []string{"restricted-a"}}
+	cfg.BlockedPatterns = []string{"*"}
+	if got := p.Evaluate(Safe, input); got != Deny {
+		t.Fatalf("batch approval overrode deny: %s", got)
+	}
+	cfg.Enabled = false
+	if got := p.Evaluate(Safe, input); got != Allow {
+		t.Fatalf("disabled guardrail: %s", got)
+	}
+	cfg.Enabled, cfg.BlockedPatterns, cfg.ApprovalThreshold = true, nil, "safe"
+	cfg.NodeOverrides = map[string]config.NodeGuardrailCfg{"public": {ApprovalThreshold: "dangerous"}}
+	if got := p.Evaluate(Safe, RiskInput{ToolName: "xops_tunnel_list", NodeIDs: []string{"public"}}); got != NeedApproval {
+		t.Fatal("batch nodes weakened the global policy")
+	}
+}
+
 func TestPolicyEvaluate_ProtectedPath(t *testing.T) {
 	p := NewPolicy(defaultTestConfig())
 
@@ -128,6 +162,30 @@ func TestPolicyEvaluate_ProtectedPath(t *testing.T) {
 	})
 	if got != NeedApproval {
 		t.Errorf("safe read on protected path with moderate threshold should NeedApproval, got %v", got)
+	}
+}
+
+func TestPolicyEvaluateGlobalScopeAndWildcardOverride(t *testing.T) {
+	for _, tc := range []struct {
+		name, global, override string
+		input                  RiskInput
+		want                   Decision
+	}{
+		{"empty list keeps global approval", "safe", "dangerous", RiskInput{}, NeedApproval},
+		{"batch keeps global approval", "safe", "dangerous", RiskInput{NodeIDs: []string{"node"}}, NeedApproval},
+		{"named node uses its override", "safe", "dangerous", RiskInput{NodeID: "node"}, Allow},
+		{"empty scope has no node override", "dangerous", "safe", RiskInput{}, Allow},
+		{"batch still checks node overrides", "dangerous", "safe", RiskInput{NodeIDs: []string{"node"}}, NeedApproval},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := defaultTestConfig()
+			cfg.ApprovalThreshold = tc.global
+			cfg.NodeOverrides = map[string]config.NodeGuardrailCfg{"*": {ApprovalThreshold: tc.override}}
+			tc.input.ToolName = "xops_tunnel_list"
+			if got := NewPolicy(cfg).Evaluate(Safe, tc.input); got != tc.want {
+				t.Fatalf("decision = %s, want %s", got, tc.want)
+			}
+		})
 	}
 }
 

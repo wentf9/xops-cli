@@ -40,3 +40,5 @@ MCP 将主机操作提供给 AI 客户端。将客户端的启动命令设为 `x
 子命令与配置参数见 [MCP 命令参考](../reference/commands/xops-mcp)。
 
 [局域网 HTTP 接入、客户端文件传输和恢复](mcp-http)。
+
+stdio 模式还提供 [SSH 隧道工具](mcp-tunnels)，支持本地（`-L`）和远程（`-R`）转发的创建、查询和停止。
