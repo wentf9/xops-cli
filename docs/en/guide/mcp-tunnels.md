@@ -79,6 +79,8 @@ Cancellation before startup is committed aborts creation. After publication, the
 
 Explicit stop, expiry, SSH disconnect or MCP process exit triggers cleanup. Tunnels do not automatically reconnect or survive process restarts. If waiting for stop times out, cleanup continues; query status. Remote forwards report `remoteRelease: "unconfirmed"` after stopping: local cleanup does not confirm release of the remote port, particularly when a network failure delays detection by the SSH server.
 
+An EOF caused by closing the listener during a normal stop is treated as cancellation and does not mark the task `failed`. Listener interruptions without a stop request and unexpected listener cleanup errors still report failure.
+
 Cancellation, timeout or MCP shutdown during ProxyJump startup releases established jump connections even if the downstream SSH handshake is incomplete or the network is unresponsive.
 
 | Limit | Current value |

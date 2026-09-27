@@ -359,7 +359,7 @@ func tunnelFixtureError(t *testing.T, ctx context.Context, err error) {
 }
 
 func expectedTunnelFixtureClose(err error) bool {
-	return err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET)
+	return err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) || platformTunnelFixtureClose(err)
 }
 
 func closeTunnelFixtureResource(t *testing.T, resource io.Closer) {

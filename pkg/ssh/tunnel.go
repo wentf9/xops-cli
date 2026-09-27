@@ -147,7 +147,9 @@ func runForwardListener(ctx context.Context, listener net.Listener, options forw
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
-				if runCtx.Err() == nil {
+				// Parent cancellation becomes visible before it reaches every
+				// child. A transport monitor may already have closed SSH here.
+				if ctx.Err() == nil && runCtx.Err() == nil {
 					acceptErr = fmt.Errorf("accept forwarded connection failed: %w", err)
 				}
 				break
@@ -172,11 +174,14 @@ func runForwardListener(ctx context.Context, listener net.Listener, options forw
 		// Stop accepted connections before joining handlers, including a SOCKS5
 		// client that has not finished sending its greeting.
 		cancel()
-		var cancellationCloseErr error
-		if !stopCancellation() {
-			cancellationCloseErr = <-cancellationClose
+		var closeErr error
+		if stopCancellation() {
+			closeErr = closeResource(listener, "forwarding listener")
+		} else {
+			// The callback owns Close once it starts. SSH listener Close is
+			// not idempotent: another call sends a second cancel-tcpip-forward.
+			closeErr = <-cancellationClose
 		}
-		closeErr := errors.Join(cancellationCloseErr, closeResource(listener, "forwarding listener"))
 		handlers.Wait()
 		forward.err = errors.Join(acceptErr, closeErr)
 	}()
