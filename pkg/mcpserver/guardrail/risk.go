@@ -44,21 +44,26 @@ type RiskInput struct {
 	Command  string   // populated only for ssh_run
 	Paths    []string // file/directory paths involved
 	Sudo     bool     // whether sudo is requested
+	Details  string   // deferred-operation size, digest and overwrite information
 }
 
 // toolBaseRisk maps tool names to their static (baseline) risk level.
 var toolBaseRisk = map[string]RiskLevel{
-	"xops_list_nodes": Safe,
-	"xops_read_file":  Safe,
-	"xops_fs_ls":      Safe,
-	"xops_download":   Safe,
+	"xops_list_nodes":       Safe,
+	"xops_read_file":        Safe,
+	"xops_fs_ls":            Safe,
+	"xops_download":         Safe,
+	"xops_prepare_download": Safe,
+	"xops_transfer_status":  Safe,
+	"xops_transfer_cancel":  Safe,
 
-	"xops_write_file": Moderate,
-	"xops_upload":     Moderate,
-	"xops_fs_mkdir":   Moderate,
-	"xops_fs_touch":   Moderate,
-	"xops_fs_mv":      Moderate,
-	"xops_fs_cp":      Moderate,
+	"xops_write_file":     Moderate,
+	"xops_upload":         Moderate,
+	"xops_prepare_upload": Moderate,
+	"xops_fs_mkdir":       Moderate,
+	"xops_fs_touch":       Moderate,
+	"xops_fs_mv":          Moderate,
+	"xops_fs_cp":          Moderate,
 
 	"xops_fs_rm":   Dangerous,
 	"xops_ssh_run": Dangerous,

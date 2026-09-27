@@ -39,8 +39,8 @@ type ReadFileOutput struct {
 	Status  string `json:"status" jsonschema:"Operation status"`
 }
 
-func getSFTPClient(ctx context.Context, nodeID string) (*sftp.Client, error) {
-	return getMCPSFTPClient(ctx, nodeID)
+func (r *Runtime) getSFTPClient(ctx context.Context, nodeID string) (*sftp.Client, error) {
+	return r.getMCPSFTPClient(ctx, nodeID)
 }
 
 type remoteFile interface {
@@ -100,12 +100,12 @@ func readOpenedRemoteFile(file remoteFile, input ReadFileInput) (output ReadFile
 	}, nil
 }
 
-func readFileHandler(ctx context.Context, req *mcp.CallToolRequest, input ReadFileInput) (_ *mcp.CallToolResult, _ ReadFileOutput, handlerErr error) {
+func (r *Runtime) readFileHandler(ctx context.Context, req *mcp.CallToolRequest, input ReadFileInput) (_ *mcp.CallToolResult, _ ReadFileOutput, handlerErr error) {
 	if input.NodeID == "" || input.Path == "" {
 		return nil, ReadFileOutput{}, fmt.Errorf("nodeID and path are required")
 	}
 
-	sftpClient, err := getSFTPClient(ctx, input.NodeID)
+	sftpClient, err := r.getSFTPClient(ctx, input.NodeID)
 	if err != nil {
 		return nil, ReadFileOutput{}, err
 	}
@@ -139,12 +139,12 @@ type WriteFileOutput struct {
 	Status       string `json:"status" jsonschema:"Operation status"`
 }
 
-func writeFileHandler(ctx context.Context, req *mcp.CallToolRequest, input WriteFileInput) (_ *mcp.CallToolResult, _ WriteFileOutput, handlerErr error) {
+func (r *Runtime) writeFileHandler(ctx context.Context, req *mcp.CallToolRequest, input WriteFileInput) (_ *mcp.CallToolResult, _ WriteFileOutput, handlerErr error) {
 	if input.NodeID == "" || input.Path == "" || input.Content == "" {
 		return nil, WriteFileOutput{}, fmt.Errorf("nodeID, path, and content are required")
 	}
 
-	sftpClient, err := getSFTPClient(ctx, input.NodeID)
+	sftpClient, err := r.getSFTPClient(ctx, input.NodeID)
 	if err != nil {
 		return nil, WriteFileOutput{}, err
 	}
@@ -185,12 +185,12 @@ func writeFileHandler(ctx context.Context, req *mcp.CallToolRequest, input Write
 	}, nil
 }
 
-func uploadFileHandler(ctx context.Context, req *mcp.CallToolRequest, input TransferFileInput) (_ *mcp.CallToolResult, _ TransferFileOutput, handlerErr error) {
+func (r *Runtime) uploadFileHandler(ctx context.Context, req *mcp.CallToolRequest, input TransferFileInput) (_ *mcp.CallToolResult, _ TransferFileOutput, handlerErr error) {
 	if input.NodeID == "" || input.LocalPath == "" || input.RemotePath == "" {
 		return nil, TransferFileOutput{}, fmt.Errorf("nodeID, localPath, and remotePath are required")
 	}
 
-	sftpClient, err := getSFTPClient(ctx, input.NodeID)
+	sftpClient, err := r.getSFTPClient(ctx, input.NodeID)
 	if err != nil {
 		return nil, TransferFileOutput{}, err
 	}
@@ -203,12 +203,12 @@ func uploadFileHandler(ctx context.Context, req *mcp.CallToolRequest, input Tran
 	return nil, TransferFileOutput{Status: "success"}, nil
 }
 
-func downloadFileHandler(ctx context.Context, req *mcp.CallToolRequest, input TransferFileInput) (_ *mcp.CallToolResult, _ TransferFileOutput, handlerErr error) {
+func (r *Runtime) downloadFileHandler(ctx context.Context, req *mcp.CallToolRequest, input TransferFileInput) (_ *mcp.CallToolResult, _ TransferFileOutput, handlerErr error) {
 	if input.NodeID == "" || input.LocalPath == "" || input.RemotePath == "" {
 		return nil, TransferFileOutput{}, fmt.Errorf("nodeID, localPath, and remotePath are required")
 	}
 
-	sftpClient, err := getSFTPClient(ctx, input.NodeID)
+	sftpClient, err := r.getSFTPClient(ctx, input.NodeID)
 	if err != nil {
 		return nil, TransferFileOutput{}, err
 	}
@@ -221,7 +221,7 @@ func downloadFileHandler(ctx context.Context, req *mcp.CallToolRequest, input Tr
 	return nil, TransferFileOutput{Status: "success"}, nil
 }
 
-func RegisterSFTP(server *mcp.Server, g *guardrail.Guardrail) {
+func (r *Runtime) registerSFTP(server *mcp.Server, g *guardrail.Guardrail) {
 	notDestructive := false
 
 	mcp.AddTool(server,
@@ -234,7 +234,7 @@ func RegisterSFTP(server *mcp.Server, g *guardrail.Guardrail) {
 			func(in ReadFileInput) guardrail.RiskInput {
 				return guardrail.RiskInput{NodeID: in.NodeID, Paths: []string{in.Path}}
 			},
-			readFileHandler,
+			r.readFileHandler,
 		),
 	)
 
@@ -248,10 +248,13 @@ func RegisterSFTP(server *mcp.Server, g *guardrail.Guardrail) {
 			func(in WriteFileInput) guardrail.RiskInput {
 				return guardrail.RiskInput{NodeID: in.NodeID, Paths: []string{in.Path}}
 			},
-			writeFileHandler,
+			r.writeFileHandler,
 		),
 	)
 
+	if r.http != nil {
+		return
+	}
 	mcp.AddTool(server,
 		&mcp.Tool{
 			Name:        "xops_upload",
@@ -262,7 +265,7 @@ func RegisterSFTP(server *mcp.Server, g *guardrail.Guardrail) {
 			func(in TransferFileInput) guardrail.RiskInput {
 				return guardrail.RiskInput{NodeID: in.NodeID, Paths: []string{in.LocalPath, in.RemotePath}}
 			},
-			uploadFileHandler,
+			r.uploadFileHandler,
 		),
 	)
 
@@ -276,7 +279,7 @@ func RegisterSFTP(server *mcp.Server, g *guardrail.Guardrail) {
 			func(in TransferFileInput) guardrail.RiskInput {
 				return guardrail.RiskInput{NodeID: in.NodeID, Paths: []string{in.RemotePath}}
 			},
-			downloadFileHandler,
+			r.downloadFileHandler,
 		),
 	)
 }

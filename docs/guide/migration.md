@@ -1,6 +1,6 @@
 # 凭据迁移
 
-本指南描述当前源码中的迁移功能；已安装版本支持的选项以 `xops credential migrate --help` 为准。
+可用迁移选项请查看已安装版本的 `xops credential migrate --help`。
 
 ## 自动升级旧配置
 

@@ -185,22 +185,10 @@ func TestCharacterization_MCP_ListNodes_DoesNotLeakPlaintextCredentials(t *testi
 		_ = conn.CloseAll()
 	})
 
-	mcpMu.Lock()
-	oldConn := mcpConnector
-	oldProvider := mcpProvider
-	mcpConnector = conn
-	mcpProvider = provider
-	mcpMu.Unlock()
-
-	t.Cleanup(func() {
-		mcpMu.Lock()
-		mcpConnector = oldConn
-		mcpProvider = oldProvider
-		mcpMu.Unlock()
-	})
+	runtime := &Runtime{ctx: ctx, connector: conn, provider: provider}
 
 	// 调用 xops_list_nodes 工具
-	_, listOut, err := listNodesHandler(ctx, nil, ListNodesInput{})
+	_, listOut, err := runtime.listNodesHandler(ctx, nil, ListNodesInput{})
 	if err != nil {
 		t.Fatalf("listNodesHandler failed: %v", err)
 	}
@@ -264,22 +252,10 @@ func TestCharacterization_MCP_FailClosedOnMissingCredential_DoesNotLeakSecrets(t
 		_ = conn.CloseAll()
 	})
 
-	mcpMu.Lock()
-	oldConn := mcpConnector
-	oldProvider := mcpProvider
-	mcpConnector = conn
-	mcpProvider = provider
-	mcpMu.Unlock()
-
-	t.Cleanup(func() {
-		mcpMu.Lock()
-		mcpConnector = oldConn
-		mcpProvider = oldProvider
-		mcpMu.Unlock()
-	})
+	runtime := &Runtime{ctx: ctx, connector: conn, provider: provider}
 
 	// 1. 测试直接调用 connectMCPNode
-	client, err := connectMCPNode(ctx, "node-unauth")
+	client, err := runtime.connectMCPNode(ctx, "node-unauth")
 	if err == nil {
 		if client != nil {
 			_ = client.Close()
@@ -294,7 +270,7 @@ func TestCharacterization_MCP_FailClosedOnMissingCredential_DoesNotLeakSecrets(t
 	testleak.AssertNoSecretInError(t, err, configuredSuPwd, clusterSensitiveSecret)
 
 	// 2. 测试通过 sshRunHandler 调用，检查命令输出与错误返回
-	_, runOut, runErr := sshRunHandler(ctx, nil, SshRunInput{
+	_, runOut, runErr := runtime.sshRunHandler(ctx, nil, SshRunInput{
 		NodeID:  "node-unauth",
 		Command: "whoami",
 	})
@@ -397,24 +373,12 @@ func TestCharacterization_MCP_FailClosedOnInteractionRequired_DoesNotLeakSecrets
 		_ = conn.CloseAll()
 	})
 
-	mcpMu.Lock()
-	oldConn := mcpConnector
-	oldProvider := mcpProvider
-	mcpConnector = conn
-	mcpProvider = provider
-	mcpMu.Unlock()
-
-	t.Cleanup(func() {
-		mcpMu.Lock()
-		mcpConnector = oldConn
-		mcpProvider = oldProvider
-		mcpMu.Unlock()
-	})
+	runtime := &Runtime{ctx: ctx, connector: conn, provider: provider}
 
 	allSecrets := []string{injectedLoginPassword, injectedPassphraseSecret, injectedSuSecret}
 
 	// 1. 测试提权执行阶段由于提权交互导致的 fail-closed（阶段 2：提权机密按命令按需解析）
-	client, err := connectMCPNode(ctx, "node-su-prompt")
+	client, err := runtime.connectMCPNode(ctx, "node-su-prompt")
 	if err != nil {
 		t.Fatalf("connectMCPNode failed: %v", err)
 	}
@@ -433,7 +397,7 @@ func TestCharacterization_MCP_FailClosedOnInteractionRequired_DoesNotLeakSecrets
 	testleak.AssertNoSecretInError(t, formattedErr, allSecrets...)
 
 	// 2. 测试 Handshake 阶段由于 auto 密码交互提示导致的 fail-closed
-	_, errHandshake := connectMCPNode(ctx, "node-handshake-prompt")
+	_, errHandshake := runtime.connectMCPNode(ctx, "node-handshake-prompt")
 	if errHandshake == nil {
 		t.Fatal("expected interaction required error for node-handshake-prompt, got nil")
 	}
@@ -450,7 +414,7 @@ func TestCharacterization_MCP_FailClosedOnInteractionRequired_DoesNotLeakSecrets
 	testleak.AssertNoSecretInError(t, errHandshake, allSecrets...)
 
 	// 3. 测试通过 sshRunHandler 调用
-	_, runOut, runErr := sshRunHandler(ctx, nil, SshRunInput{
+	_, runOut, runErr := runtime.sshRunHandler(ctx, nil, SshRunInput{
 		NodeID:  "node-handshake-prompt",
 		Command: "uname -a",
 	})

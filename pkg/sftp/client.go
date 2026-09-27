@@ -71,6 +71,7 @@ func WithForce(force bool) Option {
 // the server leaves that close blocked, the shared SSH transport is closed as
 // a bounded last-resort interrupt.
 type clientState struct {
+	sshClient     *ssh.Client
 	sftpClient    *sftp.Client
 	interrupt     func() error
 	interruptOnce sync.Once
@@ -98,7 +99,7 @@ func NewClient(ctx context.Context, sshCli *ssh.Client, opts ...Option) (*Client
 	defer cancelSetup()
 
 	sftpCli := &Client{
-		state:  &clientState{},
+		state:  &clientState{sshClient: sshCli},
 		config: DefaultConfig(),
 	}
 	for _, opt := range opts {
@@ -121,6 +122,18 @@ func NewClient(ctx context.Context, sshCli *ssh.Client, opts ...Option) (*Client
 }
 
 func newSFTPSubsystem(ctx context.Context, sshCli *ssh.Client, opts ...sftp.ClientOption) (*sftp.Client, func() error, error) {
+	client, interrupt, err := newSubsystemProtocol(ctx, sshCli, func(rd io.Reader, wr io.WriteCloser) (io.Closer, error) {
+		return sftp.NewClientPipe(rd, wr, opts...)
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return client.(*sftp.Client), interrupt, nil
+}
+
+// newSubsystemProtocol shares bounded SSH setup and cancellation/close ownership
+// between SFTP protocol clients. The factory owns protocol negotiation only.
+func newSubsystemProtocol(ctx context.Context, sshCli *ssh.Client, factory func(io.Reader, io.WriteCloser) (io.Closer, error)) (io.Closer, func() error, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
@@ -152,7 +165,7 @@ func newSFTPSubsystem(ctx context.Context, sshCli *ssh.Client, opts ...sftp.Clie
 		return err
 	}
 
-	fail := func(operation string, operationErr error) (*sftp.Client, func() error, error) {
+	fail := func(operation string, operationErr error) (io.Closer, func() error, error) {
 		return nil, nil, errors.Join(
 			fmt.Errorf("%s: %w", operation, operationErr),
 			finishSetup(),
@@ -187,7 +200,7 @@ func newSFTPSubsystem(ctx context.Context, sshCli *ssh.Client, opts ...sftp.Clie
 		stderrDone <- copyErr
 	}()
 
-	client, err := sftp.NewClientPipe(stdout, stdin, opts...)
+	client, err := factory(stdout, stdin)
 	if err != nil {
 		return nil, nil, errors.Join(
 			fmt.Errorf("initialize SFTP protocol failed: %w", err),

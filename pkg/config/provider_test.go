@@ -2,11 +2,40 @@ package config
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/wentf9/xops-cli/pkg/models"
 	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 )
+
+func TestProviderFrozenKeepsSnapshotAndOpenSSH(t *testing.T) {
+	parser, err := NewOpenSSHParserFromReader(strings.NewReader("Host bastion\n HostName 192.0.2.2\n User jump\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewProviderWithOpenSSHParser(newTestProvider().Snapshot(), parser)
+	frozen := p.Frozen()
+	p.mu.Lock()
+	host, _ := p.cfg.Hosts.Get("host-web")
+	host.Address = "192.0.2.99"
+	p.cfg.Hosts.Set("host-web", host)
+	p.mu.Unlock()
+	_, original, _, err := frozen.Resolve("web-server")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if original.Address != "10.0.0.1" {
+		t.Fatalf("frozen provider observed later update: %+v", original)
+	}
+	_, jump, identity, err := frozen.Resolve(OpenSSHNodePrefix + "bastion")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jump.Address != "192.0.2.2" || identity.User != "jump" {
+		t.Fatalf("OpenSSH fallback was lost: host=%+v user=%q", jump, identity.User)
+	}
+}
 
 func TestProvider_ResolveRejectsMissingReferencedMaps(t *testing.T) {
 	nodes := concurrent.NewMap[string, models.Node](concurrent.HashString)

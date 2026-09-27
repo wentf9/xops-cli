@@ -183,6 +183,8 @@ XOps 内置了 **Model Context Protocol (MCP)** 服务端，支持 **Claude** �
 xops mcp serve
 ```
 
+局域网 Codex / Antigravity CLI 可使用 `xops mcp serve --transport http`。认证、流式文件传输与客户端限制见 [HTTP MCP 指南](docs/guide/mcp-http.md)。
+
 **B. 配置示例：集成到 Claude Desktop**
 `claude_desktop_config.json` 配置示例：
 

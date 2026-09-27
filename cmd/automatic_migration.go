@@ -14,6 +14,9 @@ import (
 // automaticMigrationEligible deliberately excludes inspection and maintenance
 // commands. A no-save override also prevents implicit legacy secret writes.
 func automaticMigrationEligible(cmd *cobra.Command) bool {
+	if cmd.Name() == "recover" && cmd.Parent() != nil && cmd.Parent().Name() == "mcp" {
+		return false
+	}
 	for _, name := range []string{"dry-run", "help", "version"} {
 		if flag := cmd.Flags().Lookup(name); flag != nil && flag.Value.String() == "true" {
 			return false

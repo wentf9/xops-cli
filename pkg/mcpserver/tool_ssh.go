@@ -28,8 +28,8 @@ type ListNodesOutput struct {
 	Status string     `json:"status" jsonschema:"Operation status"`
 }
 
-func listNodesHandler(ctx context.Context, req *mcp.CallToolRequest, input ListNodesInput) (*mcp.CallToolResult, ListNodesOutput, error) {
-	provider, err := getMCPProvider()
+func (r *Runtime) listNodesHandler(ctx context.Context, req *mcp.CallToolRequest, input ListNodesInput) (*mcp.CallToolResult, ListNodesOutput, error) {
+	provider, err := r.getMCPProvider()
 	if err != nil {
 		return nil, ListNodesOutput{}, fmt.Errorf("failed to load config: %w", err)
 	}
@@ -77,12 +77,12 @@ type SshRunOutput struct {
 	Error  string `json:"error,omitempty" jsonschema:"Error message if failed"`
 }
 
-func sshRunHandler(ctx context.Context, req *mcp.CallToolRequest, input SshRunInput) (*mcp.CallToolResult, SshRunOutput, error) {
+func (r *Runtime) sshRunHandler(ctx context.Context, req *mcp.CallToolRequest, input SshRunInput) (*mcp.CallToolResult, SshRunOutput, error) {
 	if input.NodeID == "" || input.Command == "" {
 		return nil, SshRunOutput{}, fmt.Errorf("nodeID and command are required")
 	}
 
-	client, err := connectMCPNode(ctx, input.NodeID)
+	client, err := r.connectMCPNode(ctx, input.NodeID)
 	if err != nil {
 		return nil, SshRunOutput{}, err
 	}
@@ -110,7 +110,7 @@ func sshRunHandler(ctx context.Context, req *mcp.CallToolRequest, input SshRunIn
 	}, nil
 }
 
-func RegisterSSH(server *mcp.Server, g *guardrail.Guardrail) {
+func (r *Runtime) registerSSH(server *mcp.Server, g *guardrail.Guardrail) {
 	mcp.AddTool(server,
 		&mcp.Tool{
 			Name:        "xops_list_nodes",
@@ -121,7 +121,7 @@ func RegisterSSH(server *mcp.Server, g *guardrail.Guardrail) {
 			func(in ListNodesInput) guardrail.RiskInput {
 				return guardrail.RiskInput{}
 			},
-			listNodesHandler,
+			r.listNodesHandler,
 		),
 	)
 
@@ -140,7 +140,7 @@ func RegisterSSH(server *mcp.Server, g *guardrail.Guardrail) {
 					Sudo:    in.Sudo,
 				}
 			},
-			sshRunHandler,
+			r.sshRunHandler,
 		),
 	)
 }

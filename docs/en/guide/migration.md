@@ -1,6 +1,6 @@
 # Credential migration
 
-This guide describes the current source. Check `xops credential migrate --help` for your installed version.
+Run `xops credential migrate --help` to see the migration options available in your installed version.
 
 ## Automatic legacy upgrades
 

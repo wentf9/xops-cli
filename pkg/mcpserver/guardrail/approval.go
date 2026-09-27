@@ -108,6 +108,9 @@ func buildApprovalMessage(risk RiskLevel, input RiskInput) string {
 	if len(input.Paths) > 0 {
 		fmt.Fprintf(&b, "Paths: %s\n", strings.Join(input.Paths, ", "))
 	}
+	if input.Details != "" {
+		fmt.Fprintf(&b, "Details: %s\n", input.Details)
+	}
 	b.WriteString("\nDo you approve this operation?")
 	return b.String()
 }

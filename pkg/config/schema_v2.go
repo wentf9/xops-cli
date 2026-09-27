@@ -177,6 +177,7 @@ type ConfigurationV2 struct {
 	Hosts                 map[string]models.Host `yaml:"hosts"`
 	Nodes                 map[string]NodeV2      `yaml:"nodes"`
 	Guardrail             *GuardrailConfig       `yaml:"guardrail,omitempty"`
+	MCP                   *MCPConfig             `yaml:"mcp,omitempty"`
 	PasswordPromptPattern string                 `yaml:"password_prompt_pattern,omitempty"`
 }
 
@@ -405,6 +406,7 @@ func (c *Configuration) ToV2() (*ConfigurationV2, error) {
 		Hosts:                 make(map[string]models.Host),
 		Nodes:                 make(map[string]NodeV2),
 		PasswordPromptPattern: c.PasswordPromptPattern,
+		MCP:                   c.MCP.Clone(),
 	}
 
 	if c.Credential != nil {
@@ -487,6 +489,7 @@ func FromV2(v2 *ConfigurationV2) (*Configuration, error) {
 		Hosts:                 concurrent.NewMap[string, models.Host](concurrent.HashString),
 		Nodes:                 concurrent.NewMap[string, models.Node](concurrent.HashString),
 		Guardrail:             cloneGuardrail(v2.Guardrail),
+		MCP:                   v2.MCP.Clone(),
 		PasswordPromptPattern: v2.PasswordPromptPattern,
 	}
 

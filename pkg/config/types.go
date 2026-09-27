@@ -13,6 +13,7 @@ type Configuration struct {
 	Hosts                 *concurrent.Map[string, models.Host]     `yaml:"hosts"`
 	Nodes                 *concurrent.Map[string, models.Node]     `yaml:"nodes"`
 	Guardrail             *GuardrailConfig                         `yaml:"guardrail,omitempty"`
+	MCP                   *MCPConfig                               `yaml:"mcp,omitempty"`
 	PasswordPromptPattern string                                   `yaml:"password_prompt_pattern,omitempty"` // 全局级自定义密码提示正则
 }
 

@@ -35,11 +35,7 @@ func TestServeRejectsInvalidGuardrailConfigBeforeStartup(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "validate mcp guardrail config failed") {
 		t.Fatalf("expected guardrail validation error, got %v", err)
 	}
-	mcpMu.RLock()
-	defer mcpMu.RUnlock()
-	if mcpConnector != nil || mcpProvider != nil {
-		t.Fatal("invalid guardrail config initialized global MCP state")
-	}
+
 }
 
 func TestJoinCloseErrorPreservesPrimaryAndCloseErrors(t *testing.T) {

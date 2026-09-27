@@ -57,6 +57,14 @@ func newProvider(cfg *Configuration, parser *OpenSSHParser) *Provider {
 	}
 }
 
+// Frozen returns an independent provider with the current configuration and
+// parsed OpenSSH fallback. Later repository publications do not affect it.
+func (p *Provider) Frozen() ConfigProvider {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return newProvider(p.cfg, p.openSSH)
+}
+
 // Snapshot returns a deep copy that callers may retain and mutate freely.
 func (p *Provider) Snapshot() *Configuration {
 	if p == nil {
@@ -375,6 +383,7 @@ func cloneConfiguration(cfg *Configuration) *Configuration {
 	cloned.Credential = cfg.Credential.Clone()
 	cloned.PasswordPromptPattern = cfg.PasswordPromptPattern
 	cloned.Guardrail = cloneGuardrail(cfg.Guardrail)
+	cloned.MCP = cfg.MCP.Clone()
 	if cfg.Nodes != nil {
 		for _, key := range cfg.Nodes.Keys() {
 			if node, ok := cfg.Nodes.Get(key); ok {

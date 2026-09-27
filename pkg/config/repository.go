@@ -1178,6 +1178,25 @@ func (r *Repository) Snapshot() *Configuration {
 	return r.provider.Snapshot()
 }
 
+// Frozen exposes an immutable read-only view, retaining OpenSSH diagnostics
+// without exposing Repository's durable mutation interfaces to the caller.
+func (r *Repository) Frozen() ConfigProvider {
+	return &frozenRepository{ConfigProvider: r.provider.Frozen(), openSSHErr: r.openSSHErr}
+}
+
+type frozenRepository struct {
+	ConfigProvider
+	openSSHErr error
+}
+
+func (r *frozenRepository) ResolveSelector(input string) (string, error) {
+	nodeID, err := r.ConfigProvider.ResolveSelector(input)
+	if err != nil || nodeID != "" || r.openSSHErr == nil {
+		return nodeID, err
+	}
+	return "", fmt.Errorf("resolve openssh selector %q: %w", input, r.openSSHErr)
+}
+
 func validateConfiguration(cfg *Configuration) error {
 	for _, nodeID := range cfg.Nodes.Keys() {
 		node, ok := cfg.Nodes.Get(nodeID)

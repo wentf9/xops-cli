@@ -478,9 +478,40 @@ sudo_exec_failed:
 mcp_short:
   other: "Manage the MCP (Model Context Protocol) server"
 mcp_long:
-  other: "Start an MCP server via Stdio for Agent calls. All regular output and logs will be suppressed."
+  other: "Start the MCP server using stdio by default. Use --transport http for Streamable HTTP with Bearer Token authentication; legacy HTTP+SSE is not supported. MCP never prompts for SSH credentials or vault unlocks."
 mcp_serve_short:
-  other: "Start the MCP server over standard input and output"
+  other: "Start a stdio or Streamable HTTP MCP server"
+mcp_transport_flag:
+  other: "MCP transport: stdio or http"
+mcp_listen_flag:
+  other: "HTTP listen address, default 127.0.0.1:8080"
+mcp_public_url_flag:
+  other: "Client-facing HTTP(S) origin, required for LAN listeners"
+mcp_token_file_flag:
+  other: "File containing the HTTP Bearer Token; mutually exclusive with --token-env"
+mcp_token_env_flag:
+  other: "Environment variable containing the HTTP Bearer Token"
+mcp_state_dir_flag:
+  other: "File transfer task metadata directory"
+mcp_allowed_hosts_flag:
+  other: "Additional allowed HTTP hosts, including ports"
+mcp_allowed_origins_flag:
+  other: "Additional allowed HTTP origins"
+
+mcp_recover_short:
+  other: "Inspect or maintain transfers while the MCP service is stopped"
+mcp_recover_long:
+  other: "List transfer records without mutation by default. Refuses access while the service runs. --verify reads current target content; --cleanup removes only task-owned temporary files; --resolve-unknown records an operator decision and removes the write block without fabricating success."
+mcp_recover_id_flag:
+  other: "Transfer ID, required for maintenance actions"
+mcp_recover_verify_flag:
+  other: "Read and verify the current destination without modifying it"
+mcp_recover_cleanup_flag:
+  other: "Remove only the selected task’s owned remote temporary file"
+mcp_recover_resolve_flag:
+  other: "Acknowledge operator verification of an unknown outcome and release its write block"
+mcp_recover_reason_flag:
+  other: "Record the operator conclusion for --resolve-unknown or acknowledge unconfirmed temporary ownership for --cleanup"
 
 # ---- init ----
 tui_status_cleanup_pending:

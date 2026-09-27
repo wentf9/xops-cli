@@ -5,9 +5,12 @@ import (
 	"github.com/wentf9/xops-cli/pkg/mcpserver/guardrail"
 )
 
-// RegisterTools 统一注册各模块的 MCP 能力，并注入安全护栏
-func RegisterTools(server *mcp.Server, g *guardrail.Guardrail) {
-	RegisterSSH(server, g)
-	RegisterSFTP(server, g)
-	RegisterFS(server, g)
+// registerTools 统一注册各模块的 MCP 能力，并注入安全护栏
+func (r *Runtime) registerTools(server *mcp.Server, g *guardrail.Guardrail) {
+	r.registerSSH(server, g)
+	r.registerSFTP(server, g)
+	r.registerFS(server, g)
+	if r.http != nil {
+		r.registerTransfers(server)
+	}
 }

@@ -39,6 +39,30 @@ func TestAutomaticMigrationEligibility(t *testing.T) {
 	}
 }
 
+func TestMCPRecoveryNeverRunsStartupMigration(t *testing.T) {
+	root := &cobra.Command{Use: "xops"}
+	mcp := NewCmdMcp()
+	root.AddCommand(mcp)
+	recover, _, err := root.Find([]string{"mcp", "recover"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if automaticMigrationEligible(recover) {
+		t.Fatal("recovery must not implicitly migrate credential storage")
+	}
+	path, before, marker := automaticMigrationHelperFixture(t, true)
+	if err := autoMigrateConfiguration(recover); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatal("recovery changed configuration")
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("recovery invoked a credential helper")
+	}
+}
+
 // Exercise the actual startup migrator and helper capability guard, before
 // MCP/Playbook/connector code has a chance to restrict credential interaction.
 func TestAutomaticMigrationStartupDoesNotInvokeInteractiveHelper(t *testing.T) {

@@ -209,19 +209,19 @@ func TestMCP_ReadHandler_RequiredFields(t *testing.T) {
 	ctx := context.Background()
 
 	// 缺少 nodeID 和 path 应该返回错误
-	_, _, err := readFileHandler(ctx, nil, ReadFileInput{})
+	_, _, err := (&Runtime{}).readFileHandler(ctx, nil, ReadFileInput{})
 	if err == nil {
 		t.Error("expected error for empty nodeID and path")
 	}
 
 	// 缺少 nodeID
-	_, _, err = readFileHandler(ctx, nil, ReadFileInput{Path: "/foo"})
+	_, _, err = (&Runtime{}).readFileHandler(ctx, nil, ReadFileInput{Path: "/foo"})
 	if err == nil {
 		t.Error("expected error for empty nodeID")
 	}
 
 	// 缺少 path
-	_, _, err = readFileHandler(ctx, nil, ReadFileInput{NodeID: "node1"})
+	_, _, err = (&Runtime{}).readFileHandler(ctx, nil, ReadFileInput{NodeID: "node1"})
 	if err == nil {
 		t.Error("expected error for empty path")
 	}
@@ -232,13 +232,13 @@ func TestMCP_WriteHandler_RequiredFields(t *testing.T) {
 	ctx := context.Background()
 
 	// 全部为空
-	_, _, err := writeFileHandler(ctx, nil, WriteFileInput{})
+	_, _, err := (&Runtime{}).writeFileHandler(ctx, nil, WriteFileInput{})
 	if err == nil {
 		t.Error("expected error for all-empty WriteFileInput")
 	}
 
 	// 缺 content
-	_, _, err = writeFileHandler(ctx, nil, WriteFileInput{NodeID: "n", Path: "/p"})
+	_, _, err = (&Runtime{}).writeFileHandler(ctx, nil, WriteFileInput{NodeID: "n", Path: "/p"})
 	if err == nil {
 		t.Error("expected error for empty content")
 	}

@@ -4,7 +4,7 @@
 
 XOps keeps login passwords, private-key passphrases, and privilege passwords in credential stores. Configuration files contain references to those credentials. New installations use the built-in offline encrypted store without requiring a system keyring or external tools.
 
-This page describes the current source. Check `xops credential --help` for options available in your installed version.
+Run `xops credential --help` to see the options available in your installed version.
 
 ## Default saving behavior
 

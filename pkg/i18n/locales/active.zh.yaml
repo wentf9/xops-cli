@@ -479,9 +479,40 @@ sudo_exec_failed:
 mcp_short:
   other: "管理 MCP (Model Context Protocol) 服务端"
 mcp_long:
-  other: "以标准输入输出 (Stdio) 启动 MCP 服务端，供 Agent 调用。开启后所有常规业务输出与日志将会被屏蔽。"
+  other: "启动 MCP 服务端，默认使用标准输入输出 (stdio)。通过 --transport http 启用需要 Bearer Token 的 Streamable HTTP；不支持旧版 HTTP+SSE。MCP 不会提示输入 SSH 凭据或解锁密钥库。"
 mcp_serve_short:
-  other: "通过标准输入输出启动 MCP 服务端"
+  other: "启动 stdio 或 Streamable HTTP MCP 服务端"
+mcp_transport_flag:
+  other: "MCP 传输方式：stdio 或 http"
+mcp_listen_flag:
+  other: "HTTP 监听地址，默认 127.0.0.1:8080"
+mcp_public_url_flag:
+  other: "客户端访问的 HTTP(S) 根地址，局域网监听时必须设置"
+mcp_token_file_flag:
+  other: "读取 HTTP Bearer Token 的文件，与 --token-env 互斥"
+mcp_token_env_flag:
+  other: "提供 HTTP Bearer Token 的环境变量名称"
+mcp_state_dir_flag:
+  other: "文件传输任务元数据目录"
+mcp_allowed_hosts_flag:
+  other: "额外允许的 HTTP Host（含端口）"
+mcp_allowed_origins_flag:
+  other: "额外允许的 HTTP Origin"
+
+mcp_recover_short:
+  other: "检查或维护已停止 MCP 服务的传输任务"
+mcp_recover_long:
+  other: "默认只读列出传输记录。服务运行时拒绝访问；--verify 只读核验目标内容，--cleanup 仅清理任务归属的临时文件，--resolve-unknown 记录人工结论并解除写入阻断，不将未知结果改写为成功。"
+mcp_recover_id_flag:
+  other: "限定传输任务 ID，维护操作必须提供"
+mcp_recover_verify_flag:
+  other: "读取并校验目标当前文件，不修改文件"
+mcp_recover_cleanup_flag:
+  other: "清理该任务明确归属的远程临时文件"
+mcp_recover_resolve_flag:
+  other: "确认未知结果已人工核验，解除目标写入阻断"
+mcp_recover_reason_flag:
+  other: "记录 --resolve-unknown 的人工结论，或为 --cleanup 确认尚未记录的临时文件归属"
 
 # ---- init ----
 tui_status_cleanup_pending:

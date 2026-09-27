@@ -183,6 +183,8 @@ XOps includes a **Model Context Protocol (MCP)** server that lets MCP clients su
 xops mcp serve
 ```
 
+LAN clients (Codex / Antigravity CLI) can use `xops mcp serve --transport http`. See the [HTTP MCP guide](docs/en/guide/mcp-http.md) for authentication, streamed file transfers and client limitations.
+
 **B. Example: Integrate with Claude Desktop**
 
 Example configuration for `claude_desktop_config.json`:

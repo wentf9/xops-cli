@@ -24,6 +24,7 @@ type migrationLegacyDTO struct {
 	Hosts                 map[string]models.Host     `yaml:"hosts"`
 	Nodes                 map[string]models.Node     `yaml:"nodes"`
 	Guardrail             *GuardrailConfig           `yaml:"guardrail,omitempty"`
+	MCP                   *MCPConfig                 `yaml:"mcp,omitempty"`
 	PasswordPromptPattern string                     `yaml:"password_prompt_pattern,omitempty"`
 }
 
@@ -52,6 +53,7 @@ func decodeMigrationLegacy(data []byte) (*Configuration, error) {
 		cfg.Credential = DefaultCredentialConfig()
 	}
 	cfg.Guardrail = dto.Guardrail
+	cfg.MCP = dto.MCP.Clone()
 	cfg.PasswordPromptPattern = dto.PasswordPromptPattern
 	for name, id := range dto.Identities {
 		cfg.Identities.Set(name, id)

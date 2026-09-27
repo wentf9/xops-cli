@@ -2,8 +2,6 @@
 
 `--var key=value` 覆盖 YAML 同名变量，并统一用于步骤字段和外部 template 文件；CLI 新增变量也可用于模板，空值是有效覆盖。不存在的变量报错，不递归展开变量值。
 
-MCP 审批要求确认表单中的 `approved=true`。新协议通过 InputRequests 多轮请求完成审批，凭证绑定会话和完整工具参数，两分钟后失效且只能消费一次；旧协议使用 elicitation。仅明确不支持审批时采用配置的 fallback，协议错误、拒绝、取消或超时均不放行。审批请求和最终执行分别记入审计。
-
 ## Playbook
 
 Playbook 使用 YAML 组合 shell、script、copy、ensure 和 template 步骤。将以下内容保存为 `check-hosts.yaml`，先用只读任务验证目标选择和凭据：
@@ -35,6 +33,10 @@ xops mcp serve
 
 MCP 将主机操作提供给 AI 客户端。将客户端的启动命令设为 `xops` 的完整路径，参数设为 `["mcp", "serve"]`。在配置文件的 `guardrail` 中可设置审批阈值、禁止执行的命令、受保护路径和审计日志。
 
+需要审批时，在客户端表单中确认 `approved=true`。拒绝、取消或超时都会停止该操作；审批过期或操作参数改变后，需要重新确认。若客户端无法显示或提交表单，请改用支持审批的客户端。
+
 运行前准备好凭据和已确认的主机密钥；MCP 不会显示终端认证或解锁提示。凭据不可用时，先用 `xops credential doctor` 检查存储，并恢复访问。
 
 子命令与配置参数见 [MCP 命令参考](../reference/commands/xops-mcp)。
+
+[局域网 HTTP 接入、客户端文件传输和恢复](mcp-http)。

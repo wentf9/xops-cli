@@ -23,6 +23,7 @@ type AuditEntry struct {
 	Decision    string    `json:"decision"`
 	Outcome     string    `json:"outcome"` // "intent", "executed", "denied", "error"
 	Error       string    `json:"error,omitempty"`
+	Details     string    `json:"details,omitempty"`
 }
 
 // AuditWriter is the interface for writing audit entries.

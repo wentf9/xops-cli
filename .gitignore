@@ -17,3 +17,6 @@ docs/.vitepress/cache/
 docs/.vitepress/dist/
 docs/reference/commands/
 docs/en/reference/commands/
+
+# Optional MCP transfer helper bytecode
+scripts/mcp/__pycache__/

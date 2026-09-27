@@ -32,12 +32,12 @@ type FSListOutput struct {
 	Status string     `json:"status" jsonschema:"Operation status"`
 }
 
-func fsLsHandler(ctx context.Context, req *mcp.CallToolRequest, input FSListInput) (_ *mcp.CallToolResult, _ FSListOutput, handlerErr error) {
+func (r *Runtime) fsLsHandler(ctx context.Context, req *mcp.CallToolRequest, input FSListInput) (_ *mcp.CallToolResult, _ FSListOutput, handlerErr error) {
 	if input.NodeID == "" || input.Path == "" {
 		return nil, FSListOutput{}, fmt.Errorf("nodeID and path are required")
 	}
 
-	sftpClient, err := getMCPSFTPClient(ctx, input.NodeID)
+	sftpClient, err := r.getMCPSFTPClient(ctx, input.NodeID)
 	if err != nil {
 		return nil, FSListOutput{}, err
 	}
@@ -81,12 +81,12 @@ type FSBaseOutput struct {
 	Status string `json:"status" jsonschema:"Operation status"`
 }
 
-func fsMkdirHandler(ctx context.Context, req *mcp.CallToolRequest, input FSMkdirInput) (_ *mcp.CallToolResult, _ FSBaseOutput, handlerErr error) {
+func (r *Runtime) fsMkdirHandler(ctx context.Context, req *mcp.CallToolRequest, input FSMkdirInput) (_ *mcp.CallToolResult, _ FSBaseOutput, handlerErr error) {
 	if input.NodeID == "" || input.Path == "" {
 		return nil, FSBaseOutput{}, fmt.Errorf("nodeID and path are required")
 	}
 
-	sftpClient, err := getMCPSFTPClient(ctx, input.NodeID)
+	sftpClient, err := r.getMCPSFTPClient(ctx, input.NodeID)
 	if err != nil {
 		return nil, FSBaseOutput{}, err
 	}
@@ -108,12 +108,12 @@ type FSTouchInput struct {
 	Path   string `json:"path" jsonschema:"Absolute path to the file to create"`
 }
 
-func fsTouchHandler(ctx context.Context, req *mcp.CallToolRequest, input FSTouchInput) (_ *mcp.CallToolResult, _ FSBaseOutput, handlerErr error) {
+func (r *Runtime) fsTouchHandler(ctx context.Context, req *mcp.CallToolRequest, input FSTouchInput) (_ *mcp.CallToolResult, _ FSBaseOutput, handlerErr error) {
 	if input.NodeID == "" || input.Path == "" {
 		return nil, FSBaseOutput{}, fmt.Errorf("nodeID and path are required")
 	}
 
-	sftpClient, err := getMCPSFTPClient(ctx, input.NodeID)
+	sftpClient, err := r.getMCPSFTPClient(ctx, input.NodeID)
 	if err != nil {
 		return nil, FSBaseOutput{}, err
 	}
@@ -140,12 +140,12 @@ type FSMvInput struct {
 	New    string `json:"newPath" jsonschema:"New absolute destination path"`
 }
 
-func fsMvHandler(ctx context.Context, req *mcp.CallToolRequest, input FSMvInput) (_ *mcp.CallToolResult, _ FSBaseOutput, handlerErr error) {
+func (r *Runtime) fsMvHandler(ctx context.Context, req *mcp.CallToolRequest, input FSMvInput) (_ *mcp.CallToolResult, _ FSBaseOutput, handlerErr error) {
 	if input.NodeID == "" || input.Old == "" || input.New == "" {
 		return nil, FSBaseOutput{}, fmt.Errorf("nodeID, oldPath and newPath are required")
 	}
 
-	sftpClient, err := getMCPSFTPClient(ctx, input.NodeID)
+	sftpClient, err := r.getMCPSFTPClient(ctx, input.NodeID)
 	if err != nil {
 		return nil, FSBaseOutput{}, err
 	}
@@ -167,12 +167,12 @@ type FSRmInput struct {
 	Path   string `json:"path" jsonschema:"Absolute path to the file/directory to securely delete"`
 }
 
-func fsRmHandler(ctx context.Context, req *mcp.CallToolRequest, input FSRmInput) (*mcp.CallToolResult, FSBaseOutput, error) {
+func (r *Runtime) fsRmHandler(ctx context.Context, req *mcp.CallToolRequest, input FSRmInput) (*mcp.CallToolResult, FSBaseOutput, error) {
 	if input.NodeID == "" || input.Path == "" {
 		return nil, FSBaseOutput{}, fmt.Errorf("nodeID and path are required")
 	}
 
-	sshClient, err := connectMCPNode(ctx, input.NodeID)
+	sshClient, err := r.connectMCPNode(ctx, input.NodeID)
 	if err != nil {
 		return nil, FSBaseOutput{}, err
 	}
@@ -194,12 +194,12 @@ type FSCpInput struct {
 	Dest   string `json:"destPath" jsonschema:"Absolute path to destination"`
 }
 
-func fsCpHandler(ctx context.Context, req *mcp.CallToolRequest, input FSCpInput) (*mcp.CallToolResult, FSBaseOutput, error) {
+func (r *Runtime) fsCpHandler(ctx context.Context, req *mcp.CallToolRequest, input FSCpInput) (*mcp.CallToolResult, FSBaseOutput, error) {
 	if input.NodeID == "" || input.Src == "" || input.Dest == "" {
 		return nil, FSBaseOutput{}, fmt.Errorf("nodeID, srcPath and destPath are required")
 	}
 
-	sshClient, err := connectMCPNode(ctx, input.NodeID)
+	sshClient, err := r.connectMCPNode(ctx, input.NodeID)
 	if err != nil {
 		return nil, FSBaseOutput{}, err
 	}
@@ -215,7 +215,7 @@ func fsCpHandler(ctx context.Context, req *mcp.CallToolRequest, input FSCpInput)
 
 // ======================== REGISTER ========================
 
-func RegisterFS(server *mcp.Server, g *guardrail.Guardrail) {
+func (r *Runtime) registerFS(server *mcp.Server, g *guardrail.Guardrail) {
 	notDestructive := false
 	destructive := true
 
@@ -229,7 +229,7 @@ func RegisterFS(server *mcp.Server, g *guardrail.Guardrail) {
 			func(in FSListInput) guardrail.RiskInput {
 				return guardrail.RiskInput{NodeID: in.NodeID, Paths: []string{in.Path}}
 			},
-			fsLsHandler,
+			r.fsLsHandler,
 		),
 	)
 
@@ -243,7 +243,7 @@ func RegisterFS(server *mcp.Server, g *guardrail.Guardrail) {
 			func(in FSMkdirInput) guardrail.RiskInput {
 				return guardrail.RiskInput{NodeID: in.NodeID, Paths: []string{in.Path}}
 			},
-			fsMkdirHandler,
+			r.fsMkdirHandler,
 		),
 	)
 
@@ -257,7 +257,7 @@ func RegisterFS(server *mcp.Server, g *guardrail.Guardrail) {
 			func(in FSTouchInput) guardrail.RiskInput {
 				return guardrail.RiskInput{NodeID: in.NodeID, Paths: []string{in.Path}}
 			},
-			fsTouchHandler,
+			r.fsTouchHandler,
 		),
 	)
 
@@ -271,7 +271,7 @@ func RegisterFS(server *mcp.Server, g *guardrail.Guardrail) {
 			func(in FSMvInput) guardrail.RiskInput {
 				return guardrail.RiskInput{NodeID: in.NodeID, Paths: []string{in.Old, in.New}}
 			},
-			fsMvHandler,
+			r.fsMvHandler,
 		),
 	)
 
@@ -285,7 +285,7 @@ func RegisterFS(server *mcp.Server, g *guardrail.Guardrail) {
 			func(in FSRmInput) guardrail.RiskInput {
 				return guardrail.RiskInput{NodeID: in.NodeID, Paths: []string{in.Path}}
 			},
-			fsRmHandler,
+			r.fsRmHandler,
 		),
 	)
 
@@ -299,7 +299,7 @@ func RegisterFS(server *mcp.Server, g *guardrail.Guardrail) {
 			func(in FSCpInput) guardrail.RiskInput {
 				return guardrail.RiskInput{NodeID: in.NodeID, Paths: []string{in.Src, in.Dest}}
 			},
-			fsCpHandler,
+			r.fsCpHandler,
 		),
 	)
 }
