@@ -14,7 +14,7 @@ require (
 	github.com/charmbracelet/x/term v0.2.2
 	github.com/charmbracelet/x/termios v0.1.1
 	github.com/creack/pty v1.1.24
-	github.com/ebitengine/purego v0.11.0
+	github.com/ebitengine/purego v0.11.1
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f
 	github.com/godbus/dbus/v5 v5.2.2
 	github.com/hinshun/vt10x v0.0.0-20220301184237-5011da428d02
