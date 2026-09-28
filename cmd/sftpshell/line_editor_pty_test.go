@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/creack/pty"
 	"github.com/wentf9/xops-cli/internal/terminal"
+	pty "github.com/wentf9/xops-cli/internal/testpty"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
 	"go.uber.org/goleak"

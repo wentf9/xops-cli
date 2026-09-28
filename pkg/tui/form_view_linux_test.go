@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"charm.land/huh/v2"
-	"github.com/creack/pty"
 	"github.com/hinshun/vt10x"
+	pty "github.com/wentf9/xops-cli/internal/testpty"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"go.uber.org/goleak"
 )

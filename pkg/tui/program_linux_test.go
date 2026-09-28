@@ -14,7 +14,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/term"
-	"github.com/creack/pty"
+	pty "github.com/wentf9/xops-cli/internal/testpty"
 	"go.uber.org/goleak"
 	"golang.org/x/sys/unix"
 )
