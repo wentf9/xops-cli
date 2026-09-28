@@ -12,7 +12,8 @@ const maxMCPBodyBytes = 4 << 20
 
 // protocolAdmission runs after service authentication. Bodies are classified
 // through a separately bounded, short-lived read/parse lane so an SSE stream or
-// waiting tool POST cannot consume capacity needed for replies or cancellation.
+// waiting tool POST cannot consume capacity needed for handshake completion,
+// replies or cancellation.
 // The SDK still validates session ownership, response IDs and protocol details.
 func (r *Runtime) protocolAdmission(next http.Handler, requests chan struct{}) http.Handler {
 	parsers := make(chan struct{}, r.http.MaxRequests)
@@ -82,14 +83,12 @@ func isMCPControl(data []byte) bool {
 		return false
 	}
 	if len(envelope.Method) != 0 {
-		// A notification has no top-level ID/result/error. Only cancellation
-		// can use control capacity; the SDK resolves the target in its session.
-		var method string
-		if json.Unmarshal(envelope.Method, &method) != nil || method != "notifications/cancelled" ||
-			len(envelope.ID) != 0 || len(envelope.Result) != 0 || len(envelope.Error) != 0 {
+		// Notifications have no top-level ID/result/error. The SDK still
+		// validates their session and parameters after admission.
+		if len(envelope.ID) != 0 || len(envelope.Result) != 0 || len(envelope.Error) != 0 {
 			return false
 		}
-		return validMCPCancellation(envelope.Params)
+		return isMCPControlNotification(envelope.Method, envelope.Params)
 	}
 	if (len(envelope.Result) == 0) == (len(envelope.Error) == 0) {
 		return false
@@ -101,6 +100,24 @@ func isMCPControl(data []byte) bool {
 	switch id.(type) {
 	case string, float64:
 		return true
+	default:
+		return false
+	}
+}
+
+func isMCPControlNotification(rawMethod, params json.RawMessage) bool {
+	var method string
+	if json.Unmarshal(rawMethod, &method) != nil {
+		return false
+	}
+	switch method {
+	case "notifications/initialized":
+		// The initialize response may still hold a request slot after it is
+		// flushed and the client opens standalone SSE. Handshake completion
+		// must not contend with those requests. Params are optional objects.
+		return len(params) == 0 || params[0] == '{'
+	case "notifications/cancelled":
+		return validMCPCancellation(params)
 	default:
 		return false
 	}

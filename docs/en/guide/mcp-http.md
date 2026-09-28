@@ -42,6 +42,8 @@ Replace the example addresses and paths. Command-line flags override configurati
 
 `state_dir` stores transfer records. It defaults to `mcp-transfers` beside the configuration file. Use a local directory accessible only to the service account. Do not share it between running services or delete it while tasks need attention.
 
+`max_requests` limits concurrent ordinary HTTP requests, including SSE connections and file transfers. Initialization-complete notifications, approval replies and cancellation notifications use a separate control channel with the same concurrency limit, so an initialization request that is still finishing or a long-lived connection cannot block these messages. Either channel returns HTTP 429 when its own capacity is exhausted.
+
 ## Connect an AI client
 
 Select **Streamable HTTP** and use `http://192.168.1.10:8080/mcp`. The legacy HTTP+SSE `/sse` address is not supported.

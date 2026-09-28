@@ -34,7 +34,20 @@ func TestMCPControlClassificationCannotAdmitCalls(t *testing.T) {
 		{`{"jsonrpc":"2.0","id":2,"method":"notifications/cancelled","params":{"requestId":1}}`, false},
 		{`{"jsonrpc":"2.0","id":null,"method":"notifications/cancelled","params":{"requestId":1}}`, false},
 		{`{"jsonrpc":"2.0","method":"notifications/cancelled","result":null,"params":{"requestId":1}}`, false},
-		{`{"jsonrpc":"2.0","method":"notifications/initialized","params":{"requestId":1}}`, false},
+		{`{"jsonrpc":"2.0","method":"notifications/initialized"}`, true},
+		{`{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`, true},
+		{`{"jsonrpc":"2.0","method":"notifications/initialized","params":{"_meta":{"client":"test"}}}`, true},
+		{`{"jsonrpc":"2.0","method":"notifications/initialized","params":{"requestId":1}}`, true},
+		{`{"jsonrpc":"2.0","method":"notifications/initialized","params":null}`, false},
+		{`{"jsonrpc":"2.0","method":"notifications/initialized","params":[]}`, false},
+		{`{"jsonrpc":"2.0","method":"notifications/initialized","params":"invalid"}`, false},
+		{`{"jsonrpc":"2.0","method":"notifications/initialized","params":1}`, false},
+		{`{"jsonrpc":"2.0","id":1,"method":"notifications/initialized"}`, false},
+		{`{"jsonrpc":"2.0","id":null,"method":"notifications/initialized"}`, false},
+		{`{"jsonrpc":"2.0","method":"notifications/initialized","result":{}}`, false},
+		{`{"jsonrpc":"2.0","method":"notifications/initialized","error":{"code":-32603}}`, false},
+		{`{"jsonrpc":"2.0","method":"notifications/progress","params":{}}`, false},
+		{`[{"jsonrpc":"2.0","method":"notifications/initialized"},{"jsonrpc":"2.0","id":1,"method":"tools/call"}]`, false},
 		{`[{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}]`, false},
 		{`[{"jsonrpc":"2.0","id":1,"result":{}},{"jsonrpc":"2.0","id":2,"method":"tools/call"}]`, false},
 		{`{"jsonrpc":"2.0","id":null,"result":{}}`, false},
@@ -52,6 +65,7 @@ func TestControlAdmissionIsSeparateAndBounded(t *testing.T) {
 	const request = `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}`
 	const reply = `{"jsonrpc":"2.0","id":2,"result":{"action":"accept"}}`
 	const cancellation = `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}`
+	const initialized = `{"jsonrpc":"2.0","method":"notifications/initialized"}`
 	r := Runtime{http: &HTTPOptions{MaxRequests: 1}}
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
@@ -89,7 +103,7 @@ func TestControlAdmissionIsSeparateAndBounded(t *testing.T) {
 	}
 	occupy(request)
 	occupy(reply)
-	for _, body := range []string{request, reply, cancellation} {
+	for _, body := range []string{request, reply, cancellation, initialized} {
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, httptest.NewRequestWithContext(ctx, http.MethodPost, "/mcp", strings.NewReader(body)))
 		if response.Code != http.StatusTooManyRequests {
