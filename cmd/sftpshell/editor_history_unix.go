@@ -3,9 +3,11 @@
 package sftpshell
 
 import (
+	"context"
 	"errors"
-	"golang.org/x/sys/unix"
 	"os"
+
+	"golang.org/x/sys/unix"
 )
 
 func tryHistoryLock(file *os.File) (bool, error) {
@@ -16,3 +18,7 @@ func tryHistoryLock(file *os.File) (bool, error) {
 	return err == nil, err
 }
 func unlockHistory(file *os.File) error { return unix.Flock(int(file.Fd()), unix.LOCK_UN) }
+
+func renameCommandHistory(_ context.Context, source, destination string) error {
+	return os.Rename(source, destination)
+}

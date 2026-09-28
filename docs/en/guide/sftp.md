@@ -68,6 +68,8 @@ Pasted newlines and tabs become spaces, and control characters are removed. Past
 
 If the history or lock file is unavailable at startup, a warning is displayed and the shell uses session-only history. Readable existing entries remain available, but this fallback does not write to disk. Normally, command history is stored in `~/.xops_sftp_history`, retaining up to 500 recent entries and ignoring empty input and consecutive duplicates. Confirmation answers and batch commands are not recorded. Confirmation prompts disable command completion and history browsing. History write failures are reported while retaining the command in the current session. Once writing recovers, pending entries are merged with disk history, retaining the most recent 500 entries.
 
+On Windows, temporary file sharing conflicts are retried within the two-second history write deadline, retaining the original file and the lock shared by writers. Persistent conflicts and other errors still report a write failure without clearing existing history.
+
 Before executing commands or entering a local/remote interactive program, the prompt stops reading and restores the terminal. The SFTP prompt resumes when the program finishes. Connection loss or cancellation ends pending input and completion tasks. External SIGINT or SIGTERM ends the session after pending prompt tasks stop and terminal state is restored.
 
 At an overwrite or removal confirmation, answering `n` skips only the current item; Ctrl+C stops the rest of the command and returns to the prompt. File operations already completed are not rolled back.

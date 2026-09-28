@@ -86,7 +86,7 @@ func (h *commandHistory) Append(line string) error {
 		for _, pending := range h.pending {
 			lines = appendHistoryLine(lines, pending)
 		}
-		if err := writeCommandHistory(h.path, lines); err != nil {
+		if err := writeCommandHistory(ctx, h.path, lines); err != nil {
 			return err
 		}
 		h.lines = lines
@@ -144,7 +144,7 @@ func (h *commandHistory) withFileLock(ctx context.Context, operation func() erro
 	defer func() { retErr = errors.Join(retErr, unlockHistory(lock)) }()
 	return operation()
 }
-func writeCommandHistory(path string, lines []string) (retErr error) {
+func writeCommandHistory(ctx context.Context, path string, lines []string) (retErr error) {
 	file, err := os.CreateTemp(filepath.Dir(path), ".xops-history-*")
 	if err != nil {
 		return fmt.Errorf("create history temporary file failed: %w", err)
@@ -166,8 +166,33 @@ func writeCommandHistory(path string, lines []string) (retErr error) {
 		return fmt.Errorf("close history failed: %w", err)
 	}
 	closed = true
-	if err = os.Rename(file.Name(), path); err != nil {
+	if err = renameCommandHistory(ctx, file.Name(), path); err != nil {
 		return fmt.Errorf("replace history failed: %w", err)
 	}
 	return nil
+}
+
+// Windows metadata readers and scanners can briefly deny replacement even when
+// cooperating writers hold the sidecar lock. Keep the temporary file and the
+// writer lock until replacement succeeds or the existing history deadline ends.
+func retryHistoryRename(parent context.Context, rename func() error, retryable func(error) bool) error {
+	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	var lastErr error
+	for {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(lastErr, err)
+		}
+		lastErr = rename()
+		if lastErr == nil || !retryable(lastErr) {
+			return lastErr
+		}
+		select {
+		case <-ctx.Done():
+			return errors.Join(lastErr, ctx.Err())
+		case <-ticker.C:
+		}
+	}
 }

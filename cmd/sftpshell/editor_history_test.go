@@ -34,7 +34,7 @@ func TestCommandHistoryLimitsAndReload(t *testing.T) {
 	if len(lines) != 500 || lines[0] != "200" {
 		t.Fatal("history not bounded")
 	}
-	if err := writeCommandHistory(path, lines); err != nil {
+	if err := writeCommandHistory(t.Context(), path, lines); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err = newCommandHistory(path)
