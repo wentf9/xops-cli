@@ -11,6 +11,9 @@ import (
 	"time"
 )
 
+// Allow subprocess startup on loaded native runners while keeping every fixture bounded.
+const makefileTestTimeout = 30 * time.Second
+
 func TestMakefile_LinuxDryRun(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("requires a POSIX host")
@@ -127,7 +130,7 @@ func TestMakefile_InstallSkillPOSIX(t *testing.T) {
 				t.Fatal(err)
 			}
 			homeDir := filepath.Join(root, "home with spaces")
-			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(t.Context(), makefileTestTimeout)
 			defer cancel()
 			cmd := exec.CommandContext(ctx, "make", "OS="+platform, "SHELL=/bin/sh", "GOPATH_BIN=", "HOME="+homeDir, "install-skill")
 			cmd.Dir = root
@@ -161,7 +164,7 @@ func makefileDryRun(t *testing.T, args ...string) string {
 	if err != nil {
 		t.Skip("make command not available in environment")
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), makefileTestTimeout)
 	defer cancel()
 	options := []string{"-n", "GOPATH_BIN=", "VERSION=test", "COMMIT=test", "DATE=test"}
 	cmd := exec.CommandContext(ctx, makePath, append(options, args...)...)
@@ -196,7 +199,7 @@ func TestMakefile_GOPATHOverrideSkipsDiscovery(t *testing.T) {
 				writeMakefileFixture(t, root, "tools/go", "#!/bin/sh\nprintf 'called' >> \"$XOPS_MAKE_DISCOVERY\"\nprintf '/unused'\n")
 				t.Setenv("PATH", filepath.Join(root, "tools"))
 				t.Setenv("XOPS_MAKE_DISCOVERY", marker)
-				ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+				ctx, cancel := context.WithTimeout(t.Context(), makefileTestTimeout)
 				defer cancel()
 				cmd := exec.CommandContext(ctx, makePath, "-n", "OS="+platform.os, "SHELL=/bin/sh",
 					"POSIX_SHELL="+platform.shellMode, "GOPATH_BIN="+bin, "VERSION=test", "COMMIT=test", "DATE=test", "help")
@@ -281,7 +284,7 @@ func TestMakefile_WindowsPOSIXPath(t *testing.T) {
 				gopath = `C:\Go Home`
 			}
 			t.Setenv("FIXTURE_GOPATH", gopath)
-			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(t.Context(), makefileTestTimeout)
 			defer cancel()
 			cmd := exec.CommandContext(ctx, makePath, "--no-print-directory", "-f", "probe.mk", "OS=Windows_NT", "SHELL=/bin/sh",
 				"VERSION=test", "COMMIT=test", "DATE=test", "probe")
@@ -322,7 +325,7 @@ func TestMakefile_LintUsesExportedPOSIXPath(t *testing.T) {
 					t.Setenv("FIXTURE_EXIT", "7")
 				}
 				t.Setenv("MAKELEVEL", "1")
-				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+				ctx, cancel := context.WithTimeout(t.Context(), makefileTestTimeout)
 				defer cancel()
 				cmd := exec.CommandContext(ctx, makePath, "--no-print-directory", "OS="+platform, "SHELL=/bin/sh", "VERSION=test", "COMMIT=test", "DATE=test", "lint")
 				cmd.Dir = root
@@ -376,7 +379,7 @@ case "$2" in
   *) printf 'unexpected shell command: %s\n' "$2" >&2; exit 1 ;;
 esac
 `)
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), makefileTestTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "make", "-n", "OS=Windows_NT",
 		"SHELL="+filepath.Join(root, "sh.exe"), "GOPATH_BIN=",
