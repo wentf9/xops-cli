@@ -15,6 +15,7 @@ BIN_DIR=bin
 # Apple's Make uses the parent's PATH to spawn bare recipe commands. On POSIX
 # shells, exec forces lookup through the shell with our exported PATH instead.
 # Native Windows shells must keep plain tool invocations.
+# An explicit GOPATH_BIN (including an empty value) skips Go path discovery.
 RUN_TOOL :=
 ifeq ($(wildcard /dev/null),/dev/null)
     DEVNULL := /dev/null
@@ -38,7 +39,9 @@ ifeq ($(OS),Windows_NT)
         # Windows + POSIX Shell (Git Bash / MSYS2 / Cygwin)
         RUN_TOOL := exec
         # cygpath converts drive-letter paths to the shell's mount layout.
-        GOPATH_BIN := $(shell if command -v cygpath >/dev/null 2>&1; then cygpath -u "$$(go env GOPATH)/bin"; else printf '%s/bin' "$$(go env GOPATH)"; fi)
+        ifeq ($(origin GOPATH_BIN),undefined)
+            GOPATH_BIN := $(shell if command -v cygpath >/dev/null 2>&1; then cygpath -u "$$(go env GOPATH)/bin"; else printf '%s/bin' "$$(go env GOPATH)"; fi)
+        endif
         ifneq ($(shell test -d "$(GOPATH_BIN)" && echo yes),)
             export PATH := $(GOPATH_BIN):$(PATH)
         endif
@@ -52,7 +55,9 @@ ifeq ($(OS),Windows_NT)
     else
         # Windows 原生环境 (cmd.exe / PowerShell)
         # 自动将 Go bin 目录加入 PATH (Windows 环境变量使用分号分隔)
-        GOPATH_BIN := $(shell go env GOPATH 2>$(DEVNULL))\bin
+        ifeq ($(origin GOPATH_BIN),undefined)
+            GOPATH_BIN := $(shell go env GOPATH 2>$(DEVNULL))\bin
+        endif
         ifneq ($(wildcard $(GOPATH_BIN)),)
             export PATH := $(GOPATH_BIN);$(PATH)
         endif
@@ -67,7 +72,9 @@ else
     # Linux / macOS 环境 (POSIX)
     RUN_TOOL := exec
     SHELL_EXT :=
-    GOPATH_BIN := $(shell go env GOPATH 2>$(DEVNULL))/bin
+    ifeq ($(origin GOPATH_BIN),undefined)
+        GOPATH_BIN := $(shell go env GOPATH 2>$(DEVNULL))/bin
+    endif
     ifneq ($(shell test -d "$(GOPATH_BIN)" && echo yes),)
         export PATH := $(GOPATH_BIN):$(PATH)
     endif
