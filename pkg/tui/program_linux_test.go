@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -62,10 +63,8 @@ func testProgramShutdown(t *testing.T, input string, cancelProgram bool, filter 
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	output := &programReadyWriter{ready: make(chan struct{})}
-	done := make(chan error, 1)
-	go func() {
-		done <- Run(ctx, model, slave, output)
-	}()
+	done, stop := startProgramTest(ctx, model, slave, output)
+	defer stop()
 	select {
 	case <-output.ready:
 	case <-ctx.Done():
@@ -113,19 +112,27 @@ func TestProgramUnlockReleasesAndRestartsInput(t *testing.T) {
 	}
 	model := newV2TestModel(t)
 	restored := make(chan error, 1)
+	resumeUnlock := make(chan struct{})
+	releaseUnlock := sync.OnceFunc(func() { close(resumeUnlock) })
 	model.vaultControl = func(ctx context.Context, unlock bool) error {
 		state, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
 		if err == nil && (!unlock || *state != *before) {
 			err = errors.New("unlock did not receive the restored terminal")
 		}
 		restored <- err
-		return err
+		select {
+		case <-resumeUnlock:
+			return err
+		case <-ctx.Done():
+			return errors.Join(err, ctx.Err())
+		}
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	output := &programReadyWriter{ready: make(chan struct{})}
-	done := make(chan error, 1)
-	go func() { done <- Run(ctx, model, slave, output) }()
+	done, stop := startProgramTest(ctx, model, slave, output)
+	defer stop()
+	defer releaseUnlock()
 	select {
 	case <-output.ready:
 	case <-ctx.Done():
@@ -142,6 +149,10 @@ func TestProgramUnlockReleasesAndRestartsInput(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("unlock did not run")
 	}
+	releaseUnlock()
+	// The callback reports the restored terminal before returning. A Ctrl+C
+	// sent then is consumed by canonical ISIG handling, not the TUI decoder.
+	waitProgramRawInput(t, ctx, slave)
 	if _, err := io.WriteString(master, "\x03"); err != nil {
 		t.Fatal(err)
 	}
@@ -152,6 +163,38 @@ func TestProgramUnlockReleasesAndRestartsInput(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatal("input did not resume after unlock")
+	}
+}
+
+// Stop and join Run before closing its borrowed terminal, including on failures.
+func startProgramTest(parent context.Context, model *Model, input *os.File, output io.Writer) (<-chan error, func()) {
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan error, 1)
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		done <- Run(ctx, model, input, output)
+	}()
+	return done, func() { cancel(); <-stopped }
+}
+
+func waitProgramRawInput(t *testing.T, ctx context.Context, input *os.File) {
+	t.Helper()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		state, err := unix.IoctlGetTermios(int(input.Fd()), unix.TCGETS)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.Lflag&(unix.ICANON|unix.ISIG) == 0 {
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			t.Fatal("raw terminal input did not resume after unlock")
+		}
 	}
 }
 
@@ -187,8 +230,8 @@ func TestProgramRequestsAndDecodesBackground(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
 	output := &backgroundQueryWriter{queried: make(chan struct{})}
-	done := make(chan error, 1)
-	go func() { done <- Run(ctx, model, slave, output) }()
+	done, stop := startProgramTest(ctx, model, slave, output)
+	defer stop()
 	select {
 	case <-output.queried:
 	case <-ctx.Done():
