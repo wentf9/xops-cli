@@ -3,9 +3,11 @@
 package sftpshell
 
 import (
+	"context"
 	"errors"
-	"golang.org/x/sys/windows"
 	"os"
+
+	"golang.org/x/sys/windows"
 )
 
 func tryHistoryLock(file *os.File) (bool, error) {
@@ -17,4 +19,12 @@ func tryHistoryLock(file *os.File) (bool, error) {
 }
 func unlockHistory(file *os.File) error {
 	return windows.UnlockFileEx(windows.Handle(file.Fd()), 0, 1, 0, &windows.Overlapped{})
+}
+
+func renameCommandHistory(ctx context.Context, source, destination string) error {
+	return retryHistoryRename(ctx, func() error { return os.Rename(source, destination) }, isHistoryRenameRetryable)
+}
+
+func isHistoryRenameRetryable(err error) bool {
+	return errors.Is(err, windows.ERROR_ACCESS_DENIED) || errors.Is(err, windows.ERROR_SHARING_VIOLATION)
 }
