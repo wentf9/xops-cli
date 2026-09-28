@@ -5,7 +5,7 @@ package sftpshell
 import (
 	"context"
 	"fmt"
-	"github.com/creack/pty"
+	pty "github.com/wentf9/xops-cli/internal/testpty"
 	"io"
 	"os"
 	"strings"
