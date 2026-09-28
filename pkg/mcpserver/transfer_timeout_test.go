@@ -6,6 +6,9 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,27 +17,79 @@ import (
 	"github.com/wentf9/xops-cli/pkg/mcpserver/transfer"
 )
 
-type delayedDownloadRemote struct{ transferRemote }
+// Real-network tests need room for filesystem and scheduler latency (especially
+// Windows race builds). Exact idle boundaries are covered with virtual time.
+const transferTestIdle = 2 * time.Second
 
-func (r delayedDownloadRemote) Download(ctx context.Context, meta remoteFileMetadata, w io.Writer, progress func(int64) error) (streamResult, error) {
-	timer := time.NewTimer(300 * time.Millisecond)
+type transferTestStall struct {
+	entered atomic.Bool
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *transferTestStall) unblock() { s.once.Do(func() { close(s.release) }) }
+
+func (s *transferTestStall) wait(ctx context.Context) error {
+	s.entered.Store(true)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.release:
+		return errors.New("test stall released")
+	}
+}
+
+func waitTransferTestDelay(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
+		return nil
 	case <-ctx.Done():
-		return streamResult{}, ctx.Err()
+		return ctx.Err()
+	}
+}
+
+func awaitTransferIdleFailure(t *testing.T, server *httptest.Server, prepared PreparedTransferOutput) transfer.Status {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		status := transferTestStatus(t, server, prepared)
+		if (status.State == transfer.Failed || status.State == transfer.Cancelled) && !status.CleanupPending {
+			if !strings.Contains(status.Error, "file stream made no progress") {
+				t.Fatalf("transfer failed without stream idle expiry: %+v", status)
+			}
+			return status
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed-out transfer not cleaned: %+v", status)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+type waitingDownloadRemote struct {
+	transferRemote
+	wait func(context.Context) error
+}
+
+func (r waitingDownloadRemote) Download(ctx context.Context, meta remoteFileMetadata, w io.Writer, progress func(int64) error) (streamResult, error) {
+	if err := r.wait(ctx); err != nil {
+		return streamResult{}, err
 	}
 	return r.transferRemote.Download(ctx, meta, w, progress)
 }
 
 func TestDownloadOutlivesRequestBodyDeadline(t *testing.T) {
-	_, server, client := startTransferRuntime(t, func(o *HTTPOptions) { o.BodyTimeout = 80 * time.Millisecond; o.StreamIdle = time.Second }, pkgsftp.InMemHandler(), func(r *Runtime) {
+	_, server, client := startTransferRuntime(t, func(o *HTTPOptions) { o.BodyTimeout = time.Second; o.StreamIdle = 5 * time.Second }, pkgsftp.InMemHandler(), func(r *Runtime) {
 		r.transferDial = func(ctx context.Context, node string) (transferRemote, error) {
 			c, err := r.getMCPSFTPClient(ctx, node)
 			if err != nil {
 				return nil, err
 			}
-			return delayedDownloadRemote{&sftpTransferRemote{client: c}}, nil
+			return waitingDownloadRemote{&sftpTransferRemote{client: c}, func(ctx context.Context) error {
+				return waitTransferTestDelay(ctx, 2*time.Second)
+			}}, nil
 		}
 	})
 	payload := []byte("download is healthy beyond the request body deadline")
@@ -54,36 +109,32 @@ func TestDownloadOutlivesRequestBodyDeadline(t *testing.T) {
 	}
 }
 
-type stalledSFTPWriter struct {
+type waitingSFTPWriter struct {
 	pkgsftp.FileWriter
-	delay time.Duration
+	wait func(context.Context) error
 }
 
-func (w stalledSFTPWriter) Filewrite(req *pkgsftp.Request) (io.WriterAt, error) {
+func (w waitingSFTPWriter) Filewrite(req *pkgsftp.Request) (io.WriterAt, error) {
 	writer, err := w.FileWriter.Filewrite(req)
 	if err != nil {
 		return nil, err
 	}
-	return &delayedWriteAt{WriterAt: writer, ctx: req.Context(), delay: w.delay}, nil
+	return &waitingWriteAt{WriterAt: writer, ctx: req.Context(), wait: w.wait}, nil
 }
 
-type delayedWriteAt struct {
+type waitingWriteAt struct {
 	io.WriterAt
-	ctx   context.Context
-	delay time.Duration
+	ctx  context.Context
+	wait func(context.Context) error
 }
 
-func (w *delayedWriteAt) WriteAt(p []byte, off int64) (int, error) {
-	timer := time.NewTimer(w.delay)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-		return w.WriterAt.WriteAt(p, off)
-	case <-w.ctx.Done():
-		return 0, w.ctx.Err()
+func (w *waitingWriteAt) WriteAt(p []byte, off int64) (int, error) {
+	if err := w.wait(w.ctx); err != nil {
+		return 0, err
 	}
+	return w.WriterAt.WriteAt(p, off)
 }
-func (w *delayedWriteAt) Close() error {
+func (w *waitingWriteAt) Close() error {
 	if c, ok := w.WriterAt.(io.Closer); ok {
 		return c.Close()
 	}
@@ -91,16 +142,18 @@ func (w *delayedWriteAt) Close() error {
 }
 
 func TestStalledSFTPWriteExpiresStreamAndReleasesCapacity(t *testing.T) {
+	stall := &transferTestStall{release: make(chan struct{})}
+	defer stall.unblock() // Release the server worker before runtime cleanup.
 	handlers := pkgsftp.InMemHandler()
-	handlers.FilePut = stalledSFTPWriter{handlers.FilePut, 600 * time.Millisecond}
+	handlers.FilePut = waitingSFTPWriter{handlers.FilePut, stall.wait}
 	r, server, client := startTransferRuntime(t, func(o *HTTPOptions) {
-		o.StreamIdle = 100 * time.Millisecond
+		o.StreamIdle = transferTestIdle
 		o.Transfers.MaxActive = 1
 		o.Transfers.MaxPerTarget = 1
 	}, handlers)
 	payload := []byte("stalled remote write")
 	p := prepareTransferTest(t, client, "xops_prepare_upload", uploadBoundaryInput("stall", "/destination", payload))
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, p.Method, p.URL, bytes.NewReader(payload))
 	if err != nil {
@@ -109,7 +162,6 @@ func TestStalledSFTPWriteExpiresStreamAndReleasesCapacity(t *testing.T) {
 	for k, v := range p.Headers {
 		req.Header.Set(k, v)
 	}
-	start := time.Now()
 	response, err := server.Client().Do(req)
 	if response != nil {
 		closeTransferTestResource(t, response.Body)
@@ -117,21 +169,12 @@ func TestStalledSFTPWriteExpiresStreamAndReleasesCapacity(t *testing.T) {
 	if err != nil && !errors.Is(err, io.EOF) {
 		t.Logf("timed-out response delivery: %v", err)
 	}
-	if time.Since(start) > 450*time.Millisecond {
-		t.Fatal("SFTP write ignored stream idle timeout")
+	if !stall.entered.Load() {
+		t.Fatal("test never reached the stalled SFTP write")
 	}
+	stall.unblock()
 	// HTTP interruption can reach the caller before bounded SFTP cleanup ends.
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		status := transferTestStatus(t, server, p)
-		if (status.State == transfer.Failed || status.State == transfer.Cancelled) && !status.CleanupPending {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("stalled task not cleaned: %+v", status)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	awaitTransferIdleFailure(t, server, p)
 	next := prepareTransferTest(t, client, "xops_prepare_upload", uploadBoundaryInput("after-stall", "/next", nil))
 	response, body := transferTestRequest(t, server, next.Method, next.URL, next.Headers, bytes.NewReader(nil))
 	if response.StatusCode != http.StatusOK {
@@ -151,8 +194,10 @@ func TestStalledSFTPWriteExpiresStreamAndReleasesCapacity(t *testing.T) {
 
 func TestSFTPProgressRenewsIdleDeadline(t *testing.T) {
 	handlers := pkgsftp.InMemHandler()
-	handlers.FilePut = stalledSFTPWriter{handlers.FilePut, 60 * time.Millisecond}
-	_, server, client := startTransferRuntime(t, func(o *HTTPOptions) { o.StreamIdle = 250 * time.Millisecond }, handlers)
+	handlers.FilePut = waitingSFTPWriter{handlers.FilePut, func(ctx context.Context) error {
+		return waitTransferTestDelay(ctx, 400*time.Millisecond)
+	}}
+	_, server, client := startTransferRuntime(t, func(o *HTTPOptions) { o.StreamIdle = transferTestIdle }, handlers)
 	payload := bytes.Repeat([]byte("x"), 8*32*1024)
 	p := prepareTransferTest(t, client, "xops_prepare_upload", uploadBoundaryInput("progress", "/destination", payload))
 	start := time.Now()
@@ -160,7 +205,7 @@ func TestSFTPProgressRenewsIdleDeadline(t *testing.T) {
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("progressing upload expired: %d %s", response.StatusCode, body)
 	}
-	if time.Since(start) < 250*time.Millisecond {
+	if time.Since(start) < transferTestIdle {
 		t.Fatal("test did not cross idle window")
 	}
 	status := transferTestStatus(t, server, p)
@@ -170,19 +215,24 @@ func TestSFTPProgressRenewsIdleDeadline(t *testing.T) {
 }
 
 func TestStalledSFTPDownloadExpiresWithoutBodyDeadline(t *testing.T) {
-	_, server, client := startTransferRuntime(t, func(o *HTTPOptions) { o.BodyTimeout = 2 * time.Second; o.StreamIdle = 80 * time.Millisecond }, pkgsftp.InMemHandler(), func(r *Runtime) {
+	stall := &transferTestStall{release: make(chan struct{})}
+	defer stall.unblock()
+	_, server, client := startTransferRuntime(t, func(o *HTTPOptions) { o.BodyTimeout = 10 * time.Second; o.StreamIdle = transferTestIdle }, pkgsftp.InMemHandler(), func(r *Runtime) {
 		r.transferDial = func(ctx context.Context, node string) (transferRemote, error) {
 			c, err := r.getMCPSFTPClient(ctx, node)
 			if err != nil {
 				return nil, err
 			}
-			return delayedDownloadRemote{&sftpTransferRemote{client: c}}, nil
+			return waitingDownloadRemote{&sftpTransferRemote{client: c}, stall.wait}, nil
 		}
 	})
 	p := prepareTransferTest(t, client, "xops_prepare_upload", uploadBoundaryInput("seed", "/source", nil))
-	transferTestRequest(t, server, p.Method, p.URL, p.Headers, bytes.NewReader(nil))
+	seedResponse, seedBody := transferTestRequest(t, server, p.Method, p.URL, p.Headers, bytes.NewReader(nil))
+	if seedResponse.StatusCode != http.StatusOK {
+		t.Fatalf("seed upload failed: %d %s", seedResponse.StatusCode, seedBody)
+	}
 	p = prepareTransferTest(t, client, "xops_prepare_download", PrepareDownloadInput{RequestID: "read-stall", NodeID: "files", RemotePath: "/source"})
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, p.Method, p.URL, nil)
 	if err != nil {
@@ -198,36 +248,32 @@ func TestStalledSFTPDownloadExpiresWithoutBodyDeadline(t *testing.T) {
 	if err != nil {
 		t.Logf("interrupted stalled download: %v", err)
 	}
-	status := transferTestStatus(t, server, p)
-	if status.State != transfer.Failed && status.State != transfer.Cancelled {
-		t.Fatalf("stalled remote read not failed: %+v", status)
+	if !stall.entered.Load() {
+		t.Fatal("test never reached the stalled SFTP download")
 	}
+	awaitTransferIdleFailure(t, server, p)
 }
 
 type delayedUploadInspection struct {
 	transferRemote
-	stall   *atomic.Bool
-	entered chan struct{}
+	stall *atomic.Bool
+	gate  *transferTestStall
 }
 
 func (r delayedUploadInspection) Inspect(ctx context.Context, name string, upload, overwrite bool) (remoteFileMetadata, error) {
 	if upload && r.stall.CompareAndSwap(true, false) {
-		close(r.entered)
-		timer := time.NewTimer(600 * time.Millisecond)
-		defer timer.Stop()
-		select {
-		case <-timer.C:
-		case <-ctx.Done():
-			return remoteFileMetadata{}, ctx.Err()
+		if err := r.gate.wait(ctx); err != nil {
+			return remoteFileMetadata{}, err
 		}
 	}
 	return r.transferRemote.Inspect(ctx, name, upload, overwrite)
 }
 func TestUploadInspectionExpiresAtStreamIdleDeadline(t *testing.T) {
 	var stall atomic.Bool
-	entered := make(chan struct{})
+	gate := &transferTestStall{release: make(chan struct{})}
+	defer gate.unblock()
 	r, server, client := startTransferRuntime(t, func(o *HTTPOptions) {
-		o.StreamIdle = 100 * time.Millisecond
+		o.StreamIdle = transferTestIdle
 		o.Transfers.MaxActive = 1
 		o.Transfers.MaxPerTarget = 1
 	}, pkgsftp.InMemHandler(), func(r *Runtime) {
@@ -236,13 +282,13 @@ func TestUploadInspectionExpiresAtStreamIdleDeadline(t *testing.T) {
 			if err != nil {
 				return nil, err
 			}
-			return delayedUploadInspection{&sftpTransferRemote{client: c}, &stall, entered}, nil
+			return delayedUploadInspection{&sftpTransferRemote{client: c}, &stall, gate}, nil
 		}
 	})
 	payload := []byte("nonempty body while metadata stalls")
 	p := prepareTransferTest(t, client, "xops_prepare_upload", uploadBoundaryInput("inspect-stall", "/destination", payload))
 	stall.Store(true)
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, p.Method, p.URL, bytes.NewReader(payload))
 	if err != nil {
@@ -251,7 +297,6 @@ func TestUploadInspectionExpiresAtStreamIdleDeadline(t *testing.T) {
 	for k, v := range p.Headers {
 		req.Header.Set(k, v)
 	}
-	start := time.Now()
 	response, err := server.Client().Do(req)
 	if response != nil {
 		closeTransferTestResource(t, response.Body)
@@ -259,27 +304,12 @@ func TestUploadInspectionExpiresAtStreamIdleDeadline(t *testing.T) {
 	if err != nil {
 		t.Logf("interrupted metadata request: %v", err)
 	}
-	if time.Since(start) > 450*time.Millisecond {
-		t.Fatal("metadata inspection ignored stream idle timeout")
-	}
-	select {
-	case <-entered:
-	default:
+	if !gate.entered.Load() {
 		t.Fatal("test never reached inspection")
 	}
-	deadline := time.Now().Add(time.Second)
-	for {
-		status := transferTestStatus(t, server, p)
-		if status.State == transfer.Failed || status.State == transfer.Cancelled {
-			if status.CleanupPending || status.TempOwned {
-				t.Fatalf("inspection created a temporary: %+v", status)
-			}
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("inspection did not terminate: %+v", status)
-		}
-		time.Sleep(5 * time.Millisecond)
+	status := awaitTransferIdleFailure(t, server, p)
+	if status.TempOwned {
+		t.Fatalf("inspection created a temporary: %+v", status)
 	}
 	next := prepareTransferTest(t, client, "xops_prepare_upload", uploadBoundaryInput("after-inspection", "/next", nil))
 	response, body := transferTestRequest(t, server, next.Method, next.URL, next.Headers, bytes.NewReader(nil))

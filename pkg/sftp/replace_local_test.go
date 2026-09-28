@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -103,7 +104,8 @@ func TestReplaceLocalFileFailurePreservesOriginal(t *testing.T) {
 			original := destination
 			if stage == "rollback" || stage == "concurrent destination" {
 				original = backup
-				if !strings.Contains(err.Error(), backup) {
+				// Diagnostics quote paths with %q, including Windows backslashes.
+				if !strings.Contains(err.Error(), strconv.Quote(backup)) {
 					t.Fatalf("error does not identify preserved original: %v", err)
 				}
 			}
