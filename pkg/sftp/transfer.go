@@ -430,10 +430,7 @@ func (c *Client) downloadFile(ctx context.Context, remotePath, localPath string,
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := os.Rename(finalTempPath, localPath); err != nil {
-		return fmt.Errorf("rename local temporary file failed: %w", err)
-	}
-	return nil
+	return replaceLocalFile(finalTempPath, localPath, os.Rename)
 }
 
 func (c *Client) writeDownloadTemporaryFile(ctx context.Context, srcFile *sftp.File, dstFile *os.File, startOffset, size int64, mode os.FileMode, progress ProgressCallback) (retErr error) {

@@ -28,6 +28,16 @@ Use SCP for batch file distribution:
 xops scp ./config.conf --tag web --dest /etc/app/
 ```
 
+SCP remote paths support `~` and `~/...`, relative to the remote SFTP login directory (normally the user's home). This applies to uploads, downloads, remote relays, and batch uploads. Quote batch destination paths to prevent expansion by the local shell. `~otheruser` is unsupported; use an absolute path instead.
+
+```bash
+xops scp ./test.tar 'test1:~/tmp/' -v
+xops scp 'test1:~/tmp/test.tar' ../ -v
+xops scp ./config.conf --tag web --dest '~/tmp/'
+```
+
+Answering `y` or using `--force` replaces an existing file even when its size and modification time match the source; `--no-clobber` skips existing destinations. Local downloads first attempt an atomic rename. If the filesystem refuses to rename over an existing regular file, XOps backs up the original before promoting the download and restores it if promotion fails. This fallback is not atomic. If recovery fails, the error identifies the original file's backup path. A directory with the same name is not replaced with a regular file.
+
 Check target directory permissions and avoid overwriting files unintentionally. If the connection is lost, the SFTP shell exits with a failure status instead of accepting further invalid operations.
 
 ## Interactive input and shortcuts

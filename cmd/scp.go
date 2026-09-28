@@ -318,7 +318,10 @@ func (o *ScpOptions) runUpload(ctx context.Context, localPath string, dst PathIn
 	}
 	defer joinCloseError(&err, "upload SFTP client", sftpCli.Close)
 
-	remotePath := dst.Path
+	remotePath, err := expandSCPRemotePath(ctx, sftpCli, dst.Path)
+	if err != nil {
+		return err
+	}
 	var remoteStat os.FileInfo
 	err = sftpCli.Do(ctx, func(c *pkgsftp.Client) error {
 		var statErr error
@@ -398,7 +401,7 @@ func (o *ScpOptions) runUpload(ctx context.Context, localPath string, dst PathIn
 		}
 	}
 
-	uploadErr := sftpCli.Upload(ctx, localPath, remotePath, progress)
+	uploadErr := sftpCli.WithForce(o.Force).Upload(ctx, localPath, remotePath, progress)
 	return errors.Join(uploadErr, progressErr)
 }
 
@@ -408,6 +411,11 @@ func (o *ScpOptions) runDownload(ctx context.Context, src PathInfo, localPath st
 		return fmt.Errorf("connect download source failed: %w", err)
 	}
 	defer joinCloseError(&err, "download SFTP client", sftpCli.Close)
+
+	src.Path, err = expandSCPRemotePath(ctx, sftpCli, src.Path)
+	if err != nil {
+		return err
+	}
 
 	// Stat the source under ctx so a cancelled transfer does not block here.
 	var stat os.FileInfo
@@ -481,11 +489,11 @@ func (o *ScpOptions) runDownload(ctx context.Context, src PathInfo, localPath st
 	}
 
 	if stat.IsDir() {
-		downloadErr := sftpCli.DownloadDirectory(ctx, src.Path, localPath, progress)
+		downloadErr := sftpCli.WithForce(o.Force).DownloadDirectory(ctx, src.Path, localPath, progress)
 		return errors.Join(downloadErr, progressErr)
 	}
 
-	downloadErr := sftpCli.DownloadFile(ctx, src.Path, localDest, stat.Size(), stat.Mode(), progress)
+	downloadErr := sftpCli.WithForce(o.Force).DownloadFile(ctx, src.Path, localDest, stat.Size(), stat.Mode(), progress)
 	return errors.Join(downloadErr, progressErr)
 }
 
@@ -502,6 +510,15 @@ func (o *ScpOptions) runRemoteToRemote(ctx context.Context, src, dst PathInfo, p
 		return fmt.Errorf("connect remote destination failed: %w", err)
 	}
 	defer joinCloseError(&retErr, "destination SFTP client", dstSftp.Close)
+
+	src.Path, err = expandSCPRemotePath(ctx, srcSftp, src.Path)
+	if err != nil {
+		return err
+	}
+	dst.Path, err = expandSCPRemotePath(ctx, dstSftp, dst.Path)
+	if err != nil {
+		return err
+	}
 
 	// The cancellation watcher closes srcSftp/dstSftp when the caller's ctx
 	// is cancelled, unblocking any in-flight SFTP operations on those clients.
@@ -800,7 +817,10 @@ func (o *ScpOptions) executeTransfer(ctx context.Context, label string, addr Pat
 	}
 	defer joinCloseError(&err, "batch upload SFTP client", sftpCli.Close)
 
-	remotePath := o.Dest
+	remotePath, err := expandSCPRemotePath(ctx, sftpCli, o.Dest)
+	if err != nil {
+		return err
+	}
 	var remoteStat os.FileInfo
 	if statErr := sftpCli.Do(ctx, func(c *pkgsftp.Client) error {
 		var err error
