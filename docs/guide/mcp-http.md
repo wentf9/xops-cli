@@ -175,6 +175,8 @@ python3 scripts/mcp/transfer.py status --server http://192.168.1.10:8080 \
 
 辅助程序的 `--idle-timeout` 和 `--timeout` 可调整客户端等待时间。超时后不会自动重传；上传结果核验可能额外等待最多 45 秒。
 
+上传请求体完整读取后，HTTP 读取空闲超时不再取消后续校验或提交准备；校验仍受传输总时限约束，进入提交后使用独立的 `commit_timeout`。请求体尚未读完时，读取空闲超时仍然生效。
+
 ## 处理异常任务
 
 服务重启后，未开始的任务需要重新申请，中断的传输不会自动续传。出现 `unknown` 时，后续对同一路径的上传会被阻止，需要先核验结果。
@@ -212,11 +214,92 @@ xops mcp recover --state-dir /home/operator/.xops/mcp-transfers --id TASK_ID --c
 
 代理应保留正确的 Host，关闭 `/mcp` 和文件传输接口的请求、响应缓冲，并允许长时间传输。不要为上传配置自动重试。
 
+### Nginx 反向代理示例
+
+以下示例由 Nginx 提供 HTTPS，XOps 与 Nginx 运行在同一台主机。先准备好 `mcp.example.com` 的 DNS 和受客户端信任的 TLS 证书，再让 XOps 仅监听本机地址，复用已生成的 Token：
+
+```bash
+xops mcp serve --transport http --listen 127.0.0.1:8080 \
+  --public-url https://mcp.example.com \
+  --token-file "$HOME/.xops/mcp.token"
+```
+
+`public_url` 必须是客户端实际访问的 HTTPS 来源地址，不加 `/mcp` 或其他路径前缀；XOps 用它生成文件传输地址，并设置默认允许的 Host 和 Origin。`X-Forwarded-Proto` 不能代替此配置。
+
+将下面的 `server` 块保存到 Nginx 的 `http` 上下文加载的文件中，例如 `/etc/nginx/conf.d/xops-mcp.conf`。替换域名和证书路径：
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name mcp.example.com;
+
+    ssl_certificate     /etc/nginx/certs/mcp.example.com.fullchain.pem;
+    ssl_certificate_key /etc/nginx/certs/mcp.example.com.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    # 与 XOps 默认的 10 GiB 单文件上限对应。
+    client_max_body_size 10g;
+    client_body_timeout 75s;
+    send_timeout 75s;
+
+    proxy_http_version 1.1;
+    proxy_set_header Host $http_host;
+    proxy_set_header Connection "";
+    proxy_set_header Authorization $http_authorization;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_pass_request_headers on;
+
+    # 即时转发 MCP 流式响应和文件内容。
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_cache off;
+    gzip off;
+    proxy_next_upstream off;
+
+    proxy_connect_timeout 5s;
+    proxy_send_timeout 75s;
+    # 上传可能直到完成才返回响应；覆盖默认 2 小时传输时限。
+    proxy_read_timeout 7500s;
+
+    location = /mcp {
+        proxy_pass http://127.0.0.1:8080;
+    }
+
+    location ^~ /v1/transfers/ {
+        proxy_pass http://127.0.0.1:8080;
+    }
+
+    location / {
+        return 404;
+    }
+}
+```
+
+两个 `proxy_pass` 均不带 URI 部分，保留原始路径；不要只代理 `/mcp`、添加路径前缀或将 `/mcp` 重定向到 `/mcp/`。若 Nginx 与 XOps 位于不同容器或主机，应将上游地址改为 Nginx 能访问的 XOps 地址，并相应调整 XOps 的监听地址。
+
+`Authorization` 必须透传请求原值：`/mcp` 使用共享 Token，文件传输接口使用准备任务返回的短期凭证，不能在代理中统一替换成固定 Token。`Origin`、`Mcp-Session-Id`、`MCP-Protocol-Version` 等请求头以及响应中的会话头默认保留；不要删除或重写它们。Streamable HTTP 不需要 WebSocket 的 `Upgrade` 配置。此示例使用单个 XOps 实例，MCP 会话和后续文件传输请求应到达同一实例。
+
+`proxy_read_timeout` 是上游两次读取之间的等待时间，不是整次传输的总时限。示例使用 7500 秒，给默认两小时上传及提交留出余量；其余 75 秒超时略大于 XOps 默认一分钟空闲时限。XOps 和客户端自身的超时仍然生效。调整文件上限或超时时，应同步检查 Nginx、XOps 和客户端设置。
+
+检查配置并重新加载：
+
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+curl --max-time 10 --include https://mcp.example.com/mcp
+```
+
+未携带 Token 的检查请求应返回 `401`，用于确认 TLS 和代理路由可用。随后将 MCP 客户端地址改为 `https://mcp.example.com/mcp`，传输辅助程序的 `--server` 改为 `https://mcp.example.com`，重新连接客户端并准备传输任务。若使用非默认 HTTPS 端口，例如 `8443`，需同时修改 `listen`、`public_url` 和客户端地址；`$http_host` 会保留该端口。
+
+### 连接排查
+
 | 问题 | 检查项 |
 | --- | --- |
 | `401` 或认证失败 | 客户端 Token 是否与服务端一致，配置或环境变量是否已生效 |
 | `host_or_origin_denied` | `public_url` 是否正确；使用额外域名或来源时配置 `--allowed-hosts`、`--allowed-origins` |
 | 能调用 MCP，但传输命令无法连接 | 运行本地命令的环境是否能访问局域网地址，是否已允许网络访问 |
+| Nginx 返回 `413` | `client_max_body_size` 是否足够；同时检查 XOps 的 `max_file_bytes` |
+| Nginx 返回 `502` / `504`，或流式响应延迟出现 | 上游地址、服务状态、代理超时和缓冲设置；上传中断后先查询任务状态，不要直接重传 |
 | 任务已过期 | 重新申请任务，并在开始有效期内运行传输命令 |
 | 凭据或主机密钥错误 | 在服务端运行 `xops credential doctor`，确认凭据可用并完成主机密钥确认 |
 

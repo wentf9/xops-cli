@@ -175,6 +175,8 @@ If the service reports that it is busy, wait for active tasks to finish before r
 
 The helper's `--idle-timeout` and `--timeout` options adjust client waiting times. Timeouts do not trigger automatic retransmission; checking an upload outcome may take up to another 45 seconds.
 
+After the complete upload body has been read, the HTTP read-idle deadline no longer cancels verification or commit preparation. Verification remains bounded by the transfer timeout; committing uses the separate `commit_timeout`. Read-idle protection still applies while the request body is incomplete.
+
 ## Handle uncertain or interrupted tasks
 
 After a service restart, prepare new tasks for transfers that had not started. Interrupted transfers do not resume automatically. An `unknown` task blocks further uploads to that destination until its outcome is checked.
@@ -212,11 +214,92 @@ Plain HTTP does not encrypt the token or file content. To use HTTPS, place the s
 
 The proxy should preserve the correct Host, disable request and response buffering for `/mcp` and transfer endpoints, and allow long transfers. Do not configure automatic retries for uploads.
 
+### Nginx reverse proxy example
+
+This example terminates HTTPS at Nginx, with XOps and Nginx running on the same host. Configure DNS and a TLS certificate trusted by the clients for `mcp.example.com`, then bind XOps to loopback and reuse the existing token:
+
+```bash
+xops mcp serve --transport http --listen 127.0.0.1:8080 \
+  --public-url https://mcp.example.com \
+  --token-file "$HOME/.xops/mcp.token"
+```
+
+`public_url` must be the HTTPS origin clients actually use, without `/mcp` or another path prefix. XOps uses it to generate transfer URLs and configure the default allowed Host and Origin. `X-Forwarded-Proto` does not replace this setting.
+
+Save this `server` block in a file loaded within Nginx's `http` context, such as `/etc/nginx/conf.d/xops-mcp.conf`. Replace the domain and certificate paths:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name mcp.example.com;
+
+    ssl_certificate     /etc/nginx/certs/mcp.example.com.fullchain.pem;
+    ssl_certificate_key /etc/nginx/certs/mcp.example.com.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    # Match XOps's default 10 GiB limit per file.
+    client_max_body_size 10g;
+    client_body_timeout 75s;
+    send_timeout 75s;
+
+    proxy_http_version 1.1;
+    proxy_set_header Host $http_host;
+    proxy_set_header Connection "";
+    proxy_set_header Authorization $http_authorization;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_pass_request_headers on;
+
+    # Forward MCP streaming responses and file content immediately.
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_cache off;
+    gzip off;
+    proxy_next_upstream off;
+
+    proxy_connect_timeout 5s;
+    proxy_send_timeout 75s;
+    # Uploads may not respond until complete; allow the default 2-hour limit.
+    proxy_read_timeout 7500s;
+
+    location = /mcp {
+        proxy_pass http://127.0.0.1:8080;
+    }
+
+    location ^~ /v1/transfers/ {
+        proxy_pass http://127.0.0.1:8080;
+    }
+
+    location / {
+        return 404;
+    }
+}
+```
+
+Both `proxy_pass` directives omit a URI component to preserve the original path. Do not proxy only `/mcp`, add a path prefix, or redirect `/mcp` to `/mcp/`. If Nginx and XOps run in separate containers or hosts, use an upstream address reachable from Nginx and adjust the XOps listener accordingly.
+
+Forward each request's original `Authorization` value: `/mcp` uses the shared token, while transfer endpoints use the short-lived credential returned when preparing a task. Do not replace both with a fixed token at the proxy. Request headers such as `Origin`, `Mcp-Session-Id` and `MCP-Protocol-Version`, and session headers in responses, are preserved by default; do not remove or rewrite them. Streamable HTTP does not require WebSocket `Upgrade` settings. This example uses one XOps instance; MCP sessions and subsequent file-transfer requests should reach the same instance.
+
+`proxy_read_timeout` measures the wait between reads from the upstream, not total transfer duration. The example allows 7500 seconds to cover a default two-hour upload plus commit time. The other 75-second timeouts provide some margin over XOps's default one-minute idle limit. XOps and client timeouts still apply. When changing file-size or timeout limits, check the settings in Nginx, XOps and the client together.
+
+Check and reload the configuration:
+
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+curl --max-time 10 --include https://mcp.example.com/mcp
+```
+
+The check request without a token should return `401`, confirming TLS and proxy routing. Then change the MCP client URL to `https://mcp.example.com/mcp` and the transfer helper's `--server` to `https://mcp.example.com`, reconnect the client and prepare new transfer tasks. For a non-default HTTPS port such as `8443`, update `listen`, `public_url` and the client URLs together; `$http_host` preserves that port.
+
+### Connection troubleshooting
+
 | Problem | What to check |
 | --- | --- |
 | `401` or authentication failure | Client and server tokens match; configuration or environment changes have taken effect |
 | `host_or_origin_denied` | `public_url` is correct; configure `--allowed-hosts` and `--allowed-origins` for additional domains or origins |
 | MCP works, but the transfer command cannot connect | The local command environment can reach the LAN address and has network permission |
+| Nginx returns `413` | `client_max_body_size` allows the upload; also check XOps's `max_file_bytes` |
+| Nginx returns `502` / `504`, or streaming output is delayed | Upstream address, service availability, proxy timeouts and buffering; check task status before retrying an interrupted upload |
 | Task expired | Prepare a new task and run the transfer command within its start window |
 | Credential or host-key error | Run `xops credential doctor` on the server, restore credential access and confirm the host key |
 

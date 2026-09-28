@@ -95,17 +95,19 @@ func TestUploadTemporaryPrivateAtCreation(t *testing.T) {
 }
 
 func TestContinuousPartialUploadIsNotIdle(t *testing.T) {
-	_, server, client := startTransferRuntime(t, func(o *HTTPOptions) { o.StreamIdle = 150 * time.Millisecond }, pkgsftp.InMemHandler())
+	_, server, client := startTransferRuntime(t, func(o *HTTPOptions) { o.StreamIdle = transferTestIdle }, pkgsftp.InMemHandler())
 	data := bytes.Repeat([]byte("x"), 80)
 	p := prepareTransferTest(t, client, "xops_prepare_upload", uploadBoundaryInput("trickle", "/destination", data))
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	reader, writer := io.Pipe()
 	defer closeTransferTestResource(t, reader)
 	done := make(chan error, 1)
 	go func() {
 		defer closeTransferTestResource(t, writer)
-		timer := time.NewTicker(5 * time.Millisecond)
+		// The body spans more than one idle window, while individual reads
+		// leave enough scheduling margin for Windows race builds.
+		timer := time.NewTicker(40 * time.Millisecond)
 		defer timer.Stop()
 		for _, b := range data {
 			select {
@@ -141,6 +143,7 @@ func TestContinuousPartialUploadIsNotIdle(t *testing.T) {
 	for k, v := range p.Headers {
 		req.Header.Set(k, v)
 	}
+	start := time.Now()
 	response, err := server.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -152,6 +155,9 @@ func TestContinuousPartialUploadIsNotIdle(t *testing.T) {
 	}
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("continuous partial reads expired: %d %s", response.StatusCode, body)
+	}
+	if time.Since(start) < transferTestIdle {
+		t.Fatal("partial upload did not cross an idle window")
 	}
 	status := transferTestStatus(t, server, p)
 	if status.State != transfer.Completed || status.Bytes != int64(len(data)) {

@@ -174,7 +174,16 @@ func (r transferRequestReader) Read(data []byte) (int, error) {
 	if err := r.controller.SetReadDeadline(time.Now().Add(r.idle)); err != nil {
 		return 0, fmt.Errorf("renew upload read deadline: %w", err)
 	}
-	return r.source.Read(data)
+	n, err := r.source.Read(data)
+	if errors.Is(err, io.EOF) {
+		// A completed body leaves net/http reading for peer disconnects. Do not
+		// let the last body-read deadline cancel verification or commit setup.
+		// The stream watcher and the lease still bound the remaining work.
+		if clearErr := r.controller.SetReadDeadline(time.Time{}); clearErr != nil {
+			return n, fmt.Errorf("clear completed upload body deadline: %w", clearErr)
+		}
+	}
+	return n, err
 }
 
 // interruptTransferIO supplies cancellation for HTTP reads/writes that cannot
