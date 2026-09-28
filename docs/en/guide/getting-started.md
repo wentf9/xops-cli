@@ -15,6 +15,8 @@ make build
 
 On Windows, `make build` automatically produces `bin/xops.exe`. You can also cross-build Windows binaries on any platform with `make windows`.
 
+Use `make GOPATH_BIN=/path/to/bin build` to specify the Go tool directory. Setting `GOPATH_BIN=` skips automatic Go tool directory discovery and preserves the existing `PATH`.
+
 ## Initialize configuration
 
 ```bash

@@ -15,23 +15,10 @@ func TestMakefile_LinuxDryRun(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("requires a POSIX host")
 	}
-	if _, err := exec.LookPath("make"); err != nil {
-		t.Skip("make command not available in environment")
-	}
-
-	targets := []string{"build", "clean", "help", "windows", "linux"}
+	targets := []string{"build", "clean", "windows", "linux"}
 	for _, target := range targets {
 		t.Run(target, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-			defer cancel()
-
-			cmd := exec.CommandContext(ctx, "make", "-n", target)
-			cmd.Dir = ".."
-			out, err := cmd.CombinedOutput()
-			if err != nil {
-				t.Fatalf("make -n %s failed: %v, output: %s", target, err, string(out))
-			}
-			outStr := string(out)
+			outStr := makefileDryRun(t, target)
 
 			switch target {
 			case "build":
@@ -55,21 +42,8 @@ func TestMakefile_LinuxDryRun(t *testing.T) {
 }
 
 func TestMakefile_WindowsDryRun(t *testing.T) {
-	if _, err := exec.LookPath("make"); err != nil {
-		t.Skip("make command not available in environment")
-	}
-
 	t.Run("Windows_NT_build", func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-		defer cancel()
-
-		cmd := exec.CommandContext(ctx, "make", "-n", "OS=Windows_NT", "build")
-		cmd.Dir = ".."
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("make -n OS=Windows_NT build failed: %v, output: %s", err, string(out))
-		}
-		outStr := string(out)
+		outStr := makefileDryRun(t, "OS=Windows_NT", "build")
 		if !strings.Contains(outStr, "bin/xops.exe") {
 			t.Fatalf("expected bin/xops.exe with OS=Windows_NT, got: %s", outStr)
 		}
@@ -84,34 +58,14 @@ func TestMakefile_WindowsDryRun(t *testing.T) {
 		if runtime.GOOS == "windows" {
 			t.Skip("requires a POSIX host; native Windows clean is tested separately")
 		}
-		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-		defer cancel()
-
-		cmd := exec.CommandContext(ctx, "make", "-n", "OS=Windows_NT", "SHELL=/bin/bash", "clean")
-		cmd.Dir = ".."
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("make -n OS=Windows_NT SHELL=/bin/bash clean failed: %v, output: %s", err, string(out))
-		}
-		outStr := string(out)
+		outStr := makefileDryRun(t, "OS=Windows_NT", "SHELL=/bin/bash", "clean")
 		if !strings.Contains(outStr, "rm -rf bin coverage.out") {
 			t.Fatalf("expected rm -rf for POSIX shell on Windows_NT, got: %s", outStr)
 		}
 	})
 
 	t.Run("Windows_NT_CMD_clean", func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-		defer cancel()
-
-		// Avoid metadata subprocesses so the CMD dry run also works on POSIX hosts.
-		cmd := exec.CommandContext(ctx, "make", "-n", "OS=Windows_NT", "SHELL=cmd.exe",
-			"GOPATH_BIN=", "VERSION=test", "COMMIT=test", "DATE=test", "clean")
-		cmd.Dir = ".."
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("native Windows clean dry run failed: %v, output: %s", err, out)
-		}
-		outStr := string(out)
+		outStr := makefileDryRun(t, "OS=Windows_NT", "SHELL=cmd.exe", "clean")
 		if !strings.Contains(outStr, "rmdir /s /q bin") {
 			t.Fatalf("expected rmdir /s /q bin for CMD shell on Windows_NT, got: %s", outStr)
 		}
@@ -122,21 +76,7 @@ func TestMakefile_WindowsDryRun(t *testing.T) {
 }
 
 func TestMakefile_CrossCompilationTargets(t *testing.T) {
-	if _, err := exec.LookPath("make"); err != nil {
-		t.Skip("make command not available in environment")
-	}
-
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "make", "-n", "windows", "windows-arm64", "linux", "linux-arm64", "darwin-amd64", "darwin-arm64")
-	cmd.Dir = ".."
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("make -n cross compilation targets failed: %v, output: %s", err, string(out))
-	}
-
-	outStr := string(out)
+	outStr := makefileDryRun(t, "windows", "windows-arm64", "linux", "linux-arm64", "darwin-amd64", "darwin-arm64")
 	expectedArtifacts := []string{
 		"bin/xops.exe",
 		"bin/xops-arm64.exe",
@@ -153,22 +93,10 @@ func TestMakefile_CrossCompilationTargets(t *testing.T) {
 	}
 }
 
-func TestMakefile_TimeoutContextSafety(t *testing.T) {
-	if _, err := exec.LookPath("make"); err != nil {
-		t.Skip("make command not available in environment")
-	}
-	// Bound make execution even when the suite has no timeout.
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-
-	start := time.Now()
-	cmd := exec.CommandContext(ctx, "make", "-n", "help")
-	cmd.Dir = ".."
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("make -n help failed: %v", err)
-	}
-	if time.Since(start) > 5*time.Second {
-		t.Fatalf("make -n help took unexpectedly long: %v", time.Since(start))
+func TestMakefile_HelpDryRun(t *testing.T) {
+	out := makefileDryRun(t, "help")
+	if !strings.Contains(out, "make [target]") || !strings.Contains(out, "Targets:") {
+		t.Fatalf("help dry run omitted usage or targets: %s", out)
 	}
 }
 
@@ -218,21 +146,72 @@ func TestMakefile_InstallSkillPOSIX(t *testing.T) {
 }
 
 func TestMakefile_InstallSkillWindowsDryRun(t *testing.T) {
-	if _, err := exec.LookPath("make"); err != nil {
+	out := makefileDryRun(t, "OS=Windows_NT", "SHELL=cmd.exe", "install-skill")
+	if strings.Count(out, "(Join-Path $HOME '.gemini/skills/xops-agent')") != 2 {
+		t.Fatalf("expected expandable home paths for both installation commands, got: %s", out)
+	}
+}
+
+// Dry runs check recipes with fixed metadata, without measuring Go/Git startup
+// on a loaded native runner. Real tool execution and PATH discovery have separate
+// fixture tests below. Bound both the command and inherited output pipes.
+func makefileDryRun(t *testing.T, args ...string) string {
+	t.Helper()
+	makePath, err := exec.LookPath("make")
+	if err != nil {
 		t.Skip("make command not available in environment")
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
-	// Override shell-evaluated metadata so this dry run also works on POSIX hosts.
-	cmd := exec.CommandContext(ctx, "make", "-n", "OS=Windows_NT", "SHELL=cmd.exe",
-		"GOPATH_BIN=", "VERSION=test", "COMMIT=test", "DATE=test", "install-skill")
+	options := []string{"-n", "GOPATH_BIN=", "VERSION=test", "COMMIT=test", "DATE=test"}
+	cmd := exec.CommandContext(ctx, makePath, append(options, args...)...)
 	cmd.Dir = ".."
+	cmd.WaitDelay = time.Second
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("Windows install-skill dry run failed: %v, output: %s", err, out)
+		t.Fatalf("make dry run %v failed: %v (context: %v), output: %s", args, err, ctx.Err(), out)
 	}
-	if strings.Count(string(out), "(Join-Path $HOME '.gemini/skills/xops-agent')") != 2 {
-		t.Fatalf("expected expandable home paths for both installation commands, got: %s", out)
+	return string(out)
+}
+
+func TestMakefile_GOPATHOverrideSkipsDiscovery(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX host for shell fixtures")
+	}
+	makePath, err := exec.LookPath("make")
+	if err != nil {
+		t.Skip("make command not available in environment")
+	}
+	for _, platform := range []struct {
+		name, os, shellMode string
+	}{
+		{"POSIX", "Darwin", "yes"},
+		{"Windows_POSIX", "Windows_NT", "yes"},
+		{"Windows_CMD", "Windows_NT", ""},
+	} {
+		for _, bin := range []string{"", "/explicit go/bin"} {
+			t.Run(platform.name+"/"+bin, func(t *testing.T) {
+				root := makefileFixture(t)
+				marker := filepath.Join(root, "discovery")
+				writeMakefileFixture(t, root, "tools/go", "#!/bin/sh\nprintf 'called' >> \"$XOPS_MAKE_DISCOVERY\"\nprintf '/unused'\n")
+				t.Setenv("PATH", filepath.Join(root, "tools"))
+				t.Setenv("XOPS_MAKE_DISCOVERY", marker)
+				ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+				defer cancel()
+				cmd := exec.CommandContext(ctx, makePath, "-n", "OS="+platform.os, "SHELL=/bin/sh",
+					"POSIX_SHELL="+platform.shellMode, "GOPATH_BIN="+bin, "VERSION=test", "COMMIT=test", "DATE=test", "help")
+				cmd.Dir = root
+				cmd.WaitDelay = time.Second
+				if out, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("help with explicit GOPATH_BIN failed: %v, output: %s", err, out)
+				}
+				if _, err := os.Stat(marker); err == nil {
+					t.Fatal("explicit GOPATH_BIN still invoked Go discovery")
+				} else if !os.IsNotExist(err) {
+					t.Fatalf("check Go discovery marker: %v", err)
+				}
+			})
+		}
 	}
 }
 

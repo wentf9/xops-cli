@@ -15,6 +15,8 @@ make build
 
 在 Windows 系统上，`make build` 会自动生成 `bin/xops.exe`；亦可在任意平台上通过 `make windows` 交叉编译 Windows 产物。
 
+可用 `make GOPATH_BIN=/path/to/bin build` 指定 Go 工具目录；设置 `GOPATH_BIN=` 会跳过 Go 工具目录的自动探测，并保留现有 `PATH`。
+
 ## 初始化配置
 
 ```bash
