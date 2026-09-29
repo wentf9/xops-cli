@@ -461,9 +461,8 @@ func (m *Model) handleTagAction() (Model, tea.Cmd) {
 	}
 
 	// 初始化标签选择表单
-	*m = m.initTagSelectForm()
 	m.state = viewTagSelect
-	return *m, nil
+	return m.initTagSelectForm()
 }
 
 func newNodeDelegate(isDark bool) checkedDelegate {

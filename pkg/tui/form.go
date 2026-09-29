@@ -787,14 +787,11 @@ func (m *Model) getSelectedNodeRefs() []config.NodeRef {
 }
 
 // initTagSelectForm 初始化标签选择表单
-func (m *Model) initTagSelectForm() Model {
-	view := m.repository.View()
+func (m *Model) initTagSelectForm() (Model, tea.Cmd) {
 	m.selectedTags = []string{}
 	m.tagMode = "add"
 	m.newTagsInput = ""
-	m.tagRevision = view.Revision
-	updated, _ := m.rebuildTagSelectForm()
-	return updated
+	return m.rebuildTagSelectForm()
 }
 
 // rebuildTagSelectForm recreates Huh's completed form while retaining the
@@ -824,12 +821,15 @@ func (m *Model) rebuildTagSelectForm() (Model, tea.Cmd) {
 				huh.NewMultiSelect[string]().
 					Title(i18n.T("tui_tag_select")).
 					Options(tagOpts...).
+					// Huh v2's automatic height omits the title, leaving a
+					// single option with no visible row. Reserve both here.
+					Height(len(tagOpts)+1).
 					Value(&m.selectedTags),
 				huh.NewInput().
 					Title(i18n.T("tui_tag_new_input")).
 					Value(&m.newTagsInput),
 			),
-		).WithTheme(huh.ThemeFunc(formTheme)).WithWidth(m.lastSize.Width).WithHeight(m.lastSize.Height - 1)
+		).WithTheme(huh.ThemeFunc(formTheme))
 	} else {
 		// 没有现有标签，只显示输入框
 		m.tagForm = huh.NewForm(
@@ -844,9 +844,21 @@ func (m *Model) rebuildTagSelectForm() (Model, tea.Cmd) {
 					Title(i18n.T("tui_tag_input")).
 					Value(&m.newTagsInput),
 			),
-		).WithTheme(huh.ThemeFunc(formTheme)).WithWidth(m.lastSize.Width).WithHeight(m.lastSize.Height - 1)
+		).WithTheme(huh.ThemeFunc(formTheme))
 	}
-	return *m, m.initEmbeddedForm(m.tagForm)
+	cmd := m.initEmbeddedForm(m.tagForm)
+	return *m, tea.Batch(cmd, m.resizeTagSelectForm())
+}
+
+func (m *Model) resizeTagSelectForm() tea.Cmd {
+	size := tea.WindowSizeMsg{
+		Width:  m.formWidth(),
+		Height: max(m.lastSize.Height-appStyle.GetVerticalFrameSize()-1, 1),
+	}
+	m.tagForm.WithWidth(size.Width).WithHeight(size.Height)
+	// Rebuild the viewport and scroll to the focused field after resizing.
+	_, cmd := m.tagForm.Update(size)
+	return cmd
 }
 
 // updateTagSelect 处理标签选择视图的更新
@@ -856,10 +868,7 @@ func (m *Model) updateTagSelect(msg tea.Msg) (Model, tea.Cmd) {
 	}
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		if m.tagForm != nil {
-			m.tagForm.WithWidth(msg.Width).WithHeight(msg.Height - 1)
-		}
-		return *m, nil
+		return *m, m.resizeTagSelectForm()
 	case tea.KeyPressMsg:
 		if msg.String() == "esc" {
 			m.state = viewList

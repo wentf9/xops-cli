@@ -38,6 +38,8 @@ Press `Ctrl+S` to save a node form or `Esc` to return to the list. If an alias b
 
 Validation errors triggered by Tab or arrow-key navigation appear in the same feedback area. When feedback appears or the terminal is resized, the form adjusts its scroll position to keep the focused input visible, including the final Tags field.
 
+Press `Space` to select nodes, then `g` to manage tags. **Select existing tags** lists tags from the configuration, including when only one tag exists. Press `Tab` to focus the selector, use the arrow keys to browse and `Space` to toggle tags, then press `Enter` to continue to the new-tag input. If no tags exist, the form provides a tag input instead. Resizing preserves selected tags and entered text while keeping the focused field visible.
+
 | Key | Action |
 | --- | --- |
 | `Enter` | Open SSH for the current node |

@@ -11,6 +11,7 @@ import (
 	"charm.land/bubbles/v2/list"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/huh/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
@@ -616,7 +617,8 @@ func (m Model) View() tea.View {
 		s += m.formFooter()
 	case viewTagSelect:
 		if m.tagForm != nil {
-			s = m.tagForm.View()
+			// Long multiselect help must not wrap beyond the form's height.
+			s = lipgloss.NewStyle().MaxWidth(m.formWidth()).Render(m.tagForm.View())
 		} else {
 			s = "Tag Select (WIP)"
 		}
