@@ -107,6 +107,7 @@ type privilegeFrameWriter struct {
 	prompt   *regexp.Regexp
 	failed   bool
 	writeErr error
+	feedback sudoPromptFeedback
 }
 
 func (w *privilegeFrameWriter) Write(data []byte) (n int, retErr error) {
@@ -129,6 +130,7 @@ func (w *privilegeFrameWriter) Write(data []byte) (n int, retErr error) {
 	}
 	w.pending = append(w.pending, data...)
 	for !w.exchange.outputReady() {
+		w.pending = w.feedback.consume(w.pending)
 		token := w.exchange.readyToken
 		var prompt []int
 		if w.exchange.started() {
@@ -158,6 +160,7 @@ func (w *privilegeFrameWriter) Write(data []byte) (n int, retErr error) {
 		if err := w.emit(w.pending[:prompt[0]]); err != nil {
 			return 0, err
 		}
+		w.feedback = sudoPromptFeedback(w.exchange.mode == SudoModeSudo && bytes.HasPrefix(w.pending[prompt[0]:prompt[1]], []byte(sudoRSPromptPrefix)))
 		w.pending = w.pending[prompt[1]:]
 		select {
 		case w.exchange.prompts <- struct{}{}:
@@ -352,6 +355,9 @@ func (w *privilegeFrameWriter) promptIndex() []int {
 		prefix := strings.TrimLeft(string(line), "+")
 		if len(prefix) < len(line) && strings.HasPrefix(prefix, " ") {
 			continue
+		}
+		if w.exchange.mode == SudoModeSudo {
+			return expandSudoPrompt(w.pending, match)
 		}
 		return match
 	}

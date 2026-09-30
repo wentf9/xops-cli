@@ -29,6 +29,8 @@ The node configuration selects the escalation method: root, passwordless sudo, p
 
 `ssh --sudo` opens an elevated interactive shell. `exec -x --sudo` executes an elevated command directly, retaining PTY authentication without an extra root shell prompt or injected command echo. Validate custom su/PAM multi-step authentication and login scripts on the target system.
 
+Password sudo supports both traditional sudo and sudo-rs. When available credentials supply the password automatically, remote password prompts and sudo-rs asterisk feedback are filtered out. The sudo-rs PAM `Password:` prompt is recognized with or without trailing spaces. Missing or rejected credentials still trigger a password prompt. Authentication errors and output from the elevated command remain visible.
+
 ## Tunnels
 
 ```bash

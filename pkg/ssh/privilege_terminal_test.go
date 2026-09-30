@@ -13,10 +13,20 @@ import (
 )
 
 func TestPrivilegeTerminalHandoffAfterAuthentication(t *testing.T) {
-	for _, mode := range []SudoMode{SudoModeSudo, SudoModeSu} {
-		t.Run(string(mode), func(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		mode         SudoMode
+		sudoRSPrompt string
+	}{
+		{"sudo", SudoModeSudo, ""},
+		{"su", SudoModeSu, ""},
+		{"sudo-rs", SudoModeSudo, "Password: "},
+		{"sudo-rs without trailing space", SudoModeSudo, "Password:"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			setTestHome(t)
-			addr, evidence := startPrivilegeExchangeServer(t, privilegeServerOptions{mode: mode, password: "valid", status: 7})
+			mode := tc.mode
+			addr, evidence := startPrivilegeExchangeServer(t, privilegeServerOptions{mode: mode, password: "valid", status: 7, sudoRSPrompt: tc.sudoRSPrompt})
 			ui := &recoveryTestUI{values: []string{"wrong", "valid"}}
 			recorder := &testRecorder{}
 			client := exchangeTestClient(t, addr, mode, ui, recorder)
@@ -42,6 +52,9 @@ func TestPrivilegeTerminalHandoffAfterAuthentication(t *testing.T) {
 			}
 			if recorder.sudoCalls != 1 || evidence.commands.Load() != 1 {
 				t.Fatal("command replayed or verified password not saved")
+			}
+			if mode == SudoModeSudo && output.String() != "command output: su: Authentication failure\n" {
+				t.Fatalf("password prompt or feedback leaked: %q", output.String())
 			}
 		})
 	}

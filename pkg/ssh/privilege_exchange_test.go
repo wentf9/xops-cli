@@ -27,6 +27,7 @@ type privilegeServerOptions struct {
 	banner           string
 	withholdTerminal bool
 	inputBytes       int
+	sudoRSPrompt     string
 }
 type privilegeServerEvidence struct {
 	commands         atomic.Int32
@@ -512,12 +513,20 @@ func servePrivilegeAuthentication(t *testing.T, channel cryptoSSH.Channel, reade
 		if opts.mode == SudoModeSu {
 			prompt = "Password: "
 		}
+		if opts.sudoRSPrompt != "" {
+			prompt = "[sudo: " + prompt + "] " + opts.sudoRSPrompt
+		}
 		if _, err := io.WriteString(target, prompt); err != nil {
 			return false
 		}
 		value, err := reader.ReadString('\n')
 		if err != nil {
 			return false
+		}
+		if opts.sudoRSPrompt != "" {
+			if _, err := io.WriteString(target, "***\b \b\b \b\b \b\r\r\n"); err != nil {
+				return false
+			}
 		}
 		evidence.attempts.Add(1)
 		if strings.TrimSpace(value) == opts.password {

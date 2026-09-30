@@ -29,6 +29,8 @@ xops exec -x --sudo web-01 id
 
 `ssh --sudo` 提供提权后的交互 shell；`exec -x --sudo` 直接执行提权命令。后者保留 PTY 认证，但不额外显示 root shell 提示符和注入命令回显。自定义 su/PAM 多轮认证和登录脚本应在目标环境验证。
 
+密码 sudo 支持传统 sudo 和 sudo-rs：使用可用凭据自动认证时，会过滤远端密码提示及 sudo-rs 的星号反馈；sudo-rs 的 PAM `Password:` 提示无论是否带尾随空格，均可识别。缺少凭据或密码被拒绝时，仍会提示输入密码。认证错误和提权后命令的输出会正常显示。
+
 ## 隧道
 
 ```bash

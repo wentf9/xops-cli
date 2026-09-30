@@ -29,13 +29,14 @@ func (c *Client) confirmPrivilege(ctx context.Context, material *PrivilegeMateri
 	return nil
 }
 
-// privilegePromptWriter removes only the random sudo prompt, preserving all
-// other bytes, including split markers and partial matches at process exit.
+// privilegePromptWriter removes the random sudo prompt, including sudo-rs's
+// envelope and password feedback. Other output and partial matches are kept.
 // The session joins its stderr copier before callers inspect or flush it.
 type privilegePromptWriter struct {
 	marker, pending []byte
 	target          io.Writer
 	observed        bool
+	feedback        sudoPromptFeedback
 }
 
 func (w *privilegePromptWriter) Write(data []byte) (int, error) {
@@ -45,17 +46,23 @@ func (w *privilegePromptWriter) Write(data []byte) (int, error) {
 	}
 	w.pending = append(w.pending, data...)
 	for {
+		w.pending = w.feedback.consume(w.pending)
 		at := bytes.Index(w.pending, w.marker)
 		if at < 0 {
 			break
 		}
-		if err := w.writeOutput(w.pending[:at]); err != nil {
+		match := expandSudoPrompt(w.pending, []int{at, at + len(w.marker)})
+		if match == nil {
+			break
+		}
+		if err := w.writeOutput(w.pending[:match[0]]); err != nil {
 			return 0, err
 		}
-		w.pending = w.pending[at+len(w.marker):]
+		w.feedback = sudoPromptFeedback(bytes.HasPrefix(w.pending[match[0]:match[1]], []byte(sudoRSPromptPrefix)))
+		w.pending = w.pending[match[1]:]
 		w.observed = true
 	}
-	keep := len(w.marker) - 1
+	keep := len(w.marker) + len(sudoRSPromptPrefix) + len(sudoRSPromptSuffix) - 1
 	if len(w.pending) > keep {
 		count := len(w.pending) - keep
 		if err := w.writeOutput(w.pending[:count]); err != nil {
