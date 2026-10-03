@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/wentf9/xops-cli/core/mcp/policy"
@@ -36,40 +37,81 @@ func (s *blockingTunnelFilterSource) Resolve(ctx context.Context, request ports.
 func TestFilteredTunnelListPropagatesCallerCancellation(t *testing.T) {
 	for _, deadline := range []bool{false, true} {
 		t.Run(map[bool]string{false: "cancel", true: "deadline"}[deadline], func(t *testing.T) {
-			f := setupPublication(t, nil, false)
-			source := &blockingTunnelFilterSource{StateSource: f.coordinator, entered: make(chan context.Context, 1), release: make(chan struct{})}
-			f.runtime.provider = source
-			ctx, cancel := context.WithCancel(f.ctx)
-			if deadline {
-				cancel()
-				ctx, cancel = context.WithTimeout(f.ctx, 30*time.Millisecond)
-			}
-			defer cancel()
-			done := make(chan error, 1)
-			go func() { _, _, err := f.runtime.listTunnels(ctx, nil, ListTunnelsInput{NodeID: "node"}); done <- err }()
-			var lookup context.Context
-			select {
-			case lookup = <-source.entered:
-			case <-f.ctx.Done():
-				t.Fatal("filtered lookup did not start")
-			}
-			if deadline {
-				<-ctx.Done()
-			} else {
-				cancel()
-			}
-			if !errors.Is(lookup.Err(), ctx.Err()) {
-				t.Errorf("lookup did not inherit caller cancellation: caller=%v lookup=%v", ctx.Err(), lookup.Err())
-			}
-			close(source.release)
-			select {
-			case err := <-done:
-				if !errors.Is(err, ctx.Err()) {
-					t.Errorf("lookup cancellation lost: %v", err)
+			synctest.Test(t, func(t *testing.T) {
+				// This path only resolves a selector. Keep it in-process so virtual
+				// time cannot expire the caller before the lookup worker starts.
+				source := &blockingTunnelFilterSource{StateSource: runtimeTestProvider("node"), entered: make(chan context.Context, 1), release: make(chan struct{})}
+				manager := tunnel.New(t.Context(), nil, nil)
+				defer func() {
+					if err := manager.Shutdown(t.Context()); err != nil {
+						t.Errorf("stop tunnel manager: %v", err)
+					}
+				}()
+				r := &Runtime{ctx: t.Context(), provider: source, tunnels: manager, toolTimeout: 5 * time.Minute}
+				watchdog, stopWatchdog := context.WithTimeout(t.Context(), time.Second)
+				defer stopWatchdog()
+				ctx, cancel := context.WithCancel(t.Context())
+				want := context.Canceled
+				if deadline {
+					cancel()
+					ctx, cancel = context.WithTimeout(t.Context(), 30*time.Millisecond)
+					want = context.DeadlineExceeded
 				}
-			case <-f.ctx.Done():
-				t.Fatal("lookup worker did not exit")
-			}
+				defer cancel()
+				done := make(chan struct{})
+				var resultErr error
+				// Cancellation ends the lookup; the cleanup release also joins it
+				// when a regression disconnects the caller from the lookup context.
+				go func() {
+					defer close(done)
+					_, _, resultErr = r.listTunnels(ctx, nil, ListTunnelsInput{NodeID: "node"})
+				}()
+				defer func() {
+					close(source.release)
+					cleanup, stop := context.WithTimeout(context.WithoutCancel(t.Context()), time.Second)
+					defer stop()
+					select {
+					case <-done:
+					case <-cleanup.Done():
+						t.Error("lookup worker did not exit during cleanup")
+					}
+				}()
+				var lookup context.Context
+				select {
+				case lookup = <-source.entered:
+				case <-watchdog.Done():
+					t.Fatal("filtered lookup did not start")
+				}
+				if deadline {
+					callerDeadline, _ := ctx.Deadline()
+					lookupDeadline, ok := lookup.Deadline()
+					if !ok || !lookupDeadline.Equal(callerDeadline) {
+						t.Errorf("lookup deadline = %v, want %v", lookupDeadline, callerDeadline)
+					}
+					<-ctx.Done()
+				} else {
+					cancel()
+				}
+				// Parent Done may close before cancellation reaches every child.
+				// Observe the child's own completion before inspecting its error;
+				// releasing the source early would manufacture context.Canceled.
+				select {
+				case <-lookup.Done():
+				case <-watchdog.Done():
+					t.Fatal("caller cancellation did not reach filtered lookup")
+				}
+				if !errors.Is(lookup.Err(), want) {
+					t.Errorf("lookup cancellation = %v, want %v", lookup.Err(), want)
+				}
+				select {
+				case <-done:
+					if !errors.Is(resultErr, want) {
+						t.Errorf("lookup cancellation lost: %v", resultErr)
+					}
+				case <-watchdog.Done():
+					t.Fatal("lookup worker did not exit")
+				}
+			})
 		})
 	}
 }
