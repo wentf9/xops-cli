@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/wentf9/xops-cli/pkg/logger"
+	corelog "github.com/wentf9/xops-cli/core/log"
 )
 
 const (
@@ -26,7 +26,7 @@ type udpSession struct {
 type UDPForwarder struct {
 	listenAddr   string
 	targetAddr   string
-	logger       logger.DebugLogger
+	logger       corelog.DebugLogger
 	errorHandler ErrorHandler
 
 	mu       sync.Mutex

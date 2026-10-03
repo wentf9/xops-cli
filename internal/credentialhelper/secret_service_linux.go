@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/godbus/dbus/v5"
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -79,7 +80,7 @@ func (s *linuxNativeStore) getWithoutPrompt(ctx context.Context, ref credential.
 	defer cancel()
 	socket, err := sessionBusSocket(os.Getenv("DBUS_SESSION_BUS_ADDRESS"))
 	if err != nil {
-		return secret, fmt.Errorf("resolve Secret Service bus: %w: %w", credential.ErrCredentialStoreUnavailable, err)
+		return secret, fmt.Errorf("resolve Secret Service bus: %w: %w", coreauth.ErrCredentialStoreUnavailable, err)
 	}
 	var dialer net.Dialer
 	wire, err := dialer.DialContext(ctx, "unix", socket)
@@ -101,7 +102,7 @@ func (s *linuxNativeStore) getWithoutPrompt(ctx context.Context, ref credential.
 	}
 	conn, err := dbus.NewConn(borrowedBusSocket{wire}, dbus.WithContext(ctx))
 	if err != nil {
-		return secret, fmt.Errorf("create Secret Service connection: %w", credential.ErrCredentialStoreUnavailable)
+		return secret, fmt.Errorf("create Secret Service connection: %w", coreauth.ErrCredentialStoreUnavailable)
 	}
 	defer func() {
 		if err := conn.Close(); err != nil {
@@ -138,15 +139,15 @@ func secretServiceError(ctx context.Context, operation string, err error) error 
 	if errors.As(err, &busErr) {
 		switch busErr.Name {
 		case "org.freedesktop.Secret.Error.IsLocked":
-			return fmt.Errorf("secret service %s: %w", operation, credential.ErrCredentialStoreLocked)
+			return fmt.Errorf("secret service %s: %w", operation, coreauth.ErrCredentialStoreLocked)
 		case "org.freedesktop.DBus.Error.NameHasNoOwner", "org.freedesktop.DBus.Error.ServiceUnknown":
-			return fmt.Errorf("secret service %s: %w: org.freedesktop.secrets is not running or unavailable on the session bus; non-interactive probes do not auto-start it; start your desktop keyring service and retry", operation, credential.ErrCredentialStoreUnavailable)
+			return fmt.Errorf("secret service %s: %w: org.freedesktop.secrets is not running or unavailable on the session bus; non-interactive probes do not auto-start it; start your desktop keyring service and retry", operation, coreauth.ErrCredentialStoreUnavailable)
 		case "org.freedesktop.DBus.Error.AccessDenied":
-			return fmt.Errorf("secret service %s: %w: session bus access denied", operation, credential.ErrCredentialStoreUnavailable)
+			return fmt.Errorf("secret service %s: %w: session bus access denied", operation, coreauth.ErrCredentialStoreUnavailable)
 		}
 	}
 	// Service error bodies may contain secrets. Do not include them in diagnostics.
-	return fmt.Errorf("secret service %s: %w", operation, credential.ErrCredentialStoreUnavailable)
+	return fmt.Errorf("secret service %s: %w", operation, coreauth.ErrCredentialStoreUnavailable)
 }
 
 // SearchItems and GetSecret never request Unlock or Prompt. A relock between
@@ -161,12 +162,12 @@ func readServiceSecret(ctx context.Context, ref credential.Ref, call secretServi
 	}
 	if len(unlocked) == 0 {
 		if len(locked) != 0 {
-			return result, credential.ErrCredentialStoreLocked
+			return result, coreauth.ErrCredentialStoreLocked
 		}
-		return result, credential.ErrCredentialNotFound
+		return result, coreauth.ErrCredentialNotFound
 	}
 	if len(unlocked) != 1 || len(locked) != 0 || !unlocked[0].IsValid() || unlocked[0] == "/" {
-		return result, fmt.Errorf("ambiguous Secret Service item: %w", credential.ErrCredentialStoreUnavailable)
+		return result, fmt.Errorf("ambiguous Secret Service item: %w", coreauth.ErrCredentialStoreUnavailable)
 	}
 	var output dbus.Variant
 	var session dbus.ObjectPath
@@ -175,7 +176,7 @@ func readServiceSecret(ctx context.Context, ref credential.Ref, call secretServi
 		return result, secretServiceError(ctx, "open session", err)
 	}
 	if !session.IsValid() || session == "/" {
-		return result, fmt.Errorf("invalid Secret Service session: %w", credential.ErrCredentialStoreUnavailable)
+		return result, fmt.Errorf("invalid Secret Service session: %w", coreauth.ErrCredentialStoreUnavailable)
 	}
 	defer func() {
 		if err := call(ctx, session, "org.freedesktop.Secret.Session.Close").Err; err != nil {
@@ -194,10 +195,10 @@ func readServiceSecret(ctx context.Context, ref credential.Ref, call secretServi
 		return result, secretServiceError(ctx, "read item", err)
 	}
 	if value.Session != session || len(value.Parameters) != 0 || len(value.Value) > MaxResponseBytes {
-		return result, fmt.Errorf("invalid Secret Service secret: %w", credential.ErrCredentialStoreUnavailable)
+		return result, fmt.Errorf("invalid Secret Service secret: %w", coreauth.ErrCredentialStoreUnavailable)
 	}
 	if len(value.Value) == 0 {
-		return result, credential.ErrCredentialNotFound
+		return result, coreauth.ErrCredentialNotFound
 	}
 	if err := ctx.Err(); err != nil {
 		return result, fmt.Errorf("read Secret Service item: %w", err)

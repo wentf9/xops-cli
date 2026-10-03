@@ -7,7 +7,7 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/wentf9/xops-cli/pkg/ssh"
+	"github.com/wentf9/xops-cli/core/ssh"
 )
 
 // LocalExecutor 本地执行器

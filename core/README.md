@@ -1,12 +1,12 @@
 # Shared XOps core
 
-This subtree is being separated from the CLI application so it can eventually
-be maintained as an independent Go module. It currently shares the repository's
+This subtree is independent of the CLI application and can be extracted into
+a separately maintained Go module. It currently shares the repository's
 Go 1.26+ module; no nested module is used.
 
 Implemented packages:
 
-- `auth`: storage-independent authentication errors shared by old and new APIs.
+- `auth`: storage-independent authentication errors used directly by consumers.
 - `concurrent`: the concurrent map implementation and its original tests.
 - `log`: diagnostic interface and a no-op logger without process initialization.
 - `mcp/policy`: policy configuration values with legacy serialization preserved.
@@ -33,13 +33,16 @@ consumer probes pass. The consumer records its remotely downloadable fixed pin
 and acceptance evidence in xops-mcp/docs/reuse-baseline.md.
 Production database, version-generation and trust/credential adapters belong
 to the consuming host. Domain and dependency versions must survive restarts.
-Existing `pkg/*` imports are compatibility entry points;
-core packages and tests must never import them or root `internal/*` packages.
+CLI and server consumers import core directly; old Go API facades are removed.
+Core packages and tests must never import application `pkg/*` or root
+`internal/*` packages.
 
 New SSH consumers supply `Environment` and/or `KeySource` / `HostKeyVerifier`.
 Core does not discover personal home directories, agent sockets, default keys,
-or standard streams. The old SSH constructor supplies the CLI defaults and the
-Windows input bridge outside core.
+or standard streams. CLI adapters explicitly inject defaults and the Windows
+input bridge from `internal/sshenv`. `internal/mcphost` converts CLI configuration
+and credentials into core runtime options; commands own runtime construction
+and shutdown.
 
 `ConnectPlan` accepts a scope and a complete ordered hop snapshot containing no
 plaintext secrets. It returns a `PlanConnection` lease; defer its `Close` rather
@@ -52,13 +55,13 @@ From the repository root:
 ```sh
 python3 -m unittest discover -s scripts -p test_check_core.py
 python3 scripts/check_core.py --race
-go test ./internal/corecontract
+go test ./internal/clicontract ./internal/mcphost
 make bench
 make stress
 ```
 
 The bench and stress targets run `core/concurrent/...`, where the benchmark and
-stress implementations live; legacy compatibility packages contain no such tests.
+stress implementations live.
 
 The generated `scripts/mcp/transfer.py` remains a standalone download. Regenerate
 it with `python3 scripts/check_core.py --sync-client` after changing the canonical
@@ -70,12 +73,12 @@ rewrites core import prefixes, removes unused application dependencies, and
 builds/tests without the original module or replacements. Cross-platform import
 inspection is not native execution evidence.
 
-The legacy-facing contract tests stay outside core. MCP schemas, descriptions,
+CLI configuration and protocol contract tests stay outside core. MCP schemas, descriptions,
 and annotations are compared against fixtures verified using the original
 remote module `v0.13.1-0.20260930042335-73892b0791e3`. Updating those fixtures
 requires an explicit compatibility review, not a routine refactor regeneration.
 Comparison ignores JSON formatting, including CRLF checkout line endings;
 description text, schema values and array ordering remain significant.
 
-See the [design](../docs/development/shared-core-decoupling.md) for the remaining
-migration and acceptance criteria.
+See the [design](../docs/development/shared-core-decoupling.md) for application
+boundaries and acceptance criteria.

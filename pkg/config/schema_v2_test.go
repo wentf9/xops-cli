@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wentf9/xops-cli/core/concurrent"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
-	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 )
 
 func TestDetectSchemaVersion(t *testing.T) {

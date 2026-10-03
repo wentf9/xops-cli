@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/internal/credentialfile/format"
 	"github.com/wentf9/xops-cli/internal/kdfhelper"
 	"github.com/wentf9/xops-cli/pkg/credential"
@@ -88,7 +89,7 @@ func TestMaintenanceExpiredAndUnknownRevision(t *testing.T) {
 	}
 	got, err := s.Get(t.Context(), f.ref)
 	got.Zero()
-	if !errors.Is(err, credential.ErrCredentialNotFound) {
+	if !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		t.Fatalf("expired visible: %v", err)
 	}
 	p, err := s.snapshot(t.Context())
@@ -221,7 +222,7 @@ func TestMaintenanceLockCancelsResumeDerivation(t *testing.T) {
 	if err := s.Lock(lockCtx); err != nil {
 		t.Fatal(err)
 	}
-	if err := <-done; !errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if err := <-done; !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("resume cancellation: %v", err)
 	}
 }
@@ -231,7 +232,7 @@ func TestMaintenanceNonInteractiveAndOverlap(t *testing.T) {
 	r := testRuntime(t, nil, nil)
 	material := adminMaterial(t, f)
 	s := runtimeStore(t, r, f, SessionOptions{Mode: "key-file", KeyFile: material.KeyFile, NonInteractive: true})
-	if _, err := s.Rewrap(t.Context(), Wrapping{Mode: "prompt", Password: []byte("public-long-password")}); !errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if _, err := s.Rewrap(t.Context(), Wrapping{Mode: "prompt", Password: []byte("public-long-password")}); !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("noninteractive bypass: %v", err)
 	}
 	path := filepath.Join(f.root, "nested")

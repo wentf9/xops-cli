@@ -6,16 +6,17 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"gopkg.in/yaml.v3"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/internal/credentialfile"
 	"github.com/wentf9/xops-cli/internal/kdfhelper"
 	"github.com/wentf9/xops-cli/pkg/credential"
+	"gopkg.in/yaml.v3"
 )
 
 func TestEncryptedRuntimeRegistry(t *testing.T) {
@@ -136,7 +137,7 @@ func TestEncryptedRuntimeNonInteractivePromptCache(t *testing.T) {
 	ref := credential.Ref{StoreID: "offline", ItemID: "example"}
 	got, err := registry.Resolve(credential.WithoutInteraction(t.Context()), ref)
 	got.Zero()
-	if !errors.Is(err, credential.ErrCredentialStoreLocked) || prompt.calls != 0 {
+	if !errors.Is(err, coreauth.ErrCredentialStoreLocked) || prompt.calls != 0 {
 		t.Fatal("cold noninteractive prompted", err)
 	}
 	secret := credential.NewSecret([]byte("public-value"))
@@ -160,7 +161,7 @@ func TestEncryptedRuntimeNonInteractivePromptCache(t *testing.T) {
 	}
 	got, err = registry.Resolve(credential.WithoutInteraction(t.Context()), ref)
 	got.Zero()
-	if !errors.Is(err, credential.ErrCredentialStoreLocked) || prompt.calls != calls {
+	if !errors.Is(err, coreauth.ErrCredentialStoreLocked) || prompt.calls != calls {
 		t.Fatal("locked session prompted or returned cached data", err)
 	}
 }

@@ -8,12 +8,13 @@ import (
 	"strings"
 
 	"github.com/wentf9/xops-cli/cmd/utils"
+	coreauth "github.com/wentf9/xops-cli/core/auth"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/internal/terminal"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/i18n"
-	"github.com/wentf9/xops-cli/pkg/ssh"
 	"golang.org/x/term"
 )
 
@@ -200,7 +201,7 @@ func (h *cliInteractionHandler) confirmRemember(ctx context.Context, nodeID stri
 // Password supplies only hidden terminal input, sharing the SSH prompt gate.
 func (h *cliInteractionHandler) Password(ctx context.Context, id string) ([]byte, error) {
 	if h == nil || !h.canRemember || credential.InteractionDisabled(ctx) {
-		return nil, credential.ErrCredentialStoreLocked
+		return nil, coreauth.ErrCredentialStoreLocked
 	}
 	release, err := h.acquireGate(ctx)
 	if err != nil {

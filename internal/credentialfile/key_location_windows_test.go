@@ -4,8 +4,9 @@ package credentialfile
 
 import (
 	"errors"
-	"github.com/wentf9/xops-cli/pkg/credential"
 	"testing"
+
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 )
 
 func TestWindowsWrappingKeyCanUseAnotherVolume(t *testing.T) {
@@ -14,7 +15,7 @@ func TestWindowsWrappingKeyCanUseAnotherVolume(t *testing.T) {
 			t.Fatalf("separate key volume rejected: %v", err)
 		}
 	}
-	if err := validateWrappingKeyLocation(`C:\vault`, Wrapping{Mode: "key-file", KeyFile: `C:\vault\CURRENT`}); !errors.Is(err, credential.ErrCredentialAccessDenied) {
+	if err := validateWrappingKeyLocation(`C:\vault`, Wrapping{Mode: "key-file", KeyFile: `C:\vault\CURRENT`}); !errors.Is(err, coreauth.ErrCredentialAccessDenied) {
 		t.Fatal("key inside vault accepted")
 	}
 }

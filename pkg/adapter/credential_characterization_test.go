@@ -4,11 +4,11 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/wentf9/xops-cli/internal/testleak"
+	"github.com/wentf9/xops-cli/core/concurrent"
+	"github.com/wentf9/xops-cli/core/ssh"
+	"github.com/wentf9/xops-cli/core/testutil/testleak"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/models"
-	"github.com/wentf9/xops-cli/pkg/ssh"
-	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 )
 
 func TestCharacterization_SSHAdapter_GetConfig_CarriesPlaintextAndTokens(t *testing.T) {

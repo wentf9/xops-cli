@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -16,7 +17,7 @@ func TestLinuxMissingSecretToolDoesNotFallbackToSelf(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
 	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent/bus")
 	_, err := NewSystemStore("system", SystemStoreConfig{})
-	if !errors.Is(err, credential.ErrCredentialStoreUnavailable) || !strings.Contains(err.Error(), "install libsecret-tools") {
+	if !errors.Is(err, coreauth.ErrCredentialStoreUnavailable) || !strings.Contains(err.Error(), "install libsecret-tools") {
 		t.Fatalf("expected actionable missing dependency error, got %v", err)
 	}
 }
@@ -34,7 +35,7 @@ func TestLinuxMissingSecretToolUsesExternalHelper(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = st.Get(t.Context(), credential.Ref{StoreID: "system", ItemID: "probe"})
-	if !errors.Is(err, credential.ErrCredentialNotFound) {
+	if !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		t.Fatalf("external helper was not used: %v", err)
 	}
 }

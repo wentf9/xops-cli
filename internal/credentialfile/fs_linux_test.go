@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/wentf9/xops-cli/pkg/credential"
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"golang.org/x/sys/unix"
 )
 
@@ -108,7 +108,7 @@ func TestPrivateFileValidation(t *testing.T) {
 			if (err == nil) != tc.valid {
 				t.Fatalf("permission validation: %v", err)
 			}
-			if !tc.valid && !errors.Is(err, credential.ErrCredentialAccessDenied) {
+			if !tc.valid && !errors.Is(err, coreauth.ErrCredentialAccessDenied) {
 				t.Fatal(err)
 			}
 		})

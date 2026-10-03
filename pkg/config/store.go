@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/wentf9/xops-cli/core/concurrent"
 	"github.com/wentf9/xops-cli/pkg/crypto"
 	"github.com/wentf9/xops-cli/pkg/models"
-	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 	"gopkg.in/yaml.v3"
 )
 

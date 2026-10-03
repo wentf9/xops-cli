@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -97,7 +98,7 @@ func TestWindowsNativeSystemStore_Integration(t *testing.T) {
 
 	// 4. Get after Delete
 	_, err = store.Get(ctx, ref)
-	if !errors.Is(err, credential.ErrCredentialNotFound) {
+	if !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		t.Fatalf("expected ErrCredentialNotFound, got: %v", err)
 	}
 }

@@ -5,11 +5,11 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/wentf9/xops-cli/core/concurrent"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/models"
 	"github.com/wentf9/xops-cli/pkg/playbook"
-	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 )
 
 // createTestProvider 创建一个包含测试节点和标签的 ConfigProvider

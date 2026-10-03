@@ -5,11 +5,12 @@ import (
 	"errors"
 	"testing"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
+	"github.com/wentf9/xops-cli/core/concurrent"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
-	"github.com/wentf9/xops-cli/pkg/ssh"
-	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 )
 
 type nonInteractiveProbe struct {
@@ -22,7 +23,7 @@ func (p *nonInteractiveProbe) Resolve(ctx context.Context, _ credential.Ref) (cr
 	if !credential.InteractionDisabled(ctx) {
 		p.t.Error("backend received an interactive request")
 	}
-	return credential.Secret{}, credential.ErrCredentialStoreLocked
+	return credential.Secret{}, coreauth.ErrCredentialStoreLocked
 }
 
 func TestNonInteractiveAdapterPropagatesPolicyForEverySecretKind(t *testing.T) {
@@ -43,7 +44,7 @@ func TestNonInteractiveAdapterPropagatesPolicyForEverySecretKind(t *testing.T) {
 	adp := NewNonInteractiveSSHAdapter(repo, WithCredentialSource(probe))
 	for _, kind := range []ssh.SecretKind{ssh.SecretKindLoginPassword, ssh.SecretKindPrivateKeyPassphrase, ssh.SecretKindSuPassword} {
 		_, err := adp.ResolveSecret(t.Context(), ssh.SecretRequest{NodeID: "node", Kind: kind})
-		if !errors.Is(err, credential.ErrCredentialStoreLocked) {
+		if !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 			t.Fatalf("kind %v lost error classification: %v", kind, err)
 		}
 	}

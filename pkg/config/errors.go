@@ -2,7 +2,6 @@ package config
 
 import (
 	"errors"
-	"github.com/wentf9/xops-cli/core/auth"
 )
 
 var (
@@ -12,8 +11,6 @@ var (
 	ErrHostNotFound = errors.New("host reference not found")
 	// ErrIdentityNotFound 关联的认证身份不存在
 	ErrIdentityNotFound = errors.New("identity reference not found")
-	// ErrProxyCycle 检测到代理跳转环路
-	ErrProxyCycle = auth.ErrProxyCycle
 	// ErrAmbiguousNode means a selector matched more than one node.
 	ErrAmbiguousNode = errors.New("node selector is ambiguous")
 )

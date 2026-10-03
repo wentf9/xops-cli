@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
 	"gopkg.in/yaml.v3"
@@ -1289,7 +1290,7 @@ func (r *Repository) updateNodeCredentialTargetAtVersion(ctx context.Context, ta
 			return nil
 
 		default:
-			return fmt.Errorf("%w: unsupported credential kind %q", credential.ErrInvalidRef, kind)
+			return fmt.Errorf("%w: unsupported credential kind %q", coreauth.ErrInvalidRef, kind)
 		}
 	})
 
@@ -1779,7 +1780,7 @@ func adaptConfigError(err error) error {
 		return nil
 	}
 	if errors.Is(err, ErrConfigConflict) {
-		return fmt.Errorf("%w: %w", credential.ErrConfigConflict, err)
+		return fmt.Errorf("%w: %w", coreauth.ErrConfigConflict, err)
 	}
 	return err
 }

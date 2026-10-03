@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"golang.org/x/crypto/argon2"
 )
@@ -219,7 +220,7 @@ func TestExpectedIdentityAndAuthenticationErrors(t *testing.T) {
 	}
 	_, dek, err := OpenMeta(v["meta_file"], make([]byte, 32), "offline")
 	defer clear(dek)
-	if !errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("wrong key: %v", err)
 	}
 	_, dek, err = OpenMeta(v["meta_file"], v["wrapping_key"], "other")

@@ -7,8 +7,9 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/wentf9/xops-cli/core/concurrent"
+	corepolicy "github.com/wentf9/xops-cli/core/mcp/policy"
 	"github.com/wentf9/xops-cli/pkg/models"
-	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 )
 
 // Provider owns one coherent in-memory configuration snapshot. All reads see
@@ -432,14 +433,14 @@ func cloneHost(host models.Host) models.Host {
 	return host
 }
 
-func cloneGuardrail(cfg *GuardrailConfig) *GuardrailConfig {
+func cloneGuardrail(cfg *corepolicy.Config) *corepolicy.Config {
 	if cfg == nil {
 		return nil
 	}
 	cloned := *cfg
 	cloned.BlockedPatterns = slices.Clone(cfg.BlockedPatterns)
 	cloned.ProtectedPaths = slices.Clone(cfg.ProtectedPaths)
-	cloned.NodeOverrides = make(map[string]NodeGuardrailCfg, len(cfg.NodeOverrides))
+	cloned.NodeOverrides = make(map[string]corepolicy.NodeConfig, len(cfg.NodeOverrides))
 	for key, value := range cfg.NodeOverrides {
 		cloned.NodeOverrides[key] = value
 	}

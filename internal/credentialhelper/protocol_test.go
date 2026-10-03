@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -74,10 +75,10 @@ func TestDecodeResponseErrorCodes(t *testing.T) {
 		code        string
 		expectedErr error
 	}{
-		{"not-found", credential.ErrCredentialNotFound},
-		{"locked", credential.ErrCredentialStoreLocked},
-		{"unavailable", credential.ErrCredentialStoreUnavailable},
-		{"denied", credential.ErrCredentialAccessDenied},
+		{"not-found", coreauth.ErrCredentialNotFound},
+		{"locked", coreauth.ErrCredentialStoreLocked},
+		{"unavailable", coreauth.ErrCredentialStoreUnavailable},
+		{"denied", coreauth.ErrCredentialAccessDenied},
 		{"read-only", credential.ErrCredentialStoreReadOnly},
 	}
 
@@ -145,7 +146,7 @@ func TestUnknownErrorCodeDoesNotExposeKnownSecret(t *testing.T) {
 	if strings.Contains(err.Error(), "p@ssword-secret!") {
 		t.Fatalf("unknown error code leaked into error message: %v", err)
 	}
-	if !errors.Is(err, credential.ErrCredentialStoreUnavailable) {
+	if !errors.Is(err, coreauth.ErrCredentialStoreUnavailable) {
 		t.Fatalf("expected ErrCredentialStoreUnavailable for unknown error code, got: %v", err)
 	}
 }

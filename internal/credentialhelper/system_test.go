@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -60,7 +61,7 @@ func TestCheckSystemAvailability_HeadlessDetection(t *testing.T) {
 	_ = os.Unsetenv("WAYLAND_DISPLAY")
 
 	err := CheckSystemAvailability()
-	if !errors.Is(err, credential.ErrCredentialStoreUnavailable) {
+	if !errors.Is(err, coreauth.ErrCredentialStoreUnavailable) {
 		t.Fatalf("expected ErrCredentialStoreUnavailable in headless env, got: %v", err)
 	}
 
@@ -115,7 +116,7 @@ func TestSystemStoreOperationsWithHelper(t *testing.T) {
 
 	// 4. Get after Delete
 	_, err = store.Get(ctx, ref)
-	if !errors.Is(err, credential.ErrCredentialNotFound) {
+	if !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		t.Fatalf("expected ErrCredentialNotFound after delete, got: %v", err)
 	}
 }
@@ -172,7 +173,7 @@ func TestSystemStoreNativeStoreUnavailableInHeadless(t *testing.T) {
 
 	// 在无桌面环境且未配置外部 command 时，初始化原生 system store 必须报错 ErrCredentialStoreUnavailable
 	_, err := NewSystemStore("system", SystemStoreConfig{})
-	if !errors.Is(err, credential.ErrCredentialStoreUnavailable) {
+	if !errors.Is(err, coreauth.ErrCredentialStoreUnavailable) {
 		t.Fatalf("expected ErrCredentialStoreUnavailable, got: %v", err)
 	}
 }
@@ -210,10 +211,10 @@ func TestSystemStoreLinuxDBusFailureNotReportedAsNotFound(t *testing.T) {
 	}
 
 	_, err = store.Get(context.Background(), credential.Ref{StoreID: "system", ItemID: "k"})
-	if errors.Is(err, credential.ErrCredentialNotFound) {
+	if errors.Is(err, coreauth.ErrCredentialNotFound) {
 		t.Fatalf("expected ErrCredentialStoreUnavailable on DBus failure, but got ErrCredentialNotFound: %v", err)
 	}
-	if !errors.Is(err, credential.ErrCredentialStoreUnavailable) {
+	if !errors.Is(err, coreauth.ErrCredentialStoreUnavailable) {
 		t.Fatalf("expected ErrCredentialStoreUnavailable, got: %v", err)
 	}
 }
@@ -290,12 +291,12 @@ func TestSystemStoreLinuxDeleteStopsWhenUnlockFails(t *testing.T) {
 		stderr   string
 		want     error
 	}{
-		{"nonzero exit", "search", "1", "", credential.ErrCredentialStoreLocked},
-		{"partial unlock", "search", "0", "secret-tool: Cannot get secret of a locked object", credential.ErrCredentialStoreLocked},
-		{"error after metadata", "search", "0", strings.Repeat("attribute.xops-store = system\n", 20) + "secret-tool: Cannot get secret of a locked object", credential.ErrCredentialStoreLocked},
-		{"truncated diagnostics", "search", "0", strings.Repeat("attribute.xops-store = system\n", 160) + "secret-tool: Cannot get secret of a locked object", credential.ErrCredentialStoreUnavailable},
-		{"localized failure", "search", "0", "secret-tool: 无法读取锁定条目", credential.ErrCredentialStoreUnavailable},
-		{"partial clear", "clear", "0", "secret-tool: Cannot delete a locked object", credential.ErrCredentialStoreLocked},
+		{"nonzero exit", "search", "1", "", coreauth.ErrCredentialStoreLocked},
+		{"partial unlock", "search", "0", "secret-tool: Cannot get secret of a locked object", coreauth.ErrCredentialStoreLocked},
+		{"error after metadata", "search", "0", strings.Repeat("attribute.xops-store = system\n", 20) + "secret-tool: Cannot get secret of a locked object", coreauth.ErrCredentialStoreLocked},
+		{"truncated diagnostics", "search", "0", strings.Repeat("attribute.xops-store = system\n", 160) + "secret-tool: Cannot get secret of a locked object", coreauth.ErrCredentialStoreUnavailable},
+		{"localized failure", "search", "0", "secret-tool: 无法读取锁定条目", coreauth.ErrCredentialStoreUnavailable},
+		{"partial clear", "clear", "0", "secret-tool: Cannot delete a locked object", coreauth.ErrCredentialStoreLocked},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Setenv("TEST_SECRET_TOOL_FAIL_ACTION", testCase.action)

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -176,10 +177,10 @@ func TestProcessRunErrorCodesMapping(t *testing.T) {
 		code        string
 		expectedErr error
 	}{
-		{"not-found", credential.ErrCredentialNotFound},
-		{"locked", credential.ErrCredentialStoreLocked},
-		{"unavailable", credential.ErrCredentialStoreUnavailable},
-		{"denied", credential.ErrCredentialAccessDenied},
+		{"not-found", coreauth.ErrCredentialNotFound},
+		{"locked", coreauth.ErrCredentialStoreLocked},
+		{"unavailable", coreauth.ErrCredentialStoreUnavailable},
+		{"denied", coreauth.ErrCredentialAccessDenied},
 		{"read-only", credential.ErrCredentialStoreReadOnly},
 	}
 
@@ -211,7 +212,7 @@ func TestProcessRunTimeoutAndCancel(t *testing.T) {
 
 	// 1. 验证内部 Timeout 触发
 	_, err := Run(context.Background(), opts, ActionGet, req)
-	if !errors.Is(err, credential.ErrCredentialStoreUnavailable) {
+	if !errors.Is(err, coreauth.ErrCredentialStoreUnavailable) {
 		t.Fatalf("expected ErrCredentialStoreUnavailable on timeout, got: %v", err)
 	}
 	if !strings.Contains(err.Error(), "timed out") {
@@ -293,13 +294,13 @@ func TestHelperNonInteractiveContract(t *testing.T) {
 	req := &Request{ProtocolVersion: ProtocolVersion, StoreID: "store", ItemID: "item"}
 	// An undeclared helper must be rejected before even attempting execution.
 	_, err := Run(ctx, ProcessOptions{Command: "does-not-exist"}, ActionGet, req)
-	if !errors.Is(err, credential.ErrCredentialStoreUnavailable) || !strings.Contains(err.Error(), "does not declare") {
+	if !errors.Is(err, coreauth.ErrCredentialStoreUnavailable) || !strings.Contains(err.Error(), "does not declare") {
 		t.Fatalf("untrusted non-interactive helper: %v", err)
 	}
 	opts := fakeHelperOptions("non_interactive")
 	opts.NonInteractive = true
 	_, err = Run(ctx, opts, ActionGet, req)
-	if !errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("helper did not receive nonInteractive: %v", err)
 	}
 	if req.NonInteractive {

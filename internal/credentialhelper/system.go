@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -91,7 +92,7 @@ func (s *SystemStore) Get(ctx context.Context, ref credential.Ref) (credential.S
 		return credential.Secret{}, fmt.Errorf("system store is nil")
 	}
 	if ref.StoreID != s.storeID {
-		return credential.Secret{}, fmt.Errorf("%w: store ID mismatch (store %q vs ref %q)", credential.ErrInvalidRef, s.storeID, ref.StoreID)
+		return credential.Secret{}, fmt.Errorf("%w: store ID mismatch (store %q vs ref %q)", coreauth.ErrInvalidRef, s.storeID, ref.StoreID)
 	}
 	if s.helper != nil {
 		return s.helper.Get(ctx, ref)
@@ -99,7 +100,7 @@ func (s *SystemStore) Get(ctx context.Context, ref credential.Ref) (credential.S
 	if s.native != nil {
 		return s.native.Get(ctx, ref)
 	}
-	return credential.Secret{}, credential.ErrCredentialStoreUnavailable
+	return credential.Secret{}, coreauth.ErrCredentialStoreUnavailable
 }
 
 // Put 向系统密钥库写入凭据。
@@ -111,7 +112,7 @@ func (s *SystemStore) Put(ctx context.Context, ref credential.Ref, secret creden
 		return credential.ErrCredentialStoreReadOnly
 	}
 	if ref.StoreID != s.storeID {
-		return fmt.Errorf("%w: store ID mismatch (store %q vs ref %q)", credential.ErrInvalidRef, s.storeID, ref.StoreID)
+		return fmt.Errorf("%w: store ID mismatch (store %q vs ref %q)", coreauth.ErrInvalidRef, s.storeID, ref.StoreID)
 	}
 	if s.helper != nil {
 		return s.helper.Put(ctx, ref, secret)
@@ -119,7 +120,7 @@ func (s *SystemStore) Put(ctx context.Context, ref credential.Ref, secret creden
 	if s.native != nil {
 		return s.native.Put(ctx, ref, secret)
 	}
-	return credential.ErrCredentialStoreUnavailable
+	return coreauth.ErrCredentialStoreUnavailable
 }
 
 // Delete 从系统密钥库删除凭据。
@@ -131,7 +132,7 @@ func (s *SystemStore) Delete(ctx context.Context, ref credential.Ref) error {
 		return credential.ErrCredentialStoreReadOnly
 	}
 	if ref.StoreID != s.storeID {
-		return fmt.Errorf("%w: store ID mismatch (store %q vs ref %q)", credential.ErrInvalidRef, s.storeID, ref.StoreID)
+		return fmt.Errorf("%w: store ID mismatch (store %q vs ref %q)", coreauth.ErrInvalidRef, s.storeID, ref.StoreID)
 	}
 	if s.helper != nil {
 		return s.helper.Delete(ctx, ref)
@@ -139,7 +140,7 @@ func (s *SystemStore) Delete(ctx context.Context, ref credential.Ref) error {
 	if s.native != nil {
 		return s.native.Delete(ctx, ref)
 	}
-	return credential.ErrCredentialStoreUnavailable
+	return coreauth.ErrCredentialStoreUnavailable
 }
 
 // CheckSystemAvailability 检查当前平台系统密钥库环境是否满足可用性前置要求。

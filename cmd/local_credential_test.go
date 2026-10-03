@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/wentf9/xops-cli/cmd/utils"
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
@@ -51,9 +52,9 @@ func TestLocalSudoFirstSaveFailurePreservesConfiguration(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			want := credential.ErrCredentialStoreLocked
+			want := coreauth.ErrCredentialStoreLocked
 			if code == "unavailable" {
-				want = credential.ErrCredentialStoreUnavailable
+				want = coreauth.ErrCredentialStoreUnavailable
 			}
 			if err := utils.SaveLocalSudoPasswordContext(t.Context(), "rejected-secret"); !errors.Is(err, want) {
 				t.Fatalf("first save returned %v, want %v", err, want)
@@ -111,18 +112,18 @@ func TestLocalSudoV2CredentialLifecycle(t *testing.T) {
 		t.Fatal("local sudo wrote a password into YAML")
 	}
 	t.Setenv("TEST_HELPER_ERROR_CODE", "locked")
-	if err := utils.SaveLocalSudoPasswordContext(t.Context(), "rejected-secret"); !errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if err := utils.SaveLocalSudoPasswordContext(t.Context(), "rejected-secret"); !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("locked write: %v", err)
 	}
 	after, err := os.ReadFile(path)
 	if err != nil || string(after) != string(before) {
 		t.Fatalf("failed write changed configuration: %v", err)
 	}
-	if _, _, err := utils.GetLocalSudoPasswordContext(t.Context()); !errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if _, _, err := utils.GetLocalSudoPasswordContext(t.Context()); !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("locked reference did not fail closed: %v", err)
 	}
 	// The command must propagate backend failure before prompting or executing sudo.
-	if err := executePhase6(t, newCmdSudo(), "true"); !errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if err := executePhase6(t, newCmdSudo(), "true"); !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("sudo swallowed resolver failure: %v", err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())

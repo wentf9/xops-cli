@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/wentf9/xops-cli/internal/credentialfile"
-	"github.com/wentf9/xops-cli/pkg/credential"
 	"os"
 	"os/exec"
 	"runtime"
@@ -15,7 +13,10 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	coreauth "github.com/wentf9/xops-cli/core/auth"
+	"github.com/wentf9/xops-cli/internal/credentialfile"
 	"github.com/wentf9/xops-cli/pkg/config"
+	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
 	"github.com/wentf9/xops-cli/pkg/models"
@@ -301,7 +302,7 @@ func checkDoctorStore(ctx context.Context, storeID string, cfg config.StoreConfi
 	defer cancel()
 	secret, err := st.Get(probeCtx, credential.Ref{StoreID: storeID, ItemID: "doctor-" + credential.GenerateItemID()})
 	clear(secret.Value)
-	if err != nil && !errors.Is(err, credential.ErrCredentialNotFound) {
+	if err != nil && !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		item.Message = err.Error()
 		return item
 	}

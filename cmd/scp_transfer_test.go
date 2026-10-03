@@ -17,9 +17,10 @@ import (
 	"time"
 
 	pkgsftp "github.com/pkg/sftp"
+	xssh "github.com/wentf9/xops-cli/core/ssh"
+	"github.com/wentf9/xops-cli/internal/sshenv"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/models"
-	xssh "github.com/wentf9/xops-cli/pkg/ssh"
 	cryptossh "golang.org/x/crypto/ssh"
 )
 
@@ -100,7 +101,7 @@ func newSCPTransferFixture(t *testing.T) scpTransferFixture {
 	connector := xssh.NewConnector(tunnelTestProvider{cfg: &xssh.ClientConfig{
 		NodeID: "test@" + hostID, Address: "127.0.0.1", Port: port,
 		User: "test", AuthType: "password", Password: "test",
-	}})
+	}}, xssh.WithEnvironment(sshenv.Discover()))
 	connector.AcceptNewHostKey.Store(true)
 	t.Cleanup(func() {
 		if err := connector.CloseAll(); err != nil {

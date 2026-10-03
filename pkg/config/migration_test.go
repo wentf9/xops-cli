@@ -7,7 +7,6 @@ import (
 	"crypto/rand"
 	"encoding/pem"
 	"errors"
-	"gopkg.in/yaml.v3"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -16,9 +15,11 @@ import (
 	"testing"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
 	sshcrypto "golang.org/x/crypto/ssh"
+	"gopkg.in/yaml.v3"
 )
 
 type migrationTestStore struct {
@@ -38,11 +39,11 @@ func (s *migrationTestStore) Get(ctx context.Context, ref credential.Ref) (crede
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.locked {
-		return credential.Secret{}, credential.ErrCredentialStoreLocked
+		return credential.Secret{}, coreauth.ErrCredentialStoreLocked
 	}
 	value, ok := s.values[ref]
 	if !ok {
-		return credential.Secret{}, credential.ErrCredentialNotFound
+		return credential.Secret{}, coreauth.ErrCredentialNotFound
 	}
 	if s.corrupt {
 		return credential.NewSecret([]byte("incorrect")), nil
@@ -57,12 +58,12 @@ func (s *migrationTestStore) Put(ctx context.Context, ref credential.Ref, secret
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.putFailure {
-		return credential.ErrCredentialStoreUnavailable
+		return coreauth.ErrCredentialStoreUnavailable
 	}
 	s.values[ref] = bytes.Clone(secret.Value)
 	s.puts++
 	if s.uncertain {
-		return credential.ErrCredentialStoreUnavailable
+		return coreauth.ErrCredentialStoreUnavailable
 	}
 	return nil
 }

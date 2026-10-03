@@ -3,7 +3,7 @@ package executor
 import (
 	"context"
 
-	"github.com/wentf9/xops-cli/pkg/ssh"
+	"github.com/wentf9/xops-cli/core/ssh"
 )
 
 // Executor 定义命令执行接口

@@ -13,11 +13,12 @@ import (
 	"github.com/spf13/cobra"
 	hostcmd "github.com/wentf9/xops-cli/cmd/host"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	coreauth "github.com/wentf9/xops-cli/core/auth"
+	xssh "github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
-	xssh "github.com/wentf9/xops-cli/pkg/ssh"
 	sshcrypto "golang.org/x/crypto/ssh"
 )
 
@@ -44,7 +45,7 @@ func TestInventoryCombinedEditFailureLeavesConfigurationUnchanged(t *testing.T) 
 				t.Fatal(err)
 			}
 			t.Setenv("TEST_HELPER_ERROR_CODE", "locked")
-			if err := executePhase6WithInput(t, tc.command(), "new-secret\n", tc.args...); !errors.Is(err, credential.ErrCredentialStoreLocked) {
+			if err := executePhase6WithInput(t, tc.command(), "new-secret\n", tc.args...); !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 				t.Fatalf("locked edit: %v", err)
 			}
 			after, err := os.ReadFile(path)
@@ -156,7 +157,7 @@ func TestInventoryUnencryptedKeySwitchUnlinksLockedPassphraseAndRecoversCleanup(
 			t.Setenv("TEST_HELPER_ERROR_CODE", "locked")
 			err = executePhase6(t, tc.command(), append(tc.args, "--key", keyPath)...)
 			var cleanup *credential.CleanupError
-			if !errors.As(err, &cleanup) || !errors.Is(err, credential.ErrCredentialStoreLocked) {
+			if !errors.As(err, &cleanup) || !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 				t.Fatalf("expected applied edit with pending cleanup: %v", err)
 			}
 			cfg, err = store.Load()
@@ -290,7 +291,7 @@ func assertInventoryCleanupRecovery(t *testing.T, cfg *config.Configuration, sto
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := registry.Resolve(t.Context(), oldRef); !errors.Is(err, credential.ErrCredentialNotFound) {
+	if _, err := registry.Resolve(t.Context(), oldRef); !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		t.Fatalf("obsolete credential was not removed: %v", err)
 	}
 }

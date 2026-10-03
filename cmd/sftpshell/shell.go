@@ -17,10 +17,10 @@ import (
 
 	pkgsftp "github.com/pkg/sftp"
 	"github.com/schollz/progressbar/v3"
+	corelog "github.com/wentf9/xops-cli/core/log"
+	"github.com/wentf9/xops-cli/core/sftp"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/i18n"
-	"github.com/wentf9/xops-cli/pkg/logger"
-	"github.com/wentf9/xops-cli/pkg/sftp"
-	"github.com/wentf9/xops-cli/pkg/ssh"
 	"golang.org/x/term"
 )
 
@@ -53,7 +53,7 @@ type Shell struct {
 	stdout          io.Writer
 	stderr          io.Writer
 	askConfirmHook  func(prompt string) bool
-	logger          logger.DebugLogger
+	logger          corelog.DebugLogger
 	noOverwrite     bool
 	batch           bool // Non-terminal command input: stop at the first failure.
 	transferConfig  sftp.TransferConfig
@@ -528,23 +528,23 @@ func closeSFTPClient(cli *sftp.Client) error {
 	return nil
 }
 
-func (s *Shell) getLogger() logger.DebugLogger {
+func (s *Shell) getLogger() corelog.DebugLogger {
 	if s != nil && s.logger != nil {
 		return s.logger
 	}
-	return logger.NopLogger
+	return corelog.NopLogger
 }
 
 // Option configures the interactive SFTP presentation layer.
 type Option func(*Shell)
 
 // WithLogger injects the concurrent-safe debug logger used for secondary UI diagnostics.
-func WithLogger(l logger.DebugLogger) Option {
+func WithLogger(l corelog.DebugLogger) Option {
 	return func(s *Shell) {
 		if l != nil {
 			s.logger = l
 		} else {
-			s.logger = logger.NopLogger
+			s.logger = corelog.NopLogger
 		}
 	}
 }
@@ -591,7 +591,7 @@ func New(ctx context.Context, client *sftp.Client, sshClient *ssh.Client, stdin 
 		stdin:          stdin,
 		stdout:         stdout,
 		stderr:         stderr,
-		logger:         logger.NopLogger,
+		logger:         corelog.NopLogger,
 		transferConfig: client.Config(),
 		state:          shellCreated,
 		batch:          !terminalInput(stdin),

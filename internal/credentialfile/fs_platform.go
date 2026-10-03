@@ -13,9 +13,9 @@ import (
 	"path/filepath"
 	"strings"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/internal/credentialfile/format"
 	unix "github.com/wentf9/xops-cli/internal/vaultsys"
-	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
 type fileID struct {
@@ -79,7 +79,7 @@ func validatePrivate(st unix.Stat_t, dir bool) error {
 		want = unix.S_IFDIR | 0700
 	}
 	if st.Mode != want || st.Uid != uint32(os.Geteuid()) || (!dir && st.Nlink != 1) {
-		return credential.ErrCredentialAccessDenied
+		return coreauth.ErrCredentialAccessDenied
 	}
 	return nil
 }
@@ -156,7 +156,7 @@ func walkDirectory(ctx context.Context, path string) (_ *os.File, err error) {
 			trustedOwner := st.Uid == 0 || st.Uid == uint32(os.Geteuid())
 			protected := st.Mode&0022 == 0 || st.Mode&unix.S_ISVTX != 0
 			if !trustedOwner || !protected {
-				return nil, credential.ErrCredentialAccessDenied
+				return nil, coreauth.ErrCredentialAccessDenied
 			}
 		}
 	}
@@ -188,7 +188,7 @@ func (d *directory) child(name string) (*directory, error) {
 		return nil, err
 	}
 	if !component(name) {
-		return nil, credential.ErrCredentialAccessDenied
+		return nil, coreauth.ErrCredentialAccessDenied
 	}
 	fd, err := unix.Openat(int(d.file.Fd()), name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -204,7 +204,7 @@ func (d *directory) openHandle(name string, flags int) (*os.File, error) {
 		return nil, err
 	}
 	if !component(name) {
-		return nil, credential.ErrCredentialAccessDenied
+		return nil, coreauth.ErrCredentialAccessDenied
 	}
 	fd, err := unix.Openat(int(d.file.Fd()), name, flags|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0600)
 	if err != nil {

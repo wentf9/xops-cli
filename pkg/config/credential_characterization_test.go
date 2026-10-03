@@ -5,10 +5,10 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/wentf9/xops-cli/internal/testleak"
+	"github.com/wentf9/xops-cli/core/concurrent"
+	"github.com/wentf9/xops-cli/core/testutil/testleak"
 	"github.com/wentf9/xops-cli/pkg/crypto"
 	"github.com/wentf9/xops-cli/pkg/models"
-	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 )
 
 func TestCharacterization_StoreSave_EncryptsSecretsOnDisk_PreservesCallerMemory(t *testing.T) {

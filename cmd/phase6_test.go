@@ -11,12 +11,13 @@ import (
 	"github.com/spf13/cobra"
 	hostcmd "github.com/wentf9/xops-cli/cmd/host"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	coreauth "github.com/wentf9/xops-cli/core/auth"
+	"github.com/wentf9/xops-cli/core/concurrent"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
 	"github.com/wentf9/xops-cli/pkg/tui"
-	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 )
 
 func phase6Config(t *testing.T, storeCfg config.StoreConfig) config.Store {
@@ -141,7 +142,7 @@ func TestIdentityCredentialFailurePreservesAuthentication(t *testing.T) {
 	old, _ := before.Identities.Get("admin")
 	t.Setenv("TEST_HELPER_ERROR_CODE", "locked")
 	err = executePhase6WithInput(t, NewCmdIdentity(), "new-secret\n", "edit", "admin", "--key", "replacement-key", "--passphrase-stdin")
-	if !errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("locked write = %v", err)
 	}
 	after, err := store.Load()
@@ -321,7 +322,7 @@ func TestBatchSCPRefusesHelperWithoutNonInteractiveContract(t *testing.T) {
 		}
 	}()
 	_, err = connector.Connect(t.Context(), "node")
-	if !errors.Is(err, credential.ErrCredentialStoreUnavailable) || !strings.Contains(err.Error(), "does not declare") {
+	if !errors.Is(err, coreauth.ErrCredentialStoreUnavailable) || !strings.Contains(err.Error(), "does not declare") {
 		t.Fatalf("batch SCP did not enforce backend policy: %v", err)
 	}
 }

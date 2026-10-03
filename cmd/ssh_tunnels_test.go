@@ -13,7 +13,8 @@ import (
 	"testing"
 	"time"
 
-	xssh "github.com/wentf9/xops-cli/pkg/ssh"
+	xssh "github.com/wentf9/xops-cli/core/ssh"
+	"github.com/wentf9/xops-cli/internal/sshenv"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -95,7 +96,7 @@ func newTunnelTestClient(t *testing.T) (*xssh.Client, net.Conn) {
 	connector := xssh.NewConnector(tunnelTestProvider{&xssh.ClientConfig{
 		NodeID: "test", Address: "127.0.0.1", Port: addr.Port,
 		User: "test", AuthType: "password", Password: "test",
-	}})
+	}}, xssh.WithEnvironment(sshenv.Discover()))
 	connector.AcceptNewHostKey.Store(true)
 	t.Cleanup(func() {
 		if err := connector.CloseAll(); err != nil {

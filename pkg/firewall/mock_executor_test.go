@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/wentf9/xops-cli/pkg/ssh"
+	"github.com/wentf9/xops-cli/core/ssh"
 )
 
 // mockExecutor 记录接收到的命令并返回预设结果

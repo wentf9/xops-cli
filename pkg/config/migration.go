@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -296,7 +297,7 @@ func (m *CredentialMigrator) dryRun(ctx context.Context, opts MigrationOptions) 
 	// not write authorization; actual writes still require read-back checks.
 	secret, err := registry.Resolve(ctx, credential.Ref{StoreID: opts.ToStore, ItemID: "migration-probe-" + credential.GenerateItemID()})
 	defer clear(secret.Value)
-	if err != nil && !errors.Is(err, credential.ErrCredentialNotFound) {
+	if err != nil && !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		return MigrationReport{}, fmt.Errorf("probe destination: %w", err)
 	}
 	return m.report(state, true), nil
@@ -334,7 +335,7 @@ func (m *CredentialMigrator) registryForPlan(cfg *CredentialConfig, state *migra
 		return nil, fmt.Errorf("configure the destination store before migration")
 	}
 	if _, ok := cfg.Stores[state.Store]; !ok {
-		return nil, fmt.Errorf("%w: destination %q", credential.ErrStoreNotFound, state.Store)
+		return nil, fmt.Errorf("%w: destination %q", coreauth.ErrStoreNotFound, state.Store)
 	}
 	return m.migrationRegistry(cfg, "")
 }

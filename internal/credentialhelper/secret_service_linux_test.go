@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/godbus/dbus/v5"
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"go.uber.org/goleak"
 )
@@ -87,12 +88,12 @@ func TestReadServiceSecretWithoutPrompt(t *testing.T) {
 	}{
 		{name: "existing unlocked credential", unlocked: []dbus.ObjectPath{item}},
 		{name: "KDE empty byte session output", unlocked: []dbus.ObjectPath{item}, byteSessionOutput: true},
-		{name: "locked credential", locked: []dbus.ObjectPath{item}, want: credential.ErrCredentialStoreLocked},
-		{name: "missing credential", want: credential.ErrCredentialNotFound},
-		{name: "relocked during read", unlocked: []dbus.ObjectPath{item}, readErr: dbus.Error{Name: "org.freedesktop.Secret.Error.IsLocked"}, want: credential.ErrCredentialStoreLocked},
-		{name: "service failure", unlocked: []dbus.ObjectPath{item}, readErr: dbus.Error{Name: "org.freedesktop.DBus.Error.Failed", Body: []any{"secret-must-not-leak"}}, want: credential.ErrCredentialStoreUnavailable},
-		{name: "cleanup failure", unlocked: []dbus.ObjectPath{item}, closeErr: errors.New("secret-must-not-leak"), want: credential.ErrCredentialStoreUnavailable},
-		{name: "ambiguous credential", unlocked: []dbus.ObjectPath{item, "/items/other"}, want: credential.ErrCredentialStoreUnavailable},
+		{name: "locked credential", locked: []dbus.ObjectPath{item}, want: coreauth.ErrCredentialStoreLocked},
+		{name: "missing credential", want: coreauth.ErrCredentialNotFound},
+		{name: "relocked during read", unlocked: []dbus.ObjectPath{item}, readErr: dbus.Error{Name: "org.freedesktop.Secret.Error.IsLocked"}, want: coreauth.ErrCredentialStoreLocked},
+		{name: "service failure", unlocked: []dbus.ObjectPath{item}, readErr: dbus.Error{Name: "org.freedesktop.DBus.Error.Failed", Body: []any{"secret-must-not-leak"}}, want: coreauth.ErrCredentialStoreUnavailable},
+		{name: "cleanup failure", unlocked: []dbus.ObjectPath{item}, closeErr: errors.New("secret-must-not-leak"), want: coreauth.ErrCredentialStoreUnavailable},
+		{name: "ambiguous credential", unlocked: []dbus.ObjectPath{item, "/items/other"}, want: coreauth.ErrCredentialStoreUnavailable},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -166,10 +167,10 @@ func TestSecretServiceRejectsInvalidValues(t *testing.T) {
 		value serviceSecret
 		want  error
 	}{
-		{"wrong session", serviceSecret{Session: "/sessions/other", Value: []byte("public")}, credential.ErrCredentialStoreUnavailable},
-		{"unexpected encryption parameters", serviceSecret{Session: session, Parameters: []byte{1}, Value: []byte("public")}, credential.ErrCredentialStoreUnavailable},
-		{"oversized value", serviceSecret{Session: session, Value: make([]byte, MaxResponseBytes+1)}, credential.ErrCredentialStoreUnavailable},
-		{"empty value", serviceSecret{Session: session}, credential.ErrCredentialNotFound},
+		{"wrong session", serviceSecret{Session: "/sessions/other", Value: []byte("public")}, coreauth.ErrCredentialStoreUnavailable},
+		{"unexpected encryption parameters", serviceSecret{Session: session, Parameters: []byte{1}, Value: []byte("public")}, coreauth.ErrCredentialStoreUnavailable},
+		{"oversized value", serviceSecret{Session: session, Value: make([]byte, MaxResponseBytes+1)}, coreauth.ErrCredentialStoreUnavailable},
+		{"empty value", serviceSecret{Session: session}, coreauth.ErrCredentialNotFound},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			closed := false
@@ -211,7 +212,7 @@ func TestSecretServiceAvailabilityDiagnostics(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := secretServiceError(t.Context(), "search items", dbus.Error{Name: tc.name, Body: []any{"secret-must-not-leak"}})
-			if !errors.Is(err, credential.ErrCredentialStoreUnavailable) || !strings.Contains(err.Error(), tc.message) {
+			if !errors.Is(err, coreauth.ErrCredentialStoreUnavailable) || !strings.Contains(err.Error(), tc.message) {
 				t.Fatalf("missing actionable diagnosis: %v", err)
 			}
 			if strings.Contains(err.Error(), "secret-must-not-leak") {

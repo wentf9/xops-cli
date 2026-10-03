@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/internal/credentialfile/format"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"gopkg.in/yaml.v3"
@@ -131,7 +132,7 @@ func validateConfiguredRef(ref credential.Ref, stores map[string]StoreConfig) er
 		return err
 	}
 	if stores[ref.StoreID].Type == StoreTypeEncryptedFile && (len(ref.StoreID) > format.MaxIDBytes || len(ref.ItemID) > format.MaxIDBytes) {
-		return fmt.Errorf("%w: encrypted-file reference exceeds limit", credential.ErrInvalidRef)
+		return fmt.Errorf("%w: encrypted-file reference exceeds limit", coreauth.ErrInvalidRef)
 	}
 	return nil
 }

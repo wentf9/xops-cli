@@ -10,10 +10,10 @@ import (
 	"testing"
 
 	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
-	"github.com/wentf9/xops-cli/pkg/ssh"
 )
 
 func unavailablePersistenceFixture(t *testing.T) (*config.Repository, *config.Configuration, string, []byte) {

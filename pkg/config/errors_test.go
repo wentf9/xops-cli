@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 )
 
 func TestSentinelErrors(t *testing.T) {
@@ -22,8 +24,8 @@ func TestSentinelErrors(t *testing.T) {
 		t.Errorf("expected errors.Is to match ErrIdentityNotFound")
 	}
 
-	cycleWrapped := fmt.Errorf("validate jumps: %w", ErrProxyCycle)
-	if !errors.Is(cycleWrapped, ErrProxyCycle) {
-		t.Errorf("expected errors.Is to match ErrProxyCycle")
+	cycleWrapped := fmt.Errorf("validate jumps: %w", coreauth.ErrProxyCycle)
+	if !errors.Is(cycleWrapped, coreauth.ErrProxyCycle) {
+		t.Errorf("expected errors.Is to match coreauth.ErrProxyCycle")
 	}
 }

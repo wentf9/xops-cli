@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -41,7 +42,7 @@ func newNativeSystemStore(storeID string, cfg SystemStoreConfig) (credential.Sto
 			}
 			return NewHelperStore(storeID, opts, cfg.ReadOnly)
 		}
-		return nil, fmt.Errorf("%w: secret-tool executable not found in PATH; install libsecret-tools (Debian/Ubuntu) or provide xops-credential-system", credential.ErrCredentialStoreUnavailable)
+		return nil, fmt.Errorf("%w: secret-tool executable not found in PATH; install libsecret-tools (Debian/Ubuntu) or provide xops-credential-system", coreauth.ErrCredentialStoreUnavailable)
 	}
 
 	return &linuxNativeStore{
@@ -70,25 +71,25 @@ func (s *linuxNativeStore) Get(ctx context.Context, ref credential.Ref) (credent
 		if errors.Is(err, context.Canceled) {
 			return credential.Secret{}, context.Canceled
 		}
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, credential.ErrCredentialStoreUnavailable) || errors.Is(err, credential.ErrCredentialStoreLocked) {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, coreauth.ErrCredentialStoreUnavailable) || errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 			return credential.Secret{}, err
 		}
 		stderrLower := strings.ToLower(stderr)
 		if strings.Contains(stderrLower, "locked") {
-			return credential.Secret{}, fmt.Errorf("%w: %s", credential.ErrCredentialStoreLocked, stderr)
+			return credential.Secret{}, fmt.Errorf("%w: %s", coreauth.ErrCredentialStoreLocked, stderr)
 		}
 		if stderr != "" {
-			return credential.Secret{}, fmt.Errorf("%w: secret-tool lookup failed: %s", credential.ErrCredentialStoreUnavailable, stderr)
+			return credential.Secret{}, fmt.Errorf("%w: secret-tool lookup failed: %s", coreauth.ErrCredentialStoreUnavailable, stderr)
 		}
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
-			return credential.Secret{}, credential.ErrCredentialNotFound
+			return credential.Secret{}, coreauth.ErrCredentialNotFound
 		}
-		return credential.Secret{}, fmt.Errorf("%w: secret-tool lookup failed: %w", credential.ErrCredentialStoreUnavailable, err)
+		return credential.Secret{}, fmt.Errorf("%w: secret-tool lookup failed: %w", coreauth.ErrCredentialStoreUnavailable, err)
 	}
 
 	if len(stdout) == 0 {
-		return credential.Secret{}, credential.ErrCredentialNotFound
+		return credential.Secret{}, coreauth.ErrCredentialNotFound
 	}
 
 	return credential.NewSecret(stdout), nil
@@ -105,14 +106,14 @@ func (s *linuxNativeStore) Put(ctx context.Context, ref credential.Ref, secret c
 		if errors.Is(err, context.Canceled) {
 			return context.Canceled
 		}
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, credential.ErrCredentialStoreUnavailable) || errors.Is(err, credential.ErrCredentialStoreLocked) {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, coreauth.ErrCredentialStoreUnavailable) || errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 			return err
 		}
 		if strings.Contains(strings.ToLower(stderr), "locked") {
-			return fmt.Errorf("%w: %s", credential.ErrCredentialStoreLocked, stderr)
+			return fmt.Errorf("%w: %s", coreauth.ErrCredentialStoreLocked, stderr)
 		}
 		if stderr != "" {
-			return fmt.Errorf("%w: secret-tool store failed: %s", credential.ErrCredentialStoreUnavailable, stderr)
+			return fmt.Errorf("%w: secret-tool store failed: %s", coreauth.ErrCredentialStoreUnavailable, stderr)
 		}
 		return fmt.Errorf("secret-tool store failed: %w", err)
 	}
@@ -132,14 +133,14 @@ func (s *linuxNativeStore) Delete(ctx context.Context, ref credential.Ref) error
 		if errors.Is(err, context.Canceled) {
 			return context.Canceled
 		}
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, credential.ErrCredentialStoreUnavailable) || errors.Is(err, credential.ErrCredentialStoreLocked) {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, coreauth.ErrCredentialStoreUnavailable) || errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 			return err
 		}
 		if strings.Contains(strings.ToLower(stderr), "locked") {
-			return fmt.Errorf("%w: %s", credential.ErrCredentialStoreLocked, stderr)
+			return fmt.Errorf("%w: %s", coreauth.ErrCredentialStoreLocked, stderr)
 		}
 		if stderr != "" {
-			return fmt.Errorf("%w: secret-tool clear failed: %s", credential.ErrCredentialStoreUnavailable, stderr)
+			return fmt.Errorf("%w: secret-tool clear failed: %s", coreauth.ErrCredentialStoreUnavailable, stderr)
 		}
 		return fmt.Errorf("secret-tool clear failed: %w", err)
 	}
@@ -156,16 +157,16 @@ func (s *linuxNativeStore) unlockMatchingItems(ctx context.Context, ref credenti
 	if errors.Is(err, context.Canceled) {
 		return context.Canceled
 	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, credential.ErrCredentialStoreUnavailable) || errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, coreauth.ErrCredentialStoreUnavailable) || errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		return err
 	}
 	if strings.Contains(strings.ToLower(stderr), "locked") {
-		return fmt.Errorf("%w: %s", credential.ErrCredentialStoreLocked, stderr)
+		return fmt.Errorf("%w: %s", coreauth.ErrCredentialStoreLocked, stderr)
 	}
 	if stderr != "" {
-		return fmt.Errorf("%w: secret-tool unlock failed: %s", credential.ErrCredentialStoreUnavailable, stderr)
+		return fmt.Errorf("%w: secret-tool unlock failed: %s", coreauth.ErrCredentialStoreUnavailable, stderr)
 	}
-	return fmt.Errorf("%w: secret-tool unlock failed: %w", credential.ErrCredentialStoreLocked, err)
+	return fmt.Errorf("%w: secret-tool unlock failed: %w", coreauth.ErrCredentialStoreLocked, err)
 }
 
 func secretToolDiagnostics(args []string, stderr string) string {
@@ -185,7 +186,7 @@ func secretToolDiagnostics(args []string, stderr string) string {
 
 func (s *linuxNativeStore) execCmd(ctx context.Context, args []string, stdinData []byte) ([]byte, string, error) {
 	if credential.InteractionDisabled(ctx) {
-		return nil, "", fmt.Errorf("%w: secret-tool cannot guarantee prompt-free access; configure a non-interactive helper", credential.ErrCredentialStoreUnavailable)
+		return nil, "", fmt.Errorf("%w: secret-tool cannot guarantee prompt-free access; configure a non-interactive helper", coreauth.ErrCredentialStoreUnavailable)
 	}
 
 	timeout := s.timeout
@@ -215,12 +216,12 @@ func (s *linuxNativeStore) execCmd(ctx context.Context, args []string, stdinData
 	if err != nil {
 		if execCtx.Err() != nil {
 			if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
-				return nil, "", fmt.Errorf("%w: system helper timed out after %v", credential.ErrCredentialStoreUnavailable, timeout)
+				return nil, "", fmt.Errorf("%w: system helper timed out after %v", coreauth.ErrCredentialStoreUnavailable, timeout)
 			}
 			return nil, "", fmt.Errorf("system helper canceled: %w", execCtx.Err())
 		}
 		if isNotFoundErr(err) {
-			return nil, "", fmt.Errorf("%w: %w", credential.ErrCredentialStoreUnavailable, err)
+			return nil, "", fmt.Errorf("%w: %w", coreauth.ErrCredentialStoreUnavailable, err)
 		}
 		return nil, "", err
 	}
@@ -254,21 +255,21 @@ func (s *linuxNativeStore) execCmd(ctx context.Context, args []string, stdinData
 			return nil, sanitizedStderr, context.Canceled
 		}
 		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
-			return nil, sanitizedStderr, fmt.Errorf("%w: secret-tool timed out after %v", credential.ErrCredentialStoreUnavailable, timeout)
+			return nil, sanitizedStderr, fmt.Errorf("%w: secret-tool timed out after %v", coreauth.ErrCredentialStoreUnavailable, timeout)
 		}
 		return nil, sanitizedStderr, execCtx.Err()
 	}
 
 	// 严格检查 stdout 输出上限
 	if stdoutLimiter.total > MaxResponseBytes {
-		return nil, sanitizedStderr, fmt.Errorf("%w: secret-tool output exceeded maximum limit of %d bytes", credential.ErrCredentialStoreUnavailable, MaxResponseBytes)
+		return nil, sanitizedStderr, fmt.Errorf("%w: secret-tool output exceeded maximum limit of %d bytes", coreauth.ErrCredentialStoreUnavailable, MaxResponseBytes)
 	}
 	if stderrLimiter.total > MaxStderrBytes {
-		return nil, sanitizedStderr, fmt.Errorf("%w: secret-tool diagnostics exceeded maximum limit of %d bytes", credential.ErrCredentialStoreUnavailable, MaxStderrBytes)
+		return nil, sanitizedStderr, fmt.Errorf("%w: secret-tool diagnostics exceeded maximum limit of %d bytes", coreauth.ErrCredentialStoreUnavailable, MaxStderrBytes)
 	}
 
 	if runErr != nil && isNotFoundErr(runErr) {
-		return nil, sanitizedStderr, fmt.Errorf("%w: %w", credential.ErrCredentialStoreUnavailable, runErr)
+		return nil, sanitizedStderr, fmt.Errorf("%w: %w", coreauth.ErrCredentialStoreUnavailable, runErr)
 	}
 
 	if runErr != nil {
@@ -281,7 +282,7 @@ func (s *linuxNativeStore) execCmd(ctx context.Context, args []string, stdinData
 func checkPlatformSystemAvailability() error {
 	// Linux Secret Service 强依赖桌面 D-Bus 会话
 	if os.Getenv("DBUS_SESSION_BUS_ADDRESS") == "" && os.Getenv("DISPLAY") == "" && os.Getenv("WAYLAND_DISPLAY") == "" {
-		return fmt.Errorf("%w: system credential store unavailable in headless environment without D-Bus session", credential.ErrCredentialStoreUnavailable)
+		return fmt.Errorf("%w: system credential store unavailable in headless environment without D-Bus session", coreauth.ErrCredentialStoreUnavailable)
 	}
 	return nil
 }

@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/internal/credentialfile/format"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"go.uber.org/goleak"
@@ -180,7 +181,7 @@ func TestFileStoreNativeRoundTrip(t *testing.T) {
 	if err := s.Delete(t.Context(), f.ref); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Get(t.Context(), f.ref); !errors.Is(err, credential.ErrCredentialNotFound) {
+	if _, err := s.Get(t.Context(), f.ref); !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		t.Fatalf("missing: %v", err)
 	}
 	if n := f.budget(t).Consumed; n != 4 {

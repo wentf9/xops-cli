@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -122,7 +123,7 @@ func (p *PassStore) Get(ctx context.Context, ref credential.Ref) (credential.Sec
 		return credential.Secret{}, fmt.Errorf("pass store is nil")
 	}
 	if ref.StoreID != p.storeID {
-		return credential.Secret{}, fmt.Errorf("%w: store ID mismatch (store %q vs ref %q)", credential.ErrInvalidRef, p.storeID, ref.StoreID)
+		return credential.Secret{}, fmt.Errorf("%w: store ID mismatch (store %q vs ref %q)", coreauth.ErrInvalidRef, p.storeID, ref.StoreID)
 	}
 
 	if p.helper != nil {
@@ -141,7 +142,7 @@ func (p *PassStore) Get(ctx context.Context, ref credential.Ref) (credential.Sec
 
 	// 严禁 TrimRight 去除尾随换行，完整保留原始秘密字节
 	if len(stdout) == 0 {
-		return credential.Secret{}, credential.ErrCredentialNotFound
+		return credential.Secret{}, coreauth.ErrCredentialNotFound
 	}
 
 	sec := credential.NewSecret(stdout)
@@ -157,7 +158,7 @@ func (p *PassStore) Put(ctx context.Context, ref credential.Ref, secret credenti
 		return credential.ErrCredentialStoreReadOnly
 	}
 	if ref.StoreID != p.storeID {
-		return fmt.Errorf("%w: store ID mismatch (store %q vs ref %q)", credential.ErrInvalidRef, p.storeID, ref.StoreID)
+		return fmt.Errorf("%w: store ID mismatch (store %q vs ref %q)", coreauth.ErrInvalidRef, p.storeID, ref.StoreID)
 	}
 
 	if p.helper != nil {
@@ -185,7 +186,7 @@ func (p *PassStore) Delete(ctx context.Context, ref credential.Ref) error {
 		return credential.ErrCredentialStoreReadOnly
 	}
 	if ref.StoreID != p.storeID {
-		return fmt.Errorf("%w: store ID mismatch (store %q vs ref %q)", credential.ErrInvalidRef, p.storeID, ref.StoreID)
+		return fmt.Errorf("%w: store ID mismatch (store %q vs ref %q)", coreauth.ErrInvalidRef, p.storeID, ref.StoreID)
 	}
 
 	if p.helper != nil {
@@ -235,12 +236,12 @@ func (p *PassStore) executePassCmd(ctx context.Context, args []string, stdinData
 	if err != nil {
 		if execCtx.Err() != nil {
 			if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
-				return nil, "", fmt.Errorf("%w: pass command timed out after %v: %w", credential.ErrCredentialStoreUnavailable, timeout, execCtx.Err())
+				return nil, "", fmt.Errorf("%w: pass command timed out after %v: %w", coreauth.ErrCredentialStoreUnavailable, timeout, execCtx.Err())
 			}
 			return nil, "", fmt.Errorf("pass command canceled: %w", execCtx.Err())
 		}
 		if isNotFoundErr(err) {
-			return nil, "", fmt.Errorf("%w: pass executable not found: %s", credential.ErrCredentialStoreUnavailable, p.command)
+			return nil, "", fmt.Errorf("%w: pass executable not found: %s", coreauth.ErrCredentialStoreUnavailable, p.command)
 		}
 		return nil, "", fmt.Errorf("start pass command failed: %w", err)
 	}
@@ -270,18 +271,18 @@ func (p *PassStore) executePassCmd(ctx context.Context, args []string, stdinData
 	if execCtx.Err() != nil {
 		_ = session.KillTree()
 		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
-			return nil, sanitizedStderr, fmt.Errorf("%w: pass command timed out after %v: %w", credential.ErrCredentialStoreUnavailable, timeout, execCtx.Err())
+			return nil, sanitizedStderr, fmt.Errorf("%w: pass command timed out after %v: %w", coreauth.ErrCredentialStoreUnavailable, timeout, execCtx.Err())
 		}
 		return nil, sanitizedStderr, fmt.Errorf("pass command canceled: %w", execCtx.Err())
 	}
 
 	// 严格检查 stdout 输出上限
 	if stdoutLimiter.total > MaxResponseBytes {
-		return nil, sanitizedStderr, fmt.Errorf("%w: pass command output exceeded maximum limit of %d bytes", credential.ErrCredentialStoreUnavailable, MaxResponseBytes)
+		return nil, sanitizedStderr, fmt.Errorf("%w: pass command output exceeded maximum limit of %d bytes", coreauth.ErrCredentialStoreUnavailable, MaxResponseBytes)
 	}
 
 	if runErr != nil && isNotFoundErr(runErr) {
-		return nil, sanitizedStderr, fmt.Errorf("%w: pass executable not found: %s", credential.ErrCredentialStoreUnavailable, p.command)
+		return nil, sanitizedStderr, fmt.Errorf("%w: pass executable not found: %s", coreauth.ErrCredentialStoreUnavailable, p.command)
 	}
 
 	if runErr != nil {
@@ -298,10 +299,10 @@ func mapPassError(action string, err error, stderr string) error {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, credential.ErrCredentialStoreUnavailable) ||
-		errors.Is(err, credential.ErrCredentialStoreLocked) ||
-		errors.Is(err, credential.ErrCredentialNotFound) ||
-		errors.Is(err, credential.ErrCredentialAccessDenied) ||
+	if errors.Is(err, coreauth.ErrCredentialStoreUnavailable) ||
+		errors.Is(err, coreauth.ErrCredentialStoreLocked) ||
+		errors.Is(err, coreauth.ErrCredentialNotFound) ||
+		errors.Is(err, coreauth.ErrCredentialAccessDenied) ||
 		errors.Is(err, credential.ErrCredentialStoreReadOnly) {
 		return err
 	}
@@ -311,13 +312,13 @@ func mapPassError(action string, err error, stderr string) error {
 	combined := stderrLower + " " + errLower
 
 	if strings.Contains(combined, "is not in the password store") || strings.Contains(combined, "not found") {
-		return fmt.Errorf("%w: %w", credential.ErrCredentialNotFound, err)
+		return fmt.Errorf("%w: %w", coreauth.ErrCredentialNotFound, err)
 	}
 	if strings.Contains(combined, "decryption failed") || strings.Contains(combined, "pinentry") || strings.Contains(combined, "inappropriate ioctl for device") {
-		return fmt.Errorf("%w: %w", credential.ErrCredentialStoreLocked, err)
+		return fmt.Errorf("%w: %w", coreauth.ErrCredentialStoreLocked, err)
 	}
 	if strings.Contains(combined, "no secret key") || strings.Contains(combined, "gpg") || isNotFoundErr(err) {
-		return fmt.Errorf("%w: %w", credential.ErrCredentialStoreUnavailable, err)
+		return fmt.Errorf("%w: %w", coreauth.ErrCredentialStoreUnavailable, err)
 	}
 
 	return fmt.Errorf("pass %s failed: %w", action, err)

@@ -6,10 +6,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/wentf9/xops-cli/core/concurrent"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/firewall"
 	"github.com/wentf9/xops-cli/pkg/models"
-	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 )
 
 func createTestConfigStore(t *testing.T) (string, string) {

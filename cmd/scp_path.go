@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/wentf9/xops-cli/pkg/sftp"
+	"github.com/wentf9/xops-cli/core/sftp"
 )
 
 // expandSCPRemotePath uses the SFTP login directory, normally the remote user's

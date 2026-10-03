@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/wentf9/xops-cli/pkg/credential"
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 )
 
 // WrapSuite selects a fixed approved wrapping algorithm and parameter set.
@@ -162,7 +162,7 @@ func OpenMeta(data, wrappingKey []byte, storeID string) (Meta, []byte, error) {
 	}
 	dek, err := a.Open(nil, m.Nonce[:], p, h)
 	if err != nil {
-		return Meta{}, nil, fmt.Errorf("authenticate wrapping: %w", credential.ErrCredentialStoreLocked)
+		return Meta{}, nil, fmt.Errorf("authenticate wrapping: %w", coreauth.ErrCredentialStoreLocked)
 	}
 	if m.StoreID != storeID {
 		clear(dek)

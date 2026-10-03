@@ -12,6 +12,7 @@ import (
 
 	hostcmd "github.com/wentf9/xops-cli/cmd/host"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
@@ -100,7 +101,7 @@ func TestV2ImportFailuresPreserveConfiguration(t *testing.T) {
 			}
 			t.Setenv("TEST_HELPER_ERROR_CODE", "locked")
 			err = hostcmd.ExecuteLoadHostWithOptions(t.Context(), []utils.HostInfo{{Host: host, User: "imported", Password: "csv-secret", Alias: "new-alias"}}, hostcmd.ImportOptions{SkipVerify: true})
-			if !errors.Is(err, credential.ErrCredentialStoreLocked) {
+			if !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 				t.Fatalf("import lost backend error: %v", err)
 			}
 			after, err := os.ReadFile(path)
@@ -115,7 +116,7 @@ func TestImportVerificationResolvesExistingRef(t *testing.T) {
 	setupFirewallCredential(t)
 	t.Setenv("TEST_HELPER_ERROR_CODE", "locked")
 	err := hostcmd.ExecuteLoadHostContext(t.Context(), []utils.HostInfo{{Host: "127.0.0.1", User: "admin"}})
-	if !errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("verification omitted resolver: %v", err)
 	}
 }

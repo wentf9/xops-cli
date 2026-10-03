@@ -9,9 +9,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wentf9/xops-cli/core/concurrent"
+	corepolicy "github.com/wentf9/xops-cli/core/mcp/policy"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
-	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 	"gopkg.in/yaml.v3"
 )
 
@@ -176,7 +177,7 @@ type ConfigurationV2 struct {
 	Identities            map[string]IdentityV2  `yaml:"identities"`
 	Hosts                 map[string]models.Host `yaml:"hosts"`
 	Nodes                 map[string]NodeV2      `yaml:"nodes"`
-	Guardrail             *GuardrailConfig       `yaml:"guardrail,omitempty"`
+	Guardrail             *corepolicy.Config     `yaml:"guardrail,omitempty"`
 	MCP                   *MCPConfig             `yaml:"mcp,omitempty"`
 	PasswordPromptPattern string                 `yaml:"password_prompt_pattern,omitempty"`
 }

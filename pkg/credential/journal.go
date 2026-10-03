@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 )
 
 // OperationType 定义凭据事务操作类型。
@@ -345,7 +347,7 @@ func (s *JournalStore) readEntryLocked(id string) (*JournalEntry, error) {
 	data, err := os.ReadFile(p)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("%w: journal entry %q not found", ErrCredentialNotFound, id)
+			return nil, fmt.Errorf("%w: journal entry %q not found", coreauth.ErrCredentialNotFound, id)
 		}
 		return nil, fmt.Errorf("read journal entry %q: %w", id, err)
 	}

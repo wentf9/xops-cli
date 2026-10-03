@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -42,7 +43,7 @@ func TestHelperStoreGetPutDelete(t *testing.T) {
 
 	// 0. 未存储时 Get 应该返回 ErrCredentialNotFound
 	_, err = store.Get(ctx, ref)
-	if !errors.Is(err, credential.ErrCredentialNotFound) {
+	if !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		t.Fatalf("expected ErrCredentialNotFound before put, got: %v", err)
 	}
 
@@ -68,13 +69,13 @@ func TestHelperStoreGetPutDelete(t *testing.T) {
 
 	// 4. Delete 后再次 Get 应该返回 ErrCredentialNotFound
 	_, err = store.Get(ctx, ref)
-	if !errors.Is(err, credential.ErrCredentialNotFound) {
+	if !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		t.Fatalf("expected ErrCredentialNotFound after delete, got: %v", err)
 	}
 
 	// 5. Mismatched Ref StoreID
 	badRef := credential.Ref{StoreID: "other-store", ItemID: "my-pwd"}
-	if _, err := store.Get(ctx, badRef); !errors.Is(err, credential.ErrInvalidRef) {
+	if _, err := store.Get(ctx, badRef); !errors.Is(err, coreauth.ErrInvalidRef) {
 		t.Fatalf("expected ErrInvalidRef on store ID mismatch, got: %v", err)
 	}
 }

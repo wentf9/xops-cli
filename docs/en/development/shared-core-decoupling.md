@@ -1,8 +1,8 @@
 # Shared core and MCP interface decoupling
 
-Status: implementation in progress. D1 leaves and the D2 SSH/SFTP implementation have moved into core with legacy facades. Explicit Environment, KeySource/KeyLease, HostKeyVerifier, InputBridge, and ConnectPlan/PlanConnection/RetirePlan are available. D3 guardrails, transfer/tunnel state machines, streamed-file adapter, ports, and sshexec execution adapter are implemented. The runtime implementation now lives in core/mcp/runtime; pkg/mcpserver retains only configuration, credential, and OpenSSH compatibility adapters. D4 publication coordination, atomic admission, persistence-outcome barriers, affected-pool retirement and noncommitting revocation are implemented. D5 private bindings, v1/v2 journals and retained-transport commit handoff are implemented. D6 provides extraction and consumer acceptance checks; xops-mcp records its fixed version and remote-download evidence in docs/reuse-baseline.md. Baseline: `73892b0791e3222bbd08abee1f21ed067b1c41c8`. The [xops-mcp](https://github.com/wentf9/xops-mcp) consumer records its integration obligations in `docs/en/interface-decoupling.md`.
+Status: shared-core decoupling and direct CLI consumption are implemented. D1 leaves and the D2 SSH/SFTP implementation live in core; old Go API facades have been removed. Explicit Environment, KeySource/KeyLease, HostKeyVerifier, InputBridge, and ConnectPlan/PlanConnection/RetirePlan are available. D3 guardrails, transfer/tunnel state machines, streamed-file adapter, ports, and sshexec execution adapter are implemented. The runtime implementation now lives in core/mcp/runtime; internal/mcphost owns CLI configuration, credential, and OpenSSH adapters; internal/sshenv owns local SSH discovery and the Windows input bridge. D4 publication coordination, atomic admission, persistence-outcome barriers, affected-pool retirement and noncommitting revocation are implemented. D5 private bindings, v1/v2 journals and retained-transport commit handoff are implemented. D6 provides extraction and consumer acceptance checks; xops-mcp records its fixed version and remote-download evidence in docs/reuse-baseline.md. Baseline: `73892b0791e3222bbd08abee1f21ed067b1c41c8`. The [xops-mcp](https://github.com/wentf9/xops-mcp) consumer records its integration obligations in `docs/en/interface-decoupling.md`.
 
-Current checks: `go test ./internal/corecontract` verifies legacy types/errors/serialization and MCP schemas; `python3 scripts/check_core.py --race` checks platform dependency graphs and an isolated build of the migrated subtree. Schema fixtures were compared with the original remote module. Migrated core passed isolated Linux race tests. Native Windows amd64 non-race checks cover SSH/SFTP, ports, state, transfer, sshexec and selected runtime file-task tests. Windows/macOS dependency checks and test binaries cross-build successfully. Native macOS and Windows race are not established by this validation. Concrete vault integration stays in pkg/ssh through public APIs; pure SSH and native sudo tests moved with the implementation to core/ssh. Local integration does not replace published consumer-version acceptance.
+Current checks: `go test ./internal/clicontract` verifies CLI configuration serialization and MCP schemas; `python3 scripts/check_core.py --race` checks platform dependency graphs and an isolated build of the migrated subtree. Schema fixtures were compared with the original remote module. Migrated core passed isolated Linux race tests. Native Windows amd64 non-race checks cover SSH/SFTP, ports, state, transfer, sshexec and selected runtime file-task tests. Windows/macOS dependency checks and test binaries cross-build successfully. Native macOS and Windows race are not established by this validation. Concrete vault integration stays in pkg/adapter through public APIs; pure SSH and native sudo tests moved with the implementation to core/ssh. Local integration does not replace published consumer-version acceptance.
 
 ConnectPlan returns an explicit lease: Close releases a reference without closing transports still leased elsewhere. RetirePlan only invalidates the cache; it does not replace the future ExecutionGate. Plans capture the entire ordered chain and source versions and never re-read the parent connector's mutable provider during execution.
 
@@ -12,19 +12,19 @@ The 2026-10-02 decoupling regression fixes pass Linux regression/race checks and
 
 Shared code must be extractable into an independently maintained Go module. This includes removing reverse dependencies on CLI configuration, business models, concrete credential stores, terminal UI, personal directories, and global output; database injection alone is insufficient.
 
-Consolidate the shared implementation under a planned `core/` subtree, using the existing root module and Go 1.26+. Do not create a third repository or nested module yet. Prove isolation through an extraction check. A future extraction should move that subtree, fixtures, and module metadata, update import paths and compatibility facades, and preserve the application contracts.
+Consolidate the shared implementation under a planned `core/` subtree, using the existing root module and Go 1.26+. Do not create a third repository or nested module yet. Prove isolation through an extraction check. A future extraction should move that subtree, fixtures, and module metadata, update import paths and application adapters, and preserve the application contracts.
 
 The first consumer remains xops-mcp. Web and SQLite/PostgreSQL implementations belong there. Preserve CLI/TUI, stdio and HTTP MCP, SSH/SFTP, and native Windows input behavior. HTTP tunnels, SOCKS, multi-tenancy, and distributed operation are outside this refactor.
 
-## 2. Observed dependencies
+## 2. Dependency baseline before decoupling
 
 | Location | Coupling | Resolution |
 | --- | --- | --- |
-| MCP server construction | ConfigProvider, full snapshots, adapter, connector construction | Small ports plus a legacy composition facade |
+| MCP server construction | ConfigProvider, full snapshots, adapter, connector construction | Small ports plus internal/mcphost composition |
 | Guardrail/policy | Configuration-owned types and personal audit path defaults | Neutral policy values and explicit audit injection |
 | Inventory tools | Separate node/host/identity reads | One coherent display or operation snapshot |
 | Transfer tools/HTTP | NodeID/TargetID persisted, connection resolved again later | Distinct resource, generation, and authorization identities |
-| SSH errors/recovery | Imports config and credential error definitions | Neutral errors with old names re-exported |
+| SSH errors/recovery | Imports config and credential error definitions | Direct use of neutral core/auth errors |
 | SSH connector/authentication | Implicit home, known_hosts, key paths, agent environment | Host-provided explicit sources |
 | SSH interactive input | Standard streams and root terminal internals | Explicit I/O and cancellable input bridge |
 | Logger | Interfaces share a package with global colored output | Interface/Nop isolated from CLI output |
@@ -58,21 +58,21 @@ core/sftp -> core/ssh -> core/auth + core/log + core/concurrent
 
 Production code, tests, fixtures, and generated code under core must not import root `cmd/**`, `pkg/**`, `internal/**`, or xops-mcp. Dependencies are limited to the standard library, the subtree itself, and explicitly listed third-party protocol libraries. Public APIs must not expose CLI configuration/models, credential registries, SQL/ORM types, or flag definitions.
 
-Core implementation helpers may live under `core/internal`, but compatibility packages outside that subtree cannot import them. Containers requiring old public aliases therefore belong in a public core package.
+Core implementation helpers may live under `core/internal`; application adapters cannot cross that Go internal boundary. Consumers import shared containers directly from `core/concurrent`.
 
-## 4. Compatibility and one implementation
+## 4. Direct CLI consumption and one implementation
 
-Move the implementation into core; keep `pkg/ssh`, `pkg/sftp`, `pkg/logger`, and `pkg/mcpserver` as thin compatibility facades.
+CLI, TUI, playbooks, and application adapters directly import `core/ssh`, `core/sftp`, `core/concurrent`, `core/auth`, `core/log`, and `core/mcp/*`. `pkg/ssh`, `pkg/sftp`, `pkg/utils/concurrent`, and `pkg/mcpserver` including its subpackages are removed. Old Go import paths, aliases, error re-exports, and constructor compatibility are no longer maintained.
 
-- Use aliases where fields, serialization tags, and method sets remain compatible. Wrap constructors that provide CLI defaults.
-- Preserve the existing MCP constructors/options, Serve, HTTPOptionsFromConfig, recovery entry point, Runtime methods, and public input/output types.
-- Move private implementation tests with the implementation. Keep external compatibility tests in the old packages.
-- Alias existing guardrail configuration types to compatible neutral policy value types. Retain AuditLog for legacy serialization, but do not use it to select implicit paths in the new core entry point.
-- Re-export moved error sentinels and verify existing `errors.Is`/`errors.As` behavior rather than comparing strings.
-- Legacy interactive methods use constructor-injected I/O; old entry points supply standard streams. Core without an interactive capability returns an explicit interaction-required error.
-- Preserve startup snapshot semantics for the old HTTP entry point. Dynamic inventory is enabled through the new server entry point, not silently applied to existing CLI deployments.
+- `internal/sshenv.Discover` selects home paths, known_hosts, default keys, SSH agent, standard streams, and the platform input bridge. CLI adapters and TUI explicitly inject this environment into `core/ssh.Connector`; caller options can still override defaults.
+- `internal/mcphost.Config.RuntimeOptions` converts CLI configuration, credentials, audit paths, and transport settings into core options. Commands directly call `core/mcp/runtime.NewRuntime`, `Run`, `ServeHTTP`, and `RecoverTransfers`, and own cleanup.
+- stdio resolves configuration per invocation; HTTP and recovery preserve startup snapshots. Configured tool deadlines and the HTTP default deny policy remain effective.
+- `pkg/config.Configuration.Guardrail` directly uses `core/mcp/policy.Config`. YAML fields and persistence formats are unchanged; the CLI host expands AuditLog paths.
+- Consumers use shared errors directly from `core/auth`, preserving `errors.Is`/`errors.As` semantics without matching error strings.
+- `pkg/logger` retains CLI output and `DefaultLogger`; the diagnostic interface and Nop come directly from `core/log`. Configuration, concrete vaults, and TUI remain application responsibilities.
+- Protocol and core behavior tests follow their implementations. CLI configuration, credentials, OpenSSH, and terminal behavior stay in application tests. `internal/clicontract` retains YAML serialization and HTTP/stdio schema baselines; old Go API compilation-only checks are removed.
 
-New server production code imports core directly, so legacy configuration dependencies remain outside its compilation graph.
+New servers import only `core/*`. All consumer production and test graphs exclude upstream application packages.
 
 ## 5. Four runtime dependency roles
 
@@ -161,7 +161,7 @@ Runtime provides Shutdown(ctx) and Close with a configured bounded shutdown budg
 3. Add KeySource/KeyLease for parsed signers. Database adapters decrypt and parse keys; file adapters take explicit paths. Avoid temporary private keys in personal directories. Release material on failures/cancellation without claiming deterministic erasure of all Go signer memory.
 4. Add HostKeyVerifier using node, canonical endpoint, trust version, actual remote address, and public key. Core neither reads personal known_hosts nor accepts unknown hosts by default. Custom HostKeyVerifier calls use a deadline-bound child of the handshake coordinator context, so handshake timeout also cancels context-aware database/network verification.
 5. Hosts discover home, SSH_AUTH_SOCK, and standard streams. Explicit file/agent adapters may remain public.
-6. Move relevant error contracts and logger interfaces down, preserving facade names and matching behavior.
+6. Move relevant error contracts and logger interfaces down, using core contracts directly and preserving error matching.
 7. Keep remote PTY and privilege mechanics in core; inject a local cancellable InputBridge. Existing Windows duplicate-handle/VT/pipe handling stays in a CLI adapter initially, with native regressions. Do not replace it with uninterruptible stdin copying. Sudo/su command input and interactive privilege handoff also carry the operation context and injected InputBridge; cancellation joins input copying without closing borrowed stdin.
 
 Proposed authentication/input signatures use cryptoSSH for `golang.org/x/crypto/ssh`; request values carry target/version binding:
@@ -238,9 +238,9 @@ Gate orders versions and revocation; the transfer manager remains the sole autho
 
 | Step | Upstream work | Acceptance |
 | --- | --- | --- |
-| D1 | Export/schema baseline; neutral logging, containers, policy/errors, aliases | Dependency boundaries remain visible |
+| D1 | Export/schema baseline; neutral logging, containers, policy/errors; direct core imports | Dependency boundaries remain visible |
 | D2 | Move SSH/SFTP; explicit auth/trust/environment/input; bound plans | External adapters, real SSH/jumps/privilege/SFTP and native regressions |
-| D3 | Move MCP implementation and inject four roles; legacy facade | Equivalent tool contracts, construction rollback and shutdown |
+| D3 | Move MCP implementation and inject four roles; CLI host composition | Equivalent tool contracts, construction rollback and shutdown |
 | D4 | Admission, generations, approval binding, update barrier | Deterministic concurrency tests for identities/jumps/revocation |
 | D5 | Deferred operations and journal dual-version reading | Old fixtures, unknown protection, commit/revocation ordering |
 | D6 | Standalone fixtures and extraction check | Consumer uses core with pinned remote module version |
@@ -252,11 +252,11 @@ Keep every step buildable. D3 may initially use static legacy adapters; do not a
 1. Check production/test dependency graphs for Linux, Windows, macOS and relevant build tags; forbid same-module imports outside core.
 2. Inspect implicit home/environment discovery, global printing, standard streams, and file writes. Explicit file/stdio transports remain allowed when their resources are host-supplied.
 3. Copy only core, fixtures, and license into a temporary module. Rewrite internal core import prefixes and run tidy/build/test. Forbid replacements back to the checkout and any dependency on the original module; inspect the resulting package and module graph.
-4. Core unit/race/real SSH/SFTP fixtures run independently. CLI-dependent compatibility tests remain in the application repository.
+4. Core unit/race/real SSH/SFTP fixtures run independently. CLI-dependent integration tests remain in the application repository.
 5. Preserve upstream build/test/lint, transport contracts, and relevant native platform gates. Cross-compilation is separate evidence.
-6. Split xops-mcp checks into core-consumer and separate legacy compatibility probes. Legacy config imports must not contaminate the production/core graph. Validate remotely available pins, not only local workspaces.
+6. Keep only core consumer probes in xops-mcp. Forbid upstream packages outside core in every production/test graph on Linux, Windows, and macOS. Validate remotely available pins, not only local workspaces.
 
-Extraction proves source closure, not ABI, database, high-availability, or native support on every platform. Later externalization updates facade/adapter dependencies; avoid exposing duplicate named types from old and new module paths, using a coordinated version upgrade where required.
+Extraction proves source closure, not ABI, database, high-availability, or native support on every platform. Later externalization updates CLI/server adapter dependencies; avoid exposing duplicate named types from old and new module paths, using a coordinated version upgrade where required.
 
 ## 12. Current runtime integration and remaining work
 
@@ -284,7 +284,7 @@ Retirement covers admission that preceded an edit but has not connected yet. Suc
 
 Barrier-based tests and real MCP/SSH tests cover edits after approval, preserved admitted targets, unknown persistence, publication failure after commit, shared-jump rotation, revocation versus reserved commits, retirement outside the lock, display edits, identity/alias constraints and capacity release. Transfer preparation and tunnel creation now read invocation policy and re-enter admission after approval. Persisted ready-task validation also applies at claim/commit/recovery.
 
-Legacy CLI tunnels now execute through TunnelBackend. Enter freezes the provider once for both binding validation and the private provider retained in the permit context. The backend creates a dedicated connector from that view; it neither retains a startup runner snapshot nor rereads a mutable Repository before dialing. New requests observe published edits, while ordinary edits after admission do not redirect admitted requests. Credential sources remain adapter-private and never enter public OperationSnapshot values.
+CLI host tunnels execute through TunnelBackend. Enter freezes the provider once for both binding validation and the private provider retained in the permit context. The backend creates a dedicated connector from that view; it neither retains a startup runner snapshot nor rereads a mutable Repository before dialing. New requests observe published edits, while ordinary edits after admission do not redirect admitted requests. Credential sources remain adapter-private and never enter public OperationSnapshot values.
 
 The full tunnel-list pipeline shares the caller context and tool deadline. Retained canonical node IDs remain recognizable after disablement/deletion; other aliases use current inventory resolution. The result snapshot is captured before approval and authorized using current metadata policy. Historical identity recognition grants no execution authority.
 
@@ -307,14 +307,16 @@ Cleanup and remote verification require Recovery admission of the recorded bindi
 
 DomainID and dependency versions must survive restarts within a deployment. Display-only changes do not affect execution digests. A random per-process domain cannot represent deployment identity. Host versions must cover actual credential material and trust changes.
 
-The legacy CLI adapter derives a stable credential-dependency digest over the complete hop chain: identity references, login/passphrase/privilege references, key fingerprints, legacy password fields, and referenced store configurations. Read-only Provider snapshots participate through Target.Version even without UpdateRef. This digest is not a credential-write CAS token and contains no plaintext secrets. Unrelated stores, aliases and tags are excluded. Credential ItemIDs remain immutable by the store contract; rotation must produce a new reference.
+The CLI host adapter derives a stable credential-dependency digest over the complete hop chain: identity references, login/passphrase/privilege references, key fingerprints, legacy password fields, and referenced store configurations. Read-only Provider snapshots participate through Target.Version even without UpdateRef. This digest is not a credential-write CAS token and contains no plaintext secrets. Unrelated stores, aliases and tags are excluded. Credential ItemIDs remain immutable by the store contract; rotation must produce a new reference.
 
 ## 15. Consumer and publication acceptance
 
-xops-mcp keeps core consumer tests in internal/coreconsumer and legacy facade probes in internal/legacycompat, both using the same fixed remote version from go.mod. Normal Go tests run both contracts; the core dependency graph is checked separately so legacy application imports cannot contaminate the result. scripts/check_core_consumer.py --upstream creates a disposable local replacement and runs three-platform dependency checks, build, race and lint. Neither repository receives a replacement. The probe covers HTTP authentication, tool inventory, command execution, file roundtrips, dynamic disablement and cleanup.
+xops-mcp keeps core consumer tests in internal/coreconsumer and removes internal/legacycompat. internal/dependencycheck verifies the remote pin and all production/test dependencies on three platforms; upstream imports must stay under core. scripts/check_core_consumer.py --upstream creates a disposable local replacement and runs three-platform dependency checks, build, race and lint. Neither repository receives a replacement. The probe covers HTTP authentication, tool inventory, command execution, file roundtrips, dynamic disablement and cleanup.
 
 After the upstream commit is available on a remote branch, --version validates the exact downloadable module version without replacement before updating consumer go.mod/go.sum. A canonical pseudo-version pins that commit without requiring a release tag. Consumer CI validates its committed pin; local integration does not replace remote-download acceptance.
 
 
 
-Concurrent-container performance and stress checks use `make bench` and `make stress`, targeting `core/concurrent/...`. The legacy `pkg/utils/concurrent` facade is not a benchmark or stress-test entry point.
+Concurrent-container performance and stress checks use `make bench` and `make stress`, targeting `core/concurrent/...`. The `pkg/utils/concurrent` facade is no longer provided.
+
+Direct CLI consumption also covers stdio inventory publication, HTTP/recovery startup snapshots, audit paths, concrete vault recovery, and the Windows input bridge. Historical native-platform results are not native execution evidence for this migration.

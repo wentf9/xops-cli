@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
 )
@@ -29,10 +30,10 @@ func (r *Repository) NodeCredentialCreate(nodeID string, node models.Node, host 
 
 func (u *credentialCreateUpdater) ApplyCredentialRefAtVersion(ctx context.Context, target credential.Target, expectedVersion string, newRef *credential.Ref) (credential.MutationOutcome, string, error) {
 	if u.nodeID == "" || target.NodeID != u.nodeID || target.IdentityID != "" || expectedVersion != "" {
-		return credential.MutationOutcome{}, "", fmt.Errorf("%w: credential target does not match node creation", credential.ErrConfigConflict)
+		return credential.MutationOutcome{}, "", fmt.Errorf("%w: credential target does not match node creation", coreauth.ErrConfigConflict)
 	}
 	if (target.Kind != credential.KindLoginPassword && target.Kind != credential.KindPassphrase) || newRef == nil || newRef.IsEmpty() {
-		return credential.MutationOutcome{}, "", fmt.Errorf("%w: node creation requires an authentication credential reference", credential.ErrInvalidRef)
+		return credential.MutationOutcome{}, "", fmt.Errorf("%w: node creation requires an authentication credential reference", coreauth.ErrInvalidRef)
 	}
 	if err := newRef.Validate(); err != nil {
 		return credential.MutationOutcome{}, "", err

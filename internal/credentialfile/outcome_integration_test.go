@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -52,7 +53,7 @@ func TestCommittedOutcomeSurvivesCancellation(t *testing.T) {
 			got, getErr := plain.Get(t.Context(), f.ref)
 			got.Zero()
 			if mode == "delete" {
-				if !errors.Is(getErr, credential.ErrCredentialNotFound) {
+				if !errors.Is(getErr, coreauth.ErrCredentialNotFound) {
 					t.Fatal(getErr)
 				}
 			} else if getErr != nil {

@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 )
 
 func TestCacheBasicAndExpiry(t *testing.T) {
@@ -165,7 +167,7 @@ func TestCachedSourceAndStore(t *testing.T) {
 				getCalls++
 				sec, ok := backendData[r.String()]
 				if !ok {
-					return Secret{}, ErrCredentialNotFound
+					return Secret{}, coreauth.ErrCredentialNotFound
 				}
 				return sec.Clone(), nil
 			},
@@ -244,8 +246,8 @@ func TestCachedSourceAndStore(t *testing.T) {
 	}
 
 	_, err = cachedStore.Get(ctx, ref)
-	if !errors.Is(err, ErrCredentialNotFound) {
-		t.Fatalf("expected ErrCredentialNotFound after delete, got %v", err)
+	if !errors.Is(err, coreauth.ErrCredentialNotFound) {
+		t.Fatalf("expected coreauth.ErrCredentialNotFound after delete, got %v", err)
 	}
 }
 
@@ -286,7 +288,7 @@ func TestWriteReadbackMustReachBackend(t *testing.T) {
 	backend := &dummyStore{
 		dummySource: dummySource{
 			getFn: func(_ context.Context, _ Ref) (Secret, error) {
-				return Secret{}, ErrCredentialNotFound
+				return Secret{}, coreauth.ErrCredentialNotFound
 			},
 		},
 		putFn: func(_ context.Context, _ Ref, _ Secret) error {
@@ -300,7 +302,7 @@ func TestWriteReadbackMustReachBackend(t *testing.T) {
 	}
 	got, err := cs.Get(ctx, ref)
 	defer got.Zero()
-	if !errors.Is(err, ErrCredentialNotFound) {
+	if !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		t.Fatalf("readback hid missing backend item: err=%v", err)
 	}
 }
@@ -448,7 +450,7 @@ func (s *failedPutStoreForTest) Put(ctx context.Context, _ Ref, _ Secret) error 
 	close(s.started)
 	select {
 	case <-s.release:
-		return ErrCredentialStoreUnavailable
+		return coreauth.ErrCredentialStoreUnavailable
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -481,7 +483,7 @@ func TestFailedPutStillInvalidatesConcurrentRead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !errors.Is(putErr, ErrCredentialStoreUnavailable) {
+	if !errors.Is(putErr, coreauth.ErrCredentialStoreUnavailable) {
 		t.Fatal(putErr)
 	}
 	sec, found := c.Get(ref)
@@ -498,7 +500,7 @@ func TestFetchQueueContinuousSuccessAndFailure(t *testing.T) {
 	csFail := NewCachedSource(&dummyStore{
 		dummySource: dummySource{
 			getFn: func(context.Context, Ref) (Secret, error) {
-				return Secret{}, ErrCredentialNotFound
+				return Secret{}, coreauth.ErrCredentialNotFound
 			},
 		},
 	}, cFail)

@@ -11,15 +11,16 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	mcpruntime "github.com/wentf9/xops-cli/core/mcp/runtime"
+	"github.com/wentf9/xops-cli/internal/mcphost"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
-	"github.com/wentf9/xops-cli/pkg/mcpserver"
 )
 
 func newCmdMCPRecover() *cobra.Command {
-	options := mcpserver.RecoveryOptions{MaxRecords: 4096}
+	options := mcpruntime.RecoveryOptions{MaxRecords: 4096}
 	cmd := &cobra.Command{Use: "recover", Short: i18n.T("mcp_recover_short"), Long: i18n.T("mcp_recover_long"), Args: cobra.NoArgs}
 	cmd.Flags().StringVar(&options.TransferID, "id", "", i18n.T("mcp_recover_id_flag"))
 	cmd.Flags().BoolVar(&options.Verify, "verify", false, i18n.T("mcp_recover_verify_flag"))
@@ -53,7 +54,7 @@ func newCmdMCPRecover() *cobra.Command {
 			}
 		}
 		provider := config.ConfigProvider(config.NewProviderWithoutOpenSSH(&config.Configuration{Guardrail: policy}))
-		serveOpts := []mcpserver.Option{mcpserver.WithLogger(logger.DefaultLogger())}
+		host := mcphost.Config{Logger: logger.DefaultLogger(), Recovery: true}
 		if options.Verify || options.Cleanup {
 			cfg, err := config.ReadOnlyConfiguration(path, keyPath)
 			if err != nil {
@@ -68,11 +69,18 @@ func newCmdMCPRecover() *cobra.Command {
 				return err
 			}
 			if registry != nil {
-				serveOpts = append(serveOpts, mcpserver.WithCredentialRegistry(registry))
+				host.Registry = registry
 			}
 		}
-		serveOpts = append(serveOpts, mcpserver.WithConfigProvider(provider))
-		entries, recoverErr := mcpserver.RecoverTransfers(credential.WithoutInteraction(ctx), options, serveOpts...)
+		var serveOpts []mcpruntime.Option
+		if options.Verify || options.Cleanup || options.ResolveUnknown {
+			host.Provider = provider
+			serveOpts, err = host.RuntimeOptions()
+			if err != nil {
+				return err
+			}
+		}
+		entries, recoverErr := mcpruntime.RecoverTransfers(credential.WithoutInteraction(ctx), options, serveOpts...)
 		if entries != nil {
 			encoder := json.NewEncoder(cmd.OutOrStdout())
 			encoder.SetIndent("", "  ")
@@ -86,7 +94,7 @@ func newCmdMCPRecover() *cobra.Command {
 }
 
 // Recovery reads its own limits without requiring listener or token settings.
-func applyMCPRecoverySettings(options *mcpserver.RecoveryOptions, settings *config.MCPConfig) error {
+func applyMCPRecoverySettings(options *mcpruntime.RecoveryOptions, settings *config.MCPConfig) error {
 	if settings == nil {
 		return nil
 	}

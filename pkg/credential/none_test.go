@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 )
 
 func TestNoneStoreFailClosed(t *testing.T) {
@@ -11,10 +13,10 @@ func TestNoneStoreFailClosed(t *testing.T) {
 	store := NewNoneStore()
 	ref := Ref{StoreID: "none", ItemID: "any-item"}
 
-	// 1. Get 总是返回 ErrCredentialNotFound
+	// 1. Get 总是返回 coreauth.ErrCredentialNotFound
 	_, err := store.Get(ctx, ref)
-	if !errors.Is(err, ErrCredentialNotFound) {
-		t.Fatalf("expected ErrCredentialNotFound from NoneStore.Get, got: %v", err)
+	if !errors.Is(err, coreauth.ErrCredentialNotFound) {
+		t.Fatalf("expected coreauth.ErrCredentialNotFound from NoneStore.Get, got: %v", err)
 	}
 
 	// 2. Put 总是返回 ErrCredentialStoreReadOnly

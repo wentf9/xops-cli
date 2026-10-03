@@ -12,8 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	unix "github.com/wentf9/xops-cli/internal/vaultsys"
-	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
 // ensureWrappingKeyFile publishes complete random material without replacing an
@@ -21,7 +21,7 @@ import (
 // unlock a vault or resume a transaction using its original wrapping key.
 func ensureWrappingKeyFile(ctx context.Context, path string, ops fileOps) (err error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path || path == "/" {
-		return credential.ErrCredentialAccessDenied
+		return coreauth.ErrCredentialAccessDenied
 	}
 	parent, err := walkDirectory(ctx, filepath.Dir(path))
 	if err != nil {
@@ -143,7 +143,7 @@ func validateWrappingKeyLocation(vaultPath string, material Wrapping) error {
 		return fmt.Errorf("resolve wrapping key location: %w", err)
 	}
 	if relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("key_file must be outside the vault directory: %w", credential.ErrCredentialAccessDenied)
+		return fmt.Errorf("key_file must be outside the vault directory: %w", coreauth.ErrCredentialAccessDenied)
 	}
 	return nil
 }
@@ -160,7 +160,7 @@ func validateKeyParent(ctx context.Context, path string, roots []*directory) (er
 			return e
 		}
 		if inside {
-			return fmt.Errorf("key_file must be outside source and target vault directories: %w", credential.ErrCredentialAccessDenied)
+			return fmt.Errorf("key_file must be outside source and target vault directories: %w", coreauth.ErrCredentialAccessDenied)
 		}
 	}
 	return nil

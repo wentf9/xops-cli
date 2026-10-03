@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -26,7 +27,7 @@ func TestLazyRegistryInitializationAndCancellation(t *testing.T) {
 	for range 16 {
 		wg.Go(func() {
 			_, err := reg.Resolve(t.Context(), credential.Ref{StoreID: "none", ItemID: "item"})
-			if !errors.Is(err, credential.ErrCredentialNotFound) {
+			if !errors.Is(err, coreauth.ErrCredentialNotFound) {
 				t.Errorf("concurrent read: %v", err)
 			}
 		})

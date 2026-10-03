@@ -5,11 +5,12 @@ import (
 	"errors"
 	"testing"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
+	"github.com/wentf9/xops-cli/core/concurrent"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
-	"github.com/wentf9/xops-cli/pkg/ssh"
-	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 )
 
 func TestRememberExistingReferencesDoesNotConfirm(t *testing.T) {
@@ -63,7 +64,7 @@ func TestRememberExistingReferencesDoesNotConfirm(t *testing.T) {
 			// An unreadable reference must not be interpreted as a new secret.
 			registry.Unregister("memory")
 			_, err = a.UpdateAuth(t.Context(), "node", string(snapshot.UpdateRef.AuthVersion[:]), "stored", "", "")
-			if !errors.Is(err, credential.ErrStoreNotFound) || calls != tc.wantCalls {
+			if !errors.Is(err, coreauth.ErrStoreNotFound) || calls != tc.wantCalls {
 				t.Fatalf("reference error triggered confirmation: calls=%d err=%v", calls, err)
 			}
 		})

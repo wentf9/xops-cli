@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/wentf9/xops-cli/core/concurrent"
 	"github.com/wentf9/xops-cli/pkg/models"
-	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 )
 
 func TestProviderFrozenKeepsSnapshotAndOpenSSH(t *testing.T) {
