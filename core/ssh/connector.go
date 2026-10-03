@@ -1179,12 +1179,12 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 		return nil, nil, fmt.Errorf("unsupported auth type: %s", cfg.AuthType)
 	}
 
-	hostKeyCallback, err := c.getHostKeyCallback(ctx, coordinator, cfg)
+	hostKeyCallback, hostKeyAlgorithms, err := c.getHostKeyOptions(ctx, coordinator, cfg)
 	if err != nil {
 		if cleanup != nil {
 			err = errors.Join(err, cleanup())
 		}
-		return nil, nil, fmt.Errorf("get host key callback failed: %w", err)
+		return nil, nil, err
 	}
 
 	var clientTimeout time.Duration
@@ -1193,11 +1193,12 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 	}
 
 	return &ssh.ClientConfig{
-		User:            cfg.User,
-		Auth:            authMethods,
-		AuthCallback:    authCallback,
-		HostKeyCallback: hostKeyCallback,
-		Timeout:         clientTimeout,
+		User:              cfg.User,
+		Auth:              authMethods,
+		AuthCallback:      authCallback,
+		HostKeyCallback:   hostKeyCallback,
+		HostKeyAlgorithms: hostKeyAlgorithms,
+		Timeout:           clientTimeout,
 	}, cleanup, nil
 }
 

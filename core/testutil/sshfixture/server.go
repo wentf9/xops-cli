@@ -41,7 +41,12 @@ type Server struct {
 	closeErr    error
 }
 
-type Options struct{ PublicKeys []ssh.PublicKey }
+type Options struct {
+	PublicKeys []ssh.PublicKey
+	// HostKeys supplies deployment-owned fixture keys. The first public key is
+	// exposed as HostKey; all supplied algorithms are advertised by the peer.
+	HostKeys []ssh.Signer
+}
 
 func New(ctx context.Context) (*Server, error) { return NewWithOptions(ctx, Options{}) }
 
@@ -52,13 +57,17 @@ func NewWithOptions(ctx context.Context, options Options) (*Server, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		return nil, errors.New("fixture requires a deadline")
 	}
-	_, key, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		return nil, err
-	}
-	signer, err := ssh.NewSignerFromKey(key)
-	if err != nil {
-		return nil, err
+	hostKeys := append([]ssh.Signer(nil), options.HostKeys...)
+	if len(hostKeys) == 0 {
+		_, key, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			return nil, err
+		}
+		signer, err := ssh.NewSignerFromKey(key)
+		if err != nil {
+			return nil, err
+		}
+		hostKeys = []ssh.Signer{signer}
 	}
 	lc := net.ListenConfig{}
 	listener, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
@@ -66,7 +75,7 @@ func NewWithOptions(ctx context.Context, options Options) (*Server, error) {
 		return nil, err
 	}
 	work, cancel := context.WithCancel(ctx)
-	s := &Server{Address: listener.Addr().String(), HostKey: signer.PublicKey(), ctx: work, cancel: cancel, listener: listener,
+	s := &Server{Address: listener.Addr().String(), HostKey: hostKeys[0].PublicKey(), ctx: work, cancel: cancel, listener: listener,
 		connections: make(map[net.Conn]struct{}), handlers: sftp.InMemHandler(), config: &ssh.ServerConfig{PasswordCallback: func(_ ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
 			if string(password) != Password {
 				return nil, errors.New("fixture password rejected")
@@ -74,7 +83,9 @@ func NewWithOptions(ctx context.Context, options Options) (*Server, error) {
 			return nil, nil
 		}},
 	}
-	s.config.AddHostKey(signer)
+	for _, signer := range hostKeys {
+		s.config.AddHostKey(signer)
+	}
 	s.forwards = make(map[string]net.Listener)
 	s.config.PublicKeyCallback = func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 		for _, allowed := range options.PublicKeys {

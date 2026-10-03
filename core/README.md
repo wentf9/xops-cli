@@ -38,6 +38,11 @@ Core packages and tests must never import application `pkg/*` or root
 `internal/*` packages.
 
 New SSH consumers supply `Environment` and/or `KeySource` / `HostKeyVerifier`.
+Pinned-trust verifiers can also implement `HostKeyAlgorithmSource` to select
+supported host-key algorithms before the handshake, using the same endpoint and
+trust version as verification. Empty, unsupported, failed, or timed-out selections
+fail closed; `Verify` still checks the exact server key. RSA pins should select
+`rsa-sha2-512` / `rsa-sha2-256`, not the obsolete `ssh-rsa` SHA-1 signature.
 Core does not discover personal home directories, agent sockets, default keys,
 or standard streams. CLI adapters explicitly inject defaults and the Windows
 input bridge from `internal/sshenv`. `internal/mcphost` converts CLI configuration

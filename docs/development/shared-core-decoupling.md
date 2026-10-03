@@ -183,6 +183,11 @@ type HostKeyVerifier interface {
 	Verify(context.Context, HostKeyRequest, cryptoSSH.PublicKey) error
 }
 
+// HostKeyVerifier 可选实现；协商前按相同目标/信任版本选择算法。
+type HostKeyAlgorithmSource interface {
+	HostKeyAlgorithms(context.Context, HostKeyRequest) ([]string, error)
+}
+
 type InputBridge interface {
 	Start(context.Context, InteractiveIO, io.Writer) (InputCopy, error)
 }
@@ -194,6 +199,8 @@ type InputCopy interface {
 ```
 
 InputCopy 只关闭自己拥有的副本/取消句柄，不关闭借来的标准流；Close 中断读取，Wait 在调用期限内完成。操作结束后先停止复制，再用独立的一秒清理预算等待退出，不把已经取消的操作 context 传给清理等待；清理超时和真实错误仍返回调用方。KeyLease 的所有权从成功返回起移交调用方。每条连接的来源作用域独立，不能通过修改进程环境切换两个 runtime 的凭据或终端。
+
+固定主机公钥的宿主可用 HostKeyAlgorithmSource 解决服务器同时提供多个主机密钥算法时的协商问题。查询使用握手协调器 context 和握手期限，并携带 NodeID、Host、Port、User 与信任版本；协商前尚无实际 Remote/Hostname。算法必须来自 SSH 库的安全支持列表，空列表、查询失败或超时均拒绝连接，不回退到默认列表。RSA 公钥应选择 rsa-sha2-512/rsa-sha2-256。算法选择不能替代 Verify 对实际公钥的精确校验；未实现该可选接口的既有宿主继续使用库默认协商。
 
 这些接口以具体消费者需求为界，不额外提供通用插件注册器、ORM repository 框架或任意协议执行器。
 

@@ -27,6 +27,15 @@ type HostKeyVerifier interface {
 	Verify(context.Context, HostKeyRequest, cryptoSSH.PublicKey) error
 }
 
+// HostKeyAlgorithmSource is an optional HostKeyVerifier capability. It selects
+// host key algorithms before the handshake using the same target/trust version
+// as Verify. Hostname and Remote are not available at this stage. Implementations
+// must honor ctx; errors, empty lists and unsupported algorithms fail closed.
+// Selection does not replace Verify or authorize a different key of that type.
+type HostKeyAlgorithmSource interface {
+	HostKeyAlgorithms(context.Context, HostKeyRequest) ([]string, error)
+}
+
 // Environment supplies explicitly selected local resources. The core never
 // discovers a home directory, SSH_AUTH_SOCK, or process standard streams.
 // Slices are copied by WithEnvironment; callbacks must be concurrency-safe.
