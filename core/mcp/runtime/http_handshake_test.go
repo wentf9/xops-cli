@@ -68,13 +68,28 @@ func TestInitializationCompletesAtHTTPRequestLimit(t *testing.T) {
 	if err == nil && len(requests) != cap(requests) {
 		t.Errorf("handshake did not fill ordinary request capacity: %d/%d", len(requests), cap(requests))
 	}
+	if err != nil {
+		t.Fatalf("handshake rejected while initialize response and SSE occupied capacity: %v", err)
+	}
+	// Connect and the SSE response can finish while initialize still owns the
+	// other ordinary slot. A tool request must wait for that slot to be released.
+	response, err := rawMCPRequest(ctx, httpClient, httpServer.URL+"/mcp", session.ID(), map[string]any{
+		"jsonrpc": "2.0", "id": "held-initialize", "method": "tools/list",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeTransferTestResource(t, response.Body)
+	if response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("ordinary request bypassed held initialization: HTTP %d", response.StatusCode)
+	}
 	releaseInitialize()
 	select {
 	case <-finished:
 	case <-ctx.Done():
 		t.Fatal("initialize request did not release its slot")
 	}
-	if err != nil {
-		t.Fatalf("handshake rejected while initialize response and SSE occupied capacity: %v", err)
+	if _, err := session.ListTools(ctx, nil); err != nil {
+		t.Fatalf("ordinary request failed after initialize released capacity: %v", err)
 	}
 }
