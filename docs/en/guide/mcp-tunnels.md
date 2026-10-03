@@ -11,7 +11,7 @@ The stdio server started with `xops mcp serve` provides SSH local (`-L`) and rem
 | `local` (`-L`) | MCP process machine | SSH node |
 | `remote` (`-R`) | SSH node | MCP process machine |
 
-Configure nodes, credentials and trusted host keys first. Tunnels use the configured ProxyJump chain and never prompt for passwords or unknown host keys. They use the node configuration snapshot captured at server startup; restart MCP after changing that configuration.
+Configure nodes, credentials and trusted host keys first. Tunnels use the configured ProxyJump chain and never prompt for passwords or unknown host keys. Each tunnel uses the node and jump configuration admitted for that operation. Later ordinary edits do not redirect it to another target. External CLI configuration-file changes still require an MCP restart to load.
 
 `nodeID` accepts saved node IDs, aliases and OpenSSH IDs such as `openssh:web`. After creating through the OpenSSH alias `web`, the returned canonical ID `openssh:web` can be reused for creation retries, new tunnels and list filters. Unprefixed aliases prefer saved nodes when names collide; the `openssh:` prefix preserves the OpenSSH namespace.
 
@@ -25,6 +25,8 @@ OpenSSH identifiers, including IDs resolved from aliases, must not contain white
 | `xops_tunnel_list` | Optional `nodeID`, `state` | List this process's tunnels and retained terminal records |
 | `xops_tunnel_status` | `tunnelID` | Query one tunnel |
 | `xops_tunnel_stop` | `tunnelID` | Stop listening and close existing forwarded connections |
+
+After a node is disabled or deleted, its retained canonical `nodeID` can still filter tunnel history, together with `state`. A retained canonical ID takes precedence over a current alias with that spelling; other aliases use current inventory resolution. History queries still enforce current global and node policies. Cancelling or expiring a list request cancels its node lookup and query without changing background tunnel TTLs.
 
 Forward the loopback web service on SSH node `web-1` to an automatically allocated local port:
 

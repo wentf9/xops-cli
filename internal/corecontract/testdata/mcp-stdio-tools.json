@@ -1,0 +1,1143 @@
+[
+  {
+    "annotations": {
+      "idempotentHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Download a remote file or directory from the node to the machine running the MCP server via SFTP. Highly concurrent.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "localPath": {
+          "description": "Absolute path to the local file or directory",
+          "type": "string"
+        },
+        "nodeID": {
+          "description": "Node ID for the remote machine",
+          "type": "string"
+        },
+        "remotePath": {
+          "description": "Absolute path to the remote file or directory",
+          "type": "string"
+        }
+      },
+      "required": [
+        "nodeID",
+        "localPath",
+        "remotePath"
+      ],
+      "type": "object"
+    },
+    "name": "xops_download",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "description": "Operation status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Copy a remote file or directory to another remote location recursively.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "destPath": {
+          "description": "Absolute path to destination",
+          "type": "string"
+        },
+        "nodeID": {
+          "description": "Node ID for the remote machine",
+          "type": "string"
+        },
+        "srcPath": {
+          "description": "Absolute path to source",
+          "type": "string"
+        }
+      },
+      "required": [
+        "nodeID",
+        "srcPath",
+        "destPath"
+      ],
+      "type": "object"
+    },
+    "name": "xops_fs_cp",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "description": "Operation status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "idempotentHint": false,
+      "readOnlyHint": true
+    },
+    "description": "List remote directory files with attributes (size, modTime, isDir, permissions).",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "nodeID": {
+          "description": "Node ID for the remote machine",
+          "type": "string"
+        },
+        "path": {
+          "description": "Absolute path to the remote directory",
+          "type": "string"
+        }
+      },
+      "required": [
+        "nodeID",
+        "path"
+      ],
+      "type": "object"
+    },
+    "name": "xops_fs_ls",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "files": {
+          "description": "List of files in the directory",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "isDir": {
+                "description": "True if it is a directory",
+                "type": "boolean"
+              },
+              "modTime": {
+                "description": "Last modification time",
+                "type": "string"
+              },
+              "mode": {
+                "description": "File mode/permissions",
+                "type": "string"
+              },
+              "name": {
+                "description": "File name",
+                "type": "string"
+              },
+              "size": {
+                "description": "Size in bytes",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "name",
+              "size",
+              "mode",
+              "modTime",
+              "isDir"
+            ],
+            "type": "object"
+          },
+          "type": [
+            "null",
+            "array"
+          ]
+        },
+        "status": {
+          "description": "Operation status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "files",
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Create a remote directory, along with any necessary parents.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "nodeID": {
+          "description": "Node ID for the remote machine",
+          "type": "string"
+        },
+        "path": {
+          "description": "Absolute path to the directory to create",
+          "type": "string"
+        }
+      },
+      "required": [
+        "nodeID",
+        "path"
+      ],
+      "type": "object"
+    },
+    "name": "xops_fs_mkdir",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "description": "Operation status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Move or rename a remote file/directory.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "newPath": {
+          "description": "New absolute destination path",
+          "type": "string"
+        },
+        "nodeID": {
+          "description": "Node ID for the remote machine",
+          "type": "string"
+        },
+        "oldPath": {
+          "description": "Original absolute path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "nodeID",
+        "oldPath",
+        "newPath"
+      ],
+      "type": "object"
+    },
+    "name": "xops_fs_mv",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "description": "Operation status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Remove a remote file or directory recursively safely.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "nodeID": {
+          "description": "Node ID for the remote machine",
+          "type": "string"
+        },
+        "path": {
+          "description": "Absolute path to the file/directory to securely delete",
+          "type": "string"
+        }
+      },
+      "required": [
+        "nodeID",
+        "path"
+      ],
+      "type": "object"
+    },
+    "name": "xops_fs_rm",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "description": "Operation status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Create a new empty remote file.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "nodeID": {
+          "description": "Node ID for the remote machine",
+          "type": "string"
+        },
+        "path": {
+          "description": "Absolute path to the file to create",
+          "type": "string"
+        }
+      },
+      "required": [
+        "nodeID",
+        "path"
+      ],
+      "type": "object"
+    },
+    "name": "xops_fs_touch",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "description": "Operation status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "idempotentHint": false,
+      "readOnlyHint": true
+    },
+    "description": "List all available SSH nodes managed by XOps, optionally filtered by tag. Returns an array of node IDs that can be used with xops_ssh_run.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "tag": {
+          "description": "Filter nodes by tag. If empty, lists all nodes.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "xops_list_nodes",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "nodes": {
+          "description": "List of available nodes with detailed information",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "address": {
+                "description": "Host address and port",
+                "type": "string"
+              },
+              "alias": {
+                "description": "Node aliases",
+                "items": {
+                  "type": "string"
+                },
+                "type": [
+                  "null",
+                  "array"
+                ]
+              },
+              "authType": {
+                "description": "Authentication type",
+                "type": "string"
+              },
+              "id": {
+                "description": "Node ID / Name",
+                "type": "string"
+              },
+              "proxyJump": {
+                "description": "Proxy jump host",
+                "type": "string"
+              },
+              "tags": {
+                "description": "Node tags",
+                "items": {
+                  "type": "string"
+                },
+                "type": [
+                  "null",
+                  "array"
+                ]
+              },
+              "user": {
+                "description": "SSH user",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "address",
+              "user",
+              "authType"
+            ],
+            "type": "object"
+          },
+          "type": [
+            "null",
+            "array"
+          ]
+        },
+        "status": {
+          "description": "Operation status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "nodes",
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "idempotentHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Read a remote file via SFTP. Supports chunked reading via offset and limit to prevent memory overflow on large files. Returns EOF=true if the end of file is reached.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "description": "Max bytes to read (default 50KB, max 100KB)",
+          "type": "integer"
+        },
+        "nodeID": {
+          "description": "Node ID for the remote machine",
+          "type": "string"
+        },
+        "offset": {
+          "description": "Byte offset to start reading from",
+          "type": "integer"
+        },
+        "path": {
+          "description": "Absolute path to the remote file",
+          "type": "string"
+        }
+      },
+      "required": [
+        "nodeID",
+        "path"
+      ],
+      "type": "object"
+    },
+    "name": "xops_read_file",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "description": "File content represented as string",
+          "type": "string"
+        },
+        "eof": {
+          "description": "True if end of file reached",
+          "type": "boolean"
+        },
+        "size": {
+          "description": "Total size of the remote file",
+          "type": "integer"
+        },
+        "status": {
+          "description": "Operation status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "content",
+        "eof",
+        "size",
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Execute a shell command on a specific SSH node managed by XOps. Returns the command output.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "description": "The shell command to execute",
+          "type": "string"
+        },
+        "nodeID": {
+          "description": "The ID of the node to execute command on",
+          "type": "string"
+        },
+        "sudo": {
+          "description": "Whether to use sudo to execute the command",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "nodeID",
+        "command"
+      ],
+      "type": "object"
+    },
+    "name": "xops_ssh_run",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "error": {
+          "description": "Error message if failed",
+          "type": "string"
+        },
+        "output": {
+          "description": "Command stdout/stderr",
+          "type": "string"
+        },
+        "status": {
+          "description": "Operation status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "output",
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Create a process-owned SSH TCP tunnel over stdio only (-L or -R). Returns after listening; running does not prove destination reachability. Local means the xops MCP process machine. The tunnel survives this call until stopped, expired, disconnected, or MCP exits. A failed state is terminal; use a new requestID after fixing the cause.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "listenHost": {
+          "description": "IP literal or localhost; defaults to 127.0.0.1. Remote exposure is controlled by sshd GatewayPorts.",
+          "type": "string"
+        },
+        "listenPort": {
+          "description": "Listening TCP port, 0 to 65535. Zero requests an automatically allocated port.",
+          "type": "integer"
+        },
+        "mode": {
+          "description": "local (-L): listen on the MCP process machine and connect from the SSH node. remote (-R): listen on the SSH node and connect from the MCP process machine. No dynamic forwarding.",
+          "type": "string"
+        },
+        "nodeID": {
+          "description": "Managed SSH node ID or alias, including canonical openssh:host IDs returned by tunnel tools.",
+          "type": "string"
+        },
+        "requestID": {
+          "description": "Client-generated idempotency key. Reuse the same key and parameters to recover a lost response; use a new key for a new tunnel.",
+          "type": "string"
+        },
+        "targetHost": {
+          "description": "Destination host name or unbracketed IP literal, interpreted on the destination side of the tunnel.",
+          "type": "string"
+        },
+        "targetPort": {
+          "description": "Destination TCP port, 1 to 65535.",
+          "type": "integer"
+        },
+        "ttlSeconds": {
+          "description": "Lifetime after startup, 1 to 86400 seconds; default 3600. Not renewed by queries or retries.",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "requestID",
+        "nodeID",
+        "mode",
+        "listenPort",
+        "targetHost",
+        "targetPort"
+      ],
+      "type": "object"
+    },
+    "name": "xops_tunnel_create",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "tunnel": {
+          "additionalProperties": false,
+          "properties": {
+            "auditError": {
+              "type": "string"
+            },
+            "createdAt": {
+              "type": "string"
+            },
+            "error": {
+              "type": "string"
+            },
+            "expiresAt": {
+              "type": "string"
+            },
+            "finishedAt": {
+              "type": "string"
+            },
+            "lastConnectionError": {
+              "type": "string"
+            },
+            "listenAddress": {
+              "type": "string"
+            },
+            "listenHost": {
+              "type": "string"
+            },
+            "listenPort": {
+              "type": "integer"
+            },
+            "listenScope": {
+              "type": "string"
+            },
+            "mode": {
+              "type": "string"
+            },
+            "nodeID": {
+              "type": "string"
+            },
+            "operationID": {
+              "type": "string"
+            },
+            "remoteRelease": {
+              "type": "string"
+            },
+            "requestID": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string"
+            },
+            "targetHost": {
+              "type": "string"
+            },
+            "targetPort": {
+              "type": "integer"
+            },
+            "targetScope": {
+              "type": "string"
+            },
+            "ttlSeconds": {
+              "type": "integer"
+            },
+            "tunnelID": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "requestID",
+            "nodeID",
+            "mode",
+            "listenHost",
+            "listenPort",
+            "targetHost",
+            "targetPort",
+            "ttlSeconds",
+            "tunnelID",
+            "operationID",
+            "state",
+            "listenScope",
+            "targetScope",
+            "createdAt"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "tunnel"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "idempotentHint": false,
+      "readOnlyHint": true
+    },
+    "description": "List SSH tunnels owned by this stdio MCP process, including retained terminal states.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "nodeID": {
+          "description": "Optional node ID or alias filter; accepts returned canonical openssh:host IDs.",
+          "type": "string"
+        },
+        "state": {
+          "description": "Optional state: starting, running, stopping, stopped, expired, or failed.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "xops_tunnel_list",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "tunnels": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "auditError": {
+                "type": "string"
+              },
+              "createdAt": {
+                "type": "string"
+              },
+              "error": {
+                "type": "string"
+              },
+              "expiresAt": {
+                "type": "string"
+              },
+              "finishedAt": {
+                "type": "string"
+              },
+              "lastConnectionError": {
+                "type": "string"
+              },
+              "listenAddress": {
+                "type": "string"
+              },
+              "listenHost": {
+                "type": "string"
+              },
+              "listenPort": {
+                "type": "integer"
+              },
+              "listenScope": {
+                "type": "string"
+              },
+              "mode": {
+                "type": "string"
+              },
+              "nodeID": {
+                "type": "string"
+              },
+              "operationID": {
+                "type": "string"
+              },
+              "remoteRelease": {
+                "type": "string"
+              },
+              "requestID": {
+                "type": "string"
+              },
+              "state": {
+                "type": "string"
+              },
+              "targetHost": {
+                "type": "string"
+              },
+              "targetPort": {
+                "type": "integer"
+              },
+              "targetScope": {
+                "type": "string"
+              },
+              "ttlSeconds": {
+                "type": "integer"
+              },
+              "tunnelID": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "requestID",
+              "nodeID",
+              "mode",
+              "listenHost",
+              "listenPort",
+              "targetHost",
+              "targetPort",
+              "ttlSeconds",
+              "tunnelID",
+              "operationID",
+              "state",
+              "listenScope",
+              "targetScope",
+              "createdAt"
+            ],
+            "type": "object"
+          },
+          "type": [
+            "null",
+            "array"
+          ]
+        }
+      },
+      "required": [
+        "tunnels"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "idempotentHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Query tunnel state, listener, expiry and connection errors. Remote listener addresses do not prove GatewayPorts exposure or remote port release.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "tunnelID": {
+          "description": "Tunnel ID returned by xops_tunnel_create or xops_tunnel_list.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tunnelID"
+      ],
+      "type": "object"
+    },
+    "name": "xops_tunnel_status",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "tunnel": {
+          "additionalProperties": false,
+          "properties": {
+            "auditError": {
+              "type": "string"
+            },
+            "createdAt": {
+              "type": "string"
+            },
+            "error": {
+              "type": "string"
+            },
+            "expiresAt": {
+              "type": "string"
+            },
+            "finishedAt": {
+              "type": "string"
+            },
+            "lastConnectionError": {
+              "type": "string"
+            },
+            "listenAddress": {
+              "type": "string"
+            },
+            "listenHost": {
+              "type": "string"
+            },
+            "listenPort": {
+              "type": "integer"
+            },
+            "listenScope": {
+              "type": "string"
+            },
+            "mode": {
+              "type": "string"
+            },
+            "nodeID": {
+              "type": "string"
+            },
+            "operationID": {
+              "type": "string"
+            },
+            "remoteRelease": {
+              "type": "string"
+            },
+            "requestID": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string"
+            },
+            "targetHost": {
+              "type": "string"
+            },
+            "targetPort": {
+              "type": "integer"
+            },
+            "targetScope": {
+              "type": "string"
+            },
+            "ttlSeconds": {
+              "type": "integer"
+            },
+            "tunnelID": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "requestID",
+            "nodeID",
+            "mode",
+            "listenHost",
+            "listenPort",
+            "targetHost",
+            "targetPort",
+            "ttlSeconds",
+            "tunnelID",
+            "operationID",
+            "state",
+            "listenScope",
+            "targetScope",
+            "createdAt"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "tunnel"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Idempotently stop a tunnel owned by this stdio MCP process and close its existing connections. If waiting times out, query status; cleanup continues. Remote port release may remain unconfirmed after SSH closure.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "tunnelID": {
+          "description": "Tunnel ID returned by xops_tunnel_create or xops_tunnel_list.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tunnelID"
+      ],
+      "type": "object"
+    },
+    "name": "xops_tunnel_stop",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "tunnel": {
+          "additionalProperties": false,
+          "properties": {
+            "auditError": {
+              "type": "string"
+            },
+            "createdAt": {
+              "type": "string"
+            },
+            "error": {
+              "type": "string"
+            },
+            "expiresAt": {
+              "type": "string"
+            },
+            "finishedAt": {
+              "type": "string"
+            },
+            "lastConnectionError": {
+              "type": "string"
+            },
+            "listenAddress": {
+              "type": "string"
+            },
+            "listenHost": {
+              "type": "string"
+            },
+            "listenPort": {
+              "type": "integer"
+            },
+            "listenScope": {
+              "type": "string"
+            },
+            "mode": {
+              "type": "string"
+            },
+            "nodeID": {
+              "type": "string"
+            },
+            "operationID": {
+              "type": "string"
+            },
+            "remoteRelease": {
+              "type": "string"
+            },
+            "requestID": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string"
+            },
+            "targetHost": {
+              "type": "string"
+            },
+            "targetPort": {
+              "type": "integer"
+            },
+            "targetScope": {
+              "type": "string"
+            },
+            "ttlSeconds": {
+              "type": "integer"
+            },
+            "tunnelID": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "requestID",
+            "nodeID",
+            "mode",
+            "listenHost",
+            "listenPort",
+            "targetHost",
+            "targetPort",
+            "ttlSeconds",
+            "tunnelID",
+            "operationID",
+            "state",
+            "listenScope",
+            "targetScope",
+            "createdAt"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "tunnel"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Upload a local file or directory (from the machine running the MCP server) to the remote node via SFTP. Highly concurrent.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "localPath": {
+          "description": "Absolute path to the local file or directory",
+          "type": "string"
+        },
+        "nodeID": {
+          "description": "Node ID for the remote machine",
+          "type": "string"
+        },
+        "remotePath": {
+          "description": "Absolute path to the remote file or directory",
+          "type": "string"
+        }
+      },
+      "required": [
+        "nodeID",
+        "localPath",
+        "remotePath"
+      ],
+      "type": "object"
+    },
+    "name": "xops_upload",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "description": "Operation status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Write or append content to a remote file via SFTP. Use the append flag for chunked writing of large files.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "append": {
+          "description": "If true, append to existing file; if false, overwrite completely",
+          "type": "boolean"
+        },
+        "content": {
+          "description": "Content to write",
+          "type": "string"
+        },
+        "nodeID": {
+          "description": "Node ID for the remote machine",
+          "type": "string"
+        },
+        "path": {
+          "description": "Absolute path to the remote file",
+          "type": "string"
+        }
+      },
+      "required": [
+        "nodeID",
+        "path",
+        "content"
+      ],
+      "type": "object"
+    },
+    "name": "xops_write_file",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "bytesWritten": {
+          "description": "Number of bytes written",
+          "type": "integer"
+        },
+        "status": {
+          "description": "Operation status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "bytesWritten",
+        "status"
+      ],
+      "type": "object"
+    }
+  }
+]

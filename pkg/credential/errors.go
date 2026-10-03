@@ -1,19 +1,22 @@
 package credential
 
-import "errors"
+import (
+	"errors"
+	"github.com/wentf9/xops-cli/core/auth"
+)
 
 var (
 	// ErrCredentialNotFound 表示凭据项在指定的凭据存储中未找到。
-	ErrCredentialNotFound = errors.New("credential not found")
+	ErrCredentialNotFound = auth.ErrCredentialNotFound
 
 	// ErrCredentialStoreLocked 表示目标凭据存储处于锁定状态，需要用户解锁。
-	ErrCredentialStoreLocked = errors.New("credential store is locked")
+	ErrCredentialStoreLocked = auth.ErrCredentialStoreLocked
 
 	// ErrCredentialStoreUnavailable 表示凭据存储当前不可达或未就绪。
-	ErrCredentialStoreUnavailable = errors.New("credential store is unavailable")
+	ErrCredentialStoreUnavailable = auth.ErrCredentialStoreUnavailable
 
 	// ErrCredentialAccessDenied 表示当前用户或进程无权访问该凭据存储。
-	ErrCredentialAccessDenied = errors.New("credential access denied")
+	ErrCredentialAccessDenied = auth.ErrCredentialAccessDenied
 
 	// ErrCredentialStoreReadOnly 表示该凭据源为只读，不支持写入或删除操作。
 	ErrCredentialStoreReadOnly = errors.New("credential store is read-only")
@@ -22,13 +25,13 @@ var (
 	ErrInteractionRequired = errors.New("interaction required")
 
 	// ErrConfigConflict 表示并发写入或版本 CAS 校验发生冲突。
-	ErrConfigConflict = errors.New("configuration conflict")
+	ErrConfigConflict = auth.ErrConfigConflict
 
 	// ErrInvalidRef 表示凭据引用格式非法或 storeID/itemID 不完整。
-	ErrInvalidRef = errors.New("invalid credential reference")
+	ErrInvalidRef = auth.ErrInvalidRef
 
 	// ErrStoreNotFound 表示指定的 StoreID 未在 Registry 中注册。
-	ErrStoreNotFound = errors.New("credential store not found")
+	ErrStoreNotFound = auth.ErrStoreNotFound
 
 	// ErrStoreAlreadyRegistered 表示指定的 StoreID 已存在注册项。
 	ErrStoreAlreadyRegistered = errors.New("credential store already registered")

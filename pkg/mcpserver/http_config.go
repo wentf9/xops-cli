@@ -48,5 +48,5 @@ func HTTPOptionsFromConfig(c *config.MCPConfig) (HTTPOptions, error) {
 	if c.MaxFileBytes != nil {
 		o.Transfers.MaxFileBytes = *c.MaxFileBytes
 	}
-	return o, o.validateLimits()
+	return o, o.ValidateLimits()
 }

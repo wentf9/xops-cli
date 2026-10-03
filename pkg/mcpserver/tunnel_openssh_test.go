@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/wentf9/xops-cli/core/mcp/ports"
+	"github.com/wentf9/xops-cli/core/testutil/sshfixture"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/mcpserver/guardrail"
 	"github.com/wentf9/xops-cli/pkg/models"
@@ -33,7 +35,9 @@ func TestResolveTunnelOpenSSHNode(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			r, err := NewRuntime(t.Context(), WithConfigProvider(config.NewProviderWithOpenSSHParser(cfg, parser)))
+			provider := config.NewProviderWithOpenSSHParser(cfg, parser)
+			host := newLegacyHost(legacyConfig{provider: provider})
+			r, err := NewRuntime(t.Context(), WithConfigProvider(provider))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -50,17 +54,17 @@ func TestResolveTunnelOpenSSHNode(t *testing.T) {
 				{"web", webID}, {"openssh:web", "openssh:web"}, {"node", "node"}, {"alias", "node"},
 				{"openssh:operator@web:2200", "openssh:operator@web:2200"},
 			} {
-				if got, err := r.resolveTunnelNode(tc.selector); err != nil || got != tc.want {
+				if got, err := resolveLegacyTestNode(t.Context(), host, tc.selector); err != nil || got != tc.want {
 					t.Errorf("resolve %q = %q, %v; want %q", tc.selector, got, err, tc.want)
 				}
 			}
 			for _, selector := range []string{"openssh:", "openssh:broken", "openssh:web:65536"} {
-				if _, err := r.resolveTunnelNode(selector); err == nil || !strings.Contains(err.Error(), "resolve tunnel connection") {
+				if _, err := resolveLegacyTestNode(t.Context(), host, selector); err == nil || !strings.Contains(err.Error(), "config") {
 					t.Errorf("canonical ID %q did not reach connection validation: %v", selector, err)
 				}
 			}
 			for _, selector := range []string{"openssh:web ", "openssh: web", "openssh:web\u00a0", "web ", "openssh:\tweb", "openssh:web\n", "openssh:fixture @web", "openssh:fixture@ web"} {
-				if _, err := r.resolveTunnelNode(selector); err == nil || !strings.Contains(err.Error(), "whitespace or control") {
+				if _, err := resolveLegacyTestNode(t.Context(), host, selector); err == nil || !strings.Contains(err.Error(), "whitespace or control") {
 					t.Errorf("noncanonical ID %q was not rejected: %v", selector, err)
 				}
 			}
@@ -68,14 +72,18 @@ func TestResolveTunnelOpenSSHNode(t *testing.T) {
 	}
 }
 
-func tunnelOpenSSHFixture(t *testing.T, policy ...*config.GuardrailConfig) *tunnelSSHFixture {
+func tunnelOpenSSHFixture(t *testing.T, policies ...*config.GuardrailConfig) *legacyTunnelFixture {
 	t.Helper()
-	f := startTunnelSSHFixture(t, 0)
-	_, key, err := ed25519.GenerateKey(rand.Reader)
+	home := isolateMCPTestEnvironment(t)
+	_, private, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	block, err := cryptossh.MarshalPrivateKey(key, "tunnel fixture")
+	signer, err := cryptossh.NewSignerFromKey(private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, err := cryptossh.MarshalPrivateKey(private, "fixture")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,21 +91,46 @@ func tunnelOpenSSHFixture(t *testing.T, policy ...*config.GuardrailConfig) *tunn
 	if err := os.WriteFile(keyPath, pem.EncodeToMemory(block), 0600); err != nil {
 		t.Fatal(err)
 	}
-	host, port, err := net.SplitHostPort(f.address)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	t.Cleanup(cancel)
+	server, err := sshfixture.NewWithOptions(ctx, sshfixture.Options{PublicKeys: []cryptossh.PublicKey{signer.PublicKey()}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	text := fmt.Sprintf("Host web\n HostName %s\n Port %s\n User fixture\n IdentityFile %q\n", host, port, filepath.ToSlash(keyPath))
+	t.Cleanup(func() {
+		if err := server.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	hostname, port, err := net.SplitHostPort(server.Address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeKnownHosts(t, home, hostname, port, server.HostKey)
+	text := fmt.Sprintf("Host web\n HostName %s\n Port %s\n User fixture\n IdentityFile %q\n", hostname, port, filepath.ToSlash(keyPath))
 	parser, err := config.NewOpenSSHParserFromReader(strings.NewReader(text))
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := f.provider.Snapshot()
-	if len(policy) != 0 {
-		cfg.Guardrail = policy[0]
+	cfg := runtimeTestProvider("node").Snapshot()
+	if len(policies) > 0 {
+		cfg.Guardrail = policies[0]
 	}
-	f.provider = config.NewProviderWithOpenSSHParser(cfg, parser)
-	return f
+	return &legacyTunnelFixture{provider: config.NewProviderWithOpenSSHParser(cfg, parser), server: server}
+}
+
+type legacyTunnelFixture struct {
+	provider *config.Provider
+	server   *sshfixture.Server
+}
+
+func resolveLegacyTestNode(ctx context.Context, host *legacyHost, selector string) (string, error) {
+	view, err := host.Resolve(ctx, ports.ResolveRequest{Selectors: []string{selector}})
+	if err != nil {
+		return "", err
+	}
+	id, _, err := view.Resolve(selector)
+	return id, err
 }
 
 func TestMCPTunnelOpenSSHWhitespaceCannotBypassPolicy(t *testing.T) {
@@ -128,11 +161,8 @@ func TestMCPTunnelOpenSSHWhitespaceCannotBypassPolicy(t *testing.T) {
 					t.Errorf("node %q bypassed approval: %+v", nodeID, result.StructuredContent)
 				}
 			}
-			for _, task := range r.tunnels.List("", "") {
-				if task.State == "running" {
-					assertTunnelEcho(t, task.ListenAddress)
-				}
-				t.Errorf("unapproved tunnel created: node=%q state=%s", task.NodeID, task.State)
+			if f.server.Forwards.Load() != 0 {
+				t.Fatal("denied OpenSSH selector opened a forward")
 			}
 		})
 	}

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Generated from core/mcp/transferclient/transfer.py; edit the canonical source
 """Optional standard-library client for XOps prepared HTTP transfers.
 
 Task JSON contains a short-lived credential. Keep that file private and delete

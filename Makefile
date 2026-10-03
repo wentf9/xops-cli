@@ -219,11 +219,11 @@ ci:
 
 bench:
 	@echo "Running benchmarks..."
-	$(RUN_TOOL) go test ./pkg/utils/concurrent/... -bench=. -benchmem -benchtime=2s -run="^$$" -count=1
+	$(RUN_TOOL) go test ./core/concurrent/... -bench=. -benchmem -benchtime=2s -run="^$$" -count=1
 
 stress:
 	@echo "Running stress tests..."
-	$(RUN_TOOL) go test ./pkg/utils/concurrent/... -race -run="TestStress" -v -count=1
+	$(RUN_TOOL) go test ./core/concurrent/... -race -run="TestStress" -v -count=1
 
 # 显示帮助
 help:

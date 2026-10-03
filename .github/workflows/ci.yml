@@ -47,6 +47,11 @@ jobs:
       - name: Build all packages
         run: go build ./...
 
+      - name: Verify shared core isolation
+        run: |
+          python3 -m unittest discover -s scripts -p test_check_core.py
+          python3 scripts/check_core.py --race
+
       - name: Run tests
         run: go test -race -shuffle=on -covermode=atomic -coverprofile=coverage.out ./...
 
@@ -54,7 +59,7 @@ jobs:
         env:
           XOPS_TEST_NATIVE_SUDO_PASSWORD: public-ci-sudo-password
         run: |
-          go test -race -c -o /tmp/xops-sudo-ci.test ./pkg/ssh
+          go test -race -c -o /tmp/xops-sudo-ci.test ./core/ssh
           sudo useradd --create-home --shell /bin/bash xops-sudo-ci
           trap 'sudo rm -f /etc/sudoers.d/xops-sudo-ci /tmp/xops-sudo-ci.test; sudo userdel --remove xops-sudo-ci' EXIT
           printf 'xops-sudo-ci:%s\n' "$XOPS_TEST_NATIVE_SUDO_PASSWORD" | sudo chpasswd

@@ -1,6 +1,9 @@
 package config
 
-import "errors"
+import (
+	"errors"
+	"github.com/wentf9/xops-cli/core/auth"
+)
 
 var (
 	// ErrNodeNotFound 节点不存在错误
@@ -10,7 +13,7 @@ var (
 	// ErrIdentityNotFound 关联的认证身份不存在
 	ErrIdentityNotFound = errors.New("identity reference not found")
 	// ErrProxyCycle 检测到代理跳转环路
-	ErrProxyCycle = errors.New("proxy jump cycle detected")
+	ErrProxyCycle = auth.ErrProxyCycle
 	// ErrAmbiguousNode means a selector matched more than one node.
 	ErrAmbiguousNode = errors.New("node selector is ambiguous")
 )

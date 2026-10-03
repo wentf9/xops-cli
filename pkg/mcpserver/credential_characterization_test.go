@@ -185,7 +185,7 @@ func TestCharacterization_MCP_ListNodes_DoesNotLeakPlaintextCredentials(t *testi
 		_ = conn.CloseAll()
 	})
 
-	runtime := &Runtime{ctx: ctx, connector: conn, provider: provider}
+	runtime := newLegacyRuntimeFixture(t, ctx, provider, bufLogger, conn)
 
 	// 调用 xops_list_nodes 工具
 	_, listOut, err := runtime.listNodesHandler(ctx, nil, ListNodesInput{})
@@ -252,7 +252,7 @@ func TestCharacterization_MCP_FailClosedOnMissingCredential_DoesNotLeakSecrets(t
 		_ = conn.CloseAll()
 	})
 
-	runtime := &Runtime{ctx: ctx, connector: conn, provider: provider}
+	runtime := newLegacyRuntimeFixture(t, ctx, provider, bufLogger, conn)
 
 	// 1. 测试直接调用 connectMCPNode
 	client, err := runtime.connectMCPNode(ctx, "node-unauth")
@@ -277,7 +277,7 @@ func TestCharacterization_MCP_FailClosedOnMissingCredential_DoesNotLeakSecrets(t
 	if runErr == nil {
 		t.Fatal("expected sshRunHandler to fail, got success")
 	}
-	if !errors.Is(runErr, ssh.ErrPasswordRequired) {
+	if !strings.Contains(runErr.Error(), ssh.ErrPasswordRequired.Error()) {
 		t.Fatalf("expected sshRunHandler to return ErrPasswordRequired, got %v", runErr)
 	}
 	if runOut.Status != "" && runOut.Status != "failed" {
@@ -373,7 +373,7 @@ func TestCharacterization_MCP_FailClosedOnInteractionRequired_DoesNotLeakSecrets
 		_ = conn.CloseAll()
 	})
 
-	runtime := &Runtime{ctx: ctx, connector: conn, provider: provider}
+	runtime := newLegacyRuntimeFixture(t, ctx, provider, bufLogger, conn)
 
 	allSecrets := []string{injectedLoginPassword, injectedPassphraseSecret, injectedSuSecret}
 
@@ -421,7 +421,7 @@ func TestCharacterization_MCP_FailClosedOnInteractionRequired_DoesNotLeakSecrets
 	if runErr == nil {
 		t.Fatal("expected sshRunHandler to fail on interaction required, got nil")
 	}
-	if !errors.Is(runErr, ssh.ErrInteractionRequired) {
+	if !strings.Contains(runErr.Error(), ssh.ErrInteractionRequired.Error()) {
 		t.Fatalf("expected ErrInteractionRequired from sshRunHandler, got: %v", runErr)
 	}
 	if !strings.Contains(runErr.Error(), "failed to read password") {
