@@ -23,6 +23,7 @@ Historical implementation records describe validation at the time; they do not i
 
 ## Accepted design, pending implementation
 
+- [Shared core and MCP interface decoupling](./shared-core-decoupling)
 - [Zero-configuration credential design](./credential-experience-design)
 - [Credential experience implementation plan](./credential-experience-plan)
 - [Release-note draft](./credential-experience-release)

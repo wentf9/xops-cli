@@ -23,6 +23,7 @@ golangci-lint run ./...
 
 ## 已确认、待实现的设计
 
+- [公共代码与 MCP 接口解耦设计](./shared-core-decoupling)
 - [凭据零配置体验设计](./credential-experience-design)
 - [凭据体验实施计划](./credential-experience-plan)
 - [更新说明草案](./credential-experience-release)

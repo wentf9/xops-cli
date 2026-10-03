@@ -1,0 +1,1033 @@
+[
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Copy a remote file or directory to another remote location recursively.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "destPath": {
+          "description": "Absolute path to destination",
+          "type": "string"
+        },
+        "nodeID": {
+          "description": "Node ID for the remote machine",
+          "type": "string"
+        },
+        "srcPath": {
+          "description": "Absolute path to source",
+          "type": "string"
+        }
+      },
+      "required": [
+        "nodeID",
+        "srcPath",
+        "destPath"
+      ],
+      "type": "object"
+    },
+    "name": "xops_fs_cp",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "description": "Operation status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "idempotentHint": false,
+      "readOnlyHint": true
+    },
+    "description": "List remote directory files with attributes (size, modTime, isDir, permissions).",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "nodeID": {
+          "description": "Node ID for the remote machine",
+          "type": "string"
+        },
+        "path": {
+          "description": "Absolute path to the remote directory",
+          "type": "string"
+        }
+      },
+      "required": [
+        "nodeID",
+        "path"
+      ],
+      "type": "object"
+    },
+    "name": "xops_fs_ls",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "files": {
+          "description": "List of files in the directory",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "isDir": {
+                "description": "True if it is a directory",
+                "type": "boolean"
+              },
+              "modTime": {
+                "description": "Last modification time",
+                "type": "string"
+              },
+              "mode": {
+                "description": "File mode/permissions",
+                "type": "string"
+              },
+              "name": {
+                "description": "File name",
+                "type": "string"
+              },
+              "size": {
+                "description": "Size in bytes",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "name",
+              "size",
+              "mode",
+              "modTime",
+              "isDir"
+            ],
+            "type": "object"
+          },
+          "type": [
+            "null",
+            "array"
+          ]
+        },
+        "status": {
+          "description": "Operation status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "files",
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Create a remote directory, along with any necessary parents.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "nodeID": {
+          "description": "Node ID for the remote machine",
+          "type": "string"
+        },
+        "path": {
+          "description": "Absolute path to the directory to create",
+          "type": "string"
+        }
+      },
+      "required": [
+        "nodeID",
+        "path"
+      ],
+      "type": "object"
+    },
+    "name": "xops_fs_mkdir",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "description": "Operation status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Move or rename a remote file/directory.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "newPath": {
+          "description": "New absolute destination path",
+          "type": "string"
+        },
+        "nodeID": {
+          "description": "Node ID for the remote machine",
+          "type": "string"
+        },
+        "oldPath": {
+          "description": "Original absolute path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "nodeID",
+        "oldPath",
+        "newPath"
+      ],
+      "type": "object"
+    },
+    "name": "xops_fs_mv",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "description": "Operation status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Remove a remote file or directory recursively safely.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "nodeID": {
+          "description": "Node ID for the remote machine",
+          "type": "string"
+        },
+        "path": {
+          "description": "Absolute path to the file/directory to securely delete",
+          "type": "string"
+        }
+      },
+      "required": [
+        "nodeID",
+        "path"
+      ],
+      "type": "object"
+    },
+    "name": "xops_fs_rm",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "description": "Operation status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Create a new empty remote file.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "nodeID": {
+          "description": "Node ID for the remote machine",
+          "type": "string"
+        },
+        "path": {
+          "description": "Absolute path to the file to create",
+          "type": "string"
+        }
+      },
+      "required": [
+        "nodeID",
+        "path"
+      ],
+      "type": "object"
+    },
+    "name": "xops_fs_touch",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "description": "Operation status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "idempotentHint": false,
+      "readOnlyHint": true
+    },
+    "description": "List all available SSH nodes managed by XOps, optionally filtered by tag. Returns an array of node IDs that can be used with xops_ssh_run.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "tag": {
+          "description": "Filter nodes by tag. If empty, lists all nodes.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "xops_list_nodes",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "nodes": {
+          "description": "List of available nodes with detailed information",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "address": {
+                "description": "Host address and port",
+                "type": "string"
+              },
+              "alias": {
+                "description": "Node aliases",
+                "items": {
+                  "type": "string"
+                },
+                "type": [
+                  "null",
+                  "array"
+                ]
+              },
+              "authType": {
+                "description": "Authentication type",
+                "type": "string"
+              },
+              "id": {
+                "description": "Node ID / Name",
+                "type": "string"
+              },
+              "proxyJump": {
+                "description": "Proxy jump host",
+                "type": "string"
+              },
+              "tags": {
+                "description": "Node tags",
+                "items": {
+                  "type": "string"
+                },
+                "type": [
+                  "null",
+                  "array"
+                ]
+              },
+              "user": {
+                "description": "SSH user",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "address",
+              "user",
+              "authType"
+            ],
+            "type": "object"
+          },
+          "type": [
+            "null",
+            "array"
+          ]
+        },
+        "status": {
+          "description": "Operation status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "nodes",
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "idempotentHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Prepare a single-file download. Use a CLIENT-local command to GET the binary stream into a temporary file. Query status and compare size and SHA-256 before promoting the local file. Server state streamed does not confirm local saving.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "nodeID": {
+          "description": "Managed SSH node ID",
+          "type": "string"
+        },
+        "remotePath": {
+          "description": "Absolute source file path on the SSH target",
+          "type": "string"
+        },
+        "requestID": {
+          "description": "Client-generated idempotency key",
+          "type": "string"
+        }
+      },
+      "required": [
+        "requestID",
+        "nodeID",
+        "remotePath"
+      ],
+      "type": "object"
+    },
+    "name": "xops_prepare_download",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "cancelURL": {
+          "type": "string"
+        },
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "method": {
+          "type": "string"
+        },
+        "statusURL": {
+          "type": "string"
+        },
+        "task": {
+          "additionalProperties": false,
+          "properties": {
+            "bytes": {
+              "type": "integer"
+            },
+            "cancelRequested": {
+              "type": "boolean"
+            },
+            "cleanupPending": {
+              "type": "boolean"
+            },
+            "direction": {
+              "type": "string"
+            },
+            "error": {
+              "type": "string"
+            },
+            "nodeID": {
+              "type": "string"
+            },
+            "operationID": {
+              "type": "string"
+            },
+            "remotePath": {
+              "type": "string"
+            },
+            "resolved": {
+              "type": "boolean"
+            },
+            "sha256": {
+              "type": "string"
+            },
+            "size": {
+              "type": "integer"
+            },
+            "startBefore": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string"
+            },
+            "statusExpiresAt": {
+              "type": "string"
+            },
+            "temporaryOwnershipConfirmed": {
+              "type": "boolean"
+            },
+            "transferID": {
+              "type": "string"
+            },
+            "updatedAt": {
+              "type": "string"
+            },
+            "warning": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "transferID",
+            "operationID",
+            "direction",
+            "nodeID",
+            "remotePath",
+            "state",
+            "size",
+            "bytes",
+            "cleanupPending",
+            "temporaryOwnershipConfirmed",
+            "cancelRequested",
+            "resolved",
+            "startBefore",
+            "statusExpiresAt",
+            "updatedAt"
+          ],
+          "type": "object"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "task",
+        "statusURL",
+        "cancelURL"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Prepare a single-file upload. Does not transfer the file. Read the CLIENT file with a local command and PUT its binary bytes to the returned URL with the returned headers. Then query task status. Overwrite requires atomic replacement; destination mode is 0600. Keep requestID when retrying preparation, never automatically retry data transfer.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "nodeID": {
+          "description": "Managed SSH node ID",
+          "type": "string"
+        },
+        "overwrite": {
+          "description": "Explicitly replace an existing ordinary file atomically; new file mode is 0600",
+          "type": "boolean"
+        },
+        "remotePath": {
+          "description": "Absolute destination file path on the SSH target",
+          "type": "string"
+        },
+        "requestID": {
+          "description": "Client-generated idempotency key; keep the same key when retrying preparation",
+          "type": "string"
+        },
+        "sha256": {
+          "description": "Lowercase SHA-256 of the client file",
+          "type": "string"
+        },
+        "size": {
+          "description": "Exact client file size in bytes",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "requestID",
+        "nodeID",
+        "remotePath",
+        "size",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "name": "xops_prepare_upload",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "cancelURL": {
+          "type": "string"
+        },
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "method": {
+          "type": "string"
+        },
+        "statusURL": {
+          "type": "string"
+        },
+        "task": {
+          "additionalProperties": false,
+          "properties": {
+            "bytes": {
+              "type": "integer"
+            },
+            "cancelRequested": {
+              "type": "boolean"
+            },
+            "cleanupPending": {
+              "type": "boolean"
+            },
+            "direction": {
+              "type": "string"
+            },
+            "error": {
+              "type": "string"
+            },
+            "nodeID": {
+              "type": "string"
+            },
+            "operationID": {
+              "type": "string"
+            },
+            "remotePath": {
+              "type": "string"
+            },
+            "resolved": {
+              "type": "boolean"
+            },
+            "sha256": {
+              "type": "string"
+            },
+            "size": {
+              "type": "integer"
+            },
+            "startBefore": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string"
+            },
+            "statusExpiresAt": {
+              "type": "string"
+            },
+            "temporaryOwnershipConfirmed": {
+              "type": "boolean"
+            },
+            "transferID": {
+              "type": "string"
+            },
+            "updatedAt": {
+              "type": "string"
+            },
+            "warning": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "transferID",
+            "operationID",
+            "direction",
+            "nodeID",
+            "remotePath",
+            "state",
+            "size",
+            "bytes",
+            "cleanupPending",
+            "temporaryOwnershipConfirmed",
+            "cancelRequested",
+            "resolved",
+            "startBefore",
+            "statusExpiresAt",
+            "updatedAt"
+          ],
+          "type": "object"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "task",
+        "statusURL",
+        "cancelURL"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "idempotentHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Read a remote file via SFTP. Supports chunked reading via offset and limit to prevent memory overflow on large files. Returns EOF=true if the end of file is reached.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "description": "Max bytes to read (default 50KB, max 100KB)",
+          "type": "integer"
+        },
+        "nodeID": {
+          "description": "Node ID for the remote machine",
+          "type": "string"
+        },
+        "offset": {
+          "description": "Byte offset to start reading from",
+          "type": "integer"
+        },
+        "path": {
+          "description": "Absolute path to the remote file",
+          "type": "string"
+        }
+      },
+      "required": [
+        "nodeID",
+        "path"
+      ],
+      "type": "object"
+    },
+    "name": "xops_read_file",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "description": "File content represented as string",
+          "type": "string"
+        },
+        "eof": {
+          "description": "True if end of file reached",
+          "type": "boolean"
+        },
+        "size": {
+          "description": "Total size of the remote file",
+          "type": "integer"
+        },
+        "status": {
+          "description": "Operation status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "content",
+        "eof",
+        "size",
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Execute a shell command on a specific SSH node managed by XOps. Returns the command output.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "description": "The shell command to execute",
+          "type": "string"
+        },
+        "nodeID": {
+          "description": "The ID of the node to execute command on",
+          "type": "string"
+        },
+        "sudo": {
+          "description": "Whether to use sudo to execute the command",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "nodeID",
+        "command"
+      ],
+      "type": "object"
+    },
+    "name": "xops_ssh_run",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "error": {
+          "description": "Error message if failed",
+          "type": "string"
+        },
+        "output": {
+          "description": "Command stdout/stderr",
+          "type": "string"
+        },
+        "status": {
+          "description": "Operation status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "output",
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Request transfer cancellation. A committing or unknown upload cannot be reported as safely cancelled.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "transferID": {
+          "description": "Transfer task ID returned by a prepare tool",
+          "type": "string"
+        }
+      },
+      "required": [
+        "transferID"
+      ],
+      "type": "object"
+    },
+    "name": "xops_transfer_cancel",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes": {
+          "type": "integer"
+        },
+        "cancelRequested": {
+          "type": "boolean"
+        },
+        "cleanupPending": {
+          "type": "boolean"
+        },
+        "direction": {
+          "type": "string"
+        },
+        "error": {
+          "type": "string"
+        },
+        "nodeID": {
+          "type": "string"
+        },
+        "operationID": {
+          "type": "string"
+        },
+        "remotePath": {
+          "type": "string"
+        },
+        "resolved": {
+          "type": "boolean"
+        },
+        "sha256": {
+          "type": "string"
+        },
+        "size": {
+          "type": "integer"
+        },
+        "startBefore": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "statusExpiresAt": {
+          "type": "string"
+        },
+        "temporaryOwnershipConfirmed": {
+          "type": "boolean"
+        },
+        "transferID": {
+          "type": "string"
+        },
+        "updatedAt": {
+          "type": "string"
+        },
+        "warning": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "transferID",
+        "operationID",
+        "direction",
+        "nodeID",
+        "remotePath",
+        "state",
+        "size",
+        "bytes",
+        "cleanupPending",
+        "temporaryOwnershipConfirmed",
+        "cancelRequested",
+        "resolved",
+        "startBefore",
+        "statusExpiresAt",
+        "updatedAt"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "idempotentHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Query transfer state, checksum and cleanup status. Never automatically retry an unknown commit.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "transferID": {
+          "description": "Transfer task ID returned by a prepare tool",
+          "type": "string"
+        }
+      },
+      "required": [
+        "transferID"
+      ],
+      "type": "object"
+    },
+    "name": "xops_transfer_status",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes": {
+          "type": "integer"
+        },
+        "cancelRequested": {
+          "type": "boolean"
+        },
+        "cleanupPending": {
+          "type": "boolean"
+        },
+        "direction": {
+          "type": "string"
+        },
+        "error": {
+          "type": "string"
+        },
+        "nodeID": {
+          "type": "string"
+        },
+        "operationID": {
+          "type": "string"
+        },
+        "remotePath": {
+          "type": "string"
+        },
+        "resolved": {
+          "type": "boolean"
+        },
+        "sha256": {
+          "type": "string"
+        },
+        "size": {
+          "type": "integer"
+        },
+        "startBefore": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "statusExpiresAt": {
+          "type": "string"
+        },
+        "temporaryOwnershipConfirmed": {
+          "type": "boolean"
+        },
+        "transferID": {
+          "type": "string"
+        },
+        "updatedAt": {
+          "type": "string"
+        },
+        "warning": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "transferID",
+        "operationID",
+        "direction",
+        "nodeID",
+        "remotePath",
+        "state",
+        "size",
+        "bytes",
+        "cleanupPending",
+        "temporaryOwnershipConfirmed",
+        "cancelRequested",
+        "resolved",
+        "startBefore",
+        "statusExpiresAt",
+        "updatedAt"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Write or append content to a remote file via SFTP. Use the append flag for chunked writing of large files.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "append": {
+          "description": "If true, append to existing file; if false, overwrite completely",
+          "type": "boolean"
+        },
+        "content": {
+          "description": "Content to write",
+          "type": "string"
+        },
+        "nodeID": {
+          "description": "Node ID for the remote machine",
+          "type": "string"
+        },
+        "path": {
+          "description": "Absolute path to the remote file",
+          "type": "string"
+        }
+      },
+      "required": [
+        "nodeID",
+        "path",
+        "content"
+      ],
+      "type": "object"
+    },
+    "name": "xops_write_file",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "bytesWritten": {
+          "description": "Number of bytes written",
+          "type": "integer"
+        },
+        "status": {
+          "description": "Operation status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "bytesWritten",
+        "status"
+      ],
+      "type": "object"
+    }
+  }
+]

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"github.com/wentf9/xops-cli/core/mcp/policy"
 	"github.com/wentf9/xops-cli/pkg/models"
 	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 )
@@ -27,27 +28,11 @@ func (c *Configuration) CanRememberCredentials() bool {
 	return ok && store.Type != StoreTypeNone && !store.ReadOnly
 }
 
-// GuardrailConfig configures the MCP safety guardrail.
-type GuardrailConfig struct {
-	Enabled           bool                        `yaml:"enabled"`
-	AuditLog          string                      `yaml:"audit_log,omitempty"`
-	ApprovalThreshold string                      `yaml:"approval_threshold,omitempty"` // "safe"|"moderate"|"dangerous"
-	BlockedPatterns   []string                    `yaml:"blocked_patterns,omitempty"`
-	ProtectedPaths    []string                    `yaml:"protected_paths,omitempty"`
-	NodeOverrides     map[string]NodeGuardrailCfg `yaml:"nodes,omitempty"`
+// GuardrailConfig is the legacy name for the shared policy configuration.
+type GuardrailConfig = policy.Config
 
-	// NoElicitFallback controls behavior when the MCP client does not support
-	// Elicitation (e.g. Gemini CLI).
-	//   "deny"      — reject all operations that need approval (most secure)
-	//   "allow"     — allow all, trust client-side tool approval + ToolAnnotations
-	//   "downgrade" — allow moderate, still deny dangerous (recommended default)
-	NoElicitFallback string `yaml:"no_elicit_fallback,omitempty"`
-}
-
-// NodeGuardrailCfg holds per-node (glob pattern) policy overrides.
-type NodeGuardrailCfg struct {
-	ApprovalThreshold string `yaml:"approval_threshold"`
-}
+// NodeGuardrailCfg is the legacy name for a per-node policy override.
+type NodeGuardrailCfg = policy.NodeConfig
 
 // ConfigProvider is the read-only configuration view consumed by commands,
 // connectors, and presentation code. Durable mutations intentionally do not

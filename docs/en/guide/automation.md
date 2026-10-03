@@ -33,6 +33,8 @@ xops mcp serve
 
 MCP exposes host operations to AI clients. Set the client command to the full path of `xops` and its arguments to `["mcp", "serve"]`. Configure approval thresholds, blocked commands, protected paths, and audit logs in the configuration file's `guardrail` section.
 
+Stdio tool calls have a five-minute default deadline. Set `mcp.tool_timeout`, for example `30m`, for longer calls; expiry cancels that invocation. Background SSH tunnels have their own TTL, and HTTP file transfers use their task deadlines.
+
 When approval is requested, confirm `approved=true` in the client form. Refusal, cancellation or timeout stops the operation. Confirm again if approval expires or the operation's arguments change. If the client cannot display or submit the form, use a client that supports approval.
 
 Prepare credentials and verified host keys before starting; MCP does not display terminal authentication or unlock prompts. If credentials are unavailable, check storage with `xops credential doctor` and restore access.

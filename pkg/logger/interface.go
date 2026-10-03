@@ -1,19 +1,12 @@
 package logger
 
-// DebugLogger 定义中间层组件可选的 Debug 日志能力
-type DebugLogger interface {
-	Debug(msg string, args ...any)
-	Debugf(format string, args ...any)
-}
+import corelog "github.com/wentf9/xops-cli/core/log"
 
-// nopLogger 提供零开销的默认空实现
-type nopLogger struct{}
-
-func (nopLogger) Debug(msg string, args ...any)     {}
-func (nopLogger) Debugf(format string, args ...any) {}
+// DebugLogger retains the legacy name for the shared diagnostic contract.
+type DebugLogger = corelog.DebugLogger
 
 // NopLogger 是默认的空实现实例，保证未注入 Logger 时不发生 nil panic
-var NopLogger DebugLogger = nopLogger{}
+var NopLogger DebugLogger = corelog.NopLogger
 
 // defaultAdapter 将包级 Debug/Debugf 适配为 DebugLogger 接口
 type defaultAdapter struct{}

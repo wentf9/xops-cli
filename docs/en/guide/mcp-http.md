@@ -183,6 +183,12 @@ After the complete upload body has been read, the HTTP read-idle deadline no lon
 
 After a service restart, prepare new tasks for transfers that had not started. Interrupted transfers do not resume automatically. An `unknown` task blocks further uploads to that destination until its outcome is checked.
 
+New tasks use private v2 records containing original authorization and connection versions. Target, credential, jump, trust or policy changes prevent old ready tasks from receiving usable data credentials; verification and cleanup also reject stale bindings and retain evidence for manual handling. Uploads with a completed commit reservation retain their original connection and independent deadline. Task/request cancellation before that reservation prevents commit; safe cancellation is no longer promised afterward.
+
+Task records, including authorization metadata, are limited to 64 KiB, with preparation reserving room for later state and diagnostic fields. An oversized preparation is rejected without disabling later preparations that fit the limit; this input limit does not require restarting the service. Historical full records still restore their status view while preserving the original file; a warning identifies in-memory recovery, and unknown destination locks remain active. Operator reasons allow 4096 bytes of JSON content, including escape expansion. Actual persistence failures still stop new tasks to preserve protection when write outcomes may be uncertain.
+
+Legacy v1 records remain readable and preserve unknown destination locks. Without a binding, `--verify` and `--cleanup` cannot contact the current node. Independently verify the original target before manual handling; `--resolve-unknown --reason` records an operator conclusion without remote execution. Unknown future versions are rejected without overwriting records.
+
 Stop the XOps MCP service, then list its transfer records:
 
 ```bash

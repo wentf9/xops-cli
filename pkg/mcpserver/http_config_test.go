@@ -7,6 +7,27 @@ import (
 	"github.com/wentf9/xops-cli/pkg/config"
 )
 
+func TestStdioToolDeadlineConfiguration(t *testing.T) {
+	for _, value := range []string{"30m", "0s", "-1s", "invalid"} {
+		cfg := runtimeTestProvider("node").Snapshot()
+		cfg.MCP = &config.MCPConfig{ToolTimeout: value}
+		r, err := NewRuntime(t.Context(), WithConfigProvider(config.NewProviderWithoutOpenSSH(cfg)))
+		if value == "30m" {
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := r.Close(); err != nil {
+				t.Fatal(err)
+			}
+		} else if err == nil {
+			if closeErr := r.Close(); closeErr != nil {
+				t.Error(closeErr)
+			}
+			t.Fatalf("invalid stdio deadline accepted: %s", value)
+		}
+	}
+}
+
 func TestHTTPConfiguredLimitsAndZeroRejection(t *testing.T) {
 	maxActive := 8
 	options, err := HTTPOptionsFromConfig(&config.MCPConfig{MaxActive: &maxActive, StreamIdle: "45s"})
