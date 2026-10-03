@@ -74,6 +74,8 @@ The legacy-facing contract tests stay outside core. MCP schemas, descriptions,
 and annotations are compared against fixtures verified using the original
 remote module `v0.13.1-0.20260930042335-73892b0791e3`. Updating those fixtures
 requires an explicit compatibility review, not a routine refactor regeneration.
+Comparison ignores JSON formatting, including CRLF checkout line endings;
+description text, schema values and array ordering remain significant.
 
 See the [design](../docs/development/shared-core-decoupling.md) for the remaining
 migration and acceptance criteria.
