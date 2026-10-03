@@ -30,10 +30,34 @@ func (t *observeSSETransport) RoundTrip(req *http.Request) (*http.Response, erro
 	return response, err
 }
 
+func observeHTTPInitialization(r *Runtime, finished chan<- struct{}) {
+	next := r.httpHandler
+	finish := sync.OnceFunc(func() { close(finished) })
+	r.httpHandler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		next.ServeHTTP(w, req)
+		if req.Method == http.MethodPost && req.Header.Get("Mcp-Session-Id") == "" {
+			// Observe completion outside admission so its ordinary request slot
+			// is released. Client Connect/SSE readiness can precede this point.
+			finish()
+		}
+	})
+}
+
+func waitHTTPInitialization(t *testing.T, ctx context.Context, finished <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-finished:
+	case <-ctx.Done():
+		t.Fatal("initialize request did not release admission capacity")
+	}
+}
+
 func TestApprovalReplyCompletesAtHTTPRequestLimit(t *testing.T) {
 	var executed atomic.Int32
+	initialized := make(chan struct{})
 	policy := &config.GuardrailConfig{Enabled: true, ApprovalThreshold: "dangerous"}
 	_, server := startHTTPTestRuntime(t, func(o *HTTPOptions) { o.MaxRequests = 2; o.ToolTimeout = 800 * time.Millisecond }, policy, func(r *Runtime) {
+		observeHTTPInitialization(r, initialized)
 		mcp.AddTool(r.server, &mcp.Tool{Name: "guarded_probe"}, guardrail.WithGuardrail(r.guardrail, "guarded_probe",
 			func(struct{}) guardrail.RiskInput { return guardrail.RiskInput{} },
 			func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, map[string]string, error) {
@@ -52,6 +76,7 @@ func TestApprovalReplyCompletesAtHTTPRequestLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer closeTransferTestResource(t, session)
+	waitHTTPInitialization(t, ctx, initialized)
 	select {
 	case <-transport.ready:
 	case <-ctx.Done():
@@ -68,7 +93,9 @@ func TestCancellationCompletesAtHTTPRequestLimit(t *testing.T) {
 		t.Run(fmt.Sprint(requestID), func(t *testing.T) {
 			entered := make(chan struct{})
 			stopped := make(chan struct{})
+			initialized := make(chan struct{})
 			_, server := startHTTPTestRuntime(t, func(o *HTTPOptions) { o.MaxRequests = 2; o.ToolTimeout = 3 * time.Second }, nil, func(r *Runtime) {
+				observeHTTPInitialization(r, initialized)
 				mcp.AddTool(r.server, &mcp.Tool{Name: "cancel_probe"}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, struct{}, error) {
 					close(entered)
 					<-ctx.Done()
@@ -85,19 +112,25 @@ func TestCancellationCompletesAtHTTPRequestLimit(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer closeTransferTestResource(t, session)
+			waitHTTPInitialization(t, ctx, initialized)
 			select {
 			case <-transport.ready:
 			case <-ctx.Done():
 				t.Fatal("SSE connection did not occupy capacity")
 			}
-			done := make(chan error, 1)
+			done := make(chan struct{})
+			var requestErr error
 			go func() {
+				defer close(done)
 				response, err := rawMCPRequest(ctx, server.Client(), server.URL+"/mcp", session.ID(), map[string]any{"jsonrpc": "2.0", "id": requestID, "method": "tools/call", "params": map[string]any{"name": "cancel_probe", "arguments": map[string]any{}}})
 				if response != nil {
+					if response.StatusCode != http.StatusOK {
+						err = errors.Join(err, fmt.Errorf("tool request returned HTTP %d", response.StatusCode))
+					}
 					_, readErr := io.Copy(io.Discard, response.Body)
 					err = errors.Join(err, readErr, response.Body.Close())
 				}
-				done <- err
+				requestErr = err
 			}()
 			// Join the client request even if the cancellation notification is rejected.
 			defer func() {
@@ -110,6 +143,8 @@ func TestCancellationCompletesAtHTTPRequestLimit(t *testing.T) {
 			}()
 			select {
 			case <-entered:
+			case <-done:
+				t.Fatalf("tool request ended before execution: %v", requestErr)
 			case <-ctx.Done():
 				t.Fatal("tool did not start")
 			}
