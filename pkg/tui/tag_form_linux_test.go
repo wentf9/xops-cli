@@ -41,6 +41,9 @@ func testProgramExistingTag(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := newTagFormTestModel(t, "prod")
+	// Model fields belong to Run; retain the safe repository handle before
+	// starting the program so screen assertions cannot race a model update.
+	repository := m.repository
 	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
 	defer cancel()
 	output := &formScreenWriter{cols: 80, rows: 24}
@@ -65,7 +68,7 @@ func testProgramExistingTag(t *testing.T) {
 	output.wait(t, ctx, "┃ "+i18n.T("tui_tag_new_input"))
 	write("\r")
 	output.wait(t, ctx, i18n.Tf("tui_status_tag_removed", map[string]any{"Count": 1}))
-	node, ok := m.repository.GetNode(formCredentialTestNodeID)
+	node, ok := repository.GetNode(formCredentialTestNodeID)
 	if !ok || len(node.Tags) != 0 {
 		t.Fatal("selected tag was not removed")
 	}

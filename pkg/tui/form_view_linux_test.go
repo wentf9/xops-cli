@@ -183,6 +183,10 @@ func testProgramFieldCorrection(t *testing.T, scenario formCorrectionScenario) {
 		t.Fatal(err)
 	}
 	m := newAliasConflictTestModel(t)
+	// Update replaces the entire Model while Run is active. Capture the
+	// concurrency-safe repository before starting it instead of reading a
+	// model field after a rendered frame, which is not an update barrier.
+	repository := m.repository
 	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
 	defer cancel()
 	output := &formScreenWriter{cols: int(scenario.cols), rows: int(scenario.rows)}
@@ -219,7 +223,7 @@ func testProgramFieldCorrection(t *testing.T, scenario formCorrectionScenario) {
 	if scenario.tags {
 		output.wait(t, ctx, "> "+scenario.value)
 	}
-	if m.repository.FindAlias("taken") != "other@192.0.2.2:22" {
+	if repository.FindAlias("taken") != "other@192.0.2.2:22" {
 		t.Fatal("failed save changed alias ownership")
 	}
 	write("\x01\x0bcorrected")
@@ -227,11 +231,11 @@ func testProgramFieldCorrection(t *testing.T, scenario formCorrectionScenario) {
 	write("\x13")
 	output.wait(t, ctx, i18n.Tf("tui_status_saved", map[string]any{"ID": formCredentialTestNodeID}))
 	if scenario.tags {
-		node, ok := m.repository.GetNode(formCredentialTestNodeID)
+		node, ok := repository.GetNode(formCredentialTestNodeID)
 		if !ok || len(node.Tags) != 1 || node.Tags[0] != "corrected" {
 			t.Fatal("corrected tags were not saved")
 		}
-	} else if m.repository.FindAlias("corrected") != formCredentialTestNodeID {
+	} else if repository.FindAlias("corrected") != formCredentialTestNodeID {
 		t.Fatal("corrected alias was not saved")
 	}
 	write("\x03")
