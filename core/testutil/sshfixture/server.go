@@ -91,12 +91,33 @@ func NewWithOptions(ctx context.Context, options Options) (*Server, error) {
 }
 
 func (s *Server) record(err error) {
-	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || s.ctx.Err() != nil {
+	if err == nil || peerClosure(err) || s.ctx.Err() != nil {
 		return
 	}
 	s.mu.Lock()
 	s.errors = append(s.errors, err)
 	s.mu.Unlock()
+}
+
+// A client can disconnect while the fixture remains alive for other clients.
+// Only known peer-close errors are benign; a joined unrelated failure is kept.
+func peerClosure(err error) bool {
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		causes := joined.Unwrap()
+		for _, cause := range causes {
+			if !peerClosure(cause) {
+				return false
+			}
+		}
+		return len(causes) > 0
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		if cause := wrapped.Unwrap(); cause != nil {
+			return peerClosure(cause)
+		}
+	}
+	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) || platformPeerClosure(err)
 }
 
 func (s *Server) accept() {
@@ -259,9 +280,9 @@ func (s *Server) pipe(channel ssh.Channel, requests <-chan *ssh.Request, connect
 	// EOF/cancellation closes both directions before joining their workers.
 	go func() { ssh.DiscardRequests(requests); close(done) }()
 	copied := make(chan struct{})
-	go func() { _, err := io.Copy(channel, connection); s.relayError(err); close(copied) }()
+	go func() { _, err := io.Copy(channel, connection); s.record(err); close(copied) }()
 	_, copyErr := io.Copy(connection, channel)
-	s.relayError(copyErr)
+	s.record(copyErr)
 	s.record(connection.Close())
 	s.record(channel.Close())
 	<-copied
@@ -348,11 +369,4 @@ func (s *Server) acceptForward(connection *ssh.ServerConn, listener net.Listener
 			s.pipe(channel, requests, client)
 		}()
 	}
-}
-
-func (s *Server) relayError(err error) {
-	if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
-		return
-	}
-	s.record(err)
 }

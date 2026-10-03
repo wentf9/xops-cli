@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -91,7 +92,9 @@ func tunnelOpenSSHFixture(t *testing.T, policies ...*config.GuardrailConfig) *le
 	if err := os.WriteFile(keyPath, pem.EncodeToMemory(block), 0600); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	// Testing cancels t.Context before running cleanup callbacks. Keep the
+	// bounded peer alive until its own cleanup, after the runtime joins tunnels.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 15*time.Second)
 	t.Cleanup(cancel)
 	server, err := sshfixture.NewWithOptions(ctx, sshfixture.Options{PublicKeys: []cryptossh.PublicKey{signer.PublicKey()}})
 	if err != nil {
@@ -116,12 +119,48 @@ func tunnelOpenSSHFixture(t *testing.T, policies ...*config.GuardrailConfig) *le
 	if len(policies) > 0 {
 		cfg.Guardrail = policies[0]
 	}
-	return &legacyTunnelFixture{provider: config.NewProviderWithOpenSSHParser(cfg, parser), server: server}
+	return &legacyTunnelFixture{provider: config.NewProviderWithOpenSSHParser(cfg, parser), server: server, ctx: ctx}
 }
 
 type legacyTunnelFixture struct {
 	provider *config.Provider
 	server   *sshfixture.Server
+	ctx      context.Context
+}
+
+func TestLegacyOpenSSHFixtureCleanupOrder(t *testing.T) {
+	var fixture *legacyTunnelFixture
+	t.Run("live remote tunnel", func(t *testing.T) {
+		fixture = tunnelOpenSSHFixture(t)
+		r := newTunnelRuntime(t, fixture)
+		client := connectRuntimeTestClient(t, r)
+		input := tunnelTestInput(t, startTunnelEcho(t), "remote", "cleanup-order")
+		input.NodeID = "web"
+		created := callTunnelTool(t, client, "xops_tunnel_create", input)
+		if created.State != "running" {
+			t.Fatalf("remote tunnel did not start: %+v", created)
+		}
+		assertTunnelEcho(t, created.ListenAddress)
+		// The test context is canceled before cleanup callbacks run. The peer
+		// must remain alive until the runtime has stopped and joined its tunnels.
+		t.Cleanup(func() {
+			if !errors.Is(t.Context().Err(), context.Canceled) {
+				t.Error("test context was not canceled before cleanup")
+			}
+			if err := fixture.ctx.Err(); err != nil {
+				t.Errorf("SSH peer stopped before runtime cleanup: %v", err)
+			}
+			if err := r.Close(); err != nil {
+				t.Errorf("close runtime with live SSH peer: %v", err)
+			}
+			if err := fixture.ctx.Err(); err != nil {
+				t.Errorf("runtime cleanup stopped the SSH peer: %v", err)
+			}
+		})
+	})
+	if fixture == nil || !errors.Is(fixture.ctx.Err(), context.Canceled) {
+		t.Fatal("fixture cleanup did not cancel the SSH peer context")
+	}
 }
 
 func resolveLegacyTestNode(ctx context.Context, host *legacyHost, selector string) (string, error) {
