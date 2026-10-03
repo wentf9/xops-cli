@@ -180,6 +180,11 @@ type HostKeyVerifier interface {
 	Verify(context.Context, HostKeyRequest, cryptoSSH.PublicKey) error
 }
 
+// Optional HostKeyVerifier capability for snapshot-bound negotiation.
+type HostKeyAlgorithmSource interface {
+	HostKeyAlgorithms(context.Context, HostKeyRequest) ([]string, error)
+}
+
 type InputBridge interface {
 	Start(context.Context, InteractiveIO, io.Writer) (InputCopy, error)
 }
@@ -191,6 +196,8 @@ type InputCopy interface {
 ```
 
 InputCopy closes only owned duplicates/cancellation handles, never borrowed standard streams. Close interrupts reading; Wait honors its deadline. Input bridge cleanup stops the copy and joins it under an independent one-second budget. Cancelling the completed operation does not cancel that join or fabricate a command failure. Cleanup timeouts and real errors still propagate. KeyLease ownership transfers upon successful return. Do not switch credentials or terminal behavior between runtimes by mutating process environment.
+
+Pinned-trust hosts can implement HostKeyAlgorithmSource when a peer offers multiple host-key algorithms. Selection uses the handshake coordinator context and deadline, with NodeID, Host, Port, User and trust version; Remote/Hostname are not available before negotiation. Only the SSH library's securely supported algorithms are accepted. Empty lists, lookup failures and timeouts fail closed without default fallback. RSA pins select rsa-sha2-512/rsa-sha2-256. Verify must still compare the actual key exactly. Existing verifiers without this optional capability retain default negotiation.
 
 Avoid speculative plugin frameworks, ORM repositories, or arbitrary protocol executors.
 
