@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/internal/credentialfile/format"
 	"github.com/wentf9/xops-cli/internal/kdfhelper"
 	"github.com/wentf9/xops-cli/pkg/credential"
@@ -188,7 +189,7 @@ func TestUnauthenticatedRevisionDoesNotAdvanceWatermark(t *testing.T) {
 	lease.release()
 	bad := newerKeyFileMeta(t, f)
 	bad[len(bad)-1] ^= 1
-	if _, err := s.session.acquire(t.Context(), bad); !errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if _, err := s.session.acquire(t.Context(), bad); !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("bad wrapping accepted: %v", err)
 	}
 	lease, err = s.session.acquire(t.Context(), f.data["meta_file"])

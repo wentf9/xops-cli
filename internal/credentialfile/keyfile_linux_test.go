@@ -7,7 +7,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/wentf9/xops-cli/pkg/credential"
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 )
 
 type partialKeyReader struct {
@@ -43,7 +43,7 @@ func TestKeyMaterialExactLength(t *testing.T) {
 			clear(key)
 			continue
 		}
-		if !errors.Is(err, credential.ErrCredentialStoreLocked) || key != nil {
+		if !errors.Is(err, coreauth.ErrCredentialStoreLocked) || key != nil {
 			t.Fatalf("length %d accepted: %v", n, err)
 		}
 	}

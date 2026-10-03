@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/internal/credentialfile/format"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"golang.org/x/sys/unix"
@@ -55,7 +56,7 @@ func TestFileStoreUnsafeFilesFailClosed(t *testing.T) {
 			defer cancel()
 			secret, err := s.Get(ctx, f.ref)
 			secret.Zero()
-			want := credential.ErrCredentialAccessDenied
+			want := coreauth.ErrCredentialAccessDenied
 			if kind == "oversize" {
 				want = format.ErrCorrupt
 			}
@@ -98,7 +99,7 @@ func TestFileStoreDirectoryAndLockReplacement(t *testing.T) {
 						t.Error(closeErr)
 					}
 				}
-				if !errors.Is(err, credential.ErrCredentialAccessDenied) {
+				if !errors.Is(err, coreauth.ErrCredentialAccessDenied) {
 					t.Fatalf("root alias accepted: %v", err)
 				}
 				return
@@ -118,7 +119,7 @@ func TestFileStoreDirectoryAndLockReplacement(t *testing.T) {
 				writeFixtureFile(t, path, nil)
 			}
 			_, err := s.Get(t.Context(), f.ref)
-			want := credential.ErrCredentialAccessDenied
+			want := coreauth.ErrCredentialAccessDenied
 			if target == "lock" {
 				want = ErrRevisionChanged
 			}
@@ -196,7 +197,7 @@ func TestFileStoreUnlockRunsOutsideFileLock(t *testing.T) {
 		return key, err
 	})
 	s := f.open(t, fileOps{})
-	if _, err := s.Get(t.Context(), f.ref); !errors.Is(err, credential.ErrCredentialNotFound) {
+	if _, err := s.Get(t.Context(), f.ref); !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		t.Fatalf("unlock held a lock: %v", err)
 	}
 }
@@ -355,7 +356,7 @@ func TestFileStoreDoesNotLeakHandlesOnRejectedDirectories(t *testing.T) {
 		t.Fatal(err)
 	}
 	for range 20 {
-		if _, err := s.Get(t.Context(), f.ref); !errors.Is(err, credential.ErrCredentialAccessDenied) {
+		if _, err := s.Get(t.Context(), f.ref); !errors.Is(err, coreauth.ErrCredentialAccessDenied) {
 			t.Fatalf("unsafe dir: %v", err)
 		}
 	}
@@ -370,7 +371,7 @@ func TestFileStoreRechecksRootPermissions(t *testing.T) {
 	if err := os.Chmod(f.root, 0755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Get(t.Context(), f.ref); !errors.Is(err, credential.ErrCredentialAccessDenied) {
+	if _, err := s.Get(t.Context(), f.ref); !errors.Is(err, coreauth.ErrCredentialAccessDenied) {
 		t.Fatalf("unsafe root accepted: %v", err)
 	}
 }

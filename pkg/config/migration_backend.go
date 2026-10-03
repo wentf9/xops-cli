@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -143,11 +144,11 @@ func (m *CredentialMigrator) copyBackendCredential(ctx context.Context, registry
 		return fmt.Errorf("read migration source %d: %w", index, err)
 	}
 	if len(source.Value) == 0 || source.IsExpired(time.Now()) {
-		return fmt.Errorf("%w: migration source %d empty or expired", credential.ErrCredentialNotFound, index)
+		return fmt.Errorf("%w: migration source %d empty or expired", coreauth.ErrCredentialNotFound, index)
 	}
 	got, err := store.Get(ctx, entry.Target)
 	defer got.Zero()
-	if errors.Is(err, credential.ErrCredentialNotFound) {
+	if errors.Is(err, coreauth.ErrCredentialNotFound) {
 		if err := store.Put(ctx, entry.Target, source); err != nil {
 			return fmt.Errorf("write backend migration item %d: %w", index, err)
 		}
@@ -289,7 +290,7 @@ func (m *CredentialMigrator) dryRunBackend(ctx context.Context, opts MigrationOp
 	if probe {
 		secret, err := registry.Resolve(ctx, credential.Ref{StoreID: opts.ToStore, ItemID: "migration-probe-" + credential.GenerateItemID()})
 		defer secret.Zero()
-		if err != nil && !errors.Is(err, credential.ErrCredentialNotFound) {
+		if err != nil && !errors.Is(err, coreauth.ErrCredentialNotFound) {
 			return MigrationReport{}, fmt.Errorf("probe destination: %w", err)
 		}
 	}

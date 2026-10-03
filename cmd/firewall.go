@@ -9,16 +9,15 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/spf13/cobra"
 	cmdutils "github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/executor"
 	"github.com/wentf9/xops-cli/pkg/firewall"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
-	"github.com/wentf9/xops-cli/pkg/ssh"
-
-	"github.com/spf13/cobra"
 	pkgutils "github.com/wentf9/xops-cli/pkg/utils"
 )
 

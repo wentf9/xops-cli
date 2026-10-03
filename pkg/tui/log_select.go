@@ -9,8 +9,8 @@ import (
 	"charm.land/bubbles/v2/list"
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/i18n"
-	"github.com/wentf9/xops-cli/pkg/ssh"
 )
 
 type logScannerConnectedMsg struct {

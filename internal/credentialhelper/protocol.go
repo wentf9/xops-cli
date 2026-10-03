@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -82,17 +83,17 @@ func MapErrorCode(code, message string) error {
 	var baseErr error
 	switch trimmedCode {
 	case "not-found":
-		baseErr = credential.ErrCredentialNotFound
+		baseErr = coreauth.ErrCredentialNotFound
 	case "locked":
-		baseErr = credential.ErrCredentialStoreLocked
+		baseErr = coreauth.ErrCredentialStoreLocked
 	case "unavailable":
-		baseErr = credential.ErrCredentialStoreUnavailable
+		baseErr = coreauth.ErrCredentialStoreUnavailable
 	case "denied":
-		baseErr = credential.ErrCredentialAccessDenied
+		baseErr = coreauth.ErrCredentialAccessDenied
 	case "read-only":
 		baseErr = credential.ErrCredentialStoreReadOnly
 	default:
-		baseErr = fmt.Errorf("%w: credential helper returned unrecognized error code", credential.ErrCredentialStoreUnavailable)
+		baseErr = fmt.Errorf("%w: credential helper returned unrecognized error code", coreauth.ErrCredentialStoreUnavailable)
 	}
 
 	trimmedMsg := strings.TrimSpace(message)

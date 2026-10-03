@@ -15,11 +15,13 @@ import (
 	"testing"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
+	"github.com/wentf9/xops-cli/core/concurrent"
+	"github.com/wentf9/xops-cli/core/ssh"
+	"github.com/wentf9/xops-cli/internal/sshenv"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
-	"github.com/wentf9/xops-cli/pkg/ssh"
-	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 	cryptossh "golang.org/x/crypto/ssh"
 )
 
@@ -39,7 +41,7 @@ func (s *adapterCredentialStore) Get(_ context.Context, ref credential.Ref) (cre
 	defer s.mu.Unlock()
 	secret, ok := s.data[ref.ItemID]
 	if !ok {
-		return credential.Secret{}, credential.ErrCredentialNotFound
+		return credential.Secret{}, coreauth.ErrCredentialNotFound
 	}
 	return credential.NewSecret(secret.Value), nil
 }
@@ -1172,7 +1174,7 @@ func TestSSHAdapter_RealRepository_ConcurrentAuthUpdate_MismatchedCommittedToken
 
 	prompter := &testAdapterPrompter{returnSecret: loginPwd}
 	connector := ssh.NewConnector(
-		adapter,
+		adapter, ssh.WithEnvironment(sshenv.Discover()),
 		ssh.WithSecretResolver(adapter),
 		ssh.WithSecretPrompter(prompter),
 		ssh.WithCredentialRecorder(interceptingRecorder),
@@ -1265,7 +1267,7 @@ func TestSSHAdapter_RealRepository_CrossKind_HandshakeAuthUpdate_PreservesSudoSn
 
 	prompter := &testAdapterPrompter{returnSecret: loginPwd}
 	connector := ssh.NewConnector(
-		adapter,
+		adapter, ssh.WithEnvironment(sshenv.Discover()),
 		ssh.WithSecretResolver(adapter),
 		ssh.WithSecretPrompter(prompter),
 		ssh.WithCredentialRecorder(interceptingRecorder),
@@ -1352,7 +1354,7 @@ func TestSSHAdapter_RealRepository_CrossKind_SudoUpdate_PreservesAuthSnapshot_Re
 
 	prompter := &testAdapterPrompter{returnSecret: loginPwd}
 	connector := ssh.NewConnector(
-		adapter,
+		adapter, ssh.WithEnvironment(sshenv.Discover()),
 		ssh.WithSecretResolver(adapter),
 		ssh.WithSecretPrompter(prompter),
 		ssh.WithCredentialRecorder(interceptingRecorder),

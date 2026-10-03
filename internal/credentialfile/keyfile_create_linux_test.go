@@ -11,7 +11,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/wentf9/xops-cli/pkg/credential"
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 )
 
 func TestEnsureWrappingKeyCreatesAndReuses(t *testing.T) {
@@ -174,7 +174,7 @@ func TestEnsureWrappingKeyCanceled(t *testing.T) {
 func TestWrappingKeyMustBeOutsideVault(t *testing.T) {
 	root := t.TempDir()
 	err := validateWrappingKeyLocation(root, Wrapping{Mode: "key-file", KeyFile: filepath.Join(root, "CURRENT")})
-	if !errors.Is(err, credential.ErrCredentialAccessDenied) {
+	if !errors.Is(err, coreauth.ErrCredentialAccessDenied) {
 		t.Fatal("accepted key inside vault")
 	}
 }

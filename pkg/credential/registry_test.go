@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 )
 
 type dummySource struct {
@@ -76,8 +78,8 @@ func TestRegistryBasic(t *testing.T) {
 	}
 
 	_, err = reg.Get("missing")
-	if !errors.Is(err, ErrStoreNotFound) {
-		t.Fatalf("expected ErrStoreNotFound, got: %v", err)
+	if !errors.Is(err, coreauth.ErrStoreNotFound) {
+		t.Fatalf("expected coreauth.ErrStoreNotFound, got: %v", err)
 	}
 
 	// 验证 GetStore

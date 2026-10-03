@@ -5,10 +5,10 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/wentf9/xops-cli/core/concurrent"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
-	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 )
 
 func TestOfflineDoctorLifecycle(t *testing.T) {

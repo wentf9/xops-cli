@@ -9,9 +9,10 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	mcpruntime "github.com/wentf9/xops-cli/core/mcp/runtime"
+	"github.com/wentf9/xops-cli/internal/mcphost"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
-	"github.com/wentf9/xops-cli/pkg/mcpserver"
 )
 
 func addMCPFlags(cmd *cobra.Command) {
@@ -26,13 +27,13 @@ func addMCPFlags(cmd *cobra.Command) {
 	f.StringSlice("allowed-origins", nil, i18n.T("mcp_allowed_origins_flag"))
 }
 
-func resolveMCPOptions(cmd *cobra.Command, configuration *config.Configuration, configPath string) (string, mcpserver.HTTPOptions, error) {
+func resolveMCPOptions(cmd *cobra.Command, configuration *config.Configuration, configPath string) (string, mcpruntime.HTTPOptions, error) {
 	settings := &config.MCPConfig{}
 	if configuration != nil && configuration.MCP != nil {
 		settings = configuration.MCP.Clone()
 	}
 	if err := overrideMCPFlags(cmd, settings); err != nil {
-		return "", mcpserver.HTTPOptions{}, err
+		return "", mcpruntime.HTTPOptions{}, err
 	}
 	if settings.Transport == "" {
 		settings.Transport = "stdio"
@@ -41,12 +42,12 @@ func resolveMCPOptions(cmd *cobra.Command, configuration *config.Configuration, 
 	case "stdio":
 		for _, flag := range []string{"listen", "public-url", "token-file", "token-env", "state-dir", "allowed-hosts", "allowed-origins"} {
 			if cmd.Flags().Changed(flag) {
-				return "", mcpserver.HTTPOptions{}, errors.New("HTTP options require --transport http")
+				return "", mcpruntime.HTTPOptions{}, errors.New("HTTP options require --transport http")
 			}
 		}
-		return "stdio", mcpserver.HTTPOptions{}, nil
+		return "stdio", mcpruntime.HTTPOptions{}, nil
 	case "http":
-		o, err := mcpserver.HTTPOptionsFromConfig(settings)
+		o, err := mcphost.HTTPOptionsFromConfig(settings)
 		if err != nil {
 			return "", o, err
 		}
@@ -56,7 +57,7 @@ func resolveMCPOptions(cmd *cobra.Command, configuration *config.Configuration, 
 		o.Token, err = readMCPToken(settings.TokenFile, settings.TokenEnv)
 		return "http", o, err
 	default:
-		return "", mcpserver.HTTPOptions{}, errors.New("MCP transport must be stdio or http")
+		return "", mcpruntime.HTTPOptions{}, errors.New("MCP transport must be stdio or http")
 	}
 }
 

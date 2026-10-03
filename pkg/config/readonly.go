@@ -5,13 +5,14 @@ import (
 	"fmt"
 	"os"
 
+	corepolicy "github.com/wentf9/xops-cli/core/mcp/policy"
 	"github.com/wentf9/xops-cli/pkg/crypto"
 	"gopkg.in/yaml.v3"
 )
 
 // ReadMCPSettings reads only service settings and audit policy, without loading
 // credentials, acquiring writable config locks or migrating legacy secrets.
-func ReadMCPSettings(path string) (*MCPConfig, *GuardrailConfig, error) {
+func ReadMCPSettings(path string) (*MCPConfig, *corepolicy.Config, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil, nil
@@ -20,8 +21,8 @@ func ReadMCPSettings(path string) (*MCPConfig, *GuardrailConfig, error) {
 		return nil, nil, fmt.Errorf("read MCP configuration settings: %w", err)
 	}
 	var settings struct {
-		MCP       *MCPConfig       `yaml:"mcp"`
-		Guardrail *GuardrailConfig `yaml:"guardrail"`
+		MCP       *MCPConfig         `yaml:"mcp"`
+		Guardrail *corepolicy.Config `yaml:"guardrail"`
 	}
 	if err := yaml.Unmarshal(data, &settings); err != nil {
 		// YAML's original diagnostic may contain scalar values from a legacy

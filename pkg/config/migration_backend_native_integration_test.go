@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"gopkg.in/yaml.v3"
 )
@@ -128,7 +129,7 @@ func cleanNativeMigrationRefs(t *testing.T, m *CredentialMigrator, nativeID stri
 		}
 	}
 	for _, ref := range refs {
-		if err := native.Delete(t.Context(), ref); err != nil && !errors.Is(err, credential.ErrCredentialNotFound) {
+		if err := native.Delete(t.Context(), ref); err != nil && !errors.Is(err, coreauth.ErrCredentialNotFound) {
 			t.Errorf("clean native test reference: %v", err)
 		}
 	}

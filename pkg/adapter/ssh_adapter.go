@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
+	"github.com/wentf9/xops-cli/core/ssh"
+	"github.com/wentf9/xops-cli/internal/sshenv"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
-	"github.com/wentf9/xops-cli/pkg/ssh"
 )
 
 // SessionAuth 描述单个连接会话的临时认证机密覆盖
@@ -147,7 +149,7 @@ func NewConnectorWithInteraction(cfgProvider config.ConfigProvider, interaction 
 }
 
 func newConnector(adp *SSHAdapter, opts ...ssh.Option) *ssh.Connector {
-	var finalOpts []ssh.Option
+	finalOpts := []ssh.Option{ssh.WithEnvironment(sshenv.Discover())}
 	if cfg := adp.cfgProvider.Snapshot(); cfg != nil && cfg.PasswordPromptPattern != "" {
 		finalOpts = append(finalOpts, ssh.WithPasswordPromptPattern(cfg.PasswordPromptPattern))
 	}
@@ -467,7 +469,7 @@ func (a *SSHAdapter) resolveLoginPassword(
 	if ref := snapshot.Identity.LoginPasswordRef; ref != nil && !ref.IsEmpty() {
 		if a.credentialResolver == nil {
 			return nil, fmt.Errorf("login password ref %q/%q is configured but no credential resolver is available: %w",
-				ref.StoreID, ref.ItemID, credential.ErrCredentialStoreUnavailable)
+				ref.StoreID, ref.ItemID, coreauth.ErrCredentialStoreUnavailable)
 		}
 		sec, err := a.credentialResolver.Resolve(ctx, *ref)
 		if err != nil {
@@ -493,7 +495,7 @@ func (a *SSHAdapter) resolvePassphrase(
 	if ref := snapshot.Identity.PassphraseRef; ref != nil && !ref.IsEmpty() {
 		if a.credentialResolver == nil {
 			return nil, fmt.Errorf("passphrase ref %q/%q is configured but no credential resolver is available: %w",
-				ref.StoreID, ref.ItemID, credential.ErrCredentialStoreUnavailable)
+				ref.StoreID, ref.ItemID, coreauth.ErrCredentialStoreUnavailable)
 		}
 		sec, err := a.credentialResolver.Resolve(ctx, *ref)
 		if err != nil {
@@ -519,7 +521,7 @@ func (a *SSHAdapter) resolveSuPassword(
 	if ref := snapshot.Node.PrivilegePasswordRef; ref != nil && !ref.IsEmpty() {
 		if a.credentialResolver == nil {
 			return nil, fmt.Errorf("privilege password ref %q/%q is configured but no credential resolver is available: %w",
-				ref.StoreID, ref.ItemID, credential.ErrCredentialStoreUnavailable)
+				ref.StoreID, ref.ItemID, coreauth.ErrCredentialStoreUnavailable)
 		}
 		sec, err := a.credentialResolver.Resolve(ctx, *ref)
 		if err != nil {

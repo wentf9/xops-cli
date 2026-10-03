@@ -3,12 +3,13 @@ package utils
 import (
 	"context"
 	"fmt"
-	sshcrypto "golang.org/x/crypto/ssh"
 	"os"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
+	sshcrypto "golang.org/x/crypto/ssh"
 )
 
 // InventoryCredentialWrite keeps secret material outside inventory models.
@@ -110,7 +111,7 @@ func (w *InventoryCredentialWrite) Save(ctx context.Context, version string) err
 func validateInventoryCredentialStore(cfg *config.CredentialConfig) error {
 	store, ok := cfg.Stores[cfg.DefaultStore]
 	if !ok {
-		return fmt.Errorf("%w: configure a default credential store first", credential.ErrCredentialStoreUnavailable)
+		return fmt.Errorf("%w: configure a default credential store first", coreauth.ErrCredentialStoreUnavailable)
 	}
 	if store.Type == config.StoreTypeNone || store.ReadOnly {
 		return fmt.Errorf("%w: configure a writable credential store before saving a secret", credential.ErrCredentialStoreReadOnly)

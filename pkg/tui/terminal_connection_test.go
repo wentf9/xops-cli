@@ -15,11 +15,11 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
-	"github.com/wentf9/xops-cli/pkg/ssh"
 	cryptoSSH "golang.org/x/crypto/ssh"
 )
 

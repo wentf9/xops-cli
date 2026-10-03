@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/internal/credentialfile/format"
 	"github.com/wentf9/xops-cli/internal/kdfhelper"
 	"github.com/wentf9/xops-cli/pkg/credential"
@@ -113,7 +114,7 @@ func TestRuntimeSharedUnlockAndCache(t *testing.T) {
 	if err := a.Lock(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.Get(credential.WithoutInteraction(t.Context()), f.ref); !errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if _, err := b.Get(credential.WithoutInteraction(t.Context()), f.ref); !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("locked cache bypass: %v", err)
 	}
 	b.session.mu.Lock()
@@ -174,7 +175,7 @@ func TestRuntimeWaitersCancelIndependently(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if _, err := s.session.acquire(credential.WithoutInteraction(t.Context()), f.data["meta_password"]); !errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if _, err := s.session.acquire(credential.WithoutInteraction(t.Context()), f.data["meta_password"]); !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatal("noninteractive request joined prompt")
 	}
 	cancel()
@@ -231,7 +232,7 @@ func TestRuntimeIdleExpiryAndKeyFileRecheck(t *testing.T) {
 	if err := s.Lock(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Get(t.Context(), f.ref); !errors.Is(err, credential.ErrCredentialStoreUnavailable) {
+	if _, err := s.Get(t.Context(), f.ref); !errors.Is(err, coreauth.ErrCredentialStoreUnavailable) {
 		t.Fatalf("missing key-file ignored: %v", err)
 	}
 }
@@ -337,7 +338,7 @@ func TestRuntimeUnlockFailureAllowsRetry(t *testing.T) {
 		return bytes.Clone(f.data["password_key"]), nil
 	}))
 	s := runtimeStore(t, r, f, SessionOptions{Mode: "prompt"})
-	if _, err := s.session.acquire(t.Context(), f.data["meta_password"]); !errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if _, err := s.session.acquire(t.Context(), f.data["meta_password"]); !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("wrong material: %v", err)
 	}
 	l, err := s.session.acquire(t.Context(), f.data["meta_password"])
@@ -416,7 +417,7 @@ func TestCompletedUnlockCannotCrossLockEpoch(t *testing.T) {
 	s.session.task = task
 	s.session.epoch = 1
 	s.session.mu.Unlock()
-	if err := s.session.waitTask(t.Context(), task); !errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if err := s.session.waitTask(t.Context(), task); !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("completed pre-lock task was accepted: %v", err)
 	}
 }
@@ -471,7 +472,7 @@ func TestRuntimeRootNoninteractiveCannotBeOverridden(t *testing.T) {
 		}
 	})
 	s := runtimeStore(t, r, f, SessionOptions{Mode: "prompt"})
-	if err := s.Unlock(t.Context()); !errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if err := s.Unlock(t.Context()); !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("root policy overridden: %v", err)
 	}
 	if prompts.Load() != 0 {
@@ -490,7 +491,7 @@ func TestRuntimeLockCancelsLeaseBeforeDelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	done := s.session.requestLock()
-	if err := l.deliver(t.Context()); !errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if err := l.deliver(t.Context()); !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("stale lease delivered: %v", err)
 	}
 	select {

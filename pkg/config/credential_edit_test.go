@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -28,7 +29,7 @@ func TestCredentialNodeEditRejectsConcurrentMetadataChange(t *testing.T) {
 	}
 	target := credential.Target{NodeID: "renamed", Kind: credential.KindLoginPassword, AuthType: "password", ClearLegacyLoginPassword: true}
 	outcome, _, err := updater.ApplyCredentialRefAtVersion(t.Context(), target, string(ref.Version[:]), &credential.Ref{StoreID: "store", ItemID: "new"})
-	if !errors.Is(err, credential.ErrConfigConflict) || outcome.Applied {
+	if !errors.Is(err, coreauth.ErrConfigConflict) || outcome.Applied {
 		t.Fatalf("stale edit applied: %+v, %v", outcome, err)
 	}
 	if _, exists := repo.GetNode("renamed"); exists {

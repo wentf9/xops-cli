@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/internal/credentialfile"
 	"github.com/wentf9/xops-cli/internal/kdfhelper"
 	"github.com/wentf9/xops-cli/pkg/credential"
@@ -140,7 +141,7 @@ func verifyClone(ctx context.Context, runtime *credentialfile.Runtime, store *cr
 	}
 	got, err := clone.Get(ctx, cloneRef)
 	got.Zero()
-	if !errors.Is(err, credential.ErrCredentialNotFound) {
+	if !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		return fmt.Errorf("delete verification: %w", err)
 	}
 	return nil

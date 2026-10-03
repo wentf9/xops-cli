@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -47,7 +48,7 @@ func (s *HelperStore) Get(ctx context.Context, ref credential.Ref) (credential.S
 		return credential.Secret{}, fmt.Errorf("helper store is nil")
 	}
 	if ref.StoreID != s.storeID {
-		return credential.Secret{}, fmt.Errorf("%w: store ID mismatch (store %q vs ref %q)", credential.ErrInvalidRef, s.storeID, ref.StoreID)
+		return credential.Secret{}, fmt.Errorf("%w: store ID mismatch (store %q vs ref %q)", coreauth.ErrInvalidRef, s.storeID, ref.StoreID)
 	}
 
 	req := &Request{
@@ -66,7 +67,7 @@ func (s *HelperStore) Get(ctx context.Context, ref credential.Ref) (credential.S
 		return credential.Secret{}, err
 	}
 	if raw == nil {
-		return credential.Secret{}, credential.ErrCredentialNotFound
+		return credential.Secret{}, coreauth.ErrCredentialNotFound
 	}
 	defer func() {
 		// 确保临时解码缓冲区安全清零
@@ -90,7 +91,7 @@ func (s *HelperStore) Put(ctx context.Context, ref credential.Ref, secret creden
 		return credential.ErrCredentialStoreReadOnly
 	}
 	if ref.StoreID != s.storeID {
-		return fmt.Errorf("%w: store ID mismatch (store %q vs ref %q)", credential.ErrInvalidRef, s.storeID, ref.StoreID)
+		return fmt.Errorf("%w: store ID mismatch (store %q vs ref %q)", coreauth.ErrInvalidRef, s.storeID, ref.StoreID)
 	}
 
 	req := &Request{
@@ -113,7 +114,7 @@ func (s *HelperStore) Delete(ctx context.Context, ref credential.Ref) error {
 		return credential.ErrCredentialStoreReadOnly
 	}
 	if ref.StoreID != s.storeID {
-		return fmt.Errorf("%w: store ID mismatch (store %q vs ref %q)", credential.ErrInvalidRef, s.storeID, ref.StoreID)
+		return fmt.Errorf("%w: store ID mismatch (store %q vs ref %q)", coreauth.ErrInvalidRef, s.storeID, ref.StoreID)
 	}
 
 	req := &Request{

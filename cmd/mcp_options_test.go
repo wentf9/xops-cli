@@ -7,15 +7,15 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+	mcpruntime "github.com/wentf9/xops-cli/core/mcp/runtime"
 	"github.com/wentf9/xops-cli/pkg/config"
-	"github.com/wentf9/xops-cli/pkg/mcpserver"
 )
 
-func parseMCPTestOptions(t *testing.T, args []string, cfg *config.Configuration) (string, mcpserver.HTTPOptions, error) {
+func parseMCPTestOptions(t *testing.T, args []string, cfg *config.Configuration) (string, mcpruntime.HTTPOptions, error) {
 	t.Helper()
 	command := NewCmdMcp()
 	var transport string
-	var options mcpserver.HTTPOptions
+	var options mcpruntime.HTTPOptions
 	run := func(cmd *cobra.Command, _ []string) error {
 		var err error
 		transport, options, err = resolveMCPOptions(cmd, cfg, filepath.Join(t.TempDir(), "config.yaml"))
@@ -26,7 +26,7 @@ func parseMCPTestOptions(t *testing.T, args []string, cfg *config.Configuration)
 		child.RunE = run
 	}
 	command.SetArgs(args)
-	returnTransport := func() (string, mcpserver.HTTPOptions, error) {
+	returnTransport := func() (string, mcpruntime.HTTPOptions, error) {
 		err := command.Execute()
 		return transport, options, err
 	}
@@ -97,7 +97,7 @@ func TestMCPTokenFileAndErrorsDoNotExposeContents(t *testing.T) {
 
 func TestMCPRecoveryHonorsConfiguredFileSize(t *testing.T) {
 	size := int64(20 << 30)
-	options := mcpserver.RecoveryOptions{}
+	options := mcpruntime.RecoveryOptions{}
 	if err := applyMCPRecoverySettings(&options, &config.MCPConfig{MaxFileBytes: &size}); err != nil {
 		t.Fatal(err)
 	}

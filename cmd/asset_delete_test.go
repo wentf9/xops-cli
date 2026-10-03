@@ -6,6 +6,7 @@ import (
 
 	hostcmd "github.com/wentf9/xops-cli/cmd/host"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -20,7 +21,7 @@ func TestHostDeleteCleanupFailureRecoversWithFreshService(t *testing.T) {
 	t.Setenv("TEST_HELPER_ERROR_CODE", "locked")
 	err = executePhase6(t, hostcmd.NewCmdInventoryDelete(), "node")
 	var cleanup *credential.CleanupError
-	if !errors.As(err, &cleanup) || !errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if !errors.As(err, &cleanup) || !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("delete lost cleanup error: %v", err)
 	}
 	_, repo, cfg, err := utils.GetConfigStore()
@@ -35,10 +36,10 @@ func TestHostDeleteCleanupFailureRecoversWithFreshService(t *testing.T) {
 		t.Fatal(err)
 	}
 	results, err := service.GC(t.Context())
-	if err != nil || len(results) != 1 || !errors.Is(results[0].Err, credential.ErrCredentialStoreLocked) {
+	if err != nil || len(results) != 1 || !errors.Is(results[0].Err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("GC lost cleanup intent: %+v %v", results, err)
 	}
-	if err := executePhase6(t, newCmdCredentialGC()); !errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if err := executePhase6(t, newCmdCredentialGC()); !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("GC reported success while cleanup is locked: %v", err)
 	}
 	t.Setenv("TEST_HELPER_ERROR_CODE", "")
@@ -54,7 +55,7 @@ func TestHostDeleteCleanupFailureRecoversWithFreshService(t *testing.T) {
 	if err := executePhase6(t, newCmdCredentialGC()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := registry.Resolve(t.Context(), ref); !errors.Is(err, credential.ErrCredentialNotFound) {
+	if _, err := registry.Resolve(t.Context(), ref); !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		t.Fatalf("GC retained orphan: %v", err)
 	}
 }
@@ -89,7 +90,7 @@ func TestAssetDeletionRetainsSharedCredential(t *testing.T) {
 	if err := executePhase6(t, hostcmd.NewCmdInventoryDelete(), "other"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := registry.Resolve(t.Context(), *identity.LoginPasswordRef); !errors.Is(err, credential.ErrCredentialNotFound) {
+	if _, err := registry.Resolve(t.Context(), *identity.LoginPasswordRef); !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		t.Fatalf("last reference retained backend secret: %v", err)
 	}
 }
@@ -111,7 +112,7 @@ func TestIdentityDeleteCleansStoredCredential(t *testing.T) {
 	if err := executePhase6(t, NewCmdIdentityDelete(), "orphan"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := registry.Resolve(t.Context(), *identity.LoginPasswordRef); !errors.Is(err, credential.ErrCredentialNotFound) {
+	if _, err := registry.Resolve(t.Context(), *identity.LoginPasswordRef); !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		t.Fatalf("identity deletion leaked credential: %v", err)
 	}
 }

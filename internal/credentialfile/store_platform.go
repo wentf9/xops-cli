@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/internal/credentialfile/format"
 	unix "github.com/wentf9/xops-cli/internal/vaultsys"
 	"github.com/wentf9/xops-cli/pkg/credential"
@@ -58,7 +59,7 @@ func openStoreWithLifetime(ctx, lifetime context.Context, path, storeID string, 
 		return nil, err
 	}
 	if len(storeID) == 0 || len(storeID) > format.MaxIDBytes {
-		return nil, credential.ErrInvalidRef
+		return nil, coreauth.ErrInvalidRef
 	}
 	if err := (credential.Ref{StoreID: storeID, ItemID: "item"}).Validate(); err != nil {
 		return nil, err
@@ -104,10 +105,10 @@ func mapAccess(err error) error {
 		return nil
 	}
 	if errors.Is(err, os.ErrNotExist) {
-		return errors.Join(credential.ErrCredentialStoreUnavailable, err)
+		return errors.Join(coreauth.ErrCredentialStoreUnavailable, err)
 	}
 	if errors.Is(err, os.ErrPermission) || errors.Is(err, unix.ELOOP) || errors.Is(err, unix.ENOTDIR) {
-		return errors.Join(credential.ErrCredentialAccessDenied, err)
+		return errors.Join(coreauth.ErrCredentialAccessDenied, err)
 	}
 	return err
 }
@@ -211,10 +212,10 @@ func (s *Store) snapshot(ctx context.Context) (_ publication, err error) {
 
 func (s *Store) validateRef(ref credential.Ref) error {
 	if ref.StoreID != s.storeID {
-		return credential.ErrInvalidRef
+		return coreauth.ErrInvalidRef
 	}
 	if _, err := format.ItemFilename(ref.ItemID); err != nil {
-		return errors.Join(credential.ErrInvalidRef, err)
+		return errors.Join(coreauth.ErrInvalidRef, err)
 	}
 	return nil
 }
@@ -273,7 +274,7 @@ func (s *Store) operate(ctx context.Context, ref credential.Ref, write bool, fn 
 		ctx = lease.ctx
 	}
 	if len(key) != 32 {
-		return credential.ErrCredentialStoreLocked
+		return coreauth.ErrCredentialStoreLocked
 	}
 	ctx, cancel := context.WithTimeout(ctx, s.options.Timeout)
 	defer cancel()
@@ -316,7 +317,7 @@ func (s *Store) unlockKey(ctx context.Context, p publication) ([]byte, *keyLease
 		return l.key, l, nil
 	}
 	if s.options.Keys == nil {
-		return nil, nil, credential.ErrCredentialStoreLocked
+		return nil, nil, coreauth.ErrCredentialStoreLocked
 	}
 	work, cancel := context.WithTimeout(ctx, s.options.UnlockTimeout)
 	defer cancel()
@@ -408,7 +409,7 @@ func (s *Store) Get(ctx context.Context, ref credential.Ref) (secret credential.
 			o.lease.forget(ref)
 		}
 		if errors.Is(err, os.ErrNotExist) {
-			return credential.ErrCredentialNotFound
+			return coreauth.ErrCredentialNotFound
 		}
 		if err != nil {
 			return mapAccess(err)
@@ -428,7 +429,7 @@ func (s *Store) Get(ctx context.Context, ref credential.Ref) (secret credential.
 			return err
 		}
 		if secret.ExpiresAt != nil && !time.Now().Before(*secret.ExpiresAt) {
-			return credential.ErrCredentialNotFound
+			return coreauth.ErrCredentialNotFound
 		}
 		if o.lease != nil && !found {
 			return o.lease.remember(ref, digest, secret)

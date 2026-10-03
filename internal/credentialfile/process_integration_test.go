@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/internal/credentialfile/format"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
@@ -103,7 +104,7 @@ func TestFileStoreRealProcessExitRecovery(t *testing.T) {
 			if tc.exists && err != nil {
 				t.Fatal(err)
 			}
-			if !tc.exists && !errors.Is(err, credential.ErrCredentialNotFound) {
+			if !tc.exists && !errors.Is(err, coreauth.ErrCredentialNotFound) {
 				t.Fatalf("post-exit visibility: %v", err)
 			}
 			secret := credential.NewSecret([]byte("public-child-secret"))
@@ -162,7 +163,7 @@ func TestFileStoreMissingVaultNeverInitializes(t *testing.T) {
 			t.Error(closeErr)
 		}
 	}
-	if !errors.Is(err, credential.ErrCredentialStoreUnavailable) {
+	if !errors.Is(err, coreauth.ErrCredentialStoreUnavailable) {
 		t.Fatalf("missing vault: %v", err)
 	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
@@ -181,7 +182,7 @@ func TestFileStoreMissingVaultNeverInitializes(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	if _, err := s.Get(t.Context(), f.ref); !errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if _, err := s.Get(t.Context(), f.ref); !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("missing KeySource: %v", err)
 	}
 }
@@ -208,7 +209,7 @@ func TestFileStoreRealProcessDeleteRecovery(t *testing.T) {
 			if err := s.Delete(t.Context(), ref); err != nil {
 				t.Fatalf("delete recovery: %v", err)
 			}
-			if _, err := s.Get(t.Context(), ref); !errors.Is(err, credential.ErrCredentialNotFound) {
+			if _, err := s.Get(t.Context(), ref); !errors.Is(err, coreauth.ErrCredentialNotFound) {
 				t.Fatal(err)
 			}
 			if f.budget(t).Consumed != 4 {

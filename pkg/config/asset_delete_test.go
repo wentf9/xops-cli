@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -95,7 +96,7 @@ func TestAssetDeletionWithoutServiceFailsBeforeChangingReferences(t *testing.T) 
 	}
 	ref := repo.View().NodeRefs["web-server"]
 	err = repo.DeleteNodesWithCredentialsContext(t.Context(), []NodeRef{ref}, nil)
-	if !errors.Is(err, credential.ErrCredentialStoreUnavailable) {
+	if !errors.Is(err, coreauth.ErrCredentialStoreUnavailable) {
 		t.Fatalf("missing service: %v", err)
 	}
 	if _, exists := repo.GetNode("web-server"); !exists {

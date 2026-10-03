@@ -6,10 +6,10 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/wentf9/xops-cli/core/concurrent"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/models"
-	"github.com/wentf9/xops-cli/pkg/ssh"
-	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 )
 
 func TestEngine_OnErrorContinue_RunsFollowingStepAndMarksHostFailed(t *testing.T) {

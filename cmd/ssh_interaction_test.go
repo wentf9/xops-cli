@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/internal/terminal"
-	"github.com/wentf9/xops-cli/pkg/ssh"
 )
 
 type interactionFailingWriter struct {

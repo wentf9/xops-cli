@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
 )
@@ -60,7 +61,7 @@ func TestCredentialNodeCreationRejectsConcurrentCreation(t *testing.T) {
 		t.Fatal(err)
 	}
 	outcome, _, err := updater.ApplyCredentialRefAtVersion(t.Context(), credential.Target{NodeID: "local", Kind: credential.KindLoginPassword}, "", &credential.Ref{StoreID: "test", ItemID: "new"})
-	if !errors.Is(err, credential.ErrConfigConflict) || outcome.Applied {
+	if !errors.Is(err, coreauth.ErrConfigConflict) || outcome.Applied {
 		t.Fatalf("concurrent creation was overwritten: %+v, %v", outcome, err)
 	}
 	id, _ := repo.Snapshot().Identities.Get("local-id")

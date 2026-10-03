@@ -8,9 +8,9 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+	"github.com/wentf9/xops-cli/core/concurrent"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/models"
-	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 )
 
 func TestExecStdinRedirection(t *testing.T) {

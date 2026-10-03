@@ -15,6 +15,7 @@ import (
 	"time"
 	"unsafe"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -146,7 +147,7 @@ func TestDarwinNativeHelper_DuplicateConflictRetryFindLocked(t *testing.T) {
 		t.Fatalf("expected code 'locked', got %q (msg: %s)", resp.Code, resp.Message)
 	}
 	mappedErr := MapErrorCode(resp.Code, resp.Message)
-	if !errors.Is(mappedErr, credential.ErrCredentialStoreLocked) {
+	if !errors.Is(mappedErr, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("expected ErrCredentialStoreLocked, got: %v", mappedErr)
 	}
 }
@@ -222,7 +223,7 @@ func TestDarwinNativeHelper_DuplicateConflictRetryModDenied(t *testing.T) {
 		t.Fatalf("expected code 'denied', got %q (msg: %s)", resp.Code, resp.Message)
 	}
 	mappedErr := MapErrorCode(resp.Code, resp.Message)
-	if !errors.Is(mappedErr, credential.ErrCredentialAccessDenied) {
+	if !errors.Is(mappedErr, coreauth.ErrCredentialAccessDenied) {
 		t.Fatalf("expected ErrCredentialAccessDenied, got: %v", mappedErr)
 	}
 }
@@ -258,7 +259,7 @@ func TestDarwinNativeHelper_SignatureChangedAccessDenied(t *testing.T) {
 	}
 
 	mappedErr := MapErrorCode(resp.Code, resp.Message)
-	if !errors.Is(mappedErr, credential.ErrCredentialAccessDenied) {
+	if !errors.Is(mappedErr, coreauth.ErrCredentialAccessDenied) {
 		t.Fatalf("expected ErrCredentialAccessDenied, got: %v", mappedErr)
 	}
 }
@@ -442,7 +443,7 @@ func TestDarwinNativeHelper_StoreFailsClosedWhenSearchListHasLockedKeychain(t *t
 	}
 
 	mappedErr := MapErrorCode(resp.Code, resp.Message)
-	if !errors.Is(mappedErr, credential.ErrCredentialStoreLocked) {
+	if !errors.Is(mappedErr, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("expected ErrCredentialStoreLocked, got: %v", mappedErr)
 	}
 
@@ -576,7 +577,7 @@ func TestDarwinNativeHelper_MultiKeychainLockedClassification(t *testing.T) {
 		t.Fatalf("expected code 'locked', got %q (msg: %s)", resp.Code, resp.Message)
 	}
 	mappedErr := MapErrorCode(resp.Code, resp.Message)
-	if !errors.Is(mappedErr, credential.ErrCredentialStoreLocked) {
+	if !errors.Is(mappedErr, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("expected ErrCredentialStoreLocked, got: %v", mappedErr)
 	}
 }
@@ -647,7 +648,7 @@ func TestDarwinNativeHelper_MultiKeychainTargetUnlockedACLDeniedWithUnrelatedLoc
 		t.Fatalf("expected code 'denied' (got %q, message: %s)", resp.Code, resp.Message)
 	}
 	mappedErr := MapErrorCode(resp.Code, resp.Message)
-	if !errors.Is(mappedErr, credential.ErrCredentialAccessDenied) {
+	if !errors.Is(mappedErr, coreauth.ErrCredentialAccessDenied) {
 		t.Fatalf("expected strictly ErrCredentialAccessDenied, got: %v", mappedErr)
 	}
 }
@@ -717,7 +718,7 @@ func TestDarwinNativeHelper_MultiKeychainTargetUnlockedACLDeniedWithLockedFirstI
 		t.Fatalf("expected code 'denied' (got %q, message: %s)", resp.Code, resp.Message)
 	}
 	mappedErr := MapErrorCode(resp.Code, resp.Message)
-	if !errors.Is(mappedErr, credential.ErrCredentialAccessDenied) {
+	if !errors.Is(mappedErr, coreauth.ErrCredentialAccessDenied) {
 		t.Fatalf("expected strictly ErrCredentialAccessDenied, got: %v", mappedErr)
 	}
 }
@@ -798,7 +799,7 @@ func TestDarwinNativeHelper_TargetItemKeychainLockedVsDefaultUnlocked(t *testing
 		t.Fatalf("expected code 'locked' based on target item keychain, got %q (msg: %s)", resp.Code, resp.Message)
 	}
 	mappedErr := MapErrorCode(resp.Code, resp.Message)
-	if !errors.Is(mappedErr, credential.ErrCredentialStoreLocked) {
+	if !errors.Is(mappedErr, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("expected ErrCredentialStoreLocked, got: %v", mappedErr)
 	}
 }
@@ -877,7 +878,7 @@ func TestDarwinNativeHelper_TargetItemKeychainUnlockedVsDefaultLocked(t *testing
 		t.Fatalf("expected code 'denied' (not 'locked'), got %q (msg: %s)", resp.Code, resp.Message)
 	}
 	mappedErr := MapErrorCode(resp.Code, resp.Message)
-	if !errors.Is(mappedErr, credential.ErrCredentialAccessDenied) {
+	if !errors.Is(mappedErr, coreauth.ErrCredentialAccessDenied) {
 		t.Fatalf("expected ErrCredentialAccessDenied, got: %v", mappedErr)
 	}
 }
@@ -1091,7 +1092,7 @@ func TestDarwinNativeSystemStore_Integration(t *testing.T) {
 
 	// 6. Get after Delete -> assert ErrCredentialNotFound
 	_, err = store.Get(ctx, ref)
-	if !errors.Is(err, credential.ErrCredentialNotFound) {
+	if !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		t.Fatalf("expected ErrCredentialNotFound, got: %v", err)
 	}
 }
@@ -1294,7 +1295,7 @@ func TestDarwinNativeSystemStore_RealKeychainLockUnlock(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error on locked keychain, got nil")
 	}
-	if !errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("expected strictly ErrCredentialStoreLocked on locked keychain, got: %v", err)
 	}
 
@@ -1358,7 +1359,7 @@ func TestDarwinNativeSystemStore_RealKeychainACLAccessDenied(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected access denied error on ACL-restricted item, got nil")
 	}
-	if !errors.Is(err, credential.ErrCredentialAccessDenied) {
+	if !errors.Is(err, coreauth.ErrCredentialAccessDenied) {
 		t.Fatalf("expected strictly ErrCredentialAccessDenied on ACL-restricted item, got: %v", err)
 	}
 }
@@ -1420,7 +1421,7 @@ func TestDarwinNativeSystemStore_MultiKeychainLockClassification(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error on locked secondary keychain, got nil")
 	}
-	if !errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("expected strictly ErrCredentialStoreLocked when secondary keychain is locked (default unlocked), got: %v", err)
 	}
 
@@ -1431,7 +1432,7 @@ func TestDarwinNativeSystemStore_MultiKeychainLockClassification(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error on Put when secondary keychain is locked, got nil")
 	}
-	if !errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("expected strictly ErrCredentialStoreLocked on Put when secondary keychain is locked, got: %v", err)
 	}
 
@@ -1445,7 +1446,7 @@ func TestDarwinNativeSystemStore_MultiKeychainLockClassification(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error on Delete when secondary keychain is locked, got nil")
 	}
-	if !errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("expected strictly ErrCredentialStoreLocked on Delete when secondary keychain is locked, got: %v", err)
 	}
 
@@ -1568,10 +1569,10 @@ func TestDarwinNativeSystemStore_MultiKeychainTargetUnlockedACLDeniedWithUnrelat
 	if err == nil {
 		t.Fatal("expected error on ACL-restricted item, got nil")
 	}
-	if !errors.Is(err, credential.ErrCredentialAccessDenied) {
+	if !errors.Is(err, coreauth.ErrCredentialAccessDenied) {
 		t.Fatalf("expected strictly ErrCredentialAccessDenied (not locked), got: %v", err)
 	}
-	if errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("incorrectly mapped to ErrCredentialStoreLocked due to unrelated locked secondary keychain: %v", err)
 	}
 }

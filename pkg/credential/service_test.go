@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 )
 
 type memoryStore struct {
@@ -38,7 +40,7 @@ func (m *memoryStore) Get(_ context.Context, ref Ref) (Secret, error) {
 	}
 	val, ok := m.data[ref.ItemID]
 	if !ok {
-		return Secret{}, fmt.Errorf("%w: %s", ErrCredentialNotFound, ref)
+		return Secret{}, fmt.Errorf("%w: %s", coreauth.ErrCredentialNotFound, ref)
 	}
 	return Secret{Value: bytes.Clone(val)}, nil
 }
@@ -60,7 +62,7 @@ func (m *memoryStore) Delete(_ context.Context, ref Ref) error {
 		return m.delErr
 	}
 	if _, ok := m.data[ref.ItemID]; !ok {
-		return fmt.Errorf("%w: %s", ErrCredentialNotFound, ref)
+		return fmt.Errorf("%w: %s", coreauth.ErrCredentialNotFound, ref)
 	}
 	delete(m.data, ref.ItemID)
 	return nil
@@ -247,7 +249,7 @@ func TestService_Rotate_Success(t *testing.T) {
 
 	// 验证旧凭据从 Store 中被删除
 	_, err = store.Get(ctx, oldRef)
-	if !errors.Is(err, ErrCredentialNotFound) {
+	if !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		t.Fatalf("expected oldRef to be deleted, got err=%v", err)
 	}
 
@@ -298,7 +300,7 @@ func TestService_Delete_Success(t *testing.T) {
 
 	// 验证 Store 中的条目被删除
 	_, err = store.Get(ctx, refToDelete)
-	if !errors.Is(err, ErrCredentialNotFound) {
+	if !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		t.Fatalf("expected deleted item, got %v", err)
 	}
 
@@ -623,7 +625,7 @@ func TestService_FaultInjection_Recover_CrashAtIntent_ConfigNotApplied(t *testin
 
 	// 孤儿凭据应已被补偿删除
 	_, err = store.Get(ctx, orphanRef)
-	if !errors.Is(err, ErrCredentialNotFound) {
+	if !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		t.Fatalf("orphan credential must be deleted during recovery")
 	}
 
@@ -677,7 +679,7 @@ func TestService_FaultInjection_Recover_CrashAtIntent_ConfigApplied(t *testing.T
 		t.Fatalf("newRef must be preserved")
 	}
 	// oldRef 被成功清理
-	if _, err := store.Get(ctx, oldRef); !errors.Is(err, ErrCredentialNotFound) {
+	if _, err := store.Get(ctx, oldRef); !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		t.Fatalf("oldRef must be deleted")
 	}
 
@@ -721,7 +723,7 @@ func TestService_FaultInjection_Recover_CrashAtCommittedOrCleanup(t *testing.T) 
 	}
 
 	// oldRef 已从 Store 中清除
-	if _, err := store.Get(ctx, oldRef); !errors.Is(err, ErrCredentialNotFound) {
+	if _, err := store.Get(ctx, oldRef); !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		t.Fatalf("oldRef must be cleaned")
 	}
 
@@ -826,7 +828,7 @@ func TestService_FaultInjection_Recover_CrashAtIntent_OpDelete(t *testing.T) {
 		t.Fatalf("expected RecoveryActionCommittedCleaned, got %+v", results)
 	}
 	// refB 应从 Store 中被删除
-	if _, err := store.Get(ctx, refB); !errors.Is(err, ErrCredentialNotFound) {
+	if _, err := store.Get(ctx, refB); !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		t.Fatalf("refB must be deleted from store")
 	}
 }
@@ -920,7 +922,7 @@ func TestService_FaultInjection_CompensateFailure_RetainsJournal(t *testing.T) {
 	ctx := context.Background()
 
 	// 模拟 CAS 冲突（Applied: false）
-	casErr := fmt.Errorf("%w: version mismatch", ErrConfigConflict)
+	casErr := fmt.Errorf("%w: version mismatch", coreauth.ErrConfigConflict)
 	cfg.applyErr = casErr
 	cfg.applyOutcome = MutationOutcome{Applied: false, Durable: false}
 

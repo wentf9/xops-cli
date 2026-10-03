@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -70,7 +71,7 @@ func TestLinuxNativeDeleteWithMetadata(t *testing.T) {
 			}
 			remaining, err := store.Get(ctx, ref)
 			remaining.Zero()
-			if !errors.Is(err, credential.ErrCredentialNotFound) {
+			if !errors.Is(err, coreauth.ErrCredentialNotFound) {
 				t.Fatalf("native cleanup retained credential: %v", err)
 			}
 		})

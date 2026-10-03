@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -106,7 +107,7 @@ func TestBuildRegistryFromConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetStore none-store failed: %v", err)
 	}
-	if _, err := st1.Get(t.Context(), credential.Ref{StoreID: "none-store", ItemID: "missing"}); !errors.Is(err, credential.ErrCredentialNotFound) {
+	if _, err := st1.Get(t.Context(), credential.Ref{StoreID: "none-store", ItemID: "missing"}); !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		t.Fatalf("none get: %v", err)
 	}
 
@@ -121,7 +122,7 @@ func TestBuildRegistryFromConfig(t *testing.T) {
 
 	// 查询不存在的 store 应该报错
 	_, err = reg.GetStore("non-existent")
-	if !errors.Is(err, credential.ErrStoreNotFound) {
+	if !errors.Is(err, coreauth.ErrStoreNotFound) {
 		t.Fatalf("expected ErrStoreNotFound, got: %v", err)
 	}
 }

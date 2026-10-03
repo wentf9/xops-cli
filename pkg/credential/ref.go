@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 )
 
 // Kind 标识凭据的种类。
@@ -24,7 +26,7 @@ func (k Kind) Validate() error {
 	case KindLoginPassword, KindPassphrase, KindPrivilegePassword:
 		return nil
 	default:
-		return fmt.Errorf("%w: unknown credential kind %q", ErrInvalidRef, string(k))
+		return fmt.Errorf("%w: unknown credential kind %q", coreauth.ErrInvalidRef, string(k))
 	}
 }
 
@@ -56,7 +58,7 @@ func (r Ref) Validate() error {
 		return nil
 	}
 	if (r.StoreID == "") != (r.ItemID == "") {
-		return fmt.Errorf("%w: storeID and itemID must both be empty or non-empty", ErrInvalidRef)
+		return fmt.Errorf("%w: storeID and itemID must both be empty or non-empty", coreauth.ErrInvalidRef)
 	}
 	if err := validateRefIdentifier("storeID", r.StoreID); err != nil {
 		return err
@@ -69,10 +71,10 @@ func (r Ref) Validate() error {
 
 func validateRefIdentifier(field, val string) error {
 	if strings.TrimSpace(val) == "" {
-		return fmt.Errorf("%w: %s cannot be blank", ErrInvalidRef, field)
+		return fmt.Errorf("%w: %s cannot be blank", coreauth.ErrInvalidRef, field)
 	}
 	if strings.ContainsAny(val, "/\\ \t\r\n\x00") {
-		return fmt.Errorf("%w: %s contains invalid characters", ErrInvalidRef, field)
+		return fmt.Errorf("%w: %s contains invalid characters", coreauth.ErrInvalidRef, field)
 	}
 	return nil
 }

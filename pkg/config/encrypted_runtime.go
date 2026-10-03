@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/internal/credentialfile"
 	"github.com/wentf9/xops-cli/internal/credentialfile/format"
 	"github.com/wentf9/xops-cli/pkg/credential"
@@ -116,7 +117,7 @@ func (b *encryptedBackend) Get(ctx context.Context, ref credential.Ref) (credent
 	// input, but must not treat corruption as a missing credential or initialize
 	// a replacement vault. Writes retain their original fail-closed behavior.
 	if errors.Is(err, format.ErrCorrupt) {
-		err = errors.Join(credential.ErrCredentialStoreUnavailable, err)
+		err = errors.Join(coreauth.ErrCredentialStoreUnavailable, err)
 	}
 	return secret, err
 }

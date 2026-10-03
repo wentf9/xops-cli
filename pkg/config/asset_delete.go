@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -56,7 +57,7 @@ func deleteAssetsWithCredentials(ctx context.Context, service *credential.Servic
 		return err
 	}
 	if service == nil {
-		return fmt.Errorf("%w: asset deletion requires a credential cleanup service", credential.ErrCredentialStoreUnavailable)
+		return fmt.Errorf("%w: asset deletion requires a credential cleanup service", coreauth.ErrCredentialStoreUnavailable)
 	}
 	_, err := service.DeleteAssets(ctx, refs, func(ctx context.Context) (credential.MutationOutcome, error) {
 		outcome, err := commit(ctx)

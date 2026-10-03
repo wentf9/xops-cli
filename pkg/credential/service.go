@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 )
 
 // GenerateItemID 生成全局唯一、不可变的 32 字符十六进制随机 ItemID。
@@ -43,7 +45,7 @@ type Target struct {
 // Validate 校验 Target 的完整性与合法性。
 func (t Target) Validate() error {
 	if t.NodeID == "" && t.IdentityID == "" {
-		return fmt.Errorf("%w: target must specify nodeID or identityID", ErrInvalidRef)
+		return fmt.Errorf("%w: target must specify nodeID or identityID", coreauth.ErrInvalidRef)
 	}
 	return t.Kind.Validate()
 }
@@ -67,7 +69,7 @@ type MutationOutcome struct {
 type ConfigUpdater interface {
 	// ApplyCredentialRefAtVersion 使用版本号对配置中的凭据引用进行 CAS 原子提交。
 	// 若 newRef 为 nil，表示解除该字段凭据引用（用于删除）。
-	// 若版本发生冲突，必须返回 ErrConfigConflict。
+	// 若版本发生冲突，必须返回 coreauth.ErrConfigConflict。
 	// 若配置已替换但父目录未完成落盘同步，必须返回 DurabilityError 且 outcome.Applied = true, outcome.Durable = false。
 	ApplyCredentialRefAtVersion(ctx context.Context, target Target, expectedVersion string, newRef *Ref) (outcome MutationOutcome, newVersion string, err error)
 
@@ -167,7 +169,7 @@ func validateRotateParams(target Target, newStoreID string, oldRef *Ref, secret 
 		return err
 	}
 	if len(secret.Value) == 0 {
-		return fmt.Errorf("%w: secret value cannot be empty", ErrInvalidRef)
+		return fmt.Errorf("%w: secret value cannot be empty", coreauth.ErrInvalidRef)
 	}
 	if err := validateRefIdentifier("storeID", newStoreID); err != nil {
 		return err
@@ -191,7 +193,7 @@ func (s *Service) putAndVerifySecret(ctx context.Context, store Store, newRef Re
 	match := subtle.ConstantTimeCompare(readBack.Value, secret.Value) == 1
 	readBack.Zero()
 	if !match {
-		return fmt.Errorf("%w: readback credential content mismatch for %s", ErrCredentialStoreUnavailable, newRef)
+		return fmt.Errorf("%w: readback credential content mismatch for %s", coreauth.ErrCredentialStoreUnavailable, newRef)
 	}
 	return nil
 }
@@ -220,7 +222,7 @@ func (s *Service) cleanupOldRefOnRotate(ctx context.Context, entryID string, old
 		_ = s.journal.MarkCleanup(entryID)
 		return &CleanupError{OldRef: *oldRef, Err: getErr}
 	}
-	if delErr := oldStore.Delete(ctx, *oldRef); delErr != nil && !errors.Is(delErr, ErrCredentialNotFound) {
+	if delErr := oldStore.Delete(ctx, *oldRef); delErr != nil && !errors.Is(delErr, coreauth.ErrCredentialNotFound) {
 		_ = s.journal.MarkCleanup(entryID)
 		return &CleanupError{OldRef: *oldRef, Err: delErr}
 	}
@@ -229,7 +231,7 @@ func (s *Service) cleanupOldRefOnRotate(ctx context.Context, entryID string, old
 
 func (s *Service) compensateNewRef(ctx context.Context, entryID string, store Store, newRef Ref, origErr error) error {
 	delErr := store.Delete(context.WithoutCancel(ctx), newRef)
-	if delErr != nil && !errors.Is(delErr, ErrCredentialNotFound) {
+	if delErr != nil && !errors.Is(delErr, coreauth.ErrCredentialNotFound) {
 		return errors.Join(origErr, fmt.Errorf("compensate delete new ref %s failed: %w", newRef, delErr))
 	}
 	_ = s.journal.Remove(entryID)
@@ -357,7 +359,7 @@ func (s *Service) Delete(
 		return "", err
 	}
 	if refToDelete.IsEmpty() {
-		return "", fmt.Errorf("%w: cannot delete empty reference", ErrInvalidRef)
+		return "", fmt.Errorf("%w: cannot delete empty reference", coreauth.ErrInvalidRef)
 	}
 
 	entryID := GenerateJournalID()
@@ -574,7 +576,7 @@ func (s *Service) recoverIntentWithNewRef(ctx context.Context, entry *JournalEnt
 			res.Action = RecoveryActionScheduledForGC
 			return true
 		}
-		if delErr := store.Delete(ctx, *entry.NewRef); delErr != nil && !errors.Is(delErr, ErrCredentialNotFound) {
+		if delErr := store.Delete(ctx, *entry.NewRef); delErr != nil && !errors.Is(delErr, coreauth.ErrCredentialNotFound) {
 			res.Err = fmt.Errorf("compensate delete new ref %s: %w", entry.NewRef, delErr)
 			res.Action = RecoveryActionScheduledForGC
 			return true
@@ -672,7 +674,7 @@ func (s *Service) recoverCommittedOrCleanupStage(ctx context.Context, entry *Jou
 		return
 	}
 
-	if err := oldStore.Delete(ctx, *entry.OldRef); err != nil && !errors.Is(err, ErrCredentialNotFound) {
+	if err := oldStore.Delete(ctx, *entry.OldRef); err != nil && !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		_ = s.journal.MarkCleanup(entry.ID)
 		res.Action = RecoveryActionScheduledForGC
 		res.Err = err

@@ -1,9 +1,9 @@
 package config
 
 import (
+	"github.com/wentf9/xops-cli/core/concurrent"
 	"github.com/wentf9/xops-cli/core/mcp/policy"
 	"github.com/wentf9/xops-cli/pkg/models"
-	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 )
 
 // Configuration 对应 yaml 文件的顶层结构
@@ -13,7 +13,7 @@ type Configuration struct {
 	Identities            *concurrent.Map[string, models.Identity] `yaml:"identities"`
 	Hosts                 *concurrent.Map[string, models.Host]     `yaml:"hosts"`
 	Nodes                 *concurrent.Map[string, models.Node]     `yaml:"nodes"`
-	Guardrail             *GuardrailConfig                         `yaml:"guardrail,omitempty"`
+	Guardrail             *policy.Config                           `yaml:"guardrail,omitempty"`
 	MCP                   *MCPConfig                               `yaml:"mcp,omitempty"`
 	PasswordPromptPattern string                                   `yaml:"password_prompt_pattern,omitempty"` // 全局级自定义密码提示正则
 }
@@ -27,12 +27,6 @@ func (c *Configuration) CanRememberCredentials() bool {
 	store, ok := c.Credential.Stores[c.Credential.DefaultStore]
 	return ok && store.Type != StoreTypeNone && !store.ReadOnly
 }
-
-// GuardrailConfig is the legacy name for the shared policy configuration.
-type GuardrailConfig = policy.Config
-
-// NodeGuardrailCfg is the legacy name for a per-node policy override.
-type NodeGuardrailCfg = policy.NodeConfig
 
 // ConfigProvider is the read-only configuration view consumed by commands,
 // connectors, and presentation code. Durable mutations intentionally do not

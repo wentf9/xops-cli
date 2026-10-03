@@ -10,13 +10,13 @@ import (
 	"path/filepath"
 	"strings"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	unix "github.com/wentf9/xops-cli/internal/vaultsys"
-	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
 func readKeyFile(ctx context.Context, path string) (key []byte, err error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path || path == "/" {
-		return nil, credential.ErrCredentialAccessDenied
+		return nil, coreauth.ErrCredentialAccessDenied
 	}
 	f, err := os.Open(filepath.VolumeName(path) + string(filepath.Separator))
 	if err != nil {
@@ -75,26 +75,26 @@ func readKeyMaterial(r io.Reader) ([]byte, error) {
 	}
 	if len(key) != 32 {
 		clear(key)
-		return nil, credential.ErrCredentialStoreLocked
+		return nil, coreauth.ErrCredentialStoreLocked
 	}
 	return key, nil
 }
 
 func validateKeyPathStat(st unix.Stat_t, final bool) error {
 	if st.Uid != 0 && st.Uid != uint32(os.Geteuid()) {
-		return credential.ErrCredentialAccessDenied
+		return coreauth.ErrCredentialAccessDenied
 	}
 	if !final {
 		if st.Mode&0022 != 0 && st.Mode&unix.S_ISVTX == 0 {
-			return credential.ErrCredentialAccessDenied
+			return coreauth.ErrCredentialAccessDenied
 		}
 		return nil
 	}
 	if st.Nlink != 1 || (st.Mode != unix.S_IFREG|0400 && st.Mode != unix.S_IFREG|0600) {
-		return credential.ErrCredentialAccessDenied
+		return coreauth.ErrCredentialAccessDenied
 	}
 	if st.Size != 32 {
-		return credential.ErrCredentialStoreLocked
+		return coreauth.ErrCredentialStoreLocked
 	}
 	return nil
 }

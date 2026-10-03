@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -57,7 +58,7 @@ func Run(ctx context.Context, opts ProcessOptions, action Action, req *Request) 
 	}
 	if credential.InteractionDisabled(ctx) {
 		if !opts.NonInteractive {
-			return nil, fmt.Errorf("%w: helper does not declare non-interactive support", credential.ErrCredentialStoreUnavailable)
+			return nil, fmt.Errorf("%w: helper does not declare non-interactive support", coreauth.ErrCredentialStoreUnavailable)
 		}
 		copyReq := *req
 		copyReq.NonInteractive = true
@@ -85,12 +86,12 @@ func Run(ctx context.Context, opts ProcessOptions, action Action, req *Request) 
 	if err != nil {
 		if execCtx.Err() != nil {
 			if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
-				return nil, fmt.Errorf("%w: credential helper timed out after %v: %w", credential.ErrCredentialStoreUnavailable, timeout, execCtx.Err())
+				return nil, fmt.Errorf("%w: credential helper timed out after %v: %w", coreauth.ErrCredentialStoreUnavailable, timeout, execCtx.Err())
 			}
 			return nil, fmt.Errorf("credential helper canceled: %w", execCtx.Err())
 		}
 		if isNotFoundErr(err) {
-			return nil, fmt.Errorf("%w: credential helper executable not found: %s", credential.ErrCredentialStoreUnavailable, opts.Command)
+			return nil, fmt.Errorf("%w: credential helper executable not found: %s", coreauth.ErrCredentialStoreUnavailable, opts.Command)
 		}
 		return nil, fmt.Errorf("start credential helper failed: %w", err)
 	}
@@ -121,17 +122,17 @@ func Run(ctx context.Context, opts ProcessOptions, action Action, req *Request) 
 	if execCtx.Err() != nil {
 		_ = session.KillTree()
 		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
-			return nil, fmt.Errorf("%w: credential helper timed out after %v: %w", credential.ErrCredentialStoreUnavailable, timeout, execCtx.Err())
+			return nil, fmt.Errorf("%w: credential helper timed out after %v: %w", coreauth.ErrCredentialStoreUnavailable, timeout, execCtx.Err())
 		}
 		return nil, fmt.Errorf("credential helper canceled: %w", execCtx.Err())
 	}
 
 	if stdoutLimiter.total > MaxResponseBytes {
-		return nil, fmt.Errorf("%w: credential helper response exceeded maximum limit of %d bytes", credential.ErrCredentialStoreUnavailable, MaxResponseBytes)
+		return nil, fmt.Errorf("%w: credential helper response exceeded maximum limit of %d bytes", coreauth.ErrCredentialStoreUnavailable, MaxResponseBytes)
 	}
 
 	if runErr != nil && isNotFoundErr(runErr) {
-		return nil, fmt.Errorf("%w: credential helper executable not found: %s", credential.ErrCredentialStoreUnavailable, opts.Command)
+		return nil, fmt.Errorf("%w: credential helper executable not found: %s", coreauth.ErrCredentialStoreUnavailable, opts.Command)
 	}
 
 	return parseOutputResponse(stdoutLimiter, runErr, sanitizedStderr, sensitive)

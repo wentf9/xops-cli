@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/internal/credentialfile/format"
 	"github.com/wentf9/xops-cli/internal/kdfhelper"
 	"github.com/wentf9/xops-cli/pkg/credential"
@@ -43,14 +44,14 @@ func prepareNewWrapping(ctx context.Context, r *Runtime, material Wrapping, vaul
 
 func prepareWrapping(ctx context.Context, r *Runtime, material Wrapping, vault [16]byte, id string, ops fileOps) (*wrappingSeed, error) {
 	if len(id) == 0 || len(id) > format.MaxIDBytes {
-		return nil, credential.ErrInvalidRef
+		return nil, coreauth.ErrInvalidRef
 	}
 	seed := &wrappingSeed{meta: format.Meta{VaultID: vault, StoreID: id, Generation: 1, Revision: 1}}
 	var raw []byte
 	switch material.Mode {
 	case "prompt":
 		if credential.InteractionDisabled(ctx) || (r != nil && credential.InteractionDisabled(r.ctx)) {
-			return nil, credential.ErrCredentialStoreLocked
+			return nil, coreauth.ErrCredentialStoreLocked
 		}
 		if material.KeyFile != "" || utf8.RuneCount(material.Password) < 12 {
 			return nil, fmt.Errorf("new master password requires at least twelve Unicode characters")
@@ -129,7 +130,7 @@ func unlockWrapping(ctx context.Context, r *Runtime, material Wrapping, data []b
 		wrapping, err = format.KeyFileWrappingKey(m, raw)
 	} else if material.Mode == "prompt" && m.Suite == format.WrapPassword && material.KeyFile == "" && r != nil {
 		if credential.InteractionDisabled(ctx) || credential.InteractionDisabled(r.ctx) {
-			return nil, credential.ErrCredentialStoreLocked
+			return nil, coreauth.ErrCredentialStoreLocked
 		}
 		work, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
@@ -137,7 +138,7 @@ func unlockWrapping(ctx context.Context, r *Runtime, material Wrapping, data []b
 		copy(salt[:], m.Salt)
 		wrapping, err = r.deriveKey(work, kdfhelper.Request{Salt: salt, Password: material.Password})
 	} else {
-		return nil, credential.ErrCredentialStoreLocked
+		return nil, coreauth.ErrCredentialStoreLocked
 	}
 	defer clear(wrapping)
 	if err != nil {
@@ -186,7 +187,7 @@ func (s *Store) admin(ctx context.Context, write bool) (a *administration, err e
 		return nil, err
 	}
 	if len(a.key) != 32 {
-		return nil, credential.ErrCredentialStoreLocked
+		return nil, coreauth.ErrCredentialStoreLocked
 	}
 	if a.lease != nil {
 		a.ctx = a.lease.ctx
@@ -370,7 +371,7 @@ func (s *session) lockMaintenanceGuard(ctx context.Context) error {
 		s.mu.Lock()
 		if s.closed {
 			s.mu.Unlock()
-			return credential.ErrCredentialStoreLocked
+			return coreauth.ErrCredentialStoreLocked
 		}
 		if s.locking == nil {
 			return nil

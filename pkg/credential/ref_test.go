@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"gopkg.in/yaml.v3"
 )
 
@@ -27,8 +28,8 @@ func TestKindValidate(t *testing.T) {
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("Kind.Validate() error = %v, wantErr %v", err, tt.wantErr)
 			}
-			if tt.wantErr && !errors.Is(err, ErrInvalidRef) {
-				t.Fatalf("expected ErrInvalidRef, got: %v", err)
+			if tt.wantErr && !errors.Is(err, coreauth.ErrInvalidRef) {
+				t.Fatalf("expected coreauth.ErrInvalidRef, got: %v", err)
 			}
 		})
 	}
@@ -58,8 +59,8 @@ func TestRefValidate(t *testing.T) {
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("Ref.Validate() error = %v, wantErr %v", err, tt.wantErr)
 			}
-			if tt.wantErr && !errors.Is(err, ErrInvalidRef) {
-				t.Fatalf("expected ErrInvalidRef, got: %v", err)
+			if tt.wantErr && !errors.Is(err, coreauth.ErrInvalidRef) {
+				t.Fatalf("expected coreauth.ErrInvalidRef, got: %v", err)
 			}
 		})
 	}

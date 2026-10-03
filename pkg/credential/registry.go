@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 )
 
 // Registry 管理 StoreID 到凭据源（Source / Store）的映射。
@@ -64,7 +66,7 @@ func (r *Registry) Get(storeID string) (Source, error) {
 	r.mu.RUnlock()
 
 	if !exists {
-		return nil, fmt.Errorf("%w: store %q", ErrStoreNotFound, storeID)
+		return nil, fmt.Errorf("%w: store %q", coreauth.ErrStoreNotFound, storeID)
 	}
 	return source, nil
 }

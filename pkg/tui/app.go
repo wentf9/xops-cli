@@ -12,12 +12,12 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/huh/v2"
 	"charm.land/lipgloss/v2"
+	corelog "github.com/wentf9/xops-cli/core/log"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/i18n"
-	"github.com/wentf9/xops-cli/pkg/logger"
-	"github.com/wentf9/xops-cli/pkg/ssh"
 )
 
 type viewState int
@@ -165,7 +165,7 @@ type modelConfig struct {
 	persistenceUnavailable bool
 	vaultControl           func(context.Context, bool) error
 	rememberConfirmation   func(context.Context, string) (bool, error)
-	logger                 logger.DebugLogger
+	logger                 corelog.DebugLogger
 	ctx                    context.Context
 	interaction            ssh.InteractionHandler
 	credentialService      *credential.Service
@@ -194,7 +194,7 @@ func WithInteractionHandler(interaction ssh.InteractionHandler) ModelOption {
 }
 
 // WithLogger injects the debug logger used by TUI-owned package components.
-func WithLogger(l logger.DebugLogger) ModelOption {
+func WithLogger(l corelog.DebugLogger) ModelOption {
 	return func(cfg *modelConfig) {
 		if l != nil {
 			cfg.logger = l
@@ -237,7 +237,7 @@ func NewModel(repository *config.Repository, opts ...ModelOption) (Model, error)
 	if repository == nil {
 		return Model{}, fmt.Errorf("TUI configuration repository is nil")
 	}
-	cfg := modelConfig{logger: logger.NopLogger, ctx: context.Background()}
+	cfg := modelConfig{logger: corelog.NopLogger, ctx: context.Background()}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&cfg)

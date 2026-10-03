@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 )
 
 func TestAssetDeletionOutcomesAndRecovery(t *testing.T) {
@@ -18,7 +20,7 @@ func TestAssetDeletionOutcomesAndRecovery(t *testing.T) {
 			cfg.activeRefs[ref] = true
 			injected := errors.New("injected deletion failure")
 			if scenario == "locked" {
-				store.delErr = ErrCredentialStoreLocked
+				store.delErr = coreauth.ErrCredentialStoreLocked
 			}
 			if scenario == "intent failure" {
 				journal.syncDirFn = func(string) error { return injected }
@@ -27,7 +29,7 @@ func TestAssetDeletionOutcomesAndRecovery(t *testing.T) {
 			outcome, err := svc.DeleteAssets(t.Context(), []Ref{ref, ref}, func(context.Context) (MutationOutcome, error) {
 				called = true
 				if scenario == "conflict" {
-					return MutationOutcome{}, ErrConfigConflict
+					return MutationOutcome{}, coreauth.ErrConfigConflict
 				}
 				if scenario != "shared" {
 					delete(cfg.activeRefs, ref)
@@ -49,7 +51,7 @@ func TestAssetDeletionOutcomesAndRecovery(t *testing.T) {
 			}
 			if scenario == "locked" {
 				var cleanup *CleanupError
-				if !errors.As(err, &cleanup) || !errors.Is(err, ErrCredentialStoreLocked) {
+				if !errors.As(err, &cleanup) || !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 					t.Fatalf("cleanup outcome lost: %v", err)
 				}
 			}

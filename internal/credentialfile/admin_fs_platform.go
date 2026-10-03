@@ -13,13 +13,13 @@ import (
 	"strconv"
 	"strings"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	unix "github.com/wentf9/xops-cli/internal/vaultsys"
-	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
 func (d *directory) mkdir(ctx context.Context, name string, existing bool, ops fileOps) (child *directory, err error) {
 	if !component(name) {
-		return nil, credential.ErrCredentialAccessDenied
+		return nil, coreauth.ErrCredentialAccessDenied
 	}
 	if err := d.check(); err != nil {
 		return nil, err
@@ -97,7 +97,7 @@ func nextNumber(ctx context.Context, parent *directory, minimum uint64) (uint64,
 
 func createVaultRoot(ctx context.Context, path string) (root *directory, err error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path || path == "/" {
-		return nil, credential.ErrCredentialAccessDenied
+		return nil, coreauth.ErrCredentialAccessDenied
 	}
 	parent, err := walkDirectory(ctx, filepath.Dir(path))
 	if err != nil {
@@ -154,7 +154,7 @@ func ensureVaultLock(ctx context.Context, root *directory, ops fileOps) (err err
 
 func unlinkFile(ctx context.Context, d *directory, name string, ops fileOps) error {
 	if !component(name) {
-		return credential.ErrCredentialAccessDenied
+		return coreauth.ErrCredentialAccessDenied
 	}
 	err := ops.step(ctx, "admin:unlink", func() error { return unix.Unlinkat(int(d.file.Fd()), name, 0) })
 	if errors.Is(err, os.ErrNotExist) {

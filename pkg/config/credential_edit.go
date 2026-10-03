@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
 )
@@ -36,7 +37,7 @@ func (r *Repository) NodeCredentialEdit(ref NodeRef, nodeID string, node models.
 
 func (u *credentialEditUpdater) ApplyCredentialRefAtVersion(ctx context.Context, target credential.Target, expectedVersion string, newRef *credential.Ref) (credential.MutationOutcome, string, error) {
 	if target.Kind != credential.KindLoginPassword && target.Kind != credential.KindPassphrase {
-		return credential.MutationOutcome{}, "", fmt.Errorf("%w: inventory edit requires an authentication credential", credential.ErrInvalidRef)
+		return credential.MutationOutcome{}, "", fmt.Errorf("%w: inventory edit requires an authentication credential", coreauth.ErrInvalidRef)
 	}
 	if newRef != nil {
 		if err := newRef.Validate(); err != nil {
@@ -86,5 +87,5 @@ func (u *credentialEditUpdater) validateTarget(target credential.Target, expecte
 	} else if u.identityRef.ID != "" && target.IdentityID == u.identityRef.ID && target.NodeID == "" && expectedVersion == string(u.identityRef.Version[:]) {
 		return nil
 	}
-	return fmt.Errorf("%w: credential target does not match the displayed inventory edit", credential.ErrConfigConflict)
+	return fmt.Errorf("%w: credential target does not match the displayed inventory edit", coreauth.ErrConfigConflict)
 }

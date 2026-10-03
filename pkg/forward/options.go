@@ -1,6 +1,6 @@
 package forward
 
-import "github.com/wentf9/xops-cli/pkg/logger"
+import corelog "github.com/wentf9/xops-cli/core/log"
 
 // ErrorHandler 处理转发过程中的异步错误
 type ErrorHandler func(err error)
@@ -9,19 +9,19 @@ type ErrorHandler func(err error)
 type Option func(c *config)
 
 type config struct {
-	logger       logger.DebugLogger
+	logger       corelog.DebugLogger
 	errorHandler ErrorHandler
 }
 
 func defaultConfig() *config {
 	return &config{
-		logger:       logger.NopLogger,
+		logger:       corelog.NopLogger,
 		errorHandler: nil,
 	}
 }
 
 // WithLogger 允许调用方注入 DebugLogger 实现（必须支持并发调用）
-func WithLogger(l logger.DebugLogger) Option {
+func WithLogger(l corelog.DebugLogger) Option {
 	return func(c *config) {
 		if l != nil {
 			c.logger = l

@@ -10,11 +10,12 @@ import (
 	"sync/atomic"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/wentf9/xops-cli/core/ssh"
+	"github.com/wentf9/xops-cli/internal/sshenv"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/i18n"
-	"github.com/wentf9/xops-cli/pkg/ssh"
 )
 
 type terminalConnectionKind uint8
@@ -103,7 +104,7 @@ func newTerminalConnector(repo *config.Repository, cfg modelConfig) (*ssh.Connec
 		}
 	}
 	ports := &terminalCredentialPorts{SSHAdapter: adapter.NewSSHAdapter(repo, credentialAdapterOptions(repo, adapterConfig)...), access: access}
-	opts := []ssh.Option{ssh.WithInteractionHandler(access), ssh.WithLogger(cfg.logger)}
+	opts := []ssh.Option{ssh.WithEnvironment(sshenv.Discover()), ssh.WithInteractionHandler(access), ssh.WithLogger(cfg.logger)}
 	if snapshot := repo.Snapshot(); snapshot.PasswordPromptPattern != "" {
 		opts = append(opts, ssh.WithPasswordPromptPattern(snapshot.PasswordPromptPattern))
 	}

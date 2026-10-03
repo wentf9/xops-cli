@@ -9,10 +9,11 @@ import (
 	"strings"
 	"testing"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
+	"github.com/wentf9/xops-cli/core/concurrent"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
-	"github.com/wentf9/xops-cli/pkg/utils/concurrent"
 )
 
 type memoryCredentialStore struct {
@@ -27,7 +28,7 @@ type failingCredentialStore struct {
 
 func (s *failingCredentialStore) Put(ctx context.Context, ref credential.Ref, secret credential.Secret) error {
 	if s.failPut {
-		return credential.ErrCredentialStoreUnavailable
+		return coreauth.ErrCredentialStoreUnavailable
 	}
 	if s.onPut != nil {
 		if err := s.onPut(); err != nil {
@@ -46,7 +47,7 @@ func newMemoryCredentialStore() *memoryCredentialStore {
 func (m *memoryCredentialStore) Get(_ context.Context, ref credential.Ref) (credential.Secret, error) {
 	s, ok := m.data[ref.ItemID]
 	if !ok {
-		return credential.Secret{}, credential.ErrCredentialNotFound
+		return credential.Secret{}, coreauth.ErrCredentialNotFound
 	}
 	return credential.Secret{Value: bytes.Clone(s.Value)}, nil
 }
@@ -430,7 +431,7 @@ func TestNodeFormCredentialSwitchToKey_CompletesAtomically(t *testing.T) {
 	if snapshot.Identity.LoginPasswordRef != nil || snapshot.Identity.PassphraseRef == nil {
 		t.Fatalf("updated credential references = %#v", snapshot.Identity)
 	}
-	if _, err := store.Get(t.Context(), oldRef); !errors.Is(err, credential.ErrCredentialNotFound) {
+	if _, err := store.Get(t.Context(), oldRef); !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		t.Fatalf("old password remains after replacement: %v", err)
 	}
 }
@@ -513,7 +514,7 @@ func TestNodeFormCredentialSwitchToUnencryptedKey_CleansOldReference(t *testing.
 	if !ok || msg.err != nil {
 		t.Fatalf("save result = %#v, want success", msg)
 	}
-	if _, err := store.Get(t.Context(), oldRef); !errors.Is(err, credential.ErrCredentialNotFound) {
+	if _, err := store.Get(t.Context(), oldRef); !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		t.Fatalf("old password remains after unencrypted-key switch: %v", err)
 	}
 	snapshot, err := repo.ResolveConnection(formCredentialTestNodeID)

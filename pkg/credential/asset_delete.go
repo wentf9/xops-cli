@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 )
 
 // DeleteAssets journals every candidate ref before a single inventory commit.
@@ -84,7 +86,7 @@ func (s *Service) cleanupAssetReference(ctx context.Context, entry JournalEntry)
 		if err != nil {
 			return err
 		}
-		if err := store.Delete(ctx, *entry.OldRef); err != nil && !errors.Is(err, ErrCredentialNotFound) {
+		if err := store.Delete(ctx, *entry.OldRef); err != nil && !errors.Is(err, coreauth.ErrCredentialNotFound) {
 			return fmt.Errorf("delete unreferenced asset credential: %w", err)
 		}
 		if s.cache != nil {

@@ -12,6 +12,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/internal/credentialfile"
 	"github.com/wentf9/xops-cli/internal/credentialfile/format"
 	"github.com/wentf9/xops-cli/internal/kdfhelper"
@@ -143,11 +144,11 @@ type offlineCommand struct {
 
 func offlineConfig(cfg *config.Configuration, id, path string) (config.StoreConfig, error) {
 	if cfg.Credential == nil {
-		return config.StoreConfig{}, credential.ErrStoreNotFound
+		return config.StoreConfig{}, coreauth.ErrStoreNotFound
 	}
 	selected, ok := cfg.Credential.Stores[id]
 	if !ok {
-		return selected, credential.ErrStoreNotFound
+		return selected, coreauth.ErrStoreNotFound
 	}
 	if selected.Type != config.StoreTypeEncryptedFile {
 		return selected, fmt.Errorf("store must have type encrypted-file")
@@ -378,7 +379,7 @@ func offlineErrorCode(err error) string {
 		return "canceled"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "timeout"
-	case errors.Is(err, credential.ErrCredentialStoreLocked):
+	case errors.Is(err, coreauth.ErrCredentialStoreLocked):
 		return "locked"
 	case errors.Is(err, credentialfile.ErrUnsupported), errors.Is(err, format.ErrUnsupported):
 		return "unsupported"
@@ -394,13 +395,13 @@ func offlineErrorCode(err error) string {
 		return "resource_busy"
 	case errors.Is(err, kdfhelper.ErrResource):
 		return "resource_exhausted"
-	case errors.Is(err, credential.ErrCredentialStoreUnavailable):
+	case errors.Is(err, coreauth.ErrCredentialStoreUnavailable):
 		return "unavailable"
 	case errors.Is(err, credential.ErrCredentialStoreReadOnly):
 		return "read_only"
 	case errors.Is(err, credentialfile.ErrKeyUsageExhausted):
 		return "key_usage_exhausted"
-	case errors.Is(err, credential.ErrCredentialAccessDenied):
+	case errors.Is(err, coreauth.ErrCredentialAccessDenied):
 		return "access_denied"
 	default:
 		return "failed"

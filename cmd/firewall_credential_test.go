@@ -8,10 +8,10 @@ import (
 	"testing"
 
 	"github.com/wentf9/xops-cli/cmd/utils"
+	coreauth "github.com/wentf9/xops-cli/core/auth"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/config"
-	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/firewall"
-	"github.com/wentf9/xops-cli/pkg/ssh"
 )
 
 type firewallProbeDialer struct{ err error }
@@ -73,7 +73,7 @@ func TestRemoteFirewallPropagatesStoreLocked(t *testing.T) {
 		t.Error("firewall action ran after credential failure")
 		return "", nil
 	})
-	if !errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("firewall did not propagate backend error: %v", err)
 	}
 }
@@ -98,7 +98,7 @@ func TestFirewallBatchRequiresNonInteractiveStore(t *testing.T) {
 			t.Errorf("close connector: %v", err)
 		}
 	}()
-	if _, err := connector.Connect(t.Context(), "node"); !errors.Is(err, credential.ErrCredentialStoreUnavailable) {
+	if _, err := connector.Connect(t.Context(), "node"); !errors.Is(err, coreauth.ErrCredentialStoreUnavailable) {
 		t.Fatalf("batch accepted an interactive-only backend: %v", err)
 	}
 }

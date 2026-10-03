@@ -7,17 +7,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"gopkg.in/yaml.v3"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/internal/credentialfile"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
-	"github.com/wentf9/xops-cli/pkg/ssh"
+	"gopkg.in/yaml.v3"
 )
 
 func TestOfflineStoreCommands(t *testing.T) {

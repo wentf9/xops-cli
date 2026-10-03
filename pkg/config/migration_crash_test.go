@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -18,7 +19,7 @@ type durableMigrationBackend struct{ dir string }
 func (s durableMigrationBackend) Get(_ context.Context, ref credential.Ref) (credential.Secret, error) {
 	data, err := os.ReadFile(filepath.Join(s.dir, ref.ItemID))
 	if errors.Is(err, os.ErrNotExist) {
-		return credential.Secret{}, credential.ErrCredentialNotFound
+		return credential.Secret{}, coreauth.ErrCredentialNotFound
 	}
 	if err != nil {
 		return credential.Secret{}, err

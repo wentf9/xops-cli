@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/i18n"
-	"github.com/wentf9/xops-cli/pkg/ssh"
 )
 
 func TestHostKeyConfirmationAcceptsExplicitYesForms(t *testing.T) {

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/internal/credentialfile/format"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"golang.org/x/sys/unix"
@@ -57,7 +58,7 @@ func TestTempValidationHelper(t *testing.T) {
 	}
 	unix.Umask(previous)
 	previous = -1
-	if !errors.Is(err, credential.ErrCredentialAccessDenied) {
+	if !errors.Is(err, coreauth.ErrCredentialAccessDenied) {
 		t.Fatalf("validation error lost: %v", err)
 	}
 	for _, dir := range []string{"key-state/1", "revisions/1/items"} {

@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wentf9/xops-cli/core/sftp"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/i18n"
-	"github.com/wentf9/xops-cli/pkg/sftp"
-	"github.com/wentf9/xops-cli/pkg/ssh"
 	"go.uber.org/goleak"
 )
 

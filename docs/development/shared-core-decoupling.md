@@ -1,8 +1,8 @@
 # 公共代码与 MCP 接口解耦设计
 
-状态：实施中。D1 公共叶子层及 D2 SSH/SFTP 主体已迁入 core；旧入口保留兼容包装。已提供显式 Environment、KeySource/KeyLease、HostKeyVerifier、InputBridge，以及 ConnectPlan/PlanConnection/RetirePlan。D3 的护栏、传输/隧道状态机、文件流适配器、ports 接口和 sshexec 执行适配器已建立；运行时主体已迁到 core/mcp/runtime；旧 pkg/mcpserver 仅保留配置、凭据和 OpenSSH 兼容适配器。D4 的发布协调器、原子准入、提交结果屏障、依赖连接退役及非提交任务撤销已实现。D5 的私有授权绑定、journal v1/v2 读取和原连接提交交接已实现。D6 提供独立抽取和消费者验收入口；消费者固定版本及远端下载验证记录由 xops-mcp 的 docs/reuse-baseline.md 维护。基线为 `73892b0791e3222bbd08abee1f21ed067b1c41c8`。配套消费者为 [xops-mcp](https://github.com/wentf9/xops-mcp)，其 `docs/interface-decoupling.md` 记录服务端接入要求。
+状态：公共依赖解耦及 CLI 直接使用 core 的迁移已实现。D1 公共叶子层及 D2 SSH/SFTP 主体位于 core；旧 Go API 兼容包装已移除。已提供显式 Environment、KeySource/KeyLease、HostKeyVerifier、InputBridge，以及 ConnectPlan/PlanConnection/RetirePlan。D3 的护栏、传输/隧道状态机、文件流适配器、ports 接口和 sshexec 执行适配器已建立；运行时主体已迁到 core/mcp/runtime；CLI 的配置、凭据和 OpenSSH 宿主适配位于 internal/mcphost；本地 SSH 环境和 Windows 输入桥位于 internal/sshenv。D4 的发布协调器、原子准入、提交结果屏障、依赖连接退役及非提交任务撤销已实现。D5 的私有授权绑定、journal v1/v2 读取和原连接提交交接已实现。D6 提供独立抽取和消费者验收入口；消费者固定版本及远端下载验证记录由 xops-mcp 的 docs/reuse-baseline.md 维护。基线为 `73892b0791e3222bbd08abee1f21ed067b1c41c8`。配套消费者为 [xops-mcp](https://github.com/wentf9/xops-mcp)，其 `docs/interface-decoupling.md` 记录服务端接入要求。
 
-当前验证入口：`go test ./internal/corecontract` 检查旧类型/错误/序列化与 MCP schema，`python3 scripts/check_core.py --race` 检查多平台依赖及已迁移子树的独立模块构建。schema fixture 已与基线远端 module 对照。已迁移核心通过 Linux 独立模块 race 测试；Windows amd64 原生非 race 验证覆盖 SSH/SFTP、ports、state、transfer、sshexec 及相关 runtime 文件任务测试。Windows/macOS 依赖检查及测试交叉构建通过。macOS 原生和 Windows race 不属于本轮已获得的证据。具体凭据库集成测试留在 `pkg/ssh`，使用公开接口验证真实后端；纯 SSH 及原生 sudo 测试随实现迁往 `core/ssh`。本地消费者验证不能代替发布后的远端版本验收。
+当前验证入口：`go test ./internal/clicontract` 检查 CLI 配置序列化与 MCP schema，`python3 scripts/check_core.py --race` 检查多平台依赖及已迁移子树的独立模块构建。schema fixture 已与基线远端 module 对照。已迁移核心通过 Linux 独立模块 race 测试；Windows amd64 原生非 race 验证覆盖 SSH/SFTP、ports、state、transfer、sshexec 及相关 runtime 文件任务测试。Windows/macOS 依赖检查及测试交叉构建通过。macOS 原生和 Windows race 不属于本轮已获得的证据。具体凭据库集成测试位于 `pkg/adapter`，使用公开接口验证真实后端；纯 SSH 及原生 sudo 测试随实现迁往 `core/ssh`。本地消费者验证不能代替发布后的远端版本验收。
 
 2026-10-02 的接口解耦回归修复已通过 Linux 回归、竞态检查及 Windows amd64 测试交叉编译。Windows 原生验证环境不可达，本次修复没有新增原生执行证据；先前的原生结果仅对应当时的迁移状态。
 
@@ -12,19 +12,19 @@ ConnectPlan 返回显式租约，普通 Close 释放引用而不关闭其他租�
 
 公共代码必须能够整体抽到独立 Go module 维护。目标不止是允许 MCP 注入数据库，还包括清除公共层对 CLI 配置、业务模型、具体凭据库、终端 UI、个人目录和全局输出的反向依赖。
 
-先在本仓库规划 `core/` 公共代码子树，沿用根 `go.mod`，保持 Go 1.26+。本阶段不创建第三个仓库或嵌套 module；通过独立模块抽取检查证明边界成立。未来抽出时只迁移该子树、模块元数据与测试，调整 import path 和兼容外观，不重新设计业务接口。
+先在本仓库规划 `core/` 公共代码子树，沿用根 `go.mod`，保持 Go 1.26+。本阶段不创建第三个仓库或嵌套 module；通过独立模块抽取检查证明边界成立。未来抽出时只迁移该子树、模块元数据与测试，调整 import path 和应用适配器，不重新设计业务接口。
 
 首个消费者仍是 `xops-mcp`，SQLite/PostgreSQL 和 Web 业务都在消费者侧。现有 CLI/TUI、stdio MCP、HTTP MCP、SSH/SFTP 和 Windows 输入行为需要继续兼容。HTTP 隧道、SOCKS、多租户和分布式运行不属于本次解耦。
 
-## 2. 当前依赖证据
+## 2. 解耦前的依赖基线
 
 | 当前位置 | 耦合 | 处理方向 |
 | --- | --- | --- |
-| `pkg/mcpserver/server.go` | 依赖 config、adapter、全量配置快照，内部创建 connector | 公共 runtime 消费小接口；原包装配 CLI 适配器 |
+| `pkg/mcpserver/server.go` | 依赖 config、adapter、全量配置快照，内部创建 connector | 公共 runtime 消费小接口；internal/mcphost 装配 CLI 适配器 |
 | `pkg/mcpserver/guardrail/{guardrail,policy}.go` | 策略类型定义在 config，审计默认写个人目录 | 中立策略值与显式审计注入 |
 | `pkg/mcpserver/tool_ssh.go` | 多次查询 Node/Host/Identity，可混合不同版本 | 一次获取一致的展示或执行快照 |
 | `pkg/mcpserver/tool_transfer.go`、`http_transfer.go` | 任务只绑定 NodeID/TargetID，再次按节点取连接 | 分离目标锁、连接代际和授权绑定 |
-| `pkg/ssh/errors.go` | 为 ProxyCycle 的匹配引入整个 config 包 | 错误归属下沉，旧名字重导出 |
+| `pkg/ssh/errors.go` | 为 ProxyCycle 的匹配引入整个 config 包 | 错误归属下沉，调用方直接使用 core/auth |
 | `pkg/ssh/credential_recovery.go` | 直接识别 credential 包的存储错误 | 中立认证错误分类，保留现有恢复策略 |
 | `pkg/ssh/connector.go`、`auth.go` | 自动取 home、known_hosts、私钥路径及 SSH_AUTH_SOCK | 宿主发现环境，核心消费显式来源 |
 | `pkg/ssh/client.go`、`copy_stdin_windows.go` | 默认标准流，依赖 CLI internal/terminal | 显式交互 I/O 和可取消输入桥 |
@@ -35,7 +35,7 @@ ConnectPlan 返回显式租约，普通 Close 释放引用而不关闭其他租�
 ## 3. 目标包边界
 
 ```text
-xops-cli/cmd + pkg/tui + CLI adapters ─┐
+xops-cli/cmd + pkg/tui + internal/{mcphost,sshenv} + pkg/adapter ─┐
                                      ├──> xops-cli/core/*
 xops-mcp/internal/adapters/xops ───────┘
 
@@ -59,21 +59,21 @@ core/sftp ──> core/ssh ──> core/auth + core/log + core/concurrent
 
 硬约束：`core/**` 的生产代码、测试、fixture 和生成代码不得 import 本 module 的 `cmd/**`、`pkg/**` 或根 `internal/**`；不得依赖 `xops-mcp`。可依赖标准库、子树内包和列明的第三方协议库。公共类型不得暴露 `config.Configuration`、`models.Node`、`credential.Registry`、SQL/ORM 类型或 CLI flag 类型。
 
-核心内部实现可以使用 `core/internal/**`，但旧兼容包不能跨 Go internal 边界导入它。需要保留旧公开类型的容器应放在 `core/concurrent` 等公开包，再由旧路径做类型别名。
+核心内部实现可以使用 `core/internal/**`，应用适配器不得跨 Go internal 边界导入它。跨包使用的并发容器直接从 `core/concurrent` 导入。
 
-## 4. 兼容入口与单份实现
+## 4. CLI 直接接入与单份实现
 
-`pkg/ssh`、`pkg/sftp`、`pkg/logger`、`pkg/mcpserver` 逐步成为兼容外观。核心实现通过移动进入 `core/`，不复制后双线维护。
+CLI、TUI、playbook 和应用适配器直接导入 `core/ssh`、`core/sftp`、`core/concurrent`、`core/auth`、`core/log` 与 `core/mcp/*`。`pkg/ssh`、`pkg/sftp`、`pkg/utils/concurrent`、`pkg/mcpserver` 及其子包已移除；不再维护旧 Go import path、类型别名、错误重导出或构造函数兼容性。
 
-- 能直接兼容的类型用别名，保留现有字段、JSON/YAML 标签和方法集；需要默认值转换的构造函数使用薄包装。
-- `pkg/mcpserver.NewRuntime`、`Serve`、`WithConfigProvider`、`WithCredentialRegistry`、`WithHTTP`、`HTTPOptionsFromConfig`、`RecoverTransfers` 保留。CLI 默认值和 legacy adapter 在这层装配。
-- 旧 `Runtime` 的公开方法及工具输入/输出类型需要 API 清单和编译契约覆盖；私有字段测试随实现移动，旧包保留外部行为测试。
-- 原 `config.GuardrailConfig` / `NodeGuardrailCfg` 可别名到 `core/mcp/policy` 的兼容值类型；保留原字段与序列化。`AuditLog` 作为旧配置字段保留，核心新入口不据此自动选择文件路径。
-- 共享错误下沉后，旧包重导出相应 sentinel，验证既有 `errors.Is`/`errors.As` 关系。不能仅通过错误字符串匹配跨层。
-- SSH 的无参交互方法可继续使用构造时注入的 I/O；由旧入口提供标准流。新核心未提供交互能力时明确返回需要交互的错误。
-- 旧 HTTP 入口继续提供启动快照语义；新服务通过新入口启用动态视图，避免解耦提交改变老用户的配置生效方式。
+- `internal/sshenv.Discover` 发现个人目录、known_hosts、默认私钥、SSH agent、标准流和平台输入桥。CLI adapter 与 TUI 在构造 `core/ssh.Connector` 时显式注入环境，调用方提供的选项仍可覆盖默认值。
+- `internal/mcphost.Config.RuntimeOptions` 将 CLI 配置、凭据解析器、审计路径和传输设置转换为核心选项。命令直接调用 `core/mcp/runtime.NewRuntime`、`Run`、`ServeHTTP` 和 `RecoverTransfers`，并拥有关闭责任。
+- stdio 每次调用获取配置视图；HTTP 与恢复操作保留启动快照语义。配置的工具期限与 HTTP 默认 deny 策略继续生效。
+- `pkg/config.Configuration.Guardrail` 直接使用 `core/mcp/policy.Config`。YAML 字段和持久化格式保持不变，AuditLog 的路径展开由 CLI 宿主负责。
+- 共享错误直接从 `core/auth` 使用，按 `errors.Is`/`errors.As` 匹配；不通过错误字符串跨层传递语义。
+- `pkg/logger` 保留 CLI 彩色输出与 `DefaultLogger`，诊断接口和 Nop 直接来自 `core/log`。配置管理、具体凭据库和 TUI 继续归应用层所有。
+- 协议与核心行为测试跟随实现；CLI 配置、凭据、OpenSSH 和终端行为在应用层验证。`internal/clicontract` 保留配置序列化和 HTTP/stdio schema 基线；纯旧 Go API 编译兼容测试已删除。
 
-新的服务端从 `core/*` 导入。旧入口即使仍依赖 CLI 配置，也不会进入新消费者的编译图。
+新的服务端仅从 `core/*` 导入；消费者所有生产和测试依赖图均不得包含上游应用包。
 
 ## 5. MCP 运行时的四类依赖
 
@@ -162,9 +162,9 @@ Permit 决定可以访问的节点集合、版本和阶段。只读检查 Permit
 1. **完整连接计划**：增加 `ConnectPlan(ctx, plan)` 路径。Plan 的每一跳包含非秘密连接参数、版本化认证/提权引用和信任版本。旧 `Connect(ctx, nodeID)` 由 legacy provider 转换；新路径不会按节点递归查询可变配置。提权及认证后的版本校验同样使用绑定视图，不能意外调用全局 provider。
 2. **机密解析**：继续使用独立 SecretResolver 思路，请求绑定节点、目标、用途和版本。服务端凭据读取按版本返回或明确拒绝，不回退到最新凭据；无隐式 remember 写入。
 3. **私钥来源**：注入 KeySource，返回具有 Signer 与 Close 的 KeyLease。数据库适配器解密/解析私钥，文件适配器接受显式路径；不把数据库私钥临时写到个人目录。所有失败/取消路径释放材料；不承诺 Go signer 内存可以全部确定清零。
-4. **主机信任**：注入 HostKeyVerifier，参数包含节点、规范主机/端口、信任版本、实际远端和 public key。核心不读取个人 known_hosts，也不自动接受未知主机。CLI facade 选择旧文件及交互确认，服务端适配器选择其信任存储。自定义 Verify 接收握手协调器控制、且带握手期限的 context；握手超时会同时取消数据库/网络核验，不能仅关闭 SSH socket 后留下核验任务。
+4. **主机信任**：注入 HostKeyVerifier，参数包含节点、规范主机/端口、信任版本、实际远端和 public key。核心不读取个人 known_hosts，也不自动接受未知主机。CLI 适配器选择本地文件及交互确认，服务端适配器选择其信任存储。自定义 Verify 接收握手协调器控制、且带握手期限的 context；握手超时会同时取消数据库/网络核验，不能仅关闭 SSH socket 后留下核验任务。
 5. **环境发现**：SSH_AUTH_SOCK、home 展开、默认终端流由宿主解析后传入。公共文件/agent 适配器可以保留，但其路径/连接必须显式指定。
-6. **错误与日志**：将 SSH 实际使用的认证错误及循环跳板错误放入中立层，旧包保留导出名称与匹配语义；DebugLogger/Nop 与 CLI 彩色输出彻底分包。
+6. **错误与日志**：将 SSH 实际使用的认证错误及循环跳板错误放入中立层，调用方直接导入中立错误并保留匹配语义；DebugLogger/Nop 与 CLI 彩色输出彻底分包。
 7. **交互输入**：远端 PTY/提权协议仍在核心；本地终端输入复制通过可取消 InputBridge 注入。现有 Windows duplicate handle、VT 与 pipe 取消实现先留在 CLI adapter，保留原生测试。不能用 `io.Copy(os.Stdin, ...)` 替换现有退出逻辑。sudo/su 的命令输入及交互式提权交接同样传递操作 context 和注入的 InputBridge，取消时回收输入复制任务而不关闭借用的 stdin。
 
 认证与输入桥的签名草案如下，`cryptoSSH` 表示 `golang.org/x/crypto/ssh`。KeyRequest/HostKeyRequest 都携带前述目标和版本绑定，不能只传一个可变的节点名。
@@ -241,9 +241,9 @@ Gate 只协调版本/撤销顺序，传输 manager 继续唯一拥有任务状�
 
 | 顺序 | xops-cli 工作 | 消费者/验收 |
 | --- | --- | --- |
-| D1 基线与叶子层 | 记录导出 API/schema；移动 logger 接口、实际公共容器、中立策略/错误；旧路径兼容 | 依赖图不因 facade 掩盖反向依赖 |
+| D1 基线与叶子层 | 记录导出 API/schema；移动 logger 接口、实际公共容器、中立策略/错误；应用直接导入 core | 依赖图无反向依赖 |
 | D2 SSH/SFTP | 移动唯一实现；显式凭据/信任/环境/输入桥；新增绑定 Plan 路径 | 非 CLI adapter 真实直连/跳板/提权/SFTP；CLI 行为和原生 Windows 回归 |
-| D3 MCP 核心 | 移动 handlers/协议/状态机；注入 State、Gate、Backend、Audit；保留旧 facade | 旧/新入口相同工具契约；启动失败和关闭顺序可控 |
+| D3 MCP 核心 | 移动 handlers/协议/状态机；注入 State、Gate、Backend、Audit；CLI 宿主独立装配 | 保持 HTTP/stdio 工具契约；启动失败和关闭顺序可控 |
 | D4 动态视图 | 版本准入、连接代际、审批绑定、更新屏障 | 屏障控制的竞态测试，覆盖共享身份/跳板与撤销 |
 | D5 持久任务 | prepare/claim/commit/recovery 接缝与 journal 双版本读取 | 旧格式 fixture、未知提交保护、撤销/提交交错 |
 | D6 消费与抽取 | 不依赖 CLI 的公共测试夹具；独立模块抽取检查 | xops-mcp 改用 core 新入口，保持固定 module 版本 |
@@ -255,11 +255,11 @@ Gate 只协调版本/撤销顺序，传输 manager 继续唯一拥有任务状�
 1. 对 Linux/Windows/macOS 的 `core/...` 生产包和测试包进行 `go list -deps` 检查，禁止任何子树外的本仓库依赖；包含 build-tag 特定代码。
 2. 静态检查 core 内的个人目录/环境发现、全局打印、默认标准流和隐式文件写入；显式 file/stdio transport 可以保留，路径或流必须由调用者提供。
 3. 在临时目录仅复制 core、其 fixture 与许可证；生成独立 go.mod，把子树内部 import 前缀统一重写为测试 module，执行 tidy、build、test。禁止 `replace` 回原仓库，禁止 require 原 xops-cli module；核验最终依赖图与模块列表。
-4. 核心单元测试、竞态测试及实际 SSH/SFTP fixture 随公共代码运行；需要 CLI 配置的兼容测试留在根仓库，不混入核心。
+4. 核心单元测试、竞态测试及实际 SSH/SFTP fixture 随公共代码运行；需要 CLI 配置的应用集成测试留在根仓库，不混入核心。
 5. 保留 CLI 全量 build/test/lint、MCP HTTP/stdio 契约及涉及的原生平台 gates；跨编译与原生运行分别报告。
-6. xops-mcp 的探针拆成新 core 消费测试与独立 legacy 兼容测试；生产入口及 core 探针的图不得被旧探针的 config 导入污染。仍通过真实远端模块版本验证，不用本地 replace 代替发布验收。
+6. xops-mcp 仅保留 core 消费测试；Linux/Windows/macOS 的全量生产与测试依赖图均禁止引入上游 core 之外的包。仍通过真实远端模块版本验证，不用本地 replace 代替发布验收。
 
-抽取检查通过的含义是源码依赖闭合，不自动承诺 ABI、数据库、高可用或所有 OS 的实际运行支持。未来公共仓库建立后，CLI 兼容包和新服务的 adapter 升级依赖即可；避免公开 API 混用旧/新 module 中两套同名具名类型，必要时进行一轮协调版本升级。
+抽取检查通过的含义是源码依赖闭合，不自动承诺 ABI、数据库、高可用或所有 OS 的实际运行支持。未来公共仓库建立后，CLI 与新服务的 adapter 升级依赖即可；避免公开 API 混用旧/新 module 中两套同名具名类型，必要时进行一轮协调版本升级。
 
 ## 12. 当前运行时接入与待办
 
@@ -287,7 +287,7 @@ Publish 将状态发布、准入版本比较和执行登记按同一个内存锁
 
 已增加同步屏障测试和真实 MCP/SSH 测试，覆盖审批后改目标、已准入调用不被重定向、持久化不确定、提交后发布失败、共享跳板旋转、撤销与提交许可、无锁网络退役回调、显示信息变更、别名/ID 冲突及容量回收。文件传输准备和隧道创建已读取调用时的策略，并在审批后重新准入；ready 文件任务在 claim/commit/recovery 时也校验持久绑定。
 
-旧 CLI 适配器的隧道改由 TunnelBackend 执行。Enter 只冻结一次配置，同时用于绑定复核和私有 Permit context 中的拨号来源；后端据此创建独占 connector，不保留启动时的 runner 快照，也不在拨号前重新读取可变 Repository。配置更新后的新请求使用新视图，准入后的普通编辑不重定向旧请求。凭据来源保留在适配器私有上下文，不进入公开 OperationSnapshot。
+CLI 宿主适配器的隧道改由 TunnelBackend 执行。Enter 只冻结一次配置，同时用于绑定复核和私有 Permit context 中的拨号来源；后端据此创建独占 connector，不保留启动时的 runner 快照，也不在拨号前重新读取可变 Repository。配置更新后的新请求使用新视图，准入后的普通编辑不重定向旧请求。凭据来源保留在适配器私有上下文，不进入公开 OperationSnapshot。
 
 隧道列表的完整处理链使用调用方 context 和同一个工具期限。已有任务的规范节点 ID 可直接识别，即使该节点已停用/删除；别名仍按当前库存解析。筛选结果在审批前固定，并按当前 metadata 策略授权，历史识别不授予执行权限。
 
@@ -310,13 +310,15 @@ OpenTransfer 返回拥有原 SFTP 子系统与连接租约的 TransferSession。
 
 DomainID 和有关版本必须在同一部署跨重启保持稳定；无关显示变更不影响执行摘要。宿主不能以每次启动随机生成的域代替部署身份。服务端版本必须包括实际凭据材料和信任变化，不能只对数据库显示字段计数。
 
-旧 CLI 适配器为完整跳板链派生稳定的凭据依赖摘要，覆盖身份引用、登录/口令/提权凭据引用、密钥指纹、旧密码字段和实际引用的存储配置。只读 Provider 即使没有 UpdateRef，也会通过 Target.Version 参与绑定；摘要不会冒充凭据写入用的 CAS token，不保存明文凭据。域内无关存储、别名和标签不进入该摘要。引用的 ItemID 按凭据存储契约保持不可变，轮换必须产生新引用。
+CLI 宿主适配器为完整跳板链派生稳定的凭据依赖摘要，覆盖身份引用、登录/口令/提权凭据引用、密钥指纹、旧密码字段和实际引用的存储配置。只读 Provider 即使没有 UpdateRef，也会通过 Target.Version 参与绑定；摘要不会冒充凭据写入用的 CAS token，不保存明文凭据。域内无关存储、别名和标签不进入该摘要。引用的 ItemID 按凭据存储契约保持不可变，轮换必须产生新引用。
 
 ## 15. 消费者和发布验收
 
-xops-mcp 将 core 消费测试放在 internal/coreconsumer，旧入口兼容探针单独保留在 internal/legacycompat；两者使用 go.mod 中同一个固定远端版本。普通 Go 测试运行两组契约，core 依赖图单独检查，避免旧兼容测试的应用依赖污染判断。scripts/check_core_consumer.py --upstream 可在临时目录建立本地替换并执行三平台依赖检查、build、race 和 lint；替换不写入任一仓库。探针覆盖 HTTP 鉴权、工具集合、命令、文件往返、动态禁用和资源回收。
+xops-mcp 的 core 消费测试位于 internal/coreconsumer，internal/legacycompat 已删除。internal/dependencycheck 检查固定远端版本和三平台全量依赖图，所有上游依赖必须位于 core。scripts/check_core_consumer.py --upstream 可在临时目录建立本地替换并执行三平台依赖检查、build、race 和 lint；替换不写入任一仓库。探针覆盖 HTTP 鉴权、工具集合、命令、文件往返、动态禁用和资源回收。
 
 上游提交推送到可下载的远端分支后，用 --version 指定精确 module 版本完成无 replace 验收，再升级消费者 go.mod/go.sum。固定提交可通过规范 pseudo-version 消费，无需为此创建正式发布 tag。消费者 CI 验证已提交的 pin；本地联调不能代替远端下载验收。
 
 
-并发容器的性能与压力验收使用 `make bench` 和 `make stress`，目标为 `core/concurrent/...`。兼容包 `pkg/utils/concurrent` 仅保留 API 外观，不再作为这些测试的入口。
+并发容器的性能与压力验收使用 `make bench` 和 `make stress`，目标为 `core/concurrent/...`。不再提供 `pkg/utils/concurrent` 兼容入口。
+
+CLI 直接接入迁移的回归覆盖还包括 stdio 发布后读取新库存、HTTP/恢复保留启动库存、原审计路径、具体凭据库恢复及 Windows 输入桥。历史原生平台结果不作为本次迁移的原生执行证据。

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -144,7 +145,7 @@ func verifyMigrationRef(ctx context.Context, registry *credential.Registry, ref 
 		return fmt.Errorf("verify reference in store %q: %w", ref.StoreID, err)
 	}
 	if len(secret.Value) == 0 || secret.IsExpired(time.Now()) {
-		return fmt.Errorf("%w: migrated credential is empty or expired", credential.ErrCredentialNotFound)
+		return fmt.Errorf("%w: migrated credential is empty or expired", coreauth.ErrCredentialNotFound)
 	}
 	if value, ok := expected[ref]; ok && subtle.ConstantTimeCompare(secret.Value, value) != 1 {
 		return fmt.Errorf("migrated credential differs from legacy source")

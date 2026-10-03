@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
@@ -30,7 +31,7 @@ func CredentialRuntime() (*config.EncryptedRuntime, error) {
 	credentialOwner.RLock()
 	defer credentialOwner.RUnlock()
 	if credentialOwner.runtime == nil {
-		return nil, fmt.Errorf("%w: command credential runtime is not installed", credential.ErrCredentialStoreUnavailable)
+		return nil, fmt.Errorf("%w: command credential runtime is not installed", coreauth.ErrCredentialStoreUnavailable)
 	}
 	return credentialOwner.runtime, nil
 }

@@ -9,6 +9,8 @@ import (
 	"io"
 	"sort"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
+	corepolicy "github.com/wentf9/xops-cli/core/mcp/policy"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/crypto"
 	"github.com/wentf9/xops-cli/pkg/models"
@@ -23,7 +25,7 @@ type migrationLegacyDTO struct {
 	Identities            map[string]models.Identity `yaml:"identities"`
 	Hosts                 map[string]models.Host     `yaml:"hosts"`
 	Nodes                 map[string]models.Node     `yaml:"nodes"`
-	Guardrail             *GuardrailConfig           `yaml:"guardrail,omitempty"`
+	Guardrail             *corepolicy.Config         `yaml:"guardrail,omitempty"`
 	MCP                   *MCPConfig                 `yaml:"mcp,omitempty"`
 	PasswordPromptPattern string                     `yaml:"password_prompt_pattern,omitempty"`
 }
@@ -80,7 +82,7 @@ func (m *CredentialMigrator) migrationRegistry(cfg *CredentialConfig, destinatio
 	if destination != "" {
 		store, ok := cfg.Stores[destination]
 		if !ok {
-			return nil, fmt.Errorf("%w: destination %q", credential.ErrStoreNotFound, destination)
+			return nil, fmt.Errorf("%w: destination %q", coreauth.ErrStoreNotFound, destination)
 		}
 		if store.Type == StoreTypeNone || store.ReadOnly {
 			return nil, fmt.Errorf("%w: destination must support writes", credential.ErrCredentialStoreReadOnly)
@@ -297,7 +299,7 @@ func (m *CredentialMigrator) transferSecret(ctx context.Context, store credentia
 		}
 		return nil
 	}
-	if !errors.Is(err, credential.ErrCredentialNotFound) {
+	if !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		return fmt.Errorf("read pending migration item %d: %w", index, err)
 	}
 	if err := store.Put(ctx, ref, credential.Secret{Value: value}); err != nil {

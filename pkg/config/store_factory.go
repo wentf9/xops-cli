@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strings"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/internal/credentialhelper"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
@@ -21,7 +22,7 @@ func BuildStore(storeID string, cfg StoreConfig) (credential.Store, error) {
 
 	switch cfg.Type {
 	case StoreTypeEncryptedFile:
-		return nil, fmt.Errorf("%w: encrypted-file requires an owned credential runtime", credential.ErrCredentialStoreUnavailable)
+		return nil, fmt.Errorf("%w: encrypted-file requires an owned credential runtime", coreauth.ErrCredentialStoreUnavailable)
 	case StoreTypeNone:
 		baseStore = credential.NewNoneStore()
 

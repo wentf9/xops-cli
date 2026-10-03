@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
 )
@@ -493,9 +494,9 @@ func TestRepositoryConfigUpdater_CASConflict_ErrorContract(t *testing.T) {
 		t.Fatalf("expected outcome.Applied == false on CAS conflict")
 	}
 
-	// 【核心契约验证】：必须同时满足 errors.Is(err, credential.ErrConfigConflict) 和 errors.Is(err, ErrConfigConflict)
-	if !errors.Is(err, credential.ErrConfigConflict) {
-		t.Fatalf("expected errors.Is(err, credential.ErrConfigConflict) to be true, got: %v", err)
+	// 【核心契约验证】：必须同时满足 errors.Is(err, coreauth.ErrConfigConflict) 和 errors.Is(err, ErrConfigConflict)
+	if !errors.Is(err, coreauth.ErrConfigConflict) {
+		t.Fatalf("expected errors.Is(err, coreauth.ErrConfigConflict) to be true, got: %v", err)
 	}
 	if !errors.Is(err, ErrConfigConflict) {
 		t.Fatalf("expected errors.Is(err, config.ErrConfigConflict) to be true, got: %v", err)
@@ -721,7 +722,7 @@ func (s *inMemoryCredStore) Get(_ context.Context, ref credential.Ref) (credenti
 	defer s.mu.Unlock()
 	v, ok := s.data[ref.ItemID]
 	if !ok {
-		return credential.Secret{}, credential.ErrCredentialNotFound
+		return credential.Secret{}, coreauth.ErrCredentialNotFound
 	}
 	return credential.Secret{Value: bytes.Clone(v)}, nil
 }
@@ -737,7 +738,7 @@ func (s *inMemoryCredStore) Delete(_ context.Context, ref credential.Ref) error 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.data[ref.ItemID]; !ok {
-		return credential.ErrCredentialNotFound
+		return coreauth.ErrCredentialNotFound
 	}
 	delete(s.data, ref.ItemID)
 	return nil

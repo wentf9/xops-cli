@@ -12,12 +12,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	mcpruntime "github.com/wentf9/xops-cli/core/mcp/runtime"
+	"github.com/wentf9/xops-cli/internal/mcphost"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
-	"github.com/wentf9/xops-cli/pkg/mcpserver"
 )
 
 func NewCmdMcp() *cobra.Command {
@@ -63,20 +65,20 @@ func runMCPServer(cmd *cobra.Command, args []string) (retErr error) {
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	serveOpts := []mcpserver.Option{
-		mcpserver.WithConfigProvider(provider),
-		mcpserver.WithLogger(logger.DefaultLogger()),
+	host := mcphost.Config{
+		Provider: provider,
+		Logger:   logger.DefaultLogger(),
 	}
 	if reg, regErr := utils.GetCredentialRegistry(cfg); regErr != nil {
 		return fmt.Errorf("initialize credential resolver: %w", regErr)
 	} else if reg != nil {
-		serveOpts = append(serveOpts, mcpserver.WithCredentialRegistry(reg))
+		host.Registry = reg
 	}
 
 	if transport == "http" {
-		err = serveMCPHTTP(credential.WithoutInteraction(ctx), cmd, httpOptions, serveOpts)
+		err = serveMCPHTTP(credential.WithoutInteraction(ctx), cmd, httpOptions, host)
 	} else {
-		err = mcpserver.Serve(credential.WithoutInteraction(ctx), serveOpts...)
+		err = serveMCPStdio(credential.WithoutInteraction(ctx), host)
 	}
 	if err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) || errors.Is(err, context.Canceled) {
@@ -87,9 +89,22 @@ func runMCPServer(cmd *cobra.Command, args []string) (retErr error) {
 	return nil
 }
 
+func serveMCPStdio(ctx context.Context, host mcphost.Config) (retErr error) {
+	opts, err := host.RuntimeOptions()
+	if err != nil {
+		return err
+	}
+	runtime, err := mcpruntime.NewRuntime(ctx, opts...)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, runtime.Close()) }()
+	return runtime.Run(&mcp.StdioTransport{})
+}
+
 // serveMCPHTTP owns both listener and runtime even when startup fails before
 // the HTTP server takes over. Binding first resolves an ephemeral test port.
-func serveMCPHTTP(ctx context.Context, cmd *cobra.Command, options mcpserver.HTTPOptions, serveOpts []mcpserver.Option) (retErr error) {
+func serveMCPHTTP(ctx context.Context, cmd *cobra.Command, options mcpruntime.HTTPOptions, hostConfig mcphost.Config) (retErr error) {
 	listenCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	listener, err := (&net.ListenConfig{}).Listen(listenCtx, "tcp", options.Listen)
@@ -112,8 +127,12 @@ func serveMCPHTTP(ctx context.Context, cmd *cobra.Command, options mcpserver.HTT
 		}
 		options.PublicURL = "http://" + net.JoinHostPort(host, port)
 	}
-	serveOpts = append(serveOpts, mcpserver.WithHTTP(options))
-	runtime, err := mcpserver.NewRuntime(ctx, serveOpts...)
+	hostConfig.HTTP = &options
+	serveOpts, err := hostConfig.RuntimeOptions()
+	if err != nil {
+		return err
+	}
+	runtime, err := mcpruntime.NewRuntime(ctx, serveOpts...)
 	if err != nil {
 		return err
 	}

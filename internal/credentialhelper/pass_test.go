@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -135,7 +136,7 @@ func TestPassStoreDirectCLI(t *testing.T) {
 
 	// 1. Get 不存在时返回 ErrCredentialNotFound
 	_, err = store.Get(ctx, ref)
-	if !errors.Is(err, credential.ErrCredentialNotFound) {
+	if !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		t.Fatalf("expected ErrCredentialNotFound before put, got: %v", err)
 	}
 
@@ -162,7 +163,7 @@ func TestPassStoreDirectCLI(t *testing.T) {
 
 	// 5. Delete 之后再次 Get
 	_, err = store.Get(ctx, ref)
-	if !errors.Is(err, credential.ErrCredentialNotFound) {
+	if !errors.Is(err, coreauth.ErrCredentialNotFound) {
 		t.Fatalf("expected ErrCredentialNotFound after delete, got: %v", err)
 	}
 }
@@ -178,7 +179,7 @@ func TestPassStoreLockedMapping(t *testing.T) {
 
 	ref := credential.Ref{StoreID: "pass-store", ItemID: "locked-item"}
 	_, err = store.Get(ctx, ref)
-	if !errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("expected ErrCredentialStoreLocked, got: %v", err)
 	}
 }
@@ -223,7 +224,7 @@ func TestPassNonInteractiveDisablesPinentry(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = store.Get(credential.WithoutInteraction(t.Context()), credential.Ref{StoreID: "pass", ItemID: "item"})
-	if !errors.Is(err, credential.ErrCredentialStoreLocked) {
+	if !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("non-interactive pass: %v", err)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/internal/credentialfile/format"
 	"github.com/wentf9/xops-cli/internal/kdfhelper"
 	"github.com/wentf9/xops-cli/pkg/credential"
@@ -102,10 +103,10 @@ func (s *session) beginLockLocked(force bool) <-chan struct{} {
 	clear(s.digests)
 	w := &lockWork{done: make(chan struct{}), task: s.task, refresh: !force}
 	if s.task != nil {
-		s.task.cancel(credential.ErrCredentialStoreLocked)
+		s.task.cancel(coreauth.ErrCredentialStoreLocked)
 	}
 	for lease := range s.leases {
-		lease.cancel(credential.ErrCredentialStoreLocked)
+		lease.cancel(coreauth.ErrCredentialStoreLocked)
 		w.leases = append(w.leases, lease)
 	}
 	s.locking = w
@@ -207,10 +208,10 @@ func (l *keyLease) validLocked() error {
 		return err
 	}
 	if l.s.epoch != l.epoch || l.s.locking != nil || (!l.maintenance && len(l.s.key) != 32) {
-		return credential.ErrCredentialStoreLocked
+		return coreauth.ErrCredentialStoreLocked
 	}
 	if !l.s.deadline.IsZero() && !time.Now().Before(l.s.deadline) {
-		return credential.ErrCredentialStoreLocked
+		return coreauth.ErrCredentialStoreLocked
 	}
 	return context.Cause(l.ctx)
 }
@@ -319,7 +320,7 @@ func (s *session) startAcquire(ctx context.Context, hash [32]byte, metadata []by
 		if s.locking.refresh {
 			return nil, nil, s.locking.done, nil
 		}
-		return nil, nil, nil, credential.ErrCredentialStoreLocked
+		return nil, nil, nil, coreauth.ErrCredentialStoreLocked
 	}
 	if s.staleLocked(m, hash) {
 		return nil, nil, nil, ErrRevisionChanged
@@ -334,7 +335,7 @@ func (s *session) startAcquire(ctx context.Context, hash [32]byte, metadata []by
 		return nil, nil, s.beginRefreshLocked(), nil
 	}
 	if s.options.Mode == "prompt" && s.promptForbidden(ctx) {
-		return nil, nil, nil, credential.ErrCredentialStoreLocked
+		return nil, nil, nil, coreauth.ErrCredentialStoreLocked
 	}
 	task := s.task
 	if task != nil && context.Cause(task.ctx) != nil {
@@ -387,7 +388,7 @@ func (s *session) waitTask(ctx context.Context, task *unlockTask) error {
 		err = context.Cause(ctx)
 	}
 	if err == nil && task.epoch != s.epoch {
-		err = credential.ErrCredentialStoreLocked
+		err = coreauth.ErrCredentialStoreLocked
 	}
 	task.waiters--
 	if task.waiters == 0 {
@@ -431,7 +432,7 @@ func (s *session) unlock(task *unlockTask, metadata []byte, m format.Meta) {
 		err = errors.Join(err, cause)
 	}
 	if task.epoch != s.epoch || s.locking != nil {
-		err = errors.Join(err, credential.ErrCredentialStoreLocked)
+		err = errors.Join(err, coreauth.ErrCredentialStoreLocked)
 	}
 	if err != nil {
 		task.err = err
@@ -447,7 +448,7 @@ func (s *session) unlockMaterial(ctx context.Context, metadata []byte, m format.
 	var err error
 	if s.options.Mode == "prompt" {
 		if m.Suite != format.WrapPassword {
-			return nil, credential.ErrCredentialStoreLocked
+			return nil, coreauth.ErrCredentialStoreLocked
 		}
 		password, err = s.password(ctx)
 		if err != nil {
@@ -455,7 +456,7 @@ func (s *session) unlockMaterial(ctx context.Context, metadata []byte, m format.
 		}
 		defer clear(password)
 	} else if m.Suite != format.WrapKeyFile {
-		return nil, credential.ErrCredentialStoreLocked
+		return nil, coreauth.ErrCredentialStoreLocked
 	}
 	work, cancel := context.WithTimeout(ctx, s.options.UnlockTimeout)
 	defer cancel()
@@ -489,7 +490,7 @@ func (s *session) unlockMaterial(ctx context.Context, metadata []byte, m format.
 
 func (s *session) password(ctx context.Context) ([]byte, error) {
 	if s.promptForbidden(ctx) {
-		return nil, credential.ErrCredentialStoreLocked
+		return nil, coreauth.ErrCredentialStoreLocked
 	}
 	ctx, cancel := context.WithTimeout(ctx, s.options.PromptTimeout)
 	defer cancel()

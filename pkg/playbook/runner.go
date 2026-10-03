@@ -11,8 +11,8 @@ import (
 	"time"
 
 	pkgsftp "github.com/pkg/sftp"
-	"github.com/wentf9/xops-cli/pkg/sftp"
-	"github.com/wentf9/xops-cli/pkg/ssh"
+	"github.com/wentf9/xops-cli/core/sftp"
+	"github.com/wentf9/xops-cli/core/ssh"
 )
 
 // runStep 根据步骤类型分发到对应执行器，并处理重试逻辑。
