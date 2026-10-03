@@ -1,10 +1,12 @@
 package corecontract
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -72,11 +74,28 @@ func TestMCPToolSchemas(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read MCP baseline: %v", err)
 			}
-			if string(want) != string(encoded) {
+			equal, err := sameMCPContract(want, encoded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !equal {
 				t.Fatalf("%s MCP contract changed; review schema/annotations/descriptions before updating %s", transport, name)
 			}
 		})
 	}
+}
+
+// Git may check JSON fixtures out with CRLF on Windows. Ignore JSON formatting
+// only; string content, field values and array ordering remain significant.
+func sameMCPContract(want, got []byte) (bool, error) {
+	var expected, actual bytes.Buffer
+	if err := json.Compact(&expected, want); err != nil {
+		return false, fmt.Errorf("compact expected MCP contract: %w", err)
+	}
+	if err := json.Compact(&actual, got); err != nil {
+		return false, fmt.Errorf("compact actual MCP contract: %w", err)
+	}
+	return bytes.Equal(expected.Bytes(), actual.Bytes()), nil
 }
 
 func contractOptions() []mcpserver.Option {
