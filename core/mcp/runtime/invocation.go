@@ -21,8 +21,22 @@ type operation struct {
 	permit   ports.Permit
 }
 
-func (r *Runtime) scope() string {
+// ClientIdentity is the verified client and credential attached to an HTTP
+// tool invocation. IDs contain no bearer secret and survive detached SDK calls.
+type ClientIdentity struct{ ClientID, TokenID string }
+type clientIdentityKey struct{}
+
+func ClientIdentityFromContext(ctx context.Context) (ClientIdentity, bool) {
+	identity, ok := ctx.Value(clientIdentityKey{}).(ClientIdentity)
+	return identity, ok
+}
+
+func (r *Runtime) scope(ctx context.Context) string {
 	if r.http != nil {
+		if r.http.TokenVerifier != nil {
+			identity, _ := ClientIdentityFromContext(ctx)
+			return identity.ClientID
+		}
 		return r.http.scope
 	}
 	return r.provider.DomainID()
@@ -53,7 +67,7 @@ func (r *Runtime) resolve(ctx context.Context, selectors []string) (ports.Operat
 }
 
 func (r *Runtime) operationContext(ctx context.Context, view ports.OperationSnapshot, tool string, input any) (context.Context, *operation, error) {
-	binding, err := ports.Bind(view, r.scope(), tool, input)
+	binding, err := ports.Bind(view, r.scope(ctx), tool, input)
 	if err != nil {
 		return nil, nil, err
 	}

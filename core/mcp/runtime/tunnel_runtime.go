@@ -29,7 +29,7 @@ func (r *Runtime) runBoundTunnel(ctx context.Context, spec tunnel.Spec, ready fu
 	if err != nil {
 		return err
 	}
-	binding, err := ports.Bind(view, r.scope(), "xops_tunnel_create", spec)
+	binding, err := ports.Bind(view, r.scope(ctx), "xops_tunnel_create", spec)
 	if err != nil {
 		return err
 	}

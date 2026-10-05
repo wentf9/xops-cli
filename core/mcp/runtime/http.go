@@ -42,13 +42,7 @@ func (r *Runtime) newHTTPHandler() http.Handler {
 	initializeGate := make(chan struct{}, 1)
 	r.initializeGate = initializeGate
 	requests := make(chan struct{}, options.MaxRequests)
-	serviceAuth := auth.RequireBearerToken(func(_ context.Context, token string, _ *http.Request) (*auth.TokenInfo, error) {
-		digest := sha256.Sum256([]byte(token))
-		if subtle.ConstantTimeCompare(digest[:], options.tokenDigest[:]) != 1 {
-			return nil, auth.ErrInvalidToken
-		}
-		return &auth.TokenInfo{UserID: options.scope}, nil
-	}, &auth.RequireBearerTokenOptions{AllowMissingExpiration: true})(r.protocolAdmission(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+	serviceAuth := r.authenticateHTTP(r.protocolAdmission(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Path != "/mcp" {
 			http.NotFound(w, req)
 			return
@@ -110,6 +104,29 @@ func (r *Runtime) newHTTPHandler() http.Handler {
 		}
 		serviceAuth.ServeHTTP(w, req)
 	})
+}
+
+func (r *Runtime) verifyHTTPToken(ctx context.Context, token string, req *http.Request) (*auth.TokenInfo, error) {
+	if r.http.TokenVerifier != nil {
+		work, cancel := context.WithTimeout(ctx, r.http.HeaderTimeout)
+		defer cancel()
+		info, err := r.http.TokenVerifier(work, token, req)
+		if errors.Is(err, auth.ErrInvalidToken) {
+			return nil, auth.ErrInvalidToken
+		}
+		if err != nil || work.Err() != nil {
+			return nil, errors.New("authentication_unavailable")
+		}
+		if info == nil || info.UserID == "" || len(info.UserID) > 256 {
+			return nil, auth.ErrInvalidToken
+		}
+		return info, nil
+	}
+	digest := sha256.Sum256([]byte(token))
+	if subtle.ConstantTimeCompare(digest[:], r.http.tokenDigest[:]) != 1 {
+		return nil, auth.ErrInvalidToken
+	}
+	return &auth.TokenInfo{UserID: r.http.scope}, nil
 }
 
 type rejectBodyResponseWriter struct{ http.ResponseWriter }
@@ -218,6 +235,16 @@ func (r *Runtime) toolDeadline(next mcp.MethodHandler) mcp.MethodHandler {
 	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
 		if method != "tools/call" {
 			return next(ctx, method, req)
+		}
+		if req != nil {
+			if extra := req.GetExtra(); extra != nil && extra.TokenInfo != nil {
+				info := extra.TokenInfo
+				tokenID, _ := info.Extra["tokenID"].(string)
+				ctx = context.WithValue(ctx, clientIdentityKey{}, ClientIdentity{ClientID: info.UserID, TokenID: tokenID})
+			}
+		}
+		if r.http.TokenVerifier != nil && r.scope(ctx) == "" {
+			return nil, auth.ErrInvalidToken
 		}
 		select {
 		case executions <- struct{}{}:

@@ -327,3 +327,13 @@ After the upstream commit is available on a remote branch, --version validates t
 Concurrent-container performance and stress checks use `make bench` and `make stress`, targeting `core/concurrent/...`. The `pkg/utils/concurrent` facade is no longer provided.
 
 Direct CLI consumption also covers stdio inventory publication, HTTP/recovery startup snapshots, audit paths, concrete vault recovery, and the Windows input bridge. Historical native-platform results are not native execution evidence for this migration.
+
+## MCP HTTP client authentication API
+
+`runtime.HTTPOptions.TokenVerifier` integrates host-owned token storage and is mutually exclusive with static `Token`. Honor the supplied bounded context and return `auth.TokenInfo` with a stable, nonempty `UserID`. Optional `Extra["tokenID"]` identifies the credential. Authentication failures do not expose backend diagnostics.
+
+Dynamic authentication acquires an independent slot before calling the host, bounded by `MaxRequests`. Saturation immediately returns HTTP 429 `authentication_limit`. The slot is released when verification returns; subsequent parsing, SSE and tool execution do not retain authentication capacity. Ordinary requests and control messages keep their separate admission lanes. See `core/mcp/runtime/http_auth_admission_test.go` for concurrency, timeout-release and control-message regressions.
+
+The SDK binds sessions to `UserID`. `runtime.ClientIdentityFromContext` exposes verified client and token IDs to tool invocations. Core uses the client ID for operation bindings and transfer scopes, isolating retry, lookup and cancellation. Static-token and stdio scopes retain their existing behavior. Previously issued short-lived transfer credentials retain their original authorization; the verifier does not promise to interrupt admitted work.
+
+`core/mcp/runtime/http_identity_test.go` covers two clients, identity on detached tool calls, transfer isolation, missing identity and redacted errors.

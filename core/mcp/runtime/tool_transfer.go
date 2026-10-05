@@ -101,7 +101,7 @@ func (r *Runtime) prepareTransfer(ctx context.Context, req *mcp.CallToolRequest,
 	if err != nil {
 		return nil, PreparedTransferOutput{}, err
 	}
-	spec.Scope, spec.RequestDigest = r.http.scope, requestDigest
+	spec.Scope, spec.RequestDigest = r.scope(ctx), requestDigest
 	if existing, found, err := r.retryTransfer(ctx, spec); err != nil || found {
 		if err != nil {
 			return nil, PreparedTransferOutput{}, err
@@ -229,13 +229,13 @@ func transferRisk(spec transfer.Spec) guardrail.RiskInput {
 	return input
 }
 
-func (r *Runtime) transferStatus(_ context.Context, _ *mcp.CallToolRequest, input TransferTaskInput) (*mcp.CallToolResult, transfer.Status, error) {
-	status, err := r.transfers.Lookup(r.http.scope, input.TransferID)
+func (r *Runtime) transferStatus(ctx context.Context, _ *mcp.CallToolRequest, input TransferTaskInput) (*mcp.CallToolResult, transfer.Status, error) {
+	status, err := r.transfers.Lookup(r.scope(ctx), input.TransferID)
 	return nil, status, err
 }
 
-func (r *Runtime) transferCancel(_ context.Context, _ *mcp.CallToolRequest, input TransferTaskInput) (*mcp.CallToolResult, transfer.Status, error) {
-	status, err := r.transfers.Cancel(r.http.scope, input.TransferID)
+func (r *Runtime) transferCancel(ctx context.Context, _ *mcp.CallToolRequest, input TransferTaskInput) (*mcp.CallToolResult, transfer.Status, error) {
+	status, err := r.transfers.Cancel(r.scope(ctx), input.TransferID)
 	if errors.Is(err, transfer.ErrInvalidState) {
 		status.Warning = "commit has started or its outcome is unknown; cancellation is not confirmed"
 		return nil, status, nil
