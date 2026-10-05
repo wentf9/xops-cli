@@ -329,3 +329,13 @@ xops-mcp 的 core 消费测试位于 internal/coreconsumer，internal/legacycomp
 并发容器的性能与压力验收使用 `make bench` 和 `make stress`，目标为 `core/concurrent/...`。不再提供 `pkg/utils/concurrent` 兼容入口。
 
 CLI 直接接入迁移的回归覆盖还包括 stdio 发布后读取新库存、HTTP/恢复保留启动库存、原审计路径、具体凭据库恢复及 Windows 输入桥。历史原生平台结果不作为本次迁移的原生执行证据。
+
+## MCP HTTP 客户端认证接口
+
+`runtime.HTTPOptions.TokenVerifier` 可接入宿主的多 Token 存储，与固定 `Token` 配置互斥。验证器必须在传入的有界 context 内返回 `auth.TokenInfo`，使用稳定且非空的 `UserID` 标识客户端，可在 `Extra["tokenID"]` 携带凭据标识。认证错误不直接回显底层诊断。
+
+动态认证在调用宿主前获取独立的并发额度，上限为 `MaxRequests`；额度饱和时立即返回 HTTP 429 `authentication_limit`。验证回调返回后即释放额度，后续请求解析、SSE 和工具执行不占用认证额度。普通请求与控制消息仍分别使用原有的独立通道。并发、超时释放和控制消息回归见 `core/mcp/runtime/http_auth_admission_test.go`。
+
+SDK 按 `UserID` 绑定会话。`runtime.ClientIdentityFromContext` 返回工具请求的客户端和 Token ID；内核使用客户端 ID 作为 operation Binding 和 transfer Scope，隔离任务重试、查询和取消。固定 Token 与 stdio 的原有作用域保持不变。已有的短期传输凭据继续按原授权绑定生效；认证回调不承诺中断已经准入的工作。
+
+验证见 `core/mcp/runtime/http_identity_test.go`，包括两个客户端、脱离 HTTP 生命周期的工具身份、文件任务隔离、空身份和错误脱敏。

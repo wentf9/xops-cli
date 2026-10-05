@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/wentf9/xops-cli/core/mcp/transfer"
 )
 
@@ -20,9 +21,13 @@ const httpProtocolVersion = "2025-11-25"
 // HTTPOptions configures authenticated Streamable HTTP. Token is consumed at
 // construction; the runtime retains only its digest, never a printable token.
 type HTTPOptions struct {
-	Listen          string
-	PublicURL       string
-	Token           string
+	Listen    string
+	PublicURL string
+	Token     string
+	// TokenVerifier supplies deployment-owned authentication. It is mutually
+	// exclusive with Token and must return a stable, nonempty UserID. The
+	// optional Extra["tokenID"] identifies the credential, not the client.
+	TokenVerifier   auth.TokenVerifier
 	StateDir        string
 	AllowedHosts    []string
 	AllowedOrigins  []string
@@ -33,7 +38,7 @@ type HTTPOptions struct {
 	SessionTimeout  time.Duration
 	ShutdownTimeout time.Duration
 	MaxSessions     int
-	MaxRequests     int
+	MaxRequests     int // Per-lane capacity, including independent dynamic authentication.
 	Transfers       transfer.Limits
 	tokenDigest     [32]byte
 	scope           string
@@ -65,8 +70,8 @@ func WithHTTP(options HTTPOptions) Option {
 }
 
 func (o *HTTPOptions) validate() error {
-	if len(o.Token) < 32 || len(o.Token) > 4096 || strings.ContainsAny(o.Token, " \t\r\n") {
-		return errors.New("HTTP authentication token must contain 32 to 4096 bytes without whitespace")
+	if err := o.validateAuthentication(); err != nil {
+		return err
 	}
 	if o.StateDir == "" {
 		return errors.New("HTTP transfer state directory is required")
@@ -111,9 +116,21 @@ func (o *HTTPOptions) validate() error {
 	if err := o.validateLimits(); err != nil {
 		return err
 	}
-	o.tokenDigest = sha256.Sum256([]byte(o.Token))
-	o.scope = hex.EncodeToString(o.tokenDigest[:])
+	if o.TokenVerifier == nil {
+		o.tokenDigest = sha256.Sum256([]byte(o.Token))
+		o.scope = hex.EncodeToString(o.tokenDigest[:])
+	}
 	o.Token = ""
+	return nil
+}
+
+func (o *HTTPOptions) validateAuthentication() error {
+	if o.TokenVerifier != nil && o.Token != "" {
+		return errors.New("HTTP Token and TokenVerifier are mutually exclusive")
+	}
+	if o.TokenVerifier == nil && (len(o.Token) < 32 || len(o.Token) > 4096 || strings.ContainsAny(o.Token, " \t\r\n")) {
+		return errors.New("HTTP authentication token must contain 32 to 4096 bytes without whitespace")
+	}
 	return nil
 }
 
