@@ -571,13 +571,15 @@ func (o *SshOptions) startTunnels(ctx context.Context, cancelParent context.Canc
 	fail := func(err error) (*sshTunnelGroup, error) {
 		return nil, errors.Join(err, group.Close())
 	}
+	// Connection failures are user-facing diagnostics even when logging is
+	// disabled. Report them without stopping the listener or SSH session.
 	for _, lArg := range o.LocalForwards {
 		bAddr, dAddr, err := parseForwardArg(lArg)
 		if err != nil {
 			return fail(err)
 		}
 		forward, err := client.LocalForward(tunnelCtx, bAddr, dAddr, ssh.WithForwardErrorHandler(func(err error) {
-			logger.Warnf("ssh local forward connection failed: %v", err)
+			logger.PrintErrorf("ssh local forward connection failed: %v", err)
 		}))
 		if err != nil {
 			return fail(fmt.Errorf("setup local forward failed: %w", err))
@@ -590,7 +592,7 @@ func (o *SshOptions) startTunnels(ctx context.Context, cancelParent context.Canc
 			return fail(err)
 		}
 		forward, err := client.RemoteForward(tunnelCtx, bAddr, dAddr, ssh.WithForwardErrorHandler(func(err error) {
-			logger.Warnf("ssh remote forward connection failed: %v", err)
+			logger.PrintErrorf("ssh remote forward connection failed: %v", err)
 		}))
 		if err != nil {
 			return fail(fmt.Errorf("setup remote forward failed: %w", err))
@@ -603,7 +605,7 @@ func (o *SshOptions) startTunnels(ctx context.Context, cancelParent context.Canc
 			return fail(err)
 		}
 		forward, err := client.Socks5Forward(tunnelCtx, listenAddr, ssh.WithForwardErrorHandler(func(err error) {
-			logger.Warnf("ssh SOCKS5 forward connection failed: %v", err)
+			logger.PrintErrorf("ssh SOCKS5 forward connection failed: %v", err)
 		}))
 		if err != nil {
 			return fail(fmt.Errorf("setup SOCKS5 proxy failed: %w", err))
