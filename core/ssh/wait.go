@@ -11,6 +11,7 @@ import (
 // Wait monitors the SSH transport, probing idle connections to detect network
 // loss. It closes the client before returning and joins its transport waiter.
 // Caller cancellation returns only cleanup errors; transport loss is an error.
+// Receive progress postpones idle probes and extends pending probe timeouts.
 // Cancellation or a failed probe aborts the entire shared ProxyJump transport.
 func (c *Client) Wait(ctx context.Context) error {
 	return c.wait(ctx, DefaultKeepAliveInterval, DefaultKeepAliveTimeout)
@@ -34,8 +35,8 @@ func (c *Client) wait(ctx context.Context, interval, timeout time.Duration) (ret
 		<-done
 	}()
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -48,13 +49,18 @@ func (c *Client) wait(ctx context.Context, interval, timeout time.Duration) (ret
 				waitErr = io.EOF
 			}
 			return fmt.Errorf("SSH connection lost: %w", waitErr)
-		case <-ticker.C:
+		case <-timer.C:
+			if remaining := keepAliveReadTimeout(c.sshClient, interval); remaining > 0 {
+				timer.Reset(remaining)
+				continue
+			}
 			if err := probeWithTimeoutAndInterrupt(ctx, c.sshClient, timeout, c.Interrupt); err != nil {
 				if ctx.Err() != nil {
 					return nil
 				}
 				return fmt.Errorf("SSH connection lost: %w", err)
 			}
+			timer.Reset(interval)
 		}
 	}
 }

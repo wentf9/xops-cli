@@ -44,4 +44,8 @@ Individual forwarding connection failures are printed directly to standard error
 
 `-L` and `-D` request an SSH channel only when a client uses the forwarding port, so successfully starting a local listener does not mean the server permits forwarding. `-R` requests the remote listener during startup; if the server denies that request, the command reports an error and exits.
 
-With `-L`, `-R`, `-D`, or `-N`, XOps monitors the SSH connection. A lost connection closes the forwarding listeners and returns a failure status. Silent network loss is detected by SSH keepalive requests every 15 seconds, with a 10-second timeout per probe. Connections are not automatically reestablished; rerun the command after connectivity returns.
+For `-R`, requesting the remote listener has a 10-second limit and respects caller cancellation. Closing the listener has its own 10-second limit. Canceling startup or exceeding either request limit interrupts the SSH connection and its shared ProxyJump transport to unblock operations and release resources. An acknowledged close does not require interrupting the shared connection.
+
+With `-L`, `-R`, `-D`, or `-N`, XOps monitors the SSH connection. A keepalive is sent after 15 seconds without receiving remote data. While awaiting its reply, the probe times out only after 10 consecutive seconds without either a reply or receive progress. Forwarded data arriving over a slow link, including partially received SSH packets, refreshes that timeout so congestion delaying the keepalive reply does not interrupt an active connection. Writes accepted by local send buffers do not refresh it. ProxyJump tracks receive progress separately for each hop.
+
+A lost connection or keepalive timeout closes the forwarding listeners and returns a failure status. Connections are not automatically reestablished; rerun the command after connectivity returns.

@@ -410,7 +410,7 @@ func (c *Connector) connectNode(ctx context.Context, planNode connectionPlanNode
 			return c.wrapCachedClient(planNode.cfg, cachedClient), nil
 		}
 
-		if err := probeWithTimeoutAndInterrupt(ctx, cachedClient.SSHClient, c.keepAliveProbeTimeout(), cachedClient.interrupt); err == nil {
+		if err := c.probeCachedClient(ctx, cachedClient); err == nil {
 			return c.wrapCachedClient(planNode.cfg, cachedClient), nil
 		} else {
 			probeErr = err
@@ -446,6 +446,17 @@ func (c *Connector) wrapCachedClient(cfg *ClientConfig, cachedClient *PooledClie
 		c.getInteractionTimeout(),
 		c.getLogger(),
 	))
+}
+
+// Cache revalidation is a finite acquisition step, unlike background liveness
+// monitoring. Bound its total duration even while channel data keeps arriving:
+// the shared task outlives individual callers and must release its singleflight
+// entry without waiting for Connector.CloseAll.
+func (c *Connector) probeCachedClient(ctx context.Context, client *PooledClient) error {
+	timeout := c.keepAliveProbeTimeout()
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return probeWithTimeoutAndInterrupt(probeCtx, client.SSHClient, timeout, client.interrupt)
 }
 
 func (c *Connector) keepAliveProbeTimeout() time.Duration {
@@ -652,8 +663,10 @@ func (c *Connector) syncAuthTokensAfterConnection(nodeName string, cfg *ClientCo
 
 // EnableKeepAlive 启用连接池周期心跳（opt-in，幂等）。
 // 启用后所有新入池的连接（含 ProxyJump 跳板机连接）会挂载周期性 keepalive 探测：
-// 探测失败或超时即关闭连接并从池中驱逐，下次 Connect 自动重建。
+// 接收数据会推迟空闲探测；等待回复期间持续接收数据会刷新超时。
+// 探测失败或持续无接收进展直到超时才关闭连接并从池中驱逐，下次 Connect 自动重建。
 // interval/timeout 传非正值时回退到 DefaultKeepAliveInterval/DefaultKeepAliveTimeout。
+// Connect 的缓存复检以 timeout 为总时限，不随接收进展延长。
 // 生命周期同时绑定 ctx 与 CloseAll：任一方取消都会终止全部心跳 goroutine 并清理配置；
 // ctx 取消完成清理后允许再次启用，CloseAll 之后则不会恢复。
 // 仅对启用后入池的连接生效，存量连接不补挂。
@@ -880,7 +893,8 @@ func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, cfg *
 
 	// 建立 SSH 会话
 	// 使用 NewClientConn 接管底层的 conn
-	ncc, chans, reqs, err := ssh.NewClientConn(conn, targetAddr, sshConfig)
+	activity := &sshActivityConn{Conn: conn, startedAt: time.Now()}
+	ncc, chans, reqs, err := ssh.NewClientConn(activity, targetAddr, sshConfig)
 	if err != nil {
 		stopCancelClose()
 		return nil, nil, c.handleHandshakeFailure(ctx, coordinator, nodeName, conn, err)
@@ -908,7 +922,7 @@ func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, cfg *
 		}
 	}
 
-	return ssh.NewClient(ncc, chans, reqs), conn, nil
+	return ssh.NewClient(&activitySSHConn{Conn: ncc, activity: activity}, chans, reqs), conn, nil
 }
 
 func setInitialHandshakeDeadline(ctx context.Context, conn net.Conn, nodeName string, timeout time.Duration) error {

@@ -90,11 +90,17 @@ func (c *Client) handleLocalForward(ctx context.Context, localConn net.Conn, rem
 
 // RemoteForward starts remote port forwarding.
 // Asks SSH server to listen on remoteAddr, forwards connections to localAddr.
+// Startup and listener shutdown have independent, bounded request lifetimes.
+// Canceling startup or timing out a request interrupts the shared SSH transport.
 func (c *Client) RemoteForward(ctx context.Context, remoteAddr, localAddr string, opts ...ForwardOption) (*Forward, error) {
+	return c.remoteForward(ctx, remoteAddr, localAddr, remoteForwardRequestTimeout, opts...)
+}
+
+func (c *Client) remoteForward(ctx context.Context, remoteAddr, localAddr string, timeout time.Duration, opts ...ForwardOption) (*Forward, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("remote forward context is nil")
 	}
-	listener, err := c.sshClient.Listen("tcp", remoteAddr)
+	listener, err := c.listenRemoteContext(ctx, remoteAddr, timeout)
 	if err != nil {
 		return nil, fmt.Errorf("listen on remote address %s failed: %w", remoteAddr, err)
 	}

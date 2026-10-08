@@ -85,6 +85,8 @@ An EOF caused by closing the listener during a normal stop is treated as cancell
 
 Cancellation, timeout or MCP shutdown during ProxyJump startup releases established jump connections even if the downstream SSH handshake is incomplete or the network is unresponsive.
 
+Remote listener creation and closure each have an independent 10-second request limit; creation also respects task cancellation. A canceled startup request or an expired request limit interrupts the tunnel's dedicated SSH/ProxyJump transport and releases local resources. Remote port release still reports `unconfirmed`.
+
 | Limit | Current value |
 | --- | --- |
 | Default / maximum lifetime | 1 hour / 24 hours, selected with `ttlSeconds` |

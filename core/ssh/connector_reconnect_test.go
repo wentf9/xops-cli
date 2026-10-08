@@ -15,12 +15,18 @@ import (
 )
 
 type reconnectSSHServer struct {
-	t          *testing.T
-	ctx        context.Context
-	cfg        *ssh.ServerConfig
-	stall      atomic.Bool
-	stallDepth int
-	roots      atomic.Int32
+	t            *testing.T
+	ctx          context.Context
+	cfg          *ssh.ServerConfig
+	stall        atomic.Bool
+	stallDepth   int
+	roots        atomic.Int32
+	probeSeen    chan struct{}
+	probeOnce    sync.Once
+	forwards     atomic.Int32
+	cancels      atomic.Int32
+	stallForward atomic.Bool
+	stallCancel  atomic.Bool
 }
 
 func (s *reconnectSSHServer) serve(conn net.Conn, generation int32, depth int) {
@@ -34,21 +40,17 @@ func (s *reconnectSSHServer) serve(conn net.Conn, generation int32, depth int) {
 	}
 	defer closeTestResource(s.t, server)
 	var workers sync.WaitGroup
-	workers.Go(func() {
-		for request := range requests {
-			// Only the first connection's selected downstream server stops answering.
-			// Its jump hosts keep answering, and replacement connections are healthy.
-			if generation == 1 && depth == s.stallDepth && s.stall.Load() {
+	workers.Go(func() { s.handleRequests(requests, generation, depth) })
+	for next := range channels {
+		if next.ChannelType() == "cache-probe-traffic" {
+			channel, reqs, err := next.Accept()
+			if err != nil {
 				continue
 			}
-			if request.WantReply {
-				if err := request.Reply(false, nil); err != nil && s.ctx.Err() == nil {
-					return
-				}
-			}
+			workers.Go(func() { ssh.DiscardRequests(reqs) })
+			workers.Go(func() { serveCachedProbeTraffic(s.t, s.ctx, channel) })
+			continue
 		}
-	})
-	for next := range channels {
 		if next.ChannelType() != "direct-tcpip" {
 			if err := next.Reject(ssh.UnknownChannelType, "unsupported"); err != nil && s.ctx.Err() == nil {
 				s.t.Error(err)
@@ -63,6 +65,37 @@ func (s *reconnectSSHServer) serve(conn net.Conn, generation int32, depth int) {
 		workers.Go(func() { s.serve(nestedServerConn{Channel: channel, addr: conn.LocalAddr()}, generation, depth+1) })
 	}
 	workers.Wait()
+}
+
+func (s *reconnectSSHServer) handleRequests(requests <-chan *ssh.Request, generation int32, depth int) {
+	for request := range requests {
+		// Only the first connection's selected downstream server stops answering.
+		// Its jump hosts keep answering, and replacement connections are healthy.
+		if request.Type == "keepalive@openssh.com" && generation == 1 && depth == s.stallDepth && s.stall.Load() {
+			s.probeOnce.Do(func() { close(s.probeSeen) })
+			continue
+		}
+		accepted := false
+		switch request.Type {
+		case "tcpip-forward":
+			s.forwards.Add(1)
+			if s.stallForward.Load() {
+				continue
+			}
+			accepted = true
+		case "cancel-tcpip-forward":
+			s.cancels.Add(1)
+			if s.stallCancel.Load() {
+				continue
+			}
+			accepted = true
+		}
+		if request.WantReply {
+			if err := request.Reply(accepted, nil); err != nil && s.ctx.Err() == nil {
+				return
+			}
+		}
+	}
 }
 
 func newReconnectSSHServer(t *testing.T, ctx context.Context, stallDepth int) (*reconnectSSHServer, *net.TCPAddr) {
@@ -81,7 +114,7 @@ func newReconnectSSHServer(t *testing.T, ctx context.Context, stallDepth int) (*
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := &reconnectSSHServer{t: t, ctx: ctx, cfg: cfg, stallDepth: stallDepth}
+	server := &reconnectSSHServer{t: t, ctx: ctx, cfg: cfg, stallDepth: stallDepth, probeSeen: make(chan struct{})}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
