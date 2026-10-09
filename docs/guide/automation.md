@@ -1,5 +1,7 @@
 # Playbook 与 MCP
 
+通过 Agent 直接执行 CLI 的方式见 [Agent Skill 与功能概览](./agent-skill)。Skill 的运维流程独立于本页介绍的 MCP 服务接入。
+
 `--var key=value` 覆盖 YAML 同名变量，并统一用于步骤字段和外部 template 文件；CLI 新增变量也可用于模板，空值是有效覆盖。不存在的变量报错，不递归展开变量值。
 
 ## Playbook

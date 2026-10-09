@@ -1,5 +1,7 @@
 # Playbooks and MCP
 
+For Agent-driven CLI operations, see [Agent Skill and capability overview](./agent-skill). Skill workflows are independent of the MCP service interface described here.
+
 `--var key=value` overrides YAML defaults consistently for step fields and external template files. Newly supplied variables and empty overrides are supported. Missing variables are errors; variable values are not recursively expanded.
 
 ## Playbooks
