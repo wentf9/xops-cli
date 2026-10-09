@@ -134,7 +134,7 @@ flag_sftp_thread:
 exec_short:
   other: "Execute commands on one or more remote hosts"
 exec_long:
-  other: "Execute commands on one or more remote hosts. Supports batch execution and privilege escalation. Requires Bash in the remote SSH execution environment, including on Windows; --no-login still uses Bash, even when the command invokes powershell.exe.\n\nUsage examples (OpenSSH-compatible):\n  xops exec -l root -p 22 192.168.1.11 \"uptime\"\n  xops exec -i ~/.ssh/id_rsa -J bastion.example.com 192.168.1.11 \"df -h\"\n  xops exec root@192.168.1.11 \"uptime\"\n\nBatch execution:\n  xops exec --host host1,host2 -c \"uptime\"\n  xops exec --tag web -c \"uptime\"\n  xops exec -I hosts.txt --shell script.sh\n\nConnection Target Semantics:\n  Explicit user and port prioritize full-target matching, automatically reuse existing Host records, strictly isolate Identity credentials, consistent with ssh/sftp/scp.\n  ProxyJump (-J) resolution strategy: Prioritizes saved Node, Alias, or ~/.ssh/config Host; direct jump targets explicitly require Node/Alias, FQDN, IP, or host:port; single-label hostnames without port must be configured as a Node/Alias first.\n  The --host, --ifile (-I), and --tag selectors are mutually exclusive; choose one and use --exclude to narrow its targets."
+  other: "Execute commands on one or more remote hosts. Supports batch execution and privilege escalation. The default compatibility mode requires remote Bash; --no-login still uses Bash. For ordinary commands, --interpreter server sends unchanged SSH exec, or select --interpreter bash --launch-dialect posix. Explicit mode currently supports buffered output only, without scripts, PTY, sudo, --stream or --out-dir; total timeout is 5 minutes and the last 5 MiB of output is retained.\n\nUsage examples (OpenSSH-compatible):\n  xops exec -l root -p 22 192.168.1.11 \"uptime\"\n  xops exec -i ~/.ssh/id_rsa -J bastion.example.com 192.168.1.11 \"df -h\"\n  xops exec root@192.168.1.11 \"uptime\"\n\nBatch execution:\n  xops exec --host host1,host2 -c \"uptime\"\n  xops exec --tag web -c \"uptime\"\n  xops exec -I hosts.txt --shell script.sh\n\nConnection Target Semantics:\n  Explicit user and port prioritize full-target matching, automatically reuse existing Host records, strictly isolate Identity credentials, consistent with ssh/sftp/scp.\n  ProxyJump (-J) resolution strategy: Prioritizes saved Node, Alias, or ~/.ssh/config Host; direct jump targets explicitly require Node/Alias, FQDN, IP, or host:port; single-label hostnames without port must be configured as a Node/Alias first.\n  The --host, --ifile (-I), and --tag selectors are mutually exclusive; choose one and use --exclude to narrow its targets."
 flag_exec_sudo:
   other: "Execute with sudo"
 flag_exec_cmd:
@@ -149,6 +149,12 @@ flag_exec_task:
   other: "Number of parallel hosts"
 flag_exec_no_login:
   other: "Do not load login shell (prevents welcome messages/MOTD)"
+flag_exec_interpreter:
+  other: "Ordinary command interpreter: server (unchanged SSH exec) or bash; explicit mode uses bounded buffered output"
+flag_exec_launch_dialect:
+  other: "Server launch dialect: unknown, posix, powershell or cmd; explicit Bash requires posix"
+flag_exec_login_shell:
+  other: "Enable/disable login for an explicit Bash interpreter; incompatible with server and --no-login"
 flag_exec_stream:
   other: "Enable real-time stream output (adds host prefix in multi-host mode)"
 flag_exec_out_dir:

@@ -87,3 +87,23 @@ description text, schema values and array ordering remain significant.
 
 See the [design](../docs/development/shared-core-decoupling.md) for application
 boundaries and acceptance criteria.
+
+For a finite ordinary command, `ssh.PlanCommand` freezes the command, interpreter,
+launch dialect, login mode, stdin bytes, timeout, and output limit. Its private
+state and digest can be shared across targets without rereading mutable defaults.
+`Client.ExecuteCommand` executes that plan once and returns `CommandResult` with
+`not_started`, `completed`, or `unknown`, optional exit code/signal, combined
+output and truncation, and separate execution/I/O/cleanup errors. Use `Err()` to
+report all errors; do not infer success from a missing exit code or replay an
+unknown result. The digest is not an authorization permit.
+
+The new API defaults to unchanged server commands, a 5-minute timeout, and a
+5 MiB output window. Explicit Bash requires `LaunchPOSIX` and defaults to
+non-login mode. Original commands and generated exec payloads are each limited to 64 KiB,
+including quote expansion. Input is copied, finite, and limited to 16 MiB; output is captured
+internally, without external blocking reader/writer callbacks. Channel startup
+uses the connector's handshake timeout; cancellation joins workers and may
+interrupt a shared transport after a 1-second channel-shutdown grace period.
+PTY, scripts, privilege escalation, external I/O bridges, and delegation from
+legacy APIs remain subsequent implementation steps. Legacy execution defaults
+are preserved. See the [implementation plan](../docs/development/ssh-execution-implementation.md).

@@ -21,8 +21,12 @@ golangci-lint run ./...
 
 历史实施记录反映当时的验证范围，不自动代表当前所有平台已经验证。文档贡献流程见[文档维护](./docs)。
 
-## 已确认、待实现的设计
+## 设计与实施文档
 
+实现状态与验证范围以各文档说明为准。
+
+- [SSH 多解释器执行与兼容性设计](./ssh-execution-compatibility.md)
+- [SSH 执行兼容性实施计划](./ssh-execution-implementation.md)
 - [公共代码与 MCP 接口解耦设计](./shared-core-decoupling)
 - [凭据零配置体验设计](./credential-experience-design)
 - [凭据体验实施计划](./credential-experience-plan)

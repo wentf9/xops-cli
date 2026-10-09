@@ -21,8 +21,12 @@ Historical engineering records are grouped under `docs/development/archive/`. Th
 
 Historical implementation records describe validation at the time; they do not imply current validation on every platform. See [Writing documentation](./docs) for contribution instructions.
 
-## Accepted design, pending implementation
+## Design and implementation documents
 
+Each document states its implementation status and validation scope.
+
+- [SSH execution and interpreter compatibility](./ssh-execution-compatibility.md)
+- [SSH execution compatibility implementation plan](./ssh-execution-implementation.md)
 - [Shared core and MCP interface decoupling](./shared-core-decoupling)
 - [Zero-configuration credential design](./credential-experience-design)
 - [Credential experience implementation plan](./credential-experience-plan)
