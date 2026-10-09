@@ -20,7 +20,7 @@ xops exec --tag web --shell ./check.sh --task 5
 
 ## 显式解释器
 
-当前源码已实现 P1-A 普通命令基础和 P1-B 的请求/PTY 首批改造。`exec` 可显式选择 server 或 Bash 的缓冲执行及 PTY 命令；已安装版本以 `xops exec --help` 为准，默认兼容模式尚未切换。
+当前源码已实现 P1 阶段（P1-A 与 P1-B）的全部能力。`exec` 与 `ssh` 均支持显式选择 server 或 Bash 执行，旧入口委托统一命令计划，并为终端/管道提供可取消输出桥；已安装版本以 `xops exec --help` 与 `xops ssh --help` 为准，默认兼容模式尚未切换。
 
 ```bash
 xops exec --host alpine-01 --interpreter server -c 'uname -a'
@@ -40,7 +40,7 @@ xops exec --host linux-01 --interpreter server -x top
 xops exec --host linux-01 --interpreter bash --launch-dialect posix --login-shell=false -x top
 ```
 
-新 PTY 路径要求本地终端输入，实时输出不使用 5 MiB 缓冲窗口。Linux 的终端/管道输出使用独立可取消句柄，单次写入上限 10 秒、退出后的输出排空宽限 1 秒；原始标准流不会被关闭或修改文件标志。输入桥初始化失败、输出管道断开或写入超时会立即触发有界清理，不等待整个命令时限；对端不确认通道关闭时会中断 transport，并汇合输出协程。普通文件重定向与其他客户端平台的原生输出桥尚未验收，新路径会在发送命令前拒绝；core 消费者可提供遵守取消契约的 `ContextWriter`。现有 `ssh` 和旧输出入口的统一迁移仍在进行中。
+新 PTY 路径要求本地终端输入，实时输出不使用 5 MiB 缓冲窗口。Linux 的终端/管道输出使用独立可取消句柄，单次写入上限 10 秒、退出后的输出排空宽限 1 秒；原始标准流不会被关闭或修改文件标志。输入桥初始化失败、输出管道断开或写入超时会立即触发有界清理，不等待整个命令时限；对端不确认通道关闭时会中断 transport，并汇合输出协程。普通文件重定向与其他客户端平台的原生输出桥尚未验收，新路径会在发送命令前拒绝；core 消费者可提供遵守取消契约的 `ContextWriter`。旧 `Run`、`RunWithoutLogin`、`RunCommandWithIO`、`RunStream` 及 `ssh` 命令均已统一委托至命令计划与可取消输出桥；P2 阶段将进一步拓展全局/节点执行配置与多平台适配器。
 
 ## 交互式命令
 

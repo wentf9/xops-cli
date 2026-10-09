@@ -249,6 +249,9 @@ type RunConfig struct {
 	StreamPrefix string
 	StreamWriter io.Writer
 	OutFile      *os.File
+
+	// fileOutput replaces OutFile when its writes were bound to a context.
+	fileOutput io.Writer
 }
 
 type RunOption func(*RunConfig)
@@ -301,20 +304,13 @@ func (c *Client) Run(ctx context.Context, cmd string, opts ...RunOption) (string
 		opt(config)
 	}
 
-	var wrappedCmd string
-	if config.LoginShell {
-		// 使用 bash -l -c 执行，以加载完整的环境变量 (如 PATH)
-		wrappedCmd = fmt.Sprintf("bash -l -c '%s'", strings.ReplaceAll(cmd, "'", "'\\''"))
-	} else {
-		wrappedCmd = fmt.Sprintf("bash -c '%s'", strings.ReplaceAll(cmd, "'", "'\\''"))
-	}
-	return c.runRaw(ctx, wrappedCmd, config)
+	// 默认使用 bash -l -c 执行，以加载完整的环境变量 (如 PATH)
+	return c.runRaw(ctx, bashCommandPayload(cmd, config.LoginShell), config)
 }
 
 // RunWithoutLogin 执行命令并在非登录 Shell 中运行，避免加载 profile 脚本产生干扰输出
 func (c *Client) RunWithoutLogin(ctx context.Context, cmd string) (string, error) {
-	wrappedCmd := fmt.Sprintf("bash -c '%s'", strings.ReplaceAll(cmd, "'", "'\\''"))
-	return c.runRaw(ctx, wrappedCmd, DefaultRunConfig())
+	return c.runRaw(ctx, bashCommandPayload(cmd, false), DefaultRunConfig())
 }
 
 func (c *Client) runRaw(ctx context.Context, wrappedCmd string, config *RunConfig) (output string, retErr error) {
@@ -342,11 +338,7 @@ func (c *Client) RunScript(ctx context.Context, scriptContent string, opts ...Ru
 
 	session.Stdin = strings.NewReader(scriptContent)
 
-	cmd := "bash -s"
-	if config.LoginShell {
-		cmd = "bash -l -s"
-	}
-	return c.startWithTimeout(ctx, session, cmd, config)
+	return c.startWithTimeout(ctx, session, bashScriptPayload(config.LoginShell), config)
 }
 
 // streamReader 包装 io.ReadCloser 以便在关闭时清理 SSH session
@@ -377,7 +369,7 @@ func (c *Client) RunStream(ctx context.Context, cmd string) (io.ReadCloser, erro
 		return nil, errors.Join(fmt.Errorf("failed to create stdout pipe: %w", err), c.closeSessionBounded(session))
 	}
 
-	wrappedCmd := fmt.Sprintf("bash -c '%s'", strings.ReplaceAll(cmd, "'", "'\\''"))
+	wrappedCmd := bashCommandPayload(cmd, false)
 
 	if err := c.sessionRequest(ctx, session, "stream exec", func() error { return session.Start(wrappedCmd) }); err != nil {
 		return nil, errors.Join(fmt.Errorf("failed to start command: %w", err), c.closeSessionBounded(session))
@@ -707,10 +699,18 @@ func (c *Client) refreshConnectionTokens(kind tokenRefreshKind, committedToken s
 	return nil
 }
 
-func (c *Client) startWithTimeout(ctx context.Context, session *ssh.Session, command string, config *RunConfig, stderrWrappers ...func(io.Writer) io.Writer) (string, error) {
+func (c *Client) startWithTimeout(ctx context.Context, session *ssh.Session, command string, config *RunConfig, stderrWrappers ...func(io.Writer) io.Writer) (output string, retErr error) {
 	if config == nil {
 		config = DefaultRunConfig()
 	}
+	// External stream/file sinks are bound to ctx before the SSH copy workers
+	// can write to them; the bridge is released after every worker has joined.
+	bound, closeOutput, err := c.bindRunOutput(ctx, config)
+	if err != nil {
+		return "", err
+	}
+	defer func() { retErr = errors.Join(retErr, closeOutput()) }()
+	config = bound
 	syncWriter := newOutputWriter(config)
 	session.Stdout = syncWriter
 	session.Stderr = syncWriter
@@ -729,7 +729,7 @@ func (c *Client) startWithTimeout(ctx context.Context, session *ssh.Session, com
 	select {
 	case err := <-done:
 		err = errors.Join(err, flushPrivilegePrompt(session.Stderr))
-		output := syncWriter.String()
+		output = syncWriter.String()
 		if err != nil {
 			return output, fmt.Errorf("failed to run command: %w, output: %s", err, output)
 		}

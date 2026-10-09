@@ -8,6 +8,24 @@ xops ssh -J bastion.example.com deploy@192.0.2.10
 
 单标签跳板名称需要预先配置为节点或别名。显式用户连接同一主机时，凭据保持独立。
 
+## 命令执行与解释器
+
+`xops ssh` 支持执行远程命令（通过位置参数或 `--host` 后跟命令），并提供显式解释器与登录控制：
+
+```bash
+xops ssh web-01 uptime
+xops ssh --host web-01 --interpreter server uname -a
+xops ssh --host linux-01 --interpreter bash --launch-dialect posix --login-shell=false id
+```
+
+- **显式解释器**：支持 `--interpreter server`（原生 SSH exec 载荷）与 `--interpreter bash`（已知 POSIX 启动方言下的 Bash 命令封装）。
+- **登录控制**：支持 `--login-shell` 与 `--no-login`（两者互斥）；`--interpreter server` 拒绝登录选项。
+- **输入与 Shell 路由**：
+  - 未指定命令且标准输入为终端时，启动交互式 PTY 登录 Shell；
+  - 未指定命令且输入来自管道时，仅当显式指定 `--interpreter server` 时允许，启动原生非 PTY SSH Shell 会话流式执行输入内容，并完整保留远端退出状态与信号；非 server 解释器或未指定解释器时要求提供非空命令；
+  - 显式空命令（如 `xops ssh web-01 ""`）拒绝执行，不转换为交互式 Shell。
+- **输出可取消性**：流式命令执行接入可取消输出桥，支持常规文件、空设备以及（Linux 下）终端与管道输出，取消时安全中断并回收所有协程；非 Linux 平台的原生终端/管道可取消输出将在后续阶段提供。
+
 ## 自动保存节点
 
 SSH、SFTP、SCP 和 exec 首次连接时先在内存中准备连接信息，SSH 握手及身份认证成功后才保存节点、主机和认证模板。超时、拒绝连接、认证失败或认证前取消均不会新增这些配置；其他节点的保存也不会顺带写入尚未认证的节点。

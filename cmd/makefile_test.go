@@ -325,6 +325,7 @@ func TestMakefile_LintUsesExportedPOSIXPath(t *testing.T) {
 					t.Setenv("FIXTURE_EXIT", "7")
 				}
 				t.Setenv("MAKELEVEL", "1")
+				t.Setenv("LC_ALL", "C")
 				ctx, cancel := context.WithTimeout(t.Context(), makefileTestTimeout)
 				defer cancel()
 				cmd := exec.CommandContext(ctx, makePath, "--no-print-directory", "OS="+platform, "SHELL=/bin/sh", "VERSION=test", "COMMIT=test", "DATE=test", "lint")

@@ -155,10 +155,7 @@ func (p *CommandPlan) buildPayload() error {
 		if p.dialect != LaunchPOSIX {
 			return fmt.Errorf("bash interpreter requires posix launch dialect")
 		}
-		p.payload = "bash -c " + shellQuote(p.command)
-		if p.login == LoginEnabled {
-			p.payload = "bash -l -c " + shellQuote(p.command)
-		}
+		p.payload = bashCommandPayload(p.command, p.login == LoginEnabled)
 		if p.login == LoginInherit {
 			p.login = LoginDisabled
 		}
@@ -166,6 +163,25 @@ func (p *CommandPlan) buildPayload() error {
 		return fmt.Errorf("unsupported command interpreter %q", p.interpreter)
 	}
 	return nil
+}
+
+// bashCommandPayload is the only construction of Bash command exec payloads.
+// Legacy entry points call it directly to retain their historical lack of
+// size limits; PlanCommand additionally applies the new API limits.
+func bashCommandPayload(command string, login bool) string {
+	if login {
+		return "bash -l -c " + shellQuote(command)
+	}
+	return "bash -c " + shellQuote(command)
+}
+
+// bashScriptPayload selects Bash reading the script from stdin. It is used only
+// by legacy script entry points until the script model is migrated.
+func bashScriptPayload(login bool) string {
+	if login {
+		return "bash -l -s"
+	}
+	return "bash -s"
 }
 
 func (p CommandPlan) Command() string              { return p.command }

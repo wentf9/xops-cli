@@ -1,11 +1,13 @@
 package ssh
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	logger "github.com/wentf9/xops-cli/core/log"
 )
@@ -46,6 +48,12 @@ type sessionOutputCopy struct {
 // reaching EOF. The owner closes the SSH session/transport and cancels capable
 // writers before joining both workers through wait.
 func startSessionOutput(stdout, stderr io.Reader, stdoutWriter, stderrWriter io.Writer) sessionOutputCopy {
+	if stdoutWriter == nil {
+		stdoutWriter = io.Discard
+	}
+	if stderrWriter == nil {
+		stderrWriter = io.Discard
+	}
 	errCh := make(chan error, 2)
 	failed := make(chan error, 1)
 	var wg sync.WaitGroup
@@ -53,6 +61,10 @@ func startSessionOutput(stdout, stderr io.Reader, stdoutWriter, stderrWriter io.
 
 	copyOne := func(name string, dst io.Writer, src io.Reader) {
 		wg.Go(func() {
+			if src == nil {
+				errCh <- nil
+				return
+			}
 			_, err := io.Copy(serializedSessionOutput{mu: &outputMu, target: dst}, src)
 			if err != nil {
 				err = fmt.Errorf("copy SSH %s failed: %w", name, err)
@@ -71,6 +83,30 @@ func startSessionOutput(stdout, stderr io.Reader, stdoutWriter, stderrWriter io.
 		wg.Wait()
 		return errors.Join(<-errCh, <-errCh)
 	})}
+}
+
+func waitSessionOutput(ctx context.Context, wait func() error, cancelOutput ...context.CancelFunc) error {
+	done := make(chan error, 1)
+	go func() { done <- wait() }()
+	timer := time.NewTimer(sessionShutdownTimeout)
+	defer timer.Stop()
+	cancel := func() {
+		for _, fn := range cancelOutput {
+			if fn != nil {
+				fn()
+			}
+		}
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		cancel()
+		return errors.Join(ctx.Err(), <-done)
+	case <-timer.C:
+		cancel()
+		return errors.Join(fmt.Errorf("drain SSH output: %w", context.DeadlineExceeded), <-done)
+	}
 }
 
 // Serialize writes, not reads: holding a lock for an entire io.Copy can deadlock

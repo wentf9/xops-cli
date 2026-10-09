@@ -28,12 +28,7 @@ func (c *Client) RunWithSudo(ctx context.Context, command string, opts ...RunOpt
 	}
 	connCfg := c.ConnectionConfig()
 
-	var wrappedCmd string
-	if config.LoginShell {
-		wrappedCmd = fmt.Sprintf("bash -l -c '%s'", strings.ReplaceAll(command, "'", "'\\''"))
-	} else {
-		wrappedCmd = fmt.Sprintf("bash -c '%s'", strings.ReplaceAll(command, "'", "'\\''"))
-	}
+	wrappedCmd := bashCommandPayload(command, config.LoginShell)
 
 	switch connCfg.SudoMode {
 	case SudoModeRoot:
@@ -61,12 +56,8 @@ func (c *Client) RunScriptWithSudo(ctx context.Context, scriptContent string, op
 	}
 	connCfg := c.ConnectionConfig()
 
-	bashArgs := "bash -s"
-	bashCmd := fmt.Sprintf("bash -c '%s'", strings.ReplaceAll(scriptContent, "'", "'\\''"))
-	if config.LoginShell {
-		bashArgs = "bash -l -s"
-		bashCmd = fmt.Sprintf("bash -l -c '%s'", strings.ReplaceAll(scriptContent, "'", "'\\''"))
-	}
+	bashArgs := bashScriptPayload(config.LoginShell)
+	bashCmd := bashCommandPayload(scriptContent, config.LoginShell)
 
 	switch connCfg.SudoMode {
 	case SudoModeRoot:
@@ -96,7 +87,7 @@ func (c *Client) RunInteractiveWithSudoIO(ctx context.Context, command string, s
 	mode := c.ConnectionConfig().SudoMode
 	switch mode {
 	case SudoModeRoot:
-		return c.RunInteractiveCmdWithIO(ctx, "bash -l -c "+shellQuote(command), streams)
+		return c.RunInteractiveCmdWithIO(ctx, bashCommandPayload(command, true), streams)
 	case SudoModeSudoer:
 		wrapped, err := interactivePrivilegeCommand(mode, command)
 		if err != nil {
@@ -104,7 +95,7 @@ func (c *Client) RunInteractiveWithSudoIO(ctx context.Context, command string, s
 		}
 		return c.RunInteractiveCmdWithIO(ctx, wrapped, streams)
 	case SudoModeSudo, SudoModeSu:
-		return c.runInteractivePrivilege(ctx, mode, "exec bash -c "+shellQuote(command), streams)
+		return c.runInteractivePrivilege(ctx, mode, "exec "+bashCommandPayload(command, false), streams)
 	default:
 		return fmt.Errorf("interactive privilege escalation is unsupported for sudo mode %q", mode)
 	}
@@ -112,12 +103,11 @@ func (c *Client) RunInteractiveWithSudoIO(ctx context.Context, command string, s
 
 // Commands travel in the SSH exec request, never through echoed PTY input.
 func interactivePrivilegeCommand(mode SudoMode, command string) (string, error) {
-	quoted := "'" + strings.ReplaceAll(command, "'", "'\\''") + "'"
 	switch mode {
 	case SudoModeSudo, SudoModeSudoer:
 		return "sudo -i -- bash -c " + shellQuote(sudoLoginScript(command)), nil
 	case SudoModeSu:
-		bashCommand := "exec bash -c " + quoted
+		bashCommand := "exec " + bashCommandPayload(command, false)
 		return "su - root -c '" + strings.ReplaceAll(bashCommand, "'", "'\\''") + "'", nil
 	default:
 		return "", fmt.Errorf("interactive privilege escalation is unsupported for sudo mode %q", mode)
@@ -270,52 +260,71 @@ func (c *Client) RunCommandWithIO(ctx context.Context, command string, sudo bool
 	if _, ok := c.configSnapshot(); !ok {
 		return fmt.Errorf("ssh client or config is nil")
 	}
+	if ctx == nil {
+		return fmt.Errorf("command execution context is nil")
+	}
 	if err := validateCommandStdin(stdin); err != nil {
 		return err
 	}
+	// Native files, terminals and pipes are bound to ctx so cancellation cannot
+	// leave the SSH session joined to a blocked caller stream. Unbindable
+	// writers retain their legacy direct behavior; see BindOutput.
+	work, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stdout, stderr, closeOutput, err := c.bindCommandOutputs(work, stdout, stderr)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, closeOutput()) }()
 	if !sudo {
-		var rawCmd string
-		if command != "" {
-			rawCmd = fmt.Sprintf("bash -c '%s'", strings.ReplaceAll(command, "'", "'\\''"))
-		} else {
-			rawCmd = "bash"
-		}
-		return c.runRawCommandWithPayload(ctx, rawCmd, "", stdin, stdout, stderr)
+		return c.runRawCommandWithPayload(work, legacyBashPayload(command), "", stdin, stdout, stderr, cancel)
 	}
 
-	if err := c.maybeDetectSudoMode(ctx); err != nil {
+	if err := c.maybeDetectSudoMode(work); err != nil {
 		return err
 	}
 	clientConfig, _ := c.configSnapshot()
 
 	switch clientConfig.SudoMode {
 	case SudoModeRoot:
-		var rawCmd string
-		if command != "" {
-			rawCmd = fmt.Sprintf("bash -c '%s'", strings.ReplaceAll(command, "'", "'\\''"))
-		} else {
-			rawCmd = "bash"
-		}
-		return c.runRawCommandWithPayload(ctx, rawCmd, "", stdin, stdout, stderr)
+		return c.runRawCommandWithPayload(work, legacyBashPayload(command), "", stdin, stdout, stderr, cancel)
 	case SudoModeSudoer:
-		var rawCmd string
-		if command != "" {
-			rawCmd = fmt.Sprintf("sudo -S -p '' bash -c '%s'", strings.ReplaceAll(command, "'", "'\\''"))
-		} else {
-			rawCmd = "sudo -S -p '' bash"
-		}
-		return c.runRawCommandWithPayload(ctx, rawCmd, "", stdin, stdout, stderr)
+		return c.runRawCommandWithPayload(work, "sudo -S -p '' "+legacyBashPayload(command), "", stdin, stdout, stderr, cancel)
 	case SudoModeSudo, SudoModeSu:
 		inner := "exec bash"
 		if command != "" {
-			inner = "bash -c " + shellQuote(command)
+			inner = bashCommandPayload(command, false)
 		}
-		return c.runPrivilegeOperation(ctx, clientConfig.SudoMode, inner, stdin, stdout, stderr)
+		return c.runPrivilegeOperation(work, clientConfig.SudoMode, inner, stdin, stdout, stderr)
 	case SudoModeNone:
 		return fmt.Errorf("privilege escalation is not supported for this host (sudo_mode=none)")
 	default:
 		return fmt.Errorf("unknown sudo mode: %s, please check config to set sudo mode", clientConfig.SudoMode)
 	}
+}
+
+// legacyBashPayload keeps the historical empty-command behavior: Bash reads
+// its program from stdin. Explicit empty commands are rejected by callers
+// before reaching this compatibility path.
+func legacyBashPayload(command string) string {
+	if command == "" {
+		return "bash"
+	}
+	return bashCommandPayload(command, false)
+}
+
+func (c *Client) bindCommandOutputs(ctx context.Context, stdout, stderr io.Writer) (io.Writer, io.Writer, func() error, error) {
+	boundOut, closeOut, outCancelable, err := BindOutput(ctx, stdout)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("bind command stdout: %w", err)
+	}
+	boundErr, closeErr, errCancelable, err := BindOutput(ctx, stderr)
+	if err != nil {
+		return nil, nil, nil, errors.Join(fmt.Errorf("bind command stderr: %w", err), closeOut())
+	}
+	c.logUncancelableOutput(outCancelable, stdout)
+	c.logUncancelableOutput(errCancelable, stderr)
+	return boundOut, boundErr, func() error { return errors.Join(closeOut(), closeErr()) }, nil
 }
 
 // startCommandWithStdinPipeline starts the remote command before performing any
@@ -369,7 +378,68 @@ func setupStdinPipeline(stdin io.Reader, stdinPipe io.WriteCloser, initialPayloa
 	return stopAndWait, nil
 }
 
-func (c *Client) runRawCommandWithPayload(ctx context.Context, rawCmd, initialPayload string, stdin io.Reader, stdout, stderr io.Writer) (retErr error) {
+func (c *Client) runRawCommandWithPayload(ctx context.Context, rawCmd, initialPayload string, stdin io.Reader, stdout, stderr io.Writer, cancelOutput ...context.CancelFunc) error {
+	return c.runSessionWithInput(ctx, "exec", func(session *ssh.Session) error { return session.Start(rawCmd) }, initialPayload, stdin, stdout, stderr, cancelOutput...)
+}
+
+func openSessionPipes(session *ssh.Session) (io.WriteCloser, io.Reader, io.Reader, error) {
+	stdinPipe, err := session.StdinPipe()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("open session stdin pipe failed: %w", err)
+	}
+	stdoutPipe, err := session.StdoutPipe()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("open session stdout pipe failed: %w", err)
+	}
+	stderrPipe, err := session.StderrPipe()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("open session stderr pipe failed: %w", err)
+	}
+	return stdinPipe, stdoutPipe, stderrPipe, nil
+}
+
+func (c *Client) waitNonTerminalSession(ctx context.Context, session *ssh.Session, waitDone <-chan error, outputFailed <-chan error, abort context.CancelFunc) (waitErr, outputFailedErr error) {
+	select {
+	case err := <-waitDone:
+		return err, nil
+	case err := <-outputFailed:
+		abort()
+		return c.closeCanceledSession(ctx, session, waitDone), err
+	case <-ctx.Done():
+		abort()
+		return c.closeCanceledSession(ctx, session, waitDone), nil
+	}
+}
+
+func combineOutputCancels(cancel context.CancelFunc, cancelOutput []context.CancelFunc) context.CancelFunc {
+	return func() {
+		cancel()
+		for _, fn := range cancelOutput {
+			if fn != nil {
+				fn()
+			}
+		}
+	}
+}
+
+func resolveSessionErrors(workErr, waitErr, outputFailedErr, closeErr, inputErr, outputErr error) error {
+	if outputFailedErr != nil {
+		return errors.Join(outputFailedErr, waitErr, closeErr, inputErr, outputErr)
+	}
+	if workErr != nil && waitErr != nil && (errors.Is(waitErr, context.Canceled) || errors.Is(waitErr, context.DeadlineExceeded)) {
+		return errors.Join(workErr, waitErr, closeErr, inputErr, outputErr)
+	}
+	if waitErr != nil {
+		return errors.Join(fmt.Errorf("session command execution failed: %w", waitErr), closeErr, inputErr, outputErr)
+	}
+	return errors.Join(closeErr, inputErr, outputErr)
+}
+
+// runSessionWithInput owns one non-PTY SSH session. request names the protocol
+// request ("exec" or "shell") for deadline and error reporting; start sends it.
+// cancelOutput registers cancellation callbacks for the output-binding contexts
+// so drain timeouts and session aborts interrupt blocked output writes.
+func (c *Client) runSessionWithInput(ctx context.Context, request string, start func(*ssh.Session) error, initialPayload string, stdin io.Reader, stdout, stderr io.Writer, cancelOutput ...context.CancelFunc) (retErr error) {
 	if c == nil || c.sshClient == nil {
 		return fmt.Errorf("ssh client is not connected")
 	}
@@ -379,52 +449,51 @@ func (c *Client) runRawCommandWithPayload(ctx context.Context, rawCmd, initialPa
 	}
 	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
 
-	stdinPipe, pipeErr := session.StdinPipe()
+	stdinPipe, stdoutPipe, stderrPipe, pipeErr := openSessionPipes(session)
 	if pipeErr != nil {
-		return fmt.Errorf("open session stdin pipe failed: %w", pipeErr)
+		return pipeErr
 	}
 
-	session.Stdout = stdout
-	session.Stderr = stderr
+	work, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	finishStdin, setupErr := startCommandWithStdinPipeline(
 		func() error {
-			if err := c.sessionRequest(ctx, session, "exec", func() error { return session.Start(rawCmd) }); err != nil {
-				return fmt.Errorf("start session command failed: %w", err)
+			if err := c.sessionRequest(work, session, request, func() error { return start(session) }); err != nil {
+				return fmt.Errorf("start session %s failed: %w", request, err)
 			}
 			return nil
 		},
 		stdin,
 		stdinPipe,
 		initialPayload,
-		inputPipelineOptions{ctx: ctx, bridge: c.environment.InputBridge},
+		inputPipelineOptions{ctx: work, bridge: c.environment.InputBridge},
 	)
 	if setupErr != nil {
 		return setupErr
 	}
+	finishStdinOnce := sync.OnceValue(finishStdin)
 	defer func() {
-		if finishErr := finishStdin(); finishErr != nil {
+		if finishErr := finishStdinOnce(); finishErr != nil && !errors.Is(retErr, finishErr) {
 			retErr = errors.Join(retErr, finishErr)
 		}
 	}()
 
-	done := make(chan error, 1)
+	output := startSessionOutput(stdoutPipe, stderrPipe, stdout, stderr)
+	waitDone := make(chan error, 1)
 	go func() {
-		done <- session.Wait()
+		waitDone <- session.Wait()
 	}()
 
-	select {
-	case err := <-done:
-		if err != nil {
-			return fmt.Errorf("session command execution failed: %w", err)
-		}
-		return nil
-	case <-ctx.Done():
-		interruptErr := c.Interrupt()
-		finishErr := finishStdin()
-		<-done
-		return errors.Join(ctx.Err(), interruptErr, finishErr)
-	}
+	cancelAllOutputs := combineOutputCancels(cancel, cancelOutput)
+	waitErr, outputFailedErr := c.waitNonTerminalSession(work, session, waitDone, output.failed, cancelAllOutputs)
+
+	cancel()
+	closeErr := c.closeSessionBounded(session)
+	inputErr := finishStdinOnce()
+	outputErr := waitSessionOutput(ctx, output.wait, cancelAllOutputs)
+
+	return resolveSessionErrors(work.Err(), waitErr, outputFailedErr, closeErr, inputErr, outputErr)
 }
 
 func pipeCommandStdin(stdin io.Reader, dst io.WriteCloser, options ...inputPipelineOptions) (stopAndWait func() error, err error) {

@@ -36,7 +36,7 @@ type outputWriter struct {
 	streamPrefix []byte    // 流式模式的每行前缀
 	isNL         bool      // 流式模式：上次写入是否以换行结尾
 
-	outFile *os.File // 文件模式的目标文件
+	outFile io.Writer // 文件模式的目标；调用方文件或经取消桥接的包装
 }
 
 func newOutputWriter(config *RunConfig) *outputWriter {
@@ -45,8 +45,13 @@ func newOutputWriter(config *RunConfig) *outputWriter {
 		ringMaxBytes: config.RingMaxBytes,
 		streamWriter: config.StreamWriter,
 		streamPrefix: []byte(config.StreamPrefix),
-		outFile:      config.OutFile,
 		isNL:         true,
+	}
+	switch {
+	case config.fileOutput != nil:
+		w.outFile = config.fileOutput
+	case config.OutFile != nil:
+		w.outFile = config.OutFile
 	}
 	switch {
 	case w.mode == OutputModeString || (w.mode == OutputModeRingBuffer && w.ringMaxBytes <= 0):

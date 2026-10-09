@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	cryptoSSH "golang.org/x/crypto/ssh"
 	"golang.org/x/term"
@@ -157,20 +156,7 @@ func (c *Client) runTerminalSession(ctx context.Context, payload string, streams
 // Only cancellable output pumps use this join. Cancellation never abandons the
 // waiter or its stdout/stderr workers; legacy arbitrary writers migrate later.
 func waitTerminalOutput(ctx context.Context, wait func() error, cancel context.CancelFunc) error {
-	done := make(chan error, 1)
-	go func() { done <- wait() }()
-	timer := time.NewTimer(sessionShutdownTimeout)
-	defer timer.Stop()
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		cancel()
-		return errors.Join(ctx.Err(), <-done)
-	case <-timer.C:
-		cancel()
-		return errors.Join(fmt.Errorf("drain terminal output: %w", context.DeadlineExceeded), <-done)
-	}
+	return waitSessionOutput(ctx, wait, cancel)
 }
 
 // RunInteractivePlan executes a validated command plan in a PTY with the
