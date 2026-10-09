@@ -23,12 +23,12 @@
 
 ### ✨ 核心特性
 
-- 🤖 **AI 原生 (MCP 服务端)**: 内置 Model Context Protocol 服务端，支持命令风险评估、审批和审计。
+- 🤖 **AI 接入**: 独立的 Agent Skill 指导助手通过 CLI 完成运维任务；内置 MCP 服务端提供另一套工具接入，支持命令风险评估、审批和审计。
 - 🛡️ **SSH 增强与 TUI**: 支持导入 OpenSSH 配置、跳板机、隧道和 SSH Agent 转发。内置 **TUI (终端用户界面)**，并支持自动 Sudo 提权模式。
 - ⚡ **批量执行与传输**: 基于标签 (Tags) 对多台主机并行执行命令或本地脚本。内置 SCP/SFTP 支持，轻松实现文件批量分发。交互式 SFTP shell 会在连接中断后提示并退出，返回非零状态。
 - 🔄 **声明式任务编排 (Playbook)**: 支持 YAML 格式的任务编排，组合 shell、script、copy、ensure (幂等性状态收敛) 和 template 步骤，支持并发控制与失败策略。
-- 🗂️ **资产与凭据管理**: 本地统一管理主机、凭据 (Identity) 和标签，支持将验证成功的密码保存到离线加密库或其他已配置的凭据存储。支持通过 CSV 模板批量导入导出。
-- 🌐 **网络与安全工具**: 集成 DNS 查询、Ping、Netcat (nc)、Base64/Hex 编码转换，以及统一的**防火墙管理器** (自动适配 firewalld, ufw, iptables, nftables)。
+- 🗂️ **资产与凭据管理**: 本地统一管理主机、凭据 (Identity) 和标签，支持将验证成功的密码保存到离线加密库或其他已配置的凭据存储。支持导出 CSV 导入模板和批量导入主机。
+- 🌐 **网络与安全工具**: 集成 DNS 查询、Ping、Netcat (nc)、本地 TCP/UDP 转发、Base64/URL/UTF-8/Unicode 编码转换，以及统一的**防火墙管理器** (自动适配 firewalld, ufw, iptables, nftables)。
 - 🌍 **国际化 (i18n)**: 原生支持简体中文与英文，可根据环境自动切换。
 
 ### 📦 安装指南
@@ -209,10 +209,11 @@ stdio 模式提供 SSH `-L/-R` 隧道的创建、查询和停止工具，使用�
 
 #### 7. AI Agent 技能 (Skill) 集成
 
-XOps 提供 AI Agent Skill，封装服务器管理和故障排查所需的 CLI 操作说明。
+[`xops-agent`](skills/xops-agent/SKILL.md) 指导 Agent 通过本地命令执行环境调用 `xops`。Skill 与 MCP 是两套独立接入方式：使用 Skill 需要安装 CLI、准备 SSH 配置和凭据，无须启动或连接 MCP 服务。
 
-> [!CAUTION]
-> **⚠️ 风险提示**：本技能通过赋予 AI 助手执行 `xops` 命令的能力来工作。由于 AI 助手（如 Claude Code）是根据自然语言指令自主生成命令的，**本技能文件本身不包含强制性的服务端安全护栏**。在生产环境使用时，AI 可能会误执行高危命令（如 `rm -rf` 或重启服务）。生产使用需要启用命令执行确认并审核指令。
+Skill 按任务覆盖主机与身份管理、单机/批量执行、远端文件读写和传输、SSH 隧道、防火墙、网络诊断与 Playbook。文件操作组合 `exec`、`scp` 和批处理 `sftp`；隧道通过 `ssh -L/-R/-D -N` 创建，并由 Agent 跟踪进程、检查连通性和停止会话。
+
+CLI 操作遵循 Agent 的命令执行授权机制，不经过 MCP 服务端的审批和审计。Skill 文件提供操作指导，本身不实施服务端安全策略。
 
 **安装技能:**
 不同客户端的技能目录不同，安装命令使用通用的 `npx skills` 工具。
@@ -226,10 +227,10 @@ curl -sSL https://raw.githubusercontent.com/wentf9/xops-cli/master/install.sh | 
 Skill 安装命令：
 
 ```bash
-npx skills add https://github.com/wentf9/xops-cli/master/skills/xops-agent
+npx skills add https://github.com/wentf9/xops-cli --skill xops-agent
 ```
 
-Skill 包含主机状态查询和防火墙管理的调用说明。
+手工安装时请复制完整的 `skills/xops-agent/` 目录，保留 `references/`。功能梳理、CLI 与 MCP 能力对应关系及使用示例见 [Agent Skill 指南](docs/guide/agent-skill.md)。
 
 ## 🌍 国际化配置 / I18n
 

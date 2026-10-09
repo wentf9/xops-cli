@@ -1,110 +1,47 @@
 ---
 name: xops-agent
-description: Automate server O&M, execute batch commands, test network connectivity, transfer files, and manage host assets using the XOps CLI toolkit. Triggers when managing server clusters, performing concurrent tasks across multiple machines, checking network ports, or synchronizing configuration files.
+description: Use the xops CLI to manage SSH hosts, run remote or batch commands, inspect and edit remote files, transfer data, create SSH tunnels, and automate operations with Playbooks. Apply when the user wants server operations or network diagnostics through XOps.
 ---
 
-# XOps CLI (IT Operations Automation Tool) Skill Guide
+# XOps CLI operations
 
-This skill empowers you to manage server clusters, execute batch tasks, and perform network security diagnostics via the XOps command-line tool (`xops`).
+Perform host operations by running `xops` commands in the Agent's command environment. This skill works independently of MCP: it requires the CLI and its SSH configuration, not an MCP connection or MCP tool calls.
 
-## 🎯 Environment Self-Check & Bootstrap Installation
+## Start with the execution environment
 
-Before attempting any operations, please run `xops --version` to check if the tool is installed.
-If you receive a `command not found` error, instruct the user to execute the following installation command:
+1. Run `xops --version` and the relevant `xops <command> --help`. Installed versions may differ from this reference. If the executable is missing, use the [installation guide](https://wentf9.github.io/xops-cli/guide/getting-started). Do not reinitialize an existing setup as a diagnostic step.
+2. Identify where the command runs. Local paths, SSH keys, configuration, listeners, and downloads belong to that machine or container; they may not belong to the user's desktop. Default configuration is `~/.xops/xops_config.yaml`; an existing `XOPS_CONFIG_DIR` can select another configuration directory.
+3. Resolve the requested hosts with `xops host list` or `xops host list --tag TAG`. Match node IDs, aliases, users, ports, and jump hosts before a batch operation. For `exec` and `scp`, `--host`, `--ifile`/`-I`, and `--tag` are mutually exclusive; choose one selector and use `--exclude` to narrow it. Preserve the user's intended target set.
+4. Prepare trusted SSH host keys and credentials available to that process. Batch commands and Playbooks do not prompt for credential-store unlocks. Diagnose access with `xops credential doctor`; do not replace vaults or disable host-key verification to make a command run.
 
-```bash
-curl -sSL https://raw.githubusercontent.com/wentf9/xops-cli/master/install.sh | bash
-```
+## Choose the command
 
-## 🎯 Core Capabilities & Precise Command Usage
+Read only the reference relevant to the current task.
 
-### 1. Host & Asset Management (`xops host`)
-Manage the inventory of servers, credentials, and grouping tags.
+| Task | CLI workflow | Reference |
+| --- | --- | --- |
+| Discover hosts, manage aliases/tags, import CSV, edit identities or credentials | `host`, `identity`, `credential`, `init` | [Inventory and access](references/inventory.md) |
+| Run a remote command, use sudo, inspect services/logs, execute across a group | `exec`, `exec --sudo`, `exec --tag` | [Execution and Playbooks](references/execution.md) |
+| Run a local script remotely or orchestrate a deployment | `exec --shell`, `play` | [Execution and Playbooks](references/execution.md) |
+| Read/write/append text, list/create/copy/move/delete remote paths | `exec` with target-native commands, or batch `sftp` | [Files and transfers](references/files.md) |
+| Upload/download files and directories, relay between hosts, distribute to a tag | `scp`, batch `sftp` | [Files and transfers](references/files.md) |
+| Create, inspect, and stop SSH forwarding | `ssh -L/-R/-D -N` plus owned process/session tracking | [Tunnels and networking](references/networking.md) |
+| Manage firewalls, check DNS/ICMP/TCP, use netcat or a local TCP/UDP relay | `firewall`, `dns`, `ping`, `nc`, `forward` | [Tunnels and networking](references/networking.md) |
+| Interactive SSH/TUI, local privilege elevation, text encoding | `ssh`, `exec -x`, `tui`, `sudo`, `encode` | [Execution and Playbooks](references/execution.md) |
 
-- **Initialize Local Configuration and Import OpenSSH Hosts**:
-  ```bash
-  xops init
-  ```
-- **List All Hosts**:
-  ```bash
-  xops host list
-  ```
-- **View All Unique Tags**:
-  ```bash
-  xops host tags
-  ```
-- **Add a New Host**:
-  ```bash
-  xops host add --address "192.168.1.10" --user "root" --key ~/.ssh/id_ed25519 --alias "web-01" --tags "web"
-  ```
-- **Batch Import Hosts from CSV**:
-  ```bash
-  xops host import hosts.csv --tag "production"
-  ```
+Prefer `exec`, `scp`, and batch SFTP for unattended operations. Use terminal interfaces only when interaction is part of the task. XOps does not provide standalone CLI commands named `read_file`, `write_file`, `fs`, `upload`, `download`, or `tunnel`; compose the documented commands instead.
 
-### 2. Batch Execution (`xops exec`)
-Run commands or local scripts concurrently across multiple targets.
+## Work within the requested scope
 
-- **Execute Command via Tag**:
-  ```bash
-  xops exec --tag "web" -c "uptime"
-  ```
-- **Run Local Script Remotely**:
-  ```bash
-  xops exec --tag "db" --shell "./backup.sh" --task 5
-  ```
+- Carry forward existing authorization. Ask only when a target, overwrite policy, privilege level, destructive effect, or additional network exposure is materially unclear or outside the authorized task.
+- CLI execution does not inherit the MCP server's risk assessment, approval forms, or audit log. Follow the Agent's command-execution controls; the skill itself is guidance, not an enforcement layer.
+- `xops exec` requires Bash in the remote SSH execution environment, including on Windows: commands use `bash -l -c`, or `bash -c` with `--no-login`. Invoking `powershell.exe` inside the command does not remove that wrapper. On targets without Bash, use SCP/SFTP for file operations: download, edit locally, upload, and verify through SFTP. SFTP's `exec` also requires Bash; use its file commands instead.
+- Protect remote expansions from the local shell and quote for both shell layers when invoking another interpreter. Use script files for complex commands; passing a script to `exec` does not remove its Bash prerequisite.
+- Keep credentials out of arguments, command history, logs, and responses. Use configured stores, SSH keys/agent, or supported stdin credential flags with a trusted secret source. Do not pass secret values as literal shell arguments.
+- Use bounded execution for diagnostics and track any long-running session you create. For a timeout after a mutation starts, inspect resulting state before repeating it; do not blindly retry append, deployment, or overwrite operations.
 
-### 3. Distributed File Transfer (`xops scp`)
-Transfer files or directories between local and remote hosts.
+## Verify the outcome
 
-- **Upload to Tagged Hosts**:
-  ```bash
-  xops scp ./config.conf --tag "web" --dest "/etc/app/"
-  ```
+Check exit status and per-host failures, then verify the requested result: read back a file, compare its size/hash, probe a service, or check effective firewall rules. `--no-clobber` can succeed while skipping an existing file; a tunnel listener can start while its destination remains unreachable.
 
-### 4. Unified Firewall Management (`xops firewall`)
-Abstracts different firewall backends (firewalld, ufw, iptables, nftables).
-
-- **List Rules for a Host**:
-  ```bash
-  xops firewall list -H "web-01"
-  ```
-- **Manage Ports**:
-  ```bash
-  #open port 80/tcp,81/tcp and reload firewall
-  xops firewall port 80,81 -H "web-01" --reload
-  #remove port 80/udp
-  xops firewall port 80 --remove --proto udp -H "web-01"
-  #allow port 80/tcp from source 192.168.0.1
-  xops firewall rule 80 192.168.0.1 -H "web-01" 
-  ```
-
-### 5. Network & Security Tools
-- **Smart Ping** (Supports ICMP and TCP port checks):
-  ```bash
-  xops ping 1.1.1.1           # ICMP
-  xops ping 1.1.1.1 443       # TCP Port Check
-  ```
-- **Netcat (nc)** (Port scanning):
-  ```bash
-  #listen on local port 8080 and print requests to stdout
-  xops nc -l 8080
-  #send "scan me" to local port 8080
-  echo "scan me" | xops nc 127.0.0.1 8080
-  ```
-- **DNS Diagnostics**:
-  ```bash
-  xops dns "google.com"
-  ```
-- **Data Encoding**:
-  ```bash
-  xops encode base64 "hello"
-  xops encode base64 --decode "aGVsbG8="
-  ```
-
-## 🛠️ Execution Principles & Safety Guardrails
-
-1. **Host Verification**: Before executing batch tasks on a tag, run `xops host list` to verify which hosts will be affected.
-2. **Non-Interactive Preference**: Always prefer `xops exec` and `xops scp` over `xops ssh` or `xops tui` for automation.
-3. **High-Risk Operations**: You MUST obtain explicit user confirmation via `ask_user` before running destructive commands (e.g., `rm -rf`, `format`, `systemctl stop`) on multiple hosts.
-4. **Credential Protection**: NEVER print or log passwords/keys used in `xops host add` commands.
+Report the affected hosts, paths, successful checks, failed targets, and remaining uncertainty. Retain the process handle for any tunnel the user wants left running; otherwise stop temporary sessions and verify cleanup. Do not claim MCP task IDs, TTLs, resumability, or atomic replacement guarantees for CLI operations.

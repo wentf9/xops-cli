@@ -23,12 +23,12 @@ The documentation follows the current source and may describe changes that have 
 
 ### ✨ Key Features
 
-- 🤖 **AI-Native (MCP Server)**: A built-in Model Context Protocol server supports command risk assessment, approvals, and auditing.
+- 🤖 **AI Integration**: An independent Agent Skill guides assistants through CLI operations. The built-in MCP server provides a separate tool interface with command risk assessment, approvals, and auditing.
 - 🛡️ **Enhanced SSH & TUI**: Import OpenSSH configurations and use jump hosts, tunnels, and SSH agent forwarding. Includes a **Terminal User Interface (TUI)** and automatic sudo privilege escalation.
 - ⚡ **Batch Execution & Transfer**: Run commands or local scripts concurrently across hosts selected by tags. Built-in SCP/SFTP supports bulk file distribution. The interactive SFTP shell reports a lost connection and exits with a nonzero status.
 - 🔄 **Declarative Orchestration (Playbook)**: Define YAML workflows with shell, script, copy, ensure (idempotent convergence to a desired state), and template steps, with concurrency limits and failure policies.
-- 🗂️ **Inventory & Credentials**: Manage hosts, authentication identities (Identity), and tags locally. Save verified passwords in the offline encrypted vault or another configured credential store, and use CSV templates for bulk imports and exports.
-- 🌐 **Network & Security Tools**: Includes DNS lookups, Ping, Netcat (nc), Base64/Hex conversion, and a unified **firewall manager** that adapts to firewalld, ufw, iptables, and nftables.
+- 🗂️ **Inventory & Credentials**: Manage hosts, authentication identities (Identity), and tags locally. Save verified passwords in the offline encrypted vault or another configured credential store, export CSV import templates, and import hosts in bulk.
+- 🌐 **Network & Security Tools**: Includes DNS lookups, Ping, Netcat (nc), local TCP/UDP forwarding, Base64/URL/UTF-8/Unicode conversion, and a unified **firewall manager** that adapts to firewalld, ufw, iptables, and nftables.
 - 🌍 **Internationalization (i18n)**: Supports Simplified Chinese and English, with automatic language selection based on the environment.
 
 ### 📦 Installation
@@ -210,10 +210,11 @@ Example configuration for `claude_desktop_config.json`:
 
 #### 7. AI Agent Skill Integration
 
-XOps provides an AI Agent Skill with CLI instructions for server management and troubleshooting.
+[`xops-agent`](skills/xops-agent/SKILL.md) guides an Agent to run `xops` in its local command environment. Skill and MCP are independent interfaces: the Skill needs the CLI, SSH configuration, and credentials, without starting or connecting to an MCP server.
 
-> [!CAUTION]
-> **⚠️ Risk warning**: This skill gives AI assistants the ability to execute `xops` commands. AI assistants such as Claude Code generate commands autonomously from natural-language instructions, and **the skill file itself does not enforce server-side security guardrails**. In production, an AI assistant may mistakenly run a dangerous command, such as `rm -rf`, or restart a service. Enable command execution confirmation and review commands before production use.
+The Skill covers inventory and identities, single-host and batch commands, remote file editing and transfer, SSH tunnels, firewalls, network diagnostics, and Playbooks. File workflows combine `exec`, `scp`, and batch `sftp`. Tunnels use `ssh -L/-R/-D -N`, with the Agent tracking the process, checking connectivity, and stopping the session.
+
+CLI operations follow the Agent's command-execution authorization controls and do not pass through MCP server approvals or auditing. The Skill provides instructions; it does not enforce server policies.
 
 **Install the skill:**
 
@@ -228,10 +229,10 @@ curl -sSL https://raw.githubusercontent.com/wentf9/xops-cli/master/install.sh | 
 Install the skill:
 
 ```bash
-npx skills add https://github.com/wentf9/xops-cli/master/skills/xops-agent
+npx skills add https://github.com/wentf9/xops-cli --skill xops-agent
 ```
 
-The skill includes instructions for checking host status and managing firewalls.
+For manual installation, copy the complete `skills/xops-agent/` directory, including `references/`. See the [Agent Skill guide](docs/en/guide/agent-skill.md) for the capability overview, CLI/MCP mapping, and usage examples.
 
 ## 🌍 Internationalization / I18n
 
