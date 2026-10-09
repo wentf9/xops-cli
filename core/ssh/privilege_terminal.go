@@ -20,6 +20,10 @@ type privilegeTerminal struct {
 }
 
 func (c *Client) runInteractivePrivilege(ctx context.Context, mode SudoMode, command string, streams InteractiveIO) error {
+	return c.runInteractivePrivilegeSession(ctx, mode, command, streams, false)
+}
+
+func (c *Client) runInteractivePrivilegeSession(ctx context.Context, mode SudoMode, command string, streams InteractiveIO, ignoreExit bool) error {
 	fdIn, fdOut, err := validateInteractiveIO(streams)
 	if err != nil {
 		return err
@@ -28,7 +32,7 @@ func (c *Client) runInteractivePrivilege(ctx context.Context, mode SudoMode, com
 	if err != nil || width <= 0 || height <= 0 {
 		width, height = 80, 40
 	}
-	terminal := &privilegeTerminal{width: width, height: height, ignoreExit: true}
+	terminal := &privilegeTerminal{width: width, height: height, ignoreExit: ignoreExit}
 	terminal.activate = func(work context.Context, session *cryptoSSH.Session) (func() error, error) {
 		if err := work.Err(); err != nil {
 			return nil, err

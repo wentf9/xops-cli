@@ -104,6 +104,27 @@ including quote expansion. Input is copied, finite, and limited to 16 MiB; outpu
 internally, without external blocking reader/writer callbacks. Channel startup
 uses the connector's handshake timeout; cancellation joins workers and may
 interrupt a shared transport after a 1-second channel-shutdown grace period.
-PTY, scripts, privilege escalation, external I/O bridges, and delegation from
-legacy APIs remain subsequent implementation steps. Legacy execution defaults
-are preserved. See the [implementation plan](../docs/development/ssh-execution-implementation.md).
+P1-B adds `RunInteractivePlanWithIO` for one-shot PTY commands, sharing request
+limits and preserving nonzero/signal/missing exit status. Its output accepts finite
+memory sinks or an explicit `ContextWriter`; Linux terminal/pipe files use
+owned nonblocking handles with cancelable deadlines. Regular-file redirection
+and native file bridges on other platforms are rejected before execution.
+The PTY input file must be a local terminal. A plan cannot also supply stdin.
+Legacy plain-command/script delegation, legacy external I/O migration, and SSH
+CLI options remain subsequent implementation steps. Legacy execution defaults
+are preserved except for documented PTY exit-status and option-validation fixes. See the [implementation plan](../docs/development/ssh-execution-implementation.md).
+
+Legacy command/script/stream, PTY, shell, and escalation paths now use bounded
+session creation and exec/PTY/shell requests. Full login sessions retain their
+legacy process-exit policy while preserving separate cancellation/cleanup errors.
+`RunInteractiveWithOptions` supports the old Bash login default and explicit
+`WithLoginShell(false)`. `RunStream.Close` is idempotent and joins cancellation.
+Generic legacy output callbacks still require the remaining P1-B I/O migration;
+request deadlines alone do not establish cancellation of a blocked local writer.
+
+Terminal output pumps report failures while the session is waiting for remote
+exit. Sink errors abort the session immediately and remain in the returned error
+chain. Input-bridge initialization failures follow the same bounded shutdown:
+start/join Session.Wait, close the channel, and interrupt the transport if the
+peer never acknowledges closure before joining stdout/stderr workers. A successful
+Session.Close write alone does not establish that output readers have stopped.

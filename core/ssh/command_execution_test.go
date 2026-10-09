@@ -17,6 +17,10 @@ import (
 )
 
 type commandFixture struct {
+	blockClose                                                                       bool
+	suspendReads                                                                     atomic.Bool
+	hangPTY, terminal                                                                bool
+	requestTypes                                                                     chan string
 	reject, hangRequest, hangCommand, missing, signal, malformed, noClose, stallOpen bool
 	status                                                                           uint32
 	output                                                                           string
@@ -56,6 +60,7 @@ func commandTestClient(t *testing.T, scenario *commandFixture) *Client {
 			}
 			return
 		}
+		conn = &heldReadConn{Conn: conn, held: &scenario.suspendReads, release: ctx.Done()}
 		defer func() {
 			if err := closeResource(conn, "fixture transport"); err != nil {
 				t.Error(err)
@@ -122,19 +127,21 @@ func serveCommandFixture(t *testing.T, ctx context.Context, channel cryptoSSH.Ch
 			t.Log(err)
 		}
 	}()
-	request, ok := <-requests
-	if !ok {
+	request := nextCommandFixtureRequest(t, ctx, channel, requests, scenario)
+	if request == nil {
 		return
 	}
-	if request.Type != "exec" {
+	if request.Type != "exec" && request.Type != "shell" {
 		t.Errorf("unexpected request %s", request.Type)
 		return
 	}
 	scenario.attempts.Add(1)
 	var payload struct{ Command string }
-	if err := cryptoSSH.Unmarshal(request.Payload, &payload); err != nil {
-		t.Error(err)
-		return
+	if request.Type == "exec" {
+		if err := cryptoSSH.Unmarshal(request.Payload, &payload); err != nil {
+			t.Error(err)
+			return
+		}
 	}
 	if scenario.commands != nil {
 		scenario.commands <- payload.Command
@@ -143,6 +150,7 @@ func serveCommandFixture(t *testing.T, ctx context.Context, channel cryptoSSH.Ch
 		<-ctx.Done()
 		return
 	}
+	scenario.suspendReads.Store(scenario.blockClose)
 	if err := request.Reply(!scenario.reject, nil); err != nil {
 		t.Log(err)
 		return
@@ -154,13 +162,15 @@ func serveCommandFixture(t *testing.T, ctx context.Context, channel cryptoSSH.Ch
 		<-ctx.Done()
 		return
 	}
-	input, err := io.ReadAll(channel)
-	if err != nil {
-		t.Log(err)
-		return
-	}
-	if scenario.inputs != nil {
-		scenario.inputs <- string(input)
+	if !scenario.terminal {
+		input, err := io.ReadAll(channel)
+		if err != nil {
+			t.Log(err)
+			return
+		}
+		if scenario.inputs != nil {
+			scenario.inputs <- string(input)
+		}
 	}
 	if _, err := io.WriteString(channel, scenario.output); err != nil {
 		t.Log(err)
@@ -176,6 +186,27 @@ func serveCommandFixture(t *testing.T, ctx context.Context, channel cryptoSSH.Ch
 	if scenario.noClose {
 		<-ctx.Done()
 	}
+}
+
+func nextCommandFixtureRequest(t *testing.T, ctx context.Context, channel cryptoSSH.Channel, requests <-chan *cryptoSSH.Request, scenario *commandFixture) *cryptoSSH.Request {
+	t.Helper()
+	for request := range requests {
+		if scenario.requestTypes != nil {
+			scenario.requestTypes <- request.Type
+		}
+		if request.Type != "pty-req" {
+			return request
+		}
+		if scenario.hangPTY {
+			<-ctx.Done()
+			return nil
+		}
+		if err := request.Reply(true, nil); err != nil {
+			t.Log(err)
+			return nil
+		}
+	}
+	return nil
 }
 
 func sendCommandFixtureStatus(channel cryptoSSH.Channel, scenario *commandFixture) error {
@@ -362,4 +393,21 @@ func TestCommandTerminationDoesNotOverwriteConfirmedResult(t *testing.T) {
 	if result.Outcome != ExecutionCompleted || result.ExitCode == nil || *result.ExitCode != 127 || result.IOErr == nil {
 		t.Fatalf("contradictory status overwrote confirmed termination: %+v", result)
 	}
+}
+
+// Hold transport reads after exec acceptance, including reads already in
+// progress. The peer cannot consume/acknowledge SSH_MSG_CHANNEL_CLOSE. Fixture
+// cancellation releases this gate and joins all server workers.
+type heldReadConn struct {
+	net.Conn
+	held    *atomic.Bool
+	release <-chan struct{}
+}
+
+func (c *heldReadConn) Read(data []byte) (int, error) {
+	n, err := c.Conn.Read(data)
+	if c.held.Load() {
+		<-c.release
+	}
+	return n, err
 }

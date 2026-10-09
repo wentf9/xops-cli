@@ -134,7 +134,7 @@ func (c *Client) runWithSudo(ctx context.Context, command string, password []byt
 	if err != nil {
 		return "", fmt.Errorf("failed to create new session: %w", err)
 	}
-	defer joinResourceCloseError(&retErr, session, "sudo session")
+	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
 
 	if len(password) > 0 {
 		pwdStr := string(password) + "\n"
@@ -179,9 +179,9 @@ func (c *Client) ShellWithSudoIO(ctx context.Context, streams InteractiveIO) err
 	case SudoModeRoot:
 		return c.ShellWithIO(ctx, streams)
 	case SudoModeSudoer:
-		return c.RunInteractiveCmdWithIO(ctx, "sudo -i", streams)
+		return c.runTerminalSession(ctx, "sudo -i", streams, false, true)
 	case SudoModeSudo, SudoModeSu:
-		return c.runInteractivePrivilege(ctx, mode, `exec "${SHELL:-/bin/bash}"`, streams)
+		return c.runInteractivePrivilegeSession(ctx, mode, `exec "${SHELL:-/bin/bash}"`, streams, true)
 	default:
 		return fmt.Errorf("privilege escalation is not supported for this host (sudo_mode=%s)", mode)
 	}
@@ -190,6 +190,13 @@ func (c *Client) ShellWithSudoIO(ctx context.Context, streams InteractiveIO) err
 // ignoreShellExitError 忽略交互式 shell 的 ExitError
 // 交互式 shell 退出时可能继承用户执行的最后一条命令的退出码，这是正常行为
 func ignoreShellExitError(err error) error {
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		var retained []error
+		for _, cause := range joined.Unwrap() {
+			retained = append(retained, ignoreShellExitError(cause))
+		}
+		return errors.Join(retained...)
+	}
 	if err != nil {
 		var exitErr *ssh.ExitError
 		if errors.As(err, &exitErr) {
@@ -370,7 +377,7 @@ func (c *Client) runRawCommandWithPayload(ctx context.Context, rawCmd, initialPa
 	if err != nil {
 		return fmt.Errorf("failed to create new session: %w", err)
 	}
-	defer joinResourceCloseError(&retErr, session, "ssh command session")
+	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
 
 	stdinPipe, pipeErr := session.StdinPipe()
 	if pipeErr != nil {
@@ -382,7 +389,7 @@ func (c *Client) runRawCommandWithPayload(ctx context.Context, rawCmd, initialPa
 
 	finishStdin, setupErr := startCommandWithStdinPipeline(
 		func() error {
-			if err := session.Start(rawCmd); err != nil {
+			if err := c.sessionRequest(ctx, session, "exec", func() error { return session.Start(rawCmd) }); err != nil {
 				return fmt.Errorf("start session command failed: %w", err)
 			}
 			return nil
@@ -507,6 +514,11 @@ type subsystemSessionResult struct {
 }
 
 func (c *Client) newSessionContext(ctx context.Context) (*ssh.Session, error) {
+	if ctx != nil && c != nil {
+		work, cancel := withTimeoutOrDefault(ctx, c.handshakeTimeout, defaultSSHHandshakeTimeout)
+		defer cancel()
+		ctx = work
+	}
 	if ctx == nil {
 		return nil, fmt.Errorf("create SSH session context is nil")
 	}
@@ -524,7 +536,7 @@ func (c *Client) newSessionContext(ctx context.Context) (*ssh.Session, error) {
 			return nil, fmt.Errorf("create SSH session failed: %w", created.err)
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, errors.Join(ctxErr, created.session.Close())
+			return nil, errors.Join(ctxErr, c.closeSessionBounded(created.session))
 		}
 		return created.session, nil
 	case <-ctx.Done():
@@ -536,7 +548,7 @@ func (c *Client) newSessionContext(ctx context.Context) (*ssh.Session, error) {
 			}
 			var sessionErr error
 			if created.session != nil {
-				sessionErr = created.session.Close()
+				sessionErr = c.closeSessionBounded(created.session)
 			}
 			return nil, errors.Join(ctx.Err(), createErr, sessionErr)
 		default:
@@ -549,7 +561,7 @@ func (c *Client) newSessionContext(ctx context.Context) (*ssh.Session, error) {
 			createErr = fmt.Errorf("create SSH session after interrupt failed: %w", created.err)
 		}
 		if created.session != nil {
-			sessionErr = created.session.Close()
+			sessionErr = c.closeSessionBounded(created.session)
 		}
 		return nil, errors.Join(ctx.Err(), interruptErr, createErr, sessionErr)
 	}

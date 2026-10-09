@@ -96,6 +96,9 @@ func (c *Connector) configureClient(client *Client) *Client {
 }
 
 func (c *Client) defaultInteractiveIO() InteractiveIO {
+	if c == nil {
+		return InteractiveIO{}
+	}
 	return c.environment.InteractiveIO
 }
 

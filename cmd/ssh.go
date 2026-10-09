@@ -192,6 +192,9 @@ func (o *SshOptions) Validate() error {
 	}
 	if len(commandArgs) > 0 {
 		o.Command = strings.Join(commandArgs, " ")
+		if o.Command == "" {
+			return fmt.Errorf("explicit SSH command must not be empty")
+		}
 	}
 	if o.BgRun && !o.NoCmd {
 		return errors.New(i18n.T("ssh_err_background_requires_nocmd"))

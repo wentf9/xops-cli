@@ -78,6 +78,9 @@ func validateInteractiveIO(streams InteractiveIO) (int, int, error) {
 		return 0, 0, fmt.Errorf("interactive stderr is nil")
 	}
 	fdIn := int(streams.Stdin.Fd())
+	if !term.IsTerminal(fdIn) {
+		return 0, 0, fmt.Errorf("interactive stdin requires a local terminal")
+	}
 	fdOut := fdIn
 	if outputFile, ok := streams.Stdout.(*os.File); ok {
 		fdOut = int(outputFile.Fd())
@@ -319,7 +322,7 @@ func (c *Client) runRaw(ctx context.Context, wrappedCmd string, config *RunConfi
 	if err != nil {
 		return "", fmt.Errorf("failed to create new session: %w", err)
 	}
-	defer joinResourceCloseError(&retErr, session, "ssh command session")
+	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
 
 	return c.startWithTimeout(ctx, session, wrappedCmd, config)
 }
@@ -335,7 +338,7 @@ func (c *Client) RunScript(ctx context.Context, scriptContent string, opts ...Ru
 	if err != nil {
 		return "", fmt.Errorf("failed to create new session: %w", err)
 	}
-	defer joinResourceCloseError(&retErr, session, "ssh script session")
+	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
 
 	session.Stdin = strings.NewReader(scriptContent)
 
@@ -349,8 +352,8 @@ func (c *Client) RunScript(ctx context.Context, scriptContent string, opts ...Ru
 // streamReader 包装 io.ReadCloser 以便在关闭时清理 SSH session
 type streamReader struct {
 	io.ReadCloser
-	session *ssh.Session
-	cancel  context.CancelFunc
+	cancel context.CancelFunc
+	close  func() error
 }
 
 func (s *streamReader) Read(p []byte) (int, error) {
@@ -359,12 +362,7 @@ func (s *streamReader) Read(p []byte) (int, error) {
 
 func (s *streamReader) Close() error {
 	s.cancel()
-	err := s.ReadCloser.Close()
-	closeErr := s.session.Close()
-	if errors.Is(closeErr, io.EOF) {
-		closeErr = nil
-	}
-	return errors.Join(err, closeErr)
+	return s.close()
 }
 
 // RunStream 执行命令并返回流式输出
@@ -376,24 +374,24 @@ func (c *Client) RunStream(ctx context.Context, cmd string) (io.ReadCloser, erro
 
 	stdout, err := session.StdoutPipe()
 	if err != nil {
-		return nil, errors.Join(fmt.Errorf("failed to create stdout pipe: %w", err), session.Close())
+		return nil, errors.Join(fmt.Errorf("failed to create stdout pipe: %w", err), c.closeSessionBounded(session))
 	}
 
 	wrappedCmd := fmt.Sprintf("bash -c '%s'", strings.ReplaceAll(cmd, "'", "'\\''"))
 
-	if err := session.Start(wrappedCmd); err != nil {
-		return nil, errors.Join(fmt.Errorf("failed to start command: %w", err), session.Close())
+	if err := c.sessionRequest(ctx, session, "stream exec", func() error { return session.Start(wrappedCmd) }); err != nil {
+		return nil, errors.Join(fmt.Errorf("failed to start command: %w", err), c.closeSessionBounded(session))
 	}
 
 	derivedCtx, cancel := context.WithCancel(ctx)
 
-	// 监听 Context 自动关闭
+	closed := make(chan error, 1)
+	// Close or caller cancellation ends this watcher and unblocks stream reads.
 	go func() {
 		<-derivedCtx.Done()
-		debugCloseResource(c.getLogger(), session, "canceled ssh stream session")
+		closed <- c.closeSessionBounded(session)
 	}()
-
-	return &streamReader{ReadCloser: io.NopCloser(stdout), session: session, cancel: cancel}, nil
+	return &streamReader{ReadCloser: io.NopCloser(stdout), cancel: cancel, close: sync.OnceValue(func() error { return <-closed })}, nil
 }
 
 func (c *Client) Shell(ctx context.Context) error {
@@ -401,106 +399,15 @@ func (c *Client) Shell(ctx context.Context) error {
 }
 
 // ShellWithIO starts an interactive remote shell using caller-provided streams.
-func (c *Client) ShellWithIO(ctx context.Context, streams InteractiveIO) (retErr error) {
-	fdIn, fdOut, err := validateInteractiveIO(streams)
-	if err != nil {
-		return err
-	}
-	session, err := c.newSessionContext(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to create new session: %w", err)
-	}
-	defer joinResourceCloseError(&retErr, session, "interactive ssh shell session")
-	// 配置 PTY (终端模式)
-	modes := ssh.TerminalModes{
-		ssh.ECHO:          1,
-		ssh.TTY_OP_ISPEED: 14400,
-		ssh.TTY_OP_OSPEED: 14400,
-	}
-	// 获取当前终端文件描述符
-	width, height, err := term.GetSize(fdOut)
-	if err != nil {
-		width, height = 80, 40
-	}
-	if err := session.RequestPty("xterm-256color", height, width, modes); err != nil {
-		return fmt.Errorf("request for pty failed: %w", err)
-	}
-	// 获取管道
-	stdin, err := session.StdinPipe()
-	if err != nil {
-		return fmt.Errorf("create SSH stdin pipe failed: %w", err)
-	}
-	stdout, err := session.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("create SSH stdout pipe failed: %w", err)
-	}
-	stderr, err := session.StderrPipe()
-	if err != nil {
-		return fmt.Errorf("create SSH stderr pipe failed: %w", err)
-	}
-
-	// 启动 Shell
-	if err := session.Shell(); err != nil {
-		return fmt.Errorf("failed to start shell: %w", err)
-	}
-
-	// 设置本地终端为 Raw 模式
-	oldState, err := term.MakeRaw(fdIn)
-	if err != nil {
-		return fmt.Errorf("cannot set terminal to raw: %w", err)
-	}
-	defer func() {
-		if restoreErr := term.Restore(fdIn, oldState); restoreErr != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("restore terminal failed: %w", restoreErr))
-		}
-	}()
-
-	derivedCtx, cancelResize := context.WithCancel(ctx)
-	defer cancelResize()
-	stopResize := startWindowResizeLoop(derivedCtx, session, fdOut, width, height, c.getLogger(), c.Interrupt)
-	defer func() { retErr = errors.Join(retErr, stopResize()) }()
-	waitOutput := copySessionOutput(stdout, stderr, streams.Stdout, streams.Stderr)
-
-	done := make(chan struct{})
-	defer close(done)
-
-	go func() {
-		select {
-		case <-ctx.Done():
-			if signalErr := session.Signal(ssh.SIGKILL); signalErr != nil {
-				c.getLogger().Debugf("signal canceled interactive SSH shell failed: %v", signalErr)
-			}
-			debugCloseResource(c.getLogger(), session, "canceled interactive ssh shell session")
-		case <-done:
-		}
-	}()
-
-	// 启动协程处理用户输入
-	cancelStdin, stdinDone, err := startInputCopy(ctx, c.environment.InputBridge, streams, stdin)
-	if err != nil {
-		return err
-	}
-
-	err = session.Wait()
-	cancelErr := cancelStdin()
-	stdinErr := <-stdinDone
-
-	// 忽略 ExitError（交互式 shell 的正常退出，退出码可能继承自用户执行的最后一条命令）
-	if err != nil {
-		var exitErr *ssh.ExitError
-		if errors.As(err, &exitErr) {
-			err = nil
-		}
-	}
-	return errors.Join(err, cancelErr, stdinErr, waitOutput())
+func (c *Client) ShellWithIO(ctx context.Context, streams InteractiveIO) error {
+	return c.runTerminalSession(ctx, "", streams, true, true)
 }
 
 // RunInteractive runs one command in a PTY using an SSH exec request.
 // A non-interactive login bash loads the login environment without starting a
 // prompt or writing the command through the terminal's echoed input stream.
 func (c *Client) RunInteractive(ctx context.Context, cmd string) error {
-	wrappedCmd := fmt.Sprintf("bash -l -c '%s'", strings.ReplaceAll(cmd, "'", "'\\''"))
-	return c.RunInteractiveCmd(ctx, wrappedCmd)
+	return c.RunInteractiveWithOptions(ctx, cmd)
 }
 
 // RunInteractiveCmd 在 PTY 环境下直接执行命令（通过 SSH exec 通道，不启动交互式 shell），
@@ -510,88 +417,8 @@ func (c *Client) RunInteractiveCmd(ctx context.Context, cmd string) error {
 }
 
 // RunInteractiveCmdWithIO runs one PTY-backed command using caller-provided streams.
-func (c *Client) RunInteractiveCmdWithIO(ctx context.Context, cmd string, streams InteractiveIO) (retErr error) {
-	fdIn, fdOut, err := validateInteractiveIO(streams)
-	if err != nil {
-		return err
-	}
-	session, err := c.newSessionContext(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to create new session: %w", err)
-	}
-	defer joinResourceCloseError(&retErr, session, "interactive ssh exec session")
-
-	modes := ssh.TerminalModes{
-		ssh.ECHO:          1,
-		ssh.TTY_OP_ISPEED: 14400,
-		ssh.TTY_OP_OSPEED: 14400,
-	}
-	width, height, err := term.GetSize(fdOut)
-	if err != nil {
-		width, height = 80, 40
-	}
-	if err := session.RequestPty("xterm-256color", height, width, modes); err != nil {
-		return fmt.Errorf("request for pty failed: %w", err)
-	}
-
-	stdin, err := session.StdinPipe()
-	if err != nil {
-		return fmt.Errorf("create SSH stdin pipe failed: %w", err)
-	}
-	stdout, err := session.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("create SSH stdout pipe failed: %w", err)
-	}
-	stderr, err := session.StderrPipe()
-	if err != nil {
-		return fmt.Errorf("create SSH stderr pipe failed: %w", err)
-	}
-
-	if err := session.Start(cmd); err != nil {
-		return fmt.Errorf("start command failed: %w", err)
-	}
-
-	oldState, err := term.MakeRaw(fdIn)
-	if err != nil {
-		return fmt.Errorf("cannot set terminal to raw: %w", err)
-	}
-	defer func() {
-		if restoreErr := term.Restore(fdIn, oldState); restoreErr != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("restore terminal failed: %w", restoreErr))
-		}
-	}()
-
-	derivedCtx, cancelResize := context.WithCancel(ctx)
-	defer cancelResize()
-	stopResize := startWindowResizeLoop(derivedCtx, session, fdOut, width, height, c.getLogger(), c.Interrupt)
-	defer func() { retErr = errors.Join(retErr, stopResize()) }()
-
-	waitOutput := copySessionOutput(stdout, stderr, streams.Stdout, streams.Stderr)
-
-	done := make(chan struct{})
-	defer close(done)
-
-	go func() {
-		select {
-		case <-ctx.Done():
-			if signalErr := session.Signal(ssh.SIGKILL); signalErr != nil {
-				c.getLogger().Debugf("signal canceled interactive SSH exec session failed: %v", signalErr)
-			}
-			debugCloseResource(c.getLogger(), session, "canceled interactive ssh exec session")
-		case <-done:
-		}
-	}()
-
-	cancelStdin, stdinDone, err := startInputCopy(ctx, c.environment.InputBridge, streams, stdin)
-	if err != nil {
-		return err
-	}
-
-	err = ignoreShellExitError(session.Wait())
-	cancelErr := cancelStdin()
-	stdinErr := <-stdinDone
-
-	return errors.Join(err, cancelErr, stdinErr, waitOutput())
+func (c *Client) RunInteractiveCmdWithIO(ctx context.Context, cmd string, streams InteractiveIO) error {
+	return c.runTerminalSession(ctx, cmd, streams, false, false)
 }
 
 func withTimeoutOrDefault(ctx context.Context, timeout, defaultTimeout time.Duration) (context.Context, context.CancelFunc) {
@@ -891,7 +718,7 @@ func (c *Client) startWithTimeout(ctx context.Context, session *ssh.Session, com
 		session.Stderr = wrap(session.Stderr)
 	}
 
-	if err := session.Start(command); err != nil {
+	if err := c.sessionRequest(ctx, session, "exec", func() error { return session.Start(command) }); err != nil {
 		return "", fmt.Errorf("failed to start command: %w", err)
 	}
 	done := make(chan error, 1)
