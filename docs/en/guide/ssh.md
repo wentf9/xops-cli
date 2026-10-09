@@ -8,6 +8,24 @@ xops ssh -J bastion.example.com deploy@192.0.2.10
 
 A single-label jump host must already exist as a node or alias. Explicit users on the same host keep separate credentials.
 
+## Command execution and interpreters
+
+`xops ssh` supports executing remote commands (via positional arguments or following `--host`) with explicit interpreter and login controls:
+
+```bash
+xops ssh web-01 uptime
+xops ssh --host web-01 --interpreter server uname -a
+xops ssh --host linux-01 --interpreter bash --launch-dialect posix --login-shell=false id
+```
+
+- **Explicit interpreters**: Supports `--interpreter server` (unchanged SSH exec payload) and `--interpreter bash` (Bash payload wrapped under the known POSIX launch dialect).
+- **Login controls**: Supports `--login-shell` and `--no-login` (mutually exclusive); `--interpreter server` rejects login options.
+- **Input and shell routing**:
+  - When no command is specified and stdin is a terminal, starts a full interactive PTY login shell.
+  - When no command is specified and stdin is piped, starts a native non-PTY SSH shell executing streamed input only if `--interpreter server` is explicitly specified, preserving remote exit status and signals; non-server interpreters or unconfigured interpreters require a non-empty command.
+  - Explicit empty commands (e.g. `xops ssh web-01 ""`) are rejected and never converted into interactive shells.
+- **Cancelable outputs**: Streaming command execution uses cancelable output bridges across regular files, the null device, and (on Linux) terminals and pipes, cleanly interrupting and joining all goroutines on cancellation. Native cancelable output bridges on other platforms will follow in subsequent phases.
+
 ## Automatic node saving
 
 When SSH, SFTP, SCP, or exec first connects to a new node, XOps prepares its connection details in memory. It saves the node, host, and identity only after the SSH handshake and authentication succeed. A timeout, refused connection, authentication failure, or cancellation before authentication creates no saved configuration. Saving another node cannot accidentally publish an unauthenticated pending node.

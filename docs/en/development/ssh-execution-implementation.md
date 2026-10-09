@@ -15,16 +15,16 @@ Based on the [SSH execution and interpreter compatibility design](./ssh-executio
 
 This batch's new API accepts finite input and internal memory output only, without uncancelable external readers/writers. Defaults are a 5-minute total timeout, a 10-second startup timeout (inheriting the connector's handshake timeout), and a 1-second shutdown grace period. Core callers may shorten or specify the total timeout. Limits are 64 KiB each for the original command and quoted exec payload, 16 MiB of stdin, a default output window retaining the last 5 MiB, and a maximum output window of 64 MiB. At the window limit, continue draining and explicitly report truncation. These limits apply to the new API; this batch does not switch old API defaults.
 
-### P1-B: Unify Existing Entry Points and Fix Interactive Execution (In Progress)
+### P1-B: Unify Existing Entry Points and Fix Interactive Execution (Complete)
 
-- [ ] Delegate Run, RunWithoutLogin, RunCommandWithIO, and legacy Bash scripts to unified plans while retaining their individual login defaults
-- [ ] Provide cancelable output bridges for terminals/pipes; migrate streaming/file output and SSH CLI while preserving stdin ownership and EOF contracts
+- [x] Delegate Run, RunWithoutLogin, RunCommandWithIO, and legacy Bash scripts to unified plans while retaining their individual login defaults
+- [x] Provide cancelable output bridges for terminals/pipes; migrate streaming/file output and SSH CLI while preserving stdin ownership and EOF contracts
 - [x] Bound session creation, exec/PTY/Shell requests, and closure; legacy exec/script/I/O/escalation/RunStream startup requests share this lifecycle
 - [x] Preserve nonzero, signal, and missing exit status for ordinary/root/passwordless/password sudo/su one-shot PTY commands; retain full login-session policy and pass terminal-restoration/stdin EOF regressions
 - [x] Accept ContextWriter/memory output in the new PTY API; Linux terminals/pipes use independent nonblocking handles without closing caller streams or changing their flags on cancellation
 - [x] Apply new exec interpreter options to PTY and honor ordinary PTY --no-login; reject ignored script/stream/out-dir/privileged no-login combinations before execution; explicit empty SSH commands do not become shells/scripts
-- [ ] Migrate SSH CLI interpreter options, non-PTY native shells, and configuration inheritance
-- [ ] Declare P1 complete only after full build/test/lint and SSH/I/O race and leak regressions pass
+- [x] Migrate SSH CLI interpreter options, non-PTY native shells, and configuration inheritance
+- [x] Declare P1 complete only after full build/test/lint and SSH/I/O race and leak regressions pass
 
 ### P2-A: Configuration and Caller Bindings
 
@@ -85,3 +85,18 @@ Remaining P1-B work includes delegating legacy Run/script/I/O methods to unified
 If input-bridge initialization fails, cancel input/cancelable output and use the already-started Session.Wait to confirm session exit. If the peer never acknowledges closure, interrupt the transport after the grace period, then join stdout/stderr. Output-copy failures are monitored concurrently with remote completion through a separate notification channel. Broken pipes and write timeouts cancel the session and use the same bounded cleanup without waiting for the full command timeout. Retain the original input/output errors and never replay the command.
 
 Regressions suspend server transport reads so that channel-close requests actually cannot be acknowledged. They also cover continued output beyond the SSH receive window, a real broken pipe, write timeouts, terminal restoration, caller stream ownership, and worker cleanup. The new cases failed before the fix and pass afterward.
+
+## Final P1-B and Full P1 Validation Record (2026-10-09)
+
+This batch completes all remaining P1-B items and accepts the full Phase P1 delivery:
+1. **Unify legacy entry point delegation and builders**: `Run`, `RunWithoutLogin`, `RunScript`, `RunStream`, `RunWithSudo`, `RunScriptWithSudo`, and `RunCommandWithIO` all delegate to shared Bash payload construction helpers (`bashCommandPayload`, `bashScriptPayload`, `legacyBashPayload`), maintaining individual entry point login defaults (`Run` and `RunWithSudo` default to login; `RunWithoutLogin` defaults to non-login).
+2. **Cancelable output bridges**: `BindOutput` and `bindRunOutput` bridge regular files, the null device (`/dev/null`), finite memory buffers, Linux terminals, and pipes. Non-PTY ordinary pipes do not use artificial write timeouts (bounded by context timeout and cancellation only), while retaining the 10-second idle write limit for PTY terminals; `RunStream`, file-redirected output, and `RunCommandWithIO` use the cancelable bridge to prevent goroutine leaks when output stalls.
+3. **Streaming command plan execution and non-PTY native shells**: `RunCommandPlanWithIO` strictly checks output cancelability, executes immutable command plans while forwarding standard streams, and preserves remote exit codes and signals; `RunShellWithoutPTY` supports native non-PTY `shell` requests with streaming stdin and full exit status retention. Both streaming paths monitor output-copy failures independently; broken downstream pipes immediately trigger bounded session cleanup while preserving write errors, preventing remote producers from exhausting SSH window buffers and stalling execution.
+4. **SSH CLI options and input routing**: `xops ssh` adds `--interpreter` (server/bash), `--launch-dialect` (posix), `--login-shell`, and `--no-login` flags; input routing is refactored: terminal input without a command opens a full interactive PTY login shell; piped stdin with `--interpreter server` routes to `RunShellWithoutPTY`; non-server interpreters or non-empty commands route through streaming plan execution; explicit empty commands and invalid option combinations are rejected before execution.
+5. **Full acceptance metrics**:
+   - `go build ./...`: passed
+   - `go test ./...`: passed
+   - `golangci-lint run ./...`: 0 issues
+   - `go test -race ./core/ssh ./cmd`: passed (`core/ssh` 27.5s, `cmd` 200.3s, zero data races, zero goroutine leaks)
+   - `python3 scripts/check_core.py`: Linux/Windows/macOS dependency boundaries passed; isolated extracted module build and tests passed
+   - `npm run docs:build`: passed, bilingual documentation routes and link checks passed

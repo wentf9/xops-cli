@@ -15,16 +15,16 @@
 
 该批次的新 API 只接收有限输入和内部内存输出，不接受不可取消的外部 reader/writer。默认总时限 5 分钟、启动阶段 10 秒（继承 connector 的握手期限）、关闭宽限 1 秒；core 允许调用者缩短或指定总时限。原命令和引用后的 exec 载荷各最多 64 KiB，stdin 最多 16 MiB，默认保留最后 5 MiB 输出，最大输出窗口 64 MiB。达到输出窗口后继续排空并明确标记截断。这些是本批次新增 API 的限额，旧 API 的默认值不在本批次切换。
 
-### P1-B：现有入口统一及交互修复（进行中）
+### P1-B：现有入口统一及交互修复（已完成）
 
-- [ ] Run、RunWithoutLogin、RunCommandWithIO 和旧 Bash 脚本委托统一计划，保持各入口原有登录默认
-- [ ] 为终端/管道提供可取消输出桥；迁移流式输出、文件输出和 SSH CLI，保持 stdin 所有权与 EOF 契约
+- [x] Run、RunWithoutLogin、RunCommandWithIO 和旧 Bash 脚本委托统一计划，保持各入口原有登录默认
+- [x] 为终端/管道提供可取消输出桥；迁移流式输出、文件输出和 SSH CLI，保持 stdin 所有权与 EOF 契约
 - [x] 会话创建、exec/PTY/Shell 请求和关闭有界；旧 exec/脚本/I/O/提权/RunStream 的启动请求复用该生命周期
 - [x] 普通/root/免密/密码 sudo/su 的一次性 PTY 命令传播非零、信号及缺失退出状态；完整登录会话保留旧策略，终端恢复与 stdin EOF 回归通过
 - [x] 新 PTY API 接受 ContextWriter/内存输出；Linux 终端/管道使用独立非阻塞句柄，取消不关闭调用方流或修改其标志
 - [x] exec 的新解释器参数进入 PTY；普通 PTY --no-login 生效；被忽略的脚本/stream/out-dir/privileged no-login 组合提前拒绝；SSH 显式空命令不转为 Shell/脚本
-- [ ] SSH CLI 的新解释器选项、非 PTY 原生 Shell 与配置继承迁移
-- [ ] P1 全量 build/test/lint、SSH/I/O race 与泄漏回归通过后才声明 P1 完成
+- [x] SSH CLI 的新解释器选项、非 PTY 原生 Shell 与配置继承迁移
+- [x] P1 全量 build/test/lint、SSH/I/O race 与泄漏回归通过后才声明 P1 完成
 
 ### P2-A：配置及调用方绑定
 
@@ -85,3 +85,18 @@ Windows 原生运行、无 Bash Unix 适配器、PTY/提权和现有入口统一
 输入桥初始化失败时，先取消输入/可取消输出，再通过已经启动的 Session.Wait 确认会话退出；对端不确认关闭则在宽限到期后中断 transport，最后汇合 stdout/stderr。输出复制错误通过独立通知通道与远端退出并行监控，破管道或写超时直接触发取消与同样的有界清理，不等待完整命令超时。原始输入/输出错误保留，不重放命令。
 
 回归测试使用暂停服务端 transport 读取的 SSH peer，确保通道关闭请求实际无法获得确认；另覆盖持续产生超过 SSH 接收窗口的数据、实际破管道、写超时、终端恢复、调用方流所有权与协程回收。新增用例在修复前均失败，修复后通过。
+
+## P1-B 终批与 P1 完整验证记录（2026-10-09）
+
+本批完成 P1-B 剩余所有条目，并验收 P1 阶段整体交付：
+1. **统一旧入口委托与共享构造**：`Run`、`RunWithoutLogin`、`RunScript`、`RunStream`、`RunWithSudo`、`RunScriptWithSudo`、`RunCommandWithIO` 均统一委托至共享的 Bash 载荷构建逻辑（`bashCommandPayload`、`bashScriptPayload`、`legacyBashPayload`），保持各入口原有的登录环境默认（`Run`、`RunWithSudo` 默认登录，`RunWithoutLogin` 默认非登录）。
+2. **可取消输出桥**：`BindOutput` 与 `bindRunOutput` 接入常规文件、空设备（/dev/null）、有限内存缓冲、Linux 终端与管道。对于非 PTY 普通管道移除人为写超时限制（由上下文超时与取消约束），保留 PTY 终端的 10 秒空闲保护；`RunStream`、文件重定向输出与 `RunCommandWithIO` 接入取消桥，防止远端挂起或输出停滞时泄漏会话协程。
+3. **流式命令计划与非 PTY 原生 Shell**：`RunCommandPlanWithIO` 严格检查输出可取消性，执行不可变命令计划并转发标准输入输出，保留远端退出码与信号；`RunShellWithoutPTY` 支持非 PTY `shell` 请求与 stdin 流式转发，退出状态完整保留。两类流式入口均通过独立通知通道实时监控输出写入失败（如破管道），一旦下游断开立即触发有界会话清理并保留写入错误，防止因远端生产者耗尽 SSH 窗口停滞而导致命令 hang 或超时。
+4. **SSH CLI 选项与输入路由**：`xops ssh` 新增 `--interpreter`（server/bash）、`--launch-dialect`（posix）、`--login-shell`、`--no-login` 参数；重构输入路由：终端无命令保持全交互式 PTY 登录 Shell，管道 stdin 且显式指定 `--interpreter server` 时路由至 `RunShellWithoutPTY`，非 server 或非空命令走流式计划执行；显式空命令与非法组合提前报错。
+5. **全量验收指标**：
+   - `go build ./...`：通过
+   - `go test ./...`：通过
+   - `golangci-lint run ./...`：0 issues
+   - `go test -race ./core/ssh ./cmd`：通过（`core/ssh` 27.5s，`cmd` 200.3s，无 data race，无泄漏）
+   - `python3 scripts/check_core.py`：Linux/Windows/macOS 依赖边界通过，独立抽取模块 build/test 全量通过
+   - `npm run docs:build`：通过，双语文档路由与链接校验通过

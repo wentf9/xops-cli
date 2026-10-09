@@ -1,6 +1,6 @@
 # SSH Interpreter and Execution Compatibility Design
 
-Status: implementation in stages. The source analysis baseline is `c1851bc`. P1-A implements command plans and a core execution API with finite stdin/bounded output, plus explicit server/Bash options for ordinary CLI exec commands. The first P1-B batch adds bounded requests, PTY exit-status propagation, explicit exec PTY commands, and cancelable Linux terminal/pipe output. Legacy plan/output delegation, SSH CLI options, native output bridges on other platforms, execution configuration, MCP extension fields, and default changes remain pending. See the [implementation plan](./ssh-execution-implementation.md) for progress and restrictions, and installed help for release availability.
+Status: implementation in stages. The source analysis baseline is `c1851bc`. Phase P1 (P1-A and P1-B) is fully complete, unifying core command plans, legacy entry point delegation, cancelable output bridges, PTY exit-status propagation, non-PTY native shells, and explicit CLI exec and ssh interpreter options; execution configuration (P2-A), cross-platform adapters (P2-B), and default switching (P3) remain for subsequent phases. See the [implementation plan](./ssh-execution-implementation.md) for progress and restrictions, and installed help for release availability.
 
 The goal is to remove the implicit Bash dependency from ordinary commands and give CLI, MCP, Playbook, SFTP commands, and privilege escalation consistent execution semantics. For current usage, refer to the [command execution guide](../guide/exec.md) and the installed version's help.
 
@@ -274,7 +274,7 @@ Migrate compatibility configuration by operation kind. Ordinary commands can be 
 
 Roll back the default switch through the explicit configuration above or a compatible release that already supports the execution schema. Baseline configuration loading uses `KnownFields(true)`: after new fields have been persisted, an older binary that does not support them rejects the entire configuration. Rolling back further requires restoring the corresponding backup or exporting compatible configuration through a controlled process and validating semantic differences. A release rollback does not imply direct downgrades to arbitrary versions, and there is no fallback after a running command fails.
 
-Current status: P1-A is complete and the first P1-B request/PTY batch is implemented. Legacy-method/output-bridge migration is in progress, while P2/P3 remain pending. P1 is not complete as a whole. This document describes the final contract; see the [execution guide](../guide/exec.md) and implementation plan for the currently available CLI subset and limits.
+Current status: Phase P1 (both P1-A and P1-B) is complete, with legacy method delegation, cancelable output bridges, and SSH CLI verified; P2/P3 remain pending. This document describes the final contract; see the [execution guide](../guide/exec.md) and implementation plan for the currently available CLI subset and limits.
 
 ## 10. Verification and Acceptance
 

@@ -24,20 +24,17 @@ import (
 type ExecOptions struct {
 	interaction *cliInteractionHandler
 	SshOptions
-	HostFile     string
-	ShellFile    string
-	Command      string
-	Tag          string
-	Exclude      []string
-	TaskCount    int
-	Interactive  bool
-	NoLoginShell bool
-	Stream       bool
-	OutDir       string
+	HostFile    string
+	ShellFile   string
+	Command     string
+	Tag         string
+	Exclude     []string
+	TaskCount   int
+	Interactive bool
+	Stream      bool
+	OutDir      string
 
 	stdinScript bool
-	execution   execExecutionOptions
-	commandPlan *ssh.CommandPlan
 
 	stdout io.Writer
 	stderr io.Writer
@@ -45,9 +42,8 @@ type ExecOptions struct {
 
 func NewExecOptions() *ExecOptions {
 	return &ExecOptions{
-		SshOptions:   *NewSshOptions(),
-		TaskCount:    1,
-		NoLoginShell: false,
+		SshOptions: *NewSshOptions(),
+		TaskCount:  1,
 	}
 }
 

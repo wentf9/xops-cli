@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,13 +48,18 @@ type SshOptions struct {
 
 	Target config.ConnectionTarget
 
-	Command     string
-	stdinScript bool
+	Command      string
+	stdinScript  bool
+	NoLoginShell bool
+
+	execution   execExecutionOptions
+	commandPlan *ssh.CommandPlan
 }
 
 func NewSshOptions() *SshOptions {
 	return &SshOptions{
-		Sudo: false,
+		Sudo:         false,
+		NoLoginShell: false,
 	}
 }
 
@@ -96,12 +102,15 @@ func newCmdSshWithOptions(o *SshOptions) *cobra.Command {
 	cmd.Flags().BoolVar(&o.Sudo, "sudo", false, i18n.T("flag_sudo"))
 	cmd.Flags().StringVar(&o.Alias, "alias", "", i18n.T("flag_alias"))
 	cmd.Flags().StringSliceVar(&o.Tags, "tag", []string{}, i18n.T("flag_tag"))
+	o.execution.register(cmd)
+	cmd.Flags().BoolVar(&o.NoLoginShell, "no-login", false, i18n.T("flag_exec_no_login"))
 
 	return cmd
 }
 
 func (o *SshOptions) Complete(cmd *cobra.Command, args []string) error {
 	o.args = args
+	o.execution.capturePresence(cmd)
 	if o.PasswordStdin {
 		pwd, err := utils.ReadSecretFromStdin()
 		if err != nil {
@@ -202,7 +211,7 @@ func (o *SshOptions) Validate() error {
 	if strings.Contains(o.Alias, "@") || strings.Contains(o.Alias, ":") {
 		return errors.New(i18n.T("ssh_err_alias_invalid"))
 	}
-	return nil
+	return o.prepareCommandPlan()
 }
 
 func (o *SshOptions) Run() error {
@@ -736,5 +745,17 @@ func promptPressEnterIfTUI(stdin io.Reader, stdout io.Writer) error {
 }
 
 func (o *SshOptions) runCommand(ctx context.Context, client *ssh.Client, command string) error {
+	if o.commandPlan != nil {
+		if runtime.GOOS != "linux" {
+			return fmt.Errorf("explicit execution on %s is not supported yet: cancelable native output is only available on Linux", runtime.GOOS)
+		}
+		return client.RunCommandPlanWithIO(ctx, *o.commandPlan, os.Stdin, os.Stdout, os.Stderr)
+	}
+	if o.Command == "" && o.stdinScript && o.execution.enabled() && o.execution.interpreter == string(ssh.InterpreterServer) {
+		if runtime.GOOS != "linux" {
+			return fmt.Errorf("explicit execution on %s is not supported yet: cancelable native output is only available on Linux", runtime.GOOS)
+		}
+		return client.RunShellWithoutPTY(ctx, os.Stdin, os.Stdout, os.Stderr)
+	}
 	return client.RunCommandWithIO(ctx, command, o.Sudo, os.Stdin, os.Stdout, os.Stderr)
 }

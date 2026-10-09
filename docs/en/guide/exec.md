@@ -20,7 +20,7 @@ The default compatibility mode of `exec` requires Bash in the remote SSH executi
 
 ## Explicit interpreters
 
-The current source implements P1-A ordinary-command foundations and the first P1-B request/PTY migration. `exec` supports explicit server/Bash selection for buffered commands and PTY commands. Check `xops exec --help` for availability in an installed release; the default compatibility mode has not switched.
+The current source implements all P1 capabilities (P1-A and P1-B). Both `exec` and `ssh` support explicit server or Bash execution, legacy entry points delegate to unified command plans, and cancelable output bridges protect terminals and pipes. Check `xops exec --help` and `xops ssh --help` for availability in an installed release; the default compatibility mode has not switched.
 
 ```bash
 xops exec --host alpine-01 --interpreter server -c 'uname -a'
@@ -40,7 +40,7 @@ xops exec --host linux-01 --interpreter server -x top
 xops exec --host linux-01 --interpreter bash --launch-dialect posix --login-shell=false -x top
 ```
 
-The new PTY path requires local terminal input and streams output without the 5 MiB buffer window. Linux terminal/pipe output uses independent cancelable handles with a 10-second per-write limit and a 1-second output-drain grace period after exit. Original standard streams are not closed and their file flags are not changed. Input-bridge initialization failures, broken output pipes, and write timeouts trigger bounded cleanup immediately rather than waiting for the full command timeout. If the peer does not acknowledge channel closure, interrupt the transport and join output workers. Regular-file redirection and native output bridges on other client platforms remain unvalidated and are rejected before sending a command; core consumers may provide a `ContextWriter` that honors cancellation. Unification of existing `ssh` and legacy output entry points remains in progress.
+The new PTY path requires local terminal input and streams output without the 5 MiB buffer window. Linux terminal/pipe output uses independent cancelable handles with a 10-second per-write limit and a 1-second output-drain grace period after exit. Original standard streams are not closed and their file flags are not changed. Input-bridge initialization failures, broken output pipes, and write timeouts trigger bounded cleanup immediately rather than waiting for the full command timeout. If the peer does not acknowledge channel closure, interrupt the transport and join output workers. Regular-file redirection and native output bridges on other client platforms remain unvalidated and are rejected before sending a command; core consumers may provide a `ContextWriter` that honors cancellation. Legacy `Run`, `RunWithoutLogin`, `RunCommandWithIO`, `RunStream`, and `ssh` have been unified under command plans and cancelable output bridges; Phase P2 will expand global/node execution configuration and cross-platform adapters.
 
 ## Interactive commands
 
