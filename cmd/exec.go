@@ -195,6 +195,9 @@ func (o *ExecOptions) Complete(cmd *cobra.Command, args []string) error {
 	if err := o.prepareCommandPlan(); err != nil {
 		return err
 	}
+	if err := o.validateInteractiveOptions(); err != nil {
+		return err
+	}
 	if o.PasswordStdin {
 		pwd, err := utils.ReadSecretFromStdin()
 		if err != nil {
@@ -214,6 +217,9 @@ func (o *ExecOptions) Complete(cmd *cobra.Command, args []string) error {
 }
 
 func (o *ExecOptions) readStdinIfRequired() {
+	if o.Interactive {
+		return
+	}
 	if o.Command == "" && o.ShellFile == "" {
 		stat, err := os.Stdin.Stat()
 		if err == nil && (stat.Mode()&os.ModeCharDevice) == 0 {
@@ -239,13 +245,30 @@ func (o *ExecOptions) Validate() error {
 	if o.Host == "" && o.HostFile == "" && o.Tag == "" {
 		return fmt.Errorf("%s", i18n.T("err_no_host"))
 	}
-	if o.Interactive {
-		if o.ShellFile != "" {
-			return fmt.Errorf("%s", i18n.T("exec_err_interactive_shell"))
-		}
-		if o.HostFile != "" || o.Tag != "" || strings.Contains(o.Host, ",") {
-			return fmt.Errorf("%s", i18n.T("exec_err_interactive_multi_host"))
-		}
+	return o.validateInteractiveOptions()
+}
+
+func (o *ExecOptions) validateInteractiveOptions() error {
+	if !o.Interactive {
+		return nil
+	}
+	if o.Command == "" && o.ShellFile == "" {
+		return fmt.Errorf("%s", i18n.T("exec_err_no_cmd"))
+	}
+	if o.Stream || o.OutDir != "" {
+		return fmt.Errorf("PTY output cannot be combined with --stream or --out-dir")
+	}
+	if o.stdinScript {
+		return fmt.Errorf("PTY commands cannot use stdin scripts")
+	}
+	if o.Sudo && o.NoLoginShell {
+		return fmt.Errorf("--no-login with privileged PTY commands is not supported yet")
+	}
+	if o.ShellFile != "" {
+		return fmt.Errorf("%s", i18n.T("exec_err_interactive_shell"))
+	}
+	if o.HostFile != "" || o.Tag != "" || strings.Contains(o.Host, ",") {
+		return fmt.Errorf("%s", i18n.T("exec_err_interactive_multi_host"))
 	}
 	return nil
 }
@@ -392,6 +415,9 @@ func (o *ExecOptions) runInteractive(
 	task execHostTask,
 	cmd string,
 ) (retErr error) {
+	if o.commandPlan != nil && o.commandPlan.Command() != cmd {
+		return fmt.Errorf("[%s] command changed after execution planning", task.host)
+	}
 	client, err := connector.Connect(ctx, task.nodeID)
 	if err != nil {
 		return fmt.Errorf("[%s] %s: %w", task.host, i18n.T("fw_connect_failed"), err)
@@ -403,10 +429,12 @@ func (o *ExecOptions) runInteractive(
 	}()
 
 	var execErr error
-	if o.Sudo {
+	if o.commandPlan != nil {
+		execErr = client.RunInteractivePlan(ctx, *o.commandPlan)
+	} else if o.Sudo {
 		execErr = client.RunInteractiveWithSudo(ctx, cmd)
 	} else {
-		execErr = client.RunInteractive(ctx, cmd)
+		execErr = client.RunInteractiveWithOptions(ctx, cmd, ssh.WithLoginShell(!o.NoLoginShell))
 	}
 
 	return execErr

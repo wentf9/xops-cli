@@ -34,7 +34,20 @@ func debugCloseResource(l logger.DebugLogger, closer io.Closer, resource string)
 }
 
 func copySessionOutput(stdout, stderr io.Reader, stdoutWriter, stderrWriter io.Writer) func() error {
+	return startSessionOutput(stdout, stderr, stdoutWriter, stderrWriter).wait
+}
+
+type sessionOutputCopy struct {
+	failed <-chan error
+	wait   func() error
+}
+
+// Report the first pump failure immediately, independently of the other stream
+// reaching EOF. The owner closes the SSH session/transport and cancels capable
+// writers before joining both workers through wait.
+func startSessionOutput(stdout, stderr io.Reader, stdoutWriter, stderrWriter io.Writer) sessionOutputCopy {
 	errCh := make(chan error, 2)
+	failed := make(chan error, 1)
 	var wg sync.WaitGroup
 	var outputMu sync.Mutex
 
@@ -43,6 +56,10 @@ func copySessionOutput(stdout, stderr io.Reader, stdoutWriter, stderrWriter io.W
 			_, err := io.Copy(serializedSessionOutput{mu: &outputMu, target: dst}, src)
 			if err != nil {
 				err = fmt.Errorf("copy SSH %s failed: %w", name, err)
+				select {
+				case failed <- err:
+				default:
+				}
 			}
 			errCh <- err
 		})
@@ -50,10 +67,10 @@ func copySessionOutput(stdout, stderr io.Reader, stdoutWriter, stderrWriter io.W
 	copyOne("stdout", stdoutWriter, stdout)
 	copyOne("stderr", stderrWriter, stderr)
 
-	return func() error {
+	return sessionOutputCopy{failed: failed, wait: sync.OnceValue(func() error {
 		wg.Wait()
 		return errors.Join(<-errCh, <-errCh)
-	}
+	})}
 }
 
 // Serialize writes, not reads: holding a lock for an entire io.Copy can deadlock

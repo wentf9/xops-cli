@@ -1,6 +1,6 @@
 # Remote execution and automation
 
-Examples use a POSIX local shell and require Bash plus the referenced utilities on the remote host. By default, `xops exec` wraps ordinary commands in `bash -l -c`; `--no-login` selects `bash -c`, not the target's default shell. Windows targets also need Bash available to the SSH execution environment, even when the inner command invokes `powershell.exe`. Quote for the local shell, Bash, and any explicitly invoked interpreter. For an ordinary buffered command without Bash, current source supports `xops exec --host NODE --interpreter server -c COMMAND`, forwarding the command unchanged to the server; check installed help before using it. This explicit mode rejects scripts, PTY, sudo, streaming/file output, and has a 5-minute timeout with a 5 MiB output window. Command syntax belongs to the server; uncertain execution outcomes must not be replayed automatically. For file tasks on targets without Bash, use the SCP/SFTP workflows in [Files and transfers](files.md).
+Examples use a POSIX local shell and require Bash plus the referenced utilities on the remote host. By default, `xops exec` wraps ordinary commands in `bash -l -c`; `--no-login` selects `bash -c`, not the target's default shell. Windows targets also need Bash available to the SSH execution environment, even when the inner command invokes `powershell.exe`. Quote for the local shell, Bash, and any explicitly invoked interpreter. For an ordinary buffered command without Bash, current source supports `xops exec --host NODE --interpreter server -c COMMAND`, forwarding the command unchanged to the server; check installed help before using it. This explicit mode rejects scripts, sudo, streaming/file output, and has a 5-minute timeout with a 5 MiB buffer window. It also supports single-host `-x` with a local terminal and cancelable Linux terminal/pipe output; regular-file redirection and native output on other client platforms are rejected. One-shot PTY nonzero/signal/missing exits now report failure. Ordinary PTY --no-login takes effect; privileged PTY --no-login is currently rejected. Command syntax belongs to the server; uncertain execution outcomes must not be replayed automatically. For file tasks on targets without Bash, use the SCP/SFTP workflows in [Files and transfers](files.md).
 
 ## One host and bounded inspection
 
@@ -80,7 +80,7 @@ xops exec -x web-01 top
 xops tui
 ```
 
-Use these when the task needs a terminal. `exec -x` supports one host and no local script; it returns after the requested command and also requires Bash on the target. `ssh` provides a full shell. Single-label jump hosts must be configured nodes/aliases; FQDN, IP, and explicit `host:port` can identify direct jumps.
+Use these when the task needs a terminal. `exec -x` supports one host and no local script; it returns after the requested command and requires Bash on the target in the default compatibility path. `ssh` provides a full shell. Single-label jump hosts must be configured nodes/aliases; FQDN, IP, and explicit `host:port` can identify direct jumps.
 
 Text conversion is local:
 

@@ -135,7 +135,7 @@ scp_save_config_failed:
 exec_short:
   other: "对一个或多个远程主机执行命令"
 exec_long:
-  other: "对一个或多个远程主机执行命令。支持批量执行和提权。默认兼容模式要求远端 Bash；--no-login 仍使用 Bash。普通命令可显式使用 --interpreter server 原样发送 SSH exec，或 --interpreter bash --launch-dialect posix 选择 Bash。显式模式暂只支持缓冲输出，不支持脚本、PTY、sudo、--stream 或 --out-dir；总时限 5 分钟，保留最后 5 MiB 输出。\n\n用法示例（兼容 OpenSSH 风格）:\n  xops exec -l root -p 22 192.168.1.11 \"uptime\"\n  xops exec -i ~/.ssh/id_rsa -J bastion.example.com 192.168.1.11 \"df -h\"\n  xops exec root@192.168.1.11 \"uptime\"\n\n批量执行:\n  xops exec --host host1,host2 -c \"uptime\"\n  xops exec --tag web -c \"uptime\"\n  xops exec -I hosts.txt --shell script.sh\n\n连接目标语义说明:\n  显式指定的 user 和 port 优先完整匹配，自动复用已有 Host 并严格隔离 Identity，与 ssh/sftp/scp 行为一致。\n  跳板机(-J/ProxyJump)解析策略：优先匹配已有 Node、Alias 或 ~/.ssh/config Host；直连跳板明确要求使用 Node/Alias、FQDN、IP 或 host:port；未加端口的单标签主机名须先配置为 Node/Alias。\n  --host、--ifile (-I) 和 --tag 互斥，只能选择一种，再用 --exclude 排除部分目标。"
+  other: "对一个或多个远程主机执行命令。支持批量执行和提权。默认兼容模式要求远端 Bash；--no-login 仍使用 Bash。普通命令可显式使用 --interpreter server 原样发送 SSH exec，或 --interpreter bash --launch-dialect posix 选择 Bash。显式模式支持缓冲或单主机 PTY 命令，不支持脚本、sudo、--stream 或 --out-dir；总时限 5 分钟，缓冲模式保留最后 5 MiB 输出。新 PTY 原生输出暂支持 Linux 终端/管道，不支持普通文件重定向。\n\n用法示例（兼容 OpenSSH 风格）:\n  xops exec -l root -p 22 192.168.1.11 \"uptime\"\n  xops exec -i ~/.ssh/id_rsa -J bastion.example.com 192.168.1.11 \"df -h\"\n  xops exec root@192.168.1.11 \"uptime\"\n\n批量执行:\n  xops exec --host host1,host2 -c \"uptime\"\n  xops exec --tag web -c \"uptime\"\n  xops exec -I hosts.txt --shell script.sh\n\n连接目标语义说明:\n  显式指定的 user 和 port 优先完整匹配，自动复用已有 Host 并严格隔离 Identity，与 ssh/sftp/scp 行为一致。\n  跳板机(-J/ProxyJump)解析策略：优先匹配已有 Node、Alias 或 ~/.ssh/config Host；直连跳板明确要求使用 Node/Alias、FQDN、IP 或 host:port；未加端口的单标签主机名须先配置为 Node/Alias。\n  --host、--ifile (-I) 和 --tag 互斥，只能选择一种，再用 --exclude 排除部分目标。"
 flag_exec_sudo:
   other: "使用sudo执行"
 flag_exec_cmd:
@@ -151,7 +151,7 @@ flag_exec_task:
 flag_exec_no_login:
   other: "不加载登陆shell (用于避免欢迎信息/MOTD等干扰)"
 flag_exec_interpreter:
-  other: "普通命令解释器：server（原样 SSH exec）或 bash；显式模式使用有界缓冲输出"
+  other: "普通命令解释器：server（原样 SSH exec）或 bash；显式模式支持有界缓冲或 Linux PTY 输出"
 flag_exec_launch_dialect:
   other: "服务端启动方言：unknown、posix、powershell 或 cmd；显式 Bash 要求 posix"
 flag_exec_login_shell:

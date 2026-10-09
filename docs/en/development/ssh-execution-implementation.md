@@ -4,7 +4,7 @@ Based on the [SSH execution and interpreter compatibility design](./ssh-executio
 
 ## Delivery Order
 
-### P1-A: Command Plans and Bounded Execution Foundations (Current Batch)
+### P1-A: Command Plans and Bounded Execution Foundations (Complete)
 
 - [x] Add immutable command plans: unchanged server payloads, Bash with a known POSIX launch dialect, login-option validation, input snapshots, and plan digests
 - [x] Add an execution API with finite stdin and bounded combined output; bound channel creation, exec requests, execution, and closure, and join every worker after cancellation
@@ -15,12 +15,15 @@ Based on the [SSH execution and interpreter compatibility design](./ssh-executio
 
 This batch's new API accepts finite input and internal memory output only, without uncancelable external readers/writers. Defaults are a 5-minute total timeout, a 10-second startup timeout (inheriting the connector's handshake timeout), and a 1-second shutdown grace period. Core callers may shorten or specify the total timeout. Limits are 64 KiB each for the original command and quoted exec payload, 16 MiB of stdin, a default output window retaining the last 5 MiB, and a maximum output window of 64 MiB. At the window limit, continue draining and explicitly report truncation. These limits apply to the new API; this batch does not switch old API defaults.
 
-### P1-B: Unify Existing Entry Points and Fix Interactive Execution
+### P1-B: Unify Existing Entry Points and Fix Interactive Execution (In Progress)
 
 - [ ] Delegate Run, RunWithoutLogin, RunCommandWithIO, and legacy Bash scripts to unified plans while retaining their individual login defaults
 - [ ] Provide cancelable output bridges for terminals/pipes; migrate streaming/file output and SSH CLI while preserving stdin ownership and EOF contracts
-- [ ] Bound PTY/Shell request lifecycles; distinguish full login sessions from one-shot PTY commands and propagate exit status for ordinary/root/passwordless/password sudo/su commands
-- [ ] Apply new CLI options to PTY execution; distinguish explicit empty commands from absent commands and define shell-session option scope
+- [x] Bound session creation, exec/PTY/Shell requests, and closure; legacy exec/script/I/O/escalation/RunStream startup requests share this lifecycle
+- [x] Preserve nonzero, signal, and missing exit status for ordinary/root/passwordless/password sudo/su one-shot PTY commands; retain full login-session policy and pass terminal-restoration/stdin EOF regressions
+- [x] Accept ContextWriter/memory output in the new PTY API; Linux terminals/pipes use independent nonblocking handles without closing caller streams or changing their flags on cancellation
+- [x] Apply new exec interpreter options to PTY and honor ordinary PTY --no-login; reject ignored script/stream/out-dir/privileged no-login combinations before execution; explicit empty SSH commands do not become shells/scripts
+- [ ] Migrate SSH CLI interpreter options, non-PTY native shells, and configuration inheritance
 - [ ] Declare P1 complete only after full build/test/lint and SSH/I/O race and leak regressions pass
 
 ### P2-A: Configuration and Caller Bindings
@@ -62,3 +65,23 @@ The P1-A items above are complete. Main implementations are in `core/ssh/command
 - `python3 scripts/check_core.py`: Linux/Windows/macOS dependency boundaries passed; the independently extracted module passed build/tests
 
 Native Windows execution, Bash-free Unix adapters, PTY/escalation, and unification of existing entry points remain subsequent acceptance work. Cross-platform dependency inspection does not establish that validation. The next batch starts P1-B with legacy-method delegation, cancelable I/O bridges, and PTY exit-status fixes.
+
+## First P1-B Batch Validation Record (2026-10-09)
+
+This batch completes the checked request/PTY items above without declaring P1-B or P1 complete. `session_lifecycle.go` unifies PTY/Shell lifecycles and legacy request deadlines. One-shot command exits are no longer suppressed using full login-session policy. `RunInteractivePlanWithIO` uses finite or cancelable output; Linux terminal/pipe handles belong to the bridge and cancellation leaves the caller's original streams intact.
+
+Validation covers ordinary/root/passwordless sudo/password sudo/su nonzero, signal, and missing exit status; fragmented authentication/terminal handoff and first-character preservation; unanswered exec/PTY/Shell requests; terminal restoration, stdin EOF, blocked output-pipe cancellation, output-drain deadlines, file flags/ownership, rejecting unsupported writers before execution, and CLI option/empty-command validation.
+
+- `go build ./...`, `go test ./...`, `golangci-lint run ./...`: passed, 0 lint issues
+- `go test -race ./core/ssh ./cmd`: passed; full core and targeted race regressions for the final output-deadline classification change passed
+- Blocked-pipe cancellation test repeated 10 times: passed
+- `npm run docs:build`: passed
+- `python3 scripts/check_core.py`: three-platform dependency boundaries and isolated-module build/tests passed
+
+Remaining P1-B work includes delegating legacy Run/script/I/O methods to unified plans, migrating legacy streaming/file output and SSH CLI, and validating output bridges for other client platforms and regular files. Legacy output entry points still accept ordinary writers; request deadlines do not establish that their output callbacks are cancelable. New native PTY output exposes only Linux terminals/pipes. Other combinations are explicitly rejected without fallback or replay.
+
+### P1-B Review Fix: Output Lifecycle
+
+If input-bridge initialization fails, cancel input/cancelable output and use the already-started Session.Wait to confirm session exit. If the peer never acknowledges closure, interrupt the transport after the grace period, then join stdout/stderr. Output-copy failures are monitored concurrently with remote completion through a separate notification channel. Broken pipes and write timeouts cancel the session and use the same bounded cleanup without waiting for the full command timeout. Retain the original input/output errors and never replay the command.
+
+Regressions suspend server transport reads so that channel-close requests actually cannot be acknowledged. They also cover continued output beyond the SSH receive window, a real broken pipe, write timeouts, terminal restoration, caller stream ownership, and worker cleanup. The new cases failed before the fix and pass afterward.

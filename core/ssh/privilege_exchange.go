@@ -250,7 +250,7 @@ func (c *Client) runPrivilegeAttempt(ctx context.Context, mode SudoMode, command
 	if err != nil {
 		return err
 	}
-	defer joinResourceCloseError(&retErr, session, "privilege session")
+	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
 	exchange.session = session
 	if mode == SudoModeSu || terminal != nil {
 		width, height := 40, 80
@@ -259,7 +259,9 @@ func (c *Client) runPrivilegeAttempt(ctx context.Context, mode SudoMode, command
 			width, height = terminal.width, terminal.height
 			ptyType = "xterm-256color"
 		}
-		if err := session.RequestPty(ptyType, height, width, cryptoSSH.TerminalModes{cryptoSSH.ECHO: 0}); err != nil {
+		if err := c.sessionRequest(ctx, session, "privilege pty", func() error {
+			return session.RequestPty(ptyType, height, width, cryptoSSH.TerminalModes{cryptoSSH.ECHO: 0})
+		}); err != nil {
 			return fmt.Errorf("request su terminal: %w", err)
 		}
 	}
@@ -267,7 +269,9 @@ func (c *Client) runPrivilegeAttempt(ctx context.Context, mode SudoMode, command
 	if err != nil {
 		return err
 	}
-	defer joinResourceCloseError(&retErr, pipe, "privilege stdin")
+	defer func() {
+		retErr = errors.Join(retErr, c.closeSessionBounded(session), closeResource(pipe, "privilege stdin"))
+	}()
 	work, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -440,21 +444,12 @@ func (e *privilegeExchange) body(command string) string {
 
 // Bound the exec request itself; a server may never reply to session.Start.
 func (c *Client) startPrivilegeSession(ctx context.Context, session *cryptoSSH.Session, command string) error {
-	startCtx, cancel := withTimeoutOrDefault(ctx, c.handshakeTimeout, defaultSSHHandshakeTimeout)
-	defer cancel()
-	done := make(chan error, 1)
-	go func() { done <- session.Start(command) }()
-	select {
-	case err := <-done:
-		return err
-	case <-startCtx.Done():
-		return c.closeCanceledSession(startCtx, session, done)
-	}
+	return c.sessionRequest(ctx, session, "privilege exec", func() error { return session.Start(command) })
 }
 
 func (e *privilegeExchange) interactiveWaitError(err error) error {
 	// Output, stdin, restoration, and close errors are retained separately in
-	// privilegeOutcome; suppress only the legacy interactive process-exit result.
+	// privilegeOutcome; suppress only a full login session's process-exit result.
 	if e.terminal != nil && e.terminal.ignoreExit && e.outputReady() {
 		var exitErr *cryptoSSH.ExitError
 		if errors.As(err, &exitErr) {

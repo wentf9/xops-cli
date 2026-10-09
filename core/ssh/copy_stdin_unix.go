@@ -59,6 +59,13 @@ func copyStdinTo(src *os.File, dst io.Writer) (cancel func() error, done <-chan 
 			if fds[1].Revents&(unix.POLLIN|unix.POLLHUP) != 0 {
 				return
 			}
+			if fds[0].Revents&(unix.POLLERR|unix.POLLNVAL) != 0 {
+				copyErr = fmt.Errorf("stdin poll reported invalid or failed descriptor")
+				return
+			}
+			if fds[0].Revents&unix.POLLHUP != 0 && fds[0].Revents&unix.POLLIN == 0 {
+				return
+			}
 			if fds[0].Revents&unix.POLLIN != 0 {
 				n, err := unix.Read(stdinFd, buf)
 				if n > 0 {

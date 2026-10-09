@@ -1,6 +1,6 @@
 # SSH 多解释器执行与兼容性设计
 
-状态：分阶段实施中。源码分析基线为 `c1851bc`。P1-A 已实现有限 stdin/有界输出的 command 计划与 core 执行 API，以及 CLI exec 普通命令的显式 server/Bash 选项；其余执行配置、脚本/PTY/提权迁移、MCP 扩展字段和默认值切换仍为拟议接口。进度与限制见[实施计划](./ssh-execution-implementation.md)，已安装版本以帮助信息为准。
+状态：分阶段实施中。源码分析基线为 `c1851bc`。P1-A 已实现有限 stdin/有界输出的 command 计划与 core 执行 API，以及 CLI exec 普通命令的显式 server/Bash 选项；P1-B 首批已补齐请求期限、PTY 退出状态和 exec 显式 PTY，并提供 Linux 终端/管道的可取消输出；旧入口的计划/输出迁移、SSH CLI 新参数、其他平台原生输出桥、执行配置、MCP 扩展字段和默认值切换仍待实施。进度与限制见[实施计划](./ssh-execution-implementation.md)，已安装版本以帮助信息为准。
 
 目标是移除普通命令对 Bash 的隐式依赖，并统一 CLI、MCP、Playbook、SFTP 命令和提权路径的执行语义。当前版本的实际用法仍以[命令执行指南](../guide/exec.md)和已安装版本的帮助为准。
 
@@ -24,7 +24,7 @@
 | --- | --- | --- |
 | `xops exec` 普通命令 | `Client.Run` 使用 `bash -l -c`，`--no-login` 改用 `bash -c` | 支持原样发送，明确旧登录环境差异 |
 | `exec --shell FILE`、exec stdin 脚本 | `RunScript` 将内容送给 `bash -l -s` 或 `bash -s` | 分离脚本解释器与脚本输入，当前 shebang 不决定解释器 |
-| `exec -x` | PTY 加 `RunInteractive` 的登录 Bash；当前未传递 `NoLoginShell`，且会吞掉命令的非零退出状态 | PTY 与解释器独立，修复退出状态传播，统一登录选项的校验与生效范围 |
+| `exec -x` | PTY 加 `RunInteractive` 的登录 Bash；基线未传递 `NoLoginShell`，且会吞掉命令的非零退出状态 | PTY 与解释器独立，修复退出状态传播，统一登录选项的校验与生效范围 |
 | `ssh HOST COMMAND` | `RunCommandWithIO` 包装 `bash -c` | 原样命令与用户 stdin 分开处理 |
 | 有终端的 `ssh HOST` | `ShellWithIO` 发送 SSH `shell` 请求 | 保留服务端 Shell 语义，不额外包装 |
 | 无命令且 stdin 为管道的 `ssh HOST` | 空命令路径启动 Bash 读取输入 | 显式区分非 PTY Shell 会话与已指定解释器的脚本，不能发送空 exec 请求 |
@@ -98,7 +98,7 @@ POSIX `shellQuote` 不作为跨平台通用函数。PowerShell 的编码载荷�
 
 新增 `--interpreter`、`--launch-dialect`，新增 `--login-shell` 控制显式解释器的登录环境。启动方言取 `posix`、`powershell`、`cmd` 或 `unknown`；缺省从配置继承，否则为 unknown，不能由本地系统或内部解释器推断。`--shell` 已表示本地脚本文件，`--login`/`-l` 已表示 SSH 用户，两者不得重用。
 
-以下示例描述最终接口，其中普通缓冲命令的 server/Bash 路径已在 P1-A 实现；sh、脚本与 PTY 的新选项仍待实现。第一个示例显式写出最终目标默认值，以便在迁移期使用：
+以下示例描述最终接口，其中普通缓冲命令的 server/Bash 路径已在 P1-A 实现；P1-B 首批还开放了具有已验收输出能力的显式 PTY；sh 与脚本的新选项仍待实现。第一个示例显式写出最终目标默认值，以便在迁移期使用：
 
 ```bash
 xops exec --host alpine-01 --interpreter server -c 'uname -a'
@@ -274,7 +274,7 @@ P3 的版本号由验收后的发布计划指定，不预先声称任何已发�
 
 默认切换回退可使用上述显式配置，或回退到已支持 execution schema 的兼容版本。基线配置读取使用 `KnownFields(true)`，新增字段落盘后直接换回不支持它的旧二进制会拒绝整份配置；更早版本回退需先恢复对应备份或受控导出兼容配置，并验证语义差异。不能把“回退发布”当作任意版本均可直接降级，也不提供运行中失败回退。
 
-当前状态：P1-A 命令基础已实现，P1-B 及 P2/P3 待实施；P1 尚未整体完成。本文描述最终契约，当前可用的 CLI 子集及限额以[执行指南](../guide/exec.md)和实施计划为准。
+当前状态：P1-A 已完成，P1-B 首批请求/PTY 改造已实现，旧方法与输出桥迁移仍在进行中，P2/P3 待实施；P1 尚未整体完成。本文描述最终契约，当前可用的 CLI 子集及限额以[执行指南](../guide/exec.md)和实施计划为准。
 
 ## 10. 验证与验收
 

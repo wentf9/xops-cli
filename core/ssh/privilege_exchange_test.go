@@ -19,15 +19,16 @@ import (
 )
 
 type privilegeServerOptions struct {
-	mode             SudoMode
-	password         string
-	noPrompt         bool
-	status           uint32
-	blockExecReply   bool
-	banner           string
-	withholdTerminal bool
-	inputBytes       int
-	sudoRSPrompt     string
+	blockPtyReply, exitSignal, missingExit bool
+	mode                                   SudoMode
+	password                               string
+	noPrompt                               bool
+	status                                 uint32
+	blockExecReply                         bool
+	banner                                 string
+	withholdTerminal                       bool
+	inputBytes                             int
+	sudoRSPrompt                           string
 }
 type privilegeServerEvidence struct {
 	commands         atomic.Int32
@@ -141,6 +142,12 @@ func servePrivilegeExchange(t *testing.T, channel cryptoSSH.Channel, requests <-
 	}()
 	for req := range requests {
 		if req.Type == "pty-req" {
+			if opts.blockPtyReply {
+				if _, err := io.Copy(io.Discard, channel); err != nil && !errors.Is(err, io.EOF) {
+					t.Log(err)
+				}
+				return
+			}
 			var pty struct {
 				Term                                   string
 				Columns, Rows, PixelWidth, PixelHeight uint32
@@ -246,8 +253,28 @@ func servePrivilegeCommand(t *testing.T, channel cryptoSSH.Channel, command stri
 	if _, err := io.WriteString(channel, "command output: su: Authentication failure\n"); err != nil {
 		return
 	}
+	sendPrivilegeCommandResult(t, channel, opts)
+}
+
+func sendPrivilegeCommandResult(t *testing.T, channel cryptoSSH.Channel, opts privilegeServerOptions) {
+	t.Helper()
+	if opts.missingExit {
+		return
+	}
+	if opts.exitSignal {
+		_, err := channel.SendRequest("exit-signal", false, cryptoSSH.Marshal(struct {
+			Signal            string
+			CoreDumped        bool
+			Message, Language string
+		}{"TERM", false, "", ""}))
+		if err != nil {
+			t.Log(err)
+		}
+		return
+	}
 	sendPrivilegeStatus(t, channel, opts.status)
 }
+
 func sendPrivilegeStatus(t *testing.T, channel cryptoSSH.Channel, status uint32) {
 	t.Helper()
 	if _, err := channel.SendRequest("exit-status", false, cryptoSSH.Marshal(struct{ Status uint32 }{status})); err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {

@@ -1,6 +1,6 @@
 # SSH Interpreter and Execution Compatibility Design
 
-Status: implementation in stages. The source analysis baseline is `c1851bc`. P1-A implements command plans and a core execution API with finite stdin/bounded output, plus explicit server/Bash options for ordinary CLI exec commands. Remaining execution configuration, script/PTY/escalation migration, MCP extension fields, and default changes are still proposed. See the [implementation plan](./ssh-execution-implementation.md) for progress and restrictions, and installed help for release availability.
+Status: implementation in stages. The source analysis baseline is `c1851bc`. P1-A implements command plans and a core execution API with finite stdin/bounded output, plus explicit server/Bash options for ordinary CLI exec commands. The first P1-B batch adds bounded requests, PTY exit-status propagation, explicit exec PTY commands, and cancelable Linux terminal/pipe output. Legacy plan/output delegation, SSH CLI options, native output bridges on other platforms, execution configuration, MCP extension fields, and default changes remain pending. See the [implementation plan](./ssh-execution-implementation.md) for progress and restrictions, and installed help for release availability.
 
 The goal is to remove the implicit Bash dependency from ordinary commands and give CLI, MCP, Playbook, SFTP commands, and privilege escalation consistent execution semantics. For current usage, refer to the [command execution guide](../guide/exec.md) and the installed version's help.
 
@@ -24,7 +24,7 @@ Sending a command unchanged does not bypass the server's shell. The SSH `exec` p
 | --- | --- | --- |
 | Ordinary `xops exec` commands | `Client.Run` uses `bash -l -c`; `--no-login` switches to `bash -c` | Support unchanged command forwarding and document differences from the old login environment |
 | `exec --shell FILE` and exec stdin scripts | `RunScript` sends content to `bash -l -s` or `bash -s` | Separate the script interpreter from script input; the current shebang does not select the interpreter |
-| `exec -x` | PTY plus login Bash through `RunInteractive`; currently does not pass `NoLoginShell` and suppresses nonzero command exit statuses | Keep PTY independent of the interpreter, fix exit-status propagation, and apply consistent login-option validation and scope |
+| `exec -x` | PTY plus login Bash through `RunInteractive`; the baseline did not pass `NoLoginShell` and suppressed nonzero command exit statuses | Keep PTY independent of the interpreter, fix exit-status propagation, and apply consistent login-option validation and scope |
 | `ssh HOST COMMAND` | `RunCommandWithIO` wraps the command in `bash -c` | Handle the unchanged command separately from user stdin |
 | `ssh HOST` with a terminal | `ShellWithIO` sends an SSH `shell` request | Preserve server shell semantics without another wrapper |
 | `ssh HOST` with no command and piped stdin | The empty-command path starts Bash to read input | Explicitly distinguish a non-PTY shell session from a script with a specified interpreter; do not send an empty exec request |
@@ -98,7 +98,7 @@ The unified layer must close cancellation gaps in the baseline. The existing `st
 
 Add `--interpreter`, `--launch-dialect`, and `--login-shell`, with the latter controlling the login environment of an explicit interpreter. Launch dialect accepts `posix`, `powershell`, `cmd`, or `unknown`. If unspecified, inherit it from configuration or use unknown; do not infer it from the local OS or inner interpreter. `--shell` already denotes a local script file, and `--login`/`-l` already denotes the SSH user; neither may be repurposed.
 
-The following examples describe the final interface. P1-A implements server/Bash for ordinary buffered commands; new options for sh, scripts, and PTY remain pending. The first example states the eventual default explicitly so that it can be used during migration:
+The following examples describe the final interface. P1-A implements server/Bash for ordinary buffered commands; The first P1-B batch also exposes explicit PTY with validated output capabilities; sh and script options remain pending. The first example states the eventual default explicitly so that it can be used during migration:
 
 ```bash
 xops exec --host alpine-01 --interpreter server -c 'uname -a'
@@ -274,7 +274,7 @@ Migrate compatibility configuration by operation kind. Ordinary commands can be 
 
 Roll back the default switch through the explicit configuration above or a compatible release that already supports the execution schema. Baseline configuration loading uses `KnownFields(true)`: after new fields have been persisted, an older binary that does not support them rejects the entire configuration. Rolling back further requires restoring the corresponding backup or exporting compatible configuration through a controlled process and validating semantic differences. A release rollback does not imply direct downgrades to arbitrary versions, and there is no fallback after a running command fails.
 
-Current status: P1-A command foundations are implemented; P1-B and P2/P3 remain pending. P1 is not complete as a whole. This document describes the final contract; see the [execution guide](../guide/exec.md) and implementation plan for the currently available CLI subset and limits.
+Current status: P1-A is complete and the first P1-B request/PTY batch is implemented. Legacy-method/output-bridge migration is in progress, while P2/P3 remain pending. P1 is not complete as a whole. This document describes the final contract; see the [execution guide](../guide/exec.md) and implementation plan for the currently available CLI subset and limits.
 
 ## 10. Verification and Acceptance
 

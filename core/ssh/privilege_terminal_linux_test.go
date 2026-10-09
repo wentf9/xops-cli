@@ -72,18 +72,19 @@ func (h *canonicalPrivilegeUI) PromptSecret(ctx context.Context, req SecretReque
 
 func TestInteractivePrivilegePTYRestoresModeAndFirstInput(t *testing.T) {
 	for _, test := range []struct {
-		mode  SudoMode
-		shell bool
-	}{{SudoModeSudo, false}, {SudoModeSu, false}, {SudoModeSudo, true}, {SudoModeSu, true}} {
+		mode                   SudoMode
+		shell, signal, missing bool
+	}{{SudoModeSudo, false, false, false}, {SudoModeSu, false, false, false}, {SudoModeSudo, true, false, false}, {SudoModeSu, true, false, false},
+		{SudoModeSudo, false, true, false}, {SudoModeSu, false, true, false}, {SudoModeSudo, false, false, true}, {SudoModeSu, false, false, true}} {
 		mode := test.mode
-		t.Run(string(mode)+"/shell="+strconv.FormatBool(test.shell), func(t *testing.T) {
+		t.Run(fmt.Sprintf("%s/shell=%t/signal=%t/missing=%t", mode, test.shell, test.signal, test.missing), func(t *testing.T) {
 			setTestHome(t)
 			master, slave := openPrivilegeTestPTY(t)
 			before, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
 			if err != nil {
 				t.Fatal(err)
 			}
-			addr, evidence := startPrivilegeExchangeServer(t, privilegeServerOptions{mode: mode, password: "valid", status: 7, inputBytes: 1})
+			addr, evidence := startPrivilegeExchangeServer(t, privilegeServerOptions{mode: mode, password: "valid", status: 7, inputBytes: 1, exitSignal: test.signal, missingExit: test.missing})
 			ui := &canonicalPrivilegeUI{recoveryTestUI: recoveryTestUI{values: []string{"wrong", "valid"}}, terminal: slave}
 			recorder := &testRecorder{}
 			client := exchangeTestClient(t, addr, mode, ui, recorder)
@@ -115,9 +116,7 @@ func TestInteractivePrivilegePTYRestoresModeAndFirstInput(t *testing.T) {
 			if err := <-sent; err != nil {
 				t.Fatal(err)
 			}
-			if runErr != nil {
-				t.Fatal(runErr)
-			}
+			assertTerminalExit(t, runErr, 7, test.signal, test.missing, test.shell)
 			after, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
 			if err != nil || *before != *after {
 				t.Fatalf("terminal mode not restored: %v", err)

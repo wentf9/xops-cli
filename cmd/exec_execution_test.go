@@ -37,10 +37,10 @@ func TestExecExplicitExecutionOptions(t *testing.T) {
 		{"server explicit false", []string{"--interpreter", "server", "--login-shell=false"}, "", "inherited login"},
 		{"server no-login", []string{"--interpreter", "server", "--no-login"}, "", "requires the bash"},
 		{"login conflict", []string{"--interpreter", "bash", "--launch-dialect", "posix", "--no-login", "--login-shell"}, "", "mutually exclusive"},
-		{"PTY", []string{"--interpreter", "server", "-x"}, "", "ordinary buffered"},
-		{"sudo", []string{"--interpreter", "server", "--sudo"}, "", "ordinary buffered"},
-		{"stream", []string{"--interpreter", "server", "--stream"}, "", "ordinary buffered"},
-		{"file output", []string{"--interpreter", "server", "--out-dir", "logs"}, "", "ordinary buffered"},
+		{"PTY", []string{"--interpreter", "server", "-x"}, "echo '$HOME'", ""},
+		{"sudo", []string{"--interpreter", "server", "--sudo"}, "", "buffered or PTY"},
+		{"stream", []string{"--interpreter", "server", "--stream"}, "", "buffered or PTY"},
+		{"file output", []string{"--interpreter", "server", "--out-dir", "logs"}, "", "buffered or PTY"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			o := NewExecOptions()

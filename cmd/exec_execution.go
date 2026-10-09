@@ -40,8 +40,8 @@ func (o *ExecOptions) prepareCommandPlan() error {
 	if !o.execution.enabled() {
 		return nil
 	}
-	if o.Interactive || o.Sudo || o.ShellFile != "" || o.stdinScript || o.Stream || o.OutDir != "" {
-		return fmt.Errorf("explicit execution currently supports ordinary buffered commands only, without scripts, PTY, sudo, --stream or --out-dir")
+	if o.Sudo || o.ShellFile != "" || o.stdinScript || o.Stream || o.OutDir != "" {
+		return fmt.Errorf("explicit execution currently supports buffered or PTY commands only, without scripts, sudo, --stream or --out-dir")
 	}
 	options, err := o.execution.commandOptions(o.NoLoginShell)
 	if err != nil {
