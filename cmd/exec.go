@@ -36,6 +36,8 @@ type ExecOptions struct {
 	OutDir       string
 
 	stdinScript bool
+	execution   execExecutionOptions
+	commandPlan *ssh.CommandPlan
 
 	stdout io.Writer
 	stderr io.Writer
@@ -94,6 +96,7 @@ func newCmdExecWithOptions(o *ExecOptions) *cobra.Command {
 	cmd.Flags().IntVar(&o.TaskCount, "task", 3, i18n.T("flag_exec_task"))
 	cmd.Flags().BoolVarP(&o.Interactive, "interactive", "x", false, i18n.T("flag_exec_interactive"))
 	cmd.Flags().BoolVar(&o.NoLoginShell, "no-login", false, i18n.T("flag_exec_no_login"))
+	o.execution.register(cmd)
 	cmd.Flags().BoolVar(&o.Stream, "stream", false, i18n.T("flag_exec_stream"))
 	cmd.Flags().StringVar(&o.OutDir, "out-dir", "", i18n.T("flag_exec_out_dir"))
 
@@ -171,6 +174,27 @@ func (o *ExecOptions) extractHostFromArgs(args []string) error {
 
 func (o *ExecOptions) Complete(cmd *cobra.Command, args []string) error {
 	o.args = args
+	o.execution.capturePresence(cmd)
+	if cmd != nil && cmd.Flags().Changed("cmd") && o.Command == "" {
+		return fmt.Errorf("explicit command must not be empty")
+	}
+	if len(args) > 0 {
+		var err error
+		if o.Command == "" && o.ShellFile == "" {
+			err = o.extractCommandFromArgs(args)
+		} else {
+			err = o.extractHostFromArgs(args)
+		}
+		if err != nil {
+			return err
+		}
+		if o.Command == "" && args[len(args)-1] == "" {
+			return fmt.Errorf("explicit command must not be empty")
+		}
+	}
+	if err := o.prepareCommandPlan(); err != nil {
+		return err
+	}
 	if o.PasswordStdin {
 		pwd, err := utils.ReadSecretFromStdin()
 		if err != nil {
@@ -184,19 +208,6 @@ func (o *ExecOptions) Complete(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("read passphrase from stdin: %w", err)
 		}
 		o.Passphrase = pass
-	}
-	if len(args) == 0 {
-		o.readStdinIfRequired()
-		return nil
-	}
-	var err error
-	if o.Command == "" && o.ShellFile == "" {
-		err = o.extractCommandFromArgs(args)
-	} else {
-		err = o.extractHostFromArgs(args)
-	}
-	if err != nil {
-		return err
 	}
 	o.readStdinIfRequired()
 	return nil
@@ -216,6 +227,9 @@ func (o *ExecOptions) readStdinIfRequired() {
 }
 
 func (o *ExecOptions) Validate() error {
+	if err := o.prepareCommandPlan(); err != nil {
+		return err
+	}
 	if err := utils.ValidateRememberPolicy(o.Remember); err != nil {
 		return err
 	}
@@ -478,6 +492,9 @@ func (o *ExecOptions) getOrCreateNode(ctx context.Context, repository *config.Re
 }
 
 func (o *ExecOptions) executeTask(ctx context.Context, connector *ssh.Connector, t execHostTask, execCmd string, isScript bool, totalTasks int, stdoutMu *sync.Mutex) (retErr error) {
+	if o.commandPlan != nil {
+		return o.executePlannedTask(ctx, connector, t, execCmd, isScript, stdoutMu)
+	}
 	client, err := connector.Connect(ctx, t.nodeID)
 	if err != nil {
 		return fmt.Errorf("[%s] connect failed: %w", t.host, err)
