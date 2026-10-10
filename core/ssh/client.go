@@ -259,6 +259,14 @@ func NewTestClient(connCfg ConnectionConfig) *Client {
 	}
 }
 
+// NewTestClientWithRaw creates a Client for unit testing with an underlying raw SSH client.
+func NewTestClientWithRaw(rawClient *ssh.Client, connCfg ConnectionConfig) *Client {
+	return &Client{
+		sshClient: rawClient,
+		connCfg:   connCfg,
+	}
+}
+
 type RunConfig struct {
 	Interpreter  Interpreter
 	LoginShell   bool
@@ -343,9 +351,14 @@ func (c *Client) Run(ctx context.Context, cmd string, opts ...RunOption) (string
 		opt(config)
 	}
 
-	payload := bashCommandPayload(cmd, config.LoginShell)
-	if config.Interpreter == InterpreterSh {
+	var payload string
+	switch config.Interpreter {
+	case "", InterpreterBash:
+		payload = bashCommandPayload(cmd, config.LoginShell)
+	case InterpreterSh:
 		payload = shCommandPayload(cmd)
+	default:
+		return "", fmt.Errorf("%w: unsupported interpreter %q for Run (only bash and sh are supported)", ErrExecutionValidation, config.Interpreter)
 	}
 	return c.runRaw(ctx, payload, config)
 }
@@ -375,6 +388,16 @@ func (c *Client) RunScript(ctx context.Context, scriptContent string, opts ...Ru
 		opt(config)
 	}
 
+	var payload string
+	switch config.Interpreter {
+	case "", InterpreterBash:
+		payload = bashScriptPayload(config.LoginShell)
+	case InterpreterSh:
+		payload = shScriptPayload()
+	default:
+		return "", fmt.Errorf("%w: unsupported interpreter %q for RunScript (only bash and sh are supported)", ErrExecutionValidation, config.Interpreter)
+	}
+
 	session, err := c.newSessionContext(ctx)
 	if err != nil {
 		return "", fmt.Errorf("failed to create new session: %w", err)
@@ -383,10 +406,6 @@ func (c *Client) RunScript(ctx context.Context, scriptContent string, opts ...Ru
 
 	session.Stdin = strings.NewReader(scriptContent)
 
-	payload := bashScriptPayload(config.LoginShell)
-	if config.Interpreter == InterpreterSh {
-		payload = shScriptPayload()
-	}
 	return c.startWithTimeout(ctx, session, payload, config)
 }
 
@@ -400,6 +419,9 @@ func (c *Client) RunScriptWithExecution(ctx context.Context, content string, exe
 	}
 	if err := execution.Validate(); err != nil {
 		return "", err
+	}
+	if execution.Interpreter != "" && execution.Interpreter != InterpreterBash && execution.Interpreter != InterpreterSh {
+		return "", fmt.Errorf("%w: unsupported interpreter %q for RunScriptWithExecution (only bash and sh are supported)", ErrExecutionValidation, execution.Interpreter)
 	}
 	var opts []RunOption
 	if execution.Interpreter != "" {

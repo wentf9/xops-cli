@@ -138,15 +138,23 @@ MCP `xops_fs_cp` 在调用保持目录项语义的 `RemoteCopy` 之前，单独�
 
 本批完成上列 P2-B 全部适配器及高级操作条目：
 1. **sh 适配器与脚本协议**：支持 `InterpreterSh`（非登录 POSIX `sh -c` 与 `sh -s`）；shebang 白名单正确区分映射 `sh` 与 `bash`；非白名单 shebang 在缺少调用方显式覆盖时严格报错；执行前检测并拒绝包含 UTF-8 BOM（`\xef\xbb\xbf`）前缀的脚本；首行元数据解析安全忽略尾随 `\r` 且不改动正文原字节；`setupStdinPipeline` 严格拒绝脚本载荷与运行时 stdin 同时存在的情形。
-2. **Windows cmd/PowerShell/pwsh 适配器**：启动方言矩阵冻结（`cmd` 仅支持 `cmd` 方言，`powershell` 支持 `cmd`/`powershell`，`pwsh` 支持 `cmd`/`powershell`/`posix`）；PowerShell 使用 UTF-16LE Base64 编码载荷（`-EncodedCommand`）与 `-NoProfile -NonInteractive -ExecutionPolicy Bypass`；严格执行命令长度限制（`cmd` $\le 8191$，`PowerShell` $\le 32767$）；退出码协议冻结（`cmd` 保留 `%ERRORLEVEL%`，`PowerShell` 载荷注入 `$ErrorActionPreference = 'Stop'` 与 `$LASTEXITCODE` 判断）。
+2. **Windows cmd/PowerShell/pwsh 适配器**：启动方言矩阵冻结（`cmd` 仅支持 `cmd` 方言，`powershell` 支持 `cmd`/`powershell`，`pwsh` 支持 `cmd`/`powershell`/`posix`）；PowerShell 使用 UTF-16LE Base64 编码载荷（`-EncodedCommand`）与 `-NoProfile -NonInteractive -ExecutionPolicy Bypass`；在 `powershell` 启动方言下外层显式执行 `; exit $LASTEXITCODE` 确保子进程退出码不被外层转成 1；命令长度限制按启动方言校验（`LaunchCmd` 下限制为 8191 字符，`LaunchPowerShell`/`LaunchPOSIX` 为 32767 字符）；cmd 命令通过 `cmd.exe /d /s /c "..."` 完整包裹，保护 `&&`、`&`、`|` 等操作符在内层解释器中执行；退出码协议冻结（`cmd` 保留 `%ERRORLEVEL%`，`PowerShell` 载荷注入 `$ErrorActionPreference = 'Stop'` 与 `$LASTEXITCODE` 判断）。
 3. **Sudo/Su 控制协议与用户解释器分离**：sudo 提权控制 Shell 支持使用 `sh` 与 `bash` 承载，保持随机令牌、密码提示匹配、握手确认与退出恢复；配置化 su 严格拒绝并保留未配置的旧版语义。
-4. **SFTP 工作目录适配**：实现 `FormatWorkingDirCommand`，针对 POSIX（`cd -- '...' && ...`）、cmd（`cd /d "..." && ...`）、PowerShell（`Set-Location -LiteralPath '...' -ErrorAction Stop; ...`）提供严谨转义与路径安全防护；纯 `server` 模式在 cwd 非根目录时拒绝自动继承，防止破坏逐字执行承诺。
-5. **内置操作平台/解释器声明**：`MetricsCollector` 监控探针、sudo 自动探测、TUI 日志查看（`log_select` 与 `log_stream`）检测客户端执行配置并在非 POSIX 方言下提前报错；防火墙探测明确声明 Linux/POSIX 约束。
-6. **全量验收指标**：
+4. **SFTP 工作目录与执行适配**：`SSHAdapter.GetConfig` 完整合并传递节点及全局 `Execution` 配置至 `ClientConfig.Execution`，使正常 CLI 路径建立的 SSH 客户端具备节点执行上下文；实现 `FormatWorkingDirCommand`，针对 POSIX（`cd -- '...' && ...`）、cmd（`cd /d "..." && ...`）、PowerShell（`Set-Location -LiteralPath '...' -ErrorAction Stop; ...`）提供严谨转义与路径安全防护；纯 `server` 模式在非空 cwd 下拒绝自动继承，防止静默丢失工作目录；cmd 模式严格拒绝包含 `%`、`!`、`^`、`"` 等字符的工作目录；SFTP 交互模式与 batch 模式均通过 `ssh.PlanCommand` 构建载荷并分发给目标解释器适配器。
+5. **旧 Run API 与解释器边界**：旧版 `Run`、`RunScript`、`RunScriptWithExecution`、`RunWithSudo`、`RunScriptWithSudo`、`RunCommandWithIO` 严格限制为 `bash` 和 `sh`，对其他解释器明确返回 `ErrExecutionValidation`，禁止静默回退。
+6. **内置操作平台/解释器声明**：`MetricsCollector` 监控探针、sudo 自动探测、TUI 日志查看（`log_select` 与 `log_stream`）检测客户端执行配置并在非 POSIX 方言下提前报错；防火墙探测明确声明 Linux/POSIX 约束。
+7. **全量验收指标**：
    - `go build ./...`：通过
    - `go test ./...`：通过
    - `golangci-lint run ./...`：0 issues
    - 跨平台交叉编译：`GOOS=darwin GOARCH=arm64` 与 `GOOS=windows GOARCH=amd64` 均通过
    - `python3 scripts/check_core.py`：三平台依赖边界及抽取模块 build/test 全量通过
    - `npm run docs:build`：通过
+
+## P2-B 评审修复：cmd 两层引用、SFTP 输出兼容与 batch 登录语义（2026-10-10）
+
+1. **cmd 两层引用、操作符保护与环境变量拦截**：在 `cmdCommandPayload` 中实现 `escapeCmdCommand`，分析外层 cmd 在外层包裹双引号 `cmd.exe /d /s /c "<payload>"` 时的字符状态机。内层命令的双引号会使外层 cmd 退出引号模式，使内部操作符（`&`、`|`、`<`、`>`、`(`、`)`、`^`）暴露于外层解析（如 `echo "A&B"` 中的 `&` 或 `cwd` 中带有 `&` 的路径）。对处于外层非引用状态的操作符使用脱字符 `^` 进行转义（如 `^&`），由外层 cmd 消耗并原样还原给内层解释器。同时，由于外层 cmd 在解析命令行时会先展开 `%VAR%` 与 `!VAR!`，若变量包含双引号或操作符（如 `set X="A&echo OUTSIDE&rem "`），展开后会改变外层引用状态并突破保护执行额外命令；在实现可靠的内层变量机制前，统一拦截并拒绝所有含有 `%` 或 `!` 的环境变量展开（`ErrExecutionValidation`）。拒绝未闭合的奇数双引号与非法换行符/空字符。新增单元测试及 Wine 原生探测用例覆盖。
+2. **SFTP 未配置执行保留旧入口兼容性**：SFTP `handleExec` 在未配置 `execution`（`execCfg == nil`）时，保留旧入口兼容分发：交互模式调用 `RunInteractiveCmdWithIO`，batch 模式调用 `RunCommandWithIO`，避免直接进入要求非 Linux 原生文件可取消适配的严格输出接口（`RunCommandPlanWithIO` / `RunInteractivePlanWithIO`），确保 macOS 和 Windows 上终端与管道正常输出。
+3. **SFTP batch 执行保留非登录默认语义**：未配置 `execution` 时的 batch 执行通过旧入口执行非登录 `bash -c`；已配置且未显式指定 `login` 的 Bash batch 执行在规划时明确将 `opts.Login` 设置为 `LoginDisabled`，避免 `nil.CommandOptions()` 默认引入 `bash -l -c` 从而改变 PATH 或混入登录横幅。
+
 

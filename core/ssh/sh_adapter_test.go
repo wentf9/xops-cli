@@ -142,3 +142,45 @@ func TestSetupStdinPipeline_RejectsConflictingScriptAndRuntimeStdin(t *testing.T
 		t.Error("expected pipe to be closed on conflict error")
 	}
 }
+
+func TestLegacyRunAPIs_RejectUnsupportedInterpreters(t *testing.T) {
+	connCfg := ConnectionConfig{
+		Execution: &ExecutionConfig{
+			Interpreter:   InterpreterPowerShell,
+			LaunchDialect: LaunchCmd,
+		},
+	}
+	client := NewTestClient(connCfg)
+	ctx := context.Background()
+
+	// 1. Run rejects non-bash/sh interpreter
+	if _, err := client.Run(ctx, "Get-Date"); err == nil || !errors.Is(err, ErrExecutionValidation) {
+		t.Fatalf("expected Run to reject InterpreterPowerShell with ErrExecutionValidation, got: %v", err)
+	}
+
+	// 2. RunScript rejects non-bash/sh interpreter
+	if _, err := client.RunScript(ctx, "Get-Date"); err == nil || !errors.Is(err, ErrExecutionValidation) {
+		t.Fatalf("expected RunScript to reject InterpreterPowerShell with ErrExecutionValidation, got: %v", err)
+	}
+
+	// 3. RunScriptWithExecution rejects non-bash/sh interpreter
+	psExec := &ExecutionConfig{Interpreter: InterpreterPowerShell, LaunchDialect: LaunchCmd}
+	if _, err := client.RunScriptWithExecution(ctx, "Get-Date", psExec); err == nil || !errors.Is(err, ErrExecutionValidation) {
+		t.Fatalf("expected RunScriptWithExecution to reject InterpreterPowerShell with ErrExecutionValidation, got: %v", err)
+	}
+
+	// 4. RunWithSudo rejects non-bash/sh interpreter
+	if _, err := client.RunWithSudo(ctx, "Get-Date"); err == nil || !errors.Is(err, ErrExecutionValidation) {
+		t.Fatalf("expected RunWithSudo to reject InterpreterPowerShell with ErrExecutionValidation, got: %v", err)
+	}
+
+	// 5. RunScriptWithSudo rejects non-bash/sh interpreter
+	if _, err := client.RunScriptWithSudo(ctx, "Get-Date"); err == nil || !errors.Is(err, ErrExecutionValidation) {
+		t.Fatalf("expected RunScriptWithSudo to reject InterpreterPowerShell with ErrExecutionValidation, got: %v", err)
+	}
+
+	// 6. RunCommandWithIO rejects non-bash/sh interpreter
+	if err := client.RunCommandWithIO(ctx, "Get-Date", false, nil, nil, nil); err == nil || !errors.Is(err, ErrExecutionValidation) {
+		t.Fatalf("expected RunCommandWithIO to reject InterpreterPowerShell with ErrExecutionValidation, got: %v", err)
+	}
+}

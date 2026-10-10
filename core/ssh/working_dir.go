@@ -11,6 +11,9 @@ func FormatWorkingDirCommand(cwd, command string, execution *ExecutionConfig) (s
 	if cwd == "" {
 		return command, nil
 	}
+	if strings.ContainsAny(cwd, "\r\n\x00") {
+		return "", fmt.Errorf("%w: working directory contains illegal newline or null character", ErrExecutionValidation)
+	}
 	interp := InterpreterBash
 	if execution != nil && execution.EffectiveInterpreter() != "" {
 		interp = execution.EffectiveInterpreter()
@@ -18,18 +21,17 @@ func FormatWorkingDirCommand(cwd, command string, execution *ExecutionConfig) (s
 
 	switch interp {
 	case InterpreterServer:
-		if cwd != "/" {
-			return "", fmt.Errorf("%w: server interpreter does not support inheriting working directory %q", ErrExecutionValidation, cwd)
-		}
-		return command, nil
+		return "", fmt.Errorf("%w: server interpreter does not support inheriting working directory %q", ErrExecutionValidation, cwd)
 
 	case InterpreterBash, InterpreterSh:
 		escaped := strings.ReplaceAll(cwd, "'", "'\\''")
 		return fmt.Sprintf("cd -- '%s' && %s", escaped, command), nil
 
 	case InterpreterCmd:
-		escaped := strings.ReplaceAll(cwd, `"`, `\"`)
-		return fmt.Sprintf(`cd /d "%s" && %s`, escaped, command), nil
+		if strings.ContainsAny(cwd, "%!^\r\n\"\x00") {
+			return "", fmt.Errorf("%w: cmd working directory contains unsupported or expandable characters: %q", ErrExecutionValidation, cwd)
+		}
+		return fmt.Sprintf(`cd /d "%s" && %s`, cwd, command), nil
 
 	case InterpreterPowerShell, InterpreterPwsh:
 		escaped := strings.ReplaceAll(cwd, "'", "''")
