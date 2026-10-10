@@ -77,29 +77,40 @@ func newLogSelectModel(ctx context.Context, nodeID string, client *ssh.Client, s
 func (m logSelectModel) Init() tea.Cmd {
 	return tea.Batch(
 		textinput.Blink,
-		func() tea.Msg {
-			ctx, cancel := context.WithTimeout(m.ctx, 10*time.Second)
-			defer cancel()
-
-			cmd := `find /var/log -type f -name "*.log" 2>/dev/null | head -n 50`
-			// Include docker logs if docker exists
-			cmd += `; if command -v docker >/dev/null 2>&1; then docker ps --format 'docker:{{.Names}}' 2>/dev/null; fi`
-
-			out, err := m.client.RunWithoutLogin(ctx, cmd)
-			if err != nil {
-				return logScanResultMsg{err: err}
-			}
-
-			var files []string
-			lines := strings.Split(strings.TrimSpace(out), "\n")
-			for _, line := range lines {
-				if line = strings.TrimSpace(line); line != "" {
-					files = append(files, line)
-				}
-			}
-			return logScanResultMsg{files: files}
-		},
+		m.scanLogs(),
 	)
+}
+
+func (m logSelectModel) scanLogs() tea.Cmd {
+	return func() tea.Msg {
+		if execCfg := m.client.Execution(); execCfg != nil {
+			if execCfg.LaunchDialect == ssh.LaunchCmd || execCfg.LaunchDialect == ssh.LaunchPowerShell ||
+				execCfg.Interpreter == ssh.InterpreterCmd || execCfg.Interpreter == ssh.InterpreterPowerShell {
+				return logScanResultMsg{err: fmt.Errorf("log viewer requires Linux/POSIX platform, got incompatible execution config")}
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(m.ctx, 10*time.Second)
+		defer cancel()
+
+		cmd := `find /var/log -type f -name "*.log" 2>/dev/null | head -n 50`
+		// Include docker logs if docker exists
+		cmd += `; if command -v docker >/dev/null 2>&1; then docker ps --format 'docker:{{.Names}}' 2>/dev/null; fi`
+
+		out, err := m.client.RunWithoutLogin(ctx, cmd)
+		if err != nil {
+			return logScanResultMsg{err: err}
+		}
+
+		var files []string
+		lines := strings.Split(strings.TrimSpace(out), "\n")
+		for _, line := range lines {
+			if line = strings.TrimSpace(line); line != "" {
+				files = append(files, line)
+			}
+		}
+		return logScanResultMsg{files: files}
+	}
 }
 
 func (m logSelectModel) Update(msg tea.Msg) (logSelectModel, tea.Cmd) {

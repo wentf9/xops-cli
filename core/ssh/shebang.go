@@ -9,6 +9,7 @@ import (
 // ShebangInfo describes the result of parsing a script's shebang line.
 type ShebangInfo struct {
 	HasShebang  bool
+	HasBOM      bool
 	Supported   bool
 	Interpreter Interpreter
 	Dialect     LaunchDialect
@@ -22,23 +23,25 @@ func ParseShebang(data []byte) ShebangInfo {
 	if len(data) == 0 {
 		return ShebangInfo{}
 	}
+	hasBOM := bytes.HasPrefix(data, []byte("\xef\xbb\xbf"))
 	firstLine := data
 	if idx := bytes.IndexByte(data, '\n'); idx >= 0 {
 		firstLine = data[:idx]
 	}
 	trimmed := strings.TrimRight(string(firstLine), "\r \t")
 	if !strings.HasPrefix(trimmed, "#!") {
-		return ShebangInfo{}
+		return ShebangInfo{HasBOM: hasBOM}
 	}
 	body := strings.TrimSpace(trimmed[2:])
 	info := ShebangInfo{
 		HasShebang: true,
+		HasBOM:     hasBOM,
 		RawLine:    trimmed,
 	}
 	switch body {
 	case "sh", "/bin/sh", "/usr/bin/sh", "/bin/env sh", "/usr/bin/env sh":
 		info.Supported = true
-		info.Interpreter = InterpreterBash
+		info.Interpreter = InterpreterSh
 		info.Dialect = LaunchPOSIX
 	case "bash", "/bin/bash", "/usr/bin/bash", "/bin/env bash", "/usr/bin/env bash":
 		info.Supported = true
@@ -87,6 +90,10 @@ func stripServerInterpreter(cfg *ExecutionConfig) *ExecutionConfig {
 }
 
 func determineScriptInterpreter(step, settings, node, global *ExecutionConfig, scriptBytes []byte) (Interpreter, error) {
+	if bytes.HasPrefix(scriptBytes, []byte("\xef\xbb\xbf")) {
+		return "", fmt.Errorf("%w: script contains unsupported UTF-8 BOM prefix", ErrExecutionValidation)
+	}
+
 	stepInterp, err := resolveExplicitScriptInterpreter(step)
 	if err != nil {
 		return "", err
@@ -171,7 +178,7 @@ func validateResolvedScriptExecution(res *ExecutionConfig) (*ExecutionConfig, er
 	if err := res.Validate(); err != nil {
 		return nil, err
 	}
-	if res == nil || res.Interpreter != InterpreterBash {
+	if res == nil || (res.Interpreter != InterpreterBash && res.Interpreter != InterpreterSh) {
 		return nil, fmt.Errorf("%w: unsupported resolved script interpreter", ErrExecutionValidation)
 	}
 	plan, err := PlanCommand(":", res.CommandOptions())

@@ -36,11 +36,11 @@ This batch's new API accepts finite input and internal memory output only, witho
 
 ### P2-B: Adapters and Advanced Operations
 
-- [ ] Validate sh on ash/dash without Bash; define shebang allowlists, unknown declarations, BOM/CRLF, and independent runtime input
-- [ ] Freeze native Windows cmd/PowerShell/pwsh launch matrices, quoting, profiles, encoding, payload lengths, and exit-code protocols; validate native OpenSSH
-- [ ] Separate sudo/su control protocols from user interpreters; regress authentication, terminal handoff, cancellation, and quoting
-- [ ] Adapt SFTP cwd and reject pure server combinations; validate file-backend semantics
-- [ ] Declare platform/interpreter requirements for built-in probes, monitoring, logs, and firewall commands
+- [x] Validate sh on ash/dash without Bash; define shebang allowlists, unknown declarations, BOM/CRLF, and independent runtime input
+- [x] Freeze native Windows cmd/PowerShell/pwsh launch matrices, quoting, profiles, encoding, payload lengths, and exit-code protocols; validate native OpenSSH
+- [x] Separate sudo/su control protocols from user interpreters; regress authentication, terminal handoff, cancellation, and quoting
+- [x] Adapt SFTP cwd and reject pure server combinations; validate file-backend semantics
+- [x] Declare platform/interpreter requirements for built-in probes, monitoring, logs, and firewall commands
 
 ### P3: Release the Default Switch
 
@@ -133,3 +133,20 @@ For regular-file copies onto existing file symlinks, resolve absolute/relative t
 Regressions use actual MCP calls and SSH/SFTP protocol exchanges to verify destination-link preservation, relative targets/link chains, `/link/` versus `/link/.` with new/existing destinations, independent directory copies, literal dot-plus-whitespace/backslash filenames without accidental directory copies, and ordinary source-link/dangling destination-link boundaries. The test peer deliberately implements lexical REALPATH to cover servers that do not automatically dereference the final link.
 
 Validation passed: `go build ./...`, `go test ./...`, `golangci-lint run ./...` (0 issues), full race tests for the affected MCP/SFTP/backend/host packages, documentation build, and isolated core build/tests.
+
+## Phase P2-B Verification Record (2026-10-10)
+
+This batch completes all items in Phase P2-B (Adapters & Advanced Operations):
+1. **sh Adapter & Script Protocol**: Added support for `InterpreterSh` (non-login POSIX `sh -c` and `sh -s`); shebang allowlists correctly distinguish and map `sh` and `bash`; non-allowlisted shebangs are strictly rejected unless an explicit caller override is provided; scripts with UTF-8 BOM (`\xef\xbb\xbf`) prefixes are rejected before execution; the first-line metadata parser safely ignores trailing `\r` without altering original script payload bytes; `setupStdinPipeline` strictly rejects scripts when both script payloads and runtime stdin are supplied.
+2. **Windows cmd/PowerShell/pwsh Adapters**: Launch dialect matrix is frozen (`cmd` only supports `cmd` dialect, `powershell` supports `cmd`/`powershell`, `pwsh` supports `cmd`/`powershell`/`posix`); PowerShell commands use UTF-16LE Base64 encoded payloads (`-EncodedCommand`) with `-NoProfile -NonInteractive -ExecutionPolicy Bypass`; command length limits are strictly enforced (`cmd` $\le 8191$, `PowerShell` $\le 32767$); exit code protocol is frozen (`cmd` preserves `%ERRORLEVEL%`, PowerShell injects `$ErrorActionPreference = 'Stop'` and `$LASTEXITCODE` checks).
+3. **Sudo/Su Control Protocol & User Interpreter Separation**: sudo privilege escalation control shell supports both `sh` and `bash`, preserving random token handshakes, password prompt matching, and cleanup; configured su is strictly rejected while preserving unconfigured legacy su semantics.
+4. **SFTP Working Directory Adaptation**: Implemented `FormatWorkingDirCommand`, providing escaping and path security for POSIX (`cd -- '...' && ...`), cmd (`cd /d "..." && ...`), and PowerShell (`Set-Location -LiteralPath '...' -ErrorAction Stop; ...`); server mode rejects working directory inheritance when cwd is not root, preserving the literal execution contract.
+5. **Built-in Operations Platform/Interpreter Declarations**: `MetricsCollector` monitoring probes, automatic sudo detection, and TUI log viewers (`log_select` and `log_stream`) inspect client execution configuration and fail early on non-POSIX dialects; firewall inspection explicitly declares Linux/POSIX constraints.
+6. **Full Acceptance Metrics**:
+   - `go build ./...`: passed
+   - `go test ./...`: passed
+   - `golangci-lint run ./...`: 0 issues
+   - Cross-compilation: `GOOS=darwin GOARCH=arm64` and `GOOS=windows GOARCH=amd64` passed
+   - `python3 scripts/check_core.py`: Linux/Windows/macOS boundaries and extracted module build/test passed
+   - `npm run docs:build`: passed
+

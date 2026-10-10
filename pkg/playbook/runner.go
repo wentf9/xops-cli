@@ -417,11 +417,6 @@ func (e *Engine) runScript(ctx context.Context, client *ssh.Client, scriptPath s
 		}
 	}
 
-	var opts []ssh.RunOption
-	if resolvedExec != nil && resolvedExec.Login != nil {
-		opts = append(opts, ssh.WithLoginShell(*resolvedExec.Login))
-	}
-
 	var (
 		out       string
 		scriptErr error
@@ -429,7 +424,7 @@ func (e *Engine) runScript(ctx context.Context, client *ssh.Client, scriptPath s
 	if sudo {
 		out, scriptErr = client.RunScriptWithSudoExecution(ctx, string(content), resolvedExec)
 	} else {
-		out, scriptErr = client.RunScript(ctx, string(content), opts...)
+		out, scriptErr = client.RunScriptWithExecution(ctx, string(content), resolvedExec)
 	}
 
 	if scriptErr != nil {

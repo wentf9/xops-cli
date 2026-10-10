@@ -14,8 +14,12 @@ import (
 type Interpreter string
 
 const (
-	InterpreterServer Interpreter = "server"
-	InterpreterBash   Interpreter = "bash"
+	InterpreterServer     Interpreter = "server"
+	InterpreterBash       Interpreter = "bash"
+	InterpreterSh         Interpreter = "sh"
+	InterpreterPowerShell Interpreter = "powershell"
+	InterpreterPwsh       Interpreter = "pwsh"
+	InterpreterCmd        Interpreter = "cmd"
 )
 
 // LaunchDialect describes the server shell parsing the SSH exec payload.
@@ -159,6 +163,42 @@ func (p *CommandPlan) buildPayload() error {
 		if p.login == LoginInherit {
 			p.login = LoginDisabled
 		}
+	case InterpreterSh:
+		if p.dialect != LaunchPOSIX {
+			return fmt.Errorf("sh interpreter requires posix launch dialect")
+		}
+		if p.login == LoginEnabled {
+			return fmt.Errorf("sh interpreter does not support login shell")
+		}
+		p.login = LoginDisabled
+		p.payload = shCommandPayload(p.command)
+	case InterpreterPowerShell:
+		if p.login != LoginInherit {
+			return fmt.Errorf("powershell interpreter requires inherited login mode")
+		}
+		payload, err := powershellCommandPayload(p.command, p.dialect)
+		if err != nil {
+			return err
+		}
+		p.payload = payload
+	case InterpreterPwsh:
+		if p.login != LoginInherit {
+			return fmt.Errorf("pwsh interpreter requires inherited login mode")
+		}
+		payload, err := pwshCommandPayload(p.command, p.dialect)
+		if err != nil {
+			return err
+		}
+		p.payload = payload
+	case InterpreterCmd:
+		if p.login != LoginInherit {
+			return fmt.Errorf("cmd interpreter requires inherited login mode")
+		}
+		payload, err := cmdCommandPayload(p.command, p.dialect)
+		if err != nil {
+			return err
+		}
+		p.payload = payload
 	default:
 		return fmt.Errorf("unsupported command interpreter %q", p.interpreter)
 	}
@@ -182,6 +222,16 @@ func bashScriptPayload(login bool) string {
 		return "bash -l -s"
 	}
 	return "bash -s"
+}
+
+// shCommandPayload is the construction of sh command exec payloads.
+func shCommandPayload(command string) string {
+	return "sh -c " + shellQuote(command)
+}
+
+// shScriptPayload selects sh reading the script from stdin.
+func shScriptPayload() string {
+	return "sh -s"
 }
 
 func (p CommandPlan) Command() string              { return p.command }
