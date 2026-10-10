@@ -35,7 +35,11 @@ func (b *Backend) Run(ctx context.Context, _ ports.Permit, node string, command 
 	} else {
 		output, err = client.Run(ctx, command.Text)
 	}
-	return ports.CommandResult{Output: output, Connected: true}, err
+	outcome := ssh.ExecutionCompleted
+	if err != nil {
+		outcome = ssh.ExecutionUnknown
+	}
+	return ports.CommandResult{Output: output, Connected: true, Outcome: outcome}, err
 }
 func (b *Backend) OpenFiles(ctx context.Context, _ ports.Permit, node string) (ports.FileSession, error) {
 	client, err := b.Connector.Connect(ctx, node)

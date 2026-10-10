@@ -39,6 +39,7 @@ type Server struct {
 	workers     sync.WaitGroup
 	closeOnce   sync.Once
 	closeErr    error
+	execHandler func(command string, channel ssh.Channel)
 }
 
 type Options struct {
@@ -46,6 +47,8 @@ type Options struct {
 	// HostKeys supplies deployment-owned fixture keys. The first public key is
 	// exposed as HostKey; all supplied algorithms are advertised by the peer.
 	HostKeys []ssh.Signer
+	// ExecHandler optionally overrides the synthetic command execution handler.
+	ExecHandler func(command string, channel ssh.Channel)
 }
 
 func New(ctx context.Context) (*Server, error) { return NewWithOptions(ctx, Options{}) }
@@ -76,7 +79,7 @@ func NewWithOptions(ctx context.Context, options Options) (*Server, error) {
 	}
 	work, cancel := context.WithCancel(ctx)
 	s := &Server{Address: listener.Addr().String(), HostKey: hostKeys[0].PublicKey(), ctx: work, cancel: cancel, listener: listener,
-		connections: make(map[net.Conn]struct{}), handlers: sftp.InMemHandler(), config: &ssh.ServerConfig{PasswordCallback: func(_ ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+		connections: make(map[net.Conn]struct{}), handlers: sftp.InMemHandler(), execHandler: options.ExecHandler, config: &ssh.ServerConfig{PasswordCallback: func(_ ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
 			if string(password) != Password {
 				return nil, errors.New("fixture password rejected")
 			}
@@ -199,6 +202,12 @@ func (s *Server) session(channel ssh.Channel, requests <-chan *ssh.Request) {
 		case "exec":
 			s.Executed.Add(1)
 			s.record(request.Reply(true, nil))
+			var payload struct{ Command string }
+			_ = ssh.Unmarshal(request.Payload, &payload)
+			if s.execHandler != nil {
+				s.execHandler(payload.Command, channel)
+				return
+			}
 			_, err := io.WriteString(channel, "fixture-output")
 			s.record(err)
 			_, err = channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0}))

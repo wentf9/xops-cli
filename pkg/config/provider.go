@@ -385,6 +385,7 @@ func cloneConfiguration(cfg *Configuration) *Configuration {
 	cloned.PasswordPromptPattern = cfg.PasswordPromptPattern
 	cloned.Guardrail = cloneGuardrail(cfg.Guardrail)
 	cloned.MCP = cfg.MCP.Clone()
+	cloned.Execution = cfg.Execution.Clone()
 	if cfg.Nodes != nil {
 		for _, key := range cfg.Nodes.Keys() {
 			if node, ok := cfg.Nodes.Get(key); ok {
@@ -414,6 +415,9 @@ func cloneNode(node models.Node) models.Node {
 	node.Tags = slices.Clone(node.Tags)
 	if node.PrivilegePasswordRef != nil {
 		node.PrivilegePasswordRef = node.PrivilegePasswordRef.Clone()
+	}
+	if node.Execution != nil {
+		node.Execution = node.Execution.Clone()
 	}
 	return node
 }

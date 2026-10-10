@@ -692,9 +692,21 @@ func (c *Client) RemoteCopy(ctx context.Context, src, dst string) (retErr error)
 // RemoveAll removes a remote file, directory tree, or symbolic link through
 // SFTP. Symbolic links are removed as links and are never followed.
 func (c *Client) RemoveAll(ctx context.Context, remotePath string) error {
+	cleanPath := cleanRemotePathForRemoval(remotePath)
 	return c.Do(ctx, func(client *sftp.Client) error {
-		return removeRemoteEntry(ctx, client, remotePath)
+		return removeRemoteEntry(ctx, client, cleanPath)
 	})
+}
+
+func cleanRemotePathForRemoval(remotePath string) string {
+	if remotePath == "" || remotePath == "/" {
+		return remotePath
+	}
+	trimmed := strings.TrimRight(remotePath, "/")
+	if trimmed == "" {
+		return "/"
+	}
+	return trimmed
 }
 
 func removeRemoteEntry(ctx context.Context, client *sftp.Client, remotePath string) error {
@@ -756,14 +768,46 @@ func (c *Client) remoteCopy(ctx context.Context, src, dst string, srcStat os.Fil
 		return c.remoteCopyLink(ctx, src, dst)
 	}
 	if srcStat.IsDir() {
-		return c.remoteCopyDirectory(ctx, src, dst)
+		return c.remoteCopyDirectory(ctx, src, dst, srcStat)
 	}
 	return c.remoteCopyFile(ctx, src, dst, srcStat)
 }
 
-func (c *Client) remoteCopyDirectory(ctx context.Context, src, dst string) error {
+func (c *Client) prepareRemoteDestinationDirectory(src, dst string, srcStat os.FileInfo) (bool, error) {
+	dstLstat, dstLstatErr := c.SFTPClient().Lstat(dst)
+	if dstLstatErr == nil {
+		if dstLstat.Mode()&os.ModeSymlink != 0 {
+			return false, fmt.Errorf("cannot overwrite remote symbolic link %q with directory %q", dst, src)
+		}
+		if !dstLstat.IsDir() {
+			return false, fmt.Errorf("cannot overwrite non-directory remote destination %q with directory %q", dst, src)
+		}
+	} else if !errors.Is(dstLstatErr, os.ErrNotExist) && !os.IsNotExist(dstLstatErr) {
+		return false, fmt.Errorf("lstat remote destination failed: %w", dstLstatErr)
+	}
+
+	dstStat, dstErr := c.SFTPClient().Stat(dst)
+	if dstErr != nil && !errors.Is(dstErr, os.ErrNotExist) && !os.IsNotExist(dstErr) {
+		return false, fmt.Errorf("stat remote destination failed: %w", dstErr)
+	}
+	dstExisted := dstErr == nil && dstStat.IsDir()
+
 	if err := c.SFTPClient().MkdirAll(dst); err != nil {
-		return fmt.Errorf("mkdir remote directory failed: %w", err)
+		return false, fmt.Errorf("mkdir remote directory failed: %w", err)
+	}
+	if !dstExisted && srcStat != nil {
+		initialMode := srcStat.Mode().Perm() | 0700
+		if err := c.SFTPClient().Chmod(dst, initialMode); err != nil {
+			return false, fmt.Errorf("set remote directory initial mode failed: %w", err)
+		}
+	}
+	return dstExisted, nil
+}
+
+func (c *Client) remoteCopyDirectory(ctx context.Context, src, dst string, srcStat os.FileInfo) error {
+	dstExisted, err := c.prepareRemoteDestinationDirectory(src, dst, srcStat)
+	if err != nil {
+		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -782,6 +826,14 @@ func (c *Client) remoteCopyDirectory(ctx context.Context, src, dst string) error
 		// their targets.
 		if err := c.remoteCopy(ctx, subSrc, subDst, nil); err != nil {
 			return fmt.Errorf("copy remote entry %q to %q failed: %w", subSrc, subDst, err)
+		}
+	}
+	if !dstExisted && srcStat != nil {
+		if err := c.SFTPClient().Chmod(dst, srcStat.Mode()); err != nil {
+			return fmt.Errorf("set remote directory final mode failed: %w", err)
+		}
+		if err := c.SFTPClient().Chtimes(dst, srcStat.ModTime(), srcStat.ModTime()); err != nil {
+			return fmt.Errorf("set remote directory timestamps failed: %w", err)
 		}
 	}
 	return nil
@@ -839,7 +891,53 @@ func (c *Client) replaceRemoteLink(tempPath, remotePath string) error {
 	return nil
 }
 
+// resolveRemoteCopyFileDestination follows a destination symbolic link so that
+// copying a regular file onto it updates the link target and leaves the link in
+// place, like cp -r. It also reports the mode of an existing regular
+// destination so that overwriting keeps its permissions.
+func (c *Client) resolveRemoteCopyFileDestination(src, dst string) (string, os.FileMode, bool, error) {
+	info, err := c.SFTPClient().Lstat(dst)
+	if errors.Is(err, os.ErrNotExist) {
+		return dst, 0, false, nil
+	}
+	if err != nil {
+		return "", 0, false, fmt.Errorf("lstat remote destination failed: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		resolved, resolveErr := c.canonicalRemotePath(dst)
+		if resolveErr != nil {
+			return "", 0, false, fmt.Errorf("resolve remote destination symbolic link failed: %w", resolveErr)
+		}
+		if resolved == src {
+			return "", 0, false, fmt.Errorf("remote source and destination are the same file: %q", src)
+		}
+		dst = resolved
+		info, err = c.SFTPClient().Stat(dst)
+		if errors.Is(err, os.ErrNotExist) {
+			return dst, 0, false, nil
+		}
+		if err != nil {
+			return "", 0, false, fmt.Errorf("stat remote destination symbolic link target failed: %w", err)
+		}
+	}
+	if info.IsDir() {
+		return "", 0, false, fmt.Errorf("cannot overwrite remote destination directory %q with a file", dst)
+	}
+	if !info.Mode().IsRegular() {
+		return "", 0, false, fmt.Errorf("cannot overwrite non-regular remote destination %q", dst)
+	}
+	return dst, info.Mode(), true, nil
+}
+
 func (c *Client) remoteCopyFile(ctx context.Context, src, dst string, srcStat os.FileInfo) (retErr error) {
+	dst, existingMode, dstExisted, err := c.resolveRemoteCopyFileDestination(src, dst)
+	if err != nil {
+		return err
+	}
+	finalMode := srcStat.Mode()
+	if dstExisted {
+		finalMode = existingMode
+	}
 	srcFile, err := c.SFTPClient().Open(src)
 	if err != nil {
 		return fmt.Errorf("open remote source file failed: %w", err)
@@ -887,7 +985,7 @@ func (c *Client) remoteCopyFile(ctx context.Context, src, dst string, srcStat os
 	if err := c.verifyRemoteTemporaryFile(tempPath); err != nil {
 		return err
 	}
-	if err := c.SFTPClient().Chmod(tempPath, srcStat.Mode()); err != nil {
+	if err := c.SFTPClient().Chmod(tempPath, finalMode); err != nil {
 		return fmt.Errorf("set remote temporary destination mode failed: %w", err)
 	}
 	if err := c.SFTPClient().Chtimes(tempPath, srcStat.ModTime(), srcStat.ModTime()); err != nil {

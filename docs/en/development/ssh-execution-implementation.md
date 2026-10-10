@@ -28,11 +28,11 @@ This batch's new API accepts finite input and internal memory output only, witho
 
 ### P2-A: Configuration and Caller Bindings
 
-- [ ] Global/Node/Playbook execution schemas, presence, inheritance, and DTO/clone/import/export round-trip tests
-- [ ] Pass plans and structured results through MCP input, ports, and host backends; show effective semantics in approval and bind execution configuration in digests
-- [ ] Node/global execution changes invalidate stale approvals without invalidating unrelated configuration; request-supplied dialects cannot lower risk
-- [ ] Freeze Playbook script-source bytes and node+step plans; prohibit retries for uncertain outcomes or additional cleanup failures
-- [ ] Define ensure result-source protocols, check/action/verify classification, and legacy workflow migration
+- [x] Global/Node/Playbook execution schemas, presence, inheritance, and DTO/clone/import/export round-trip tests
+- [x] Pass plans and structured results through MCP input, ports, and host backends; show effective semantics in approval and bind execution configuration in digests
+- [x] Node/global execution changes invalidate stale approvals without invalidating unrelated configuration; request-supplied dialects cannot lower risk
+- [x] Freeze Playbook script-source bytes and node+step plans; prohibit retries for uncertain outcomes or additional cleanup failures
+- [x] Define ensure result-source protocols, check/action/verify classification, and legacy workflow migration
 
 ### P2-B: Adapters and Advanced Operations
 
@@ -100,3 +100,36 @@ This batch completes all remaining P1-B items and accepts the full Phase P1 deli
    - `go test -race ./core/ssh ./cmd`: passed (`core/ssh` 27.5s, `cmd` 200.3s, zero data races, zero goroutine leaks)
    - `python3 scripts/check_core.py`: Linux/Windows/macOS dependency boundaries passed; isolated extracted module build and tests passed
    - `npm run docs:build`: passed, bilingual documentation routes and link checks passed
+
+## Phase P2-A Verification Record (2026-10-09)
+
+This batch completes all items in Phase P2-A:
+1. **Execution Configuration Schema & Inheritance**: `core/ssh/execution_config.go` implements `ExecutionConfig` (`interpreter`, `launch_dialect`, `login` with strict validation and unknown field rejection), preserving explicit `login: false`. `ResolveExecution` and `EffectiveExecution` establish consistent multi-tier inheritance across Global (`models.Configuration`), Node (`models.Node`), and Playbook (`Settings` and `Step`), covered by V2 schema round-trip and snapshot isolation tests.
+2. **MCP Ports & Structured Execution Binding**: `ports.CommandResult` provides structured execution metadata (`PlanDigest`, `Phase`, `Outcome`, `ExitCode`, `Signal`, `Truncated`, `ExecutionErr`, `IOErr`, `CleanupErr`). `OperationSnapshot.Digest` includes effective execution versions, properly invalidating stale approvals when execution semantics change while preserving bindings when unrelated fields change. `guardrail.AnalyzeCommandWithDialect` prevents client-supplied dialects from artificially lowering command risk.
+3. **Playbook Script-Source & Plan Freezing**: `Engine.Run` preloads and caches all script sources via `preloadScripts` prior to task dispatch; all target nodes and retry attempts share immutable script bytes without rereading disk files during execution. `runShell` and `runScript` freeze immutable command plans; retry logic strictly enforces non-retryable boundaries: uncertain outcomes (`Outcome == ExecutionUnknown`), unstarted executions (`ExecutionNotStarted`), canceled contexts, and additional cleanup/IO errors are prohibited from retrying.
+4. **Ensure Result Protocol & Classification**: `runEnsure` integrates a controlled result-frame protocol (`trap ... EXIT`) that reliably differentiates exit code 0 (`StatusSkipped`, no action needed), exit code 127 (`StatusFailed`, cannot distinguish missing binary from startup failure, action prohibited), execution layer faults or lost result frames (`StatusFailed`, action prohibited), and confirmed non-zero exits (triggers remediation action followed by post-action verification). Server mode without supported shell adapters is rejected upfront, and control frames are stripped from user output.
+5. **Full Acceptance Metrics**:
+   - `go build ./...`: passed
+   - `go test ./...`: passed
+   - `golangci-lint run ./...`: 0 issues
+   - `python3 scripts/check_core.py`: Linux/Windows/macOS boundaries and extracted module build/test passed
+   - `npm run docs:build`: passed
+
+## P2-A Review Fix: Execution Defaults, Risk Dialects, and Escalation
+
+- In P1/P2, MCP commands without execution configuration (including an empty object) retain POSIX `bash -l -c`; only explicit server selection forwards commands unchanged. The default switch remains P3 work, and command/approval plans share the same stage defaults.
+- Explicit server execution without trusted launch-dialect metadata is classified as unknown and cannot obtain a POSIX safe-prefix exemption. Request-supplied posix cannot replace node metadata; configuration/plan errors are rejected before approval.
+- Both MCP backends resolve and validate execution before connecting or taking the sudo branch. Supported Bash sudo paths explicitly pass effective login mode; Playbook shell, ensure.check/action/verify, and scripts reuse this validation. Server escalation, incompatible launch dialects, and unimplemented configured su combinations are rejected before user operations start. Unconfigured legacy su semantics are preserved.
+- After selecting an interpreter from a shebang or script default, revalidate the final configuration and freeze login mode. A script declaration does not prove the outer launch dialect; Bash scripts cannot carry cmd/PowerShell/unknown launch environments into a legacy Bash path.
+
+Regressions cover actual SSH payloads in both MCP backends, nil/empty configuration defaults, login:false with root/NOPASSWD sudo, zero dispatch for unsupported escalation, unknown-dialect approval and rejection of self-asserted POSIX safety, and login propagation through Playbook sudo shell/ensure phases plus script preflight validation. Build, full tests, lint, full race tests for affected packages, and independent core extraction passed.
+
+## SFTP Copy-Path Review Fix (2026-10-10)
+
+Before calling the entry-preserving `RemoteCopy`, MCP `xops_fs_cp` resolves copy operands separately. Ordinary source symlinks remain links. A directory source ending in `/` follows directory symlinks while retaining the original basename for an existing destination directory; a source ending in `/.` copies contents directly. Path classification recognizes only actual `/` separators and preserves literal spaces, tabs, and backslashes in filenames.
+
+For regular-file copies onto existing file symlinks, resolve absolute/relative targets and link chains, update the target file, and retain the original link. Apply the same check after appending a basename to an existing destination directory. Entry copies of source links do not use this dereferencing rule. Reject dangling destination file links and file-over-directory combinations before writing.
+
+Regressions use actual MCP calls and SSH/SFTP protocol exchanges to verify destination-link preservation, relative targets/link chains, `/link/` versus `/link/.` with new/existing destinations, independent directory copies, literal dot-plus-whitespace/backslash filenames without accidental directory copies, and ordinary source-link/dangling destination-link boundaries. The test peer deliberately implements lexical REALPATH to cover servers that do not automatically dereference the final link.
+
+Validation passed: `go build ./...`, `go test ./...`, `golangci-lint run ./...` (0 issues), full race tests for the affected MCP/SFTP/backend/host packages, documentation build, and isolated core build/tests.

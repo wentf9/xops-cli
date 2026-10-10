@@ -17,6 +17,44 @@ import (
 	"golang.org/x/term"
 )
 
+// RunWithSudoExecution honors a frozen execution configuration or rejects an
+// unvalidated escalation adapter. Nil configuration preserves legacy behavior.
+func (c *Client) RunWithSudoExecution(ctx context.Context, command string, execution *ExecutionConfig) (string, error) {
+	opts, err := c.configuredSudoOptions(ctx, command, execution)
+	if err != nil {
+		return "", err
+	}
+	return c.RunWithSudo(ctx, command, opts...)
+}
+
+// RunScriptWithSudoExecution applies the same target/login capability checks
+// to a script whose interpreter has already been resolved by the caller.
+func (c *Client) RunScriptWithSudoExecution(ctx context.Context, content string, execution *ExecutionConfig) (string, error) {
+	opts, err := c.configuredSudoOptions(ctx, ":", execution)
+	if err != nil {
+		return "", err
+	}
+	return c.RunScriptWithSudo(ctx, content, opts...)
+}
+
+func (c *Client) configuredSudoOptions(ctx context.Context, command string, execution *ExecutionConfig) ([]RunOption, error) {
+	opts, err := execution.SudoRunOptions(command)
+	if err != nil {
+		return nil, err
+	}
+	if isExecutionConfigured(execution) {
+		if err := c.maybeDetectSudoMode(ctx); err != nil {
+			return nil, err
+		}
+		// Legacy su always starts a target login shell and does not implement
+		// the configured interpreter/login contract. Do not ignore that policy.
+		if c.ConnectionConfig().SudoMode == SudoModeSu {
+			return nil, fmt.Errorf("%w: configured su execution is not supported", ErrExecutionValidation)
+		}
+	}
+	return opts, nil
+}
+
 func (c *Client) RunWithSudo(ctx context.Context, command string, opts ...RunOption) (string, error) {
 	config := DefaultRunConfig()
 	for _, opt := range opts {

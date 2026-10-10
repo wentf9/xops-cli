@@ -39,7 +39,7 @@ func TestEngine_OnErrorContinue_RunsFollowingStepAndMarksHostFailed(t *testing.T
 	}
 
 	var executed []string
-	e.runStepFn = func(_ context.Context, _ *ssh.Client, step Step, _ bool) StepResult {
+	e.runStepFn = func(_ context.Context, _ *ssh.Client, step Step, _ bool, _ models.Node) StepResult {
 		executed = append(executed, step.Name)
 		if step.Name == "step-fail" {
 			return StepResult{StepName: step.Name, Status: StatusFailed, Err: errors.New("step failed")}

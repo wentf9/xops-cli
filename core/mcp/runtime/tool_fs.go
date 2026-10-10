@@ -2,14 +2,17 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"path"
 	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	pkgsftp "github.com/pkg/sftp"
 	"github.com/wentf9/xops-cli/core/mcp/guardrail"
+	"github.com/wentf9/xops-cli/core/mcp/ports"
 )
 
 // ======================== LS ========================
@@ -160,28 +163,100 @@ func (r *Runtime) fsMvHandler(ctx context.Context, req *mcp.CallToolRequest, inp
 	return nil, FSBaseOutput{Status: "success"}, nil
 }
 
-// ======================== RM (Bypass via SSH run) ========================
+// ======================== RM ========================
 
 type FSRmInput struct {
 	NodeID string `json:"nodeID" jsonschema:"Node ID for the remote machine"`
 	Path   string `json:"path" jsonschema:"Absolute path to the file/directory to securely delete"`
 }
 
-func (r *Runtime) fsRmHandler(ctx context.Context, req *mcp.CallToolRequest, input FSRmInput) (*mcp.CallToolResult, FSBaseOutput, error) {
+func (r *Runtime) fsRmHandler(ctx context.Context, req *mcp.CallToolRequest, input FSRmInput) (_ *mcp.CallToolResult, _ FSBaseOutput, handlerErr error) {
 	if input.NodeID == "" || input.Path == "" {
 		return nil, FSBaseOutput{}, fmt.Errorf("nodeID and path are required")
 	}
+	if isRootEquivalentPath(input.Path) {
+		return nil, FSBaseOutput{}, fmt.Errorf("rm failed: refusing to remove root directory %q (preserve-root)", input.Path)
+	}
+	if hasTerminalDotComponent(input.Path) {
+		return nil, FSBaseOutput{}, fmt.Errorf("rm failed: refusing to remove %q: path ends with '.' or '..'", input.Path)
+	}
 
-	cmd := fmt.Sprintf("rm -rf %s", escapePosix(input.Path))
-	output, err := r.runCommand(ctx, input.NodeID, cmd, false)
+	sftpClient, err := r.getMCPSFTPClient(ctx, input.NodeID)
 	if err != nil {
-		return nil, FSBaseOutput{}, fmt.Errorf("rm failed: %w, output: %s", err, output)
+		return nil, FSBaseOutput{}, err
+	}
+	defer joinCloseError(&handlerErr, sftpClient, "sftp client")
+
+	if err := validateRmPath(ctx, sftpClient, input.Path); err != nil {
+		return nil, FSBaseOutput{}, fmt.Errorf("rm failed: %w", err)
+	}
+
+	if err := sftpClient.RemoveAll(ctx, input.Path); err != nil {
+		return nil, FSBaseOutput{}, fmt.Errorf("rm failed: %w", err)
 	}
 
 	return nil, FSBaseOutput{Status: "success"}, nil
 }
 
-// ======================== CP (Bypass via SSH run) ========================
+func validateRmPath(ctx context.Context, sftpClient ports.FileSession, rawPath string) error {
+	hasTrailingSlash := strings.HasSuffix(rawPath, "/")
+	entryPath := strings.TrimRight(rawPath, "/")
+	if entryPath == "" {
+		entryPath = "/"
+	}
+
+	info, statErr := sftpClient.Lstat(ctx, rawPath)
+	if statErr == nil && ((info.IsDir() && info.Mode()&os.ModeSymlink == 0) || hasTrailingSlash) {
+		resolved, realErr := sftpClient.RealPath(ctx, rawPath)
+		if realErr != nil {
+			return realErr
+		}
+		if isRootEquivalentPath(resolved) {
+			return fmt.Errorf("refusing to remove root directory %q (preserve-root)", rawPath)
+		}
+	} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) && !os.IsNotExist(statErr) {
+		return statErr
+	}
+
+	if hasTrailingSlash && entryPath != "/" {
+		entryInfo, entryErr := sftpClient.Lstat(ctx, entryPath)
+		if entryErr == nil && entryInfo.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to remove symbolic link %q with trailing slash", rawPath)
+		} else if entryErr != nil && !errors.Is(entryErr, os.ErrNotExist) && !os.IsNotExist(entryErr) {
+			return entryErr
+		}
+	}
+
+	return nil
+}
+
+func isRootEquivalentPath(raw string) bool {
+	if strings.TrimSpace(raw) == "" {
+		return true
+	}
+	normalized := strings.ReplaceAll(raw, "\\", "/")
+	cleaned := path.Clean(normalized)
+
+	if cleaned == "/" || cleaned == "." || cleaned == ".." {
+		return true
+	}
+
+	cleanedDrive := strings.TrimPrefix(cleaned, "/")
+	if len(cleanedDrive) == 2 && cleanedDrive[1] == ':' && isAlpha(cleanedDrive[0]) {
+		return true
+	}
+	if len(cleanedDrive) == 3 && cleanedDrive[1] == ':' && cleanedDrive[2] == '/' && isAlpha(cleanedDrive[0]) {
+		return true
+	}
+
+	return false
+}
+
+func isAlpha(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
+// ======================== CP ========================
 
 type FSCpInput struct {
 	NodeID string `json:"nodeID" jsonschema:"Node ID for the remote machine"`
@@ -189,18 +264,173 @@ type FSCpInput struct {
 	Dest   string `json:"destPath" jsonschema:"Absolute path to destination"`
 }
 
-func (r *Runtime) fsCpHandler(ctx context.Context, req *mcp.CallToolRequest, input FSCpInput) (*mcp.CallToolResult, FSBaseOutput, error) {
+func (r *Runtime) fsCpHandler(ctx context.Context, req *mcp.CallToolRequest, input FSCpInput) (_ *mcp.CallToolResult, _ FSBaseOutput, handlerErr error) {
 	if input.NodeID == "" || input.Src == "" || input.Dest == "" {
 		return nil, FSBaseOutput{}, fmt.Errorf("nodeID, srcPath and destPath are required")
 	}
 
-	cmd := fmt.Sprintf("cp -r %s %s", escapePosix(input.Src), escapePosix(input.Dest))
-	output, err := r.runCommand(ctx, input.NodeID, cmd, false)
+	sftpClient, err := r.getMCPSFTPClient(ctx, input.NodeID)
 	if err != nil {
-		return nil, FSBaseOutput{}, fmt.Errorf("cp failed: %w, output: %s", err, output)
+		return nil, FSBaseOutput{}, err
+	}
+	defer joinCloseError(&handlerErr, sftpClient, "sftp client")
+
+	effectiveSrc, err := resolveCopySource(ctx, sftpClient, input.Src)
+	if err != nil {
+		return nil, FSBaseOutput{}, fmt.Errorf("cp failed: %w", err)
+	}
+
+	effectiveDest, err := resolveCopyDestination(ctx, sftpClient, input.Src, effectiveSrc, input.Dest)
+	if err != nil {
+		return nil, FSBaseOutput{}, fmt.Errorf("cp failed: %w", err)
+	}
+
+	if err := sftpClient.RemoteCopy(ctx, effectiveSrc, effectiveDest); err != nil {
+		return nil, FSBaseOutput{}, fmt.Errorf("cp failed: %w", err)
 	}
 
 	return nil, FSBaseOutput{Status: "success"}, nil
+}
+
+// resolveCopySource preserves unqualified symbolic-link entries. A trailing
+// slash or terminal /. requests a directory referent instead. The original
+// operand is kept separately for destination naming (link/, unlike link/.,
+// still contributes the link's basename rather than its referent's basename).
+func resolveCopySource(ctx context.Context, files ports.FileSession, src string) (string, error) {
+	if !hasTrailingDot(src) && !strings.HasSuffix(src, "/") {
+		return src, nil
+	}
+	resolved, err := resolveCopyReferent(ctx, files, src)
+	if err != nil {
+		return "", fmt.Errorf("resolve source directory failed: %w", err)
+	}
+	info, err := files.Stat(ctx, resolved)
+	if err != nil {
+		return "", fmt.Errorf("stat source directory failed: %w", err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("source %q is not a directory", src)
+	}
+	return resolved, nil
+}
+
+// SFTP paths use / only. Whitespace and backslashes are literal filename bytes;
+// trimming them can turn a requested file into a different directory operand.
+func hasTrailingDot(raw string) bool {
+	trimmed := strings.TrimRight(raw, "/")
+	return trimmed == "." || strings.HasSuffix(trimmed, "/.")
+}
+
+// Some SFTP peers implement REALPATH lexically, without dereferencing the final
+// symbolic link. Resolve that entry explicitly before an entry-replacing copy.
+func resolveCopyReferent(ctx context.Context, files ports.FileSession, remotePath string) (string, error) {
+	resolved, err := files.RealPath(ctx, remotePath)
+	if err != nil {
+		return "", err
+	}
+	const maxLinks = 40
+	for followed := 0; ; followed++ {
+		info, err := files.Lstat(ctx, resolved)
+		if err != nil {
+			return "", err
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			return resolved, nil
+		}
+		if followed == maxLinks {
+			return "", fmt.Errorf("too many symbolic links resolving copy path %q", remotePath)
+		}
+		var target string
+		if err := files.Do(ctx, func(c *pkgsftp.Client) error {
+			var readErr error
+			target, readErr = c.ReadLink(resolved)
+			return readErr
+		}); err != nil {
+			return "", fmt.Errorf("read copy symbolic link %q failed: %w", resolved, err)
+		}
+		if !path.IsAbs(target) {
+			target = path.Join(path.Dir(resolved), target)
+		}
+		resolved, err = files.RealPath(ctx, target)
+		if err != nil {
+			return "", err
+		}
+	}
+}
+
+// hasTerminalDotComponent reports whether the last path component is "." or
+// "..", which rm -rf refuses to operate on.
+func hasTerminalDotComponent(raw string) bool {
+	trimmed := strings.TrimRight(raw, "/")
+	last := trimmed
+	if i := strings.LastIndex(trimmed, "/"); i >= 0 {
+		last = trimmed[i+1:]
+	}
+	return last == "." || last == ".."
+}
+
+func resolveCopyDestination(ctx context.Context, files ports.FileSession, src, resolvedSrc, dest string) (string, error) {
+	info, err := files.Stat(ctx, dest)
+	if err == nil && info.IsDir() {
+		if !hasTrailingDot(src) {
+			// Use the literal source operand for naming, not the referent path.
+			base := path.Base(strings.TrimRight(src, "/"))
+			if base != "." && base != "/" && base != "" {
+				dest = path.Join(dest, base)
+			}
+		}
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("stat destination failed: %w", err)
+	} else if strings.HasSuffix(dest, "/") {
+		return "", fmt.Errorf("destination directory %q does not exist", dest)
+	}
+
+	sourceInfo, err := files.Lstat(ctx, resolvedSrc)
+	if err != nil {
+		return "", fmt.Errorf("stat copy source failed: %w", err)
+	}
+	if sourceInfo.IsDir() {
+		destInfo, err := files.Lstat(ctx, dest)
+		if err == nil && destInfo.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("cannot overwrite symbolic link %q with directory %q", dest, src)
+		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("lstat destination failed: %w", err)
+		}
+	}
+	// cp -r preserves ordinary source links as entries. Only a regular-file
+	// source follows a destination file link instead of replacing the link.
+	if !sourceInfo.Mode().IsRegular() {
+		return dest, nil
+	}
+	return resolveCopyFileDestination(ctx, files, dest)
+}
+
+func resolveCopyFileDestination(ctx context.Context, files ports.FileSession, dest string) (string, error) {
+	info, err := files.Lstat(ctx, dest)
+	if errors.Is(err, os.ErrNotExist) {
+		return dest, nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("lstat destination failed: %w", err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("cannot overwrite destination directory %q with a file", dest)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return dest, nil
+	}
+	resolved, err := resolveCopyReferent(ctx, files, dest)
+	if err != nil {
+		return "", fmt.Errorf("resolve destination symbolic link failed: %w", err)
+	}
+	info, err = files.Stat(ctx, resolved)
+	if err != nil {
+		return "", fmt.Errorf("stat destination symbolic link target failed: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("destination symbolic link %q does not refer to a regular file", dest)
+	}
+	return resolved, nil
 }
 
 // ======================== REGISTER ========================
@@ -292,8 +522,4 @@ func (r *Runtime) registerFS(server *mcp.Server, g *guardrail.Guardrail) {
 			r.fsCpHandler,
 		),
 	)
-}
-
-func escapePosix(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }

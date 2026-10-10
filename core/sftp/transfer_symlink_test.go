@@ -1,6 +1,7 @@
 package sftp
 
 import (
+	"errors"
 	"os"
 	"testing"
 
@@ -175,5 +176,133 @@ func TestClient_RemoteCopy_OverwriteExistingDestination(t *testing.T) {
 	}
 	if target != "/target1" {
 		t.Errorf("expected target '/target1', got %q", target)
+	}
+}
+
+func TestClient_RemoveAll_TrailingSlashSymlink(t *testing.T) {
+	client := newTestSFTPClientWithHandlers(t, pkgsftp.InMemHandler())
+
+	if err := client.state.sftpClient.MkdirAll("/outside"); err != nil {
+		t.Fatalf("mkdir outside failed: %v", err)
+	}
+	f, err := client.state.sftpClient.Create("/outside/secret.txt")
+	if err != nil {
+		t.Fatalf("create secret failed: %v", err)
+	}
+	if _, err := f.Write([]byte("secret")); err != nil {
+		t.Fatalf("write secret failed: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close secret failed: %v", err)
+	}
+
+	if err := client.state.sftpClient.Symlink("/outside", "/link_dir"); err != nil {
+		t.Fatalf("create link failed: %v", err)
+	}
+
+	if err := client.RemoveAll(t.Context(), "/link_dir/"); err != nil {
+		t.Fatalf("RemoveAll trailing slash symlink failed: %v", err)
+	}
+
+	if _, err := client.state.sftpClient.Lstat("/link_dir"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected /link_dir to be removed, got: %v", err)
+	}
+	if _, err := client.state.sftpClient.Lstat("/outside/secret.txt"); err != nil {
+		t.Fatalf("expected /outside/secret.txt to remain intact, got: %v", err)
+	}
+}
+
+func TestClient_RemoveAll_PreservesWhitespaceAndBackslash(t *testing.T) {
+	client := newTestSFTPClientWithHandlers(t, pkgsftp.InMemHandler())
+
+	if err := client.state.sftpClient.MkdirAll("/data"); err != nil {
+		t.Fatalf("mkdir /data failed: %v", err)
+	}
+
+	createFile := func(path string, content string) {
+		f, err := client.state.sftpClient.Create(path)
+		if err != nil {
+			t.Fatalf("create %q failed: %v", path, err)
+		}
+		if _, err := f.Write([]byte(content)); err != nil {
+			t.Fatalf("write %q failed: %v", path, err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("close %q failed: %v", path, err)
+		}
+	}
+
+	createFile("/data/report", "report")
+	createFile("/data/report  ", "report-spaces")
+	createFile("/data/report\\", "report-backslash")
+
+	// 1. Remove "/data/report  " (trailing whitespace). Must not remove "/data/report".
+	if err := client.RemoveAll(t.Context(), "/data/report  "); err != nil {
+		t.Fatalf("RemoveAll /data/report   failed: %v", err)
+	}
+	if _, err := client.state.sftpClient.Lstat("/data/report  "); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected /data/report   to be removed, got: %v", err)
+	}
+	if _, err := client.state.sftpClient.Lstat("/data/report"); err != nil {
+		t.Fatalf("expected /data/report to remain intact, got: %v", err)
+	}
+
+	// 2. Remove "/data/report\\" (trailing backslash). Must not remove "/data/report".
+	if err := client.RemoveAll(t.Context(), "/data/report\\"); err != nil {
+		t.Fatalf("RemoveAll /data/report\\ failed: %v", err)
+	}
+	if _, err := client.state.sftpClient.Lstat("/data/report\\"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected /data/report\\ to be removed, got: %v", err)
+	}
+	if _, err := client.state.sftpClient.Lstat("/data/report"); err != nil {
+		t.Fatalf("expected /data/report to remain intact, got: %v", err)
+	}
+}
+
+func TestClient_RemoteCopy_RejectsDestinationDirectorySymlink(t *testing.T) {
+	client := newTestSFTPClientWithHandlers(t, pkgsftp.InMemHandler())
+
+	// 1. Setup /outside directory, /src directory with a file, /dst directory with symlink /dst/sub -> /outside
+	if err := client.state.sftpClient.MkdirAll("/outside"); err != nil {
+		t.Fatalf("mkdir /outside failed: %v", err)
+	}
+	if err := client.state.sftpClient.MkdirAll("/src"); err != nil {
+		t.Fatalf("mkdir /src failed: %v", err)
+	}
+	srcFile, err := client.state.sftpClient.Create("/src/file.txt")
+	if err != nil {
+		t.Fatalf("create /src/file.txt failed: %v", err)
+	}
+	_ = srcFile.Close()
+
+	if err := client.state.sftpClient.MkdirAll("/dst"); err != nil {
+		t.Fatalf("mkdir /dst failed: %v", err)
+	}
+	if err := client.state.sftpClient.Symlink("/outside", "/dst/sub"); err != nil {
+		t.Fatalf("symlink /dst/sub -> /outside failed: %v", err)
+	}
+
+	// Direct copy of directory /src onto destination symlink /dst/sub must fail
+	if err := client.RemoteCopy(t.Context(), "/src", "/dst/sub"); err == nil {
+		t.Fatal("expected RemoteCopy /src to /dst/sub to fail, but succeeded")
+	}
+
+	// Recursive copy of directory containing 'sub' into /dst where /dst/sub is a symlink
+	if err := client.state.sftpClient.MkdirAll("/parent/sub"); err != nil {
+		t.Fatalf("mkdir /parent/sub failed: %v", err)
+	}
+	subFile, err := client.state.sftpClient.Create("/parent/sub/nested.txt")
+	if err != nil {
+		t.Fatalf("create /parent/sub/nested.txt failed: %v", err)
+	}
+	_ = subFile.Close()
+
+	if err := client.RemoteCopy(t.Context(), "/parent", "/dst"); err == nil {
+		t.Fatal("expected RemoteCopy /parent to /dst to fail due to /dst/sub symlink, but succeeded")
+	}
+
+	// Verify /outside remains intact without nested.txt
+	if _, err := client.state.sftpClient.Lstat("/outside/nested.txt"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected /outside/nested.txt to not exist, got: %v", err)
 	}
 }

@@ -9,6 +9,8 @@ import (
 	"text/template"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/wentf9/xops-cli/core/ssh"
 )
 
 // Load 从文件路径加载并解析 Playbook。
@@ -82,8 +84,14 @@ func (p *Playbook) Validate() error {
 		return fmt.Errorf("targets must specify at least one of: tags, nodes, hosts")
 	}
 
+	if p.Settings.Execution != nil {
+		if err := p.Settings.Execution.Validate(); err != nil {
+			return fmt.Errorf("settings execution invalid: %w", err)
+		}
+	}
+
 	for i, s := range p.Steps {
-		if err := s.validate(); err != nil {
+		if err := s.validate(p.Settings.Execution); err != nil {
 			return fmt.Errorf("step[%d] %q: %w", i, s.Name, err)
 		}
 	}
@@ -104,7 +112,7 @@ func (t *Targets) hasAny() bool {
 }
 
 // validate 校验单个步骤的合法性。
-func (s *Step) validate() error {
+func (s *Step) validate(parentExec *ssh.ExecutionConfig) error {
 	if s.Name == "" {
 		return fmt.Errorf("name must not be empty")
 	}
@@ -123,6 +131,16 @@ func (s *Step) validate() error {
 	if s.Retries < 0 {
 		return fmt.Errorf("retries must be >= 0")
 	}
+
+	if s.Execution != nil {
+		if err := s.Execution.Validate(); err != nil {
+			return fmt.Errorf("execution invalid: %w", err)
+		}
+	}
+	if _, err := ssh.ResolveExecution(s.Execution, parentExec); err != nil {
+		return fmt.Errorf("effective execution invalid: %w", err)
+	}
+
 	return nil
 }
 

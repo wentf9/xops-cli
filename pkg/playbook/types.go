@@ -3,6 +3,8 @@ package playbook
 import (
 	"fmt"
 	"time"
+
+	"github.com/wentf9/xops-cli/core/ssh"
 )
 
 // Playbook 是编排文件的顶层结构
@@ -25,10 +27,11 @@ type Targets struct {
 // Settings 定义全局执行配置
 type Settings struct {
 	// Concurrency 控制最大并发主机数，0 表示使用默认值 1
-	Concurrency uint     `yaml:"concurrency,omitempty"`
-	Sudo        bool     `yaml:"sudo,omitempty"`
-	OnError     OnError  `yaml:"on_error,omitempty"`
-	Timeout     Duration `yaml:"timeout,omitempty"`
+	Concurrency uint                 `yaml:"concurrency,omitempty"`
+	Sudo        bool                 `yaml:"sudo,omitempty"`
+	OnError     OnError              `yaml:"on_error,omitempty"`
+	Timeout     Duration             `yaml:"timeout,omitempty"`
+	Execution   *ssh.ExecutionConfig `yaml:"execution,omitempty"`
 }
 
 // OnError 定义步骤失败时的处理策略
@@ -55,6 +58,9 @@ type Step struct {
 
 	// Sudo 步骤级别的提权覆盖；nil 表示继承全局 Settings.Sudo
 	Sudo *bool `yaml:"sudo,omitempty"`
+
+	// Execution 步骤级别的执行配置覆盖；nil 表示继承 Playbook Settings.Execution
+	Execution *ssh.ExecutionConfig `yaml:"execution,omitempty"`
 
 	// Retries 失败重试次数，默认 0（不重试）
 	Retries int `yaml:"retries,omitempty"`

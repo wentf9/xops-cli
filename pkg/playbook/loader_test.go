@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/playbook"
 )
 
@@ -273,5 +274,119 @@ steps:
 	}
 	if pb.Name != "named-test" {
 		t.Errorf("Name = %q, want 'named-test'", pb.Name)
+	}
+}
+
+func TestPlaybookExecution(t *testing.T) {
+	validYAML := `
+name: exec-playbook
+targets:
+  tags: [web]
+settings:
+  execution:
+    interpreter: bash
+    launch_dialect: posix
+    login: false
+steps:
+  - name: step default inherits
+    shell: echo inherit
+  - name: step override to server
+    shell: uname -a
+    execution:
+      interpreter: server
+  - name: step override login
+    shell: env
+    execution:
+      login: true
+`
+	path := writeTempPlaybook(t, validYAML)
+	pb, err := playbook.Load(path, nil)
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+
+	if pb.Settings.Execution == nil || pb.Settings.Execution.Interpreter != "bash" || *pb.Settings.Execution.Login != false {
+		t.Fatalf("Settings execution unexpected: %+v", pb.Settings.Execution)
+	}
+
+	// Step 0: inherits
+	eff0, err := ssh.ResolveExecution(pb.Steps[0].Execution, pb.Settings.Execution)
+	if err != nil {
+		t.Fatalf("step 0 resolve error: %v", err)
+	}
+	if eff0.Interpreter != "bash" || *eff0.Login != false {
+		t.Fatalf("step 0 effective: %+v", eff0)
+	}
+
+	// Step 1: override to server
+	eff1, err := ssh.ResolveExecution(pb.Steps[1].Execution, pb.Settings.Execution)
+	if err != nil {
+		t.Fatalf("step 1 resolve error: %v", err)
+	}
+	if eff1.Interpreter != "server" || eff1.Login != nil {
+		t.Fatalf("step 1 effective: %+v", eff1)
+	}
+
+	// Step 2: override login
+	eff2, err := ssh.ResolveExecution(pb.Steps[2].Execution, pb.Settings.Execution)
+	if err != nil {
+		t.Fatalf("step 2 resolve error: %v", err)
+	}
+	if eff2.Interpreter != "bash" || eff2.Login == nil || *eff2.Login != true {
+		t.Fatalf("step 2 effective: %+v", eff2)
+	}
+
+	// Invalid settings execution
+	badSettingsYAML := `
+name: bad-settings
+targets:
+  tags: [web]
+settings:
+  execution:
+    interpreter: server
+    login: true
+steps:
+  - name: dummy
+    shell: echo 1
+`
+	badSettingsPath := writeTempPlaybook(t, badSettingsYAML)
+	if _, err := playbook.Load(badSettingsPath, nil); err == nil {
+		t.Fatal("expected error for bad settings execution")
+	}
+
+	// Invalid step execution incompatible with settings
+	badStepYAML := `
+name: bad-step
+targets:
+  tags: [web]
+settings:
+  execution:
+    interpreter: bash
+    launch_dialect: posix
+steps:
+  - name: incompatible
+    shell: echo 1
+    execution:
+      launch_dialect: windows-cmd
+`
+	badStepPath := writeTempPlaybook(t, badStepYAML)
+	if _, err := playbook.Load(badStepPath, nil); err == nil {
+		t.Fatal("expected error for step execution incompatible with settings")
+	}
+
+	// Unknown field in execution block
+	unknownFieldYAML := `
+name: unknown-field
+targets:
+  tags: [web]
+steps:
+  - name: unknown
+    shell: echo 1
+    execution:
+      invalid_option: foo
+`
+	unknownFieldPath := writeTempPlaybook(t, unknownFieldYAML)
+	if _, err := playbook.Load(unknownFieldPath, nil); err == nil {
+		t.Fatal("expected error for unknown field in execution block")
 	}
 }

@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/config"
+	"github.com/wentf9/xops-cli/pkg/models"
 	pkgutils "github.com/wentf9/xops-cli/pkg/utils"
 )
 
@@ -16,19 +18,25 @@ const defaultConcurrency = uint(1)
 
 // Engine 是 Playbook 的执行引擎
 type Engine struct {
-	pb        *Playbook
-	provider  config.ConfigProvider
-	listener  EventListener
-	connect   func(context.Context, string) (*ssh.Client, error)
-	runStepFn func(context.Context, *ssh.Client, Step, bool) StepResult
+	pb                 *Playbook
+	provider           config.ConfigProvider
+	listener           EventListener
+	connect            func(context.Context, string) (*ssh.Client, error)
+	runStepFn          func(context.Context, *ssh.Client, Step, bool, models.Node) StepResult
+	dispatchStepFn     func(context.Context, *ssh.Client, Step, bool, models.Node) StepResult
+	scriptSources      map[string][]byte
+	globalExecCaptured bool
+	frozenGlobalExec   *ssh.ExecutionConfig
+	frozenNodeExec     map[string]*ssh.ExecutionConfig
 }
 
 // NewEngine 创建一个执行引擎实例，支持通过 EngineOption 注入不可变组件。
 func NewEngine(pb *Playbook, provider config.ConfigProvider, connector *ssh.Connector, opts ...EngineOption) *Engine {
 	e := &Engine{
-		pb:       pb,
-		provider: provider,
-		listener: NopEventListener,
+		pb:            pb,
+		provider:      provider,
+		listener:      NopEventListener,
+		scriptSources: make(map[string][]byte),
 	}
 	if connector == nil {
 		e.connect = func(context.Context, string) (*ssh.Client, error) {
@@ -38,6 +46,7 @@ func NewEngine(pb *Playbook, provider config.ConfigProvider, connector *ssh.Conn
 		e.connect = connector.Connect
 	}
 	e.runStepFn = e.runStep
+	e.dispatchStepFn = e.dispatchStep
 	for _, opt := range opts {
 		if opt != nil {
 			opt(e)
@@ -55,12 +64,28 @@ func (e *Engine) getListener() EventListener {
 
 // Run 执行 Playbook，返回完整的执行报告。
 func (e *Engine) Run(ctx context.Context) (*Report, error) {
+	if err := e.preloadScripts(); err != nil {
+		return nil, err
+	}
+
+	e.snapshotExecution()
+
 	nodeIDs, err := e.resolveTargets()
 	if err != nil {
 		return nil, err
 	}
 	if len(nodeIDs) == 0 {
 		return nil, ErrNoTargets
+	}
+
+	if e.frozenNodeExec != nil {
+		for _, id := range nodeIDs {
+			if _, ok := e.frozenNodeExec[id]; !ok {
+				if node, ok := e.provider.GetNode(id); ok {
+					e.frozenNodeExec[id] = node.Execution.Clone()
+				}
+			}
+		}
 	}
 
 	e.getListener().OnTargetsResolved(len(nodeIDs))
@@ -170,6 +195,39 @@ func (e *Engine) resolveTargets() ([]string, error) {
 	return nodeIDs, nil
 }
 
+// preloadScripts reads and freezes all script source files into scriptSources for the run.
+// A fresh cache is created for each run so modified files are reloaded and partial
+// preload failures never leave behind a stale cache.
+func (e *Engine) preloadScripts() error {
+	e.scriptSources = nil
+	if e.pb == nil {
+		e.scriptSources = make(map[string][]byte)
+		return nil
+	}
+	freshSources := make(map[string][]byte)
+	for _, step := range e.pb.Steps {
+		if step.Script != "" {
+			if _, ok := freshSources[step.Script]; ok {
+				continue
+			}
+			info, err := os.Stat(step.Script)
+			if err != nil {
+				return fmt.Errorf("stat script %q: %w", step.Script, err)
+			}
+			if info.Size() > ssh.MaxCommandInputBytes {
+				return fmt.Errorf("script %q exceeds maximum size %d bytes", step.Script, ssh.MaxCommandInputBytes)
+			}
+			data, err := os.ReadFile(step.Script)
+			if err != nil {
+				return fmt.Errorf("read script %q: %w", step.Script, err)
+			}
+			freshSources[step.Script] = data
+		}
+	}
+	e.scriptSources = freshSources
+	return nil
+}
+
 // runOnHost 在单台主机上顺序执行所有步骤。
 // cancel 用于 abort_all 策略时通知其他 goroutine。
 func (e *Engine) runOnHost(ctx context.Context, nodeID string, cancel context.CancelFunc, onError OnError) HostReport {
@@ -177,7 +235,7 @@ func (e *Engine) runOnHost(ctx context.Context, nodeID string, cancel context.Ca
 		NodeID: nodeID,
 	}
 	start := time.Now()
-	_, hostObj, _, resolveErr := e.provider.Resolve(nodeID)
+	nodeObj, hostObj, _, resolveErr := e.provider.Resolve(nodeID)
 	if resolveErr != nil {
 		hr.Status = HostStatusFailed
 		resolveStep := StepResult{
@@ -193,6 +251,7 @@ func (e *Engine) runOnHost(ctx context.Context, nodeID string, cancel context.Ca
 		}
 		return hr
 	}
+	nodeObj.Execution = e.nodeExecution(nodeID, nodeObj)
 	hostAddr := hostObj.Address
 	hr.Host = hostAddr
 
@@ -229,7 +288,7 @@ func (e *Engine) runOnHost(ctx context.Context, nodeID string, cancel context.Ca
 
 		e.getListener().OnStepRunning(hostAddr, step.Name)
 
-		result := e.runStepFn(ctx, client, step, globalSudo)
+		result := e.runStepFn(ctx, client, step, globalSudo, nodeObj)
 		hr.Steps = append(hr.Steps, result)
 
 		// 触发步骤结果回调
@@ -261,4 +320,37 @@ func (e *Engine) runOnHost(ctx context.Context, nodeID string, cancel context.Ca
 
 	hr.Duration = time.Since(start)
 	return hr
+}
+
+func (e *Engine) snapshotExecution() {
+	e.globalExecCaptured = false
+	e.frozenGlobalExec = nil
+	e.frozenNodeExec = nil
+	if e.provider == nil {
+		return
+	}
+	snap := e.provider.Snapshot()
+	if snap == nil {
+		e.globalExecCaptured = true
+		return
+	}
+	e.frozenGlobalExec = snap.Execution
+	e.frozenNodeExec = make(map[string]*ssh.ExecutionConfig)
+	if snap.Nodes != nil {
+		for _, key := range snap.Nodes.Keys() {
+			if node, ok := snap.Nodes.Get(key); ok {
+				e.frozenNodeExec[key] = node.Execution.Clone()
+			}
+		}
+	}
+	e.globalExecCaptured = true
+}
+
+func (e *Engine) nodeExecution(nodeID string, node models.Node) *ssh.ExecutionConfig {
+	if e != nil && e.frozenNodeExec != nil {
+		if frozenExec, ok := e.frozenNodeExec[nodeID]; ok {
+			return frozenExec.Clone()
+		}
+	}
+	return node.Execution.Clone()
 }

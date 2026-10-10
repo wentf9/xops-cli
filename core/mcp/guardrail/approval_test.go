@@ -3,10 +3,12 @@ package guardrail
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/wentf9/xops-cli/core/ssh"
 )
 
 func TestApprovalProtocol(t *testing.T) {
@@ -96,5 +98,32 @@ func TestApprovalNilAndUnsupported(t *testing.T) {
 				t.Fatalf("fallback=%s risk=%v err=%v", fallback, risk, err)
 			}
 		}
+	}
+}
+
+func TestBuildApprovalMessageExecution(t *testing.T) {
+	login := false
+	msg := buildApprovalMessage(Dangerous, RiskInput{
+		ToolName: "xops_ssh_run",
+		NodeID:   "prod-1",
+		Command:  "systemctl restart nginx",
+		Execution: &ssh.ExecutionConfig{
+			Interpreter:   ssh.InterpreterBash,
+			LaunchDialect: ssh.LaunchPOSIX,
+			Login:         &login,
+		},
+		PlanDigest: "abc123digest",
+	})
+	if !strings.Contains(msg, "Interpreter: bash") {
+		t.Fatalf("message missing interpreter: %s", msg)
+	}
+	if !strings.Contains(msg, "Dialect:     posix") {
+		t.Fatalf("message missing dialect: %s", msg)
+	}
+	if !strings.Contains(msg, "Login:       false") {
+		t.Fatalf("message missing login: %s", msg)
+	}
+	if !strings.Contains(msg, "PlanDigest:  abc123digest") {
+		t.Fatalf("message missing plan digest: %s", msg)
 	}
 }

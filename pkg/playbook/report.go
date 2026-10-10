@@ -6,6 +6,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/wentf9/xops-cli/core/ssh"
 )
 
 // StepStatus 表示单个步骤的执行状态
@@ -33,11 +35,19 @@ const (
 
 // StepResult 表示单个步骤在单台主机上的执行结果
 type StepResult struct {
-	StepName string
-	Status   StepStatus
-	Output   string
-	Err      error
-	Duration time.Duration
+	StepName   string
+	Status     StepStatus
+	Outcome    ssh.ExecutionOutcome
+	ExitCode   *uint32
+	Signal     string
+	PlanDigest string
+	Output     string
+	Truncated  bool
+	Err        error
+	CleanupErr error
+	IOErr      error
+	Duration   time.Duration
+	Retryable  bool
 }
 
 // HostReport 是单台主机的完整执行报告

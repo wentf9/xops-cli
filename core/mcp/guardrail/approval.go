@@ -108,6 +108,20 @@ func buildApprovalMessage(risk RiskLevel, input RiskInput) string {
 	if input.Sudo {
 		b.WriteString("Sudo: yes\n")
 	}
+	if input.Execution != nil {
+		if input.Execution.Interpreter != "" {
+			fmt.Fprintf(&b, "Interpreter: %s\n", input.Execution.Interpreter)
+		}
+		if input.Execution.LaunchDialect != "" {
+			fmt.Fprintf(&b, "Dialect:     %s\n", input.Execution.LaunchDialect)
+		}
+		if input.Execution.Login != nil {
+			fmt.Fprintf(&b, "Login:       %v\n", *input.Execution.Login)
+		}
+	}
+	if input.PlanDigest != "" {
+		fmt.Fprintf(&b, "PlanDigest:  %s\n", input.PlanDigest)
+	}
 	if len(input.Paths) > 0 {
 		fmt.Fprintf(&b, "Paths: %s\n", strings.Join(input.Paths, ", "))
 	}

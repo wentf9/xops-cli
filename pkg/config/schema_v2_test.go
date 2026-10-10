@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/wentf9/xops-cli/core/concurrent"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
 )
@@ -612,5 +613,157 @@ func TestSchemaV2RejectsTrailingDocument(t *testing.T) {
 	data := []byte("schema_version: 2\ncredential: {stores: {}}\nidentities: {}\nhosts: {}\nnodes: {}\n---\npassword: must-not-be-ignored\n")
 	if _, err := UnmarshalV2(data); !errors.Is(err, ErrSchemaValidation) {
 		t.Fatalf("trailing document accepted: %v", err)
+	}
+}
+
+const schemaV2ExecutionYAML = `schema_version: 2
+credential:
+  default_store: s
+  stores:
+    s: {type: system}
+identities:
+  u: {user: root, auth_type: key}
+hosts:
+  h: {address: 127.0.0.1, port: 22}
+execution:
+  interpreter: bash
+  launch_dialect: posix
+  login: false
+nodes:
+  n1:
+    host_ref: h
+    identity_ref: u
+  n2:
+    host_ref: h
+    identity_ref: u
+    execution:
+      interpreter: server
+  n3:
+    host_ref: h
+    identity_ref: u
+    execution:
+      login: true
+`
+
+func parseSchemaV2Execution(t *testing.T) *ConfigurationV2 {
+	t.Helper()
+	cfgV2, err := UnmarshalV2([]byte(schemaV2ExecutionYAML))
+	if err != nil {
+		t.Fatalf("UnmarshalV2() unexpected error: %v", err)
+	}
+	return cfgV2
+}
+
+func TestSchemaV2Execution_ParseAndInheritance(t *testing.T) {
+	cfgV2 := parseSchemaV2Execution(t)
+
+	if cfgV2.Execution == nil || cfgV2.Execution.Interpreter != "bash" || cfgV2.Execution.LaunchDialect != "posix" || cfgV2.Execution.Login == nil || *cfgV2.Execution.Login != false {
+		t.Fatalf("global execution mismatch: %+v", cfgV2.Execution)
+	}
+
+	// n1 inherits global
+	effN1, err := ssh.ResolveExecution(cfgV2.Nodes["n1"].Execution, cfgV2.Execution)
+	if err != nil || effN1.Interpreter != "bash" || *effN1.Login != false {
+		t.Fatalf("n1 effective = %+v, want bash with login false (err: %v)", effN1, err)
+	}
+
+	// n2 overrides interpreter to server; login is reset to nil
+	effN2, err := ssh.ResolveExecution(cfgV2.Nodes["n2"].Execution, cfgV2.Execution)
+	if err != nil || effN2.Interpreter != "server" || effN2.Login != nil {
+		t.Fatalf("n2 effective = %+v, want server with login nil (err: %v)", effN2, err)
+	}
+
+	// n3 overrides login to true
+	effN3, err := ssh.ResolveExecution(cfgV2.Nodes["n3"].Execution, cfgV2.Execution)
+	if err != nil || effN3.Interpreter != "bash" || effN3.Login == nil || *effN3.Login != true {
+		t.Fatalf("n3 effective = %+v, want bash with login true (err: %v)", effN3, err)
+	}
+}
+
+func TestSchemaV2Execution_FromV2AndSnapshot(t *testing.T) {
+	cfgV2 := parseSchemaV2Execution(t)
+	cfg, err := FromV2(cfgV2)
+	if err != nil {
+		t.Fatalf("FromV2() error: %v", err)
+	}
+	if cfg.Execution == nil || cfg.Execution.Interpreter != "bash" || cfg.Execution.Login == nil || *cfg.Execution.Login != false {
+		t.Fatalf("FromV2 global execution lost or mutated: %+v", cfg.Execution)
+	}
+
+	n2Node, ok := cfg.Nodes.Get("n2")
+	if !ok || n2Node.Execution == nil || n2Node.Execution.Interpreter != "server" {
+		t.Fatalf("FromV2 n2 execution lost: %+v", n2Node.Execution)
+	}
+
+	// Test snapshot isolation
+	snapshot := cfg.Snapshot()
+	f := true
+	snapshot.Execution.Login = &f
+	if *cfg.Execution.Login != false {
+		t.Fatal("mutating snapshot mutated original cfg.Execution")
+	}
+
+	// Test ToV2 roundtrip
+	cfgV2Roundtrip, err := cfg.ToV2()
+	if err != nil {
+		t.Fatalf("ToV2() error: %v", err)
+	}
+	if cfgV2Roundtrip.Execution == nil || *cfgV2Roundtrip.Execution.Login != false {
+		t.Fatalf("ToV2 roundtrip lost login: false")
+	}
+	if cfgV2Roundtrip.Nodes["n2"].Execution == nil || cfgV2Roundtrip.Nodes["n2"].Execution.Interpreter != "server" {
+		t.Fatalf("ToV2 roundtrip lost node execution")
+	}
+}
+
+func TestSchemaV2Execution_InvalidCombinationFails(t *testing.T) {
+	badYAML := `schema_version: 2
+credential:
+  default_store: s
+  stores: {s: {type: system}}
+identities: {u: {user: root, auth_type: key}}
+hosts: {h: {address: 127.0.0.1, port: 22}}
+execution:
+  interpreter: server
+  login: true
+nodes:
+  n: {host_ref: h, identity_ref: u}
+`
+	if _, err := UnmarshalV2([]byte(badYAML)); err == nil {
+		t.Fatal("expected error for server interpreter with login: true")
+	}
+
+	// Test unknown field rejection in execution
+	unknownFieldYAML := `schema_version: 2
+credential:
+  default_store: s
+  stores: {s: {type: system}}
+identities: {u: {user: root, auth_type: key}}
+hosts: {h: {address: 127.0.0.1, port: 22}}
+execution:
+  interpreter: server
+  unknown_opt: true
+nodes:
+  n: {host_ref: h, identity_ref: u}
+`
+	if _, err := UnmarshalV2([]byte(unknownFieldYAML)); err == nil {
+		t.Fatal("expected error for unknown field in execution block")
+	}
+
+	// Test node execution incompatible with global
+	incompatibleNodeYAML := `schema_version: 2
+credential:
+  default_store: s
+  stores: {s: {type: system}}
+identities: {u: {user: root, auth_type: key}}
+hosts: {h: {address: 127.0.0.1, port: 22}}
+execution:
+  interpreter: bash
+  launch_dialect: windows-cmd
+nodes:
+  n: {host_ref: h, identity_ref: u}
+`
+	if _, err := UnmarshalV2([]byte(incompatibleNodeYAML)); err == nil {
+		t.Fatal("expected error for bash interpreter with windows-cmd dialect")
 	}
 }
