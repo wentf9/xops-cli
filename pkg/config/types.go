@@ -3,6 +3,7 @@ package config
 import (
 	"github.com/wentf9/xops-cli/core/concurrent"
 	"github.com/wentf9/xops-cli/core/mcp/policy"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/models"
 )
 
@@ -16,6 +17,7 @@ type Configuration struct {
 	Guardrail             *policy.Config                           `yaml:"guardrail,omitempty"`
 	MCP                   *MCPConfig                               `yaml:"mcp,omitempty"`
 	PasswordPromptPattern string                                   `yaml:"password_prompt_pattern,omitempty"` // 全局级自定义密码提示正则
+	Execution             *ssh.ExecutionConfig                     `yaml:"execution,omitempty"`
 }
 
 // CanRememberCredentials checks configured write capability without accessing a

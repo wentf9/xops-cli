@@ -55,8 +55,15 @@ func IsBlocked(cmd string) bool {
 	return false
 }
 
-// AnalyzeCommand returns the risk level for an ssh_run command string.
+// AnalyzeCommand returns the risk level for an ssh_run command string under POSIX dialect.
 func AnalyzeCommand(cmd string) RiskLevel {
+	return AnalyzeCommandWithDialect(cmd, "posix")
+}
+
+// AnalyzeCommandWithDialect returns the risk level for an ssh_run command string under a specified launch dialect.
+// If the launch dialect is unknown or non-POSIX, POSIX safe prefixes cannot be trusted,
+// and the command is treated as at least Moderate.
+func AnalyzeCommandWithDialect(cmd string, dialect string) RiskLevel {
 	if cmd == "" {
 		return Safe
 	}
@@ -73,6 +80,11 @@ func AnalyzeCommand(cmd string) RiskLevel {
 	}
 
 	if containsChaining(normalized) {
+		return Moderate
+	}
+
+	// Unknown or non-POSIX dialects cannot safely assume POSIX commands/builtins.
+	if dialect != "" && dialect != "posix" {
 		return Moderate
 	}
 

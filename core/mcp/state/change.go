@@ -183,7 +183,7 @@ func (change *Change) compareTarget(id string, target, updated ports.Target, exi
 	if err != nil {
 		return err
 	}
-	if oldKey != newKey || target.Version != updated.Version || target.Disabled != updated.Disabled {
+	if oldKey != newKey || target.Version != updated.Version || target.ExecutionVersion != updated.ExecutionVersion || target.Disabled != updated.Disabled {
 		change.Affected[id] = struct{}{}
 		change.Retired = append(change.Retired, target.Plan)
 	}

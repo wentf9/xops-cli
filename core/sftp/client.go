@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"path"
 	"sync"
 	"time"
@@ -395,6 +396,41 @@ func (c *Client) Cwd(ctx context.Context) (cwd string, retErr error) {
 		return err
 	})
 	return cwd, retErr
+}
+
+// Stat returns the FileInfo for a remote path using the caller's cancellation boundary.
+func (c *Client) Stat(ctx context.Context, remotePath string) (os.FileInfo, error) {
+	var info os.FileInfo
+	err := c.Do(ctx, func(rawClient *sftp.Client) error {
+		var statErr error
+		info, statErr = rawClient.Stat(remotePath)
+		return statErr
+	})
+	return info, err
+}
+
+// Lstat returns the FileInfo for a remote path without following symbolic links,
+// using the caller's cancellation boundary.
+func (c *Client) Lstat(ctx context.Context, remotePath string) (os.FileInfo, error) {
+	var info os.FileInfo
+	err := c.Do(ctx, func(rawClient *sftp.Client) error {
+		var lstatErr error
+		info, lstatErr = rawClient.Lstat(remotePath)
+		return lstatErr
+	})
+	return info, err
+}
+
+// RealPath returns the canonicalized absolute path on the remote host,
+// using the caller's cancellation boundary.
+func (c *Client) RealPath(ctx context.Context, remotePath string) (string, error) {
+	var realPath string
+	err := c.Do(ctx, func(rawClient *sftp.Client) error {
+		var realErr error
+		realPath, realErr = rawClient.RealPath(remotePath)
+		return realErr
+	})
+	return realPath, err
 }
 
 // JoinPath 辅助函数：处理远程路径拼接 (SFTP 协议强制使用 forward slash)

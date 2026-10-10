@@ -11,6 +11,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/concurrent"
 	corepolicy "github.com/wentf9/xops-cli/core/mcp/policy"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
 	"gopkg.in/yaml.v3"
@@ -159,14 +160,15 @@ type IdentityV2 struct {
 
 // NodeV2 对应 Schema v2 中的节点配置，提权密码使用引用模型。
 type NodeV2 struct {
-	Alias                 []string        `yaml:"alias,omitempty"`
-	Tags                  []string        `yaml:"tags,omitempty"`
-	HostRef               string          `yaml:"host_ref"`
-	IdentityRef           string          `yaml:"identity_ref"`
-	ProxyJump             string          `yaml:"proxy_jump,omitempty"`
-	SudoMode              models.SudoMode `yaml:"sudo_mode"`
-	PrivilegePasswordRef  *credential.Ref `yaml:"privilege_password_ref,omitempty"`
-	PasswordPromptPattern string          `yaml:"password_prompt_pattern,omitempty"`
+	Alias                 []string             `yaml:"alias,omitempty"`
+	Tags                  []string             `yaml:"tags,omitempty"`
+	HostRef               string               `yaml:"host_ref"`
+	IdentityRef           string               `yaml:"identity_ref"`
+	ProxyJump             string               `yaml:"proxy_jump,omitempty"`
+	SudoMode              models.SudoMode      `yaml:"sudo_mode"`
+	PrivilegePasswordRef  *credential.Ref      `yaml:"privilege_password_ref,omitempty"`
+	PasswordPromptPattern string               `yaml:"password_prompt_pattern,omitempty"`
+	Execution             *ssh.ExecutionConfig `yaml:"execution,omitempty"`
 }
 
 // ConfigurationV2 是 Schema v2 的顶级规范配置 DTO。
@@ -180,6 +182,7 @@ type ConfigurationV2 struct {
 	Guardrail             *corepolicy.Config     `yaml:"guardrail,omitempty"`
 	MCP                   *MCPConfig             `yaml:"mcp,omitempty"`
 	PasswordPromptPattern string                 `yaml:"password_prompt_pattern,omitempty"`
+	Execution             *ssh.ExecutionConfig   `yaml:"execution,omitempty"`
 }
 
 // ValidateV2 对 ConfigurationV2 进行全面且严格的合法性校验。
@@ -189,6 +192,12 @@ func ValidateV2(cfg *ConfigurationV2) error {
 	}
 	if cfg.SchemaVersion != 2 {
 		return fmt.Errorf("%w: expected schema_version 2, got %d", ErrSchemaValidation, cfg.SchemaVersion)
+	}
+
+	if cfg.Execution != nil {
+		if err := cfg.Execution.Validate(); err != nil {
+			return fmt.Errorf("%w: global execution invalid: %w", ErrSchemaValidation, err)
+		}
 	}
 
 	if err := validateCredentialConfig(&cfg.Credential); err != nil {
@@ -327,6 +336,15 @@ func validateNodeRefs(nodeName string, node NodeV2, cfg *ConfigurationV2) error 
 			}
 		}
 	}
+
+	if node.Execution != nil {
+		if err := node.Execution.Validate(); err != nil {
+			return fmt.Errorf("%w: node %q execution invalid: %w", ErrSchemaValidation, nodeName, err)
+		}
+	}
+	if _, err := ssh.ResolveExecution(node.Execution, cfg.Execution); err != nil {
+		return fmt.Errorf("%w: node %q effective execution invalid: %w", ErrSchemaValidation, nodeName, err)
+	}
 	return nil
 }
 
@@ -408,6 +426,7 @@ func (c *Configuration) ToV2() (*ConfigurationV2, error) {
 		Nodes:                 make(map[string]NodeV2),
 		PasswordPromptPattern: c.PasswordPromptPattern,
 		MCP:                   c.MCP.Clone(),
+		Execution:             c.Execution.Clone(),
 	}
 
 	if c.Credential != nil {
@@ -465,6 +484,7 @@ func (c *Configuration) ToV2() (*ConfigurationV2, error) {
 					SudoMode:              n.SudoMode,
 					PrivilegePasswordRef:  n.PrivilegePasswordRef.Clone(),
 					PasswordPromptPattern: n.PasswordPromptPattern,
+					Execution:             n.Execution.Clone(),
 				}
 			}
 		}
@@ -492,6 +512,7 @@ func FromV2(v2 *ConfigurationV2) (*Configuration, error) {
 		Guardrail:             cloneGuardrail(v2.Guardrail),
 		MCP:                   v2.MCP.Clone(),
 		PasswordPromptPattern: v2.PasswordPromptPattern,
+		Execution:             v2.Execution.Clone(),
 	}
 
 	for k, h := range v2.Hosts {
@@ -519,6 +540,7 @@ func FromV2(v2 *ConfigurationV2) (*Configuration, error) {
 			SudoMode:              n.SudoMode,
 			PrivilegePasswordRef:  n.PrivilegePasswordRef.Clone(),
 			PasswordPromptPattern: n.PasswordPromptPattern,
+			Execution:             n.Execution.Clone(),
 		})
 	}
 

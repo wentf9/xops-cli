@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -34,11 +35,15 @@ func (t trust) Verify(ctx context.Context, _ ssh.HostKeyRequest, key cryptoSSH.P
 }
 
 func setupBackend(t *testing.T) (*sshexec.Backend, ports.OperationSnapshot, *sshfixture.Server, context.Context) {
+	return setupBackendWithHandler(t, nil)
+}
+
+func setupBackendWithHandler(t *testing.T, handler func(string, cryptoSSH.Channel)) (*sshexec.Backend, ports.OperationSnapshot, *sshfixture.Server, context.Context) {
 	t.Helper()
 	t.Cleanup(func() { goleak.VerifyNone(t) })
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	t.Cleanup(cancel)
-	server, err := sshfixture.New(ctx)
+	server, err := sshfixture.NewWithOptions(ctx, sshfixture.Options{ExecHandler: handler})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,5 +180,198 @@ func TestBackendStreamsAndCommitsThroughSeparatePermits(t *testing.T) {
 	}
 	if output.String() != "payload" {
 		t.Fatalf("download = %q", output.String())
+	}
+}
+
+func TestBackendExecutionDefaultsAndSudoConfiguration(t *testing.T) {
+	no := false
+	for _, test := range []struct {
+		name          string
+		node, request *ssh.ExecutionConfig
+		sudo          bool
+		mode          ssh.SudoMode
+		payload       string
+		invalid       bool
+	}{
+		{name: "legacy command", payload: "bash -l -c 'uptime'"},
+		{name: "explicit server", request: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer}, payload: "uptime"},
+		{name: "legacy sudo root", sudo: true, mode: ssh.SudoModeRoot, payload: "bash -l -c 'uptime'"},
+		{name: "configured sudo root", node: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchPOSIX, Login: &no}, sudo: true, mode: ssh.SudoModeRoot, payload: "bash -c 'uptime'"},
+		{name: "configured NOPASSWD", request: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchPOSIX, Login: &no}, sudo: true, mode: ssh.SudoModeSudoer, payload: "sudo -S -p '' bash -c 'uptime'"},
+		{name: "server escalation rejected", request: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer}, sudo: true, mode: ssh.SudoModeRoot, invalid: true},
+		{name: "unknown Bash launch rejected", request: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchUnknown}, sudo: true, mode: ssh.SudoModeRoot, invalid: true},
+		{name: "configured su rejected", request: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchPOSIX, Login: &no}, sudo: true, mode: ssh.SudoModeSu, invalid: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			commands := make(chan string, 4)
+			backend, view, server, ctx := setupBackendWithHandler(t, func(command string, ch cryptoSSH.Channel) {
+				commands <- command
+				if _, err := io.WriteString(ch, "fixture-output"); err != nil {
+					t.Error(err)
+					return
+				}
+				if _, err := ch.SendRequest("exit-status", false, cryptoSSH.Marshal(struct{ Status uint32 }{0})); err != nil {
+					t.Error(err)
+				}
+			})
+			target := view.Targets["node"]
+			target.Execution = test.node
+			target.Plan.Hops[0].SudoMode = test.mode
+			view.Targets["node"] = target
+			result, err := backend.Run(ctx, permit(t, ctx, view, ports.Execute), "node", ports.Command{Text: "uptime", Sudo: test.sudo, Execution: test.request})
+			if test.invalid {
+				if !errors.Is(err, ssh.ErrExecutionValidation) || result.Outcome != ssh.ExecutionNotStarted || server.Executed.Load() != 0 {
+					t.Fatalf("invalid execution dispatched: %+v, %v", result, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := <-commands; got != test.payload {
+				t.Fatalf("payload %q, want %q", got, test.payload)
+			}
+			if server.Executed.Load() != 1 {
+				t.Fatal("unexpected command or probe")
+			}
+		})
+	}
+}
+
+func TestBackendSudoSignalTerminationPreserved(t *testing.T) {
+	backend, view, _, ctx := setupBackendWithHandler(t, func(_ string, ch cryptoSSH.Channel) {
+		if _, err := io.WriteString(ch, "signal-output"); err != nil {
+			t.Error(err)
+			return
+		}
+		msg := struct {
+			Signal     string
+			CoreDumped bool
+			ErrorMsg   string
+			Lang       string
+		}{
+			Signal: "TERM",
+		}
+		if _, err := ch.SendRequest("exit-signal", false, cryptoSSH.Marshal(msg)); err != nil {
+			t.Error(err)
+		}
+	})
+	target := view.Targets["node"]
+	target.Plan.Hops[0].SudoMode = ssh.SudoModeRoot
+	view.Targets["node"] = target
+
+	result, err := backend.Run(ctx, permit(t, ctx, view, ports.Execute), "node", ports.Command{
+		Text: "sleep 10",
+		Sudo: true,
+	})
+	if err == nil {
+		t.Fatal("expected error for signal-terminated sudo command")
+	}
+	if result.Signal != "TERM" {
+		t.Fatalf("result.Signal = %q, want %q", result.Signal, "TERM")
+	}
+	if result.ExitCode != nil {
+		t.Fatalf("result.ExitCode = %v, want nil", *result.ExitCode)
+	}
+	if result.Outcome != ssh.ExecutionCompleted {
+		t.Fatalf("result.Outcome = %v, want %v", result.Outcome, ssh.ExecutionCompleted)
+	}
+}
+
+func TestBackendFilesystemRejectsNonPOSIXDialects(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		node    *ssh.ExecutionConfig
+		request *ssh.ExecutionConfig
+		cmd     ports.Command
+		invalid bool
+		wantCmd string
+	}{
+		{
+			name:    "server cmd rejected with filesystem flag",
+			node:    &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer, LaunchDialect: ssh.LaunchCmd},
+			cmd:     ports.Command{Text: "rm -rf '/tmp/test'", Filesystem: true},
+			invalid: true,
+		},
+		{
+			name:    "server cmd rejected with require posix flag",
+			node:    &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer, LaunchDialect: ssh.LaunchCmd},
+			cmd:     ports.Command{Text: "rm -rf '/tmp/test'", RequirePOSIX: true},
+			invalid: true,
+		},
+		{
+			name:    "server powershell rejected",
+			node:    &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer, LaunchDialect: ssh.LaunchPowerShell},
+			cmd:     ports.Command{Text: "cp -r '/tmp/a' '/tmp/b'", Filesystem: true},
+			invalid: true,
+		},
+		{
+			name:    "server unknown dialect rejected",
+			node:    &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer, LaunchDialect: ssh.LaunchUnknown},
+			cmd:     ports.Command{Text: "rm -rf '/tmp/test'", Filesystem: true},
+			invalid: true,
+		},
+		{
+			name:    "server unconfigured dialect defaults to unknown and rejected",
+			node:    &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer},
+			cmd:     ports.Command{Text: "rm -rf '/tmp/test'", Filesystem: true},
+			invalid: true,
+		},
+		{
+			name:    "server posix allowed",
+			node:    &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer, LaunchDialect: ssh.LaunchPOSIX},
+			cmd:     ports.Command{Text: "rm -rf '/tmp/test'", Filesystem: true},
+			invalid: false,
+			wantCmd: "rm -rf '/tmp/test'",
+		},
+		{
+			name:    "default bash allowed",
+			node:    nil,
+			cmd:     ports.Command{Text: "rm -rf '/tmp/test'", Filesystem: true},
+			invalid: false,
+			wantCmd: "bash -l -c 'rm -rf '\\''/tmp/test'\\'''",
+		},
+		{
+			name:    "explicit bash posix allowed",
+			node:    &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchPOSIX},
+			cmd:     ports.Command{Text: "rm -rf '/tmp/test'", Filesystem: true},
+			invalid: false,
+			wantCmd: "bash -c 'rm -rf '\\''/tmp/test'\\'''",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			commands := make(chan string, 4)
+			backend, view, server, ctx := setupBackendWithHandler(t, func(command string, ch cryptoSSH.Channel) {
+				commands <- command
+				if _, err := io.WriteString(ch, "ok"); err != nil {
+					t.Error(err)
+					return
+				}
+				if _, err := ch.SendRequest("exit-status", false, cryptoSSH.Marshal(struct{ Status uint32 }{0})); err != nil {
+					t.Error(err)
+				}
+			})
+			target := view.Targets["node"]
+			target.Execution = test.node
+			view.Targets["node"] = target
+			cmd := test.cmd
+			cmd.Execution = test.request
+			result, err := backend.Run(ctx, permit(t, ctx, view, ports.Execute), "node", cmd)
+			if test.invalid {
+				if !errors.Is(err, ssh.ErrExecutionValidation) || result.Outcome != ssh.ExecutionNotStarted || server.Executed.Load() != 0 {
+					t.Fatalf("expected execution validation error and no dispatch, got result=%+v, err=%v, executed=%d", result, err, server.Executed.Load())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := <-commands; got != test.wantCmd {
+				t.Fatalf("executed command %q, want %q", got, test.wantCmd)
+			}
+			if server.Executed.Load() != 1 {
+				t.Fatalf("expected 1 execution, got %d", server.Executed.Load())
+			}
+		})
 	}
 }

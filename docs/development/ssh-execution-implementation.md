@@ -28,11 +28,11 @@
 
 ### P2-A：配置及调用方绑定
 
-- [ ] 全局/Node/Playbook execution schema、presence、继承和 DTO/克隆/导入导出往返测试
-- [ ] MCP 输入、ports、宿主 backend 传递计划与结构化结果；审批展示及摘要绑定有效执行配置
-- [ ] Node/global execution 变化使旧审批失效，无关配置不误失效；请求方言声明不能降低风险
-- [ ] Playbook 脚本源字节和 node+step 计划冻结；不确定结果及附加清理错误禁止重试
-- [ ] ensure 结果来源协议、check/action/verify 分类及旧工作流迁移
+- [x] 全局/Node/Playbook execution schema、presence、继承和 DTO/克隆/导入导出往返测试
+- [x] MCP 输入、ports、宿主 backend 传递计划与结构化结果；审批展示及摘要绑定有效执行配置
+- [x] Node/global execution 变化使旧审批失效，无关配置不误失效；请求方言声明不能降低风险
+- [x] Playbook 脚本源字节和 node+step 计划冻结；不确定结果及附加清理错误禁止重试
+- [x] ensure 结果来源协议、check/action/verify 分类及旧工作流迁移
 
 ### P2-B：适配器及高级操作
 
@@ -100,3 +100,36 @@ Windows 原生运行、无 Bash Unix 适配器、PTY/提权和现有入口统一
    - `go test -race ./core/ssh ./cmd`：通过（`core/ssh` 27.5s，`cmd` 200.3s，无 data race，无泄漏）
    - `python3 scripts/check_core.py`：Linux/Windows/macOS 依赖边界通过，独立抽取模块 build/test 全量通过
    - `npm run docs:build`：通过，双语文档路由与链接校验通过
+
+## P2-A 验证记录（2026-10-09）
+
+本批完成上列 P2-A 全部条目：
+1. **执行配置模型与往返继承**：`core/ssh/execution_config.go` 实现 `ExecutionConfig`（`interpreter`、`launch_dialect`、`login` 字段与严格校验），支持未知字段拒绝与 `login: false` 显式保留；完成 `ResolveExecution` 与 `EffectiveExecution` 多层继承覆盖。在全局（`models.Configuration`）、Node（`models.Node`）、Playbook（`Settings` 与 `Step`）完成配置接入、V2 Schema 往返序列化与快照防御性克隆。
+2. **MCP 与 Ports 结构化执行绑定**：`ports.CommandResult` 扩展结构化字段（`PlanDigest`、`Phase`、`Outcome`、`ExitCode`、`Signal`、`Truncated`、`ExecutionErr`、`IOErr`、`CleanupErr`）；`OperationSnapshot.Digest` 绑定有效执行版本，使得执行语义变更触发摘要更新与旧审批自动失效，无关配置（如 prompt 正则、新增无关节点）不误失效；`guardrail.AnalyzeCommandWithDialect` 阻止通过客户端请求方言伪装安全。
+3. **Playbook 脚本源字节与计划冻结**：`Engine.Run` 在分发前通过 `preloadScripts` 完成全量脚本源文件有界读取并缓存；所有目标节点与多次重试共享同一份源字节，执行阶段禁止重读磁盘。`runShell` 与 `runScript` 冻结 `CommandPlan` 与执行选项；失败处理严格区分重试边界：仅确认完成且无附加清理/IO 错误的非零退出码允许重试，`Outcome == ExecutionUnknown`、`ExecutionNotStarted`、上下文取消或附加清理错误严格禁止重试。
+4. **ensure 结果协议与分类**：`runEnsure` 接入受控结果帧协议（`trap ... EXIT`），可靠区分退出码 0（`StatusSkipped`，跳过动作）、退出码 127（`StatusFailed`，无法区分缺失与故障，禁止动作）、结果帧丢失或执行故障（`StatusFailed`，禁止动作）以及确认非零状态（触发 action 并运行 verify 验证）；server 模式缺少 shell 结果适配器时提前拒绝，控制帧与用户输出隔离剥离。
+5. **全量验收指标**：
+   - `go build ./...`：通过
+   - `go test ./...`：通过
+   - `golangci-lint run ./...`：0 issues
+   - `python3 scripts/check_core.py`：三平台依赖边界及抽取模块 build/test 全量通过
+   - `npm run docs:build`：通过
+
+## P2-A 评审修复：执行默认、风险方言与提权
+
+- P1/P2 未配置 execution（包括空对象）的 MCP 命令继续使用 POSIX `bash -l -c`；只有显式 server 才原样执行。默认切换仍留到 P3，普通命令与审批计划使用同一阶段默认。
+- 显式 server 缺少可信启动方言时按 unknown 分类，不套用 POSIX 安全前缀放行。请求自报 posix 不能替代节点元数据，配置/计划错误在审批前拒绝。
+- 两个 MCP backend 在连接和 sudo 分流之前解析、验证配置。受支持的 Bash sudo 路径显式传递有效 login；Playbook shell、ensure.check/action/verify 与脚本复用该校验。server 提权、不兼容启动方言和尚未适配的配置化 su 在用户操作开始前拒绝；无配置的旧 su 语义保留。
+- shebang 或脚本默认选中解释器后，重新验证最终配置并冻结登录模式。脚本声明不能证明外层启动方言；Bash 脚本不能携带 cmd/PowerShell/unknown 启动环境继续落入旧 Bash 路径。
+
+回归覆盖两个 MCP backend 的实际 SSH 载荷、nil/空配置兼容默认、login:false 的 root/NOPASSWD sudo、非法提权零派发，MCP 审批前的 unknown 方言拦截与防自报 POSIX 放行，以及 Playbook sudo shell/ensure 三阶段的登录选项和脚本执行前校验。build、全量 test、lint、相关包全量 race 与 core 独立抽取验证通过。
+
+## SFTP 复制路径评审修复（2026-10-10）
+
+MCP `xops_fs_cp` 在调用保持目录项语义的 `RemoteCopy` 之前，单独解析复制操作数：普通源符号链接仍复制为链接；以 `/` 结尾的目录源跟随目录链接，但使用原始源 basename 构造既有目录下的目的路径；以 `/.` 结尾时只复制内容。路径判定只识别实际 `/` 分隔符，保留空白、制表符和反斜杠等合法文件名字符。
+
+常规文件复制到既有文件符号链接时，解析绝对/相对链接及链接链后更新目标文件，保留原链接本身；既有目的目录追加 basename 后，同样检查最终目的项。源链接的目录项复制不应用该跟随规则。悬空目的文件链接和文件覆盖目录组合在写入前拒绝。
+
+回归通过实际 MCP 调用和 SSH/SFTP 协议验证：目标文件链接保留、相对目标/链接链、目录源 `/link/` 与 `/link/.` 对新建/既有目的目录的区别、复制目录独立于源、点号加空白/反斜杠的字面文件名不导致目录复制，以及普通源链接/悬空目的链接边界。测试 peer 的 REALPATH 保持词法行为，验证未自动解引用的服务端也能正确解析最终链接。
+
+验证结果：`go build ./...`、`go test ./...`、`golangci-lint run ./...`（0 issues）、MCP/SFTP/backend/host 相关包全量 race、文档构建和 core 独立抽取 build/test 均通过。

@@ -27,6 +27,8 @@ xops play --help
 
 `stop` stops subsequent steps on the current host; `abort_all` cancels other host tasks after failure; `continue` allows subsequent steps on the current host. Check target tags and privilege configuration before running.
 
+The current source supports execution configuration. Without it, MCP and Playbook commands retain login Bash defaults. An explicit server with an unknown launch dialect follows uncertain-risk policy and cannot receive a POSIX safe-prefix exemption. Escalation applies the resolved login option; unsupported server escalation and configured su combinations fail before execution. Selecting Bash through a shebang still requires a known POSIX launch dialect; cmd/PowerShell dialects cannot be discarded before running the script. See the [execution guide](./exec) for the available CLI execution options.
+
 ## MCP
 
 ```bash
@@ -46,3 +48,5 @@ See the [MCP reference](../reference/commands/xops-mcp) for subcommands and opti
 Stdio also provides [SSH tunnel tools](mcp-tunnels) to create, inspect and stop local (`-L`) and remote (`-R`) forwards.
 
 [LAN HTTP setup, client file transfers and recovery](mcp-http).
+
+`xops_fs_cp` copies through SFTP: ordinary source links remain links, directory source `link/` follows the directory while retaining `link` as the destination basename, and `link/.` copies contents directly. Copying a regular file onto an existing file link updates its target and preserves the link; dangling destination file links are rejected. Spaces and backslashes in paths are literal characters; only `/` is a separator.

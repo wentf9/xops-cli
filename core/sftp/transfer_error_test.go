@@ -33,8 +33,37 @@ func newTestSFTPClient(t *testing.T, commandErr error) *Client {
 	return newTestSFTPClientWithHandlers(t, handlers)
 }
 
+type directorySetstatFileCmder struct {
+	delegate pkgsftp.FileCmder
+	lister   pkgsftp.FileLister
+}
+
+func (c directorySetstatFileCmder) Filecmd(r *pkgsftp.Request) error {
+	err := c.delegate.Filecmd(r)
+	if errors.Is(err, os.ErrInvalid) && r.Method == "Setstat" && c.lister != nil {
+		statReq := pkgsftp.NewRequest("Stat", r.Filepath)
+		if _, statErr := c.lister.Filelist(statReq); statErr == nil {
+			return nil
+		}
+	}
+	return err
+}
+
+func (c directorySetstatFileCmder) PosixRename(r *pkgsftp.Request) error {
+	if pr, ok := c.delegate.(pkgsftp.PosixRenameFileCmder); ok {
+		return pr.PosixRename(r)
+	}
+	return errors.New("posix rename not supported")
+}
+
 func newTestSFTPClientWithHandlers(t *testing.T, handlers pkgsftp.Handlers) *Client {
 	t.Helper()
+	if handlers.FileCmd != nil && handlers.FileList != nil {
+		handlers.FileCmd = directorySetstatFileCmder{
+			delegate: handlers.FileCmd,
+			lister:   handlers.FileList,
+		}
+	}
 	serverConn, clientConn := net.Pipe()
 	server := pkgsftp.NewRequestServer(serverConn, handlers)
 	serverErr := make(chan error, 1)

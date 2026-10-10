@@ -1,6 +1,9 @@
 package guardrail
 
-import "testing"
+import (
+	"github.com/wentf9/xops-cli/core/ssh"
+	"testing"
+)
 
 func TestIsBlocked(t *testing.T) {
 	tests := []struct {
@@ -106,5 +109,65 @@ func TestExtractFirstWord(t *testing.T) {
 				t.Errorf("extractFirstWord(%q) = %q, want %q", tt.cmd, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestAnalyzeCommandDialect(t *testing.T) {
+	// Under POSIX dialect, safe prefix commands are Safe
+	if got := AnalyzeCommandWithDialect("uptime", "posix"); got != Safe {
+		t.Fatalf("uptime under posix: got %v, want Safe", got)
+	}
+	if got := AnalyzeCommandWithDialect("ls -la", "posix"); got != Safe {
+		t.Fatalf("ls -la under posix: got %v, want Safe", got)
+	}
+
+	// Under unknown or non-POSIX dialect, safe prefix commands must NOT be assumed Safe
+	for _, dialect := range []string{"unknown", "cmd", "powershell", "windows-cmd"} {
+		if got := AnalyzeCommandWithDialect("uptime", dialect); got != Moderate {
+			t.Fatalf("uptime under %q: got %v, want Moderate", dialect, got)
+		}
+		if got := AnalyzeCommandWithDialect("ls -la", dialect); got != Moderate {
+			t.Fatalf("ls -la under %q: got %v, want Moderate", dialect, got)
+		}
+	}
+
+	// Dangerous commands remain Dangerous under any dialect
+	for _, dialect := range []string{"posix", "unknown", "cmd", "powershell"} {
+		if got := AnalyzeCommandWithDialect("rm -rf /", dialect); got != Dangerous {
+			t.Fatalf("rm -rf / under %q: got %v, want Dangerous", dialect, got)
+		}
+	}
+}
+
+func TestClassifyDialect(t *testing.T) {
+	// Unknown dialect cannot be Safe even for read-only commands
+	riUnknown := RiskInput{
+		ToolName: "xops_ssh_run",
+		Command:  "uptime",
+		Dialect:  "unknown",
+	}
+	if got := Classify(riUnknown); got != Moderate {
+		t.Fatalf("Classify uptime unknown dialect: got %v, want Moderate", got)
+	}
+
+	// Posix dialect for uptime is Safe
+	riPosix := RiskInput{
+		ToolName: "xops_ssh_run",
+		Command:  "uptime",
+		Dialect:  "posix",
+	}
+	if got := Classify(riPosix); got != Safe {
+		t.Fatalf("Classify uptime posix dialect: got %v, want Safe", got)
+	}
+}
+
+func TestClassifyServerWithoutDialectIsNotPOSIXSafe(t *testing.T) {
+	input := RiskInput{ToolName: "xops_ssh_run", Command: "ls", Execution: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer}}
+	if got := Classify(input); got != Moderate {
+		t.Fatalf("server with unknown dialect classified %s", got)
+	}
+	input.Execution = nil
+	if got := Classify(input); got != Safe {
+		t.Fatalf("legacy default changed classification: %s", got)
 	}
 }

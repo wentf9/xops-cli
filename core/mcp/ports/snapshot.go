@@ -42,9 +42,35 @@ func (s OperationSnapshot) Clone() OperationSnapshot {
 	for id, target := range s.Targets {
 		target.Info = cloneNode(target.Info)
 		target.Plan.Hops = slices.Clone(target.Plan.Hops)
+		if target.Execution != nil {
+			target.Execution = target.Execution.Clone()
+		}
 		s.Targets[id] = target
 	}
 	return s
+}
+
+// ExecutionVersion computes a stable dependency version for an effective execution configuration.
+// It incorporates the adapter version and distinguishes inherited login from explicit false.
+func ExecutionVersion(exec *ssh.ExecutionConfig) string {
+	const adapterVersion = "v1"
+	var raw struct {
+		Adapter       string            `json:"adapter"`
+		Interpreter   ssh.Interpreter   `json:"interpreter,omitempty"`
+		LaunchDialect ssh.LaunchDialect `json:"launchDialect,omitempty"`
+		Login         ssh.LoginMode     `json:"login,omitempty"`
+	}
+	raw.Adapter = adapterVersion
+	if exec != nil {
+		raw.Interpreter = exec.Interpreter
+		raw.LaunchDialect = exec.LaunchDialect
+		raw.Login = exec.LoginMode()
+	} else {
+		raw.Login = ssh.LoginInherit
+	}
+	data, _ := json.Marshal(raw)
+	sum := sha256.Sum256(data)
+	return "execution-v1:" + hex.EncodeToString(sum[:])
 }
 
 func (s OperationSnapshot) Resolve(selector string) (string, Target, error) {
@@ -75,8 +101,8 @@ func (s OperationSnapshot) Digest() (string, error) {
 		return "", errors.New("snapshot publication domain is required")
 	}
 	type targetIdentity struct {
-		ConnectionKey, Version string
-		Disabled               bool
+		ConnectionKey, Version, ExecutionVersion string
+		Disabled                                 bool
 	}
 	targets := make(map[string]targetIdentity, len(s.Targets))
 	for id, target := range s.Targets {
@@ -87,7 +113,7 @@ func (s OperationSnapshot) Digest() (string, error) {
 		if target.Info.ID != id || target.Plan.Hops[len(target.Plan.Hops)-1].NodeID != id {
 			return "", errors.New("snapshot node and connection plan identities disagree")
 		}
-		targets[id] = targetIdentity{key, target.Version, target.Disabled}
+		targets[id] = targetIdentity{key, target.Version, target.ExecutionVersion, target.Disabled}
 	}
 	selectors := make(map[string]string, len(s.Selectors))
 	maps.Copy(selectors, s.Selectors)

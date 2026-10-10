@@ -1,6 +1,10 @@
 package guardrail
 
-import "net/netip"
+import (
+	"net/netip"
+
+	"github.com/wentf9/xops-cli/core/ssh"
+)
 
 // RiskLevel represents the danger level of a tool invocation.
 type RiskLevel int
@@ -50,6 +54,9 @@ type RiskInput struct {
 	Details    string   // deferred-operation size, digest and overwrite information
 	TunnelMode string   // local or remote SSH forwarding
 	ListenHost string   // normalized IP literal, never resolved through DNS
+	Execution  *ssh.ExecutionConfig
+	Dialect    string
+	PlanDigest string
 }
 
 // toolBaseRisk maps tool names to their static (baseline) risk level.
@@ -79,7 +86,7 @@ var toolBaseRisk = map[string]RiskLevel{
 }
 
 // Classify returns the effective risk level for a tool invocation.
-// For ssh_run, it refines the level based on command analysis.
+// For ssh_run, it refines the level based on command analysis and launch dialect.
 func Classify(input RiskInput) RiskLevel {
 	base, ok := toolBaseRisk[input.ToolName]
 	if !ok {
@@ -88,7 +95,14 @@ func Classify(input RiskInput) RiskLevel {
 
 	if input.ToolName == "xops_ssh_run" {
 		if input.Command != "" {
-			base = AnalyzeCommand(input.Command)
+			dialect := input.Dialect
+			if dialect == "" && input.Execution != nil {
+				dialect = string(input.Execution.CommandOptions().LaunchDialect)
+				if dialect == "" {
+					dialect = string(ssh.LaunchUnknown)
+				}
+			}
+			base = AnalyzeCommandWithDialect(input.Command, dialect)
 		}
 		if input.Sudo && base < Moderate {
 			base = Moderate

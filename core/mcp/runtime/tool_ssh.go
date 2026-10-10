@@ -2,12 +2,14 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
-	"errors"
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/wentf9/xops-cli/core/mcp/guardrail"
 	"github.com/wentf9/xops-cli/core/mcp/ports"
+	"github.com/wentf9/xops-cli/core/ssh"
 )
 
 type ListNodesInput struct {
@@ -52,15 +54,21 @@ func (r *Runtime) listNodesHandler(parent context.Context, req *mcp.CallToolRequ
 }
 
 type SshRunInput struct {
-	NodeID  string `json:"nodeID" jsonschema:"The ID of the node to execute command on"`
-	Command string `json:"command" jsonschema:"The shell command to execute"`
-	Sudo    bool   `json:"sudo,omitempty" jsonschema:"Whether to use sudo to execute the command"`
+	NodeID    string               `json:"nodeID" jsonschema:"The ID of the node to execute command on"`
+	Command   string               `json:"command" jsonschema:"The shell command to execute"`
+	Sudo      bool                 `json:"sudo,omitempty" jsonschema:"Whether to use sudo to execute the command"`
+	Execution *ssh.ExecutionConfig `json:"execution,omitempty" jsonschema:"Optional execution configuration overriding node/global defaults"`
 }
 
 type SshRunOutput struct {
-	Output string `json:"output" jsonschema:"Command stdout/stderr"`
-	Status string `json:"status" jsonschema:"Operation status"`
-	Error  string `json:"error,omitempty" jsonschema:"Error message if failed"`
+	Output     string  `json:"output" jsonschema:"Command stdout/stderr"`
+	Status     string  `json:"status" jsonschema:"Operation status"`
+	Error      string  `json:"error,omitempty" jsonschema:"Error message if failed"`
+	Outcome    string  `json:"outcome,omitempty" jsonschema:"Execution outcome: not_started, completed, or unknown"`
+	ExitCode   *uint32 `json:"exitCode,omitempty" jsonschema:"Exit status code if received"`
+	Signal     string  `json:"signal,omitempty" jsonschema:"Termination signal if terminated by signal"`
+	PlanDigest string  `json:"planDigest,omitempty" jsonschema:"Digest of the executed command plan"`
+	Truncated  bool    `json:"truncated,omitempty" jsonschema:"Whether output exceeded limit and was truncated"`
 }
 
 func (r *Runtime) sshRunHandler(ctx context.Context, req *mcp.CallToolRequest, input SshRunInput) (*mcp.CallToolResult, SshRunOutput, error) {
@@ -68,7 +76,7 @@ func (r *Runtime) sshRunHandler(ctx context.Context, req *mcp.CallToolRequest, i
 		return nil, SshRunOutput{}, fmt.Errorf("nodeID and command are required")
 	}
 
-	result, execErr := r.commandResult(ctx, input.NodeID, input.Command, input.Sudo)
+	result, execErr := r.commandResult(ctx, input.NodeID, input.Command, input.Sudo, input.Execution)
 	if execErr != nil && !result.Connected {
 		return nil, SshRunOutput{}, execErr
 	}
@@ -82,9 +90,14 @@ func (r *Runtime) sshRunHandler(ctx context.Context, req *mcp.CallToolRequest, i
 	}
 
 	return nil, SshRunOutput{
-		Output: output,
-		Status: status,
-		Error:  errStr,
+		Output:     output,
+		Status:     status,
+		Error:      errStr,
+		Outcome:    string(result.Outcome),
+		ExitCode:   result.ExitCode,
+		Signal:     result.Signal,
+		PlanDigest: result.PlanDigest,
+		Truncated:  result.Truncated,
 	}, nil
 }
 
@@ -104,16 +117,37 @@ func (r *Runtime) registerSSH(server *mcp.Server, g *guardrail.Guardrail) {
 			Name:        "xops_ssh_run",
 			Description: "Execute a shell command on a specific SSH node managed by XOps. Returns the command output.",
 			Annotations: &mcp.ToolAnnotations{DestructiveHint: &destructive},
+			InputSchema: sshRunInputSchema(),
 		},
 		withOperation(r, g, "xops_ssh_run",
 			func(in SshRunInput) guardrail.RiskInput {
 				return guardrail.RiskInput{
-					NodeID:  in.NodeID,
-					Command: in.Command,
-					Sudo:    in.Sudo,
+					NodeID:    in.NodeID,
+					Command:   in.Command,
+					Sudo:      in.Sudo,
+					Execution: in.Execution,
 				}
 			},
 			r.sshRunHandler,
 		),
 	)
+}
+
+func sshRunInputSchema() *jsonschema.Schema {
+	schema, err := jsonschema.For[SshRunInput](nil)
+	if err != nil {
+		panic(fmt.Sprintf("generate sshRunInputSchema: %v", err))
+	}
+	if execSchema, ok := schema.Properties["execution"]; ok && execSchema != nil {
+		if execSchema.Properties != nil {
+			execSchema.Properties["launch_dialect"] = &jsonschema.Schema{
+				Type: "string",
+			}
+			execSchema.Properties["login"] = &jsonschema.Schema{
+				Types: []string{"null", "boolean", "string"},
+			}
+			execSchema.PropertyOrder = []string{"interpreter", "launchDialect", "launch_dialect", "login"}
+		}
+	}
+	return schema
 }

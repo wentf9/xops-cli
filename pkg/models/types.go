@@ -1,6 +1,9 @@
 package models
 
-import "github.com/wentf9/xops-cli/pkg/credential"
+import (
+	"github.com/wentf9/xops-cli/core/ssh"
+	"github.com/wentf9/xops-cli/pkg/credential"
+)
 
 // Identity 定义认证信息
 type Identity struct {
@@ -52,6 +55,9 @@ type Node struct {
 
 	// 交互式拦截配置
 	PasswordPromptPattern string `yaml:"password_prompt_pattern,omitempty"` // 节点级自定义密码提示正则
+
+	// 执行环境配置
+	Execution *ssh.ExecutionConfig `yaml:"execution,omitempty" json:"execution,omitempty"`
 }
 
 // NodeFilter 用于批量操作时筛选节点

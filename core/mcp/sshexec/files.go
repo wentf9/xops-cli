@@ -3,6 +3,7 @@ package sshexec
 import (
 	"context"
 	"io"
+	"os"
 
 	pkgsftp "github.com/pkg/sftp"
 	"github.com/wentf9/xops-cli/core/mcp/ports"
@@ -52,4 +53,44 @@ func (s *fileSession) CreatePrivateExclusive(ctx context.Context, name string, w
 	}
 	defer cancel()
 	return s.Client.CreatePrivateExclusive(work, name, write)
+}
+func (s *fileSession) RemoveAll(ctx context.Context, remotePath string) error {
+	work, cancel, err := s.backend.work(ctx, s.permit, s.phases...)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	return s.Client.RemoveAll(work, remotePath)
+}
+func (s *fileSession) RemoteCopy(ctx context.Context, src, dst string) error {
+	work, cancel, err := s.backend.work(ctx, s.permit, s.phases...)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	return s.Client.RemoteCopy(work, src, dst)
+}
+func (s *fileSession) Stat(ctx context.Context, remotePath string) (os.FileInfo, error) {
+	work, cancel, err := s.backend.work(ctx, s.permit, s.phases...)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	return s.Client.Stat(work, remotePath)
+}
+func (s *fileSession) Lstat(ctx context.Context, remotePath string) (os.FileInfo, error) {
+	work, cancel, err := s.backend.work(ctx, s.permit, s.phases...)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	return s.Client.Lstat(work, remotePath)
+}
+func (s *fileSession) RealPath(ctx context.Context, remotePath string) (string, error) {
+	work, cancel, err := s.backend.work(ctx, s.permit, s.phases...)
+	if err != nil {
+		return "", err
+	}
+	defer cancel()
+	return s.Client.RealPath(work, remotePath)
 }

@@ -4,7 +4,9 @@ package ports
 
 import (
 	"context"
+	"errors"
 	"io"
+	"os"
 
 	pkgsftp "github.com/pkg/sftp"
 	"github.com/wentf9/xops-cli/core/mcp/guardrail"
@@ -41,8 +43,10 @@ type Target struct {
 	Plan ssh.ConnectionPlan
 	// Version changes only when execution dependencies or relevant policy inputs
 	// change. A display-only edit must not automatically change this version.
-	Version  string
-	Disabled bool
+	Version          string
+	ExecutionVersion string
+	Execution        *ssh.ExecutionConfig
+	Disabled         bool
 }
 
 type OperationSnapshot struct {
@@ -112,14 +116,63 @@ type NoopAudit struct{}
 func (NoopAudit) Append(ctx context.Context, _ AuditEvent) error { return ctx.Err() }
 
 type Command struct {
-	Text string
-	Sudo bool
+	Text         string
+	Sudo         bool
+	Execution    *ssh.ExecutionConfig
+	Plan         *ssh.CommandPlan
+	Filesystem   bool
+	RequirePOSIX bool
 }
 
 type CommandResult struct {
-	Output    string
-	Connected bool
+	Output       string
+	Connected    bool
+	PlanDigest   string
+	Phase        string
+	Outcome      ssh.ExecutionOutcome
+	ExitCode     *uint32
+	Signal       string
+	Truncated    bool
+	ExecutionErr error
+	IOErr        error
+	CleanupErr   error
 }
+
+func (r CommandResult) Err() error {
+	return errors.Join(r.ExecutionErr, r.IOErr, r.CleanupErr)
+}
+
+func FromSSHResult(r ssh.CommandResult, connected bool) CommandResult {
+	return CommandResult{
+		Output:       r.Output,
+		Connected:    connected,
+		PlanDigest:   r.PlanDigest,
+		Phase:        r.Phase,
+		Outcome:      r.Outcome,
+		ExitCode:     r.ExitCode,
+		Signal:       r.Signal,
+		Truncated:    r.Truncated,
+		ExecutionErr: r.ExecutionErr,
+		IOErr:        r.IOErr,
+		CleanupErr:   r.CleanupErr,
+	}
+}
+
+func (r CommandResult) ToSSHResult() ssh.CommandResult {
+	return ssh.CommandResult{
+		PlanDigest:   r.PlanDigest,
+		Phase:        r.Phase,
+		Outcome:      r.Outcome,
+		ExitCode:     r.ExitCode,
+		Signal:       r.Signal,
+		Output:       r.Output,
+		Truncated:    r.Truncated,
+		ExecutionErr: r.ExecutionErr,
+		IOErr:        r.IOErr,
+		CleanupErr:   r.CleanupErr,
+	}
+}
+
 type InspectRequest struct {
 	Path      string
 	Upload    bool
@@ -133,6 +186,11 @@ type FileSession interface {
 	Upload(context.Context, string, string, sftp.ProgressCallback) error
 	Download(context.Context, string, string, sftp.ProgressCallback) error
 	CreatePrivateExclusive(context.Context, string, func(io.Writer) error) (bool, bool, error)
+	RemoveAll(context.Context, string) error
+	RemoteCopy(context.Context, string, string) error
+	Stat(context.Context, string) (os.FileInfo, error)
+	Lstat(context.Context, string) (os.FileInfo, error)
+	RealPath(context.Context, string) (string, error)
 	Close() error
 }
 

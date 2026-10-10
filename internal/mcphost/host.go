@@ -19,6 +19,7 @@ import (
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
+	cryptoSSH "golang.org/x/crypto/ssh"
 )
 
 type host struct {
@@ -125,7 +126,26 @@ func (h *host) resolveSnapshot(ctx context.Context, request ports.ResolveRequest
 		if err != nil {
 			return ports.OperationSnapshot{}, err
 		}
-		view.Targets[id] = ports.Target{Info: info, Plan: plan, Version: version}
+		var globalExec *ssh.ExecutionConfig
+		if cfg := p.Snapshot(); cfg != nil {
+			globalExec = cfg.Execution
+		}
+		node, _, _, err := p.Resolve(id)
+		if err != nil {
+			return ports.OperationSnapshot{}, err
+		}
+		effectiveExec, err := ssh.ResolveExecution(node.Execution, globalExec)
+		if err != nil {
+			return ports.OperationSnapshot{}, err
+		}
+		execVersion := ports.ExecutionVersion(effectiveExec)
+		view.Targets[id] = ports.Target{
+			Info:             info,
+			Plan:             plan,
+			Version:          version,
+			ExecutionVersion: execVersion,
+			Execution:        effectiveExec,
+		}
 		view.Selectors[selector] = id
 	}
 	return view, nil
@@ -216,21 +236,83 @@ func (b *backend) Run(ctx context.Context, permit ports.Permit, nodeID string, c
 		return ports.CommandResult{}, err
 	}
 	defer cancel()
-	id, _, err := permit.Snapshot().Resolve(nodeID)
+	id, target, err := permit.Snapshot().Resolve(nodeID)
 	if err != nil {
 		return ports.CommandResult{}, err
+	}
+	effectiveExec, err := ssh.ResolveExecution(command.Execution, target.Execution)
+	if err != nil {
+		return ports.CommandResult{
+			Outcome:      ssh.ExecutionNotStarted,
+			ExecutionErr: err,
+		}, err
+	}
+	if command.Sudo {
+		if _, err := effectiveExec.SudoRunOptions(command.Text); err != nil {
+			return ports.CommandResult{Outcome: ssh.ExecutionNotStarted, ExecutionErr: err}, err
+		}
+	}
+	var plan ssh.CommandPlan
+	if command.Plan != nil {
+		plan = *command.Plan
+	} else {
+		plan, err = ssh.PlanCommand(command.Text, effectiveExec.CommandOptions())
+		if err != nil {
+			return ports.CommandResult{
+				Outcome:      ssh.ExecutionNotStarted,
+				ExecutionErr: err,
+			}, err
+		}
+	}
+	if command.Filesystem || command.RequirePOSIX {
+		if plan.LaunchDialect() != ssh.LaunchPOSIX {
+			err = fmt.Errorf("%w: non-POSIX execution dialect %q is not supported for generated filesystem commands", ssh.ErrExecutionValidation, plan.LaunchDialect())
+			return ports.CommandResult{
+				Outcome:      ssh.ExecutionNotStarted,
+				ExecutionErr: err,
+			}, err
+		}
 	}
 	client, err := b.connector.Connect(work, id)
 	if err != nil {
 		return ports.CommandResult{}, err
 	}
-	var output string
 	if command.Sudo {
-		output, err = client.RunWithSudo(work, command.Text)
-	} else {
-		output, err = client.Run(work, command.Text)
+		output, err := client.RunWithSudoExecution(work, command.Text, effectiveExec)
+		var exitCode *uint32
+		var signal string
+		outcome := ssh.ExecutionCompleted
+		if err != nil {
+			var exitErr *cryptoSSH.ExitError
+			if errors.As(err, &exitErr) {
+				if sig := exitErr.Signal(); sig != "" {
+					signal = sig
+					exitCode = nil
+				} else {
+					code := uint32(exitErr.ExitStatus())
+					exitCode = &code
+				}
+			} else if errors.Is(err, ssh.ErrExecutionValidation) {
+				outcome = ssh.ExecutionNotStarted
+			} else {
+				outcome = ssh.ExecutionUnknown
+			}
+		} else {
+			zero := uint32(0)
+			exitCode = &zero
+		}
+		return ports.CommandResult{
+			Output:       output,
+			Connected:    true,
+			Outcome:      outcome,
+			ExitCode:     exitCode,
+			Signal:       signal,
+			ExecutionErr: err,
+		}, err
 	}
-	return ports.CommandResult{Output: output, Connected: true}, err
+
+	res := client.ExecuteCommand(work, plan)
+	return ports.FromSSHResult(res, true), res.Err()
 }
 func (b *backend) files(ctx context.Context, permit ports.Permit, nodeID string, phases ...ports.Phase) (*sftp.Client, error) {
 	work, cancel, err := ports.WorkContext(ctx, permit, phases...)

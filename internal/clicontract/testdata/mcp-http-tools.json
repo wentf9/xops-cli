@@ -745,6 +745,32 @@
           "description": "The shell command to execute",
           "type": "string"
         },
+        "execution": {
+          "additionalProperties": false,
+          "description": "Optional execution configuration overriding node/global defaults",
+          "properties": {
+            "interpreter": {
+              "type": "string"
+            },
+            "launchDialect": {
+              "type": "string"
+            },
+            "launch_dialect": {
+              "type": "string"
+            },
+            "login": {
+              "type": [
+                "null",
+                "boolean",
+                "string"
+              ]
+            }
+          },
+          "type": [
+            "null",
+            "object"
+          ]
+        },
         "nodeID": {
           "description": "The ID of the node to execute command on",
           "type": "string"
@@ -768,13 +794,38 @@
           "description": "Error message if failed",
           "type": "string"
         },
+        "exitCode": {
+          "description": "Exit status code if received",
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": [
+            "null",
+            "integer"
+          ]
+        },
+        "outcome": {
+          "description": "Execution outcome: not_started, completed, or unknown",
+          "type": "string"
+        },
         "output": {
           "description": "Command stdout/stderr",
+          "type": "string"
+        },
+        "planDigest": {
+          "description": "Digest of the executed command plan",
+          "type": "string"
+        },
+        "signal": {
+          "description": "Termination signal if terminated by signal",
           "type": "string"
         },
         "status": {
           "description": "Operation status",
           "type": "string"
+        },
+        "truncated": {
+          "description": "Whether output exceeded limit and was truncated",
+          "type": "boolean"
         }
       },
       "required": [

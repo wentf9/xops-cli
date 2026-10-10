@@ -12,6 +12,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/wentf9/xops-cli/core/mcp/guardrail"
 	"github.com/wentf9/xops-cli/core/mcp/ports"
+	"github.com/wentf9/xops-cli/core/ssh"
 )
 
 type operationKey struct{}
@@ -79,6 +80,37 @@ func (r *Runtime) operationContext(ctx context.Context, view ports.OperationSnap
 	return context.WithValue(guardrail.WithPolicy(ctx, view.Policy, digest), operationKey{}, op), op, nil
 }
 
+// Freeze command semantics before policy evaluation. Missing configuration is
+// legacy Bash; an explicit server environment without trusted dialect metadata
+// is unknown, never the legacy empty-string POSIX safe-prefix classification.
+func resolveExecutionRisk(input guardrail.RiskInput, target ports.Target) (guardrail.RiskInput, error) {
+	effective, err := ssh.ResolveExecution(input.Execution, target.Execution)
+	if err != nil {
+		return input, err
+	}
+	if input.Sudo {
+		if _, err := effective.SudoRunOptions(input.Command); err != nil {
+			return input, err
+		}
+	}
+	plan, err := ssh.PlanCommand(input.Command, effective.CommandOptions())
+	if err != nil {
+		return input, err
+	}
+	input.Execution, input.PlanDigest = effective, plan.Digest()
+	input.Dialect = string(ssh.LaunchUnknown)
+	if target.Execution != nil && target.Execution.LaunchDialect != "" {
+		trusted := target.Execution.LaunchDialect
+		requested := plan.LaunchDialect()
+		if requested == trusted || requested == ssh.LaunchUnknown {
+			input.Dialect = string(trusted)
+		}
+	} else if effective == nil || (effective.Interpreter == "" && effective.LaunchDialect == "" && effective.Login == nil) {
+		input.Dialect = string(ssh.LaunchPOSIX)
+	}
+	return input, nil
+}
+
 func withOperation[In, Out any](r *Runtime, g *guardrail.Guardrail, tool string, risk func(In) guardrail.RiskInput, handler mcp.ToolHandlerFor[In, Out]) mcp.ToolHandlerFor[In, Out] {
 	return func(parent context.Context, request *mcp.CallToolRequest, input In) (*mcp.CallToolResult, Out, error) {
 		var zero Out
@@ -94,9 +126,16 @@ func withOperation[In, Out any](r *Runtime, g *guardrail.Guardrail, tool string,
 			return nil, zero, err
 		}
 		if ri.NodeID != "" {
-			ri.NodeID, _, err = view.Resolve(ri.NodeID)
+			var target ports.Target
+			ri.NodeID, target, err = view.Resolve(ri.NodeID)
 			if err != nil {
 				return nil, zero, err
+			}
+			if ri.Command != "" {
+				ri, err = resolveExecutionRisk(ri, target)
+				if err != nil {
+					return nil, zero, err
+				}
 			}
 		}
 		for i, id := range ri.NodeIDs {
@@ -238,15 +277,6 @@ func currentOperation(ctx context.Context) (*operation, error) {
 	return op, nil
 }
 
-func (r *Runtime) runCommand(ctx context.Context, nodeID, command string, sudo bool) (string, error) {
-	op, err := currentOperation(ctx)
-	if err != nil {
-		return "", err
-	}
-	result, err := r.backend.Run(ctx, op.permit, nodeID, ports.Command{Text: command, Sudo: sudo})
-	return result.Output, FormatMCPError(err)
-}
-
 func (r *Runtime) getMCPSFTPClient(ctx context.Context, nodeID string) (ports.FileSession, error) {
 	op, err := currentOperation(ctx)
 	if err != nil {
@@ -255,11 +285,11 @@ func (r *Runtime) getMCPSFTPClient(ctx context.Context, nodeID string) (ports.Fi
 	return r.backend.OpenFiles(ctx, op.permit, nodeID)
 }
 
-func (r *Runtime) commandResult(ctx context.Context, nodeID, command string, sudo bool) (ports.CommandResult, error) {
+func (r *Runtime) commandResult(ctx context.Context, nodeID, command string, sudo bool, exec *ssh.ExecutionConfig) (ports.CommandResult, error) {
 	op, err := currentOperation(ctx)
 	if err != nil {
 		return ports.CommandResult{}, err
 	}
-	result, err := r.backend.Run(ctx, op.permit, nodeID, ports.Command{Text: command, Sudo: sudo})
+	result, err := r.backend.Run(ctx, op.permit, nodeID, ports.Command{Text: command, Sudo: sudo, Execution: exec})
 	return result, FormatMCPError(err)
 }
