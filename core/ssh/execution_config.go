@@ -80,30 +80,27 @@ func (e *ExecutionConfig) CommandOptions() CommandOptions {
 }
 
 // SudoRunOptions rejects unsupported escalation semantics before dispatch and
-// maps the validated Bash login mode to the legacy sudo adapter explicitly.
+// maps the validated Bash or sh mode to the sudo adapter explicitly.
 func (e *ExecutionConfig) SudoRunOptions(command string) ([]RunOption, error) {
 	if err := e.Validate(); err != nil {
 		return nil, err
 	}
 	opts := e.CommandOptions()
-	if opts.Interpreter != InterpreterBash {
-		return nil, fmt.Errorf("%w: sudo requires a supported explicit Bash adapter", ErrExecutionValidation)
+	if opts.Interpreter != InterpreterBash && opts.Interpreter != InterpreterSh {
+		return nil, fmt.Errorf("%w: sudo requires a supported explicit Bash or sh adapter", ErrExecutionValidation)
 	}
 	plan, err := PlanCommand(command, opts)
 	if err != nil {
 		return nil, fmt.Errorf("%w: plan sudo command: %w", ErrExecutionValidation, err)
 	}
-	return []RunOption{WithLoginShell(plan.LoginMode() == LoginEnabled)}, nil
+	return []RunOption{WithLoginShell(plan.LoginMode() == LoginEnabled), WithInterpreter(opts.Interpreter)}, nil
 }
 
 // Validate validates that the execution configuration contains supported
 // values and mutually compatible settings.
-func (e *ExecutionConfig) Validate() error {
-	if e == nil {
-		return nil
-	}
+func (e *ExecutionConfig) validateValues() error {
 	switch e.Interpreter {
-	case "", InterpreterServer, InterpreterBash:
+	case "", InterpreterServer, InterpreterBash, InterpreterSh, InterpreterPowerShell, InterpreterPwsh, InterpreterCmd:
 	default:
 		return fmt.Errorf("%w: unsupported interpreter %q", ErrExecutionValidation, e.Interpreter)
 	}
@@ -113,16 +110,58 @@ func (e *ExecutionConfig) Validate() error {
 	default:
 		return fmt.Errorf("%w: unsupported launch_dialect %q", ErrExecutionValidation, e.LaunchDialect)
 	}
-
-	if e.Interpreter == InterpreterServer && e.Login != nil {
-		return fmt.Errorf("%w: server interpreter requires inherited login mode", ErrExecutionValidation)
-	}
-
-	if e.Interpreter == InterpreterBash && e.LaunchDialect != "" && e.LaunchDialect != LaunchPOSIX {
-		return fmt.Errorf("%w: bash interpreter requires posix launch dialect", ErrExecutionValidation)
-	}
-
 	return nil
+}
+
+func (e *ExecutionConfig) validateDialectCompatibility() error {
+	switch e.Interpreter {
+	case InterpreterBash, InterpreterSh:
+		if e.LaunchDialect != "" && e.LaunchDialect != LaunchPOSIX {
+			return fmt.Errorf("%w: %s interpreter requires posix launch dialect", ErrExecutionValidation, e.Interpreter)
+		}
+	case InterpreterPowerShell:
+		if e.LaunchDialect != "" && e.LaunchDialect != LaunchCmd && e.LaunchDialect != LaunchPowerShell {
+			return fmt.Errorf("%w: powershell interpreter requires cmd or powershell launch dialect", ErrExecutionValidation)
+		}
+	case InterpreterPwsh:
+		if e.LaunchDialect != "" && e.LaunchDialect != LaunchCmd && e.LaunchDialect != LaunchPowerShell && e.LaunchDialect != LaunchPOSIX {
+			return fmt.Errorf("%w: pwsh interpreter requires cmd, powershell, or posix launch dialect", ErrExecutionValidation)
+		}
+	case InterpreterCmd:
+		if e.LaunchDialect != "" && e.LaunchDialect != LaunchCmd {
+			return fmt.Errorf("%w: cmd interpreter requires cmd launch dialect", ErrExecutionValidation)
+		}
+	}
+	return nil
+}
+
+func (e *ExecutionConfig) validateLoginCompatibility() error {
+	switch e.Interpreter {
+	case InterpreterServer, InterpreterPowerShell, InterpreterPwsh, InterpreterCmd:
+		if e.Login != nil {
+			return fmt.Errorf("%w: %s interpreter requires inherited login mode", ErrExecutionValidation, e.Interpreter)
+		}
+	case InterpreterSh:
+		if e.Login != nil && *e.Login {
+			return fmt.Errorf("%w: sh interpreter does not support login shell", ErrExecutionValidation)
+		}
+	}
+	return nil
+}
+
+// Validate validates that the execution configuration contains supported
+// values and mutually compatible settings.
+func (e *ExecutionConfig) Validate() error {
+	if e == nil {
+		return nil
+	}
+	if err := e.validateValues(); err != nil {
+		return err
+	}
+	if err := e.validateDialectCompatibility(); err != nil {
+		return err
+	}
+	return e.validateLoginCompatibility()
 }
 
 // UnmarshalYAML strictly unmarshals and validates an ExecutionConfig from YAML,

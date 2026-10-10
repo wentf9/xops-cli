@@ -8,7 +8,9 @@ import (
 	"github.com/wentf9/xops-cli/pkg/executor"
 )
 
-// DetectFirewall 自动探测系统使用的防火墙后端
+// DetectFirewall 自动探测系统使用的防火墙后端。
+// 要求远端为 Linux/POSIX 环境，依赖 command -v 探针探测底层工具。
+// 不支持 Windows 或非 POSIX 执行环境。
 func DetectFirewall(ctx context.Context, exec executor.Executor) (Firewall, error) {
 	// 探测优先级: firewalld -> ufw -> nftables -> iptables
 

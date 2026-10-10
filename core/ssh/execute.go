@@ -30,6 +30,9 @@ func (c *Client) RunWithSudoExecution(ctx context.Context, command string, execu
 // RunScriptWithSudoExecution applies the same target/login capability checks
 // to a script whose interpreter has already been resolved by the caller.
 func (c *Client) RunScriptWithSudoExecution(ctx context.Context, content string, execution *ExecutionConfig) (string, error) {
+	if strings.HasPrefix(content, "\xef\xbb\xbf") {
+		return "", fmt.Errorf("%w: script contains unsupported UTF-8 BOM prefix", ErrExecutionValidation)
+	}
 	opts, err := c.configuredSudoOptions(ctx, ":", execution)
 	if err != nil {
 		return "", err
@@ -56,7 +59,7 @@ func (c *Client) configuredSudoOptions(ctx context.Context, command string, exec
 }
 
 func (c *Client) RunWithSudo(ctx context.Context, command string, opts ...RunOption) (string, error) {
-	config := DefaultRunConfig()
+	config := c.defaultRunConfig()
 	for _, opt := range opts {
 		opt(config)
 	}
@@ -67,6 +70,9 @@ func (c *Client) RunWithSudo(ctx context.Context, command string, opts ...RunOpt
 	connCfg := c.ConnectionConfig()
 
 	wrappedCmd := bashCommandPayload(command, config.LoginShell)
+	if config.Interpreter == InterpreterSh {
+		wrappedCmd = shCommandPayload(command)
+	}
 
 	switch connCfg.SudoMode {
 	case SudoModeRoot:
@@ -84,7 +90,10 @@ func (c *Client) RunWithSudo(ctx context.Context, command string, opts ...RunOpt
 
 // RunScriptWithSudo 提权执行脚本
 func (c *Client) RunScriptWithSudo(ctx context.Context, scriptContent string, opts ...RunOption) (string, error) {
-	config := DefaultRunConfig()
+	if strings.HasPrefix(scriptContent, "\xef\xbb\xbf") {
+		return "", fmt.Errorf("%w: script contains unsupported UTF-8 BOM prefix", ErrExecutionValidation)
+	}
+	config := c.defaultRunConfig()
 	for _, opt := range opts {
 		opt(config)
 	}
@@ -96,6 +105,10 @@ func (c *Client) RunScriptWithSudo(ctx context.Context, scriptContent string, op
 
 	bashArgs := bashScriptPayload(config.LoginShell)
 	bashCmd := bashCommandPayload(scriptContent, config.LoginShell)
+	if config.Interpreter == InterpreterSh {
+		bashArgs = shScriptPayload()
+		bashCmd = shCommandPayload(scriptContent)
+	}
 
 	switch connCfg.SudoMode {
 	case SudoModeRoot:
@@ -391,6 +404,11 @@ func startCommandWithStdinPipeline(
 func setupStdinPipeline(stdin io.Reader, stdinPipe io.WriteCloser, initialPayload string, options ...inputPipelineOptions) (finishStdin func() error, err error) {
 	if stdinPipe == nil {
 		return func() error { return nil }, nil
+	}
+
+	if initialPayload != "" && stdin != nil {
+		closeErr := stdinPipe.Close()
+		return nil, fmt.Errorf("%w: conflicting script payload and runtime stdin input", errors.Join(ErrExecutionValidation, closeErr))
 	}
 
 	if initialPayload != "" {

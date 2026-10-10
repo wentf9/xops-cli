@@ -122,6 +122,15 @@ func (mc *MetricsCollector) Start(ctx context.Context) error {
 	mc.cancel = cancel
 	mc.mu.Unlock()
 
+	// 内置监控探针要求 Linux/POSIX 环境
+	if execCfg := mc.client.Execution(); execCfg != nil {
+		if execCfg.LaunchDialect == LaunchCmd || execCfg.LaunchDialect == LaunchPowerShell ||
+			execCfg.Interpreter == InterpreterCmd || execCfg.Interpreter == InterpreterPowerShell {
+			mc.finishStart(generation, cancel)
+			return fmt.Errorf("dashboard monitoring requires Linux/POSIX platform, got incompatible execution config")
+		}
+	}
+
 	// 发送探针前，先探测系统平台
 	osName, err := mc.client.RunWithoutLogin(derivedCtx, "uname -s")
 	if err != nil {

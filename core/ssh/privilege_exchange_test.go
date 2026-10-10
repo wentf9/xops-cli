@@ -569,3 +569,25 @@ func servePrivilegeAuthentication(t *testing.T, channel cryptoSSH.Channel, reade
 	}
 	return false
 }
+
+func TestPrivilegeExchange_InterpreterCommand(t *testing.T) {
+	client := &Client{}
+	exchangeBash := newPrivilegeExchange(client, SudoModeSudo, false, InterpreterBash)
+	cmdBash := exchangeBash.command("whoami")
+	if !strings.Contains(cmdBash, "-- bash -c ") {
+		t.Errorf("expected bash -c in sudo command, got: %s", cmdBash)
+	}
+
+	exchangeSh := newPrivilegeExchange(client, SudoModeSudo, false, InterpreterSh)
+	cmdSh := exchangeSh.command("whoami")
+	if !strings.Contains(cmdSh, "-- sh -c ") {
+		t.Errorf("expected sh -c in sudo command, got: %s", cmdSh)
+	}
+
+	// Verify default is bash
+	exchangeDefault := newPrivilegeExchange(client, SudoModeSudo, false)
+	cmdDefault := exchangeDefault.command("whoami")
+	if !strings.Contains(cmdDefault, "-- bash -c ") {
+		t.Errorf("expected default bash -c in sudo command, got: %s", cmdDefault)
+	}
+}

@@ -29,7 +29,7 @@ func TestParseShebang(t *testing.T) {
 			data:        "#!/usr/bin/env sh\r\necho ok\r\n",
 			hasShebang:  true,
 			supported:   true,
-			interpreter: ssh.InterpreterBash,
+			interpreter: ssh.InterpreterSh,
 			dialect:     ssh.LaunchPOSIX,
 		},
 		{
@@ -45,7 +45,7 @@ func TestParseShebang(t *testing.T) {
 			data:        "#!sh\necho ok\n",
 			hasShebang:  true,
 			supported:   true,
-			interpreter: ssh.InterpreterBash,
+			interpreter: ssh.InterpreterSh,
 			dialect:     ssh.LaunchPOSIX,
 		},
 		{
@@ -158,12 +158,20 @@ func TestResolveScriptExecution_Shebang(t *testing.T) {
 
 	t.Run("supported shebang resolves interpreter", func(t *testing.T) {
 		global := &ssh.ExecutionConfig{LaunchDialect: ssh.LaunchPOSIX}
-		res, err := ssh.ResolveScriptExecution(nil, nil, nil, global, []byte("#!/bin/sh\necho hi"))
+		resBash, err := ssh.ResolveScriptExecution(nil, nil, nil, global, []byte("#!/bin/bash\necho hi"))
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if res == nil || res.Interpreter != ssh.InterpreterBash || res.LaunchDialect != ssh.LaunchPOSIX {
-			t.Fatalf("unexpected res: %+v", res)
+		if resBash == nil || resBash.Interpreter != ssh.InterpreterBash || resBash.LaunchDialect != ssh.LaunchPOSIX {
+			t.Fatalf("unexpected resBash: %+v", resBash)
+		}
+
+		resSh, err := ssh.ResolveScriptExecution(nil, nil, nil, global, []byte("#!/bin/sh\necho hi"))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if resSh == nil || resSh.Interpreter != ssh.InterpreterSh || resSh.LaunchDialect != ssh.LaunchPOSIX {
+			t.Fatalf("unexpected resSh: %+v", resSh)
 		}
 	})
 }
@@ -236,4 +244,46 @@ func TestResolveScriptExecution_FallbackAndOverrides(t *testing.T) {
 			t.Errorf("expected login false, got %v", res.Login)
 		}
 	})
+}
+
+func TestResolveScriptExecution_ShInterpreter(t *testing.T) {
+	node := &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer, LaunchDialect: ssh.LaunchPOSIX}
+	res, err := ssh.ResolveScriptExecution(nil, nil, node, nil, []byte("#!/bin/sh\necho hi"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res == nil {
+		t.Fatal("expected non-nil res")
+	}
+	if res.Interpreter != ssh.InterpreterSh {
+		t.Errorf("expected sh, got %v", res.Interpreter)
+	}
+	if res.LaunchDialect != ssh.LaunchPOSIX {
+		t.Errorf("expected posix, got %v", res.LaunchDialect)
+	}
+	if res.Login == nil || *res.Login != false {
+		t.Errorf("expected login false, got %v", res.Login)
+	}
+}
+
+func TestResolveScriptExecution_BOMRejection(t *testing.T) {
+	node := &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer, LaunchDialect: ssh.LaunchPOSIX}
+	bomScript := append([]byte("\xef\xbb\xbf"), []byte("#!/bin/sh\necho hi")...)
+	_, err := ssh.ResolveScriptExecution(nil, nil, node, nil, bomScript)
+	if err == nil {
+		t.Fatal("expected error for script with BOM, got nil")
+	}
+	if !errors.Is(err, ssh.ErrExecutionValidation) {
+		t.Fatalf("expected ErrExecutionValidation, got: %v", err)
+	}
+
+	// Also rejected when interpreter is explicitly specified
+	step := &ssh.ExecutionConfig{Interpreter: ssh.InterpreterSh}
+	_, err = ssh.ResolveScriptExecution(step, nil, node, nil, bomScript)
+	if err == nil {
+		t.Fatal("expected error for script with BOM with step override, got nil")
+	}
+	if !errors.Is(err, ssh.ErrExecutionValidation) {
+		t.Fatalf("expected ErrExecutionValidation, got: %v", err)
+	}
 }

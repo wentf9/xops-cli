@@ -2177,8 +2177,11 @@ func (s *Shell) handleExec(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("%s", i18n.T("sftp_shell_exec_usage"))
 	}
-	escapedCwd := strings.ReplaceAll(s.cwd, "'", "'\\''")
-	cmdStr := fmt.Sprintf("cd '%s' && %s", escapedCwd, strings.Join(args, " "))
+	userCmd := strings.Join(args, " ")
+	cmdStr, err := ssh.FormatWorkingDirCommand(s.cwd, userCmd, s.sshClient.Execution())
+	if err != nil {
+		return fmt.Errorf("exec: %w", err)
+	}
 	if s.batch {
 		if err := s.sshClient.RunCommandWithIO(ctx, cmdStr, false, strings.NewReader(""), s.stdout, s.stderr); err != nil {
 			return fmt.Errorf("exec failed: %w", err)

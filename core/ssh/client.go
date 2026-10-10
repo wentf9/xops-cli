@@ -242,7 +242,25 @@ func (c *Client) AuthMaterial() *AuthMaterial {
 	return nil
 }
 
+// Execution returns the configured execution configuration for this client, or nil.
+func (c *Client) Execution() *ExecutionConfig {
+	if c == nil {
+		return nil
+	}
+	c.cfgMu.RLock()
+	defer c.cfgMu.RUnlock()
+	return c.connCfg.Execution.Clone()
+}
+
+// NewTestClient creates a Client for unit testing with the provided connection config.
+func NewTestClient(connCfg ConnectionConfig) *Client {
+	return &Client{
+		connCfg: connCfg,
+	}
+}
+
 type RunConfig struct {
+	Interpreter  Interpreter
 	LoginShell   bool
 	OutMode      OutputMode
 	RingMaxBytes int
@@ -257,6 +275,12 @@ type RunConfig struct {
 type RunOption func(*RunConfig)
 
 const sessionShutdownTimeout = time.Second
+
+func WithInterpreter(interp Interpreter) RunOption {
+	return func(c *RunConfig) {
+		c.Interpreter = interp
+	}
+}
 
 func WithLoginShell(login bool) RunOption {
 	return func(c *RunConfig) {
@@ -298,14 +322,32 @@ func DefaultRunConfig() *RunConfig {
 	}
 }
 
-func (c *Client) Run(ctx context.Context, cmd string, opts ...RunOption) (string, error) {
+func (c *Client) defaultRunConfig() *RunConfig {
 	config := DefaultRunConfig()
+	if c != nil {
+		if exec := c.Execution(); exec != nil {
+			if exec.Interpreter != "" {
+				config.Interpreter = exec.Interpreter
+			}
+			if exec.Login != nil {
+				config.LoginShell = *exec.Login
+			}
+		}
+	}
+	return config
+}
+
+func (c *Client) Run(ctx context.Context, cmd string, opts ...RunOption) (string, error) {
+	config := c.defaultRunConfig()
 	for _, opt := range opts {
 		opt(config)
 	}
 
-	// 默认使用 bash -l -c 执行，以加载完整的环境变量 (如 PATH)
-	return c.runRaw(ctx, bashCommandPayload(cmd, config.LoginShell), config)
+	payload := bashCommandPayload(cmd, config.LoginShell)
+	if config.Interpreter == InterpreterSh {
+		payload = shCommandPayload(cmd)
+	}
+	return c.runRaw(ctx, payload, config)
 }
 
 // RunWithoutLogin 执行命令并在非登录 Shell 中运行，避免加载 profile 脚本产生干扰输出
@@ -325,7 +367,10 @@ func (c *Client) runRaw(ctx context.Context, wrappedCmd string, config *RunConfi
 
 // RunScript 执行 Shell 脚本内容
 func (c *Client) RunScript(ctx context.Context, scriptContent string, opts ...RunOption) (output string, retErr error) {
-	config := DefaultRunConfig()
+	if strings.HasPrefix(scriptContent, "\xef\xbb\xbf") {
+		return "", fmt.Errorf("%w: script contains unsupported UTF-8 BOM prefix", ErrExecutionValidation)
+	}
+	config := c.defaultRunConfig()
 	for _, opt := range opts {
 		opt(config)
 	}
@@ -338,7 +383,32 @@ func (c *Client) RunScript(ctx context.Context, scriptContent string, opts ...Ru
 
 	session.Stdin = strings.NewReader(scriptContent)
 
-	return c.startWithTimeout(ctx, session, bashScriptPayload(config.LoginShell), config)
+	payload := bashScriptPayload(config.LoginShell)
+	if config.Interpreter == InterpreterSh {
+		payload = shScriptPayload()
+	}
+	return c.startWithTimeout(ctx, session, payload, config)
+}
+
+// RunScriptWithExecution applies the resolved execution configuration to RunScript.
+func (c *Client) RunScriptWithExecution(ctx context.Context, content string, execution *ExecutionConfig) (string, error) {
+	if strings.HasPrefix(content, "\xef\xbb\xbf") {
+		return "", fmt.Errorf("%w: script contains unsupported UTF-8 BOM prefix", ErrExecutionValidation)
+	}
+	if execution == nil {
+		return c.RunScript(ctx, content)
+	}
+	if err := execution.Validate(); err != nil {
+		return "", err
+	}
+	var opts []RunOption
+	if execution.Interpreter != "" {
+		opts = append(opts, WithInterpreter(execution.Interpreter))
+	}
+	if execution.Login != nil {
+		opts = append(opts, WithLoginShell(*execution.Login))
+	}
+	return c.RunScript(ctx, content, opts...)
 }
 
 // streamReader 包装 io.ReadCloser 以便在关闭时清理 SSH session
@@ -531,6 +601,36 @@ func (c *Client) resolvePrivilegeMaterial(ctx context.Context, kind SecretKind, 
 	return material, nil
 }
 
+func (c *Client) isNonPOSIXExecution() bool {
+	if execCfg := c.Execution(); execCfg != nil {
+		return execCfg.LaunchDialect == LaunchCmd || execCfg.LaunchDialect == LaunchPowerShell ||
+			execCfg.Interpreter == InterpreterCmd || execCfg.Interpreter == InterpreterPowerShell
+	}
+	return false
+}
+
+func (c *Client) detectRootOrSudoer(ctx context.Context) (bool, error) {
+	// 1. 探测是否已经是 root
+	// 使用 RunWithoutLogin 避免 MOTD 干扰输出
+	if out, err := c.RunWithoutLogin(ctx, "id -u"); err == nil {
+		// 稳健检查：只要最后一行输出是 0，即认为是 root
+		lines := strings.Split(strings.TrimSpace(out), "\n")
+		if len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "0" {
+			return true, c.updateSudoMode(ctx, SudoModeRoot)
+		}
+	} else if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
+	// 2. 探测是否有免密 sudo 权限
+	if _, err := c.RunWithoutLogin(ctx, "sudo -n true"); err == nil {
+		return true, c.updateSudoMode(ctx, SudoModeSudoer)
+	} else if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
 func (c *Client) maybeDetectSudoMode(ctx context.Context) error {
 	if ctx == nil {
 		return fmt.Errorf("sudo detection context is nil")
@@ -545,6 +645,10 @@ func (c *Client) maybeDetectSudoMode(ctx context.Context) error {
 	if connCfg.SudoMode != "" && connCfg.SudoMode != SudoModeAuto {
 		return nil
 	}
+	// 非 POSIX 平台（如 cmd、PowerShell）跳过 Unix sudo/su 探测
+	if c.isNonPOSIXExecution() {
+		return nil
+	}
 	if c.sshClient == nil {
 		return fmt.Errorf("ssh client is not connected")
 	}
@@ -553,22 +657,8 @@ func (c *Client) maybeDetectSudoMode(ctx context.Context) error {
 		return err
 	}
 
-	// 1. 探测是否已经是 root
-	// 使用 RunWithoutLogin 避免 MOTD 干扰输出
-	if out, err := c.RunWithoutLogin(ctx, "id -u"); err == nil {
-		// 稳健检查：只要最后一行输出是 0，即认为是 root
-		lines := strings.Split(strings.TrimSpace(out), "\n")
-		if len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "0" {
-			return c.updateSudoMode(ctx, SudoModeRoot)
-		}
-	} else if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	// 2. 探测是否有免密 sudo 权限
-	if _, err := c.RunWithoutLogin(ctx, "sudo -n true"); err == nil {
-		return c.updateSudoMode(ctx, SudoModeSudoer)
-	} else if err := ctx.Err(); err != nil {
+	detected, err := c.detectRootOrSudoer(ctx)
+	if err != nil || detected {
 		return err
 	}
 

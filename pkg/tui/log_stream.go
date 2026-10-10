@@ -83,6 +83,13 @@ func (m logStreamerModel) Init() tea.Cmd {
 
 func (m *logStreamerModel) startStream() tea.Cmd {
 	return func() tea.Msg {
+		if execCfg := m.client.Execution(); execCfg != nil {
+			if execCfg.LaunchDialect == ssh.LaunchCmd || execCfg.LaunchDialect == ssh.LaunchPowerShell ||
+				execCfg.Interpreter == ssh.InterpreterCmd || execCfg.Interpreter == ssh.InterpreterPowerShell {
+				return logStreamClosedMsg{sessionID: m.sessionID, err: fmt.Errorf("log streaming requires Linux/POSIX platform, got incompatible execution config")}
+			}
+		}
+
 		cmd := fmt.Sprintf("tail -n 100 -f %s", m.file)
 		if after, ok := strings.CutPrefix(m.file, "docker:"); ok {
 			container := after

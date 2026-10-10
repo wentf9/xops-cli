@@ -214,6 +214,7 @@ func clientConfigFromPlan(cfg ConnectionConfig) ClientConfig {
 		AuthUpdateToken: cfg.AuthUpdateToken, SudoUpdateToken: cfg.SudoUpdateToken, SudoMode: cfg.SudoMode,
 		ProxyJump: cfg.ProxyJump, OriginalProxyJump: cfg.OriginalProxyJump, HasOriginalProxyJump: cfg.HasOriginalProxyJump,
 		PasswordPromptPattern: cfg.PasswordPromptPattern,
+		Execution:             cfg.Execution.Clone(),
 	}
 }
 

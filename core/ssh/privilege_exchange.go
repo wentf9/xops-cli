@@ -39,10 +39,26 @@ type privilegeExchange struct {
 	terminalToken                     string
 	terminalReady                     chan struct{}
 	terminalOnce                      sync.Once
+	interpreter                       Interpreter
 }
 
-func newPrivilegeExchange(c *Client, mode SudoMode, force bool) *privilegeExchange {
-	return &privilegeExchange{client: c, mode: mode, readyToken: "[xops-ready-" + rand.Text() + "]", promptToken: "[xops-password-" + rand.Text() + "]", ackToken: "[xops-continue-" + rand.Text() + "]", ready: make(chan struct{}), prompts: make(chan struct{}, 3), forcePrompt: force, outputErrors: make(chan error, 1)}
+func newPrivilegeExchange(c *Client, mode SudoMode, force bool, interp ...Interpreter) *privilegeExchange {
+	selectedInterp := InterpreterBash
+	if len(interp) > 0 && interp[0] != "" {
+		selectedInterp = interp[0]
+	}
+	return &privilegeExchange{
+		client:       c,
+		mode:         mode,
+		interpreter:  selectedInterp,
+		readyToken:   "[xops-ready-" + rand.Text() + "]",
+		promptToken:  "[xops-password-" + rand.Text() + "]",
+		ackToken:     "[xops-continue-" + rand.Text() + "]",
+		ready:        make(chan struct{}),
+		prompts:      make(chan struct{}, 3),
+		forcePrompt:  force,
+		outputErrors: make(chan error, 1),
+	}
 }
 func (e *privilegeExchange) started() bool {
 	select {
@@ -54,8 +70,12 @@ func (e *privilegeExchange) started() bool {
 }
 func shellQuote(value string) string { return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'" }
 func (e *privilegeExchange) command(command string) string {
+	shellName := "bash"
+	if e.interpreter == InterpreterSh {
+		shellName = "sh"
+	}
 	if command == "" {
-		command = "exec bash -l"
+		command = "exec " + shellName + " -l"
 	}
 	body := e.body(command)
 	if e.mode == SudoModeSu {
@@ -66,7 +86,7 @@ func (e *privilegeExchange) command(command string) string {
 		prefix = "sudo -i -S -p "
 		body = sudoLoginScript(body)
 	}
-	return prefix + shellQuote(e.promptToken) + " -- bash -c " + shellQuote(body)
+	return prefix + shellQuote(e.promptToken) + " -- " + shellName + " -c " + shellQuote(body)
 }
 
 func (e *privilegeExchange) input(ctx context.Context, stdin io.Reader, pipe io.WriteCloser) error {
@@ -201,7 +221,7 @@ func (w *privilegeFrameWriter) flush() error {
 	return err
 }
 
-func (c *Client) runPrivilegeOperation(ctx context.Context, mode SudoMode, command string, stdin io.Reader, stdout, stderr io.Writer, terminals ...*privilegeTerminal) error {
+func (c *Client) runPrivilegeOperation(ctx context.Context, mode SudoMode, command string, stdin io.Reader, stdout, stderr io.Writer, options ...any) error {
 	if ctx == nil || c == nil {
 		return fmt.Errorf("privilege execution requires a client and context")
 	}
@@ -212,14 +232,20 @@ func (c *Client) runPrivilegeOperation(ctx context.Context, mode SudoMode, comma
 		return err
 	}
 	var terminal *privilegeTerminal
-	if len(terminals) > 0 {
-		terminal = terminals[0]
-		if terminal != nil && terminal.activate == nil {
-			return fmt.Errorf("privilege terminal activation is missing")
+	var interp Interpreter
+	for _, opt := range options {
+		switch v := opt.(type) {
+		case *privilegeTerminal:
+			terminal = v
+		case Interpreter:
+			interp = v
 		}
 	}
+	if terminal != nil && terminal.activate == nil {
+		return fmt.Errorf("privilege terminal activation is missing")
+	}
 	for attempt := 0; attempt < 3; attempt++ {
-		err := c.runPrivilegeAttempt(ctx, mode, command, stdin, stdout, stderr, attempt > 0, terminal)
+		err := c.runPrivilegeAttempt(ctx, mode, command, stdin, stdout, stderr, attempt > 0, terminal, interp)
 		if mode != SudoModeSu || !errors.Is(err, errPrivilegeAuthenticationRejected) || credentialRecoveryPrompter(c.prompter) == nil || attempt == 2 {
 			return err
 		}
@@ -227,8 +253,8 @@ func (c *Client) runPrivilegeOperation(ctx context.Context, mode SudoMode, comma
 	return errPrivilegeAuthenticationRejected
 }
 
-func (c *Client) runPrivilegeAttempt(ctx context.Context, mode SudoMode, command string, stdin io.Reader, stdout, stderr io.Writer, force bool, terminal *privilegeTerminal) (retErr error) {
-	exchange := newPrivilegeExchange(c, mode, force)
+func (c *Client) runPrivilegeAttempt(ctx context.Context, mode SudoMode, command string, stdin io.Reader, stdout, stderr io.Writer, force bool, terminal *privilegeTerminal, interp ...Interpreter) (retErr error) {
+	exchange := newPrivilegeExchange(c, mode, force, interp...)
 	exchange.terminal = terminal
 	if terminal != nil {
 		exchange.terminalToken = "[xops-terminal-" + rand.Text() + "]"
@@ -327,10 +353,10 @@ func (c *Client) waitPrivilegeExchange(ctx context.Context, cancel context.Cance
 
 func (c *Client) runPrivilegeWithConfig(ctx context.Context, mode SudoMode, command string, stdin io.Reader, config *RunConfig) (string, error) {
 	if config == nil {
-		config = DefaultRunConfig()
+		config = c.defaultRunConfig()
 	}
 	output := newOutputWriter(config)
-	err := c.runPrivilegeOperation(ctx, mode, command, stdin, output, output)
+	err := c.runPrivilegeOperation(ctx, mode, command, stdin, output, output, config.Interpreter)
 	return output.String(), err
 }
 

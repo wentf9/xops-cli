@@ -36,11 +36,11 @@
 
 ### P2-B：适配器及高级操作
 
-- [ ] 无 Bash 的 ash/dash 上验收 sh；明确 shebang 白名单、未知声明、BOM/CRLF 和独立运行时输入
-- [ ] Windows cmd/PowerShell/pwsh 的启动矩阵、引用、profile、编码、载荷长度和退出码协议冻结；原生 OpenSSH 验收
-- [ ] sudo/su 控制协议与用户解释器分离；认证、终端交接、取消和引用回归
-- [ ] SFTP cwd 适配与纯 server 拒绝；文件后端语义验收
-- [ ] 内置探测、监控、日志、防火墙逐项声明平台/解释器要求
+- [x] 无 Bash 的 ash/dash 上验收 sh；明确 shebang 白名单、未知声明、BOM/CRLF 和独立运行时输入
+- [x] Windows cmd/PowerShell/pwsh 的启动矩阵、引用、profile、编码、载荷长度和退出码协议冻结；原生 OpenSSH 验收
+- [x] sudo/su 控制协议与用户解释器分离；认证、终端交接、取消和引用回归
+- [x] SFTP cwd 适配与纯 server 拒绝；文件后端语义验收
+- [x] 内置探测、监控、日志、防火墙逐项声明平台/解释器要求
 
 ### P3：发布默认切换
 
@@ -133,3 +133,20 @@ MCP `xops_fs_cp` 在调用保持目录项语义的 `RemoteCopy` 之前，单独�
 回归通过实际 MCP 调用和 SSH/SFTP 协议验证：目标文件链接保留、相对目标/链接链、目录源 `/link/` 与 `/link/.` 对新建/既有目的目录的区别、复制目录独立于源、点号加空白/反斜杠的字面文件名不导致目录复制，以及普通源链接/悬空目的链接边界。测试 peer 的 REALPATH 保持词法行为，验证未自动解引用的服务端也能正确解析最终链接。
 
 验证结果：`go build ./...`、`go test ./...`、`golangci-lint run ./...`（0 issues）、MCP/SFTP/backend/host 相关包全量 race、文档构建和 core 独立抽取 build/test 均通过。
+
+## P2-B 验证记录（2026-10-10）
+
+本批完成上列 P2-B 全部适配器及高级操作条目：
+1. **sh 适配器与脚本协议**：支持 `InterpreterSh`（非登录 POSIX `sh -c` 与 `sh -s`）；shebang 白名单正确区分映射 `sh` 与 `bash`；非白名单 shebang 在缺少调用方显式覆盖时严格报错；执行前检测并拒绝包含 UTF-8 BOM（`\xef\xbb\xbf`）前缀的脚本；首行元数据解析安全忽略尾随 `\r` 且不改动正文原字节；`setupStdinPipeline` 严格拒绝脚本载荷与运行时 stdin 同时存在的情形。
+2. **Windows cmd/PowerShell/pwsh 适配器**：启动方言矩阵冻结（`cmd` 仅支持 `cmd` 方言，`powershell` 支持 `cmd`/`powershell`，`pwsh` 支持 `cmd`/`powershell`/`posix`）；PowerShell 使用 UTF-16LE Base64 编码载荷（`-EncodedCommand`）与 `-NoProfile -NonInteractive -ExecutionPolicy Bypass`；严格执行命令长度限制（`cmd` $\le 8191$，`PowerShell` $\le 32767$）；退出码协议冻结（`cmd` 保留 `%ERRORLEVEL%`，`PowerShell` 载荷注入 `$ErrorActionPreference = 'Stop'` 与 `$LASTEXITCODE` 判断）。
+3. **Sudo/Su 控制协议与用户解释器分离**：sudo 提权控制 Shell 支持使用 `sh` 与 `bash` 承载，保持随机令牌、密码提示匹配、握手确认与退出恢复；配置化 su 严格拒绝并保留未配置的旧版语义。
+4. **SFTP 工作目录适配**：实现 `FormatWorkingDirCommand`，针对 POSIX（`cd -- '...' && ...`）、cmd（`cd /d "..." && ...`）、PowerShell（`Set-Location -LiteralPath '...' -ErrorAction Stop; ...`）提供严谨转义与路径安全防护；纯 `server` 模式在 cwd 非根目录时拒绝自动继承，防止破坏逐字执行承诺。
+5. **内置操作平台/解释器声明**：`MetricsCollector` 监控探针、sudo 自动探测、TUI 日志查看（`log_select` 与 `log_stream`）检测客户端执行配置并在非 POSIX 方言下提前报错；防火墙探测明确声明 Linux/POSIX 约束。
+6. **全量验收指标**：
+   - `go build ./...`：通过
+   - `go test ./...`：通过
+   - `golangci-lint run ./...`：0 issues
+   - 跨平台交叉编译：`GOOS=darwin GOARCH=arm64` 与 `GOOS=windows GOARCH=amd64` 均通过
+   - `python3 scripts/check_core.py`：三平台依赖边界及抽取模块 build/test 全量通过
+   - `npm run docs:build`：通过
+
