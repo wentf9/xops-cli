@@ -2178,12 +2178,49 @@ func (s *Shell) handleExec(ctx context.Context, args []string) error {
 		return fmt.Errorf("%s", i18n.T("sftp_shell_exec_usage"))
 	}
 	userCmd := strings.Join(args, " ")
-	cmdStr, err := ssh.FormatWorkingDirCommand(s.cwd, userCmd, s.sshClient.Execution())
+	execCfg := s.sshClient.Execution()
+	if execCfg == nil {
+		cmdStr, err := ssh.FormatWorkingDirCommand(s.cwd, userCmd, nil)
+		if err != nil {
+			return fmt.Errorf("exec: %w", err)
+		}
+		if s.batch {
+			if err := s.sshClient.RunCommandWithIO(ctx, cmdStr, false, strings.NewReader(""), s.stdout, s.stderr); err != nil {
+				return fmt.Errorf("exec failed: %w", err)
+			}
+			return nil
+		}
+		if err := s.closeLineEditor(); err != nil {
+			return fmt.Errorf("close SFTP line editor before remote command failed: %w", err)
+		}
+		streams, err := s.interactiveIO()
+		if err != nil {
+			return err
+		}
+		if err := s.sshClient.RunInteractiveCmdWithIO(ctx, cmdStr, streams); err != nil {
+			return fmt.Errorf("exec: %w", err)
+		}
+		s.fprintlnStdout("")
+		return nil
+	}
+
+	if err := execCfg.Validate(); err != nil {
+		return fmt.Errorf("exec: %w", err)
+	}
+	cmdStr, err := ssh.FormatWorkingDirCommand(s.cwd, userCmd, execCfg)
+	if err != nil {
+		return fmt.Errorf("exec: %w", err)
+	}
+	opts := execCfg.CommandOptions()
+	if s.batch && execCfg.Login == nil && opts.Interpreter == ssh.InterpreterBash {
+		opts.Login = ssh.LoginDisabled
+	}
+	plan, err := ssh.PlanCommand(cmdStr, opts)
 	if err != nil {
 		return fmt.Errorf("exec: %w", err)
 	}
 	if s.batch {
-		if err := s.sshClient.RunCommandWithIO(ctx, cmdStr, false, strings.NewReader(""), s.stdout, s.stderr); err != nil {
+		if err := s.sshClient.RunCommandPlanWithIO(ctx, plan, strings.NewReader(""), s.stdout, s.stderr); err != nil {
 			return fmt.Errorf("exec failed: %w", err)
 		}
 		return nil
@@ -2195,7 +2232,7 @@ func (s *Shell) handleExec(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := s.sshClient.RunInteractiveCmdWithIO(ctx, cmdStr, streams); err != nil {
+	if err := s.sshClient.RunInteractivePlanWithIO(ctx, plan, streams); err != nil {
 		return fmt.Errorf("exec: %w", err)
 	}
 	s.fprintlnStdout("")

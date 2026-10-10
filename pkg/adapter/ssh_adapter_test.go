@@ -1445,3 +1445,96 @@ func adapterPrivilegeSignal(t *testing.T, channel cryptossh.Channel, command str
 	}
 	return true
 }
+
+func TestSSHAdapter_GetConfig_ExecutionResolution(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		globalExec *ssh.ExecutionConfig
+		nodeExec   *ssh.ExecutionConfig
+		wantInterp ssh.Interpreter
+		wantDial   ssh.LaunchDialect
+		wantErr    bool
+	}{
+		{
+			name: "global execution inherited when node execution is nil",
+			globalExec: &ssh.ExecutionConfig{
+				Interpreter:   ssh.InterpreterPowerShell,
+				LaunchDialect: ssh.LaunchCmd,
+			},
+			nodeExec:   nil,
+			wantInterp: ssh.InterpreterPowerShell,
+			wantDial:   ssh.LaunchCmd,
+		},
+		{
+			name: "node execution overrides global execution",
+			globalExec: &ssh.ExecutionConfig{
+				Interpreter:   ssh.InterpreterBash,
+				LaunchDialect: ssh.LaunchPOSIX,
+			},
+			nodeExec: &ssh.ExecutionConfig{
+				Interpreter:   ssh.InterpreterCmd,
+				LaunchDialect: ssh.LaunchCmd,
+			},
+			wantInterp: ssh.InterpreterCmd,
+			wantDial:   ssh.LaunchCmd,
+		},
+		{
+			name:       "both nil results in nil ClientConfig Execution",
+			globalExec: nil,
+			nodeExec:   nil,
+		},
+		{
+			name: "incompatible node and global execution fails GetConfig",
+			globalExec: &ssh.ExecutionConfig{
+				LaunchDialect: ssh.LaunchCmd,
+			},
+			nodeExec: &ssh.ExecutionConfig{
+				Interpreter: ssh.InterpreterBash,
+			},
+			wantErr: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Configuration{
+				Execution:  tc.globalExec,
+				Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
+				Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
+				Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
+			}
+			cfg.Hosts.Set("host1", models.Host{Address: "192.0.2.1", Port: 22})
+			cfg.Identities.Set("id1", models.Identity{User: "user", AuthType: "password"})
+			cfg.Nodes.Set("node1", models.Node{
+				HostRef:     "host1",
+				IdentityRef: "id1",
+				Execution:   tc.nodeExec,
+			})
+
+			adapter := NewSSHAdapter(config.NewProviderWithoutOpenSSH(cfg))
+			clientCfg, err := adapter.GetConfig("node1")
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tc.wantInterp == "" {
+				if clientCfg.Execution != nil {
+					t.Fatalf("expected nil Execution, got %+v", clientCfg.Execution)
+				}
+				return
+			}
+			if clientCfg.Execution == nil {
+				t.Fatalf("expected Execution, got nil")
+			}
+			if clientCfg.Execution.EffectiveInterpreter() != tc.wantInterp {
+				t.Errorf("interpreter = %q, want %q", clientCfg.Execution.EffectiveInterpreter(), tc.wantInterp)
+			}
+			if clientCfg.Execution.LaunchDialect != tc.wantDial {
+				t.Errorf("launchDialect = %q, want %q", clientCfg.Execution.LaunchDialect, tc.wantDial)
+			}
+		})
+	}
+}

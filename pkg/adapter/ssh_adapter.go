@@ -201,6 +201,15 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 		sudoUpdateToken = string(snapshot.UpdateRef.SudoVersion[:])
 	}
 
+	var globalExec *ssh.ExecutionConfig
+	if globalCfg := a.cfgProvider.Snapshot(); globalCfg != nil {
+		globalExec = globalCfg.Execution
+	}
+	execCfg, err := ssh.ResolveExecution(snapshot.Node.Execution, globalExec)
+	if err != nil {
+		return nil, fmt.Errorf("resolve execution for node %q failed: %w", nodeID, err)
+	}
+
 	cfg := &ssh.ClientConfig{
 		NodeID:                nodeID,
 		Address:               snapshot.Host.Address,
@@ -218,6 +227,7 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 		OriginalProxyJump:     snapshot.Node.ProxyJump,
 		HasOriginalProxyJump:  true,
 		PasswordPromptPattern: snapshot.Node.PasswordPromptPattern,
+		Execution:             execCfg,
 	}
 
 	if override, ok := a.getSessionOverride(nodeID); ok {

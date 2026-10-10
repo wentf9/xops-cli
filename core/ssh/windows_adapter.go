@@ -3,6 +3,7 @@ package ssh
 import (
 	"encoding/base64"
 	"fmt"
+	"strings"
 	"unicode/utf16"
 )
 
@@ -47,11 +48,15 @@ func powershellCommandPayload(command string, dialect LaunchDialect) (string, er
 	case LaunchCmd:
 		payload = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + encoded
 	case LaunchPowerShell:
-		payload = "& powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + encoded
+		payload = "& powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + encoded + "; exit $LASTEXITCODE"
 	}
 
-	if len(payload) > MaxPowerShellPayloadBytes {
-		return "", fmt.Errorf("powershell command payload exceeds %d bytes limit", MaxPowerShellPayloadBytes)
+	maxLen := MaxPowerShellPayloadBytes
+	if dialect == LaunchCmd {
+		maxLen = MaxCmdPayloadBytes
+	}
+	if len(payload) > maxLen {
+		return "", fmt.Errorf("powershell command payload exceeds %d bytes limit", maxLen)
 	}
 	return payload, nil
 }
@@ -68,15 +73,58 @@ func pwshCommandPayload(command string, dialect LaunchDialect) (string, error) {
 	case LaunchCmd:
 		payload = "pwsh.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + encoded
 	case LaunchPowerShell:
-		payload = "& pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + encoded
+		payload = "& pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + encoded + "; exit $LASTEXITCODE"
 	case LaunchPOSIX:
 		payload = "pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + encoded
 	}
 
-	if len(payload) > MaxPowerShellPayloadBytes {
-		return "", fmt.Errorf("pwsh command payload exceeds %d bytes limit", MaxPowerShellPayloadBytes)
+	maxLen := MaxPowerShellPayloadBytes
+	if dialect == LaunchCmd {
+		maxLen = MaxCmdPayloadBytes
+	}
+	if len(payload) > maxLen {
+		return "", fmt.Errorf("pwsh command payload exceeds %d bytes limit", maxLen)
 	}
 	return payload, nil
+}
+
+// escapeCmdCommand escapes metacharacters that would be exposed to the outer cmd.exe
+// when the command is wrapped in outer quotes: cmd.exe /d /s /c "<command>".
+// In outer cmd, double quotes toggle quote state. When an inner double quote closes
+// quote state in outer cmd, characters such as &, |, <, >, (, ), ^ fall outside quotes
+// and would be parsed as operators or escape characters by outer cmd unless escaped with ^.
+func escapeCmdCommand(command string) (string, error) {
+	if strings.ContainsAny(command, "\r\n\x00") {
+		return "", fmt.Errorf("%w: cmd command contains illegal newline or null character", ErrExecutionValidation)
+	}
+	if strings.Count(command, "\"")%2 != 0 {
+		return "", fmt.Errorf("%w: cmd command contains unbalanced double quotes", ErrExecutionValidation)
+	}
+	if strings.ContainsAny(command, "%!") {
+		return "", fmt.Errorf("%w: cmd command contains unsupported variable expansion: %q", ErrExecutionValidation, command)
+	}
+
+	var sb strings.Builder
+	sb.Grow(len(command) + 16)
+
+	inOuterQuote := true
+	for _, r := range command {
+		if r == '"' {
+			inOuterQuote = !inOuterQuote
+			sb.WriteRune(r)
+		} else if !inOuterQuote {
+			switch r {
+			case '&', '|', '<', '>', '(', ')', '^':
+				sb.WriteByte('^')
+				sb.WriteRune(r)
+			default:
+				sb.WriteRune(r)
+			}
+		} else {
+			sb.WriteRune(r)
+		}
+	}
+	return sb.String(), nil
 }
 
 // cmdCommandPayload builds the payload for Windows Command Prompt (cmd.exe).
@@ -85,7 +133,12 @@ func cmdCommandPayload(command string, dialect LaunchDialect) (string, error) {
 		return "", fmt.Errorf("cmd interpreter requires cmd launch dialect, got %q", dialect)
 	}
 
-	payload := "cmd.exe /d /c " + command
+	escaped, err := escapeCmdCommand(command)
+	if err != nil {
+		return "", err
+	}
+
+	payload := fmt.Sprintf(`cmd.exe /d /s /c "%s"`, escaped)
 	if len(payload) > MaxCmdPayloadBytes {
 		return "", fmt.Errorf("cmd command payload exceeds %d bytes limit", MaxCmdPayloadBytes)
 	}
