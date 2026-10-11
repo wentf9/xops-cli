@@ -1,65 +1,107 @@
 # 命令执行
 
-通过 `--host`、`--ifile`/`-I` 或 `--tag` 选择目标后，第一个位置参数就是远程命令，不需要再提供位置主机参数。`ssh --host` 同样保留完整的位置命令。例如 `xops exec --host web-01 uname -a` 和 `xops ssh --host web-01 uname -a` 均执行 `uname -a`。
+XOps CLI 提供了强大的远程命令执行能力（`xops exec`），支持单主机交互、多主机并行批处理、脚本分发执行以及跨平台的命令解释器适配。
 
-`exec` 和 `scp` 的 `--host`、`--ifile`/`-I`、`--tag` 三种目标选择参数互斥，组合使用会在执行前报错。选择其中一种后，可用 `--exclude` 排除部分节点。
+通过 `--host`、`--ifile`/`-I` 或 `--tag` 选择目标后，第一个位置参数即为远程命令。例如 `xops exec --host web-01 uname -a`。`--host`、`--ifile`/`-I`、`--tag` 三种目标选择参数互斥，选择其一后可使用 `--exclude` 排除部分节点。
 
-全局参数可放在子命令前后，例如 `xops --color never exec --host web-01 uname -a`。SSH/exec 从远程命令开始保留后续参数原样；有歧义时用 `--` 显式分隔，例如 `xops exec --host web-01 -- echo --help`。
+全局参数可置于子命令前后，例如 `xops --color never exec --host web-01 uname -a`。远程命令后的参数会保持原样传递；若参数可能引起歧义，可使用 `--` 明确分隔，例如 `xops exec --host web-01 -- echo --help`。
 
 ## 普通与批量执行
 
 ```bash
+# 单节点执行命令
 xops exec web-01 uptime
+
+# 基于标签对多台主机批量执行
 xops exec --tag web -c 'uptime'
+
+# 批量执行本地脚本，设置并发数为 5
 xops exec --tag web --shell ./check.sh --task 5
 ```
 
-普通模式适合有限输出、脚本和批处理。批处理不会弹出凭据库解锁提示；需要预先准备可非交互访问的凭据。
+- **批处理适用场景**：适合日常运维巡检、批量部署和自动化任务。批处理模式下不会弹出交互式凭据解锁对话框，需预先配置可非交互访问的凭据（如免密私钥或已解锁的凭据库）。
+- **缓冲与截断保护**：普通命令执行保留最近 5 MiB 的输出内容，超出上限后继续排空读取并在控制台显示截断标记，防止海量日志输出耗尽本地内存。
+- **长度与超时限制**：原始命令及参数包装载荷最大支持 64 KiB，单次执行总超时默认为 5 分钟。
 
-`exec` 的默认兼容模式要求远端 SSH 执行环境中可调用 Bash：普通命令包装为 `bash -l -c`，`--no-login` 仅改为 `bash -c`。Windows SSH 目标同样需要 Bash；命令中显式调用 `powershell.exe` 不会去掉外层 Bash。没有 Bash 时，文件任务可通过 SCP/SFTP 下载、本地编辑、上传并重新下载核验；目录操作使用 SFTP 文件命令，SFTP 的 `exec` 也依赖 Bash。
+## 执行解释器与环境配置
 
-## 显式解释器
+XOps 支持多种远程解释器，以适应 Linux、Alpine、Windows 等不同操作系统与执行环境。
 
-当前源码已实现 P1 阶段（P1-A 与 P1-B）的全部能力。`exec` 与 `ssh` 均支持显式选择 server 或 Bash 执行，旧入口委托统一命令计划，并为终端/管道提供可取消输出桥；已安装版本以 `xops exec --help` 与 `xops ssh --help` 为准，默认兼容模式尚未切换。
+### 默认解释器：原生执行 (`server`)
+
+在未显式指定解释器且未配置节点解释器时，XOps 默认采用 `server` 模式：
+- **无依赖的原生命令执行**：命令原样通过 SSH exec 请求发送至远端，由远端用户的默认 Shell 或 SSH 守护进程直接执行。
+- **广泛的系统兼容性**：远端无需预装 Bash，天然适配精简容器、Alpine Linux（仅内置 `ash`/`sh`）、Windows（默认 PowerShell 或 CMD）以及各类网络设备。
+- **行为规范**：`server` 模式不添加任何外层包装，不接受 `--login-shell` 选项。
+
+### 多解释器支持
+
+针对需要特定 Shell 语法、环境变量或登录脚本的场景，可通过 `--interpreter` 指定目标解释器：
 
 ```bash
+# 原生 SSH 执行（默认）
 xops exec --host alpine-01 --interpreter server -c 'uname -a'
-xops exec --host linux-01 --interpreter bash --launch-dialect posix --login-shell -c 'printf "%s\n" "$PATH"'
+
+# 显式使用 Bash 执行并加载登录环境
+xops exec --host linux-01 --interpreter bash --launch-dialect posix --login-shell -c 'echo $PATH'
+
+# 显式使用 Bash 执行（非登录模式）
+xops exec --host linux-01 --interpreter bash --launch-dialect posix --login-shell=false -c 'echo $VAR'
+
+# 显式使用 POSIX sh 执行
+xops exec --host linux-01 --interpreter sh --launch-dialect posix -c 'id'
+
+# Windows 目标：通过 PowerShell 执行
+xops exec --host win-01 --interpreter powershell -c 'Get-Process | Select-Object -First 5'
+
+# Windows 目标：通过 CMD 执行
+xops exec --host win-01 --interpreter cmd -c 'dir'
 ```
 
-server 将 `-c` 字符串原样发送到 SSH exec，不添加 Bash，也不自动探测或转换命令。服务端仍可使用自己的 Shell 或强制命令；Windows 或设备命令必须符合服务端语法。位置参数仍以空格连接；需要保留引用和空白时使用 `-c`。
+- **`bash`**：调用远端 `bash`。支持 `--login-shell`（等效于 `bash -l -c`）或 `--no-login` / `--login-shell=false`（等效于 `bash -c`）。要求启动方言为 `posix`。
+- **`sh`**：调用标准 POSIX `sh -c`。适用于不依赖 Bash 特性的标准 Shell 脚本，不支持登录 Shell。
+- **`powershell` / `pwsh`**：针对 Windows 主机或跨平台 PowerShell 目标，自动处理命令安全转义与退出码传递。
+- **`cmd`**：针对 Windows 命令提示符（`cmd /c`），自动处理参数引号并限制命令长度在 8191 字符安全范围以内。
 
-显式 Bash 要求已知 POSIX 启动方言，默认不加载登录环境；`--login-shell` 启用登录模式，`--login-shell=false` 显式关闭。server 不接受登录选项。P1 中只覆盖方言或登录模式时，解释器仍沿用 Bash+login 的阶段默认，且须提供已知 POSIX 启动方言；切换 server 必须显式指定 `--interpreter server`。`--no-login` 的旧 Bash 含义保留，与 `--login-shell` 互斥。
+### 启动方言 (`--launch-dialect`)
 
-显式模式支持普通缓冲命令和单主机 PTY 命令，仍拒绝脚本/管道脚本、`--sudo`、`--stream` 和 `--out-dir` 组合。`exec -c` 不把管道输入转发为用户数据。普通缓冲执行保留最后 5 MiB 输出，超出后继续读取并显示截断标记；原命令及引用后的 exec 载荷各最多 64 KiB；单次命令总时限为 5 分钟。非零退出、信号退出和执行结果不确定均报告失败；`outcome=unknown` 表示命令可能已产生副作用，不能直接重跑。关闭连接不证明远端进程已终止。
+启动方言用于指导 XOps 对命令载荷进行语法校验与转义：
+- `posix`：适用于各类 Linux/UNIX Shell（Bash、sh、Zsh 等）。
+- `powershell`：适用于 Windows PowerShell 与跨平台 PowerShell。
+- `cmd`：适用于 Windows 命令提示符。
 
-显式 PTY 示例（客户端 Linux 终端）：
+> 💡 **提示**：除了在命令行临时指定，您可以在主机配置文件 `~/.xops/xops_config.yaml` 中为节点持久化设置 `execution`，详情参见[主机与身份配置](./hosts)。
+
+## 交互式终端与 PTY (`-x`)
+
+使用 `-x` 参数可为单台主机分配伪终端（PTY），支持交互式全屏终端程序与需要 TTY 的工具：
 
 ```bash
-xops exec --host linux-01 --interpreter server -x top
-xops exec --host linux-01 --interpreter bash --launch-dialect posix --login-shell=false -x top
-```
-
-新 PTY 路径要求本地终端输入，实时输出不使用 5 MiB 缓冲窗口。Linux 的终端/管道输出使用独立可取消句柄，单次写入上限 10 秒、退出后的输出排空宽限 1 秒；原始标准流不会被关闭或修改文件标志。输入桥初始化失败、输出管道断开或写入超时会立即触发有界清理，不等待整个命令时限；对端不确认通道关闭时会中断 transport，并汇合输出协程。普通文件重定向与其他客户端平台的原生输出桥尚未验收，新路径会在发送命令前拒绝；core 消费者可提供遵守取消契约的 `ContextWriter`。旧 `Run`、`RunWithoutLogin`、`RunCommandWithIO`、`RunStream` 及 `ssh` 命令均已统一委托至命令计划与可取消输出桥；P2 阶段将进一步拓展全局/节点执行配置与多平台适配器。
-
-## 交互式命令
-
-```bash
+# 运行实时系统监控
 xops exec -x web-01 top
-xops exec -x web-01 ls
-xops exec -x --sudo web-01 ls /root
+
+# 查看需要交互确认的程序
+xops exec -x web-01 htop
+
+# 交互式提权执行命令
+xops exec -x --sudo web-01 ls -la /root
 ```
 
-`-x` 为单台主机提供交互终端，适合 `top`、`vim` 等终端程序，不支持多主机或本地脚本文件，默认兼容路径需要远端安装 Bash；显式 server 不新增 Bash 包装。命令结束后返回本地终端，不额外打开远端 shell。一次性命令的非零退出、信号退出或退出状态缺失均报告失败；完整登录 Shell 保留既有退出策略。普通 PTY 的 `--no-login` 现在生效；与提权 PTY 组合时暂不支持，提前报错。PTY 也不能组合脚本输入、`--stream` 或 `--out-dir`。
+- **单主机限制**：PTY 模式仅支持针对单台主机的即时交互，不支持多主机批处理或本地脚本文件。
+- **原生终端流**：交互式命令直接连接本地终端，不设 5 MiB 缓冲上限，命令退出后即刻返回本地终端。
+- **输出重定向与兼容性**：支持标准输出与错误重定向（例如 `xops exec -x web-01 uptime 2>error.log`）。
+- **取消与清理保障**：当收到中断信号（Ctrl+C）或发生网络断开时，XOps 会在有界时间内主动释放终端资源、终止 SSH 通道并回收后台协程，避免远端进程悬挂。
 
-命令自身或登录启动脚本打印的内容仍保留。需要完整交互 shell 时使用 `xops ssh`。仅执行 `ls` 等命令时通常不需要 `-x`。
+## 参数引用与转义建议
 
-## 引号
-
-将希望交给远端解释的表达式用本地 shell 的正确引号保护。例如 Bash 中：
+当命令包含空格、环境变量或特殊符号时，推荐使用 `-c` 并配合正确的单双引号：
 
 ```bash
+# 在本地保护变量，使其在远端解析
 xops exec web-01 -c 'printf "%s\n" "$HOME"'
+
+# 在本地解析变量后传入远端
+xops exec web-01 -c "echo Current User is $USER"
 ```
 
-在本地使用 PowerShell 时，引号规则不同；复杂任务优先使用脚本文件，远端仍需 Bash。完整选项见[命令参考](../reference/commands/xops-exec)。
+在本地 Windows（PowerShell 或 CMD）中使用时，请注意本地 Shell 的转义规则差异。更复杂的任务推荐编写为脚本文件，通过 `--shell` 选项分发执行。完整选项见[命令参考](../reference/commands/xops-exec)。

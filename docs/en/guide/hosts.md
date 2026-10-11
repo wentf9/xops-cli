@@ -49,6 +49,46 @@ xops ssh audit@192.0.2.10
 
 Use `xops identity --help` for identity operations, or `xops tui` for the [terminal management interface](./tui). Keep passwords out of shared command histories and documentation examples.
 
+## Node execution configuration (`execution`)
+
+In addition to network addresses and authentication identities, you can configure execution parameters (such as interpreter, launch dialect, and login mode) per node in `~/.xops/xops_config.yaml`. This enables `xops exec`, `xops ssh`, Playbooks, and MCP to automatically pick the most suitable execution model:
+
+```yaml
+schema_version: 2
+# Optional global execution defaults
+execution:
+  interpreter: server
+
+nodes:
+  # Scenario 1: Minimal container / Alpine Linux (no Bash, native execution)
+  alpine-01:
+    host_ref: h_alpine
+    identity_ref: id_root
+    execution:
+      interpreter: server
+
+  # Scenario 2: Traditional Linux host (loads personal login environment)
+  web-prod-01:
+    host_ref: h_web
+    identity_ref: id_deploy
+    execution:
+      interpreter: bash
+      launch_dialect: posix
+      login: true
+
+  # Scenario 3: Windows Server (executes commands via PowerShell)
+  win-ad-01:
+    host_ref: h_win
+    identity_ref: id_admin
+    execution:
+      interpreter: powershell
+      launch_dialect: powershell
+```
+
+- **Configuration precedence**: CLI flag > Playbook step override > Playbook settings > Node configuration (`node.execution`) > Global configuration (`cfg.execution`) > System default (`server`).
+- **No manual flag required**: Once configured for a node, operations such as remote commands or piped script execution (`cat script.sh | xops ssh web-prod-01`) automatically use the matching interpreter and environment without having to specify `--interpreter` each time.
+
+
 ## Removed credential arguments
 
 The plaintext arguments `--password` and `--key-pass`, including their short forms, have been removed from `host add|edit` and `identity add|edit`. Use `--password-stdin` for login passwords or `--passphrase-stdin` for private-key passphrases. These two options are mutually exclusive; `--password-stdin` cannot be combined with `--key`. With `host add`, neither stdin option can be combined with `--identity`.
