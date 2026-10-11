@@ -49,6 +49,46 @@ xops ssh audit@192.0.2.10
 
 使用 `xops identity --help` 查看身份管理操作，或运行 `xops tui` 进入[终端管理界面](./tui)。不要将密码放入共享命令记录或文档示例。
 
+## 节点执行环境配置 (`execution`)
+
+除了网络地址与认证身份外，您可以在配置文件 `~/.xops/xops_config.yaml` 中为每个节点持久化预设执行环境（如解释器、启动方言及登录模式），使得 `xops exec`、`xops ssh`、Playbook 以及 MCP 能够自动采用最契合该主机的执行方式：
+
+```yaml
+schema_version: 2
+# 全局默认执行配置（可选）
+execution:
+  interpreter: server
+
+nodes:
+  # 场景 1：精简容器 / Alpine Linux（无 Bash 环境，原生执行）
+  alpine-01:
+    host_ref: h_alpine
+    identity_ref: id_root
+    execution:
+      interpreter: server
+
+  # 场景 2：传统 Linux 服务器（需要加载个人登录环境变量）
+  web-prod-01:
+    host_ref: h_web
+    identity_ref: id_deploy
+    execution:
+      interpreter: bash
+      launch_dialect: posix
+      login: true
+
+  # 场景 3：Windows Server（通过 PowerShell 执行命令）
+  win-ad-01:
+    host_ref: h_win
+    identity_ref: id_admin
+    execution:
+      interpreter: powershell
+      launch_dialect: powershell
+```
+
+- **配置优先级**：CLI 显式命令行参数 > Playbook 步骤设置 > Playbook 全局设置 > 节点配置 (`node.execution`) > 全局配置 (`cfg.execution`) > 系统默认 (`server`)。
+- **免显式指定**：一旦为节点配置了正确的解释器，在执行命令或通过管道传入脚本（如 `cat script.sh | xops ssh web-prod-01`）时，XOps 会自动应用对应的解释器与登录环境，无需每次手动指定 `--interpreter`。
+
+
 ## 已删除的凭据参数
 
 `host add|edit` 和 `identity add|edit` 已删除明文参数 `--password`、`--key-pass` 及其短参数。登录密码改用 `--password-stdin`，私钥口令改用 `--passphrase-stdin`。这两个选项互斥，`--password-stdin` 也不能与 `--key` 同时使用。`host add` 的两个标准输入选项均不能与 `--identity` 同时使用。

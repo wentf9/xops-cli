@@ -1,30 +1,42 @@
 # SSH and privilege escalation
 
+`xops ssh` provides full-featured SSH connectivity and remote session management, integrating node aliases, jump hosts, interpreter adaptations, elevated sessions, and reliable port forwarding tunnels.
+
 ```bash
+# Connect quickly via node alias
 xops ssh web-01
+
+# Connect specifying private key and username
 xops ssh -i ~/.ssh/id_ed25519 deploy@192.0.2.10
+
+# Connect through a jump host (bastion)
 xops ssh -J bastion.example.com deploy@192.0.2.10
 ```
 
 A single-label jump host must already exist as a node or alias. Explicit users on the same host keep separate credentials.
 
-## Command execution and interpreters
+## Command execution and interpreter adaptation
 
-`xops ssh` supports executing remote commands (via positional arguments or following `--host`) with explicit interpreter and login controls:
+`xops ssh` supports running one-off remote commands directly (via positional arguments or following `--host`), with interpreter and login controls:
 
 ```bash
+# Native remote command execution (default)
 xops ssh web-01 uptime
 xops ssh --host web-01 --interpreter server uname -a
+
+# Explicit Bash execution with login shell controls
 xops ssh --host linux-01 --interpreter bash --launch-dialect posix --login-shell=false id
 ```
 
-- **Explicit interpreters**: Supports `--interpreter server` (unchanged SSH exec payload) and `--interpreter bash` (Bash payload wrapped under the known POSIX launch dialect).
-- **Login controls**: Supports `--login-shell` and `--no-login` (mutually exclusive); `--interpreter server` rejects login options.
-- **Input and shell routing**:
-  - When no command is specified and stdin is a terminal, starts a full interactive PTY login shell.
-  - When no command is specified and stdin is piped, starts a native non-PTY SSH shell executing streamed input only if `--interpreter server` is explicitly specified, preserving remote exit status and signals; non-server interpreters or unconfigured interpreters require a non-empty command.
-  - Explicit empty commands (e.g. `xops ssh web-01 ""`) are rejected and never converted into interactive shells.
-- **Cancelable outputs**: Streaming command execution uses cancelable output bridges across regular files, the null device, and (on Linux) terminals and pipes, cleanly interrupting and joining all goroutines on cancellation. Native cancelable output bridges on other platforms will follow in subsequent phases.
+- **Interpreter selection**: Supports `--interpreter server` (native execution, default), `bash`, `sh`, `powershell`, `pwsh`, and `cmd`.
+- **Login environment controls**: When using the `bash` interpreter, supports `--login-shell` (load login profile) and `--no-login` (do not load login profile); the `server` interpreter forwards commands directly and rejects login options.
+- **Input stream and shell routing**:
+  - **Interactive shell**: When no command is specified and stdin is a terminal, starts an interactive PTY login shell.
+  - **Piped script streaming**: When no command is specified and stdin is piped (e.g. `cat script.sh | xops ssh web-01`), XOps routes automatically according to the target node's execution configuration:
+    - If the node is `server` (default), starts a native non-PTY shell streaming the piped input;
+    - If the node is configured for `bash` or `sh`, starts the target interpreter reading the input script from stdin, honoring the node's login configuration.
+  - Explicit empty commands (e.g. `xops ssh web-01 ""`) are safely rejected and will not inadvertently open an interactive shell.
+- **Cancelable output safety**: Command execution streams use cancelable output protection across terminals, pipes, regular files, and the null device. When interrupted by Ctrl+C or upon timeout, XOps cleanly terminates the SSH session and reclaims resources.
 
 ## Automatic node saving
 
@@ -39,7 +51,10 @@ If saving the node fails, XOps reports the error and closes the authenticated SS
 ## Privilege escalation
 
 ```bash
+# Open an elevated interactive shell
 xops ssh --sudo web-01
+
+# Execute a command elevated directly
 xops exec -x --sudo web-01 id
 ```
 
@@ -49,21 +64,23 @@ The node configuration selects the escalation method: root, passwordless sudo, p
 
 Password sudo supports both traditional sudo and sudo-rs. When available credentials supply the password automatically, remote password prompts and sudo-rs asterisk feedback are filtered out. The sudo-rs PAM `Password:` prompt is recognized with or without trailing spaces. Missing or rejected credentials still trigger a password prompt. Authentication errors and output from the elevated command remain visible.
 
-## Tunnels
+## Port forwarding and tunnels
 
 ```bash
+# Local port forwarding: forward local 8080 to 127.0.0.1:80 on remote server
 xops ssh -L 8080:127.0.0.1:80 -N web-01
+
+# Dynamic SOCKS5 proxy: open a SOCKS5 proxy on local port 1080
 xops ssh -D 1080 -N web-01
+
+# Remote port forwarding: forward remote port 9000 to local 127.0.0.1:3000
+xops ssh -R 9000:127.0.0.1:3000 -N web-01
 ```
 
-Tunnels close when the session ends. See [Troubleshooting](../troubleshooting/) for connection, host key, and credential issues.
-
-Individual forwarding connection failures are printed directly to standard error (stderr), including the forwarding type and original error, regardless of `--log-level`. Failures to connect to a destination also include its address. When the server rejects forwarding, the diagnostic includes the reason, such as `administratively prohibited`. The failed connection closes while the SSH session and forwarding listener keep running.
-
-`-L` and `-D` request an SSH channel only when a client uses the forwarding port, so successfully starting a local listener does not mean the server permits forwarding. `-R` requests the remote listener during startup; if the server denies that request, the command reports an error and exits.
-
-For `-R`, requesting the remote listener has a 10-second limit and respects caller cancellation. Closing the listener has its own 10-second limit. Canceling startup or exceeding either request limit interrupts the SSH connection and its shared ProxyJump transport to unblock operations and release resources. An acknowledged close does not require interrupting the shared connection.
-
-With `-L`, `-R`, `-D`, or `-N`, XOps monitors the SSH connection. A keepalive is sent after 15 seconds without receiving remote data. While awaiting its reply, the probe times out only after 10 consecutive seconds without either a reply or receive progress. Forwarded data arriving over a slow link, including partially received SSH packets, refreshes that timeout so congestion delaying the keepalive reply does not interrupt an active connection. Writes accepted by local send buffers do not refresh it. ProxyJump tracks receive progress separately for each hop.
-
-A lost connection or keepalive timeout closes the forwarding listeners and returns a failure status. Connections are not automatically reestablished; rerun the command after connectivity returns.
+- **Lifecycle**: Tunnels close automatically when the session terminates. On connection drops or heartbeat timeouts, XOps closes local listeners and exits with a failure status.
+- **Error diagnostics and isolation**: Forwarding failures are reported to stderr with the forwarding type and error details. If the server denies forwarding (e.g. `administratively prohibited`), the failed channel is closed while the primary session and listeners remain active.
+- **Deferred binding and immediate verification**:
+  - `-L` and `-D` request SSH channels only when local ports receive incoming connections;
+  - `-R` requests remote listening immediately at startup, failing fast if the remote server rejects the request.
+- **Bounded timeouts**: Remote listener establishment and shutdown have independent 10-second deadlines, safely freeing local and connection resources upon timeout or cancellation.
+- **Keepalive and heartbeat monitoring**: Connections with `-L`, `-R`, `-D`, or `-N` are actively monitored. A heartbeat is sent if no remote data is received for 15 seconds; timeout is triggered only after 10 consecutive seconds without replies or data progress. Ongoing throughput resets timers automatically to avoid false timeouts under load.

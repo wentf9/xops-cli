@@ -1,52 +1,99 @@
 # Playbooks and MCP
 
+XOps provides declarative task orchestration (Playbooks) for operations engineers and a Model Context Protocol (MCP) server for AI Agents, enabling seamless infrastructure automation.
+
 For Agent-driven CLI operations, see [Agent Skill and capability overview](./agent-skill). Skill workflows are independent of the MCP service interface described here.
 
-`--var key=value` overrides YAML defaults consistently for step fields and external template files. Newly supplied variables and empty overrides are supported. Missing variables are errors; variable values are not recursively expanded.
+## Declarative Playbooks
 
-## Playbooks
+Playbooks use YAML to define automation workflows, combining `shell`, `script`, `copy`, `ensure` (state convergence), and `template` (configuration rendering) steps, with concurrency and failure handling controls.
 
-Playbooks combine shell, script, copy, ensure, and template steps in YAML. Save this read-only task as `check-hosts.yaml` to verify target selection and credentials:
+### Example Playbook
+
+Save the following content as `deploy-service.yaml`:
 
 ```yaml
-name: check-hosts
+name: deploy-service
 targets:
   tags: [web]
 settings:
-  concurrency: 2
+  concurrency: 5
   on_error: stop
+  execution:
+    interpreter: bash
+    launch_dialect: posix
+    login: true
+vars:
+  http_port: "8080"
 steps:
-  - name: uptime
+  - name: Check system uptime
     shell: uptime
+
+  - name: Ensure Nginx is installed
+    ensure:
+      check: "nginx -v"
+      action: "apt-get update && apt-get install -y nginx"
+    sudo: true
+
+  - name: Render and deploy configuration file
+    template:
+      src: "./nginx.conf.tmpl"
+      dest: "/etc/nginx/nginx.conf"
+    sudo: true
+
+  - name: Restart service
+    shell: "systemctl restart nginx"
+    sudo: true
 ```
+
+Running the Playbook:
 
 ```bash
-xops play check-hosts.yaml
-xops play --help
+# Execute Playbook
+xops play deploy-service.yaml
+
+# Override variables from command line
+xops play deploy-service.yaml --var http_port=8081
+
+# Dry-run execution preview without making changes
+xops play deploy-service.yaml --dry-run
+
+# Restrict execution to a specific host
+xops play deploy-service.yaml --limit web-01
 ```
 
-`stop` stops subsequent steps on the current host; `abort_all` cancels other host tasks after failure; `continue` allows subsequent steps on the current host. Check target tags and privilege configuration before running.
+### Error handling and execution environments
 
-The current source supports execution configuration. Without it, MCP and Playbook commands retain login Bash defaults. An explicit server with an unknown launch dialect follows uncertain-risk policy and cannot receive a POSIX safe-prefix exemption. Escalation applies the resolved login option; unsupported server escalation and configured su combinations fail before execution. Selecting Bash through a shebang still requires a known POSIX launch dialect; cmd/PowerShell dialects cannot be discarded before running the script. See the [execution guide](./exec) for the available CLI execution options.
+- **Failure handling policies (`on_error`)**:
+  - `stop` (default): Stop subsequent steps on the failing host; other hosts continue uninterrupted;
+  - `abort_all`: Cancel all active and pending host tasks immediately upon any host failure;
+  - `continue`: Ignore step failures on the current host and proceed with remaining steps.
+- **Variable overrides (`--var key=value`)**: Variables passed via CLI override YAML values of the same name and can be referenced in templates and command steps; undefined variables trigger validation errors.
+- **Execution environment configuration (`execution`)**:
+  - Configure default execution options (such as `interpreter: bash`, `powershell`, `cmd`, or `server`) in `settings.execution`;
+  - Override execution per step using `execution` (for instance, using `interpreter: cmd` on a specific step targeting Windows hosts);
+  - Unconfigured steps inherit settings hierarchically: step override > playbook settings > node configuration > system default.
 
-## MCP
+## MCP service integration
 
 ```bash
 xops mcp serve
 ```
 
-MCP exposes host operations to AI clients. Set the client command to the full path of `xops` and its arguments to `["mcp", "serve"]`. Configure approval thresholds, blocked commands, protected paths, and audit logs in the configuration file's `guardrail` section.
+XOps includes a built-in server adhering to the Model Context Protocol (MCP) standard, enabling seamless integration with AI clients like Claude Desktop and Cursor.
 
-Stdio tool calls have a five-minute default deadline. Set `mcp.tool_timeout`, for example `30m`, for longer calls; expiry cancels that invocation. Background SSH tunnels have their own TTL, and HTTP file transfers use their task deadlines.
+### Client configuration
 
-When approval is requested, confirm `approved=true` in the client form. Refusal, cancellation or timeout stops the operation. Confirm again if approval expires or the operation's arguments change. If the client cannot display or submit the form, use a client that supports approval.
+Set the MCP server command in your AI client to the absolute path of `xops`, with arguments `["mcp", "serve"]`.
 
-Prepare credentials and verified host keys before starting; MCP does not display terminal authentication or unlock prompts. If credentials are unavailable, check storage with `xops credential doctor` and restore access.
+In `~/.xops/xops_config.yaml`, configure approval thresholds, blocked command rules, protected path policies, and audit logs under the `guardrail` section.
 
-See the [MCP reference](../reference/commands/xops-mcp) for subcommands and options.
+### Timeouts and long-running operations
 
-Stdio also provides [SSH tunnel tools](mcp-tunnels) to create, inspect and stop local (`-L`) and remote (`-R`) forwards.
+- **Call timeout controls**: Stdio tool calls have a default timeout of 5 minutes. Adjust `mcp.tool_timeout` (e.g., `30m`) in your configuration for longer tasks.
+- **Approval safety mechanisms**: When an operation triggers safety thresholds, the client prompts for approval with `approved=true`. Rejections, cancellations, or expired approvals terminate the operation cleanly.
+- **Non-interactive credential access**: MCP operates in non-interactive mode and will not display terminal passphrase prompts or credential store unlock dialogues. Ensure target hosts have credentials configured or accessible. Use `xops credential doctor` to verify storage health.
 
-[LAN HTTP setup, client file transfers and recovery](mcp-http).
-
-`xops_fs_cp` copies through SFTP: ordinary source links remain links, directory source `link/` follows the directory while retaining `link` as the destination basename, and `link/.` copies contents directly. Copying a regular file onto an existing file link updates its target and preserves the link; dangling destination file links are rejected. Spaces and backslashes in paths are literal characters; only `/` is a separator.
+See the [MCP reference](../reference/commands/xops-mcp) for subcommands and options. Advanced topics:
+- [LAN HTTP setup, client file transfers and recovery](mcp-http)
+- [MCP SSH tunnel tools](mcp-tunnels) (manage port forwarding dynamically via AI)
