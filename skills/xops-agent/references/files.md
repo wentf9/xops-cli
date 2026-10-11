@@ -1,10 +1,10 @@
 # Remote files and transfers through the CLI
 
-Use `exec` for text operations on targets with Bash, `scp` for transfers, and batch `sftp` file commands for filesystem operations without a remote shell. No MCP connection, HTTP transfer task, or transfer helper is needed. Local paths always refer to the Agent's CLI environment.
+Use `exec` with the target's actual command language for text operations, `scp` for transfers, and batch `sftp` file commands for filesystem operations without a remote shell. Ordinary commands default to the server shell and do not require Bash. No MCP connection, HTTP transfer task, or transfer helper is needed. Local paths always refer to the Agent's CLI environment.
 
 ## Read and edit text
 
-On a target with Bash and the required POSIX utilities:
+On a target with a POSIX server shell and the required utilities:
 
 ```bash
 xops exec --host web-01 -c 'ls -ld /srv/app && ls -l /srv/app'
@@ -14,7 +14,13 @@ xops exec --host web-01 -c 'tail -n 100 /var/log/app.log'
 
 Use a bounded range for inspection. If exact bytes, binary data, or a large file are needed, download it and inspect locally. Byte-range reads can use a target-supported utility such as `dd`; its offsets and counts are byte-oriented only with the appropriate block-size settings.
 
-`xops exec` requires Bash on Windows SSH targets too: it sends `bash -l -c`, or `bash -c` with `--no-login`. Replacing the inner command with PowerShell syntax or invoking `powershell.exe` does not remove this prerequisite. Without Bash, download with SCP/SFTP, read or edit locally, upload with the intended overwrite policy, and download to a separate local path to verify content. Use SFTP file commands for directory operations; SFTP's `exec` also uses Bash.
+On a Windows target, use syntax for its configured SSH server shell, or select a supported explicit adapter for an ordinary command. For example, from a POSIX local shell when the server launches through cmd.exe:
+
+```bash
+xops exec --host win-01 --interpreter powershell --launch-dialect cmd -c 'Get-Content -LiteralPath "C:\app\settings.ini" -TotalCount 120'
+```
+
+Verify the launch dialect first; a Windows target can have a PowerShell default shell instead. See [execution selection and current CLI limits](execution.md#select-the-execution-environment). If the command language or tools are unavailable, download with SCP/SFTP, read or edit locally, upload with the intended overwrite policy, and download to a separate local path to verify content.
 
 For a small authorized append on a POSIX target:
 
@@ -54,6 +60,8 @@ SFTP
 These are examples of separate requested actions, not a mandatory sequence. SFTP `mkdir` creates one directory and requires an existing parent; an existing destination can fail the batch. `cp` and `rm` support directories recursively. `--no-clobber` skips existing destinations; skipped copies do not prove the desired content was installed. Use `--force` for intended overwrite, or `cp -f` / `mv -f` for a single operation. An authorized deletion can use `rm -f /exact/path` in the batch; review the exact path and wildcard expansion first.
 
 SFTP input is split on whitespace; quoted filenames with spaces are not shell-parsed. For such paths use `scp` with the whole operand quoted, or `exec -c` with correctly quoted target-native commands. Wildcards `*`, `?`, and `[...]` are expanded by SFTP path operations; use exact paths for narrowly scoped changes.
+
+SFTP `exec` is separate from these file commands: it prepends a working-directory operation using the node/global execution adapter. Default `server` rejects a nonempty SFTP cwd, including `/`; select a compatible explicit Bash/sh/cmd/PowerShell adapter in configuration before using it. Its strict output path currently needs Linux native terminal/pipe support (batch regular-file output is supported), so prefer pure SFTP commands for portable file operations.
 
 | Need | POSIX target command through `xops exec -c` | Notes |
 | --- | --- | --- |

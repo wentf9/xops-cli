@@ -22,6 +22,16 @@
 
 `host import --template` exports a CSV import template, not the existing host inventory. Encoding subcommands are `base64`, `url`, `utf8`, and `unicode`; there is no separate `hex` subcommand. Consult the [command reference](../reference/) and the installed version's `--help` for complete options.
 
+## Current execution semantics
+
+Ordinary commands default to `server`, sending the command directly to the remote SSH shell without an implicit `bash -l -c` wrapper. Choose syntax for the actual remote shell; a Windows target no longer needs Bash merely for default command execution. Older versions can still use Bash defaults, so check the version and configuration first.
+
+Global and node settings accept `execution`; Playbooks also support `settings.execution` and step overrides. Explicit Bash/sh/PowerShell/pwsh/cmd adapters require a compatible `launch_dialect`, describing the remote outer shell rather than the Agent's local OS. `--no-login` retains compatibility non-login Bash semantics; it is not a general login switch for all interpreters.
+
+Local scripts need a supported interpreter and a known launch dialect. An allowlisted sh/bash shebang selects the interpreter but cannot establish a POSIX outer shell. Scripts without a reliable interpreter, BOMs, and unsupported combinations are rejected before execution. SFTP file commands need no shell, but SFTP `exec` inherits its current directory: default `server` rejects a nonempty cwd and needs an explicitly configured adapter that can generate the directory change.
+
+Entry points still have limits: explicit `exec` execution flags cannot currently be combined with scripts, sudo, `--stream`, or `--out-dir`; explicit SSH execution and strict PTY output also have client-platform restrictions. Ordinary and strict explicit PTY paths support different outputs. The Skill's `references/execution.md` describes these current code boundaries, Bash compatibility settings, Windows examples, and Playbook check/retry rules.
+
 ## Performing MCP capabilities through the CLI
 
 This table maps capabilities; the Skill executes the CLI workflows in the right column.

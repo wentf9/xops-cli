@@ -1,6 +1,42 @@
 # Remote execution and automation
 
-Examples use a POSIX local shell and require Bash plus the referenced utilities on the remote host. By default, `xops exec` wraps ordinary commands in `bash -l -c`; `--no-login` selects `bash -c`, not the target's default shell. Windows targets also need Bash available to the SSH execution environment, even when the inner command invokes `powershell.exe`. Quote for the local shell, Bash, and any explicitly invoked interpreter. For an ordinary buffered command without Bash, current source supports `xops exec --host NODE --interpreter server -c COMMAND`, forwarding the command unchanged to the server; check installed help before using it. This explicit mode rejects scripts, sudo, streaming/file output, and has a 5-minute timeout with a 5 MiB buffer window. It also supports single-host `-x` with a local terminal and cancelable Linux terminal/pipe output; regular-file redirection and native output on other client platforms are rejected. One-shot PTY nonzero/signal/missing exits now report failure. Ordinary PTY --no-login takes effect; privileged PTY --no-login is currently rejected. Command syntax belongs to the server; uncertain execution outcomes must not be replayed automatically. For file tasks on targets without Bash, use the SCP/SFTP workflows in [Files and transfers](files.md).
+Examples use a POSIX local shell. Remote command syntax and utilities depend on the target; POSIX examples require a POSIX server shell, not necessarily Bash. Current source uses the P3 defaults: ordinary `exec`, SSH commands, MCP commands, and Playbook `shell` steps default to `server`, launch dialect `unknown`, and inherited login mode. A server command is sent unchanged in an SSH exec request. Older installed versions can still wrap commands in Bash; check version and available flags before applying these defaults.
+
+## Select the execution environment
+
+Global and node `execution` configuration can change the defaults. For one-off ordinary commands, current `exec` supports:
+
+```bash
+# Native cmd.exe server shell; no remote Bash prerequisite
+xops exec --host win-01 -c 'ver'
+
+# Explicit interpreter and verified outer server shell
+xops exec --host linux-01 --interpreter sh --launch-dialect posix -c 'id -u'
+xops exec --host linux-01 --interpreter bash --launch-dialect posix --login-shell -c 'printf "%s\n" "$PATH"'
+xops exec --host win-01 --interpreter powershell --launch-dialect cmd -c 'Get-Process | Select-Object -First 5'
+xops exec --host win-01 --interpreter cmd --launch-dialect cmd -c 'dir'
+```
+
+Select the launch dialect from the **remote SSH default shell**, not the local OS or the requested inner interpreter. Unknown is valid for `server`; explicit adapters need a supported known dialect:
+
+| Interpreter | Launch dialect | Login behavior |
+| --- | --- | --- |
+| `server` | `unknown` or a known dialect | Inherited only; do not pass `--login-shell`, including `false`. |
+| `bash` | `posix` | Explicit adapter defaults to non-login; `--login-shell` enables login. |
+| `sh` | `posix` | Non-login only. |
+| `powershell` | `cmd` or `powershell` | Inherited; uses `-NoProfile -NonInteractive -EncodedCommand`. |
+| `pwsh` | `posix`, `cmd`, or `powershell` | Inherited; uses the encoded PowerShell adapter. |
+| `cmd` | `cmd` | Inherited; currently rejects `%`, `!`, newlines, and unbalanced double quotes. |
+
+`--no-login` alone selects non-login Bash for compatibility and assumes POSIX launch when no dialect was supplied. It is not a generic switch for server/sh/PowerShell/cmd. Explicit `--launch-dialect unknown` is not replaced with POSIX, and `--login-shell` conflicts with `--no-login`.
+
+Current CLI boundaries matter:
+
+- `exec` with explicit `--interpreter`, `--launch-dialect`, or `--login-shell` supports buffered commands or single-host PTY commands; it rejects scripts, sudo, `--stream`, and `--out-dir`. Planned buffered execution has a 5-minute default timeout, 64 KiB command/payload bounds, and retains the last 5 MiB of output. Do not assume every legacy/streaming entry point has those same limits.
+- Legacy `exec` streaming/file-output paths support server/Bash/sh, not the Windows adapters. For cmd/PowerShell commands, use the explicit buffered CLI flags above; setting a Windows node default does not enable every entry point.
+- Explicit `exec -x` uses strict native output support: currently Linux terminals/pipes, without regular-file redirection. Ordinary `exec -x` without those explicit flags uses a compatible terminal path and accepts regular-file output; it still uses the resolved server/adapter payload.
+- Explicit execution flags on `ssh` (also `--no-login`) currently require a Linux client and reject sudo and `-N`. Ordinary SSH commands and unconfigured piped server-shell input retain non-Linux compatibility paths. Remote Windows support and native Windows **client** output support are separate concerns.
+- One-shot PTY commands report nonzero, signal, and missing-status failures. Unknown outcomes after disconnect or cancellation are not safe to replay automatically.
 
 ## One host and bounded inspection
 
@@ -20,7 +56,7 @@ xops exec --host web-01 -c 'printf "%s\n" "$HOME"'
 
 After a target selector (`--host`, `--ifile`, or `--tag`), positional arguments are the remote command, not another host. Use `--` to disambiguate remote options, for example `xops exec --host web-01 -- echo --help`. Put XOps options before the remote command. Do not invent an `exec --timeout` flag; set a suitable bound in the Agent's command runner and cancel its process when needed.
 
-`--sudo` uses the node's configured privilege strategy, including root, sudo, or su modes. It is distinct from `xops sudo`, which elevates on the local CLI machine. Login success alone does not prove privilege escalation succeeded.
+`--sudo` uses the node's configured Unix privilege strategy, including root, sudo, or su modes. It is distinct from `xops sudo`, which elevates on the local CLI machine. Unconfigured escalation retains the legacy Unix Bash compatibility path; explicit server escalation is unsupported. Configured Bash/sh escalation and configured su have narrower support than ordinary execution; do not infer Windows UAC support or silently remove `--sudo`. Login success alone does not prove privilege escalation succeeded.
 
 ## Batch commands and local scripts
 
@@ -29,12 +65,26 @@ xops host list --tag web
 xops exec --tag web --exclude web-02 --task 3 -c 'uptime'
 xops exec --host web-01,web-02 --task 2 --stream -c 'df -h'
 xops exec --ifile ./hosts.txt --out-dir ./results -c 'uname -a'
-xops exec --tag web --shell ./check.sh --task 3
+# Deliberately run this local script as non-login Bash on POSIX targets
+xops exec --tag web --no-login --shell ./check.sh --task 3
 ```
 
 The `--host`, `--ifile`/`-I`, and `--tag` flags are mutually exclusive: choose one, since combining any of them is rejected before execution. `--exclude` narrows the selected set. `--task` limits concurrent hosts, `--stream` prefixes streamed multi-host output, and `--out-dir` retains per-host logs. Protect logs if command output is sensitive.
 
-Write a local script for complex quoting or several dependent commands, then pass it with `--shell`. The script belongs to the CLI machine. Use explicit failure handling inside it; the last successful command must not hide an earlier failure. Check each host's outcome and the process exit code. After an interrupted mutation, inspect the affected hosts before rerunning it.
+Write a local script for complex quoting or several dependent commands, then pass it with `--shell`. The script belongs to the CLI machine and is sent to the selected interpreter through stdin. Do not combine script bytes with a separate runtime stdin stream or credential stdin stream. A no-command `exec` with piped stdin is also a script; a no-command nonterminal `ssh HOST` in server mode instead sends an SSH shell request. Piped `ssh --sudo` remains an escalation operation.
+
+Scripts now require a reliable interpreter. Supported `sh`/`bash` shebangs (such as `#!/bin/sh`, `#!/bin/bash`, or `#!/usr/bin/env sh`, without extra arguments) can select it; a shebang does **not** establish the outer launch dialect. Configure `launch_dialect: posix` only after verifying the server shell. Missing shebangs need a configured non-server interpreter or the deliberate Bash `--no-login` compatibility path. An unsupported shebang needs a supported explicit step/settings or CLI interpreter override; a node default alone does not override it. BOMs and explicit server scripts remain rejected. Do not silently strip or rewrite script bytes. The current script adapter supports Bash/sh, not arbitrary Python, cmd, or PowerShell scripts.
+
+For a node that deliberately needs the old login Bash environment, merge this fragment into that node's existing configuration, preserving its connection and identity fields:
+
+```yaml
+execution:
+  interpreter: bash
+  launch_dialect: posix
+  login: true
+```
+
+Do not automatically apply it to every host. Explicit `--interpreter`, `--launch-dialect`, and `--login-shell` flags are not currently accepted together with `--shell`; use supported node configuration, `--no-login` for a Bash script, or Playbook execution settings. Use explicit failure handling inside scripts; the last successful command must not hide an earlier failure. Check each host's outcome and the process exit code. After an interrupted mutation, inspect the affected hosts before rerunning it.
 
 ## Playbooks
 
@@ -47,6 +97,7 @@ targets:
 settings:
   concurrency: 2
   on_error: stop
+  timeout: 2m
 steps:
   - name: uptime
     shell: uptime
@@ -64,12 +115,25 @@ xops play check-web.yaml --limit web-01
 | Step | Use |
 | --- | --- |
 | `shell` | Execute a remote command. |
-| `script` | Upload and execute a local script. |
+| `script` | Read a local script and send its bytes to the resolved interpreter. |
 | `copy` | Upload a local file. |
 | `ensure` | Run a check and execute its action only if the desired state is absent. |
 | `template` | Render a local Go template and upload the result. |
 
 `on_error: stop` stops later steps on the failing host; `abort_all` cancels other host tasks; `continue` permits later steps on that same host. `--dry-run` previews the workflow without proving connectivity or credentials. More examples are in the [automation guide](https://wentf9.github.io/xops-cli/guide/automation).
+
+Ordinary step configuration resolves from step → `settings.execution` → node → global configuration. For scripts, explicit step/settings interpreter choices precede a supported shebang, then non-server node/global defaults. `server` is not a script interpreter. When a workflow needs POSIX script or ensure adapters, explicitly configure the known environment, for example:
+
+```yaml
+settings:
+  execution:
+    interpreter: bash
+    launch_dialect: posix
+    login: false
+  timeout: 5m
+```
+
+Use this only on compatible hosts. Ensure checks reject explicitly configured server mode; unconfigured checks retain a controlled Bash compatibility wrapper. Only a confirmed check result can authorize the action and subsequent verification. Timeout, cancellation, signal, I/O, cleanup, or uncertain startup failures must not be treated as an absent desired state. Retry settings apply to confirmed clean command failures; do not assume every failed attempt is retryable. Script sources and execution settings are frozen within a run, so changing local files/configuration during execution is not an update mechanism.
 
 ## Interactive and local utilities
 
@@ -80,7 +144,7 @@ xops exec -x web-01 top
 xops tui
 ```
 
-Use these when the task needs a terminal. `exec -x` supports one host and no local script; it returns after the requested command and requires Bash on the target in the default compatibility path. `ssh` provides a full shell. Single-label jump hosts must be configured nodes/aliases; FQDN, IP, and explicit `host:port` can identify direct jumps.
+Use these when the task needs a terminal. `exec -x` supports one host and no local script; it returns after the requested command and now defaults to the native server payload. Privileged PTY `--no-login` is currently rejected. `ssh` without a command opens a full server shell; that login session is distinct from one-shot command execution. Single-label jump hosts must be configured nodes/aliases; FQDN, IP, and explicit `host:port` can identify direct jumps.
 
 Text conversion is local:
 

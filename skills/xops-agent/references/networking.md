@@ -71,7 +71,7 @@ xops firewall rule 8080 192.0.2.20 --host web-01
 xops firewall service http --host web-01 --reload
 ```
 
-Select the intended action, not all four examples. XOps adapts to firewalld, ufw, iptables, and nftables; supported service/zone behavior depends on the detected backend. Target selection supports `--host`, `--ifile`, `--tag`, `--exclude`, and `--task`. Use `firewall <subcommand> --help` for options such as `--zone`, `--reject`, and `--drop`.
+Select the intended action, not all four examples. XOps's generated firewall commands target Linux/POSIX environments; they are not a Windows firewall adapter. It adapts to firewalld, ufw, iptables, and nftables; supported service/zone behavior depends on the detected backend. Target selection supports `--host`, `--ifile`, `--tag`, `--exclude`, and `--task`. Use `firewall <subcommand> --help` for options such as `--zone`, `--reject`, and `--drop`.
 
 Rule changes can affect the management connection. Keep authorized source/port scope explicit and verify effective rules and connectivity afterward. `--clear` removes rules in the relevant category; do not add it for an ordinary single-port change. No plaintext firewall password flag exists; credentials must already be configured.
 

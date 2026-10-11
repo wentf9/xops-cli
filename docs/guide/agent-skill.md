@@ -22,6 +22,16 @@
 
 `host import --template` 导出的是 CSV 导入模板，不是已有主机清单。编码子命令是 `base64`、`url`、`utf8`、`unicode`，没有独立的 `hex` 子命令。完整参数以[命令参考](../reference/)及已安装版本的 `--help` 为准。
 
+## 当前执行语义
+
+普通命令默认使用 `server`，直接将命令发送给远端 SSH Shell，不再隐式包装 `bash -l -c`。应根据远端实际 Shell 选择语法；Windows 远端不再因为默认路径而要求安装 Bash。旧版本可能仍采用 Bash 默认，使用前需核对版本及配置。
+
+全局与节点可设置 `execution`；Playbook 还支持 `settings.execution` 与步骤级覆盖。显式 Bash/sh/PowerShell/pwsh/cmd 适配器要求兼容的 `launch_dialect`，它描述远端外层 Shell，而不是 Agent 的本地系统。`--no-login` 保留非登录 Bash 兼容语义，不是控制所有解释器的通用选项。
+
+本地脚本需要受支持的解释器以及已知的启动方言；白名单 sh/bash shebang 只选择解释器，不能证明外层 Shell 是 POSIX。无可靠解释器、BOM 或不支持的组合会在执行前拒绝。SFTP 文件命令不依赖 Shell，但 SFTP `exec` 要继承当前目录，默认 `server` 会拒绝非空 cwd，需要明确配置可生成目录切换命令的适配器。
+
+不同入口仍有限制：`exec` 的显式执行参数暂不支持与脚本、sudo、`--stream` 或 `--out-dir` 组合；`ssh` 显式执行与严格 PTY 输出也有客户端平台限制。普通 PTY 路径与严格显式路径的输出能力不同。Skill 的 `references/execution.md` 按当前代码说明这些边界，并提供 Bash 兼容配置、Windows 示例和 Playbook 检查/重试规则。
+
 ## MCP 能力如何通过 CLI 完成
 
 下表用于说明能力对应关系，Skill 实际执行右侧 CLI 工作流。

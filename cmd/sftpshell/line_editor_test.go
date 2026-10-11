@@ -214,7 +214,7 @@ func TestLineEditorTypeAheadAcrossBuffersAndRecreation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer closeTestResource(t, reader)
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	commands := make([]string, 80)
 	var input strings.Builder

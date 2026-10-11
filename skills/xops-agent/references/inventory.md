@@ -43,6 +43,12 @@ Host add/import verify SSH by default. Add asks whether to save after verificati
 
 New nodes discovered by SSH, exec, SCP, or SFTP are saved after successful SSH authentication, even when the later command/transfer fails. `--remember never` controls automatic saving of prompted secrets, not node metadata. Failed authentication does not create a new node.
 
+## Execution configuration
+
+Inspect global and node `execution` fields in the selected Schema v2 configuration before selecting remote command syntax. Ordinary commands now default to `server`; node settings override global settings. Fields are `interpreter`, `launch_dialect`, and optional boolean `login`. A child interpreter change can drop the parent's interpreter-specific login option, while the launch dialect still inherits and must remain compatible.
+
+There are no `host add/edit --interpreter` or `--launch-dialect` flags. For a persistent change, preserve the existing YAML and node references, change only the authorized execution fields, and verify configuration loading before remote execution. Do not guess the dialect from the client's OS or rewrite the entire inventory to change one node. See [Execution and Playbooks](execution.md#select-the-execution-environment) for supported combinations and a Bash compatibility fragment.
+
 ## Noninteractive access
 
 The default store named `file` uses the `encrypted-file` backend with a separate key file. Verified secrets are saved according to the remember policy; first saving can initialize the default vault and key. Available backends also include `system`, `pass`, `helper`, and `none`.
