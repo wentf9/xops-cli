@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -19,7 +20,19 @@ import (
 
 func verificationRepository(t *testing.T) (*config.Repository, config.Store) {
 	t.Helper()
-	t.Setenv("XOPS_CONFIG_DIR", t.TempDir())
+	return verificationRepositoryAtDirectory(t, t.TempDir())
+}
+
+func verificationRepositoryAtDirectory(t *testing.T, directory string) (*config.Repository, config.Store) {
+	t.Helper()
+	// macOS exposes its temporary directory through a system symlink. The
+	// offline vault intentionally rejects symlink ancestors, so fixtures must
+	// use the physical path rather than weakening that production boundary.
+	physical, err := filepath.EvalSymlinks(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XOPS_CONFIG_DIR", physical)
 	if err := i18n.Init("en"); err != nil {
 		t.Fatal(err)
 	}
@@ -51,6 +64,37 @@ func verificationRepository(t *testing.T) (*config.Repository, config.Store) {
 		t.Fatal(err)
 	}
 	return repo, store
+}
+
+func TestImportFixtureWithSymlinkedTemporaryDirectory(t *testing.T) {
+	directory, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "temporary-directory-alias")
+	if err := os.Symlink(directory, alias); err != nil {
+		t.Skipf("directory symlinks unavailable: %v", err)
+	}
+	repo, store := verificationRepositoryAtDirectory(t, alias)
+	draft, err := prepareImport(repo, utils.HostInfo{Host: "192.0.2.1", User: "root", Port: 2222, Password: "symlink-fixture-secret"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := draft.save(t.Context(), repo); err != nil {
+		t.Fatalf("import through system temporary alias: %v", err)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, ok := cfg.Nodes.Get(draft.nodeID)
+	if !ok {
+		t.Fatal("import did not persist the node")
+	}
+	id, ok := cfg.Identities.Get(node.IdentityRef)
+	if !ok || persistedTestPassword(t, cfg, id) != "symlink-fixture-secret" {
+		t.Fatal("import did not persist the credential reference")
+	}
 }
 
 func TestImportVerificationPolicies(t *testing.T) {

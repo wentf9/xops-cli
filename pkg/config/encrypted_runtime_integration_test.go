@@ -169,7 +169,7 @@ func TestEncryptedRuntimeNonInteractivePromptCache(t *testing.T) {
 func TestEncryptedMigrationAndFinalize(t *testing.T) {
 	migrator, _, _ := migrationFixture(t)
 	disk := NewDefaultStore(migrator.path, migrator.keyPath)
-	cfg, err := disk.Load()
+	cfg, err := loadMigrationTestConfiguration(migrator.path, migrator.keyPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +179,7 @@ func TestEncryptedMigrationAndFinalize(t *testing.T) {
 	}
 	vault := filepath.Join(filepath.Dir(migrator.path), "vault")
 	cfg.Credential.Stores["vault"] = StoreConfig{Type: StoreTypeEncryptedFile, Path: vault, Unlock: "key-file", KeyFile: key}
-	if err := disk.Save(cfg); err != nil {
+	if err := writeMigrationTestConfiguration(migrator.path, migrator.keyPath, cfg); err != nil {
 		t.Fatal(err)
 	}
 	owner := NewEncryptedRuntime(t.Context(), migrator.path, nil)
@@ -199,6 +199,10 @@ func TestEncryptedMigrationAndFinalize(t *testing.T) {
 	if err != nil || !report.Verified || report.Credentials != 3 {
 		t.Fatalf("migration: %+v %v", report, err)
 	}
+	// Only the explicitly migrated v2 result may enter the ordinary runtime.
+	if loaded, err := disk.Load(); err != nil || loaded.SchemaVersion != 2 {
+		t.Fatalf("migrated configuration rejected by runtime: %v", err)
+	}
 	if _, err := migrator.Finalize(credential.WithoutInteraction(t.Context())); err != nil {
 		t.Fatal(err)
 	}
@@ -212,13 +216,12 @@ func TestEncryptedMigrationAndFinalize(t *testing.T) {
 
 func TestEncryptedMigrationRejectsLegacyKeyBeforeWrites(t *testing.T) {
 	m, _, _ := migrationFixture(t)
-	disk := NewDefaultStore(m.path, m.keyPath)
-	cfg, err := disk.Load()
+	cfg, err := loadMigrationTestConfiguration(m.path, m.keyPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	cfg.Credential.Stores["vault"] = StoreConfig{Type: StoreTypeEncryptedFile, Path: filepath.Join(filepath.Dir(m.path), "vault"), Unlock: "key-file", KeyFile: m.keyPath}
-	if err := disk.Save(cfg); err != nil {
+	if err := writeMigrationTestConfiguration(m.path, m.keyPath, cfg); err != nil {
 		t.Fatal(err)
 	}
 	before, err := os.ReadFile(m.path)
@@ -243,7 +246,7 @@ func TestEncryptedMigrationRejectsLegacyKeyBeforeWrites(t *testing.T) {
 func TestEncryptedFinalizeProtectsChangedKeyConfiguration(t *testing.T) {
 	m, _, _ := migrationFixture(t)
 	disk := NewDefaultStore(m.path, m.keyPath)
-	cfg, err := disk.Load()
+	cfg, err := loadMigrationTestConfiguration(m.path, m.keyPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +261,7 @@ func TestEncryptedFinalizeProtectsChangedKeyConfiguration(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg.Credential.Stores["vault"] = StoreConfig{Type: StoreTypeEncryptedFile, Path: path, Unlock: "key-file", KeyFile: key}
-	if err := disk.Save(cfg); err != nil {
+	if err := writeMigrationTestConfiguration(m.path, m.keyPath, cfg); err != nil {
 		t.Fatal(err)
 	}
 	owner := NewEncryptedRuntime(t.Context(), m.path, nil)
