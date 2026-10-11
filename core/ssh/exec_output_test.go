@@ -275,11 +275,16 @@ func TestLegacyFileOutputsReceiveCommandOutput(t *testing.T) {
 func TestBindOutputStandardFileHandles(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		for _, target := range []*os.File{os.Stdout, os.Stderr} {
+			info, statErr := target.Stat()
+			isRegularOrNull := statErr == nil && (info.Mode().IsRegular() || isNullDevice(info))
 			_, closeFn, cancelable, err := BindOutput(t.Context(), target)
 			if err != nil {
 				t.Fatalf("bind %s on %s: unexpected error %v", target.Name(), runtime.GOOS, err)
 			}
-			if cancelable {
+			if isRegularOrNull && !cancelable {
+				t.Fatalf("%s regular file or null device unexpectedly reported non-cancelable on %s", target.Name(), runtime.GOOS)
+			}
+			if !isRegularOrNull && cancelable {
 				t.Fatalf("%s unexpectedly reported cancelable on %s", target.Name(), runtime.GOOS)
 			}
 			if err := closeFn(); err != nil {

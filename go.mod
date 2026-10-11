@@ -17,6 +17,7 @@ require (
 	github.com/ebitengine/purego v0.11.1
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f
 	github.com/godbus/dbus/v5 v5.2.2
+	github.com/google/jsonschema-go v0.4.3
 	github.com/hinshun/vt10x v0.0.0-20220301184237-5011da428d02
 	github.com/kevinburke/ssh_config v1.6.0
 	github.com/modelcontextprotocol/go-sdk v1.8.0
@@ -46,7 +47,6 @@ require (
 	github.com/clipperhouse/displaywidth v0.11.0 // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/google/jsonschema-go v0.4.3 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/kr/fs v0.1.0 // indirect
