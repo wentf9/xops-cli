@@ -68,6 +68,32 @@ func (c *Client) RunShellWithoutPTY(ctx context.Context, stdin io.Reader, stdout
 	return c.runSessionWithInput(work, "shell", func(session *cryptoSSH.Session) error { return session.Shell() }, "", stdin, boundOut, boundErr, cancel)
 }
 
+// RunShellWithIO sends an SSH shell request without a PTY using caller-provided I/O streams.
+// Unlike RunShellWithoutPTY, which enforces strict output cancelability, RunShellWithIO
+// allows uncancelable outputs on platforms where native cancelable output is unavailable.
+func (c *Client) RunShellWithIO(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) (retErr error) {
+	if ctx == nil {
+		return fmt.Errorf("shell execution context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("shell execution canceled: %w", err)
+	}
+	if c == nil || c.sshClient == nil {
+		return fmt.Errorf("SSH client is not connected")
+	}
+	if err := validateCommandStdin(stdin); err != nil {
+		return err
+	}
+	work, cancel := context.WithCancel(ctx)
+	defer cancel()
+	boundOut, boundErr, closeOutput, err := c.bindCommandOutputs(work, stdout, stderr)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, closeOutput()) }()
+	return c.runSessionWithInput(work, "shell", func(session *cryptoSSH.Session) error { return session.Shell() }, "", stdin, boundOut, boundErr, cancel)
+}
+
 // bindStrictOutputs is the new-API counterpart of bindCommandOutputs: output
 // that cannot be canceled is rejected rather than silently used.
 func bindStrictOutputs(ctx context.Context, stdout, stderr io.Writer) (io.Writer, io.Writer, func() error, error) {

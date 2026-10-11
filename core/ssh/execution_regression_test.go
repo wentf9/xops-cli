@@ -5,18 +5,18 @@ import (
 	"testing"
 )
 
-func TestConfiguredCommandDefaultsStayLegacyUntilP3(t *testing.T) {
-	no := false
+func TestConfiguredCommandDefaultsP3(t *testing.T) {
+	yes := true
 	for _, test := range []struct {
 		name    string
 		cfg     *ExecutionConfig
 		payload string
 	}{
-		{"absent", nil, "bash -l -c 'uptime'"},
-		{"empty", &ExecutionConfig{}, "bash -l -c 'uptime'"},
-		{"login only", &ExecutionConfig{Login: &no}, "bash -c 'uptime'"},
+		{"absent", nil, "uptime"},
+		{"empty", &ExecutionConfig{}, "uptime"},
 		{"explicit server", &ExecutionConfig{Interpreter: InterpreterServer}, "uptime"},
 		{"explicit bash default", &ExecutionConfig{Interpreter: InterpreterBash, LaunchDialect: LaunchPOSIX}, "bash -c 'uptime'"},
+		{"explicit bash login", &ExecutionConfig{Interpreter: InterpreterBash, LaunchDialect: LaunchPOSIX, Login: &yes}, "bash -l -c 'uptime'"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			plan, err := PlanCommand("uptime", test.cfg.CommandOptions())
@@ -79,5 +79,63 @@ func TestScriptRevalidatesDerivedInterpreterAndLaunchDialect(t *testing.T) {
 	res, err := ResolveScriptExecution(nil, nil, &ExecutionConfig{Interpreter: InterpreterServer, LaunchDialect: LaunchPOSIX}, nil, []byte("#!/bin/bash\necho script"))
 	if err != nil || res.Login == nil || *res.Login {
 		t.Fatalf("resolved Bash login not frozen to adapter default: %+v, %v", res, err)
+	}
+}
+
+func TestResolveCommandIOInterpreter(t *testing.T) {
+	client := &Client{}
+
+	// 1. Unconfigured non-sudo: defaults to Server, empty command rejected
+	_, err := client.resolveCommandIOInterpreter(false, "")
+	if !errors.Is(err, ErrExecutionValidation) {
+		t.Fatalf("expected ErrExecutionValidation for unconfigured non-sudo empty command, got: %v", err)
+	}
+
+	interp, err := client.resolveCommandIOInterpreter(false, "uptime")
+	if err != nil || interp != InterpreterServer {
+		t.Fatalf("unconfigured non-sudo command: interp=%q, err=%v", interp, err)
+	}
+
+	// 2. Unconfigured sudo: defaults to Bash, allows empty command
+	interp, err = client.resolveCommandIOInterpreter(true, "")
+	if err != nil || interp != InterpreterBash {
+		t.Fatalf("unconfigured sudo empty command: interp=%q, err=%v", interp, err)
+	}
+
+	// 3. Server interpreter with sudo: rejected
+	serverClient := NewTestClient(ConnectionConfig{Execution: &ExecutionConfig{Interpreter: InterpreterServer}})
+	_, err = serverClient.resolveCommandIOInterpreter(true, "uptime")
+	if !errors.Is(err, ErrExecutionValidation) {
+		t.Fatalf("expected ErrExecutionValidation for server sudo, got: %v", err)
+	}
+}
+
+func TestRunScriptOptionOrdering(t *testing.T) {
+	no := false
+	exec := &ExecutionConfig{
+		Interpreter:   InterpreterBash,
+		LaunchDialect: LaunchPOSIX,
+		Login:         &no,
+	}
+
+	extraOpts := []RunOption{WithLoginShell(true), WithInterpreter(InterpreterSh)}
+	opts := make([]RunOption, len(extraOpts))
+	copy(opts, extraOpts)
+	if exec.Interpreter != "" {
+		opts = append(opts, WithInterpreter(exec.Interpreter))
+	}
+	if exec.Login != nil {
+		opts = append(opts, WithLoginShell(*exec.Login))
+	}
+
+	config := DefaultRunConfig()
+	for _, opt := range opts {
+		opt(config)
+	}
+	if config.LoginShell != false {
+		t.Fatalf("expected LoginShell=false, got %t", config.LoginShell)
+	}
+	if config.Interpreter != InterpreterBash {
+		t.Fatalf("expected Interpreter=bash, got %s", config.Interpreter)
 	}
 }

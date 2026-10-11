@@ -430,7 +430,19 @@ func (o *ExecOptions) runInteractive(
 	} else if o.Sudo {
 		execErr = client.RunInteractiveWithSudo(ctx, cmd)
 	} else {
-		execErr = client.RunInteractiveWithOptions(ctx, cmd, ssh.WithLoginShell(!o.NoLoginShell))
+		opts := client.Execution().CommandOptions()
+		if o.execution.enabled() || o.execution.noLoginSet {
+			cliOpts, optErr := o.execution.commandOptions(o.NoLoginShell)
+			if optErr != nil {
+				return optErr
+			}
+			opts = cliOpts
+		}
+		plan, planErr := ssh.PlanCommand(cmd, opts)
+		if planErr != nil {
+			return fmt.Errorf("[%s] plan interactive command: %w", task.host, planErr)
+		}
+		execErr = client.RunInteractiveCmd(ctx, plan.Payload())
 	}
 
 	return execErr
@@ -524,11 +536,7 @@ func (o *ExecOptions) executeTask(ctx context.Context, connector *ssh.Connector,
 		return fmt.Errorf("[%s] connect failed: %w", t.host, err)
 	}
 
-	var output string
-	var execErr error
-
-	var runOpts []ssh.RunOption
-	runOpts = append(runOpts, ssh.WithLoginShell(!o.NoLoginShell))
+	var outputOpts []ssh.RunOption
 
 	if o.OutDir != "" {
 		// 清洗主机名，防止路径穿越
@@ -541,7 +549,7 @@ func (o *ExecOptions) executeTask(ctx context.Context, connector *ssh.Connector,
 		defer func() {
 			joinExecLogCloseError(&retErr, f, t.host, logFile)
 		}()
-		runOpts = append(runOpts, ssh.WithOutFile(f))
+		outputOpts = append(outputOpts, ssh.WithOutFile(f))
 	} else if o.Stream || totalTasks == 1 {
 		prefix := ""
 		if totalTasks > 1 {
@@ -552,30 +560,66 @@ func (o *ExecOptions) executeTask(ctx context.Context, connector *ssh.Connector,
 			}
 		}
 		// 使用 lockedWriter 包装 os.Stdout，防止多 goroutine 写入交错
-		runOpts = append(runOpts, ssh.WithStream(ssh.NewLockedWriter(stdoutMu, o.stdoutWriter()), prefix))
+		outputOpts = append(outputOpts, ssh.WithStream(ssh.NewLockedWriter(stdoutMu, o.stdoutWriter()), prefix))
 	} else {
-		runOpts = append(runOpts, ssh.WithRingBuffer(5*1024*1024))
+		outputOpts = append(outputOpts, ssh.WithRingBuffer(5*1024*1024))
 	}
 
-	if isScript {
-		if o.Sudo {
-			output, execErr = client.RunScriptWithSudo(ctx, execCmd, runOpts...)
-		} else {
-			output, execErr = client.RunScript(ctx, execCmd, runOpts...)
-		}
-	} else {
-		if o.Sudo {
-			output, execErr = client.RunWithSudo(ctx, execCmd, runOpts...)
-		} else {
-			output, execErr = client.Run(ctx, execCmd, runOpts...)
-		}
-	}
+	output, execErr := o.dispatchTaskExecution(ctx, client, execCmd, isScript, outputOpts)
 
 	printErr := o.printTaskResult(t, output, execErr, stdoutMu)
 	if execErr != nil {
 		return errors.Join(fmt.Errorf("[%s] %w", t.host, execErr), printErr)
 	}
 	return printErr
+}
+
+func (o *ExecOptions) resolveScriptExecutionConfig() (*ssh.ExecutionConfig, error) {
+	if !o.execution.enabled() && !o.execution.noLoginSet {
+		return nil, nil
+	}
+	opts, err := o.execution.commandOptions(o.NoLoginShell)
+	if err != nil {
+		return nil, err
+	}
+	cliExec := &ssh.ExecutionConfig{
+		Interpreter:   opts.Interpreter,
+		LaunchDialect: opts.LaunchDialect,
+	}
+	switch opts.Login {
+	case ssh.LoginEnabled:
+		val := true
+		cliExec.Login = &val
+	case ssh.LoginDisabled:
+		val := false
+		cliExec.Login = &val
+	}
+	return cliExec, nil
+}
+
+func (o *ExecOptions) dispatchTaskExecution(ctx context.Context, client *ssh.Client, execCmd string, isScript bool, outputOpts []ssh.RunOption) (string, error) {
+	if isScript {
+		cliExec, err := o.resolveScriptExecutionConfig()
+		if err != nil {
+			return "", err
+		}
+		resolvedExec, err := ssh.ResolveScriptExecution(cliExec, nil, client.Execution(), nil, []byte(execCmd))
+		if err != nil {
+			return "", err
+		}
+		if o.Sudo {
+			return client.RunScriptWithSudoExecution(ctx, execCmd, resolvedExec, outputOpts...)
+		}
+		return client.RunScriptWithExecution(ctx, execCmd, resolvedExec, outputOpts...)
+	}
+	cmdOpts := append([]ssh.RunOption{ssh.WithLoginShell(!o.NoLoginShell)}, outputOpts...)
+	if o.execution.noLoginSet || o.NoLoginShell {
+		cmdOpts = append(cmdOpts, ssh.WithInterpreter(ssh.InterpreterBash))
+	}
+	if o.Sudo {
+		return client.RunWithSudo(ctx, execCmd, cmdOpts...)
+	}
+	return client.Run(ctx, execCmd, cmdOpts...)
 }
 
 func joinExecLogCloseError(retErr *error, closer io.Closer, host, logFile string) {

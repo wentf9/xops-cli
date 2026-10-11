@@ -292,10 +292,10 @@ func (e *Engine) runShell(ctx context.Context, client *ssh.Client, cmd string, s
 		}
 	}
 
-	if effectiveExec != nil {
-		return e.runShellEffective(ctx, client, cmd, effectiveExec, sudo)
+	if effectiveExec == nil && !sudo {
+		effectiveExec = &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer, LaunchDialect: ssh.LaunchUnknown}
 	}
-	return e.runShellLegacy(ctx, client, cmd, sudo)
+	return e.runShellEffective(ctx, client, cmd, effectiveExec, sudo)
 }
 
 func (e *Engine) runShellEffective(ctx context.Context, client *ssh.Client, cmd string, effectiveExec *ssh.ExecutionConfig, sudo bool) StepResult {
@@ -555,7 +555,7 @@ func (e *Engine) executeEnsureCheck(ctx context.Context, client *ssh.Client, che
 		}
 	}
 
-	if effectiveExec != nil && effectiveExec.Interpreter == ssh.InterpreterServer {
+	if effectiveExec != nil && effectiveExec.EffectiveInterpreter() == ssh.InterpreterServer {
 		return "", 0, StepResult{
 			Status:    StatusFailed,
 			Outcome:   ssh.ExecutionNotStarted,
@@ -714,7 +714,7 @@ func (e *Engine) executeEnsureCheckLegacy(ctx context.Context, client *ssh.Clien
 	if sudo {
 		out, checkErr = client.RunWithSudo(ctx, wrappedCheck)
 	} else {
-		out, checkErr = client.Run(ctx, wrappedCheck)
+		out, checkErr = client.Run(ctx, wrappedCheck, ssh.WithInterpreter(ssh.InterpreterBash))
 	}
 	if checkErr != nil {
 		ec, sig, hasExit, cleanupErr, ioErr, otherErr, isCanceled := classifySessionError(checkErr)

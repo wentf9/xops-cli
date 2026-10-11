@@ -29,14 +29,17 @@ func (c *Client) RunWithSudoExecution(ctx context.Context, command string, execu
 
 // RunScriptWithSudoExecution applies the same target/login capability checks
 // to a script whose interpreter has already been resolved by the caller.
-func (c *Client) RunScriptWithSudoExecution(ctx context.Context, content string, execution *ExecutionConfig) (string, error) {
+func (c *Client) RunScriptWithSudoExecution(ctx context.Context, content string, execution *ExecutionConfig, extraOpts ...RunOption) (string, error) {
 	if strings.HasPrefix(content, "\xef\xbb\xbf") {
 		return "", fmt.Errorf("%w: script contains unsupported UTF-8 BOM prefix", ErrExecutionValidation)
 	}
-	opts, err := c.configuredSudoOptions(ctx, ":", execution)
+	execOpts, err := c.configuredSudoOptions(ctx, ":", execution)
 	if err != nil {
 		return "", err
 	}
+	opts := make([]RunOption, len(extraOpts))
+	copy(opts, extraOpts)
+	opts = append(opts, execOpts...)
 	return c.RunScriptWithSudo(ctx, content, opts...)
 }
 
@@ -311,6 +314,50 @@ func (c *Client) RunCommandWithInput(ctx context.Context, command string, input 
 	return c.RunCommandWithIO(ctx, command, false, stdin, stdout, stderr)
 }
 
+func (c *Client) resolveCommandIOInterpreter(sudo bool, command string) (Interpreter, error) {
+	if exec := c.Execution(); exec != nil {
+		if err := exec.Validate(); err != nil {
+			return "", err
+		}
+	}
+	interp := InterpreterServer
+	if exec := c.Execution(); exec != nil && exec.EffectiveInterpreter() != "" {
+		interp = exec.EffectiveInterpreter()
+	} else if sudo {
+		interp = InterpreterBash
+	}
+	switch interp {
+	case InterpreterServer, InterpreterBash, InterpreterSh:
+	default:
+		return "", fmt.Errorf("%w: unsupported interpreter %q for RunCommandWithIO (only server, bash and sh are supported)", ErrExecutionValidation, interp)
+	}
+	if interp == InterpreterServer && command == "" {
+		return "", fmt.Errorf("%w: command must not be empty for server interpreter", ErrExecutionValidation)
+	}
+	if sudo && interp == InterpreterServer {
+		return "", fmt.Errorf("%w: server interpreter does not support sudo escalation in RunCommandWithIO", ErrExecutionValidation)
+	}
+	return interp, nil
+}
+
+func (c *Client) resolveExecutionLogin(interp Interpreter) bool {
+	if interp != InterpreterBash {
+		return false
+	}
+	if exec := c.Execution(); exec != nil {
+		return exec.LoginMode() == LoginEnabled
+	}
+	return false
+}
+
+func (c *Client) resolveCommandIOPayload(interp Interpreter, command string) string {
+	if interp == InterpreterServer {
+		return command
+	}
+	login := c.resolveExecutionLogin(interp)
+	return legacyPayloadWithLogin(command, interp, login)
+}
+
 // RunCommandWithIO executes a command (or interactive bash when command is empty) using caller-provided I/O streams.
 // If sudo is true, it escalates privileges according to the target node's SudoMode.
 // stdin is borrowed from the caller and will never be closed by this method. To
@@ -328,14 +375,9 @@ func (c *Client) RunCommandWithIO(ctx context.Context, command string, sudo bool
 		return err
 	}
 
-	interp := InterpreterBash
-	if exec := c.Execution(); exec != nil && exec.EffectiveInterpreter() != "" {
-		interp = exec.EffectiveInterpreter()
-	}
-	switch interp {
-	case InterpreterBash, InterpreterSh:
-	default:
-		return fmt.Errorf("%w: unsupported interpreter %q for RunCommandWithIO (only bash and sh are supported)", ErrExecutionValidation, interp)
+	interp, err := c.resolveCommandIOInterpreter(sudo, command)
+	if err != nil {
+		return err
 	}
 
 	// Native files, terminals and pipes are bound to ctx so cancellation cannot
@@ -348,7 +390,7 @@ func (c *Client) RunCommandWithIO(ctx context.Context, command string, sudo bool
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, closeOutput()) }()
-	payload := legacyPayload(command, interp)
+	payload := c.resolveCommandIOPayload(interp, command)
 	if !sudo {
 		return c.runRawCommandWithPayload(work, payload, "", stdin, stdout, stderr, cancel)
 	}
@@ -357,14 +399,21 @@ func (c *Client) RunCommandWithIO(ctx context.Context, command string, sudo bool
 		return err
 	}
 	clientConfig, _ := c.configSnapshot()
+	return c.dispatchSudoCommand(work, clientConfig, command, payload, interp, stdin, stdout, stderr, cancel)
+}
 
+func (c *Client) dispatchSudoCommand(ctx context.Context, clientConfig ClientConfig, command, payload string, interp Interpreter, stdin io.Reader, stdout, stderr io.Writer, cancel context.CancelFunc) error {
 	switch clientConfig.SudoMode {
 	case SudoModeRoot:
-		return c.runRawCommandWithPayload(work, payload, "", stdin, stdout, stderr, cancel)
+		return c.runRawCommandWithPayload(ctx, payload, "", stdin, stdout, stderr, cancel)
 	case SudoModeSudoer:
-		return c.runRawCommandWithPayload(work, "sudo -S -p '' "+payload, "", stdin, stdout, stderr, cancel)
+		return c.runRawCommandWithPayload(ctx, "sudo -S -p '' "+payload, "", stdin, stdout, stderr, cancel)
 	case SudoModeSudo, SudoModeSu:
+		login := c.resolveExecutionLogin(interp)
 		inner := "exec bash"
+		if login {
+			inner = "exec bash -l"
+		}
 		if interp == InterpreterSh {
 			inner = "exec sh"
 		}
@@ -372,10 +421,10 @@ func (c *Client) RunCommandWithIO(ctx context.Context, command string, sudo bool
 			if interp == InterpreterSh {
 				inner = shCommandPayload(command)
 			} else {
-				inner = bashCommandPayload(command, false)
+				inner = bashCommandPayload(command, login)
 			}
 		}
-		return c.runPrivilegeOperation(work, clientConfig.SudoMode, inner, stdin, stdout, stderr, interp)
+		return c.runPrivilegeOperation(ctx, clientConfig.SudoMode, inner, stdin, stdout, stderr, interp)
 	case SudoModeNone:
 		return fmt.Errorf("privilege escalation is not supported for this host (sudo_mode=none)")
 	default:
@@ -384,6 +433,10 @@ func (c *Client) RunCommandWithIO(ctx context.Context, command string, sudo bool
 }
 
 func legacyPayload(command string, interp Interpreter) string {
+	return legacyPayloadWithLogin(command, interp, false)
+}
+
+func legacyPayloadWithLogin(command string, interp Interpreter, login bool) string {
 	if interp == InterpreterSh {
 		if command == "" {
 			return "sh"
@@ -391,9 +444,12 @@ func legacyPayload(command string, interp Interpreter) string {
 		return shCommandPayload(command)
 	}
 	if command == "" {
+		if login {
+			return "bash -l"
+		}
 		return "bash"
 	}
-	return bashCommandPayload(command, false)
+	return bashCommandPayload(command, login)
 }
 
 // legacyBashPayload keeps the historical empty-command behavior: Bash reads

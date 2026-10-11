@@ -46,34 +46,28 @@ func (e *ExecutionConfig) LoginMode() LoginMode {
 }
 
 // EffectiveInterpreter returns the configured interpreter, or the default
-// InterpreterBash if unspecified.
+// InterpreterServer if unspecified.
 func (e *ExecutionConfig) EffectiveInterpreter() Interpreter {
 	if e == nil || e.Interpreter == "" {
-		return InterpreterBash
+		return InterpreterServer
 	}
 	return e.Interpreter
 }
 
-// CommandOptions applies P1/P2 caller defaults, then converts execution config.
-// Absence retains legacy POSIX Bash+login until P3. An explicit interpreter
-// uses its adapter defaults; server never inherits a POSIX launch assumption.
+// CommandOptions applies caller defaults, then converts execution config.
+// In Phase P3, absence or unspecified interpreter defaults to InterpreterServer with
+// LaunchUnknown and LoginInherit. An explicit interpreter uses its adapter defaults;
+// server never inherits a POSIX launch assumption.
 func (e *ExecutionConfig) CommandOptions() CommandOptions {
 	if e == nil {
-		return CommandOptions{Interpreter: InterpreterBash, LaunchDialect: LaunchPOSIX, Login: LoginEnabled}
+		return CommandOptions{Interpreter: InterpreterServer, LaunchDialect: LaunchUnknown, Login: LoginInherit}
 	}
 	opts := CommandOptions{
 		Interpreter:   e.EffectiveInterpreter(),
 		LaunchDialect: e.LaunchDialect,
 		Login:         e.LoginMode(),
 	}
-	if e.Interpreter == "" {
-		if e.LaunchDialect == "" {
-			opts.LaunchDialect = LaunchPOSIX
-		}
-		if e.Login == nil {
-			opts.Login = LoginEnabled
-		}
-	} else if e.Interpreter == InterpreterServer && e.LaunchDialect == "" {
+	if opts.Interpreter == InterpreterServer && opts.LaunchDialect == "" {
 		opts.LaunchDialect = LaunchUnknown
 	}
 	return opts
@@ -81,7 +75,11 @@ func (e *ExecutionConfig) CommandOptions() CommandOptions {
 
 // SudoRunOptions rejects unsupported escalation semantics before dispatch and
 // maps the validated Bash or sh mode to the sudo adapter explicitly.
+// A nil config preserves the legacy POSIX Bash+login environment.
 func (e *ExecutionConfig) SudoRunOptions(command string) ([]RunOption, error) {
+	if e == nil {
+		return []RunOption{WithLoginShell(true), WithInterpreter(InterpreterBash)}, nil
+	}
 	if err := e.Validate(); err != nil {
 		return nil, err
 	}
@@ -345,8 +343,8 @@ func ResolveExecution(child, parent *ExecutionConfig) (*ExecutionConfig, error) 
 	// interpreter & login:
 	if child.Interpreter != "" {
 		res.Interpreter = child.Interpreter
-		if child.EffectiveInterpreter() != parent.EffectiveInterpreter() {
-			// Changed interpreter (accounting for implicit default Bash): do not inherit parent's login!
+		if child.Interpreter == InterpreterServer || (parent.Interpreter != "" && child.EffectiveInterpreter() != parent.EffectiveInterpreter()) {
+			// Changed interpreter or server interpreter: do not inherit parent's login!
 			if child.Login != nil {
 				val := *child.Login
 				res.Login = &val
@@ -390,6 +388,9 @@ func EffectiveExecution(layers ...*ExecutionConfig) (*ExecutionConfig, error) {
 		if err != nil {
 			return nil, err
 		}
+	}
+	if effective != nil && effective.EffectiveInterpreter() == InterpreterServer && effective.Login != nil {
+		return nil, fmt.Errorf("%w: server interpreter requires inherited login mode", ErrExecutionValidation)
 	}
 	return effective, nil
 }

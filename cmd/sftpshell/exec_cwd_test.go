@@ -266,7 +266,7 @@ func TestHandleExec_InteractiveMode_RequiresFileStdin(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			s := &Shell{
 				batch:     false,
-				cwd:       "/remote/dir",
+				cwd:       "",
 				sshClient: client,
 				stdin:     strings.NewReader("echo test"),
 				stdout:    &stdout,
@@ -292,15 +292,23 @@ func TestHandleExec_BatchExecution_InterpretersEndToEnd(t *testing.T) {
 		execution     *ssh.ExecutionConfig
 		cwd           string
 		args          []string
+		wantErr       string
 		verifyPayload func(t *testing.T, payload string)
 	}{
 		{
-			name:      "unconfigured execution defaults to batch non-login bash",
+			name:      "unconfigured execution rejects non-empty cwd under server default",
 			execution: nil,
 			cwd:       "/var/log",
 			args:      []string{"ls", "-la"},
+			wantErr:   "server interpreter does not support inheriting working directory",
+		},
+		{
+			name:      "unconfigured execution with empty cwd runs server command directly",
+			execution: nil,
+			cwd:       "",
+			args:      []string{"uptime"},
 			verifyPayload: func(t *testing.T, payload string) {
-				expected := "bash -c 'cd -- '\\''/var/log'\\'' && ls -la'"
+				expected := "uptime"
 				if payload != expected {
 					t.Errorf("expected payload %q, got %q", expected, payload)
 				}
@@ -468,6 +476,12 @@ func TestHandleExec_BatchExecution_InterpretersEndToEnd(t *testing.T) {
 			}
 
 			err := s.handleExec(context.Background(), tc.args)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("handleExec failed: %v", err)
 			}

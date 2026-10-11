@@ -160,7 +160,7 @@ func TestRunCommandWithIO_ConsecutiveCommands(t *testing.T) {
 		t.Fatalf("second command failed: %v", err)
 	}
 	rec := <-recordedCh
-	if rec.cmd != "bash -c 'echo 2'" {
+	if rec.cmd != "echo 2" {
 		t.Errorf("unexpected command: %s", rec.cmd)
 	}
 }

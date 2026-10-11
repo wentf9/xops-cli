@@ -60,12 +60,16 @@ func (o execExecutionOptions) commandOptions(noLogin bool) (ssh.CommandOptions, 
 		return ssh.CommandOptions{}, fmt.Errorf("explicit interpreter and launch dialect must not be empty")
 	}
 	options := ssh.CommandOptions{Interpreter: ssh.Interpreter(o.interpreter), LaunchDialect: ssh.LaunchDialect(o.dialect)}
-	// P1 retains the entry point's Bash+login default. A dialect/login override
-	// alone must not opt the caller into server mode before the default switch.
 	if !o.interpreterSet {
-		options.Interpreter, options.Login = ssh.InterpreterBash, ssh.LoginEnabled
+		options.Interpreter, options.LaunchDialect, options.Login = ssh.InterpreterServer, ssh.LaunchUnknown, ssh.LoginInherit
+		if o.dialectSet {
+			options.LaunchDialect = ssh.LaunchDialect(o.dialect)
+		}
 	}
 	if o.loginSet {
+		if options.Interpreter == ssh.InterpreterServer {
+			return ssh.CommandOptions{}, fmt.Errorf("server interpreter requires inherited login mode")
+		}
 		options.Login = ssh.LoginDisabled
 		if o.login {
 			options.Login = ssh.LoginEnabled
@@ -75,14 +79,14 @@ func (o execExecutionOptions) commandOptions(noLogin bool) (ssh.CommandOptions, 
 		if o.loginSet {
 			return ssh.CommandOptions{}, fmt.Errorf("--no-login and --login-shell are mutually exclusive")
 		}
-		if options.Interpreter != "" && options.Interpreter != ssh.InterpreterBash {
+		if o.interpreterSet && options.Interpreter != ssh.InterpreterBash {
 			return ssh.CommandOptions{}, fmt.Errorf("--no-login requires the bash interpreter")
 		}
 		options.Interpreter, options.Login = ssh.InterpreterBash, ssh.LoginEnabled
 		if noLogin {
 			options.Login = ssh.LoginDisabled
 		}
-		if options.LaunchDialect == "" {
+		if !o.dialectSet {
 			options.LaunchDialect = ssh.LaunchPOSIX
 		}
 	}
