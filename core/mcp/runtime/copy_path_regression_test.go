@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"path"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -250,6 +252,9 @@ func TestFSCopyDirectoryQualifiedSymlinkSources(t *testing.T) {
 func TestFSCopyPreservesLiteralPathCharacters(t *testing.T) {
 	for _, name := range []string{". ", ".\t", ".\\", "\\.", "report ", "report\\"} {
 		t.Run(name, func(t *testing.T) {
+			if runtime.GOOS == "windows" && strings.Contains(name, `\`) {
+				t.Skip("in-memory SFTP handler cannot preserve backslashes in filenames on Windows")
+			}
 			f := newCopyPathFixture(t)
 			if err := f.files.Do(f.ctx, func(c *pkgsftp.Client) error {
 				if err := c.MkdirAll("/data"); err != nil {

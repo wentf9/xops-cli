@@ -3,6 +3,7 @@ package sftp
 import (
 	"errors"
 	"os"
+	"runtime"
 	"testing"
 
 	pkgsftp "github.com/pkg/sftp"
@@ -234,7 +235,9 @@ func TestClient_RemoveAll_PreservesWhitespaceAndBackslash(t *testing.T) {
 
 	createFile("/data/report", "report")
 	createFile("/data/report  ", "report-spaces")
-	createFile("/data/report\\", "report-backslash")
+	if runtime.GOOS != "windows" {
+		createFile("/data/report\\", "report-backslash")
+	}
 
 	// 1. Remove "/data/report  " (trailing whitespace). Must not remove "/data/report".
 	if err := client.RemoveAll(t.Context(), "/data/report  "); err != nil {
@@ -248,14 +251,16 @@ func TestClient_RemoveAll_PreservesWhitespaceAndBackslash(t *testing.T) {
 	}
 
 	// 2. Remove "/data/report\\" (trailing backslash). Must not remove "/data/report".
-	if err := client.RemoveAll(t.Context(), "/data/report\\"); err != nil {
-		t.Fatalf("RemoveAll /data/report\\ failed: %v", err)
-	}
-	if _, err := client.state.sftpClient.Lstat("/data/report\\"); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("expected /data/report\\ to be removed, got: %v", err)
-	}
-	if _, err := client.state.sftpClient.Lstat("/data/report"); err != nil {
-		t.Fatalf("expected /data/report to remain intact, got: %v", err)
+	if runtime.GOOS != "windows" {
+		if err := client.RemoveAll(t.Context(), "/data/report\\"); err != nil {
+			t.Fatalf("RemoveAll /data/report\\ failed: %v", err)
+		}
+		if _, err := client.state.sftpClient.Lstat("/data/report\\"); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("expected /data/report\\ to be removed, got: %v", err)
+		}
+		if _, err := client.state.sftpClient.Lstat("/data/report"); err != nil {
+			t.Fatalf("expected /data/report to remain intact, got: %v", err)
+		}
 	}
 }
 
