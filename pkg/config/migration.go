@@ -13,10 +13,9 @@ import (
 
 // MigrationOptions selects an explicitly configured writable destination.
 type MigrationOptions struct {
-	ToStore   string
-	DryRun    bool
-	Restart   bool
-	automatic bool
+	ToStore string
+	DryRun  bool
+	Restart bool
 }
 
 // MigrationReport contains metadata only. It never returns decoded secrets.
@@ -76,10 +75,10 @@ func (m *CredentialMigrator) report(state *migrationState, dryRun bool) Migratio
 // Migrate preserves all old materials until an explicit Finalize call. A failed
 // or interrupted run can reuse the recorded immutable refs on the next run.
 func (m *CredentialMigrator) Migrate(ctx context.Context, opts MigrationOptions) (report MigrationReport, retErr error) {
-	if ctx == nil || (opts.ToStore == "" && !opts.automatic) {
+	if ctx == nil || opts.ToStore == "" {
 		return report, fmt.Errorf("migration requires context and destination store")
 	}
-	if opts.Restart && (opts.DryRun || opts.automatic) {
+	if opts.Restart && opts.DryRun {
 		return report, fmt.Errorf("restart requires an explicit non-dry-run v2 migration")
 	}
 	if opts.DryRun {
@@ -110,7 +109,7 @@ func (m *CredentialMigrator) migrateLocked(ctx context.Context, opts MigrationOp
 	if err != nil {
 		return report, err
 	}
-	if version == 2 && !opts.automatic {
+	if version == 2 {
 		return m.migrateV2Source(ctx, opts, state, rawV2)
 	}
 	return m.resumeLegacyMigration(ctx, opts, state)
@@ -136,10 +135,6 @@ func (m *CredentialMigrator) resumeLegacyMigration(ctx context.Context, opts Mig
 	}
 	defer clear(raw)
 	defer clear(key)
-	opts, err = automaticMigrationOptions(raw, opts)
-	if err != nil || opts.ToStore == "" {
-		return report, err
-	}
 
 	if state != nil && state.Store != opts.ToStore {
 		return report, fmt.Errorf("migration already targets store %q", state.Store)
@@ -346,43 +341,4 @@ func (m *CredentialMigrator) WithRegistryFactory(factory func(*CredentialConfig)
 		m.registry = factory
 	}
 	return m
-}
-
-// AutoMigrate upgrades eligible legacy configurations to their selected store.
-// A zero report means the configuration was absent, already v2, or opted out.
-// Call only from normal usage paths; never from inspection or dry-run commands.
-func (m *CredentialMigrator) AutoMigrate(ctx context.Context) (MigrationReport, error) {
-	raw, err := readMigrationFile(m.path)
-	if errors.Is(err, os.ErrNotExist) {
-		return MigrationReport{}, nil
-	}
-	if err != nil {
-		return MigrationReport{}, err
-	}
-	defer clear(raw)
-	opts, err := automaticMigrationOptions(raw, MigrationOptions{automatic: true})
-	if err != nil || opts.ToStore == "" {
-		return MigrationReport{}, err
-	}
-	return m.Migrate(ctx, opts)
-}
-
-func automaticMigrationOptions(raw []byte, opts MigrationOptions) (MigrationOptions, error) {
-	if !opts.automatic {
-		return opts, nil
-	}
-	opts.ToStore = ""
-	version, err := DetectSchemaVersion(raw)
-	if err != nil || version != 1 {
-		return opts, err
-	}
-	cfg, err := decodeMigrationLegacy(raw)
-	if err != nil {
-		return opts, err
-	}
-	defer clearMigrationConfiguration(cfg)
-	if cfg.Credential.RememberPrompted != "never" && cfg.CanRememberCredentials() {
-		opts.ToStore = cfg.Credential.DefaultStore
-	}
-	return opts, nil
 }

@@ -20,7 +20,7 @@ type versionDetector struct {
 
 // DetectSchemaVersion 探测 YAML 字节流的配置模式版本。
 // 如果没有显式指定 schema_version，按 Schema v1 处理（返回 1）。
-// 目前支持版本 1 与版本 2；其余版本返回 ErrUnsupportedSchemaVersion。
+// 检测器为显式迁移保留 v1 识别；普通加载另由 ValidateRuntimeSchema 限制为 v2。
 func DetectSchemaVersion(data []byte) (int, error) {
 	if len(data) == 0 {
 		return 1, nil
@@ -42,4 +42,20 @@ func DetectSchemaVersion(data []byte) (int, error) {
 	default:
 		return version, fmt.Errorf("%w: version %d", ErrUnsupportedSchemaVersion, version)
 	}
+}
+
+// ErrLegacyConfiguration marks configurations retired after the v0.12.0 and
+// v0.13.0 compatibility releases. Only explicit migration may read their secrets.
+var ErrLegacyConfiguration = errors.New("schema v1 compatibility ended after v0.13.0; run xops credential migrate --dry-run --to <store>, then xops credential migrate --to <store>")
+
+// ValidateRuntimeSchema enforces the ordinary runtime policy independently of
+// format detection, which must continue to recognize v1 for explicit migration.
+func ValidateRuntimeSchema(version int) error {
+	if version == 2 {
+		return nil
+	}
+	if version == 1 {
+		return fmt.Errorf("%w: %w", ErrUnsupportedSchemaVersion, ErrLegacyConfiguration)
+	}
+	return fmt.Errorf("%w: version %d", ErrUnsupportedSchemaVersion, version)
 }

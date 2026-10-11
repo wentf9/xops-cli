@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"errors"
+	"gopkg.in/yaml.v3"
 	"os"
 	"strings"
 	"testing"
@@ -20,7 +21,7 @@ func TestCredentialMigrationCLI(t *testing.T) {
 	id, _ := cfg.Identities.Get("admin")
 	id.Password = "migration-cli-secret"
 	cfg.Identities.Set("admin", id)
-	if err := store.Save(cfg); err != nil {
+	if err := writeLegacyCLIConfiguration(cfg); err != nil {
 		t.Fatal(err)
 	}
 	path, key, err := utils.GetConfigFilePath()
@@ -105,7 +106,7 @@ func TestCredentialBackendMigrationCLI(t *testing.T) {
 	id.Password = "backend-cli-secret"
 	cfg.Identities.Set("admin", id)
 	cfg.Credential.Stores["other"] = config.StoreConfig{Type: config.StoreTypeHelper, Command: os.Args[0]}
-	if err := store.Save(cfg); err != nil {
+	if err := writeLegacyCLIConfiguration(cfg); err != nil {
 		t.Fatal(err)
 	}
 	if err := executePhase6(t, NewCmdCredential(), "migrate", "--to", "test"); err != nil {
@@ -137,4 +138,19 @@ func TestCredentialBackendMigrationCLI(t *testing.T) {
 	if err := command.ExecuteContext(t.Context()); err == nil {
 		t.Fatal("restart plus dry-run accepted")
 	}
+}
+
+// Test-only v1 source: ordinary Store.Save must never write this format again.
+func writeLegacyCLIConfiguration(cfg *config.Configuration) error {
+	cfg = cfg.Snapshot()
+	cfg.SchemaVersion = 1
+	raw, err := yaml.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	path, _, err := utils.GetConfigFilePath()
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, raw, 0600)
 }

@@ -19,7 +19,7 @@ func createTestConfigStore(t *testing.T) (string, string) {
 	keyPath := filepath.Join(tmpDir, ".key")
 
 	store := config.NewDefaultStore(cfgPath, keyPath)
-	cfg := &config.Configuration{
+	cfg := &config.Configuration{SchemaVersion: 2,
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
 		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
 		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
@@ -67,7 +67,7 @@ func TestExec_EmptyTasks_ReturnsErrorAndNoPanic(t *testing.T) {
 }
 
 func TestExec_BuildTasksFromHosts_PartialErrorsCollected(t *testing.T) {
-	cfg := &config.Configuration{
+	cfg := &config.Configuration{SchemaVersion: 2,
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
 		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
 		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),

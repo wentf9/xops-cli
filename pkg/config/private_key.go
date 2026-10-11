@@ -38,7 +38,7 @@ func PrivateKeyFingerprint(path string, passphrase []byte) (string, error) {
 }
 
 // BindPrivateKeyFingerprint prepares v2 passphrase metadata before the caller
-// enters a credential transaction. Legacy compatibility is unchanged.
+// enters a credential transaction. Migration resolves legacy metadata separately.
 func BindPrivateKeyFingerprint(cfg *Configuration, target credential.Target, passphrase []byte) (credential.Target, error) {
 	if cfg == nil || cfg.SchemaVersion != 2 || target.Kind != credential.KindPassphrase || len(passphrase) == 0 {
 		return target, nil

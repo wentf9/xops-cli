@@ -146,7 +146,7 @@ func assertRepeatedImportSaved(t *testing.T, store config.Store, wantAliases []s
 		t.Fatalf("aliases = %v, want %v", node.Alias, wantAliases)
 	}
 	identity, ok := cfg.Identities.Get(node.IdentityRef)
-	if !ok || identity.Password != "secret-7" {
+	if !ok || persistedTestPassword(t, cfg, identity) != "secret-7" {
 		t.Fatal("last CSV row did not determine the saved credential")
 	}
 }

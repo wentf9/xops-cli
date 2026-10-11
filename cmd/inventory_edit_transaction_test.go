@@ -145,7 +145,7 @@ func TestInventoryUnencryptedKeySwitchUnlinksLockedPassphraseAndRecoversCleanup(
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := phase6Config(t, config.StoreConfig{Type: config.StoreTypeHelper, Command: os.Args[0]})
-			if err := executePhase6WithInput(t, NewCmdIdentity(), "old-passphrase\n", "edit", "admin", "--key", "old-key", "--passphrase-stdin"); err != nil {
+			if err := executePhase6WithInput(t, NewCmdIdentity(), "key-password\n", "edit", "admin", "--key", inventoryTestPrivateKey(t, true), "--passphrase-stdin"); err != nil {
 				t.Fatal(err)
 			}
 			cfg, err := store.Load()
@@ -226,7 +226,7 @@ func TestInventoryUnencryptedKeyWithoutStoredPassphraseNeedsNoWritableStore(t *t
 
 func TestHostUnencryptedKeyKeepsSharedPassphrase(t *testing.T) {
 	store := phase6Config(t, config.StoreConfig{Type: config.StoreTypeHelper, Command: os.Args[0]})
-	if err := executePhase6WithInput(t, NewCmdIdentity(), "shared-passphrase\n", "edit", "admin", "--key", "old-key", "--passphrase-stdin"); err != nil {
+	if err := executePhase6WithInput(t, NewCmdIdentity(), "key-password\n", "edit", "admin", "--key", inventoryTestPrivateKey(t, true), "--passphrase-stdin"); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := store.Load()
@@ -262,7 +262,7 @@ func TestHostUnencryptedKeyKeepsSharedPassphrase(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer clear(secret.Value)
-	if string(secret.Value) != "shared-passphrase" {
+	if string(secret.Value) != "key-password" {
 		t.Fatal("shared credential was erased")
 	}
 }

@@ -409,7 +409,7 @@ func TestEncryptedRuntimeReadOnlyDoesNotInitialize(t *testing.T) {
 	}
 }
 
-func TestEncryptedRuntimeAutomaticLegacyUpgrade(t *testing.T) {
+func TestEncryptedRuntimeExplicitLegacyUpgrade(t *testing.T) {
 	m, _, raw := migrationFixture(t)
 	// Remove only the backend selection; retain encrypted legacy values and key.
 	var data map[string]any
@@ -431,9 +431,9 @@ func TestEncryptedRuntimeAutomaticLegacyUpgrade(t *testing.T) {
 		}
 	})
 	m.WithRegistryFactory(owner.Registry)
-	report, err := m.AutoMigrate(t.Context())
+	report, err := m.Migrate(t.Context(), MigrationOptions{ToStore: "file"})
 	if err != nil || !report.Verified || report.Store != "file" {
-		t.Fatalf("automatic offline upgrade: %+v, %v", report, err)
+		t.Fatalf("explicit offline upgrade: %+v, %v", report, err)
 	}
 	cfg, err := NewDefaultStore(m.path, m.keyPath).Load()
 	if err != nil {

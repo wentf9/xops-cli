@@ -22,7 +22,7 @@ The default inherits `credential.remember_prompted`; new installations use `alwa
 xops tui --remember never
 ```
 
-This also disables automatic migration for that invocation without changing global configuration. Explicit credential-form submissions and explicit migration are separate management actions. Existing passwords are never filled back into forms.
+This does not change global configuration. V1 compatibility has ended, so TUI startup no longer migrates legacy files automatically; migrate explicitly to v2 first. Explicit credential-form submissions and explicit migration are separate management actions. Existing passwords are never filled back into forms.
 
 A save failure retains the connection, and a persistence warning remains visible after the UI resumes. If automatic persistence cannot initialize at startup, connections remain available with an explicit warning that new credentials cannot be saved. Fix configuration or credential-directory permissions and restart the TUI. Passing read-only doctor checks does not establish write permissions.
 

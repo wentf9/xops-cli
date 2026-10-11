@@ -121,7 +121,7 @@ func TestExecCommandWithFlagsNotParsedAsXopsFlags(t *testing.T) {
 
 func TestExecNonExistingNodeNotPersisted(t *testing.T) {
 	// 创建临时的内存 Provider
-	cfg := &config.Configuration{
+	cfg := &config.Configuration{SchemaVersion: 2,
 		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
 		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),

@@ -25,7 +25,7 @@ xops ssh --remember never web-01
 xops tui --remember ask
 ```
 
-`never` also disables automatic legacy upgrades. It does not block explicit credential-form submissions or migration commands. Explicit storage and saving policies in existing configurations are preserved.
+`never` does not block explicit credential-form submissions or migration commands. Schema v1 compatibility has ended; normal startup no longer upgrades legacy files automatically. Follow the [migration guide](./migration) to convert them to v2 first. Explicit storage and saving policies in existing v2 configurations are preserved.
 
 ## Choose a store
 

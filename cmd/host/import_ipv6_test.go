@@ -17,7 +17,7 @@ func seedIPv6ImportNode(t *testing.T, repo *config.Repository, nodeID string) {
 	_, err := repo.CreateNodeContext(t.Context(), nodeID,
 		models.Node{HostRef: "2001:db8::1:22", IdentityRef: "root@2001:db8::1", Alias: []string{"existing-v6"}},
 		models.Host{Address: "2001:db8::1", Port: 22},
-		models.Identity{User: "root", AuthType: "password", Password: "old-secret"})
+		models.Identity{User: "root", AuthType: "password"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +66,7 @@ func assertIPv6ImportUpdated(t *testing.T, cfg *config.Configuration, nodeID str
 		t.Fatalf("existing node ID or aliases were not preserved: %+v", node)
 	}
 	identity, ok := cfg.Identities.Get(node.IdentityRef)
-	if !ok || identity.Password != "last-secret" {
+	if !ok || persistedTestPassword(t, cfg, identity) != "last-secret" {
 		t.Fatal("existing IPv6 credentials were not updated in CSV order")
 	}
 }

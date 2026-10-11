@@ -1,9 +1,7 @@
 package config
 
 import (
-	"bytes"
 	"context"
-	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -13,7 +11,6 @@ import (
 	"time"
 
 	"github.com/wentf9/xops-cli/core/concurrent"
-	"github.com/wentf9/xops-cli/pkg/crypto"
 	"github.com/wentf9/xops-cli/pkg/models"
 	"gopkg.in/yaml.v3"
 )
@@ -76,7 +73,6 @@ type DurabilityChecker interface {
 
 type defaultStore struct {
 	Path        string
-	KeyPath     string // 用于加解密配置文件中的敏感字段
 	gate        contextGate
 	writeFile   func(string, []byte, os.FileMode) error
 	atomicWrite func(string, []byte, os.FileMode) (PersistResult, error)
@@ -138,35 +134,6 @@ func (g *contextGate) acquire(ctx context.Context) error {
 
 func (g *contextGate) release() {
 	<-g.sema
-}
-
-// loadOrCreateKeyLocked loads the encryption key while the configuration lock
-// is held. A missing key is created only for a new or plaintext configuration;
-// generating a replacement for an encrypted file would make existing secrets
-// permanently unreadable.
-func (s *defaultStore) loadOrCreateKeyLocked(create bool) ([]byte, error) {
-	key, err := os.ReadFile(s.KeyPath)
-	if err == nil {
-		if len(key) != crypto.KeySize {
-			return nil, fmt.Errorf("invalid key file size in %q: expected %d, got %d", s.KeyPath, crypto.KeySize, len(key))
-		}
-		return key, nil
-	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("read configuration key %q failed: %w", s.KeyPath, err)
-	}
-	if !create {
-		return nil, fmt.Errorf("configuration key %q is missing for encrypted configuration: %w", s.KeyPath, err)
-	}
-
-	key = make([]byte, crypto.KeySize)
-	if _, err := cryptorand.Read(key); err != nil {
-		return nil, fmt.Errorf("generate configuration key failed: %w", err)
-	}
-	if _, err := atomicWriteFile(s.KeyPath, key, 0o600); err != nil {
-		return nil, fmt.Errorf("write configuration key %q failed: %w", s.KeyPath, err)
-	}
-	return key, nil
 }
 
 func (s *defaultStore) Load() (cfg *Configuration, retErr error) {
@@ -312,7 +279,7 @@ func (s *defaultStore) loadLocked() (*Configuration, error) {
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			// Only absent configurations receive new-install defaults. Existing
-			// v1 files retain their compatibility behavior until explicit migration.
+			// files must pass the Schema v2 check before becoming runtime state.
 			configuration.SchemaVersion = 2
 			configuration.Credential = DefaultCredentialConfig()
 			return &configuration, nil
@@ -323,99 +290,14 @@ func (s *defaultStore) loadLocked() (*Configuration, error) {
 	if err != nil {
 		return nil, err
 	}
-	if version == 2 {
-		dto, err := UnmarshalV2(data)
-		if err != nil {
-			return nil, err
-		}
-		return FromV2(dto)
+	if err := ValidateRuntimeSchema(version); err != nil {
+		return nil, err
 	}
-	// 2. yaml.Unmarshal
-	if err = yaml.Unmarshal(data, &configuration); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal configuration: %w", err)
-	}
-	// 3. 初始化 Crypter 并解密敏感字段
-	key, err := s.loadOrCreateKeyLocked(!bytes.Contains(data, []byte(crypto.Prefix)))
-	if err != nil {
-		return nil, fmt.Errorf("failed to load or generate decryption key: %w", err)
-	}
-	crypter, err := crypto.NewCrypter(key)
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize decrypter: %w", err)
-	}
-	migratedIdentities, err := decryptIdentities(crypter, &configuration)
+	dto, err := UnmarshalV2(data)
 	if err != nil {
 		return nil, err
 	}
-	migratedNodes, err := decryptNodes(crypter, &configuration)
-	if err != nil {
-		return nil, err
-	}
-	// 若配置文件中存在明文敏感字段，立即加密回写（一次性迁移）
-	if migratedIdentities || migratedNodes {
-		if _, err := s.saveLocked(&configuration); err != nil {
-			return nil, fmt.Errorf("migrate plaintext configuration secrets failed: %w", err)
-		}
-	}
-	return &configuration, nil
-}
-
-// decryptIdentities 解密所有 Identity 中的 Password 和 Passphrase 字段。
-// 返回 true 表示发现了明文值（需要触发迁移保存）。
-func decryptIdentities(crypter *crypto.Crypter, config *Configuration) (migrated bool, err error) {
-	for _, name := range config.Identities.Keys() {
-		identity, _ := config.Identities.Get(name)
-		changed := false
-		if identity.Password != "" {
-			if crypto.IsEncrypted(identity.Password) {
-				plain, decryptErr := crypter.Decrypt(identity.Password)
-				if decryptErr != nil {
-					return false, fmt.Errorf("decrypt identity %q password failed: %w", name, decryptErr)
-				}
-				identity.Password = plain
-				changed = true
-			} else {
-				migrated = true // 明文，需加密回写
-			}
-		}
-		if identity.Passphrase != "" {
-			if crypto.IsEncrypted(identity.Passphrase) {
-				plain, decryptErr := crypter.Decrypt(identity.Passphrase)
-				if decryptErr != nil {
-					return false, fmt.Errorf("decrypt identity %q passphrase failed: %w", name, decryptErr)
-				}
-				identity.Passphrase = plain
-				changed = true
-			} else {
-				migrated = true
-			}
-		}
-		if changed {
-			config.Identities.Set(name, identity)
-		}
-	}
-	return migrated, nil
-}
-
-// decryptNodes 解密所有 Node 中的 SuPwd 字段。
-// 返回 true 表示发现了明文值（需要触发迁移保存）。
-func decryptNodes(crypter *crypto.Crypter, config *Configuration) (migrated bool, err error) {
-	for _, name := range config.Nodes.Keys() {
-		node, _ := config.Nodes.Get(name)
-		if node.SuPwd != "" {
-			if crypto.IsEncrypted(node.SuPwd) {
-				plain, decryptErr := crypter.Decrypt(node.SuPwd)
-				if decryptErr != nil {
-					return false, fmt.Errorf("decrypt node %q sudo password failed: %w", name, decryptErr)
-				}
-				node.SuPwd = plain
-				config.Nodes.Set(name, node)
-			} else {
-				migrated = true // 明文，需加密回写
-			}
-		}
-	}
-	return migrated, nil
+	return FromV2(dto)
 }
 
 func (s *defaultStore) Save(cfg *Configuration) error {
@@ -446,45 +328,20 @@ func (s *defaultStore) saveLocked(cfg *Configuration) (PersistResult, error) {
 	if cfg == nil {
 		return PersistResult{}, fmt.Errorf("configuration is nil")
 	}
-	if cfg.SchemaVersion == 2 {
-		dto, err := cfg.ToV2()
-		if err != nil {
-			return PersistResult{}, err
-		}
-		data, err := yaml.Marshal(dto)
-		if err != nil {
-			return PersistResult{}, fmt.Errorf("encode schema v2: %w", err)
-		}
-		return s.writeConfigurationBytes(data)
+	version := cfg.SchemaVersion
+	if version == 0 {
+		version = 1
 	}
-	if cfg.SchemaVersion != 0 && cfg.SchemaVersion != 1 {
-		return PersistResult{}, ErrUnsupportedSchemaVersion
+	if err := ValidateRuntimeSchema(version); err != nil {
+		return PersistResult{}, err
 	}
-	// 初始化 Crypter
-	key, err := s.loadOrCreateKeyLocked(true)
-	if err != nil {
-		return PersistResult{}, fmt.Errorf("failed to load or generate encryption key: %w", err)
-	}
-	crypter, err := crypto.NewCrypter(key)
-	if err != nil {
-		return PersistResult{}, fmt.Errorf("failed to initialize encrypter: %w", err)
-	}
-
-	// Serialize an encrypted private copy. Store.Save must never mutate caller
-	// memory because snapshots can be read concurrently by the rest of the CLI.
-	serialized := cloneConfiguration(cfg)
-	_, _, err = encryptIdentities(crypter, serialized)
+	dto, err := cfg.ToV2()
 	if err != nil {
 		return PersistResult{}, err
 	}
-	_, err = encryptNodes(crypter, serialized)
+	data, err := yaml.Marshal(dto)
 	if err != nil {
-		return PersistResult{}, err
-	}
-
-	data, err := yaml.Marshal(serialized)
-	if err != nil {
-		return PersistResult{}, fmt.Errorf("failed to marshal configuration: %w", err)
+		return PersistResult{}, fmt.Errorf("encode schema v2: %w", err)
 	}
 	return s.writeConfigurationBytes(data)
 }
@@ -618,53 +475,9 @@ func createDirectoryChain(directory string, syncDirectory func(string) error) er
 	return nil
 }
 
-func encryptIdentities(crypter *crypto.Crypter, cfg *Configuration) (origPasswords, origPassphrases map[string]string, err error) {
-	origPasswords = make(map[string]string)
-	origPassphrases = make(map[string]string)
-	for _, name := range cfg.Identities.Keys() {
-		identity, _ := cfg.Identities.Get(name)
-		if identity.Password != "" && !crypto.IsEncrypted(identity.Password) {
-			origPasswords[name] = identity.Password
-			enc, encryptErr := crypter.Encrypt(identity.Password)
-			if encryptErr != nil {
-				return origPasswords, origPassphrases, fmt.Errorf("encrypt identity %q password failed: %w", name, encryptErr)
-			}
-			identity.Password = enc
-		}
-		if identity.Passphrase != "" && !crypto.IsEncrypted(identity.Passphrase) {
-			origPassphrases[name] = identity.Passphrase
-			enc, encryptErr := crypter.Encrypt(identity.Passphrase)
-			if encryptErr != nil {
-				return origPasswords, origPassphrases, fmt.Errorf("encrypt identity %q passphrase failed: %w", name, encryptErr)
-			}
-			identity.Passphrase = enc
-		}
-		cfg.Identities.Set(name, identity)
-	}
-	return origPasswords, origPassphrases, nil
-}
-
-func encryptNodes(crypter *crypto.Crypter, cfg *Configuration) (map[string]string, error) {
-	origSuPwds := make(map[string]string)
-	for _, name := range cfg.Nodes.Keys() {
-		node, _ := cfg.Nodes.Get(name)
-		if node.SuPwd != "" && !crypto.IsEncrypted(node.SuPwd) {
-			origSuPwds[name] = node.SuPwd
-			enc, encryptErr := crypter.Encrypt(node.SuPwd)
-			if encryptErr != nil {
-				return origSuPwds, fmt.Errorf("encrypt node %q sudo password failed: %w", name, encryptErr)
-			}
-			node.SuPwd = enc
-			cfg.Nodes.Set(name, node)
-		}
-	}
-	return origSuPwds, nil
-}
-
-// NewDefaultStore 创建一个默认的文件系统配置存储实例
-func NewDefaultStore(path string, keyPath string) Store {
-	return &defaultStore{
-		Path:    path,
-		KeyPath: keyPath,
-	}
+// NewDefaultStore creates a Schema v2-only configuration store.
+// keyPath is retained for source compatibility; legacy keys are used only by
+// NewCredentialMigrator and are never read or created by this store.
+func NewDefaultStore(path string, _ string) Store {
+	return &defaultStore{Path: path}
 }

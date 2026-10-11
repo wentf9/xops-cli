@@ -92,7 +92,7 @@ func TestPrivateKeySymlinkTargetValidation(t *testing.T) {
 
 func TestMigrationWithSymlinkedPrivateKey(t *testing.T) {
 	m, _, _ := migrationFixture(t)
-	cfg, err := NewDefaultStore(m.path, m.keyPath).Load()
+	cfg, err := loadMigrationTestConfiguration(m.path, m.keyPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestMigrationWithSymlinkedPrivateKey(t *testing.T) {
 	privateKeyTestLink(t, id.KeyPath, link)
 	id.KeyPath = link
 	cfg.Identities.Set("ops", id)
-	if err := NewDefaultStore(m.path, m.keyPath).Save(cfg); err != nil {
+	if err := writeMigrationTestConfiguration(m.path, m.keyPath, cfg); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.Migrate(t.Context(), MigrationOptions{ToStore: "vault", DryRun: true}); err != nil {
@@ -110,7 +110,7 @@ func TestMigrationWithSymlinkedPrivateKey(t *testing.T) {
 	if report, err := m.Migrate(t.Context(), MigrationOptions{ToStore: "vault"}); err != nil || !report.Verified {
 		t.Fatalf("linked-key migration failed: %v", err)
 	}
-	cfg, err = NewDefaultStore(m.path, m.keyPath).Load()
+	cfg, err = loadMigrationTestConfiguration(m.path, m.keyPath)
 	if err != nil {
 		t.Fatal(err)
 	}

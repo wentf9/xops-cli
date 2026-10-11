@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 )
 
@@ -25,13 +26,13 @@ func initCredentialPolicyTestI18n(t *testing.T) {
 	}
 }
 
-func TestLegacyWarningPolicy(t *testing.T) {
+func TestLegacyRejectionPolicy(t *testing.T) {
 	initCredentialPolicyTestI18n(t)
 	for _, tc := range []struct {
-		name string
-		data string
-		args []string
-		warn bool
+		name   string
+		data   string
+		args   []string
+		reject bool
 	}{
 		{"implicit v1", "identities: {}\n", []string{"host", "list"}, true},
 		{"explicit v1 MCP", "schema_version: 1\n", []string{"mcp", "serve"}, true},
@@ -50,24 +51,27 @@ func TestLegacyWarningPolicy(t *testing.T) {
 				}
 			}
 			root := newRootCmd()
-			// Test the read-only warning independently of operational auto-migration.
-			root.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error { return warnLegacyConfiguration(cmd) }
 			initRootFlags(root)
 			registerCommands(root)
 			leaf, _, err := root.Find(tc.args)
 			if err != nil {
 				t.Fatal(err)
 			}
-			leaf.RunE = func(*cobra.Command, []string) error { return nil }
+			called := false
+			leaf.RunE = func(*cobra.Command, []string) error { called = true; return nil }
 			var out, diagnostic bytes.Buffer
 			root.SetOut(&out)
 			root.SetErr(&diagnostic)
 			root.SetArgs(tc.args)
-			if err := root.Execute(); err != nil {
-				t.Fatal(err)
+			err = root.Execute()
+			if errors.Is(err, config.ErrLegacyConfiguration) != tc.reject || (!tc.reject && err != nil) {
+				t.Fatalf("unexpected schema policy error: %v", err)
 			}
-			if strings.Contains(diagnostic.String(), "Schema v1") != tc.warn {
-				t.Fatalf("unexpected warning: %q", diagnostic.String())
+			if called == tc.reject {
+				t.Fatalf("command dispatch did not enforce schema policy: called=%t", called)
+			}
+			if diagnostic.Len() != 0 {
+				t.Fatalf("schema policy polluted diagnostics: %q", diagnostic.String())
 			}
 			if out.Len() != 0 {
 				t.Fatalf("warning polluted command stdout: %q", out.String())

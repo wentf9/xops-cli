@@ -2,13 +2,13 @@
 
 可用迁移选项请查看已安装版本的 `xops credential migrate --help`。
 
-## 自动升级旧配置
+## 兼容期结束：显式迁移旧配置
 
-正常连接、TUI、MCP、Playbook 等 CLI 使用入口会自动把符合条件的 Schema v1 配置升级为引用式 Schema v2。没有后端配置时使用默认离线库；显式 `none`、`remember_prompted: never` 或单次 `--remember never` 禁止自动迁移，仍允许显式迁移。成功后保留旧配置和 `secret.key`；失败保留现有配置和恢复材料。只读命令不触发升级。
+v0.12.0 和 v0.13.0 是 Schema v1 的两个兼容版本，兼容期现已结束。普通 CLI、TUI、MCP、Playbook 及只读配置加载只接受 Schema v2；缺少 `schema_version` 的旧文件也按 v1 拒绝，并提示显式迁移。帮助和版本命令不依赖配置，`credential migrate` 与 `credential finalize-migration` 继续可用。
 
-启动阶段的自动迁移始终禁止凭据交互，包括 MCP、Playbook、批量命令和 TUI 初始化。需要解锁或不能保证非交互的后端会产生迁移警告，不弹出终端、pinentry 或系统密钥库对话框；保留现有配置和恢复材料。解锁后可重试，或显式执行迁移。
+普通启动不再自动迁移、解密或加密回写旧凭据，也不会读取或创建旧 `secret.key`。拒绝 v1 时原配置和旧密钥保持不变。不要仅把 `schema_version` 改成 2：v2 不接受明文或 `ENC:` 凭据字段，需要通过迁移器写入凭据库并生成引用。
 
-也可手动迁移旧配置，目标必须已配置且可写：
+先备份旧配置与已有 `secret.key`，然后显式迁移到已配置且可写的目标。未配置后端时，迁移器提供默认离线 `file` 配置；已有自定义配置时需确保目标库存在。旧加密凭据缺少原 key 时应恢复备份，迁移器不会生成替代旧 key：
 
 ```bash
 xops credential migrate --dry-run --to file

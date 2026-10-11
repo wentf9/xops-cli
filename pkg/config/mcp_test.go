@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,12 +37,8 @@ func TestReadOnlyConfigurationDoesNotMigratePlaintext(t *testing.T) {
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := ReadOnlyConfiguration(path, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.MCP == nil || cfg.MCP.StateDir != "/state/tasks" {
-		t.Fatal("read-only loader lost settings")
+	if _, err := ReadOnlyConfiguration(path, key); !errors.Is(err, ErrLegacyConfiguration) {
+		t.Fatalf("legacy read-only config accepted: %v", err)
 	}
 	after, err := os.ReadFile(path)
 	if err != nil || string(after) != string(data) {

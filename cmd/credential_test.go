@@ -72,7 +72,7 @@ func TestCredentialStoreList(t *testing.T) {
 	}
 	store := config.NewDefaultStore(cfgPath, keyPath)
 
-	cfg := &config.Configuration{
+	cfg := &config.Configuration{SchemaVersion: 2,
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
 		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
 		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
@@ -80,7 +80,7 @@ func TestCredentialStoreList(t *testing.T) {
 			DefaultStore: "vault-1",
 			Stores: map[string]config.StoreConfig{
 				"vault-1": {
-					Type:     "memory",
+					Type:     config.StoreTypeNone,
 					ReadOnly: false,
 				},
 				"file-backup": {
@@ -130,7 +130,7 @@ func TestCredentialDoctor(t *testing.T) {
 	}
 	store := config.NewDefaultStore(cfgPath, keyPath)
 
-	cfg := &config.Configuration{
+	cfg := &config.Configuration{SchemaVersion: 2,
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
 		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
 		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
@@ -162,7 +162,7 @@ func TestCredentialGC(t *testing.T) {
 	}
 	store := config.NewDefaultStore(cfgPath, keyPath)
 
-	cfg := &config.Configuration{
+	cfg := &config.Configuration{SchemaVersion: 2,
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
 		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
 		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),

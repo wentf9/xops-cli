@@ -441,7 +441,7 @@ func TestRepository_ConcurrentFileRepositoriesRetainBothChanges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load left repository snapshot: %v", err)
 	}
-	rightStore := NewDefaultStore(store.(*defaultStore).Path, store.(*defaultStore).KeyPath)
+	rightStore := NewDefaultStore(store.(*defaultStore).Path, "")
 	rightSnapshot, err := rightStore.Load()
 	if err != nil {
 		t.Fatalf("load right repository snapshot: %v", err)
@@ -495,7 +495,7 @@ func TestRepository_NodeRefRejectsCrossProcessSameNodeChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load left snapshot: %v", err)
 	}
-	rightStore := NewDefaultStore(store.(*defaultStore).Path, store.(*defaultStore).KeyPath)
+	rightStore := NewDefaultStore(store.(*defaultStore).Path, "")
 	rightSnapshot, err := rightStore.Load()
 	if err != nil {
 		t.Fatalf("load right snapshot: %v", err)
@@ -539,7 +539,7 @@ func TestRepository_NodeRefMergesCrossProcessUnrelatedChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load left snapshot: %v", err)
 	}
-	rightStore := NewDefaultStore(store.(*defaultStore).Path, store.(*defaultStore).KeyPath)
+	rightStore := NewDefaultStore(store.(*defaultStore).Path, "")
 	rightSnapshot, err := rightStore.Load()
 	if err != nil {
 		t.Fatalf("load right snapshot: %v", err)

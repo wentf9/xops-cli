@@ -2,13 +2,13 @@
 
 Run `xops credential migrate --help` to see the migration options available in your installed version.
 
-## Automatic legacy upgrades
+## Compatibility ended: migrate legacy configuration explicitly
 
-Normal CLI entry points, including connections, TUI, MCP, and Playbook, automatically upgrade eligible Schema v1 configurations to reference-based Schema v2. Without an explicit backend, they use the default offline store. Explicit `none`, `remember_prompted: never`, or invocation-level `--remember never` disables automatic migration; explicit migration remains available. Success retains the old configuration and `secret.key`; failure retains current configuration and recovery material. Read-only commands do not trigger upgrades.
+v0.12.0 and v0.13.0 were the two Schema v1 compatibility releases; that period has ended. Ordinary CLI, TUI, MCP, Playbook, and read-only configuration loading now accept only Schema v2. Legacy files without `schema_version` are also rejected as v1, with explicit migration guidance. Help and version commands remain configuration-independent; `credential migrate` and `credential finalize-migration` remain available.
 
-Startup automatic migration always disables credential interaction, including MCP, Playbook, batch commands, and TUI initialization. Stores requiring unlock or lacking a non-interactive guarantee produce a migration warning without terminal, pinentry, or system keyring prompts; current configuration and recovery material remain. Unlock the store and retry, or explicitly invoke migration.
+Normal startup no longer automatically migrates, decrypts, or encrypts legacy credentials and never reads or creates the old `secret.key`. Rejection preserves the source configuration and key. Do not merely change `schema_version` to 2: v2 rejects plaintext and `ENC:` credential fields. The migrator must store secrets in a credential backend and create references.
 
-You can also migrate legacy configuration explicitly to a configured writable destination:
+Back up the old configuration and existing `secret.key`, then migrate explicitly to a configured writable destination. When backend configuration is absent, the migrator supplies the default offline `file` configuration; for an existing custom setup, ensure the destination is declared. Restore the original key from backup if encrypted legacy credentials have lost it; the migrator never generates a replacement legacy key:
 
 ```bash
 xops credential migrate --dry-run --to file

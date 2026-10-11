@@ -64,8 +64,8 @@ func newCmdCredentialFinalizeMigration() *cobra.Command {
 }
 
 func commandCredentialMigrator() (*config.CredentialMigrator, error) {
-	// Never call GetConfigStore here: its v1 compatibility loader publishes
-	// plaintext and may rewrite the source or create a key before backup.
+	// Read legacy input only through the explicit migrator; ordinary configuration
+	// loading rejects v1 and must never publish its plaintext into runtime state.
 	path, key, err := utils.GetConfigFilePath()
 	if err != nil {
 		return nil, err

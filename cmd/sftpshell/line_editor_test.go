@@ -220,7 +220,8 @@ func TestLineEditorTypeAheadAcrossBuffersAndRecreation(t *testing.T) {
 	var input strings.Builder
 	for i := range commands {
 		commands[i] = fmt.Sprintf("command-%02d-%s", i, strings.Repeat("x", 70))
-		input.WriteString(commands[i] + "\r")
+		input.WriteString(commands[i])
+		input.WriteString("\r")
 	}
 	written := make(chan error, 1)
 	go func() { _, err := writer.WriteString(input.String()); written <- errors.Join(err, writer.Close()) }()

@@ -26,7 +26,7 @@ func phase6Config(t *testing.T, storeCfg config.StoreConfig) config.Store {
 	t.Setenv("TEST_IDENTITY_HELPER", "1")
 	t.Setenv("TEST_HELPER_DATA_FILE", filepath.Join(dir, "helper-data"))
 	cfg := &config.Configuration{
-		SchemaVersion: 1,
+		SchemaVersion: 2,
 		Nodes:         concurrent.NewMap[string, models.Node](concurrent.HashString),
 		Hosts:         concurrent.NewMap[string, models.Host](concurrent.HashString),
 		Identities:    concurrent.NewMap[string, models.Identity](concurrent.HashString),
@@ -141,7 +141,7 @@ func TestIdentityCredentialFailurePreservesAuthentication(t *testing.T) {
 	}
 	old, _ := before.Identities.Get("admin")
 	t.Setenv("TEST_HELPER_ERROR_CODE", "locked")
-	err = executePhase6WithInput(t, NewCmdIdentity(), "new-secret\n", "edit", "admin", "--key", "replacement-key", "--passphrase-stdin")
+	err = executePhase6WithInput(t, NewCmdIdentity(), "key-password\n", "edit", "admin", "--key", inventoryTestPrivateKey(t, true), "--passphrase-stdin")
 	if !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
 		t.Fatalf("locked write = %v", err)
 	}
@@ -327,7 +327,7 @@ func TestBatchSCPRefusesHelperWithoutNonInteractiveContract(t *testing.T) {
 	}
 }
 
-func TestInventoryPassphraseReplacementClearsLegacySecrets(t *testing.T) {
+func TestInventoryPassphraseReplacementKeepsSecretsInReferences(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		newCmd func() *cobra.Command
@@ -338,24 +338,26 @@ func TestInventoryPassphraseReplacementClearsLegacySecrets(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := phase6Config(t, config.StoreConfig{Type: config.StoreTypeHelper, Command: os.Args[0]})
+			if err := executePhase6WithInput(t, NewCmdIdentity(), "previous-password\n", "edit", "admin", "--password-stdin"); err != nil {
+				t.Fatal(err)
+			}
+			keyPath := inventoryTestPrivateKey(t, true)
+			args := append([]string(nil), tc.args...)
+			for i, arg := range args {
+				if arg == "fixture-key" {
+					args[i] = keyPath
+				}
+			}
+			if err := executePhase6WithInput(t, tc.newCmd(), "key-password\n", args...); err != nil {
+				t.Fatal(err)
+			}
 			cfg, err := store.Load()
-			if err != nil {
-				t.Fatal(err)
-			}
-			cfg.Identities.Set("admin", models.Identity{User: "admin", AuthType: "password", Password: "legacy-login", Passphrase: "legacy-passphrase"})
-			if err := store.Save(cfg); err != nil {
-				t.Fatal(err)
-			}
-			if err := executePhase6WithInput(t, tc.newCmd(), "fixture-passphrase\n", tc.args...); err != nil {
-				t.Fatal(err)
-			}
-			cfg, err = store.Load()
 			if err != nil {
 				t.Fatal(err)
 			}
 			node, _ := cfg.Nodes.Get("node")
 			identity, _ := cfg.Identities.Get(node.IdentityRef)
-			if identity.Password != "" || identity.Passphrase != "" || identity.AuthType != "key" || identity.KeyPath != utils.ToAbsolutePath("fixture-key") || identity.PassphraseRef == nil {
+			if identity.Password != "" || identity.Passphrase != "" || identity.AuthType != "key" || identity.KeyPath != keyPath || identity.PassphraseRef == nil {
 				t.Fatal("passphrase transaction did not commit authentication metadata or clear legacy fields")
 			}
 			reg, err := utils.GetCredentialRegistry(cfg)
@@ -367,7 +369,7 @@ func TestInventoryPassphraseReplacementClearsLegacySecrets(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer clear(secret.Value)
-			if string(secret.Value) != "fixture-passphrase" {
+			if string(secret.Value) != "key-password" {
 				t.Fatal("passphrase mismatch")
 			}
 		})

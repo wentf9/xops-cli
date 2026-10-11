@@ -104,7 +104,7 @@ func pendingAdapterRepository(t *testing.T) (*config.Repository, config.Store, s
 	path := filepath.Join(dir, "config.yaml")
 	diskStore := config.NewDefaultStore(path, filepath.Join(dir, "config.key"))
 	cfg := config.NewProviderWithoutOpenSSH(nil).Snapshot()
-	cfg.Credential = &config.CredentialConfig{DefaultStore: "memory"}
+	cfg.Credential = &config.CredentialConfig{DefaultStore: "memory", Stores: map[string]config.StoreConfig{"memory": {Type: config.StoreTypeHelper, Command: "test-memory-store"}}}
 	if err := diskStore.Save(cfg); err != nil {
 		t.Fatal(err)
 	}

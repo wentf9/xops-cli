@@ -6,7 +6,6 @@ import (
 	"os"
 
 	corepolicy "github.com/wentf9/xops-cli/core/mcp/policy"
-	"github.com/wentf9/xops-cli/pkg/crypto"
 	"gopkg.in/yaml.v3"
 )
 
@@ -20,6 +19,16 @@ func ReadMCPSettings(path string) (*MCPConfig, *corepolicy.Config, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("read MCP configuration settings: %w", err)
 	}
+	version, err := DetectSchemaVersion(data)
+	if err != nil {
+		if errors.Is(err, ErrUnsupportedSchemaVersion) {
+			return nil, nil, err
+		}
+		return nil, nil, fmt.Errorf("%w: invalid MCP service configuration", ErrSchemaValidation)
+	}
+	if err := ValidateRuntimeSchema(version); err != nil {
+		return nil, nil, err
+	}
 	var settings struct {
 		MCP       *MCPConfig         `yaml:"mcp"`
 		Guardrail *corepolicy.Config `yaml:"guardrail"`
@@ -32,10 +41,9 @@ func ReadMCPSettings(path string) (*MCPConfig, *corepolicy.Config, error) {
 	return settings.MCP.Clone(), cloneGuardrail(settings.Guardrail), nil
 }
 
-// ReadOnlyConfiguration decodes one atomically published configuration file.
-// Legacy decryption uses an existing key only; it never creates keys, upgrades
-// schemas or writes encrypted replacements for plaintext credentials.
-func ReadOnlyConfiguration(path, keyPath string) (*Configuration, error) {
+// ReadOnlyConfiguration reads Schema v2 without acquiring writable locks.
+// The legacy key parameter is ignored; only the explicit migrator decrypts v1.
+func ReadOnlyConfiguration(path, _ string) (*Configuration, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read configuration without migration: %w", err)
@@ -44,49 +52,12 @@ func ReadOnlyConfiguration(path, keyPath string) (*Configuration, error) {
 	if err != nil {
 		return nil, err
 	}
-	if version == 2 {
-		dto, err := UnmarshalV2(data)
-		if err != nil {
-			return nil, err
-		}
-		return FromV2(dto)
+	if err := ValidateRuntimeSchema(version); err != nil {
+		return nil, err
 	}
-	cfg, err := decodeMigrationLegacy(data)
+	dto, err := UnmarshalV2(data)
 	if err != nil {
 		return nil, err
 	}
-	var crypter *crypto.Crypter
-	if hasEncryptedConfigurationSecrets(cfg) {
-		key, err := os.ReadFile(keyPath)
-		if err != nil {
-			return nil, fmt.Errorf("read existing configuration key: %w", err)
-		}
-		crypter, err = crypto.NewCrypter(key)
-		if err != nil {
-			return nil, fmt.Errorf("initialize read-only configuration decryption: %w", err)
-		}
-	}
-	if _, err := decryptIdentities(crypter, cfg); err != nil {
-		return nil, err
-	}
-	if _, err := decryptNodes(crypter, cfg); err != nil {
-		return nil, err
-	}
-	return cfg, nil
-}
-
-func hasEncryptedConfigurationSecrets(cfg *Configuration) bool {
-	for _, key := range cfg.Identities.Keys() {
-		identity, _ := cfg.Identities.Get(key)
-		if crypto.IsEncrypted(identity.Password) || crypto.IsEncrypted(identity.Passphrase) {
-			return true
-		}
-	}
-	for _, key := range cfg.Nodes.Keys() {
-		node, _ := cfg.Nodes.Get(key)
-		if crypto.IsEncrypted(node.SuPwd) {
-			return true
-		}
-	}
-	return false
+	return FromV2(dto)
 }

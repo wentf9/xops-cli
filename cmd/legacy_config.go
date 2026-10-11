@@ -8,13 +8,11 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
 	"github.com/wentf9/xops-cli/pkg/config"
-	"github.com/wentf9/xops-cli/pkg/i18n"
 )
 
-// warnLegacyConfiguration inspects only the schema, without loading secrets or
-// creating files. Migration remains independent of the ordinary load policy.
-// Warnings go to stderr so MCP stdout remains reserved for JSON-RPC.
-func warnLegacyConfiguration(cmd *cobra.Command) error {
+// checkConfigurationSchema rejects legacy runtime use without loading secrets.
+// Explicit migration and finalization remain independent of ordinary loading.
+func checkConfigurationSchema(cmd *cobra.Command) error {
 	if cmd.Name() == "migrate" || cmd.Name() == "finalize-migration" {
 		return nil
 	}
@@ -42,10 +40,5 @@ func warnLegacyConfiguration(cmd *cobra.Command) error {
 	if err != nil {
 		return fmt.Errorf("inspect configuration schema: %w", err)
 	}
-	if version == 1 {
-		if _, err := fmt.Fprintln(cmd.ErrOrStderr(), i18n.T("legacy_config_warning")); err != nil {
-			return fmt.Errorf("write legacy configuration warning: %w", err)
-		}
-	}
-	return nil
+	return config.ValidateRuntimeSchema(version)
 }

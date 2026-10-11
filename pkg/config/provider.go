@@ -378,6 +378,8 @@ func cloneConfiguration(cfg *Configuration) *Configuration {
 		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
 	}
 	if cfg == nil {
+		cloned.SchemaVersion = 2
+		cloned.Credential = DefaultCredentialConfig()
 		return cloned
 	}
 	cloned.SchemaVersion = cfg.SchemaVersion

@@ -10,6 +10,8 @@ import (
 
 func TestTUIAssetDeletionRunsCredentialCleanupAsynchronously(t *testing.T) {
 	cfg := newFormCredentialTestConfiguration("")
+	cfg.SchemaVersion = 2
+	cfg.Credential.Stores = map[string]config.StoreConfig{"mem": {Type: config.StoreTypeHelper, Command: "test-memory-store"}}
 	node, _ := cfg.Nodes.Get(formCredentialTestNodeID)
 	identity, _ := cfg.Identities.Get(node.IdentityRef)
 	ref := &credential.Ref{StoreID: "mem", ItemID: "old"}

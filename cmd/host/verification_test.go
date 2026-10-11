@@ -29,7 +29,19 @@ func verificationRepository(t *testing.T) (*config.Repository, config.Store) {
 	}
 	store := config.NewDefaultStore(path, key)
 	cfg := config.NewProviderWithoutOpenSSH(nil).Snapshot()
-	cfg.SchemaVersion = 1
+	cfg.SchemaVersion = 2
+	cfg.Credential = config.DefaultCredentialConfig()
+	owner := config.NewEncryptedRuntime(t.Context(), path, nil)
+	detach, err := utils.InstallCredentialRuntime(owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		detach()
+		if err := owner.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	cfg.Identities.Set("fixture", models.Identity{User: "root", AuthType: "auto"})
 	if err := store.Save(cfg); err != nil {
 		t.Fatal(err)
@@ -275,4 +287,21 @@ func TestHostAddSkipVerificationWithoutCredentials(t *testing.T) {
 	if err != nil || cfg.Nodes.Count() != 1 {
 		t.Fatalf("offline node was not saved: %v", err)
 	}
+}
+
+func persistedTestPassword(t *testing.T, cfg *config.Configuration, id models.Identity) string {
+	t.Helper()
+	if id.Password != "" || id.LoginPasswordRef == nil {
+		t.Fatal("expected a credential reference without plaintext")
+	}
+	registry, err := utils.GetCredentialRegistry(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret, err := registry.Resolve(t.Context(), *id.LoginPasswordRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secret.Zero()
+	return string(secret.Value)
 }

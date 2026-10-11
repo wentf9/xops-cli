@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/wentf9/xops-cli/cmd/utils"
-	"github.com/wentf9/xops-cli/pkg/config"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -14,7 +12,9 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/wentf9/xops-cli/cmd/host"
+	"github.com/wentf9/xops-cli/cmd/utils"
 	"github.com/wentf9/xops-cli/cmd/version"
+	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
 )
@@ -101,10 +101,7 @@ func newRootCmd() *cobra.Command {
 			if logLevel == "debug" {
 				logger.Debug(i18n.T("debug_mode_enabled"))
 			}
-			if err := autoMigrateConfiguration(cmd); err != nil {
-				return err
-			}
-			return warnLegacyConfiguration(cmd)
+			return checkConfigurationSchema(cmd)
 		},
 	}
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {

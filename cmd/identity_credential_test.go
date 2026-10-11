@@ -132,7 +132,7 @@ func TestIdentityCredentialSetAndDelete_Stdin(t *testing.T) {
 	}
 	store := config.NewDefaultStore(cfgPath, keyPath)
 
-	cfg := &config.Configuration{
+	cfg := &config.Configuration{SchemaVersion: 2,
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
 		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
 		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
@@ -149,7 +149,6 @@ func TestIdentityCredentialSetAndDelete_Stdin(t *testing.T) {
 	cfg.Identities.Set("admin", models.Identity{
 		User:     "root",
 		AuthType: "password",
-		Password: "legacy_plain_password",
 	})
 	if err := store.Save(cfg); err != nil {
 		t.Fatalf("failed to save initial config: %v", err)
@@ -218,7 +217,7 @@ func TestIdentityCredentialSet_NotFound(t *testing.T) {
 	}
 	store := config.NewDefaultStore(cfgPath, keyPath)
 
-	cfg := &config.Configuration{
+	cfg := &config.Configuration{SchemaVersion: 2,
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
 		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
 		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),

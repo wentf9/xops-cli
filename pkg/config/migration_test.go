@@ -97,7 +97,7 @@ func migrationFixture(t *testing.T) (*CredentialMigrator, *migrationTestStore, [
 	cfg.Nodes.Set("node", models.Node{HostRef: "host", IdentityRef: "ops", SuPwd: "privilege-password", SudoMode: models.SudoModeSu})
 	path := filepath.Join(dir, "config.yaml")
 	key := filepath.Join(dir, "secret.key")
-	if err := NewDefaultStore(path, key).Save(cfg); err != nil {
+	if err := writeMigrationTestConfiguration(path, key, cfg); err != nil {
 		t.Fatal(err)
 	}
 	raw, err := os.ReadFile(path)
@@ -207,7 +207,7 @@ func TestMigrationRoundTripAndFinalize(t *testing.T) {
 		t.Fatal("backup differs from original")
 	}
 	assertMigrationArtifactModes(t, m)
-	cfg, err := NewDefaultStore(m.path, m.keyPath).Load()
+	cfg, err := loadMigrationTestConfiguration(m.path, m.keyPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +224,7 @@ func TestMigrationRoundTripAndFinalize(t *testing.T) {
 	// Metadata edits after migration must not prevent explicit finalization.
 	id.User = "changed"
 	cfg.Identities.Set("ops", id)
-	if err := NewDefaultStore(m.path, m.keyPath).Save(cfg); err != nil {
+	if err := writeMigrationTestConfiguration(m.path, m.keyPath, cfg); err != nil {
 		t.Fatal(err)
 	}
 	report, err = m.Finalize(t.Context())
@@ -232,11 +232,11 @@ func TestMigrationRoundTripAndFinalize(t *testing.T) {
 		t.Fatalf("finalize: %+v, %v", report, err)
 	}
 	assertLegacyFilesRemoved(t, m)
-	cfg, err = NewDefaultStore(m.path, m.keyPath).Load()
+	cfg, err = loadMigrationTestConfiguration(m.path, m.keyPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := NewDefaultStore(m.path, m.keyPath).Save(cfg); err != nil {
+	if err := writeMigrationTestConfiguration(m.path, m.keyPath, cfg); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(m.keyPath); !errors.Is(err, os.ErrNotExist) {
@@ -348,7 +348,7 @@ func assertMigrationArtifactModes(t *testing.T, m *CredentialMigrator) {
 
 func TestMigrationPlaintextWithoutKey(t *testing.T) {
 	m, _, _ := migrationFixture(t)
-	cfg, err := NewDefaultStore(m.path, m.keyPath).Load()
+	cfg, err := loadMigrationTestConfiguration(m.path, m.keyPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -433,13 +433,13 @@ func assertLegacyFilesRemoved(t *testing.T, m *CredentialMigrator) {
 
 func TestMigrationAgentOnlyCanUseNone(t *testing.T) {
 	m, backend, _ := migrationFixture(t)
-	cfg, err := NewDefaultStore(m.path, m.keyPath).Load()
+	cfg, err := loadMigrationTestConfiguration(m.path, m.keyPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	clearMigrationConfiguration(cfg)
 	cfg.Credential = &CredentialConfig{DefaultStore: "none", Stores: map[string]StoreConfig{"none": {Type: StoreTypeNone}}}
-	if err := NewDefaultStore(m.path, m.keyPath).Save(cfg); err != nil {
+	if err := writeMigrationTestConfiguration(m.path, m.keyPath, cfg); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.Migrate(t.Context(), MigrationOptions{ToStore: "none", DryRun: true}); err != nil {
@@ -463,7 +463,7 @@ func TestMigrationEncryptedPrivateKeyFingerprint(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			m, backend, _ := migrationFixture(t)
-			cfg, err := NewDefaultStore(m.path, m.keyPath).Load()
+			cfg, err := loadMigrationTestConfiguration(m.path, m.keyPath)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -487,7 +487,7 @@ func TestMigrationEncryptedPrivateKeyFingerprint(t *testing.T) {
 			if wrong {
 				id.Passphrase = "wrong-passphrase"
 				cfg.Identities.Set("ops", id)
-				if err := NewDefaultStore(m.path, m.keyPath).Save(cfg); err != nil {
+				if err := writeMigrationTestConfiguration(m.path, m.keyPath, cfg); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -505,7 +505,7 @@ func TestMigrationEncryptedPrivateKeyFingerprint(t *testing.T) {
 
 func TestMigrationPreservesV1ReferencesAndCompletesFingerprint(t *testing.T) {
 	m, backend, _ := migrationFixture(t)
-	cfg, err := NewDefaultStore(m.path, m.keyPath).Load()
+	cfg, err := loadMigrationTestConfiguration(m.path, m.keyPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -516,7 +516,7 @@ func TestMigrationPreservesV1ReferencesAndCompletesFingerprint(t *testing.T) {
 	id.KeyFingerprint = ""
 	cfg.Identities.Set("ops", id)
 	backend.values[ref] = []byte("existing-passphrase")
-	if err := NewDefaultStore(m.path, m.keyPath).Save(cfg); err != nil {
+	if err := writeMigrationTestConfiguration(m.path, m.keyPath, cfg); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.Migrate(t.Context(), MigrationOptions{ToStore: "vault", DryRun: true}); err != nil {
@@ -525,7 +525,7 @@ func TestMigrationPreservesV1ReferencesAndCompletesFingerprint(t *testing.T) {
 	if _, err := m.Migrate(t.Context(), MigrationOptions{ToStore: "vault"}); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err = NewDefaultStore(m.path, m.keyPath).Load()
+	cfg, err = loadMigrationTestConfiguration(m.path, m.keyPath)
 	if err != nil {
 		t.Fatal(err)
 	}

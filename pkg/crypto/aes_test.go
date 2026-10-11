@@ -1,6 +1,9 @@
 package crypto
 
 import (
+	"crypto/rand"
+	"encoding/base64"
+	"io"
 	"strings"
 	"testing"
 )
@@ -151,4 +154,23 @@ func TestEncrypt_SameInput_DifferentOutput(t *testing.T) {
 	if enc1 == enc2 {
 		t.Error("two encryptions of the same plaintext should produce different ciphertext (random nonce)")
 	}
+}
+
+// Fixture writer for legacy ciphertext; excluded from production builds.
+// Encrypt 加密字符串
+// 输出格式: ENC:<Base64(Nonce + Ciphertext)>
+func (c *Crypter) Encrypt(plaintext string) (string, error) {
+	// 1. 生成随机 Nonce (Number used once)
+	// GCM 标准 Nonce 长度为 12 字节
+	nonce := make([]byte, c.gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", err
+	}
+
+	// 2. 加密 (Seal)
+	// Seal 会将结果追加到第一个参数 (dst) 后面，这里我们将 Nonce 作为前缀一并存储
+	ciphertext := c.gcm.Seal(nonce, nonce, []byte(plaintext), nil)
+
+	// 3. Base64 编码并添加前缀
+	return Prefix + base64.StdEncoding.EncodeToString(ciphertext), nil
 }
