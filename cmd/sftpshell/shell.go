@@ -2180,33 +2180,11 @@ func (s *Shell) handleExec(ctx context.Context, args []string) error {
 	userCmd := strings.Join(args, " ")
 	execCfg := s.sshClient.Execution()
 	if execCfg == nil {
-		cmdStr, err := ssh.FormatWorkingDirCommand(s.cwd, userCmd, nil)
-		if err != nil {
-			return fmt.Errorf("exec: %w", err)
-		}
-		if s.batch {
-			if err := s.sshClient.RunCommandWithIO(ctx, cmdStr, false, strings.NewReader(""), s.stdout, s.stderr); err != nil {
-				return fmt.Errorf("exec failed: %w", err)
-			}
-			return nil
-		}
-		if err := s.closeLineEditor(); err != nil {
-			return fmt.Errorf("close SFTP line editor before remote command failed: %w", err)
-		}
-		streams, err := s.interactiveIO()
-		if err != nil {
-			return err
-		}
-		if err := s.sshClient.RunInteractiveCmdWithIO(ctx, cmdStr, streams); err != nil {
-			return fmt.Errorf("exec: %w", err)
-		}
-		s.fprintlnStdout("")
-		return nil
-	}
-
-	if err := execCfg.Validate(); err != nil {
+		execCfg = &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer, LaunchDialect: ssh.LaunchUnknown}
+	} else if err := execCfg.Validate(); err != nil {
 		return fmt.Errorf("exec: %w", err)
 	}
+
 	cmdStr, err := ssh.FormatWorkingDirCommand(s.cwd, userCmd, execCfg)
 	if err != nil {
 		return fmt.Errorf("exec: %w", err)

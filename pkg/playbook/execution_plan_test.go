@@ -1169,3 +1169,53 @@ func TestPlaybook_EnsureProtocol_ExecutionTimeoutRejectedPlanned_Check1(t *testi
 		t.Fatalf("expected timeout error, got: %v", stepRes.Err)
 	}
 }
+
+func TestPlaybook_UnconfiguredSudoShellPreservesCompatibility(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	var executedPayload string
+	server, err := sshfixture.NewWithOptions(ctx, sshfixture.Options{
+		ExecHandler: func(cmd string, ch cryptoSSH.Channel) {
+			executedPayload = cmd
+			_, _ = ch.Write([]byte("ok\n"))
+			_, _ = ch.SendRequest("exit-status", false, cryptoSSH.Marshal(struct{ Status uint32 }{0}))
+			_ = ch.Close()
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+
+	// Unconfigured execution (nil ExecutionConfig) with sudo step
+	provider, connector := setupFixtureProvider(t, server, nil)
+	yes := true
+	pb := &playbook.Playbook{
+		Name:    "unconfigured-sudo-test",
+		Targets: playbook.Targets{Nodes: []string{"node-1"}},
+		Steps: []playbook.Step{
+			{
+				Name:  "sudo-step",
+				Shell: "uptime",
+				Sudo:  &yes,
+			},
+		},
+	}
+
+	engine := playbook.NewEngine(pb, provider, connector)
+	report, err := engine.Run(t.Context())
+	if err != nil {
+		t.Fatalf("engine.Run failed: %v", err)
+	}
+	if len(report.Hosts) != 1 || len(report.Hosts[0].Steps) != 1 {
+		t.Fatalf("unexpected report hosts: %+v", report.Hosts)
+	}
+	res := report.Hosts[0].Steps[0]
+	if res.Status != playbook.StatusChanged {
+		t.Fatalf("status = %s, want StatusChanged, err=%v", res.Status, res.Err)
+	}
+	if !strings.Contains(executedPayload, "bash -l -c 'uptime'") {
+		t.Fatalf("expected legacy Bash sudo payload, got %q", executedPayload)
+	}
+}

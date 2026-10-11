@@ -18,11 +18,11 @@ func TestFormatWorkingDirCommand(t *testing.T) {
 		wantErr   bool
 	}{
 		{
-			name:      "nil execution defaults to bash cd with quotes and double dash",
+			name:      "nil execution defaults to server and rejects non-empty cwd",
 			cwd:       "/var/log",
 			command:   "ls -la",
 			execution: nil,
-			want:      "cd -- '/var/log' && ls -la",
+			wantErr:   true,
 		},
 		{
 			name:      "empty cwd returns command verbatim",

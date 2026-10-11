@@ -744,6 +744,26 @@ func promptPressEnterIfTUI(stdin io.Reader, stdout io.Writer) error {
 	return nil
 }
 
+func (o *SshOptions) effectiveInterpreter(client *ssh.Client) ssh.Interpreter {
+	if o.execution.interpreterSet && o.execution.interpreter != "" {
+		return ssh.Interpreter(o.execution.interpreter)
+	}
+	if client != nil && client.Execution() != nil && client.Execution().EffectiveInterpreter() != "" {
+		return client.Execution().EffectiveInterpreter()
+	}
+	return ssh.InterpreterServer
+}
+
+func (o *SshOptions) runPipedShell(ctx context.Context, client *ssh.Client) error {
+	if o.execution.enabled() && runtime.GOOS != "linux" {
+		return fmt.Errorf("explicit execution on %s is not supported yet: cancelable native output is only available on Linux", runtime.GOOS)
+	}
+	if runtime.GOOS == "linux" {
+		return client.RunShellWithoutPTY(ctx, os.Stdin, os.Stdout, os.Stderr)
+	}
+	return client.RunShellWithIO(ctx, os.Stdin, os.Stdout, os.Stderr)
+}
+
 func (o *SshOptions) runCommand(ctx context.Context, client *ssh.Client, command string) error {
 	if o.commandPlan != nil {
 		if runtime.GOOS != "linux" {
@@ -751,11 +771,23 @@ func (o *SshOptions) runCommand(ctx context.Context, client *ssh.Client, command
 		}
 		return client.RunCommandPlanWithIO(ctx, *o.commandPlan, os.Stdin, os.Stdout, os.Stderr)
 	}
-	if o.Command == "" && o.stdinScript && o.execution.enabled() && o.execution.interpreter == string(ssh.InterpreterServer) {
-		if runtime.GOOS != "linux" {
-			return fmt.Errorf("explicit execution on %s is not supported yet: cancelable native output is only available on Linux", runtime.GOOS)
+	if !o.Sudo && o.Command == "" && o.stdinScript {
+		if o.effectiveInterpreter(client) == ssh.InterpreterServer {
+			return o.runPipedShell(ctx, client)
 		}
-		return client.RunShellWithoutPTY(ctx, os.Stdin, os.Stdout, os.Stderr)
+	}
+	if !o.Sudo && o.Command != "" {
+		var execCfg *ssh.ExecutionConfig
+		if client != nil {
+			execCfg = client.Execution()
+		}
+		plan, err := ssh.PlanCommand(command, execCfg.CommandOptions())
+		if err != nil {
+			return fmt.Errorf("plan command: %w", err)
+		}
+		if runtime.GOOS == "linux" {
+			return client.RunCommandPlanWithIO(ctx, plan, os.Stdin, os.Stdout, os.Stderr)
+		}
 	}
 	return client.RunCommandWithIO(ctx, command, o.Sudo, os.Stdin, os.Stdout, os.Stderr)
 }

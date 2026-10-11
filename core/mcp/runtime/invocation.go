@@ -105,8 +105,6 @@ func resolveExecutionRisk(input guardrail.RiskInput, target ports.Target) (guard
 		if requested == trusted || requested == ssh.LaunchUnknown {
 			input.Dialect = string(trusted)
 		}
-	} else if effective == nil || (effective.Interpreter == "" && effective.LaunchDialect == "" && effective.Login == nil) {
-		input.Dialect = string(ssh.LaunchPOSIX)
 	}
 	return input, nil
 }

@@ -65,7 +65,10 @@ func TestLegacyBashEntryPointPayloads(t *testing.T) {
 		name, payload, input string
 		run                  func(*Client) (string, error)
 	}{
-		{"login", "bash -l -c 'echo '\\''quoted'\\'''", "", func(c *Client) (string, error) { return c.Run(t.Context(), "echo 'quoted'") }},
+		{"server default", "echo 'quoted'", "", func(c *Client) (string, error) { return c.Run(t.Context(), "echo 'quoted'") }},
+		{"bash login", "bash -l -c 'echo '\\''quoted'\\'''", "", func(c *Client) (string, error) {
+			return c.Run(t.Context(), "echo 'quoted'", WithInterpreter(InterpreterBash))
+		}},
 		{"non-login", "bash -c 'echo '\\''quoted'\\'''", "", func(c *Client) (string, error) { return c.RunWithoutLogin(t.Context(), "echo 'quoted'") }},
 		{"script login", "bash -l -s", "#!/bin/sh\necho script\n", func(c *Client) (string, error) { return c.RunScript(t.Context(), "#!/bin/sh\necho script\n") }},
 		{"script non-login", "bash -s", "echo script\n", func(c *Client) (string, error) {

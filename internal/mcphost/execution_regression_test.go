@@ -37,7 +37,7 @@ func (v executionFixtureTrust) Verify(ctx context.Context, _ ssh.HostKeyRequest,
 }
 
 func TestLegacyHostBackendExecutionConfiguration(t *testing.T) {
-	no := false
+	yes, no := true, false
 	for _, test := range []struct {
 		name      string
 		execution *ssh.ExecutionConfig
@@ -46,7 +46,8 @@ func TestLegacyHostBackendExecutionConfiguration(t *testing.T) {
 		payload   string
 		invalid   bool
 	}{
-		{name: "legacy", payload: "bash -l -c 'uptime'"},
+		{name: "unconfigured command defaults to server", payload: "uptime"},
+		{name: "configured bash command", execution: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchPOSIX, Login: &yes}, payload: "bash -l -c 'uptime'"},
 		{name: "explicit server", execution: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer}, payload: "uptime"},
 		{name: "legacy sudo", sudo: true, mode: ssh.SudoModeRoot, payload: "bash -l -c 'uptime'"},
 		{name: "configured sudo", execution: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchPOSIX, Login: &no}, sudo: true, mode: ssh.SudoModeRoot, payload: "bash -c 'uptime'"},
@@ -200,6 +201,7 @@ func newExecutionBackendFixture(t *testing.T, mode ssh.SudoMode) (*backend, *ssh
 }
 
 func TestLegacyHostBackendFilesystemRejectsNonPOSIXDialects(t *testing.T) {
+	yes := true
 	for _, test := range []struct {
 		name    string
 		node    *ssh.ExecutionConfig
@@ -246,8 +248,14 @@ func TestLegacyHostBackendFilesystemRejectsNonPOSIXDialects(t *testing.T) {
 			wantCmd: "rm -rf '/tmp/test'",
 		},
 		{
-			name:    "default bash allowed",
+			name:    "unconfigured node rejects filesystem commands due to unknown dialect",
 			node:    nil,
+			cmd:     ports.Command{Text: "rm -rf '/tmp/test'", Filesystem: true},
+			invalid: true,
+		},
+		{
+			name:    "configured bash allowed",
+			node:    &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchPOSIX, Login: &yes},
 			cmd:     ports.Command{Text: "rm -rf '/tmp/test'", Filesystem: true},
 			invalid: false,
 			wantCmd: "bash -l -c 'rm -rf '\\''/tmp/test'\\'''",

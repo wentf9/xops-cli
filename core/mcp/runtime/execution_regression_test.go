@@ -28,7 +28,7 @@ func TestExecutionRiskUsesTrustedDialectAndLegacyDefaults(t *testing.T) {
 		want            guardrail.RiskLevel
 		dialect         string
 	}{
-		{"legacy", nil, nil, guardrail.Safe, "posix"},
+		{"unconfigured request", nil, nil, guardrail.Moderate, "unknown"},
 		{"unspecified server dialect", &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer}, nil, guardrail.Moderate, "unknown"},
 		{"node server unspecified dialect", nil, &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer}, guardrail.Moderate, "unknown"},
 		{"untrusted POSIX assertion", &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer, LaunchDialect: ssh.LaunchPOSIX}, nil, guardrail.Moderate, "unknown"},
@@ -90,7 +90,7 @@ func TestUnknownServerRequiresApprovalBeforeBackend(t *testing.T) {
 		request, target *ssh.ExecutionConfig
 		denied          bool
 	}{
-		{"legacy request", nil, nil, false},
+		{"unconfigured request", nil, nil, true},
 		{"request server unknown", &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer}, nil, true},
 		{"node server unknown", nil, &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer}, true},
 		{"request cannot assert safety", &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer, LaunchDialect: ssh.LaunchPOSIX}, nil, true},
@@ -1065,13 +1065,15 @@ func TestMCPToolExecutionSupportedJSONForms(t *testing.T) {
 		{
 			name: "login enabled string",
 			execution: map[string]any{
-				"login": "enabled",
+				"interpreter": "bash",
+				"login":       "enabled",
 			},
 		},
 		{
 			name: "login disabled string",
 			execution: map[string]any{
-				"login": "disabled",
+				"interpreter": "bash",
+				"login":       "disabled",
 			},
 		},
 		{
@@ -1083,13 +1085,15 @@ func TestMCPToolExecutionSupportedJSONForms(t *testing.T) {
 		{
 			name: "login boolean true",
 			execution: map[string]any{
-				"login": true,
+				"interpreter": "bash",
+				"login":       true,
 			},
 		},
 		{
 			name: "login boolean false",
 			execution: map[string]any{
-				"login": false,
+				"interpreter": "bash",
+				"login":       false,
 			},
 		},
 		{

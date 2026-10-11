@@ -100,13 +100,13 @@ func TestParseShebang(t *testing.T) {
 }
 
 func TestResolveScriptExecution_ExplicitAndLegacy(t *testing.T) {
-	t.Run("all nil returns nil nil indicating legacy mode", func(t *testing.T) {
-		res, err := ssh.ResolveScriptExecution(nil, nil, nil, nil, []byte("echo legacy"))
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
+	t.Run("all nil without shebang fails before execution in P3", func(t *testing.T) {
+		_, err := ssh.ResolveScriptExecution(nil, nil, nil, nil, []byte("echo legacy"))
+		if err == nil {
+			t.Fatal("expected error for script without interpreter or shebang in P3")
 		}
-		if res != nil {
-			t.Fatalf("expected nil res for legacy, got %+v", res)
+		if !errors.Is(err, ssh.ErrExecutionValidation) {
+			t.Fatalf("expected ErrExecutionValidation, got: %v", err)
 		}
 	})
 

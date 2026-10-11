@@ -199,6 +199,8 @@ func (s *Server) session(channel ssh.Channel, requests <-chan *ssh.Request) {
 	defer func() { s.record(channel.Close()) }()
 	for request := range requests {
 		switch request.Type {
+		case "pty-req":
+			s.record(request.Reply(true, nil))
 		case "exec":
 			s.Executed.Add(1)
 			s.record(request.Reply(true, nil))

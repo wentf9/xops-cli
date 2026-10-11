@@ -14,10 +14,7 @@ func FormatWorkingDirCommand(cwd, command string, execution *ExecutionConfig) (s
 	if strings.ContainsAny(cwd, "\r\n\x00") {
 		return "", fmt.Errorf("%w: working directory contains illegal newline or null character", ErrExecutionValidation)
 	}
-	interp := InterpreterBash
-	if execution != nil && execution.EffectiveInterpreter() != "" {
-		interp = execution.EffectiveInterpreter()
-	}
+	interp := execution.EffectiveInterpreter()
 
 	switch interp {
 	case InterpreterServer:

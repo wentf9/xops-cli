@@ -42,12 +42,12 @@ This batch's new API accepts finite input and internal memory output only, witho
 - [x] Adapt SFTP cwd and reject pure server combinations; validate file-backend semantics
 - [x] Declare platform/interpreter requirements for built-in probes, monitoring, logs, and firewall commands
 
-### P3: Release the Default Switch
+### P3: Release the Default Switch (Complete)
 
-- [ ] Complete P1/P2 acceptance and shared-core consumer validation; assign the release version
-- [ ] Use server as the consistent ordinary-command default; reject scripts without a reliable interpreter before execution
-- [ ] Publish separate Bash compatibility migration for commands/scripts, SFTP restrictions, and rollback-compatible schema versions
-- [ ] Obtain native Windows and genuinely Bash-free Unix evidence; prohibit fallback to another interpreter after failure
+- [x] Complete P1/P2 acceptance and shared-core consumer validation; assign the release version
+- [x] Use server as the consistent ordinary-command default; reject scripts without a reliable interpreter before execution
+- [x] Publish separate Bash compatibility migration for commands/scripts, SFTP restrictions, and rollback-compatible schema versions
+- [x] Obtain native Windows and genuinely Bash-free Unix evidence; prohibit fallback to another interpreter after failure
 
 ## Validation and Submission
 
@@ -156,5 +156,33 @@ This batch completes all items in Phase P2-B (Adapters & Advanced Operations):
 1. **cmd Two-Layer Quoting, Operator Protection & Variable Expansion Guard**: Implemented `escapeCmdCommand` in `cmdCommandPayload` using a state machine tracking the outer cmd double quote state when wrapped in `cmd.exe /d /s /c "<payload>"`. When inner double quotes cause the outer cmd to toggle out of quote mode, inner operators (`&`, `|`, `<`, `>`, `(`, `)`, `^`) become exposed to outer parsing (such as `&` in `echo "A&B"` or directories containing `&`). Operators outside outer quotes are caret-escaped (`^&`), allowing outer cmd to consume the caret and pass the literal characters to the inner cmd interpreter. Furthermore, because outer cmd parses and expands `%VAR%` and `!VAR!` at command-line parse time before launching child processes, if variable contents include double quotes or operators (such as `set X="A&echo OUTSIDE&rem "`), expanding them alters outer quoting and breaks out of protection to execute arbitrary commands. Until reliable inner variable expansion mechanisms are implemented, all commands containing `%` or `!` variable expansions are uniformly rejected (`ErrExecutionValidation`). Unbalanced quotes and illegal newlines/null characters are rejected early. Validated via unit tests and native Wine execution probes.
 2. **SFTP Unconfigured Execution Preserves Legacy Entry Points**: When `execution` is unconfigured (`execCfg == nil`), SFTP `handleExec` routes through legacy compatibility entry points: `RunInteractiveCmdWithIO` for interactive sessions and `RunCommandWithIO` for batch mode. This avoids strict cancelable output checks (`RunCommandPlanWithIO` / `RunInteractivePlanWithIO`) that reject non-Linux native files without context writers, ensuring terminal and pipe streams on macOS and Windows operate without errors.
 3. **SFTP Batch Execution Retains Non-Login Default**: Batch mode without execution config executes via legacy `RunCommandWithIO` using non-login `bash -c`. When execution is configured without an explicit `login` parameter, Bash batch planning explicitly assigns `opts.Login = LoginDisabled`, avoiding `nil.CommandOptions()`'s default `LoginEnabled` (`bash -l -c`) which could alter PATH or insert login banners into batch output.
+
+## Phase P3 Validation Record: Release Default Switch, Script Interception & Native Multi-Platform Evidence (2026-10-10)
+
+This batch completes all release default switch and acceptance items for Phase P3:
+1. **Release Default Unified to server**:
+   - CLI (`xops exec`, `xops ssh`), MCP (`xops_ssh_run`), Playbook (`shell` step), and core (`CommandOptions`, `EffectiveInterpreter`) uniformly default unspecified or absent execution configurations to the `server` interpreter with `unknown` launch dialect and `inherit` login mode. The user's command string is delivered verbatim to the SSH `exec` channel, eliminating implicit remote Bash dependencies.
+   - Explicit compatibility configurations: Nodes or workflows depending on legacy Bash environments can pin their behavior explicitly via `execution: { interpreter: bash, launch_dialect: posix, login: true }`. CLI `--no-login` retains its legacy contract (selecting the non-login Bash compatibility path when an interpreter is not specified).
+   - The `server` interpreter strictly accepts only `Login == nil` (`inherit`); explicit `login: enabled/disabled/true/false` is statically rejected (`ErrExecutionValidation`). `ResolveExecution` safely drops parent `login` configurations when the child specifies `server`, preventing accidental inheritance of illegal login modes.
+2. **Early Script Interception for Absent Interpreters**:
+   - Script executions consistently route through `ssh.ResolveScriptExecution` before dispatch. Scripts without an explicit interpreter and without an allowlisted shebang (or with missing/unsupported shebangs) immediately return `ErrExecutionValidation: server interpreter cannot be used for scripts` and are rejected before execution, preventing raw `server` defaults from being misapplied to scripts.
+3. **Privilege Escalation and SFTP Boundaries**:
+   - Unix escalation (`sudo`/`su`) without an execution configuration preserves legacy Unix Bash escalation compatibility. Specifying `server` interpreter for escalation is strictly rejected before execution.
+   - SFTP `exec` uniformly integrates with `FormatWorkingDirCommand` and `PlanCommand`. Default `server` execution explicitly rejects non-empty working directories (`server interpreter does not support inheriting working directory`), preventing relative path operations from executing erroneously in remote HOME directories; `cwd == ""` executes verbatim.
+4. **Native Windows and Bash-Free Unix Platform Evidence**:
+   - **Native Windows OpenSSH**:
+     - Default mode: `./bin/xops ssh vm dir` and `./bin/xops exec --host vm -c dir` executed without flags, successfully listing directories in the remote default cmd.exe shell (exit status 0, eliminating `'bash' is not recognized as an internal or external command`).
+     - Explicit interpreters: PowerShell (`Get-Date`), pwsh (`$PSVersionTable.PSVersion` outputting 7.6.6), and cmd (`echo HelloFromCmd`) all executed successfully with exit code verification.
+     - Script rejection: Scripts without a shebang failed immediately with `server interpreter cannot be used for scripts` and were blocked locally.
+   - **Bash-Free Unix Platform (Alpine Linux Docker container, BusyBox ash/sh only, verified absent bash)**:
+     - Default mode: `./bin/xops ssh root@127.0.0.1:22222 uname -a` and `./bin/xops exec --host alpine-test -c 'uname -m'` (outputting x86_64) executed natively in ash without errors.
+     - Script dispatch: A script with `#!/bin/sh` was delivered via stdin to `/bin/sh` and executed successfully (outputting `Running on Linux in shell sh`); a script with `#!/bin/bash` returned exit status 127 `sh: bash: not found`; scripts without a shebang were rejected locally.
+5. **Full Acceptance Metrics**:
+   - `go build ./...`: passed
+   - `go test ./...`: all passed
+   - `golangci-lint run ./...`: 0 issues
+   - `python3 scripts/check_core.py`: Linux, Windows, macOS boundaries and extracted module build/test all passed
+   - `npm run docs:build`: passed
+
 
 

@@ -184,7 +184,7 @@ func TestBackendStreamsAndCommitsThroughSeparatePermits(t *testing.T) {
 }
 
 func TestBackendExecutionDefaultsAndSudoConfiguration(t *testing.T) {
-	no := false
+	yes, no := true, false
 	for _, test := range []struct {
 		name          string
 		node, request *ssh.ExecutionConfig
@@ -193,7 +193,8 @@ func TestBackendExecutionDefaultsAndSudoConfiguration(t *testing.T) {
 		payload       string
 		invalid       bool
 	}{
-		{name: "legacy command", payload: "bash -l -c 'uptime'"},
+		{name: "unconfigured command defaults to server", payload: "uptime"},
+		{name: "configured bash command", node: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchPOSIX, Login: &yes}, payload: "bash -l -c 'uptime'"},
 		{name: "explicit server", request: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer}, payload: "uptime"},
 		{name: "legacy sudo root", sudo: true, mode: ssh.SudoModeRoot, payload: "bash -l -c 'uptime'"},
 		{name: "configured sudo root", node: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchPOSIX, Login: &no}, sudo: true, mode: ssh.SudoModeRoot, payload: "bash -c 'uptime'"},
@@ -279,6 +280,7 @@ func TestBackendSudoSignalTerminationPreserved(t *testing.T) {
 }
 
 func TestBackendFilesystemRejectsNonPOSIXDialects(t *testing.T) {
+	yes := true
 	for _, test := range []struct {
 		name    string
 		node    *ssh.ExecutionConfig
@@ -325,8 +327,14 @@ func TestBackendFilesystemRejectsNonPOSIXDialects(t *testing.T) {
 			wantCmd: "rm -rf '/tmp/test'",
 		},
 		{
-			name:    "default bash allowed",
+			name:    "unconfigured node rejects filesystem commands due to unknown dialect",
 			node:    nil,
+			cmd:     ports.Command{Text: "rm -rf '/tmp/test'", Filesystem: true},
+			invalid: true,
+		},
+		{
+			name:    "configured bash allowed",
+			node:    &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchPOSIX, Login: &yes},
 			cmd:     ports.Command{Text: "rm -rf '/tmp/test'", Filesystem: true},
 			invalid: false,
 			wantCmd: "bash -l -c 'rm -rf '\\''/tmp/test'\\'''",

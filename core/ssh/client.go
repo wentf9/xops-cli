@@ -353,12 +353,14 @@ func (c *Client) Run(ctx context.Context, cmd string, opts ...RunOption) (string
 
 	var payload string
 	switch config.Interpreter {
-	case "", InterpreterBash:
+	case "", InterpreterServer:
+		payload = cmd
+	case InterpreterBash:
 		payload = bashCommandPayload(cmd, config.LoginShell)
 	case InterpreterSh:
 		payload = shCommandPayload(cmd)
 	default:
-		return "", fmt.Errorf("%w: unsupported interpreter %q for Run (only bash and sh are supported)", ErrExecutionValidation, config.Interpreter)
+		return "", fmt.Errorf("%w: unsupported interpreter %q for Run (only server, bash and sh are supported)", ErrExecutionValidation, config.Interpreter)
 	}
 	return c.runRaw(ctx, payload, config)
 }
@@ -410,12 +412,12 @@ func (c *Client) RunScript(ctx context.Context, scriptContent string, opts ...Ru
 }
 
 // RunScriptWithExecution applies the resolved execution configuration to RunScript.
-func (c *Client) RunScriptWithExecution(ctx context.Context, content string, execution *ExecutionConfig) (string, error) {
+func (c *Client) RunScriptWithExecution(ctx context.Context, content string, execution *ExecutionConfig, extraOpts ...RunOption) (string, error) {
 	if strings.HasPrefix(content, "\xef\xbb\xbf") {
 		return "", fmt.Errorf("%w: script contains unsupported UTF-8 BOM prefix", ErrExecutionValidation)
 	}
 	if execution == nil {
-		return c.RunScript(ctx, content)
+		return c.RunScript(ctx, content, extraOpts...)
 	}
 	if err := execution.Validate(); err != nil {
 		return "", err
@@ -423,7 +425,8 @@ func (c *Client) RunScriptWithExecution(ctx context.Context, content string, exe
 	if execution.Interpreter != "" && execution.Interpreter != InterpreterBash && execution.Interpreter != InterpreterSh {
 		return "", fmt.Errorf("%w: unsupported interpreter %q for RunScriptWithExecution (only bash and sh are supported)", ErrExecutionValidation, execution.Interpreter)
 	}
-	var opts []RunOption
+	opts := make([]RunOption, len(extraOpts))
+	copy(opts, extraOpts)
 	if execution.Interpreter != "" {
 		opts = append(opts, WithInterpreter(execution.Interpreter))
 	}

@@ -1,9 +1,12 @@
 package cmd
 
 import (
+	"context"
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/wentf9/xops-cli/core/ssh"
 )
 
 func TestSSHEmptyCommandDoesNotBecomeShellOrStdinScript(t *testing.T) {
@@ -82,10 +85,10 @@ func TestSSHExplicitExecutionOptions(t *testing.T) {
 			payload: "echo $HOME",
 		},
 		{
-			name:    "bash posix login default",
+			name:    "server posix dialect default",
 			flags:   []string{"--launch-dialect", "posix"},
 			args:    []string{"node", "echo", "$HOME"},
-			payload: "bash -l -c 'echo $HOME'",
+			payload: "echo $HOME",
 		},
 		{
 			name:    "bash explicit dialect and login",
@@ -104,6 +107,18 @@ func TestSSHExplicitExecutionOptions(t *testing.T) {
 			flags:   []string{"--interpreter", "bash", "--launch-dialect", "posix", "--no-login"},
 			args:    []string{"node", "uptime"},
 			payload: "bash -c 'uptime'",
+		},
+		{
+			name:    "no-login alone selects bash and posix",
+			flags:   []string{"--no-login"},
+			args:    []string{"node", "uptime"},
+			payload: "bash -c 'uptime'",
+		},
+		{
+			name:    "no-login with explicit unknown dialect rejected",
+			flags:   []string{"--launch-dialect", "unknown", "--no-login"},
+			args:    []string{"node", "uptime"},
+			wantErr: "requires posix",
 		},
 		{
 			name:    "server interactive terminal shell allowed",
@@ -244,5 +259,114 @@ func TestSSHExplicitPipedStdinRouting(t *testing.T) {
 				t.Fatalf("empty explicit option %v (piped=%v) accepted: %v", flags, piped, err)
 			}
 		}
+	}
+}
+
+func TestSSHPipedStdinWithSudoPreservesEscalation(t *testing.T) {
+	o := NewSshOptions()
+	cmd := newCmdSshWithOptions(o)
+	if err := cmd.Flags().Parse([]string{"--sudo", "node"}); err != nil {
+		t.Fatal(err)
+	}
+	o.stdinScript = true // simulate cat script.sh | xops ssh --sudo host
+	if err := o.Complete(cmd, cmd.Flags().Args()); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Validate(); err != nil {
+		t.Fatalf("piped stdin with sudo should validate: %v", err)
+	}
+	if o.commandPlan != nil {
+		t.Fatalf("expected no command plan for legacy sudo stdin: %+v", o.commandPlan)
+	}
+}
+
+func TestSSHEffectiveInterpreter(t *testing.T) {
+	o := NewSshOptions()
+	// Unconfigured client defaults to InterpreterServer
+	clientNil := ssh.NewTestClient(ssh.ConnectionConfig{})
+	if got := o.effectiveInterpreter(clientNil); got != ssh.InterpreterServer {
+		t.Fatalf("unconfigured client got %v, want InterpreterServer", got)
+	}
+
+	// Client with node execution config (bash) resolves to InterpreterBash
+	clientBash := ssh.NewTestClient(ssh.ConnectionConfig{
+		Execution: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchPOSIX},
+	})
+	if got := o.effectiveInterpreter(clientBash); got != ssh.InterpreterBash {
+		t.Fatalf("bash client got %v, want InterpreterBash", got)
+	}
+
+	// Client with node execution config (sh) resolves to InterpreterSh
+	clientSh := ssh.NewTestClient(ssh.ConnectionConfig{
+		Execution: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterSh, LaunchDialect: ssh.LaunchPOSIX},
+	})
+	if got := o.effectiveInterpreter(clientSh); got != ssh.InterpreterSh {
+		t.Fatalf("sh client got %v, want InterpreterSh", got)
+	}
+
+	// CLI override takes precedence over client config
+	oCLI := NewSshOptions()
+	oCLI.execution.interpreterSet = true
+	oCLI.execution.interpreter = string(ssh.InterpreterServer)
+	if got := oCLI.effectiveInterpreter(clientBash); got != ssh.InterpreterServer {
+		t.Fatalf("cli override got %v, want InterpreterServer", got)
+	}
+}
+
+func TestSSHRunCommandPlanningErrorNotIgnored(t *testing.T) {
+	o := NewSshOptions()
+	o.Command = "uptime"
+
+	// Client configured with Bash but unknown dialect: PlanCommand rejects it
+	clientInvalidDialect := ssh.NewTestClient(ssh.ConnectionConfig{
+		Execution: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchUnknown},
+	})
+	err := o.runCommand(context.Background(), clientInvalidDialect, o.Command)
+	if err == nil || !strings.Contains(err.Error(), "plan command") || !strings.Contains(err.Error(), "requires posix") {
+		t.Fatalf("expected plan error for invalid dialect, got: %v", err)
+	}
+
+	// Command with NUL character rejected during planning
+	clientValid := ssh.NewTestClient(ssh.ConnectionConfig{})
+	oBadCmd := NewSshOptions()
+	oBadCmd.Command = "uptime\x00bad"
+	err = oBadCmd.runCommand(context.Background(), clientValid, oBadCmd.Command)
+	if err == nil || !strings.Contains(err.Error(), "plan command") {
+		t.Fatalf("expected plan error for command with NUL, got: %v", err)
+	}
+}
+
+func TestSSHRunCommandPipedStdinHonorsInterpreter(t *testing.T) {
+	// For unconfigured node (server interpreter), piped script resolves to server
+	oServer := NewSshOptions()
+	oServer.stdinScript = true
+	clientServer := ssh.NewTestClient(ssh.ConnectionConfig{})
+	if interp := oServer.effectiveInterpreter(clientServer); interp != ssh.InterpreterServer {
+		t.Fatalf("expected InterpreterServer, got %v", interp)
+	}
+
+	// For node configured with bash, piped script resolves to bash (not server)
+	oBash := NewSshOptions()
+	oBash.stdinScript = true
+	clientBash := ssh.NewTestClient(ssh.ConnectionConfig{
+		Execution: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchPOSIX},
+	})
+	if interp := oBash.effectiveInterpreter(clientBash); interp != ssh.InterpreterBash {
+		t.Fatalf("expected InterpreterBash, got %v", interp)
+	}
+}
+
+func TestSSHRunCommandPipedStdinPreservesLoginMode(t *testing.T) {
+	o := NewSshOptions()
+	o.stdinScript = true
+	yes := true
+	clientBashLogin := ssh.NewTestClient(ssh.ConnectionConfig{
+		Execution: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchPOSIX, Login: &yes},
+	})
+	if interp := o.effectiveInterpreter(clientBashLogin); interp != ssh.InterpreterBash {
+		t.Fatalf("expected InterpreterBash, got %v", interp)
+	}
+	if clientBashLogin.Execution().LoginMode() != ssh.LoginEnabled {
+		t.Fatalf("expected LoginEnabled, got %v", clientBashLogin.Execution().LoginMode())
 	}
 }

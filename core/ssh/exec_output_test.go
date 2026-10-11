@@ -185,10 +185,25 @@ func TestLegacyStreamingEntryPointPayloads(t *testing.T) {
 		name, command, payload, input string
 		run                           func(*Client) error
 	}{
-		{"command", "echo 'x'", "bash -c 'echo '\\''x'\\'''", "in", func(c *Client) error {
+		{"server default command", "echo 'x'", "echo 'x'", "in", func(c *Client) error {
 			return c.RunCommandWithIO(t.Context(), "echo 'x'", false, strings.NewReader("in"), io.Discard, io.Discard)
 		}},
-		{"empty command reads stdin", "", "bash", "script", func(c *Client) error {
+		{"bash configured command", "echo 'x'", "bash -c 'echo '\\''x'\\'''", "in", func(c *Client) error {
+			c.connCfg.Execution = &ExecutionConfig{Interpreter: InterpreterBash}
+			return c.RunCommandWithIO(t.Context(), "echo 'x'", false, strings.NewReader("in"), io.Discard, io.Discard)
+		}},
+		{"bash empty command reads stdin", "", "bash", "script", func(c *Client) error {
+			c.connCfg.Execution = &ExecutionConfig{Interpreter: InterpreterBash}
+			return c.RunCommandWithIO(t.Context(), "", false, strings.NewReader("script"), io.Discard, io.Discard)
+		}},
+		{"bash login command with input", "echo 'x'", "bash -l -c 'echo '\\''x'\\'''", "in", func(c *Client) error {
+			yes := true
+			c.connCfg.Execution = &ExecutionConfig{Interpreter: InterpreterBash, LaunchDialect: LaunchPOSIX, Login: &yes}
+			return c.RunCommandWithIO(t.Context(), "echo 'x'", false, strings.NewReader("in"), io.Discard, io.Discard)
+		}},
+		{"bash login empty command reads stdin", "", "bash -l", "script", func(c *Client) error {
+			yes := true
+			c.connCfg.Execution = &ExecutionConfig{Interpreter: InterpreterBash, LaunchDialect: LaunchPOSIX, Login: &yes}
 			return c.RunCommandWithIO(t.Context(), "", false, strings.NewReader("script"), io.Discard, io.Discard)
 		}},
 		{"stream", "tail -f x", "bash -c 'tail -f x'", "", func(c *Client) error {
@@ -216,6 +231,15 @@ func TestLegacyStreamingEntryPointPayloads(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("server empty command rejected", func(t *testing.T) {
+		scenario := &commandFixture{commands: make(chan string, 1), inputs: make(chan string, 1), output: "output"}
+		client := commandTestClient(t, scenario)
+		err := client.RunCommandWithIO(t.Context(), "", false, strings.NewReader("script"), io.Discard, io.Discard)
+		if !errors.Is(err, ErrExecutionValidation) {
+			t.Fatalf("expected ErrExecutionValidation for empty command in server mode, got: %v", err)
+		}
+	})
 }
 
 func TestLegacyFileOutputsReceiveCommandOutput(t *testing.T) {

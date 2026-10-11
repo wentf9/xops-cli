@@ -42,12 +42,12 @@
 - [x] SFTP cwd 适配与纯 server 拒绝；文件后端语义验收
 - [x] 内置探测、监控、日志、防火墙逐项声明平台/解释器要求
 
-### P3：发布默认切换
+### P3：发布默认切换（已完成）
 
-- [ ] P1/P2 全部验收且共享 core 消费者验证通过；明确发布版本
-- [ ] 命令默认统一为 server；无可靠解释器的脚本执行前拒绝
-- [ ] 发布命令/脚本各自的 Bash 兼容迁移、SFTP 限制与可回退 schema 版本说明
-- [ ] 原生 Windows 与真正无 Bash Unix 平台证据齐备；禁止通过失败后更换解释器回退
+- [x] P1/P2 全部验收且共享 core 消费者验证通过；明确发布版本
+- [x] 命令默认统一为 server；无可靠解释器的脚本执行前拒绝
+- [x] 发布命令/脚本各自的 Bash 兼容迁移、SFTP 限制与可回退 schema 版本说明
+- [x] 原生 Windows 与真正无 Bash Unix 平台证据齐备；禁止通过失败后更换解释器回退
 
 ## 验证与提交
 
@@ -156,5 +156,33 @@ MCP `xops_fs_cp` 在调用保持目录项语义的 `RemoteCopy` 之前，单独�
 1. **cmd 两层引用、操作符保护与环境变量拦截**：在 `cmdCommandPayload` 中实现 `escapeCmdCommand`，分析外层 cmd 在外层包裹双引号 `cmd.exe /d /s /c "<payload>"` 时的字符状态机。内层命令的双引号会使外层 cmd 退出引号模式，使内部操作符（`&`、`|`、`<`、`>`、`(`、`)`、`^`）暴露于外层解析（如 `echo "A&B"` 中的 `&` 或 `cwd` 中带有 `&` 的路径）。对处于外层非引用状态的操作符使用脱字符 `^` 进行转义（如 `^&`），由外层 cmd 消耗并原样还原给内层解释器。同时，由于外层 cmd 在解析命令行时会先展开 `%VAR%` 与 `!VAR!`，若变量包含双引号或操作符（如 `set X="A&echo OUTSIDE&rem "`），展开后会改变外层引用状态并突破保护执行额外命令；在实现可靠的内层变量机制前，统一拦截并拒绝所有含有 `%` 或 `!` 的环境变量展开（`ErrExecutionValidation`）。拒绝未闭合的奇数双引号与非法换行符/空字符。新增单元测试及 Wine 原生探测用例覆盖。
 2. **SFTP 未配置执行保留旧入口兼容性**：SFTP `handleExec` 在未配置 `execution`（`execCfg == nil`）时，保留旧入口兼容分发：交互模式调用 `RunInteractiveCmdWithIO`，batch 模式调用 `RunCommandWithIO`，避免直接进入要求非 Linux 原生文件可取消适配的严格输出接口（`RunCommandPlanWithIO` / `RunInteractivePlanWithIO`），确保 macOS 和 Windows 上终端与管道正常输出。
 3. **SFTP batch 执行保留非登录默认语义**：未配置 `execution` 时的 batch 执行通过旧入口执行非登录 `bash -c`；已配置且未显式指定 `login` 的 Bash batch 执行在规划时明确将 `opts.Login` 设置为 `LoginDisabled`，避免 `nil.CommandOptions()` 默认引入 `bash -l -c` 从而改变 PATH 或混入登录横幅。
+
+## P3 验证记录：发布默认切换、脚本拦截与原生多平台实机证据（2026-10-10）
+
+本批完成上列 P3 全部发布默认切换与验收条目：
+1. **发布默认统一切换至 server**：
+   - CLI（`xops exec`、`xops ssh`）、MCP（`xops_ssh_run`）、Playbook（`shell` step）以及 core（`CommandOptions`、`EffectiveInterpreter`）统一将未指定或缺省的解释器切换为 `server`，启动方言缺省为 `unknown`，登录模式为 `inherit`。直接将用户命令原样放入 SSH `exec` 请求，消除对远端 Bash 的隐式依赖。
+   - 显式兼容配置：依赖旧 Bash 环境的节点或工作流可通过显式配置 `execution: { interpreter: bash, launch_dialect: posix, login: true }` 固定；CLI `--no-login` 保留兼容语义（未指定解释器时激活兼容非登录 Bash 路径）。
+   - `server` 解释器仅支持 `Login == nil`（继承模式），显式指定 `login: enabled/disabled/true/false` 均被静态校验拒绝；`ResolveExecution` 在子配置为 `server` 时安全忽略父级 `login` 设定，避免意外继承非法登录模式。
+2. **无可靠解释器的脚本执行前拦截**：
+   - 在执行前对脚本统一调用 `ssh.ResolveScriptExecution` 解析解释器；无显式指定解释器且无白名单 shebang（或缺失/不受支持 shebang）的脚本，直接返回 `ErrExecutionValidation: server interpreter cannot be used for scripts` 并在本地拦截拒绝，禁止将 server 模式盲目用于脚本执行。
+3. **提权与 SFTP 边界**：
+   - Unix 提权（`sudo`/`su`）在未配置 execution 时保留传统 Unix Bash 提权兼容行为；显式指定 `server` 解释器执行提权时在执行前严格拒绝。
+   - SFTP `exec` 全面接入 `FormatWorkingDirCommand` 与 `PlanCommand`；默认 `server` 解释器在工作目录非空时显式拒绝（`server interpreter does not support inheriting working directory`），防止相对路径操作静默在远端 HOME 目录下误执行；`cwd == ""` 时直通原样执行。
+4. **原生 Windows 与无 Bash Unix 平台实机证据**：
+   - **原生 Windows OpenSSH**：
+     - 默认模式：`./bin/xops ssh vm dir` 与 `./bin/xops exec --host vm -c dir` 成功在远端默认 cmd.exe 环境下直接列出目录（退出码 0，不再报错 `'bash' 不是内部或外部命令`）。
+     - 显式解释器：PowerShell（`Get-Date`）、pwsh（`$PSVersionTable.PSVersion` 输出 7.6.6）、cmd（`echo HelloFromCmd`）均成功执行并通过退出码校验。
+     - 脚本拦截：无 shebang 脚本执行直接报错 `server interpreter cannot be used for scripts` 并在本地拦截。
+   - **无 Bash Unix 平台（Alpine Linux Docker 容器，仅 BusyBox ash/sh，确认无 bash）**：
+     - 默认模式：`./bin/xops ssh root@127.0.0.1:22222 uname -a` 与 `./bin/xops exec --host alpine-test -c 'uname -m'`（输出 x86_64）在纯 ash 环境下成功原生执行。
+     - 脚本分发：包含 `#!/bin/sh` 的脚本经由 stdin 正确传给 `/bin/sh` 执行成功（输出 `Running on Linux in shell sh`）；包含 `#!/bin/bash` 的脚本在远端返回状态码 127 `sh: bash: not found`；无 shebang 脚本执行在本地拦截拒绝。
+5. **全量验收指标**：
+   - `go build ./...`：通过
+   - `go test ./...`：全量通过
+   - `golangci-lint run ./...`：0 issues
+   - `python3 scripts/check_core.py`：三平台依赖边界及抽取模块 build/test 全量通过
+   - `npm run docs:build`：通过
+
 
 

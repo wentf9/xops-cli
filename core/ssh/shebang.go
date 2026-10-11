@@ -134,14 +134,11 @@ func determineScriptInterpreter(step, settings, node, global *ExecutionConfig, s
 // Explicitly selecting the server interpreter in step or settings returns an error.
 // If the script declares an unsupported shebang without an explicit step or settings
 // override, an error is returned.
-// If no execution config is configured anywhere across all layers, it returns (nil, nil)
-// indicating legacy mode.
-// If execution config is present but no valid non-server script interpreter can be
+// In Phase P3, scripts use the unified model by default and fail before execution
+// if no reliable interpreter is available.
+// If execution config is present or defaulted but no valid non-server script interpreter can be
 // determined, an error is returned.
 func ResolveScriptExecution(step, settings, node, global *ExecutionConfig, scriptBytes []byte) (*ExecutionConfig, error) {
-	if !isExecutionConfigured(step) && !isExecutionConfigured(settings) && !isExecutionConfigured(node) && !isExecutionConfigured(global) {
-		return nil, nil
-	}
 
 	targetInterp, err := determineScriptInterpreter(step, settings, node, global, scriptBytes)
 	if err != nil {

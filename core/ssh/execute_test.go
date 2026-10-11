@@ -215,12 +215,26 @@ func TestRunCommandWithIO_MockServer(t *testing.T) {
 			t.Errorf("expected stdout 'mock_output\\n', got %q", stdout.String())
 		}
 		rec := <-recordedCh
-		expectedCmd := "bash -c 'echo hello'"
+		expectedCmd := "echo hello"
 		if rec.cmd != expectedCmd {
 			t.Errorf("expected command %q, got %q", expectedCmd, rec.cmd)
 		}
 		if !rec.stdinEOF {
 			t.Error("expected command stdin EOF")
+		}
+
+		// Explicit Bash execution
+		cBash := newClient(rawClient, nil, &ClientConfig{
+			SudoMode:  SudoModeNone,
+			Execution: &ExecutionConfig{Interpreter: InterpreterBash},
+		}, nil, "")
+		var stdoutBash, stderrBash bytes.Buffer
+		if err := cBash.RunCommandWithIO(ctx, "echo hello", false, nil, &stdoutBash, &stderrBash); err != nil {
+			t.Fatalf("RunCommandWithIO with bash failed: %v", err)
+		}
+		recBash := <-recordedCh
+		if recBash.cmd != "bash -c 'echo hello'" {
+			t.Errorf("expected bash command, got %q", recBash.cmd)
 		}
 	})
 
