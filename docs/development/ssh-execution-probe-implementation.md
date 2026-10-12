@@ -2,11 +2,55 @@
 
 ## 当前范围
 
-已完成设计路线图的 **M1（Core 协议）、M2（Client 缓存）与 M3（CLI 添加/导入与诊断）**。Core 入口为
+已完成设计路线图的 **M1–M4**，包括 Core 协议、连接缓存、录入与诊断、受限操作懒加载。Core 入口为
 `(*ssh.Client).ProbeExecutionConfig(ctx)`，复用已经认证的连接，无需新建 TCP 连接或重新鉴权。
 
-**待接入**：直接 SSH/exec 动态录入的凭据记忆生命周期、M4 的 Playbook script/ensure 及 SFTP cwd
-懒加载。普通命令执行不会主动探测或在失败后重放；M3 对新节点持久化的推荐会参与后续配置解析。
+普通命令执行不会因为执行失败而探测或重放。首次动态录入可在用户允许记忆凭据时单独触发录入探针；
+script/ensure/cwd 的受限操作探测只缓存结果，录入探测则随新节点原子保存推荐配置。
+
+## M4 与动态录入
+
+- `NeedsExecutionProbe` 仅识别未指定解释器、未知方言且继承 login 的配置。任何显式解释器
+  （包括 server）、已知方言或显式 login 均不会被覆盖。
+- Playbook 无 shebang 的 script 可在上述缺省环境下探测；BOM、不支持的 shebang 和显式执行配置
+  继续按原校验规则处理。白名单 shebang 不能证明外层方言，不额外触发探测。
+- ensure 在检查之前探测并冻结配置，检查、action、复查使用相同配置。当前只允许 POSIX bash/sh；
+  Windows script/ensure 会在用户代码开始前拒绝，不做语法翻译。
+- SFTP 非空 cwd 的 exec 在需要时探测。CMD 的普通推荐仍为 server，但受限操作会选用已安装的
+  PowerShell/pwsh/cmd 适配器。空 cwd 的普通命令不探测。Windows SFTP 驱动器路径转换受 Windows
+  适配器约束；跨平台 pwsh 使用自身 `$IsWindows` 在执行时选择路径，不依赖探测缓存，
+  Linux pwsh 的 POSIX 路径不转换。`/C:` 驱动器根目录会转换成绝对路径 `C:/`。
+- 缓存由物理连接的 PooledClient 共享，重新获取的 Client 包装对象也复用同一成功或失败结果。
+  `CachedExecutionProbe` 不发起网络操作、不等待正在进行的探测，并返回深拷贝。
+- 新增可选 Core `AuthenticatedConnectionConfirmer` 能力，在认证成功后、节点确认及凭据写入前
+  接收已认证 Client，禁止保留/关闭它或执行用户命令。旧 ConnectionConfirmer 保持回退行为。
+- CLI 仅在允许记忆凭据时启用 `WithEnrollmentProbing`。适配器再检查非交互、录入选项、Remember、
+  pending 节点及缺省执行配置；已有节点、会话凭据、非交互批处理和显式配置均不探测。
+  CLI 通过 `WithEnrollmentProbeExclusions` 按节点排除显式执行参数的目标，包括 `--interpreter`、
+  `--launch-dialect`、`--login-shell` 和 `--no-login`（含显式 false）。排除不影响凭据记忆、
+  正常节点录入及其他节点的探测策略；CLI 执行参数仅用于本次会话，不自动写入节点。
+  认证失败不探测、不新增节点；探针失败只警告，继续原有认证成功录入。
+  若底层传输已出现读写错误或关闭，Core 保留已确认节点，但返回连接错误，不记录凭据、
+  不发布失效连接、不执行用户命令。该检查复用传输状态，不增加网络请求或监控 goroutine。
+- `ConfirmNodeWithExecutionContext` 在原节点确认事务中加入推荐，不改变认证/提权字段版本，
+  保留并发修改冲突和已应用但持久性不确定的错误语义；已确认的节点不会被后到探针覆盖。
+  当前 Client 仅采用仓库实际发布的 execution，普通命令失败不重试。
+
+M4 测试覆盖 sh-only script、ensure action/复查冻结、缓存共享、失败不派发用户代码、显式/非法脚本
+不探测、Windows 拒绝 POSIX 工作流、SFTP POSIX/CMD/pwsh cwd、平台帧及动态记忆策略/原子保存。
+`vm` 的真实 SFTP 批处理已验证 `/C:/Users/...` cwd 的自动探测与命令执行，退出码为 0。
+M4 的 Core、adapter、SFTP、Playbook 四组相关测试已在 `vm` 原生执行，返回码均为 0；Core 组
+包含原生 cmd.exe、Windows PowerShell 与 pwsh 载荷验证。其余工作流测试使用隔离 SSH 协议服务端，
+不代表在 Windows 上执行了 POSIX 脚本。远端临时测试程序已全部清理。本地完整构建、全量测试、相关
+包 Race 检查与全量 Lint 通过；Windows 原生回归未启用 Race。
+
+M4 review 修复补充：断连录入回归连续运行 100 次通过；新增传输首个错误保持、失效连接不入池、
+显式 pwsh 冷连接及驱动器根目录回归。`vm` 原生 Core、adapter、SFTP 回归均通过，
+包含真实 pwsh 的带引号目录切换；Linux 原生 pwsh 验证同形 POSIX 路径保持不变。
+测试程序及下载的便携解释器均已清理。CLI 覆盖参数回归覆盖 SSH 和交互式 exec 的
+默认探测、显式参数排除、连接缓存与磁盘保存、凭据记忆及其他节点不受排除影响。
+该 CLI 回归的 12 个场景在 `vm` 原生 Windows 上全部通过，临时程序已清理；新增回归的 Race、
+完整构建、全量测试与 Lint 均通过。主机密钥记录使用测试专属临时文件。
 
 ## M3 接入与保存约束
 
@@ -48,7 +92,8 @@ known_hosts，或因回环端口复用造成主机密钥冲突。相关录入 Ra
   最多 1 秒的关闭宽限期。调用者的更短 deadline 或取消优先。
 - 复用 `ExecuteCommand` 的有界输出、取消与通道关闭机制，不新增后台探测 goroutine。
   对端通道无法回收时沿用现有行为，中断共享 transport，可能影响该连接上的其他任务。
-- 每个 Client 只执行一次探测，包括失败结果。并发调用共享该次尝试，等待者可独立取消；
+- 每个 Connector 管理的 SSH 连接只执行一次探测，包括失败结果，池中的 Client 包装对象共享缓存。
+  并发调用共享该次尝试，等待者可独立取消；
   首个调用者取消会终止并缓存该次失败。重新连接后可重新探测。
 - 返回值为深拷贝，解释器切片与 `Login` 指针均不共享；不改变 Client 的 `Execution()`，
   不写入配置文件。调用方必须先检查错误，再使用推荐配置。
@@ -62,7 +107,8 @@ known_hosts，或因回环端口复用造成主机密钥冲突。相关录入 Ra
 `%COMSPEC%` 或 `$PSVersionTable`，并验证展开值，避免将 PowerShell DefaultShell 误判为 CMD。
 
 PowerShell 阶段二直接执行静态 PowerShell 查询，不依赖 `powershell.exe`，支持仅安装 pwsh 的
-DefaultShell。此时不能凭 PowerShell 版本推断 Windows 或实际 Shell 路径，相关元数据留空。
+DefaultShell。阶段一另输出 `[Environment]::OSVersion.Platform` 平台帧，明确识别 Windows_NT 或
+Unix 平台；无有效平台帧时 OS 留空。Shell 路径仍留空，不凭 PowerShell 版本推断 OS 或路径。
 POSIX 的 `RemoteShellPath` 来自 `$SHELL`，仅作环境元数据，不作为方言判断的唯一依据。
 
 Review 后补充两项协议修正：POSIX 首探使用 `if :; then ...; fi` 语法保护，避免 Linux
@@ -104,6 +150,7 @@ go build ./...
 go test ./...
 go test -race ./core/ssh ./core/testutil/sshfixture
 go test -race ./cmd/host ./pkg/adapter ./pkg/config
+go test -race ./cmd/sftpshell ./pkg/playbook
 golangci-lint run ./...
 # 原生解释器回归测试；在目标平台运行，未安装的解释器会跳过
 go test ./core/ssh -run '^TestProbeShell' -count=1 -v

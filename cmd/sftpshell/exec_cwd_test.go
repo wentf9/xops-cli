@@ -296,11 +296,11 @@ func TestHandleExec_BatchExecution_InterpretersEndToEnd(t *testing.T) {
 		verifyPayload func(t *testing.T, payload string)
 	}{
 		{
-			name:      "unconfigured execution rejects non-empty cwd under server default",
+			name:      "unconfigured execution fails safely when cwd probe has no valid response",
 			execution: nil,
 			cwd:       "/var/log",
 			args:      []string{"ls", "-la"},
-			wantErr:   "server interpreter does not support inheriting working directory",
+			wantErr:   "SSH execution probe failed",
 		},
 		{
 			name:      "unconfigured execution with empty cwd runs server command directly",

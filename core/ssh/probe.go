@@ -7,11 +7,28 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 // ErrExecutionProbe identifies an inconclusive or failed execution probe.
 var ErrExecutionProbe = errors.New("SSH execution probe failed")
+
+type executionProbeCache struct {
+	mu     sync.Mutex
+	done   chan struct{}
+	result *ProbeResult
+	err    error
+}
+
+func (c *Client) executionProbeCache() *executionProbeCache {
+	c.probeMu.Lock()
+	defer c.probeMu.Unlock()
+	if c.probeCache == nil {
+		c.probeCache = &executionProbeCache{}
+	}
+	return c.probeCache
+}
 
 const (
 	probeCommandTimeout = 2 * time.Second
@@ -25,7 +42,7 @@ const (
 	// Probe the outer shell itself: invoking cmd.exe under PowerShell would
 	// otherwise incorrectly identify a PowerShell DefaultShell as CMD.
 	probeCmd               = `echo __XOPS_DIALECT_CMD__:%COMSPEC%`
-	probePowerShell        = `Write-Output ('__XOPS_DIALECT_POWERSHELL__:' + $PSVersionTable.PSVersion.ToString())`
+	probePowerShell        = `Write-Output ('__XOPS_DIALECT_POWERSHELL__:' + $PSVersionTable.PSVersion.ToString()); Write-Output ('__XOPS_PLATFORM__:' + [Environment]::OSVersion.Platform)`
 	probePOSIXInterpreters = `for i in bash sh powershell pwsh cmd; do if command -v "$i" >/dev/null 2>&1; then printf '__XOPS_INTERP__:%s\n' "$i"; fi; done; printf '__XOPS_INTERP_END__\n'`
 	// Optional failed lookups must not become the enumeration's exit status.
 	// Parenthesize the end echo so the separator adds no trailing frame space.
@@ -61,7 +78,7 @@ func (r *ProbeResult) clone() *ProbeResult {
 }
 
 // ProbeExecutionConfig performs one read-only, bounded two-stage probe per
-// authenticated Client lifetime. Concurrent callers share that attempt; each
+// authenticated SSH connection lifetime (including pooled wrappers). Callers share that attempt; each
 // waiter can cancel independently. Failures are cached as well, preventing
 // repeated probes of restricted servers. The initiating caller owns the probe
 // context; its cancellation is cached. Returned snapshots can be mutated safely.
@@ -77,26 +94,27 @@ func (c *Client) ProbeExecutionConfig(ctx context.Context) (*ProbeResult, error)
 	if c == nil || c.sshClient == nil {
 		return nil, fmt.Errorf("%w: SSH client is not connected", ErrExecutionProbe)
 	}
-	c.probeMu.Lock()
-	if done := c.probeDone; done != nil {
-		c.probeMu.Unlock()
+	cache := c.executionProbeCache()
+	cache.mu.Lock()
+	if done := cache.done; done != nil {
+		cache.mu.Unlock()
 		select {
 		case <-ctx.Done():
 			return nil, fmt.Errorf("%w: wait for cached result: %w", ErrExecutionProbe, ctx.Err())
 		case <-done:
-			c.probeMu.Lock()
-			defer c.probeMu.Unlock()
-			return c.probeCache.clone(), c.probeErr
+			cache.mu.Lock()
+			defer cache.mu.Unlock()
+			return cache.result.clone(), cache.err
 		}
 	}
-	c.probeDone = make(chan struct{})
-	c.probeMu.Unlock()
+	cache.done = make(chan struct{})
+	cache.mu.Unlock()
 
 	result, err := c.probeExecution(ctx)
-	c.probeMu.Lock()
-	defer c.probeMu.Unlock()
-	c.probeCache, c.probeErr = result, err
-	close(c.probeDone)
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	cache.result, cache.err = result, err
+	close(cache.done)
 	return result.clone(), err
 }
 
@@ -227,9 +245,13 @@ func parseProbeDialect(output, command string) (LaunchDialect, string, string) {
 		}
 	case probePowerShell:
 		if frame, ok := probeFrame(output, "__XOPS_DIALECT_POWERSHELL__:"); ok && validProbeVersion(frame) {
-			// PowerShell Core may be a Unix DefaultShell; do not infer OS
-			// or an executable path from the language version alone.
-			return LaunchPowerShell, "", ""
+			// Use the explicit platform query, never the language version, to
+			// distinguish Windows PowerShell Core from Unix DefaultShells.
+			remoteOS := ""
+			if platform, found := probeFrame(output, "__XOPS_PLATFORM__:"); found {
+				remoteOS = map[string]string{"Win32NT": "Windows_NT", "Unix": "Unix", "MacOSX": "Darwin"}[platform]
+			}
+			return LaunchPowerShell, remoteOS, ""
 		}
 	}
 	return LaunchUnknown, "", ""

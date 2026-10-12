@@ -407,7 +407,7 @@ func (e *Engine) runScript(ctx context.Context, client *ssh.Client, scriptPath s
 		settingsExec = e.pb.Settings.Execution
 	}
 
-	resolvedExec, err := ssh.ResolveScriptExecution(stepExec, settingsExec, node.Execution, globalExec, content)
+	resolvedExec, err := e.resolveRuntimeScriptExecution(ctx, client, stepExec, settingsExec, node.Execution, globalExec, content)
 	if err != nil {
 		return StepResult{
 			Status:    StatusFailed,
@@ -540,12 +540,7 @@ func extractEnsureFrame(output, marker string) (string, uint32, bool) {
 }
 
 func (e *Engine) executeEnsureCheck(ctx context.Context, client *ssh.Client, checkCmd string, stepExec *ssh.ExecutionConfig, sudo bool, node models.Node) (string, uint32, StepResult) {
-	globalExec := e.globalExecution()
-	var settingsExec *ssh.ExecutionConfig
-	if e.pb != nil {
-		settingsExec = e.pb.Settings.Execution
-	}
-	effectiveExec, err := ssh.EffectiveExecution(stepExec, settingsExec, node.Execution, globalExec)
+	effectiveExec, err := e.resolveEnsureExecution(ctx, client, stepExec, node)
 	if err != nil {
 		return "", 0, StepResult{
 			Status:    StatusFailed,
@@ -555,25 +550,13 @@ func (e *Engine) executeEnsureCheck(ctx context.Context, client *ssh.Client, che
 		}
 	}
 
-	if effectiveExec != nil && effectiveExec.EffectiveInterpreter() == ssh.InterpreterServer {
-		return "", 0, StepResult{
-			Status:    StatusFailed,
-			Outcome:   ssh.ExecutionNotStarted,
-			Retryable: false,
-			Err:       fmt.Errorf("ensure check unsupported with server interpreter: cannot verify check result origin without controlled shell adapter"),
-		}
-	}
-
 	marker := fmt.Sprintf("__XOPS_ENSURE_%s__", generateEnsureNonce())
 	wrappedCheck := fmt.Sprintf("{\n  trap 'printf \"\\n%s:%%d\\n\" \"$?\"' EXIT\n  %s\n}", marker, checkCmd)
 
-	if effectiveExec != nil {
-		if sudo {
-			return e.executeEnsureCheckSudo(ctx, client, wrappedCheck, marker, effectiveExec)
-		}
-		return e.executeEnsureCheckPlanned(ctx, client, wrappedCheck, marker, effectiveExec)
+	if sudo {
+		return e.executeEnsureCheckSudo(ctx, client, wrappedCheck, marker, effectiveExec)
 	}
-	return e.executeEnsureCheckLegacy(ctx, client, wrappedCheck, marker, sudo)
+	return e.executeEnsureCheckPlanned(ctx, client, wrappedCheck, marker, effectiveExec)
 }
 
 func (e *Engine) executeEnsureCheckSudo(ctx context.Context, client *ssh.Client, wrappedCheck, marker string, effectiveExec *ssh.ExecutionConfig) (string, uint32, StepResult) {
@@ -706,69 +689,6 @@ func (e *Engine) executeEnsureCheckPlanned(ctx context.Context, client *ssh.Clie
 	return cleanOut, code, StepResult{Status: StatusOK, Outcome: ssh.ExecutionCompleted, Output: cleanOut}
 }
 
-func (e *Engine) executeEnsureCheckLegacy(ctx context.Context, client *ssh.Client, wrappedCheck, marker string, sudo bool) (string, uint32, StepResult) {
-	var (
-		out      string
-		checkErr error
-	)
-	if sudo {
-		out, checkErr = client.RunWithSudo(ctx, wrappedCheck)
-	} else {
-		out, checkErr = client.Run(ctx, wrappedCheck, ssh.WithInterpreter(ssh.InterpreterBash))
-	}
-	if checkErr != nil {
-		ec, sig, hasExit, cleanupErr, ioErr, otherErr, isCanceled := classifySessionError(checkErr)
-		if isCanceled || otherErr != nil || !hasExit {
-			return "", 0, StepResult{
-				Status:    StatusFailed,
-				Outcome:   ssh.ExecutionUnknown,
-				Output:    out,
-				Err:       fmt.Errorf("ensure check execution failed: %w", checkErr),
-				Retryable: false,
-			}
-		}
-		if cleanupErr != nil || ioErr != nil {
-			cleanOut, _, _ := extractEnsureFrame(out, marker)
-			return cleanOut, 0, StepResult{
-				Status:     StatusFailed,
-				Outcome:    ssh.ExecutionCompleted,
-				ExitCode:   ec,
-				Signal:     sig,
-				CleanupErr: cleanupErr,
-				IOErr:      ioErr,
-				Output:     cleanOut,
-				Err:        fmt.Errorf("ensure check had I/O or cleanup error: %w", checkErr),
-				Retryable:  false,
-			}
-		}
-		if sig != "" {
-			cleanOut, _, _ := extractEnsureFrame(out, marker)
-			return cleanOut, 0, StepResult{
-				Status:    StatusFailed,
-				Outcome:   ssh.ExecutionCompleted,
-				Signal:    sig,
-				Output:    cleanOut,
-				Err:       fmt.Errorf("ensure check terminated by signal %s", sig),
-				Retryable: false,
-			}
-		}
-	}
-	cleanOut, code, ok := extractEnsureFrame(out, marker)
-	if !ok {
-		ec, sig, _ := parseExitError(checkErr)
-		return cleanOut, 0, StepResult{
-			Status:    StatusFailed,
-			Outcome:   ssh.ExecutionCompleted,
-			ExitCode:  ec,
-			Signal:    sig,
-			Output:    cleanOut,
-			Err:       fmt.Errorf("ensure check result frame missing (check was not reached or exited prematurely), action not executed"),
-			Retryable: false,
-		}
-	}
-	return cleanOut, code, StepResult{Status: StatusOK, Outcome: ssh.ExecutionCompleted, Output: cleanOut}
-}
-
 // runEnsure 执行幂等性状态收敛：先 check，确认不满足时执行 action，再验证。
 //
 // 结果协议：
@@ -778,6 +698,12 @@ func (e *Engine) executeEnsureCheckLegacy(ctx context.Context, client *ssh.Clien
 //   - 再次 check 通过 (exit 0) → StatusChanged（修复成功）
 //   - 再次 check 失败 → StatusFailed（修复后仍不满足）
 func (e *Engine) runEnsure(ctx context.Context, client *ssh.Client, spec *EnsureSpec, stepExec *ssh.ExecutionConfig, sudo bool, node models.Node) StepResult {
+	// Freeze the controlled adapter across check, action and verification.
+	resolved, err := e.resolveEnsureExecution(ctx, client, stepExec, node)
+	if err != nil {
+		return StepResult{Status: StatusFailed, Outcome: ssh.ExecutionNotStarted, Err: err}
+	}
+	stepExec = resolved
 	cleanOut, checkCode, checkRes := e.executeEnsureCheck(ctx, client, spec.Check, stepExec, sudo, node)
 	if checkRes.Status == StatusFailed {
 		return checkRes

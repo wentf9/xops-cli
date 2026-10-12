@@ -1,5 +1,14 @@
 # SFTP and file transfer
 
+SFTP `exec` with a nonempty current directory probes unspecified execution settings before sending user
+work. The bounded, read-only result is cached for the connection and is not written to disk. Linux uses
+bash/sh; Windows CMD prefers installed PowerShell for cwd support, falling back to CMD when needed.
+Explicit interpreter choices are preserved, and explicit `server` still rejects a nonempty cwd. Empty-cwd
+ordinary commands do not probe. A failed probe stops before user work and never retries it under another
+interpreter. Windows `/C:/...` SFTP paths become `C:/...`, and the drive root `/C:` becomes `C:/`.
+Cross-platform pwsh selects paths using its own `$IsWindows`, including explicit configurations on cold
+connections without a probe cache. POSIX paths are preserved.
+
 In batch mode, `lls`/`lll` and remote `ls`/`ll` fail on missing paths or directory read errors. A listing failure in any wildcard match stops the remaining matches and subsequent commands.
 
 Piped or file input automatically uses batch mode: the first command failure stops execution with a nonzero exit status, without running later commands or writing interactive history. Batch `exec` uses no PTY; `exec` and `lexec` receive EOF on stdin so they cannot consume subsequent SFTP commands. `shell/lshell` require a terminal. Operations requiring confirmation fail unless an existing force/no-clobber option resolves it. Commands are limited to 1 MiB per line. Interactive command errors allow correction and continuation; connection or output failures still terminate the session.

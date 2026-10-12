@@ -357,6 +357,10 @@ func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuratio
 		adpOpts = append(adpOpts, adapter.WithCredentialSource(reg))
 	}
 	if shouldRemember {
+		adpOpts = append(adpOpts, enrollmentProbeOption())
+		if o.execution.enabled() || o.execution.noLoginSet {
+			adpOpts = append(adpOpts, adapter.WithEnrollmentProbeExclusions(nodeID))
+		}
 		persistence, err := o.interaction.automaticPersistenceOptions(repository, cfg)
 		if err != nil {
 			return nil, err

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+
+	"github.com/wentf9/xops-cli/core/ssh"
 )
 
 type pendingConnection struct {
@@ -95,6 +97,36 @@ func (r *Repository) connectionProvider(nodeID string) *Provider {
 // A failed save leaves the pending connection available for an explicit retry;
 // an applied write is never rolled back, even if durability is uncertain.
 func (r *Repository) ConfirmNodeContext(ctx context.Context, nodeID string) error {
+	return r.confirmNodeContext(ctx, nodeID, nil)
+}
+
+// PendingNodeExecution returns a defensive execution snapshot only for a new,
+// unconfirmed node. Saved and OpenSSH virtual nodes are never enrollment targets.
+func (r *Repository) PendingNodeExecution(nodeID string) (*ssh.ExecutionConfig, bool) {
+	if r == nil {
+		return nil, false
+	}
+	r.pendingMu.RLock()
+	defer r.pendingMu.RUnlock()
+	pending := r.pending[nodeID]
+	if pending == nil {
+		return nil, false
+	}
+	node, ok := pending.provider.GetNode(nodeID)
+	return node.Execution.Clone(), ok
+}
+
+// ConfirmNodeWithExecutionContext includes a successful enrollment probe in the
+// same node-creation transaction. Existing pending execution settings win.
+func (r *Repository) ConfirmNodeWithExecutionContext(ctx context.Context, nodeID string, execution *ssh.ExecutionConfig) error {
+	execution = execution.Clone()
+	if err := execution.Validate(); err != nil {
+		return fmt.Errorf("validate enrollment execution: %w", err)
+	}
+	return r.confirmNodeContext(ctx, nodeID, execution)
+}
+
+func (r *Repository) confirmNodeContext(ctx context.Context, nodeID string, execution *ssh.ExecutionConfig) error {
 	if r == nil || ctx == nil {
 		return fmt.Errorf("confirm connection requires repository and context")
 	}
@@ -119,6 +151,9 @@ func (r *Repository) ConfirmNodeContext(ctx context.Context, nodeID string) erro
 	node, host, identity, err := pending.provider.Resolve(nodeID)
 	if err != nil {
 		return fmt.Errorf("resolve pending connection %q: %w", nodeID, err)
+	}
+	if execution != nil && ssh.NeedsExecutionProbe(node.Execution) {
+		node.Execution = execution.Clone()
 	}
 	result, err := r.commitResultContext(ctx, anyRevision, func(cfg *Configuration) error {
 		if existing, ok := cfg.Nodes.Get(nodeID); ok && !reflect.DeepEqual(existing, node) {

@@ -133,7 +133,7 @@ settings:
   timeout: 5m
 ```
 
-Use this only on compatible hosts. Ensure checks reject explicitly configured server mode; unconfigured checks retain a controlled Bash compatibility wrapper. Only a confirmed check result can authorize the action and subsequent verification. Timeout, cancellation, signal, I/O, cleanup, or uncertain startup failures must not be treated as an absent desired state. Retry settings apply to confirmed clean command failures; do not assume every failed attempt is retryable. Script sources and execution settings are frozen within a run, so changing local files/configuration during execution is not an update mechanism.
+Use this only on compatible hosts. Ensure checks reject explicitly configured server mode; unconfigured checks probe once and require a detected POSIX bash/sh adapter. The same adapter is used for check, action and verification. Playbook scripts without a shebang can use the same bounded connection cache when execution is unspecified. Runtime probing does not persist configuration or change ordinary command defaults. Windows script/ensure remains unsupported; SFTP cwd exec can use a detected Windows adapter. Probe failures stop before user work and are not interpreter retries. Only a confirmed check result can authorize the action and subsequent verification. Timeout, cancellation, signal, I/O, cleanup, or uncertain startup failures must not be treated as an absent desired state. Retry settings apply to confirmed clean command failures; do not assume every failed attempt is retryable. Script sources and execution settings are frozen within a run, so changing local files/configuration during execution is not an update mechanism.
 
 ## Interactive and local utilities
 

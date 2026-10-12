@@ -23,9 +23,7 @@ type Client struct {
 	rootConn           net.Conn
 	cfgMu              sync.RWMutex
 	probeMu            sync.Mutex
-	probeDone          chan struct{}
-	probeCache         *ProbeResult
-	probeErr           error
+	probeCache         *executionProbeCache
 	sudoMu             sync.Mutex
 	connCfg            ConnectionConfig
 	provider           ConnectionProvider

@@ -888,12 +888,25 @@ func TestPlaybook_EnsureProtocol_SignalTerminationRejectedSudo(t *testing.T) {
 	}
 }
 
-func TestPlaybook_EnsureProtocol_SignalTerminationRejectedLegacy(t *testing.T) {
+func TestPlaybook_EnsureProtocol_SignalTerminationRejectedAfterProbe(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 
 	server, err := sshfixture.NewWithOptions(ctx, sshfixture.Options{
 		ExecHandler: func(cmd string, ch cryptoSSH.Channel) {
+			if strings.Contains(cmd, "__XOPS_DIALECT_POSIX__") || strings.Contains(cmd, "__XOPS_INTERP__") {
+				output := "__XOPS_INTERP__:bash\n__XOPS_INTERP_END__\n"
+				if strings.Contains(cmd, "__XOPS_DIALECT_POSIX__") {
+					output = "__XOPS_DIALECT_POSIX__:Linux:/bin/bash\n"
+				}
+				if _, err := io.WriteString(ch, output); err != nil {
+					t.Error(err)
+				}
+				if _, err := ch.SendRequest("exit-status", false, cryptoSSH.Marshal(struct{ Status uint32 }{0})); err != nil {
+					t.Error(err)
+				}
+				return
+			}
 			marker := findEnsureMarker(cmd)
 			if marker != "" {
 				_, _ = ch.Write([]byte("\n" + marker + ":0\n"))
@@ -917,7 +930,7 @@ func TestPlaybook_EnsureProtocol_SignalTerminationRejectedLegacy(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = server.Close() })
 
-	// Legacy mode: ExecutionConfig is nil
+	// Missing execution now probes first; signal termination must still fail closed.
 	provider, connector := setupFixtureProvider(t, server, nil)
 
 	pb := &playbook.Playbook{

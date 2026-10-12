@@ -473,6 +473,12 @@ func (o *ExecOptions) buildAdapterOptions(tasks []execHostTask, cfg *config.Conf
 		adpOpts = append(adpOpts, adapter.WithCredentialSource(reg))
 	}
 	if remember {
+		adpOpts = append(adpOpts, enrollmentProbeOption())
+		if o.execution.enabled() || o.execution.noLoginSet {
+			for _, task := range tasks {
+				adpOpts = append(adpOpts, adapter.WithEnrollmentProbeExclusions(task.nodeID))
+			}
+		}
 		persistence, err := o.interaction.automaticPersistenceOptions(repository, cfg)
 		if err != nil {
 			return nil, err

@@ -16,14 +16,53 @@ type sshActivityConn struct {
 	net.Conn
 	startedAt time.Time
 	lastRead  atomic.Int64
+	failure   atomic.Pointer[sshTransportFailure]
 }
+
+type sshTransportFailure struct{ err error }
 
 func (c *sshActivityConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
 	if n > 0 {
 		c.lastRead.Store(int64(time.Since(c.startedAt)))
 	}
+	c.recordFailure(err)
 	return n, err
+}
+
+func (c *sshActivityConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	c.recordFailure(err)
+	return n, err
+}
+
+func (c *sshActivityConn) Close() error {
+	c.recordFailure(net.ErrClosed)
+	return c.Conn.Close()
+}
+
+func (c *sshActivityConn) recordFailure(err error) {
+	if err != nil {
+		c.failure.CompareAndSwap(nil, &sshTransportFailure{err: err})
+	}
+}
+
+// transportError reports already observed terminal I/O without a request or a
+// watcher goroutine. SSH treats a packet transport read/write error as fatal.
+// It does not promise that an apparently healthy peer will remain connected.
+func (c *Client) transportError() error {
+	if c == nil || c.sshClient == nil {
+		return net.ErrClosed
+	}
+	if conn, ok := c.sshClient.Conn.(*activitySSHConn); ok {
+		if failure := conn.activity.failure.Load(); failure != nil {
+			return failure.err
+		}
+	}
+	if root, ok := c.rootConn.(*physicalSSHConn); ok && root.closed.Load() {
+		return net.ErrClosed
+	}
+	return nil
 }
 
 func (c *sshActivityConn) readIdle() time.Duration {
