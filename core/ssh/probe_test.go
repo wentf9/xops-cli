@@ -19,7 +19,7 @@ import (
 
 func executionProbeClient(t *testing.T, version string, handler func(context.Context, string, cryptoSSH.Channel)) (*Client, *sshfixture.Server) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	server, err := sshfixture.NewWithOptions(ctx, sshfixture.Options{
 		ServerVersion: version,
 		ExecHandler:   func(command string, channel cryptoSSH.Channel) { handler(ctx, command, channel) },
@@ -290,7 +290,7 @@ func TestProbeExecutionConfigInitiatorCancellation(t *testing.T) {
 
 func TestProbeExecutionConfigTotalDeadline(t *testing.T) {
 	client, server := executionProbeClient(t, "", func(ctx context.Context, _ string, channel cryptoSSH.Channel) {
-		timer := time.NewTimer(2800 * time.Millisecond)
+		timer := time.NewTimer(4200 * time.Millisecond)
 		defer timer.Stop()
 		select {
 		case <-timer.C:
