@@ -38,9 +38,9 @@ func TestProbeShellDialects(t *testing.T) {
 			if tt.dialect == LaunchPowerShell {
 				// Warm up JIT/CLR runtime cache and utility cmdlets so slow runner
 				// cold-start does not consume the probeCommandTimeout.
-				warmupCtx, warmupCancel := context.WithTimeout(t.Context(), 5*time.Second)
+				warmupCtx, warmupCancel := context.WithTimeout(t.Context(), 10*time.Second)
 				defer warmupCancel()
-				_ = exec.CommandContext(warmupCtx, shell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Get-Command -CommandType Application sh -ErrorAction SilentlyContinue; exit 0").Run()
+				_ = exec.CommandContext(warmupCtx, shell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Get-Command -CommandType Application bash,sh,powershell,pwsh,cmd -ErrorAction SilentlyContinue; exit 0").Run()
 			}
 			client, _ := executionProbeClient(t, "", func(ctx context.Context, payload string, channel cryptoSSH.Channel) {
 				output, status := runProbeShell(t, ctx, shell, tt.dialect, payload, nil)
@@ -111,7 +111,7 @@ func TestProbeShellCmdMissingInterpreters(t *testing.T) {
 
 func runProbeShell(t *testing.T, ctx context.Context, shell string, dialect LaunchDialect, payload string, env []string) (string, uint32) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	args := []string{"-c", payload}
 	switch dialect {
