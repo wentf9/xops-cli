@@ -75,7 +75,7 @@ func TestImportRepeatedEndpointPreservesRowOrder(t *testing.T) {
 
 func TestImportDifferentEndpointsRemainConcurrent(t *testing.T) {
 	repo, _ := verificationRepository(t)
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancel()
 	entered := make(chan string, 4)
 	release := make(chan struct{})

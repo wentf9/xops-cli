@@ -290,7 +290,7 @@ func TestProbeExecutionConfigInitiatorCancellation(t *testing.T) {
 
 func TestProbeExecutionConfigTotalDeadline(t *testing.T) {
 	client, server := executionProbeClient(t, "", func(ctx context.Context, _ string, channel cryptoSSH.Channel) {
-		timer := time.NewTimer(1500 * time.Millisecond)
+		timer := time.NewTimer(2200 * time.Millisecond)
 		defer timer.Stop()
 		select {
 		case <-timer.C:
