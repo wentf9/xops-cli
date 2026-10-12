@@ -31,9 +31,9 @@ func (c *Client) executionProbeCache() *executionProbeCache {
 }
 
 const (
-	probeCommandTimeout = 2 * time.Second
+	probeCommandTimeout = 2500 * time.Millisecond
 	// Reserve one second for ExecuteCommand's bounded channel shutdown.
-	probeWorkTimeout = 4 * time.Second
+	probeWorkTimeout = 6 * time.Second
 	probeOutputLimit = 16 << 10
 
 	// The POSIX if/then grammar is intentional: PowerShell 7 can also parse

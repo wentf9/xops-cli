@@ -55,7 +55,7 @@ Use `xops identity --help` for identity operations, or `xops tui` for the [termi
 
 For new nodes, `host add` and `host import` (including the `host load` alias) reuse the authenticated
 verification connection to detect the launch dialect and available interpreters. The recommendation is
-saved with the node. Probing takes at most approximately five seconds; a failed probe reports a warning
+saved with the node. Probing takes at most approximately seven seconds; a failed probe reports a warning
 and leaves execution unspecified without preventing an authenticated node from being saved. Existing
 imported nodes are not automatically reprobed and retain their execution settings.
 
