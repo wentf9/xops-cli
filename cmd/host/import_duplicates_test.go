@@ -46,7 +46,7 @@ func TestImportRepeatedEndpointPreservesRowOrder(t *testing.T) {
 					wantAliases = append(wantAliases, row.Alias)
 				}
 				wantErr := errors.New("verification rejected")
-				verify := func(context.Context, *config.Repository, string, config.ConnectionSnapshot) error {
+				verify := func(context.Context, *config.Repository, string, *inventoryVerification) error {
 					if mode == "skip" {
 						t.Error("skip-verify attempted verification")
 					}
@@ -79,7 +79,7 @@ func TestImportDifferentEndpointsRemainConcurrent(t *testing.T) {
 	defer cancel()
 	entered := make(chan string, 4)
 	release := make(chan struct{})
-	verify := func(ctx context.Context, _ *config.Repository, id string, draft config.ConnectionSnapshot) error {
+	verify := func(ctx context.Context, _ *config.Repository, id string, draft *inventoryVerification) error {
 		if len(draft.Node.Alias) == 1 {
 			entered <- id
 			select {

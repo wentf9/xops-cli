@@ -51,6 +51,47 @@ Use `xops identity --help` for identity operations, or `xops tui` for the [termi
 
 ## Node execution configuration (`execution`)
 
+### Automatic probing and diagnostics
+
+For new nodes, `host add` and `host import` (including the `host load` alias) reuse the authenticated
+verification connection to detect the launch dialect and available interpreters. The recommendation is
+saved with the node. Probing takes at most approximately five seconds; a failed probe reports a warning
+and leaves execution unspecified without preventing an authenticated node from being saved. Existing
+imported nodes are not automatically reprobed and retain their execution settings.
+
+```bash
+# Verify authentication while skipping the probe; --probe=false also works
+xops host add --address 192.0.2.10 --user deploy --key ~/.ssh/id_ed25519 --no-probe
+xops host import hosts.csv --no-probe
+# Explicit fields take priority; import applies these flags only to new nodes
+xops host add --address 192.0.2.10 --user deploy --key ~/.ssh/id_ed25519 --interpreter sh --launch-dialect posix
+# Diagnose a saved node or alias without saving
+xops host probe web-01
+# Replace only this node's execution settings
+xops host probe web-01 --save
+```
+
+`--skip-verify` also skips probing. `--probe` and `--no-probe` are mutually exclusive. Explicit execution
+fields are preserved; incompatible recommendations produce a warning and only the explicit fields are
+saved. Failed probes never persist partial recommendations.
+
+Probe connections use independent `server/unknown` settings for the target and jumps. Their configured
+command execution settings do not affect connection setup. For example, global `bash/posix` defaults
+do not prevent a new node from specifying only `--interpreter powershell` and having probing fill in
+the Windows launch dialect. Global settings remain unchanged; credentials, host-key checks and jump
+routes still apply.
+
+`host probe` authenticates non-interactively with existing credentials and displays the remote OS,
+shell path, SSH banner, launch dialect, available interpreters and recommendation. Unknown metadata is
+shown as `-`. Only `--save` writes configuration; probe failures and concurrent node edits prevent saving
+and return a nonzero exit status. Linux normally recommends bash, then sh, with login disabled. Windows
+CMD with Windows PowerShell available still recommends `server/cmd`. Probing does not translate commands.
+
+Automatic probing currently covers these CLI addition/import paths. Direct SSH/exec enrollment, TUI
+and runtime lazy probing are not yet connected.
+
+### Manual configuration
+
 In addition to network addresses and authentication identities, you can configure execution parameters (such as interpreter, launch dialect, and login mode) per node in `~/.xops/xops_config.yaml`. This enables `xops exec`, `xops ssh`, Playbooks, and MCP to automatically pick the most suitable execution model:
 
 ```yaml

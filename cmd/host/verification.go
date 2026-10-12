@@ -9,15 +9,23 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/internal/terminal"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 )
 
-type inventoryVerifier func(context.Context, *config.Repository, string, config.ConnectionSnapshot) error
+type inventoryVerification struct {
+	config.ConnectionSnapshot
+	Probe    bool
+	Result   *ssh.ProbeResult
+	ProbeErr error
+}
 
-func verifyInventoryNode(ctx context.Context, repo *config.Repository, nodeID string, bundle config.ConnectionSnapshot) error {
+type inventoryVerifier func(context.Context, *config.Repository, string, *inventoryVerification) error
+
+func verifyInventoryNode(ctx context.Context, repo *config.Repository, nodeID string, bundle *inventoryVerification) error {
 	preview, err := repo.PreviewConnection(nodeID, bundle.Node, bundle.Host, bundle.Identity)
 	if err != nil {
 		return err
@@ -26,7 +34,12 @@ func verifyInventoryNode(ctx context.Context, repo *config.Repository, nodeID st
 	if err != nil {
 		return fmt.Errorf("initialize verification credentials: %w", err)
 	}
-	return adapter.VerifyConnection(ctx, preview, nodeID, registry)
+	if !bundle.Probe {
+		return adapter.VerifyConnection(ctx, preview, nodeID, registry)
+	}
+	result, err := adapter.VerifyConnectionWithProbe(ctx, preview, nodeID, registry)
+	bundle.Result, bundle.ProbeErr = result.Probe, result.ProbeErr
+	return err
 }
 
 func confirmFailedVerification(cmd *cobra.Command, nodeID string, verifyErr error) error {
@@ -51,10 +64,26 @@ func confirmFailedVerification(cmd *cobra.Command, nodeID string, verifyErr erro
 	return nil
 }
 
-func verifyAndConfirmAddedNode(cmd *cobra.Command, repo *config.Repository, nodeID string, bundle config.ConnectionSnapshot, auth utils.HostInfo, verify inventoryVerifier) error {
-	draft := importDraft{bundle: bundle, addr: auth}
-	if err := verify(cmd.Context(), repo, nodeID, draft.verificationBundle()); err != nil {
+func verifyAndConfirmAddedNode(cmd *cobra.Command, repo *config.Repository, nodeID string, bundle *inventoryVerification, auth utils.HostInfo, verify inventoryVerifier) error {
+	draft := importDraft{bundle: bundle.ConnectionSnapshot, addr: auth}
+	bundle.ConnectionSnapshot = draft.verificationBundle()
+	if err := verify(cmd.Context(), repo, nodeID, bundle); err != nil {
+		bundle.Result = nil
 		return confirmFailedVerification(cmd, nodeID, err)
 	}
 	return nil
+}
+
+func verifyAndProbeAddedNode(cmd *cobra.Command, repo *config.Repository, nodeID string, bundle *inventoryVerification, auth utils.HostInfo, verify inventoryVerifier) (*ssh.ExecutionConfig, error) {
+	explicit := bundle.Node.Execution.Clone()
+	if err := verifyAndConfirmAddedNode(cmd, repo, nodeID, bundle, auth, verify); err != nil {
+		return nil, err
+	}
+	execution, warning := enrollmentExecution(explicit, bundle)
+	if warning != nil {
+		if _, err := fmt.Fprintln(cmd.ErrOrStderr(), probeWarning(nodeID, warning)); err != nil {
+			return nil, fmt.Errorf("report execution probe warning: %w", err)
+		}
+	}
+	return execution, nil
 }

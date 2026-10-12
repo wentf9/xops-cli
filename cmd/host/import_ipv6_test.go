@@ -29,7 +29,7 @@ func TestImportIPv6UpdatesExistingNode(t *testing.T) {
 			t.Run(nodeID+"/"+mode, func(t *testing.T) {
 				repo, store := verificationRepository(t)
 				seedIPv6ImportNode(t, repo, nodeID)
-				verify := func(_ context.Context, _ *config.Repository, id string, bundle config.ConnectionSnapshot) error {
+				verify := func(_ context.Context, _ *config.Repository, id string, bundle *inventoryVerification) error {
 					if mode == "skip" {
 						t.Error("skip-verify attempted verification")
 					}

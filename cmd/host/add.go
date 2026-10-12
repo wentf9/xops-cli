@@ -35,6 +35,10 @@ func newCmdInventoryAdd(verify inventoryVerifier) *cobra.Command {
 		Short: i18n.T("inventory_add_short"),
 		Long:  i18n.T("inventory_add_long"),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			probe, execution, err := enrollmentProbeOptions(cmd)
+			if err != nil {
+				return err
+			}
 			password, keyPass, err := secretInput.Read(cmd)
 			if err != nil {
 				return err
@@ -95,12 +99,14 @@ func newCmdInventoryAdd(verify inventoryVerifier) *cobra.Command {
 				Tags:        tags,
 				ProxyJump:   resolvedJump,
 				SudoMode:    models.SudoModeAuto,
+				Execution:   execution,
 			}
 
 			if !skipVerify {
-				bundle := config.ConnectionSnapshot{Node: node, Host: hostObj, Identity: identity}
+				bundle := inventoryVerification{ConnectionSnapshot: config.ConnectionSnapshot{Node: node, Host: hostObj, Identity: identity}, Probe: probe}
 				auth := utils.HostInfo{Password: password, KeyPath: keyPath, Passphrase: keyPass}
-				if err := verifyAndConfirmAddedNode(cmd, repository, name, bundle, auth, verify); err != nil {
+				node.Execution, err = verifyAndProbeAddedNode(cmd, repository, name, &bundle, auth, verify)
+				if err != nil {
 					return err
 				}
 			}
@@ -131,6 +137,7 @@ func newCmdInventoryAdd(verify inventoryVerifier) *cobra.Command {
 	cmd.Flags().StringSliceVarP(&tags, "tags", "t", []string{}, i18n.T("flag_inv_tags"))
 	cmd.Flags().StringVarP(&jump, "jump", "j", "", i18n.T("flag_inv_jump"))
 	cmd.Flags().BoolVar(&skipVerify, "skip-verify", false, i18n.T("flag_skip_verify"))
+	registerEnrollmentProbeFlags(cmd)
 
 	secretInput.RegisterFlags(cmd)
 	cmd.MarkFlagsMutuallyExclusive("identity", "password-stdin", "passphrase-stdin")

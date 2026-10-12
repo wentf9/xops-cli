@@ -33,6 +33,11 @@ func verificationRepositoryAtDirectory(t *testing.T, directory string) (*config.
 		t.Fatal(err)
 	}
 	t.Setenv("XOPS_CONFIG_DIR", physical)
+	// Real SSH fixtures must not read personal keys, agents, OpenSSH config or
+	// known_hosts; reused loopback ports otherwise collide with earlier runs.
+	t.Setenv("HOME", physical)
+	t.Setenv("USERPROFILE", physical)
+	t.Setenv("SSH_AUTH_SOCK", "")
 	if err := i18n.Init("en"); err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +117,7 @@ func TestImportVerificationPolicies(t *testing.T) {
 			repo, store := verificationRepository(t)
 			var calls atomic.Int32
 			wantErr := errors.New("authentication rejected")
-			verify := func(_ context.Context, repo *config.Repository, id string, draft config.ConnectionSnapshot) error {
+			verify := func(_ context.Context, repo *config.Repository, id string, draft *inventoryVerification) error {
 				calls.Add(1)
 				if _, ok := repo.GetNode(id); ok {
 					t.Error("node was saved before verification")
@@ -167,7 +172,7 @@ func TestFailedImportDoesNotUpdateExistingNode(t *testing.T) {
 		t.Fatal(err)
 	}
 	addr.Password, addr.Alias = "wrong-new-secret", "new-alias"
-	verify := func(_ context.Context, _ *config.Repository, _ string, bundle config.ConnectionSnapshot) error {
+	verify := func(_ context.Context, _ *config.Repository, _ string, bundle *inventoryVerification) error {
 		if bundle.Identity.Password != addr.Password {
 			t.Error("verification used old credentials")
 		}
@@ -187,7 +192,7 @@ func TestImportCancellationNeverForcesSave(t *testing.T) {
 	repo, store := verificationRepository(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	verify := func(context.Context, *config.Repository, string, config.ConnectionSnapshot) error {
+	verify := func(context.Context, *config.Repository, string, *inventoryVerification) error {
 		cancel()
 		return context.Canceled
 	}
@@ -217,7 +222,7 @@ func TestHostAddVerificationConfirmation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			_, store := verificationRepository(t)
 			calls := 0
-			verify := func(_ context.Context, repo *config.Repository, id string, _ config.ConnectionSnapshot) error {
+			verify := func(_ context.Context, repo *config.Repository, id string, _ *inventoryVerification) error {
 				calls++
 				if _, ok := repo.GetNode(id); ok {
 					t.Error("add saved before verification")
@@ -271,7 +276,7 @@ func TestImportVerificationFlagsMutuallyExclusive(t *testing.T) {
 
 func TestImportFailedDefaultPortDoesNotPolluteNextImport(t *testing.T) {
 	repo, store := verificationRepository(t)
-	verify := func(_ context.Context, _ *config.Repository, _ string, bundle config.ConnectionSnapshot) error {
+	verify := func(_ context.Context, _ *config.Repository, _ string, bundle *inventoryVerification) error {
 		if bundle.Host.Port == 22 {
 			return errors.New("connection refused on default port")
 		}
@@ -315,7 +320,7 @@ func TestImportPassphraseReplacementVerifiesNewSecret(t *testing.T) {
 
 func TestHostAddSkipVerificationWithoutCredentials(t *testing.T) {
 	_, store := verificationRepository(t)
-	cmd := newCmdInventoryAdd(func(context.Context, *config.Repository, string, config.ConnectionSnapshot) error {
+	cmd := newCmdInventoryAdd(func(context.Context, *config.Repository, string, *inventoryVerification) error {
 		t.Error("skip-verify attempted a connection")
 		return errors.New("unexpected verification")
 	})

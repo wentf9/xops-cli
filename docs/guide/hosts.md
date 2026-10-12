@@ -51,6 +51,40 @@ xops ssh audit@192.0.2.10
 
 ## 节点执行环境配置 (`execution`)
 
+### 自动探测与诊断
+
+`host add` 和 `host import`（包括 `host load` 别名）默认在新节点认证成功后，复用同一连接
+探测启动方言与可用解释器，并将推荐的 `execution` 随节点一起保存。探针最多约 5 秒；失败时
+输出警告，仍可保存认证成功的节点，并保留未配置状态。导入已有节点不会自动重探或覆盖其执行配置。
+
+```bash
+# 验证连接，但跳过探针；也可使用 --probe=false
+xops host add --address 192.0.2.10 --user deploy --key ~/.ssh/id_ed25519 --no-probe
+xops host import hosts.csv --no-probe
+# 显式字段优先于探测推荐；导入时仅应用于新节点
+xops host add --address 192.0.2.10 --user deploy --key ~/.ssh/id_ed25519 --interpreter sh --launch-dialect posix
+# 诊断已保存的节点或别名，默认只展示结果
+xops host probe web-01
+# 替换该节点的 execution，其他字段及凭据保持不变
+xops host probe web-01 --save
+```
+
+`--skip-verify` 同时跳过探针；`--probe` 与 `--no-probe` 不能同时指定。显式执行字段始终保留，
+若与探测结果不兼容，会输出警告并仅保存显式字段。探测失败时不会持久化部分推荐。
+
+探测连接使用独立的 `server/unknown` 配置，目标及跳板的命令执行配置不参与探测连接的解析。
+例如全局为 `bash/posix` 时，新节点仍可仅指定 `--interpreter powershell`，由探针补齐 Windows
+启动方言；全局配置保持不变，连接凭据、主机密钥校验和跳板路径照常使用。
+
+`host probe` 使用现有连接凭据进行非交互式认证，显示远端系统、Shell 路径、SSH 标识、启动方言、
+可用解释器与推荐配置；无法确定的元数据以 `-` 显示。仅 `--save` 写回配置；探测失败或节点在探测
+期间被修改时不保存，并返回非零退出码。Linux 通常推荐 bash（其次 sh），关闭 login；Windows CMD
+存在 Windows PowerShell 时仍推荐 `server/cmd`。探测不会翻译用户命令。
+
+目前自动探测仅接入上述 CLI 添加/导入路径。直接 SSH/exec 首次录入、TUI 和运行时懒加载尚未接入。
+
+### 手动配置
+
 除了网络地址与认证身份外，您可以在配置文件 `~/.xops/xops_config.yaml` 中为每个节点持久化预设执行环境（如解释器、启动方言及登录模式），使得 `xops exec`、`xops ssh`、Playbook 以及 MCP 能够自动采用最契合该主机的执行方式：
 
 ```yaml
