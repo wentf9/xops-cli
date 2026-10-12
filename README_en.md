@@ -89,6 +89,8 @@ xops host tags
 
 Imports save only nodes that pass SSH verification by default, and failed rows are explicitly marked as not saved. `--skip-verify` saves directly without verification; `--save-on-verify-failure` saves even when verification fails. These options are mutually exclusive. Both `host add` and the TUI verify new nodes first and ask whether to save after a failure, defaulting to no. For offline addition, use `--skip-verify` in the CLI or select **Skip verification and save** in the TUI form.
 
+Use `xops host probe <node-or-alias>` to diagnose a saved node, or `xops host probe --all` for all saved nodes. Add `--save` to persist successful recommendations. Individual failures do not stop `--all`; see [Hosts & Identities](docs/en/guide/hosts.md) for details.
+
 #### 3. SSH Connections & TUI
 
 ```bash

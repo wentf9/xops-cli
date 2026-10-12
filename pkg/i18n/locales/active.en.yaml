@@ -1102,12 +1102,14 @@ flag_host_probe:
   other: "Probe and save execution settings for new nodes using the verification connection"
 flag_host_no_probe:
   other: "Skip automatic execution probing"
+flag_host_probe_all:
+  other: "Probe all saved nodes (cannot be combined with a node selector)"
 flag_host_probe_save:
   other: "Save the recommendation, replacing this node's execution settings"
 inventory_probe_short:
   other: "Probe a saved node's SSH execution environment"
 inventory_probe_long:
-  other: "Use saved connection credentials to detect the outer shell and available interpreters. Display the recommendation; --save replaces only the selected node's execution settings. Authentication is non-interactive; concurrent node edits prevent saving."
+  other: "Use saved connection credentials to detect the outer shell and available interpreters. Specify a node or --all for every saved node in node ID order. Failed nodes do not stop --all; any failure returns a nonzero exit status. Display the recommendation; --save replaces only successfully probed nodes' execution settings. Authentication is non-interactive; concurrent node edits prevent saving."
 inventory_probe_warning:
   other: "[{{.Node}}] warning: execution probe unavailable; preserving explicit settings or server defaults: {{.Error}}"
 inventory_probe_saved:
