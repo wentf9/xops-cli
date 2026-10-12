@@ -46,7 +46,11 @@ func TestPwshWindowsSFTPWorkingDirExecutesWithoutProbe(t *testing.T) {
 	if err != nil {
 		t.Skipf("native pwsh unavailable: %v", err)
 	}
-	directory := filepath.Join(t.TempDir(), "quoted'directory")
+	tempDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := filepath.Join(tempDir, "quoted'directory")
 	if err := os.Mkdir(directory, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +59,11 @@ func TestPwshWindowsSFTPWorkingDirExecutesWithoutProbe(t *testing.T) {
 		t.Fatal(err)
 	}
 	output, status := runProbeShell(t, t.Context(), shell, LaunchPowerShell, "$ProgressPreference = 'SilentlyContinue'; "+command, nil)
-	if status != 0 || !strings.EqualFold(filepath.Clean(strings.TrimSpace(output)), filepath.Clean(directory)) {
+	cleanOutput := filepath.Clean(strings.TrimSpace(output))
+	if physicalOutput, err := filepath.EvalSymlinks(cleanOutput); err == nil {
+		cleanOutput = physicalOutput
+	}
+	if status != 0 || !strings.EqualFold(cleanOutput, filepath.Clean(directory)) {
 		t.Fatalf("native Windows cwd failed: status %d, output %q", status, output)
 	}
 }

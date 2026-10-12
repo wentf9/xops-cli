@@ -35,6 +35,13 @@ func TestProbeShellDialects(t *testing.T) {
 			if err != nil {
 				t.Skipf("shell unavailable: %v", err)
 			}
+			if tt.dialect == LaunchPowerShell {
+				// Warm up JIT/CLR runtime cache so slow runner cold-start does not
+				// consume the probeCommandTimeout.
+				warmupCtx, warmupCancel := context.WithTimeout(t.Context(), 5*time.Second)
+				defer warmupCancel()
+				_ = exec.CommandContext(warmupCtx, shell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "exit 0").Run()
+			}
 			client, _ := executionProbeClient(t, "", func(ctx context.Context, payload string, channel cryptoSSH.Channel) {
 				output, status := runProbeShell(t, ctx, shell, tt.dialect, payload, nil)
 				replyExecutionProbe(t, ctx, channel, output, status)
@@ -59,14 +66,27 @@ func TestProbeShellCmdMissingInterpreters(t *testing.T) {
 	}
 	systemDir := filepath.Join(os.Getenv("SystemRoot"), "System32")
 	shell := filepath.Join(systemDir, "cmd.exe")
+	// Windows 10/Server 2019+ System32 may contain a native bash.exe launcher stub.
+	hasBash := false
+	if _, err := os.Stat(filepath.Join(systemDir, "bash.exe")); err == nil {
+		hasBash = true
+	}
 	for _, withPowerShell := range []bool{false, true} {
 		name := "CMD only"
 		searchPath := systemDir
-		want := []Interpreter{InterpreterCmd}
+		var want []Interpreter
+		if hasBash {
+			want = append(want, InterpreterBash)
+		}
+		want = append(want, InterpreterCmd)
 		if withPowerShell {
 			name = "Windows PowerShell without pwsh"
 			searchPath += string(os.PathListSeparator) + filepath.Join(systemDir, "WindowsPowerShell", "v1.0")
-			want = []Interpreter{InterpreterPowerShell, InterpreterCmd}
+			want = nil
+			if hasBash {
+				want = append(want, InterpreterBash)
+			}
+			want = append(want, InterpreterPowerShell, InterpreterCmd)
 		}
 		t.Run(name, func(t *testing.T) {
 			env := slices.DeleteFunc(os.Environ(), func(value string) bool {
@@ -104,6 +124,16 @@ func runProbeShell(t *testing.T, ctx context.Context, shell string, dialect Laun
 	configureProbeShellCommand(command, shell, dialect, payload)
 	command.WaitDelay = time.Second
 	command.Env = env
+	if dialect == LaunchPowerShell {
+		baseEnv := env
+		if baseEnv == nil {
+			baseEnv = os.Environ()
+		}
+		command.Env = append(slices.Clone(baseEnv),
+			"POWERSHELL_TELEMETRY_OPTOUT=1",
+			"POWERSHELL_UPDATECHECK=Off",
+		)
+	}
 	// An empty directory prevents incidental local executables from satisfying
 	// where.exe lookups in the Windows PATH-isolation regression cases.
 	command.Dir = t.TempDir()
