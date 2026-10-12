@@ -17,7 +17,7 @@
 然而，对于高级自动化场景：
 - **Playbook `script` 步骤**：要求已知的脚本解释器适配器（如 `bash` 或 `sh`），禁止使用 `server` 模式直接运行脚本；
 - **Playbook `ensure` 检查步骤**：要求非 `server` 的受控 Shell 适配器以捕获退出状态控制帧；
-- **SFTP `exec` 工作目录继承**：`server` 模式显式拒绝附加 `cwd`，必须具备已知的 `posix`、`cmd` 或 `powershell` 适配器；
+- **SFTP `exec` 工作目录继承**：`server` 直通不附加 `cwd`（SFTP 已知 `server/cmd` 可临时派生 CMD 适配器），必须具备已知的 `posix`、`cmd` 或 `powershell` 适配器；
 - **Unix 提权 (`sudo`/`su`)**：在非 POSIX 方言或未配置执行环境下被严格拦截。
 
 若完全依赖用户手动在节点（`nodes.<node>.execution`）或全局配置中静态维护 `interpreter` 与 `launch_dialect`，维护成本高且容易因配置不匹配（如在 Windows `cmd.exe` 节点配置 `posix` 方言）导致命令乱码或执行失败。
@@ -76,7 +76,7 @@ Level 4: 连接级会话缓存 (Session Cache)   ──► 单次 SSH Client 生
   - 执行 Playbook `ensure` 检查步骤（需要受控 Shell 捕获控制帧）；
   - 执行 SFTP `exec` 且带有非空工作目录 `cwd`。
 - 探测成功后仅将配置缓存在当前运行进程的内存上下文中，不自动改写静态磁盘配置文件。
-- 显式解释器（包括 `server`）、已知方言及显式 login 不被懒加载替换。script/ensure 当前仅支持 POSIX bash/sh。
+- 显式解释器（包括 `server`）、已知方言及显式 login 不被懒加载替换。script/ensure 支持 bash/sh/zsh/fish，外层方言须为 posix/fish；fish ensure 使用原生退出事件报告检查状态。
 
 ### 2.4 接入层级四：连接级内存缓存 (Connection-Level Session Cache)
 - Client 引用受并发锁保护的探测状态，连接池中的包装对象共享同一缓存；
@@ -230,7 +230,9 @@ __XOPS_INTERP_END__
 
 | 探测到的 LaunchDialect | 可用 Interpreters | 推荐 Interpreter | 推荐 Login | 适用场景与推荐理由 |
 | :--- | :--- | :--- | :--- | :--- |
-| **`posix`** | 包含 `bash`, `sh` | `bash` | `false` | 标准 Linux/macOS，具备完备的脚本和 ensure 适配能力 |
+| **`posix`** | 远端默认 bash/sh/zsh/fish 在可用列表中 | 远端默认 Shell | `false` | 保留用户默认执行环境，ash/dash 映射为 sh |
+| **`fish`** | 包含 `fish` | `fish` | `false` | 外层探测确认 fish，不受过期 `$SHELL` 影响 |
+| **`posix` / `fish`** | 默认 Shell 未知、不支持或不可用 | 按 bash → sh → zsh → fish 选择可用项 | `false` | 保留确定的回退规则 |
 | **`posix`** | 仅 `sh` (无 bash) | `sh` | `false` | Alpine / 容器精简镜像，规避默认调用 bash 导致的 127 错误 |
 | **`posix`** | 包含 `pwsh` | 用户可选 `pwsh` | `nil` | Linux 下运行 PowerShell Core 脚本 |
 | **`cmd`** | 包含 `cmd`, `powershell` | `server` (可选 `powershell`) | `nil` | 基础命令直通 cmd；自动化工作流推荐 powershell |

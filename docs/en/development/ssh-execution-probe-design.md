@@ -75,7 +75,7 @@ Targets the critical lifecycle event when a node is added for the first time:
   - Running a Playbook `ensure` inspection step (requires a controlled shell for exit status capture).
   - Executing an SFTP `exec` with a non-empty `cwd`.
 - Successfully probed configurations are cached in process memory only, without modifying static configuration files on disk.
-- Explicit interpreters (including `server`), known dialects, and explicit login options are never overridden by lazy probing. `script`/`ensure` currently only supports POSIX bash/sh.
+- Explicit interpreters (including `server`), known dialects, and explicit login options are never overridden by lazy probing. `script`/`ensure` supports bash/sh/zsh/fish with a posix/fish outer dialect; fish ensure reports check status through a native exit event.
 
 ### 2.4 Level 4: Connection-Level Session Cache
 - Clients share concurrent-safe probe state across pooled wrapper instances.
@@ -189,7 +189,9 @@ The probing engine derives recommended configurations based on composite attribu
 
 | Detected LaunchDialect | Available Interpreters | Recommended Interpreter | Recommended Login | Use Case & Rationale |
 | :--- | :--- | :--- | :--- | :--- |
-| **`posix`** | contains `bash`, `sh` | `bash` | `false` | Standard Linux/macOS; complete script & ensure support |
+| **`posix`** | Default bash/sh/zsh/fish is available | Remote default shell | `false` | Preserve the user's default environment; ash/dash map to sh |
+| **`fish`** | contains `fish` | `fish` | `false` | Native fish probe overrides stale `$SHELL` |
+| **`posix` / `fish`** | Default shell unknown, unsupported or unavailable | First available: bash → sh → zsh → fish | `false` | Deterministic fallback |
 | **`posix`** | `sh` only (no bash) | `sh` | `false` | Alpine / minimal container images; prevents code 127 errors |
 | **`posix`** | contains `pwsh` | User-selectable `pwsh` | `nil` | Executing PowerShell Core scripts under Linux |
 | **`cmd`** | contains `cmd`, `powershell` | `server` (opt-in `powershell`) | `nil` | Basic commands pass through cmd; automation prefers powershell |

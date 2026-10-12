@@ -23,7 +23,7 @@ func TestProbeShellDialects(t *testing.T) {
 		shell   string
 		dialect LaunchDialect
 	}{
-		{"sh", LaunchPOSIX}, {"bash", LaunchPOSIX},
+		{"sh", LaunchPOSIX}, {"bash", LaunchPOSIX}, {"zsh", LaunchPOSIX}, {"fish", LaunchFish},
 		{"pwsh", LaunchPowerShell}, {"powershell.exe", LaunchPowerShell},
 		{"cmd.exe", LaunchCmd},
 	} {

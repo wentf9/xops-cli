@@ -31,10 +31,11 @@ func TestExecExplicitExecutionOptions(t *testing.T) {
 		{"bash login", []string{"--interpreter", "bash", "--launch-dialect", "posix", "--login-shell"}, "bash -l -c 'echo '\\''$HOME'\\'''", ""},
 		{"bash explicit disabled", []string{"--interpreter", "bash", "--launch-dialect", "posix", "--login-shell=false"}, "bash -c 'echo '\\''$HOME'\\'''", ""},
 		{"old no-login with explicit dialect", []string{"--launch-dialect", "posix", "--no-login"}, "bash -c 'echo '\\''$HOME'\\'''", ""},
-		{"no-login with explicit unknown dialect rejected", []string{"--launch-dialect", "unknown", "--no-login"}, "", "bash interpreter requires posix launch dialect"},
+		{"no-login with explicit unknown dialect rejected", []string{"--launch-dialect", "unknown", "--no-login"}, "", "bash interpreter requires posix or fish launch dialect"},
 		{"sh non-login", []string{"--interpreter", "sh", "--launch-dialect", "posix"}, "sh -c 'echo '\\''$HOME'\\'''", ""},
+		{"zsh non-login", []string{"--interpreter", "zsh", "--launch-dialect", "posix"}, "zsh -c 'echo '\\''$HOME'\\'''", ""},
 		{"sh login rejected", []string{"--interpreter", "sh", "--launch-dialect", "posix", "--login-shell"}, "", "sh interpreter does not support login shell"},
-		{"unknown interpreter", []string{"--interpreter", "zsh"}, "", "unsupported command interpreter"},
+		{"unknown interpreter", []string{"--interpreter", "invalid-shell"}, "", "unsupported command interpreter"},
 		{"bash without dialect", []string{"--interpreter", "bash"}, "", "requires posix"},
 		{"server login", []string{"--interpreter", "server", "--login-shell"}, "", "inherited login"},
 		{"server explicit false", []string{"--interpreter", "server", "--login-shell=false"}, "", "inherited login"},
@@ -250,5 +251,45 @@ func TestExecInteractiveEffectivePlanning(t *testing.T) {
 	err = o.runInteractive(ctx, connectorInvalid, task, "uptime")
 	if err == nil || !strings.Contains(err.Error(), "plan interactive command") || !strings.Contains(err.Error(), "requires posix") {
 		t.Fatalf("expected planning error for invalid node execution dialect, got: %v", err)
+	}
+}
+
+func TestExecConfiguredUnixLoginDefaults(t *testing.T) {
+	for _, interpreter := range []ssh.Interpreter{ssh.InterpreterZsh, ssh.InterpreterFish} {
+		for _, configuredLogin := range []bool{false, true} {
+			for _, explicitNoLogin := range []bool{false, true} {
+				execution := &ssh.ExecutionConfig{Interpreter: interpreter, LaunchDialect: ssh.LaunchPOSIX, Login: &configuredLogin}
+				o := NewExecOptions()
+				o.execution.noLoginSet, o.NoLoginShell = explicitNoLogin, explicitNoLogin
+				run := &ssh.RunConfig{Interpreter: interpreter, LoginShell: configuredLogin}
+				for _, option := range o.commandRunOptions(execution, []ssh.RunOption{ssh.WithRingBuffer(4096)}) {
+					option(run)
+				}
+				wantInterpreter, wantLogin := interpreter, configuredLogin
+				if explicitNoLogin {
+					wantInterpreter, wantLogin = ssh.InterpreterBash, false
+				}
+				if run.Interpreter != wantInterpreter || run.LoginShell != wantLogin || run.RingMaxBytes != 4096 {
+					t.Fatalf("configured interpreter=%s login=%v explicitNoLogin=%v: %+v", interpreter, configuredLogin, explicitNoLogin, run)
+				}
+			}
+		}
+	}
+	o := NewExecOptions()
+	o.execution.noLoginSet = true
+	run := &ssh.RunConfig{Interpreter: ssh.InterpreterZsh, LoginShell: false}
+	for _, option := range o.commandRunOptions(&ssh.ExecutionConfig{Interpreter: ssh.InterpreterZsh}, nil) {
+		option(run)
+	}
+	if run.Interpreter != ssh.InterpreterBash || !run.LoginShell {
+		t.Fatal("explicit --no-login=false lost legacy Bash login semantics")
+	}
+	o = NewExecOptions()
+	run = &ssh.RunConfig{LoginShell: false}
+	for _, option := range o.commandRunOptions(nil, nil) {
+		option(run)
+	}
+	if !run.LoginShell {
+		t.Fatal("legacy Bash login default changed")
 	}
 }

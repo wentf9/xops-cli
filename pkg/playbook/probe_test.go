@@ -107,7 +107,7 @@ func TestLazyProbeFailureNeverExecutesOrRetriesUserWork(t *testing.T) {
 			t.Fatalf("failed probe authorized user work: %+v", result)
 		}
 	}
-	if server.Executed.Load() != 3 {
+	if server.Executed.Load() != 4 {
 		t.Fatal("failed probe was repeated or user work was sent")
 	}
 }
@@ -154,5 +154,37 @@ func TestLazyWindowsProbeRejectsPOSIXScriptAndEnsure(t *testing.T) {
 	}
 	if server.Executed.Load() != 3 {
 		t.Fatal("probe repeated or user work was sent")
+	}
+}
+
+func TestEnsureAdaptersWithFishOuterShell(t *testing.T) {
+	engine := &Engine{}
+	for _, interpreter := range []ssh.Interpreter{ssh.InterpreterBash, ssh.InterpreterSh, ssh.InterpreterZsh, ssh.InterpreterFish} {
+		cfg := &ssh.ExecutionConfig{Interpreter: interpreter, LaunchDialect: ssh.LaunchFish}
+		resolved, err := engine.resolveEnsureExecution(t.Context(), nil, cfg, models.Node{})
+		if err != nil || resolved.Interpreter != interpreter || resolved.LaunchDialect != ssh.LaunchFish {
+			t.Fatalf("adapter %s rejected for fish outer shell: %+v, %v", interpreter, resolved, err)
+		}
+	}
+}
+
+func TestEnsureExecutionErrorStatuses(t *testing.T) {
+	for _, tt := range []struct {
+		interpreter ssh.Interpreter
+		code        uint32
+		blocked     bool
+	}{
+		{ssh.InterpreterFish, 0, false}, {ssh.InterpreterFish, 1, false},
+		{ssh.InterpreterFish, 7, false}, {ssh.InterpreterFish, 122, false},
+		{ssh.InterpreterFish, 121, true}, {ssh.InterpreterFish, 123, true},
+		{ssh.InterpreterFish, 124, true}, {ssh.InterpreterFish, 125, true},
+		{ssh.InterpreterFish, 126, true}, {ssh.InterpreterFish, 127, true},
+		{ssh.InterpreterBash, 124, false}, {ssh.InterpreterSh, 121, false},
+		{ssh.InterpreterZsh, 123, false}, {ssh.InterpreterBash, 126, true},
+		{ssh.InterpreterSh, 127, true}, {ssh.InterpreterZsh, 126, true},
+	} {
+		if err := ensureCheckExecutionError(tt.interpreter, tt.code); (err != nil) != tt.blocked {
+			t.Fatalf("interpreter=%s status=%d want blocked=%v error=%v", tt.interpreter, tt.code, tt.blocked, err)
+		}
 	}
 }

@@ -158,7 +158,7 @@ func assertDynamicEnrollment(t *testing.T, ctx context.Context, mode string, con
 		wantProbe = 2
 	}
 	if mode == "probe failure" {
-		wantProbe = 3
+		wantProbe = 4
 	}
 	if server.Executed.Load() != wantProbe || (warnings.Load() == 1) != (mode == "probe failure") {
 		t.Fatal("enrollment probe policy or warnings incorrect")

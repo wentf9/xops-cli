@@ -17,7 +17,7 @@ type ShebangInfo struct {
 }
 
 // ParseShebang inspects the first line of script data and validates it against
-// the supported shebang allowlist (sh and bash paths or /usr/bin/env sh|bash
+// the supported shebang allowlist (sh, bash, zsh and fish paths or /usr/bin/env sh|bash|zsh|fish
 // without additional arguments). Trailing CR is ignored for metadata parsing.
 func ParseShebang(data []byte) ShebangInfo {
 	if len(data) == 0 {
@@ -47,6 +47,14 @@ func ParseShebang(data []byte) ShebangInfo {
 		info.Supported = true
 		info.Interpreter = InterpreterBash
 		info.Dialect = LaunchPOSIX
+	case "zsh", "/bin/zsh", "/usr/bin/zsh", "/bin/env zsh", "/usr/bin/env zsh":
+		info.Supported = true
+		info.Interpreter = InterpreterZsh
+		info.Dialect = LaunchPOSIX
+	case "fish", "/bin/fish", "/usr/bin/fish", "/bin/env fish", "/usr/bin/env fish":
+		info.Supported = true
+		info.Interpreter = InterpreterFish
+		info.Dialect = LaunchFish
 	default:
 		// Unsupported shebang (e.g. has flags like /bin/bash -e or unsupported interpreter like python)
 		info.Supported = false
@@ -175,7 +183,7 @@ func validateResolvedScriptExecution(res *ExecutionConfig) (*ExecutionConfig, er
 	if err := res.Validate(); err != nil {
 		return nil, err
 	}
-	if res == nil || (res.Interpreter != InterpreterBash && res.Interpreter != InterpreterSh) {
+	if res == nil || (res.Interpreter != InterpreterBash && res.Interpreter != InterpreterSh && res.Interpreter != InterpreterZsh && res.Interpreter != InterpreterFish) {
 		return nil, fmt.Errorf("%w: unsupported resolved script interpreter", ErrExecutionValidation)
 	}
 	plan, err := PlanCommand(":", res.CommandOptions())

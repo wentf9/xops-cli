@@ -28,7 +28,7 @@ xops ssh --host web-01 --interpreter server uname -a
 xops ssh --host linux-01 --interpreter bash --launch-dialect posix --login-shell=false id
 ```
 
-- **Interpreter selection**: Supports `--interpreter server` (native execution, default), `bash`, `sh`, `powershell`, `pwsh`, and `cmd`.
+- **Interpreter selection**: Supports `--interpreter server` (native execution, default), `bash`, `sh`, `zsh`, `fish`, `powershell`, `pwsh`, and `cmd`.
 - **Login environment controls**: When using the `bash` interpreter, supports `--login-shell` (load login profile) and `--no-login` (do not load login profile); the `server` interpreter forwards commands directly and rejects login options.
 - **Input stream and shell routing**:
   - **Interactive shell**: When no command is specified and stdin is a terminal, starts an interactive PTY login shell.
@@ -63,6 +63,10 @@ The node configuration selects the escalation method: root, passwordless sudo, p
 `ssh --sudo` opens an elevated interactive shell. `exec -x --sudo` executes an elevated command directly, retaining PTY authentication without an extra root shell prompt or injected command echo. Validate custom su/PAM multi-step authentication and login scripts on the target system.
 
 Password sudo supports both traditional sudo and sudo-rs. When available credentials supply the password automatically, remote password prompts and sudo-rs asterisk feedback are filtered out. The sudo-rs PAM `Password:` prompt is recognized with or without trailing spaces. Missing or rejected credentials still trigger a password prompt. Authentication errors and output from the elevated command remain visible.
+
+Fish nodes support the same elevation modes. Save `launch_dialect: fish` in the node execution settings and select `interpreter: fish` (or bash/sh/zsh), then use `xops exec --host fish-01 --sudo -c 'id'`, `xops exec -x --host fish-01 --sudo -c 'id'`, or `xops ssh fish-01 --sudo`. Elevated Playbook fish scripts are also supported. A fixed `/bin/sh` handles authentication before starting the selected interpreter, keeping passwords, acknowledgements and user stdin separate. The fish path avoids `sudo -i` command concatenation; login mode belongs to the selected interpreter. For su, the target must support `-s /bin/sh` to pin the control shell ([su manual](https://man7.org/linux/man-pages/man1/su.1.html)). CLI explicit `--interpreter` flags still cannot be combined with `--sudo`; use node or Playbook execution settings.
+
+For zsh, set `interpreter: zsh` and `launch_dialect: posix`. The same `--sudo` commands and Playbook elevation settings apply. Zsh shares the POSIX authentication protocol and supports sudo and su; its commands and scripts retain zsh semantics. Login mode selects `zsh -l`; su pins the control shell with `-s /bin/sh`.
 
 ## Port forwarding and tunnels
 

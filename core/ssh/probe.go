@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path"
 	"slices"
 	"strconv"
 	"strings"
@@ -38,18 +39,19 @@ const (
 
 	// The POSIX if/then grammar is intentional: PowerShell 7 can also parse
 	// command substitution and ||, and can invoke an external printf on Unix.
-	probePOSIX = `if :; then printf '__XOPS_DIALECT_POSIX__:%s:%s\n' "$(uname -s 2>/dev/null || echo UNAME_FAIL)" "$SHELL"; fi`
-	// Probe the outer shell itself: invoking cmd.exe under PowerShell would
-	// otherwise incorrectly identify a PowerShell DefaultShell as CMD.
+	probePOSIX            = `if :; then printf '__XOPS_DIALECT_POSIX__:%s:%s\n' "$(uname -s 2>/dev/null || echo UNAME_FAIL)" "$SHELL"; fi`
+	probeFish             = `if set -q FISH_VERSION; printf '__XOPS_DIALECT_FISH__:%s\n' "$FISH_VERSION"; printf '__XOPS_FISH_OS__:%s\n' (uname -s); printf '__XOPS_FISH_SHELL__:%s\n' "$SHELL"; end`
+	probeFishInterpreters = `for i in bash sh zsh fish powershell pwsh cmd; if command -q $i; printf '__XOPS_INTERP__:%s\n' $i; end; end; printf '__XOPS_INTERP_END__\n'`
+	// Probe the outer shell itself, rather than cmd.exe under PowerShell.
 	probeCmd               = `echo __XOPS_DIALECT_CMD__:%COMSPEC%`
 	probePowerShell        = `Write-Output ('__XOPS_DIALECT_POWERSHELL__:' + $PSVersionTable.PSVersion.ToString()); Write-Output ('__XOPS_PLATFORM__:' + [Environment]::OSVersion.Platform)`
-	probePOSIXInterpreters = `for i in bash sh powershell pwsh cmd; do if command -v "$i" >/dev/null 2>&1; then printf '__XOPS_INTERP__:%s\n' "$i"; fi; done; printf '__XOPS_INTERP_END__\n'`
+	probePOSIXInterpreters = `for i in bash sh zsh fish powershell pwsh cmd; do if command -v "$i" >/dev/null 2>&1; then printf '__XOPS_INTERP__:%s\n' "$i"; fi; done; printf '__XOPS_INTERP_END__\n'`
 	// Optional failed lookups must not become the enumeration's exit status.
 	// Parenthesize the end echo so the separator adds no trailing frame space.
-	probeCmdInterpreters = `where bash.exe >nul 2>&1 && (echo __XOPS_INTERP__:bash) & where sh.exe >nul 2>&1 && (echo __XOPS_INTERP__:sh) & where powershell.exe >nul 2>&1 && (echo __XOPS_INTERP__:powershell) & where pwsh.exe >nul 2>&1 && (echo __XOPS_INTERP__:pwsh) & (echo __XOPS_INTERP__:cmd) & (echo __XOPS_INTERP_END__) & exit /b 0`
+	probeCmdInterpreters = `where bash.exe >nul 2>&1 && (echo __XOPS_INTERP__:bash) & where sh.exe >nul 2>&1 && (echo __XOPS_INTERP__:sh) & where zsh.exe >nul 2>&1 && (echo __XOPS_INTERP__:zsh) & where fish.exe >nul 2>&1 && (echo __XOPS_INTERP__:fish) & where powershell.exe >nul 2>&1 && (echo __XOPS_INTERP__:powershell) & where pwsh.exe >nul 2>&1 && (echo __XOPS_INTERP__:pwsh) & (echo __XOPS_INTERP__:cmd) & (echo __XOPS_INTERP_END__) & exit /b 0`
 	// Use the native outer PowerShell so pwsh-only servers do not require
 	// powershell.exe merely to enumerate their installed interpreters.
-	probePowerShellInterpreters = `foreach ($i in @('bash','sh','powershell','pwsh','cmd')) { if (Get-Command $i -CommandType Application -ErrorAction SilentlyContinue) { Write-Output ('__XOPS_INTERP__:' + $i) } }; Write-Output '__XOPS_INTERP_END__'`
+	probePowerShellInterpreters = `foreach ($i in @('bash','sh','zsh','fish','powershell','pwsh','cmd')) { if (Get-Command $i -CommandType Application -ErrorAction SilentlyContinue) { Write-Output ('__XOPS_INTERP__:' + $i) } }; Write-Output '__XOPS_INTERP_END__'`
 )
 
 // ProbeResult is a diagnostic snapshot. SuggestedConfig is safe to persist only
@@ -144,7 +146,7 @@ func (c *Client) probeExecution(ctx context.Context) (*ProbeResult, error) {
 		return result, fmt.Errorf("%w: %w", ErrExecutionProbe, err)
 	}
 	result.AvailableInterpreters = interpreters
-	result.SuggestedConfig = recommendProbeExecution(result.DetectedDialect, interpreters)
+	result.SuggestedConfig = recommendProbeExecution(result.DetectedDialect, result.RemoteShellPath, interpreters)
 	result.RecommendedInterpreter = result.SuggestedConfig.Interpreter
 	if err := result.SuggestedConfig.Validate(); err != nil {
 		return result, fmt.Errorf("%w: validate recommendation: %w", ErrExecutionProbe, err)
@@ -171,9 +173,9 @@ func (c *Client) executeProbeCommand(ctx context.Context, command string) (strin
 }
 
 func (c *Client) detectProbeDialect(ctx context.Context, result *ProbeResult) error {
-	commands := []string{probePOSIX, probeCmd, probePowerShell}
+	commands := []string{probePOSIX, probeCmd, probePowerShell, probeFish}
 	if strings.Contains(result.ServerVersion, "OpenSSH_for_Windows") || strings.Contains(result.ServerVersion, "Microsoft:Windows") {
-		commands = []string{probeCmd, probePowerShell, probePOSIX}
+		commands = []string{probeCmd, probePowerShell, probePOSIX, probeFish}
 	}
 	var failures []error
 	for _, command := range commands {
@@ -237,6 +239,8 @@ func parseProbeDialect(output, command string) (LaunchDialect, string, string) {
 				return LaunchPOSIX, remoteOS, shell
 			}
 		}
+	case probeFish:
+		return parseProbeFish(output)
 	case probeCmd:
 		if frame, ok := probeFrame(output, "__XOPS_DIALECT_CMD__:"); ok {
 			if len(frame) > 3 && frame[1] == ':' && (frame[2] == '\\' || frame[2] == '/') && strings.HasSuffix(strings.ToLower(frame), "cmd.exe") {
@@ -277,6 +281,8 @@ func probeInterpreterCommand(dialect LaunchDialect) (string, error) {
 	switch dialect {
 	case LaunchPOSIX:
 		return shCommandPayload(probePOSIXInterpreters), nil
+	case LaunchFish:
+		return probeFishInterpreters, nil
 	case LaunchCmd:
 		return cmdCommandPayload(probeCmdInterpreters, dialect)
 	case LaunchPowerShell:
@@ -300,7 +306,7 @@ func parseProbeInterpreters(output string) ([]Interpreter, error) {
 		}
 		if value, ok := strings.CutPrefix(line, "__XOPS_INTERP__:"); ok {
 			interpreter := Interpreter(value)
-			if ended || !slices.Contains([]Interpreter{InterpreterBash, InterpreterSh, InterpreterPowerShell, InterpreterPwsh, InterpreterCmd}, interpreter) || slices.Contains(interpreters, interpreter) {
+			if ended || !slices.Contains([]Interpreter{InterpreterBash, InterpreterSh, InterpreterZsh, InterpreterFish, InterpreterPowerShell, InterpreterPwsh, InterpreterCmd}, interpreter) || slices.Contains(interpreters, interpreter) {
 				return nil, errors.New("invalid or duplicate interpreter frame")
 			}
 			interpreters = append(interpreters, interpreter)
@@ -312,12 +318,13 @@ func parseProbeInterpreters(output string) ([]Interpreter, error) {
 	return interpreters, nil
 }
 
-func recommendProbeExecution(dialect LaunchDialect, available []Interpreter) ExecutionConfig {
+func recommendProbeExecution(dialect LaunchDialect, remoteShellPath string, available []Interpreter) ExecutionConfig {
 	config := ExecutionConfig{Interpreter: InterpreterServer, LaunchDialect: dialect}
 	switch dialect {
-	case LaunchPOSIX:
-		for _, interpreter := range []Interpreter{InterpreterBash, InterpreterSh} {
-			if slices.Contains(available, interpreter) {
+	case LaunchPOSIX, LaunchFish:
+		preferred := preferredProbeInterpreter(dialect, remoteShellPath)
+		for _, interpreter := range []Interpreter{preferred, InterpreterBash, InterpreterSh, InterpreterZsh, InterpreterFish} {
+			if interpreter != "" && slices.Contains(available, interpreter) {
 				login := false
 				config.Interpreter, config.Login = interpreter, &login
 				break
@@ -336,4 +343,35 @@ func recommendProbeExecution(dialect LaunchDialect, available []Interpreter) Exe
 		}
 	}
 	return config
+}
+
+func parseProbeFish(output string) (LaunchDialect, string, string) {
+	version, versionOK := probeFrame(output, "__XOPS_DIALECT_FISH__:")
+	remoteOS, osOK := probeFrame(output, "__XOPS_FISH_OS__:")
+	shell, shellOK := probeFrame(output, "__XOPS_FISH_SHELL__:")
+	if versionOK && validProbeVersion(version) && osOK && remoteOS != "" && shellOK && (shell == "" || strings.HasPrefix(shell, "/")) {
+		return LaunchFish, remoteOS, shell
+	}
+	return LaunchUnknown, "", ""
+}
+
+// Prefer the reported default-shell path only as an allowlisted interpreter name;
+// never interpolate remote metadata into an exec payload. A native fish probe
+// establishes the actual shell even when the inherited SHELL variable is stale.
+func preferredProbeInterpreter(dialect LaunchDialect, remoteShellPath string) Interpreter {
+	if dialect == LaunchFish {
+		return InterpreterFish
+	}
+	switch path.Base(remoteShellPath) {
+	case "bash":
+		return InterpreterBash
+	case "sh", "ash", "dash":
+		return InterpreterSh
+	case "zsh":
+		return InterpreterZsh
+	case "fish":
+		return InterpreterFish
+	default:
+		return ""
+	}
 }

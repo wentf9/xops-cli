@@ -551,7 +551,7 @@ func (e *Engine) executeEnsureCheck(ctx context.Context, client *ssh.Client, che
 	}
 
 	marker := fmt.Sprintf("__XOPS_ENSURE_%s__", generateEnsureNonce())
-	wrappedCheck := fmt.Sprintf("{\n  trap 'printf \"\\n%s:%%d\\n\" \"$?\"' EXIT\n  %s\n}", marker, checkCmd)
+	wrappedCheck := wrapEnsureCheck(checkCmd, marker, effectiveExec.Interpreter)
 
 	if sudo {
 		return e.executeEnsureCheckSudo(ctx, client, wrappedCheck, marker, effectiveExec)
@@ -693,8 +693,8 @@ func (e *Engine) executeEnsureCheckPlanned(ctx context.Context, client *ssh.Clie
 //
 // 结果协议：
 //   - check 通过 (exit 0) → StatusSkipped（已满足，无需变更）
-//   - check 退出码 127、超时、断连或执行层故障/缺少结果帧 → StatusFailed（停止，严禁执行 action）
-//   - check 确认非 0（排除 127）且具备有效结果帧 → 执行 action → 再次 check 验证
+//   - check 保留执行错误码（126/127，fish 另含 121/123/124/125）、超时、断连或执行层故障/缺少结果帧 → StatusFailed（停止，严禁执行 action）
+//   - check 确认非 0（排除保留执行错误码）且具备有效结果帧 → 执行 action → 再次 check 验证
 //   - 再次 check 通过 (exit 0) → StatusChanged（修复成功）
 //   - 再次 check 失败 → StatusFailed（修复后仍不满足）
 func (e *Engine) runEnsure(ctx context.Context, client *ssh.Client, spec *EnsureSpec, stepExec *ssh.ExecutionConfig, sudo bool, node models.Node) StepResult {
@@ -718,12 +718,12 @@ func (e *Engine) runEnsure(ctx context.Context, client *ssh.Client, spec *Ensure
 		}
 	}
 
-	if checkCode == 127 {
+	if checkErr := ensureCheckExecutionError(resolved.Interpreter, checkCode); checkErr != nil {
 		return StepResult{
 			Status:    StatusFailed,
 			Outcome:   ssh.ExecutionCompleted,
 			Output:    cleanOut,
-			Err:       fmt.Errorf("ensure check exited with 127 (cannot distinguish command missing from startup failure), action not executed"),
+			Err:       checkErr,
 			Retryable: false,
 		}
 	}

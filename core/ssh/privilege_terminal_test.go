@@ -17,11 +17,17 @@ func TestPrivilegeTerminalHandoffAfterAuthentication(t *testing.T) {
 		name         string
 		mode         SudoMode
 		sudoRSPrompt string
+		interpreter  Interpreter
 	}{
-		{"sudo", SudoModeSudo, ""},
-		{"su", SudoModeSu, ""},
-		{"sudo-rs", SudoModeSudo, "Password: "},
-		{"sudo-rs without trailing space", SudoModeSudo, "Password:"},
+		{"sudo", SudoModeSudo, "", ""},
+		{"su", SudoModeSu, "", ""},
+		{"fish sudo", SudoModeSudo, "", InterpreterFish},
+		{"fish su", SudoModeSu, "", InterpreterFish},
+		{"zsh sudo", SudoModeSudo, "", InterpreterZsh},
+		{"zsh su", SudoModeSu, "", InterpreterZsh},
+		{"fish sudo-rs", SudoModeSudo, "Password: ", InterpreterFish},
+		{"sudo-rs", SudoModeSudo, "Password: ", ""},
+		{"sudo-rs without trailing space", SudoModeSudo, "Password:", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			setTestHome(t)
@@ -30,6 +36,7 @@ func TestPrivilegeTerminalHandoffAfterAuthentication(t *testing.T) {
 			ui := &recoveryTestUI{values: []string{"wrong", "valid"}}
 			recorder := &testRecorder{}
 			client := exchangeTestClient(t, addr, mode, ui, recorder)
+			setPrivilegeTestExecution(client, tc.interpreter)
 			var activated, restored atomic.Int32
 			terminal := &privilegeTerminal{width: 100, height: 30, ignoreExit: true, activate: func(ctx context.Context, session *cryptoSSH.Session) (func() error, error) {
 				if evidence.attempts.Load() != 2 || session == nil {
@@ -131,4 +138,17 @@ func TestPrivilegeTerminalCancellationRestoresBeforeReturn(t *testing.T) {
 	if !errors.Is(err, context.Canceled) || restored.Load() != 1 || evidence.commands.Load() != 0 || recorder.sudoCalls != 0 {
 		t.Fatalf("incomplete cancellation cleanup: %v", err)
 	}
+}
+
+func setPrivilegeTestExecution(client *Client, interpreter Interpreter) {
+	if interpreter == "" {
+		return
+	}
+	dialect := LaunchPOSIX
+	if interpreter == InterpreterFish {
+		dialect = LaunchFish
+	}
+	client.cfgMu.Lock()
+	client.connCfg.Execution = &ExecutionConfig{Interpreter: interpreter, LaunchDialect: dialect}
+	client.cfgMu.Unlock()
 }

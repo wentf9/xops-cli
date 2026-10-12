@@ -2181,7 +2181,7 @@ func (s *Shell) handleExec(ctx context.Context, args []string) error {
 	execCfg := s.sshClient.Execution()
 	if s.cwd != "" {
 		var err error
-		execCfg, err = s.sshClient.ProbeControlledExecution(ctx, execCfg)
+		execCfg, err = s.sshClient.ResolveWorkingDirectoryExecution(ctx, execCfg)
 		if err != nil {
 			return fmt.Errorf("exec: resolve working directory adapter: %w", err)
 		}

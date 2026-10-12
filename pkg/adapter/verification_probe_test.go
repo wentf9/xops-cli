@@ -72,7 +72,7 @@ func TestVerificationProbeReusesAuthenticationWithoutPersistence(t *testing.T) {
 			} else {
 				result, verifyErr := VerifyConnectionWithProbe(ctx, preview, "draft", nil)
 				err = verifyErr
-				wantCommands = map[string]int32{"probe": 2, "restricted probe": 3, "probe timeout": 1}[mode]
+				wantCommands = map[string]int32{"probe": 2, "restricted probe": 4, "probe timeout": 1}[mode]
 				if mode != "probe" {
 					if !errors.Is(result.ProbeErr, ssh.ErrExecutionProbe) {
 						t.Fatalf("probe error not retained: %v", result.ProbeErr)

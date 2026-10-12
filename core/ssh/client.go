@@ -270,13 +270,14 @@ func NewTestClientWithRaw(rawClient *ssh.Client, connCfg ConnectionConfig) *Clie
 }
 
 type RunConfig struct {
-	Interpreter  Interpreter
-	LoginShell   bool
-	OutMode      OutputMode
-	RingMaxBytes int
-	StreamPrefix string
-	StreamWriter io.Writer
-	OutFile      *os.File
+	Interpreter   Interpreter
+	LaunchDialect LaunchDialect
+	LoginShell    bool
+	OutMode       OutputMode
+	RingMaxBytes  int
+	StreamPrefix  string
+	StreamWriter  io.Writer
+	OutFile       *os.File
 
 	// fileOutput replaces OutFile when its writes were bound to a context.
 	fileOutput io.Writer
@@ -290,6 +291,11 @@ func WithInterpreter(interp Interpreter) RunOption {
 	return func(c *RunConfig) {
 		c.Interpreter = interp
 	}
+}
+
+// WithLaunchDialect carries the frozen outer shell through legacy run adapters.
+func WithLaunchDialect(dialect LaunchDialect) RunOption {
+	return func(c *RunConfig) { c.LaunchDialect = dialect }
 }
 
 func WithLoginShell(login bool) RunOption {
@@ -336,8 +342,12 @@ func (c *Client) defaultRunConfig() *RunConfig {
 	config := DefaultRunConfig()
 	if c != nil {
 		if exec := c.Execution(); exec != nil {
+			config.LaunchDialect = exec.LaunchDialect
 			if exec.Interpreter != "" {
 				config.Interpreter = exec.Interpreter
+			}
+			if exec.Interpreter == InterpreterFish || exec.Interpreter == InterpreterZsh {
+				config.LoginShell = false
 			}
 			if exec.Login != nil {
 				config.LoginShell = *exec.Login
@@ -354,6 +364,23 @@ func (c *Client) Run(ctx context.Context, cmd string, opts ...RunOption) (string
 	}
 
 	var payload string
+	if usesPortableShellAdapter(config) {
+		login := LoginDisabled
+		if config.LoginShell {
+			login = LoginEnabled
+		}
+		if config.Interpreter == InterpreterSh {
+			login = LoginDisabled
+		}
+		if config.Interpreter == "" || config.Interpreter == InterpreterServer || config.Interpreter == InterpreterPwsh {
+			login = LoginInherit
+		}
+		plan, err := PlanCommand(cmd, CommandOptions{Interpreter: config.Interpreter, LaunchDialect: config.LaunchDialect, Login: login})
+		if err != nil {
+			return "", fmt.Errorf("plan Unix execution: %w", err)
+		}
+		return c.runRaw(ctx, plan.Payload(), config)
+	}
 	switch config.Interpreter {
 	case "", InterpreterServer:
 		payload = cmd
@@ -362,13 +389,17 @@ func (c *Client) Run(ctx context.Context, cmd string, opts ...RunOption) (string
 	case InterpreterSh:
 		payload = shCommandPayload(cmd)
 	default:
-		return "", fmt.Errorf("%w: unsupported interpreter %q for Run (only server, bash and sh are supported)", ErrExecutionValidation, config.Interpreter)
+		return "", fmt.Errorf("%w: unsupported interpreter %q for Run (only server, bash, sh and configured zsh/fish are supported)", ErrExecutionValidation, config.Interpreter)
 	}
 	return c.runRaw(ctx, payload, config)
 }
 
 // RunWithoutLogin 执行命令并在非登录 Shell 中运行，避免加载 profile 脚本产生干扰输出
 func (c *Client) RunWithoutLogin(ctx context.Context, cmd string) (string, error) {
+	config := c.defaultRunConfig()
+	if usesPortableShellAdapter(config) {
+		return c.runRaw(ctx, unixCommandPayload(InterpreterSh, cmd, false, config.LaunchDialect), config)
+	}
 	return c.runRaw(ctx, bashCommandPayload(cmd, false), DefaultRunConfig())
 }
 
@@ -398,8 +429,12 @@ func (c *Client) RunScript(ctx context.Context, scriptContent string, opts ...Ru
 		payload = bashScriptPayload(config.LoginShell)
 	case InterpreterSh:
 		payload = shScriptPayload()
+	case InterpreterZsh:
+		payload = zshScriptPayload(config.LoginShell)
+	case InterpreterFish:
+		payload = fishScriptPayload(config.LoginShell)
 	default:
-		return "", fmt.Errorf("%w: unsupported interpreter %q for RunScript (only bash and sh are supported)", ErrExecutionValidation, config.Interpreter)
+		return "", fmt.Errorf("%w: unsupported interpreter %q for RunScript (only bash, sh, zsh and fish are supported)", ErrExecutionValidation, config.Interpreter)
 	}
 
 	session, err := c.newSessionContext(ctx)
@@ -424,8 +459,8 @@ func (c *Client) RunScriptWithExecution(ctx context.Context, content string, exe
 	if err := execution.Validate(); err != nil {
 		return "", err
 	}
-	if execution.Interpreter != "" && execution.Interpreter != InterpreterBash && execution.Interpreter != InterpreterSh {
-		return "", fmt.Errorf("%w: unsupported interpreter %q for RunScriptWithExecution (only bash and sh are supported)", ErrExecutionValidation, execution.Interpreter)
+	if execution.Interpreter != "" && execution.Interpreter != InterpreterBash && execution.Interpreter != InterpreterSh && execution.Interpreter != InterpreterZsh && execution.Interpreter != InterpreterFish {
+		return "", fmt.Errorf("%w: unsupported interpreter %q for RunScriptWithExecution (only bash, sh, zsh and fish are supported)", ErrExecutionValidation, execution.Interpreter)
 	}
 	opts := make([]RunOption, len(extraOpts))
 	copy(opts, extraOpts)

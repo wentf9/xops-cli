@@ -20,16 +20,24 @@ func FormatWorkingDirCommand(cwd, command string, execution *ExecutionConfig) (s
 	case InterpreterServer:
 		return "", fmt.Errorf("%w: server interpreter does not support inheriting working directory %q", ErrExecutionValidation, cwd)
 
-	case InterpreterBash, InterpreterSh:
+	case InterpreterBash, InterpreterSh, InterpreterZsh:
 		escaped := strings.ReplaceAll(cwd, "'", "'\\''")
-		return fmt.Sprintf("cd -- '%s' && %s", escaped, command), nil
+		// A brace group keeps every statement conditional on a successful cd.
+		return fmt.Sprintf("cd -- '%s' && {\n%s\n}", escaped, command), nil
+
+	case InterpreterFish:
+		// Guard the entire program, including semicolon-separated commands and
+		// trailing comments, while preserving the program's exit status.
+		return "cd -- " + fishQuote(cwd) + "; and begin\n" + command + "\nend", nil
 
 	case InterpreterCmd:
 		cwd = NormalizeWindowsSFTPWorkingDir(cwd)
 		if strings.ContainsAny(cwd, "%!^\r\n\"\x00") {
 			return "", fmt.Errorf("%w: cmd working directory contains unsupported or expandable characters: %q", ErrExecutionValidation, cwd)
 		}
-		return fmt.Sprintf(`cd /d "%s" && %s`, cwd, command), nil
+		// Exit this CMD invocation on cd failure before any user statement,
+		// retaining ERRORLEVEL and avoiding changes to the user command grammar.
+		return fmt.Sprintf(`cd /d "%s" || exit /b & %s`, cwd, command), nil
 
 	case InterpreterPowerShell, InterpreterPwsh:
 		if interp == InterpreterPowerShell || execution.LaunchDialect == LaunchCmd {

@@ -36,21 +36,21 @@ func TestFormatWorkingDirCommand(t *testing.T) {
 			cwd:       "-strange-dir",
 			command:   "echo hi",
 			execution: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash},
-			want:      "cd -- '-strange-dir' && echo hi",
+			want:      "cd -- '-strange-dir' && {\necho hi\n}",
 		},
 		{
 			name:      "cwd with single quotes escaped in bash",
 			cwd:       "/path/with'quote",
 			command:   "pwd",
 			execution: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash},
-			want:      "cd -- '/path/with'\\''quote' && pwd",
+			want:      "cd -- '/path/with'\\''quote' && {\npwd\n}",
 		},
 		{
 			name:      "sh interpreter formats posix cd",
 			cwd:       "/home/user",
 			command:   "whoami",
 			execution: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterSh},
-			want:      "cd -- '/home/user' && whoami",
+			want:      "cd -- '/home/user' && {\nwhoami\n}",
 		},
 		{
 			name:      "server interpreter with root slash rejected",
@@ -78,7 +78,7 @@ func TestFormatWorkingDirCommand(t *testing.T) {
 			cwd:       `C:\Program Files (x86)\App & Tools`,
 			command:   "dir",
 			execution: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterCmd},
-			want:      `cd /d "C:\Program Files (x86)\App & Tools" && dir`,
+			want:      `cd /d "C:\Program Files (x86)\App & Tools" || exit /b & dir`,
 		},
 		{
 			name:      "cmd interpreter rejects percent environment variable expansion",

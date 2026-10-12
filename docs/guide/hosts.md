@@ -74,20 +74,20 @@ xops host probe --all --save
 
 `--all` 与节点或别名参数互斥，按节点 ID 顺序探测全部已保存节点（不含 OpenSSH 虚拟节点）。单节点失败后继续探测其余节点，并在结束时返回汇总错误和非零退出码；取消操作会停止后续探测。空节点列表仅输出提示。`--all --save` 仅保存成功节点，失败或并发修改的节点不会被覆盖，已成功保存的节点不会回滚。
 
-`--skip-verify` 同时跳过探针；`--probe` 与 `--no-probe` 不能同时指定。显式执行字段始终保留，
-若与探测结果不兼容，会输出警告并仅保存显式字段。探测失败时不会持久化部分推荐。
+`--skip-verify` 同时跳过探针；`--probe` 与 `--no-probe` 不能同时指定。显式执行字段始终保留，若与探测结果不兼容，会输出警告并仅保存显式字段。探测失败时不会持久化部分推荐。
 
 探测连接使用独立的 `server/unknown` 配置，目标及跳板的命令执行配置不参与探测连接的解析。
-例如全局为 `bash/posix` 时，新节点仍可仅指定 `--interpreter powershell`，由探针补齐 Windows
-启动方言；全局配置保持不变，连接凭据、主机密钥校验和跳板路径照常使用。
+例如全局为 `bash/posix` 时，新节点仍可仅指定 `--interpreter powershell`，由探针补齐 Windows启动方言；全局配置保持不变，连接凭据、主机密钥校验和跳板路径照常使用。
 
-`host probe` 使用现有连接凭据进行非交互式认证，显示远端系统、Shell 路径、SSH 标识、启动方言、
-可用解释器与推荐配置；无法确定的元数据以 `-` 显示。仅 `--save` 写回配置；探测失败或节点在探测
-期间被修改时不保存，并返回非零退出码。Linux 通常推荐 bash（其次 sh），关闭 login；Windows CMD
-存在 Windows PowerShell 时仍推荐 `server/cmd`。探测不会翻译用户命令。
+`host probe` 使用现有连接凭据进行非交互式认证，显示远端系统、Shell 路径、SSH 标识、启动方言、可用解释器与推荐配置；无法确定的元数据以 `-` 显示。仅 `--save` 写回配置；探测失败或节点在探测期间被修改时不保存，并返回非零退出码。Unix 节点优先推荐受支持且可用的远端默认 Shell，默认关闭login；Windows CMD存在 Windows PowerShell 时仍推荐 `server/cmd`。探测不会翻译用户命令。
 
-直接 SSH/交互式 exec 首次连接新节点时，若已启用凭据记忆且执行配置未指定，会在认证成功后、
-节点确认前复用连接探测，并随新节点原子保存推荐。仅会话凭据、非交互 exec 批处理、已有节点及显式执行配置不触发此路径。CLI 显式 `--interpreter`、`--launch-dialect`、`--login-shell` 或 `--no-login`（包括显式 false）会跳过目标节点的录入探测，参数仅用于本次会话；凭据记忆和其他节点的探测策略照常生效。
+默认 Shell 为 fish 的节点会探测为 `launch_dialect: fish`，命令参数使用 fish 专用转义。优先推荐 fish，默认关闭 login。可通过 `--interpreter fish` 显式选择 fish；`host probe --save` 和 `host probe --all --save` 会保存探测到的外层方言。支持 fish 命令与 Playbook 脚本（含 `#!/usr/bin/env fish`），不会将 fish 命令翻译为 POSIX 语法。ensure 检查支持原生 bash/sh/zsh/fish，保留默认 fish 配置并复用同一配置完成检查、action 与复查。fish 外层 Shell 与 fish 解释器支持免密 sudo、密码 sudo 和 su，认证握手使用 `/bin/sh`，详情见[SSH 与提权](./ssh)。
+
+默认 Shell 为 zsh 的节点沿用 `launch_dialect: posix`。`host probe` 会优先推荐可用的 zsh，即使同时安装了 bash/sh；添加节点时仍可通过 `--interpreter` 显式覆盖推荐。支持 zsh 命令、工作目录、登录模式、`#!/usr/bin/env zsh` Playbook 脚本、ensure 检查、sudo 和 su。提权复用现有 POSIX 认证与控制 Shell，用户代码由 zsh 执行。zsh 并不完全兼容 Bash（见 [zsh 兼容性说明](https://zsh.sourceforge.io/Doc/Release/Invocation.html#Compatibility)）。
+
+Unix 推荐优先遵循远端报告的默认 Shell（`$SHELL`），支持 bash、sh、zsh 和 fish；ash/dash 映射为 sh。探针确认外层为 fish 时优先采用 fish，避免继承的 `$SHELL` 过期造成误选。所选解释器必须出现在可用列表中；默认 Shell 未知、不支持或不在 PATH 中时，才按 bash → sh → zsh → fish 回退。远端 Shell 路径只用于匹配固定解释器名称，不会拼入执行命令。此规则同时适用于添加/导入、首次连接、运行时探测及 `host probe --save`，显式执行字段仍优先。
+
+直接 SSH/交互式 exec 首次连接新节点时，若已启用凭据记忆且执行配置未指定，会在认证成功后、节点确认前复用连接探测，并随新节点原子保存推荐。仅会话凭据、非交互 exec 批处理、已有节点及显式执行配置不触发此路径。CLI 显式 `--interpreter`、`--launch-dialect`、`--login-shell` 或 `--no-login`（包括显式 false）会跳过目标节点的录入探测，参数仅用于本次会话；凭据记忆和其他节点的探测策略照常生效。
 探针失败只警告，认证成功的节点仍按原策略保存。如果底层连接已断开，连接请求返回错误，不缓存该连接或派发用户命令。TUI 添加仍使用原有纯连接验证。
 
 Playbook 无 shebang 的 script、ensure 及 SFTP 非空 cwd 的 `exec` 可在执行配置未指定时按需探测。

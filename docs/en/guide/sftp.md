@@ -1,13 +1,16 @@
 # SFTP and file transfer
 
+Bash/sh/zsh/fish `exec` with a nonempty working directory guards the entire user program with a conditional block. A failed directory change prevents all semicolon-separated and multiline commands from running; successful changes preserve the user program's exit status.
+
 SFTP `exec` with a nonempty current directory probes unspecified execution settings before sending user
 work. The bounded, read-only result is cached for the connection and is not written to disk. Linux uses
-bash/sh; Windows CMD prefers installed PowerShell for cwd support, falling back to CMD when needed.
-Explicit interpreter choices are preserved, and explicit `server` still rejects a nonempty cwd. Empty-cwd
-ordinary commands do not probe. A failed probe stops before user work and never retries it under another
+the supported default bash/sh/zsh/fish shell; Windows CMD prefers installed PowerShell for cwd support, falling back to CMD when needed.
+For saved `server/cmd`, a cwd-aware command uses a temporary CMD adapter with `cd /d`, preserving native CMD syntax without probing or changing saved execution settings. Other explicit `server` configurations still reject a nonempty cwd. Empty-cwd ordinary commands remain native and do not probe. A failed probe stops before user work and never retries it under another
 interpreter. Windows `/C:/...` SFTP paths become `C:/...`, and the drive root `/C:` becomes `C:/`.
 Cross-platform pwsh selects paths using its own `$IsWindows`, including explicit configurations on cold
 connections without a probe cache. POSIX paths are preserved.
+
+CMD working-directory commands use `cd /d "directory" || exit /b & user-command`. A failed directory change immediately exits that CMD invocation with its failure status, preventing all later `&`, `&&`, `||` and grouped commands from running. Successful changes preserve native CMD commands, comments and user-program exit codes.
 
 In batch mode, `lls`/`lll` and remote `ls`/`ll` fail on missing paths or directory read errors. A listing failure in any wildcard match stops the remaining matches and subsequent commands.
 

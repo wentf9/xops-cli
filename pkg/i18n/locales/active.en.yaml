@@ -150,11 +150,11 @@ flag_exec_task:
 flag_exec_no_login:
   other: "Do not load login shell (prevents welcome messages/MOTD)"
 flag_exec_interpreter:
-  other: "Ordinary command interpreter: server (unchanged SSH exec) or bash; explicit mode supports bounded buffers or Linux PTY output"
+  other: "Ordinary command interpreter: server (unchanged SSH exec), bash, sh, zsh, fish, powershell, pwsh or cmd; explicit mode supports bounded buffers or Linux PTY output"
 flag_exec_launch_dialect:
-  other: "Server launch dialect: unknown, posix, powershell or cmd; explicit Bash requires posix"
+  other: "Server launch dialect: unknown, posix, fish, powershell or cmd; Bash/sh/zsh/fish require posix or fish"
 flag_exec_login_shell:
-  other: "Enable/disable login for an explicit Bash interpreter; incompatible with server and --no-login"
+  other: "Enable/disable login for an explicit Bash/zsh/fish interpreter; incompatible with server and --no-login"
 flag_exec_stream:
   other: "Enable real-time stream output (adds host prefix in multi-host mode)"
 flag_exec_out_dir:
@@ -1109,7 +1109,7 @@ flag_host_probe_save:
 inventory_probe_short:
   other: "Probe a saved node's SSH execution environment"
 inventory_probe_long:
-  other: "Use saved connection credentials to detect the outer shell and available interpreters. Specify a node or --all for every saved node in node ID order. Failed nodes do not stop --all; any failure returns a nonzero exit status. Display the recommendation; --save replaces only successfully probed nodes' execution settings. Authentication is non-interactive; concurrent node edits prevent saving."
+  other: "Use saved connection credentials to detect the outer shell and available interpreters. Specify a node or --all for every saved node in node ID order. Failed nodes do not stop --all; any failure returns a nonzero exit status. Prefer a supported, available Unix default shell; otherwise fall back to bash, sh, zsh, then fish. Display the recommendation; --save replaces only successfully probed nodes' execution settings. Authentication is non-interactive; concurrent node edits prevent saving."
 inventory_probe_warning:
   other: "[{{.Node}}] warning: execution probe unavailable; preserving explicit settings or server defaults: {{.Error}}"
 inventory_probe_saved:
@@ -1134,6 +1134,6 @@ inventory_probe_duration:
   other: "Probe duration"
 
 flag_host_interpreter:
-  other: "Explicit interpreter for new nodes: server, bash, sh, powershell, pwsh or cmd"
+  other: "Explicit interpreter for new nodes: server, bash, sh, zsh, fish, powershell, pwsh or cmd"
 flag_host_launch_dialect:
-  other: "Explicit launch dialect for new nodes: unknown, posix, powershell or cmd"
+  other: "Explicit launch dialect for new nodes: unknown, posix, fish, powershell or cmd"

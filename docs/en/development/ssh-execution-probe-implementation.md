@@ -10,7 +10,7 @@ Standard command executions do not probe or replay upon failure. Initial dynamic
 
 - `NeedsExecutionProbe` identifies only configurations without an explicit interpreter, with an unknown dialect, and inheriting login mode. Any explicit interpreter (including `server`), known dialect, or explicit login setting is never overwritten.
 - Playbook scripts without a shebang probe under the default environment above; BOMs, unsupported shebangs, and explicit execution configurations continue using existing validation rules. Whitelisted shebangs do not prove outer dialects and do not trigger extra probes.
-- `ensure` probes and freezes configuration before inspection; check, action, and re-check steps share the identical configuration. Currently limited to POSIX bash/sh; Windows script/ensure steps are rejected before user code starts without syntax translation.
+- `ensure` probes and freezes configuration before inspection; check, action, and re-check steps share the identical configuration. Supports bash/sh/zsh/fish with a posix/fish outer dialect; Windows script/ensure steps are rejected before user code starts without syntax translation.
 - SFTP exec with non-empty `cwd` probes as needed. CMD's default recommendation remains `server`, but restricted operations select installed PowerShell/pwsh/cmd adapters. Ordinary commands with empty `cwd` do not probe. Windows SFTP drive path conversion follows Windows adapter constraints; cross-platform pwsh uses its internal `$IsWindows` at execution time without relying on probe cache; Linux pwsh POSIX paths remain unchanged. The `/C:` drive root converts to absolute `C:/`.
 - Caches are shared by the physical connection's PooledClient; newly obtained Client wrappers reuse identical success or failure results. `CachedExecutionProbe` does not initiate network calls, does not block on in-progress probes, and returns a deep copy.
 - Added optional Core `AuthenticatedConnectionConfirmer` capability, receiving an authenticated Client after handshake success but before node confirmation and credential persistence, with retention, closure, or command execution prohibited. Legacy ConnectionConfirmer retains fallback behavior.
@@ -44,7 +44,7 @@ PowerShell Stage 2 executes static queries directly without depending on `powers
 
 Two further refinements following review: POSIX initial probe employs `if :; then ...; fi` syntax guards, preventing Linux PowerShell 7 (which supports `$()`, `||`, and external `printf`) from misidentification as POSIX; CMD enumeration executes explicit `exit /b 0` after termination frames, avoiding leftover `where` non-zero exit codes when optional interpreters are missing. CMD end frames enclose `echo` in parentheses to prevent trailing spaces before command separators from entering the frame.
 
-CMD preserves design recommendations: `server/cmd` when Windows PowerShell is present, `cmd/cmd` when CMD alone exists. PowerShell outer shells recommend `powershell` first, or `pwsh` if only Core is available. POSIX prefers `bash`, then `sh`, both disabling login; fails if no supported interpreter is detected. All successful recommendations pass `Validate()`.
+CMD preserves design recommendations: `server/cmd` when Windows PowerShell is present, `cmd/cmd` when CMD alone exists. PowerShell outer shells recommend `powershell` first, or `pwsh` if only Core is available. POSIX/fish prefers the supported and available remote default shell (bash/sh/zsh/fish; ash/dash map to sh). A native fish dialect overrides stale `$SHELL` metadata. Unknown, unsupported or unavailable defaults fall back to bash → sh → zsh → fish, with login disabled; no supported interpreter is a probe failure. All successful recommendations pass `Validate()`.
 
 Payloads are generated strictly from static constants and dialect wrappers without inserting node fields, banners, or remote output, without creating remote files, requesting PTYs, or escalating privileges.
 
@@ -71,3 +71,11 @@ golangci-lint run ./...
 # Native shell regression test; runs on target platform, skips uninstalled shells
 go test ./core/ssh -run '^TestProbeShell' -count=1 -v
 ```
+
+Fish ensure registers `function <random-frame-name> --on-event fish_exit` and uses `builtin printf` to report the check exit code, preserving normal completion and explicit `exit`. Exec replacement or parse failure emits no result frame, so actions remain blocked. Fish working-directory commands guard the whole compound program with `cd ...; and begin ... end`. See [fish events](https://fishshell.com/docs/current/language.html#event).
+
+Ensure blocks statuses 126/127 for all interpreters and additionally 121/123/124/125 for fish before authorizing actions. Explicit reserved exits follow the same conservative policy. Bash/sh/zsh working-directory payloads guard the entire program with `cd ... && { ...; }`, matching the fish block behavior. See [fish status codes](https://fishshell.com/docs/current/language.html#the-status-variable).
+
+SFTP exec resolves cwd through `ResolveWorkingDirectoryExecution`. Saved server/cmd (including a cmd-only dialect setting) derives a temporary cmd/cmd adapter without probing, then applies `cd /d` and drive-path normalization. The connection/node configuration is unchanged. Other explicit server dialects are not inferred from paths such as `/C:`.
+
+CMD cwd payloads use an early-exit guard: `cd /d "..." || exit /b & ...`. Omitting an explicit exit code retains the failed cd ERRORLEVEL. On success, the guard is skipped and user code gets no extra grouping or interpreter layer, preserving rem comments, groups and explicit exit codes. Native Windows regression tests cover the guard; read-only commands on vm also verified that a failed directory prevents subsequent statements. See [Microsoft exit documentation](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/exit).

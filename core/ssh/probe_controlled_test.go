@@ -95,12 +95,12 @@ func TestWindowsSFTPDrivePathsPreservePOSIXSemantics(t *testing.T) {
 		dialect     LaunchDialect
 		want        string
 	}{
-		{InterpreterCmd, LaunchCmd, `cd /d "C:/Users/fixture" && echo ok`},
+		{InterpreterCmd, LaunchCmd, `cd /d "C:/Users/fixture" || exit /b & echo ok`},
 		{InterpreterPowerShell, LaunchPowerShell, "Set-Location -LiteralPath 'C:/Users/fixture' -ErrorAction Stop; echo ok"},
 		{InterpreterPwsh, LaunchCmd, "Set-Location -LiteralPath 'C:/Users/fixture' -ErrorAction Stop; echo ok"},
 		{InterpreterPwsh, LaunchPOSIX, "Set-Location -LiteralPath $(if ($IsWindows) { 'C:/Users/fixture' } else { '/C:/Users/fixture' }) -ErrorAction Stop; echo ok"},
 		{InterpreterPwsh, LaunchPowerShell, "Set-Location -LiteralPath $(if ($IsWindows) { 'C:/Users/fixture' } else { '/C:/Users/fixture' }) -ErrorAction Stop; echo ok"},
-		{InterpreterSh, LaunchPOSIX, "cd -- '/C:/Users/fixture' && echo ok"},
+		{InterpreterSh, LaunchPOSIX, "cd -- '/C:/Users/fixture' && {\necho ok\n}"},
 	} {
 		got, err := FormatWorkingDirCommand("/C:/Users/fixture", "echo ok", &ExecutionConfig{Interpreter: tt.interpreter, LaunchDialect: tt.dialect})
 		if err != nil || got != tt.want {
@@ -112,5 +112,48 @@ func TestWindowsSFTPDrivePathsPreservePOSIXSemantics(t *testing.T) {
 	}
 	if got := NormalizeWindowsSFTPWorkingDir("/C:"); got != "C:/" {
 		t.Fatalf("drive root became a relative path: %q", got)
+	}
+}
+
+func TestWorkingDirectoryExecutionPreservesNativeCMD(t *testing.T) {
+	for _, interpreter := range []Interpreter{InterpreterServer, ""} {
+		execution := &ExecutionConfig{Interpreter: interpreter, LaunchDialect: LaunchCmd}
+		client := NewTestClient(ConnectionConfig{Execution: execution.Clone()})
+		resolved, err := client.ResolveWorkingDirectoryExecution(t.Context(), execution)
+		if err != nil || resolved.Interpreter != InterpreterCmd || resolved.LaunchDialect != LaunchCmd {
+			t.Fatalf("known CMD cwd adapter = %+v, %v", resolved, err)
+		}
+		if !reflect.DeepEqual(execution, client.Execution()) || resolved == execution {
+			t.Fatal("cwd adapter mutated connection or caller configuration")
+		}
+		if _, cached := client.CachedExecutionProbe(); cached {
+			t.Fatal("known CMD cwd adapter started a probe")
+		}
+		for _, cwd := range []string{"/C:", "/C:/", "/C:/Windows"} {
+			command, err := FormatWorkingDirCommand(cwd, "dir", resolved)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(command, "/C:") || !strings.HasPrefix(command, `cd /d "C:/`) {
+				t.Fatalf("Windows cwd was not normalized: %q", command)
+			}
+			if _, err := PlanCommand(command, resolved.CommandOptions()); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+func TestWorkingDirectoryExecutionDoesNotGuessUnknownServerDialect(t *testing.T) {
+	for _, dialect := range []LaunchDialect{"", LaunchUnknown, LaunchPOSIX, LaunchFish, LaunchPowerShell} {
+		execution := &ExecutionConfig{Interpreter: InterpreterServer, LaunchDialect: dialect}
+		client := NewTestClient(ConnectionConfig{Execution: execution})
+		resolved, err := client.ResolveWorkingDirectoryExecution(t.Context(), execution)
+		if err != nil || resolved.Interpreter != InterpreterServer || resolved.LaunchDialect != dialect {
+			t.Fatalf("explicit server choice changed: %+v, %v", resolved, err)
+		}
+		if _, err := FormatWorkingDirCommand("/C:", "dir", resolved); err == nil {
+			t.Fatalf("path inferred Windows semantics for dialect %q", dialect)
+		}
 	}
 }

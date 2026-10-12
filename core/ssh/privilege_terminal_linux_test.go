@@ -74,10 +74,11 @@ func TestInteractivePrivilegePTYRestoresModeAndFirstInput(t *testing.T) {
 	for _, test := range []struct {
 		mode                   SudoMode
 		shell, signal, missing bool
-	}{{SudoModeSudo, false, false, false}, {SudoModeSu, false, false, false}, {SudoModeSudo, true, false, false}, {SudoModeSu, true, false, false},
-		{SudoModeSudo, false, true, false}, {SudoModeSu, false, true, false}, {SudoModeSudo, false, false, true}, {SudoModeSu, false, false, true}} {
+		interpreter            Interpreter
+	}{{SudoModeSudo, false, false, false, ""}, {SudoModeSu, false, false, false, ""}, {SudoModeSudo, true, false, false, ""}, {SudoModeSu, true, false, false, ""},
+		{SudoModeSudo, false, true, false, ""}, {SudoModeSu, false, true, false, ""}, {SudoModeSudo, false, false, true, ""}, {SudoModeSu, false, false, true, ""}, {SudoModeSudo, false, false, false, InterpreterFish}, {SudoModeSu, true, false, false, InterpreterFish}, {SudoModeSudo, false, false, false, InterpreterZsh}, {SudoModeSu, true, false, false, InterpreterZsh}} {
 		mode := test.mode
-		t.Run(fmt.Sprintf("%s/shell=%t/signal=%t/missing=%t", mode, test.shell, test.signal, test.missing), func(t *testing.T) {
+		t.Run(fmt.Sprintf("%s/shell=%t/signal=%t/missing=%t/interpreter=%s", mode, test.shell, test.signal, test.missing, test.interpreter), func(t *testing.T) {
 			setTestHome(t)
 			master, slave := openPrivilegeTestPTY(t)
 			before, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
@@ -88,6 +89,7 @@ func TestInteractivePrivilegePTYRestoresModeAndFirstInput(t *testing.T) {
 			ui := &canonicalPrivilegeUI{recoveryTestUI: recoveryTestUI{values: []string{"wrong", "valid"}}, terminal: slave}
 			recorder := &testRecorder{}
 			client := exchangeTestClient(t, addr, mode, ui, recorder)
+			setPrivilegeTestExecution(client, test.interpreter)
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
 			if err := master.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {

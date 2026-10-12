@@ -89,8 +89,14 @@ routes still apply.
 `host probe` authenticates non-interactively with existing credentials and displays the remote OS,
 shell path, SSH banner, launch dialect, available interpreters and recommendation. Unknown metadata is
 shown as `-`. Only `--save` writes configuration; probe failures and concurrent node edits prevent saving
-and return a nonzero exit status. Linux normally recommends bash, then sh, with login disabled. Windows
+and return a nonzero exit status. Unix nodes prefer a supported, available remote default shell, with login disabled. Windows
 CMD with Windows PowerShell available still recommends `server/cmd`. Probing does not translate commands.
+
+Fish default shells are detected as `launch_dialect: fish`, with fish-specific argument escaping. Recommendations prefer fish, with login disabled. To select fish explicitly, use `--interpreter fish`; `host probe --save` and `host probe --all --save` persist the detected outer dialect. Fish commands and Playbook scripts (including `#!/usr/bin/env fish`) are supported; fish commands are not translated to POSIX syntax. Ensure checks support native bash/sh/zsh/fish, retaining the default fish configuration for check, action and verification. Fish outer shells and the fish interpreter support passwordless sudo, password sudo and su, using `/bin/sh` for the authentication handshake; see [SSH and privilege escalation](./ssh).
+
+Zsh default shells use `launch_dialect: posix`. `host probe` prefers available zsh even when bash/sh are also installed; explicit `--interpreter` choices still override recommendations. Zsh supports commands, working directories, login mode, Playbook scripts with `#!/usr/bin/env zsh`, ensure checks, sudo and su. Privilege execution shares the existing POSIX authentication/control shell; user code runs in zsh. Zsh is not fully Bash-compatible ([zsh compatibility](https://zsh.sourceforge.io/Doc/Release/Invocation.html#Compatibility)).
+
+Unix recommendations prefer the default shell reported in `$SHELL`: bash, sh, zsh or fish; ash/dash map to sh. A native fish dialect probe takes precedence over a stale inherited `$SHELL`. The selected interpreter must be available on PATH. Only unknown, unsupported or unavailable defaults fall back to bash → sh → zsh → fish. Remote shell paths select fixed interpreter names and are never interpolated into commands. This rule applies to add/import, enrollment, runtime probes and `host probe --save`; explicit execution fields retain priority.
 
 Direct SSH and interactive exec first connections also probe after authentication and before confirming
 a new node when credential remembering is enabled and execution is unspecified. The recommendation is
