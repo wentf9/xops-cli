@@ -13,6 +13,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/core/testutil/sshfixture"
+	"github.com/wentf9/xops-cli/pkg/i18n"
 	cryptoSSH "golang.org/x/crypto/ssh"
 )
 
@@ -150,6 +151,9 @@ func (v execFixtureVerifier) Verify(ctx context.Context, _ ssh.HostKeyRequest, k
 }
 
 func TestExecExplicitTaskUsesFrozenPlan(t *testing.T) {
+	if err := i18n.Init("en"); err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	t.Cleanup(cancel)
 	server, err := sshfixture.New(ctx)
