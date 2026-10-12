@@ -77,14 +77,17 @@ func WithRememberConfirmation(confirm func(context.Context, string) (bool, error
 
 // SSHAdapter 实现 ssh.ConnectionProvider, ssh.SecretResolver, ssh.CredentialRecorder 接口，作为业务模型与底层 SSH 的防腐层
 type SSHAdapter struct {
-	cfgProvider          config.ConfigProvider
-	credentialResolver   CredentialResolver
-	credentialService    *credential.Service
-	sessionOverrides     map[string]SessionAuth
-	globalSessionAuth    *SessionAuth
-	nonInteractive       bool
-	credentialRecording  bool
-	rememberConfirmation func(context.Context, string) (bool, error)
+	cfgProvider             config.ConfigProvider
+	credentialResolver      CredentialResolver
+	credentialService       *credential.Service
+	sessionOverrides        map[string]SessionAuth
+	globalSessionAuth       *SessionAuth
+	nonInteractive          bool
+	credentialRecording     bool
+	rememberConfirmation    func(context.Context, string) (bool, error)
+	enrollmentProbe         bool
+	enrollmentProbeWarning  func(string, error)
+	enrollmentProbeExcluded map[string]struct{}
 }
 
 // WithCredentialService injects the transactional writer used when an

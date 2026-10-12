@@ -28,7 +28,7 @@ golangci-lint run ./...
 - [SSH 多解释器执行与兼容性设计](./ssh-execution-compatibility.md)
 - [SSH 执行兼容性实施计划](./ssh-execution-implementation.md)
 - [SSH 解释器与启动方言自动探测设计](./ssh-execution-probe-design.md)
-- [SSH 执行环境探针实施记录（M1–M3）](./ssh-execution-probe-implementation.md)
+- [SSH 执行环境探针实施记录（M1–M4）](./ssh-execution-probe-implementation.md)
 - [公共代码与 MCP 接口解耦设计](./shared-core-decoupling)
 - [凭据零配置体验设计](./credential-experience-design)
 - [凭据体验实施计划](./credential-experience-plan)

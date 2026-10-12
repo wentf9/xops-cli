@@ -1,6 +1,6 @@
 # SSH 解释器与启动方言自动探测设计
 
-**文档状态**：实施中（M1/M2 与 M3 CLI 添加/导入及诊断已实现；动态录入及 M4 待接入；协议修正与验证范围见[实施记录](./ssh-execution-probe-implementation.md)）
+**文档状态**：M1–M4 已实现（接入条件、协议修正与验证范围见[实施记录](./ssh-execution-probe-implementation.md)）
 
 **依据文档**：[SSH 多解释器执行与兼容性设计](./ssh-execution-compatibility.md)、[SSH 执行兼容性实施计划](./ssh-execution-implementation.md)
 
@@ -72,13 +72,14 @@ Level 4: 连接级会话缓存 (Session Cache)   ──► 单次 SSH Client 生
 
 ### 2.3 接入层级三：运行时受限操作懒加载 (Lazy On-Demand Probing)
 - 仅当且仅当发生以下情况，且节点当前有效配置为缺省的 `server` + `unknown` 时触发单次懒加载：
-  - 执行 Playbook `script` 步骤且脚本缺少白名单 shebang；
+  - 执行 Playbook `script` 步骤且脚本没有 shebang，并且未指定解释器；不自动替换不支持的 shebang 或 BOM；
   - 执行 Playbook `ensure` 检查步骤（需要受控 Shell 捕获控制帧）；
   - 执行 SFTP `exec` 且带有非空工作目录 `cwd`。
 - 探测成功后仅将配置缓存在当前运行进程的内存上下文中，不自动改写静态磁盘配置文件。
+- 显式解释器（包括 `server`）、已知方言及显式 login 不被懒加载替换。script/ensure 当前仅支持 POSIX bash/sh。
 
 ### 2.4 接入层级四：连接级内存缓存 (Connection-Level Session Cache)
-- 在 `ssh.Client` 内部维护受并发锁保护的 `probeCache *ProbeResult`；
+- Client 引用受并发锁保护的探测状态，连接池中的包装对象共享同一缓存；
 - 同一个连接生命周期内，探测只执行一次。后续并发任务或连续的数十个步骤完全命中内存缓存，网络开销为 0。
 
 ---
@@ -135,9 +136,10 @@ SSH `exec` 的输入为裸字符串，远端使用默认登录 Shell 解析。�
 
 3. **Windows PowerShell 备选探针**：
    ```powershell
-   Write-Output ('__XOPS_DIALECT_POWERSHELL__:' + $PSVersionTable.PSVersion.ToString())
+   Write-Output ('__XOPS_DIALECT_POWERSHELL__:' + $PSVersionTable.PSVersion.ToString()); Write-Output ('__XOPS_PLATFORM__:' + [Environment]::OSVersion.Platform)
    ```
    - **PowerShell DefaultShell**：输出 `__XOPS_DIALECT_POWERSHELL__:<Version>`，退出码为 0。确认为 `LaunchPowerShell`。
+   - **平台元数据**：`__XOPS_PLATFORM__:Win32NT` 明确标识 Windows；`Unix` 保留为 Unix 平台。不凭语言版本猜测操作系统。
 
 4. **安全兜底**：
    若上述探针均在有界超时内未收到有效特征帧，结果标记为 `LaunchUnknown`。

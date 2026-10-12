@@ -433,7 +433,7 @@ func (c *Connector) connectNode(ctx context.Context, planNode connectionPlanNode
 }
 
 func (c *Connector) wrapCachedClient(cfg *ClientConfig, cachedClient *PooledClient) *Client {
-	return c.configureClient(newClientWithComponents(
+	client := c.configureClient(newClientWithComponents(
 		cachedClient.SSHClient,
 		cachedClient.RootConn,
 		cfg,
@@ -446,6 +446,13 @@ func (c *Connector) wrapCachedClient(cfg *ClientConfig, cachedClient *PooledClie
 		c.getInteractionTimeout(),
 		c.getLogger(),
 	))
+	cachedClient.probeMu.Lock()
+	if cachedClient.probeCache == nil {
+		cachedClient.probeCache = &executionProbeCache{}
+	}
+	client.probeCache = cachedClient.probeCache
+	cachedClient.probeMu.Unlock()
+	return client
 }
 
 // Cache revalidation is a finite acquisition step, unlike background liveness
@@ -535,7 +542,15 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 			return nil, errors.Join(fmt.Errorf("release SSH authentication material: %w", err), closeResource(rawClient, "SSH client after authentication cleanup"), closeResource(rootConn, "SSH transport after authentication cleanup"))
 		}
 	}
-	if err := c.confirmAuthenticatedConnection(ctx, nodeName, rootConn); err != nil {
+	transportRoot := rootConn
+	if proxy, ok := dialer.(*SSHProxyDialer); ok && proxy.RootConn != nil {
+		transportRoot = proxy.RootConn
+	}
+	client := c.wrapCachedClient(cfg, &PooledClient{SSHClient: rawClient, RootConn: transportRoot})
+	if err := c.confirmAuthenticatedConnection(ctx, nodeName, rootConn, client, cfg); err != nil {
+		return nil, err
+	}
+	if err := checkInitializedTransport(nodeName, cfg, client); err != nil {
 		return nil, err
 	}
 
@@ -574,11 +589,10 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 	cfg.Passphrase = ""
 	cfg.SuPwd = ""
 
-	transportRoot := rootConn
-	if proxy, ok := dialer.(*SSHProxyDialer); ok && proxy.RootConn != nil {
-		transportRoot = proxy.RootConn
+	if err := checkInitializedTransport(nodeName, cfg, client); err != nil {
+		return nil, err
 	}
-	pooled := &PooledClient{SSHClient: rawClient, RootConn: transportRoot}
+	pooled := &PooledClient{SSHClient: rawClient, RootConn: transportRoot, probeCache: client.executionProbeCache()}
 	if err := c.publishClient(nodeName, pooled); err != nil {
 		if closeErr := rootConn.Close(); closeErr != nil {
 			return nil, fmt.Errorf("%w; close unpublished SSH client failed: %w", err, closeErr)
@@ -587,19 +601,10 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 	}
 	c.startKeepAliveFor(nodeName, pooled)
 	// 返回封装的 Client，注入组件，且 Client 不持有 AuthMaterial
-	return c.configureClient(newClientWithComponents(
-		rawClient,
-		transportRoot,
-		cfg,
-		c.provider,
-		c.secretResolver,
-		c.secretPrompter,
-		c.credentialRecorder,
-		c.PasswordPromptPattern,
-		c.getHandshakeTimeout(),
-		c.getInteractionTimeout(),
-		c.getLogger(),
-	)), nil
+	client.cfgMu.Lock()
+	client.connCfg = cfg.ToConnectionConfig()
+	client.cfgMu.Unlock()
+	return client, nil
 }
 
 func (c *Connector) publishClient(nodeName string, client *PooledClient) error {
@@ -609,6 +614,15 @@ func (c *Connector) publishClient(nodeName string, client *PooledClient) error {
 		return ErrConnectorClosed
 	}
 	c.clients.Set(nodeName, client)
+	return nil
+}
+
+func checkInitializedTransport(nodeID string, cfg *ClientConfig, client *Client) error {
+	if err := client.transportError(); err != nil {
+		connectionErr := &ConnectionError{NodeID: nodeID, Address: cfg.Address, Port: cfg.Port, AuthType: cfg.AuthType,
+			Err: fmt.Errorf("SSH transport closed during initialization: %w", err)}
+		return errors.Join(connectionErr, client.Interrupt())
+	}
 	return nil
 }
 
@@ -1376,8 +1390,10 @@ func appendKnownHost(knownHostsFile, hostname string, key ssh.PublicKey) (err er
 // PooledClient retains the outermost transport, including for ProxyJump clients.
 // Interrupting it also terminates other clients sharing that transport.
 type PooledClient struct {
-	SSHClient *ssh.Client
-	RootConn  net.Conn
+	SSHClient  *ssh.Client
+	RootConn   net.Conn
+	probeMu    sync.Mutex
+	probeCache *executionProbeCache
 }
 
 func (c *PooledClient) interrupt() error {
@@ -1385,7 +1401,7 @@ func (c *PooledClient) interrupt() error {
 }
 
 // A confirmation failure must close the authenticated but unpublished client.
-func (c *Connector) confirmAuthenticatedConnection(ctx context.Context, nodeID string, root net.Conn) (err error) {
+func (c *Connector) confirmAuthenticatedConnection(ctx context.Context, nodeID string, root net.Conn, client *Client, cfg *ClientConfig) (err error) {
 	defer func() {
 		if err != nil {
 			if closeErr := root.Close(); closeErr != nil {
@@ -1393,7 +1409,18 @@ func (c *Connector) confirmAuthenticatedConnection(ctx context.Context, nodeID s
 			}
 		}
 	}()
-	if confirmer, ok := c.provider.(ConnectionConfirmer); ok {
+	if confirmer, ok := c.provider.(AuthenticatedConnectionConfirmer); ok {
+		execution, err := confirmer.ConfirmAuthenticatedConnection(ctx, nodeID, client)
+		if err != nil {
+			return fmt.Errorf("confirm authenticated node %q: %w", nodeID, err)
+		}
+		if err := execution.Validate(); err != nil {
+			return fmt.Errorf("validate authenticated execution: %w", err)
+		}
+		if execution != nil {
+			cfg.Execution = execution.Clone()
+		}
+	} else if confirmer, ok := c.provider.(ConnectionConfirmer); ok {
 		if err := confirmer.ConfirmConnection(ctx, nodeID); err != nil {
 			return fmt.Errorf("confirm authenticated node %q: %w", nodeID, err)
 		}

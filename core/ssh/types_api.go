@@ -140,9 +140,19 @@ func zeroBytes(b []byte) {
 }
 
 // ConnectionConfirmer is an optional provider capability invoked immediately
-// after SSH authentication, before recording credentials or opening sessions.
+// after SSH authentication, before recording credentials or dispatching user work.
 type ConnectionConfirmer interface {
 	ConfirmConnection(context.Context, string) error
+}
+
+// AuthenticatedConnectionConfirmer optionally inspects an authenticated client
+// before enrollment and credential recording. It may run bounded read-only
+// probes but must not retain/close the client or execute user commands.
+// Implementations own confirmation and may return newly persisted execution
+// defaults for this client; nil preserves its frozen defaults.
+// ConnectionConfirmer is the fallback.
+type AuthenticatedConnectionConfirmer interface {
+	ConfirmAuthenticatedConnection(context.Context, string, *Client) (*ExecutionConfig, error)
 }
 
 // ConnectionProvider 提供指定节点的底层连接配置。

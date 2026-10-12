@@ -74,6 +74,17 @@ xops play deploy-service.yaml --limit web-01
   - 也可以在单个步骤中通过 `execution` 覆盖（例如针对 Windows 节点的步骤使用 `interpreter: cmd`）；
   - 步骤未配置时，依次继承 Playbook 设置、目标节点配置或系统默认。
 
+### Playbook 按需探测
+
+未指定解释器且启动方言未知时，无 shebang 的 `script` 和 `ensure` 会在执行用户代码前进行有界只读
+探测，同一 SSH 连接只探测一次，失败结果也会缓存。结果仅用于本次受限操作，不改写节点配置或普通
+`shell` 步骤的默认执行方式。显式解释器（包括 `server`）、BOM 和未支持的 shebang 不会被自动替换。
+白名单 bash/sh shebang 仍不能证明外层方言，需已有兼容配置。
+
+当前 script/ensure 仅支持 POSIX bash/sh。探测到 Windows 时会在执行用户代码前明确拒绝，不会翻译
+脚本或 ensure 检查语法。ensure 的检查、action 和复查使用同一受控配置；探针失败不会执行 action，
+也不会触发用户命令重试。试运行不连接远端、不运行探针。
+
 ## MCP 服务集成
 
 ```bash

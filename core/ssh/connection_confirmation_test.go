@@ -8,6 +8,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/wentf9/xops-cli/core/testutil/sshfixture"
+	cryptoSSH "golang.org/x/crypto/ssh"
 )
 
 type confirmationProvider struct {
@@ -22,6 +25,73 @@ func (p *confirmationProvider) ConfirmConnection(context.Context, string) error 
 }
 
 type confirmationErrorDialer struct{ err error }
+
+type disconnectedProbeProvider struct {
+	mockConfigStore
+	probeErr error
+}
+
+func (p *disconnectedProbeProvider) ConfirmAuthenticatedConnection(ctx context.Context, _ string, client *Client) (*ExecutionConfig, error) {
+	// Enrollment preserves authenticated node metadata even when probing fails.
+	// The connector must independently reject the disconnected transport.
+	_, err := client.ProbeExecutionConfig(ctx)
+	p.probeErr = err
+	if !errors.Is(err, ErrExecutionProbe) {
+		return nil, errors.New("expected execution probe failure")
+	}
+	// A channel can close before its parent transport. Wait for the fixture's
+	// canceled physical connection so this tests an already observed failure.
+	if err := client.sshClient.Wait(); err == nil {
+		return nil, errors.New("expected transport disconnection")
+	}
+	return nil, nil
+}
+
+func TestDisconnectedEnrollmentProbeDoesNotPublishTransport(t *testing.T) {
+	setTestHome(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	peerCtx, dropPeer := context.WithCancel(ctx)
+	defer dropPeer()
+	server, err := sshfixture.NewWithOptions(peerCtx, sshfixture.Options{ExecHandler: func(_ string, _ cryptoSSH.Channel) { dropPeer() }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeTestResource(t, server) })
+	host, portText, err := net.SplitHostPort(server.Address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &disconnectedProbeProvider{mockConfigStore: mockConfigStore{cfg: &ClientConfig{
+		NodeID: "node", Address: host, Port: port, User: "fixture",
+		AuthType: "password", Password: sshfixture.Password,
+	}}}
+	connector := newTestConnector(provider, WithHandshakeTimeout(time.Second))
+	connector.AcceptNewHostKey.Store(true)
+	t.Cleanup(func() {
+		if err := connector.CloseAll(); err != nil {
+			t.Error(err)
+		}
+	})
+	client, err := connector.Connect(ctx, "node")
+	if client != nil {
+		t.Cleanup(func() { closeTestResource(t, client) })
+	}
+	var connectionErr *ConnectionError
+	if client != nil || !errors.As(err, &connectionErr) || connectionErr.NodeID != "node" {
+		t.Fatalf("disconnected enrollment returned client=%v, error=%v, probe=%v", client != nil, err, provider.probeErr)
+	}
+	if _, published := connector.clients.Get("node"); published {
+		t.Fatal("disconnected enrollment published a pooled transport")
+	}
+	if server.Authenticated.Load() != 1 || server.Executed.Load() != 1 {
+		t.Fatal("disconnected enrollment retried authentication or user work")
+	}
+}
 
 func (d confirmationErrorDialer) Dial(string, string) (net.Conn, error) {
 	return nil, d.err

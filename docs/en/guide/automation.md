@@ -74,6 +74,18 @@ xops play deploy-service.yaml --limit web-01
   - Override execution per step using `execution` (for instance, using `interpreter: cmd` on a specific step targeting Windows hosts);
   - Unconfigured steps inherit settings hierarchically: step override > playbook settings > node configuration > system default.
 
+### On-demand Playbook probing
+
+With an unspecified interpreter and unknown launch dialect, scripts without a shebang and ensure
+checks perform a bounded read-only probe before user code. One SSH connection shares the result,
+including failures. Runtime probing does not write node configuration or change ordinary shell-step
+defaults. Explicit interpreters (including `server`), BOMs and unsupported shebangs are not replaced.
+An allowlisted bash/sh shebang still requires an already known compatible outer dialect.
+
+Script and ensure adapters currently support POSIX bash/sh. A Windows detection fails before user code
+without syntax translation. Ensure uses the same controlled configuration for check, action and verify;
+probe failures never authorize an action or retry user work. Dry runs do not connect or probe.
+
 ## MCP service integration
 
 ```bash

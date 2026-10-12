@@ -93,6 +93,9 @@ CLI 添加和导入新节点时默认复用验证连接探测执行环境，并�
 `--no-probe` 跳过探测，`--skip-verify` 同时跳过探测。已有节点可用 `xops host probe <节点或别名>`
 诊断，添加 `--save` 保存推荐配置。参数与配置优先级见[主机与身份](docs/guide/hosts.md)。
 
+启用凭据记忆的交互式首次连接也可随新节点保存探测推荐。Playbook 无 shebang 的 script/ensure 与
+SFTP cwd exec 会对未指定的执行环境按需探测，仅缓存于连接；显式解释器不被覆盖，探针失败不执行用户代码。
+
 #### 3. SSH 连接与 TUI
 
 ```bash

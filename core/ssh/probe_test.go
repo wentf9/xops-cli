@@ -246,6 +246,9 @@ func TestProbeExecutionConfigWaiterCancellation(t *testing.T) {
 	// Initiator exits on release or its bounded probe timeout; joined below.
 	go func() { _, err := client.ProbeExecutionConfig(t.Context()); done <- err }()
 	<-started
+	if _, ready := client.CachedExecutionProbe(); ready {
+		t.Fatal("running probe was exposed as a completed cache entry")
+	}
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Millisecond)
 	defer cancel()
 	if _, err := client.ProbeExecutionConfig(ctx); !errors.Is(err, context.DeadlineExceeded) {

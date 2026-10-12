@@ -2179,6 +2179,13 @@ func (s *Shell) handleExec(ctx context.Context, args []string) error {
 	}
 	userCmd := strings.Join(args, " ")
 	execCfg := s.sshClient.Execution()
+	if s.cwd != "" {
+		var err error
+		execCfg, err = s.sshClient.ProbeControlledExecution(ctx, execCfg)
+		if err != nil {
+			return fmt.Errorf("exec: resolve working directory adapter: %w", err)
+		}
+	}
 	if execCfg == nil {
 		execCfg = &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer, LaunchDialect: ssh.LaunchUnknown}
 	} else if err := execCfg.Validate(); err != nil {

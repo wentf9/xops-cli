@@ -81,7 +81,12 @@ xops host probe web-01 --save
 期间被修改时不保存，并返回非零退出码。Linux 通常推荐 bash（其次 sh），关闭 login；Windows CMD
 存在 Windows PowerShell 时仍推荐 `server/cmd`。探测不会翻译用户命令。
 
-目前自动探测仅接入上述 CLI 添加/导入路径。直接 SSH/exec 首次录入、TUI 和运行时懒加载尚未接入。
+直接 SSH/交互式 exec 首次连接新节点时，若已启用凭据记忆且执行配置未指定，会在认证成功后、
+节点确认前复用连接探测，并随新节点原子保存推荐。仅会话凭据、非交互 exec 批处理、已有节点及显式执行配置不触发此路径。CLI 显式 `--interpreter`、`--launch-dialect`、`--login-shell` 或 `--no-login`（包括显式 false）会跳过目标节点的录入探测，参数仅用于本次会话；凭据记忆和其他节点的探测策略照常生效。
+探针失败只警告，认证成功的节点仍按原策略保存。如果底层连接已断开，连接请求返回错误，不缓存该连接或派发用户命令。TUI 添加仍使用原有纯连接验证。
+
+Playbook 无 shebang 的 script、ensure 及 SFTP 非空 cwd 的 `exec` 可在执行配置未指定时按需探测。
+这些运行时结果仅保留在连接缓存中，不自动写入磁盘；显式解释器（包括 `server`）始终保留。
 
 ### 手动配置
 

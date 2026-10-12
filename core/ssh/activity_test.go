@@ -15,12 +15,55 @@ import (
 
 type activityTestIO struct {
 	net.Conn
-	n   int
-	err error
+	n        int
+	err      error
+	writeErr error
 }
 
-func (c *activityTestIO) Read([]byte) (int, error)    { return c.n, c.err }
-func (c *activityTestIO) Write(p []byte) (int, error) { return len(p), nil }
+func (c *activityTestIO) Read([]byte) (int, error) { return c.n, c.err }
+func (c *activityTestIO) Write(p []byte) (int, error) {
+	if c.writeErr != nil {
+		return 0, c.writeErr
+	}
+	return len(p), nil
+}
+
+func TestSSHActivityRecordsFirstTransportFailure(t *testing.T) {
+	for _, operation := range []string{"read", "write", "close"} {
+		t.Run(operation, func(t *testing.T) {
+			local, peer := net.Pipe()
+			t.Cleanup(func() { closeTestResource(t, peer) })
+			underlying := &activityTestIO{Conn: local}
+			activity := &sshActivityConn{Conn: underlying, startedAt: time.Now()}
+			t.Cleanup(func() { closeTestResource(t, activity) })
+			client := &Client{sshClient: &ssh.Client{Conn: &activitySSHConn{activity: activity}}}
+			if err := client.transportError(); err != nil {
+				t.Fatalf("healthy transport: %v", err)
+			}
+			want := io.EOF
+			switch operation {
+			case "read":
+				underlying.err = want
+				if _, err := activity.Read(nil); !errors.Is(err, want) {
+					t.Fatal(err)
+				}
+			case "write":
+				underlying.writeErr = want
+				if _, err := activity.Write(nil); !errors.Is(err, want) {
+					t.Fatal(err)
+				}
+			case "close":
+				want = net.ErrClosed
+			}
+			if err := activity.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := client.transportError(); !errors.Is(err, want) {
+				t.Fatalf("transport failure = %v, want first cause %v", err, want)
+			}
+		})
+	}
+}
 
 type activityProbeConn struct {
 	monitoredTestConn

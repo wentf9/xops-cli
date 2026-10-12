@@ -87,8 +87,19 @@ shown as `-`. Only `--save` writes configuration; probe failures and concurrent 
 and return a nonzero exit status. Linux normally recommends bash, then sh, with login disabled. Windows
 CMD with Windows PowerShell available still recommends `server/cmd`. Probing does not translate commands.
 
-Automatic probing currently covers these CLI addition/import paths. Direct SSH/exec enrollment, TUI
-and runtime lazy probing are not yet connected.
+Direct SSH and interactive exec first connections also probe after authentication and before confirming
+a new node when credential remembering is enabled and execution is unspecified. The recommendation is
+saved atomically with enrollment. Session-only credentials, non-interactive exec batch tasks, saved nodes and
+explicit execution settings do not trigger this path. Explicit CLI `--interpreter`, `--launch-dialect`,
+`--login-shell` or `--no-login` (including an explicit false) skip enrollment probing for the target.
+These flags apply to the current session; credential remembering and probing policy for other nodes
+remain active. Probe failures warn while preserving normal
+authenticated enrollment. An already disconnected transport fails connection acquisition without pooling
+it or dispatching user work. TUI additions retain authentication-only verification.
+
+Playbook scripts without a shebang, ensure checks and SFTP exec with a nonempty cwd can probe missing
+execution settings on demand. These runtime results remain in the connection cache without disk writes;
+explicit interpreter choices, including `server`, are preserved.
 
 ### Manual configuration
 
