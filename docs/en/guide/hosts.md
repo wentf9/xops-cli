@@ -69,7 +69,12 @@ xops host add --address 192.0.2.10 --user deploy --key ~/.ssh/id_ed25519 --inter
 xops host probe web-01
 # Replace only this node's execution settings
 xops host probe web-01 --save
+# Probe all saved nodes; add --save to save each successful recommendation
+xops host probe --all
+xops host probe --all --save
 ```
+
+`--all` cannot be combined with a node or alias. It probes every saved node in node ID order, excluding OpenSSH virtual nodes. Individual failures do not stop remaining probes; the command returns aggregated errors and a nonzero exit status at the end. Cancellation stops subsequent probes. An empty inventory only prints a message. `--all --save` saves successful recommendations individually; failed or concurrently edited nodes are preserved, and successful saves are not rolled back.
 
 `--skip-verify` also skips probing. `--probe` and `--no-probe` are mutually exclusive. Explicit execution
 fields are preserved; incompatible recommendations produce a warning and only the explicit fields are

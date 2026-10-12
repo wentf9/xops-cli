@@ -67,7 +67,12 @@ xops host add --address 192.0.2.10 --user deploy --key ~/.ssh/id_ed25519 --inter
 xops host probe web-01
 # 替换该节点的 execution，其他字段及凭据保持不变
 xops host probe web-01 --save
+# 探测全部已保存节点；添加 --save 保存各成功节点的推荐配置
+xops host probe --all
+xops host probe --all --save
 ```
+
+`--all` 与节点或别名参数互斥，按节点 ID 顺序探测全部已保存节点（不含 OpenSSH 虚拟节点）。单节点失败后继续探测其余节点，并在结束时返回汇总错误和非零退出码；取消操作会停止后续探测。空节点列表仅输出提示。`--all --save` 仅保存成功节点，失败或并发修改的节点不会被覆盖，已成功保存的节点不会回滚。
 
 `--skip-verify` 同时跳过探针；`--probe` 与 `--no-probe` 不能同时指定。显式执行字段始终保留，
 若与探测结果不兼容，会输出警告并仅保存显式字段。探测失败时不会持久化部分推荐。

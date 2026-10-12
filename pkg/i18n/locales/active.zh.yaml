@@ -1103,12 +1103,14 @@ flag_host_probe:
   other: "复用验证连接探测并保存新节点的执行配置"
 flag_host_no_probe:
   other: "跳过自动执行环境探测"
+flag_host_probe_all:
+  other: "探测全部已保存节点（不能同时指定节点）"
 flag_host_probe_save:
   other: "保存推荐配置，替换该节点的执行配置"
 inventory_probe_short:
   other: "探测已保存节点的 SSH 执行环境"
 inventory_probe_long:
-  other: "使用已保存的连接凭据探测外层 Shell 与可用解释器并展示推荐配置；--save 仅替换所选节点的执行配置。认证为非交互式，并发节点修改会阻止保存。"
+  other: "使用已保存的连接凭据探测外层 Shell 与可用解释器并展示推荐配置。指定单个节点或使用 --all 按节点 ID 顺序探测全部已保存节点；单节点失败继续探测其余节点，存在失败时返回非零退出码。--save 仅替换探测成功节点的执行配置。认证为非交互式，并发节点修改会阻止保存。"
 inventory_probe_warning:
   other: "[{{.Node}}] 警告：执行环境探测不可用，保留显式配置或 server 默认值：{{.Error}}"
 inventory_probe_saved:
