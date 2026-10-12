@@ -36,11 +36,11 @@ func TestProbeShellDialects(t *testing.T) {
 				t.Skipf("shell unavailable: %v", err)
 			}
 			if tt.dialect == LaunchPowerShell {
-				// Warm up JIT/CLR runtime cache so slow runner cold-start does not
-				// consume the probeCommandTimeout.
+				// Warm up JIT/CLR runtime cache and utility cmdlets so slow runner
+				// cold-start does not consume the probeCommandTimeout.
 				warmupCtx, warmupCancel := context.WithTimeout(t.Context(), 5*time.Second)
 				defer warmupCancel()
-				_ = exec.CommandContext(warmupCtx, shell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "exit 0").Run()
+				_ = exec.CommandContext(warmupCtx, shell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Get-Command -CommandType Application sh -ErrorAction SilentlyContinue; exit 0").Run()
 			}
 			client, _ := executionProbeClient(t, "", func(ctx context.Context, payload string, channel cryptoSSH.Channel) {
 				output, status := runProbeShell(t, ctx, shell, tt.dialect, payload, nil)
