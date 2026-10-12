@@ -41,7 +41,7 @@ func (v executionTestTrust) Verify(ctx context.Context, _ ssh.HostKeyRequest, ke
 	return ctx.Err()
 }
 
-func executionTestClient(t *testing.T, handler func(string, cryptoSSH.Channel)) (*ssh.Client, *sshfixture.Server) {
+func executionTestClient(t *testing.T, handler func(string, cryptoSSH.Channel), modes ...ssh.SudoMode) (*ssh.Client, *sshfixture.Server) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	t.Cleanup(cancel)
@@ -62,7 +62,11 @@ func executionTestClient(t *testing.T, handler func(string, cryptoSSH.Channel)) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	connector := ssh.NewConnector(executionTestProvider{ssh.ClientConfig{NodeID: "node", Address: host, Port: port, User: "fixture", AuthType: "password", Password: sshfixture.Password, SudoMode: ssh.SudoModeRoot}}, ssh.WithHostKeyVerifier(executionTestTrust{server.HostKey}))
+	mode := ssh.SudoModeRoot
+	if len(modes) > 0 {
+		mode = modes[0]
+	}
+	connector := ssh.NewConnector(executionTestProvider{ssh.ClientConfig{NodeID: "node", Address: host, Port: port, User: "fixture", AuthType: "password", Password: sshfixture.Password, SudoMode: mode}}, ssh.WithHostKeyVerifier(executionTestTrust{server.HostKey}))
 	t.Cleanup(func() {
 		if err := connector.CloseAll(); err != nil {
 			t.Error(err)

@@ -46,6 +46,22 @@ func (c *Client) ProbeControlledExecution(ctx context.Context, execution *Execut
 	return resolved, nil
 }
 
+// ResolveWorkingDirectoryExecution selects an adapter for one cwd-aware command.
+// A known server/cmd configuration has native CMD semantics, so CMD can apply
+// the directory without changing command language. Keep this derived adapter
+// session-local; unspecified configurations still use the bounded probe.
+func (c *Client) ResolveWorkingDirectoryExecution(ctx context.Context, execution *ExecutionConfig) (*ExecutionConfig, error) {
+	if execution != nil && execution.EffectiveInterpreter() == InterpreterServer && execution.LaunchDialect == LaunchCmd {
+		if err := execution.Validate(); err != nil {
+			return nil, err
+		}
+		resolved := execution.Clone()
+		resolved.Interpreter = InterpreterCmd
+		return resolved, nil
+	}
+	return c.ProbeControlledExecution(ctx, execution)
+}
+
 // CachedExecutionProbe returns an already completed diagnostic snapshot without
 // starting or waiting for network work. A failed or running probe returns false.
 func (c *Client) CachedExecutionProbe() (*ProbeResult, bool) {

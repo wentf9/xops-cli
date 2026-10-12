@@ -51,6 +51,12 @@ xops exec --host linux-01 --interpreter bash --launch-dialect posix --login-shel
 # 显式使用 POSIX sh 执行
 xops exec --host linux-01 --interpreter sh --launch-dialect posix -c 'id'
 
+# 默认 Shell 为 zsh 的节点
+xops exec --host zsh-01 --interpreter zsh --launch-dialect posix -c 'print -r -- $ZSH_VERSION'
+
+# 默认 Shell 为 fish 的节点
+xops exec --host fish-01 --interpreter fish --launch-dialect fish -c 'set greeting hello; echo $greeting'
+
 # Windows 目标：通过 PowerShell 执行
 xops exec --host win-01 --interpreter powershell -c 'Get-Process | Select-Object -First 5'
 
@@ -58,15 +64,20 @@ xops exec --host win-01 --interpreter powershell -c 'Get-Process | Select-Object
 xops exec --host win-01 --interpreter cmd -c 'dir'
 ```
 
-- **`bash`**：调用远端 `bash`。支持 `--login-shell`（等效于 `bash -l -c`）或 `--no-login` / `--login-shell=false`（等效于 `bash -c`）。要求启动方言为 `posix`。
+- **`bash`**：调用远端 `bash`。支持 `--login-shell`（等效于 `bash -l -c`）或 `--no-login` / `--login-shell=false`（等效于 `bash -c`）。要求启动方言为 `posix` 或 `fish`。
 - **`sh`**：调用标准 POSIX `sh -c`。适用于不依赖 Bash 特性的标准 Shell 脚本，不支持登录 Shell。
+- **`zsh`**：使用 `zsh -c`，通过 `--login-shell` 使用 `zsh -l -c`。外层启动方言可为 `posix` 或 `fish`。脚本使用 `zsh -s`；sudo/su 复用 POSIX 认证握手并保留 zsh 语义。
+- **`fish`**：使用 `fish -c`，可通过 `--login-shell` 使用 `fish -l -c`。要求外层启动方言为 `posix` 或 `fish`；`--no-login` 仍为Bash 兼容参数。
 - **`powershell` / `pwsh`**：针对 Windows 主机或跨平台 PowerShell 目标，自动处理命令安全转义与退出码传递。
 - **`cmd`**：针对 Windows 命令提示符（`cmd /c`），自动处理参数引号并限制命令长度在 8191 字符安全范围以内。
+
+使用已保存的 zsh/fish 执行配置时，普通与提权 `exec` 命令均保留节点的 login 模式。显式 `--no-login`（包括 `--no-login=false`）继续使用原有的 Bash 选择语义。
 
 ### 启动方言 (`--launch-dialect`)
 
 启动方言用于指导 XOps 对命令载荷进行语法校验与转义：
 - `posix`：适用于各类 Linux/UNIX Shell（Bash、sh、Zsh 等）。
+- `fish`：适用于默认 fish Shell，单独处理引号与反斜杠转义。
 - `powershell`：适用于 Windows PowerShell 与跨平台 PowerShell。
 - `cmd`：适用于 Windows 命令提示符。
 

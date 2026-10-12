@@ -79,11 +79,15 @@ xops play deploy-service.yaml --limit web-01
 未指定解释器且启动方言未知时，无 shebang 的 `script` 和 `ensure` 会在执行用户代码前进行有界只读
 探测，同一 SSH 连接只探测一次，失败结果也会缓存。结果仅用于本次受限操作，不改写节点配置或普通
 `shell` 步骤的默认执行方式。显式解释器（包括 `server`）、BOM 和未支持的 shebang 不会被自动替换。
-白名单 bash/sh shebang 仍不能证明外层方言，需已有兼容配置。
+白名单 bash/sh/zsh/fish shebang 仍不能证明外层方言，需已有兼容配置。
 
-当前 script/ensure 仅支持 POSIX bash/sh。探测到 Windows 时会在执行用户代码前明确拒绝，不会翻译
+script/ensure 支持 bash、sh、zsh 和原生 fish，外层启动方言可为 posix 或 fish。探测到 Windows 时会在执行用户代码前明确拒绝，不会翻译
 脚本或 ensure 检查语法。ensure 的检查、action 和复查使用同一受控配置；探针失败不会执行 action，
 也不会触发用户命令重试。试运行不连接远端、不运行探针。
+
+fish ensure 在 fish 中执行 check、action 与复查，并通过退出事件捕获检查状态，包括显式 `exit`。检查通过时跳过 action；确认非零状态后才执行 action 并复查。126/127、fish 保留的执行错误码 121/123/124/125、语法错误、超时、断连或缺少结果帧都会停止流程；检查中的 `exec` 替换进程会绕过退出事件，因此会作为缺少结果帧处理。默认 fish 的自动探测结果会直接用于此流程。
+
+这些保留退出码即使由检查程序显式返回，也不会触发 action：无法区分用户返回值与展开失败、不可执行等错误时，按检查失败处理。普通条件不满足（如 `false` 返回 1）仍按原流程执行 action 与复查。
 
 ## MCP 服务集成
 

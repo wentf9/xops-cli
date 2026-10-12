@@ -140,7 +140,7 @@ MCP `xops_fs_cp` 在调用保持目录项语义的 `RemoteCopy` 之前，单独�
 1. **sh 适配器与脚本协议**：支持 `InterpreterSh`（非登录 POSIX `sh -c` 与 `sh -s`）；shebang 白名单正确区分映射 `sh` 与 `bash`；非白名单 shebang 在缺少调用方显式覆盖时严格报错；执行前检测并拒绝包含 UTF-8 BOM（`\xef\xbb\xbf`）前缀的脚本；首行元数据解析安全忽略尾随 `\r` 且不改动正文原字节；`setupStdinPipeline` 严格拒绝脚本载荷与运行时 stdin 同时存在的情形。
 2. **Windows cmd/PowerShell/pwsh 适配器**：启动方言矩阵冻结（`cmd` 仅支持 `cmd` 方言，`powershell` 支持 `cmd`/`powershell`，`pwsh` 支持 `cmd`/`powershell`/`posix`）；PowerShell 使用 UTF-16LE Base64 编码载荷（`-EncodedCommand`）与 `-NoProfile -NonInteractive -ExecutionPolicy Bypass`；在 `powershell` 启动方言下外层显式执行 `; exit $LASTEXITCODE` 确保子进程退出码不被外层转成 1；命令长度限制按启动方言校验（`LaunchCmd` 下限制为 8191 字符，`LaunchPowerShell`/`LaunchPOSIX` 为 32767 字符）；cmd 命令通过 `cmd.exe /d /s /c "..."` 完整包裹，保护 `&&`、`&`、`|` 等操作符在内层解释器中执行；退出码协议冻结（`cmd` 保留 `%ERRORLEVEL%`，`PowerShell` 载荷注入 `$ErrorActionPreference = 'Stop'` 与 `$LASTEXITCODE` 判断）。
 3. **Sudo/Su 控制协议与用户解释器分离**：sudo 提权控制 Shell 支持使用 `sh` 与 `bash` 承载，保持随机令牌、密码提示匹配、握手确认与退出恢复；配置化 su 严格拒绝并保留未配置的旧版语义。
-4. **SFTP 工作目录与执行适配**：`SSHAdapter.GetConfig` 完整合并传递节点及全局 `Execution` 配置至 `ClientConfig.Execution`，使正常 CLI 路径建立的 SSH 客户端具备节点执行上下文；实现 `FormatWorkingDirCommand`，针对 POSIX（`cd -- '...' && ...`）、cmd（`cd /d "..." && ...`）、PowerShell（`Set-Location -LiteralPath '...' -ErrorAction Stop; ...`）提供严谨转义与路径安全防护；纯 `server` 模式在非空 cwd 下拒绝自动继承，防止静默丢失工作目录；cmd 模式严格拒绝包含 `%`、`!`、`^`、`"` 等字符的工作目录；SFTP 交互模式与 batch 模式均通过 `ssh.PlanCommand` 构建载荷并分发给目标解释器适配器。
+4. **SFTP 工作目录与执行适配**：`SSHAdapter.GetConfig` 完整合并传递节点及全局 `Execution` 配置至 `ClientConfig.Execution`，使正常 CLI 路径建立的 SSH 客户端具备节点执行上下文；实现 `FormatWorkingDirCommand`，针对 POSIX（`cd -- '...' && ...`）、cmd（`cd /d "..." && ...`）、PowerShell（`Set-Location -LiteralPath '...' -ErrorAction Stop; ...`）提供严谨转义与路径安全防护；纯 `server` 模式在非空 cwd 下拒绝自动继承（SFTP 已知 `server/cmd` 可临时派生 CMD 适配器），防止静默丢失工作目录；cmd 模式严格拒绝包含 `%`、`!`、`^`、`"` 等字符的工作目录；SFTP 交互模式与 batch 模式均通过 `ssh.PlanCommand` 构建载荷并分发给目标解释器适配器。
 5. **旧 Run API 与解释器边界**：旧版 `Run`、`RunScript`、`RunScriptWithExecution`、`RunWithSudo`、`RunScriptWithSudo`、`RunCommandWithIO` 严格限制为 `bash` 和 `sh`，对其他解释器明确返回 `ErrExecutionValidation`，禁止静默回退。
 6. **内置操作平台/解释器声明**：`MetricsCollector` 监控探针、sudo 自动探测、TUI 日志查看（`log_select` 与 `log_stream`）检测客户端执行配置并在非 POSIX 方言下提前报错；防火墙探测明确声明 Linux/POSIX 约束。
 7. **全量验收指标**：
@@ -168,7 +168,7 @@ MCP `xops_fs_cp` 在调用保持目录项语义的 `RemoteCopy` 之前，单独�
    - 在执行前对脚本统一调用 `ssh.ResolveScriptExecution` 解析解释器；无显式指定解释器且无白名单 shebang（或缺失/不受支持 shebang）的脚本，直接返回 `ErrExecutionValidation: server interpreter cannot be used for scripts` 并在本地拦截拒绝，禁止将 server 模式盲目用于脚本执行。
 3. **提权与 SFTP 边界**：
    - Unix 提权（`sudo`/`su`）在未配置 execution 时保留传统 Unix Bash 提权兼容行为；显式指定 `server` 解释器执行提权时在执行前严格拒绝。
-   - SFTP `exec` 全面接入 `FormatWorkingDirCommand` 与 `PlanCommand`；默认 `server` 解释器在工作目录非空时显式拒绝（`server interpreter does not support inheriting working directory`），防止相对路径操作静默在远端 HOME 目录下误执行；`cwd == ""` 时直通原样执行。
+   - SFTP `exec` 全面接入 `FormatWorkingDirCommand` 与 `PlanCommand`；其他 `server` 配置在工作目录非空时显式拒绝，SFTP 已知 `server/cmd` 使用临时 CMD 适配器（`server interpreter does not support inheriting working directory`），防止相对路径操作静默在远端 HOME 目录下误执行；`cwd == ""` 时直通原样执行。
 4. **原生 Windows 与无 Bash Unix 平台实机证据**：
    - **原生 Windows OpenSSH**：
      - 默认模式：`./bin/xops ssh vm dir` 与 `./bin/xops exec --host vm -c dir` 成功在远端默认 cmd.exe 环境下直接列出目录（退出码 0，不再报错 `'bash' 不是内部或外部命令`）。

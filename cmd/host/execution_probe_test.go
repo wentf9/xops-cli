@@ -39,6 +39,8 @@ func TestHostAddExecutionProbe(t *testing.T) {
 		{name: "no probe", flags: []string{"--no-probe"}},
 		{name: "probe false", flags: []string{"--probe=false"}},
 		{name: "offline", flags: []string{"--skip-verify"}},
+		{name: "explicit zsh", flags: []string{"--interpreter", "zsh"}, interpreter: "zsh", dialect: "posix", probe: true},
+		{name: "explicit fish", flags: []string{"--interpreter", "fish"}, interpreter: "fish", dialect: "posix", probe: true},
 		{name: "explicit sh", flags: []string{"--interpreter", "sh"}, interpreter: "sh", dialect: "posix", probe: true},
 		{name: "explicit server", flags: []string{"--interpreter", "server"}, interpreter: "server", dialect: "posix", probe: true},
 		{name: "explicit dialect", flags: []string{"--launch-dialect", "cmd"}, dialect: "cmd", probe: true, warning: true},

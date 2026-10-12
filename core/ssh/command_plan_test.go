@@ -71,7 +71,7 @@ func TestCommandPlanBashAndDigest(t *testing.T) {
 func TestCommandPlanRejectsUnsupportedCombinations(t *testing.T) {
 	for name, options := range map[string]CommandOptions{
 		"unknown interpreter":  {Interpreter: "sh"},
-		"unknown dialect":      {LaunchDialect: "fish"},
+		"unknown dialect":      {LaunchDialect: "invalid-shell"},
 		"unknown login":        {Login: "sometimes"},
 		"server login":         {Login: LoginEnabled},
 		"server no login":      {Login: LoginDisabled},

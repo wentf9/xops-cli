@@ -52,9 +52,13 @@ func (c *Client) configuredSudoOptions(ctx context.Context, command string, exec
 		if err := c.maybeDetectSudoMode(ctx); err != nil {
 			return nil, err
 		}
-		// Legacy su always starts a target login shell and does not implement
-		// the configured interpreter/login contract. Do not ignore that policy.
-		if c.ConnectionConfig().SudoMode == SudoModeSu {
+		// Legacy su cannot enforce a configured interpreter/login contract.
+		// The portable adapter pins /bin/sh for control and starts user code separately.
+		config := c.defaultRunConfig()
+		for _, opt := range opts {
+			opt(config)
+		}
+		if c.ConnectionConfig().SudoMode == SudoModeSu && !usesPortableShellAdapter(config) {
 			return nil, fmt.Errorf("%w: configured su execution is not supported", ErrExecutionValidation)
 		}
 	}
@@ -71,6 +75,10 @@ func (c *Client) RunWithSudo(ctx context.Context, command string, opts ...RunOpt
 		return "", err
 	}
 	connCfg := c.ConnectionConfig()
+
+	if usesPortableShellAdapter(config) {
+		return c.runPortableWithSudo(ctx, command, false, config)
+	}
 
 	var wrappedCmd string
 	switch config.Interpreter {
@@ -111,6 +119,10 @@ func (c *Client) RunScriptWithSudo(ctx context.Context, scriptContent string, op
 	}
 	connCfg := c.ConnectionConfig()
 
+	if usesPortableShellAdapter(config) {
+		return c.runPortableWithSudo(ctx, scriptContent, true, config)
+	}
+
 	var bashArgs, bashCmd string
 	switch config.Interpreter {
 	case "", InterpreterBash:
@@ -149,6 +161,9 @@ func (c *Client) RunInteractiveWithSudoIO(ctx context.Context, command string, s
 		return err
 	}
 	mode := c.ConnectionConfig().SudoMode
+	if usesPortableShellAdapter(c.defaultRunConfig()) {
+		return c.runInteractivePortableWithSudo(ctx, mode, command, streams, false)
+	}
 	switch mode {
 	case SudoModeRoot:
 		return c.RunInteractiveCmdWithIO(ctx, bashCommandPayload(command, true), streams)
@@ -229,6 +244,9 @@ func (c *Client) ShellWithSudoIO(ctx context.Context, streams InteractiveIO) err
 		return err
 	}
 	mode := c.ConnectionConfig().SudoMode
+	if usesPortableShellAdapter(c.defaultRunConfig()) {
+		return c.runInteractivePortableWithSudo(ctx, mode, "", streams, true)
+	}
 	switch mode {
 	case SudoModeRoot:
 		return c.ShellWithIO(ctx, streams)
@@ -327,9 +345,16 @@ func (c *Client) resolveCommandIOInterpreter(sudo bool, command string) (Interpr
 		interp = InterpreterBash
 	}
 	switch interp {
-	case InterpreterServer, InterpreterBash, InterpreterSh:
+	case InterpreterServer, InterpreterBash, InterpreterSh, InterpreterZsh, InterpreterFish:
 	default:
-		return "", fmt.Errorf("%w: unsupported interpreter %q for RunCommandWithIO (only server, bash and sh are supported)", ErrExecutionValidation, interp)
+		return "", fmt.Errorf("%w: unsupported interpreter %q for RunCommandWithIO (only server, bash, sh, zsh and fish are supported)", ErrExecutionValidation, interp)
+	}
+	config := c.defaultRunConfig()
+	config.Interpreter, config.LoginShell = interp, c.resolveExecutionLogin(interp)
+	if usesPortableShellAdapter(config) && interp != InterpreterServer {
+		if err := validatePortableShellConfig(config); err != nil {
+			return "", err
+		}
 	}
 	if interp == InterpreterServer && command == "" {
 		return "", fmt.Errorf("%w: command must not be empty for server interpreter", ErrExecutionValidation)
@@ -341,7 +366,7 @@ func (c *Client) resolveCommandIOInterpreter(sudo bool, command string) (Interpr
 }
 
 func (c *Client) resolveExecutionLogin(interp Interpreter) bool {
-	if interp != InterpreterBash {
+	if interp != InterpreterBash && interp != InterpreterZsh && interp != InterpreterFish {
 		return false
 	}
 	if exec := c.Execution(); exec != nil {
@@ -355,6 +380,11 @@ func (c *Client) resolveCommandIOPayload(interp Interpreter, command string) str
 		return command
 	}
 	login := c.resolveExecutionLogin(interp)
+	config := c.defaultRunConfig()
+	config.Interpreter, config.LoginShell = interp, login
+	if usesPortableShellAdapter(config) {
+		return portableUserCommand(command, config, config.LaunchDialect)
+	}
 	return legacyPayloadWithLogin(command, interp, login)
 }
 
@@ -403,6 +433,12 @@ func (c *Client) RunCommandWithIO(ctx context.Context, command string, sudo bool
 }
 
 func (c *Client) dispatchSudoCommand(ctx context.Context, clientConfig ClientConfig, command, payload string, interp Interpreter, stdin io.Reader, stdout, stderr io.Writer, cancel context.CancelFunc) error {
+	config := c.defaultRunConfig()
+	config.Interpreter, config.LoginShell = interp, c.resolveExecutionLogin(interp)
+	if usesPortableShellAdapter(config) && clientConfig.SudoMode != SudoModeRoot {
+		inner := portableUserCommand(command, config, LaunchPOSIX)
+		return c.runPrivilegeOperation(ctx, clientConfig.SudoMode, inner, stdin, stdout, stderr, config)
+	}
 	switch clientConfig.SudoMode {
 	case SudoModeRoot:
 		return c.runRawCommandWithPayload(ctx, payload, "", stdin, stdout, stderr, cancel)

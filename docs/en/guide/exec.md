@@ -51,6 +51,12 @@ xops exec --host linux-01 --interpreter bash --launch-dialect posix --login-shel
 # Explicit POSIX sh
 xops exec --host linux-01 --interpreter sh --launch-dialect posix -c 'id'
 
+# Explicit zsh on a zsh default shell
+xops exec --host zsh-01 --interpreter zsh --launch-dialect posix -c 'print -r -- $ZSH_VERSION'
+
+# Fish command on a fish default shell
+xops exec --host fish-01 --interpreter fish --launch-dialect fish -c 'set greeting hello; echo $greeting'
+
 # Windows target via PowerShell
 xops exec --host win-01 --interpreter powershell -c 'Get-Process | Select-Object -First 5'
 
@@ -58,15 +64,20 @@ xops exec --host win-01 --interpreter powershell -c 'Get-Process | Select-Object
 xops exec --host win-01 --interpreter cmd -c 'dir'
 ```
 
-- **`bash`**: Invokes remote `bash`. Supports `--login-shell` (equivalent to `bash -l -c`) and `--no-login` / `--login-shell=false` (equivalent to `bash -c`). Requires the `posix` launch dialect.
+- **`bash`**: Invokes remote `bash`. Supports `--login-shell` (equivalent to `bash -l -c`) and `--no-login` / `--login-shell=false` (equivalent to `bash -c`). Requires the `posix` or `fish` launch dialect.
 - **`sh`**: Invokes standard POSIX `sh -c`. Suited for standard shell scripts independent of Bash features; rejects login shells.
+- **`zsh`**: Uses `zsh -c`, or `zsh -l -c` with `--login-shell`. Requires a `posix` or `fish` outer launch dialect. Scripts use `zsh -s`; sudo/su reuse the POSIX authentication handshake while retaining zsh semantics.
+- **`fish`**: Uses `fish -c`, or `fish -l -c` with `--login-shell`. Requires `posix` or `fish` as the actual outer launch dialect; `--no-login` remains a Bash compatibility flag.
 - **`powershell` / `pwsh`**: Designed for Windows hosts or cross-platform PowerShell environments, handling command argument escaping and exit code forwarding.
 - **`cmd`**: Designed for Windows Command Prompt (`cmd /c`), handling quoting and enforcing an 8191-character safety limit.
+
+When using saved zsh/fish execution settings, ordinary and elevated `exec` commands retain the configured login mode. Explicit `--no-login` (including `--no-login=false`) keeps its legacy Bash selection semantics.
 
 ### Launch dialects (`--launch-dialect`)
 
 The launch dialect instructs XOps how to validate and escape command payloads:
 - `posix`: For Linux/UNIX shells (Bash, sh, Zsh, etc.).
+- `fish`: Fish default shell, with separate escaping for quotes and backslashes.
 - `powershell`: For Windows PowerShell and cross-platform PowerShell.
 - `cmd`: For Windows Command Prompt.
 

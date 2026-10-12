@@ -17,6 +17,8 @@ const (
 	InterpreterServer     Interpreter = "server"
 	InterpreterBash       Interpreter = "bash"
 	InterpreterSh         Interpreter = "sh"
+	InterpreterFish       Interpreter = "fish"
+	InterpreterZsh        Interpreter = "zsh"
 	InterpreterPowerShell Interpreter = "powershell"
 	InterpreterPwsh       Interpreter = "pwsh"
 	InterpreterCmd        Interpreter = "cmd"
@@ -28,6 +30,7 @@ type LaunchDialect string
 const (
 	LaunchUnknown    LaunchDialect = "unknown"
 	LaunchPOSIX      LaunchDialect = "posix"
+	LaunchFish       LaunchDialect = "fish"
 	LaunchPowerShell LaunchDialect = "powershell"
 	LaunchCmd        LaunchDialect = "cmd"
 )
@@ -79,8 +82,8 @@ type CommandPlan struct {
 }
 
 // PlanCommand validates and freezes one ordinary command without network I/O.
-// It never performs OS detection or fallback. Bash requires a known POSIX outer
-// shell; server preserves command bytes and accepts only inherited login mode.
+// It never performs OS detection or fallback. Unix adapters require a known
+// POSIX or fish outer shell; server preserves command bytes and accepts only inherited login mode.
 func PlanCommand(command string, options CommandOptions) (CommandPlan, error) {
 	if command == "" || len(command) > MaxCommandBytes || strings.ContainsRune(command, '\x00') {
 		return CommandPlan{}, fmt.Errorf("command must contain 1 to %d bytes without NUL", MaxCommandBytes)
@@ -140,7 +143,7 @@ func (p *CommandPlan) defaults() {
 
 func (p *CommandPlan) buildPayload() error {
 	switch p.dialect {
-	case LaunchUnknown, LaunchPOSIX, LaunchPowerShell, LaunchCmd:
+	case LaunchUnknown, LaunchPOSIX, LaunchFish, LaunchPowerShell, LaunchCmd:
 	default:
 		return fmt.Errorf("unsupported launch dialect %q", p.dialect)
 	}
@@ -155,23 +158,9 @@ func (p *CommandPlan) buildPayload() error {
 			return fmt.Errorf("server interpreter requires inherited login mode")
 		}
 		p.payload = p.command
-	case InterpreterBash:
-		if p.dialect != LaunchPOSIX {
-			return fmt.Errorf("bash interpreter requires posix launch dialect")
-		}
-		p.payload = bashCommandPayload(p.command, p.login == LoginEnabled)
-		if p.login == LoginInherit {
-			p.login = LoginDisabled
-		}
-	case InterpreterSh:
-		if p.dialect != LaunchPOSIX {
-			return fmt.Errorf("sh interpreter requires posix launch dialect")
-		}
-		if p.login == LoginEnabled {
-			return fmt.Errorf("sh interpreter does not support login shell")
-		}
-		p.login = LoginDisabled
-		p.payload = shCommandPayload(p.command)
+	case InterpreterBash, InterpreterSh, InterpreterZsh, InterpreterFish:
+		return p.buildUnixPayload()
+
 	case InterpreterPowerShell:
 		if p.login != LoginInherit {
 			return fmt.Errorf("powershell interpreter requires inherited login mode")
@@ -205,7 +194,7 @@ func (p *CommandPlan) buildPayload() error {
 	return nil
 }
 
-// bashCommandPayload is the only construction of Bash command exec payloads.
+// bashCommandPayload constructs legacy Bash payloads for a POSIX outer shell.
 // Legacy entry points call it directly to retain their historical lack of
 // size limits; PlanCommand additionally applies the new API limits.
 func bashCommandPayload(command string, login bool) string {
@@ -240,3 +229,49 @@ func (p CommandPlan) Interpreter() Interpreter     { return p.interpreter }
 func (p CommandPlan) LaunchDialect() LaunchDialect { return p.dialect }
 func (p CommandPlan) LoginMode() LoginMode         { return p.login }
 func (p CommandPlan) Digest() string               { return p.digest }
+
+// fishQuote preserves literal backslashes as well as quotes in fish arguments.
+// POSIX single-quote escaping alone is insufficient for a fish outer shell.
+func fishQuote(value string) string {
+	return "'" + strings.NewReplacer(`\`, `\\`, "'", `\'`).Replace(value) + "'"
+}
+
+func unixCommandPayload(interpreter Interpreter, command string, login bool, dialect LaunchDialect) string {
+	quoted := shellQuote(command)
+	if dialect == LaunchFish {
+		quoted = fishQuote(command)
+	}
+	prefix := string(interpreter)
+	if login {
+		prefix += " -l"
+	}
+	return prefix + " -c " + quoted
+}
+
+func fishScriptPayload(login bool) string {
+	if login {
+		return "fish -l"
+	}
+	return "fish"
+}
+
+func (p *CommandPlan) buildUnixPayload() error {
+	if p.dialect != LaunchPOSIX && p.dialect != LaunchFish {
+		return fmt.Errorf("%s interpreter requires posix or fish launch dialect", p.interpreter)
+	}
+	if p.interpreter == InterpreterSh && p.login == LoginEnabled {
+		return fmt.Errorf("sh interpreter does not support login shell")
+	}
+	if p.login == LoginInherit {
+		p.login = LoginDisabled
+	}
+	p.payload = unixCommandPayload(p.interpreter, p.command, p.login == LoginEnabled, p.dialect)
+	return nil
+}
+
+func zshScriptPayload(login bool) string {
+	if login {
+		return "zsh -l -s"
+	}
+	return "zsh -s"
+}

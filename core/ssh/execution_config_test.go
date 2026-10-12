@@ -101,12 +101,12 @@ func TestExecutionConfig_YAMLRejections(t *testing.T) {
 		},
 		{
 			name:    "unsupported interpreter",
-			input:   "interpreter: zsh\n",
+			input:   "interpreter: invalid-shell\n",
 			wantErr: "unsupported interpreter",
 		},
 		{
 			name:    "unsupported launch dialect",
-			input:   "launch_dialect: fish\n",
+			input:   "launch_dialect: invalid-shell\n",
 			wantErr: "unsupported launch_dialect",
 		},
 		{
@@ -122,7 +122,7 @@ func TestExecutionConfig_YAMLRejections(t *testing.T) {
 		{
 			name:    "bash with cmd dialect",
 			input:   "interpreter: bash\nlaunch_dialect: cmd\n",
-			wantErr: "bash interpreter requires posix launch dialect",
+			wantErr: "bash interpreter requires posix or fish launch dialect",
 		},
 	}
 

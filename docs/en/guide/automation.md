@@ -80,11 +80,15 @@ With an unspecified interpreter and unknown launch dialect, scripts without a sh
 checks perform a bounded read-only probe before user code. One SSH connection shares the result,
 including failures. Runtime probing does not write node configuration or change ordinary shell-step
 defaults. Explicit interpreters (including `server`), BOMs and unsupported shebangs are not replaced.
-An allowlisted bash/sh shebang still requires an already known compatible outer dialect.
+An allowlisted bash/sh/zsh/fish shebang still requires an already known compatible outer dialect.
 
-Script and ensure adapters currently support POSIX bash/sh. A Windows detection fails before user code
+Script and ensure adapters support bash, sh, zsh and native fish, with a posix or fish outer launch dialect. A Windows detection fails before user code
 without syntax translation. Ensure uses the same controlled configuration for check, action and verify;
 probe failures never authorize an action or retry user work. Dry runs do not connect or probe.
+
+Fish ensure runs check, action and verification in fish. An exit event captures the check status, including explicit `exit`. A successful check skips the action; a confirmed nonzero check permits the action and verification. Exit 126/127, fish execution-error statuses 121/123/124/125, parse errors, timeout, disconnect or missing result frames stop the flow. An `exec` replacement bypasses the exit event and is treated as a missing result frame. Automatically probed default fish settings are retained for this flow.
+
+Reserved exit codes also block the action when returned explicitly by a check program. When user-defined status cannot be distinguished from expansion or execution failure, the check fails conservatively. Ordinary unmet conditions, such as `false` returning 1, still run the action and verification.
 
 ## MCP service integration
 

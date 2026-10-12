@@ -618,14 +618,26 @@ func (o *ExecOptions) dispatchTaskExecution(ctx context.Context, client *ssh.Cli
 		}
 		return client.RunScriptWithExecution(ctx, execCmd, resolvedExec, outputOpts...)
 	}
-	cmdOpts := append([]ssh.RunOption{ssh.WithLoginShell(!o.NoLoginShell)}, outputOpts...)
-	if o.execution.noLoginSet || o.NoLoginShell {
-		cmdOpts = append(cmdOpts, ssh.WithInterpreter(ssh.InterpreterBash))
-	}
+	cmdOpts := o.commandRunOptions(client.Execution(), outputOpts)
 	if o.Sudo {
 		return client.RunWithSudo(ctx, execCmd, cmdOpts...)
 	}
 	return client.Run(ctx, execCmd, cmdOpts...)
+}
+
+// commandRunOptions retains legacy Bash defaults while respecting configured
+// zsh/fish login modes unless the caller explicitly selects --no-login.
+func (o *ExecOptions) commandRunOptions(execution *ssh.ExecutionConfig, outputOpts []ssh.RunOption) []ssh.RunOption {
+	var options []ssh.RunOption
+	portable := execution != nil && (execution.Interpreter == ssh.InterpreterZsh || execution.Interpreter == ssh.InterpreterFish || execution.LaunchDialect == ssh.LaunchFish)
+	if !portable || o.execution.noLoginSet || o.NoLoginShell {
+		options = append(options, ssh.WithLoginShell(!o.NoLoginShell))
+	}
+	options = append(options, outputOpts...)
+	if o.execution.noLoginSet || o.NoLoginShell {
+		options = append(options, ssh.WithInterpreter(ssh.InterpreterBash))
+	}
+	return options
 }
 
 func joinExecLogCloseError(retErr *error, closer io.Closer, host, logFile string) {

@@ -74,7 +74,7 @@ func (e *ExecutionConfig) CommandOptions() CommandOptions {
 }
 
 // SudoRunOptions rejects unsupported escalation semantics before dispatch and
-// maps the validated Bash or sh mode to the sudo adapter explicitly.
+// maps the validated Bash, sh, zsh or fish mode to the sudo adapter explicitly.
 // A nil config preserves the legacy POSIX Bash+login environment.
 func (e *ExecutionConfig) SudoRunOptions(command string) ([]RunOption, error) {
 	if e == nil {
@@ -84,27 +84,27 @@ func (e *ExecutionConfig) SudoRunOptions(command string) ([]RunOption, error) {
 		return nil, err
 	}
 	opts := e.CommandOptions()
-	if opts.Interpreter != InterpreterBash && opts.Interpreter != InterpreterSh {
-		return nil, fmt.Errorf("%w: sudo requires a supported explicit Bash or sh adapter", ErrExecutionValidation)
+	if opts.Interpreter != InterpreterBash && opts.Interpreter != InterpreterSh && opts.Interpreter != InterpreterZsh && opts.Interpreter != InterpreterFish {
+		return nil, fmt.Errorf("%w: sudo requires a supported explicit Bash, sh, zsh or fish adapter", ErrExecutionValidation)
 	}
 	plan, err := PlanCommand(command, opts)
 	if err != nil {
 		return nil, fmt.Errorf("%w: plan sudo command: %w", ErrExecutionValidation, err)
 	}
-	return []RunOption{WithLoginShell(plan.LoginMode() == LoginEnabled), WithInterpreter(opts.Interpreter)}, nil
+	return []RunOption{WithLoginShell(plan.LoginMode() == LoginEnabled), WithInterpreter(opts.Interpreter), WithLaunchDialect(opts.LaunchDialect)}, nil
 }
 
 // Validate validates that the execution configuration contains supported
 // values and mutually compatible settings.
 func (e *ExecutionConfig) validateValues() error {
 	switch e.Interpreter {
-	case "", InterpreterServer, InterpreterBash, InterpreterSh, InterpreterPowerShell, InterpreterPwsh, InterpreterCmd:
+	case "", InterpreterServer, InterpreterBash, InterpreterSh, InterpreterZsh, InterpreterFish, InterpreterPowerShell, InterpreterPwsh, InterpreterCmd:
 	default:
 		return fmt.Errorf("%w: unsupported interpreter %q", ErrExecutionValidation, e.Interpreter)
 	}
 
 	switch e.LaunchDialect {
-	case "", LaunchPOSIX, LaunchPowerShell, LaunchCmd, LaunchUnknown:
+	case "", LaunchPOSIX, LaunchFish, LaunchPowerShell, LaunchCmd, LaunchUnknown:
 	default:
 		return fmt.Errorf("%w: unsupported launch_dialect %q", ErrExecutionValidation, e.LaunchDialect)
 	}
@@ -113,17 +113,17 @@ func (e *ExecutionConfig) validateValues() error {
 
 func (e *ExecutionConfig) validateDialectCompatibility() error {
 	switch e.Interpreter {
-	case InterpreterBash, InterpreterSh:
-		if e.LaunchDialect != "" && e.LaunchDialect != LaunchPOSIX {
-			return fmt.Errorf("%w: %s interpreter requires posix launch dialect", ErrExecutionValidation, e.Interpreter)
+	case InterpreterBash, InterpreterSh, InterpreterZsh, InterpreterFish:
+		if e.LaunchDialect != "" && e.LaunchDialect != LaunchPOSIX && e.LaunchDialect != LaunchFish {
+			return fmt.Errorf("%w: %s interpreter requires posix or fish launch dialect", ErrExecutionValidation, e.Interpreter)
 		}
 	case InterpreterPowerShell:
 		if e.LaunchDialect != "" && e.LaunchDialect != LaunchCmd && e.LaunchDialect != LaunchPowerShell {
 			return fmt.Errorf("%w: powershell interpreter requires cmd or powershell launch dialect", ErrExecutionValidation)
 		}
 	case InterpreterPwsh:
-		if e.LaunchDialect != "" && e.LaunchDialect != LaunchCmd && e.LaunchDialect != LaunchPowerShell && e.LaunchDialect != LaunchPOSIX {
-			return fmt.Errorf("%w: pwsh interpreter requires cmd, powershell, or posix launch dialect", ErrExecutionValidation)
+		if e.LaunchDialect != "" && e.LaunchDialect != LaunchCmd && e.LaunchDialect != LaunchPowerShell && e.LaunchDialect != LaunchPOSIX && e.LaunchDialect != LaunchFish {
+			return fmt.Errorf("%w: pwsh interpreter requires cmd, powershell, posix, or fish launch dialect", ErrExecutionValidation)
 		}
 	case InterpreterCmd:
 		if e.LaunchDialect != "" && e.LaunchDialect != LaunchCmd {

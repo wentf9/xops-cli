@@ -61,7 +61,7 @@ These are examples of separate requested actions, not a mandatory sequence. SFTP
 
 SFTP input is split on whitespace; quoted filenames with spaces are not shell-parsed. For such paths use `scp` with the whole operand quoted, or `exec -c` with correctly quoted target-native commands. Wildcards `*`, `?`, and `[...]` are expanded by SFTP path operations; use exact paths for narrowly scoped changes.
 
-SFTP `exec` is separate from these file commands: it prepends a working-directory operation using the node/global execution adapter. Default `server` rejects a nonempty SFTP cwd, including `/`; select a compatible explicit Bash/sh/cmd/PowerShell adapter in configuration before using it. Its strict output path currently needs Linux native terminal/pipe support (batch regular-file output is supported), so prefer pure SFTP commands for portable file operations.
+SFTP `exec` is separate from these file commands: it prepends a working-directory operation using the node/global execution adapter. Saved `server/cmd` uses a temporary CMD adapter for cwd without changing configuration; `/C:` becomes absolute `C:/`. Other explicit `server` configurations reject a nonempty SFTP cwd, including `/`; select a compatible adapter before using them. Its strict output path currently needs Linux native terminal/pipe support (batch regular-file output is supported), so prefer pure SFTP commands for portable file operations.
 
 | Need | POSIX target command through `xops exec -c` | Notes |
 | --- | --- | --- |

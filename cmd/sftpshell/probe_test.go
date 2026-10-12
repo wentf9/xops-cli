@@ -113,7 +113,7 @@ func TestSFTPCwdProbeFailureIsCached(t *testing.T) {
 			t.Fatal("failed probe authorized user command")
 		}
 	}
-	if server.Executed.Load() != 3 {
+	if server.Executed.Load() != 4 {
 		t.Fatal("failed cwd probe repeated or executed user work")
 	}
 }
@@ -201,5 +201,43 @@ func verifyLazySFTPCwdPayload(t *testing.T, dialect ssh.LaunchDialect, command s
 		}
 	} else if !strings.Contains(decoded, "Set-Location -LiteralPath 'C:/Temp'") {
 		t.Errorf("cwd missing from PowerShell payload: %q", decoded)
+	}
+}
+
+func TestSFTPSavedServerCMDCwdAndNativeCommandIsolation(t *testing.T) {
+	execution := &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer, LaunchDialect: ssh.LaunchCmd}
+	commands := make(chan string, 8)
+	client, server := lazySFTPClient(t, ssh.LaunchCmd, execution, func(command string, ch cryptoSSH.Channel) {
+		commands <- command
+		writeSFTPProbeResult(t, ch, "done")
+	})
+	shell := &Shell{batch: true, sshClient: client, stdout: io.Discard, stderr: io.Discard}
+	for _, cwd := range []string{"/C:", "/C:/", "/C:/Windows"} {
+		shell.cwd = cwd
+		if err := shell.handleExec(t.Context(), []string{"dir"}); err != nil {
+			t.Fatalf("exec dir at %s: %v", cwd, err)
+		}
+		expectedDir := "C:/"
+		if cwd == "/C:/Windows" {
+			expectedDir = "C:/Windows"
+		}
+		command := <-commands
+		expected := `cmd.exe /d /s /c "cd /d "` + expectedDir + `" || exit /b & dir"`
+		if command != expected {
+			t.Fatalf("cwd payload=%q want=%q", command, expected)
+		}
+	}
+	shell.cwd = ""
+	if err := shell.handleExec(t.Context(), []string{"dir"}); err != nil {
+		t.Fatal(err)
+	}
+	if command := <-commands; command != "dir" {
+		t.Fatalf("ordinary native command changed: %q", command)
+	}
+	if server.Executed.Load() != 4 || client.Execution().Interpreter != ssh.InterpreterServer || client.Execution().LaunchDialect != ssh.LaunchCmd {
+		t.Fatalf("derived cwd adapter changed defaults or repeated work: requests=%d execution=%+v", server.Executed.Load(), client.Execution())
+	}
+	if _, cached := client.CachedExecutionProbe(); cached {
+		t.Fatal("known server/cmd unexpectedly started a probe")
 	}
 }

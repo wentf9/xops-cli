@@ -84,6 +84,10 @@ func TestProbeExecutionConfigDialects(t *testing.T) {
 		commands                                      int32
 	}{
 		{"Linux", "", probePOSIX, "__XOPS_DIALECT_POSIX__:Linux:/bin/bash\n", "bash\nsh\npwsh", LaunchPOSIX, InterpreterBash, 2},
+		{"fish outer shell", "", probeFish, "__XOPS_DIALECT_FISH__:4.9.3\n__XOPS_FISH_OS__:Linux\n__XOPS_FISH_SHELL__:/usr/bin/fish\n", "bash\nsh\nfish", LaunchFish, InterpreterFish, 5},
+		{"fish only", "", probeFish, "__XOPS_DIALECT_FISH__:3.6.0\n__XOPS_FISH_OS__:Darwin\n__XOPS_FISH_SHELL__:\n", "fish", LaunchFish, InterpreterFish, 5},
+		{"zsh default shell", "", probePOSIX, "__XOPS_DIALECT_POSIX__:Darwin:/bin/zsh\n", "bash\nsh\nzsh", LaunchPOSIX, InterpreterZsh, 2},
+		{"zsh only", "", probePOSIX, "__XOPS_DIALECT_POSIX__:Linux:/usr/bin/zsh\n", "zsh", LaunchPOSIX, InterpreterZsh, 2},
 		{"Alpine ash", "", probePOSIX, "__XOPS_DIALECT_POSIX__:Linux:/bin/ash\n", "sh", LaunchPOSIX, InterpreterSh, 2},
 		{"Darwin empty SHELL", "", probePOSIX, "__XOPS_DIALECT_POSIX__:Darwin:\n", "bash\nsh", LaunchPOSIX, InterpreterBash, 2},
 		{"CMD priority", "SSH-2.0-OpenSSH_for_Windows_9.5", probeCmd, "__XOPS_DIALECT_CMD__:C:\\Windows\\system32\\cmd.exe\r\n", "powershell\ncmd", LaunchCmd, InterpreterServer, 2},
@@ -181,7 +185,7 @@ func TestProbeExecutionConfigFailureCache(t *testing.T) {
 					t.Fatalf("result = %+v, err = %v", result, err)
 				}
 			}
-			if server.Executed.Load() != 3 {
+			if server.Executed.Load() != 4 {
 				t.Fatalf("failed probe repeated: %d requests", server.Executed.Load())
 			}
 		})
@@ -383,7 +387,7 @@ func TestProbeConnectionCachesAreIndependent(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if attempts.Load() != 6 {
+	if attempts.Load() != 8 {
 		t.Fatal("new connection reused an earlier connection's failed cache")
 	}
 }

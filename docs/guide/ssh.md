@@ -28,7 +28,7 @@ xops ssh --host web-01 --interpreter server uname -a
 xops ssh --host linux-01 --interpreter bash --launch-dialect posix --login-shell=false id
 ```
 
-- **解释器选择**：支持 `--interpreter server`（原生执行，默认）、`bash`、`sh`、`powershell`、`pwsh` 及 `cmd`。
+- **解释器选择**：支持 `--interpreter server`（原生执行，默认）、`bash`、`sh`、`zsh`、`fish`、`powershell`、`pwsh` 及 `cmd`。
 - **登录环境控制**：当使用 `bash` 解释器时，支持 `--login-shell`（加载登录配置）与 `--no-login`（不加载登录配置）；`server` 解释器原生透传，不接受登录选项。
 - **输入流与 Shell 路由**：
   - **终端交互 Shell**：未指定命令且标准输入为终端时，启动交互式 PTY 登录 Shell；
@@ -63,6 +63,10 @@ xops exec -x --sudo web-01 id
 `ssh --sudo` 提供提权后的交互 shell；`exec -x --sudo` 直接执行提权命令。后者保留 PTY 认证，但不额外显示 root shell 提示符和注入命令回显。自定义 su/PAM 多轮认证和登录脚本应在目标环境验证。
 
 密码 sudo 支持传统 sudo 和 sudo-rs：使用可用凭据自动认证时，会过滤远端密码提示及 sudo-rs 的星号反馈；sudo-rs 的 PAM `Password:` 提示无论是否带尾随空格，均可识别。缺少凭据或密码被拒绝时，仍会提示输入密码。认证错误和提权后命令的输出会正常显示。
+
+Fish 节点也支持上述提权模式：在节点 `execution` 中保存 `launch_dialect: fish`，选择 `interpreter: fish`（也可选择 bash/sh/zsh），再使用 `xops exec --host fish-01 --sudo -c 'id'`、`xops exec -x --host fish-01 --sudo -c 'id'` 或 `xops ssh fish-01 --sudo`。Playbook 的 fish 脚本也支持提权。认证握手在固定 `/bin/sh` 中执行，成功后才启动所选解释器；密码、握手确认与用户 stdin 分离。fish 路径不使用 `sudo -i` 拼接命令，登录模式由所选解释器控制。su 通过 `-s /bin/sh` 固定控制 Shell，目标系统需支持该选项（见 [su 手册](https://man7.org/linux/man-pages/man1/su.1.html)）。CLI 显式 `--interpreter` 与 `--sudo` 仍不可组合，请使用节点或 Playbook 执行配置。
+
+zsh 节点配置 `interpreter: zsh` 与 `launch_dialect: posix` 后，可使用相同的 `--sudo` 命令和 Playbook 提权配置。zsh 复用 POSIX 认证协议，支持 sudo 和 su，命令与脚本保留 zsh 语义。登录模式使用 `zsh -l`；su 同样通过 `-s /bin/sh` 固定控制 Shell。
 
 ## 端口转发与隧道
 

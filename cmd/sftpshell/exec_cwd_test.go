@@ -323,7 +323,7 @@ func TestHandleExec_BatchExecution_InterpretersEndToEnd(t *testing.T) {
 			cwd:  "/var/log",
 			args: []string{"ls", "-la"},
 			verifyPayload: func(t *testing.T, payload string) {
-				expected := "bash -c 'cd -- '\\''/var/log'\\'' && ls -la'"
+				expected := "bash -c 'cd -- '\\''/var/log'\\'' && {\nls -la\n}'"
 				if payload != expected {
 					t.Errorf("expected payload %q, got %q", expected, payload)
 				}
@@ -342,7 +342,7 @@ func TestHandleExec_BatchExecution_InterpretersEndToEnd(t *testing.T) {
 			cwd:  "/var/log",
 			args: []string{"ls", "-la"},
 			verifyPayload: func(t *testing.T, payload string) {
-				expected := "bash -l -c 'cd -- '\\''/var/log'\\'' && ls -la'"
+				expected := "bash -l -c 'cd -- '\\''/var/log'\\'' && {\nls -la\n}'"
 				if payload != expected {
 					t.Errorf("expected payload %q, got %q", expected, payload)
 				}
@@ -357,7 +357,7 @@ func TestHandleExec_BatchExecution_InterpretersEndToEnd(t *testing.T) {
 			cwd:  "/var/log",
 			args: []string{"ls", "-la"},
 			verifyPayload: func(t *testing.T, payload string) {
-				expected := "sh -c 'cd -- '\\''/var/log'\\'' && ls -la'"
+				expected := "sh -c 'cd -- '\\''/var/log'\\'' && {\nls -la\n}'"
 				if payload != expected {
 					t.Errorf("expected payload %q, got %q", expected, payload)
 				}
@@ -412,7 +412,7 @@ func TestHandleExec_BatchExecution_InterpretersEndToEnd(t *testing.T) {
 			cwd:  `C:\Tools`,
 			args: []string{"dir", "/b"},
 			verifyPayload: func(t *testing.T, payload string) {
-				expected := `cmd.exe /d /s /c "cd /d "C:\Tools" && dir /b"`
+				expected := `cmd.exe /d /s /c "cd /d "C:\Tools" || exit /b & dir /b"`
 				if payload != expected {
 					t.Errorf("expected payload %q, got %q", expected, payload)
 				}
@@ -427,7 +427,7 @@ func TestHandleExec_BatchExecution_InterpretersEndToEnd(t *testing.T) {
 			cwd:  `C:\Tools`,
 			args: []string{"echo", `"A&B"`},
 			verifyPayload: func(t *testing.T, payload string) {
-				expected := `cmd.exe /d /s /c "cd /d "C:\Tools" && echo "A^&B""`
+				expected := `cmd.exe /d /s /c "cd /d "C:\Tools" || exit /b & echo "A^&B""`
 				if payload != expected {
 					t.Errorf("expected payload %q, got %q", expected, payload)
 				}

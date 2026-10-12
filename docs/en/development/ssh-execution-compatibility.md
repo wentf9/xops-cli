@@ -206,7 +206,7 @@ The following must be preserved:
 
 ### 6.2 SFTP Working Directories and File Operations
 
-SFTP directory state is independent of the process directory used by SSH exec. Pure server mode always rejects automatic cwd handling, even when the launch dialect is known; it cannot promise byte-for-byte forwarding while inserting `cd`. An `exec` operation that needs to inherit the current SFTP directory must explicitly select an interpreter adapter capable of generating a working-directory operation. Otherwise, report the unsupported combination before sending the user command.
+SFTP directory state is independent of the process directory used by SSH exec. Pure server passthrough does not add cwd. For known server/cmd, SFTP derives a temporary CMD adapter for that cwd-aware operation, preserving native CMD syntax and applying `cd /d` without changing connection or node settings. Other explicit server configurations require a compatible working-directory adapter; unsupported combinations fail before sending user code.
 
 The generated cwd expression enters the execution plan together with the user command. POSIX, PowerShell, and cmd each handle path quoting and failure propagation. Do not execute the user command after a failed cwd change or silently ignore the current SFTP directory when an adapter is missing. P3 migration instructions must include this restriction.
 

@@ -40,6 +40,7 @@ type privilegeExchange struct {
 	terminalReady                     chan struct{}
 	terminalOnce                      sync.Once
 	interpreter                       Interpreter
+	launchDialect                     LaunchDialect
 }
 
 func newPrivilegeExchange(c *Client, mode SudoMode, force bool, interp ...Interpreter) *privilegeExchange {
@@ -47,7 +48,7 @@ func newPrivilegeExchange(c *Client, mode SudoMode, force bool, interp ...Interp
 	if len(interp) > 0 && interp[0] != "" {
 		selectedInterp = interp[0]
 	}
-	return &privilegeExchange{
+	exchange := &privilegeExchange{
 		client:       c,
 		mode:         mode,
 		interpreter:  selectedInterp,
@@ -59,6 +60,10 @@ func newPrivilegeExchange(c *Client, mode SudoMode, force bool, interp ...Interp
 		forcePrompt:  force,
 		outputErrors: make(chan error, 1),
 	}
+	if execution := c.Execution(); execution != nil {
+		exchange.launchDialect = execution.LaunchDialect
+	}
+	return exchange
 }
 func (e *privilegeExchange) started() bool {
 	select {
@@ -70,6 +75,9 @@ func (e *privilegeExchange) started() bool {
 }
 func shellQuote(value string) string { return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'" }
 func (e *privilegeExchange) command(command string) string {
+	if e.launchDialect == LaunchFish || e.interpreter == InterpreterFish || e.interpreter == InterpreterZsh {
+		return e.portableCommand(command)
+	}
 	shellName := "bash"
 	if e.interpreter == InterpreterSh {
 		shellName = "sh"
@@ -225,27 +233,32 @@ func (c *Client) runPrivilegeOperation(ctx context.Context, mode SudoMode, comma
 	if ctx == nil || c == nil {
 		return fmt.Errorf("privilege execution requires a client and context")
 	}
-	if mode != SudoModeSudo && mode != SudoModeSu {
+	if mode != SudoModeSudo && mode != SudoModeSu && mode != SudoModeSudoer {
 		return fmt.Errorf("unsupported privilege exchange mode %q", mode)
 	}
 	if err := validateCommandStdin(stdin); err != nil {
 		return err
 	}
 	var terminal *privilegeTerminal
-	var interp Interpreter
+	config := c.defaultRunConfig()
 	for _, opt := range options {
 		switch v := opt.(type) {
 		case *privilegeTerminal:
 			terminal = v
 		case Interpreter:
-			interp = v
+			config.Interpreter = v
+		case *RunConfig:
+			if v != nil {
+				copied := *v
+				config = &copied
+			}
 		}
 	}
 	if terminal != nil && terminal.activate == nil {
 		return fmt.Errorf("privilege terminal activation is missing")
 	}
 	for attempt := 0; attempt < 3; attempt++ {
-		err := c.runPrivilegeAttempt(ctx, mode, command, stdin, stdout, stderr, attempt > 0, terminal, interp)
+		err := c.runPrivilegeAttempt(ctx, mode, command, stdin, stdout, stderr, attempt > 0, terminal, config)
 		if mode != SudoModeSu || !errors.Is(err, errPrivilegeAuthenticationRejected) || credentialRecoveryPrompter(c.prompter) == nil || attempt == 2 {
 			return err
 		}
@@ -253,15 +266,16 @@ func (c *Client) runPrivilegeOperation(ctx context.Context, mode SudoMode, comma
 	return errPrivilegeAuthenticationRejected
 }
 
-func (c *Client) runPrivilegeAttempt(ctx context.Context, mode SudoMode, command string, stdin io.Reader, stdout, stderr io.Writer, force bool, terminal *privilegeTerminal, interp ...Interpreter) (retErr error) {
-	exchange := newPrivilegeExchange(c, mode, force, interp...)
+func (c *Client) runPrivilegeAttempt(ctx context.Context, mode SudoMode, command string, stdin io.Reader, stdout, stderr io.Writer, force bool, terminal *privilegeTerminal, config *RunConfig) (retErr error) {
+	exchange := newPrivilegeExchange(c, mode, force, config.Interpreter)
+	exchange.launchDialect = config.LaunchDialect
 	exchange.terminal = terminal
 	if terminal != nil {
 		exchange.terminalToken = "[xops-terminal-" + rand.Text() + "]"
 		exchange.terminalReady = make(chan struct{})
 	}
 	defer func() { exchange.material.Zero() }()
-	if credentialRecoveryPrompter(c.prompter) == nil {
+	if mode != SudoModeSudoer && credentialRecoveryPrompter(c.prompter) == nil {
 		kind := SecretKindSudoPassword
 		if mode == SudoModeSu {
 			kind = SecretKindSuPassword
@@ -356,7 +370,7 @@ func (c *Client) runPrivilegeWithConfig(ctx context.Context, mode SudoMode, comm
 		config = c.defaultRunConfig()
 	}
 	output := newOutputWriter(config)
-	err := c.runPrivilegeOperation(ctx, mode, command, stdin, output, output, config.Interpreter)
+	err := c.runPrivilegeOperation(ctx, mode, command, stdin, output, output, config)
 	return output.String(), err
 }
 

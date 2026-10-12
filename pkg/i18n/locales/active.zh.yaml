@@ -151,11 +151,11 @@ flag_exec_task:
 flag_exec_no_login:
   other: "不加载登陆shell (用于避免欢迎信息/MOTD等干扰)"
 flag_exec_interpreter:
-  other: "普通命令解释器：server（原样 SSH exec）或 bash；显式模式支持有界缓冲或 Linux PTY 输出"
+  other: "普通命令解释器：server（原样 SSH exec）、bash、sh、zsh、fish、powershell、pwsh 或 cmd；显式模式支持有界缓冲或 Linux PTY 输出"
 flag_exec_launch_dialect:
-  other: "服务端启动方言：unknown、posix、powershell 或 cmd；显式 Bash 要求 posix"
+  other: "服务端启动方言：unknown、posix、fish、powershell 或 cmd；Bash/sh/zsh/fish 要求 posix 或 fish"
 flag_exec_login_shell:
-  other: "启用/关闭显式 Bash 的登录环境；不能与 server 或 --no-login 组合"
+  other: "启用/关闭显式 Bash/zsh/fish 的登录环境；不能与 server 或 --no-login 组合"
 flag_exec_stream:
   other: "启用实时流式输出 (多主机时自动添加主机前缀)"
 flag_exec_out_dir:
@@ -1110,7 +1110,7 @@ flag_host_probe_save:
 inventory_probe_short:
   other: "探测已保存节点的 SSH 执行环境"
 inventory_probe_long:
-  other: "使用已保存的连接凭据探测外层 Shell 与可用解释器并展示推荐配置。指定单个节点或使用 --all 按节点 ID 顺序探测全部已保存节点；单节点失败继续探测其余节点，存在失败时返回非零退出码。--save 仅替换探测成功节点的执行配置。认证为非交互式，并发节点修改会阻止保存。"
+  other: "使用已保存的连接凭据探测外层 Shell 与可用解释器并展示推荐配置。Unix 优先采用受支持且可用的远端默认 Shell，否则按 bash、sh、zsh、fish 回退。指定单个节点或使用 --all 按节点 ID 顺序探测全部已保存节点；单节点失败继续探测其余节点，存在失败时返回非零退出码。--save 仅替换探测成功节点的执行配置。认证为非交互式，并发节点修改会阻止保存。"
 inventory_probe_warning:
   other: "[{{.Node}}] 警告：执行环境探测不可用，保留显式配置或 server 默认值：{{.Error}}"
 inventory_probe_saved:
@@ -1135,6 +1135,6 @@ inventory_probe_duration:
   other: "探测耗时"
 
 flag_host_interpreter:
-  other: "新节点的显式解释器：server、bash、sh、powershell、pwsh 或 cmd"
+  other: "新节点的显式解释器：server、bash、sh、zsh、fish、powershell、pwsh 或 cmd"
 flag_host_launch_dialect:
-  other: "新节点的显式启动方言：unknown、posix、powershell 或 cmd"
+  other: "新节点的显式启动方言：unknown、posix、fish、powershell 或 cmd"

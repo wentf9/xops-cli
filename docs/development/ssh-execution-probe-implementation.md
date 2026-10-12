@@ -14,7 +14,7 @@ script/ensure/cwd 的受限操作探测只缓存结果，录入探测则随新�
   （包括 server）、已知方言或显式 login 均不会被覆盖。
 - Playbook 无 shebang 的 script 可在上述缺省环境下探测；BOM、不支持的 shebang 和显式执行配置
   继续按原校验规则处理。白名单 shebang 不能证明外层方言，不额外触发探测。
-- ensure 在检查之前探测并冻结配置，检查、action、复查使用相同配置。当前只允许 POSIX bash/sh；
+- ensure 在检查之前探测并冻结配置，检查、action、复查使用相同配置。支持 bash/sh/zsh/fish，外层方言须为 posix/fish；
   Windows script/ensure 会在用户代码开始前拒绝，不做语法翻译。
 - SFTP 非空 cwd 的 exec 在需要时探测。CMD 的普通推荐仍为 server，但受限操作会选用已安装的
   PowerShell/pwsh/cmd 适配器。空 cwd 的普通命令不探测。Windows SFTP 驱动器路径转换受 Windows
@@ -117,8 +117,8 @@ PowerShell 7 同样支持 `$()`、`||` 且能调用外部 `printf` 时被误判�
 CMD 结束帧的 `echo` 使用括号包裹，避免命令分隔符前的空格进入特征帧。
 
 CMD 保持设计推荐：存在 Windows PowerShell 时推荐 `server/cmd`，仅 CMD 时推荐 `cmd/cmd`。
-PowerShell 外层优先推荐 `powershell`，仅有 Core 时推荐 `pwsh`。POSIX 优先 `bash`，其次
-`sh`，两者均关闭 login；无受支持解释器时返回失败。所有成功推荐均经过 `Validate()`。
+PowerShell 外层优先推荐 `powershell`，仅有 Core 时推荐 `pwsh`。POSIX/fish 优先使用受支持且可用的远端默认 Shell（bash/sh/zsh/fish，ash/dash 映射 sh）；
+确认 fish 方言时优先 fish，避免继承的 `$SHELL` 过期。默认 Shell 未知、不支持或不可用时才按bash → sh → zsh → fish 回退，均关闭 login；无受支持解释器时返回失败。所有成功推荐均经过 `Validate()`。
 
 探针载荷只由静态常量及已有方言包装器生成，不插入节点字段、banner 或远端输出，不创建
 远端文件，不请求 PTY，不做提权。后续持久化接入仍需遵守节点事务与显式配置优先级。
@@ -155,3 +155,11 @@ golangci-lint run ./...
 # 原生解释器回归测试；在目标平台运行，未安装的解释器会跳过
 go test ./core/ssh -run '^TestProbeShell' -count=1 -v
 ```
+
+fish ensure 使用 `function <随机结果帧名称> --on-event fish_exit` 和 `builtin printf` 输出检查退出码，保留正常退出与显式 `exit` 的语义。`exec` 替换进程或解析失败不产生结果帧，维持停止 action 的原有约束。fish 工作目录命令使用 `cd ...; and begin ... end` 保护整个复合程序。退出事件参考 [fish 文档](https://fishshell.com/docs/current/language.html#event)。
+
+ensure 在 action 前拦截所有解释器的 126/127；fish 另拦截 121/123/124/125，防止命令展开或执行失败被当作条件不满足。显式返回保留码也采用同一保守策略。bash/sh/zsh 的工作目录载荷使用 `cd ... && { ...; }` 保护整个程序，与 fish 的条件代码块保持一致。fish 状态码参考[官方说明](https://fishshell.com/docs/current/language.html#the-status-variable)。
+
+SFTP `exec` 通过 `ResolveWorkingDirectoryExecution` 解析本次 cwd 适配器。已保存的 `server/cmd`（含仅配置 cmd 方言）无需重新探测，临时派生 `cmd/cmd` 后应用 `cd /d` 与驱动器路径规范化，原始连接/节点配置保持不变。其余显式 server 方言不根据 `/C:` 等路径猜测平台。
+
+CMD cwd 包装采用失败后退出的前置守卫 `cd /d "..." || exit /b & ...`。`exit /b` 不显式指定状态码，保留 cd 的失败 ERRORLEVEL；成功时跳过退出守卫，用户命令不另加括号或额外解释器层，因此 `rem` 注释、分组及显式退出码保留原有语义。已补充 Windows 原生 CMD 回归测试，并在 vm 节点用只读命令验证失败目录不会执行后续语句。退出指令参考 [Microsoft 文档](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/exit)。
