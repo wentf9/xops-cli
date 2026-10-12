@@ -1052,7 +1052,7 @@ credential_save_unavailable:
   other: "自动凭据保存不可用；本次连接将不保存凭据"
 
 inventory_add_long:
-  other: "添加单个节点。默认先验证 SSH 身份认证；验证失败时提示原因并询问是否仍然保存（默认不保存）。使用 --skip-verify 跳过验证直接保存。"
+  other: "添加单个节点。默认先验证 SSH 身份认证；验证失败时提示原因并询问是否仍然保存（默认不保存）。使用 --skip-verify 跳过验证与探测直接保存。验证成功后默认探测执行配置，--no-probe 跳过探测，显式执行参数优先。"
 
 flag_skip_verify:
   other: "跳过 SSH 验证，直接保存节点"
@@ -1098,3 +1098,41 @@ tui_verify_skip:
 
 inventory_save_incomplete:
   other: "[{{.Node}}] 更改已应用，但保存后续步骤报错；请检查配置后再重试：{{.Error}}"
+
+flag_host_probe:
+  other: "复用验证连接探测并保存新节点的执行配置"
+flag_host_no_probe:
+  other: "跳过自动执行环境探测"
+flag_host_probe_save:
+  other: "保存推荐配置，替换该节点的执行配置"
+inventory_probe_short:
+  other: "探测已保存节点的 SSH 执行环境"
+inventory_probe_long:
+  other: "使用已保存的连接凭据探测外层 Shell 与可用解释器并展示推荐配置；--save 仅替换所选节点的执行配置。认证为非交互式，并发节点修改会阻止保存。"
+inventory_probe_warning:
+  other: "[{{.Node}}] 警告：执行环境探测不可用，保留显式配置或 server 默认值：{{.Error}}"
+inventory_probe_saved:
+  other: "已保存推荐执行配置"
+inventory_probe_node:
+  other: "节点"
+inventory_probe_os:
+  other: "远端系统"
+inventory_probe_shell:
+  other: "Shell 路径"
+inventory_probe_banner:
+  other: "SSH 标识"
+inventory_probe_dialect:
+  other: "启动方言"
+inventory_probe_available:
+  other: "可用解释器"
+inventory_probe_recommended:
+  other: "推荐解释器"
+inventory_probe_login:
+  other: "登录模式"
+inventory_probe_duration:
+  other: "探测耗时"
+
+flag_host_interpreter:
+  other: "新节点的显式解释器：server、bash、sh、powershell、pwsh 或 cmd"
+flag_host_launch_dialect:
+  other: "新节点的显式启动方言：unknown、posix、powershell 或 cmd"

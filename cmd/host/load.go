@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/i18n"
@@ -26,6 +27,8 @@ type ImportOptions struct {
 	SaveOnVerifyFailure bool
 	Output              io.Writer
 	Tag                 string
+	NoProbe             bool
+	Execution           *ssh.ExecutionConfig // Applied only to newly enrolled nodes.
 }
 
 func NewCmdInventoryLoad() *cobra.Command {
@@ -45,6 +48,7 @@ func RegisterImportVerificationFlags(cmd *cobra.Command) {
 	cmd.Flags().Bool("skip-verify", false, i18n.T("flag_skip_verify"))
 	cmd.Flags().Bool("save-on-verify-failure", false, i18n.T("flag_save_on_verify_failure"))
 	cmd.MarkFlagsMutuallyExclusive("skip-verify", "save-on-verify-failure")
+	registerEnrollmentProbeFlags(cmd)
 }
 
 func RunInventoryLoad(cmd *cobra.Command, args []string) error {
@@ -76,7 +80,11 @@ func RunInventoryLoad(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("read save-on-failure option: %w", err)
 	}
-	return ExecuteLoadHostWithOptions(cmd.Context(), hosts, ImportOptions{SkipVerify: skip, SaveOnVerifyFailure: keep, Output: cmd.OutOrStdout(), Tag: Tag})
+	probe, execution, err := enrollmentProbeOptions(cmd)
+	if err != nil {
+		return err
+	}
+	return ExecuteLoadHostWithOptions(cmd.Context(), hosts, ImportOptions{SkipVerify: skip, SaveOnVerifyFailure: keep, Output: cmd.OutOrStdout(), Tag: Tag, NoProbe: !probe, Execution: execution})
 }
 
 // ExecuteLoadHost imports only authenticated nodes by default.
@@ -89,6 +97,9 @@ func ExecuteLoadHostContext(ctx context.Context, hosts []utils.HostInfo) error {
 }
 
 func ExecuteLoadHostWithOptions(ctx context.Context, hosts []utils.HostInfo, opts ImportOptions) error {
+	if err := opts.Execution.Validate(); err != nil {
+		return err
+	}
 	if opts.SkipVerify && opts.SaveOnVerifyFailure {
 		return fmt.Errorf("--skip-verify and --save-on-verify-failure are mutually exclusive")
 	}
@@ -109,6 +120,7 @@ type importDraft struct {
 type importResult struct {
 	nodeID, status string
 	err            error
+	warning        error
 }
 
 type importRow struct {
@@ -168,6 +180,11 @@ func executeImport(ctx context.Context, repo *config.Repository, hosts []utils.H
 	}
 	var errs []error
 	for _, result := range results {
+		if result.warning != nil {
+			if _, err := fmt.Fprintln(out, probeWarning(result.nodeID, result.warning)); err != nil {
+				errs = append(errs, fmt.Errorf("write import probe warning: %w", err))
+			}
+		}
 		message := i18n.Tf(result.status, map[string]any{"Node": result.nodeID, "Error": result.err})
 		if _, err := fmt.Fprintln(out, message); err != nil {
 			errs = append(errs, fmt.Errorf("write import result: %w", err))
@@ -187,12 +204,19 @@ func importOne(ctx context.Context, repo *config.Repository, addr utils.HostInfo
 		return result
 	}
 	result.nodeID = draft.nodeID
+	if draft.ref.ID == "" {
+		draft.bundle.Node.Execution = opts.Execution.Clone()
+	}
 	var verifyErr error
 	if !opts.SkipVerify {
-		verifyErr = verify(ctx, repo, draft.nodeID, draft.verificationBundle())
+		check := inventoryVerification{ConnectionSnapshot: draft.verificationBundle(), Probe: !opts.NoProbe && draft.ref.ID == ""}
+		verifyErr = verify(ctx, repo, draft.nodeID, &check)
 		if verifyErr != nil && (!opts.SaveOnVerifyFailure || ctx.Err() != nil) {
 			result.status, result.err = "inventory_verify_not_saved", verifyErr
 			return result
+		}
+		if verifyErr == nil && draft.ref.ID == "" {
+			draft.bundle.Node.Execution, result.warning = enrollmentExecution(opts.Execution, &check)
 		}
 	}
 	if err := draft.save(ctx, repo); err != nil {

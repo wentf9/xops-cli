@@ -89,6 +89,10 @@ xops host tags
 
 导入默认只保存 SSH 验证通过的节点，失败行会明确标记“未保存”；`--skip-verify` 跳过验证直接保存，`--save-on-verify-failure` 验证失败也保存，两者互斥。`host add` 和 TUI 添加节点默认先验证，失败后询问是否保存（默认否）；CLI 使用 `--skip-verify`、TUI 使用表单中的“跳过验证直接保存”选项进行离线添加。
 
+CLI 添加和导入新节点时默认复用验证连接探测执行环境，并随节点保存推荐配置；探测失败仅警告。
+`--no-probe` 跳过探测，`--skip-verify` 同时跳过探测。已有节点可用 `xops host probe <节点或别名>`
+诊断，添加 `--save` 保存推荐配置。参数与配置优先级见[主机与身份](docs/guide/hosts.md)。
+
 #### 3. SSH 连接与 TUI
 
 ```bash

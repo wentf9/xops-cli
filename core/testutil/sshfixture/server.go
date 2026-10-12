@@ -23,27 +23,30 @@ import (
 const Password = "synthetic-ssh-fixture-password"
 
 type Server struct {
-	Address     string
-	HostKey     ssh.PublicKey
-	Executed    atomic.Int32
-	Forwards    atomic.Int32
-	ctx         context.Context
-	cancel      context.CancelFunc
-	listener    net.Listener
-	config      *ssh.ServerConfig
-	handlers    sftp.Handlers
-	mu          sync.Mutex
-	connections map[net.Conn]struct{}
-	forwards    map[string]net.Listener
-	errors      []error
-	workers     sync.WaitGroup
-	closeOnce   sync.Once
-	closeErr    error
-	execHandler func(command string, channel ssh.Channel)
+	Address       string
+	HostKey       ssh.PublicKey
+	Executed      atomic.Int32
+	Authenticated atomic.Int32 // Successful SSH authentications, independent of exec channels.
+	Forwards      atomic.Int32
+	ctx           context.Context
+	cancel        context.CancelFunc
+	listener      net.Listener
+	config        *ssh.ServerConfig
+	handlers      sftp.Handlers
+	mu            sync.Mutex
+	connections   map[net.Conn]struct{}
+	forwards      map[string]net.Listener
+	errors        []error
+	workers       sync.WaitGroup
+	closeOnce     sync.Once
+	closeErr      error
+	execHandler   func(command string, channel ssh.Channel)
 }
 
 type Options struct {
 	PublicKeys []ssh.PublicKey
+	// ServerVersion optionally supplies the SSH identification banner.
+	ServerVersion string
 	// HostKeys supplies deployment-owned fixture keys. The first public key is
 	// exposed as HostKey; all supplied algorithms are advertised by the peer.
 	HostKeys []ssh.Signer
@@ -86,13 +89,23 @@ func NewWithOptions(ctx context.Context, options Options) (*Server, error) {
 			return nil, nil
 		}},
 	}
+	passwordCallback := s.config.PasswordCallback
+	s.config.PasswordCallback = func(metadata ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+		permissions, err := passwordCallback(metadata, password)
+		if err == nil {
+			s.Authenticated.Add(1)
+		}
+		return permissions, err
+	}
 	for _, signer := range hostKeys {
 		s.config.AddHostKey(signer)
 	}
+	s.config.ServerVersion = options.ServerVersion
 	s.forwards = make(map[string]net.Listener)
 	s.config.PublicKeyCallback = func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 		for _, allowed := range options.PublicKeys {
 			if bytes.Equal(allowed.Marshal(), key.Marshal()) {
+				s.Authenticated.Add(1)
 				return nil, nil
 			}
 		}

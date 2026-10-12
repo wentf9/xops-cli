@@ -22,6 +22,10 @@ type Client struct {
 	sshClient          *ssh.Client
 	rootConn           net.Conn
 	cfgMu              sync.RWMutex
+	probeMu            sync.Mutex
+	probeDone          chan struct{}
+	probeCache         *ProbeResult
+	probeErr           error
 	sudoMu             sync.Mutex
 	connCfg            ConnectionConfig
 	provider           ConnectionProvider
