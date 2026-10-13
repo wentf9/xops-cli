@@ -312,3 +312,27 @@ curl --max-time 10 --include https://mcp.example.com/mcp
 | 凭据或主机密钥错误 | 在服务端运行 `xops credential doctor`，确认凭据可用并完成主机密钥确认 |
 
 参数详情见 [MCP 命令参考](../reference/commands/xops-mcp)。
+
+## 命令解释器与自动探测
+
+`xops_ssh_run` 的执行配置优先级为请求的 `execution`、节点配置、全局配置，支持 bash、sh、zsh、fish、PowerShell、pwsh、CMD 和 `server`。例如：
+
+```json
+{
+  "nodeID": "web-01",
+  "command": "set -l values first second; printf '%s' $values[2]",
+  "execution": { "interpreter": "fish", "launchDialect": "fish", "login": false }
+}
+```
+
+`launch_dialect` 也是 `launchDialect` 的兼容写法。`sudo: true` 使用相同的执行配置；fish/zsh 复用共享 SSH 提权适配器，凭据仍须预先配置。
+
+当请求、节点和全局均未指定解释器或方言时，内置 MCP 后端在执行前通过固定的只读 SSH 探针选择远端默认 Shell。显式配置（包括 `server`）不被覆盖。探测结果按 SSH 连接缓存，不写回节点或全局配置；探测失败不运行用户命令。需要持续使用远端透传语义时，显式指定 `execution.interpreter: server`。
+
+探测先取得绑定到当前配置快照的 inspection 许可，完成后释放，再对最终解释器和命令计划进行风险评估及审批。配置在审批期间变化会使执行许可失效；策略明确禁止的命令不会启动探测。fish 命令按 fish 语义保守评估，即使其外层启动方言是 POSIX，也不会套用 POSIX 安全前缀规则。SFTP 文件操作不依赖 Shell 探测。
+
+嵌入式 MCP 主机可通过 `ports.ExecutionProber` 提供相同的准备能力；未实现该可选接口的自定义后端保留原来的执行行为。
+
+Shell 表达式中的命令替换、进程替换、变量展开、换行及后台操作符均按至少中等风险处理，包括以 `echo` 等只读前缀开头的命令；即使表达式被引用或转义，也保持保守分类。探测取消或超时不会永久阻止后续调用，后续请求可重新探测；语法不兼容、协议错误等非上下文失败仍按连接缓存。CLI 内置后端的探测和实际命令执行均使用各自许可中捕获的完整连接计划，配置编辑不会将已授权操作重定向到新地址；普通执行与提权执行复用同一连接代际，并在调用结束时释放连接租约。
+
+只读分类采用明确的命令及查询形式检查。`find`（包括 `-delete`、`-exec` 和文件输出动作）、`sed`、`awk`、`file`、`ss`、`journalctl`、分页器等具有写入或程序执行模式的工具统一按至少中等风险处理，纯查询用法也保守处理。`hostname` 仅放行无参数和指定查询选项；`date` 仅放行无参数或单个 `+格式` 参数；`ip` 仅放行 `addr`/`route` 及其无额外参数的 `show` 查询；`systemctl` 仅放行完整的 `status` 子命令及已知显示选项。引号、转义、通配符、环境赋值等无法确定参数含义的形式保持至少中等风险，命令名和子命令按完整词匹配，避免写入参数或相似前缀绕过审批。

@@ -71,15 +71,16 @@ func (c *Client) CachedExecutionProbe() (*ProbeResult, bool) {
 	cache := c.executionProbeCache()
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
-	if cache.done == nil {
+	attempt := cache.attempt
+	if attempt == nil {
 		return nil, false
 	}
 	select {
-	case <-cache.done:
-		if cache.err != nil {
+	case <-attempt.done:
+		if attempt.err != nil {
 			return nil, false
 		}
-		return cache.result.clone(), true
+		return attempt.result.clone(), true
 	default:
 		return nil, false
 	}

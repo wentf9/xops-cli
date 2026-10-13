@@ -36,6 +36,7 @@ type Backend struct {
 }
 
 var _ ports.Backend = (*Backend)(nil)
+var _ ports.ExecutionProber = (*Backend)(nil)
 
 func New(ctx context.Context, options Options) (*Backend, error) {
 	if ctx == nil {
@@ -91,6 +92,20 @@ func (b *Backend) connection(ctx context.Context, permit ports.Permit, selector 
 		return nil, fmt.Errorf("connect bound SSH target: %w", err)
 	}
 	return connection, nil
+}
+
+func (b *Backend) ProbeExecution(ctx context.Context, permit ports.Permit, nodeID string) (_ *ssh.ProbeResult, retErr error) {
+	work, cancel, err := b.work(ctx, permit, ports.Inspect)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	connection, err := b.connection(work, permit, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { retErr = errors.Join(retErr, connection.Close()) }()
+	return connection.Client.ProbeExecutionConfig(work)
 }
 
 func (b *Backend) Run(ctx context.Context, permit ports.Permit, nodeID string, command ports.Command) (result ports.CommandResult, retErr error) {

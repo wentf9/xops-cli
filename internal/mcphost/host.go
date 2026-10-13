@@ -229,14 +229,33 @@ type backend struct {
 }
 
 var _ ports.TunnelBackend = (*backend)(nil)
+var _ ports.ExecutionProber = (*backend)(nil)
 
-func (b *backend) Run(ctx context.Context, permit ports.Permit, nodeID string, command ports.Command) (ports.CommandResult, error) {
+func (b *backend) ProbeExecution(ctx context.Context, permit ports.Permit, nodeID string) (_ *ssh.ProbeResult, retErr error) {
+	work, cancel, err := ports.WorkContext(ctx, permit, ports.Inspect)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	_, target, err := permit.Snapshot().Resolve(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	connection, err := b.connector.ConnectPlan(work, target.Plan)
+	if err != nil {
+		return nil, fmt.Errorf("connect MCP execution probe: %w", err)
+	}
+	defer func() { retErr = errors.Join(retErr, connection.Close()) }()
+	return connection.Client.ProbeExecutionConfig(work)
+}
+
+func (b *backend) Run(ctx context.Context, permit ports.Permit, nodeID string, command ports.Command) (_ ports.CommandResult, retErr error) {
 	work, cancel, err := ports.WorkContext(ctx, permit, ports.Execute)
 	if err != nil {
 		return ports.CommandResult{}, err
 	}
 	defer cancel()
-	id, target, err := permit.Snapshot().Resolve(nodeID)
+	_, target, err := permit.Snapshot().Resolve(nodeID)
 	if err != nil {
 		return ports.CommandResult{}, err
 	}
@@ -273,10 +292,12 @@ func (b *backend) Run(ctx context.Context, permit ports.Permit, nodeID string, c
 			}, err
 		}
 	}
-	client, err := b.connector.Connect(work, id)
+	connection, err := b.connector.ConnectPlan(work, target.Plan)
 	if err != nil {
 		return ports.CommandResult{}, err
 	}
+	defer func() { retErr = errors.Join(retErr, connection.Close()) }()
+	client := connection.Client
 	if command.Sudo {
 		output, err := client.RunWithSudoExecution(work, command.Text, effectiveExec)
 		var exitCode *uint32

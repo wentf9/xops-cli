@@ -747,7 +747,7 @@
         },
         "execution": {
           "additionalProperties": false,
-          "description": "Optional execution configuration overriding node/global defaults",
+          "description": "Optional execution configuration overriding node/global defaults; supports fish and zsh. Unspecified environments are probed when the backend supports discovery; explicit server preserves passthrough.",
           "properties": {
             "interpreter": {
               "type": "string"

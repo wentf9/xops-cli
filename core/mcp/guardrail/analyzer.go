@@ -2,6 +2,7 @@ package guardrail
 
 import (
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -33,15 +34,13 @@ var dangerousPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\bwget\b.*\|\s*(ba)?sh`),
 }
 
-// safeCommandPrefixes identify read-only commands (when not piped or chained).
-var safeCommandPrefixes = []string{
-	"ls", "cat", "head", "tail", "less", "more",
-	"whoami", "hostname", "uname", "id",
-	"df", "free", "uptime", "ps", "top",
-	"date", "cal", "echo", "pwd", "which", "type",
-	"wc", "file", "stat", "find", "grep", "awk", "sed",
-	"ip addr", "ip route", "ss", "netstat",
-	"systemctl status", "journalctl",
+// These commands have no mutation or program-execution argument modes.
+// Mixed-purpose utilities (find, sed, awk, file, ss, journalctl, pagers, etc.)
+// require at least Moderate risk even when their name looks read-only.
+var readOnlyCommands = []string{
+	"ls", "cat", "head", "tail", "whoami", "uname", "id",
+	"df", "free", "uptime", "ps", "cal", "echo", "pwd",
+	"which", "type", "wc", "stat", "grep", "netstat",
 }
 
 // IsBlocked returns true if the command matches a hard-blocked pattern.
@@ -88,18 +87,52 @@ func AnalyzeCommandWithDialect(cmd string, dialect string) RiskLevel {
 		return Moderate
 	}
 
-	firstWord := extractFirstWord(normalized)
-	for _, prefix := range safeCommandPrefixes {
-		parts := strings.Fields(prefix)
-		if len(parts) == 1 && firstWord == parts[0] {
-			return Safe
-		}
-		if len(parts) > 1 && strings.HasPrefix(normalized, prefix) {
-			return Safe
-		}
+	if isReadOnlyInvocation(cmd) {
+		return Safe
 	}
 
 	return Moderate
+}
+
+func isReadOnlyInvocation(command string) bool {
+	// Do not infer argv through shell quoting, escaping, globbing or environment
+	// assignments. Unknown forms stay Moderate instead of hiding option names or
+	// changing how an otherwise read-only executable is loaded.
+	if strings.ContainsAny(command, "\\'\"=*?[]{}!~#") {
+		return false
+	}
+	// POSIX shell token separators are ASCII; Unicode whitespace must not make
+	// a different executable name look like one of the read-only commands.
+	words := strings.FieldsFunc(command, func(character rune) bool {
+		return character == ' ' || character == '\t'
+	})
+	if len(words) == 0 {
+		return false
+	}
+	switch words[0] {
+	case "hostname":
+		return len(words) == 1 || (len(words) == 2 && slices.Contains([]string{"-f", "--fqdn", "-s", "--short", "-d", "--domain", "-i", "--ip-address", "-I", "--all-ip-addresses"}, words[1]))
+	case "date":
+		return len(words) == 1 || (len(words) == 2 && strings.HasPrefix(words[1], "+"))
+	case "ip":
+		return (len(words) == 2 || (len(words) == 3 && words[2] == "show")) && (words[1] == "addr" || words[1] == "route")
+	case "systemctl":
+		return isSystemctlStatusQuery(words[1:])
+	default:
+		return slices.Contains(readOnlyCommands, words[0])
+	}
+}
+
+func isSystemctlStatusQuery(arguments []string) bool {
+	if len(arguments) == 0 || arguments[0] != "status" {
+		return false
+	}
+	for _, argument := range arguments[1:] {
+		if strings.HasPrefix(argument, "-") && !slices.Contains([]string{"--no-pager", "--full", "-l", "--plain"}, argument) {
+			return false
+		}
+	}
+	return true
 }
 
 // sensitivePaths that elevate risk when targeted.
@@ -128,25 +161,16 @@ func AnalyzePaths(paths []string) RiskLevel {
 }
 
 func containsChaining(cmd string) bool {
+	// Safe prefixes do not establish safety when expansions, substitutions or
+	// additional shell statements can execute code. Keep quoted/escaped forms
+	// conservative rather than attempting a partial parser for several shells.
+	if strings.ContainsAny(cmd, "$`()<\n\r&") {
+		return true
+	}
 	for _, sep := range []string{"&&", "||", "|", ";", ">>", ">"} {
 		if strings.Contains(cmd, sep) {
 			return true
 		}
 	}
 	return false
-}
-
-func extractFirstWord(cmd string) string {
-	// skip leading env vars like VAR=val
-	for {
-		parts := strings.SplitN(cmd, " ", 2)
-		if len(parts) == 0 {
-			return ""
-		}
-		if strings.Contains(parts[0], "=") && len(parts) > 1 {
-			cmd = strings.TrimSpace(parts[1])
-			continue
-		}
-		return parts[0]
-	}
 }

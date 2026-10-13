@@ -16,7 +16,13 @@ import (
 var ErrExecutionProbe = errors.New("SSH execution probe failed")
 
 type executionProbeCache struct {
-	mu     sync.Mutex
+	mu      sync.Mutex
+	attempt *executionProbeAttempt
+}
+
+// Each attempt owns its completion/result, so waiters on a canceled attempt
+// cannot accidentally observe a replacement attempt's result.
+type executionProbeAttempt struct {
 	done   chan struct{}
 	result *ProbeResult
 	err    error
@@ -82,13 +88,14 @@ func (r *ProbeResult) clone() *ProbeResult {
 	return &copy
 }
 
-// ProbeExecutionConfig performs one read-only, bounded two-stage probe per
-// authenticated SSH connection lifetime (including pooled wrappers). Callers share that attempt; each
-// waiter can cancel independently. Failures are cached as well, preventing
-// repeated probes of restricted servers. The initiating caller owns the probe
-// context; its cancellation is cached. Returned snapshots can be mutated safely.
+// ProbeExecutionConfig performs a read-only, bounded two-stage probe. Successful
+// results and non-context failures are shared for the authenticated connection's
+// lifetime, including pooled wrappers. Concurrent callers share one attempt;
+// each waiter can cancel independently. Non-context failures are cached, preventing
+// repeated probes of restricted servers. A canceled or expired attempt can be
+// retried by a later caller; its original waiters still receive its own result.
 // This method neither changes Execution() nor writes configuration or retries
-// user commands. A new connection is required to retry an inconclusive probe.
+// user commands. A new connection is required to retry non-context failures.
 func (c *Client) ProbeExecutionConfig(ctx context.Context) (*ProbeResult, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("%w: context is nil", ErrExecutionProbe)
@@ -101,25 +108,33 @@ func (c *Client) ProbeExecutionConfig(ctx context.Context) (*ProbeResult, error)
 	}
 	cache := c.executionProbeCache()
 	cache.mu.Lock()
-	if done := cache.done; done != nil {
-		cache.mu.Unlock()
+	if attempt := cache.attempt; attempt != nil {
 		select {
-		case <-ctx.Done():
-			return nil, fmt.Errorf("%w: wait for cached result: %w", ErrExecutionProbe, ctx.Err())
-		case <-done:
-			cache.mu.Lock()
-			defer cache.mu.Unlock()
-			return cache.result.clone(), cache.err
+		case <-attempt.done:
+			if errors.Is(attempt.err, context.Canceled) || errors.Is(attempt.err, context.DeadlineExceeded) {
+				break
+			}
+			cache.mu.Unlock()
+			return attempt.result.clone(), attempt.err
+		default:
+			cache.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("%w: wait for cached result: %w", ErrExecutionProbe, ctx.Err())
+			case <-attempt.done:
+				return attempt.result.clone(), attempt.err
+			}
 		}
 	}
-	cache.done = make(chan struct{})
+	attempt := &executionProbeAttempt{done: make(chan struct{})}
+	cache.attempt = attempt
 	cache.mu.Unlock()
 
 	result, err := c.probeExecution(ctx)
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
-	cache.result, cache.err = result, err
-	close(cache.done)
+	attempt.result, attempt.err = result, err
+	close(attempt.done)
 	return result.clone(), err
 }
 

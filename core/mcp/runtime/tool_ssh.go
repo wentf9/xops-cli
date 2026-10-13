@@ -57,7 +57,7 @@ type SshRunInput struct {
 	NodeID    string               `json:"nodeID" jsonschema:"The ID of the node to execute command on"`
 	Command   string               `json:"command" jsonschema:"The shell command to execute"`
 	Sudo      bool                 `json:"sudo,omitempty" jsonschema:"Whether to use sudo to execute the command"`
-	Execution *ssh.ExecutionConfig `json:"execution,omitempty" jsonschema:"Optional execution configuration overriding node/global defaults"`
+	Execution *ssh.ExecutionConfig `json:"execution,omitempty" jsonschema:"Optional execution configuration overriding node/global defaults; supports fish and zsh. Unspecified environments are probed when the backend supports discovery; explicit server preserves passthrough."`
 }
 
 type SshRunOutput struct {

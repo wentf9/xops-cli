@@ -6,8 +6,14 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -106,6 +112,9 @@ func TestBackendExecutesOnlyWithBoundPermission(t *testing.T) {
 		t.Fatal("rejected operation reached SSH")
 	}
 	execute := permit(t, ctx, view, ports.Execute)
+	if _, err := backend.ProbeExecution(ctx, execute, "node"); !errors.Is(err, ports.ErrPurpose) {
+		t.Fatalf("execution permit acquired probe authority: %v", err)
+	}
 	result, err := backend.Run(ctx, execute, "node", ports.Command{Text: "hostname"})
 	if err != nil || result.Output != "fixture-output" {
 		t.Fatalf("SSH roundtrip: %+v %v", result, err)
@@ -118,6 +127,168 @@ func TestBackendExecutesOnlyWithBoundPermission(t *testing.T) {
 	}
 	if server.Executed.Load() != 1 {
 		t.Fatal("cancelled execution reached SSH")
+	}
+}
+
+func TestBackendProbeDefaultShellAndConnectionCache(t *testing.T) {
+	for _, interpreter := range []ssh.Interpreter{ssh.InterpreterFish, ssh.InterpreterZsh} {
+		t.Run(string(interpreter), func(t *testing.T) {
+			backend, view, server, ctx := setupBackendWithHandler(t, func(command string, ch cryptoSSH.Channel) {
+				output, status := "syntax error\n", uint32(1)
+				switch {
+				case strings.Contains(command, "__XOPS_INTERP_END__"):
+					output, status = "__XOPS_INTERP__:bash\n__XOPS_INTERP__:sh\n__XOPS_INTERP__:"+string(interpreter)+"\n__XOPS_INTERP_END__\n", 0
+				case interpreter == ssh.InterpreterZsh && strings.Contains(command, "__XOPS_DIALECT_POSIX__"):
+					output, status = "__XOPS_DIALECT_POSIX__:Linux:/bin/zsh\n", 0
+				case interpreter == ssh.InterpreterFish && strings.Contains(command, "__XOPS_DIALECT_FISH__"):
+					output, status = "__XOPS_DIALECT_FISH__:3.7.0\n__XOPS_FISH_OS__:Linux\n__XOPS_FISH_SHELL__:/bin/fish\n", 0
+				}
+				if _, err := io.WriteString(ch, output); err != nil {
+					t.Error(err)
+				}
+				if _, err := ch.SendRequest("exit-status", false, cryptoSSH.Marshal(struct{ Status uint32 }{status})); err != nil {
+					t.Error(err)
+				}
+			})
+			for attempt := 0; attempt < 2; attempt++ {
+				inspection := permit(t, ctx, view, ports.Inspect)
+				before := server.Executed.Load()
+				result, err := backend.ProbeExecution(ctx, inspection, "node")
+				if err != nil || result.RecommendedInterpreter != interpreter || result.SuggestedConfig.Interpreter != interpreter {
+					t.Fatalf("default shell probe: %+v %v", result, err)
+				}
+				if attempt == 1 && server.Executed.Load() != before {
+					t.Fatal("probe cache was not shared across connection leases")
+				}
+				if err := inspection.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			canceled, cancel := context.WithCancel(ctx)
+			cancel()
+			before := server.Executed.Load()
+			if _, err := backend.ProbeExecution(canceled, permit(t, ctx, view, ports.Inspect), "node"); !errors.Is(err, context.Canceled) || server.Executed.Load() != before {
+				t.Fatalf("canceled discovery reached SSH: %v", err)
+			}
+		})
+	}
+}
+
+func TestBackendProbeRecoversAfterRequestCancellation(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	var requests atomic.Int32
+	backend, view, server, ctx := setupBackendWithHandler(t, func(command string, ch cryptoSSH.Channel) {
+		if requests.Add(1) == 1 {
+			close(started)
+			// Released below, including on test failure, before fixture cleanup.
+			select {
+			case <-release:
+			case <-t.Context().Done():
+			}
+			return
+		}
+		output := "fixture-output"
+		switch {
+		case strings.Contains(command, "__XOPS_DIALECT_POSIX__"):
+			output = "__XOPS_DIALECT_POSIX__:Linux:/bin/sh\n"
+		case strings.Contains(command, "__XOPS_INTERP_END__"):
+			output = "__XOPS_INTERP__:sh\n__XOPS_INTERP_END__\n"
+		}
+		if _, err := io.WriteString(ch, output); err != nil {
+			t.Error(err)
+		}
+		if _, err := ch.SendRequest("exit-status", false, cryptoSSH.Marshal(struct{ Status uint32 }{0})); err != nil {
+			t.Error(err)
+		}
+	})
+	request, cancel := context.WithCancel(ctx)
+	defer cancel()
+	inspection := permit(t, ctx, view, ports.Inspect)
+	done := make(chan error, 1)
+	// Probe exits on request cancellation; joined before releasing the server.
+	go func() { _, err := backend.ProbeExecution(request, inspection, "node"); done <- err }()
+	select {
+	case <-started:
+	case <-ctx.Done():
+		cancel()
+		<-done
+		t.Fatal(ctx.Err())
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("first request: %v", err)
+	}
+	releaseOnce.Do(func() { close(release) })
+	if err := inspection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	result, err := backend.ProbeExecution(ctx, permit(t, ctx, view, ports.Inspect), "node")
+	if err != nil || result.RecommendedInterpreter != ssh.InterpreterSh {
+		t.Fatalf("fresh request reused canceled result: %+v %v", result, err)
+	}
+	if server.Authenticated.Load() != 1 || server.Executed.Load() != 3 {
+		t.Fatalf("recovery did not reuse healthy transport: auth=%d exec=%d", server.Authenticated.Load(), server.Executed.Load())
+	}
+	commandResult, err := backend.Run(ctx, permit(t, ctx, view, ports.Execute), "node", ports.Command{Text: "uptime", Execution: result.SuggestedConfig.Clone()})
+	if err != nil || commandResult.Output != "fixture-output" || server.Executed.Load() != 4 {
+		t.Fatalf("execution after recovery: %+v %v", commandResult, err)
+	}
+}
+
+func TestBackendNativeFishAndZshNOPASSWD(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires native Unix shells")
+	}
+	for _, interpreter := range []ssh.Interpreter{ssh.InterpreterFish, ssh.InterpreterZsh} {
+		t.Run(string(interpreter), func(t *testing.T) {
+			shell, err := exec.LookPath(string(interpreter))
+			if err != nil {
+				t.Skipf("shell unavailable: %v", err)
+			}
+			directory := t.TempDir()
+			// Test-only sudo forwards argv without changing credentials. Native
+			// shell/control-frame behavior runs normally over the SSH channel.
+			forwarder := "#!/bin/sh\n[ \"$1\" = -n ] && [ \"$2\" = -S ] && [ \"$3\" = -p ] && [ \"$5\" = -- ] || exit 93\nshift 5\nexec \"$@\"\n"
+			if err := os.WriteFile(filepath.Join(directory, "sudo"), []byte(forwarder), 0700); err != nil {
+				t.Fatal(err)
+			}
+			backend, view, _, ctx := setupBackendWithHandler(t, func(payload string, ch cryptoSSH.Channel) {
+				work, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+				defer cancel()
+				command := exec.CommandContext(work, shell, "-c", payload)
+				command.WaitDelay = time.Second
+				command.Env = append(os.Environ(), "PATH="+directory+string(os.PathListSeparator)+os.Getenv("PATH"), "HOME="+directory, "ZDOTDIR="+directory, "XDG_CONFIG_HOME="+directory)
+				command.Stdin, command.Stdout, command.Stderr = ch, ch, ch.Stderr()
+				status := uint32(0)
+				if err := command.Run(); err != nil {
+					var exit *exec.ExitError
+					if errors.As(err, &exit) && exit.ExitCode() >= 0 {
+						status = uint32(exit.ExitCode())
+					} else {
+						t.Errorf("native privilege fixture: %v", err)
+						status = 1
+					}
+				}
+				if _, err := ch.SendRequest("exit-status", false, cryptoSSH.Marshal(struct{ Status uint32 }{status})); err != nil {
+					t.Error(err)
+				}
+			})
+			dialect, text := ssh.LaunchPOSIX, "values=(first second); print -rn -- $values[2]"
+			if interpreter == ssh.InterpreterFish {
+				dialect, text = ssh.LaunchFish, "set -l values first second; printf '%s' $values[2]"
+			}
+			login := false
+			target := view.Targets["node"]
+			target.Execution = &ssh.ExecutionConfig{Interpreter: interpreter, LaunchDialect: dialect, Login: &login}
+			target.Plan.Hops[0].SudoMode = ssh.SudoModeSudoer
+			view.Targets["node"] = target
+			result, err := backend.Run(ctx, permit(t, ctx, view, ports.Execute), "node", ports.Command{Text: text, Sudo: true})
+			if err != nil || result.Output != "second" || result.Outcome != ssh.ExecutionCompleted {
+				t.Fatalf("native %s sudo: %+v %v", interpreter, result, err)
+			}
+		})
 	}
 }
 
@@ -196,6 +367,10 @@ func TestBackendExecutionDefaultsAndSudoConfiguration(t *testing.T) {
 		{name: "unconfigured command defaults to server", payload: "uptime"},
 		{name: "configured bash command", node: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchPOSIX, Login: &yes}, payload: "bash -l -c 'uptime'"},
 		{name: "explicit server", request: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer}, payload: "uptime"},
+		{name: "configured fish", node: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterFish, LaunchDialect: ssh.LaunchFish, Login: &no}, payload: "fish -c 'uptime'"},
+		{name: "configured zsh", node: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterZsh, LaunchDialect: ssh.LaunchPOSIX, Login: &no}, payload: "zsh -c 'uptime'"},
+		{name: "fish sudo override", node: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchPOSIX}, request: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterFish, LaunchDialect: ssh.LaunchFish, Login: &no}, sudo: true, mode: ssh.SudoModeRoot, payload: "fish -c 'uptime'"},
+		{name: "zsh sudo override", request: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterZsh, LaunchDialect: ssh.LaunchPOSIX, Login: &no}, sudo: true, mode: ssh.SudoModeRoot, payload: "zsh -c 'uptime'"},
 		{name: "legacy sudo root", sudo: true, mode: ssh.SudoModeRoot, payload: "bash -l -c 'uptime'"},
 		{name: "configured sudo root", node: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchPOSIX, Login: &no}, sudo: true, mode: ssh.SudoModeRoot, payload: "bash -c 'uptime'"},
 		{name: "configured NOPASSWD", request: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchPOSIX, Login: &no}, sudo: true, mode: ssh.SudoModeSudoer, payload: "sudo -S -p '' bash -c 'uptime'"},

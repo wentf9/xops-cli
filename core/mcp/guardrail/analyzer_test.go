@@ -70,6 +70,86 @@ func TestAnalyzeCommand(t *testing.T) {
 	}
 }
 
+func TestSafePrefixesDoNotHideShellExecution(t *testing.T) {
+	for _, command := range []string{
+		`echo =(touch "$XOPS_REVIEW_MARKER")`,
+		`echo $(touch /tmp/marker)`,
+		"echo `touch /tmp/marker`",
+		`cat <(touch /tmp/marker)`,
+		"echo hello\ntouch /tmp/marker",
+		"echo hello\rtouch /tmp/marker",
+		"echo hello & touch /tmp/marker",
+		`echo $SHELL`,
+		`echo 'literal $(text)'`,
+	} {
+		t.Run(command, func(t *testing.T) {
+			if got := AnalyzeCommandWithDialect(command, "posix"); got < Moderate {
+				t.Fatalf("shell expression classified safe: %q => %v", command, got)
+			}
+		})
+	}
+}
+
+func TestReadOnlyInvocationArgumentBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		command string
+		want    RiskLevel
+	}{
+		{"find /tmp/file -delete", Moderate},
+		{"find /tmp/file -exec touch /tmp/owned +", Moderate},
+		{"find /tmp/file -execdir touch /tmp/owned +", Moderate},
+		{"find /tmp/file -fprint /tmp/output", Moderate},
+		{"find /tmp/file -fls /tmp/output", Moderate},
+		{"find /tmp/file -fprintf /tmp/output %p", Moderate},
+		{"find /tmp/file -ok touch /tmp/owned +", Moderate},
+		{"find /tmp/file -print", Moderate},
+		{"sed -i s/old/new/ /tmp/file", Moderate},
+		{"sed w/tmp/output /tmp/file", Moderate},
+		{"sed e /tmp/program", Moderate},
+		{"awk -f /tmp/program /tmp/file", Moderate},
+		{"file -C", Moderate},
+		{"ss -K dst 192.0.2.1", Moderate},
+		{"journalctl --rotate", Moderate},
+		{"journalctl --vacuum-size=1M", Moderate},
+		{"less -o/tmp/output /tmp/file", Moderate},
+		{"hostname changed-host", Moderate},
+		{"hostname -F /tmp/name", Moderate},
+		{"date -s 2030-01-01", Moderate},
+		{"date 010100002030", Moderate},
+		{"ip addr flush dev eth0", Moderate},
+		{"ip route flush table main", Moderate},
+		{"ip route add 192.0.2.0/24 dev eth0", Moderate},
+		{"systemctl status-invalid nginx", Moderate},
+		{"systemctl status nginx --unknown", Moderate},
+		{"LD_PRELOAD=/tmp/code.so ls", Moderate},
+		{`"find" /tmp/file -delete`, Moderate},
+		{`fi\nd /tmp/file -delete`, Moderate},
+		{"ls\u00a0-la", Moderate},
+		{"\u00a0ls -la", Moderate},
+		{"ls\v-la", Moderate},
+		{"ls\t-la /tmp", Safe},
+		{"hostname", Safe},
+		{"hostname -f", Safe},
+		{"hostname --short", Safe},
+		{"date", Safe},
+		{"date +%F", Safe},
+		{"ip addr", Safe},
+		{"ip addr show", Safe},
+		{"ip route show", Safe},
+		{"systemctl status nginx --no-pager", Safe},
+		{"ls -la /tmp", Safe},
+		{"cat /etc/hosts", Safe},
+		{"ps aux", Safe},
+		{"grep pattern /tmp/file", Safe},
+	} {
+		t.Run(tc.command, func(t *testing.T) {
+			if got := AnalyzeCommandWithDialect(tc.command, "posix"); got != tc.want {
+				t.Fatalf("argument risk: %q => %v, want %v", tc.command, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestAnalyzePaths(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -88,25 +168,6 @@ func TestAnalyzePaths(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := AnalyzePaths(tt.paths); got != tt.want {
 				t.Errorf("AnalyzePaths(%v) = %v, want %v", tt.paths, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestExtractFirstWord(t *testing.T) {
-	tests := []struct {
-		cmd  string
-		want string
-	}{
-		{"ls -la", "ls"},
-		{"LANG=C ls", "ls"},
-		{"VAR=val CMD=1 echo hello", "echo"},
-		{"cat file.txt", "cat"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.cmd, func(t *testing.T) {
-			if got := extractFirstWord(tt.cmd); got != tt.want {
-				t.Errorf("extractFirstWord(%q) = %q, want %q", tt.cmd, got, tt.want)
 			}
 		})
 	}

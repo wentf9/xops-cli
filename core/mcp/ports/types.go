@@ -202,6 +202,13 @@ type Backend interface {
 	Shutdown(context.Context) error
 }
 
+// ExecutionProber is an optional preparation capability. It accepts only an
+// inspection permit and executes the fixed, bounded SSH shell probes, never
+// caller-provided commands. The result is transient operation metadata.
+type ExecutionProber interface {
+	ProbeExecution(context.Context, Permit, string) (*ssh.ProbeResult, error)
+}
+
 // TransferSession retains the original transport until Close. ReserveCommit
 // exchanges streaming authority for an already admitted commit permit without
 // dialing again. Calls on a session are sequential; Close may interrupt I/O.

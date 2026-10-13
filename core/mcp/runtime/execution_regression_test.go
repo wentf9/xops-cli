@@ -33,6 +33,9 @@ func TestExecutionRiskUsesTrustedDialectAndLegacyDefaults(t *testing.T) {
 		{"node server unspecified dialect", nil, &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer}, guardrail.Moderate, "unknown"},
 		{"untrusted POSIX assertion", &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer, LaunchDialect: ssh.LaunchPOSIX}, nil, guardrail.Moderate, "unknown"},
 		{"trusted POSIX server", &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer}, &ssh.ExecutionConfig{LaunchDialect: ssh.LaunchPOSIX}, guardrail.Safe, "posix"},
+		{"fish through POSIX stays conservative", &ssh.ExecutionConfig{Interpreter: ssh.InterpreterFish, LaunchDialect: ssh.LaunchPOSIX}, &ssh.ExecutionConfig{LaunchDialect: ssh.LaunchPOSIX}, guardrail.Moderate, "fish"},
+		{"configured fish", nil, &ssh.ExecutionConfig{Interpreter: ssh.InterpreterFish, LaunchDialect: ssh.LaunchFish}, guardrail.Moderate, "fish"},
+		{"configured zsh", nil, &ssh.ExecutionConfig{Interpreter: ssh.InterpreterZsh, LaunchDialect: ssh.LaunchPOSIX}, guardrail.Safe, "posix"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ri, err := resolveExecutionRisk(guardrail.RiskInput{ToolName: "xops_ssh_run", Command: "ls", Execution: test.request}, ports.Target{Execution: test.target})

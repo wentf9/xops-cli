@@ -312,3 +312,27 @@ The check request without a token should return `401`, confirming TLS and proxy 
 | Credential or host-key error | Run `xops credential doctor` on the server, restore credential access and confirm the host key |
 
 See the [MCP command reference](../reference/commands/xops-mcp) for details.
+
+## Command interpreters and discovery
+
+`xops_ssh_run` resolves execution settings in request `execution`, node, then global order. It supports bash, sh, zsh, fish, PowerShell, pwsh, CMD, and `server`. For example:
+
+```json
+{
+  "nodeID": "web-01",
+  "command": "set -l values first second; printf '%s' $values[2]",
+  "execution": { "interpreter": "fish", "launchDialect": "fish", "login": false }
+}
+```
+
+`launch_dialect` is also accepted as an alias for `launchDialect`. `sudo: true` uses the same execution settings; fish/zsh use the shared SSH privilege adapters and still require credentials to be configured in advance.
+
+When neither an interpreter nor a dialect is specified at any level, built-in MCP backends run fixed read-only SSH probes before execution and prefer the remote default shell. Explicit choices, including `server`, are preserved. Results are cached per SSH connection and never persisted to node/global settings. Failed discovery prevents user-command execution. Explicitly select `execution.interpreter: server` to retain remote passthrough semantics.
+
+Discovery acquires an inspection permit bound to the current configuration snapshot, then releases it before evaluating risk and requesting approval for the resolved interpreter and command plan. Configuration edits during approval invalidate execution admission. Commands explicitly blocked by policy do not trigger discovery. Fish commands receive conservative fish classification even when launched through a POSIX outer shell. SFTP file operations do not require shell discovery.
+
+Embedded hosts can implement the optional `ports.ExecutionProber` preparation capability. Custom backends without this interface retain their previous execution behavior.
+
+Command/process substitutions, variable expansions, newlines, and background operators are classified as at least Moderate, including commands starting with read-only prefixes such as `echo`. Quoted or escaped expressions remain conservatively classified. Canceled or expired probes do not permanently block later calls: a subsequent request may start a fresh probe. Non-context failures, such as incompatible syntax or protocol errors, remain cached per connection. The built-in CLI backend uses the complete connection plan captured in each permit for both discovery and command execution, so configuration edits cannot redirect admitted operations to another endpoint. Ordinary and elevated execution reuse the same connection generation and release their connection leases when each call completes.
+
+Read-only classification checks explicit commands and query forms. Mixed-purpose utilities such as `find` (including `-delete`, `-exec`, and file-output actions), `sed`, `awk`, `file`, `ss`, `journalctl`, and pagers remain at least Moderate, including query-only uses. `hostname` permits only no arguments or listed query options; `date` permits no arguments or one `+format` argument; `ip` permits only `addr`/`route` and their `show` queries without extra arguments; `systemctl` permits only the complete `status` subcommand with known display options. Quoting, escaping, globbing, environment assignments, and other forms with uncertain argument semantics remain at least Moderate. Command/subcommand matching uses complete words to prevent mutating arguments or similar prefixes from bypassing approval.

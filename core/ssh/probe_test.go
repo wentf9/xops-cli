@@ -269,27 +269,59 @@ func TestProbeExecutionConfigWaiterCancellation(t *testing.T) {
 }
 
 func TestProbeExecutionConfigInitiatorCancellation(t *testing.T) {
-	scenario := &commandFixture{hangCommand: true, commands: make(chan string, 1)}
-	client := commandTestClient(t, scenario)
+	started, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+	var posixAttempts atomic.Int32
+	client, server := executionProbeClient(t, "", func(ctx context.Context, command string, channel cryptoSSH.Channel) {
+		if command == probePOSIX {
+			if posixAttempts.Add(1) == 1 {
+				close(started)
+				select {
+				case <-release:
+				case <-ctx.Done():
+				}
+				return
+			}
+			replyExecutionProbe(t, ctx, channel, "__XOPS_DIALECT_POSIX__:Linux:/bin/sh\n", 0)
+			return
+		}
+		replyExecutionProbe(t, ctx, channel, "__XOPS_INTERP__:sh\n__XOPS_INTERP_END__\n", 0)
+	})
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	done := make(chan error, 1)
-	// Cancellation closes the command channel and joins its I/O workers.
+	// The caller exits on cancellation, and is joined before retrying.
 	go func() { _, err := client.ProbeExecutionConfig(ctx); done <- err }()
-	select {
-	case <-scenario.commands:
-	case <-time.After(time.Second):
-		cancel()
-		<-done
-		t.Fatal("probe did not send an exec request")
-	}
+	<-started
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("initiator error = %v", err)
 	}
-	result, err := client.ProbeExecutionConfig(t.Context())
-	if !errors.Is(err, context.Canceled) || result.SuggestedConfig.Interpreter != InterpreterServer || scenario.attempts.Load() != 1 {
-		t.Fatalf("cancellation not cached: result %+v, err %v, requests %d", result, err, scenario.attempts.Load())
+	if _, cached := client.CachedExecutionProbe(); cached {
+		t.Fatal("canceled attempt appeared successful")
+	}
+	const waiters = 8
+	results := make(chan error, waiters)
+	// Each retry exits on the probe's bounded timeout; all are joined below.
+	for range waiters {
+		go func() {
+			result, err := client.ProbeExecutionConfig(t.Context())
+			if err == nil && result.RecommendedInterpreter != InterpreterSh {
+				err = errors.New("retry did not discover sh")
+			}
+			results <- err
+		}()
+	}
+	for range waiters {
+		if err := <-results; err != nil {
+			t.Error(err)
+		}
+	}
+	if server.Executed.Load() != 3 {
+		t.Fatalf("retries did not share one new attempt: requests=%d", server.Executed.Load())
+	}
+	if _, cached := client.CachedExecutionProbe(); !cached {
+		t.Fatal("successful retry was not cached")
 	}
 }
 

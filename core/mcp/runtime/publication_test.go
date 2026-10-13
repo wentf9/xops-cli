@@ -5,10 +5,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -61,7 +64,7 @@ func setupPublicationWithAdmission(t *testing.T, options *mcp.ClientOptions, ena
 	t.Cleanup(cancel)
 	f := &publicationFixture{ctx: ctx}
 	var err error
-	f.first, err = sshfixture.New(ctx)
+	f.first, err = sshfixture.NewWithOptions(ctx, sshfixture.Options{ExecHandler: func(command string, ch cryptoSSH.Channel) { replyPublicationCommand(t, command, ch) }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +73,7 @@ func setupPublicationWithAdmission(t *testing.T, options *mcp.ClientOptions, ena
 			t.Error(err)
 		}
 	})
-	f.second, err = sshfixture.New(ctx)
+	f.second, err = sshfixture.NewWithOptions(ctx, sshfixture.Options{ExecHandler: func(command string, ch cryptoSSH.Channel) { replyPublicationCommand(t, command, ch) }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +179,64 @@ func publicationTarget(t *testing.T, address string) ports.Target {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return ports.Target{Info: ports.NodeInfo{ID: "node", Address: address, User: "fixture", AuthType: "password"}, Version: "1", Plan: ssh.ConnectionPlan{Scope: "publication-test", Hops: []ssh.ConnectionConfig{{NodeID: "node", Address: host, Port: port, User: "fixture", AuthType: "password", AuthUpdateToken: "auth-1", TrustVersion: "trust-1"}}}}
+	// Publication-only command cases request explicit passthrough.
+	return ports.Target{ExecutionVersion: ports.ExecutionVersion(nil), Info: ports.NodeInfo{ID: "node", Address: address, User: "fixture", AuthType: "password"}, Version: "1", Plan: ssh.ConnectionPlan{Scope: "publication-test", Hops: []ssh.ConnectionConfig{{NodeID: "node", Address: host, Port: port, User: "fixture", AuthType: "password", AuthUpdateToken: "auth-1", TrustVersion: "trust-1"}}}}
+}
+
+func replyPublicationCommand(t *testing.T, command string, ch cryptoSSH.Channel) {
+	t.Helper()
+	output, status := "fixture-output", uint32(0)
+	switch {
+	case strings.Contains(command, "__XOPS_INTERP_END__"):
+		output = "__XOPS_INTERP__:bash\n__XOPS_INTERP__:sh\n__XOPS_INTERP__:fish\n__XOPS_INTERP_END__\n"
+	case strings.Contains(command, "__XOPS_DIALECT_FISH__"):
+		output = "__XOPS_DIALECT_FISH__:3.7.0\n__XOPS_FISH_OS__:Linux\n__XOPS_FISH_SHELL__:/bin/fish\n"
+	case strings.Contains(command, "__XOPS_DIALECT_"):
+		output, status = "syntax error\n", 1
+	}
+	if _, err := io.WriteString(ch, output); err != nil {
+		t.Error(err)
+	}
+	if _, err := ch.SendRequest("exit-status", false, cryptoSSH.Marshal(struct{ Status uint32 }{status})); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestMCPDefaultFishProbeSDKRoundTripAndCache(t *testing.T) {
+	f := setupPublication(t, nil, false)
+	login := false
+	plan, err := ssh.PlanCommand("hostname", ssh.CommandOptions{Interpreter: ssh.InterpreterFish, LaunchDialect: ssh.LaunchFish, Login: ssh.LoginDisabled})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		result, err := f.client.CallTool(f.ctx, &mcp.CallToolParams{Name: "xops_ssh_run", Arguments: SshRunInput{NodeID: "node", Command: "hostname"}})
+		if err != nil || result.IsError {
+			t.Fatalf("MCP roundtrip: %+v %v", result, err)
+		}
+		data, err := json.Marshal(result.StructuredContent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var output SshRunOutput
+		if err := json.Unmarshal(data, &output); err != nil {
+			t.Fatal(err)
+		}
+		if output.PlanDigest != plan.Digest() || output.Output != "fixture-output" {
+			t.Fatalf("wrong executed plan: %+v", output)
+		}
+	}
+	if f.first.Executed.Load() != 7 {
+		t.Fatalf("expected five probes and two user commands: %d", f.first.Executed.Load())
+	}
+	if f.coordinator.Snapshot().Targets["node"].Execution != nil {
+		t.Fatal("probe persisted configuration")
+	}
+	// Exercise the wire schema's snake_case alias and explicit login value.
+	result, err := f.client.CallTool(f.ctx, &mcp.CallToolParams{Name: "xops_ssh_run", Arguments: map[string]any{"nodeID": "node", "command": "hostname", "execution": map[string]any{"interpreter": "fish", "launch_dialect": "fish", "login": login}}})
+	if err != nil || result.IsError || f.first.Executed.Load() != 8 {
+		t.Fatalf("explicit fish wire configuration: %+v %v", result, err)
+	}
 }
 
 func publishTarget(t *testing.T, f *publicationFixture, address string) {
@@ -211,7 +271,7 @@ func TestApprovedCommandCannotSwitchTargetBeforeAdmission(t *testing.T) {
 	finished := make(chan error, 1)
 	// Both client cancellation and the released approval terminate this call.
 	go func() {
-		result, err := f.client.CallTool(f.ctx, &mcp.CallToolParams{Name: "xops_ssh_run", Arguments: SshRunInput{NodeID: "node", Command: "hostname"}})
+		result, err := f.client.CallTool(f.ctx, &mcp.CallToolParams{Name: "xops_ssh_run", Arguments: SshRunInput{NodeID: "node", Command: "hostname", Execution: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer}}})
 		if err == nil && !result.IsError {
 			err = errors.New("stale approval executed")
 		}
@@ -236,7 +296,7 @@ func TestRuntimeUsesNewTargetOnlyForNewInvocations(t *testing.T) {
 	f := setupPublication(t, nil, false)
 	call := func() {
 		t.Helper()
-		result, err := f.client.CallTool(f.ctx, &mcp.CallToolParams{Name: "xops_ssh_run", Arguments: SshRunInput{NodeID: "node", Command: "hostname"}})
+		result, err := f.client.CallTool(f.ctx, &mcp.CallToolParams{Name: "xops_ssh_run", Arguments: SshRunInput{NodeID: "node", Command: "hostname", Execution: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer}}})
 		if err != nil || result.IsError {
 			t.Fatalf("command: %+v %v", result, err)
 		}
@@ -271,7 +331,7 @@ func TestAdmittedCommandKeepsItsTargetAcrossPublication(t *testing.T) {
 	finished := make(chan error, 1)
 	// The barrier separates gate admission from connection acquisition.
 	go func() {
-		result, err := f.client.CallTool(f.ctx, &mcp.CallToolParams{Name: "xops_ssh_run", Arguments: SshRunInput{NodeID: "node", Command: "hostname"}})
+		result, err := f.client.CallTool(f.ctx, &mcp.CallToolParams{Name: "xops_ssh_run", Arguments: SshRunInput{NodeID: "node", Command: "hostname", Execution: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer}}})
 		if err == nil && result.IsError {
 			err = errors.New("admitted command failed")
 		}

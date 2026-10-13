@@ -17,9 +17,10 @@ import (
 
 type operationKey struct{}
 type operation struct {
-	snapshot ports.OperationSnapshot
-	binding  ports.Binding
-	permit   ports.Permit
+	snapshot  ports.OperationSnapshot
+	binding   ports.Binding
+	permit    ports.Permit
+	execution *ssh.ExecutionConfig
 }
 
 // ClientIdentity is the verified client and credential attached to an HTTP
@@ -80,8 +81,8 @@ func (r *Runtime) operationContext(ctx context.Context, view ports.OperationSnap
 	return context.WithValue(guardrail.WithPolicy(ctx, view.Policy, digest), operationKey{}, op), op, nil
 }
 
-// Freeze command semantics before policy evaluation. Missing configuration is
-// legacy Bash; an explicit server environment without trusted dialect metadata
+// Freeze command semantics before policy evaluation. An explicit server
+// environment without trusted dialect metadata
 // is unknown, never the legacy empty-string POSIX safe-prefix classification.
 func resolveExecutionRisk(input guardrail.RiskInput, target ports.Target) (guardrail.RiskInput, error) {
 	effective, err := ssh.ResolveExecution(input.Execution, target.Execution)
@@ -106,7 +107,52 @@ func resolveExecutionRisk(input guardrail.RiskInput, target ports.Target) (guard
 			input.Dialect = string(trusted)
 		}
 	}
+	if plan.Interpreter() == ssh.InterpreterFish {
+		input.Dialect = string(ssh.LaunchFish)
+	}
 	return input, nil
+}
+
+func (r *Runtime) prepareExecution(ctx context.Context, g *guardrail.Guardrail, view ports.OperationSnapshot, tool string, input any, risk guardrail.RiskInput, target ports.Target) (_ guardrail.RiskInput, _ ports.Target, probed bool, retErr error) {
+	effective, err := ssh.ResolveExecution(risk.Execution, target.Execution)
+	if err != nil {
+		return risk, target, false, err
+	}
+	prober, supported := r.backend.(ports.ExecutionProber)
+	if !supported || !ssh.NeedsExecutionProbe(effective) {
+		return risk, target, false, nil
+	}
+	work, op, err := r.operationContext(ctx, view, tool, input)
+	if err != nil {
+		return risk, target, false, err
+	}
+	// Hard policy denials must not cause even discovery traffic. Unknown shell
+	// syntax stays conservative until the fixed probe supplies trusted metadata.
+	preflight := risk
+	preflight.Dialect = string(ssh.LaunchUnknown)
+	if g != nil && g.EvaluateContext(work, preflight) == guardrail.Deny {
+		return risk, target, false, nil
+	}
+	permission, err := r.enter(work, view, op.binding, ports.Inspect, "")
+	if err != nil {
+		return risk, target, false, err
+	}
+	defer func() { retErr = errors.Join(retErr, permission.Close()) }()
+	result, err := prober.ProbeExecution(work, permission, risk.NodeID)
+	if err != nil {
+		return risk, target, false, fmt.Errorf("prepare MCP execution: %w", err)
+	}
+	if result == nil || result.DetectedDialect == "" || result.DetectedDialect == ssh.LaunchUnknown || result.SuggestedConfig.Interpreter == "" || result.SuggestedConfig.LaunchDialect != result.DetectedDialect {
+		return risk, target, false, fmt.Errorf("%w: incomplete MCP execution probe", ssh.ErrExecutionProbe)
+	}
+	if err := result.SuggestedConfig.Validate(); err != nil {
+		return risk, target, false, err
+	}
+	risk.Execution = result.SuggestedConfig.Clone()
+	// Use discovered metadata only for this operation's risk evaluation. Keep
+	// the source snapshot/version intact so admission can still detect edits.
+	target.Execution = risk.Execution.Clone()
+	return risk, target, true, nil
 }
 
 func withOperation[In, Out any](r *Runtime, g *guardrail.Guardrail, tool string, risk func(In) guardrail.RiskInput, handler mcp.ToolHandlerFor[In, Out]) mcp.ToolHandlerFor[In, Out] {
@@ -115,6 +161,8 @@ func withOperation[In, Out any](r *Runtime, g *guardrail.Guardrail, tool string,
 		ctx, cancel := r.toolContext(parent)
 		defer cancel()
 		ri := risk(input)
+		ri.ToolName = tool
+		probed := false
 		selectors := slices.Clone(ri.NodeIDs)
 		if ri.NodeID != "" {
 			selectors = append(selectors, ri.NodeID)
@@ -130,6 +178,10 @@ func withOperation[In, Out any](r *Runtime, g *guardrail.Guardrail, tool string,
 				return nil, zero, err
 			}
 			if ri.Command != "" {
+				ri, target, probed, err = r.prepareExecution(ctx, g, view, tool, input, ri, target)
+				if err != nil {
+					return nil, zero, err
+				}
 				ri, err = resolveExecutionRisk(ri, target)
 				if err != nil {
 					return nil, zero, err
@@ -142,10 +194,19 @@ func withOperation[In, Out any](r *Runtime, g *guardrail.Guardrail, tool string,
 				return nil, zero, err
 			}
 		}
-		ctx, op, err := r.operationContext(ctx, view, tool, input)
+		var boundInput any = input
+		if probed {
+			boundInput = struct {
+				Input      In
+				Execution  *ssh.ExecutionConfig
+				PlanDigest string
+			}{input, ri.Execution, ri.PlanDigest}
+		}
+		ctx, op, err := r.operationContext(ctx, view, tool, boundInput)
 		if err != nil {
 			return nil, zero, err
 		}
+		op.execution = ri.Execution.Clone()
 		return guardrail.WithGuardrail(g, tool, func(In) guardrail.RiskInput { return ri },
 			func(work context.Context, req *mcp.CallToolRequest, in In) (_ *mcp.CallToolResult, _ Out, retErr error) {
 				permission, err := r.enter(work, op.snapshot, op.binding, ports.Execute, guardrail.OperationID(work))
@@ -287,6 +348,9 @@ func (r *Runtime) commandResult(ctx context.Context, nodeID, command string, sud
 	op, err := currentOperation(ctx)
 	if err != nil {
 		return ports.CommandResult{}, err
+	}
+	if op.execution != nil {
+		exec = op.execution.Clone()
 	}
 	result, err := r.backend.Run(ctx, op.permit, nodeID, ports.Command{Text: command, Sudo: sudo, Execution: exec})
 	return result, FormatMCPError(err)
