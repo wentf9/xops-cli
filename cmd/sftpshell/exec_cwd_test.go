@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"net"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -542,8 +543,14 @@ func TestHandleExec_ConnectorIntegration_WithNodeExecution(t *testing.T) {
 			adapter.WithSessionAuthOverride("node-server", adapter.SessionAuth{Password: "pwd"}),
 			adapter.WithSessionAuthOverride("node-ps", adapter.SessionAuth{Password: "pwd"}),
 		},
+		ssh.WithEnvironment(ssh.Environment{KnownHostsFile: filepath.Join(t.TempDir(), "known_hosts")}),
 	)
 	connector.AcceptNewHostKey.Store(true)
+	t.Cleanup(func() {
+		if err := connector.CloseAll(); err != nil {
+			t.Error(err)
+		}
+	})
 
 	t.Run("server node rejects non-empty cwd and executes verbatim with empty cwd", func(t *testing.T) {
 		client, err := connector.Connect(context.Background(), "node-server")

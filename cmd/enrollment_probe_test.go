@@ -48,9 +48,14 @@ func verifyCLIEnrollmentProbe(t *testing.T, command string, execution execExecut
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	const operationTimeout = 10 * time.Second
+	// The fixture serves setup plus two independent enrollment operations. Its
+	// lifetime must not impose a shared operation budget on both connections.
+	fixtureCtx, fixtureCancel := context.WithTimeout(t.Context(), 3*operationTimeout)
+	defer fixtureCancel()
+	server := newCLIEnrollmentProbeFixture(t, fixtureCtx)
+	ctx, cancel := context.WithTimeout(t.Context(), operationTimeout)
 	defer cancel()
-	server := newCLIEnrollmentProbeFixture(t, ctx)
 	host, portText, err := net.SplitHostPort(server.Address)
 	if err != nil {
 		t.Fatal(err)
@@ -92,26 +97,30 @@ func verifyCLIEnrollmentProbe(t *testing.T, command string, execution execExecut
 		}
 	})
 	for index, id := range []string{nodeID, otherNodeID} {
-		client, err := connector.Connect(ctx, id)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() {
-			if err := client.Close(); err != nil {
-				t.Error(err)
+		func() {
+			connectCtx, connectCancel := context.WithTimeout(t.Context(), operationTimeout)
+			defer connectCancel()
+			client, err := connector.Connect(connectCtx, id)
+			if err != nil {
+				t.Fatal(err)
 			}
-		})
-		wantRequests := int32(2)
-		if !execution.enabled() && !execution.noLoginSet {
-			wantRequests = 4
-		}
-		if index == 0 {
-			wantRequests -= 2
-		}
-		assertCLIEnrollmentProbe(t, client, repo, store, id, index == 1 || (!execution.enabled() && !execution.noLoginSet))
-		if server.Executed.Load() != wantRequests {
-			t.Fatalf("probe requests=%d, want %d", server.Executed.Load(), wantRequests)
-		}
+			t.Cleanup(func() {
+				if err := client.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+			wantRequests := int32(2)
+			if !execution.enabled() && !execution.noLoginSet {
+				wantRequests = 4
+			}
+			if index == 0 {
+				wantRequests -= 2
+			}
+			assertCLIEnrollmentProbe(t, client, repo, store, id, index == 1 || (!execution.enabled() && !execution.noLoginSet))
+			if server.Executed.Load() != wantRequests {
+				t.Fatalf("probe requests=%d, want %d", server.Executed.Load(), wantRequests)
+			}
+		}()
 	}
 }
 

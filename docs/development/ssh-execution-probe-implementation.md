@@ -171,3 +171,7 @@ Windows 的 Git/MSYS/WSL sh/bash 具有额外 argv 转换边界，不能充当�
 fish 解析错误回归使用未闭合的 `if true`，覆盖 fish 3/4 的普通与提权 ensure 路径。裸 `if` 在 Ubuntu 24.04 的 fish 3.7 中是返回状态 2 的帮助命令，不能作为跨版本语法错误样本。PowerShell 解释器枚举禁止模块自动加载：`Get-Command` 精确名称查找即使指定 `Application` 仍可能进入模块发现路径；查询期间临时设置全局 `PSModuleAutoLoadingPreference=None`，通过 `finally` 恢复原值，使用无需加载模块的 `[Console]::WriteLine` 输出帧。原生回归同时验证 PATH 程序发现、不会加载同名函数模块以及偏好恢复，不放宽现有超时。参考 [Get-Command 文档](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/get-command) 与 [PowerShell 命令发现实现](https://github.com/PowerShell/PowerShell/blob/master/src/System.Management.Automation/engine/GetCommandCommand.cs)。
 
 Windows 主 CI 与兼容性矩阵将 `TestProbeShell*` 放在独立必跑步骤中，先于其余全量测试执行，避免原生运行时启动与其他包的 KDF/辅助进程争抢资源；全量阶段仅排除这些已经单独执行的用例。PowerShell 模块隔离回归先用正常环境启动运行时，再在待测枚举之前设置 PATH/PSModulePath，避免把 CLR 启动本身也置于缺失系统路径的环境。就绪、枚举开始和枚举结束帧可区分启动与枚举阻塞，10 秒进程看门狗保持不变。握手内部超时先于父超时的回归使用 `testing/synctest` 分别等待两个取消事件，验证 10ms/50ms 的虚拟时序及原始错误原因保留，不再用 100ms 的真实睡眠推测定时器回调已经执行。
+
+CLI 入库探针回归分别为每次连接提供 10 秒操作预算，不再让两次独立入库共享同一截止时间；SSH fixture 使用覆盖准备及两次操作的生命周期预算，测试清理仍确定关闭连接和服务端。cmd 测试的凭据 helper 会重新执行测试二进制，race 构建默认每次退出等待 1 秒，不能把该测试运行时开销当成 SSH/凭据操作耗时。cmd TestMain 为子进程保留其他 GORACE 选项并追加 `atexit_sleep_ms=0`，CI 也统一设置此选项，与兼容性矩阵保持一致；race 检测继续启用，生产超时不变。
+
+SFTP cwd 的 Connector 集成用例使用独立临时 known_hosts，并在清理时关闭 Connector，避免读取或修改开发者的默认信任库，也避免随机端口复用触发旧测试密钥冲突。
