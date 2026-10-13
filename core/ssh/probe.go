@@ -121,23 +121,30 @@ func (c *Client) ProbeExecutionConfig(ctx context.Context) (*ProbeResult, error)
 }
 
 func (c *Client) probeExecution(ctx context.Context) (*ProbeResult, error) {
+	return probeExecutionWithExecutor(ctx, string(c.sshClient.ServerVersion()), c.executeProbeCommand)
+}
+
+// Keep probe decisions independent of transport and local process startup.
+// Production always supplies the bounded SSH executor; tests can control I/O
+// without changing the production command or overall timeout budgets.
+func probeExecutionWithExecutor(ctx context.Context, serverVersion string, execute func(context.Context, string) (string, error)) (*ProbeResult, error) {
 	started := time.Now()
 	result := &ProbeResult{
 		DetectedDialect: LaunchUnknown, RecommendedInterpreter: InterpreterServer,
 		SuggestedConfig: ExecutionConfig{Interpreter: InterpreterServer, LaunchDialect: LaunchUnknown},
-		ServerVersion:   string(c.sshClient.ServerVersion()), ProbedAt: started.UTC(),
+		ServerVersion:   serverVersion, ProbedAt: started.UTC(),
 	}
 	defer func() { result.Duration = time.Since(started) }()
 	work, cancel := context.WithTimeout(ctx, probeWorkTimeout)
 	defer cancel()
-	if err := c.detectProbeDialect(work, result); err != nil {
+	if err := detectProbeDialect(work, result, execute); err != nil {
 		return result, fmt.Errorf("%w: detect launch dialect: %w", ErrExecutionProbe, err)
 	}
 	command, err := probeInterpreterCommand(result.DetectedDialect)
 	if err != nil {
 		return result, err
 	}
-	output, err := c.executeProbeCommand(work, command)
+	output, err := execute(work, command)
 	if err != nil {
 		return result, fmt.Errorf("%w: enumerate interpreters: %w", ErrExecutionProbe, err)
 	}
@@ -172,14 +179,14 @@ func (c *Client) executeProbeCommand(ctx context.Context, command string) (strin
 	return result.Output, nil
 }
 
-func (c *Client) detectProbeDialect(ctx context.Context, result *ProbeResult) error {
+func detectProbeDialect(ctx context.Context, result *ProbeResult, execute func(context.Context, string) (string, error)) error {
 	commands := []string{probePOSIX, probeCmd, probePowerShell, probeFish}
 	if strings.Contains(result.ServerVersion, "OpenSSH_for_Windows") || strings.Contains(result.ServerVersion, "Microsoft:Windows") {
 		commands = []string{probeCmd, probePowerShell, probePOSIX, probeFish}
 	}
 	var failures []error
 	for _, command := range commands {
-		output, err := c.executeProbeCommand(ctx, command)
+		output, err := execute(ctx, command)
 		if err != nil {
 			// A syntax error is expected for nonmatching shells. Transport,
 			// cancellation, protocol and cleanup errors must stop the probe.
