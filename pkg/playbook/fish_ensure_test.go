@@ -121,7 +121,11 @@ func TestFishEnsureCheckExitProtocol(t *testing.T) {
 		{"reserved non-executable", "exit 126", StatusFailed, false},
 		{"non-reserved application status", "exit 122", StatusFailed, true},
 		{"explicit exit 127", "exit 127", StatusFailed, false},
-		{"parse failure", "if", StatusFailed, false},
+		// Bare "if" prints help with status 2 in fish 3.7; use an unfinished
+		// conditional that is a syntax error in both fish 3 and fish 4.
+		{"parse failure", "if true", StatusFailed, false},
+		{"parse failure after valid statement", "true; if true", StatusFailed, false},
+		{"parse failure after explicit exit", "exit 0; if true", StatusFailed, false},
 		{"exec bypasses exit handler", "exec false", StatusFailed, false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -149,7 +153,7 @@ func TestFishEnsureCheckExitProtocol(t *testing.T) {
 }
 
 func TestFishEnsureExecutionErrorsNeverRunElevatedAction(t *testing.T) {
-	for _, check := range []string{`test -f "$XOPS_TEST_ENSURE_FILE"/*`, `command "$HOME"`} {
+	for _, check := range []string{`test -f "$XOPS_TEST_ENSURE_FILE"/*`, `command "$HOME"`, "if true", "true; if true", "exit 0; if true"} {
 		t.Run(check, func(t *testing.T) {
 			directory := t.TempDir()
 			client, _ := nativeFishEnsureClient(t, directory, ssh.SudoModeSudoer)

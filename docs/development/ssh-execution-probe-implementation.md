@@ -167,3 +167,5 @@ CMD cwd 包装采用失败后退出的前置守卫 `cd /d "..." || exit /b & ...
 CI 的探针测试按边界分层：原生 Shell 语法测试直接执行探针载荷与帧解析，不再通过本地子进程模拟 SSH 服务端并叠加生产探针预算；保留每个原生进程 10 秒的测试看门狗，移除无法跨进程保证 JIT 状态的 PowerShell 预热。状态机的总预算通过可注入执行器与 Go `testing/synctest` 虚拟时钟验证，直接使用生产总预算，不再真实等待 4.2 秒并假设第几次请求恰好超时。SSH 取消、缓存和协议错误仍由真实回环 SSH fixture 覆盖。生产 5 秒单命令/12 秒总预算保持不变。
 
 Windows 的 Git/MSYS/WSL sh/bash 具有额外 argv 转换边界，不能充当原生 Unix 远端。Unix 解释器的原生语义测试仅在 Unix 主机运行；Linux CI 显式安装 fish/zsh，避免因缺少解释器跳过关键覆盖。Windows 客户端的 POSIX/fish 载荷仍通过真实回环 SSH 验证逐字节传输，Windows CMD/PowerShell 原生语法测试继续运行。测试失败会记录解释器绝对路径及进程耗时，便于区分执行环境与协议问题。
+
+fish 解析错误回归使用未闭合的 `if true`，覆盖 fish 3/4 的普通与提权 ensure 路径。裸 `if` 在 Ubuntu 24.04 的 fish 3.7 中是返回状态 2 的帮助命令，不能作为跨版本语法错误样本。PowerShell 解释器枚举禁止模块自动加载：`Get-Command` 精确名称查找即使指定 `Application` 仍可能进入模块发现路径；查询期间临时设置全局 `PSModuleAutoLoadingPreference=None`，通过 `finally` 恢复原值，使用无需加载模块的 `[Console]::WriteLine` 输出帧。原生回归同时验证 PATH 程序发现、不会加载同名函数模块以及偏好恢复，不放宽现有超时。参考 [Get-Command 文档](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/get-command) 与 [PowerShell 命令发现实现](https://github.com/PowerShell/PowerShell/blob/master/src/System.Management.Automation/engine/GetCommandCommand.cs)。
