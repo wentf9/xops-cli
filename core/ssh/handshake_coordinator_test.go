@@ -6,6 +6,7 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -325,25 +326,31 @@ func TestCoordinatingPrompter_ExpiredCoordinator_DoesNotCallPrompter(t *testing.
 }
 
 func TestHandshakeCoordinator_InternalTimeoutPrecedesParentDeadline_MaintainsDeadlineExceeded(t *testing.T) {
-	parentCtx, parentCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer parentCancel()
+	synctest.Test(t, func(t *testing.T) {
+		parentCtx, parentCancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+		defer parentCancel()
+		hc := newHandshakeCoordinator(parentCtx, 10*time.Millisecond)
+		defer hc.Close()
 
-	// 协调器内部握手超时 10ms，早于父 context 的 50ms
-	hc := newHandshakeCoordinator(parentCtx, 10*time.Millisecond)
-	defer hc.Close()
+		started := time.Now()
+		<-hc.Context().Done()
+		if elapsed := time.Since(started); elapsed != 10*time.Millisecond || parentCtx.Err() != nil {
+			t.Fatalf("internal timeout did not precede parent: elapsed=%s parent=%v", elapsed, parentCtx.Err())
+		}
+		cause := context.Cause(hc.Context())
+		if !errors.Is(cause, context.DeadlineExceeded) || !errors.Is(cause, ErrHandshakeClosed) {
+			t.Fatalf("internal timeout cause = %v", cause)
+		}
 
-	// 等待二者均已到期（100ms > 50ms > 10ms）
-	time.Sleep(100 * time.Millisecond)
-
-	if parentCtx.Err() == nil {
-		t.Fatal("expected parent context to be expired")
-	}
-
-	err := hc.Err()
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("expected coordinator Err to wrap context.DeadlineExceeded, got: %v", err)
-	}
-	if errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("coordinator Err was downgraded to context.Canceled: %v", err)
-	}
+		// Wait for cancellation itself, not a sleep that merely outlasts its
+		// nominal deadline. The virtual clock guarantees both event ordering and
+		// completion without depending on host timer callback scheduling.
+		<-parentCtx.Done()
+		if elapsed := time.Since(started); elapsed != 50*time.Millisecond {
+			t.Fatalf("parent deadline elapsed = %s", elapsed)
+		}
+		if err := hc.Err(); !errors.Is(err, context.DeadlineExceeded) || !errors.Is(context.Cause(hc.Context()), cause) {
+			t.Fatalf("parent cancellation replaced internal timeout cause: %v", err)
+		}
+	})
 }

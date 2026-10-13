@@ -153,18 +153,22 @@ func TestProbeShellPowerShellEnumerationDoesNotLoadModules(t *testing.T) {
 				t.Fatal(err)
 			}
 			loaded := filepath.Join(directory, "loaded")
-			env := slices.DeleteFunc(os.Environ(), func(value string) bool {
-				key, _, _ := strings.Cut(value, "=")
-				return strings.EqualFold(key, "PATH") || strings.EqualFold(key, "PSModulePath")
-			})
-			env = append(env, "PATH="+directory, "PSModulePath="+filepath.Dir(moduleDir), "XOPS_TEST_MODULE_LOADED="+loaded)
+			// Start the native runtime with its normal environment. PATH/module
+			// isolation belongs to the enumeration under test, not CLR startup.
+			env := append(os.Environ(), "XOPS_TEST_PROBE_PATH="+directory,
+				"XOPS_TEST_PROBE_MODULE_PATH="+filepath.Dir(moduleDir), "XOPS_TEST_MODULE_LOADED="+loaded)
 			payload, err := probeInterpreterCommand(LaunchPowerShell)
 			if err != nil {
 				t.Fatal(err)
 			}
-			payload = "$global:PSModuleAutoLoadingPreference = 'All'; " + payload + "; if ($global:PSModuleAutoLoadingPreference -ne 'All') { exit 97 }"
+			payload = "[Console]::WriteLine('__XOPS_TEST_READY__'); $env:PATH = $env:XOPS_TEST_PROBE_PATH; $env:PSModulePath = $env:XOPS_TEST_PROBE_MODULE_PATH; $global:PSModuleAutoLoadingPreference = 'All'; [Console]::WriteLine('__XOPS_TEST_ENUM_START__'); " + payload + "; [Console]::WriteLine('__XOPS_TEST_ENUM_END__'); if ($global:PSModuleAutoLoadingPreference -ne 'All') { exit 97 }"
 			output, status := runProbeShell(t, t.Context(), shell, LaunchPowerShell, payload, env)
 			got, err := parseProbeInterpreters(output)
+			for _, frame := range []string{"__XOPS_TEST_READY__", "__XOPS_TEST_ENUM_START__", "__XOPS_TEST_ENUM_END__"} {
+				if !strings.Contains(output, frame+"\n") && !strings.Contains(output, frame+"\r\n") {
+					t.Fatalf("native PowerShell did not reach %s: status=%d output=%q", frame, status, output)
+				}
+			}
 			if status != 0 || err != nil || !slices.Contains(got, InterpreterBash) {
 				t.Fatalf("PATH-only enumeration: status=%d interpreters=%v error=%v output=%q", status, got, err, output)
 			}
