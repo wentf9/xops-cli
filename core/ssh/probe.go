@@ -51,7 +51,10 @@ const (
 	probeCmdInterpreters = `where bash.exe >nul 2>&1 && (echo __XOPS_INTERP__:bash) & where sh.exe >nul 2>&1 && (echo __XOPS_INTERP__:sh) & where zsh.exe >nul 2>&1 && (echo __XOPS_INTERP__:zsh) & where fish.exe >nul 2>&1 && (echo __XOPS_INTERP__:fish) & where powershell.exe >nul 2>&1 && (echo __XOPS_INTERP__:powershell) & where pwsh.exe >nul 2>&1 && (echo __XOPS_INTERP__:pwsh) & (echo __XOPS_INTERP__:cmd) & (echo __XOPS_INTERP_END__) & exit /b 0`
 	// Use the native outer PowerShell so pwsh-only servers do not require
 	// powershell.exe merely to enumerate their installed interpreters.
-	probePowerShellInterpreters = `foreach ($i in @('bash','sh','zsh','fish','powershell','pwsh','cmd')) { if (Get-Command $i -CommandType Application -ErrorAction SilentlyContinue) { Write-Output ('__XOPS_INTERP__:' + $i) } }; Write-Output '__XOPS_INTERP_END__'`
+	// Missing exact names otherwise trigger module discovery even with the
+	// Application filter. Discovery reads the global preference, so restore it
+	// in finally rather than relying on a child-scope variable. Console needs no module.
+	probePowerShellInterpreters = `& { $previous = $global:PSModuleAutoLoadingPreference; try { $global:PSModuleAutoLoadingPreference = 'None'; foreach ($i in @('bash','sh','zsh','fish','powershell','pwsh','cmd')) { if (Get-Command $i -CommandType Application -ListImported -ErrorAction SilentlyContinue) { [Console]::WriteLine('__XOPS_INTERP__:' + $i) } }; [Console]::WriteLine('__XOPS_INTERP_END__') } finally { $global:PSModuleAutoLoadingPreference = $previous } }`
 )
 
 // ProbeResult is a diagnostic snapshot. SuggestedConfig is safe to persist only

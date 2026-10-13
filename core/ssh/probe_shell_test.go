@@ -124,6 +124,64 @@ func TestProbeShellCmdMissingInterpreters(t *testing.T) {
 	}
 }
 
+func TestProbeShellPowerShellEnumerationDoesNotLoadModules(t *testing.T) {
+	for _, name := range []string{"pwsh", "powershell.exe"} {
+		t.Run(name, func(t *testing.T) {
+			shell, err := exec.LookPath(name)
+			if err != nil {
+				t.Skipf("shell unavailable: %v", err)
+			}
+			directory := t.TempDir()
+			application := "bash"
+			if runtime.GOOS == "windows" {
+				application += ".exe"
+			}
+			// Discovery must find this PATH entry without executing it.
+			if err := os.WriteFile(filepath.Join(directory, application), []byte("unused"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			moduleDir := filepath.Join(directory, "modules", "fish")
+			if err := os.MkdirAll(moduleDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			manifest := "@{ RootModule = 'fish.psm1'; ModuleVersion = '1.0'; FunctionsToExport = @('fish') }"
+			if err := os.WriteFile(filepath.Join(moduleDir, "fish.psd1"), []byte(manifest), 0600); err != nil {
+				t.Fatal(err)
+			}
+			module := "[IO.File]::WriteAllText($env:XOPS_TEST_MODULE_LOADED, 'loaded'); function fish {}"
+			if err := os.WriteFile(filepath.Join(moduleDir, "fish.psm1"), []byte(module), 0600); err != nil {
+				t.Fatal(err)
+			}
+			loaded := filepath.Join(directory, "loaded")
+			env := slices.DeleteFunc(os.Environ(), func(value string) bool {
+				key, _, _ := strings.Cut(value, "=")
+				return strings.EqualFold(key, "PATH") || strings.EqualFold(key, "PSModulePath")
+			})
+			env = append(env, "PATH="+directory, "PSModulePath="+filepath.Dir(moduleDir), "XOPS_TEST_MODULE_LOADED="+loaded)
+			payload, err := probeInterpreterCommand(LaunchPowerShell)
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload = "$global:PSModuleAutoLoadingPreference = 'All'; " + payload + "; if ($global:PSModuleAutoLoadingPreference -ne 'All') { exit 97 }"
+			output, status := runProbeShell(t, t.Context(), shell, LaunchPowerShell, payload, env)
+			got, err := parseProbeInterpreters(output)
+			if status != 0 || err != nil || !slices.Contains(got, InterpreterBash) {
+				t.Fatalf("PATH-only enumeration: status=%d interpreters=%v error=%v output=%q", status, got, err, output)
+			}
+			// PowerShell can add PSHOME to PATH during startup. Its own executable
+			// is allowed, but module-exported functions must never count as shells.
+			for _, interpreter := range got {
+				if interpreter != InterpreterBash && interpreter != InterpreterPwsh && interpreter != InterpreterPowerShell {
+					t.Fatalf("enumeration included a non-PATH interpreter: %v", got)
+				}
+			}
+			if _, err := os.Stat(loaded); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("interpreter discovery loaded an unrelated module: %v", err)
+			}
+		})
+	}
+}
+
 func runProbeShell(t *testing.T, ctx context.Context, shell string, dialect LaunchDialect, payload string, env []string) (string, uint32) {
 	t.Helper()
 	// Git/MSYS/WSL executables add a Windows argv conversion layer. They are
