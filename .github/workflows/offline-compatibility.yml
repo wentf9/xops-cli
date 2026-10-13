@@ -66,6 +66,11 @@ jobs:
         run: go env GOOS GOARCH CGO_ENABLED
       - name: Build
         run: go build ./...
+      - name: Install native Unix shell test dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fish zsh
       - name: Full native shuffled tests
         run: go test ${{ env.RACE_FLAGS }} -parallel 2 -shuffle=on ./...
       - name: Native vault and real KDF helper (release configuration)

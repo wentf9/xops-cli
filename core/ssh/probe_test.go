@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/wentf9/xops-cli/core/testutil/sshfixture"
@@ -293,26 +294,31 @@ func TestProbeExecutionConfigInitiatorCancellation(t *testing.T) {
 }
 
 func TestProbeExecutionConfigTotalDeadline(t *testing.T) {
-	client, server := executionProbeClient(t, "", func(ctx context.Context, _ string, channel cryptoSSH.Channel) {
-		timer := time.NewTimer(4200 * time.Millisecond)
-		defer timer.Stop()
-		select {
-		case <-timer.C:
-			replyExecutionProbe(t, ctx, channel, "unsupported shell\n", 1)
-		case <-ctx.Done():
+	synctest.Test(t, func(t *testing.T) {
+		attempts := 0
+		execute := func(ctx context.Context, _ string) (string, error) {
+			attempts++
+			if attempts < 3 {
+				time.Sleep(4200 * time.Millisecond)
+				return "unsupported shell\n", nil
+			}
+			// This is durable blocking in the bubble, so the virtual clock advances
+			// directly to the production overall deadline without wall-clock sleeps.
+			<-ctx.Done()
+			return "", ctx.Err()
+		}
+		started := time.Now()
+		result, err := probeExecutionWithExecutor(t.Context(), "SSH-2.0-test", execute)
+		if !errors.Is(err, ErrExecutionProbe) || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("probe total deadline error = %v", err)
+		}
+		if elapsed := time.Since(started); elapsed != probeWorkTimeout || result.Duration != probeWorkTimeout {
+			t.Fatalf("overall budget was not applied: elapsed=%s snapshot=%s", elapsed, result.Duration)
+		}
+		if attempts != 3 {
+			t.Fatalf("timeout did not stop the current dialect attempt: requests=%d", attempts)
 		}
 	})
-	started := time.Now()
-	_, err := client.ProbeExecutionConfig(t.Context())
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("probe total deadline error = %v", err)
-	}
-	if elapsed := time.Since(started); elapsed < probeWorkTimeout || elapsed > probeWorkTimeout+sessionShutdownTimeout+500*time.Millisecond {
-		t.Fatalf("total probe duration = %s", elapsed)
-	}
-	if server.Executed.Load() != 3 {
-		t.Fatalf("expected total timeout during third dialect attempt, requests %d", server.Executed.Load())
-	}
 }
 
 func TestProbeExecutionConfigValidation(t *testing.T) {

@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	cryptoSSH "golang.org/x/crypto/ssh"
 )
 
 func TestCommandPlanServerPreservesBytes(t *testing.T) {
@@ -122,5 +124,33 @@ func TestCommandPlanRejectsOversizeQuotedPayload(t *testing.T) {
 	command := strings.Repeat("'", MaxCommandBytes/2)
 	if _, err := PlanCommand(command, CommandOptions{Interpreter: InterpreterBash, LaunchDialect: LaunchPOSIX}); err == nil || !strings.Contains(err.Error(), "generated exec payload") {
 		t.Fatalf("oversize quoted payload accepted: %v", err)
+	}
+}
+
+func TestUnixPayloadSSHTransportPreservesBytes(t *testing.T) {
+	value := "quote' and \\\\ and \\' $HOME (echo injected); & |\n中文"
+	for _, dialect := range []LaunchDialect{LaunchPOSIX, LaunchFish} {
+		for _, interpreter := range []Interpreter{InterpreterBash, InterpreterSh, InterpreterZsh, InterpreterFish} {
+			t.Run(string(dialect)+"/"+string(interpreter), func(t *testing.T) {
+				quote := shellQuote
+				if interpreter == InterpreterFish {
+					quote = fishQuote
+				}
+				plan, err := PlanCommand("printf '%s' "+quote(value), CommandOptions{Interpreter: interpreter, LaunchDialect: dialect})
+				if err != nil {
+					t.Fatal(err)
+				}
+				client, _ := executionProbeClient(t, "", func(ctx context.Context, payload string, channel cryptoSSH.Channel) {
+					if payload != plan.Payload() {
+						t.Errorf("SSH exec payload changed: got=%q want=%q", payload, plan.Payload())
+					}
+					replyExecutionProbe(t, ctx, channel, value, 0)
+				})
+				result := client.ExecuteCommand(t.Context(), plan)
+				if err := result.Err(); err != nil || result.Output != value {
+					t.Fatalf("SSH bytes changed: output=%q want=%q error=%v", result.Output, value, err)
+				}
+			})
+		}
 	}
 }

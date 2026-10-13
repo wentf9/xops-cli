@@ -12,8 +12,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	cryptoSSH "golang.org/x/crypto/ssh"
 )
 
 // Run the actual payload in installed shells; synthetic frame responses cannot
@@ -35,26 +33,43 @@ func TestProbeShellDialects(t *testing.T) {
 			if err != nil {
 				t.Skipf("shell unavailable: %v", err)
 			}
-			if tt.dialect == LaunchPowerShell {
-				// Warm up JIT/CLR runtime cache and utility cmdlets so slow runner
-				// cold-start does not consume the probeCommandTimeout.
-				warmupCtx, warmupCancel := context.WithTimeout(t.Context(), 10*time.Second)
-				defer warmupCancel()
-				_ = exec.CommandContext(warmupCtx, shell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Get-Command -CommandType Application bash,sh,powershell,pwsh,cmd -ErrorAction SilentlyContinue; exit 0").Run()
-			}
-			client, _ := executionProbeClient(t, "", func(ctx context.Context, payload string, channel cryptoSSH.Channel) {
+			// Native grammar checks have a process watchdog, not the production SSH
+			// probe budget. Each interpreter process starts cold on hosted runners.
+			execute := func(ctx context.Context, payload string) (string, error) {
 				output, status := runProbeShell(t, ctx, shell, tt.dialect, payload, nil)
-				replyExecutionProbe(t, ctx, channel, output, status)
-			})
-			result, err := client.ProbeExecutionConfig(t.Context())
-			if err != nil {
-				t.Fatalf("native %s probe: %v, snapshot %+v", tt.shell, err, result)
+				if t.Failed() {
+					t.FailNow()
+				}
+				if status != 0 {
+					return output, &CommandExitError{ExitCode: &status}
+				}
+				return output, nil
+			}
+			result := &ProbeResult{ServerVersion: "SSH-2.0-native-test"}
+			if err := detectProbeDialect(t.Context(), result, execute); err != nil {
+				t.Fatalf("native %s dialect: %v", shell, err)
 			}
 			if result.DetectedDialect != tt.dialect {
-				t.Fatalf("native %s detected as %s, want %s", tt.shell, result.DetectedDialect, tt.dialect)
+				t.Fatalf("native %s detected as %s, want %s", shell, result.DetectedDialect, tt.dialect)
 			}
-			if err := result.SuggestedConfig.Validate(); err != nil {
+			enumeration, err := probeInterpreterCommand(result.DetectedDialect)
+			if err != nil {
 				t.Fatal(err)
+			}
+			output, err := execute(t.Context(), enumeration)
+			if err != nil {
+				t.Fatalf("native %s enumeration: %v", shell, err)
+			}
+			available, err := parseProbeInterpreters(output)
+			if err != nil {
+				t.Fatalf("native %s interpreter frames: %v", shell, err)
+			}
+			recommendation := recommendProbeExecution(result.DetectedDialect, result.RemoteShellPath, available)
+			if err := recommendation.Validate(); err != nil {
+				t.Fatal(err)
+			}
+			if recommendation.Interpreter == InterpreterServer && tt.dialect != LaunchCmd {
+				t.Fatalf("native %s found no supported interpreter: %v", shell, available)
 			}
 		})
 	}
@@ -111,6 +126,15 @@ func TestProbeShellCmdMissingInterpreters(t *testing.T) {
 
 func runProbeShell(t *testing.T, ctx context.Context, shell string, dialect LaunchDialect, payload string, env []string) (string, uint32) {
 	t.Helper()
+	// Git/MSYS/WSL executables add a Windows argv conversion layer. They are
+	// not native Unix remote shells; Unix grammar runs on Unix, while Windows
+	// client payload fidelity is covered over SSH without CreateProcess.
+	if runtime.GOOS == "windows" && (dialect == LaunchPOSIX || dialect == LaunchFish) {
+		t.Skip("native Unix shell semantics require a Unix host; SSH payload bytes are tested separately")
+	}
+	started := time.Now()
+	t.Logf("native shell: path=%s dialect=%s", shell, dialect)
+	defer func() { t.Logf("native shell elapsed=%s", time.Since(started)) }()
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	args := []string{"-c", payload}

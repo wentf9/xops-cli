@@ -163,3 +163,7 @@ ensure 在 action 前拦截所有解释器的 126/127；fish 另拦截 121/123/1
 SFTP `exec` 通过 `ResolveWorkingDirectoryExecution` 解析本次 cwd 适配器。已保存的 `server/cmd`（含仅配置 cmd 方言）无需重新探测，临时派生 `cmd/cmd` 后应用 `cd /d` 与驱动器路径规范化，原始连接/节点配置保持不变。其余显式 server 方言不根据 `/C:` 等路径猜测平台。
 
 CMD cwd 包装采用失败后退出的前置守卫 `cd /d "..." || exit /b & ...`。`exit /b` 不显式指定状态码，保留 cd 的失败 ERRORLEVEL；成功时跳过退出守卫，用户命令不另加括号或额外解释器层，因此 `rem` 注释、分组及显式退出码保留原有语义。已补充 Windows 原生 CMD 回归测试，并在 vm 节点用只读命令验证失败目录不会执行后续语句。退出指令参考 [Microsoft 文档](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/exit)。
+
+CI 的探针测试按边界分层：原生 Shell 语法测试直接执行探针载荷与帧解析，不再通过本地子进程模拟 SSH 服务端并叠加生产探针预算；保留每个原生进程 10 秒的测试看门狗，移除无法跨进程保证 JIT 状态的 PowerShell 预热。状态机的总预算通过可注入执行器与 Go `testing/synctest` 虚拟时钟验证，直接使用生产总预算，不再真实等待 4.2 秒并假设第几次请求恰好超时。SSH 取消、缓存和协议错误仍由真实回环 SSH fixture 覆盖。生产 5 秒单命令/12 秒总预算保持不变。
+
+Windows 的 Git/MSYS/WSL sh/bash 具有额外 argv 转换边界，不能充当原生 Unix 远端。Unix 解释器的原生语义测试仅在 Unix 主机运行；Linux CI 显式安装 fish/zsh，避免因缺少解释器跳过关键覆盖。Windows 客户端的 POSIX/fish 载荷仍通过真实回环 SSH 验证逐字节传输，Windows CMD/PowerShell 原生语法测试继续运行。测试失败会记录解释器绝对路径及进程耗时，便于区分执行环境与协议问题。
