@@ -1,136 +1,121 @@
 # Hosts and identities
 
-XOps separates network addresses (Host), authentication identities (Identity), and connection nodes (Node). Multiple user identities can share one address.
+XOps manages network addresses (**Host**), authentication profiles (**Identity**), and connection targets (**Node**) as separate records. Multiple user accounts (such as `deploy` and `audit`) can share the same server address without mixing up credentials.
+
+## Quick start
 
 ```bash
+# Add a single host (verifies SSH authentication and probes the remote shell by default)
 xops host add --address 192.0.2.10 --user deploy --key ~/.ssh/id_ed25519 --alias web-01 --tags web
+
+# Bulk-import hosts from CSV and assign the 'web' tag
+xops host import hosts.csv --tag web
+
+# List hosts or tags
 xops host list
 xops host tags
-xops host import hosts.csv --tag web
+
+# Export a blank CSV import template (does not export your existing inventory)
+xops host import --template
 ```
 
-See `xops host import --help` and repository examples for CSV format and options. `inventory` remains a compatibility alias for `host`; prefer `host` in new scripts.
+`inventory` remains a compatibility alias for `host`, and `host load` remains an alias for `host import`; prefer `host` and `host import` in new scripts.
 
-## Verification policy for imports
-
-By default, each CSV row is used to verify SSH authentication before its node and credentials are saved. A failed row reports the node ID, the failure, and that it was not saved. If the row targets an existing node, failed verification leaves its configuration and credentials unchanged.
-
-Repeated rows for the same node are verified and saved in CSV order. Aliases accumulate, and a later successfully saved row can update the credentials. Different nodes are still processed concurrently. This ordering applies to all three verification modes, and results are always printed in CSV order.
-
-IPv6 imports remain compatible with node IDs created by older versions without brackets, such as `root@2001:db8::1:22`. A match preserves and updates the existing node ID. Newly created IPv6 node IDs use brackets, such as `root@[2001:db8::1]:22`.
-
-```bash
-# Default: save only nodes that pass verification
-xops host import hosts.csv
-# Make no SSH connections and directly save all valid rows
-xops host import hosts.csv --skip-verify
-# Verify each row, but save it even if verification fails
-xops host import hosts.csv --save-on-verify-failure
-```
-
-The two options are mutually exclusive. They also apply to `host load` and `inventory import`. A verification failure returns a nonzero exit status, including when `--save-on-verify-failure` is used. Cancellation never forces a save. Skipping verification only skips the connection check; configuration and credential-store validation still run.
-
-## Adding one node
-
-`host add` verifies the connection by default. If verification succeeds, it saves the node. If verification fails, it reports the reason and asks `Save this node even though verification failed? [y/N]`. Only an explicit `y` or `yes` saves the node; Enter, rejection, or an unreadable response leaves it unsaved. For unattended offline addition, specify:
-
-```bash
-xops host add --address 192.0.2.10 --user deploy --skip-verify
-```
-
-With `--skip-verify`, a node can be saved without a password, private key, or identity template and configured with credentials later. The TUI provides the same policy for adding a node; see the [terminal management interface](./tui).
-
-An explicit different user reuses the Host with a separate Identity/Node, without inheriting another user's credentials:
+Connecting to an existing host with an explicit different username automatically reuses the `Host` record while creating a separate `Identity` and `Node`:
 
 ```bash
 xops ssh deploy@web-01
 xops ssh audit@192.0.2.10
 ```
 
-Use `xops identity --help` for identity operations, or `xops tui` for the [terminal management interface](./tui). Keep passwords out of shared command histories and documentation examples.
+Run `xops identity --help` for identity management commands, or `xops tui` to manage nodes visually in the [terminal interface](./tui).
+
+## Verification policies for add and import
+
+### 1. Adding a single node (`host add`)
+
+By default, `host add` verifies the SSH connection before saving:
+- **Verification succeeds**: Saves the node, credentials, and recommended execution profile.
+- **Verification fails**: Prints the failure reason and asks `Save this node even though verification failed? [y/N]`. Only an explicit `y` or `yes` saves the node; pressing Enter, `n`, or closing input leaves it unsaved.
+- **Offline addition (`--skip-verify`)**: In automated scripts or when the host is not yet reachable, pass `--skip-verify` to skip the connection check (configuration and credential-store validation still run). With `--skip-verify`, you can also save a node skeleton before configuring credentials:
+
+```bash
+xops host add --address 192.0.2.10 --user deploy --skip-verify
+```
+
+### 2. Bulk import (`host import`)
+
+By default, each CSV row is verified over SSH and only rows that pass authentication are saved; failed rows report the node ID, reason, and `not saved` (if a failed row targets an existing node, its existing configuration and credentials remain untouched).
+
+```bash
+# Default: save only nodes that pass SSH verification
+xops host import hosts.csv
+
+# Offline import: make no SSH connections and save all valid rows directly
+xops host import hosts.csv --skip-verify
+
+# Keep failed rows: verify each row, but save failed nodes as well and mark them in the output
+xops host import hosts.csv --save-on-verify-failure
+```
+
+- `--skip-verify` and `--save-on-verify-failure` are mutually exclusive. Any verification failure returns a nonzero exit status (including with `--save-on-verify-failure`); cancellation never forces a save.
+- **Concurrency and ordering**: Different nodes are verified in parallel. Repeated rows for the same node run serially in CSV order—aliases accumulate, later successful rows can update credentials, and output is always printed in CSV row order.
+- **IPv6 compatibility**: Imports match unbracketed IPv6 node IDs from older versions (such as `root@2001:db8::1:22`) and update them in place; newly created IPv6 nodes use brackets (such as `root@[2001:db8::1]:22`).
 
 ## Node execution configuration (`execution`)
 
-### Automatic probing and diagnostics
+### 1. Automatic probing and `host probe` diagnostics
 
-For new nodes, `host add` and `host import` (including the `host load` alias) reuse the authenticated
-verification connection to detect the launch dialect and available interpreters. The recommendation is
-saved with the node. Probing takes at most approximately nine seconds; a failed probe reports a warning
-and leaves execution unspecified without preventing an authenticated node from being saved. Existing
-imported nodes are not automatically reprobed and retain their execution settings.
+When a new node passes authentication during `host add`, `host import`, or **an interactive first `ssh`/`exec` connection with credential remembering enabled**, XOps reuses that authenticated connection to detect the remote launch dialect and available interpreters (bounded within ~9 seconds, no second handshake) and saves the recommended `execution` settings with the node.
 
 ```bash
-# Verify authentication while skipping the probe; --probe=false also works
+# Verify authentication while skipping the shell probe (--probe=false also works)
 xops host add --address 192.0.2.10 --user deploy --key ~/.ssh/id_ed25519 --no-probe
 xops host import hosts.csv --no-probe
-# Explicit fields take priority; import applies these flags only to new nodes
+
+# Set explicit interpreter or dialect (explicit flags override probe recommendations; applies only to new nodes on import)
 xops host add --address 192.0.2.10 --user deploy --key ~/.ssh/id_ed25519 --interpreter sh --launch-dialect posix
-# Diagnose a saved node or alias without saving
+
+# Diagnose a saved node (prints table only by default; add --save to update the node's execution settings)
 xops host probe web-01
-# Replace only this node's execution settings
 xops host probe web-01 --save
-# Probe all saved nodes; add --save to save each successful recommendation
+
+# Probe all saved nodes (excluding OpenSSH virtual nodes); add --save to persist each successful recommendation
 xops host probe --all
 xops host probe --all --save
 ```
 
-`--all` cannot be combined with a node or alias. It probes every saved node in node ID order, excluding OpenSSH virtual nodes. Individual failures do not stop remaining probes; the command returns aggregated errors and a nonzero exit status at the end. Cancellation stops subsequent probes. An empty inventory only prints a message. `--all --save` saves successful recommendations individually; failed or concurrently edited nodes are preserved, and successful saves are not rolled back.
+**Probing rules and boundaries**:
+- **Non-blocking on failure**: During `host add`/`import` or first-connection enrollment, a failed or timed-out probe emits a warning while still saving the authenticated node with `execution` left unspecified (TUI node additions, session-only credentials, non-interactive batch runs, and existing nodes during import do not auto-probe).
+- **Explicit flag isolation**: `--skip-verify` also skips probing. Explicit `--interpreter` / `--launch-dialect` flags always take precedence (the probe connection itself uses an isolated `server/unknown` view, so even if global config defaults to `bash/posix`, a new node can specify `--interpreter powershell` and let probing fill in the Windows launch dialect). Passing `--interpreter`, `--launch-dialect`, `--login-shell`, or `--no-login` to `xops ssh` / `xops exec` applies to that session only and skips enrollment probing for the target node.
+- **Recommendation order**:
+  - **Unix / Linux (`posix` or `fish` dialect)**: Prefers the remote default shell reported in `$SHELL` if supported and available on `PATH` (`bash`, `sh`, `zsh`, or `fish`; `ash`/`dash` map to `sh`), with `login: false`. A native `fish` outer dialect probe takes priority over a stale inherited `$SHELL`; if the default shell is unknown or unavailable, XOps falls back in order: `bash` → `sh` → `zsh` → `fish`.
+  - **Windows**: A CMD outer shell recommends `server/cmd` when Windows PowerShell is also installed (or `cmd/cmd` when only CMD is present); a PowerShell outer shell recommends `powershell` (or `pwsh` if only PowerShell Core is installed).
+- **Shell support highlights**:
+  - **`fish` (`launch_dialect: fish`)**: Supports commands, Playbook scripts (including `#!/usr/bin/env fish`), `ensure` checks, and passwordless/password `sudo` and `su` (using `/bin/sh` for the authentication handshake; see [SSH and privilege escalation](./ssh)).
+  - **`zsh` (`launch_dialect: posix`)**: Supports commands, working directories, login mode, `#!/usr/bin/env zsh` scripts, `ensure` checks, and `sudo`/`su` (note that zsh is not 100% Bash-compatible; see [zsh compatibility](https://zsh.sourceforge.io/Doc/Release/Invocation.html#Compatibility)).
+- **On-demand runtime probing**: Playbook scripts without a shebang, `ensure` checks, and SFTP `exec` with a nonempty `cwd` probe unspecified execution settings on demand and cache the result in connection memory without writing to disk.
 
-`--skip-verify` also skips probing. `--probe` and `--no-probe` are mutually exclusive. Explicit execution
-fields are preserved; incompatible recommendations produce a warning and only the explicit fields are
-saved. Failed probes never persist partial recommendations.
+### 2. Manual `execution` configuration
 
-Probe connections use independent `server/unknown` settings for the target and jumps. Their configured
-command execution settings do not affect connection setup. For example, global `bash/posix` defaults
-do not prevent a new node from specifying only `--interpreter powershell` and having probing fill in
-the Windows launch dialect. Global settings remain unchanged; credentials, host-key checks and jump
-routes still apply.
-
-`host probe` authenticates non-interactively with existing credentials and displays the remote OS,
-shell path, SSH banner, launch dialect, available interpreters and recommendation. Unknown metadata is
-shown as `-`. Only `--save` writes configuration; probe failures and concurrent node edits prevent saving
-and return a nonzero exit status. Unix nodes prefer a supported, available remote default shell, with login disabled. Windows
-CMD with Windows PowerShell available still recommends `server/cmd`. Probing does not translate commands.
-
-Fish default shells are detected as `launch_dialect: fish`, with fish-specific argument escaping. Recommendations prefer fish, with login disabled. To select fish explicitly, use `--interpreter fish`; `host probe --save` and `host probe --all --save` persist the detected outer dialect. Fish commands and Playbook scripts (including `#!/usr/bin/env fish`) are supported; fish commands are not translated to POSIX syntax. Ensure checks support native bash/sh/zsh/fish, retaining the default fish configuration for check, action and verification. Fish outer shells and the fish interpreter support passwordless sudo, password sudo and su, using `/bin/sh` for the authentication handshake; see [SSH and privilege escalation](./ssh).
-
-Zsh default shells use `launch_dialect: posix`. `host probe` prefers available zsh even when bash/sh are also installed; explicit `--interpreter` choices still override recommendations. Zsh supports commands, working directories, login mode, Playbook scripts with `#!/usr/bin/env zsh`, ensure checks, sudo and su. Privilege execution shares the existing POSIX authentication/control shell; user code runs in zsh. Zsh is not fully Bash-compatible ([zsh compatibility](https://zsh.sourceforge.io/Doc/Release/Invocation.html#Compatibility)).
-
-Unix recommendations prefer the default shell reported in `$SHELL`: bash, sh, zsh or fish; ash/dash map to sh. A native fish dialect probe takes precedence over a stale inherited `$SHELL`. The selected interpreter must be available on PATH. Only unknown, unsupported or unavailable defaults fall back to bash → sh → zsh → fish. Remote shell paths select fixed interpreter names and are never interpolated into commands. This rule applies to add/import, enrollment, runtime probes and `host probe --save`; explicit execution fields retain priority.
-
-Direct SSH and interactive exec first connections also probe after authentication and before confirming
-a new node when credential remembering is enabled and execution is unspecified. The recommendation is
-saved atomically with enrollment. Session-only credentials, non-interactive exec batch tasks, saved nodes and
-explicit execution settings do not trigger this path. Explicit CLI `--interpreter`, `--launch-dialect`,
-`--login-shell` or `--no-login` (including an explicit false) skip enrollment probing for the target.
-These flags apply to the current session; credential remembering and probing policy for other nodes
-remain active. Probe failures warn while preserving normal
-authenticated enrollment. An already disconnected transport fails connection acquisition without pooling
-it or dispatching user work. TUI additions retain authentication-only verification.
-
-Playbook scripts without a shebang, ensure checks and SFTP exec with a nonempty cwd can probe missing
-execution settings on demand. These runtime results remain in the connection cache without disk writes;
-explicit interpreter choices, including `server`, are preserved.
-
-### Manual configuration
-
-In addition to network addresses and authentication identities, you can configure execution parameters (such as interpreter, launch dialect, and login mode) per node in `~/.xops/xops_config.yaml`. This enables `xops exec`, `xops ssh`, Playbooks, and MCP to automatically pick the most suitable execution model:
+You can also configure `execution` globally or per node in `~/.xops/xops_config.yaml`:
 
 ```yaml
 schema_version: 2
-# Optional global execution defaults
+# Optional global execution default (defaults to server when omitted)
 execution:
   interpreter: server
 
 nodes:
-  # Scenario 1: Minimal container / Alpine Linux (no Bash, native execution)
+  # Scenario 1: Minimal container / Alpine Linux (no Bash; use sh or server passthrough)
   alpine-01:
     host_ref: h_alpine
     identity_ref: id_root
     execution:
-      interpreter: server
+      interpreter: sh
+      launch_dialect: posix
 
-  # Scenario 2: Traditional Linux host (loads personal login environment)
+  # Scenario 2: Traditional Linux host that needs login profile variables
   web-prod-01:
     host_ref: h_web
     identity_ref: id_deploy
@@ -139,7 +124,7 @@ nodes:
       launch_dialect: posix
       login: true
 
-  # Scenario 3: Windows Server (executes commands via PowerShell)
+  # Scenario 3: Windows Server running commands via PowerShell
   win-ad-01:
     host_ref: h_win
     identity_ref: id_admin
@@ -148,14 +133,21 @@ nodes:
       launch_dialect: powershell
 ```
 
-- **Configuration precedence**: CLI flag > Playbook step override > Playbook settings > Node configuration (`node.execution`) > Global configuration (`cfg.execution`) > System default (`server`).
-- **No manual flag required**: Once configured for a node, operations such as remote commands or piped script execution (`cat script.sh | xops ssh web-prod-01`) automatically use the matching interpreter and environment without having to specify `--interpreter` each time.
-
+**Configuration precedence**: CLI flags > Playbook step `execution` > Playbook `settings.execution` > Node configuration (`node.execution`) > Global configuration (`cfg.execution`) > System default (`server`).
 
 ## Removed credential arguments
 
-The plaintext arguments `--password` and `--key-pass`, including their short forms, have been removed from `host add|edit` and `identity add|edit`. Use `--password-stdin` for login passwords or `--passphrase-stdin` for private-key passphrases. These two options are mutually exclusive; `--password-stdin` cannot be combined with `--key`. With `host add`, neither stdin option can be combined with `--identity`.
+Plaintext flags `--password` and `--key-pass` (and their short forms) have been removed from `host add|edit` and `identity add|edit` to keep secrets out of command arguments and shell history; the legacy `loadHost` command has also been removed (use `xops host import`).
 
-For example, `xops identity edit admin --password-stdin` reads the replacement password from standard input; `xops host edit web --key ~/.ssh/id_ed25519 --passphrase-stdin` reads the key passphrase. Supply input through a trusted pipe or redirected file, keeping secret values out of command arguments and shell history. Empty input is rejected before inventory changes are saved. Omitting these flags on edits preserves the existing credentials unless the authentication method or key is changed.
+Use interactive prompts, `xops identity credential set`, or pipe secrets through `--password-stdin` (login password) and `--passphrase-stdin` (private-key passphrase):
 
-Interactive password prompts and `xops identity credential set` remain available. The legacy `loadHost` command has been removed; use `xops host import`.
+```bash
+# Update an identity's login password from stdin
+xops identity edit admin --password-stdin
+
+# Update a node's private key and key passphrase from stdin
+xops host edit web-01 --key ~/.ssh/id_ed25519 --passphrase-stdin
+```
+
+- `--password-stdin` and `--passphrase-stdin` are mutually exclusive; `--password-stdin` cannot be combined with `--key`; on `host add`, neither stdin flag can be combined with `--identity`.
+- Empty input is rejected before changes are saved. Omitting these flags when editing preserves existing credentials (unless you change the authentication method or private-key path).

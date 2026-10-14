@@ -1,31 +1,33 @@
 # 凭据迁移
 
-可用迁移选项请查看已安装版本的 `xops credential migrate --help`。
+`xops credential migrate` 用于将旧版 Schema v1 配置升级为 Schema v2，或在不同的 Schema v2 凭据后端之间搬迁凭据。支持的具体参数可通过 `xops credential migrate --help` 查看。
 
-## 兼容期结束：显式迁移旧配置
+## 场景一：从旧版（Schema v1）配置升级
 
-v0.12.0 和 v0.13.0 是 Schema v1 的两个兼容版本，兼容期现已结束。普通 CLI、TUI、MCP、Playbook 及只读配置加载只接受 Schema v2；缺少 `schema_version` 的旧文件也按 v1 拒绝，并提示显式迁移。帮助和版本命令不依赖配置，`credential migrate` 与 `credential finalize-migration` 继续可用。
-
-普通启动不再自动迁移、解密或加密回写旧凭据，也不会读取或创建旧 `secret.key`。拒绝 v1 时原配置和旧密钥保持不变。不要仅把 `schema_version` 改成 2：v2 不接受明文或 `ENC:` 凭据字段，需要通过迁移器写入凭据库并生成引用。
-
-先备份旧配置与已有 `secret.key`，然后显式迁移到已配置且可写的目标。未配置后端时，迁移器提供默认离线 `file` 配置；已有自定义配置时需确保目标库存在。旧加密凭据缺少原 key 时应恢复备份，迁移器不会生成替代旧 key：
+v0.12.0 与 v0.13.0 的 Schema v1 自动兼容期已结束。当前版本的 CLI、TUI、MCP 和 Playbook 仅接受 Schema v2 配置（缺少 `schema_version` 的旧文件同样按 v1 拒绝，并提示执行迁移）：
+- **切勿手动改版本号**：不要直接把 YAML 中的 `schema_version` 手工改为 `2`——Schema v2 不接受明文或 `ENC:` 加密字段，必须通过 `credential migrate` 将密码写入凭据库并转换为引用。
+- **先备份再迁移**：迁移前请先备份旧配置文件和 `secret.key`（若旧配置含有 `ENC:` 字段且丢失了原 `secret.key`，需先从备份找回，迁移器不会生成替代旧密钥）。
 
 ```bash
+# 1. 预检迁移计划（只读，不修改任何文件或密钥）
 xops credential migrate --dry-run --to file
+
+# 2. 执行迁移（若配置中尚未声明后端，会自动补齐默认离线 file 库配置）
 xops credential migrate --to file
-```
 
-验证 SSH、SFTP、exec、提权及自动化入口后，显式清理 v1 旧配置备份和旧密钥：
-
-```bash
+# 3. 验证日常 SSH、SFTP、exec、提权与 Playbook 正常可用后，清理 v1 遗留备份和 secret.key
 xops credential finalize-migration
 ```
 
-该清理命令只处理 v1 旧材料，不删除任何后端中的凭据，也不清理 v2 后端迁移备份。
+`finalize-migration` **仅清理 v1 升级留下的旧配置备份与 `secret.key`**，不会删除任何凭据库中的凭据，也不会清理 v2 跨后端迁移备份。
 
-## 从离线库迁往其他后端
+## 场景二：在 Schema v2 不同后端之间迁移
 
-在现有配置的 `credential.stores` 中添加目标，保留所有已有字段、库和引用。例如添加 `system` 后，相关配置可以是：
+### 1. 从默认离线库迁往系统密钥库或其他后端
+
+只修改配置中的 `default_store` 不会搬迁已有凭据。如需将离线库（`file`）中的凭据迁入系统密钥库（`system`）、`pass` 或 `helper`：
+
+**第一步**：在 `~/.xops/xops_config.yaml` 的 `credential.stores` 中添加目标后端（保留原有的 `file` 库和所有现有引用）：
 
 ```yaml
 credential:
@@ -41,7 +43,9 @@ credential:
       type: system
 ```
 
-`system` 需要可访问且已解锁的系统密钥库。Linux 还需要 `secret-tool`、用户 D-Bus 会话和 Secret Service；仅安装命令不代表服务可用。`pass` 或 `helper` 也可作为目标，配置与依赖见[凭据存储](./credentials)及[配置示例](https://github.com/wentf9/xops-cli/blob/master/xops_config.example.yaml)。
+> 使用 `system` 时，系统密钥库必须可访问且已解锁（Linux 还需安装 `secret-tool` 并具备活动的 D-Bus 会话与 Secret Service）。其他后端配置见[凭据存储](./credentials)及 [`xops_config.example.yaml`](https://github.com/wentf9/xops-cli/blob/master/xops_config.example.yaml)。
+
+**第二步**：检查存储状态并执行迁移：
 
 ```bash
 xops credential doctor
@@ -49,33 +53,30 @@ xops credential migrate --dry-run --to system
 xops credential migrate --to system
 ```
 
-迁移覆盖当前配置中所有不在目标库的登录密码、私钥解锁口令和提权密码引用。共享引用只复制一次；已在目标库的引用保持不变。写入、读回验证成功后，使用配置冲突检查一次性切换引用，并将 `default_store` 改为目标库。`remember_prompted` 保持原值。只修改 `default_store` 不会搬迁已有凭据；配置未引用的历史凭据也不会搬迁。
+- **迁移范围与原子切换**：迁移器会复制当前配置引用的所有登录密码、私钥口令和提权密码（多个节点共享的同一引用只复制一次；已在目标库的引用和未被当前配置引用的历史孤儿条目不会搬迁）。全部写入并读回校验通过后，一次性将配置引用和 `default_store` 切换为 `system`（`remember_prompted` 保持不变）。
+- **`--dry-run` 边界**：仅检查迁移计划和源读取路径，不写入任何文件或凭据，也不测试目标库写权限；若目标后端不支持保留源凭据的到期时间元数据，正式迁移的读回校验会拒绝切换。
 
-`--dry-run` 不写入文件、凭据或密钥，只检查计划及读取路径，不证明目标库可写。尚未创建的离线目标可通过计划检查，实际初始化在迁移写入时进行。目标若无法保留源凭据的到期信息，读回校验会拒绝切换。
+### 2. 迁回离线凭据库
 
-## 迁回离线库
-
-保留原 `file` 配置及库、密钥，执行：
+保留原 `file` 库配置与密钥设置，执行：
 
 ```bash
 xops credential migrate --dry-run --to file
 xops credential migrate --to file
 ```
 
-原 key-file 存在时直接使用。只有确认是新库时才允许生成密钥；已有库丢失密钥或存在未完成的库事务时，应先按[离线库恢复指南](./offline-store#备份与恢复)恢复。
+若原 `credentials.key` 存在会直接复用；仅当确认目标是全新离线库时才会生成新密钥。若已有离线库丢失密钥或存在未完成的事务，请先按[离线库恢复指南](./offline-store#备份与恢复)恢复。
 
-## 中断、冲突与保留材料
+## 中断恢复、并发冲突与备份保留
 
-迁移中断后先修复后端访问问题，再重跑同一命令。迁移会复用记录中的目标引用，校验已写入内容；写入或持久化结果不确定时不删除任何源凭据。配置已经切换但验证尚未完成时，重跑会重新验证并确认配置持久化。
-
-并发配置修改会导致冲突并保留当前配置。确认当前配置是希望保留的版本后，可显式重新规划：
+- **普通中断直接重跑**：若迁移中途因后端锁定或超时中断，修复访问问题后**直接重跑原命令**即可。迁移器会复用已记录的目标引用并校验已写入内容；在写入或配置持久化未完全确认前，绝不会删除源凭据。
+- **配置冲突时使用 `--restart`**：若迁移期间其他终端修改了配置文件导致冲突，确认当前配置无误后，可用 `--restart` 归档旧迁移计划并基于最新配置重新分配目标引用（仅用于正式 v2 迁移，不可与 `--dry-run` 同用，也不会回滚配置或删除已写入凭据）：
 
 ```bash
 xops credential migrate --to system --restart
 ```
 
-`--restart` 仅适用于 v2 实际迁移，不能与 `--dry-run` 合用。它归档旧计划，从当前配置重新分配目标引用；不回滚配置，也不删除此前写入的凭据。配置未改变的普通中断应重跑原命令，无需 `--restart`。
-
-v2 迁移在配置文件旁保存 `<配置文件>.backend-migration.json` 和 `<配置文件>.v2.<源配置摘要>.bak`；后续迁移或重新规划会把旧记录归档为 `.backend-migration.json.<记录摘要>.bak`。这些文件只有配置元数据和引用，不包含凭据值。v1 的 `.migration.json`、`.v1.bak` 和 `.v1.key.bak` 独立保留，不会被后端迁移覆盖。尚未验证完的 v1 迁移须先重跑原命令完成验证，无须提前删除旧材料。
-
-验证实际连接后仍保留源库与备份，本命令没有自动源库清理。恢复旧配置需要对应源库和密钥仍可用；不要只备份引用配置。手动删除历史凭据前，应检查其他配置和备份是否仍引用它们，并使用对应后端的管理工具。`finalize-migration` 不能用作跨后端通用清理命令。
+- **备份与记录文件说明**：
+  - v2 跨后端迁移会在配置文件旁生成 `<配置文件>.backend-migration.json` 和 `<配置文件>.v2.<源配置摘要>.bak`（重规划时归档为 `.backend-migration.json.<摘要>.bak`），其中仅含引用与元数据，不含明文密码。
+  - v1 升级生成的 `.migration.json`、`.v1.bak` 和 `.v1.key.bak` 与 v2 迁移互不覆盖。
+  - **源库保留**：v2 跨后端迁移完成后，源凭据库中的数据和备份文件会继续保留（不会自动清空源库）。手动清理旧后端凭据前，请确认没有其他配置文件或备份仍在引用它们。

@@ -1,6 +1,6 @@
 # SSH 执行兼容性实施计划
 
-依据：[SSH 多解释器执行与兼容性设计](./ssh-execution-compatibility.md)。状态：实施中；各项完成须同时具备代码、测试及双语文档，不能以本计划替代验证证据。
+依据：[SSH 多解释器执行与兼容性设计](./ssh-execution-compatibility.md)。状态：P1（P1-A、P1-B）、P2（P2-A、P2-B）与 P3 已全部完成；各项完成均具备代码、测试及双语文档验证记录。
 
 ## 交付顺序
 
@@ -26,7 +26,7 @@
 - [x] SSH CLI 的新解释器选项、非 PTY 原生 Shell 与配置继承迁移
 - [x] P1 全量 build/test/lint、SSH/I/O race 与泄漏回归通过后才声明 P1 完成
 
-### P2-A：配置及调用方绑定
+### P2-A：配置及调用方绑定（已完成）
 
 - [x] 全局/Node/Playbook execution schema、presence、继承和 DTO/克隆/导入导出往返测试
 - [x] MCP 输入、ports、宿主 backend 传递计划与结构化结果；审批展示及摘要绑定有效执行配置
@@ -34,7 +34,7 @@
 - [x] Playbook 脚本源字节和 node+step 计划冻结；不确定结果及附加清理错误禁止重试
 - [x] ensure 结果来源协议、check/action/verify 分类及旧工作流迁移
 
-### P2-B：适配器及高级操作
+### P2-B：适配器及高级操作（已完成）
 
 - [x] 无 Bash 的 ash/dash 上验收 sh；明确 shebang 白名单、未知声明、BOM/CRLF 和独立运行时输入
 - [x] Windows cmd/PowerShell/pwsh 的启动矩阵、引用、profile、编码、载荷长度和退出码协议冻结；原生 OpenSSH 验收

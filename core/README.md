@@ -97,30 +97,34 @@ output and truncation, and separate execution/I/O/cleanup errors. Use `Err()` to
 report all errors; do not infer success from a missing exit code or replay an
 unknown result. The digest is not an authorization permit.
 
-The new API defaults to unchanged server commands, a 5-minute timeout, and a
-5 MiB output window. Explicit Bash requires `LaunchPOSIX` and defaults to
-non-login mode. Original commands and generated exec payloads are each limited to 64 KiB,
-including quote expansion. Input is copied, finite, and limited to 16 MiB; output is captured
+The new API defaults to unchanged `server` commands (`LaunchUnknown`, `LoginInherit`), a 5-minute timeout, and a
+5 MiB output window. Explicit interpreters (`bash`, `sh`, `zsh`, `fish`, `powershell`, `pwsh`, `cmd`) require a
+compatible launch dialect (`posix`, `fish`, `cmd`, `powershell`) and default to non-login/inherited mode per adapter.
+Original commands and generated exec payloads are each limited to 64 KiB,
+including quote expansion (with outer `cmd` capped at 8191 characters and `powershell`/`posix` at 32767 characters for Windows adapters). Input is copied, finite, and limited to 16 MiB; output is captured
 internally, without external blocking reader/writer callbacks. Channel startup
 uses the connector's handshake timeout; cancellation joins workers and may
 interrupt a shared transport after a 1-second channel-shutdown grace period.
-P1-B adds `RunInteractivePlanWithIO` for one-shot PTY commands, sharing request
+`RunInteractivePlanWithIO` executes one-shot PTY commands, sharing request
 limits and preserving nonzero/signal/missing exit status. Its output accepts finite
 memory sinks or an explicit `ContextWriter`; Linux terminal/pipe files use
-owned nonblocking handles with cancelable deadlines. Regular-file redirection
+owned nonblocking handles with cancelable deadlines, while regular-file PTY redirection
 and native file bridges on other platforms are rejected before execution.
-The PTY input file must be a local terminal. A plan cannot also supply stdin.
-Legacy plain-command/script delegation, legacy external I/O migration, and SSH
-CLI options remain subsequent implementation steps. Legacy execution defaults
-are preserved except for documented PTY exit-status and option-validation fixes. See the [implementation plan](../docs/development/ssh-execution-implementation.md).
+The PTY input file must be a local terminal, and a PTY plan cannot also supply stdin.
+For non-PTY streaming, `RunCommandPlanWithIO` and `RunShellWithoutPTY` use `BindOutput`
+(supporting `ContextWriter`, finite memory sinks, `io.Discard`, `os.DevNull`, local regular files,
+and Linux terminals/pipes). `(*Client).ProbeExecutionConfig(ctx)` provides bounded two-stage
+read-only dialect and interpreter probing with connection-level caching. See the [implementation plan](../docs/development/ssh-execution-implementation.md) and [probe implementation record](../docs/development/ssh-execution-probe-implementation.md).
 
-Legacy command/script/stream, PTY, shell, and escalation paths now use bounded
-session creation and exec/PTY/shell requests. Full login sessions retain their
+Legacy command/script/stream, PTY, shell, and escalation paths delegate to shared payload builders,
+`BindOutput`, and bounded session creation / exec / PTY / shell requests (`RunWithSudoExecution` and
+`RunScriptWithSudoExecution` enforce configured adapter and login validation, while `ResolveScriptExecution`
+rejects scripts without a resolved non-server interpreter). Full login sessions retain their
 legacy process-exit policy while preserving separate cancellation/cleanup errors.
 `RunInteractiveWithOptions` supports the old Bash login default and explicit
 `WithLoginShell(false)`. `RunStream.Close` is idempotent and joins cancellation.
-Generic legacy output callbacks still require the remaining P1-B I/O migration;
-request deadlines alone do not establish cancellation of a blocked local writer.
+Arbitrary non-`ContextWriter` callbacks passed to legacy output entry points still cannot be
+interrupted by a request deadline alone; callers must keep custom writers non-blocking.
 
 Terminal output pumps report failures while the session is waiting for remote
 exit. Sink errors abort the session immediately and remain in the returned error

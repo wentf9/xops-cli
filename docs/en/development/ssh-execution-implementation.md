@@ -1,6 +1,6 @@
 # SSH Execution Compatibility Implementation Plan
 
-Based on the [SSH execution and interpreter compatibility design](./ssh-execution-compatibility.md). Status: implementation in progress. Each completed item requires code, tests, and bilingual documentation; this plan does not replace validation evidence.
+Based on the [SSH execution and interpreter compatibility design](./ssh-execution-compatibility.md). Status: Phase P1 (P1-A, P1-B), P2 (P2-A, P2-B), and P3 are complete, with code, tests, and bilingual documentation verification records below.
 
 ## Delivery Order
 
@@ -26,7 +26,7 @@ This batch's new API accepts finite input and internal memory output only, witho
 - [x] Migrate SSH CLI interpreter options, non-PTY native shells, and configuration inheritance
 - [x] Declare P1 complete only after full build/test/lint and SSH/I/O race and leak regressions pass
 
-### P2-A: Configuration and Caller Bindings
+### P2-A: Configuration and Caller Bindings (Complete)
 
 - [x] Global/Node/Playbook execution schemas, presence, inheritance, and DTO/clone/import/export round-trip tests
 - [x] Pass plans and structured results through MCP input, ports, and host backends; show effective semantics in approval and bind execution configuration in digests
@@ -34,7 +34,7 @@ This batch's new API accepts finite input and internal memory output only, witho
 - [x] Freeze Playbook script-source bytes and node+step plans; prohibit retries for uncertain outcomes or additional cleanup failures
 - [x] Define ensure result-source protocols, check/action/verify classification, and legacy workflow migration
 
-### P2-B: Adapters and Advanced Operations
+### P2-B: Adapters and Advanced Operations (Complete)
 
 - [x] Validate sh on ash/dash without Bash; define shebang allowlists, unknown declarations, BOM/CRLF, and independent runtime input
 - [x] Freeze native Windows cmd/PowerShell/pwsh launch matrices, quoting, profiles, encoding, payload lengths, and exit-code protocols; validate native OpenSSH

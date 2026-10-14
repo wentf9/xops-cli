@@ -1,118 +1,96 @@
 # Command execution
 
-XOps CLI provides robust remote command execution (`xops exec`), supporting single-host interactive terminals, multi-host parallel batching, script distribution, and cross-platform command interpreter adaptations.
+Use `xops exec` to run commands across one or many remote hosts, distribute and run local scripts, or allocate an interactive pseudo-terminal (PTY).
 
-Selecting targets via `--host`, `--ifile`/`-I`, or `--tag` treats the first positional argument as the remote command. For example, `xops exec --host web-01 uname -a`. The `--host`, `--ifile`/`-I`, and `--tag` target selectors are mutually exclusive; select one and use `--exclude` to narrow down the target list.
-
-Global flags may appear before or after subcommands, for example `xops --color never exec --host web-01 uname -a`. Positional arguments following the remote command are preserved as-is. Use `--` to avoid flag ambiguity, such as `xops exec --host web-01 -- echo --help`.
-
-## Regular and batch execution
+## Quick start
 
 ```bash
-# Execute command on a single node
+# Run a command on a single host
 xops exec web-01 uptime
 
-# Execute command across a group of hosts matched by tag
+# Run a command in parallel across all hosts with the 'web' tag
 xops exec --tag web -c 'uptime'
 
-# Distribute and execute a local script with concurrency of 5
+# Run a local script across tagged hosts with a concurrency limit of 5
 xops exec --tag web --shell ./check.sh --task 5
+
+# Exclude specific nodes from a batch run
+xops exec --tag web --exclude web-maintenance-01 -c 'df -h'
 ```
 
-- **Batch execution use cases**: Ideal for routine operations, batch deployments, and automated tasks. Batch execution does not prompt interactively for credential store unlocking; ensure non-interactive credentials (such as passwordless SSH keys or unlocked credential stores) are configured beforehand.
-- **Buffering and truncation protection**: Regular execution retains the latest 5 MiB of output in memory, continues draining beyond that limit, and displays a truncation indicator to prevent unbounded memory growth from large logs.
-- **Payload and timeout bounds**: The raw command and quoted execution payload are each capped at 64 KiB, with a default single-command execution timeout of 5 minutes.
+**Target selection and argument rules**:
+- `--host`, `--ifile`/`-I` (host list file), and `--tag` are mutually exclusive. Once a target selector is set, the first positional argument becomes the remote command (e.g. `xops exec --host web-01 uname -a`), or you can pass the command string explicitly with `-c`.
+- Global flags can appear before or after the subcommand (e.g. `xops --color never exec --host web-01 uname -a`). If the remote command itself takes flags starting with `-`, quote it with `-c` or place `--` before the command (e.g. `xops exec --host web-01 -- echo --help`).
+- **Batch limits**: Non-interactive batch runs never open desktop keyring unlock dialogs (an already unlocked Linux keyring can still be read; a locked keyring returns `locked`). Raw commands and quoted payloads are each capped at 64 KiB, with a default 5-minute timeout and a 5 MiB rolling output window (excess output is drained and marked as truncated).
 
-## Interpreters and execution configuration
+## Interpreters and cross-platform execution
 
-XOps supports multiple remote command interpreters to adapt seamlessly across Linux, Alpine, Windows, and specialized systems.
+### 1. Default mode: Native passthrough (`server`)
 
-### Default interpreter: Native execution (`server`)
+When `--interpreter` is omitted and the node has no configured `execution`, XOps defaults to `server` mode:
+- The command string is sent unchanged in the SSH `exec` request to the remote default shell without an implicit `bash -l -c` wrapper.
+- Works out of the box on targets without Bash, including Alpine Linux (`ash`/`sh`), Windows OpenSSH (CMD or PowerShell), and network appliances.
+- `server` mode rejects `--login-shell`.
 
-When no interpreter is explicitly specified and no node-level interpreter is configured, XOps defaults to `server` mode:
-- **Zero-dependency native execution**: Commands are forwarded directly through the SSH exec subsystem to the remote default shell or command handler without wrapper layers.
-- **Broad OS compatibility**: Requires no Bash pre-installed on the target, working out of the box on minimal containers, Alpine Linux (using default `ash`/`sh`), Windows (using PowerShell or CMD), and network appliances.
-- **Standard behavior**: `server` mode applies no outer shell wrapping and rejects `--login-shell`.
+### 2. Choosing an interpreter and launch dialect
 
-### Multi-interpreter support
-
-When specific shell environments, login scripts, or variables are required, choose an interpreter using `--interpreter`:
+When a command relies on specific shell syntax, login profile variables, or cross-platform quoting, specify `--interpreter` and `--launch-dialect`:
 
 ```bash
-# Native SSH execution (default)
-xops exec --host alpine-01 --interpreter server -c 'uname -a'
-
-# Explicit Bash with login shell environment
+# Run with login Bash (bash -l -c)
 xops exec --host linux-01 --interpreter bash --launch-dialect posix --login-shell -c 'echo $PATH'
 
-# Explicit Bash without login shell
+# Run with non-login Bash (bash -c) or POSIX sh (sh -c)
 xops exec --host linux-01 --interpreter bash --launch-dialect posix --login-shell=false -c 'echo $VAR'
+xops exec --host alpine-01 --interpreter sh --launch-dialect posix -c 'id'
 
-# Explicit POSIX sh
-xops exec --host linux-01 --interpreter sh --launch-dialect posix -c 'id'
-
-# Explicit zsh on a zsh default shell
+# Nodes with zsh or fish as their default shell
 xops exec --host zsh-01 --interpreter zsh --launch-dialect posix -c 'print -r -- $ZSH_VERSION'
-
-# Fish command on a fish default shell
 xops exec --host fish-01 --interpreter fish --launch-dialect fish -c 'set greeting hello; echo $greeting'
 
-# Windows target via PowerShell
+# Windows targets via PowerShell or CMD
 xops exec --host win-01 --interpreter powershell -c 'Get-Process | Select-Object -First 5'
-
-# Windows target via CMD
 xops exec --host win-01 --interpreter cmd -c 'dir'
 ```
 
-- **`bash`**: Invokes remote `bash`. Supports `--login-shell` (equivalent to `bash -l -c`) and `--no-login` / `--login-shell=false` (equivalent to `bash -c`). Requires the `posix` or `fish` launch dialect.
-- **`sh`**: Invokes standard POSIX `sh -c`. Suited for standard shell scripts independent of Bash features; rejects login shells.
-- **`zsh`**: Uses `zsh -c`, or `zsh -l -c` with `--login-shell`. Requires a `posix` or `fish` outer launch dialect. Scripts use `zsh -s`; sudo/su reuse the POSIX authentication handshake while retaining zsh semantics.
-- **`fish`**: Uses `fish -c`, or `fish -l -c` with `--login-shell`. Requires `posix` or `fish` as the actual outer launch dialect; `--no-login` remains a Bash compatibility flag.
-- **`powershell` / `pwsh`**: Designed for Windows hosts or cross-platform PowerShell environments, handling command argument escaping and exit code forwarding.
-- **`cmd`**: Designed for Windows Command Prompt (`cmd /c`), handling quoting and enforcing an 8191-character safety limit.
+| Interpreter (`--interpreter`) | Supported outer dialects (`--launch-dialect`) | Login and quoting behavior |
+| --- | --- | --- |
+| `server` (default) | `unknown` (or omitted) | Sent unchanged; rejects `--login-shell`; cannot be used for local scripts without a resolved interpreter |
+| `bash` | `posix`, `fish` | Supports `--login-shell` (`bash -l -c`) and `--no-login` / `--login-shell=false` (`bash -c`) |
+| `sh` | `posix`, `fish` | Non-login `sh -c` / `sh -s`; rejects login mode |
+| `zsh` | `posix`, `fish` | Supports `--login-shell` (`zsh -l -c`), `zsh -s` scripts, and `sudo`/`su` |
+| `fish` | `posix`, `fish` | Supports `--login-shell` (`fish -l -c`), scripts, and `sudo`/`su` |
+| `powershell` / `pwsh` | `cmd`, `powershell` (`pwsh` also supports `posix`/`fish`) | UTF-16LE Base64 `-EncodedCommand` payload; preserves `$LASTEXITCODE` (capped at 32767 characters) |
+| `cmd` | `cmd` | Wrapped in `cmd.exe /d /s /c` with caret escaping; preserves `%ERRORLEVEL%` (capped at 8191 characters; blocks outer `%VAR%`/`!VAR!` expansion) |
 
-When using saved zsh/fish execution settings, ordinary and elevated `exec` commands retain the configured login mode. Explicit `--no-login` (including `--no-login=false`) keeps its legacy Bash selection semantics.
-
-### Launch dialects (`--launch-dialect`)
-
-The launch dialect instructs XOps how to validate and escape command payloads:
-- `posix`: For Linux/UNIX shells (Bash, sh, Zsh, etc.).
-- `fish`: Fish default shell, with separate escaping for quotes and backslashes.
-- `powershell`: For Windows PowerShell and cross-platform PowerShell.
-- `cmd`: For Windows Command Prompt.
-
-> 💡 **Tip**: Instead of specifying options on every command, you can persist execution configurations in `~/.xops/xops_config.yaml`. See [Hosts and identities](./hosts).
+To avoid passing interpreter flags on every command, save `execution` on the node in `~/.xops/xops_config.yaml` (`host add`/`import` also probes and saves this automatically)—see [Hosts and identities](./hosts#node-execution-configuration-execution). Explicit `--no-login` (including `--no-login=false`) retains its legacy Bash selection semantics.
 
 ## Interactive terminal and PTY (`-x`)
 
-The `-x` flag allocates a pseudo-terminal (PTY) for a single host, enabling interactive full-screen terminal programs:
+Add `-x` / `--interactive` to allocate a pseudo-terminal (PTY) for a single host when running full-screen terminal apps (`top`, `htop`, `vim`) or interactive elevated commands:
 
 ```bash
-# Live system monitoring
+# Run an interactive terminal program
 xops exec -x web-01 top
 
-# Interactive system inspection
-xops exec -x web-01 htop
-
-# Interactive privileged command execution
+# Run a single elevated command interactively
 xops exec -x --sudo web-01 ls -la /root
 ```
 
-- **Single-host restriction**: PTY mode is strictly scoped to one host and cannot be combined with multi-host batching or local script files.
-- **Streaming terminal output**: Interactive execution streams directly to the local terminal without the 5 MiB buffer limit, returning to the local prompt upon exit.
-- **Output redirection and compatibility**: Output and error streams can be redirected normally (e.g. `xops exec -x web-01 uptime 2>error.log`).
-- **Cancellation and resource reclamation**: When interrupted by Ctrl+C or a network drop, XOps cleanly releases terminal resources, terminates the SSH channel, and joins background routines within bounded limits.
+- **Single-host only**: `-x` targets a single host and cannot be combined with multi-host batches, local scripts (`--shell`), `--stream`, or `--out-dir`.
+- **Direct streaming and exit status**: Output streams directly to the local terminal without the 5 MiB memory cap, supports stdout/stderr redirection (e.g. `xops exec -x web-01 uptime 2>error.log`), and propagates nonzero exit codes and signals.
+- **Bounded cleanup**: Pressing `Ctrl+C` or losing the connection restores the local terminal, closes the SSH channel, and joins background workers within bounded deadlines.
 
-## Quoting and escaping guidelines
+## Quoting and variable expansion tips
 
-When commands contain whitespace, environment variables, or shell syntax, use `-c` along with single or double quotes:
+When a command contains spaces, pipelines, or environment variables, pass `-c` with single or double quotes depending on where variables should expand:
 
 ```bash
-# Protect variable expression so it resolves on the remote host
+# Single quotes: keep $HOME literal locally so the remote shell expands it
 xops exec web-01 -c 'printf "%s\n" "$HOME"'
 
-# Expand variable locally before passing to the remote host
+# Double quotes: expand $USER on the local machine before sending
 xops exec web-01 -c "echo Current User is $USER"
 ```
 
-When running commands from Windows PowerShell or CMD locally, keep local quoting differences in mind. Complex multi-step operations are best authored as script files distributed via `--shell`. See the [command reference](../reference/commands/xops-exec) for complete options.
+When running XOps from local Windows PowerShell or CMD, keep local quoting rules in mind; for multi-line or complex logic, put the commands in a script file and run it with `--shell`. See the [`xops exec` command reference](../reference/commands/xops-exec) for all options.

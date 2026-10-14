@@ -1,139 +1,138 @@
-# 🚀 XOps CLI
+# XOps CLI
 
 <div align="center">
-  <h3>Manage remote hosts from your terminal</h3>
+  <img src="docs/public/logo.svg" width="88" alt="XOps CLI Logo" />
+  <h3>Modern Terminal Operations & AI Automation in a Single Binary</h3>
+  <p><b>SSH / SFTP · Terminal UI · Offline Encrypted Vault · Parallel Batch Execution · YAML Playbooks · Guardrailed MCP Server & Agent Skill</b></p>
 
   <p>
-    <img alt="Go Version" src="https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go" />
-    <img alt="License" src="https://img.shields.io/badge/License-MIT-blue.svg" />
-    <img alt="Platform" src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey" />
+    <img alt="Go Version" src="https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat-square&logo=go" />
+    <img alt="Platform" src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-4c8bf5?style=flat-square" />
+    <img alt="MCP Ready" src="https://img.shields.io/badge/AI-MCP%20%26%20Agent%20Skill-8A2BE2?style=flat-square" />
+    <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-MIT-2ea44f?style=flat-square" /></a>
   </p>
 
-[English](README_en.md) | [简体中文](README.md)
-
+  <p>
+    <a href="https://wentf9.github.io/xops-cli/en/"><b>📖 Documentation</b></a> ·
+    <a href="https://wentf9.github.io/xops-cli/en/guide/getting-started"><b>🚀 Getting Started</b></a> ·
+    <a href="https://wentf9.github.io/xops-cli/en/reference/"><b>⌨️ Command Reference</b></a> ·
+    <a href="docs/en/troubleshooting/index.md"><b>🔧 Troubleshooting</b></a> ·
+    <a href="README.md"><b>简体中文</b></a>
+  </p>
 </div>
 
 ---
 
-**XOps CLI** brings host management, SSH connections, file transfers, batch execution, and Playbook orchestration into one terminal tool. It also integrates with AI clients through the **Model Context Protocol (MCP)**, with configurable operation approvals and auditing.
+Tired of stitching together half a dozen tools just to manage remote servers?
+- Editing `~/.ssh/config` by hand, or using `sshpass` and leaking plaintext passwords into your shell history?
+- Setting up a heavyweight Python / Ansible environment when all you want is a single binary to run parallel commands, distribute files, and converge state across a fleet?
+- Watching scripts break when hitting Alpine containers (no Bash), Windows OpenSSH (`cmd` / `PowerShell`), or `fish` / `zsh` hosts?
+- Wanting AI assistants (Claude, Codex, Cursor) to help inspect and operate servers—without giving them an unguarded root shell?
 
-[User guide](https://wentf9.github.io/xops-cli/en/) · [Command reference](https://wentf9.github.io/xops-cli/en/reference/) · [Troubleshooting](docs/en/troubleshooting/index.md)
+**XOps CLI** packs all of this into **one self-contained Go binary**: zero remote dependencies, local encrypted credential storage by default, automatic remote shell probing, and first-class **MCP Server** (with risk guardrails, interactive approvals, and audit logs) plus an installable **AI Agent Skill**.
 
-The documentation follows the current source and may describe changes that have not yet been released. Use `xops <command> --help` to check the options supported by your installed version.
+---
 
-### ✨ Key Features
-
-- 🤖 **AI Integration**: An independent Agent Skill guides assistants through CLI operations. The built-in MCP server provides a separate tool interface with command risk assessment, approvals, and auditing.
-- 🛡️ **Enhanced SSH & TUI**: Import OpenSSH configurations and use jump hosts, tunnels, and SSH agent forwarding. Includes a **Terminal User Interface (TUI)** and automatic sudo privilege escalation.
-- ⚡ **Batch Execution & Transfer**: Run commands or local scripts concurrently across hosts selected by tags. Built-in SCP/SFTP supports bulk file distribution. The interactive SFTP shell reports a lost connection and exits with a nonzero status.
-- 🔄 **Declarative Orchestration (Playbook)**: Define YAML workflows with shell, script, copy, ensure (idempotent convergence to a desired state), and template steps, with concurrency limits and failure policies.
-- 🗂️ **Inventory & Credentials**: Manage hosts, authentication identities (Identity), and tags locally. Save verified passwords in the offline encrypted vault or another configured credential store, export CSV import templates, and import hosts in bulk.
-- 🌐 **Network & Security Tools**: Includes DNS lookups, Ping, Netcat (nc), local TCP/UDP forwarding, Base64/URL/UTF-8/Unicode conversion, and a unified **firewall manager** that adapts to firewalld, ufw, iptables, and nftables.
-- 🌍 **Internationalization (i18n)**: Supports Simplified Chinese and English, with automatic language selection based on the environment.
-
-### 📦 Installation
-
-Install a prebuilt release on Linux or macOS:
+## ⚡ 30-Second Quick Start
 
 ```bash
+# 1. Install prebuilt binary (Linux / macOS)
 curl -sSL https://raw.githubusercontent.com/wentf9/xops-cli/master/install.sh | bash
-```
 
-Building from source requires Go 1.26 or newer. The Makefile supports Linux, macOS, and Windows:
-
-```bash
-git clone https://github.com/wentf9/xops-cli.git
-cd xops-cli
-make build
-# Windows produces bin/xops.exe; use make windows on any platform to cross-compile
-# Or build manually: go build -o xops ./cmd/cli/main.go
-```
-
-### 🚀 Quick Start
-
-#### 1. Initialization
-
-```bash
-# Create the Schema v2 configuration at ~/.xops/xops_config.yaml without creating an encryption key
-# Import non-wildcard Host entries from ~/.ssh/config by default; no remote connections are made
+# 2. Import your existing ~/.ssh/config (local read only, no remote connections, never overwrites existing nodes)
 xops init
 
-# Use a specific OpenSSH configuration, or skip importing entirely
-xops init --ssh-config ~/.ssh/config.work
-xops init --skip-ssh-import
+# 3. Connect to any host — saves the node and encrypts your password/passphrase locally only after auth succeeds
+xops ssh root@192.0.2.10
+
+# 4. Launch the interactive Terminal UI (SSH sessions, live system metrics, remote log search, tag management)
+xops tui
 ```
 
-Initialization can be repeated without overwriting existing nodes. Run `xops host list` afterward to inspect the imported nodes.
+> **Build from source** (requires Go 1.26+; Makefile supports Linux, macOS, and Windows natively):
+> ```bash
+> git clone https://github.com/wentf9/xops-cli.git && cd xops-cli && make build
+> # Produces bin/xops.exe on Windows; run 'make windows' on any OS to cross-compile
+> ```
 
-New installations save verified passwords and private-key passphrases in the built-in offline encrypted vault. The vault and its key file are created automatically on the first save. Add `--remember never` to disable automatic credential saving for one connection, or set `credential.remember_prompted: never` in the configuration to disable it globally.
+---
 
-New nodes discovered through SSH, SFTP, SCP, or exec are saved only after the SSH handshake and authentication succeed. Connection timeouts, refused connections, and authentication failures do not add nodes. Saving happens immediately after authentication, without waiting for a shell or remote command to succeed. Existing nodes are not deleted when a connection fails. Explicit additions and imports can use `--skip-verify` to save offline. `--remember` controls credential secrets and does not affect saving node details after successful authentication.
+## ✨ Why XOps CLI?
 
-See [credential storage](docs/en/guide/credentials.md) for storage choices and backups, and [credential migration](docs/en/guide/migration.md) for upgrading old configurations or changing stores.
+| Everyday Pain Point | How XOps CLI Solves It |
+| --- | --- |
+| **Plaintext passwords & repetitive prompts** | **Authenticate once, encrypted locally**: Verified login passwords, key passphrases, and `sudo`/`su` passwords are encrypted in `~/.xops/credentials/` (or OS Keychain / `pass` / external helpers). Plaintext secrets never touch YAML or shell history. |
+| **Broken scripts on non-Bash or Windows hosts** | **Zero remote dependencies + Auto Shell Probing**: Commands default to native `server` passthrough without requiring Bash. On first enrollment, XOps reuses the authenticated connection to probe the outer dialect (`posix`/`fish`/`cmd`/`powershell`) and installed interpreters (`bash`/`sh`/`zsh`/`fish`/`powershell`/`pwsh`/`cmd`). |
+| **Disconnect between interactive & batch tools** | **Scale from 1 host to 100**: Use the exact same inventory and credentials for interactive `xops ssh`, `xops tui`, and `xops sftp`, or fan out in parallel with `xops exec --tag web` and `xops scp --tag web`. |
+| **Heavyweight orchestration for simple deployments** | **Declarative YAML Playbooks**: Combine `shell`, `script`, `copy`, `template`, and idempotent `ensure` (`check` → `action` → verify) steps. Strict 3-state outcome tracking (`not_started` / `completed` / `unknown`) guarantees uncertain network drops are never blindly replayed. |
+| **Unsafe AI access to production servers** | **Dual AI Integration (MCP + Agent Skill)**: Built-in MCP server (`stdio` and LAN Streamable `HTTP`) with command risk analysis, interactive Elicitation approvals, protected path rules, and audit logs—plus the `xops-agent` Skill for direct CLI agents. |
 
-#### 2. Host & Inventory Management
+---
+
+## 🛠️ Feature Tour
+
+### 1. Host Inventory, Auto-Probing & Encrypted Credentials
+
+XOps separates network addresses (**Host**), authentication profiles (**Identity**), and connection targets (**Node**), so multiple accounts can share the same server cleanly:
 
 ```bash
-# Import hosts from a CSV file and assign the 'web' tag
+# Bulk-import hosts from CSV with the 'web' tag (verifies SSH auth and probes remote shells by default)
 xops host import hosts.csv --tag web
 
-# Manually add one host
-xops host add --address 192.0.2.10 --user root --key ~/.ssh/id_ed25519 --alias web-01 --tags web
+# Add a single host manually
+xops host add --address 192.0.2.10 --user deploy --key ~/.ssh/id_ed25519 --alias web-01 --tags web
 
-# List hosts or tags
+# List hosts/tags, or probe remote OS and available interpreters on saved nodes
 xops host list
-xops host tags
+xops host probe web-01
+xops host probe --all --save
+
+# Inspect credential stores and health
+xops credential store list
+xops credential doctor
 ```
 
-`inventory` remains a compatibility alias for `host`, and `host load` remains a compatibility alias for `host import`. Use the canonical commands above in new scripts.
+- **Verified before saving**: First connections via `ssh`, `sftp`, `scp`, or `exec` save a new node only after the SSH handshake and authentication succeed—connection timeouts or wrong passwords never leave junk entries.
+- **Flexible saving policies**: Pass `--remember never` for a one-off session, or set `credential.remember_prompted: ask | never` globally. Use `--skip-verify` for offline additions/imports (or `--no-probe` to skip shell probing).
+- Learn more: [Hosts & Identities](docs/en/guide/hosts.md) · [Credential Storage](docs/en/guide/credentials.md) · [Offline Vault](docs/en/guide/offline-store.md) · [Credential Migration](docs/en/guide/migration.md)
 
-Imports save only nodes that pass SSH verification by default, and failed rows are explicitly marked as not saved. `--skip-verify` saves directly without verification; `--save-on-verify-failure` saves even when verification fails. These options are mutually exclusive. Both `host add` and the TUI verify new nodes first and ask whether to save after a failure, defaulting to no. For offline addition, use `--skip-verify` in the CLI or select **Skip verification and save** in the TUI form.
-
-Use `xops host probe <node-or-alias>` to diagnose a saved node, or `xops host probe --all` for all saved nodes. Recommendations prefer a supported, available remote default shell, including zsh and fish. Add `--save` to persist successful recommendations. Individual failures do not stop `--all`; see [Hosts & Identities](docs/en/guide/hosts.md) for details.
-
-#### 3. SSH Connections & TUI
+### 2. Enhanced SSH, Privilege Escalation & Interactive SFTP
 
 ```bash
-# Launch the interactive management interface
-xops tui
-
-# Connect using an alias
+# Connect via alias, or as a different user on the same host (reuses Host, isolates credentials)
 xops ssh web-01
+xops ssh audit@web-01
 
-# Connect to the same host as a different user (reuses Host, isolates credentials, inherits ProxyJump)
-xops ssh test@192.0.2.20
-xops ssh test@web-01
+# Jump host traversal (multi-hop ProxyJump via IP/FQDN/host:port or saved node aliases)
+xops ssh -J bastion.example.com -i ~/.ssh/id_rsa root@192.0.2.13
 
-# OpenSSH-style jump host and private key (direct jumps accept FQDN/IP/host:port; single labels require a saved Node/Alias)
-xops ssh -J bastion.example.com -i ~/.ssh/id_rsa root@192.0.2.13 # Direct jump (FQDN, 192.0.2.1, or jumphost:22)
-xops ssh -J jumphost -i ~/.ssh/id_rsa root@192.0.2.13            # Alias jump (jumphost is an existing node/alias)
-
-# Connect with sudo privilege escalation
+# No root SSH login required: connect as an ordinary user and escalate via sudo / sudo-rs / su
 xops ssh --sudo web-01
+xops exec -x --sudo web-01 id
+
+# Port forwarding & dynamic SOCKS5 proxy (with smart keepalive and disconnect cleanup)
+xops ssh -L 8080:127.0.0.1:80 -D 1080 -N web-01
+
+# Interactive SFTP shell (multi-page Tab completion, Ctrl+R history search, cwd-aware 'exec')
+xops sftp web-01
 ```
 
-#### 4. Batch Execution & File Distribution
+- Learn more: [SSH & Privilege Escalation](docs/en/guide/ssh.md) · [SFTP & File Transfer](docs/en/guide/sftp.md) · [Terminal UI (TUI)](docs/en/guide/tui.md)
+
+### 3. Parallel Batch Execution & YAML Playbooks
 
 ```bash
-# Run uptime concurrently on all hosts tagged 'web'
-xops exec --tag web -c "uptime"
+# Run a command in parallel across all 'web' hosts (excluding a maintenance node)
+xops exec --tag web --exclude web-maint-01 -c "uptime"
 
-# Run a local script on remote hosts with a concurrency limit of 5
+# Distribute and run a local script across hosts with concurrency of 5
 xops exec --tag web --shell ./setup.sh --task 5
 
-# Distribute a configuration file to the target servers
+# Distribute a configuration file to a group of servers
 xops scp ./config.conf --tag web --dest /etc/app/
 ```
 
-Ordinary `exec` can read existing credentials from an unlocked Linux desktop keyring without `-x`.
-Use `-x` for commands that need an interactive remote terminal, such as `top` or `vim`; ordinary batch execution does not prompt to unlock the keyring.
-A locked keyring returns `locked` and must first be unlocked in the desktop session. The executing process needs access to that desktop's D-Bus session.
-
-#### 5. Declarative Orchestration (Playbook)
-
-Playbooks describe deployment tasks in YAML. Supported actions include shell, script, copy, ensure (converging to a desired state), and template.
-
-Example `deploy.yaml`:
+Define idempotent deployments in YAML (`deploy.yaml`):
 
 ```yaml
 name: deploy-web
@@ -141,57 +140,51 @@ targets:
   tags: [web]
 settings:
   concurrency: 2
-  on_error: stop
+  on_error: stop # stop | abort_all | continue
 vars:
   app_port: "8080"
 steps:
-  - name: "Install nginx"
+  - name: "Ensure nginx is installed"
     ensure:
       check: "nginx -v"
-      action: "apt-get install -y nginx"
+      action: "apt-get update && apt-get install -y nginx"
     sudo: true
+
   - name: "Render and distribute configuration"
     template:
       src: "./nginx.conf.tmpl"
       dest: "/etc/nginx/nginx.conf"
     sudo: true
-  - name: "Start the nginx service"
-    shell: "systemctl start nginx"
+
+  - name: "Restart nginx service"
+    shell: "systemctl restart nginx"
     sudo: true
 ```
 
-`settings.on_error: abort_all` cancels other active host tasks when a connection or step fails on any host. `continue` only allows subsequent steps on the current host to proceed.
-
-Run a Playbook:
-
 ```bash
-# Run the Playbook and supply or override variables
-xops play deploy.yaml --var app_port=8081
-
-# Preview the steps without executing them
+# Preview the execution plan (dry run) and execute with variable overrides
 xops play deploy.yaml --dry-run
-
-# Limit execution to a specific node
-xops play deploy.yaml --limit web-01
+xops play deploy.yaml --var app_port=8081 --limit web-01
 ```
 
-#### 6. AI & MCP Integration
+- Learn more: [Command Execution](docs/en/guide/exec.md) · [Playbooks & Automation](docs/en/guide/automation.md)
 
-XOps includes a **Model Context Protocol (MCP)** server that lets MCP clients such as **Claude** query and operate servers.
+### 4. AI Integration: MCP Server & Agent Skill
 
-**A. Start the MCP server:**
+XOps offers two independent ways to integrate with AI assistants:
+
+#### Option A: Built-in MCP Server (Claude Desktop / Cursor / Codex / Antigravity)
 
 ```bash
+# Start local stdio MCP server (inventory, command execution, SFTP file tools, and -L/-R SSH tunnels)
 xops mcp serve
+
+# Start LAN Streamable HTTP MCP server (Bearer token auth + streamed multi-GiB file transfers)
+xops mcp serve --transport http --listen 0.0.0.0:8080 \
+  --public-url http://192.168.1.10:8080 --token-file ~/.xops/mcp.token
 ```
 
-LAN clients (Codex / Antigravity CLI) can use `xops mcp serve --transport http`. See the [HTTP MCP guide](docs/en/guide/mcp-http.md) for authentication, streamed file transfers and client limitations.
-
-Stdio provides tools to create, inspect and stop SSH `-L/-R` tunnels. See [MCP SSH tunnels](docs/en/guide/mcp-tunnels.md).
-
-**B. Example: Integrate with Claude Desktop**
-
-Example configuration for `claude_desktop_config.json`:
+Add to `claude_desktop_config.json`:
 
 ```json
 {
@@ -204,47 +197,29 @@ Example configuration for `claude_desktop_config.json`:
 }
 ```
 
-**C. Security guardrails:**
+- **Built-in Guardrails**: Evaluates command and path risk before execution, prompts for interactive client approval (`Elicitation`) on sensitive operations, invalidates permits if target settings change during approval, and writes structured audit logs.
+- Learn more: [MCP HTTP & File Transfers](docs/en/guide/mcp-http.md) · [MCP SSH Tunnels](docs/en/guide/mcp-tunnels.md)
 
-- **Risk assessment**: Evaluates the risk of commands requested by AI clients, including potentially dangerous operations such as `rm -rf`.
-- **Policy controls**: Configure approval thresholds, blocked commands, and protected paths.
-- **Audit logs**: Record MCP tool calls and their outcomes for traceability.
+#### Option B: `xops-agent` Skill (Direct CLI Operation for Agents)
 
-#### 7. AI Agent Skill Integration
-
-[`xops-agent`](skills/xops-agent/SKILL.md) guides an Agent to run `xops` in its local command environment. Skill and MCP are independent interfaces: the Skill needs the CLI, SSH configuration, and credentials, without starting or connecting to an MCP server.
-
-The Skill covers inventory and identities, single-host and batch commands, remote file editing and transfer, SSH tunnels, firewalls, network diagnostics, and Playbooks. File workflows combine `exec`, `scp`, and batch `sftp`. Tunnels use `ssh -L/-R/-D -N`, with the Agent tracking the process, checking connectivity, and stopping the session.
-
-CLI operations follow the Agent's command-execution authorization controls and do not pass through MCP server approvals or auditing. The Skill provides instructions; it does not enforce server policies.
-
-**Install the skill:**
-
-Skill directories vary by client. The installation command uses the general-purpose `npx skills` tool.
-
-Install XOps CLI:
-
-```bash
-curl -sSL https://raw.githubusercontent.com/wentf9/xops-cli/master/install.sh | bash
-```
-
-Install the skill:
+Install the [`xops-agent`](skills/xops-agent/SKILL.md) Skill so Skill-capable agents can operate `xops` directly in their shell without running an MCP server:
 
 ```bash
 npx skills add https://github.com/wentf9/xops-cli --skill xops-agent
 ```
 
-For manual installation, copy the complete `skills/xops-agent/` directory, including `references/`. See the [Agent Skill guide](docs/en/guide/agent-skill.md) for the capability overview, CLI/MCP mapping, and usage examples.
+For manual installation, copy the complete `skills/xops-agent/` directory (preserving `SKILL.md` and `references/`). See the [Agent Skill Guide](docs/en/guide/agent-skill.md).
 
-## 🌍 Internationalization / I18n
+### 5. Built-in Network & Security Toolkit
 
-Select the language with `--lang`. If it is omitted, XOps detects the language from the system environment.
+No need to memorize distro-specific firewall syntax or install extra diagnostic utilities:
+- **`xops firewall`**: Unified firewall management across `firewalld`, `ufw`, `iptables`, and `nftables` (status, ports, services, source rules, reload).
+- **`xops dns` / `ping` / `nc` / `forward`**: Cross-platform DNS lookup, ICMP ping, TCP/UDP netcat, and local port forwarding.
+- **`xops encode`**: Command-line `base64`, `url`, `utf8`, and `unicode` encoding/decoding.
+- **Bilingual CLI (`i18n`)**: Automatically detects Simplified Chinese or English from your environment, or switch on the fly with `--lang zh` / `--lang en`.
 
-```bash
-xops --lang en host list
-xops --lang zh host list
-```
+---
 
 ## 📄 License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+Released under the [MIT License](LICENSE). If XOps CLI makes your server operations or AI workflows easier, please consider giving the repo a **Star ⭐**!

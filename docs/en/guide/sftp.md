@@ -1,26 +1,34 @@
 # SFTP and file transfer
 
-Bash/sh/zsh/fish `exec` with a nonempty working directory guards the entire user program with a conditional block. A failed directory change prevents all semicolon-separated and multiline commands from running; successful changes preserve the user program's exit status.
+XOps provides both an interactive SFTP shell (`xops sftp`) and a command-line file transfer tool (`xops scp`).
 
-SFTP `exec` with a nonempty current directory probes unspecified execution settings before sending user
-work. The bounded, read-only result is cached for the connection and is not written to disk. Linux uses
-the supported default bash/sh/zsh/fish shell; Windows CMD prefers installed PowerShell for cwd support, falling back to CMD when needed.
-For saved `server/cmd`, a cwd-aware command uses a temporary CMD adapter with `cd /d`, preserving native CMD syntax without probing or changing saved execution settings. Other explicit `server` configurations still reject a nonempty cwd. Empty-cwd ordinary commands remain native and do not probe. A failed probe stops before user work and never retries it under another
-interpreter. Windows `/C:/...` SFTP paths become `C:/...`, and the drive root `/C:` becomes `C:/`.
-Cross-platform pwsh selects paths using its own `$IsWindows`, including explicit configurations on cold
-connections without a probe cache. POSIX paths are preserved.
+## Quick start
 
-CMD working-directory commands use `cd /d "directory" || exit /b & user-command`. A failed directory change immediately exits that CMD invocation with its failure status, preventing all later `&`, `&&`, `||` and grouped commands from running. Successful changes preserve native CMD commands, comments and user-program exit codes.
+### 1. Upload, download, and distribute files with SCP
 
-In batch mode, `lls`/`lll` and remote `ls`/`ll` fail on missing paths or directory read errors. A listing failure in any wildcard match stops the remaining matches and subsequent commands.
+```bash
+# Upload a file or directory relative to the remote login home directory
+xops scp ./test.tar 'web-01:~/tmp/' -v
 
-Piped or file input automatically uses batch mode: the first command failure stops execution with a nonzero exit status, without running later commands or writing interactive history. Batch `exec` uses no PTY; `exec` and `lexec` receive EOF on stdin so they cannot consume subsequent SFTP commands. `shell/lshell` require a terminal. Operations requiring confirmation fail unless an existing force/no-clobber option resolves it. Commands are limited to 1 MiB per line. Interactive command errors allow correction and continuation; connection or output failures still terminate the session.
+# Download from a remote host to a local directory
+xops scp 'web-01:~/tmp/test.tar' ../ -v
+
+# Distribute a file to all hosts matching a tag (quote ~ paths so the local shell does not expand them)
+xops scp ./config.conf --tag web --dest '~/tmp/'
+xops scp ./config.conf --tag web --dest /etc/app/
+```
+
+- **Path rules**: Remote paths support `~` and `~/...` relative to the remote SFTP login directory (normally the user's home) across uploads, downloads, remote-to-remote relays, and batch uploads. `~otheruser` is not supported; use an absolute path instead.
+- **Overwrite policy**: Answering `y` at a prompt or passing `--force` overwrites existing files even if size and modification time match; `--no-clobber` skips existing destinations. Always verify target directory permissions before overwriting.
+- **Local download replacement**: Downloads first attempt an atomic rename. If the filesystem refuses to rename over an existing regular file, XOps backs up the original file before promoting the download and restores it on failure (this fallback is non-atomic; if restoration fails, the error reports the backup path). A directory of the same name is never replaced with a regular file.
+
+### 2. Interactive SFTP shell
 
 ```bash
 xops sftp web-01
 ```
 
-Run `help` inside the SFTP shell for all commands. Common operations:
+Type `help` at the SFTP prompt to list all commands. Common operations:
 
 ```text
 pwd
@@ -32,56 +40,45 @@ exec date
 exit
 ```
 
-`exec` runs a command in the current remote directory with a PTY for terminal programs, then returns to the SFTP prompt. `shell` opens a remote shell and `lexec` runs a local command. Exit the interactive program before entering more SFTP commands.
+- `exec <command>`: Runs a command in the current remote directory (allocating a PTY in interactive mode for terminal programs) and returns to the SFTP prompt.
+- `shell` / `lshell`: Opens a remote or local interactive shell; `lexec`: runs a local command. The SFTP prompt resumes when the child program exits.
+- If the connection drops, the SFTP shell exits immediately with a nonzero status rather than accepting further commands.
 
-Use SCP for batch file distribution:
+## Interactive input and keyboard shortcuts
 
-```bash
-xops scp ./config.conf --tag web --dest /etc/app/
-```
-
-SCP remote paths support `~` and `~/...`, relative to the remote SFTP login directory (normally the user's home). This applies to uploads, downloads, remote relays, and batch uploads. Quote batch destination paths to prevent expansion by the local shell. `~otheruser` is unsupported; use an absolute path instead.
-
-```bash
-xops scp ./test.tar 'test1:~/tmp/' -v
-xops scp 'test1:~/tmp/test.tar' ../ -v
-xops scp ./config.conf --tag web --dest '~/tmp/'
-```
-
-Answering `y` or using `--force` replaces an existing file even when its size and modification time match the source; `--no-clobber` skips existing destinations. Local downloads first attempt an atomic rename. If the filesystem refuses to rename over an existing regular file, XOps backs up the original before promoting the download and restores it if promotion fails. This fallback is not atomic. If recovery fails, the error identifies the original file's backup path. A directory with the same name is not replaced with a regular file.
-
-Check target directory permissions and avoid overwriting files unintentionally. If the connection is lost, the SFTP shell exits with a failure status instead of accepting further invalid operations.
-
-## Interactive input and shortcuts
-
-The SFTP prompt supports line editing, command history, and local and remote path completion. Long commands scroll horizontally within the input area. On submission, the entire command is echoed into terminal scrollback, including commands longer than one screen. Cursor positions use visible display cells, including wide characters, combining marks, and emoji, and adjust when the terminal is resized. Commands typed ahead are read in order by subsequent prompts instead of being discarded when the preceding command is submitted.
-
-UTF-8 characters and bracketed pastes split across prompts are preserved too; newlines inside a paste never submit a command. When stdin is a terminal and stdout is piped through a tool such as `tee`, command prompts, edited text, and confirmation questions remain visible using the input terminal dimensions and updating when that terminal is resized.
+The SFTP prompt supports line editing, command history (saved in `~/.xops_sftp_history`), and local/remote path completion:
 
 | Key | Behavior |
 | --- | --- |
-| Delete | Delete the character after the cursor; do nothing on an empty line or at the end |
-| Ctrl+D | Exit on an empty line; otherwise delete the character after the cursor |
-| Ctrl+C | Cancel the current input; stop processing remaining files in the command at a confirmation prompt |
-| Home/End, Ctrl+A/E | Move to the beginning/end of the line |
-| Ctrl+U/K/W | Delete before the cursor/after the cursor/the previous word |
-| ↑/↓, Ctrl+P/N | Browse history; returning to the newest position restores the draft |
-| Ctrl+R | Search history backward; press again for an earlier match |
-| Enter / Esc (history search) | Accept the match and return to editing without executing it |
-| Ctrl+G (history search) | Cancel the search and restore the draft |
-| Tab / Shift+Tab | Request completion, then cycle forward/backward through candidates, turning pages automatically |
-| PageUp / PageDown (completion menu) | Move by a page while retaining the selection position where possible; stop at the first/last page |
-| Enter (completion menu) | Accept the selected candidate and return to editing without executing; default to the first match if none is selected |
-| Esc | Dismiss completion candidates |
+| `Tab` / `Shift+Tab` | Request path completion and cycle forward/backward through candidates (turning pages automatically) |
+| `PageUp` / `PageDown` | Move by a full page in the completion menu (stops at first/last page) |
+| `Enter` / `Esc` (completion menu) | `Enter` inserts the selected candidate without running the command; `Esc` closes the menu |
+| `↑` / `↓`, `Ctrl+P` / `N` | Browse history; returning to the newest line restores your current draft |
+| `Ctrl+R` | Reverse-search history; press again for an earlier match |
+| `Enter` / `Esc` / `Ctrl+G` (search) | `Enter`/`Esc` accepts the match and returns to editing; `Ctrl+G` cancels search and restores the draft |
+| `Home` / `End`, `Ctrl+A` / `E` | Jump to the start / end of the line |
+| `Ctrl+U` / `K` / `W` | Delete before cursor / after cursor / previous word |
+| `Delete` / `Ctrl+D` | `Delete` removes the character under the cursor; `Ctrl+D` exits on an empty line or deletes under the cursor |
+| `Ctrl+C` | Cancel current input; at an overwrite/delete prompt, abort remaining files in the current command (`n` skips only the current item) |
 
-A unique match is inserted immediately. After completing a directory, press Tab again to complete its contents without typing another character. With multiple matches, Tab / Shift+Tab cycles through the current candidates. The selected item uses reverse highlighting and a `>` marker; the panel arranges columns to fit the terminal width, showing at most six candidate rows and a footer with the page and candidate counts. Short terminals show fewer rows. Resizing keeps the selected item visible. The marker remains when colors are disabled. Enter accepts the selection and closes the menu. After accepting a directory, press Tab to complete its contents. Press Enter again after leaving candidate selection to execute the command. Type a more specific prefix and press Tab to narrow the results. Only the current page is rendered.
+**Editor and history behavior**:
+- **Completion menu**: A single match is inserted immediately; after completing a directory, press `Tab` again to complete inside it. Multiple matches display in a multi-column grid (up to 6 rows with page and total counts) highlighted with `>`. Remote completion queries time out after 2 seconds and cancel automatically if you keep typing.
+- **Scrolling and paste**: Long lines scroll horizontally while editing and echo in full on submission. Wide characters, combining marks, emoji, and bracketed pastes split across reads are preserved (newlines and tabs in pasted text become spaces without submitting the command). When `stdin` is a terminal and `stdout` is piped (e.g. to `tee`), prompts and terminal resize handling continue to work via the input terminal.
+- **History resilience**: Up to 500 recent non-empty, non-duplicate interactive commands are stored (confirmation answers and batch commands are excluded). If the history or lock file is unavailable at startup, XOps warns and falls back to session-only history. Temporary Windows file-sharing conflicts retry within a 2-second deadline; write failures keep commands in memory and merge them back to disk once writing recovers.
 
-Pasted newlines and tabs become spaces, and control characters are removed. Pasting does not execute commands; press Enter to submit. Path completion runs in the background with a two-second timeout. Editing the input or leaving the prompt cancels the request; stale results never replace newer input. After cancellation or timeout, remote completion can be requested again without running another command first. Pasting during history search appends to the search query rather than editing the displayed history entry.
+## Batch mode
 
-If the history or lock file is unavailable at startup, a warning is displayed and the shell uses session-only history. Readable existing entries remain available, but this fallback does not write to disk. Normally, command history is stored in `~/.xops_sftp_history`, retaining up to 500 recent entries and ignoring empty input and consecutive duplicates. Confirmation answers and batch commands are not recorded. Confirmation prompts disable command completion and history browsing. History write failures are reported while retaining the command in the current session. Once writing recovers, pending entries are merged with disk history, retaining the most recent 500 entries.
+Piping or redirecting input into `xops sftp` (e.g. `xops sftp web-01 < batch.txt`) automatically enables batch mode:
+- The first command failure stops execution immediately with a nonzero exit status, without running later commands or writing interactive history.
+- Local `lls`/`lll` and remote `ls`/`ll` fail immediately on missing paths or read errors; a failure on any wildcard match stops the remaining matches and subsequent commands.
+- Batch `exec` allocates no PTY, and `exec` / `lexec` receive `EOF` on stdin so they cannot consume subsequent SFTP commands.
+- `shell`/`lshell` require an interactive terminal; operations that would prompt for overwrite or removal fail unless resolved with force/no-clobber options. Each command line is capped at 1 MiB.
 
-On Windows, temporary file sharing conflicts are retried within the two-second history write deadline, retaining the original file and the lock shared by writers. Persistent conflicts and other errors still report a write failure without clearing existing history.
+## Working directory inheritance and probing for `exec`
 
-Before executing commands or entering a local/remote interactive program, the prompt stops reading and restores the terminal. The SFTP prompt resumes when the program finishes. Connection loss or cancellation ends pending input and completion tasks. External SIGINT or SIGTERM ends the session after pending prompt tasks stop and terminal state is restored.
+After changing the remote directory with `cd`, SFTP `exec` binds the current remote working directory (`cwd`) to your command:
 
-At an overwrite or removal confirmation, answering `n` skips only the current item; Ctrl+C stops the rest of the command and returns to the prompt. File operations already completed are not rolled back.
+- **POSIX and fish (`bash`/`sh`/`zsh`/`fish`)**: A nonempty `cwd` wraps the entire user program in a conditional block (`cd ... && { ...; }` or fish's `cd ...; and begin ... end`). If changing directories fails, semicolon-separated or multiline commands do not run; on success, the user program's exit status is preserved.
+- **Windows CMD (`cmd` and saved `server/cmd`)**: Uses `cd /d "directory" || exit /b & user-command`. A failed directory change exits immediately with the failure `ERRORLEVEL` so later `&`, `&&`, `||`, or grouped commands never run; on success, native CMD syntax, `rem` comments, and exit codes are preserved. Saved `server/cmd` nodes derive a temporary CMD adapter for `cwd`-aware `exec` calls without reprobing or modifying node settings.
+- **Windows path normalization**: Windows SFTP paths `/C:/...` convert to `C:/...`, and drive roots `/C:` or `/C:/` convert to `C:/` (running `exec dir` at `sftp:/C:>` lists the root of `C:`). Cross-platform `pwsh` selects path formats at runtime via its own `$IsWindows` even on cold connections without a probe cache; POSIX paths remain unchanged.
+- **On-demand probing**: When execution settings are unspecified and the launch dialect is unknown, `exec` with a nonempty `cwd` runs a bounded read-only probe once per connection and caches the result in memory (Linux prefers default `bash`/`sh`/`zsh`/`fish`; Windows CMD prefers installed PowerShell for `cwd` handling and falls back to CMD). Empty-`cwd` commands do not probe. Other explicit `server` configurations reject a nonempty `cwd`. A failed probe aborts before running user code and never retries under another interpreter.

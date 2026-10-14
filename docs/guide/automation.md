@@ -1,16 +1,16 @@
 # Playbook 与 MCP
 
-XOps 提供了面向运维工程师的声明式任务编排（Playbook）以及面向 AI Agent 的工具调用服务（MCP），帮助您实现基础设施的自动化管理。
+XOps 提供 YAML 声明式任务编排（`xops play`）和内置 Model Context Protocol 服务端（`xops mcp`）。
 
-通过 Agent 直接执行 CLI 的方式见 [Agent Skill 与功能概览](./agent-skill)。Skill 的运维流程独立于本页介绍的 MCP 服务接入。
+> 若希望让支持 Skill 的 AI 助手在本地直接调用 `xops` CLI 完成运维操作（无需启动 MCP 服务），请参阅 [Agent Skill 与功能概览](./agent-skill)。
 
 ## Playbook 声明式编排
 
-Playbook 使用 YAML 格式定义任务流程，支持组合 `shell`、`script`、`copy`、`ensure`（状态收敛）和 `template`（配置渲染）步骤，并提供主机并发控制与失败策略。
+Playbook 使用 YAML 编排多台主机上的自动化步骤，支持 `shell`（执行命令）、`script`（分发执行本地脚本）、`copy`（上传文件）、`ensure`（状态检查与幂等收敛）和 `template`（渲染配置模板）。
 
-### 示例 Playbook
+### 1. 快速上手示例
 
-将以下内容保存为 `deploy-service.yaml`：
+创建 `deploy-service.yaml`：
 
 ```yaml
 name: deploy-service
@@ -46,69 +46,58 @@ steps:
     sudo: true
 ```
 
-运行 Playbook：
+运行与调试命令：
 
 ```bash
-# 执行 Playbook
-xops play deploy-service.yaml
-
-# 通过命令行参数覆盖变量
-xops play deploy-service.yaml --var http_port=8081
-
-# 仅进行试运行预览（Dry Run）
+# 预览目标主机与执行步骤（不连接远端、不执行任何更改）
 xops play deploy-service.yaml --dry-run
 
-# 将执行范围限制到特定主机
-xops play deploy-service.yaml --limit web-01
+# 正式运行 Playbook
+xops play deploy-service.yaml
+
+# 命令行注入或覆盖变量（未定义的模板变量会在执行前报错）
+xops play deploy-service.yaml --var http_port=8081
+
+# 仅在指定节点列表上执行
+xops play deploy-service.yaml --limit web-01,web-02
 ```
 
-### 失败处理与变量控制
+### 2. 失败策略、重试与执行配置
 
-- **失败处理策略 (`on_error`)**：
-  - `stop`（默认）：当前主机停止执行后续步骤，其他主机不受影响；
-  - `abort_all`：一旦任意主机失败，立即取消所有其他主机的任务；
-  - `continue`：当前主机忽略错误，继续执行后续步骤。
-- **变量覆盖 (`--var key=value`)**：命令行指定的变量会优先覆盖 YAML 内同名变量，并可被模板文件和步骤命令引用；未定义变量会导致解析报错。
-- **执行环境定制 (`execution`)**：
-  - 可以在 `settings.execution` 中声明全局默认解释器（如 `bash`、`powershell`、`cmd` 或 `server`）；
-  - 也可以在单个步骤中通过 `execution` 覆盖（例如针对 Windows 节点的步骤使用 `interpreter: cmd`）；
-  - 步骤未配置时，依次继承 Playbook 设置、目标节点配置或系统默认。
+- **失败控制（`settings.on_error`）**：
+  - `stop`（默认）：出错主机停止后续步骤，其他并行主机继续执行。
+  - `abort_all`：任一主机连接失败或步骤失败时，立即取消所有其他正在运行的主机任务。
+  - `continue`：当前主机忽略该步骤错误，继续执行后续步骤。
+- **安全重试边界**：步骤配置 `retries` 后，仅当远端命令**确认已执行完毕且无 I/O 或通道清理错误**时才会按 `retry_delay` 重试；若连接中断导致远端执行结果不确定（`unknown`），XOps 绝不自动重放，避免重复产生副作用。本地脚本内容在任务开始前一次性读取并冻结。
+- **执行环境继承（`execution`）**：支持在步骤级 `step.execution`、全局 `settings.execution` 或节点配置中指定 `interpreter`（如 `bash`、`sh`、`zsh`、`fish`、`powershell`、`pwsh`、`cmd`、`server`）与 `launch_dialect`。
 
-### Playbook 按需探测
+### 3. `script` 与 `ensure` 按需探测及状态码规则
 
-未指定解释器且启动方言未知时，无 shebang 的 `script` 和 `ensure` 会在执行用户代码前进行有界只读
-探测，同一 SSH 连接只探测一次，失败结果也会缓存。结果仅用于本次受限操作，不改写节点配置或普通
-`shell` 步骤的默认执行方式。显式解释器（包括 `server`）、BOM 和未支持的 shebang 不会被自动替换。
-白名单 bash/sh/zsh/fish shebang 仍不能证明外层方言，需已有兼容配置。
+当未指定解释器且启动方言未知时，**无 shebang 的 `script` 步骤**和 **`ensure` 步骤**会在运行用户代码前自动发起一次有界只读探测（同一连接共享缓存，不改写磁盘配置，也不影响普通 `shell` 步骤的默认 `server` 直通）：
+- **支持范围**：`script` 与 `ensure` 支持 `bash`、`sh`、`zsh` 和原生 `fish`（外层启动方言须为 `posix` 或 `fish`）。若探测到 Windows 环境，会在执行用户代码前直接报错拒绝，不做跨平台语法翻译。显式解释器（含 `server`）、UTF-8 BOM 和非白名单 shebang 不会被自动替换；白名单 shebang 仍需已知兼容的外层方言。
+- **`ensure` 收敛与保留退出码保护**：
+  - `ensure` 先运行 `check`：返回 `0` 则判定满足条件并跳过 `action`（`StatusSkipped`）；确认返回普通非零状态（如 `false` 返回 `1`）时执行 `action`，随后再次运行 `check` 复查（`check`、`action`、复查全程冻结使用同一执行配置）。
+  - **异常退出码拦截**：若 `check` 返回保留错误码 `126`/`127`（命令不可执行或未找到）、fish 保留错误码 `121`/`123`/`124`/`125`、发生语法错误、超时、断连或丢失控制帧（例如在 `check` 中调用 `exec` 替换了 Shell 进程），均直接判定步骤失败（`StatusFailed`），**严禁触发 `action`**。
 
-script/ensure 支持 bash、sh、zsh 和原生 fish，外层启动方言可为 posix 或 fish。探测到 Windows 时会在执行用户代码前明确拒绝，不会翻译
-脚本或 ensure 检查语法。ensure 的检查、action 和复查使用同一受控配置；探针失败不会执行 action，
-也不会触发用户命令重试。试运行不连接远端、不运行探针。
+## MCP 服务接入
 
-fish ensure 在 fish 中执行 check、action 与复查，并通过退出事件捕获检查状态，包括显式 `exit`。检查通过时跳过 action；确认非零状态后才执行 action 并复查。126/127、fish 保留的执行错误码 121/123/124/125、语法错误、超时、断连或缺少结果帧都会停止流程；检查中的 `exec` 替换进程会绕过退出事件，因此会作为缺少结果帧处理。默认 fish 的自动探测结果会直接用于此流程。
-
-这些保留退出码即使由检查程序显式返回，也不会触发 action：无法区分用户返回值与展开失败、不可执行等错误时，按检查失败处理。普通条件不满足（如 `false` 返回 1）仍按原流程执行 action 与复查。
-
-## MCP 服务集成
+XOps 内置 MCP 服务端，可供 Claude Desktop、Cursor、Codex 等 AI 客户端调用受控的主机查询、远程命令、文件传输与 SSH 隧道工具。
 
 ```bash
+# 启动默认 stdio 模式 MCP 服务
 xops mcp serve
 ```
 
-XOps 内置了符合 Model Context Protocol 标准的服务端，可供 Claude Desktop、Cursor 等支持 MCP 的 AI 客户端无缝调用。
+### 1. 客户端接入与安全护栏
 
-### 客户端接入配置
+在 AI 客户端的 MCP 配置中，将启动命令设为 `xops` 的绝对路径，参数设为 `["mcp", "serve"]`。
 
-将 AI 客户端中的 MCP 服务器启动命令配置为 `xops` 的绝对路径，参数设置为 `["mcp", "serve"]`。
+在 `~/.xops/xops_config.yaml` 的 `guardrail` 字段中可配置审批阈值、高危命令拦截、受保护文件路径和审计日志路径：
+- **操作审批**：当工具调用达到需审批的风险级别时，客户端会弹出审批请求（需确认 `approved=true`），拒绝、取消或超时均不会执行远端操作。
+- **默认超时与非交互凭据**：单次工具调用默认超时为 5 分钟（可通过 `mcp.tool_timeout` 调整，如 `30m`）。MCP 全程运行在非交互模式下，不会弹出终端密码提示或密钥环解锁窗口，启动前可用 `xops credential doctor` 检查凭据可用性。
 
-在配置文件 `~/.xops/xops_config.yaml` 的 `guardrail` 中可设置安全审批阈值、禁止执行的命令、受保护的文件路径与审计日志输出。
+### 2. 进阶指南与参考
 
-### 工具超时与长任务处理
-
-- **调用超时控制**：stdio 模式的单次工具调用默认时限为 5 分钟。若需运行大型构建或长时间命令，可在配置中调整 `mcp.tool_timeout`（例如 `30m`）。
-- **审批安全机制**：当操作触发安全防护规则时，客户端会弹出审批表单，需确认 `approved=true` 后方可继续执行。审批被拒绝、取消或超时均会安全终止操作。
-- **免交互凭据保障**：MCP 运行在非交互模式下，不会弹出终端凭据输入或密码库解锁提示。请确保相关主机的凭据已成功导入或配置免密访问。可用 `xops credential doctor` 检查存储状态。
-
-子命令与配置参数见 [MCP 命令参考](../reference/commands/xops-mcp)。更多高级特性：
-- [局域网 HTTP 接入、客户端文件传输和恢复](mcp-http)
-- [MCP SSH 隧道工具](mcp-tunnels)（支持通过 AI 动态建立和管理端口转发）
+- [MCP 命令参考](../reference/commands/xops-mcp)
+- [MCP HTTP 局域网接入、大文件传输与异常恢复](./mcp-http)
+- [MCP stdio SSH 隧道工具（`-L` / `-R`）](./mcp-tunnels)

@@ -25,8 +25,8 @@ Relying entirely on manual configuration of `interpreter` and `launch_dialect` i
 
 | In Scope | Not Promised |
 | :--- | :--- |
-| Automatic identification of remote SSH server outer launch dialect (`posix`, `cmd`, `powershell`) | Inferring full environment capabilities solely from SSH Banner, `$SHELL`, or a single `uname` call |
-| Automatic enumeration of installed interpreters on the target node (`bash`, `sh`, `powershell`, `pwsh`, `cmd`) | Translating arbitrary cross-platform syntax (e.g. translating POSIX pipelines to PowerShell) |
+| Automatic identification of remote SSH server outer launch dialect (`posix`, `fish`, `cmd`, `powershell`) | Inferring full environment capabilities solely from SSH Banner, `$SHELL`, or a single `uname` call |
+| Automatic enumeration of installed interpreters on the target node (`bash`, `sh`, `zsh`, `fish`, `powershell`, `pwsh`, `cmd`) | Translating arbitrary cross-platform syntax (e.g. translating POSIX pipelines to PowerShell) |
 | Automatic probing on initial node enrollment with atomic persistence to Schema V2 config | Automatically switching interpreters to retry user commands after failure |
 | Connection-level session memory caching and controlled runtime on-demand lazy probing | Probing without network timeouts, blocking indefinitely |
 | Read-only, side-effect-free, and MOTD/banner-noise-resilient probing lifecycle | Allowing probes to create temporary remote files or leave orphan processes |
@@ -91,18 +91,18 @@ SSH `exec` receives a raw command string evaluated by the remote default login s
 [Established Authenticated Connection]
       │
       ▼
-┌──────────────────────────────────────────────┐
-│ Stage 1: Outer Launch Dialect Determination │
-│ Goal: Determine default server interpreter   │
-│ Result: posix | cmd | powershell | unknown   │
-└──────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────┐
+│ Stage 1: Outer Launch Dialect Determination       │
+│ Goal: Determine default server interpreter         │
+│ Result: posix | fish | cmd | powershell | unknown │
+└────────────────────────────────────────────────────┘
       │
       ▼ (Construct inner commands under verified outer syntax)
-┌──────────────────────────────────────────────┐
-│ Stage 2: Inner Interpreter Enumeration       │
-│ Goal: Locate usable execution binaries       │
-│ Candidates: bash, sh, powershell, pwsh, cmd  │
-└──────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────┐
+│ Stage 2: Inner Interpreter Enumeration             │
+│ Goal: Locate usable execution binaries             │
+│ Candidates: bash, sh, zsh, fish, powershell, pwsh, cmd │
+└────────────────────────────────────────────────────┘
       │
       ▼
 [Recommendation Matrix -> Emit ProbeResult]
@@ -126,21 +126,27 @@ The majority of targets hit on the very first SSH `exec` request.
    - **Windows cmd.exe**: Incompatible with `if/then`; rejected as an invalid POSIX frame.
    - **PowerShell (including Core on Linux)**: Incompatible with `if :; then ...; fi`; exits with error. POSIX cannot be detected using `printf`, `$()`, or `||` alone as PowerShell 7 can parse or invoke external commands with these constructs.
 
-2. **Windows CMD Fallback Probe**:
+2. **Fish Fallback Probe**:
+   ```fish
+   if set -q FISH_VERSION; printf '__XOPS_DIALECT_FISH__:%s\n' "$FISH_VERSION"; printf '__XOPS_FISH_OS__:%s\n' (uname -s); printf '__XOPS_FISH_SHELL__:%s\n' "$SHELL"; end
+   ```
+   - **Fish DefaultShell**: `set -q FISH_VERSION` succeeds and outputs `__XOPS_DIALECT_FISH__:<Version>` along with OS/Shell metadata frames, exiting with 0. Confirmed as `LaunchFish`.
+
+3. **Windows CMD Fallback Probe**:
    ```cmd
    echo __XOPS_DIALECT_CMD__:%COMSPEC%
    ```
    - **Windows cmd.exe**: Outputs `__XOPS_DIALECT_CMD__:C:\Windows\system32\cmd.exe` with exit code 0. Confirmed as `LaunchCmd`.
    - **POSIX / PowerShell**: `%COMSPEC%` is not expanded; rejected as an invalid frame. Variable expansion must occur in the outer shell itself, not by invoking an inner `cmd.exe`.
 
-3. **Windows PowerShell Fallback Probe**:
+4. **Windows PowerShell Fallback Probe**:
    ```powershell
    Write-Output ('__XOPS_DIALECT_POWERSHELL__:' + $PSVersionTable.PSVersion.ToString()); Write-Output ('__XOPS_PLATFORM__:' + [Environment]::OSVersion.Platform)
    ```
    - **PowerShell DefaultShell**: Outputs `__XOPS_DIALECT_POWERSHELL__:<Version>` with exit code 0. Confirmed as `LaunchPowerShell`.
    - **Platform Metadata**: `__XOPS_PLATFORM__:Win32NT` marks Windows; `Unix` denotes Unix-like hosts. Does not guess operating systems from language versions alone.
 
-4. **Safety Fallback**:
+5. **Safety Fallback**:
    If no valid frame is received within bounded timeouts, dialect marks as `LaunchUnknown`.
 
 ---
@@ -149,36 +155,46 @@ The majority of targets hit on the very first SSH `exec` request.
 
 Once the outer dialect is established, subsequent commands strictly use payload generators and escaping mechanisms native to that dialect.
 
-All three dialects use a line-by-line streaming protocol: each available interpreter emits `__XOPS_INTERP__:<name>`, followed by `__XOPS_INTERP_END__`. `<name>` is strictly limited to `bash`, `sh`, `powershell`, `pwsh`, and `cmd`. Parsers ignore noise lines and CRLF variations, rejecting invalid interpreter names, duplicate frames, frames after the termination delimiter, or missing end delimiters; non-zero exit or truncated output is treated as enumeration failure.
+All four dialects use a line-by-line streaming protocol: each available interpreter emits `__XOPS_INTERP__:<name>`, followed by `__XOPS_INTERP_END__`. `<name>` is strictly limited to `bash`, `sh`, `zsh`, `fish`, `powershell`, `pwsh`, and `cmd`. Parsers ignore noise lines and CRLF variations, rejecting invalid interpreter names, duplicate frames, frames after the termination delimiter, or missing end delimiters; non-zero exit or truncated output is treated as enumeration failure.
 
-#### 3.2.1 When `LaunchDialect == LaunchPOSIX`
-Executes via `sh -c` without external dependencies (1 RTT):
+#### 3.2.1 When `LaunchDialect == LaunchPOSIX` or `LaunchFish`
+`LaunchPOSIX` executes without external dependencies (1 RTT):
 ```sh
-sh -c '
-for i in bash sh powershell pwsh cmd; do
+for i in bash sh zsh fish powershell pwsh cmd; do
     if command -v "$i" >/dev/null 2>&1; then
-        printf "__XOPS_INTERP__:%s\n" "$i"
+        printf '__XOPS_INTERP__:%s\n' "$i"
     fi
 done
-printf "__XOPS_INTERP_END__\n"
-'
+printf '__XOPS_INTERP_END__\n'
+```
+`LaunchFish` enumerates via native fish loop and `command -q`:
+```fish
+for i in bash sh zsh fish powershell pwsh cmd; if command -q $i; printf '__XOPS_INTERP__:%s\n' $i; end; end; printf '__XOPS_INTERP_END__\n'
 ```
 
 #### 3.2.2 When `LaunchDialect == LaunchCmd`
 Constructs command with caret (`^`) escape protection via `cmdCommandPayload`:
 ```bat
-cmd.exe /d /s /c "where bash.exe >nul 2>&1 && (echo __XOPS_INTERP__:bash) & where sh.exe >nul 2>&1 && (echo __XOPS_INTERP__:sh) & where powershell.exe >nul 2>&1 && (echo __XOPS_INTERP__:powershell) & where pwsh.exe >nul 2>&1 && (echo __XOPS_INTERP__:pwsh) & (echo __XOPS_INTERP__:cmd) & (echo __XOPS_INTERP_END__) & exit /b 0"
+cmd.exe /d /s /c "where bash.exe >nul 2>&1 && (echo __XOPS_INTERP__:bash) & where sh.exe >nul 2>&1 && (echo __XOPS_INTERP__:sh) & where zsh.exe >nul 2>&1 && (echo __XOPS_INTERP__:zsh) & where fish.exe >nul 2>&1 && (echo __XOPS_INTERP__:fish) & where powershell.exe >nul 2>&1 && (echo __XOPS_INTERP__:powershell) & where pwsh.exe >nul 2>&1 && (echo __XOPS_INTERP__:pwsh) & (echo __XOPS_INTERP__:cmd) & (echo __XOPS_INTERP_END__) & exit /b 0"
 ```
 
 #### 3.2.3 When `LaunchDialect == LaunchPowerShell`
-Executed directly by the verified outer PowerShell without invoking `powershellCommandPayload` or requiring `powershell.exe`, supporting pwsh-only DefaultShells:
+Executed directly by the verified outer PowerShell without invoking `powershellCommandPayload` or requiring `powershell.exe` (disabling module auto-loading via `$global:PSModuleAutoLoadingPreference = 'None'` and restoring it in `finally`), supporting pwsh-only DefaultShells:
 ```powershell
-foreach ($i in @('bash','sh','powershell','pwsh','cmd')) {
-    if (Get-Command $i -CommandType Application -ErrorAction SilentlyContinue) {
-        Write-Output ('__XOPS_INTERP__:' + $i)
+& {
+    $previous = $global:PSModuleAutoLoadingPreference
+    try {
+        $global:PSModuleAutoLoadingPreference = 'None'
+        foreach ($i in @('bash','sh','zsh','fish','powershell','pwsh','cmd')) {
+            if (Get-Command $i -CommandType Application -ListImported -ErrorAction SilentlyContinue) {
+                [Console]::WriteLine('__XOPS_INTERP__:' + $i)
+            }
+        }
+        [Console]::WriteLine('__XOPS_INTERP_END__')
+    } finally {
+        $global:PSModuleAutoLoadingPreference = $previous
     }
 }
-Write-Output '__XOPS_INTERP_END__'
 ```
 
 ---
@@ -254,7 +270,7 @@ nodes:
 Probing strictly adheres to project coding rules:
 
 1. **Zero Resource Leak**:
-   - All `ssh.Session` instances created by probes close within bounded grace periods via `defer c.closeSessionBounded(session)`.
+   - All probe commands execute via `PlanCommand` + `c.ExecuteCommand(ctx, plan)` with bounded channel shutdown and worker joining (`defer c.closeSessionBounded(session)` for legacy session helpers).
    - No background goroutines without cancellation exits are launched.
 
 2. **Strict Timeouts**:

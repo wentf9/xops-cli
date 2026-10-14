@@ -1,81 +1,76 @@
 # Agent Skill 与功能概览
 
-`xops-agent` 将 XOps 的操作方法提供给支持 Skill 的 Agent。Agent 读取说明后，在自己的命令执行环境中运行 `xops`，再检查输出和实际结果。它与 MCP 是两套独立体系，不要求注册 MCP 工具或连接 MCP 服务。
+`xops-agent` 将 XOps CLI 的操作规范提供给支持 Skill 的 AI 助手（如 Claude Code、Codex、Cursor 等）。助手读取技能说明后，直接在自身的命令执行环境中运行 `xops` 命令并检查输出。
 
-## 项目功能
+它与 MCP 服务是两套独立体系，使用 Skill 时无需启动 `xops mcp serve` 或注册 MCP 工具。
 
-| 功能 | CLI 入口 | Skill 中的操作方式 |
-| --- | --- | --- |
-| 初始化、OpenSSH 导入 | `init` | 检查现有配置，按需初始化或选择导入来源 |
-| 主机、身份、别名与标签 | `host`、`identity` | 查询目标、CSV 导入、增删改资产、维护标签 |
-| 凭据与离线加密库 | `credential`、`identity credential` | 检查访问、配置凭据，按任务执行迁移、轮换、恢复和清理 |
-| SSH 与提权 | `ssh`、`exec --sudo` | 指定身份、端口、ProxyJump；按需申请终端或提权 |
-| 单机与批量命令 | `exec` | 选择主机/标签/主机文件，限制并发，检查逐主机结果 |
-| 文件读写与目录操作 | `exec`、批处理 `sftp` | 有界读取、写入/追加、列目录、创建、复制、移动和删除 |
-| 文件与目录传输 | `scp`、`sftp` | 上传、下载、远端中转、按标签分发，选择覆盖策略并核验 |
-| SSH 隧道与代理 | `ssh -L/-R/-D -N` | 跟踪进程或会话、检查监听与目标服务、停止并验证释放 |
-| 声明式任务 | `play` | 组合 shell、script、copy、ensure、template，预览后按目标执行 |
-| 防火墙 | `firewall` | 查询状态与规则，管理端口、服务、来源规则及重载 |
-| 网络诊断与本地转发 | `dns`、`ping`、`nc`、`forward` | 从 CLI 所在环境检查 DNS/ICMP/TCP，或创建 TCP/UDP 转发 |
-| 交互与本地辅助 | `tui`、`sudo`、`encode` | 终端管理、本地提权、Base64/URL/UTF-8/Unicode 转换 |
-| 服务管理与命令发现 | `mcp serve/recover`、`version`、`help`、`completion` | 按明确的服务管理任务使用 CLI；Skill 的普通运维流程不依赖 MCP |
+## 快速安装与使用
 
-`host import --template` 导出的是 CSV 导入模板，不是已有主机清单。编码子命令是 `base64`、`url`、`utf8`、`unicode`，没有独立的 `hex` 子命令。完整参数以[命令参考](../reference/)及已安装版本的 `--help` 为准。
-
-## 当前执行语义
-
-普通命令默认使用 `server`，直接将命令发送给远端 SSH Shell，不再隐式包装 `bash -l -c`。应根据远端实际 Shell 选择语法；Windows 远端不再因为默认路径而要求安装 Bash。旧版本可能仍采用 Bash 默认，使用前需核对版本及配置。
-
-全局与节点可设置 `execution`；Playbook 还支持 `settings.execution` 与步骤级覆盖。显式 Bash/sh/zsh/fish/PowerShell/pwsh/cmd 适配器要求兼容的 `launch_dialect`，它描述远端外层 Shell，而不是 Agent 的本地系统。`--no-login` 保留非登录 Bash 兼容语义，不是控制所有解释器的通用选项。
-
-本地脚本需要受支持的解释器以及已知的启动方言；白名单 sh/bash/zsh/fish shebang 只选择解释器，不能证明外层 Shell 是 POSIX。无可靠解释器、BOM 或不支持的组合会在执行前拒绝。Playbook 无 shebang 的 script/ensure 与 SFTP 非空 cwd 的 exec 可对未指定的执行配置按需探测，结果仅缓存于连接；显式解释器（包括 server）不会被替换。SFTP 文件命令不依赖 Shell，已知 server/cmd 的 exec 使用临时 CMD 适配器继承 cwd，其他显式 server 配置仍拒绝非空 cwd；探测失败会在用户代码开始前停止。
-
-不同入口仍有限制：`exec` 的显式执行参数暂不支持与脚本、sudo、`--stream` 或 `--out-dir` 组合；`ssh` 显式执行与严格 PTY 输出也有客户端平台限制。普通 PTY 路径与严格显式路径的输出能力不同。Skill 的 `references/execution.md` 按当前代码说明这些边界，并提供 Bash 兼容配置、Windows 示例和 Playbook 检查/重试规则。
-
-## MCP 能力如何通过 CLI 完成
-
-下表用于说明能力对应关系，Skill 实际执行右侧 CLI 工作流。
-
-| MCP 能力 | 对应 CLI 工作流 |
-| --- | --- |
-| `xops_list_nodes` | `xops host list`，需要时添加 `--tag` |
-| `xops_ssh_run` | `xops exec --host NODE -c COMMAND`，按需添加 `--sudo` |
-| `xops_read_file` | `exec` 调用目标系统的文本读取命令；大文件/二进制先用 `scp` 下载 |
-| `xops_write_file` | 本地生成文件后 `scp` 上传，或通过 `exec` 执行明确的写入/追加操作 |
-| `xops_fs_ls/mkdir/touch/cp/mv/rm` | 批处理 `sftp` 或 `exec` 调用目标系统的文件命令；创建空文件使用后者 |
-| stdio `xops_upload/download` | `xops scp` 上传/下载文件和目录，或批处理 SFTP |
-| HTTP `xops_prepare_upload/download`、`xops_transfer_status/cancel` | CLI 直接传输，检查进程、退出码与目标文件；取消时终止本次拥有的进程 |
-| stdio `xops_tunnel_create/list/status/stop` | `xops ssh -L/-R -N` 配合进程/会话跟踪、连通性检查与停止操作 |
-
-两种入口的生命周期语义不同。CLI 不产生 MCP 传输任务 ID、隧道 ID 或 TTL，也没有 `xops tunnel list` 等命令。终止传输进程不会回滚已经写入的内容。CLI 隧道还支持 `-D` SOCKS5；MCP 隧道仅提供 stdio 下的 `-L/-R`。
-
-Skill 调用 CLI 时不经过 MCP 服务端的风险评估、审批表单和审计，需遵循 Agent 自身的命令执行授权机制。现有任务授权应继续沿用；目标、覆盖范围或网络暴露范围不明确时再澄清。
-
-## 安装与使用
-
-在 Agent 的命令环境中[安装 XOps](./getting-started)，准备 SSH 配置、可信主机密钥与可访问的凭据，然后安装 Skill：
+先在 AI 助手所在的命令环境中[安装 XOps](./getting-started)，准备好 SSH 配置、可信主机密钥与可访问的凭据，然后安装 Skill：
 
 ```bash
 npx skills add https://github.com/wentf9/xops-cli --skill xops-agent
 ```
 
-手工安装时将完整的 [`skills/xops-agent/`](https://github.com/wentf9/xops-cli/tree/master/skills/xops-agent) 目录复制到客户端支持的技能目录，保留 `SKILL.md` 和 `references/`。更新当前仓库中的文件不会自动更新其他位置已安装的副本。
+若手动安装，将仓库中完整的 [`skills/xops-agent/`](https://github.com/wentf9/xops-cli/tree/master/skills/xops-agent) 目录复制到客户端的技能目录（保留 `SKILL.md` 和 `references/` 子目录；更新仓库源码不会自动同步其他位置已安装的副本）。
 
-Skill 主文件负责环境检查、任务选择和结果验证，四份参考按需加载：
+安装后可直接用自然语言向助手下达任务，例如：
+- “用 xops-agent 检查 `web` 标签所有主机的磁盘占用，列出失败节点。”
+- “读取 `web-01` 的应用配置，修改端口并验证文件内容。”
+- “将本地 `assets` 目录分发到 `web` 标签主机，已有文件不要覆盖。”
+- “通过 `web-01` 转发远端 3000 端口，验证网页后关闭隧道。”
+- “把这组部署步骤整理成 Playbook，先用 `--dry-run` 预览目标和执行顺序。”
+
+**Skill 内部参考文件（按需加载）**：
 
 | 文件 | 内容 |
 | --- | --- |
-| `references/inventory.md` | 主机、身份、标签、凭据和离线库维护 |
-| `references/execution.md` | 单机/批量执行、脚本、Playbook、交互与本地工具 |
-| `references/files.md` | 读写文件、目录操作、SCP/SFTP 和传输校验 |
-| `references/networking.md` | 隧道进程管理、防火墙、网络诊断与转发 |
+| `references/inventory.md` | 主机、身份、标签、凭据和离线加密库维护 |
+| `references/execution.md` | 单机/批量执行、脚本、Playbook、交互终端与本地工具 |
+| `references/files.md` | 读写文件、目录操作、SCP/SFTP 与传输校验 |
+| `references/networking.md` | 隧道进程管理、防火墙、网络诊断与本地转发 |
 
-示例请求：
+## CLI 功能总览
 
-- “用 xops-agent 检查 web 标签所有主机的磁盘占用，列出失败节点。”
-- “读取 web-01 的应用配置，修改端口并验证文件内容。”
-- “将本地 assets 目录分发到 web 标签主机，已有文件不要覆盖。”
-- “通过 web-01 转发远端 3000 端口，验证网页后关闭隧道。”
-- “把这组部署步骤整理成 Playbook，先预览目标和执行顺序。”
+| 功能领域 | CLI 入口 | Skill 中的常用操作 |
+| --- | --- | --- |
+| 初始化与 OpenSSH 导入 | `init` | 检查现有配置，按需初始化或导入 `~/.ssh/config` |
+| 主机、身份、别名与标签 | `host`、`identity` | 查询节点、CSV 批量导入、增删改资产、维护标签 |
+| 凭据与离线加密库 | `credential`、`identity credential` | 检查存储状态、配置凭据，按需执行迁移、轮换、恢复和清理 |
+| SSH 连接与提权 | `ssh`、`exec --sudo` | 指定身份、端口、ProxyJump；按需申请终端或 `sudo`/`su` 提权 |
+| 单机与批量命令 | `exec` | 按主机/标签/列表文件选择目标，控制并发数，检查逐主机输出 |
+| 文件读写与目录操作 | `exec`、批处理 `sftp` | 有界读取、写入/追加、列目录、创建、复制、移动和删除 |
+| 文件与目录传输 | `scp`、`sftp` | 上传、下载、远端中转、按标签分发，选择覆盖策略并校验结果 |
+| SSH 隧道与代理 | `ssh -L/-R/-D -N` | 管理转发进程或会话、检查监听与目标服务、停止并验证端口释放 |
+| 声明式任务编排 | `play` | 组合 `shell`、`script`、`copy`、`ensure`、`template`，先预览再执行 |
+| 防火墙管理 | `firewall` | 查询状态与规则，管理端口、服务、来源规则及重载（自动适配 firewalld/ufw/iptables/nftables） |
+| 网络诊断与本地转发 | `dns`、`ping`、`nc`、`forward` | 从 CLI 所在机器检查 DNS/ICMP/TCP，或建立本地 TCP/UDP 转发 |
+| 交互界面与编码工具 | `tui`、`sudo`、`encode` | 终端可视化管理、本地提权、`base64`/`url`/`utf8`/`unicode` 编码转换 |
+| 服务管理与命令发现 | `mcp serve/recover`、`version`、`help`、`completion` | 按明确任务管理 MCP 服务或查看命令帮助 |
 
-本地文件和监听地址属于 Agent 实际运行 CLI 的机器；容器或远程沙箱不等于用户桌面。批处理 SFTP 按空白拆分参数，带空格的路径应使用正确引用的 SCP 参数或远端命令。详细限制见 [SFTP 指南](./sftp)、[SSH 指南](./ssh)和 Skill 参考。
+> 注意：`host import --template` 仅导出空白 CSV 模板，而非导出已有主机清单；`encode` 子命令包含 `base64`、`url`、`utf8`、`unicode`（无独立 `hex` 子命令）。完整选项以[命令参考](../reference/)和 `xops <command> --help` 为准。
+
+## 执行语义与操作边界
+
+- **普通命令默认直通（`server`）**：命令直接发给远端默认 SSH Shell，不再隐式包装 `bash -l -c`。请按远端实际 Shell 编写语法（Windows 节点无需为了默认命令额外安装 Bash）。
+- **显式解释器与配置继承**：全局、节点、Playbook `settings.execution` 和步骤均可配置 `execution`。显式使用 `bash`、`sh`、`zsh`、`fish`、`powershell`、`pwsh` 或 `cmd` 时，需搭配描述**远端外层 Shell** 的 `launch_dialect`；`--no-login` 仅保留非登录 Bash 兼容语义。
+- **脚本与按需探测**：本地脚本需要明确的解释器与已知启动方言（白名单 `sh`/`bash`/`zsh`/`fish` shebang 仅选择解释器，不能单独证明外层方言为 POSIX；无可靠解释器或含 UTF-8 BOM 的脚本会在执行前拒绝）。Playbook 无 shebang 的 `script`/`ensure` 以及 SFTP 带非空 `cwd` 的 `exec` 会对未指定的执行环境按需探测并缓存于连接内存；显式解释器（含 `server`）不会被替换（已知 `server/cmd` 的 SFTP `exec` 使用临时 CMD 适配器继承 `cwd`，其余显式 `server` 配置拒绝非空 `cwd`）。
+- **入口组合限制**：`exec` 的命令行显式执行参数暂不支持与脚本、`--sudo`、`--stream` 或 `--out-dir` 组合；`ssh` 的命令行显式执行参数当前仅在 Linux 客户端支持。
+- **本地环境与路径注意**：本地文件路径和监听端口均位于**运行 `xops` 的机器**（若 Agent 运行在容器或远程沙箱中，不等同于用户桌面）。批处理 SFTP 按空白分词，包含空格的路径请使用加引号的 `scp` 参数或远端命令。
+
+## MCP 工具与 CLI 命令对照
+
+Skill 实际执行右侧的 CLI 命令，不经过 MCP 服务端：
+
+| MCP 工具 | 对应 CLI 工作流 |
+| --- | --- |
+| `xops_list_nodes` | `xops host list`（可加 `--tag`） |
+| `xops_ssh_run` | `xops exec --host NODE -c COMMAND`（可加 `--sudo`） |
+| `xops_read_file` | 通过 `exec` 调用目标系统读取命令；大文件或二进制文件用 `scp` 下载 |
+| `xops_write_file` | 本地生成文件后用 `scp` 上传，或通过 `exec` 执行写入/追加 |
+| `xops_fs_ls/mkdir/touch/cp/mv/rm` | 批处理 `sftp` 或 `exec` 调用目标系统文件命令（创建空文件用后者） |
+| stdio `xops_upload/download` | `xops scp` 上传/下载文件与目录，或使用批处理 `sftp` |
+| HTTP `xops_prepare_upload/download`、`xops_transfer_status/cancel` | 直接运行 `xops scp`，检查进程退出码与目标文件；取消时终止当前进程 |
+| stdio `xops_tunnel_create/list/status/stop` | `xops ssh -L/-R -N`（CLI 另支持 `-D` SOCKS5；通过进程/会话管理启停） |
+
+> **生命周期与授权差异**：CLI 不生成 MCP 传输任务 ID、隧道 ID 或 TTL，也没有 `xops tunnel list` 命令；终止 CLI 传输进程不会回滚已写入的数据。Skill 调用 CLI 时遵循 Agent 自身的命令执行授权机制，当目标、覆盖范围或端口暴露范围不明确时应先向用户确认。

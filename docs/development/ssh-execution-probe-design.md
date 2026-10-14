@@ -26,8 +26,8 @@
 
 | 纳入范围 | 不包含的承诺 |
 | :--- | :--- |
-| 自动识别 SSH 服务端的外层启动方言（`posix`、`cmd`、`powershell`） | 仅凭 SSH Banner、`$SHELL` 或单次 `uname` 猜测全部环境能力 |
-| 自动枚举目标节点已安装的可用解释器（`bash`、`sh`、`powershell`、`pwsh`、`cmd`） | 任意跨平台命令自动语法转译（如将 POSIX 管道自动翻译为 PowerShell） |
+| 自动识别 SSH 服务端的外层启动方言（`posix`、`fish`、`cmd`、`powershell`） | 仅凭 SSH Banner、`$SHELL` 或单次 `uname` 猜测全部环境能力 |
+| 自动枚举目标节点已安装的可用解释器（`bash`、`sh`、`zsh`、`fish`、`powershell`、`pwsh`、`cmd`） | 任意跨平台命令自动语法转译（如将 POSIX 管道自动翻译为 PowerShell） |
 | 首次录入节点时自动执行探针并原子持久化至 Schema V2 配置 | 在用户命令执行失败后自动更换解释器重试 |
 | 提供连接级内存缓存与受控的运行时按需懒加载机制 | 探针执行无视网络超时无限阻塞 |
 | 探针全流程只读、无副作用、抗 MOTD/Banner 噪声干扰 | 允许探针在远端创建临时文件或遗留孤儿进程 |
@@ -92,18 +92,18 @@ SSH `exec` 的输入为裸字符串，远端使用默认登录 Shell 解析。�
 [建立已认证连接]
       │
       ▼
-┌──────────────────────────────────────────────┐
-│ 阶段 1: 外层启动方言 (LaunchDialect) 判定    │
-│ 目标: 确定服务端默认命令解释器规范            │
-│ 结果集: posix | cmd | powershell | unknown   │
-└──────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────┐
+│ 阶段 1: 外层启动方言 (LaunchDialect) 判定          │
+│ 目标: 确定服务端默认命令解释器规范                  │
+│ 结果集: posix | fish | cmd | powershell | unknown │
+└────────────────────────────────────────────────────┘
       │
       ▼ (在已知的外层语法保护下构造内层指令)
-┌──────────────────────────────────────────────┐
-│ 阶段 2: 内层可用解释器 (Interpreters) 枚举    │
-│ 目标: 检索系统环境内可调用的执行器            │
-│ 候选集: bash, sh, powershell, pwsh, cmd      │
-└──────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────┐
+│ 阶段 2: 内层可用解释器 (Interpreters) 枚举          │
+│ 目标: 检索系统环境内可调用的执行器                  │
+│ 候选集: bash, sh, zsh, fish, powershell, pwsh, cmd │
+└────────────────────────────────────────────────────┘
       │
       ▼
 [推荐矩阵计算 -> 输出 ProbeResult]
@@ -127,21 +127,27 @@ SSH `exec` 的输入为裸字符串，远端使用默认登录 Shell 解析。�
    - **Windows cmd.exe**：`if/then` 语法不兼容，不接受为有效 POSIX 特征帧。
    - **PowerShell（含 Linux 上的 Core）**：`if :; then ...; fi` 语法不兼容，报错退出。不能仅使用 `printf`、`$()` 或 `||` 判断 POSIX，PowerShell 7 也能解析或调用这些结构。
 
-2. **Windows CMD 备选探针**：
+2. **Fish 备选探针**：
+   ```fish
+   if set -q FISH_VERSION; printf '__XOPS_DIALECT_FISH__:%s\n' "$FISH_VERSION"; printf '__XOPS_FISH_OS__:%s\n' (uname -s); printf '__XOPS_FISH_SHELL__:%s\n' "$SHELL"; end
+   ```
+   - **Fish DefaultShell**：`set -q FISH_VERSION` 成立并输出 `__XOPS_DIALECT_FISH__:<Version>` 及 OS/Shell 元数据帧，退出码为 0。确认为 `LaunchFish`。
+
+3. **Windows CMD 备选探针**：
    ```cmd
    echo __XOPS_DIALECT_CMD__:%COMSPEC%
    ```
    - **Windows cmd.exe**：输出 `__XOPS_DIALECT_CMD__:C:\Windows\system32\cmd.exe`，退出码为 0。确认为 `LaunchCmd`。
    - **POSIX / PowerShell 环境**：输出中的 `%COMSPEC%` 未展开，不接受为有效特征帧。探测必须由外层 Shell 自身展开变量，不能通过调用内层 `cmd.exe` 判断外层方言。
 
-3. **Windows PowerShell 备选探针**：
+4. **Windows PowerShell 备选探针**：
    ```powershell
    Write-Output ('__XOPS_DIALECT_POWERSHELL__:' + $PSVersionTable.PSVersion.ToString()); Write-Output ('__XOPS_PLATFORM__:' + [Environment]::OSVersion.Platform)
    ```
    - **PowerShell DefaultShell**：输出 `__XOPS_DIALECT_POWERSHELL__:<Version>`，退出码为 0。确认为 `LaunchPowerShell`。
    - **平台元数据**：`__XOPS_PLATFORM__:Win32NT` 明确标识 Windows；`Unix` 保留为 Unix 平台。不凭语言版本猜测操作系统。
 
-4. **安全兜底**：
+5. **安全兜底**：
    若上述探针均在有界超时内未收到有效特征帧，结果标记为 `LaunchUnknown`。
 
 ---
@@ -150,22 +156,24 @@ SSH `exec` 的输入为裸字符串，远端使用默认登录 Shell 解析。�
 
 外层方言确立后，后续命令严格使用目标方言对应的转义与载荷生成机制，杜绝语法混淆。
 
-三种方言统一使用逐行响应协议：每个可用解释器输出一行 `__XOPS_INTERP__:<name>`，最后输出
-`__XOPS_INTERP_END__`。`<name>` 仅允许 `bash`、`sh`、`powershell`、`pwsh`、`cmd`，不接受逗号列表
+四种方言统一使用逐行响应协议：每个可用解释器输出一行 `__XOPS_INTERP__:<name>`，最后输出
+`__XOPS_INTERP_END__`。`<name>` 仅允许 `bash`、`sh`、`zsh`、`fish`、`powershell`、`pwsh`、`cmd`，不接受逗号列表
 或布尔键值格式。解析器忽略普通噪声行与 CRLF 差异，拒绝非法解释器、重复帧、结束帧之后的
 解释器帧及缺失结束帧；非零退出或截断输出也视为枚举失败。
 
-#### 3.2.1 当 `LaunchDialect == LaunchPOSIX`
-通过 `sh -c` 执行单条无外部依赖的只读脚本（1 次 RTT）：
+#### 3.2.1 当 `LaunchDialect == LaunchPOSIX` 或 `LaunchFish`
+`LaunchPOSIX` 执行单条无外部依赖的只读脚本（1 次 RTT）：
 ```sh
-sh -c '
-for i in bash sh powershell pwsh cmd; do
+for i in bash sh zsh fish powershell pwsh cmd; do
     if command -v "$i" >/dev/null 2>&1; then
-        printf "__XOPS_INTERP__:%s\n" "$i"
+        printf '__XOPS_INTERP__:%s\n' "$i"
     fi
 done
-printf "__XOPS_INTERP_END__\n"
-'
+printf '__XOPS_INTERP_END__\n'
+```
+`LaunchFish` 使用原生 fish 循环与 `command -q` 枚举：
+```fish
+for i in bash sh zsh fish powershell pwsh cmd; if command -q $i; printf '__XOPS_INTERP__:%s\n' $i; end; end; printf '__XOPS_INTERP_END__\n'
 ```
 
 标准 Linux（安装 bash/sh）的输出示例，对应 `[bash, sh]`：
@@ -195,24 +203,32 @@ __XOPS_INTERP_END__
 #### 3.2.2 当 `LaunchDialect == LaunchCmd`
 利用 `cmdCommandPayload` 构建带有脱字符 `^` 转义保护的指令：
 ```bat
-cmd.exe /d /s /c "where bash.exe >nul 2>&1 && (echo __XOPS_INTERP__:bash) & where sh.exe >nul 2>&1 && (echo __XOPS_INTERP__:sh) & where powershell.exe >nul 2>&1 && (echo __XOPS_INTERP__:powershell) & where pwsh.exe >nul 2>&1 && (echo __XOPS_INTERP__:pwsh) & (echo __XOPS_INTERP__:cmd) & (echo __XOPS_INTERP_END__) & exit /b 0"
+cmd.exe /d /s /c "where bash.exe >nul 2>&1 && (echo __XOPS_INTERP__:bash) & where sh.exe >nul 2>&1 && (echo __XOPS_INTERP__:sh) & where zsh.exe >nul 2>&1 && (echo __XOPS_INTERP__:zsh) & where fish.exe >nul 2>&1 && (echo __XOPS_INTERP__:fish) & where powershell.exe >nul 2>&1 && (echo __XOPS_INTERP__:powershell) & where pwsh.exe >nul 2>&1 && (echo __XOPS_INTERP__:pwsh) & (echo __XOPS_INTERP__:cmd) & (echo __XOPS_INTERP_END__) & exit /b 0"
 ```
 - **输出解析**：
   - `__XOPS_INTERP__:cmd` 必然存在；
-  - 根据 `__XOPS_INTERP__:bash` / `sh` / `powershell` / `pwsh` 标记对应解释器可用；
+  - 根据 `__XOPS_INTERP__:bash` / `sh` / `zsh` / `fish` / `powershell` / `pwsh` 标记对应解释器可用；
   - 完整输出结束帧后显式以 0 退出，可选解释器缺失不应导致整次枚举失败。
 
 #### 3.2.3 当 `LaunchDialect == LaunchPowerShell`
 直接由已识别的外层 PowerShell 执行静态查询，不调用 `powershellCommandPayload`，也不要求
-安装 `powershell.exe`，从而支持仅安装 pwsh 的 DefaultShell：
+安装 `powershell.exe`（在 `try/finally` 中临时禁用模块自动加载 `$global:PSModuleAutoLoadingPreference = 'None'` 并使用 `[Console]::WriteLine`），从而支持仅安装 pwsh 的 DefaultShell：
 
 ```powershell
-foreach ($i in @('bash','sh','powershell','pwsh','cmd')) {
-    if (Get-Command $i -CommandType Application -ErrorAction SilentlyContinue) {
-        Write-Output ('__XOPS_INTERP__:' + $i)
+& {
+    $previous = $global:PSModuleAutoLoadingPreference
+    try {
+        $global:PSModuleAutoLoadingPreference = 'None'
+        foreach ($i in @('bash','sh','zsh','fish','powershell','pwsh','cmd')) {
+            if (Get-Command $i -CommandType Application -ListImported -ErrorAction SilentlyContinue) {
+                [Console]::WriteLine('__XOPS_INTERP__:' + $i)
+            }
+        }
+        [Console]::WriteLine('__XOPS_INTERP_END__')
+    } finally {
+        $global:PSModuleAutoLoadingPreference = $previous
     }
 }
-Write-Output '__XOPS_INTERP_END__'
 ```
 
 仅安装 PowerShell Core 的输出示例，对应 `[pwsh]`：
@@ -299,7 +315,7 @@ nodes:
 探测流程必须严格遵循 `AGENTS.md` 中的红线要求：
 
 1. **绝对禁止资源泄漏 (Zero Resource Leak)**：
-   - 所有探针创建的 `ssh.Session` 必须使用 `defer c.closeSessionBounded(session)` 在有界宽限期内关闭；
+   - 所有探针命令复用 `PlanCommand` + `c.ExecuteCommand(ctx, plan)` 的有界通道关闭与工作协程汇合机制（旧会话辅助路径使用 `defer c.closeSessionBounded(session)`）；
    - 严禁启动任何无取消信号退出保障的后台 Goroutine。
 
 2. **严格的超时与取消控制 (Strict Timeouts)**：

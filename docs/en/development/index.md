@@ -25,9 +25,14 @@ Historical implementation records describe validation at the time; they do not i
 
 Each document states its implementation status and validation scope.
 
+- [Architecture and governance map](./governance/architecture-map.md)
 - [SSH execution and interpreter compatibility](./ssh-execution-compatibility.md)
 - [SSH execution compatibility implementation plan](./ssh-execution-implementation.md)
+- [SSH interpreter and launch dialect automated probing design](./ssh-execution-probe-design.md)
+- [SSH execution probing implementation record (M1–M4)](./ssh-execution-probe-implementation.md)
 - [Shared core and MCP interface decoupling](./shared-core-decoupling)
+- [MCP Streamable HTTP and file streaming design](./mcp-http-transfer-design.md)
+- [Offline credential store compatibility](./compatibility.md)
 - [Zero-configuration credential design](./credential-experience-design)
 - [Credential experience implementation plan](./credential-experience-plan)
 - [Release-note draft](./credential-experience-release)

@@ -1,31 +1,33 @@
 # Credential migration
 
-Run `xops credential migrate --help` to see the migration options available in your installed version.
+Use `xops credential migrate` to upgrade legacy Schema v1 configurations to Schema v2, or to move credentials between Schema v2 storage backends. Run `xops credential migrate --help` to see all options in your installed build.
 
-## Compatibility ended: migrate legacy configuration explicitly
+## Scenario 1: Upgrading a legacy (Schema v1) configuration
 
-v0.12.0 and v0.13.0 were the two Schema v1 compatibility releases; that period has ended. Ordinary CLI, TUI, MCP, Playbook, and read-only configuration loading now accept only Schema v2. Legacy files without `schema_version` are also rejected as v1, with explicit migration guidance. Help and version commands remain configuration-independent; `credential migrate` and `credential finalize-migration` remain available.
-
-Normal startup no longer automatically migrates, decrypts, or encrypts legacy credentials and never reads or creates the old `secret.key`. Rejection preserves the source configuration and key. Do not merely change `schema_version` to 2: v2 rejects plaintext and `ENC:` credential fields. The migrator must store secrets in a credential backend and create references.
-
-Back up the old configuration and existing `secret.key`, then migrate explicitly to a configured writable destination. When backend configuration is absent, the migrator supplies the default offline `file` configuration; for an existing custom setup, ensure the destination is declared. Restore the original key from backup if encrypted legacy credentials have lost it; the migrator never generates a replacement legacy key:
+The automatic Schema v1 compatibility window (v0.12.0 and v0.13.0) has ended. CLI, TUI, MCP, and Playbook commands now accept only Schema v2 (files missing `schema_version` are also rejected as v1 with instructions to run `credential migrate`):
+- **Do not edit `schema_version` by hand**: Simply changing `schema_version` to `2` in YAML will fail because Schema v2 rejects plaintext and `ENC:` fields—the migrator must move secrets into a credential store and replace them with references.
+- **Back up first**: Back up your old configuration file and `secret.key` before migrating (if your v1 config has `ENC:` fields and `secret.key` is missing, restore `secret.key` from backup first; the migrator never generates a replacement legacy key).
 
 ```bash
+# 1. Preview the migration plan (read-only; writes no files, credentials, or keys)
 xops credential migrate --dry-run --to file
+
+# 2. Run the migration (automatically adds the default offline 'file' store if no stores are configured yet)
 xops credential migrate --to file
-```
 
-After validating SSH, SFTP, exec, escalation, and automation, explicitly remove the v1 configuration backup and legacy keys:
-
-```bash
+# 3. After verifying SSH, SFTP, exec, sudo/su, and Playbooks, clean up v1 backups and secret.key
 xops credential finalize-migration
 ```
 
-This command only cleans v1 legacy material. It does not delete credentials from any backend or remove v2 backend migration backups.
+`finalize-migration` **only removes v1 legacy configuration backups and `secret.key`**; it never deletes credentials from any storage backend or removes v2 backend-migration backups.
 
-## Move from offline storage to another backend
+## Scenario 2: Moving between Schema v2 backends
 
-Add a destination to `credential.stores` in your existing configuration, preserving existing fields, stores, and references. For example, after adding `system`, the relevant section could be:
+### 1. From the offline store to the system keyring or another backend
+
+Changing `default_store` in YAML alone does not move existing credentials. To move credentials from the default `file` vault to `system`, `pass`, or `helper`:
+
+**Step 1**: Add the destination backend under `credential.stores` in `~/.xops/xops_config.yaml` while keeping the existing `file` store entry and all current references intact:
 
 ```yaml
 credential:
@@ -41,7 +43,9 @@ credential:
       type: system
 ```
 
-`system` requires an accessible, unlocked system credential store. Linux also requires `secret-tool`, a user D-Bus session, and Secret Service; installing the command alone does not make the service available. You can also target `pass` or `helper`; see [credential storage](./credentials) and the [configuration example](https://github.com/wentf9/xops-cli/blob/master/xops_config.example.yaml) for configuration and dependencies.
+> The `system` backend requires an accessible, unlocked OS keyring (on Linux, `secret-tool`, an active user D-Bus session, and Secret Service are required). See [credential storage](./credentials) and [`xops_config.example.yaml`](https://github.com/wentf9/xops-cli/blob/master/xops_config.example.yaml) for `pass` and `helper` settings.
+
+**Step 2**: Check store health and run the migration:
 
 ```bash
 xops credential doctor
@@ -49,33 +53,30 @@ xops credential migrate --dry-run --to system
 xops credential migrate --to system
 ```
 
-Migration covers all login password, private-key passphrase, and privilege password references in the current configuration that are outside the destination. Shared references are copied once; references already in the destination remain unchanged. After writing and verifying reads, migration checks for configuration conflicts and switches all references and `default_store` together. It preserves `remember_prompted`. Changing `default_store` alone does not move existing credentials. Historical items without current configuration references are not migrated.
+- **Scope and atomic switch**: Migration copies all login password, private-key passphrase, and privilege password references used in the active configuration that are not yet in the destination (shared references are copied once; items already in the destination and unreferenced historical items are untouched). After writing and verifying read-backs, XOps checks for concurrent config edits and switches all references and `default_store` together (preserving `remember_prompted`).
+- **What `--dry-run` checks**: Validates the migration plan and source reads without writing files, credentials, or keys and without testing destination write access. If a destination backend cannot preserve source credential expiry metadata, read-back verification aborts the switch.
 
-`--dry-run` writes no files, credentials, or keys. It checks the plan and read paths, not write authorization. An absent offline destination can pass planning; actual initialization occurs during migration writes. If a destination cannot preserve source credential expiry metadata, read-back verification rejects the switch.
+### 2. Moving back to the offline store
 
-## Return to offline storage
-
-Keep the original `file` configuration, vault, and key, then run:
+Keep your `file` store configuration and key settings in place, then run:
 
 ```bash
 xops credential migrate --dry-run --to file
 xops credential migrate --to file
 ```
 
-An existing key-file is reused. Key generation is allowed only for a confirmed new vault. If an existing vault has lost its key or has an unfinished vault transaction, first follow the [offline recovery guide](./offline-store#backup-and-recovery).
+An existing `credentials.key` is reused automatically; a new key is generated only for a confirmed brand-new vault. If an existing vault has lost its key or has an unfinished transaction, follow the [offline recovery guide](./offline-store#backup-and-recovery) first.
 
-## Interruptions, conflicts, and retained material
+## Resuming after interruptions, conflicts, and retained backups
 
-After interruption, fix backend access and rerun the same command. Migration reuses recorded destination references and checks existing contents. Write failures and uncertain durability never delete source credentials. If configuration switched before verification completed, rerunning verifies it again and confirms configuration durability.
-
-Concurrent configuration edits cause a conflict and preserve the current configuration. After confirming that the current configuration is the version to keep, explicitly start a new plan:
+- **Rerun the same command after an interruption**: If a migration is interrupted by a locked backend or timeout, fix backend access and **rerun the exact same command**. The migrator reuses recorded destination references and verifies already-written items; source credentials are never deleted on write errors or uncertain durability.
+- **Use `--restart` after a concurrent config edit**: If another terminal modified the configuration during migration, confirm that the current configuration is the one you want to keep and start a fresh plan with `--restart` (applies only to real v2 migrations, cannot be combined with `--dry-run`, and never rolls back config or deletes previously written credentials):
 
 ```bash
 xops credential migrate --to system --restart
 ```
 
-`--restart` applies only to actual v2 migrations and cannot accompany `--dry-run`. It archives the previous plan and allocates new destination references from the current configuration. It does not roll back configuration or delete previously written credentials. For ordinary interruptions without configuration changes, rerun the original command without `--restart`.
-
-V2 migration keeps `<config>.backend-migration.json` and `<config>.v2.<source-config-digest>.bak` beside the configuration. Subsequent migrations or restarts archive old records as `.backend-migration.json.<record-digest>.bak`. These files contain configuration metadata and references, never credential values. V1 `.migration.json`, `.v1.bak`, and `.v1.key.bak` files remain separate and are not overwritten. Resume an unverified v1 migration with its original command first; deleting legacy material is not required.
-
-Source stores and backups remain after connection validation; this command provides no automatic source cleanup. Restoring old configuration also requires its source stores and keys, so backing up reference configuration alone is insufficient. Before manually deleting historical credentials, check references in other configurations and backups, then use the backend's management tools. `finalize-migration` is not a general backend cleanup command.
+- **Migration records and backups**:
+  - V2 backend migrations save `<config>.backend-migration.json` and `<config>.v2.<source-config-digest>.bak` beside your configuration file (archived as `.backend-migration.json.<record-digest>.bak` on subsequent migrations or restarts). These files contain only metadata and references—never secret values.
+  - V1 `.migration.json`, `.v1.bak`, and `.v1.key.bak` files are kept separately and never overwritten by v2 migrations.
+  - **Source stores are preserved**: V2 migrations keep source store items and backups intact after switching; before manually deleting historical items from an old backend, verify that no other configurations or backups still reference them.
