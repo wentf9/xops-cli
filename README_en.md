@@ -37,8 +37,15 @@ Tired of stitching together half a dozen tools just to manage remote servers?
 
 ```bash
 # 1. Install prebuilt binary (Linux / macOS)
-curl -sSL https://raw.githubusercontent.com/wentf9/xops-cli/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/wentf9/xops-cli/master/install.sh | bash
+```
 
+```powershell
+# Install on Windows from PowerShell 5.1+ (x64 / ARM64, no administrator privileges required)
+irm https://raw.githubusercontent.com/wentf9/xops-cli/master/install.ps1 | iex
+```
+
+```bash
 # 2. Import your existing ~/.ssh/config (local read only, no remote connections, never overwrites existing nodes)
 xops init
 

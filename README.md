@@ -37,8 +37,13 @@
 
 ```bash
 # 1. 一键安装（Linux / macOS）
-curl -sSL https://raw.githubusercontent.com/wentf9/xops-cli/master/install.sh | bash
-
+curl -fsSL https://raw.githubusercontent.com/wentf9/xops-cli/master/install.sh | bash
+```
+```powershell
+# Windows 在 PowerShell 5.1+ 中安装（支持 x64 / ARM64，无需管理员权限）：
+irm https://raw.githubusercontent.com/wentf9/xops-cli/master/install.ps1 | iex
+```
+```bash
 # 2. 导入现有的 ~/.ssh/config（纯本地读取，不连远端，不覆盖已有节点）
 xops init
 

@@ -6,6 +6,27 @@ Download the binary for your OS and architecture from [GitHub Releases](https://
 - **Linux / macOS**: Place `xops` in a directory on your `PATH` (such as `/usr/local/bin`).
 - **Windows**: Add the folder containing `xops.exe` to `PATH`, or run `./xops.exe` directly in PowerShell.
 
+Install on Linux / macOS with Bash (amd64 / arm64, no administrator privileges required):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/wentf9/xops-cli/master/install.sh | bash
+
+# Specify the installation directory
+curl -fsSL https://raw.githubusercontent.com/wentf9/xops-cli/master/install.sh | bash -s -- --install-dir "$HOME/tools/xops"
+```
+
+On Windows, install the latest release from PowerShell 5.1+ (x64 / ARM64, no administrator privileges required):
+
+```powershell
+irm https://raw.githubusercontent.com/wentf9/xops-cli/master/install.ps1 | iex
+
+# To customize the directory, download the script and pass a parameter:
+Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/wentf9/xops-cli/master/install.ps1 -OutFile install.ps1
+.\install.ps1 -InstallDir "$HOME\tools\xops"
+```
+
+The scripts detect the system architecture, install to `%LOCALAPPDATA%\Programs\xops\xops.exe` on Windows or `$HOME/.local/bin/xops` on Linux / macOS, and configure PATH. Restart other open terminals before running `xops` there. Running the installer again updates the binary; if XOps is running, close it before retrying.
+
 To build from source (**Go 1.26+** required; the Makefile supports Linux, macOS, and Windows CMD / PowerShell / Git Bash):
 
 ```bash

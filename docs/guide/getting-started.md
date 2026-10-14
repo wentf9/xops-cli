@@ -6,6 +6,27 @@
 - **Linux / macOS**：将 `xops` 放入 `PATH` 目录（如 `/usr/local/bin`）。
 - **Windows**：将 `xops.exe` 所在目录加入 `PATH`，或在 PowerShell 中直接运行 `./xops.exe`。
 
+Linux / macOS 可通过 Bash 一键安装（amd64 / arm64，无需管理员权限）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/wentf9/xops-cli/master/install.sh | bash
+
+# 指定安装目录
+curl -fsSL https://raw.githubusercontent.com/wentf9/xops-cli/master/install.sh | bash -s -- --install-dir "$HOME/tools/xops"
+```
+
+Windows 也可在 PowerShell 5.1+ 中一键安装最新发布版（x64 / ARM64，无需管理员权限）：
+
+```powershell
+irm https://raw.githubusercontent.com/wentf9/xops-cli/master/install.ps1 | iex
+
+# 需要自定义目录时，下载脚本后传参执行：
+Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/wentf9/xops-cli/master/install.ps1 -OutFile install.ps1
+.\install.ps1 -InstallDir "$HOME\tools\xops"
+```
+
+脚本自动识别系统架构，将程序安装到 `%LOCALAPPDATA%\Programs\xops\xops.exe` / `$HOME/.local/bin/xops`，并将目录加入用户及当前 shell 的 PATH。其他已打开的终端需要重启后才能直接运行 `xops`。重复安装会更新程序；若程序正在运行，请先关闭再重试。
+
 也可以从源码编译（需要 **Go 1.26+**，Makefile 原生支持 Linux、macOS 与 Windows CMD / PowerShell / Git Bash）：
 
 ```bash
