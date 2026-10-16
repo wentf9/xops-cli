@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/wentf9/xops-cli/cmd"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"golang.org/x/sys/unix"
 )
 
@@ -18,10 +19,14 @@ import (
 // Aliased full standard streams must not block reporting or a nonzero exit.
 func TestReportErrorFullPipeExit(t *testing.T) {
 	if stream := os.Getenv("XOPS_TEST_FAILED_SCP_OUTPUT"); stream != "" {
-		reportError(errors.Join(errors.New("transfer failed"), &cmd.SCPOutputError{Stream: stream, Err: context.DeadlineExceeded}))
+		var outputErr error = &cmd.SCPOutputError{Stream: stream, Err: context.DeadlineExceeded}
+		if stream == "command" {
+			outputErr = &ssh.OutputError{Target: os.Stderr, Err: context.DeadlineExceeded}
+		}
+		reportError(errors.Join(errors.New("operation failed"), outputErr))
 		os.Exit(1)
 	}
-	for _, stream := range []string{"stderr", "stdout"} {
+	for _, stream := range []string{"stderr", "stdout", "command"} {
 		t.Run(stream, func(t *testing.T) {
 			reader, writer, err := os.Pipe()
 			if err != nil {

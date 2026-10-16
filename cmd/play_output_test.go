@@ -41,7 +41,7 @@ func TestPlayOptionsPrintDryRunReturnsOutputError(t *testing.T) {
 	wantErr := errors.New("output unavailable")
 	o := &PlayOptions{Out: playErrorWriter{err: wantErr}}
 
-	if err := o.printDryRun(&playbook.Playbook{}); !errors.Is(err, wantErr) {
+	if err := o.printDryRun(t.Context(), &playbook.Playbook{}); !errors.Is(err, wantErr) {
 		t.Fatalf("printDryRun error = %v, want wrapped output error", err)
 	}
 }

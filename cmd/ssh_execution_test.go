@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"context"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -168,12 +167,6 @@ func TestSSHExplicitExecutionOptions(t *testing.T) {
 				t.Fatal(err)
 			}
 			err := o.Validate()
-			if runtime.GOOS != "linux" && (o.execution.enabled() || o.execution.noLoginSet) {
-				if err == nil || !strings.Contains(err.Error(), "cancelable native output is only available on Linux") {
-					t.Fatalf("error %v, want platform guard error on %s", err, runtime.GOOS)
-				}
-				return
-			}
 			if test.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
 					t.Fatalf("error %v, want substring %q", err, test.wantErr)
@@ -200,9 +193,6 @@ func TestSSHExplicitExecutionOptions(t *testing.T) {
 }
 
 func TestSSHExplicitPipedStdinRouting(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("explicit execution is currently available on Linux only")
-	}
 	// Server mode with piped stdin -> accepted, no plan (handled by RunShellWithoutPTY)
 	o := NewSshOptions()
 	cmd := newCmdSshWithOptions(o)

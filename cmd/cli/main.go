@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -35,12 +34,11 @@ func main() {
 	}
 }
 
-// Standard streams can share a sink, so failed auxiliary output must not be
+// Standard streams can share a sink, so failed standard-stream output must not be
 // reported to them again, even when the original failure was on stdout.
 // Preserve the nonzero exit status and leave all other error reporting intact.
 func reportError(err error) {
-	var outputErr *cmd.SCPOutputError
-	if !errors.As(err, &outputErr) {
+	if !cmd.HasStandardOutputError(err) {
 		logger.PrintError(err.Error())
 	}
 }

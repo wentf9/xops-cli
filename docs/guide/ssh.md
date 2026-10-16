@@ -24,11 +24,11 @@ xops ssh -J bastion.example.com deploy@192.0.2.10
 xops ssh web-01 uptime
 xops ssh --host web-01 --interpreter server uname -a
 
-# 显式指定解释器与登录环境（当前 xops ssh 显式执行参数仅在 Linux 客户端开放）
+# 显式指定解释器与登录环境（需具备可取消输出和受支持的本地输入）
 xops ssh --host linux-01 --interpreter bash --launch-dialect posix --login-shell=false id
 ```
 
-- **解释器选择**：支持 `--interpreter server`（默认，原生透传）、`bash`、`sh`、`zsh`、`fish`、`powershell`、`pwsh` 及 `cmd`（注：`xops ssh` 的命令行显式执行参数依赖本地可取消原生输出句柄，当前仅在 Linux 客户端支持；Windows / macOS 客户端可通过[节点配置](./hosts#节点执行环境配置-execution)或改用 `xops exec`）。
+- **解释器选择**：支持 `--interpreter server`（默认，原生透传）、`bash`、`sh`、`zsh`、`fish`、`powershell`、`pwsh` 及 `cmd`（注：`xops ssh` 的命令行显式执行参数按实际本地 I/O 能力检查：支持 Linux 终端/管道、macOS 终端/已有非阻塞管道等输出；Windows 控制台输出仍不支持，文件 stdin 需宿主提供输入桥；Windows 客户端也可用 `xops exec` 的缓冲命令入口）。
 - **登录环境控制**：使用 `bash`、`zsh` 或 `fish` 时可通过 `--login-shell` 控制是否加载登录环境；`--no-login` 为 Bash 兼容参数（等效于非登录 `bash -c`）；`server` 模式不接受登录选项。
 - **输入流与 Shell 路由**：
   - **终端无命令**：标准输入为终端且未传命令时，打开交互式 PTY 登录 Shell。

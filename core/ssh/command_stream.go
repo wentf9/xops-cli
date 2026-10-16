@@ -27,7 +27,7 @@ func (c *Client) RunCommandPlanWithIO(ctx context.Context, plan CommandPlan, std
 	if plan.input != "" {
 		return fmt.Errorf("streaming command plan must not include finite input")
 	}
-	if err := validateCommandStdin(stdin); err != nil {
+	if err := validateCommandStdin(stdin, c.environment.InputBridge); err != nil {
 		return err
 	}
 	work, cancel := context.WithTimeout(ctx, plan.timeout)
@@ -55,7 +55,7 @@ func (c *Client) RunShellWithoutPTY(ctx context.Context, stdin io.Reader, stdout
 	if c == nil || c.sshClient == nil {
 		return fmt.Errorf("SSH client is not connected")
 	}
-	if err := validateCommandStdin(stdin); err != nil {
+	if err := validateCommandStdin(stdin, c.environment.InputBridge); err != nil {
 		return err
 	}
 	work, cancel := context.WithCancel(ctx)
@@ -81,7 +81,7 @@ func (c *Client) RunShellWithIO(ctx context.Context, stdin io.Reader, stdout, st
 	if c == nil || c.sshClient == nil {
 		return fmt.Errorf("SSH client is not connected")
 	}
-	if err := validateCommandStdin(stdin); err != nil {
+	if err := validateCommandStdin(stdin, c.environment.InputBridge); err != nil {
 		return err
 	}
 	work, cancel := context.WithCancel(ctx)

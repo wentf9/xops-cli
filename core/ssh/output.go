@@ -2,10 +2,12 @@ package ssh
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"sync"
+	"time"
 )
 
 // OutputMode 定义远程命令输出的收集策略。
@@ -222,4 +224,34 @@ func (lw *LockedWriter) Write(p []byte) (n int, err error) {
 	lw.mu.Lock()
 	defer lw.mu.Unlock()
 	return lw.w.Write(p)
+}
+
+// lockedOutputBinding retains the caller's serialization while exposing only
+// the sink already bound by BindOutput. It owns no goroutine or borrowed stream.
+type lockedOutputBinding struct {
+	ctx    context.Context
+	locked *LockedWriter
+	bound  io.Writer
+}
+
+func (w lockedOutputBinding) Write(p []byte) (int, error) {
+	if err := w.ctx.Err(); err != nil {
+		return 0, &OutputError{Target: w.locked, Err: err}
+	}
+	if !w.locked.mu.TryLock() {
+		tick := time.NewTicker(time.Millisecond)
+		defer tick.Stop()
+		for !w.locked.mu.TryLock() {
+			select {
+			case <-w.ctx.Done():
+				return 0, &OutputError{Target: w.locked, Err: w.ctx.Err()}
+			case <-tick.C:
+			}
+		}
+	}
+	defer w.locked.mu.Unlock()
+	if err := w.ctx.Err(); err != nil {
+		return 0, &OutputError{Target: w.locked, Err: err}
+	}
+	return w.bound.Write(p)
 }

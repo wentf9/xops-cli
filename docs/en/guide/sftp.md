@@ -55,7 +55,7 @@ xops scp --tag web --src ./config.conf --dest /etc/app/
     - `-vv`: Adds SFTP extensions, path operations, and per-file transfer results.
     - `-vvv`: Adds SFTP packet types, request IDs, lengths, and status codes.
   - Combining `-q` and `-v` follows OpenSSH flag order: `-qv` hides the progress bar while keeping SSH/SFTP diagnostics; `-vq` hides both the progress bar and SSH diagnostics, keeping only SCP transfer and SFTP init messages.
-  - On consoles or pipes that do not support cancelable writes, XOps automatically skips progress and diagnostic output so transfers never hang; redirect `stderr` to a log file (e.g., `2>scp.log`) if you want to capture diagnostics there.
+  - Windows pipes and macOS terminals/already nonblocking pipes support native cancelable output. Unsupported sinks, including Windows consoles and macOS blocking anonymous pipes, skip progress, diagnostics and upload status while transfers continue; redirect `stderr` to a log file (e.g., `2>scp.log`) if you want to capture diagnostics there.
 
 ```bash
 # Quiet mode (no progress bar)

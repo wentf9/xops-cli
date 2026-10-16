@@ -103,7 +103,7 @@ func (o *ExecOptions) executePlannedTask(ctx context.Context, connector *ssh.Con
 	}
 	result := client.ExecuteCommand(ctx, *o.commandPlan)
 	execErr := result.Err()
-	printErr := o.printTaskResult(task, result.Output, execErr, stdoutMu)
+	printErr := o.printTaskResult(ctx, task, result.Output, execErr, stdoutMu)
 	if execErr != nil {
 		return errors.Join(fmt.Errorf("[%s] command outcome=%s phase=%s: %w", task.host, result.Outcome, result.Phase, execErr), printErr)
 	}

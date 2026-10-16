@@ -128,7 +128,7 @@ func TestValidateCommandStdin_RejectsTypedNil(t *testing.T) {
 	)
 
 	for _, stdin := range []io.Reader{fileReader, bufferReader, bytesReader, stringsReader} {
-		if err := validateCommandStdin(stdin); err == nil {
+		if err := validateCommandStdin(stdin, nil); err == nil {
 			t.Fatalf("validateCommandStdin(%T) returned nil error", stdin)
 		}
 	}
@@ -255,10 +255,25 @@ func startHangingSSHServer(t *testing.T, serverWg *sync.WaitGroup) (net.Listener
 
 // TestRunCommandWithIO_SuCancellation 验证 SudoModeSu 在 context 取消时能够快速返回，不破坏原始 os.File 且没有残留 goroutine
 func TestRunCommandWithIO_SuCancellation(t *testing.T) {
+	baseline := goleak.IgnoreCurrent()
 	var serverWg sync.WaitGroup
 	listener, rawClient, clientConn := startHangingSSHServer(t, &serverWg)
+	t.Cleanup(func() {
+		_ = rawClient.Close()
+		_ = listener.Close()
+		_ = clientConn.Close()
+		serverWg.Wait()
+		goleak.VerifyNone(t, baseline)
+	})
 
 	cli := newClient(rawClient, clientConn, &ClientConfig{SudoMode: SudoModeSu, SuPwd: "pass"}, nil, "test-node")
+
+	// Cancellation occurs while waiting for privilege authentication, before
+	// stdin starts. Still supply the host capability required by Windows
+	// preflight. This existing fake joins immediately once canceled.
+	bridge := &delayedInputBridge{waiting: make(chan context.Context, 1), stopping: make(chan struct{}), release: make(chan struct{}), reaped: make(chan struct{})}
+	close(bridge.release)
+	cli.environment.InputBridge = bridge
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -295,22 +310,29 @@ func TestRunCommandWithIO_SuCancellation(t *testing.T) {
 	if _, err := r.Read(buf); err != nil || string(buf) != "probe" {
 		t.Fatalf("read from pipe after cancellation failed: %v, got %q", err, string(buf))
 	}
-
-	// 显式关闭测试服务器与连接，确保退出
-	_ = rawClient.Close()
-	_ = listener.Close()
-	_ = clientConn.Close()
-	serverWg.Wait()
-
-	goleak.VerifyNone(t, goleak.IgnoreCurrent())
 }
 
 // TestRunCommandWithIO_SudoCancellation 验证 SudoModeSudo 在 context 取消时能够快速返回且保留原始 os.File
 func TestRunCommandWithIO_SudoCancellation(t *testing.T) {
+	baseline := goleak.IgnoreCurrent()
 	var serverWg sync.WaitGroup
 	listener, rawClient, clientConn := startHangingSSHServer(t, &serverWg)
+	t.Cleanup(func() {
+		_ = rawClient.Close()
+		_ = listener.Close()
+		_ = clientConn.Close()
+		serverWg.Wait()
+		goleak.VerifyNone(t, baseline)
+	})
 
 	cli := newClient(rawClient, clientConn, &ClientConfig{SudoMode: SudoModeSudo, Password: "pass"}, nil, "test-node")
+
+	// Cancellation occurs while waiting for privilege authentication, before
+	// stdin starts. Still supply the host capability required by Windows
+	// preflight. This existing fake joins immediately once canceled.
+	bridge := &delayedInputBridge{waiting: make(chan context.Context, 1), stopping: make(chan struct{}), release: make(chan struct{}), reaped: make(chan struct{})}
+	close(bridge.release)
+	cli.environment.InputBridge = bridge
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -347,13 +369,6 @@ func TestRunCommandWithIO_SudoCancellation(t *testing.T) {
 	if _, err := r.Read(buf); err != nil || string(buf) != "probe" {
 		t.Fatalf("read from pipe after cancellation failed: %v, got %q", err, string(buf))
 	}
-
-	_ = rawClient.Close()
-	_ = listener.Close()
-	_ = clientConn.Close()
-	serverWg.Wait()
-
-	goleak.VerifyNone(t, goleak.IgnoreCurrent())
 }
 
 func TestClient_RunCancellationJoinsSessionWait(t *testing.T) {

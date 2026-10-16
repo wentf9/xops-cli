@@ -236,7 +236,7 @@ func (c *Client) runPrivilegeOperation(ctx context.Context, mode SudoMode, comma
 	if mode != SudoModeSudo && mode != SudoModeSu && mode != SudoModeSudoer {
 		return fmt.Errorf("unsupported privilege exchange mode %q", mode)
 	}
-	if err := validateCommandStdin(stdin); err != nil {
+	if err := validateCommandStdin(stdin, c.environment.InputBridge); err != nil {
 		return err
 	}
 	var terminal *privilegeTerminal

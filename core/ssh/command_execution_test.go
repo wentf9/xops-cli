@@ -26,6 +26,7 @@ type commandFixture struct {
 	output                                                                           string
 	commands                                                                         chan string
 	inputs                                                                           chan string
+	inputBytes                                                                       int
 	attempts                                                                         atomic.Int32
 }
 
@@ -163,7 +164,7 @@ func serveCommandFixture(t *testing.T, ctx context.Context, channel cryptoSSH.Ch
 		return
 	}
 	if !scenario.terminal {
-		input, err := io.ReadAll(channel)
+		input, err := readCommandFixtureInput(channel, scenario.inputBytes)
 		if err != nil {
 			t.Log(err)
 			return
@@ -410,4 +411,15 @@ func (c *heldReadConn) Read(data []byte) (int, error) {
 		<-c.release
 	}
 	return n, err
+}
+
+// Fixed-size input lets a fixture command finish without waiting for terminal
+// EOF; zero retains the existing read-until-EOF command behavior.
+func readCommandFixtureInput(reader io.Reader, size int) ([]byte, error) {
+	if size == 0 {
+		return io.ReadAll(reader)
+	}
+	input := make([]byte, size)
+	_, err := io.ReadFull(reader, input)
+	return input, err
 }

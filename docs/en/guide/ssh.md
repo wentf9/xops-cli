@@ -24,11 +24,11 @@ In addition to interactive logins, `xops ssh` can execute a single command or st
 xops ssh web-01 uptime
 xops ssh --host web-01 --interpreter server uname -a
 
-# Run with an explicit interpreter and login mode (explicit execution flags on xops ssh currently require a Linux client)
+# Run with an explicit interpreter and login mode (requires cancelable output and supported local input)
 xops ssh --host linux-01 --interpreter bash --launch-dialect posix --login-shell=false id
 ```
 
-- **Interpreter selection**: Supports `--interpreter server` (default native passthrough), `bash`, `sh`, `zsh`, `fish`, `powershell`, `pwsh`, and `cmd` (note: CLI explicit execution flags on `xops ssh` rely on cancelable native output handles and are currently available on Linux clients; on Windows/macOS clients, configure [`execution` on the node](./hosts#node-execution-configuration-execution) or use `xops exec`).
+- **Interpreter selection**: Supports `--interpreter server` (default native passthrough), `bash`, `sh`, `zsh`, `fish`, `powershell`, `pwsh`, and `cmd` (note: CLI explicit execution flags on `xops ssh` check actual local I/O capabilities, including Linux terminal/pipe and macOS terminal/already nonblocking pipe output; Windows console output remains unsupported and file stdin requires a host input bridge; Windows clients can also use buffered `xops exec` commands).
 - **Login environment**: `bash`, `zsh`, and `fish` support `--login-shell`; `--no-login` remains a Bash compatibility flag (non-login `bash -c`); `server` mode rejects login flags.
 - **Input and shell routing**:
   - **Terminal with no command**: Opens an interactive PTY login shell.

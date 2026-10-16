@@ -5,7 +5,34 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 )
+
+// OutputError marks a failed output write. Hosts must not report it back to
+// the same possibly blocked sink. Unwrap preserves cancellation and I/O causes.
+type OutputError struct {
+	Target io.Writer // Borrowed sink identity; never closed by the error owner.
+	Err    error
+}
+
+// TargetsFile matches the original file even when serialized by LockedWriter.
+// It compares file objects, without probing handles or consulting global stdio.
+func (e *OutputError) TargetsFile(file *os.File) bool {
+	target := e.Target
+	for {
+		locked, ok := target.(*LockedWriter)
+		if !ok {
+			return target == file
+		}
+		if locked == nil {
+			return false
+		}
+		target = locked.w
+	}
+}
+
+func (e *OutputError) Error() string { return "write command output: " + e.Err.Error() }
+func (e *OutputError) Unwrap() error { return e.Err }
 
 // regularFileOutput borrows a local regular file. The kernel does not allow a
 // blocked regular-file write to be interrupted, so cancellation is checked
@@ -22,6 +49,11 @@ func (w regularFileOutput) WriteContext(ctx context.Context, data []byte) (int, 
 // isNullDevice reports the platform null device, whose writes never block but
 // which cannot register for deadlines like other character devices.
 func isNullDevice(info os.FileInfo) bool {
+	// Windows device/pipe FileInfo values may all carry zero file IDs.
+	// Its platform binding identifies NUL by kernel object name instead.
+	if runtime.GOOS == "windows" || info.Mode()&os.ModeCharDevice == 0 {
+		return false
+	}
 	null, err := os.Stat(os.DevNull)
 	return err == nil && os.SameFile(info, null)
 }
@@ -30,12 +62,14 @@ func isNullDevice(info os.FileInfo) bool {
 // not leave the SSH session waiting for a blocked write.
 //
 // ContextWriter implementations, finite memory sinks, io.Discard, the null
-// device, local regular files, and (on Linux) terminals and pipes are bound to
-// ctx. Terminals and
-// pipes use an owned non-blocking handle: the caller's file is never closed and
-// its descriptor flags are not modified. Unlike PTY output, no per-write idle
-// limit is applied, so a slow consumer such as a pager is not treated as a
-// failure; only ctx cancellation or its deadline interrupts a stalled write.
+// device, local regular files, and native terminal/pipe adapters bind to ctx.
+// Linux and macOS terminal adapters use owned nonblocking handles; macOS also
+// accepts already nonblocking pipes. Windows synchronous/overlapped pipes use
+// owned duplicate handles with thread/request-specific cancellation. The caller's
+// file is never closed and its flags or console modes are not modified. macOS
+// blocking pipes and Windows consoles remain unsupported. Unlike PTY output, no
+// per-write idle limit is applied, so a slow consumer such as a pager is not
+// treated as a failure; only ctx cancellation or its deadline interrupts a write.
 //
 // Any other writer is returned unchanged with cancelable=false: arbitrary
 // Write callbacks cannot be interrupted, and wrapping them in a goroutine would
@@ -53,10 +87,20 @@ func BindOutput(ctx context.Context, target io.Writer) (writer io.Writer, closeF
 	if nilCapability(target) {
 		return nil, noop, false, fmt.Errorf("bind command output: output is nil")
 	}
+	if locked, ok := target.(*LockedWriter); ok {
+		if locked.mu == nil {
+			return nil, noop, false, fmt.Errorf("bind command output: output mutex is nil")
+		}
+		bound, closeBound, supported, bindErr := BindOutput(ctx, locked.w)
+		if bindErr != nil || !supported {
+			return target, closeBound, supported, bindErr
+		}
+		return lockedOutputBinding{ctx, locked, bound}, closeBound, true, nil
+	}
 	if file, ok := target.(*os.File); ok {
 		info, statErr := file.Stat()
 		if statErr == nil && (info.Mode().IsRegular() || isNullDevice(info)) {
-			return contextOutput{ctx, regularFileOutput{file}}, noop, true, nil
+			return contextOutput{ctx, regularFileOutput{file}, file}, noop, true, nil
 		}
 	}
 	bound, closeBound, bindErr := prepareContextOutputWithLimit(ctx, target, 0)

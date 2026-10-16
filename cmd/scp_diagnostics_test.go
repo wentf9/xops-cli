@@ -173,8 +173,8 @@ func TestSCPDiagnosticBoundAndEscape(t *testing.T) {
 }
 
 func TestSCPDiagnosticBlockedPipe(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("cancelable file bindings currently require Linux")
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" && runtime.GOOS != "windows" {
+		t.Skip("requires native cancelable pipe output")
 	}
 	reader, writer, err := os.Pipe()
 	if err != nil {
