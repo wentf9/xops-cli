@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -291,5 +292,67 @@ func TestExecConfiguredUnixLoginDefaults(t *testing.T) {
 	}
 	if !run.LoginShell {
 		t.Fatal("legacy Bash login default changed")
+	}
+}
+
+type blockedExecOutput struct{}
+
+func (blockedExecOutput) Write([]byte) (int, error) { panic("unbound output") }
+func (blockedExecOutput) WriteContext(ctx context.Context, _ []byte) (int, error) {
+	<-ctx.Done()
+	return 0, ctx.Err()
+}
+
+func TestExecTaskLockedStreamCancellation(t *testing.T) {
+	fixtureCtx, stopFixture := context.WithTimeout(t.Context(), 5*time.Second)
+	defer stopFixture()
+	server, err := sshfixture.New(fixtureCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := server.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	address, portText, err := net.SplitHostPort(server.Address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connector := ssh.NewConnector(tunnelTestProvider{cfg: &ssh.ClientConfig{
+		NodeID: "fixture", Address: address, Port: port, User: "test", AuthType: "password", Password: sshfixture.Password,
+	}}, ssh.WithHostKeyVerifier(execFixtureVerifier{server.HostKey}))
+	defer func() {
+		if err := connector.CloseAll(); err != nil {
+			t.Error(err)
+		}
+	}()
+	o := NewExecOptions()
+	o.Stream = true
+	o.stdout = blockedExecOutput{}
+	o.stderr = &bytes.Buffer{}
+	var mu sync.Mutex
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- o.executeTask(ctx, connector, execHostTask{host: "fixture", nodeID: "fixture"}, "command", false, 1, &mu)
+	}()
+	select {
+	case err := <-done:
+		var outputErr *ssh.OutputError
+		if !errors.Is(err, context.DeadlineExceeded) || !errors.As(err, &outputErr) {
+			t.Fatalf("stream cancellation lost: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		_ = connector.CloseAll()
+		t.Fatal("locked stream did not join")
+	}
+	if server.Executed.Load() != 1 {
+		t.Fatalf("command executed %d times", server.Executed.Load())
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -401,7 +402,7 @@ func (c *Client) RunCommandWithIO(ctx context.Context, command string, sudo bool
 	if ctx == nil {
 		return fmt.Errorf("command execution context is nil")
 	}
-	if err := validateCommandStdin(stdin); err != nil {
+	if err := validateCommandStdin(stdin, c.environment.InputBridge); err != nil {
 		return err
 	}
 
@@ -523,7 +524,11 @@ func startCommandWithStdinPipeline(
 	if startCommand == nil {
 		return nil, fmt.Errorf("start SSH command function is nil")
 	}
-	if err := validateCommandStdin(stdin); err != nil {
+	var bridge InputBridge
+	if len(options) > 0 {
+		bridge = options[0].bridge
+	}
+	if err := validateCommandStdin(stdin, bridge); err != nil {
 		return nil, err
 	}
 	if err := startCommand(); err != nil {
@@ -687,15 +692,15 @@ func pipeCommandStdin(stdin io.Reader, dst io.WriteCloser, options ...inputPipel
 	if stdin == nil {
 		return nil, nil
 	}
-	if err := validateCommandStdin(stdin); err != nil {
+	ctx := context.Background()
+	var bridge InputBridge
+	if len(options) > 0 {
+		ctx, bridge = options[0].ctx, options[0].bridge
+	}
+	if err := validateCommandStdin(stdin, bridge); err != nil {
 		return nil, err
 	}
 	if fileStdin, ok := stdin.(*os.File); ok && fileStdin != nil {
-		ctx := context.Background()
-		var bridge InputBridge
-		if len(options) > 0 {
-			ctx, bridge = options[0].ctx, options[0].bridge
-		}
 		cancel, done, err := startInputCopy(ctx, bridge, InteractiveIO{Stdin: fileStdin}, dst)
 		if err != nil {
 			return nil, err
@@ -738,13 +743,16 @@ func pipeCommandStdin(stdin io.Reader, dst io.WriteCloser, options ...inputPipel
 	return stopAndWait, nil
 }
 
-func validateCommandStdin(stdin io.Reader) error {
+func validateCommandStdin(stdin io.Reader, bridge InputBridge) error {
 	switch value := stdin.(type) {
 	case nil:
 		return nil
 	case *os.File:
 		if value == nil {
 			return fmt.Errorf("command stdin file is nil")
+		}
+		if runtime.GOOS == "windows" && nilCapability(bridge) {
+			return fmt.Errorf("native Windows file input requires an input bridge: %w", ErrInteractionRequired)
 		}
 	case *bytes.Buffer:
 		if value == nil {

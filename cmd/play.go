@@ -125,7 +125,7 @@ func (o *PlayOptions) RunContext(ctx context.Context) (retErr error) {
 
 	// Dry Run 模式：打印 Playbook 内容后退出
 	if o.DryRun {
-		return o.printDryRun(pb)
+		return o.printDryRun(ctx, pb)
 	}
 
 	// 加载配置与 SSH 连接器（Playbook 为批处理模式，禁止交互式密码提示）
@@ -158,13 +158,14 @@ func (o *PlayOptions) RunContext(ctx context.Context) (retErr error) {
 		return runErr
 	}
 
-	if err := report.RenderTo(o.outputWriter()); err != nil {
-		return fmt.Errorf("write playbook report failed: %w", err)
-	}
+	return o.writeReport(ctx, report, runErr)
+}
 
+func (o *PlayOptions) writeReport(ctx context.Context, report *playbook.Report, runErr error) error {
 	executionErr := playbookExecutionError(report)
-	if runErr != nil || executionErr != nil {
-		return fmt.Errorf("%s: %w", i18n.T("play_err_some_failed"), errors.Join(runErr, executionErr))
+	outputErr := writeCommandOutput(ctx, o.outputWriter(), report.RenderTo)
+	if runErr != nil || executionErr != nil || outputErr != nil {
+		return fmt.Errorf("%s: %w", i18n.T("play_err_some_failed"), errors.Join(runErr, executionErr, outputErr))
 	}
 
 	return nil
@@ -193,38 +194,39 @@ func playbookExecutionError(report *playbook.Report) error {
 }
 
 // printDryRun 在 Dry Run 模式下打印 Playbook 摘要。
-func (o *PlayOptions) printDryRun(pb *playbook.Playbook) error {
-	w := o.outputWriter()
-	if _, err := fmt.Fprintf(w, "🔍 %s\n\n", i18n.T("play_dry_run")); err != nil {
-		return fmt.Errorf("write dry-run header failed: %w", err)
-	}
-	if _, err := fmt.Fprintf(w, "Playbook : %s\n", pb.Name); err != nil {
-		return fmt.Errorf("write dry-run playbook name failed: %w", err)
-	}
-	if pb.Description != "" {
-		if _, err := fmt.Fprintf(w, "Desc     : %s\n", pb.Description); err != nil {
-			return fmt.Errorf("write dry-run description failed: %w", err)
+func (o *PlayOptions) printDryRun(ctx context.Context, pb *playbook.Playbook) error {
+	return writeCommandOutput(ctx, o.outputWriter(), func(w io.Writer) error {
+		if _, err := fmt.Fprintf(w, "🔍 %s\n\n", i18n.T("play_dry_run")); err != nil {
+			return fmt.Errorf("write dry-run header failed: %w", err)
 		}
-	}
-	if _, err := fmt.Fprintf(w, "Targets  : tags=%v nodes=%v hosts=%v\n",
-		pb.Targets.Tags, pb.Targets.Nodes, pb.Targets.Hosts); err != nil {
-		return fmt.Errorf("write dry-run targets failed: %w", err)
-	}
-	if _, err := fmt.Fprintf(w, "Settings : concurrency=%d, sudo=%v, on_error=%s\n",
-		pb.Settings.Concurrency, pb.Settings.Sudo, pb.Settings.OnError); err != nil {
-		return fmt.Errorf("write dry-run settings failed: %w", err)
-	}
-	if _, err := fmt.Fprintf(w, "Steps    : %d\n\n", len(pb.Steps)); err != nil {
-		return fmt.Errorf("write dry-run step count failed: %w", err)
-	}
+		if _, err := fmt.Fprintf(w, "Playbook : %s\n", pb.Name); err != nil {
+			return fmt.Errorf("write dry-run playbook name failed: %w", err)
+		}
+		if pb.Description != "" {
+			if _, err := fmt.Fprintf(w, "Desc     : %s\n", pb.Description); err != nil {
+				return fmt.Errorf("write dry-run description failed: %w", err)
+			}
+		}
+		if _, err := fmt.Fprintf(w, "Targets  : tags=%v nodes=%v hosts=%v\n",
+			pb.Targets.Tags, pb.Targets.Nodes, pb.Targets.Hosts); err != nil {
+			return fmt.Errorf("write dry-run targets failed: %w", err)
+		}
+		if _, err := fmt.Fprintf(w, "Settings : concurrency=%d, sudo=%v, on_error=%s\n",
+			pb.Settings.Concurrency, pb.Settings.Sudo, pb.Settings.OnError); err != nil {
+			return fmt.Errorf("write dry-run settings failed: %w", err)
+		}
+		if _, err := fmt.Fprintf(w, "Steps    : %d\n\n", len(pb.Steps)); err != nil {
+			return fmt.Errorf("write dry-run step count failed: %w", err)
+		}
 
-	for i, s := range pb.Steps {
-		stepType := stepTypeName(s)
-		if _, err := fmt.Fprintf(w, "  [%d] %-20s (%s)\n", i+1, s.Name, stepType); err != nil {
-			return fmt.Errorf("write dry-run step failed: %w", err)
+		for i, s := range pb.Steps {
+			stepType := stepTypeName(s)
+			if _, err := fmt.Fprintf(w, "  [%d] %-20s (%s)\n", i+1, s.Name, stepType); err != nil {
+				return fmt.Errorf("write dry-run step failed: %w", err)
+			}
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 func (o *PlayOptions) outputWriter() io.Writer {

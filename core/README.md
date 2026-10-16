@@ -107,13 +107,21 @@ uses the connector's handshake timeout; cancellation joins workers and may
 interrupt a shared transport after a 1-second channel-shutdown grace period.
 `RunInteractivePlanWithIO` executes one-shot PTY commands, sharing request
 limits and preserving nonzero/signal/missing exit status. Its output accepts finite
-memory sinks or an explicit `ContextWriter`; Linux terminal/pipe files use
-owned nonblocking handles with cancelable deadlines, while regular-file PTY redirection
-and native file bridges on other platforms are rejected before execution.
+memory sinks or an explicit `ContextWriter`; Linux terminal/pipe files and macOS terminals use owned nonblocking handles
+with cancelable deadlines. macOS also supports pipes already in nonblocking mode;
+blocking anonymous pipes remain unsupported. Windows synchronous/overlapped
+pipes use owned duplicate handles and thread/request-specific cancellation. Regular-file
+PTY redirection, Windows consoles and other unsupported native sinks are rejected before execution.
 The PTY input file must be a local terminal, and a PTY plan cannot also supply stdin.
 For non-PTY streaming, `RunCommandPlanWithIO` and `RunShellWithoutPTY` use `BindOutput`
 (supporting `ContextWriter`, finite memory sinks, `io.Discard`, `os.DevNull`, local regular files,
-and Linux terminals/pipes). `(*Client).ProbeExecutionConfig(ctx)` provides bounded two-stage
+and the same native terminal/pipe adapters). `BindOutput` also preserves cancellation
+through `LockedWriter`, including waiting for its shared mutex. `OutputError`
+identifies sink failures so hosts can avoid writing errors back to blocked streams.
+Windows file stdin honors the host-injected `Environment.InputBridge`; without
+a bridge it is rejected before command/shell requests. `OutputError.Target` retains
+the borrowed sink identity: only standard-stream failures suppress CLI reporting,
+while independent log-file failures remain visible. `(*Client).ProbeExecutionConfig(ctx)` provides bounded two-stage
 read-only dialect and interpreter probing with connection-level caching. See the [implementation plan](../docs/development/ssh-execution-implementation.md) and [probe implementation record](../docs/development/ssh-execution-probe-implementation.md).
 
 Legacy command/script/stream, PTY, shell, and escalation paths delegate to shared payload builders,
@@ -144,3 +152,6 @@ Optional `DiagnosticLevel() int` filters higher-level events; absent means all
 levels. DEBUG1 installs no packet observer. SFTP stream/request IDs correlate
 packets without recording handles or file contents. See the
 [SCP diagnostics design](../docs/development/scp-diagnostics.md).
+
+Native output ownership, cancellation races, platform limits and acceptance tests
+are described in [native cancelable output](../docs/development/native-cancelable-output.md).

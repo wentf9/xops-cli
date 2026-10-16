@@ -194,9 +194,8 @@ func TestSCPProgressOutput(t *testing.T) {
 				if transferErr != nil {
 					t.Fatal(transferErr)
 				}
-				// Native console bindings outside Linux are deliberately disabled
-				// until they can guarantee cancelable output; transfers still run.
-				wantProgress := output == "terminal" && runtime.GOOS == "linux"
+				// Unix PTYs have native cancelable bindings on Linux and macOS.
+				wantProgress := output == "terminal" && (runtime.GOOS == "linux" || runtime.GOOS == "darwin")
 				if got, want := strings.Contains(captured, description), wantProgress; got != want {
 					t.Fatalf("progress present=%v, want %v; output=%q", got, want, captured)
 				}

@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"fmt"
-	"runtime"
 
 	"github.com/wentf9/xops-cli/core/ssh"
 )
@@ -10,9 +9,6 @@ import (
 func (o *SshOptions) prepareCommandPlan() error {
 	if !o.execution.enabled() && !o.execution.noLoginSet {
 		return nil
-	}
-	if runtime.GOOS != "linux" {
-		return fmt.Errorf("explicit execution on %s is not supported yet: cancelable native output is only available on Linux", runtime.GOOS)
 	}
 	if o.Sudo {
 		return fmt.Errorf("explicit execution currently supports ordinary commands without sudo")

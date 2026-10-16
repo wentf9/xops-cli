@@ -573,7 +573,7 @@ func (o *ExecOptions) executeTask(ctx context.Context, connector *ssh.Connector,
 
 	output, execErr := o.dispatchTaskExecution(ctx, client, execCmd, isScript, outputOpts)
 
-	printErr := o.printTaskResult(t, output, execErr, stdoutMu)
+	printErr := o.printTaskResult(ctx, t, output, execErr, stdoutMu)
 	if execErr != nil {
 		return errors.Join(fmt.Errorf("[%s] %w", t.host, execErr), printErr)
 	}
@@ -660,24 +660,26 @@ func (o *ExecOptions) stderrWriter() io.Writer {
 	return os.Stderr
 }
 
-func writeExecResult(mu *sync.Mutex, writer io.Writer, format string, args ...any) error {
-	mu.Lock()
-	defer mu.Unlock()
-	if _, err := fmt.Fprintf(writer, format, args...); err != nil {
-		return fmt.Errorf("write command result failed: %w", err)
-	}
-	return nil
+func writeExecResult(ctx context.Context, mu *sync.Mutex, writer io.Writer, format string, args ...any) error {
+	return writeCommandOutput(ctx, ssh.NewLockedWriter(mu, writer), func(bound io.Writer) error {
+		_, err := fmt.Fprintf(bound, format, args...)
+		return err
+	})
 }
 
-func (o *ExecOptions) printTaskResult(t execHostTask, output string, execErr error, stdoutMu *sync.Mutex) error {
+func (o *ExecOptions) printTaskResult(ctx context.Context, t execHostTask, output string, execErr error, stdoutMu *sync.Mutex) error {
+	if HasStandardOutputError(execErr) {
+		return nil
+	}
+
 	if execErr != nil {
 		// 仅在有部分输出时将标准输出打印出来（错误本身交给根命令统一汇报）
 		if output != "" {
 			if logger.ColorEnabled() {
 				header := logger.Cyan(fmt.Sprintf("%s\n------------", t.host))
-				return writeExecResult(stdoutMu, o.stderrWriter(), "%s\n%s\n", header, output)
+				return writeExecResult(ctx, stdoutMu, o.stderrWriter(), "%s\n%s\n", header, output)
 			} else {
-				return writeExecResult(stdoutMu, o.stderrWriter(), "[%s]\n%s\n", t.host, output)
+				return writeExecResult(ctx, stdoutMu, o.stderrWriter(), "[%s]\n%s\n", t.host, output)
 			}
 		}
 		return nil
@@ -685,9 +687,9 @@ func (o *ExecOptions) printTaskResult(t execHostTask, output string, execErr err
 	if output != "" {
 		if logger.ColorEnabled() {
 			header := logger.Cyan(fmt.Sprintf("%s\n------------", t.host))
-			return writeExecResult(stdoutMu, o.stdoutWriter(), "%s\n%s\n", header, output)
+			return writeExecResult(ctx, stdoutMu, o.stdoutWriter(), "%s\n%s\n", header, output)
 		}
-		return writeExecResult(stdoutMu, o.stdoutWriter(), "%s\n", i18n.Tf("exec_result_success", map[string]any{"Host": t.host, "Output": output}))
+		return writeExecResult(ctx, stdoutMu, o.stdoutWriter(), "%s\n", i18n.Tf("exec_result_success", map[string]any{"Host": t.host, "Output": output}))
 	}
 	if o.OutDir != "" {
 		safeHost := sanitizeHostForFilename(t.host)
@@ -697,7 +699,7 @@ func (o *ExecOptions) printTaskResult(t execHostTask, output string, execErr err
 			successPart := logger.Green(fmt.Sprintf("Executed successfully (output saved to %s)", filepath.Join(o.OutDir, safeHost+".log")))
 			message = hostPart + successPart
 		}
-		return writeExecResult(stdoutMu, o.stdoutWriter(), "%s\n", message)
+		return writeExecResult(ctx, stdoutMu, o.stdoutWriter(), "%s\n", message)
 	}
 	message := fmt.Sprintf("[%s] Executed successfully", t.host)
 	if logger.ColorEnabled() {
@@ -705,7 +707,7 @@ func (o *ExecOptions) printTaskResult(t execHostTask, output string, execErr err
 		successPart := logger.Green("Executed successfully")
 		message = hostPart + successPart
 	}
-	return writeExecResult(stdoutMu, o.stdoutWriter(), "%s\n", message)
+	return writeExecResult(ctx, stdoutMu, o.stdoutWriter(), "%s\n", message)
 }
 
 // sanitizeHostForFilename 清洗主机名，防止路径穿越攻击。

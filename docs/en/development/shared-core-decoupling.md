@@ -347,3 +347,7 @@ remain alive until connector/client shutdown. Events contain public protocol
 metadata only and do not participate in trust, authorization or lease decisions.
 SCP is the first CLI consumer; see [SCP diagnostics](./scp-diagnostics.md) for
 output ownership and cancellation limits.
+
+## Native cancelable output
+
+`BindOutput` and strict PTY output use core platform adapters for Windows pipes and macOS terminals/already nonblocking pipes. Windows consoles and macOS blocking anonymous pipes retain their safe fallback. Original streams are never closed or have flags modified; core gains no host dependency. See [native cancelable output](./native-cancelable-output.md).

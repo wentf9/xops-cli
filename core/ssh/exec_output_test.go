@@ -153,6 +153,37 @@ func TestBindRunOutputModes(t *testing.T) {
 	}
 }
 
+func TestBindRunOutputFileFailureRetainsTarget(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "command.log")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = file.Close() }()
+	client := &Client{}
+	config, release, err := client.bindRunOutput(t.Context(), &RunConfig{OutMode: OutputModeFile, OutFile: file})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = newOutputWriter(config).Write([]byte("log output"))
+	var failure *OutputError
+	if !errors.As(err, &failure) || !failure.TargetsFile(file) {
+		t.Fatalf("log sink identity lost: %v", err)
+	}
+	if failure.TargetsFile(os.Stderr) || failure.TargetsFile(os.Stdout) {
+		t.Fatal("log was classified as a standard stream")
+	}
+	if err := release(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Stat(); err != nil {
+		t.Fatalf("borrowed log closed: %v", err)
+	}
+}
+
 func TestLegacyBashPayloadMatchesHistoricalQuoting(t *testing.T) {
 	historical := func(command string, login bool) string {
 		flag := ""
@@ -284,7 +315,7 @@ func TestBindOutputStandardFileHandles(t *testing.T) {
 			if isRegularOrNull && !cancelable {
 				t.Fatalf("%s regular file or null device unexpectedly reported non-cancelable on %s", target.Name(), runtime.GOOS)
 			}
-			if !isRegularOrNull && cancelable {
+			if runtime.GOOS != "darwin" && runtime.GOOS != "windows" && !isRegularOrNull && cancelable {
 				t.Fatalf("%s unexpectedly reported cancelable on %s", target.Name(), runtime.GOOS)
 			}
 			if err := closeFn(); err != nil {

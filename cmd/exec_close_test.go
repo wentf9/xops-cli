@@ -31,7 +31,7 @@ func TestPrintTaskResultReturnsOutputError(t *testing.T) {
 	o := NewExecOptions()
 	o.stdout = execErrorWriter{err: wantErr}
 
-	err := o.printTaskResult(execHostTask{host: "host-1"}, "output", nil, &sync.Mutex{})
+	err := o.printTaskResult(t.Context(), execHostTask{host: "host-1"}, "output", nil, &sync.Mutex{})
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("printTaskResult() error = %v, want wrapped output error", err)
 	}

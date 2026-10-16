@@ -4,7 +4,6 @@ package ssh
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -36,17 +35,5 @@ func prepareFileOutput(ctx context.Context, source *os.File, perWrite time.Durat
 	if err != nil {
 		return nil, nil, fmt.Errorf("open owned terminal output: %w", err)
 	}
-	if err := owned.SetWriteDeadline(time.Now().Add(terminalWriteTimeout)); err != nil {
-		return nil, nil, errors.Join(fmt.Errorf("terminal output does not support deadlines: %w", err), closeResource(owned, "owned terminal output"))
-	}
-	canceled := make(chan error, 1)
-	stop := context.AfterFunc(ctx, func() { canceled <- owned.SetWriteDeadline(time.Now()) })
-	closeFn := func() error {
-		var cancelErr error
-		if !stop() {
-			cancelErr = <-canceled
-		}
-		return errors.Join(cancelErr, closeResource(owned, "owned terminal output"))
-	}
-	return contextOutput{ctx, fileContextOutput{owned, perWrite}}, closeFn, nil
+	return bindOwnedFileOutput(ctx, owned, source, perWrite)
 }

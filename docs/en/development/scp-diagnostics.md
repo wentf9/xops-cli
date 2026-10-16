@@ -55,8 +55,10 @@ not claim to reproduce OpenSSH's output line for line with the Go SSH backend.
   exceeding one second cancels the output binding. Shutdown closes the queue,
   joins the writer and releases the binding. Borrowed stdout/stderr streams are never closed.
   Command cancellation also cancels the output binding.
-- Windows/macOS consoles or pipes without a cancelable binding skip progress,
-  diagnostics and upload status messages on that stream while transfers continue, with no direct writes at shutdown.
+- Windows synchronous/overlapped pipes, plus macOS terminals and
+  already nonblocking pipes, use native cancelable bindings. Windows consoles, macOS blocking
+  anonymous pipes and other unsupported sinks skip progress, diagnostics and
+  upload status messages on that stream while transfers continue, with no direct writes at shutdown.
   Redirect stderr to a regular log file to retain diagnostics. Regular-file
   writes remain subject to native Write limitations and are not claimed to be interruptible.
 - Selector upload skip messages remain on stderr and success messages on stdout,
@@ -115,5 +117,8 @@ Regression tests cover single-byte/coalesced fragments, zero/short packets,
 4 GiB declared lengths, unknown types, clipped metadata, short writes and Close
 ownership, concurrent stream IDs, fuzzing, verbosity/quiet order and approximately
 2 MiB concurrent uploads/downloads/relays. The local OpenSSH comparison still
-connects only to a loopback fixture. Native Windows/macOS execution is not
-established for this change.
+connects only to a loopback fixture. Windows pipe support and console fallback were verified natively on `vm`;
+macOS native execution remains pending CI.
+
+Platform implementation and native acceptance boundaries are documented in
+[native cancelable output](./native-cancelable-output.md).

@@ -140,6 +140,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: go test -race -tags=integration -run '^TestWindows(InteractiveInputConPTY|ConPTYOutputClosedHandle)$' -count=1 -timeout=60s ./internal/terminal
 
+      - name: Run native Windows console output fallback regression
+        if: ${{ !cancelled() }}
+        run: go test -race -tags=integration -run '^TestWindowsOutputConPTYFallback$' -count=1 -timeout=60s ./core/ssh
+
   macos-test:
     name: macOS Build and Test
     runs-on: macos-latest

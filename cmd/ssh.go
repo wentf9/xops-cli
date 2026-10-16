@@ -8,7 +8,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -759,10 +758,11 @@ func (o *SshOptions) effectiveInterpreter(client *ssh.Client) ssh.Interpreter {
 }
 
 func (o *SshOptions) runPipedShell(ctx context.Context, client *ssh.Client) error {
-	if o.execution.enabled() && runtime.GOOS != "linux" {
-		return fmt.Errorf("explicit execution on %s is not supported yet: cancelable native output is only available on Linux", runtime.GOOS)
+	strict, err := commandOutputSupported(ctx)
+	if err != nil {
+		return err
 	}
-	if runtime.GOOS == "linux" {
+	if o.execution.enabled() || strict {
 		return client.RunShellWithoutPTY(ctx, os.Stdin, os.Stdout, os.Stderr)
 	}
 	return client.RunShellWithIO(ctx, os.Stdin, os.Stdout, os.Stderr)
@@ -770,9 +770,6 @@ func (o *SshOptions) runPipedShell(ctx context.Context, client *ssh.Client) erro
 
 func (o *SshOptions) runCommand(ctx context.Context, client *ssh.Client, command string) error {
 	if o.commandPlan != nil {
-		if runtime.GOOS != "linux" {
-			return fmt.Errorf("explicit execution on %s is not supported yet: cancelable native output is only available on Linux", runtime.GOOS)
-		}
 		return client.RunCommandPlanWithIO(ctx, *o.commandPlan, os.Stdin, os.Stdout, os.Stderr)
 	}
 	if !o.Sudo && o.Command == "" && o.stdinScript {
@@ -789,7 +786,11 @@ func (o *SshOptions) runCommand(ctx context.Context, client *ssh.Client, command
 		if err != nil {
 			return fmt.Errorf("plan command: %w", err)
 		}
-		if runtime.GOOS == "linux" {
+		strict, err := commandOutputSupported(ctx)
+		if err != nil {
+			return err
+		}
+		if strict {
 			return client.RunCommandPlanWithIO(ctx, plan, os.Stdin, os.Stdout, os.Stderr)
 		}
 	}

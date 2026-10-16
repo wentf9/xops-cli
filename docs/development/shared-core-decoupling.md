@@ -346,3 +346,7 @@ SDK 按 `UserID` 绑定会话。`runtime.ClientIdentityFromContext` 返回工具
 未装配时无输出。观察者归宿主所有，须并发安全、及时返回，存活至连接器/客户端关闭；
 事件仅含公开协议元数据，不携带凭据或文件内容，也不参与信任、授权和租约决策。
 CLI 首个调用方为 SCP，输出和取消边界见 [SCP 分级诊断](./scp-diagnostics.md)。
+
+## 原生可取消输出
+
+`BindOutput` 与严格 PTY 输出通过 core 内的平台文件实现 Windows 管道、macOS 终端及已有非阻塞管道的取消。Windows 控制台与 macOS 阻塞匿名管道保留安全降级；原流不关闭、不修改标志，不在 core 引入宿主依赖。详见 [原生可取消输出](./native-cancelable-output.md)。
