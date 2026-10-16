@@ -350,4 +350,4 @@ output ownership and cancellation limits.
 
 ## Native cancelable output
 
-`BindOutput` and strict PTY output use core platform adapters for Windows pipes and macOS terminals/already nonblocking pipes. Windows consoles and macOS blocking anonymous pipes retain their safe fallback. Original streams are never closed or have flags modified; core gains no host dependency. See [native cancelable output](./native-cancelable-output.md).
+`BindOutput` and strict PTY output use core platform adapters for Windows pipes, Windows consoles with a host-injected relay, and macOS terminals/already nonblocking pipes. Windows consoles without injection and macOS blocking anonymous pipes retain their safe fallback. Original streams are never closed or have flags modified; core gains no host dependency. See [native cancelable output](./native-cancelable-output.md).

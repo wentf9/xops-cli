@@ -7,11 +7,15 @@ import (
 
 	"github.com/wentf9/xops-cli/cmd"
 	"github.com/wentf9/xops-cli/internal/kdfhelper"
+	"github.com/wentf9/xops-cli/internal/sshenv"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
 )
 
 func main() {
+	if code, handled := sshenv.ServeConsoleOutputRelay(os.Args[1:]); handled {
+		os.Exit(code)
+	}
 	if len(os.Args) > 1 && os.Args[1] == kdfhelper.PrivateArgument {
 		if len(os.Args) != 2 {
 			os.Exit(1)

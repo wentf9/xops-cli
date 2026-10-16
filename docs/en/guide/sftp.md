@@ -51,11 +51,11 @@ xops scp --tag web --src ./config.conf --dest /etc/app/
   - A progress bar is shown on `stderr` by default in interactive terminals and hidden automatically when output is piped or redirected.
   - `-q` / `--quiet`: Hides the progress bar and SSH warnings/diagnostics (errors and security prompts are still shown).
   - `-v` / `--verbose`: Prints SSH/SFTP connection and transfer diagnostics (independent of project-level `--debug` logs):
-    - `-v`: Shows connection versions, negotiated algorithms, host key fingerprints, authentication steps, and SFTP status.
-    - `-vv`: Adds SFTP extensions, path operations, and per-file transfer results.
-    - `-vvv`: Adds SFTP packet types, request IDs, lengths, and status codes.
+    - `-v`: Shows connection, authentication, and transfer information.
+    - `-vv`: Adds more detail about file operations.
+    - `-vvv`: Produces the most detailed troubleshooting log.
   - Combining `-q` and `-v` follows OpenSSH flag order: `-qv` hides the progress bar while keeping SSH/SFTP diagnostics; `-vq` hides both the progress bar and SSH diagnostics, keeping only SCP transfer and SFTP init messages.
-  - Windows pipes and macOS terminals/already nonblocking pipes support native cancelable output. Unsupported sinks, including Windows consoles and macOS blocking anonymous pipes, skip progress, diagnostics and upload status while transfers continue; redirect `stderr` to a log file (e.g., `2>scp.log`) if you want to capture diagnostics there.
+  - If the output environment does not support progress or diagnostics, these extra messages are omitted while file transfers continue. To save diagnostics, append `2>scp.log` to the command.
 
 ```bash
 # Quiet mode (no progress bar)
@@ -64,13 +64,13 @@ xops scp -q ./file web-01:~/file
 # Hide progress bar while showing SSH/SFTP diagnostics
 xops scp -qv ./file web-01:~/file
 
-# Inspect SFTP file operations (-vv) or packet details (-vvv)
+# Get a more detailed troubleshooting log
 xops scp -qvv ./file web-01:~/file
 ```
 
 - **Remote `~` paths**: Remote paths support `~` and `~/...`, resolved relative to the remote SFTP login directory (typically the user's home directory). `~otheruser` is not supported; use an absolute path instead.
 - **Overwrite behavior**: Answering `y` at a prompt or passing `-f`/`--force` overwrites existing files (even when size and modification time match); passing `-n`/`--no-clobber` skips existing files.
-- **Safe local download replacement**: When overwriting an existing local file, XOps tries an atomic rename first. If the filesystem does not allow renaming over an existing file, XOps backs up the original file before putting the downloaded file in place and restores the backup if anything fails (reporting the backup path if restoration itself fails). An existing directory is never replaced by a regular file.
+- **Local download protection**: If an overwrite fails, XOps attempts to restore the original file. If manual recovery is needed, follow the backup path in the error message. An existing directory is never replaced by a regular file.
 
 ### 2. Interactive SFTP shell
 
@@ -92,7 +92,7 @@ exit
 
 - `exec <command>`: Runs a command in the current remote directory (allocating a PTY in interactive mode for terminal programs) and returns to the SFTP prompt.
 - `shell` / `lshell`: Opens a remote or local interactive shell; `lexec`: runs a local command. The SFTP prompt resumes when the child program exits.
-- If the connection drops, the SFTP shell exits immediately with a nonzero status rather than accepting further commands.
+- If the connection drops or command output fails, the session ends with a nonzero status. Reconnect to continue working.
 
 ## Interactive input and keyboard shortcuts
 
@@ -114,7 +114,7 @@ The SFTP prompt supports line editing, command history (saved in `~/.xops_sftp_h
 **Editor and history behavior**:
 - **Completion menu**: A single match is inserted immediately; after completing a directory, press `Tab` again to complete inside it. Multiple matches display in a multi-column grid (up to 6 rows with page and total counts) highlighted with `>`. Remote completion queries time out after 2 seconds and cancel automatically if you keep typing.
 - **Scrolling and paste**: Long lines scroll horizontally while editing and echo in full on submission. Wide characters, combining marks, emoji, and bracketed pastes split across reads are preserved (newlines and tabs in pasted text become spaces without submitting the command). When `stdin` is a terminal and `stdout` is piped (e.g. to `tee`), prompts and terminal resize handling continue to work via the input terminal.
-- **History resilience**: Up to 500 recent non-empty, non-duplicate interactive commands are stored (confirmation answers and batch commands are excluded). If the history or lock file is unavailable at startup, XOps warns and falls back to session-only history. Temporary Windows file-sharing conflicts retry within a 2-second deadline; write failures keep commands in memory and merge them back to disk once writing recovers.
+- **History**: Up to 500 recent non-empty interactive commands are saved, excluding consecutive duplicates, confirmation answers, and batch commands. If the history file is unavailable, XOps warns and temporarily keeps session-only history. A failed save does not erase old entries; saving resumes when the file becomes available.
 
 ## Batch mode
 
@@ -126,9 +126,15 @@ Piping or redirecting input into `xops sftp` (e.g. `xops sftp web-01 < batch.txt
 
 ## Working directory inheritance and probing for `exec`
 
-After changing the remote directory with `cd`, SFTP `exec` binds the current remote working directory (`cwd`) to your command:
+`exec` runs commands in the current remote directory. Use `cd` to change directories first. If the directory cannot be entered, the command will not run.
 
-- **POSIX and fish (`bash`/`sh`/`zsh`/`fish`)**: A nonempty `cwd` wraps the entire user program in a conditional block (`cd ... && { ...; }` or fish's `cd ...; and begin ... end`). If changing directories fails, semicolon-separated or multiline commands do not run; on success, the user program's exit status is preserved.
-- **Windows CMD (`cmd` and saved `server/cmd`)**: Uses `cd /d "directory" || exit /b & user-command`. A failed directory change exits immediately with the failure `ERRORLEVEL` so later `&`, `&&`, `||`, or grouped commands never run; on success, native CMD syntax, `rem` comments, and exit codes are preserved. Saved `server/cmd` nodes derive a temporary CMD adapter for `cwd`-aware `exec` calls without reprobing or modifying node settings.
-- **Windows path normalization**: Windows SFTP paths `/C:/...` convert to `C:/...`, and drive roots `/C:` or `/C:/` convert to `C:/` (running `exec dir` at `sftp:/C:>` lists the root of `C:`). Cross-platform `pwsh` selects path formats at runtime via its own `$IsWindows` even on cold connections without a probe cache; POSIX paths remain unchanged.
-- **On-demand probing**: When execution settings are unspecified and the launch dialect is unknown, `exec` with a nonempty `cwd` runs a bounded read-only probe once per connection and caches the result in memory (Linux prefers default `bash`/`sh`/`zsh`/`fish`; Windows CMD prefers installed PowerShell for `cwd` handling and falls back to CMD). Empty-`cwd` commands do not probe. Other explicit `server` configurations reject a nonempty `cwd`. A failed probe aborts before running user code and never retries under another interpreter.
+For Windows hosts, use paths such as `/C:/...`:
+
+```text
+cd /C:/Windows
+exec dir
+```
+
+Use `cd /C:` to enter the root of the C: drive.
+
+When no interpreter is configured, XOps attempts to detect the remote environment. If execution is reported as unsupported, check the node's `execution` settings and select an interpreter installed on that host—see [Hosts and identities](./hosts#node-execution-configuration-execution). A configured `server` interpreter supports the SFTP working directory only with the `cmd` launch dialect; other environments need an explicit interpreter. If detection fails, the command does not run.

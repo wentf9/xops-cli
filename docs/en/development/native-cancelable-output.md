@@ -10,7 +10,7 @@ SSH streaming/PTY output. No separate SSH or transfer backend is introduced.
 | macOS terminals | `F_GETPATH`, independently reopen nonblocking, verify identity, Go deadlines | Own handle; no terminal mode changes |
 | macOS already nonblocking pipes | `F_DUPFD_CLOEXEC`, Go deadlines | Own descriptor, shared status; caller must keep the pipe nonblocking until release |
 | macOS blocking anonymous pipes | Unsupported; retain the existing safe fallback | No shared `O_NONBLOCK` changes or helper processes |
-| Windows consoles | Unsupported; retain the safe fallback | Native Windows 11 ConPTY writes did not reliably cancel with `CancelSynchronousIo`; no helper processes |
+| Windows consoles | Host-injected relay entry point, duplicate handle and lazily started pipe-backed subprocess; pipe requests/ACKs cancel with `CancelIoEx`/`CancelSynchronousIo` | Safe fallback without injection; cancellation checks process exit without closing the borrowed handle or changing console mode |
 | Windows synchronous/overlapped pipes | Duplicate handle, thread cancellation and request-specific `CancelIoEx` | Own event and pinned request/buffer lifetime; never cancel other borrowed-handle requests |
 | Regular files | Existing implementation | A filesystem Write already in progress is not promised to be interruptible |
 
@@ -21,6 +21,26 @@ The OVERLAPPED event low bit suppresses IOCP notification, so custom requests do
 not reach an existing Go completion port on the borrowed pipe. NUL is identified
 by handle object name rather than potentially zero device/pipe FileInfo IDs, which
 could misclassify a console or pipe as an ordinary file.
+
+For Windows consoles, the host explicitly supplies `work, cleanup := WithConsoleOutputRelay(ctx, ConsoleOutputRelay{Executable, Args, Env})`
+and must retain `cleanup` until all command I/O finishes. The scope owns all bindings, including those whose local
+`closeFn` failed. Scope cleanup cancels output before retrying reclamation and retains failed bindings for host retries.
+There is no global manager or background retry goroutine. The CLI owns this scope in `cmd/root.go` and dispatches
+`--xops-console-output-relay` to `ServeConsoleOutputRelay` in `cmd/cli/main.go` before normal startup. Core never reads a relay environment variable
+or exits/takes over the host during package initialization. Importing core alone does not enable the relay.
+The first nonempty write starts the helper; borrowed console handles and modes remain unchanged.
+
+On Windows 10+, creation-time `PROC_THREAD_ATTRIBUTE_JOB_LIST` assignment atomically places the relay in a
+non-inheritable kill-on-close Job Object. There is no start/assign race. Parent death closes the Job and terminates
+the relay independently of pipe EOF, including while console output is blocked. Unsupported attributes or Job
+constraints fail startup rather than falling back to an unowned helper.
+
+Job termination is asynchronous. Cleanup releases process, ACK and Job handles only after `WAIT_OBJECT_0`.
+It waits up to five seconds; failures/timeouts return `ssh.OutputError` retaining the sink identity, disable further
+writes, and leave the command scope owning the binding for retry. SFTP treats output/cleanup failures as fatal,
+without writing diagnostics to failed streams or restoring the line editor; cancellation/disconnect wrapping preserves
+the original error chain. Closed scopes reject new bindings rather than falling back to direct I/O. Cleanup errors
+do not mean the relay exited or that the terminal can safely be handed back.
 
 macOS `/dev/fd` shares file status like dup; it is not equivalent to Linux
 `/proc/self/fd`. SCP terminal detection uses `SyscallConn.Control`, avoiding
@@ -57,8 +77,16 @@ execution, step and report-output failures together.
 
 ## Validation and boundaries
 
+The relay implementation and review fixes still require native Windows CI. Historical `vm` results below
+cover only the original pipe/console-fallback implementation, not the new relay. Regressions require entering
+actual console output before cancellation and proving relay process exit before resuming ConPTY draining.
+They also cover fallback without injection, environment variables not taking over process startup,
+command-scope ownership of failed bindings, rejecting new bindings after scope closure, and parent-death reclamation
+without Go defers. Portable SFTP regressions cover direct, wrapped and joined output errors (including interruption),
+asserting zero diagnostic writes and preserved errors.
+
 Platform tests cover Windows blocking synchronous/overlapped pipe cancellation,
-borrowed handles, console fallback and safe fallback with an unread ConPTY
+borrowed handles, console relay binding and blocked-write cancellation with an unread ConPTY
 output pipe (`integration`). macOS tests cover paused terminals, nonblocking pipe
 cancellation, rejection of blocking pipes, borrowed flags and terminal reuse.
 Existing native Windows/macOS CI runs these tests; Windows ConPTY has a dedicated

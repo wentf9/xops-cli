@@ -34,8 +34,8 @@ SSH/SFTP 的 `WithDiagnostics` 只装配观察者，不改变连接租约、认�
   诊断回调、进度条及选择器上传状态提示只向容量 128 的队列非阻塞入队，满时丢弃辅助显示并汇报数量，不阻塞协议或传输。
 - 支持 `ssh.BindOutput` 的输出使用命令拥有的 writer goroutine；单次写入超过一秒取消输出 binding，
   结束时关闭队列、等待 writer、释放 binding。借用的 stdout/stderr 从不关闭。取消原命令也取消输出 binding。
-- Windows 同步/overlapped 管道、macOS 终端及已有非阻塞管道使用原生可取消 binding。
-  Windows 控制台、macOS 阻塞匿名管道及其他不支持的输出跳过该流上的进度、诊断及上传状态提示并继续传输，结束时也不直接写入；
+- Windows 控制台、同步/overlapped 管道、macOS 终端及已有非阻塞管道使用原生可取消 binding。
+  macOS 阻塞匿名管道及其他不支持的输出跳过该流上的进度、诊断及上传状态提示并继续传输，结束时也不直接写入；
   可重定向 stderr 到普通日志文件保留诊断。常规文件写入仍受平台原生 Write 的限制，不能声称其可中断。
 - 选择器上传的跳过提示仍写 stderr、成功提示仍写 stdout，并保留原有颜色及 `-q` 行为；
   两者复用受控队列，调用方结束时等待并释放绑定，写入失败不作为传输成功返回。

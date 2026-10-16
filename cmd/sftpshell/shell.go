@@ -822,8 +822,12 @@ func (s *Shell) reportCommandError(err error) error {
 		return nil
 	}
 	var outputErr *shellOutputError
+	var sshOutputErr *ssh.OutputError
 	var cleanupErr *promptCleanupError
-	if s.batch || errors.As(err, &outputErr) || errors.As(err, &cleanupErr) {
+	// stdout/stderr may share the same blocked console. Never diagnose an
+	// SSH output/cleanup failure by directly writing to either stream, and
+	// never resume the line editor while terminal output may still be pending.
+	if s.batch || errors.As(err, &outputErr) || errors.As(err, &sshOutputErr) || errors.As(err, &cleanupErr) {
 		return err
 	}
 	if errors.Is(err, ErrPromptInterrupted) {
