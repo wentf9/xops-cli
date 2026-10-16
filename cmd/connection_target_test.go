@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -610,7 +612,7 @@ func TestCommands_SCP_FlagPrecedence(t *testing.T) {
 		}
 	})
 
-	t.Run("scp_flag_port_overrides_path_port", func(t *testing.T) {
+	t.Run("scp_flag_port_overrides_selected_node_port", func(t *testing.T) {
 		repo := setupTestRepository(t)
 		scpOpt := NewScpOptions()
 		scpOpt.Port = 2222
@@ -626,6 +628,69 @@ func TestCommands_SCP_FlagPrecedence(t *testing.T) {
 			t.Errorf("expected nodeID 'test@10.238.221.181:2222', got %q", res.NodeID)
 		}
 	})
+}
+
+func TestCommands_SCPPortSelectionPreservesNumericFilename(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		storedPorts []uint16
+		port        uint16
+		wantPort    uint16
+		ambiguous   bool
+	}{
+		{"unique configured port", []uint16{122}, 0, 122, false},
+		{"multiple ports without flag", []uint16{22, 122}, 0, 0, true},
+		{"explicit nondefault port", []uint16{22, 122}, 122, 122, false},
+		{"explicit standard port", []uint16{22, 122}, 22, 22, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			provider, err := config.NewProvider(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg := provider.Snapshot()
+			cfg.Identities.Set("user", models.Identity{User: "user", AuthType: "auto"})
+			for _, port := range tc.storedPorts {
+				hostID := fmt.Sprintf("scp.fixture.invalid:%d", port)
+				cfg.Hosts.Set(hostID, models.Host{Address: "scp.fixture.invalid", Port: port})
+				cfg.Nodes.Set("user@"+hostID, models.Node{HostRef: hostID, IdentityRef: "user"})
+			}
+			repo, err := config.NewRepositoryWithoutOpenSSH(cfg, &memoryStore{cfg: cfg})
+			if err != nil {
+				t.Fatal(err)
+			}
+			path, err := parsePath("user@scp.fixture.invalid:22:file")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if path.Path != "22:file" || path.Port != 0 {
+				t.Fatalf("parsed path: %+v", path)
+			}
+			options := NewScpOptions()
+			options.Port = tc.port
+			target, err := options.resolveTargetForPath(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if target.HasPort != (tc.port != 0) {
+				t.Fatalf("HasPort = %v", target.HasPort)
+			}
+			res, err := repo.PrepareNodeContext(t.Context(), config.EnsureNodeOptions{Target: target})
+			if tc.ambiguous {
+				var ambiguous *config.AmbiguousNodeError
+				if !errors.As(err, &ambiguous) || len(ambiguous.Candidates) != 2 {
+					t.Fatalf("expected ambiguity across two ports, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := fmt.Sprintf("user@scp.fixture.invalid:%d", tc.wantPort); res.Created || res.NodeID != want {
+				t.Fatalf("resolved %q, created=%v; want %q", res.NodeID, res.Created, want)
+			}
+		})
+	}
 }
 
 func TestCommands_Exec_FlagPrecedence(t *testing.T) {

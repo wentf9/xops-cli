@@ -8,19 +8,69 @@ XOps provides both an interactive SFTP shell (`xops sftp`) and a command-line fi
 
 ```bash
 # Upload a file or directory relative to the remote login home directory
-xops scp ./test.tar 'web-01:~/tmp/' -v
+xops scp ./test.tar 'web-01:~/tmp/'
 
 # Download from a remote host to a local directory
-xops scp 'web-01:~/tmp/test.tar' ../ -v
+xops scp 'web-01:~/tmp/test.tar' ../
+
+# Relay a file directly between two remote hosts (routed through your machine)
+xops scp 'web-01:~/config.conf' 'web-02:~/config.conf'
+
+# Upload to one or more hosts with --host
+xops scp --host web-01 ./config.conf ./
+xops scp --host web-01,web-02 ./config.conf /etc/app/
 
 # Distribute a file to all hosts matching a tag (quote ~ paths so the local shell does not expand them)
-xops scp ./config.conf --tag web --dest '~/tmp/'
-xops scp ./config.conf --tag web --dest /etc/app/
+xops scp --tag web ./config.conf '~/tmp/'
 ```
 
-- **Path rules**: Remote paths support `~` and `~/...` relative to the remote SFTP login directory (normally the user's home) across uploads, downloads, remote-to-remote relays, and batch uploads. `~otheruser` is not supported; use an absolute path instead.
-- **Overwrite policy**: Answering `y` at a prompt or passing `--force` overwrites existing files even if size and modification time match; `--no-clobber` skips existing destinations. Always verify target directory permissions before overwriting.
-- **Local download replacement**: Downloads first attempt an atomic rename. If the filesystem refuses to rename over an existing regular file, XOps backs up the original file before promoting the download and restores it on failure (this fallback is non-atomic; if restoration fails, the error reports the backup path). A directory of the same name is never replaced with a regular file.
+Basic syntax: `xops scp [options] <source> <destination>`. Both source and destination paths are required:
+
+- **Single-host and relay transfers**: Without `--host`, `--tag`, or `-I/--ifile`, either path can use `[[user@]host:]file` (where the host part is a node name, alias, or host address). Local-to-remote uploads, remote-to-local downloads, and remote-to-remote relays through the local client are all supported (local-to-local is not).
+- **Ports and special paths**:
+  - Like OpenSSH `scp`, use `-P 122` (or `--port 122`) to set the SSH port; lowercase `-p` is not used for ports.
+  - Everything after the host colon is treated as the file path, not a port—for example, `user@host:22:file` refers to a remote file named `22:file`. Enclose IPv6 addresses in brackets, such as `user@[::1]:file`.
+  - When `-P` is omitted, XOps uses the matched node's configured port. If a host matches multiple saved ports, XOps reports the ambiguity rather than guessing port 22—specify `-P` or use a unique alias. To relay between two hosts on different ports, assign each host an alias.
+  - Windows remote paths accept `vm:C:/Users/example/file.txt`. Prefix local filenames containing colons with `./` (e.g., `./22:file`).
+- **Batch or targeted uploads (`--host` / `--tag` / `-I`)**: Passing `--host`, `--tag`, or `-I/--ifile` always uploads from the local machine to the selected hosts (the three flags are mutually exclusive; use `--exclude` to filter out hosts). In this mode, both paths are treated as literal file paths—characters like `:`, `@`, and `[` are treated as ordinary filename characters rather than remote address syntax.
+- **`--src` and `--dest` compatibility flags**: You can pass `--src <source> --dest <dest>` instead of two positional paths, but both flags must be used together and cannot be mixed with positional arguments.
+
+```bash
+# Connect on port 122 and upload to a remote file named 22:file
+xops scp -P 122 ./config.conf user@host:22:file
+
+# With --host, @ and : in paths are treated as literal filename characters
+xops scp --host web-01 ./config.conf 'user@name:backup'
+
+# Using --src and --dest compatibility flags
+xops scp --src ./config.conf --dest web-01:~/config.conf
+xops scp --tag web --src ./config.conf --dest /etc/app/
+```
+
+- **Progress bar and connection diagnostics**:
+  - A progress bar is shown on `stderr` by default in interactive terminals and hidden automatically when output is piped or redirected.
+  - `-q` / `--quiet`: Hides the progress bar and SSH warnings/diagnostics (errors and security prompts are still shown).
+  - `-v` / `--verbose`: Prints SSH/SFTP connection and transfer diagnostics (independent of project-level `--debug` logs):
+    - `-v`: Shows connection versions, negotiated algorithms, host key fingerprints, authentication steps, and SFTP status.
+    - `-vv`: Adds SFTP extensions, path operations, and per-file transfer results.
+    - `-vvv`: Adds SFTP packet types, request IDs, lengths, and status codes.
+  - Combining `-q` and `-v` follows OpenSSH flag order: `-qv` hides the progress bar while keeping SSH/SFTP diagnostics; `-vq` hides both the progress bar and SSH diagnostics, keeping only SCP transfer and SFTP init messages.
+  - On consoles or pipes that do not support cancelable writes, XOps automatically skips progress and diagnostic output so transfers never hang; redirect `stderr` to a log file (e.g., `2>scp.log`) if you want to capture diagnostics there.
+
+```bash
+# Quiet mode (no progress bar)
+xops scp -q ./file web-01:~/file
+
+# Hide progress bar while showing SSH/SFTP diagnostics
+xops scp -qv ./file web-01:~/file
+
+# Inspect SFTP file operations (-vv) or packet details (-vvv)
+xops scp -qvv ./file web-01:~/file
+```
+
+- **Remote `~` paths**: Remote paths support `~` and `~/...`, resolved relative to the remote SFTP login directory (typically the user's home directory). `~otheruser` is not supported; use an absolute path instead.
+- **Overwrite behavior**: Answering `y` at a prompt or passing `-f`/`--force` overwrites existing files (even when size and modification time match); passing `-n`/`--no-clobber` skips existing files.
+- **Safe local download replacement**: When overwriting an existing local file, XOps tries an atomic rename first. If the filesystem does not allow renaming over an existing file, XOps backs up the original file before putting the downloaded file in place and restores the backup if anything fails (reporting the backup path if restoration itself fails). An existing directory is never replaced by a regular file.
 
 ### 2. Interactive SFTP shell
 

@@ -94,6 +94,8 @@ func (c *Client) UploadFile(ctx context.Context, localPath, remotePath string, s
 }
 
 func (c *Client) uploadFile(ctx context.Context, localPath, remotePath string, size int64, mode os.FileMode, progress ProgressCallback) (retErr error) {
+	finishDiagnostic := c.observeFileTransfer("upload", localPath, remotePath, size)
+	defer func() { finishDiagnostic(retErr) }()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -343,6 +345,8 @@ func (c *Client) DownloadFile(ctx context.Context, remotePath, localPath string,
 
 //nolint:gocyclo
 func (c *Client) downloadFile(ctx context.Context, remotePath, localPath string, size int64, mode os.FileMode, progress ProgressCallback) (retErr error) {
+	finishDiagnostic := c.observeFileTransfer("download", remotePath, localPath, size)
+	defer func() { finishDiagnostic(retErr) }()
 	if err := ctx.Err(); err != nil {
 		return err
 	}

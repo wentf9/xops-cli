@@ -93,7 +93,7 @@ func TestClient_InterruptClosesOnlyOwnSFTPSubsystem(t *testing.T) {
 		t.Fatal("test setup did not reuse the underlying SSH transport")
 	}
 
-	firstSFTPClient, err := NewClient(connectCtx, firstSSHClient)
+	firstSFTPClient, err := NewClient(connectCtx, firstSSHClient, WithDiagnostics(&protocolRecorder{level: 3}))
 	if err != nil {
 		t.Fatalf("create first SFTP client: %v", err)
 	}

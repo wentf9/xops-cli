@@ -12,11 +12,17 @@ import (
 	"time"
 
 	"github.com/pkg/sftp"
+	corelog "github.com/wentf9/xops-cli/core/log"
 	"github.com/wentf9/xops-cli/core/ssh"
 	cryptossh "golang.org/x/crypto/ssh"
 )
 
 type Option func(*Client)
+
+// WithDiagnostics installs a caller-owned observer for subsystem setup.
+func WithDiagnostics(observer corelog.DiagnosticObserver) Option {
+	return func(c *Client) { c.diagnostics = observer }
+}
 
 const (
 	defaultSubsystemSetupTimeout = 10 * time.Second
@@ -82,8 +88,10 @@ type clientState struct {
 }
 
 type Client struct {
-	state  *clientState
-	config TransferConfig
+	state              *clientState
+	config             TransferConfig
+	diagnostics        corelog.DiagnosticObserver
+	diagnosticStreamID uint64
 }
 
 // NewClient creates an SFTP subsystem on an existing SSH connection. Setup is
@@ -106,26 +114,43 @@ func NewClient(ctx context.Context, sshCli *ssh.Client, opts ...Option) (*Client
 	for _, opt := range opts {
 		opt(sftpCli)
 	}
+	diagnostics := newProtocolDiagnostics(sftpCli.diagnostics)
+	if diagnostics != nil {
+		sftpCli.diagnosticStreamID = diagnostics.streamID
+	}
+	event := corelog.Diagnostic{Kind: corelog.SubsystemStarting, StreamID: sftpCli.diagnosticStreamID}
+	if sftpCli.diagnostics != nil {
+		event.User = sshCli.SSHClient().User()
+		if addr := sshCli.SSHClient().RemoteAddr(); addr != nil {
+			event.Host = addr.String()
+		}
+	}
+	corelog.EmitDiagnostic(sftpCli.diagnostics, event)
 
 	client, interrupt, err := newSFTPSubsystem(
 		setupCtx,
 		sshCli,
+		diagnostics,
 		sftp.MaxConcurrentRequestsPerFile(sftpCli.config.ThreadsPerFile),
 		sftp.MaxPacket(32*1024),
 	)
 	if err != nil {
+		event.Kind = corelog.SubsystemFailed
+		corelog.EmitDiagnostic(sftpCli.diagnostics, event)
 		return nil, fmt.Errorf("failed to create sftp subsystem: %w", err)
 	}
 	sftpCli.state.sftpClient = client
 	sftpCli.state.interrupt = interrupt
+	event.Kind = corelog.SubsystemReady
+	corelog.EmitDiagnostic(sftpCli.diagnostics, event)
 
 	return sftpCli, nil
 }
 
-func newSFTPSubsystem(ctx context.Context, sshCli *ssh.Client, opts ...sftp.ClientOption) (*sftp.Client, func() error, error) {
+func newSFTPSubsystem(ctx context.Context, sshCli *ssh.Client, diagnostics *protocolDiagnostics, opts ...sftp.ClientOption) (*sftp.Client, func() error, error) {
 	client, interrupt, err := newSubsystemProtocol(ctx, sshCli, func(rd io.Reader, wr io.WriteCloser) (io.Closer, error) {
 		return sftp.NewClientPipe(rd, wr, opts...)
-	})
+	}, diagnostics)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -134,7 +159,7 @@ func newSFTPSubsystem(ctx context.Context, sshCli *ssh.Client, opts ...sftp.Clie
 
 // newSubsystemProtocol shares bounded SSH setup and cancellation/close ownership
 // between SFTP protocol clients. The factory owns protocol negotiation only.
-func newSubsystemProtocol(ctx context.Context, sshCli *ssh.Client, factory func(io.Reader, io.WriteCloser) (io.Closer, error)) (io.Closer, func() error, error) {
+func newSubsystemProtocol(ctx context.Context, sshCli *ssh.Client, factory func(io.Reader, io.WriteCloser) (io.Closer, error), diagnostics *protocolDiagnostics) (io.Closer, func() error, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
@@ -192,7 +217,8 @@ func newSubsystemProtocol(ctx context.Context, sshCli *ssh.Client, factory func(
 
 	stderrDone := make(chan error, 1)
 	go func() {
-		_, copyErr := io.Copy(io.Discard, stderr)
+		n, copyErr := io.Copy(io.Discard, stderr)
+		diagnostics.stderr(n)
 		if copyErr != nil && !errors.Is(copyErr, io.EOF) && !errors.Is(copyErr, net.ErrClosed) {
 			copyErr = fmt.Errorf("drain SFTP subsystem stderr failed: %w", copyErr)
 		} else {
@@ -201,7 +227,8 @@ func newSubsystemProtocol(ctx context.Context, sshCli *ssh.Client, factory func(
 		stderrDone <- copyErr
 	}()
 
-	client, err := factory(stdout, stdin)
+	rd, wr := diagnostics.pipes(stdout, stdin)
+	client, err := factory(rd, wr)
 	if err != nil {
 		return nil, nil, errors.Join(
 			fmt.Errorf("initialize SFTP protocol failed: %w", err),

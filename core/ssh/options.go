@@ -9,6 +9,11 @@ import (
 // Option 用于配置 Connector
 type Option func(*Connector)
 
+// WithDiagnostics installs an optional caller-owned protocol lifecycle observer.
+func WithDiagnostics(observer logger.DiagnosticObserver) Option {
+	return func(c *Connector) { c.diagnostics = observer }
+}
+
 // WithLogger 配置 Connector 使用的 DebugLogger（必须支持并发调用）
 func WithLogger(l logger.DebugLogger) Option {
 	return func(c *Connector) {

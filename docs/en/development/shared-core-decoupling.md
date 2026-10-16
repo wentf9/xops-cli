@@ -337,3 +337,13 @@ Dynamic authentication acquires an independent slot before calling the host, bou
 The SDK binds sessions to `UserID`. `runtime.ClientIdentityFromContext` exposes verified client and token IDs to tool invocations. Core uses the client ID for operation bindings and transfer scopes, isolating retry, lookup and cancellation. Static-token and stdio scopes retain their existing behavior. Previously issued short-lived transfer credentials retain their original authorization; the verifier does not promise to interrupt admitted work.
 
 `core/mcp/runtime/http_identity_test.go` covers two clients, identity on detached tool calls, transfer isolation, missing identity and redacted errors.
+
+## Optional SSH/SFTP lifecycle diagnostics
+
+`core/log.DiagnosticObserver` is independent of `DebugLogger`. SSH/SFTP accept
+a host-owned observer through optional `WithDiagnostics` options; absence means
+no diagnostic output. Observers must be concurrency-safe, return promptly and
+remain alive until connector/client shutdown. Events contain public protocol
+metadata only and do not participate in trust, authorization or lease decisions.
+SCP is the first CLI consumer; see [SCP diagnostics](./scp-diagnostics.md) for
+output ownership and cancellation limits.

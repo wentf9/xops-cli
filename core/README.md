@@ -132,3 +132,15 @@ chain. Input-bridge initialization failures follow the same bounded shutdown:
 start/join Session.Wait, close the channel, and interrupt the transport if the
 peer never acknowledges closure before joining stdout/stderr workers. A successful
 Session.Close write alone does not establish that output readers have stopped.
+
+SSH and SFTP accept optional `WithDiagnostics(core/log.DiagnosticObserver)` options.
+These typed lifecycle events are independent of `DebugLogger`, contain public
+protocol metadata only, and do not change authentication, host trust or leases.
+Observers are caller-owned, concurrency-safe and must return promptly; keep them
+alive until connector/client shutdown. No observer means no diagnostic output.
+
+SFTP DEBUG2/3 diagnostics observe bounded metadata at existing pipe boundaries.
+Optional `DiagnosticLevel() int` filters higher-level events; absent means all
+levels. DEBUG1 installs no packet observer. SFTP stream/request IDs correlate
+packets without recording handles or file contents. See the
+[SCP diagnostics design](../docs/development/scp-diagnostics.md).

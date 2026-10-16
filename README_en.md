@@ -136,7 +136,7 @@ xops exec --tag web --exclude web-maint-01 -c "uptime"
 xops exec --tag web --shell ./setup.sh --task 5
 
 # Distribute a configuration file to a group of servers
-xops scp ./config.conf --tag web --dest /etc/app/
+xops scp --tag web ./config.conf /etc/app/
 ```
 
 Define idempotent deployments in YAML (`deploy.yaml`):
