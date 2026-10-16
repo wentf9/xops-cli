@@ -209,10 +209,10 @@ func (o *SftpOptions) RunContext(ctx context.Context) (err error) {
 		if errors.Is(err, context.Canceled) {
 			select {
 			case connectionErr := <-disconnectErr:
-				return fmt.Errorf("%s: %w", i18n.T("sftp_shell_start_failed"), connectionErr)
+				return fmt.Errorf("%s: %w", i18n.T("sftp_shell_start_failed"), errors.Join(err, connectionErr))
 			default:
 				if ctxErr := ctx.Err(); ctxErr != nil {
-					return fmt.Errorf("%s: %w", i18n.T("sftp_shell_start_failed"), ctxErr)
+					return fmt.Errorf("%s: %w", i18n.T("sftp_shell_start_failed"), errors.Join(err, ctxErr))
 				}
 			}
 		}

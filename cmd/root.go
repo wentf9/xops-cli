@@ -14,6 +14,7 @@ import (
 	"github.com/wentf9/xops-cli/cmd/host"
 	"github.com/wentf9/xops-cli/cmd/utils"
 	"github.com/wentf9/xops-cli/cmd/version"
+	"github.com/wentf9/xops-cli/internal/sshenv"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
@@ -22,6 +23,13 @@ import (
 func Execute() (err error) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	ctx, closeOutput, err := sshenv.OutputContext(ctx)
+	if err != nil {
+		return fmt.Errorf("select console output relay: %w", err)
+	}
+	// The command owns the relay scope, including bindings whose local Close
+	// failed. Keep this owner until all command/credential I/O has stopped.
+	defer func() { err = errors.Join(err, closeOutput()) }()
 	path, _, err := utils.GetConfigFilePath()
 	if err != nil {
 		return err

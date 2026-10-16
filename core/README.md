@@ -110,8 +110,17 @@ limits and preserving nonzero/signal/missing exit status. Its output accepts fin
 memory sinks or an explicit `ContextWriter`; Linux terminal/pipe files and macOS terminals use owned nonblocking handles
 with cancelable deadlines. macOS also supports pipes already in nonblocking mode;
 blocking anonymous pipes remain unsupported. Windows synchronous/overlapped
-pipes use owned duplicate handles and thread/request-specific cancellation. Regular-file
-PTY redirection, Windows consoles and other unsupported native sinks are rejected before execution.
+pipes use owned duplicate handles and thread/request-specific cancellation, and Windows
+consoles use an owned duplicate handle with a pipe-backed relay subprocess only
+when the host explicitly injects `work, cleanup := WithConsoleOutputRelay(ctx, ConsoleOutputRelay{...})`.
+The host must retain and call cleanup after command I/O ends. This command scope retains failed bindings
+for cleanup retry; no background reaper or global manager is installed. Windows 10+ creation-time Job List
+assignment places each relay atomically in a non-inheritable kill-on-close Job Object, covering parent death.
+Cleanup failures retain sink identity through `OutputError`, and a closed scope rejects new console bindings.
+The Windows host dispatches its private entry point to `ServeConsoleOutputRelay`;
+core never dispatches environment variables or exits the host during package initialization.
+Without injection, consoles retain the unsupported-output fallback. Regular-file
+PTY redirection and other unsupported native sinks are rejected before execution.
 The PTY input file must be a local terminal, and a PTY plan cannot also supply stdin.
 For non-PTY streaming, `RunCommandPlanWithIO` and `RunShellWithoutPTY` use `BindOutput`
 (supporting `ContextWriter`, finite memory sinks, `io.Discard`, `os.DevNull`, local regular files,

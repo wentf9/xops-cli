@@ -24,28 +24,28 @@ In addition to interactive logins, `xops ssh` can execute a single command or st
 xops ssh web-01 uptime
 xops ssh --host web-01 --interpreter server uname -a
 
-# Run with an explicit interpreter and login mode (requires cancelable output and supported local input)
+# Run with Bash without loading the login environment
 xops ssh --host linux-01 --interpreter bash --launch-dialect posix --login-shell=false id
 ```
 
-- **Interpreter selection**: Supports `--interpreter server` (default native passthrough), `bash`, `sh`, `zsh`, `fish`, `powershell`, `pwsh`, and `cmd` (note: CLI explicit execution flags on `xops ssh` check actual local I/O capabilities, including Linux terminal/pipe and macOS terminal/already nonblocking pipe output; Windows console output remains unsupported and file stdin requires a host input bridge; Windows clients can also use buffered `xops exec` commands).
+- **Interpreter selection**: Uses the remote shell by default. To choose an interpreter, use `server`, `bash`, `sh`, `zsh`, `fish`, `powershell`, `pwsh`, or `cmd`. See [Command execution](./exec#interpreters-and-cross-platform-execution) for flag combinations. Terminal use is supported on Windows, macOS, and Linux.
 - **Login environment**: `bash`, `zsh`, and `fish` support `--login-shell`; `--no-login` remains a Bash compatibility flag (non-login `bash -c`); `server` mode rejects login flags.
 - **Input and shell routing**:
   - **Terminal with no command**: Opens an interactive PTY login shell.
-  - **Piped stdin with no command (e.g. `cat script.sh | xops ssh web-01`)**: Routes according to the target node's execution config—if `server` (default), opens a non-PTY SSH shell session streaming stdin and preserving the remote exit code; if configured for `bash`, `sh`, `zsh`, or `fish`, launches that interpreter to read the script from stdin while honoring the node's login setting.
+  - **Piped script with no command (e.g. `cat script.sh | xops ssh web-01`)**: The remote shell reads and runs the script by default. If the node specifies `bash`, `sh`, `zsh`, or `fish`, that interpreter and the node's login settings are used instead.
   - **Empty-command guard**: Passing an explicit empty command (e.g. `xops ssh web-01 ""`) fails immediately instead of opening an interactive shell.
-- **Cancellation safety**: Pressing `Ctrl+C` or hitting a timeout cleanly terminates the SSH session and releases local terminal, pipe, and file handles.
+- **Interrupting and saving output**: Press `Ctrl+C` to interrupt an operation. If piped output is reported as unsupported, run directly in the terminal or use a non-interactive `xops exec` command and save its output to a file.
 
 ## Automatic node saving on first connection
 
-When `ssh`, `sftp`, `scp`, or `exec` connects to a new host for the first time, XOps prepares the node in memory and **saves the node, host, and identity only after the SSH handshake and authentication succeed**:
+When `ssh`, `sftp`, `scp`, or `exec` connects to a new host for the first time, XOps **saves the node, host, and identity only after the connection and authentication succeed**:
 - Timeouts, refused connections, authentication failures, or cancellations before authentication leave no stale entries behind.
 - Saving occurs before opening a shell or running a command, so a subsequent command failure does not delete an authenticated node (nor do connection failures remove existing saved nodes).
 - `--remember never` only prevents saving password/passphrase secrets; authenticated node address details are still saved.
 
 For example, if `xops ssh root@192.0.2.10` fails on default port 22, no `:22` node is created. If `xops ssh root@192.0.2.10:2222` then authenticates, only the `:2222` node is saved, and future commands that omit the port will match it automatically (if multiple ports are saved for the same host, specify the port or use a unique alias).
 
-If saving the node fails, XOps reports the error and closes the connection before handing it to the caller; if the configuration file was replaced on disk but syncing its parent directory failed, the applied configuration is retained without rollback.
+If saving the node fails, the connection reports an error. If the message says the configuration may already have been saved, check `xops host list` before retrying.
 
 ## Sudo / Su privilege escalation
 
@@ -59,10 +59,10 @@ xops exec -x --sudo web-01 id
 
 The node's `sudo_mode` controls how privileges are escalated (`auto`, `root`, passwordless `sudoer`, password `sudo`, or `su`):
 - **Servers that disallow direct root SSH login**: Use `su` mode to log in over SSH as an ordinary user and switch to `root` inside the session without enabling `PermitRootLogin`.
-- **Traditional `sudo` and `sudo-rs` compatibility**: Automated authentication strips remote password prompts and `sudo-rs` asterisk echoes (matching PAM `Password:` prompts with or without trailing spaces). If credentials are missing or rejected, XOps prompts securely. `exec -x --sudo` prints only the command output without extra root shell prompts.
+- **Traditional `sudo` and `sudo-rs` compatibility**: XOps prompts again if credentials are missing or rejected. `exec -x --sudo` shows only the command output without extra root shell prompts.
 - **Multi-shell escalation (`bash` / `sh` / `zsh` / `fish`)**:
   - Nodes configured with `launch_dialect: fish` + `interpreter: fish` (or `bash`/`sh`/`zsh`), or `launch_dialect: posix` + `interpreter: zsh`, support `xops ssh --sudo`, `xops exec --sudo`, and Playbook `sudo: true`.
-  - The authentication handshake runs in a fixed `/bin/sh` control shell (`su` passes `-s /bin/sh`; see the [su manual](https://man7.org/linux/man-pages/man1/su.1.html)) before launching the target interpreter, keeping passwords, handshake tokens, and user `stdin` strictly separated.
+  - The target must provide `/bin/sh`; using `su` also requires support for its `-s` option. See the [su manual](https://man7.org/linux/man-pages/man1/su.1.html).
   - CLI explicit `--interpreter` flags cannot currently be combined with `--sudo`; configure `execution` on the node or Playbook instead.
 
 ## Port forwarding and tunnels

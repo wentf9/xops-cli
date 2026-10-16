@@ -349,4 +349,4 @@ CLI 首个调用方为 SCP，输出和取消边界见 [SCP 分级诊断](./scp-d
 
 ## 原生可取消输出
 
-`BindOutput` 与严格 PTY 输出通过 core 内的平台文件实现 Windows 管道、macOS 终端及已有非阻塞管道的取消。Windows 控制台与 macOS 阻塞匿名管道保留安全降级；原流不关闭、不修改标志，不在 core 引入宿主依赖。详见 [原生可取消输出](./native-cancelable-output.md)。
+`BindOutput` 与严格 PTY 输出通过 core 内的平台文件实现 Windows 管道、宿主显式注入中继的 Windows 控制台、macOS 终端及已有非阻塞管道的取消。未注入的 Windows 控制台及 macOS 阻塞匿名管道保留安全降级；原流不关闭、不修改标志，不在 core 引入宿主依赖。详见 [原生可取消输出](./native-cancelable-output.md)。

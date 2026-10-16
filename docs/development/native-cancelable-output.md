@@ -9,7 +9,7 @@ SCP 的诊断、进度和上传状态，以及共享 SSH 流式/PTY 入口均复
 | macOS 终端 | `F_GETPATH` 定位实际终端并独立以非阻塞模式重开，验证设备身份，Go deadline | 自有句柄；不修改终端模式 |
 | macOS 已有非阻塞管道 | `F_DUPFD_CLOEXEC`、Go deadline | 自有描述符，共享状态；调用方须保持管道非阻塞直到释放绑定 |
 | macOS 普通阻塞匿名管道 | 不支持，保留现有安全降级 | 不设置共享 `O_NONBLOCK`，不引入辅助进程 |
-| Windows 控制台 | 不支持，保留安全降级 | Windows 11 原生 ConPTY 阻塞写入不能由 `CancelSynchronousIo` 可靠取消；不引入辅助进程 |
+| Windows 控制台 | 宿主显式注入中继入口；自有重复句柄，按需启动管道中继子进程，管道请求/ACK 经 `CancelIoEx`/`CancelSynchronousIo` 取消 | 未注入时保留安全降级；取消后检查进程退出，不关闭原句柄或修改控制台模式 |
 | Windows 同步/overlapped 管道 | 自有重复句柄，线程取消加针对具体 OVERLAPPED 的 `CancelIoEx` | 自有事件与固定生命周期的 pinned 内存；不取消借用者其他请求 |
 | 普通文件 | 保留原有实现 | 原生文件系统正在执行的 Write 不承诺可中断 |
 
@@ -17,6 +17,23 @@ Windows 每次 native 写入的取消协程在完成前持续重试，覆盖“�
 返回前等待 I/O 及取消协程结束，再释放事件、请求缓冲区和线程句柄、解除线程锁定。
 OVERLAPPED 事件低位抑制 IOCP 通知，避免向借用管道原有关联的 Go completion port 投递自定义请求。
 NUL 通过句柄对象名识别；不使用可能均为零的设备/管道 FileInfo ID 判断，以免把控制台、管道误当普通文件。
+
+Windows 控制台的宿主通过 `work, cleanup := WithConsoleOutputRelay(ctx, ConsoleOutputRelay{Executable, Args, Env})`
+显式提供中继程序、私有入口参数和环境快照，并必须持有 `cleanup` 到命令 I/O 全部结束。
+作用域拥有所有绑定，包括局部 `closeFn` 清理失败的绑定；作用域关闭先取消输出，再重试回收，失败仍保留所有权供宿主重试。
+不创建全局管理器或后台重试协程。CLI 在 `cmd/root.go` 持有该作用域，在 `cmd/cli/main.go` 的正常命令启动前分派
+`--xops-console-output-relay` 到 `ServeConsoleOutputRelay`。
+core 不读取中继环境变量，不在 `init()` 中退出或接管宿主进程；只导入 core 不会启用中继。
+中继首次非空写入时才创建，借用的控制台句柄和模式始终不变。
+
+Windows 10+ 中继通过创建时的 `PROC_THREAD_ATTRIBUTE_JOB_LIST` 原子加入非继承的 kill-on-close Job Object；
+不存在先启动再加入 Job 的竞态。父进程异常退出会由 OS 关闭 Job 并终止中继，即使中继正阻塞于控制台写入也不依赖管道 EOF。
+不支持该属性或 Job 约束时启动失败，不退回无 Job 的子进程。
+
+Job 终止仍是异步操作，不能当作汇合成功。清理检查 `WAIT_OBJECT_0` 后才释放进程、ACK 和 Job 句柄；
+终止后等待最多 5 秒，失败或超时作为保留目标流的 `ssh.OutputError` 返回，禁用后续写入，由命令作用域继续拥有并重试。
+SFTP 对这类输出/清理错误立即终止会话，不向故障流补打诊断或恢复行编辑器；取消/断连包装也保留原始错误链。
+关闭的中继作用域拒绝新绑定，不静默回退为直接写入。清理错误不代表中继已退出或可以安全交还终端。
 
 macOS 的 `/dev/fd` 与 dup 一样共享文件状态，不能作为 Linux `/proc/self/fd` 的等价替代。
 SCP 终端探测使用 `SyscallConn.Control`；不调用可能清除管道 `O_NONBLOCK` 的 `File.Fd`。
@@ -42,8 +59,13 @@ Playbook 同时保留执行、步骤及报告输出错误。
 
 ## 验证与边界
 
-原生平台测试包括 Windows 同步/overlapped 管道阻塞取消、借用句柄、控制台降级，
-以及 ConPTY 不排空输出时的安全降级（`integration`）；macOS 覆盖暂停终端、非阻塞管道取消、
+中继版本及本轮评审修复尚待 Windows 原生 CI 验证；下述 `vm` 历史记录仅覆盖原管道与控制台降级实现，
+不能作为新中继的原生通过证据。回归测试要求实际进入控制台写入后再取消，并在恢复 ConPTY 排空前确认中继进程退出；
+另覆盖未注入时降级、环境变量不接管进程、命令作用域接管失败绑定、关闭后拒绝新绑定，以及不运行 Go defer 的杀父回收。
+SFTP 便携回归覆盖直接、包装和合并的输出错误（包括与中断合并），验证零补打且不吞掉错误。
+
+原生平台测试包括 Windows 同步/overlapped 管道阻塞取消、借用句柄、控制台绑定与中继写入，
+以及 ConPTY 不排空输出时的阻塞写入取消（`integration`）；macOS 覆盖暂停终端、非阻塞管道取消、
 阻塞管道拒绝、借用标志和终端可继续使用。已有 CI 分别在 Windows/macOS 执行相应测试，
 Windows ConPTY 增加独立回归步骤。本次已在 Windows 11 `vm` 原生验证管道与控制台降级；
 macOS 仍待原生 CI，交叉编译和 Wine 不作为原生通过证据。

@@ -167,7 +167,7 @@ func (c *Client) RunInteractivePlan(ctx context.Context, plan CommandPlan) error
 
 // RunInteractivePlanWithIO requires local terminal input and finite or
 // context-aware output. Native terminal/pipe support follows the platform
-// adapters; Windows consoles and regular-file PTY redirection remain unsupported.
+// adapters; regular-file PTY redirection and macOS blocking pipes remain unsupported.
 func (c *Client) RunInteractivePlanWithIO(ctx context.Context, plan CommandPlan, streams InteractiveIO) (retErr error) {
 	if err := validateCommandExecution(ctx, c, plan); err != nil {
 		return err

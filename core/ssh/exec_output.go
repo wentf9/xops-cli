@@ -2,6 +2,7 @@ package ssh
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -65,9 +66,12 @@ func isNullDevice(info os.FileInfo) bool {
 // device, local regular files, and native terminal/pipe adapters bind to ctx.
 // Linux and macOS terminal adapters use owned nonblocking handles; macOS also
 // accepts already nonblocking pipes. Windows synchronous/overlapped pipes use
-// owned duplicate handles with thread/request-specific cancellation. The caller's
-// file is never closed and its flags or console modes are not modified. macOS
-// blocking pipes and Windows consoles remain unsupported. Unlike PTY output, no
+// owned duplicate handles with thread/request-specific cancellation, and Windows
+// consoles use an owned duplicate handle with a pipe-backed relay subprocess
+// only when the host explicitly selects WithConsoleOutputRelay on ctx and owns
+// its returned cleanup function through command completion.
+// The caller's file is never closed and its flags or console modes are not modified.
+// macOS blocking pipes remain unsupported. Unlike PTY output, no
 // per-write idle limit is applied, so a slow consumer such as a pager is not
 // treated as a failure; only ctx cancellation or its deadline interrupts a write.
 //
@@ -105,6 +109,10 @@ func BindOutput(ctx context.Context, target io.Writer) (writer io.Writer, closeF
 	}
 	bound, closeBound, bindErr := prepareContextOutputWithLimit(ctx, target, 0)
 	if bindErr != nil {
+		var outputErr *OutputError
+		if errors.As(bindErr, &outputErr) {
+			return nil, noop, false, bindErr // A closed scope must not fall back to raw I/O.
+		}
 		return target, noop, false, nil
 	}
 	return bound, closeBound, true, nil

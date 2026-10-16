@@ -55,8 +55,8 @@ not claim to reproduce OpenSSH's output line for line with the Go SSH backend.
   exceeding one second cancels the output binding. Shutdown closes the queue,
   joins the writer and releases the binding. Borrowed stdout/stderr streams are never closed.
   Command cancellation also cancels the output binding.
-- Windows synchronous/overlapped pipes, plus macOS terminals and
-  already nonblocking pipes, use native cancelable bindings. Windows consoles, macOS blocking
+- Windows consoles and synchronous/overlapped pipes, plus macOS terminals and
+  already nonblocking pipes, use native cancelable bindings. macOS blocking
   anonymous pipes and other unsupported sinks skip progress, diagnostics and
   upload status messages on that stream while transfers continue, with no direct writes at shutdown.
   Redirect stderr to a regular log file to retain diagnostics. Regular-file
