@@ -86,11 +86,11 @@ prompt_host_key_confirm:
 scp_short:
   other: "在本地和远程主机之间传输文件"
 scp_long:
-  other: "在本地和远程主机之间传输文件，支持多台主机并行传输。\n\n用法示例（兼容 OpenSSH 风格）:\n  xops scp -i ~/.ssh/id_rsa local_path user@host:remote_path\n  xops scp local_path user@host:remote_path\n  xops scp user@host:remote_path local_path\n  xops scp user1@host1:path1 user2@host2:path2\n\n批量传输 (xops 增强):\n  xops scp local_path --dest remote_path --host host1,host2\n  xops scp local_path --dest remote_path --tag web\n\n连接目标语义说明:\n  远程路径中的显式 user/port 完整参与匹配，自动复用已有 Host 并严格隔离 Identity 凭证。\n  通过 flags 提供主机和用户信息时会覆盖参数提供的信息。\n  --host、--ifile (-I) 和 --tag 互斥，只能选择一种，再用 --exclude 排除部分目标。"
+  other: "在本地与远程主机之间上传、下载或跨机中转文件。\n\n单机传输（支持节点名、别名或 [user@]host，指定端口用 -P）:\n  xops scp local_path web-01:remote_path\n  xops scp web-01:remote_path local_path\n  xops scp web-01:path1 web-02:path2\n  xops scp -i ~/.ssh/id_rsa -P 122 local_path user@host:remote_path\n\n指定主机或批量上传（本地 -> 一台或多台主机）:\n  xops scp --host web-01 local_path remote_path\n  xops scp --host web-01,web-02 local_path remote_path\n  xops scp --tag web local_path remote_path\n  xops scp -I hosts.txt local_path remote_path\n\n具名路径兼容写法（--src 与 --dest 须成对使用，不可与位置参数混用）:\n  xops scp --src local_path --dest web-01:remote_path\n\n路径与目标说明:\n  必须提供源路径和目标路径（第一个为源，第二个为目标）。\n  地址冒号后的内容全部作为文件路径，例如 user@host:22:file 表示文件 22:file；SSH 端口请用 -P/--port 指定。\n  未指定 -P 时使用匹配节点的配置端口；若同一主机匹配到多个端口会提示歧义，请用 -P 或唯一别名区分。\n  --host、-I/--ifile、--tag 互斥，可用 --exclude 排除部分主机；使用这些选项时固定从本地上传，两个路径中的 :、@ 按普通文件名字符处理。\n\n进度与诊断:\n  终端默认显示进度条（重定向或管道时自动隐藏）。\n  -q/--quiet 隐藏进度条及 SSH 告警与诊断（保留失败报错和安全确认）。\n  -v/--verbose 输出 SSH/SFTP 连接与传输诊断（与 --debug 项目日志独立）：\n    -v   连接、认证与传输状态\n    -vv  附加 SFTP 扩展与文件操作\n    -vvv 附加 SFTP 数据包信息\n  组合顺序同 OpenSSH：-qv 隐藏进度但保留 SSH/SFTP 诊断；-vq 仅保留 SCP 传输诊断。"
 flag_scp_src:
-  other: "源路径 (批量模式使用)"
+  other: "源路径（兼容写法，须与 --dest 成对使用，不可与位置路径混用）"
 flag_scp_dest:
-  other: "目标路径 (批量模式使用)"
+  other: "目标路径（兼容写法，须与 --src 成对使用，不可与位置路径混用）"
 flag_ifile:
   other: "主机列表文件路径"
 flag_scp_tag:
@@ -758,7 +758,7 @@ sftp_shell_start_failed:
 scp_err_no_src:
   other: "必须指定源路径"
 scp_err_no_dest:
-  other: "必须指定目标路径或目标主机/标签组"
+  other: "必须指定目标路径"
 scp_err_both_local:
   other: "不支持的传输模式: 两端都是本地路径"
 scp_err_stat_remote:
@@ -1138,3 +1138,16 @@ flag_host_interpreter:
   other: "新节点的显式解释器：server、bash、sh、zsh、fish、powershell、pwsh 或 cmd"
 flag_host_launch_dialect:
   other: "新节点的显式启动方言：unknown、posix、fish、powershell 或 cmd"
+scp_err_mixed_paths:
+  other: "--src/--dest 不能与位置路径参数混用；请直接传 <源路径> <目标路径>，或同时使用 --src 和 --dest"
+scp_err_path_count:
+  other: "请提供源路径和目标路径（例如 xops scp <源路径> <目标路径>，或使用 --src 与 --dest）"
+scp_err_empty_selector:
+  other: "主机选择器不能为空"
+scp_err_port_zero:
+  other: "SSH 端口须在 1 到 65535 之间"
+flag_scp_quiet:
+  other: "隐藏进度条及 SSH 告警与诊断（保留失败报错和安全确认）"
+
+flag_scp_verbose:
+  other: "输出 SSH/SFTP 诊断信息（-vv 含文件操作，-vvv 含 SFTP 数据包；独立于 --debug）"

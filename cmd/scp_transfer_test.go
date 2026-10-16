@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +29,8 @@ type scpTransferFixture struct {
 	ctx       context.Context
 	repo      *config.Repository
 	connector *xssh.Connector
+	address   string
+	hostKey   cryptossh.PublicKey
 	// Keep native paths for fixture I/O separate from the server's SFTP paths:
 	// on Windows these are C:\... and /C:/..., respectively.
 	home       string
@@ -41,7 +44,7 @@ func closeSCPTestResource(t *testing.T, resource io.Closer) {
 	}
 }
 
-func newSCPTransferFixture(t *testing.T) scpTransferFixture {
+func newSCPTransferFixture(t *testing.T, opts ...xssh.Option) scpTransferFixture {
 	t.Helper()
 	localHome := t.TempDir()
 	t.Setenv("HOME", localHome)
@@ -90,10 +93,12 @@ func newSCPTransferFixture(t *testing.T) scpTransferFixture {
 		t.Fatal(err)
 	}
 	snapshot := provider.Snapshot()
-	hostID := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
-	snapshot.Hosts.Set(hostID, models.Host{Address: "127.0.0.1", Port: uint16(port)})
+	// Inventory treats loopback nodes as local and excludes them from tags.
+	// The connector below still directs every connection to the loopback fixture.
+	hostID := net.JoinHostPort("scp.fixture.invalid", strconv.Itoa(port))
+	snapshot.Hosts.Set(hostID, models.Host{Address: "scp.fixture.invalid", Port: uint16(port)})
 	snapshot.Identities.Set("test", models.Identity{User: "test", AuthType: "password", Password: "test"})
-	snapshot.Nodes.Set("test@"+hostID, models.Node{HostRef: hostID, IdentityRef: "test", Alias: []string{"scp-test"}})
+	snapshot.Nodes.Set("test@"+hostID, models.Node{HostRef: hostID, IdentityRef: "test", Alias: []string{"scp-test"}, Tags: []string{"scp-fixture"}})
 	repo, err := config.NewRepositoryWithoutOpenSSH(snapshot, &memoryStore{cfg: snapshot})
 	if err != nil {
 		t.Fatal(err)
@@ -101,7 +106,7 @@ func newSCPTransferFixture(t *testing.T) scpTransferFixture {
 	connector := xssh.NewConnector(tunnelTestProvider{cfg: &xssh.ClientConfig{
 		NodeID: "test@" + hostID, Address: "127.0.0.1", Port: port,
 		User: "test", AuthType: "password", Password: "test",
-	}}, xssh.WithEnvironment(sshenv.Discover()))
+	}}, append([]xssh.Option{xssh.WithEnvironment(sshenv.Discover())}, opts...)...)
 	connector.AcceptNewHostKey.Store(true)
 	t.Cleanup(func() {
 		if err := connector.CloseAll(); err != nil {
@@ -117,7 +122,7 @@ func newSCPTransferFixture(t *testing.T) scpTransferFixture {
 	if err != nil {
 		t.Fatalf("resolve SCP fixture remote home: %v", err)
 	}
-	return scpTransferFixture{ctx: ctx, repo: repo, connector: connector, home: remoteHome, remoteHome: sftpHome}
+	return scpTransferFixture{ctx: ctx, repo: repo, connector: connector, address: listener.Addr().String(), hostKey: signer.PublicKey(), home: remoteHome, remoteHome: sftpHome}
 }
 
 func serveSCPTestConnection(t *testing.T, ctx context.Context, conn net.Conn, cfg *cryptossh.ServerConfig, home string) {
@@ -169,6 +174,11 @@ func serveSCPTestConnection(t *testing.T, ctx context.Context, conn net.Conn, cf
 					defer closeSCPTestResource(t, server)
 					if err := server.Serve(); err != nil && !errors.Is(err, io.EOF) {
 						t.Errorf("serve SCP test SFTP: %v", err)
+					}
+					// OpenSSH waits for the subsystem's exit status after closing
+					// SFTP stdin. Go clients may already have closed the channel.
+					if _, err := channel.SendRequest("exit-status", false, cryptossh.Marshal(struct{ Status uint32 }{0})); err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+						t.Errorf("send SCP fixture subsystem exit status: %v", err)
 					}
 					return
 				}
@@ -249,6 +259,157 @@ func TestSCPDownloadRemoteHome(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertSCPTestFile(t, filepath.Join(destination, "payload.txt"), "payload")
+}
+
+func TestSCPTransferSingleHostUpload(t *testing.T) {
+	for _, target := range []string{"./", "~/code/"} {
+		t.Run(target, func(t *testing.T) {
+			fixture := newSCPTransferFixture(t)
+			if err := os.Mkdir(filepath.Join(fixture.home, "code"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			local := filepath.Join(t.TempDir(), "payload.txt")
+			writeSCPTestFile(t, local, "single host payload")
+			options := NewScpOptions()
+			options.Host = "scp-test"
+			if err := options.Complete(nil, []string{local, target}); err != nil {
+				t.Fatal(err)
+			}
+			if err := options.Validate(); err != nil {
+				t.Fatal(err)
+			}
+			if err := options.runTransfer(fixture.ctx, fixture.repo, fixture.connector); err != nil {
+				t.Fatal(err)
+			}
+			want := filepath.Join(fixture.home, "payload.txt")
+			if target == "~/code/" {
+				want = filepath.Join(fixture.home, "code", "payload.txt")
+			}
+			assertSCPTestFile(t, want, "single host payload")
+		})
+	}
+}
+
+func TestSCPTransferSingleHostExcluded(t *testing.T) {
+	fixture := newSCPTransferFixture(t)
+	options := NewScpOptions()
+	options.Host = "scp-test"
+	options.Exclude = []string{"scp-test"}
+	options.Source = filepath.Join(t.TempDir(), "payload.txt")
+	options.Dest = "./"
+	writeSCPTestFile(t, options.Source, "excluded payload")
+	if err := options.runTransfer(fixture.ctx, fixture.repo, fixture.connector); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(fixture.home, "payload.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("excluded host received a file: %v", err)
+	}
+}
+
+func TestSCPSelectorUploadsLiteralPaths(t *testing.T) {
+	for _, selector := range []string{"host", "hosts", "tag", "ifile"} {
+		for _, name := range []string{"name@source[", "user@host:source["} {
+			t.Run(selector+"/"+name, func(t *testing.T) {
+				if runtime.GOOS == "windows" && strings.Contains(name, ":") {
+					t.Skip("Windows filesystems do not allow colons in filenames")
+				}
+				fixture := newSCPTransferFixture(t)
+				options := NewScpOptions()
+				switch selector {
+				case "host":
+					options.Host = "scp-test"
+				case "hosts":
+					options.Host = "scp-test,scp-test"
+					options.NoOverwrite = true
+				case "tag":
+					options.Tag = "scp-fixture"
+				case "ifile":
+					options.HostFile = filepath.Join(t.TempDir(), "hosts.txt")
+					writeSCPTestFile(t, options.HostFile, "scp-test\n")
+				}
+				t.Chdir(t.TempDir())
+				source := name
+				writeSCPTestFile(t, source, "literal path payload")
+				target := "dest@" + name
+				if err := options.Complete(nil, []string{source, target}); err != nil {
+					t.Fatal(err)
+				}
+				if err := options.runTransfer(fixture.ctx, fixture.repo, fixture.connector); err != nil {
+					t.Fatal(err)
+				}
+				assertSCPTestFile(t, filepath.Join(fixture.home, target), "literal path payload")
+				assertSCPTestFile(t, source, "literal path payload")
+			})
+		}
+	}
+}
+
+func TestSCPSelectorUploadCanceled(t *testing.T) {
+	fixture := newSCPTransferFixture(t)
+	options := NewScpOptions()
+	options.Host = "scp-test"
+	options.Source = filepath.Join(t.TempDir(), "payload.txt")
+	options.Dest = "./"
+	writeSCPTestFile(t, options.Source, "canceled payload")
+	ctx, cancel := context.WithCancel(fixture.ctx)
+	cancel()
+	if err := options.runTransfer(ctx, fixture.repo, fixture.connector); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled upload error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(fixture.home, "payload.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled upload created a file: %v", err)
+	}
+}
+
+func TestSCPTransferOneToOneDirections(t *testing.T) {
+	fixture := newSCPTransferFixture(t)
+	writeSCPTestFile(t, filepath.Join(fixture.home, "payload.txt"), "remote payload")
+	destination := t.TempDir()
+	options := NewScpOptions()
+	options.Source = "scp-test:~/payload.txt"
+	options.Dest = destination
+	if err := options.runTransfer(fixture.ctx, fixture.repo, fixture.connector); err != nil {
+		t.Fatal(err)
+	}
+	assertSCPTestFile(t, filepath.Join(destination, "payload.txt"), "remote payload")
+
+	options.Source = filepath.Join(destination, "payload.txt")
+	options.Dest = "scp-test:~/uploaded.txt"
+	if err := options.runTransfer(fixture.ctx, fixture.repo, fixture.connector); err != nil {
+		t.Fatal(err)
+	}
+	assertSCPTestFile(t, filepath.Join(fixture.home, "uploaded.txt"), "remote payload")
+
+	// A unique alias selects the configured SSH port without embedding it in the path.
+	options.Source = "scp-test:payload.txt"
+	options.Dest = "scp-test:~/relayed.txt"
+	if err := options.runTransfer(fixture.ctx, fixture.repo, fixture.connector); err != nil {
+		t.Fatal(err)
+	}
+	assertSCPTestFile(t, filepath.Join(fixture.home, "relayed.txt"), "remote payload")
+}
+
+func TestSCPTransferNumericFilename(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows fixture filesystem cannot store filenames containing colons")
+	}
+	fixture := newSCPTransferFixture(t)
+	writeSCPTestFile(t, filepath.Join(fixture.home, "22:file"), "numeric filename payload")
+	directory := t.TempDir()
+	options := NewScpOptions()
+	options.Source = "scp-test:22:file"
+	options.Dest = directory
+	if err := options.runTransfer(fixture.ctx, fixture.repo, fixture.connector); err != nil {
+		t.Fatal(err)
+	}
+	local := filepath.Join(directory, "22:file")
+	assertSCPTestFile(t, local, "numeric filename payload")
+	options.Source = local
+	options.Dest = "scp-test:22:uploaded"
+	if err := options.runTransfer(fixture.ctx, fixture.repo, fixture.connector); err != nil {
+		t.Fatal(err)
+	}
+	assertSCPTestFile(t, filepath.Join(fixture.home, "22:uploaded"), "numeric filename payload")
 }
 
 func TestSCPBatchAndRelayRemoteHome(t *testing.T) {

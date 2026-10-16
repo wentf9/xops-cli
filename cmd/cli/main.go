@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -29,8 +30,18 @@ func main() {
 	}
 
 	if err := cmd.Execute(); err != nil {
-		logger.PrintError(err.Error())
+		reportError(err)
 		os.Exit(1)
+	}
+}
+
+// Standard streams can share a sink, so failed auxiliary output must not be
+// reported to them again, even when the original failure was on stdout.
+// Preserve the nonzero exit status and leave all other error reporting intact.
+func reportError(err error) {
+	var outputErr *cmd.SCPOutputError
+	if !errors.As(err, &outputErr) {
+		logger.PrintError(err.Error())
 	}
 }
 

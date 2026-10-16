@@ -25,7 +25,7 @@ func (c *Client) CreatePrivateExclusive(ctx context.Context, name string, write 
 	defer cancel()
 	raw, interrupt, err := newSubsystemProtocol(setupCtx, c.state.sshClient, func(rd io.Reader, wr io.WriteCloser) (io.Closer, error) {
 		return newPrivateFileStream(ctx, rd, wr)
-	})
+	}, newProtocolDiagnostics(c.diagnostics))
 	if err != nil {
 		return false, false, err
 	}

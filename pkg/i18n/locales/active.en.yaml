@@ -86,11 +86,11 @@ prompt_host_key_confirm:
 scp_short:
   other: "Transfer files between local and remote hosts"
 scp_long:
-  other: "Transfer files between local and remote hosts with parallel multi-host support.\n\nUsage examples (OpenSSH-compatible):\n  xops scp -i ~/.ssh/id_rsa local_path user@host:remote_path\n  xops scp local_path user@host:remote_path\n  xops scp user@host:remote_path local_path\n  xops scp user1@host1:path1 user2@host2:path2\n\nBatch transfer (xops enhanced):\n  xops scp local_path --dest remote_path --host host1,host2\n  xops scp local_path --dest remote_path --tag web\n\nConnection Target Semantics:\n  Explicit user/port in remote paths participate fully in matching, automatically reuse existing Host records, and strictly isolate Identity credentials.\n  The --host, --ifile (-I), and --tag selectors are mutually exclusive; choose one and use --exclude to narrow its targets."
+  other: "Upload, download, or relay files between local and remote hosts.\n\nSingle-host transfer (node name, alias, or [user@]host; use -P for port):\n  xops scp local_path web-01:remote_path\n  xops scp web-01:remote_path local_path\n  xops scp web-01:path1 web-02:path2\n  xops scp -i ~/.ssh/id_rsa -P 122 local_path user@host:remote_path\n\nTarget or batch upload (local -> one or more hosts):\n  xops scp --host web-01 local_path remote_path\n  xops scp --host web-01,web-02 local_path remote_path\n  xops scp --tag web local_path remote_path\n  xops scp -I hosts.txt local_path remote_path\n\nNamed-flag compatibility (must pass both --src and --dest without positional paths):\n  xops scp --src local_path --dest web-01:remote_path\n\nPath and target rules:\n  Both source and destination paths are required (source first, destination second).\n  Everything after the host colon is treated as the file path (e.g., user@host:22:file means file 22:file); use -P/--port for the SSH port.\n  When -P is omitted, XOps uses the matched node's configured port; if a host matches multiple ports, specify -P or a unique alias.\n  --host, -I/--ifile, and --tag are mutually exclusive (use --exclude to filter hosts). When any of them is set, XOps always uploads from local and treats : or @ in both paths as literal filename characters.\n\nProgress and diagnostics:\n  Progress bars appear by default in terminals and are hidden when redirected or piped.\n  -q/--quiet hides the progress bar and SSH warnings/diagnostics (errors and security prompts remain visible).\n  -v/--verbose prints SSH/SFTP connection and transfer diagnostics (independent of --debug):\n    -v   connection, auth, and transfer status\n    -vv  adds SFTP extensions and file operations\n    -vvv adds SFTP packet details\n  Flag order follows OpenSSH: -qv hides progress while keeping SSH/SFTP diagnostics; -vq keeps only SCP transfer diagnostics."
 flag_scp_src:
-  other: "Source path (batch mode)"
+  other: "Source path (compatibility flag; requires --dest and cannot mix with positional paths)"
 flag_scp_dest:
-  other: "Destination path (batch mode)"
+  other: "Destination path (compatibility flag; requires --src and cannot mix with positional paths)"
 flag_ifile:
   other: "Host list file path"
 flag_scp_tag:
@@ -757,7 +757,7 @@ sftp_shell_start_failed:
 scp_err_no_src:
   other: "Source path must be specified"
 scp_err_no_dest:
-  other: "Destination path or host/tag must be specified"
+  other: "Destination path is required"
 scp_err_both_local:
   other: "Unsupported transfer mode: both ends are local paths"
 scp_err_stat_remote:
@@ -1137,3 +1137,16 @@ flag_host_interpreter:
   other: "Explicit interpreter for new nodes: server, bash, sh, zsh, fish, powershell, pwsh or cmd"
 flag_host_launch_dialect:
   other: "Explicit launch dialect for new nodes: unknown, posix, fish, powershell or cmd"
+scp_err_mixed_paths:
+  other: "Cannot mix --src/--dest with positional paths; pass <source> <dest> or use both --src and --dest"
+scp_err_path_count:
+  other: "Please provide both source and destination paths (e.g. xops scp <source> <dest>, or use --src and --dest)"
+scp_err_empty_selector:
+  other: "Host selector cannot be empty"
+scp_err_port_zero:
+  other: "SSH port must be between 1 and 65535"
+flag_scp_quiet:
+  other: "Hide progress bar and SSH warnings/diagnostics (errors and security prompts remain)"
+
+flag_scp_verbose:
+  other: "Print SSH/SFTP diagnostics (-vv includes file ops, -vvv includes SFTP packets; independent of --debug)"

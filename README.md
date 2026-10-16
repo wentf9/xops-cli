@@ -134,7 +134,7 @@ xops exec --tag web --exclude web-maint-01 -c "uptime"
 xops exec --tag web --shell ./setup.sh --task 5
 
 # 批量分发配置文件到目标服务器群
-xops scp ./config.conf --tag web --dest /etc/app/
+xops scp --tag web ./config.conf /etc/app/
 ```
 
 使用 YAML 编写声明式 Playbook（`deploy.yaml`），实现幂等部署：

@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -66,6 +67,7 @@ type Connector struct {
 	// keepAliveWG 覆盖配置 watcher 及已从注册表驱逐、但尚未完全返回的心跳 goroutine。
 	keepAliveWG sync.WaitGroup
 	logger      logger.DebugLogger
+	diagnostics logger.DiagnosticObserver
 }
 
 // keepAliveConfig 描述 Connector 级心跳配置（见 EnableKeepAlive）
@@ -407,10 +409,12 @@ func (c *Connector) connectNode(ctx context.Context, planNode connectionPlanNode
 	var probeErr error
 	if cachedClient, ok := c.clients.Get(nodeName); ok {
 		if cachedClient.SSHClient.Conn == nil {
+			logger.EmitDiagnostic(c.diagnostics, logger.Diagnostic{Kind: logger.ConnectionReused, NodeID: nodeName})
 			return c.wrapCachedClient(planNode.cfg, cachedClient), nil
 		}
 
 		if err := c.probeCachedClient(ctx, cachedClient); err == nil {
+			logger.EmitDiagnostic(c.diagnostics, logger.Diagnostic{Kind: logger.ConnectionReused, NodeID: nodeName})
 			return c.wrapCachedClient(planNode.cfg, cachedClient), nil
 		} else {
 			probeErr = err
@@ -874,8 +878,13 @@ func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, cfg *
 		cfg.Port = 22
 	}
 	targetAddr := fmt.Sprintf("%s:%d", cfg.Address, cfg.Port)
+	_, proxied := dialer.(*SSHProxyDialer)
+	event := logger.Diagnostic{Kind: logger.Connecting, NodeID: nodeName, Host: cfg.Address, User: cfg.User, Port: cfg.Port, Proxied: proxied}
+	logger.EmitDiagnostic(c.diagnostics, event)
 	conn, err := dialer.DialContext(ctx, "tcp", targetAddr)
 	if err != nil {
+		event.Kind = logger.HandshakeFailed
+		logger.EmitDiagnostic(c.diagnostics, event)
 		if isHandshakeTimeoutError(err) && coordinator != nil {
 			coordinator.FailClosed(context.DeadlineExceeded)
 		}
@@ -893,6 +902,8 @@ func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, cfg *
 			Err:      dialErr,
 		}
 	}
+	event.Kind = logger.Connected
+	logger.EmitDiagnostic(c.diagnostics, event)
 	if _, proxied := dialer.(*SSHProxyDialer); !proxied {
 		conn = &physicalSSHConn{Conn: conn}
 	}
@@ -911,6 +922,8 @@ func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, cfg *
 	ncc, chans, reqs, err := ssh.NewClientConn(activity, targetAddr, sshConfig)
 	if err != nil {
 		stopCancelClose()
+		event.Kind = logger.HandshakeFailed
+		logger.EmitDiagnostic(c.diagnostics, event)
 		return nil, nil, c.handleHandshakeFailure(ctx, coordinator, nodeName, conn, err)
 	}
 	stoppedCancelClose := stopCancelClose()
@@ -936,7 +949,23 @@ func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, cfg *
 		}
 	}
 
+	c.observeAuthenticated(ncc, event)
 	return ssh.NewClient(&activitySSHConn{Conn: ncc, activity: activity}, chans, reqs), conn, nil
+}
+
+func (c *Connector) observeAuthenticated(ncc ssh.Conn, event logger.Diagnostic) {
+	if c.diagnostics == nil {
+		return
+	}
+	event.Kind = logger.Authenticated
+	event.ClientVersion, event.ServerVersion = string(ncc.ClientVersion()), string(ncc.ServerVersion())
+	if metadata, ok := ncc.(ssh.AlgorithmsConnMetadata); ok {
+		algorithms := metadata.Algorithms()
+		event.KeyExchange, event.HostKey = algorithms.KeyExchange, algorithms.HostKey
+		event.ReadCipher, event.WriteCipher = algorithms.Read.Cipher, algorithms.Write.Cipher
+		event.ReadMAC, event.WriteMAC = algorithms.Read.MAC, algorithms.Write.MAC
+	}
+	logger.EmitDiagnostic(c.diagnostics, event)
 }
 
 func setInitialHandshakeDeadline(ctx context.Context, conn net.Conn, nodeName string, timeout time.Duration) error {
@@ -1168,7 +1197,8 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 					}
 				}
 			},
-			Logger: c.getLogger(),
+			Logger:      c.getLogger(),
+			Diagnostics: c.diagnostics,
 		})
 		if err != nil {
 			return nil, nil, err
@@ -1220,14 +1250,46 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 		clientTimeout = 15 * time.Second
 	}
 
-	return &ssh.ClientConfig{
+	clientConfig := &ssh.ClientConfig{
 		User:              cfg.User,
 		Auth:              authMethods,
 		AuthCallback:      authCallback,
 		HostKeyCallback:   hostKeyCallback,
 		HostKeyAlgorithms: hostKeyAlgorithms,
 		Timeout:           clientTimeout,
-	}, cleanup, nil
+	}
+	c.observeSSHConfig(cfg, clientConfig)
+	return clientConfig, cleanup, nil
+}
+
+// observeSSHConfig adds diagnostics without changing fallback selection or trust results.
+func (c *Connector) observeSSHConfig(cfg *ClientConfig, clientConfig *ssh.ClientConfig) {
+	if c.diagnostics == nil {
+		return
+	}
+	if clientConfig.AuthCallback == nil && len(clientConfig.Auth) == 1 {
+		protocol := "publickey"
+		if cfg.AuthType == "password" {
+			protocol = "password"
+		}
+		clientConfig.AuthCallback = func(ctx *ssh.ClientAuthContext) (ssh.AuthMethod, error) {
+			event := authenticationDiagnostic(ctx)
+			logger.EmitDiagnostic(c.diagnostics, event)
+			// Match x/crypto's fallback selection without replacing it.
+			// A successful initial "none" does not invoke this callback.
+			if slices.Contains(ctx.AllowedMethods, protocol) && !slices.Contains(ctx.TriedMethods, protocol) {
+				event.Kind, event.Method, event.Methods = logger.AuthenticationAttempt, protocol, nil
+				logger.EmitDiagnostic(c.diagnostics, event)
+			}
+			return nil, nil
+		}
+	}
+	verify := clientConfig.HostKeyCallback
+	clientConfig.HostKeyCallback = func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		err := verify(hostname, remote, key)
+		logger.EmitDiagnostic(c.diagnostics, logger.Diagnostic{Kind: logger.HostKeyChecked, NodeID: cfg.NodeID, HostKey: key.Type(), Fingerprint: ssh.FingerprintSHA256(key), Accepted: err == nil})
+		return err
+	}
 }
 
 func buildKeyAuthMethod(cfg *ClientConfig, extraPassphrase []byte, resolver ...func(string) string) (ssh.AuthMethod, error) {

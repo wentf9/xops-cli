@@ -90,10 +90,14 @@ xops scp 'web-01:/srv/report.txt' 'archive-01:/srv/report.txt' --no-clobber
 
 # Batch upload to selected nodes
 xops host list --tag web
-xops scp ./config.conf --tag web --dest /srv/app/ --task 3 --no-clobber
+xops scp --tag web --task 3 --no-clobber ./config.conf /srv/app/
 ```
 
-Choose `--no-clobber` to skip existing targets or `--force` for authorized replacement. `--force` overwrites even when size/mtime match. Do not combine those opposing policies. `--task` controls parallel host transfers, `--thread` per-file concurrency, and `--progress` displays progress. Batch target selectors `--host`, `--ifile`/`-I`, and `--tag` are mutually exclusive; combining them is rejected before transfer. Use `--exclude` to narrow the selected set.
+SCP requires two paths: `xops scp [options] <source> <destination>` (or pass both `--src` and `--dest` without positional paths; never mix the two). Without host selectors, either path accepts `[[user@]host:]file` (node name, alias, or `[user@]host`). Everything after the address delimiter (after `]:` for IPv6) is the file path, including numeric prefixes like `22:file`. Use `-P`/`--port` for an explicit SSH port—never `-p` or `host:port:file`. When `-P` is omitted, a unique matching node supplies its configured port; if multiple ports match, disambiguate with `-P` or a unique alias. With `--host`, `--tag`, or `--ifile`/`-I` (mutually exclusive; filter with `--exclude`), SCP always uploads from local and treats both paths as literal filenames (including `:` and `@`).
+
+Terminals show a progress bar on `stderr` by default (omitted when piped or redirected). `-q`/`--quiet` hides progress and SSH warnings/diagnostics while keeping errors and security prompts. `-v`/`--verbose` prints SSH/SFTP and transfer diagnostics independently of global `--debug` (`-v` connection/auth/SFTP state, `-vv` SFTP extensions and file ops, `-vvv` SFTP packet metadata). Flag order follows OpenSSH: `-qv` hides progress while showing SSH/SFTP diagnostics; `-vq` hides progress and SSH diagnostics while keeping SCP transfer and SFTP init messages. Consoles or pipes without cancelable writes skip progress and diagnostic output so transfers do not block; redirect `stderr` to a regular file to capture diagnostics.
+
+Choose `--no-clobber` (`-n`) to skip existing targets or `--force` (`-f`) to overwrite (even when size and mtime match); do not combine both. `--task` controls parallel host transfers and `--thread` controls per-file concurrency.
 
 Quote remote `~` operands to prevent local shell expansion. XOps expands `~`/`~/...` using the remote SFTP login directory; `~otheruser` is unsupported. Prefer an absolute path when targeting a specific filesystem location. Windows SFTP path syntax depends on the server; inspect its reported working directory before assuming a drive path.
 

@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +15,7 @@ import (
 	"github.com/schollz/progressbar/v3"
 	"github.com/spf13/cobra"
 	cmdutils "github.com/wentf9/xops-cli/cmd/utils"
+	corelog "github.com/wentf9/xops-cli/core/log"
 	"github.com/wentf9/xops-cli/core/sftp"
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/adapter"
@@ -24,26 +24,33 @@ import (
 	"github.com/wentf9/xops-cli/pkg/logger"
 	"github.com/wentf9/xops-cli/pkg/models"
 	pkgutils "github.com/wentf9/xops-cli/pkg/utils"
+	"golang.org/x/term"
 )
 
 type ScpOptions struct {
 	SshOptions
-	Recursive   bool
-	Progress    bool
-	Force       bool
-	NoOverwrite bool
-	TaskCount   int
-	ThreadCount int
-	Source      string
-	Dest        string
-	HostFile    string
-	Tag         string
-	Exclude     []string
+	Recursive    bool
+	Quiet        bool
+	Verbose      bool
+	Force        bool
+	NoOverwrite  bool
+	TaskCount    int
+	ThreadCount  int
+	Source       string
+	Dest         string
+	HostFile     string
+	Tag          string
+	Exclude      []string
+	sshLogLevel  int
+	verboseSeen  bool
+	verboseLevel int
+	diagnostics  corelog.DiagnosticObserver
 }
 
 func NewScpOptions() *ScpOptions {
 	return &ScpOptions{
 		SshOptions:  *NewSshOptions(),
+		sshLogLevel: scpSSHInfo,
 		TaskCount:   1,
 		ThreadCount: sftp.DefaultThreadsPerFile,
 	}
@@ -52,7 +59,7 @@ func NewScpOptions() *ScpOptions {
 func NewCmdScp() *cobra.Command {
 	o := NewScpOptions()
 	cmd := &cobra.Command{
-		Use:   "scp [[user@]host:]source [[user@]host:]dest",
+		Use:   "scp [flags] [[user@]host:]source [[user@]host:]dest",
 		Short: i18n.T("scp_short"),
 		Long:  i18n.T("scp_long"),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -67,7 +74,7 @@ func NewCmdScp() *cobra.Command {
 	}
 
 	// OpenSSH-compatible flags
-	cmd.Flags().Uint16VarP(&o.Port, "port", "p", 0, i18n.T("flag_port"))
+	cmd.Flags().Uint16VarP(&o.Port, "port", "P", 0, i18n.T("flag_port"))
 	cmd.Flags().StringVarP(&o.User, "login", "l", "", i18n.T("flag_login"))
 	cmd.Flags().StringVarP(&o.IdentityFile, "identity", "i", "", i18n.T("flag_identity"))
 	cmd.Flags().StringVarP(&o.JumpHost, "jump", "J", "", i18n.T("flag_jump"))
@@ -86,7 +93,7 @@ func NewCmdScp() *cobra.Command {
 	cmd.Flags().StringVarP(&o.HostFile, "ifile", "I", "", i18n.T("flag_ifile"))
 	cmd.Flags().StringVar(&o.Tag, "tag", "", i18n.T("flag_scp_tag"))
 	cmd.Flags().StringSliceVar(&o.Exclude, "exclude", nil, i18n.T("flag_exclude"))
-	cmd.Flags().BoolVarP(&o.Progress, "progress", "v", false, i18n.T("flag_progress"))
+	o.registerOutputFlags(cmd)
 	cmd.Flags().BoolVarP(&o.Force, "force", "f", false, i18n.T("flag_force"))
 	cmd.Flags().BoolVarP(&o.NoOverwrite, "no-clobber", "n", false, i18n.T("flag_no_overwrite"))
 	cmd.Flags().IntVar(&o.TaskCount, "task", 3, i18n.T("flag_task"))
@@ -94,11 +101,41 @@ func NewCmdScp() *cobra.Command {
 
 	cmd.MarkFlagsMutuallyExclusive("host", "ifile", "tag")
 	cmd.MarkFlagsMutuallyExclusive("force", "no-clobber")
+	cmd.MarkFlagsRequiredTogether("src", "dest")
 	return cmd
 }
 
-func (o *ScpOptions) Complete(_ *cobra.Command, args []string) error {
+func (o *ScpOptions) Complete(cmd *cobra.Command, args []string) error {
 	o.args = args
+	pathFlags := o.Source != "" || o.Dest != ""
+	if cmd != nil {
+		if cmd.Flags().Changed("port") && o.Port == 0 {
+			return errors.New(i18n.T("scp_err_port_zero"))
+		}
+		pathFlags = pathFlags || cmd.Flags().Changed("src") || cmd.Flags().Changed("dest")
+		for _, name := range []string{"host", "tag", "ifile"} {
+			value, err := cmd.Flags().GetString(name)
+			if err != nil {
+				return err
+			}
+			if cmd.Flags().Changed(name) && strings.TrimSpace(value) == "" {
+				return fmt.Errorf("%s: --%s", i18n.T("scp_err_empty_selector"), name)
+			}
+		}
+	}
+	if len(args) > 0 {
+		if pathFlags {
+			return errors.New(i18n.T("scp_err_mixed_paths"))
+		}
+		if len(args) != 2 {
+			return errors.New(i18n.T("scp_err_path_count"))
+		}
+		o.Source, o.Dest = args[0], args[1]
+	}
+	if err := o.Validate(); err != nil {
+		return err
+	}
+	// Reject invalid path arguments before reading caller-owned credential input.
 	if o.PasswordStdin {
 		pwd, err := cmdutils.ReadSecretFromStdin()
 		if err != nil {
@@ -113,18 +150,6 @@ func (o *ScpOptions) Complete(_ *cobra.Command, args []string) error {
 		}
 		o.Passphrase = pass
 	}
-	if len(args) == 2 {
-		if o.Source == "" {
-			o.Source = args[0]
-		}
-		if o.Dest == "" {
-			o.Dest = args[1]
-		}
-	} else if len(args) == 1 {
-		if o.Source == "" {
-			o.Source = args[0]
-		}
-	}
 	return nil
 }
 
@@ -135,7 +160,7 @@ func (o *ScpOptions) Validate() error {
 	if o.Source == "" {
 		return fmt.Errorf("%s", i18n.T("scp_err_no_src"))
 	}
-	if o.Dest == "" && o.Host == "" && o.Tag == "" {
+	if o.Dest == "" {
 		return fmt.Errorf("%s", i18n.T("scp_err_no_dest"))
 	}
 	return nil
@@ -162,47 +187,24 @@ func parsePath(p string) (PathInfo, error) {
 		}
 	}
 
-	var addrPart, pathPart string
-	if openBracket := strings.Index(p, "["); openBracket != -1 {
+	firstColon := strings.Index(p, ":")
+	if firstColon == -1 || strings.ContainsAny(p[:firstColon], "/\\") {
+		return PathInfo{Path: p}, nil
+	}
+
+	separator := firstColon
+	if openBracket := strings.Index(p, "["); openBracket != -1 && openBracket < firstColon {
 		closeBracket := strings.Index(p[openBracket:], "]")
 		if closeBracket == -1 {
 			return PathInfo{}, fmt.Errorf("malformed bracketed address in %q", p)
 		}
-		afterBracket := openBracket + closeBracket + 1
-		rest := p[afterBracket:]
-		if strings.HasPrefix(rest, ":") {
-			rest = rest[1:]
-			if nextColon := strings.Index(rest, ":"); nextColon != -1 {
-				portStr := rest[:nextColon]
-				if _, err := strconv.ParseUint(portStr, 10, 16); err == nil {
-					addrPart = p[:afterBracket] + ":" + portStr
-					pathPart = rest[nextColon+1:]
-				} else {
-					addrPart = p[:afterBracket]
-					pathPart = rest
-				}
-			} else {
-				addrPart = p[:afterBracket]
-				pathPart = rest
-			}
-		}
-	} else if colonIdx := strings.Index(p, ":"); colonIdx != -1 {
-		rest := p[colonIdx+1:]
-		if nextColon := strings.Index(rest, ":"); nextColon != -1 {
-			portCandidate := rest[:nextColon]
-			afterSecondColon := rest[nextColon+1:]
-			if strings.HasPrefix(afterSecondColon, "/") || strings.HasPrefix(afterSecondColon, "~") {
-				addrPart = p[:colonIdx] + ":" + portCandidate
-				pathPart = afterSecondColon
-			} else {
-				addrPart = p[:colonIdx]
-				pathPart = rest
-			}
-		} else {
-			addrPart = p[:colonIdx]
-			pathPart = rest
+		separator = openBracket + closeBracket + 1
+		if separator >= len(p) || p[separator] != ':' {
+			return PathInfo{Path: p}, nil
 		}
 	}
+	// The address/path delimiter is final: numeric prefixes are filenames, not ports.
+	addrPart, pathPart := p[:separator], p[separator+1:]
 
 	if addrPart != "" {
 		if strings.Contains(addrPart, "/") || strings.Contains(addrPart, "\\") {
@@ -254,6 +256,14 @@ func (e *transferProgressErrors) Err() error {
 }
 
 func (o *ScpOptions) RunContext(ctx context.Context) (retErr error) {
+	if o.Verbose {
+		diagnostics, err := newSCPDiagnostics(ctx, os.Stderr, "stderr", o.sshLogLevel >= scpSSHDebug1, o.verboseLevel)
+		if err != nil {
+			return err
+		}
+		o.diagnostics = diagnostics
+		defer func() { o.diagnostics = nil; retErr = errors.Join(retErr, diagnostics.finish()) }()
+	}
 	configPath, keyPath, pathErr := cmdutils.GetConfigFilePath()
 	if pathErr != nil {
 		return fmt.Errorf("get config file path failed: %w", pathErr)
@@ -276,6 +286,25 @@ func (o *ScpOptions) RunContext(ctx context.Context) (retErr error) {
 		joinConnectorCloseError(&retErr, connector)
 	}()
 
+	return o.runTransfer(ctx, provider, connector)
+}
+
+// runTransfer borrows the caller-owned connector for path routing and transfer.
+func (o *ScpOptions) runTransfer(ctx context.Context, provider config.ConfigProvider, connector *ssh.Connector) (retErr error) {
+	if diagnostics, ok := o.diagnostics.(*scpDiagnostics); ok {
+		diagnostics.transfer(o.Source, o.Dest, "starting")
+		defer func() {
+			status := "completed"
+			if retErr != nil {
+				status = "failed"
+			}
+			diagnostics.transfer(o.Source, o.Dest, status)
+		}()
+	}
+	// Selectors always mean upload. Paths are literal, including ':', '@' and '['.
+	if o.Host != "" || o.Tag != "" || o.HostFile != "" {
+		return o.runBatch(ctx, provider, connector)
+	}
 	src, srcErr := parsePath(o.Source)
 	if srcErr != nil {
 		return fmt.Errorf("parse source path failed: %w", srcErr)
@@ -287,11 +316,6 @@ func (o *ScpOptions) RunContext(ctx context.Context) (retErr error) {
 		if dstErr != nil {
 			return fmt.Errorf("parse dest path failed: %w", dstErr)
 		}
-	}
-
-	// 1. 批量上传模式 (-H host1,host2 或 -I hostfile 或 --tag tag)
-	if o.Tag != "" || (o.Host != "" && strings.Contains(o.Host, ",")) || o.HostFile != "" {
-		return o.runBatch(ctx, provider, connector)
 	}
 
 	// 2. 远程到远程
@@ -360,49 +384,20 @@ func (o *ScpOptions) runUpload(ctx context.Context, localPath string, dst PathIn
 	}
 
 	var progress sftp.ProgressCallback
-	var progressErr error
-	var progressMu sync.Mutex
-	if o.Progress {
+	finishProgress := func() error { return nil }
+	if o.progressEnabled() {
 		info, err := os.Stat(localPath)
 		if err != nil {
 			return err
 		}
-		description := "Uploading " + filepath.Base(localPath)
-		bar := progressbar.NewOptions64(
-			info.Size(),
-			progressbar.OptionSetDescription(description),
-			progressbar.OptionSetWriter(os.Stderr),
-			progressbar.OptionEnableColorCodes(logger.ColorEnabled()),
-			progressbar.OptionShowBytes(true),
-			progressbar.OptionSetWidth(30),
-			progressbar.OptionThrottle(100*time.Millisecond),
-			progressbar.OptionShowCount(),
-			progressbar.OptionOnCompletion(func() {
-				if _, err := fmt.Fprintln(os.Stderr); err != nil {
-					progressMu.Lock()
-					progressErr = errors.Join(progressErr, fmt.Errorf("progress completion newline failed: %w", err))
-					progressMu.Unlock()
-				}
-			}),
-			progressbar.OptionSetTheme(progressbar.Theme{
-				Saucer:        "=",
-				SaucerHead:    ">",
-				SaucerPadding: " ",
-				BarStart:      "[",
-				BarEnd:        "]",
-			}),
-		)
-		progress = func(n int64) {
-			if barErr := bar.Add64(n); barErr != nil {
-				progressMu.Lock()
-				progressErr = errors.Join(progressErr, barErr)
-				progressMu.Unlock()
-			}
+		size := info.Size()
+		if info.IsDir() {
+			size = -1
 		}
+		progress, finishProgress = o.createTransferProgress(ctx, size, "Uploading "+filepath.Base(localPath), 0)
 	}
-
 	uploadErr := sftpCli.WithForce(o.Force).Upload(ctx, localPath, remotePath, progress)
-	return errors.Join(uploadErr, progressErr)
+	return errors.Join(uploadErr, finishProgress())
 }
 
 func (o *ScpOptions) runDownload(ctx context.Context, src PathInfo, localPath string, provider config.ConfigProvider, connector *ssh.Connector) (err error) {
@@ -450,51 +445,17 @@ func (o *ScpOptions) runDownload(ctx context.Context, src PathInfo, localPath st
 		}
 	}
 
-	var progress sftp.ProgressCallback
-	var progressErr error
-	var progressMu sync.Mutex
-	if o.Progress {
-		description := "Downloading " + filepath.Base(src.Path)
-		bar := progressbar.NewOptions64(
-			stat.Size(),
-			progressbar.OptionSetDescription(description),
-			progressbar.OptionSetWriter(os.Stderr),
-			progressbar.OptionEnableColorCodes(logger.ColorEnabled()),
-			progressbar.OptionShowBytes(true),
-			progressbar.OptionSetWidth(30),
-			progressbar.OptionThrottle(100*time.Millisecond),
-			progressbar.OptionShowCount(),
-			progressbar.OptionOnCompletion(func() {
-				if _, err := fmt.Fprintln(os.Stderr); err != nil {
-					progressMu.Lock()
-					progressErr = errors.Join(progressErr, fmt.Errorf("progress completion newline failed: %w", err))
-					progressMu.Unlock()
-				}
-			}),
-			progressbar.OptionSetTheme(progressbar.Theme{
-				Saucer:        "=",
-				SaucerHead:    ">",
-				SaucerPadding: " ",
-				BarStart:      "[",
-				BarEnd:        "]",
-			}),
-		)
-		progress = func(n int64) {
-			if barErr := bar.Add64(n); barErr != nil {
-				progressMu.Lock()
-				progressErr = errors.Join(progressErr, barErr)
-				progressMu.Unlock()
-			}
-		}
+	size := stat.Size()
+	if stat.IsDir() {
+		size = -1
 	}
-
+	progress, finishProgress := o.createTransferProgress(ctx, size, "Downloading "+filepath.Base(src.Path), 0)
 	if stat.IsDir() {
 		downloadErr := sftpCli.WithForce(o.Force).DownloadDirectory(ctx, src.Path, localPath, progress)
-		return errors.Join(downloadErr, progressErr)
+		return errors.Join(downloadErr, finishProgress())
 	}
-
 	downloadErr := sftpCli.WithForce(o.Force).DownloadFile(ctx, src.Path, localDest, stat.Size(), stat.Mode(), progress)
-	return errors.Join(downloadErr, progressErr)
+	return errors.Join(downloadErr, finishProgress())
 }
 
 //nolint:gocyclo
@@ -628,9 +589,9 @@ func (o *ScpOptions) runRemoteToRemote(ctx context.Context, src, dst PathInfo, p
 		}
 	}
 
-	progress, progressErrs := o.createRemoteToRemoteProgress(srcStat.Size(), srcStat.Name(), startOffset)
+	progress, finishProgress := o.createTransferProgress(ctx, srcStat.Size(), "Relaying "+filepath.Base(srcStat.Name()), startOffset)
 	defer func() {
-		if pErr := progressErrs.Err(); pErr != nil {
+		if pErr := finishProgress(); pErr != nil {
 			retErr = errors.Join(retErr, pErr)
 		}
 	}()
@@ -681,17 +642,51 @@ func (o *ScpOptions) confirmRemoteToRemoteOverwrite(ctx context.Context, dstSftp
 	return false, nil
 }
 
-func (o *ScpOptions) createRemoteToRemoteProgress(size int64, name string, startOffset int64) (sftp.ProgressCallback, *transferProgressErrors) {
-	var progress sftp.ProgressCallback
+// progressEnabled follows SCP terminal behavior; redirected output stays clean.
+func (o *ScpOptions) progressEnabled() bool {
+	return !o.Quiet && term.IsTerminal(int(os.Stdout.Fd())) && term.IsTerminal(int(os.Stderr.Fd()))
+}
+
+// createTransferProgress owns one bar per transfer. The caller must finish it
+// after all progress callbacks have joined; the finish function never closes stderr.
+func (o *ScpOptions) createTransferProgress(ctx context.Context, size int64, description string, startOffset int64) (sftp.ProgressCallback, func() error) {
 	errs := &transferProgressErrors{}
-	if o.Progress {
-		bar := progressbar.DefaultBytes(size, "Relaying "+filepath.Base(name))
-		progress = func(n int64) { errs.Add("update progress", bar.Add64(n)) }
-		if startOffset > 0 {
-			progress(startOffset)
-		}
+	if !o.progressEnabled() {
+		return nil, errs.Err
 	}
-	return progress, errs
+	output, err := newSCPDiagnostics(ctx, os.Stderr, "stderr", false, 0)
+	if err != nil {
+		return nil, func() error { return err }
+	}
+	if output.disabled {
+		return nil, output.finish
+	}
+	bar := progressbar.NewOptions64(size,
+		progressbar.OptionSetDescription(description),
+		progressbar.OptionSetWriter(output),
+		progressbar.OptionEnableColorCodes(logger.ColorEnabled()),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionSetWidth(30),
+		progressbar.OptionThrottle(100*time.Millisecond),
+		progressbar.OptionShowCount(),
+		progressbar.OptionOnCompletion(func() {
+			_, err := fmt.Fprintln(output)
+			errs.Add("progress completion newline", err)
+		}),
+		progressbar.OptionSetTheme(progressbar.Theme{Saucer: "=", SaucerHead: ">", SaucerPadding: " ", BarStart: "[", BarEnd: "]"}),
+	)
+	progress := func(n int64) { errs.Add("update progress", bar.Add64(n)) }
+	if startOffset > 0 {
+		progress(startOffset)
+	}
+	return progress, func() error {
+		// Interrupted or indeterminate bars do not run OptionOnCompletion.
+		if !bar.IsFinished() {
+			_, err := fmt.Fprintln(output)
+			errs.Add("progress final newline", err)
+		}
+		return errors.Join(errs.Err(), output.finish())
+	}
 }
 
 func (o *ScpOptions) doRemoteToRemote(ctx context.Context, srcSftp *sftp.Client, srcFile *pkgsftp.File, dstFile *pkgsftp.File, startOffset, size int64, dstSftp *sftp.Client, progress sftp.ProgressCallback) (err error) {
@@ -845,17 +840,42 @@ func (o *ScpOptions) executeTransfer(ctx context.Context, label string, addr Pat
 		// Destination exists: skip if NoOverwrite, skip if not Force (user did
 		// not explicitly request overwrite in batch mode).
 		if o.NoOverwrite || !o.Force {
-			logger.PrintWarn(i18n.Tf("scp_skip", map[string]any{"Label": label}))
-			return nil
+			return o.writeTransferStatus(ctx, os.Stderr, "stderr", logger.Yellow(i18n.Tf("scp_skip", map[string]any{"Label": label})))
 		}
 	}
 
-	err = sftpCli.Upload(ctx, o.Source, remotePath, nil)
+	var progress sftp.ProgressCallback
+	finishProgress := func() error { return nil }
+	if o.progressEnabled() {
+		info, statErr := os.Stat(o.Source)
+		if statErr != nil {
+			return fmt.Errorf("stat local source failed: %w", statErr)
+		}
+		size := info.Size()
+		if info.IsDir() {
+			size = -1
+		}
+		progress, finishProgress = o.createTransferProgress(ctx, size, "Uploading ["+label+"] "+filepath.Base(o.Source), 0)
+	}
+	err = errors.Join(sftpCli.Upload(ctx, o.Source, remotePath, progress), finishProgress())
 	if err != nil {
 		return fmt.Errorf("upload failed: %w", err)
 	}
-	logger.PrintSuccess(i18n.Tf("scp_done", map[string]any{"Label": label}))
-	return nil
+	return o.writeTransferStatus(ctx, os.Stdout, "stdout", logger.Green(i18n.Tf("scp_done", map[string]any{"Label": label})))
+}
+
+// writeTransferStatus owns and joins a single-message output queue. The sink is
+// borrowed; unsupported sinks are skipped by the same policy as diagnostics.
+func (o *ScpOptions) writeTransferStatus(ctx context.Context, target io.Writer, stream, message string) error {
+	if o.Quiet {
+		return nil
+	}
+	output, err := newSCPDiagnostics(ctx, target, stream, false, 0)
+	if err != nil {
+		return err
+	}
+	output.enqueue(message + "\n")
+	return output.finish()
 }
 
 func joinCloseError(target *error, resource string, closeFn func() error) {
@@ -873,11 +893,9 @@ func (o *ScpOptions) shouldSkipRemoteToRemote(ctx context.Context, dstSftp *sftp
 	})
 	if err == nil {
 		if ds.Size() == srcStat.Size() && ds.ModTime().Unix() == srcStat.ModTime().Unix() {
-			if o.Progress {
-				bar := progressbar.DefaultBytes(srcStat.Size(), "Relaying "+filepath.Base(srcStat.Name()))
-				if progressErr := bar.Add64(srcStat.Size()); progressErr != nil {
-					return false, fmt.Errorf("complete relay progress failed: %w", progressErr)
-				}
+			_, finishProgress := o.createTransferProgress(ctx, srcStat.Size(), "Relaying "+filepath.Base(srcStat.Name()), srcStat.Size())
+			if err := finishProgress(); err != nil {
+				return false, err
 			}
 			return true, nil
 		}
@@ -945,6 +963,7 @@ func (o *ScpOptions) connectSftpForPath(ctx context.Context, p PathInfo, specifi
 	sftpCli, err := sftp.NewClient(
 		ctx,
 		client,
+		sftp.WithDiagnostics(o.diagnostics),
 		sftp.WithThreadsPerFile(o.ThreadCount),
 		sftp.WithForce(o.Force),
 	)
@@ -1176,9 +1195,9 @@ func (o *ScpOptions) credentialConnectorWithInteraction(provider *config.Reposit
 	}
 	var connector *ssh.Connector
 	if batch {
-		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
+		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics))
 	} else {
-		connector = newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithInteractionHandler(interaction))
+		connector = newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics), ssh.WithInteractionHandler(interaction))
 	}
 	return connector, nil
 }

@@ -434,6 +434,7 @@ type AutoAuthOptions struct {
 	PasswordCallback   func(string)
 	PassphraseCallback func(keyPath, passphrase string)
 	Logger             logger.DebugLogger
+	Diagnostics        logger.DiagnosticObserver
 }
 
 const (
@@ -453,10 +454,21 @@ type autoAuthPlan struct {
 	cleanup      func()
 }
 
+func authenticationDiagnostic(ctx *ssh.ClientAuthContext) logger.Diagnostic {
+	event := logger.Diagnostic{Kind: logger.AuthenticationMethods, Methods: append([]string(nil), ctx.AllowedMethods...)}
+	if ctx.Metadata != nil {
+		event.User = ctx.Metadata.User()
+		if remote := ctx.Metadata.RemoteAddr(); remote != nil {
+			event.Host = remote.String()
+		}
+	}
+	return event
+}
+
 // newSequentialAuthCallback 按候选顺序驱动认证。
 // ClientConfig.Auth 只会尝试同一 RFC 4252 method 的第一个实例，因此 auto 模式必须通过
 // AuthCallback 显式推进多个 publickey candidate。
-func newSequentialAuthCallback(candidates []autoAuthCandidate, secProvider *autoSecretProvider, l logger.DebugLogger) ssh.ClientAuthCallback {
+func newSequentialAuthCallback(candidates []autoAuthCandidate, secProvider *autoSecretProvider, l logger.DebugLogger, observers ...logger.DiagnosticObserver) ssh.ClientAuthCallback {
 	if l == nil {
 		l = logger.NopLogger
 	}
@@ -464,6 +476,15 @@ func newSequentialAuthCallback(candidates []autoAuthCandidate, secProvider *auto
 	next := 0
 	selected := false
 	return func(ctx *ssh.ClientAuthContext) (ssh.AuthMethod, error) {
+		var observer logger.DiagnosticObserver
+		if len(observers) > 0 {
+			observer = observers[0]
+		}
+		event := logger.Diagnostic{Kind: logger.AuthenticationMethods}
+		if observer != nil {
+			event = authenticationDiagnostic(ctx)
+		}
+		logger.EmitDiagnostic(observer, event)
 		if secProvider != nil {
 			if err := secProvider.terminalError(); err != nil {
 				return nil, err
@@ -481,6 +502,8 @@ func newSequentialAuthCallback(candidates []autoAuthCandidate, secProvider *auto
 
 			l.Debugf("Trying SSH auth candidate: %s", candidate.label)
 			selected = true
+			event.Kind, event.Method, event.Methods = logger.AuthenticationAttempt, candidate.protocol, nil
+			logger.EmitDiagnostic(observer, event)
 			return candidate.method, nil
 		}
 
@@ -610,7 +633,7 @@ func buildAutoAuthPlan(ctx context.Context, opts AutoAuthOptions, first ...ssh.A
 
 	return autoAuthPlan{
 		candidates:   candidates,
-		authCallback: newSequentialAuthCallback(candidates, secProvider, l),
+		authCallback: newSequentialAuthCallback(candidates, secProvider, l, opts.Diagnostics),
 		cleanup:      cleanup,
 	}
 }

@@ -339,3 +339,10 @@ CLI 直接接入迁移的回归覆盖还包括 stdio 发布后读取新库存、
 SDK 按 `UserID` 绑定会话。`runtime.ClientIdentityFromContext` 返回工具请求的客户端和 Token ID；内核使用客户端 ID 作为 operation Binding 和 transfer Scope，隔离任务重试、查询和取消。固定 Token 与 stdio 的原有作用域保持不变。已有的短期传输凭据继续按原授权绑定生效；认证回调不承诺中断已经准入的工作。
 
 验证见 `core/mcp/runtime/http_identity_test.go`，包括两个客户端、脱离 HTTP 生命周期的工具身份、文件任务隔离、空身份和错误脱敏。
+
+## 可选 SSH/SFTP 生命周期诊断
+
+`core/log.DiagnosticObserver` 与 `DebugLogger` 分离，SSH/SFTP 通过可选 `WithDiagnostics` 接收宿主观察者；
+未装配时无输出。观察者归宿主所有，须并发安全、及时返回，存活至连接器/客户端关闭；
+事件仅含公开协议元数据，不携带凭据或文件内容，也不参与信任、授权和租约决策。
+CLI 首个调用方为 SCP，输出和取消边界见 [SCP 分级诊断](./scp-diagnostics.md)。
