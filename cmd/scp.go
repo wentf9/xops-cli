@@ -538,18 +538,8 @@ func (o *ScpOptions) runRemoteToRemote(ctx context.Context, src, dst PathInfo, p
 		dstPath = dstSftp.JoinPath(dstPath, filepath.Base(src.Path))
 	}
 
-	// 1. 检查目标文件是否已存在且完全匹配 (用于直接跳过)
-	if !o.Force {
-		skip, err := o.shouldSkipRemoteToRemote(ctx, dstSftp, dstPath, srcStat)
-		if err != nil {
-			return err
-		}
-		if skip {
-			return nil
-		}
-	}
-
-	// 再次检查覆盖标志并询问用户 (如果 shouldSkip 没有跳过且没有 -f)
+	// Decide overwrite once. Matching size/mtime cannot prove equal contents,
+	// and a skipped destination must not render completed transfer progress.
 	skipOverwrite, err := o.confirmRemoteToRemoteOverwrite(ctx, dstSftp, dstPath)
 	if err != nil {
 		return err
@@ -882,39 +872,6 @@ func joinCloseError(target *error, resource string, closeFn func() error) {
 	if closeErr := closeFn(); closeErr != nil {
 		*target = errors.Join(*target, fmt.Errorf("close %s failed: %w", resource, closeErr))
 	}
-}
-
-func (o *ScpOptions) shouldSkipRemoteToRemote(ctx context.Context, dstSftp *sftp.Client, dstPath string, srcStat os.FileInfo) (bool, error) {
-	var ds os.FileInfo
-	err := dstSftp.Do(ctx, func(c *pkgsftp.Client) error {
-		var err error
-		ds, err = c.Stat(dstPath)
-		return err
-	})
-	if err == nil {
-		if ds.Size() == srcStat.Size() && ds.ModTime().Unix() == srcStat.ModTime().Unix() {
-			_, finishProgress := o.createTransferProgress(ctx, srcStat.Size(), "Relaying "+filepath.Base(srcStat.Name()), srcStat.Size())
-			if err := finishProgress(); err != nil {
-				return false, err
-			}
-			return true, nil
-		}
-
-		// 检查标志位和询问用户
-		if o.NoOverwrite {
-			return true, nil
-		}
-		if !o.Force {
-			confirmed, confirmErr := cmdutils.AskConfirmation(i18n.Tf("prompt_overwrite", map[string]any{"Path": dstPath}))
-			if confirmErr != nil {
-				return false, confirmErr
-			}
-			if !confirmed {
-				return true, nil
-			}
-		}
-	}
-	return false, nil
 }
 
 func (o *ScpOptions) prepareRemoteToRemoteFile(ctx context.Context, dstSftp *sftp.Client, tempPath string, srcSize int64) (int64, *pkgsftp.File, error) {
