@@ -28,7 +28,27 @@ func darwinOutputFlags(t *testing.T, file *os.File) (descriptor uintptr, flags i
 	if flagErr != nil {
 		t.Fatal(flagErr)
 	}
-	return descriptor, flags
+	return descriptor, darwinOutputStatusFlags(flags)
+}
+
+func darwinOutputStatusFlags(flags int) int {
+	// XNU F_GETFL exposes FWASWRITTEN, which the kernel sets after a write,
+	// including through a duplicate. It is history, not a caller-controlled
+	// status flag (bsd/sys/fcntl.h and bsd/kern/sys_generic.c).
+	const fWasWritten = 0x00010000
+	return flags &^ fWasWritten
+}
+
+func TestDarwinOutputStatusFlags(t *testing.T) {
+	const before = unix.O_WRONLY | unix.O_NONBLOCK
+	if got := darwinOutputStatusFlags(before | 0x00010000); got != before {
+		t.Fatalf("write history changed status flags: %#x", got)
+	}
+	for _, flag := range []int{unix.O_ACCMODE, unix.O_NONBLOCK, unix.O_APPEND, unix.O_ASYNC, unix.O_SYNC, unix.O_DSYNC} {
+		if darwinOutputStatusFlags(before^flag) == before {
+			t.Fatalf("caller flag change ignored: %#x", flag)
+		}
+	}
 }
 
 func TestDarwinOutputPausedTerminalCancellation(t *testing.T) {
@@ -67,7 +87,7 @@ func TestDarwinOutputPausedTerminalCancellation(t *testing.T) {
 	}
 	_, after := darwinOutputFlags(t, slave)
 	if after != before {
-		t.Fatal("borrowed terminal flags changed")
+		t.Fatalf("borrowed terminal flags changed: before=%#x after=%#x", before, after)
 	}
 }
 
@@ -105,7 +125,7 @@ func TestDarwinOutputNonblockingPipe(t *testing.T) {
 	}
 	_, after := darwinOutputFlags(t, writer)
 	if after != before {
-		t.Fatal("borrowed pipe flags changed")
+		t.Fatalf("borrowed pipe flags changed: before=%#x after=%#x", before, after)
 	}
 }
 
@@ -130,7 +150,7 @@ func TestDarwinOutputBlockingPipeRemainsUnsupported(t *testing.T) {
 	}
 	_, after := darwinOutputFlags(t, writer)
 	if after != before {
-		t.Fatal("borrowed blocking pipe flags changed")
+		t.Fatalf("borrowed blocking pipe flags changed: before=%#x after=%#x", before, after)
 	}
 }
 
