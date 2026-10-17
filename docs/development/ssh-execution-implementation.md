@@ -71,6 +71,10 @@
 
 回归新增密码 sudo 的命令/脚本流式输出、阻塞取消与文件失败身份，root 提权 PTY 的 ContextWriter 与终端恢复，脚本读取取消/所有权/限额、凭据 stdin 冲突，以及方言/登录模式/解释器部分覆盖的 SSH fixture 验证。原审查的五个 overlay 探针对应问题已加入仓库回归；测试使用合成凭据与本地 fixture，不连接真实服务器。
 
+## stdin EOF 的并发所有权
+
+`pipeCommandStdin` 不得在复制线程仍执行 SSH stdin `Write` 时调用 `Close`：`x/crypto/ssh` 的 `CloseWrite` 会修改写入路径读取的 EOF 状态，两者不是并发安全的。有限内存输入由复制线程在写入结束后独占发送 EOF，finish 只汇合该线程；文件输入先停止本地输入桥并汇合写入，再关闭 SSH stdin。会话拥有者仍负责先关闭或中断会话/transport，释放可能阻塞在远端窗口上的写入；不得用并发 EOF 代替中断，也不关闭调用方的本地输入流。回归同时覆盖内存/文件输入、正常/错误路径、关闭顺序和幂等性。
+
 ## 验证与提交
 
 每批新增能力和 Bug 修复均须有对应测试。提交 PR 或 push 前执行 `go build ./...`、`go test ./...`、`golangci-lint run ./...`；文档执行 `npm run docs:check`，本地源码链接另行验证。涉及 SSH 并发的批次补充 `go test -race ./core/ssh ./cmd`。没有平台证据的适配器保持未开放状态。

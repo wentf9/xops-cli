@@ -71,6 +71,10 @@ Regressions in `cmd/exec_combinations_test.go`, `cmd/exec_combination_errors_tes
 
 Regressions cover password-sudo command/script streams, blocked-output cancellation and file-error identity; root privileged PTY ContextWriter use and terminal restoration; script-read cancellation/ownership/limits and credential-stdin conflicts; and SSH-fixture validation of partial dialect/login/interpreter overrides. The five original review-overlay probes have corresponding repository regressions. Tests use synthetic credentials and local fixtures, never real servers.
 
+## Concurrent Ownership of stdin EOF
+
+`pipeCommandStdin` must not close SSH stdin while its copying worker is still in `Write`: `x/crypto/ssh.CloseWrite` changes EOF state read by the write path, and the operations are not concurrent-safe. For finite memory input, the copying worker exclusively sends EOF after writing; finish only joins that worker. File input first stops the local input bridge and joins writes, then closes SSH stdin. The session owner must still close or interrupt the session/transport first to release writes blocked on the remote window. Concurrent EOF is not an interruption mechanism, and borrowed local input streams remain open. Regressions cover memory/file input, normal/error paths, close ordering and idempotency.
+
 ## Validation and Submission
 
 Every new capability and bug fix requires corresponding tests. Before a PR or push, run `go build ./...`, `go test ./...`, and `golangci-lint run ./...`. Run `npm run docs:check` for documentation and validate local source links separately. Batches affecting SSH concurrency also run `go test -race ./core/ssh ./cmd`. Adapters remain unavailable without platform evidence.

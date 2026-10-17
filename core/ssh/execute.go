@@ -743,14 +743,18 @@ func pipeCommandStdin(stdin io.Reader, dst io.WriteCloser, options ...inputPipel
 		}
 		return sync.OnceValue(func() error {
 			cancelErr := cancel()
-			if closeErr := dst.Close(); closeErr != nil && !errors.Is(closeErr, os.ErrClosed) && !errors.Is(closeErr, io.EOF) {
-				cancelErr = errors.Join(cancelErr, closeErr)
-			}
+			// The session owner closes/interrupts its channel before finishing
+			// input, unblocking any SSH window write. Join that writer before
+			// CloseWrite: x/crypto's stdin Write and Close are not concurrent-safe.
 			copyErr := <-done
-			if copyErr != nil && !errors.Is(copyErr, io.EOF) && !errors.Is(copyErr, os.ErrClosed) {
-				cancelErr = errors.Join(cancelErr, copyErr)
+			if errors.Is(copyErr, io.EOF) || errors.Is(copyErr, os.ErrClosed) {
+				copyErr = nil
 			}
-			return cancelErr
+			closeErr := dst.Close()
+			if errors.Is(closeErr, io.EOF) || errors.Is(closeErr, os.ErrClosed) {
+				closeErr = nil
+			}
+			return errors.Join(cancelErr, copyErr, closeErr)
 		}), nil
 	}
 
@@ -765,17 +769,17 @@ func pipeCommandStdin(stdin io.Reader, dst io.WriteCloser, options ...inputPipel
 	go func() {
 		defer close(doneCh)
 		_, copyErr := io.Copy(dst, stdin)
+		if errors.Is(copyErr, io.EOF) || errors.Is(copyErr, os.ErrClosed) {
+			copyErr = nil
+		}
+		// Only the copying goroutine owns EOF on this finite input. Closing
+		// from stopAndWait could race an in-flight channel.WriteExtended.
 		doneCh <- errors.Join(copyErr, closeDst())
 	}()
 
-	stopAndWait = sync.OnceValue(func() error {
-		closeErr := closeDst()
-		copyErr := <-doneCh
-		if copyErr != nil && !errors.Is(copyErr, io.EOF) && !errors.Is(copyErr, os.ErrClosed) {
-			closeErr = errors.Join(closeErr, copyErr)
-		}
-		return closeErr
-	})
+	// Supported memory readers are finite. A blocked destination write is
+	// released by the caller's session/transport shutdown, not by racing EOF.
+	stopAndWait = sync.OnceValue(func() error { return <-doneCh })
 	return stopAndWait, nil
 }
 
