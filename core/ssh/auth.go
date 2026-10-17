@@ -454,6 +454,21 @@ type autoAuthPlan struct {
 	cleanup      func()
 }
 
+func observeAuthNegotiation(observer logger.DiagnosticObserver, ctx *ssh.ClientAuthContext, seen *bool) {
+	if *seen || ctx == nil || ctx.Metadata == nil || observer == nil {
+		return
+	}
+	*seen = true
+	event := authenticationDiagnostic(ctx)
+	event.Kind, event.Methods = logger.Negotiated, nil
+	event.ClientVersion, event.ServerVersion = string(ctx.Metadata.ClientVersion()), string(ctx.Metadata.ServerVersion())
+	a := ctx.Algorithms
+	event.KeyExchange, event.HostKey = a.KeyExchange, a.HostKey
+	event.ReadCipher, event.WriteCipher = a.Read.Cipher, a.Write.Cipher
+	event.ReadMAC, event.WriteMAC = a.Read.MAC, a.Write.MAC
+	logger.EmitDiagnostic(observer, event)
+}
+
 func authenticationDiagnostic(ctx *ssh.ClientAuthContext) logger.Diagnostic {
 	event := logger.Diagnostic{Kind: logger.AuthenticationMethods, Methods: append([]string(nil), ctx.AllowedMethods...)}
 	if ctx.Metadata != nil {
@@ -475,6 +490,7 @@ func newSequentialAuthCallback(candidates []autoAuthCandidate, secProvider *auto
 
 	next := 0
 	selected := false
+	negotiated := false
 	return func(ctx *ssh.ClientAuthContext) (ssh.AuthMethod, error) {
 		var observer logger.DiagnosticObserver
 		if len(observers) > 0 {
@@ -482,6 +498,7 @@ func newSequentialAuthCallback(candidates []autoAuthCandidate, secProvider *auto
 		}
 		event := logger.Diagnostic{Kind: logger.AuthenticationMethods}
 		if observer != nil {
+			observeAuthNegotiation(observer, ctx, &negotiated)
 			event = authenticationDiagnostic(ctx)
 		}
 		logger.EmitDiagnostic(observer, event)

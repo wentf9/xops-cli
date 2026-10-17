@@ -92,6 +92,7 @@ func resolveKeyPath(path string, resolve func(string) string) string {
 
 func (c *Connector) configureClient(client *Client) *Client {
 	client.environment = c.environment
+	client.diagnostics = c.diagnostics
 	return client
 }
 

@@ -33,6 +33,7 @@ type ForwardOption func(*forwardOptions)
 type forwardOptions struct {
 	onConnectionError func(error)
 	maxConnections    int
+	observe           func(string) // Optional lifecycle callback; no I/O in core.
 }
 
 // WithForwardConnectionLimit bounds concurrent accepted connections. Excess
@@ -71,10 +72,11 @@ func (c *Client) LocalForward(ctx context.Context, localAddr, remoteAddr string,
 	}
 	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", localAddr)
 	if err != nil {
+		c.observeForward("local", "listen failed", localAddr, remoteAddr)
 		return nil, fmt.Errorf("listen on local address %s failed: %w", localAddr, err)
 	}
-	return runForwardListener(ctx, listener, c.forwardOptions(opts...), func(runCtx context.Context, conn net.Conn) error {
-		return c.handleLocalForward(runCtx, conn, remoteAddr)
+	return runForwardListener(ctx, listener, c.forwardDiagnostics(c.forwardOptions(opts...), "local", listener, remoteAddr), func(runCtx context.Context, conn net.Conn) error {
+		return c.observedForwardHandler("local", listener.Addr().String(), remoteAddr, func() error { return c.handleLocalForward(runCtx, conn, remoteAddr) })
 	}), nil
 }
 
@@ -102,10 +104,11 @@ func (c *Client) remoteForward(ctx context.Context, remoteAddr, localAddr string
 	}
 	listener, err := c.listenRemoteContext(ctx, remoteAddr, timeout)
 	if err != nil {
+		c.observeForward("remote", "listen failed", remoteAddr, localAddr)
 		return nil, fmt.Errorf("listen on remote address %s failed: %w", remoteAddr, err)
 	}
-	return runForwardListener(ctx, listener, c.forwardOptions(opts...), func(runCtx context.Context, conn net.Conn) error {
-		return c.handleRemoteForward(runCtx, conn, localAddr)
+	return runForwardListener(ctx, listener, c.forwardDiagnostics(c.forwardOptions(opts...), "remote", listener, localAddr), func(runCtx context.Context, conn net.Conn) error {
+		return c.observedForwardHandler("remote", listener.Addr().String(), localAddr, func() error { return c.handleRemoteForward(runCtx, conn, localAddr) })
 	}), nil
 }
 
@@ -134,8 +137,20 @@ func (c *Client) forwardOptions(opts ...ForwardOption) forwardOptions {
 
 func runForwardListener(ctx context.Context, listener net.Listener, options forwardOptions, handle func(context.Context, net.Conn) error) *Forward {
 	forward := &Forward{done: make(chan struct{}), addr: listener.Addr()}
+	if options.observe != nil {
+		options.observe("listening")
+	}
 	go func() {
 		defer close(forward.done)
+		defer func() {
+			if options.observe != nil {
+				outcome := "closed"
+				if forward.err != nil {
+					outcome = "failed"
+				}
+				options.observe(outcome)
+			}
+		}()
 		runCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
 

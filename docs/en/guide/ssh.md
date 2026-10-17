@@ -15,6 +15,21 @@ xops ssh -J bastion.example.com deploy@192.0.2.10
 
 Direct jump hosts accept an IP, FQDN, or `host:port`; a single-label jump name (such as `-J jumphost`) must already exist as a saved node or alias. Connecting to the same host as a different user keeps credentials isolated per user.
 
+## Connection diagnostics
+
+```bash
+xops ssh -v web-01
+xops ssh -vv web-01 uptime
+xops ssh -vvv -N -L 8080:127.0.0.1:80 web-01
+xops ssh -v web-01 uptime >output.log 2>ssh.log
+```
+
+- `-v` shows connections, host-key verification, authentication, negotiated algorithms and session results; `-vv` adds request confirmations and forwarding connections; `-vvv` also shows session cleanup. Diagnostics use OpenSSH-style `debug1/2/3:` prefixes on stderr without changing remote stdout.
+- `-q` hides diagnostics and tunnel-ready status, not remote output, failures or security confirmations. Like OpenSSH, order matters: `-qv` enables diagnostics, `-vq` disables them, and `-vqv` does not immediately restore DEBUG1.
+- `--debug` / `--log-level` control separate internal logs and are not changed by `-v/-q`. Put a remote command's own `-v` after its command name, for example `xops ssh -v web-01 curl -v https://example.com`.
+- Diagnostics omit command, script, password and private-key bodies, but include hosts, usernames, fingerprints and forwarding addresses. Review logs before sharing. `-vvv` is not a complete internal SSH packet trace.
+- If a pipe does not support diagnostic output, redirect stderr to a regular log file. Diagnostic output failure makes the operation fail, but does not prove that the remote command never ran; do not blindly retry. With `-f -N`, only foreground validation diagnostics are visible; background logs are not retained.
+
 ## Running remote commands and piped scripts
 
 In addition to interactive logins, `xops ssh` can execute a single command or stream a local script over stdin:
@@ -79,5 +94,5 @@ xops ssh -R 9000:127.0.0.1:3000 -N web-01
 ```
 
 - **Binding and verification timing**: `-L` and `-D` open SSH channels on demand when local connections arrive; `-R` requests remote listening immediately at startup (with independent 10-second setup and teardown deadlines) and exits with an error if the server refuses.
-- **Per-connection error isolation**: Individual forwarding errors (such as `administratively prohibited` or an unreachable target port) are printed to `stderr` without tearing down the main SSH session or listener.
+- **Per-connection error isolation**: Individual forwarding errors (such as `administratively prohibited` or an unreachable target port) are queued to controlled stderr output without tearing down the main SSH session or listener. `-N` ready status remains on stdout. Blocked output does not hold up forwarding callbacks; output failures are returned at shutdown. Unsupported pipes may omit auxiliary messages; redirect the affected stream to a regular file instead.
 - **Keepalive and disconnect handling**: Sessions with `-L`, `-R`, `-D`, or `-N` actively monitor the connection—sending an SSH heartbeat after 15 seconds of idle traffic and declaring a timeout only after 10 consecutive seconds with neither a reply nor data progress. When the connection drops, XOps closes local listeners and exits with a nonzero status. Combine `-f -N` to run tunnels in the background.

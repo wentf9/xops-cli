@@ -34,7 +34,7 @@ build_time_label:
 ssh_short:
   other: "通过SSH连接到指定主机"
 ssh_long:
-  other: "通过SSH连接到指定主机并提供交互式终端。\n\n用法示例（兼容 OpenSSH 风格）:\n  xops ssh user@host[:port]\n  xops ssh -l user -p 22 -i ~/.ssh/id_rsa hostname\n  xops ssh -J bastion.example.com hostname # 直连跳板 (支持 FQDN/IP/host:port)\n  xops ssh -J jumphost hostname            # 别名跳板 (需预先保存为节点/别名)\n  xops ssh -L 8080:localhost:80 -N hostname\n\nxops 增强选项:\n  xops ssh --host web-01                # 按别名/名称连接\n  xops ssh --sudo hostname              # 以 sudo 模式连接\n  xops ssh --alias myserver hostname    # 保存连接别名\n  xops ssh --tag web hostname           # 为节点添加标签\n\n连接目标语义说明:\n  显式指定的 user 和 port 完整参与匹配，绝不被已有节点静默覆盖。\n  显式新用户连接已有主机时，自动复用已有 Host，独立隔离凭证(Identity)，并自动继承主机的唯一 ProxyJump。\n  跳板机(-J/ProxyJump)解析策略：优先匹配已有 Node、Alias 或 ~/.ssh/config Host；直连跳板明确要求使用 Node/Alias、FQDN、IP 或 host:port；未加端口的单标签主机名须先配置为 Node/Alias。\n  密码可通过 --password-stdin、安全终端提示或已配置的凭据库提供。\n  通过验证的凭据将按 remember 策略保存到凭据库。"
+  other: "通过SSH连接到指定主机并提供交互式终端。\n\n用法示例（兼容 OpenSSH 风格）:\n  xops ssh user@host[:port]\n  xops ssh -l user -p 22 -i ~/.ssh/id_rsa hostname\n  xops ssh -J bastion.example.com hostname # 直连跳板 (支持 FQDN/IP/host:port)\n  xops ssh -J jumphost hostname            # 别名跳板 (需预先保存为节点/别名)\n  xops ssh -L 8080:localhost:80 -N hostname\n  xops ssh -v hostname                    # 连接与会话诊断\n  xops ssh -vvv hostname uptime            # 包含请求与清理信息\n\nxops 增强选项:\n  xops ssh --host web-01                # 按别名/名称连接\n  xops ssh --sudo hostname              # 以 sudo 模式连接\n  xops ssh --alias myserver hostname    # 保存连接别名\n  xops ssh --tag web hostname           # 为节点添加标签\n\n连接目标语义说明:\n  显式指定的 user 和 port 完整参与匹配，绝不被已有节点静默覆盖。\n  显式新用户连接已有主机时，自动复用已有 Host，独立隔离凭证(Identity)，并自动继承主机的唯一 ProxyJump。\n  跳板机(-J/ProxyJump)解析策略：优先匹配已有 Node、Alias 或 ~/.ssh/config Host；直连跳板明确要求使用 Node/Alias、FQDN、IP 或 host:port；未加端口的单标签主机名须先配置为 Node/Alias。\n  密码可通过 --password-stdin、安全终端提示或已配置的凭据库提供。\n  通过验证的凭据将按 remember 策略保存到凭据库。"
 flag_host:
   other: "目标主机/连接别名"
 flag_hosts:
@@ -1146,6 +1146,10 @@ scp_err_empty_selector:
   other: "主机选择器不能为空"
 scp_err_port_zero:
   other: "SSH 端口须在 1 到 65535 之间"
+flag_ssh_verbose:
+  other: "输出 SSH 诊断信息（-vv 含请求，-vvv 含清理；独立于 --debug）"
+flag_ssh_quiet:
+  other: "隐藏 SSH 诊断及隧道就绪提示（保留失败报错和安全确认）"
 flag_scp_quiet:
   other: "隐藏进度条及 SSH 告警与诊断（保留失败报错和安全确认）"
 

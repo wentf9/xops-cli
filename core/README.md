@@ -164,6 +164,10 @@ These typed lifecycle events are independent of `DebugLogger`, contain public
 protocol metadata only, and do not change authentication, host trust or leases.
 Observers are caller-owned, concurrency-safe and must return promptly; keep them
 alive until connector/client shutdown. No observer means no diagnostic output.
+SSH also reports observed negotiation, session requests/results/cleanup and
+forwarding lifecycles. Exit-code presence distinguishes confirmed status from
+signals or unknown outcomes; commands and arbitrary remote error text are excluded.
+See [SSH diagnostics](../docs/development/ssh-diagnostics.md).
 
 SFTP DEBUG2/3 diagnostics observe bounded metadata at existing pipe boundaries.
 Optional `DiagnosticLevel() int` filters higher-level events; absent means all

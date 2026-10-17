@@ -124,7 +124,7 @@ func TestFixedAuthenticationDiagnosticsPreserveResult(t *testing.T) {
 			if err := c.CloseAll(); err != nil {
 				t.Fatal(err)
 			}
-			attempts, authenticated := 0, 0
+			attempts, authenticated, negotiated := 0, 0, 0
 			for _, event := range recorder.snapshot() {
 				if event.Kind == corelog.AuthenticationAttempt {
 					attempts++
@@ -135,6 +135,15 @@ func TestFixedAuthenticationDiagnosticsPreserveResult(t *testing.T) {
 				if event.Kind == corelog.Authenticated {
 					authenticated++
 				}
+				if event.Kind == corelog.Negotiated {
+					negotiated++
+					if event.KeyExchange == "" || event.ReadCipher == "" || event.ClientVersion == "" || event.ServerVersion == "" {
+						t.Fatalf("missing pre-authentication metadata: %+v", event)
+					}
+				}
+			}
+			if negotiated != 1 {
+				t.Fatalf("negotiation missing or duplicated: %d", negotiated)
 			}
 			if attempts != 1 || (authenticated == 1) != (password == "fixture") {
 				t.Fatalf("attempts=%d authenticated=%d", attempts, authenticated)

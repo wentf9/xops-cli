@@ -14,6 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	corelog "github.com/wentf9/xops-cli/core/log"
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
@@ -24,6 +25,8 @@ import (
 
 type SshOptions struct {
 	interaction     *cliInteractionHandler
+	diagnostic      sshDiagnosticOptions
+	diagnostics     corelog.DiagnosticObserver
 	Host            string
 	Port            uint16
 	User            string
@@ -81,6 +84,7 @@ func newCmdSshWithOptions(o *SshOptions) *cobra.Command {
 			return o.RunContext(cmd.Context())
 		},
 	}
+	o.diagnostic.register(cmd)
 	// OpenSSH-compatible flags
 	cmd.Flags().Uint16VarP(&o.Port, "port", "p", 0, i18n.T("flag_port"))
 	cmd.Flags().StringVarP(&o.User, "login", "l", "", i18n.T("flag_login"))
@@ -237,6 +241,15 @@ func (o *SshOptions) RunContext(ctx context.Context) (err error) {
 		}()
 	}
 
+	observer, finishDiagnostics, diagnosticErr := o.startDiagnostics(ctx)
+	if diagnosticErr != nil {
+		return diagnosticErr
+	}
+	o.diagnostics = observer
+	defer func() {
+		o.diagnostics = nil
+		err = errors.Join(err, finishDiagnostics())
+	}()
 	if o.BgRun && !isChild {
 		return o.runParentDaemon(ctx)
 	}
@@ -268,7 +281,7 @@ func (o *SshOptions) runParentDaemon(ctx context.Context) (err error) {
 	if optErr != nil {
 		return optErr
 	}
-	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithInteractionHandler(o.interaction))
+	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithInteractionHandler(o.interaction), ssh.WithDiagnostics(o.diagnostics))
 	defer func() {
 		joinConnectorCloseError(&err, connector)
 	}()
@@ -288,10 +301,9 @@ func (o *SshOptions) runParentDaemon(ctx context.Context) (err error) {
 		}
 	}()
 
-	// 测试端口绑定/隧道是否正常工作
-	runCtx, runCancel := context.WithCancel(ctx)
-	defer runCancel()
-	tunnels, err := o.startTunnels(runCtx, runCancel, client)
+	// Validation tunnels own their child context. Closing them must leave the
+	// command-owned output context alive until auxiliary output has flushed.
+	tunnels, err := o.startTunnels(ctx, nil, client)
 	if err != nil {
 		return err
 	}
@@ -393,7 +405,7 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 	if optErr != nil {
 		return optErr
 	}
-	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithInteractionHandler(o.interaction))
+	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithInteractionHandler(o.interaction), ssh.WithDiagnostics(o.diagnostics))
 	defer func() {
 		joinConnectorCloseError(&err, connector)
 	}()
@@ -415,7 +427,8 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
 
-	tunnels, err := o.startTunnels(runCtx, runCancel, client)
+	// Keep output on the command context while tunnels own their child context.
+	tunnels, err := o.startTunnels(ctx, runCancel, client)
 	if err != nil {
 		return err
 	}
@@ -426,8 +439,10 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 	}()
 
 	if o.NoCmd {
-		if !isChild {
-			fmt.Printf("SSH tunnels established to %s. Press Ctrl+C to exit.\n", nodeID)
+		if !isChild && !o.diagnostic.quiet {
+			if err := tunnels.reportReady(ctx, os.Stdout, nodeID); err != nil {
+				return err
+			}
 		}
 		<-runCtx.Done()
 		return nil
@@ -532,10 +547,13 @@ func (o *SshOptions) resolveNode(ctx context.Context, provider *config.Repositor
 }
 
 type sshTunnelGroup struct {
-	cancel context.CancelFunc
-	done   sync.WaitGroup
-	errMu  sync.Mutex
-	err    error
+	cancel     context.CancelFunc
+	done       sync.WaitGroup
+	errMu      sync.Mutex
+	err        error
+	stderr     *sshDiagnostics // Borrowed from the command, or owned when not verbose.
+	ownsStderr bool
+	stdout     *diagnosticOutput // Optional ready status, owned until Close.
 }
 
 func newSSHTunnelGroup(ctx context.Context, cancelParent context.CancelFunc) (*sshTunnelGroup, context.Context) {
@@ -573,28 +591,67 @@ func (g *sshTunnelGroup) Close() error {
 	}
 	g.cancel()
 	g.done.Wait()
+	// All callback producers have stopped. Never close a command-owned stderr;
+	// RunContext releases that shared queue after its connector has also stopped.
+	var outputErr error
+	if g.ownsStderr {
+		outputErr = g.stderr.finish()
+	}
+	if g.stdout != nil {
+		outputErr = errors.Join(outputErr, g.stdout.finish())
+	}
 	g.errMu.Lock()
 	defer g.errMu.Unlock()
-	return g.err
+	return errors.Join(g.err, outputErr)
+}
+
+// reportReady preserves stdout and the original status text without a raw
+// write. The caller finishes setup before Close, which joins the owned writer.
+func (g *sshTunnelGroup) reportReady(ctx context.Context, target io.Writer, nodeID string) error {
+	if g.stdout == nil {
+		output, err := newDiagnosticOutput(ctx, target, "stdout", "ssh")
+		if err != nil {
+			return err
+		}
+		g.stdout = output
+	}
+	g.stdout.enqueue(fmt.Sprintf("SSH tunnels established to %s. Press Ctrl+C to exit.\n", nodeID))
+	return nil
 }
 
 func (o *SshOptions) startTunnels(ctx context.Context, cancelParent context.CancelFunc, client *ssh.Client) (*sshTunnelGroup, error) {
 	group, tunnelCtx := newSSHTunnelGroup(ctx, cancelParent)
-	if o.NoCmd || len(o.LocalForwards) > 0 || len(o.RemoteForwards) > 0 || o.DynamicForward != "" {
-		group.addWait(func() error { return client.Wait(tunnelCtx) })
-	}
 	fail := func(err error) (*sshTunnelGroup, error) {
 		return nil, errors.Join(err, group.Close())
 	}
-	// Connection failures are user-facing diagnostics even when logging is
-	// disabled. Report them without stopping the listener or SSH session.
+	hasForwards := len(o.LocalForwards) > 0 || len(o.RemoteForwards) > 0 || o.DynamicForward != ""
+	if hasForwards {
+		if diagnostics, ok := o.diagnostics.(*sshDiagnostics); ok && diagnostics != nil {
+			group.stderr = diagnostics
+		} else {
+			var gates []chan struct{}
+			if o.interaction != nil {
+				gates = append(gates, o.interaction.promptGate)
+			}
+			output, err := newSSHDiagnostics(ctx, os.Stderr, 0, gates...)
+			if err != nil {
+				return fail(err)
+			}
+			group.stderr, group.ownsStderr = output, true
+		}
+	}
+	if o.NoCmd || hasForwards {
+		group.addWait(func() error { return client.Wait(tunnelCtx) })
+	}
+	// Connection failures stay visible even without verbose logging, but callbacks
+	// only enqueue: a failed stderr must never hold up Forward.Wait or cancellation.
 	for _, lArg := range o.LocalForwards {
 		bAddr, dAddr, err := parseForwardArg(lArg)
 		if err != nil {
 			return fail(err)
 		}
 		forward, err := client.LocalForward(tunnelCtx, bAddr, dAddr, ssh.WithForwardErrorHandler(func(err error) {
-			logger.PrintErrorf("ssh local forward connection failed: %v", err)
+			group.stderr.message(logger.Red(fmt.Sprintf("ssh local forward connection failed: %v", err)) + "\n")
 		}))
 		if err != nil {
 			return fail(fmt.Errorf("setup local forward failed: %w", err))
@@ -607,7 +664,7 @@ func (o *SshOptions) startTunnels(ctx context.Context, cancelParent context.Canc
 			return fail(err)
 		}
 		forward, err := client.RemoteForward(tunnelCtx, bAddr, dAddr, ssh.WithForwardErrorHandler(func(err error) {
-			logger.PrintErrorf("ssh remote forward connection failed: %v", err)
+			group.stderr.message(logger.Red(fmt.Sprintf("ssh remote forward connection failed: %v", err)) + "\n")
 		}))
 		if err != nil {
 			return fail(fmt.Errorf("setup remote forward failed: %w", err))
@@ -620,7 +677,7 @@ func (o *SshOptions) startTunnels(ctx context.Context, cancelParent context.Canc
 			return fail(err)
 		}
 		forward, err := client.Socks5Forward(tunnelCtx, listenAddr, ssh.WithForwardErrorHandler(func(err error) {
-			logger.PrintErrorf("ssh SOCKS5 forward connection failed: %v", err)
+			group.stderr.message(logger.Red(fmt.Sprintf("ssh SOCKS5 forward connection failed: %v", err)) + "\n")
 		}))
 		if err != nil {
 			return fail(fmt.Errorf("setup SOCKS5 proxy failed: %w", err))

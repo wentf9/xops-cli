@@ -34,7 +34,7 @@ build_time_label:
 ssh_short:
   other: "Connect to a remote host via SSH"
 ssh_long:
-  other: "Connect to a remote host via SSH and open an interactive terminal.\n\nUsage examples (OpenSSH-compatible):\n  xops ssh user@host[:port]\n  xops ssh -l user -p 22 -i ~/.ssh/id_rsa hostname\n  xops ssh -J bastion.example.com hostname # Direct jump (supports FQDN/IP/host:port)\n  xops ssh -J jumphost hostname            # Alias jump (requires saved node/alias)\n  xops ssh -L 8080:localhost:80 -N hostname\n\nxops enhanced options:\n  xops ssh --host web-01                # Connect by alias/name\n  xops ssh --sudo hostname              # Connect with sudo mode\n  xops ssh --alias myserver hostname    # Save connection alias\n  xops ssh --tag web hostname           # Add tag to node\n\nConnection Target Semantics:\n  Explicit user and port participate fully in matching and will never be silently overridden by existing nodes.\n  Connecting as a new user to an existing host automatically reuses the existing Host, strictly isolates Identity credentials, and inherits unique host ProxyJump.\n  ProxyJump (-J) resolution strategy: Prioritizes saved Node, Alias, or ~/.ssh/config Host; direct jump targets explicitly require Node/Alias, FQDN, IP, or host:port; single-label hostnames without port must be configured as a Node/Alias first.\n  Passwords can be supplied through --password-stdin, secure terminal prompts, or configured credential stores. Verified credentials are saved according to the remember policy."
+  other: "Connect to a remote host via SSH and open an interactive terminal.\n\nUsage examples (OpenSSH-compatible):\n  xops ssh user@host[:port]\n  xops ssh -l user -p 22 -i ~/.ssh/id_rsa hostname\n  xops ssh -J bastion.example.com hostname # Direct jump (supports FQDN/IP/host:port)\n  xops ssh -J jumphost hostname            # Alias jump (requires saved node/alias)\n  xops ssh -L 8080:localhost:80 -N hostname\n  xops ssh -v hostname                    # Connection/session diagnostics\n  xops ssh -vvv hostname uptime            # Include requests and cleanup\n\nxops enhanced options:\n  xops ssh --host web-01                # Connect by alias/name\n  xops ssh --sudo hostname              # Connect with sudo mode\n  xops ssh --alias myserver hostname    # Save connection alias\n  xops ssh --tag web hostname           # Add tag to node\n\nConnection Target Semantics:\n  Explicit user and port participate fully in matching and will never be silently overridden by existing nodes.\n  Connecting as a new user to an existing host automatically reuses the existing Host, strictly isolates Identity credentials, and inherits unique host ProxyJump.\n  ProxyJump (-J) resolution strategy: Prioritizes saved Node, Alias, or ~/.ssh/config Host; direct jump targets explicitly require Node/Alias, FQDN, IP, or host:port; single-label hostnames without port must be configured as a Node/Alias first.\n  Passwords can be supplied through --password-stdin, secure terminal prompts, or configured credential stores. Verified credentials are saved according to the remember policy."
 flag_host:
   other: "Target host / connection alias"
 flag_hosts:
@@ -1145,6 +1145,10 @@ scp_err_empty_selector:
   other: "Host selector cannot be empty"
 scp_err_port_zero:
   other: "SSH port must be between 1 and 65535"
+flag_ssh_verbose:
+  other: "Print SSH diagnostics (-vv includes requests, -vvv includes cleanup; independent of --debug)"
+flag_ssh_quiet:
+  other: "Suppress SSH diagnostics and tunnel status (errors and security prompts remain)"
 flag_scp_quiet:
   other: "Hide progress bar and SSH warnings/diagnostics (errors and security prompts remain)"
 

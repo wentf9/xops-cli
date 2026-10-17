@@ -33,6 +33,7 @@ type Client struct {
 	connectorPattern   string         // Connector 全局级密码提示正则，当节点级为空时回落到此字段
 	promptRegex        *regexp.Regexp // 缓存预编译好的正则
 	logger             logger.DebugLogger
+	diagnostics        logger.DiagnosticObserver // Immutable; connector owns its lifetime.
 	handshakeTimeout   time.Duration
 	interactionTimeout time.Duration
 }
@@ -878,7 +879,7 @@ func (c *Client) startWithTimeout(ctx context.Context, session *ssh.Session, com
 	}
 	done := make(chan error, 1)
 	go func() {
-		done <- session.Wait()
+		done <- c.waitSession(session)
 	}()
 
 	select {
