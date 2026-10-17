@@ -23,7 +23,14 @@ func TestEnrollmentProbeDisconnectPreservesNodeAndRejectsConnection(t *testing.T
 	defer cancel()
 	peerCtx, dropPeer := context.WithCancel(ctx)
 	defer dropPeer()
-	server, err := sshfixture.NewWithOptions(peerCtx, sshfixture.Options{ExecHandler: func(_ string, _ cryptoSSH.Channel) { dropPeer() }})
+	server, err := sshfixture.NewWithOptions(peerCtx, sshfixture.Options{ExecHandler: func(_ string, _ cryptoSSH.Channel) {
+		dropPeer()
+		// Keep the handler alive until test cancellation. Returning here would
+		// let the fixture's deferred Channel.Close race transport shutdown,
+		// producing a channel-only failure before the disconnect is observed.
+		// The test owns ctx and cancels it before fixture cleanup joins workers.
+		<-ctx.Done()
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,6 +84,7 @@ func TestEnrollmentProbeDisconnectPreservesNodeAndRejectsConnection(t *testing.T
 		t.Fatal("authenticated node was lost or partial probe settings persisted")
 	}
 	if warnings.Load() != 1 || server.Executed.Load() != 1 || server.Authenticated.Load() != 1 || len(secrets.data) != 0 {
-		t.Fatal("disconnected enrollment retried, dispatched user work or recorded credentials")
+		t.Fatalf("disconnected enrollment retried, dispatched user work or recorded credentials: warnings=%d exec=%d auth=%d credentials=%d",
+			warnings.Load(), server.Executed.Load(), server.Authenticated.Load(), len(secrets.data))
 	}
 }
