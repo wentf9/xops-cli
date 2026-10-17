@@ -81,8 +81,25 @@ func TestContextOutputRegularFileErrors(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := prepareContextOutput(t.Context(), file); !errors.Is(err, os.ErrClosed) {
-		t.Fatalf("closed output accepted or cause lost: %v", err)
+	writer, release, err = prepareContextOutput(t.Context(), file)
+	if writer != nil || release != nil {
+		t.Fatal("closed output created a writer or binding")
+	}
+	assertClosedOutputStatCause(t, file, err)
+}
+
+func assertClosedOutputStatCause(t *testing.T, file *os.File, err error) {
+	t.Helper()
+	// Go 1.26's Windows File.Stat reports ERROR_INVALID_HANDLE after Close,
+	// not os.ErrClosed. Require the actual native cause and PathError metadata
+	// to survive wrapping instead of assuming one cross-platform sentinel.
+	_, statErr := file.Stat()
+	var want, got *os.PathError
+	if !errors.As(statErr, &want) {
+		t.Fatalf("closed file did not produce a Stat PathError: %v", statErr)
+	}
+	if !errors.Is(err, want.Err) || !errors.As(err, &got) || got.Op != want.Op || got.Path != want.Path {
+		t.Fatalf("closed output Stat cause lost: got %v, want %v", err, statErr)
 	}
 }
 
@@ -101,9 +118,10 @@ func TestInteractivePlanClosedFileRejectedBeforeCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = client.RunInteractivePlanWithIO(t.Context(), plan, InteractiveIO{Stdout: file, Stderr: file})
-	if !errors.Is(err, os.ErrClosed) || scenario.attempts.Load() != 0 {
-		t.Fatalf("closed output reached execution or cause lost: %v", err)
+	if scenario.attempts.Load() != 0 {
+		t.Fatalf("closed output reached execution: %v", err)
 	}
+	assertClosedOutputStatCause(t, file, err)
 }
 
 // A controlled waiter models an in-flight file write that the OS cannot cancel.
