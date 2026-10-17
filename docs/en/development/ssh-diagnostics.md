@@ -57,6 +57,8 @@ The CLI bounds and escapes untrusted strings. Public metadata still includes add
 ## Validation entry points and platform limits
 
 Regressions cover levels/quiet ordering, remote argument boundaries, independent internal logs, success/nonzero/signal/missing status/rejection/cancellation, legacy PTY exit policy and terminal restoration, forwarding listeners, redaction, prompt-gate cancellation, bounded queues, unsupported sinks, blocked pipes and output-error identity. Additional combination regressions cover local/remote/SOCKS5 forwarding with verbose logging both enabled and disabled: full stderr, diagnostic timeout, forwarding failure and shutdown. Ready-status tests cover blocked/failing stdout, normal draining and borrowed-stream ownership.
+Windows blocking-output tests query the relevant write-direction buffer quota with `GetNamedPipeInfo`, complete a write of that quota, then verify that one additional byte blocks until cancellation. Canceling an oversized write alone does not prove a full pipe: Windows may discard pending data, leaving room for subsequent diagnostics or ready status. Unix still establishes the blocked condition using a large write with committed partial bytes.
+
 System OpenSSH comparisons connect only to a loopback fixture with a pinned public key, never user servers, and do not snapshot complete output.
 
 ```sh

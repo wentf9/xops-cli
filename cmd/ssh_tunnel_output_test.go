@@ -17,29 +17,6 @@ import (
 	"github.com/wentf9/xops-cli/core/testutil/sshfixture"
 )
 
-// fillTunnelOutputPipe writes through an owned cancelable binding, rather than
-// relying on queue scheduling or the platform's default pipe capacity.
-func fillTunnelOutputPipe(t *testing.T, writer *os.File) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
-	defer cancel()
-	bound, closeOutput, supported, err := ssh.BindOutput(ctx, writer)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if err := closeOutput(); err != nil {
-			t.Error(err)
-		}
-	}()
-	if !supported {
-		t.Skip("native cancelable pipe binding unavailable")
-	}
-	if _, err := bound.Write(bytes.Repeat([]byte("x"), 4<<20)); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("pipe was not filled and canceled: %v", err)
-	}
-}
-
 func tunnelOutputFixture(t *testing.T, ctx context.Context) *ssh.Client {
 	t.Helper()
 	server, err := sshfixture.New(ctx)
