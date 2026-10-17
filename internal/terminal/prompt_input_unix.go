@@ -14,6 +14,7 @@ import (
 
 type pollPromptInput struct {
 	file          *os.File
+	fd            int // Captured without File.Fd, which can change shared flags.
 	cancelReader  *os.File
 	cancelWriter  *os.File
 	interruptOnce sync.Once
@@ -33,11 +34,23 @@ func DuplicatePromptInput(input io.Reader) (PromptInput, error) {
 		}
 		return nil, fmt.Errorf("prompt input must be an *os.File or io.ReadCloser")
 	}
-	fd, err := unix.Dup(int(file.Fd()))
+	raw, err := file.SyscallConn()
 	if err != nil {
 		return nil, err
 	}
-	unix.CloseOnExec(fd)
+	fd := -1
+	var duplicateErr error
+	if err := raw.Control(func(source uintptr) {
+		fd, duplicateErr = unix.FcntlInt(source, unix.F_DUPFD_CLOEXEC, 0)
+	}); err != nil {
+		if fd >= 0 {
+			return nil, errors.Join(err, unix.Close(fd))
+		}
+		return nil, err
+	}
+	if duplicateErr != nil {
+		return nil, duplicateErr
+	}
 	duplicate := os.NewFile(uintptr(fd), file.Name())
 	cancelReader, cancelWriter, err := os.Pipe()
 	if err != nil {
@@ -48,6 +61,7 @@ func DuplicatePromptInput(input io.Reader) (PromptInput, error) {
 	}
 	return &pollPromptInput{
 		file:         duplicate,
+		fd:           fd,
 		cancelReader: cancelReader,
 		cancelWriter: cancelWriter,
 	}, nil
@@ -55,7 +69,7 @@ func DuplicatePromptInput(input io.Reader) (PromptInput, error) {
 
 func (i *pollPromptInput) Read(buffer []byte) (int, error) {
 	pollFDs := []unix.PollFd{
-		{Fd: int32(i.file.Fd()), Events: unix.POLLIN},
+		{Fd: int32(i.fd), Events: unix.POLLIN},
 		{Fd: int32(i.cancelReader.Fd()), Events: unix.POLLIN},
 	}
 	for {

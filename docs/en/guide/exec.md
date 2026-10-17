@@ -22,7 +22,8 @@ xops exec --tag web --exclude web-maintenance-01 -c 'df -h'
 - `--host`, `--ifile`/`-I` (host list file), and `--tag` are mutually exclusive. Once a target selector is set, the first positional argument becomes the remote command (e.g. `xops exec --host web-01 uname -a`), or you can pass the command string explicitly with `-c`.
 - Global flags can appear before or after the subcommand (e.g. `xops --color never exec --host web-01 uname -a`). If the remote command itself takes flags starting with `-`, quote it with `-c` or place `--` before the command (e.g. `xops exec --host web-01 -- echo --help`).
 - **Batch credentials**: Batch runs do not display credential-store unlock dialogs. Unlock the required stores before starting a batch.
-- **Explicit interpreter limits**: Commands are limited to 64 KiB with a default 5-minute execution timeout. Non-interactive results retain the last 5 MiB of output and report truncation when exceeded. Some shells impose stricter command-length limits.
+- **Script input**: `--shell` requires a regular file. Pipe scripts through standard input instead, without also supplying credentials through `--password-stdin` or `--passphrase-stdin`.
+- **Explicit interpreter limits**: Ordinary commands are limited to 64 KiB and scripts to 16 MiB, with a default 5-minute timeout for non-interactive execution. Results retain the last 5 MiB of output and report truncation when exceeded; `--stream` displays output live and `--out-dir` saves logs without this retention limit. Some shells impose stricter command-length limits.
 
 ## Interpreters and cross-platform execution
 
@@ -66,7 +67,20 @@ Set `--launch-dialect` to match the remote SSH default shell; for example, use `
 | `powershell` / `pwsh` | `cmd`, `powershell` (`pwsh` also supports `posix`/`fish`) | Does not load user profiles; preserves command exit status |
 | `cmd` | `cmd` | Subject to CMD's 8191-character limit; commands containing `%`, `!`, newlines, or unpaired double quotes are currently unsupported |
 
-Explicit interpreter flags (`--interpreter`, `--launch-dialect`, `--login-shell`) support ordinary commands or single-host interactive commands. They cannot be combined with `--shell`, `--sudo`, `--stream`, or `--out-dir`. To select an interpreter for scripts or elevated operations, set `execution` on the node instead.
+Interpreter flags can be combined with `--shell`, `--sudo`, `--stream`, or `--out-dir`:
+
+```bash
+# Run a local script with sh, elevate, and save per-host logs in logs
+xops exec --tag web --interpreter sh --launch-dialect posix --sudo --shell check.sh --out-dir logs
+
+# Run a Bash command across hosts and display output live
+xops exec --tag web --interpreter bash --launch-dialect posix --stream -c 'uptime'
+
+# Use the remote default shell and save output to logs
+xops exec --host web-01 --interpreter server --out-dir logs -c 'df -h'
+```
+
+Scripts and Unix privilege escalation support `bash`, `sh`, `zsh`, and `fish`, not `server`, `powershell`, `pwsh`, or `cmd`. `--stream` and `--out-dir` remain mutually exclusive; see below for interactive-mode restrictions.
 
 To avoid passing interpreter flags on every command, save `execution` on the node in `~/.xops/xops_config.yaml` (`host add`/`import` also probes and saves this automatically)—see [Hosts and identities](./hosts#node-execution-configuration-execution). Explicit `--no-login` (including `--no-login=false`) retains its legacy Bash selection semantics.
 
@@ -80,11 +94,14 @@ xops exec -x web-01 top
 
 # Run a single elevated command interactively
 xops exec -x --sudo web-01 ls -la /root
+
+# Select an interpreter and save interactive output (input still comes from the terminal)
+xops exec --host web-01 -x --interpreter bash --launch-dialect posix -c 'uptime' >output.log 2>error.log
 ```
 
 - **Single-host only**: `-x` targets a single host and cannot be combined with multi-host batches, local scripts (`--shell`), `--stream`, or `--out-dir`.
-- **Output and exit status**: Output appears directly in the terminal without the 5 MiB result-retention limit above, and nonzero exit codes and signals are preserved. Interactive commands with explicit interpreter flags do not support output to regular files. To save results, use a non-interactive command such as `xops exec web-01 uptime >output.log`.
-- **Interrupting commands**: Press `Ctrl+C` to interrupt. After a disconnection, check what ran remotely before retrying; do not immediately repeat commands that might change data.
+- **Output and exit status**: Output appears in the terminal by default. Save it with `>output.log`, `2>error.log`, or `>output.log 2>&1`, including when selecting an explicit interpreter. The 5 MiB result-retention limit above does not apply, and nonzero exit codes and signals are preserved. Input must still come from a local terminal. Logs from terminal programs may contain color or cursor-control characters, and remote stdout and stderr may not remain separate.
+- **Interrupting commands**: Press `Ctrl+C` to interrupt. If the disk or filesystem becomes unresponsive while saving logs, interruption may need to wait; no log writes continue after the command returns. After a disconnection, check what ran remotely before retrying; do not immediately repeat commands that might change data.
 
 ## Quoting and variable expansion tips
 

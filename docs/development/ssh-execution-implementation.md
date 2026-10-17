@@ -49,6 +49,28 @@
 - [x] 发布命令/脚本各自的 Bash 兼容迁移、SFTP 限制与可回退 schema 版本说明
 - [x] 原生 Windows 与真正无 Bash Unix 平台证据齐备；禁止通过失败后更换解释器回退
 
+## CLI 显式参数组合接通
+
+`cmd/exec_execution.go:prepareCommandPlan` 不再统一拒绝 `--shell`、`--sudo`、`--stream`、`--out-dir`，改为按操作类型验证能力：
+
+- 普通缓冲命令继续通过 `ExecuteCommand` 执行不可变计划。流式/文件输出复用 `Client.Run` 的现有输出适配器，以 `server/unknown` 原样发送计划中已冻结的 payload，避免二次解释器包装；执行前仍核对原命令，拒绝规划后变更。
+- 脚本文件和 stdin 脚本进入 `ResolveScriptExecution`，显式解释器优先于 shebang，正文不转换。显式模式脚本上限 16 MiB，stdin 使用有界读取且不关闭借用流；普通命令仍受 64 KiB 限额约束。stdin 读取后重新校验，防止将脚本误当作普通命令。
+- 非交互新组合使用任务拥有的 5 分钟 context，默认 5 MiB 环形结果窗口；`--stream` 和 `--out-dir` 不受结果窗口限制。每个日志文件由任务打开并在执行/输出清理完成后关闭，关闭错误仍合并返回。
+- `RunWithSudoExecution` 增加可选输出参数，并将已验证的解释器/启动方言/登录选项最后应用，避免输出选项覆盖执行契约。`RunScriptWithExecution` 同时传递解析后的启动方言。原调用方式保持可编译，未启用显式参数的 CLI 路径保持原行为。
+- 新增 `RunInteractiveWithSudoExecution`，与现有非交互显式提权入口对应；复用认证与终端交接流程，通过操作级配置传递用户解释器，不改共享 Client 配置。显式 PTY 提权使用独立 POSIX 控制 Shell，不借旧 `sudo -i` 路径隐式加载登录环境；保留退出码、首字符、认证后进入 raw mode 和返回前恢复终端的约束。
+- 仍拒绝 server/Windows 解释器脚本或 Unix 提权，以及 PTY 与脚本、多主机、`--stream`、`--out-dir` 的组合；不放宽 core 的配置化 su 能力检查，不改变 SSH 信任、凭据保存或重试策略。
+
+回归覆盖 `cmd/exec_combinations_test.go`、`cmd/exec_combination_errors_test.go`、`cmd/exec_interactive_unix_test.go`、`core/ssh/explicit_privilege_test.go` 和 `explicit_privilege_linux_test.go`：实际 SSH 请求载荷、原始脚本字节、提权前缀、逐主机输出、日志、非零退出、输出阻塞取消、stdin 限额、共享配置不变，以及 PTY 认证/输入交接/终端恢复。协议对端为 fixture，不执行真实远端命令；跨平台编译不能替代 Windows/macOS 原生验收。
+
+## CLI 组合评审修复
+
+- `runPrivilegeWithConfig` 在创建输出 writer 前绑定 stream/file 输出；显式提权 PTY 在进入 root 或认证分流前完成严格输出绑定。绑定拥有者将取消函数传递给提权流程；下层借用已有绑定，不重复释放。正常退出先完成输出与帧排空，再释放绑定；异常退出先取消输出再汇合工作协程。认证前的 su 重试保留绑定，不重放用户命令。
+- `cmd/exec_input.go` 复用 `internal/terminal.DuplicatePromptInput` 读取脚本，取消只中断自有副本，关闭前汇合中断回调。读取使用命令 context 和 5 分钟准备阶段上限；正在内核执行的文件系统调用仍可能等待。显式模式保持 16 MiB 限额：普通文件先检查大小，读取时仍限制为上限加一字节以覆盖文件增长；`--shell` 拒绝非普通文件，管道使用 stdin。stdin 凭据和 stdin 脚本在消费字节前互斥。
+- Unix 输入副本通过 `SyscallConn.Control` 和 `F_DUPFD_CLOEXEC` 创建并保存 fd，避免 `File.Fd` 清除借用输入的非阻塞标志。副本关闭不关闭或读取调用方后续输入。
+- 脚本配置只保留实际设置的 interpreter/dialect/login；不再把只指定方言解释为显式 server。预校验检查参数值和已知不支持的脚本解释器，实际脚本在取得节点配置后通过 `ResolveScriptExecution` 解析，继承缺省字段并在用户命令发送前拒绝不兼容组合。普通命令既有参数默认与 `--no-login` 兼容语义不变。
+
+回归新增密码 sudo 的命令/脚本流式输出、阻塞取消与文件失败身份，root 提权 PTY 的 ContextWriter 与终端恢复，脚本读取取消/所有权/限额、凭据 stdin 冲突，以及方言/登录模式/解释器部分覆盖的 SSH fixture 验证。原审查的五个 overlay 探针对应问题已加入仓库回归；测试使用合成凭据与本地 fixture，不连接真实服务器。
+
 ## 验证与提交
 
 每批新增能力和 Bug 修复均须有对应测试。提交 PR 或 push 前执行 `go build ./...`、`go test ./...`、`golangci-lint run ./...`；文档执行 `npm run docs:check`，本地源码链接另行验证。涉及 SSH 并发的批次补充 `go test -race ./core/ssh ./cmd`。没有平台证据的适配器保持未开放状态。

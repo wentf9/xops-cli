@@ -194,38 +194,35 @@ func (o *ExecOptions) Complete(cmd *cobra.Command, args []string) error {
 	if err := o.validateInteractiveOptions(); err != nil {
 		return err
 	}
-	if o.PasswordStdin {
-		pwd, err := utils.ReadSecretFromStdin()
-		if err != nil {
-			return fmt.Errorf("read password from stdin: %w", err)
-		}
-		o.Password = pwd
+	ctx := context.Background()
+	if cmd != nil && cmd.Context() != nil {
+		ctx = cmd.Context()
 	}
-	if o.PassphraseStdin {
-		pass, err := utils.ReadSecretFromStdin()
-		if err != nil {
-			return fmt.Errorf("read passphrase from stdin: %w", err)
-		}
-		o.Passphrase = pass
-	}
-	o.readStdinIfRequired()
-	return nil
+	return o.completeInput(ctx)
 }
 
-func (o *ExecOptions) readStdinIfRequired() {
+func (o *ExecOptions) readStdinIfRequired(ctx context.Context) error {
 	if o.Interactive {
-		return
+		return nil
 	}
 	if o.Command == "" && o.ShellFile == "" {
 		stat, err := os.Stdin.Stat()
 		if err == nil && (stat.Mode()&os.ModeCharDevice) == 0 {
-			content, err := io.ReadAll(os.Stdin)
-			if err == nil && len(content) > 0 {
+			var limit int64
+			if o.execution.enabled() {
+				limit = ssh.MaxCommandInputBytes
+			}
+			content, err := readExecScriptInput(ctx, os.Stdin, limit)
+			if err != nil {
+				return fmt.Errorf("read stdin script: %w", err)
+			}
+			if len(content) > 0 {
 				o.Command = string(content)
 				o.stdinScript = true
 			}
 		}
 	}
+	return nil
 }
 
 func (o *ExecOptions) Validate() error {
@@ -257,8 +254,8 @@ func (o *ExecOptions) validateInteractiveOptions() error {
 	if o.stdinScript {
 		return fmt.Errorf("PTY commands cannot use stdin scripts")
 	}
-	if o.Sudo && o.NoLoginShell {
-		return fmt.Errorf("--no-login with privileged PTY commands is not supported yet")
+	if o.Sudo && o.NoLoginShell && !o.execution.enabled() {
+		return fmt.Errorf("--no-login with privileged PTY commands requires an explicit interpreter")
 	}
 	if o.ShellFile != "" {
 		return fmt.Errorf("%s", i18n.T("exec_err_interactive_shell"))
@@ -304,7 +301,11 @@ func (o *ExecOptions) RunContext(ctx context.Context) (retErr error) {
 	var execCmd string
 	var isScript bool
 	if o.ShellFile != "" {
-		content, err := os.ReadFile(o.ShellFile)
+		var limit int64
+		if o.execution.enabled() {
+			limit = ssh.MaxCommandInputBytes
+		}
+		content, err := readExecScriptFile(ctx, o.ShellFile, limit)
 		if err != nil {
 			return fmt.Errorf("%s: %w", i18n.T("exec_err_read_script"), err)
 		}
@@ -314,6 +315,12 @@ func (o *ExecOptions) RunContext(ctx context.Context) (retErr error) {
 		execCmd = o.Command
 		if o.stdinScript {
 			isScript = true
+		}
+	}
+
+	if isScript && o.execution.enabled() {
+		if len(execCmd) > ssh.MaxCommandInputBytes {
+			return fmt.Errorf("script exceeds %d bytes", ssh.MaxCommandInputBytes)
 		}
 	}
 
@@ -425,7 +432,13 @@ func (o *ExecOptions) runInteractive(
 	}()
 
 	var execErr error
-	if o.commandPlan != nil {
+	if o.Sudo && o.execution.enabled() {
+		execution, optErr := o.cliExecutionConfig()
+		if optErr != nil {
+			return optErr
+		}
+		execErr = client.RunInteractiveWithSudoExecution(ctx, cmd, execution)
+	} else if o.commandPlan != nil {
 		execErr = client.RunInteractivePlan(ctx, *o.commandPlan)
 	} else if o.Sudo {
 		execErr = client.RunInteractiveWithSudo(ctx, cmd)
@@ -535,7 +548,18 @@ func (o *ExecOptions) getOrCreateNode(ctx context.Context, repository *config.Re
 
 func (o *ExecOptions) executeTask(ctx context.Context, connector *ssh.Connector, t execHostTask, execCmd string, isScript bool, totalTasks int, stdoutMu *sync.Mutex) (retErr error) {
 	if o.commandPlan != nil {
-		return o.executePlannedTask(ctx, connector, t, execCmd, isScript, stdoutMu)
+		if isScript || o.commandPlan.Command() != execCmd {
+			return fmt.Errorf("[%s] command changed after execution planning", t.host)
+		}
+		if !o.Sudo && !o.Stream && o.OutDir == "" {
+			return o.executePlannedTask(ctx, connector, t, execCmd, isScript, stdoutMu)
+		}
+	}
+	if o.execution.enabled() {
+		// This task owns cancellation; output and privilege workers finish before return.
+		work, cancel := context.WithTimeout(ctx, ssh.DefaultCommandTimeout)
+		defer cancel()
+		ctx = work
 	}
 	client, err := connector.Connect(ctx, t.nodeID)
 	if err != nil {
@@ -556,7 +580,7 @@ func (o *ExecOptions) executeTask(ctx context.Context, connector *ssh.Connector,
 			joinExecLogCloseError(&retErr, f, t.host, logFile)
 		}()
 		outputOpts = append(outputOpts, ssh.WithOutFile(f))
-	} else if o.Stream || totalTasks == 1 {
+	} else if o.Stream || (totalTasks == 1 && !o.execution.enabled()) {
 		prefix := ""
 		if totalTasks > 1 {
 			if logger.ColorEnabled() {
@@ -580,32 +604,41 @@ func (o *ExecOptions) executeTask(ctx context.Context, connector *ssh.Connector,
 	return printErr
 }
 
-func (o *ExecOptions) resolveScriptExecutionConfig() (*ssh.ExecutionConfig, error) {
+func (o *ExecOptions) cliExecutionConfig() (*ssh.ExecutionConfig, error) {
 	if !o.execution.enabled() && !o.execution.noLoginSet {
 		return nil, nil
 	}
-	opts, err := o.execution.commandOptions(o.NoLoginShell)
-	if err != nil {
-		return nil, err
+	if o.execution.noLoginSet {
+		// --no-login keeps its legacy meaning of explicitly selecting Bash.
+		opts, err := o.execution.commandOptions(o.NoLoginShell)
+		if err != nil {
+			return nil, err
+		}
+		login := opts.Login == ssh.LoginEnabled
+		return &ssh.ExecutionConfig{Interpreter: opts.Interpreter, LaunchDialect: opts.LaunchDialect, Login: &login}, nil
 	}
-	cliExec := &ssh.ExecutionConfig{
-		Interpreter:   opts.Interpreter,
-		LaunchDialect: opts.LaunchDialect,
+	if (o.execution.interpreterSet && o.execution.interpreter == "") || (o.execution.dialectSet && o.execution.dialect == "") {
+		return nil, fmt.Errorf("explicit interpreter and launch dialect must not be empty")
 	}
-	switch opts.Login {
-	case ssh.LoginEnabled:
-		val := true
-		cliExec.Login = &val
-	case ssh.LoginDisabled:
-		val := false
-		cliExec.Login = &val
+	// Missing fields must stay missing: script shebangs and node configuration
+	// resolve them later. Selecting a dialect is not selecting server.
+	cliExec := &ssh.ExecutionConfig{}
+	if o.execution.interpreterSet {
+		cliExec.Interpreter = ssh.Interpreter(o.execution.interpreter)
 	}
-	return cliExec, nil
+	if o.execution.dialectSet {
+		cliExec.LaunchDialect = ssh.LaunchDialect(o.execution.dialect)
+	}
+	if o.execution.loginSet {
+		login := o.execution.login
+		cliExec.Login = &login
+	}
+	return cliExec, cliExec.Validate()
 }
 
 func (o *ExecOptions) dispatchTaskExecution(ctx context.Context, client *ssh.Client, execCmd string, isScript bool, outputOpts []ssh.RunOption) (string, error) {
 	if isScript {
-		cliExec, err := o.resolveScriptExecutionConfig()
+		cliExec, err := o.cliExecutionConfig()
 		if err != nil {
 			return "", err
 		}
@@ -617,6 +650,20 @@ func (o *ExecOptions) dispatchTaskExecution(ctx context.Context, client *ssh.Cli
 			return client.RunScriptWithSudoExecution(ctx, execCmd, resolvedExec, outputOpts...)
 		}
 		return client.RunScriptWithExecution(ctx, execCmd, resolvedExec, outputOpts...)
+	}
+	if o.commandPlan != nil {
+		if o.Sudo {
+			execution, err := o.cliExecutionConfig()
+			if err != nil {
+				return "", err
+			}
+			return client.RunWithSudoExecution(ctx, execCmd, execution, outputOpts...)
+		}
+		// The interpreter has already been applied by PlanCommand. Send its
+		// frozen payload unchanged through the existing output-mode adapters.
+		opts := append([]ssh.RunOption{}, outputOpts...)
+		opts = append(opts, ssh.WithInterpreter(ssh.InterpreterServer), ssh.WithLaunchDialect(ssh.LaunchUnknown))
+		return client.Run(ctx, o.commandPlan.Payload(), opts...)
 	}
 	cmdOpts := o.commandRunOptions(client.Execution(), outputOpts)
 	if o.Sudo {

@@ -59,8 +59,10 @@ func isNullDevice(info os.FileInfo) bool {
 	return err == nil && os.SameFile(info, null)
 }
 
-// BindOutput prepares a non-PTY command output sink so that canceling ctx does
-// not leave the SSH session waiting for a blocked write.
+// BindOutput prepares a non-PTY command output sink with cancellation-aware
+// ownership. Supported terminal/pipe writes can be interrupted. Regular files
+// check cancellation between writes; a kernel write already in progress must
+// finish before return, with no hard cancellation deadline for a stalled filesystem.
 //
 // ContextWriter implementations, finite memory sinks, io.Discard, the null
 // device, local regular files, and native terminal/pipe adapters bind to ctx.

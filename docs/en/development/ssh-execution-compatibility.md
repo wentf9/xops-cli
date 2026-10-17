@@ -98,7 +98,7 @@ The unified layer must close cancellation gaps in the baseline. The existing `st
 
 Add `--interpreter`, `--launch-dialect`, and `--login-shell`, with the latter controlling the login environment of an explicit interpreter. Launch dialect accepts `posix`, `powershell`, `cmd`, or `unknown`. If unspecified, inherit it from configuration or use unknown; do not infer it from the local OS or inner interpreter. `--shell` already denotes a local script file, and `--login`/`-l` already denotes the SSH user; neither may be repurposed.
 
-The following examples describe the final interface. P1-A implements server/Bash for ordinary buffered commands; The first P1-B batch also exposes explicit PTY with validated output capabilities; sh and script options remain pending. The first example states the eventual default explicitly so that it can be used during migration:
+Explicit `exec` interpreter flags now support scripts, escalation, streaming output, and per-host logs. Ordinary buffered commands retain immutable command plans; streaming/file output sends the frozen payload without wrapping the interpreter again. Scripts and escalation remain limited to existing adapters, and PTY remains incompatible with multi-host execution, scripts, and streaming/file output. These examples use the current interface:
 
 ```bash
 xops exec --host alpine-01 --interpreter server -c 'uname -a'

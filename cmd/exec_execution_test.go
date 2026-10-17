@@ -43,9 +43,10 @@ func TestExecExplicitExecutionOptions(t *testing.T) {
 		{"server no-login", []string{"--interpreter", "server", "--no-login"}, "", "requires the bash"},
 		{"login conflict", []string{"--interpreter", "bash", "--launch-dialect", "posix", "--no-login", "--login-shell"}, "", "mutually exclusive"},
 		{"PTY", []string{"--interpreter", "server", "-x"}, "echo '$HOME'", ""},
-		{"sudo", []string{"--interpreter", "server", "--sudo"}, "", "buffered or PTY"},
-		{"stream", []string{"--interpreter", "server", "--stream"}, "", "buffered or PTY"},
-		{"file output", []string{"--interpreter", "server", "--out-dir", "logs"}, "", "buffered or PTY"},
+		{"server sudo rejected", []string{"--interpreter", "server", "--sudo"}, "", "sudo requires a supported explicit"},
+		{"bash sudo", []string{"--interpreter", "bash", "--launch-dialect", "posix", "--sudo"}, "bash -c 'echo '\\''$HOME'\\'''", ""},
+		{"stream", []string{"--interpreter", "server", "--stream"}, "echo '$HOME'", ""},
+		{"file output", []string{"--interpreter", "server", "--out-dir", "logs"}, "echo '$HOME'", ""},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			o := NewExecOptions()
@@ -77,7 +78,7 @@ func TestExecExplicitExecutionOptions(t *testing.T) {
 func TestExecExplicitInputRouting(t *testing.T) {
 	for _, flags := range [][]string{
 		{"--interpreter", "server", "--host", "fixture"},
-		{"--interpreter", "bash", "--launch-dialect", "posix", "--host", "fixture", "--shell", "file.sh"},
+		{"--interpreter", "server", "--host", "fixture", "--shell", "file.sh"},
 		{"--host", "fixture", "-c", ""},
 		{"--host", "fixture", ""},
 		{"fixture", ""},
