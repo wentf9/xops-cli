@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -51,7 +52,7 @@ func captureSSHTunnelErrors(t *testing.T) <-chan string {
 	return lines
 }
 
-func requestRejectedTunnelConnection(t *testing.T, addr string, socks bool) {
+func requestRejectedTunnelConnection(t *testing.T, addr string, socks bool, destinations ...string) {
 	t.Helper()
 	conn, err := net.DialTimeout("tcp", addr, time.Second)
 	if err != nil {
@@ -62,8 +63,20 @@ func requestRejectedTunnelConnection(t *testing.T, addr string, socks bool) {
 		t.Fatal(err)
 	}
 	if socks {
-		// No-auth greeting followed by CONNECT to 127.0.0.1:20173.
-		if _, err := conn.Write([]byte{5, 1, 0, 5, 1, 0, 1, 127, 0, 0, 1, 0x4e, 0xcd}); err != nil {
+		// No-auth greeting followed by CONNECT to the selected loopback target.
+		destination := "127.0.0.1:20173"
+		if len(destinations) > 0 {
+			destination = destinations[0]
+		}
+		_, portText, err := net.SplitHostPort(destination)
+		if err != nil {
+			t.Fatal(err)
+		}
+		port, err := strconv.ParseUint(portText, 10, 16)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Write([]byte{5, 1, 0, 5, 1, 0, 1, 127, 0, 0, 1, byte(port >> 8), byte(port)}); err != nil {
 			t.Fatal(err)
 		}
 		var reply [12]byte

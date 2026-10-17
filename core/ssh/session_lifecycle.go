@@ -5,19 +5,31 @@ import (
 	"errors"
 	"fmt"
 
+	corelog "github.com/wentf9/xops-cli/core/log"
 	cryptoSSH "golang.org/x/crypto/ssh"
 	"golang.org/x/term"
 )
 
 // sessionRequest establishes cancellation before entering a blocking SSH
 // request. Its worker exits on a reply or on channel/transport interruption.
-func (c *Client) sessionRequest(ctx context.Context, session *cryptoSSH.Session, name string, request func() error) error {
+func (c *Client) sessionRequest(ctx context.Context, session *cryptoSSH.Session, name string, request func() error) (retErr error) {
 	if ctx == nil {
 		return fmt.Errorf("SSH %s request context is nil", name)
 	}
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("SSH %s request canceled: %w", name, err)
 	}
+	c.observeSession(corelog.SessionRequest, 2, name, "sending")
+	defer func() {
+		outcome := "accepted"
+		if retErr != nil {
+			outcome = "failed or interrupted"
+		}
+		c.observeSession(corelog.SessionRequest, 2, name, outcome)
+		if retErr == nil && name != "pty" && name != "privilege pty" {
+			c.observeSession(corelog.SessionStarted, 1, name, "accepted")
+		}
+	}()
 	work, cancel := withTimeoutOrDefault(ctx, c.handshakeTimeout, defaultSSHHandshakeTimeout)
 	defer cancel()
 	done := make(chan error, 1)
@@ -46,7 +58,14 @@ func (c *Client) waitTerminalSession(ctx context.Context, session *cryptoSSH.Ses
 	}
 }
 
-func (c *Client) closeSessionBounded(session *cryptoSSH.Session) error {
+func (c *Client) closeSessionBounded(session *cryptoSSH.Session) (retErr error) {
+	defer func() {
+		outcome := "completed"
+		if retErr != nil {
+			outcome = "failed"
+		}
+		c.observeSession(corelog.SessionCleanup, 3, "close", outcome)
+	}()
 	work, cancel := withTimeoutOrDefault(context.Background(), sessionShutdownTimeout, sessionShutdownTimeout)
 	defer cancel()
 	done := make(chan error, 1)
@@ -121,7 +140,7 @@ func (c *Client) runTerminalSession(ctx context.Context, payload string, streams
 	waitDone := make(chan error, 1)
 	// Start before input initialization: even that failure must join Wait and
 	// force transport interruption if the peer ignores channel closure.
-	go func() { waitDone <- session.Wait() }()
+	go func() { waitDone <- c.waitSession(session) }()
 	abort := func() {
 		cancel()
 		if len(cancelOutput) > 0 {

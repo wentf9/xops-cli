@@ -17,10 +17,11 @@ func (c *Client) Socks5Forward(ctx context.Context, listenAddr string, opts ...F
 	}
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
+		c.observeForward("dynamic", "listen failed", listenAddr, "")
 		return nil, fmt.Errorf("listen on local SOCKS5 address %s failed: %w", listenAddr, err)
 	}
-	return runForwardListener(ctx, listener, c.forwardOptions(opts...), func(runCtx context.Context, conn net.Conn) error {
-		return c.handleSocks5(runCtx, conn)
+	return runForwardListener(ctx, listener, c.forwardDiagnostics(c.forwardOptions(opts...), "dynamic", listener, ""), func(runCtx context.Context, conn net.Conn) error {
+		return c.observedForwardHandler("dynamic", listener.Addr().String(), "", func() error { return c.handleSocks5(runCtx, conn) })
 	}), nil
 }
 

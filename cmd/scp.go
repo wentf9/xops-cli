@@ -24,7 +24,6 @@ import (
 	"github.com/wentf9/xops-cli/pkg/logger"
 	"github.com/wentf9/xops-cli/pkg/models"
 	pkgutils "github.com/wentf9/xops-cli/pkg/utils"
-	"golang.org/x/term"
 )
 
 type ScpOptions struct {
@@ -50,7 +49,7 @@ type ScpOptions struct {
 func NewScpOptions() *ScpOptions {
 	return &ScpOptions{
 		SshOptions:  *NewSshOptions(),
-		sshLogLevel: scpSSHInfo,
+		sshLogLevel: sshLogInfo,
 		TaskCount:   1,
 		ThreadCount: sftp.DefaultThreadsPerFile,
 	}
@@ -257,7 +256,7 @@ func (e *transferProgressErrors) Err() error {
 
 func (o *ScpOptions) RunContext(ctx context.Context) (retErr error) {
 	if o.Verbose {
-		diagnostics, err := newSCPDiagnostics(ctx, os.Stderr, "stderr", o.sshLogLevel >= scpSSHDebug1, o.verboseLevel)
+		diagnostics, err := newSCPDiagnostics(ctx, os.Stderr, "stderr", o.sshLogLevel >= sshLogDebug1, o.verboseLevel)
 		if err != nil {
 			return err
 		}
@@ -634,22 +633,7 @@ func (o *ScpOptions) confirmRemoteToRemoteOverwrite(ctx context.Context, dstSftp
 
 // progressEnabled follows SCP terminal behavior; redirected output stays clean.
 func (o *ScpOptions) progressEnabled() bool {
-	return !o.Quiet && scpTerminal(os.Stdout) && scpTerminal(os.Stderr)
-}
-
-// scpTerminal must not call File.Fd: on Unix that can clear O_NONBLOCK,
-// invalidating a macOS output binding that shares the pipe description.
-func scpTerminal(file *os.File) bool {
-	if file == nil {
-		return false
-	}
-	raw, err := file.SyscallConn()
-	if err != nil {
-		return false
-	}
-	terminal := false
-	err = raw.Control(func(fd uintptr) { terminal = term.IsTerminal(int(fd)) })
-	return err == nil && terminal
+	return !o.Quiet && diagnosticTerminal(os.Stdout) && diagnosticTerminal(os.Stderr)
 }
 
 // createTransferProgress owns one bar per transfer. The caller must finish it

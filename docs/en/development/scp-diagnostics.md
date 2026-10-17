@@ -83,6 +83,10 @@ tests check queue bounds, control escaping, zero writes to unsupported sinks,
 output errors and stderr ownership. Windows/macOS native console behavior remains for native CI;
 cross-compilation does not establish native execution results.
 
+## Output shared with SSH
+
+SCP's bounded queue and output binding now live in `cmd/diagnostic_output.go`; ordered flags and escaping live in `cmd/diagnostic_flags.go`. SSH lifecycle formatting is shared with `xops ssh -v`. SCP retains its own verbose/quiet behavior, SFTP events and output-error wrapper; only SSH renders the new pre-authentication negotiation event. See [SSH diagnostics](./ssh-diagnostics.md).
+
 ## Follow-up implementation and dependency boundary
 
 The selected approach retains existing dependencies without a fork, vendoring or

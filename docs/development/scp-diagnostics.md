@@ -51,6 +51,10 @@ SSH/SFTP 的 `WithDiagnostics` 只装配观察者，不改变连接租约、认�
 另检查队列容量、控制字符转义、不支持输出零写入、输出错误与 stderr 所有权。
 Windows/macOS 原生控制台行为仍由相应原生 CI 验证，交叉编译不代替原生执行。
 
+## 与 SSH 共用的输出
+
+SCP 的有界队列和输出绑定已抽取到 `cmd/diagnostic_output.go`，有序参数及转义位于 `cmd/diagnostic_flags.go`；SSH 生命周期格式化与 `xops ssh -v` 共用。SCP 自身的 verbose/quiet、SFTP 事件及输出错误包装保持不变，新增认证前协商事件仅由 SSH 展示。详见 [SSH 诊断](./ssh-diagnostics.md)。
+
 ## 后续实现与依赖边界
 
 按用户选择保持现有依赖，无 fork、vendor 或第二套 SSH 后端。

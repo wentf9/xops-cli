@@ -12,6 +12,12 @@ const (
 	AuthenticationMethods DiagnosticKind = "authentication_methods"
 	AuthenticationAttempt DiagnosticKind = "authentication_attempt"
 	Authenticated         DiagnosticKind = "authenticated"
+	Negotiated            DiagnosticKind = "negotiated"
+	SessionRequest        DiagnosticKind = "session_request"
+	SessionStarted        DiagnosticKind = "session_started"
+	SessionFinished       DiagnosticKind = "session_finished"
+	SessionCleanup        DiagnosticKind = "session_cleanup"
+	ForwardLifecycle      DiagnosticKind = "forward_lifecycle"
 	SubsystemStarting     DiagnosticKind = "subsystem_starting"
 	SubsystemReady        DiagnosticKind = "subsystem_ready"
 	SubsystemFailed       DiagnosticKind = "subsystem_failed"
@@ -47,6 +53,8 @@ type Diagnostic struct {
 	StatusCode                                 uint32
 	HasPacketID                                bool
 	HasStatus                                  bool
+	HasExitCode                                bool
+	ExitCode                                   int64
 	Path, Extension, ExtensionVersion          string
 	Truncated                                  bool
 	Operation, Outcome                         string

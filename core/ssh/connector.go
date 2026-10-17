@@ -1272,7 +1272,9 @@ func (c *Connector) observeSSHConfig(cfg *ClientConfig, clientConfig *ssh.Client
 		if cfg.AuthType == "password" {
 			protocol = "password"
 		}
+		negotiated := false
 		clientConfig.AuthCallback = func(ctx *ssh.ClientAuthContext) (ssh.AuthMethod, error) {
+			observeAuthNegotiation(c.diagnostics, ctx, &negotiated)
 			event := authenticationDiagnostic(ctx)
 			logger.EmitDiagnostic(c.diagnostics, event)
 			// Match x/crypto's fallback selection without replacing it.

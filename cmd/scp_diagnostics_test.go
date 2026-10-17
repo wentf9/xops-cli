@@ -108,10 +108,10 @@ func TestSCPDiagnosticTransfers(t *testing.T) {
 				if !strings.Contains(text, "scp: transfer starting:") {
 					t.Fatalf("missing SCP diagnostics: %q", text)
 				}
-				if got := strings.Contains(text, "debug1: Connecting to"); got != (o.sshLogLevel >= scpSSHDebug1) {
+				if got := strings.Contains(text, "debug1: Connecting to"); got != (o.sshLogLevel >= sshLogDebug1) {
 					t.Fatalf("SSH quiet precedence: %q", text)
 				}
-				if o.sshLogLevel >= scpSSHDebug1 {
+				if o.sshLogLevel >= sshLogDebug1 {
 					for _, want := range []string{"Connection established", "Server host key", "SHA256:", "Authenticated to", "kex: algorithm:", "SFTP subsystem ready"} {
 						if want == "SFTP subsystem ready" && mode == "cancel" {
 							continue

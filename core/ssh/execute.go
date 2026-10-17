@@ -710,7 +710,7 @@ func (c *Client) runSessionWithInput(ctx context.Context, request string, start 
 	output := startSessionOutput(stdoutPipe, stderrPipe, stdout, stderr)
 	waitDone := make(chan error, 1)
 	go func() {
-		waitDone <- session.Wait()
+		waitDone <- c.waitSession(session)
 	}()
 
 	cancelAllOutputs := combineOutputCancels(cancel, cancelOutput)
@@ -813,7 +813,7 @@ type subsystemSessionResult struct {
 	err     error
 }
 
-func (c *Client) newSessionContext(ctx context.Context) (*ssh.Session, error) {
+func (c *Client) newSessionContext(ctx context.Context) (_ *ssh.Session, retErr error) {
 	if ctx != nil && c != nil {
 		work, cancel := withTimeoutOrDefault(ctx, c.handshakeTimeout, defaultSSHHandshakeTimeout)
 		defer cancel()
@@ -825,6 +825,14 @@ func (c *Client) newSessionContext(ctx context.Context) (*ssh.Session, error) {
 	if c == nil || c.sshClient == nil {
 		return nil, fmt.Errorf("ssh client is not connected")
 	}
+	c.observeSession(logger.SessionRequest, 2, "open", "sending")
+	defer func() {
+		outcome := "accepted"
+		if retErr != nil {
+			outcome = "failed or interrupted"
+		}
+		c.observeSession(logger.SessionRequest, 2, "open", outcome)
+	}()
 	result := make(chan subsystemSessionResult, 1)
 	go func() {
 		session, err := c.sshClient.NewSession()

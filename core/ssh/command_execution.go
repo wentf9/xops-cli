@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	logger "github.com/wentf9/xops-cli/core/log"
 	cryptoSSH "golang.org/x/crypto/ssh"
 )
 
@@ -77,7 +78,7 @@ func (o *commandObservation) snapshot() CommandResult {
 // PTY, perform privilege escalation, probe the server, or retry execution.
 // All workers are joined; closing a stuck channel may interrupt the shared
 // transport, including other operations using the same ProxyJump connection.
-func (c *Client) ExecuteCommand(ctx context.Context, plan CommandPlan) CommandResult {
+func (c *Client) ExecuteCommand(ctx context.Context, plan CommandPlan) (result CommandResult) {
 	observation := &commandObservation{result: CommandResult{
 		PlanDigest: plan.digest, Phase: "validate", Outcome: ExecutionNotStarted,
 	}}
@@ -85,6 +86,7 @@ func (c *Client) ExecuteCommand(ctx context.Context, plan CommandPlan) CommandRe
 		observation.result.ExecutionErr = err
 		return observation.snapshot()
 	}
+	defer func() { c.observeCommandResult(result) }()
 	work, cancel := context.WithTimeout(ctx, plan.timeout)
 	defer cancel()
 	observation.result.Phase = "open"
@@ -94,10 +96,10 @@ func (c *Client) ExecuteCommand(ctx context.Context, plan CommandPlan) CommandRe
 		return observation.snapshot()
 	}
 	output := newOutputWriter(&RunConfig{OutMode: OutputModeRingBuffer, RingMaxBytes: plan.outputLimit})
-	workersDone, startDone := startCommandWorkers(work, channel, requests, plan, output, observation)
+	workersDone, startDone := c.startCommandWorkers(work, channel, requests, plan, output, observation)
 	waitErr := c.waitCommandWorkers(work, workersDone, startDone)
 	cleanupErr := c.closeCommandChannel(channel, workersDone)
-	result := observation.snapshot()
+	result = observation.snapshot()
 	result.Output, result.Truncated = output.String(), output.truncated
 	result.CleanupErr = cleanupErr
 	if waitErr != nil {
@@ -164,7 +166,7 @@ type commandStartResult struct {
 	err      error
 }
 
-func startCommandWorkers(ctx context.Context, channel cryptoSSH.Channel, requests <-chan *cryptoSSH.Request,
+func (c *Client) startCommandWorkers(ctx context.Context, channel cryptoSSH.Channel, requests <-chan *cryptoSSH.Request,
 	plan CommandPlan, output *outputWriter, observation *commandObservation,
 ) (<-chan struct{}, <-chan commandStartResult) {
 	var workers sync.WaitGroup
@@ -181,20 +183,27 @@ func startCommandWorkers(ctx context.Context, channel cryptoSSH.Channel, request
 		})
 	}
 	startDone := make(chan commandStartResult, 1)
-	workers.Go(func() { sendCommandInput(ctx, channel, plan, observation, startDone) })
+	workers.Go(func() { c.sendCommandInput(ctx, channel, plan, observation, startDone) })
 	done := make(chan struct{})
 	// Every worker is unblocked by the supervisor's channel/transport closure.
 	go func() { workers.Wait(); close(done) }()
 	return done, startDone
 }
 
-func sendCommandInput(ctx context.Context, channel cryptoSSH.Channel, plan CommandPlan, observation *commandObservation, startDone chan<- commandStartResult) {
+func (c *Client) sendCommandInput(ctx context.Context, channel cryptoSSH.Channel, plan CommandPlan, observation *commandObservation, startDone chan<- commandStartResult) {
 	if err := ctx.Err(); err != nil {
 		startDone <- commandStartResult{err: err}
 		return
 	}
 	observation.update(func(r *CommandResult) { r.Phase, r.Outcome = "request", ExecutionUnknown })
+	c.observeSession(logger.SessionRequest, 2, "exec", "sending")
 	accepted, err := channel.SendRequest("exec", true, cryptoSSH.Marshal(struct{ Command string }{plan.payload}))
+	if err == nil && accepted {
+		c.observeSession(logger.SessionRequest, 2, "exec", "accepted")
+		c.observeSession(logger.SessionStarted, 1, "exec", "accepted")
+	} else {
+		c.observeSession(logger.SessionRequest, 2, "exec", "failed or rejected")
+	}
 	startDone <- commandStartResult{accepted, err}
 	if err != nil {
 		observation.update(func(r *CommandResult) { r.ExecutionErr = fmt.Errorf("send SSH exec request: %w", err) })
@@ -308,7 +317,14 @@ func observeCommandTermination(request *cryptoSSH.Request, observation *commandO
 	}
 }
 
-func (c *Client) closeCommandChannel(channel cryptoSSH.Channel, workersDone <-chan struct{}) error {
+func (c *Client) closeCommandChannel(channel cryptoSSH.Channel, workersDone <-chan struct{}) (retErr error) {
+	defer func() {
+		outcome := "completed"
+		if retErr != nil {
+			outcome = "failed"
+		}
+		c.observeSession(logger.SessionCleanup, 3, "close", outcome)
+	}()
 	done := make(chan error, 1)
 	// Channel.Close may block writing to a broken transport. Interrupt is the
 	// bounded fallback; the supervisor always joins this worker and I/O workers.

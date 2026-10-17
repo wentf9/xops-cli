@@ -354,7 +354,7 @@ func (c *Client) runPrivilegeAttempt(ctx context.Context, mode SudoMode, command
 		return err
 	}
 	waitDone := make(chan error, 1)
-	go func() { waitDone <- session.Wait() }()
+	go func() { waitDone <- c.waitSession(session) }()
 	inputDone := make(chan error, 1)
 	go func() { inputDone <- exchange.input(work, stdin, pipe) }()
 	waitErr, inputErr, closeErr := c.waitPrivilegeExchange(work, cancel, abort, session, waitDone, inputDone, exchange.outputErrors)
