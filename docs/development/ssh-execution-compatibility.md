@@ -98,7 +98,7 @@ POSIX `shellQuote` 不作为跨平台通用函数。PowerShell 的编码载荷�
 
 新增 `--interpreter`、`--launch-dialect`，新增 `--login-shell` 控制显式解释器的登录环境。启动方言取 `posix`、`powershell`、`cmd` 或 `unknown`；缺省从配置继承，否则为 unknown，不能由本地系统或内部解释器推断。`--shell` 已表示本地脚本文件，`--login`/`-l` 已表示 SSH 用户，两者不得重用。
 
-以下示例描述最终接口，其中普通缓冲命令的 server/Bash 路径已在 P1-A 实现；P1-B 首批还开放了具有已验收输出能力的显式 PTY；sh 与脚本的新选项仍待实现。第一个示例显式写出最终目标默认值，以便在迁移期使用：
+`exec` 的显式解释器参数已接通脚本、提权、流式输出和按主机日志。普通缓冲命令继续使用不可变命令计划；流式/文件输出发送计划中已冻结的载荷，不再次包装解释器。脚本和提权仍限定于已有适配器，PTY 与多主机、脚本、流式/文件输出的互斥规则不变。以下示例使用当前接口：
 
 ```bash
 xops exec --host alpine-01 --interpreter server -c 'uname -a'

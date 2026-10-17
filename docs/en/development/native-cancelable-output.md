@@ -12,7 +12,7 @@ SSH streaming/PTY output. No separate SSH or transfer backend is introduced.
 | macOS blocking anonymous pipes | Unsupported; retain the existing safe fallback | No shared `O_NONBLOCK` changes or helper processes |
 | Windows consoles | Host-injected relay entry point, duplicate handle and lazily started pipe-backed subprocess; pipe requests/ACKs cancel with `CancelIoEx`/`CancelSynchronousIo` | Safe fallback without injection; cancellation checks process exit without closing the borrowed handle or changing console mode |
 | Windows synchronous/overlapped pipes | Duplicate handle, thread cancellation and request-specific `CancelIoEx` | Own event and pinned request/buffer lifetime; never cancel other borrowed-handle requests |
-| Regular files | Existing implementation | A filesystem Write already in progress is not promised to be interruptible |
+| Regular files, including PTY redirection | Shared synchronous `regularFileOutput` | Check cancellation between writes; an in-flight kernel Write must finish before return, without a hard cancellation deadline |
 
 Windows retries cancellation until completion, covering cancellation before the
 system call starts. Each write joins native I/O and its cancellation worker before
@@ -49,6 +49,14 @@ their existing contract: strict execution rejects them before starting; legacy
 entry points retain their compatibility policy; SCP skips auxiliary output and
 continues transferring. Callers retain original streams, cancel and join writes
 before release; bindings release only their own resources.
+
+## PTY regular-file redirection
+
+`prepareContextOutputWithLimit` recognizes regular files before invoking native terminal/pipe adapters. Strict PTY output reuses the synchronous `regularFileOutput` already used by `BindOutput`, with no new goroutine, duplicate file handle, or file-relay subprocess. The binding borrows the file without closing, syncing, or changing its open flags; only requested writes advance its shared offset. Terminal input requirements and native terminal/pipe cancellation and per-write protection are unchanged.
+
+Files have an explicitly weaker cancellation contract: check context before each write, but do not promise to interrupt a write already executing in the kernel. Wait for that write before returning. Cancellation/drain deadlines in `waitTerminalOutput`/`waitSessionOutput` signal shutdown and still join output workers; neither the one-second shutdown grace nor PTY write protection is a hard file-write deadline. Slow disks, NFS, or stalled filesystems may delay cancellation indefinitely. Never return early and leave delayed writes behind. Write errors retain `OutputError.Target` and the original file error; closed files are rejected before command dispatch.
+
+Regressions cover portable append flags/ownership, pre-write cancellation, read-only/closed-file errors and a controlled in-flight-write waiter, plus Linux PTY separate/combined redirection, nonzero status, terminal restoration on failure, explicit privileged file output, and explicit-interpreter CLI redirection. SSH peers are fixtures; the controlled waiter does not inject a native kernel slow-disk fault. Native Windows/macOS PTY acceptance still belongs to platform CI.
 
 ## CLI integration
 

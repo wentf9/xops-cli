@@ -20,12 +20,16 @@ import (
 
 // RunWithSudoExecution honors a frozen execution configuration or rejects an
 // unvalidated escalation adapter. Nil configuration preserves legacy behavior.
-func (c *Client) RunWithSudoExecution(ctx context.Context, command string, execution *ExecutionConfig) (string, error) {
+func (c *Client) RunWithSudoExecution(ctx context.Context, command string, execution *ExecutionConfig, extraOpts ...RunOption) (string, error) {
 	opts, err := c.configuredSudoOptions(ctx, command, execution)
 	if err != nil {
 		return "", err
 	}
-	return c.RunWithSudo(ctx, command, opts...)
+	// Execution options are applied last so output selection cannot replace the
+	// validated target interpreter, launch dialect or login mode.
+	runOpts := append([]RunOption{}, extraOpts...)
+	runOpts = append(runOpts, opts...)
+	return c.RunWithSudo(ctx, command, runOpts...)
 }
 
 // RunScriptWithSudoExecution applies the same target/login capability checks
@@ -155,6 +159,33 @@ func (c *Client) RunInteractiveWithSudo(ctx context.Context, command string) err
 	return c.RunInteractiveWithSudoIO(ctx, command, c.defaultInteractiveIO())
 }
 
+// RunInteractiveWithSudoExecution applies a per-operation execution configuration
+// without mutating the shared client's defaults. Terminal streams are borrowed
+// from the host environment; the existing privilege lifecycle owns their binding.
+func (c *Client) RunInteractiveWithSudoExecution(ctx context.Context, command string, execution *ExecutionConfig) (retErr error) {
+	if execution == nil {
+		return c.RunInteractiveWithSudo(ctx, command)
+	}
+	opts, err := c.configuredSudoOptions(ctx, command, execution)
+	if err != nil {
+		return err
+	}
+	config := c.defaultRunConfig()
+	for _, opt := range opts {
+		opt(config)
+	}
+	work, cancelOutput := context.WithCancel(ctx)
+	defer cancelOutput()
+	streams := c.defaultInteractiveIO()
+	stdout, stderr, closeOutput, err := bindStrictOutputs(work, streams.Stdout, streams.Stderr)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, closeOutput()) }()
+	streams.Stdout, streams.Stderr = stdout, stderr
+	return c.runInteractivePortableWithSudo(work, c.ConnectionConfig().SudoMode, command, streams, false, config, cancelOutput)
+}
+
 // RunInteractiveWithSudoIO uses an authenticated terminal handoff before
 // consuming caller input. The injected streams avoid process-global I/O changes.
 func (c *Client) RunInteractiveWithSudoIO(ctx context.Context, command string, streams InteractiveIO) error {
@@ -163,7 +194,7 @@ func (c *Client) RunInteractiveWithSudoIO(ctx context.Context, command string, s
 	}
 	mode := c.ConnectionConfig().SudoMode
 	if usesPortableShellAdapter(c.defaultRunConfig()) {
-		return c.runInteractivePortableWithSudo(ctx, mode, command, streams, false)
+		return c.runInteractivePortableWithSudo(ctx, mode, command, streams, false, c.defaultRunConfig())
 	}
 	switch mode {
 	case SudoModeRoot:
@@ -246,7 +277,7 @@ func (c *Client) ShellWithSudoIO(ctx context.Context, streams InteractiveIO) err
 	}
 	mode := c.ConnectionConfig().SudoMode
 	if usesPortableShellAdapter(c.defaultRunConfig()) {
-		return c.runInteractivePortableWithSudo(ctx, mode, "", streams, true)
+		return c.runInteractivePortableWithSudo(ctx, mode, "", streams, true, c.defaultRunConfig())
 	}
 	switch mode {
 	case SudoModeRoot:
@@ -254,7 +285,7 @@ func (c *Client) ShellWithSudoIO(ctx context.Context, streams InteractiveIO) err
 	case SudoModeSudoer:
 		return c.runTerminalSession(ctx, "sudo -i", streams, false, true)
 	case SudoModeSudo, SudoModeSu:
-		return c.runInteractivePrivilegeSession(ctx, mode, `exec "${SHELL:-/bin/bash}"`, streams, true)
+		return c.runInteractivePrivilegeSession(ctx, mode, `exec "${SHELL:-/bin/bash}"`, streams, true, nil)
 	default:
 		return fmt.Errorf("privilege escalation is not supported for this host (sudo_mode=%s)", mode)
 	}
@@ -416,7 +447,7 @@ func (c *Client) RunCommandWithIO(ctx context.Context, command string, sudo bool
 	// writers retain their legacy direct behavior; see BindOutput.
 	work, cancel := context.WithCancel(ctx)
 	defer cancel()
-	stdout, stderr, closeOutput, err := c.bindCommandOutputs(work, stdout, stderr)
+	stdout, stderr, closeOutput, err := c.bindCommandOutputs(work, stdout, stderr, false)
 	if err != nil {
 		return err
 	}
@@ -438,7 +469,7 @@ func (c *Client) dispatchSudoCommand(ctx context.Context, clientConfig ClientCon
 	config.Interpreter, config.LoginShell = interp, c.resolveExecutionLogin(interp)
 	if usesPortableShellAdapter(config) && clientConfig.SudoMode != SudoModeRoot {
 		inner := portableUserCommand(command, config, LaunchPOSIX)
-		return c.runPrivilegeOperation(ctx, clientConfig.SudoMode, inner, stdin, stdout, stderr, config)
+		return c.runPrivilegeOperation(ctx, clientConfig.SudoMode, inner, stdin, stdout, stderr, config, cancel)
 	}
 	switch clientConfig.SudoMode {
 	case SudoModeRoot:
@@ -461,7 +492,7 @@ func (c *Client) dispatchSudoCommand(ctx context.Context, clientConfig ClientCon
 				inner = bashCommandPayload(command, login)
 			}
 		}
-		return c.runPrivilegeOperation(ctx, clientConfig.SudoMode, inner, stdin, stdout, stderr, interp)
+		return c.runPrivilegeOperation(ctx, clientConfig.SudoMode, inner, stdin, stdout, stderr, interp, cancel)
 	case SudoModeNone:
 		return fmt.Errorf("privilege escalation is not supported for this host (sudo_mode=none)")
 	default:
@@ -496,7 +527,12 @@ func legacyBashPayload(command string) string {
 	return legacyPayload(command, InterpreterBash)
 }
 
-func (c *Client) bindCommandOutputs(ctx context.Context, stdout, stderr io.Writer) (io.Writer, io.Writer, func() error, error) {
+// alreadyBound is used only when the caller owns output bindings and supplies
+// their cancellation to the operation. Do not duplicate or close them here.
+func (c *Client) bindCommandOutputs(ctx context.Context, stdout, stderr io.Writer, alreadyBound bool) (io.Writer, io.Writer, func() error, error) {
+	if alreadyBound {
+		return stdout, stderr, func() error { return nil }, nil
+	}
 	boundOut, closeOut, outCancelable, err := BindOutput(ctx, stdout)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("bind command stdout: %w", err)

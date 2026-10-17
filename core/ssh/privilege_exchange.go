@@ -75,7 +75,7 @@ func (e *privilegeExchange) started() bool {
 }
 func shellQuote(value string) string { return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'" }
 func (e *privilegeExchange) command(command string) string {
-	if e.launchDialect == LaunchFish || e.interpreter == InterpreterFish || e.interpreter == InterpreterZsh {
+	if (e.terminal != nil && e.terminal.portableControl) || e.launchDialect == LaunchFish || e.interpreter == InterpreterFish || e.interpreter == InterpreterZsh {
 		return e.portableCommand(command)
 	}
 	shellName := "bash"
@@ -240,6 +240,7 @@ func (c *Client) runPrivilegeOperation(ctx context.Context, mode SudoMode, comma
 		return err
 	}
 	var terminal *privilegeTerminal
+	var cancelOutput context.CancelFunc
 	config := c.defaultRunConfig()
 	for _, opt := range options {
 		switch v := opt.(type) {
@@ -247,6 +248,8 @@ func (c *Client) runPrivilegeOperation(ctx context.Context, mode SudoMode, comma
 			terminal = v
 		case Interpreter:
 			config.Interpreter = v
+		case context.CancelFunc:
+			cancelOutput = v
 		case *RunConfig:
 			if v != nil {
 				copied := *v
@@ -258,7 +261,7 @@ func (c *Client) runPrivilegeOperation(ctx context.Context, mode SudoMode, comma
 		return fmt.Errorf("privilege terminal activation is missing")
 	}
 	for attempt := 0; attempt < 3; attempt++ {
-		err := c.runPrivilegeAttempt(ctx, mode, command, stdin, stdout, stderr, attempt > 0, terminal, config)
+		err := c.runPrivilegeAttempt(ctx, mode, command, stdin, stdout, stderr, attempt > 0, terminal, config, cancelOutput)
 		if mode != SudoModeSu || !errors.Is(err, errPrivilegeAuthenticationRejected) || credentialRecoveryPrompter(c.prompter) == nil || attempt == 2 {
 			return err
 		}
@@ -266,7 +269,7 @@ func (c *Client) runPrivilegeOperation(ctx context.Context, mode SudoMode, comma
 	return errPrivilegeAuthenticationRejected
 }
 
-func (c *Client) runPrivilegeAttempt(ctx context.Context, mode SudoMode, command string, stdin io.Reader, stdout, stderr io.Writer, force bool, terminal *privilegeTerminal, config *RunConfig) (retErr error) {
+func (c *Client) runPrivilegeAttempt(ctx context.Context, mode SudoMode, command string, stdin io.Reader, stdout, stderr io.Writer, force bool, terminal *privilegeTerminal, config *RunConfig, cancelOuterOutput context.CancelFunc) (retErr error) {
 	exchange := newPrivilegeExchange(c, mode, force, config.Interpreter)
 	exchange.launchDialect = config.LaunchDialect
 	exchange.terminal = terminal
@@ -321,6 +324,22 @@ func (c *Client) runPrivilegeAttempt(ctx context.Context, mode SudoMode, command
 	if stderr == nil {
 		stderr = io.Discard
 	}
+	// Output has its own lifetime: normal Wait completion stops input, but
+	// pending frame bytes must still be flushed before output is canceled.
+	outputCtx, cancelOutput := context.WithCancel(ctx)
+	defer cancelOutput()
+	stdout, stderr, closeOutput, err := c.bindCommandOutputs(outputCtx, stdout, stderr, cancelOuterOutput != nil)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, closeOutput()) }()
+	abort := func() {
+		cancel()
+		cancelOutput()
+		if cancelOuterOutput != nil {
+			cancelOuterOutput()
+		}
+	}
 	pattern := regexp.MustCompile(regexp.QuoteMeta(exchange.promptToken))
 	if mode == SudoModeSu {
 		pattern = c.passwordPromptRegex()
@@ -338,12 +357,12 @@ func (c *Client) runPrivilegeAttempt(ctx context.Context, mode SudoMode, command
 	go func() { waitDone <- session.Wait() }()
 	inputDone := make(chan error, 1)
 	go func() { inputDone <- exchange.input(work, stdin, pipe) }()
-	waitErr, inputErr, closeErr := c.waitPrivilegeExchange(work, cancel, session, waitDone, inputDone, exchange.outputErrors)
+	waitErr, inputErr, closeErr := c.waitPrivilegeExchange(work, cancel, abort, session, waitDone, inputDone, exchange.outputErrors)
 	flushErr := errors.Join(out.flush(), diagnostic.flush(), out.writeErr, diagnostic.writeErr)
 	return exchange.finish(ctx, privilegeOutcome{waitErr: waitErr, inputErr: inputErr, closeErr: closeErr, flushErr: flushErr, outputFailed: out.failed || diagnostic.failed})
 }
 
-func (c *Client) waitPrivilegeExchange(ctx context.Context, cancel context.CancelFunc, session *cryptoSSH.Session, waitDone, inputDone, outputErrors <-chan error) (waitErr, inputErr, closeErr error) {
+func (c *Client) waitPrivilegeExchange(ctx context.Context, cancel, abort context.CancelFunc, session *cryptoSSH.Session, waitDone, inputDone, outputErrors <-chan error) (waitErr, inputErr, closeErr error) {
 	select {
 	case waitErr = <-waitDone:
 		cancel()
@@ -351,26 +370,38 @@ func (c *Client) waitPrivilegeExchange(ctx context.Context, cancel context.Cance
 		closeErr = closeResource(session, "completed privilege session")
 		inputErr = <-inputDone
 	case inputErr = <-inputDone:
-		cancel()
+		abort()
 		closeErr = c.closeCanceledSession(ctx, session, waitDone)
 	case inputErr = <-outputErrors:
-		cancel()
+		abort()
 		closeErr = c.closeCanceledSession(ctx, session, waitDone)
 		inputErr = errors.Join(inputErr, <-inputDone)
 	case <-ctx.Done():
-		cancel()
+		abort()
 		closeErr = c.closeCanceledSession(ctx, session, waitDone)
 		inputErr = <-inputDone
 	}
 	return
 }
 
-func (c *Client) runPrivilegeWithConfig(ctx context.Context, mode SudoMode, command string, stdin io.Reader, config *RunConfig) (string, error) {
+func (c *Client) runPrivilegeWithConfig(ctx context.Context, mode SudoMode, command string, stdin io.Reader, config *RunConfig) (result string, retErr error) {
+	if ctx == nil || c == nil {
+		return "", fmt.Errorf("privilege execution requires a client and context")
+	}
 	if config == nil {
 		config = c.defaultRunConfig()
 	}
-	output := newOutputWriter(config)
-	err := c.runPrivilegeOperation(ctx, mode, command, stdin, output, output, config)
+	// This operation owns bindings across pre-command authentication retries.
+	// Abort cancels them before joining SSH workers; normal completion flushes first.
+	work, cancelOutput := context.WithCancel(ctx)
+	defer cancelOutput()
+	bound, closeOutput, err := c.bindRunOutput(work, config)
+	if err != nil {
+		return "", err
+	}
+	defer func() { retErr = errors.Join(retErr, closeOutput()) }()
+	output := newOutputWriter(bound)
+	err = c.runPrivilegeOperation(ctx, mode, command, stdin, output, output, config, cancelOutput)
 	return output.String(), err
 }
 

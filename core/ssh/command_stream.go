@@ -86,7 +86,7 @@ func (c *Client) RunShellWithIO(ctx context.Context, stdin io.Reader, stdout, st
 	}
 	work, cancel := context.WithCancel(ctx)
 	defer cancel()
-	boundOut, boundErr, closeOutput, err := c.bindCommandOutputs(work, stdout, stderr)
+	boundOut, boundErr, closeOutput, err := c.bindCommandOutputs(work, stdout, stderr, false)
 	if err != nil {
 		return err
 	}

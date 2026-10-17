@@ -153,8 +153,9 @@ func (c *Client) runTerminalSession(ctx context.Context, payload string, streams
 	return errors.Join(waitErr, closeErr, inputErr, outputErr)
 }
 
-// Only cancellable output pumps use this join. Cancellation never abandons the
-// waiter or its stdout/stderr workers; legacy arbitrary writers migrate later.
+// Bound output pumps use this join. Cancellation never abandons the waiter or
+// its stdout/stderr workers. In-flight regular-file writes must finish first;
+// legacy arbitrary writers migrate later.
 func waitTerminalOutput(ctx context.Context, wait func() error, cancel context.CancelFunc) error {
 	return waitSessionOutput(ctx, wait, cancel)
 }
@@ -165,9 +166,11 @@ func (c *Client) RunInteractivePlan(ctx context.Context, plan CommandPlan) error
 	return c.RunInteractivePlanWithIO(ctx, plan, c.defaultInteractiveIO())
 }
 
-// RunInteractivePlanWithIO requires local terminal input and finite or
-// context-aware output. Native terminal/pipe support follows the platform
-// adapters; regular-file PTY redirection and macOS blocking pipes remain unsupported.
+// RunInteractivePlanWithIO requires local terminal input and finite,
+// context-aware, or regular-file output. Regular files are borrowed and check
+// cancellation between writes; a kernel write in progress must finish before
+// return, so file-output cleanup has no hard time bound. Native terminal/pipe
+// support follows the platform adapters; macOS blocking pipes remain unsupported.
 func (c *Client) RunInteractivePlanWithIO(ctx context.Context, plan CommandPlan, streams InteractiveIO) (retErr error) {
 	if err := validateCommandExecution(ctx, c, plan); err != nil {
 		return err

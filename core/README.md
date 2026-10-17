@@ -120,7 +120,11 @@ Cleanup failures retain sink identity through `OutputError`, and a closed scope 
 The Windows host dispatches its private entry point to `ServeConsoleOutputRelay`;
 core never dispatches environment variables or exits the host during package initialization.
 Without injection, consoles retain the unsupported-output fallback. Regular-file
-PTY redirection and other unsupported native sinks are rejected before execution.
+PTY redirection reuses the synchronous file adapter: cancellation is checked between
+writes, but an in-flight kernel write must finish before return. There is no hard
+cleanup deadline for a stalled filesystem, and no output worker is abandoned.
+Bindings never close, sync, or change the borrowed file's flags or offset except
+through the requested writes. Other unsupported native sinks are rejected before execution.
 The PTY input file must be a local terminal, and a PTY plan cannot also supply stdin.
 For non-PTY streaming, `RunCommandPlanWithIO` and `RunShellWithoutPTY` use `BindOutput`
 (supporting `ContextWriter`, finite memory sinks, `io.Discard`, `os.DevNull`, local regular files,
@@ -138,6 +142,11 @@ Legacy command/script/stream, PTY, shell, and escalation paths delegate to share
 `RunScriptWithSudoExecution` enforce configured adapter and login validation, while `ResolveScriptExecution`
 rejects scripts without a resolved non-server interpreter). Full login sessions retain their
 legacy process-exit policy while preserving separate cancellation/cleanup errors.
+`RunWithSudoExecution` also accepts output options, applying validated execution
+settings last. `RunInteractiveWithSudoExecution` carries per-operation interpreter,
+launch dialect and login settings through the existing authentication/terminal
+handoff without mutating shared client configuration. Explicit PTY escalation
+separates the POSIX control shell from the user interpreter and its login mode.
 `RunInteractiveWithOptions` supports the old Bash login default and explicit
 `WithLoginShell(false)`. `RunStream.Close` is idempotent and joins cancellation.
 Arbitrary non-`ContextWriter` callbacks passed to legacy output entry points still cannot be

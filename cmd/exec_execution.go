@@ -40,11 +40,38 @@ func (o *ExecOptions) prepareCommandPlan() error {
 	if !o.execution.enabled() {
 		return nil
 	}
-	if o.Sudo || o.ShellFile != "" || o.stdinScript || o.Stream || o.OutDir != "" {
-		return fmt.Errorf("explicit execution currently supports buffered or PTY commands only, without scripts, sudo, --stream or --out-dir")
+	o.commandPlan = nil
+	if o.ShellFile != "" || o.stdinScript || (o.Command == "" && !o.Interactive) {
+		execution, err := o.cliExecutionConfig()
+		if err != nil {
+			return err
+		}
+		if execution.Interpreter != "" && execution.Interpreter != ssh.InterpreterBash && execution.Interpreter != ssh.InterpreterSh && execution.Interpreter != ssh.InterpreterZsh && execution.Interpreter != ssh.InterpreterFish {
+			return fmt.Errorf("%w: scripts require bash, sh, zsh or fish", ssh.ErrExecutionValidation)
+		}
+		// Full resolution needs the actual script and the target node. Do not
+		// turn an absent interpreter/dialect into an explicit server/unknown.
+		return nil
 	}
 	options, err := o.execution.commandOptions(o.NoLoginShell)
 	if err != nil {
+		return err
+	}
+	command := o.Command
+	if command == "" {
+		command = ":" // Validate options before consuming a possible stdin script.
+	}
+	if o.Sudo {
+		execution, err := o.cliExecutionConfig()
+		if err != nil {
+			return err
+		}
+		if _, err := execution.SudoRunOptions(command); err != nil {
+			return err
+		}
+	}
+	if o.Command == "" {
+		_, err := ssh.PlanCommand(command, options)
 		return err
 	}
 	plan, err := ssh.PlanCommand(o.Command, options)

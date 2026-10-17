@@ -15,6 +15,8 @@ const terminalWriteTimeout = 10 * time.Second
 // ContextWriter is an explicit output capability. Implementations must return
 // when ctx is canceled, perform no writes after returning, and not retain data.
 // Ordinary io.Writer callbacks cannot provide that guarantee automatically.
+// The built-in regular-file adapter has a weaker contract: cancellation is
+// checked between writes, and an in-flight kernel write must finish before return.
 type ContextWriter interface {
 	WriteContext(context.Context, []byte) (int, error)
 }
@@ -53,8 +55,10 @@ func prepareContextOutput(ctx context.Context, target io.Writer) (io.Writer, fun
 	return prepareContextOutputWithLimit(ctx, target, terminalWriteTimeout)
 }
 
-// perWriteLimit bounds each native file write; zero leaves only ctx's own
-// deadline and cancellation, for consumers that may legitimately stall.
+// perWriteLimit bounds native terminal/pipe writes; zero leaves only ctx's own
+// deadline and cancellation, for consumers that may legitimately stall. Regular
+// files use the shared synchronous adapter instead: no deadline can interrupt an
+// in-flight kernel write, and the session must join it before returning.
 func prepareContextOutputWithLimit(ctx context.Context, target io.Writer, perWriteLimit time.Duration) (io.Writer, func() error, error) {
 	if nilCapability(target) {
 		return nil, nil, fmt.Errorf("terminal output is nil")
@@ -66,6 +70,15 @@ func prepareContextOutputWithLimit(ctx context.Context, target io.Writer, perWri
 	case *bytes.Buffer, *strings.Builder:
 		return contextOutput{ctx, memoryContextOutput{target}, target}, func() error { return nil }, nil
 	case *os.File:
+		info, err := value.Stat()
+		if err != nil {
+			return nil, nil, fmt.Errorf("inspect output file: %w", err)
+		}
+		if info.Mode().IsRegular() {
+			// Borrow the caller's file, offset and flags. No background write is
+			// started, and cleanup never closes or syncs the borrowed file.
+			return contextOutput{ctx, regularFileOutput{value}, value}, func() error { return nil }, nil
+		}
 		return prepareFileOutput(ctx, value, perWriteLimit)
 	}
 	if target == io.Discard {

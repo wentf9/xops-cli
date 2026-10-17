@@ -17,13 +17,15 @@ type privilegeTerminal struct {
 	width, height int
 	activate      func(context.Context, *cryptoSSH.Session) (func() error, error)
 	ignoreExit    bool
+	// Explicit execution keeps the control shell separate from user login mode.
+	portableControl bool
 }
 
 func (c *Client) runInteractivePrivilege(ctx context.Context, mode SudoMode, command string, streams InteractiveIO) error {
-	return c.runInteractivePrivilegeSession(ctx, mode, command, streams, false)
+	return c.runInteractivePrivilegeSession(ctx, mode, command, streams, false, nil)
 }
 
-func (c *Client) runInteractivePrivilegeSession(ctx context.Context, mode SudoMode, command string, streams InteractiveIO, ignoreExit bool) error {
+func (c *Client) runInteractivePrivilegeSession(ctx context.Context, mode SudoMode, command string, streams InteractiveIO, ignoreExit bool, config *RunConfig, cancelOutput ...context.CancelFunc) error {
 	fdIn, fdOut, err := validateInteractiveIO(streams)
 	if err != nil {
 		return err
@@ -32,7 +34,7 @@ func (c *Client) runInteractivePrivilegeSession(ctx context.Context, mode SudoMo
 	if err != nil || width <= 0 || height <= 0 {
 		width, height = 80, 40
 	}
-	terminal := &privilegeTerminal{width: width, height: height, ignoreExit: ignoreExit}
+	terminal := &privilegeTerminal{width: width, height: height, ignoreExit: ignoreExit, portableControl: config != nil}
 	terminal.activate = func(work context.Context, session *cryptoSSH.Session) (func() error, error) {
 		if err := work.Err(); err != nil {
 			return nil, err
@@ -50,7 +52,14 @@ func (c *Client) runInteractivePrivilegeSession(ctx context.Context, mode SudoMo
 			return resizeErr
 		}, nil
 	}
-	return c.runPrivilegeOperation(ctx, mode, command, streams.Stdin, streams.Stdout, streams.Stderr, terminal)
+	if config == nil {
+		config = c.defaultRunConfig()
+	}
+	var abortOutput context.CancelFunc
+	if len(cancelOutput) > 0 {
+		abortOutput = cancelOutput[0]
+	}
+	return c.runPrivilegeOperation(ctx, mode, command, streams.Stdin, streams.Stdout, streams.Stderr, terminal, config, abortOutput)
 }
 
 func (e *privilegeExchange) forwardInput(ctx context.Context, stdin io.Reader, pipe io.WriteCloser) (retErr error) {

@@ -467,6 +467,9 @@ func (c *Client) RunScriptWithExecution(ctx context.Context, content string, exe
 	if execution.Interpreter != "" {
 		opts = append(opts, WithInterpreter(execution.Interpreter))
 	}
+	if execution.LaunchDialect != "" {
+		opts = append(opts, WithLaunchDialect(execution.LaunchDialect))
+	}
 	if execution.Login != nil {
 		opts = append(opts, WithLoginShell(*execution.Login))
 	}

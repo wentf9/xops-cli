@@ -81,8 +81,7 @@ func (e *privilegeExchange) portableCommand(command string) string {
 	return prefix + quote(e.promptToken) + " -- /bin/sh -c " + quote(body)
 }
 
-func (c *Client) runInteractivePortableWithSudo(ctx context.Context, mode SudoMode, command string, streams InteractiveIO, shell bool) error {
-	config := c.defaultRunConfig()
+func (c *Client) runInteractivePortableWithSudo(ctx context.Context, mode SudoMode, command string, streams InteractiveIO, shell bool, config *RunConfig, cancelOutput ...context.CancelFunc) error {
 	if config.Interpreter == "" || config.Interpreter == InterpreterServer {
 		config.Interpreter = InterpreterFish
 	}
@@ -99,10 +98,10 @@ func (c *Client) runInteractivePortableWithSudo(ctx context.Context, mode SudoMo
 	}
 	if mode == SudoModeRoot {
 		payload := portableUserCommand(command, config, config.LaunchDialect)
-		return c.runTerminalSession(ctx, payload, streams, false, shell)
+		return c.runTerminalSession(ctx, payload, streams, false, shell, cancelOutput...)
 	}
 	inner := portableUserCommand(command, config, LaunchPOSIX)
-	return c.runInteractivePrivilegeSession(ctx, mode, inner, streams, shell)
+	return c.runInteractivePrivilegeSession(ctx, mode, inner, streams, shell, config, cancelOutput...)
 }
 
 func validatePortableShellConfig(config *RunConfig) error {
