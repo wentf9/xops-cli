@@ -33,6 +33,8 @@ func (c *Client) confirmPrivilege(ctx context.Context, material *PrivilegeMateri
 // envelope and password feedback. Other output and partial matches are kept.
 // The session joins its stderr copier before callers inspect or flush it.
 type privilegePromptWriter struct {
+	client          *Client // Borrowed immutable diagnostic capability; no credential access.
+	mode            SudoMode
 	marker, pending []byte
 	target          io.Writer
 	observed        bool
@@ -58,6 +60,7 @@ func (w *privilegePromptWriter) Write(data []byte) (int, error) {
 		if err := w.writeOutput(w.pending[:match[0]]); err != nil {
 			return 0, err
 		}
+		w.client.observePrivilegePrompt(w.mode, string(w.pending[match[0]:match[1]]), string(w.marker))
 		w.feedback = sudoPromptFeedback(bytes.HasPrefix(w.pending[match[0]:match[1]], []byte(sudoRSPromptPrefix)))
 		w.pending = w.pending[match[1]:]
 		w.observed = true

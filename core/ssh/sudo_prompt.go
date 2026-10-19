@@ -25,6 +25,19 @@ func expandSudoPrompt(data []byte, match []int) []int {
 	return match
 }
 
+// Do not let a generic fallback (e.g. (?i)password) consume part of our
+// fragmented marker or sudo-rs envelope and produce duplicate responses.
+func incompleteSudoPrompt(data []byte, marker string) bool {
+	for _, prefix := range []string{marker, sudoRSPromptPrefix} {
+		for size := 1; size <= len(prefix) && size <= len(data); size++ {
+			if bytes.HasSuffix(data, []byte(prefix[:size])) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // sudo-rs may render password feedback even with PTY echo disabled. Suppress
 // only feedback immediately following our recognized prompt, ending at the
 // newline or the first non-feedback byte. Diagnostics remain visible.

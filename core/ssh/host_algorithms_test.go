@@ -132,7 +132,7 @@ func TestHostAlgorithmFailureClosesPrivateKeyLease(t *testing.T) {
 			})
 			connector := NewConnector(nil, WithKeySource(&fixtureKeySource{lease: lease}), WithHostKeyVerifier(source), WithHandshakeTimeout(20*time.Millisecond))
 			defer closePlanConnector(t, connector)
-			config, release, err := connector.buildSSHConfig(t.Context(), &ClientConfig{AuthType: "key", KeyRef: "fixture"}, nil, nil)
+			config, release, err := connector.buildSSHConfig(t.Context(), &ClientConfig{AuthType: "key", KeyRef: "fixture"}, nil, nil, nil)
 			if err == nil || config != nil || release != nil || lease.closed.Load() != 1 {
 				t.Fatalf("algorithm failure leaked key or fell back: config=%v err=%v closed=%d", config, err, lease.closed.Load())
 			}

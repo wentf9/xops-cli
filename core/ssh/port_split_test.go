@@ -730,7 +730,7 @@ func TestPortSplit_SecretResolver_InFlight_CloseAllCancellation(t *testing.T) {
 	}
 }
 
-func startTestMultiAuthSSHServer(t *testing.T, expectedPub ssh.PublicKey, expectedPassword string) (string, func()) {
+func startTestMultiAuthSSHServer(t *testing.T, expectedPub ssh.PublicKey, expectedPassword string, configure ...func(*ssh.ServerConfig)) (string, func()) {
 	t.Helper()
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -756,6 +756,9 @@ func startTestMultiAuthSSHServer(t *testing.T, expectedPub ssh.PublicKey, expect
 		},
 	}
 	serverConfig.AddHostKey(signer)
+	for _, option := range configure {
+		option(serverConfig)
+	}
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

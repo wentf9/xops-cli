@@ -32,6 +32,7 @@ type Client struct {
 	recorder           CredentialRecorder
 	connectorPattern   string         // Connector 全局级密码提示正则，当节点级为空时回落到此字段
 	promptRegex        *regexp.Regexp // 缓存预编译好的正则
+	sudoPromptFallback *regexp.Regexp // Immutable, valid explicit node/global pattern only; never the implicit default.
 	logger             logger.DebugLogger
 	diagnostics        logger.DiagnosticObserver // Immutable; connector owns its lifetime.
 	handshakeTimeout   time.Duration
@@ -144,10 +145,14 @@ func newClientWithComponents(
 	if pattern == "" {
 		pattern = connectorPattern
 	}
+	explicitPattern := pattern != ""
 	if pattern == "" {
 		pattern = DefaultPasswordPromptPattern
 	}
 	re, err := regexp.Compile(pattern)
+	if err == nil && explicitPattern && !re.MatchString("") {
+		c.sudoPromptFallback = re
+	}
 	if err != nil {
 		c.getLogger().Debugf("ssh client: failed to compile password prompt regex %q: %v, falling back to default", pattern, err)
 		re = regexp.MustCompile(DefaultPasswordPromptPattern)
@@ -621,9 +626,17 @@ func (c *Client) resolvePrivilegeMaterial(ctx context.Context, kind SecretKind, 
 	resolveCtx, cancelResolve := withTimeoutOrDefault(ctx, c.handshakeTimeout, defaultSSHHandshakeTimeout)
 	defer cancelResolve()
 
+	var privilegeMode SudoMode
+	switch kind {
+	case SecretKindSudoPassword:
+		privilegeMode = SudoModeSudo
+	case SecretKindSuPassword:
+		privilegeMode = SudoModeSu
+	}
 	// 1. 优先尝试 SecretResolver 解析
 	promptOnly := len(forcePrompt) > 0 && forcePrompt[0]
 	if c.resolver != nil && !promptOnly {
+		c.observePrivilege(privilegeMode, "credential_lookup", 2, 0)
 		secretBytes, err := c.resolvePrivilegeCandidate(resolveCtx, req, connCfg.AuthUpdateToken)
 		if len(secretBytes) > 0 {
 			// [P2] 立即安排原始切片在函数退出时清零，覆盖成功、错误与交互回退等所有路径
@@ -632,10 +645,12 @@ func (c *Client) resolvePrivilegeMaterial(ctx context.Context, kind SecretKind, 
 		if err == nil && len(secretBytes) > 0 {
 			matBytes := make([]byte, len(secretBytes))
 			copy(matBytes, secretBytes)
+			c.observePrivilege(privilegeMode, "credential_available", 2, 0)
 			return &PrivilegeMaterial{Password: matBytes}, nil
 		}
 		if err != nil && !errors.Is(err, ErrInteractionRequired) && !reportCredentialFailure(ctx, c.prompter, "read", err) {
 			// [P1] 后端故障直接终止并保留错误链
+			c.observePrivilege(privilegeMode, "credential_lookup_failed", 2, 0)
 			return nil, fmt.Errorf("resolve privilege secret failed: %w", err)
 		}
 	}
@@ -649,10 +664,13 @@ func (c *Client) resolvePrivilegeMaterial(ctx context.Context, kind SecretKind, 
 	promptCtx, cancelPrompt := withTimeoutOrDefault(ctx, c.interactionTimeout, DefaultInteractionTimeout)
 	defer cancelPrompt()
 
+	c.observePrivilege(privilegeMode, "interactive_prompt", 2, 0)
 	pwd, err := c.prompter.PromptSecret(promptCtx, req)
 	if err != nil {
+		c.observePrivilege(privilegeMode, "interactive_prompt_failed", 2, 0)
 		return nil, fmt.Errorf("prompt privilege secret failed: %w", err)
 	}
+	c.observePrivilege(privilegeMode, "interactive_prompt_completed", 2, 0)
 
 	if kind == SecretKindSudoPassword {
 		connCfg.SudoMode = SudoModeSudo
@@ -678,32 +696,39 @@ func (c *Client) isNonPOSIXExecution() bool {
 func (c *Client) detectRootOrSudoer(ctx context.Context) (bool, error) {
 	// 1. 探测是否已经是 root
 	// 使用 RunWithoutLogin 避免 MOTD 干扰输出
+	c.observePrivilege(SudoModeAuto, "root_probe", 2, 0)
 	if out, err := c.RunWithoutLogin(ctx, "id -u"); err == nil {
 		// 稳健检查：只要最后一行输出是 0，即认为是 root
 		lines := strings.Split(strings.TrimSpace(out), "\n")
 		if len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "0" {
+			c.observePrivilege(SudoModeRoot, "root_confirmed", 1, 0)
 			return true, c.updateSudoMode(ctx, SudoModeRoot)
 		}
 	} else if err := ctx.Err(); err != nil {
 		return false, err
 	}
 
+	c.observePrivilege(SudoModeAuto, "root_probe_unconfirmed", 2, 0)
 	// 2. 探测是否有免密 sudo 权限
+	c.observePrivilege(SudoModeAuto, "passwordless_probe", 2, 0)
 	if _, err := c.RunWithoutLogin(ctx, "sudo -n true"); err == nil {
+		c.observePrivilege(SudoModeSudoer, "passwordless_available", 1, 0)
 		return true, c.updateSudoMode(ctx, SudoModeSudoer)
 	} else if err := ctx.Err(); err != nil {
 		return false, err
 	}
+	c.observePrivilege(SudoModeAuto, "passwordless_unconfirmed", 2, 0)
 	return false, nil
 }
 
-func (c *Client) maybeDetectSudoMode(ctx context.Context) error {
+func (c *Client) maybeDetectSudoMode(ctx context.Context) (retErr error) {
 	if ctx == nil {
 		return fmt.Errorf("sudo detection context is nil")
 	}
 	if c == nil {
 		return fmt.Errorf("ssh client or config is nil")
 	}
+	defer func() { c.observePrivilegeSelection(ctx, retErr) }()
 	c.sudoMu.Lock()
 	defer c.sudoMu.Unlock()
 	connCfg := c.ConnectionConfig()
@@ -713,6 +738,7 @@ func (c *Client) maybeDetectSudoMode(ctx context.Context) error {
 	}
 	// 非 POSIX 平台（如 cmd、PowerShell）跳过 Unix sudo/su 探测
 	if c.isNonPOSIXExecution() {
+		c.observePrivilege(SudoModeAuto, "detection_unsupported", 1, 0)
 		return nil
 	}
 	if c.sshClient == nil {
@@ -723,12 +749,14 @@ func (c *Client) maybeDetectSudoMode(ctx context.Context) error {
 		return err
 	}
 
+	c.observePrivilege(SudoModeAuto, "detection_started", 1, 0)
 	detected, err := c.detectRootOrSudoer(ctx)
 	if err != nil || detected {
 		return err
 	}
 
 	// 3. 测试密码 sudo 是否真正可用（按命令解析登录密码，使用完毕立即清零）
+	c.observePrivilege(SudoModeSudo, "password_probe", 2, 0)
 	priv, err := c.resolvePrivilegeMaterial(ctx, SecretKindSudoPassword)
 	if err == nil {
 		defer priv.Zero()

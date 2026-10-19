@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 	corelog "github.com/wentf9/xops-cli/core/log"
 	"github.com/wentf9/xops-cli/pkg/i18n"
+	cryptoSSH "golang.org/x/crypto/ssh"
 )
 
 // SSH has one log level, unlike scp's independent SSH and SFTP verbosity.
@@ -122,17 +123,50 @@ func formatSSHDiagnostic(e corelog.Diagnostic) string {
 	case corelog.AuthenticationAttempt:
 		return "Next authentication method for " + peer + ": " + q(e.Method)
 	case corelog.Authenticated:
-		return fmt.Sprintf("Authenticated to %s. Local version %s; remote version %s.\ndebug1: kex: algorithm: %s; host key algorithm: %s\ndebug1: cipher server->client: %s MAC: %s; client->server: %s MAC: %s",
-			peer, q(e.ClientVersion), q(e.ServerVersion), q(e.KeyExchange), q(e.HostKey), q(e.ReadCipher), q(e.ReadMAC), q(e.WriteCipher), q(e.WriteMAC))
+		return fmt.Sprintf("Authenticated to %s using %s. Local version %s; remote version %s.\ndebug1: kex: algorithm: %s; host key algorithm: %s\ndebug1: cipher server->client: %s MAC: %s; client->server: %s MAC: %s",
+			peer, authenticatedMethod(e), q(e.ClientVersion), q(e.ServerVersion), q(e.KeyExchange), q(e.HostKey), q(e.ReadCipher), diagnosticMAC(e.ReadCipher, e.ReadMAC), q(e.WriteCipher), diagnosticMAC(e.WriteCipher, e.WriteMAC))
 	case corelog.Negotiated:
 		return fmt.Sprintf("Connection %s: local version %s; remote version %s; kex: %s; host key algorithm: %s; cipher server->client: %s MAC: %s; client->server: %s MAC: %s.",
-			peer, q(e.ClientVersion), q(e.ServerVersion), q(e.KeyExchange), q(e.HostKey), q(e.ReadCipher), q(e.ReadMAC), q(e.WriteCipher), q(e.WriteMAC))
+			peer, q(e.ClientVersion), q(e.ServerVersion), q(e.KeyExchange), q(e.HostKey), q(e.ReadCipher), diagnosticMAC(e.ReadCipher, e.ReadMAC), q(e.WriteCipher), diagnosticMAC(e.WriteCipher, e.WriteMAC))
 	case corelog.SubsystemStarting:
 		return "Sending subsystem: sftp to " + peer
 	case corelog.SubsystemReady:
 		return "SFTP subsystem ready for " + peer + " (protocol version 3)."
 	case corelog.SubsystemFailed:
 		return "SFTP subsystem setup failed for " + peer + "."
+	case corelog.SessionRequest, corelog.SessionStarted, corelog.SessionFinished, corelog.SessionCleanup:
+		return formatSessionDiagnostic(e, peer)
+	case corelog.PrivilegeLifecycle:
+		return formatPrivilegeDiagnostic(e, peer)
+	case corelog.ForwardLifecycle:
+		return fmt.Sprintf("%s forwarding %s for %s: %s -> %s.", q(e.Operation), q(e.Outcome), peer, q(e.Source), q(e.Destination))
+	default:
+		return ""
+	}
+}
+
+func formatPrivilegeDiagnostic(e corelog.Diagnostic, peer string) string {
+	q := quotedDiagnostic
+	switch e.Outcome {
+	case "command_prepared":
+		return fmt.Sprintf("Sending privilege command via %s for %s: %s.", q(e.Operation), peer, q(e.PrivilegeCommand))
+	case "password_prompt_pattern", "password_prompt_fallback_pattern":
+		label := strings.ReplaceAll(strings.TrimPrefix(e.Outcome, "password_prompt_"), "_", " ")
+		return fmt.Sprintf("Privilege password prompt %s via %s for %s: %s.", label, q(e.Operation), peer, q(e.PrivilegePromptPattern))
+	case "password_prompt_matched":
+		return fmt.Sprintf("Matched privilege password prompt via %s for %s: %s.", q(e.Operation), peer, q(e.PrivilegePrompt))
+	default:
+		attempt := ""
+		if e.Attempt > 0 {
+			attempt = fmt.Sprintf(" (attempt %d)", e.Attempt)
+		}
+		return fmt.Sprintf("Privilege escalation via %s for %s: %s%s.", q(e.Operation), peer, q(strings.ReplaceAll(e.Outcome, "_", " ")), attempt)
+	}
+}
+
+func formatSessionDiagnostic(e corelog.Diagnostic, peer string) string {
+	q := quotedDiagnostic
+	switch e.Kind {
 	case corelog.SessionRequest:
 		return fmt.Sprintf("Session request %s %s for %s.", q(e.Operation), q(e.Outcome), peer)
 	case corelog.SessionStarted:
@@ -144,11 +178,33 @@ func formatSSHDiagnostic(e corelog.Diagnostic) string {
 		return fmt.Sprintf("Session ended for %s: %s (no confirmed exit status).", peer, q(e.Outcome))
 	case corelog.SessionCleanup:
 		return fmt.Sprintf("Session channel cleanup %s for %s.", q(e.Outcome), peer)
-	case corelog.ForwardLifecycle:
-		return fmt.Sprintf("%s forwarding %s for %s: %s -> %s.", q(e.Operation), q(e.Outcome), peer, q(e.Source), q(e.Destination))
 	default:
 		return ""
 	}
+}
+
+// Match OpenSSH's AEAD marker without treating missing metadata as AEAD.
+func diagnosticMAC(cipher, mac string) string {
+	if mac != "" {
+		return quotedDiagnostic(mac)
+	}
+	switch cipher {
+	case cryptoSSH.CipherAES128GCM, cryptoSSH.CipherAES256GCM, cryptoSSH.CipherChaCha20Poly1305:
+		return "<implicit>"
+	default:
+		return "<unknown>"
+	}
+}
+
+func authenticatedMethod(event corelog.Diagnostic) string {
+	method := "<unknown>"
+	if event.Method != "" {
+		method = quotedDiagnostic(event.Method)
+	}
+	if len(event.Methods) > 1 {
+		method += " (authentication chain: " + quotedDiagnostic(strings.Join(event.Methods, ",")) + ")"
+	}
+	return method
 }
 
 var _ corelog.DiagnosticObserver = (*sshDiagnostics)(nil)

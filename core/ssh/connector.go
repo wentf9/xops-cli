@@ -46,7 +46,7 @@ type Connector struct {
 	AcceptNewHostKey atomic.Bool
 	// PasswordPromptPattern 全局级自定义密码提示正则（可选）。
 	// 当节点的 ClientConfig.PasswordPromptPattern 为空时，使用此值；
-	// 两者均为空则使用内置的 DefaultPasswordPromptPattern。
+	// su 在两者均为空时使用 DefaultPasswordPromptPattern；sudo 回退仅接受有效显式配置。
 	PasswordPromptPattern string
 	// lifecycleMu 与 connectWG 共同保证 CloseAll 和共享建连任务的生命周期有序：
 	// closed 置位后不再允许新任务登记或连接发布，CloseAll 等待所有已登记任务返回。
@@ -524,9 +524,10 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 	defer coordinator.Close()
 
 	var discoveredAuth bool
+	authentication := newAuthenticationTrace(c.diagnostics, nodeName)
 	sshConfig, cleanup, err := c.buildSSHConfig(ctx, cfg, coordinator, func() {
 		discoveredAuth = true
-	})
+	}, authentication)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build ssh config for '%s': %w", nodeName, err)
 	}
@@ -537,7 +538,7 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 
 	// 共享任务不继承任一调用者的 deadline，由 coordinator 统一施加有界超时并在交互时暂停；
 	// 这同时约束直连和 ProxyJump 的通道建立，避免共享任务无限占用 singleflight。
-	rawClient, rootConn, err := c.dialAndHandshake(coordinator.Context(), nodeName, cfg, dialer, sshConfig, coordinator)
+	rawClient, rootConn, err := c.dialAndHandshake(coordinator.Context(), nodeName, cfg, dialer, sshConfig, coordinator, authentication)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial and handshake: %w", err)
 	}
@@ -867,7 +868,7 @@ func (c *Connector) handleHandshakeFailure(ctx context.Context, coordinator *han
 	return &HandshakeError{NodeID: nodeName, Err: handshakeErr}
 }
 
-func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, cfg *ClientConfig, dialer Dialer, sshConfig *ssh.ClientConfig, coordinator *handshakeCoordinator) (*ssh.Client, net.Conn, error) {
+func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, cfg *ClientConfig, dialer Dialer, sshConfig *ssh.ClientConfig, coordinator *handshakeCoordinator, authentication *authenticationTrace) (*ssh.Client, net.Conn, error) {
 	if dialer == nil {
 		dialer = c.baseDialer
 	}
@@ -949,15 +950,19 @@ func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, cfg *
 		}
 	}
 
-	c.observeAuthenticated(ncc, event)
+	c.observeAuthenticated(ncc, event, authentication)
 	return ssh.NewClient(&activitySSHConn{Conn: ncc, activity: activity}, chans, reqs), conn, nil
 }
 
-func (c *Connector) observeAuthenticated(ncc ssh.Conn, event logger.Diagnostic) {
+func (c *Connector) observeAuthenticated(ncc ssh.Conn, event logger.Diagnostic, authentication *authenticationTrace) {
 	if c.diagnostics == nil {
 		return
 	}
 	event.Kind = logger.Authenticated
+	event.Methods = authentication.successfulMethods()
+	if len(event.Methods) > 0 {
+		event.Method = event.Methods[len(event.Methods)-1]
+	}
 	event.ClientVersion, event.ServerVersion = string(ncc.ClientVersion()), string(ncc.ServerVersion())
 	if metadata, ok := ncc.(ssh.AlgorithmsConnMetadata); ok {
 		algorithms := metadata.Algorithms()
@@ -1131,7 +1136,11 @@ func (c *Connector) resolveAgentAuth(ctx context.Context) (ssh.AuthMethod, func(
 }
 
 // buildSSHConfig 根据 Identity 模型构建 ssh.ClientConfig
-func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coordinator *handshakeCoordinator, onAuthDiscovered func()) (*ssh.ClientConfig, func() error, error) {
+func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coordinator *handshakeCoordinator, onAuthDiscovered func(), authentication *authenticationTrace) (*ssh.ClientConfig, func() error, error) {
+	observer := c.diagnostics
+	if authentication != nil {
+		observer = authentication
+	}
 	var cleanup func() error
 	var authCallback ssh.ClientAuthCallback
 	authMethods := []ssh.AuthMethod{}
@@ -1198,7 +1207,7 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 				}
 			},
 			Logger:      c.getLogger(),
-			Diagnostics: c.diagnostics,
+			Diagnostics: observer,
 		})
 		if err != nil {
 			return nil, nil, err
@@ -1258,13 +1267,14 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 		HostKeyAlgorithms: hostKeyAlgorithms,
 		Timeout:           clientTimeout,
 	}
-	c.observeSSHConfig(cfg, clientConfig)
+	c.observeSSHConfig(cfg, clientConfig, observer)
+	clientConfig.AuthCallback = authentication.wrap(clientConfig.AuthCallback)
 	return clientConfig, cleanup, nil
 }
 
 // observeSSHConfig adds diagnostics without changing fallback selection or trust results.
-func (c *Connector) observeSSHConfig(cfg *ClientConfig, clientConfig *ssh.ClientConfig) {
-	if c.diagnostics == nil {
+func (c *Connector) observeSSHConfig(cfg *ClientConfig, clientConfig *ssh.ClientConfig, observer logger.DiagnosticObserver) {
+	if observer == nil {
 		return
 	}
 	if clientConfig.AuthCallback == nil && len(clientConfig.Auth) == 1 {
@@ -1274,14 +1284,14 @@ func (c *Connector) observeSSHConfig(cfg *ClientConfig, clientConfig *ssh.Client
 		}
 		negotiated := false
 		clientConfig.AuthCallback = func(ctx *ssh.ClientAuthContext) (ssh.AuthMethod, error) {
-			observeAuthNegotiation(c.diagnostics, ctx, &negotiated)
+			observeAuthNegotiation(observer, ctx, &negotiated)
 			event := authenticationDiagnostic(ctx)
-			logger.EmitDiagnostic(c.diagnostics, event)
+			logger.EmitDiagnostic(observer, event)
 			// Match x/crypto's fallback selection without replacing it.
 			// A successful initial "none" does not invoke this callback.
 			if slices.Contains(ctx.AllowedMethods, protocol) && !slices.Contains(ctx.TriedMethods, protocol) {
 				event.Kind, event.Method, event.Methods = logger.AuthenticationAttempt, protocol, nil
-				logger.EmitDiagnostic(c.diagnostics, event)
+				logger.EmitDiagnostic(observer, event)
 			}
 			return nil, nil
 		}
@@ -1289,7 +1299,7 @@ func (c *Connector) observeSSHConfig(cfg *ClientConfig, clientConfig *ssh.Client
 	verify := clientConfig.HostKeyCallback
 	clientConfig.HostKeyCallback = func(hostname string, remote net.Addr, key ssh.PublicKey) error {
 		err := verify(hostname, remote, key)
-		logger.EmitDiagnostic(c.diagnostics, logger.Diagnostic{Kind: logger.HostKeyChecked, NodeID: cfg.NodeID, HostKey: key.Type(), Fingerprint: ssh.FingerprintSHA256(key), Accepted: err == nil})
+		logger.EmitDiagnostic(observer, logger.Diagnostic{Kind: logger.HostKeyChecked, NodeID: cfg.NodeID, HostKey: key.Type(), Fingerprint: ssh.FingerprintSHA256(key), Accepted: err == nil})
 		return err
 	}
 }

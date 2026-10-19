@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -188,7 +189,7 @@ func (c *Client) RunInteractiveWithSudoExecution(ctx context.Context, command st
 
 // RunInteractiveWithSudoIO uses an authenticated terminal handoff before
 // consuming caller input. The injected streams avoid process-global I/O changes.
-func (c *Client) RunInteractiveWithSudoIO(ctx context.Context, command string, streams InteractiveIO) error {
+func (c *Client) RunInteractiveWithSudoIO(ctx context.Context, command string, streams InteractiveIO) (retErr error) {
 	if err := c.maybeDetectSudoMode(ctx); err != nil {
 		return err
 	}
@@ -200,10 +201,14 @@ func (c *Client) RunInteractiveWithSudoIO(ctx context.Context, command string, s
 	case SudoModeRoot:
 		return c.RunInteractiveCmdWithIO(ctx, bashCommandPayload(command, true), streams)
 	case SudoModeSudoer:
+		c.observePrivilege(mode, "attempt_started", 1, 1)
+		defer func() { c.observePrivilegeResult(ctx, mode, retErr) }()
 		wrapped, err := interactivePrivilegeCommand(mode, command)
 		if err != nil {
 			return err
 		}
+		preview, _ := interactivePrivilegeCommand(mode, "<privileged payload>") // Same supported mode as wrapped.
+		c.observePrivilegeCommand(mode, preview)
 		return c.RunInteractiveCmdWithIO(ctx, wrapped, streams)
 	case SudoModeSudo, SudoModeSu:
 		return c.runInteractivePrivilege(ctx, mode, "exec "+bashCommandPayload(command, false), streams)
@@ -227,6 +232,12 @@ func interactivePrivilegeCommand(mode SudoMode, command string) (string, error) 
 
 func (c *Client) runWithSudo(ctx context.Context, command string, password []byte, extraStdin io.Reader, config *RunConfig, material ...*PrivilegeMaterial) (output string, retErr error) {
 	connCfg := c.ConnectionConfig()
+	mode := SudoModeSudoer
+	if len(password) > 0 || connCfg.SudoMode == SudoModeSudo {
+		mode = SudoModeSudo
+	}
+	c.observePrivilege(mode, "attempt_started", 1, 1)
+	defer func() { c.observePrivilegeResult(ctx, mode, retErr) }()
 	if len(password) == 0 && connCfg.SudoMode == SudoModeSudo {
 		return "", fmt.Errorf("sudo password is required but not provided")
 	}
@@ -250,11 +261,14 @@ func (c *Client) runWithSudo(ctx context.Context, command string, password []byt
 
 	fullCmd := fmt.Sprintf("sudo -S -p '' %s", command)
 	if len(material) == 0 || material[0] == nil || material[0].confirmedSave == nil {
+		c.observePrivilegeCommand(mode, "sudo -S -p '' <privileged payload>")
 		return c.startWithTimeout(ctx, session, fullCmd, config)
 	}
 	prompt := "[xops-password-" + rand.Text() + "]"
-	observer := &privilegePromptWriter{marker: []byte(prompt)}
+	observer := &privilegePromptWriter{marker: []byte(prompt), client: c, mode: mode}
 	fullCmd = fmt.Sprintf("sudo -S -p '%s' %s", prompt, command)
+	c.observePrivilegeCommand(mode, "sudo -S -p '<password-prompt>' <privileged payload>")
+	c.observePrivilegePromptPattern(mode, regexp.QuoteMeta(prompt), prompt, false)
 	output, err = c.startWithTimeout(ctx, session, fullCmd, config, func(target io.Writer) io.Writer { observer.target = target; return observer })
 	if err == nil && observer.observed {
 		material[0].verified = true
@@ -271,7 +285,7 @@ func (c *Client) ShellWithSudo(ctx context.Context) error {
 }
 
 // ShellWithSudoIO authenticates before switching the local terminal to raw mode.
-func (c *Client) ShellWithSudoIO(ctx context.Context, streams InteractiveIO) error {
+func (c *Client) ShellWithSudoIO(ctx context.Context, streams InteractiveIO) (retErr error) {
 	if err := c.maybeDetectSudoMode(ctx); err != nil {
 		return err
 	}
@@ -283,6 +297,9 @@ func (c *Client) ShellWithSudoIO(ctx context.Context, streams InteractiveIO) err
 	case SudoModeRoot:
 		return c.ShellWithIO(ctx, streams)
 	case SudoModeSudoer:
+		c.observePrivilege(mode, "attempt_started", 1, 1)
+		defer func() { c.observePrivilegeResult(ctx, mode, retErr) }()
+		c.observePrivilegeCommand(mode, "sudo -i")
 		return c.runTerminalSession(ctx, "sudo -i", streams, false, true)
 	case SudoModeSudo, SudoModeSu:
 		return c.runInteractivePrivilegeSession(ctx, mode, `exec "${SHELL:-/bin/bash}"`, streams, true, nil)
@@ -464,7 +481,7 @@ func (c *Client) RunCommandWithIO(ctx context.Context, command string, sudo bool
 	return c.dispatchSudoCommand(work, clientConfig, command, payload, interp, stdin, stdout, stderr, cancel)
 }
 
-func (c *Client) dispatchSudoCommand(ctx context.Context, clientConfig ClientConfig, command, payload string, interp Interpreter, stdin io.Reader, stdout, stderr io.Writer, cancel context.CancelFunc) error {
+func (c *Client) dispatchSudoCommand(ctx context.Context, clientConfig ClientConfig, command, payload string, interp Interpreter, stdin io.Reader, stdout, stderr io.Writer, cancel context.CancelFunc) (retErr error) {
 	config := c.defaultRunConfig()
 	config.Interpreter, config.LoginShell = interp, c.resolveExecutionLogin(interp)
 	if usesPortableShellAdapter(config) && clientConfig.SudoMode != SudoModeRoot {
@@ -475,6 +492,9 @@ func (c *Client) dispatchSudoCommand(ctx context.Context, clientConfig ClientCon
 	case SudoModeRoot:
 		return c.runRawCommandWithPayload(ctx, payload, "", stdin, stdout, stderr, cancel)
 	case SudoModeSudoer:
+		c.observePrivilege(clientConfig.SudoMode, "attempt_started", 1, 1)
+		defer func() { c.observePrivilegeResult(ctx, clientConfig.SudoMode, retErr) }()
+		c.observePrivilegeCommand(clientConfig.SudoMode, "sudo -S -p '' <privileged payload>")
 		return c.runRawCommandWithPayload(ctx, "sudo -S -p '' "+payload, "", stdin, stdout, stderr, cancel)
 	case SudoModeSudo, SudoModeSu:
 		login := c.resolveExecutionLogin(interp)

@@ -1147,7 +1147,7 @@ scp_err_empty_selector:
 scp_err_port_zero:
   other: "SSH 端口须在 1 到 65535 之间"
 flag_ssh_verbose:
-  other: "输出 SSH 诊断信息（-vv 含请求，-vvv 含清理；独立于 --debug）"
+  other: "输出 SSH 诊断信息（-vv 含请求与提权交互，-vvv 含终端交接与清理；独立于 --debug）"
 flag_ssh_quiet:
   other: "隐藏 SSH 诊断及隧道就绪提示（保留失败报错和安全确认）"
 flag_scp_quiet:

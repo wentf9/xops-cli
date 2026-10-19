@@ -38,7 +38,7 @@ not claim to reproduce OpenSSH's output line for line with the Go SSH backend.
   callback selects a candidate. The observer callback for fixed authentication
   returns nil to preserve dependency fallback selection. No successful method
   is inferred from configuration. Initial none-authentication success does not
-  generate an invented password/publickey attempt.
+  generate an invented password/publickey attempt. The authenticated summary uses per-handshake evidence to display the completed method and multi-stage success chain; see [SSH diagnostics](./ssh-diagnostics.md). Independent MACs display `<implicit>` for AEAD, actual negotiated names for non-AEAD, and `<unknown>` when missing and unconfirmed.
 - SFTP events report initialization start, failure and success; successful
   initialization means the dependency has validated SFTP v3. SCP reports the
   overall transfer start and final outcome. DEBUG2 reports advertised extensions, path requests and per-file outcomes.
