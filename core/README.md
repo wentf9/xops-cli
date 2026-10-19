@@ -161,12 +161,13 @@ Session.Close write alone does not establish that output readers have stopped.
 
 SSH and SFTP accept optional `WithDiagnostics(core/log.DiagnosticObserver)` options.
 These typed lifecycle events are independent of `DebugLogger`, contain public
-protocol metadata only, and do not change authentication, host trust or leases.
+protocol metadata and redacted privilege diagnostics only, and do not change authentication, host trust or leases.
 Observers are caller-owned, concurrency-safe and must return promptly; keep them
 alive until connector/client shutdown. No observer means no diagnostic output.
 SSH also reports observed negotiation, session requests/results/cleanup and
 forwarding lifecycles. Exit-code presence distinguishes confirmed status from
-signals or unknown outcomes; commands and arbitrary remote error text are excluded.
+signals or unknown outcomes. Privilege diagnostics include payload-redacted sudo/su invocations, active prompt patterns and recognized prompt text with normalized random markers; credential response buffers are never inspected. User commands, scripts and arbitrary remote error text are excluded.
+sudo's prompt-gated exchange prefers its random `-p` marker and accepts a valid explicitly configured node/global password prompt pattern as fallback before readiness. No configuration, invalid/empty-matching patterns and passwordless mode do not enable a generic fallback. Existing password retry/input gates remain unchanged; this does not add OTP support or command replay.
 See [SSH diagnostics](../docs/development/ssh-diagnostics.md).
 
 SFTP DEBUG2/3 diagnostics observe bounded metadata at existing pipe boundaries.

@@ -24,10 +24,11 @@ xops ssh -vvv -N -L 8080:127.0.0.1:80 web-01
 xops ssh -v web-01 uptime >output.log 2>ssh.log
 ```
 
-- `-v` shows connections, host-key verification, authentication, negotiated algorithms and session results; `-vv` adds request confirmations and forwarding connections; `-vvv` also shows session cleanup. Diagnostics use OpenSSH-style `debug1/2/3:` prefixes on stderr without changing remote stdout.
+- `-v` shows connections, host-key verification, the final successful authentication method, negotiated algorithms and session results; `-vv` adds request confirmations, privilege interactions and forwarding connections; `-vvv` also shows terminal handoff and session cleanup. Diagnostics use OpenSSH-style `debug1/2/3:` prefixes on stderr without changing remote stdout.
+- The authenticated line's `using "publickey"`, `using "password"` or `using "none"` identifies the method that actually completed the handshake; multi-stage authentication also shows the successful chain. `MAC: <implicit>` means AES-GCM or ChaCha20-Poly1305 provides integrity protection without a separate MAC, not that integrity checking is disabled. Non-AEAD algorithms display the actual HMAC name; unconfirmed values display `<unknown>`.
 - `-q` hides diagnostics and tunnel-ready status, not remote output, failures or security confirmations. Like OpenSSH, order matters: `-qv` enables diagnostics, `-vq` disables them, and `-vqv` does not immediately restore DEBUG1.
 - `--debug` / `--log-level` control separate internal logs and are not changed by `-v/-q`. Put a remote command's own `-v` after its command name, for example `xops ssh -v web-01 curl -v https://example.com`.
-- Diagnostics omit command, script, password and private-key bodies, but include hosts, usernames, fingerprints and forwarding addresses. Review logs before sharing. `-vvv` is not a complete internal SSH packet trace.
+- Diagnostics omit user-command, script, password and private-key bodies. Escalation invocations redact their payloads, but logs include hosts, usernames, fingerprints, password prompt text and forwarding addresses. Review logs before sharing. `-vvv` is not a complete internal SSH packet trace.
 - If a pipe does not support diagnostic output, redirect stderr to a regular log file. Diagnostic output failure makes the operation fail, but does not prove that the remote command never ran; do not blindly retry. With `-f -N`, only foreground validation diagnostics are visible; background logs are not retained.
 
 ## Running remote commands and piped scripts
@@ -68,13 +69,19 @@ If saving the node fails, the connection reports an error. If the message says t
 # Open an elevated interactive shell
 xops ssh --sudo web-01
 
+# Diagnose escalation: mode selection, password interactions and remote readiness
+xops ssh -vv --sudo web-01
+
 # Run a single command with a PTY and privilege escalation
 xops exec -x --sudo web-01 id
 ```
 
+For escalation, `-v` shows mode selection, escalation invocations, attempts/retries, remote elevated-shell readiness and termination; `-vv` adds root/passwordless probes, credential lookup, password-matching patterns, actual recognized prompt text and response phases; `-vvv` also shows terminal handoff and restoration. sudo/su options, target users and control shells are visible. User command/script bodies appear as `<privileged payload>` and random prompt markers as `<password-prompt>` (for example, `[sudo: <password-prompt>] Password:`). Credential response values and control frames never enter diagnostics. Selecting a mode does not prove successful escalation, and elevated-shell readiness does not prove that the subsequent user command succeeds. Root and passwordless paths do not invent password interactions.
+
 The node's `sudo_mode` controls how privileges are escalated (`auto`, `root`, passwordless `sudoer`, password `sudo`, or `su`):
 - **Servers that disallow direct root SSH login**: Use `su` mode to log in over SSH as an ordinary user and switch to `root` inside the session without enabling `PermitRootLogin`.
 - **Traditional `sudo` and `sudo-rs` compatibility**: XOps prompts again if credentials are missing or rejected. `exec -x --sudo` shows only the command output without extra root shell prompts.
+- **sudo/PAM ignoring `-p`**: Explicitly set node-level or global `password_prompt_pattern`, for example `password_prompt_pattern: '(?m)^Password:[ \t]*$'`. sudo prefers its random marker and only falls back to this configured pattern when no marker matches; node settings take precedence. Missing/invalid patterns and patterns matching the empty string never enable the built-in default as a sudo fallback; passwordless `sudoer` mode does not fall back. `-vv` reports fallback rules and matches. Match the actual password prompt precisely, not banners or other input requests. This does not support OTP/multi-factor authentication or replay user commands.
 - **Multi-shell escalation (`bash` / `sh` / `zsh` / `fish`)**:
   - Nodes configured with `launch_dialect: fish` + `interpreter: fish` (or `bash`/`sh`/`zsh`), or `launch_dialect: posix` + `interpreter: zsh`, support `xops ssh --sudo`, `xops exec --sudo`, and Playbook `sudo: true`.
   - The target must provide `/bin/sh`; using `su` also requires support for its `-s` option. See the [su manual](https://man7.org/linux/man-pages/man1/su.1.html).

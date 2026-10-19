@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	cryptoSSH "golang.org/x/crypto/ssh"
 )
@@ -41,6 +42,7 @@ type privilegeExchange struct {
 	terminalOnce                      sync.Once
 	interpreter                       Interpreter
 	launchDialect                     LaunchDialect
+	commandPreview                    string // Setup-owned; populated by the same wrapper as the actual invocation.
 }
 
 func newPrivilegeExchange(c *Client, mode SudoMode, force bool, interp ...Interpreter) *privilegeExchange {
@@ -85,7 +87,15 @@ func (e *privilegeExchange) command(command string) string {
 	if command == "" {
 		command = "exec " + shellName + " -l"
 	}
-	body := e.body(command)
+	e.commandPreview = e.wrapCommandBody("<privileged payload>", "<password-prompt>")
+	return e.wrapCommandBody(e.body(command), e.promptToken)
+}
+
+func (e *privilegeExchange) wrapCommandBody(body, prompt string) string {
+	shellName := "bash"
+	if e.interpreter == InterpreterSh {
+		shellName = "sh"
+	}
 	if e.mode == SudoModeSu {
 		return "export LC_ALL=C; su - root -c " + shellQuote("exec bash -c "+shellQuote(body))
 	}
@@ -94,7 +104,7 @@ func (e *privilegeExchange) command(command string) string {
 		prefix = "sudo -i -S -p "
 		body = sudoLoginScript(body)
 	}
-	return prefix + shellQuote(e.promptToken) + " -- " + shellName + " -c " + shellQuote(body)
+	return prefix + shellQuote(prompt) + " -- " + shellName + " -c " + shellQuote(body)
 }
 
 func (e *privilegeExchange) input(ctx context.Context, stdin io.Reader, pipe io.WriteCloser) error {
@@ -114,6 +124,7 @@ func (e *privilegeExchange) input(ctx context.Context, stdin io.Reader, pipe io.
 		case <-e.ready:
 			return e.forwardInput(ctx, stdin, pipe)
 		case <-e.prompts:
+			e.client.observePrivilege(e.mode, "password_prompt", 2, attempts+1)
 			sent, err := e.respond(ctx, pipe, attempts)
 			if err != nil {
 				return err
@@ -129,13 +140,17 @@ func (e *privilegeExchange) input(ctx context.Context, stdin io.Reader, pipe io.
 // Each SSH output stream owns its own frame buffer. Shared state only contains
 // metadata and channels. Matching stops after ready so command output is opaque.
 type privilegeFrameWriter struct {
-	exchange *privilegeExchange
-	target   io.Writer
-	pending  []byte
-	prompt   *regexp.Regexp
-	failed   bool
-	writeErr error
-	feedback sudoPromptFeedback
+	exchange        *privilegeExchange
+	target          io.Writer
+	pending         []byte
+	prompt          *regexp.Regexp
+	failed          bool
+	writeErr        error
+	feedback        sudoPromptFeedback
+	fallbackMatched bool // Owned by this output stream, reset on every prompt search.
+	linePrefix      privilegeLinePrefix
+	regexpPrefix    byte                              // Zero means a fresh matching region, otherwise a preceding boundary class.
+	contextPatterns map[*regexp.Regexp]*regexp.Regexp // Stream-owned lazy cache: primary and optional fallback only.
 }
 
 func (w *privilegeFrameWriter) Write(data []byte) (n int, retErr error) {
@@ -167,15 +182,21 @@ func (w *privilegeFrameWriter) Write(data []byte) (n int, retErr error) {
 			prompt = w.promptIndex()
 		}
 		ready := bytes.Index(w.pending, []byte(token))
-		if ready >= 0 && (prompt == nil || ready < prompt[0]) {
+		if ready >= 0 && (prompt == nil || w.fallbackMatched || ready < prompt[0]) {
 			if err := w.emit(w.pending[:ready]); err != nil {
 				return 0, err
 			}
-			w.pending = w.pending[ready+len(token):]
+			w.consumeFrame(ready + len(token))
 			if !w.exchange.started() {
-				w.exchange.readyOnce.Do(func() { close(w.exchange.ready) })
+				w.exchange.readyOnce.Do(func() {
+					w.exchange.client.observePrivilege(w.exchange.mode, "elevated_shell_ready", 1, 0)
+					close(w.exchange.ready)
+				})
 			} else {
-				w.exchange.terminalOnce.Do(func() { close(w.exchange.terminalReady) })
+				w.exchange.terminalOnce.Do(func() {
+					w.exchange.client.observePrivilege(w.exchange.mode, "terminal_handoff_confirmed", 3, 0)
+					close(w.exchange.terminalReady)
+				})
 			}
 			if w.exchange.outputReady() {
 				return n, w.flush()
@@ -188,8 +209,9 @@ func (w *privilegeFrameWriter) Write(data []byte) (n int, retErr error) {
 		if err := w.emit(w.pending[:prompt[0]]); err != nil {
 			return 0, err
 		}
+		w.observePrompt(prompt)
 		w.feedback = sudoPromptFeedback(w.exchange.mode == SudoModeSudo && bytes.HasPrefix(w.pending[prompt[0]:prompt[1]], []byte(sudoRSPromptPrefix)))
-		w.pending = w.pending[prompt[1]:]
+		w.consumeFrame(prompt[1])
 		select {
 		case w.exchange.prompts <- struct{}{}:
 		default:
@@ -203,6 +225,7 @@ func (w *privilegeFrameWriter) Write(data []byte) (n int, retErr error) {
 		if err := w.emit(w.pending[:count]); err != nil {
 			return 0, err
 		}
+		w.rememberDiscarded(w.pending[:count])
 		w.pending = append(w.pending[:0], w.pending[count:]...)
 	}
 	return n, nil
@@ -225,11 +248,12 @@ func (w *privilegeFrameWriter) emit(data []byte) error {
 func (w *privilegeFrameWriter) flush() error {
 	err := w.emit(w.pending)
 	clear(w.pending)
+	w.consumeFrame(len(w.pending))
 	w.pending = nil
 	return err
 }
 
-func (c *Client) runPrivilegeOperation(ctx context.Context, mode SudoMode, command string, stdin io.Reader, stdout, stderr io.Writer, options ...any) error {
+func (c *Client) runPrivilegeOperation(ctx context.Context, mode SudoMode, command string, stdin io.Reader, stdout, stderr io.Writer, options ...any) (retErr error) {
 	if ctx == nil || c == nil {
 		return fmt.Errorf("privilege execution requires a client and context")
 	}
@@ -260,11 +284,14 @@ func (c *Client) runPrivilegeOperation(ctx context.Context, mode SudoMode, comma
 	if terminal != nil && terminal.activate == nil {
 		return fmt.Errorf("privilege terminal activation is missing")
 	}
+	defer func() { c.observePrivilegeResult(ctx, mode, retErr) }()
 	for attempt := 0; attempt < 3; attempt++ {
+		c.observePrivilege(mode, "attempt_started", 1, attempt+1)
 		err := c.runPrivilegeAttempt(ctx, mode, command, stdin, stdout, stderr, attempt > 0, terminal, config, cancelOutput)
 		if mode != SudoModeSu || !errors.Is(err, errPrivilegeAuthenticationRejected) || credentialRecoveryPrompter(c.prompter) == nil || attempt == 2 {
 			return err
 		}
+		c.observePrivilege(mode, "exchange_retry", 1, attempt+2)
 	}
 	return errPrivilegeAuthenticationRejected
 }
@@ -350,7 +377,9 @@ func (c *Client) runPrivilegeAttempt(ctx context.Context, mode SudoMode, command
 	out := &privilegeFrameWriter{exchange: exchange, target: stdout, prompt: pattern}
 	diagnostic := &privilegeFrameWriter{exchange: exchange, target: stderr, prompt: pattern}
 	session.Stdout, session.Stderr = out, diagnostic
-	if err := c.startPrivilegeSession(work, session, exchange.command(command)); err != nil {
+	fullCommand := exchange.command(command)
+	c.observePrivilegeExchange(exchange, pattern)
+	if err := c.startPrivilegeSession(work, session, fullCommand); err != nil {
 		return err
 	}
 	waitDone := make(chan error, 1)
@@ -422,21 +451,55 @@ func (w *privilegeFrameWriter) writeBytes(data []byte) (int, error) {
 // Shell xtrace renders command arguments before running sudo/su. Such a line
 // is not a password challenge, even if it contains our prompt argument.
 func (w *privilegeFrameWriter) promptIndex() []int {
-	for _, match := range w.prompt.FindAllIndex(w.pending, -1) {
-		line := w.pending[:match[0]]
-		if at := bytes.LastIndexByte(line, '\n'); at >= 0 {
-			line = line[at+1:]
-		}
-		prefix := strings.TrimLeft(string(line), "+")
-		if len(prefix) < len(line) && strings.HasPrefix(prefix, " ") {
-			continue
-		}
-		if w.exchange.mode == SudoModeSudo {
-			return expandSudoPrompt(w.pending, match)
-		}
+	w.fallbackMatched = false
+	match, incomplete := w.findPrompt(w.prompt, w.exchange.mode == SudoModeSudo)
+	if match != nil || incomplete {
 		return match
 	}
-	return nil
+	if w.exchange.mode != SudoModeSudo || w.exchange.client == nil || w.exchange.client.sudoPromptFallback == nil {
+		return nil
+	}
+	if incompleteSudoPrompt(w.pending, w.exchange.promptToken) {
+		return nil
+	}
+	match, _ = w.findPrompt(w.exchange.client.sudoPromptFallback, false)
+	w.fallbackMatched = match != nil
+	return match
+}
+
+// An incomplete sudo-rs envelope must wait for its suffix, never fall back to
+// a partial challenge. Zero-width matches cannot consume a prompt or send input.
+func (w *privilegeFrameWriter) findPrompt(pattern *regexp.Regexp, expand bool) ([]int, bool) {
+	if pattern == nil {
+		return nil, false
+	}
+	line, scanned, search := w.linePrefix, 0, 0
+	for search <= len(w.pending) {
+		match := w.nextPromptMatch(pattern, search)
+		if match == nil {
+			break
+		}
+		if match[0] == match[1] {
+			if match[1] == len(w.pending) {
+				break
+			}
+			_, size := utf8.DecodeRune(w.pending[match[1]:])
+			search = match[1] + size
+			continue
+		}
+		search = match[1]
+		line = advancePrivilegeLine(line, w.pending[scanned:match[0]])
+		scanned = match[0]
+		if privilegeXtraceAt(line, w.pending[match[0]:]) {
+			continue
+		}
+		if expand {
+			full := expandSudoPrompt(w.pending, match)
+			return full, full == nil
+		}
+		return match, false
+	}
+	return nil, false
 }
 
 type privilegeOutcome struct {
@@ -445,6 +508,9 @@ type privilegeOutcome struct {
 }
 
 func (e *privilegeExchange) finish(ctx context.Context, o privilegeOutcome) error {
+	if !e.started() {
+		e.client.observePrivilege(e.mode, "elevation_not_confirmed", 1, 0)
+	}
 	waitErr := e.interactiveWaitError(o.waitErr)
 	result := errors.Join(waitErr, o.inputErr, o.closeErr, o.flushErr)
 	if e.terminal != nil && !e.outputReady() && result == nil {
@@ -461,6 +527,7 @@ func (e *privilegeExchange) finish(ctx context.Context, o privilegeOutcome) erro
 	e.mu.Unlock()
 	var exitErr *cryptoSSH.ExitError
 	if !e.started() && rejected && errors.As(o.waitErr, &exitErr) && exitErr.ExitStatus() != 0 && o.inputErr == nil && o.closeErr == nil && o.flushErr == nil && !o.outputFailed && ctx.Err() == nil {
+		e.client.observePrivilege(e.mode, "authentication_rejected", 1, 0)
 		return errors.Join(errPrivilegeAuthenticationRejected, result)
 	}
 	if !e.started() && result == nil {
@@ -474,7 +541,11 @@ func (e *privilegeExchange) respond(ctx context.Context, pipe io.Writer, attempt
 		return false, nil
 	}
 	if attempts >= 3 || (attempts > 0 && credentialRecoveryPrompter(e.client.prompter) == nil) {
+		e.client.observePrivilege(e.mode, "retry_limit", 1, attempts+1)
 		return false, errPrivilegeAuthenticationRejected
+	}
+	if attempts > 0 {
+		e.client.observePrivilege(e.mode, "password_retry", 1, attempts+1)
 	}
 	kind := SecretKindSudoPassword
 	if e.mode == SudoModeSu {
@@ -500,6 +571,7 @@ func (e *privilegeExchange) respond(ctx context.Context, pipe io.Writer, attempt
 		return false, fmt.Errorf("send privilege response: %w", err)
 	}
 	e.passwordSent = true
+	e.client.observePrivilege(e.mode, "password_response_sent", 2, attempts+1)
 	return true, nil
 }
 

@@ -66,7 +66,11 @@ func (e *privilegeExchange) portableCommand(command string) string {
 	if command == "" {
 		command = portableUserCommand("", &RunConfig{Interpreter: e.interpreter, LoginShell: true}, LaunchPOSIX)
 	}
-	body := e.body(command)
+	e.commandPreview = e.wrapPortableBody("<privileged payload>", "<password-prompt>")
+	return e.wrapPortableBody(e.body(command), e.promptToken)
+}
+
+func (e *privilegeExchange) wrapPortableBody(body, prompt string) string {
 	quote := shellQuote
 	if e.launchDialect == LaunchFish {
 		quote = fishQuote
@@ -78,7 +82,7 @@ func (e *privilegeExchange) portableCommand(command string) string {
 	if e.mode == SudoModeSudoer {
 		prefix = "sudo -n -S -p "
 	}
-	return prefix + quote(e.promptToken) + " -- /bin/sh -c " + quote(body)
+	return prefix + quote(prompt) + " -- /bin/sh -c " + quote(body)
 }
 
 func (c *Client) runInteractivePortableWithSudo(ctx context.Context, mode SudoMode, command string, streams InteractiveIO, shell bool, config *RunConfig, cancelOutput ...context.CancelFunc) error {

@@ -67,11 +67,21 @@ func (e *privilegeExchange) forwardInput(ctx context.Context, stdin io.Reader, p
 		return err
 	}
 	if e.terminal != nil {
+		e.client.observePrivilege(e.mode, "terminal_activating", 3, 0)
 		restore, err := e.terminal.activate(ctx, e.session)
 		if err != nil {
 			return err
 		}
-		defer func() { retErr = errors.Join(retErr, restore()) }()
+		e.client.observePrivilege(e.mode, "terminal_activated", 3, 0)
+		defer func() {
+			restoreErr := restore()
+			phase := "terminal_restored"
+			if restoreErr != nil {
+				phase = "terminal_restore_failed"
+			}
+			e.client.observePrivilege(e.mode, phase, 3, 0)
+			retErr = errors.Join(retErr, restoreErr)
+		}()
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -79,6 +89,7 @@ func (e *privilegeExchange) forwardInput(ctx context.Context, stdin io.Reader, p
 	if _, err := fmt.Fprintln(pipe, e.ackToken); err != nil {
 		return fmt.Errorf("confirm privilege readiness: %w", err)
 	}
+	e.client.observePrivilege(e.mode, "handoff_ack_sent", 3, 0)
 	if e.terminal != nil {
 		handoff, cancel := withTimeoutOrDefault(ctx, e.client.handshakeTimeout, defaultSSHHandshakeTimeout)
 		defer cancel()
@@ -92,6 +103,7 @@ func (e *privilegeExchange) forwardInput(ctx context.Context, stdin io.Reader, p
 	if err != nil {
 		return err
 	}
+	e.client.observePrivilege(e.mode, "input_forwarding", 2, 0)
 	<-ctx.Done()
 	return finish()
 }

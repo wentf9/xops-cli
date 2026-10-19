@@ -24,10 +24,11 @@ xops ssh -vvv -N -L 8080:127.0.0.1:80 web-01
 xops ssh -v web-01 uptime >output.log 2>ssh.log
 ```
 
-- `-v` 显示连接、主机密钥验证、认证、协商算法和会话结果；`-vv` 增加请求确认及转发连接信息；`-vvv` 再增加会话清理信息。诊断采用 OpenSSH 风格的 `debug1/2/3:` 前缀，写入 stderr，不改变远程 stdout。
+- `-v` 显示连接、主机密钥验证、最终成功的认证方式、协商算法和会话结果；`-vv` 增加请求确认、提权交互及转发连接信息；`-vvv` 再增加终端交接与会话清理信息。诊断采用 OpenSSH 风格的 `debug1/2/3:` 前缀，写入 stderr，不改变远程 stdout。
+- 认证成功行中的 `using "publickey"`、`using "password"` 或 `using "none"` 表示实际完成握手的方法；多阶段认证还显示成功链。`MAC: <implicit>` 表示 AES-GCM 或 ChaCha20-Poly1305 自带完整性保护，无需独立 MAC，并非没有校验；非 AEAD 算法显示实际 HMAC 名称，无法确认的值显示 `<unknown>`。
 - `-q` 隐藏诊断及隧道就绪提示，不隐藏远程输出、失败报错或安全确认。与 OpenSSH 一样，顺序有影响：`-qv` 启用诊断，`-vq` 关闭诊断，`-vqv` 不立即恢复 DEBUG1。
 - `--debug` / `--log-level` 控制另一套内部日志，不受 `-v/-q` 改写。远程命令自己的 `-v` 放在命令名称之后，例如 `xops ssh -v web-01 curl -v https://example.com`。
-- 诊断不打印命令、脚本、密码或私钥正文，但包含主机、用户名、指纹及转发地址，分享日志前仍需检查。`-vvv` 不提供完整的 SSH 内部报文跟踪。
+- 诊断不打印用户命令、脚本、密码或私钥正文；提权调用使用脱敏载荷，但包含主机、用户名、指纹、密码提示词及转发地址，分享日志前仍需检查。`-vvv` 不提供完整的 SSH 内部报文跟踪。
 - 若某类管道不支持诊断输出，请将 stderr 重定向到普通日志文件。诊断输出失败会使本次操作报错，不代表远程命令未执行，请勿因此直接重试。`-f -N` 只显示前台验证阶段的诊断，不保留后台持续日志。
 
 ## 执行远程命令与管道脚本
@@ -68,13 +69,19 @@ xops ssh --host linux-01 --interpreter bash --launch-dialect posix --login-shell
 # 打开提权后的交互式 Shell
 xops ssh --sudo web-01
 
+# 排查提权：显示模式选择、密码交互与远端就绪阶段
+xops ssh -vv --sudo web-01
+
 # 在 PTY 下以提权身份执行单条命令
 xops exec -x --sudo web-01 id
 ```
 
+提权诊断中，`-v` 显示模式选择、提权调用、尝试/重试、远端提权 Shell 就绪及结束结果；`-vv` 补充 root/免密探测、凭据查找、密码提示匹配规则及实际识别到的提示词/响应阶段；`-vvv` 还显示终端交接与恢复。sudo/su 的选项、目标用户和控制 Shell 可见；用户命令/脚本显示为 `<privileged payload>`，随机提示标记显示为 `<password-prompt>`（例如 `[sudo: <password-prompt>] Password:`）。密码等凭据响应内容及控制帧不会写入诊断。模式被选中不代表已提权成功；提权 Shell 就绪也不代表后续用户命令成功。root 或免密路径不会虚构密码交互。
+
 提权方式由节点的 `sudo_mode` 配置决定（支持 `auto`、`root`、`sudoer` 免密、`sudo` 密码、`su` 密码）：
 - **禁止 root 直接登录的主机**：可配置为 `su` 模式，使用普通用户建立 SSH 连接后再通过 `su` 和 root 密码切换身份，无需开放 `PermitRootLogin`。
 - **传统 `sudo` 与 `sudo-rs` 兼容**：缺少凭据或密码被拒时，会提示重新输入。`exec -x --sudo` 仅显示命令结果，不显示多余的 root 提示符。
+- **sudo/PAM 忽略 `-p` 时**：可在节点或全局配置中显式设置 `password_prompt_pattern`，例如 `password_prompt_pattern: '(?m)^Password:[ \t]*$'`。sudo 优先识别随机标记，未匹配时才使用该配置回退；节点配置优先于全局配置。未配置、正则无效或可匹配空字符串时不会自动启用内置默认正则作为 sudo 回退；`sudoer` 免密模式不回退。`-vv` 显示回退规则和命中情况。请按真实密码提示精确配置，避免匹配 banner 或其他输入；此功能不支持 OTP/多因素认证，也不会重新执行用户命令。
 - **多 Shell 提权支持（`bash` / `sh` / `zsh` / `fish`）**：
   - 节点配置 `launch_dialect: fish` + `interpreter: fish`（或 `bash`/`sh`/`zsh`），或配置 `launch_dialect: posix` + `interpreter: zsh` 后，均可使用 `xops ssh --sudo`、`xops exec --sudo` 和 Playbook `sudo: true`。
   - 目标系统需提供 `/bin/sh`；使用 `su` 时还需支持 `-s` 选项，见 [su 手册](https://man7.org/linux/man-pages/man1/su.1.html)。

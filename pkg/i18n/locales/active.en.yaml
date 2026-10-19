@@ -1146,7 +1146,7 @@ scp_err_empty_selector:
 scp_err_port_zero:
   other: "SSH port must be between 1 and 65535"
 flag_ssh_verbose:
-  other: "Print SSH diagnostics (-vv includes requests, -vvv includes cleanup; independent of --debug)"
+  other: "Print SSH diagnostics (-vv includes requests and privilege interactions, -vvv includes terminal handoff and cleanup; independent of --debug)"
 flag_ssh_quiet:
   other: "Suppress SSH diagnostics and tunnel status (errors and security prompts remain)"
 flag_scp_quiet:

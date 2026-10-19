@@ -18,6 +18,7 @@ const (
 	SessionFinished       DiagnosticKind = "session_finished"
 	SessionCleanup        DiagnosticKind = "session_cleanup"
 	ForwardLifecycle      DiagnosticKind = "forward_lifecycle"
+	PrivilegeLifecycle    DiagnosticKind = "privilege_lifecycle"
 	SubsystemStarting     DiagnosticKind = "subsystem_starting"
 	SubsystemReady        DiagnosticKind = "subsystem_ready"
 	SubsystemFailed       DiagnosticKind = "subsystem_failed"
@@ -30,9 +31,12 @@ const (
 	FileTransfer          DiagnosticKind = "file_transfer"
 )
 
-// Diagnostic contains public protocol metadata only. Never put credentials,
+// Diagnostic contains public protocol and redacted privilege metadata only. Never put credentials,
 // private keys, file contents, or arbitrary error text in these fields.
-// Method describes a selected attempt, not proof that it authenticated.
+// For AuthenticationAttempt, Method is the selected protocol method, not proof
+// of success. For Authenticated, Method is the final successful method and
+// Methods is the server-confirmed partial-success chain plus that final method.
+// AuthenticationMethods uses Methods for the server's advertised alternatives.
 type Diagnostic struct {
 	// Level is 1..3; zero preserves the original DEBUG1 event behavior.
 	Level                                      int
@@ -55,11 +59,15 @@ type Diagnostic struct {
 	HasStatus                                  bool
 	HasExitCode                                bool
 	ExitCode                                   int64
+	Attempt                                    int // Privilege exchange/password attempt, 1-based; zero when not applicable.
 	Path, Extension, ExtensionVersion          string
 	Truncated                                  bool
 	Operation, Outcome                         string
-	Source, Destination                        string
-	Size                                       int64
+	// PrivilegeCommand is a payload-redacted invocation, never a user command.
+	// Prompts/patterns exclude response bytes and normalize random markers.
+	PrivilegeCommand, PrivilegePrompt, PrivilegePromptPattern string
+	Source, Destination                                       string
+	Size                                                      int64
 }
 
 // DiagnosticObserver is optional and independent of DebugLogger. Implementations

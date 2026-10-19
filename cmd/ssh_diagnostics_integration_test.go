@@ -81,10 +81,13 @@ func TestSSHDiagnosticsEndToEnd(t *testing.T) {
 				t.Fatal(err)
 			}
 			text := diagnostics.String()
-			for _, required := range []string{"debug1: Connecting", "Server host key", "kex:", "Next authentication method", "Authenticated to", "Entering", "Exit status 0"} {
+			for _, required := range []string{"debug1: Connecting", "Server host key", "kex:", "Next authentication method", "Authenticated to", `using "password"`, "Entering", "Exit status 0"} {
 				if !strings.Contains(text, required) {
 					t.Fatalf("missing %q: %s", required, text)
 				}
+			}
+			if strings.Contains(text, `MAC: ""`) {
+				t.Fatalf("negotiated MAC was displayed as empty: %s", text)
 			}
 			for _, private := range []string{sshfixture.Password, "private-command-marker", "private-input-marker", "fixture-output"} {
 				if strings.Contains(text, private) {

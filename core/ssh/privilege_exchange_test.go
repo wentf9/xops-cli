@@ -29,6 +29,7 @@ type privilegeServerOptions struct {
 	withholdTerminal                       bool
 	inputBytes                             int
 	sudoRSPrompt                           string
+	ignoredPrompt                          string // Simulate PAM ignoring sudo -p, without invoking a real sudo.
 }
 type privilegeServerEvidence struct {
 	commands         atomic.Int32
@@ -282,7 +283,7 @@ func sendPrivilegeStatus(t *testing.T, channel cryptoSSH.Channel, status uint32)
 	}
 }
 
-func exchangeTestClient(t *testing.T, addr string, mode SudoMode, ui InteractionHandler, recorder CredentialRecorder) *Client {
+func exchangeTestClient(t *testing.T, addr string, mode SudoMode, ui InteractionHandler, recorder CredentialRecorder, promptPattern ...string) *Client {
 	t.Helper()
 	host, portText, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -293,6 +294,9 @@ func exchangeTestClient(t *testing.T, addr string, mode SudoMode, ui Interaction
 		t.Fatal(err)
 	}
 	provider := &trackingProvider{cfg: &ClientConfig{NodeID: "node", Address: host, Port: port, User: "user", AuthType: "password", Password: "login", SudoMode: mode, SudoUpdateToken: "sudo"}}
+	if len(promptPattern) > 0 {
+		provider.cfg.PasswordPromptPattern = promptPattern[0]
+	}
 	connector := newTestConnector(provider, WithInteractionHandler(ui), WithCredentialRecorder(recorder))
 	t.Cleanup(func() {
 		if err := connector.CloseAll(); err != nil {
@@ -542,6 +546,9 @@ func servePrivilegeAuthentication(t *testing.T, channel cryptoSSH.Channel, reade
 		}
 		if opts.sudoRSPrompt != "" {
 			prompt = "[sudo: " + prompt + "] " + opts.sudoRSPrompt
+		}
+		if opts.ignoredPrompt != "" {
+			prompt = opts.ignoredPrompt
 		}
 		if _, err := io.WriteString(target, prompt); err != nil {
 			return false
