@@ -16,7 +16,7 @@ require (
 	github.com/creack/pty v1.1.24
 	github.com/ebitengine/purego v0.11.2
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f
-	github.com/godbus/dbus/v5 v5.2.2
+	github.com/godbus/dbus/v5 v5.2.4
 	github.com/google/jsonschema-go v0.4.3
 	github.com/hinshun/vt10x v0.0.0-20220301184237-5011da428d02
 	github.com/kevinburke/ssh_config v1.6.0
