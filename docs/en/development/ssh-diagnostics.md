@@ -5,6 +5,8 @@
 `xops ssh -v/-vv/-vvv` reuses SCP's structured diagnostics and controlled output. It does not switch SSH backends or change authentication candidate order, host trust, connection leases, interpreter payloads or command retry policy.
 `--debug` / `--log-level` still control independent internal logs. See the [SSH guide](../guide/ssh.md) for usage and restrictions.
 
+`xops sftp -v/-vv/-vvv` reuses the same `sshDiagnostics` observer and single log level (only `-v` is registered, with no `-q`), and passes the observer to both the connector and `sftp.WithDiagnostics`. SFTP protocol events are rendered as `debugN: [sftp N] ...` by `formatSFTPDiagnostic`, shared with SCP and without the `scp:` prefix; SCP output is unchanged. The observer is deferred before the connector, SFTP client and shell cleanup, so it is released last.
+
 References: [ssh(1)](https://man.openbsd.org/ssh.1), OpenSSH portable's
 [ssh.c](https://github.com/openssh/openssh-portable/blob/master/ssh.c) and
 [clientloop.c](https://github.com/openssh/openssh-portable/blob/master/clientloop.c).

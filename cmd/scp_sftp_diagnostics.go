@@ -9,6 +9,17 @@ import (
 // observeSFTP handles SCP's own protocol diagnostics independently of the SSH
 // log level, preserving OpenSSH's behavior when -q follows one or more -v flags.
 func (d *scpDiagnostics) observeSFTP(e corelog.Diagnostic) bool {
+	message, ok := formatSFTPDiagnostic(e)
+	if !ok {
+		return false
+	}
+	d.enqueue(fmt.Sprintf("scp: debug%d: %s\n", max(e.Level, 1), message))
+	return true
+}
+
+// formatSFTPDiagnostic renders SFTP protocol metadata shared by scp and sftp.
+// The result carries the stream marker but no command prefix or debug level.
+func formatSFTPDiagnostic(e corelog.Diagnostic) (string, bool) {
 	q := quotedDiagnostic
 	var message string
 	switch e.Kind {
@@ -39,10 +50,9 @@ func (d *scpDiagnostics) observeSFTP(e corelog.Diagnostic) bool {
 	case corelog.FileTransfer:
 		message = fmt.Sprintf("%s %s: %s -> %s size %d", e.Operation, e.Outcome, q(e.Source), q(e.Destination), e.Size)
 	default:
-		return false
+		return "", false
 	}
-	d.enqueue(fmt.Sprintf("scp: debug%d: [sftp %d] %s\n", max(e.Level, 1), e.StreamID, message))
-	return true
+	return fmt.Sprintf("[sftp %d] %s", e.StreamID, message), true
 }
 
 var sftpPacketNames = [256]string{

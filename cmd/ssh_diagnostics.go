@@ -22,6 +22,18 @@ type sshDiagnosticOptions struct {
 }
 
 func (o *sshDiagnosticOptions) register(cmd *cobra.Command) {
+	o.registerVerbose(cmd, "flag_ssh_verbose")
+	cmd.Flags().VarP(orderedOutputFlag{&o.quiet, func(v bool) {
+		if v {
+			o.level = sshLogQuiet
+		}
+	}}, "quiet", "q", i18n.T("flag_ssh_quiet"))
+	cmd.Flags().Lookup("quiet").NoOptDefVal = "true"
+}
+
+// registerVerbose installs only -v/--verbose for commands without a quiet mode,
+// such as sftp, sharing SSH's single ordered log level.
+func (o *sshDiagnosticOptions) registerVerbose(cmd *cobra.Command, usageKey string) {
 	o.level = sshLogInfo
 	cmd.Flags().VarP(orderedOutputFlag{&o.verbose, func(v bool) {
 		if !v {
@@ -35,14 +47,8 @@ func (o *sshDiagnosticOptions) register(cmd *cobra.Command) {
 		} else if o.level < sshLogDebug3 {
 			o.level++
 		}
-	}}, "verbose", "v", i18n.T("flag_ssh_verbose"))
+	}}, "verbose", "v", i18n.T(usageKey))
 	cmd.Flags().Lookup("verbose").NoOptDefVal = "true"
-	cmd.Flags().VarP(orderedOutputFlag{&o.quiet, func(v bool) {
-		if v {
-			o.level = sshLogQuiet
-		}
-	}}, "quiet", "q", i18n.T("flag_ssh_quiet"))
-	cmd.Flags().Lookup("quiet").NoOptDefVal = "true"
 }
 
 // sshDiagnostics uses the same bounded output owner as SCP. CRLF also works
@@ -71,6 +77,10 @@ func (d *sshDiagnostics) ObserveDiagnostic(e corelog.Diagnostic) {
 		return
 	}
 	message := formatSSHDiagnostic(e)
+	if message == "" {
+		// SFTP protocol events exist only for commands that open a subsystem, such as sftp.
+		message, _ = formatSFTPDiagnostic(e)
+	}
 	if message == "" {
 		return
 	}

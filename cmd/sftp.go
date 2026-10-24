@@ -82,6 +82,7 @@ func NewCmdSftp() *cobra.Command {
 	cmd.Flags().StringVar(&o.Remember, "remember", "", i18n.T("flag_remember"))
 	cmd.Flags().StringVar(&o.Alias, "alias", "", i18n.T("flag_alias"))
 	cmd.Flags().StringSliceVar(&o.Tags, "tag", []string{}, i18n.T("flag_tag"))
+	o.diagnostic.registerVerbose(cmd, "flag_sftp_verbose")
 
 	cmd.MarkFlagsMutuallyExclusive("force", "no-clobber")
 	return cmd
@@ -126,11 +127,20 @@ func (o *SftpOptions) RunContext(ctx context.Context) (err error) {
 		return optErr
 	}
 	var connector *ssh.Connector
+	// The diagnostic sink must outlive the connector, SFTP client and shell, which
+	// are the event producers. Deferring it first makes it the last cleanup to run.
+	observer, finishDiagnostics, diagnosticErr := connectionOptions.startDiagnostics(ctx)
+	if diagnosticErr != nil {
+		return diagnosticErr
+	}
+	defer func() {
+		err = errors.Join(err, finishDiagnostics())
+	}()
 	if batch {
 		adpOpts = append(adpOpts, adapter.WithNonInteractive(true))
-		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
+		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(observer))
 	} else {
-		connector = newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithInteractionHandler(connectionOptions.interaction))
+		connector = newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithInteractionHandler(connectionOptions.interaction), ssh.WithDiagnostics(observer))
 	}
 	defer func() {
 		joinConnectorCloseError(&err, connector)
@@ -145,6 +155,7 @@ func (o *SftpOptions) RunContext(ctx context.Context) (err error) {
 		sftp.WithConcurrentFiles(o.maxTask),
 		sftp.WithThreadsPerFile(o.maxThread),
 		sftp.WithForce(o.force),
+		sftp.WithDiagnostics(observer),
 	)
 	if err != nil {
 		return fmt.Errorf("%s: %w", i18n.T("err_connect_failed"), err)

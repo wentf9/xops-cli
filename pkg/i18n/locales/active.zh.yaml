@@ -1155,3 +1155,5 @@ flag_scp_quiet:
 
 flag_scp_verbose:
   other: "输出 SSH/SFTP 诊断信息（-vv 含文件操作，-vvv 含 SFTP 数据包；独立于 --debug）"
+flag_sftp_verbose:
+  other: "输出 SSH/SFTP 诊断信息（-vv 含文件操作，-vvv 含 SFTP 数据包；独立于 --debug）"
