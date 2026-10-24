@@ -94,9 +94,19 @@ func TestSplitCommandLine(t *testing.T) {
 			wantErr: errUnclosedQuote,
 		},
 		{
-			name:    "trailing backslash",
-			input:   `put trailing\`,
-			wantErr: errTrailingBackslash,
+			name:  "trailing backslash preserved as literal for path",
+			input: `put trailing\`,
+			want:  []string{"put", `trailing\`},
+		},
+		{
+			name:  "Windows path with trailing backslash in double quotes",
+			input: `put "C:\Users\test\"`,
+			want:  []string{"put", `C:\Users\test\`},
+		},
+		{
+			name:  "Windows directory with trailing backslash in double quotes followed by arg",
+			input: `put "bin036\" /remote/path`,
+			want:  []string{"put", `bin036\`, "/remote/path"},
 		},
 	}
 
