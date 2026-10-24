@@ -1,4 +1,4 @@
-package ssh
+package tui
 
 import (
 	"context"
@@ -6,8 +6,11 @@ import (
 	"errors"
 	"io"
 	"math"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/wentf9/xops-cli/core/ssh"
 )
 
 func TestFormatUptime(t *testing.T) {
@@ -69,5 +72,24 @@ func TestCPUTicks(t *testing.T) {
 	// Usage = (500 - 450) / 500 = 10%
 	if math.Abs(usage-10.0) > 0.1 {
 		t.Errorf("expected CPU usage 10.0%%, got %f%%", usage)
+	}
+}
+
+func TestMetricsCollector_RejectsIncompatibleExecution(t *testing.T) {
+	connCfg := ssh.ConnectionConfig{
+		Execution: &ssh.ExecutionConfig{
+			Interpreter:   ssh.InterpreterPowerShell,
+			LaunchDialect: ssh.LaunchPowerShell,
+		},
+	}
+	client := ssh.NewTestClient(connCfg)
+	mc := NewMetricsCollector(client)
+
+	err := mc.Start(context.Background())
+	if err == nil {
+		t.Fatal("expected error starting metrics collector on Windows config, got nil")
+	}
+	if !strings.Contains(err.Error(), "Linux/POSIX") {
+		t.Errorf("error %q does not mention Linux/POSIX requirement", err.Error())
 	}
 }
