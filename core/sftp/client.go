@@ -92,6 +92,7 @@ type Client struct {
 	config             TransferConfig
 	diagnostics        corelog.DiagnosticObserver
 	diagnosticStreamID uint64
+	fileProgress       FileProgressCallback
 }
 
 // NewClient creates an SFTP subsystem on an existing SSH connection. Setup is
@@ -460,6 +461,21 @@ func (c *Client) RealPath(ctx context.Context, remotePath string) (string, error
 	return realPath, err
 }
 
+// StatVFS returns VFS statistics for the remote path. If the server does not support
+// the statvfs@openssh.com extension, it returns an error.
+func (c *Client) StatVFS(ctx context.Context, remotePath string) (*sftp.StatVFS, error) {
+	var vfs *sftp.StatVFS
+	err := c.Do(ctx, func(rawClient *sftp.Client) error {
+		var statErr error
+		vfs, statErr = rawClient.StatVFS(remotePath)
+		return statErr
+	})
+	if err != nil {
+		return nil, fmt.Errorf("statvfs remote path %q failed: %w", remotePath, err)
+	}
+	return vfs, nil
+}
+
 // JoinPath 辅助函数：处理远程路径拼接 (SFTP 协议强制使用 forward slash)
 func (c *Client) JoinPath(elem ...string) string {
 	if c == nil || c.state == nil || c.state.sftpClient == nil {
@@ -476,6 +492,17 @@ func (c *Client) WithForce(force bool) *Client {
 	}
 	clone := *c
 	clone.config.Force = force
+	return &clone
+}
+
+// WithFileProgress returns a new Client instance sharing the same underlying connection
+// but with the specified per-file progress callback. This is safe for concurrent use.
+func (c *Client) WithFileProgress(callback FileProgressCallback) *Client {
+	if c == nil {
+		return nil
+	}
+	clone := *c
+	clone.fileProgress = callback
 	return &clone
 }
 

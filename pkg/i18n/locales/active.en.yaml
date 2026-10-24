@@ -584,6 +584,8 @@ sftp_shell_upload_failed:
   other: "\nUpload failed: {{.Error}}"
 sftp_shell_upload_done:
   other: "\nUpload complete"
+sftp_shell_storage_insufficient_warning:
+  other: "Warning: Remote destination storage space may be insufficient (Available: {{.Free}} / Total: {{.Total}}, Required: {{.Need}})"
 sftp_shell_exec_usage:
   other: "Usage: exec <command>"
 sftp_shell_lexec_usage:

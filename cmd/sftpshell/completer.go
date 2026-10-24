@@ -7,13 +7,240 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 
 	pkgsftp "github.com/pkg/sftp"
 )
 
+type completionCursor struct {
+	cmd               string
+	argIndex          int  // 0: 命令名, 1: 第一个参数, 2: 第二个参数...
+	isCommand         bool // 是否在补全命令名
+	partial           string
+	quoteChar         rune // 0: 无引号, '\'': 单引号, '"': 双引号
+	head              string
+	prefixBeforeQuote string
+}
+
+func writeEscapedCompletionRune(r rune, inQuote rune, current *strings.Builder) {
+	if inQuote == '"' {
+		if r == '"' || r == '\\' {
+			current.WriteRune(r)
+		} else {
+			current.WriteRune('\\')
+			current.WriteRune(r)
+		}
+		return
+	}
+	switch r {
+	case ' ', '\t', '\n', '\r', '\'', '"', '\\':
+		current.WriteRune(r)
+	default:
+		current.WriteRune('\\')
+		current.WriteRune(r)
+	}
+}
+
+// parseCompletionCursor 词法分析光标前的输入，提取补全上下文
+//
+//nolint:gocyclo
+func parseCompletionCursor(content string) completionCursor {
+	runes := []rune(content)
+	var tokens []string
+	var current strings.Builder
+	var inToken bool
+	var inQuote rune
+	var escaped bool
+	tokenStartRune := 0
+	quoteStartRune := -1
+	prefixBeforeQuote := ""
+
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+
+		if escaped {
+			escaped = false
+			inToken = true
+			writeEscapedCompletionRune(r, inQuote, &current)
+			continue
+		}
+
+		if inQuote == '\'' {
+			inToken = true
+			if r == '\'' {
+				inQuote = 0
+				quoteStartRune = -1
+				prefixBeforeQuote = ""
+			} else {
+				current.WriteRune(r)
+			}
+			continue
+		}
+
+		if inQuote == '"' {
+			inToken = true
+			if r == '\\' {
+				escaped = true
+				continue
+			}
+			if r == '"' {
+				inQuote = 0
+				quoteStartRune = -1
+				prefixBeforeQuote = ""
+			} else {
+				current.WriteRune(r)
+			}
+			continue
+		}
+
+		// 无引号状态
+		if r == '\\' {
+			escaped = true
+			if !inToken {
+				inToken = true
+				tokenStartRune = i
+			}
+			continue
+		}
+
+		if r == '\'' {
+			inQuote = '\''
+			quoteStartRune = i
+			prefixBeforeQuote = current.String()
+			if !inToken {
+				inToken = true
+				tokenStartRune = i
+			}
+			continue
+		}
+
+		if r == '"' {
+			inQuote = '"'
+			quoteStartRune = i
+			prefixBeforeQuote = current.String()
+			if !inToken {
+				inToken = true
+				tokenStartRune = i
+			}
+			continue
+		}
+
+		if unicode.IsSpace(r) {
+			if inToken {
+				tokens = append(tokens, current.String())
+				current.Reset()
+				inToken = false
+			}
+			continue
+		}
+
+		if !inToken {
+			inToken = true
+			tokenStartRune = i
+		}
+		current.WriteRune(r)
+	}
+
+	if escaped {
+		current.WriteRune('\\')
+	}
+
+	if !inToken {
+		if len(tokens) == 0 {
+			return completionCursor{
+				cmd:       "",
+				argIndex:  0,
+				isCommand: true,
+				partial:   "",
+				quoteChar: 0,
+				head:      content,
+			}
+		}
+		return completionCursor{
+			cmd:       tokens[0],
+			argIndex:  len(tokens),
+			isCommand: false,
+			partial:   "",
+			quoteChar: 0,
+			head:      content,
+		}
+	}
+
+	if len(tokens) == 0 {
+		return completionCursor{
+			cmd:       current.String(),
+			argIndex:  0,
+			isCommand: true,
+			partial:   current.String(),
+			quoteChar: inQuote,
+			head:      string(runes[:tokenStartRune]),
+		}
+	}
+
+	cmd := tokens[0]
+	argIndex := len(tokens)
+	partial := current.String()
+	head := ""
+	if inQuote != 0 && quoteStartRune >= 0 {
+		head = string(runes[:quoteStartRune+1])
+	} else {
+		head = string(runes[:tokenStartRune])
+		prefixBeforeQuote = ""
+	}
+
+	return completionCursor{
+		cmd:               cmd,
+		argIndex:          argIndex,
+		isCommand:         false,
+		partial:           partial,
+		quoteChar:         inQuote,
+		head:              head,
+		prefixBeforeQuote: prefixBeforeQuote,
+	}
+}
+
+// escapeShellArg 在无引号模式下对路径中的空格和特殊字符进行转义
+func escapeShellArg(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case ' ':
+			b.WriteString(`\ `)
+		case '\t':
+			b.WriteString(`\` + "\t")
+		case '\'':
+			b.WriteString(`\'`)
+		case '"':
+			b.WriteString(`\"`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// formatCompletionCandidate 格式化补全候选词
+// 1. 无引号时转义空格等字符；
+// 2. 引号内时不转义空格，若为普通文件自动补全闭合引号，目录则保留以供继续补全下一级。
+func formatCompletionCandidate(candidate string, quoteChar rune, isDir bool) string {
+	switch quoteChar {
+	case '\'':
+		if isDir {
+			return candidate
+		}
+		return candidate + "'"
+	case '"':
+		if isDir {
+			return candidate
+		}
+		return candidate + `"`
+	default:
+		return escapeShellArg(candidate)
+	}
+}
+
 // wordCompleter 计算光标位置对应的命令或路径补全候选
 func (s *Shell) wordCompleter(ctx context.Context, line string, pos int) (head string, completions []string, tail string, err error) {
-	// line editor 传入的 pos 是 rune 位置，需要转换为字节位置来切分字符串
 	runes := []rune(line)
 	if pos < 0 || pos > len(runes) {
 		return "", nil, "", fmt.Errorf("completion cursor out of range")
@@ -21,41 +248,51 @@ func (s *Shell) wordCompleter(ctx context.Context, line string, pos int) (head s
 	content := string(runes[:pos])
 	tail = string(runes[pos:])
 
-	// 场景1：补全命令名（行首无空格）
-	if !strings.Contains(content, " ") {
+	cursor := parseCompletionCursor(content)
+
+	if cursor.isCommand {
 		cmds := []string{"exit", "quit", "bye", "help", "?", "pwd", "lpwd", "ls", "ll", "lls", "lll", "cd", "lcd", "mkdir", "lmkdir", "rm", "lrm", "cp", "lcp", "mv", "lmv", "get", "put", "exec", "lexec", "shell", "lshell"}
 		for _, c := range cmds {
-			if strings.HasPrefix(c, content) {
+			if strings.HasPrefix(c, cursor.partial) {
 				completions = append(completions, c)
 			}
 		}
-		return "", completions, tail, nil
+		return cursor.head, completions, tail, nil
 	}
 
-	// 场景2：补全命令参数
-	parts := strings.Fields(content)
-	if len(parts) < 1 {
-		return line, nil, "", nil
+	var rawCandidates []string
+	switch cursor.cmd {
+	case "cd", "ls", "ll", "mkdir", "rm", "cp", "mv":
+		rawCandidates, err = s.completeRemotePath(ctx, cursor.partial)
+	case "lcd", "lls", "lll", "lmkdir", "lrm", "lcp", "lmv":
+		rawCandidates, err = s.completeLocalPath(cursor.partial)
+	case "put":
+		if cursor.argIndex <= 1 {
+			rawCandidates, err = s.completeLocalPath(cursor.partial)
+		} else {
+			rawCandidates, err = s.completeRemotePath(ctx, cursor.partial)
+		}
+	case "get":
+		if cursor.argIndex <= 1 {
+			rawCandidates, err = s.completeRemotePath(ctx, cursor.partial)
+		} else {
+			rawCandidates, err = s.completeLocalPath(cursor.partial)
+		}
 	}
 
-	cmd := parts[0]
-	var partial string
-	if !strings.HasSuffix(content, " ") {
-		partial = parts[len(parts)-1]
+	if err != nil {
+		return cursor.head, nil, tail, err
 	}
 
-	// 计算出不参与本次补全的前缀部分
-	prefixLen := len(content) - len(partial)
-	head = content[:prefixLen]
-
-	switch cmd {
-	case "cd", "ls", "ll", "get", "mkdir", "rm", "cp", "mv":
-		completions, err = s.completeRemotePath(ctx, partial)
-	case "lcd", "lls", "lll", "put", "lmkdir", "lrm", "lcp", "lmv":
-		completions, err = s.completeLocalPath(partial)
+	for _, cand := range rawCandidates {
+		if cursor.prefixBeforeQuote != "" {
+			cand = strings.TrimPrefix(cand, cursor.prefixBeforeQuote)
+		}
+		isDir := strings.HasSuffix(cand, "/") || strings.HasSuffix(cand, string(filepath.Separator))
+		completions = append(completions, formatCompletionCandidate(cand, cursor.quoteChar, isDir))
 	}
 
-	return head, completions, tail, err
+	return cursor.head, completions, tail, nil
 }
 
 // completeRemotePath 补全远程路径
@@ -143,7 +380,7 @@ func (s *Shell) completeLocalPath(partial string) ([]string, error) {
 		if strings.HasPrefix(entry.Name(), prefix) {
 			name := entry.Name()
 			if entry.IsDir() {
-				name += sep
+				name += "/"
 			}
 			if dir != "." {
 				candidates = append(candidates, dir+name)

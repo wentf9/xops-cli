@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/schollz/progressbar/v3"
 	"github.com/wentf9/xops-cli/core/sftp"
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/i18n"
@@ -1481,5 +1482,407 @@ func TestReportCommandInterruptionKeepsCleanupFailuresFatal(t *testing.T) {
 	shell.batch = true
 	if got := shell.reportCommandError(ErrPromptInterrupted); !errors.Is(got, ErrPromptInterrupted) {
 		t.Fatal("batch error swallowed")
+	}
+}
+
+func TestProgressBar_ExitDoesNotFillTo100Percent(t *testing.T) {
+	var buf bytes.Buffer
+	totalSize := int64(1000)
+	bar := progressbar.NewOptions64(
+		totalSize,
+		progressbar.OptionSetDescription("Uploading"),
+		progressbar.OptionSetWriter(&buf),
+		progressbar.OptionEnableColorCodes(false),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionShowCount(),
+		progressbar.OptionSetWidth(30),
+		progressbar.OptionSetRenderBlankState(true),
+		progressbar.OptionOnCompletion(func() {
+			buf.WriteString("\n")
+		}),
+	)
+
+	// Simulate partial upload of 200 bytes out of 1000
+	if err := bar.Add64(200); err != nil {
+		t.Fatalf("bar.Add64 failed: %v", err)
+	}
+
+	// Calling Exit() on error
+	if err := bar.Exit(); err != nil {
+		t.Fatalf("bar.Exit failed: %v", err)
+	}
+
+	state := bar.State()
+	if state.CurrentPercent == 1.0 {
+		t.Errorf("expected Exit() not to fill bar to 100%%, got %v", state.CurrentPercent)
+	}
+	if state.CurrentBytes != 200 {
+		t.Errorf("expected CurrentBytes = 200, got %v", state.CurrentBytes)
+	}
+	output := buf.String()
+	if strings.Contains(output, "100%") {
+		t.Errorf("expected output not to contain '100%%', got %q", output)
+	}
+	if !strings.Contains(output, "200 B/1.0 kB") {
+		t.Errorf("expected output to contain '200 B/1.0 kB', got %q", output)
+	}
+}
+
+func TestCheckRemoteStorageSpace_NilClientNoPanic(t *testing.T) {
+	initTestI18n(t)
+	var stdout bytes.Buffer
+	s := &Shell{
+		stdout:   &stdout,
+		stderr:   &bytes.Buffer{},
+		cwd:      "/remote",
+		localCwd: t.TempDir(),
+	}
+
+	s.checkRemoteStorageSpace(t.Context(), nil, "/remote/path", 1000, false)
+	if stdout.Len() != 0 {
+		t.Errorf("expected no output when client is nil, got %q", stdout.String())
+	}
+}
+
+func TestTruncateAndPad(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		maxLen   int
+		expected string
+	}{
+		{
+			name:     "short string padded",
+			input:    "short.txt",
+			maxLen:   20,
+			expected: "short.txt           ",
+		},
+		{
+			name:     "exact length",
+			input:    "12345678901234567890",
+			maxLen:   20,
+			expected: "12345678901234567890",
+		},
+		{
+			name:     "long filename truncated preserving suffix",
+			input:    "a_very_long_file_name_for_testing_purposes.tar.gz",
+			maxLen:   20,
+			expected: "a_very_long_...ar.gz",
+		},
+		{
+			name:     "unicode filename padded",
+			input:    "松雀 By_Makise.png",
+			maxLen:   20,
+			expected: "松雀 By_Makise.png    ",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := truncateAndPad(tc.input, tc.maxLen)
+			if got != tc.expected {
+				t.Errorf("expected %q, got %q", tc.expected, got)
+			}
+			if len([]rune(got)) != tc.maxLen {
+				t.Errorf("expected rune length %d, got %d", tc.maxLen, len([]rune(got)))
+			}
+		})
+	}
+}
+
+func TestRenderFileDetail(t *testing.T) {
+	// Normal 50%
+	line := renderFileDetail("short.txt", 500, 1000)
+	if !strings.HasPrefix(line, "File: short.txt") {
+		t.Errorf("expected prefix 'File: short.txt', got %q", line)
+	}
+	if !strings.Contains(line, " 50%") {
+		t.Errorf("expected ' 50%%', got %q", line)
+	}
+	if !strings.Contains(line, "|██████      |") {
+		t.Errorf("expected mini bar '|██████      |', got %q", line)
+	}
+	if !strings.Contains(line, "[ 500 B / 1000 B ]") {
+		t.Errorf("expected '[ 500 B / 1000 B ]', got %q", line)
+	}
+
+	// 0-byte file (100%)
+	emptyLine := renderFileDetail("empty.txt", 0, 0)
+	if !strings.Contains(emptyLine, "100%") {
+		t.Errorf("expected empty file to show 100%%, got %q", emptyLine)
+	}
+	if !strings.Contains(emptyLine, "[ 0 B / 0 B ]") {
+		t.Errorf("expected '[ 0 B / 0 B ]', got %q", emptyLine)
+	}
+
+	// Large file 2 GB of 4 GB
+	largeLine := renderFileDetail("big.iso", 2*1024*1024*1024, 4*1024*1024*1024)
+	if !strings.Contains(largeLine, "[ 2.0 GB / 4.0 GB ]") {
+		t.Errorf("expected '[ 2.0 GB / 4.0 GB ]', got %q", largeLine)
+	}
+}
+
+func TestDirectoryProgressTracker(t *testing.T) {
+	var buf bytes.Buffer
+	bar := progressbar.NewOptions64(
+		10000,
+		progressbar.OptionSetDescription("Total"),
+		progressbar.OptionSetWriter(&buf),
+		progressbar.OptionSetMaxDetailRow(1),
+		progressbar.OptionThrottle(0),
+	)
+
+	tracker := newDirectoryProgressTracker(bar)
+	tracker.throttle = 0 // Disable throttle for deterministic test
+
+	if tracker.hasRenderedDetail() {
+		t.Error("expected hasRenderedDetail to be false initially")
+	}
+
+	// 1. Progress on file1
+	tracker.onFileProgress(sftp.FileTransferProgress{
+		Path:        "/dir/file1.txt",
+		Size:        1000,
+		Transferred: 500,
+		Increment:   500,
+	})
+
+	if !tracker.hasRenderedDetail() {
+		t.Error("expected hasRenderedDetail to be true after progress event")
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "file1.txt") {
+		t.Errorf("expected detail to contain file1.txt, got %q", output)
+	}
+
+	// 2. Complete file1
+	tracker.onFileProgress(sftp.FileTransferProgress{
+		Path:        "/dir/file1.txt",
+		Size:        1000,
+		Transferred: 1000,
+		Increment:   500,
+	})
+
+	// 3. Switch to file2
+	tracker.onFileProgress(sftp.FileTransferProgress{
+		Path:        "/dir/file2.txt",
+		Size:        2000,
+		Transferred: 600,
+		Increment:   600,
+	})
+
+	output = buf.String()
+	if !strings.Contains(output, "file2.txt") {
+		t.Errorf("expected detail to switch to file2.txt, got %q", output)
+	}
+
+	// 4. Complete file2
+	tracker.onFileProgress(sftp.FileTransferProgress{
+		Path:        "/dir/file2.txt",
+		Size:        2000,
+		Transferred: 2000,
+		Increment:   1400,
+	})
+
+	// 5. Handle 0-byte file without locking focus
+	tracker.onFileProgress(sftp.FileTransferProgress{
+		Path:        "/dir/empty.txt",
+		Size:        0,
+		Transferred: 0,
+		Increment:   0,
+	})
+	if tracker.currentFile != "" {
+		t.Errorf("expected 0-byte file to release currentFile immediately, got %q", tracker.currentFile)
+	}
+
+	// 6. Subsequent file should immediately take focus without waiting for timeout
+	tracker.onFileProgress(sftp.FileTransferProgress{
+		Path:        "/dir/file3.txt",
+		Size:        500,
+		Transferred: 250,
+		Increment:   250,
+	})
+	if tracker.currentFile != "/dir/file3.txt" {
+		t.Errorf("expected file3 to acquire focus immediately, got %q", tracker.currentFile)
+	}
+}
+
+func TestNewTransferProgressBar_ZeroTotalSize(t *testing.T) {
+	s := &Shell{stdout: &bytes.Buffer{}}
+	totalSize := int64(0)
+	bar, tracker := s.newTransferProgressBar("Uploading", totalSize, false)
+	if bar.IsFinished() {
+		t.Error("expected progressbar with totalSize=0 not to be finished at initialization")
+	}
+	if tracker != nil {
+		t.Error("expected tracker to be nil for single file")
+	}
+
+	// Verify directory with totalSize=0 does not create tracker
+	barDir, trackerDir := s.newTransferProgressBar("Uploading", 0, true)
+	if trackerDir != nil {
+		t.Error("expected tracker to be nil for directory with totalSize=0")
+	}
+	if barDir.IsFinished() {
+		t.Error("expected progressbar with totalSize=0 not to be finished at initialization")
+	}
+
+	// Verify directory with totalSize>0 creates tracker
+	_, trackerDirWithTotal := s.newTransferProgressBar("Uploading", 1000, true)
+	if trackerDirWithTotal == nil {
+		t.Error("expected tracker to be non-nil for directory with totalSize>0")
+	}
+
+	// Verify callback with n=0 does not record display error
+	callback := func(n int64) {
+		if totalSize > 0 && n > 0 {
+			if err := bar.Add64(n); err != nil {
+				s.recordDisplayError(err)
+			}
+		}
+	}
+	callback(0)
+	if s.displayErr != nil {
+		t.Fatalf("expected no display error on callback(0), got %v", s.displayErr)
+	}
+
+	// Verify finish logic for totalSize=0 does not record display error
+	if tracker != nil && tracker.hasRenderedDetail() {
+		s.fprintStdout("\n")
+	}
+	if s.displayErr != nil {
+		t.Fatalf("expected no display error for totalSize=0, got %v", s.displayErr)
+	}
+}
+
+func TestShellRun_QuotedAndEscapedCommands(t *testing.T) {
+	initTestI18n(t)
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("failed to create pipe: %v", err)
+	}
+	defer closeTestResource(t, r)
+	defer closeTestResource(t, w)
+
+	tempDir := t.TempDir()
+	t.Chdir(tempDir)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	s := &Shell{
+		cwd:      "/remote",
+		localCwd: tempDir,
+		stdin:    r,
+		stdout:   &stdout,
+		stderr:   &stderr,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- s.Run(ctx)
+	}()
+
+	commands := []string{
+		"lmkdir 'Single Quoted Dir'\n",
+		`lmkdir "Double Quoted Dir"` + "\n",
+		`lmkdir Escaped\ Space\ Dir` + "\n",
+		"lcd 'Single Quoted Dir'\n",
+		"lpwd\n",
+		"exit\n",
+	}
+
+	for _, cmd := range commands {
+		if _, err := w.WriteString(cmd); err != nil {
+			t.Fatalf("write command %q failed: %v", cmd, err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("s.Run() returned error: %v, stderr: %s", err, stderr.String())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("s.Run() timed out waiting for exit")
+	}
+
+	// 验证三个带空格目录均成功被 lmkdir 创建
+	for _, expectedDir := range []string{"Single Quoted Dir", "Double Quoted Dir", "Escaped Space Dir"} {
+		info, err := os.Stat(filepath.Join(tempDir, expectedDir))
+		if err != nil || !info.IsDir() {
+			t.Errorf("expected directory %q to exist, err: %v", expectedDir, err)
+		}
+	}
+
+	// 验证 lcd 成功切换进 'Single Quoted Dir'
+	if !strings.Contains(stdout.String(), filepath.Join(tempDir, "Single Quoted Dir")) {
+		t.Errorf("stdout = %q, expected to contain lpwd output for 'Single Quoted Dir'", stdout.String())
+	}
+}
+
+func TestShellRun_PassthroughTrailingBackslash(t *testing.T) {
+	initTestI18n(t)
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("failed to create pipe: %v", err)
+	}
+	defer closeTestResource(t, r)
+	defer closeTestResource(t, w)
+
+	tempDir := t.TempDir()
+	t.Chdir(tempDir)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	s := &Shell{
+		cwd:      "/remote",
+		localCwd: tempDir,
+		stdin:    r,
+		stdout:   &stdout,
+		stderr:   &stderr,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- s.Run(ctx)
+	}()
+
+	// 1. lexec 带末尾反斜杠，不应被 splitCommandLine 作为 trailing backslash 拦截
+	// 2. put 带末尾反斜杠，应正确被 splitCommandLine 拦截并报错
+	// 3. exit
+	commands := []string{
+		"lexec echo trailing\\\n",
+		"put test\\\n",
+		"exit\n",
+	}
+
+	for _, cmd := range commands {
+		if _, err := w.WriteString(cmd); err != nil {
+			t.Fatalf("write command %q failed: %v", cmd, err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("s.Run() returned error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("s.Run() timed out waiting for exit")
+	}
+
+	stderrOutput := stderr.String()
+	// put test\ 应当报 trailing backslash
+	if !strings.Contains(stderrOutput, "trailing backslash") {
+		t.Errorf("expected stderr to contain 'trailing backslash' for put command, got: %q", stderrOutput)
 	}
 }

@@ -709,9 +709,27 @@ func (s *Shell) Run(ctx context.Context) (runErr error) {
 			continue
 		}
 
-		args := strings.Fields(input)
-		cmd := args[0]
-		params := args[1:]
+		var cmd string
+		var params []string
+		if passCmd, rawArgs, ok := parsePassthroughCommand(input); ok {
+			cmd = passCmd
+			if rawArgs != "" {
+				params = []string{rawArgs}
+			}
+		} else {
+			args, err := splitCommandLine(input)
+			if err != nil {
+				if reportErr := s.reportCommandError(err); reportErr != nil {
+					return reportErr
+				}
+				continue
+			}
+			if len(args) == 0 {
+				continue
+			}
+			cmd = args[0]
+			params = args[1:]
+		}
 
 		// Pure-local and lifecycle commands do not need the remote SFTP client;
 		// skip the health-check probe to avoid blocking exit/local ops on a
@@ -1366,6 +1384,8 @@ func (s *Shell) handleGet(ctx context.Context, args []string) error {
 }
 
 // getSingle 下载单个远程文件/目录到本地，含覆盖确认与进度条
+//
+//nolint:gocyclo
 func (s *Shell) getSingle(ctx context.Context, remote, local string) error {
 	cli, release, err := s.acquireClient(ctx)
 	if err != nil {
@@ -1409,7 +1429,7 @@ func (s *Shell) getSingle(ctx context.Context, remote, local string) error {
 	var totalSize int64
 	description := "Downloading"
 	if info.IsDir() {
-		description = "Downloading (Dir)"
+		description = "Total"
 		walkErr := cli.Do(ctx, func(client *pkgsftp.Client) error {
 			walker := client.Walk(remote)
 			for walker.Step() {
@@ -1429,22 +1449,16 @@ func (s *Shell) getSingle(ctx context.Context, remote, local string) error {
 		totalSize = info.Size()
 	}
 
-	bar := progressbar.NewOptions64(
-		totalSize,
-		progressbar.OptionSetDescription(description),
-		progressbar.OptionSetWriter(s.stdout),
-		progressbar.OptionEnableColorCodes(true),
-		progressbar.OptionShowBytes(true),
-		progressbar.OptionSetWidth(30),
-		progressbar.OptionThrottle(65*time.Millisecond),
-		progressbar.OptionOnCompletion(func() {
-			s.fprintStdout("\n")
-		}),
-	)
+	bar, tracker := s.newTransferProgressBar(description, totalSize, info.IsDir())
 	callback := func(n int64) {
-		if err := bar.Add64(n); err != nil {
-			s.recordDisplayError(fmt.Errorf("update download progress failed: %w", err))
+		if totalSize > 0 && n > 0 {
+			if err := bar.Add64(n); err != nil {
+				s.recordDisplayError(fmt.Errorf("update download progress failed: %w", err))
+			}
 		}
+	}
+	if info.IsDir() && tracker != nil {
+		clientToUse = clientToUse.WithFileProgress(tracker.onFileProgress)
 	}
 
 	var dlErr error
@@ -1453,14 +1467,23 @@ func (s *Shell) getSingle(ctx context.Context, remote, local string) error {
 	} else {
 		dlErr = clientToUse.DownloadFile(ctx, remote, localDest, info.Size(), info.Mode(), callback)
 	}
-	if finishErr := bar.Finish(); finishErr != nil {
-		s.recordDisplayError(fmt.Errorf("finish download progress failed: %w", finishErr))
-	}
 	if dlErr != nil {
+		if totalSize > 0 {
+			_ = bar.Exit()
+		}
+		if tracker != nil && tracker.hasRenderedDetail() {
+			s.fprintStdout("\n")
+		}
 		return fmt.Errorf("download failed: %w", dlErr)
-	} else {
-		s.fprintlnStdout(i18n.T("sftp_shell_download_done"))
 	}
+	if totalSize > 0 {
+		if finishErr := bar.Finish(); finishErr != nil {
+			s.recordDisplayError(fmt.Errorf("finish download progress failed: %w", finishErr))
+		}
+	} else if tracker != nil && tracker.hasRenderedDetail() {
+		s.fprintStdout("\n")
+	}
+	s.fprintlnStdout(i18n.T("sftp_shell_download_done"))
 	return nil
 }
 
@@ -1535,6 +1558,8 @@ func (s *Shell) handlePut(ctx context.Context, args []string) error {
 }
 
 // putSingle 上传单个本地文件/目录到远程，含覆盖确认与进度条
+//
+//nolint:gocyclo
 func (s *Shell) putSingle(ctx context.Context, local, remote string) error {
 	cli, release, err := s.acquireClient(ctx)
 	if err != nil {
@@ -1575,6 +1600,12 @@ func (s *Shell) putSingle(ctx context.Context, local, remote string) error {
 
 	// 计算本地文件大小以显示准确的进度条
 	var totalSize int64
+	localStat, localStatErr := os.Stat(local)
+	if localStatErr != nil {
+		return fmt.Errorf("upload failed: %w", localStatErr)
+	}
+	isDir := localStat.IsDir()
+
 	walkErr := filepath.Walk(local, func(_ string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -1588,34 +1619,236 @@ func (s *Shell) putSingle(ctx context.Context, local, remote string) error {
 		return fmt.Errorf("upload failed: %w", walkErr)
 	}
 
-	bar := progressbar.NewOptions64(
-		totalSize,
-		progressbar.OptionSetDescription("Uploading"),
-		progressbar.OptionSetWriter(s.stdout), // Use the shell output stream
-		progressbar.OptionEnableColorCodes(true),
-		progressbar.OptionShowBytes(true),
-		progressbar.OptionSetWidth(30),
-		progressbar.OptionThrottle(65*time.Millisecond),
-		progressbar.OptionOnCompletion(func() {
-			s.fprintStdout("\n")
-		}),
-	)
+	s.checkRemoteStorageSpace(ctx, clientToUse, remote, totalSize, destinationExists)
+
+	description := "Uploading"
+	if isDir {
+		description = "Total"
+	}
+
+	bar, tracker := s.newTransferProgressBar(description, totalSize, isDir)
 	callback := func(n int64) {
-		if err := bar.Add64(n); err != nil {
-			s.recordDisplayError(fmt.Errorf("update upload progress failed: %w", err))
+		if totalSize > 0 && n > 0 {
+			if err := bar.Add64(n); err != nil {
+				s.recordDisplayError(fmt.Errorf("update upload progress failed: %w", err))
+			}
 		}
+	}
+	if isDir && tracker != nil {
+		clientToUse = clientToUse.WithFileProgress(tracker.onFileProgress)
 	}
 
 	uploadErr := clientToUse.Upload(ctx, local, remote, callback)
-	if finishErr := bar.Finish(); finishErr != nil {
-		s.recordDisplayError(fmt.Errorf("finish upload progress failed: %w", finishErr))
-	}
 	if uploadErr != nil {
+		if totalSize > 0 {
+			_ = bar.Exit()
+		}
+		if tracker != nil && tracker.hasRenderedDetail() {
+			s.fprintStdout("\n")
+		}
 		return fmt.Errorf("upload failed: %w", uploadErr)
-	} else {
-		s.fprintlnStdout(i18n.T("sftp_shell_upload_done"))
 	}
+	if totalSize > 0 {
+		if finishErr := bar.Finish(); finishErr != nil {
+			s.recordDisplayError(fmt.Errorf("finish upload progress failed: %w", finishErr))
+		}
+	} else if tracker != nil && tracker.hasRenderedDetail() {
+		s.fprintStdout("\n")
+	}
+	s.fprintlnStdout(i18n.T("sftp_shell_upload_done"))
 	return nil
+}
+
+func isOpUnsupported(err error) bool {
+	if errors.Is(err, pkgsftp.ErrSSHFxOpUnsupported) {
+		return true
+	}
+	var statusErr *pkgsftp.StatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.FxCode() == pkgsftp.ErrSSHFxOpUnsupported
+	}
+	return false
+}
+
+func (s *Shell) checkRemoteStorageSpace(ctx context.Context, client *sftp.Client, remote string, totalSize int64, destinationExists bool) {
+	if client == nil {
+		return
+	}
+	var vfs *pkgsftp.StatVFS
+	var vfsErr error
+	target := remote
+	if !destinationExists {
+		target = path.Dir(remote)
+	}
+	for target != "" {
+		if ctx != nil && ctx.Err() != nil {
+			break
+		}
+		vfs, vfsErr = client.StatVFS(ctx, target)
+		if vfsErr == nil && vfs != nil {
+			break
+		}
+		if isOpUnsupported(vfsErr) {
+			break
+		}
+		parent := path.Dir(target)
+		if parent == target {
+			break
+		}
+		target = parent
+	}
+	if vfs == nil && s.cwd != "" && (ctx == nil || ctx.Err() == nil) && !isOpUnsupported(vfsErr) {
+		vfs, _ = client.StatVFS(ctx, s.cwd)
+	}
+	if vfs != nil {
+		avail := sftp.AvailableStorageSpace(vfs)
+		total := sftp.TotalStorageSpace(vfs)
+		if avail == 0 || (totalSize > 0 && avail < uint64(totalSize)) {
+			s.fprintlnStdout(i18n.Tf("sftp_shell_storage_insufficient_warning", map[string]any{
+				"Free":  formatBytes(int64(avail)),
+				"Total": formatBytes(int64(total)),
+				"Need":  formatBytes(totalSize),
+			}))
+		}
+	}
+}
+
+func (s *Shell) newTransferProgressBar(description string, totalSize int64, isDir bool) (*progressbar.ProgressBar, *directoryProgressTracker) {
+	opts := []progressbar.Option{
+		progressbar.OptionSetDescription(description),
+		progressbar.OptionSetWriter(s.stdout),
+		progressbar.OptionEnableColorCodes(true),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionShowCount(),
+		progressbar.OptionSetWidth(30),
+		progressbar.OptionThrottle(65 * time.Millisecond),
+		progressbar.OptionSetRenderBlankState(totalSize > 0),
+		progressbar.OptionOnCompletion(func() {
+			s.fprintStdout("\n")
+		}),
+	}
+	if isDir && totalSize > 0 {
+		opts = append(opts, progressbar.OptionSetMaxDetailRow(1))
+	}
+
+	bar := progressbar.NewOptions64(totalSize, opts...)
+	var tracker *directoryProgressTracker
+	if isDir && totalSize > 0 {
+		tracker = newDirectoryProgressTracker(bar)
+	}
+	return bar, tracker
+}
+
+type directoryProgressTracker struct {
+	mu          sync.Mutex
+	bar         *progressbar.ProgressBar
+	currentFile string
+	lastRender  time.Time
+	throttle    time.Duration
+	hasRendered bool
+}
+
+func newDirectoryProgressTracker(bar *progressbar.ProgressBar) *directoryProgressTracker {
+	return &directoryProgressTracker{
+		bar:      bar,
+		throttle: 65 * time.Millisecond,
+	}
+}
+
+func (t *directoryProgressTracker) hasRenderedDetail() bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.hasRendered
+}
+
+func (t *directoryProgressTracker) onFileProgress(p sftp.FileTransferProgress) {
+	if t == nil || t.bar == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	now := time.Now()
+	filename := filepath.Base(filepath.ToSlash(p.Path))
+
+	if t.currentFile == "" {
+		t.currentFile = p.Path
+	}
+
+	if t.currentFile == p.Path {
+		isDone := (p.Size > 0 && p.Transferred >= p.Size) || (p.Size == 0 && p.Transferred == 0)
+		if isDone || now.Sub(t.lastRender) >= t.throttle {
+			line := renderFileDetail(filename, p.Transferred, p.Size)
+			if err := t.bar.AddDetail(line); err == nil {
+				t.hasRendered = true
+			}
+			t.lastRender = now
+		}
+		if isDone {
+			t.currentFile = ""
+		}
+	} else if now.Sub(t.lastRender) > time.Second {
+		t.currentFile = p.Path
+		line := renderFileDetail(filename, p.Transferred, p.Size)
+		if err := t.bar.AddDetail(line); err == nil {
+			t.hasRendered = true
+		}
+		t.lastRender = now
+	}
+}
+
+func truncateAndPad(s string, maxLen int) string {
+	runes := []rune(s)
+	if len(runes) > maxLen {
+		if maxLen <= 3 {
+			return string(runes[:maxLen])
+		}
+		prefixLen := maxLen - 3 - 5
+		if prefixLen < 1 {
+			prefixLen = 1
+		}
+		suffixLen := maxLen - 3 - prefixLen
+		return string(runes[:prefixLen]) + "..." + string(runes[len(runes)-suffixLen:])
+	}
+	padding := maxLen - len(runes)
+	if padding > 0 {
+		return s + strings.Repeat(" ", padding)
+	}
+	return s
+}
+
+func renderFileDetail(name string, transferred, size int64) string {
+	base := filepath.Base(filepath.ToSlash(name))
+	namePart := truncateAndPad(base, 20)
+
+	var pct float64
+	if size > 0 {
+		pct = float64(transferred) / float64(size) * 100
+		if pct > 100 {
+			pct = 100
+		} else if pct < 0 {
+			pct = 0
+		}
+	} else {
+		pct = 100
+	}
+	pctStr := fmt.Sprintf("%3.0f%%", pct)
+
+	const barWidth = 12
+	filled := int(float64(barWidth) * (pct / 100.0))
+	if filled > barWidth {
+		filled = barWidth
+	} else if filled < 0 {
+		filled = 0
+	}
+	barStr := "|" + strings.Repeat("█", filled) + strings.Repeat(" ", barWidth-filled) + "|"
+
+	bytesStr := fmt.Sprintf("[ %s / %s ]", formatBytes(transferred), formatBytes(size))
+
+	return fmt.Sprintf("File: %s %s %s %s", namePart, pctStr, barStr, bytesStr)
 }
 
 func (s *Shell) handleMkdir(ctx context.Context, args []string) error {

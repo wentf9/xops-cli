@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -336,5 +337,39 @@ func TestClient_RemoteCopy_RecursiveFollowsDestinationFileSymlink(t *testing.T) 
 	}
 	if string(data) != "new" {
 		t.Fatalf("expected link target to receive copied content, got %q", data)
+	}
+}
+
+func TestClient_UploadFile_PreservesReadOnlyPermissions(t *testing.T) {
+	handlers := pkgsftp.InMemHandler()
+	recordingCmder := &setstatRecordingFileCmder{delegate: handlers.FileCmd}
+	handlers.FileCmd = recordingCmder
+	client := newTestSFTPClientWithHandlers(t, handlers)
+
+	localPath := filepath.Join(t.TempDir(), "readonly.txt")
+	content := []byte("readonly data")
+	if err := os.WriteFile(localPath, content, 0o555); err != nil {
+		t.Fatalf("write local file failed: %v", err)
+	}
+
+	remotePath := "/readonly.txt"
+	if err := client.UploadFile(t.Context(), localPath, remotePath, int64(len(content)), 0o555, nil); err != nil {
+		t.Fatalf("UploadFile failed: %v", err)
+	}
+
+	tempCalls := recordingCmder.getCallsForPath(remotePath + client.config.TempSuffix)
+	if len(tempCalls) < 2 {
+		t.Fatalf("expected at least 2 setstat calls on temporary file, got %d", len(tempCalls))
+	}
+	if got := tempCalls[0].Perm(); got&0o200 == 0 {
+		t.Fatalf("expected temporary file to have write permission during upload, got %v", got)
+	}
+	if got := tempCalls[len(tempCalls)-1].Perm(); got != 0o555 {
+		t.Fatalf("expected temporary file final mode 0555, got %v", got)
+	}
+
+	dstCalls := recordingCmder.getCallsForPath(remotePath)
+	if len(dstCalls) != 0 {
+		t.Fatalf("expected no redundant setstat calls on final remote destination, got %d", len(dstCalls))
 	}
 }
