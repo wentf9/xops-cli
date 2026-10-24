@@ -1,4 +1,4 @@
-package ssh
+package tui
 
 import (
 	"context"
@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/wentf9/xops-cli/core/ssh"
 )
 
 // DiskMetric 存储单个分区的指标
@@ -85,7 +87,7 @@ type procTick struct {
 type MetricsCollector struct {
 	mu         sync.Mutex
 	nextMu     sync.Mutex
-	client     *Client
+	client     *ssh.Client
 	decoder    *json.Decoder
 	stream     io.ReadCloser
 	lastTicks  *CPUTicks
@@ -97,7 +99,7 @@ type MetricsCollector struct {
 	generation uint64
 }
 
-func NewMetricsCollector(c *Client) *MetricsCollector {
+func NewMetricsCollector(c *ssh.Client) *MetricsCollector {
 	return &MetricsCollector{
 		client:    c,
 		lastProcs: make(map[int]procTick),
@@ -124,8 +126,8 @@ func (mc *MetricsCollector) Start(ctx context.Context) error {
 
 	// 内置监控探针要求 Linux/POSIX 环境
 	if execCfg := mc.client.Execution(); execCfg != nil {
-		if execCfg.LaunchDialect == LaunchCmd || execCfg.LaunchDialect == LaunchPowerShell ||
-			execCfg.Interpreter == InterpreterCmd || execCfg.Interpreter == InterpreterPowerShell {
+		if execCfg.LaunchDialect == ssh.LaunchCmd || execCfg.LaunchDialect == ssh.LaunchPowerShell ||
+			execCfg.Interpreter == ssh.InterpreterCmd || execCfg.Interpreter == ssh.InterpreterPowerShell {
 			mc.finishStart(generation, cancel)
 			return fmt.Errorf("dashboard monitoring requires Linux/POSIX platform, got incompatible execution config")
 		}
@@ -398,6 +400,7 @@ func (mc *MetricsCollector) SortConfig() (string, bool) {
 	defer mc.mu.Unlock()
 	return mc.SortBy, mc.SortAsc
 }
+
 func formatUptime(uptime uint64) string {
 	days := uptime / 86400
 	hours := (uptime % 86400) / 3600

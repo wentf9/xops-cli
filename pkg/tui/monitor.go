@@ -15,7 +15,7 @@ import (
 
 type monitorMsg struct {
 	sessionID int64
-	metrics   *ssh.SystemMetrics
+	metrics   *SystemMetrics
 }
 
 type monitorErrorMsg struct {
@@ -27,8 +27,8 @@ type monitorModel struct {
 	ctx       context.Context
 	nodeID    string
 	sessionID int64
-	collector *ssh.MetricsCollector
-	metrics   *ssh.SystemMetrics
+	collector *MetricsCollector
+	metrics   *SystemMetrics
 	err       error
 	width     int
 	height    int
@@ -41,7 +41,7 @@ func newMonitorModel(ctx context.Context, nodeID string, client *ssh.Client) mon
 		ctx:       ctx,
 		nodeID:    nodeID,
 		sessionID: time.Now().UnixNano(),
-		collector: ssh.NewMetricsCollector(client),
+		collector: NewMetricsCollector(client),
 	}
 }
 

@@ -19,6 +19,12 @@ linters:
   settings:
     gocyclo:
       min-complexity: 20
+  exclusions:
+    rules:
+      - path: "_test\\.go"
+        linters:
+          - errcheck
+        source: "<-"
 
 formatters:
   # Enable specific formatter.

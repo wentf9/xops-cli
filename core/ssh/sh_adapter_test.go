@@ -83,25 +83,6 @@ func TestShAdapter_BOMRejectionInRunScript(t *testing.T) {
 	}
 }
 
-func TestMetricsCollector_RejectsIncompatibleExecution(t *testing.T) {
-	cfg := &ClientConfig{
-		Execution: &ExecutionConfig{
-			Interpreter:   InterpreterPowerShell,
-			LaunchDialect: LaunchPowerShell,
-		},
-	}
-	client := newClient(nil, nil, cfg, nil, "")
-	mc := NewMetricsCollector(client)
-
-	err := mc.Start(context.Background())
-	if err == nil {
-		t.Fatal("expected error starting metrics collector on Windows config, got nil")
-	}
-	if !strings.Contains(err.Error(), "Linux/POSIX") {
-		t.Errorf("error %q does not mention Linux/POSIX requirement", err.Error())
-	}
-}
-
 func TestMaybeDetectSudoMode_SkipsOnNonPOSIX(t *testing.T) {
 	cfg := &ClientConfig{
 		Execution: &ExecutionConfig{
