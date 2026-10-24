@@ -1855,12 +1855,12 @@ func TestShellRun_PassthroughTrailingBackslash(t *testing.T) {
 		runDone <- s.Run(ctx)
 	}()
 
-	// 1. lexec 带末尾反斜杠，不应被 splitCommandLine 作为 trailing backslash 拦截
-	// 2. put 带末尾反斜杠，应正确被 splitCommandLine 拦截并报错
+	// 1. lexec 带末尾反斜杠，不应被拦截
+	// 2. put 带未闭合引号，应正确被 splitCommandLine 拦截并报错 unclosed quote
 	// 3. exit
 	commands := []string{
 		"lexec echo trailing\\\n",
-		"put test\\\n",
+		"put 'unclosed_quote\n",
 		"exit\n",
 	}
 
@@ -1881,8 +1881,7 @@ func TestShellRun_PassthroughTrailingBackslash(t *testing.T) {
 	}
 
 	stderrOutput := stderr.String()
-	// put test\ 应当报 trailing backslash
-	if !strings.Contains(stderrOutput, "trailing backslash") {
-		t.Errorf("expected stderr to contain 'trailing backslash' for put command, got: %q", stderrOutput)
+	if !strings.Contains(stderrOutput, "unclosed quote") {
+		t.Errorf("expected stderr to contain 'unclosed quote', got: %q", stderrOutput)
 	}
 }

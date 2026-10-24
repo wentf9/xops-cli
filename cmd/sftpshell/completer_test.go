@@ -124,14 +124,14 @@ func TestCompleteLocalPath_DirSuffix(t *testing.T) {
 	for _, c := range candidates {
 		if strings.Contains(c, subDirName) {
 			foundDir = true
-			if !strings.HasSuffix(c, "/") {
-				t.Errorf("directory candidate %q must end with '/'", c)
+			if !strings.HasSuffix(c, sep) {
+				t.Errorf("directory candidate %q must end with path separator %q", c, sep)
 			}
 		}
 		if strings.Contains(c, fileName) {
 			foundFile = true
-			if strings.HasSuffix(c, "/") || strings.HasSuffix(c, sep) {
-				t.Errorf("file candidate %q must not end with separator", c)
+			if strings.HasSuffix(c, sep) {
+				t.Errorf("file candidate %q must not end with path separator %q", c, sep)
 			}
 		}
 	}
@@ -202,7 +202,7 @@ func assertContainsCandidate(t *testing.T, candidates []string, expected string)
 	t.Errorf("expected candidate %q in %v", expected, candidates)
 }
 
-func setupSpaceTestEnv(t *testing.T) *Shell {
+func setupSpaceTestEnv(t *testing.T) (*Shell, string) {
 	t.Helper()
 	tmpDir := t.TempDir()
 	dirWithSpace := "Witch of Eclipse"
@@ -215,11 +215,11 @@ func setupSpaceTestEnv(t *testing.T) *Shell {
 	if err := os.WriteFile(filepath.Join(tmpDir, dirWithSpace, "chara test.png"), []byte("test2"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	return &Shell{localCwd: tmpDir}
+	return &Shell{localCwd: tmpDir}, string(filepath.Separator)
 }
 
 func TestWordCompleter_SpaceAndQuoteHandling(t *testing.T) {
-	shell := setupSpaceTestEnv(t)
+	shell, sep := setupSpaceTestEnv(t)
 
 	t.Run("no quotes escapes spaces", func(t *testing.T) {
 		res := shell.completeLine(t.Context(), "put Witch", len("put Witch"))
@@ -229,7 +229,7 @@ func TestWordCompleter_SpaceAndQuoteHandling(t *testing.T) {
 		if res.head != "put " {
 			t.Errorf("head = %q, want %q", res.head, "put ")
 		}
-		assertContainsCandidate(t, res.candidates, `Witch\ of\ Eclipse/`)
+		assertContainsCandidate(t, res.candidates, `Witch\ of\ Eclipse`+sep)
 		assertContainsCandidate(t, res.candidates, `Witch\ of\ Eclipse.png`)
 	})
 
@@ -241,7 +241,7 @@ func TestWordCompleter_SpaceAndQuoteHandling(t *testing.T) {
 		if res.head != `put "` {
 			t.Errorf("head = %q, want %q", res.head, `put "`)
 		}
-		assertContainsCandidate(t, res.candidates, "Witch of Eclipse/")
+		assertContainsCandidate(t, res.candidates, "Witch of Eclipse"+sep)
 		assertContainsCandidate(t, res.candidates, `Witch of Eclipse.png"`)
 	})
 
@@ -253,7 +253,7 @@ func TestWordCompleter_SpaceAndQuoteHandling(t *testing.T) {
 		if res.head != `put '` {
 			t.Errorf("head = %q, want %q", res.head, `put '`)
 		}
-		assertContainsCandidate(t, res.candidates, "Witch of Eclipse/")
+		assertContainsCandidate(t, res.candidates, "Witch of Eclipse"+sep)
 		assertContainsCandidate(t, res.candidates, `Witch of Eclipse.png'`)
 	})
 

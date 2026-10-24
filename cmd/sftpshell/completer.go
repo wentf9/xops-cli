@@ -380,7 +380,7 @@ func (s *Shell) completeLocalPath(partial string) ([]string, error) {
 		if strings.HasPrefix(entry.Name(), prefix) {
 			name := entry.Name()
 			if entry.IsDir() {
-				name += "/"
+				name += sep
 			}
 			if dir != "." {
 				candidates = append(candidates, dir+name)
