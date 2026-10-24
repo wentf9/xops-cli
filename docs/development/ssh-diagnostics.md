@@ -5,6 +5,8 @@
 `xops ssh -v/-vv/-vvv` 复用 SCP 的结构化诊断及受控输出，不切换 SSH 后端、不修改认证候选顺序、主机信任、连接租约、解释器载荷或命令重试策略。
 `--debug` / `--log-level` 仍独立控制内部日志。参数与用户限制见 [SSH 指南](../guide/ssh.md)。
 
+`xops sftp -v/-vv/-vvv` 复用同一个 `sshDiagnostics` 观察器与单一日志级别（只注册 `-v`，没有 `-q`），同时把观察器传给连接器和 `sftp.WithDiagnostics`。SFTP 协议事件通过与 SCP 共享的 `formatSFTPDiagnostic` 渲染为 `debugN: [sftp N] ...`，不带 `scp:` 前缀；SCP 输出保持不变。观察器先于连接器、SFTP 客户端和 shell 的清理注册，因此最后释放。
+
 参考 [ssh(1)](https://man.openbsd.org/ssh.1) 和 OpenSSH portable 的
 [ssh.c](https://github.com/openssh/openssh-portable/blob/master/ssh.c)、
 [clientloop.c](https://github.com/openssh/openssh-portable/blob/master/clientloop.c)。

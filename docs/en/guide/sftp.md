@@ -93,6 +93,11 @@ exit
 - `exec <command>`: Runs a command in the current remote directory (allocating a PTY in interactive mode for terminal programs) and returns to the SFTP prompt.
 - `shell` / `lshell`: Opens a remote or local interactive shell; `lexec`: runs a local command. The SFTP prompt resumes when the child program exits.
 - If the connection drops or command output fails, the session ends with a nonzero status. Reconnect to continue working.
+- **Connection diagnostics**: `-v` / `--verbose` prints SSH/SFTP diagnostics to `stderr` (independent of `--debug`). It uses the same `debug1/2/3:` format as `xops ssh -v`:
+  - `-v`: Shows connection, host key verification, authentication, negotiated algorithms, and SFTP initialization.
+  - `-vv`: Adds SFTP extensions, path requests, and `get`/`put` file operations.
+  - `-vvv`: Adds SFTP packet types, request IDs, lengths, and status codes. File contents and credentials are never printed.
+  - Unlike `xops scp`, `xops sftp` has no `-q`. Diagnostics from tab completion or a running command may interleave with the line being edited; to keep the prompt clean, save them to a file, for example `xops sftp -vv web-01 2>sftp.log`.
 
 ## Interactive input and keyboard shortcuts
 

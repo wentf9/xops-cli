@@ -1154,3 +1154,5 @@ flag_scp_quiet:
 
 flag_scp_verbose:
   other: "Print SSH/SFTP diagnostics (-vv includes file ops, -vvv includes SFTP packets; independent of --debug)"
+flag_sftp_verbose:
+  other: "Print SSH/SFTP diagnostics (-vv includes file ops, -vvv includes SFTP packets; independent of --debug)"
