@@ -49,7 +49,10 @@ func replaceLocalFile(tempPath, localPath string, rename func(string, string) er
 		return promotionErr
 	}
 	if err := os.Remove(backupPath); err != nil {
-		return fmt.Errorf("remove local destination backup %q failed: %w", backupPath, err)
+		_ = os.Chmod(backupPath, 0o600)
+		if retryErr := os.Remove(backupPath); retryErr != nil {
+			return fmt.Errorf("remove local destination backup %q failed: %w", backupPath, err)
+		}
 	}
 	return nil
 }

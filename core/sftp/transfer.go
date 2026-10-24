@@ -12,6 +12,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/sync/errgroup"
@@ -49,7 +50,10 @@ func (c *Client) upload(ctx context.Context, localPath, remotePath string, progr
 		return fmt.Errorf("stat remote destination failed: %w", err)
 	}
 
-	return c.uploadFile(ctx, localPath, remotePath, info.Size(), info.Mode(), progress)
+	if err := c.uploadFile(ctx, localPath, remotePath, info.Size(), info.Mode(), progress); err != nil {
+		return fmt.Errorf("upload %q to %q: %w", localPath, remotePath, err)
+	}
+	return nil
 }
 
 // Download 下载入口：支持文件或目录
@@ -82,17 +86,24 @@ func (c *Client) download(ctx context.Context, remotePath, localPath string, pro
 		return fmt.Errorf("stat local destination failed: %w", err)
 	}
 
-	return c.downloadFile(ctx, remotePath, localPath, info.Size(), info.Mode(), progress)
+	if err := c.downloadFile(ctx, remotePath, localPath, info.Size(), info.Mode(), progress); err != nil {
+		return fmt.Errorf("download %q to %q: %w", remotePath, localPath, err)
+	}
+	return nil
 }
 
 // ================== 单文件多线程分块逻辑 ==================
 
 func (c *Client) UploadFile(ctx context.Context, localPath, remotePath string, size int64, mode os.FileMode, progress ProgressCallback) (retErr error) {
 	return runInterruptibleOperation(ctx, c.interruptTransfers, func() error {
-		return c.uploadFile(ctx, localPath, remotePath, size, mode, progress)
+		if err := c.uploadFile(ctx, localPath, remotePath, size, mode, progress); err != nil {
+			return fmt.Errorf("upload %q to %q: %w", localPath, remotePath, err)
+		}
+		return nil
 	})
 }
 
+//nolint:gocyclo
 func (c *Client) uploadFile(ctx context.Context, localPath, remotePath string, size int64, mode os.FileMode, progress ProgressCallback) (retErr error) {
 	finishDiagnostic := c.observeFileTransfer("upload", localPath, remotePath, size)
 	defer func() { finishDiagnostic(retErr) }()
@@ -115,16 +126,54 @@ func (c *Client) uploadFile(ctx context.Context, localPath, remotePath string, s
 		return fmt.Errorf("local source size changed: expected %d bytes, got %d", size, srcStat.Size())
 	}
 
+	var fileTransferred atomic.Int64
+	var completedEmitted bool
+	if c.fileProgress != nil {
+		if size > 0 {
+			c.fileProgress(FileTransferProgress{
+				Path:        localPath,
+				Size:        size,
+				Transferred: 0,
+				Increment:   0,
+			})
+		}
+		defer func() {
+			if retErr == nil && !completedEmitted {
+				if fileTransferred.Load() < size || size == 0 {
+					c.fileProgress(FileTransferProgress{
+						Path:        localPath,
+						Size:        size,
+						Transferred: size,
+						Increment:   0,
+					})
+				}
+			}
+		}()
+	}
+
 	// 只有在非强制模式下才检查跳过
 	if !c.config.Force {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		skip, skipErr := c.shouldSkipUpload(remotePath, srcStat, progress)
+		skip, skipErr := c.shouldSkipUpload(remotePath, srcStat)
 		if skipErr != nil {
 			return skipErr
 		}
 		if skip {
+			fileTransferred.Store(srcStat.Size())
+			if c.fileProgress != nil {
+				completedEmitted = true
+				c.fileProgress(FileTransferProgress{
+					Path:        localPath,
+					Size:        srcStat.Size(),
+					Transferred: srcStat.Size(),
+					Increment:   srcStat.Size(),
+				})
+			}
+			if progress != nil && srcStat.Size() > 0 {
+				progress(srcStat.Size())
+			}
 			return nil
 		}
 	}
@@ -135,7 +184,7 @@ func (c *Client) uploadFile(ctx context.Context, localPath, remotePath string, s
 	tempPath := remotePath + c.config.TempSuffix
 	startOffset, dstFile, err := c.prepareUploadFile(tempPath, size, srcFile)
 	if err != nil {
-		return fmt.Errorf("prepare remote temporary file failed: %w", err)
+		return c.wrapUploadStorageError(ctx, "prepare remote temporary file", tempPath, size, err)
 	}
 
 	if dstFile != nil {
@@ -147,16 +196,36 @@ func (c *Client) uploadFile(ctx context.Context, localPath, remotePath string, s
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := dstFile.Chmod(mode); err != nil {
+		tempMode := mode | 0o600
+		if err := dstFile.Chmod(tempMode); err != nil {
 			return fmt.Errorf("set remote temporary file mode failed: %w", err)
 		}
 
-		if progress != nil && startOffset > 0 {
-			progress(startOffset)
+		fileCb := progress
+		if c.fileProgress != nil {
+			fileCb = func(n int64) {
+				curr := fileTransferred.Add(n)
+				c.fileProgress(FileTransferProgress{
+					Path:        localPath,
+					Size:        size,
+					Transferred: curr,
+					Increment:   n,
+				})
+				if progress != nil {
+					progress(n)
+				}
+			}
 		}
 
-		if err := c.doUpload(ctx, srcFile, dstFile, startOffset, size, progress); err != nil {
-			return fmt.Errorf("upload file content failed: %w", err)
+		if startOffset > 0 {
+			if fileCb != nil {
+				fileCb(startOffset)
+			}
+		}
+
+		if err := c.doUpload(ctx, srcFile, dstFile, startOffset, size, fileCb); err != nil {
+			remainingNeeded := size - fileTransferred.Load()
+			return c.wrapUploadStorageError(ctx, "upload file content", tempPath, remainingNeeded, err)
 		}
 		if err := dstFile.Close(); err != nil {
 			dstFile = nil
@@ -168,10 +237,10 @@ func (c *Client) uploadFile(ctx context.Context, localPath, remotePath string, s
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return c.finalizeUpload(ctx, tempPath, remotePath, srcStat)
+	return c.finalizeUpload(ctx, tempPath, remotePath, srcStat, mode)
 }
 
-func (c *Client) finalizeUpload(ctx context.Context, tempPath, remotePath string, srcStat os.FileInfo) error {
+func (c *Client) finalizeUpload(ctx context.Context, tempPath, remotePath string, srcStat os.FileInfo, targetMode os.FileMode) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -180,6 +249,11 @@ func (c *Client) finalizeUpload(ctx context.Context, tempPath, remotePath string
 	}
 	if err := c.SFTPClient().Chtimes(tempPath, srcStat.ModTime(), srcStat.ModTime()); err != nil {
 		return fmt.Errorf("set remote temporary file timestamps failed: %w", err)
+	}
+	if targetMode != 0 && targetMode != (targetMode|0o600) {
+		if err := c.SFTPClient().Chmod(tempPath, targetMode); err != nil {
+			return fmt.Errorf("set remote temporary file mode failed: %w", err)
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -235,18 +309,20 @@ func (c *Client) replaceRemoteDestinationFallback(tempPath, remotePath string) e
 		return errors.Join(fmt.Errorf("rename remote temporary file failed: %w", err), rollbackErr)
 	}
 	if err := c.SFTPClient().Remove(backupPath); err != nil {
-		return fmt.Errorf("remove remote destination backup failed: %w", err)
+		// On Windows or certain SFTP servers, deleting a read-only file fails with SSH_FX_FAILURE/permission denied.
+		// Attempt to clear read-only flag and retry deletion.
+		_ = c.SFTPClient().Chmod(backupPath, 0o600)
+		if retryErr := c.SFTPClient().Remove(backupPath); retryErr != nil {
+			return fmt.Errorf("remove remote destination backup failed: %w", err)
+		}
 	}
 	return nil
 }
 
-func (c *Client) shouldSkipUpload(remotePath string, srcStat os.FileInfo, progress ProgressCallback) (bool, error) {
+func (c *Client) shouldSkipUpload(remotePath string, srcStat os.FileInfo) (bool, error) {
 	rStat, err := c.SFTPClient().Stat(remotePath)
 	if err == nil {
 		if rStat.Size() == srcStat.Size() && rStat.ModTime().Unix() == srcStat.ModTime().Unix() {
-			if progress != nil {
-				progress(srcStat.Size())
-			}
 			return true, nil
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -337,9 +413,119 @@ func (c *Client) doUpload(ctx context.Context, srcFile *os.File, dstFile *sftp.F
 	return c.parallelTransfer(ctx, srcFile, dstFile, startOffset, size, progress)
 }
 
+func (c *Client) wrapUploadStorageError(ctx context.Context, op string, remotePath string, neededBytes int64, err error) error {
+	if err == nil {
+		return nil
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return fmt.Errorf("%s failed: %w", op, err)
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, sftp.ErrSSHFxPermissionDenied) || errors.Is(err, sftp.ErrSSHFxNoSuchFile) ||
+		errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) {
+		return fmt.Errorf("%s failed: %w", op, err)
+	}
+	if vfs, vfsErr := c.checkRemoteFreeSpace(remotePath); vfsErr == nil && vfs != nil {
+		avail := AvailableStorageSpace(vfs)
+		total := TotalStorageSpace(vfs)
+		if avail == 0 || (neededBytes > 0 && avail < uint64(neededBytes)) {
+			return fmt.Errorf("%s failed (insufficient remote storage space: %s free of %s): %w",
+				op, FormatByteSize(avail), FormatByteSize(total), err)
+		}
+	}
+	return fmt.Errorf("%s failed: %w", op, err)
+}
+
+func isOpUnsupported(err error) bool {
+	if errors.Is(err, sftp.ErrSSHFxOpUnsupported) {
+		return true
+	}
+	var statusErr *sftp.StatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.FxCode() == sftp.ErrSSHFxOpUnsupported
+	}
+	return false
+}
+
+func (c *Client) checkRemoteFreeSpace(remotePath string) (*sftp.StatVFS, error) {
+	if c == nil || c.state == nil || c.state.sftpClient == nil {
+		return nil, errors.New("client not available")
+	}
+	vfs, err := c.state.sftpClient.StatVFS(remotePath)
+	if err == nil && vfs != nil {
+		return vfs, nil
+	}
+	if isOpUnsupported(err) {
+		return nil, err
+	}
+	target := remotePath
+	for {
+		dir := path.Dir(target)
+		if dir == "" || dir == target {
+			break
+		}
+		vfs, err = c.state.sftpClient.StatVFS(dir)
+		if err == nil && vfs != nil {
+			return vfs, nil
+		}
+		if isOpUnsupported(err) {
+			return nil, err
+		}
+		target = dir
+	}
+	return nil, err
+}
+
+// AvailableStorageSpace returns the available space in bytes from StatVFS.
+func AvailableStorageSpace(vfs *sftp.StatVFS) uint64 {
+	if vfs == nil {
+		return 0
+	}
+	frsize := vfs.Frsize
+	if frsize == 0 {
+		frsize = vfs.Bsize
+	}
+	if frsize == 0 {
+		frsize = 512
+	}
+	return frsize * vfs.Bavail
+}
+
+// TotalStorageSpace returns the total space in bytes from StatVFS.
+func TotalStorageSpace(vfs *sftp.StatVFS) uint64 {
+	if vfs == nil {
+		return 0
+	}
+	frsize := vfs.Frsize
+	if frsize == 0 {
+		frsize = vfs.Bsize
+	}
+	if frsize == 0 {
+		frsize = 512
+	}
+	return frsize * vfs.Blocks
+}
+
+// FormatByteSize formats a byte count into a human-readable size string (e.g. "24.5 KB", "40.0 GB").
+func FormatByteSize(bytes uint64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := uint64(unit), 0
+	for n := bytes / unit; n >= unit && exp < 5; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
 func (c *Client) DownloadFile(ctx context.Context, remotePath, localPath string, size int64, mode os.FileMode, progress ProgressCallback) (retErr error) {
 	return runInterruptibleOperation(ctx, c.interruptTransfers, func() error {
-		return c.downloadFile(ctx, remotePath, localPath, size, mode, progress)
+		if err := c.downloadFile(ctx, remotePath, localPath, size, mode, progress); err != nil {
+			return fmt.Errorf("download %q to %q: %w", remotePath, localPath, err)
+		}
+		return nil
 	})
 }
 
@@ -366,16 +552,54 @@ func (c *Client) downloadFile(ctx context.Context, remotePath, localPath string,
 		return fmt.Errorf("remote source size changed: expected %d bytes, got %d", size, srcStat.Size())
 	}
 
+	var fileTransferred atomic.Int64
+	var completedEmitted bool
+	if c.fileProgress != nil {
+		if size > 0 {
+			c.fileProgress(FileTransferProgress{
+				Path:        remotePath,
+				Size:        size,
+				Transferred: 0,
+				Increment:   0,
+			})
+		}
+		defer func() {
+			if retErr == nil && !completedEmitted {
+				if fileTransferred.Load() < size || size == 0 {
+					c.fileProgress(FileTransferProgress{
+						Path:        remotePath,
+						Size:        size,
+						Transferred: size,
+						Increment:   0,
+					})
+				}
+			}
+		}()
+	}
+
 	// 只有在非强制模式下才检查跳过
 	if !c.config.Force {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		skip, skipErr := c.shouldSkipDownload(localPath, srcStat, progress)
+		skip, skipErr := c.shouldSkipDownload(localPath, srcStat)
 		if skipErr != nil {
 			return skipErr
 		}
 		if skip {
+			fileTransferred.Store(srcStat.Size())
+			if c.fileProgress != nil {
+				completedEmitted = true
+				c.fileProgress(FileTransferProgress{
+					Path:        remotePath,
+					Size:        srcStat.Size(),
+					Transferred: srcStat.Size(),
+					Increment:   srcStat.Size(),
+				})
+			}
+			if progress != nil && srcStat.Size() > 0 {
+				progress(srcStat.Size())
+			}
 			return nil
 		}
 	}
@@ -389,6 +613,22 @@ func (c *Client) downloadFile(ctx context.Context, remotePath, localPath string,
 		return fmt.Errorf("prepare local temporary file failed: %w", err)
 	}
 
+	fileCb := progress
+	if c.fileProgress != nil {
+		fileCb = func(n int64) {
+			curr := fileTransferred.Add(n)
+			c.fileProgress(FileTransferProgress{
+				Path:        remotePath,
+				Size:        size,
+				Transferred: curr,
+				Increment:   n,
+			})
+			if progress != nil {
+				progress(n)
+			}
+		}
+	}
+
 	var dstStat os.FileInfo
 	if dstFile != nil {
 		var statErr error
@@ -396,7 +636,7 @@ func (c *Client) downloadFile(ctx context.Context, remotePath, localPath string,
 		if statErr != nil {
 			return fmt.Errorf("stat local temporary file failed: %w", statErr)
 		}
-		if err := c.writeDownloadTemporaryFile(ctx, srcFile, dstFile, startOffset, size, mode, progress); err != nil {
+		if err := c.writeDownloadTemporaryFile(ctx, srcFile, dstFile, startOffset, size, mode, fileCb); err != nil {
 			return err
 		}
 	}
@@ -416,7 +656,10 @@ func (c *Client) downloadFile(ctx context.Context, remotePath, localPath string,
 	}
 	defer func() {
 		if rmErr := os.Remove(finalTempPath); rmErr != nil && !os.IsNotExist(rmErr) {
-			retErr = errors.Join(retErr, fmt.Errorf("remove final temporary path failed: %w", rmErr))
+			_ = os.Chmod(finalTempPath, 0o600)
+			if retryErr := os.Remove(finalTempPath); retryErr != nil && !os.IsNotExist(retryErr) {
+				retErr = errors.Join(retErr, fmt.Errorf("remove final temporary path failed: %w", rmErr))
+			}
 		}
 	}()
 
@@ -430,6 +673,11 @@ func (c *Client) downloadFile(ctx context.Context, remotePath, localPath string,
 	}
 	if err := os.Chtimes(finalTempPath, srcStat.ModTime(), srcStat.ModTime()); err != nil {
 		return fmt.Errorf("set local temporary file timestamps failed: %w", err)
+	}
+	if mode != 0 && mode != (mode|0o600) {
+		if err := os.Chmod(finalTempPath, mode); err != nil {
+			return fmt.Errorf("set local temporary file mode failed: %w", err)
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -446,7 +694,8 @@ func (c *Client) writeDownloadTemporaryFile(ctx context.Context, srcFile *sftp.F
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := dstFile.Chmod(mode); err != nil {
+	tempMode := mode | 0o600
+	if err := dstFile.Chmod(tempMode); err != nil {
 		return fmt.Errorf("set local temporary file mode failed: %w", err)
 	}
 	if progress != nil && startOffset > 0 {
@@ -463,13 +712,10 @@ func (c *Client) writeDownloadTemporaryFile(ctx context.Context, srcFile *sftp.F
 	return nil
 }
 
-func (c *Client) shouldSkipDownload(localPath string, srcStat os.FileInfo, progress ProgressCallback) (bool, error) {
+func (c *Client) shouldSkipDownload(localPath string, srcStat os.FileInfo) (bool, error) {
 	lStat, err := os.Stat(localPath)
 	if err == nil {
 		if lStat.Size() == srcStat.Size() && lStat.ModTime().Unix() == srcStat.ModTime().Unix() {
-			if progress != nil {
-				progress(srcStat.Size())
-			}
 			return true, nil
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -833,11 +1079,11 @@ func (c *Client) remoteCopyDirectory(ctx context.Context, src, dst string, srcSt
 		}
 	}
 	if !dstExisted && srcStat != nil {
-		if err := c.SFTPClient().Chmod(dst, srcStat.Mode()); err != nil {
-			return fmt.Errorf("set remote directory final mode failed: %w", err)
-		}
 		if err := c.SFTPClient().Chtimes(dst, srcStat.ModTime(), srcStat.ModTime()); err != nil {
 			return fmt.Errorf("set remote directory timestamps failed: %w", err)
+		}
+		if err := c.SFTPClient().Chmod(dst, srcStat.Mode()); err != nil {
+			return fmt.Errorf("set remote directory final mode failed: %w", err)
 		}
 	}
 	return nil
@@ -989,11 +1235,11 @@ func (c *Client) remoteCopyFile(ctx context.Context, src, dst string, srcStat os
 	if err := c.verifyRemoteTemporaryFile(tempPath); err != nil {
 		return err
 	}
-	if err := c.SFTPClient().Chmod(tempPath, finalMode); err != nil {
-		return fmt.Errorf("set remote temporary destination mode failed: %w", err)
-	}
 	if err := c.SFTPClient().Chtimes(tempPath, srcStat.ModTime(), srcStat.ModTime()); err != nil {
 		return fmt.Errorf("set remote temporary destination timestamps failed: %w", err)
+	}
+	if err := c.SFTPClient().Chmod(tempPath, finalMode); err != nil {
+		return fmt.Errorf("set remote temporary destination mode failed: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -1224,7 +1470,10 @@ func (c *Client) uploadDirectory(ctx context.Context, localDir, remoteDir string
 		remoteDest := c.JoinPath(remoteDir, filepath.ToSlash(relPath))
 
 		if info.IsDir() {
-			return c.SFTPClient().MkdirAll(remoteDest)
+			if mkdirErr := c.SFTPClient().MkdirAll(remoteDest); mkdirErr != nil {
+				return fmt.Errorf("create remote directory %q: %w", remoteDest, mkdirErr)
+			}
+			return nil
 		}
 
 		loopPath := path
@@ -1238,13 +1487,16 @@ func (c *Client) uploadDirectory(ctx context.Context, localDir, remoteDir string
 		}
 		g.Go(func() error {
 			defer func() { <-sem }()
-			return c.UploadFile(groupCtx, loopPath, loopDest, loopInfo.Size(), loopInfo.Mode(), progress)
+			if err := c.uploadFile(groupCtx, loopPath, loopDest, loopInfo.Size(), loopInfo.Mode(), progress); err != nil {
+				return fmt.Errorf("upload %q to %q: %w", loopPath, loopDest, err)
+			}
+			return nil
 		})
 
 		return nil
 	})
 
-	return finishTransferGroup(cancel, g, err)
+	return finishTransferGroup(ctx, cancel, g, err)
 }
 
 func (c *Client) DownloadDirectory(ctx context.Context, remoteDir, localDir string, progress ProgressCallback) error {
@@ -1316,14 +1568,17 @@ func (c *Client) downloadDirectory(ctx context.Context, remoteDir, localDir stri
 		}
 		g.Go(func() error {
 			defer func() { <-sem }()
-			return c.DownloadFile(groupCtx, loopPath, loopDest, loopInfo.Size(), loopInfo.Mode(), progress)
+			if err := c.downloadFile(groupCtx, loopPath, loopDest, loopInfo.Size(), loopInfo.Mode(), progress); err != nil {
+				return fmt.Errorf("download %q to %q: %w", loopPath, loopDest, err)
+			}
+			return nil
 		})
 	}
 
 	if traversalErr == nil {
 		traversalErr = walker.Err()
 	}
-	return finishTransferGroup(cancel, g, traversalErr)
+	return finishTransferGroup(ctx, cancel, g, traversalErr)
 }
 
 func remoteRelativePath(base, target string) (string, error) {
@@ -1343,12 +1598,18 @@ func remoteRelativePath(base, target string) (string, error) {
 	return strings.TrimPrefix(target, prefix), nil
 }
 
-func finishTransferGroup(cancel context.CancelFunc, group *errgroup.Group, operationErr error) error {
+func finishTransferGroup(ctx context.Context, cancel context.CancelFunc, group *errgroup.Group, operationErr error) error {
 	if operationErr != nil {
 		cancel()
 	}
 	groupErr := group.Wait()
 	cancel()
+	if groupErr != nil && ctx.Err() == nil && errors.Is(operationErr, context.Canceled) {
+		return groupErr
+	}
+	if operationErr != nil && ctx.Err() == nil && errors.Is(groupErr, context.Canceled) {
+		return operationErr
+	}
 	return errors.Join(operationErr, groupErr)
 }
 

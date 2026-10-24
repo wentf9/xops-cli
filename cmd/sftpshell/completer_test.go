@@ -124,14 +124,14 @@ func TestCompleteLocalPath_DirSuffix(t *testing.T) {
 	for _, c := range candidates {
 		if strings.Contains(c, subDirName) {
 			foundDir = true
-			if !strings.HasSuffix(c, sep) {
-				t.Errorf("directory candidate %q must end with path separator %q", c, sep)
+			if !strings.HasSuffix(c, "/") {
+				t.Errorf("directory candidate %q must end with '/'", c)
 			}
 		}
 		if strings.Contains(c, fileName) {
 			foundFile = true
-			if strings.HasSuffix(c, sep) {
-				t.Errorf("file candidate %q must not end with path separator %q", c, sep)
+			if strings.HasSuffix(c, "/") || strings.HasSuffix(c, sep) {
+				t.Errorf("file candidate %q must not end with separator", c)
 			}
 		}
 	}
@@ -190,4 +190,103 @@ func TestCompletionErrorsAndCursorValidation(t *testing.T) {
 			t.Fatal("invalid cursor accepted")
 		}
 	}
+}
+
+func assertContainsCandidate(t *testing.T, candidates []string, expected string) {
+	t.Helper()
+	for _, c := range candidates {
+		if c == expected {
+			return
+		}
+	}
+	t.Errorf("expected candidate %q in %v", expected, candidates)
+}
+
+func setupSpaceTestEnv(t *testing.T) *Shell {
+	t.Helper()
+	tmpDir := t.TempDir()
+	dirWithSpace := "Witch of Eclipse"
+	if err := os.Mkdir(filepath.Join(tmpDir, dirWithSpace), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "Witch of Eclipse.png"), []byte("test"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, dirWithSpace, "chara test.png"), []byte("test2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return &Shell{localCwd: tmpDir}
+}
+
+func TestWordCompleter_SpaceAndQuoteHandling(t *testing.T) {
+	shell := setupSpaceTestEnv(t)
+
+	t.Run("no quotes escapes spaces", func(t *testing.T) {
+		res := shell.completeLine(t.Context(), "put Witch", len("put Witch"))
+		if res.err != nil {
+			t.Fatalf("unexpected error: %v", res.err)
+		}
+		if res.head != "put " {
+			t.Errorf("head = %q, want %q", res.head, "put ")
+		}
+		assertContainsCandidate(t, res.candidates, `Witch\ of\ Eclipse/`)
+		assertContainsCandidate(t, res.candidates, `Witch\ of\ Eclipse.png`)
+	})
+
+	t.Run("double quotes keeps spaces and closes files", func(t *testing.T) {
+		res := shell.completeLine(t.Context(), `put "Witch`, len(`put "Witch`))
+		if res.err != nil {
+			t.Fatalf("unexpected error: %v", res.err)
+		}
+		if res.head != `put "` {
+			t.Errorf("head = %q, want %q", res.head, `put "`)
+		}
+		assertContainsCandidate(t, res.candidates, "Witch of Eclipse/")
+		assertContainsCandidate(t, res.candidates, `Witch of Eclipse.png"`)
+	})
+
+	t.Run("single quotes keeps spaces and closes files", func(t *testing.T) {
+		res := shell.completeLine(t.Context(), `put 'Witch`, len(`put 'Witch`))
+		if res.err != nil {
+			t.Fatalf("unexpected error: %v", res.err)
+		}
+		if res.head != `put '` {
+			t.Errorf("head = %q, want %q", res.head, `put '`)
+		}
+		assertContainsCandidate(t, res.candidates, "Witch of Eclipse/")
+		assertContainsCandidate(t, res.candidates, `Witch of Eclipse.png'`)
+	})
+
+	t.Run("escaped subdirectory completion", func(t *testing.T) {
+		input := `put Witch\ of\ Eclipse/`
+		res := shell.completeLine(t.Context(), input, len(input))
+		if res.err != nil {
+			t.Fatalf("unexpected error: %v", res.err)
+		}
+		if res.head != "put " {
+			t.Errorf("head = %q, want %q", res.head, "put ")
+		}
+		assertContainsCandidate(t, res.candidates, `Witch\ of\ Eclipse/chara\ test.png`)
+	})
+
+	t.Run("trailing backslash keeps backslash for directory traversal", func(t *testing.T) {
+		cursor := parseCompletionCursor(`put "Witch of Eclipse\`)
+		if cursor.partial != `Witch of Eclipse\` {
+			t.Errorf("cursor.partial = %q, want %q", cursor.partial, `Witch of Eclipse\`)
+		}
+	})
+
+	t.Run("mid-argument quote does not duplicate prefix", func(t *testing.T) {
+		input := `put Witch\ of\ Eclipse/"chara`
+		res := shell.completeLine(t.Context(), input, len(input))
+		if res.err != nil {
+			t.Fatalf("unexpected error: %v", res.err)
+		}
+		expectedHead := `put Witch\ of\ Eclipse/"`
+		if res.head != expectedHead {
+			t.Errorf("head = %q, want %q", res.head, expectedHead)
+		}
+		// 验证 candidate 没有重复 Witch\ of\ Eclipse 前缀
+		assertContainsCandidate(t, res.candidates, `chara test.png"`)
+	})
 }

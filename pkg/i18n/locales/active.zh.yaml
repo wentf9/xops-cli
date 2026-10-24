@@ -585,6 +585,8 @@ sftp_shell_upload_failed:
   other: "\n上传失败: {{.Error}}"
 sftp_shell_upload_done:
   other: "\n上传完成"
+sftp_shell_storage_insufficient_warning:
+  other: "警告: 远程目标存储空间可能不足 (可用: {{.Free}} / 总量: {{.Total}}，本次待传: {{.Need}})"
 sftp_shell_exec_usage:
   other: "用法: exec <命令>"
 sftp_shell_lexec_usage:
