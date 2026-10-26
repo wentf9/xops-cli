@@ -55,8 +55,8 @@ npx skills add https://github.com/wentf9/xops-cli --skill xops-agent
 - **普通命令默认直通（`server`）**：命令直接发给远端默认 SSH Shell，不再隐式包装 `bash -l -c`。请按远端实际 Shell 编写语法（Windows 节点无需为了默认命令额外安装 Bash）。
 - **显式解释器与配置继承**：全局、节点、Playbook `settings.execution` 和步骤均可配置 `execution`。显式使用 `bash`、`sh`、`zsh`、`fish`、`powershell`、`pwsh` 或 `cmd` 时，需搭配描述**远端外层 Shell** 的 `launch_dialect`；`--no-login` 仅保留非登录 Bash 兼容语义。
 - **脚本与按需探测**：本地脚本需要明确的解释器与已知启动方言（白名单 `sh`/`bash`/`zsh`/`fish` shebang 仅选择解释器，不能单独证明外层方言为 POSIX；无可靠解释器或含 UTF-8 BOM 的脚本会在执行前拒绝）。Playbook 无 shebang 的 `script`/`ensure` 以及 SFTP 带非空 `cwd` 的 `exec` 会对未指定的执行环境按需探测并缓存于连接内存；显式解释器（含 `server`）不会被替换（已知 `server/cmd` 的 SFTP `exec` 使用临时 CMD 适配器继承 `cwd`，其余显式 `server` 配置拒绝非空 `cwd`）。
-- **入口组合限制**：`exec` 的命令行显式执行参数暂不支持与脚本、`--sudo`、`--stream` 或 `--out-dir` 组合；`ssh` 的命令行显式执行参数当前仅在 Linux 客户端支持。
-- **本地环境与路径注意**：本地文件路径和监听端口均位于**运行 `xops` 的机器**（若 Agent 运行在容器或远程沙箱中，不等同于用户桌面）。批处理 SFTP 按空白分词，包含空格的路径请使用加引号的 `scp` 参数或远端命令。
+- **入口组合与参数支持**：`exec` 的命令行显式解释器参数（`--interpreter`、`--launch-dialect`、`--login-shell`）可与 `--shell`（脚本）、`--sudo`、`--stream` 或 `--out-dir` 组合（脚本与提权支持 `bash`/`sh`/`zsh`/`fish`）；`ssh` 的命令行显式执行参数跨 Linux、macOS 与 Windows 统一按宿主 I/O 能力检查并执行。`host add` 与 `host import` 支持录入阶段的 `--interpreter`、`--launch-dialect` 及 `--probe`/`--no-probe`。
+- **本地环境与路径注意**：本地文件路径和监听端口均位于**运行 `xops` 的机器**（若 Agent 运行在容器或远程沙箱中，不等同于用户桌面）。交互与批处理 SFTP 均支持单双引号及反斜杠转义，含空格的路径可直接使用引号包裹或 `\ ` 转义。
 
 ## MCP 工具与 CLI 命令对照
 

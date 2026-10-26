@@ -31,7 +31,7 @@ Select an available port and record the node, direction, bind address, target, a
 
 The CLI has no `xops tunnel create/list/status/stop`, request IDs, or managed tunnel TTL. Implement those operational steps with the owned process and connectivity checks:
 
-1. Check that the session is still running and inspect stderr. `administratively prohibited`, target refusal, and other channel errors can occur after a listener starts. `-L`/`-D` open a forwarding channel on use; `-R` requests the remote listener at startup.
+1. Check that the session is still running and inspect stderr. `administratively prohibited`, target refusal, and other channel errors can occur after a listener starts. `-L`/`-D` open a forwarding channel on use; `-R` requests the remote listener at startup. `xops ssh` supports `-v`/`-vv`/`-vvv` for leveled connection, authentication, and forwarding channel diagnostics on `stderr`.
 2. Probe the actual application. For the local HTTP example:
 
    ```bash

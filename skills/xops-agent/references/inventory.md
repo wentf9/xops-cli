@@ -47,7 +47,7 @@ New nodes discovered by SSH, exec, SCP, or SFTP are saved after successful SSH a
 
 Inspect global and node `execution` fields in the selected Schema v2 configuration before selecting remote command syntax. Ordinary commands now default to `server`; node settings override global settings. Fields are `interpreter`, `launch_dialect`, and optional boolean `login`. A child interpreter change can drop the parent's interpreter-specific login option, while the launch dialect still inherits and must remain compatible.
 
-There are no `host add/edit --interpreter` or `--launch-dialect` flags. For a persistent change, preserve the existing YAML and node references, change only the authorized execution fields, and verify configuration loading before remote execution. Do not guess the dialect from the client's OS or rewrite the entire inventory to change one node. See [Execution and Playbooks](execution.md#select-the-execution-environment) for supported combinations and a Bash compatibility fragment.
+`host add` and `host import` accept `--interpreter` and `--launch-dialect` flags along with `--probe`/`--no-probe` controls, whereas `host edit` has no execution flags. For a persistent change to an existing node, preserve the existing YAML and node references, change only the authorized execution fields, and verify configuration loading before remote execution. Do not guess the dialect from the client's OS or rewrite the entire inventory to change one node. See [Execution and Playbooks](execution.md#select-the-execution-environment) for supported combinations and a Bash compatibility fragment.
 
 ## Noninteractive access
 

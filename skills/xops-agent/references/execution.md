@@ -22,20 +22,22 @@ Select the launch dialect from the **remote SSH default shell**, not the local O
 | Interpreter | Launch dialect | Login behavior |
 | --- | --- | --- |
 | `server` | `unknown` or a known dialect | Inherited only; do not pass `--login-shell`, including `false`. |
-| `bash` | `posix` | Explicit adapter defaults to non-login; `--login-shell` enables login. |
-| `sh` | `posix` | Non-login only. |
+| `bash` | `posix` or `fish` | Explicit adapter defaults to non-login; `--login-shell` enables login. |
+| `sh` | `posix` or `fish` | Non-login only. |
+| `zsh` | `posix` or `fish` | Explicit adapter defaults to non-login; `--login-shell` enables login. |
+| `fish` | `posix` or `fish` | Explicit adapter defaults to non-login; `--login-shell` enables login. |
 | `powershell` | `cmd` or `powershell` | Inherited; uses `-NoProfile -NonInteractive -EncodedCommand`. |
-| `pwsh` | `posix`, `cmd`, or `powershell` | Inherited; uses the encoded PowerShell adapter. |
+| `pwsh` | `posix`, `fish`, `cmd`, or `powershell` | Inherited; uses the encoded PowerShell adapter. |
 | `cmd` | `cmd` | Inherited; currently rejects `%`, `!`, newlines, and unbalanced double quotes. |
 
 `--no-login` alone selects non-login Bash for compatibility and assumes POSIX launch when no dialect was supplied. It is not a generic switch for server/sh/PowerShell/cmd. Explicit `--launch-dialect unknown` is not replaced with POSIX, and `--login-shell` conflicts with `--no-login`.
 
 Current CLI boundaries matter:
 
-- `exec` with explicit `--interpreter`, `--launch-dialect`, or `--login-shell` supports buffered commands or single-host PTY commands; it rejects scripts, sudo, `--stream`, and `--out-dir`. Planned buffered execution has a 5-minute default timeout, 64 KiB command/payload bounds, and retains the last 5 MiB of output. Do not assume every legacy/streaming entry point has those same limits.
-- Legacy `exec` streaming/file-output paths support server/Bash/sh, not the Windows adapters. For cmd/PowerShell commands, use the explicit buffered CLI flags above; setting a Windows node default does not enable every entry point.
-- Explicit `exec -x` uses strict native output support: Linux terminals/pipes, macOS terminals/already nonblocking pipes and Windows pipes, without regular-file redirection or Windows consoles. Ordinary `exec -x` without those explicit flags uses a compatible terminal path and accepts regular-file output; it still uses the resolved server/adapter payload.
-- Explicit execution flags on `ssh` (also `--no-login`) check actual local I/O capabilities and reject sudo and `-N`. Windows file stdin uses the host-injected input bridge; only a missing bridge causes rejection before remote requests. Ordinary SSH commands and unconfigured piped server-shell input select strict or compatible output paths by capability. Remote Windows support and native Windows **client** output support are separate concerns.
+- `exec` with explicit `--interpreter`, `--launch-dialect`, or `--login-shell` connects and combines with `--shell`, `--sudo`, `--stream`, and `--out-dir`. Scripts and Unix privilege escalation support `bash`, `sh`, `zsh`, and `fish`, rejecting `server`, `powershell`, `pwsh`, and `cmd`.
+- Bounded execution limits: ordinary commands are bounded to 64 KiB, scripts to 16 MiB (`ssh.MaxCommandInputBytes`), with a 5-minute default timeout for noninteractive execution. Default result retention keeps the last 5 MiB of output (with a truncation note if exceeded); streaming with `--stream` or writing per-host logs with `--out-dir` is not constrained by this 5 MiB retention limit.
+- Output handling: PTY commands (`-x`) support regular-file output redirection (`>output.log 2>error.log`). Native cancelable output covers Linux terminals/pipes, macOS terminals/nonblocking pipes, Windows pipes, Windows consoles (via host-injected console relay), and regular files. macOS blocking anonymous pipes skip auxiliary progress/diagnostics.
+- Explicit execution flags on `ssh` (also `--no-login`) check actual local I/O capabilities across Linux, macOS, and Windows and reject sudo and `-N`. Windows file stdin uses the host-injected input bridge; only a missing bridge causes rejection before remote requests. Ordinary SSH commands and unconfigured piped server-shell input select strict or compatible output paths by capability. Remote Windows support and native Windows **client** output support are separate concerns.
 - One-shot PTY commands report nonzero, signal, and missing-status failures. Unknown outcomes after disconnect or cancellation are not safe to replay automatically.
 
 ## One host and bounded inspection
@@ -73,7 +75,7 @@ The `--host`, `--ifile`/`-I`, and `--tag` flags are mutually exclusive: choose o
 
 Write a local script for complex quoting or several dependent commands, then pass it with `--shell`. The script belongs to the CLI machine and is sent to the selected interpreter through stdin. Do not combine script bytes with a separate runtime stdin stream or credential stdin stream. A no-command `exec` with piped stdin is also a script; a no-command nonterminal `ssh HOST` in server mode instead sends an SSH shell request. Piped `ssh --sudo` remains an escalation operation.
 
-Scripts now require a reliable interpreter. Supported `sh`/`bash` shebangs (such as `#!/bin/sh`, `#!/bin/bash`, or `#!/usr/bin/env sh`, without extra arguments) can select it; a shebang does **not** establish the outer launch dialect. Configure `launch_dialect: posix` only after verifying the server shell. Missing shebangs need a configured non-server interpreter or the deliberate Bash `--no-login` compatibility path. An unsupported shebang needs a supported explicit step/settings or CLI interpreter override; a node default alone does not override it. BOMs and explicit server scripts remain rejected. Do not silently strip or rewrite script bytes. The current script adapter supports Bash/sh, not arbitrary Python, cmd, or PowerShell scripts.
+Scripts now require a reliable interpreter. Supported `sh`/`bash`/`zsh`/`fish` shebangs (such as `#!/bin/sh`, `#!/bin/bash`, `#!/bin/zsh`, `#!/bin/fish`, or `#!/usr/bin/env ...`, without extra arguments) can select it; a shebang does **not** establish the outer launch dialect. Configure `launch_dialect: posix` (or `fish`) only after verifying the server shell. Missing shebangs need a configured non-server interpreter or the deliberate Bash `--no-login` compatibility path. An unsupported shebang needs a supported explicit step/settings or CLI interpreter override; a node default alone does not override it. BOMs and explicit server scripts remain rejected. Do not silently strip or rewrite script bytes. The current script adapter supports `bash`, `sh`, `zsh`, and `fish`, not arbitrary Python, cmd, or PowerShell scripts.
 
 For a node that deliberately needs the old login Bash environment, merge this fragment into that node's existing configuration, preserving its connection and identity fields:
 
@@ -84,7 +86,7 @@ execution:
   login: true
 ```
 
-Do not automatically apply it to every host. Explicit `--interpreter`, `--launch-dialect`, and `--login-shell` flags are not currently accepted together with `--shell`; use supported node configuration, `--no-login` for a Bash script, or Playbook execution settings. Use explicit failure handling inside scripts; the last successful command must not hide an earlier failure. Check each host's outcome and the process exit code. After an interrupted mutation, inspect the affected hosts before rerunning it.
+Do not automatically apply it to every host. Explicit `--interpreter`, `--launch-dialect`, and `--login-shell` flags can be used together with `--shell` (as well as `--stream`, `--out-dir`, or `--sudo`) to override script resolution directly from the CLI. Use explicit failure handling inside scripts; the last successful command must not hide an earlier failure. Check each host's outcome and the process exit code. After an interrupted mutation, inspect the affected hosts before rerunning it.
 
 ## Playbooks
 
@@ -144,7 +146,7 @@ xops exec -x web-01 top
 xops tui
 ```
 
-Use these when the task needs a terminal. `exec -x` supports one host and no local script; it returns after the requested command and now defaults to the native server payload. Privileged PTY `--no-login` is currently rejected. `ssh` without a command opens a full server shell; that login session is distinct from one-shot command execution. Single-label jump hosts must be configured nodes/aliases; FQDN, IP, and explicit `host:port` can identify direct jumps.
+Use these when the task needs a terminal. `exec -x` supports one host and no local script; it returns after the requested command and now defaults to the native server payload. Privileged PTY with `--no-login` requires an explicit interpreter (e.g. `--interpreter bash`). `ssh` without a command opens a full server shell; that login session is distinct from one-shot command execution. Single-label jump hosts must be configured nodes/aliases; FQDN, IP, and explicit `host:port` can identify direct jumps.
 
 Text conversion is local:
 
