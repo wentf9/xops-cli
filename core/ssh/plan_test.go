@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	corelog "github.com/wentf9/xops-cli/core/log"
 	"go.uber.org/goleak"
 )
 
@@ -255,5 +256,51 @@ func TestCapturedPlanClosesNestedBlackholedTransport(t *testing.T) {
 				t.Fatal("captured plan shutdown blocked on a nested SSH channel")
 			}
 		})
+	}
+}
+
+func TestConnectPlanEmitsDiagnostics(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	address, _, stop := startTestAutoSSHServer(t, "plan-password")
+	defer stop()
+	host, portText, err := net.SplitHostPort(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &forbiddenPlanProvider{}
+	recorder := &diagnosticRecorder{}
+	connector := NewConnector(provider,
+		WithSecretResolver(planSecrets{}),
+		WithHostKeyVerifier(&fixtureTrust{}),
+		WithDiagnostics(recorder),
+	)
+	defer closePlanConnector(t, connector)
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	plan := ConnectionPlan{Scope: "runtime", Hops: []ConnectionConfig{{
+		NodeID: "node", Address: host, Port: port, User: "fixture", AuthType: "password", AuthUpdateToken: "v1",
+	}}}
+	lease := connectPlanFixture(t, ctx, connector, plan)
+	defer closePlanLease(t, lease)
+
+	events := recorder.snapshot()
+	if len(events) == 0 {
+		t.Fatal("ConnectPlan did not emit any diagnostics")
+	}
+	var sawConnecting, sawConnected bool
+	for _, ev := range events {
+		if ev.Kind == corelog.Connecting {
+			sawConnecting = true
+		}
+		if ev.Kind == corelog.Connected {
+			sawConnected = true
+		}
+	}
+	if !sawConnecting || !sawConnected {
+		t.Fatalf("expected Connecting and Connected diagnostics, got %+v", events)
 	}
 }

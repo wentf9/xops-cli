@@ -188,6 +188,7 @@ func (c *Connector) acquirePlan(key string, plan ConnectionPlan) (*planEntry, er
 			WithHandshakeTimeout(c.getHandshakeTimeout()), WithInteractionTimeout(c.interactionTimeout),
 			WithSecretResolver(c.secretResolver), WithKeySource(c.keySource), WithHostKeyVerifier(c.hostKeyVerifier),
 			WithPasswordPromptPattern(c.PasswordPromptPattern),
+			WithDiagnostics(c.diagnostics),
 		)
 		c.kaMu.Lock()
 		keepAlive := c.keepAliveCfg
