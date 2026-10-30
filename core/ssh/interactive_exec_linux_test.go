@@ -114,7 +114,10 @@ func testInteractiveExecRequestInProcess(t *testing.T, sudo bool, wantCommand st
 	if err != nil {
 		t.Fatal(err)
 	}
-	client := newClient(cryptoSSH.NewClient(raw, channels, requests), conn, &ClientConfig{SudoMode: SudoModeSudoer}, nil, "test")
+	client := newClient(cryptoSSH.NewClient(raw, channels, requests), conn, &ClientConfig{
+		SudoMode:  SudoModeSudoer,
+		Execution: &ExecutionConfig{Interpreter: InterpreterBash, LaunchDialect: LaunchPOSIX},
+	}, nil, "test")
 	client.environment = fixtureEnvironment()
 	defer func() {
 		if err := client.Close(); err != nil {

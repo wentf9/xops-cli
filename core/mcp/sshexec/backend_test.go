@@ -383,8 +383,18 @@ func TestBackendExecutionDefaultsAndSudoConfiguration(t *testing.T) {
 		{name: "configured su rejected", request: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchPOSIX, Login: &no}, sudo: true, mode: ssh.SudoModeSu, invalid: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			commands := make(chan string, 4)
+			commands := make(chan string, 8)
 			backend, view, server, ctx := setupBackendWithHandler(t, func(command string, ch cryptoSSH.Channel) {
+				if strings.Contains(command, "__XOPS_DIALECT_POSIX__") {
+					_, _ = io.WriteString(ch, "__XOPS_DIALECT_POSIX__:Linux:/bin/bash\n")
+					_, _ = ch.SendRequest("exit-status", false, cryptoSSH.Marshal(struct{ Status uint32 }{0}))
+					return
+				}
+				if strings.Contains(command, "__XOPS_INTERP__") {
+					_, _ = io.WriteString(ch, "__XOPS_INTERP__:bash\n__XOPS_INTERP_END__\n")
+					_, _ = ch.SendRequest("exit-status", false, cryptoSSH.Marshal(struct{ Status uint32 }{0}))
+					return
+				}
 				commands <- command
 				if _, err := io.WriteString(ch, "fixture-output"); err != nil {
 					t.Error(err)
@@ -411,8 +421,12 @@ func TestBackendExecutionDefaultsAndSudoConfiguration(t *testing.T) {
 			if got := <-commands; got != test.payload {
 				t.Fatalf("payload %q, want %q", got, test.payload)
 			}
-			if server.Executed.Load() != 1 {
-				t.Fatal("unexpected command or probe")
+			wantExecuted := int32(1)
+			if test.name == "legacy sudo root" {
+				wantExecuted = 3 // 2 probe commands (dialect + interp) + 1 user command
+			}
+			if server.Executed.Load() != wantExecuted {
+				t.Fatalf("unexpected command or probe: executed %d, want %d", server.Executed.Load(), wantExecuted)
 			}
 		})
 	}
@@ -700,5 +714,52 @@ func TestOpenPTYCloseUnblocksStalledWindowWrite(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("blocked pty.Write did not unblock after pty.Close")
+	}
+}
+
+func TestBackendExecutionFreeBSDSudoAutoProbe(t *testing.T) {
+	commands := make(chan string, 8)
+	backend, view, server, ctx := setupBackendWithHandler(t, func(command string, ch cryptoSSH.Channel) {
+		if strings.Contains(command, "__XOPS_DIALECT_POSIX__") {
+			_, _ = io.WriteString(ch, "__XOPS_DIALECT_POSIX__:FreeBSD:/bin/sh\n")
+			_, _ = ch.SendRequest("exit-status", false, cryptoSSH.Marshal(struct{ Status uint32 }{0}))
+			return
+		}
+		if strings.Contains(command, "__XOPS_INTERP__") {
+			_, _ = io.WriteString(ch, "__XOPS_INTERP__:sh\n__XOPS_INTERP_END__\n")
+			_, _ = ch.SendRequest("exit-status", false, cryptoSSH.Marshal(struct{ Status uint32 }{0}))
+			return
+		}
+		if strings.Contains(command, "bash") {
+			_, _ = io.WriteString(ch.Stderr(), "exec: bash: not found\n")
+			_, _ = ch.SendRequest("exit-status", false, cryptoSSH.Marshal(struct{ Status uint32 }{127}))
+			return
+		}
+		commands <- command
+		if _, err := io.WriteString(ch, "fixture-output"); err != nil {
+			t.Error(err)
+			return
+		}
+		if _, err := ch.SendRequest("exit-status", false, cryptoSSH.Marshal(struct{ Status uint32 }{0})); err != nil {
+			t.Error(err)
+		}
+	})
+	target := view.Targets["node"]
+	target.Execution = nil
+	target.Plan.Hops[0].SudoMode = ssh.SudoModeRoot
+	view.Targets["node"] = target
+	result, err := backend.Run(ctx, permit(t, ctx, view, ports.Execute), "node", ports.Command{Text: "uptime", Sudo: true})
+	if err != nil {
+		t.Fatalf("backend.Run failed: %v", err)
+	}
+	if result.Outcome != ssh.ExecutionCompleted {
+		t.Fatalf("expected ExecutionCompleted, got %v", result.Outcome)
+	}
+	got := <-commands
+	if got != "sh -c 'uptime'" {
+		t.Fatalf("payload %q, want %q", got, "sh -c 'uptime'")
+	}
+	if server.Executed.Load() != 3 {
+		t.Fatalf("executed %d, want 3 (2 probes + 1 command)", server.Executed.Load())
 	}
 }

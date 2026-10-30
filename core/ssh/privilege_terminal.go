@@ -21,11 +21,11 @@ type privilegeTerminal struct {
 	portableControl bool
 }
 
-func (c *Client) runInteractivePrivilege(ctx context.Context, mode SudoMode, command string, streams InteractiveIO) error {
-	return c.runInteractivePrivilegeSession(ctx, mode, command, streams, false, nil)
+func (c *Client) runInteractivePrivilege(ctx context.Context, mode SudoMode, command string, streams InteractiveIO, extra ...any) error {
+	return c.runInteractivePrivilegeSession(ctx, mode, command, streams, false, nil, extra...)
 }
 
-func (c *Client) runInteractivePrivilegeSession(ctx context.Context, mode SudoMode, command string, streams InteractiveIO, ignoreExit bool, config *RunConfig, cancelOutput ...context.CancelFunc) error {
+func (c *Client) runInteractivePrivilegeSession(ctx context.Context, mode SudoMode, command string, streams InteractiveIO, ignoreExit bool, config *RunConfig, extra ...any) error {
 	fdIn, fdOut, err := validateInteractiveIO(streams)
 	if err != nil {
 		return err
@@ -55,11 +55,10 @@ func (c *Client) runInteractivePrivilegeSession(ctx context.Context, mode SudoMo
 	if config == nil {
 		config = c.defaultRunConfig()
 	}
-	var abortOutput context.CancelFunc
-	if len(cancelOutput) > 0 {
-		abortOutput = cancelOutput[0]
-	}
-	return c.runPrivilegeOperation(ctx, mode, command, streams.Stdin, streams.Stdout, streams.Stderr, terminal, config, abortOutput)
+	opts := make([]any, 0, 2+len(extra))
+	opts = append(opts, terminal, config)
+	opts = append(opts, extra...)
+	return c.runPrivilegeOperation(ctx, mode, command, streams.Stdin, streams.Stdout, streams.Stderr, opts...)
 }
 
 func (e *privilegeExchange) forwardInput(ctx context.Context, stdin io.Reader, pipe io.WriteCloser) (retErr error) {
