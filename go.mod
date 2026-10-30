@@ -22,7 +22,7 @@ require (
 	github.com/kevinburke/ssh_config v1.6.0
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	github.com/nicksnyder/go-i18n/v2 v2.6.1
-	github.com/pkg/sftp v1.13.11
+	github.com/pkg/sftp v1.13.12
 	github.com/pkg/sftp/v2 v2.0.0-alpha2
 	github.com/prometheus-community/pro-bing v0.9.1
 	github.com/rivo/uniseg v0.4.7
