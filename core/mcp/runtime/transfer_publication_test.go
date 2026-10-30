@@ -76,7 +76,7 @@ func TestReadyTransferCannotUseEditedDependencies(t *testing.T) {
 			if response.StatusCode != http.StatusConflict {
 				t.Fatalf("stale claim HTTP %d", response.StatusCode)
 			}
-			result, err := f.client.CallTool(f.ctx, &mcp.CallToolParams{Name: "xops_prepare_upload", Arguments: input})
+			result, err := f.client.CallTool(f.ctx, &mcp.CallToolParams{Name: "transfer", Arguments: input})
 			if err != nil || !result.IsError {
 				t.Fatalf("stale retry minted credentials: %+v %v", result, err)
 			}

@@ -21,10 +21,10 @@ OpenSSH 标识及别名解析出的 OpenSSH ID 不得包含空白或控制字符
 
 | 工具 | 输入 | 用途 |
 | --- | --- | --- |
-| `xops_tunnel_create` | `requestID`、`nodeID`、`mode`、`listenPort`、`targetHost`、`targetPort`，可选 `listenHost`、`ttlSeconds` | 创建隧道并返回状态 |
-| `xops_tunnel_list` | 可选 `nodeID`、`state` | 列出当前进程持有的隧道和保留的终态记录 |
-| `xops_tunnel_status` | `tunnelID` | 查询单条隧道 |
-| `xops_tunnel_stop` | `tunnelID` | 停止监听，并关闭已有转发连接 |
+| `tunnel`，`action: "create"` | `requestID`、`nodeID`、`mode`、`listenPort`、`targetHost`、`targetPort`，可选 `listenHost`、`ttlSeconds` | 创建隧道并返回状态 |
+| `tunnel`，`action: "list"` | 可选 `nodeID`、`state` | 列出当前进程持有的隧道和保留的终态记录 |
+| `tunnel`，`action: "status"` | `tunnelID` | 查询单条隧道 |
+| `tunnel`，`action: "stop"` | `tunnelID` | 停止监听，并关闭已有转发连接 |
 
 节点停用或删除后，仍可用保留记录中的规范 `nodeID` 筛选历史隧道，并继续使用 `state` 过滤。历史规范 ID 优先于当前同名别名；其他别名按当前节点配置解析。历史查询仍执行当前全局和节点策略，不能绕过审批。列表请求取消或到期会取消节点解析及本次查询，不改变后台隧道的 TTL。
 

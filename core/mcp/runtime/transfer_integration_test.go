@@ -180,11 +180,39 @@ func startTransferRuntime(t *testing.T, modify func(*HTTPOptions), handlers pkgs
 	return r, server, connectHTTPTestClient(t, server, nil)
 }
 
+func normalizeTransferTestCall(name string, input any) (string, any) {
+	switch name {
+	case "xops_prepare_upload":
+		if u, ok := input.(PrepareUploadInput); ok {
+			u.Action = "prepare_push"
+			return "transfer", u
+		}
+		if m, ok := input.(map[string]any); ok {
+			m["action"] = "prepare_push"
+			return "transfer", m
+		}
+		return "transfer", input
+	case "xops_prepare_download":
+		if d, ok := input.(PrepareDownloadInput); ok {
+			d.Action = "prepare_pull"
+			return "transfer", d
+		}
+		if m, ok := input.(map[string]any); ok {
+			m["action"] = "prepare_pull"
+			return "transfer", m
+		}
+		return "transfer", input
+	default:
+		return name, input
+	}
+}
+
 func prepareTransferTest(t *testing.T, client *mcp.ClientSession, name string, input any) PreparedTransferOutput {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	result, err := client.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: input})
+	toolName, args := normalizeTransferTestCall(name, input)
+	result, err := client.CallTool(ctx, &mcp.CallToolParams{Name: toolName, Arguments: args})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -199,7 +199,7 @@ func TestRecoveryVerificationUsesConfiguredFileLimit(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		binding, err := ports.Bind(view, record.Spec.Scope, "xops_prepare_upload", record.Spec)
+		binding, err := ports.Bind(view, record.Spec.Scope, "transfer", record.Spec)
 		if err != nil {
 			t.Fatal(err)
 		}

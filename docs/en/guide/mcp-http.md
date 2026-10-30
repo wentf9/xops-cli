@@ -92,10 +92,10 @@ HTTP transfers have two steps: prepare a task through MCP, then run a transfer c
 
 | Action | MCP tool |
 | --- | --- |
-| Prepare an upload | `xops_prepare_upload` |
-| Prepare a download | `xops_prepare_download` |
-| Check task status | `xops_transfer_status` |
-| Cancel a task | `xops_transfer_cancel` |
+| Prepare an upload | `transfer` with `action: "prepare_push"` |
+| Prepare a download | `transfer` with `action: "prepare_pull"` |
+| Check task status | `transfer` with `action: "status"` |
+| Cancel a task | `transfer` with `action: "cancel"` |
 
 Have the client calculate the file size and SHA-256 when preparing an upload, and use an absolute path on the target server. Save the complete task content returned by the preparation tool as `upload-task.json` or `download-task.json`. It contains the transfer address and a short-lived credential; do not edit it manually, publish it or commit it to version control.
 
@@ -150,7 +150,7 @@ python3 scripts/mcp/transfer.py status --server http://192.168.1.10:8080 \
 | `failed`, `cancelled`, `expired` | Read the error, address its cause and prepare a new task |
 | `unknown` | The upload outcome is uncertain; verify it as described below before retrying |
 
-To cancel, ask the client to call `xops_transfer_cancel` with the task ID. An upload that has started committing may no longer be stoppable; check its final status. Closing the client or disconnecting the network does not confirm cancellation.
+To cancel, ask the client to call `transfer` (`action: "cancel"`) with the task ID. An upload that has started committing may no longer be stoppable; check its final status. Closing the client or disconnecting the network does not confirm cancellation.
 
 If a preparation response is lost, have the client retry preparation with the same request ID and arguments, then use the newly returned task content. Do not automatically replay file transfers. Check status after an upload timeout to avoid overwriting twice.
 
@@ -315,7 +315,7 @@ See the [MCP command reference](../reference/commands/xops-mcp) for details.
 
 ## Command interpreters and discovery
 
-`xops_ssh_run` resolves execution settings in order: request `execution` > node configuration > global configuration, supporting `bash`, `sh`, `zsh`, `fish`, `powershell`, `pwsh`, `cmd`, and `server` (`launch_dialect` is accepted as an alias for `launchDialect`, and `sudo: true` uses the same execution settings):
+`terminal` (`session: "once"`) resolves execution settings in order: request `execution` > node configuration > global configuration, supporting `bash`, `sh`, `zsh`, `fish`, `powershell`, `pwsh`, `cmd`, and `server` (`launch_dialect` is accepted as an alias for `launchDialect`, and `sudo: true` uses the same execution settings):
 
 ```json
 {

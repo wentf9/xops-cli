@@ -56,8 +56,9 @@ func TestUnknownCommitRecoveryDoesNotRepeatWrite(t *testing.T) {
 		t.Fatalf("lost reply was misclassified: %+v", status)
 	}
 	retry := input
+	retry.Action = "prepare_push"
 	retry.RequestID, retry.Overwrite = "new-request", true
-	result, err := client.CallTool(t.Context(), &mcp.CallToolParams{Name: "xops_prepare_upload", Arguments: retry})
+	result, err := client.CallTool(t.Context(), &mcp.CallToolParams{Name: "transfer", Arguments: retry})
 	if err != nil || !result.IsError {
 		t.Fatalf("uncertain destination was writable: %+v %v", result, err)
 	}
@@ -180,7 +181,7 @@ func TestCancelActiveTransferStopsIOAndKeepsServiceUsable(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("upload did not start")
 	}
-	result, err := client.CallTool(ctx, &mcp.CallToolParams{Name: "xops_transfer_cancel", Arguments: TransferTaskInput{TransferID: p.Task.ID}})
+	result, err := client.CallTool(ctx, &mcp.CallToolParams{Name: "transfer", Arguments: TransferTaskInput{Action: "cancel", TransferID: p.Task.ID}})
 	if err != nil || result.IsError {
 		t.Fatalf("cancel call: %+v %v", result, err)
 	}
@@ -197,7 +198,7 @@ func TestCancelActiveTransferStopsIOAndKeepsServiceUsable(t *testing.T) {
 		t.Fatalf("active cancellation status: %+v", status)
 	}
 	tools, err := client.ListTools(ctx, nil)
-	if err != nil || len(tools.Tools) != 14 {
+	if err != nil || len(tools.Tools) != 5 {
 		t.Fatalf("service unavailable after cancellation: %v", err)
 	}
 	if records := r.transfers.Records(); len(records) != 1 {

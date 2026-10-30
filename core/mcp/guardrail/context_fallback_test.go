@@ -39,11 +39,13 @@ func TestUpdatedPolicyFallbackDoesNotInheritStartupOptIn(t *testing.T) {
 				g := NewWithAuditSink(&policy.Config{Enabled: true, ApprovalThreshold: "safe", NoElicitFallback: startup}, &contextualAudit{})
 				for _, current := range []string{"", FallbackAllow, FallbackDeny, FallbackDowngrade} {
 					for _, dangerous := range []bool{false, true} {
-						tool := "xops_write_file"
+						tool := "file"
+						action := "write"
 						if dangerous {
-							tool = "xops_ssh_run"
+							tool = "terminal"
+							action = "once"
 						}
-						ri := RiskInput{ToolName: tool, Command: "rm -rf /var/tmp/fixture", Paths: []string{"/var/tmp/fixture"}}
+						ri := RiskInput{ToolName: tool, Action: action, Command: "rm -rf /var/tmp/fixture", Paths: []string{"/var/tmp/fixture"}}
 						executed := false
 						wrapped := WithGuardrail(g, tool, func(struct{}) RiskInput { return ri }, func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {
 							executed = true

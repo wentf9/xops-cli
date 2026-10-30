@@ -22,7 +22,7 @@ func boundRecord(t *testing.T) Record {
 	r.Version = recordVersion
 	r.Spec.RequestDigest = strings.Repeat("a", 64)
 	view := ports.OperationSnapshot{DomainID: "test", Targets: map[string]ports.Target{"node": {Info: ports.NodeInfo{ID: "node"}, Plan: ssh.ConnectionPlan{Scope: "test", Hops: []ssh.ConnectionConfig{{NodeID: "node", Address: "localhost", User: "fixture", AuthUpdateToken: "\xff\x00\x80", SudoUpdateToken: "\xfe\x00\x81"}}}}}}
-	binding, err := ports.Bind(view, r.Spec.Scope, "xops_prepare_upload", r.Spec)
+	binding, err := ports.Bind(view, r.Spec.Scope, "transfer", r.Spec)
 	if err != nil {
 		t.Fatal(err)
 	}

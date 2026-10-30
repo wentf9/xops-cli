@@ -33,7 +33,7 @@ func TestInvocationPoliciesAreIndependentDefensiveViews(t *testing.T) {
 	allowed.Enabled = true
 	allowed.BlockedPatterns[0] = "*"
 	second := WithPolicy(t.Context(), allowed, "second")
-	risk := RiskInput{ToolName: "xops_ssh_run", Command: "hostname"}
+	risk := RiskInput{ToolName: "terminal", Action: "once", Command: "hostname"}
 	if g.EvaluateContext(first, risk) != Allow || g.EvaluateContext(second, risk) != Deny {
 		t.Fatal("policy snapshots contaminated one another")
 	}
@@ -45,7 +45,7 @@ func TestOutcomeAuditSurvivesRequestCancellation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
 	ctx = WithPolicy(ctx, policy.Config{Enabled: false}, "bound-target")
-	handler := WithGuardrail(g, "xops_list_nodes", func(struct{}) RiskInput { return RiskInput{} },
+	handler := WithGuardrail(g, "nodes", func(struct{}) RiskInput { return RiskInput{} },
 		func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {
 			cancel()
 			return nil, struct{}{}, nil
@@ -66,7 +66,7 @@ func TestIntentAuditFailurePreventsExecution(t *testing.T) {
 	marker := errors.New("audit unavailable")
 	g := NewWithAuditSink(&policy.Config{Enabled: false}, failingContextAudit{marker})
 	executed := false
-	handler := WithGuardrail(g, "xops_list_nodes", func(struct{}) RiskInput { return RiskInput{} },
+	handler := WithGuardrail(g, "nodes", func(struct{}) RiskInput { return RiskInput{} },
 		func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {
 			executed = true
 			return nil, struct{}{}, nil

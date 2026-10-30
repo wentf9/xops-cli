@@ -26,7 +26,7 @@ func (a *Authorization) validate(spec Spec) error {
 	if a == nil {
 		return ErrBindingRequired
 	}
-	want, err := ports.Bind(a.Snapshot, spec.Scope, "xops_prepare_"+string(spec.Direction), spec)
+	want, err := ports.Bind(a.Snapshot, spec.Scope, "transfer", spec)
 	if err != nil {
 		return err
 	}

@@ -128,7 +128,7 @@ func TestLegacyHostBackendSudoSignalTermination(t *testing.T) {
 		}
 	})
 	view := ports.OperationSnapshot{DomainID: "fixture", Targets: map[string]ports.Target{"node": {Info: ports.NodeInfo{ID: "node"}, Version: "1", Plan: ssh.ConnectionPlan{Scope: "fixture", Hops: []ssh.ConnectionConfig{{NodeID: "node", Address: host, Port: port, User: "fixture", AuthType: "password", SudoMode: ssh.SudoModeRoot}}}}}}
-	binding, err := ports.Bind(view, "fixture", "xops_ssh_run", struct{}{})
+	binding, err := ports.Bind(view, "fixture", "terminal", struct{}{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +203,7 @@ func newExecutionBackendFixtureWithHandler(t *testing.T, mode ssh.SudoMode, hand
 		}
 	})
 	view := ports.OperationSnapshot{DomainID: "fixture", Targets: map[string]ports.Target{"node": {Info: ports.NodeInfo{ID: "node"}, Version: "1", Plan: ssh.ConnectionPlan{Scope: "fixture", Hops: []ssh.ConnectionConfig{{NodeID: "node", Address: host, Port: port, User: "fixture", AuthType: "password", SudoMode: mode}}}}}}
-	binding, err := ports.Bind(view, "fixture", "xops_ssh_run", struct{}{})
+	binding, err := ports.Bind(view, "fixture", "terminal", struct{}{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,7 +333,7 @@ func TestLegacyHostBackendFilesystemRejectsNonPOSIXDialects(t *testing.T) {
 			target := view.Targets["node"]
 			target.Execution = test.node
 			view.Targets["node"] = target
-			binding, err := ports.Bind(view, "fixture", "xops_ssh_run", struct{}{})
+			binding, err := ports.Bind(view, "fixture", "terminal", struct{}{})
 			if err != nil {
 				t.Fatal(err)
 			}

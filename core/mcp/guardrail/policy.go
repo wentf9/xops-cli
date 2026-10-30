@@ -78,15 +78,24 @@ func (p *Policy) Evaluate(risk RiskLevel, input RiskInput) Decision {
 		return Allow
 	}
 
-	if input.ToolName == "xops_ssh_run" && IsBlocked(input.Command) {
+	if input.ToolName == "terminal" && IsBlocked(input.Command) {
+		return Deny
+	}
+	if input.Text != "" && IsBlocked(input.Text) {
 		return Deny
 	}
 
+	candidates := []string{input.Command}
+	if input.Text != "" {
+		candidates = append(candidates, input.Text)
+	}
 	for _, pattern := range p.cfg.BlockedPatterns {
-		matched, err := filepath.Match(pattern, input.Command)
-		if err != nil || matched {
-			// Fail-closed: deny if pattern matches or if pattern matching produces an error
-			return Deny
+		for _, candidate := range candidates {
+			matched, err := filepath.Match(pattern, candidate)
+			if err != nil || matched {
+				// Fail-closed: deny if pattern matches or if pattern matching produces an error
+				return Deny
+			}
 		}
 	}
 

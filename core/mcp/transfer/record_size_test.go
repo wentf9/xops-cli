@@ -92,7 +92,7 @@ func TestOversizedAuthorizationDoesNotDisableTransferStore(t *testing.T) {
 	for i := range 2000 {
 		record.Authorization.Snapshot.Policy.NodeOverrides[fmt.Sprintf("node-%04d", i)] = policy.NodeConfig{ApprovalThreshold: "dangerous"}
 	}
-	binding, err := ports.Bind(record.Authorization.Snapshot, record.Spec.Scope, "xops_prepare_upload", record.Spec)
+	binding, err := ports.Bind(record.Authorization.Snapshot, record.Spec.Scope, "transfer", record.Spec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestAcceptedLargeTaskFitsFailureAndResolution(t *testing.T) {
 	r := boundRecord(t)
 	r.Spec.RemotePath = "/" + strings.Repeat("<", 1000) + "/file"
 	r.Authorization.Snapshot.Policy.AuditLog = strings.Repeat("x", 36<<10)
-	binding, err := ports.Bind(r.Authorization.Snapshot, r.Spec.Scope, "xops_prepare_upload", r.Spec)
+	binding, err := ports.Bind(r.Authorization.Snapshot, r.Spec.Scope, "transfer", r.Spec)
 	if err != nil {
 		t.Fatal(err)
 	}

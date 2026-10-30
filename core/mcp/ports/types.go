@@ -122,6 +122,19 @@ type Command struct {
 	Plan         *ssh.CommandPlan
 	Filesystem   bool
 	RequirePOSIX bool
+	// OutputLimit overrides the default captured output bound when Plan is
+	// nil. Zero selects ssh.DefaultCommandOutput.
+	OutputLimit int
+}
+
+// CommandOptions derives the plan options for c under the effective
+// execution configuration.
+func (c Command) CommandOptions(effective *ssh.ExecutionConfig) ssh.CommandOptions {
+	options := effective.CommandOptions()
+	if c.OutputLimit > 0 {
+		options.OutputLimit = c.OutputLimit
+	}
+	return options
 }
 
 type CommandResult struct {
@@ -217,8 +230,20 @@ type TransferSession interface {
 	ReserveCommit(context.Context, Permit) error
 }
 
+// TunnelBackend is an optional backend capability for running SSH port forwards.
 type TunnelBackend interface {
 	RunTunnel(context.Context, Permit, tunnel.Spec, func(string) bool, func(error)) error
+}
+
+// PTYSession represents a persistent interactive shell channel over SSH.
+type PTYSession interface {
+	io.ReadWriteCloser
+	Signal(sig string) error
+}
+
+// PTYBackend is an optional backend capability for opening persistent PTY shell sessions.
+type PTYBackend interface {
+	OpenPTY(context.Context, Permit, string) (PTYSession, error)
 }
 
 type Dependencies struct {

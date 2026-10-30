@@ -3,6 +3,7 @@
 package sshfixture
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/ed25519"
@@ -11,7 +12,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -41,6 +44,7 @@ type Server struct {
 	closeOnce     sync.Once
 	closeErr      error
 	execHandler   func(command string, channel ssh.Channel)
+	shellHandler  func(channel ssh.Channel, requests <-chan *ssh.Request)
 }
 
 type Options struct {
@@ -52,6 +56,8 @@ type Options struct {
 	HostKeys []ssh.Signer
 	// ExecHandler optionally overrides the synthetic command execution handler.
 	ExecHandler func(command string, channel ssh.Channel)
+	// ShellHandler optionally overrides the synthetic interactive shell handler.
+	ShellHandler func(channel ssh.Channel, requests <-chan *ssh.Request)
 }
 
 func New(ctx context.Context) (*Server, error) { return NewWithOptions(ctx, Options{}) }
@@ -82,7 +88,7 @@ func NewWithOptions(ctx context.Context, options Options) (*Server, error) {
 	}
 	work, cancel := context.WithCancel(ctx)
 	s := &Server{Address: listener.Addr().String(), HostKey: hostKeys[0].PublicKey(), ctx: work, cancel: cancel, listener: listener,
-		connections: make(map[net.Conn]struct{}), handlers: sftp.InMemHandler(), execHandler: options.ExecHandler, config: &ssh.ServerConfig{PasswordCallback: func(_ ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+		connections: make(map[net.Conn]struct{}), handlers: sftp.InMemHandler(), execHandler: options.ExecHandler, shellHandler: options.ShellHandler, config: &ssh.ServerConfig{PasswordCallback: func(_ ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
 			if string(password) != Password {
 				return nil, errors.New("fixture password rejected")
 			}
@@ -214,6 +220,15 @@ func (s *Server) session(channel ssh.Channel, requests <-chan *ssh.Request) {
 		switch request.Type {
 		case "pty-req":
 			s.record(request.Reply(true, nil))
+		case "shell":
+			s.Executed.Add(1)
+			s.record(request.Reply(true, nil))
+			if s.shellHandler != nil {
+				s.shellHandler(channel, requests)
+				return
+			}
+			s.defaultShell(channel, requests)
+			return
 		case "exec":
 			s.Executed.Add(1)
 			s.record(request.Reply(true, nil))
@@ -404,4 +419,108 @@ func (s *Server) acceptForward(connection *ssh.ServerConn, listener net.Listener
 			s.pipe(channel, requests, client)
 		}()
 	}
+}
+
+func (s *Server) defaultShell(channel ssh.Channel, requests <-chan *ssh.Request) {
+	reqDone := make(chan struct{})
+	go func() {
+		defer close(reqDone)
+		for req := range requests {
+			if req.WantReply {
+				s.record(req.Reply(true, nil))
+			}
+		}
+	}()
+	defer func() {
+		_ = channel.Close()
+		<-reqDone
+	}()
+
+	cwd := "/home/fixture"
+	env := make(map[string]string)
+	lastExit := 0
+
+	scanner := bufio.NewScanner(channel)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.Contains(line, "\x04") {
+			if strings.Contains(line, "\x04") {
+				break
+			}
+			continue
+		}
+		if strings.Contains(line, "\x03") {
+			lastExit = 130
+			_, err := io.WriteString(channel, "^C\n")
+			s.record(err)
+			continue
+		}
+		for _, stmt := range strings.Split(line, ";") {
+			if s.execShellStmt(channel, strings.TrimSpace(stmt), &cwd, env, &lastExit) {
+				return
+			}
+		}
+	}
+}
+
+// sentinelTokenPattern extracts the completion token from the persistent
+// session printf line, whose prefix is split across two printf arguments.
+var sentinelTokenPattern = regexp.MustCompile(`'DONE_([0-9a-f]+)'`)
+
+func (s *Server) execShellStmt(channel ssh.Channel, stmt string, cwd *string, env map[string]string, lastExit *int) bool {
+	if stmt == "" || strings.HasPrefix(stmt, "stty ") || strings.HasPrefix(stmt, "PS1=") {
+		return false
+	}
+	if stmt == "exit" {
+		_, err := channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0}))
+		s.record(err)
+		return true
+	}
+	if strings.HasPrefix(stmt, "cd ") {
+		arg := strings.TrimSpace(strings.TrimPrefix(stmt, "cd "))
+		arg = strings.TrimSpace(strings.TrimPrefix(arg, "--"))
+		arg = strings.Trim(arg, "'\"")
+		if arg != "" {
+			*cwd = arg
+		}
+		*lastExit = 0
+		return false
+	}
+	if stmt == "pwd" {
+		_, err := io.WriteString(channel, *cwd+"\n")
+		s.record(err)
+		*lastExit = 0
+		return false
+	}
+	if strings.HasPrefix(stmt, "export ") {
+		rest := strings.TrimSpace(strings.TrimPrefix(stmt, "export "))
+		for _, pair := range strings.Fields(rest) {
+			if k, v, ok := strings.Cut(pair, "="); ok {
+				env[k] = strings.Trim(v, "'\"")
+			}
+		}
+		*lastExit = 0
+		return false
+	}
+	if strings.HasPrefix(stmt, "echo ") {
+		text := strings.TrimSpace(strings.TrimPrefix(stmt, "echo "))
+		text = strings.Trim(text, "'\"")
+		for k, v := range env {
+			text = strings.ReplaceAll(text, "${"+k+"}", v)
+			text = strings.ReplaceAll(text, "$"+k, v)
+		}
+		_, err := io.WriteString(channel, text+"\n")
+		s.record(err)
+		*lastExit = 0
+		return false
+	}
+	if m := sentinelTokenPattern.FindStringSubmatch(stmt); m != nil {
+		_, err := fmt.Fprintf(channel, "\n___MCP_DONE_%s_%d___\n", m[1], *lastExit)
+		s.record(err)
+		return false
+	}
+	_, err := io.WriteString(channel, "fixture-output\n")
+	s.record(err)
+	*lastExit = 0
+	return false
 }

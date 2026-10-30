@@ -64,6 +64,13 @@ func (b *Backend) Inspect(ctx context.Context, permit ports.Permit, node string,
 	defer func() { retErr = errors.Join(retErr, remote.Close()) }()
 	return remote.Inspect(ctx, request.Path, request.Upload, request.Overwrite)
 }
+func (b *Backend) OpenPTY(ctx context.Context, _ ports.Permit, node string) (ports.PTYSession, error) {
+	client, err := b.Connector.Connect(ctx, node)
+	if err != nil {
+		return nil, err
+	}
+	return sshexec.OpenClientPTY(ctx, client, nil)
+}
 func (b *Backend) Shutdown(context.Context) error { return b.Connector.CloseAll() }
 func (b *Backend) RunTunnel(ctx context.Context, _ ports.Permit, spec tunnel.Spec, ready func(string) bool, report func(error)) (retErr error) {
 	connector := ssh.NewConnector(b.provider, b.provider.SSHOptions()...)

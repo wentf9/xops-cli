@@ -92,10 +92,10 @@ HTTP 文件传输分为两步：先通过 MCP 准备任务，再在客户端运�
 
 | 操作 | MCP 工具 |
 | --- | --- |
-| 准备上传任务 | `xops_prepare_upload` |
-| 准备下载任务 | `xops_prepare_download` |
-| 查询任务状态 | `xops_transfer_status` |
-| 取消任务 | `xops_transfer_cancel` |
+| 准备上传任务 | `transfer`，`action: "prepare_push"` |
+| 准备下载任务 | `transfer`，`action: "prepare_pull"` |
+| 查询任务状态 | `transfer`，`action: "status"` |
+| 取消任务 | `transfer`，`action: "cancel"` |
 
 让客户端在准备上传时计算文件大小和 SHA-256，并使用目标服务器上的绝对路径。把准备工具返回的完整任务内容保存为 `upload-task.json` 或 `download-task.json`，其中包含传输地址和短期凭证；不要手动修改，也不要公开或提交到版本库。
 
@@ -150,7 +150,7 @@ python3 scripts/mcp/transfer.py status --server http://192.168.1.10:8080 \
 | `failed`、`cancelled`、`expired` | 查看错误原因，处理后重新申请传输任务 |
 | `unknown` | 上传结果不确定，先按下文核验，暂勿重传 |
 
-取消时，让客户端调用 `xops_transfer_cancel` 并提供任务 ID。已经开始提交的上传可能无法停止，应继续查询最终状态。关闭客户端或断开网络不代表操作已取消。
+取消时，让客户端调用 `transfer`（`action: "cancel"`）并提供任务 ID。已经开始提交的上传可能无法停止，应继续查询最终状态。关闭客户端或断开网络不代表操作已取消。
 
 如果准备任务的回复丢失，让客户端使用相同的请求 ID 和参数重试准备步骤，并使用新返回的任务内容。文件传输本身不应自动重试；上传超时后先查询状态，避免重复覆盖。
 
@@ -315,7 +315,7 @@ curl --max-time 10 --include https://mcp.example.com/mcp
 
 ## 命令解释器与自动探测
 
-`xops_ssh_run` 的执行配置优先级为：请求参数 `execution` > 节点配置 > 全局配置，支持 `bash`、`sh`、`zsh`、`fish`、`powershell`、`pwsh`、`cmd` 和 `server`（JSON 中 `launch_dialect` 与 `launchDialect` 均可识别，`sudo: true` 复用相同的执行配置）：
+`terminal`（`session: "once"`）的执行配置优先级为：请求参数 `execution` > 节点配置 > 全局配置，支持 `bash`、`sh`、`zsh`、`fish`、`powershell`、`pwsh`、`cmd` 和 `server`（JSON 中 `launch_dialect` 与 `launchDialect` 均可识别，`sudo: true` 复用相同的执行配置）：
 
 ```json
 {

@@ -21,10 +21,10 @@ OpenSSH identifiers, including IDs resolved from aliases, must not contain white
 
 | Tool | Input | Purpose |
 | --- | --- | --- |
-| `xops_tunnel_create` | `requestID`, `nodeID`, `mode`, `listenPort`, `targetHost`, `targetPort`; optional `listenHost`, `ttlSeconds` | Create a tunnel and return its state |
-| `xops_tunnel_list` | Optional `nodeID`, `state` | List this process's tunnels and retained terminal records |
-| `xops_tunnel_status` | `tunnelID` | Query one tunnel |
-| `xops_tunnel_stop` | `tunnelID` | Stop listening and close existing forwarded connections |
+| `tunnel` with `action: "create"` | `requestID`, `nodeID`, `mode`, `listenPort`, `targetHost`, `targetPort`; optional `listenHost`, `ttlSeconds` | Create a tunnel and return its state |
+| `tunnel` with `action: "list"` | Optional `nodeID`, `state` | List this process's tunnels and retained terminal records |
+| `tunnel` with `action: "status"` | `tunnelID` | Query one tunnel |
+| `tunnel` with `action: "stop"` | `tunnelID` | Stop listening and close existing forwarded connections |
 
 After a node is disabled or deleted, its retained canonical `nodeID` can still filter tunnel history, together with `state`. A retained canonical ID takes precedence over a current alias with that spelling; other aliases use current inventory resolution. History queries still enforce current global and node policies. Cancelling or expiring a list request cancels its node lookup and query without changing background tunnel TTLs.
 

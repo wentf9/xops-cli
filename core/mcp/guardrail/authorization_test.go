@@ -11,7 +11,7 @@ func TestDeferredAuthorizationDoesNotReportExecution(t *testing.T) {
 	g := New(defaultTestConfig())
 	audit := &fakeAuditWriter{}
 	g.SetAuditWriter(audit)
-	risk := RiskInput{ToolName: "xops_prepare_upload", NodeID: "fixture", NodeIDs: []string{"first", "second"}, Paths: []string{"/tmp/file"}, Details: "size=3; overwrite=false"}
+	risk := RiskInput{ToolName: "transfer", Action: "prepare_push", NodeID: "fixture", NodeIDs: []string{"first", "second"}, Paths: []string{"/tmp/file"}, Details: "size=3; overwrite=false"}
 	op, pending, err := g.Authorize(t.Context(), &mcp.CallToolRequest{}, risk, struct{ Size int }{3})
 	if err != nil || pending != nil || op == "" {
 		t.Fatalf("authorization: op=%q pending=%+v err=%v", op, pending, err)
@@ -35,7 +35,7 @@ func TestDeferredAuthorizationDoesNotReportExecution(t *testing.T) {
 func TestDeferredAuthorizationAuditFailureIssuesNoGrant(t *testing.T) {
 	g := New(defaultTestConfig())
 	g.SetAuditWriter(&fakeAuditWriter{failOn: 1})
-	op, pending, err := g.Authorize(t.Context(), nil, RiskInput{ToolName: "xops_prepare_download"}, struct{}{})
+	op, pending, err := g.Authorize(t.Context(), nil, RiskInput{ToolName: "transfer", Action: "prepare_pull"}, struct{}{})
 	if err == nil || op != "" || pending != nil {
 		t.Fatalf("grant survived audit failure: %q %+v %v", op, pending, err)
 	}

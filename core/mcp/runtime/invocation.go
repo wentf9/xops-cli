@@ -343,15 +343,3 @@ func (r *Runtime) getMCPSFTPClient(ctx context.Context, nodeID string) (ports.Fi
 	}
 	return r.backend.OpenFiles(ctx, op.permit, nodeID)
 }
-
-func (r *Runtime) commandResult(ctx context.Context, nodeID, command string, sudo bool, exec *ssh.ExecutionConfig) (ports.CommandResult, error) {
-	op, err := currentOperation(ctx)
-	if err != nil {
-		return ports.CommandResult{}, err
-	}
-	if op.execution != nil {
-		exec = op.execution.Clone()
-	}
-	result, err := r.backend.Run(ctx, op.permit, nodeID, ports.Command{Text: command, Sudo: sudo, Execution: exec})
-	return result, FormatMCPError(err)
-}

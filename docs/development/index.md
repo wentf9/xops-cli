@@ -32,6 +32,7 @@ golangci-lint run ./...
 - [SSH 执行环境探针实施记录（M1–M4）](./ssh-execution-probe-implementation.md)
 - [公共代码与 MCP 接口解耦设计](./shared-core-decoupling)
 - [MCP Streamable HTTP 与文件流转发设计](./mcp-http-transfer-design.md)
+- [MCP 极简全能型工具架构重构设计](./mcp-minimal-tools-design.md)
 - [离线凭据库兼容性](./compatibility.md)
 - [凭据零配置体验设计](./credential-experience-design)
 - [凭据体验实施计划](./credential-experience-plan)

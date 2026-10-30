@@ -193,7 +193,7 @@ func TestMCPTunnelOpenSSHWhitespaceCannotBypassPolicy(t *testing.T) {
 				input := tunnelTestInput(t, target, "local", fmt.Sprintf("whitespace-%d", i))
 				input.NodeID = nodeID
 				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-				result, err := client.CallTool(ctx, &mcp.CallToolParams{Name: "xops_tunnel_create", Arguments: input})
+				result, err := client.CallTool(ctx, &mcp.CallToolParams{Name: "tunnel", Arguments: input})
 				cancel()
 				if err != nil {
 					t.Fatal(err)

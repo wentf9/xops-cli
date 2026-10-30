@@ -230,6 +230,7 @@ type backend struct {
 
 var _ ports.TunnelBackend = (*backend)(nil)
 var _ ports.ExecutionProber = (*backend)(nil)
+var _ ports.PTYBackend = (*backend)(nil)
 
 func (b *backend) ProbeExecution(ctx context.Context, permit ports.Permit, nodeID string) (_ *ssh.ProbeResult, retErr error) {
 	work, cancel, err := ports.WorkContext(ctx, permit, ports.Inspect)
@@ -275,7 +276,7 @@ func (b *backend) Run(ctx context.Context, permit ports.Permit, nodeID string, c
 	if command.Plan != nil {
 		plan = *command.Plan
 	} else {
-		plan, err = ssh.PlanCommand(command.Text, effectiveExec.CommandOptions())
+		plan, err = ssh.PlanCommand(command.Text, command.CommandOptions(effectiveExec))
 		if err != nil {
 			return ports.CommandResult{
 				Outcome:      ssh.ExecutionNotStarted,
@@ -369,5 +370,21 @@ func (b *backend) OpenTransfer(ctx context.Context, permit ports.Permit, nodeID 
 		return nil, err
 	}
 	return ports.GuardTransfer(context.WithoutCancel(ctx), remotefile.New(files), permit)
+}
+func (b *backend) OpenPTY(ctx context.Context, permit ports.Permit, nodeID string) (ports.PTYSession, error) {
+	work, cancel, err := ports.WorkContext(ctx, permit, ports.Execute)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	_, target, err := permit.Snapshot().Resolve(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	connection, err := b.connector.ConnectPlan(work, target.Plan)
+	if err != nil {
+		return nil, err
+	}
+	return sshexec.OpenClientPTY(work, connection.Client, connection.Close)
 }
 func (b *backend) Shutdown(context.Context) error { return b.connector.CloseAll() }

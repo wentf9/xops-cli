@@ -10,6 +10,7 @@ import (
 	logger "github.com/wentf9/xops-cli/core/log"
 	"github.com/wentf9/xops-cli/core/mcp/guardrail"
 	"github.com/wentf9/xops-cli/core/mcp/ports"
+	"github.com/wentf9/xops-cli/core/mcp/session"
 	"github.com/wentf9/xops-cli/core/mcp/transfer"
 	"github.com/wentf9/xops-cli/core/mcp/tunnel"
 	"github.com/wentf9/xops-cli/core/ssh"
@@ -65,6 +66,7 @@ type Runtime struct {
 	logger         logger.DebugLogger
 	initializeGate chan struct{}
 	recoveryDone   <-chan struct{}
+	sessions       *session.Manager
 	tunnels        *tunnel.Manager
 	tunnelRun      tunnel.Runner
 	toolTimeout    time.Duration
@@ -117,7 +119,7 @@ func NewRuntime(ctx context.Context, opts ...Option) (_ *Runtime, retErr error) 
 	work, cancel := context.WithCancel(ctx)
 	r := &Runtime{ctx: work, cancel: cancel, provider: cfg.dependencies.State, gate: cfg.dependencies.Gate,
 		guardrail: guardrail.NewWithAuditSink(&initial.Policy, cfg.dependencies.Audit), http: cfg.http, logger: cfg.logger,
-		tunnelRun: cfg.tunnelRun, toolTimeout: cfg.toolTimeout, closeDone: make(chan struct{})}
+		sessions: session.NewManager(0), tunnelRun: cfg.tunnelRun, toolTimeout: cfg.toolTimeout, closeDone: make(chan struct{})}
 	published := false
 	defer func() {
 		if !published {
@@ -206,6 +208,9 @@ func (r *Runtime) Shutdown(ctx context.Context) error {
 
 func (r *Runtime) shutdown(ctx context.Context) (result error) {
 	r.cancel()
+	if r.sessions != nil {
+		result = errors.Join(result, r.sessions.Shutdown(ctx))
+	}
 	if r.tunnels != nil {
 		result = errors.Join(result, r.tunnels.Shutdown(ctx))
 	}

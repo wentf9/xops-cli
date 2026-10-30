@@ -25,7 +25,7 @@ import (
 
 func uploadBoundaryInput(id, name string, data []byte) PrepareUploadInput {
 	digest := sha256.Sum256(data)
-	return PrepareUploadInput{RequestID: id, NodeID: "files", RemotePath: name, Size: int64(len(data)), SHA256: hex.EncodeToString(digest[:])}
+	return PrepareUploadInput{Action: "prepare_push", RequestID: id, NodeID: "files", RemotePath: name, Size: int64(len(data)), SHA256: hex.EncodeToString(digest[:])}
 }
 
 func withBoundarySFTP(t *testing.T, r *Runtime, fn func(*pkgsftp.Client) error) {
@@ -71,7 +71,7 @@ func TestTransferDestinationBoundaries(t *testing.T) {
 		t.Fatalf("initial upload: %d %s", response.StatusCode, body)
 	}
 	input.RequestID = "no-clobber"
-	result, err := client.CallTool(t.Context(), &mcp.CallToolParams{Name: "xops_prepare_upload", Arguments: input})
+	result, err := client.CallTool(t.Context(), &mcp.CallToolParams{Name: "transfer", Arguments: input})
 	if err != nil || !result.IsError {
 		t.Fatalf("existing destination allowed: %+v %v", result, err)
 	}
@@ -108,13 +108,13 @@ func TestTransferDestinationBoundaries(t *testing.T) {
 	})
 	for _, name := range []string{"/directory", "/link"} {
 		for _, direction := range []string{"upload", "download"} {
-			var args any = PrepareDownloadInput{RequestID: direction + name, NodeID: "files", RemotePath: name}
+			var args any = PrepareDownloadInput{Action: "prepare_pull", RequestID: direction + name, NodeID: "files", RemotePath: name}
 			if direction == "upload" {
 				u := uploadBoundaryInput(direction+name, name, nil)
 				u.Overwrite = true
 				args = u
 			}
-			result, err := client.CallTool(t.Context(), &mcp.CallToolParams{Name: "xops_prepare_" + direction, Arguments: args})
+			result, err := client.CallTool(t.Context(), &mcp.CallToolParams{Name: "transfer", Arguments: args})
 			if err != nil || !result.IsError {
 				t.Fatalf("%s accepted %s: %+v %v", direction, name, result, err)
 			}
@@ -331,7 +331,7 @@ func TestOverwriteRequiresAdvertisedAtomicRename(t *testing.T) {
 	r, _, client := startTransferRuntime(t, nil, pkgsftp.InMemHandler())
 	input := uploadBoundaryInput("unsupported-replace", "/destination", nil)
 	input.Overwrite = true
-	result, err := client.CallTool(t.Context(), &mcp.CallToolParams{Name: "xops_prepare_upload", Arguments: input})
+	result, err := client.CallTool(t.Context(), &mcp.CallToolParams{Name: "transfer", Arguments: input})
 	if err != nil || !result.IsError {
 		t.Fatalf("atomic rename unavailable but preparation allowed: %+v %v", result, err)
 	}

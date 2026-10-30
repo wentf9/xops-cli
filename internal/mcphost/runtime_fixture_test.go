@@ -103,12 +103,12 @@ func callTool(ctx context.Context, client *mcp.ClientSession, name string, input
 
 func (f *runtimeFixture) listNodesHandler(ctx context.Context, _ *mcp.CallToolRequest, input mcpruntime.ListNodesInput) (*mcp.CallToolResult, mcpruntime.ListNodesOutput, error) {
 	var output mcpruntime.ListNodesOutput
-	result, err := callTool(ctx, f.client, "xops_list_nodes", input, &output)
+	result, err := callTool(ctx, f.client, "nodes", input, &output)
 	return result, output, err
 }
-func (f *runtimeFixture) sshRunHandler(ctx context.Context, _ *mcp.CallToolRequest, input mcpruntime.SshRunInput) (*mcp.CallToolResult, mcpruntime.SshRunOutput, error) {
-	var output mcpruntime.SshRunOutput
-	result, err := callTool(ctx, f.client, "xops_ssh_run", input, &output)
+func (f *runtimeFixture) sshRunHandler(ctx context.Context, _ *mcp.CallToolRequest, input mcpruntime.TerminalInput) (*mcp.CallToolResult, mcpruntime.TerminalOutput, error) {
+	var output mcpruntime.TerminalOutput
+	result, err := callTool(ctx, f.client, "terminal", input, &output)
 	return result, output, err
 }
 func (f *runtimeFixture) connectMCPNode(ctx context.Context, nodeID string) (*ssh.Client, error) {

@@ -37,8 +37,8 @@ func TestWithGuardrail_TwoPhaseAudit(t *testing.T) {
 		return nil, dummyOutput{Response: "success"}, nil
 	}
 
-	wrapped := WithGuardrail(g, "xops_list_nodes", func(in dummyInput) RiskInput {
-		return RiskInput{ToolName: "xops_list_nodes", Command: in.Command, Details: "tunnelID=example", NodeIDs: []string{"first", "second"}}
+	wrapped := WithGuardrail(g, "nodes", func(in dummyInput) RiskInput {
+		return RiskInput{ToolName: "nodes", Command: in.Command, Details: "tunnelID=example", NodeIDs: []string{"first", "second"}}
 	}, handler)
 
 	_, out, err := wrapped(context.Background(), &mcp.CallToolRequest{}, dummyInput{Command: "ls"})
@@ -109,8 +109,8 @@ func TestWithGuardrail_FirstAuditFails_BlocksExecution(t *testing.T) {
 		return nil, dummyOutput{Response: "success"}, nil
 	}
 
-	wrapped := WithGuardrail(g, "xops_list_nodes", func(in dummyInput) RiskInput {
-		return RiskInput{ToolName: "xops_list_nodes", Command: in.Command}
+	wrapped := WithGuardrail(g, "nodes", func(in dummyInput) RiskInput {
+		return RiskInput{ToolName: "nodes", Command: in.Command}
 	}, handler)
 
 	_, _, err := wrapped(context.Background(), &mcp.CallToolRequest{}, dummyInput{Command: "ls"})
@@ -140,8 +140,8 @@ func TestWithGuardrail_SecondAuditFails_PreservesResultAndWarns(t *testing.T) {
 		}, dummyOutput{Response: "data created"}, nil
 	}
 
-	wrapped := WithGuardrail(g, "xops_list_nodes", func(in dummyInput) RiskInput {
-		return RiskInput{ToolName: "xops_list_nodes", Command: in.Command}
+	wrapped := WithGuardrail(g, "nodes", func(in dummyInput) RiskInput {
+		return RiskInput{ToolName: "nodes", Command: in.Command}
 	}, handler)
 
 	res, out, err := wrapped(context.Background(), &mcp.CallToolRequest{}, dummyInput{Command: "ls"})
@@ -192,12 +192,12 @@ func TestWithGuardrail_SecondAuditFails_PreservesResultAcrossMCPTransport(t *tes
 			Content: []mcp.Content{&mcp.TextContent{Text: "business output"}},
 		}, dummyOutput{Response: "data created"}, nil
 	}
-	wrapped := WithGuardrail(g, "xops_list_nodes", func(in dummyInput) RiskInput {
-		return RiskInput{ToolName: "xops_list_nodes", Command: in.Command}
+	wrapped := WithGuardrail(g, "nodes", func(in dummyInput) RiskInput {
+		return RiskInput{ToolName: "nodes", Command: in.Command}
 	}, handler)
 
 	server := mcp.NewServer(&mcp.Implementation{Name: "test-server", Version: "v1"}, nil)
-	mcp.AddTool(server, &mcp.Tool{Name: "xops_list_nodes"}, wrapped)
+	mcp.AddTool(server, &mcp.Tool{Name: "nodes"}, wrapped)
 	clientTransport, serverTransport := mcp.NewInMemoryTransports()
 	serverSession, err := server.Connect(t.Context(), serverTransport, nil)
 	if err != nil {
@@ -221,7 +221,7 @@ func TestWithGuardrail_SecondAuditFails_PreservesResultAcrossMCPTransport(t *tes
 	})
 
 	result, err := clientSession.CallTool(t.Context(), &mcp.CallToolParams{
-		Name:      "xops_list_nodes",
+		Name:      "nodes",
 		Arguments: dummyInput{Command: "ls"},
 	})
 	if err != nil {
