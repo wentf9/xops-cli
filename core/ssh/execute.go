@@ -50,45 +50,131 @@ func (c *Client) RunScriptWithSudoExecution(ctx context.Context, content string,
 }
 
 func (c *Client) configuredSudoOptions(ctx context.Context, command string, execution *ExecutionConfig) ([]RunOption, error) {
+	if execution == nil {
+		return nil, nil
+	}
 	opts, err := execution.SudoRunOptions(command)
 	if err != nil {
 		return nil, err
 	}
 	if isExecutionConfigured(execution) {
-		if err := c.maybeDetectSudoMode(ctx); err != nil {
-			return nil, err
-		}
 		// Legacy su cannot enforce a configured interpreter/login contract.
 		// The portable adapter pins /bin/sh for control and starts user code separately.
-		config := c.defaultRunConfig()
+		config := c.defaultPrivilegeRunConfig()
 		for _, opt := range opts {
 			opt(config)
 		}
-		if c.ConnectionConfig().SudoMode == SudoModeSu && !usesPortableShellAdapter(config) {
+		if err := c.maybeDetectSudoMode(ctx, config); err != nil {
+			return nil, err
+		}
+		if c.ConnectionConfig().SudoMode == SudoModeSu && !usesPortableShellAdapter(config) && config.Interpreter != InterpreterSh {
 			return nil, fmt.Errorf("%w: configured su execution is not supported", ErrExecutionValidation)
 		}
 	}
 	return opts, nil
 }
 
-func (c *Client) RunWithSudo(ctx context.Context, command string, opts ...RunOption) (string, error) {
-	config := c.defaultRunConfig()
+func (c *Client) shouldProbePrivilegeExecution() bool {
+	if c == nil || !NeedsExecutionProbe(c.privilegeExecution()) {
+		return false
+	}
+	switch c.ConnectionConfig().SudoMode {
+	case "", SudoModeAuto, SudoModeRoot, SudoModeSudoer, SudoModeSudo, SudoModeSu:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Client) ensureNonInteractivePrivilegeCredential(ctx context.Context) (*PrivilegeMaterial, error) {
+	if c == nil || credentialRecoveryPrompter(c.prompter) != nil {
+		return nil, nil
+	}
+	mode := c.ConnectionConfig().SudoMode
+	if mode != SudoModeSudo && mode != SudoModeSu {
+		return nil, nil
+	}
+	kind := SecretKindSudoPassword
+	if mode == SudoModeSu {
+		kind = SecretKindSuPassword
+	}
+	value, err := c.resolvePrivilegeMaterial(ctx, kind)
+	if err != nil {
+		return nil, fmt.Errorf("%s password is required but not provided: %w", mode, err)
+	}
+	return value, nil
+}
+
+func (c *Client) maybeProbeExecutionForPrivilege(ctx context.Context) (*PrivilegeMaterial, error) {
+	if !c.shouldProbePrivilegeExecution() {
+		return nil, nil
+	}
+	mat, err := c.ensureNonInteractivePrivilegeCredential(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := c.maybeProbePrivilegeExecution(ctx); err != nil {
+		mat.Zero()
+		return nil, err
+	}
+	return mat, nil
+}
+
+func (c *Client) preparePrivilegeRunConfig(opts ...RunOption) (callerCfg *RunConfig, config *RunConfig) {
+	callerCfg = DefaultRunConfig()
+	for _, opt := range opts {
+		opt(callerCfg)
+	}
+	config = c.defaultPrivilegeRunConfig()
+	baseLogin := config.LoginShell
 	for _, opt := range opts {
 		opt(config)
 	}
+	if callerCfg.Interpreter == "" {
+		if config.Interpreter == InterpreterSh {
+			config.LoginShell = false
+		} else if c != nil && NeedsExecutionProbe(c.Execution()) {
+			if exec := c.privilegeExecution(); exec != nil && exec.Login == nil && (config.Interpreter == InterpreterZsh || config.Interpreter == InterpreterFish) {
+				config.LoginShell = baseLogin
+			}
+		}
+	}
+	return callerCfg, config
+}
 
-	if err := c.maybeDetectSudoMode(ctx); err != nil {
+func (c *Client) resolvePrivilegeRunConfig(ctx context.Context, opts ...RunOption) (*RunConfig, *PrivilegeMaterial, error) {
+	callerCfg, _ := c.preparePrivilegeRunConfig(opts...)
+	if err := c.maybeDetectSudoMode(ctx, callerCfg); err != nil {
+		return nil, nil, err
+	}
+	var mat *PrivilegeMaterial
+	if callerCfg.Interpreter == "" {
+		var err error
+		mat, err = c.maybeProbeExecutionForPrivilege(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	_, config := c.preparePrivilegeRunConfig(opts...)
+	return config, mat, nil
+}
+
+func (c *Client) RunWithSudo(ctx context.Context, command string, opts ...RunOption) (string, error) {
+	config, mat, err := c.resolvePrivilegeRunConfig(ctx, opts...)
+	if err != nil {
 		return "", err
 	}
+	defer func() { mat.Zero() }()
 	connCfg := c.ConnectionConfig()
 
 	if usesPortableShellAdapter(config) {
-		return c.runPortableWithSudo(ctx, command, false, config)
+		return c.runPortableWithSudo(ctx, command, false, config, mat)
 	}
 
 	var wrappedCmd string
 	switch config.Interpreter {
 	case "", InterpreterBash:
+		config.Interpreter = InterpreterBash
 		wrappedCmd = bashCommandPayload(command, config.LoginShell)
 	case InterpreterSh:
 		wrappedCmd = shCommandPayload(command)
@@ -98,13 +184,13 @@ func (c *Client) RunWithSudo(ctx context.Context, command string, opts ...RunOpt
 
 	switch connCfg.SudoMode {
 	case SudoModeRoot:
-		return c.Run(ctx, command, opts...)
+		return c.Run(ctx, command, func(target *RunConfig) { *target = *config })
 	case SudoModeSudoer:
 		return c.runWithSudo(ctx, wrappedCmd, nil, nil, config)
 	case SudoModeSudo:
-		return c.runPrivilegeWithConfig(ctx, connCfg.SudoMode, wrappedCmd, nil, config)
+		return c.runPrivilegeWithConfig(ctx, connCfg.SudoMode, wrappedCmd, nil, config, mat)
 	case SudoModeSu:
-		return c.runPrivilegeWithConfig(ctx, connCfg.SudoMode, command, nil, config)
+		return c.runPrivilegeWithConfig(ctx, connCfg.SudoMode, command, nil, config, mat)
 	default:
 		return "", fmt.Errorf("unknown sudo mode: %s, please check config to set sudo mode", connCfg.SudoMode)
 	}
@@ -115,23 +201,21 @@ func (c *Client) RunScriptWithSudo(ctx context.Context, scriptContent string, op
 	if strings.HasPrefix(scriptContent, "\xef\xbb\xbf") {
 		return "", fmt.Errorf("%w: script contains unsupported UTF-8 BOM prefix", ErrExecutionValidation)
 	}
-	config := c.defaultRunConfig()
-	for _, opt := range opts {
-		opt(config)
-	}
-
-	if err := c.maybeDetectSudoMode(ctx); err != nil {
+	config, mat, err := c.resolvePrivilegeRunConfig(ctx, opts...)
+	if err != nil {
 		return "", err
 	}
+	defer func() { mat.Zero() }()
 	connCfg := c.ConnectionConfig()
 
 	if usesPortableShellAdapter(config) {
-		return c.runPortableWithSudo(ctx, scriptContent, true, config)
+		return c.runPortableWithSudo(ctx, scriptContent, true, config, mat)
 	}
 
 	var bashArgs, bashCmd string
 	switch config.Interpreter {
 	case "", InterpreterBash:
+		config.Interpreter = InterpreterBash
 		bashArgs = bashScriptPayload(config.LoginShell)
 		bashCmd = bashCommandPayload(scriptContent, config.LoginShell)
 	case InterpreterSh:
@@ -143,13 +227,13 @@ func (c *Client) RunScriptWithSudo(ctx context.Context, scriptContent string, op
 
 	switch connCfg.SudoMode {
 	case SudoModeRoot:
-		return c.RunScript(ctx, scriptContent, opts...)
+		return c.RunScript(ctx, scriptContent, func(target *RunConfig) { *target = *config })
 	case SudoModeSudoer:
 		return c.runWithSudo(ctx, bashArgs, nil, strings.NewReader(scriptContent), config)
 	case SudoModeSudo:
-		return c.runPrivilegeWithConfig(ctx, connCfg.SudoMode, bashArgs, strings.NewReader(scriptContent), config)
+		return c.runPrivilegeWithConfig(ctx, connCfg.SudoMode, bashArgs, strings.NewReader(scriptContent), config, mat)
 	case SudoModeSu:
-		return c.runPrivilegeWithConfig(ctx, connCfg.SudoMode, bashCmd, nil, config)
+		return c.runPrivilegeWithConfig(ctx, connCfg.SudoMode, bashCmd, nil, config, mat)
 	default:
 		return "", fmt.Errorf("unsupported sudo mode: %s", connCfg.SudoMode)
 	}
@@ -171,7 +255,7 @@ func (c *Client) RunInteractiveWithSudoExecution(ctx context.Context, command st
 	if err != nil {
 		return err
 	}
-	config := c.defaultRunConfig()
+	config := c.defaultPrivilegeRunConfig()
 	for _, opt := range opts {
 		opt(config)
 	}
@@ -190,12 +274,18 @@ func (c *Client) RunInteractiveWithSudoExecution(ctx context.Context, command st
 // RunInteractiveWithSudoIO uses an authenticated terminal handoff before
 // consuming caller input. The injected streams avoid process-global I/O changes.
 func (c *Client) RunInteractiveWithSudoIO(ctx context.Context, command string, streams InteractiveIO) (retErr error) {
-	if err := c.maybeDetectSudoMode(ctx); err != nil {
+	mat, err := c.maybeProbeExecutionForPrivilege(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { mat.Zero() }()
+	config := c.defaultPrivilegeRunConfig()
+	if err := c.maybeDetectSudoMode(ctx, config); err != nil {
 		return err
 	}
 	mode := c.ConnectionConfig().SudoMode
-	if usesPortableShellAdapter(c.defaultRunConfig()) {
-		return c.runInteractivePortableWithSudo(ctx, mode, command, streams, false, c.defaultRunConfig())
+	if usesPortableShellAdapter(config) || config.Interpreter == InterpreterSh {
+		return c.runInteractivePortableWithSudo(ctx, mode, command, streams, false, config, mat)
 	}
 	switch mode {
 	case SudoModeRoot:
@@ -211,7 +301,7 @@ func (c *Client) RunInteractiveWithSudoIO(ctx context.Context, command string, s
 		c.observePrivilegeCommand(mode, preview)
 		return c.RunInteractiveCmdWithIO(ctx, wrapped, streams)
 	case SudoModeSudo, SudoModeSu:
-		return c.runInteractivePrivilege(ctx, mode, "exec "+bashCommandPayload(command, false), streams)
+		return c.runInteractivePrivilege(ctx, mode, "exec "+bashCommandPayload(command, false), streams, mat)
 	default:
 		return fmt.Errorf("interactive privilege escalation is unsupported for sudo mode %q", mode)
 	}
@@ -286,12 +376,18 @@ func (c *Client) ShellWithSudo(ctx context.Context) error {
 
 // ShellWithSudoIO authenticates before switching the local terminal to raw mode.
 func (c *Client) ShellWithSudoIO(ctx context.Context, streams InteractiveIO) (retErr error) {
-	if err := c.maybeDetectSudoMode(ctx); err != nil {
+	mat, err := c.maybeProbeExecutionForPrivilege(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { mat.Zero() }()
+	config := c.defaultPrivilegeRunConfig()
+	if err := c.maybeDetectSudoMode(ctx, config); err != nil {
 		return err
 	}
 	mode := c.ConnectionConfig().SudoMode
-	if usesPortableShellAdapter(c.defaultRunConfig()) {
-		return c.runInteractivePortableWithSudo(ctx, mode, "", streams, true, c.defaultRunConfig())
+	if usesPortableShellAdapter(config) || config.Interpreter == InterpreterSh {
+		return c.runInteractivePortableWithSudo(ctx, mode, "", streams, true, config, mat)
 	}
 	switch mode {
 	case SudoModeRoot:
@@ -302,7 +398,7 @@ func (c *Client) ShellWithSudoIO(ctx context.Context, streams InteractiveIO) (re
 		c.observePrivilegeCommand(mode, "sudo -i")
 		return c.runTerminalSession(ctx, "sudo -i", streams, false, true)
 	case SudoModeSudo, SudoModeSu:
-		return c.runInteractivePrivilegeSession(ctx, mode, `exec "${SHELL:-/bin/bash}"`, streams, true, nil)
+		return c.runInteractivePrivilegeSession(ctx, mode, `exec "${SHELL:-/bin/bash}"`, streams, true, nil, mat)
 	default:
 		return fmt.Errorf("privilege escalation is not supported for this host (sudo_mode=%s)", mode)
 	}
@@ -382,13 +478,17 @@ func (c *Client) RunCommandWithInput(ctx context.Context, command string, input 
 }
 
 func (c *Client) resolveCommandIOInterpreter(sudo bool, command string) (Interpreter, error) {
-	if exec := c.Execution(); exec != nil {
+	exec := c.Execution()
+	if sudo {
+		exec = c.privilegeExecution()
+	}
+	if exec != nil {
 		if err := exec.Validate(); err != nil {
 			return "", err
 		}
 	}
 	interp := InterpreterServer
-	if exec := c.Execution(); exec != nil && exec.EffectiveInterpreter() != "" {
+	if exec != nil && exec.EffectiveInterpreter() != "" {
 		interp = exec.EffectiveInterpreter()
 	} else if sudo {
 		interp = InterpreterBash
@@ -399,7 +499,10 @@ func (c *Client) resolveCommandIOInterpreter(sudo bool, command string) (Interpr
 		return "", fmt.Errorf("%w: unsupported interpreter %q for RunCommandWithIO (only server, bash, sh, zsh and fish are supported)", ErrExecutionValidation, interp)
 	}
 	config := c.defaultRunConfig()
-	config.Interpreter, config.LoginShell = interp, c.resolveExecutionLogin(interp)
+	if sudo {
+		config = c.defaultPrivilegeRunConfig()
+	}
+	config.Interpreter, config.LoginShell = interp, c.resolveExecutionLogin(interp, sudo)
 	if usesPortableShellAdapter(config) && interp != InterpreterServer {
 		if err := validatePortableShellConfig(config); err != nil {
 			return "", err
@@ -414,22 +517,30 @@ func (c *Client) resolveCommandIOInterpreter(sudo bool, command string) (Interpr
 	return interp, nil
 }
 
-func (c *Client) resolveExecutionLogin(interp Interpreter) bool {
+func (c *Client) resolveExecutionLogin(interp Interpreter, sudo ...bool) bool {
 	if interp != InterpreterBash && interp != InterpreterZsh && interp != InterpreterFish {
 		return false
 	}
-	if exec := c.Execution(); exec != nil {
+	exec := c.Execution()
+	if len(sudo) > 0 && sudo[0] {
+		exec = c.privilegeExecution()
+	}
+	if exec != nil {
 		return exec.LoginMode() == LoginEnabled
 	}
 	return false
 }
 
-func (c *Client) resolveCommandIOPayload(interp Interpreter, command string) string {
+func (c *Client) resolveCommandIOPayload(interp Interpreter, command string, sudo ...bool) string {
 	if interp == InterpreterServer {
 		return command
 	}
-	login := c.resolveExecutionLogin(interp)
+	isSudo := len(sudo) > 0 && sudo[0]
+	login := c.resolveExecutionLogin(interp, isSudo)
 	config := c.defaultRunConfig()
+	if isSudo {
+		config = c.defaultPrivilegeRunConfig()
+	}
 	config.Interpreter, config.LoginShell = interp, login
 	if usesPortableShellAdapter(config) {
 		return portableUserCommand(command, config, config.LaunchDialect)
@@ -454,6 +565,16 @@ func (c *Client) RunCommandWithIO(ctx context.Context, command string, sudo bool
 		return err
 	}
 
+	var mat *PrivilegeMaterial
+	if sudo {
+		var err error
+		mat, err = c.maybeProbeExecutionForPrivilege(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	defer func() { mat.Zero() }()
+
 	interp, err := c.resolveCommandIOInterpreter(sudo, command)
 	if err != nil {
 		return err
@@ -469,24 +590,30 @@ func (c *Client) RunCommandWithIO(ctx context.Context, command string, sudo bool
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, closeOutput()) }()
-	payload := c.resolveCommandIOPayload(interp, command)
+	payload := c.resolveCommandIOPayload(interp, command, sudo)
 	if !sudo {
 		return c.runRawCommandWithPayload(work, payload, "", stdin, stdout, stderr, cancel)
 	}
 
-	if err := c.maybeDetectSudoMode(work); err != nil {
+	runCfg := c.defaultPrivilegeRunConfig()
+	runCfg.Interpreter, runCfg.LoginShell = interp, c.resolveExecutionLogin(interp, true)
+	if err := c.maybeDetectSudoMode(work, runCfg); err != nil {
 		return err
 	}
 	clientConfig, _ := c.configSnapshot()
-	return c.dispatchSudoCommand(work, clientConfig, command, payload, interp, stdin, stdout, stderr, cancel)
+	return c.dispatchSudoCommand(work, clientConfig, command, payload, interp, stdin, stdout, stderr, cancel, mat)
 }
 
-func (c *Client) dispatchSudoCommand(ctx context.Context, clientConfig ClientConfig, command, payload string, interp Interpreter, stdin io.Reader, stdout, stderr io.Writer, cancel context.CancelFunc) (retErr error) {
-	config := c.defaultRunConfig()
-	config.Interpreter, config.LoginShell = interp, c.resolveExecutionLogin(interp)
+func (c *Client) dispatchSudoCommand(ctx context.Context, clientConfig ClientConfig, command, payload string, interp Interpreter, stdin io.Reader, stdout, stderr io.Writer, cancel context.CancelFunc, mat ...*PrivilegeMaterial) (retErr error) {
+	var preResolved *PrivilegeMaterial
+	if len(mat) > 0 {
+		preResolved = mat[0]
+	}
+	config := c.defaultPrivilegeRunConfig()
+	config.Interpreter, config.LoginShell = interp, c.resolveExecutionLogin(interp, true)
 	if usesPortableShellAdapter(config) && clientConfig.SudoMode != SudoModeRoot {
 		inner := portableUserCommand(command, config, LaunchPOSIX)
-		return c.runPrivilegeOperation(ctx, clientConfig.SudoMode, inner, stdin, stdout, stderr, config, cancel)
+		return c.runPrivilegeOperation(ctx, clientConfig.SudoMode, inner, stdin, stdout, stderr, config, cancel, preResolved)
 	}
 	switch clientConfig.SudoMode {
 	case SudoModeRoot:
@@ -497,7 +624,7 @@ func (c *Client) dispatchSudoCommand(ctx context.Context, clientConfig ClientCon
 		c.observePrivilegeCommand(clientConfig.SudoMode, "sudo -S -p '' <privileged payload>")
 		return c.runRawCommandWithPayload(ctx, "sudo -S -p '' "+payload, "", stdin, stdout, stderr, cancel)
 	case SudoModeSudo, SudoModeSu:
-		login := c.resolveExecutionLogin(interp)
+		login := c.resolveExecutionLogin(interp, true)
 		inner := "exec bash"
 		if login {
 			inner = "exec bash -l"
@@ -512,7 +639,7 @@ func (c *Client) dispatchSudoCommand(ctx context.Context, clientConfig ClientCon
 				inner = bashCommandPayload(command, login)
 			}
 		}
-		return c.runPrivilegeOperation(ctx, clientConfig.SudoMode, inner, stdin, stdout, stderr, interp, cancel)
+		return c.runPrivilegeOperation(ctx, clientConfig.SudoMode, inner, stdin, stdout, stderr, interp, cancel, preResolved)
 	case SudoModeNone:
 		return fmt.Errorf("privilege escalation is not supported for this host (sudo_mode=none)")
 	default:

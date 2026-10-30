@@ -1232,3 +1232,74 @@ func TestPlaybook_UnconfiguredSudoShellPreservesCompatibility(t *testing.T) {
 		t.Fatalf("expected legacy Bash sudo payload, got %q", executedPayload)
 	}
 }
+
+func TestPlaybook_FreeBSD_UnconfiguredSudoShellAutoProbesSh(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	var commands []string
+	server, err := sshfixture.NewWithOptions(ctx, sshfixture.Options{
+		ExecHandler: func(cmd string, ch cryptoSSH.Channel) {
+			if strings.Contains(cmd, "__XOPS_DIALECT_POSIX__") {
+				_, _ = io.WriteString(ch, "__XOPS_DIALECT_POSIX__:FreeBSD:/bin/sh\n")
+				_, _ = ch.SendRequest("exit-status", false, cryptoSSH.Marshal(struct{ Status uint32 }{0}))
+				_ = ch.Close()
+				return
+			}
+			if strings.Contains(cmd, "__XOPS_INTERP__") {
+				_, _ = io.WriteString(ch, "__XOPS_INTERP__:sh\n__XOPS_INTERP_END__\n")
+				_, _ = ch.SendRequest("exit-status", false, cryptoSSH.Marshal(struct{ Status uint32 }{0}))
+				_ = ch.Close()
+				return
+			}
+			if strings.Contains(cmd, "bash") {
+				_, _ = io.WriteString(ch.Stderr(), "exec: bash: not found\n")
+				_, _ = ch.SendRequest("exit-status", false, cryptoSSH.Marshal(struct{ Status uint32 }{127}))
+				_ = ch.Close()
+				return
+			}
+			commands = append(commands, cmd)
+			_, _ = ch.Write([]byte("freebsd_ok\n"))
+			_, _ = ch.SendRequest("exit-status", false, cryptoSSH.Marshal(struct{ Status uint32 }{0}))
+			_ = ch.Close()
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+
+	provider, connector := setupFixtureProvider(t, server, nil)
+	yes := true
+	pb := &playbook.Playbook{
+		Name:    "freebsd-sudo-test",
+		Targets: playbook.Targets{Nodes: []string{"node-1"}},
+		Steps: []playbook.Step{
+			{
+				Name:  "sudo-step",
+				Shell: "uptime",
+				Sudo:  &yes,
+			},
+		},
+	}
+
+	engine := playbook.NewEngine(pb, provider, connector)
+	report, err := engine.Run(t.Context())
+	if err != nil {
+		t.Fatalf("engine.Run failed: %v", err)
+	}
+	if len(report.Hosts) != 1 || len(report.Hosts[0].Steps) != 1 {
+		t.Fatalf("unexpected report hosts: %+v", report.Hosts)
+	}
+	res := report.Hosts[0].Steps[0]
+	if res.Status != playbook.StatusChanged {
+		t.Fatalf("status = %s, want StatusChanged, err=%v", res.Status, res.Err)
+	}
+	if len(commands) == 0 {
+		t.Fatal("expected at least one command executed")
+	}
+	lastCmd := commands[len(commands)-1]
+	if strings.Contains(lastCmd, "bash") || !strings.Contains(lastCmd, "sh") {
+		t.Fatalf("expected FreeBSD sh command, got %q", lastCmd)
+	}
+}

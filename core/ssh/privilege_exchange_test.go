@@ -602,22 +602,99 @@ func servePrivilegeAuthentication(t *testing.T, channel cryptoSSH.Channel, reade
 
 func TestPrivilegeExchange_InterpreterCommand(t *testing.T) {
 	client := &Client{}
+
+	// 1. Sudo mode with bash
 	exchangeBash := newPrivilegeExchange(client, SudoModeSudo, false, InterpreterBash)
 	cmdBash := exchangeBash.command("whoami")
 	if !strings.Contains(cmdBash, "-- bash -c ") {
 		t.Errorf("expected bash -c in sudo command, got: %s", cmdBash)
 	}
 
+	// 2. Sudo mode with sh
 	exchangeSh := newPrivilegeExchange(client, SudoModeSudo, false, InterpreterSh)
 	cmdSh := exchangeSh.command("whoami")
 	if !strings.Contains(cmdSh, "-- sh -c ") {
 		t.Errorf("expected sh -c in sudo command, got: %s", cmdSh)
 	}
+	if strings.Contains(cmdSh, "bash") {
+		t.Errorf("expected no bash in sh sudo command, got: %s", cmdSh)
+	}
 
-	// Verify default is bash
+	// 3. Su mode with sh (BSD-compatible exec sh -c, no bash)
+	exchangeSuSh := newPrivilegeExchange(client, SudoModeSu, false, InterpreterSh)
+	cmdSuSh := exchangeSuSh.command("whoami")
+	if !strings.Contains(cmdSuSh, "su - root -c ") || !strings.Contains(cmdSuSh, "exec sh -c ") {
+		t.Errorf("expected su - root -c with exec sh -c, got: %s", cmdSuSh)
+	}
+	if strings.Contains(cmdSuSh, "bash") {
+		t.Errorf("expected no bash in InterpreterSh Su command, got: %s", cmdSuSh)
+	}
+
+	// 4. Su mode with bash
+	exchangeSuBash := newPrivilegeExchange(client, SudoModeSu, false, InterpreterBash)
+	cmdSuBash := exchangeSuBash.command("whoami")
+	if !strings.Contains(cmdSuBash, "su - root -c ") || !strings.Contains(cmdSuBash, "exec bash -c ") {
+		t.Errorf("expected su - root -c with exec bash -c, got: %s", cmdSuBash)
+	}
+
+	// 5. Empty command (interactive shell) with sh: must produce 'exec sh' without invalid '-l'
+	cmdEmptySh := exchangeSh.command("")
+	if !strings.Contains(cmdEmptySh, "exec sh") {
+		t.Errorf("expected exec sh in empty command, got: %s", cmdEmptySh)
+	}
+	if strings.Contains(cmdEmptySh, "exec sh -l") || strings.Contains(cmdEmptySh, "-l") {
+		t.Errorf("expected no -l option for InterpreterSh in empty command, got: %s", cmdEmptySh)
+	}
+
+	// 6. Empty command with bash: should retain 'exec bash -l'
+	cmdEmptyBash := exchangeBash.command("")
+	if !strings.Contains(cmdEmptyBash, "exec bash -l") {
+		t.Errorf("expected exec bash -l for InterpreterBash in empty command, got: %s", cmdEmptyBash)
+	}
+
+	// 7. Verify default interpreter is bash
 	exchangeDefault := newPrivilegeExchange(client, SudoModeSudo, false)
 	cmdDefault := exchangeDefault.command("whoami")
 	if !strings.Contains(cmdDefault, "-- bash -c ") {
 		t.Errorf("expected default bash -c in sudo command, got: %s", cmdDefault)
+	}
+}
+
+func TestPrivilegeExchange_WrapCommandBody_SuInterpreter(t *testing.T) {
+	client := &Client{}
+
+	exchangeSh := newPrivilegeExchange(client, SudoModeSu, false, InterpreterSh)
+	wrappedSh := exchangeSh.wrapCommandBody("echo hello", "test-prompt")
+	if !strings.Contains(wrappedSh, "su - root -c ") {
+		t.Fatalf("expected su - root -c in wrapCommandBody, got: %s", wrappedSh)
+	}
+	if !strings.Contains(wrappedSh, "exec sh -c ") {
+		t.Fatalf("expected exec sh -c in wrapCommandBody for InterpreterSh, got: %s", wrappedSh)
+	}
+	if strings.Contains(wrappedSh, "bash") {
+		t.Fatalf("unexpected bash in wrapCommandBody for InterpreterSh, got: %s", wrappedSh)
+	}
+
+	exchangeBash := newPrivilegeExchange(client, SudoModeSu, false, InterpreterBash)
+	wrappedBash := exchangeBash.wrapCommandBody("echo hello", "test-prompt")
+	if !strings.Contains(wrappedBash, "exec bash -c ") {
+		t.Fatalf("expected exec bash -c in wrapCommandBody for InterpreterBash, got: %s", wrappedBash)
+	}
+}
+
+func TestPrivilegeExchange_WrapPortableBody_BSDSu(t *testing.T) {
+	client := &Client{}
+
+	exchangeSh := newPrivilegeExchange(client, SudoModeSu, false, InterpreterSh)
+	exchangeSh.launchDialect = LaunchPOSIX
+	wrappedPortable := exchangeSh.wrapPortableBody("echo hello", "test-prompt")
+
+	// Must NOT contain GNU-specific -s /bin/sh
+	if strings.Contains(wrappedPortable, "-s /bin/sh") {
+		t.Fatalf("expected no GNU -s /bin/sh in wrapPortableBody for FreeBSD / InterpreterSh, got: %s", wrappedPortable)
+	}
+	// Must contain BSD-compatible su syntax
+	if !strings.Contains(wrappedPortable, "su - root -c ") || !strings.Contains(wrappedPortable, "exec sh -c ") {
+		t.Fatalf("expected BSD-compatible su - root -c 'exec sh -c ...' in wrapPortableBody, got: %s", wrappedPortable)
 	}
 }

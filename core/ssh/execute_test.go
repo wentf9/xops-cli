@@ -240,7 +240,10 @@ func TestRunCommandWithIO_MockServer(t *testing.T) {
 
 	// 2. 测试 Sudoer 模式执行（免密）
 	t.Run("SudoerCommand", func(t *testing.T) {
-		c := newClient(rawClient, nil, &ClientConfig{SudoMode: SudoModeSudoer}, nil, "")
+		c := newClient(rawClient, nil, &ClientConfig{
+			SudoMode:  SudoModeSudoer,
+			Execution: &ExecutionConfig{Interpreter: InterpreterBash, LaunchDialect: LaunchPOSIX},
+		}, nil, "")
 		var stdout, stderr bytes.Buffer
 		err := c.RunCommandWithIO(ctx, "ls /root", true, nil, &stdout, &stderr)
 		if err != nil {
@@ -258,7 +261,11 @@ func TestRunCommandWithIO_MockServer(t *testing.T) {
 
 	// 3. 测试 Sudo 密码模式执行
 	t.Run("SudoPasswordCommand", func(t *testing.T) {
-		c := newClient(rawClient, nil, &ClientConfig{SudoMode: SudoModeSudo, Password: "secret_password"}, nil, "")
+		c := newClient(rawClient, nil, &ClientConfig{
+			SudoMode:  SudoModeSudo,
+			Password:  "secret_password",
+			Execution: &ExecutionConfig{Interpreter: InterpreterBash, LaunchDialect: LaunchPOSIX},
+		}, nil, "")
 		var stdout, stderr bytes.Buffer
 		err := c.RunCommandWithIO(ctx, "ls /root", true, strings.NewReader("extra_stdin\n"), &stdout, &stderr)
 		if err != nil {
@@ -278,7 +285,10 @@ func TestRunCommandWithIO_MockServer(t *testing.T) {
 
 	// 4. 测试 Root 模式执行
 	t.Run("RootCommand", func(t *testing.T) {
-		c := newClient(rawClient, nil, &ClientConfig{SudoMode: SudoModeRoot}, nil, "")
+		c := newClient(rawClient, nil, &ClientConfig{
+			SudoMode:  SudoModeRoot,
+			Execution: &ExecutionConfig{Interpreter: InterpreterBash, LaunchDialect: LaunchPOSIX},
+		}, nil, "")
 		var stdout, stderr bytes.Buffer
 		err := c.RunCommandWithIO(ctx, "ls /root", true, nil, &stdout, &stderr)
 		if err != nil {
@@ -296,7 +306,11 @@ func TestRunCommandWithIO_MockServer(t *testing.T) {
 
 	// 5. 测试 Su 模式执行（命令只执行一次，stdin 严格等于 password + payload 串行传输）
 	t.Run("SuCommand", func(t *testing.T) {
-		c := newClient(rawClient, nil, &ClientConfig{SudoMode: SudoModeSu, SuPwd: "root_password"}, nil, "")
+		c := newClient(rawClient, nil, &ClientConfig{
+			SudoMode:  SudoModeSu,
+			SuPwd:     "root_password",
+			Execution: &ExecutionConfig{Interpreter: InterpreterBash, LaunchDialect: LaunchPOSIX},
+		}, nil, "")
 		var stdout, stderr bytes.Buffer
 		err := c.RunCommandWithIO(ctx, "cat /etc/shadow", true, strings.NewReader("user_payload\n"), &stdout, &stderr)
 		if err != nil {
