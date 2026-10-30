@@ -64,13 +64,13 @@ When operating through the Skill, the assistant runs the CLI commands in the rig
 
 | MCP tool | Equivalent CLI workflow |
 | --- | --- |
-| `xops_list_nodes` | `xops host list` (optionally with `--tag`) |
-| `xops_ssh_run` | `xops exec --host NODE -c COMMAND` (optionally with `--sudo`) |
-| `xops_read_file` | Target-native text commands via `exec`; download large or binary files with `scp` |
-| `xops_write_file` | Generate a local file and upload with `scp`, or run an explicit write/append via `exec` |
-| `xops_fs_ls/mkdir/touch/cp/mv/rm` | Batch `sftp` or target-native file commands via `exec` (use the latter to create empty files) |
-| Stdio `xops_upload/download` | Upload/download files and directories with `xops scp` or batch `sftp` |
-| HTTP `xops_prepare_upload/download`, `xops_transfer_status/cancel` | Transfer directly with `xops scp`, check the exit status and destination file, and cancel by stopping the owned process |
-| Stdio `xops_tunnel_create/list/status/stop` | `xops ssh -L/-R -N` (CLI also supports `-D` SOCKS5; manage lifecycle via the owned process/session) |
+| `nodes` | `xops host list` (optionally with `--tag`) |
+| `terminal` (`session: "once"`) | `xops exec --host NODE -c COMMAND` (optionally with `--sudo`); directory operations also use target-native commands via `exec` |
+| `terminal` (named persistent session) | No direct equivalent; each CLI `exec` is independent, use the interactive `xops ssh` terminal when needed |
+| `file` (`read`/`write`/`patch`/`stat`) | Target-native read/write commands via `exec`, or batch `sftp`; use `scp` for large or binary files |
+| `gui` | No CLI equivalent |
+| Stdio `transfer` (`push`/`pull`) | Upload/download files and directories with `xops scp` or batch `sftp` |
+| HTTP `transfer` (`prepare_push`/`prepare_pull`/`status`/`cancel`) | Transfer directly with `xops scp`, check the exit status and destination file, and cancel by stopping the owned process |
+| Stdio `tunnel` (`create`/`list`/`status`/`stop`) | `xops ssh -L/-R -N` (CLI also supports `-D` SOCKS5; manage lifecycle via the owned process/session) |
 
 > **Lifecycle and authorization differences**: The CLI does not create MCP transfer IDs, tunnel IDs, or TTLs, and there is no `xops tunnel list` command; killing a transfer process does not roll back bytes already written. Skill-driven CLI commands follow the assistant's own command-execution authorization—clarify targets, overwrite scope, or network exposure first whenever they are ambiguous.

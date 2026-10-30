@@ -46,77 +46,127 @@ func ParseRiskLevel(s string) RiskLevel {
 // for risk assessment.
 type RiskInput struct {
 	ToolName   string
+	Action     string // polymorphic sub-action (e.g. read/write/patch/stat, push/pull, create/list/status/stop)
 	NodeID     string
 	NodeIDs    []string // additional canonical nodes covered by a batch operation
-	Command    string   // populated only for ssh_run
+	Command    string   // populated for terminal command execution
+	Text       string   // keystrokes typed into a remote GUI session (gui type)
 	Paths      []string // file/directory paths involved
 	Sudo       bool     // whether sudo is requested
 	Details    string   // deferred-operation size, digest and overwrite information
-	TunnelMode string   // local or remote SSH forwarding
+	TunnelMode string   // local, remote, or dynamic SSH forwarding
 	ListenHost string   // normalized IP literal, never resolved through DNS
 	Execution  *ssh.ExecutionConfig
 	Dialect    string
 	PlanDigest string
 }
 
-// toolBaseRisk maps tool names to their static (baseline) risk level.
-var toolBaseRisk = map[string]RiskLevel{
-	"xops_list_nodes":       Safe,
-	"xops_read_file":        Safe,
-	"xops_fs_ls":            Safe,
-	"xops_download":         Safe,
-	"xops_prepare_download": Safe,
-	"xops_transfer_status":  Safe,
-	"xops_transfer_cancel":  Safe,
-	"xops_tunnel_list":      Safe,
-	"xops_tunnel_status":    Safe,
-	"xops_tunnel_stop":      Moderate,
-	"xops_tunnel_create":    Dangerous,
-
-	"xops_write_file":     Moderate,
-	"xops_upload":         Moderate,
-	"xops_prepare_upload": Moderate,
-	"xops_fs_mkdir":       Moderate,
-	"xops_fs_touch":       Moderate,
-	"xops_fs_mv":          Moderate,
-	"xops_fs_cp":          Moderate,
-
-	"xops_fs_rm":   Dangerous,
-	"xops_ssh_run": Dangerous,
-}
-
 // Classify returns the effective risk level for a tool invocation.
-// For ssh_run, it refines the level based on command analysis and launch dialect.
 func Classify(input RiskInput) RiskLevel {
-	base, ok := toolBaseRisk[input.ToolName]
-	if !ok {
-		return Dangerous // unknown tools default to highest risk
-	}
-
-	if input.ToolName == "xops_ssh_run" {
-		if input.Command != "" {
-			dialect := input.Dialect
-			if dialect == "" && input.Execution != nil {
-				dialect = string(input.Execution.CommandOptions().LaunchDialect)
-				if dialect == "" {
-					dialect = string(ssh.LaunchUnknown)
-				}
-			}
-			base = AnalyzeCommandWithDialect(input.Command, dialect)
-		}
-		if input.Sudo && base < Moderate {
-			base = Moderate
-		}
-	}
-	if input.ToolName == "xops_tunnel_create" && input.TunnelMode == "local" {
-		if addr, err := netip.ParseAddr(input.ListenHost); err == nil && addr.Unmap().IsLoopback() {
-			base = Moderate
-		}
-	}
+	base := classifyBase(input)
 
 	pathRisk := AnalyzePaths(input.Paths)
 	if pathRisk > base {
 		return pathRisk
 	}
 	return base
+}
+
+func classifyBase(input RiskInput) RiskLevel {
+	switch input.ToolName {
+	case "nodes":
+		return Safe
+	case "terminal":
+		return classifyTerminal(input)
+	case "file":
+		return classifyFile(input.Action)
+	case "gui":
+		return classifyGUI(input)
+	case "transfer":
+		return classifyTransfer(input.Action)
+	case "tunnel":
+		return classifyTunnel(input)
+	default:
+		return Dangerous
+	}
+}
+
+func classifyTerminal(input RiskInput) RiskLevel {
+	if input.Command == "" && input.Action == "poll" {
+		return Safe
+	}
+	isPersistentRun := input.Action != "" && input.Action != "once" && input.Action != "poll"
+	base := Dangerous
+	if input.Command == "" && isPersistentRun {
+		base = Moderate
+	}
+	if input.Command != "" {
+		dialect := input.Dialect
+		if dialect == "" && input.Execution != nil {
+			dialect = string(input.Execution.CommandOptions().LaunchDialect)
+			if dialect == "" {
+				dialect = string(ssh.LaunchUnknown)
+			}
+		}
+		base = AnalyzeCommandWithDialect(input.Command, dialect)
+	}
+	if (input.Sudo || isPersistentRun) && base < Moderate {
+		base = Moderate
+	}
+	return base
+}
+
+func classifyFile(action string) RiskLevel {
+	switch action {
+	case "read", "stat":
+		return Safe
+	case "write", "patch":
+		return Moderate
+	default:
+		return Dangerous
+	}
+}
+
+// classifyGUI rates keyboard input (type and key) and any unknown action as
+// Dangerous because keystrokes can be split across multiple calls and
+// submitted with Return into a remote terminal window, bypassing single-call
+// command analysis.
+func classifyGUI(input RiskInput) RiskLevel {
+	switch input.Action {
+	case "shot", "move":
+		return Safe
+	case "click", "double_click", "right_click", "scroll", "drag":
+		return Moderate
+	default:
+		return Dangerous
+	}
+}
+
+func classifyTransfer(action string) RiskLevel {
+	switch action {
+	case "pull", "prepare_pull", "status", "cancel":
+		return Safe
+	case "push", "prepare_push":
+		return Moderate
+	default:
+		return Dangerous
+	}
+}
+
+func classifyTunnel(input RiskInput) RiskLevel {
+	switch input.Action {
+	case "list", "status":
+		return Safe
+	case "stop":
+		return Moderate
+	case "create":
+		if input.TunnelMode == "local" {
+			if addr, err := netip.ParseAddr(input.ListenHost); err == nil && addr.Unmap().IsLoopback() {
+				return Moderate
+			}
+		}
+		return Dangerous
+	default:
+		return Dangerous
+	}
 }

@@ -101,7 +101,7 @@ func TestMCPExecutionProbeFreezesDefaultShellBeforeDispatch(t *testing.T) {
 					}
 				})
 				client := connectRuntimeTestClient(t, r)
-				result, err := client.CallTool(t.Context(), &mcp.CallToolParams{Name: "xops_ssh_run", Arguments: SshRunInput{NodeID: "node", Command: "ls", Sudo: sudo}})
+				result, err := client.CallTool(t.Context(), &mcp.CallToolParams{Name: "terminal", Arguments: TerminalInput{NodeID: "node", Command: "ls", Sudo: sudo}})
 				if err != nil || result.IsError || backend.probes.Load() != 1 || backend.calls.Load() != 1 || gate.closed.Load() != 2 {
 					t.Fatalf("probe/execute lifecycle: result=%+v error=%v probes=%d calls=%d closed=%d", result, err, backend.probes.Load(), backend.calls.Load(), gate.closed.Load())
 				}
@@ -166,7 +166,7 @@ func TestMCPExecutionProbeRespectsOverridesAndFailures(t *testing.T) {
 			if command == "" {
 				command = "ls"
 			}
-			result, err := client.CallTool(t.Context(), &mcp.CallToolParams{Name: "xops_ssh_run", Arguments: SshRunInput{NodeID: "node", Command: command, Execution: tc.request}})
+			result, err := client.CallTool(t.Context(), &mcp.CallToolParams{Name: "terminal", Arguments: TerminalInput{NodeID: "node", Command: command, Execution: tc.request}})
 			if err != nil || result.IsError != tc.denied || backend.probes.Load() != tc.probes || backend.calls.Load() != tc.calls {
 				t.Fatalf("result=%+v error=%v probes=%d calls=%d", result, err, backend.probes.Load(), backend.calls.Load())
 			}
@@ -219,7 +219,7 @@ func TestMCPProbedPOSIXCommandsStillRequireApproval(t *testing.T) {
 				}
 			})
 			client := connectRuntimeTestClient(t, r)
-			result, err := client.CallTool(t.Context(), &mcp.CallToolParams{Name: "xops_ssh_run", Arguments: SshRunInput{NodeID: "node", Command: tc.command}})
+			result, err := client.CallTool(t.Context(), &mcp.CallToolParams{Name: "terminal", Arguments: TerminalInput{NodeID: "node", Command: tc.command}})
 			wantCalls := int32(1)
 			if tc.denied {
 				wantCalls = 0

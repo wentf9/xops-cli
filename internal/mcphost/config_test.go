@@ -42,7 +42,7 @@ func TestRuntimeInventoryPublication(t *testing.T) {
 				t.Fatal(err)
 			}
 			var output mcpruntime.ListNodesOutput
-			if _, err := callTool(ctx, client, "xops_list_nodes", mcpruntime.ListNodesInput{Tag: "published"}, &output); err != nil {
+			if _, err := callTool(ctx, client, "nodes", mcpruntime.ListNodesInput{Tag: "published"}, &output); err != nil {
 				t.Fatal(err)
 			}
 			want := 0
@@ -74,14 +74,14 @@ func TestRuntimeDefaultAuditPath(t *testing.T) {
 	}
 	client := protocolClient(t, runtime, "2025-11-25", nil)
 	var output mcpruntime.ListNodesOutput
-	if _, err := callTool(ctx, client, "xops_list_nodes", mcpruntime.ListNodesInput{}, &output); err != nil {
+	if _, err := callTool(ctx, client, "nodes", mcpruntime.ListNodesInput{}, &output); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(home, ".xops", "audit.log"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), `"tool":"xops_list_nodes"`) {
+	if !strings.Contains(string(data), `"tool":"nodes"`) {
 		t.Fatalf("CLI audit did not record the tool: %s", data)
 	}
 }

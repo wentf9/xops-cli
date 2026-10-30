@@ -44,6 +44,9 @@ func TestExplicitPrivilegedPTYBindsContextOutput(t *testing.T) {
 	if !errors.Is(err, context.Canceled) || !errors.As(err, &outputErr) || outputErr.Target != sink {
 		t.Fatalf("PTY output cancellation lost: %v", err)
 	}
+	if got := countSinkOutputErrors(err, sink); got != 1 {
+		t.Fatalf("sink OutputError count = %d, want 1 in %v", got, err)
+	}
 	if sink.raw.Load() != 0 || scenario.attempts.Load() != 1 {
 		t.Fatal("unbound output or command replay")
 	}

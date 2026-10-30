@@ -30,11 +30,12 @@ type privilegeExchange struct {
 	readyOnce                         sync.Once
 	mu                                sync.Mutex
 	outputMu                          sync.Mutex
+	writeErr                          error
 	rejected                          bool
 	material                          *PrivilegeMaterial // owned by input worker, then by its joining caller
 	passwordSent                      bool
 	forcePrompt                       bool
-	outputErrors                      chan error
+	outputErrors                      chan struct{}
 	terminal                          *privilegeTerminal
 	session                           *cryptoSSH.Session
 	terminalToken                     string
@@ -60,7 +61,7 @@ func newPrivilegeExchange(c *Client, mode SudoMode, force bool, interp ...Interp
 		ready:        make(chan struct{}),
 		prompts:      make(chan struct{}, 3),
 		forcePrompt:  force,
-		outputErrors: make(chan error, 1),
+		outputErrors: make(chan struct{}, 1),
 	}
 	if execution := c.Execution(); execution != nil {
 		exchange.launchDialect = execution.LaunchDialect
@@ -144,8 +145,8 @@ type privilegeFrameWriter struct {
 	target          io.Writer
 	pending         []byte
 	prompt          *regexp.Regexp
-	failed          bool
 	writeErr        error
+	failed          bool
 	feedback        sudoPromptFeedback
 	fallbackMatched bool // Owned by this output stream, reset on every prompt search.
 	linePrefix      privilegeLinePrefix
@@ -153,18 +154,8 @@ type privilegeFrameWriter struct {
 	contextPatterns map[*regexp.Regexp]*regexp.Regexp // Stream-owned lazy cache: primary and optional fallback only.
 }
 
-func (w *privilegeFrameWriter) Write(data []byte) (n int, retErr error) {
-	defer func() {
-		if retErr != nil {
-			w.failed = true
-			w.writeErr = retErr
-			select {
-			case w.exchange.outputErrors <- retErr:
-			default:
-			}
-		}
-	}()
-	n = len(data)
+func (w *privilegeFrameWriter) Write(data []byte) (int, error) {
+	n := len(data)
 	if w.exchange.outputReady() {
 		if err := w.flush(); err != nil {
 			return 0, err
@@ -215,7 +206,9 @@ func (w *privilegeFrameWriter) Write(data []byte) (n int, retErr error) {
 		select {
 		case w.exchange.prompts <- struct{}{}:
 		default:
-			return 0, fmt.Errorf("too many privilege prompts")
+			err := fmt.Errorf("too many privilege prompts")
+			w.recordError(err)
+			return 0, err
 		}
 	}
 	// Bounded look-behind supports fragmented prompts without retaining banners.
@@ -246,7 +239,10 @@ func (w *privilegeFrameWriter) emit(data []byte) error {
 	return err
 }
 func (w *privilegeFrameWriter) flush() error {
-	err := w.emit(w.pending)
+	var err error
+	if !w.failed {
+		err = w.emit(w.pending)
+	}
 	clear(w.pending)
 	w.consumeFrame(len(w.pending))
 	w.pending = nil
@@ -383,15 +379,27 @@ func (c *Client) runPrivilegeAttempt(ctx context.Context, mode SudoMode, command
 		return err
 	}
 	waitDone := make(chan error, 1)
-	go func() { waitDone <- c.waitSession(session) }()
+	go func() { waitDone <- exchange.waitSession(session, out, diagnostic) }()
 	inputDone := make(chan error, 1)
 	go func() { inputDone <- exchange.input(work, stdin, pipe) }()
 	waitErr, inputErr, closeErr := c.waitPrivilegeExchange(work, cancel, abort, session, waitDone, inputDone, exchange.outputErrors)
-	flushErr := errors.Join(out.flush(), diagnostic.flush(), out.writeErr, diagnostic.writeErr)
+	_ = out.flush()
+	_ = diagnostic.flush()
+	flushErr := exchange.writeErr
 	return exchange.finish(ctx, privilegeOutcome{waitErr: waitErr, inputErr: inputErr, closeErr: closeErr, flushErr: flushErr, outputFailed: out.failed || diagnostic.failed})
 }
 
-func (c *Client) waitPrivilegeExchange(ctx context.Context, cancel, abort context.CancelFunc, session *cryptoSSH.Session, waitDone, inputDone, outputErrors <-chan error) (waitErr, inputErr, closeErr error) {
+func (e *privilegeExchange) waitSession(session *cryptoSSH.Session, out, diagnostic *privilegeFrameWriter) error {
+	err := e.client.waitSession(session)
+	e.outputMu.Lock()
+	defer e.outputMu.Unlock()
+	if err != nil && ((out.writeErr != nil && errors.Is(err, out.writeErr)) || (diagnostic.writeErr != nil && errors.Is(err, diagnostic.writeErr))) {
+		return nil
+	}
+	return err
+}
+
+func (c *Client) waitPrivilegeExchange(ctx context.Context, cancel, abort context.CancelFunc, session *cryptoSSH.Session, waitDone, inputDone <-chan error, outputErrors <-chan struct{}) (waitErr, inputErr, closeErr error) {
 	select {
 	case waitErr = <-waitDone:
 		cancel()
@@ -401,10 +409,10 @@ func (c *Client) waitPrivilegeExchange(ctx context.Context, cancel, abort contex
 	case inputErr = <-inputDone:
 		abort()
 		closeErr = c.closeCanceledSession(ctx, session, waitDone)
-	case inputErr = <-outputErrors:
+	case <-outputErrors:
 		abort()
 		closeErr = c.closeCanceledSession(ctx, session, waitDone)
-		inputErr = errors.Join(inputErr, <-inputDone)
+		inputErr = <-inputDone
 	case <-ctx.Done():
 		abort()
 		closeErr = c.closeCanceledSession(ctx, session, waitDone)
@@ -442,10 +450,25 @@ func (w *privilegeFrameWriter) writeBytes(data []byte) (int, error) {
 		err = io.ErrShortWrite
 	}
 	if err != nil {
-		w.failed = true
-		w.writeErr = err
+		w.recordErrorLocked(err)
 	}
 	return n, err
+}
+
+func (w *privilegeFrameWriter) recordError(err error) {
+	w.exchange.outputMu.Lock()
+	defer w.exchange.outputMu.Unlock()
+	w.recordErrorLocked(err)
+}
+
+func (w *privilegeFrameWriter) recordErrorLocked(err error) {
+	w.failed = true
+	w.writeErr = err
+	w.exchange.writeErr = errors.Join(w.exchange.writeErr, err)
+	select {
+	case w.exchange.outputErrors <- struct{}{}:
+	default:
+	}
 }
 
 // Shell xtrace renders command arguments before running sudo/su. Such a line
@@ -512,7 +535,7 @@ func (e *privilegeExchange) finish(ctx context.Context, o privilegeOutcome) erro
 		e.client.observePrivilege(e.mode, "elevation_not_confirmed", 1, 0)
 	}
 	waitErr := e.interactiveWaitError(o.waitErr)
-	result := errors.Join(waitErr, o.inputErr, o.closeErr, o.flushErr)
+	result := errors.Join(o.flushErr, waitErr, o.inputErr, o.closeErr)
 	if e.terminal != nil && !e.outputReady() && result == nil {
 		result = fmt.Errorf("privilege session ended before terminal handoff")
 	}

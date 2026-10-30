@@ -5,14 +5,14 @@ import (
 	"github.com/wentf9/xops-cli/core/mcp/guardrail"
 )
 
-// registerTools 统一注册各模块的 MCP 能力，并注入安全护栏
+// registerTools registers the converged minimal MCP toolset with guardrail protection.
 func (r *Runtime) registerTools(server *mcp.Server, g *guardrail.Guardrail) {
-	r.registerSSH(server, g)
-	r.registerSFTP(server, g)
-	r.registerFS(server, g)
-	if r.http != nil {
-		r.registerTransfers(server)
-	} else {
+	r.registerNodes(server)
+	r.registerTerminal(server, g)
+	r.registerFile(server, g)
+	r.registerGUI(server, g)
+	r.registerTransfer(server, g)
+	if r.http == nil {
 		r.registerTunnels(server)
 	}
 }

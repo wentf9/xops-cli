@@ -271,7 +271,7 @@ func TestCharacterization_MCP_FailClosedOnMissingCredential_DoesNotLeakSecrets(t
 	testleak.AssertNoSecretInError(t, err, configuredSuPwd, clusterSensitiveSecret)
 
 	// 2. 测试通过 sshRunHandler 调用，检查命令输出与错误返回
-	_, runOut, runErr := runtime.sshRunHandler(ctx, nil, mcpruntime.SshRunInput{
+	_, runOut, runErr := runtime.sshRunHandler(ctx, nil, mcpruntime.TerminalInput{
 		NodeID:  "node-unauth",
 		Command: "whoami",
 	})
@@ -415,7 +415,7 @@ func TestCharacterization_MCP_FailClosedOnInteractionRequired_DoesNotLeakSecrets
 	testleak.AssertNoSecretInError(t, errHandshake, allSecrets...)
 
 	// 3. 测试通过 sshRunHandler 调用
-	_, runOut, runErr := runtime.sshRunHandler(ctx, nil, mcpruntime.SshRunInput{
+	_, runOut, runErr := runtime.sshRunHandler(ctx, nil, mcpruntime.TerminalInput{
 		NodeID:  "node-handshake-prompt",
 		Command: "uname -a",
 	})

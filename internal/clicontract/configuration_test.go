@@ -27,7 +27,7 @@ func TestPolicyConfigurationRoundTrip(t *testing.T) {
 		t.Fatalf("policy serialization changed:\n%s", encoded)
 	}
 	if got := guardrail.NewPolicy(shared).Evaluate(guardrail.Safe, guardrail.RiskInput{
-		ToolName: "xops_ssh_run", NodeID: "production", Command: "echo ok",
+		ToolName: "terminal", NodeID: "production", Command: "echo ok",
 	}); got != guardrail.NeedApproval {
 		t.Fatalf("per-node policy = %v, want approval", got)
 	}

@@ -68,35 +68,62 @@ func TestPasswordSudoOutputUsesContextBinding(t *testing.T) {
 }
 
 func TestPasswordSudoBlockedStreamCancellation(t *testing.T) {
-	setTestHome(t)
-	addr, evidence := startPrivilegeExchangeServer(t, privilegeServerOptions{mode: SudoModeSudo, password: "valid"})
-	client := exchangeTestClient(t, addr, SudoModeSudo, &recoveryTestUI{values: []string{"valid"}}, &testRecorder{})
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-	sink := &privilegeContextSink{entered: make(chan struct{}), block: true}
-	done, joined := make(chan error, 1), make(chan struct{})
-	go func() {
-		defer close(joined)
-		_, err := client.RunWithSudoExecution(ctx, "chosen", &ExecutionConfig{Interpreter: InterpreterSh, LaunchDialect: LaunchPOSIX}, WithStream(sink, ""))
-		done <- err
-	}()
-	defer func() { cancel(); <-joined }()
-	select {
-	case <-sink.entered:
-	case err := <-done:
-		t.Fatalf("stream ended before context-aware write: %v", err)
-	case <-ctx.Done():
-		t.Fatal("stream did not start")
+	for _, missingExit := range []bool{false, true} {
+		t.Run(map[bool]string{false: "exit-status", true: "missing-exit"}[missingExit], func(t *testing.T) {
+			setTestHome(t)
+			addr, evidence := startPrivilegeExchangeServer(t, privilegeServerOptions{mode: SudoModeSudo, password: "valid", missingExit: missingExit})
+			client := exchangeTestClient(t, addr, SudoModeSudo, &recoveryTestUI{values: []string{"valid"}}, &testRecorder{})
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			sink := &privilegeContextSink{entered: make(chan struct{}), block: true}
+			done, joined := make(chan error, 1), make(chan struct{})
+			go func() {
+				defer close(joined)
+				_, err := client.RunWithSudoExecution(ctx, "chosen", &ExecutionConfig{Interpreter: InterpreterSh, LaunchDialect: LaunchPOSIX}, WithStream(sink, ""))
+				done <- err
+			}()
+			defer func() { cancel(); <-joined }()
+			select {
+			case <-sink.entered:
+			case err := <-done:
+				t.Fatalf("stream ended before context-aware write: %v", err)
+			case <-ctx.Done():
+				t.Fatal("stream did not start")
+			}
+			cancel()
+			err := <-done
+			var outputErr *OutputError
+			if !errors.Is(err, context.Canceled) || !errors.As(err, &outputErr) || outputErr.Target != sink {
+				t.Fatalf("cancellation or sink identity lost: %v", err)
+			}
+			if got := countSinkOutputErrors(err, sink); got != 1 {
+				t.Fatalf("sink OutputError count = %d, want 1 in %v", got, err)
+			}
+			if evidence.commands.Load() != 1 || sink.raw.Load() != 0 {
+				t.Fatal("command replayed or raw Write used")
+			}
+		})
 	}
-	cancel()
-	err := <-done
-	var outputErr *OutputError
-	if !errors.Is(err, context.Canceled) || !errors.As(err, &outputErr) || outputErr.Target != sink {
-		t.Fatalf("cancellation or sink identity lost: %v", err)
+}
+
+func countSinkOutputErrors(err error, target any) int {
+	if err == nil {
+		return 0
 	}
-	if evidence.commands.Load() != 1 || sink.raw.Load() != 0 {
-		t.Fatal("command replayed or raw Write used")
+	if outputErr, ok := err.(*OutputError); ok && outputErr.Target == target { //nolint:errorlint // intentionally counting distinct *OutputError nodes in the unwrap tree
+		return 1
 	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		total := 0
+		for _, child := range joined.Unwrap() {
+			total += countSinkOutputErrors(child, target)
+		}
+		return total
+	}
+	if unwrapped := errors.Unwrap(err); unwrapped != nil {
+		return countSinkOutputErrors(unwrapped, target)
+	}
+	return 0
 }
 
 func TestPasswordSudoFileFailureRetainsSink(t *testing.T) {

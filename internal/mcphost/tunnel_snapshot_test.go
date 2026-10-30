@@ -124,12 +124,13 @@ func tunnelSnapshotHost(t *testing.T, address string) models.Host {
 type holdLegacyTunnelAdmission struct {
 	ports.ExecutionGate
 	entered, release chan struct{}
+	once             sync.Once
 }
 
 func (g *holdLegacyTunnelAdmission) Enter(ctx context.Context, request ports.Admission) (ports.Permit, error) {
 	permit, err := g.ExecutionGate.Enter(ctx, request)
-	if err == nil && request.Binding.Tool == "xops_tunnel_create" && request.Phase == ports.Execute {
-		close(g.entered)
+	if err == nil && request.Binding.Tool == "tunnel" && request.Phase == ports.Execute {
+		g.once.Do(func() { close(g.entered) })
 		select {
 		case <-g.release:
 		case <-ctx.Done():
@@ -157,13 +158,13 @@ func TestCLITunnelRetainsAdmittedTargetAcrossLaterRepositoryEdit(t *testing.T) {
 	client := connectRuntimeTestClient(t, runtime)
 	input := tunnelTestInput(t, startTunnelEcho(t), "remote", "admitted-before-edit")
 	type result struct {
-		output coreruntime.TunnelOutput
+		output coreruntime.TunnelPolyOutput
 		err    error
 	}
 	done := make(chan result, 1)
 	go func() {
-		var output coreruntime.TunnelOutput
-		_, err := callTool(ctx, client, "xops_tunnel_create", input, &output)
+		var output coreruntime.TunnelPolyOutput
+		_, err := callTool(ctx, client, "tunnel", input, &output)
 		done <- result{output, err}
 	}()
 	select {
@@ -185,7 +186,7 @@ func TestCLITunnelRetainsAdmittedTargetAcrossLaterRepositoryEdit(t *testing.T) {
 		if created.err != nil {
 			t.Fatal(created.err)
 		}
-		if created.output.Tunnel.State != "running" {
+		if created.output.Tunnel == nil || created.output.Tunnel.State != "running" {
 			t.Fatalf("admitted tunnel failed: %+v", created.output)
 		}
 		assertTunnelEcho(t, created.output.Tunnel.ListenAddress)

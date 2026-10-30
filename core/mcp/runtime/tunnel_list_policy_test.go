@@ -69,7 +69,8 @@ func callTunnelList(t *testing.T, client *mcp.ClientSession, input ListTunnelsIn
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	result, err := client.CallTool(ctx, &mcp.CallToolParams{Name: "xops_tunnel_list", Arguments: input})
+	input.Action = "list"
+	result, err := client.CallTool(ctx, &mcp.CallToolParams{Name: "tunnel", Arguments: input})
 	if err != nil {
 		t.Fatal(err)
 	}

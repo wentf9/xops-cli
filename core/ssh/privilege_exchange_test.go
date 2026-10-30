@@ -529,9 +529,32 @@ func TestPrivilegeExchangeOutputFailureStopsBeforeInput(t *testing.T) {
 	if !errors.Is(err, outputErr) || errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("output failure did not abort promptly: %v", err)
 	}
+	if got := countTargetErrors(err, outputErr); got != 1 {
+		t.Fatalf("output failure count = %d, want 1 in %v", got, err)
+	}
 	if evidence.commands.Load() != 0 || evidence.attempts.Load() != 0 || ui.prompts != 0 {
 		t.Fatal("output failure consumed input or started command")
 	}
+}
+
+func countTargetErrors(err, target error) int {
+	if err == nil {
+		return 0
+	}
+	if err == target { //nolint:errorlint // intentionally counting distinct target error leaves in the unwrap tree
+		return 1
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		total := 0
+		for _, child := range joined.Unwrap() {
+			total += countTargetErrors(child, target)
+		}
+		return total
+	}
+	if unwrapped := errors.Unwrap(err); unwrapped != nil {
+		return countTargetErrors(unwrapped, target)
+	}
+	return 0
 }
 
 func servePrivilegeAuthentication(t *testing.T, channel cryptoSSH.Channel, reader *bufio.Reader, target io.Writer, command string, opts privilegeServerOptions, evidence *privilegeServerEvidence) bool {

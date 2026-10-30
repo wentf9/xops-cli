@@ -20,7 +20,7 @@ func fixtureSnapshot() OperationSnapshot {
 
 func TestBindingIgnoresDisplayButIncludesExecutionDependencies(t *testing.T) {
 	snapshot := fixtureSnapshot()
-	binding, err := Bind(snapshot, "scope", "xops_ssh_run", map[string]string{"command": "hostname"})
+	binding, err := Bind(snapshot, "scope", "terminal", map[string]string{"cmd": "hostname"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +57,7 @@ func TestBindingIgnoresDisplayButIncludesExecutionDependencies(t *testing.T) {
 
 func TestPermitIsImmutableBoundedAndPurposeLimited(t *testing.T) {
 	snapshot := fixtureSnapshot()
-	binding, err := Bind(snapshot, "scope", "xops_prepare_upload", struct{}{})
+	binding, err := Bind(snapshot, "scope", "transfer", struct{}{})
 	if err != nil {
 		t.Fatal(err)
 	}

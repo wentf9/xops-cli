@@ -134,7 +134,7 @@ func (r *Session) Upload(ctx context.Context, temporary string, source io.Reader
 			return nil
 		})
 		if !result.Created {
-			result.CreationRejected = explicitSFTPRejection(err)
+			result.CreationRejected = ExplicitSFTPRejection(err)
 		}
 		return err
 	})
@@ -254,13 +254,15 @@ func (r *Session) Commit(ctx context.Context, temporary, destination string, ove
 			result.Committed = true
 			return nil
 		}
-		result.Rejected = explicitSFTPRejection(err)
+		result.Rejected = ExplicitSFTPRejection(err)
 		return fmt.Errorf("commit remote upload: %w", err)
 	})
 	return result, retErr
 }
 
-func explicitSFTPRejection(err error) bool {
+// ExplicitSFTPRejection reports whether err is a definitive SFTP server status
+// indicating the target operation was rejected without mutating the path.
+func ExplicitSFTPRejection(err error) bool {
 	if errors.Is(err, os.ErrExist) || errors.Is(err, os.ErrPermission) || errors.Is(err, os.ErrNotExist) {
 		return true
 	}
@@ -273,6 +275,19 @@ func explicitSFTPRejection(err error) bool {
 		return status.Code == 2 || status.Code == 3 || status.Code == 8 || status.Code == 11
 	}
 	return false
+}
+
+// IsPermissionDenied reports whether err is an OS or SFTP permission-denied status.
+func IsPermissionDenied(err error) bool {
+	if errors.Is(err, os.ErrPermission) {
+		return true
+	}
+	var modern *sshfx.StatusPacket
+	if errors.As(err, &modern) && modern.StatusCode == sshfx.StatusPermissionDenied {
+		return true
+	}
+	var status *pkgsftp.StatusError
+	return errors.As(err, &status) && status.Code == 3
 }
 
 func (r *Session) Remove(ctx context.Context, name string) error {

@@ -96,6 +96,9 @@ func buildApprovalMessage(risk RiskLevel, input RiskInput) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "⚠️ [Risk: %s] Operation requires your approval\n\n", strings.ToUpper(risk.String()))
 	fmt.Fprintf(&b, "Tool:  %s\n", input.ToolName)
+	if input.Action != "" {
+		fmt.Fprintf(&b, "Action: %s\n", input.Action)
+	}
 	if input.NodeID != "" {
 		fmt.Fprintf(&b, "Node:  %s\n", input.NodeID)
 	}
@@ -104,6 +107,9 @@ func buildApprovalMessage(risk RiskLevel, input RiskInput) string {
 	}
 	if input.Command != "" {
 		fmt.Fprintf(&b, "Command: %s\n", input.Command)
+	}
+	if input.Text != "" {
+		fmt.Fprintf(&b, "Text: %q\n", input.Text)
 	}
 	if input.Sudo {
 		b.WriteString("Sudo: yes\n")

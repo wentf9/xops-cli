@@ -34,7 +34,8 @@ func callTunnelList(t *testing.T, client *mcp.ClientSession, input mcpruntime.Li
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	result, err := client.CallTool(ctx, &mcp.CallToolParams{Name: "xops_tunnel_list", Arguments: input})
+	input.Action = "list"
+	result, err := client.CallTool(ctx, &mcp.CallToolParams{Name: "tunnel", Arguments: input})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,15 +70,44 @@ func connectRuntimeTestClient(t *testing.T, r *mcpruntime.Runtime) *mcp.ClientSe
 func tunnelListPolicyClient(t *testing.T, r *mcpruntime.Runtime, version string, options *mcp.ClientOptions) *mcp.ClientSession {
 	return protocolClient(t, r, version, options)
 }
+func normalizeTunnelCall(name string, input any) (string, any) {
+	switch name {
+	case "xops_tunnel_create":
+		if c, ok := input.(mcpruntime.CreateTunnelInput); ok {
+			c.Action = "create"
+			return "tunnel", c
+		}
+		return "tunnel", input
+	case "xops_tunnel_status":
+		if u, ok := input.(mcpruntime.TunnelInput); ok {
+			u.Action = "status"
+			return "tunnel", u
+		}
+		return "tunnel", input
+	case "xops_tunnel_stop":
+		if u, ok := input.(mcpruntime.TunnelInput); ok {
+			u.Action = "stop"
+			return "tunnel", u
+		}
+		return "tunnel", input
+	default:
+		return name, input
+	}
+}
+
 func callTunnelTool(t *testing.T, client *mcp.ClientSession, name string, input any) tunnel.Status {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	var output mcpruntime.TunnelOutput
-	if _, err := callTool(ctx, client, name, input, &output); err != nil {
+	toolName, args := normalizeTunnelCall(name, input)
+	var output mcpruntime.TunnelPolyOutput
+	if _, err := callTool(ctx, client, toolName, args, &output); err != nil {
 		t.Fatal(err)
 	}
-	return output.Tunnel
+	if output.Tunnel == nil {
+		t.Fatal("missing tunnel in output")
+	}
+	return *output.Tunnel
 }
 func tunnelTestInput(t *testing.T, address, mode, requestID string) mcpruntime.CreateTunnelInput {
 	t.Helper()
@@ -89,7 +119,7 @@ func tunnelTestInput(t *testing.T, address, mode, requestID string) mcpruntime.C
 	if err != nil {
 		t.Fatal(err)
 	}
-	return mcpruntime.CreateTunnelInput{RequestID: requestID, NodeID: "node", Mode: mode, ListenHost: "127.0.0.1", TargetHost: host, TargetPort: port, TTLSeconds: 60}
+	return mcpruntime.CreateTunnelInput{Action: "create", RequestID: requestID, NodeID: "node", Mode: mode, ListenHost: "127.0.0.1", TargetHost: host, TargetPort: port, TTLSeconds: 60}
 }
 func startTunnelEcho(t *testing.T) string {
 	t.Helper()

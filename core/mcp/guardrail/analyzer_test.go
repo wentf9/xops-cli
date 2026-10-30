@@ -203,7 +203,7 @@ func TestAnalyzeCommandDialect(t *testing.T) {
 func TestClassifyDialect(t *testing.T) {
 	// Unknown dialect cannot be Safe even for read-only commands
 	riUnknown := RiskInput{
-		ToolName: "xops_ssh_run",
+		ToolName: "terminal",
 		Command:  "uptime",
 		Dialect:  "unknown",
 	}
@@ -213,7 +213,7 @@ func TestClassifyDialect(t *testing.T) {
 
 	// Posix dialect for uptime is Safe
 	riPosix := RiskInput{
-		ToolName: "xops_ssh_run",
+		ToolName: "terminal",
 		Command:  "uptime",
 		Dialect:  "posix",
 	}
@@ -223,7 +223,7 @@ func TestClassifyDialect(t *testing.T) {
 }
 
 func TestClassifyServerWithoutDialectIsNotPOSIXSafe(t *testing.T) {
-	input := RiskInput{ToolName: "xops_ssh_run", Command: "ls", Execution: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer}}
+	input := RiskInput{ToolName: "terminal", Command: "ls", Execution: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer}}
 	if got := Classify(input); got != Moderate {
 		t.Fatalf("server with unknown dialect classified %s", got)
 	}

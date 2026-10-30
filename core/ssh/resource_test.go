@@ -2,6 +2,7 @@ package ssh
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"strings"
@@ -71,6 +72,45 @@ func TestSessionOutputReportsFailureBeforeOtherStreamEOF(t *testing.T) {
 	for range 2 {
 		if err := output.wait(); !errors.Is(err, wantErr) {
 			t.Fatalf("joined error lost: %v", err)
+		}
+	}
+}
+
+func TestSessionOutputOrdersBlockedWriteFailureBeforeWaitingStream(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	sink := &privilegeContextSink{entered: make(chan struct{}), block: true}
+	stdoutWriter, stderrWriter, closeOutput, err := bindStrictOutputs(ctx, sink, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := closeOutput(); err != nil {
+			t.Error(err)
+		}
+	}()
+	stderrReader, stderrPipe := io.Pipe()
+	defer func() {
+		_ = stderrReader.Close()
+		_ = stderrPipe.Close()
+	}()
+	output := startSessionOutput(strings.NewReader("stdout"), stderrReader, stdoutWriter, stderrWriter)
+	<-sink.entered
+	if _, err := io.WriteString(stderrPipe, "stderr"); err != nil {
+		t.Fatal(err)
+	}
+	if err := stderrPipe.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Increase the chance that the stderr pump is waiting on outputMu when
+	// cancellation fires; ordering is guaranteed regardless because the stdout
+	// pump records its write error before releasing outputMu.
+	time.Sleep(time.Millisecond)
+	cancel()
+	for _, got := range []error{<-output.failed, output.wait()} {
+		var outputErr *OutputError
+		if !errors.Is(got, context.Canceled) || !errors.As(got, &outputErr) || outputErr.Target != sink {
+			t.Fatalf("blocked stream sink identity lost: %v", got)
 		}
 	}
 }

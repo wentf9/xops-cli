@@ -19,23 +19,82 @@ import (
 	"github.com/wentf9/xops-cli/core/mcp/transfer"
 )
 
+// TransferFileInput is the Stdio transfer tool input (direct local <-> remote SFTP).
+type TransferFileInput struct {
+	NodeID     string `json:"nodeID" jsonschema:"Target SSH node ID or alias"`
+	Direction  string `json:"direction" jsonschema:"Transfer direction: push (upload local to remote) or pull (download remote to local)"`
+	LocalPath  string `json:"localPath" jsonschema:"Absolute path to the local file or directory"`
+	RemotePath string `json:"remotePath" jsonschema:"Absolute path to the remote file or directory"`
+}
+
+type TransferFileOutput struct {
+	Direction string `json:"direction,omitempty" jsonschema:"Executed transfer direction"`
+	Status    string `json:"status" jsonschema:"Operation status"`
+}
+
+func (r *Runtime) stdioTransferHandler(ctx context.Context, _ *mcp.CallToolRequest, input TransferFileInput) (_ *mcp.CallToolResult, _ TransferFileOutput, handlerErr error) {
+	if input.NodeID == "" || input.LocalPath == "" || input.RemotePath == "" || input.Direction == "" {
+		return nil, TransferFileOutput{}, fmt.Errorf("nodeID, direction, localPath, and remotePath are required")
+	}
+	if input.Direction != "push" && input.Direction != "pull" {
+		return nil, TransferFileOutput{}, fmt.Errorf("unsupported transfer direction %q (expected push or pull)", input.Direction)
+	}
+
+	sftpClient, err := r.getMCPSFTPClient(ctx, input.NodeID)
+	if err != nil {
+		return nil, TransferFileOutput{}, err
+	}
+	defer joinCloseError(&handlerErr, sftpClient, "sftp client")
+
+	switch input.Direction {
+	case "push":
+		if err := sftpClient.Upload(ctx, input.LocalPath, input.RemotePath, nil); err != nil {
+			return nil, TransferFileOutput{}, fmt.Errorf("push failed: %w", err)
+		}
+	case "pull":
+		if err := sftpClient.Download(ctx, input.RemotePath, input.LocalPath, nil); err != nil {
+			return nil, TransferFileOutput{}, fmt.Errorf("pull failed: %w", err)
+		}
+	}
+
+	return nil, TransferFileOutput{
+		Direction: input.Direction,
+		Status:    "success",
+	}, nil
+}
+
+// HTTPTransferInput is the polymorphic HTTP out-of-band transfer tool input.
+type HTTPTransferInput struct {
+	Action     string `json:"action" jsonschema:"Transfer action: prepare_push, prepare_pull, status, or cancel"`
+	RequestID  string `json:"requestID,omitempty" jsonschema:"Client-generated idempotency key for prepare_push or prepare_pull; keep the same key when retrying preparation"`
+	NodeID     string `json:"nodeID,omitempty" jsonschema:"Managed SSH node ID for prepare_push or prepare_pull"`
+	RemotePath string `json:"remotePath,omitempty" jsonschema:"Absolute file path on the SSH target for prepare_push or prepare_pull"`
+	Size       int64  `json:"size,omitempty" jsonschema:"Exact client file size in bytes for prepare_push"`
+	SHA256     string `json:"sha256,omitempty" jsonschema:"Lowercase SHA-256 of the client file for prepare_push"`
+	Overwrite  bool   `json:"overwrite,omitempty" jsonschema:"Explicitly replace an existing ordinary file atomically for prepare_push; new file mode is 0600"`
+	TransferID string `json:"transferID,omitempty" jsonschema:"Transfer task ID returned by prepare_push or prepare_pull, used by status and cancel"`
+}
+
 type PrepareUploadInput struct {
-	RequestID  string `json:"requestID" jsonschema:"Client-generated idempotency key; keep the same key when retrying preparation"`
-	NodeID     string `json:"nodeID" jsonschema:"Managed SSH node ID"`
-	RemotePath string `json:"remotePath" jsonschema:"Absolute destination file path on the SSH target"`
-	Size       int64  `json:"size" jsonschema:"Exact client file size in bytes"`
-	SHA256     string `json:"sha256" jsonschema:"Lowercase SHA-256 of the client file"`
-	Overwrite  bool   `json:"overwrite,omitempty" jsonschema:"Explicitly replace an existing ordinary file atomically; new file mode is 0600"`
+	Action     string `json:"action,omitempty"`
+	RequestID  string `json:"requestID"`
+	NodeID     string `json:"nodeID"`
+	RemotePath string `json:"remotePath"`
+	Size       int64  `json:"size"`
+	SHA256     string `json:"sha256"`
+	Overwrite  bool   `json:"overwrite,omitempty"`
 }
 
 type PrepareDownloadInput struct {
-	RequestID  string `json:"requestID" jsonschema:"Client-generated idempotency key"`
-	NodeID     string `json:"nodeID" jsonschema:"Managed SSH node ID"`
-	RemotePath string `json:"remotePath" jsonschema:"Absolute source file path on the SSH target"`
+	Action     string `json:"action,omitempty"`
+	RequestID  string `json:"requestID"`
+	NodeID     string `json:"nodeID"`
+	RemotePath string `json:"remotePath"`
 }
 
 type TransferTaskInput struct {
-	TransferID string `json:"transferID" jsonschema:"Transfer task ID returned by a prepare tool"`
+	Action     string `json:"action,omitempty"`
+	TransferID string `json:"transferID"`
 }
 
 type PreparedTransferOutput struct {
@@ -43,8 +102,8 @@ type PreparedTransferOutput struct {
 	URL       string            `json:"url,omitempty"`
 	Method    string            `json:"method,omitempty"`
 	Headers   map[string]string `json:"headers,omitempty"`
-	StatusURL string            `json:"statusURL"`
-	CancelURL string            `json:"cancelURL"`
+	StatusURL string            `json:"statusURL,omitempty"`
+	CancelURL string            `json:"cancelURL,omitempty"`
 }
 
 func (r *Runtime) preparedTransfer(p transfer.Prepared) PreparedTransferOutput {
@@ -62,7 +121,48 @@ func (r *Runtime) preparedTransfer(p transfer.Prepared) PreparedTransferOutput {
 	return out
 }
 
+func (r *Runtime) httpTransferHandler(ctx context.Context, req *mcp.CallToolRequest, input HTTPTransferInput) (*mcp.CallToolResult, PreparedTransferOutput, error) {
+	action := input.Action
+	if action == "" {
+		switch {
+		case input.TransferID != "":
+			action = "status"
+		case input.SHA256 != "":
+			action = "prepare_push"
+		case input.RequestID != "":
+			action = "prepare_pull"
+		}
+	}
+
+	switch action {
+	case "prepare_push", "upload", "prepare_upload":
+		return r.prepareUpload(ctx, req, PrepareUploadInput{
+			RequestID:  input.RequestID,
+			NodeID:     input.NodeID,
+			RemotePath: input.RemotePath,
+			Size:       input.Size,
+			SHA256:     input.SHA256,
+			Overwrite:  input.Overwrite,
+		})
+	case "prepare_pull", "download", "prepare_download":
+		return r.prepareDownload(ctx, req, PrepareDownloadInput{
+			RequestID:  input.RequestID,
+			NodeID:     input.NodeID,
+			RemotePath: input.RemotePath,
+		})
+	case "status":
+		res, st, err := r.transferStatus(ctx, req, TransferTaskInput{TransferID: input.TransferID})
+		return res, PreparedTransferOutput{Task: st}, err
+	case "cancel":
+		res, st, err := r.transferCancel(ctx, req, TransferTaskInput{TransferID: input.TransferID})
+		return res, PreparedTransferOutput{Task: st}, err
+	default:
+		return nil, PreparedTransferOutput{}, fmt.Errorf("unsupported transfer action %q (expected prepare_push, prepare_pull, status, or cancel)", input.Action)
+	}
+}
+
 func (r *Runtime) prepareUpload(ctx context.Context, req *mcp.CallToolRequest, input PrepareUploadInput) (*mcp.CallToolResult, PreparedTransferOutput, error) {
+	input.Action = ""
 	if input.Size < 0 || input.Size > r.http.Transfers.MaxFileBytes {
 		return nil, PreparedTransferOutput{}, errors.New("upload size exceeds the permitted range")
 	}
@@ -76,6 +176,7 @@ func (r *Runtime) prepareUpload(ctx context.Context, req *mcp.CallToolRequest, i
 }
 
 func (r *Runtime) prepareDownload(ctx context.Context, req *mcp.CallToolRequest, input PrepareDownloadInput) (*mcp.CallToolResult, PreparedTransferOutput, error) {
+	input.Action = ""
 	spec := transfer.Spec{RequestID: input.RequestID, NodeID: input.NodeID, RequestedPath: input.RemotePath,
 		RemotePath: input.RemotePath, Direction: transfer.Download}
 	return r.prepareTransfer(ctx, req, spec, input)
@@ -116,7 +217,7 @@ func (r *Runtime) prepareTransfer(ctx context.Context, req *mcp.CallToolRequest,
 	if err != nil {
 		return nil, PreparedTransferOutput{}, err
 	}
-	ctx, _, err = r.operationContext(ctx, view, "xops_prepare_"+string(spec.Direction), input)
+	ctx, _, err = r.operationContext(ctx, view, "transfer", input)
 	if err != nil {
 		return nil, PreparedTransferOutput{}, err
 	}
@@ -136,7 +237,7 @@ func (r *Runtime) prepareTransfer(ctx context.Context, req *mcp.CallToolRequest,
 	if spec.Size > r.http.Transfers.MaxFileBytes {
 		return nil, PreparedTransferOutput{}, errors.New("source file exceeds transfer size limit")
 	}
-	ctx, op, err := r.operationContext(ctx, view, "xops_prepare_"+string(spec.Direction), spec)
+	ctx, op, err := r.operationContext(ctx, view, "transfer", spec)
 	if err != nil {
 		return nil, PreparedTransferOutput{}, err
 	}
@@ -219,7 +320,11 @@ func (r *Runtime) inspectTransfer(ctx context.Context, spec transfer.Spec) (_ re
 }
 
 func transferRisk(spec transfer.Spec) guardrail.RiskInput {
-	input := guardrail.RiskInput{ToolName: "xops_prepare_" + string(spec.Direction), NodeID: spec.NodeID, Paths: []string{spec.RemotePath}}
+	action := "prepare_pull"
+	if spec.Direction == transfer.Upload {
+		action = "prepare_push"
+	}
+	input := guardrail.RiskInput{ToolName: "transfer", Action: action, NodeID: spec.NodeID, Paths: []string{spec.RemotePath}}
 	if spec.RequestedPath != "" && spec.RequestedPath != spec.RemotePath {
 		input.Paths = append(input.Paths, spec.RequestedPath)
 	}
@@ -263,12 +368,39 @@ func (r *Runtime) auditTransfer(id, outcome string, cause error) error {
 	return r.guardrail.RecordAuthorizedContext(ctx, record.OperationID, transferRisk(record.Spec), outcome, cause)
 }
 
-func (r *Runtime) registerTransfers(server *mcp.Server) {
-	destructive := true
-	mcp.AddTool(server, &mcp.Tool{Name: "xops_prepare_upload", Description: "Prepare a single-file upload. Does not transfer the file. Read the CLIENT file with a local command and PUT its binary bytes to the returned URL with the returned headers. Then query task status. Overwrite requires atomic replacement; destination mode is 0600. Keep requestID when retrying preparation, never automatically retry data transfer.", Annotations: &mcp.ToolAnnotations{DestructiveHint: &destructive}}, r.prepareUpload)
-	mcp.AddTool(server, &mcp.Tool{Name: "xops_prepare_download", Description: "Prepare a single-file download. Use a CLIENT-local command to GET the binary stream into a temporary file. Query status and compare size and SHA-256 before promoting the local file. Server state streamed does not confirm local saving.", Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true}}, r.prepareDownload)
-	mcp.AddTool(server, &mcp.Tool{Name: "xops_transfer_status", Description: "Query transfer state, checksum and cleanup status. Never automatically retry an unknown commit.", Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true}}, r.transferStatus)
-	mcp.AddTool(server, &mcp.Tool{Name: "xops_transfer_cancel", Description: "Request transfer cancellation. A committing or unknown upload cannot be reported as safely cancelled."}, r.transferCancel)
+func (r *Runtime) registerTransfer(server *mcp.Server, g *guardrail.Guardrail) {
+	if r.http != nil {
+		destructive := true
+		mcp.AddTool(server, &mcp.Tool{
+			Name:        "transfer",
+			Description: "Out-of-band HTTP binary file transfer controller. Actions: 'prepare_push' (prepare single-file upload, returns PUT URL & headers), 'prepare_pull' (prepare single-file download, returns GET URL & headers), 'status' (query transfer state & SHA-256), 'cancel' (request cancellation).",
+			Annotations: &mcp.ToolAnnotations{DestructiveHint: &destructive},
+		}, r.httpTransferHandler)
+		return
+	}
+
+	notDestructive := false
+	mcp.AddTool(server,
+		&mcp.Tool{
+			Name:        "transfer",
+			Description: "Transfer files or directories between the local MCP host and a remote SSH node via SFTP. Directions: 'push' (local to remote) or 'pull' (remote to local).",
+			Annotations: &mcp.ToolAnnotations{DestructiveHint: &notDestructive},
+		},
+		withOperation(r, g, "transfer",
+			func(in TransferFileInput) guardrail.RiskInput {
+				paths := []string{in.RemotePath}
+				if in.Direction == "push" && in.LocalPath != "" {
+					paths = []string{in.LocalPath, in.RemotePath}
+				}
+				return guardrail.RiskInput{
+					Action: in.Direction,
+					NodeID: in.NodeID,
+					Paths:  paths,
+				}
+			},
+			r.stdioTransferHandler,
+		),
+	)
 }
 
 func transferRequestDigest(direction transfer.Direction, input any) (string, error) {

@@ -37,6 +37,7 @@ type Backend struct {
 
 var _ ports.Backend = (*Backend)(nil)
 var _ ports.ExecutionProber = (*Backend)(nil)
+var _ ports.PTYBackend = (*Backend)(nil)
 
 func New(ctx context.Context, options Options) (*Backend, error) {
 	if ctx == nil {
@@ -134,7 +135,7 @@ func (b *Backend) Run(ctx context.Context, permit ports.Permit, nodeID string, c
 	if command.Plan != nil {
 		plan = *command.Plan
 	} else {
-		plan, err = ssh.PlanCommand(command.Text, effectiveExec.CommandOptions())
+		plan, err = ssh.PlanCommand(command.Text, command.CommandOptions(effectiveExec))
 		if err != nil {
 			result.Outcome = ssh.ExecutionNotStarted
 			result.ExecutionErr = err
@@ -229,6 +230,19 @@ func (b *Backend) OpenTransfer(ctx context.Context, permit ports.Permit, nodeID 
 		return nil, err
 	}
 	return ports.GuardTransfer(b.ctx, remotefile.New(&transferFiles{Client: files.Client, release: files.release}), permit)
+}
+
+func (b *Backend) OpenPTY(ctx context.Context, permit ports.Permit, nodeID string) (ports.PTYSession, error) {
+	work, cancel, err := b.work(ctx, permit, ports.Execute)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	connection, err := b.connection(work, permit, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	return OpenClientPTY(work, connection.Client, connection.Close)
 }
 
 // Retire drains a cached plan but never grants or revokes execution permission.

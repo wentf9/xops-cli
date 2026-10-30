@@ -52,7 +52,7 @@ func assertRuntimeNode(t *testing.T, session *mcp.ClientSession, nodeID string) 
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "xops_list_nodes", Arguments: map[string]any{}})
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "nodes", Arguments: map[string]any{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,11 +107,12 @@ func TestRuntimeToolsAndShutdownAreIsolated(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string]bool{
-		"xops_list_nodes": true, "xops_ssh_run": true,
-		"xops_read_file": true, "xops_write_file": true, "xops_upload": true, "xops_download": true,
-		"xops_fs_ls": true, "xops_fs_mkdir": true, "xops_fs_touch": true,
-		"xops_fs_mv": true, "xops_fs_rm": true, "xops_fs_cp": true,
-		"xops_tunnel_create": true, "xops_tunnel_list": true, "xops_tunnel_status": true, "xops_tunnel_stop": true,
+		"nodes":    true,
+		"terminal": true,
+		"file":     true,
+		"gui":      true,
+		"transfer": true,
+		"tunnel":   true,
 	}
 	for _, tool := range result.Tools {
 		if !want[tool.Name] {

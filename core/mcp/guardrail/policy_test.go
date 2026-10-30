@@ -1,6 +1,7 @@
 package guardrail
 
 import (
+	"strings"
 	"testing"
 
 	config "github.com/wentf9/xops-cli/core/mcp/policy"
@@ -19,7 +20,7 @@ func TestPolicyEvaluate_Disabled(t *testing.T) {
 	cfg.Enabled = false
 	p := NewPolicy(cfg)
 
-	got := p.Evaluate(Dangerous, RiskInput{ToolName: "xops_fs_rm", Paths: []string{"/"}})
+	got := p.Evaluate(Dangerous, RiskInput{ToolName: "terminal", Command: "rm -rf /", Paths: []string{"/"}})
 	if got != Allow {
 		t.Errorf("disabled policy should Allow everything, got %v", got)
 	}
@@ -29,7 +30,7 @@ func TestPolicyEvaluate_BlockedCommand(t *testing.T) {
 	p := NewPolicy(defaultTestConfig())
 
 	got := p.Evaluate(Dangerous, RiskInput{
-		ToolName: "xops_ssh_run",
+		ToolName: "terminal",
 		Command:  "rm -rf /",
 		NodeID:   "test-node",
 	})
@@ -38,11 +39,24 @@ func TestPolicyEvaluate_BlockedCommand(t *testing.T) {
 	}
 }
 
+// Typing a blocked command into a remote terminal window must be denied just
+// like running it through the terminal tool.
+func TestPolicyEvaluate_BlockedGUIText(t *testing.T) {
+	p := NewPolicy(defaultTestConfig())
+	input := RiskInput{ToolName: "gui", Action: "type", Text: "rm -rf /", NodeID: "test-node"}
+	if got := p.Evaluate(Classify(input), input); got != Deny {
+		t.Errorf("blocked gui text should be Deny, got %v", got)
+	}
+	if msg := buildApprovalMessage(Dangerous, input); !strings.Contains(msg, `Text: "rm -rf /"`) {
+		t.Errorf("approval message must show typed text, got:\n%s", msg)
+	}
+}
+
 func TestPolicyEvaluate_SafeOperation(t *testing.T) {
 	p := NewPolicy(defaultTestConfig())
 
 	got := p.Evaluate(Safe, RiskInput{
-		ToolName: "xops_list_nodes",
+		ToolName: "nodes",
 	})
 	if got != Allow {
 		t.Errorf("safe operation should Allow, got %v", got)
@@ -53,7 +67,8 @@ func TestPolicyEvaluate_DangerousNeedsApproval(t *testing.T) {
 	p := NewPolicy(defaultTestConfig())
 
 	got := p.Evaluate(Dangerous, RiskInput{
-		ToolName: "xops_fs_rm",
+		ToolName: "terminal",
+		Command:  "rm -rf /var/log/app",
 		NodeID:   "prod-web-1",
 		Paths:    []string{"/var/log/app"},
 	})
@@ -68,7 +83,8 @@ func TestPolicyEvaluate_ModerateWithThreshold(t *testing.T) {
 	p := NewPolicy(cfg)
 
 	got := p.Evaluate(Moderate, RiskInput{
-		ToolName: "xops_write_file",
+		ToolName: "file",
+		Action:   "write",
 		NodeID:   "test-node",
 		Paths:    []string{"/tmp/test.txt"},
 	})
@@ -85,7 +101,8 @@ func TestPolicyEvaluate_NodeOverride(t *testing.T) {
 	p := NewPolicy(cfg)
 
 	got := p.Evaluate(Moderate, RiskInput{
-		ToolName: "xops_write_file",
+		ToolName: "file",
+		Action:   "write",
 		NodeID:   "prod-web-1",
 		Paths:    []string{"/tmp/test.txt"},
 	})
@@ -94,7 +111,8 @@ func TestPolicyEvaluate_NodeOverride(t *testing.T) {
 	}
 
 	got = p.Evaluate(Moderate, RiskInput{
-		ToolName: "xops_write_file",
+		ToolName: "file",
+		Action:   "write",
 		NodeID:   "dev-api-1",
 		Paths:    []string{"/tmp/test.txt"},
 	})
@@ -116,12 +134,12 @@ func TestPolicyEvaluateBatchNodes(t *testing.T) {
 		{[]string{"restricted-a", "public"}, NeedApproval},
 		{[]string{"restricted-a", "restricted-b"}, NeedApproval},
 	} {
-		input := RiskInput{ToolName: "xops_tunnel_list", NodeIDs: tc.nodes}
+		input := RiskInput{ToolName: "tunnel", Action: "list", NodeIDs: tc.nodes}
 		if got := p.Evaluate(Safe, input); got != tc.want {
 			t.Errorf("nodes=%v decision=%s, want %s", tc.nodes, got, tc.want)
 		}
 	}
-	input := RiskInput{ToolName: "xops_tunnel_list", NodeIDs: []string{"restricted-a"}}
+	input := RiskInput{ToolName: "tunnel", Action: "list", NodeIDs: []string{"restricted-a"}}
 	cfg.BlockedPatterns = []string{"*"}
 	if got := p.Evaluate(Safe, input); got != Deny {
 		t.Fatalf("batch approval overrode deny: %s", got)
@@ -132,7 +150,7 @@ func TestPolicyEvaluateBatchNodes(t *testing.T) {
 	}
 	cfg.Enabled, cfg.BlockedPatterns, cfg.ApprovalThreshold = true, nil, "safe"
 	cfg.NodeOverrides = map[string]config.NodeConfig{"public": {ApprovalThreshold: "dangerous"}}
-	if got := p.Evaluate(Safe, RiskInput{ToolName: "xops_tunnel_list", NodeIDs: []string{"public"}}); got != NeedApproval {
+	if got := p.Evaluate(Safe, RiskInput{ToolName: "tunnel", Action: "list", NodeIDs: []string{"public"}}); got != NeedApproval {
 		t.Fatal("batch nodes weakened the global policy")
 	}
 }
@@ -141,11 +159,12 @@ func TestPolicyEvaluate_ProtectedPath(t *testing.T) {
 	p := NewPolicy(defaultTestConfig())
 
 	got := p.Evaluate(Safe, RiskInput{
-		ToolName: "xops_read_file",
+		ToolName: "file",
+		Action:   "read",
 		NodeID:   "test-node",
 		Paths:    []string{"/etc/passwd"},
 	})
-	// read_file is Safe, but /etc is protected -> elevated to Moderate,
+	// file read is Safe, but /etc is protected -> elevated to Moderate,
 	// threshold is dangerous -> still Allow
 	if got != Allow {
 		t.Errorf("safe read on protected path with dangerous threshold should Allow, got %v", got)
@@ -156,7 +175,8 @@ func TestPolicyEvaluate_ProtectedPath(t *testing.T) {
 	p2 := NewPolicy(cfg)
 
 	got = p2.Evaluate(Safe, RiskInput{
-		ToolName: "xops_read_file",
+		ToolName: "file",
+		Action:   "read",
 		NodeID:   "test-node",
 		Paths:    []string{"/etc/passwd"},
 	})
@@ -181,7 +201,8 @@ func TestPolicyEvaluateGlobalScopeAndWildcardOverride(t *testing.T) {
 			cfg := defaultTestConfig()
 			cfg.ApprovalThreshold = tc.global
 			cfg.NodeOverrides = map[string]config.NodeConfig{"*": {ApprovalThreshold: tc.override}}
-			tc.input.ToolName = "xops_tunnel_list"
+			tc.input.ToolName = "tunnel"
+			tc.input.Action = "list"
 			if got := NewPolicy(cfg).Evaluate(Safe, tc.input); got != tc.want {
 				t.Fatalf("decision = %s, want %s", got, tc.want)
 			}
@@ -221,7 +242,7 @@ func TestPolicyEvaluate_CustomBlockedPattern(t *testing.T) {
 	p := NewPolicy(cfg)
 
 	got := p.Evaluate(Moderate, RiskInput{
-		ToolName: "xops_ssh_run",
+		ToolName: "terminal",
 		Command:  "run_dangerous_script.sh",
 		NodeID:   "test",
 	})
@@ -261,7 +282,7 @@ func TestPolicyEvaluate_MalformedPattern_FailClosed(t *testing.T) {
 	p := NewPolicy(cfg)
 
 	got := p.Evaluate(Safe, RiskInput{
-		ToolName: "xops_ssh_run",
+		ToolName: "terminal",
 		Command:  "echo safe",
 		NodeID:   "test",
 	})
@@ -277,43 +298,83 @@ func TestClassify(t *testing.T) {
 		want  RiskLevel
 	}{
 		{
-			"safe tool",
-			RiskInput{ToolName: "xops_list_nodes"},
+			"safe tool nodes",
+			RiskInput{ToolName: "nodes"},
 			Safe,
 		},
 		{
-			"moderate tool",
-			RiskInput{ToolName: "xops_write_file", Paths: []string{"/tmp/file"}},
+			"file read safe",
+			RiskInput{ToolName: "file", Action: "read", Paths: []string{"/tmp/file"}},
+			Safe,
+		},
+		{
+			"file stat safe",
+			RiskInput{ToolName: "file", Action: "stat", Paths: []string{"/tmp/dir"}},
+			Safe,
+		},
+		{
+			"file write moderate",
+			RiskInput{ToolName: "file", Action: "write", Paths: []string{"/tmp/file"}},
 			Moderate,
 		},
 		{
-			"dangerous tool",
-			RiskInput{ToolName: "xops_fs_rm", Paths: []string{"/tmp/file"}},
-			Dangerous,
+			"file patch moderate",
+			RiskInput{ToolName: "file", Action: "patch", Paths: []string{"/tmp/file"}},
+			Moderate,
 		},
 		{
-			"ssh_run safe command",
-			RiskInput{ToolName: "xops_ssh_run", Command: "ls -la"},
+			"gui shot safe",
+			RiskInput{ToolName: "gui", Action: "shot"},
 			Safe,
 		},
 		{
-			"ssh_run dangerous command",
-			RiskInput{ToolName: "xops_ssh_run", Command: "rm -rf /var/log"},
+			"gui click moderate",
+			RiskInput{ToolName: "gui", Action: "click"},
+			Moderate,
+		},
+		{
+			"transfer pull safe",
+			RiskInput{ToolName: "transfer", Action: "pull", Paths: []string{"/tmp/file"}},
+			Safe,
+		},
+		{
+			"transfer push moderate",
+			RiskInput{ToolName: "transfer", Action: "push", Paths: []string{"/tmp/file"}},
+			Moderate,
+		},
+		{
+			"terminal safe command",
+			RiskInput{ToolName: "terminal", Action: "once", Command: "ls -la"},
+			Safe,
+		},
+		{
+			"terminal persistent session elevates safe command to moderate",
+			RiskInput{ToolName: "terminal", Action: "work", Command: "ls -la"},
+			Moderate,
+		},
+		{
+			"terminal poll safe",
+			RiskInput{ToolName: "terminal", Action: "poll", Command: ""},
+			Safe,
+		},
+		{
+			"terminal dangerous command",
+			RiskInput{ToolName: "terminal", Action: "once", Command: "rm -rf /var/log"},
 			Dangerous,
 		},
 		{
-			"ssh_run with sudo",
-			RiskInput{ToolName: "xops_ssh_run", Command: "ls -la", Sudo: true},
+			"terminal with sudo",
+			RiskInput{ToolName: "terminal", Action: "once", Command: "ls -la", Sudo: true},
 			Moderate,
 		},
 		{
 			"moderate tool on root path",
-			RiskInput{ToolName: "xops_fs_cp", Paths: []string{"/"}},
+			RiskInput{ToolName: "file", Action: "write", Paths: []string{"/"}},
 			Dangerous,
 		},
 		{
 			"unknown tool",
-			RiskInput{ToolName: "xops_unknown"},
+			RiskInput{ToolName: "unknown_tool"},
 			Dangerous,
 		},
 	}

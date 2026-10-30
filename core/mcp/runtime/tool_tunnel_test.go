@@ -73,14 +73,46 @@ func tunnelTestInput(t *testing.T, target, mode, id string) CreateTunnelInput {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return CreateTunnelInput{RequestID: id, NodeID: "alias", Mode: mode, TargetHost: host, TargetPort: port}
+	return CreateTunnelInput{Action: "create", RequestID: id, NodeID: "alias", Mode: mode, TargetHost: host, TargetPort: port}
+}
+
+func normalizeTunnelTestCall(name string, input any) (string, any) {
+	switch name {
+	case "xops_tunnel_create":
+		if c, ok := input.(CreateTunnelInput); ok {
+			c.Action = "create"
+			return "tunnel", c
+		}
+		return "tunnel", input
+	case "xops_tunnel_status":
+		if u, ok := input.(TunnelInput); ok {
+			u.Action = "status"
+			return "tunnel", u
+		}
+		return "tunnel", input
+	case "xops_tunnel_stop":
+		if u, ok := input.(TunnelInput); ok {
+			u.Action = "stop"
+			return "tunnel", u
+		}
+		return "tunnel", input
+	case "xops_tunnel_list":
+		if l, ok := input.(ListTunnelsInput); ok {
+			l.Action = "list"
+			return "tunnel", l
+		}
+		return "tunnel", input
+	default:
+		return name, input
+	}
 }
 
 func callTunnelTool(t *testing.T, client *mcp.ClientSession, name string, input any) tunnel.Status {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	result, err := client.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: input})
+	toolName, args := normalizeTunnelTestCall(name, input)
+	result, err := client.CallTool(ctx, &mcp.CallToolParams{Name: toolName, Arguments: args})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,14 +123,14 @@ func callTunnelTool(t *testing.T, client *mcp.ClientSession, name string, input 
 	if err != nil {
 		t.Fatal(err)
 	}
-	var output TunnelOutput
+	var output TunnelPolyOutput
 	if err := json.Unmarshal(data, &output); err != nil {
 		t.Fatal(err)
 	}
-	if output.Tunnel.TunnelID == "" {
+	if output.Tunnel == nil || output.Tunnel.TunnelID == "" {
 		t.Fatalf("missing tunnel: %s", data)
 	}
-	return output.Tunnel
+	return *output.Tunnel
 }
 
 func assertTunnelEcho(t *testing.T, address string) net.Conn {
@@ -191,7 +223,7 @@ func TestMCPTunnelRoundTripAndConnectionIsolation(t *testing.T) {
 					t.Fatal(err)
 				}
 				for range 2 {
-					stopped := callTunnelTool(t, client, "xops_tunnel_stop", TunnelInput{first.TunnelID})
+					stopped := callTunnelTool(t, client, "xops_tunnel_stop", TunnelInput{TunnelID: first.TunnelID})
 					if stopped.State != "stopped" {
 						t.Fatalf("stop: %+v", stopped)
 					}
@@ -322,7 +354,7 @@ func TestMCPStdioTunnelProcessRoundTrip(t *testing.T) {
 			t.Fatalf("stdio create: %+v", s)
 		}
 		assertTunnelEcho(t, s.ListenAddress)
-		stopped := callTunnelTool(t, session, "xops_tunnel_stop", TunnelInput{s.TunnelID})
+		stopped := callTunnelTool(t, session, "xops_tunnel_stop", TunnelInput{TunnelID: s.TunnelID})
 		if stopped.State != "stopped" {
 			t.Fatalf("stdio stop: %+v", stopped)
 		}
@@ -365,7 +397,7 @@ func TestMCPTunnelApprovalAndAliasPolicy(t *testing.T) {
 				}
 				defer closeTransferTestResource(t, session)
 				input := tunnelTestInput(t, startTunnelEcho(t), "remote", "approval")
-				result, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "xops_tunnel_create", Arguments: input})
+				result, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "tunnel", Arguments: input})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -383,7 +415,7 @@ func TestMCPTunnelApprovalAndAliasPolicy(t *testing.T) {
 					t.Fatalf("retry requested %d approvals", approvals.Load())
 				}
 				input.TargetPort++
-				result, err = session.CallTool(t.Context(), &mcp.CallToolParams{Name: "xops_tunnel_create", Arguments: input})
+				result, err = session.CallTool(t.Context(), &mcp.CallToolParams{Name: "tunnel", Arguments: input})
 				if err != nil || !result.IsError {
 					t.Fatalf("conflicting retry: %+v, %v", result, err)
 				}
@@ -404,7 +436,7 @@ func tunnelApprovalOptions(t *testing.T, action string, approvals *atomic.Int32)
 	if action != "unsupported" {
 		opts.ElicitationHandler = func(_ context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
 			approvals.Add(1)
-			if strings.Contains(req.Params.Message, "Tool:  xops_tunnel_create") && (!strings.Contains(req.Params.Message, "listen=") || !strings.Contains(req.Params.Message, "target=")) {
+			if strings.Contains(req.Params.Message, "Tool:  tunnel") && strings.Contains(req.Params.Message, "mode=") && (!strings.Contains(req.Params.Message, "listen=") || !strings.Contains(req.Params.Message, "target=")) {
 				t.Error("approval omitted endpoints")
 			}
 			return &mcp.ElicitResult{Action: action, Content: map[string]any{"approved": action == "accept"}}, nil
@@ -415,8 +447,8 @@ func tunnelApprovalOptions(t *testing.T, action string, approvals *atomic.Int32)
 
 func assertTunnelQueryPolicy(t *testing.T, session *mcp.ClientSession, id string, approvals *atomic.Int32) {
 	t.Helper()
-	callTunnelTool(t, session, "xops_tunnel_status", TunnelInput{id})
-	result, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "xops_tunnel_list", Arguments: ListTunnelsInput{NodeID: "alias"}})
+	callTunnelTool(t, session, "xops_tunnel_status", TunnelInput{TunnelID: id})
+	result, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "tunnel", Arguments: ListTunnelsInput{Action: "list", NodeID: "alias"}})
 	if err != nil || result.IsError {
 		t.Fatalf("query: %+v, %v", result, err)
 	}
@@ -437,11 +469,11 @@ func TestMCPTunnelRejectsUnsupportedInput(t *testing.T) {
 	}()
 	client := connectRuntimeTestClient(t, r)
 	for _, input := range []CreateTunnelInput{
-		{RequestID: "dynamic", NodeID: "node", Mode: "dynamic", TargetHost: "localhost", TargetPort: 80},
-		{RequestID: "bad-node", NodeID: "missing", Mode: "local", TargetHost: "localhost", TargetPort: 80},
-		{RequestID: "bad-port", NodeID: "node", Mode: "local", ListenPort: -1, TargetHost: "localhost", TargetPort: 80},
+		{Action: "create", RequestID: "dynamic", NodeID: "node", Mode: "dynamic", TargetHost: "localhost", TargetPort: 80},
+		{Action: "create", RequestID: "bad-node", NodeID: "missing", Mode: "local", TargetHost: "localhost", TargetPort: 80},
+		{Action: "create", RequestID: "bad-port", NodeID: "node", Mode: "local", ListenPort: -1, TargetHost: "localhost", TargetPort: 80},
 	} {
-		result, err := client.CallTool(t.Context(), &mcp.CallToolParams{Name: "xops_tunnel_create", Arguments: input})
+		result, err := client.CallTool(t.Context(), &mcp.CallToolParams{Name: "tunnel", Arguments: input})
 		if err != nil || !result.IsError {
 			t.Fatalf("invalid input accepted: %+v, %v", result, err)
 		}
@@ -465,12 +497,12 @@ func TestMCPTunnelIPv6AndQueries(t *testing.T) {
 			t.Fatalf("IPv6 listener: %+v", created)
 		}
 		assertTunnelEcho(t, created.ListenAddress)
-		status := callTunnelTool(t, client, "xops_tunnel_status", TunnelInput{created.TunnelID})
+		status := callTunnelTool(t, client, "xops_tunnel_status", TunnelInput{TunnelID: created.TunnelID})
 		if status.ListenAddress != created.ListenAddress || status.ListenScope == status.TargetScope {
 			t.Fatalf("query: %+v", status)
 		}
 	}
-	result, err := client.CallTool(t.Context(), &mcp.CallToolParams{Name: "xops_tunnel_list", Arguments: ListTunnelsInput{NodeID: "alias", State: "running"}})
+	result, err := client.CallTool(t.Context(), &mcp.CallToolParams{Name: "tunnel", Arguments: ListTunnelsInput{Action: "list", NodeID: "alias", State: "running"}})
 	if err != nil || result.IsError {
 		t.Fatalf("list: %+v, %v", result, err)
 	}

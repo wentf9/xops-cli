@@ -59,21 +59,37 @@ func startSessionOutput(stdout, stderr io.Reader, stdoutWriter, stderrWriter io.
 	var wg sync.WaitGroup
 	var outputMu sync.Mutex
 
+	recordFailure := func(err error) {
+		select {
+		case failed <- err:
+		default:
+		}
+		errCh <- err
+	}
 	copyOne := func(name string, dst io.Writer, src io.Reader) {
 		wg.Go(func() {
 			if src == nil {
 				errCh <- nil
 				return
 			}
-			_, err := io.Copy(serializedSessionOutput{mu: &outputMu, target: dst}, src)
-			if err != nil {
-				err = fmt.Errorf("copy SSH %s failed: %w", name, err)
-				select {
-				case failed <- err:
-				default:
+			var recorded bool
+			_, err := io.Copy(serializedSessionOutput{
+				mu:     &outputMu,
+				target: dst,
+				onError: func(writeErr error) {
+					if !recorded {
+						recorded = true
+						recordFailure(fmt.Errorf("copy SSH %s failed: %w", name, writeErr))
+					}
+				},
+			}, src)
+			if !recorded {
+				if err != nil {
+					recordFailure(fmt.Errorf("copy SSH %s failed: %w", name, err))
+				} else {
+					errCh <- nil
 				}
 			}
-			errCh <- err
 		})
 	}
 	copyOne("stdout", stdoutWriter, stdout)
@@ -113,12 +129,20 @@ func waitSessionOutput(ctx context.Context, wait func() error, cancelOutput ...c
 // when the remote command fills the other SSH stream before closing this one.
 // Hiding ReaderFrom also prevents an underlying buffer from bypassing the lock.
 type serializedSessionOutput struct {
-	mu     *sync.Mutex
-	target io.Writer
+	mu      *sync.Mutex
+	target  io.Writer
+	onError func(error)
 }
 
 func (w serializedSessionOutput) Write(data []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.target.Write(data)
+	n, err := w.target.Write(data)
+	if err == nil && n < len(data) {
+		err = io.ErrShortWrite
+	}
+	if err != nil && w.onError != nil {
+		w.onError(err)
+	}
+	return n, err
 }

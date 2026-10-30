@@ -45,11 +45,15 @@ func setupBackend(t *testing.T) (*sshexec.Backend, ports.OperationSnapshot, *ssh
 }
 
 func setupBackendWithHandler(t *testing.T, handler func(string, cryptoSSH.Channel)) (*sshexec.Backend, ports.OperationSnapshot, *sshfixture.Server, context.Context) {
+	return setupBackendWithOptions(t, sshfixture.Options{ExecHandler: handler})
+}
+
+func setupBackendWithOptions(t *testing.T, options sshfixture.Options) (*sshexec.Backend, ports.OperationSnapshot, *sshfixture.Server, context.Context) {
 	t.Helper()
 	t.Cleanup(func() { goleak.VerifyNone(t) })
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	t.Cleanup(cancel)
-	server, err := sshfixture.NewWithOptions(ctx, sshfixture.Options{ExecHandler: handler})
+	server, err := sshfixture.NewWithOptions(ctx, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -556,5 +560,145 @@ func TestBackendFilesystemRejectsNonPOSIXDialects(t *testing.T) {
 				t.Fatalf("expected 1 execution, got %d", server.Executed.Load())
 			}
 		})
+	}
+}
+
+func TestOpenPTYConcurrentWriteAndSignalOverSSHChannel(t *testing.T) {
+	backend, view, _, ctx := setupBackend(t)
+	pty, err := backend.OpenPTY(ctx, permit(t, ctx, view, ports.Execute), "node")
+	if err != nil {
+		t.Fatalf("OpenPTY failed: %v", err)
+	}
+	defer func() {
+		if err := pty.Close(); err != nil {
+			t.Errorf("pty.Close failed: %v", err)
+		}
+	}()
+
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		_, _ = io.Copy(io.Discard, pty)
+	}()
+
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Go(func() {
+			for range 16 {
+				if _, err := pty.Write([]byte("echo hi\n")); err != nil {
+					t.Errorf("pty.Write failed: %v", err)
+					return
+				}
+			}
+		})
+		wg.Go(func() {
+			for range 16 {
+				if err := pty.Signal("INT"); err != nil {
+					t.Errorf("pty.Signal(INT) failed: %v", err)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	var closeWg sync.WaitGroup
+	stopWriters := make(chan struct{})
+	for range 2 {
+		closeWg.Go(func() {
+			for {
+				select {
+				case <-stopWriters:
+					return
+				default:
+					_, _ = pty.Write([]byte("echo hi\n"))
+				}
+			}
+		})
+		closeWg.Go(func() {
+			for {
+				select {
+				case <-stopWriters:
+					return
+				default:
+					_ = pty.Signal("INT")
+				}
+			}
+		})
+	}
+	time.Sleep(10 * time.Millisecond)
+	if err := pty.Close(); err != nil {
+		t.Fatalf("pty.Close failed: %v", err)
+	}
+	close(stopWriters)
+	closeWg.Wait()
+	<-readDone
+}
+
+func TestOpenPTYCloseUnblocksStalledWindowWrite(t *testing.T) {
+	shellStall := make(chan struct{})
+	firstByteReceived := make(chan struct{})
+	backend, view, _, ctx := setupBackendWithOptions(t, sshfixture.Options{
+		ShellHandler: func(ch cryptoSSH.Channel, requests <-chan *cryptoSSH.Request) {
+			go cryptoSSH.DiscardRequests(requests)
+			var one [1]byte
+			if _, err := io.ReadFull(ch, one[:]); err == nil {
+				close(firstByteReceived)
+			}
+			// Stop reading after the first byte so the client's SSH channel send
+			// window (initial 2 MiB) fills up and pty.Write blocks inside
+			// WriteExtended while holding p.writeMu.
+			<-shellStall
+		},
+	})
+	defer close(shellStall)
+
+	pty, err := backend.OpenPTY(ctx, permit(t, ctx, view, ports.Execute), "node")
+	if err != nil {
+		t.Fatalf("OpenPTY failed: %v", err)
+	}
+
+	writeDone := make(chan error, 1)
+	chunk := bytes.Repeat([]byte("A"), 4*1024*1024)
+	go func() {
+		_, err := pty.Write(chunk)
+		writeDone <- err
+	}()
+	select {
+	case <-firstByteReceived:
+	case err := <-writeDone:
+		t.Fatalf("write finished before server received channel data: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for pty.Write to send channel data")
+	}
+	// Give pty.Write a brief moment after the first packet arrives to exhaust the
+	// remaining 2 MiB SSH channel window and stall inside WriteExtended.
+	time.Sleep(10 * time.Millisecond)
+	select {
+	case err := <-writeDone:
+		t.Fatalf("write finished before window stall: %v", err)
+	default:
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- pty.Close()
+	}()
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("pty.Close failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pty.Close deadlocked when pty.Write was blocked on SSH channel window flow control")
+	}
+
+	select {
+	case err := <-writeDone:
+		if err == nil {
+			t.Fatal("expected blocked 4 MiB pty.Write to fail when pty.Close closed the SSH session")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked pty.Write did not unblock after pty.Close")
 	}
 }

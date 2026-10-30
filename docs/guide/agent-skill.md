@@ -64,13 +64,13 @@ Skill 实际执行右侧的 CLI 命令，不经过 MCP 服务端：
 
 | MCP 工具 | 对应 CLI 工作流 |
 | --- | --- |
-| `xops_list_nodes` | `xops host list`（可加 `--tag`） |
-| `xops_ssh_run` | `xops exec --host NODE -c COMMAND`（可加 `--sudo`） |
-| `xops_read_file` | 通过 `exec` 调用目标系统读取命令；大文件或二进制文件用 `scp` 下载 |
-| `xops_write_file` | 本地生成文件后用 `scp` 上传，或通过 `exec` 执行写入/追加 |
-| `xops_fs_ls/mkdir/touch/cp/mv/rm` | 批处理 `sftp` 或 `exec` 调用目标系统文件命令（创建空文件用后者） |
-| stdio `xops_upload/download` | `xops scp` 上传/下载文件与目录，或使用批处理 `sftp` |
-| HTTP `xops_prepare_upload/download`、`xops_transfer_status/cancel` | 直接运行 `xops scp`，检查进程退出码与目标文件；取消时终止当前进程 |
-| stdio `xops_tunnel_create/list/status/stop` | `xops ssh -L/-R -N`（CLI 另支持 `-D` SOCKS5；通过进程/会话管理启停） |
+| `nodes` | `xops host list`（可加 `--tag`） |
+| `terminal`（`session: "once"`） | `xops exec --host NODE -c COMMAND`（可加 `--sudo`）；目录操作同样通过 `exec` 调用目标系统命令 |
+| `terminal`（命名持久会话） | 无直接对应；CLI 每次 `exec` 都是独立会话，需要时用 `xops ssh` 交互终端 |
+| `file`（`read`/`write`/`patch`/`stat`） | 通过 `exec` 调用目标系统读取/写入命令，或批处理 `sftp`；大文件或二进制文件用 `scp` |
+| `gui` | 无 CLI 对应 |
+| stdio `transfer`（`push`/`pull`） | `xops scp` 上传/下载文件与目录，或使用批处理 `sftp` |
+| HTTP `transfer`（`prepare_push`/`prepare_pull`/`status`/`cancel`） | 直接运行 `xops scp`，检查进程退出码与目标文件；取消时终止当前进程 |
+| stdio `tunnel`（`create`/`list`/`status`/`stop`） | `xops ssh -L/-R -N`（CLI 另支持 `-D` SOCKS5；通过进程/会话管理启停） |
 
 > **生命周期与授权差异**：CLI 不生成 MCP 传输任务 ID、隧道 ID 或 TTL，也没有 `xops tunnel list` 命令；终止 CLI 传输进程不会回滚已写入的数据。Skill 调用 CLI 时遵循 Agent 自身的命令执行授权机制，当目标、覆盖范围或端口暴露范围不明确时应先向用户确认。

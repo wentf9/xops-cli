@@ -104,7 +104,8 @@ func TestApprovalNilAndUnsupported(t *testing.T) {
 func TestBuildApprovalMessageExecution(t *testing.T) {
 	login := false
 	msg := buildApprovalMessage(Dangerous, RiskInput{
-		ToolName: "xops_ssh_run",
+		ToolName: "terminal",
+		Action:   "once",
 		NodeID:   "prod-1",
 		Command:  "systemctl restart nginx",
 		Execution: &ssh.ExecutionConfig{

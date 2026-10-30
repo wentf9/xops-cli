@@ -141,10 +141,10 @@ func TestTransferApprovalCannotIssueTaskForEditedTarget(t *testing.T) {
 		}
 	}}, true, true)
 	sum := sha256.Sum256([]byte("x"))
-	input := PrepareUploadInput{RequestID: "prepare-race", NodeID: "node", RemotePath: "/prepared", Size: 1, SHA256: hex.EncodeToString(sum[:])}
+	input := PrepareUploadInput{Action: "prepare_push", RequestID: "prepare-race", NodeID: "node", RemotePath: "/prepared", Size: 1, SHA256: hex.EncodeToString(sum[:])}
 	finished := make(chan error, 1)
 	go func() {
-		result, err := f.client.CallTool(f.ctx, &mcp.CallToolParams{Name: "xops_prepare_upload", Arguments: input})
+		result, err := f.client.CallTool(f.ctx, &mcp.CallToolParams{Name: "transfer", Arguments: input})
 		if err == nil && !result.IsError {
 			err = errors.New("stale approval issued a transfer task")
 		}
@@ -210,7 +210,7 @@ func TestMCPDefaultFishProbeSDKRoundTripAndCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	for attempt := 0; attempt < 2; attempt++ {
-		result, err := f.client.CallTool(f.ctx, &mcp.CallToolParams{Name: "xops_ssh_run", Arguments: SshRunInput{NodeID: "node", Command: "hostname"}})
+		result, err := f.client.CallTool(f.ctx, &mcp.CallToolParams{Name: "terminal", Arguments: TerminalInput{NodeID: "node", Command: "hostname"}})
 		if err != nil || result.IsError {
 			t.Fatalf("MCP roundtrip: %+v %v", result, err)
 		}
@@ -218,7 +218,7 @@ func TestMCPDefaultFishProbeSDKRoundTripAndCache(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		var output SshRunOutput
+		var output TerminalOutput
 		if err := json.Unmarshal(data, &output); err != nil {
 			t.Fatal(err)
 		}
@@ -233,7 +233,7 @@ func TestMCPDefaultFishProbeSDKRoundTripAndCache(t *testing.T) {
 		t.Fatal("probe persisted configuration")
 	}
 	// Exercise the wire schema's snake_case alias and explicit login value.
-	result, err := f.client.CallTool(f.ctx, &mcp.CallToolParams{Name: "xops_ssh_run", Arguments: map[string]any{"nodeID": "node", "command": "hostname", "execution": map[string]any{"interpreter": "fish", "launch_dialect": "fish", "login": login}}})
+	result, err := f.client.CallTool(f.ctx, &mcp.CallToolParams{Name: "terminal", Arguments: map[string]any{"nodeID": "node", "cmd": "hostname", "execution": map[string]any{"interpreter": "fish", "launch_dialect": "fish", "login": login}}})
 	if err != nil || result.IsError || f.first.Executed.Load() != 8 {
 		t.Fatalf("explicit fish wire configuration: %+v %v", result, err)
 	}
@@ -271,7 +271,7 @@ func TestApprovedCommandCannotSwitchTargetBeforeAdmission(t *testing.T) {
 	finished := make(chan error, 1)
 	// Both client cancellation and the released approval terminate this call.
 	go func() {
-		result, err := f.client.CallTool(f.ctx, &mcp.CallToolParams{Name: "xops_ssh_run", Arguments: SshRunInput{NodeID: "node", Command: "hostname", Execution: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer}}})
+		result, err := f.client.CallTool(f.ctx, &mcp.CallToolParams{Name: "terminal", Arguments: TerminalInput{NodeID: "node", Command: "hostname", Execution: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer}}})
 		if err == nil && !result.IsError {
 			err = errors.New("stale approval executed")
 		}
@@ -296,7 +296,7 @@ func TestRuntimeUsesNewTargetOnlyForNewInvocations(t *testing.T) {
 	f := setupPublication(t, nil, false)
 	call := func() {
 		t.Helper()
-		result, err := f.client.CallTool(f.ctx, &mcp.CallToolParams{Name: "xops_ssh_run", Arguments: SshRunInput{NodeID: "node", Command: "hostname", Execution: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer}}})
+		result, err := f.client.CallTool(f.ctx, &mcp.CallToolParams{Name: "terminal", Arguments: TerminalInput{NodeID: "node", Command: "hostname", Execution: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer}}})
 		if err != nil || result.IsError {
 			t.Fatalf("command: %+v %v", result, err)
 		}
@@ -331,7 +331,7 @@ func TestAdmittedCommandKeepsItsTargetAcrossPublication(t *testing.T) {
 	finished := make(chan error, 1)
 	// The barrier separates gate admission from connection acquisition.
 	go func() {
-		result, err := f.client.CallTool(f.ctx, &mcp.CallToolParams{Name: "xops_ssh_run", Arguments: SshRunInput{NodeID: "node", Command: "hostname", Execution: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer}}})
+		result, err := f.client.CallTool(f.ctx, &mcp.CallToolParams{Name: "terminal", Arguments: TerminalInput{NodeID: "node", Command: "hostname", Execution: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer}}})
 		if err == nil && result.IsError {
 			err = errors.New("admitted command failed")
 		}
@@ -365,9 +365,9 @@ func TestTunnelApprovalCannotStartOnEditedTarget(t *testing.T) {
 	}}, true)
 	finished := make(chan *mcp.CallToolResult, 1)
 	failures := make(chan error, 1)
-	input := CreateTunnelInput{RequestID: "approval-race", NodeID: "node", Mode: "local", ListenHost: "127.0.0.1", TargetHost: "127.0.0.1", TargetPort: 80, TTLSeconds: 60}
+	input := CreateTunnelInput{Action: "create", RequestID: "approval-race", NodeID: "node", Mode: "local", ListenHost: "127.0.0.1", TargetHost: "127.0.0.1", TargetPort: 80, TTLSeconds: 60}
 	go func() {
-		result, err := f.client.CallTool(f.ctx, &mcp.CallToolParams{Name: "xops_tunnel_create", Arguments: input})
+		result, err := f.client.CallTool(f.ctx, &mcp.CallToolParams{Name: "tunnel", Arguments: input})
 		if err != nil {
 			failures <- err
 		} else {
@@ -411,7 +411,7 @@ func TestTunnelCreationUsesPublishedPolicy(t *testing.T) {
 	if err := update.Publish(f.ctx, f.backend.RetirePlans); err != nil {
 		t.Fatal(err)
 	}
-	result, err := f.client.CallTool(f.ctx, &mcp.CallToolParams{Name: "xops_tunnel_create", Arguments: CreateTunnelInput{RequestID: "policy", NodeID: "node", Mode: "local", ListenHost: "127.0.0.1", TargetHost: "127.0.0.1", TargetPort: 80, TTLSeconds: 60}})
+	result, err := f.client.CallTool(f.ctx, &mcp.CallToolParams{Name: "tunnel", Arguments: CreateTunnelInput{Action: "create", RequestID: "policy", NodeID: "node", Mode: "local", ListenHost: "127.0.0.1", TargetHost: "127.0.0.1", TargetPort: 80, TTLSeconds: 60}})
 	if err != nil || !result.IsError {
 		t.Fatalf("new policy was ignored: %+v %v", result, err)
 	}

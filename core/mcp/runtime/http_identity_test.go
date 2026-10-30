@@ -63,16 +63,16 @@ func TestHTTPClientIdentityAndTransferIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 	for id, session := range clients {
-		for _, tool := range []string{"xops_transfer_status", "xops_transfer_cancel"} {
-			if id == "client-a" && tool == "xops_transfer_cancel" {
+		for _, action := range []string{"status", "cancel"} {
+			if id == "client-a" && action == "cancel" {
 				continue
 			}
-			result, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: tool, Arguments: map[string]any{"transferID": prepared.Status.ID}})
+			result, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "transfer", Arguments: map[string]any{"action": action, "transferID": prepared.Status.ID}})
 			if err != nil {
 				t.Fatal(err)
 			}
 			if result.IsError != (id == "client-b") {
-				t.Fatalf("%s accessed %s: %+v", id, tool, result)
+				t.Fatalf("%s accessed %s: %+v", id, action, result)
 			}
 		}
 	}

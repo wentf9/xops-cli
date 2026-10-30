@@ -13,36 +13,132 @@ import (
 	"github.com/wentf9/xops-cli/core/mcp/tunnel"
 )
 
+type TunnelPolyInput struct {
+	Action     string `json:"action" jsonschema:"Tunnel action: create, list, status, or stop"`
+	RequestID  string `json:"requestID,omitempty" jsonschema:"Client-generated idempotency key for create. Reuse the same key and parameters to recover a lost response."`
+	NodeID     string `json:"nodeID,omitempty" jsonschema:"Managed SSH node ID or alias (required for create, optional filter for list)"`
+	Mode       string `json:"mode,omitempty" jsonschema:"For create: local (-L) or remote (-R). No dynamic forwarding."`
+	ListenHost string `json:"listenHost,omitempty" jsonschema:"For create: IP literal or localhost; defaults to 127.0.0.1"`
+	ListenPort int    `json:"listenPort,omitempty" jsonschema:"For create: listening TCP port, 0 to 65535 (0 allocates automatically)"`
+	TargetHost string `json:"targetHost,omitempty" jsonschema:"For create: destination host name or unbracketed IP literal"`
+	TargetPort int    `json:"targetPort,omitempty" jsonschema:"For create: destination TCP port, 1 to 65535"`
+	TTLSeconds int    `json:"ttlSeconds,omitempty" jsonschema:"For create: lifetime after startup, 1 to 86400 seconds; default 3600"`
+	TunnelID   string `json:"tunnelID,omitempty" jsonschema:"For status or stop: tunnel ID returned by create or list"`
+	State      string `json:"state,omitempty" jsonschema:"For list: optional state filter (starting, running, stopping, stopped, expired, or failed)"`
+}
+
+type TunnelPolyOutput struct {
+	Tunnel  *tunnel.Status  `json:"tunnel,omitempty"`
+	Tunnels []tunnel.Status `json:"tunnels,omitempty"`
+}
+
 type CreateTunnelInput struct {
-	RequestID  string `json:"requestID" jsonschema:"Client-generated idempotency key. Reuse the same key and parameters to recover a lost response; use a new key for a new tunnel."`
-	NodeID     string `json:"nodeID" jsonschema:"Managed SSH node ID or alias, including canonical openssh:host IDs returned by tunnel tools."`
-	Mode       string `json:"mode" jsonschema:"local (-L): listen on the MCP process machine and connect from the SSH node. remote (-R): listen on the SSH node and connect from the MCP process machine. No dynamic forwarding."`
-	ListenHost string `json:"listenHost,omitempty" jsonschema:"IP literal or localhost; defaults to 127.0.0.1. Remote exposure is controlled by sshd GatewayPorts."`
-	ListenPort int    `json:"listenPort" jsonschema:"Listening TCP port, 0 to 65535. Zero requests an automatically allocated port."`
-	TargetHost string `json:"targetHost" jsonschema:"Destination host name or unbracketed IP literal, interpreted on the destination side of the tunnel."`
-	TargetPort int    `json:"targetPort" jsonschema:"Destination TCP port, 1 to 65535."`
-	TTLSeconds int    `json:"ttlSeconds,omitempty" jsonschema:"Lifetime after startup, 1 to 86400 seconds; default 3600. Not renewed by queries or retries."`
+	Action     string `json:"action,omitempty"`
+	RequestID  string `json:"requestID"`
+	NodeID     string `json:"nodeID"`
+	Mode       string `json:"mode"`
+	ListenHost string `json:"listenHost,omitempty"`
+	ListenPort int    `json:"listenPort"`
+	TargetHost string `json:"targetHost"`
+	TargetPort int    `json:"targetPort"`
+	TTLSeconds int    `json:"ttlSeconds,omitempty"`
 }
 
 type TunnelInput struct {
-	TunnelID string `json:"tunnelID" jsonschema:"Tunnel ID returned by xops_tunnel_create or xops_tunnel_list."`
+	Action   string `json:"action,omitempty"`
+	TunnelID string `json:"tunnelID"`
 }
 
 type ListTunnelsInput struct {
-	NodeID string `json:"nodeID,omitempty" jsonschema:"Optional node ID or alias filter; accepts returned canonical openssh:host IDs."`
-	State  string `json:"state,omitempty" jsonschema:"Optional state: starting, running, stopping, stopped, expired, or failed."`
+	Action string `json:"action,omitempty"`
+	NodeID string `json:"nodeID,omitempty"`
+	State  string `json:"state,omitempty"`
 }
 
 type TunnelOutput struct {
 	Tunnel tunnel.Status `json:"tunnel"`
 }
+
 type ListTunnelsOutput struct {
 	Tunnels []tunnel.Status `json:"tunnels"`
 }
 
 func tunnelRisk(s tunnel.Spec) guardrail.RiskInput {
-	return guardrail.RiskInput{ToolName: "xops_tunnel_create", NodeID: s.NodeID, TunnelMode: s.Mode, ListenHost: s.ListenHost,
-		Details: fmt.Sprintf("mode=%s; listen=%s; target=%s; ttlSeconds=%d; requestID=%s", s.Mode, s.ListenAddress(), s.TargetAddress(), s.TTLSeconds, s.RequestID)}
+	return guardrail.RiskInput{
+		ToolName:   "tunnel",
+		Action:     "create",
+		NodeID:     s.NodeID,
+		TunnelMode: s.Mode,
+		ListenHost: s.ListenHost,
+		Details:    fmt.Sprintf("mode=%s; listen=%s; target=%s; ttlSeconds=%d; requestID=%s", s.Mode, s.ListenAddress(), s.TargetAddress(), s.TTLSeconds, s.RequestID),
+	}
+}
+
+func resolveTunnelAction(input TunnelPolyInput) string {
+	if input.Action != "" {
+		return input.Action
+	}
+	switch {
+	case input.Mode != "" || input.RequestID != "" || input.TargetHost != "" || input.TargetPort != 0:
+		return "create"
+	case input.TunnelID != "":
+		return "status"
+	default:
+		return "list"
+	}
+}
+
+func (r *Runtime) tunnelHandler(ctx context.Context, req *mcp.CallToolRequest, input TunnelPolyInput) (*mcp.CallToolResult, TunnelPolyOutput, error) {
+	switch resolveTunnelAction(input) {
+	case "create":
+		res, out, err := r.createTunnel(ctx, req, CreateTunnelInput{
+			RequestID:  input.RequestID,
+			NodeID:     input.NodeID,
+			Mode:       input.Mode,
+			ListenHost: input.ListenHost,
+			ListenPort: input.ListenPort,
+			TargetHost: input.TargetHost,
+			TargetPort: input.TargetPort,
+			TTLSeconds: input.TTLSeconds,
+		})
+		if err != nil || res != nil {
+			return res, TunnelPolyOutput{}, err
+		}
+		st := out.Tunnel
+		return nil, TunnelPolyOutput{Tunnel: &st}, nil
+	case "list":
+		res, out, err := r.listTunnels(ctx, req, ListTunnelsInput{
+			NodeID: input.NodeID,
+			State:  input.State,
+		})
+		if err != nil || res != nil {
+			return res, TunnelPolyOutput{}, err
+		}
+		tunnels := out.Tunnels
+		if tunnels == nil {
+			tunnels = []tunnel.Status{}
+		}
+		return nil, TunnelPolyOutput{Tunnels: tunnels}, nil
+	case "status":
+		res, out, err := r.tunnelStatus(ctx, req, TunnelInput{TunnelID: input.TunnelID})
+		if err != nil || res != nil {
+			return res, TunnelPolyOutput{}, err
+		}
+		st := out.Tunnel
+		return nil, TunnelPolyOutput{Tunnel: &st}, nil
+	case "stop":
+		res, out, err := r.stopTunnel(ctx, req, TunnelInput{TunnelID: input.TunnelID})
+		if err != nil && out.Tunnel.TunnelID == "" {
+			return res, TunnelPolyOutput{}, err
+		}
+		if res != nil {
+			return res, TunnelPolyOutput{}, err
+		}
+		st := out.Tunnel
+		return nil, TunnelPolyOutput{Tunnel: &st}, err
+	default:
+		return nil, TunnelPolyOutput{}, fmt.Errorf("unsupported tunnel action %q (expected create, list, status, or stop)", input.Action)
+	}
 }
 
 func (r *Runtime) resolveTunnelNode(ctx context.Context, selector string) (string, error) {
@@ -52,8 +148,6 @@ func (r *Runtime) resolveTunnelNode(ctx context.Context, selector string) (strin
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	// A retained task proves its canonical ID even if execution is now disabled
-	// or the inventory entry is gone. Aliases still use current inventory rules.
 	if len(r.tunnels.List(selector, "")) != 0 {
 		return selector, nil
 	}
@@ -84,7 +178,7 @@ func (r *Runtime) createTunnel(ctx context.Context, req *mcp.CallToolRequest, in
 	if existing, found, err := r.tunnels.Retry(spec); found || err != nil {
 		return nil, TunnelOutput{Tunnel: existing}, err
 	}
-	ctx, op, err := r.operationContext(ctx, view, "xops_tunnel_create", spec)
+	ctx, op, err := r.operationContext(ctx, view, "tunnel", spec)
 	if err != nil {
 		return nil, TunnelOutput{}, err
 	}
@@ -119,10 +213,8 @@ func (r *Runtime) listTunnels(ctx context.Context, req *mcp.CallToolRequest, inp
 			return nil, ListTunnelsOutput{}, err
 		}
 	}
-	// Authorize the exact snapshot returned below. Refreshing after approval
-	// could include tunnels on nodes whose policy has never been checked.
 	snapshot := r.tunnels.List(input.NodeID, input.State)
-	risk := guardrail.RiskInput{NodeID: input.NodeID, Details: "state=" + input.State}
+	risk := guardrail.RiskInput{Action: "list", NodeID: input.NodeID, Details: "state=" + input.State}
 	if input.NodeID == "" {
 		for _, status := range snapshot {
 			risk.NodeIDs = append(risk.NodeIDs, status.NodeID)
@@ -130,7 +222,7 @@ func (r *Runtime) listTunnels(ctx context.Context, req *mcp.CallToolRequest, inp
 		slices.Sort(risk.NodeIDs)
 		risk.NodeIDs = slices.Compact(risk.NodeIDs)
 	}
-	return withMetadata(r, "xops_tunnel_list",
+	return withMetadata(r, "tunnel",
 		func(ListTunnelsInput) guardrail.RiskInput { return risk },
 		func(context.Context, *mcp.CallToolRequest, ListTunnelsInput) (*mcp.CallToolResult, ListTunnelsOutput, error) {
 			return nil, ListTunnelsOutput{Tunnels: snapshot}, nil
@@ -145,9 +237,9 @@ func (r *Runtime) tunnelStatus(ctx context.Context, req *mcp.CallToolRequest, in
 	if err != nil {
 		return nil, TunnelOutput{}, err
 	}
-	return withMetadata(r, "xops_tunnel_status",
+	return withMetadata(r, "tunnel",
 		func(in TunnelInput) guardrail.RiskInput {
-			return guardrail.RiskInput{NodeID: status.NodeID, Details: "tunnelID=" + in.TunnelID}
+			return guardrail.RiskInput{Action: "status", NodeID: status.NodeID, Details: "tunnelID=" + in.TunnelID}
 		},
 		func(_ context.Context, _ *mcp.CallToolRequest, in TunnelInput) (*mcp.CallToolResult, TunnelOutput, error) {
 			latest, err := r.tunnels.Status(in.TunnelID)
@@ -166,13 +258,14 @@ func (r *Runtime) stopTunnel(ctx context.Context, req *mcp.CallToolRequest, inpu
 		return nil, TunnelOutput{}, err
 	}
 	risk := tunnelRisk(status.Spec)
-	risk.ToolName = "xops_tunnel_stop"
+	risk.ToolName = "tunnel"
+	risk.Action = "stop"
 	risk.Details += "; tunnelID=" + input.TunnelID
 	view, err := r.resolve(ctx, nil)
 	if err != nil {
 		return nil, TunnelOutput{}, err
 	}
-	ctx, op, err := r.operationContext(ctx, view, "xops_tunnel_stop", struct {
+	ctx, op, err := r.operationContext(ctx, view, "tunnel", struct {
 		Input  TunnelInput
 		NodeID string
 	}{input, status.NodeID})
@@ -192,8 +285,6 @@ func (r *Runtime) stopTunnel(ctx context.Context, req *mcp.CallToolRequest, inpu
 	defer cancel()
 	status, err = r.tunnels.Stop(stopCtx, input.TunnelID)
 	if auditErr := r.guardrail.RecordAuthorized(opID, risk, "stop_requested", err); auditErr != nil {
-		// Cleanup may already be complete. Return the state and audit error so
-		// callers do not mistake an audit failure for an unexecuted operation.
 		status.AuditError = auditErr.Error()
 	}
 	return nil, TunnelOutput{Tunnel: status}, err
@@ -203,11 +294,12 @@ func (r *Runtime) registerTunnels(server *mcp.Server) {
 	if r.http != nil {
 		return
 	}
-	notDestructive, destructive := false, true
-	mcp.AddTool(server, &mcp.Tool{Name: "xops_tunnel_create", Description: "Create a process-owned SSH TCP tunnel over stdio only (-L or -R). Returns after listening; running does not prove destination reachability. Local means the xops MCP process machine. The tunnel survives this call until stopped, expired, disconnected, or MCP exits. A failed state is terminal; use a new requestID after fixing the cause.", Annotations: &mcp.ToolAnnotations{DestructiveHint: &notDestructive, IdempotentHint: true}}, r.createTunnel)
-	mcp.AddTool(server, &mcp.Tool{Name: "xops_tunnel_list", Description: "List SSH tunnels owned by this stdio MCP process, including retained terminal states.", Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true}}, r.listTunnels)
-	mcp.AddTool(server, &mcp.Tool{Name: "xops_tunnel_status", Description: "Query tunnel state, listener, expiry and connection errors. Remote listener addresses do not prove GatewayPorts exposure or remote port release.", Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true}}, r.tunnelStatus)
-	mcp.AddTool(server, &mcp.Tool{Name: "xops_tunnel_stop", Description: "Idempotently stop a tunnel owned by this stdio MCP process and close its existing connections. If waiting times out, query status; cleanup continues. Remote port release may remain unconfirmed after SSH closure.", Annotations: &mcp.ToolAnnotations{DestructiveHint: &destructive, IdempotentHint: true}}, r.stopTunnel)
+	notDestructive := false
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "tunnel",
+		Description: "Manage process-owned SSH TCP port forwarding tunnels over stdio (-L local or -R remote). Actions: 'create', 'list', 'status', 'stop'.",
+		Annotations: &mcp.ToolAnnotations{DestructiveHint: &notDestructive, IdempotentHint: true},
+	}, r.tunnelHandler)
 }
 
 func (r *Runtime) runCapturedTunnel(ctx context.Context, view ports.OperationSnapshot, binding ports.Binding, operationID string, spec tunnel.Spec, ready func(string) bool, report func(error)) (retErr error) {

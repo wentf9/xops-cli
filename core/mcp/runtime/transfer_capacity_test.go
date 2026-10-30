@@ -21,7 +21,7 @@ func TestUploadCommitKeepsItsAdmissionSlotAtCapacity(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				binding, err := ports.Bind(view, "other-operation", "xops_ssh_run", "hostname")
+				binding, err := ports.Bind(view, "other-operation", "terminal", "hostname")
 				if err != nil {
 					t.Fatal(err)
 				}
