@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -26,6 +27,10 @@ func TestExecutionRiskUsesTrustedDialectAndLegacyDefaults(t *testing.T) {
 		{"trusted POSIX server", &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer}, &ssh.ExecutionConfig{LaunchDialect: ssh.LaunchPOSIX}, guardrail.Safe, "posix"},
 		{"fish through POSIX stays conservative", &ssh.ExecutionConfig{Interpreter: ssh.InterpreterFish, LaunchDialect: ssh.LaunchPOSIX}, &ssh.ExecutionConfig{LaunchDialect: ssh.LaunchPOSIX}, guardrail.Moderate, "fish"},
 		{"configured fish", nil, &ssh.ExecutionConfig{Interpreter: ssh.InterpreterFish, LaunchDialect: ssh.LaunchFish}, guardrail.Moderate, "fish"},
+		{"csh through POSIX stays conservative", &ssh.ExecutionConfig{Interpreter: ssh.InterpreterCsh, LaunchDialect: ssh.LaunchPOSIX}, &ssh.ExecutionConfig{LaunchDialect: ssh.LaunchPOSIX}, guardrail.Moderate, "csh"},
+		{"tcsh through POSIX stays conservative", &ssh.ExecutionConfig{Interpreter: ssh.InterpreterTcsh, LaunchDialect: ssh.LaunchPOSIX}, &ssh.ExecutionConfig{LaunchDialect: ssh.LaunchPOSIX}, guardrail.Moderate, "csh"},
+		{"configured csh", nil, &ssh.ExecutionConfig{Interpreter: ssh.InterpreterCsh, LaunchDialect: ssh.LaunchCsh}, guardrail.Moderate, "csh"},
+		{"configured tcsh", nil, &ssh.ExecutionConfig{Interpreter: ssh.InterpreterTcsh, LaunchDialect: ssh.LaunchCsh}, guardrail.Moderate, "csh"},
 		{"configured zsh", nil, &ssh.ExecutionConfig{Interpreter: ssh.InterpreterZsh, LaunchDialect: ssh.LaunchPOSIX}, guardrail.Safe, "posix"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -330,6 +335,387 @@ func TestMCPToolExecutionSupportedJSONForms(t *testing.T) {
 		}
 		if !result.IsError {
 			t.Fatal("expected schema validation error for numeric login, but call succeeded")
+		}
+	})
+}
+
+func TestResolveExecutionRisk_PersistentSessionPreservesOuterDialect(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		targetDialect ssh.LaunchDialect
+		interpreter   ssh.Interpreter
+		expectedShell string
+		expectedOnce  string
+	}{
+		{"csh on posix", ssh.LaunchPOSIX, ssh.InterpreterCsh, "posix", "csh"},
+		{"tcsh on posix", ssh.LaunchPOSIX, ssh.InterpreterTcsh, "posix", "csh"},
+		{"fish on posix", ssh.LaunchPOSIX, ssh.InterpreterFish, "posix", "fish"},
+		{"csh on csh", ssh.LaunchCsh, ssh.InterpreterCsh, "csh", "csh"},
+		{"tcsh on csh", ssh.LaunchCsh, ssh.InterpreterTcsh, "csh", "csh"},
+		{"fish on fish", ssh.LaunchFish, ssh.InterpreterFish, "fish", "fish"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target := ports.Target{
+				Execution: &ssh.ExecutionConfig{
+					LaunchDialect: tc.targetDialect,
+				},
+			}
+			reqExecution := &ssh.ExecutionConfig{
+				Interpreter:   tc.interpreter,
+				LaunchDialect: tc.targetDialect,
+			}
+
+			// In persistent session (riskActionShell), outer PTY launch dialect must be preserved.
+			riShell, err := resolveExecutionRisk(guardrail.RiskInput{
+				ToolName:  "terminal",
+				Action:    riskActionShell,
+				Command:   "ls",
+				Execution: reqExecution,
+			}, target)
+			if err != nil {
+				t.Fatalf("resolveExecutionRisk(riskActionShell) failed: %v", err)
+			}
+			if riShell.Dialect != tc.expectedShell {
+				t.Fatalf("expected persistent session dialect %q, got %q", tc.expectedShell, riShell.Dialect)
+			}
+
+			// In once session (riskActionOnce), single-command plan interpreter should set dialect.
+			riOnce, err := resolveExecutionRisk(guardrail.RiskInput{
+				ToolName:  "terminal",
+				Action:    riskActionOnce,
+				Command:   "ls",
+				Execution: reqExecution,
+			}, target)
+			if err != nil {
+				t.Fatalf("resolveExecutionRisk(riskActionOnce) failed: %v", err)
+			}
+			if riOnce.Dialect != tc.expectedOnce {
+				t.Fatalf("expected once session dialect %q, got %q", tc.expectedOnce, riOnce.Dialect)
+			}
+		})
+	}
+}
+
+func TestTerminalPersistentSessionSignalSkipsProbeAndPlan(t *testing.T) {
+	signals := []string{"SIGINT", "EOF", "SIGTERM", "SIGKILL", "sigint", " eof "}
+	for _, sig := range signals {
+		t.Run("signal_"+sig, func(t *testing.T) {
+			backend := &probeRuntimeBackend{
+				executed: make(chan *ssh.ExecutionConfig, 1),
+				result: &ssh.ProbeResult{
+					DetectedDialect: ssh.LaunchPOSIX,
+					SuggestedConfig: ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchPOSIX},
+				},
+			}
+			provider := runtimeTestProvider("node")
+			gate := &probeRuntimeGate{domain: provider.DomainID()}
+			r, err := NewRuntime(t.Context(), WithDependencies(ports.Dependencies{
+				State:      provider,
+				Gate:       gate,
+				Audit:      ports.NoopAudit{},
+				NewBackend: func(context.Context) (ports.Backend, error) { return backend, nil },
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				_ = r.Close()
+			})
+			client := connectRuntimeTestClient(t, r)
+
+			// Signal on persistent session must skip prepareExecution (0 probes).
+			_, _ = client.CallTool(t.Context(), &mcp.CallToolParams{
+				Name: "terminal",
+				Arguments: TerminalInput{
+					NodeID:  "node",
+					Session: "dev",
+					Command: sig,
+				},
+			})
+			if backend.probes.Load() != 0 {
+				t.Fatalf("expected 0 probes for signal %q on persistent session, got %d", sig, backend.probes.Load())
+			}
+		})
+	}
+
+	// Normal command on persistent session without static execution config MUST trigger probe.
+	t.Run("normal_command_triggers_probe", func(t *testing.T) {
+		login := false
+		backend := &probeRuntimeBackend{
+			executed: make(chan *ssh.ExecutionConfig, 1),
+			result: &ssh.ProbeResult{
+				DetectedDialect: ssh.LaunchPOSIX,
+				SuggestedConfig: ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchPOSIX, Login: &login},
+			},
+		}
+		provider := runtimeTestProvider("node")
+		gate := &probeRuntimeGate{domain: provider.DomainID()}
+		r, err := NewRuntime(t.Context(), WithDependencies(ports.Dependencies{
+			State:      provider,
+			Gate:       gate,
+			Audit:      ports.NoopAudit{},
+			NewBackend: func(context.Context) (ports.Backend, error) { return backend, nil },
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_ = r.Close()
+		})
+		client := connectRuntimeTestClient(t, r)
+		_, _ = client.CallTool(t.Context(), &mcp.CallToolParams{
+			Name: "terminal",
+			Arguments: TerminalInput{
+				NodeID:  "node",
+				Session: "dev",
+				Command: "uptime",
+			},
+		})
+		if backend.probes.Load() != 1 {
+			t.Fatalf("expected 1 probe for normal command on persistent session, got %d", backend.probes.Load())
+		}
+	})
+}
+
+func assertEarlyRejected(t *testing.T, client *mcp.ClientSession, in TerminalInput, wantErr string) {
+	t.Helper()
+	res, err := client.CallTool(t.Context(), &mcp.CallToolParams{
+		Name:      "terminal",
+		Arguments: in,
+	})
+	if err == nil && (res == nil || !res.IsError) {
+		t.Fatal("expected error, got success")
+	}
+	errMsg := ""
+	if err != nil {
+		errMsg = err.Error()
+	} else if res != nil && len(res.Content) > 0 {
+		if text, ok := res.Content[0].(*mcp.TextContent); ok {
+			errMsg = text.Text
+		}
+	}
+	if !strings.Contains(errMsg, wantErr) {
+		t.Fatalf("unexpected error message: %q, want it to contain %q", errMsg, wantErr)
+	}
+}
+
+func TestPersistentSessionRejectsSudoAndExecutionEarly(t *testing.T) {
+	login := false
+	backend := &probeRuntimeBackend{
+		executed: make(chan *ssh.ExecutionConfig, 1),
+		result: &ssh.ProbeResult{
+			DetectedDialect: ssh.LaunchPOSIX,
+			SuggestedConfig: ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchPOSIX, Login: &login},
+		},
+	}
+	provider := runtimeTestProvider("node")
+	gate := &probeRuntimeGate{domain: provider.DomainID()}
+	r, err := NewRuntime(t.Context(), WithDependencies(ports.Dependencies{
+		State:      provider,
+		Gate:       gate,
+		Audit:      ports.NoopAudit{},
+		NewBackend: func(context.Context) (ports.Backend, error) { return backend, nil },
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = r.Close()
+	})
+	client := connectRuntimeTestClient(t, r)
+
+	wantErr := "sudo and execution are supported only with session='once'; run sudo inside the persistent shell instead"
+
+	t.Run("rejects_sudo", func(t *testing.T) {
+		assertEarlyRejected(t, client, TerminalInput{
+			NodeID:  "node",
+			Session: "dev",
+			Command: "whoami",
+			Sudo:    true,
+		}, wantErr)
+		if backend.probes.Load() != 0 {
+			t.Fatalf("expected 0 probes when sudo on persistent session is rejected early, got %d", backend.probes.Load())
+		}
+	})
+
+	t.Run("rejects_execution", func(t *testing.T) {
+		assertEarlyRejected(t, client, TerminalInput{
+			NodeID:    "node",
+			Session:   "dev",
+			Command:   "uptime",
+			Execution: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash},
+		}, wantErr)
+		if backend.probes.Load() != 0 {
+			t.Fatalf("expected 0 probes when execution on persistent session is rejected early, got %d", backend.probes.Load())
+		}
+	})
+
+	t.Run("rejects_before_guardrail_approval", func(t *testing.T) {
+		providerWithPolicy := runtimeTestProvider("node")
+		state := executionRiskSource{
+			StateSource: providerWithPolicy,
+			execution:   &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchPOSIX},
+		}
+		gateStrict := &probeRuntimeGate{domain: providerWithPolicy.DomainID()}
+		rStrict, err := NewRuntime(t.Context(), WithDependencies(ports.Dependencies{
+			State:      state,
+			Gate:       gateStrict,
+			Audit:      ports.NoopAudit{},
+			NewBackend: func(context.Context) (ports.Backend, error) { return backend, nil },
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_ = rStrict.Close()
+		})
+		clientStrict := connectRuntimeTestClient(t, rStrict)
+		assertEarlyRejected(t, clientStrict, TerminalInput{
+			NodeID:  "node",
+			Session: "dev",
+			Command: "whoami",
+			Sudo:    true,
+		}, wantErr)
+	})
+
+	t.Run("passive_poll_skips_probe", func(t *testing.T) {
+		for _, cmd := range []string{"", "   "} {
+			backendProbeCount := backend.probes.Load()
+			_, _ = client.CallTool(t.Context(), &mcp.CallToolParams{
+				Name: "terminal",
+				Arguments: TerminalInput{
+					NodeID:  "node",
+					Session: "dev",
+					Command: cmd,
+					Cwd:     "",
+				},
+			})
+			if backend.probes.Load() != backendProbeCount {
+				t.Fatalf("expected 0 probes when command %q and cwd are empty on persistent session, got delta %d", cmd, backend.probes.Load()-backendProbeCount)
+			}
+		}
+	})
+
+	t.Run("empty_cmd_with_cwd_performs_probe", func(t *testing.T) {
+		for _, cmd := range []string{"", "   "} {
+			backendProbeCount := backend.probes.Load()
+			_, _ = client.CallTool(t.Context(), &mcp.CallToolParams{
+				Name: "terminal",
+				Arguments: TerminalInput{
+					NodeID:  "node",
+					Session: "dev",
+					Command: cmd,
+					Cwd:     "/var/tmp",
+				},
+			})
+			if backend.probes.Load() != backendProbeCount+1 {
+				t.Fatalf("expected 1 probe when command %q has persistent cwd on unconfigured session, got delta %d", cmd, backend.probes.Load()-backendProbeCount)
+			}
+		}
+	})
+}
+
+func TestPersistentSessionWindowsRejection(t *testing.T) {
+	winBackend := &probeRuntimeBackend{
+		executed: make(chan *ssh.ExecutionConfig, 1),
+		result: &ssh.ProbeResult{
+			DetectedDialect: ssh.LaunchPowerShell,
+			SuggestedConfig: ssh.ExecutionConfig{Interpreter: ssh.InterpreterPowerShell, LaunchDialect: ssh.LaunchPowerShell},
+		},
+	}
+	winProvider := runtimeTestProvider("node-win")
+	winGate := &probeRuntimeGate{domain: winProvider.DomainID()}
+	rWin, err := NewRuntime(t.Context(), WithDependencies(ports.Dependencies{
+		State:      winProvider,
+		Gate:       winGate,
+		Audit:      ports.NoopAudit{},
+		NewBackend: func(context.Context) (ports.Backend, error) { return winBackend, nil },
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = rWin.Close()
+	})
+	clientWin := connectRuntimeTestClient(t, rWin)
+	res, err := clientWin.CallTool(t.Context(), &mcp.CallToolParams{
+		Name: "terminal",
+		Arguments: TerminalInput{
+			NodeID:  "node-win",
+			Session: "dev",
+			Command: "",
+			Cwd:     "C:\\temp",
+		},
+	})
+	wantErr := "persistent sessions require a Unix login shell"
+	errMsg := ""
+	if err != nil {
+		errMsg = err.Error()
+	} else if res != nil && len(res.Content) > 0 {
+		if text, ok := res.Content[0].(*mcp.TextContent); ok {
+			errMsg = text.Text
+		}
+	}
+	if !strings.Contains(errMsg, wantErr) {
+		t.Fatalf("expected persistent session Unix login shell error, got err=%v errMsg=%q res=%+v", err, errMsg, res)
+	}
+	if winBackend.probes.Load() != 1 {
+		t.Fatalf("expected 1 probe for unconfigured Windows node with persistent cwd switch, got %d", winBackend.probes.Load())
+	}
+}
+
+func TestOnceSessionCmdValidationEarly(t *testing.T) {
+	login := false
+	backend := &probeRuntimeBackend{
+		executed: make(chan *ssh.ExecutionConfig, 1),
+		result: &ssh.ProbeResult{
+			DetectedDialect: ssh.LaunchPOSIX,
+			SuggestedConfig: ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchPOSIX, Login: &login},
+		},
+	}
+	provider := runtimeTestProvider("node")
+	gate := &probeRuntimeGate{domain: provider.DomainID()}
+	r, err := NewRuntime(t.Context(), WithDependencies(ports.Dependencies{
+		State:      provider,
+		Gate:       gate,
+		Audit:      ports.NoopAudit{},
+		NewBackend: func(context.Context) (ports.Backend, error) { return backend, nil },
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = r.Close()
+	})
+	client := connectRuntimeTestClient(t, r)
+
+	t.Run("once_session_allows_sudo_and_execution", func(t *testing.T) {
+		for _, in := range []TerminalInput{
+			{NodeID: "node", Session: "once", Command: "whoami", Sudo: true},
+			{NodeID: "node", Session: "once", Command: "uptime", Execution: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash}},
+			{NodeID: "node", Session: "", Command: "whoami", Sudo: true},
+			{NodeID: "node", Session: "", Command: "uptime", Execution: &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash}},
+		} {
+			if err := in.Validate(); err != nil {
+				t.Fatalf("expected Validate() nil for once session with sudo/execution, got: %v", err)
+			}
+		}
+	})
+
+	t.Run("once_session_rejects_empty_and_whitespace_cmd_early", func(t *testing.T) {
+		backendProbeCount := backend.probes.Load()
+		wantErr := "cmd is required for once session mode"
+		for _, cmd := range []string{"", "   ", "\t\n"} {
+			for _, sess := range []string{"", "once"} {
+				in := TerminalInput{NodeID: "node", Session: sess, Command: cmd}
+				if err := in.Validate(); err == nil || !strings.Contains(err.Error(), wantErr) {
+					t.Fatalf("expected Validate() error containing %q for sess=%q cmd=%q, got: %v", wantErr, sess, cmd, err)
+				}
+				assertEarlyRejected(t, client, in, wantErr)
+			}
+		}
+		if backend.probes.Load() != backendProbeCount {
+			t.Fatalf("expected 0 probes when once session cmd is rejected early, got delta %d", backend.probes.Load()-backendProbeCount)
 		}
 	})
 }

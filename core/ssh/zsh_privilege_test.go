@@ -52,6 +52,11 @@ func TestZshPrivilegeLoginAndInput(t *testing.T) {
 				if err != nil || output != want {
 					t.Fatalf("login=%v output=%q error=%v", login, output, err)
 				}
+				script := "if [[ -o login ]]; then printf login; else printf nonlogin; fi\n"
+				scriptOut, err := client.RunScriptWithSudoExecution(t.Context(), script, selected)
+				if err != nil || scriptOut != want {
+					t.Fatalf("script login=%v output=%q error=%v", login, scriptOut, err)
+				}
 			}
 		})
 	}

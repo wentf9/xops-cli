@@ -2,6 +2,8 @@ package runtime
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"slices"
@@ -15,7 +17,7 @@ import (
 
 type TunnelPolyInput struct {
 	Action     string `json:"action" jsonschema:"Tunnel action: create, list, status, or stop"`
-	RequestID  string `json:"requestID,omitempty" jsonschema:"Client-generated idempotency key for create. Reuse the same key and parameters to recover a lost response."`
+	RequestID  string `json:"requestID,omitempty" jsonschema:"Optional client-generated idempotency key for create (auto-generated if omitted). Reuse the same key and parameters to recover a lost response."`
 	NodeID     string `json:"nodeID,omitempty" jsonschema:"Managed SSH node ID or alias (required for create, optional filter for list)"`
 	Mode       string `json:"mode,omitempty" jsonschema:"For create: local (-L) or remote (-R). No dynamic forwarding."`
 	ListenHost string `json:"listenHost,omitempty" jsonschema:"For create: IP literal or localhost; defaults to 127.0.0.1"`
@@ -162,8 +164,23 @@ func (r *Runtime) resolveTunnelNode(ctx context.Context, selector string) (strin
 func (r *Runtime) createTunnel(ctx context.Context, req *mcp.CallToolRequest, input CreateTunnelInput) (*mcp.CallToolResult, TunnelOutput, error) {
 	ctx, cancel := r.toolContext(ctx)
 	defer cancel()
-	spec, err := tunnel.Normalize(tunnel.Spec{RequestID: input.RequestID, NodeID: input.NodeID, Mode: input.Mode,
-		ListenHost: input.ListenHost, ListenPort: input.ListenPort, TargetHost: input.TargetHost, TargetPort: input.TargetPort, TTLSeconds: input.TTLSeconds})
+	if r.tunnels == nil {
+		return nil, TunnelOutput{}, errors.New("SSH tunnel tools are available only over stdio")
+	}
+	validateReqID := input.RequestID
+	if validateReqID == "" {
+		validateReqID = "unassigned-request-id"
+	}
+	spec, err := tunnel.Normalize(tunnel.Spec{
+		RequestID:  validateReqID,
+		NodeID:     input.NodeID,
+		Mode:       input.Mode,
+		ListenHost: input.ListenHost,
+		ListenPort: input.ListenPort,
+		TargetHost: input.TargetHost,
+		TargetPort: input.TargetPort,
+		TTLSeconds: input.TTLSeconds,
+	})
 	if err != nil {
 		return nil, TunnelOutput{}, err
 	}
@@ -174,6 +191,11 @@ func (r *Runtime) createTunnel(ctx context.Context, req *mcp.CallToolRequest, in
 	spec.NodeID, _, err = view.Resolve(spec.NodeID)
 	if err != nil {
 		return nil, TunnelOutput{}, err
+	}
+	if input.RequestID == "" {
+		spec.RequestID = r.deterministicTunnelRequestID(spec)
+	} else {
+		spec.RequestID = input.RequestID
 	}
 	if existing, found, err := r.tunnels.Retry(spec); found || err != nil {
 		return nil, TunnelOutput{Tunnel: existing}, err
@@ -191,6 +213,31 @@ func (r *Runtime) createTunnel(ctx context.Context, req *mcp.CallToolRequest, in
 			return r.runCapturedTunnel(taskCtx, op.snapshot, op.binding, operationID, captured, ready, report)
 		})
 	return nil, TunnelOutput{Tunnel: status}, err
+}
+
+func (r *Runtime) deterministicTunnelRequestID(spec tunnel.Spec) string {
+	var existing []tunnel.Status
+	if r.tunnels != nil {
+		existing = r.tunnels.List(spec.NodeID, "")
+	}
+	existingByID := make(map[string]tunnel.Status, len(existing))
+	for _, st := range existing {
+		existingByID[st.RequestID] = st
+	}
+	for counter := 0; ; counter++ {
+		data := fmt.Sprintf("tunnel:%s:%s:%s:%d:%s:%d:%d:%d",
+			spec.NodeID, spec.Mode, spec.ListenHost, spec.ListenPort,
+			spec.TargetHost, spec.TargetPort, spec.TTLSeconds, counter)
+		sum := sha256.Sum256([]byte(data))
+		reqID := hex.EncodeToString(sum[:16])
+		st, ok := existingByID[reqID]
+		if !ok {
+			return reqID
+		}
+		if st.FinishedAt.IsZero() {
+			return reqID
+		}
+	}
 }
 
 func (r *Runtime) listTunnels(ctx context.Context, req *mcp.CallToolRequest, input ListTunnelsInput) (*mcp.CallToolResult, ListTunnelsOutput, error) {

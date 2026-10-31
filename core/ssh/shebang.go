@@ -55,6 +55,14 @@ func ParseShebang(data []byte) ShebangInfo {
 		info.Supported = true
 		info.Interpreter = InterpreterFish
 		info.Dialect = LaunchFish
+	case "csh", "/bin/csh", "/usr/bin/csh", "/bin/env csh", "/usr/bin/env csh":
+		info.Supported = true
+		info.Interpreter = InterpreterCsh
+		info.Dialect = LaunchCsh
+	case "tcsh", "/bin/tcsh", "/usr/bin/tcsh", "/bin/env tcsh", "/usr/bin/env tcsh":
+		info.Supported = true
+		info.Interpreter = InterpreterTcsh
+		info.Dialect = LaunchCsh
 	default:
 		// Unsupported shebang (e.g. has flags like /bin/bash -e or unsupported interpreter like python)
 		info.Supported = false
@@ -183,7 +191,7 @@ func validateResolvedScriptExecution(res *ExecutionConfig) (*ExecutionConfig, er
 	if err := res.Validate(); err != nil {
 		return nil, err
 	}
-	if res == nil || (res.Interpreter != InterpreterBash && res.Interpreter != InterpreterSh && res.Interpreter != InterpreterZsh && res.Interpreter != InterpreterFish) {
+	if res == nil || (res.Interpreter != InterpreterBash && res.Interpreter != InterpreterSh && res.Interpreter != InterpreterZsh && res.Interpreter != InterpreterFish && res.Interpreter != InterpreterCsh && res.Interpreter != InterpreterTcsh) {
 		return nil, fmt.Errorf("%w: unsupported resolved script interpreter", ErrExecutionValidation)
 	}
 	plan, err := PlanCommand(":", res.CommandOptions())

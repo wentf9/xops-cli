@@ -142,7 +142,7 @@ func TestPrivilegeTerminalCancellationRestoresBeforeReturn(t *testing.T) {
 
 func setPrivilegeTestExecution(client *Client, interpreter Interpreter) {
 	if interpreter == "" {
-		return
+		interpreter = InterpreterBash
 	}
 	dialect := LaunchPOSIX
 	if interpreter == InterpreterFish {

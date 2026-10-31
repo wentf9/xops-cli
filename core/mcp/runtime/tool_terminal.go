@@ -31,11 +31,21 @@ const (
 type TerminalInput struct {
 	NodeID    string               `json:"nodeID" jsonschema:"Target SSH node ID or alias"`
 	Command   string               `json:"cmd,omitempty" jsonschema:"Shell command to execute, empty to poll incremental output on a persistent session, or SIGINT/EOF/SIGTERM/SIGKILL to signal a persistent session"`
-	Session   string               `json:"session,omitempty" jsonschema:"Session mode: 'once' (default, stateless) or a custom session name to persist PTY state (cwd, env, background jobs) in the remote POSIX login shell"`
+	Session   string               `json:"session,omitempty" jsonschema:"Session mode: 'once' (default, stateless) or a custom session name to persist PTY state (cwd, env, background jobs) in the remote login shell (supports POSIX shells, fish, and csh/tcsh)"`
 	Cwd       string               `json:"cwd,omitempty" jsonschema:"Optional working directory to switch to before executing cmd"`
 	Timeout   int                  `json:"timeout,omitempty" jsonschema:"Max seconds to wait before returning output (once: bounded by the server tool timeout; persistent sessions: default 5s, after which the command keeps running and can be polled)"`
 	Sudo      bool                 `json:"sudo,omitempty" jsonschema:"Whether to execute the command with sudo privileges (once mode only)"`
-	Execution *ssh.ExecutionConfig `json:"execution,omitempty" jsonschema:"Optional execution configuration overriding node/global defaults (once mode only); supports fish and zsh. Unspecified environments are probed when the backend supports discovery; explicit server preserves passthrough."`
+	Execution *ssh.ExecutionConfig `json:"execution,omitempty" jsonschema:"Optional execution configuration overriding node/global defaults (once mode only); supports fish, zsh, and csh/tcsh. Unspecified environments are probed when the backend supports discovery; explicit server preserves passthrough."`
+}
+
+func (in TerminalInput) Validate() error {
+	if isPersistentSession(in.Session) && (in.Sudo || in.Execution != nil) {
+		return errors.New("sudo and execution are supported only with session='once'; run sudo inside the persistent shell instead")
+	}
+	if !isPersistentSession(in.Session) && strings.TrimSpace(in.Command) == "" {
+		return errors.New("cmd is required for once session mode")
+	}
+	return nil
 }
 
 type TerminalOutput struct {
@@ -51,6 +61,73 @@ type TerminalOutput struct {
 }
 
 func isPersistentSession(name string) bool { return name != "" && name != onceSession }
+
+func skipRedirectOrDoubleAnd(cmd string, i int) (int, bool) {
+	if i+1 >= len(cmd) {
+		return 0, false
+	}
+	next := cmd[i+1]
+	if (cmd[i] == '&' && next == '>') || (cmd[i] == '>' && next == '&') {
+		return 1, false
+	}
+	if cmd[i] == '&' && next == '&' {
+		return 1, true
+	}
+	return 0, false
+}
+
+func updateQuotes(ch byte, inSingle, inDouble *bool) bool {
+	if ch == '\'' && !*inDouble {
+		*inSingle = !*inSingle
+		return true
+	}
+	if ch == '"' && !*inSingle {
+		*inDouble = !*inDouble
+		return true
+	}
+	return false
+}
+
+func isCommandSeparator(ch byte) bool {
+	return ch == ';' || ch == '\n' || ch == '|'
+}
+
+func hasUnredirectedBackgroundJob(cmd string) bool {
+	var inSingle, inDouble bool
+	segmentStart := 0
+
+	for i := 0; i < len(cmd); i++ {
+		ch := cmd[i]
+		if ch == '\\' && !inSingle {
+			i++
+			continue
+		}
+		if updateQuotes(ch, &inSingle, &inDouble) || inSingle || inDouble {
+			continue
+		}
+
+		if skip, isAnd := skipRedirectOrDoubleAnd(cmd, i); skip > 0 {
+			i += skip
+			if isAnd {
+				segmentStart = i + 1
+			}
+			continue
+		}
+
+		if ch == '&' {
+			if !strings.Contains(cmd[segmentStart:i], "/dev/null") {
+				return true
+			}
+			segmentStart = i + 1
+			continue
+		}
+
+		if isCommandSeparator(ch) {
+			segmentStart = i + 1
+		}
+	}
+	return false
+}
 
 func (r *Runtime) terminalHandler(ctx context.Context, _ *mcp.CallToolRequest, input TerminalInput) (*mcp.CallToolResult, TerminalOutput, error) {
 	if input.NodeID == "" {
@@ -89,6 +166,12 @@ func (r *Runtime) terminalHandler(ctx context.Context, _ *mcp.CallToolRequest, i
 	}
 	if execErr != nil {
 		out.Status, out.Error = "failed", FormatMCPError(execErr).Error()
+		isTimeout := errors.Is(execErr, context.DeadlineExceeded) ||
+			(runCtx != nil && errors.Is(runCtx.Err(), context.DeadlineExceeded)) ||
+			strings.Contains(strings.ToLower(out.Error), "deadline exceeded")
+		if isTimeout && hasUnredirectedBackgroundJob(input.Command) {
+			out.Error += "\n(hint: background jobs '&' in session='once' inherit SSH stdout/stderr pipes and block channel closure; redirect '>/dev/null 2>&1 </dev/null &' or use a persistent session)"
+		}
 	}
 	return nil, out, nil
 }
@@ -111,15 +194,22 @@ func (r *Runtime) runOnce(ctx, runCtx context.Context, input TerminalInput) (por
 		if err != nil {
 			return ports.CommandResult{}, err
 		}
-		effective, err := ssh.ResolveExecution(execution, target.Execution)
+		effective, err := resolveTargetExecution(execution, target.Execution)
 		if err != nil {
 			return ports.CommandResult{}, err
 		}
-		if command.Text, err = ssh.FormatWorkingDirCommand(input.Cwd, input.Command, effective); err != nil {
+		workingDirExec := effective
+		if effective.EffectiveInterpreter() == ssh.InterpreterServer {
+			if derived, ok := ssh.DeriveWorkingDirectoryExecution(effective); ok {
+				workingDirExec = derived
+			}
+		}
+		if command.Text, err = ssh.FormatWorkingDirCommand(input.Cwd, input.Command, workingDirExec); err != nil {
 			return ports.CommandResult{}, err
 		}
+		command.Execution = workingDirExec
 		if !input.Sudo {
-			plan, err := ssh.PlanCommand(command.Text, effective.CommandOptions())
+			plan, err := ssh.PlanCommand(command.Text, workingDirExec.CommandOptions())
 			if err != nil {
 				return ports.CommandResult{}, err
 			}
@@ -150,12 +240,16 @@ func (r *Runtime) terminalSessionHandler(ctx context.Context, input TerminalInpu
 	if err != nil {
 		return nil, TerminalOutput{}, err
 	}
-	// Completion detection relies on POSIX "$?" and printf.
-	if target.Execution != nil {
-		switch target.Execution.LaunchDialect {
-		case ssh.LaunchFish, ssh.LaunchPowerShell, ssh.LaunchCmd:
-			return nil, TerminalOutput{}, fmt.Errorf("persistent sessions require a POSIX login shell; node %s uses %s (use session='once')", nodeID, target.Execution.LaunchDialect)
-		}
+	var dialect ssh.LaunchDialect
+	if target.Execution != nil && target.Execution.LaunchDialect != "" {
+		dialect = target.Execution.LaunchDialect
+	}
+	if op.execution != nil && op.execution.LaunchDialect != "" && op.execution.LaunchDialect != ssh.LaunchUnknown {
+		dialect = op.execution.LaunchDialect
+	}
+	switch dialect {
+	case ssh.LaunchPowerShell, ssh.LaunchCmd:
+		return nil, TerminalOutput{}, fmt.Errorf("persistent sessions require a Unix login shell (posix, fish, or csh); node %s uses %s (use session='once')", nodeID, dialect)
 	}
 
 	var timeout time.Duration
@@ -170,6 +264,7 @@ func (r *Runtime) terminalSessionHandler(ctx context.Context, input TerminalInpu
 	res, err := r.sessions.Execute(ctx, session.ExecuteRequest{
 		Key:        session.Key{Scope: r.scope(ctx), NodeID: nodeID, SessionName: input.Session},
 		Generation: generation,
+		Dialect:    dialect,
 		Dial: func(dialCtx context.Context) (ports.PTYSession, error) {
 			return ptyBackend.OpenPTY(dialCtx, op.permit, nodeID)
 		},

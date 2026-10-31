@@ -69,7 +69,8 @@ func (r *Session) Inspect(ctx context.Context, name string, upload, overwrite bo
 }
 
 func inspectTransferFile(client *pkgsftp.Client, name string, upload, overwrite bool) (Metadata, error) {
-	if !path.IsAbs(name) || name == "/" || len(name) > 4096 || strings.ContainsRune(name, '\x00') {
+	name = NormalizeSFTPPath(name)
+	if !path.IsAbs(name) || IsRootPath(name) || len(name) > 4096 || strings.ContainsRune(name, '\x00') {
 		return Metadata{}, errors.New("transfer requires an absolute remote file path")
 	}
 	name = path.Clean(name)
@@ -314,4 +315,47 @@ func (r *Session) Remove(ctx context.Context, name string) error {
 		}
 		return nil
 	})
+}
+
+func isAlpha(b byte) bool {
+	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
+}
+
+// NormalizeSFTPPath converts Windows drive paths (C:\..., c:/..., /C:\...) into
+// OpenSSH SFTP canonical form (/C:/...) with an uppercase drive letter and
+// forward slashes. Non-drive POSIX paths are cleaned without altering backslashes.
+func NormalizeSFTPPath(p string) string {
+	if p == "" {
+		return ""
+	}
+	// Case 1: C:\... or C:/... or C:\ or C:
+	if len(p) >= 2 && isAlpha(p[0]) && p[1] == ':' && (len(p) == 2 || p[2] == '/' || p[2] == '\\') {
+		drive := strings.ToUpper(string(p[0]))
+		rest := strings.ReplaceAll(p[2:], "\\", "/")
+		cleanRest := path.Clean("/" + rest)
+		if cleanRest == "/" {
+			return "/" + drive + ":"
+		}
+		return "/" + drive + ":" + cleanRest
+	}
+	// Case 2: /C:\... or /c:/... or /C: or /C:/
+	if len(p) >= 3 && p[0] == '/' && isAlpha(p[1]) && p[2] == ':' && (len(p) == 3 || p[3] == '/' || p[3] == '\\') {
+		drive := strings.ToUpper(string(p[1]))
+		rest := strings.ReplaceAll(p[3:], "\\", "/")
+		cleanRest := path.Clean("/" + rest)
+		if cleanRest == "/" {
+			return "/" + drive + ":"
+		}
+		return "/" + drive + ":" + cleanRest
+	}
+	return path.Clean(p)
+}
+
+// IsRootPath reports whether p represents a POSIX or Windows drive root directory.
+func IsRootPath(cleaned string) bool {
+	norm := NormalizeSFTPPath(cleaned)
+	if norm == "/" {
+		return true
+	}
+	return len(norm) == 3 && norm[0] == '/' && isAlpha(norm[1]) && norm[2] == ':'
 }

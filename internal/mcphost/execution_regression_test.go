@@ -165,10 +165,20 @@ func newExecutionBackendFixtureWithHandler(t *testing.T, mode ssh.SudoMode, hand
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	t.Cleanup(cancel)
-	commands := make(chan string, 4)
+	commands := make(chan string, 8)
 	server, err := sshfixture.NewWithOptions(ctx, sshfixture.Options{ExecHandler: func(command string, ch cryptoSSH.Channel) {
 		if handler != nil {
 			handler(command, ch)
+			return
+		}
+		if strings.Contains(command, "__XOPS_DIALECT_POSIX__") {
+			_, _ = io.WriteString(ch, "__XOPS_DIALECT_POSIX__:Linux:/bin/bash\n")
+			_, _ = ch.SendRequest("exit-status", false, cryptoSSH.Marshal(struct{ Status uint32 }{0}))
+			return
+		}
+		if strings.Contains(command, "__XOPS_INTERP__") {
+			_, _ = io.WriteString(ch, "__XOPS_INTERP__:bash\n__XOPS_INTERP_END__\n")
+			_, _ = ch.SendRequest("exit-status", false, cryptoSSH.Marshal(struct{ Status uint32 }{0}))
 			return
 		}
 		commands <- command
@@ -352,6 +362,12 @@ func TestLegacyHostBackendFilesystemRejectsNonPOSIXDialects(t *testing.T) {
 			if test.invalid {
 				if !errors.Is(err, ssh.ErrExecutionValidation) || result.Outcome != ssh.ExecutionNotStarted || server.Executed.Load() != 0 {
 					t.Fatalf("expected execution validation error and no dispatch, got result=%+v, err=%v, executed=%d", result, err, server.Executed.Load())
+				}
+				if test.cmd.RequirePOSIX && !strings.Contains(err.Error(), "POSIX shell target (X11/Wayland) is required") {
+					t.Fatalf("expected error mentioning POSIX shell target (X11/Wayland) is required, got %v", err)
+				}
+				if test.cmd.Filesystem && !strings.Contains(err.Error(), "generated filesystem commands") {
+					t.Fatalf("expected error mentioning generated filesystem commands, got %v", err)
 				}
 				return
 			}

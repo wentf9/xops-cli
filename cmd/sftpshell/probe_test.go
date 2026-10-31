@@ -113,7 +113,7 @@ func TestSFTPCwdProbeFailureIsCached(t *testing.T) {
 			t.Fatal("failed probe authorized user command")
 		}
 	}
-	if server.Executed.Load() != 4 {
+	if server.Executed.Load() != 5 {
 		t.Fatal("failed cwd probe repeated or executed user work")
 	}
 }

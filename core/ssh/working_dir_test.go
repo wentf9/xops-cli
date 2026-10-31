@@ -170,3 +170,68 @@ func TestFormatWorkingDirCommand_ServerRejectionMessage(t *testing.T) {
 		t.Errorf("error %q does not mention server interpreter inheritance", err.Error())
 	}
 }
+
+func TestDeriveWorkingDirectoryExecution(t *testing.T) {
+	tests := []struct {
+		name       string
+		cfg        *ssh.ExecutionConfig
+		wantOk     bool
+		wantInterp ssh.Interpreter
+	}{
+		{
+			name:   "nil execution",
+			cfg:    nil,
+			wantOk: false,
+		},
+		{
+			name:       "server with cmd dialect",
+			cfg:        &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer, LaunchDialect: ssh.LaunchCmd},
+			wantOk:     true,
+			wantInterp: ssh.InterpreterCmd,
+		},
+		{
+			name:   "server with powershell dialect",
+			cfg:    &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer, LaunchDialect: ssh.LaunchPowerShell},
+			wantOk: false,
+		},
+		{
+			name:   "server with posix dialect",
+			cfg:    &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer, LaunchDialect: ssh.LaunchPOSIX},
+			wantOk: false,
+		},
+		{
+			name:   "non-server interpreter",
+			cfg:    &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchPOSIX},
+			wantOk: false,
+		},
+		{
+			name:   "server without dialect",
+			cfg:    &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer},
+			wantOk: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			derived, ok := ssh.DeriveWorkingDirectoryExecution(tt.cfg)
+			if ok != tt.wantOk {
+				t.Fatalf("DeriveWorkingDirectoryExecution(%v) ok = %v, want %v", tt.cfg, ok, tt.wantOk)
+			}
+			if ok {
+				if derived.EffectiveInterpreter() != tt.wantInterp {
+					t.Errorf("EffectiveInterpreter() = %v, want %v", derived.EffectiveInterpreter(), tt.wantInterp)
+				}
+				if tt.wantInterp == ssh.InterpreterCmd {
+					cmd, err := ssh.FormatWorkingDirCommand(`C:\Users\wentf`, "whoami", derived)
+					if err != nil {
+						t.Fatalf("FormatWorkingDirCommand failed: %v", err)
+					}
+					want := `cd /d "C:\Users\wentf" || exit /b & whoami`
+					if cmd != want {
+						t.Errorf("cmd = %q, want %q", cmd, want)
+					}
+				}
+			}
+		})
+	}
+}

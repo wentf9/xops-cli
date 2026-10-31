@@ -16,6 +16,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/wentf9/xops-cli/core/mcp/guardrail"
 	"github.com/wentf9/xops-cli/core/mcp/ports"
+	"github.com/wentf9/xops-cli/core/mcp/remotefile"
 	"github.com/wentf9/xops-cli/core/mcp/transfer"
 )
 
@@ -38,6 +39,10 @@ func (r *Runtime) stdioTransferHandler(ctx context.Context, _ *mcp.CallToolReque
 	}
 	if input.Direction != "push" && input.Direction != "pull" {
 		return nil, TransferFileOutput{}, fmt.Errorf("unsupported transfer direction %q (expected push or pull)", input.Direction)
+	}
+	input.RemotePath = remotefile.NormalizeSFTPPath(input.RemotePath)
+	if !path.IsAbs(input.RemotePath) || remotefile.IsRootPath(input.RemotePath) || strings.ContainsRune(input.RemotePath, '\x00') {
+		return nil, TransferFileOutput{}, errors.New("remotePath must be an absolute non-root file path")
 	}
 
 	sftpClient, err := r.getMCPSFTPClient(ctx, input.NodeID)
@@ -163,6 +168,7 @@ func (r *Runtime) httpTransferHandler(ctx context.Context, req *mcp.CallToolRequ
 
 func (r *Runtime) prepareUpload(ctx context.Context, req *mcp.CallToolRequest, input PrepareUploadInput) (*mcp.CallToolResult, PreparedTransferOutput, error) {
 	input.Action = ""
+	input.RemotePath = remotefile.NormalizeSFTPPath(input.RemotePath)
 	if input.Size < 0 || input.Size > r.http.Transfers.MaxFileBytes {
 		return nil, PreparedTransferOutput{}, errors.New("upload size exceeds the permitted range")
 	}
@@ -177,6 +183,7 @@ func (r *Runtime) prepareUpload(ctx context.Context, req *mcp.CallToolRequest, i
 
 func (r *Runtime) prepareDownload(ctx context.Context, req *mcp.CallToolRequest, input PrepareDownloadInput) (*mcp.CallToolResult, PreparedTransferOutput, error) {
 	input.Action = ""
+	input.RemotePath = remotefile.NormalizeSFTPPath(input.RemotePath)
 	spec := transfer.Spec{RequestID: input.RequestID, NodeID: input.NodeID, RequestedPath: input.RemotePath,
 		RemotePath: input.RemotePath, Direction: transfer.Download}
 	return r.prepareTransfer(ctx, req, spec, input)
@@ -186,7 +193,7 @@ func validateTransferRequest(spec transfer.Spec) error {
 	if spec.RequestID == "" || len(spec.RequestID) > 128 || spec.NodeID == "" || len(spec.NodeID) > 1024 {
 		return errors.New("bounded requestID and nodeID are required")
 	}
-	if !path.IsAbs(spec.RemotePath) || path.Clean(spec.RemotePath) == "/" || len(spec.RemotePath) > 4096 || strings.ContainsRune(spec.RemotePath, '\x00') {
+	if !path.IsAbs(spec.RemotePath) || remotefile.IsRootPath(spec.RemotePath) || len(spec.RemotePath) > 4096 || strings.ContainsRune(spec.RemotePath, '\x00') {
 		return errors.New("an absolute remote file path is required")
 	}
 	return nil
@@ -388,9 +395,10 @@ func (r *Runtime) registerTransfer(server *mcp.Server, g *guardrail.Guardrail) {
 		},
 		withOperation(r, g, "transfer",
 			func(in TransferFileInput) guardrail.RiskInput {
-				paths := []string{in.RemotePath}
+				normRemote := remotefile.NormalizeSFTPPath(in.RemotePath)
+				paths := []string{normRemote}
 				if in.Direction == "push" && in.LocalPath != "" {
-					paths = []string{in.LocalPath, in.RemotePath}
+					paths = []string{in.LocalPath, normRemote}
 				}
 				return guardrail.RiskInput{
 					Action: in.Direction,

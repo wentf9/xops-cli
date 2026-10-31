@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -344,23 +345,80 @@ func DefaultRunConfig() *RunConfig {
 	}
 }
 
+func applyExecutionToRunConfig(config *RunConfig, exec *ExecutionConfig) {
+	if config == nil || exec == nil {
+		return
+	}
+	config.LaunchDialect = exec.LaunchDialect
+	if exec.Interpreter != "" {
+		config.Interpreter = exec.Interpreter
+	}
+	if exec.Interpreter == InterpreterSh || exec.Interpreter == InterpreterFish || exec.Interpreter == InterpreterZsh || exec.Interpreter == InterpreterCsh || exec.Interpreter == InterpreterTcsh {
+		config.LoginShell = false
+	}
+	if exec.Login != nil {
+		config.LoginShell = *exec.Login
+	}
+}
+
 func (c *Client) defaultRunConfig() *RunConfig {
 	config := DefaultRunConfig()
 	if c != nil {
-		if exec := c.Execution(); exec != nil {
-			config.LaunchDialect = exec.LaunchDialect
-			if exec.Interpreter != "" {
-				config.Interpreter = exec.Interpreter
-			}
-			if exec.Interpreter == InterpreterFish || exec.Interpreter == InterpreterZsh {
-				config.LoginShell = false
-			}
-			if exec.Login != nil {
-				config.LoginShell = *exec.Login
-			}
-		}
+		applyExecutionToRunConfig(config, c.Execution())
 	}
 	return config
+}
+
+func (c *Client) privilegeExecution() *ExecutionConfig {
+	if c == nil {
+		return nil
+	}
+	exec := c.Execution()
+	if !NeedsExecutionProbe(exec) {
+		return exec
+	}
+	if cached, ok := c.CachedExecutionProbe(); ok && cached != nil {
+		resolved := cached.SuggestedConfig.Clone()
+		if resolved.Interpreter == InterpreterServer && resolved.LaunchDialect == LaunchCmd {
+			for _, interpreter := range []Interpreter{InterpreterPowerShell, InterpreterPwsh, InterpreterCmd} {
+				if slices.Contains(cached.AvailableInterpreters, interpreter) {
+					resolved.Interpreter = interpreter
+					break
+				}
+			}
+		}
+		resolved.Login = nil
+		if resolved.Validate() == nil {
+			return resolved
+		}
+	}
+	return exec
+}
+
+func (c *Client) defaultPrivilegeRunConfig() *RunConfig {
+	config := DefaultRunConfig()
+	if c != nil {
+		applyExecutionToRunConfig(config, c.privilegeExecution())
+	}
+	return config
+}
+
+func (c *Client) probeRunConfig(config *RunConfig) *RunConfig {
+	base := c.defaultPrivilegeRunConfig()
+	probeCfg := DefaultRunConfig()
+	probeCfg.LoginShell = false
+	probeCfg.OutMode = OutputModeString
+	probeCfg.Interpreter = base.Interpreter
+	probeCfg.LaunchDialect = base.LaunchDialect
+	if config != nil {
+		if config.Interpreter != "" {
+			probeCfg.Interpreter = config.Interpreter
+		}
+		if config.LaunchDialect != "" {
+			probeCfg.LaunchDialect = config.LaunchDialect
+		}
+	}
+	return probeCfg
 }
 
 func (c *Client) Run(ctx context.Context, cmd string, opts ...RunOption) (string, error) {
@@ -375,7 +433,7 @@ func (c *Client) Run(ctx context.Context, cmd string, opts ...RunOption) (string
 		if config.LoginShell {
 			login = LoginEnabled
 		}
-		if config.Interpreter == InterpreterSh {
+		if config.Interpreter == InterpreterSh || config.Interpreter == InterpreterCsh || config.Interpreter == InterpreterTcsh {
 			login = LoginDisabled
 		}
 		if config.Interpreter == "" || config.Interpreter == InterpreterServer || config.Interpreter == InterpreterPwsh {
@@ -402,9 +460,13 @@ func (c *Client) Run(ctx context.Context, cmd string, opts ...RunOption) (string
 
 // RunWithoutLogin 执行命令并在非登录 Shell 中运行，避免加载 profile 脚本产生干扰输出
 func (c *Client) RunWithoutLogin(ctx context.Context, cmd string) (string, error) {
-	config := c.defaultRunConfig()
-	if usesPortableShellAdapter(config) {
-		return c.runRaw(ctx, unixCommandPayload(InterpreterSh, cmd, false, config.LaunchDialect), config)
+	return c.runWithoutLoginWithConfig(ctx, cmd, c.defaultRunConfig())
+}
+
+func (c *Client) runWithoutLoginWithConfig(ctx context.Context, cmd string, config *RunConfig) (string, error) {
+	probeCfg := c.probeRunConfig(config)
+	if usesPortableShellAdapter(probeCfg) || probeCfg.Interpreter == InterpreterSh {
+		return c.runRaw(ctx, unixCommandPayload(InterpreterSh, cmd, false, probeCfg.LaunchDialect), probeCfg)
 	}
 	return c.runRaw(ctx, bashCommandPayload(cmd, false), DefaultRunConfig())
 }
@@ -439,8 +501,12 @@ func (c *Client) RunScript(ctx context.Context, scriptContent string, opts ...Ru
 		payload = zshScriptPayload(config.LoginShell)
 	case InterpreterFish:
 		payload = fishScriptPayload(config.LoginShell)
+	case InterpreterCsh:
+		payload = cshScriptPayload()
+	case InterpreterTcsh:
+		payload = tcshScriptPayload()
 	default:
-		return "", fmt.Errorf("%w: unsupported interpreter %q for RunScript (only bash, sh, zsh and fish are supported)", ErrExecutionValidation, config.Interpreter)
+		return "", fmt.Errorf("%w: unsupported interpreter %q for RunScript (only bash, sh, zsh, fish, csh and tcsh are supported)", ErrExecutionValidation, config.Interpreter)
 	}
 
 	session, err := c.newSessionContext(ctx)
@@ -465,8 +531,8 @@ func (c *Client) RunScriptWithExecution(ctx context.Context, content string, exe
 	if err := execution.Validate(); err != nil {
 		return "", err
 	}
-	if execution.Interpreter != "" && execution.Interpreter != InterpreterBash && execution.Interpreter != InterpreterSh && execution.Interpreter != InterpreterZsh && execution.Interpreter != InterpreterFish {
-		return "", fmt.Errorf("%w: unsupported interpreter %q for RunScriptWithExecution (only bash, sh, zsh and fish are supported)", ErrExecutionValidation, execution.Interpreter)
+	if execution.Interpreter != "" && execution.Interpreter != InterpreterBash && execution.Interpreter != InterpreterSh && execution.Interpreter != InterpreterZsh && execution.Interpreter != InterpreterFish && execution.Interpreter != InterpreterCsh && execution.Interpreter != InterpreterTcsh {
+		return "", fmt.Errorf("%w: unsupported interpreter %q for RunScriptWithExecution (only bash, sh, zsh, fish, csh and tcsh are supported)", ErrExecutionValidation, execution.Interpreter)
 	}
 	opts := make([]RunOption, len(extraOpts))
 	copy(opts, extraOpts)
@@ -686,18 +752,41 @@ func (c *Client) resolvePrivilegeMaterial(ctx context.Context, kind SecretKind, 
 }
 
 func (c *Client) isNonPOSIXExecution() bool {
-	if execCfg := c.Execution(); execCfg != nil {
+	if execCfg := c.privilegeExecution(); execCfg != nil {
 		return execCfg.LaunchDialect == LaunchCmd || execCfg.LaunchDialect == LaunchPowerShell ||
 			execCfg.Interpreter == InterpreterCmd || execCfg.Interpreter == InterpreterPowerShell
 	}
 	return false
 }
 
-func (c *Client) detectRootOrSudoer(ctx context.Context) (bool, error) {
+func (c *Client) maybeProbePrivilegeExecution(ctx context.Context) (*ExecutionConfig, error) {
+	if c == nil {
+		return nil, fmt.Errorf("ssh client is nil")
+	}
+	if ctx == nil {
+		return nil, fmt.Errorf("execution probe context is nil")
+	}
+	exec := c.privilegeExecution()
+	if !NeedsExecutionProbe(exec) {
+		return exec, nil
+	}
+	probed, err := c.ProbeControlledExecution(ctx, exec)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		c.getLogger().Debugf("automatic privilege execution probe failed: %v, keeping legacy defaults", err)
+		return exec, nil
+	}
+	return probed, nil
+}
+
+func (c *Client) detectRootOrSudoer(ctx context.Context, config *RunConfig) (bool, error) {
+	probeCfg := c.probeRunConfig(config)
 	// 1. 探测是否已经是 root
-	// 使用 RunWithoutLogin 避免 MOTD 干扰输出
+	// 使用 runWithoutLoginWithConfig 避免 MOTD 干扰输出
 	c.observePrivilege(SudoModeAuto, "root_probe", 2, 0)
-	if out, err := c.RunWithoutLogin(ctx, "id -u"); err == nil {
+	if out, err := c.runWithoutLoginWithConfig(ctx, "id -u", probeCfg); err == nil {
 		// 稳健检查：只要最后一行输出是 0，即认为是 root
 		lines := strings.Split(strings.TrimSpace(out), "\n")
 		if len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "0" {
@@ -711,7 +800,7 @@ func (c *Client) detectRootOrSudoer(ctx context.Context) (bool, error) {
 	c.observePrivilege(SudoModeAuto, "root_probe_unconfirmed", 2, 0)
 	// 2. 探测是否有免密 sudo 权限
 	c.observePrivilege(SudoModeAuto, "passwordless_probe", 2, 0)
-	if _, err := c.RunWithoutLogin(ctx, "sudo -n true"); err == nil {
+	if _, err := c.runWithoutLoginWithConfig(ctx, "sudo -n true", probeCfg); err == nil {
 		c.observePrivilege(SudoModeSudoer, "passwordless_available", 1, 0)
 		return true, c.updateSudoMode(ctx, SudoModeSudoer)
 	} else if err := ctx.Err(); err != nil {
@@ -721,7 +810,8 @@ func (c *Client) detectRootOrSudoer(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
-func (c *Client) maybeDetectSudoMode(ctx context.Context) (retErr error) {
+//nolint:gocyclo // Multi-stage privilege detection coordinates root probe, passwordless sudo, password sudo, and su fallback.
+func (c *Client) maybeDetectSudoMode(ctx context.Context, configs ...*RunConfig) (retErr error) {
 	if ctx == nil {
 		return fmt.Errorf("sudo detection context is nil")
 	}
@@ -729,6 +819,19 @@ func (c *Client) maybeDetectSudoMode(ctx context.Context) (retErr error) {
 		return fmt.Errorf("ssh client or config is nil")
 	}
 	defer func() { c.observePrivilegeSelection(ctx, retErr) }()
+	// 如果已经有确定的 SudoMode，且不是 "auto" 或空，则不再探测
+	if connCfg := c.ConnectionConfig(); connCfg.SudoMode != "" && connCfg.SudoMode != SudoModeAuto {
+		return nil
+	}
+	var callerCfg *RunConfig
+	if len(configs) > 0 {
+		callerCfg = configs[0]
+	}
+	if callerCfg == nil || callerCfg.Interpreter == "" {
+		if _, err := c.maybeProbePrivilegeExecution(ctx); err != nil {
+			return err
+		}
+	}
 	c.sudoMu.Lock()
 	defer c.sudoMu.Unlock()
 	connCfg := c.ConnectionConfig()
@@ -749,8 +852,9 @@ func (c *Client) maybeDetectSudoMode(ctx context.Context) (retErr error) {
 		return err
 	}
 
+	probeCfg := c.probeRunConfig(callerCfg)
 	c.observePrivilege(SudoModeAuto, "detection_started", 1, 0)
-	detected, err := c.detectRootOrSudoer(ctx)
+	detected, err := c.detectRootOrSudoer(ctx, probeCfg)
 	if err != nil || detected {
 		return err
 	}
@@ -761,7 +865,7 @@ func (c *Client) maybeDetectSudoMode(ctx context.Context) (retErr error) {
 	if err == nil {
 		defer priv.Zero()
 		priv.deferSave = true
-		if _, testErr := c.runWithSudo(ctx, "true", priv.Password, nil, nil, priv); testErr == nil {
+		if _, testErr := c.runWithSudo(ctx, "true", priv.Password, nil, probeCfg, priv); testErr == nil {
 			return c.confirmDetectedSudo(ctx, priv)
 		} else if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr

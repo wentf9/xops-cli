@@ -45,6 +45,12 @@ func TestTerminalSessionExitAndRequestContracts(t *testing.T) {
 			client := commandTestClient(t, scenario)
 			client.cfgMu.Lock()
 			client.connCfg.SudoMode = test.mode
+			if test.mode != "" {
+				client.connCfg.Execution = &ExecutionConfig{
+					Interpreter:   InterpreterBash,
+					LaunchDialect: LaunchPOSIX,
+				}
+			}
 			client.cfgMu.Unlock()
 			var output bytes.Buffer
 			streams := InteractiveIO{Stdin: stdin, Stdout: &output, Stderr: &output}

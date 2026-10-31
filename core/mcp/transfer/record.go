@@ -86,11 +86,15 @@ func (s Spec) validateIdentity() error {
 	return nil
 }
 
+func isDriveRoot(p string) bool {
+	return len(p) == 3 && p[0] == '/' && p[2] == ':' && ((p[1] >= 'A' && p[1] <= 'Z') || (p[1] >= 'a' && p[1] <= 'z'))
+}
+
 func (s Spec) validate() error {
 	if err := s.validateIdentity(); err != nil {
 		return err
 	}
-	if !path.IsAbs(s.RemotePath) || path.Clean(s.RemotePath) != s.RemotePath || s.RemotePath == "/" ||
+	if !path.IsAbs(s.RemotePath) || path.Clean(s.RemotePath) != s.RemotePath || s.RemotePath == "/" || isDriveRoot(s.RemotePath) ||
 		len(s.RemotePath) > 4096 || strings.ContainsRune(s.RemotePath, '\x00') {
 		return errors.New("transfer requires a normalized absolute remote file path")
 	}

@@ -26,8 +26,8 @@
 
 | 纳入范围 | 不包含的承诺 |
 | :--- | :--- |
-| 自动识别 SSH 服务端的外层启动方言（`posix`、`fish`、`cmd`、`powershell`） | 仅凭 SSH Banner、`$SHELL` 或单次 `uname` 猜测全部环境能力 |
-| 自动枚举目标节点已安装的可用解释器（`bash`、`sh`、`zsh`、`fish`、`powershell`、`pwsh`、`cmd`） | 任意跨平台命令自动语法转译（如将 POSIX 管道自动翻译为 PowerShell） |
+| 自动识别 SSH 服务端的外层启动方言（`posix`、`fish`、`csh`、`cmd`、`powershell`） | 仅凭 SSH Banner、`$SHELL` 或单次 `uname` 猜测全部环境能力 |
+| 自动枚举目标节点已安装的可用解释器（`bash`、`sh`、`zsh`、`fish`、`csh`、`tcsh`、`powershell`、`pwsh`、`cmd`） | 任意跨平台命令自动语法转译（如将 POSIX 管道自动翻译为 PowerShell） |
 | 首次录入节点时自动执行探针并原子持久化至 Schema V2 配置 | 在用户命令执行失败后自动更换解释器重试 |
 | 提供连接级内存缓存与受控的运行时按需懒加载机制 | 探针执行无视网络超时无限阻塞 |
 | 探针全流程只读、无副作用、抗 MOTD/Banner 噪声干扰 | 允许探针在远端创建临时文件或遗留孤儿进程 |
@@ -76,7 +76,7 @@ Level 4: 连接级会话缓存 (Session Cache)   ──► 单次 SSH Client 生
   - 执行 Playbook `ensure` 检查步骤（需要受控 Shell 捕获控制帧）；
   - 执行 SFTP `exec` 且带有非空工作目录 `cwd`。
 - 探测成功后仅将配置缓存在当前运行进程的内存上下文中，不自动改写静态磁盘配置文件。
-- 显式解释器（包括 `server`）、已知方言及显式 login 不被懒加载替换。script/ensure 支持 bash/sh/zsh/fish，外层方言须为 posix/fish；fish ensure 使用原生退出事件报告检查状态。
+- 显式解释器（包括 `server`）、已知方言及显式 login 不被懒加载替换。`script` 支持 `bash`/`sh`/`zsh`/`fish`/`csh`/`tcsh`，`ensure` 支持 `bash`/`sh`/`zsh`/`fish`（在 `csh` 外层方言下自动回退至已探测到的可用 `bash`/`sh`/`zsh`/`fish`），外层方言须为 `posix`/`fish`/`csh`；fish ensure 使用原生退出事件报告检查状态。
 
 ### 2.4 接入层级四：连接级内存缓存 (Connection-Level Session Cache)
 - Client 引用受并发锁保护的探测状态，连接池中的包装对象共享同一缓存；

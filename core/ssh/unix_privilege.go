@@ -8,7 +8,7 @@ import (
 )
 
 func usesPortableShellAdapter(config *RunConfig) bool {
-	return config != nil && (config.Interpreter == InterpreterZsh || config.Interpreter == InterpreterFish || config.LaunchDialect == LaunchFish)
+	return config != nil && (config.Interpreter == InterpreterZsh || config.Interpreter == InterpreterFish || config.Interpreter == InterpreterCsh || config.Interpreter == InterpreterTcsh || config.LaunchDialect == LaunchFish || config.LaunchDialect == LaunchCsh)
 }
 
 // The control shell always speaks POSIX. User code is a separate interpreter
@@ -18,21 +18,22 @@ func portableUserCommand(command string, config *RunConfig, dialect LaunchDialec
 	if interpreter == "" {
 		interpreter = InterpreterBash
 	}
+	supportsLogin := interpreter != InterpreterSh && interpreter != InterpreterCsh && interpreter != InterpreterTcsh
 	if command == "" {
 		payload := "exec " + string(interpreter)
-		if config.LoginShell && interpreter != InterpreterSh {
+		if config.LoginShell && supportsLogin {
 			payload += " -l"
 		}
 		return payload
 	}
-	return unixCommandPayload(interpreter, command, config.LoginShell && interpreter != InterpreterSh, dialect)
+	return unixCommandPayload(interpreter, command, config.LoginShell && supportsLogin, dialect)
 }
 
-func (c *Client) runPortableWithSudo(ctx context.Context, content string, script bool, config *RunConfig) (string, error) {
+func (c *Client) runPortableWithSudo(ctx context.Context, content string, script bool, config *RunConfig, mat ...*PrivilegeMaterial) (string, error) {
 	switch config.Interpreter {
-	case "", InterpreterBash, InterpreterSh, InterpreterZsh, InterpreterFish:
+	case "", InterpreterBash, InterpreterSh, InterpreterZsh, InterpreterFish, InterpreterCsh, InterpreterTcsh:
 	default:
-		return "", fmt.Errorf("%w: Unix privilege execution requires bash, sh, zsh or fish", ErrExecutionValidation)
+		return "", fmt.Errorf("%w: Unix privilege execution requires bash, sh, zsh, fish, csh or tcsh", ErrExecutionValidation)
 	}
 	if err := validatePortableShellConfig(config); err != nil {
 		return "", err
@@ -54,7 +55,7 @@ func (c *Client) runPortableWithSudo(ctx context.Context, content string, script
 		}
 		return c.runRaw(ctx, portableUserCommand(content, config, config.LaunchDialect), config)
 	case SudoModeSudoer, SudoModeSudo, SudoModeSu:
-		return c.runPrivilegeWithConfig(ctx, mode, inner, input, config)
+		return c.runPrivilegeWithConfig(ctx, mode, inner, input, config, mat...)
 	default:
 		return "", fmt.Errorf("privilege escalation is unsupported for sudo mode %q", mode)
 	}
@@ -72,10 +73,32 @@ func (e *privilegeExchange) portableCommand(command string) string {
 
 func (e *privilegeExchange) wrapPortableBody(body, prompt string) string {
 	quote := shellQuote
-	if e.launchDialect == LaunchFish {
+	switch e.launchDialect {
+	case LaunchFish:
 		quote = fishQuote
+	case LaunchCsh:
+		quote = cshQuote
 	}
 	if e.mode == SudoModeSu {
+		if (e.interpreter == InterpreterSh || e.interpreter == InterpreterCsh || e.interpreter == InterpreterTcsh || e.launchDialect == LaunchCsh) && e.launchDialect != LaunchFish {
+			normalized := strings.ReplaceAll(body, "\r\n", "\n")
+			trimmed := strings.TrimSuffix(normalized, "\n")
+			var suBody string
+			if !strings.Contains(trimmed, "\n") {
+				suBody = "exec sh -c " + strings.ReplaceAll(shellQuote(trimmed), "!", "'\\!'")
+			} else {
+				lines := strings.Split(trimmed, "\n")
+				quotedLines := make([]string, len(lines))
+				for i, line := range lines {
+					quotedLines[i] = strings.ReplaceAll(shellQuote(line), "!", "'\\!'")
+				}
+				suBody = "exec sh -c 'eval \"$(printf '\\''%s\\n'\\'' \"$@\")\"' sh " + strings.Join(quotedLines, " ")
+			}
+			if e.launchDialect == LaunchCsh {
+				return "env LC_ALL=C su - root -c " + quote(suBody)
+			}
+			return "export LC_ALL=C; su - root -c " + shellQuote(suBody)
+		}
 		return "env LC_ALL=C su - root -s /bin/sh -c " + quote(body)
 	}
 	prefix := "sudo -S -p "
@@ -85,14 +108,18 @@ func (e *privilegeExchange) wrapPortableBody(body, prompt string) string {
 	return prefix + quote(prompt) + " -- /bin/sh -c " + quote(body)
 }
 
-func (c *Client) runInteractivePortableWithSudo(ctx context.Context, mode SudoMode, command string, streams InteractiveIO, shell bool, config *RunConfig, cancelOutput ...context.CancelFunc) error {
+func (c *Client) runInteractivePortableWithSudo(ctx context.Context, mode SudoMode, command string, streams InteractiveIO, shell bool, config *RunConfig, extra ...any) error {
 	if config.Interpreter == "" || config.Interpreter == InterpreterServer {
-		config.Interpreter = InterpreterFish
+		if config.LaunchDialect == LaunchCsh {
+			config.Interpreter = InterpreterCsh
+		} else {
+			config.Interpreter = InterpreterFish
+		}
 	}
 	switch config.Interpreter {
-	case InterpreterBash, InterpreterSh, InterpreterZsh, InterpreterFish:
+	case InterpreterBash, InterpreterSh, InterpreterZsh, InterpreterFish, InterpreterCsh, InterpreterTcsh:
 	default:
-		return fmt.Errorf("%w: interactive Unix privilege execution requires bash, sh, zsh or fish", ErrExecutionValidation)
+		return fmt.Errorf("%w: interactive Unix privilege execution requires bash, sh, zsh, fish, csh or tcsh", ErrExecutionValidation)
 	}
 	if shell {
 		config.LoginShell = true
@@ -100,12 +127,18 @@ func (c *Client) runInteractivePortableWithSudo(ctx context.Context, mode SudoMo
 	if err := validatePortableShellConfig(config); err != nil {
 		return err
 	}
+	var cancelOutput []context.CancelFunc
+	for _, item := range extra {
+		if fn, ok := item.(context.CancelFunc); ok {
+			cancelOutput = append(cancelOutput, fn)
+		}
+	}
 	if mode == SudoModeRoot {
 		payload := portableUserCommand(command, config, config.LaunchDialect)
 		return c.runTerminalSession(ctx, payload, streams, false, shell, cancelOutput...)
 	}
 	inner := portableUserCommand(command, config, LaunchPOSIX)
-	return c.runInteractivePrivilegeSession(ctx, mode, inner, streams, shell, config, cancelOutput...)
+	return c.runInteractivePrivilegeSession(ctx, mode, inner, streams, shell, config, extra...)
 }
 
 func validatePortableShellConfig(config *RunConfig) error {
@@ -114,7 +147,7 @@ func validatePortableShellConfig(config *RunConfig) error {
 		interpreter = InterpreterBash
 	}
 	login := LoginDisabled
-	if config.LoginShell && interpreter != InterpreterSh {
+	if config.LoginShell && interpreter != InterpreterSh && interpreter != InterpreterCsh && interpreter != InterpreterTcsh {
 		login = LoginEnabled
 	}
 	if _, err := PlanCommand("true", CommandOptions{Interpreter: interpreter, LaunchDialect: config.LaunchDialect, Login: login}); err != nil {

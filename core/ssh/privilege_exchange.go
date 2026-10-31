@@ -63,7 +63,7 @@ func newPrivilegeExchange(c *Client, mode SudoMode, force bool, interp ...Interp
 		forcePrompt:  force,
 		outputErrors: make(chan struct{}, 1),
 	}
-	if execution := c.Execution(); execution != nil {
+	if execution := c.privilegeExecution(); execution != nil {
 		exchange.launchDialect = execution.LaunchDialect
 	}
 	return exchange
@@ -78,7 +78,7 @@ func (e *privilegeExchange) started() bool {
 }
 func shellQuote(value string) string { return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'" }
 func (e *privilegeExchange) command(command string) string {
-	if (e.terminal != nil && e.terminal.portableControl) || e.launchDialect == LaunchFish || e.interpreter == InterpreterFish || e.interpreter == InterpreterZsh {
+	if (e.terminal != nil && e.terminal.portableControl) || e.launchDialect == LaunchFish || e.launchDialect == LaunchCsh || e.interpreter == InterpreterFish || e.interpreter == InterpreterZsh || e.interpreter == InterpreterCsh || e.interpreter == InterpreterTcsh {
 		return e.portableCommand(command)
 	}
 	shellName := "bash"
@@ -86,7 +86,11 @@ func (e *privilegeExchange) command(command string) string {
 		shellName = "sh"
 	}
 	if command == "" {
-		command = "exec " + shellName + " -l"
+		if e.interpreter == InterpreterSh {
+			command = "exec sh"
+		} else {
+			command = "exec " + shellName + " -l"
+		}
 	}
 	e.commandPreview = e.wrapCommandBody("<privileged payload>", "<password-prompt>")
 	return e.wrapCommandBody(e.body(command), e.promptToken)
@@ -98,7 +102,7 @@ func (e *privilegeExchange) wrapCommandBody(body, prompt string) string {
 		shellName = "sh"
 	}
 	if e.mode == SudoModeSu {
-		return "export LC_ALL=C; su - root -c " + shellQuote("exec bash -c "+shellQuote(body))
+		return "export LC_ALL=C; su - root -c " + shellQuote("exec "+shellName+" -c "+shellQuote(body))
 	}
 	prefix := "sudo -S -p "
 	if e.terminal != nil {
@@ -249,19 +253,8 @@ func (w *privilegeFrameWriter) flush() error {
 	return err
 }
 
-func (c *Client) runPrivilegeOperation(ctx context.Context, mode SudoMode, command string, stdin io.Reader, stdout, stderr io.Writer, options ...any) (retErr error) {
-	if ctx == nil || c == nil {
-		return fmt.Errorf("privilege execution requires a client and context")
-	}
-	if mode != SudoModeSudo && mode != SudoModeSu && mode != SudoModeSudoer {
-		return fmt.Errorf("unsupported privilege exchange mode %q", mode)
-	}
-	if err := validateCommandStdin(stdin, c.environment.InputBridge); err != nil {
-		return err
-	}
-	var terminal *privilegeTerminal
-	var cancelOutput context.CancelFunc
-	config := c.defaultRunConfig()
+func (c *Client) parsePrivilegeOperationOptions(options ...any) (terminal *privilegeTerminal, cancelOutput context.CancelFunc, config *RunConfig, preResolved *PrivilegeMaterial) {
+	config = c.defaultPrivilegeRunConfig()
 	for _, opt := range options {
 		switch v := opt.(type) {
 		case *privilegeTerminal:
@@ -275,15 +268,32 @@ func (c *Client) runPrivilegeOperation(ctx context.Context, mode SudoMode, comma
 				copied := *v
 				config = &copied
 			}
+		case *PrivilegeMaterial:
+			preResolved = v
 		}
 	}
+	return terminal, cancelOutput, config, preResolved
+}
+
+func (c *Client) runPrivilegeOperation(ctx context.Context, mode SudoMode, command string, stdin io.Reader, stdout, stderr io.Writer, options ...any) (retErr error) {
+	if ctx == nil || c == nil {
+		return fmt.Errorf("privilege execution requires a client and context")
+	}
+	if mode != SudoModeSudo && mode != SudoModeSu && mode != SudoModeSudoer {
+		return fmt.Errorf("unsupported privilege exchange mode %q", mode)
+	}
+	if err := validateCommandStdin(stdin, c.environment.InputBridge); err != nil {
+		return err
+	}
+	terminal, cancelOutput, config, preResolved := c.parsePrivilegeOperationOptions(options...)
 	if terminal != nil && terminal.activate == nil {
 		return fmt.Errorf("privilege terminal activation is missing")
 	}
 	defer func() { c.observePrivilegeResult(ctx, mode, retErr) }()
 	for attempt := 0; attempt < 3; attempt++ {
 		c.observePrivilege(mode, "attempt_started", 1, attempt+1)
-		err := c.runPrivilegeAttempt(ctx, mode, command, stdin, stdout, stderr, attempt > 0, terminal, config, cancelOutput)
+		err := c.runPrivilegeAttempt(ctx, mode, command, stdin, stdout, stderr, attempt > 0, terminal, config, cancelOutput, preResolved)
+		preResolved = nil
 		if mode != SudoModeSu || !errors.Is(err, errPrivilegeAuthenticationRejected) || credentialRecoveryPrompter(c.prompter) == nil || attempt == 2 {
 			return err
 		}
@@ -292,7 +302,25 @@ func (c *Client) runPrivilegeOperation(ctx context.Context, mode SudoMode, comma
 	return errPrivilegeAuthenticationRejected
 }
 
-func (c *Client) runPrivilegeAttempt(ctx context.Context, mode SudoMode, command string, stdin io.Reader, stdout, stderr io.Writer, force bool, terminal *privilegeTerminal, config *RunConfig, cancelOuterOutput context.CancelFunc) (retErr error) {
+func (c *Client) initPrivilegeAttemptMaterial(ctx context.Context, mode SudoMode, force bool, preResolved ...*PrivilegeMaterial) (*PrivilegeMaterial, error) {
+	if len(preResolved) > 0 && preResolved[0] != nil && !force {
+		return preResolved[0], nil
+	}
+	if mode == SudoModeSudoer || credentialRecoveryPrompter(c.prompter) != nil {
+		return nil, nil
+	}
+	kind := SecretKindSudoPassword
+	if mode == SudoModeSu {
+		kind = SecretKindSuPassword
+	}
+	value, err := c.resolvePrivilegeMaterial(ctx, kind, force)
+	if err != nil {
+		return nil, fmt.Errorf("%s password is required but not provided: %w", mode, err)
+	}
+	return value, nil
+}
+
+func (c *Client) runPrivilegeAttempt(ctx context.Context, mode SudoMode, command string, stdin io.Reader, stdout, stderr io.Writer, force bool, terminal *privilegeTerminal, config *RunConfig, cancelOuterOutput context.CancelFunc, preResolved ...*PrivilegeMaterial) (retErr error) {
 	exchange := newPrivilegeExchange(c, mode, force, config.Interpreter)
 	exchange.launchDialect = config.LaunchDialect
 	exchange.terminal = terminal
@@ -301,17 +329,11 @@ func (c *Client) runPrivilegeAttempt(ctx context.Context, mode SudoMode, command
 		exchange.terminalReady = make(chan struct{})
 	}
 	defer func() { exchange.material.Zero() }()
-	if mode != SudoModeSudoer && credentialRecoveryPrompter(c.prompter) == nil {
-		kind := SecretKindSudoPassword
-		if mode == SudoModeSu {
-			kind = SecretKindSuPassword
-		}
-		value, err := c.resolvePrivilegeMaterial(ctx, kind, force)
-		if err != nil {
-			return fmt.Errorf("%s password is required but not provided: %w", mode, err)
-		}
-		exchange.material = value
+	mat, err := c.initPrivilegeAttemptMaterial(ctx, mode, force, preResolved...)
+	if err != nil {
+		return err
 	}
+	exchange.material = mat
 	session, err := c.newSessionContext(ctx)
 	if err != nil {
 		return err
@@ -421,12 +443,16 @@ func (c *Client) waitPrivilegeExchange(ctx context.Context, cancel, abort contex
 	return
 }
 
-func (c *Client) runPrivilegeWithConfig(ctx context.Context, mode SudoMode, command string, stdin io.Reader, config *RunConfig) (result string, retErr error) {
+func (c *Client) runPrivilegeWithConfig(ctx context.Context, mode SudoMode, command string, stdin io.Reader, config *RunConfig, mat ...*PrivilegeMaterial) (result string, retErr error) {
 	if ctx == nil || c == nil {
 		return "", fmt.Errorf("privilege execution requires a client and context")
 	}
 	if config == nil {
-		config = c.defaultRunConfig()
+		config = c.defaultPrivilegeRunConfig()
+	}
+	var preResolved *PrivilegeMaterial
+	if len(mat) > 0 {
+		preResolved = mat[0]
 	}
 	// This operation owns bindings across pre-command authentication retries.
 	// Abort cancels them before joining SSH workers; normal completion flushes first.
@@ -438,7 +464,7 @@ func (c *Client) runPrivilegeWithConfig(ctx context.Context, mode SudoMode, comm
 	}
 	defer func() { retErr = errors.Join(retErr, closeOutput()) }()
 	output := newOutputWriter(bound)
-	err = c.runPrivilegeOperation(ctx, mode, command, stdin, output, output, config, cancelOutput)
+	err = c.runPrivilegeOperation(ctx, mode, command, stdin, output, output, config, cancelOutput, preResolved)
 	return output.String(), err
 }
 

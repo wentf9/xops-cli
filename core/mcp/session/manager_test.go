@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/wentf9/xops-cli/core/mcp/ports"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"go.uber.org/goleak"
 )
 
@@ -1465,5 +1466,251 @@ func TestSIGTERMAndSIGKILLBypassBlockedPayloadWrite(t *testing.T) {
 	killPTY.eventsMu.Unlock()
 	if len(killEvents) != 3 || killEvents[0] != "signal:SIGTERM" || killEvents[1] != "signal:SIGKILL" || killEvents[2] != "write-closed" {
 		t.Fatalf("expected events [signal:SIGTERM signal:SIGKILL write-closed], got %v", killEvents)
+	}
+}
+
+func TestManagerFishAndCshPersistentSessions(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	mgr, shutdown := newTestManager(t)
+	defer shutdown()
+
+	for _, tc := range []struct {
+		name       string
+		dialect    ssh.LaunchDialect
+		initSubstr string
+		statusVar  string
+		cwd        string
+		wantCd     string
+	}{
+		{
+			name:       "fish",
+			dialect:    ssh.LaunchFish,
+			initSubstr: "function fish_prompt; end",
+			statusVar:  "$status",
+			cwd:        `/tmp/a'b\c`,
+			wantCd:     `cd -- '/tmp/a\'b\\c'`,
+		},
+		{
+			name:       "csh",
+			dialect:    ssh.LaunchCsh,
+			initSubstr: "unset edit; set prompt=''; set prompt2=''; set rprompt='';",
+			statusVar:  "\"$status\"",
+			cwd:        "/tmp/dir'bang!",
+			wantCd:     `cd -- '/tmp/dir'\''bang\!'`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var lines []string
+			var linesMu sync.Mutex
+			dial := func(context.Context) (ports.PTYSession, error) {
+				return newFakePTY(func(in io.Reader, out io.Writer, _ <-chan string) {
+					scanner := bufio.NewScanner(in)
+					for scanner.Scan() {
+						line := scanner.Text()
+						linesMu.Lock()
+						lines = append(lines, line)
+						linesMu.Unlock()
+						if tok, ok := sentinelToken(line); ok {
+							_, _ = fmt.Fprintf(out, "ok\n___MCP_DONE_%s_0___\n", tok)
+						}
+					}
+				}), nil
+			}
+			res, err := mgr.Execute(context.Background(), ExecuteRequest{
+				Key:        Key{Scope: "stdio", NodeID: "n1", SessionName: tc.name},
+				Generation: "gen-" + tc.name,
+				Dialect:    tc.dialect,
+				Dial:       dial,
+				Command:    "echo ok",
+				Cwd:        tc.cwd,
+			})
+			if err != nil || res.State != StateCompleted || res.ExitCode == nil || *res.ExitCode != 0 || res.Output != "ok" {
+				t.Fatalf("unexpected result for %s: res=%+v err=%v", tc.name, res, err)
+			}
+			linesMu.Lock()
+			recorded := strings.Join(lines, "\n")
+			linesMu.Unlock()
+			if !strings.Contains(recorded, tc.initSubstr) || !strings.Contains(recorded, tc.wantCd) || !strings.Contains(recorded, tc.statusVar) {
+				t.Fatalf("dialect %s session lines missing expected fragments:\n%s", tc.name, recorded)
+			}
+		})
+	}
+}
+
+func TestCleanTerminalOutputStripsEchoedSentinelCmd(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{
+			name: "echoed posix sentinel with prompt",
+			raw:  "hello world\r\nroot@freebsd:~ # printf '\\n%s%s_%d___\\n' '___MCP_' 'DONE_abcdef123456' \"$?\"\r\n",
+			want: "hello world",
+		},
+		{
+			name: "echoed fish sentinel",
+			raw:  "data\nprintf '\\n%s%s_%d___\\n' '___MCP_' 'DONE_123456789abc' $status\n",
+			want: "data",
+		},
+		{
+			name: "echoed csh sentinel with prompt",
+			raw:  "test\nuser@host> printf '\\n%s%s_%d___\\n' '___MCP_' 'DONE_deadbeef0011' \"$status\"\n",
+			want: "test",
+		},
+		{
+			name: "echoed sentinel standalone",
+			raw:  "printf '\\n%s%s_%d___\\n' '___MCP_' 'DONE_0123456789ab' \"$?\"\n",
+			want: "",
+		},
+		{
+			name: "multiple echoed sentinels interleaved",
+			raw:  "out1\nprintf '\\n%s%s_%d___\\n' '___MCP_' 'DONE_111111111111' \"$?\"\nout2\nprintf '\\n%s%s_%d___\\n' '___MCP_' 'DONE_222222222222' $status\n",
+			want: "out1\nout2",
+		},
+		{
+			name: "user printf not stripped",
+			raw:  "printf 'hello %s' world\n",
+			want: "printf 'hello %s' world",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := cleanTerminalOutput(tc.raw); got != tc.want {
+				t.Fatalf("cleanTerminalOutput mismatch:\ngot:  %q\nwant: %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSessionInitCommandDialects(t *testing.T) {
+	posix := sessionInitCommand(ssh.LaunchPOSIX)
+	for _, expected := range []string{
+		"set +o emacs 2>/dev/null",
+		"set +o vi 2>/dev/null",
+		"unsetopt zle PROMPT_SP 2>/dev/null",
+		"PS1=''; PS2=''; PROMPT=''; PROMPT2=''",
+		"stty -echo noflsh 2>/dev/null",
+		"export TERM=dumb NO_COLOR=1 DEBIAN_FRONTEND=noninteractive GIT_TERMINAL_PROMPT=0 CI=true",
+	} {
+		if !strings.Contains(posix, expected) {
+			t.Errorf("posix init command missing %q; got: %q", expected, posix)
+		}
+	}
+
+	csh := sessionInitCommand(ssh.LaunchCsh)
+	for _, expected := range []string{
+		"unset edit",
+		"set prompt=''",
+		"set prompt2=''",
+		"set rprompt=''",
+		"stty -echo noflsh >& /dev/null",
+		"setenv TERM dumb",
+	} {
+		if !strings.Contains(csh, expected) {
+			t.Errorf("csh init command missing %q; got: %q", expected, csh)
+		}
+	}
+
+	fish := sessionInitCommand(ssh.LaunchFish)
+	for _, expected := range []string{
+		"stty -echo noflsh 2>/dev/null",
+		"function fish_prompt; end",
+		"set -gx TERM dumb",
+	} {
+		if !strings.Contains(fish, expected) {
+			t.Errorf("fish init command missing %q; got: %q", expected, fish)
+		}
+	}
+}
+
+func TestSendSignalActiveVsIdleWindow(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	mgr, shutdown := newTestManager(t)
+	defer shutdown()
+
+	// 1. Idle session signal completes quickly via settleIdleSignal (100ms)
+	idleKey := Key{Scope: "stdio", NodeID: "n1", SessionName: "idle-sig"}
+	dialIdle := func(context.Context) (ports.PTYSession, error) {
+		return newFakePTY(func(in io.Reader, out io.Writer, _ <-chan string) {
+			scanner := bufio.NewScanner(in)
+			for scanner.Scan() {
+				line := scanner.Text()
+				if tok, ok := sentinelToken(line); ok {
+					_, _ = fmt.Fprintf(out, "ready\n___MCP_DONE_%s_0___\n", tok)
+				}
+			}
+		}), nil
+	}
+	// Initial command to establish session
+	initRes, err := mgr.Execute(context.Background(), ExecuteRequest{
+		Key:     idleKey,
+		Dial:    dialIdle,
+		Command: "echo ready",
+	})
+	if err != nil || initRes.State != StateCompleted {
+		t.Fatalf("expected completed init, got res=%+v err=%v", initRes, err)
+	}
+
+	start := time.Now()
+	sigRes, err := mgr.Execute(context.Background(), ExecuteRequest{
+		Key:     idleKey,
+		Dial:    dialIdle,
+		Command: "SIGINT",
+	})
+	elapsed := time.Since(start)
+	if err != nil || sigRes.State != StateIdle {
+		t.Fatalf("expected idle SIGINT to return StateIdle, got res=%+v err=%v", sigRes, err)
+	}
+	if elapsed > 1500*time.Millisecond {
+		t.Fatalf("idle SIGINT took too long: %v (expected ~100ms)", elapsed)
+	}
+
+	// 2. Active command signal waits for sentinel and completes
+	activeKey := Key{Scope: "stdio", NodeID: "n1", SessionName: "active-sig"}
+	sigCh := make(chan string, 1)
+	dialActive := func(context.Context) (ports.PTYSession, error) {
+		return newFakePTY(func(in io.Reader, out io.Writer, sigs <-chan string) {
+			var activeToken string
+			scanner := bufio.NewScanner(in)
+			for scanner.Scan() {
+				line := scanner.Text()
+				if tok, ok := sentinelToken(line); ok {
+					activeToken = tok
+					// Don't respond yet, wait for signal
+					select {
+					case s := <-sigs:
+						sigCh <- s
+						// Exit with code 130 on SIGINT after short delay
+						time.Sleep(50 * time.Millisecond)
+						_, _ = fmt.Fprintf(out, "\n___MCP_DONE_%s_130___\n", activeToken)
+					case <-time.After(5 * time.Second):
+					}
+				}
+			}
+		}), nil
+	}
+
+	// Run long-running command with short timeout so it enters StateRunning
+	runRes, err := mgr.Execute(context.Background(), ExecuteRequest{
+		Key:     activeKey,
+		Dial:    dialActive,
+		Command: "sleep 10",
+		Timeout: 20 * time.Millisecond,
+	})
+	if err != nil || runRes.State != StateRunning {
+		t.Fatalf("expected StateRunning, got res=%+v err=%v", runRes, err)
+	}
+
+	// Send SIGINT to active session
+	sigActiveRes, err := mgr.Execute(context.Background(), ExecuteRequest{
+		Key:     activeKey,
+		Dial:    dialActive,
+		Command: "SIGINT",
+	})
+	if err != nil || sigActiveRes.State != StateCompleted {
+		t.Fatalf("expected StateCompleted after active SIGINT, got res=%+v err=%v", sigActiveRes, err)
+	}
+	if sigActiveRes.ExitCode == nil || *sigActiveRes.ExitCode != 130 {
+		t.Fatalf("expected exit code 130, got %v", sigActiveRes.ExitCode)
 	}
 }

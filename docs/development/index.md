@@ -33,6 +33,7 @@ golangci-lint run ./...
 - [公共代码与 MCP 接口解耦设计](./shared-core-decoupling)
 - [MCP Streamable HTTP 与文件流转发设计](./mcp-http-transfer-design.md)
 - [MCP 极简全能型工具架构重构设计](./mcp-minimal-tools-design.md)
+- [基于 FreeBSD 实机验证的 MCP 改进方案](./mcp-freebsd-validation-plan.md)
 - [离线凭据库兼容性](./compatibility.md)
 - [凭据零配置体验设计](./credential-experience-design)
 - [凭据体验实施计划](./credential-experience-plan)
