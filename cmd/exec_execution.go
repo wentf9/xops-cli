@@ -36,6 +36,15 @@ func (o *execExecutionOptions) capturePresence(cmd *cobra.Command) {
 
 func (o execExecutionOptions) enabled() bool { return o.interpreterSet || o.dialectSet || o.loginSet }
 
+func isSupportedScriptInterpreter(interp ssh.Interpreter) bool {
+	switch interp {
+	case "", ssh.InterpreterBash, ssh.InterpreterSh, ssh.InterpreterZsh, ssh.InterpreterFish, ssh.InterpreterCsh, ssh.InterpreterTcsh:
+		return true
+	default:
+		return false
+	}
+}
+
 func (o *ExecOptions) prepareCommandPlan() error {
 	if !o.execution.enabled() {
 		return nil
@@ -46,8 +55,8 @@ func (o *ExecOptions) prepareCommandPlan() error {
 		if err != nil {
 			return err
 		}
-		if execution.Interpreter != "" && execution.Interpreter != ssh.InterpreterBash && execution.Interpreter != ssh.InterpreterSh && execution.Interpreter != ssh.InterpreterZsh && execution.Interpreter != ssh.InterpreterFish {
-			return fmt.Errorf("%w: scripts require bash, sh, zsh or fish", ssh.ErrExecutionValidation)
+		if !isSupportedScriptInterpreter(execution.Interpreter) {
+			return fmt.Errorf("%w: scripts require bash, sh, zsh, fish, csh or tcsh", ssh.ErrExecutionValidation)
 		}
 		// Full resolution needs the actual script and the target node. Do not
 		// turn an absent interpreter/dialect into an explicit server/unknown.

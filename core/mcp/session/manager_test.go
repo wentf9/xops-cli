@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/wentf9/xops-cli/core/mcp/ports"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"go.uber.org/goleak"
 )
 
@@ -1465,5 +1466,73 @@ func TestSIGTERMAndSIGKILLBypassBlockedPayloadWrite(t *testing.T) {
 	killPTY.eventsMu.Unlock()
 	if len(killEvents) != 3 || killEvents[0] != "signal:SIGTERM" || killEvents[1] != "signal:SIGKILL" || killEvents[2] != "write-closed" {
 		t.Fatalf("expected events [signal:SIGTERM signal:SIGKILL write-closed], got %v", killEvents)
+	}
+}
+
+func TestManagerFishAndCshPersistentSessions(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	mgr, shutdown := newTestManager(t)
+	defer shutdown()
+
+	for _, tc := range []struct {
+		name       string
+		dialect    ssh.LaunchDialect
+		initSubstr string
+		statusVar  string
+		cwd        string
+		wantCd     string
+	}{
+		{
+			name:       "fish",
+			dialect:    ssh.LaunchFish,
+			initSubstr: "function fish_prompt; end",
+			statusVar:  "$status",
+			cwd:        `/tmp/a'b\c`,
+			wantCd:     `cd -- '/tmp/a\'b\\c'`,
+		},
+		{
+			name:       "csh",
+			dialect:    ssh.LaunchCsh,
+			initSubstr: "set prompt=''; set rprompt=''; setenv TERM dumb",
+			statusVar:  "\"$status\"",
+			cwd:        "/tmp/dir'bang!",
+			wantCd:     `cd -- '/tmp/dir'\''bang\!'`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var lines []string
+			var linesMu sync.Mutex
+			dial := func(context.Context) (ports.PTYSession, error) {
+				return newFakePTY(func(in io.Reader, out io.Writer, _ <-chan string) {
+					scanner := bufio.NewScanner(in)
+					for scanner.Scan() {
+						line := scanner.Text()
+						linesMu.Lock()
+						lines = append(lines, line)
+						linesMu.Unlock()
+						if tok, ok := sentinelToken(line); ok {
+							_, _ = fmt.Fprintf(out, "ok\n___MCP_DONE_%s_0___\n", tok)
+						}
+					}
+				}), nil
+			}
+			res, err := mgr.Execute(context.Background(), ExecuteRequest{
+				Key:        Key{Scope: "stdio", NodeID: "n1", SessionName: tc.name},
+				Generation: "gen-" + tc.name,
+				Dialect:    tc.dialect,
+				Dial:       dial,
+				Command:    "echo ok",
+				Cwd:        tc.cwd,
+			})
+			if err != nil || res.State != StateCompleted || res.ExitCode == nil || *res.ExitCode != 0 || res.Output != "ok" {
+				t.Fatalf("unexpected result for %s: res=%+v err=%v", tc.name, res, err)
+			}
+			linesMu.Lock()
+			recorded := strings.Join(lines, "\n")
+			linesMu.Unlock()
+			if !strings.Contains(recorded, tc.initSubstr) || !strings.Contains(recorded, tc.wantCd) || !strings.Contains(recorded, tc.statusVar) {
+				t.Fatalf("dialect %s session lines missing expected fragments:\n%s", tc.name, recorded)
+			}
+		})
 	}
 }

@@ -676,7 +676,7 @@ func (o *ExecOptions) dispatchTaskExecution(ctx context.Context, client *ssh.Cli
 // zsh/fish login modes unless the caller explicitly selects --no-login.
 func (o *ExecOptions) commandRunOptions(execution *ssh.ExecutionConfig, outputOpts []ssh.RunOption) []ssh.RunOption {
 	var options []ssh.RunOption
-	portable := execution != nil && (execution.Interpreter == ssh.InterpreterZsh || execution.Interpreter == ssh.InterpreterFish || execution.LaunchDialect == ssh.LaunchFish)
+	portable := execution != nil && (execution.Interpreter == ssh.InterpreterZsh || execution.Interpreter == ssh.InterpreterFish || execution.Interpreter == ssh.InterpreterCsh || execution.Interpreter == ssh.InterpreterTcsh || execution.LaunchDialect == ssh.LaunchFish || execution.LaunchDialect == ssh.LaunchCsh)
 	if !portable || o.execution.noLoginSet || o.NoLoginShell {
 		options = append(options, ssh.WithLoginShell(!o.NoLoginShell))
 	}

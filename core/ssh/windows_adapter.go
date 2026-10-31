@@ -63,8 +63,8 @@ func powershellCommandPayload(command string, dialect LaunchDialect) (string, er
 
 // pwshCommandPayload builds the payload for PowerShell Core (pwsh).
 func pwshCommandPayload(command string, dialect LaunchDialect) (string, error) {
-	if dialect != LaunchCmd && dialect != LaunchPowerShell && dialect != LaunchPOSIX && dialect != LaunchFish {
-		return "", fmt.Errorf("pwsh interpreter requires cmd, powershell, posix, or fish launch dialect, got %q", dialect)
+	if dialect != LaunchCmd && dialect != LaunchPowerShell && dialect != LaunchPOSIX && dialect != LaunchFish && dialect != LaunchCsh {
+		return "", fmt.Errorf("pwsh interpreter requires cmd, powershell, posix, fish, or csh launch dialect, got %q", dialect)
 	}
 
 	encoded := encodePowerShellCommand(wrapPowerShellCommand(command))
@@ -74,7 +74,7 @@ func pwshCommandPayload(command string, dialect LaunchDialect) (string, error) {
 		payload = "pwsh.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + encoded
 	case LaunchPowerShell:
 		payload = "& pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + encoded + "; exit $LASTEXITCODE"
-	case LaunchPOSIX, LaunchFish:
+	case LaunchPOSIX, LaunchFish, LaunchCsh:
 		payload = "pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + encoded
 	}
 

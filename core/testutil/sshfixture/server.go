@@ -468,7 +468,9 @@ func (s *Server) defaultShell(channel ssh.Channel, requests <-chan *ssh.Request)
 var sentinelTokenPattern = regexp.MustCompile(`'DONE_([0-9a-f]+)'`)
 
 func (s *Server) execShellStmt(channel ssh.Channel, stmt string, cwd *string, env map[string]string, lastExit *int) bool {
-	if stmt == "" || strings.HasPrefix(stmt, "stty ") || strings.HasPrefix(stmt, "PS1=") {
+	if stmt == "" || strings.HasPrefix(stmt, "stty ") || strings.HasPrefix(stmt, "PS1=") ||
+		strings.HasPrefix(stmt, "function fish_") || stmt == "end" ||
+		strings.HasPrefix(stmt, "set ") || strings.HasPrefix(stmt, "setenv ") {
 		return false
 	}
 	if stmt == "exit" {

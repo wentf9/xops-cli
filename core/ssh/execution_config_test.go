@@ -122,7 +122,7 @@ func TestExecutionConfig_YAMLRejections(t *testing.T) {
 		{
 			name:    "bash with cmd dialect",
 			input:   "interpreter: bash\nlaunch_dialect: cmd\n",
-			wantErr: "bash interpreter requires posix or fish launch dialect",
+			wantErr: "bash interpreter requires posix, fish, or csh launch dialect",
 		},
 	}
 

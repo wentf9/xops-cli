@@ -78,7 +78,7 @@ func (e *privilegeExchange) started() bool {
 }
 func shellQuote(value string) string { return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'" }
 func (e *privilegeExchange) command(command string) string {
-	if (e.terminal != nil && e.terminal.portableControl) || e.launchDialect == LaunchFish || e.interpreter == InterpreterFish || e.interpreter == InterpreterZsh {
+	if (e.terminal != nil && e.terminal.portableControl) || e.launchDialect == LaunchFish || e.launchDialect == LaunchCsh || e.interpreter == InterpreterFish || e.interpreter == InterpreterZsh || e.interpreter == InterpreterCsh || e.interpreter == InterpreterTcsh {
 		return e.portableCommand(command)
 	}
 	shellName := "bash"

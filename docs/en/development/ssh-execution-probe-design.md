@@ -25,8 +25,8 @@ Relying entirely on manual configuration of `interpreter` and `launch_dialect` i
 
 | In Scope | Not Promised |
 | :--- | :--- |
-| Automatic identification of remote SSH server outer launch dialect (`posix`, `fish`, `cmd`, `powershell`) | Inferring full environment capabilities solely from SSH Banner, `$SHELL`, or a single `uname` call |
-| Automatic enumeration of installed interpreters on the target node (`bash`, `sh`, `zsh`, `fish`, `powershell`, `pwsh`, `cmd`) | Translating arbitrary cross-platform syntax (e.g. translating POSIX pipelines to PowerShell) |
+| Automatic identification of remote SSH server outer launch dialect (`posix`, `fish`, `csh`, `cmd`, `powershell`) | Inferring full environment capabilities solely from SSH Banner, `$SHELL`, or a single `uname` call |
+| Automatic enumeration of installed interpreters on the target node (`bash`, `sh`, `zsh`, `fish`, `csh`, `tcsh`, `powershell`, `pwsh`, `cmd`) | Translating arbitrary cross-platform syntax (e.g. translating POSIX pipelines to PowerShell) |
 | Automatic probing on initial node enrollment with atomic persistence to Schema V2 config | Automatically switching interpreters to retry user commands after failure |
 | Connection-level session memory caching and controlled runtime on-demand lazy probing | Probing without network timeouts, blocking indefinitely |
 | Read-only, side-effect-free, and MOTD/banner-noise-resilient probing lifecycle | Allowing probes to create temporary remote files or leave orphan processes |
@@ -75,7 +75,7 @@ Targets the critical lifecycle event when a node is added for the first time:
   - Running a Playbook `ensure` inspection step (requires a controlled shell for exit status capture).
   - Executing an SFTP `exec` with a non-empty `cwd`.
 - Successfully probed configurations are cached in process memory only, without modifying static configuration files on disk.
-- Explicit interpreters (including `server`), known dialects, and explicit login options are never overridden by lazy probing. `script`/`ensure` supports bash/sh/zsh/fish with a posix/fish outer dialect; fish ensure reports check status through a native exit event.
+- Explicit interpreters (including `server`), known dialects, and explicit login options are never overridden by lazy probing. `script` supports `bash`/`sh`/`zsh`/`fish`/`csh`/`tcsh` and `ensure` supports `bash`/`sh`/`zsh`/`fish` (falling back to an available `bash`/`sh`/`zsh`/`fish` under a `csh` outer dialect) with a `posix`/`fish`/`csh` outer dialect; fish ensure reports check status through a native exit event.
 
 ### 2.4 Level 4: Connection-Level Session Cache
 - Clients share concurrent-safe probe state across pooled wrapper instances.

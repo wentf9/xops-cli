@@ -87,6 +87,9 @@ func TestProbeExecutionConfigDialects(t *testing.T) {
 		{"Linux", "", probePOSIX, "__XOPS_DIALECT_POSIX__:Linux:/bin/bash\n", "bash\nsh\npwsh", LaunchPOSIX, InterpreterBash, 2},
 		{"fish outer shell", "", probeFish, "__XOPS_DIALECT_FISH__:4.9.3\n__XOPS_FISH_OS__:Linux\n__XOPS_FISH_SHELL__:/usr/bin/fish\n", "bash\nsh\nfish", LaunchFish, InterpreterFish, 5},
 		{"fish only", "", probeFish, "__XOPS_DIALECT_FISH__:3.6.0\n__XOPS_FISH_OS__:Darwin\n__XOPS_FISH_SHELL__:\n", "fish", LaunchFish, InterpreterFish, 5},
+		{"csh outer shell", "", probeCsh, "__XOPS_DIALECT_CSH__:FreeBSD:/bin/csh\n", "sh\ncsh\ntcsh", LaunchCsh, InterpreterCsh, 6},
+		{"csh fallback UNAME_FAIL", "", probeCsh, "__XOPS_DIALECT_CSH__:UNAME_FAIL:/bin/csh\n", "sh\ncsh\ntcsh", LaunchCsh, InterpreterCsh, 6},
+		{"tcsh outer shell", "", probeCsh, "__XOPS_DIALECT_CSH__:FreeBSD:/bin/tcsh\n", "sh\ncsh\ntcsh", LaunchCsh, InterpreterTcsh, 6},
 		{"zsh default shell", "", probePOSIX, "__XOPS_DIALECT_POSIX__:Darwin:/bin/zsh\n", "bash\nsh\nzsh", LaunchPOSIX, InterpreterZsh, 2},
 		{"zsh only", "", probePOSIX, "__XOPS_DIALECT_POSIX__:Linux:/usr/bin/zsh\n", "zsh", LaunchPOSIX, InterpreterZsh, 2},
 		{"Alpine ash", "", probePOSIX, "__XOPS_DIALECT_POSIX__:Linux:/bin/ash\n", "sh", LaunchPOSIX, InterpreterSh, 2},
@@ -186,7 +189,7 @@ func TestProbeExecutionConfigFailureCache(t *testing.T) {
 					t.Fatalf("result = %+v, err = %v", result, err)
 				}
 			}
-			if server.Executed.Load() != 4 {
+			if server.Executed.Load() != 5 {
 				t.Fatalf("failed probe repeated: %d requests", server.Executed.Load())
 			}
 		})
@@ -425,7 +428,7 @@ func TestProbeConnectionCachesAreIndependent(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if attempts.Load() != 8 {
+	if attempts.Load() != 10 {
 		t.Fatal("new connection reused an earlier connection's failed cache")
 	}
 }

@@ -38,6 +38,16 @@ type TerminalInput struct {
 	Execution *ssh.ExecutionConfig `json:"execution,omitempty" jsonschema:"Optional execution configuration overriding node/global defaults (once mode only); supports fish and zsh. Unspecified environments are probed when the backend supports discovery; explicit server preserves passthrough."`
 }
 
+func (in TerminalInput) Validate() error {
+	if isPersistentSession(in.Session) && (in.Sudo || in.Execution != nil) {
+		return errors.New("sudo and execution are supported only with session='once'; run sudo inside the persistent shell instead")
+	}
+	if !isPersistentSession(in.Session) && strings.TrimSpace(in.Command) == "" {
+		return errors.New("cmd is required for once session mode")
+	}
+	return nil
+}
+
 type TerminalOutput struct {
 	Output     string  `json:"output" jsonschema:"Command stdout/stderr (folded when verbose)"`
 	Status     string  `json:"status" jsonschema:"Operation status: success, running, or failed"`
@@ -150,12 +160,16 @@ func (r *Runtime) terminalSessionHandler(ctx context.Context, input TerminalInpu
 	if err != nil {
 		return nil, TerminalOutput{}, err
 	}
-	// Completion detection relies on POSIX "$?" and printf.
-	if target.Execution != nil {
-		switch target.Execution.LaunchDialect {
-		case ssh.LaunchFish, ssh.LaunchPowerShell, ssh.LaunchCmd:
-			return nil, TerminalOutput{}, fmt.Errorf("persistent sessions require a POSIX login shell; node %s uses %s (use session='once')", nodeID, target.Execution.LaunchDialect)
-		}
+	var dialect ssh.LaunchDialect
+	if target.Execution != nil && target.Execution.LaunchDialect != "" {
+		dialect = target.Execution.LaunchDialect
+	}
+	if op.execution != nil && op.execution.LaunchDialect != "" && op.execution.LaunchDialect != ssh.LaunchUnknown {
+		dialect = op.execution.LaunchDialect
+	}
+	switch dialect {
+	case ssh.LaunchPowerShell, ssh.LaunchCmd:
+		return nil, TerminalOutput{}, fmt.Errorf("persistent sessions require a Unix login shell (posix, fish, or csh); node %s uses %s (use session='once')", nodeID, dialect)
 	}
 
 	var timeout time.Duration
@@ -170,6 +184,7 @@ func (r *Runtime) terminalSessionHandler(ctx context.Context, input TerminalInpu
 	res, err := r.sessions.Execute(ctx, session.ExecuteRequest{
 		Key:        session.Key{Scope: r.scope(ctx), NodeID: nodeID, SessionName: input.Session},
 		Generation: generation,
+		Dialect:    dialect,
 		Dial: func(dialCtx context.Context) (ports.PTYSession, error) {
 			return ptyBackend.OpenPTY(dialCtx, op.permit, nodeID)
 		},

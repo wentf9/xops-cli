@@ -107,7 +107,7 @@ func TestLazyProbeFailureNeverExecutesOrRetriesUserWork(t *testing.T) {
 			t.Fatalf("failed probe authorized user work: %+v", result)
 		}
 	}
-	if server.Executed.Load() != 4 {
+	if server.Executed.Load() != 5 {
 		t.Fatal("failed probe was repeated or user work was sent")
 	}
 }
@@ -165,6 +165,42 @@ func TestEnsureAdaptersWithFishOuterShell(t *testing.T) {
 		if err != nil || resolved.Interpreter != interpreter || resolved.LaunchDialect != ssh.LaunchFish {
 			t.Fatalf("adapter %s rejected for fish outer shell: %+v, %v", interpreter, resolved, err)
 		}
+	}
+}
+
+func TestEnsureAdaptersWithCshOuterShell(t *testing.T) {
+	engine := &Engine{}
+	for _, interpreter := range []ssh.Interpreter{ssh.InterpreterBash, ssh.InterpreterSh, ssh.InterpreterZsh, ssh.InterpreterFish} {
+		cfg := &ssh.ExecutionConfig{Interpreter: interpreter, LaunchDialect: ssh.LaunchCsh}
+		resolved, err := engine.resolveEnsureExecution(t.Context(), nil, cfg, models.Node{})
+		if err != nil || resolved.Interpreter != interpreter || resolved.LaunchDialect != ssh.LaunchCsh {
+			t.Fatalf("adapter %s rejected for csh outer shell: %+v, %v", interpreter, resolved, err)
+		}
+	}
+	for _, interpreter := range []ssh.Interpreter{ssh.InterpreterCsh, ssh.InterpreterTcsh} {
+		cfg := &ssh.ExecutionConfig{Interpreter: interpreter, LaunchDialect: ssh.LaunchCsh}
+		if _, err := engine.resolveEnsureExecution(t.Context(), nil, cfg, models.Node{}); !errors.Is(err, ssh.ErrExecutionValidation) {
+			t.Fatalf("expected ErrExecutionValidation for explicit %s ensure adapter, got %v", interpreter, err)
+		}
+	}
+	client, _ := executionTestClient(t, func(command string, ch cryptoSSH.Channel) {
+		switch {
+		case strings.Contains(command, "__XOPS_DIALECT_POSIX__"),
+			strings.HasPrefix(command, "echo __XOPS_DIALECT_CMD__:"),
+			strings.Contains(command, "__XOPS_DIALECT_POWERSHELL__"),
+			strings.Contains(command, "__XOPS_DIALECT_FISH__"):
+			writeLazyResult(t, ch, "syntax error\n", 1)
+		case strings.Contains(command, "__XOPS_DIALECT_CSH__"):
+			writeLazyResult(t, ch, "__XOPS_DIALECT_CSH__:FreeBSD:/bin/tcsh\n", 0)
+		case strings.Contains(command, "__XOPS_INTERP__"):
+			writeLazyResult(t, ch, "__XOPS_INTERP__:tcsh\n__XOPS_INTERP__:csh\n__XOPS_INTERP__:sh\n__XOPS_INTERP_END__\n", 0)
+		default:
+			writeLazyResult(t, ch, "", 0)
+		}
+	})
+	resolved, err := engine.resolveEnsureExecution(t.Context(), client, nil, models.Node{})
+	if err != nil || resolved.Interpreter != ssh.InterpreterSh || resolved.LaunchDialect != ssh.LaunchCsh {
+		t.Fatalf("expected ensure on csh node to fall back to sh under csh dialect, got %+v, err=%v", resolved, err)
 	}
 }
 

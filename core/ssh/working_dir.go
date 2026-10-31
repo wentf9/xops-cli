@@ -30,6 +30,11 @@ func FormatWorkingDirCommand(cwd, command string, execution *ExecutionConfig) (s
 		// trailing comments, while preserving the program's exit status.
 		return "cd -- " + fishQuote(cwd) + "; and begin\n" + command + "\nend", nil
 
+	case InterpreterCsh, InterpreterTcsh:
+		// Exit the csh/tcsh invocation immediately on cd failure before any
+		// subsequent statement or line runs, retaining the user program's exit status.
+		return "cd -- " + cshQuote(cwd) + " || exit $status\n" + command, nil
+
 	case InterpreterCmd:
 		cwd = NormalizeWindowsSFTPWorkingDir(cwd)
 		if strings.ContainsAny(cwd, "%!^\r\n\"\x00") {

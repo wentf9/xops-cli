@@ -26,6 +26,48 @@ func (e *Engine) resolveRuntimeScriptExecution(ctx context.Context, client *ssh.
 	return ssh.ResolveScriptExecution(step, settings, node, global, content)
 }
 
+func hasExplicitInterpreter(layers ...*ssh.ExecutionConfig) bool {
+	for _, layer := range layers {
+		if layer != nil && layer.Interpreter != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func fallbackEnsureInterpreter(client *ssh.Client, effective *ssh.ExecutionConfig) *ssh.ExecutionConfig {
+	cached, ok := client.CachedExecutionProbe()
+	if !ok || cached == nil {
+		return effective
+	}
+	for _, candidate := range []ssh.Interpreter{ssh.InterpreterBash, ssh.InterpreterSh, ssh.InterpreterZsh, ssh.InterpreterFish} {
+		for _, avail := range cached.AvailableInterpreters {
+			if avail == candidate {
+				cloned := effective.Clone()
+				cloned.Interpreter = candidate
+				login := false
+				cloned.Login = &login
+				return cloned
+			}
+		}
+	}
+	return effective
+}
+
+func isEnsureCompatible(effective *ssh.ExecutionConfig) bool {
+	switch effective.LaunchDialect {
+	case ssh.LaunchPOSIX, ssh.LaunchFish, ssh.LaunchCsh:
+	default:
+		return false
+	}
+	switch effective.Interpreter {
+	case ssh.InterpreterBash, ssh.InterpreterSh, ssh.InterpreterZsh, ssh.InterpreterFish:
+		return true
+	default:
+		return false
+	}
+}
+
 func (e *Engine) resolveEnsureExecution(ctx context.Context, client *ssh.Client, step *ssh.ExecutionConfig, node models.Node) (*ssh.ExecutionConfig, error) {
 	var settings *ssh.ExecutionConfig
 	if e.pb != nil {
@@ -42,8 +84,11 @@ func (e *Engine) resolveEnsureExecution(ctx context.Context, client *ssh.Client,
 	if effective.EffectiveInterpreter() == ssh.InterpreterServer {
 		return nil, fmt.Errorf("ensure check unsupported with server interpreter: cannot verify check result origin without controlled shell adapter")
 	}
-	if (effective.LaunchDialect != ssh.LaunchPOSIX && effective.LaunchDialect != ssh.LaunchFish) || (effective.Interpreter != ssh.InterpreterBash && effective.Interpreter != ssh.InterpreterSh && effective.Interpreter != ssh.InterpreterZsh && effective.Interpreter != ssh.InterpreterFish) {
-		return nil, fmt.Errorf("%w: ensure requires a bash, sh, zsh or fish adapter with a posix or fish launch dialect", ssh.ErrExecutionValidation)
+	if !hasExplicitInterpreter(step, settings, node.Execution, e.globalExecution()) && (effective.Interpreter == ssh.InterpreterCsh || effective.Interpreter == ssh.InterpreterTcsh) {
+		effective = fallbackEnsureInterpreter(client, effective)
+	}
+	if !isEnsureCompatible(effective) {
+		return nil, fmt.Errorf("%w: ensure requires a bash, sh, zsh or fish adapter with a posix, fish, or csh launch dialect", ssh.ErrExecutionValidation)
 	}
 	return effective, nil
 }
