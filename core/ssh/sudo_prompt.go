@@ -3,12 +3,15 @@ package ssh
 import "bytes"
 
 const sudoRSPromptPrefix = "[sudo: "
-const sudoRSPromptSuffix = "] Password:"
+const maxSudoRSPromptSuffixBytes = 64
+
+var fullWidthColon = []byte("\xef\xbc\x9a")
 
 // sudo-rs treats -p as the label inside its PAM prompt. Wait for the entire
 // envelope before answering; otherwise a fragmented suffix leaks to the user.
 // The colon completes the prompt: PAM may omit trailing whitespace. Optional
 // spaces, including those in a later packet, are consumed with the feedback.
+// Localized prompts may end in English colon ':' or full-width colon '：' (\xef\xbc\x9a).
 // Other sudo implementations emit only the supplied random marker.
 func expandSudoPrompt(data []byte, match []int) []int {
 	start, end := match[0], match[1]
@@ -16,11 +19,51 @@ func expandSudoPrompt(data []byte, match []int) []int {
 		return match
 	}
 	suffix := data[end:]
-	if len(suffix) < len(sudoRSPromptSuffix) && bytes.HasPrefix([]byte(sudoRSPromptSuffix), suffix) {
+	if len(suffix) == 0 {
 		return nil
 	}
-	if bytes.HasPrefix(suffix, []byte(sudoRSPromptSuffix)) {
-		return []int{start - len(sudoRSPromptPrefix), end + len(sudoRSPromptSuffix)}
+	if suffix[0] != ']' {
+		return match
+	}
+	if len(suffix) == 1 {
+		return nil
+	}
+	if suffix[1] != ' ' {
+		return match
+	}
+
+	limit := len(suffix)
+	if limit > maxSudoRSPromptSuffixBytes {
+		limit = maxSudoRSPromptSuffixBytes
+	}
+	window := suffix[:limit]
+
+	colonIdx := -1
+	colonLen := 0
+	for i := 0; i < len(window); {
+		if window[i] == '\n' || window[i] == '\r' {
+			return match
+		}
+		if window[i] == ':' {
+			colonIdx = i
+			colonLen = 1
+			break
+		}
+		if bytes.HasPrefix(window[i:], fullWidthColon) {
+			colonIdx = i
+			colonLen = len(fullWidthColon)
+			break
+		}
+		i++
+	}
+
+	if colonIdx >= 0 {
+		colonEnd := colonIdx + colonLen
+		return []int{start - len(sudoRSPromptPrefix), end + colonEnd}
+	}
+
+	if len(suffix) < maxSudoRSPromptSuffixBytes && bytes.IndexByte(suffix, '\n') < 0 && bytes.IndexByte(suffix, '\r') < 0 {
+		return nil
 	}
 	return match
 }

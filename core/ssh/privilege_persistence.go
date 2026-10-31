@@ -65,7 +65,7 @@ func (w *privilegePromptWriter) Write(data []byte) (int, error) {
 		w.pending = w.pending[match[1]:]
 		w.observed = true
 	}
-	keep := len(w.marker) + len(sudoRSPromptPrefix) + len(sudoRSPromptSuffix) - 1
+	keep := len(w.marker) + len(sudoRSPromptPrefix) + maxSudoRSPromptSuffixBytes - 1
 	if len(w.pending) > keep {
 		count := len(w.pending) - keep
 		if err := w.writeOutput(w.pending[:count]); err != nil {

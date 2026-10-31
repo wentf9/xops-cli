@@ -163,6 +163,23 @@ func TestAnalyzePaths(t *testing.T) {
 		{"boot path", []string{"/boot/vmlinuz"}, Moderate},
 		{"root slash", []string{"/"}, Dangerous},
 		{"multiple mixed", []string{"/tmp/ok", "/etc/hosts"}, Moderate},
+		{"windows drive root backslash", []string{`C:\`}, Dangerous},
+		{"windows drive root forward slash", []string{"c:/"}, Dangerous},
+		{"windows drive root bare", []string{"C:"}, Dangerous},
+		{"windows drive root prefixed", []string{"/C:"}, Dangerous},
+		{"windows drive root prefixed slash", []string{"/c:/"}, Dangerous},
+		{"windows drive root prefixed backslash", []string{`/C:\`}, Dangerous},
+		{"windows safe user path", []string{`C:\Users\wentf\test.txt`}, Safe},
+		{"windows safe user path forward", []string{"c:/Users/wentf/test.txt"}, Safe},
+		{"windows safe prefixed", []string{"/C:/Users/wentf/test.txt"}, Safe},
+		{"windows sensitive config", []string{`C:\Windows\System32\config\SAM`}, Moderate},
+		{"windows sensitive repair", []string{"/c:/windows/repair/backup.hiv"}, Moderate},
+		{"posix dotdot to root", []string{"/tmp/.."}, Dangerous},
+		{"posix dotdot to root trailing", []string{"/var/log/../.."}, Dangerous},
+		{"windows dotdot to root", []string{`C:\Users\..\..`}, Dangerous},
+		{"windows sensitive dotdot config", []string{`C:\Users\..\Windows\System32\config\SAM`}, Moderate},
+		{"posix sensitive dotdot", []string{"/tmp/../etc/passwd"}, Moderate},
+		{"posix safe dotdot out of sensitive", []string{"/etc/../tmp/file"}, Safe},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

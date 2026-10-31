@@ -52,6 +52,9 @@ func TestWindowsAdapters_PlanCommand_PowerShell(t *testing.T) {
 		if !strings.Contains(decoded, "Get-Process") {
 			t.Errorf("decoded script missing command: %s", decoded)
 		}
+		if !strings.Contains(decoded, "$ProgressPreference = 'SilentlyContinue'") {
+			t.Errorf("decoded script missing ProgressPreference: %s", decoded)
+		}
 		if !strings.Contains(decoded, "$ErrorActionPreference = 'Stop'") {
 			t.Errorf("decoded script missing ErrorActionPreference: %s", decoded)
 		}

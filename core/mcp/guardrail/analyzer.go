@@ -1,6 +1,7 @@
 package guardrail
 
 import (
+	"path"
 	"regexp"
 	"slices"
 	"strings"
@@ -141,23 +142,92 @@ var sensitivePaths = []string{
 	"/var/lib", "/root", "/proc", "/sys",
 }
 
+// sensitiveWindowsPaths elevate risk when targeted on Windows filesystems.
+var sensitiveWindowsPaths = []string{
+	"/windows/system32/config",
+	"/windows/repair",
+}
+
+func isAlpha(b byte) bool {
+	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
+}
+
+func parseDrivePath(p string) (drive string, rest string, ok bool) {
+	if len(p) >= 2 && isAlpha(p[0]) && p[1] == ':' && (len(p) == 2 || p[2] == '/' || p[2] == '\\') {
+		return strings.ToUpper(string(p[0])), p[2:], true
+	}
+	if len(p) >= 3 && p[0] == '/' && isAlpha(p[1]) && p[2] == ':' && (len(p) == 3 || p[3] == '/' || p[3] == '\\') {
+		return strings.ToUpper(string(p[1])), p[3:], true
+	}
+	return "", "", false
+}
+
 // AnalyzePaths returns the highest risk level implied by the given paths.
 func AnalyzePaths(paths []string) RiskLevel {
 	level := Safe
 	for _, p := range paths {
-		cleaned := strings.TrimRight(p, "/")
-		if cleaned == "" || cleaned == "/" {
-			return Dangerous
+		pathRisk := analyzeSinglePath(p)
+		if pathRisk > level {
+			level = pathRisk
 		}
-		for _, sensitive := range sensitivePaths {
-			if cleaned == sensitive || strings.HasPrefix(cleaned, sensitive+"/") {
-				if level < Moderate {
-					level = Moderate
-				}
-			}
+		if level == Dangerous {
+			return Dangerous
 		}
 	}
 	return level
+}
+
+func analyzeSinglePath(p string) RiskLevel {
+	if p == "" {
+		return Dangerous
+	}
+	if _, rest, ok := parseDrivePath(p); ok {
+		return analyzeDrivePath(rest)
+	}
+	return analyzePosixPath(p)
+}
+
+func analyzeDrivePath(rest string) RiskLevel {
+	rest = strings.ReplaceAll(rest, "\\", "/")
+	cleanRest := path.Clean("/" + rest)
+	if cleanRest == "/" {
+		return Dangerous
+	}
+	for _, sensitive := range sensitivePaths {
+		if cleanRest == sensitive || strings.HasPrefix(cleanRest, sensitive+"/") {
+			return Moderate
+		}
+	}
+	lowerRest := strings.TrimRight(strings.ToLower(cleanRest), "/")
+	for _, sensitive := range sensitiveWindowsPaths {
+		if lowerRest == sensitive || strings.HasPrefix(lowerRest, sensitive+"/") {
+			return Moderate
+		}
+	}
+	return Safe
+}
+
+func analyzePosixPath(p string) RiskLevel {
+	cleaned := path.Clean(p)
+	if cleaned == "" || cleaned == "/" || cleaned == "." {
+		return Dangerous
+	}
+	for _, sensitive := range sensitivePaths {
+		if cleaned == sensitive || strings.HasPrefix(cleaned, sensitive+"/") {
+			return Moderate
+		}
+	}
+	lower := strings.ToLower(strings.ReplaceAll(p, "\\", "/"))
+	cleanLower := strings.TrimRight(path.Clean("/"+lower), "/")
+	if cleanLower == "" {
+		return Dangerous
+	}
+	for _, sensitive := range sensitiveWindowsPaths {
+		if cleanLower == sensitive || strings.HasPrefix(cleanLower, sensitive+"/") {
+			return Moderate
+		}
+	}
+	return Safe
 }
 
 func containsChaining(cmd string) bool {

@@ -346,3 +346,60 @@ func TestFailureAudit(t *testing.T) {
 		}
 	})
 }
+
+func TestDynamicPortBackfill(t *testing.T) {
+	m := testManager(t, func(ctx context.Context, s Spec, ready func(string) bool, report func(error)) error {
+		if !ready("127.0.0.1:42953") {
+			return nil
+		}
+		<-ctx.Done()
+		return nil
+	}, nil)
+
+	spec := testSpec("dynport")
+	spec.ListenPort = 0 // request dynamic port
+	status, err := m.Create(t.Context(), spec, "op")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.ListenPort != 42953 {
+		t.Fatalf("expected ListenPort to be backfilled to 42953, got %d", status.ListenPort)
+	}
+	if status.ListenAddress != "127.0.0.1:42953" {
+		t.Fatalf("expected ListenAddress to be 127.0.0.1:42953, got %q", status.ListenAddress)
+	}
+
+	queryStatus, err := m.Status(status.TunnelID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queryStatus.ListenPort != 42953 {
+		t.Fatalf("queried status ListenPort: expected 42953, got %d", queryStatus.ListenPort)
+	}
+
+	// Idempotent retry with original spec (ListenPort: 0)
+	retryOrig, found, err := m.Retry(spec)
+	if err != nil || !found {
+		t.Fatalf("Retry with original spec failed: found=%v, err=%v", found, err)
+	}
+	if retryOrig.ListenPort != 42953 || retryOrig.TunnelID != status.TunnelID {
+		t.Fatalf("Retry with original spec: got ListenPort=%d TunnelID=%q, want 42953 and %q", retryOrig.ListenPort, retryOrig.TunnelID, status.TunnelID)
+	}
+
+	// Idempotent retry with backfilled spec (ListenPort: 42953)
+	retryBackfilled, found, err := m.Retry(status.Spec)
+	if err != nil || !found {
+		t.Fatalf("Retry with backfilled spec failed: found=%v, err=%v", found, err)
+	}
+	if retryBackfilled.TunnelID != status.TunnelID {
+		t.Fatalf("Retry with backfilled spec: got TunnelID=%q, want %q", retryBackfilled.TunnelID, status.TunnelID)
+	}
+
+	// Conflicting retry with different port
+	conflictSpec := spec
+	conflictSpec.ListenPort = 9999
+	_, _, err = m.Retry(conflictSpec)
+	if err == nil || !strings.Contains(err.Error(), "tunnel_request_conflict") {
+		t.Fatalf("expected tunnel_request_conflict for modified port, got %v", err)
+	}
+}

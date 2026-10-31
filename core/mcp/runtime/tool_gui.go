@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
+	"unicode"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/wentf9/xops-cli/core/mcp/guardrail"
@@ -12,10 +14,11 @@ import (
 )
 
 type GUIInput struct {
-	NodeID string `json:"nodeID" jsonschema:"Target SSH node ID or alias"`
-	Action string `json:"action" jsonschema:"GUI action: shot, click, double_click, right_click, move, type, key, scroll, or drag"`
-	Coord  []int  `json:"coord,omitempty" jsonschema:"Normalized 0-1000 coordinates: [x, y] for click/move/scroll, or [start_x, start_y, end_x, end_y] for drag"`
-	Text   string `json:"text,omitempty" jsonschema:"Text to input for type, key combination for key (e.g. ctrl+c, Return), or direction for scroll (up, down, left, right)"`
+	NodeID  string `json:"nodeID" jsonschema:"Target SSH node ID or alias"`
+	Action  string `json:"action" jsonschema:"GUI action: shot, click, double_click, right_click, move, type, key, scroll, or drag"`
+	Coord   []int  `json:"coord,omitempty" jsonschema:"Normalized 0-1000 coordinates: [x, y] for click/move/scroll, or [start_x, start_y, end_x, end_y] for drag"`
+	Text    string `json:"text,omitempty" jsonschema:"Text to input for type, key combination for key (e.g. ctrl+c, Return), or direction for scroll (up, down, left, right)"`
+	Display string `json:"display,omitempty" jsonschema:"Optional X11 display (e.g. :0, :1); auto-detected when omitted"`
 }
 
 type GUIOutput struct {
@@ -28,7 +31,12 @@ func (r *Runtime) guiHandler(ctx context.Context, _ *mcp.CallToolRequest, input 
 	if input.NodeID == "" || input.Action == "" {
 		return nil, GUIOutput{}, errors.New("nodeID and action are required")
 	}
-	script, err := gui.BuildScript(gui.Request{Action: input.Action, Coord: input.Coord, Text: input.Text})
+	script, err := gui.BuildScript(gui.Request{
+		Action:  input.Action,
+		Coord:   input.Coord,
+		Text:    input.Text,
+		Display: input.Display,
+	})
 	if err != nil {
 		return nil, GUIOutput{}, err
 	}
@@ -44,6 +52,10 @@ func (r *Runtime) guiHandler(ctx context.Context, _ *mcp.CallToolRequest, input 
 		OutputLimit:  gui.CaptureOutputLimit,
 	})
 	if execErr != nil {
+		detail := sanitizeRemoteOutput(res.Output, 512)
+		if detail != "" {
+			return nil, GUIOutput{}, fmt.Errorf("gui action %q failed: %w: %s", input.Action, FormatMCPError(execErr), detail)
+		}
 		return nil, GUIOutput{}, fmt.Errorf("gui action %q failed: %w", input.Action, FormatMCPError(execErr))
 	}
 	if res.Truncated {
@@ -84,9 +96,35 @@ func (r *Runtime) registerGUI(server *mcp.Server, g *guardrail.Guardrail) {
 	mcp.AddTool(server,
 		&mcp.Tool{
 			Name:        "gui",
-			Description: "Visual desktop automation (Computer Use) on a remote Linux SSH node (X11, or Wayland with ydotool/grim). Uses 0-1000 normalized coordinates and returns a compressed screenshot (longest edge <= 1280px) after every action. Keyboard actions ('type', 'key') are rated Dangerous and require approval under the default policy.",
+			Description: "Visual desktop automation (Computer Use) on a remote Linux/FreeBSD/Unix SSH node (X11, or Wayland with ydotool/grim). Uses 0-1000 normalized coordinates and returns a compressed screenshot (longest edge <= 1280px) after every action. Keyboard actions ('type', 'key') are rated Dangerous and require approval under the default policy.",
 			Annotations: &mcp.ToolAnnotations{DestructiveHint: &destructive},
 		},
 		withOperation(r, g, "gui", guiRiskInput, r.guiHandler),
 	)
+}
+
+func sanitizeRemoteOutput(output string, limit int) string {
+	s := strings.TrimSpace(output)
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(min(len(s), limit))
+	for _, r := range s {
+		if b.Len() >= limit {
+			break
+		}
+		if r == '\r' {
+			continue
+		}
+		if r == '\n' {
+			b.WriteByte(' ')
+			continue
+		}
+		if unicode.IsControl(r) {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return strings.TrimSpace(b.String())
 }

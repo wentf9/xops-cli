@@ -2,6 +2,7 @@ package patch
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -99,5 +100,74 @@ func TestApplyErrorsOnAmbiguousAndNoMatch(t *testing.T) {
 	invalidPatch := "<<<<\nunclosed"
 	if _, err := Apply(original, invalidPatch); !errors.Is(err, ErrInvalidFormat) {
 		t.Fatalf("expected ErrInvalidFormat, got %v", err)
+	}
+}
+
+func TestApplyLeadingTrailingBlankLinesTolerance(t *testing.T) {
+	// Case 1: Leading blank lines in search block
+	content1 := "package main\nfunc hello() {\n\tprintln(\"hi\")\n}\n"
+	patch1 := "<<<<\n\n\nfunc hello() {\n\tprintln(\"hi\")\n}\n====\nfunc helloWorld() {\n\tprintln(\"hello world\")\n}\n>>>>"
+	res1, err := Apply(content1, patch1)
+	if err != nil {
+		t.Fatalf("Case 1 (leading blank lines) failed: %v", err)
+	}
+	if res1.Blocks != 1 || res1.Fuzzy != 1 {
+		t.Fatalf("Case 1 expected 1 block and 1 fuzzy, got blocks=%d fuzzy=%d", res1.Blocks, res1.Fuzzy)
+	}
+	if !strings.Contains(res1.Content, "func helloWorld()") {
+		t.Fatalf("Case 1 expected replaced content, got:\n%s", res1.Content)
+	}
+
+	// Case 2: Trailing blank lines in search block
+	content2 := "package main\nfunc hello() {\n\tprintln(\"hi\")\n}\n"
+	patch2 := "<<<<\nfunc hello() {\n\tprintln(\"hi\")\n}\n\n\n====\nfunc helloWorld() {\n\tprintln(\"hello world\")\n}\n>>>>"
+	res2, err := Apply(content2, patch2)
+	if err != nil {
+		t.Fatalf("Case 2 (trailing blank lines) failed: %v", err)
+	}
+	if res2.Blocks != 1 || res2.Fuzzy != 1 {
+		t.Fatalf("Case 2 expected 1 block and 1 fuzzy, got blocks=%d fuzzy=%d", res2.Blocks, res2.Fuzzy)
+	}
+	if !strings.Contains(res2.Content, "func helloWorld()") {
+		t.Fatalf("Case 2 expected replaced content, got:\n%s", res2.Content)
+	}
+
+	// Case 3: Both leading and trailing blank lines with spaces and tabs
+	content3 := "package main\nfunc hello() {\n}\n"
+	patch3 := "<<<<\n  \n\t\nfunc hello() {\n}\n\t\n  \n====\nfunc helloWorld() {\n}\n>>>>"
+	res3, err := Apply(content3, patch3)
+	if err != nil {
+		t.Fatalf("Case 3 (both leading & trailing with spaces/tabs) failed: %v", err)
+	}
+	if res3.Blocks != 1 || res3.Fuzzy != 1 {
+		t.Fatalf("Case 3 expected 1 block and 1 fuzzy, got blocks=%d fuzzy=%d", res3.Blocks, res3.Fuzzy)
+	}
+
+	// Case 4: Target file has fewer lines than total search block lines (due to padding)
+	content4 := "line1\nline2\n"
+	patch4 := "<<<<\n\n\nline1\nline2\n\n\n====\nnewline1\nnewline2\n>>>>"
+	res4, err := Apply(content4, patch4)
+	if err != nil {
+		t.Fatalf("Case 4 (target file has fewer lines than padded block) failed: %v", err)
+	}
+	if res4.Blocks != 1 || res4.Fuzzy != 1 {
+		t.Fatalf("Case 4 expected 1 block and 1 fuzzy, got blocks=%d fuzzy=%d", res4.Blocks, res4.Fuzzy)
+	}
+	if want := "newline1\nnewline2\n"; res4.Content != want {
+		t.Fatalf("Case 4 content mismatch: got %q, want %q", res4.Content, want)
+	}
+
+	// Case 5: Ambiguous match after trimming
+	content5 := "dup\ndup\n"
+	patch5 := "<<<<\n\n\ndup\n\n\n====\nrep\n>>>>"
+	if _, err := Apply(content5, patch5); !errors.Is(err, ErrAmbiguousMatch) {
+		t.Fatalf("Case 5 expected ErrAmbiguousMatch, got: %v", err)
+	}
+
+	// Case 6: Purely blank search block falls through to ErrNoMatch
+	content6 := "line1\nline2\n"
+	patch6 := "<<<<\n   \n\t\n====\nrep\n>>>>"
+	if _, err := Apply(content6, patch6); !errors.Is(err, ErrNoMatch) {
+		t.Fatalf("Case 6 expected ErrNoMatch for all-blank search block, got: %v", err)
 	}
 }

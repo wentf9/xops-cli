@@ -33,6 +33,7 @@ Each document states its implementation status and validation scope.
 - [Shared core and MCP interface decoupling](./shared-core-decoupling)
 - [MCP Streamable HTTP and file streaming design](./mcp-http-transfer-design.md)
 - [Minimalist all-in-one MCP tool architecture refactoring design](./mcp-minimal-tools-design.md)
+- [MCP improvement plan based on live FreeBSD validation](./mcp-freebsd-validation-plan.md)
 - [Offline credential store compatibility](./compatibility.md)
 - [Zero-configuration credential design](./credential-experience-design)
 - [Credential experience implementation plan](./credential-experience-plan)

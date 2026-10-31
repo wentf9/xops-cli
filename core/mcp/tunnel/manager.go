@@ -137,6 +137,7 @@ type Observer func(Status, string, error) error
 type task struct {
 	runner    Runner
 	status    Status
+	origSpec  Spec
 	ctx       context.Context
 	cancel    context.CancelCauseFunc
 	ready     chan struct{}
@@ -166,7 +167,7 @@ func New(ctx context.Context, run Runner, observe Observer) *Manager {
 func (m *Manager) retryLocked(s Spec) (*task, error) {
 	if id, ok := m.requests[s.RequestID]; ok {
 		t := m.tasks[id]
-		if t.status.Spec != s {
+		if t.origSpec != s && t.status.Spec != s {
 			return nil, errors.New("tunnel_request_conflict: requestID was used with different parameters")
 		}
 		return t, nil
@@ -272,7 +273,8 @@ func (m *Manager) reserveLocked(requestCtx context.Context, s Spec, operationID 
 		return nil, errors.New("tunnel runner is required")
 	}
 	t := &task{ctx: ctx, cancel: cancel, ready: make(chan struct{}), done: make(chan struct{}), runner: runner,
-		status: Status{Spec: s, TunnelID: id, OperationID: operationID, State: "starting", ListenScope: scope, TargetScope: targetScope, CreatedAt: time.Now().UTC()}}
+		origSpec: s,
+		status:   Status{Spec: s, TunnelID: id, OperationID: operationID, State: "starting", ListenScope: scope, TargetScope: targetScope, CreatedAt: time.Now().UTC()}}
 	m.tasks[id], m.requests[s.RequestID] = t, id
 	// The worker is owned by the manager; cancellation and Shutdown join it.
 	go m.serve(requestCtx, t)
@@ -319,6 +321,11 @@ func (m *Manager) serve(requestCtx context.Context, t *task) {
 				return false
 			}
 			t.status.State, t.status.ListenAddress = "running", address
+			if _, portStr, err := net.SplitHostPort(address); err == nil {
+				if p, err := strconv.Atoi(portStr); err == nil && p > 0 {
+					t.status.ListenPort = p
+				}
+			}
 			t.status.ExpiresAt = time.Now().UTC().Add(time.Duration(t.status.TTLSeconds) * time.Second)
 			expiration = time.AfterFunc(time.Until(t.status.ExpiresAt), func() { t.cancel(errExpired) })
 			startup.Stop()
