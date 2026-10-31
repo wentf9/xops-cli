@@ -33,7 +33,7 @@
 | :--- | :--- | :--- | :--- |
 | **`terminal`** | stdio & http | `xops_ssh_run`<br>`xops_fs_mkdir`, `xops_fs_touch`, `xops_fs_mv`, `xops_fs_rm`, `xops_fs_cp` | **收敛 + 升级**：统一单次命令（`session="once"`）与持久 PTY 会话（`session="<id>"`）；内置非交互环境变量注入、信号发送（`SIGINT`/`EOF`）、智能输出折叠与 `$HOME/.cache/xops-mcp/cmd-*.log` 转存。删除 `tool_fs.go` 中的冗余 SFTP 包装工具。 |
 | **`file`** | stdio & http | `xops_read_file`<br>`xops_write_file`<br>`xops_fs_ls` | **收敛 + 升级**：通过 `action="read"\|"write"\|"patch"\|"stat"` 多态分发。`read` 强制带行号按行分页；`patch` 支持 `<<<< ==== >>>>` 缩进容错替换与即时语法预检；`stat` 支持单文件元信息与自动降噪的紧凑目录树。 |
-| **`gui`** | stdio & http | *(全新能力)* | **新增**：支持 `action="shot"\|"click"\|"double_click"\|"right_click"\|"move"\|"type"\|"key"\|"scroll"\|"drag"`，自适应 Wayland / X11，0~1000 归一化坐标，内存等比缩放 `1280px` 压缩返回，变更操作自动附带最新截图。 |
+| **`gui`** | stdio & http | *(全新能力)* | **新增**：支持 `action="shot"\|"click"\|"double_click"\|"right_click"\|"move"\|"type"\|"key"\|"scroll"\|"drag"`，自适应 Wayland / X11（支持 Linux/FreeBSD/Unix 桌面环境与 `display` 自动探测），0~1000 归一化坐标，内存等比缩放 `1280px` 压缩返回，变更操作自动附带最新截图。 |
 | **`transfer`** | stdio & http | stdio: `xops_upload`, `xops_download`<br>http: `xops_prepare_upload`, `xops_prepare_download`, `xops_transfer_status`, `xops_transfer_cancel` | **收敛**：stdio 下通过 `direction="push"\|"pull"` 直接流式传输宿主机与远端文件/目录；HTTP 模式下复用多态参数承载带外流式传输生命周期（`prepare` / `status` / `cancel`）。 |
 | **`nodes`** | stdio & http | `xops_list_nodes` | **保留并精简**：多主机资产发现入口，支持按 `tag` 过滤，为其余工具提供目标 `node` ID。 |
 | **`tunnel`** | 仅 stdio | `xops_tunnel_create`<br>`xops_tunnel_list`<br>`xops_tunnel_status`<br>`xops_tunnel_stop` | **保留并多态合并**：将 4 个跨本机/远端网络命名空间的 SSH 端口转发工具合并为单个 `tunnel(action="create"\|"list"\|"status"\|"stop")` 工具。 |
@@ -49,12 +49,12 @@
 | 工具名 | 传输模式 | 必填参数 (`required`) | 可选参数 (`properties`) | 核心说明 |
 | :--- | :--- | :--- | :--- | :--- |
 | **`nodes`** | stdio & http | *(无)* | `tag` | 列出已配置 SSH 节点（支持按 `tag` 过滤） |
-| **`terminal`** | stdio & http | `nodeID` | `cmd`, `cwd`, `session`, `timeout`, `sudo`, `execution` | 执行无状态命令（`session='once'`，支持 `sudo` 与 `execution` 覆盖）或操作持久 PTY 会话（`cmd` 为空轮询增量输出，或传 `SIGINT`/`EOF`/`SIGTERM`/`SIGKILL`） |
-| **`file`** | stdio & http | `nodeID`, `action`, `path` | `content`, `range` | SFTP 文件与目录操作：`read`（带行号分页，上限 512 KiB）、`write`（原子替换，自动建父目录）、`patch`（`<<<< ==== >>>>` 原子替换，上限 512 KiB）、`stat`（元信息或 2 层降噪目录树）。原子替换会创建新 inode（需保留硬链接或扩展 ACL 时请用 `terminal`） |
-| **`gui`** | stdio & http | `nodeID`, `action` | `coord`, `text` | 远端 Linux 桌面（X11，或带 `ydotool`/`grim` 的 Wayland）视觉自动化：0–1000 归一化坐标，每次动作后返回 `<= 1280px` 压缩截图；键盘动作（`type`/`key`）评为 `Dangerous` |
-| **`transfer`** | stdio | `nodeID`, `direction`, `localPath`, `remotePath` | *(无)* | 本机与远端节点流式传输文件或目录（`direction: "push" \| "pull"`） |
-| **`transfer`** | http | `action` | `nodeID`, `remotePath`, `requestID`, `transferID`, `size`, `sha256`, `overwrite` | HTTP 带外流式传输生命周期（`action: "prepare_push" \| "prepare_pull" \| "status" \| "cancel"`），配合 `/v1/transfers/{id}/content` 数据面 |
-| **`tunnel`** | 仅 stdio | `action` | `nodeID`, `tunnelID`, `requestID`, `mode`, `listenHost`, `listenPort`, `targetHost`, `targetPort`, `ttlSeconds`, `state` | 进程托管的 SSH TCP 端口转发隧道（`action: "create" \| "list" \| "status" \| "stop"`） |
+| **`terminal`** | stdio & http | `nodeID` | `cmd`, `cwd`, `session`, `timeout`, `sudo`, `execution` | 执行无状态命令（`session='once'`，支持 `sudo` 与 `execution` 覆盖，支持 fish、zsh 与 csh/tcsh，支持 Windows server+cmd 节点的 `cwd` 自动切换）或操作持久 PTY 会话（支持 POSIX、Fish 及 Csh/Tcsh 登录 Shell 持久化；`cmd` 为空轮询增量输出，或传 `SIGINT`/`EOF`/`SIGTERM`/`SIGKILL`） |
+| **`file`** | stdio & http | `nodeID`, `action`, `path` | `content`, `range` | SFTP 文件与目录操作：`read`（带行号分页，上限 512 KiB）、`write`（原子替换，自动建父目录）、`patch`（`<<<< ==== >>>>` 原子替换，上限 512 KiB）、`stat`（元信息或 2 层降噪目录树）。规范化 Windows 盘符路径（如 `C:\...`）并严格拦截盘符根路径（如 `/C:`）；原子替换会创建新 inode（需保留硬链接或扩展 ACL 时请用 `terminal`） |
+| **`gui`** | stdio & http | `nodeID`, `action` | `coord`, `text`, `display` | 远端 Linux/FreeBSD/Unix 桌面（X11，或带 `ydotool`/`grim` 的 Wayland）视觉自动化：`display` 为可选 X11 显示器（例如 :0、:1；省略时自动探测活跃 X11 套接字）；0–1000 归一化坐标，每次动作后返回 `<= 1280px` 压缩截图；键盘动作（`type`/`key`）评为 `Dangerous`；非 POSIX 节点调用时明确提示需要 POSIX shell (X11/Wayland) |
+| **`transfer`** | stdio | `nodeID`, `direction`, `localPath`, `remotePath` | *(无)* | 本机与远端节点流式传输文件或目录（`direction: "push" \| "pull"`），规范化 Windows 盘符路径并拦截盘符根 |
+| **`transfer`** | http | `action` | `nodeID`, `remotePath`, `requestID`, `transferID`, `size`, `sha256`, `overwrite` | HTTP 带外流式传输生命周期（`action: "prepare_push" \| "prepare_pull" \| "status" \| "cancel"`），配合 `/v1/transfers/{id}/content` 数据面，规范化 Windows 盘符路径并拦截盘符根 |
+| **`tunnel`** | 仅 stdio | `action` | `nodeID`, `tunnelID`, `requestID`, `mode`, `listenHost`, `listenPort`, `targetHost`, `targetPort`, `ttlSeconds`, `state` | 进程托管的 SSH TCP 端口转发隧道（`action: "create" \| "list" \| "status" \| "stop"`；`create` 省略 `requestID` 时自动生成 16 字节随机 hex 幂等键，`listenPort: 0` 动态分配并回填实际端口） |
 
 ---
 
@@ -99,6 +99,9 @@ flowchart TB
      export DEBIAN_FRONTEND=noninteractive GIT_TERMINAL_PROMPT=0 PAGER=cat SYSTEMD_PAGER=cat CI=true;
      ```
    - 若指定 `cwd`，通过 POSIX 单引号安全转义后前置 `cd -- '<escaped_cwd>' && `。
+   - **Windows `server` + `cmd` 节点 `cwd` 适配 (R4)**：当目标节点配置为 `interpreter="server"` 且入口方言为 `launch_dialect="cmd"`（或 `powershell`/`posix`）时，通过 `DeriveWorkingDirectoryExecution` 自动派生底层局部执行配置，将命令安全包装为 `cd /d "<escaped_cwd>" || exit /b & <escaped_cmd>`，解决服务端直通解释器无法继承工作目录的问题。
+   - **PowerShell CLIXML 进度流抑制与入口方言保护 (R5)**：在 PowerShell 命令前缀自动注入 `$ProgressPreference = 'SilentlyContinue'; `，彻底消除非交互 SSH 下运行 `Get-ComputerInfo`、`Invoke-WebRequest` 等 Cmdlet 时向 stderr 输出的大量 `#< CLIXML` 进度流噪声；同时在运行时严格保护目标节点已确定的入口 `launchDialect`（如已固定的 `cmd`），避免请求侧 `execution.launchDialect` 误覆盖导致生成不兼容的入口命令。
+   - **Ubuntu `sudo-rs` 本地化 PAM 提示符完整剥离 (R6)**：特权执行通过 `expandSudoPrompt` 支持识别 `sudo-rs` 本地化挑战后缀（如中文 `zh_CN.UTF-8` 下的 `[sudo: ...] 密码：`，支持 ASCII 冒号 `:` 与全角冒号 `：` / `\xef\xbc\x9a`），在 64 字节有界窗口内彻底清洗提示符，杜绝提示符字符渗入命令输出。
 2. **智能输出截断与转存（Smart Output Compression）**：
    - **当 `exit_code == 0` 且输出行数 `> 60`**：保留前 15 行 + 最后 30 行，中间插入折叠提示：
      `[... 380 lines omitted. Full log saved to /home/ops/.cache/xops-mcp/cmd-20261029T120000-8f9a1c2b3d4e.log ...]`
@@ -170,20 +173,28 @@ flowchart TB
 - 若目标为目录：遍历最多 2 层（最多 200 个条目）并输出紧凑树形文本，**内置忽略集合**：
   `.git`, `node_modules`, `__pycache__`, `.venv`, `venv`, `target`, `dist`, `build`。
 
+#### 4.2.6 Windows SFTP 原生路径规范化与盘符根保护 (R1)
+- **路径规范化 (`remotefile.NormalizeSFTPPath`)**：识别 Windows 盘符前缀（如 `C:\...`、`c:/...`、`/C:\...`），转换为 OpenSSH SFTP 标准的 `/C:/...` 形式（大写盘符且统一使用正斜杠 `/`），普通 POSIX 路径保持原样不转换 `\`，避免破坏合法 POSIX 路径。
+- **盘符根保护 (`remotefile.IsRootPath`)**：判定 `/` 以及盘符根（如 `/C:`、`C:\`、`C:/`）。`file`（`read`、`write`、`patch`、`stat`）与 `transfer`（`push`、`pull`、`prepare_push`、`prepare_pull`）全流程拦截盘符根路径并归类为 `RiskDangerous`（报 `"root path access"`），`transfer` 任务 Spec 校验同步拒绝盘符根。
+
 ---
 
 ### 4.3 `gui`：X11 / Wayland 自适应与纯 Go 零 CGO 图像管线（`core/mcp/gui`）
 
 #### 4.3.1 远端显示协议自适应脚本
-每次 `gui` 调用通过单次 POSIX 脚本在远端探测图形环境并执行动作：
-1. **环境准备**：
-   - 默认设置 `DISPLAY="${DISPLAY:-:0}"`，若未显式设置 `XAUTHORITY` 且 `$HOME/.Xauthority` 可读则自动补齐；使用 `mktemp -d` 创建 `0700` 私有临时目录存放截图并在退出时清理。
+每次 `gui` 调用通过单次 POSIX 脚本在远端探测图形环境（支持 Linux/FreeBSD/Unix X11 与 Linux Wayland）并执行动作：
+1. **环境准备与显示探测增强 (R3)**：
+   - 支持通过 `display` 参数显式指定 X11 显示器（例如 `:0`、`:1`）；省略时自动探测 `/tmp/.X11-unix/X*` 活跃套接字（默认回退为 `:0`）。
+   - **Wayland 自动发现与 XDG 运行时探测**：若 `XDG_RUNTIME_DIR` 未设置且 `/run/user/$(id -u)` 存在，自动导出 `XDG_RUNTIME_DIR="/run/user/$(id -u)"`；若 `WAYLAND_DISPLAY` 未设置且 `$XDG_RUNTIME_DIR/wayland-0` 存在，自动设置 `WAYLAND_DISPLAY="wayland-0"`。
+   - **XAUTHORITY 多路径回退探测**：当 `$XAUTHORITY` 未设置且 `$HOME/.Xauthority` 不存在时，依次探测 `$XDG_RUNTIME_DIR/.mutter-Xwaylandauth.*`、`$XDG_RUNTIME_DIR/gdm/Xauthority` 及 `/run/user/$(id -u)/Xauthority`。
+   - **截图工具链回退**：在原有 `grim`/`spectacle`/`maim`/`import`/`scrot` 之外，补充 `gnome-screenshot -f "$tmp"` 作为回退分支。
+   - 使用 `mktemp -d` 创建 `0700` 私有临时目录存放截图并在退出时清理。
 2. **分辨率获取与 0~1000 坐标映射**：
    - 将模型输入的 `coord = [x, y]`（归一化范围 $0 \sim 1000$）按实际桌面分辨率 $(W, H)$ 换算为像素坐标：
      $$X = \operatorname{round}\left(\frac{x \cdot W}{1000}\right), \quad Y = \operatorname{round}\left(\frac{y \cdot H}{1000}\right)$$
 3. **键鼠注入适配**：
-   - **Wayland (`$WAYLAND_DISPLAY` 非空且安装 `ydotool`/`grim`)**：使用 `ydotool`（`mousemove --absolute`、`click`、`type`、`key`）与 `grim`/`spectacle`。
-   - **X11 / Xvfb**：使用 `xdotool`（`mousemove`、`click`、`type --clearmodifiers`、`key`）与 `maim`/`import`/`scrot`。
+   - **Wayland (`$WAYLAND_DISPLAY` 非空且安装 `ydotool`/`grim`)**：使用 `ydotool`（`mousemove --absolute`、`click`、`type`、`key`）与 `grim`/`spectacle`/`gnome-screenshot`。
+   - **X11 / Xvfb**：使用 `xdotool`（`mousemove`、`click`、`type --clearmodifiers`、`key`）与 `maim`/`import`/`scrot`/`gnome-screenshot`。
 4. **动作后自动截屏闭环**：
    - 若 `action == "shot"`：直接采集屏幕图像输出到 stdout。
    - 若 `action` 为变更类动作（`click`、`double_click`、`right_click`、`type`、`key`、`scroll`、`drag`）：执行动作后 `sleep 0.5` 等待 UI 渲染，随后立即在同一脚本内采集最新截图输出到 stdout。
@@ -194,6 +205,17 @@ flowchart TB
 2. **MCP 端纯 Go 处理**：
    - 若输入已为 WebP 字节流则直接透传；否则在内存中使用纯 Go 标准库 `image/png`、`image/jpeg` 解码，并用纯 Go 双线性插值将长边等比缩放至 `<= 1280px`、编码为 JPEG（Quality 75）。
    - 封装为 MCP 标准 `&mcp.ImageContent`，全程零 CGO 依赖，100% 兼容 `linux`/`darwin`/`windows` 交叉编译。
+
+#### 4.3.3 失败诊断与非 POSIX 保护 (R3, R7)
+1. **受界错误诊断输出透传 (R3)**：当远端执行返回非零退出码时，截取远端 stderr 输出并清洗控制字符后附加至错误响应（最多 512 字节），清晰呈现工具缺失或权限错误原因，避免仅返回孤立的非零退出状态码。
+2. **非 POSIX 节点明确拦截 (R7)**：当在 Windows (`cmd`/`powershell`) 等非 POSIX 节点调用 `gui` 时，明确返回需要 POSIX shell (X11/Wayland) 环境的语义化报错，避免误报为文件系统命令错误。
+
+---
+
+### 4.4 `tunnel`：进程托管 SSH 端口转发与动态端口分配（`core/mcp/tunnel`）
+
+1. **`requestID` 自动生成 (R2)**：当 `action="create"` 且调用方未指定 `requestID` 时，运行时自动生成 16 字节随机 hex 字符串作为请求 ID，若传入显式 ID 则保留以保证重试幂等性。
+2. **动态分配端口回填 (R2)**：指定 `listenPort: 0` 时，系统在本地绑定空闲监听端口后，自动解析实际分配的端口号并回填至 `status.ListenPort`（及 `listenAddress`），使调用方能直接获取就绪的端口。
 
 ---
 
@@ -207,16 +229,16 @@ flowchart TB
 | **`nodes`** | - | `Safe` | 始终只读 |
 | **`terminal`** | `session == "once"` | 由 `AnalyzeCommandWithDialect` 决定 | 命中 `blockedPatterns` 直接 `Deny`；命中 `dangerousPatterns` 为 `Dangerous`；含 `sudo=true` 最低 `Moderate` |
 | **`terminal`** | `session != "once"` (持久 PTY) | `Moderate` | 命中 `dangerousPatterns` 提至 `Dangerous`；命中 `blockedPatterns` 直接 `Deny` |
-| **`file`** | `action == "read" \| "stat"` | `Safe` | `AnalyzePaths([path])`：触及 `/etc`、`/root` 等敏感路径提至 `Moderate` |
-| **`file`** | `action == "write" \| "patch"` | `Moderate` | `AnalyzePaths([path])`：触及 `/` 或空路径直接 `Dangerous` |
+| **`file`** | `action == "read" \| "stat"` | `Safe` | `AnalyzePaths([path])`：支持 Windows 盘符路径规范化；触及 `/etc`、`/root` 或 Windows `/c:/windows/system32/config` 等敏感系统路径提至 `Moderate` |
+| **`file`** | `action == "write" \| "patch"` | `Moderate` | `AnalyzePaths([path])`：触及 `/`、空路径或 Windows 盘符根（如 `C:\`、`/C:`）直接评为 `Dangerous`（报 `root path access`） |
 | **`gui`** | `action == "shot" \| "move"` | `Safe` | 只读视觉观测或移动光标 |
 | **`gui`** | `click` / `double_click` / `right_click` / `drag` / `scroll` | `Moderate` | 鼠标交互变更动作 |
 | **`gui`** | `type` / `key` | `Dangerous` | 键盘输入可跨多次调用拼接命令并回车执行，一律按高风险要求审批，且文本同时受 `IsBlocked` 与 `BlockedPatterns` 拦截 |
-| **`transfer`** | `pull` / `prepare_pull` / `status` / `cancel` | `Safe` | `AnalyzePaths([remote_path])` |
-| **`transfer`** | `push` / `prepare_push` | `Moderate` | `AnalyzePaths([remote_path])` |
+| **`transfer`** | `pull` / `prepare_pull` / `status` / `cancel` | `Safe` | `AnalyzePaths([remote_path])`：支持 Windows 盘符路径规范化并拦截盘符根 |
+| **`transfer`** | `push` / `prepare_push` | `Moderate` | `AnalyzePaths([remote_path])`：支持 Windows 盘符路径规范化并拦截盘符根 |
 | **`tunnel`** | `action == "list" \| "status"` | `Safe` | 元数据只读 |
 | **`tunnel`** | `action == "stop"` | `Moderate` | 停止已有隧道 |
-| **`tunnel`** | `action == "create"` | `Moderate` (本地回环) / `Dangerous` (暴露网卡或 `-R`) | 与现有 `tunnelRisk` 完全一致 |
+| **`tunnel`** | `action == "create"` | `Moderate` (本地回环) / `Dangerous` (暴露网卡或 `-R`) | `requestID` 可选（缺省自动生成 16 字节 hex）；`listenPort: 0` 动态分配并回填实际端口；与现有 `tunnelRisk` 完全一致 |
 
 ### 5.2 不可破坏的 `Permit` / `Binding` 不变量
 - 每次工具调用仍严格走 `Runtime.withOperation` / `withMetadata` 管线：`Resolve` 快照 -> 计算包含 `(ToolName, Action, Input)` 的 `ports.Bind` 摘要 -> `Guardrail` 审批与审计 -> `ExecutionGate.Enter` 换取有界 `Permit` -> 传入 `Backend` 执行。
@@ -283,7 +305,15 @@ core/mcp/
 
 - **持久会话结果语义与清理**：只有观测到完成哨兵才返回 `outcome=completed` 与退出码；等待超时返回 `status=running`、`outcome=unknown`；会话在哨兵之前结束（或因 `EOF`/`SIGKILL` 关闭，其中 `EOF` 等待最长 1s）返回 `status=failed`、`outcome=unknown`，均不携带退出码并立即从会话池移除。新建（或过期/重配后重建）持久会话时在输出结构体中返回 `newSession=true`。哨兵由 `printf` 的两个参数拼接，命令回显不会被误判为完成；格式不合法的候选会被跳过。输出自动剥离 ANSI 转义序列并折叠单行 `\r` 进度刷新帧。
 - **会话忙碌保护、非阻塞互斥与信号语义**：会话使用 `TryLock` 非阻塞获取执行锁；当已有调用持有执行锁时，并发下发新命令或空 `cmd` 轮询立即返回 `ErrSessionInUse`；并发发送控制信号（`SIGINT`/`EOF`/`SIGTERM`/`SIGKILL`）仅在该会话**确实有命令正在运行**（命令 payload 写入与写 stdin 的信号 `SIGINT`/`EOF` 由同一把会话输入锁 `inputMu` 串行化，确保 `SIGINT`/`EOF` 排在完整 payload 写入之后；而不写 stdin 的 SSH 通道请求信号 `SIGTERM`/`SIGKILL` 不获取 `inputMu`，即使命令 payload 写入因远端流控阻塞也能立即穿透投递并通过 `SIGKILL` 关闭 PTY 解除写入阻塞；底层 `ptySession` 通过 `writeMu` 串行化对 SSH channel stdin 的写入以及 `Close()` 中 `session.Close()` 之后的 `stdin.Close()`，避免与 `x/crypto/ssh` 内部缓冲池或 `sentEOF` 产生并发竞态）时才直接穿透投递以中断等待中的命令，若执行锁仅被空闲轮询或其它短暂操作占用则同样返回 `ErrSessionInUse`；当无调用正在等待但上一条命令仍在后台运行时，提交新命令返回 `ErrSessionBusy`；对不存在、已过期或因配置/凭据变更被淘汰的会话发送信号或空 `cmd` 轮询直接返回 `ErrSessionNotFound`（附带淘汰原因如 `reconfigured`，绝不静默新建会话）。发送 `SIGINT`/`EOF`/`SIGTERM` 后，仅当在等待窗口内实际观测到完成哨兵才解除忙碌状态；若前台进程忽略信号继续运行，会话保持 `StateRunning`（忙碌），防止后续命令被注入到前台进程 stdin；`SIGKILL` 无论会话忙碌或空闲（即使进程在等待窗口内刚好输出完成哨兵）均无条件强制关闭并从会话池移除会话。持久会话中仅切换 `cwd`（空 `cmd`）评为 `Moderate`。
-- **会话生命周期与配额**：会话代数 `Generation` 组合目标 `ConnectionKey`、`Version` 与 `ExecutionVersion`（配合 `state.Coordinator` 更新屏障排空在途许可，按相等比较），并在同一把管理器锁内完成代数与过期校验，节点连接参数、凭据或执行配置变更后在下次调用时自动关闭旧会话并重建（若旧会话不再被调用，其持有的底层连接租约与隧道一致，最长保留至空闲 TTL 到期由后台回收协程或 `Shutdown` 清理）；单 `Scope` 最多 16 个会话、全局最多 64 个会话，名额在 `Dial` 之前即预占（通过 `defer` 保证即使 `Dial` 失败或 panic 也必定释放）并对相同 `Key` 与 `Generation` 的并发新建请求去重复用同一在途拨号（仅当领头拨号方自身的 `context` 已取消或超时且等待方 `context` 仍有效时，等待方才自动接力重试拨号；若后端连接超时而领头方 `context` 未取消，所有等待方立即共享该错误返回而不串行重试）；空闲 TTL（默认 30m，运行中为 60m，仅由客户端 `Execute` 交互续期，绝对生命周期上限 12h）由后台回收协程及容量满时的按需清理执行，`Shutdown` 负责回收协程与全部会话。持久会话不支持 `sudo`/`execution`，非 POSIX 登录 shell 直接拒绝。折叠日志保存在 `$HOME/.cache/xops-mcp`（0700 目录、0600 独占文件），最多保留最近 32 份。
+- **会话生命周期与配额**：会话代数 `Generation` 组合目标 `ConnectionKey`、`Version` 与 `ExecutionVersion`（配合 `state.Coordinator` 更新屏障排空在途许可，按相等比较），并在同一把管理器锁内完成代数与过期校验，节点连接参数、凭据或执行配置变更后在下次调用时自动关闭旧会话并重建（若旧会话不再被调用，其持有的底层连接租约与隧道一致，最长保留至空闲 TTL 到期由后台回收协程或 `Shutdown` 清理）；单 `Scope` 最多 16 个会话、全局最多 64 个会话，名额在 `Dial` 之前即预占（通过 `defer` 保证即使 `Dial` 失败或 panic 也必定释放）并对相同 `Key` 与 `Generation` 的并发新建请求去重复用同一在途拨号（仅当领头拨号方自身的 `context` 已取消或超时且等待方 `context` 仍有效时，等待方才自动接力重试拨号；若后端连接超时而领头方 `context` 未取消，所有等待方立即共享该错误返回而不串行重试）；空闲 TTL（默认 30m，运行中为 60m，仅由客户端 `Execute` 交互续期，绝对生命周期上限 12h）由后台回收协程及容量满时的按需清理执行，`Shutdown` 负责回收协程与全部会话。持久会话不支持 `sudo`/`execution`，支持 POSIX、Fish 及 Csh/Tcsh 登录 Shell 持久化。折叠日志保存在 `$HOME/.cache/xops-mcp`（0700 目录、0600 独占文件），最多保留最近 32 份。
 - **`file`**：先校验 `action` 再打开 SFTP；`write`/`patch` 优先通过同目录私有临时文件 + `posix-rename`（新建文件时在无 `posix-rename` 扩展的服务端使用 SFTP v3 `Rename`）原子替换并保留原权限与属主（`Chown`），注意原子替换会生成新 inode（若需保留硬链接或扩展 ACL 请使用 `terminal`）；临时文件创建被服务端明确拒绝（如 `EEXIST`/`EACCES`）时绝不删除未拥有路径；若目标已存在且为普通文件，但服务端不支持 `posix-rename`、父目录无写权限创建临时文件、或临时文件无法保留原属主/属组，则回退为在原普通文件上原地覆写并在返回结果中标记 `inPlace=true`；始终拒绝替换符号链接；`patch` 写回前校验 size、mtime 与 SHA-256 内容哈希防止覆盖并发修改；超过 512 KiB 的文件拒绝 `patch`，`read` 会标记 `truncated`。整文件精确匹配失败后的空白容错匹配会在 `fuzzyBlocks` 中报告。
-- **`gui`**：仅支持 Linux（X11，或带 `ydotool`/`grim` 的 Wayland）。截图使用 `mktemp -d` 私有目录，输出上限 48 MiB 且截断即报错；`type` 与 `key` 一律评为 `Dangerous`（防止跨调用分段输入绕过命令分析，默认策略下需交互审批或在节点策略中调整阈值），同时匹配阻断规则并在审批与审计详情中展示输入内容。
+- **`gui`**：支持 Linux/FreeBSD/Unix 环境（X11，或带 `ydotool`/`grim` 的 Wayland）。支持显式 `display` 参数或自动探测活跃 X11 套接字。截图使用 `mktemp -d` 私有目录，输出上限 48 MiB 且截断即报错；`type` 与 `key` 一律评为 `Dangerous`（防止跨调用分段输入绕过命令分析，默认策略下需交互审批或在节点策略中调整阈值），同时匹配阻断规则并在审批与审计详情中展示输入内容。
+- **Ubuntu 与 Windows 平台适配与缺陷加固 (R1 ~ R7)**：
+  - **路径规范化与盘符根保护 (R1)**：`remotefile.NormalizeSFTPPath` 统一将 Windows 盘符前缀（`C:\...`、`c:/...`、`/C:\...`）转为大写 `/C:/...` 与正斜杠，保留普通 POSIX 路径；`remotefile.IsRootPath` 识别 `/` 与 `/C:` 等盘符根；`file`、`transfer`、`record.Spec` 与 `guardrail.AnalyzePaths` 全链路拦截盘符根路径（评为 `RiskDangerous`，报 `"root path access"`），并增加对 Windows 敏感系统路径（如 `/c:/windows/system32/config`、`/c:/windows/repair`）的保护。
+  - **`tunnel` 请求 ID 自动生成与动态端口回填 (R2)**：`tunnel` 在 `action="create"` 且未传 `requestID` 时自动生成 16 字节随机 hex 幂等键，显式传值时保留原值以维持幂等；当 `listenPort: 0` 时从监听地址解析实际端口并回填 `status.ListenPort`。
+  - **`gui` 错误诊断透传、Wayland 自动发现与非 POSIX 提示 (R3, R7)**：远端执行失败时截取最多 512 字节清洗后的 stderr 输出拼接到错误响应中；自动探测 Wayland 套接字（`/run/user/$(id -u)/wayland-0`）与 Xauthority（`.mutter-Xwaylandauth.*`、`gdm/Xauthority`）；补充 `gnome-screenshot` 回退；在 Windows 等非 POSIX 节点上调用 `gui` 时返回明确提示需要 POSIX shell (X11/Wayland) 环境。
+  - **Windows `server` + `cmd` 节点 `cwd` 适配 (R4)**：当节点为 `interpreter="server"` 且 `launch_dialect="cmd"` 时，通过 `DeriveWorkingDirectoryExecution` 安全派生局部执行配置，自动应用 `cd /d "<cwd>" || exit /b & ...` 包装。
+  - **PowerShell CLIXML 进度抑制与入口方言保护 (R5)**：在 PowerShell 命令前置注入 `$ProgressPreference = 'SilentlyContinue'; `，消除 `#< CLIXML` 进度流噪声；当目标节点已固定入口 `launchDialect`（如 `cmd`）时，运行时保护节点入口方言不被请求侧误覆盖。
+  - **Ubuntu `sudo-rs` 本地化 PAM 提示符剥离 (R6)**：`expandSudoPrompt` 支持识别 `sudo-rs` 本地化后缀（如 `[sudo: ...] 密码：`，支持 ASCII 冒号 `:` 与全角冒号 `：` / `\xef\xbc\x9a`），在 64 字节有界窗口内彻底清洗提示符，杜绝提示符字符渗入命令输出。
+
 

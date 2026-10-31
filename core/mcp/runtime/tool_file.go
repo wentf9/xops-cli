@@ -88,6 +88,7 @@ func (r *Runtime) fileHandler(ctx context.Context, _ *mcp.CallToolRequest, input
 	if input.NodeID == "" || input.Path == "" || input.Action == "" {
 		return nil, FileOutput{}, errors.New("nodeID, action, and path are required")
 	}
+	input.Path = remotefile.NormalizeSFTPPath(input.Path)
 	switch input.Action {
 	case "read", "write", "patch", "stat":
 	default:
@@ -148,13 +149,29 @@ func readBounded(ctx context.Context, files ports.FileSession, name string) (dat
 	return data, info, truncated, err
 }
 
-func fileRead(ctx context.Context, files ports.FileSession, input FileInput) (FileOutput, error) {
+func validateReadInput(input FileInput) (FileInput, error) {
+	input.Path = remotefile.NormalizeSFTPPath(input.Path)
+	if !path.IsAbs(input.Path) || strings.ContainsRune(input.Path, '\x00') {
+		return FileInput{}, errors.New("file path must be absolute")
+	}
+	if remotefile.IsRootPath(input.Path) {
+		return FileInput{}, errors.New("cannot read root directory as a file")
+	}
 	if len(input.Range) != 0 && len(input.Range) != 2 {
-		return FileOutput{}, errors.New("range must be [start_line, end_line]")
+		return FileInput{}, errors.New("range must be [start_line, end_line]")
 	}
 	if len(input.Range) == 2 && (input.Range[0] < 1 || input.Range[1] < input.Range[0]) {
-		return FileOutput{}, fmt.Errorf("invalid line range [%d, %d]: lines are 1-based and end_line >= start_line", input.Range[0], input.Range[1])
+		return FileInput{}, fmt.Errorf("invalid line range [%d, %d]: lines are 1-based and end_line >= start_line", input.Range[0], input.Range[1])
 	}
+	return input, nil
+}
+
+func fileRead(ctx context.Context, files ports.FileSession, input FileInput) (FileOutput, error) {
+	validInput, err := validateReadInput(input)
+	if err != nil {
+		return FileOutput{}, err
+	}
+	input = validInput
 
 	data, info, truncated, err := readBounded(ctx, files, input.Path)
 	if err != nil {
@@ -273,8 +290,12 @@ func filePatch(ctx context.Context, files ports.FileSession, input FileInput) (F
 // content hash must still match so concurrent edits are never overwritten.
 // Symbolic links and special files are always refused.
 func replaceFile(ctx context.Context, files ports.FileSession, name string, content []byte, expected *fileSnapshot) (bool, error) {
+	name = remotefile.NormalizeSFTPPath(name)
 	if !path.IsAbs(name) || strings.ContainsRune(name, '\x00') {
 		return false, errors.New("file path must be absolute")
+	}
+	if remotefile.IsRootPath(name) {
+		return false, errors.New("cannot replace root directory")
 	}
 	name = path.Clean(name)
 	dir := path.Dir(name)
@@ -594,7 +615,7 @@ func (r *Runtime) registerFile(server *mcp.Server, g *guardrail.Guardrail) {
 				return guardrail.RiskInput{
 					Action: in.Action,
 					NodeID: in.NodeID,
-					Paths:  []string{in.Path},
+					Paths:  []string{remotefile.NormalizeSFTPPath(in.Path)},
 				}
 			},
 			r.fileHandler,

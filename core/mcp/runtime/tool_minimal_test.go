@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -29,6 +30,8 @@ import (
 type stubResultBackend struct {
 	ports.Backend
 	runResult ports.CommandResult
+	runErr    error
+	lastCmd   ports.Command
 }
 
 func (b *stubResultBackend) ProbeExecution(context.Context, ports.Permit, string) (*ssh.ProbeResult, error) {
@@ -41,7 +44,11 @@ func (b *stubResultBackend) ProbeExecution(context.Context, ports.Permit, string
 	}, nil
 }
 
-func (b *stubResultBackend) Run(context.Context, ports.Permit, string, ports.Command) (ports.CommandResult, error) {
+func (b *stubResultBackend) Run(ctx context.Context, p ports.Permit, node string, cmd ports.Command) (ports.CommandResult, error) {
+	b.lastCmd = cmd
+	if b.runErr != nil {
+		return b.runResult, b.runErr
+	}
 	return b.runResult, nil
 }
 func (b *stubResultBackend) OpenFiles(context.Context, ports.Permit, string) (ports.FileSession, error) {
@@ -209,6 +216,65 @@ def greet():
 	if !strings.Contains(badJSONOut.LintWarning, "Warning: Syntax error") {
 		t.Fatalf("expected lint warning for invalid JSON, got %q", badJSONOut.LintWarning)
 	}
+
+}
+
+func TestFileToolWindowsPathAndDriveRoot(t *testing.T) {
+	client := startStdioSFTPRuntime(t, pkgsftp.InMemHandler())
+
+	// 1. Write file with Windows native path.
+	winWriteRes, err := client.CallTool(t.Context(), &mcp.CallToolParams{
+		Name: "file",
+		Arguments: FileInput{
+			NodeID:  "files",
+			Action:  "write",
+			Path:    `C:\workspace\win.txt`,
+			Content: "windows content",
+		},
+	})
+	if err != nil || winWriteRes.IsError {
+		t.Fatalf("file write with Windows path failed: err=%v res=%+v", err, winWriteRes)
+	}
+
+	// 2. Read file with Windows native path.
+	winReadRes, err := client.CallTool(t.Context(), &mcp.CallToolParams{
+		Name: "file",
+		Arguments: FileInput{
+			NodeID: "files",
+			Action: "read",
+			Path:   `C:\workspace\win.txt`,
+		},
+	})
+	if err != nil || winReadRes.IsError {
+		t.Fatalf("file read with Windows path failed: err=%v res=%+v", err, winReadRes)
+	}
+
+	// 3. Write on drive root must be rejected.
+	rootWriteRes, err := client.CallTool(t.Context(), &mcp.CallToolParams{
+		Name: "file",
+		Arguments: FileInput{
+			NodeID:  "files",
+			Action:  "write",
+			Path:    `C:\`,
+			Content: "root content",
+		},
+	})
+	if err == nil && !rootWriteRes.IsError {
+		t.Fatalf("expected write on drive root to fail, got success")
+	}
+
+	// 4. Read on drive root must be rejected.
+	rootReadRes, err := client.CallTool(t.Context(), &mcp.CallToolParams{
+		Name: "file",
+		Arguments: FileInput{
+			NodeID: "files",
+			Action: "read",
+			Path:   `C:\`,
+		},
+	})
+	if err == nil && !rootReadRes.IsError {
+		t.Fatalf("expected read on drive root to fail, got success")
+	}
 }
 
 func TestStdioTransferPushAndPull(t *testing.T) {
@@ -248,6 +314,48 @@ func TestStdioTransferPushAndPull(t *testing.T) {
 	got, err := os.ReadFile(dstFile)
 	if err != nil || string(got) != "push-and-pull-payload" {
 		t.Fatalf("pulled file mismatch: %q err=%v", got, err)
+	}
+
+	// First create directory on mock SFTP via file write
+	initRes, err := client.CallTool(t.Context(), &mcp.CallToolParams{
+		Name: "file",
+		Arguments: FileInput{
+			NodeID:  "files",
+			Action:  "write",
+			Path:    `C:\win_dir\init.txt`,
+			Content: "init",
+		},
+	})
+	if err != nil || initRes.IsError {
+		t.Fatalf("prepare mock win_dir failed: err=%v res=%+v", err, initRes)
+	}
+
+	// Push with Windows native path
+	winPushRes, err := client.CallTool(t.Context(), &mcp.CallToolParams{
+		Name: "transfer",
+		Arguments: TransferFileInput{
+			NodeID:     "files",
+			Direction:  "push",
+			LocalPath:  srcFile,
+			RemotePath: `C:\win_dir\win_pushed.txt`,
+		},
+	})
+	if err != nil || winPushRes.IsError {
+		t.Fatalf("stdio transfer push with Windows path failed: err=%v res=%+v", err, winPushRes)
+	}
+
+	// Push to drive root must fail
+	rootPushRes, err := client.CallTool(t.Context(), &mcp.CallToolParams{
+		Name: "transfer",
+		Arguments: TransferFileInput{
+			NodeID:     "files",
+			Direction:  "push",
+			LocalPath:  srcFile,
+			RemotePath: `C:\`,
+		},
+	})
+	if err == nil && !rootPushRes.IsError {
+		t.Fatalf("expected push to drive root to fail, got success")
 	}
 }
 
@@ -328,6 +436,22 @@ func TestTerminalOutputFoldingAndGUIScreenshot(t *testing.T) {
 	})
 	if err != nil || !truncRes.IsError {
 		t.Fatalf("expected tool error for truncated screenshot, got err=%v res=%+v", err, truncRes)
+	}
+
+	// 4. GUI non-zero exit error includes sanitized remote output diagnostic.
+	backend.runResult.Truncated = false
+	backend.runResult.Output = "no supported screenshot utility found (grim, spectacle, maim, import, scrot, gnome-screenshot)\n"
+	backend.runErr = errors.New("remote command exited with status 127")
+	failRes, err := client.CallTool(t.Context(), &mcp.CallToolParams{
+		Name:      "gui",
+		Arguments: GUIInput{NodeID: "node", Action: "shot"},
+	})
+	if err != nil || !failRes.IsError {
+		t.Fatalf("expected error for failed GUI command, got err=%v res=%+v", err, failRes)
+	}
+	errText := failRes.Content[0].(*mcp.TextContent).Text
+	if !strings.Contains(errText, "no supported screenshot utility found") {
+		t.Fatalf("expected diagnostic remote output in error text, got: %s", errText)
 	}
 }
 
@@ -763,5 +887,309 @@ func TestPruneFoldedLogsBoundsCacheDirectory(t *testing.T) {
 	}
 	if logCount != maxFoldedLogs || !hasNotes {
 		t.Fatalf("expected %d cmd logs and notes.txt preserved, got logCount=%d hasNotes=%v", maxFoldedLogs, logCount, hasNotes)
+	}
+}
+
+func TestHasUnredirectedBackgroundJob(t *testing.T) {
+	for _, tc := range []struct {
+		cmd  string
+		want bool
+	}{
+		{cmd: "Xvfb :1 & sleep 1", want: true},
+		{cmd: "Xvfb :1 &", want: true},
+		{cmd: "foo; bar &", want: true},
+		{cmd: "cmd1 & cmd2 &", want: true},
+		{cmd: "sleep 10 &", want: true},
+		{cmd: "foo 2>&1 &", want: true},
+		{cmd: "Xvfb :1 >/dev/null 2>&1 & sleep 1", want: false},
+		{cmd: "nohup python app.py > /dev/null 2>&1 &", want: false},
+		{cmd: "echo 'a & b'", want: false},
+		{cmd: "echo \"a & b\"", want: false},
+		{cmd: "make && make test", want: false},
+		{cmd: "foo 2>&1", want: false},
+		{cmd: "foo >& /dev/null &", want: false},
+		{cmd: "foo &> /dev/null &", want: false},
+		{cmd: "echo \\&", want: false},
+		{cmd: "echo \"foo \\\" & bar\"", want: false},
+	} {
+		t.Run(tc.cmd, func(t *testing.T) {
+			got := hasUnredirectedBackgroundJob(tc.cmd)
+			if got != tc.want {
+				t.Errorf("hasUnredirectedBackgroundJob(%q) = %v; want %v", tc.cmd, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTerminalBackgroundJobTimeoutDiagnostic(t *testing.T) {
+	backend := &stubResultBackend{
+		runResult: ports.CommandResult{
+			Connected: true,
+			Outcome:   ssh.ExecutionUnknown,
+		},
+		runErr: context.DeadlineExceeded,
+	}
+	client := startStubResultRuntime(t, backend)
+
+	// 1. Unredirected background job with deadline exceeded -> hint appended
+	res1, err := client.CallTool(t.Context(), &mcp.CallToolParams{
+		Name: "terminal",
+		Arguments: TerminalInput{
+			NodeID:  "node",
+			Command: "Xvfb :1 & sleep 1",
+			Session: "once",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected call error: %v", err)
+	}
+	var out1 TerminalOutput
+	raw1, _ := json.Marshal(res1.StructuredContent)
+	_ = json.Unmarshal(raw1, &out1)
+	if out1.Status != "failed" {
+		t.Fatalf("expected status failed, got %q", out1.Status)
+	}
+	expectedHint := "(hint: background jobs '&' in session='once' inherit SSH stdout/stderr pipes and block channel closure; redirect '>/dev/null 2>&1 </dev/null &' or use a persistent session)"
+	if !strings.Contains(out1.Error, expectedHint) {
+		t.Fatalf("expected diagnostic hint in error:\n%s", out1.Error)
+	}
+
+	// 2. Redirected background job with deadline exceeded -> NO hint
+	res2, err := client.CallTool(t.Context(), &mcp.CallToolParams{
+		Name: "terminal",
+		Arguments: TerminalInput{
+			NodeID:  "node",
+			Command: "Xvfb :1 >/dev/null 2>&1 & sleep 1",
+			Session: "once",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected call error: %v", err)
+	}
+	var out2 TerminalOutput
+	raw2, _ := json.Marshal(res2.StructuredContent)
+	_ = json.Unmarshal(raw2, &out2)
+	if strings.Contains(out2.Error, expectedHint) {
+		t.Fatalf("redirected job must not contain diagnostic hint:\n%s", out2.Error)
+	}
+
+	// 3. Normal command with non-timeout error -> NO hint
+	backend.runErr = errors.New("command exited with code 1")
+	res3, err := client.CallTool(t.Context(), &mcp.CallToolParams{
+		Name: "terminal",
+		Arguments: TerminalInput{
+			NodeID:  "node",
+			Command: "Xvfb :1 &",
+			Session: "once",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected call error: %v", err)
+	}
+	var out3 TerminalOutput
+	raw3, _ := json.Marshal(res3.StructuredContent)
+	_ = json.Unmarshal(raw3, &out3)
+	if strings.Contains(out3.Error, expectedHint) {
+		t.Fatalf("non-timeout error must not contain diagnostic hint:\n%s", out3.Error)
+	}
+}
+
+func TestGUIDisplayParameterAndValidation(t *testing.T) {
+	backend := &stubResultBackend{
+		runResult: ports.CommandResult{
+			Output:    "___MCP_GUI_IMG_BEGIN___\niVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==\n___MCP_GUI_IMG_END___\n",
+			Connected: true,
+			Outcome:   ssh.ExecutionCompleted,
+		},
+	}
+	client := startStubResultRuntime(t, backend)
+
+	// 1. Valid explicit display :1
+	res1, err := client.CallTool(t.Context(), &mcp.CallToolParams{
+		Name: "gui",
+		Arguments: GUIInput{
+			NodeID:  "node",
+			Action:  "shot",
+			Display: ":1",
+		},
+	})
+	if err != nil || res1.IsError {
+		t.Fatalf("gui shot with display :1 failed: err=%v res=%+v", err, res1)
+	}
+	if !strings.Contains(backend.lastCmd.Text, "export DISPLAY=':1'") {
+		t.Fatalf("expected export DISPLAY=':1' in generated script:\n%s", backend.lastCmd.Text)
+	}
+
+	// 2. Omitted display auto-detects
+	res2, err := client.CallTool(t.Context(), &mcp.CallToolParams{
+		Name: "gui",
+		Arguments: GUIInput{
+			NodeID: "node",
+			Action: "shot",
+		},
+	})
+	if err != nil || res2.IsError {
+		t.Fatalf("gui shot with omitted display failed: err=%v res=%+v", err, res2)
+	}
+	if !strings.Contains(backend.lastCmd.Text, "for _sock in /tmp/.X11-unix/X*; do") {
+		t.Fatalf("expected auto-detection loop in generated script:\n%s", backend.lastCmd.Text)
+	}
+
+	// 3. Invalid display rejected before backend invocation
+	backend.lastCmd = ports.Command{}
+	res3, err := client.CallTool(t.Context(), &mcp.CallToolParams{
+		Name: "gui",
+		Arguments: GUIInput{
+			NodeID:  "node",
+			Action:  "shot",
+			Display: ":1; rm -rf /",
+		},
+	})
+	if err == nil && !res3.IsError {
+		t.Fatal("expected error for invalid display injection")
+	}
+	if backend.lastCmd.Text != "" {
+		t.Fatalf("backend must not be called when display validation fails, but got:\n%s", backend.lastCmd.Text)
+	}
+}
+
+type staticExecutionSource struct {
+	ports.StateSource
+	execution *ssh.ExecutionConfig
+}
+
+func (s staticExecutionSource) Resolve(ctx context.Context, request ports.ResolveRequest) (ports.OperationSnapshot, error) {
+	view, err := s.StateSource.Resolve(ctx, request)
+	if err != nil {
+		return view, err
+	}
+	view = view.Clone()
+	for id, target := range view.Targets {
+		target.Execution = s.execution.Clone()
+		target.ExecutionVersion = ports.ExecutionVersion(target.Execution)
+		view.Targets[id] = target
+	}
+	return view, nil
+}
+
+func TestTerminalSingleCommandCwdUnderServerCmd(t *testing.T) {
+	backend := &stubResultBackend{
+		runResult: ports.CommandResult{
+			Output:    "wentf\n",
+			Connected: true,
+			Outcome:   ssh.ExecutionCompleted,
+		},
+	}
+	provider := runtimeTestProvider("win-node")
+	target := &ssh.ExecutionConfig{
+		Interpreter:   ssh.InterpreterServer,
+		LaunchDialect: ssh.LaunchCmd,
+	}
+	source := staticExecutionSource{provider, target}
+
+	deps := ports.Dependencies{
+		State:      source,
+		Gate:       executionRiskGate{source.DomainID()},
+		Audit:      ports.NoopAudit{},
+		NewBackend: func(context.Context) (ports.Backend, error) { return backend, nil },
+	}
+	r, err := NewRuntime(t.Context(), WithDependencies(deps))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := connectRuntimeTestClient(t, r)
+
+	res, err := client.CallTool(t.Context(), &mcp.CallToolParams{
+		Name: "terminal",
+		Arguments: TerminalInput{
+			NodeID:  "win-node",
+			Command: "whoami",
+			Cwd:     `C:\Users\wentf`,
+			Session: "once",
+		},
+	})
+	if err != nil || res.IsError {
+		t.Fatalf("terminal call failed: err=%v res=%+v", err, res)
+	}
+	expectedText := `cd /d "C:\Users\wentf" || exit /b & whoami`
+	if backend.lastCmd.Text != expectedText {
+		t.Fatalf("expected command text %q, got %q", expectedText, backend.lastCmd.Text)
+	}
+	if backend.lastCmd.Execution.EffectiveInterpreter() != ssh.InterpreterCmd {
+		t.Fatalf("expected derived execution InterpreterCmd, got %v", backend.lastCmd.Execution.EffectiveInterpreter())
+	}
+}
+
+func TestWindowsLaunchDialectProtection(t *testing.T) {
+	backend := &stubResultBackend{
+		runResult: ports.CommandResult{
+			Output:    "wentf\n",
+			Connected: true,
+			Outcome:   ssh.ExecutionCompleted,
+		},
+	}
+	provider := runtimeTestProvider("win-node")
+	target := &ssh.ExecutionConfig{
+		Interpreter:   ssh.InterpreterServer,
+		LaunchDialect: ssh.LaunchCmd,
+	}
+	source := staticExecutionSource{provider, target}
+
+	deps := ports.Dependencies{
+		State:      source,
+		Gate:       executionRiskGate{source.DomainID()},
+		Audit:      ports.NoopAudit{},
+		NewBackend: func(context.Context) (ports.Backend, error) { return backend, nil },
+	}
+	r, err := NewRuntime(t.Context(), WithDependencies(deps))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := connectRuntimeTestClient(t, r)
+
+	res, err := client.CallTool(t.Context(), &mcp.CallToolParams{
+		Name: "terminal",
+		Arguments: TerminalInput{
+			NodeID:  "win-node",
+			Command: "whoami",
+			Execution: &ssh.ExecutionConfig{
+				Interpreter:   ssh.InterpreterPowerShell,
+				LaunchDialect: ssh.LaunchPowerShell,
+			},
+			Session: "once",
+		},
+	})
+	if err != nil || res.IsError {
+		t.Fatalf("terminal call failed: err=%v res=%+v", err, res)
+	}
+	if backend.lastCmd.Execution.LaunchDialect != ssh.LaunchCmd {
+		t.Fatalf("expected LaunchDialect to be protected as %v, got %v", ssh.LaunchCmd, backend.lastCmd.Execution.LaunchDialect)
+	}
+	if backend.lastCmd.Execution.Interpreter != ssh.InterpreterPowerShell {
+		t.Fatalf("expected Interpreter to be powershell, got %v", backend.lastCmd.Execution.Interpreter)
+	}
+}
+
+func TestSanitizeRemoteOutput(t *testing.T) {
+	// Bounded limit test
+	longText := strings.Repeat("A", 1000)
+	got := sanitizeRemoteOutput(longText, 512)
+	if len(got) > 512 {
+		t.Fatalf("expected length <= 512, got %d", len(got))
+	}
+
+	// Non-printable control characters and newline cleaning
+	dirty := "Failed:\r\nline 1\r\nline 2\t\x00\x1b[31merr\x1b[0m\a\b"
+	cleaned := sanitizeRemoteOutput(dirty, 512)
+	if strings.ContainsAny(cleaned, "\r\n\x00\x1b\a\b") {
+		t.Fatalf("cleaned output still has control characters: %q", cleaned)
+	}
+	if !strings.Contains(cleaned, "Failed: line 1 line 2") {
+		t.Fatalf("cleaned output missing words: %q", cleaned)
+	}
+
+	// Empty and whitespace
+	if sanitizeRemoteOutput("  \r\n  ", 512) != "" {
+		t.Fatalf("expected empty string for whitespace input")
 	}
 }

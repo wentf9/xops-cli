@@ -33,7 +33,7 @@ func encodePowerShellCommand(command string) string {
 // and native process exit codes ($LASTEXITCODE) are faithfully propagated to the
 // PowerShell process exit code.
 func wrapPowerShellCommand(command string) string {
-	return "$ErrorActionPreference = 'Stop'\n" + command + "\nif ($LASTEXITCODE -ne $null -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+	return "$ProgressPreference = 'SilentlyContinue'; $ErrorActionPreference = 'Stop'\n" + command + "\nif ($LASTEXITCODE -ne $null -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
 }
 
 // powershellCommandPayload builds the payload for Windows PowerShell (powershell.exe).

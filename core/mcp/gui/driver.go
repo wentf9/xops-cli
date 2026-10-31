@@ -11,6 +11,7 @@ import (
 	"image/color"
 	"image/jpeg"
 	_ "image/png" // Register PNG decoder
+	"regexp"
 	"strings"
 )
 
@@ -35,15 +36,21 @@ const (
 	imageEndMarker   = "___MCP_GUI_IMG_END___"
 )
 
+var displayPattern = regexp.MustCompile(`^:[0-9]+(\.[0-9]+)?$`)
+
 // Request describes a normalized GUI action.
 type Request struct {
-	Action string
-	Coord  []int
-	Text   string
+	Action  string
+	Coord   []int
+	Text    string
+	Display string
 }
 
 // Validate checks action, coordinate bounds (0-1000), and required parameters.
 func (r Request) Validate() error {
+	if r.Display != "" && !displayPattern.MatchString(r.Display) {
+		return fmt.Errorf("invalid display %q: must match ^:[0-9]+(\\.[0-9]+)?$", r.Display)
+	}
 	for _, c := range r.Coord {
 		if c < 0 || c > 1000 {
 			return fmt.Errorf("coordinate %d out of normalized [0, 1000] range", c)
@@ -96,8 +103,41 @@ func BuildScript(req Request) (string, error) {
 
 	var b strings.Builder
 	b.WriteString("set -e\n")
-	b.WriteString("export DISPLAY=\"${DISPLAY:-:0}\"\n")
-	b.WriteString("if [ -z \"${XAUTHORITY:-}\" ] && [ -r \"$HOME/.Xauthority\" ]; then export XAUTHORITY=\"$HOME/.Xauthority\"; fi\n")
+	b.WriteString("if [ -z \"${XDG_RUNTIME_DIR:-}\" ]; then\n")
+	b.WriteString("  _uid=$(id -u 2>/dev/null || true)\n")
+	b.WriteString("  if [ -n \"$_uid\" ] && [ -d \"/run/user/$_uid\" ]; then\n")
+	b.WriteString("    export XDG_RUNTIME_DIR=\"/run/user/$_uid\"\n")
+	b.WriteString("  fi\n")
+	b.WriteString("fi\n")
+	if req.Display != "" {
+		fmt.Fprintf(&b, "export DISPLAY=%s\n", shellQuote(req.Display))
+	} else {
+		b.WriteString("if [ -z \"${WAYLAND_DISPLAY:-}\" ] && [ -n \"${XDG_RUNTIME_DIR:-}\" ] && [ -S \"$XDG_RUNTIME_DIR/wayland-0\" ]; then\n")
+		b.WriteString("  export WAYLAND_DISPLAY=\"wayland-0\"\n")
+		b.WriteString("fi\n")
+		b.WriteString("if [ -z \"${DISPLAY:-}\" ]; then\n")
+		b.WriteString("  if [ ! -S /tmp/.X11-unix/X0 ]; then\n")
+		b.WriteString("    for _sock in /tmp/.X11-unix/X*; do\n")
+		b.WriteString("      if [ -S \"$_sock\" ]; then DISPLAY=\":${_sock#/tmp/.X11-unix/X}\"; break; fi\n")
+		b.WriteString("    done\n")
+		b.WriteString("  fi\n")
+		b.WriteString("  export DISPLAY=\"${DISPLAY:-:0}\"\n")
+		b.WriteString("fi\n")
+	}
+	b.WriteString("if [ -z \"${XAUTHORITY:-}\" ]; then\n")
+	b.WriteString("  if [ -r \"$HOME/.Xauthority\" ]; then\n")
+	b.WriteString("    export XAUTHORITY=\"$HOME/.Xauthority\"\n")
+	b.WriteString("  elif [ -n \"${XDG_RUNTIME_DIR:-}\" ]; then\n")
+	b.WriteString("    for _auth in \"$XDG_RUNTIME_DIR\"/.mutter-Xwaylandauth.*; do\n")
+	b.WriteString("      if [ -r \"$_auth\" ]; then export XAUTHORITY=\"$_auth\"; break; fi\n")
+	b.WriteString("    done\n")
+	b.WriteString("    if [ -z \"${XAUTHORITY:-}\" ] && [ -r \"$XDG_RUNTIME_DIR/gdm/Xauthority\" ]; then\n")
+	b.WriteString("      export XAUTHORITY=\"$XDG_RUNTIME_DIR/gdm/Xauthority\"\n")
+	b.WriteString("    elif [ -z \"${XAUTHORITY:-}\" ] && [ -r \"$XDG_RUNTIME_DIR/Xauthority\" ]; then\n")
+	b.WriteString("      export XAUTHORITY=\"$XDG_RUNTIME_DIR/Xauthority\"\n")
+	b.WriteString("    fi\n")
+	b.WriteString("  fi\n")
+	b.WriteString("fi\n")
 	b.WriteString("RES=$(xdpyinfo 2>/dev/null | awk '/dimensions:/ {print $2; exit}' || true)\n")
 	b.WriteString("if [ -z \"$RES\" ]; then RES=$(xrandr 2>/dev/null | awk '/\\*/ {print $1; exit}' || true); fi\n")
 	b.WriteString("RES_W=$(printf '%s' \"$RES\" | cut -d'x' -f1)\n")
@@ -125,18 +165,20 @@ func BuildScript(req Request) (string, error) {
 	b.WriteString("TMP_DIR=$(mktemp -d \"${TMPDIR:-/tmp}/mcp_gui.XXXXXXXXXX\")\n")
 	b.WriteString("trap 'rm -rf \"$TMP_DIR\"' EXIT\n")
 	b.WriteString("TMP_IMG=\"$TMP_DIR/shot.png\"\n")
-	b.WriteString("if [ -n \"${WAYLAND_DISPLAY:-}\" ] && command -v grim >/dev/null 2>&1; then\n")
-	b.WriteString("  grim \"$TMP_IMG\"\n")
-	b.WriteString("elif [ -n \"${WAYLAND_DISPLAY:-}\" ] && command -v spectacle >/dev/null 2>&1; then\n")
-	b.WriteString("  spectacle -b -n -o \"$TMP_IMG\"\n")
-	b.WriteString("elif command -v maim >/dev/null 2>&1; then\n")
-	b.WriteString("  maim \"$TMP_IMG\"\n")
-	b.WriteString("elif command -v import >/dev/null 2>&1; then\n")
-	b.WriteString("  import -window root \"$TMP_IMG\"\n")
-	b.WriteString("elif command -v scrot >/dev/null 2>&1; then\n")
-	b.WriteString("  scrot -o \"$TMP_IMG\"\n")
+	b.WriteString("if [ -n \"${WAYLAND_DISPLAY:-}\" ] && command -v grim >/dev/null 2>&1 && grim \"$TMP_IMG\" 2>/dev/null; then\n")
+	b.WriteString("  :\n")
+	b.WriteString("elif [ -n \"${WAYLAND_DISPLAY:-}\" ] && command -v spectacle >/dev/null 2>&1 && spectacle -b -n -o \"$TMP_IMG\" 2>/dev/null; then\n")
+	b.WriteString("  :\n")
+	b.WriteString("elif command -v maim >/dev/null 2>&1 && maim \"$TMP_IMG\" 2>/dev/null; then\n")
+	b.WriteString("  :\n")
+	b.WriteString("elif command -v import >/dev/null 2>&1 && import -window root \"$TMP_IMG\" 2>/dev/null; then\n")
+	b.WriteString("  :\n")
+	b.WriteString("elif command -v scrot >/dev/null 2>&1 && scrot -o \"$TMP_IMG\" 2>/dev/null; then\n")
+	b.WriteString("  :\n")
+	b.WriteString("elif command -v gnome-screenshot >/dev/null 2>&1 && gnome-screenshot -f \"$TMP_IMG\" 2>/dev/null; then\n")
+	b.WriteString("  :\n")
 	b.WriteString("else\n")
-	b.WriteString("  echo 'no supported screenshot utility found (grim, spectacle, maim, import, scrot)' >&2\n")
+	b.WriteString("  echo 'no supported screenshot utility found (grim, spectacle, maim, import, scrot, gnome-screenshot)' >&2\n")
 	b.WriteString("  exit 127\n")
 	b.WriteString("fi\n")
 	fmt.Fprintf(&b, "printf '%s\\n'\n", imageBeginMarker)

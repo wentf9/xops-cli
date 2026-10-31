@@ -284,7 +284,15 @@ func (b *backend) Run(ctx context.Context, permit ports.Permit, nodeID string, c
 			}, err
 		}
 	}
-	if command.Filesystem || command.RequirePOSIX {
+	if command.RequirePOSIX {
+		if plan.LaunchDialect() != ssh.LaunchPOSIX {
+			err = fmt.Errorf("%w: non-POSIX execution dialect %q is not supported; POSIX shell target (X11/Wayland) is required", ssh.ErrExecutionValidation, plan.LaunchDialect())
+			return ports.CommandResult{
+				Outcome:      ssh.ExecutionNotStarted,
+				ExecutionErr: err,
+			}, err
+		}
+	} else if command.Filesystem {
 		if plan.LaunchDialect() != ssh.LaunchPOSIX {
 			err = fmt.Errorf("%w: non-POSIX execution dialect %q is not supported for generated filesystem commands", ssh.ErrExecutionValidation, plan.LaunchDialect())
 			return ports.CommandResult{

@@ -28,15 +28,17 @@ import (
 )
 
 const (
-	DefaultTimeout          = 5 * time.Second
-	DefaultIdleTTL          = 30 * time.Minute
-	DefaultMaxSessions      = 16
-	DefaultMaxTotalSessions = 64
-	maxSessionLifetime      = 12 * time.Hour
-	maxBufferBytes          = 256 * 1024
-	signalSettleWindow      = 100 * time.Millisecond
-	eofSettleWindow         = time.Second
-	minReaperInterval       = 10 * time.Millisecond
+	DefaultTimeout           = 5 * time.Second
+	DefaultIdleTTL           = 30 * time.Minute
+	DefaultMaxSessions       = 16
+	DefaultMaxTotalSessions  = 64
+	maxSessionLifetime       = 12 * time.Hour
+	maxBufferBytes           = 256 * 1024
+	signalSettleWindow       = 100 * time.Millisecond
+	activeSignalSettleWindow = 2 * time.Second
+	sessionInitSettleWindow  = 100 * time.Millisecond
+	eofSettleWindow          = time.Second
+	minReaperInterval        = 10 * time.Millisecond
 
 	sentinelHead = "___MCP_"
 	sentinelTail = "DONE_"
@@ -60,8 +62,9 @@ var (
 	// ErrManagerClosed is returned after Shutdown.
 	ErrManagerClosed = errors.New("session manager is shut down")
 
-	staleSentinelPattern = regexp.MustCompile(`\n?` + sentinelMark + `[0-9a-f]+_[0-9]+` + sentinelEnd + `\n?`)
-	ansiEscapePattern    = regexp.MustCompile(`\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])`)
+	staleSentinelPattern     = regexp.MustCompile(`\n?` + sentinelMark + `[0-9a-f]+_[0-9]+` + sentinelEnd + `\n?`)
+	echoedSentinelCmdPattern = regexp.MustCompile(`(?m)^[^\n]*printf '\\n%s%s_%d` + sentinelEnd + `\\n' '` + sentinelHead + `' '` + sentinelTail + `[0-9a-f]+' [^\n]*\n?`)
+	ansiEscapePattern        = regexp.MustCompile(`\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])`)
 )
 
 // State describes what is known about the command after an Execute call.
@@ -265,7 +268,7 @@ func (m *Manager) executeExisting(ctx context.Context, req ExecuteRequest, upper
 
 	var res ExecuteResult
 	if isSignalCommand(upper) {
-		res, err = sess.sendSignal(ctx, req.Key.SessionName, upper)
+		res, err = sess.sendSignal(ctx, req.Key.SessionName, upper, req.Timeout)
 	} else {
 		res, err = sess.pollOutput(ctx, timeout)
 	}
@@ -496,6 +499,18 @@ func (m *Manager) getOrCreate(ctx context.Context, req ExecuteRequest) (sess *ma
 		_ = newSess.close()
 		return nil, fmt.Errorf("initialize PTY session %q: %w", req.Key.SessionName, err)
 	}
+	if sessionInitSettleWindow > 0 {
+		timer := time.NewTimer(sessionInitSettleWindow)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			_ = newSess.close()
+			return nil, ctx.Err()
+		}
+		timer.Stop()
+		newSess.drain()
+	}
 
 	handedOff = true
 	return m.publishSession(req, call, newSess)
@@ -724,7 +739,7 @@ func (s *managedSession) readLoop() {
 // activeSentinel is cleared only if the completion sentinel is actually
 // observed during the settle window (or if SIGKILL forcibly terminates the
 // session), so an ignored signal cannot be used to bypass ErrSessionBusy.
-func (s *managedSession) sendSignal(ctx context.Context, sessionName, upperCmd string) (ExecuteResult, error) {
+func (s *managedSession) sendSignal(ctx context.Context, sessionName, upperCmd string, timeout time.Duration) (ExecuteResult, error) {
 	needsInputLock := signalWritesStdin(upperCmd)
 	if needsInputLock {
 		s.inputMu.Lock()
@@ -741,7 +756,12 @@ func (s *managedSession) sendSignal(ctx context.Context, sessionName, upperCmd s
 		return s.settleIdleSignal(ctx, upperCmd), nil
 	}
 
-	res, err := s.waitSentinel(ctx, sentinel, signalSettleWindow)
+	settleTimeout := activeSignalSettleWindow
+	if timeout > settleTimeout {
+		settleTimeout = timeout
+	}
+
+	res, err := s.waitSentinel(ctx, sentinel, settleTimeout)
 	if err != nil {
 		return ExecuteResult{}, err
 	}
@@ -916,6 +936,7 @@ func cleanTerminalOutput(raw string) string {
 	raw = strings.ReplaceAll(raw, "\r\n", "\n")
 	raw = ansiEscapePattern.ReplaceAllString(raw, "")
 	raw = staleSentinelPattern.ReplaceAllString(raw, "\n")
+	raw = echoedSentinelCmdPattern.ReplaceAllString(raw, "")
 	if strings.ContainsRune(raw, '\r') {
 		lines := strings.Split(raw, "\n")
 		for i, line := range lines {
@@ -943,9 +964,9 @@ func sessionInitCommand(dialect ssh.LaunchDialect) string {
 	case ssh.LaunchFish:
 		return "stty -echo noflsh 2>/dev/null; function fish_prompt; end; function fish_right_prompt; end; function fish_mode_prompt; end; set -g fish_greeting ''; set -gx TERM dumb; set -gx NO_COLOR 1; set -gx DEBIAN_FRONTEND noninteractive; set -gx GIT_TERMINAL_PROMPT 0; set -gx CI true\n"
 	case ssh.LaunchCsh:
-		return "stty -echo noflsh >& /dev/null; set prompt=''; set rprompt=''; setenv TERM dumb; setenv NO_COLOR 1; setenv DEBIAN_FRONTEND noninteractive; setenv GIT_TERMINAL_PROMPT 0; setenv CI true\n"
+		return "unset edit; set prompt=''; set prompt2=''; set rprompt=''; stty -echo noflsh >& /dev/null; setenv TERM dumb; setenv NO_COLOR 1; setenv DEBIAN_FRONTEND noninteractive; setenv GIT_TERMINAL_PROMPT 0; setenv CI true\n"
 	default:
-		return "stty -echo noflsh 2>/dev/null; PS1=''; export TERM=dumb NO_COLOR=1 DEBIAN_FRONTEND=noninteractive GIT_TERMINAL_PROMPT=0 CI=true\n"
+		return "set +o emacs 2>/dev/null; set +o vi 2>/dev/null; unsetopt zle PROMPT_SP 2>/dev/null; PS1=''; PS2=''; PROMPT=''; PROMPT2=''; stty -echo noflsh 2>/dev/null; export TERM=dumb NO_COLOR=1 DEBIAN_FRONTEND=noninteractive GIT_TERMINAL_PROMPT=0 CI=true\n"
 	}
 }
 

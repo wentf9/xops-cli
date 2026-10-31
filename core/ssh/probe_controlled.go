@@ -46,18 +46,32 @@ func (c *Client) ProbeControlledExecution(ctx context.Context, execution *Execut
 	return resolved, nil
 }
 
+// DeriveWorkingDirectoryExecution returns a derived ExecutionConfig when an explicit
+// server interpreter has a known launch dialect that can safely execute cd.
+func DeriveWorkingDirectoryExecution(execution *ExecutionConfig) (*ExecutionConfig, bool) {
+	if execution == nil || execution.EffectiveInterpreter() != InterpreterServer {
+		return nil, false
+	}
+	switch execution.LaunchDialect {
+	case LaunchCmd:
+		resolved := execution.Clone()
+		resolved.Interpreter = InterpreterCmd
+		return resolved, true
+	default:
+		return nil, false
+	}
+}
+
 // ResolveWorkingDirectoryExecution selects an adapter for one cwd-aware command.
 // A known server/cmd configuration has native CMD semantics, so CMD can apply
 // the directory without changing command language. Keep this derived adapter
 // session-local; unspecified configurations still use the bounded probe.
 func (c *Client) ResolveWorkingDirectoryExecution(ctx context.Context, execution *ExecutionConfig) (*ExecutionConfig, error) {
-	if execution != nil && execution.EffectiveInterpreter() == InterpreterServer && execution.LaunchDialect == LaunchCmd {
-		if err := execution.Validate(); err != nil {
+	if derived, ok := DeriveWorkingDirectoryExecution(execution); ok {
+		if err := derived.Validate(); err != nil {
 			return nil, err
 		}
-		resolved := execution.Clone()
-		resolved.Interpreter = InterpreterCmd
-		return resolved, nil
+		return derived, nil
 	}
 	return c.ProbeControlledExecution(ctx, execution)
 }

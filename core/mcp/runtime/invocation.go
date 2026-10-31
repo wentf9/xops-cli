@@ -83,11 +83,46 @@ func (r *Runtime) operationContext(ctx context.Context, view ports.OperationSnap
 	return context.WithValue(guardrail.WithPolicy(ctx, view.Policy, digest), operationKey{}, op), op, nil
 }
 
+func resolveTargetExecution(request, target *ssh.ExecutionConfig) (*ssh.ExecutionConfig, error) {
+	reqExec := request
+	if reqExec != nil && target != nil && target.LaunchDialect != "" && reqExec.LaunchDialect != "" && reqExec.LaunchDialect != target.LaunchDialect {
+		reqExec = reqExec.Clone()
+		reqExec.LaunchDialect = target.LaunchDialect
+	}
+	effective, err := ssh.ResolveExecution(reqExec, target)
+	if err != nil {
+		return nil, err
+	}
+	if target != nil && target.LaunchDialect != "" && effective != nil {
+		effective.LaunchDialect = target.LaunchDialect
+	}
+	return effective, nil
+}
+
+func classifyShellDialect(plan ssh.CommandPlan) string {
+	switch plan.Interpreter() {
+	case ssh.InterpreterFish:
+		return string(ssh.LaunchFish)
+	case ssh.InterpreterCsh, ssh.InterpreterTcsh:
+		return string(ssh.LaunchCsh)
+	default:
+		return ""
+	}
+}
+
+func isValidProbeResult(result *ssh.ProbeResult) bool {
+	return result != nil &&
+		result.DetectedDialect != "" &&
+		result.DetectedDialect != ssh.LaunchUnknown &&
+		result.SuggestedConfig.Interpreter != "" &&
+		result.SuggestedConfig.LaunchDialect == result.DetectedDialect
+}
+
 // Freeze command semantics before policy evaluation. An explicit server
 // environment without trusted dialect metadata
 // is unknown, never the legacy empty-string POSIX safe-prefix classification.
 func resolveExecutionRisk(input guardrail.RiskInput, target ports.Target) (guardrail.RiskInput, error) {
-	effective, err := ssh.ResolveExecution(input.Execution, target.Execution)
+	effective, err := resolveTargetExecution(input.Execution, target.Execution)
 	if err != nil {
 		return input, err
 	}
@@ -119,18 +154,15 @@ func resolveExecutionRisk(input guardrail.RiskInput, target ports.Target) (guard
 		}
 	}
 	if input.Action != riskActionShell {
-		if plan.Interpreter() == ssh.InterpreterFish {
-			input.Dialect = string(ssh.LaunchFish)
-		}
-		if plan.Interpreter() == ssh.InterpreterCsh || plan.Interpreter() == ssh.InterpreterTcsh {
-			input.Dialect = string(ssh.LaunchCsh)
+		if dialect := classifyShellDialect(plan); dialect != "" {
+			input.Dialect = dialect
 		}
 	}
 	return input, nil
 }
 
 func (r *Runtime) prepareExecution(ctx context.Context, g *guardrail.Guardrail, view ports.OperationSnapshot, tool string, input any, risk guardrail.RiskInput, target ports.Target) (_ guardrail.RiskInput, _ ports.Target, probed bool, retErr error) {
-	effective, err := ssh.ResolveExecution(risk.Execution, target.Execution)
+	effective, err := resolveTargetExecution(risk.Execution, target.Execution)
 	if err != nil {
 		return risk, target, false, err
 	}
@@ -158,7 +190,7 @@ func (r *Runtime) prepareExecution(ctx context.Context, g *guardrail.Guardrail, 
 	if err != nil {
 		return risk, target, false, fmt.Errorf("prepare MCP execution: %w", err)
 	}
-	if result == nil || result.DetectedDialect == "" || result.DetectedDialect == ssh.LaunchUnknown || result.SuggestedConfig.Interpreter == "" || result.SuggestedConfig.LaunchDialect != result.DetectedDialect {
+	if !isValidProbeResult(result) {
 		return risk, target, false, fmt.Errorf("%w: incomplete MCP execution probe", ssh.ErrExecutionProbe)
 	}
 	if err := result.SuggestedConfig.Validate(); err != nil {

@@ -108,7 +108,7 @@
       "idempotentHint": false,
       "readOnlyHint": false
     },
-    "description": "Visual desktop automation (Computer Use) on a remote Linux SSH node (X11, or Wayland with ydotool/grim). Uses 0-1000 normalized coordinates and returns a compressed screenshot (longest edge \u003c= 1280px) after every action. Keyboard actions ('type', 'key') are rated Dangerous and require approval under the default policy.",
+    "description": "Visual desktop automation (Computer Use) on a remote Linux/FreeBSD/Unix SSH node (X11, or Wayland with ydotool/grim). Uses 0-1000 normalized coordinates and returns a compressed screenshot (longest edge \u003c= 1280px) after every action. Keyboard actions ('type', 'key') are rated Dangerous and require approval under the default policy.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -125,6 +125,10 @@
             "null",
             "array"
           ]
+        },
+        "display": {
+          "description": "Optional X11 display (e.g. :0, :1); auto-detected when omitted",
+          "type": "string"
         },
         "nodeID": {
           "description": "Target SSH node ID or alias",
@@ -277,7 +281,7 @@
         },
         "execution": {
           "additionalProperties": false,
-          "description": "Optional execution configuration overriding node/global defaults (once mode only); supports fish and zsh. Unspecified environments are probed when the backend supports discovery; explicit server preserves passthrough.",
+          "description": "Optional execution configuration overriding node/global defaults (once mode only); supports fish, zsh, and csh/tcsh. Unspecified environments are probed when the backend supports discovery; explicit server preserves passthrough.",
           "properties": {
             "interpreter": {
               "type": "string"
@@ -306,7 +310,7 @@
           "type": "string"
         },
         "session": {
-          "description": "Session mode: 'once' (default, stateless) or a custom session name to persist PTY state (cwd, env, background jobs) in the remote POSIX login shell",
+          "description": "Session mode: 'once' (default, stateless) or a custom session name to persist PTY state (cwd, env, background jobs) in the remote login shell (supports POSIX shells, fish, and csh/tcsh)",
           "type": "string"
         },
         "sudo": {
@@ -461,7 +465,7 @@
           "type": "string"
         },
         "requestID": {
-          "description": "Client-generated idempotency key for create. Reuse the same key and parameters to recover a lost response.",
+          "description": "Optional client-generated idempotency key for create (auto-generated if omitted). Reuse the same key and parameters to recover a lost response.",
           "type": "string"
         },
         "state": {

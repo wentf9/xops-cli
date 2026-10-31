@@ -148,17 +148,55 @@ func applyBlock(content string, block Block) (string, bool, error) {
 		return "", false, fmt.Errorf("%w: found %d exact matches; include more surrounding context lines", ErrAmbiguousMatch, exactCount)
 	}
 
-	// Stage 2: Line-by-line TrimSpace fallback with indentation alignment.
 	contentLines := strings.Split(content, "\n")
 	searchLines := strings.Split(block.Search, "\n")
+
+	// Stage 2: Line-by-line TrimSpace fallback with indentation alignment.
+	if res, ok, err := applyStage2(contentLines, searchLines, block.Replace); ok || err != nil {
+		return res, ok, err
+	}
+
+	// Stage 2b: Fuzzy fallback when search block contains leading or trailing blank lines.
+	return applyStage2b(contentLines, searchLines, block.Replace)
+}
+
+func applyStage2(contentLines, searchLines []string, replace string) (string, bool, error) {
 	if len(contentLines) < len(searchLines) {
-		return "", false, ErrNoMatch
+		return "", false, nil
 	}
 
 	var matchIndices []int
 	maxStart := len(contentLines) - len(searchLines)
 	for start := 0; start <= maxStart; start++ {
 		if matchesTrimmed(contentLines[start:start+len(searchLines)], searchLines) {
+			matchIndices = append(matchIndices, start)
+		}
+	}
+
+	if len(matchIndices) == 1 {
+		return replaceMatchedWindow(contentLines, searchLines, matchIndices[0], replace), true, nil
+	}
+	if len(matchIndices) > 1 {
+		return "", false, fmt.Errorf("%w: found %d whitespace-insensitive matches; include more surrounding context lines", ErrAmbiguousMatch, len(matchIndices))
+	}
+	return "", false, nil
+}
+
+func applyStage2b(contentLines, searchLines []string, replace string) (string, bool, error) {
+	firstNonBlank, lastNonBlank := findNonBlankLineRange(searchLines)
+	if firstNonBlank == -1 || (firstNonBlank == 0 && lastNonBlank == len(searchLines)-1) {
+		return "", false, ErrNoMatch
+	}
+
+	trimmedSearchLines := searchLines[firstNonBlank : lastNonBlank+1]
+	if len(contentLines) < len(trimmedSearchLines) {
+		return "", false, ErrNoMatch
+	}
+
+	var matchIndices []int
+	maxStart := len(contentLines) - len(trimmedSearchLines)
+	for start := 0; start <= maxStart; start++ {
+		if matchesTrimmed(contentLines[start:start+len(trimmedSearchLines)], trimmedSearchLines) {
 			matchIndices = append(matchIndices, start)
 		}
 	}
@@ -170,11 +208,28 @@ func applyBlock(content string, block Block) (string, bool, error) {
 		return "", false, fmt.Errorf("%w: found %d whitespace-insensitive matches; include more surrounding context lines", ErrAmbiguousMatch, len(matchIndices))
 	}
 
-	start := matchIndices[0]
+	return replaceMatchedWindow(contentLines, trimmedSearchLines, matchIndices[0], replace), true, nil
+}
+
+func findNonBlankLineRange(lines []string) (int, int) {
+	first := -1
+	last := -1
+	for i, line := range lines {
+		if strings.TrimSpace(line) != "" {
+			if first == -1 {
+				first = i
+			}
+			last = i
+		}
+	}
+	return first, last
+}
+
+func replaceMatchedWindow(contentLines, searchLines []string, start int, replace string) string {
 	matchedSlice := contentLines[start : start+len(searchLines)]
 	var replacement []string
-	if block.Replace != "" {
-		replaceLines := strings.Split(block.Replace, "\n")
+	if replace != "" {
+		replaceLines := strings.Split(replace, "\n")
 		replacement = alignIndentation(matchedSlice, searchLines, replaceLines)
 	}
 
@@ -182,7 +237,7 @@ func applyBlock(content string, block Block) (string, bool, error) {
 	resultLines = append(resultLines, contentLines[:start]...)
 	resultLines = append(resultLines, replacement...)
 	resultLines = append(resultLines, contentLines[start+len(searchLines):]...)
-	return strings.Join(resultLines, "\n"), true, nil
+	return strings.Join(resultLines, "\n")
 }
 
 func matchesTrimmed(candidate, search []string) bool {
