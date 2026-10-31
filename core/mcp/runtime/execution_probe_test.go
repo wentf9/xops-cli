@@ -59,6 +59,10 @@ func (b *probeRuntimeBackend) Run(ctx context.Context, p ports.Permit, _ string,
 	return ports.CommandResult{Connected: true, Outcome: ssh.ExecutionCompleted}, work.Err()
 }
 
+func (b *probeRuntimeBackend) OpenPTY(ctx context.Context, p ports.Permit, _ string) (ports.PTYSession, error) {
+	return nil, errors.New("pty not implemented in stub")
+}
+
 type probeRuntimeGate struct {
 	domain    string
 	stale     bool

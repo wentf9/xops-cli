@@ -3,7 +3,7 @@ package ssh
 import "testing"
 
 func TestProbeRecommendationPrefersDefaultShell(t *testing.T) {
-	all := []Interpreter{InterpreterBash, InterpreterSh, InterpreterZsh, InterpreterFish}
+	all := []Interpreter{InterpreterBash, InterpreterSh, InterpreterZsh, InterpreterFish, InterpreterCsh, InterpreterTcsh}
 	for _, tt := range []struct {
 		name, shell string
 		dialect     LaunchDialect
@@ -16,6 +16,10 @@ func TestProbeRecommendationPrefersDefaultShell(t *testing.T) {
 		{"fish dialect with stale SHELL", "/bin/bash", LaunchFish, all, InterpreterFish},
 		{"fish dialect with empty SHELL", "", LaunchFish, all, InterpreterFish},
 		{"fish login shell behind POSIX wrapper", "/usr/local/bin/fish", LaunchPOSIX, all, InterpreterFish},
+		{"csh default", "/bin/csh", LaunchCsh, all, InterpreterCsh},
+		{"tcsh default", "/bin/tcsh", LaunchCsh, all, InterpreterTcsh},
+		{"csh dialect with empty SHELL", "", LaunchCsh, all, InterpreterCsh},
+		{"tcsh login shell behind POSIX wrapper", "/usr/local/bin/tcsh", LaunchPOSIX, all, InterpreterTcsh},
 		{"sh default", "/bin/sh", LaunchPOSIX, all, InterpreterSh},
 		{"dash default", "/bin/dash", LaunchPOSIX, all, InterpreterSh},
 		{"ash default", "/bin/ash", LaunchPOSIX, all, InterpreterSh},

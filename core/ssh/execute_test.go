@@ -338,14 +338,19 @@ func readMockPrivilegeInput(channel cryptoSSH.Channel, command string) (string, 
 		if strings.Contains(command, "su - root") {
 			prompt = "Password: "
 		}
-		if _, err := io.WriteString(channel.Stderr(), prompt); err != nil {
-			return "", err
+		if strings.Contains(command, "sudo -n") {
+			prompt = ""
 		}
-		value, err := reader.ReadString('\n')
-		if err != nil {
-			return value, err
+		if prompt != "" {
+			if _, err := io.WriteString(channel.Stderr(), prompt); err != nil {
+				return "", err
+			}
+			value, err := reader.ReadString('\n')
+			if err != nil {
+				return value, err
+			}
+			prefix = value
 		}
-		prefix = value
 		if _, err := io.WriteString(channel.Stderr(), ready); err != nil {
 			return prefix, err
 		}

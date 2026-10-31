@@ -353,7 +353,7 @@ func applyExecutionToRunConfig(config *RunConfig, exec *ExecutionConfig) {
 	if exec.Interpreter != "" {
 		config.Interpreter = exec.Interpreter
 	}
-	if exec.Interpreter == InterpreterSh || exec.Interpreter == InterpreterFish || exec.Interpreter == InterpreterZsh {
+	if exec.Interpreter == InterpreterSh || exec.Interpreter == InterpreterFish || exec.Interpreter == InterpreterZsh || exec.Interpreter == InterpreterCsh || exec.Interpreter == InterpreterTcsh {
 		config.LoginShell = false
 	}
 	if exec.Login != nil {
@@ -433,7 +433,7 @@ func (c *Client) Run(ctx context.Context, cmd string, opts ...RunOption) (string
 		if config.LoginShell {
 			login = LoginEnabled
 		}
-		if config.Interpreter == InterpreterSh {
+		if config.Interpreter == InterpreterSh || config.Interpreter == InterpreterCsh || config.Interpreter == InterpreterTcsh {
 			login = LoginDisabled
 		}
 		if config.Interpreter == "" || config.Interpreter == InterpreterServer || config.Interpreter == InterpreterPwsh {
@@ -501,8 +501,12 @@ func (c *Client) RunScript(ctx context.Context, scriptContent string, opts ...Ru
 		payload = zshScriptPayload(config.LoginShell)
 	case InterpreterFish:
 		payload = fishScriptPayload(config.LoginShell)
+	case InterpreterCsh:
+		payload = cshScriptPayload()
+	case InterpreterTcsh:
+		payload = tcshScriptPayload()
 	default:
-		return "", fmt.Errorf("%w: unsupported interpreter %q for RunScript (only bash, sh, zsh and fish are supported)", ErrExecutionValidation, config.Interpreter)
+		return "", fmt.Errorf("%w: unsupported interpreter %q for RunScript (only bash, sh, zsh, fish, csh and tcsh are supported)", ErrExecutionValidation, config.Interpreter)
 	}
 
 	session, err := c.newSessionContext(ctx)
@@ -527,8 +531,8 @@ func (c *Client) RunScriptWithExecution(ctx context.Context, content string, exe
 	if err := execution.Validate(); err != nil {
 		return "", err
 	}
-	if execution.Interpreter != "" && execution.Interpreter != InterpreterBash && execution.Interpreter != InterpreterSh && execution.Interpreter != InterpreterZsh && execution.Interpreter != InterpreterFish {
-		return "", fmt.Errorf("%w: unsupported interpreter %q for RunScriptWithExecution (only bash, sh, zsh and fish are supported)", ErrExecutionValidation, execution.Interpreter)
+	if execution.Interpreter != "" && execution.Interpreter != InterpreterBash && execution.Interpreter != InterpreterSh && execution.Interpreter != InterpreterZsh && execution.Interpreter != InterpreterFish && execution.Interpreter != InterpreterCsh && execution.Interpreter != InterpreterTcsh {
+		return "", fmt.Errorf("%w: unsupported interpreter %q for RunScriptWithExecution (only bash, sh, zsh, fish, csh and tcsh are supported)", ErrExecutionValidation, execution.Interpreter)
 	}
 	opts := make([]RunOption, len(extraOpts))
 	copy(opts, extraOpts)

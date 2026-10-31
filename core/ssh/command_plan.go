@@ -19,6 +19,8 @@ const (
 	InterpreterSh         Interpreter = "sh"
 	InterpreterFish       Interpreter = "fish"
 	InterpreterZsh        Interpreter = "zsh"
+	InterpreterCsh        Interpreter = "csh"
+	InterpreterTcsh       Interpreter = "tcsh"
 	InterpreterPowerShell Interpreter = "powershell"
 	InterpreterPwsh       Interpreter = "pwsh"
 	InterpreterCmd        Interpreter = "cmd"
@@ -31,6 +33,7 @@ const (
 	LaunchUnknown    LaunchDialect = "unknown"
 	LaunchPOSIX      LaunchDialect = "posix"
 	LaunchFish       LaunchDialect = "fish"
+	LaunchCsh        LaunchDialect = "csh"
 	LaunchPowerShell LaunchDialect = "powershell"
 	LaunchCmd        LaunchDialect = "cmd"
 )
@@ -143,7 +146,7 @@ func (p *CommandPlan) defaults() {
 
 func (p *CommandPlan) buildPayload() error {
 	switch p.dialect {
-	case LaunchUnknown, LaunchPOSIX, LaunchFish, LaunchPowerShell, LaunchCmd:
+	case LaunchUnknown, LaunchPOSIX, LaunchFish, LaunchCsh, LaunchPowerShell, LaunchCmd:
 	default:
 		return fmt.Errorf("unsupported launch dialect %q", p.dialect)
 	}
@@ -158,7 +161,7 @@ func (p *CommandPlan) buildPayload() error {
 			return fmt.Errorf("server interpreter requires inherited login mode")
 		}
 		p.payload = p.command
-	case InterpreterBash, InterpreterSh, InterpreterZsh, InterpreterFish:
+	case InterpreterBash, InterpreterSh, InterpreterZsh, InterpreterFish, InterpreterCsh, InterpreterTcsh:
 		return p.buildUnixPayload()
 
 	case InterpreterPowerShell:
@@ -236,10 +239,46 @@ func fishQuote(value string) string {
 	return "'" + strings.NewReplacer(`\`, `\\`, "'", `\'`).Replace(value) + "'"
 }
 
+// FishQuote quotes value as a single fish token.
+func FishQuote(value string) string {
+	return fishQuote(value)
+}
+
+// cshQuote quotes value as a single C-shell (csh/tcsh) token. Inside single
+// quotes in csh/tcsh, ' is closed and escaped as '\”, ! must be escaped as \!
+// to suppress history expansion, and literal newlines must be preceded by \.
+func cshQuote(value string) string {
+	var b strings.Builder
+	b.Grow(len(value) + 8)
+	b.WriteByte('\'')
+	for i := 0; i < len(value); i++ {
+		switch value[i] {
+		case '\'':
+			b.WriteString(`'\''`)
+		case '!':
+			b.WriteString(`\!`)
+		case '\n':
+			b.WriteString("\\\n")
+		default:
+			b.WriteByte(value[i])
+		}
+	}
+	b.WriteByte('\'')
+	return b.String()
+}
+
+// CshQuote quotes value as a single C-shell (csh/tcsh) token.
+func CshQuote(value string) string {
+	return cshQuote(value)
+}
+
 func unixCommandPayload(interpreter Interpreter, command string, login bool, dialect LaunchDialect) string {
 	quoted := shellQuote(command)
-	if dialect == LaunchFish {
+	switch dialect {
+	case LaunchFish:
 		quoted = fishQuote(command)
+	case LaunchCsh:
+		quoted = cshQuote(command)
 	}
 	prefix := string(interpreter)
 	if login {
@@ -255,12 +294,20 @@ func fishScriptPayload(login bool) string {
 	return "fish"
 }
 
+func cshScriptPayload() string {
+	return "csh -s"
+}
+
+func tcshScriptPayload() string {
+	return "tcsh -s"
+}
+
 func (p *CommandPlan) buildUnixPayload() error {
-	if p.dialect != LaunchPOSIX && p.dialect != LaunchFish {
-		return fmt.Errorf("%s interpreter requires posix or fish launch dialect", p.interpreter)
+	if p.dialect != LaunchPOSIX && p.dialect != LaunchFish && p.dialect != LaunchCsh {
+		return fmt.Errorf("%s interpreter requires posix, fish, or csh launch dialect", p.interpreter)
 	}
-	if p.interpreter == InterpreterSh && p.login == LoginEnabled {
-		return fmt.Errorf("sh interpreter does not support login shell")
+	if (p.interpreter == InterpreterSh || p.interpreter == InterpreterCsh || p.interpreter == InterpreterTcsh) && p.login == LoginEnabled {
+		return fmt.Errorf("%s interpreter does not support login shell", p.interpreter)
 	}
 	if p.login == LoginInherit {
 		p.login = LoginDisabled

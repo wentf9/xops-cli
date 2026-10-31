@@ -131,7 +131,7 @@ func (c *Client) preparePrivilegeRunConfig(opts ...RunOption) (callerCfg *RunCon
 		opt(config)
 	}
 	if callerCfg.Interpreter == "" {
-		if config.Interpreter == InterpreterSh {
+		if config.Interpreter == InterpreterSh || config.Interpreter == InterpreterCsh || config.Interpreter == InterpreterTcsh {
 			config.LoginShell = false
 		} else if c != nil && NeedsExecutionProbe(c.Execution()) {
 			if exec := c.privilegeExecution(); exec != nil && exec.Login == nil && (config.Interpreter == InterpreterZsh || config.Interpreter == InterpreterFish) {
@@ -494,9 +494,9 @@ func (c *Client) resolveCommandIOInterpreter(sudo bool, command string) (Interpr
 		interp = InterpreterBash
 	}
 	switch interp {
-	case InterpreterServer, InterpreterBash, InterpreterSh, InterpreterZsh, InterpreterFish:
+	case InterpreterServer, InterpreterBash, InterpreterSh, InterpreterZsh, InterpreterFish, InterpreterCsh, InterpreterTcsh:
 	default:
-		return "", fmt.Errorf("%w: unsupported interpreter %q for RunCommandWithIO (only server, bash, sh, zsh and fish are supported)", ErrExecutionValidation, interp)
+		return "", fmt.Errorf("%w: unsupported interpreter %q for RunCommandWithIO (only server, bash, sh, zsh, fish, csh and tcsh are supported)", ErrExecutionValidation, interp)
 	}
 	config := c.defaultRunConfig()
 	if sudo {

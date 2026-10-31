@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -185,6 +186,7 @@ type freebsdMockServer struct {
 	recordedCh chan mockExecRecord
 	isRoot     atomic.Bool
 	isSudoer   atomic.Bool
+	allowBash  atomic.Bool
 }
 
 func (s *freebsdMockServer) newClient(cfg *ClientConfig) *Client {
@@ -235,7 +237,7 @@ func startFreeBSDMockSSHServer(t *testing.T) *freebsdMockServer {
 					if err != nil {
 						return
 					}
-					go handleFreeBSDMockSession(channel, requests, recordedCh, &server.isRoot, &server.isSudoer)
+					go handleFreeBSDMockSession(channel, requests, recordedCh, &server.isRoot, &server.isSudoer, &server.allowBash)
 				}
 			}(conn)
 		}
@@ -253,7 +255,7 @@ func startFreeBSDMockSSHServer(t *testing.T) *freebsdMockServer {
 }
 
 //nolint:gocyclo // FreeBSD mock session handler handles probe queries, root/sudoer detection, and privilege exchange.
-func handleFreeBSDMockSession(channel cryptoSSH.Channel, requests <-chan *cryptoSSH.Request, recordedCh chan<- mockExecRecord, isRoot, isSudoer *atomic.Bool) {
+func handleFreeBSDMockSession(channel cryptoSSH.Channel, requests <-chan *cryptoSSH.Request, recordedCh chan<- mockExecRecord, isRoot, isSudoer, allowBash *atomic.Bool) {
 	defer func() { _ = channel.Close() }()
 
 	for req := range requests {
@@ -292,7 +294,7 @@ func handleFreeBSDMockSession(channel cryptoSSH.Channel, requests <-chan *crypto
 			}
 
 			// 3. FreeBSD Base System: bash does NOT exist -> return exit status 127
-			if strings.Contains(rec.cmd, "bash") {
+			if (allowBash == nil || !allowBash.Load()) && strings.Contains(rec.cmd, "bash") {
 				_, _ = io.WriteString(channel.Stderr(), "exec: bash: not found\n")
 				_, _ = channel.SendRequest("exit-status", false, []byte{0, 0, 0, 127})
 				if recordedCh != nil {
@@ -1229,6 +1231,82 @@ func TestPrivilegeExecution_LoginShellPreservation(t *testing.T) {
 			t.Errorf("expected explicit bash with Login=false to have LoginShell=false, got: %v", defBash.LoginShell)
 		}
 	})
+}
+
+// 22. [Regression Test] RunScriptWithSudo & RunScriptWithSudoExecution preserve login shell flags on the wire
+func TestShAdapter_RunScriptWithSudoLoginShellPreservation(t *testing.T) {
+	mock := startFreeBSDMockSSHServer(t)
+	mock.isSudoer.Store(true)
+	mock.allowBash.Store(true)
+	ctx := t.Context()
+
+	for _, tc := range []struct {
+		interp     Interpreter
+		dialect    LaunchDialect
+		login      bool
+		wantToken  string
+		avoidToken string
+	}{
+		{InterpreterBash, LaunchPOSIX, true, "bash -l -s", ""},
+		{InterpreterBash, LaunchPOSIX, false, "bash -s", "-l"},
+		{InterpreterBash, LaunchCsh, true, "bash -l -s", ""},
+		{InterpreterZsh, LaunchPOSIX, true, "zsh -l -s", ""},
+		{InterpreterZsh, LaunchPOSIX, false, "zsh -s", "-l"},
+		{InterpreterFish, LaunchPOSIX, true, "fish -l", ""},
+		{InterpreterFish, LaunchPOSIX, false, "fish", "-l"},
+		{InterpreterCsh, LaunchCsh, true, "csh -s", "-l"},
+		{InterpreterCsh, LaunchCsh, false, "csh -s", "-l"},
+		{InterpreterTcsh, LaunchCsh, true, "tcsh -s", "-l"},
+		{InterpreterTcsh, LaunchCsh, false, "tcsh -s", "-l"},
+		{InterpreterSh, LaunchPOSIX, true, "sh -s", "-l"},
+		{InterpreterSh, LaunchPOSIX, false, "sh -s", "-l"},
+	} {
+		t.Run(string(tc.interp)+"_login_"+fmt.Sprint(tc.login), func(t *testing.T) {
+			c := mock.newClient(&ClientConfig{
+				SudoMode: SudoModeSudoer,
+				Execution: &ExecutionConfig{
+					Interpreter:   tc.interp,
+					LaunchDialect: tc.dialect,
+				},
+			})
+			_, err := c.RunScriptWithSudo(ctx, "echo test\n", WithInterpreter(tc.interp), WithLaunchDialect(tc.dialect), WithLoginShell(tc.login))
+			if err != nil {
+				t.Fatalf("RunScriptWithSudo(%s, login=%v) failed: %v", tc.interp, tc.login, err)
+			}
+			rec := mock.drainRecord(t)
+			if !strings.Contains(rec.cmd, tc.wantToken) {
+				t.Errorf("RunScriptWithSudo(%s, login=%v): wire command %q does not contain %q", tc.interp, tc.login, rec.cmd, tc.wantToken)
+			}
+			if tc.avoidToken != "" && strings.Contains(rec.cmd, tc.avoidToken) {
+				t.Errorf("RunScriptWithSudo(%s, login=%v): wire command %q unexpectedly contains %q", tc.interp, tc.login, rec.cmd, tc.avoidToken)
+			}
+
+			// Also test RunScriptWithSudoExecution
+			loginCopy := tc.login
+			execCfg := &ExecutionConfig{
+				Interpreter:   tc.interp,
+				LaunchDialect: tc.dialect,
+				Login:         &loginCopy,
+			}
+			if tc.login && (tc.interp == InterpreterSh || tc.interp == InterpreterCsh || tc.interp == InterpreterTcsh) {
+				if _, err = c.RunScriptWithSudoExecution(ctx, "echo test\n", execCfg); !errors.Is(err, ErrExecutionValidation) {
+					t.Errorf("RunScriptWithSudoExecution(%s, login=true) expected ErrExecutionValidation, got: %v", tc.interp, err)
+				}
+			} else {
+				_, err = c.RunScriptWithSudoExecution(ctx, "echo test\n", execCfg)
+				if err != nil {
+					t.Fatalf("RunScriptWithSudoExecution(%s, login=%v) failed: %v", tc.interp, tc.login, err)
+				}
+				recExec := mock.drainRecord(t)
+				if !strings.Contains(recExec.cmd, tc.wantToken) {
+					t.Errorf("RunScriptWithSudoExecution(%s, login=%v): wire command %q does not contain %q", tc.interp, tc.login, recExec.cmd, tc.wantToken)
+				}
+				if tc.avoidToken != "" && strings.Contains(recExec.cmd, tc.avoidToken) {
+					t.Errorf("RunScriptWithSudoExecution(%s, login=%v): wire command %q unexpectedly contains %q", tc.interp, tc.login, recExec.cmd, tc.avoidToken)
+				}
+			}
+		})
+	}
 }
 
 type cancelAfterResolveSecretResolver struct {

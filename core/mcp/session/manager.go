@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/wentf9/xops-cli/core/mcp/ports"
+	"github.com/wentf9/xops-cli/core/ssh"
 )
 
 const (
@@ -95,6 +96,7 @@ type ExecuteRequest struct {
 	// requests carrying a stale generation are admitted after a configuration
 	// update (enforced by the state.Coordinator update barrier).
 	Generation string
+	Dialect    ssh.LaunchDialect
 	Dial       func(ctx context.Context) (ports.PTYSession, error)
 	Command    string
 	Cwd        string
@@ -138,6 +140,7 @@ type dialCall struct {
 type managedSession struct {
 	pty        ports.PTYSession
 	generation string
+	dialect    ssh.LaunchDialect
 	createdAt  time.Time
 	execMu     sync.Mutex
 	inputMu    sync.Mutex
@@ -171,8 +174,14 @@ func NewManager(idleTTL time.Duration) *Manager {
 	}
 }
 
-func isSignalCommand(upper string) bool {
+// IsSignalCommand reports whether the command string represents a terminal control signal.
+func IsSignalCommand(cmd string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(cmd))
 	return upper == "SIGINT" || upper == "EOF" || upper == "SIGTERM" || upper == "SIGKILL"
+}
+
+func isSignalCommand(upper string) bool {
+	return IsSignalCommand(upper)
 }
 
 func signalWritesStdin(upper string) bool {
@@ -209,7 +218,7 @@ func (m *Manager) Execute(ctx context.Context, req ExecuteRequest) (ExecuteResul
 	if sess.busy() {
 		return ExecuteResult{}, ErrSessionBusy
 	}
-	sentinelPrefix, payload, err := buildSentinelPayload(req.Cwd, req.Command, trimmedCmd)
+	sentinelPrefix, payload, err := buildSentinelPayload(sess.dialect, req.Cwd, req.Command, trimmedCmd)
 	if err != nil {
 		return ExecuteResult{}, err
 	}
@@ -474,6 +483,7 @@ func (m *Manager) getOrCreate(ctx context.Context, req ExecuteRequest) (sess *ma
 	newSess := &managedSession{
 		pty:        pty,
 		generation: req.Generation,
+		dialect:    req.Dialect,
 		createdAt:  now,
 		notifyCh:   make(chan struct{}, 1),
 		readerDone: make(chan struct{}),
@@ -481,7 +491,7 @@ func (m *Manager) getOrCreate(ctx context.Context, req ExecuteRequest) (sess *ma
 	newSess.touch(now)
 	go newSess.readLoop()
 
-	initCmd := "stty -echo noflsh 2>/dev/null; PS1=''; export TERM=dumb NO_COLOR=1 DEBIAN_FRONTEND=noninteractive GIT_TERMINAL_PROMPT=0 CI=true\n"
+	initCmd := sessionInitCommand(req.Dialect)
 	if _, err := io.WriteString(pty, initCmd); err != nil {
 		_ = newSess.close()
 		return nil, fmt.Errorf("initialize PTY session %q: %w", req.Key.SessionName, err)
@@ -928,11 +938,22 @@ func (s *managedSession) close() error {
 	return s.closeErr
 }
 
+func sessionInitCommand(dialect ssh.LaunchDialect) string {
+	switch dialect {
+	case ssh.LaunchFish:
+		return "stty -echo noflsh 2>/dev/null; function fish_prompt; end; function fish_right_prompt; end; function fish_mode_prompt; end; set -g fish_greeting ''; set -gx TERM dumb; set -gx NO_COLOR 1; set -gx DEBIAN_FRONTEND noninteractive; set -gx GIT_TERMINAL_PROMPT 0; set -gx CI true\n"
+	case ssh.LaunchCsh:
+		return "stty -echo noflsh >& /dev/null; set prompt=''; set rprompt=''; setenv TERM dumb; setenv NO_COLOR 1; setenv DEBIAN_FRONTEND noninteractive; setenv GIT_TERMINAL_PROMPT 0; setenv CI true\n"
+	default:
+		return "stty -echo noflsh 2>/dev/null; PS1=''; export TERM=dumb NO_COLOR=1 DEBIAN_FRONTEND=noninteractive GIT_TERMINAL_PROMPT=0 CI=true\n"
+	}
+}
+
 // buildSentinelPayload returns the expected sentinel prefix and the shell
 // payload. The sentinel is assembled by printf from two separate arguments so
 // the literal prefix never appears in the command text itself; an echoed
 // command line therefore cannot be mistaken for completion.
-func buildSentinelPayload(cwd, rawCmd, trimmedCmd string) (string, string, error) {
+func buildSentinelPayload(dialect ssh.LaunchDialect, cwd, rawCmd, trimmedCmd string) (string, string, error) {
 	token, err := randomToken()
 	if err != nil {
 		return "", "", err
@@ -942,7 +963,14 @@ func buildSentinelPayload(cwd, rawCmd, trimmedCmd string) (string, string, error
 		if strings.ContainsAny(cwd, "\r\n\x00") {
 			return "", "", errors.New("working directory contains illegal newline or null character")
 		}
-		fmt.Fprintf(&b, "cd -- '%s'\n", strings.ReplaceAll(cwd, "'", `'\''`))
+		switch dialect {
+		case ssh.LaunchFish:
+			fmt.Fprintf(&b, "cd -- %s\n", ssh.FishQuote(cwd))
+		case ssh.LaunchCsh:
+			fmt.Fprintf(&b, "cd -- %s\n", ssh.CshQuote(cwd))
+		default:
+			fmt.Fprintf(&b, "cd -- '%s'\n", strings.ReplaceAll(cwd, "'", `'\''`))
+		}
 	}
 	if trimmedCmd != "" {
 		b.WriteString(rawCmd)
@@ -950,7 +978,14 @@ func buildSentinelPayload(cwd, rawCmd, trimmedCmd string) (string, string, error
 			b.WriteByte('\n')
 		}
 	}
-	fmt.Fprintf(&b, "printf '\\n%%s%%s_%%d%s\\n' '%s' '%s%s' \"$?\"\n", sentinelEnd, sentinelHead, sentinelTail, token)
+	statusExpr := "\"$?\""
+	switch dialect {
+	case ssh.LaunchFish:
+		statusExpr = "$status"
+	case ssh.LaunchCsh:
+		statusExpr = "\"$status\""
+	}
+	fmt.Fprintf(&b, "printf '\\n%%s%%s_%%d%s\\n' '%s' '%s%s' %s\n", sentinelEnd, sentinelHead, sentinelTail, token, statusExpr)
 	return sentinelMark + token + "_", b.String(), nil
 }
 

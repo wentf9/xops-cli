@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/wentf9/xops-cli/core/mcp/guardrail"
 	"github.com/wentf9/xops-cli/core/mcp/ports"
+	"github.com/wentf9/xops-cli/core/mcp/session"
 	"github.com/wentf9/xops-cli/core/ssh"
 )
 
@@ -94,6 +96,15 @@ func resolveExecutionRisk(input guardrail.RiskInput, target ports.Target) (guard
 			return input, err
 		}
 	}
+	if strings.TrimSpace(input.Command) == "" {
+		input.Execution = effective
+		input.PlanDigest = ""
+		input.Dialect = string(ssh.LaunchUnknown)
+		if target.Execution != nil && target.Execution.LaunchDialect != "" {
+			input.Dialect = string(target.Execution.LaunchDialect)
+		}
+		return input, nil
+	}
 	plan, err := ssh.PlanCommand(input.Command, effective.CommandOptions())
 	if err != nil {
 		return input, err
@@ -107,8 +118,13 @@ func resolveExecutionRisk(input guardrail.RiskInput, target ports.Target) (guard
 			input.Dialect = string(trusted)
 		}
 	}
-	if plan.Interpreter() == ssh.InterpreterFish {
-		input.Dialect = string(ssh.LaunchFish)
+	if input.Action != riskActionShell {
+		if plan.Interpreter() == ssh.InterpreterFish {
+			input.Dialect = string(ssh.LaunchFish)
+		}
+		if plan.Interpreter() == ssh.InterpreterCsh || plan.Interpreter() == ssh.InterpreterTcsh {
+			input.Dialect = string(ssh.LaunchCsh)
+		}
 	}
 	return input, nil
 }
@@ -155,6 +171,44 @@ func (r *Runtime) prepareExecution(ctx context.Context, g *guardrail.Guardrail, 
 	return risk, target, true, nil
 }
 
+func validateOperationInput[In any](input In, ri guardrail.RiskInput) error {
+	if validator, ok := any(input).(interface{ Validate() error }); ok {
+		if err := validator.Validate(); err != nil {
+			return err
+		}
+	}
+	if ri.ToolName == "terminal" && (ri.Action == riskActionShell || ri.Action == riskActionPoll) && (ri.Sudo || ri.Execution != nil) {
+		return errors.New("sudo and execution are supported only with session='once'; run sudo inside the persistent shell instead")
+	}
+	return nil
+}
+
+func (r *Runtime) prepareAndResolveExecution(ctx context.Context, g *guardrail.Guardrail, view ports.OperationSnapshot, tool string, input any, ri guardrail.RiskInput, target ports.Target) (guardrail.RiskInput, bool, error) {
+	hasPersistentCwd := false
+	if ri.ToolName == "terminal" {
+		if in, ok := input.(TerminalInput); ok {
+			hasPersistentCwd = isPersistentSession(in.Session) && in.Cwd != ""
+		} else if in, ok := input.(*TerminalInput); ok && in != nil {
+			hasPersistentCwd = in.Cwd != "" && isPersistentSession(in.Session)
+		} else if ri.Action == riskActionShell && len(ri.Paths) > 0 {
+			hasPersistentCwd = true
+		}
+	}
+	isSignal := ri.ToolName == "terminal" && ri.Action == riskActionShell && session.IsSignalCommand(ri.Command)
+	if isSignal || ri.Action == riskActionPoll || (strings.TrimSpace(ri.Command) == "" && !hasPersistentCwd) {
+		return ri, false, nil
+	}
+	ri, target, probed, err := r.prepareExecution(ctx, g, view, tool, input, ri, target)
+	if err != nil {
+		return ri, false, err
+	}
+	ri, err = resolveExecutionRisk(ri, target)
+	if err != nil {
+		return ri, false, err
+	}
+	return ri, probed, nil
+}
+
 func withOperation[In, Out any](r *Runtime, g *guardrail.Guardrail, tool string, risk func(In) guardrail.RiskInput, handler mcp.ToolHandlerFor[In, Out]) mcp.ToolHandlerFor[In, Out] {
 	return func(parent context.Context, request *mcp.CallToolRequest, input In) (*mcp.CallToolResult, Out, error) {
 		var zero Out
@@ -162,6 +216,9 @@ func withOperation[In, Out any](r *Runtime, g *guardrail.Guardrail, tool string,
 		defer cancel()
 		ri := risk(input)
 		ri.ToolName = tool
+		if err := validateOperationInput(input, ri); err != nil {
+			return nil, zero, err
+		}
 		probed := false
 		selectors := slices.Clone(ri.NodeIDs)
 		if ri.NodeID != "" {
@@ -177,15 +234,9 @@ func withOperation[In, Out any](r *Runtime, g *guardrail.Guardrail, tool string,
 			if err != nil {
 				return nil, zero, err
 			}
-			if ri.Command != "" {
-				ri, target, probed, err = r.prepareExecution(ctx, g, view, tool, input, ri, target)
-				if err != nil {
-					return nil, zero, err
-				}
-				ri, err = resolveExecutionRisk(ri, target)
-				if err != nil {
-					return nil, zero, err
-				}
+			ri, probed, err = r.prepareAndResolveExecution(ctx, g, view, tool, input, ri, target)
+			if err != nil {
+				return nil, zero, err
 			}
 		}
 		for i, id := range ri.NodeIDs {
