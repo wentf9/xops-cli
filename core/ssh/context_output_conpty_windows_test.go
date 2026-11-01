@@ -123,7 +123,7 @@ func waitForBlockedConsoleWrite(t *testing.T, started string, writeDone <-chan e
 	for {
 		if _, err := os.Stat(started); err == nil {
 			break
-		} else if !errors.Is(err, os.ErrNotExist) {
+		} else if !errors.Is(err, os.ErrNotExist) && !isTransientWindowsFileErr(err) {
 			t.Fatal(err)
 		}
 		select {
@@ -146,8 +146,15 @@ func publishConsoleMarker(t *testing.T, marker, result string) {
 	if err := os.WriteFile(marker+".tmp", []byte(result), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Rename(marker+".tmp", marker); err != nil {
-		t.Fatal(err)
+	for i := 0; i < 50; i++ {
+		err := os.Rename(marker+".tmp", marker)
+		if err == nil {
+			return
+		}
+		if !isTransientWindowsFileErr(err) || i == 49 {
+			t.Fatal(err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -229,7 +236,7 @@ func waitForConsoleMarker(t *testing.T, ctx context.Context, marker string, done
 		if err == nil {
 			return string(data)
 		}
-		if !errors.Is(err, os.ErrNotExist) {
+		if !errors.Is(err, os.ErrNotExist) && !isTransientWindowsFileErr(err) {
 			t.Fatal(err)
 		}
 		select {
@@ -241,6 +248,10 @@ func waitForConsoleMarker(t *testing.T, ctx context.Context, marker string, done
 		case <-tick.C:
 		}
 	}
+}
+
+func isTransientWindowsFileErr(err error) bool {
+	return errors.Is(err, windows.ERROR_ACCESS_DENIED) || errors.Is(err, windows.ERROR_SHARING_VIOLATION)
 }
 
 func killConsoleOwnerAndWaitRelay(t *testing.T, ctx context.Context, process *os.Process, done <-chan error, joined *bool, result string) {
