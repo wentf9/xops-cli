@@ -184,17 +184,18 @@ flowchart TB
 #### 4.3.1 远端显示协议自适应脚本
 每次 `gui` 调用通过单次 POSIX 脚本在远端探测图形环境（支持 Linux/FreeBSD/Unix X11 与 Linux Wayland）并执行动作：
 1. **环境准备与显示探测增强 (R3)**：
-   - 支持通过 `display` 参数显式指定 X11 显示器（例如 `:0`、`:1`）；省略时自动探测 `/tmp/.X11-unix/X*` 活跃套接字（默认回退为 `:0`）。
-   - **Wayland 自动发现与 XDG 运行时探测**：若 `XDG_RUNTIME_DIR` 未设置且 `/run/user/$(id -u)` 存在，自动导出 `XDG_RUNTIME_DIR="/run/user/$(id -u)"`；若 `WAYLAND_DISPLAY` 未设置且 `$XDG_RUNTIME_DIR/wayland-0` 存在，自动设置 `WAYLAND_DISPLAY="wayland-0"`。
-   - **XAUTHORITY 多路径回退探测**：当 `$XAUTHORITY` 未设置且 `$HOME/.Xauthority` 不存在时，依次探测 `$XDG_RUNTIME_DIR/.mutter-Xwaylandauth.*`、`$XDG_RUNTIME_DIR/gdm/Xauthority` 及 `/run/user/$(id -u)/Xauthority`。
-   - **截图工具链回退**：在原有 `grim`/`spectacle`/`maim`/`import`/`scrot` 之外，补充 `gnome-screenshot -f "$tmp"` 作为回退分支。
+   - 支持通过 `display` 参数显式指定 X11 显示器（例如 `:0`、`:1`）；省略时优先匹配当前 Wayland 会话套接字对应的 Xwayland 显示（如 `wayland-1` 映射 `:1`），若不可用则探测 `/tmp/.X11-unix/X*` 活跃套接字（默认回退为 `:0`）；当默认显示器鉴权失败导致分辨率获取为空时，自动轮询其他活跃 X 套接字回退定位有效显示器。
+   - **Wayland 自动发现与 XDG 运行时探测**：若 `XDG_RUNTIME_DIR` 未设置且 `/run/user/$(id -u)` 存在，自动导出 `XDG_RUNTIME_DIR="/run/user/$(id -u)"`；若 `WAYLAND_DISPLAY` 未设置，优先探测 `$XDG_RUNTIME_DIR/wayland-0`，若不存在则遍历扫描 `$XDG_RUNTIME_DIR/wayland-*` 域套接字回退适配多套接字会话（如 `wayland-1`）。
+   - **XAUTHORITY 多路径回退探测与非空校验**：优先在活跃会话运行时目录下探测 `$XDG_RUNTIME_DIR/.mutter-Xwaylandauth.*` 与 `$XDG_RUNTIME_DIR/xauth_*`（兼容 KDE Plasma Wayland），其次回退至 `$XDG_RUNTIME_DIR/gdm/Xauthority`、`$XDG_RUNTIME_DIR/Xauthority` 及 `$HOME/.Xauthority`；所有候选文件均需同时满足可读与非空（`-r` 与 `-s`），避免 0 字节历史残留文件遮蔽活跃会话凭据。
+   - **截图工具链回退**：在原有 `grim`/`spectacle`/`maim`/`import`/`scrot` 之外，补充 `gnome-screenshot -f "$tmp"` 作为回退分支，并支持 `spectacle` 在 Wayland 与 KDE X11 环境下通用候选执行。
    - 使用 `mktemp -d` 创建 `0700` 私有临时目录存放截图并在退出时清理。
 2. **分辨率获取与 0~1000 坐标映射**：
    - 将模型输入的 `coord = [x, y]`（归一化范围 $0 \sim 1000$）按实际桌面分辨率 $(W, H)$ 换算为像素坐标：
      $$X = \operatorname{round}\left(\frac{x \cdot W}{1000}\right), \quad Y = \operatorname{round}\left(\frac{y \cdot H}{1000}\right)$$
-3. **键鼠注入适配**：
-   - **Wayland (`$WAYLAND_DISPLAY` 非空且安装 `ydotool`/`grim`)**：使用 `ydotool`（`mousemove --absolute`、`click`、`type`、`key`）与 `grim`/`spectacle`/`gnome-screenshot`。
-   - **X11 / Xvfb**：使用 `xdotool`（`mousemove`、`click`、`type --clearmodifiers`、`key`）与 `maim`/`import`/`scrot`/`gnome-screenshot`。
+3. **键鼠注入适配与诊断**：
+   - **Wayland (`$WAYLAND_DISPLAY` 非空且安装 `ydotool`)**：使用 `ydotool`（`mousemove --absolute`、`click`、`type`、`key`）。
+   - **X11 / Xvfb**：使用 `xdotool`（`mousemove`、`click`、`type --clearmodifiers`、`key`）。
+   - **工具缺失诊断**：当远端节点既未安装 `ydotool` 也未安装 `xdotool` 时，非 `shot` 键鼠动作直接输出明确诊断错误 `no supported input utility found (ydotool, xdotool)` 并以状态码 127 退出。
 4. **动作后自动截屏闭环**：
    - 若 `action == "shot"`：直接采集屏幕图像输出到 stdout。
    - 若 `action` 为变更类动作（`click`、`double_click`、`right_click`、`type`、`key`、`scroll`、`drag`）：执行动作后 `sleep 0.5` 等待 UI 渲染，随后立即在同一脚本内采集最新截图输出到 stdout。
@@ -311,7 +312,7 @@ core/mcp/
 - **Ubuntu 与 Windows 平台适配与缺陷加固 (R1 ~ R7)**：
   - **路径规范化与盘符根保护 (R1)**：`remotefile.NormalizeSFTPPath` 统一将 Windows 盘符前缀（`C:\...`、`c:/...`、`/C:\...`）转为大写 `/C:/...` 与正斜杠，保留普通 POSIX 路径；`remotefile.IsRootPath` 识别 `/` 与 `/C:` 等盘符根；`file`、`transfer`、`record.Spec` 与 `guardrail.AnalyzePaths` 全链路拦截盘符根路径（评为 `RiskDangerous`，报 `"root path access"`），并增加对 Windows 敏感系统路径（如 `/c:/windows/system32/config`、`/c:/windows/repair`）的保护。
   - **`tunnel` 请求 ID 自动生成与动态端口回填 (R2)**：`tunnel` 在 `action="create"` 且未传 `requestID` 时自动生成 16 字节随机 hex 幂等键，显式传值时保留原值以维持幂等；当 `listenPort: 0` 时从监听地址解析实际端口并回填 `status.ListenPort`。
-  - **`gui` 错误诊断透传、Wayland 自动发现与非 POSIX 提示 (R3, R7)**：远端执行失败时截取最多 512 字节清洗后的 stderr 输出拼接到错误响应中；自动探测 Wayland 套接字（`/run/user/$(id -u)/wayland-0`）与 Xauthority（`.mutter-Xwaylandauth.*`、`gdm/Xauthority`）；补充 `gnome-screenshot` 回退；在 Windows 等非 POSIX 节点上调用 `gui` 时返回明确提示需要 POSIX shell (X11/Wayland) 环境。
+  - **`gui` 错误诊断透传、Wayland 自动发现与非 POSIX 提示 (R3, R7)**：远端执行失败时截取最多 512 字节清洗后的 stderr 输出拼接到错误响应中；自动探测 Wayland 套接字（优先 `wayland-0`，回退扫描 `wayland-*`）与 Xauthority（优先 `$XDG_RUNTIME_DIR` 下 `.mutter-Xwaylandauth.*`、`xauth_*` 等非空文件）；补充 `gnome-screenshot` 回退与 `ydotool`/`xdotool` 缺失明确诊断；在 Windows 等非 POSIX 节点上调用 `gui` 时返回明确提示需要 POSIX shell (X11/Wayland) 环境。
   - **Windows `server` + `cmd` 节点 `cwd` 适配 (R4)**：当节点为 `interpreter="server"` 且 `launch_dialect="cmd"` 时，通过 `DeriveWorkingDirectoryExecution` 安全派生局部执行配置，自动应用 `cd /d "<cwd>" || exit /b & ...` 包装。
   - **PowerShell CLIXML 进度抑制与入口方言保护 (R5)**：在 PowerShell 命令前置注入 `$ProgressPreference = 'SilentlyContinue'; `，消除 `#< CLIXML` 进度流噪声；当目标节点已固定入口 `launchDialect`（如 `cmd`）时，运行时保护节点入口方言不被请求侧误覆盖。
   - **Ubuntu `sudo-rs` 本地化 PAM 提示符剥离 (R6)**：`expandSudoPrompt` 支持识别 `sudo-rs` 本地化后缀（如 `[sudo: ...] 密码：`，支持 ASCII 冒号 `:` 与全角冒号 `：` / `\xef\xbc\x9a`），在 64 字节有界窗口内彻底清洗提示符，杜绝提示符字符渗入命令输出。

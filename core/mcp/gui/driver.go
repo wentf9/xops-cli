@@ -103,6 +103,7 @@ func BuildScript(req Request) (string, error) {
 
 	var b strings.Builder
 	b.WriteString("set -e\n")
+	b.WriteString("[ -n \"${ZSH_VERSION:-}\" ] && setopt nonomatch 2>/dev/null || true\n")
 	b.WriteString("if [ -z \"${XDG_RUNTIME_DIR:-}\" ]; then\n")
 	b.WriteString("  _uid=$(id -u 2>/dev/null || true)\n")
 	b.WriteString("  if [ -n \"$_uid\" ] && [ -d \"/run/user/$_uid\" ]; then\n")
@@ -112,11 +113,19 @@ func BuildScript(req Request) (string, error) {
 	if req.Display != "" {
 		fmt.Fprintf(&b, "export DISPLAY=%s\n", shellQuote(req.Display))
 	} else {
-		b.WriteString("if [ -z \"${WAYLAND_DISPLAY:-}\" ] && [ -n \"${XDG_RUNTIME_DIR:-}\" ] && [ -S \"$XDG_RUNTIME_DIR/wayland-0\" ]; then\n")
-		b.WriteString("  export WAYLAND_DISPLAY=\"wayland-0\"\n")
+		b.WriteString("if [ -z \"${WAYLAND_DISPLAY:-}\" ] && [ -n \"${XDG_RUNTIME_DIR:-}\" ]; then\n")
+		b.WriteString("  if [ -S \"$XDG_RUNTIME_DIR/wayland-0\" ]; then\n")
+		b.WriteString("    export WAYLAND_DISPLAY=\"wayland-0\"\n")
+		b.WriteString("  else\n")
+		b.WriteString("    for _wsock in \"$XDG_RUNTIME_DIR\"/wayland-*; do\n")
+		b.WriteString("      if [ -S \"$_wsock\" ]; then export WAYLAND_DISPLAY=\"${_wsock##*/}\"; break; fi\n")
+		b.WriteString("    done\n")
+		b.WriteString("  fi\n")
 		b.WriteString("fi\n")
 		b.WriteString("if [ -z \"${DISPLAY:-}\" ]; then\n")
-		b.WriteString("  if [ ! -S /tmp/.X11-unix/X0 ]; then\n")
+		b.WriteString("  if [ -n \"${WAYLAND_DISPLAY:-}\" ] && [ -S \"/tmp/.X11-unix/X${WAYLAND_DISPLAY#wayland-}\" ]; then\n")
+		b.WriteString("    DISPLAY=\":${WAYLAND_DISPLAY#wayland-}\"\n")
+		b.WriteString("  elif [ ! -S /tmp/.X11-unix/X0 ]; then\n")
 		b.WriteString("    for _sock in /tmp/.X11-unix/X*; do\n")
 		b.WriteString("      if [ -S \"$_sock\" ]; then DISPLAY=\":${_sock#/tmp/.X11-unix/X}\"; break; fi\n")
 		b.WriteString("    done\n")
@@ -125,21 +134,36 @@ func BuildScript(req Request) (string, error) {
 		b.WriteString("fi\n")
 	}
 	b.WriteString("if [ -z \"${XAUTHORITY:-}\" ]; then\n")
-	b.WriteString("  if [ -r \"$HOME/.Xauthority\" ]; then\n")
-	b.WriteString("    export XAUTHORITY=\"$HOME/.Xauthority\"\n")
-	b.WriteString("  elif [ -n \"${XDG_RUNTIME_DIR:-}\" ]; then\n")
-	b.WriteString("    for _auth in \"$XDG_RUNTIME_DIR\"/.mutter-Xwaylandauth.*; do\n")
-	b.WriteString("      if [ -r \"$_auth\" ]; then export XAUTHORITY=\"$_auth\"; break; fi\n")
+	b.WriteString("  if [ -n \"${XDG_RUNTIME_DIR:-}\" ]; then\n")
+	b.WriteString("    for _auth in \"$XDG_RUNTIME_DIR\"/.mutter-Xwaylandauth.* \"$XDG_RUNTIME_DIR\"/xauth_*; do\n")
+	b.WriteString("      if [ -r \"$_auth\" ] && [ -s \"$_auth\" ]; then export XAUTHORITY=\"$_auth\"; break; fi\n")
 	b.WriteString("    done\n")
-	b.WriteString("    if [ -z \"${XAUTHORITY:-}\" ] && [ -r \"$XDG_RUNTIME_DIR/gdm/Xauthority\" ]; then\n")
+	b.WriteString("    if [ -z \"${XAUTHORITY:-}\" ] && [ -r \"$XDG_RUNTIME_DIR/gdm/Xauthority\" ] && [ -s \"$XDG_RUNTIME_DIR/gdm/Xauthority\" ]; then\n")
 	b.WriteString("      export XAUTHORITY=\"$XDG_RUNTIME_DIR/gdm/Xauthority\"\n")
-	b.WriteString("    elif [ -z \"${XAUTHORITY:-}\" ] && [ -r \"$XDG_RUNTIME_DIR/Xauthority\" ]; then\n")
+	b.WriteString("    elif [ -z \"${XAUTHORITY:-}\" ] && [ -r \"$XDG_RUNTIME_DIR/Xauthority\" ] && [ -s \"$XDG_RUNTIME_DIR/Xauthority\" ]; then\n")
 	b.WriteString("      export XAUTHORITY=\"$XDG_RUNTIME_DIR/Xauthority\"\n")
 	b.WriteString("    fi\n")
+	b.WriteString("  fi\n")
+	b.WriteString("  if [ -z \"${XAUTHORITY:-}\" ] && [ -r \"$HOME/.Xauthority\" ] && [ -s \"$HOME/.Xauthority\" ]; then\n")
+	b.WriteString("    export XAUTHORITY=\"$HOME/.Xauthority\"\n")
 	b.WriteString("  fi\n")
 	b.WriteString("fi\n")
 	b.WriteString("RES=$(xdpyinfo 2>/dev/null | awk '/dimensions:/ {print $2; exit}' || true)\n")
 	b.WriteString("if [ -z \"$RES\" ]; then RES=$(xrandr 2>/dev/null | awk '/\\*/ {print $1; exit}' || true); fi\n")
+	if req.Display == "" {
+		b.WriteString("if [ -z \"$RES\" ]; then\n")
+		b.WriteString("  for _try_sock in /tmp/.X11-unix/X*; do\n")
+		b.WriteString("    if [ -S \"$_try_sock\" ]; then\n")
+		b.WriteString("      _try_disp=\":${_try_sock#/tmp/.X11-unix/X}\"\n")
+		b.WriteString("      if [ \"$_try_disp\" != \"$DISPLAY\" ]; then\n")
+		b.WriteString("        _try_res=$(DISPLAY=\"$_try_disp\" xdpyinfo 2>/dev/null | awk '/dimensions:/ {print $2; exit}' || true)\n")
+		b.WriteString("        if [ -z \"$_try_res\" ]; then _try_res=$(DISPLAY=\"$_try_disp\" xrandr 2>/dev/null | awk '/\\*/ {print $1; exit}' || true); fi\n")
+		b.WriteString("        if [ -n \"$_try_res\" ]; then DISPLAY=\"$_try_disp\"; export DISPLAY; RES=\"$_try_res\"; break; fi\n")
+		b.WriteString("      fi\n")
+		b.WriteString("    fi\n")
+		b.WriteString("  done\n")
+		b.WriteString("fi\n")
+	}
 	b.WriteString("RES_W=$(printf '%s' \"$RES\" | cut -d'x' -f1)\n")
 	b.WriteString("RES_H=$(printf '%s' \"$RES\" | cut -d'x' -f2)\n")
 	b.WriteString("case \"$RES_W\" in ''|*[!0-9]*) RES_W=1920 ;; esac\n")
@@ -167,7 +191,7 @@ func BuildScript(req Request) (string, error) {
 	b.WriteString("TMP_IMG=\"$TMP_DIR/shot.png\"\n")
 	b.WriteString("if [ -n \"${WAYLAND_DISPLAY:-}\" ] && command -v grim >/dev/null 2>&1 && grim \"$TMP_IMG\" 2>/dev/null; then\n")
 	b.WriteString("  :\n")
-	b.WriteString("elif [ -n \"${WAYLAND_DISPLAY:-}\" ] && command -v spectacle >/dev/null 2>&1 && spectacle -b -n -o \"$TMP_IMG\" 2>/dev/null; then\n")
+	b.WriteString("elif command -v spectacle >/dev/null 2>&1 && spectacle -b -n -o \"$TMP_IMG\" 2>/dev/null; then\n")
 	b.WriteString("  :\n")
 	b.WriteString("elif command -v maim >/dev/null 2>&1 && maim \"$TMP_IMG\" 2>/dev/null; then\n")
 	b.WriteString("  :\n")
@@ -193,46 +217,67 @@ func buildActionSnippet(req Request) string {
 	case ActionMove:
 		return "if [ -n \"${WAYLAND_DISPLAY:-}\" ] && command -v ydotool >/dev/null 2>&1; then\n" +
 			"  ydotool mousemove --absolute -x \"$PX1\" -y \"$PY1\"\n" +
-			"else\n" +
+			"elif command -v xdotool >/dev/null 2>&1; then\n" +
 			"  xdotool mousemove \"$PX1\" \"$PY1\"\n" +
+			"else\n" +
+			"  echo 'no supported input utility found (ydotool, xdotool)' >&2\n" +
+			"  exit 127\n" +
 			"fi\n"
 	case ActionClick:
 		return "if [ -n \"${WAYLAND_DISPLAY:-}\" ] && command -v ydotool >/dev/null 2>&1; then\n" +
 			"  ydotool mousemove --absolute -x \"$PX1\" -y \"$PY1\" && ydotool click 0xC0\n" +
-			"else\n" +
+			"elif command -v xdotool >/dev/null 2>&1; then\n" +
 			"  xdotool mousemove \"$PX1\" \"$PY1\" click 1\n" +
+			"else\n" +
+			"  echo 'no supported input utility found (ydotool, xdotool)' >&2\n" +
+			"  exit 127\n" +
 			"fi\n"
 	case ActionDoubleClick:
 		return "if [ -n \"${WAYLAND_DISPLAY:-}\" ] && command -v ydotool >/dev/null 2>&1; then\n" +
 			"  ydotool mousemove --absolute -x \"$PX1\" -y \"$PY1\" && ydotool click --repeat 2 0xC0\n" +
-			"else\n" +
+			"elif command -v xdotool >/dev/null 2>&1; then\n" +
 			"  xdotool mousemove \"$PX1\" \"$PY1\" click --repeat 2 1\n" +
+			"else\n" +
+			"  echo 'no supported input utility found (ydotool, xdotool)' >&2\n" +
+			"  exit 127\n" +
 			"fi\n"
 	case ActionRightClick:
 		return "if [ -n \"${WAYLAND_DISPLAY:-}\" ] && command -v ydotool >/dev/null 2>&1; then\n" +
 			"  ydotool mousemove --absolute -x \"$PX1\" -y \"$PY1\" && ydotool click 0xC1\n" +
-			"else\n" +
+			"elif command -v xdotool >/dev/null 2>&1; then\n" +
 			"  xdotool mousemove \"$PX1\" \"$PY1\" click 3\n" +
+			"else\n" +
+			"  echo 'no supported input utility found (ydotool, xdotool)' >&2\n" +
+			"  exit 127\n" +
 			"fi\n"
 	case ActionDrag:
 		return "if [ -n \"${WAYLAND_DISPLAY:-}\" ] && command -v ydotool >/dev/null 2>&1; then\n" +
 			"  ydotool mousemove --absolute -x \"$PX1\" -y \"$PY1\" && ydotool click 0x40 && ydotool mousemove --absolute -x \"$PX2\" -y \"$PY2\" && ydotool click 0x80\n" +
-			"else\n" +
+			"elif command -v xdotool >/dev/null 2>&1; then\n" +
 			"  xdotool mousemove \"$PX1\" \"$PY1\" mousedown 1 mousemove \"$PX2\" \"$PY2\" mouseup 1\n" +
+			"else\n" +
+			"  echo 'no supported input utility found (ydotool, xdotool)' >&2\n" +
+			"  exit 127\n" +
 			"fi\n"
 	case ActionType:
 		quoted := shellQuote(req.Text)
 		return fmt.Sprintf("if [ -n \"${WAYLAND_DISPLAY:-}\" ] && command -v ydotool >/dev/null 2>&1; then\n"+
 			"  ydotool type -- %s\n"+
-			"else\n"+
+			"elif command -v xdotool >/dev/null 2>&1; then\n"+
 			"  xdotool type --clearmodifiers -- %s\n"+
+			"else\n"+
+			"  echo 'no supported input utility found (ydotool, xdotool)' >&2\n"+
+			"  exit 127\n"+
 			"fi\n", quoted, quoted)
 	case ActionKey:
 		quoted := shellQuote(req.Text)
 		return fmt.Sprintf("if [ -n \"${WAYLAND_DISPLAY:-}\" ] && command -v ydotool >/dev/null 2>&1; then\n"+
 			"  ydotool key %s\n"+
-			"else\n"+
+			"elif command -v xdotool >/dev/null 2>&1; then\n"+
 			"  xdotool key --clearmodifiers %s\n"+
+			"else\n"+
+			"  echo 'no supported input utility found (ydotool, xdotool)' >&2\n"+
+			"  exit 127\n"+
 			"fi\n", quoted, quoted)
 	case ActionScroll:
 		btn := "5"
@@ -259,8 +304,11 @@ func buildActionSnippet(req Request) string {
 		}
 		return fmt.Sprintf("if [ -n \"${WAYLAND_DISPLAY:-}\" ] && command -v ydotool >/dev/null 2>&1; then\n"+
 			"  %sydotool mousemove --wheel -- %s\n"+
-			"else\n"+
+			"elif command -v xdotool >/dev/null 2>&1; then\n"+
 			"  xdotool %sclick --repeat 3 %s\n"+
+			"else\n"+
+			"  echo 'no supported input utility found (ydotool, xdotool)' >&2\n"+
+			"  exit 127\n"+
 			"fi\n", waylandMove, wheelArgs, movePrefix, btn)
 	default:
 		return ""
