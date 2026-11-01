@@ -40,6 +40,13 @@ func TestCommandTreeUsesCanonicalCommands(t *testing.T) {
 	if _, _, err := root.Find([]string{"loadHost"}); err == nil {
 		t.Fatal("removed loadHost command is still registered")
 	}
+
+	for _, removed := range []string{"ping", "nc", "dns", "encode", "forward", "sudo", "firewall"} {
+		found, _, err := root.Find([]string{removed})
+		if err == nil && found != nil && found.Name() == removed {
+			t.Fatalf("removed command %q is still registered", removed)
+		}
+	}
 }
 
 func TestMCPCommandRejectsUnknownArguments(t *testing.T) {

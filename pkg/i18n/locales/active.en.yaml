@@ -212,78 +212,6 @@ config_load_error:
 save_config_failed:
   other: "Failed to save config: {{.Error}}"
 
-# ---- firewall ----
-firewall_short:
-  other: "Manage firewall settings on target hosts"
-firewall_long:
-  other: "Multi-backend firewall management tool (firewalld, ufw, iptables, nftables).\nAutomatically detects the firewall type on the target host."
-firewall_list_short:
-  other: "List rules"
-firewall_port_short:
-  other: "Manage port rules (e.g. 80, 8080-8090)"
-firewall_service_short:
-  other: "Manage service rules (e.g. http, https)"
-firewall_rule_short:
-  other: "Manage complex rules (with source IP)"
-firewall_reload_short:
-  other: "Reload firewall"
-firewall_status_short:
-  other: "Check firewall status"
-flag_fw_host:
-  other: "Target host(s) / alias, comma separated"
-flag_fw_ifile:
-  other: "Host list file (one host/alias per line)"
-flag_fw_tags:
-  other: "Target tags, comma separated or specified multiple times"
-flag_fw_user:
-  other: "SSH username"
-flag_fw_task:
-  other: "Number of parallel tasks"
-flag_fw_proto:
-  other: "Protocol type (tcp/udp)"
-flag_fw_remove:
-  other: "Remove rule"
-flag_fw_reload:
-  other: "Reload after operation"
-flag_fw_zone:
-  other: "Firewall zone (firewalld only)"
-flag_fw_clear:
-  other: "Clear all rules of this type"
-fw_node_not_found:
-  other: "[{{.User}}@{{.Host}}:{{.Port}}] No matching node config found, please add via inventory first"
-fw_connect_failed:
-  other: "[{{.Host}}] Connection failed: {{.Error}}"
-fw_detect_failed:
-  other: "[{{.Host}}] Failed to detect firewall: {{.Error}}"
-fw_action_failed:
-  other: "[{{.Host}}] Failed: {{.Error}}\nOutput: {{.Output}}"
-fw_action_success:
-  other: "[{{.Host}}] Success ({{.FwName}})\n{{.Output}}"
-fw_reload_failed:
-  other: "[{{.Host}}] Failed to reload firewall: {{.Error}}"
-fw_local_reload_failed:
-  other: "[LOCAL] Failed to reload firewall: {{.Error}}"
-fw_result_success:
-  other: "Success"
-fw_result_failed:
-  other: "Failed"
-fw_label_error:
-  other: "Error"
-fw_label_output:
-  other: "Output"
-fw_label_connect_failed:
-  other: "Connection failed"
-fw_label_detect_failed:
-  other: "Failed to detect firewall"
-fw_label_reload_failed:
-  other: "Failed to reload firewall"
-fw_err_node_not_found:
-  other: "No matching node config found, please add via inventory first"
-fw_status_running:
-  other: "running"
-fw_status_not_running:
-  other: "not running"
-
 # ---- inventory (host) ----
 inventory_short:
   other: "Manage stored hosts and nodes"
@@ -384,97 +312,7 @@ inventory_load_read_failed:
 inventory_load_config_failed:
   other: "failed to load config file: {{.Error}}"
 
-# ---- encode ----
-encode_short:
-  other: "Perform various encode/decode operations"
-encode_long:
-  other: "Encode or decode the provided string"
-url_short:
-  other: "URL encode/decode"
-url_long:
-  other: "URL encode or decode the provided string"
-base64_short:
-  other: "Base64 encode/decode"
-base64_long:
-  other: "Base64 encode or decode the provided string"
-utf8_short:
-  other: "UTF-8 encode/decode"
-utf8_long:
-  other: "UTF-8 encode or decode the provided string"
-unicode_short:
-  other: "Unicode encode/decode"
-unicode_long:
-  other: "Unicode encode or decode the provided string"
-flag_decode:
-  other: "Switch to decode mode"
-flag_base64_url:
-  other: "Use URL-safe mode (only URL-safe characters in base64 output)"
-
-# ---- ping ----
-ping_short:
-  other: "ICMP Ping a host or check if a TCP port is open"
-ping_long:
-  other: "This command has two modes:\n1. ICMP Ping (1 argument):\n   Sends ICMP requests to test network connectivity, similar to the system ping tool.\n   Example: xops ping 8.8.8.8\n   On Linux, ICMP raw sockets require elevated privileges:\n   Set sysctl net.ipv4.ping_group_range=\"0 2147483647\"\n   Or: setcap cap_net_raw+eip /path/to/xops\n   Or run with sudo.\n\n2. TCP port check (2 arguments):\n   Attempts a TCP connection to determine if the port is open.\n   Example: xops ping 8.8.8.8 53"
-ping_resolve_info:
-  other: "Host [{{.Host}}] resolves to: [{{.IP}}]"
-ping_tcp_testing:
-  other: "Testing TCP connection to {{.Address}}..."
-ping_port_closed:
-  other: "Port {{.Port}} on host {{.IP}} is closed or filtered: {{.Error}}"
-ping_port_open:
-  other: "Port {{.Port}} on host {{.IP}} is open!"
-ping_icmp_start:
-  other: "Pinging {{.IP}} via ICMP..."
-ping_stats_header:
-  other: "\n--- {{.Addr}} ping statistics ---"
-ping_stats_packets:
-  other: "{{.Sent}} packets sent, {{.Recv}} packets received, {{.Loss}}% packet loss"
-ping_stats_rtt:
-  other: "rtt min/avg/max/stddev = {{.Min}}/{{.Avg}}/{{.Max}}/{{.StdDev}}"
-
-# ---- dns ----
-dns_short:
-  other: "DNS lookup"
-dns_long:
-  other: "DNS lookup"
-dns_resolve_error:
-  other: "Host [{{.Domain}}] cannot be resolved: {{.Error}}"
-dns_resolve_info:
-  other: "Host [{{.Domain}}] resolves to: [{{.IP}}]"
-
-# ---- nc ----
-nc_short:
-  other: "Network tool providing partial nc (netcat) functionality"
-nc_long:
-  other: "Network tool providing partial nc (netcat) functionality\n\tUsage:\n\txops nc -l <port>\n\tListen on the specified port and output all request content. Non-root users on Linux cannot listen on ports below 1024.\n\txops nc <ip> <port>\n\tConnect to the specified IP and port, sending stdin content to the target. Use with pipes or redirection."
-flag_nc_listen:
-  other: "Port to listen on (non-root users on Linux cannot listen on ports below 1024)"
-flag_nc_udp:
-  other: "Use UDP protocol (default: TCP)"
-nc_listening:
-  other: "Listening on port {{.Port}}...\n"
-nc_connected:
-  other: "Connected to {{.Addr}}\n"
-nc_interactive_warning:
-  other: "Warning: You are running this in an interactive terminal, no data will be sent. Use pipes or redirection instead.\n"
-nc_new_connection:
-  other: "New connection from: {{.Addr}}\n"
-nc_request_content:
-  other: "Request content from {{.Addr}}:\n"
-nc_connection_closed:
-  other: "Connection {{.Addr}} closed\n"
-
-# ---- sudo ----
-sudo_short:
-  other: "Execute commands locally with sudo"
-sudo_long:
-  other: "Execute commands locally with sudo. Supports automatic password retrieval from config.\nExamples:\n  xops sudo \"ss -tlpn\"\n  xops sudo -s\n  xops sudo \"firewall-cmd --list-all\" -p mypassword"
-flag_sudo_passwd:
-  other: "Local sudo password"
-flag_sudo_shell:
-  other: "Enter root shell (similar to sudo -s)"
-prompt_sudo_password:
-  other: "Enter sudo password (press Enter if none):"
+# ---- ssh / exec sudo / su ----
 prompt_su_password:
   other: "Enter su root password for {{.Node}}:"
 sudo_exec_failed:
@@ -769,36 +607,6 @@ scp_err_no_host_addr:
 scp_err_exclude:
   other: "Failed to resolve exclude rules"
 
-# ---- ping additions ----
-ping_err_resolve:
-  other: "Provided hostname cannot be resolved to IP address"
-ping_err_create_pinger:
-  other: "Failed to create pinger"
-
-# ---- nc additions ----
-nc_err_args_missing:
-  other: "IP and port must be specified, or use -l to listen on a port"
-nc_err_invalid_ip:
-  other: "Invalid IP address: {{.IP}}"
-nc_err_invalid_port:
-  other: "Invalid port: {{.Port}}"
-nc_err_listen:
-  other: "Cannot listen on port {{.Port}}"
-nc_err_accept:
-  other: "Failed to accept connection"
-nc_err_handle:
-  other: "Failed to handle connection"
-nc_err_connect:
-  other: "Failed to connect to {{.Addr}}"
-nc_err_write_conn:
-  other: "Failed to write to connection"
-nc_err_read_input:
-  other: "Failed to read input"
-nc_err_write_out:
-  other: "Failed to write output"
-nc_err_conn_error:
-  other: "Error on connection {{.Addr}}"
-
 # ---- identity additions ----
 identity_err_not_found:
   other: "Authentication template {{.Name}} not found"
@@ -814,12 +622,6 @@ alias_err_duplicate_input:
   other: "Duplicate alias in input: {{.Alias}}"
 tag_err_duplicate_input:
   other: "Duplicate tag in input: {{.Tag}}"
-
-# ---- firewall additions ----
-fw_err_os_not_supported:
-  other: "Firewall management is only supported on Linux (current system is {{.OS}})"
-fw_err_exclude:
-  other: "Failed to resolve exclude rules"
 
 # ---- exec additions ----
 exec_err_no_cmd:
@@ -839,28 +641,7 @@ exec_err_exclude:
 flag_exclude:
   other: "Exclude specified hosts (supports Node ID / alias / IP / User@Host, comma separated or specified multiple times)"
 
-# ---- encode additions ----
-encode_err_need_arg:
-  other: "Need at least one argument"
-
-# ---- forward ----
-forward_short:
-  other: "Port forwarding, forwards TCP/UDP traffic from a local port to a remote address"
-forward_long:
-  other: "Port forwarding, forwards TCP/UDP traffic from a local port to a remote address\n\tUsage:\n\txops forward <listen-addr> <target-addr>\n\tlisten-addr format: [host:]port, e.g. :8080 or 127.0.0.1:8080\n\ttarget-addr format: host:port, e.g. 192.168.1.10:80\n\tForwarding runs until Ctrl+C is pressed"
-flag_forward_udp:
-  other: "Use UDP protocol (default TCP)"
-forward_stopping:
-  other: "Stopping port forwarder..."
-forward_err_args:
-  other: "Two arguments required: listen-addr and target-addr"
-forward_err_listen_addr:
-  other: "Invalid listen address {{.Addr}}"
-forward_err_target_addr:
-  other: "Invalid target address {{.Addr}}"
-forward_err_port_required:
-  other: "port is required"
-
+# ---- tui monitor ----
 tui_monitor_error:
   other: "Error fetching metrics: {{.Error}}"
 tui_monitor_fetching:

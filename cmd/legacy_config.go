@@ -21,7 +21,7 @@ func checkConfigurationSchema(cmd *cobra.Command) error {
 		top = top.Parent()
 	}
 	switch top.Name() {
-	case "init", "host", "identity", "credential", "ssh", "sftp", "scp", "exec", "tui", "mcp", "play", "sudo", "firewall", "forward":
+	case "init", "host", "identity", "credential", "ssh", "sftp", "scp", "exec", "tui", "mcp", "play":
 	default:
 		return nil
 	}

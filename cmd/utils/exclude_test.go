@@ -1,7 +1,6 @@
 package utils
 
 import (
-	"errors"
 	"testing"
 
 	"github.com/wentf9/xops-cli/core/concurrent"
@@ -155,26 +154,4 @@ func TestResolveExcludes(t *testing.T) {
 			t.Fatal("expected error for unmatched exclude, got nil")
 		}
 	})
-}
-
-func TestResolveFirstSelectorRejectsAmbiguousCandidate(t *testing.T) {
-	provider := newTestProvider(
-		map[string]models.Node{
-			"one": {HostRef: "host-one", IdentityRef: "identity-one"},
-			"two": {HostRef: "host-two", IdentityRef: "identity-two"},
-		},
-		map[string]models.Host{
-			"host-one": {Address: "shared.example", Port: 22},
-			"host-two": {Address: "shared.example", Port: 22},
-		},
-		map[string]models.Identity{
-			"identity-one": {User: "root"},
-			"identity-two": {User: "deploy"},
-		},
-	)
-
-	_, err := resolveFirstSelector(provider, "shared.example")
-	if !errors.Is(err, config.ErrAmbiguousNode) {
-		t.Fatalf("resolveFirstSelector() error = %v, want ErrAmbiguousNode", err)
-	}
 }

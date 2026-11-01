@@ -8,7 +8,6 @@ import (
 
 	"github.com/wentf9/xops-cli/core/concurrent"
 	"github.com/wentf9/xops-cli/pkg/config"
-	"github.com/wentf9/xops-cli/pkg/firewall"
 	"github.com/wentf9/xops-cli/pkg/models"
 )
 
@@ -105,25 +104,5 @@ func TestExec_BuildTasksFromHosts_PartialErrorsCollected(t *testing.T) {
 	}
 	if len(hostErrs) != 1 {
 		t.Fatalf("expected 1 host resolution error collected, got %d", len(hostErrs))
-	}
-}
-
-func TestFirewall_RunRemoteFirewalls_EmptyTargetsReturnsError(t *testing.T) {
-	cfgPath, keyPath := createTestConfigStore(t)
-	t.Setenv("XOPS_CONFIG_PATH", cfgPath)
-	t.Setenv("XOPS_KEY_PATH", keyPath)
-
-	opts := &FirewallOptions{
-		SshOptions: SshOptions{
-			Tags: []string{"non-existent-tag"},
-		},
-	}
-
-	err := opts.runRemoteFirewalls(context.Background(), func(fw firewall.Firewall) (string, error) {
-		return "ok", nil
-	})
-
-	if err == nil {
-		t.Fatal("expected error when remote tags match 0 nodes, got nil")
 	}
 }

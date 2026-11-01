@@ -1,4 +1,4 @@
-# SSH tunnels, firewalls, and network diagnostics
+# SSH tunnels
 
 ## Create an SSH tunnel
 
@@ -38,53 +38,8 @@ The CLI has no `xops tunnel create/list/status/stop`, request IDs, or managed tu
    curl --connect-timeout 5 --max-time 10 http://127.0.0.1:18080/
    ```
 
-   `xops ping 127.0.0.1 18080` checks TCP acceptance only; it cannot prove the forwarded destination works. Use a database client or another protocol-appropriate probe for other services.
+   Checking TCP connection acceptance alone cannot prove the forwarded destination works. Use a database client, HTTP probe, or another protocol-appropriate tool for the service.
 3. For status, inspect the command runner's retained session/PID and the relevant listener (for example local `ss` on Linux or `Get-NetTCPConnection` on Windows). There is no persistent XOps tunnel inventory.
 4. Stop only the session created for this task. Use the runner's stop/cancel action, or signal its exact owned PID, then wait for exit and verify the listener is gone. Avoid broad process-name kills. Remote port release can be delayed after network failure; do not claim release without a check.
 
 SSH disconnect/keepalive failure ends forwarding and returns failure; there is no automatic reconnect. If the user requests a lifetime, bound the owned process accordingly and clean it up at that deadline; do not invent a CLI TTL flag. Leave a tunnel running only when ongoing access is part of the task, and report the handle/address needed to manage it.
-
-## Local TCP/UDP relays
-
-```bash
-xops forward 127.0.0.1:8080 192.0.2.10:80
-xops forward 127.0.0.1:5353 192.0.2.53:53 --udp
-```
-
-These commands forward directly from the CLI machine without SSH encryption or SSH node authentication. Track and stop their processes as above. Use SSH forwarding when the path is meant to traverse an SSH node or ProxyJump.
-
-## Firewall management
-
-Inspect the selected targets and effective rules first:
-
-```bash
-xops firewall status --host web-01
-xops firewall list --host web-01
-```
-
-For requested rule changes:
-
-```bash
-xops firewall port 8080 --host web-01 --proto tcp --reload
-xops firewall port 8080 --host web-01 --proto tcp --remove --reload
-xops firewall rule 8080 192.0.2.20 --host web-01
-xops firewall service http --host web-01 --reload
-```
-
-Select the intended action, not all four examples. XOps's generated firewall commands target Linux/POSIX environments; they are not a Windows firewall adapter. It adapts to firewalld, ufw, iptables, and nftables; supported service/zone behavior depends on the detected backend. Target selection supports `--host`, `--ifile`, `--tag`, `--exclude`, and `--task`. Use `firewall <subcommand> --help` for options such as `--zone`, `--reject`, and `--drop`.
-
-Rule changes can affect the management connection. Keep authorized source/port scope explicit and verify effective rules and connectivity afterward. `--clear` removes rules in the relevant category; do not add it for an ordinary single-port change. No plaintext firewall password flag exists; credentials must already be configured.
-
-## DNS, ICMP, TCP, and netcat
-
-```bash
-xops dns example.com
-xops ping 192.0.2.10
-xops ping 192.0.2.10 443
-xops nc 192.0.2.10 8080
-xops nc -l 8080
-```
-
-`ping ADDRESS` uses ICMP and may need local raw-socket permissions; adding a port performs a TCP reachability check. `nc` connects or listens and supports `--udp`; it is not a general port-scanner interface. DNS and reachability checks run from the CLI machine. To diagnose from a remote network, use `xops exec` with tools actually available on that target rather than assuming the local result applies there.
-
-Bound diagnostic runs using the command runner's deadline and stop listeners after the test. If ICMP permissions are absent, report that limitation or use a suitable authorized TCP check; do not automatically change system-wide capabilities or sysctls.

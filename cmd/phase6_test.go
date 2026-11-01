@@ -46,6 +46,41 @@ func phase6Config(t *testing.T, storeCfg config.StoreConfig) config.Store {
 	return store
 }
 
+func setupPhase6Credential(t *testing.T) {
+	t.Helper()
+	store := phase6Config(t, config.StoreConfig{Type: config.StoreTypeHelper, Command: os.Args[0], NonInteractive: true})
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", t.TempDir())
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.SchemaVersion = 2
+	if err := store.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := executePhase6WithInput(t, NewCmdIdentity(), "fixture-secret\n", "edit", "admin", "--password-stdin"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func configureSessionOnlyCredential(t *testing.T) {
+	t.Helper()
+	path, key, err := utils.GetConfigFilePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := config.NewDefaultStore(path, key)
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Credential = &config.CredentialConfig{DefaultStore: "none", RememberPrompted: "never", Stores: map[string]config.StoreConfig{"none": {Type: config.StoreTypeNone}}}
+	if err := store.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func executePhase6(t *testing.T, cmd *cobra.Command, args ...string) error {
 	t.Helper()
 	cmd.SetArgs(args)

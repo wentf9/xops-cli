@@ -86,7 +86,7 @@ SSH 登录密码与 `sudo`/`su` 提权密码独立验证、分开存储：
 
 ## 已移除的明文参数
 
-为防止密码留在进程列表或 Shell 历史中，所有命令均已移除 `--password`、`--passphrase`、`--suPwd` 及防火墙的 `--password/-w` 明文参数：
+为防止密码留在进程列表或 Shell 历史中，所有命令均已移除 `--password`、`--passphrase`、`--suPwd` 明文参数：
 - **SSH / SFTP / SCP / exec**：使用安全交互提示、已保存凭据，或通过受控管道传入 `--password-stdin` / `--passphrase-stdin`。
 - **主机与身份管理（`host` / `identity`）**：使用 `--password-stdin`、`--passphrase-stdin` 或 `xops identity credential set`，详见[主机与身份管理](./hosts#已删除的凭据参数)。
 - **参数边界**：`ssh` 和 `exec` 会拒绝远端命令之前的未知参数；远端命令名或显式 `--` 分隔符之后的参数则原样传给远端。

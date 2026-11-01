@@ -26,9 +26,9 @@ Once installed, you can ask the assistant to handle tasks in plain language:
 | File | Contents |
 | --- | --- |
 | `references/inventory.md` | Hosts, identities, tags, credentials, and offline-store maintenance |
-| `references/execution.md` | Single-host/batch commands, scripts, Playbooks, interactive terminals, and local tools |
+| `references/execution.md` | Single-host/batch commands, scripts, Playbooks, and interactive terminals |
 | `references/files.md` | Reading/writing files, directory operations, SCP/SFTP, and transfer verification |
-| `references/networking.md` | Tunnel process management, firewalls, network diagnostics, and local forwarding |
+| `references/networking.md` | Tunnel process management and network connectivity |
 
 ## CLI capability overview
 
@@ -43,12 +43,10 @@ Once installed, you can ask the assistant to handle tasks in plain language:
 | File & directory transfers | `scp`, `sftp` | Upload, download, relay between hosts, distribute by tag, set overwrite policy, and verify |
 | SSH tunnels & proxies | `ssh -L/-R/-D -N` | Track tunnel processes/sessions, verify listeners and target services, stop, and confirm release |
 | Declarative orchestration | `play` | Combine `shell`, `script`, `copy`, `ensure`, and `template` steps; preview with `--dry-run` before running |
-| Firewall management | `firewall` | Inspect status/rules and manage ports, services, source rules, and reloads (adapts to firewalld/ufw/iptables/nftables) |
-| Network diagnostics & local forwarding | `dns`, `ping`, `nc`, `forward` | Test DNS/ICMP/TCP from the CLI machine or set up local TCP/UDP relays |
-| Interactive UI & encoding utilities | `tui`, `sudo`, `encode` | Visual terminal management, local elevation, and `base64`/`url`/`utf8`/`unicode` conversion |
+| Interactive terminal UI | `tui` | Visual terminal management, SSH sessions, and real-time monitoring |
 | Service administration & discovery | `mcp serve/recover`, `version`, `help`, `completion` | Manage MCP services when explicitly requested or inspect CLI help |
 
-> Note: `host import --template` exports a blank CSV template rather than your existing inventory; `encode` subcommands are `base64`, `url`, `utf8`, and `unicode` (there is no standalone `hex` subcommand). See the [command reference](../reference/) and `xops <command> --help` for full options.
+> Note: `host import --template` exports a blank CSV template rather than your existing inventory. See the [command reference](../reference/) and `xops <command> --help` for full options.
 
 ## Execution semantics and operational boundaries
 

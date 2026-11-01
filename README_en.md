@@ -217,14 +217,6 @@ npx skills add https://github.com/wentf9/xops-cli --skill xops-agent
 
 For manual installation, copy the complete `skills/xops-agent/` directory (preserving `SKILL.md` and `references/`). See the [Agent Skill Guide](docs/en/guide/agent-skill.md).
 
-### 5. Built-in Network & Security Toolkit
-
-No need to memorize distro-specific firewall syntax or install extra diagnostic utilities:
-- **`xops firewall`**: Unified firewall management across `firewalld`, `ufw`, `iptables`, and `nftables` (status, ports, services, source rules, reload).
-- **`xops dns` / `ping` / `nc` / `forward`**: Cross-platform DNS lookup, ICMP ping, TCP/UDP netcat, and local port forwarding.
-- **`xops encode`**: Command-line `base64`, `url`, `utf8`, and `unicode` encoding/decoding.
-- **Bilingual CLI (`i18n`)**: Automatically detects Simplified Chinese or English from your environment, or switch on the fly with `--lang zh` / `--lang en`.
-
 ---
 
 ## 📄 License

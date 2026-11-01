@@ -58,7 +58,7 @@ xops exec --host web-01 -c 'printf "%s\n" "$HOME"'
 
 After a target selector (`--host`, `--ifile`, or `--tag`), positional arguments are the remote command, not another host. Use `--` to disambiguate remote options, for example `xops exec --host web-01 -- echo --help`. Put XOps options before the remote command. Do not invent an `exec --timeout` flag; set a suitable bound in the Agent's command runner and cancel its process when needed.
 
-`--sudo` uses the node's configured Unix privilege strategy, including root, sudo, or su modes. It is distinct from `xops sudo`, which elevates on the local CLI machine. Unconfigured escalation retains the legacy Unix Bash compatibility path; explicit server escalation is unsupported. Configured Bash/sh escalation and configured su have narrower support than ordinary execution; do not infer Windows UAC support or silently remove `--sudo`. Login success alone does not prove privilege escalation succeeded.
+`--sudo` uses the node's configured Unix privilege strategy, including root, sudo, or su modes. Unconfigured escalation retains the legacy Unix Bash compatibility path; explicit server escalation is unsupported. Configured Bash/sh escalation and configured su have narrower support than ordinary execution; do not infer Windows UAC support or silently remove `--sudo`. Login success alone does not prove privilege escalation succeeded.
 
 ## Batch commands and local scripts
 
@@ -137,7 +137,7 @@ settings:
 
 Use this only on compatible hosts. Ensure checks reject explicitly configured server mode; unconfigured checks probe once and require a detected POSIX bash/sh adapter. The same adapter is used for check, action and verification. Playbook scripts without a shebang can use the same bounded connection cache when execution is unspecified. Runtime probing does not persist configuration or change ordinary command defaults. Windows script/ensure remains unsupported; SFTP cwd exec can use a detected Windows adapter. Probe failures stop before user work and are not interpreter retries. Only a confirmed check result can authorize the action and subsequent verification. Timeout, cancellation, signal, I/O, cleanup, or uncertain startup failures must not be treated as an absent desired state. Retry settings apply to confirmed clean command failures; do not assume every failed attempt is retryable. Script sources and execution settings are frozen within a run, so changing local files/configuration during execution is not an update mechanism.
 
-## Interactive and local utilities
+## Interactive terminal and utilities
 
 ```bash
 xops ssh -J bastion.example.com -i ~/.ssh/id_ed25519 deploy@web-01
@@ -146,18 +146,6 @@ xops exec -x web-01 top
 xops tui
 ```
 
-Use these when the task needs a terminal. `exec -x` supports one host and no local script; it returns after the requested command and now defaults to the native server payload. Privileged PTY with `--no-login` requires an explicit interpreter (e.g. `--interpreter bash`). `ssh` without a command opens a full server shell; that login session is distinct from one-shot command execution. Single-label jump hosts must be configured nodes/aliases; FQDN, IP, and explicit `host:port` can identify direct jumps.
-
-Text conversion is local:
-
-```bash
-xops encode base64 'hello'
-xops encode base64 --decode 'aGVsbG8='
-xops encode url 'https://example.com/a b'
-xops encode utf8 '你好'
-xops encode unicode '你好'
-```
-
-Use `--decode` for the reverse operation and `encode base64 --url` for URL-safe Base64. Available modes are `base64`, `url`, `utf8`, and `unicode`; there is no `encode hex` subcommand. `version`, `help`, and `completion` provide local CLI discovery and shell completion.
+Use these when the task needs a terminal. `exec -x` supports one host and no local script; it returns after the requested command and now defaults to the native server payload. Privileged PTY with `--no-login` requires an explicit interpreter (e.g. `--interpreter bash`). `ssh` without a command opens a full server shell; that login session is distinct from one-shot command execution. Single-label jump hosts must be configured nodes/aliases; FQDN, IP, and explicit `host:port` can identify direct jumps. `version`, `help`, and `completion` provide local CLI discovery and shell completion.
 
 The project also has CLI administration commands `xops mcp serve` and `xops mcp recover`. They are for explicitly requested MCP service administration, not prerequisites for this skill's host workflows. Consult `xops mcp --help` and the [HTTP service guide](https://wentf9.github.io/xops-cli/guide/mcp-http) for such a task.

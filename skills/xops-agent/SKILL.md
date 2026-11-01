@@ -1,6 +1,6 @@
 ---
 name: xops-agent
-description: Use the xops CLI to manage SSH hosts, run remote or batch commands, inspect and edit remote files, transfer data, create SSH tunnels, and automate operations with Playbooks. Apply when the user wants server operations or network diagnostics through XOps.
+description: Use the xops CLI to manage SSH hosts, run remote or batch commands, inspect and edit remote files, transfer data, create SSH tunnels, and automate operations with Playbooks. Apply when the user wants server operations or remote automation through XOps.
 ---
 
 # XOps CLI operations
@@ -26,8 +26,7 @@ Read only the reference relevant to the current task.
 | Read/write/append text, list/create/copy/move/delete remote paths | `exec` with target-native commands, or batch `sftp` | [Files and transfers](references/files.md) |
 | Upload/download files and directories, relay between hosts, distribute to a tag | `scp`, batch `sftp` | [Files and transfers](references/files.md) |
 | Create, inspect, and stop SSH forwarding | `ssh -L/-R/-D -N` plus owned process/session tracking | [Tunnels and networking](references/networking.md) |
-| Manage firewalls, check DNS/ICMP/TCP, use netcat or a local TCP/UDP relay | `firewall`, `dns`, `ping`, `nc`, `forward` | [Tunnels and networking](references/networking.md) |
-| Interactive SSH/TUI, local privilege elevation, text encoding | `ssh`, `exec -x`, `tui`, `sudo`, `encode` | [Execution and Playbooks](references/execution.md) |
+| Interactive SSH and TUI | `ssh`, `exec -x`, `tui` | [Execution and Playbooks](references/execution.md) |
 
 Prefer `exec`, `scp`, and batch SFTP for unattended operations. Use terminal interfaces only when interaction is part of the task. XOps does not provide standalone CLI commands named `read_file`, `write_file`, `fs`, `upload`, `download`, or `tunnel`; compose the documented commands instead.
 
@@ -42,6 +41,6 @@ Prefer `exec`, `scp`, and batch SFTP for unattended operations. Use terminal int
 
 ## Verify the outcome
 
-Check exit status and per-host failures, then verify the requested result: read back a file, compare its size/hash, probe a service, or check effective firewall rules. `--no-clobber` can succeed while skipping an existing file; a tunnel listener can start while its destination remains unreachable.
+Check exit status and per-host failures, then verify the requested result: read back a file, compare its size/hash, or probe a service. `--no-clobber` can succeed while skipping an existing file; a tunnel listener can start while its destination remains unreachable.
 
 Report the affected hosts, paths, successful checks, failed targets, and remaining uncertainty. Retain the process handle for any tunnel the user wants left running; otherwise stop temporary sessions and verify cleanup. Do not claim MCP task IDs, TTLs, resumability, or atomic replacement guarantees for CLI operations.

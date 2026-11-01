@@ -215,14 +215,6 @@ npx skills add https://github.com/wentf9/xops-cli --skill xops-agent
 
 手工安装可直接复制 `skills/xops-agent/` 目录（保留 `SKILL.md` 与 `references/`）。详见 [Agent Skill 指南](docs/guide/agent-skill.md)。
 
-### 5. 内置网络诊断与安全工具箱
-
-无需记忆不同发行版的防火墙命令或额外安装小工具：
-- **`xops firewall`**：统一管理 `firewalld`、`ufw`、`iptables` 与 `nftables`（查状态、开端口、管服务、重载规则）。
-- **`xops dns` / `ping` / `nc` / `forward`**：跨平台 DNS 查询、ICMP Ping、TCP/UDP 端口探测与本机流量转发。
-- **`xops encode`**：命令行 `base64`、`url`、`utf8`、`unicode` 编码转换。
-- **双语切换**：根据系统环境自动识别中英文，或随时通过 `--lang zh` / `--lang en` 切换。
-
 ---
 
 ## 📄 开源协议

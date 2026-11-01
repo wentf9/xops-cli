@@ -20,7 +20,7 @@ import (
 func TestV2ImportPersistsCredentialReferences(t *testing.T) {
 	for _, kind := range []string{"password", "passphrase"} {
 		t.Run(kind, func(t *testing.T) {
-			setupFirewallCredential(t)
+			setupPhase6Credential(t)
 			listener, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {
 				t.Fatal(err)
@@ -90,7 +90,7 @@ func TestV2ImportPersistsCredentialReferences(t *testing.T) {
 func TestV2ImportFailuresPreserveConfiguration(t *testing.T) {
 	for _, host := range []string{"127.0.0.1", "127.0.0.2"} {
 		t.Run(host, func(t *testing.T) {
-			setupFirewallCredential(t)
+			setupPhase6Credential(t)
 			path, _, err := utils.GetConfigFilePath()
 			if err != nil {
 				t.Fatal(err)
@@ -113,7 +113,7 @@ func TestV2ImportFailuresPreserveConfiguration(t *testing.T) {
 }
 
 func TestImportVerificationResolvesExistingRef(t *testing.T) {
-	setupFirewallCredential(t)
+	setupPhase6Credential(t)
 	t.Setenv("TEST_HELPER_ERROR_CODE", "locked")
 	err := hostcmd.ExecuteLoadHostContext(t.Context(), []utils.HostInfo{{Host: "127.0.0.1", User: "admin"}})
 	if !errors.Is(err, coreauth.ErrCredentialStoreLocked) {

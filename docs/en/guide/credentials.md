@@ -86,7 +86,7 @@ See [offline credential storage](./offline-store) for master-password vaults, ke
 
 ## Removed plaintext flags
 
-To keep secrets out of process listings and shell history, `--password`, `--passphrase`, `--suPwd`, and the firewall `--password/-w` flags have been removed:
+To keep secrets out of process listings and shell history, `--password`, `--passphrase`, and `--suPwd` flags have been removed:
 - **SSH / SFTP / SCP / exec**: Use interactive prompts, saved credentials, or pipe secrets via `--password-stdin` / `--passphrase-stdin`.
 - **Host and identity commands (`host` / `identity`)**: Use `--password-stdin`, `--passphrase-stdin`, or `xops identity credential set`; see [host and identity management](./hosts#removed-credential-arguments).
 - **Flag boundaries**: `ssh` and `exec` reject unknown flags placed before the remote command; arguments after the remote command name or an explicit `--` separator are passed through unchanged.

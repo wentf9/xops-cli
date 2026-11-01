@@ -26,9 +26,9 @@ npx skills add https://github.com/wentf9/xops-cli --skill xops-agent
 | 文件 | 内容 |
 | --- | --- |
 | `references/inventory.md` | 主机、身份、标签、凭据和离线加密库维护 |
-| `references/execution.md` | 单机/批量执行、脚本、Playbook、交互终端与本地工具 |
+| `references/execution.md` | 单机/批量执行、脚本、Playbook与交互终端 |
 | `references/files.md` | 读写文件、目录操作、SCP/SFTP 与传输校验 |
-| `references/networking.md` | 隧道进程管理、防火墙、网络诊断与本地转发 |
+| `references/networking.md` | 隧道进程管理与网络连接 |
 
 ## CLI 功能总览
 
@@ -43,12 +43,10 @@ npx skills add https://github.com/wentf9/xops-cli --skill xops-agent
 | 文件与目录传输 | `scp`、`sftp` | 上传、下载、远端中转、按标签分发，选择覆盖策略并校验结果 |
 | SSH 隧道与代理 | `ssh -L/-R/-D -N` | 管理转发进程或会话、检查监听与目标服务、停止并验证端口释放 |
 | 声明式任务编排 | `play` | 组合 `shell`、`script`、`copy`、`ensure`、`template`，先预览再执行 |
-| 防火墙管理 | `firewall` | 查询状态与规则，管理端口、服务、来源规则及重载（自动适配 firewalld/ufw/iptables/nftables） |
-| 网络诊断与本地转发 | `dns`、`ping`、`nc`、`forward` | 从 CLI 所在机器检查 DNS/ICMP/TCP，或建立本地 TCP/UDP 转发 |
-| 交互界面与编码工具 | `tui`、`sudo`、`encode` | 终端可视化管理、本地提权、`base64`/`url`/`utf8`/`unicode` 编码转换 |
+| 终端管理界面 | `tui` | 终端可视化管理、SSH 会话与实时系统监控 |
 | 服务管理与命令发现 | `mcp serve/recover`、`version`、`help`、`completion` | 按明确任务管理 MCP 服务或查看命令帮助 |
 
-> 注意：`host import --template` 仅导出空白 CSV 模板，而非导出已有主机清单；`encode` 子命令包含 `base64`、`url`、`utf8`、`unicode`（无独立 `hex` 子命令）。完整选项以[命令参考](../reference/)和 `xops <command> --help` 为准。
+> 注意：`host import --template` 仅导出空白 CSV 模板，而非导出已有主机清单。完整选项以[命令参考](../reference/)和 `xops <command> --help` 为准。
 
 ## 执行语义与操作边界
 

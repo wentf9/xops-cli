@@ -1,7 +1,6 @@
 package utils
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -12,7 +11,6 @@ import (
 	"strings"
 
 	"github.com/wentf9/xops-cli/pkg/config"
-	"github.com/wentf9/xops-cli/pkg/models"
 	pkgfile "github.com/wentf9/xops-cli/pkg/utils/file"
 	"golang.org/x/term"
 )
@@ -34,145 +32,6 @@ func GetConfigStore() (config.Store, *config.Repository, *config.Configuration, 
 		return nil, nil, nil, fmt.Errorf("create configuration repository: %w", err)
 	}
 	return configStore, repository, repository.Snapshot(), nil
-}
-
-// GetLocalSudoPassword 尝试从配置文件中获取本地 sudo 密码，返回 (password, found, error)
-func GetLocalSudoPassword() (string, bool, error) {
-	return GetLocalSudoPasswordContext(context.Background())
-}
-
-// GetLocalSudoPasswordContext resolves v2 references on demand with cancellation.
-func GetLocalSudoPasswordContext(ctx context.Context) (string, bool, error) {
-	configPath, keyPathCfg, err := GetConfigFilePath()
-	if err != nil {
-		return "", false, fmt.Errorf("get config file path failed: %w", err)
-	}
-	configStore := config.NewDefaultStore(configPath, keyPathCfg)
-	cfg, err := configStore.Load()
-	if err != nil {
-		return "", false, fmt.Errorf("load config failed: %w", err)
-	}
-	provider := config.NewProviderWithoutOpenSSH(cfg)
-
-	username, userErr := GetCurrentUser()
-	if userErr != nil {
-		return "", false, userErr
-	}
-
-	nodeID, resolveErr := resolveFirstSelector(provider, "localhost", "local", username)
-	if resolveErr != nil {
-		return "", false, fmt.Errorf("resolve local sudo node: %w", resolveErr)
-	}
-
-	if nodeID != "" {
-		if id, ok := provider.GetIdentity(nodeID); ok {
-			if id.LoginPasswordRef != nil && !id.LoginPasswordRef.IsEmpty() {
-				registry, err := GetCredentialRegistry(cfg)
-				if err != nil {
-					return "", false, err
-				}
-				if registry == nil {
-					return "", false, fmt.Errorf("local sudo credential registry is missing")
-				}
-				secret, err := registry.Resolve(ctx, *id.LoginPasswordRef)
-				defer clear(secret.Value)
-				if err != nil {
-					return "", false, fmt.Errorf("resolve local sudo credential: %w", err)
-				}
-				return string(secret.Value), true, nil
-			}
-			return id.Password, id.Password != "", nil
-		}
-	}
-	return "", false, nil
-}
-
-// SaveLocalSudoPassword 保存本地 sudo 密码到配置文件
-func SaveLocalSudoPassword(password string) error {
-	return SaveLocalSudoPasswordContext(context.Background(), password)
-}
-
-// SaveLocalSudoPasswordContext persists the local sudo password with caller
-// cancellation applied to the configuration transaction.
-func SaveLocalSudoPasswordContext(ctx context.Context, password string) error {
-	configPath, keyPathCfg, err := GetConfigFilePath()
-	if err != nil {
-		return fmt.Errorf("get config file path failed: %w", err)
-	}
-	store := config.NewDefaultStore(configPath, keyPathCfg)
-	cfg, err := store.Load()
-	if err != nil {
-		return fmt.Errorf("load config failed: %w", err)
-	}
-	repository, repositoryErr := config.NewRepositoryWithoutOpenSSH(cfg, store)
-	if repositoryErr != nil {
-		return fmt.Errorf("create configuration repository: %w", repositoryErr)
-	}
-
-	username, err := GetCurrentUser()
-	if err != nil {
-		return err
-	}
-	if cfg.SchemaVersion == 2 {
-		return saveLocalSudoCredential(ctx, repository, username, password)
-	}
-	address := "localhost"
-
-	// 先尝试按 GetLocalSudoPassword 的优先级查找已有的 Node
-	view := repository.View()
-	nodeID, resolveErr := resolveFirstSelector(repository, "localhost", "local", username)
-	if resolveErr != nil {
-		return fmt.Errorf("resolve local sudo node: %w", resolveErr)
-	}
-
-	if nodeID != "" {
-		node, host, identity, resolveErr := repository.Resolve(nodeID)
-		if resolveErr != nil {
-			return fmt.Errorf("resolve local node %q for update: %w", nodeID, resolveErr)
-		}
-		identity.Password = password
-		identity.AuthType = "password"
-		if err := repository.ReplaceNodeAtRefContext(ctx, view.NodeRefs[nodeID], nodeID, node, host, identity); err != nil {
-			return fmt.Errorf("update local sudo password failed: %w", err)
-		}
-	} else {
-		// 全新创建
-		nodeID = fmt.Sprintf("%s@%s", username, address)
-		hostID := "localhost"
-		identityID := fmt.Sprintf("%s@local", username)
-
-		if _, err := repository.CreateNodeContext(ctx, nodeID, models.Node{
-			Alias:       []string{"localhost", "local", username},
-			HostRef:     hostID,
-			IdentityRef: identityID,
-			SudoMode:    models.SudoModeSudo,
-		}, models.Host{
-			Address: "127.0.0.1",
-			Port:    22,
-			Alias:   []string{"localhost", "local"},
-		}, models.Identity{
-			User:     username,
-			Password: password,
-			AuthType: "password",
-		}); err != nil {
-			return fmt.Errorf("create local sudo node failed: %w", err)
-		}
-	}
-
-	return nil
-}
-
-func resolveFirstSelector(provider config.ConfigProvider, selectors ...string) (string, error) {
-	for _, selector := range selectors {
-		nodeID, err := provider.ResolveSelector(selector)
-		if err != nil {
-			return "", fmt.Errorf("resolve selector %q: %w", selector, err)
-		}
-		if nodeID != "" {
-			return nodeID, nil
-		}
-	}
-	return "", nil
 }
 
 // ParsePort 解析端口字符串

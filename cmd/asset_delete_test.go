@@ -11,7 +11,7 @@ import (
 )
 
 func TestHostDeleteCleanupFailureRecoversWithFreshService(t *testing.T) {
-	setupFirewallCredential(t)
+	setupPhase6Credential(t)
 	_, _, cfg, err := utils.GetConfigStore()
 	if err != nil {
 		t.Fatal(err)
@@ -61,7 +61,7 @@ func TestHostDeleteCleanupFailureRecoversWithFreshService(t *testing.T) {
 }
 
 func TestAssetDeletionRetainsSharedCredential(t *testing.T) {
-	setupFirewallCredential(t)
+	setupPhase6Credential(t)
 	store, _, cfg, err := utils.GetConfigStore()
 	if err != nil {
 		t.Fatal(err)
@@ -96,7 +96,7 @@ func TestAssetDeletionRetainsSharedCredential(t *testing.T) {
 }
 
 func TestIdentityDeleteCleansStoredCredential(t *testing.T) {
-	setupFirewallCredential(t)
+	setupPhase6Credential(t)
 	if err := executePhase6WithInput(t, NewCmdIdentity(), "identity-secret\n", "add", "--name", "orphan", "--user", "ops", "--password-stdin"); err != nil {
 		t.Fatal(err)
 	}

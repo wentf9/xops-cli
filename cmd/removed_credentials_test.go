@@ -23,7 +23,6 @@ func TestRemovedCredentialFlagsRejected(t *testing.T) {
 		{[]string{"sftp"}, []string{"--password", "--passphrase"}},
 		{[]string{"scp"}, []string{"--password", "--passphrase"}},
 		{[]string{"exec"}, []string{"--password", "--passphrase", "--suPwd"}},
-		{[]string{"firewall", "list"}, []string{"--password", "-w"}},
 		{[]string{"host", "add"}, []string{"--password", "-P", "--key-pass", "-w"}},
 		{[]string{"host", "edit"}, []string{"--password", "-P", "--key-pass", "-w"}},
 		{[]string{"inventory", "add"}, []string{"--password", "-P", "--key-pass", "-w"}},

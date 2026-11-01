@@ -146,13 +146,6 @@ func registerCommands(rootCmd *cobra.Command) {
 	rootCmd.AddCommand(NewCmdPlay())
 	rootCmd.AddCommand(NewCmdIdentity())
 	rootCmd.AddCommand(NewCmdCredential())
-	rootCmd.AddCommand(newCmdNc())
-	rootCmd.AddCommand(newCmdDns())
-	rootCmd.AddCommand(newCmdPing())
-	rootCmd.AddCommand(newCmdFirewall())
-	rootCmd.AddCommand(newCmdSudo())
-	rootCmd.AddCommand(newCmdEncode())
-	rootCmd.AddCommand(newCmdForward())
 }
 
 func newCmdVersion() *cobra.Command {
