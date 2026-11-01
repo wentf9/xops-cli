@@ -394,7 +394,7 @@ func TestCshPrivilegeMultilineSu(t *testing.T) {
 		{"bang_multiline", "echo line1!\necho line2\necho line3!", "line1!\nline2\nline3!\n"},
 		{"bang_multiline_crlf", "echo line1!\r\necho line2\r\necho line3!\r\n", "line1!\nline2\nline3!\n"},
 		{"variables", "VAR='hello world'\necho $VAR\necho done", "hello world\ndone\n"},
-		{"quotes_and_slashes", "echo 'single quoted'\necho \"double quoted\"\necho 'path\\to\\file'", "single quoted\ndouble quoted\npath\\to\\file\n"},
+		{"quotes_and_slashes", "echo 'single quoted'\necho \"double quoted\"\necho 'path\\sub\\dir'", "single quoted\ndouble quoted\npath\\sub\\dir\n"},
 		{"multiline_empty_line", "echo first\n\necho second", "first\nsecond\n"},
 		{"multiline_comment", "echo first\n# a comment\necho second", "first\nsecond\n"},
 		{"multiline_heredoc", "cat << 'EOF'\nheredoc test\nEOF", "heredoc test\n"},

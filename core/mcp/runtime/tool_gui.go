@@ -66,13 +66,15 @@ func (r *Runtime) guiHandler(ctx context.Context, _ *mcp.CallToolRequest, input 
 	if err != nil {
 		return nil, GUIOutput{}, fmt.Errorf("process gui screenshot: %w", err)
 	}
-	return &mcp.CallToolResult{
+	toolResult := &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.ImageContent{Data: imgBytes, MIMEType: mimeType}},
-	}, GUIOutput{
+	}
+	output := GUIOutput{
 		Action:   input.Action,
 		MimeType: mimeType,
 		Status:   "success",
-	}, nil
+	}
+	return toolResult, output, nil
 }
 
 // guiRiskInput exposes typed text to the guardrail: typing into a terminal
