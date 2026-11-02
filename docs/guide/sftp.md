@@ -34,6 +34,10 @@ xops scp --tag web ./config.conf '~/tmp/'
   - Windows 远端路径支持 `vm:C:/Users/example/file.txt`；如果本地文件名本身包含冒号，请加上 `./` 前缀（如 `./22:file`）。
 - **批量或指定主机上传（`--host` / `--tag` / `-I`）**：传入 `--host`、`--tag` 或 `-I/--ifile` 时，固定从本地上传到选中主机（三个选项互斥，可配合 `--exclude` 排除部分主机）。此时两个路径都按纯路径处理，路径里的 `:`、`@`、`[` 等均视为普通文件名字符，不再解析为远程地址。
 - **`--src` 与 `--dest` 兼容写法**：可以用 `--src <源> --dest <目标>` 代替两个位置参数，但两者必须成对出现，且不能与位置路径混用。
+- **提权传输（`--sudo`）**：
+  - 传入 `--sudo` 启用提权传输，在上传、下载以及跨主机中转中均生效（经由本机中转时两端均使用提权会话）。
+  - 底层机制：通过提权通道在远端启动 `sftp-server` 二进制，建立 root 权限的 SFTPv3 流；若远端登录用户本身为 root 则直接请求标准 SFTP subsystem。
+  - 示例：`xops scp --sudo ./app.service web-01:/etc/systemd/system/`、`xops scp --sudo 'web-01:/etc/shadow' ./`、`xops scp --sudo web-01:/root/data.tar web-02:/root/data.tar`。
 
 ```bash
 # 连接 122 端口，上传为远端文件 22:file
@@ -90,8 +94,12 @@ exec date
 exit
 ```
 
-- `exec <命令>`：在当前远端目录执行命令（交互模式下分配 PTY 以支持终端程序），结束后返回 SFTP 提示符。
-- `shell` / `lshell`：进入远端或本地交互式 Shell；`lexec`：执行本地命令。退出子程序后恢复 SFTP 提示符。
+- `exec <命令>`：在当前远端目录执行命令（交互模式下分配 PTY 以支持终端程序），结束后返回 SFTP 提示符。若连接时使用了 `--sudo`，则命令默认继承提权执行。
+- `shell` / `lshell`：进入远端或本地交互式 Shell（若连接时使用了 `--sudo`，远端 Shell 同样继承提权）；`lexec`：执行本地命令。退出子程序后恢复 SFTP 提示符。
+- **提权会话（`--sudo`）**：
+  - 连接时传入 `--sudo` 启动提权 SFTP 会话：`xops sftp --sudo web-01`。
+  - 通过提权通道启动远端 `sftp-server`（root 登录直接请求 subsystem），使 SFTP 文件读写、查看等操作拥有 root 权限。
+  - 交互式 `shell` 与内置 `exec` 命令默认同样继承 `--sudo` 提权执行。
 - 连接中断或命令输出失败时，会话会结束并返回非零状态。需要继续操作时，请重新连接。
 - **连接诊断**：`-v` / `--verbose` 将 SSH/SFTP 诊断信息写入 `stderr`（独立于 `--debug`），采用与 `xops ssh -v` 相同的 `debug1/2/3:` 格式：
   - `-v`：显示连接、主机密钥验证、认证、协商算法及 SFTP 初始化信息。

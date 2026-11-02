@@ -82,6 +82,7 @@ func NewCmdSftp() *cobra.Command {
 	cmd.Flags().StringVar(&o.Remember, "remember", "", i18n.T("flag_remember"))
 	cmd.Flags().StringVar(&o.Alias, "alias", "", i18n.T("flag_alias"))
 	cmd.Flags().StringSliceVar(&o.Tags, "tag", []string{}, i18n.T("flag_tag"))
+	cmd.Flags().BoolVar(&o.Sudo, "sudo", false, i18n.T("flag_sudo"))
 	o.diagnostic.registerVerbose(cmd, "flag_sftp_verbose")
 
 	cmd.MarkFlagsMutuallyExclusive("force", "no-clobber")
@@ -156,6 +157,7 @@ func (o *SftpOptions) RunContext(ctx context.Context) (err error) {
 		sftp.WithThreadsPerFile(o.maxThread),
 		sftp.WithForce(o.force),
 		sftp.WithDiagnostics(observer),
+		sftp.WithSudo(o.Sudo),
 	)
 	if err != nil {
 		return fmt.Errorf("%s: %w", i18n.T("err_connect_failed"), err)
@@ -203,7 +205,7 @@ func (o *SftpOptions) RunContext(ctx context.Context) (err error) {
 	}()
 
 	// 启动 Shell
-	shell, err := sftpshell.New(ctx, sftpClient, client, os.Stdin, os.Stdout, os.Stderr, sftpshell.WithLogger(logger.DefaultLogger()), sftpshell.WithNoOverwrite(o.noOverwrite))
+	shell, err := sftpshell.New(ctx, sftpClient, client, os.Stdin, os.Stdout, os.Stderr, sftpshell.WithLogger(logger.DefaultLogger()), sftpshell.WithNoOverwrite(o.noOverwrite), sftpshell.WithSudo(o.Sudo))
 	if err != nil {
 		markShellDone()
 		return fmt.Errorf("%s: %w", i18n.T("sftp_shell_create_failed"), err)

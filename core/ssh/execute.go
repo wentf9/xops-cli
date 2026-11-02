@@ -120,6 +120,23 @@ func (c *Client) maybeProbeExecutionForPrivilege(ctx context.Context) (*Privileg
 	return mat, nil
 }
 
+// ResolvePrivilegeExecution probes and returns the effective ExecutionConfig for privilege escalation.
+// In non-interactive environments, it validates that required credentials are present before probing.
+// If probing fails without context cancellation, it gracefully falls back to legacy defaults.
+func (c *Client) ResolvePrivilegeExecution(ctx context.Context) (*ExecutionConfig, error) {
+	if c == nil {
+		return nil, nil
+	}
+	mat, err := c.ensureNonInteractivePrivilegeCredential(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if mat != nil {
+		mat.Zero()
+	}
+	return c.maybeProbePrivilegeExecution(ctx)
+}
+
 func (c *Client) preparePrivilegeRunConfig(opts ...RunOption) (callerCfg *RunConfig, config *RunConfig) {
 	callerCfg = DefaultRunConfig()
 	for _, opt := range opts {
@@ -269,9 +286,15 @@ func (c *Client) RunInteractiveWithSudo(ctx context.Context, command string) err
 // RunInteractiveWithSudoExecution applies a per-operation execution configuration
 // without mutating the shared client's defaults. Terminal streams are borrowed
 // from the host environment; the existing privilege lifecycle owns their binding.
-func (c *Client) RunInteractiveWithSudoExecution(ctx context.Context, command string, execution *ExecutionConfig) (retErr error) {
+func (c *Client) RunInteractiveWithSudoExecution(ctx context.Context, command string, execution *ExecutionConfig) error {
+	return c.RunInteractiveWithSudoExecutionIO(ctx, command, execution, c.defaultInteractiveIO())
+}
+
+// RunInteractiveWithSudoExecutionIO applies a per-operation execution configuration
+// using caller-provided streams without mutating the shared client's defaults.
+func (c *Client) RunInteractiveWithSudoExecutionIO(ctx context.Context, command string, execution *ExecutionConfig, streams InteractiveIO) (retErr error) {
 	if execution == nil {
-		return c.RunInteractiveWithSudo(ctx, command)
+		return c.RunInteractiveWithSudoIO(ctx, command, streams)
 	}
 	opts, err := c.configuredSudoOptions(ctx, command, execution)
 	if err != nil {
@@ -283,7 +306,6 @@ func (c *Client) RunInteractiveWithSudoExecution(ctx context.Context, command st
 	}
 	work, cancelOutput := context.WithCancel(ctx)
 	defer cancelOutput()
-	streams := c.defaultInteractiveIO()
 	stdout, stderr, closeOutput, err := bindStrictOutputs(work, streams.Stdout, streams.Stderr)
 	if err != nil {
 		return err
@@ -510,8 +532,8 @@ func (c *Client) resolveCommandIOInterpreter(sudo bool, command string) (Interpr
 		}
 	}
 	interp := InterpreterServer
-	if exec != nil && exec.EffectiveInterpreter() != "" {
-		interp = exec.EffectiveInterpreter()
+	if exec != nil && exec.Interpreter != "" {
+		interp = exec.Interpreter
 	} else if sudo {
 		interp = InterpreterBash
 	}

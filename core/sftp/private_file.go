@@ -21,9 +21,15 @@ func (c *Client) CreatePrivateExclusive(ctx context.Context, name string, write 
 	if ctx == nil || c == nil || c.state == nil || c.state.sshClient == nil || write == nil {
 		return false, false, errors.New("private file creation requires an SSH client and writer")
 	}
-	setupCtx, cancel := context.WithTimeout(ctx, defaultSubsystemSetupTimeout)
-	defer cancel()
-	raw, interrupt, err := newSubsystemProtocol(setupCtx, c.state.sshClient, func(rd io.Reader, wr io.WriteCloser) (io.Closer, error) {
+	var setupCtx context.Context
+	var cancel context.CancelFunc
+	if c.config.Sudo {
+		setupCtx = ctx
+	} else {
+		setupCtx, cancel = context.WithTimeout(ctx, defaultSubsystemSetupTimeout)
+		defer cancel()
+	}
+	raw, interrupt, err := newSubsystemProtocol(setupCtx, c.state.sshClient, c.config.Sudo, func(rd io.Reader, wr io.WriteCloser) (io.Closer, error) {
 		return newPrivateFileStream(ctx, rd, wr)
 	}, newProtocolDiagnostics(c.diagnostics))
 	if err != nil {

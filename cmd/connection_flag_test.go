@@ -43,6 +43,14 @@ func TestConnectionFlagsRegistration(t *testing.T) {
 			if remember.DefValue != "" {
 				t.Errorf("%s --remember default value = %q, want %q", tc.name, remember.DefValue, "inherit configuration")
 			}
+
+			sudoFlag := tc.cmd.Flags().Lookup("sudo")
+			if sudoFlag == nil {
+				t.Fatalf("%s missing --sudo flag", tc.name)
+			}
+			if sudoFlag.Value.Type() != "bool" {
+				t.Errorf("%s --sudo type = %q, want bool", tc.name, sudoFlag.Value.Type())
+			}
 		})
 	}
 }

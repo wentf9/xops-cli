@@ -46,8 +46,8 @@ type scpDiagnostics struct {
 	scpLevel   int
 }
 
-func newSCPDiagnostics(ctx context.Context, target io.Writer, stream string, sshVerbose bool, scpLevel int) (*scpDiagnostics, error) {
-	output, err := newDiagnosticOutput(ctx, target, stream, "scp")
+func newSCPDiagnostics(ctx context.Context, target io.Writer, stream string, sshVerbose bool, scpLevel int, gates ...chan struct{}) (*scpDiagnostics, error) {
+	output, err := newDiagnosticOutput(ctx, target, stream, "scp", gates...)
 	if err != nil {
 		return nil, &SCPOutputError{Stream: stream, Err: err}
 	}

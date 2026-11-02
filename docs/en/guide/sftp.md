@@ -34,6 +34,10 @@ Basic syntax: `xops scp [options] <source> <destination>`. Both source and desti
   - Windows remote paths accept `vm:C:/Users/example/file.txt`. Prefix local filenames containing colons with `./` (e.g., `./22:file`).
 - **Batch or targeted uploads (`--host` / `--tag` / `-I`)**: Passing `--host`, `--tag`, or `-I/--ifile` always uploads from the local machine to the selected hosts (the three flags are mutually exclusive; use `--exclude` to filter out hosts). In this mode, both paths are treated as literal file paths—characters like `:`, `@`, and `[` are treated as ordinary filename characters rather than remote address syntax.
 - **`--src` and `--dest` compatibility flags**: You can pass `--src <source> --dest <dest>` instead of two positional paths, but both flags must be used together and cannot be mixed with positional arguments.
+- **Privilege escalation (`--sudo`)**:
+  - Pass `--sudo` to enable elevated transfers for uploads, downloads, and remote-to-remote relays (when relaying between two remote hosts, privilege escalation is enabled on both sides).
+  - Under the hood, XOps starts the remote `sftp-server` binary via an escalation channel to establish a root SFTPv3 stream; if the login user is already root, it directly requests the standard SFTP subsystem.
+  - Examples: `xops scp --sudo ./app.service web-01:/etc/systemd/system/`, `xops scp --sudo 'web-01:/etc/shadow' ./`, `xops scp --sudo web-01:/root/data.tar web-02:/root/data.tar`.
 
 ```bash
 # Connect on port 122 and upload to a remote file named 22:file
@@ -90,8 +94,12 @@ exec date
 exit
 ```
 
-- `exec <command>`: Runs a command in the current remote directory (allocating a PTY in interactive mode for terminal programs) and returns to the SFTP prompt.
-- `shell` / `lshell`: Opens a remote or local interactive shell; `lexec`: runs a local command. The SFTP prompt resumes when the child program exits.
+- `exec <command>`: Runs a command in the current remote directory (allocating a PTY in interactive mode for terminal programs) and returns to the SFTP prompt. When connected with `--sudo`, commands inherit elevated execution by default.
+- `shell` / `lshell`: Opens a remote or local interactive shell (remote shell inherits elevated privileges when connected with `--sudo`); `lexec`: runs a local command. The SFTP prompt resumes when the child program exits.
+- **Privilege escalation (`--sudo`)**:
+  - Pass `--sudo` when connecting to start an elevated SFTP session: `xops sftp --sudo web-01`.
+  - It launches the remote `sftp-server` binary via an escalation channel (or requests the subsystem directly if logged in as root), granting root privileges for all file operations.
+  - Interactive `shell` and built-in `exec` commands also inherit elevated privileges by default.
 - If the connection drops or command output fails, the session ends with a nonzero status. Reconnect to continue working.
 - **Connection diagnostics**: `-v` / `--verbose` prints SSH/SFTP diagnostics to `stderr` (independent of `--debug`). It uses the same `debug1/2/3:` format as `xops ssh -v`:
   - `-v`: Shows connection, host key verification, authentication, negotiated algorithms, and SFTP initialization.

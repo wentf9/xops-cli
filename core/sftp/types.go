@@ -17,6 +17,7 @@ type TransferConfig struct {
 	ResumeMinSize   int64
 	TempSuffix      string
 	Force           bool
+	Sudo            bool
 }
 
 func DefaultConfig() TransferConfig {

@@ -73,6 +73,13 @@ func WithForce(force bool) Option {
 	}
 }
 
+// WithSudo enables privileged SFTP execution using an elevated sftp-server binary.
+func WithSudo(sudo bool) Option {
+	return func(c *Client) {
+		c.config.Sudo = sudo
+	}
+}
+
 // Client wraps an SFTP client and owns only file-transfer concerns. Canceling
 // an in-flight operation first closes only this client's SFTP subsystem. If
 // the server leaves that close blocked, the shared SSH transport is closed as
@@ -105,8 +112,6 @@ func NewClient(ctx context.Context, sshCli *ssh.Client, opts ...Option) (*Client
 	if sshCli == nil {
 		return nil, fmt.Errorf("ssh client is nil")
 	}
-	setupCtx, cancelSetup := context.WithTimeout(ctx, defaultSubsystemSetupTimeout)
-	defer cancelSetup()
 
 	sftpCli := &Client{
 		state:  &clientState{sshClient: sshCli},
@@ -128,13 +133,31 @@ func NewClient(ctx context.Context, sshCli *ssh.Client, opts ...Option) (*Client
 	}
 	corelog.EmitDiagnostic(sftpCli.diagnostics, event)
 
-	client, interrupt, err := newSFTPSubsystem(
-		setupCtx,
-		sshCli,
-		diagnostics,
-		sftp.MaxConcurrentRequestsPerFile(sftpCli.config.ThreadsPerFile),
-		sftp.MaxPacket(32*1024),
-	)
+	var client *sftp.Client
+	var interrupt func() error
+	var err error
+
+	if sftpCli.config.Sudo {
+		client, interrupt, err = newSFTPSubsystem(
+			ctx,
+			sshCli,
+			true,
+			diagnostics,
+			sftp.MaxConcurrentRequestsPerFile(sftpCli.config.ThreadsPerFile),
+			sftp.MaxPacket(32*1024),
+		)
+	} else {
+		setupCtx, cancelSetup := context.WithTimeout(ctx, defaultSubsystemSetupTimeout)
+		defer cancelSetup()
+		client, interrupt, err = newSFTPSubsystem(
+			setupCtx,
+			sshCli,
+			false,
+			diagnostics,
+			sftp.MaxConcurrentRequestsPerFile(sftpCli.config.ThreadsPerFile),
+			sftp.MaxPacket(32*1024),
+		)
+	}
 	if err != nil {
 		event.Kind = corelog.SubsystemFailed
 		corelog.EmitDiagnostic(sftpCli.diagnostics, event)
@@ -148,8 +171,8 @@ func NewClient(ctx context.Context, sshCli *ssh.Client, opts ...Option) (*Client
 	return sftpCli, nil
 }
 
-func newSFTPSubsystem(ctx context.Context, sshCli *ssh.Client, diagnostics *protocolDiagnostics, opts ...sftp.ClientOption) (*sftp.Client, func() error, error) {
-	client, interrupt, err := newSubsystemProtocol(ctx, sshCli, func(rd io.Reader, wr io.WriteCloser) (io.Closer, error) {
+func newSFTPSubsystem(ctx context.Context, sshCli *ssh.Client, sudo bool, diagnostics *protocolDiagnostics, opts ...sftp.ClientOption) (*sftp.Client, func() error, error) {
+	client, interrupt, err := newSubsystemProtocol(ctx, sshCli, sudo, func(rd io.Reader, wr io.WriteCloser) (io.Closer, error) {
 		return sftp.NewClientPipe(rd, wr, opts...)
 	}, diagnostics)
 	if err != nil {
@@ -160,9 +183,13 @@ func newSFTPSubsystem(ctx context.Context, sshCli *ssh.Client, diagnostics *prot
 
 // newSubsystemProtocol shares bounded SSH setup and cancellation/close ownership
 // between SFTP protocol clients. The factory owns protocol negotiation only.
-func newSubsystemProtocol(ctx context.Context, sshCli *ssh.Client, factory func(io.Reader, io.WriteCloser) (io.Closer, error), diagnostics *protocolDiagnostics) (io.Closer, func() error, error) {
+func newSubsystemProtocol(ctx context.Context, sshCli *ssh.Client, sudo bool, factory func(io.Reader, io.WriteCloser) (io.Closer, error), diagnostics *protocolDiagnostics) (io.Closer, func() error, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
+	}
+
+	if sudo {
+		return newSudoSubsystemProtocol(ctx, sshCli, factory, diagnostics)
 	}
 
 	session, err := newSubsystemSessionContext(ctx, sshCli)
@@ -229,6 +256,77 @@ func newSubsystemProtocol(ctx context.Context, sshCli *ssh.Client, factory func(
 	}()
 
 	rd, wr := diagnostics.pipes(stdout, stdin)
+	client, err := factory(rd, wr)
+	if err != nil {
+		return nil, nil, errors.Join(
+			fmt.Errorf("initialize SFTP protocol failed: %w", err),
+			finishSetup(),
+			interrupt(),
+			waitSubsystemStderr(stderrDone),
+		)
+	}
+	if setupErr := finishSetup(); setupErr != nil {
+		return nil, nil, errors.Join(
+			setupErr,
+			closeTransferResource(client, "SFTP client after canceled setup"),
+			interrupt(),
+			waitSubsystemStderr(stderrDone),
+		)
+	}
+
+	interruptAndWait := sync.OnceValues(func() (struct{}, error) {
+		return struct{}{}, errors.Join(interrupt(), waitSubsystemStderr(stderrDone))
+	})
+	return client, func() error {
+		_, err := interruptAndWait()
+		return err
+	}, nil
+}
+
+func newSudoSubsystemProtocol(ctx context.Context, sshCli *ssh.Client, factory func(io.Reader, io.WriteCloser) (io.Closer, error), diagnostics *protocolDiagnostics) (io.Closer, func() error, error) {
+	stream, err := sshCli.OpenSFTPStream(ctx, true)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	protoCtx, cancelProto := context.WithTimeout(ctx, defaultSubsystemSetupTimeout)
+	defer cancelProto()
+
+	interrupt := func() error {
+		return stream.Close()
+	}
+	setupCanceled := make(chan error, 1)
+	stopSetupCancellation := context.AfterFunc(protoCtx, func() {
+		setupCanceled <- interrupt()
+	})
+	finishSetupCancellation := sync.OnceValues(func() (struct{}, error) {
+		if stopSetupCancellation() {
+			return struct{}{}, nil
+		}
+		return struct{}{}, errors.Join(protoCtx.Err(), <-setupCanceled)
+	})
+	finishSetup := func() error {
+		_, err := finishSetupCancellation()
+		return err
+	}
+
+	stderrDone := make(chan error, 1)
+	go func() {
+		var n int64
+		var copyErr error
+		if stream.Stderr != nil {
+			n, copyErr = io.Copy(io.Discard, stream.Stderr)
+		}
+		diagnostics.stderr(n)
+		if copyErr != nil && !errors.Is(copyErr, io.EOF) && !errors.Is(copyErr, net.ErrClosed) {
+			copyErr = fmt.Errorf("drain SFTP subsystem stderr failed: %w", copyErr)
+		} else {
+			copyErr = nil
+		}
+		stderrDone <- copyErr
+	}()
+
+	rd, wr := diagnostics.pipes(stream.Reader, stream.WriteCloser)
 	client, err := factory(rd, wr)
 	if err != nil {
 		return nil, nil, errors.Join(

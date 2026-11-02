@@ -56,6 +56,7 @@ type Shell struct {
 	logger          corelog.DebugLogger
 	noOverwrite     bool
 	batch           bool // Non-terminal command input: stop at the first failure.
+	sudo            bool
 	transferConfig  sftp.TransferConfig
 	newClientFn     clientFactory
 	newLineEditorFn lineEditorFactory
@@ -180,6 +181,7 @@ func (s *Shell) refreshClient(
 		}
 
 		cfg = oldClient.Config()
+		cfg.Sudo = s.sudo
 		s.clientMu.Lock()
 		s.transferConfig = cfg
 		if s.client == oldClient {
@@ -201,6 +203,7 @@ func (s *Shell) refreshClient(
 		createFn = sftp.NewClient
 	}
 
+	cfg.Sudo = s.sudo
 	newCli, err := createFn(ctx, sshCli,
 		sftp.WithForce(cfg.Force),
 		sftp.WithConcurrentFiles(cfg.ConcurrentFiles),
@@ -208,6 +211,7 @@ func (s *Shell) refreshClient(
 		sftp.WithChunkSize(int(cfg.ChunkSize)),
 		sftp.WithResume(cfg.EnableResume),
 		sftp.WithResumeMinSize(cfg.ResumeMinSize),
+		sftp.WithSudo(cfg.Sudo),
 	)
 	if err != nil {
 		return fmt.Errorf("reconnect sftp subsystem failed: %w", err)
@@ -230,6 +234,7 @@ func (s *Shell) refreshClient(
 	s.client = newCli
 	s.clientInvalid = false
 	s.transferConfig = newCli.Config()
+	s.transferConfig.Sudo = s.sudo
 	s.clientMu.Unlock()
 	return nil
 }
@@ -557,6 +562,14 @@ func WithNoOverwrite(noOverwrite bool) Option {
 	}
 }
 
+// WithSudo enables privileged execution for the SFTP session and its subcommands.
+func WithSudo(sudo bool) Option {
+	return func(s *Shell) {
+		s.sudo = sudo
+		s.transferConfig.Sudo = sudo
+	}
+}
+
 // New creates a new interactive SFTP presentation layer. The line editor is
 // created lazily by Run immediately before its first prompt, so Close never
 // has to tear down an editor that has not begun reading.
@@ -592,6 +605,7 @@ func New(ctx context.Context, client *sftp.Client, sshClient *ssh.Client, stdin 
 		stdout:         stdout,
 		stderr:         stderr,
 		logger:         corelog.NopLogger,
+		sudo:           client.Config().Sudo,
 		transferConfig: client.Config(),
 		state:          shellCreated,
 		batch:          !terminalInput(stdin),
@@ -2375,8 +2389,14 @@ func (s *Shell) handleShell(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := s.sshClient.ShellWithIO(ctx, streams); err != nil {
-		return fmt.Errorf("shell: %w", err)
+	if s.sudo {
+		if err := s.sshClient.ShellWithSudoIO(ctx, streams); err != nil {
+			return fmt.Errorf("shell: %w", err)
+		}
+	} else {
+		if err := s.sshClient.ShellWithIO(ctx, streams); err != nil {
+			return fmt.Errorf("shell: %w", err)
+		}
 	}
 	s.fprintlnStdout("")
 	return nil
@@ -2409,32 +2429,68 @@ func (s *Shell) handleLshell(ctx context.Context) error {
 	return nil
 }
 
+func (s *Shell) resolveExecConfig(ctx context.Context) (*ssh.ExecutionConfig, error) {
+	if s.sudo {
+		execCfg, err := s.sshClient.ResolvePrivilegeExecution(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("exec: resolve privilege execution: %w", err)
+		}
+		if execCfg != nil {
+			if err := execCfg.Validate(); err != nil {
+				return nil, fmt.Errorf("exec: %w", err)
+			}
+		}
+		return execCfg, nil
+	}
+	workingDirCfg := s.sshClient.Execution()
+	if s.cwd != "" {
+		var err error
+		workingDirCfg, err = s.sshClient.ResolveWorkingDirectoryExecution(ctx, workingDirCfg)
+		if err != nil {
+			return nil, fmt.Errorf("exec: resolve working directory adapter: %w", err)
+		}
+	}
+	if workingDirCfg == nil {
+		workingDirCfg = &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer, LaunchDialect: ssh.LaunchUnknown}
+	}
+	if err := workingDirCfg.Validate(); err != nil {
+		return nil, fmt.Errorf("exec: %w", err)
+	}
+	return workingDirCfg, nil
+}
+
 // handleExec 在远程主机上执行命令，分配 PTY 以支持 vim/top 等交互式程序
 func (s *Shell) handleExec(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("%s", i18n.T("sftp_shell_exec_usage"))
 	}
 	userCmd := strings.Join(args, " ")
-	execCfg := s.sshClient.Execution()
-	if s.cwd != "" {
-		var err error
-		execCfg, err = s.sshClient.ResolveWorkingDirectoryExecution(ctx, execCfg)
-		if err != nil {
-			return fmt.Errorf("exec: resolve working directory adapter: %w", err)
-		}
-	}
-	if execCfg == nil {
-		execCfg = &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer, LaunchDialect: ssh.LaunchUnknown}
-	} else if err := execCfg.Validate(); err != nil {
-		return fmt.Errorf("exec: %w", err)
+	execCfgForWorkingDir, err := s.resolveExecConfig(ctx)
+	if err != nil {
+		return err
 	}
 
-	cmdStr, err := ssh.FormatWorkingDirCommand(s.cwd, userCmd, execCfg)
+	formatCfg := execCfgForWorkingDir
+	if s.sudo {
+		if formatCfg == nil {
+			formatCfg = &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchPOSIX}
+		} else if formatCfg.Interpreter == "" {
+			formatCfg = formatCfg.Clone()
+			formatCfg.Interpreter = ssh.InterpreterBash
+			if formatCfg.LaunchDialect == "" || formatCfg.LaunchDialect == ssh.LaunchUnknown {
+				formatCfg.LaunchDialect = ssh.LaunchPOSIX
+			}
+		}
+	}
+	cmdStr, err := ssh.FormatWorkingDirCommand(s.cwd, userCmd, formatCfg)
 	if err != nil {
 		return fmt.Errorf("exec: %w", err)
 	}
-	opts := execCfg.CommandOptions()
-	if s.batch && execCfg.Login == nil && opts.Interpreter == ssh.InterpreterBash {
+	if s.sudo {
+		return s.handleExecSudo(ctx, cmdStr)
+	}
+	opts := execCfgForWorkingDir.CommandOptions()
+	if s.batch && execCfgForWorkingDir.Login == nil && opts.Interpreter == ssh.InterpreterBash {
 		opts.Login = ssh.LoginDisabled
 	}
 	plan, err := ssh.PlanCommand(cmdStr, opts)
@@ -2490,6 +2546,31 @@ func (s *Shell) handleLexec(ctx context.Context, cmdStr string) error {
 	if err != nil {
 		return fmt.Errorf("lexec: %w", err)
 	}
+	return nil
+}
+
+func (s *Shell) handleExecSudo(ctx context.Context, cmdStr string) error {
+	if s.batch {
+		if err := s.sshClient.RunCommandWithIO(ctx, cmdStr, true, strings.NewReader(""), s.stdout, s.stderr); err != nil {
+			return fmt.Errorf("exec failed: %w", err)
+		}
+		return nil
+	}
+	if err := s.closeLineEditor(); err != nil {
+		return fmt.Errorf("close SFTP line editor before remote command failed: %w", err)
+	}
+	streams, err := s.interactiveIO()
+	if err != nil {
+		return err
+	}
+	execCfg := s.sshClient.Execution()
+	if execCfg != nil && execCfg.Interpreter == "" {
+		execCfg = nil
+	}
+	if err := s.sshClient.RunInteractiveWithSudoExecutionIO(ctx, cmdStr, execCfg, streams); err != nil {
+		return fmt.Errorf("exec: %w", err)
+	}
+	s.fprintlnStdout("")
 	return nil
 }
 

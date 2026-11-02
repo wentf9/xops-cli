@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -106,6 +108,7 @@ func newSCPTransferFixture(t *testing.T, opts ...xssh.Option) scpTransferFixture
 	connector := xssh.NewConnector(tunnelTestProvider{cfg: &xssh.ClientConfig{
 		NodeID: "test@" + hostID, Address: "127.0.0.1", Port: port,
 		User: "test", AuthType: "password", Password: "test",
+		SudoMode: xssh.SudoModeSudoer,
 	}}, append([]xssh.Option{xssh.WithEnvironment(sshenv.Discover())}, opts...)...)
 	connector.AcceptNewHostKey.Store(true)
 	t.Cleanup(func() {
@@ -160,31 +163,102 @@ func serveSCPTestConnection(t *testing.T, ctx context.Context, conn net.Conn, cf
 		workers.Go(func() {
 			defer closeSCPTestResource(t, channel)
 			for request := range requests {
-				accepted := request.Type == "subsystem" && string(request.Payload) == string(cryptossh.Marshal(struct{ Name string }{"sftp"}))
-				if err := request.Reply(accepted, nil); err != nil {
-					t.Errorf("reply to SCP test subsystem: %v", err)
+				if handleSCPTestSubsystem(t, channel, request, home) {
 					return
 				}
-				if accepted {
-					server, err := pkgsftp.NewServer(channel, pkgsftp.WithServerWorkingDirectory(home))
-					if err != nil {
-						t.Errorf("create SCP test SFTP server: %v", err)
-						return
-					}
-					defer closeSCPTestResource(t, server)
-					if err := server.Serve(); err != nil && !errors.Is(err, io.EOF) {
-						t.Errorf("serve SCP test SFTP: %v", err)
-					}
-					// OpenSSH waits for the subsystem's exit status after closing
-					// SFTP stdin. Go clients may already have closed the channel.
-					if _, err := channel.SendRequest("exit-status", false, cryptossh.Marshal(struct{ Status uint32 }{0})); err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
-						t.Errorf("send SCP fixture subsystem exit status: %v", err)
-					}
+				if handleSCPTestExec(t, channel, request, home) {
+					return
+				}
+				if err := request.Reply(false, nil); err != nil {
+					t.Errorf("reply to SCP test request: %v", err)
 					return
 				}
 			}
 		})
 	}
+}
+
+func handleSCPTestSubsystem(t *testing.T, channel cryptossh.Channel, request *cryptossh.Request, home string) bool {
+	if request.Type != "subsystem" || string(request.Payload) != string(cryptossh.Marshal(struct{ Name string }{"sftp"})) {
+		return false
+	}
+	if err := request.Reply(true, nil); err != nil {
+		t.Errorf("reply to SCP test subsystem: %v", err)
+		return true
+	}
+	server, err := pkgsftp.NewServer(channel, pkgsftp.WithServerWorkingDirectory(home))
+	if err != nil {
+		t.Errorf("create SCP test SFTP server: %v", err)
+		return true
+	}
+	defer closeSCPTestResource(t, server)
+	if err := server.Serve(); err != nil && !errors.Is(err, io.EOF) {
+		t.Errorf("serve SCP test SFTP: %v", err)
+	}
+	if _, err := channel.SendRequest("exit-status", false, cryptossh.Marshal(struct{ Status uint32 }{0})); err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+		t.Errorf("send SCP fixture subsystem exit status: %v", err)
+	}
+	return true
+}
+
+func handleSCPTestExec(t *testing.T, channel cryptossh.Channel, request *cryptossh.Request, home string) bool {
+	if request.Type != "exec" {
+		return false
+	}
+	var payload struct {
+		Command string
+	}
+	if err := cryptossh.Unmarshal(request.Payload, &payload); err != nil {
+		return false
+	}
+	cmd := payload.Command
+	readyToken := extractSCPTestToken(cmd, "[xops-ready-")
+	streamToken := extractSCPTestToken(cmd, "[xops-sftp-stream-")
+	if readyToken == "" && streamToken == "" {
+		return false
+	}
+	if err := request.Reply(true, nil); err != nil {
+		t.Errorf("reply to SCP test exec: %v", err)
+		return true
+	}
+	reader := bufio.NewReader(channel)
+	if readyToken != "" {
+		_, _ = io.WriteString(channel, readyToken)
+	}
+	ack, _ := reader.ReadString('\n')
+	_ = ack
+	if streamToken != "" {
+		_, _ = io.WriteString(channel, streamToken)
+	}
+	server, err := pkgsftp.NewServer(channel, pkgsftp.WithServerWorkingDirectory(home))
+	if err != nil {
+		t.Errorf("create SCP test SFTP server: %v", err)
+		return true
+	}
+	defer closeSCPTestResource(t, server)
+	if err := server.Serve(); err != nil && !errors.Is(err, io.EOF) {
+		t.Errorf("serve SCP test SFTP: %v", err)
+	}
+	_, _ = channel.SendRequest("exit-status", false, cryptossh.Marshal(struct{ Status uint32 }{0}))
+	return true
+}
+
+func extractSCPTestToken(command, prefix string) string {
+	at := strings.Index(command, prefix)
+	if at >= 0 && strings.HasPrefix(command[at:], prefix+"%s]") {
+		nonce := regexp.MustCompile(`[A-Z2-7]{26,}`).FindString(command[at:])
+		if nonce != "" {
+			return prefix + nonce + "]"
+		}
+	}
+	if at < 0 {
+		return ""
+	}
+	end := strings.Index(command[at:], "]")
+	if end < 0 {
+		return ""
+	}
+	return command[at : at+end+1]
 }
 
 func writeSCPTestFile(t *testing.T, name, content string) {
@@ -504,4 +578,38 @@ func TestSCPRemoteHomeExpansionBoundaries(t *testing.T) {
 	if _, err := expandSCPRemotePath(ctx, client, "~/file"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled expansion error = %v", err)
 	}
+}
+
+func TestSCPTransferWithSudo(t *testing.T) {
+	fixture := newSCPTransferFixture(t)
+	writeSCPTestFile(t, filepath.Join(fixture.home, "payload.txt"), "sudo remote payload")
+	destination := t.TempDir()
+
+	// 1. Download with --sudo
+	options := NewScpOptions()
+	options.Sudo = true
+	options.Source = "scp-test:~/payload.txt"
+	options.Dest = destination
+	if err := options.runTransfer(fixture.ctx, fixture.repo, fixture.connector); err != nil {
+		t.Fatalf("download with --sudo failed: %v", err)
+	}
+	assertSCPTestFile(t, filepath.Join(destination, "payload.txt"), "sudo remote payload")
+
+	// 2. Upload with --sudo
+	localFile := filepath.Join(destination, "uploaded.txt")
+	writeSCPTestFile(t, localFile, "sudo upload payload")
+	options.Source = localFile
+	options.Dest = "scp-test:~/uploaded.txt"
+	if err := options.runTransfer(fixture.ctx, fixture.repo, fixture.connector); err != nil {
+		t.Fatalf("upload with --sudo failed: %v", err)
+	}
+	assertSCPTestFile(t, filepath.Join(fixture.home, "uploaded.txt"), "sudo upload payload")
+
+	// 3. Remote-to-remote (relay) with --sudo
+	options.Source = "scp-test:uploaded.txt"
+	options.Dest = "scp-test:~/relayed.txt"
+	if err := options.runTransfer(fixture.ctx, fixture.repo, fixture.connector); err != nil {
+		t.Fatalf("remote-to-remote with --sudo failed: %v", err)
+	}
+	assertSCPTestFile(t, filepath.Join(fixture.home, "relayed.txt"), "sudo upload payload")
 }

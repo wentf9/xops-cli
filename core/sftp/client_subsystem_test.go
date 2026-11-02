@@ -1,6 +1,7 @@
 package sftp
 
 import (
+	"bufio"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -9,7 +10,9 @@ import (
 	"io"
 	"net"
 	"path/filepath"
+	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -290,37 +293,189 @@ func serveSubsystemTestChannel(newChannel cryptossh.NewChannel, stallSubsystem b
 	}()
 
 	for request := range requests {
-		accepted := request.Type == "subsystem"
-		if accepted {
-			var payload struct {
-				Name string
+		switch request.Type {
+		case "subsystem":
+			done, err := handleSubsystemTestSubsystem(channel, request, stallSubsystem)
+			if err != nil {
+				return err
 			}
-			if err := cryptossh.Unmarshal(request.Payload, &payload); err != nil || payload.Name != "sftp" {
-				accepted = false
+			if done {
+				return retErr
+			}
+		case "exec":
+			done, err := handleSubsystemTestExec(channel, request)
+			if err != nil {
+				return err
+			}
+			if done {
+				return retErr
+			}
+		default:
+			if err := request.Reply(false, nil); err != nil {
+				return fmt.Errorf("reply to test SSH session request failed: %w", err)
 			}
 		}
-		if accepted && stallSubsystem {
-			_, copyErr := io.Copy(io.Discard, channel)
-			if copyErr != nil && !errors.Is(copyErr, io.EOF) && !errors.Is(copyErr, net.ErrClosed) {
-				return fmt.Errorf("wait for canceled test SFTP subsystem failed: %w", copyErr)
-			}
-			return retErr
-		}
-		if err := request.Reply(accepted, nil); err != nil {
-			return fmt.Errorf("reply to test SSH session request failed: %w", err)
-		}
-		if !accepted {
-			continue
-		}
-
-		server := pkgsftp.NewRequestServer(channel, pkgsftp.InMemHandler())
-		serveErr := server.Serve()
-		if serveErr != nil && !errors.Is(serveErr, io.EOF) {
-			return fmt.Errorf("serve test SFTP subsystem failed: %w", serveErr)
-		}
-		return retErr
 	}
 	return retErr
+}
+
+func handleSubsystemTestSubsystem(channel cryptossh.Channel, request *cryptossh.Request, stallSubsystem bool) (bool, error) {
+	var payload struct {
+		Name string
+	}
+	accepted := cryptossh.Unmarshal(request.Payload, &payload) == nil && payload.Name == "sftp"
+	if accepted && stallSubsystem {
+		_, copyErr := io.Copy(io.Discard, channel)
+		if copyErr != nil && !errors.Is(copyErr, io.EOF) && !errors.Is(copyErr, net.ErrClosed) {
+			return true, fmt.Errorf("wait for canceled test SFTP subsystem failed: %w", copyErr)
+		}
+		return true, nil
+	}
+	if err := request.Reply(accepted, nil); err != nil {
+		return false, fmt.Errorf("reply to test SSH session request failed: %w", err)
+	}
+	if !accepted {
+		return false, nil
+	}
+
+	server := pkgsftp.NewRequestServer(channel, pkgsftp.InMemHandler())
+	serveErr := server.Serve()
+	if serveErr != nil && !errors.Is(serveErr, io.EOF) {
+		return true, fmt.Errorf("serve test SFTP subsystem failed: %w", serveErr)
+	}
+	return true, nil
+}
+
+func handleSubsystemTestExec(channel cryptossh.Channel, request *cryptossh.Request) (bool, error) {
+	var payload struct {
+		Command string
+	}
+	if err := cryptossh.Unmarshal(request.Payload, &payload); err != nil {
+		return false, nil
+	}
+	if err := request.Reply(true, nil); err != nil {
+		return false, fmt.Errorf("reply to test SSH session exec request failed: %w", err)
+	}
+	cmd := payload.Command
+	readyToken := extractSubsystemTestToken(cmd, "[xops-ready-")
+	streamToken := extractSubsystemTestToken(cmd, "[xops-sftp-stream-")
+	reader := bufio.NewReader(channel)
+	if readyToken != "" {
+		_, _ = io.WriteString(channel, readyToken)
+	}
+	ack, _ := reader.ReadString('\n')
+	_ = ack
+	if streamToken != "" {
+		_, _ = io.WriteString(channel, streamToken)
+	}
+	server := pkgsftp.NewRequestServer(channel, pkgsftp.InMemHandler())
+	serveErr := server.Serve()
+	_, _ = channel.SendRequest("exit-status", false, cryptossh.Marshal(struct{ Status uint32 }{0}))
+	if serveErr != nil && !errors.Is(serveErr, io.EOF) {
+		return true, fmt.Errorf("serve test SFTP exec subsystem failed: %w", serveErr)
+	}
+	return true, nil
+}
+
+func extractSubsystemTestToken(command, prefix string) string {
+	at := strings.Index(command, prefix)
+	if at >= 0 && strings.HasPrefix(command[at:], prefix+"%s]") {
+		nonce := regexp.MustCompile(`[A-Z2-7]{26,}`).FindString(command[at:])
+		if nonce != "" {
+			return prefix + nonce + "]"
+		}
+	}
+	if at < 0 {
+		return ""
+	}
+	end := strings.Index(command[at:], "]")
+	if end < 0 {
+		return ""
+	}
+	return command[at : at+end+1]
+}
+
+func TestClient_WithSudoSubsystem(t *testing.T) {
+	address := startSubsystemTestSSHServer(t, false)
+	host, portText, err := net.SplitHostPort(address)
+	if err != nil {
+		t.Fatalf("split test SSH address: %v", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("parse test SSH port: %v", err)
+	}
+	t.Setenv("HOME", t.TempDir())
+
+	connector := newFixtureConnector(t,
+		subsystemTestStore{config: &projectssh.ClientConfig{
+			NodeID:   "test-node",
+			Address:  host,
+			Port:     port,
+			User:     "test-user",
+			AuthType: "password",
+			Password: "test-password",
+			SudoMode: projectssh.SudoModeSudoer,
+		}},
+		projectssh.WithInteractionHandler(subsystemTestInteraction{}),
+	)
+	t.Cleanup(func() {
+		if err := connector.CloseAll(); err != nil {
+			t.Errorf("close test connector: %v", err)
+		}
+	})
+
+	sshCli, err := connector.Connect(t.Context(), "test-node")
+	if err != nil {
+		t.Fatalf("connect SSH: %v", err)
+	}
+
+	sftpCli, err := NewClient(t.Context(), sshCli, WithSudo(true))
+	if err != nil {
+		t.Fatalf("NewClient(WithSudo(true)) failed: %v", err)
+	}
+	defer func() {
+		if err := sftpCli.Close(); err != nil {
+			t.Errorf("close sftp client: %v", err)
+		}
+	}()
+
+	if !sftpCli.Config().Sudo {
+		t.Errorf("expected sftpCli.Config().Sudo to be true")
+	}
+
+	// Create, write and read back a file using Do
+	filePath := "/sudo-test.txt"
+	content := []byte("elevated-content")
+	err = sftpCli.Do(t.Context(), func(rawCli *pkgsftp.Client) error {
+		f, err := rawCli.Create(filePath)
+		if err != nil {
+			return fmt.Errorf("create: %w", err)
+		}
+		if _, err := f.Write(content); err != nil {
+			_ = f.Close()
+			return fmt.Errorf("write: %w", err)
+		}
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("close write: %w", err)
+		}
+		r, err := rawCli.Open(filePath)
+		if err != nil {
+			return fmt.Errorf("open: %w", err)
+		}
+		defer func() { _ = r.Close() }()
+		readBack, err := io.ReadAll(r)
+		if err != nil {
+			return fmt.Errorf("read: %w", err)
+		}
+		if string(readBack) != string(content) {
+			return fmt.Errorf("expected content %q, got %q", string(content), string(readBack))
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("SFTP file operations failed: %v", err)
+	}
 }
 
 func newFixtureConnector(t *testing.T, provider projectssh.ConnectionProvider, opts ...projectssh.Option) *projectssh.Connector {

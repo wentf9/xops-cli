@@ -85,6 +85,7 @@ func NewCmdScp() *cobra.Command {
 	cmd.Flags().BoolVar(&o.PassphraseStdin, "passphrase-stdin", false, i18n.T("flag_passphrase_stdin"))
 	cmd.Flags().StringVar(&o.Remember, "remember", "", i18n.T("flag_remember"))
 	cmd.Flags().StringVar(&o.Alias, "alias", "", i18n.T("flag_alias"))
+	cmd.Flags().BoolVar(&o.Sudo, "sudo", false, i18n.T("flag_sudo"))
 
 	// scp-specific flags
 	cmd.Flags().StringVar(&o.Source, "src", "", i18n.T("flag_scp_src"))
@@ -255,8 +256,11 @@ func (e *transferProgressErrors) Err() error {
 }
 
 func (o *ScpOptions) RunContext(ctx context.Context) (retErr error) {
+	if o.interaction == nil {
+		o.interaction = newCLIInteractionHandler()
+	}
 	if o.Verbose {
-		diagnostics, err := newSCPDiagnostics(ctx, os.Stderr, "stderr", o.sshLogLevel >= sshLogDebug1, o.verboseLevel)
+		diagnostics, err := newSCPDiagnostics(ctx, os.Stderr, "stderr", o.sshLogLevel >= sshLogDebug1, o.verboseLevel, o.interaction.promptGate)
 		if err != nil {
 			return err
 		}
@@ -922,6 +926,7 @@ func (o *ScpOptions) connectSftpForPath(ctx context.Context, p PathInfo, specifi
 		sftp.WithDiagnostics(o.diagnostics),
 		sftp.WithThreadsPerFile(o.ThreadCount),
 		sftp.WithForce(o.Force),
+		sftp.WithSudo(o.Sudo),
 	)
 	if err != nil {
 		return "", nil, err
@@ -1124,7 +1129,10 @@ func (o *ScpOptions) validateRemoteRelayResumePrefix(ctx context.Context, srcFil
 var errPrefixMismatch = errors.New("resume prefix mismatch")
 
 func (o *ScpOptions) credentialConnector(provider *config.Repository, cfg *config.Configuration) (*ssh.Connector, error) {
-	return o.credentialConnectorWithInteraction(provider, cfg, newCLIInteractionHandler())
+	if o.interaction == nil {
+		o.interaction = newCLIInteractionHandler()
+	}
+	return o.credentialConnectorWithInteraction(provider, cfg, o.interaction)
 }
 
 func (o *ScpOptions) credentialConnectorWithInteraction(provider *config.Repository, cfg *config.Configuration, interaction *cliInteractionHandler) (*ssh.Connector, error) {

@@ -5,6 +5,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/wentf9/xops-cli/pkg/config"
 )
 
 func TestScpOptionsCompletePaths(t *testing.T) {
@@ -301,5 +303,44 @@ func TestParsePath_ValidAndInvalid(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestScpOptionsInteractionConsistency(t *testing.T) {
+	o := NewScpOptions()
+	if o.interaction != nil {
+		t.Fatalf("expected initial interaction to be nil, got %v", o.interaction)
+	}
+	cfg := &config.Configuration{}
+	repo, err := config.NewRepositoryWithoutOpenSSH(cfg, &memoryStore{cfg: cfg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := o.credentialConnector(repo, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn == nil {
+		t.Fatal("expected non-nil connector")
+	}
+	if o.interaction == nil {
+		t.Fatal("expected o.interaction to be initialized")
+	}
+	firstInteraction := o.interaction
+	firstGate := o.interaction.promptGate
+
+	// Subsequent call to credentialConnector must reuse the exact same interaction handler and promptGate
+	conn2, err := o.credentialConnector(repo, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn2 == nil {
+		t.Fatal("expected non-nil connector on second call")
+	}
+	if o.interaction != firstInteraction {
+		t.Fatal("expected o.interaction to be preserved and reused across calls")
+	}
+	if o.interaction.promptGate != firstGate {
+		t.Fatal("expected promptGate to remain identical")
 	}
 }
