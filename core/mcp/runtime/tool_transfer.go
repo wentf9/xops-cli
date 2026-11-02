@@ -22,7 +22,7 @@ import (
 
 // TransferFileInput is the Stdio transfer tool input (direct local <-> remote SFTP).
 type TransferFileInput struct {
-	NodeID     string `json:"nodeID" jsonschema:"Target SSH node ID or alias"`
+	NodeID     string `json:"nodeID" jsonschema:"Target SSH node ID or alias (call 'nodes' first if unknown)"`
 	Direction  string `json:"direction" jsonschema:"Transfer direction: push (upload local to remote) or pull (download remote to local)"`
 	LocalPath  string `json:"localPath" jsonschema:"Absolute path to the local file or directory"`
 	RemotePath string `json:"remotePath" jsonschema:"Absolute path to the remote file or directory"`
@@ -72,7 +72,7 @@ func (r *Runtime) stdioTransferHandler(ctx context.Context, _ *mcp.CallToolReque
 type HTTPTransferInput struct {
 	Action     string `json:"action" jsonschema:"Transfer action: prepare_push, prepare_pull, status, or cancel"`
 	RequestID  string `json:"requestID,omitempty" jsonschema:"Client-generated idempotency key for prepare_push or prepare_pull; keep the same key when retrying preparation"`
-	NodeID     string `json:"nodeID,omitempty" jsonschema:"Managed SSH node ID for prepare_push or prepare_pull"`
+	NodeID     string `json:"nodeID,omitempty" jsonschema:"Managed SSH node ID or alias for prepare_push or prepare_pull (call 'nodes' first if unknown)"`
 	RemotePath string `json:"remotePath,omitempty" jsonschema:"Absolute file path on the SSH target for prepare_push or prepare_pull"`
 	Size       int64  `json:"size,omitempty" jsonschema:"Exact client file size in bytes for prepare_push"`
 	SHA256     string `json:"sha256,omitempty" jsonschema:"Lowercase SHA-256 of the client file for prepare_push"`
@@ -380,7 +380,7 @@ func (r *Runtime) registerTransfer(server *mcp.Server, g *guardrail.Guardrail) {
 		destructive := true
 		mcp.AddTool(server, &mcp.Tool{
 			Name:        "transfer",
-			Description: "Out-of-band HTTP binary file transfer controller. Actions: 'prepare_push' (prepare single-file upload, returns PUT URL & headers), 'prepare_pull' (prepare single-file download, returns GET URL & headers), 'status' (query transfer state & SHA-256), 'cancel' (request cancellation).",
+			Description: "Out-of-band HTTP binary file transfer controller for managed SSH nodes. Actions: 'prepare_push' (prepare single-file upload, returns PUT URL & headers), 'prepare_pull' (prepare single-file download, returns GET URL & headers), 'status' (query transfer state & SHA-256), 'cancel' (request cancellation).",
 			Annotations: &mcp.ToolAnnotations{DestructiveHint: &destructive},
 		}, r.httpTransferHandler)
 		return
@@ -390,7 +390,7 @@ func (r *Runtime) registerTransfer(server *mcp.Server, g *guardrail.Guardrail) {
 	mcp.AddTool(server,
 		&mcp.Tool{
 			Name:        "transfer",
-			Description: "Transfer files or directories between the local MCP host and a remote SSH node via SFTP. Directions: 'push' (local to remote) or 'pull' (remote to local).",
+			Description: "Transfer files or directories between the local MCP host and a managed remote SSH node via SFTP. Directions: 'push' (local to remote) or 'pull' (remote to local).",
 			Annotations: &mcp.ToolAnnotations{DestructiveHint: &notDestructive},
 		},
 		withOperation(r, g, "transfer",

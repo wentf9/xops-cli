@@ -54,7 +54,7 @@ func (r *Runtime) registerNodes(server *mcp.Server) {
 	mcp.AddTool(server,
 		&mcp.Tool{
 			Name:        "nodes",
-			Description: "List all available SSH nodes managed by XOps, optionally filtered by tag.",
+			Description: "List and discover all managed remote SSH hosts/nodes, optionally filtered by tag. Call this tool first to inspect available servers and resolve the target 'nodeID' or alias before calling terminal, file, transfer, tunnel, or gui.",
 			Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 		},
 		r.listNodesHandler,

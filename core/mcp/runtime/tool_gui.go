@@ -14,7 +14,7 @@ import (
 )
 
 type GUIInput struct {
-	NodeID  string `json:"nodeID" jsonschema:"Target SSH node ID or alias"`
+	NodeID  string `json:"nodeID" jsonschema:"Target SSH node ID or alias (call 'nodes' first if unknown)"`
 	Action  string `json:"action" jsonschema:"GUI action: shot, click, double_click, right_click, move, type, key, scroll, or drag"`
 	Coord   []int  `json:"coord,omitempty" jsonschema:"Normalized 0-1000 coordinates: [x, y] for click/move/scroll, or [start_x, start_y, end_x, end_y] for drag"`
 	Text    string `json:"text,omitempty" jsonschema:"Text to input for type, key combination for key (e.g. ctrl+c, Return), or direction for scroll (up, down, left, right)"`
@@ -98,7 +98,7 @@ func (r *Runtime) registerGUI(server *mcp.Server, g *guardrail.Guardrail) {
 	mcp.AddTool(server,
 		&mcp.Tool{
 			Name:        "gui",
-			Description: "Visual desktop automation (Computer Use) on a remote Linux/FreeBSD/Unix SSH node (X11, or Wayland with ydotool/grim). Uses 0-1000 normalized coordinates and returns a compressed screenshot (longest edge <= 1280px) after every action. Keyboard actions ('type', 'key') are rated Dangerous and require approval under the default policy.",
+			Description: "Visual desktop automation (Computer Use) on a managed remote Linux/FreeBSD/Unix SSH node (X11, or Wayland with ydotool/grim). Uses 0-1000 normalized coordinates and returns a compressed screenshot (longest edge <= 1280px) after every action. Keyboard actions ('type', 'key') are rated Dangerous and require approval under the default policy.",
 			Annotations: &mcp.ToolAnnotations{DestructiveHint: &destructive},
 		},
 		withOperation(r, g, "gui", guiRiskInput, r.guiHandler),

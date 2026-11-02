@@ -45,7 +45,7 @@ var ignoredStatDirs = map[string]bool{
 }
 
 type FileInput struct {
-	NodeID  string `json:"nodeID" jsonschema:"Target SSH node ID or alias"`
+	NodeID  string `json:"nodeID" jsonschema:"Target SSH node ID or alias (call 'nodes' first if unknown)"`
 	Action  string `json:"action" jsonschema:"File operation: read, write, patch, or stat"`
 	Path    string `json:"path" jsonschema:"Absolute path to the remote file or directory"`
 	Content string `json:"content,omitempty" jsonschema:"Full file content for write, or <<<< ==== >>>> search/replace blocks for patch"`
@@ -607,7 +607,7 @@ func (r *Runtime) registerFile(server *mcp.Server, g *guardrail.Guardrail) {
 	mcp.AddTool(server,
 		&mcp.Tool{
 			Name:        "file",
-			Description: "Unified remote file and directory operator over SFTP. Actions: 'read' (line-numbered with optional [start, end] range, first 512 KiB), 'write' (atomic replace; creates parent dirs), 'patch' (applies <<<< ==== >>>> search/replace blocks atomically; files up to 512 KiB), 'stat' (file metadata or noise-filtered 2-level directory tree). Atomic replacement creates a new inode (use terminal when hard links or extended ACLs must be preserved).",
+			Description: "Unified remote file and directory operator over SFTP on a managed SSH node. Prefer this tool over terminal shell commands for reading, writing, patching, or listing remote files. Actions: 'read' (line-numbered with optional [start, end] range, first 512 KiB), 'write' (atomic replace; creates parent dirs), 'patch' (applies <<<< ==== >>>> search/replace blocks atomically; files up to 512 KiB), 'stat' (file metadata or noise-filtered 2-level directory tree). Atomic replacement creates a new inode (use terminal when hard links or extended ACLs must be preserved).",
 			Annotations: &mcp.ToolAnnotations{DestructiveHint: &destructive},
 		},
 		withOperation(r, g, "file",

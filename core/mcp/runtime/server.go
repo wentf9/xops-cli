@@ -85,6 +85,16 @@ func FormatMCPError(err error) error {
 	return err
 }
 
+func serverInstructions(isHTTP bool) string {
+	tools := "nodes, terminal, file, transfer, tunnel, gui"
+	if isHTTP {
+		tools = "nodes, terminal, file, transfer, gui"
+	}
+	return "Managed SSH remote operations server. " +
+		"For any task involving managed remote hosts/servers—discovering hosts, running remote commands, reading/editing remote files, transferring files, port forwarding, or remote desktop control—always use this server's MCP tools (" + tools + ") directly instead of local shell or local filesystem tools. " +
+		"Workflow: Call 'nodes' first to discover available hosts and resolve the target 'nodeID' (or alias), then pass 'nodeID' to 'file' (SFTP read/write/patch/stat), 'terminal' (remote command execution and persistent PTY sessions), 'transfer' (upload/download), 'tunnel' (SSH port forwarding), or 'gui' (remote desktop)."
+}
+
 func NewRuntime(ctx context.Context, opts ...Option) (_ *Runtime, retErr error) {
 	if ctx == nil {
 		return nil, errors.New("mcp context is required")
@@ -150,7 +160,10 @@ func NewRuntime(ctx context.Context, opts ...Option) (_ *Runtime, retErr error) 
 		r.transfers = manager
 	}
 	r.initializeTunnels()
-	options := &mcp.ServerOptions{Capabilities: &mcp.ServerCapabilities{Tools: &mcp.ToolCapabilities{ListChanged: true}}}
+	options := &mcp.ServerOptions{
+		Instructions: serverInstructions(cfg.http != nil),
+		Capabilities: &mcp.ServerCapabilities{Tools: &mcp.ToolCapabilities{ListChanged: true}},
+	}
 	if cfg.http != nil {
 		options.SupportedProtocolVersions = []string{httpProtocolVersion}
 	}

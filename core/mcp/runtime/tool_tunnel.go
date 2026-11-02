@@ -18,7 +18,7 @@ import (
 type TunnelPolyInput struct {
 	Action     string `json:"action" jsonschema:"Tunnel action: create, list, status, or stop"`
 	RequestID  string `json:"requestID,omitempty" jsonschema:"Optional client-generated idempotency key for create (auto-generated if omitted). Reuse the same key and parameters to recover a lost response."`
-	NodeID     string `json:"nodeID,omitempty" jsonschema:"Managed SSH node ID or alias (required for create, optional filter for list)"`
+	NodeID     string `json:"nodeID,omitempty" jsonschema:"Managed SSH node ID or alias (required for create, optional filter for list; call 'nodes' first if unknown)"`
 	Mode       string `json:"mode,omitempty" jsonschema:"For create: local (-L) or remote (-R). No dynamic forwarding."`
 	ListenHost string `json:"listenHost,omitempty" jsonschema:"For create: IP literal or localhost; defaults to 127.0.0.1"`
 	ListenPort int    `json:"listenPort,omitempty" jsonschema:"For create: listening TCP port, 0 to 65535 (0 allocates automatically)"`
@@ -344,7 +344,7 @@ func (r *Runtime) registerTunnels(server *mcp.Server) {
 	notDestructive := false
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "tunnel",
-		Description: "Manage process-owned SSH TCP port forwarding tunnels over stdio (-L local or -R remote). Actions: 'create', 'list', 'status', 'stop'.",
+		Description: "Manage process-owned SSH TCP port forwarding tunnels on a managed SSH node over stdio (-L local or -R remote). Actions: 'create', 'list', 'status', 'stop'.",
 		Annotations: &mcp.ToolAnnotations{DestructiveHint: &notDestructive, IdempotentHint: true},
 	}, r.tunnelHandler)
 }

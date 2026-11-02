@@ -29,7 +29,7 @@ const (
 )
 
 type TerminalInput struct {
-	NodeID    string               `json:"nodeID" jsonschema:"Target SSH node ID or alias"`
+	NodeID    string               `json:"nodeID" jsonschema:"Target SSH node ID or alias (call 'nodes' first if unknown)"`
 	Command   string               `json:"cmd,omitempty" jsonschema:"Shell command to execute, empty to poll incremental output on a persistent session, or SIGINT/EOF/SIGTERM/SIGKILL to signal a persistent session"`
 	Session   string               `json:"session,omitempty" jsonschema:"Session mode: 'once' (default, stateless) or a custom session name to persist PTY state (cwd, env, background jobs) in the remote login shell (supports POSIX shells, fish, and csh/tcsh)"`
 	Cwd       string               `json:"cwd,omitempty" jsonschema:"Optional working directory to switch to before executing cmd"`
@@ -410,7 +410,7 @@ func (r *Runtime) registerTerminal(server *mcp.Server, g *guardrail.Guardrail) {
 	mcp.AddTool(server,
 		&mcp.Tool{
 			Name:        "terminal",
-			Description: "Execute a shell command or interact with a persistent PTY session on a managed SSH node. Use session='once' (default) for stateless commands or a custom session name to persist cwd, env, and background processes (idle sessions expire after 30m). A running persistent command must be polled (empty cmd) or interrupted (SIGINT/EOF/SIGTERM/SIGKILL) before the next command.",
+			Description: "Execute a remote shell command or interact with a persistent PTY session on a managed SSH node. Use session='once' (default) for stateless commands or a custom session name to persist cwd, env, and background processes (idle sessions expire after 30m). A running persistent command must be polled (empty cmd) or interrupted (SIGINT/EOF/SIGTERM/SIGKILL) before the next command.",
 			Annotations: &mcp.ToolAnnotations{DestructiveHint: &destructive},
 			InputSchema: terminalInputSchema(),
 		},

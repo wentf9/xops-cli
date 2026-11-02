@@ -5,7 +5,7 @@
       "idempotentHint": false,
       "readOnlyHint": false
     },
-    "description": "Unified remote file and directory operator over SFTP. Actions: 'read' (line-numbered with optional [start, end] range, first 512 KiB), 'write' (atomic replace; creates parent dirs), 'patch' (applies \u003c\u003c\u003c\u003c ==== \u003e\u003e\u003e\u003e search/replace blocks atomically; files up to 512 KiB), 'stat' (file metadata or noise-filtered 2-level directory tree). Atomic replacement creates a new inode (use terminal when hard links or extended ACLs must be preserved).",
+    "description": "Unified remote file and directory operator over SFTP on a managed SSH node. Prefer this tool over terminal shell commands for reading, writing, patching, or listing remote files. Actions: 'read' (line-numbered with optional [start, end] range, first 512 KiB), 'write' (atomic replace; creates parent dirs), 'patch' (applies \u003c\u003c\u003c\u003c ==== \u003e\u003e\u003e\u003e search/replace blocks atomically; files up to 512 KiB), 'stat' (file metadata or noise-filtered 2-level directory tree). Atomic replacement creates a new inode (use terminal when hard links or extended ACLs must be preserved).",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -18,7 +18,7 @@
           "type": "string"
         },
         "nodeID": {
-          "description": "Target SSH node ID or alias",
+          "description": "Target SSH node ID or alias (call 'nodes' first if unknown)",
           "type": "string"
         },
         "path": {
@@ -108,7 +108,7 @@
       "idempotentHint": false,
       "readOnlyHint": false
     },
-    "description": "Visual desktop automation (Computer Use) on a remote Linux/FreeBSD/Unix SSH node (X11, or Wayland with ydotool/grim). Uses 0-1000 normalized coordinates and returns a compressed screenshot (longest edge \u003c= 1280px) after every action. Keyboard actions ('type', 'key') are rated Dangerous and require approval under the default policy.",
+    "description": "Visual desktop automation (Computer Use) on a managed remote Linux/FreeBSD/Unix SSH node (X11, or Wayland with ydotool/grim). Uses 0-1000 normalized coordinates and returns a compressed screenshot (longest edge \u003c= 1280px) after every action. Keyboard actions ('type', 'key') are rated Dangerous and require approval under the default policy.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -131,7 +131,7 @@
           "type": "string"
         },
         "nodeID": {
-          "description": "Target SSH node ID or alias",
+          "description": "Target SSH node ID or alias (call 'nodes' first if unknown)",
           "type": "string"
         },
         "text": {
@@ -175,7 +175,7 @@
       "idempotentHint": false,
       "readOnlyHint": true
     },
-    "description": "List all available SSH nodes managed by XOps, optionally filtered by tag.",
+    "description": "List and discover all managed remote SSH hosts/nodes, optionally filtered by tag. Call this tool first to inspect available servers and resolve the target 'nodeID' or alias before calling terminal, file, transfer, tunnel, or gui.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -267,7 +267,7 @@
       "idempotentHint": false,
       "readOnlyHint": false
     },
-    "description": "Execute a shell command or interact with a persistent PTY session on a managed SSH node. Use session='once' (default) for stateless commands or a custom session name to persist cwd, env, and background processes (idle sessions expire after 30m). A running persistent command must be polled (empty cmd) or interrupted (SIGINT/EOF/SIGTERM/SIGKILL) before the next command.",
+    "description": "Execute a remote shell command or interact with a persistent PTY session on a managed SSH node. Use session='once' (default) for stateless commands or a custom session name to persist cwd, env, and background processes (idle sessions expire after 30m). A running persistent command must be polled (empty cmd) or interrupted (SIGINT/EOF/SIGTERM/SIGKILL) before the next command.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -306,7 +306,7 @@
           ]
         },
         "nodeID": {
-          "description": "Target SSH node ID or alias",
+          "description": "Target SSH node ID or alias (call 'nodes' first if unknown)",
           "type": "string"
         },
         "session": {
@@ -386,7 +386,7 @@
       "idempotentHint": false,
       "readOnlyHint": false
     },
-    "description": "Out-of-band HTTP binary file transfer controller. Actions: 'prepare_push' (prepare single-file upload, returns PUT URL \u0026 headers), 'prepare_pull' (prepare single-file download, returns GET URL \u0026 headers), 'status' (query transfer state \u0026 SHA-256), 'cancel' (request cancellation).",
+    "description": "Out-of-band HTTP binary file transfer controller for managed SSH nodes. Actions: 'prepare_push' (prepare single-file upload, returns PUT URL \u0026 headers), 'prepare_pull' (prepare single-file download, returns GET URL \u0026 headers), 'status' (query transfer state \u0026 SHA-256), 'cancel' (request cancellation).",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -395,7 +395,7 @@
           "type": "string"
         },
         "nodeID": {
-          "description": "Managed SSH node ID for prepare_push or prepare_pull",
+          "description": "Managed SSH node ID or alias for prepare_push or prepare_pull (call 'nodes' first if unknown)",
           "type": "string"
         },
         "overwrite": {
