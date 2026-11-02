@@ -34,6 +34,8 @@ type ExecOptions struct {
 	Stream      bool
 	OutDir      string
 
+	ScriptArgs []string
+
 	stdinScript bool
 
 	stdout io.Writer
@@ -53,9 +55,10 @@ func NewCmdExec() *cobra.Command {
 
 func newCmdExecWithOptions(o *ExecOptions) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "exec [flags] [command]",
+		Use:   "exec [flags] [command] [-- [arg...]]",
 		Short: i18n.T("exec_short"),
-		Long:  i18n.T("exec_long"),
+
+		Long: i18n.T("exec_long"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			o.stdout = cmd.OutOrStdout()
 			o.stderr = cmd.ErrOrStderr()
@@ -145,24 +148,93 @@ func (o *ExecOptions) extractCommandFromArgs(args []string) error {
 	return nil
 }
 
-func (o *ExecOptions) extractHostFromArgs(args []string) error {
-	if o.Host == "" && o.HostFile == "" && o.Tag == "" && len(args) > 0 {
-		hostPart := args[0]
-		if len(args) > 1 && strings.HasPrefix(args[1], "@") {
-			hostPart = args[0] + args[1]
+func parsePositionalHost(args []string) (host, user string, port uint16, consumed int, err error) {
+	if len(args) == 0 {
+		return "", "", 0, 0, nil
+	}
+	hostPart := args[0]
+	consumed = 1
+	if len(args) > 1 && strings.HasPrefix(args[1], "@") {
+		hostPart = args[0] + args[1]
+		consumed = 2
+	}
+	u, h, p, err := utils.ParseAddr(hostPart)
+	if err != nil {
+		return "", "", 0, 0, fmt.Errorf("invalid host address %q: %w", hostPart, err)
+	}
+	return h, u, p, consumed, nil
+}
+
+func (o *ExecOptions) applySinglePositionalHost(args []string, extraArgErr func(string) error) error {
+	if o.Host != "" || o.HostFile != "" || o.Tag != "" {
+		if len(args) > 0 {
+			return extraArgErr(args[0])
 		}
-		u, h, p, err := utils.ParseAddr(hostPart)
-		if err != nil {
-			return fmt.Errorf("invalid host address %q: %w", hostPart, err)
+		return nil
+	}
+	h, u, p, consumed, err := parsePositionalHost(args)
+	if err != nil {
+		return err
+	}
+	if h != "" {
+		o.Host = h
+		if o.User == "" {
+			o.User = u
 		}
-		if h != "" {
-			o.Host = h
-			if o.User == "" {
-				o.User = u
-			}
-			if o.Port == 0 {
-				o.Port = p
-			}
+		if o.Port == 0 {
+			o.Port = p
+		}
+	}
+	if len(args) > consumed {
+		return extraArgErr(args[consumed])
+	}
+	return nil
+}
+
+func (o *ExecOptions) completeDashArgs(cmd *cobra.Command, args []string, dashIdx int) error {
+	preDashArgs := args[:dashIdx]
+	postDashArgs := args[dashIdx:]
+
+	if err := o.applySinglePositionalHost(preDashArgs, func(arg string) error {
+		return fmt.Errorf("unexpected positional argument %q before '--'", arg)
+	}); err != nil {
+		return err
+	}
+
+	if o.ShellFile != "" {
+		o.ScriptArgs = append([]string(nil), postDashArgs...)
+		return nil
+	}
+
+	if (cmd != nil && cmd.Flags().Changed("cmd")) || o.Command != "" {
+		return fmt.Errorf("cannot specify both -c/--cmd and command after '--'")
+	}
+	o.Command = strings.Join(postDashArgs, " ")
+	if len(postDashArgs) == 0 || o.Command == "" {
+		return fmt.Errorf("explicit command must not be empty")
+	}
+	return nil
+}
+
+func (o *ExecOptions) completeNonDashArgs(cmd *cobra.Command, args []string) error {
+	if o.ShellFile != "" {
+		return o.applySinglePositionalHost(args, func(arg string) error {
+			return fmt.Errorf("script arguments must be passed after '--', unexpected positional argument %q", arg)
+		})
+	}
+
+	if (cmd != nil && cmd.Flags().Changed("cmd")) || o.Command != "" {
+		return o.applySinglePositionalHost(args, func(arg string) error {
+			return fmt.Errorf("unexpected positional argument %q when -c/--cmd is specified", arg)
+		})
+	}
+
+	if len(args) > 0 {
+		if err := o.extractCommandFromArgs(args); err != nil {
+			return err
+		}
+		if o.Command == "" && args[len(args)-1] == "" {
+			return fmt.Errorf("explicit command must not be empty")
 		}
 	}
 	return nil
@@ -174,20 +246,22 @@ func (o *ExecOptions) Complete(cmd *cobra.Command, args []string) error {
 	if cmd != nil && cmd.Flags().Changed("cmd") && o.Command == "" {
 		return fmt.Errorf("explicit command must not be empty")
 	}
-	if len(args) > 0 {
-		var err error
-		if o.Command == "" && o.ShellFile == "" {
-			err = o.extractCommandFromArgs(args)
-		} else {
-			err = o.extractHostFromArgs(args)
-		}
-		if err != nil {
+
+	dashIdx := -1
+	if cmd != nil {
+		dashIdx = cmd.ArgsLenAtDash()
+	}
+
+	if dashIdx >= 0 {
+		if err := o.completeDashArgs(cmd, args, dashIdx); err != nil {
 			return err
 		}
-		if o.Command == "" && args[len(args)-1] == "" {
-			return fmt.Errorf("explicit command must not be empty")
+	} else {
+		if err := o.completeNonDashArgs(cmd, args); err != nil {
+			return err
 		}
 	}
+
 	if err := o.prepareCommandPlan(); err != nil {
 		return err
 	}
@@ -234,6 +308,9 @@ func (o *ExecOptions) Validate() error {
 	}
 	if o.Command == "" && o.ShellFile == "" {
 		return fmt.Errorf("%s", i18n.T("exec_err_no_cmd"))
+	}
+	if o.Command != "" && o.ShellFile != "" {
+		return fmt.Errorf("cannot specify both command and --shell script")
 	}
 	if o.Host == "" && o.HostFile == "" && o.Tag == "" {
 		return fmt.Errorf("%s", i18n.T("err_no_host"))
@@ -646,10 +723,15 @@ func (o *ExecOptions) dispatchTaskExecution(ctx context.Context, client *ssh.Cli
 		if err != nil {
 			return "", err
 		}
-		if o.Sudo {
-			return client.RunScriptWithSudoExecution(ctx, execCmd, resolvedExec, outputOpts...)
+		scriptOpts := outputOpts
+		if len(o.ScriptArgs) > 0 {
+			scriptOpts = append(append([]ssh.RunOption(nil), outputOpts...), ssh.WithScriptArgs(o.ScriptArgs...))
 		}
-		return client.RunScriptWithExecution(ctx, execCmd, resolvedExec, outputOpts...)
+		if o.Sudo {
+			return client.RunScriptWithSudoExecution(ctx, execCmd, resolvedExec, scriptOpts...)
+		}
+		return client.RunScriptWithExecution(ctx, execCmd, resolvedExec, scriptOpts...)
+
 	}
 	if o.commandPlan != nil {
 		if o.Sudo {

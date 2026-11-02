@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/spf13/cobra"
@@ -46,10 +47,19 @@ func isSupportedScriptInterpreter(interp ssh.Interpreter) bool {
 }
 
 func (o *ExecOptions) prepareCommandPlan() error {
+	if len(o.ScriptArgs) > 0 && o.ShellFile == "" {
+		return fmt.Errorf("script arguments can only be specified when running a script with --shell")
+	}
+	for _, arg := range o.ScriptArgs {
+		if strings.ContainsRune(arg, '\x00') {
+			return fmt.Errorf("script arguments must not contain NUL bytes")
+		}
+	}
 	if !o.execution.enabled() {
 		return nil
 	}
 	o.commandPlan = nil
+
 	if o.ShellFile != "" || o.stdinScript || (o.Command == "" && !o.Interactive) {
 		execution, err := o.cliExecutionConfig()
 		if err != nil {

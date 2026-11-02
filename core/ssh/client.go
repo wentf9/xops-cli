@@ -285,6 +285,7 @@ type RunConfig struct {
 	StreamPrefix  string
 	StreamWriter  io.Writer
 	OutFile       *os.File
+	ScriptArgs    []string
 
 	// fileOutput replaces OutFile when its writes were bound to a context.
 	fileOutput io.Writer
@@ -314,6 +315,13 @@ func WithLoginShell(login bool) RunOption {
 func WithOutputMode(mode OutputMode) RunOption {
 	return func(c *RunConfig) {
 		c.OutMode = mode
+	}
+}
+
+// WithScriptArgs specifies the positional arguments to pass to the script when executing via RunScript.
+func WithScriptArgs(args ...string) RunOption {
+	return func(c *RunConfig) {
+		c.ScriptArgs = append([]string(nil), args...)
 	}
 }
 
@@ -491,22 +499,9 @@ func (c *Client) RunScript(ctx context.Context, scriptContent string, opts ...Ru
 		opt(config)
 	}
 
-	var payload string
-	switch config.Interpreter {
-	case "", InterpreterBash:
-		payload = bashScriptPayload(config.LoginShell)
-	case InterpreterSh:
-		payload = shScriptPayload()
-	case InterpreterZsh:
-		payload = zshScriptPayload(config.LoginShell)
-	case InterpreterFish:
-		payload = fishScriptPayload(config.LoginShell)
-	case InterpreterCsh:
-		payload = cshScriptPayload()
-	case InterpreterTcsh:
-		payload = tcshScriptPayload()
-	default:
-		return "", fmt.Errorf("%w: unsupported interpreter %q for RunScript (only bash, sh, zsh, fish, csh and tcsh are supported)", ErrExecutionValidation, config.Interpreter)
+	payload, err := formatScriptPayload(config.Interpreter, config.LoginShell, config.LaunchDialect, config.ScriptArgs)
+	if err != nil {
+		return "", err
 	}
 
 	session, err := c.newSessionContext(ctx)

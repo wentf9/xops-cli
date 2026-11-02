@@ -88,6 +88,8 @@ func routingFlag(cmd *cobra.Command, arg string) (int, []string, bool) {
 // flags after a positional host. An explicit separator always wins.
 func preprocessSubArgs(args []string, cmd *cobra.Command) []string {
 	target := false
+	explicitExecInput := false
+
 	for i := 0; i < len(args); {
 		if args[i] == "--" {
 			return append([]string(nil), args...)
@@ -101,11 +103,18 @@ func preprocessSubArgs(args []string, cmd *cobra.Command) []string {
 				if name == "host" || (cmd.Name() == "exec" && (name == "tag" || name == "ifile")) {
 					target = true
 				}
+				if cmd.Name() == "exec" && (name == "cmd" || name == "shell") {
+					explicitExecInput = true
+				}
 			}
 			i += n
 			continue
 		}
 		if target {
+			if explicitExecInput {
+				i++
+				continue
+			}
 			return separateRemoteArgs(args, i)
 		}
 		target = true

@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/core/testutil/sshfixture"
 	"github.com/wentf9/xops-cli/pkg/i18n"
@@ -59,6 +60,7 @@ func newExecCombinationFixture(t *testing.T, handler func(string, cryptoSSH.Chan
 type execCombinationCase struct {
 	name, interpreter, dialect, output string
 	script, sudo, login                bool
+	scriptArgs                         []string
 	status                             uint32
 }
 
@@ -79,14 +81,20 @@ func TestExecExplicitCombinationsExecute(t *testing.T) {
 		{name: "sh sudo file", interpreter: "sh", dialect: "posix", sudo: true, output: "file"},
 		{name: "bash login sudo file", interpreter: "bash", dialect: "posix", sudo: true, login: true, output: "file"},
 		{name: "bash script buffered", interpreter: "bash", dialect: "posix", script: true},
+		{name: "bash script with args", interpreter: "bash", dialect: "posix", script: true, scriptArgs: []string{"arg1", "arg 2", "--flag"}},
+		{name: "bash script sudo with args", interpreter: "bash", dialect: "posix", script: true, sudo: true, scriptArgs: []string{"arg1", "arg 2", "--flag"}},
 		{name: "sh script stream", interpreter: "sh", dialect: "posix", script: true, output: "stream"},
+		{name: "sh script with args", interpreter: "sh", dialect: "posix", script: true, scriptArgs: []string{"arg1", "arg 2", "--flag"}},
 		{name: "fish script file", interpreter: "fish", dialect: "fish", script: true, output: "file"},
+		{name: "fish script with args", interpreter: "fish", dialect: "fish", script: true, scriptArgs: []string{"arg1", "arg 2", "--flag"}},
 		{name: "zsh script stream", interpreter: "zsh", dialect: "posix", script: true, output: "stream"},
+		{name: "zsh script with args", interpreter: "zsh", dialect: "posix", script: true, scriptArgs: []string{"arg1", "arg 2", "--flag"}},
 		{name: "bash script sudo stream", interpreter: "bash", dialect: "posix", script: true, sudo: true, output: "stream"},
 		{name: "sh script sudo file", interpreter: "sh", dialect: "posix", script: true, sudo: true, output: "file"},
 		{name: "nonzero stream", interpreter: "sh", dialect: "posix", output: "stream", status: 7},
 		{name: "nonzero sudo file", interpreter: "bash", dialect: "posix", sudo: true, output: "file", status: 9},
 	} {
+
 		t.Run(test.name, func(t *testing.T) {
 			type request struct{ command, input string }
 			requests := make(chan request, 1)
@@ -123,25 +131,15 @@ func TestExecExplicitCombinationsExecute(t *testing.T) {
 				t.Fatalf("command missing or replayed: %d", server.Executed.Load())
 			}
 			got := <-requests
-			var expected string
-			if test.script {
-				expected = test.interpreter + " -s"
-				if test.interpreter == "fish" {
-					expected = "fish"
-				}
-				if got.input != content {
-					t.Fatalf("script bytes changed: %q", got.input)
-				}
-			} else {
-				expected = o.commandPlan.Payload()
+			if test.script && got.input != content {
+				t.Fatalf("script bytes changed: %q", got.input)
 			}
-			if test.sudo {
-				expected = "sudo -S -p '' " + expected
-			}
+			expected := expectedCombinationCommand(test, o)
 			if got.command != expected {
 				t.Fatalf("payload %q, want %q", got.command, expected)
 			}
 			assertExecCombinationOutput(t, test.output, logDir, stdout.String()+stderr.String())
+
 			client, err := connector.Connect(ctx, "fixture")
 			if err != nil {
 				t.Fatal(err)
@@ -186,16 +184,49 @@ func prepareExecCombination(t *testing.T, test execCombinationCase) (*ExecOption
 		logDir = t.TempDir()
 		flags = append(flags, "--out-dir", logDir)
 	}
+	if len(test.scriptArgs) > 0 {
+		flags = append(flags, "--")
+		flags = append(flags, test.scriptArgs...)
+	}
 	if err := command.Flags().Parse(flags); err != nil {
 		t.Fatal(err)
 	}
-	if err := o.Complete(command, nil); err != nil {
+	if err := o.Complete(command, command.Flags().Args()); err != nil {
 		t.Fatal(err)
 	}
 	if err := o.Validate(); err != nil {
 		t.Fatal(err)
 	}
 	return o, content, logDir
+}
+
+func expectedCombinationCommand(test execCombinationCase, o *ExecOptions) string {
+	var expected string
+	if test.script {
+		if len(test.scriptArgs) > 0 {
+			switch test.interpreter {
+			case "bash":
+				expected = "bash -s -- 'arg1' 'arg 2' '--flag'"
+			case "sh":
+				expected = "sh -s -- 'arg1' 'arg 2' '--flag'"
+			case "zsh":
+				expected = "zsh -s -- 'arg1' 'arg 2' '--flag'"
+			case "fish":
+				expected = "fish -c 'source - \\'arg1\\' \\'arg 2\\' \\'--flag\\''"
+			}
+		} else {
+			expected = test.interpreter + " -s"
+			if test.interpreter == "fish" {
+				expected = "fish"
+			}
+		}
+	} else {
+		expected = o.commandPlan.Payload()
+	}
+	if test.sudo {
+		expected = "sudo -S -p '' " + expected
+	}
+	return expected
 }
 
 func assertExecCombinationOutput(t *testing.T, mode, logDir, output string) {
@@ -308,4 +339,97 @@ func TestExecExplicitOutputModesRejectChangedCommand(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestExecAndSSHCommandWithSeparatorRegression(t *testing.T) {
+	if err := i18n.Init("en"); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("exec with separator in command", func(t *testing.T) {
+		type request struct{ command string }
+		requests := make(chan request, 1)
+		ctx, _, server := newExecCombinationFixture(t, func(command string, channel cryptoSSH.Channel) {
+			requests <- request{command}
+			_, _ = io.WriteString(channel, "combined-out\n")
+			_, _ = channel.SendRequest("exit-status", false, cryptoSSH.Marshal(struct{ Status uint32 }{0}))
+		})
+		address, portText, _ := net.SplitHostPort(server.Address)
+		port, _ := strconv.Atoi(portText)
+		connector := ssh.NewConnector(tunnelTestProvider{cfg: &ssh.ClientConfig{
+			NodeID: "fixture", Address: address, Port: port, User: "test", AuthType: "password", Password: sshfixture.Password,
+			SudoMode: ssh.SudoModeSudoer,
+		}}, ssh.WithHostKeyVerifier(execFixtureVerifier{server.HostKey}))
+		t.Cleanup(func() { _ = connector.CloseAll() })
+
+		root := newRootCmd()
+		initRootFlags(root)
+		root.PersistentPreRunE = nil
+		o := NewExecOptions()
+		execCmd := newCmdExecWithOptions(o)
+		var capturedCommand string
+		execCmd.RunE = func(c *cobra.Command, args []string) error {
+			if err := o.Complete(c, args); err != nil {
+				return err
+			}
+			if err := o.Validate(); err != nil {
+				return err
+			}
+			capturedCommand = o.Command
+			var stdout, stderr bytes.Buffer
+			o.stdout, o.stderr = &stdout, &stderr
+			var mu sync.Mutex
+			return o.executeTask(ctx, connector, execHostTask{nodeID: "fixture", host: "fixture"}, o.Command, false, 1, &mu)
+		}
+		root.AddCommand(execCmd)
+
+		args := []string{"exec", "--host", "fixture", "ls", "-l", "--", "/tmp"}
+		root.SetArgs(normalizeCommandArgs(root, args))
+		if err := root.ExecuteContext(ctx); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if capturedCommand != "ls -l -- /tmp" {
+			t.Fatalf("expected capturedCommand %q, got %q", "ls -l -- /tmp", capturedCommand)
+		}
+		if server.Executed.Load() != 1 {
+			t.Fatalf("expected 1 execution on server, got %d", server.Executed.Load())
+		}
+		req := <-requests
+		if !strings.Contains(req.command, "ls -l -- /tmp") {
+			t.Fatalf("wire command %q does not contain expected command", req.command)
+		}
+	})
+
+	t.Run("ssh with separator in command", func(t *testing.T) {
+		root := newRootCmd()
+		initRootFlags(root)
+		root.PersistentPreRunE = nil
+		sshOpt := NewSshOptions()
+		sshCmd := newCmdSshWithOptions(sshOpt)
+		var capturedCommand, targetSelector string
+		sshCmd.RunE = func(c *cobra.Command, args []string) error {
+			if err := sshOpt.Complete(c, args); err != nil {
+				return err
+			}
+			if err := sshOpt.Validate(); err != nil {
+				return err
+			}
+			capturedCommand = sshOpt.Command
+			targetSelector = sshOpt.Target.Selector
+			return nil
+		}
+		root.AddCommand(sshCmd)
+
+		args := []string{"ssh", "fixture", "ls", "-a", "--", "/tmp"}
+		root.SetArgs(normalizeCommandArgs(root, args))
+		if err := root.ExecuteContext(t.Context()); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if targetSelector != "fixture" {
+			t.Fatalf("expected target host %q, got %q", "fixture", targetSelector)
+		}
+		if capturedCommand != "ls -a -- /tmp" {
+			t.Fatalf("expected capturedCommand %q, got %q", "ls -a -- /tmp", capturedCommand)
+		}
+	})
 }

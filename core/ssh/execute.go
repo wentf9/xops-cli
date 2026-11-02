@@ -212,15 +212,21 @@ func (c *Client) RunScriptWithSudo(ctx context.Context, scriptContent string, op
 		return c.runPortableWithSudo(ctx, scriptContent, true, config, mat)
 	}
 
-	var bashArgs, bashCmd string
+	var bashArgs string
 	switch config.Interpreter {
 	case "", InterpreterBash:
 		config.Interpreter = InterpreterBash
-		bashArgs = bashScriptPayload(config.LoginShell)
-		bashCmd = bashCommandPayload(scriptContent, config.LoginShell)
+		var err error
+		bashArgs, err = formatScriptPayload(InterpreterBash, config.LoginShell, LaunchPOSIX, config.ScriptArgs)
+		if err != nil {
+			return "", err
+		}
 	case InterpreterSh:
-		bashArgs = shScriptPayload()
-		bashCmd = shCommandPayload(scriptContent)
+		var err error
+		bashArgs, err = formatScriptPayload(InterpreterSh, false, LaunchPOSIX, config.ScriptArgs)
+		if err != nil {
+			return "", err
+		}
 	default:
 		return "", fmt.Errorf("%w: unsupported interpreter %q for RunScriptWithSudo (only bash and sh are supported)", ErrExecutionValidation, config.Interpreter)
 	}
@@ -233,6 +239,22 @@ func (c *Client) RunScriptWithSudo(ctx context.Context, scriptContent string, op
 	case SudoModeSudo:
 		return c.runPrivilegeWithConfig(ctx, connCfg.SudoMode, bashArgs, strings.NewReader(scriptContent), config, mat)
 	case SudoModeSu:
+		var bashCmd string
+		if config.Interpreter == InterpreterSh {
+			bashCmd = shCommandPayload(scriptContent)
+		} else {
+			bashCmd = bashCommandPayload(scriptContent, config.LoginShell)
+		}
+		if len(config.ScriptArgs) > 0 {
+			quotedArgs := make([]string, len(config.ScriptArgs))
+			for i, a := range config.ScriptArgs {
+				quotedArgs[i] = shellQuote(a)
+			}
+			bashCmd += " " + string(config.Interpreter) + " " + strings.Join(quotedArgs, " ")
+		}
+		if len(bashCmd) > MaxCommandBytes {
+			return "", fmt.Errorf("%w: generated exec payload exceeds %d bytes", ErrExecutionValidation, MaxCommandBytes)
+		}
 		return c.runPrivilegeWithConfig(ctx, connCfg.SudoMode, bashCmd, nil, config, mat)
 	default:
 		return "", fmt.Errorf("unsupported sudo mode: %s", connCfg.SudoMode)

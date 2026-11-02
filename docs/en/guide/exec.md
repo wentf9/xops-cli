@@ -14,16 +14,23 @@ xops exec --tag web -c 'uptime'
 # Run a local script across tagged hosts with a concurrency limit of 5
 xops exec --tag web --shell ./check.sh --task 5
 
+# Run a local script and pass arguments (separated by --)
+xops exec --tag web --shell ./check.sh -- --env prod "arg 2"
+
 # Exclude specific nodes from a batch run
 xops exec --tag web --exclude web-maintenance-01 -c 'df -h'
 ```
 
 **Target selection and argument rules**:
 - `--host`, `--ifile`/`-I` (host list file), and `--tag` are mutually exclusive. Once a target selector is set, the first positional argument becomes the remote command (e.g. `xops exec --host web-01 uname -a`), or you can pass the command string explicitly with `-c`.
-- Global flags can appear before or after the subcommand (e.g. `xops --color never exec --host web-01 uname -a`). If the remote command itself takes flags starting with `-`, quote it with `-c` or place `--` before the command (e.g. `xops exec --host web-01 -- echo --help`).
+- Supports POSIX-style `--` argument separator:
+  - Command mode (without `--shell`): Arguments following `--` are passed as the remote command unchanged (e.g. `xops exec --host web-01 -- echo --help`), equivalent to `-c`, preventing command flags from being interpreted as local options.
+  - Script mode (with `--shell`): Script arguments may only be passed after `--` (e.g. `xops exec --host web-01 --shell ./script.sh -- arg1 "arg 2"`). The remote script safely receives them via `$1`, `$2` (or `$argv` in Fish) preserving spaces and special characters. Positional arguments before `--` are only used for target host resolution when `--host`/`--tag`/`--ifile` is omitted; extra positional arguments result in an error.
+- Global flags can appear before or after the subcommand (e.g. `xops --color never exec --host web-01 uname -a`).
 - **Batch credentials**: Batch runs do not display credential-store unlock dialogs. Unlock the required stores before starting a batch.
 - **Script input**: `--shell` requires a regular file. Pipe scripts through standard input instead, without also supplying credentials through `--password-stdin` or `--passphrase-stdin`.
 - **Explicit interpreter limits**: Ordinary commands are limited to 64 KiB and scripts to 16 MiB, with a default 5-minute timeout for non-interactive execution. Results retain the last 5 MiB of output and report truncation when exceeded; `--stream` displays output live and `--out-dir` saves logs without this retention limit. Some shells impose stricter command-length limits.
+
 
 ## Interpreters and cross-platform execution
 

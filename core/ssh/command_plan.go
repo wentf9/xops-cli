@@ -322,3 +322,93 @@ func zshScriptPayload(login bool) string {
 	}
 	return "zsh -s"
 }
+
+func validateScriptArgs(args []string) error {
+	for _, arg := range args {
+		if strings.ContainsRune(arg, '\x00') {
+			return fmt.Errorf("%w: script arguments must not contain NUL bytes", ErrExecutionValidation)
+		}
+	}
+	return nil
+}
+
+func quoteForDialect(dialect LaunchDialect, s string) string {
+	switch dialect {
+	case LaunchFish:
+		return fishQuote(s)
+	case LaunchCsh:
+		return cshQuote(s)
+	default:
+		return shellQuote(s)
+	}
+}
+
+// FormatScriptPayload constructs the command string for executing a script from stdin.
+func FormatScriptPayload(interp Interpreter, login bool, dialect LaunchDialect, args []string) (string, error) {
+	return formatScriptPayload(interp, login, dialect, args)
+}
+
+func formatScriptPayload(interp Interpreter, login bool, dialect LaunchDialect, args []string) (string, error) {
+	if err := validateScriptArgs(args); err != nil {
+		return "", err
+	}
+	var payload string
+	if len(args) == 0 {
+		switch interp {
+		case "", InterpreterBash:
+			payload = bashScriptPayload(login)
+		case InterpreterSh:
+			payload = shScriptPayload()
+		case InterpreterZsh:
+			payload = zshScriptPayload(login)
+		case InterpreterFish:
+			payload = fishScriptPayload(login)
+		case InterpreterCsh:
+			payload = cshScriptPayload()
+		case InterpreterTcsh:
+			payload = tcshScriptPayload()
+		default:
+			return "", fmt.Errorf("%w: unsupported interpreter %q for RunScript (only bash, sh, zsh, fish, csh and tcsh are supported)", ErrExecutionValidation, interp)
+		}
+	} else {
+		quotedArgs := make([]string, len(args))
+		for i, arg := range args {
+			quotedArgs[i] = quoteForDialect(dialect, arg)
+		}
+		argStr := strings.Join(quotedArgs, " ")
+
+		switch interp {
+		case "", InterpreterBash:
+			prefix := "bash -s -- "
+			if login {
+				prefix = "bash -l -s -- "
+			}
+			payload = prefix + argStr
+		case InterpreterSh:
+			payload = "sh -s -- " + argStr
+		case InterpreterZsh:
+			prefix := "zsh -s -- "
+			if login {
+				prefix = "zsh -l -s -- "
+			}
+			payload = prefix + argStr
+		case InterpreterFish:
+			fishQuotedArgs := make([]string, len(args))
+			for i, arg := range args {
+				fishQuotedArgs[i] = fishQuote(arg)
+			}
+			inner := "source - " + strings.Join(fishQuotedArgs, " ")
+			payload = unixCommandPayload(InterpreterFish, inner, login, dialect)
+		case InterpreterCsh:
+			payload = "csh -s -b " + argStr
+		case InterpreterTcsh:
+			payload = "tcsh -s -b " + argStr
+		default:
+			return "", fmt.Errorf("%w: unsupported interpreter %q for RunScript (only bash, sh, zsh, fish, csh and tcsh are supported)", ErrExecutionValidation, interp)
+		}
+	}
+	if len(payload) > MaxCommandBytes {
+		return "", fmt.Errorf("%w: generated exec payload exceeds %d bytes", ErrExecutionValidation, MaxCommandBytes)
+	}
+	return payload, nil
+}

@@ -18,7 +18,14 @@ func TestArgumentRouting(t *testing.T) {
 		{"explicit separator", []string{"exec", "--host", "vps", "--", "echo", "--color", "always"}, []string{"echo", "--color", "always"}},
 		{"tag", []string{"exec", "--tag", "test", "echo", "--help"}, []string{"echo", "--help"}},
 		{"command flag", []string{"exec", "--host", "vps", "-c", "echo --help"}, nil},
+		{"separator with flags", []string{"exec", "--host", "vps", "--", "arg1", "-l", "-p", "2222"}, []string{"arg1", "-l", "-p", "2222"}},
+		{"shell with separator", []string{"exec", "--host", "vps", "--shell", "a.sh", "--", "arg1", "arg 2", "--flag"}, []string{"arg1", "arg 2", "--flag"}},
+		{"shell without separator", []string{"exec", "--host", "vps", "--shell", "a.sh", "arg1"}, []string{"arg1"}},
+		{"cmd without separator", []string{"exec", "--host", "vps", "-c", "uptime", "extra"}, []string{"extra"}},
+		{"exec command contains separator", []string{"exec", "--host", "host", "ls", "-l", "--", "/tmp"}, []string{"ls", "-l", "--", "/tmp"}},
+		{"ssh command contains separator", []string{"ssh", "host", "ls", "-a", "--", "/tmp"}, []string{"host", "ls", "-a", "--", "/tmp"}},
 	} {
+
 		t.Run(tc.name, func(t *testing.T) {
 			root := newRootCmd()
 			initRootFlags(root)

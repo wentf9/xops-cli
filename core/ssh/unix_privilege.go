@@ -41,12 +41,15 @@ func (c *Client) runPortableWithSudo(ctx context.Context, content string, script
 	inner := portableUserCommand(content, config, LaunchPOSIX)
 	var input io.Reader
 	if script {
-		inner = strings.TrimPrefix(portableUserCommand("", config, LaunchPOSIX), "exec ")
-		if config.Interpreter != InterpreterFish {
-			inner += " -s"
+		supportsLogin := config.Interpreter != InterpreterSh && config.Interpreter != InterpreterCsh && config.Interpreter != InterpreterTcsh
+		var err error
+		inner, err = formatScriptPayload(config.Interpreter, config.LoginShell && supportsLogin, LaunchPOSIX, config.ScriptArgs)
+		if err != nil {
+			return "", err
 		}
 		input = strings.NewReader(content)
 	}
+
 	mode := c.ConnectionConfig().SudoMode
 	switch mode {
 	case SudoModeRoot:

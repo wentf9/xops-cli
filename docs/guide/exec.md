@@ -14,16 +14,23 @@ xops exec --tag web -c 'uptime'
 # 按标签并行分发并执行本地脚本（设置并发数为 5）
 xops exec --tag web --shell ./check.sh --task 5
 
+# 执行本地脚本并传递参数（通过 -- 分隔传递）
+xops exec --tag web --shell ./check.sh -- --env prod "arg 2"
+
 # 排除特定节点
 xops exec --tag web --exclude web-maintenance-01 -c 'df -h'
 ```
 
 **目标与参数规则**：
 - `--host`、`--ifile`/`-I`（主机列表文件）、`--tag` 三种目标选择方式互斥；指定其中之一后，第一个位置参数即可作为远程命令（如 `xops exec --host web-01 uname -a`），或用 `-c` 显式传入命令字符串。
-- 全局参数可放在子命令前后（如 `xops --color never exec --host web-01 uname -a`）。若远程命令自身带有以 `-` 开头的参数，可用 `-c` 引起来，或使用 `--` 分隔（如 `xops exec --host web-01 -- echo --help`）。
+- 支持 POSIX 风格的 `--` 参数分隔：
+  - 普通命令模式（未指定 `--shell`）：`--` 后面的内容原样传递给远程命令（如 `xops exec --host web-01 -- echo --help`），效果与 `-c` 一致，避免命令自身参数被误解析为本地选项。
+  - 脚本执行模式（指定 `--shell`）：仅允许通过 `--` 显式分隔向本地脚本传递位置参数（如 `xops exec --host web-01 --shell ./script.sh -- arg1 "arg 2"`），脚本通过 `$1`、`$2`（Fish 下为 `$argv`）安全接收并完整保留空格与特殊字符；`--` 之前的位置参数仅在未指定 `--host`/`--tag`/`--ifile` 时用于解析目标主机，多余位置参数会报错。
+- 全局参数可放在子命令前后（如 `xops --color never exec --host web-01 uname -a`）。
 - **批处理凭据**：批处理不会弹出凭据库解锁对话框；运行前请先解锁所需的凭据库。
 - **脚本来源**：`--shell` 需指定普通文件；管道脚本请通过标准输入传入，且不能同时使用 `--password-stdin` 或 `--passphrase-stdin` 提供凭据。
 - **显式解释器模式的限额**：普通命令最长 64 KiB，脚本最长 16 MiB，非交互执行默认时限为 5 分钟。默认结果保留最后 5 MiB 输出，超出时会提示截断；使用 `--stream` 实时显示或 `--out-dir` 保存日志时不受此结果保留限制。部分 Shell 还可能有更严格的命令长度限制。
+
 
 ## 解释器选择与跨平台执行
 
