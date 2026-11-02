@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -169,6 +170,9 @@ func TestShell_HandleShell_WithSudo_RejectsNoneMode(t *testing.T) {
 }
 
 func TestShell_HandleExec_WithSudo_DefaultConfig_Interactive(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("interactive PTY execution is unsupported on Windows")
+	}
 	var executedCmd atomic.Pointer[string]
 	rawClient, cleanup := startMockSSHExecServer(t, func(cmd string) {
 		executedCmd.Store(&cmd)
@@ -254,6 +258,9 @@ func TestShell_HandleExec_WithSudo_DefaultConfig_Batch(t *testing.T) {
 }
 
 func TestShell_HandleExec_WithSudo_DefaultConfig_WithCwd_Interactive(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("interactive PTY execution is unsupported on Windows")
+	}
 	var executedCmd atomic.Pointer[string]
 	rawClient, cleanup := startMockSSHExecServer(t, func(cmd string) {
 		executedCmd.Store(&cmd)
@@ -347,6 +354,9 @@ func TestShell_HandleExec_WithSudo_DefaultConfig_WithCwd_Batch(t *testing.T) {
 }
 
 func TestShell_HandleExec_WithSudo_Interactive_WithCwd(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("interactive PTY execution is unsupported on Windows")
+	}
 	var executedCmd atomic.Pointer[string]
 	rawClient, cleanup := startMockSSHExecServer(t, func(cmd string) {
 		executedCmd.Store(&cmd)
@@ -527,7 +537,7 @@ func TestShell_HandleExec_WithSudo_LaunchDialectOnly_WithCwd(t *testing.T) {
 		t.Errorf("expected whoami in formatted command, got: %s", formatted)
 	}
 
-	// End-to-end interactive execution with LaunchDialect only and cwd
+	// End-to-end execution with LaunchDialect only and cwd
 	var executedCmd atomic.Pointer[string]
 	rawClient, cleanup := startMockSSHExecServer(t, func(cmd string) {
 		executedCmd.Store(&cmd)
@@ -542,52 +552,59 @@ func TestShell_HandleExec_WithSudo_LaunchDialectOnly_WithCwd(t *testing.T) {
 	}
 	sshCli := ssh.NewTestClientWithRaw(rawClient, connCfg)
 
-	master, slave, err := pty.Open()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = master.Close(); _ = slave.Close() }()
+	t.Run("Interactive", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("interactive PTY execution is unsupported on Windows")
+		}
+		master, slave, err := pty.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = master.Close(); _ = slave.Close() }()
 
-	s := &Shell{
-		batch:     false,
-		sudo:      true,
-		cwd:       "/var/log",
-		sshClient: sshCli,
-		stdin:     slave,
-		stdout:    slave,
-		stderr:    slave,
-	}
+		s := &Shell{
+			batch:     false,
+			sudo:      true,
+			cwd:       "/var/log",
+			sshClient: sshCli,
+			stdin:     slave,
+			stdout:    slave,
+			stderr:    slave,
+		}
 
-	err = s.handleExec(t.Context(), []string{"whoami"})
-	if err != nil {
-		t.Fatalf("handleExec in interactive mode with launch_dialect only failed: %v", err)
-	}
-	cmdPtr := executedCmd.Load()
-	if cmdPtr == nil {
-		t.Fatal("expected command to be executed on server")
-	}
-	if !strings.Contains(*cmdPtr, "/var/log") {
-		t.Errorf("expected executed command to contain '/var/log', got: %s", *cmdPtr)
-	}
-	if !strings.Contains(*cmdPtr, "whoami") {
-		t.Errorf("expected whoami in formatted command, got: %s", *cmdPtr)
-	}
-	// End-to-end batch execution with LaunchDialect only and cwd
-	executedCmd.Store(nil)
-	sBatch := &Shell{
-		batch:     true,
-		sudo:      true,
-		cwd:       "/var/log",
-		sshClient: sshCli,
-		stdout:    &bytes.Buffer{},
-		stderr:    &bytes.Buffer{},
-	}
-	if err := sBatch.handleExec(t.Context(), []string{"whoami"}); err != nil {
-		t.Fatalf("handleExec in batch mode with launch_dialect only failed: %v", err)
-	}
-	if cmdPtr := executedCmd.Load(); cmdPtr == nil || !strings.Contains(*cmdPtr, "/var/log") {
-		t.Fatalf("expected batch command with '/var/log', got: %v", cmdPtr)
-	}
+		err = s.handleExec(t.Context(), []string{"whoami"})
+		if err != nil {
+			t.Fatalf("handleExec in interactive mode with launch_dialect only failed: %v", err)
+		}
+		cmdPtr := executedCmd.Load()
+		if cmdPtr == nil {
+			t.Fatal("expected command to be executed on server")
+		}
+		if !strings.Contains(*cmdPtr, "/var/log") {
+			t.Errorf("expected executed command to contain '/var/log', got: %s", *cmdPtr)
+		}
+		if !strings.Contains(*cmdPtr, "whoami") {
+			t.Errorf("expected whoami in formatted command, got: %s", *cmdPtr)
+		}
+	})
+
+	t.Run("Batch", func(t *testing.T) {
+		executedCmd.Store(nil)
+		sBatch := &Shell{
+			batch:     true,
+			sudo:      true,
+			cwd:       "/var/log",
+			sshClient: sshCli,
+			stdout:    &bytes.Buffer{},
+			stderr:    &bytes.Buffer{},
+		}
+		if err := sBatch.handleExec(t.Context(), []string{"whoami"}); err != nil {
+			t.Fatalf("handleExec in batch mode with launch_dialect only failed: %v", err)
+		}
+		if cmdPtr := executedCmd.Load(); cmdPtr == nil || !strings.Contains(*cmdPtr, "/var/log") {
+			t.Fatalf("expected batch command with '/var/log', got: %v", cmdPtr)
+		}
+	})
 }
 
 func TestShell_HandleExec_WithSudo_ExplicitServerInterpreter_Rejected(t *testing.T) {
@@ -600,36 +617,43 @@ func TestShell_HandleExec_WithSudo_ExplicitServerInterpreter_Rejected(t *testing
 	}
 	sshCli := ssh.NewTestClient(connCfg)
 
-	master, slave, err := pty.Open()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = master.Close(); _ = slave.Close() }()
+	t.Run("Interactive", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("interactive PTY execution is unsupported on Windows")
+		}
+		master, slave, err := pty.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = master.Close(); _ = slave.Close() }()
 
-	// Interactive mode with explicit InterpreterServer must fail validation
-	sInteractive := &Shell{
-		batch:     false,
-		sudo:      true,
-		sshClient: sshCli,
-		stdin:     slave,
-		stdout:    slave,
-		stderr:    slave,
-	}
-	if err := sInteractive.handleExec(t.Context(), []string{"whoami"}); err == nil {
-		t.Fatal("expected error for explicit server interpreter with sudo in interactive mode, got nil")
-	}
+		// Interactive mode with explicit InterpreterServer must fail validation
+		sInteractive := &Shell{
+			batch:     false,
+			sudo:      true,
+			sshClient: sshCli,
+			stdin:     slave,
+			stdout:    slave,
+			stderr:    slave,
+		}
+		if err := sInteractive.handleExec(t.Context(), []string{"whoami"}); err == nil {
+			t.Fatal("expected error for explicit server interpreter with sudo in interactive mode, got nil")
+		}
+	})
 
-	// Batch mode with explicit InterpreterServer must also fail validation
-	sBatch := &Shell{
-		batch:     true,
-		sudo:      true,
-		sshClient: sshCli,
-		stdout:    &bytes.Buffer{},
-		stderr:    &bytes.Buffer{},
-	}
-	if err := sBatch.handleExec(t.Context(), []string{"whoami"}); err == nil {
-		t.Fatal("expected error for explicit server interpreter with sudo in batch mode, got nil")
-	}
+	t.Run("Batch", func(t *testing.T) {
+		// Batch mode with explicit InterpreterServer must also fail validation
+		sBatch := &Shell{
+			batch:     true,
+			sudo:      true,
+			sshClient: sshCli,
+			stdout:    &bytes.Buffer{},
+			stderr:    &bytes.Buffer{},
+		}
+		if err := sBatch.handleExec(t.Context(), []string{"whoami"}); err == nil {
+			t.Fatal("expected error for explicit server interpreter with sudo in batch mode, got nil")
+		}
+	})
 }
 
 func TestShell_HandleExec_WithSudoSu_UnconfiguredExecution_AvoidsConfiguredSuRejection(t *testing.T) {
