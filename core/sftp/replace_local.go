@@ -10,6 +10,17 @@ import (
 // renaming over an existing file; in that case, retain the old regular file in a
 // backup until promotion succeeds. This fallback is not atomic.
 func replaceLocalFile(tempPath, localPath string, rename func(string, string) error) error {
+	return replaceLocalEntry(tempPath, localPath, false, rename)
+}
+
+// replaceLocalLink replaces an existing regular file or symbolic link with the
+// temporary symbolic link at tempPath, using a backup fallback when rename
+// rejects overwriting an existing entry.
+func replaceLocalLink(tempPath, localPath string, rename func(string, string) error) error {
+	return replaceLocalEntry(tempPath, localPath, true, rename)
+}
+
+func replaceLocalEntry(tempPath, localPath string, allowSymlinkDestination bool, rename func(string, string) error) error {
 	renameErr := rename(tempPath, localPath)
 	if renameErr == nil {
 		return nil
@@ -22,7 +33,8 @@ func replaceLocalFile(tempPath, localPath string, rename func(string, string) er
 		return errors.Join(fmt.Errorf("rename local temporary file failed: %w", renameErr),
 			fmt.Errorf("lstat local destination before replacement failed: %w", err))
 	}
-	if !info.Mode().IsRegular() {
+	canReplace := info.Mode().IsRegular() || (allowSymlinkDestination && info.Mode()&os.ModeSymlink != 0)
+	if !canReplace {
 		return fmt.Errorf("cannot replace non-regular local destination %q: %w", localPath, renameErr)
 	}
 

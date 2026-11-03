@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -141,6 +142,41 @@ func TestReplaceLocalFileRejectsDirectoryAndExistingBackup(t *testing.T) {
 			assertReplacementContent(t, temporary, "new bytes")
 			if entry == "backup" {
 				assertReplacementContent(t, temporary+".backup", "existing backup")
+			}
+		})
+	}
+}
+
+func TestReplaceLocalLink(t *testing.T) {
+	for _, fallback := range []bool{false, true} {
+		name := "atomic rename"
+		rename := os.Rename
+		if fallback {
+			name = "filesystem rejects replacement"
+			rename = renameWithoutReplacement
+		}
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			temporary := filepath.Join(dir, "temporary")
+			destination := filepath.Join(dir, "destination")
+			if err := os.Symlink("old_target", destination); err != nil {
+				if runtime.GOOS == "windows" {
+					t.Skip("skipping symlink test on Windows due to privilege requirements")
+				}
+				t.Fatal(err)
+			}
+			if err := os.Symlink("new_target", temporary); err != nil {
+				t.Fatal(err)
+			}
+			if err := replaceLocalLink(temporary, destination, rename); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.Readlink(destination)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != "new_target" {
+				t.Fatalf("symlink target = %q, want %q", got, "new_target")
 			}
 		})
 	}

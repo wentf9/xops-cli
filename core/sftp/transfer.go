@@ -18,7 +18,8 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// Upload 上传入口：支持文件或目录
+// Upload 上传入口：支持文件或目录（顶层路径使用 os.Stat 解引用符号链接，与 OpenSSH scp 单路径行为一致；
+// 目录递归遍历内部则通过 UploadLink 保留子项符号链接）。
 func (c *Client) Upload(ctx context.Context, localPath, remotePath string, progress ProgressCallback) error {
 	return runInterruptibleOperation(ctx, c.interruptTransfers, func() error {
 		return c.upload(ctx, localPath, remotePath, progress)
@@ -56,7 +57,8 @@ func (c *Client) upload(ctx context.Context, localPath, remotePath string, progr
 	return nil
 }
 
-// Download 下载入口：支持文件或目录
+// Download 下载入口：支持文件或目录（顶层路径使用 Stat 解引用符号链接，与 OpenSSH scp 单路径行为一致；
+// 目录递归遍历内部则通过 DownloadLink 保留子项符号链接）。
 func (c *Client) Download(ctx context.Context, remotePath, localPath string, progress ProgressCallback) error {
 	return runInterruptibleOperation(ctx, c.interruptTransfers, func() error {
 		return c.download(ctx, remotePath, localPath, progress)
@@ -1439,12 +1441,58 @@ func (c *Client) UploadDirectory(ctx context.Context, localDir, remoteDir string
 	})
 }
 
+func (c *Client) ensureRemoteUploadDirectory(src, dst string) error {
+	dst = cleanRemotePathForRemoval(dst)
+	dstLstat, err := c.SFTPClient().Lstat(dst)
+	if err == nil {
+		if dstLstat.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("cannot overwrite remote symbolic link %q with directory %q", dst, src)
+		}
+		if !dstLstat.IsDir() {
+			return fmt.Errorf("cannot overwrite non-directory remote destination %q with directory %q", dst, src)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) && !os.IsNotExist(err) {
+		return fmt.Errorf("lstat remote destination %q failed: %w", dst, err)
+	}
+	return c.SFTPClient().MkdirAll(dst)
+}
+
+func ensureLocalDownloadDirectory(src, dst string, perm os.FileMode) error {
+	dst = filepath.Clean(dst)
+	dstLstat, err := os.Lstat(dst)
+	if err == nil {
+		if dstLstat.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("cannot overwrite local symbolic link %q with directory %q", dst, src)
+		}
+		if !dstLstat.IsDir() {
+			return fmt.Errorf("cannot overwrite non-directory local destination %q with directory %q", dst, src)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) && !os.IsNotExist(err) {
+		return fmt.Errorf("lstat local destination %q failed: %w", dst, err)
+	}
+	return os.MkdirAll(dst, perm)
+}
+
+func (c *Client) emitLinkProgress(path string, linkSize int64, progress ProgressCallback) {
+	if c.fileProgress != nil {
+		c.fileProgress(FileTransferProgress{
+			Path:        path,
+			Size:        linkSize,
+			Transferred: linkSize,
+			Increment:   linkSize,
+		})
+	}
+	if progress != nil && linkSize > 0 {
+		progress(linkSize)
+	}
+}
+
 func (c *Client) uploadDirectory(ctx context.Context, localDir, remoteDir string, progress ProgressCallback) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	// 1. 确保远程根目录存在
-	if err := c.SFTPClient().MkdirAll(remoteDir); err != nil {
+	// 1. 确保远程根目录存在且不是符号链接/非目录条目
+	if err := c.ensureRemoteUploadDirectory(localDir, remoteDir); err != nil {
 		return fmt.Errorf("create remote destination directory failed: %w", err)
 	}
 
@@ -1470,7 +1518,7 @@ func (c *Client) uploadDirectory(ctx context.Context, localDir, remoteDir string
 		remoteDest := c.JoinPath(remoteDir, filepath.ToSlash(relPath))
 
 		if info.IsDir() {
-			if mkdirErr := c.SFTPClient().MkdirAll(remoteDest); mkdirErr != nil {
+			if mkdirErr := c.ensureRemoteUploadDirectory(path, remoteDest); mkdirErr != nil {
 				return fmt.Errorf("create remote directory %q: %w", remoteDest, mkdirErr)
 			}
 			return nil
@@ -1487,6 +1535,12 @@ func (c *Client) uploadDirectory(ctx context.Context, localDir, remoteDir string
 		}
 		g.Go(func() error {
 			defer func() { <-sem }()
+			if loopInfo.Mode()&os.ModeSymlink != 0 {
+				if err := c.uploadLink(groupCtx, loopPath, loopDest, progress); err != nil {
+					return fmt.Errorf("upload %q to %q: %w", loopPath, loopDest, err)
+				}
+				return nil
+			}
 			if err := c.uploadFile(groupCtx, loopPath, loopDest, loopInfo.Size(), loopInfo.Mode(), progress); err != nil {
 				return fmt.Errorf("upload %q to %q: %w", loopPath, loopDest, err)
 			}
@@ -1499,6 +1553,99 @@ func (c *Client) uploadDirectory(ctx context.Context, localDir, remoteDir string
 	return finishTransferGroup(ctx, cancel, g, err)
 }
 
+func (c *Client) UploadLink(ctx context.Context, localPath, remotePath string, progress ProgressCallback) error {
+	return runInterruptibleOperation(ctx, c.interruptTransfers, func() error {
+		return c.uploadLink(ctx, localPath, remotePath, progress)
+	})
+}
+
+func (c *Client) shouldSkipUploadLink(remotePath, target string) (bool, error) {
+	dstLstat, err := c.SFTPClient().Lstat(remotePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("lstat remote destination failed: %w", err)
+	}
+	if dstLstat.IsDir() {
+		return false, fmt.Errorf("cannot overwrite remote destination directory %q with symbolic link", remotePath)
+	}
+	if !c.config.Force && dstLstat.Mode()&os.ModeSymlink != 0 {
+		if existingTarget, readErr := c.SFTPClient().ReadLink(remotePath); readErr == nil && existingTarget == target {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (c *Client) createRemoteTempLink(tempPath, target string) error {
+	if tempInfo, err := c.SFTPClient().Lstat(tempPath); err == nil {
+		if tempInfo.IsDir() {
+			return fmt.Errorf("create remote temporary symbolic link failed: temporary path %q is a directory", tempPath)
+		}
+		if !c.config.Force {
+			return fmt.Errorf("create remote temporary symbolic link failed: path %q already exists", tempPath)
+		}
+		if rmErr := c.SFTPClient().Remove(tempPath); rmErr != nil {
+			return fmt.Errorf("remove existing remote temporary path %q failed: %w", tempPath, rmErr)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("lstat remote temporary symbolic link failed: %w", err)
+	}
+	if err := c.SFTPClient().Symlink(target, tempPath); err != nil {
+		return fmt.Errorf("create remote temporary symbolic link failed: %w", err)
+	}
+	return nil
+}
+
+func (c *Client) uploadLink(ctx context.Context, localPath, remotePath string, progress ProgressCallback) (retErr error) {
+	finishDiagnostic := c.observeFileTransfer("upload", localPath, remotePath, 0)
+	defer func() { finishDiagnostic(retErr) }()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	target, err := os.Readlink(localPath)
+	if err != nil {
+		return fmt.Errorf("read local symbolic link %q failed: %w", localPath, err)
+	}
+	linkSize := int64(len(target))
+
+	skip, skipErr := c.shouldSkipUploadLink(remotePath, target)
+	if skipErr != nil {
+		return skipErr
+	}
+	if skip {
+		c.emitLinkProgress(localPath, linkSize, progress)
+		return nil
+	}
+
+	tempPath := remotePath + c.config.TempSuffix
+	if tempPath == remotePath {
+		return fmt.Errorf("upload temporary link conflicts with destination: %q", tempPath)
+	}
+	if err := c.createRemoteTempLink(tempPath, target); err != nil {
+		return err
+	}
+	promoted := false
+	defer func() {
+		if promoted {
+			return
+		}
+		if removeErr := c.SFTPClient().Remove(tempPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			retErr = errors.Join(retErr, fmt.Errorf("remove remote temporary symbolic link failed: %w", removeErr))
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := c.replaceRemoteLink(tempPath, remotePath); err != nil {
+		return err
+	}
+	promoted = true
+	c.emitLinkProgress(localPath, linkSize, progress)
+	return nil
+}
+
 func (c *Client) DownloadDirectory(ctx context.Context, remoteDir, localDir string, progress ProgressCallback) error {
 	return runInterruptibleOperation(ctx, c.interruptTransfers, func() error {
 		return c.downloadDirectory(ctx, remoteDir, localDir, progress)
@@ -1509,7 +1656,7 @@ func (c *Client) downloadDirectory(ctx context.Context, remoteDir, localDir stri
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(localDir, 0755); err != nil {
+	if err := ensureLocalDownloadDirectory(remoteDir, localDir, 0755); err != nil {
 		return fmt.Errorf("create local download directory failed: %w", err)
 	}
 
@@ -1542,7 +1689,7 @@ func (c *Client) downloadDirectory(ctx context.Context, remoteDir, localDir stri
 		localDest := filepath.Join(localDir, filepath.FromSlash(relPath))
 
 		if info.IsDir() {
-			if err := os.MkdirAll(localDest, info.Mode()|0700); err != nil {
+			if err := ensureLocalDownloadDirectory(path, localDest, info.Mode()|0700); err != nil {
 				traversalErr = fmt.Errorf("create local directory %q failed: %w", localDest, err)
 				break
 			}
@@ -1568,6 +1715,12 @@ func (c *Client) downloadDirectory(ctx context.Context, remoteDir, localDir stri
 		}
 		g.Go(func() error {
 			defer func() { <-sem }()
+			if loopInfo.Mode()&os.ModeSymlink != 0 {
+				if err := c.downloadLink(groupCtx, loopPath, loopDest, progress); err != nil {
+					return fmt.Errorf("download %q to %q: %w", loopPath, loopDest, err)
+				}
+				return nil
+			}
 			if err := c.downloadFile(groupCtx, loopPath, loopDest, loopInfo.Size(), loopInfo.Mode(), progress); err != nil {
 				return fmt.Errorf("download %q to %q: %w", loopPath, loopDest, err)
 			}
@@ -1579,6 +1732,80 @@ func (c *Client) downloadDirectory(ctx context.Context, remoteDir, localDir stri
 		traversalErr = walker.Err()
 	}
 	return finishTransferGroup(ctx, cancel, g, traversalErr)
+}
+
+func (c *Client) DownloadLink(ctx context.Context, remotePath, localPath string, progress ProgressCallback) error {
+	return runInterruptibleOperation(ctx, c.interruptTransfers, func() error {
+		return c.downloadLink(ctx, remotePath, localPath, progress)
+	})
+}
+
+func (c *Client) shouldSkipDownloadLink(localPath, target string) (bool, error) {
+	dstLstat, err := os.Lstat(localPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("lstat local destination failed: %w", err)
+	}
+	if dstLstat.IsDir() {
+		return false, fmt.Errorf("cannot overwrite local destination directory %q with symbolic link", localPath)
+	}
+	if !c.config.Force && dstLstat.Mode()&os.ModeSymlink != 0 {
+		if existingTarget, readErr := os.Readlink(localPath); readErr == nil && existingTarget == target {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (c *Client) downloadLink(ctx context.Context, remotePath, localPath string, progress ProgressCallback) (retErr error) {
+	finishDiagnostic := c.observeFileTransfer("download", remotePath, localPath, 0)
+	defer func() { finishDiagnostic(retErr) }()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	target, err := c.SFTPClient().ReadLink(remotePath)
+	if err != nil {
+		return fmt.Errorf("read remote symbolic link %q failed: %w", remotePath, err)
+	}
+	linkSize := int64(len(target))
+
+	skip, err := c.shouldSkipDownloadLink(localPath, target)
+	if err != nil {
+		return err
+	}
+	if skip {
+		c.emitLinkProgress(remotePath, linkSize, progress)
+		return nil
+	}
+
+	rb := make([]byte, 16)
+	if _, err := rand.Read(rb); err != nil {
+		return fmt.Errorf("generate random bytes failed: %w", err)
+	}
+	tempPath := localPath + c.config.TempSuffix + "." + hex.EncodeToString(rb)
+	if err := os.Symlink(target, tempPath); err != nil {
+		return fmt.Errorf("create local temporary symbolic link failed: %w", err)
+	}
+	promoted := false
+	defer func() {
+		if promoted {
+			return
+		}
+		if rmErr := os.Remove(tempPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			retErr = errors.Join(retErr, fmt.Errorf("remove local temporary symbolic link failed: %w", rmErr))
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := replaceLocalLink(tempPath, localPath, os.Rename); err != nil {
+		return err
+	}
+	promoted = true
+	c.emitLinkProgress(remotePath, linkSize, progress)
+	return nil
 }
 
 func remoteRelativePath(base, target string) (string, error) {
