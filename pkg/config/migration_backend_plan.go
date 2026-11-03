@@ -95,6 +95,14 @@ func backendRefs(cfg *ConfigurationV2) []credential.Ref {
 	for _, id := range cfg.Identities {
 		add(id.LoginPasswordRef)
 		add(id.PassphraseRef)
+		if id.OTP != nil {
+			add(id.OTP.TOTPSecretRef)
+		}
+		if id.KeyboardInteractive != nil {
+			for _, r := range id.KeyboardInteractive.Rules {
+				add(r.SecretRef)
+			}
+		}
 	}
 	for _, node := range cfg.Nodes {
 		add(node.PrivilegePasswordRef)
@@ -123,16 +131,9 @@ func planBackendMigration(raw []byte, store string, prior *backendMigrationState
 			state.Entries = append(state.Entries, backendMigrationEntry{Source: ref, Target: credential.Ref{StoreID: store, ItemID: credential.GenerateItemID()}})
 		}
 	}
-	if prior != nil {
-		if prior.SourceHash != state.SourceHash || prior.Store != store || len(prior.Entries) != len(state.Entries) {
-			return nil, nil, fmt.Errorf("%w: pending backend migration differs from source or destination; use --restart to plan from current configuration", ErrConfigConflict)
-		}
-		for i := range state.Entries {
-			if prior.Entries[i].Source != state.Entries[i].Source {
-				return nil, nil, fmt.Errorf("invalid backend migration plan")
-			}
-		}
-		state = prior
+	state, err = validatePriorBackendPlan(prior, state, store)
+	if err != nil {
+		return nil, nil, err
 	}
 	replacements := make(map[credential.Ref]credential.Ref)
 	for _, entry := range state.Entries {
@@ -147,9 +148,7 @@ func planBackendMigration(raw []byte, store string, prior *backendMigrationState
 		return ref
 	}
 	for name, id := range cfg.Identities {
-		id.LoginPasswordRef = replace(id.LoginPasswordRef)
-		id.PassphraseRef = replace(id.PassphraseRef)
-		cfg.Identities[name] = id
+		cfg.Identities[name] = replaceIdentityMigrationRefs(id, replace)
 	}
 	for name, node := range cfg.Nodes {
 		node.PrivilegePasswordRef = replace(node.PrivilegePasswordRef)
@@ -173,4 +172,35 @@ func planBackendMigration(raw []byte, store string, prior *backendMigrationState
 
 func (m *CredentialMigrator) backendReport(state *backendMigrationState, dry bool) MigrationReport {
 	return MigrationReport{Store: state.Store, Credentials: len(state.Entries), BackupPath: m.backendBackupPath(state.SourceHash), DryRun: dry, Verified: state.Verified, BackendMigration: true}
+}
+
+func validatePriorBackendPlan(prior, current *backendMigrationState, store string) (*backendMigrationState, error) {
+	if prior == nil {
+		return current, nil
+	}
+	if prior.SourceHash != current.SourceHash || prior.Store != store || len(prior.Entries) != len(current.Entries) {
+		return nil, fmt.Errorf("%w: pending backend migration differs from source or destination; use --restart to plan from current configuration", ErrConfigConflict)
+	}
+	for i := range current.Entries {
+		if prior.Entries[i].Source != current.Entries[i].Source {
+			return nil, fmt.Errorf("invalid backend migration plan")
+		}
+	}
+	return prior, nil
+}
+
+func replaceIdentityMigrationRefs(id IdentityV2, replace func(*credential.Ref) *credential.Ref) IdentityV2 {
+	id.LoginPasswordRef = replace(id.LoginPasswordRef)
+	id.PassphraseRef = replace(id.PassphraseRef)
+	if id.OTP != nil {
+		id.OTP = id.OTP.Clone()
+		id.OTP.TOTPSecretRef = replace(id.OTP.TOTPSecretRef)
+	}
+	if id.KeyboardInteractive != nil {
+		id.KeyboardInteractive = id.KeyboardInteractive.Clone()
+		for i := range id.KeyboardInteractive.Rules {
+			id.KeyboardInteractive.Rules[i].SecretRef = replace(id.KeyboardInteractive.Rules[i].SecretRef)
+		}
+	}
+	return id
 }

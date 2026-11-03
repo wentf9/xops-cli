@@ -778,15 +778,33 @@ identity_credential_set_short:
 identity_credential_delete_short:
   other: "Delete persistent credential reference for an identity"
 flag_credential_kind:
-  other: "Credential secret kind (login_password, passphrase)"
+  other: "Credential secret kind (login_password, passphrase, totp_secret, challenge_answer)"
 flag_credential_store:
   other: "Target credential store ID (leave empty for default store)"
+flag_credential_rule:
+  other: "Challenge rule name (required when kind is challenge_answer)"
 flag_password_stdin:
   other: "Read password securely from stdin to avoid exposure in command arguments"
 flag_passphrase_stdin:
   other: "Read passphrase securely from stdin to avoid exposure in command arguments"
+flag_otp:
+  other: "One-time password (OTP/2FA) token for the session"
+flag_otp_stdin:
+  other: "Read one-time password (OTP) from standard input"
 flag_remember:
   other: "Credential persistence policy: ask, always, never; inherits credential.remember_prompted, then ask; batch mode never saves"
+err_otp_mutually_exclusive:
+  other: "cannot specify both --otp and --otp-stdin"
+err_rule_required_for_challenge:
+  other: "--rule is required when credential kind is challenge_answer"
+prompt_enter_otp:
+  other: "Enter one-time password (OTP): "
+prompt_enter_otp_for:
+  other: "Enter one-time password (OTP) for {{.User}}@{{.Host}}: "
+prompt_enter_response:
+  other: "Enter response: "
+identity_set_secret_short:
+  other: "Store a secret credential (password, passphrase, totp_secret, challenge_answer) for an identity"
 
 
 credential_migrate_short:

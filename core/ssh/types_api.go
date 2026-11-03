@@ -192,6 +192,8 @@ const (
 	SecretKindPrivateKeyPassphrase
 	SecretKindSuPassword
 	SecretKindSudoPassword
+	SecretKindOTP
+	SecretKindKeyboardInteractive
 )
 
 // ErrSnapshotMismatch 表示连接快照与当前配置版本或目标不匹配
@@ -206,6 +208,11 @@ type SecretRequest struct {
 	Port         int
 	KeyPath      string
 	VersionToken string
+	Instruction  string
+	Prompt       string
+	Echo         bool
+	Attempt      int
+	NumPrompts   int
 }
 
 // HostKeyConfirmation 描述主机密钥指纹确认请求

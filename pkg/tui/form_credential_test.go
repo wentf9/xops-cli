@@ -643,6 +643,79 @@ func TestNodeFormCredentialDelete_RemovesLegacyPlaintext(t *testing.T) {
 	}
 }
 
+func TestNodeFormState_KeyboardInteractivePreservesAndRotatesLoginPasswordRef(t *testing.T) {
+	cfg := newFormCredentialTestConfiguration("")
+	existingRef := &credential.Ref{StoreID: "mem", ItemID: "ki-login-pwd"}
+	ident, _ := cfg.Identities.Get("user@192.168.1.50")
+	ident.AuthType = "keyboard-interactive"
+	ident.LoginPasswordRef = existingRef.Clone()
+	cfg.Identities.Set("user@192.168.1.50", ident)
+
+	repo := newTestRepository(t, cfg)
+	memStore := newMemoryCredentialStore()
+	memStore.data[existingRef.ItemID] = credential.NewSecret([]byte("initial-pwd"))
+	service := newFormCredentialTestService(t, repo, memStore)
+
+	// 1. Keep action preserves LoginPasswordRef when authType is keyboard-interactive
+	modelKeep := &Model{
+		repository:        repo,
+		credentialService: service,
+		formState: &nodeFormState{
+			isEdit:              true,
+			originalID:          formCredentialTestNodeID,
+			user:                "user",
+			address:             "192.168.1.50",
+			port:                "22",
+			authType:            "keyboard-interactive",
+			passwordAction:      "keep",
+			existingPasswordRef: existingRef.Clone(),
+			sudoMode:            "auto",
+		},
+	}
+	completeConfigurationMutation(t, modelKeep, modelKeep.saveFormCmd())
+
+	snapKeep, err := repo.ResolveConnection(formCredentialTestNodeID)
+	if err != nil {
+		t.Fatalf("resolve connection after keep: %v", err)
+	}
+	if snapKeep.Identity.AuthType != "keyboard-interactive" {
+		t.Fatalf("authType = %q, want keyboard-interactive", snapKeep.Identity.AuthType)
+	}
+	if snapKeep.Identity.LoginPasswordRef == nil || *snapKeep.Identity.LoginPasswordRef != *existingRef {
+		t.Fatalf("LoginPasswordRef = %v, want preserved %v", snapKeep.Identity.LoginPasswordRef, existingRef)
+	}
+
+	// 2. Replace action rotates LoginPasswordRef while preserving authType == "otp"
+	modelReplace := &Model{
+		repository:        repo,
+		credentialService: service,
+		formState: &nodeFormState{
+			isEdit:              true,
+			originalID:          formCredentialTestNodeID,
+			user:                "user",
+			address:             "192.168.1.50",
+			port:                "22",
+			authType:            "otp",
+			password:            "rotated-mfa-password",
+			passwordAction:      "replace",
+			existingPasswordRef: existingRef.Clone(),
+			sudoMode:            "auto",
+		},
+	}
+	completeConfigurationMutation(t, modelReplace, modelReplace.saveFormCmd())
+
+	snapReplace, err := repo.ResolveConnection(formCredentialTestNodeID)
+	if err != nil {
+		t.Fatalf("resolve connection after replace: %v", err)
+	}
+	if snapReplace.Identity.AuthType != "otp" {
+		t.Fatalf("authType = %q, want otp", snapReplace.Identity.AuthType)
+	}
+	if snapReplace.Identity.LoginPasswordRef == nil || snapReplace.Identity.LoginPasswordRef.ItemID == existingRef.ItemID {
+		t.Fatalf("expected rotated LoginPasswordRef, got %v", snapReplace.Identity.LoginPasswordRef)
+	}
+}
+
 const formCredentialTestNodeID = "user@192.168.1.50:22"
 
 func newFormCredentialTestConfiguration(password string) *config.Configuration {

@@ -15,8 +15,19 @@ import (
 
 // completeInput establishes one owner for stdin before consuming any bytes.
 func (o *ExecOptions) completeInput(ctx context.Context) error {
-	if !o.Interactive && o.Command == "" && o.ShellFile == "" && (o.PasswordStdin || o.PassphraseStdin) {
+	if o.OTP != "" && o.OTPStdin {
+		return errors.New(i18n.T("err_otp_mutually_exclusive"))
+	}
+	if !o.Interactive && o.Command == "" && o.ShellFile == "" && (o.PasswordStdin || o.PassphraseStdin || o.OTPStdin) {
 		return fmt.Errorf("stdin cannot supply both credentials and a script; use --cmd or --shell")
+	}
+	if o.OTPStdin {
+		otp, err := utils.ReadSecretLineFromStdin()
+		if err != nil {
+			return fmt.Errorf("read otp from stdin: %w", err)
+		}
+		o.OTP = otp
+		o.OTPStdin = false
 	}
 	if o.PasswordStdin {
 		pwd, err := utils.ReadSecretFromStdin()

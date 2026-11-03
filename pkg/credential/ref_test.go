@@ -18,6 +18,8 @@ func TestKindValidate(t *testing.T) {
 		{"login_password", KindLoginPassword, false},
 		{"passphrase", KindPassphrase, false},
 		{"privilege_password", KindPrivilegePassword, false},
+		{"totp_secret", KindTOTPSecret, false},
+		{"challenge_answer", KindChallengeAnswer, false},
 		{"empty", "", true},
 		{"unknown", "unknown_kind", true},
 	}
@@ -32,6 +34,64 @@ func TestKindValidate(t *testing.T) {
 				t.Fatalf("expected coreauth.ErrInvalidRef, got: %v", err)
 			}
 		})
+	}
+}
+
+func TestParseRef(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    Ref
+		wantErr bool
+	}{
+		{"empty string", "", Ref{}, false},
+		{"whitespace only", "   ", Ref{}, false},
+		{"valid store and item", "default/item-123", Ref{StoreID: "default", ItemID: "item-123"}, false},
+		{"missing slash", "default-item", Ref{}, true},
+		{"multiple slashes", "store/sub/item", Ref{}, true},
+		{"empty store", "/item-123", Ref{}, true},
+		{"empty item", "store/", Ref{}, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseRef(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ParseRef(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			}
+			if !tt.wantErr && got != tt.want {
+				t.Fatalf("ParseRef(%q) = %+v, want %+v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTargetValidate(t *testing.T) {
+	// Missing nodeID and identityID
+	t1 := Target{Kind: KindLoginPassword}
+	if err := t1.Validate(); err == nil {
+		t.Fatal("expected error for target missing both nodeID and identityID")
+	}
+
+	// Challenge answer without RuleName
+	t2 := Target{IdentityID: "id1", Kind: KindChallengeAnswer}
+	if err := t2.Validate(); err == nil {
+		t.Fatal("expected error for challenge_answer without RuleName")
+	}
+
+	// Challenge answer with RuleName
+	t3 := Target{IdentityID: "id1", Kind: KindChallengeAnswer, RuleName: "otp-rule"}
+	if err := t3.Validate(); err != nil {
+		t.Fatalf("unexpected error for challenge_answer with RuleName: %v", err)
+	}
+	if id := t3.TargetIdentifier(); id != "id1#otp-rule" {
+		t.Fatalf("expected target identifier 'id1#otp-rule', got: %s", id)
+	}
+
+	// Node target identifier without RuleName
+	t4 := Target{NodeID: "node1", Kind: KindLoginPassword}
+	if id := t4.TargetIdentifier(); id != "node1" {
+		t.Fatalf("expected target identifier 'node1', got: %s", id)
 	}
 }
 

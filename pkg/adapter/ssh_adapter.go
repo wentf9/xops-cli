@@ -3,9 +3,13 @@ package adapter
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"strings"
+	"time"
 
 	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/core/ssh"
+	"github.com/wentf9/xops-cli/internal/credentialhelper"
 	"github.com/wentf9/xops-cli/internal/sshenv"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
@@ -18,6 +22,7 @@ type SessionAuth struct {
 	Passphrase string
 	KeyPath    string
 	SuPwd      string
+	OTP        string
 	Remember   bool
 }
 
@@ -243,11 +248,17 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 		if override.KeyPath != "" {
 			cfg.KeyPath = override.KeyPath
 		}
-		// Route explicit session material through auto authentication. This lets
-		// the connector record it after a successful handshake when requested,
-		// while still keeping it out of the configuration before that point.
-		if override.Password != "" || override.Passphrase != "" || override.KeyPath != "" {
-			cfg.AuthType = "auto"
+		// Route explicit session material through auto authentication unless the
+		// identity already uses keyboard-interactive or otp. This lets the
+		// connector record discovered credentials after a successful handshake
+		// and enables stage-0 keyboard-interactive when --otp is supplied on a
+		// default password node.
+		if cfg.AuthType != "keyboard-interactive" && cfg.AuthType != "otp" {
+			if override.Password != "" || override.Passphrase != "" || override.KeyPath != "" {
+				cfg.AuthType = "auto"
+			} else if override.OTP != "" && (cfg.AuthType == "" || cfg.AuthType == "password") {
+				cfg.AuthType = "auto"
+			}
 		}
 		if override.SuPwd != "" {
 			cfg.SuPwd = override.SuPwd
@@ -465,8 +476,205 @@ func (a *SSHAdapter) ResolveSecret(ctx context.Context, req ssh.SecretRequest) (
 		return nil, ssh.ErrInteractionRequired
 	case ssh.SecretKindSuPassword:
 		return a.resolveSuPassword(ctx, snapshot, hasOverride, override)
+	case ssh.SecretKindOTP:
+		return a.resolveOTP(ctx, snapshot, req, hasOverride, override)
+	case ssh.SecretKindKeyboardInteractive:
+		return a.resolveKeyboardInteractive(ctx, snapshot, req, hasOverride, override)
 	default:
 		return nil, fmt.Errorf("unsupported secret kind: %v", req.Kind)
+	}
+}
+
+func (a *SSHAdapter) resolveOTP(
+	ctx context.Context,
+	snapshot config.ConnectionSnapshot,
+	req ssh.SecretRequest,
+	hasOverride bool,
+	override SessionAuth,
+) ([]byte, error) {
+	if req.Attempt > 1 {
+		return nil, ssh.ErrInteractionRequired
+	}
+	if hasOverride && override.OTP != "" {
+		return []byte(override.OTP), nil
+	}
+	otpCfg := snapshot.Identity.OTP
+	if otpCfg == nil {
+		return nil, ssh.ErrInteractionRequired
+	}
+	if ref := otpCfg.TOTPSecretRef; ref != nil && !ref.IsEmpty() {
+		if a.credentialResolver == nil {
+			return nil, fmt.Errorf("totp secret ref %q/%q is configured but no credential resolver is available: %w",
+				ref.StoreID, ref.ItemID, coreauth.ErrCredentialStoreUnavailable)
+		}
+		sec, err := a.credentialResolver.Resolve(ctx, *ref)
+		if err != nil {
+			return nil, fmt.Errorf("get totp secret from store: %w", err)
+		}
+		defer sec.Zero()
+		code, err := coreauth.GenerateTOTP(string(sec.Value), time.Now())
+		if err != nil {
+			return nil, fmt.Errorf("generate totp: %w", err)
+		}
+		return []byte(code), nil
+	}
+	if strings.TrimSpace(otpCfg.Command) != "" {
+		timeout := otpCfg.Timeout
+		if timeout <= 0 {
+			timeout = credentialhelper.DefaultAnswerCommandTimeout
+		}
+		promptText := req.Prompt
+		if promptText == "" {
+			promptText = "OTP"
+		}
+		identityName := snapshot.Node.IdentityRef
+		if identityName == "" {
+			identityName = snapshot.Identity.User
+		}
+		opts := credentialhelper.AnswerCommandOptions{
+			Command:        otpCfg.Command,
+			Args:           otpCfg.Args,
+			Timeout:        timeout,
+			Node:           req.NodeID,
+			Host:           snapshot.Host.Address,
+			User:           snapshot.Identity.User,
+			Identity:       identityName,
+			Prompt:         promptText,
+			Instruction:    req.Instruction,
+			Echo:           req.Echo,
+			NonInteractive: a.nonInteractive || credential.InteractionDisabled(ctx),
+		}
+		ans, err := credentialhelper.RunAnswerCommand(ctx, opts)
+		if err != nil {
+			return nil, fmt.Errorf("execute otp command: %w", err)
+		}
+		return ans, nil
+	}
+	return nil, ssh.ErrInteractionRequired
+}
+
+func (a *SSHAdapter) resolveKeyboardInteractive(
+	ctx context.Context,
+	snapshot config.ConnectionSnapshot,
+	req ssh.SecretRequest,
+	hasOverride bool,
+	override SessionAuth,
+) ([]byte, error) {
+	// Anti-loop protection: if server rejected previous answer, fall back immediately to interaction
+	if req.Attempt > 1 {
+		return nil, ssh.ErrInteractionRequired
+	}
+
+	// 1. Inspect user-configured keyboard-interactive rules
+	if ki := snapshot.Identity.KeyboardInteractive; ki != nil && len(ki.Rules) > 0 {
+		for _, rule := range ki.Rules {
+			promptRe, err := regexp.Compile(rule.PromptPattern)
+			if err != nil {
+				return nil, fmt.Errorf("invalid prompt pattern %q in rule %q: %w", rule.PromptPattern, rule.Name, err)
+			}
+			if !promptRe.MatchString(req.Prompt) {
+				continue
+			}
+			if rule.InstructionPattern != "" {
+				instRe, err := regexp.Compile(rule.InstructionPattern)
+				if err != nil {
+					return nil, fmt.Errorf("invalid instruction pattern %q in rule %q: %w", rule.InstructionPattern, rule.Name, err)
+				}
+				if !instRe.MatchString(req.Instruction) {
+					continue
+				}
+			}
+
+			// Matched rule! Resolve answer by source
+			return a.resolveChallengeRuleAnswer(ctx, snapshot, req, rule, hasOverride, override)
+		}
+	}
+
+	// 2. Fallback to explicit OTP matching
+	if snapshot.Identity.OTP != nil && snapshot.Identity.OTP.PromptPattern != "" {
+		otpPromptRe, err := regexp.Compile(snapshot.Identity.OTP.PromptPattern)
+		if err != nil {
+			return nil, fmt.Errorf("invalid otp prompt pattern %q: %w", snapshot.Identity.OTP.PromptPattern, err)
+		}
+		if otpPromptRe.MatchString(req.Prompt) {
+			return a.resolveOTP(ctx, snapshot, req, hasOverride, override)
+		}
+	} else if req.NumPrompts <= 1 && ((hasOverride && override.OTP != "") || snapshot.Identity.AuthType == "otp" || hasConfiguredOTP(snapshot.Identity.OTP)) {
+		return a.resolveOTP(ctx, snapshot, req, hasOverride, override)
+	}
+
+	// 3. No rule matched: fallback to interactive prompt
+	return nil, ssh.ErrInteractionRequired
+}
+
+func hasConfiguredOTP(otp *models.OTPConfig) bool {
+	if otp == nil {
+		return false
+	}
+	return (otp.TOTPSecretRef != nil && !otp.TOTPSecretRef.IsEmpty()) || strings.TrimSpace(otp.Command) != ""
+}
+
+func (a *SSHAdapter) resolveChallengeRuleAnswer(
+	ctx context.Context,
+	snapshot config.ConnectionSnapshot,
+	req ssh.SecretRequest,
+	rule models.ChallengeRule,
+	hasOverride bool,
+	override SessionAuth,
+) ([]byte, error) {
+	switch rule.Source {
+	case models.ChallengeSourceOTP:
+		return a.resolveOTP(ctx, snapshot, req, hasOverride, override)
+	case models.ChallengeSourceLoginPassword:
+		return a.resolveLoginPassword(ctx, snapshot, hasOverride, override)
+	case models.ChallengeSourceSecret:
+		if rule.SecretRef == nil || rule.SecretRef.IsEmpty() {
+			return nil, fmt.Errorf("rule %q has source secret but secret_ref is empty", rule.Name)
+		}
+		if a.credentialResolver == nil {
+			return nil, fmt.Errorf("rule %q secret ref %q/%q is configured but no credential resolver is available: %w",
+				rule.Name, rule.SecretRef.StoreID, rule.SecretRef.ItemID, coreauth.ErrCredentialStoreUnavailable)
+		}
+		sec, err := a.credentialResolver.Resolve(ctx, *rule.SecretRef)
+		if err != nil {
+			return nil, fmt.Errorf("get challenge answer for rule %q from store: %w", rule.Name, err)
+		}
+		defer sec.Zero()
+		ans := make([]byte, len(sec.Value))
+		copy(ans, sec.Value)
+		return ans, nil
+	case models.ChallengeSourceCommand:
+		if strings.TrimSpace(rule.Command) == "" {
+			return nil, fmt.Errorf("rule %q has source command but command is empty", rule.Name)
+		}
+		timeout := rule.Timeout
+		if timeout <= 0 {
+			timeout = credentialhelper.DefaultAnswerCommandTimeout
+		}
+		identityName := snapshot.Node.IdentityRef
+		if identityName == "" {
+			identityName = snapshot.Identity.User
+		}
+		opts := credentialhelper.AnswerCommandOptions{
+			Command:        rule.Command,
+			Args:           rule.Args,
+			Timeout:        timeout,
+			Node:           req.NodeID,
+			Host:           snapshot.Host.Address,
+			User:           snapshot.Identity.User,
+			Identity:       identityName,
+			Prompt:         req.Prompt,
+			Instruction:    req.Instruction,
+			Echo:           req.Echo,
+			NonInteractive: a.nonInteractive || credential.InteractionDisabled(ctx),
+		}
+		ans, err := credentialhelper.RunAnswerCommand(ctx, opts)
+		if err != nil {
+			return nil, fmt.Errorf("execute challenge rule %q command: %w", rule.Name, err)
+		}
+		return ans, nil
+	default:
+		return nil, fmt.Errorf("unsupported challenge answer source %q in rule %q", rule.Source, rule.Name)
 	}
 }
 
@@ -554,7 +762,7 @@ func validateSecretRequestSnapshot(snapshot config.ConnectionSnapshot, req ssh.S
 		var currentVersion string
 		if snapshot.UpdateRef != nil {
 			switch req.Kind {
-			case ssh.SecretKindLoginPassword, ssh.SecretKindPrivateKeyPassphrase:
+			case ssh.SecretKindLoginPassword, ssh.SecretKindPrivateKeyPassphrase, ssh.SecretKindOTP, ssh.SecretKindKeyboardInteractive:
 				currentVersion = string(snapshot.UpdateRef.AuthVersion[:])
 			case ssh.SecretKindSuPassword, ssh.SecretKindSudoPassword:
 				currentVersion = string(snapshot.UpdateRef.SudoVersion[:])

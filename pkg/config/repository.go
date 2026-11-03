@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -269,23 +270,27 @@ func nodeAuthVersion(cfg *Configuration, nodeID string) (Version, error) {
 		return Version{}, fmt.Errorf("resolve identity %q authentication version: %w", node.IdentityRef, ErrIdentityNotFound)
 	}
 	data, err := yaml.Marshal(struct {
-		IdentityRef      string          `yaml:"identity_ref"`
-		AuthType         string          `yaml:"auth_type"`
-		Password         string          `yaml:"password"`
-		KeyPath          string          `yaml:"key_path"`
-		Passphrase       string          `yaml:"passphrase"`
-		KeyFingerprint   string          `yaml:"key_fingerprint,omitempty"`
-		LoginPasswordRef *credential.Ref `yaml:"login_password_ref,omitempty"`
-		PassphraseRef    *credential.Ref `yaml:"passphrase_ref,omitempty"`
+		IdentityRef         string                            `yaml:"identity_ref"`
+		AuthType            string                            `yaml:"auth_type"`
+		Password            string                            `yaml:"password"`
+		KeyPath             string                            `yaml:"key_path"`
+		Passphrase          string                            `yaml:"passphrase"`
+		KeyFingerprint      string                            `yaml:"key_fingerprint,omitempty"`
+		LoginPasswordRef    *credential.Ref                   `yaml:"login_password_ref,omitempty"`
+		PassphraseRef       *credential.Ref                   `yaml:"passphrase_ref,omitempty"`
+		OTP                 *models.OTPConfig                 `yaml:"otp,omitempty"`
+		KeyboardInteractive *models.KeyboardInteractiveConfig `yaml:"keyboard_interactive,omitempty"`
 	}{
-		IdentityRef:      node.IdentityRef,
-		AuthType:         identity.AuthType,
-		Password:         identity.Password,
-		KeyPath:          identity.KeyPath,
-		Passphrase:       identity.Passphrase,
-		KeyFingerprint:   identity.KeyFingerprint,
-		LoginPasswordRef: identity.LoginPasswordRef,
-		PassphraseRef:    identity.PassphraseRef,
+		IdentityRef:         node.IdentityRef,
+		AuthType:            identity.AuthType,
+		Password:            identity.Password,
+		KeyPath:             identity.KeyPath,
+		Passphrase:          identity.Passphrase,
+		KeyFingerprint:      identity.KeyFingerprint,
+		LoginPasswordRef:    identity.LoginPasswordRef,
+		PassphraseRef:       identity.PassphraseRef,
+		OTP:                 identity.OTP,
+		KeyboardInteractive: identity.KeyboardInteractive,
 	})
 	if err != nil {
 		return Version{}, fmt.Errorf("serialize node %q authentication version: %w", nodeID, err)
@@ -1273,7 +1278,7 @@ func (r *Repository) updateNodeCredentialTargetAtVersion(ctx context.Context, ta
 	var committedVersion string
 	commitResult, err := r.commitResultContext(ctx, anyRevision, func(cfg *Configuration) error {
 		switch kind {
-		case credential.KindLoginPassword, credential.KindPassphrase:
+		case credential.KindLoginPassword, credential.KindPassphrase, credential.KindTOTPSecret, credential.KindChallengeAnswer:
 			ver, updateErr := updateNodeAuthCredentialTarget(cfg, target, expectedVersion, newRef)
 			if updateErr != nil {
 				return updateErr
@@ -1314,6 +1319,7 @@ func updateNodeAuthCredentialRef(
 	clearKeyPath bool,
 	clearLegacyLoginPassword bool,
 	clearLegacyPassphrase bool,
+	ruleName string,
 ) (string, error) {
 	node, ok := cfg.Nodes.Get(nodeID)
 	if !ok {
@@ -1347,34 +1353,10 @@ func updateNodeAuthCredentialRef(
 		cfg.Nodes.Set(nodeID, node)
 	}
 
-	if kind == credential.KindLoginPassword {
-		identity.LoginPasswordRef = newRef.Clone()
-		identity.Password = ""
-		if newRef != nil && !newRef.IsEmpty() {
-			identity.AuthType = "password"
-		}
-	} else {
-		identity.PassphraseRef = newRef.Clone()
-		identity.Passphrase = ""
-		if newRef != nil && !newRef.IsEmpty() {
-			identity.AuthType = "key"
-		}
+	if err := applyIdentityCredentialRefKind(&identity, kind, newRef, ruleName, node.IdentityRef); err != nil {
+		return "", err
 	}
-	if keyPath != "" {
-		identity.KeyPath = keyPath
-	}
-	if authType != "" {
-		identity.AuthType = authType
-	}
-	if clearKeyPath {
-		identity.KeyPath = ""
-	}
-	if clearLegacyLoginPassword {
-		identity.Password = ""
-	}
-	if clearLegacyPassphrase {
-		identity.Passphrase = ""
-	}
+	applyIdentityAuthModifications(&identity, keyPath, authType, clearKeyPath, clearLegacyLoginPassword, clearLegacyPassphrase)
 
 	cfg.Identities.Set(node.IdentityRef, identity)
 
@@ -1438,8 +1420,9 @@ func (r *Repository) updateIdentityCredentialRefAtVersionContext(ctx context.Con
 	if err := kind.Validate(); err != nil {
 		return MutationOutcome{}, "", err
 	}
-	if kind != credential.KindLoginPassword && kind != credential.KindPassphrase {
-		return MutationOutcome{}, "", fmt.Errorf("invalid credential kind %q for identity: only login_password and passphrase supported", kind)
+	if kind != credential.KindLoginPassword && kind != credential.KindPassphrase &&
+		kind != credential.KindTOTPSecret && kind != credential.KindChallengeAnswer {
+		return MutationOutcome{}, "", fmt.Errorf("invalid credential kind %q for identity", kind)
 	}
 	if newRef != nil {
 		if err := newRef.Validate(); err != nil {
@@ -1468,18 +1451,8 @@ func (r *Repository) updateIdentityCredentialRefAtVersionContext(ctx context.Con
 			}
 		}
 
-		if kind == credential.KindLoginPassword {
-			identity.LoginPasswordRef = newRef.Clone()
-			identity.Password = ""
-			if newRef != nil && !newRef.IsEmpty() {
-				identity.AuthType = "password"
-			}
-		} else {
-			identity.PassphraseRef = newRef.Clone()
-			identity.Passphrase = ""
-			if newRef != nil && !newRef.IsEmpty() {
-				identity.AuthType = "key"
-			}
+		if err := applyIdentityCredentialRefKind(&identity, kind, newRef, target.RuleName, identityID); err != nil {
+			return err
 		}
 
 		applyIdentityCredentialMetadata(&identity, target)
@@ -1638,13 +1611,7 @@ func isRefReferencedIn(cfg *Configuration, ref credential.Ref) bool {
 	if cfg.Identities != nil {
 		for _, k := range cfg.Identities.Keys() {
 			id, ok := cfg.Identities.Get(k)
-			if !ok {
-				continue
-			}
-			if id.LoginPasswordRef != nil && *id.LoginPasswordRef == ref {
-				return true
-			}
-			if id.PassphraseRef != nil && *id.PassphraseRef == ref {
+			if ok && isRefReferencedInIdentity(id, ref) {
 				return true
 			}
 		}
@@ -1653,16 +1620,119 @@ func isRefReferencedIn(cfg *Configuration, ref credential.Ref) bool {
 	if cfg.Nodes != nil {
 		for _, k := range cfg.Nodes.Keys() {
 			node, ok := cfg.Nodes.Get(k)
-			if !ok {
-				continue
-			}
-			if node.PrivilegePasswordRef != nil && *node.PrivilegePasswordRef == ref {
+			if ok && node.PrivilegePasswordRef != nil && *node.PrivilegePasswordRef == ref {
 				return true
 			}
 		}
 	}
 
 	return false
+}
+
+func isRefReferencedInIdentity(id models.Identity, ref credential.Ref) bool {
+	if id.LoginPasswordRef != nil && *id.LoginPasswordRef == ref {
+		return true
+	}
+	if id.PassphraseRef != nil && *id.PassphraseRef == ref {
+		return true
+	}
+	if id.OTP != nil && id.OTP.TOTPSecretRef != nil && *id.OTP.TOTPSecretRef == ref {
+		return true
+	}
+	if id.KeyboardInteractive != nil {
+		for _, r := range id.KeyboardInteractive.Rules {
+			if r.SecretRef != nil && *r.SecretRef == ref {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func applyIdentityCredentialRefKind(identity *models.Identity, kind credential.Kind, newRef *credential.Ref, ruleName, identityID string) error {
+	switch kind {
+	case credential.KindLoginPassword:
+		identity.LoginPasswordRef = newRef.Clone()
+		identity.Password = ""
+		if newRef != nil && !newRef.IsEmpty() && identity.AuthType != "keyboard-interactive" && identity.AuthType != "otp" {
+			identity.AuthType = "password"
+		}
+	case credential.KindPassphrase:
+		identity.PassphraseRef = newRef.Clone()
+		identity.Passphrase = ""
+		if newRef != nil && !newRef.IsEmpty() && identity.AuthType != "keyboard-interactive" && identity.AuthType != "otp" {
+			identity.AuthType = "key"
+		}
+	case credential.KindTOTPSecret:
+		return applyIdentityTOTPSecretRef(identity, newRef)
+	case credential.KindChallengeAnswer:
+		return applyIdentityChallengeAnswerRef(identity, newRef, ruleName, identityID)
+	}
+	return nil
+}
+
+func applyIdentityTOTPSecretRef(identity *models.Identity, newRef *credential.Ref) error {
+	if newRef == nil || newRef.IsEmpty() {
+		if identity.OTP != nil {
+			identity.OTP.TOTPSecretRef = nil
+			if strings.TrimSpace(identity.OTP.Command) == "" {
+				identity.OTP = nil
+			}
+		}
+		return nil
+	}
+	if identity.OTP == nil {
+		identity.OTP = &models.OTPConfig{}
+	}
+	identity.OTP.TOTPSecretRef = newRef.Clone()
+	identity.OTP.Command = ""
+	identity.OTP.Args = nil
+	if identity.AuthType == "" {
+		identity.AuthType = "otp"
+	}
+	return nil
+}
+
+func applyIdentityChallengeAnswerRef(identity *models.Identity, newRef *credential.Ref, ruleName, identityID string) error {
+	if ruleName == "" {
+		return fmt.Errorf("challenge_answer credential requires rule_name in target")
+	}
+	if identity.KeyboardInteractive == nil {
+		return fmt.Errorf("challenge rule %q not found in identity %q", ruleName, identityID)
+	}
+	for i := range identity.KeyboardInteractive.Rules {
+		if identity.KeyboardInteractive.Rules[i].Name != ruleName {
+			continue
+		}
+		if newRef == nil || newRef.IsEmpty() {
+			identity.KeyboardInteractive.Rules = slices.Delete(identity.KeyboardInteractive.Rules, i, i+1)
+			if len(identity.KeyboardInteractive.Rules) == 0 {
+				identity.KeyboardInteractive = nil
+			}
+		} else {
+			identity.KeyboardInteractive.Rules[i].SecretRef = newRef.Clone()
+		}
+		return nil
+	}
+	return fmt.Errorf("challenge rule %q not found in identity %q", ruleName, identityID)
+}
+
+func applyIdentityAuthModifications(identity *models.Identity, keyPath, authType string, clearKeyPath, clearLegacyLoginPassword, clearLegacyPassphrase bool) {
+	if keyPath != "" {
+		identity.KeyPath = keyPath
+	}
+	if authType != "" {
+		identity.AuthType = authType
+	}
+	if clearKeyPath {
+		identity.KeyPath = ""
+	}
+	if clearLegacyLoginPassword {
+		identity.Password = ""
+	}
+	if clearLegacyPassphrase {
+		identity.Passphrase = ""
+	}
 }
 
 func equalRef(actual, expected *credential.Ref) bool {
@@ -1692,6 +1762,29 @@ func confirmNodeRefDurable(diskCfg *Configuration, target credential.Target, ref
 			return false
 		}
 		return equalRef(identity.PassphraseRef, ref)
+	case credential.KindTOTPSecret:
+		identity, ok := diskCfg.Identities.Get(node.IdentityRef)
+		if !ok {
+			return false
+		}
+		if identity.OTP == nil {
+			return ref == nil || ref.IsEmpty()
+		}
+		return equalRef(identity.OTP.TOTPSecretRef, ref)
+	case credential.KindChallengeAnswer:
+		identity, ok := diskCfg.Identities.Get(node.IdentityRef)
+		if !ok {
+			return false
+		}
+		if identity.KeyboardInteractive == nil {
+			return ref == nil || ref.IsEmpty()
+		}
+		for _, r := range identity.KeyboardInteractive.Rules {
+			if r.Name == target.RuleName {
+				return equalRef(r.SecretRef, ref)
+			}
+		}
+		return ref == nil || ref.IsEmpty()
 	}
 	return false
 }
@@ -1706,6 +1799,21 @@ func confirmIdentityRefDurable(diskCfg *Configuration, target credential.Target,
 		return equalRef(identity.LoginPasswordRef, ref)
 	case credential.KindPassphrase:
 		return equalRef(identity.PassphraseRef, ref)
+	case credential.KindTOTPSecret:
+		if identity.OTP == nil {
+			return ref == nil || ref.IsEmpty()
+		}
+		return equalRef(identity.OTP.TOTPSecretRef, ref)
+	case credential.KindChallengeAnswer:
+		if identity.KeyboardInteractive == nil {
+			return ref == nil || ref.IsEmpty()
+		}
+		for _, r := range identity.KeyboardInteractive.Rules {
+			if r.Name == target.RuleName {
+				return equalRef(r.SecretRef, ref)
+			}
+		}
+		return ref == nil || ref.IsEmpty()
 	}
 	return false
 }
@@ -1822,7 +1930,7 @@ func applyIdentityCredentialMetadata(identity *models.Identity, target credentia
 }
 
 func updateNodeAuthCredentialTarget(cfg *Configuration, target credential.Target, expectedVersion string, newRef *credential.Ref) (string, error) {
-	version, err := updateNodeAuthCredentialRef(cfg, target.NodeID, expectedVersion, target.Kind, newRef, target.KeyPath, target.AuthType, target.ClearKeyPath, target.ClearLegacyLoginPassword, target.ClearLegacyPassphrase)
+	version, err := updateNodeAuthCredentialRef(cfg, target.NodeID, expectedVersion, target.Kind, newRef, target.KeyPath, target.AuthType, target.ClearKeyPath, target.ClearLegacyLoginPassword, target.ClearLegacyPassphrase, target.RuleName)
 	if err != nil || target.KeyFingerprint == "" {
 		return version, err
 	}

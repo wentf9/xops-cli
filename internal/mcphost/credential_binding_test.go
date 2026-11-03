@@ -20,10 +20,41 @@ import (
 func credentialBindingConfig() *config.Configuration {
 	cfg := config.NewProviderWithoutOpenSSH(nil).Snapshot()
 	cfg.Guardrail = &corepolicy.Config{Enabled: false}
-	cfg.Credential = &config.CredentialConfig{Stores: map[string]config.StoreConfig{"fixture": {Type: config.StoreTypeHelper, Command: "original-helper"}, "unused": {Type: config.StoreTypeNone}}}
+	cfg.Credential = &config.CredentialConfig{
+		Stores: map[string]config.StoreConfig{
+			"fixture":         {Type: config.StoreTypeHelper, Command: "original-helper"},
+			"totp-store":      {Type: config.StoreTypeHelper, Command: "totp-helper"},
+			"challenge-store": {Type: config.StoreTypeHelper, Command: "challenge-helper"},
+			"unused":          {Type: config.StoreTypeNone},
+		},
+	}
 	cfg.Hosts.Set("host", models.Host{Address: "192.0.2.1", Port: 22})
-	cfg.Identities.Set("identity", models.Identity{User: "fixture", AuthType: "password", LoginPasswordRef: &credential.Ref{StoreID: "fixture", ItemID: "login-1"}, PassphraseRef: &credential.Ref{StoreID: "fixture", ItemID: "passphrase-1"}, KeyFingerprint: "fingerprint-1"})
-	cfg.Nodes.Set("node", models.Node{HostRef: "host", IdentityRef: "identity", SudoMode: models.SudoModeSu, PrivilegePasswordRef: &credential.Ref{StoreID: "fixture", ItemID: "privilege-1"}})
+	cfg.Identities.Set("identity", models.Identity{
+		User:             "fixture",
+		AuthType:         "password",
+		LoginPasswordRef: &credential.Ref{StoreID: "fixture", ItemID: "login-1"},
+		PassphraseRef:    &credential.Ref{StoreID: "fixture", ItemID: "passphrase-1"},
+		KeyFingerprint:   "fingerprint-1",
+		OTP: &models.OTPConfig{
+			TOTPSecretRef: &credential.Ref{StoreID: "totp-store", ItemID: "totp-1"},
+		},
+		KeyboardInteractive: &models.KeyboardInteractiveConfig{
+			Rules: []models.ChallengeRule{
+				{
+					Name:          "rule-1",
+					PromptPattern: "^Verification code:",
+					Source:        models.ChallengeSourceSecret,
+					SecretRef:     &credential.Ref{StoreID: "challenge-store", ItemID: "answer-1"},
+				},
+			},
+		},
+	})
+	cfg.Nodes.Set("node", models.Node{
+		HostRef:              "host",
+		IdentityRef:          "identity",
+		SudoMode:             models.SudoModeSu,
+		PrivilegePasswordRef: &credential.Ref{StoreID: "fixture", ItemID: "privilege-1"},
+	})
 	return cfg
 }
 
@@ -59,13 +90,33 @@ func persistedAdmission(t *testing.T, ctx context.Context, host *host) ports.Adm
 
 func TestCLIRecoveryBindsCredentialDependenciesWithoutUpdateRef(t *testing.T) {
 	for _, frozen := range []bool{false, true} {
-		for _, edit := range []string{"login-ref", "passphrase-ref", "privilege-ref", "fingerprint", "password", "passphrase", "su-password", "identity-ref", "store", "jump-login-ref", "display-only", "unused-store"} {
+		for _, edit := range []string{
+			"login-ref", "passphrase-ref", "privilege-ref", "fingerprint",
+			"password", "passphrase", "su-password", "identity-ref", "store",
+			"jump-login-ref", "display-only", "unused-store",
+			"totp-ref", "totp-command", "totp-store",
+			"challenge-ref", "challenge-command", "challenge-rule-added", "challenge-store",
+			"jump-totp-ref", "jump-challenge-ref",
+		} {
 			t.Run(edit+map[bool]string{false: "-provider", true: "-frozen"}[frozen], func(t *testing.T) {
 				ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 				defer cancel()
 				cfg := credentialBindingConfig()
 				jumpIdentity, _ := cfg.Identities.Get("identity")
 				jumpIdentity.LoginPasswordRef = &credential.Ref{StoreID: "fixture", ItemID: "jump-login-1"}
+				jumpIdentity.OTP = &models.OTPConfig{
+					TOTPSecretRef: &credential.Ref{StoreID: "totp-store", ItemID: "jump-totp-1"},
+				}
+				jumpIdentity.KeyboardInteractive = &models.KeyboardInteractiveConfig{
+					Rules: []models.ChallengeRule{
+						{
+							Name:          "jump-rule-1",
+							PromptPattern: "^Jump code:",
+							Source:        models.ChallengeSourceSecret,
+							SecretRef:     &credential.Ref{StoreID: "challenge-store", ItemID: "jump-answer-1"},
+						},
+					},
+				}
 				cfg.Identities.Set("jump-identity", jumpIdentity)
 				cfg.Nodes.Set("jump", models.Node{HostRef: "host", IdentityRef: "jump-identity"})
 				node, _ := cfg.Nodes.Get("node")
@@ -100,6 +151,7 @@ func assertAdmission(t *testing.T, ctx context.Context, host *host, admission po
 	}
 }
 
+//nolint:gocyclo // Test helper managing mutation scenarios for connection dependency binding
 func editCredentialBinding(cfg *config.Configuration, edit string) {
 	node, _ := cfg.Nodes.Get("node")
 	identity, _ := cfg.Identities.Get("identity")
@@ -134,6 +186,47 @@ func editCredentialBinding(cfg *config.Configuration, edit string) {
 		node.Tags = []string{"display-tag"}
 	case "unused-store":
 		cfg.Credential.Stores["unused"] = config.StoreConfig{Type: config.StoreTypeHelper, Command: "unused-helper"}
+	case "totp-ref":
+		identity.OTP.TOTPSecretRef = &credential.Ref{StoreID: "totp-store", ItemID: "totp-2"}
+	case "totp-command":
+		identity.OTP.Command = "/usr/bin/get-totp"
+	case "totp-store":
+		store := cfg.Credential.Stores["totp-store"]
+		store.Command = "replacement-totp-helper"
+		cfg.Credential.Stores["totp-store"] = store
+	case "challenge-ref":
+		identity.KeyboardInteractive.Rules[0].SecretRef = &credential.Ref{StoreID: "challenge-store", ItemID: "answer-2"}
+	case "challenge-command":
+		identity.KeyboardInteractive.Rules[0].Command = "/usr/bin/get-answer"
+	case "challenge-rule-added":
+		identity.KeyboardInteractive.Rules = append(identity.KeyboardInteractive.Rules, models.ChallengeRule{
+			Name:          "rule-2",
+			PromptPattern: "^Second factor:",
+			Source:        models.ChallengeSourceOTP,
+		})
+	case "challenge-store":
+		store := cfg.Credential.Stores["challenge-store"]
+		store.Command = "replacement-challenge-helper"
+		cfg.Credential.Stores["challenge-store"] = store
+	case "jump-totp-ref":
+		jump, _ := cfg.Identities.Get("jump-identity")
+		jump.OTP = &models.OTPConfig{
+			TOTPSecretRef: &credential.Ref{StoreID: "totp-store", ItemID: "jump-totp-2"},
+		}
+		cfg.Identities.Set("jump-identity", jump)
+	case "jump-challenge-ref":
+		jump, _ := cfg.Identities.Get("jump-identity")
+		jump.KeyboardInteractive = &models.KeyboardInteractiveConfig{
+			Rules: []models.ChallengeRule{
+				{
+					Name:          "jump-rule-1",
+					PromptPattern: "^Jump code:",
+					Source:        models.ChallengeSourceSecret,
+					SecretRef:     &credential.Ref{StoreID: "challenge-store", ItemID: "jump-answer-2"},
+				},
+			},
+		}
+		cfg.Identities.Set("jump-identity", jump)
 	}
 	cfg.Nodes.Set("node", node)
 	cfg.Identities.Set("identity", identity)

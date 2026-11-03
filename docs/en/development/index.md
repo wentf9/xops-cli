@@ -30,6 +30,7 @@ Each document states its implementation status and validation scope.
 - [SSH execution compatibility implementation plan](./ssh-execution-implementation.md)
 - [SSH interpreter and launch dialect automated probing design](./ssh-execution-probe-design.md)
 - [SSH execution probing implementation record (M1–M4)](./ssh-execution-probe-implementation.md)
+- [SSH OTP and keyboard-interactive login design](./ssh-otp-keyboard-interactive-design.md)
 - [Shared core and MCP interface decoupling](./shared-core-decoupling)
 - [MCP Streamable HTTP and file streaming design](./mcp-http-transfer-design.md)
 - [Minimalist all-in-one MCP tool architecture refactoring design](./mcp-minimal-tools-design.md)

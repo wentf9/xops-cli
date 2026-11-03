@@ -415,37 +415,41 @@ func resolveKeyAuthMethod(keyPath string, secProvider *autoSecretProvider, passp
 
 // AutoAuthOptions 封装 auto 认证的完整上下文选项。
 type AutoAuthOptions struct {
-	AgentSocket        string
-	DefaultKeyPaths    []string
-	ResolveKeyPath     func(string) string
-	LifecycleCtx       context.Context
-	NodeID             string
-	User               string
-	Host               string
-	Port               int
-	VersionToken       string
-	Resolver           SecretResolver
-	Prompter           SecretPrompter
-	HandshakeTimeout   time.Duration
-	InteractionTimeout time.Duration
-	FailClosed         func(error)
-	RecoveryPrompter   SecretPrompter
-	KeyPath            string
-	PasswordCallback   func(string)
-	PassphraseCallback func(keyPath, passphrase string)
-	Logger             logger.DebugLogger
-	Diagnostics        logger.DiagnosticObserver
+	AgentSocket               string
+	DefaultKeyPaths           []string
+	ResolveKeyPath            func(string) string
+	LifecycleCtx              context.Context
+	NodeID                    string
+	User                      string
+	Host                      string
+	Port                      int
+	VersionToken              string
+	Resolver                  SecretResolver
+	Prompter                  SecretPrompter
+	HandshakeTimeout          time.Duration
+	InteractionTimeout        time.Duration
+	FailClosed                func(error)
+	RecoveryPrompter          SecretPrompter
+	KeyPath                   string
+	PasswordCallback          func(string)
+	PassphraseCallback        func(keyPath, passphrase string)
+	CandidateRejectedCallback func(protocol string)
+	Logger                    logger.DebugLogger
+	Diagnostics               logger.DiagnosticObserver
 }
 
 const (
-	autoAuthProtocolPublicKey = "publickey"
-	autoAuthProtocolPassword  = "password"
+	autoAuthProtocolPublicKey           = "publickey"
+	autoAuthProtocolPassword            = "password"
+	autoAuthProtocolKeyboardInteractive = "keyboard-interactive"
 )
 
 type autoAuthCandidate struct {
-	protocol string
-	label    string
-	method   ssh.AuthMethod
+	protocol   string
+	label      string
+	method     ssh.AuthMethod
+	allow      func(*ssh.ClientAuthContext) bool
+	onRejected func()
 }
 
 type autoAuthPlan struct {
@@ -489,8 +493,10 @@ func newSequentialAuthCallback(candidates []autoAuthCandidate, secProvider *auto
 	}
 
 	next := 0
+	lastStage := 0
 	selected := false
 	negotiated := false
+	var activeCandidate *autoAuthCandidate
 	return func(ctx *ssh.ClientAuthContext) (ssh.AuthMethod, error) {
 		var observer logger.DiagnosticObserver
 		if len(observers) > 0 {
@@ -508,24 +514,38 @@ func newSequentialAuthCallback(candidates []autoAuthCandidate, secProvider *auto
 			}
 		}
 
+		stage := len(ctx.PartialSuccessMethods)
+		if stage > lastStage {
+			lastStage = stage
+			next = 0
+			selected = false
+			activeCandidate = nil
+		} else if activeCandidate != nil {
+			if activeCandidate.onRejected != nil {
+				activeCandidate.onRejected()
+			}
+			activeCandidate = nil
+		}
+
 		for next < len(candidates) {
 			candidate := candidates[next]
 			next++
 
-			if !slices.Contains(ctx.AllowedMethods, candidate.protocol) {
+			if !slices.Contains(ctx.AllowedMethods, candidate.protocol) || (candidate.allow != nil && !candidate.allow(ctx)) {
 				l.Debugf("Skipping SSH auth candidate %q: server allows %v", candidate.label, ctx.AllowedMethods)
 				continue
 			}
 
 			l.Debugf("Trying SSH auth candidate: %s", candidate.label)
 			selected = true
+			activeCandidate = &candidate
 			event.Kind, event.Method, event.Methods = logger.AuthenticationAttempt, candidate.protocol, nil
 			logger.EmitDiagnostic(observer, event)
 			return candidate.method, nil
 		}
 
 		if !selected {
-			return nil, fmt.Errorf("server permits SSH authentication methods %v, but no matching local key, agent or password method is available", ctx.AllowedMethods)
+			return nil, fmt.Errorf("server permits SSH authentication methods %v, but no matching local key, agent, password or keyboard-interactive method is available", ctx.AllowedMethods)
 		}
 		return nil, nil
 	}
@@ -562,9 +582,15 @@ func buildAutoAuthPlan(ctx context.Context, opts AutoAuthOptions, first ...ssh.A
 		recoveryPrompter:   opts.RecoveryPrompter,
 	}
 
+	rejectPublicKey := func() {
+		if opts.CandidateRejectedCallback != nil {
+			opts.CandidateRejectedCallback(autoAuthProtocolPublicKey)
+		}
+	}
+
 	var candidates []autoAuthCandidate
 	for _, method := range first {
-		candidates = append(candidates, autoAuthCandidate{protocol: autoAuthProtocolPublicKey, label: "explicit signer", method: method})
+		candidates = append(candidates, autoAuthCandidate{protocol: autoAuthProtocolPublicKey, label: "explicit signer", method: method, onRejected: rejectPublicKey})
 	}
 	var cleanup func()
 	seenKeyPaths := make(map[string]struct{})
@@ -596,9 +622,10 @@ func buildAutoAuthPlan(ctx context.Context, opts AutoAuthOptions, first ...ssh.A
 		}
 
 		candidates = append(candidates, autoAuthCandidate{
-			protocol: autoAuthProtocolPublicKey,
-			label:    label + ": " + keyPath,
-			method:   method,
+			protocol:   autoAuthProtocolPublicKey,
+			label:      label + ": " + keyPath,
+			method:     method,
+			onRejected: rejectPublicKey,
 		})
 	}
 
@@ -646,6 +673,18 @@ func buildAutoAuthPlan(ctx context.Context, opts AutoAuthOptions, first ...ssh.A
 		protocol: autoAuthProtocolPassword,
 		label:    "password",
 		method:   passwordMethod,
+		onRejected: func() {
+			if opts.CandidateRejectedCallback != nil {
+				opts.CandidateRejectedCallback(autoAuthProtocolPassword)
+			}
+		},
+	})
+
+	kbMethod := buildKeyboardInteractiveAuthMethod(secProvider)
+	candidates = append(candidates, autoAuthCandidate{
+		protocol: autoAuthProtocolKeyboardInteractive,
+		label:    "keyboard-interactive",
+		method:   kbMethod,
 	})
 
 	return autoAuthPlan{

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -1536,5 +1537,722 @@ func TestSSHAdapter_GetConfig_ExecutionResolution(t *testing.T) {
 				t.Errorf("launchDialect = %q, want %q", clientCfg.Execution.LaunchDialect, tc.wantDial)
 			}
 		})
+	}
+}
+
+func TestAdapterAnswerCommandHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_ADAPTER_COMMAND_HELPER") != "1" {
+		return
+	}
+	mode := os.Getenv("ADAPTER_HELPER_MODE")
+	switch mode {
+	case "otp_fixed":
+		fmt.Println("789123")
+		os.Exit(0)
+	case "pin_fixed":
+		fmt.Println("secret-pin-42")
+		os.Exit(0)
+	case "verify_env":
+		if os.Getenv("XOPS_NODE") != "node-cmd" {
+			fmt.Fprintf(os.Stderr, "unexpected XOPS_NODE: %q\n", os.Getenv("XOPS_NODE"))
+			os.Exit(1)
+		}
+		if os.Getenv("XOPS_PROMPT") != "Enter Security PIN:" {
+			fmt.Fprintf(os.Stderr, "unexpected XOPS_PROMPT: %q\n", os.Getenv("XOPS_PROMPT"))
+			os.Exit(2)
+		}
+		if os.Getenv("XOPS_ECHO") != "true" {
+			fmt.Fprintf(os.Stderr, "unexpected XOPS_ECHO: %q\n", os.Getenv("XOPS_ECHO"))
+			os.Exit(3)
+		}
+		fmt.Println("env-verified-pin")
+		os.Exit(0)
+	case "fail":
+		fmt.Fprintln(os.Stderr, "external helper command error")
+		os.Exit(1)
+	default:
+		os.Exit(99)
+	}
+}
+
+func TestSSHAdapter_ResolveSecret_OTP(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Session override precedence over configured TOTP
+	t.Run("SessionOverride_Precedence", func(t *testing.T) {
+		cfg := newTestAdapterConfig("node1", models.Identity{
+			User:     "ops",
+			AuthType: "otp",
+			OTP: &models.OTPConfig{
+				TOTPSecretRef: &credential.Ref{StoreID: "default", ItemID: "totp-item"},
+			},
+		})
+		store := &adapterCredentialStore{data: map[string]credential.Secret{
+			"totp-item": credential.NewSecret([]byte("JBSWY3DPEHPK3PXP")),
+		}}
+		reg := credential.NewRegistry()
+		_ = reg.Register("default", store)
+		adp := NewSSHAdapter(config.NewProviderWithoutOpenSSH(cfg),
+			WithCredentialSource(reg),
+			WithSessionAuthOverride("node1", SessionAuth{OTP: "999888"}),
+		)
+
+		otp, err := adp.ResolveSecret(ctx, ssh.SecretRequest{Kind: ssh.SecretKindOTP, NodeID: "node1"})
+		if err != nil {
+			t.Fatalf("expected success, got %v", err)
+		}
+		if string(otp) != "999888" {
+			t.Fatalf("expected session override '999888', got %q", string(otp))
+		}
+	})
+
+	// 2. Global session override fallback
+	t.Run("GlobalSessionOverride_Fallback", func(t *testing.T) {
+		cfg := newTestAdapterConfig("node1", models.Identity{User: "ops", AuthType: "otp"})
+		adp := NewSSHAdapter(config.NewProviderWithoutOpenSSH(cfg),
+			WithGlobalSessionAuth(SessionAuth{OTP: "111222"}),
+		)
+		otp, err := adp.ResolveSecret(ctx, ssh.SecretRequest{Kind: ssh.SecretKindOTP, NodeID: "node1"})
+		if err != nil {
+			t.Fatalf("expected success, got %v", err)
+		}
+		if string(otp) != "111222" {
+			t.Fatalf("expected global override '111222', got %q", string(otp))
+		}
+	})
+
+	// 3. TOTP Secret Ref generation with Base32 seed
+	t.Run("TOTPSecretRef_Success", func(t *testing.T) {
+		rawSeed := "JBSWY3DPEHPK3PXP" // standard Base32 seed
+		cfg := newTestAdapterConfig("node1", models.Identity{
+			User:     "ops",
+			AuthType: "otp",
+			OTP: &models.OTPConfig{
+				TOTPSecretRef: &credential.Ref{StoreID: "default", ItemID: "totp-seed"},
+			},
+		})
+		store := &adapterCredentialStore{data: map[string]credential.Secret{
+			"totp-seed": credential.NewSecret([]byte(rawSeed)),
+		}}
+		reg := credential.NewRegistry()
+		_ = reg.Register("default", store)
+		adp := NewSSHAdapter(config.NewProviderWithoutOpenSSH(cfg), WithCredentialSource(reg))
+
+		before := time.Now()
+		otp, err := adp.ResolveSecret(ctx, ssh.SecretRequest{Kind: ssh.SecretKindOTP, NodeID: "node1"})
+		if err != nil {
+			t.Fatalf("ResolveSecret OTP failed: %v", err)
+		}
+		expectedOTP, _ := coreauth.GenerateTOTP(rawSeed, before)
+		if string(otp) != expectedOTP {
+			t.Fatalf("expected TOTP %q, got %q", expectedOTP, string(otp))
+		}
+	})
+
+	// 4. TOTP Secret Ref with otpauth:// URI
+	t.Run("TOTPSecretRef_URI", func(t *testing.T) {
+		uri := "otpauth://totp/Acme:ops@example.com?secret=JBSWY3DPEHPK3PXP&digits=8"
+		cfg := newTestAdapterConfig("node1", models.Identity{
+			User:     "ops",
+			AuthType: "otp",
+			OTP: &models.OTPConfig{
+				TOTPSecretRef: &credential.Ref{StoreID: "default", ItemID: "uri-seed"},
+			},
+		})
+		store := &adapterCredentialStore{data: map[string]credential.Secret{
+			"uri-seed": credential.NewSecret([]byte(uri)),
+		}}
+		reg := credential.NewRegistry()
+		_ = reg.Register("default", store)
+		adp := NewSSHAdapter(config.NewProviderWithoutOpenSSH(cfg), WithCredentialSource(reg))
+
+		otp, err := adp.ResolveSecret(ctx, ssh.SecretRequest{Kind: ssh.SecretKindOTP, NodeID: "node1"})
+		if err != nil {
+			t.Fatalf("ResolveSecret OTP failed: %v", err)
+		}
+		if len(otp) != 8 {
+			t.Fatalf("expected 8-digit OTP from URI config, got %q (len %d)", string(otp), len(otp))
+		}
+	})
+
+	// 5. TOTP missing credential resolver
+	t.Run("TOTPSecretRef_NoResolverAvailable", func(t *testing.T) {
+		cfg := newTestAdapterConfig("node1", models.Identity{
+			User: "ops",
+			OTP: &models.OTPConfig{
+				TOTPSecretRef: &credential.Ref{StoreID: "default", ItemID: "totp-seed"},
+			},
+		})
+		adp := NewSSHAdapter(config.NewProviderWithoutOpenSSH(cfg)) // No WithCredentialSource
+		_, err := adp.ResolveSecret(ctx, ssh.SecretRequest{Kind: ssh.SecretKindOTP, NodeID: "node1"})
+		if !errors.Is(err, coreauth.ErrCredentialStoreUnavailable) {
+			t.Fatalf("expected ErrCredentialStoreUnavailable, got %v", err)
+		}
+	})
+
+	// 6. External OTP Command execution
+	t.Run("ExternalCommand_Success", func(t *testing.T) {
+		t.Setenv("GO_WANT_ADAPTER_COMMAND_HELPER", "1")
+		t.Setenv("ADAPTER_HELPER_MODE", "otp_fixed")
+
+		cfg := newTestAdapterConfig("node1", models.Identity{
+			User: "ops",
+			OTP: &models.OTPConfig{
+				Command: os.Args[0],
+				Args:    []string{"-test.run=^TestAdapterAnswerCommandHelperProcess$", "--"},
+				Timeout: 5 * time.Second,
+			},
+		})
+		adp := NewSSHAdapter(config.NewProviderWithoutOpenSSH(cfg))
+		otp, err := adp.ResolveSecret(ctx, ssh.SecretRequest{Kind: ssh.SecretKindOTP, NodeID: "node1"})
+		if err != nil {
+			t.Fatalf("ResolveSecret external OTP command failed: %v", err)
+		}
+		if string(otp) != "789123" {
+			t.Fatalf("expected command output '789123', got %q", string(otp))
+		}
+	})
+
+	// 7. External OTP Command failure
+	t.Run("ExternalCommand_Failure", func(t *testing.T) {
+		t.Setenv("GO_WANT_ADAPTER_COMMAND_HELPER", "1")
+		t.Setenv("ADAPTER_HELPER_MODE", "fail")
+
+		cfg := newTestAdapterConfig("node1", models.Identity{
+			User: "ops",
+			OTP: &models.OTPConfig{
+				Command: os.Args[0],
+				Args:    []string{"-test.run=^TestAdapterAnswerCommandHelperProcess$", "--"},
+				Timeout: 5 * time.Second,
+			},
+		})
+		adp := NewSSHAdapter(config.NewProviderWithoutOpenSSH(cfg))
+		_, err := adp.ResolveSecret(ctx, ssh.SecretRequest{Kind: ssh.SecretKindOTP, NodeID: "node1"})
+		if err == nil {
+			t.Fatal("expected command execution error, got nil")
+		}
+	})
+
+	// 8. Unconfigured OTP returns ErrInteractionRequired
+	t.Run("Unconfigured_InteractionRequired", func(t *testing.T) {
+		cfg := newTestAdapterConfig("node1", models.Identity{User: "ops"})
+		adp := NewSSHAdapter(config.NewProviderWithoutOpenSSH(cfg))
+		_, err := adp.ResolveSecret(ctx, ssh.SecretRequest{Kind: ssh.SecretKindOTP, NodeID: "node1"})
+		if !errors.Is(err, ssh.ErrInteractionRequired) {
+			t.Fatalf("expected ErrInteractionRequired, got %v", err)
+		}
+	})
+
+	// 9. Anti-loop on Attempt > 1
+	t.Run("AntiLoop_AttemptGreaterThanOne", func(t *testing.T) {
+		cfg := newTestAdapterConfig("node1", models.Identity{
+			User: "ops",
+			OTP: &models.OTPConfig{
+				TOTPSecretRef: &credential.Ref{StoreID: "default", ItemID: "seed"},
+			},
+		})
+		adp := NewSSHAdapter(config.NewProviderWithoutOpenSSH(cfg),
+			WithSessionAuthOverride("node1", SessionAuth{OTP: "123456"}),
+		)
+		_, err := adp.ResolveSecret(ctx, ssh.SecretRequest{
+			Kind:    ssh.SecretKindOTP,
+			NodeID:  "node1",
+			Attempt: 2,
+		})
+		if !errors.Is(err, ssh.ErrInteractionRequired) {
+			t.Fatalf("expected ErrInteractionRequired on Attempt > 1, got %v", err)
+		}
+	})
+}
+
+//nolint:gocyclo // Subtests comprehensively verify keyboard-interactive rule evaluation matrix
+func TestSSHAdapter_ResolveSecret_KeyboardInteractive(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Anti-loop protection: Attempt > 1 breaks immediately
+	t.Run("AntiLoop_AttemptGreaterThanOne", func(t *testing.T) {
+		cfg := newTestAdapterConfig("node1", models.Identity{
+			User: "ops",
+			KeyboardInteractive: &models.KeyboardInteractiveConfig{
+				Rules: []models.ChallengeRule{
+					{
+						Name:          "rule-pwd",
+						PromptPattern: ".*",
+						Source:        models.ChallengeSourceLoginPassword,
+					},
+				},
+			},
+			Password: "my-password",
+		})
+		adp := NewSSHAdapter(config.NewProviderWithoutOpenSSH(cfg))
+
+		// Attempt 1 resolves
+		ans, err := adp.ResolveSecret(ctx, ssh.SecretRequest{
+			Kind:    ssh.SecretKindKeyboardInteractive,
+			NodeID:  "node1",
+			Prompt:  "Password:",
+			Attempt: 1,
+		})
+		if err != nil || string(ans) != "my-password" {
+			t.Fatalf("attempt 1 failed: err=%v, ans=%q", err, string(ans))
+		}
+
+		// Attempt 2 returns ErrInteractionRequired
+		_, err = adp.ResolveSecret(ctx, ssh.SecretRequest{
+			Kind:    ssh.SecretKindKeyboardInteractive,
+			NodeID:  "node1",
+			Prompt:  "Password:",
+			Attempt: 2,
+		})
+		if !errors.Is(err, ssh.ErrInteractionRequired) {
+			t.Fatalf("attempt 2 must return ErrInteractionRequired, got %v", err)
+		}
+	})
+
+	// 2. Rule matching: Source LoginPassword
+	t.Run("Rule_SourceLoginPassword", func(t *testing.T) {
+		cfg := newTestAdapterConfig("node1", models.Identity{
+			User: "ops",
+			KeyboardInteractive: &models.KeyboardInteractiveConfig{
+				Rules: []models.ChallengeRule{
+					{
+						Name:          "unix-pwd",
+						PromptPattern: "^Password:\\s*$",
+						Source:        models.ChallengeSourceLoginPassword,
+					},
+				},
+			},
+			Password: "login-secret-pass",
+		})
+		adp := NewSSHAdapter(config.NewProviderWithoutOpenSSH(cfg))
+		ans, err := adp.ResolveSecret(ctx, ssh.SecretRequest{
+			Kind:    ssh.SecretKindKeyboardInteractive,
+			NodeID:  "node1",
+			Prompt:  "Password: ",
+			Attempt: 1,
+		})
+		if err != nil {
+			t.Fatalf("expected success, got %v", err)
+		}
+		if string(ans) != "login-secret-pass" {
+			t.Fatalf("expected 'login-secret-pass', got %q", string(ans))
+		}
+	})
+
+	// 3. Rule matching: Source OTP
+	t.Run("Rule_SourceOTP", func(t *testing.T) {
+		rawSeed := "JBSWY3DPEHPK3PXP"
+		cfg := newTestAdapterConfig("node1", models.Identity{
+			User: "ops",
+			OTP: &models.OTPConfig{
+				TOTPSecretRef: &credential.Ref{StoreID: "default", ItemID: "totp-seed"},
+			},
+			KeyboardInteractive: &models.KeyboardInteractiveConfig{
+				Rules: []models.ChallengeRule{
+					{
+						Name:          "google-auth",
+						PromptPattern: "^Verification code:\\s*$",
+						Source:        models.ChallengeSourceOTP,
+					},
+				},
+			},
+		})
+		store := &adapterCredentialStore{data: map[string]credential.Secret{
+			"totp-seed": credential.NewSecret([]byte(rawSeed)),
+		}}
+		reg := credential.NewRegistry()
+		_ = reg.Register("default", store)
+		adp := NewSSHAdapter(config.NewProviderWithoutOpenSSH(cfg), WithCredentialSource(reg))
+
+		before := time.Now()
+		ans, err := adp.ResolveSecret(ctx, ssh.SecretRequest{
+			Kind:    ssh.SecretKindKeyboardInteractive,
+			NodeID:  "node1",
+			Prompt:  "Verification code: ",
+			Attempt: 1,
+		})
+		if err != nil {
+			t.Fatalf("expected success, got %v", err)
+		}
+		expectedOTP, _ := coreauth.GenerateTOTP(rawSeed, before)
+		if string(ans) != expectedOTP {
+			t.Fatalf("expected OTP %q, got %q", expectedOTP, string(ans))
+		}
+	})
+
+	// 4. Rule matching: Source Secret (Challenge Answer from Credential Store)
+	t.Run("Rule_SourceSecret", func(t *testing.T) {
+		cfg := newTestAdapterConfig("node1", models.Identity{
+			User: "ops",
+			KeyboardInteractive: &models.KeyboardInteractiveConfig{
+				Rules: []models.ChallengeRule{
+					{
+						Name:          "dept-challenge",
+						PromptPattern: "^Department Code:\\s*$",
+						Source:        models.ChallengeSourceSecret,
+						SecretRef:     &credential.Ref{StoreID: "default", ItemID: "dept-ans-123"},
+					},
+				},
+			},
+		})
+		store := &adapterCredentialStore{data: map[string]credential.Secret{
+			"dept-ans-123": credential.NewSecret([]byte("ENGINEERING-99")),
+		}}
+		reg := credential.NewRegistry()
+		_ = reg.Register("default", store)
+		adp := NewSSHAdapter(config.NewProviderWithoutOpenSSH(cfg), WithCredentialSource(reg))
+
+		ans, err := adp.ResolveSecret(ctx, ssh.SecretRequest{
+			Kind:    ssh.SecretKindKeyboardInteractive,
+			NodeID:  "node1",
+			Prompt:  "Department Code: ",
+			Attempt: 1,
+		})
+		if err != nil {
+			t.Fatalf("expected success, got %v", err)
+		}
+		if string(ans) != "ENGINEERING-99" {
+			t.Fatalf("expected 'ENGINEERING-99', got %q", string(ans))
+		}
+	})
+
+	// 5. Rule matching: Source Command with Context Environment Injection
+	t.Run("Rule_SourceCommand_ContextEnv", func(t *testing.T) {
+		t.Setenv("GO_WANT_ADAPTER_COMMAND_HELPER", "1")
+		t.Setenv("ADAPTER_HELPER_MODE", "verify_env")
+
+		cfg := newTestAdapterConfig("node-cmd", models.Identity{
+			User: "ops",
+			KeyboardInteractive: &models.KeyboardInteractiveConfig{
+				Rules: []models.ChallengeRule{
+					{
+						Name:          "env-pin",
+						PromptPattern: "^Enter Security PIN:",
+						Source:        models.ChallengeSourceCommand,
+						Command:       os.Args[0],
+						Args:          []string{"-test.run=^TestAdapterAnswerCommandHelperProcess$", "--"},
+						Timeout:       5 * time.Second,
+					},
+				},
+			},
+		})
+		adp := NewSSHAdapter(config.NewProviderWithoutOpenSSH(cfg))
+		ans, err := adp.ResolveSecret(ctx, ssh.SecretRequest{
+			Kind:        ssh.SecretKindKeyboardInteractive,
+			NodeID:      "node-cmd",
+			Prompt:      "Enter Security PIN:",
+			Instruction: "Two-Factor Gateway",
+			Echo:        true,
+			Attempt:     1,
+		})
+		if err != nil {
+			t.Fatalf("execute command rule failed: %v", err)
+		}
+		if string(ans) != "env-verified-pin" {
+			t.Fatalf("expected 'env-verified-pin', got %q", string(ans))
+		}
+	})
+
+	// 6. Sequential rule order: first match wins
+	t.Run("Rule_SequentialEvaluation_FirstMatchWins", func(t *testing.T) {
+		cfg := newTestAdapterConfig("node1", models.Identity{
+			User: "ops",
+			KeyboardInteractive: &models.KeyboardInteractiveConfig{
+				Rules: []models.ChallengeRule{
+					{
+						Name:          "rule-1",
+						PromptPattern: "Code",
+						Source:        models.ChallengeSourceLoginPassword,
+					},
+					{
+						Name:          "rule-2",
+						PromptPattern: "Verification Code",
+						Source:        models.ChallengeSourceCommand,
+					},
+				},
+			},
+			Password: "first-rule-answer",
+		})
+		adp := NewSSHAdapter(config.NewProviderWithoutOpenSSH(cfg))
+		ans, err := adp.ResolveSecret(ctx, ssh.SecretRequest{
+			Kind:    ssh.SecretKindKeyboardInteractive,
+			NodeID:  "node1",
+			Prompt:  "Enter Verification Code:",
+			Attempt: 1,
+		})
+		if err != nil {
+			t.Fatalf("expected success, got %v", err)
+		}
+		if string(ans) != "first-rule-answer" {
+			t.Fatalf("expected Rule 1 to win ('first-rule-answer'), got %q", string(ans))
+		}
+	})
+
+	// 7. InstructionPattern matching
+	t.Run("Rule_InstructionPattern_Filtering", func(t *testing.T) {
+		cfg := newTestAdapterConfig("node1", models.Identity{
+			User: "ops",
+			KeyboardInteractive: &models.KeyboardInteractiveConfig{
+				Rules: []models.ChallengeRule{
+					{
+						Name:               "duo-only",
+						PromptPattern:      "^Passcode:",
+						InstructionPattern: "Duo Security",
+						Source:             models.ChallengeSourceLoginPassword,
+					},
+				},
+			},
+			Password: "duo-password",
+		})
+		adp := NewSSHAdapter(config.NewProviderWithoutOpenSSH(cfg))
+
+		// Mismatched instruction -> rule skipped -> ErrInteractionRequired
+		_, err := adp.ResolveSecret(ctx, ssh.SecretRequest{
+			Kind:        ssh.SecretKindKeyboardInteractive,
+			NodeID:      "node1",
+			Prompt:      "Passcode:",
+			Instruction: "Standard Login Prompt",
+			Attempt:     1,
+		})
+		if !errors.Is(err, ssh.ErrInteractionRequired) {
+			t.Fatalf("expected ErrInteractionRequired when instruction doesn't match, got %v", err)
+		}
+
+		// Matched instruction -> rule applies
+		ans, err := adp.ResolveSecret(ctx, ssh.SecretRequest{
+			Kind:        ssh.SecretKindKeyboardInteractive,
+			NodeID:      "node1",
+			Prompt:      "Passcode:",
+			Instruction: "Duo Security Authentication",
+			Attempt:     1,
+		})
+		if err != nil || string(ans) != "duo-password" {
+			t.Fatalf("expected 'duo-password', got ans=%q, err=%v", string(ans), err)
+		}
+	})
+
+	// 8. Fallback to OTP PromptPattern
+	t.Run("Fallback_OTPPromptPattern", func(t *testing.T) {
+		rawSeed := "JBSWY3DPEHPK3PXP"
+		cfg := newTestAdapterConfig("node1", models.Identity{
+			User: "ops",
+			OTP: &models.OTPConfig{
+				TOTPSecretRef: &credential.Ref{StoreID: "default", ItemID: "seed"},
+				PromptPattern: "(?i)(one-time password|otp)",
+			},
+		})
+		store := &adapterCredentialStore{data: map[string]credential.Secret{
+			"seed": credential.NewSecret([]byte(rawSeed)),
+		}}
+		reg := credential.NewRegistry()
+		_ = reg.Register("default", store)
+		adp := NewSSHAdapter(config.NewProviderWithoutOpenSSH(cfg), WithCredentialSource(reg))
+
+		before := time.Now()
+		ans, err := adp.ResolveSecret(ctx, ssh.SecretRequest{
+			Kind:    ssh.SecretKindKeyboardInteractive,
+			NodeID:  "node1",
+			Prompt:  "Please enter your One-Time Password:",
+			Attempt: 1,
+		})
+		if err != nil {
+			t.Fatalf("expected success, got %v", err)
+		}
+		expectedOTP, _ := coreauth.GenerateTOTP(rawSeed, before)
+		if string(ans) != expectedOTP {
+			t.Fatalf("expected OTP %q, got %q", expectedOTP, string(ans))
+		}
+	})
+
+	// 9. Fallback to AuthType == "otp" without PromptPattern
+	t.Run("Fallback_AuthTypeOTP_NoPattern", func(t *testing.T) {
+		cfg := newTestAdapterConfig("node1", models.Identity{
+			User:     "ops",
+			AuthType: "otp",
+			OTP: &models.OTPConfig{
+				TOTPSecretRef: &credential.Ref{StoreID: "default", ItemID: "seed"},
+			},
+		})
+		store := &adapterCredentialStore{data: map[string]credential.Secret{
+			"seed": credential.NewSecret([]byte("JBSWY3DPEHPK3PXP")),
+		}}
+		reg := credential.NewRegistry()
+		_ = reg.Register("default", store)
+		adp := NewSSHAdapter(config.NewProviderWithoutOpenSSH(cfg), WithCredentialSource(reg))
+
+		ans, err := adp.ResolveSecret(ctx, ssh.SecretRequest{
+			Kind:    ssh.SecretKindKeyboardInteractive,
+			NodeID:  "node1",
+			Prompt:  "Arbitrary Server Challenge Prompt:",
+			Attempt: 1,
+		})
+		if err != nil {
+			t.Fatalf("expected success, got %v", err)
+		}
+		if len(ans) != 6 {
+			t.Fatalf("expected 6-digit OTP, got %q", string(ans))
+		}
+	})
+
+	// 10. Fallback to session OTP override
+	t.Run("Fallback_SessionOTPOverride_NoPattern", func(t *testing.T) {
+		cfg := newTestAdapterConfig("node1", models.Identity{User: "ops"})
+		adp := NewSSHAdapter(config.NewProviderWithoutOpenSSH(cfg),
+			WithSessionAuthOverride("node1", SessionAuth{OTP: "444555"}),
+		)
+		ans, err := adp.ResolveSecret(ctx, ssh.SecretRequest{
+			Kind:    ssh.SecretKindKeyboardInteractive,
+			NodeID:  "node1",
+			Prompt:  "Challenge:",
+			Attempt: 1,
+		})
+		if err != nil {
+			t.Fatalf("expected success, got %v", err)
+		}
+		if string(ans) != "444555" {
+			t.Fatalf("expected '444555', got %q", string(ans))
+		}
+	})
+
+	// 11. Unmatched challenge returns ErrInteractionRequired
+	t.Run("NoRuleMatched_InteractionRequired", func(t *testing.T) {
+		cfg := newTestAdapterConfig("node1", models.Identity{
+			User: "ops",
+			KeyboardInteractive: &models.KeyboardInteractiveConfig{
+				Rules: []models.ChallengeRule{
+					{
+						Name:          "pin-rule",
+						PromptPattern: "^PIN:",
+						Source:        models.ChallengeSourceLoginPassword,
+					},
+				},
+			},
+			Password: "my-password",
+		})
+		adp := NewSSHAdapter(config.NewProviderWithoutOpenSSH(cfg))
+		_, err := adp.ResolveSecret(ctx, ssh.SecretRequest{
+			Kind:    ssh.SecretKindKeyboardInteractive,
+			NodeID:  "node1",
+			Prompt:  "Mother's maiden name?",
+			Attempt: 1,
+		})
+		if !errors.Is(err, ssh.ErrInteractionRequired) {
+			t.Fatalf("expected ErrInteractionRequired, got %v", err)
+		}
+	})
+
+	// 12. MFA key/auto identity with configured OTP (no PromptPattern) resolves single-prompt challenge
+	t.Run("Fallback_ConfiguredOTPOnKeyIdentity_SinglePrompt", func(t *testing.T) {
+		cfg := newTestAdapterConfig("node1", models.Identity{
+			User:     "ops",
+			AuthType: "key",
+			OTP: &models.OTPConfig{
+				TOTPSecretRef: &credential.Ref{StoreID: "default", ItemID: "seed"},
+			},
+		})
+		store := &adapterCredentialStore{data: map[string]credential.Secret{
+			"seed": credential.NewSecret([]byte("JBSWY3DPEHPK3PXP")),
+		}}
+		reg := credential.NewRegistry()
+		_ = reg.Register("default", store)
+		adp := NewSSHAdapter(config.NewProviderWithoutOpenSSH(cfg), WithCredentialSource(reg))
+
+		ans, err := adp.ResolveSecret(ctx, ssh.SecretRequest{
+			Kind:       ssh.SecretKindKeyboardInteractive,
+			NodeID:     "node1",
+			Prompt:     "Verification code:",
+			Attempt:    1,
+			NumPrompts: 1,
+		})
+		if err != nil {
+			t.Fatalf("expected success for key+OTP MFA identity, got %v", err)
+		}
+		if len(ans) != 6 {
+			t.Fatalf("expected 6-digit OTP, got %q", string(ans))
+		}
+	})
+
+	// 13. Multi-question challenge packet without rules or PromptPattern does not blindly send OTP
+	t.Run("MultiPromptPacket_NoPattern_RequiresInteraction", func(t *testing.T) {
+		cfg := newTestAdapterConfig("node1", models.Identity{
+			User:     "ops",
+			AuthType: "otp",
+			OTP: &models.OTPConfig{
+				TOTPSecretRef: &credential.Ref{StoreID: "default", ItemID: "seed"},
+			},
+		})
+		store := &adapterCredentialStore{data: map[string]credential.Secret{
+			"seed": credential.NewSecret([]byte("JBSWY3DPEHPK3PXP")),
+		}}
+		reg := credential.NewRegistry()
+		_ = reg.Register("default", store)
+		adp := NewSSHAdapter(config.NewProviderWithoutOpenSSH(cfg),
+			WithCredentialSource(reg),
+			WithSessionAuthOverride("node1", SessionAuth{OTP: "123456"}),
+		)
+
+		_, err := adp.ResolveSecret(ctx, ssh.SecretRequest{
+			Kind:       ssh.SecretKindKeyboardInteractive,
+			NodeID:     "node1",
+			Prompt:     "Password:",
+			Attempt:    1,
+			NumPrompts: 2,
+		})
+		if !errors.Is(err, ssh.ErrInteractionRequired) {
+			t.Fatalf("expected ErrInteractionRequired for multi-prompt packet without matching rule, got %v", err)
+		}
+	})
+}
+
+func TestSSHAdapter_GetConfig_OTPSessionOverrideAuthTypeRouting(t *testing.T) {
+	// 1. Default password node with session OTP override routes through "auto" so stage-0 keyboard-interactive is reachable
+	cfgPwd := newTestAdapterConfig("node-pwd", models.Identity{
+		User:     "ops",
+		AuthType: "password",
+	})
+	adpPwd := NewSSHAdapter(config.NewProviderWithoutOpenSSH(cfgPwd),
+		WithSessionAuthOverride("node-pwd", SessionAuth{OTP: "123456"}),
+	)
+	clientCfgPwd, err := adpPwd.GetConfig("node-pwd")
+	if err != nil {
+		t.Fatalf("GetConfig failed: %v", err)
+	}
+	if clientCfgPwd.AuthType != "auto" {
+		t.Fatalf("expected AuthType 'auto' when --otp is provided on password node, got %q", clientCfgPwd.AuthType)
+	}
+
+	// 2. Explicit keyboard-interactive node with session Password override preserves "keyboard-interactive"
+	cfgKI := newTestAdapterConfig("node-ki", models.Identity{
+		User:     "ops",
+		AuthType: "keyboard-interactive",
+	})
+	adpKI := NewSSHAdapter(config.NewProviderWithoutOpenSSH(cfgKI),
+		WithSessionAuthOverride("node-ki", SessionAuth{Password: "pam-pass"}),
+	)
+	clientCfgKI, err := adpKI.GetConfig("node-ki")
+	if err != nil {
+		t.Fatalf("GetConfig failed: %v", err)
+	}
+	if clientCfgKI.AuthType != "keyboard-interactive" {
+		t.Fatalf("expected AuthType 'keyboard-interactive' to be preserved, got %q", clientCfgKI.AuthType)
+	}
+}
+
+func newTestAdapterConfig(nodeID string, identity models.Identity) *config.Configuration {
+	nodeMap := concurrent.NewMap[string, models.Node](concurrent.HashString)
+	hostMap := concurrent.NewMap[string, models.Host](concurrent.HashString)
+	identityMap := concurrent.NewMap[string, models.Identity](concurrent.HashString)
+
+	hostMap.Set("host1", models.Host{Address: "127.0.0.1", Port: 22})
+	identityMap.Set("id1", identity)
+	nodeMap.Set(nodeID, models.Node{
+		HostRef:     "host1",
+		IdentityRef: "id1",
+	})
+
+	return &config.Configuration{
+		Nodes:      nodeMap,
+		Identities: identityMap,
+		Hosts:      hostMap,
 	}
 }

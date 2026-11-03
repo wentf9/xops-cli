@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -765,5 +766,547 @@ nodes:
 `
 	if _, err := UnmarshalV2([]byte(incompatibleNodeYAML)); err == nil {
 		t.Fatal("expected error for bash interpreter with windows-cmd dialect")
+	}
+}
+
+func TestSchemaV2_ForbiddenPlaintextSecrets(t *testing.T) {
+	tests := []struct {
+		name        string
+		yamlSnippet string
+		errContains string
+	}{
+		{
+			name: "totp_secret under identity",
+			yamlSnippet: `schema_version: 2
+credential: {default_store: s, stores: {s: {type: system}}}
+hosts: {h: {address: 1.1.1.1, port: 22}}
+identities:
+  dev:
+    user: admin
+    auth_type: key
+    totp_secret: "JBSWY3DPEHPK3PXP"
+nodes: {n: {host_ref: h, identity_ref: dev}}`,
+			errContains: "totp_secret",
+		},
+		{
+			name: "otp_secret under identity",
+			yamlSnippet: `schema_version: 2
+credential: {default_store: s, stores: {s: {type: system}}}
+hosts: {h: {address: 1.1.1.1, port: 22}}
+identities:
+  dev:
+    user: admin
+    auth_type: key
+    otp_secret: "JBSWY3DPEHPK3PXP"
+nodes: {n: {host_ref: h, identity_ref: dev}}`,
+			errContains: "otp_secret",
+		},
+		{
+			name: "answer under identity",
+			yamlSnippet: `schema_version: 2
+credential: {default_store: s, stores: {s: {type: system}}}
+hosts: {h: {address: 1.1.1.1, port: 22}}
+identities:
+  dev:
+    user: admin
+    auth_type: key
+    answer: "plain_answer"
+nodes: {n: {host_ref: h, identity_ref: dev}}`,
+			errContains: "answer",
+		},
+		{
+			name: "secret under identity",
+			yamlSnippet: `schema_version: 2
+credential: {default_store: s, stores: {s: {type: system}}}
+hosts: {h: {address: 1.1.1.1, port: 22}}
+identities:
+  dev:
+    user: admin
+    auth_type: key
+    secret: "plain_secret"
+nodes: {n: {host_ref: h, identity_ref: dev}}`,
+			errContains: "secret",
+		},
+		{
+			name: "totp_secret in otp block",
+			yamlSnippet: `schema_version: 2
+credential: {default_store: s, stores: {s: {type: system}}}
+hosts: {h: {address: 1.1.1.1, port: 22}}
+identities:
+  dev:
+    user: admin
+    auth_type: key
+    otp:
+      totp_secret: "JBSWY3DPEHPK3PXP"
+nodes: {n: {host_ref: h, identity_ref: dev}}`,
+			errContains: "totp_secret",
+		},
+		{
+			name: "otp_secret in otp block",
+			yamlSnippet: `schema_version: 2
+credential: {default_store: s, stores: {s: {type: system}}}
+hosts: {h: {address: 1.1.1.1, port: 22}}
+identities:
+  dev:
+    user: admin
+    auth_type: key
+    otp:
+      otp_secret: "JBSWY3DPEHPK3PXP"
+nodes: {n: {host_ref: h, identity_ref: dev}}`,
+			errContains: "otp_secret",
+		},
+		{
+			name: "secret in otp block",
+			yamlSnippet: `schema_version: 2
+credential: {default_store: s, stores: {s: {type: system}}}
+hosts: {h: {address: 1.1.1.1, port: 22}}
+identities:
+  dev:
+    user: admin
+    auth_type: key
+    otp:
+      secret: "JBSWY3DPEHPK3PXP"
+nodes: {n: {host_ref: h, identity_ref: dev}}`,
+			errContains: "secret",
+		},
+		{
+			name: "answer in keyboard_interactive rule",
+			yamlSnippet: `schema_version: 2
+credential: {default_store: s, stores: {s: {type: system}}}
+hosts: {h: {address: 1.1.1.1, port: 22}}
+identities:
+  dev:
+    user: admin
+    auth_type: key
+    keyboard_interactive:
+      rules:
+        - name: r1
+          prompt_pattern: "Code:"
+          answer: "secret_answer"
+nodes: {n: {host_ref: h, identity_ref: dev}}`,
+			errContains: "answer",
+		},
+		{
+			name: "secret in keyboard_interactive rule",
+			yamlSnippet: `schema_version: 2
+credential: {default_store: s, stores: {s: {type: system}}}
+hosts: {h: {address: 1.1.1.1, port: 22}}
+identities:
+  dev:
+    user: admin
+    auth_type: key
+    keyboard_interactive:
+      rules:
+        - name: r1
+          prompt_pattern: "Code:"
+          secret: "secret_val"
+nodes: {n: {host_ref: h, identity_ref: dev}}`,
+			errContains: "secret",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := UnmarshalV2([]byte(tt.yamlSnippet))
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tt.errContains)
+			}
+			if !errors.Is(err, ErrSchemaValidation) {
+				t.Fatalf("expected ErrSchemaValidation, got: %v", err)
+			}
+			if !strings.Contains(err.Error(), tt.errContains) {
+				t.Fatalf("error %q does not contain %q", err.Error(), tt.errContains)
+			}
+		})
+	}
+}
+
+func TestSchemaV2_OTPValidation(t *testing.T) {
+	baseYAML := `schema_version: 2
+credential:
+  default_store: pass
+  stores:
+    pass: {type: pass}
+hosts: {h: {address: 10.0.0.1, port: 22}}
+nodes: {n: {host_ref: h, identity_ref: dev}}
+`
+
+	// 1. Mutual exclusion: both totp_secret_ref and command
+	t.Run("mutual exclusion both ref and command", func(t *testing.T) {
+		y := baseYAML + `identities:
+  dev:
+    user: dev
+    auth_type: otp
+    otp:
+      totp_secret_ref: {store_id: pass, item_id: "totp-key"}
+      command: "oathtool --totp"
+`
+		_, err := UnmarshalV2([]byte(y))
+		if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+			t.Fatalf("expected mutually exclusive error, got: %v", err)
+		}
+	})
+
+	// 2. Missing source: neither totp_secret_ref nor command
+	t.Run("missing both ref and command", func(t *testing.T) {
+		y := baseYAML + `identities:
+  dev:
+    user: dev
+    auth_type: otp
+    otp:
+      prompt_pattern: "Code:"
+`
+		_, err := UnmarshalV2([]byte(y))
+		if err == nil || !strings.Contains(err.Error(), "must specify either") {
+			t.Fatalf("expected must specify either error, got: %v", err)
+		}
+	})
+
+	// 3. Unconfigured store in totp_secret_ref
+	t.Run("unconfigured store", func(t *testing.T) {
+		y := baseYAML + `identities:
+  dev:
+    user: dev
+    auth_type: otp
+    otp:
+      totp_secret_ref: {store_id: nonexistent_store, item_id: "totp-key"}
+`
+		_, err := UnmarshalV2([]byte(y))
+		if err == nil || !strings.Contains(err.Error(), "not configured") {
+			t.Fatalf("expected store not configured error, got: %v", err)
+		}
+	})
+
+	// 4. Shell metacharacters in command
+	t.Run("shell metacharacters", func(t *testing.T) {
+		y := baseYAML + `identities:
+  dev:
+    user: dev
+    auth_type: otp
+    otp:
+      command: "oathtool; rm -rf /"
+`
+		_, err := UnmarshalV2([]byte(y))
+		if err == nil || !strings.Contains(err.Error(), "forbidden shell characters") {
+			t.Fatalf("expected forbidden shell characters error, got: %v", err)
+		}
+	})
+
+	// 5. Invalid regex in prompt_pattern
+	t.Run("invalid prompt_pattern regex", func(t *testing.T) {
+		y := baseYAML + `identities:
+  dev:
+    user: dev
+    auth_type: otp
+    otp:
+      totp_secret_ref: {store_id: pass, item_id: "totp-key"}
+      prompt_pattern: "(unclosed_regex"
+`
+		_, err := UnmarshalV2([]byte(y))
+		if err == nil || !strings.Contains(err.Error(), "invalid regex") {
+			t.Fatalf("expected invalid regex error, got: %v", err)
+		}
+	})
+
+	// 6. Valid OTP config with totp_secret_ref
+	t.Run("valid totp_secret_ref", func(t *testing.T) {
+		y := baseYAML + `identities:
+  dev:
+    user: dev
+    auth_type: otp
+    otp:
+      totp_secret_ref: {store_id: pass, item_id: "totp-key"}
+      prompt_pattern: "Verification Code:"
+`
+		cfg, err := UnmarshalV2([]byte(y))
+		if err != nil {
+			t.Fatalf("unexpected error for valid totp_secret_ref: %v", err)
+		}
+		if cfg.Identities["dev"].OTP == nil || cfg.Identities["dev"].OTP.TOTPSecretRef.ItemID != "totp-key" {
+			t.Fatalf("parsed OTP config mismatch")
+		}
+	})
+
+	// 7. Valid OTP config with command
+	t.Run("valid command", func(t *testing.T) {
+		y := baseYAML + `identities:
+  dev:
+    user: dev
+    auth_type: otp
+    otp:
+      command: "/usr/local/bin/get-totp"
+      args: ["--account", "dev"]
+      timeout: 10s
+`
+		cfg, err := UnmarshalV2([]byte(y))
+		if err != nil {
+			t.Fatalf("unexpected error for valid command: %v", err)
+		}
+		if cfg.Identities["dev"].OTP.Command != "/usr/local/bin/get-totp" {
+			t.Fatalf("parsed OTP command mismatch")
+		}
+		if cfg.Identities["dev"].OTP.Timeout != 10*time.Second {
+			t.Fatalf("parsed OTP timeout mismatch: got %v", cfg.Identities["dev"].OTP.Timeout)
+		}
+	})
+}
+
+const testKIYAMLBase = `schema_version: 2
+credential:
+  default_store: pass
+  stores:
+    pass: {type: pass}
+hosts: {h: {address: 10.0.0.1, port: 22}}
+nodes: {n: {host_ref: h, identity_ref: dev}}
+`
+
+func TestSchemaV2_KeyboardInteractiveValidation_InvalidRules(t *testing.T) {
+	// 1. Duplicate rule names
+	t.Run("duplicate rule names", func(t *testing.T) {
+		y := testKIYAMLBase + `identities:
+  dev:
+    user: dev
+    auth_type: keyboard-interactive
+    keyboard_interactive:
+      rules:
+        - name: dup
+          prompt_pattern: "Prompt1:"
+          source: otp
+        - name: dup
+          prompt_pattern: "Prompt2:"
+          source: otp
+`
+		_, err := UnmarshalV2([]byte(y))
+		if err == nil || !strings.Contains(err.Error(), "duplicate rule name") {
+			t.Fatalf("expected duplicate rule name error, got: %v", err)
+		}
+	})
+
+	// 2. Empty prompt_pattern
+	t.Run("empty prompt_pattern", func(t *testing.T) {
+		y := testKIYAMLBase + `identities:
+  dev:
+    user: dev
+    auth_type: keyboard-interactive
+    keyboard_interactive:
+      rules:
+        - prompt_pattern: ""
+          source: otp
+`
+		_, err := UnmarshalV2([]byte(y))
+		if err == nil || !strings.Contains(err.Error(), "prompt_pattern cannot be empty") {
+			t.Fatalf("expected empty prompt_pattern error, got: %v", err)
+		}
+	})
+
+	// 3. Invalid instruction regex
+	t.Run("invalid instruction regex", func(t *testing.T) {
+		y := testKIYAMLBase + `identities:
+  dev:
+    user: dev
+    auth_type: keyboard-interactive
+    keyboard_interactive:
+      rules:
+        - prompt_pattern: "Password:"
+          instruction_pattern: "[invalid_regex"
+          source: login_password
+`
+		_, err := UnmarshalV2([]byte(y))
+		if err == nil || !strings.Contains(err.Error(), "invalid regex") {
+			t.Fatalf("expected invalid regex error, got: %v", err)
+		}
+	})
+
+	// 4. source: otp with secret_ref
+	t.Run("source otp with secret_ref", func(t *testing.T) {
+		y := testKIYAMLBase + `identities:
+  dev:
+    user: dev
+    auth_type: keyboard-interactive
+    keyboard_interactive:
+      rules:
+        - prompt_pattern: "Code:"
+          source: otp
+          secret_ref: {store_id: pass, item_id: "sec1"}
+`
+		_, err := UnmarshalV2([]byte(y))
+		if err == nil || !strings.Contains(err.Error(), "cannot specify secret_ref") {
+			t.Fatalf("expected cannot specify secret_ref error, got: %v", err)
+		}
+	})
+
+	// 5. source: secret without name
+	t.Run("source secret without name", func(t *testing.T) {
+		y := testKIYAMLBase + `identities:
+  dev:
+    user: dev
+    auth_type: keyboard-interactive
+    keyboard_interactive:
+      rules:
+        - prompt_pattern: "PIN:"
+          source: secret
+          secret_ref: {store_id: pass, item_id: "pin1"}
+`
+		_, err := UnmarshalV2([]byte(y))
+		if err == nil || !strings.Contains(err.Error(), "must specify non-empty name") {
+			t.Fatalf("expected must specify non-empty name error, got: %v", err)
+		}
+	})
+
+	// 6. source: secret without secret_ref
+	t.Run("source secret without secret_ref", func(t *testing.T) {
+		y := testKIYAMLBase + `identities:
+  dev:
+    user: dev
+    auth_type: keyboard-interactive
+    keyboard_interactive:
+      rules:
+        - name: pin-rule
+          prompt_pattern: "PIN:"
+          source: secret
+`
+		_, err := UnmarshalV2([]byte(y))
+		if err == nil || !strings.Contains(err.Error(), "must specify secret_ref") {
+			t.Fatalf("expected must specify secret_ref error, got: %v", err)
+		}
+	})
+
+	// 7. source: command with forbidden shell character
+	t.Run("source command with shell char", func(t *testing.T) {
+		y := testKIYAMLBase + `identities:
+  dev:
+    user: dev
+    auth_type: keyboard-interactive
+    keyboard_interactive:
+      rules:
+        - name: cmd-rule
+          prompt_pattern: "Token:"
+          source: command
+          command: "cat token | tr -d '\n'"
+`
+		_, err := UnmarshalV2([]byte(y))
+		if err == nil || !strings.Contains(err.Error(), "forbidden shell characters") {
+			t.Fatalf("expected forbidden shell characters error, got: %v", err)
+		}
+	})
+}
+
+func TestSchemaV2_KeyboardInteractiveValidation_ValidRules(t *testing.T) {
+	y := testKIYAMLBase + `identities:
+  dev:
+    user: dev
+    auth_type: keyboard-interactive
+    keyboard_interactive:
+      rules:
+        - name: pwd-rule
+          prompt_pattern: "Password:"
+          source: login_password
+        - name: otp-rule
+          prompt_pattern: "Verification Code:"
+          instruction_pattern: "Enter MFA"
+          source: otp
+        - name: sec-rule
+          prompt_pattern: "Static PIN:"
+          source: secret
+          secret_ref: {store_id: pass, item_id: "static-pin"}
+        - name: cmd-rule
+          prompt_pattern: "Dynamic Token:"
+          source: command
+          command: "/usr/bin/token-gen"
+          args: ["--env", "prod"]
+          timeout: 5s
+`
+	cfg, err := UnmarshalV2([]byte(y))
+	if err != nil {
+		t.Fatalf("unexpected error for valid rules: %v", err)
+	}
+	rules := cfg.Identities["dev"].KeyboardInteractive.Rules
+	if len(rules) != 4 {
+		t.Fatalf("expected 4 rules, got %d", len(rules))
+	}
+	if rules[0].Source != models.ChallengeSourceLoginPassword ||
+		rules[1].Source != models.ChallengeSourceOTP ||
+		rules[2].Source != models.ChallengeSourceSecret ||
+		rules[3].Source != models.ChallengeSourceCommand {
+		t.Fatalf("parsed rules sources mismatch")
+	}
+}
+
+func TestToV2AndFromV2_OTPAndKeyboardInteractive(t *testing.T) {
+	orig := &Configuration{
+		SchemaVersion: 2,
+		Credential: &CredentialConfig{
+			DefaultStore: "pass",
+			Stores: map[string]StoreConfig{
+				"pass": {Type: StoreTypePass},
+			},
+		},
+		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
+		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
+		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
+	}
+
+	orig.Hosts.Set("h1", models.Host{Address: "127.0.0.1", Port: 22})
+
+	idModel := models.Identity{
+		User:     "ops",
+		AuthType: "keyboard-interactive",
+		OTP: &models.OTPConfig{
+			TOTPSecretRef: &credential.Ref{StoreID: "pass", ItemID: "totp-key"},
+			PromptPattern: "OTP:",
+		},
+		KeyboardInteractive: &models.KeyboardInteractiveConfig{
+			Rules: []models.ChallengeRule{
+				{
+					Name:          "r1",
+					PromptPattern: "Password:",
+					Source:        models.ChallengeSourceLoginPassword,
+				},
+				{
+					Name:          "r2",
+					PromptPattern: "OTP:",
+					Source:        models.ChallengeSourceOTP,
+				},
+			},
+		},
+	}
+	orig.Identities.Set("id1", idModel)
+	orig.Nodes.Set("n1", models.Node{HostRef: "h1", IdentityRef: "id1"})
+
+	// Convert to V2 DTO
+	v2, err := orig.ToV2()
+	if err != nil {
+		t.Fatalf("ToV2 failed: %v", err)
+	}
+
+	v2ID := v2.Identities["id1"]
+	if v2ID.OTP == nil || v2ID.OTP.TOTPSecretRef.ItemID != "totp-key" {
+		t.Fatalf("v2 OTP mismatch")
+	}
+	if v2ID.KeyboardInteractive == nil || len(v2ID.KeyboardInteractive.Rules) != 2 {
+		t.Fatalf("v2 KeyboardInteractive mismatch")
+	}
+
+	// Verify deep clone isolation
+	v2ID.OTP.TOTPSecretRef.ItemID = "mutated"
+	if idModel.OTP.TOTPSecretRef.ItemID != "totp-key" {
+		t.Fatalf("mutating v2 affected orig model")
+	}
+
+	// Convert back FromV2
+	reloaded, err := FromV2(v2)
+	if err != nil {
+		t.Fatalf("FromV2 failed: %v", err)
+	}
+
+	reloadedID, ok := reloaded.Identities.Get("id1")
+	if !ok {
+		t.Fatalf("identity id1 missing in reloaded config")
+	}
+	if reloadedID.OTP == nil || reloadedID.OTP.TOTPSecretRef.ItemID != "mutated" {
+		t.Fatalf("reloaded OTP mismatch")
+	}
+	if reloadedID.KeyboardInteractive == nil || len(reloadedID.KeyboardInteractive.Rules) != 2 {
+		t.Fatalf("reloaded KeyboardInteractive mismatch")
 	}
 }

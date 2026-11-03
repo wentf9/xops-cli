@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,6 +28,8 @@ type Target struct {
 	NodeID     string `json:"nodeID,omitempty"`
 	IdentityID string `json:"identityID,omitempty"`
 	Kind       Kind   `json:"kind"`
+	// RuleName 标识 keyboard-interactive 规则名称（当 Kind 为 KindChallengeAnswer 时必填）。
+	RuleName string `json:"ruleName,omitempty"`
 	// KeyPath is the non-secret private-key path to commit atomically with a
 	// passphrase reference. It is ignored for other credential kinds.
 	KeyPath        string `json:"keyPath,omitempty"`
@@ -47,15 +50,25 @@ func (t Target) Validate() error {
 	if t.NodeID == "" && t.IdentityID == "" {
 		return fmt.Errorf("%w: target must specify nodeID or identityID", coreauth.ErrInvalidRef)
 	}
-	return t.Kind.Validate()
+	if err := t.Kind.Validate(); err != nil {
+		return err
+	}
+	if t.Kind == KindChallengeAnswer && strings.TrimSpace(t.RuleName) == "" {
+		return fmt.Errorf("%w: target ruleName cannot be empty for challenge_answer", coreauth.ErrInvalidRef)
+	}
+	return nil
 }
 
 // TargetIdentifier 返回目标的非敏感字符串标识。
 func (t Target) TargetIdentifier() string {
+	base := t.IdentityID
 	if t.NodeID != "" {
-		return t.NodeID
+		base = t.NodeID
 	}
-	return t.IdentityID
+	if t.RuleName != "" {
+		return base + "#" + t.RuleName
+	}
+	return base
 }
 
 // MutationOutcome 描述配置提交的结果状态。
@@ -290,6 +303,7 @@ func (s *Service) Rotate(
 		TargetNode:               target.NodeID,
 		TargetIdentity:           target.IdentityID,
 		TargetKind:               target.Kind,
+		RuleName:                 target.RuleName,
 		KeyPath:                  target.KeyPath,
 		KeyFingerprint:           target.KeyFingerprint,
 		AuthType:                 target.AuthType,
@@ -385,6 +399,7 @@ func (s *Service) Delete(
 		TargetNode:               target.NodeID,
 		TargetIdentity:           target.IdentityID,
 		TargetKind:               target.Kind,
+		RuleName:                 target.RuleName,
 		KeyPath:                  target.KeyPath,
 		KeyFingerprint:           target.KeyFingerprint,
 		AuthType:                 target.AuthType,

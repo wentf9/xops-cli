@@ -29,6 +29,14 @@ func BackupReferences(path, storeID string) ([]credential.Ref, error) {
 	for _, id := range cfg.Identities {
 		add(id.LoginPasswordRef)
 		add(id.PassphraseRef)
+		if id.OTP != nil {
+			add(id.OTP.TOTPSecretRef)
+		}
+		if id.KeyboardInteractive != nil {
+			for _, r := range id.KeyboardInteractive.Rules {
+				add(r.SecretRef)
+			}
+		}
 	}
 	for _, node := range cfg.Nodes {
 		add(node.PrivilegePasswordRef)

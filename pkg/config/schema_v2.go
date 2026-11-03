@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -150,12 +151,14 @@ func (c *CredentialConfig) Clone() *CredentialConfig {
 
 // IdentityV2 对应 Schema v2 中的认证身份配置，不含任何明文凭据。
 type IdentityV2 struct {
-	User             string          `yaml:"user"`
-	KeyPath          string          `yaml:"key_path,omitempty"`
-	KeyFingerprint   string          `yaml:"key_fingerprint,omitempty"`
-	LoginPasswordRef *credential.Ref `yaml:"login_password_ref,omitempty"`
-	PassphraseRef    *credential.Ref `yaml:"passphrase_ref,omitempty"`
-	AuthType         string          `yaml:"auth_type"`
+	User                string                            `yaml:"user"`
+	KeyPath             string                            `yaml:"key_path,omitempty"`
+	KeyFingerprint      string                            `yaml:"key_fingerprint,omitempty"`
+	LoginPasswordRef    *credential.Ref                   `yaml:"login_password_ref,omitempty"`
+	PassphraseRef       *credential.Ref                   `yaml:"passphrase_ref,omitempty"`
+	AuthType            string                            `yaml:"auth_type"`
+	OTP                 *models.OTPConfig                 `yaml:"otp,omitempty"`
+	KeyboardInteractive *models.KeyboardInteractiveConfig `yaml:"keyboard_interactive,omitempty"`
 }
 
 // NodeV2 对应 Schema v2 中的节点配置，提权密码使用引用模型。
@@ -310,6 +313,146 @@ func validateIdentityRefs(idName string, id IdentityV2, stores map[string]StoreC
 			}
 		}
 	}
+
+	if id.OTP != nil {
+		if err := validateOTPConfig(idName, id.OTP, stores); err != nil {
+			return err
+		}
+	}
+
+	if id.KeyboardInteractive != nil {
+		if err := validateKeyboardInteractiveConfig(idName, id.KeyboardInteractive, stores); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func validateOTPConfig(idName string, otp *models.OTPConfig, stores map[string]StoreConfig) error {
+	hasRef := otp.TOTPSecretRef != nil && !otp.TOTPSecretRef.IsEmpty()
+	hasCmd := strings.TrimSpace(otp.Command) != ""
+
+	if hasRef && hasCmd {
+		return fmt.Errorf("%w: identity %q otp cannot specify both totp_secret_ref and command (mutually exclusive)", ErrSchemaValidation, idName)
+	}
+	if !hasRef && !hasCmd {
+		return fmt.Errorf("%w: identity %q otp must specify either totp_secret_ref or command", ErrSchemaValidation, idName)
+	}
+
+	if hasRef {
+		if err := validateConfiguredRef(*otp.TOTPSecretRef, stores); err != nil {
+			return fmt.Errorf("%w: identity %q otp totp_secret_ref invalid: %w", ErrSchemaValidation, idName, err)
+		}
+		if _, ok := stores[otp.TOTPSecretRef.StoreID]; !ok {
+			return fmt.Errorf("%w: identity %q otp totp_secret_ref store %q not configured", ErrSchemaValidation, idName, otp.TOTPSecretRef.StoreID)
+		}
+	}
+
+	if hasCmd {
+		if strings.ContainsAny(otp.Command, ";|&`$\n") {
+			return fmt.Errorf("%w: identity %q otp command contains forbidden shell characters", ErrSchemaValidation, idName)
+		}
+	}
+
+	if strings.TrimSpace(otp.PromptPattern) != "" {
+		if _, err := regexp.Compile(otp.PromptPattern); err != nil {
+			return fmt.Errorf("%w: identity %q otp prompt_pattern %q invalid regex: %w", ErrSchemaValidation, idName, otp.PromptPattern, err)
+		}
+	}
+
+	if otp.Timeout < 0 {
+		return fmt.Errorf("%w: identity %q otp timeout cannot be negative", ErrSchemaValidation, idName)
+	}
+
+	return nil
+}
+
+func validateKeyboardInteractiveConfig(idName string, ki *models.KeyboardInteractiveConfig, stores map[string]StoreConfig) error {
+	seenNames := make(map[string]int)
+
+	for idx, rule := range ki.Rules {
+		ruleDesc := fmt.Sprintf("rule %d", idx+1)
+		if rule.Name != "" {
+			ruleDesc = fmt.Sprintf("rule %d (%q)", idx+1, rule.Name)
+			if prevIdx, exists := seenNames[rule.Name]; exists {
+				return fmt.Errorf("%w: identity %q keyboard_interactive has duplicate rule name %q in rules %d and %d", ErrSchemaValidation, idName, rule.Name, prevIdx, idx+1)
+			}
+			seenNames[rule.Name] = idx + 1
+		}
+
+		if strings.TrimSpace(rule.PromptPattern) == "" {
+			return fmt.Errorf("%w: identity %q keyboard_interactive %s prompt_pattern cannot be empty", ErrSchemaValidation, idName, ruleDesc)
+		}
+		if _, err := regexp.Compile(rule.PromptPattern); err != nil {
+			return fmt.Errorf("%w: identity %q keyboard_interactive %s prompt_pattern %q invalid regex: %w", ErrSchemaValidation, idName, ruleDesc, rule.PromptPattern, err)
+		}
+
+		if strings.TrimSpace(rule.InstructionPattern) != "" {
+			if _, err := regexp.Compile(rule.InstructionPattern); err != nil {
+				return fmt.Errorf("%w: identity %q keyboard_interactive %s instruction_pattern %q invalid regex: %w", ErrSchemaValidation, idName, ruleDesc, rule.InstructionPattern, err)
+			}
+		}
+
+		if rule.Timeout < 0 {
+			return fmt.Errorf("%w: identity %q keyboard_interactive %s timeout cannot be negative", ErrSchemaValidation, idName, ruleDesc)
+		}
+
+		if err := validateChallengeRuleSource(idName, ruleDesc, rule, stores); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func validateChallengeRuleSource(idName, ruleDesc string, rule models.ChallengeRule, stores map[string]StoreConfig) error {
+	switch rule.Source {
+	case models.ChallengeSourceOTP, models.ChallengeSourceLoginPassword:
+		return validateNoSecretRefOrCommand(idName, ruleDesc, string(rule.Source), rule)
+
+	case models.ChallengeSourceSecret:
+		if strings.TrimSpace(rule.Name) == "" {
+			return fmt.Errorf("%w: identity %q keyboard_interactive %s with source \"secret\" must specify non-empty name", ErrSchemaValidation, idName, ruleDesc)
+		}
+		if rule.SecretRef == nil || rule.SecretRef.IsEmpty() {
+			return fmt.Errorf("%w: identity %q keyboard_interactive %s with source \"secret\" must specify secret_ref", ErrSchemaValidation, idName, ruleDesc)
+		}
+		if strings.TrimSpace(rule.Command) != "" {
+			return fmt.Errorf("%w: identity %q keyboard_interactive %s with source \"secret\" cannot specify command", ErrSchemaValidation, idName, ruleDesc)
+		}
+		if err := validateConfiguredRef(*rule.SecretRef, stores); err != nil {
+			return fmt.Errorf("%w: identity %q keyboard_interactive %s secret_ref invalid: %w", ErrSchemaValidation, idName, ruleDesc, err)
+		}
+		if _, ok := stores[rule.SecretRef.StoreID]; !ok {
+			return fmt.Errorf("%w: identity %q keyboard_interactive %s secret_ref store %q not configured", ErrSchemaValidation, idName, ruleDesc, rule.SecretRef.StoreID)
+		}
+
+	case models.ChallengeSourceCommand:
+		if rule.SecretRef != nil && !rule.SecretRef.IsEmpty() {
+			return fmt.Errorf("%w: identity %q keyboard_interactive %s with source \"command\" cannot specify secret_ref", ErrSchemaValidation, idName, ruleDesc)
+		}
+		if strings.TrimSpace(rule.Command) == "" {
+			return fmt.Errorf("%w: identity %q keyboard_interactive %s with source \"command\" must specify non-empty command", ErrSchemaValidation, idName, ruleDesc)
+		}
+		if strings.ContainsAny(rule.Command, ";|&`$\n") {
+			return fmt.Errorf("%w: identity %q keyboard_interactive %s command contains forbidden shell characters", ErrSchemaValidation, idName, ruleDesc)
+		}
+
+	default:
+		return fmt.Errorf("%w: identity %q keyboard_interactive %s has unknown source %q", ErrSchemaValidation, idName, ruleDesc, rule.Source)
+	}
+
+	return nil
+}
+
+func validateNoSecretRefOrCommand(idName, ruleDesc, source string, rule models.ChallengeRule) error {
+	if rule.SecretRef != nil && !rule.SecretRef.IsEmpty() {
+		return fmt.Errorf("%w: identity %q keyboard_interactive %s with source %q cannot specify secret_ref", ErrSchemaValidation, idName, ruleDesc, source)
+	}
+	if strings.TrimSpace(rule.Command) != "" {
+		return fmt.Errorf("%w: identity %q keyboard_interactive %s with source %q cannot specify command", ErrSchemaValidation, idName, ruleDesc, source)
+	}
 	return nil
 }
 
@@ -384,15 +527,12 @@ func checkForbiddenPlaintextFields(data []byte) error {
 	// 检查 identities 是否包含 password 或 passphrase
 	if identitiesRaw, ok := generic["identities"].(map[string]interface{}); ok {
 		for idName, val := range identitiesRaw {
-			if fields, ok := val.(map[string]interface{}); ok {
-				if _, hasPwd := fields["password"]; hasPwd {
-					return fmt.Errorf("%w: identity %q contains forbidden plaintext field 'password' in schema v2",
-						ErrSchemaValidation, idName)
-				}
-				if _, hasPassphrase := fields["passphrase"]; hasPassphrase {
-					return fmt.Errorf("%w: identity %q contains forbidden plaintext field 'passphrase' in schema v2",
-						ErrSchemaValidation, idName)
-				}
+			fields, ok := val.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if err := checkIdentityPlaintext(idName, fields); err != nil {
+				return err
 			}
 		}
 	}
@@ -409,6 +549,70 @@ func checkForbiddenPlaintextFields(data []byte) error {
 		}
 	}
 
+	return nil
+}
+
+func checkIdentityPlaintext(idName string, fields map[string]interface{}) error {
+	for _, f := range []string{"password", "passphrase"} {
+		if _, has := fields[f]; has {
+			return fmt.Errorf("%w: identity %q contains forbidden plaintext field '%s' in schema v2", ErrSchemaValidation, idName, f)
+		}
+	}
+	if _, hasTOTP := fields["totp_secret"]; hasTOTP {
+		return fmt.Errorf("%w: identity %q contains forbidden plaintext field 'totp_secret' in schema v2; configure otp.totp_secret_ref instead", ErrSchemaValidation, idName)
+	}
+	if _, hasOTP := fields["otp_secret"]; hasOTP {
+		return fmt.Errorf("%w: identity %q contains forbidden plaintext field 'otp_secret' in schema v2; configure otp.totp_secret_ref instead", ErrSchemaValidation, idName)
+	}
+	if _, hasAns := fields["answer"]; hasAns {
+		return fmt.Errorf("%w: identity %q contains forbidden plaintext field 'answer' in schema v2; configure keyboard_interactive.rules with secret_ref instead", ErrSchemaValidation, idName)
+	}
+	if _, hasSec := fields["secret"]; hasSec {
+		return fmt.Errorf("%w: identity %q contains forbidden plaintext field 'secret' in schema v2; configure keyboard_interactive.rules with secret_ref instead", ErrSchemaValidation, idName)
+	}
+
+	if otpRaw, ok := fields["otp"].(map[string]interface{}); ok {
+		if err := checkOTPPlaintext(idName, otpRaw); err != nil {
+			return err
+		}
+	}
+
+	if kiRaw, ok := fields["keyboard_interactive"].(map[string]interface{}); ok {
+		if rulesRaw, ok := kiRaw["rules"].([]interface{}); ok {
+			if err := checkRulesPlaintext(idName, rulesRaw); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func checkOTPPlaintext(idName string, otpRaw map[string]interface{}) error {
+	for _, f := range []string{"totp_secret", "otp_secret", "secret", "answer", "password", "passphrase"} {
+		if _, has := otpRaw[f]; has {
+			return fmt.Errorf("%w: identity %q otp contains forbidden plaintext field '%s' in schema v2; configure totp_secret_ref instead", ErrSchemaValidation, idName, f)
+		}
+	}
+	return nil
+}
+
+func checkRulesPlaintext(idName string, rulesRaw []interface{}) error {
+	for idx, ruleItem := range rulesRaw {
+		ruleMap, ok := ruleItem.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		ruleName, _ := ruleMap["name"].(string)
+		ruleDesc := fmt.Sprintf("rule %d", idx+1)
+		if ruleName != "" {
+			ruleDesc = fmt.Sprintf("rule %d (%q)", idx+1, ruleName)
+		}
+		for _, f := range []string{"answer", "secret", "totp_secret", "otp_secret", "password", "passphrase"} {
+			if _, has := ruleMap[f]; has {
+				return fmt.Errorf("%w: identity %q keyboard_interactive %s contains forbidden plaintext field '%s' in schema v2; configure secret_ref instead", ErrSchemaValidation, idName, ruleDesc, f)
+			}
+		}
+	}
 	return nil
 }
 
@@ -457,12 +661,14 @@ func (c *Configuration) ToV2() (*ConfigurationV2, error) {
 						ErrSchemaValidation, key)
 				}
 				v2.Identities[key] = IdentityV2{
-					User:             id.User,
-					KeyPath:          id.KeyPath,
-					KeyFingerprint:   id.KeyFingerprint,
-					LoginPasswordRef: id.LoginPasswordRef.Clone(),
-					PassphraseRef:    id.PassphraseRef.Clone(),
-					AuthType:         id.AuthType,
+					User:                id.User,
+					KeyPath:             id.KeyPath,
+					KeyFingerprint:      id.KeyFingerprint,
+					LoginPasswordRef:    id.LoginPasswordRef.Clone(),
+					PassphraseRef:       id.PassphraseRef.Clone(),
+					AuthType:            id.AuthType,
+					OTP:                 id.OTP.Clone(),
+					KeyboardInteractive: id.KeyboardInteractive.Clone(),
 				}
 			}
 		}
@@ -521,12 +727,14 @@ func FromV2(v2 *ConfigurationV2) (*Configuration, error) {
 
 	for k, id := range v2.Identities {
 		cfg.Identities.Set(k, models.Identity{
-			User:             id.User,
-			KeyPath:          id.KeyPath,
-			KeyFingerprint:   id.KeyFingerprint,
-			LoginPasswordRef: id.LoginPasswordRef.Clone(),
-			PassphraseRef:    id.PassphraseRef.Clone(),
-			AuthType:         id.AuthType,
+			User:                id.User,
+			KeyPath:             id.KeyPath,
+			KeyFingerprint:      id.KeyFingerprint,
+			LoginPasswordRef:    id.LoginPasswordRef.Clone(),
+			PassphraseRef:       id.PassphraseRef.Clone(),
+			AuthType:            id.AuthType,
+			OTP:                 id.OTP.Clone(),
+			KeyboardInteractive: id.KeyboardInteractive.Clone(),
 		})
 	}
 

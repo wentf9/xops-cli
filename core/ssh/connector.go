@@ -515,6 +515,13 @@ func (c *Connector) recordAuthUpdate(ctx context.Context, nodeName string, cfg *
 	return committedToken, nil
 }
 
+func shouldRecordDiscoveredAuth(discoveredAuth bool, oldAuthToken string, cfg *ClientConfig) bool {
+	if !discoveredAuth || oldAuthToken == "" || cfg == nil {
+		return false
+	}
+	return cfg.Password != "" || cfg.Passphrase != ""
+}
+
 func (c *Connector) initializeConnection(ctx context.Context, planNode connectionPlanNode, dialer Dialer) (_ *Client, retErr error) {
 	nodeName := planNode.name
 	cfg := planNode.cfg
@@ -561,7 +568,7 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 
 	// 认证并连接成功后，检查我们是否通过 "auto" 下的终端交互获取到了新凭证（密码或密钥密码）。
 	oldAuthToken := cfg.AuthUpdateToken
-	hasAuthUpdate := discoveredAuth && oldAuthToken != ""
+	hasAuthUpdate := shouldRecordDiscoveredAuth(discoveredAuth, oldAuthToken, cfg)
 	var committedAuthToken string
 	recordingFailed := false
 	if hasAuthUpdate {
@@ -1136,6 +1143,8 @@ func (c *Connector) resolveAgentAuth(ctx context.Context) (ssh.AuthMethod, func(
 }
 
 // buildSSHConfig 根据 Identity 模型构建 ssh.ClientConfig
+//
+//nolint:gocyclo // buildSSHConfig coordinates multiple authentication strategies, host key verification, and diagnostics.
 func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coordinator *handshakeCoordinator, onAuthDiscovered func(), authentication *authenticationTrace) (*ssh.ClientConfig, func() error, error) {
 	observer := c.diagnostics
 	if authentication != nil {
@@ -1162,6 +1171,8 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 		if coordinator != nil {
 			failClosed = coordinator.FailClosed
 		}
+		originalAuthType := cfg.AuthType
+		originalKeyPath := cfg.KeyPath
 		plan, release, err := c.buildOwnedAutoAuth(ctx, cfg, AutoAuthOptions{
 			AgentSocket:        c.environment.AgentSocket,
 			DefaultKeyPaths:    c.environment.DefaultKeyPaths,
@@ -1181,12 +1192,13 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 			KeyPath:            cfg.KeyPath,
 			PasswordCallback: func(s string) {
 				if s != "" {
-					// Auto candidates are tried in order. If key authentication
-					// failed, only the password actually requested afterwards may
-					// be persisted after a successful handshake.
-					cfg.Passphrase = ""
+					// Rejected earlier key candidates are cleared by
+					// CandidateRejectedCallback; preserve cfg.Passphrase if an
+					// earlier key stage achieved PartialSuccess in MFA.
 					cfg.Password = s
-					cfg.AuthType = "password"
+					if cfg.Passphrase == "" {
+						cfg.AuthType = "password"
+					}
 					if onAuthDiscovered != nil {
 						onAuthDiscovered()
 					}
@@ -1206,6 +1218,21 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 					}
 				}
 			},
+			CandidateRejectedCallback: func(protocol string) {
+				switch protocol {
+				case autoAuthProtocolPublicKey:
+					cfg.Passphrase = ""
+					cfg.KeyPath = originalKeyPath
+					if cfg.Password == "" {
+						cfg.AuthType = originalAuthType
+					}
+				case autoAuthProtocolPassword:
+					cfg.Password = ""
+					if cfg.Passphrase == "" {
+						cfg.AuthType = originalAuthType
+					}
+				}
+			},
 			Logger:      c.getLogger(),
 			Diagnostics: observer,
 		})
@@ -1214,6 +1241,9 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 		}
 		authCallback = plan.authCallback
 		cleanup = release
+
+	case "keyboard-interactive", "otp":
+		authCallback = c.buildKeyboardInteractiveAuth(authCtx, cfg, prompter, coordinator, observer)
 
 	case "password":
 		if credentialRecoveryPrompter(c.secretPrompter) != nil {
@@ -1244,6 +1274,10 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 
 	default:
 		return nil, nil, fmt.Errorf("unsupported auth type: %s", cfg.AuthType)
+	}
+
+	if authCallback == nil && len(authMethods) == 1 {
+		authCallback = c.buildSingleMethodTransitionCallback(authCtx, cfg, prompter, coordinator, observer)
 	}
 
 	hostKeyCallback, hostKeyAlgorithms, err := c.getHostKeyOptions(ctx, coordinator, cfg)
@@ -1277,30 +1311,126 @@ func (c *Connector) observeSSHConfig(cfg *ClientConfig, clientConfig *ssh.Client
 	if observer == nil {
 		return
 	}
-	if clientConfig.AuthCallback == nil && len(clientConfig.Auth) == 1 {
-		protocol := "publickey"
-		if cfg.AuthType == "password" {
-			protocol = "password"
-		}
-		negotiated := false
-		clientConfig.AuthCallback = func(ctx *ssh.ClientAuthContext) (ssh.AuthMethod, error) {
-			observeAuthNegotiation(observer, ctx, &negotiated)
-			event := authenticationDiagnostic(ctx)
-			logger.EmitDiagnostic(observer, event)
-			// Match x/crypto's fallback selection without replacing it.
-			// A successful initial "none" does not invoke this callback.
-			if slices.Contains(ctx.AllowedMethods, protocol) && !slices.Contains(ctx.TriedMethods, protocol) {
-				event.Kind, event.Method, event.Methods = logger.AuthenticationAttempt, protocol, nil
-				logger.EmitDiagnostic(observer, event)
-			}
-			return nil, nil
-		}
-	}
 	verify := clientConfig.HostKeyCallback
 	clientConfig.HostKeyCallback = func(hostname string, remote net.Addr, key ssh.PublicKey) error {
 		err := verify(hostname, remote, key)
 		logger.EmitDiagnostic(observer, logger.Diagnostic{Kind: logger.HostKeyChecked, NodeID: cfg.NodeID, HostKey: key.Type(), Fingerprint: ssh.FingerprintSHA256(key), Accepted: err == nil})
 		return err
+	}
+}
+
+func (c *Connector) newAutoSecretProvider(authCtx context.Context, cfg *ClientConfig, prompter SecretPrompter, coordinator *handshakeCoordinator) *autoSecretProvider {
+	var failClosed func(error)
+	if coordinator != nil {
+		failClosed = coordinator.FailClosed
+	}
+	return &autoSecretProvider{
+		lifecycleCtx:       authCtx,
+		nodeID:             cfg.NodeID,
+		user:               cfg.User,
+		host:               cfg.Address,
+		port:               cfg.Port,
+		versionToken:       cfg.AuthUpdateToken,
+		resolver:           c.secretResolver,
+		prompter:           prompter,
+		handshakeTimeout:   c.getHandshakeTimeout(),
+		interactionTimeout: c.interactionTimeout,
+		failClosed:         failClosed,
+		recoveryPrompter:   credentialRecoveryPrompter(c.secretPrompter),
+	}
+}
+
+func (c *Connector) buildKeyboardInteractiveAuth(authCtx context.Context, cfg *ClientConfig, prompter SecretPrompter, coordinator *handshakeCoordinator, observer logger.DiagnosticObserver) ssh.ClientAuthCallback {
+	secProvider := c.newAutoSecretProvider(authCtx, cfg, prompter, coordinator)
+	kbMethod := buildKeyboardInteractiveAuthMethod(secProvider)
+	candidates := []autoAuthCandidate{
+		{
+			protocol: autoAuthProtocolKeyboardInteractive,
+			label:    cfg.AuthType,
+			method:   kbMethod,
+		},
+	}
+	passwordAttempts := 0
+	initialPassword := cfg.Password
+	passwordMethod := ssh.RetryableAuthMethod(ssh.PasswordCallback(func() (string, error) {
+		retry := passwordAttempts > 0
+		if retry && secProvider.recoveryPrompter == nil {
+			return "", ErrInteractionRequired
+		}
+		passwordAttempts++
+		if !retry && initialPassword != "" {
+			pwd := initialPassword
+			initialPassword = ""
+			return pwd, nil
+		}
+		password, err := secProvider.resolveOrPromptAttempt(SecretRequest{
+			Kind: SecretKindLoginPassword,
+		}, retry)
+		if err != nil {
+			return "", fmt.Errorf("failed to read password: %w", err)
+		}
+		return password, nil
+	}), 3)
+	candidates = append(candidates, autoAuthCandidate{
+		protocol: autoAuthProtocolPassword,
+		label:    "password",
+		method:   passwordMethod,
+		allow: func(ctx *ssh.ClientAuthContext) bool {
+			// Only coordinate with password in explicit keyboard-interactive/otp mode
+			// when multi-stage MFA is in progress or when the initial stage did not
+			// offer keyboard-interactive (e.g., password -> keyboard-interactive MFA).
+			return len(ctx.PartialSuccessMethods) > 0 || !slices.Contains(ctx.TriedMethods, autoAuthProtocolKeyboardInteractive)
+		},
+	})
+	return newSequentialAuthCallback(candidates, secProvider, c.getLogger(), observer)
+}
+
+func (c *Connector) buildSingleMethodTransitionCallback(authCtx context.Context, cfg *ClientConfig, prompter SecretPrompter, coordinator *handshakeCoordinator, observer logger.DiagnosticObserver) ssh.ClientAuthCallback {
+	secProvider := c.newAutoSecretProvider(authCtx, cfg, prompter, coordinator)
+	kbMethod := buildKeyboardInteractiveAuthMethod(secProvider)
+	protocol := "publickey"
+	if cfg.AuthType == "password" {
+		protocol = "password"
+	}
+	negotiated := false
+	lastStage := 0
+	kbTriedInStage := false
+	return func(ctx *ssh.ClientAuthContext) (ssh.AuthMethod, error) {
+		if observer != nil {
+			observeAuthNegotiation(observer, ctx, &negotiated)
+			event := authenticationDiagnostic(ctx)
+			logger.EmitDiagnostic(observer, event)
+		}
+		if secProvider != nil {
+			if err := secProvider.terminalError(); err != nil {
+				return nil, err
+			}
+		}
+		stage := len(ctx.PartialSuccessMethods)
+		if stage > lastStage {
+			lastStage = stage
+			kbTriedInStage = false
+		}
+		// When single-method auth achieves partial success, transition to keyboard-interactive once per stage if allowed by server
+		if stage > 0 && !kbTriedInStage && slices.Contains(ctx.AllowedMethods, autoAuthProtocolKeyboardInteractive) {
+			kbTriedInStage = true
+			if observer != nil {
+				event := authenticationDiagnostic(ctx)
+				event.Kind, event.Method, event.Methods = logger.AuthenticationAttempt, autoAuthProtocolKeyboardInteractive, nil
+				logger.EmitDiagnostic(observer, event)
+			}
+			c.getLogger().Debugf("Transitioning to keyboard-interactive after partial success: %v", ctx.PartialSuccessMethods)
+			return kbMethod, nil
+		}
+		// Diagnostic logging for the primary method attempt
+		if stage == 0 && observer != nil {
+			if slices.Contains(ctx.AllowedMethods, protocol) && !slices.Contains(ctx.TriedMethods, protocol) {
+				event := authenticationDiagnostic(ctx)
+				event.Kind, event.Method, event.Methods = logger.AuthenticationAttempt, protocol, nil
+				logger.EmitDiagnostic(observer, event)
+			}
+		}
+		return nil, nil
 	}
 }
 

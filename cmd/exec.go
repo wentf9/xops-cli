@@ -82,6 +82,8 @@ func newCmdExecWithOptions(o *ExecOptions) *cobra.Command {
 	cmd.Flags().StringVar(&o.Host, "host", "", i18n.T("flag_hosts"))
 	cmd.Flags().BoolVar(&o.PasswordStdin, "password-stdin", false, i18n.T("flag_password_stdin"))
 	cmd.Flags().BoolVar(&o.PassphraseStdin, "passphrase-stdin", false, i18n.T("flag_passphrase_stdin"))
+	cmd.Flags().StringVar(&o.OTP, "otp", "", i18n.T("flag_otp"))
+	cmd.Flags().BoolVar(&o.OTPStdin, "otp-stdin", false, i18n.T("flag_otp_stdin"))
 	cmd.Flags().StringVar(&o.Remember, "remember", "", i18n.T("flag_remember"))
 	cmd.Flags().StringVar(&o.Alias, "alias", "", i18n.T("flag_alias"))
 	cmd.Flags().BoolVar(&o.Sudo, "sudo", false, i18n.T("flag_exec_sudo"))
@@ -102,6 +104,7 @@ func newCmdExecWithOptions(o *ExecOptions) *cobra.Command {
 	cmd.MarkFlagsMutuallyExclusive("host", "ifile", "tag")
 	cmd.MarkFlagsMutuallyExclusive("cmd", "shell")
 	cmd.MarkFlagsMutuallyExclusive("stream", "out-dir")
+	cmd.MarkFlagsMutuallyExclusive("otp", "otp-stdin")
 
 	return cmd
 }
@@ -300,6 +303,9 @@ func (o *ExecOptions) readStdinIfRequired(ctx context.Context) error {
 }
 
 func (o *ExecOptions) Validate() error {
+	if o.OTP != "" && o.OTPStdin {
+		return errors.New(i18n.T("err_otp_mutually_exclusive"))
+	}
 	if err := o.prepareCommandPlan(); err != nil {
 		return err
 	}
@@ -554,7 +560,7 @@ func (o *ExecOptions) buildAdapterOptions(tasks []execHostTask, cfg *config.Conf
 	adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{Remember: remember}))
 	for _, task := range tasks {
 		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(task.nodeID, adapter.SessionAuth{
-			Password: task.pass, Passphrase: task.passphrase, KeyPath: task.keyPath, Remember: remember,
+			Password: task.pass, Passphrase: task.passphrase, KeyPath: task.keyPath, Remember: remember, OTP: o.OTP,
 		}))
 	}
 	if reg, regErr := utils.GetCredentialRegistry(cfg); regErr != nil {

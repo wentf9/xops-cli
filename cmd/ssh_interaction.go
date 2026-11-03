@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strings"
+	"unicode"
 
 	"github.com/wentf9/xops-cli/cmd/utils"
 	coreauth "github.com/wentf9/xops-cli/core/auth"
@@ -17,6 +19,38 @@ import (
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"golang.org/x/term"
 )
+
+var (
+	ansiCSIFilter = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
+	ansiOSCFilter = regexp.MustCompile(`\x1b\][^\x07\x1b]*(\x07|\x1b\\)`)
+	ansiEscFilter = regexp.MustCompile(`\x1b[@-Z\\-_]`)
+)
+
+func sanitizeInteractiveText(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	cleaned := ansiCSIFilter.ReplaceAllString(raw, "")
+	cleaned = ansiOSCFilter.ReplaceAllString(cleaned, "")
+	cleaned = ansiEscFilter.ReplaceAllString(cleaned, "")
+
+	var b strings.Builder
+	b.Grow(len(cleaned))
+	for _, r := range cleaned {
+		if r == '\r' {
+			continue
+		}
+		if r == '\n' || r == '\t' {
+			b.WriteRune(r)
+			continue
+		}
+		if unicode.IsControl(r) {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
 
 type cliInteractionHandler struct {
 	canRemember bool
@@ -96,7 +130,28 @@ func (h *cliInteractionHandler) PromptSecret(ctx context.Context, request ssh.Se
 	}
 	defer release()
 
+	// 1. If server sent an instruction banner, print it first (sanitized) to output
+	if request.Instruction != "" && h.output != nil {
+		sanitizedInstruction := sanitizeInteractiveText(request.Instruction)
+		if sanitizedInstruction != "" {
+			if _, err := fmt.Fprintln(h.output, sanitizedInstruction); err != nil {
+				return "", fmt.Errorf("display instruction banner failed: %w", err)
+			}
+		}
+	}
+
+	// 2. Format and sanitize prompt text
 	prompt := formatSecretPrompt(request)
+
+	// 3. Select input method based on Echo flag
+	if request.Echo {
+		line, err := h.terminal.ReadLine(ctx, prompt)
+		if err != nil {
+			return "", fmt.Errorf("read line from terminal failed: %w", err)
+		}
+		return line, nil
+	}
+
 	secret, err := h.terminal.ReadSecret(ctx, prompt)
 	if err != nil {
 		return "", fmt.Errorf("read secret from terminal failed: %w", err)
@@ -125,25 +180,12 @@ func (h *cliInteractionHandler) ConfirmHostKey(ctx context.Context, request ssh.
 
 func formatSecretPrompt(req ssh.SecretRequest) string {
 	switch req.Kind {
+	case ssh.SecretKindKeyboardInteractive:
+		return formatKeyboardInteractivePrompt(req)
+	case ssh.SecretKindOTP:
+		return formatOTPPrompt(req)
 	case ssh.SecretKindLoginPassword:
-		if req.User != "" && req.Host != "" {
-			text := i18n.Tf("prompt_enter_password_for", map[string]any{"User": req.User, "Host": req.Host})
-			if text != "prompt_enter_password_for" {
-				return text
-			}
-			return fmt.Sprintf("Enter password for %s@%s: ", req.User, req.Host)
-		} else if req.User != "" {
-			text := i18n.Tf("prompt_enter_user_password", map[string]any{"User": req.User})
-			if text != "prompt_enter_user_password" {
-				return text
-			}
-			return fmt.Sprintf("Enter password for user %s: ", req.User)
-		}
-		text := i18n.T("prompt_enter_password")
-		if text != "prompt_enter_password" {
-			return text
-		}
-		return "Enter password: "
+		return formatLoginPasswordPrompt(req)
 	case ssh.SecretKindPrivateKeyPassphrase:
 		text := i18n.Tf("prompt_enter_passphrase", map[string]any{"Path": req.KeyPath})
 		if text != "prompt_enter_passphrase" {
@@ -165,6 +207,64 @@ func formatSecretPrompt(req ssh.SecretRequest) string {
 	default:
 		return "Enter password: "
 	}
+}
+
+func formatKeyboardInteractivePrompt(req ssh.SecretRequest) string {
+	sanitizedPrompt := sanitizeInteractiveText(req.Prompt)
+	if sanitizedPrompt == "" {
+		text := i18n.T("prompt_enter_response")
+		if text != "prompt_enter_response" {
+			return text
+		}
+		return "Enter response: "
+	}
+	if !strings.HasSuffix(sanitizedPrompt, " ") && !strings.HasSuffix(sanitizedPrompt, "\n") {
+		sanitizedPrompt += " "
+	}
+	return sanitizedPrompt
+}
+
+func formatOTPPrompt(req ssh.SecretRequest) string {
+	if req.Prompt != "" {
+		sanitizedPrompt := sanitizeInteractiveText(req.Prompt)
+		if !strings.HasSuffix(sanitizedPrompt, " ") && !strings.HasSuffix(sanitizedPrompt, "\n") {
+			sanitizedPrompt += " "
+		}
+		return sanitizedPrompt
+	}
+	if req.User != "" && req.Host != "" {
+		text := i18n.Tf("prompt_enter_otp_for", map[string]any{"User": req.User, "Host": req.Host})
+		if text != "prompt_enter_otp_for" {
+			return text
+		}
+		return fmt.Sprintf("Enter OTP code for %s@%s: ", req.User, req.Host)
+	}
+	text := i18n.T("prompt_enter_otp")
+	if text != "prompt_enter_otp" {
+		return text
+	}
+	return "Enter OTP code: "
+}
+
+func formatLoginPasswordPrompt(req ssh.SecretRequest) string {
+	if req.User != "" && req.Host != "" {
+		text := i18n.Tf("prompt_enter_password_for", map[string]any{"User": req.User, "Host": req.Host})
+		if text != "prompt_enter_password_for" {
+			return text
+		}
+		return fmt.Sprintf("Enter password for %s@%s: ", req.User, req.Host)
+	} else if req.User != "" {
+		text := i18n.Tf("prompt_enter_user_password", map[string]any{"User": req.User})
+		if text != "prompt_enter_user_password" {
+			return text
+		}
+		return fmt.Sprintf("Enter password for user %s: ", req.User)
+	}
+	text := i18n.T("prompt_enter_password")
+	if text != "prompt_enter_password" {
+		return text
+	}
+	return "Enter password: "
 }
 
 func formatHostKeyPrompt(req ssh.HostKeyConfirmation) string {

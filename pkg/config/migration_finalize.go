@@ -114,11 +114,31 @@ func (m *CredentialMigrator) verifyV2(ctx context.Context, data []byte, expected
 	if err != nil {
 		return err
 	}
+	refs := collectV2Refs(dto)
+	for ref := range refs {
+		if err := verifyMigrationRef(ctx, registry, ref, expected); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func collectV2Refs(dto *ConfigurationV2) map[credential.Ref]struct{} {
 	refs := make(map[credential.Ref]struct{})
 	for _, id := range dto.Identities {
 		for _, ref := range []*credential.Ref{id.LoginPasswordRef, id.PassphraseRef} {
 			if ref != nil && !ref.IsEmpty() {
 				refs[*ref] = struct{}{}
+			}
+		}
+		if id.OTP != nil && id.OTP.TOTPSecretRef != nil && !id.OTP.TOTPSecretRef.IsEmpty() {
+			refs[*id.OTP.TOTPSecretRef] = struct{}{}
+		}
+		if id.KeyboardInteractive != nil {
+			for _, r := range id.KeyboardInteractive.Rules {
+				if r.SecretRef != nil && !r.SecretRef.IsEmpty() {
+					refs[*r.SecretRef] = struct{}{}
+				}
 			}
 		}
 	}
@@ -127,12 +147,7 @@ func (m *CredentialMigrator) verifyV2(ctx context.Context, data []byte, expected
 			refs[*ref] = struct{}{}
 		}
 	}
-	for ref := range refs {
-		if err := verifyMigrationRef(ctx, registry, ref, expected); err != nil {
-			return err
-		}
-	}
-	return nil
+	return refs
 }
 
 func verifyMigrationRef(ctx context.Context, registry *credential.Registry, ref credential.Ref, expected map[credential.Ref][]byte) error {

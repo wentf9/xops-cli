@@ -32,6 +32,8 @@ type SshOptions struct {
 	User            string
 	Password        string
 	PasswordStdin   bool
+	OTP             string
+	OTPStdin        bool
 	IdentityFile    string
 	Passphrase      string
 	PassphraseStdin bool
@@ -101,6 +103,8 @@ func newCmdSshWithOptions(o *SshOptions) *cobra.Command {
 	cmd.Flags().StringVar(&o.Host, "host", "", i18n.T("flag_host"))
 	cmd.Flags().BoolVar(&o.PasswordStdin, "password-stdin", false, i18n.T("flag_password_stdin"))
 	cmd.Flags().BoolVar(&o.PassphraseStdin, "passphrase-stdin", false, i18n.T("flag_passphrase_stdin"))
+	cmd.Flags().StringVar(&o.OTP, "otp", "", i18n.T("flag_otp"))
+	cmd.Flags().BoolVar(&o.OTPStdin, "otp-stdin", false, i18n.T("flag_otp_stdin"))
 	cmd.Flags().StringVar(&o.Remember, "remember", "", i18n.T("flag_remember"))
 	cmd.Flags().BoolVar(&o.Sudo, "sudo", false, i18n.T("flag_sudo"))
 	cmd.Flags().StringVar(&o.Alias, "alias", "", i18n.T("flag_alias"))
@@ -108,12 +112,26 @@ func newCmdSshWithOptions(o *SshOptions) *cobra.Command {
 	o.execution.register(cmd)
 	cmd.Flags().BoolVar(&o.NoLoginShell, "no-login", false, i18n.T("flag_exec_no_login"))
 
+	cmd.MarkFlagsMutuallyExclusive("otp", "otp-stdin")
+
 	return cmd
 }
 
 func (o *SshOptions) Complete(cmd *cobra.Command, args []string) error {
 	o.args = args
 	o.execution.capturePresence(cmd)
+	hadCredentialStdin := o.OTPStdin || o.PasswordStdin || o.PassphraseStdin
+	if o.OTP != "" && o.OTPStdin {
+		return errors.New(i18n.T("err_otp_mutually_exclusive"))
+	}
+	if o.OTPStdin {
+		otp, err := utils.ReadSecretLineFromStdin()
+		if err != nil {
+			return fmt.Errorf("read otp from stdin: %w", err)
+		}
+		o.OTP = otp
+		o.OTPStdin = false
+	}
 	if o.PasswordStdin {
 		pwd, err := utils.ReadSecretFromStdin()
 		if err != nil {
@@ -128,7 +146,7 @@ func (o *SshOptions) Complete(cmd *cobra.Command, args []string) error {
 		}
 		o.Passphrase = pass
 	}
-	if !o.StdinRedirect {
+	if !o.StdinRedirect && !hadCredentialStdin {
 		stat, err := os.Stdin.Stat()
 		if err == nil && (stat.Mode()&os.ModeCharDevice) == 0 {
 			o.stdinScript = true
@@ -190,6 +208,9 @@ func (o *SshOptions) parseArgs() error {
 }
 
 func (o *SshOptions) Validate() error {
+	if o.OTP != "" && o.OTPStdin {
+		return errors.New(i18n.T("err_otp_mutually_exclusive"))
+	}
 	if err := utils.ValidateRememberPolicy(o.Remember); err != nil {
 		return err
 	}
@@ -210,6 +231,9 @@ func (o *SshOptions) Validate() error {
 	}
 	if o.BgRun && !o.NoCmd {
 		return errors.New(i18n.T("ssh_err_background_requires_nocmd"))
+	}
+	if o.BgRun && (o.OTP != "" || o.OTPStdin) {
+		return fmt.Errorf("background mode (-f) cannot be combined with one-time --otp or --otp-stdin; configure persistent identity otp instead")
 	}
 	if strings.Contains(o.Alias, "@") || strings.Contains(o.Alias, ":") {
 		return errors.New(i18n.T("ssh_err_alias_invalid"))
@@ -361,6 +385,7 @@ func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuratio
 		Passphrase: o.Passphrase,
 		KeyPath:    utils.ToAbsolutePath(o.IdentityFile),
 		Remember:   shouldRemember,
+		OTP:        o.OTP,
 	}))
 	if reg, regErr := utils.GetCredentialRegistry(cfg); regErr != nil {
 		return nil, fmt.Errorf("initialize credential resolver: %w", regErr)

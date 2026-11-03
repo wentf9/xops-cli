@@ -124,6 +124,45 @@ func ReadSecretFromStdin() (string, error) {
 	return ReadSecretFromReader(os.Stdin)
 }
 
+// ReadSecretLineFromReader 从指定的 Reader 流逐字节读取单行机密（直到 \n 或 EOF），
+// 不预先缓冲后续字节，防止吞掉流中后续数据，并去除末尾的 \r 和 \n。
+func ReadSecretLineFromReader(r io.Reader, maxBytes int64) (string, error) {
+	if r == nil {
+		r = os.Stdin
+	}
+	if maxBytes <= 0 {
+		maxBytes = 4096
+	}
+	var buf []byte
+	b := make([]byte, 1)
+	for int64(len(buf)) < maxBytes {
+		n, err := r.Read(b)
+		if n > 0 {
+			if b[0] == '\n' {
+				break
+			}
+			buf = append(buf, b[0])
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return "", fmt.Errorf("read secret line failed: %w", err)
+		}
+	}
+	line := strings.TrimRight(string(buf), "\r\n")
+	line = strings.TrimSpace(line)
+	if len(line) == 0 {
+		return "", errors.New("standard input is empty")
+	}
+	return line, nil
+}
+
+// ReadSecretLineFromStdin 从标准输入流读取单行机密
+func ReadSecretLineFromStdin() (string, error) {
+	return ReadSecretLineFromReader(os.Stdin, 4096)
+}
+
 // EffectiveRememberPolicy applies command override, configuration, then ask.
 func EffectiveRememberPolicy(override string, cfg *config.Configuration) string {
 	policy := strings.ToLower(strings.TrimSpace(override))

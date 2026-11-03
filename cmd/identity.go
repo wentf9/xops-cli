@@ -6,10 +6,12 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/i18n"
@@ -34,7 +36,15 @@ func NewCmdIdentity() *cobra.Command {
 	cmd.AddCommand(NewCmdIdentityEdit())
 	cmd.AddCommand(NewCmdIdentityDelete())
 	cmd.AddCommand(NewCmdIdentityCredential())
+	cmd.AddCommand(newCmdIdentitySetSecret())
 
+	return cmd
+}
+
+func newCmdIdentitySetSecret() *cobra.Command {
+	cmd := newCmdIdentityCredentialSet()
+	cmd.Use = "set-secret [name]"
+	cmd.Short = i18n.T("identity_set_secret_short")
 	return cmd
 }
 
@@ -315,6 +325,7 @@ func newCmdIdentityCredentialSet() *cobra.Command {
 	var (
 		kindStr       string
 		storeID       string
+		ruleName      string
 		passwordStdin bool
 	)
 
@@ -325,8 +336,11 @@ func newCmdIdentityCredentialSet() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
 			kind := credential.Kind(kindStr)
-			if kind != credential.KindLoginPassword && kind != credential.KindPassphrase {
-				return fmt.Errorf("invalid credential kind %q: must be login_password or passphrase", kindStr)
+			if err := kind.Validate(); err != nil {
+				return fmt.Errorf("invalid credential kind %q: must be login_password, passphrase, totp_secret, or challenge_answer", kindStr)
+			}
+			if kind == credential.KindChallengeAnswer && strings.TrimSpace(ruleName) == "" {
+				return errors.New(i18n.T("err_rule_required_for_challenge"))
 			}
 
 			_, repo, cfg, err := utils.GetConfigStore()
@@ -344,9 +358,23 @@ func newCmdIdentityCredentialSet() *cobra.Command {
 				return fmt.Errorf("resolve identity %q reference: %w", name, config.ErrIdentityNotFound)
 			}
 
+			if kind == credential.KindChallengeAnswer {
+				if err := validateIdentityChallengeRule(ident, ruleName, name); err != nil {
+					return err
+				}
+			}
+
 			secretStr, err := resolveSecretInput(cmd.InOrStdin(), passwordStdin, kindStr)
 			if err != nil {
 				return err
+			}
+
+			if kind == credential.KindTOTPSecret {
+				totpCfg, err := coreauth.ParseTOTPSecret(secretStr)
+				if err != nil {
+					return fmt.Errorf("invalid TOTP secret: %w", err)
+				}
+				clear(totpCfg.Secret)
 			}
 
 			targetStore := storeID
@@ -358,12 +386,7 @@ func newCmdIdentityCredentialSet() *cobra.Command {
 				}
 			}
 
-			var oldRef *credential.Ref
-			if kind == credential.KindLoginPassword {
-				oldRef = ident.LoginPasswordRef
-			} else {
-				oldRef = ident.PassphraseRef
-			}
+			oldRef := findIdentityOldRef(kind, ident, ruleName)
 
 			svc, err := utils.GetCredentialService(repo, cfg)
 			if err != nil {
@@ -373,19 +396,24 @@ func newCmdIdentityCredentialSet() *cobra.Command {
 			target := credential.Target{
 				IdentityID: name,
 				Kind:       kind,
+				RuleName:   ruleName,
 			}
-			target.KeyPath = ident.KeyPath
-			target, err = config.BindPrivateKeyFingerprint(cfg, target, []byte(secretStr))
-			if err != nil {
-				return err
+			if kind == credential.KindPassphrase {
+				target.KeyPath = ident.KeyPath
+				target, err = config.BindPrivateKeyFingerprint(cfg, target, []byte(secretStr))
+				if err != nil {
+					return err
+				}
 			}
+			secret := credential.NewSecret([]byte(secretStr))
+			defer secret.Zero()
 			newRef, _, err := svc.Rotate(
 				cmd.Context(),
 				target,
 				string(ref.Version[:]),
 				oldRef,
 				targetStore,
-				credential.Secret{Value: []byte(secretStr)},
+				secret,
 			)
 			if err != nil {
 				return fmt.Errorf("rotate credential in store failed: %w", err)
@@ -398,6 +426,7 @@ func newCmdIdentityCredentialSet() *cobra.Command {
 
 	cmd.Flags().StringVar(&kindStr, "kind", "login_password", i18n.T("flag_credential_kind"))
 	cmd.Flags().StringVar(&storeID, "store", "", i18n.T("flag_credential_store"))
+	cmd.Flags().StringVar(&ruleName, "rule", "", i18n.T("flag_credential_rule"))
 	cmd.Flags().BoolVar(&passwordStdin, "password-stdin", false, i18n.T("flag_password_stdin"))
 	return cmd
 }
@@ -414,7 +443,10 @@ func resolveSecretInput(r io.Reader, stdin bool, kindStr string) (string, error)
 }
 
 func newCmdIdentityCredentialDelete() *cobra.Command {
-	var kindStr string
+	var (
+		kindStr  string
+		ruleName string
+	)
 
 	cmd := &cobra.Command{
 		Use:   "delete [name]",
@@ -423,8 +455,11 @@ func newCmdIdentityCredentialDelete() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
 			kind := credential.Kind(kindStr)
-			if kind != credential.KindLoginPassword && kind != credential.KindPassphrase {
-				return fmt.Errorf("invalid credential kind %q: must be login_password or passphrase", kindStr)
+			if err := kind.Validate(); err != nil {
+				return fmt.Errorf("invalid credential kind %q: must be login_password, passphrase, totp_secret, or challenge_answer", kindStr)
+			}
+			if kind == credential.KindChallengeAnswer && strings.TrimSpace(ruleName) == "" {
+				return errors.New(i18n.T("err_rule_required_for_challenge"))
 			}
 
 			_, repo, cfg, err := utils.GetConfigStore()
@@ -442,16 +477,18 @@ func newCmdIdentityCredentialDelete() *cobra.Command {
 				return fmt.Errorf("resolve identity %q reference: %w", name, config.ErrIdentityNotFound)
 			}
 
-			var oldRef *credential.Ref
-			if kind == credential.KindLoginPassword {
-				oldRef = ident.LoginPasswordRef
-			} else {
-				oldRef = ident.PassphraseRef
+			if kind == credential.KindChallengeAnswer {
+				if err := validateIdentityChallengeRule(ident, ruleName, name); err != nil {
+					return err
+				}
 			}
+
+			oldRef := findIdentityOldRef(kind, ident, ruleName)
 
 			target := credential.Target{
 				IdentityID: name,
 				Kind:       kind,
+				RuleName:   ruleName,
 			}
 
 			svc, err := utils.GetCredentialService(repo, cfg)
@@ -477,5 +514,39 @@ func newCmdIdentityCredentialDelete() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&kindStr, "kind", "login_password", i18n.T("flag_credential_kind"))
+	cmd.Flags().StringVar(&ruleName, "rule", "", i18n.T("flag_credential_rule"))
 	return cmd
+}
+
+func validateIdentityChallengeRule(ident models.Identity, ruleName, identityName string) error {
+	if ident.KeyboardInteractive != nil {
+		for _, r := range ident.KeyboardInteractive.Rules {
+			if r.Name == ruleName {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("challenge rule %q not found in identity %q", ruleName, identityName)
+}
+
+func findIdentityOldRef(kind credential.Kind, ident models.Identity, ruleName string) *credential.Ref {
+	switch kind {
+	case credential.KindLoginPassword:
+		return ident.LoginPasswordRef
+	case credential.KindPassphrase:
+		return ident.PassphraseRef
+	case credential.KindTOTPSecret:
+		if ident.OTP != nil {
+			return ident.OTP.TOTPSecretRef
+		}
+	case credential.KindChallengeAnswer:
+		if ident.KeyboardInteractive != nil {
+			for _, r := range ident.KeyboardInteractive.Rules {
+				if r.Name == ruleName {
+					return r.SecretRef
+				}
+			}
+		}
+	}
+	return nil
 }

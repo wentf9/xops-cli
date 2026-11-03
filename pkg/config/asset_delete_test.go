@@ -6,6 +6,7 @@ import (
 
 	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
+	"github.com/wentf9/xops-cli/pkg/models"
 )
 
 func TestAssetDeletionCollectsAllKindsAndPreservesUncertainCommit(t *testing.T) {
@@ -101,5 +102,63 @@ func TestAssetDeletionWithoutServiceFailsBeforeChangingReferences(t *testing.T) 
 	}
 	if _, exists := repo.GetNode("web-server"); !exists {
 		t.Fatal("deletion silently bypassed journal")
+	}
+}
+
+func TestAssetDeletionCollectsOTPAndChallengeAnswerCredentials(t *testing.T) {
+	cfg := newTestProvider().Snapshot()
+	node, _ := cfg.Nodes.Get("web-server")
+	identity, _ := cfg.Identities.Get(node.IdentityRef)
+
+	totpRef := credential.Ref{StoreID: "memory", ItemID: "totp-key"}
+	answerRef := credential.Ref{StoreID: "memory", ItemID: "answer-key"}
+
+	identity.OTP = &models.OTPConfig{
+		TOTPSecretRef: &totpRef,
+	}
+	identity.KeyboardInteractive = &models.KeyboardInteractiveConfig{
+		Rules: []models.ChallengeRule{
+			{
+				Name:          "r1",
+				PromptPattern: "Answer:",
+				Source:        models.ChallengeSourceSecret,
+				SecretRef:     &answerRef,
+			},
+		},
+	}
+	cfg.Identities.Set(node.IdentityRef, identity)
+
+	persistent := &memoryPersistStore{cfg: cfg, result: &PersistResult{Applied: true, Durable: true}}
+	repo, err := NewRepositoryWithoutOpenSSH(cfg, persistent)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store := &inMemoryCredStore{data: map[string][]byte{
+		"totp-key":   []byte("base32seed"),
+		"answer-key": []byte("staticanswer"),
+	}}
+	registry := credential.NewRegistry()
+	if err := registry.Register("memory", store); err != nil {
+		t.Fatal(err)
+	}
+	journal, err := credential.NewJournalStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc, err := credential.NewService(registry, journal, repo.AsConfigUpdater(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ref := repo.View().NodeRefs["web-server"]
+	err = repo.DeleteNodesWithCredentialsContext(t.Context(), []NodeRef{ref}, svc)
+	if err != nil {
+		t.Fatalf("DeleteNodesWithCredentialsContext failed: %v", err)
+	}
+
+	// Verify both OTP and ChallengeAnswer secrets are cleaned up
+	if len(store.data) != 0 {
+		t.Fatalf("expected all credentials to be deleted, remaining: %v", store.data)
 	}
 }

@@ -5,11 +5,13 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	coreauth "github.com/wentf9/xops-cli/core/auth"
+	"github.com/wentf9/xops-cli/core/concurrent"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
 )
@@ -1038,5 +1040,175 @@ func TestCrossRepository_CleanupStage_AllowsConfigurationEvolution(t *testing.T)
 	entries, _ := journalStore.ListPending()
 	if len(entries) != 0 {
 		t.Fatalf("cleanup journal should be removed, got %d", len(entries))
+	}
+}
+
+func TestNodeAuthVersion_OTPAndKeyboardInteractive(t *testing.T) {
+	cfg := &Configuration{
+		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
+		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
+	}
+
+	id := models.Identity{
+		User:     "dev",
+		AuthType: "otp",
+		OTP: &models.OTPConfig{
+			TOTPSecretRef: &credential.Ref{StoreID: "s1", ItemID: "totp-1"},
+		},
+		KeyboardInteractive: &models.KeyboardInteractiveConfig{
+			Rules: []models.ChallengeRule{
+				{
+					Name:          "r1",
+					PromptPattern: "Code:",
+					Source:        models.ChallengeSourceOTP,
+				},
+			},
+		},
+	}
+	cfg.Identities.Set("id1", id)
+	cfg.Nodes.Set("node1", models.Node{IdentityRef: "id1"})
+
+	baseVer, err := nodeAuthVersion(cfg, "node1")
+	if err != nil {
+		t.Fatalf("nodeAuthVersion failed: %v", err)
+	}
+
+	// 1. Same config yields identical hash
+	sameVer, err := nodeAuthVersion(cfg, "node1")
+	if err != nil || sameVer != baseVer {
+		t.Fatalf("expected identical hash for unchanged config")
+	}
+
+	// 2. Mutating OTP TOTPSecretRef alters version
+	idMutatedOTP := id.Clone()
+	idMutatedOTP.OTP.TOTPSecretRef.ItemID = "totp-2"
+	cfg.Identities.Set("id1", idMutatedOTP)
+
+	otpVer, err := nodeAuthVersion(cfg, "node1")
+	if err != nil {
+		t.Fatalf("nodeAuthVersion failed: %v", err)
+	}
+	if otpVer == baseVer {
+		t.Fatalf("expected version hash to change after mutating OTP TOTPSecretRef")
+	}
+
+	// 3. Mutating KeyboardInteractive rule pattern alters version
+	idMutatedKI := id.Clone()
+	idMutatedKI.KeyboardInteractive.Rules[0].PromptPattern = "Password:"
+	cfg.Identities.Set("id1", idMutatedKI)
+
+	kiVer, err := nodeAuthVersion(cfg, "node1")
+	if err != nil {
+		t.Fatalf("nodeAuthVersion failed: %v", err)
+	}
+	if kiVer == baseVer || kiVer == otpVer {
+		t.Fatalf("expected version hash to change after mutating KeyboardInteractive rule")
+	}
+}
+
+func setupTestRepoWithChallengeAnswer(t *testing.T) (*Repository, string) {
+	t.Helper()
+	store := &mockPersistStore{result: PersistResult{Applied: true, Durable: true}}
+	repo, err := NewRepositoryWithoutOpenSSH(newTestProvider().Snapshot(), store)
+	if err != nil {
+		t.Fatalf("NewRepositoryWithoutOpenSSH failed: %v", err)
+	}
+
+	id := models.Identity{
+		User:     "ops",
+		AuthType: "keyboard-interactive",
+		KeyboardInteractive: &models.KeyboardInteractiveConfig{
+			Rules: []models.ChallengeRule{
+				{
+					Name:          "answer-rule",
+					PromptPattern: "PIN:",
+					Source:        models.ChallengeSourceSecret,
+					SecretRef:     &credential.Ref{StoreID: "s1", ItemID: "old-pin"},
+				},
+			},
+		},
+	}
+	if err := createIdentity(repo, "id-1", id); err != nil {
+		t.Fatalf("createIdentity failed: %v", err)
+	}
+
+	node := models.Node{IdentityRef: "id-1", HostRef: "h1"}
+	host := models.Host{Address: "10.0.0.1", Port: 22}
+	if err := createNode(repo, "node-1", node, host, id); err != nil {
+		t.Fatalf("createNode failed: %v", err)
+	}
+
+	connSnap, err := repo.ResolveConnection("node-1")
+	if err != nil {
+		t.Fatalf("ResolveConnection failed: %v", err)
+	}
+	return repo, string(connSnap.UpdateRef.AuthVersion[:])
+}
+
+func TestRepository_CASMutation_TOTPSecret(t *testing.T) {
+	ctx := context.Background()
+	repo, initialAuthVer := setupTestRepoWithChallengeAnswer(t)
+
+	totpRef := credential.Ref{StoreID: "s1", ItemID: "new-totp"}
+	totpTarget := credential.Target{NodeID: "node-1", Kind: credential.KindTOTPSecret}
+	outcome, newVer, err := repo.AsConfigUpdater().ApplyCredentialRefAtVersion(ctx, totpTarget, initialAuthVer, &totpRef)
+	if err != nil || !outcome.Durable {
+		t.Fatalf("ApplyCredentialRefAtVersion for KindTOTPSecret failed: %v", err)
+	}
+	if newVer == initialAuthVer {
+		t.Fatalf("expected auth version to change after TOTP secret update")
+	}
+
+	snap := repo.Snapshot()
+	if !isRefReferencedIn(snap, totpRef) {
+		t.Fatalf("expected isRefReferencedIn(totpRef) to be true")
+	}
+	if !confirmNodeRefDurable(snap, totpTarget, &totpRef) {
+		t.Fatalf("expected confirmNodeRefDurable for TOTP secret to be true")
+	}
+
+	_, _, err = repo.AsConfigUpdater().ApplyCredentialRefAtVersion(ctx, totpTarget, initialAuthVer, &totpRef)
+	if err == nil || !errors.Is(err, ErrConfigConflict) {
+		t.Fatalf("expected ErrConfigConflict for stale version, got: %v", err)
+	}
+}
+
+func TestRepository_CASMutation_ChallengeAnswer(t *testing.T) {
+	ctx := context.Background()
+	repo, initialAuthVer := setupTestRepoWithChallengeAnswer(t)
+
+	ansRef := credential.Ref{StoreID: "s1", ItemID: "new-pin"}
+	ansTarget := credential.Target{NodeID: "node-1", Kind: credential.KindChallengeAnswer, RuleName: "answer-rule"}
+	outcome2, newVer2, err := repo.AsConfigUpdater().ApplyCredentialRefAtVersion(ctx, ansTarget, initialAuthVer, &ansRef)
+	if err != nil || !outcome2.Durable {
+		t.Fatalf("ApplyCredentialRefAtVersion for KindChallengeAnswer failed: %v", err)
+	}
+	if newVer2 == initialAuthVer {
+		t.Fatalf("expected auth version to change after ChallengeAnswer update")
+	}
+
+	snap2 := repo.Snapshot()
+	if !isRefReferencedIn(snap2, ansRef) {
+		t.Fatalf("expected isRefReferencedIn(ansRef) to be true")
+	}
+	if !confirmNodeRefDurable(snap2, ansTarget, &ansRef) {
+		t.Fatalf("expected confirmNodeRefDurable for ChallengeAnswer to be true")
+	}
+
+	badRuleTarget := credential.Target{NodeID: "node-1", Kind: credential.KindChallengeAnswer, RuleName: "nonexistent-rule"}
+	_, _, err = repo.AsConfigUpdater().ApplyCredentialRefAtVersion(ctx, badRuleTarget, newVer2, &ansRef)
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("expected rule not found error, got: %v", err)
+	}
+
+	idTarget := credential.Target{IdentityID: "id-1", Kind: credential.KindChallengeAnswer, RuleName: "answer-rule"}
+	idAnsRef := credential.Ref{StoreID: "s1", ItemID: "identity-pin"}
+	outcome3, _, err := repo.AsConfigUpdater().ApplyCredentialRefAtVersion(ctx, idTarget, "", &idAnsRef)
+	if err != nil || !outcome3.Durable {
+		t.Fatalf("identity-level ApplyCredentialRefAtVersion failed: %v", err)
+	}
+	snap3 := repo.Snapshot()
+	if !confirmIdentityRefDurable(snap3, idTarget, &idAnsRef) {
+		t.Fatalf("expected confirmIdentityRefDurable to be true")
 	}
 }

@@ -4,13 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"github.com/wentf9/xops-cli/pkg/credential"
 	"os"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/wentf9/xops-cli/pkg/credential"
+	"github.com/wentf9/xops-cli/pkg/models"
 	"gopkg.in/yaml.v3"
 )
 
@@ -353,5 +354,80 @@ func TestBackendMigrationExpiryComparison(t *testing.T) {
 	b.ExpiresAt = &changed
 	if sameMigrationSecret(a, b) {
 		t.Fatal("changed expiry accepted")
+	}
+}
+
+func TestBackendMigration_OTPAndKeyboardInteractive(t *testing.T) {
+	totpRef := credential.Ref{StoreID: "storeA", ItemID: "totp-old"}
+	ruleRef := credential.Ref{StoreID: "storeA", ItemID: "rule-old"}
+
+	cfg := &ConfigurationV2{
+		SchemaVersion: 2,
+		Credential: CredentialConfig{
+			DefaultStore: "storeA",
+			Stores: map[string]StoreConfig{
+				"storeA": {Type: StoreTypePass},
+				"storeB": {Type: StoreTypePass},
+			},
+		},
+		Hosts: map[string]models.Host{
+			"h1": {Address: "127.0.0.1", Port: 22},
+		},
+		Identities: map[string]IdentityV2{
+			"ops": {
+				User:     "dev",
+				AuthType: "keyboard-interactive",
+				OTP: &models.OTPConfig{
+					TOTPSecretRef: &totpRef,
+				},
+				KeyboardInteractive: &models.KeyboardInteractiveConfig{
+					Rules: []models.ChallengeRule{
+						{
+							Name:          "r1",
+							PromptPattern: "PIN:",
+							Source:        models.ChallengeSourceSecret,
+							SecretRef:     &ruleRef,
+						},
+					},
+				},
+			},
+		},
+		Nodes: map[string]NodeV2{
+			"n1": {HostRef: "h1", IdentityRef: "ops"},
+		},
+	}
+
+	// 1. backendRefs collects both totp and rule secret refs
+	refs := backendRefs(cfg)
+	if len(refs) != 2 {
+		t.Fatalf("expected 2 refs in backendRefs, got %d", len(refs))
+	}
+
+	// 2. Plan migration to storeB
+	raw, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	state, planRaw, err := planBackendMigration(raw, "storeB", nil)
+	if err != nil {
+		t.Fatalf("planBackendMigration failed: %v", err)
+	}
+
+	if len(state.Entries) != 2 {
+		t.Fatalf("expected 2 migration entries, got %d", len(state.Entries))
+	}
+
+	plannedCfg, err := UnmarshalV2(planRaw)
+	if err != nil {
+		t.Fatalf("UnmarshalV2 of planned config failed: %v", err)
+	}
+
+	plannedID := plannedCfg.Identities["ops"]
+	if plannedID.OTP.TOTPSecretRef.StoreID != "storeB" {
+		t.Fatalf("expected TOTPSecretRef to migrate to storeB, got %s", plannedID.OTP.TOTPSecretRef.StoreID)
+	}
+	if plannedID.KeyboardInteractive.Rules[0].SecretRef.StoreID != "storeB" {
+		t.Fatalf("expected rule SecretRef to migrate to storeB, got %s", plannedID.KeyboardInteractive.Rules[0].SecretRef.StoreID)
 	}
 }

@@ -36,7 +36,8 @@ func (r *Repository) NodeCredentialEdit(ref NodeRef, nodeID string, node models.
 }
 
 func (u *credentialEditUpdater) ApplyCredentialRefAtVersion(ctx context.Context, target credential.Target, expectedVersion string, newRef *credential.Ref) (credential.MutationOutcome, string, error) {
-	if target.Kind != credential.KindLoginPassword && target.Kind != credential.KindPassphrase {
+	if target.Kind != credential.KindLoginPassword && target.Kind != credential.KindPassphrase &&
+		target.Kind != credential.KindTOTPSecret && target.Kind != credential.KindChallengeAnswer {
 		return credential.MutationOutcome{}, "", fmt.Errorf("%w: inventory edit requires an authentication credential", coreauth.ErrInvalidRef)
 	}
 	if newRef != nil {
@@ -48,12 +49,8 @@ func (u *credentialEditUpdater) ApplyCredentialRefAtVersion(ctx context.Context,
 		return credential.MutationOutcome{}, "", err
 	}
 	identity := cloneIdentity(u.identity)
-	if target.Kind == credential.KindLoginPassword {
-		identity.LoginPasswordRef = newRef.Clone()
-		identity.Password = ""
-	} else {
-		identity.PassphraseRef = newRef.Clone()
-		identity.Passphrase = ""
+	if err := applyTargetRefToIdentity(&identity, target, newRef); err != nil {
+		return credential.MutationOutcome{}, "", err
 	}
 	applyIdentityCredentialMetadata(&identity, target)
 	var version Version
@@ -88,4 +85,20 @@ func (u *credentialEditUpdater) validateTarget(target credential.Target, expecte
 		return nil
 	}
 	return fmt.Errorf("%w: credential target does not match the displayed inventory edit", coreauth.ErrConfigConflict)
+}
+
+func applyTargetRefToIdentity(identity *models.Identity, target credential.Target, newRef *credential.Ref) error {
+	switch target.Kind {
+	case credential.KindLoginPassword:
+		identity.LoginPasswordRef = newRef.Clone()
+		identity.Password = ""
+	case credential.KindPassphrase:
+		identity.PassphraseRef = newRef.Clone()
+		identity.Passphrase = ""
+	case credential.KindTOTPSecret:
+		return applyIdentityTOTPSecretRef(identity, newRef)
+	case credential.KindChallengeAnswer:
+		return applyIdentityChallengeAnswerRef(identity, newRef, target.RuleName, target.IdentityID)
+	}
+	return nil
 }

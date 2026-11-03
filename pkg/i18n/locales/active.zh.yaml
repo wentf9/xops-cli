@@ -779,15 +779,33 @@ identity_credential_set_short:
 identity_credential_delete_short:
   other: "删除指定身份的持久化机密引用"
 flag_credential_kind:
-  other: "凭据机密类型 (login_password, passphrase)"
+  other: "凭据机密类型 (login_password, passphrase, totp_secret, challenge_answer)"
 flag_credential_store:
   other: "目标凭据存储 ID（留空使用默认 Store）"
+flag_credential_rule:
+  other: "质询规则名称（当 kind 为 challenge_answer 时必填）"
 flag_password_stdin:
   other: "从标准输入 (stdin) 安全读取密码，避免在进程参数中暴露明文"
 flag_passphrase_stdin:
   other: "从标准输入 (stdin) 安全读取私钥密码，避免在进程参数中暴露明文"
+flag_otp:
+  other: "当前连接会话的一次性动态口令 (OTP/2FA)"
+flag_otp_stdin:
+  other: "从标准输入安全读取一次性动态口令 (OTP)"
 flag_remember:
   other: "凭据保存策略: ask、always、never；未指定时继承 credential.remember_prompted，再默认 ask；批处理不保存"
+err_otp_mutually_exclusive:
+  other: "不能同时指定 --otp 与 --otp-stdin"
+err_rule_required_for_challenge:
+  other: "当凭据类型为 challenge_answer 时必须指定 --rule 规则名称"
+prompt_enter_otp:
+  other: "请输入一次性动态口令 (OTP): "
+prompt_enter_otp_for:
+  other: "请输入 {{.User}}@{{.Host}} 的一次性动态口令 (OTP): "
+prompt_enter_response:
+  other: "请输入应答内容: "
+identity_set_secret_short:
+  other: "为指定身份安全存储机密凭据 (password, passphrase, totp_secret, challenge_answer)"
 
 
 credential_migrate_short:

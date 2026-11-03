@@ -79,6 +79,8 @@ func NewCmdSftp() *cobra.Command {
 	cmd.Flags().StringVar(&o.Host, "host", "", i18n.T("flag_host"))
 	cmd.Flags().BoolVar(&o.PasswordStdin, "password-stdin", false, i18n.T("flag_password_stdin"))
 	cmd.Flags().BoolVar(&o.PassphraseStdin, "passphrase-stdin", false, i18n.T("flag_passphrase_stdin"))
+	cmd.Flags().StringVar(&o.OTP, "otp", "", i18n.T("flag_otp"))
+	cmd.Flags().BoolVar(&o.OTPStdin, "otp-stdin", false, i18n.T("flag_otp_stdin"))
 	cmd.Flags().StringVar(&o.Remember, "remember", "", i18n.T("flag_remember"))
 	cmd.Flags().StringVar(&o.Alias, "alias", "", i18n.T("flag_alias"))
 	cmd.Flags().StringSliceVar(&o.Tags, "tag", []string{}, i18n.T("flag_tag"))
@@ -86,6 +88,7 @@ func NewCmdSftp() *cobra.Command {
 	o.diagnostic.registerVerbose(cmd, "flag_sftp_verbose")
 
 	cmd.MarkFlagsMutuallyExclusive("force", "no-clobber")
+	cmd.MarkFlagsMutuallyExclusive("otp", "otp-stdin")
 	return cmd
 }
 

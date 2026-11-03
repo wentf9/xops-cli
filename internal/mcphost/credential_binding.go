@@ -36,7 +36,7 @@ func credentialVersion(provider config.ConfigProvider, plan ssh.ConnectionPlan) 
 			NodeID: hop.NodeID, IdentityRef: snapshot.Node.IdentityRef, Identity: snapshot.Identity,
 			SudoMode: snapshot.Node.SudoMode, SuPassword: snapshot.Node.SuPwd, PrivilegePasswordRef: snapshot.Node.PrivilegePasswordRef,
 		})
-		for _, ref := range []*credential.Ref{snapshot.Identity.LoginPasswordRef, snapshot.Identity.PassphraseRef, snapshot.Node.PrivilegePasswordRef} {
+		for _, ref := range hopCredentialRefs(snapshot) {
 			if ref == nil || ref.IsEmpty() {
 				continue
 			}
@@ -60,4 +60,21 @@ func credentialVersion(provider config.ConfigProvider, plan ssh.ConnectionPlan) 
 	defer clear(data)
 	digest := sha256.Sum256(data)
 	return "credentials-v1:" + hex.EncodeToString(digest[:]), nil
+}
+
+func hopCredentialRefs(snapshot config.ConnectionSnapshot) []*credential.Ref {
+	refs := []*credential.Ref{
+		snapshot.Identity.LoginPasswordRef,
+		snapshot.Identity.PassphraseRef,
+		snapshot.Node.PrivilegePasswordRef,
+	}
+	if snapshot.Identity.OTP != nil {
+		refs = append(refs, snapshot.Identity.OTP.TOTPSecretRef)
+	}
+	if snapshot.Identity.KeyboardInteractive != nil {
+		for i := range snapshot.Identity.KeyboardInteractive.Rules {
+			refs = append(refs, snapshot.Identity.KeyboardInteractive.Rules[i].SecretRef)
+		}
+	}
+	return refs
 }

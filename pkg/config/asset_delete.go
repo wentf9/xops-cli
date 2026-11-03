@@ -7,6 +7,7 @@ import (
 
 	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/credential"
+	"github.com/wentf9/xops-cli/pkg/models"
 )
 
 // DeleteNodesWithCredentialsContext atomically removes selected assets, then
@@ -20,8 +21,10 @@ func (r *Repository) DeleteNodesWithCredentialsContext(ctx context.Context, refs
 	var credentials []credential.Ref
 	for _, ref := range refs {
 		node, _ := cfg.Nodes.Get(ref.ID)
-		identity, _ := cfg.Identities.Get(node.IdentityRef)
-		credentials = appendCredentialRefs(credentials, node.PrivilegePasswordRef, identity.LoginPasswordRef, identity.PassphraseRef)
+		credentials = appendCredentialRefs(credentials, node.PrivilegePasswordRef)
+		if identity, ok := cfg.Identities.Get(node.IdentityRef); ok {
+			credentials = appendIdentityCredentialRefs(credentials, identity)
+		}
 	}
 	return deleteAssetsWithCredentials(ctx, service, credentials, func(ctx context.Context) (MutationOutcome, error) {
 		return r.deleteNodesAtRefsWithOutcome(ctx, refs)
@@ -36,10 +39,23 @@ func (r *Repository) DeleteIdentityWithCredentialsContext(ctx context.Context, r
 		return err
 	}
 	identity, _ := cfg.Identities.Get(ref.ID)
-	refs := appendCredentialRefs(nil, identity.LoginPasswordRef, identity.PassphraseRef)
+	refs := appendIdentityCredentialRefs(nil, identity)
 	return deleteAssetsWithCredentials(ctx, service, refs, func(ctx context.Context) (MutationOutcome, error) {
 		return r.DeleteIdentityAtRefContext(ctx, ref)
 	})
+}
+
+func appendIdentityCredentialRefs(refs []credential.Ref, identity models.Identity) []credential.Ref {
+	refs = appendCredentialRefs(refs, identity.LoginPasswordRef, identity.PassphraseRef)
+	if identity.OTP != nil {
+		refs = appendCredentialRefs(refs, identity.OTP.TOTPSecretRef)
+	}
+	if identity.KeyboardInteractive != nil {
+		for _, r := range identity.KeyboardInteractive.Rules {
+			refs = appendCredentialRefs(refs, r.SecretRef)
+		}
+	}
+	return refs
 }
 
 func appendCredentialRefs(refs []credential.Ref, candidates ...*credential.Ref) []credential.Ref {

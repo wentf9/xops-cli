@@ -18,16 +18,37 @@ const (
 	KindPassphrase Kind = "passphrase"
 	// KindPrivilegePassword 标识提权密码（sudo 或 su）。
 	KindPrivilegePassword Kind = "privilege_password"
+	// KindTOTPSecret 标识 TOTP 种子密钥（RFC 6238 / RFC 4226）。
+	KindTOTPSecret Kind = "totp_secret"
+	// KindChallengeAnswer 标识 keyboard-interactive 静态挑战应答。
+	KindChallengeAnswer Kind = "challenge_answer"
 )
 
 // Validate 验证 Kind 是否合法。
 func (k Kind) Validate() error {
 	switch k {
-	case KindLoginPassword, KindPassphrase, KindPrivilegePassword:
+	case KindLoginPassword, KindPassphrase, KindPrivilegePassword, KindTOTPSecret, KindChallengeAnswer:
 		return nil
 	default:
 		return fmt.Errorf("%w: unknown credential kind %q", coreauth.ErrInvalidRef, string(k))
 	}
+}
+
+// ParseRef 解析 "storeID/itemID" 格式的凭据引用字符串。
+// 空字符串返回空引用与 nil 错误。
+func ParseRef(s string) (Ref, error) {
+	if strings.TrimSpace(s) == "" {
+		return Ref{}, nil
+	}
+	storeID, itemID, ok := strings.Cut(s, "/")
+	if !ok {
+		return Ref{}, fmt.Errorf("%w: reference %q must be formatted as 'storeID/itemID'", coreauth.ErrInvalidRef, s)
+	}
+	ref := Ref{StoreID: storeID, ItemID: itemID}
+	if err := ref.Validate(); err != nil {
+		return Ref{}, err
+	}
+	return ref, nil
 }
 
 // Ref 定义凭据在外部凭据存储中的引用。

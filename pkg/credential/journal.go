@@ -57,6 +57,7 @@ type JournalEntry struct {
 	TargetNode               string        `json:"targetNode,omitempty"`
 	TargetIdentity           string        `json:"targetIdentity,omitempty"`
 	TargetKind               Kind          `json:"targetKind,omitempty"`
+	RuleName                 string        `json:"ruleName,omitempty"`
 	KeyPath                  string        `json:"keyPath,omitempty"`
 	KeyFingerprint           string        `json:"keyFingerprint,omitempty"`
 	AuthType                 string        `json:"authType,omitempty"`
@@ -76,6 +77,7 @@ func (j *JournalEntry) Target() Target {
 		NodeID:                   j.TargetNode,
 		IdentityID:               j.TargetIdentity,
 		Kind:                     j.TargetKind,
+		RuleName:                 j.RuleName,
 		KeyPath:                  j.KeyPath,
 		KeyFingerprint:           j.KeyFingerprint,
 		AuthType:                 j.AuthType,

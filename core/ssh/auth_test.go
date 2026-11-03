@@ -237,8 +237,8 @@ func TestBuildAutoAuthPlan_LazySigner_OpenSSH(t *testing.T) {
 	if ui.called {
 		t.Error("PromptSecret was unexpectedly called during buildAutoAuthPlan")
 	}
-	if len(plan.candidates) != 2 {
-		t.Fatalf("expected default key and password candidates, got %d", len(plan.candidates))
+	if len(plan.candidates) != 3 {
+		t.Fatalf("expected default key, password, and keyboard-interactive candidates, got %d", len(plan.candidates))
 	}
 	if plan.candidates[0].protocol != autoAuthProtocolPublicKey {
 		t.Fatalf("first candidate protocol = %q, want %q", plan.candidates[0].protocol, autoAuthProtocolPublicKey)
@@ -279,8 +279,8 @@ func TestBuildAutoAuthPlan_LazySigner_PEMFallback(t *testing.T) {
 	if ui.called {
 		t.Error("PromptSecret was unexpectedly called during buildAutoAuthPlan")
 	}
-	if len(plan.candidates) != 2 {
-		t.Fatalf("expected PEM key and password candidates, got %d", len(plan.candidates))
+	if len(plan.candidates) != 3 {
+		t.Fatalf("expected PEM key, password, and keyboard-interactive candidates, got %d", len(plan.candidates))
 	}
 	if plan.candidates[0].protocol != autoAuthProtocolPublicKey {
 		t.Fatalf("first candidate protocol = %q, want %q", plan.candidates[0].protocol, autoAuthProtocolPublicKey)

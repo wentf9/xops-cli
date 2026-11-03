@@ -84,13 +84,14 @@ func TestJournalTarget_PreservesCredentialMetadata(t *testing.T) {
 	entry := &JournalEntry{
 		TargetNode:               "node-a",
 		TargetKind:               KindPassphrase,
+		RuleName:                 "mfa-rule",
 		KeyPath:                  "/home/test/.ssh/id_ed25519",
 		ClearLegacyLoginPassword: true,
 		ClearLegacyPassphrase:    true,
 	}
 
 	target := entry.Target()
-	if target.KeyPath != entry.KeyPath || !target.ClearLegacyLoginPassword || !target.ClearLegacyPassphrase {
+	if target.KeyPath != entry.KeyPath || !target.ClearLegacyLoginPassword || !target.ClearLegacyPassphrase || target.RuleName != entry.RuleName {
 		t.Fatalf("credential metadata mismatch: %+v", target)
 	}
 }

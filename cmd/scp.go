@@ -83,6 +83,8 @@ func NewCmdScp() *cobra.Command {
 	cmd.Flags().StringVar(&o.Host, "host", "", i18n.T("flag_hosts"))
 	cmd.Flags().BoolVar(&o.PasswordStdin, "password-stdin", false, i18n.T("flag_password_stdin"))
 	cmd.Flags().BoolVar(&o.PassphraseStdin, "passphrase-stdin", false, i18n.T("flag_passphrase_stdin"))
+	cmd.Flags().StringVar(&o.OTP, "otp", "", i18n.T("flag_otp"))
+	cmd.Flags().BoolVar(&o.OTPStdin, "otp-stdin", false, i18n.T("flag_otp_stdin"))
 	cmd.Flags().StringVar(&o.Remember, "remember", "", i18n.T("flag_remember"))
 	cmd.Flags().StringVar(&o.Alias, "alias", "", i18n.T("flag_alias"))
 	cmd.Flags().BoolVar(&o.Sudo, "sudo", false, i18n.T("flag_sudo"))
@@ -101,6 +103,7 @@ func NewCmdScp() *cobra.Command {
 
 	cmd.MarkFlagsMutuallyExclusive("host", "ifile", "tag")
 	cmd.MarkFlagsMutuallyExclusive("force", "no-clobber")
+	cmd.MarkFlagsMutuallyExclusive("otp", "otp-stdin")
 	cmd.MarkFlagsRequiredTogether("src", "dest")
 	return cmd
 }
@@ -136,6 +139,21 @@ func (o *ScpOptions) Complete(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	// Reject invalid path arguments before reading caller-owned credential input.
+	return o.completeStdinCredentials()
+}
+
+func (o *ScpOptions) completeStdinCredentials() error {
+	if o.OTP != "" && o.OTPStdin {
+		return errors.New(i18n.T("err_otp_mutually_exclusive"))
+	}
+	if o.OTPStdin {
+		otp, err := cmdutils.ReadSecretLineFromStdin()
+		if err != nil {
+			return fmt.Errorf("read otp from stdin: %w", err)
+		}
+		o.OTP = otp
+		o.OTPStdin = false
+	}
 	if o.PasswordStdin {
 		pwd, err := cmdutils.ReadSecretFromStdin()
 		if err != nil {
@@ -154,6 +172,9 @@ func (o *ScpOptions) Complete(cmd *cobra.Command, args []string) error {
 }
 
 func (o *ScpOptions) Validate() error {
+	if o.OTP != "" && o.OTPStdin {
+		return errors.New(i18n.T("err_otp_mutually_exclusive"))
+	}
 	if err := cmdutils.ValidateRememberPolicy(o.Remember); err != nil {
 		return err
 	}
@@ -1142,9 +1163,19 @@ func (o *ScpOptions) credentialConnectorWithInteraction(provider *config.Reposit
 	if batch {
 		adpOpts = append(adpOpts, adapter.WithNonInteractive(true))
 	}
-	adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{
-		Password: o.Password, Passphrase: o.Passphrase, Remember: shouldRemember,
-	}))
+	targetNodes := o.resolvedTargetNodeIDs(provider)
+	if len(targetNodes) > 0 {
+		adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{Remember: shouldRemember}))
+		for _, nodeID := range targetNodes {
+			adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, adapter.SessionAuth{
+				Password: o.Password, Passphrase: o.Passphrase, Remember: shouldRemember, OTP: o.OTP,
+			}))
+		}
+	} else {
+		adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{
+			Password: o.Password, Passphrase: o.Passphrase, Remember: shouldRemember, OTP: o.OTP,
+		}))
+	}
 	if shouldRemember {
 		persistence, serviceErr := interaction.automaticPersistenceOptions(provider, cfg)
 		if serviceErr != nil {
@@ -1164,4 +1195,37 @@ func (o *ScpOptions) credentialConnectorWithInteraction(provider *config.Reposit
 		connector = newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics), ssh.WithInteractionHandler(interaction))
 	}
 	return connector, nil
+}
+
+func (o *ScpOptions) resolvedTargetNodeIDs(provider *config.Repository) []string {
+	if provider == nil {
+		return nil
+	}
+	var paths []PathInfo
+	if o.Host != "" && !strings.Contains(o.Host, ",") {
+		paths = append(paths, PathInfo{Host: o.Host, IsRemote: true})
+	}
+	if src, err := parsePath(o.Source); err == nil && src.IsRemote {
+		paths = append(paths, src)
+	}
+	if dst, err := parsePath(o.Dest); err == nil && dst.IsRemote {
+		paths = append(paths, dst)
+	}
+	var nodeIDs []string
+	seen := make(map[string]struct{})
+	for _, p := range paths {
+		selector, _, _, err := o.resolvePathInfo(p)
+		if err != nil || selector == "" {
+			continue
+		}
+		nodeID, err := provider.ResolveSelector(selector)
+		if err != nil || nodeID == "" {
+			continue
+		}
+		if _, exists := seen[nodeID]; !exists {
+			seen[nodeID] = struct{}{}
+			nodeIDs = append(nodeIDs, nodeID)
+		}
+	}
+	return nodeIDs
 }

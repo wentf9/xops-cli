@@ -138,6 +138,8 @@ func (m *Model) initForm(nodeID string) (Model, tea.Cmd) {
 			Options(
 				huh.NewOption("Password", "password"),
 				huh.NewOption("Key File", "key"),
+				huh.NewOption("OTP / 2FA", "otp"),
+				huh.NewOption("Keyboard-Interactive", "keyboard-interactive"),
 			).
 			Value(&state.authType).
 			Inline(true),
@@ -514,7 +516,7 @@ func (m *Model) saveFormCmd() tea.Cmd {
 	if !s.isEdit && !s.skipVerify {
 		checkIdentity := identity
 		checkIdentity.AuthType = s.authType
-		if s.authType == "password" && s.password != "" {
+		if s.authType != "key" && s.password != "" {
 			checkIdentity.Password = s.password
 			checkIdentity.LoginPasswordRef = nil
 		}
@@ -569,22 +571,23 @@ func (s *nodeFormState) applyIdentityCredentials(identity *models.Identity, absK
 	// A credential store write occurs after this metadata mutation. Keep the
 	// previous authentication usable until that write atomically installs the
 	// new reference and key path.
-	credentialReplacement := (s.authType == "password" && actions.password == "replace" && s.password != "") ||
-		(s.authType == "key" && actions.passphrase == "replace" && s.passphrase != "")
+	previousUsesKey := previousAuthType == "key"
+	currentUsesKey := s.authType == "key"
+	credentialReplacement := (!currentUsesKey && actions.password == "replace" && s.password != "") ||
+		(currentUsesKey && actions.passphrase == "replace" && s.passphrase != "")
 	previousRef := (*credential.Ref)(nil)
-	switch previousAuthType {
-	case "password":
-		previousRef = identity.LoginPasswordRef
-	case "key":
+	if previousUsesKey {
 		previousRef = identity.PassphraseRef
+	} else if previousAuthType != "" {
+		previousRef = identity.LoginPasswordRef
 	}
-	deferSwitch := previousAuthType != s.authType && (credentialReplacement || previousRef != nil)
-	deferKeyPath := previousAuthType == "key" && s.authType == "key" && credentialReplacement
+	deferSwitch := previousUsesKey != currentUsesKey && (credentialReplacement || previousRef != nil)
+	deferKeyPath := previousUsesKey && currentUsesKey && credentialReplacement
 	deferCredentialMetadata := deferSwitch || deferKeyPath
 	identity.AuthType = s.authType
 	if deferSwitch {
 		identity.AuthType = previousAuthType
-		if previousAuthType == "password" {
+		if !previousUsesKey {
 			actions.cleanupKind = credential.KindLoginPassword
 			actions.cleanupRef = identity.LoginPasswordRef.Clone()
 		} else {
@@ -592,18 +595,17 @@ func (s *nodeFormState) applyIdentityCredentials(identity *models.Identity, absK
 			actions.cleanupRef = identity.PassphraseRef.Clone()
 		}
 	}
-	if deferSwitch && previousAuthType == "key" && s.authType == "password" {
+	if deferSwitch && previousUsesKey && !currentUsesKey {
 		actions.clearKeyPath = true
 	}
-	if previousAuthType != s.authType {
-		switch previousAuthType {
-		case "password":
+	if previousUsesKey != currentUsesKey {
+		if !previousUsesKey && previousAuthType != "" {
 			actions.cleanupKind = credential.KindLoginPassword
 			actions.cleanupRef = identity.LoginPasswordRef.Clone()
 			if deferSwitch && identity.Password != "" {
 				actions.clearLegacyLoginPassword = true
 			}
-		case "key":
+		} else if previousUsesKey {
 			actions.cleanupKind = credential.KindPassphrase
 			actions.cleanupRef = identity.PassphraseRef.Clone()
 			if deferSwitch && identity.Passphrase != "" {
@@ -612,7 +614,7 @@ func (s *nodeFormState) applyIdentityCredentials(identity *models.Identity, absK
 		}
 	}
 
-	if s.authType == "password" {
+	if !currentUsesKey {
 		if !deferCredentialMetadata {
 			identity.KeyPath = ""
 			identity.Passphrase = ""
@@ -670,7 +672,7 @@ func (s *nodeFormState) applyIdentityCredentials(identity *models.Identity, absK
 
 func syncCredentialsToStore(ctx context.Context, repository *config.Repository, credSvc *credential.Service, nodeID, authVersion string, s nodeFormState, actions formCredentialActions) error {
 	if credSvc == nil {
-		if repository.Snapshot().Credential != nil && ((s.authType == "password" && (actions.password == "replace" || actions.password == "delete")) ||
+		if repository.Snapshot().Credential != nil && ((s.authType != "key" && (actions.password == "replace" || actions.password == "delete")) ||
 			(s.authType == "key" && (actions.passphrase == "replace" || actions.passphrase == "delete"))) {
 			return errors.New("credential service is unavailable")
 		}
@@ -690,13 +692,14 @@ func syncCredentialsToStore(ctx context.Context, repository *config.Repository, 
 		}
 		keyFingerprint = target.KeyFingerprint
 	}
-	version := authVersion
-	var err error
-	switch s.authType {
-	case "password":
-		version, err = syncFormCredential(ctx, credSvc, nodeID, credential.KindLoginPassword, authVersion, actions.password, s.existingPasswordRef, targetStore, s.password, "", s.authType, keyFingerprint, actions.clearKeyPath, actions.clearLegacyLoginPassword, actions.clearLegacyPassphrase)
-	case "key":
+	var (
+		version string
+		err     error
+	)
+	if s.authType == "key" {
 		version, err = syncFormCredential(ctx, credSvc, nodeID, credential.KindPassphrase, authVersion, actions.passphrase, s.existingPassphraseRef, targetStore, s.passphrase, actions.keyPath, s.authType, keyFingerprint, actions.clearKeyPath, actions.clearLegacyLoginPassword, actions.clearLegacyPassphrase)
+	} else {
+		version, err = syncFormCredential(ctx, credSvc, nodeID, credential.KindLoginPassword, authVersion, actions.password, s.existingPasswordRef, targetStore, s.password, "", s.authType, keyFingerprint, actions.clearKeyPath, actions.clearLegacyLoginPassword, actions.clearLegacyPassphrase)
 	}
 	if err != nil {
 		return err

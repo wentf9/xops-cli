@@ -425,13 +425,7 @@ func cloneNode(node models.Node) models.Node {
 }
 
 func cloneIdentity(identity models.Identity) models.Identity {
-	if identity.LoginPasswordRef != nil {
-		identity.LoginPasswordRef = identity.LoginPasswordRef.Clone()
-	}
-	if identity.PassphraseRef != nil {
-		identity.PassphraseRef = identity.PassphraseRef.Clone()
-	}
-	return identity
+	return identity.Clone()
 }
 
 func cloneHost(host models.Host) models.Host {
