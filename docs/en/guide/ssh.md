@@ -63,6 +63,122 @@ For example, if `xops ssh root@192.0.2.10` fails on default port 22, no `:22` no
 
 If saving the node fails, the connection reports an error. If the message says the configuration may already have been saved, check `xops host list` before retrying.
 
+## SSH authentication methods and multi-factor authentication (MFA)
+
+XOps supports various standard SSHv2 authentication mechanisms as well as server-orchestrated multi-stage multi-factor authentication (MFA / 2FA) flows.
+
+### Supported authentication methods
+
+| Method | Protocol name | Description and capabilities |
+| --- | --- | --- |
+| **Public key** | `publickey` | Supports RSA, Ed25519, ECDSA, PKCS#8, and PEM private keys; supports passphrase-protected key files via interactive terminal prompt or piped `--passphrase-stdin`. |
+| **Password** | `password` | Traditional static password authentication; saved in secure vaults with zero plaintext storage, supplied via secure interactive prompt or piped `--password-stdin`. |
+| **Keyboard interactive** | `keyboard-interactive` (RFC 4256) | Server-initiated challenge/response questions (e.g., dynamic PAM prompts, static security questions). Supports **manual interactive replies** (with automatic echo suppression for passwords), **regex automated challenge rules** (`keyboard_interactive.rules`), reusing login passwords (`login_password`), reusing dynamic tokens (`otp`), vault-managed secrets (`secret`), and external command providers (`command`). |
+| **One-time password** | `otp` (RFC 6238 / RFC 4226) | Time-based One-Time Passwords (TOTP). Built-in pure Go standard library RFC 6238 implementation (supports standard Base32 seeds and `otpauth://` URIs, SHA1/SHA256/SHA512, 6/8 digits, and custom steps). Supports vault-managed secrets (`totp_secret_ref`), external command providers (`command`), and per-session CLI overrides (`--otp` / `--otp-stdin`). |
+| **Multi-stage MFA** | `PartialSuccessMethods` | Automatically tracks and progresses through multi-stage authentication requirements (e.g., public key + password, password + TOTP, public key + TOTP, password + security question) until full authentication is granted. |
+
+### Configuration and examples
+
+#### 1. Configuration file (`~/.xops/xops_config.yaml`)
+
+XOps strictly adheres to the Schema v2 architecture and zero-plaintext security policy:
+- `hosts` defines network hosts and ports;
+- `identities` manages authentication credentials—passphrases, passwords, TOTP secrets, and challenge answers are stored in vaults, leaving only `*_ref` references in the configuration;
+- `nodes` aggregates `host_ref` and `identity_ref` into directly connectable node definitions.
+
+```yaml
+hosts:
+  bastion-host:
+    address: 198.51.100.1
+    port: 22
+
+identities:
+  opsadmin-mfa:
+    user: opsadmin
+    auth_type: auto             # Optional: auto, key, password, agent, otp, keyboard-interactive
+    key_path: ~/.ssh/id_ed25519 # Private key for public key auth
+    
+    # Option A: TOTP (OTP) automated authentication
+    otp:
+      totp_secret_ref:          # Vault-managed TOTP seed reference (recorded via xops identity credential set)
+        store_id: file
+        item_id: totp-seed
+      prompt_pattern: '(?i)verification code|otp' # Optional: automatically supplies OTP when prompt matches
+      # Or obtain OTP via an external command (mutually exclusive with totp_secret_ref; shell metacharacters forbidden):
+      # command: "/usr/local/bin/get-totp"
+      # args: ["--account", "opsadmin"]
+      # timeout: 5s
+
+    # Option B: Keyboard-interactive automated challenge rules
+    keyboard_interactive:
+      rules:
+        # Rule 1: Static security question answer managed by credential store (source: secret)
+        - name: security_question
+          prompt_pattern: '(?i)favorite city'          # Regex matching server prompt (required)
+          instruction_pattern: '(?i)answer carefully' # Optional: regex matching server instruction
+          source: secret                              # Source type: secret, command, login_password, otp
+          secret_ref:                                 # Credential reference (recorded via xops identity credential set)
+            store_id: file
+            item_id: city-answer
+
+        # Rule 2: External command provider (source: command) querying an external password manager
+        - name: corporate_sso_token
+          prompt_pattern: '(?i)one-time passcode'
+          source: command
+          command: "op"
+          args: ["read", "op://Employee/bastion/passcode"]
+          timeout: 5s
+
+        # Rule 3: Automatically reuse login password when challenged
+        - name: pam_password
+          prompt_pattern: '(?i)password'
+          source: login_password
+
+        # Rule 4: Automatically reuse configured OTP when challenged
+        - name: pam_otp
+          prompt_pattern: '(?i)authenticator code'
+          source: otp
+
+nodes:
+  bastion-mfa:
+    host_ref: bastion-host
+    identity_ref: opsadmin-mfa
+    sudo_mode: none
+```
+
+#### 2. Storing credentials securely via CLI
+
+Secrets do not (and cannot) be written in plaintext in the YAML file. Use `xops identity credential set` with `--password-stdin` to safely record secrets into the vault:
+
+```bash
+# Store login password and private-key passphrase
+xops identity credential set opsadmin-mfa --kind login_password --password-stdin
+xops identity credential set opsadmin-mfa --kind passphrase --password-stdin
+
+# Store TOTP shared secret (supports Base32 string or otpauth:// URI; automatically binds totp_secret_ref)
+printf '%s\n' 'JBSWY3DPEHPK3PXP' | xops identity credential set opsadmin-mfa --kind totp_secret --password-stdin
+
+# Store challenge answer for a specific rule (rule name must already be declared in keyboard_interactive.rules)
+printf '%s\n' 'Beijing' | xops identity credential set opsadmin-mfa --kind challenge_answer --rule security_question --password-stdin
+```
+
+#### 3. Ephemeral session overrides and manual fallback
+
+- **Passing ephemeral one-time passwords (session overrides)**:
+  When connecting to an MFA/2FA-enabled host from the terminal, supply the current OTP token directly via the command line without modifying persistent identity configurations:
+  ```bash
+  # Pass token via --otp
+  xops ssh --otp 839201 bastion-mfa
+
+  # Pass token safely via stdin pipeline (avoids process table exposure)
+  printf '%s\n' '839201' | xops ssh --otp-stdin bastion-mfa
+  ```
+
+- **Interactive fallback when unconfigured**:
+  If a server issues a `keyboard-interactive` challenge for which no rule matches, XOps will never make heuristic assumptions about the prompt type. Instead, it presents the server prompt directly to the terminal for manual user input:
+  - If the server flags the challenge as secret (e.g. passwords or PINs), echo is suppressed to protect confidential input;
+  - If the server flags the challenge as visible text, typed characters echo normally.
+
 ## Sudo / Su privilege escalation
 
 ```bash

@@ -1,6 +1,6 @@
 # 凭据存储
 
-XOps 将登录密码、私钥解锁口令和 `sudo`/`su` 提权密码保存在专门的凭据库中，配置文件 `~/.xops/xops_config.yaml` 只记录凭据引用（Reference），不保存明文或旧版 `ENC:` 字段。
+XOps 将登录密码、私钥解锁口令、`sudo`/`su` 提权密码、TOTP 动态口令密钥（`totp_secret`）以及键盘交互质询答案（`challenge_answer`）保存在专门的凭据库中，配置文件 `~/.xops/xops_config.yaml` 只记录凭据引用（Reference），不保存明文或旧版 `ENC:` 字段。
 
 新安装默认使用内置离线加密库（`encrypted-file`），开箱即用，无需预先安装桌面密钥环或外部工具。可用选项可通过 `xops credential --help` 查看。
 
@@ -77,6 +77,19 @@ SSH 登录密码与 `sudo`/`su` 提权密码独立验证、分开存储：
 - 免密 `sudo` 或尚在有效期内的 `sudo` 授权缓存不会请求密码。
 - 提权密码一旦通过握手验证，即使后续用户命令返回非零退出码，该提权密码仍会按策略保存，同时命令正常返回失败状态。
 - 提权密码同样最多尝试 3 次；一旦用户命令可能已经开始执行，绝不会为了重试认证而重复运行命令。交互式提权要求远端具备受支持的 Shell 与 `stty`。
+
+## TOTP 与质询答案凭据
+
+针对开启多因素认证（2FA/MFA）的主机，XOps 支持在安全凭据库中托管 TOTP 共享密钥与静态安全质询答案：
+- **TOTP 密钥（`totp_secret`）**：保存 Base32 编码的 TOTP 密钥，由内置算法自动生成当前动态口令。
+- **质询答案（`challenge_answer`）**：保存与指定质询规则（`rule`）关联的静态回答文本。
+- **命令行录入**：可通过 `xops identity credential set` 配合 `--password-stdin` 安全录入，避免明文落盘或暴露于命令行参数中：
+  ```bash
+  # 录入身份的 TOTP 密钥
+  xops identity credential set my-id --kind totp_secret --password-stdin
+  # 录入身份指定规则的安全问题答案
+  xops identity credential set my-id --kind challenge_answer --rule security_question --password-stdin
+  ```
 
 ## 备份与恢复
 

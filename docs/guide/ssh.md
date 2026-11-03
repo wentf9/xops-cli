@@ -63,6 +63,122 @@ xops ssh --host linux-01 --interpreter bash --launch-dialect posix --login-shell
 
 若保存节点失败，本次连接会报错。若提示配置可能已经保存，请先用 `xops host list` 检查，再决定是否重试。
 
+## SSH 认证方式与多因素认证 (MFA)
+
+XOps 支持标准 SSHv2 的多种身份认证机制，以及由服务器端发起的任意多阶段多因素认证（MFA / 2FA）流程。
+
+### 支持的认证方式
+
+| 认证方式 | 协议方法名 | 说明与特性 |
+| --- | --- | --- |
+| **公钥认证** | `publickey` | 支持 RSA、Ed25519、ECDSA、PKCS#8、PEM 等密钥格式；支持口令保护的私钥文件，支持交互式提示或 `--passphrase-stdin` 管道传入口令。 |
+| **密码认证** | `password` | 传统静态口令认证；支持安全凭据库安全加密存储（zero-plaintext），支持交互式安全提示或 `--password-stdin` 管道传入。 |
+| **键盘交互质询** | `keyboard-interactive` (RFC 4256) | 服务器发起的交互式问答（如 PAM 动态质询、静态安全问题等）。支持**人工交互输入**（自动根据提示属性开启/关闭回显）、**正则自动化匹配规则**（`keyboard_interactive.rules`），答案来源支持复用登录密码（`login_password`）、复用动态口令（`otp`）、凭据库托管机密（`secret`）以及外部命令提供者（`command`）。 |
+| **一次性动态口令** | `otp` (RFC 6238 / RFC 4226) | 基于时间的动态口令（TOTP）。内置纯 Go 标准库实现的 RFC 6238 算法（支持标准 Base32 密钥及 `otpauth://` URI 格式，支持 SHA1/SHA256/SHA512、6/8 位及自定义步长）。支持凭据库托管密钥（`totp_secret_ref`）、外部命令提供者（`command`）以及命令行单次会话覆盖参数（`--otp` / `--otp-stdin`）。 |
+| **多阶段多因素认证** | `PartialSuccessMethods` 编排 | 自动识别服务器的多阶段认证要求（例如：公钥 + 密码、密码 + TOTP、公钥 + TOTP、密码 + 静态安全问题等），按阶段自动流转至全部认证通过。 |
+
+### 配置与使用示例
+
+#### 1. 配置文件（`~/.xops/xops_config.yaml`）
+
+XOps 严格遵守 Schema v2 架构规范与零明文安全策略：
+- `hosts` 定义网络主机与端口；
+- `identities` 维护认证身份，私钥口令、登录密码、TOTP 密钥和质询答案一律由凭据库托管，配置文件中仅保存 `*_ref` 引用；
+- `nodes` 聚合 `host_ref` 与 `identity_ref`，形成可直接连接的节点条目。
+
+```yaml
+hosts:
+  bastion-host:
+    address: 198.51.100.1
+    port: 22
+
+identities:
+  opsadmin-mfa:
+    user: opsadmin
+    auth_type: auto             # 可选：auto、key、password、agent、otp、keyboard-interactive
+    key_path: ~/.ssh/id_ed25519 # 公钥认证密钥路径
+    
+    # 方式 A：TOTP (OTP) 自动化配置
+    otp:
+      totp_secret_ref:          # 凭据库托管的 TOTP 种子引用（通过 xops identity credential set 录入生成）
+        store_id: file
+        item_id: totp-seed
+      prompt_pattern: '(?i)verification code|otp' # 可选：当质询提示词匹配该正则时自动提供 OTP
+      # 也可通过外部命令动态获取 OTP（与 totp_secret_ref 二选一，禁止使用 Shell 特殊元字符）：
+      # command: "/usr/local/bin/get-totp"
+      # args: ["--account", "opsadmin"]
+      # timeout: 5s
+
+    # 方式 B：键盘交互质询 (Keyboard-Interactive) 自动化规则
+    keyboard_interactive:
+      rules:
+        # 规则 1：静态安全问题，答案由安全凭据库托管（source: secret）
+        - name: security_question
+          prompt_pattern: '(?i)favorite city'          # 正则匹配服务器 Prompt 文本（必填）
+          instruction_pattern: '(?i)answer carefully' # 可选：正则匹配服务器说明文本
+          source: secret                              # 来源类型：secret、command、login_password、otp
+          secret_ref:                                 # 凭据引用（通过 xops identity credential set 录入生成）
+            store_id: file
+            item_id: city-answer
+
+        # 规则 2：外部命令提供者（source: command），从外部密码管理器动态读取答案
+        - name: corporate_sso_token
+          prompt_pattern: '(?i)one-time passcode'
+          source: command
+          command: "op"
+          args: ["read", "op://Employee/bastion/passcode"]
+          timeout: 5s
+
+        # 规则 3：服务器通过质询提问密码时，自动复用当前身份的登录密码
+        - name: pam_password
+          prompt_pattern: '(?i)password'
+          source: login_password
+
+        # 规则 4：服务器通过质询提问动态口令时，自动复用当前身份配置的 OTP
+        - name: pam_otp
+          prompt_pattern: '(?i)authenticator code'
+          source: otp
+
+nodes:
+  bastion-mfa:
+    host_ref: bastion-host
+    identity_ref: opsadmin-mfa
+    sudo_mode: none
+```
+
+#### 2. 通过 CLI 安全录入凭据
+
+机密无需（且不允许）在 YAML 文件中手写明文，使用 `xops identity credential set` 配合 `--password-stdin` 即可安全录入对应机密：
+
+```bash
+# 录入登录密码与私钥解密口令
+xops identity credential set opsadmin-mfa --kind login_password --password-stdin
+xops identity credential set opsadmin-mfa --kind passphrase --password-stdin
+
+# 录入 TOTP 共享密钥（支持 Base32 密钥或 otpauth:// URI，自动在身份中配置 totp_secret_ref）
+printf '%s\n' 'JBSWY3DPEHPK3PXP' | xops identity credential set opsadmin-mfa --kind totp_secret --password-stdin
+
+# 录入特定质询规则的静态回答（需在 keyboard_interactive.rules 中已声明该规则 name）
+printf '%s\n' 'Beijing' | xops identity credential set opsadmin-mfa --kind challenge_answer --rule security_question --password-stdin
+```
+
+#### 3. 命令行临时覆盖与人工交互回退
+
+- **临时传入当前动态口令（会话单次覆盖）**：
+  在终端中临时连接开启了 2FA/OTP 的服务器时，可直接通过命令行参数传入当前的动态口令，单次优先使用，不改动身份的持久化配置：
+  ```bash
+  # 通过 --otp 传入当前动态口令
+  xops ssh --otp 839201 bastion-mfa
+
+  # 通过管道安全传入动态口令（避免暴露在进程列表）
+  printf '%s\n' '839201' | xops ssh --otp-stdin bastion-mfa
+  ```
+
+- **无配置时的交互式提示**：
+  若服务器启用了 `keyboard-interactive` 挑战，而当前配置中未指定匹配规则，XOps 不会凭关键字猜测问题类型，而是直接在终端安全展示服务器发起的原始挑战问题，由用户人工输入答案：
+  - 若服务器标记该问题不需要回显（如密码/PIN），终端将关闭回显以保护隐私；
+  - 若服务器标记该问题允许回显（如确认信息/普通文本），终端将正常显示用户键入的字符。
+
 ## Sudo / Su 提权
 
 ```bash

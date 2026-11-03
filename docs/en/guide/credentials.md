@@ -1,6 +1,6 @@
 # Credential storage
 
-XOps stores login passwords, private-key passphrases, and `sudo`/`su` privilege passwords in dedicated credential stores. Your configuration file (`~/.xops/xops_config.yaml`) keeps only references to those items—never plaintext secrets or legacy `ENC:` fields.
+XOps stores login passwords, private-key passphrases, `sudo`/`su` privilege passwords, TOTP secret keys (`totp_secret`), and keyboard-interactive challenge answers (`challenge_answer`) in dedicated credential stores. Your configuration file (`~/.xops/xops_config.yaml`) keeps only references to those items—never plaintext secrets or legacy `ENC:` fields.
 
 New installations use the built-in offline encrypted store (`encrypted-file`) out of the box, without requiring a desktop keyring or external tools. Run `xops credential --help` to see all available subcommands.
 
@@ -77,6 +77,19 @@ SSH login and `sudo`/`su` escalation are verified and stored separately:
 - Passwordless `sudo` and valid cached `sudo` sessions do not ask for a password.
 - Once a privilege password passes the escalation handshake, it can be saved according to policy even if the user command itself exits with a nonzero status (the command still reports failure).
 - Privilege passwords allow up to 3 attempts. Once a user command may have started running, XOps never re-runs the command just to retry authentication. Interactive escalation requires a supported remote shell and `stty`.
+
+## TOTP and challenge credentials
+
+For hosts with multi-factor authentication (2FA/MFA) enabled, XOps can store and manage TOTP shared secrets and static challenge answers in secure credential vaults:
+- **TOTP secrets (`totp_secret`)**: Stores Base32-encoded TOTP secrets, automatically evaluated by the native time-step algorithm during connection establishment.
+- **Challenge answers (`challenge_answer`)**: Stores static response texts bound to a specific challenge rule (`rule`).
+- **CLI setup**: Use `xops identity credential set` with `--password-stdin` to safely record secrets without writing plaintext into configuration files or shell histories:
+  ```bash
+  # Store a TOTP secret for an identity
+  xops identity credential set my-id --kind totp_secret --password-stdin
+  # Store a challenge answer for a specific rule
+  xops identity credential set my-id --kind challenge_answer --rule security_question --password-stdin
+  ```
 
 ## Backup and recovery
 

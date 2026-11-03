@@ -226,28 +226,45 @@ func testPrivilegeRemotePTYHandoff(t *testing.T, sudoLogin bool, password string
 	}
 }
 
+func readUntilToken(reader *bufio.Reader, token string) (string, error) {
+	var accumulated strings.Builder
+	for {
+		chunk, err := reader.ReadString(']')
+		accumulated.WriteString(chunk)
+		if err != nil {
+			return accumulated.String(), err
+		}
+		if strings.Contains(accumulated.String(), token) {
+			return accumulated.String(), nil
+		}
+	}
+}
+
 func verifyPrivilegePTYHandoff(t *testing.T, master, slave *os.File, exchange *privilegeExchange, password string) {
 	t.Helper()
 	reader := bufio.NewReader(master)
 	if password != "" {
-		prompt, err := reader.ReadString(']')
-		if err != nil || !strings.HasSuffix(prompt, exchange.promptToken) {
-			t.Fatalf("native sudo did not request a password: %v", err)
+		prompt, err := readUntilToken(reader, exchange.promptToken)
+		if err != nil {
+			t.Fatalf("native sudo did not request a password (%q): %v", prompt, err)
 		}
 		if _, err := fmt.Fprintln(master, password); err != nil {
 			t.Fatal(err)
 		}
 	}
-	ready, err := reader.ReadString(']')
-	if err != nil || strings.TrimSpace(ready) != exchange.readyToken {
-		t.Fatalf("readiness: %q, %v", ready, err)
+	ready, err := readUntilToken(reader, exchange.readyToken)
+	if err != nil {
+		t.Fatalf("readiness (%q): %v", ready, err)
 	}
 	if _, err := fmt.Fprintln(master, exchange.ackToken); err != nil {
 		t.Fatal(err)
 	}
-	handoff, err := reader.ReadString(']')
-	if err != nil || handoff != exchange.terminalToken {
-		t.Fatalf("acknowledgement echoed or terminal not ready: %q, %v", handoff, err)
+	handoff, err := readUntilToken(reader, exchange.terminalToken)
+	if err != nil {
+		t.Fatalf("terminal not ready (%q): %v", handoff, err)
+	}
+	if strings.Contains(handoff, exchange.ackToken) {
+		t.Fatalf("acknowledgement echoed before terminal handoff: %q", handoff)
 	}
 	after, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
 	// Native sudo with use_pty owns a separate inner terminal. Its successful
@@ -261,5 +278,49 @@ func verifyPrivilegePTYHandoff(t *testing.T, master, slave *os.File, exchange *p
 	}
 	if string(output) != "user-output" {
 		t.Fatalf("unexpected command output: %q", output)
+	}
+}
+
+func TestReadUntilToken_SudoRSEnvelope(t *testing.T) {
+	promptToken := "[xops-password-abc123xyz]"
+	readyToken := "[xops-ready-ready456]"
+	terminalToken := "[xops-terminal-term789]"
+
+	// Simulate full stream as emitted by sudo-rs under Linux PTY handoff:
+	// sudo-rs wraps promptToken as [sudo: [xops-password-abc123xyz]] Password:
+	// followed by password entry newline, readyToken, ack, terminalToken, and user output.
+	stream := "[sudo: " + promptToken + "] Password: \r\n" + readyToken + "\r\n" + terminalToken + "user-output"
+	reader := bufio.NewReader(strings.NewReader(stream))
+
+	gotPrompt, err := readUntilToken(reader, promptToken)
+	if err != nil {
+		t.Fatalf("failed reading prompt token: %v", err)
+	}
+	if !strings.Contains(gotPrompt, promptToken) {
+		t.Fatalf("expected prompt token in %q", gotPrompt)
+	}
+
+	gotReady, err := readUntilToken(reader, readyToken)
+	if err != nil {
+		t.Fatalf("failed reading ready token: %v", err)
+	}
+	if !strings.Contains(gotReady, readyToken) {
+		t.Fatalf("expected ready token in %q", gotReady)
+	}
+
+	gotTerminal, err := readUntilToken(reader, terminalToken)
+	if err != nil {
+		t.Fatalf("failed reading terminal token: %v", err)
+	}
+	if !strings.Contains(gotTerminal, terminalToken) {
+		t.Fatalf("expected terminal token in %q", gotTerminal)
+	}
+
+	output := make([]byte, len("user-output"))
+	if _, err := io.ReadFull(reader, output); err != nil {
+		t.Fatalf("failed reading output: %v", err)
+	}
+	if string(output) != "user-output" {
+		t.Fatalf("unexpected output: %q", output)
 	}
 }
