@@ -360,3 +360,37 @@ func TestSSHRunCommandPipedStdinPreservesLoginMode(t *testing.T) {
 		t.Fatalf("expected LoginEnabled, got %v", clientBashLogin.Execution().LoginMode())
 	}
 }
+
+func TestSSHExplicitInterpreterInheritsNodeLaunchDialect(t *testing.T) {
+	o := NewSshOptions()
+	cmd := newCmdSshWithOptions(o)
+	if err := cmd.Flags().Parse([]string{"--interpreter", "powershell", "win-test-2225", "Write-Output", "P2_SSH_WIN_OK"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Complete(cmd, cmd.Flags().Args()); err != nil {
+		t.Fatalf("Complete failed: %v", err)
+	}
+	if err := o.Validate(); err != nil {
+		t.Fatalf("Validate failed: %v", err)
+	}
+
+	// 1. Without node LaunchDialect, resolveCommandPlan fails with "requires cmd or powershell launch dialect"
+	if _, err := o.resolveCommandPlan(o.Command, nil); err == nil || !strings.Contains(err.Error(), "requires cmd or powershell launch dialect") {
+		t.Fatalf("expected missing launch dialect error for unconfigured node, got: %v", err)
+	}
+
+	// 2. With node LaunchDialect=cmd, resolveCommandPlan inherits LaunchCmd and plans PowerShell payload
+	plan, err := o.resolveCommandPlan(o.Command, &ssh.ExecutionConfig{
+		Interpreter:   ssh.InterpreterCmd,
+		LaunchDialect: ssh.LaunchCmd,
+	})
+	if err != nil {
+		t.Fatalf("resolveCommandPlan with node LaunchCmd failed: %v", err)
+	}
+	if plan.Interpreter() != ssh.InterpreterPowerShell {
+		t.Fatalf("expected InterpreterPowerShell, got %v", plan.Interpreter())
+	}
+	if !strings.Contains(plan.Payload(), "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ") {
+		t.Fatalf("unexpected payload: %q", plan.Payload())
+	}
+}

@@ -59,6 +59,12 @@ func TestExecExplicitExecutionOptions(t *testing.T) {
 				t.Fatal(err)
 			}
 			err := o.Complete(command, command.Flags().Args())
+			if err == nil {
+				err = o.Validate()
+			}
+			if err == nil && o.commandPlan == nil {
+				_, err = o.resolveCommandPlan(o.Command, nil)
+			}
 			if test.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
 					t.Fatalf("error %v, want %q", err, test.wantErr)
@@ -66,9 +72,6 @@ func TestExecExplicitExecutionOptions(t *testing.T) {
 				return
 			}
 			if err != nil {
-				t.Fatal(err)
-			}
-			if err := o.Validate(); err != nil {
 				t.Fatal(err)
 			}
 			if o.commandPlan == nil || o.commandPlan.Payload() != test.payload {
@@ -358,5 +361,98 @@ func TestExecTaskLockedStreamCancellation(t *testing.T) {
 	}
 	if server.Executed.Load() != 1 {
 		t.Fatalf("command executed %d times", server.Executed.Load())
+	}
+}
+
+func TestExecExplicitInterpreterInheritsNodeLaunchDialect(t *testing.T) {
+	if err := i18n.Init("en"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	t.Cleanup(cancel)
+
+	var gotPayload string
+	server, err := sshfixture.NewWithOptions(ctx, sshfixture.Options{
+		ExecHandler: func(cmd string, ch cryptoSSH.Channel) {
+			gotPayload = cmd
+			_, _ = ch.Write([]byte("P2_EXEC_WIN_OK\n"))
+			_, _ = ch.SendRequest("exit-status", false, cryptoSSH.Marshal(struct{ Status uint32 }{0}))
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+
+	address, portText, err := net.SplitHostPort(server.Address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Node configured with cmd interpreter and cmd launch_dialect (like win-test-2225)
+	connector := ssh.NewConnector(tunnelTestProvider{cfg: &ssh.ClientConfig{
+		NodeID:   "win-test-2225",
+		Address:  address,
+		Port:     port,
+		User:     "test",
+		AuthType: "password",
+		Password: sshfixture.Password,
+		Execution: &ssh.ExecutionConfig{
+			Interpreter:   ssh.InterpreterCmd,
+			LaunchDialect: ssh.LaunchCmd,
+		},
+	}}, ssh.WithHostKeyVerifier(execFixtureVerifier{server.HostKey}))
+	t.Cleanup(func() { _ = connector.CloseAll() })
+
+	// 1. Explicit --interpreter powershell without --launch-dialect inherits LaunchCmd from node
+	o := NewExecOptions()
+	command := newCmdExecWithOptions(o)
+	if err := command.Flags().Parse([]string{"--host", "win-test-2225", "--interpreter", "powershell", "-c", "Write-Output P2_EXEC_WIN_OK"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Complete(command, nil); err != nil {
+		t.Fatalf("Complete failed: %v", err)
+	}
+	if err := o.Validate(); err != nil {
+		t.Fatalf("Validate failed: %v", err)
+	}
+
+	var output bytes.Buffer
+	o.stdout, o.stderr = &output, &output
+	var mu sync.Mutex
+	task := execHostTask{nodeID: "win-test-2225", host: "win-test-2225"}
+	if err := o.executeTask(ctx, connector, task, o.Command, false, 1, &mu); err != nil {
+		t.Fatalf("executeTask with inherited launch_dialect failed: %v", err)
+	}
+	if !strings.Contains(gotPayload, "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ") {
+		t.Fatalf("expected encoded powershell payload, got %q", gotPayload)
+	}
+	if !strings.Contains(output.String(), "P2_EXEC_WIN_OK") {
+		t.Fatalf("unexpected output: %q", output.String())
+	}
+
+	// 2. Default node execution (cmd + LaunchCmd, no CLI flags) also executes via planned adapter
+	oDefault := NewExecOptions()
+	cmdDefault := newCmdExecWithOptions(oDefault)
+	if err := cmdDefault.Flags().Parse([]string{"--host", "win-test-2225", "-c", "echo P2_DEFAULT_CMD_OK"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := oDefault.Complete(cmdDefault, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := oDefault.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	output.Reset()
+	oDefault.stdout, oDefault.stderr = &output, &output
+	if err := oDefault.executeTask(ctx, connector, task, oDefault.Command, false, 1, &mu); err != nil {
+		t.Fatalf("executeTask with node default cmd interpreter failed: %v", err)
+	}
+	if !strings.Contains(gotPayload, "cmd.exe /d /s /c ") {
+		t.Fatalf("expected cmd.exe payload, got %q", gotPayload)
 	}
 }

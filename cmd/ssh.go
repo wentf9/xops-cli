@@ -1732,6 +1732,17 @@ func (o *SshOptions) runCommandWithStreams(ctx context.Context, client *ssh.Clie
 	if o.commandPlan != nil {
 		return client.RunCommandPlanWithIO(ctx, *o.commandPlan, stdin, stdout, stderr)
 	}
+	if (o.execution.enabled() || o.execution.noLoginSet) && !o.Sudo && command != "" {
+		var execCfg *ssh.ExecutionConfig
+		if client != nil {
+			execCfg = client.Execution()
+		}
+		plan, err := o.resolveCommandPlan(command, execCfg)
+		if err != nil {
+			return err
+		}
+		return client.RunCommandPlanWithIO(ctx, plan, stdin, stdout, stderr)
+	}
 	if !o.Sudo && o.Command == "" && o.stdinScript {
 		if o.effectiveInterpreter(client) == ssh.InterpreterServer {
 			return o.runPipedShellWithStreams(ctx, client, stdin, stdout, stderr)
