@@ -1885,3 +1885,96 @@ func TestShellRun_PassthroughTrailingBackslash(t *testing.T) {
 		t.Errorf("expected stderr to contain 'unclosed quote', got: %q", stderrOutput)
 	}
 }
+
+func TestParseLsFlags(t *testing.T) {
+	tests := []struct {
+		name        string
+		args        []string
+		defaultLong bool
+		wantArgs    []string
+		wantLong    bool
+	}{
+		{
+			name:        "ls -l path",
+			args:        []string{"-l", "/tmp/file.txt"},
+			defaultLong: false,
+			wantArgs:    []string{"/tmp/file.txt"},
+			wantLong:    true,
+		},
+		{
+			name:        "ls -la path",
+			args:        []string{"-la", "/tmp"},
+			defaultLong: false,
+			wantArgs:    []string{"/tmp"},
+			wantLong:    true,
+		},
+		{
+			name:        "ll -1 overrides default long",
+			args:        []string{"-1", "/tmp"},
+			defaultLong: true,
+			wantArgs:    []string{"/tmp"},
+			wantLong:    false,
+		},
+		{
+			name:        "double dash preserves literal -l filename",
+			args:        []string{"-l", "--", "-l"},
+			defaultLong: false,
+			wantArgs:    []string{"-l"},
+			wantLong:    true,
+		},
+		{
+			name:        "non-ls flag preserved as path",
+			args:        []string{"-foo"},
+			defaultLong: false,
+			wantArgs:    []string{"-foo"},
+			wantLong:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotArgs, gotLong := parseLsFlags(tt.args, tt.defaultLong)
+			if gotLong != tt.wantLong {
+				t.Fatalf("parseLsFlags(%v, %v) long = %v, want %v", tt.args, tt.defaultLong, gotLong, tt.wantLong)
+			}
+			if len(gotArgs) != len(tt.wantArgs) {
+				t.Fatalf("parseLsFlags(%v, %v) args = %v, want %v", tt.args, tt.defaultLong, gotArgs, tt.wantArgs)
+			}
+			for i := range gotArgs {
+				if gotArgs[i] != tt.wantArgs[i] {
+					t.Fatalf("parseLsFlags(%v, %v) args[%d] = %q, want %q", tt.args, tt.defaultLong, i, gotArgs[i], tt.wantArgs[i])
+				}
+			}
+		})
+	}
+}
+
+func TestLocalLsWithLongFlag(t *testing.T) {
+	initTestI18n(t)
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "sample.txt")
+	writeTestFile(t, filePath, []byte("hello world"))
+
+	s := &Shell{
+		cwd:      "/test/remote/dir",
+		localCwd: dir,
+		stdout:   &stdout,
+		stderr:   &stderr,
+	}
+
+	exit, err := s.dispatchCommand(context.Background(), "lls", []string{"-l", "sample.txt"})
+	if exit {
+		t.Error("expected exit to be false")
+	}
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "sample.txt") || !strings.Contains(out, "-rw-") {
+		t.Fatalf("expected long listing output containing mode and sample.txt, got %q", out)
+	}
+}
