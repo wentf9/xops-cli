@@ -400,6 +400,9 @@ func executeProxy(
 	}
 
 	cfg, muxOpts := buildControlProxyClientConfig(target, provider, nodeID, o)
+	if err := o.prepareControlProxyCommandPlan(cfg.Execution); err != nil {
+		return controlError(streams.Stderr, err.Error())
+	}
 
 	client, err := ssh.DialControlProxyClient(ctx, socketPath, target, sshenv.Discover(), cfg, logger.DefaultLogger(), muxOpts...)
 	if err != nil {
@@ -419,24 +422,35 @@ func executeProxy(
 		return nil
 	}
 
-	var sessionErr error
-	if o.Command != "" || o.stdinScript {
-		sessionErr = o.runCommandWithStreams(ctx, client, o.Command, streams.Stdin, streams.Stdout, streams.Stderr)
-	} else {
-		stdinFile, _ := streams.Stdin.(*os.File)
-		ioStreams := ssh.InteractiveIO{
-			Stdin:  stdinFile,
-			Stdout: streams.Stdout,
-			Stderr: streams.Stderr,
-		}
-		if o.Sudo {
-			sessionErr = client.ShellWithSudoIO(ctx, ioStreams)
-		} else {
-			sessionErr = client.ShellWithIO(ctx, ioStreams)
-		}
-	}
+	return mapControlProxySessionError(streams.Stderr, o.runControlProxySession(ctx, client, streams))
+}
 
-	return mapControlProxySessionError(streams.Stderr, sessionErr)
+func (o *SshOptions) prepareControlProxyCommandPlan(nodeExec *ssh.ExecutionConfig) error {
+	if o.NoCmd || o.Sudo || o.Command == "" || o.commandPlan != nil || (!o.execution.enabled() && !o.execution.noLoginSet) {
+		return nil
+	}
+	plan, err := o.resolveCommandPlan(o.Command, nodeExec)
+	if err != nil {
+		return err
+	}
+	o.commandPlan = &plan
+	return nil
+}
+
+func (o *SshOptions) runControlProxySession(ctx context.Context, client *ssh.Client, streams controlStreams) error {
+	if o.Command != "" || o.stdinScript {
+		return o.runCommandWithStreams(ctx, client, o.Command, streams.Stdin, streams.Stdout, streams.Stderr)
+	}
+	stdinFile, _ := streams.Stdin.(*os.File)
+	ioStreams := ssh.InteractiveIO{
+		Stdin:  stdinFile,
+		Stdout: streams.Stdout,
+		Stderr: streams.Stderr,
+	}
+	if o.Sudo {
+		return client.ShellWithSudoIO(ctx, ioStreams)
+	}
+	return client.ShellWithIO(ctx, ioStreams)
 }
 
 func buildControlProxyClientConfig(

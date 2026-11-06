@@ -826,6 +826,17 @@ func TestControl_Proxy_ExecutesSessionAndPropagatesExitCode(t *testing.T) {
 	}
 }
 
+func TestControl_Proxy_DeferredInterpreterValidationBeforeDial(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	missingSock := filepath.Join(t.TempDir(), "never_dialed.sock")
+	_, stderr, err := runControlProxyTestCommand(ctx, t, []string{"-O", "proxy", "-S", missingSock, "--interpreter", "powershell", "fixture@127.0.0.1:22", "--", "Get-Date"})
+	if code, ok := ExitCodeFromError(err); !ok || code != 255 || !strings.Contains(stderr, `powershell interpreter requires cmd or powershell launch dialect`) {
+		t.Fatalf("expected deferred interpreter error before socket dial (255), got code=%d ok=%v err=%v stderr=%q", code, ok, err, stderr)
+	}
+}
+
 func TestProgrammaticGeneralOptions_AppliedWithoutComplete(t *testing.T) {
 	// 1. Programmatic SshOptions (without Complete) applies -o Port/User/IdentityFile/ProxyJump,
 	// while explicit struct fields take precedence over -o options.

@@ -541,13 +541,21 @@ func (o *ExecOptions) runInteractive(
 
 	var execErr error
 	if o.Sudo && o.execution.enabled() {
-		execution, optErr := o.cliExecutionConfig()
+		cliExec, optErr := o.cliExecutionConfig()
+		if optErr != nil {
+			return optErr
+		}
+		execution, optErr := ssh.ResolveExecution(cliExec, client.Execution())
 		if optErr != nil {
 			return optErr
 		}
 		execErr = client.RunInteractiveWithSudoExecution(ctx, cmd, execution)
-	} else if o.commandPlan != nil {
-		execErr = client.RunInteractivePlan(ctx, *o.commandPlan)
+	} else if o.commandPlan != nil || o.execution.enabled() {
+		plan, planErr := o.resolveCommandPlan(cmd, client.Execution())
+		if planErr != nil {
+			return fmt.Errorf("[%s] %w", task.host, planErr)
+		}
+		execErr = client.RunInteractivePlan(ctx, plan)
 	} else if o.Sudo {
 		execErr = client.RunInteractiveWithSudo(ctx, cmd)
 	} else {
@@ -667,9 +675,15 @@ func (o *ExecOptions) getOrCreateNode(ctx context.Context, repository *config.Re
 	return res.NodeID, updated, nil
 }
 
+func (o *ExecOptions) isPlannedCommandMismatch(execCmd string, isScript bool) bool {
+	return isScript ||
+		(o.commandPlan != nil && o.commandPlan.Command() != execCmd) ||
+		(o.commandPlan == nil && o.Command != execCmd)
+}
+
 func (o *ExecOptions) executeTask(ctx context.Context, connector *ssh.Connector, t execHostTask, execCmd string, isScript bool, totalTasks int, stdoutMu *sync.Mutex) (retErr error) {
-	if o.commandPlan != nil {
-		if isScript || o.commandPlan.Command() != execCmd {
+	if o.commandPlan != nil || (!isScript && o.execution.enabled()) {
+		if o.isPlannedCommandMismatch(execCmd, isScript) {
 			return fmt.Errorf("[%s] command changed after execution planning", t.host)
 		}
 		if !o.Sudo && !o.Stream && o.OutDir == "" {
@@ -726,35 +740,19 @@ func (o *ExecOptions) executeTask(ctx context.Context, connector *ssh.Connector,
 }
 
 func (o *ExecOptions) cliExecutionConfig() (*ssh.ExecutionConfig, error) {
-	if !o.execution.enabled() && !o.execution.noLoginSet {
-		return nil, nil
+	return o.execution.toExecutionConfig(o.NoLoginShell)
+}
+
+func usesWindowsCommandPlanAdapter(execCfg *ssh.ExecutionConfig) bool {
+	if execCfg == nil {
+		return false
 	}
-	if o.execution.noLoginSet {
-		// --no-login keeps its legacy meaning of explicitly selecting Bash.
-		opts, err := o.execution.commandOptions(o.NoLoginShell)
-		if err != nil {
-			return nil, err
-		}
-		login := opts.Login == ssh.LoginEnabled
-		return &ssh.ExecutionConfig{Interpreter: opts.Interpreter, LaunchDialect: opts.LaunchDialect, Login: &login}, nil
+	switch execCfg.Interpreter {
+	case ssh.InterpreterPowerShell, ssh.InterpreterPwsh, ssh.InterpreterCmd:
+		return true
+	default:
+		return false
 	}
-	if (o.execution.interpreterSet && o.execution.interpreter == "") || (o.execution.dialectSet && o.execution.dialect == "") {
-		return nil, fmt.Errorf("explicit interpreter and launch dialect must not be empty")
-	}
-	// Missing fields must stay missing: script shebangs and node configuration
-	// resolve them later. Selecting a dialect is not selecting server.
-	cliExec := &ssh.ExecutionConfig{}
-	if o.execution.interpreterSet {
-		cliExec.Interpreter = ssh.Interpreter(o.execution.interpreter)
-	}
-	if o.execution.dialectSet {
-		cliExec.LaunchDialect = ssh.LaunchDialect(o.execution.dialect)
-	}
-	if o.execution.loginSet {
-		login := o.execution.login
-		cliExec.Login = &login
-	}
-	return cliExec, cliExec.Validate()
 }
 
 func (o *ExecOptions) dispatchTaskExecution(ctx context.Context, client *ssh.Client, execCmd string, isScript bool, outputOpts []ssh.RunOption) (string, error) {
@@ -777,19 +775,36 @@ func (o *ExecOptions) dispatchTaskExecution(ctx context.Context, client *ssh.Cli
 		return client.RunScriptWithExecution(ctx, execCmd, resolvedExec, scriptOpts...)
 
 	}
-	if o.commandPlan != nil {
+	if o.commandPlan != nil || o.execution.enabled() {
 		if o.Sudo {
-			execution, err := o.cliExecutionConfig()
+			cliExec, err := o.cliExecutionConfig()
+			if err != nil {
+				return "", err
+			}
+			execution, err := ssh.ResolveExecution(cliExec, client.Execution())
 			if err != nil {
 				return "", err
 			}
 			return client.RunWithSudoExecution(ctx, execCmd, execution, outputOpts...)
 		}
+		plan, err := o.resolveCommandPlan(execCmd, client.Execution())
+		if err != nil {
+			return "", err
+		}
 		// The interpreter has already been applied by PlanCommand. Send its
 		// frozen payload unchanged through the existing output-mode adapters.
 		opts := append([]ssh.RunOption{}, outputOpts...)
 		opts = append(opts, ssh.WithInterpreter(ssh.InterpreterServer), ssh.WithLaunchDialect(ssh.LaunchUnknown))
-		return client.Run(ctx, o.commandPlan.Payload(), opts...)
+		return client.Run(ctx, plan.Payload(), opts...)
+	}
+	if !o.Sudo && !o.execution.noLoginSet && !o.NoLoginShell && usesWindowsCommandPlanAdapter(client.Execution()) {
+		plan, err := ssh.PlanCommand(execCmd, client.Execution().CommandOptions())
+		if err != nil {
+			return "", fmt.Errorf("plan command: %w", err)
+		}
+		opts := append([]ssh.RunOption{}, outputOpts...)
+		opts = append(opts, ssh.WithInterpreter(ssh.InterpreterServer), ssh.WithLaunchDialect(ssh.LaunchUnknown))
+		return client.Run(ctx, plan.Payload(), opts...)
 	}
 	cmdOpts := o.commandRunOptions(client.Execution(), outputOpts)
 	if o.Sudo {

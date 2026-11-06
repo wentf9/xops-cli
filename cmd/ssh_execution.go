@@ -23,12 +23,41 @@ func (o *SshOptions) prepareCommandPlan() error {
 	if err != nil {
 		return err
 	}
+	if o.execution.needsNodeResolution() {
+		if err := validateDeferredCommandOptions(o.Command, options, false, nil); err != nil {
+			return fmt.Errorf("plan explicit command: %w", err)
+		}
+		o.commandPlan = nil
+		return nil
+	}
 	plan, err := ssh.PlanCommand(o.Command, options)
 	if err != nil {
 		return fmt.Errorf("plan explicit command: %w", err)
 	}
 	o.commandPlan = &plan
 	return nil
+}
+
+func (o *SshOptions) resolveCommandPlan(command string, nodeExec *ssh.ExecutionConfig) (ssh.CommandPlan, error) {
+	if o.commandPlan != nil {
+		if o.commandPlan.Command() != command {
+			return ssh.CommandPlan{}, fmt.Errorf("command changed after execution planning")
+		}
+		return *o.commandPlan, nil
+	}
+	cliExec, err := o.execution.toExecutionConfig(o.NoLoginShell)
+	if err != nil {
+		return ssh.CommandPlan{}, err
+	}
+	resolved, err := ssh.ResolveExecution(cliExec, nodeExec)
+	if err != nil {
+		return ssh.CommandPlan{}, fmt.Errorf("plan explicit command: %w", err)
+	}
+	plan, err := ssh.PlanCommand(command, resolved.CommandOptions())
+	if err != nil {
+		return ssh.CommandPlan{}, fmt.Errorf("plan explicit command: %w", err)
+	}
+	return plan, nil
 }
 
 func (o *SshOptions) validateEmptyCommandExecution() error {
