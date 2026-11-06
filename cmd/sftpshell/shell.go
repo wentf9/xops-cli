@@ -1172,6 +1172,7 @@ func (s *Shell) handleLocalCd(args []string) error {
 }
 
 func (s *Shell) handleLs(ctx context.Context, args []string, long bool) error {
+	args, long = parseLsFlags(args, long)
 	if len(args) > 0 && hasWildcard(args[0]) {
 		matches, err := s.expandRemote(ctx, args[0])
 		if err != nil {
@@ -1261,6 +1262,7 @@ func (s *Shell) listRemoteOne(ctx context.Context, path string, long bool) error
 }
 
 func (s *Shell) handleLocalLs(args []string, long bool) error {
+	args, long = parseLsFlags(args, long)
 	if len(args) > 0 && hasWildcard(args[0]) {
 		matches, err := s.expandLocal(args[0])
 		if err != nil {
@@ -2351,6 +2353,49 @@ func parseForceFlag(args []string) ([]string, bool) {
 		}
 	}
 	return filtered, force
+}
+
+func parseLsFlags(args []string, defaultLong bool) ([]string, bool) {
+	long := defaultLong
+	filtered := make([]string, 0, len(args))
+	parsingFlags := true
+	for _, arg := range args {
+		if !parsingFlags {
+			filtered = append(filtered, arg)
+			continue
+		}
+		if arg == "--" {
+			parsingFlags = false
+			continue
+		}
+		if len(arg) > 1 && strings.HasPrefix(arg, "-") && isLsFlagGroup(arg[1:]) {
+			for _, ch := range arg[1:] {
+				switch ch {
+				case 'l':
+					long = true
+				case '1':
+					long = false
+				}
+			}
+			continue
+		}
+		filtered = append(filtered, arg)
+	}
+	return filtered, long
+}
+
+func isLsFlagGroup(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, ch := range s {
+		switch ch {
+		case 'l', 'a', 'h', '1':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Shell) printHelp() {
