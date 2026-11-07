@@ -128,6 +128,12 @@ func normalizePlan(plan ConnectionPlan) (ConnectionPlan, error) {
 		if !hop.HasOriginalProxyJump {
 			hop.OriginalProxyJump, hop.HasOriginalProxyJump = hop.ProxyJump, true
 		}
+		hop.Execution = hop.Execution.Clone()
+		hop.Options = hop.Options.Clone()
+		hop.Options.StripClasses(OptionClassMux)
+		if hop.Options.IsEmpty() {
+			hop.Options = nil
+		}
 		seen[hop.NodeID] = true
 		plan.Hops[index], previous = hop, hop.NodeID
 	}
@@ -191,7 +197,7 @@ func (c *Connector) acquirePlan(key string, plan ConnectionPlan) (*planEntry, er
 		// RetirePlan. Plans therefore always dial their own transport.
 		connector := NewConnector(provider,
 			WithEnvironment(c.environment), WithLogger(c.getLogger()), WithDialer(c.baseDialer),
-			WithHandshakeTimeout(c.getHandshakeTimeout()), WithInteractionTimeout(c.interactionTimeout),
+			WithHandshakeTimeout(c.getNodeHandshakeTimeout(nil)), WithInteractionTimeout(c.interactionTimeout),
 			WithSecretResolver(c.secretResolver), WithKeySource(c.keySource), WithHostKeyVerifier(c.hostKeyVerifier),
 			WithPasswordPromptPattern(c.PasswordPromptPattern),
 			WithDiagnostics(c.diagnostics),
@@ -215,6 +221,11 @@ func (c *Connector) acquirePlan(key string, plan ConnectionPlan) (*planEntry, er
 }
 
 func clientConfigFromPlan(cfg ConnectionConfig) ClientConfig {
+	opts := cfg.Options.Clone()
+	opts.StripClasses(OptionClassMux)
+	if opts.IsEmpty() {
+		opts = nil
+	}
 	return ClientConfig{
 		NodeID: cfg.NodeID, Address: cfg.Address, Port: cfg.Port, User: cfg.User, AuthType: cfg.AuthType,
 		KeyPath: cfg.KeyPath, KeyRef: cfg.KeyRef, TrustVersion: cfg.TrustVersion,
@@ -222,6 +233,7 @@ func clientConfigFromPlan(cfg ConnectionConfig) ClientConfig {
 		ProxyJump: cfg.ProxyJump, OriginalProxyJump: cfg.OriginalProxyJump, HasOriginalProxyJump: cfg.HasOriginalProxyJump,
 		PasswordPromptPattern: cfg.PasswordPromptPattern,
 		Execution:             cfg.Execution.Clone(),
+		Options:               opts,
 	}
 }
 

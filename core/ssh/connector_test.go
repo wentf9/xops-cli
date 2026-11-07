@@ -738,7 +738,7 @@ func TestConnector_DefaultFailClosed_RejectsInteraction(t *testing.T) {
 	}
 
 	// 验证 Client 在默认无交互 handler 下提权同样失败关闭
-	client := newClientWithComponents(nil, nil, store.cfg, connector.provider, connector.secretResolver, connector.secretPrompter, connector.credentialRecorder, "", connector.getHandshakeTimeout(), connector.getInteractionTimeout(), nil)
+	client := newClientWithComponents(nil, nil, store.cfg, connector.provider, connector.secretResolver, connector.secretPrompter, connector.credentialRecorder, "", connector.getNodeHandshakeTimeout(store.cfg), connector.getInteractionTimeout(), nil)
 	_, privErr := client.resolvePrivilegeMaterial(context.Background(), SecretKindSuPassword)
 	if privErr == nil {
 		t.Fatal("expected error on privilege resolution without handler, got nil")

@@ -85,9 +85,10 @@ type keepAliveConfig struct {
 
 // keepAliveEntry 单个连接的心跳注册条目
 type keepAliveEntry struct {
-	cancel context.CancelFunc // per-node ctx 的取消函数
-	client *PooledClient      // 心跳目标，用于驱逐时指针比对防止误删新连接
-	done   <-chan struct{}    // 心跳 goroutine 的退出通知
+	cancel     context.CancelFunc // per-node ctx 的取消函数
+	client     *PooledClient      // 心跳目标，用于驱逐时指针比对防止误删新连接
+	done       <-chan struct{}    // 心跳 goroutine 的退出通知
+	nodeScoped bool               // 是否由节点自身的 ServerAliveInterval 驱动（独立于全局 keepAliveCfg 生命周期）
 }
 
 var knownHostsFileMutex sync.Mutex
@@ -344,7 +345,7 @@ func (c *Connector) connectPlan(ctx context.Context, plan []connectionPlanNode) 
 		}
 		dialer := c.baseDialer
 		if dialer == nil {
-			dialer = &net.Dialer{Timeout: c.getHandshakeTimeout()}
+			dialer = c.directDialerFor(planNode.cfg)
 		}
 		if planNode.cfg.ProxyJump != "" {
 			if connected == nil {
@@ -362,11 +363,33 @@ func (c *Connector) connectPlan(ctx context.Context, plan []connectionPlanNode) 
 	return connected, nil
 }
 
-func (c *Connector) getHandshakeTimeout() time.Duration {
+func (c *Connector) getNodeHandshakeTimeout(cfg *ClientConfig) time.Duration {
+	if cfg != nil && cfg.Options != nil {
+		if ct := cfg.Options.ConnectTimeout(); ct > 0 {
+			return ct
+		}
+	}
 	if c.handshakeTimeout > 0 {
 		return c.handshakeTimeout
 	}
 	return defaultSSHHandshakeTimeout
+}
+
+func (c *Connector) getNodeSecretPrompter(cfg *ClientConfig) SecretPrompter {
+	if cfg != nil && cfg.Options != nil && cfg.Options.BatchMode() {
+		return rejectInteraction{}
+	}
+	return c.secretPrompter
+}
+
+func (c *Connector) directDialerFor(cfg *ClientConfig) Dialer {
+	d := &net.Dialer{Timeout: c.getNodeHandshakeTimeout(cfg)}
+	if cfg != nil && cfg.Options != nil {
+		if tcpKA, ok := cfg.Options.TCPKeepAlive(); ok && !tcpKA {
+			d.KeepAlive = -1
+		}
+	}
+	return d
 }
 
 func (c *Connector) getInteractionTimeout() time.Duration {
@@ -418,7 +441,7 @@ func (c *Connector) resolveConnectionPlan(ctx context.Context, nodeName string) 
 			nodeCfg.HasOriginalProxyJump = true
 		}
 		positions[current] = len(plan)
-		plan = append(plan, connectionPlanNode{name: current, cfg: &nodeCfg, control: c.resolveControl(current)})
+		plan = append(plan, connectionPlanNode{name: current, cfg: &nodeCfg, control: c.resolveControl(current, &nodeCfg)})
 
 		jumps := splitProxyJumpChain(nodeCfg.ProxyJump)
 		if len(jumps) > 1 {
@@ -451,7 +474,7 @@ func (c *Connector) resolveConnectionPlan(ctx context.Context, nodeName string) 
 					cloned.ProxyJump = ""
 				}
 				positions[jumpName] = len(plan)
-				plan = append(plan, connectionPlanNode{name: jumpName, cfg: &cloned, control: c.resolveControl(jumpName)})
+				plan = append(plan, connectionPlanNode{name: jumpName, cfg: &cloned, control: c.resolveControl(jumpName, &cloned)})
 			}
 			return plan, nil
 		}
@@ -467,15 +490,24 @@ func (c *Connector) expectedPeerUID() uint32 {
 	return expectedPeerUIDFromEnvironment(c.environment)
 }
 
-func (c *Connector) resolveControl(nodeName string) *ControlConfig {
+func (c *Connector) resolveControl(nodeName string, cfg *ClientConfig) *ControlConfig {
 	if c.controlProvider != nil {
 		if ctrl, err := c.controlProvider.GetControlConfig(nodeName); err == nil && ctrl != nil {
 			return ctrl
 		}
+		return nil
 	}
 	if cp, ok := c.provider.(ControlProvider); ok {
 		if ctrl, err := cp.GetControlConfig(nodeName); err == nil && ctrl != nil {
 			return ctrl
+		}
+		return nil
+	}
+	if cfg != nil && cfg.Options != nil {
+		if err := cfg.Options.ValidateEffective(); err == nil {
+			return cfg.Options.ControlConfig()
+		} else {
+			c.getLogger().Debugf("ssh: ignoring invalid effective control options for %q: %v", nodeName, err)
 		}
 	}
 	return nil
@@ -604,10 +636,10 @@ func (c *Connector) wrapCachedClient(cfg *ClientConfig, cachedClient *PooledClie
 		cfg,
 		c.provider,
 		c.secretResolver,
-		c.secretPrompter,
+		c.getNodeSecretPrompter(cfg),
 		c.credentialRecorder,
 		c.PasswordPromptPattern,
-		c.getHandshakeTimeout(),
+		c.getNodeHandshakeTimeout(cfg),
 		c.getInteractionTimeout(),
 		c.getLogger(),
 	))
@@ -645,11 +677,11 @@ func (c *Connector) evictCachedClient(nodeName string, stale *PooledClient) {
 	c.removeKeepAliveFor(nodeName, stale)
 }
 
-func (c *Connector) resolveSecret(req SecretRequest) ([]byte, error) {
+func (c *Connector) resolveSecret(cfg *ClientConfig, req SecretRequest) ([]byte, error) {
 	if c.secretResolver == nil {
 		return nil, ErrInteractionRequired
 	}
-	timeout := c.getHandshakeTimeout()
+	timeout := c.getNodeHandshakeTimeout(cfg)
 	if timeout <= 0 {
 		timeout = defaultSSHHandshakeTimeout
 	}
@@ -665,7 +697,7 @@ func (c *Connector) recordAuthUpdate(ctx context.Context, nodeName string, cfg *
 	}
 	committedToken, err := c.credentialRecorder.UpdateAuth(ctx, nodeName, cfg.AuthUpdateToken, cfg.Password, cfg.KeyPath, cfg.Passphrase)
 	if err != nil {
-		if reportCredentialFailure(ctx, c.secretPrompter, "save", err) {
+		if reportCredentialFailure(ctx, c.getNodeSecretPrompter(cfg), "save", err) {
 			return "", errCredentialNotSaved
 		}
 		if closeErr := rootConn.Close(); closeErr != nil {
@@ -688,7 +720,7 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 	cfg := planNode.cfg
 	originalKeyPath := cfg.KeyPath
 
-	coordinator := newHandshakeCoordinator(ctx, c.getHandshakeTimeout())
+	coordinator := newHandshakeCoordinator(ctx, c.getNodeHandshakeTimeout(cfg))
 	defer coordinator.Close()
 
 	var discoveredAuth bool
@@ -772,7 +804,7 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 		}
 		return nil, err
 	}
-	c.startKeepAliveFor(nodeName, pooled)
+	c.startKeepAliveFor(nodeName, pooled, cfg)
 	// Start multiplexing master if configured. Pass rootConn (this hop's own
 	// connection, not the bastion's transportRoot) so shutting down a jump-target
 	// master never closes the underlying bastion TCP connection.
@@ -883,7 +915,7 @@ func (c *Connector) tryConnectMultiplex(ctx context.Context, planNode connection
 }
 
 func (c *Connector) probeActiveMuxMaster(ctx context.Context, planNode connectionPlanNode, expandedPath string, target TargetContext, origFi os.FileInfo, explicitMaster bool, masterMode ControlMasterMode) (*Client, bool, error) {
-	probeTimeout := c.getHandshakeTimeout()
+	probeTimeout := c.getNodeHandshakeTimeout(planNode.cfg)
 	if probeTimeout > 2*time.Second {
 		probeTimeout = 2 * time.Second
 	}
@@ -956,7 +988,7 @@ func (c *Connector) dialAndPublishProxy(ctx context.Context, planNode connection
 }
 
 func (c *Connector) tryDialAndPublishProxy(ctx context.Context, planNode connectionPlanNode, expandedPath string, target TargetContext) (*Client, error) {
-	dialCtx, cancel := context.WithTimeout(ctx, c.getHandshakeTimeout())
+	dialCtx, cancel := context.WithTimeout(ctx, c.getNodeHandshakeTimeout(planNode.cfg))
 	defer cancel()
 	rawClient, proxyConn, proxyErr := DialControlProxy(dialCtx, expandedPath, target, WithExpectedPeerUID(c.expectedPeerUID()))
 	if proxyErr != nil {
@@ -972,7 +1004,7 @@ func (c *Connector) tryDialAndPublishProxy(ctx context.Context, planNode connect
 		_ = proxyConn.Close()
 		return nil, err
 	}
-	c.startKeepAliveFor(planNode.name, pooled)
+	c.startKeepAliveFor(planNode.name, pooled, planNode.cfg)
 	logger.EmitDiagnostic(c.diagnostics, logger.Diagnostic{
 		Kind:   logger.ConnectionReused,
 		NodeID: planNode.name,
@@ -1105,7 +1137,7 @@ func (c *Connector) maybeStartMasterListener(planNode connectionPlanNode, rawCli
 		Environment:           c.environment,
 		RootConn:              rootConn,
 		InitialActiveSessions: 1,
-		ConfirmSession:        c.confirmSessionCallback(planNode.name),
+		ConfirmSession:        c.confirmSessionCallback(planNode.name, planNode.cfg),
 	})
 	if err != nil {
 		// A concurrent master already owns this path (or the bind was rejected).
@@ -1250,8 +1282,8 @@ func (c *Connector) Masters() []*MuxServer {
 
 // confirmSessionCallback adapts the injected SessionConfirmer into the bounded,
 // fail-closed callback a master uses for ask/autoask mode.
-func (c *Connector) confirmSessionCallback(nodeName string) func(string) bool {
-	if c.sessionConfirmer == nil {
+func (c *Connector) confirmSessionCallback(nodeName string, cfg *ClientConfig) func(string) bool {
+	if c.sessionConfirmer == nil || (cfg != nil && cfg.Options != nil && cfg.Options.BatchMode()) {
 		return nil
 	}
 	confirmer := c.sessionConfirmer
@@ -1394,11 +1426,17 @@ func (c *Connector) watchKeepAliveConfig(cfg *keepAliveConfig) {
 		return
 	}
 	c.keepAliveCfg = nil
-	c.keepAlives.IterCb(func(_ string, entry *keepAliveEntry) bool {
-		entry.cancel()
+	var globalNodes []string
+	c.keepAlives.IterCb(func(nodeName string, entry *keepAliveEntry) bool {
+		if !entry.nodeScoped {
+			entry.cancel()
+			globalNodes = append(globalNodes, nodeName)
+		}
 		return true
 	})
-	c.keepAlives.Clear()
+	for _, nodeName := range globalNodes {
+		c.keepAlives.Remove(nodeName)
+	}
 }
 
 // startKeepAliveFor 为入池连接挂载心跳；未启用心跳时为 no-op。
@@ -1406,11 +1444,38 @@ func (c *Connector) watchKeepAliveConfig(cfg *keepAliveConfig) {
 // 杜绝"读到 cfg 后、写入注册表前"窗口内 CloseAll 先行清空导致的孤儿注册条目。
 // 同节点重连时先取消旧心跳，避免同一节点存在多个心跳 goroutine。
 // 锁序恒为 kaMu -> keepAlives 分片锁，evictDeadClient 不取 kaMu，无死锁风险
-func (c *Connector) startKeepAliveFor(nodeName string, client *PooledClient) {
+func (c *Connector) startKeepAliveFor(nodeName string, client *PooledClient, clientCfgs ...*ClientConfig) {
 	c.kaMu.Lock()
 	defer c.kaMu.Unlock()
-	cfg := c.keepAliveCfg
-	if cfg == nil || cfg.ctx.Err() != nil {
+
+	var clientCfg *ClientConfig
+	if len(clientCfgs) > 0 {
+		clientCfg = clientCfgs[0]
+	}
+
+	var parentCtx context.Context
+	var interval, timeout time.Duration
+	var nodeScoped bool
+	if cfg := c.keepAliveCfg; cfg != nil && cfg.ctx.Err() == nil {
+		parentCtx = cfg.ctx
+		interval = cfg.interval
+		timeout = cfg.timeout
+	}
+	if clientCfg != nil && clientCfg.Options != nil {
+		countMax := clientCfg.Options.ServerAliveCountMax()
+		if nodeInterval := clientCfg.Options.ServerAliveInterval(); nodeInterval > 0 {
+			nodeScoped = true
+			parentCtx = c.lifecycleCtx
+			interval = nodeInterval
+			if countMax <= 0 {
+				countMax = 3
+			}
+			timeout = nodeInterval * time.Duration(countMax)
+		} else if interval > 0 && countMax > 0 {
+			timeout = interval * time.Duration(countMax)
+		}
+	}
+	if parentCtx == nil || parentCtx.Err() != nil || interval <= 0 {
 		return
 	}
 
@@ -1419,14 +1484,15 @@ func (c *Connector) startKeepAliveFor(nodeName string, client *PooledClient) {
 		old.cancel()
 	}
 
-	nodeCtx, cancel := context.WithCancel(cfg.ctx)
+	nodeCtx, cancel := context.WithCancel(parentCtx)
 	entry := &keepAliveEntry{
-		cancel: cancel,
-		client: client,
+		cancel:     cancel,
+		client:     client,
+		nodeScoped: nodeScoped,
 	}
 	c.keepAlives.Set(nodeName, entry)
 	c.keepAliveWG.Add(1)
-	entry.done = startKeepAlive(nodeCtx, client.SSHClient, cfg.interval, cfg.timeout, func(error) {
+	entry.done = startKeepAlive(nodeCtx, client.SSHClient, interval, timeout, func(error) {
 		c.evictDeadClient(nodeName, client, entry)
 	}, client.interrupt)
 	go func() {
@@ -1456,7 +1522,7 @@ func (c *Connector) evictDeadClient(nodeName string, dead *PooledClient, entry *
 	entry.cancel()
 }
 
-func (c *Connector) initHandshakeDeadline(ctx context.Context, conn net.Conn, nodeName string, coordinator *handshakeCoordinator) error {
+func (c *Connector) initHandshakeDeadline(ctx context.Context, conn net.Conn, nodeName string, timeout time.Duration, coordinator *handshakeCoordinator) error {
 	if coordinator != nil {
 		if err := coordinator.SetConn(conn); err != nil {
 			if closeErr := conn.Close(); closeErr != nil {
@@ -1466,7 +1532,7 @@ func (c *Connector) initHandshakeDeadline(ctx context.Context, conn net.Conn, no
 		}
 		return nil
 	}
-	return setInitialHandshakeDeadline(ctx, conn, nodeName, c.getHandshakeTimeout())
+	return setInitialHandshakeDeadline(ctx, conn, nodeName, timeout)
 }
 
 func handshakeCancelError(ctx context.Context, coordinator *handshakeCoordinator, nodeName string) error {
@@ -1528,7 +1594,7 @@ func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, cfg *
 		dialer = c.baseDialer
 	}
 	if dialer == nil {
-		dialer = &net.Dialer{Timeout: c.getHandshakeTimeout()}
+		dialer = c.directDialerFor(cfg)
 	}
 	if cfg.Port == 0 {
 		cfg.Port = 22
@@ -1563,7 +1629,7 @@ func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, cfg *
 	if _, proxied := dialer.(*SSHProxyDialer); !proxied {
 		conn = &physicalSSHConn{Conn: conn}
 	}
-	if err := c.initHandshakeDeadline(ctx, conn, nodeName, coordinator); err != nil {
+	if err := c.initHandshakeDeadline(ctx, conn, nodeName, c.getNodeHandshakeTimeout(cfg), coordinator); err != nil {
 		return nil, nil, err
 	}
 	stopCancelClose := context.AfterFunc(ctx, func() {
@@ -1749,7 +1815,7 @@ func (c *Connector) CloseAll() error {
 
 func (c *Connector) resolvePasswordAuth(cfg *ClientConfig) (ssh.AuthMethod, error) {
 	if cfg.Password == "" {
-		secret, err := c.resolveSecret(SecretRequest{
+		secret, err := c.resolveSecret(cfg, SecretRequest{
 			Kind:         SecretKindLoginPassword,
 			NodeID:       cfg.NodeID,
 			User:         cfg.User,
@@ -1776,7 +1842,7 @@ func (c *Connector) resolveKeyAuth(cfg *ClientConfig) (ssh.AuthMethod, error) {
 	var secret []byte
 	if cfg.Passphrase == "" {
 		var err error
-		secret, err = c.resolveSecret(SecretRequest{
+		secret, err = c.resolveSecret(cfg, SecretRequest{
 			Kind:         SecretKindPrivateKeyPassphrase,
 			NodeID:       cfg.NodeID,
 			User:         cfg.User,
@@ -1821,15 +1887,20 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 	var authCallback ssh.ClientAuthCallback
 	authMethods := []ssh.AuthMethod{}
 
-	prompter := c.secretPrompter
+	basePrompter := c.getNodeSecretPrompter(cfg)
+	prompter := basePrompter
 	authCtx := c.lifecycleCtx
 	if coordinator != nil {
 		authCtx = coordinator.Context()
 		prompter = &coordinatingPrompter{
-			prompter:    c.secretPrompter,
+			prompter:    basePrompter,
 			coordinator: coordinator,
 		}
 	}
+
+	hostKeyChanged := &atomic.Bool{}
+	policy := newAuthPolicy(cfg.Options, hostKeyChanged)
+	pubkeyAllowed, passwordAllowed, kbAllowed := policy.pubkeyAllowed, policy.passwordAllowed, policy.kbAllowed
 
 	// 根据 AuthType 处理不同的认证方式
 	switch cfg.AuthType {
@@ -1852,11 +1923,13 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 			VersionToken:       cfg.AuthUpdateToken,
 			Resolver:           c.secretResolver,
 			Prompter:           prompter,
-			HandshakeTimeout:   c.getHandshakeTimeout(),
+			HandshakeTimeout:   c.getNodeHandshakeTimeout(cfg),
 			InteractionTimeout: c.interactionTimeout,
 			FailClosed:         failClosed,
-			RecoveryPrompter:   credentialRecoveryPrompter(c.secretPrompter),
+			RecoveryPrompter:   credentialRecoveryPrompter(basePrompter),
 			KeyPath:            cfg.KeyPath,
+			SSHOptions:         cfg.Options,
+			HostKeyChanged:     hostKeyChanged,
 			PasswordCallback: func(s string) {
 				if s != "" {
 					// Rejected earlier key candidates are cleared by
@@ -1910,10 +1983,16 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 		cleanup = release
 
 	case "keyboard-interactive", "otp":
-		authCallback = c.buildKeyboardInteractiveAuth(authCtx, cfg, prompter, coordinator, observer)
+		if !kbAllowed {
+			return nil, nil, errors.New("keyboard-interactive authentication disabled by SSH options")
+		}
+		authCallback = c.buildKeyboardInteractiveAuth(authCtx, cfg, policy, prompter, coordinator, observer)
 
 	case "password":
-		if credentialRecoveryPrompter(c.secretPrompter) != nil {
+		if !passwordAllowed {
+			return nil, nil, errors.New("password authentication disabled by SSH options")
+		}
+		if credentialRecoveryPrompter(basePrompter) != nil {
 			authMethods = append(authMethods, c.recoverablePasswordAuth(authCtx, cfg, prompter, onAuthDiscovered))
 			break
 		}
@@ -1924,6 +2003,9 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 		authMethods = append(authMethods, method)
 
 	case "key":
+		if !pubkeyAllowed {
+			return nil, nil, errors.New("publickey authentication disabled by SSH options")
+		}
 		method, release, err := c.keyAuth(authCtx, cfg, prompter, onAuthDiscovered)
 		if err != nil {
 			return nil, nil, err
@@ -1932,6 +2014,12 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 		cleanup = release
 
 	case "agent":
+		if !pubkeyAllowed {
+			return nil, nil, errors.New("publickey authentication disabled by SSH options")
+		}
+		if policy.identitiesOnly {
+			return nil, nil, errors.New("ssh-agent authentication disabled by IdentitiesOnly=yes")
+		}
 		method, agentCleanup, err := c.resolveAgentAuth(ctx)
 		if err != nil {
 			return nil, nil, err
@@ -1944,10 +2032,18 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 	}
 
 	if authCallback == nil && len(authMethods) == 1 {
-		authCallback = c.buildSingleMethodTransitionCallback(authCtx, cfg, prompter, coordinator, observer)
+		authCallback = c.buildSingleMethodTransitionCallback(authCtx, cfg, policy, prompter, coordinator, observer)
 	}
 
-	hostKeyCallback, hostKeyAlgorithms, err := c.getHostKeyOptions(ctx, coordinator, cfg)
+	hostKeyCallback, hostKeyAlgorithms, err := c.getHostKeyOptions(ctx, coordinator, cfg, hostKeyChanged)
+	if err != nil {
+		if cleanup != nil {
+			err = errors.Join(err, cleanup())
+		}
+		return nil, nil, err
+	}
+
+	cryptoCfg, err := buildTransportCryptoConfig(cfg.Options)
 	if err != nil {
 		if cleanup != nil {
 			err = errors.Join(err, cleanup())
@@ -1961,6 +2057,7 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 	}
 
 	clientConfig := &ssh.ClientConfig{
+		Config:            cryptoCfg,
 		User:              cfg.User,
 		Auth:              authMethods,
 		AuthCallback:      authCallback,
@@ -1971,6 +2068,35 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 	c.observeSSHConfig(cfg, clientConfig, observer)
 	clientConfig.AuthCallback = authentication.wrap(clientConfig.AuthCallback)
 	return clientConfig, cleanup, nil
+}
+
+func buildTransportCryptoConfig(opts *Options) (ssh.Config, error) {
+	var cryptoCfg ssh.Config
+	if opts == nil {
+		return cryptoCfg, nil
+	}
+	if ciphers := opts.Ciphers(); ciphers != "" {
+		list, err := ResolveAlgorithmList(ciphers, ssh.SupportedAlgorithms().Ciphers)
+		if err != nil {
+			return cryptoCfg, fmt.Errorf("resolve Ciphers option: %w", err)
+		}
+		cryptoCfg.Ciphers = list
+	}
+	if macs := opts.MACs(); macs != "" {
+		list, err := ResolveAlgorithmList(macs, ssh.SupportedAlgorithms().MACs)
+		if err != nil {
+			return cryptoCfg, fmt.Errorf("resolve MACs option: %w", err)
+		}
+		cryptoCfg.MACs = list
+	}
+	if kex := opts.KexAlgorithms(); kex != "" {
+		list, err := ResolveAlgorithmList(kex, ssh.SupportedAlgorithms().KeyExchanges)
+		if err != nil {
+			return cryptoCfg, fmt.Errorf("resolve KexAlgorithms option: %w", err)
+		}
+		cryptoCfg.KeyExchanges = list
+	}
+	return cryptoCfg, nil
 }
 
 // observeSSHConfig adds diagnostics without changing fallback selection or trust results.
@@ -1991,6 +2117,7 @@ func (c *Connector) newAutoSecretProvider(authCtx context.Context, cfg *ClientCo
 	if coordinator != nil {
 		failClosed = coordinator.FailClosed
 	}
+	basePrompter := c.getNodeSecretPrompter(cfg)
 	return &autoSecretProvider{
 		lifecycleCtx:       authCtx,
 		nodeID:             cfg.NodeID,
@@ -2000,14 +2127,14 @@ func (c *Connector) newAutoSecretProvider(authCtx context.Context, cfg *ClientCo
 		versionToken:       cfg.AuthUpdateToken,
 		resolver:           c.secretResolver,
 		prompter:           prompter,
-		handshakeTimeout:   c.getHandshakeTimeout(),
+		handshakeTimeout:   c.getNodeHandshakeTimeout(cfg),
 		interactionTimeout: c.interactionTimeout,
 		failClosed:         failClosed,
-		recoveryPrompter:   credentialRecoveryPrompter(c.secretPrompter),
+		recoveryPrompter:   credentialRecoveryPrompter(basePrompter),
 	}
 }
 
-func (c *Connector) buildKeyboardInteractiveAuth(authCtx context.Context, cfg *ClientConfig, prompter SecretPrompter, coordinator *handshakeCoordinator, observer logger.DiagnosticObserver) ssh.ClientAuthCallback {
+func (c *Connector) buildKeyboardInteractiveAuth(authCtx context.Context, cfg *ClientConfig, policy authPolicy, prompter SecretPrompter, coordinator *handshakeCoordinator, observer logger.DiagnosticObserver) ssh.ClientAuthCallback {
 	secProvider := c.newAutoSecretProvider(authCtx, cfg, prompter, coordinator)
 	kbMethod := buildKeyboardInteractiveAuthMethod(secProvider)
 	candidates := []autoAuthCandidate{
@@ -2017,44 +2144,49 @@ func (c *Connector) buildKeyboardInteractiveAuth(authCtx context.Context, cfg *C
 			method:   kbMethod,
 		},
 	}
-	passwordAttempts := 0
-	initialPassword := cfg.Password
-	passwordMethod := ssh.RetryableAuthMethod(ssh.PasswordCallback(func() (string, error) {
-		retry := passwordAttempts > 0
-		if retry && secProvider.recoveryPrompter == nil {
-			return "", ErrInteractionRequired
-		}
-		passwordAttempts++
-		if !retry && initialPassword != "" {
-			pwd := initialPassword
-			initialPassword = ""
-			return pwd, nil
-		}
-		password, err := secProvider.resolveOrPromptAttempt(SecretRequest{
-			Kind: SecretKindLoginPassword,
-		}, retry)
-		if err != nil {
-			return "", fmt.Errorf("failed to read password: %w", err)
-		}
-		return password, nil
-	}), 3)
-	candidates = append(candidates, autoAuthCandidate{
-		protocol: autoAuthProtocolPassword,
-		label:    "password",
-		method:   passwordMethod,
-		allow: func(ctx *ssh.ClientAuthContext) bool {
-			// Only coordinate with password in explicit keyboard-interactive/otp mode
-			// when multi-stage MFA is in progress or when the initial stage did not
-			// offer keyboard-interactive (e.g., password -> keyboard-interactive MFA).
-			return len(ctx.PartialSuccessMethods) > 0 || !slices.Contains(ctx.TriedMethods, autoAuthProtocolKeyboardInteractive)
-		},
-	})
-	return newSequentialAuthCallback(candidates, secProvider, c.getLogger(), observer)
+	if policy.passwordAllowed {
+		passwordAttempts := 0
+		initialPassword := cfg.Password
+		passwordMethod := ssh.RetryableAuthMethod(ssh.PasswordCallback(func() (string, error) {
+			retry := passwordAttempts > 0
+			if retry && secProvider.recoveryPrompter == nil {
+				return "", ErrInteractionRequired
+			}
+			passwordAttempts++
+			if !retry && initialPassword != "" {
+				pwd := initialPassword
+				initialPassword = ""
+				return pwd, nil
+			}
+			password, err := secProvider.resolveOrPromptAttempt(SecretRequest{
+				Kind: SecretKindLoginPassword,
+			}, retry)
+			if err != nil {
+				return "", fmt.Errorf("failed to read password: %w", err)
+			}
+			return password, nil
+		}), 3)
+		candidates = append(candidates, autoAuthCandidate{
+			protocol: autoAuthProtocolPassword,
+			label:    "password",
+			method:   passwordMethod,
+			allow: func(ctx *ssh.ClientAuthContext) bool {
+				// Only coordinate with password in explicit keyboard-interactive/otp mode
+				// when multi-stage MFA is in progress or when the initial stage did not
+				// offer keyboard-interactive (e.g., password -> keyboard-interactive MFA).
+				return len(ctx.PartialSuccessMethods) > 0 || !slices.Contains(ctx.TriedMethods, autoAuthProtocolKeyboardInteractive)
+			},
+		})
+	}
+	return newSequentialAuthCallbackWithPolicy(candidates, policy, secProvider, c.getLogger(), observer)
 }
 
-func (c *Connector) buildSingleMethodTransitionCallback(authCtx context.Context, cfg *ClientConfig, prompter SecretPrompter, coordinator *handshakeCoordinator, observer logger.DiagnosticObserver) ssh.ClientAuthCallback {
+func (c *Connector) buildSingleMethodTransitionCallback(authCtx context.Context, cfg *ClientConfig, policy authPolicy, prompter SecretPrompter, coordinator *handshakeCoordinator, observer logger.DiagnosticObserver) ssh.ClientAuthCallback {
 	secProvider := c.newAutoSecretProvider(authCtx, cfg, prompter, coordinator)
-	kbMethod := buildKeyboardInteractiveAuthMethod(secProvider)
+	var kbMethod ssh.AuthMethod
+	if policy.kbAllowed {
+		kbMethod = buildKeyboardInteractiveAuthMethod(secProvider)
+	}
 	protocol := "publickey"
 	if cfg.AuthType == "password" {
 		protocol = "password"
@@ -2078,8 +2210,11 @@ func (c *Connector) buildSingleMethodTransitionCallback(authCtx context.Context,
 			lastStage = stage
 			kbTriedInStage = false
 		}
-		// When single-method auth achieves partial success, transition to keyboard-interactive once per stage if allowed by server
-		if stage > 0 && !kbTriedInStage && slices.Contains(ctx.AllowedMethods, autoAuthProtocolKeyboardInteractive) {
+		// When single-method auth achieves partial success, transition to keyboard-interactive once per stage if allowed by server and policy
+		if stage > 0 && policy.kbAllowed && !kbTriedInStage && slices.Contains(ctx.AllowedMethods, autoAuthProtocolKeyboardInteractive) {
+			if err := policy.checkProtocolRuntime(autoAuthProtocolKeyboardInteractive); err != nil {
+				return nil, err
+			}
 			kbTriedInStage = true
 			if observer != nil {
 				event := authenticationDiagnostic(ctx)
@@ -2089,9 +2224,11 @@ func (c *Connector) buildSingleMethodTransitionCallback(authCtx context.Context,
 			c.getLogger().Debugf("Transitioning to keyboard-interactive after partial success: %v", ctx.PartialSuccessMethods)
 			return kbMethod, nil
 		}
-		// Diagnostic logging for the primary method attempt
-		if stage == 0 && observer != nil {
-			if slices.Contains(ctx.AllowedMethods, protocol) && !slices.Contains(ctx.TriedMethods, protocol) {
+		if stage == 0 {
+			if err := policy.checkProtocolRuntime(protocol); err != nil {
+				return nil, err
+			}
+			if observer != nil && slices.Contains(ctx.AllowedMethods, protocol) && !slices.Contains(ctx.TriedMethods, protocol) {
 				event := authenticationDiagnostic(ctx)
 				event.Kind, event.Method, event.Methods = logger.AuthenticationAttempt, protocol, nil
 				logger.EmitDiagnostic(observer, event)
@@ -2138,41 +2275,20 @@ func buildKeyAuthMethod(cfg *ClientConfig, extraPassphrase []byte, resolver ...f
 	return ssh.PublicKeys(signer), nil
 }
 
-func (c *Connector) getHostKeyCallback(ctx context.Context, coordinator *handshakeCoordinator, cfg *ClientConfig) (ssh.HostKeyCallback, error) {
+func (c *Connector) getHostKeyCallback(ctx context.Context, coordinator *handshakeCoordinator, cfg *ClientConfig, hostKeyChangedFlags ...*atomic.Bool) (ssh.HostKeyCallback, error) {
 	if c.hostKeyVerifier != nil {
-		verificationParent := ctx
-		if coordinator != nil {
-			verificationParent = coordinator.Context()
-		}
-		request := HostKeyRequest{NodeID: cfg.NodeID, Host: cfg.Address, Port: cfg.Port, User: cfg.User, VersionToken: cfg.TrustVersion}
-		return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
-			verification, cancel := context.WithTimeout(verificationParent, c.getHandshakeTimeout())
-			defer cancel()
-			if err := verification.Err(); err != nil {
-				return err
-			}
-			requestCopy := request
-			requestCopy.Hostname, requestCopy.Remote = hostname, remote
-			return c.hostKeyVerifier.Verify(verification, requestCopy, key)
-		}, nil
-	}
-	if err := validateEnvironment(c.environment); err != nil {
-		return nil, err
-	}
-	knownHostsFile := c.environment.KnownHostsFile
-
-	if _, err := os.Stat(knownHostsFile); os.IsNotExist(err) {
-		if mkdirErr := os.MkdirAll(filepath.Dir(knownHostsFile), 0700); mkdirErr != nil {
-			return nil, fmt.Errorf("create .ssh directory failed: %w", mkdirErr)
-		}
-		if writeErr := os.WriteFile(knownHostsFile, []byte(""), 0600); writeErr != nil {
-			return nil, fmt.Errorf("create known_hosts file failed: %w", writeErr)
-		}
+		return c.verifierHostKeyCallback(ctx, coordinator, cfg), nil
 	}
 
-	hostKeyCallback, err := knownhosts.New(knownHostsFile)
+	var hostKeyChanged *atomic.Bool
+	if len(hostKeyChangedFlags) > 0 {
+		hostKeyChanged = hostKeyChangedFlags[0]
+	}
+
+	strictMode, userKH, batchMode := extractHostKeyPolicy(cfg)
+	knownHostsFile, noKnownHostsFile, hostKeyCallback, err := c.openKnownHostsCallback(userKH, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("parse known_hosts file failed: %w", err)
+		return nil, err
 	}
 
 	return func(hostname string, remote net.Addr, key ssh.PublicKey) (retErr error) {
@@ -2182,29 +2298,186 @@ func (c *Connector) getHostKeyCallback(ctx context.Context, coordinator *handsha
 		}
 
 		if keyErr, ok := errors.AsType[*knownhosts.KeyError](err); ok {
-			if len(keyErr.Want) > 0 {
-				return fmt.Errorf("%w: remote host identification has changed for %s: %w", ErrHostKeyMismatch, hostname, err)
-			}
-
-			if coordinator != nil {
-				if pauseErr := coordinator.Pause(); pauseErr != nil {
-					return pauseErr
-				}
-				defer func() {
-					if resumeErr := coordinator.Resume(); resumeErr != nil {
-						retErr = errors.Join(retErr, resumeErr)
-					}
-				}()
-			}
-
-			if promptErr := c.promptHostKeyVerification(ctx, hostname, remote, key); promptErr != nil {
-				return promptErr
-			}
-
-			return appendKnownHost(knownHostsFile, hostname, key)
+			return c.handleKnownHostsKeyError(ctx, coordinator, keyErr, strictMode, batchMode, noKnownHostsFile, knownHostsFile, hostname, remote, key, hostKeyChanged)
 		}
 		return err
 	}, nil
+}
+
+func (c *Connector) verifierHostKeyCallback(ctx context.Context, coordinator *handshakeCoordinator, cfg *ClientConfig) ssh.HostKeyCallback {
+	verificationParent := ctx
+	if coordinator != nil {
+		verificationParent = coordinator.Context()
+	}
+	request := HostKeyRequest{NodeID: cfg.NodeID, Host: cfg.Address, Port: cfg.Port, User: cfg.User, VersionToken: cfg.TrustVersion}
+	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		verification, cancel := context.WithTimeout(verificationParent, c.getNodeHandshakeTimeout(cfg))
+		defer cancel()
+		if err := verification.Err(); err != nil {
+			return err
+		}
+		requestCopy := request
+		requestCopy.Hostname, requestCopy.Remote = hostname, remote
+		return c.hostKeyVerifier.Verify(verification, requestCopy, key)
+	}
+}
+
+func extractHostKeyPolicy(cfg *ClientConfig) (strictMode string, userKH string, batchMode bool) {
+	strictMode = StrictHostKeyCheckingAsk
+	if cfg != nil && cfg.Options != nil {
+		if m := cfg.Options.StrictHostKeyChecking(); m != "" {
+			strictMode = m
+		}
+		userKH = strings.TrimSpace(cfg.Options.UserKnownHostsFile())
+		batchMode = cfg.Options.BatchMode()
+	}
+	return strictMode, userKH, batchMode
+}
+
+func (c *Connector) openKnownHostsCallback(userKH string, cfg *ClientConfig) (string, bool, ssh.HostKeyCallback, error) {
+	emptyCallback := func(string, net.Addr, ssh.PublicKey) error {
+		return &knownhosts.KeyError{}
+	}
+	if strings.EqualFold(userKH, "none") || userKH == "/dev/null" {
+		return "", true, emptyCallback, nil
+	}
+
+	if userKH != "" {
+		return c.openCustomKnownHostsFiles(userKH, cfg, emptyCallback)
+	}
+
+	if err := validateEnvironment(c.environment); err != nil {
+		return "", false, nil, err
+	}
+	knownHostsFile := c.environment.KnownHostsFile
+	if _, err := os.Stat(knownHostsFile); os.IsNotExist(err) {
+		if mkdirErr := os.MkdirAll(filepath.Dir(knownHostsFile), 0700); mkdirErr != nil {
+			return "", false, nil, fmt.Errorf("create .ssh directory failed: %w", mkdirErr)
+		}
+		if writeErr := os.WriteFile(knownHostsFile, []byte(""), 0600); writeErr != nil {
+			return "", false, nil, fmt.Errorf("create known_hosts file failed: %w", writeErr)
+		}
+	}
+
+	hostKeyCallback, err := knownhosts.New(knownHostsFile)
+	if err != nil {
+		return "", false, nil, fmt.Errorf("parse known_hosts file failed: %w", err)
+	}
+	return knownHostsFile, false, hostKeyCallback, nil
+}
+
+func (c *Connector) openCustomKnownHostsFiles(userKH string, cfg *ClientConfig, emptyCallback ssh.HostKeyCallback) (string, bool, ssh.HostKeyCallback, error) {
+	fields := strings.Fields(userKH)
+	var existingFiles []string
+	var primaryWriteFile string
+	target := TargetContext{}
+	if cfg != nil {
+		target = TargetContext{
+			Host:         cfg.Address,
+			Port:         cfg.Port,
+			User:         cfg.User,
+			OriginalHost: cfg.NodeID,
+			JumpHost:     cfg.ProxyJump,
+		}
+	}
+	for _, tokenPath := range fields {
+		if strings.EqualFold(tokenPath, "none") || tokenPath == "/dev/null" {
+			continue
+		}
+		expanded, expErr := expandKnownHostsPath(tokenPath, c.environment, target)
+		if expErr != nil {
+			return "", false, nil, fmt.Errorf("expand UserKnownHostsFile %q failed: %w", tokenPath, expErr)
+		}
+		if primaryWriteFile == "" {
+			primaryWriteFile = expanded
+		}
+		st, err := os.Stat(expanded)
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				return "", false, nil, fmt.Errorf("stat UserKnownHostsFile %q failed: %w", expanded, err)
+			}
+			continue
+		}
+		if st.IsDir() {
+			return "", false, nil, fmt.Errorf("UserKnownHostsFile %q is a directory", expanded)
+		}
+		existingFiles = append(existingFiles, expanded)
+	}
+	if len(existingFiles) == 0 {
+		return primaryWriteFile, primaryWriteFile == "", emptyCallback, nil
+	}
+	hostKeyCallback, err := knownhosts.New(existingFiles...)
+	if err != nil {
+		return "", false, nil, fmt.Errorf("parse known_hosts file failed: %w", err)
+	}
+	return primaryWriteFile, primaryWriteFile == "", hostKeyCallback, nil
+}
+
+func expandKnownHostsPath(pattern string, env Environment, target TargetContext) (string, error) {
+	return ExpandControlPath(pattern, env, target)
+}
+
+func (c *Connector) handleKnownHostsKeyError(
+	ctx context.Context,
+	coordinator *handshakeCoordinator,
+	keyErr *knownhosts.KeyError,
+	strictMode string,
+	batchMode bool,
+	noKnownHostsFile bool,
+	knownHostsFile string,
+	hostname string,
+	remote net.Addr,
+	key ssh.PublicKey,
+	hostKeyChanged *atomic.Bool,
+) (retErr error) {
+	if len(keyErr.Want) > 0 {
+		if strictMode == StrictHostKeyCheckingNo {
+			if hostKeyChanged != nil {
+				hostKeyChanged.Store(true)
+			}
+			c.getLogger().Debugf("host key verification: remote host identification changed for %s; continuing due to StrictHostKeyChecking=no with password and keyboard-interactive authentication disabled", hostname)
+			return nil
+		}
+		return fmt.Errorf("%w: remote host identification has changed for %s: %w", ErrHostKeyMismatch, hostname, keyErr)
+	}
+
+	switch strictMode {
+	case StrictHostKeyCheckingYes:
+		return fmt.Errorf("%w: no host key is known for %s and StrictHostKeyChecking=yes", ErrHostKeyMismatch, hostname)
+	case StrictHostKeyCheckingNo:
+		if !noKnownHostsFile && knownHostsFile != "" {
+			_ = appendKnownHost(knownHostsFile, hostname, key)
+		}
+		return nil
+	case StrictHostKeyCheckingAcceptNew:
+		if noKnownHostsFile || knownHostsFile == "" {
+			return nil
+		}
+		return appendKnownHost(knownHostsFile, hostname, key)
+	default:
+		if batchMode && !c.AcceptNewHostKey.Load() {
+			return ErrInteractionRequired
+		}
+		if coordinator != nil {
+			if pauseErr := coordinator.Pause(); pauseErr != nil {
+				return pauseErr
+			}
+			defer func() {
+				if resumeErr := coordinator.Resume(); resumeErr != nil {
+					retErr = errors.Join(retErr, resumeErr)
+				}
+			}()
+		}
+
+		if promptErr := c.promptHostKeyVerification(ctx, hostname, remote, key); promptErr != nil {
+			return promptErr
+		}
+
+		if noKnownHostsFile || knownHostsFile == "" {
+			return nil
+		}
+		return appendKnownHost(knownHostsFile, hostname, key)
+	}
 }
 
 func (c *Connector) promptHostKeyVerification(ctx context.Context, hostname string, remote net.Addr, key ssh.PublicKey) error {
@@ -2241,7 +2514,11 @@ func appendKnownHost(knownHostsFile, hostname string, key ssh.PublicKey) (err er
 	knownHostsFileMutex.Lock()
 	defer knownHostsFileMutex.Unlock()
 
-	f, openErr := os.OpenFile(knownHostsFile, os.O_APPEND|os.O_WRONLY, 0600)
+	if mkdirErr := os.MkdirAll(filepath.Dir(knownHostsFile), 0700); mkdirErr != nil {
+		return fmt.Errorf("create known_hosts directory failed: %w", mkdirErr)
+	}
+
+	f, openErr := os.OpenFile(knownHostsFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if openErr != nil {
 		return fmt.Errorf("open known_hosts file failed: %w", openErr)
 	}

@@ -75,6 +75,14 @@ func (p *Provider) Frozen() ConfigProvider {
 	return frozen
 }
 
+// GetOpenSSHOptions returns supported OpenSSH options from OpenSSH config for an alias.
+func (p *Provider) GetOpenSSHOptions(alias string) (*ssh.Options, error) {
+	if p == nil || p.openSSH == nil {
+		return nil, nil
+	}
+	return p.openSSH.GetSSHOptions(alias)
+}
+
 // GetOpenSSHControl returns multiplexing configuration from OpenSSH config for an alias.
 func (p *Provider) GetOpenSSHControl(alias string) (*ssh.ControlConfig, error) {
 	if p == nil || p.openSSH == nil {
@@ -452,7 +460,7 @@ func cloneConfiguration(cfg *Configuration) *Configuration {
 	cloned.Guardrail = cloneGuardrail(cfg.Guardrail)
 	cloned.MCP = cfg.MCP.Clone()
 	cloned.Execution = cfg.Execution.Clone()
-	cloned.Control = cfg.Control.Clone()
+	cloned.SSHOptions = cfg.SSHOptions.Clone()
 	if cfg.Nodes != nil {
 		for _, key := range cfg.Nodes.Keys() {
 			if node, ok := cfg.Nodes.Get(key); ok {
@@ -486,8 +494,8 @@ func cloneNode(node models.Node) models.Node {
 	if node.Execution != nil {
 		node.Execution = node.Execution.Clone()
 	}
-	if node.Control != nil {
-		node.Control = node.Control.Clone()
+	if node.SSHOptions != nil {
+		node.SSHOptions = node.SSHOptions.Clone()
 	}
 	return node
 }

@@ -202,22 +202,22 @@ func TestAdversarial_ControlPathNone_DisablesSharing(t *testing.T) {
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
 		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
 		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
-		Control: &ssh.ControlConfig{
+		SSHOptions: ssh.OptionsFromControl(&ssh.ControlConfig{
 			Master:  ssh.ControlMasterAuto,
 			Path:    "/tmp/global.sock",
 			Persist: "1h",
-		},
+		}),
 	}
 	cfg.Hosts.Set("host1", models.Host{Address: "192.168.1.100"})
 	cfg.Identities.Set("id1", models.Identity{User: "alice", AuthType: "auto"})
 	cfg.Nodes.Set("persistent-node", models.Node{
 		HostRef:     "host1",
 		IdentityRef: "id1",
-		Control: &ssh.ControlConfig{
+		SSHOptions: ssh.OptionsFromControl(&ssh.ControlConfig{
 			Master:  ssh.ControlMasterAuto,
 			Path:    "/tmp/lower-tier.sock",
 			Persist: "10m",
-		},
+		}),
 	})
 
 	provider, err := config.NewProvider(cfg)

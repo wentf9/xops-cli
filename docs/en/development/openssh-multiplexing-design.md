@@ -331,20 +331,20 @@ If a prior master crashed abnormally (`kill -9` or power failure), an inactive s
 
 ### 5.1 4-Tier Resolution Precedence
 
-`pkg/adapter/ssh_adapter.go:ResolveControl` evaluates multiplexing configurations strictly according to the following precedence:
+`pkg/adapter/ssh_adapter.go:ResolveSSHOptions` (and `ResolveControl` derived from it) evaluates OpenSSH client options and multiplexing configurations strictly according to the following precedence:
 
 $$\text{Tier 1 (CLI Session Overrides)} > \text{Tier 2 (Node Config)} > \text{Tier 3 (Global Defaults)} > \text{Tier 4 (OpenSSH Config)}$$
 
 1. **Tier 1 (CLI Session Overrides)**: Command-line flags `-M`, `-M -M`, `-S <path>`, `-S none`, and `-o Key=Value`.
-2. **Tier 2 (Node Configuration)**: Target node definition in `config.yaml` (`nodes[name].control`).
-3. **Tier 3 (Global Defaults)**: Root-level default configuration in `config.yaml` (`control`).
-4. **Tier 4 (OpenSSH Config Fallback)**: Parsed from `~/.ssh/config` matching the target host. Within Tier 4, concrete host entries take precedence over wildcard patterns (`Host *`).
+2. **Tier 2 (Node Configuration)**: Target node definition in `config.yaml` (`nodes[name].ssh_options`).
+3. **Tier 3 (Global Defaults)**: Root-level default configuration in `config.yaml` (`ssh_options`).
+4. **Tier 4 (OpenSSH Config Fallback)**: Parsed from `~/.ssh/config` matching the target host (including `ControlMaster`, `ControlPath`, `ControlPersist`, and connection/authentication/algorithm options). Within Tier 4, concrete host entries take precedence over wildcard patterns (`Host *`).
 
 ### 5.2 Orthogonal Field-by-Field Merging
 
-The three primary configuration fields (`Master`, `Path`, `Persist`) are orthogonal and merged independently across tiers:
-- A higher tier leaves unset fields to be inherited from lower tiers.
-- **Explicit Disablement (`-S none` or `Path: "none"`)**: If any higher tier explicitly specifies `Path: "none"`, multiplexing is disabled globally for that session: `Master` is normalized to `"no"`, `Persist` is cleared, and the client falls back to direct connection.
+`core/ssh/ssh_options.go:Options` uses a registry-driven (`optionRegistry`) normalized key-value model where all supported OpenSSH options are orthogonal and merged independently across the 4 tiers:
+- A higher tier leaves unset options to be inherited from lower tiers.
+- **Explicit Disablement (`-S none` or `control_path: "none"`)**: If any higher tier explicitly specifies `control_path: "none"` (or `ControlPath=none`), multiplexing is disabled globally for that session: `control_master` is normalized to `"no"`, `control_persist` is cleared, and the client falls back to direct connection.
 
 ### 5.3 ControlPath Token Expansion
 
@@ -381,29 +381,42 @@ $$\text{Hash} = \text{SHA-1}(\%l + \%h + \%p + \%r + \%j)$$
 The result is a fixed 40-character lowercase hexadecimal string. The recommended standard socket path is:
 `~/.ssh/cm-%C` (approximately 54 bytes, comfortably within all OS limits).
 
-### 5.5 Schema V2 Declarations & CAS Entity Versioning
+### 5.5 Schema V2 `ssh_options` Extensible Configuration & CAS Entity Versioning
 
-In `pkg/config/types.go` and `schema_v2.go`, `ControlConfig` is integrated into the configuration schema:
+In `pkg/config/types.go` and `schema_v2.go`, both global and per-node configurations use the extensible `ssh_options` mapping (`*ssh.Options`):
+- **Canonical `snake_case` Persistence & OpenSSH Input Compatibility**: When marshaled to disk, `ssh_options` always writes canonical `snake_case` keys (consistent with the rest of `xops_config.yaml`). When unmarshaling manually edited files, both canonical `snake_case` and OpenSSH standard `PascalCase` / case-insensitive option names (e.g., `ControlMaster`, `StrictHostKeyChecking`) are accepted. Unknown keys or duplicate representations of the same option are rejected during validation.
 
 ```yaml
 # config.yaml (Schema V2)
-control:
-  master: auto
-  path: ~/.ssh/cm-%C
-  persist: 10m
+ssh_options:
+  control_master: auto
+  control_path: ~/.ssh/cm-%C
+  control_persist: 10m
+  connect_timeout: 15s
+  server_alive_interval: 30s
+  strict_host_key_checking: accept-new
 
 nodes:
   web01:
-    host: 10.0.0.1
-    user: ops
-    control:
-      master: "yes"
-      path: /tmp/custom-%h-%p
-      persist: 0
+    host_ref: host-web01
+    identity_ref: id-ops
+    ssh_options:
+      control_master: "yes"
+      control_path: /tmp/custom-%h-%p
+      control_persist: "0"
+      tcp_keep_alive: "yes"
 ```
 
-- **Validation**: `ValidateControlConfig` verifies enum values, persist duration syntax, and unexpanded path token syntax.
-- **CAS Versioning**: `ControlConfig` participates in the `NodeRef` CAS content hash (`pkg/config/repository.go:nodeEntityVersion`), so a change invalidates dependent optimistic-concurrency preconditions for that node. `nodeAuthVersion` stays scoped to authentication material and does not include multiplexing configuration.
+- **Supported OpenSSH Options Registry (`core/ssh/ssh_options.go`, 19 options isolated by `OptionClass`)**:
+  - **Multiplexing (`OptionClassMux`)**: `control_master` (`ControlMaster`), `control_path` (`ControlPath`), `control_persist` (`ControlPersist`)
+  - **Transport & Algorithms (`OptionClassTransport`)**: `connect_timeout` (`ConnectTimeout`), `server_alive_interval` (`ServerAliveInterval`), `server_alive_count_max` (`ServerAliveCountMax`), `tcp_keep_alive` (`TCPKeepAlive`), `host_key_algorithms` (`HostKeyAlgorithms`), `ciphers` (`Ciphers`), `macs` (`MACs`), `kex_algorithms` (`KexAlgorithms`; all supporting full list, `+` append, `^` prepend, and `-` remove modifiers)
+  - **Authentication Control (`OptionClassAuth`)**: `pubkey_authentication` (`PubkeyAuthentication`), `password_authentication` (`PasswordAuthentication`), `kbd_interactive_authentication` (`KbdInteractiveAuthentication` / `ChallengeResponseAuthentication`), `identities_only` (`IdentitiesOnly`), `preferred_authentications` (`PreferredAuthentications`), `batch_mode` (`BatchMode`)
+  - **Host Key Trust (`OptionClassTrust`)**: `strict_host_key_checking` (`StrictHostKeyChecking`: `yes`/`ask`/`accept-new`/`no`/`off`), `user_known_hosts_file` (`UserKnownHostsFile`)
+- **Trust & Inheritance Boundaries**:
+  - `OptionClassTrust` options are **never inherited from `~/.ssh/config` (Tier 4)**; they are accepted only from CLI `-o` (Tier 1) and explicit `xops` configuration (Tier 2 / Tier 3). When a remote host key has changed (`known_hosts` mismatch) and `StrictHostKeyChecking=no` is explicitly set, XOps follows OpenSSH native semantics by disabling password and keyboard-interactive authentication (allowing only public-key authentication) to prevent credential disclosure.
+  - Managed `xops` nodes only inherit `OptionClassMux` and `OptionClassTransport` from Tier 4 (`~/.ssh/config`), and `ParseOpenSSHHosts` persists only those two classes when importing nodes.
+  - MCP Host and credential-verification paths pass `WithHostTrustOverrides(false)` and `WithControlMultiplexing(false)`, stripping `OptionClassTrust` and `OptionClassMux` to preserve fail-closed host key verification.
+- **CAS Versioning**: `SSHOptions` participates in the `NodeRef` CAS content hash (`pkg/config/repository.go:nodeEntityVersion`), so a change invalidates dependent optimistic-concurrency preconditions for that node. `nodeAuthVersion` stays scoped to authentication material.
 
 ---
 
@@ -417,7 +430,7 @@ nodes:
   - `-M`: Enable master mode (equivalent to `-o ControlMaster=yes`).
   - `-M -M` (repeated): Enable confirmation master mode (equivalent to `-o ControlMaster=ask`).
   - `-S <path>`: Specify control socket path (or `-S none` to disable connection sharing).
-  - `-o Key=Value`: Pass OpenSSH options (`ControlMaster`, `ControlPath`, `ControlPersist`, `Port`, `User`, `IdentityFile`, `ProxyJump`).
+  - `-o Key=Value`: Pass OpenSSH client options (supports `Port`, `User`, `IdentityFile`, `ProxyJump`, and all 19 `ssh_options` listed in section 5.5, case-insensitively in either `PascalCase` or `snake_case`).
   - `-O <ctl_cmd>`: Send control command to active master.
 - **`xops scp`, `xops sftp`, `xops exec`**:
   - Register `-S` and `-o` flags.

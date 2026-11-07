@@ -79,7 +79,7 @@ func (c *Connector) keyAuth(ctx context.Context, cfg *ClientConfig, prompter Sec
 	if c.keySource != nil {
 		return c.sourcedKeyAuth(ctx, cfg)
 	}
-	if credentialRecoveryPrompter(c.secretPrompter) != nil {
+	if credentialRecoveryPrompter(c.getNodeSecretPrompter(cfg)) != nil {
 		method, release, err := c.recoverableKeyAuth(ctx, cfg, prompter, discovered)
 		return method, legacyAuthCleanup(release), err
 	}
@@ -90,7 +90,8 @@ func (c *Connector) keyAuth(ctx context.Context, cfg *ClientConfig, prompter Sec
 // Explicit referenced signers precede agent/file/password candidates. A source
 // lookup failure cannot silently fall back to a different authentication source.
 func (c *Connector) buildOwnedAutoAuth(ctx context.Context, cfg *ClientConfig, options AutoAuthOptions) (autoAuthPlan, func() error, error) {
-	if cfg.KeyRef == "" && (c.keySource == nil || cfg.KeyPath == "") {
+	policy := newAuthPolicy(options.SSHOptions, options.HostKeyChanged)
+	if !policy.pubkeyAllowed || (cfg.KeyRef == "" && (c.keySource == nil || cfg.KeyPath == "")) {
 		plan := buildAutoAuthPlan(ctx, options)
 		return plan, legacyAuthCleanup(plan.cleanup), nil
 	}

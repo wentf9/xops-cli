@@ -41,8 +41,8 @@ func (c *Connector) recoverablePasswordAuth(ctx context.Context, cfg *ClientConf
 	provider := &autoSecretProvider{
 		lifecycleCtx: ctx, nodeID: cfg.NodeID, user: cfg.User,
 		host: cfg.Address, port: cfg.Port, versionToken: cfg.AuthUpdateToken,
-		resolver: c.secretResolver, prompter: prompter, recoveryPrompter: c.secretPrompter,
-		handshakeTimeout: c.getHandshakeTimeout(), interactionTimeout: c.interactionTimeout,
+		resolver: c.secretResolver, prompter: prompter, recoveryPrompter: credentialRecoveryPrompter(c.getNodeSecretPrompter(cfg)),
+		handshakeTimeout: c.getNodeHandshakeTimeout(cfg), interactionTimeout: c.interactionTimeout,
 	}
 	attempts := 0
 	initial := cfg.Password
@@ -73,8 +73,8 @@ func (c *Connector) recoverableKeyAuth(ctx context.Context, cfg *ClientConfig, p
 	provider := &autoSecretProvider{
 		lifecycleCtx: ctx, nodeID: cfg.NodeID, user: cfg.User,
 		host: cfg.Address, port: cfg.Port, versionToken: cfg.AuthUpdateToken,
-		resolver: resolver, prompter: prompter, recoveryPrompter: c.secretPrompter,
-		handshakeTimeout: c.getHandshakeTimeout(), interactionTimeout: c.interactionTimeout,
+		resolver: resolver, prompter: prompter, recoveryPrompter: credentialRecoveryPrompter(c.getNodeSecretPrompter(cfg)),
+		handshakeTimeout: c.getNodeHandshakeTimeout(cfg), interactionTimeout: c.interactionTimeout,
 	}
 	method, err := resolveKeyAuthMethod(resolveKeyPath(cfg.KeyPath, c.environment.ResolveKeyPath), provider, func(_ string, passphrase string) {
 		cfg.Passphrase, cfg.Password = passphrase, ""

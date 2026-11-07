@@ -135,6 +135,30 @@ nodes:
 
 **生效优先级**：CLI 命令行参数 > Playbook 步骤 `execution` > Playbook 全局 `settings.execution` > 节点配置 (`node.execution`) > 全局配置 (`cfg.execution`) > 系统默认 (`server`)。
 
+## OpenSSH 客户端选项与连接共享（`ssh_options`）
+
+你可以在 `~/.xops/xops_config.yaml` 的全局或节点层级配置 `ssh_options`，或在 `xops ssh|scp|sftp|exec` 中通过 `-o Key=Value` 临时覆盖。落盘配置统一使用 `snake_case`，同时也支持手动编辑时直接书写 OpenSSH 标准 `PascalCase` 键名（如 `ControlMaster`、`ConnectTimeout`）：
+
+```yaml
+schema_version: 2
+ssh_options:
+  control_master: auto
+  control_path: ~/.ssh/cm-%C
+  control_persist: 10m
+  connect_timeout: 15s
+  server_alive_interval: 30s
+
+nodes:
+  web-prod-01:
+    host_ref: h_web
+    identity_ref: id_deploy
+    ssh_options:
+      control_persist: 30m
+      strict_host_key_checking: accept-new
+```
+
+**生效优先级**：CLI `-M`/`-S`/`-o` > 节点配置 (`node.ssh_options`) > 全局配置 (`cfg.ssh_options`) > `~/.ssh/config`（其中 `StrictHostKeyChecking` 与 `UserKnownHostsFile` 等主机信任选项仅从 CLI `-o` 或 `xops_config.yaml` 显式配置中读取，不从 `~/.ssh/config` 隐式继承）。
+
 ## 已删除的凭据参数
 
 `host add|edit` 和 `identity add|edit` 已移除明文参数 `--password`、`--key-pass` 及其短参数，避免密码泄露在命令行参数和 Shell 历史中；旧命令 `loadHost` 也已移除（请改用 `xops host import`）。

@@ -117,10 +117,10 @@ func TestPlaybook_ActiveControlSocketReuse(t *testing.T) {
 		HostRef:     "host-1",
 		IdentityRef: "id-1",
 		Tags:        []string{"web"},
-		Control: &ssh.ControlConfig{
+		SSHOptions: ssh.OptionsFromControl(&ssh.ControlConfig{
 			Master: ssh.ControlMasterAuto,
 			Path:   sockPath,
-		},
+		}),
 	})
 
 	provider := config.NewProviderWithoutOpenSSH(cfg)
@@ -195,19 +195,19 @@ func TestPlaybook_CrossNodeSocketSharing(t *testing.T) {
 		HostRef:     "host-1",
 		IdentityRef: "id-1",
 		Tags:        []string{"web"},
-		Control: &ssh.ControlConfig{
+		SSHOptions: ssh.OptionsFromControl(&ssh.ControlConfig{
 			Master: ssh.ControlMasterAuto,
 			Path:   sockPath,
-		},
+		}),
 	})
 	cfg.Nodes.Set("web-02", models.Node{
 		HostRef:     "host-1",
 		IdentityRef: "id-1",
 		Tags:        []string{"web"},
-		Control: &ssh.ControlConfig{
+		SSHOptions: ssh.OptionsFromControl(&ssh.ControlConfig{
 			Master: ssh.ControlMasterAuto,
 			Path:   sockPath,
-		},
+		}),
 	})
 
 	provider := config.NewProviderWithoutOpenSSH(cfg)
@@ -275,10 +275,10 @@ func TestPlaybook_ControlPathNone_BypassesReuse(t *testing.T) {
 	cfg.Nodes.Set("web-direct", models.Node{
 		HostRef:     "host-1",
 		IdentityRef: "id-1",
-		Control: &ssh.ControlConfig{
+		SSHOptions: ssh.OptionsFromControl(&ssh.ControlConfig{
 			Master: ssh.ControlMasterNo,
 			Path:   "none",
-		},
+		}),
 	})
 
 	_ = sockPath // active socket exists, but node explicitly set "none"
@@ -360,10 +360,10 @@ func TestPlaybook_StaleSocketAutoUnlinkAndFallback(t *testing.T) {
 	cfg.Nodes.Set("web-stale", models.Node{
 		HostRef:     "host-1",
 		IdentityRef: "id-1",
-		Control: &ssh.ControlConfig{
+		SSHOptions: ssh.OptionsFromControl(&ssh.ControlConfig{
 			Master: ssh.ControlMasterAuto,
 			Path:   staleSockPath,
-		},
+		}),
 	})
 
 	provider := config.NewProviderWithoutOpenSSH(cfg)

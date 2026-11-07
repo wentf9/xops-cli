@@ -11,6 +11,7 @@ import (
 	"os"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	logger "github.com/wentf9/xops-cli/core/log"
@@ -434,6 +435,8 @@ type AutoAuthOptions struct {
 	PasswordCallback          func(string)
 	PassphraseCallback        func(keyPath, passphrase string)
 	CandidateRejectedCallback func(protocol string)
+	SSHOptions                *Options
+	HostKeyChanged            *atomic.Bool
 	Logger                    logger.DebugLogger
 	Diagnostics               logger.DiagnosticObserver
 }
@@ -488,6 +491,14 @@ func authenticationDiagnostic(ctx *ssh.ClientAuthContext) logger.Diagnostic {
 // ClientConfig.Auth 只会尝试同一 RFC 4252 method 的第一个实例，因此 auto 模式必须通过
 // AuthCallback 显式推进多个 publickey candidate。
 func newSequentialAuthCallback(candidates []autoAuthCandidate, secProvider *autoSecretProvider, l logger.DebugLogger, observers ...logger.DiagnosticObserver) ssh.ClientAuthCallback {
+	return newSequentialAuthCallbackWithPolicy(candidates, authPolicy{
+		pubkeyAllowed:   true,
+		passwordAllowed: true,
+		kbAllowed:       true,
+	}, secProvider, l, observers...)
+}
+
+func newSequentialAuthCallbackWithPolicy(candidates []autoAuthCandidate, policy authPolicy, secProvider *autoSecretProvider, l logger.DebugLogger, observers ...logger.DiagnosticObserver) ssh.ClientAuthCallback {
 	if l == nil {
 		l = logger.NopLogger
 	}
@@ -496,6 +507,7 @@ func newSequentialAuthCallback(candidates []autoAuthCandidate, secProvider *auto
 	lastStage := 0
 	selected := false
 	negotiated := false
+	var blockedErr error
 	var activeCandidate *autoAuthCandidate
 	return func(ctx *ssh.ClientAuthContext) (ssh.AuthMethod, error) {
 		var observer logger.DiagnosticObserver
@@ -519,6 +531,7 @@ func newSequentialAuthCallback(candidates []autoAuthCandidate, secProvider *auto
 			lastStage = stage
 			next = 0
 			selected = false
+			blockedErr = nil
 			activeCandidate = nil
 		} else if activeCandidate != nil {
 			if activeCandidate.onRejected != nil {
@@ -535,6 +548,13 @@ func newSequentialAuthCallback(candidates []autoAuthCandidate, secProvider *auto
 				l.Debugf("Skipping SSH auth candidate %q: server allows %v", candidate.label, ctx.AllowedMethods)
 				continue
 			}
+			if err := policy.checkProtocolRuntime(candidate.protocol); err != nil {
+				l.Debugf("Skipping SSH auth candidate %q due to runtime policy: %v", candidate.label, err)
+				if blockedErr == nil {
+					blockedErr = err
+				}
+				continue
+			}
 
 			l.Debugf("Trying SSH auth candidate: %s", candidate.label)
 			selected = true
@@ -545,6 +565,9 @@ func newSequentialAuthCallback(candidates []autoAuthCandidate, secProvider *auto
 		}
 
 		if !selected {
+			if blockedErr != nil {
+				return nil, blockedErr
+			}
 			return nil, fmt.Errorf("server permits SSH authentication methods %v, but no matching local key, agent, password or keyboard-interactive method is available", ctx.AllowedMethods)
 		}
 		return nil, nil
@@ -588,11 +611,52 @@ func buildAutoAuthPlan(ctx context.Context, opts AutoAuthOptions, first ...ssh.A
 		}
 	}
 
-	var candidates []autoAuthCandidate
-	for _, method := range first {
-		candidates = append(candidates, autoAuthCandidate{protocol: autoAuthProtocolPublicKey, label: "explicit signer", method: method, onRejected: rejectPublicKey})
-	}
+	policy := newAuthPolicy(opts.SSHOptions, opts.HostKeyChanged)
+
+	var pubkeyCandidates []autoAuthCandidate
 	var cleanup func()
+	if policy.pubkeyAllowed {
+		pubkeyCandidates, cleanup = buildAutoPubkeyCandidates(ctx, opts, first, secProvider, rejectPublicKey, policy.identitiesOnly, l)
+	}
+
+	var passwordCandidates []autoAuthCandidate
+	if policy.passwordAllowed {
+		passwordCandidates = buildAutoPasswordCandidates(opts, secProvider)
+	}
+
+	var kbCandidates []autoAuthCandidate
+	if policy.kbAllowed {
+		kbMethod := buildKeyboardInteractiveAuthMethod(secProvider)
+		kbCandidates = append(kbCandidates, autoAuthCandidate{
+			protocol: autoAuthProtocolKeyboardInteractive,
+			label:    "keyboard-interactive",
+			method:   kbMethod,
+		})
+	}
+
+	candidates := orderAutoAuthCandidates(policy.preferred, pubkeyCandidates, passwordCandidates, kbCandidates)
+
+	return autoAuthPlan{
+		candidates:   candidates,
+		authCallback: newSequentialAuthCallbackWithPolicy(candidates, policy, secProvider, l, opts.Diagnostics),
+		cleanup:      cleanup,
+	}
+}
+
+func buildAutoPubkeyCandidates(
+	ctx context.Context,
+	opts AutoAuthOptions,
+	first []ssh.AuthMethod,
+	secProvider *autoSecretProvider,
+	rejectPublicKey func(),
+	identitiesOnly bool,
+	l logger.DebugLogger,
+) ([]autoAuthCandidate, func()) {
+	var pubkeyCandidates []autoAuthCandidate
+	var cleanup func()
+	for _, method := range first {
+		pubkeyCandidates = append(pubkeyCandidates, autoAuthCandidate{protocol: autoAuthProtocolPublicKey, label: "explicit signer", method: method, onRejected: rejectPublicKey})
+	}
 	seenKeyPaths := make(map[string]struct{})
 
 	addKey := func(path, label string) {
@@ -621,7 +685,7 @@ func buildAutoAuthPlan(ctx context.Context, opts AutoAuthOptions, first ...ssh.A
 			return
 		}
 
-		candidates = append(candidates, autoAuthCandidate{
+		pubkeyCandidates = append(pubkeyCandidates, autoAuthCandidate{
 			protocol:   autoAuthProtocolPublicKey,
 			label:      label + ": " + keyPath,
 			method:     method,
@@ -629,30 +693,38 @@ func buildAutoAuthPlan(ctx context.Context, opts AutoAuthOptions, first ...ssh.A
 		})
 	}
 
+	hasExplicitIdentity := len(first) > 0 || opts.KeyPath != ""
 	// 显式身份必须优先于任何自动发现来源。
 	if opts.KeyPath != "" {
 		addKey(opts.KeyPath, "explicit key")
 	}
 
-	if socket := opts.AgentSocket; socket != "" {
-		conn, err := dialSSHAgent(ctx, socket)
-		if err == nil {
-			agentClient := agent.NewClient(conn)
-			candidates = append(candidates, autoAuthCandidate{
-				protocol: autoAuthProtocolPublicKey,
-				label:    "ssh-agent",
-				method:   ssh.PublicKeysCallback(agentClient.Signers),
-			})
-			cleanup = func() { debugCloseResource(l, conn, "ssh agent connection") }
-		} else {
-			l.Debugf("connect to ssh-agent failed: %v", err)
+	if !identitiesOnly {
+		if socket := opts.AgentSocket; socket != "" {
+			conn, err := dialSSHAgent(ctx, socket)
+			if err == nil {
+				agentClient := agent.NewClient(conn)
+				pubkeyCandidates = append(pubkeyCandidates, autoAuthCandidate{
+					protocol: autoAuthProtocolPublicKey,
+					label:    "ssh-agent",
+					method:   ssh.PublicKeysCallback(agentClient.Signers),
+				})
+				cleanup = func() { debugCloseResource(l, conn, "ssh agent connection") }
+			} else {
+				l.Debugf("connect to ssh-agent failed: %v", err)
+			}
 		}
 	}
 
-	for _, path := range opts.DefaultKeyPaths {
-		addKey(path, "default key")
+	if !identitiesOnly || !hasExplicitIdentity {
+		for _, path := range opts.DefaultKeyPaths {
+			addKey(path, "default key")
+		}
 	}
+	return pubkeyCandidates, cleanup
+}
 
+func buildAutoPasswordCandidates(opts AutoAuthOptions, secProvider *autoSecretProvider) []autoAuthCandidate {
 	passwordAttempts := 0
 	passwordMethod := ssh.RetryableAuthMethod(ssh.PasswordCallback(func() (string, error) {
 		retry := passwordAttempts > 0 && opts.RecoveryPrompter != nil
@@ -669,7 +741,7 @@ func buildAutoAuthPlan(ctx context.Context, opts AutoAuthOptions, first ...ssh.A
 		return password, nil
 	}), 3)
 
-	candidates = append(candidates, autoAuthCandidate{
+	return []autoAuthCandidate{{
 		protocol: autoAuthProtocolPassword,
 		label:    "password",
 		method:   passwordMethod,
@@ -678,20 +750,92 @@ func buildAutoAuthPlan(ctx context.Context, opts AutoAuthOptions, first ...ssh.A
 				opts.CandidateRejectedCallback(autoAuthProtocolPassword)
 			}
 		},
-	})
+	}}
+}
 
-	kbMethod := buildKeyboardInteractiveAuthMethod(secProvider)
-	candidates = append(candidates, autoAuthCandidate{
-		protocol: autoAuthProtocolKeyboardInteractive,
-		label:    "keyboard-interactive",
-		method:   kbMethod,
-	})
+type authPolicy struct {
+	pubkeyAllowed   bool
+	passwordAllowed bool
+	kbAllowed       bool
+	identitiesOnly  bool
+	preferred       []string
+	hostKeyChanged  *atomic.Bool
+}
 
-	return autoAuthPlan{
-		candidates:   candidates,
-		authCallback: newSequentialAuthCallback(candidates, secProvider, l, opts.Diagnostics),
-		cleanup:      cleanup,
+func newAuthPolicy(sshOpts *Options, hostKeyChanged *atomic.Bool) authPolicy {
+	pubkeyAllowed, passwordAllowed, kbAllowed, identitiesOnly, preferred := resolveAutoAuthPolicy(sshOpts)
+	return authPolicy{
+		pubkeyAllowed:   pubkeyAllowed,
+		passwordAllowed: passwordAllowed,
+		kbAllowed:       kbAllowed,
+		identitiesOnly:  identitiesOnly,
+		preferred:       preferred,
+		hostKeyChanged:  hostKeyChanged,
 	}
+}
+
+func (p authPolicy) checkProtocolRuntime(protocol string) error {
+	switch protocol {
+	case autoAuthProtocolPassword, autoAuthProtocolKeyboardInteractive:
+		if p.hostKeyChanged != nil && p.hostKeyChanged.Load() {
+			return fmt.Errorf("%w: %s authentication disabled because remote host key has changed", ErrHostKeyMismatch, protocol)
+		}
+	}
+	return nil
+}
+
+func resolveAutoAuthPolicy(sshOpts *Options) (pubkeyAllowed, passwordAllowed, kbAllowed, identitiesOnly bool, preferred []string) {
+	pubkeyAllowed = true
+	passwordAllowed = true
+	kbAllowed = true
+	if sshOpts == nil {
+		return
+	}
+	if v, ok := sshOpts.PubkeyAuthentication(); ok {
+		pubkeyAllowed = v
+	}
+	if v, ok := sshOpts.PasswordAuthentication(); ok {
+		passwordAllowed = v
+	}
+	if v, ok := sshOpts.KbdInteractiveAuthentication(); ok {
+		kbAllowed = v
+	}
+	identitiesOnly = sshOpts.IdentitiesOnly()
+	preferred = sshOpts.PreferredAuthentications()
+	if len(preferred) > 0 {
+		if !slices.Contains(preferred, autoAuthProtocolPublicKey) {
+			pubkeyAllowed = false
+		}
+		if !slices.Contains(preferred, autoAuthProtocolPassword) {
+			passwordAllowed = false
+		}
+		if !slices.Contains(preferred, autoAuthProtocolKeyboardInteractive) {
+			kbAllowed = false
+		}
+	}
+	return
+}
+
+func orderAutoAuthCandidates(preferred []string, pubkey, password, kb []autoAuthCandidate) []autoAuthCandidate {
+	if len(preferred) == 0 {
+		var all []autoAuthCandidate
+		all = append(all, pubkey...)
+		all = append(all, password...)
+		all = append(all, kb...)
+		return all
+	}
+	var ordered []autoAuthCandidate
+	for _, proto := range preferred {
+		switch proto {
+		case autoAuthProtocolPublicKey:
+			ordered = append(ordered, pubkey...)
+		case autoAuthProtocolPassword:
+			ordered = append(ordered, password...)
+		case autoAuthProtocolKeyboardInteractive:
+			ordered = append(ordered, kb...)
+		}
+	}
+	return ordered
 }
 
 func (p *autoSecretProvider) decryptPrivateKey(data []byte, path string) (ssh.Signer, string, error) {

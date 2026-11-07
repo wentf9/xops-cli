@@ -1209,6 +1209,13 @@ func (r *Repository) Snapshot() *Configuration {
 	return r.provider.Snapshot()
 }
 
+func (r *Repository) GetOpenSSHOptions(alias string) (*ssh.Options, error) {
+	if r == nil || r.provider == nil {
+		return nil, nil
+	}
+	return r.provider.GetOpenSSHOptions(alias)
+}
+
 func (r *Repository) GetOpenSSHControl(alias string) (*ssh.ControlConfig, error) {
 	if r == nil || r.provider == nil {
 		return nil, nil

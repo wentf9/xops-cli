@@ -218,7 +218,7 @@ func (p *OpenSSHParser) GetVirtualNode(alias string) (models.Node, models.Host, 
 	}
 	proxyJump = parseOpenSSHProxyJump(proxyJump)
 
-	ctrl, err := parseOpenSSHControl(p.cfg, lookupAlias)
+	sshOpts, err := parseOpenSSHOptions(p.cfg, lookupAlias)
 	if err != nil {
 		return models.Node{}, models.Host{}, models.Identity{}, err
 	}
@@ -233,7 +233,7 @@ func (p *OpenSSHParser) GetVirtualNode(alias string) (models.Node, models.Host, 
 		SudoMode:    models.SudoModeAuto, // 对于导入节点，依然支持 auto
 		Tags:        []string{"openssh"}, // 打一个虚拟 tag
 		Alias:       []string{alias},
-		Control:     ctrl,
+		SSHOptions:  sshOpts,
 	}
 
 	host := models.Host{
@@ -250,8 +250,8 @@ func (p *OpenSSHParser) GetVirtualNode(alias string) (models.Node, models.Host, 
 	return node, host, identity, nil
 }
 
-// GetControlConfig parses multiplexing options for a given alias/host in ssh_config.
-func (p *OpenSSHParser) GetControlConfig(alias string) (*ssh.ControlConfig, error) {
+// GetSSHOptions parses supported OpenSSH client options for a given alias/host in ssh_config.
+func (p *OpenSSHParser) GetSSHOptions(alias string) (*ssh.Options, error) {
 	if p == nil || p.cfg == nil || alias == "" {
 		return nil, nil
 	}
@@ -260,57 +260,95 @@ func (p *OpenSSHParser) GetControlConfig(alias string) (*ssh.ControlConfig, erro
 	if err != nil {
 		lookupAlias = cleanAlias
 	}
-	return parseOpenSSHControl(p.cfg, lookupAlias)
+	return parseOpenSSHOptions(p.cfg, lookupAlias)
 }
 
-func parseOpenSSHControl(cfg *ssh_config.Config, host string) (*ssh.ControlConfig, error) {
+// GetControlConfig parses multiplexing options for a given alias/host in ssh_config.
+func (p *OpenSSHParser) GetControlConfig(alias string) (*ssh.ControlConfig, error) {
+	opts, err := p.GetSSHOptions(alias)
+	if err != nil || opts == nil {
+		return nil, err
+	}
+	return opts.ControlConfig(), nil
+}
+
+func parseOpenSSHOptions(cfg *ssh_config.Config, host string) (*ssh.Options, error) {
 	if cfg == nil || host == "" {
 		return nil, nil
 	}
-	masterVal, err := cfg.Get(host, "ControlMaster")
-	if err != nil {
-		return nil, fmt.Errorf("read openssh ControlMaster for host %q: %w", host, err)
+	opts := &ssh.Options{}
+	for _, spec := range ssh.RegisteredOptionSpecs() {
+		// Trust-class options (StrictHostKeyChecking, UserKnownHostsFile) are never
+		// inherited from ~/.ssh/config so wildcard host blocks cannot implicitly
+		// weaken host key verification.
+		if spec.Class == ssh.OptionClassTrust {
+			continue
+		}
+		val, err := firstMatchingOpenSSHOption(cfg, host, spec)
+		if err != nil {
+			return nil, err
+		}
+		if val == "" {
+			continue
+		}
+		if spec.AllowList {
+			filtered := ssh.FilterSupportedListValue(spec.CanonicalKey, val)
+			if filtered == "" {
+				continue
+			}
+			val = filtered
+		}
+		if err := opts.Set(spec.CanonicalKey, val); err != nil {
+			// Preserve strict error reporting on ControlMaster and ControlPersist,
+			// while leniently skipping unsupported ~/.ssh/config values (e.g.
+			// ControlPath tokens like %k or PubkeyAuthentication=unbound).
+			if spec.CanonicalKey == ssh.OptionControlMaster || spec.CanonicalKey == ssh.OptionControlPersist {
+				return nil, fmt.Errorf("invalid %s %q for %q in ssh config: %w", spec.OpenSSHName, val, host, err)
+			}
+			continue
+		}
 	}
-	pathVal, err := cfg.Get(host, "ControlPath")
-	if err != nil {
-		return nil, fmt.Errorf("read openssh ControlPath for host %q: %w", host, err)
-	}
-	persistVal, err := cfg.Get(host, "ControlPersist")
-	if err != nil {
-		return nil, fmt.Errorf("read openssh ControlPersist for host %q: %w", host, err)
-	}
-
-	masterVal = strings.TrimSpace(masterVal)
-	pathVal = strings.TrimSpace(pathVal)
-	persistVal = strings.TrimSpace(persistVal)
-
-	if masterVal == "" && pathVal == "" && persistVal == "" {
+	if opts.IsEmpty() {
 		return nil, nil
 	}
+	return opts, nil
+}
 
-	// An absent ControlMaster stays empty so lower-priority layers keep the
-	// ability to inherit a value orthogonally. Only an explicit directive is
-	// normalized into a mode.
-	var masterMode ssh.ControlMasterMode
-	if masterVal != "" {
-		mode, err := ssh.ParseControlMasterMode(masterVal)
+// firstMatchingOpenSSHOption resolves an option across ssh_config Host blocks in
+// OpenSSH first-match-wins order across both the primary OpenSSHName and its aliases.
+func firstMatchingOpenSSHOption(cfg *ssh_config.Config, host string, spec ssh.OptionSpec) (string, error) {
+	if len(spec.Aliases) == 0 {
+		val, err := cfg.Get(host, spec.OpenSSHName)
 		if err != nil {
-			return nil, fmt.Errorf("invalid ControlMaster %q for %q in ssh config: %w", masterVal, host, err)
+			return "", fmt.Errorf("read openssh %s for host %q: %w", spec.OpenSSHName, host, err)
 		}
-		masterMode = mode
+		return strings.TrimSpace(val), nil
 	}
-
-	if persistVal != "" {
-		if _, _, _, err := ssh.ParseControlPersist(persistVal); err != nil {
-			return nil, fmt.Errorf("invalid ControlPersist %q for %q in ssh config: %w", persistVal, host, err)
+	keys := make([]string, 0, 1+len(spec.Aliases))
+	keys = append(keys, strings.ToLower(spec.OpenSSHName))
+	for _, alias := range spec.Aliases {
+		keys = append(keys, strings.ToLower(alias))
+	}
+	for _, h := range cfg.Hosts {
+		if !h.Matches(host) {
+			continue
+		}
+		for _, node := range h.Nodes {
+			kv, ok := node.(*ssh_config.KV)
+			if !ok || kv == nil {
+				continue
+			}
+			lkey := strings.ToLower(strings.TrimSpace(kv.Key))
+			for _, candidate := range keys {
+				if lkey == candidate {
+					if v := strings.TrimSpace(kv.Value); v != "" {
+						return v, nil
+					}
+				}
+			}
 		}
 	}
-
-	return &ssh.ControlConfig{
-		Master:  masterMode,
-		Path:    pathVal,
-		Persist: persistVal,
-	}, nil
+	return "", nil
 }
 
 func parseOpenSSHHostSpec(spec string) (host, userName string, port uint16, err error) {

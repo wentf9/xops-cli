@@ -114,7 +114,7 @@ func (h *host) resolveSnapshot(ctx context.Context, request ports.ResolveRequest
 		return ports.OperationSnapshot{}, err
 	}
 	view := ports.OperationSnapshot{DomainID: h.domain, Policy: h.policy, Targets: make(map[string]ports.Target), Selectors: make(map[string]string)}
-	adp := adapter.NewSSHAdapter(p, adapter.WithNonInteractive(true), adapter.WithControlMultiplexing(false), adapter.WithCredentialSource(h.config.Registry), adapter.WithCredentialRecording(false))
+	adp := adapter.NewSSHAdapter(p, adapter.WithNonInteractive(true), adapter.WithControlMultiplexing(false), adapter.WithHostTrustOverrides(false), adapter.WithCredentialSource(h.config.Registry), adapter.WithCredentialRecording(false))
 	for _, selector := range request.Selectors {
 		if selector == "" {
 			continue

@@ -172,7 +172,7 @@ type NodeV2 struct {
 	PrivilegePasswordRef  *credential.Ref      `yaml:"privilege_password_ref,omitempty"`
 	PasswordPromptPattern string               `yaml:"password_prompt_pattern,omitempty"`
 	Execution             *ssh.ExecutionConfig `yaml:"execution,omitempty"`
-	Control               *ssh.ControlConfig   `yaml:"control,omitempty"`
+	SSHOptions            *ssh.Options         `yaml:"ssh_options,omitempty"`
 }
 
 // ConfigurationV2 是 Schema v2 的顶级规范配置 DTO。
@@ -187,7 +187,7 @@ type ConfigurationV2 struct {
 	MCP                   *MCPConfig             `yaml:"mcp,omitempty"`
 	PasswordPromptPattern string                 `yaml:"password_prompt_pattern,omitempty"`
 	Execution             *ssh.ExecutionConfig   `yaml:"execution,omitempty"`
-	Control               *ssh.ControlConfig     `yaml:"control,omitempty"`
+	SSHOptions            *ssh.Options           `yaml:"ssh_options,omitempty"`
 }
 
 // ValidateV2 对 ConfigurationV2 进行全面且严格的合法性校验。
@@ -205,9 +205,9 @@ func ValidateV2(cfg *ConfigurationV2) error {
 		}
 	}
 
-	if cfg.Control != nil {
-		if err := ValidateControlConfig(cfg.Control); err != nil {
-			return fmt.Errorf("%w: global control invalid: %w", ErrSchemaValidation, err)
+	if cfg.SSHOptions != nil {
+		if err := ValidateSSHOptions(cfg.SSHOptions); err != nil {
+			return fmt.Errorf("%w: global ssh_options invalid: %w", ErrSchemaValidation, err)
 		}
 	}
 
@@ -497,16 +497,16 @@ func validateNodeRefs(nodeName string, node NodeV2, cfg *ConfigurationV2) error 
 		return fmt.Errorf("%w: node %q effective execution invalid: %w", ErrSchemaValidation, nodeName, err)
 	}
 
-	if node.Control != nil {
-		if err := ValidateControlConfig(node.Control); err != nil {
-			return fmt.Errorf("%w: node %q control invalid: %w", ErrSchemaValidation, nodeName, err)
+	if node.SSHOptions != nil {
+		if err := ValidateSSHOptions(node.SSHOptions); err != nil {
+			return fmt.Errorf("%w: node %q ssh_options invalid: %w", ErrSchemaValidation, nodeName, err)
 		}
 	}
-	if effectiveControl, err := ssh.ResolveControl(node.Control, cfg.Control); err != nil {
-		return fmt.Errorf("%w: node %q effective control invalid: %w", ErrSchemaValidation, nodeName, err)
-	} else if effectiveControl != nil {
-		if err := ValidateEffectiveControl(effectiveControl); err != nil {
-			return fmt.Errorf("%w: node %q effective control invalid: %w", ErrSchemaValidation, nodeName, err)
+	if effectiveOpts, err := ssh.ResolveOptions(node.SSHOptions, cfg.SSHOptions); err != nil {
+		return fmt.Errorf("%w: node %q effective ssh_options invalid: %w", ErrSchemaValidation, nodeName, err)
+	} else if effectiveOpts != nil {
+		if err := ValidateEffectiveSSHOptions(effectiveOpts); err != nil {
+			return fmt.Errorf("%w: node %q effective ssh_options invalid: %w", ErrSchemaValidation, nodeName, err)
 		}
 	}
 	return nil
@@ -652,7 +652,7 @@ func (c *Configuration) ToV2() (*ConfigurationV2, error) {
 		PasswordPromptPattern: c.PasswordPromptPattern,
 		MCP:                   c.MCP.Clone(),
 		Execution:             c.Execution.Clone(),
-		Control:               c.Control.Clone(),
+		SSHOptions:            c.SSHOptions.Clone(),
 	}
 
 	if c.Credential != nil {
@@ -713,7 +713,7 @@ func (c *Configuration) ToV2() (*ConfigurationV2, error) {
 					PrivilegePasswordRef:  n.PrivilegePasswordRef.Clone(),
 					PasswordPromptPattern: n.PasswordPromptPattern,
 					Execution:             n.Execution.Clone(),
-					Control:               n.Control.Clone(),
+					SSHOptions:            n.SSHOptions.Clone(),
 				}
 			}
 		}
@@ -742,7 +742,7 @@ func FromV2(v2 *ConfigurationV2) (*Configuration, error) {
 		MCP:                   v2.MCP.Clone(),
 		PasswordPromptPattern: v2.PasswordPromptPattern,
 		Execution:             v2.Execution.Clone(),
-		Control:               v2.Control.Clone(),
+		SSHOptions:            v2.SSHOptions.Clone(),
 	}
 
 	for k, h := range v2.Hosts {
@@ -773,7 +773,7 @@ func FromV2(v2 *ConfigurationV2) (*Configuration, error) {
 			PrivilegePasswordRef:  n.PrivilegePasswordRef.Clone(),
 			PasswordPromptPattern: n.PasswordPromptPattern,
 			Execution:             n.Execution.Clone(),
-			Control:               n.Control.Clone(),
+			SSHOptions:            n.SSHOptions.Clone(),
 		})
 	}
 

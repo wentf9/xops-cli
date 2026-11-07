@@ -25,7 +25,11 @@ func newNonInteractiveMCPConnector(provider config.ConfigProvider, l corelog.Deb
 	if cfg := provider.Snapshot(); cfg != nil && cfg.PasswordPromptPattern != "" {
 		sshOpts = append(sshOpts, ssh.WithPasswordPromptPattern(cfg.PasswordPromptPattern))
 	}
-	adpOpts := []adapter.Option{adapter.WithNonInteractive(true), adapter.WithControlMultiplexing(false)}
+	adpOpts := []adapter.Option{
+		adapter.WithNonInteractive(true),
+		adapter.WithControlMultiplexing(false),
+		adapter.WithHostTrustOverrides(false),
+	}
 	if credentialRegistry != nil {
 		adpOpts = append(adpOpts, adapter.WithCredentialSource(credentialRegistry))
 	}

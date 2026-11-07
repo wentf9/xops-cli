@@ -2345,3 +2345,122 @@ func TestSSHAdapter_ZeroPortAndEmptyUserSnapshotNormalization(t *testing.T) {
 		t.Fatalf("expected ErrSnapshotMismatch for mismatched user, got %v", err)
 	}
 }
+
+type batchModeSpyResolver struct {
+	interactionDisabled bool
+}
+
+func (r *batchModeSpyResolver) Resolve(ctx context.Context, _ credential.Ref) (credential.Secret, error) {
+	r.interactionDisabled = credential.InteractionDisabled(ctx)
+	return credential.Secret{Value: []byte("resolved-secret")}, nil
+}
+
+func TestSSHAdapter_BatchModeDisablesInteractionAndWriteback(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.NewProviderWithoutOpenSSH(nil).Snapshot()
+	cfg.Hosts.Set("h-batch", models.Host{Address: "10.88.77.66", Port: 22})
+	cfg.Identities.Set("id-batch", models.Identity{
+		User:             "root",
+		AuthType:         "password",
+		LoginPasswordRef: &credential.Ref{StoreID: "encrypted_file", ItemID: "item-1"},
+	})
+	cfg.Nodes.Set("node-batch", models.Node{
+		HostRef:     "h-batch",
+		IdentityRef: "id-batch",
+		SSHOptions:  ssh.MustOptions(ssh.OptionBatchMode, "yes"),
+	})
+	provider := config.NewProviderWithoutOpenSSH(cfg)
+
+	spy := &batchModeSpyResolver{}
+	confirmCalled := false
+	adp := NewSSHAdapter(
+		provider,
+		WithCredentialSource(spy),
+		WithRememberConfirmation(func(context.Context, string) (bool, error) {
+			confirmCalled = true
+			return true, nil
+		}),
+	)
+
+	secret, err := adp.ResolveSecret(ctx, ssh.SecretRequest{
+		Kind:   ssh.SecretKindLoginPassword,
+		NodeID: "node-batch",
+		Host:   "10.88.77.66",
+		Port:   22,
+		User:   "root",
+	})
+	if err != nil || string(secret) != "resolved-secret" {
+		t.Fatalf("ResolveSecret failed: secret=%q err=%v", string(secret), err)
+	}
+	if !spy.interactionDisabled {
+		t.Fatal("expected credential.InteractionDisabled(ctx) to be true when BatchMode=yes")
+	}
+
+	if tok, err := adp.UpdateAuth(ctx, "node-batch", "tok-1", "new-pass", "", ""); err != nil || tok != "tok-1" {
+		t.Fatalf("expected UpdateAuth no-op under BatchMode=yes, got tok=%q err=%v", tok, err)
+	}
+	if tok, err := adp.UpdateSudo(ctx, "node-batch", "sudo-1", ssh.SudoModeSu, "new-su"); err != nil || tok != "sudo-1" {
+		t.Fatalf("expected UpdateSudo no-op under BatchMode=yes, got tok=%q err=%v", tok, err)
+	}
+	if confirmCalled {
+		t.Fatal("expected rememberConfirmation not to be called when BatchMode=yes")
+	}
+
+	// Verify ConfirmAuthenticatedConnection skips enrollment probe when BatchMode=yes
+	repo, err := config.NewRepositoryWithoutOpenSSH(cfg, adapterTestStore{})
+	if err != nil {
+		t.Fatalf("NewRepositoryWithoutOpenSSH failed: %v", err)
+	}
+	prepared, err := repo.PrepareNodeContext(ctx, config.EnsureNodeOptions{
+		Target: config.ConnectionTarget{Selector: "10.88.77.66", User: "root", HasUser: true, Port: 22, HasPort: true},
+	})
+	if err != nil {
+		t.Fatalf("PrepareNodeContext failed: %v", err)
+	}
+	probeAdp := NewSSHAdapter(
+		repo,
+		WithEnrollmentProbing(nil),
+		WithSessionAuthOverride(prepared.NodeID, SessionAuth{Password: "pw", Remember: true}),
+		WithSessionControlOverride(prepared.NodeID, SessionControlOptions{
+			Options: ssh.MustOptions(ssh.OptionBatchMode, "yes"),
+		}),
+	)
+	// Passing a nil *ssh.Client would panic if ConfirmAuthenticatedConnection attempted client.ProbeExecutionConfig(ctx)
+	execCfg, err := probeAdp.ConfirmAuthenticatedConnection(ctx, prepared.NodeID, nil)
+	if err != nil {
+		t.Fatalf("ConfirmAuthenticatedConnection failed under BatchMode=yes: %v", err)
+	}
+	if execCfg != nil {
+		t.Fatalf("expected nil execution config when enrollment probe is skipped under BatchMode=yes, got %+v", execCfg)
+	}
+}
+
+func TestParseOptionStringsRejectsEmptyValuesAndSessionControlSync(t *testing.T) {
+	for _, invalid := range []string{
+		"=val",
+		"ControlPath=",
+		"control_path=   ",
+		"User=",
+		"IdentityFile=",
+		"ProxyJump=",
+		"Port=",
+		"ConnectTimeout=",
+	} {
+		if _, err := ParseOptionStrings([]string{invalid}); err == nil {
+			t.Fatalf("expected ParseOptionStrings(%q) to fail on empty key/value, got nil", invalid)
+		}
+	}
+
+	var ctrl SessionControlOptions
+	ctrl.SetMaster(ssh.ControlMasterAuto)
+	ctrl.SetPath("/tmp/cm-%h.sock")
+	ctrl.SetPersist("10m")
+
+	// Clearing via empty string must clear both the pointer field and the underlying Options map.
+	ctrl.SetMaster("")
+	ctrl.SetPath("")
+	ctrl.SetPersist("")
+	if !ctrl.IsEmpty() || ctrl.ToSSHOptions() != nil {
+		t.Fatalf("expected SessionControlOptions to be empty after clearing Master/Path/Persist, got %+v (ToSSHOptions=%+v)", ctrl, ctrl.ToSSHOptions())
+	}
+}

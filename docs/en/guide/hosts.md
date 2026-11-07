@@ -135,6 +135,30 @@ nodes:
 
 **Configuration precedence**: CLI flags > Playbook step `execution` > Playbook `settings.execution` > Node configuration (`node.execution`) > Global configuration (`cfg.execution`) > System default (`server`).
 
+## OpenSSH client options and multiplexing (`ssh_options`)
+
+You can configure `ssh_options` globally or per node in `~/.xops/xops_config.yaml`, or override them per session on `xops ssh|scp|sftp|exec` via `-o Key=Value`. Persisted files emit canonical `snake_case` keys while also accepting OpenSSH `PascalCase` option names (such as `ControlMaster` and `ConnectTimeout`) when edited by hand:
+
+```yaml
+schema_version: 2
+ssh_options:
+  control_master: auto
+  control_path: ~/.ssh/cm-%C
+  control_persist: 10m
+  connect_timeout: 15s
+  server_alive_interval: 30s
+
+nodes:
+  web-prod-01:
+    host_ref: h_web
+    identity_ref: id_deploy
+    ssh_options:
+      control_persist: 30m
+      strict_host_key_checking: accept-new
+```
+
+**Configuration precedence**: CLI `-M`/`-S`/`-o` > Node configuration (`node.ssh_options`) > Global configuration (`cfg.ssh_options`) > `~/.ssh/config` (host-trust options such as `StrictHostKeyChecking` and `UserKnownHostsFile` are read only from explicit CLI `-o` flags or `xops_config.yaml`, never implicitly inherited from `~/.ssh/config`).
+
 ## Removed credential arguments
 
 Plaintext flags `--password` and `--key-pass` (and their short forms) have been removed from `host add|edit` and `identity add|edit` to keep secrets out of command arguments and shell history; the legacy `loadHost` command has also been removed (use `xops host import`).

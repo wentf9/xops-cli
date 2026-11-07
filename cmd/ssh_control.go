@@ -475,29 +475,12 @@ func buildControlProxyClientConfig(
 	var (
 		cfg      *ssh.ClientConfig
 		snapshot *config.Configuration
+		adp      *adapter.SSHAdapter
 		muxOpts  []ssh.MuxClientOption
 	)
 	if provider != nil {
 		snapshot = provider.Snapshot()
-		sessionAuth := adapter.SessionAuth{
-			Password:   o.Password,
-			Passphrase: o.Passphrase,
-			KeyPath:    utils.ToAbsolutePath(o.IdentityFile),
-			Remember:   false,
-			OTP:        o.OTP,
-			ProxyJump:  o.JumpHost,
-		}
-		adpOpts := []adapter.Option{
-			adapter.WithCredentialRecording(false),
-			adapter.WithGlobalSessionAuth(sessionAuth),
-		}
-		if nodeID != "" {
-			adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, sessionAuth))
-		}
-		if reg, regErr := utils.GetCredentialRegistry(snapshot); regErr == nil && reg != nil {
-			adpOpts = append(adpOpts, adapter.WithCredentialSource(reg))
-		}
-		adp := adapter.NewSSHAdapter(provider, adpOpts...)
+		adp = adapter.NewSSHAdapter(provider, buildControlProxyAdapterOptions(snapshot, nodeID, o)...)
 		if nodeID != "" {
 			if resolvedCfg, err := adp.GetConfig(nodeID); err == nil && resolvedCfg != nil {
 				normalizeControlProxyResolvedConfig(resolvedCfg, target)
@@ -527,6 +510,7 @@ func buildControlProxyClientConfig(
 			SudoMode:              ssh.SudoModeAuto,
 			ProxyJump:             target.JumpHost,
 			Execution:             resolvedExec,
+			Options:               resolveControlProxyFallbackOptions(adp, target.Host, o),
 			PasswordPromptPattern: globalPattern,
 		}
 	}
@@ -544,6 +528,54 @@ func buildControlProxyClientConfig(
 		muxOpts = append(muxOpts, ssh.WithMuxPasswordPromptPattern(snapshot.PasswordPromptPattern))
 	}
 	return cfg, muxOpts
+}
+
+func resolveControlProxyFallbackOptions(adp *adapter.SSHAdapter, host string, o *SshOptions) *ssh.Options {
+	var sessionCtrlOpts adapter.SessionControlOptions
+	if o != nil {
+		if parsed, err := o.control.ToSessionControlOptions(); err == nil {
+			sessionCtrlOpts = parsed
+		}
+	}
+	if adp != nil {
+		if opts, err := adp.ResolveSSHOptions(host, sessionCtrlOpts); err == nil {
+			return opts
+		}
+	}
+	if opts, err := ssh.EffectiveOptions(sessionCtrlOpts.ToSSHOptions()); err == nil && !opts.IsEmpty() {
+		return opts
+	}
+	return nil
+}
+
+func buildControlProxyAdapterOptions(snapshot *config.Configuration, nodeID string, o *SshOptions) []adapter.Option {
+	sessionAuth := adapter.SessionAuth{
+		Password:   o.Password,
+		Passphrase: o.Passphrase,
+		KeyPath:    utils.ToAbsolutePath(o.IdentityFile),
+		Remember:   false,
+		OTP:        o.OTP,
+		ProxyJump:  o.JumpHost,
+	}
+	adpOpts := []adapter.Option{
+		adapter.WithCredentialRecording(false),
+		adapter.WithGlobalSessionAuth(sessionAuth),
+	}
+	if nodeID != "" {
+		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, sessionAuth))
+	}
+	if o != nil {
+		if sessionCtrlOpts, ctrlErr := o.control.ToSessionControlOptions(); ctrlErr == nil && !sessionCtrlOpts.IsEmpty() {
+			adpOpts = append(adpOpts, adapter.WithGlobalSessionControl(sessionCtrlOpts))
+			if nodeID != "" {
+				adpOpts = append(adpOpts, adapter.WithSessionControlOverride(nodeID, sessionCtrlOpts))
+			}
+		}
+	}
+	if reg, regErr := utils.GetCredentialRegistry(snapshot); regErr == nil && reg != nil {
+		adpOpts = append(adpOpts, adapter.WithCredentialSource(reg))
+	}
+	return adpOpts
 }
 
 func normalizeControlProxyResolvedConfig(resolvedCfg *ssh.ClientConfig, target ssh.TargetContext) {

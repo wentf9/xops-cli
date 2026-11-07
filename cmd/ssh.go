@@ -567,13 +567,11 @@ func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuratio
 // disableSessionControlForParent stops a -f parent from claiming the control
 // socket that the detached child owns, including any ProxyJump hops. It sets
 // both global and node-level overrides so neither a jump hop nor a node-scoped
-// -M/-S/-o override on the target can bind or attach to a control socket.
+// -M/-S/-o override on the target can bind or attach to a control socket, while
+// preserving non-multiplexing CLI -o options.
 func disableSessionControlForParent(nodeID string) adapter.Option {
-	disabledSharing := "none"
-	ctrl := adapter.SessionControlOptions{Path: &disabledSharing}
 	return func(a *adapter.SSHAdapter) {
-		adapter.WithGlobalSessionControl(ctrl)(a)
-		adapter.WithSessionControlOverride(nodeID, ctrl)(a)
+		a.DisableSessionControlSharing(nodeID)
 	}
 }
 
@@ -866,11 +864,13 @@ func (o *SshOptions) muxDaemonArgs(nodeID string, expandedPath string, master *s
 		args = append(args, "-J", jumpHost)
 	}
 	args = append(args, "--remember", "never")
-	for _, opt := range o.control.Options {
-		if master != nil && isTargetSpecificOption(opt) {
-			continue
+	if o.shouldPassIdentityFile(nodeID, master) {
+		for _, opt := range o.control.Options {
+			if master != nil && isTargetSpecificOption(opt) {
+				continue
+			}
+			args = append(args, "-o", opt)
 		}
-		args = append(args, "-o", opt)
 	}
 	if master != nil {
 		if ctrl := master.Target().Control; ctrl != nil && ctrl.Persist != "" {

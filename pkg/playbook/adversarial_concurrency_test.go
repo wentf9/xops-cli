@@ -49,10 +49,10 @@ func TestAdversarial_Playbook_HighConcurrencySocketSharing(t *testing.T) {
 			HostRef:     "shared-host",
 			IdentityRef: "shared-id",
 			Tags:        []string{"web"},
-			Control: &ssh.ControlConfig{
+			SSHOptions: ssh.OptionsFromControl(&ssh.ControlConfig{
 				Master: ssh.ControlMasterAuto,
 				Path:   sockPath,
-			},
+			}),
 		})
 	}
 
@@ -140,10 +140,10 @@ func TestAdversarial_Playbook_RapidSequentialMultiStep(t *testing.T) {
 	cfg.Nodes.Set("node-seq", models.Node{
 		HostRef:     "host-seq",
 		IdentityRef: "id-seq",
-		Control: &ssh.ControlConfig{
+		SSHOptions: ssh.OptionsFromControl(&ssh.ControlConfig{
 			Master: ssh.ControlMasterAuto,
 			Path:   sockPath,
-		},
+		}),
 	})
 
 	provider := config.NewProviderWithoutOpenSSH(cfg)
@@ -211,10 +211,10 @@ func TestAdversarial_Playbook_ConcurrentSharedAndDirectNodes(t *testing.T) {
 		cfg.Nodes.Set(fmt.Sprintf("shared-%02d", i), models.Node{
 			HostRef:     "mixed-host",
 			IdentityRef: "mixed-id",
-			Control: &ssh.ControlConfig{
+			SSHOptions: ssh.OptionsFromControl(&ssh.ControlConfig{
 				Master: ssh.ControlMasterAuto,
 				Path:   sockPath,
-			},
+			}),
 		})
 	}
 
@@ -223,10 +223,10 @@ func TestAdversarial_Playbook_ConcurrentSharedAndDirectNodes(t *testing.T) {
 		cfg.Nodes.Set(fmt.Sprintf("direct-%02d", i), models.Node{
 			HostRef:     "mixed-host",
 			IdentityRef: "mixed-id",
-			Control: &ssh.ControlConfig{
+			SSHOptions: ssh.OptionsFromControl(&ssh.ControlConfig{
 				Master: ssh.ControlMasterNo,
 				Path:   "none",
-			},
+			}),
 		})
 	}
 
@@ -337,10 +337,10 @@ func TestAdversarial_Playbook_StaleSocketSimulatedCrashRecovery(t *testing.T) {
 	cfg.Nodes.Set("node-crash", models.Node{
 		HostRef:     "host-crash",
 		IdentityRef: "id-crash",
-		Control: &ssh.ControlConfig{
+		SSHOptions: ssh.OptionsFromControl(&ssh.ControlConfig{
 			Master: ssh.ControlMasterAuto,
 			Path:   staleSockPath,
-		},
+		}),
 	})
 
 	provider := config.NewProviderWithoutOpenSSH(cfg)

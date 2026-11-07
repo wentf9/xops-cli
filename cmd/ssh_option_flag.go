@@ -236,6 +236,11 @@ func resolveControlConfig(provider config.ConfigProvider, nodeID, selector strin
 
 // mergeSessionControl converts session overrides into one ControlConfig layer.
 func mergeSessionControl(sessionOpts adapter.SessionControlOptions) *ssh.ControlConfig {
+	if opts := sessionOpts.ToSSHOptions(); opts != nil {
+		if ctrl := opts.ControlConfig(); ctrl != nil {
+			return ctrl
+		}
+	}
 	ctrl := &ssh.ControlConfig{}
 	if sessionOpts.Master != nil {
 		ctrl.Master = *sessionOpts.Master

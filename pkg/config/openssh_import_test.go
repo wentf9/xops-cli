@@ -104,13 +104,13 @@ Host *
 	if app.Name != "app" {
 		t.Fatalf("expected first host to be 'app', got %s", app.Name)
 	}
-	if app.Node.Control == nil {
-		t.Fatal("expected app.Node.Control to be non-nil")
+	if app.Node.SSHOptions == nil {
+		t.Fatal("expected app.Node.SSHOptions to be non-nil")
 	}
-	if app.Node.Control.Master != "auto" ||
-		app.Node.Control.Path != "~/.ssh/sockets/%r@%h-%p" ||
-		app.Node.Control.Persist != "10m" {
-		t.Fatalf("app control mismatch: %+v", app.Node.Control)
+	if app.Node.SSHOptions.ControlMaster() != "auto" ||
+		app.Node.SSHOptions.ControlPath() != "~/.ssh/sockets/%r@%h-%p" ||
+		app.Node.SSHOptions.ControlPersist() != "10m" {
+		t.Fatalf("app control mismatch: %+v", app.Node.SSHOptions)
 	}
 
 	// 2. custom has explicit control options
@@ -118,13 +118,13 @@ Host *
 	if custom.Name != "custom" {
 		t.Fatalf("expected second host to be 'custom', got %s", custom.Name)
 	}
-	if custom.Node.Control == nil {
-		t.Fatal("expected custom.Node.Control to be non-nil")
+	if custom.Node.SSHOptions == nil {
+		t.Fatal("expected custom.Node.SSHOptions to be non-nil")
 	}
-	if custom.Node.Control.Master != "yes" ||
-		custom.Node.Control.Path != "/tmp/custom.sock" ||
-		custom.Node.Control.Persist != "0" {
-		t.Fatalf("custom control mismatch: %+v", custom.Node.Control)
+	if custom.Node.SSHOptions.ControlMaster() != "yes" ||
+		custom.Node.SSHOptions.ControlPath() != "/tmp/custom.sock" ||
+		custom.Node.SSHOptions.ControlPersist() != "0" {
+		t.Fatalf("custom control mismatch: %+v", custom.Node.SSHOptions)
 	}
 
 	// 3. disabled overrides path to none
@@ -132,13 +132,13 @@ Host *
 	if disabled.Name != "disabled" {
 		t.Fatalf("expected third host to be 'disabled', got %s", disabled.Name)
 	}
-	if disabled.Node.Control == nil {
-		t.Fatal("expected disabled.Node.Control to be non-nil")
+	if disabled.Node.SSHOptions == nil {
+		t.Fatal("expected disabled.Node.SSHOptions to be non-nil")
 	}
-	if disabled.Node.Control.Path != "none" {
-		t.Fatalf("disabled control mismatch: %+v", disabled.Node.Control)
+	if disabled.Node.SSHOptions.ControlPath() != "none" {
+		t.Fatalf("disabled control mismatch: %+v", disabled.Node.SSHOptions)
 	}
-	if disabled.Node.Control.IsEnabled() {
+	if disabled.Node.SSHOptions.ControlConfig().IsEnabled() {
 		t.Fatal("disabled control should have IsEnabled() == false")
 	}
 }
@@ -156,5 +156,44 @@ func TestParseOpenSSHHosts_InvalidControl(t *testing.T) {
 	_, err = ParseOpenSSHHosts(strings.NewReader("Host bad\n  ControlPersist 10invalid\n"), "user")
 	if err == nil || !strings.Contains(err.Error(), "invalid ControlPersist") {
 		t.Fatalf("expected invalid ControlPersist error, got: %v", err)
+	}
+}
+
+func TestParseOpenSSHHosts_FiltersOutAuthAndTrustOptions(t *testing.T) {
+	t.Parallel()
+
+	const input = `
+Host imported-node
+    HostName 10.0.0.50
+    User deploy
+    ConnectTimeout 15
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%C
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    PasswordAuthentication no
+    BatchMode yes
+`
+	hosts, err := ParseOpenSSHHosts(strings.NewReader(input), "local-user")
+	if err != nil {
+		t.Fatalf("ParseOpenSSHHosts() error = %v", err)
+	}
+	if len(hosts) != 1 {
+		t.Fatalf("expected 1 host, got %d", len(hosts))
+	}
+	opts := hosts[0].Node.SSHOptions
+	if opts == nil {
+		t.Fatal("expected imported SSHOptions to be non-nil")
+	}
+	// Mux and Transport options are preserved
+	if opts.ControlMaster() != "auto" || opts.Get("connect_timeout") != "15" {
+		t.Fatalf("expected mux and transport options to be imported, got %+v", opts)
+	}
+	// Trust and Auth options must not be persisted into imported nodes
+	if opts.StrictHostKeyChecking() != "" || opts.UserKnownHostsFile() != "" {
+		t.Fatalf("expected trust options to be stripped on import, got %+v", opts)
+	}
+	if opts.Get("password_authentication") != "" || opts.Get("batch_mode") != "" {
+		t.Fatalf("expected auth options to be stripped on import, got %+v", opts)
 	}
 }
