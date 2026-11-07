@@ -657,11 +657,14 @@ func recvFDs(conn *net.UnixConn, count int) ([]int, error) {
 		return nil, fmt.Errorf(format, args...)
 	}
 
+	const surplusFDSlack = 4
 	var data [1]byte
 	for len(fds) < count {
-		// Reserve room for the descriptors still missing: an undersized buffer
-		// truncates the control message and silently drops descriptors.
-		oob := make([]byte, unix.CmsgSpace((count-len(fds))*4))
+		// Reserve room for the descriptors still missing plus surplus slack: on
+		// 32-bit aligned cmsg platforms (e.g. Darwin), CmsgSpace(4) has room for
+		// only a single descriptor, so extra slack lets recvFDs receive and close
+		// surplus descriptors instead of hitting MSG_CTRUNC.
+		oob := make([]byte, unix.CmsgSpace((count-len(fds)+surplusFDSlack)*4))
 		_, oobn, flags, _, err := conn.ReadMsgUnix(data[:], oob)
 		if err != nil {
 			return fail("receive descriptors: %w", err)

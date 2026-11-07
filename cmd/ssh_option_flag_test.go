@@ -417,7 +417,7 @@ func TestWaitForControlSocketStopsWhenDaemonExits(t *testing.T) {
 	exited := make(chan struct{})
 	close(exited)
 
-	socketPath := filepath.Join(t.TempDir(), "never.sock")
+	socketPath := filepath.Join(shortControlTempDir(t), "never.sock")
 	start := time.Now()
 	err := waitForControlSocket(context.Background(), socketPath, 10*time.Second, exited)
 	if err == nil {
@@ -440,7 +440,7 @@ func TestWaitForControlSocketStopsWhenDaemonExits(t *testing.T) {
 // only on the next probe.
 func TestWaitForControlSocketWakesOnDaemonExit(t *testing.T) {
 	exited := make(chan struct{})
-	socketPath := filepath.Join(t.TempDir(), "late.sock")
+	socketPath := filepath.Join(shortControlTempDir(t), "late.sock")
 
 	go func() {
 		time.Sleep(controlSocketPollInterval / 2)
@@ -463,7 +463,7 @@ func TestWaitForControlSocketWakesOnDaemonExit(t *testing.T) {
 // TestWaitForControlSocketHonorsCancellation verifies that a canceled caller stops
 // the wait promptly and reports cancellation rather than a probe error.
 func TestWaitForControlSocketHonorsCancellation(t *testing.T) {
-	socketPath := filepath.Join(t.TempDir(), "canceled.sock")
+	socketPath := filepath.Join(shortControlTempDir(t), "canceled.sock")
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		time.Sleep(controlSocketPollInterval / 2)
@@ -544,7 +544,7 @@ func TestControlCommandAllowsExplicitSocketWithoutTarget(t *testing.T) {
 // TestReleaseMastersForHandoffClosesTargetSocket verifies that
 // releaseMastersForHandoff reserves and shuts down a persistent target master.
 func TestReleaseMastersForHandoffClosesTargetSocket(t *testing.T) {
-	targetSock := filepath.Join(t.TempDir(), "target.sock")
+	targetSock := filepath.Join(shortControlTempDir(t), "target.sock")
 	targetMaster, err := ssh.StartMuxServer(context.Background(), nilDummySSHClient(t), ssh.MuxMasterOptions{
 		Path:                  targetSock,
 		Target:                ssh.TargetContext{Control: &ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: targetSock, Persist: "10m"}},

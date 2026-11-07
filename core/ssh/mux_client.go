@@ -139,6 +139,11 @@ func DialMuxClient(ctx context.Context, socketPath string, opts ...MuxClientOpti
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "unix", socketPath)
 	if err != nil {
+		if runtime.GOOS == "windows" && isConnectionRefused(err) {
+			if _, statErr := os.Lstat(socketPath); errors.Is(statErr, os.ErrNotExist) {
+				return nil, fmt.Errorf("dial mux socket %q: %w", socketPath, statErr)
+			}
+		}
 		return nil, fmt.Errorf("dial mux socket %q: %w", socketPath, err)
 	}
 
@@ -556,16 +561,14 @@ func isConnectionRefused(err error) bool {
 }
 
 // isControlSocketFileInfo reports whether fi describes a valid control socket
-// entry on the current platform. On Unix only actual socket inodes qualify so a
-// regular file at ControlPath is never mistaken for a stale socket and unlinked.
+// entry on the current platform. Only actual socket inodes/reparse points
+// qualify so a regular file at ControlPath is never mistaken for a stale socket
+// and unlinked.
 func isControlSocketFileInfo(fi os.FileInfo) bool {
 	if fi == nil {
 		return false
 	}
-	if fi.Mode()&os.ModeSocket != 0 {
-		return true
-	}
-	return runtime.GOOS == "windows" && fi.Mode().IsRegular()
+	return fi.Mode()&os.ModeSocket != 0
 }
 
 func socketPathExists(path string) bool {

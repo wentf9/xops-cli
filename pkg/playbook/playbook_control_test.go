@@ -353,9 +353,9 @@ func TestPlaybook_StaleSocketAutoUnlinkAndFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create socket failed: %v", err)
 	}
-	defer func() { _ = syscall.Close(fd) }()
 	sa := &syscall.SockaddrUnix{Name: staleSockPath}
 	if err := syscall.Bind(fd, sa); err != nil {
+		_ = syscall.Close(fd)
 		t.Fatalf("bind failed: %v", err)
 	}
 	_ = syscall.Close(fd) // Close without listening, leaving stale socket file
