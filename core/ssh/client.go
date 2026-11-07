@@ -121,6 +121,14 @@ func newClientWithComponents(
 	if cfg != nil {
 		connCfg = cfg.ToConnectionConfig()
 	}
+	if connCfg.Options != nil {
+		if connCfg.Options.BatchMode() {
+			prompter = rejectInteraction{}
+		}
+		if ct := connCfg.Options.ConnectTimeout(); ct > 0 {
+			handshakeTimeout = ct
+		}
+	}
 	if resolver == nil && cfg != nil && (cfg.Password != "" || cfg.SuPwd != "") {
 		resolver = &compatSecretResolver{
 			password: cfg.Password,
@@ -231,7 +239,11 @@ func (c *Client) configSnapshot() (ClientConfig, bool) {
 		SudoMode:              c.connCfg.SudoMode,
 		SudoUpdateToken:       c.connCfg.SudoUpdateToken,
 		ProxyJump:             c.connCfg.ProxyJump,
+		OriginalProxyJump:     c.connCfg.OriginalProxyJump,
+		HasOriginalProxyJump:  c.connCfg.HasOriginalProxyJump,
 		PasswordPromptPattern: c.connCfg.PasswordPromptPattern,
+		Execution:             c.connCfg.Execution.Clone(),
+		Options:               c.connCfg.Options.Clone(),
 	}, true
 }
 
@@ -242,7 +254,7 @@ func (c *Client) ConnectionConfig() ConnectionConfig {
 	}
 	c.cfgMu.RLock()
 	defer c.cfgMu.RUnlock()
-	return c.connCfg
+	return c.connCfg.Clone()
 }
 
 // AuthMaterial returns authentication material held by the client.

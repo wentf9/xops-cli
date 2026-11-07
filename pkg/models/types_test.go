@@ -189,46 +189,65 @@ func TestIdentity_CloneAndEqual(t *testing.T) {
 	}
 }
 
-func TestNode_ControlYAMLSerialization(t *testing.T) {
-	// 1. Without Control, field should be omitted in YAML
-	nodeWithoutControl := Node{
+func TestNode_SSHOptionsYAMLSerialization(t *testing.T) {
+	// 1. Without SSHOptions, field should be omitted in YAML
+	nodeWithoutOptions := Node{
 		HostRef:     "srv1",
 		IdentityRef: "admin",
 	}
-	out, err := yaml.Marshal(nodeWithoutControl)
+	out, err := yaml.Marshal(nodeWithoutOptions)
 	if err != nil {
 		t.Fatalf("marshal error: %v", err)
 	}
-	if strings.Contains(string(out), "control:") {
-		t.Fatalf("expected control to be omitted, got: %s", string(out))
+	if strings.Contains(string(out), "ssh_options:") {
+		t.Fatalf("expected ssh_options to be omitted, got: %s", string(out))
 	}
 
-	// 2. With Control, field should be marshaled and unmarshaled correctly
-	nodeWithControl := Node{
+	// 2. With SSHOptions, field should be marshaled in snake_case and unmarshaled correctly
+	nodeWithOptions := Node{
 		HostRef:     "srv1",
 		IdentityRef: "admin",
-		Control: &ssh.ControlConfig{
-			Master:  ssh.ControlMasterAuto,
-			Path:    "~/.ssh/cm-%r@%h:%p",
-			Persist: "10m",
-		},
+		SSHOptions: ssh.MustOptions(
+			ssh.OptionControlMaster, "auto",
+			ssh.OptionControlPath, "~/.ssh/cm-%r@%h:%p",
+			ssh.OptionControlPersist, "10m",
+			ssh.OptionStrictHostKeyChecking, "accept-new",
+		),
 	}
-	data, err := yaml.Marshal(nodeWithControl)
+	data, err := yaml.Marshal(nodeWithOptions)
 	if err != nil {
 		t.Fatalf("marshal error: %v", err)
 	}
-	if !strings.Contains(string(data), "control:") {
-		t.Fatalf("expected control in YAML, got: %s", string(data))
+	if !strings.Contains(string(data), "ssh_options:") || !strings.Contains(string(data), "control_master: auto") {
+		t.Fatalf("expected ssh_options with snake_case in YAML, got: %s", string(data))
 	}
 
 	var unmarshaled Node
 	if err := yaml.Unmarshal(data, &unmarshaled); err != nil {
 		t.Fatalf("unmarshal error: %v", err)
 	}
-	if unmarshaled.Control == nil {
-		t.Fatal("expected unmarshaled Control to be non-nil")
+	if unmarshaled.SSHOptions == nil {
+		t.Fatal("expected unmarshaled SSHOptions to be non-nil")
 	}
-	if !unmarshaled.Control.Equal(nodeWithControl.Control) {
-		t.Fatalf("expected %v, got %v", nodeWithControl.Control, unmarshaled.Control)
+	if !unmarshaled.SSHOptions.Equal(nodeWithOptions.SSHOptions) {
+		t.Fatalf("expected %v, got %v", nodeWithOptions.SSHOptions, unmarshaled.SSHOptions)
+	}
+
+	// 3. Manually edited YAML with OpenSSH PascalCase keys under ssh_options
+	pascalYAML := `
+host_ref: srv1
+identity_ref: admin
+ssh_options:
+  ControlMaster: auto
+  ControlPath: ~/.ssh/cm-%r@%h:%p
+  ControlPersist: 10m
+  StrictHostKeyChecking: accept-new
+`
+	var fromPascal Node
+	if err := yaml.Unmarshal([]byte(pascalYAML), &fromPascal); err != nil {
+		t.Fatalf("unmarshal PascalCase ssh_options error: %v", err)
+	}
+	if !fromPascal.SSHOptions.Equal(nodeWithOptions.SSHOptions) {
+		t.Fatalf("expected %v, got %v", nodeWithOptions.SSHOptions, fromPascal.SSHOptions)
 	}
 }

@@ -61,14 +61,14 @@ func TestParentDaemonDisablesNodeControlSharing(t *testing.T) {
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
 		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
 		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
-		Control:    &ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: "/tmp/global.sock", Persist: "1h"},
+		SSHOptions: ssh.OptionsFromControl(&ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: "/tmp/global.sock", Persist: "1h"}),
 	}
 	cfg.Hosts.Set("host-1", models.Host{Address: "192.0.2.1", Port: 22})
 	cfg.Identities.Set("id-1", models.Identity{User: "ops", AuthType: "auto"})
 	cfg.Nodes.Set("web-01", models.Node{
 		HostRef:     "host-1",
 		IdentityRef: "id-1",
-		Control:     &ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: "/tmp/node.sock", Persist: "10m"},
+		SSHOptions:  ssh.OptionsFromControl(&ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: "/tmp/node.sock", Persist: "10m"}),
 	})
 	provider := config.NewProviderWithoutOpenSSH(cfg)
 
@@ -104,7 +104,7 @@ func TestParentDaemonDisablesNodeControlSharing(t *testing.T) {
 	cfg.Nodes.Set("jump-01", models.Node{
 		HostRef:     "host-1",
 		IdentityRef: "id-1",
-		Control:     &ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: "/tmp/jump.sock", Persist: "10m"},
+		SSHOptions:  ssh.OptionsFromControl(&ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: "/tmp/jump.sock", Persist: "10m"}),
 	})
 	jumpDisabled, err := adapter.NewSSHAdapter(provider, adpOpts...).GetControlConfig("jump-01")
 	if err != nil {
@@ -211,11 +211,11 @@ func TestDrainOwnedMastersWaitsForSecondarySession(t *testing.T) {
 	cfg.Nodes.Set("web-01", models.Node{
 		HostRef:     "h1",
 		IdentityRef: "id1",
-		Control: &ssh.ControlConfig{
+		SSHOptions: ssh.OptionsFromControl(&ssh.ControlConfig{
 			Master:  ssh.ControlMasterAuto,
 			Path:    sockPath,
 			Persist: "10m",
-		},
+		}),
 	})
 	provider := config.NewProviderWithoutOpenSSH(cfg)
 	connector := adapter.NewConnector(provider, ssh.WithHostKeyVerifier(staticHostKeyTrust{}))
@@ -314,11 +314,11 @@ func TestReleaseMastersForHandoffRestoresSessionOnFailure(t *testing.T) {
 	cfg.Nodes.Set("web-01", models.Node{
 		HostRef:     "h1",
 		IdentityRef: "id1",
-		Control: &ssh.ControlConfig{
+		SSHOptions: ssh.OptionsFromControl(&ssh.ControlConfig{
 			Master:  ssh.ControlMasterAuto,
 			Path:    sockPath,
 			Persist: "1s",
-		},
+		}),
 	})
 	provider := config.NewProviderWithoutOpenSSH(cfg)
 	connector := adapter.NewConnector(provider, ssh.WithHostKeyVerifier(staticHostKeyTrust{}))
@@ -497,12 +497,12 @@ func TestMultiHostHandoff_PreservesAllTargetMasters(t *testing.T) {
 	cfg.Nodes.Set("nodeA", models.Node{
 		HostRef:     "hA",
 		IdentityRef: "id1",
-		Control:     &ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: sockA, Persist: "10m"},
+		SSHOptions:  ssh.OptionsFromControl(&ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: sockA, Persist: "10m"}),
 	})
 	cfg.Nodes.Set("nodeB", models.Node{
 		HostRef:     "hB",
 		IdentityRef: "id1",
-		Control:     &ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: sockB, Persist: "10m"},
+		SSHOptions:  ssh.OptionsFromControl(&ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: sockB, Persist: "10m"}),
 	})
 
 	provider := config.NewProviderWithoutOpenSSH(cfg)
@@ -786,7 +786,16 @@ func TestMuxDaemonArgsIsolationAndRememberSuppression(t *testing.T) {
 	opts.User = "targetuser"
 	opts.IdentityFile = "/tmp/target-only-id"
 	opts.JumpHost = "bastion"
-	opts.control.Options = []string{"ProxyJump=bastion", "Port=2222", "User=targetuser", "IdentityFile=/tmp/target-only-id", "ControlMaster=auto"}
+	opts.control.Options = []string{
+		"ProxyJump=bastion",
+		"Port=2222",
+		"User=targetuser",
+		"IdentityFile=/tmp/target-only-id",
+		"ControlMaster=auto",
+		"StrictHostKeyChecking=no",
+		"PubkeyAuthentication=no",
+		"UserKnownHostsFile=/tmp/target_kh",
+	}
 
 	args := opts.muxDaemonArgs("bastion", sockPath, jumpMaster)
 	joined := strings.Join(args, " ")
@@ -796,8 +805,24 @@ func TestMuxDaemonArgsIsolationAndRememberSuppression(t *testing.T) {
 	if !strings.Contains(joined, "-p "+strconv.Itoa(port)) || !strings.Contains(joined, "-l jumpuser") {
 		t.Fatalf("expected jumpMaster's port %d and user jumpuser, got %q", port, joined)
 	}
-	if strings.Contains(joined, "-J ") || strings.Contains(joined, "ProxyJump=") || strings.Contains(joined, "2222") || strings.Contains(joined, "targetuser") || strings.Contains(joined, "target-only-id") || strings.Contains(joined, "-i ") {
-		t.Fatalf("expected target-specific JumpHost/Port/User/IdentityFile options to be stripped for jumpMaster, got %q", joined)
+	for _, forbidden := range []string{
+		"-J ",
+		"ProxyJump=",
+		"2222",
+		"targetuser",
+		"target-only-id",
+		"-i ",
+		"StrictHostKeyChecking=no",
+		"PubkeyAuthentication=no",
+		"UserKnownHostsFile=",
+		"ControlMaster=auto",
+	} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("expected target-scoped option %q to be stripped for jumpMaster, got %q", forbidden, joined)
+		}
+	}
+	if !strings.Contains(joined, "-o ControlPersist=5m") || !strings.Contains(joined, "-o ControlMaster=yes") {
+		t.Fatalf("expected jumpMaster's own ControlPersist=5m and ControlMaster=yes, got %q", joined)
 	}
 
 	// Verify resolveNode in mux daemon child mode never persists an unconfirmed target.
@@ -1014,21 +1039,21 @@ func TestHandoffConnectorMastersDoesNotSkipPersistentJumpForNonPersistentTarget(
 	cfg.Nodes.Set("bastion", models.Node{
 		HostRef:     "h-jump",
 		IdentityRef: "id1",
-		Control: &ssh.ControlConfig{
+		SSHOptions: ssh.OptionsFromControl(&ssh.ControlConfig{
 			Master:  ssh.ControlMasterAuto,
 			Path:    jumpSock,
 			Persist: "5m",
-		},
+		}),
 	})
 	cfg.Nodes.Set("app", models.Node{
 		HostRef:     "h-target",
 		IdentityRef: "id1",
 		ProxyJump:   "bastion",
-		Control: &ssh.ControlConfig{
+		SSHOptions: ssh.OptionsFromControl(&ssh.ControlConfig{
 			Master:  ssh.ControlMasterAuto,
 			Path:    targetSock,
 			Persist: "no",
-		},
+		}),
 	})
 
 	provider := config.NewProviderWithoutOpenSSH(cfg)
@@ -1096,21 +1121,21 @@ func TestMuxDaemonKeepsJumpMasterReferenceUntilTargetExits(t *testing.T) {
 	cfg.Nodes.Set("bastion", models.Node{
 		HostRef:     "h-jump",
 		IdentityRef: "id1",
-		Control: &ssh.ControlConfig{
+		SSHOptions: ssh.OptionsFromControl(&ssh.ControlConfig{
 			Master:  ssh.ControlMasterAuto,
 			Path:    jumpSock,
 			Persist: "1s",
-		},
+		}),
 	})
 	cfg.Nodes.Set("app", models.Node{
 		HostRef:     "h-target",
 		IdentityRef: "id1",
 		ProxyJump:   "bastion",
-		Control: &ssh.ControlConfig{
+		SSHOptions: ssh.OptionsFromControl(&ssh.ControlConfig{
 			Master:  ssh.ControlMasterAutoAsk,
 			Path:    targetSock,
 			Persist: "5m",
-		},
+		}),
 	})
 
 	provider := config.NewProviderWithoutOpenSSH(cfg)
@@ -2046,13 +2071,13 @@ Host app
 		t.Fatalf("parse ssh_config: %v", err)
 	}
 	cfg := newEmptyTestConfig()
-	cfg.Control = &ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: "/tmp/global-%n", Persist: "30s"}
+	cfg.SSHOptions = ssh.OptionsFromControl(&ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: "/tmp/global-%n", Persist: "30s"})
 	cfg.Hosts.Set("10.0.0.10:22", models.Host{Address: "10.0.0.10", Port: 22})
 	cfg.Identities.Set("ubuntu@10.0.0.10", models.Identity{User: "ubuntu", AuthType: "auto"})
 	cfg.Nodes.Set("prod", models.Node{
 		HostRef:     "10.0.0.10:22",
 		IdentityRef: "ubuntu@10.0.0.10",
-		Control:     &ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: "/tmp/prod-tier2-%n", Persist: "30s"},
+		SSHOptions:  ssh.OptionsFromControl(&ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: "/tmp/prod-tier2-%n", Persist: "30s"}),
 	})
 	// Saved node from a previous `xops ssh -p 2222 app` where OpenSSHAlias was not serialized to YAML.
 	cfg.Hosts.Set("10.0.0.20:2222", models.Host{Address: "10.0.0.20", Port: 2222})
@@ -2086,7 +2111,7 @@ Host app
 
 	// R10-2 (Part 2): saved node ubuntu@10.0.0.20:2222 retains OpenSSHAlias="app" when resolved via selector "app".
 	cfgNoGlobal := repo.Snapshot()
-	cfgNoGlobal.Control = nil
+	cfgNoGlobal.SSHOptions = nil
 	store2 := config.NewDefaultStore(filepath.Join(t.TempDir(), "config2.yaml"), filepath.Join(t.TempDir(), "key2"))
 	repoTier4, err := config.NewRepositoryWithOpenSSHParser(cfgNoGlobal, store2, parser)
 	if err != nil {
@@ -2359,7 +2384,7 @@ Host jump-alias
 		t.Fatalf("parse ssh_config: %v", err)
 	}
 	baseCfg := newEmptyTestConfig()
-	baseCfg.Control = &ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: "/tmp/cm-global-%n-%r@%h:%p-%j", Persist: "30s"}
+	baseCfg.SSHOptions = ssh.OptionsFromControl(&ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: "/tmp/cm-global-%n-%r@%h:%p-%j", Persist: "30s"})
 	baseCfg.Hosts.Set("10.0.0.10:22", models.Host{Address: "10.0.0.10", Port: 22, Alias: []string{"host-alias"}})
 	baseCfg.Identities.Set("root@10.0.0.10", models.Identity{User: "root", AuthType: "auto", KeyPath: "/tmp/root_key"})
 	baseCfg.Nodes.Set("web-node", models.Node{
@@ -2367,7 +2392,7 @@ Host jump-alias
 		IdentityRef: "root@10.0.0.10",
 		Alias:       []string{"web"},
 		ProxyJump:   "openssh:jump-alias",
-		Control:     &ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: "/tmp/cm-node-%n-%r@%h:%p-%j", Persist: "30s"},
+		SSHOptions:  ssh.OptionsFromControl(&ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: "/tmp/cm-node-%n-%r@%h:%p-%j", Persist: "30s"}),
 	})
 
 	targets := []config.ConnectionTarget{
@@ -2474,7 +2499,7 @@ Host gw
 	cfg.Nodes.Set("gw-2222", models.Node{
 		HostRef:     "10.0.0.10:2222",
 		IdentityRef: "root@10.0.0.10",
-		Control:     &ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: "/tmp/tier2-gw2222-%n", Persist: "30s"},
+		SSHOptions:  ssh.OptionsFromControl(&ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: "/tmp/tier2-gw2222-%n", Persist: "30s"}),
 	})
 	provider := config.NewProviderWithOpenSSHParser(cfg, parser)
 

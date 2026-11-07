@@ -1311,7 +1311,7 @@ func TestToV2AndFromV2_OTPAndKeyboardInteractive(t *testing.T) {
 	}
 }
 
-func TestSchemaV2_ControlConfig_Unmarshal(t *testing.T) {
+func TestSchemaV2_SSHOptions_Unmarshal(t *testing.T) {
 	yamlData := `schema_version: 2
 credential:
   default_store: pass
@@ -1321,18 +1321,20 @@ hosts:
   h1: {address: 192.168.1.10, port: 22}
 identities:
   dev: {user: dev, auth_type: auto}
-control:
-  master: auto
-  path: ~/.ssh/cm-%r@%h:%p
-  persist: 10m
+ssh_options:
+  control_master: auto
+  control_path: ~/.ssh/cm-%r@%h:%p
+  control_persist: 10m
+  strict_host_key_checking: accept-new
 nodes:
   n1:
     host_ref: h1
     identity_ref: dev
-    control:
-      master: yes
-      path: /tmp/custom-%h.sock
-      persist: 5m
+    ssh_options:
+      ControlMaster: yes
+      ControlPath: /tmp/custom-%h.sock
+      ControlPersist: 5m
+      ConnectTimeout: 15s
   n2:
     host_ref: h1
     identity_ref: dev
@@ -1343,35 +1345,36 @@ nodes:
 		t.Fatalf("UnmarshalV2 failed: %v", err)
 	}
 
-	// Verify global control
-	if cfg.Control == nil {
-		t.Fatal("expected global control to be non-nil")
+	// Verify global ssh_options
+	if cfg.SSHOptions == nil {
+		t.Fatal("expected global ssh_options to be non-nil")
 	}
-	if cfg.Control.Master != ssh.ControlMasterAuto ||
-		cfg.Control.Path != "~/.ssh/cm-%r@%h:%p" ||
-		cfg.Control.Persist != "10m" {
-		t.Fatalf("global control mismatch: %+v", cfg.Control)
+	if cfg.SSHOptions.ControlMaster() != ssh.ControlMasterAuto ||
+		cfg.SSHOptions.ControlPath() != "~/.ssh/cm-%r@%h:%p" ||
+		cfg.SSHOptions.ControlPersist() != "10m" ||
+		cfg.SSHOptions.StrictHostKeyChecking() != ssh.StrictHostKeyCheckingAcceptNew {
+		t.Fatalf("global ssh_options mismatch: %+v", cfg.SSHOptions)
 	}
 
-	// Verify node n1 control
+	// Verify node n1 ssh_options (parsed from PascalCase OpenSSH keys)
 	n1 := cfg.Nodes["n1"]
-	if n1.Control == nil {
-		t.Fatal("expected node n1 control to be non-nil")
+	if n1.SSHOptions == nil {
+		t.Fatal("expected node n1 ssh_options to be non-nil")
 	}
-	if n1.Control.Master != ssh.ControlMasterYes ||
-		n1.Control.Path != "/tmp/custom-%h.sock" ||
-		n1.Control.Persist != "5m" {
-		t.Fatalf("node n1 control mismatch: %+v", n1.Control)
+	if n1.SSHOptions.ControlMaster() != ssh.ControlMasterYes ||
+		n1.SSHOptions.ControlPath() != "/tmp/custom-%h.sock" ||
+		n1.SSHOptions.ControlPersist() != "5m" {
+		t.Fatalf("node n1 ssh_options mismatch: %+v", n1.SSHOptions)
 	}
 
-	// Verify node n2 control is nil
+	// Verify node n2 ssh_options is nil
 	n2 := cfg.Nodes["n2"]
-	if n2.Control != nil {
-		t.Fatalf("expected node n2 control to be nil, got: %+v", n2.Control)
+	if n2.SSHOptions != nil {
+		t.Fatalf("expected node n2 ssh_options to be nil, got: %+v", n2.SSHOptions)
 	}
 }
 
-func TestSchemaV2_ControlConfig_FromV2AndRoundtrip(t *testing.T) {
+func TestSchemaV2_SSHOptions_FromV2AndRoundtrip(t *testing.T) {
 	yamlData := `schema_version: 2
 credential:
   default_store: pass
@@ -1381,18 +1384,18 @@ hosts:
   h1: {address: 192.168.1.10, port: 22}
 identities:
   dev: {user: dev, auth_type: auto}
-control:
-  master: auto
-  path: ~/.ssh/cm-%r@%h:%p
-  persist: 10m
+ssh_options:
+  control_master: auto
+  control_path: ~/.ssh/cm-%r@%h:%p
+  control_persist: 10m
 nodes:
   n1:
     host_ref: h1
     identity_ref: dev
-    control:
-      master: yes
-      path: /tmp/custom-%h.sock
-      persist: 5m
+    ssh_options:
+      control_master: yes
+      control_path: /tmp/custom-%h.sock
+      control_persist: 5m
 `
 
 	cfg, err := UnmarshalV2([]byte(yamlData))
@@ -1406,19 +1409,19 @@ nodes:
 	if err != nil {
 		t.Fatalf("FromV2 failed: %v", err)
 	}
-	if memCfg.Control == nil || !memCfg.Control.Equal(cfg.Control) {
-		t.Fatalf("FromV2 global control mismatch: %+v", memCfg.Control)
+	if memCfg.SSHOptions == nil || !memCfg.SSHOptions.Equal(cfg.SSHOptions) {
+		t.Fatalf("FromV2 global ssh_options mismatch: %+v", memCfg.SSHOptions)
 	}
 
 	memN1, ok := memCfg.Nodes.Get("n1")
-	if !ok || memN1.Control == nil || !memN1.Control.Equal(n1.Control) {
-		t.Fatalf("FromV2 node n1 control mismatch")
+	if !ok || memN1.SSHOptions == nil || !memN1.SSHOptions.Equal(n1.SSHOptions) {
+		t.Fatalf("FromV2 node n1 ssh_options mismatch")
 	}
 
 	// Verify snapshot isolation
 	snap := memCfg.Snapshot()
-	snap.Control.Master = ssh.ControlMasterAsk
-	if memCfg.Control.Master != ssh.ControlMasterAuto {
+	snap.SSHOptions.SetControlMaster(ssh.ControlMasterAsk)
+	if memCfg.SSHOptions.ControlMaster() != ssh.ControlMasterAuto {
 		t.Fatal("snapshot mutation affected original config")
 	}
 
@@ -1427,12 +1430,12 @@ nodes:
 	if err != nil {
 		t.Fatalf("ToV2 failed: %v", err)
 	}
-	if v2Back.Control == nil || !v2Back.Control.Equal(cfg.Control) {
-		t.Fatalf("ToV2 global control mismatch")
+	if v2Back.SSHOptions == nil || !v2Back.SSHOptions.Equal(cfg.SSHOptions) {
+		t.Fatalf("ToV2 global ssh_options mismatch")
 	}
 }
 
-func TestSchemaV2_ControlConfig_ValidationErrors(t *testing.T) {
+func TestSchemaV2_SSHOptions_ValidationErrors(t *testing.T) {
 	baseYAML := `schema_version: 2
 credential:
   default_store: pass
@@ -1446,8 +1449,8 @@ identities:
 
 	// 1. Invalid global ControlMaster
 	t.Run("invalid global master", func(t *testing.T) {
-		y := baseYAML + `control:
-  master: invalid_mode
+		y := baseYAML + `ssh_options:
+  control_master: invalid_mode
 nodes:
   n1: {host_ref: h1, identity_ref: dev}
 `
@@ -1463,10 +1466,10 @@ nodes:
   n1:
     host_ref: h1
     identity_ref: dev
-    control:
-      master: auto
-      path: /tmp/sock
-      persist: 10xyz
+    ssh_options:
+      control_master: auto
+      control_path: /tmp/sock
+      control_persist: 10xyz
 `
 		_, err := UnmarshalV2([]byte(y))
 		if err == nil || !errors.Is(err, ErrSchemaValidation) || !strings.Contains(err.Error(), "invalid ControlPersist") {
@@ -1480,9 +1483,9 @@ nodes:
   n1:
     host_ref: h1
     identity_ref: dev
-    control:
-      master: "no"
-      persist: 10m
+    ssh_options:
+      control_master: "no"
+      control_persist: 10m
 `
 		_, err := UnmarshalV2([]byte(y))
 		if err == nil || !errors.Is(err, ErrSchemaValidation) || !strings.Contains(err.Error(), "cannot be specified when ControlMaster is 'no'") {
@@ -1490,14 +1493,14 @@ nodes:
 		}
 	})
 
-	// 4. Effective control: Active Master with no Path anywhere
+	// 4. Effective ssh_options: Active Master with no Path anywhere
 	t.Run("active master without path", func(t *testing.T) {
 		y := baseYAML + `nodes:
   n1:
     host_ref: h1
     identity_ref: dev
-    control:
-      master: auto
+    ssh_options:
+      control_master: auto
 `
 		_, err := UnmarshalV2([]byte(y))
 		if err == nil || !errors.Is(err, ErrSchemaValidation) || !strings.Contains(err.Error(), "requires non-empty ControlPath") {
@@ -1505,15 +1508,15 @@ nodes:
 		}
 	})
 
-	// 5. Effective control: Node sets Path="none" with Master="yes"
+	// 5. Effective ssh_options: Node sets Path="none" with Master="yes"
 	t.Run("active master with path none", func(t *testing.T) {
 		y := baseYAML + `nodes:
   n1:
     host_ref: h1
     identity_ref: dev
-    control:
-      master: yes
-      path: none
+    ssh_options:
+      control_master: yes
+      control_path: none
 `
 		_, err := UnmarshalV2([]byte(y))
 		if err == nil || !errors.Is(err, ErrSchemaValidation) || !strings.Contains(err.Error(), "ControlPath cannot be 'none'") {
@@ -1522,7 +1525,7 @@ nodes:
 	})
 }
 
-func TestSchemaV2_ControlConfig_NodeDisableMultiplexing(t *testing.T) {
+func TestSchemaV2_SSHOptions_NodeDisableMultiplexing(t *testing.T) {
 	yamlData := `schema_version: 2
 credential:
   default_store: pass
@@ -1532,16 +1535,16 @@ hosts:
   h1: {address: 192.168.1.10, port: 22}
 identities:
   dev: {user: dev, auth_type: auto}
-control:
-  master: auto
-  path: ~/.ssh/cm-%r@%h:%p
-  persist: 10m
+ssh_options:
+  control_master: auto
+  control_path: ~/.ssh/cm-%r@%h:%p
+  control_persist: 10m
 nodes:
   n1:
     host_ref: h1
     identity_ref: dev
-    control:
-      path: none
+    ssh_options:
+      control_path: none
   n2:
     host_ref: h1
     identity_ref: dev
@@ -1549,23 +1552,24 @@ nodes:
 
 	cfg, err := UnmarshalV2([]byte(yamlData))
 	if err != nil {
-		t.Fatalf("UnmarshalV2 failed on valid node control path: none: %v", err)
+		t.Fatalf("UnmarshalV2 failed on valid node control_path: none: %v", err)
 	}
 
-	// Verify node n1 has raw control path none
+	// Verify node n1 has raw control_path none
 	n1 := cfg.Nodes["n1"]
-	if n1.Control == nil {
-		t.Fatal("expected node n1 control to be non-nil")
+	if n1.SSHOptions == nil {
+		t.Fatal("expected node n1 ssh_options to be non-nil")
 	}
-	if n1.Control.Path != "none" {
-		t.Fatalf("expected node n1 control path to be %q, got %q", "none", n1.Control.Path)
+	if n1.SSHOptions.ControlPath() != "none" {
+		t.Fatalf("expected node n1 control_path to be %q, got %q", "none", n1.SSHOptions.ControlPath())
 	}
 
-	// Verify effective control for node n1 disables multiplexing
-	eff, err := ssh.ResolveControl(n1.Control, cfg.Control)
+	// Verify effective ssh_options for node n1 disables multiplexing
+	effOpts, err := ssh.ResolveOptions(n1.SSHOptions, cfg.SSHOptions)
 	if err != nil {
-		t.Fatalf("unexpected ResolveControl error: %v", err)
+		t.Fatalf("unexpected ResolveOptions error: %v", err)
 	}
+	eff := effOpts.ControlConfig()
 	if eff.Master != ssh.ControlMasterNo {
 		t.Fatalf("expected effective master %q, got %q", ssh.ControlMasterNo, eff.Master)
 	}
@@ -1579,12 +1583,13 @@ nodes:
 		t.Fatal("expected effective control to be disabled for node n1")
 	}
 
-	// Verify node n2 inherits global control
+	// Verify node n2 inherits global ssh_options
 	n2 := cfg.Nodes["n2"]
-	effN2, err := ssh.ResolveControl(n2.Control, cfg.Control)
+	effN2Opts, err := ssh.ResolveOptions(n2.SSHOptions, cfg.SSHOptions)
 	if err != nil {
-		t.Fatalf("unexpected ResolveControl error for n2: %v", err)
+		t.Fatalf("unexpected ResolveOptions error for n2: %v", err)
 	}
+	effN2 := effN2Opts.ControlConfig()
 	if effN2.Master != ssh.ControlMasterAuto || effN2.Path != "~/.ssh/cm-%r@%h:%p" || effN2.Persist != "10m" {
 		t.Fatalf("node n2 unexpected effective control: %+v", effN2)
 	}

@@ -331,20 +331,20 @@ const (
 
 ### 5.1 4 层继承优先级
 
-`pkg/adapter/ssh_adapter.go:ResolveControl` 严格按以下优先级由高到低解析复用配置：
+`pkg/adapter/ssh_adapter.go:ResolveSSHOptions`（以及基于其派生的 `ResolveControl`）严格按以下优先级由高到低解析 OpenSSH 客户端选项与连接共享配置：
 
 $$\text{Tier 1 (CLI Session Overrides)} > \text{Tier 2 (Node Config)} > \text{Tier 3 (Global Defaults)} > \text{Tier 4 (OpenSSH Config)}$$
 
 1. **Tier 1 (CLI 会话参数覆盖)**：命令行传入的 `-M`、`-M -M`、`-S <path>`、`-S none`、`-o Key=Value`。
-2. **Tier 2 (Node 级配置)**：当前节点在 `config.yaml` 中配置的 `nodes[name].control`。
-3. **Tier 3 (Global 全局配置)**：全局配置中定义的默认 `control`。
-4. **Tier 4 (OpenSSH 系统配置)**：解析 `~/.ssh/config` 中针对该 Host 匹配的 `ControlMaster`、`ControlPath`、`ControlPersist`。在 Tier 4 内部，具体的 Host 声明（非通配符）优先于泛通配符（如 `Host *`）。
+2. **Tier 2 (Node 级配置)**：当前节点在 `config.yaml` 中配置的 `nodes[name].ssh_options`。
+3. **Tier 3 (Global 全局配置)**：全局配置中定义的默认 `ssh_options`。
+4. **Tier 4 (OpenSSH 系统配置)**：解析 `~/.ssh/config` 中针对该 Host 匹配的 OpenSSH 客户端选项（包含 `ControlMaster`、`ControlPath`、`ControlPersist` 及连接/认证/算法选项）。在 Tier 4 内部，具体的 Host 声明（非通配符）优先于泛通配符（如 `Host *`）。
 
 ### 5.2 字段级合并语义 (Orthogonal Field-by-Field Merging)
 
-三项关键配置（`Master`、`Path`、`Persist`）是彼此正交的独立字段，逐层按字段级合并：
-- 每一层若未显式指定某个字段，则向下继承更低层级的字段值。
-- **禁用语义 (`-S none` 或 `Path: "none"`)**：当任何高优先级层级显式指定了 `Path: "none"`，该指令具有全局最高禁用意图——强制将合并后的 `Master` 归一化为 `"no"`，清除 `Persist` 为空，并立即退出复用链路，回退至原生直接连接。
+`core/ssh/ssh_options.go:Options` 采用注册表驱动（`optionRegistry`）的规范化键值模型，所有受支持的 OpenSSH 选项在 4 个层级之间彼此正交、按项独立合并：
+- 每一层若未显式指定某个选项，则向下继承更低层级的选项值。
+- **禁用语义 (`-S none` 或 `control_path: "none"`)**：当任何高优先级层级显式指定了 `control_path: "none"`（或 `ControlPath=none`），该指令具有全局最高禁用意图——强制将合并后的 `control_master` 归一化为 `"no"`，清除 `control_persist`，并立即退出复用链路，回退至原生直接连接。
 
 ### 5.3 ControlPath 路径令牌展开机制
 
@@ -381,29 +381,42 @@ $$\text{Hash} = \text{SHA-1}(\%l + \%h + \%p + \%r + \%j)$$
 输出固定为 40 个字符的十六进制小写字符串。推荐的生产标准路径模式为：
 `~/.ssh/cm-%C`（全长约 54 字节，安全适配所有 Unix 内核限制）。
 
-### 5.5 Schema V2 配置声明与 CAS 实体版本化
+### 5.5 Schema V2 `ssh_options` 可扩展配置与 CAS 实体版本化
 
-在 `pkg/config/types.go` 与 `schema_v2.go` 中，`ControlConfig` 深度嵌入模型：
+在 `pkg/config/types.go` 与 `schema_v2.go` 中，全局与节点级统一使用可扩展的 `ssh_options` 映射（`*ssh.Options`）：
+- **落盘规范与手写兼容**：序列化落盘时统一输出规范 `snake_case` 键名（与 `xops_config.yaml` 其余字段风格一致）；反序列化加载时同时接受规范 `snake_case` 与 OpenSSH 标准 `PascalCase`/大小写不敏感键名（如 `ControlMaster`、`StrictHostKeyChecking`），允许用户直接按 OpenSSH 习惯手动编辑配置文件。未知键或同一选项的重复键名会在加载/校验阶段直接报错拒绝。
 
 ```yaml
 # config.yaml (Schema V2)
-control:
-  master: auto
-  path: ~/.ssh/cm-%C
-  persist: 10m
+ssh_options:
+  control_master: auto
+  control_path: ~/.ssh/cm-%C
+  control_persist: 10m
+  connect_timeout: 15s
+  server_alive_interval: 30s
+  strict_host_key_checking: accept-new
 
 nodes:
   web01:
-    host: 10.0.0.1
-    user: ops
-    control:
-      master: "yes"
-      path: /tmp/custom-%h-%p
-      persist: 0
+    host_ref: host-web01
+    identity_ref: id-ops
+    ssh_options:
+      control_master: "yes"
+      control_path: /tmp/custom-%h-%p
+      control_persist: "0"
+      tcp_keep_alive: "yes"
 ```
 
-- **验证保护**：`ValidateControlConfig` 校验模式必须属于合法枚举，校验 `Persist` 格式，校验未展开路径的语法合法性。
-- **CAS 版本哈希**：`ControlConfig` 纳入 `nodeEntityVersion`（`NodeRef`）的 CAS 内容哈希计算（`pkg/config/repository.go:nodeEntityVersion`），配置变更自动使依赖该节点的上层 `NodeRef` 乐观并发校验失效；认证机密版本 `nodeAuthVersion` 仍只覆盖认证材料，不包含复用配置。
+- **受支持的 OpenSSH 选项注册表（`core/ssh/ssh_options.go`，共 19 项，按 `OptionClass` 分类隔离）**：
+  - **多路复用 (`OptionClassMux`)**：`control_master` (`ControlMaster`), `control_path` (`ControlPath`), `control_persist` (`ControlPersist`)
+  - **传输与算法 (`OptionClassTransport`)**：`connect_timeout` (`ConnectTimeout`), `server_alive_interval` (`ServerAliveInterval`), `server_alive_count_max` (`ServerAliveCountMax`), `tcp_keep_alive` (`TCPKeepAlive`), `host_key_algorithms` (`HostKeyAlgorithms`), `ciphers` (`Ciphers`), `macs` (`MACs`), `kex_algorithms` (`KexAlgorithms`；均支持完整列表、`+` 追加、`^` 前置、`-` 移除语法)
+  - **认证控制 (`OptionClassAuth`)**：`pubkey_authentication` (`PubkeyAuthentication`), `password_authentication` (`PasswordAuthentication`), `kbd_interactive_authentication` (`KbdInteractiveAuthentication` / `ChallengeResponseAuthentication`), `identities_only` (`IdentitiesOnly`), `preferred_authentications` (`PreferredAuthentications`), `batch_mode` (`BatchMode`)
+  - **主机密钥信任 (`OptionClassTrust`)**：`strict_host_key_checking` (`StrictHostKeyChecking`: `yes`/`ask`/`accept-new`/`no`/`off`), `user_known_hosts_file` (`UserKnownHostsFile`)
+- **信任与继承边界**：
+  - `OptionClassTrust` 选项**不从 `~/.ssh/config`（Tier 4）继承**，仅接受来自 CLI `-o`（Tier 1）与 `xops` 显式配置（Tier 2 / Tier 3）；当主机指纹发生变更（`known_hosts` 不匹配）且显式指定 `StrictHostKeyChecking=no` 时，遵循 OpenSSH 原生语义自动禁用密码与键盘交互认证（仅允许公钥认证），防止凭据泄露给中间人。
+  - 已纳管的 `xops` 节点在回退查询 Tier 4 (`~/.ssh/config`) 时仅继承 `OptionClassMux` 与 `OptionClassTransport`；`ParseOpenSSHHosts` 导入节点时同样仅持久化这两类选项。
+  - MCP Host 与凭据校验路径显式启用 `WithHostTrustOverrides(false)` 与 `WithControlMultiplexing(false)`，剥离 `OptionClassTrust` 与 `OptionClassMux`，保持 fail-closed 主机密钥校验。
+- **CAS 版本哈希**：`SSHOptions` 纳入 `nodeEntityVersion`（`NodeRef`）的 CAS 内容哈希计算（`pkg/config/repository.go:nodeEntityVersion`），配置变更自动使依赖该节点的上层 `NodeRef` 乐观并发校验失效；认证机密版本 `nodeAuthVersion` 仍只覆盖认证材料。
 
 ---
 
@@ -417,7 +430,7 @@ nodes:
   - `-M`：启用 Master 模式（相当于 `-o ControlMaster=yes`）。
   - `-M -M`（重复指定）：启用确认 Master 模式（相当于 `-o ControlMaster=ask`）。
   - `-S <path>`：指定控制套接字路径（或 `-S none` 显式禁用连接共享）。
-  - `-o Key=Value`：传递通用 SSH 参数（支持 `ControlMaster`、`ControlPath`、`ControlPersist`、`Port`、`User`、`IdentityFile`、`ProxyJump`）。
+  - `-o Key=Value`：传递 OpenSSH 客户端选项（支持 `Port`、`User`、`IdentityFile`、`ProxyJump` 以及第 5.5 节列出的全部 19 项 `ssh_options` 选项，大小写不敏感并同时支持 `PascalCase` 与 `snake_case`）。
   - `-O <ctl_cmd>`：向正在运行的 Master 进程发送控制指令。
 - **`xops scp`、`xops sftp`、`xops exec`**：
   - 注册 `-S` 与 `-o` 参数。

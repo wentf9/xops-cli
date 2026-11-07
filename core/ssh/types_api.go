@@ -45,6 +45,7 @@ type ClientConfig struct {
 	// 为空时回落到 Connector 的全局配置，再为空则使用内置的多语言默认模式。
 	PasswordPromptPattern string
 	Execution             *ExecutionConfig
+	Options               *Options
 }
 
 // ToConnectionConfig 将 ClientConfig 转换为仅含网络与连接参数的 ConnectionConfig，剥离所有明文密码。
@@ -74,6 +75,7 @@ func (c *ClientConfig) ToConnectionConfig() ConnectionConfig {
 		HasOriginalProxyJump:  hasOriginal,
 		PasswordPromptPattern: c.PasswordPromptPattern,
 		Execution:             c.Execution.Clone(),
+		Options:               c.Options.Clone(),
 	}
 }
 
@@ -95,6 +97,15 @@ type ConnectionConfig struct {
 	HasOriginalProxyJump  bool
 	PasswordPromptPattern string
 	Execution             *ExecutionConfig
+	Options               *Options
+}
+
+// Clone returns a deep copy of ConnectionConfig, isolating mutable Execution and Options pointers.
+func (c ConnectionConfig) Clone() ConnectionConfig {
+	out := c
+	out.Execution = c.Execution.Clone()
+	out.Options = c.Options.Clone()
+	return out
 }
 
 // AuthMaterial 包含单次 SSH 握手所需的敏感认证材料。
@@ -273,6 +284,10 @@ func validateTargetCompatibility(cur ConnectionConfig, newCfg *ClientConfig) err
 	}
 	if newCfg.KeyRef != cur.KeyRef || newCfg.TrustVersion != cur.TrustVersion {
 		return fmt.Errorf("%w: key reference or host trust version changed", ErrSnapshotMismatch)
+	}
+	if cur.Options.StrictHostKeyChecking() != newCfg.Options.StrictHostKeyChecking() ||
+		cur.Options.UserKnownHostsFile() != newCfg.Options.UserKnownHostsFile() {
+		return fmt.Errorf("%w: host trust options changed", ErrSnapshotMismatch)
 	}
 	if newCfg.KeyPath != cur.KeyPath {
 		return fmt.Errorf("%w: key path changed (expected %q, got %q)",

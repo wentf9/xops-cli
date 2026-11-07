@@ -386,13 +386,13 @@ Host srv-ask
 	if err != nil {
 		t.Fatalf("GetVirtualNode(srv-auto) failed: %v", err)
 	}
-	if node1.Control == nil || node1.Control.Master != ssh.ControlMasterAuto ||
-		node1.Control.Path != "~/.ssh/sockets/%r@%h-%p" ||
-		node1.Control.Persist != "10m" {
-		t.Fatalf("srv-auto control mismatch: %+v", node1.Control)
+	if node1.SSHOptions == nil || node1.SSHOptions.ControlMaster() != ssh.ControlMasterAuto ||
+		node1.SSHOptions.ControlPath() != "~/.ssh/sockets/%r@%h-%p" ||
+		node1.SSHOptions.ControlPersist() != "10m" {
+		t.Fatalf("srv-auto control mismatch: %+v", node1.SSHOptions)
 	}
 	ctrl1, err := parser.GetControlConfig("srv-auto")
-	if err != nil || !ctrl1.Equal(node1.Control) {
+	if err != nil || !ctrl1.Equal(node1.SSHOptions.ControlConfig()) {
 		t.Fatalf("GetControlConfig(srv-auto) mismatch: %v, err=%v", ctrl1, err)
 	}
 
@@ -400,19 +400,19 @@ Host srv-ask
 	if err != nil {
 		t.Fatalf("GetVirtualNode(srv-yes) failed: %v", err)
 	}
-	if node2.Control == nil || node2.Control.Master != ssh.ControlMasterYes ||
-		node2.Control.Path != "/tmp/mux-%C.sock" ||
-		node2.Control.Persist != "0" {
-		t.Fatalf("srv-yes control mismatch: %+v", node2.Control)
+	if node2.SSHOptions == nil || node2.SSHOptions.ControlMaster() != ssh.ControlMasterYes ||
+		node2.SSHOptions.ControlPath() != "/tmp/mux-%C.sock" ||
+		node2.SSHOptions.ControlPersist() != "0" {
+		t.Fatalf("srv-yes control mismatch: %+v", node2.SSHOptions)
 	}
 
 	node3, _, _, err := parser.GetVirtualNode("srv-ask")
 	if err != nil {
 		t.Fatalf("GetVirtualNode(srv-ask) failed: %v", err)
 	}
-	if node3.Control == nil || node3.Control.Master != ssh.ControlMasterAsk ||
-		node3.Control.Persist != "1h" {
-		t.Fatalf("srv-ask control mismatch: %+v", node3.Control)
+	if node3.SSHOptions == nil || node3.SSHOptions.ControlMaster() != ssh.ControlMasterAsk ||
+		node3.SSHOptions.ControlPersist() != "1h" {
+		t.Fatalf("srv-ask control mismatch: %+v", node3.SSHOptions)
 	}
 }
 
@@ -437,10 +437,10 @@ Host srv-nocontrol
 	if err != nil {
 		t.Fatalf("GetVirtualNode(srv-none) failed: %v", err)
 	}
-	if node4.Control == nil || node4.Control.Path != "none" || node4.Control.Master != ssh.ControlMasterNo {
-		t.Fatalf("srv-none control mismatch: %+v", node4.Control)
+	if node4.SSHOptions == nil || node4.SSHOptions.ControlPath() != "none" || node4.SSHOptions.ControlMaster() != ssh.ControlMasterNo {
+		t.Fatalf("srv-none control mismatch: %+v", node4.SSHOptions)
 	}
-	if node4.Control.IsEnabled() {
+	if node4.SSHOptions.ControlConfig().IsEnabled() {
 		t.Fatalf("srv-none should have IsEnabled() == false")
 	}
 
@@ -448,8 +448,8 @@ Host srv-nocontrol
 	if err != nil {
 		t.Fatalf("GetVirtualNode(srv-nocontrol) failed: %v", err)
 	}
-	if node5.Control != nil {
-		t.Fatalf("expected srv-nocontrol Control to be nil, got: %+v", node5.Control)
+	if node5.SSHOptions != nil {
+		t.Fatalf("expected srv-nocontrol SSHOptions to be nil, got: %+v", node5.SSHOptions)
 	}
 }
 
@@ -567,17 +567,17 @@ Host *
 	if found == nil {
 		t.Fatal("no-master-host was not imported")
 	}
-	if found.Node.Control == nil {
-		t.Fatal("expected imported control config")
+	if found.Node.SSHOptions == nil {
+		t.Fatal("expected imported ssh_options config")
 	}
-	if found.Node.Control.Master != ssh.ControlMasterNo {
-		t.Fatalf("expected ControlMaster=no, got %q", found.Node.Control.Master)
+	if found.Node.SSHOptions.ControlMaster() != ssh.ControlMasterNo {
+		t.Fatalf("expected ControlMaster=no, got %q", found.Node.SSHOptions.ControlMaster())
 	}
-	if found.Node.Control.Persist != "" {
-		t.Fatalf("expected inherited ControlPersist to be dropped for ControlMaster=no, got %q", found.Node.Control.Persist)
+	if found.Node.SSHOptions.ControlPersist() != "" {
+		t.Fatalf("expected inherited ControlPersist to be dropped for ControlMaster=no, got %q", found.Node.SSHOptions.ControlPersist())
 	}
-	if err := ValidateControlConfig(found.Node.Control); err != nil {
-		t.Fatalf("imported control config is invalid: %v", err)
+	if err := ValidateSSHOptions(found.Node.SSHOptions); err != nil {
+		t.Fatalf("imported ssh_options config is invalid: %v", err)
 	}
 }
 
@@ -607,5 +607,57 @@ Host path-only
 	}
 	if ctrl.Path != "~/.ssh/path-only.sock" || ctrl.Persist != "5m" {
 		t.Fatalf("unexpected control config %+v", ctrl)
+	}
+}
+
+func TestOpenSSHParser_LenientOptionsAndNeverInheritsTrust(t *testing.T) {
+	configContent := `
+Host *
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    KexAlgorithms sntrup761x25519-sha512@openssh.com,curve25519-sha256
+    MACs umac-128-etm@openssh.com,hmac-sha2-256
+    PreferredAuthentications gssapi-with-mic,publickey,password
+    PubkeyAuthentication unbound
+    ChallengeResponseAuthentication yes
+
+Host modern-host
+    HostName 10.0.0.99
+    User ubuntu
+    KbdInteractiveAuthentication no
+    ControlPath ~/.ssh/cm-%k
+`
+	parser, err := NewOpenSSHParserFromReader(strings.NewReader(configContent))
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	node, _, _, err := parser.GetVirtualNode("modern-host")
+	if err != nil {
+		t.Fatalf("GetVirtualNode(modern-host) failed on modern OpenSSH options: %v", err)
+	}
+	if node.SSHOptions == nil {
+		t.Fatal("expected non-nil SSHOptions")
+	}
+	// H1: Trust options in ~/.ssh/config must never be inherited
+	if node.SSHOptions.StrictHostKeyChecking() != "" || node.SSHOptions.UserKnownHostsFile() != "" {
+		t.Fatalf("expected trust options from ~/.ssh/config to be ignored, got %+v", node.SSHOptions)
+	}
+	// H3: Unsupported algorithm/auth items filtered out, supported items kept
+	if got := node.SSHOptions.Get(ssh.OptionKexAlgorithms); got != "curve25519-sha256" {
+		t.Fatalf("expected KexAlgorithms=curve25519-sha256, got %q", got)
+	}
+	if got := node.SSHOptions.Get(ssh.OptionMACs); got != "hmac-sha2-256" {
+		t.Fatalf("expected MACs=hmac-sha2-256, got %q", got)
+	}
+	if got := node.SSHOptions.Get(ssh.OptionPreferredAuthentications); got != "publickey,password" {
+		t.Fatalf("expected PreferredAuthentications=publickey,password, got %q", got)
+	}
+	// Unsupported ControlPath token %k and PubkeyAuthentication=unbound are skipped leniently
+	if node.SSHOptions.ControlPath() != "" {
+		t.Fatalf("expected unsupported ControlPath %%k to be skipped, got %q", node.SSHOptions.ControlPath())
+	}
+	// L4: ChallengeResponseAuthentication in Host * appeared before KbdInteractiveAuthentication in Host modern-host
+	if kbdEnabled, kbdSet := node.SSHOptions.KbdInteractiveAuthentication(); !kbdSet || !kbdEnabled {
+		t.Fatalf("expected first-match-wins ChallengeResponseAuthentication=yes in Host * to win over later KbdInteractiveAuthentication=no")
 	}
 }

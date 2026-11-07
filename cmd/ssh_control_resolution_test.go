@@ -15,9 +15,9 @@ import (
 )
 
 const controlResolutionConfig = `schema_version: 2
-control:
-  master: auto
-  path: "%s"
+ssh_options:
+  control_master: auto
+  control_path: "%s"
 nodes:
   web-01:
     host_ref: host-web-01
@@ -257,9 +257,9 @@ func TestControlCommandGlobalDefaultHonorsCLIOverrides(t *testing.T) {
 	directory := t.TempDir()
 	t.Setenv("XOPS_CONFIG_DIR", directory)
 	content := fmt.Sprintf(`schema_version: 2
-control:
-  master: auto
-  path: "%s"
+ssh_options:
+  control_master: auto
+  control_path: "%s"
 nodes:
   web-01:
     host_ref: host-web-01
@@ -415,9 +415,9 @@ func TestControlCommandDisambiguatesMultiPortHostAndDefaultLocalUser(t *testing.
 	directory := t.TempDir()
 	t.Setenv("XOPS_CONFIG_DIR", directory)
 	content := `schema_version: 2
-control:
-  master: auto
-  path: "/tmp/cm-%r@%h-%p.sock"
+ssh_options:
+  control_master: auto
+  control_path: "/tmp/cm-%r@%h-%p.sock"
 nodes:
   root@10.0.0.1:22:
     host_ref: h-22
@@ -493,16 +493,16 @@ nodes:
     host_ref: h-base
     identity_ref: id-root
     sudo_mode: none
-    control:
-      master: auto
-      path: "/tmp/base-%n.sock"
+    ssh_options:
+      control_master: auto
+      control_path: "/tmp/base-%n.sock"
   "test@10.0.0.5:2222":
     host_ref: h-base
     identity_ref: id-test
     sudo_mode: none
-    control:
-      master: auto
-      path: "/tmp/derived-%r@%h-%p.sock"
+    ssh_options:
+      control_master: auto
+      control_path: "/tmp/derived-%r@%h-%p.sock"
 hosts:
   h-base:
     address: 10.0.0.5

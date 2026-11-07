@@ -18,6 +18,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/core/testutil/sshfixture"
+	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/models"
 	cryptoSSH "golang.org/x/crypto/ssh"
@@ -946,5 +947,87 @@ func TestBuildControlProxyClientConfig_NormalizesAndPropagatesJump(t *testing.T)
 	}
 	if sockPath != "/tmp/mux-directopt@10.55.66.77:2288" {
 		t.Fatalf("expected expanded socket path '/tmp/mux-directopt@10.55.66.77:2288', got %q", sockPath)
+	}
+}
+
+func TestDisableSessionControlForParentAndProxySSHOptions(t *testing.T) {
+	cfg := config.NewProviderWithoutOpenSSH(nil).Snapshot()
+	cfg.Hosts.Set("h-zero", models.Host{Address: "10.55.66.77", Port: 0})
+	cfg.Identities.Set("id-empty", models.Identity{User: "", AuthType: "password", Password: "pw"})
+	cfg.Nodes.Set("node-zero", models.Node{HostRef: "h-zero", IdentityRef: "id-empty"})
+	provider := config.NewProviderWithoutOpenSSH(cfg)
+
+	targetCtx := ssh.TargetContext{
+		Host:     "10.55.66.77",
+		Port:     22,
+		User:     "fallbackuser",
+		JumpHost: "openssh:10.55.66.1:22",
+	}
+
+	// Verify buildControlProxyClientConfig forwards Tier 1 -o SSHOptions to adp.GetConfig(nodeID)
+	proxyWithOpts := &SshOptions{
+		JumpHost: "10.55.66.1:22",
+		control: SSHControlFlags{
+			Options: []string{"ConnectTimeout=17", "StrictHostKeyChecking=no"},
+		},
+	}
+	clientCfgWithOpts, _ := buildControlProxyClientConfig(targetCtx, provider, "node-zero", proxyWithOpts)
+	if clientCfgWithOpts == nil || clientCfgWithOpts.Options == nil {
+		t.Fatalf("expected non-nil clientCfg.Options from buildControlProxyClientConfig, got %+v", clientCfgWithOpts)
+	}
+	if clientCfgWithOpts.Options.ConnectTimeout() != 17*time.Second ||
+		clientCfgWithOpts.Options.StrictHostKeyChecking() != ssh.StrictHostKeyCheckingNo {
+		t.Fatalf("expected Tier 1 -o options in proxy clientCfg, got %+v", clientCfgWithOpts.Options)
+	}
+
+	// Verify buildControlProxyClientConfig also resolves Options on the ad-hoc (nodeID == "") fallback branch
+	clientCfgAdHoc, _ := buildControlProxyClientConfig(targetCtx, provider, "", proxyWithOpts)
+	if clientCfgAdHoc == nil || clientCfgAdHoc.Options == nil ||
+		clientCfgAdHoc.Options.ConnectTimeout() != 17*time.Second ||
+		clientCfgAdHoc.Options.StrictHostKeyChecking() != ssh.StrictHostKeyCheckingNo {
+		t.Fatalf("expected Tier 1 -o options in ad-hoc proxy clientCfg, got %+v", clientCfgAdHoc)
+	}
+}
+
+func TestDisableSessionControlForParentPreservesNonMuxOptions(t *testing.T) {
+	cfg := config.NewProviderWithoutOpenSSH(nil).Snapshot()
+	cfg.Hosts.Set("h-zero", models.Host{Address: "10.55.66.77", Port: 0})
+	cfg.Identities.Set("id-empty", models.Identity{User: "", AuthType: "password", Password: "pw"})
+	cfg.Nodes.Set("node-zero", models.Node{HostRef: "h-zero", IdentityRef: "id-empty"})
+
+	// Verify disableSessionControlForParent disables multiplexing while preserving Tier 1 -o SSHOptions
+	tmpCfgDir := t.TempDir()
+	store := config.NewDefaultStore(filepath.Join(tmpCfgDir, "config.yaml"), filepath.Join(tmpCfgDir, "key"))
+	repo, err := config.NewRepositoryWithoutOpenSSH(cfg, store)
+	if err != nil {
+		t.Fatalf("NewRepositoryWithoutOpenSSH failed: %v", err)
+	}
+	parentOpts := NewSshOptions()
+	parentOpts.Remember = "never"
+	parentOpts.control = SSHControlFlags{
+		MasterCount: 1,
+		ControlPath: "/tmp/parent-should-not-bind.sock",
+		Options:     []string{"ConnectTimeout=19", "StrictHostKeyChecking=no"},
+	}
+	adpOpts, err := parentOpts.buildAdapterOptions("node-zero", cfg, repo)
+	if err != nil {
+		t.Fatalf("buildAdapterOptions failed: %v", err)
+	}
+	adpOpts = append(adpOpts, disableSessionControlForParent("node-zero"))
+	adp := adapter.NewSSHAdapter(repo, adpOpts...)
+	if ctrl, ctrlErr := adp.GetControlConfig("node-zero"); ctrlErr != nil || ctrl == nil || ctrl.Path != "none" || ctrl.Master != ssh.ControlMasterNo {
+		t.Fatalf("expected disabled control config (Path=none, Master=no) for -f parent, got ctrl=%+v err=%v", ctrl, ctrlErr)
+	}
+	parentClientCfg, err := adp.GetConfig("node-zero")
+	if err != nil {
+		t.Fatalf("adp.GetConfig(node-zero) failed: %v", err)
+	}
+	if parentClientCfg.Options == nil ||
+		parentClientCfg.Options.ConnectTimeout() != 19*time.Second ||
+		parentClientCfg.Options.StrictHostKeyChecking() != ssh.StrictHostKeyCheckingNo {
+		t.Fatalf("expected non-mux -o options preserved for -f parent, got %+v", parentClientCfg.Options)
+	}
+	if parentClientCfg.Options.ControlPath() != "none" || parentClientCfg.Options.ControlMaster() != ssh.ControlMasterNo {
+		t.Fatalf("expected ControlPath=none and ControlMaster=no in -f parent Options, got %+v", parentClientCfg.Options.ControlConfig())
 	}
 }

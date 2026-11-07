@@ -231,8 +231,8 @@ type Node struct {
 	// 执行环境配置
 	Execution *ssh.ExecutionConfig `yaml:"execution,omitempty" json:"execution,omitempty"`
 
-	// 连接复用配置
-	Control *ssh.ControlConfig `yaml:"control,omitempty" json:"control,omitempty"`
+	// OpenSSH 客户端选项配置（支持连接复用、超时、主机密钥策略、算法与认证控制等）
+	SSHOptions *ssh.Options `yaml:"ssh_options,omitempty" json:"ssh_options,omitempty"`
 
 	// OpenSSHAlias 记录运行时从 ~/.ssh/config 具体 Host 块派生该节点时的源别名（不序列化落盘）
 	OpenSSHAlias string `yaml:"-" json:"-"`

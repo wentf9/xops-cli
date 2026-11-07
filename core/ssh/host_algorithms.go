@@ -5,12 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sync/atomic"
 
 	cryptoSSH "golang.org/x/crypto/ssh"
 )
 
-func (c *Connector) getHostKeyOptions(ctx context.Context, coordinator *handshakeCoordinator, cfg *ClientConfig) (cryptoSSH.HostKeyCallback, []string, error) {
-	callback, err := c.getHostKeyCallback(ctx, coordinator, cfg)
+func (c *Connector) getHostKeyOptions(ctx context.Context, coordinator *handshakeCoordinator, cfg *ClientConfig, hostKeyChanged ...*atomic.Bool) (cryptoSSH.HostKeyCallback, []string, error) {
+	callback, err := c.getHostKeyCallback(ctx, coordinator, cfg, hostKeyChanged...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("get host key callback failed: %w", err)
 	}
@@ -22,14 +23,22 @@ func (c *Connector) getHostKeyOptions(ctx context.Context, coordinator *handshak
 }
 
 func (c *Connector) getHostKeyAlgorithms(ctx context.Context, coordinator *handshakeCoordinator, cfg *ClientConfig) ([]string, error) {
+	var optionAlgos []string
+	if cfg != nil && cfg.Options != nil && cfg.Options.HostKeyAlgorithms() != "" {
+		algos, err := ResolveAlgorithmList(cfg.Options.HostKeyAlgorithms(), cryptoSSH.SupportedAlgorithms().HostKeys)
+		if err != nil {
+			return nil, fmt.Errorf("resolve HostKeyAlgorithms option: %w", err)
+		}
+		optionAlgos = algos
+	}
 	source, ok := c.hostKeyVerifier.(HostKeyAlgorithmSource)
 	if !ok {
-		return nil, nil
-	} // Existing verifiers retain the SSH library defaults.
+		return optionAlgos, nil
+	} // Existing verifiers retain the SSH library defaults (or optionAlgos when specified).
 	if coordinator != nil {
 		ctx = coordinator.Context()
 	}
-	selection, cancel := context.WithTimeout(ctx, c.getHandshakeTimeout())
+	selection, cancel := context.WithTimeout(ctx, c.getNodeHandshakeTimeout(cfg))
 	defer cancel()
 	if err := selection.Err(); err != nil {
 		return nil, err
@@ -49,6 +58,18 @@ func (c *Connector) getHostKeyAlgorithms(ctx context.Context, coordinator *hands
 		if !slices.Contains(cryptoSSH.SupportedAlgorithms().HostKeys, algorithm) {
 			return nil, fmt.Errorf("host key algorithm source returned unsupported algorithm %q", algorithm)
 		}
+	}
+	if len(optionAlgos) > 0 {
+		var intersected []string
+		for _, alg := range optionAlgos {
+			if slices.Contains(algorithms, alg) {
+				intersected = append(intersected, alg)
+			}
+		}
+		if len(intersected) == 0 {
+			return nil, errors.New("no host key algorithms in common between HostKeyAlgorithms option and pinned host key verifier")
+		}
+		return intersected, nil
 	}
 	return slices.Clone(algorithms), nil
 }

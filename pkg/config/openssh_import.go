@@ -93,11 +93,11 @@ func openSSHHostFromConfig(cfg *ssh_config.Config, name, defaultUser string) (Op
 		return OpenSSHHost{}, err
 	}
 
-	ctrl, err := parseOpenSSHControl(cfg, name)
+	sshOpts, err := parseOpenSSHOptions(cfg, name)
 	if err != nil {
 		return OpenSSHHost{}, err
 	}
-	ctrl = normalizeImportedControl(ctrl)
+	sshOpts = normalizeImportedSSHOptions(sshOpts)
 
 	return OpenSSHHost{
 		Name: name,
@@ -111,45 +111,56 @@ func openSSHHostFromConfig(cfg *ssh_config.Config, name, defaultUser string) (Op
 			KeyPath:  expandedKeyPath,
 		},
 		Node: models.Node{
-			Alias:     []string{name},
-			Tags:      []string{"openssh"},
-			ProxyJump: proxyJump,
-			SudoMode:  models.SudoModeAuto,
-			Control:   ctrl,
+			Alias:      []string{name},
+			Tags:       []string{"openssh"},
+			ProxyJump:  proxyJump,
+			SudoMode:   models.SudoModeAuto,
+			SSHOptions: sshOpts,
 		},
 	}, nil
 }
 
-// normalizeImportedControl makes an imported ControlConfig valid under the
+// normalizeImportedSSHOptions makes imported ssh.Options valid under the
 // persisted schema rules without weakening them. OpenSSH inherits ControlPersist
 // independently of ControlMaster, so a host that resolved to ControlMaster=no
 // can carry a ControlPersist it never asked for; that combination is contradictory
 // once materialized, and the master mode wins.
-func normalizeImportedControl(ctrl *ssh.ControlConfig) *ssh.ControlConfig {
-	if ctrl == nil {
+func normalizeImportedSSHOptions(opts *ssh.Options) *ssh.Options {
+	if opts == nil || opts.IsEmpty() {
 		return nil
 	}
-	if ctrl.Path == "" {
+	// Only import mux and transport options into persisted node configurations;
+	// never persist trust or auth-policy options from ~/.ssh/config into nodes.
+	cloned := opts.FilterByClasses(ssh.OptionClassMux, ssh.OptionClassTransport)
+	if cloned == nil || cloned.IsEmpty() {
+		return nil
+	}
+	pathVal := cloned.ControlPath()
+	masterMode := cloned.ControlMaster()
+	persistVal := cloned.ControlPersist()
+
+	if pathVal == "" {
 		// An OpenSSH host with ControlMaster or ControlPersist but no ControlPath
-		// cannot form a standalone node ControlConfig without failing schema
+		// cannot form a standalone node multiplexing config without failing schema
 		// validation when no global ControlPath is set.
+		cloned.Delete(ssh.OptionControlMaster)
+		cloned.Delete(ssh.OptionControlPersist)
+	} else {
+		if masterMode == ssh.ControlMasterNo && persistVal != "" {
+			enabled, _, _, err := ssh.ParseControlPersist(persistVal)
+			if err != nil || enabled {
+				cloned.Delete(ssh.OptionControlPersist)
+			}
+		}
+		if pathVal == "none" {
+			_ = cloned.Set(ssh.OptionControlMaster, string(ssh.ControlMasterNo))
+			cloned.Delete(ssh.OptionControlPersist)
+		}
+	}
+	if cloned.IsEmpty() {
 		return nil
 	}
-	if ctrl.Master == ssh.ControlMasterNo && ctrl.Persist != "" {
-		if _, _, _, err := ssh.ParseControlPersist(ctrl.Persist); err != nil {
-			ctrl.Persist = ""
-			return ctrl
-		}
-		enabled, _, _, _ := ssh.ParseControlPersist(ctrl.Persist)
-		if enabled {
-			ctrl.Persist = ""
-		}
-	}
-	if ctrl.Path == "none" {
-		ctrl.Master = ssh.ControlMasterNo
-		ctrl.Persist = ""
-	}
-	return ctrl
+	return cloned
 }
 
 func openSSHValue(cfg *ssh_config.Config, host, key, fallback string) (string, error) {

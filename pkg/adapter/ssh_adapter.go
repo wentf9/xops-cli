@@ -29,42 +29,96 @@ type SessionAuth struct {
 	Remember   bool
 }
 
-// SessionControlOptions specifies session-level multiplexing overrides (Tier 1).
-// Pointers indicate whether a flag was explicitly specified on the CLI.
+// SessionControlOptions specifies session-level OpenSSH option overrides (Tier 1).
+// Pointers indicate whether a multiplexing flag was explicitly specified on the CLI.
 type SessionControlOptions struct {
 	Master  *ssh.ControlMasterMode
 	Path    *string
 	Persist *string
+	Options *ssh.Options
 }
 
-// IsEmpty returns true if no session control flags were provided.
+// IsEmpty returns true if no session control or SSH option flags were provided.
 func (s SessionControlOptions) IsEmpty() bool {
-	return s.Master == nil && s.Path == nil && s.Persist == nil
+	return s.Master == nil && s.Path == nil && s.Persist == nil && s.Options.IsEmpty()
+}
+
+func (s *SessionControlOptions) ensureOptions() *ssh.Options {
+	if s.Options == nil {
+		s.Options = &ssh.Options{}
+	}
+	return s.Options
 }
 
 // SetMaster sets the ControlMaster override.
 func (s *SessionControlOptions) SetMaster(m ssh.ControlMasterMode) {
+	if m == "" {
+		s.Master = nil
+		if s.Options != nil {
+			s.Options.Delete(ssh.OptionControlMaster)
+		}
+		return
+	}
 	s.Master = &m
+	s.ensureOptions().SetControlMaster(m)
 }
 
 // SetPath sets the ControlPath override.
 func (s *SessionControlOptions) SetPath(p string) {
+	if p == "" {
+		s.Path = nil
+		if s.Options != nil {
+			s.Options.Delete(ssh.OptionControlPath)
+		}
+		return
+	}
 	s.Path = &p
+	s.ensureOptions().SetControlPath(p)
 }
 
 // SetPersist sets the ControlPersist override.
 func (s *SessionControlOptions) SetPersist(p string) {
+	if p == "" {
+		s.Persist = nil
+		if s.Options != nil {
+			s.Options.Delete(ssh.OptionControlPersist)
+		}
+		return
+	}
 	s.Persist = &p
+	s.ensureOptions().SetControlPersist(p)
 }
 
-// supportedSSHOptions lists the -o keys this CLI understands. Unknown keys are
-// rejected instead of ignored so a typo cannot silently disable the requested
-// behavior.
-var supportedSSHOptions = []string{
-	"controlmaster", "controlpath", "controlpersist", "port", "user", "identityfile", "proxyjump",
+// ToSSHOptions returns the session-level ssh.Options representation (including Master/Path/Persist fields).
+func (s SessionControlOptions) ToSSHOptions() *ssh.Options {
+	opts := s.Options.Clone()
+	if s.Master != nil && *s.Master != "" {
+		if opts == nil {
+			opts = &ssh.Options{}
+		}
+		opts.SetControlMaster(*s.Master)
+	}
+	if s.Path != nil && *s.Path != "" {
+		if opts == nil {
+			opts = &ssh.Options{}
+		}
+		opts.SetControlPath(*s.Path)
+	}
+	if s.Persist != nil && *s.Persist != "" {
+		if opts == nil {
+			opts = &ssh.Options{}
+		}
+		opts.SetControlPersist(*s.Persist)
+	}
+	if opts.IsEmpty() {
+		return nil
+	}
+	return opts
 }
 
 // ParseOptionStrings parses OpenSSH -o Key=Value strings into SessionControlOptions.
+// Unknown keys are rejected instead of ignored so a typo cannot silently disable
+// the requested behavior.
 func ParseOptionStrings(options []string) (SessionControlOptions, error) {
 	var opts SessionControlOptions
 	for _, opt := range options {
@@ -78,33 +132,62 @@ func ParseOptionStrings(options []string) (SessionControlOptions, error) {
 		}
 		key = strings.TrimSpace(key)
 		val = strings.TrimSpace(val)
-
-		switch strings.ToLower(key) {
-		case "controlmaster":
-			m, err := ssh.ParseControlMasterMode(val)
-			if err != nil {
-				return opts, fmt.Errorf("invalid ControlMaster in -o option: %w", err)
-			}
-			opts.SetMaster(m)
-		case "controlpath":
-			opts.SetPath(val)
-		case "controlpersist":
-			if _, _, _, err := ssh.ParseControlPersist(val); err != nil {
-				return opts, fmt.Errorf("invalid ControlPersist in -o option: %w", err)
-			}
-			opts.SetPersist(val)
-		case "port":
-			p, err := strconv.ParseUint(val, 10, 16)
-			if err != nil || p == 0 {
-				return opts, fmt.Errorf("invalid Port in -o option: %q", val)
-			}
-		case "user", "identityfile", "proxyjump":
-			// Applied to the connection target by the CLI, see ApplyGeneralOptions.
-		default:
-			return opts, fmt.Errorf("unsupported -o option %q (supported: %s)", key, strings.Join(supportedSSHOptions, ", "))
+		if key == "" {
+			return opts, fmt.Errorf("invalid -o option format (expected Key=Value): %q", opt)
+		}
+		if err := applyParsedOption(&opts, key, val); err != nil {
+			return opts, err
 		}
 	}
 	return opts, nil
+}
+
+func applyParsedOption(opts *SessionControlOptions, key, val string) error {
+	switch strings.ToLower(key) {
+	case "controlmaster", "control_master":
+		m, err := ssh.ParseControlMasterMode(val)
+		if err != nil {
+			return fmt.Errorf("invalid ControlMaster in -o option: %w", err)
+		}
+		opts.SetMaster(m)
+	case "controlpath", "control_path":
+		if val == "" {
+			return fmt.Errorf("invalid ControlPath in -o option: value cannot be empty")
+		}
+		if strings.EqualFold(val, "none") {
+			val = "none"
+		} else if err := ssh.ValidateControlPathSyntax(val); err != nil {
+			return fmt.Errorf("invalid ControlPath in -o option: %w", err)
+		}
+		opts.SetPath(val)
+	case "controlpersist", "control_persist":
+		if _, _, _, err := ssh.ParseControlPersist(val); err != nil {
+			return fmt.Errorf("invalid ControlPersist in -o option: %w", err)
+		}
+		opts.SetPersist(strings.ToLower(val))
+	case "port":
+		p, err := strconv.ParseUint(val, 10, 16)
+		if err != nil || p == 0 {
+			return fmt.Errorf("invalid Port in -o option: %q", val)
+		}
+	case "user", "identityfile", "proxyjump":
+		if val == "" {
+			return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
+		}
+		// Applied to the connection target by the CLI, see ApplyGeneralOptions.
+	default:
+		spec, supported := ssh.LookupOptionSpec(key)
+		if !supported {
+			return fmt.Errorf("unsupported -o option %q", key)
+		}
+		if val == "" {
+			return fmt.Errorf("invalid %s in -o option: value cannot be empty", spec.OpenSSHName)
+		}
+		if err := opts.ensureOptions().Set(spec.CanonicalKey, val); err != nil {
+			return fmt.Errorf("invalid %s in -o option: %w", spec.OpenSSHName, err)
+		}
+	}
+	return nil
 }
 
 // CredentialResolver 描述能够根据 Ref 解析 Secret 的契约（如 *credential.Registry）
@@ -156,6 +239,32 @@ func WithGlobalSessionControl(opts SessionControlOptions) Option {
 	}
 }
 
+// DisableSessionControlSharing forces ControlPath=none for the session (both
+// globally and on nodeID) while preserving any non-multiplexing session SSH
+// options already registered for nodeID or globally.
+func (a *SSHAdapter) DisableSessionControlSharing(nodeID string) {
+	disable := func(s SessionControlOptions) SessionControlOptions {
+		var out SessionControlOptions
+		if s.Options != nil {
+			out.Options = s.Options.Clone()
+			out.Options.StripClasses(ssh.OptionClassMux)
+		}
+		out.SetPath("none")
+		return out
+	}
+	if a.globalSessionControl != nil {
+		updated := disable(*a.globalSessionControl)
+		a.globalSessionControl = &updated
+	} else {
+		updated := disable(SessionControlOptions{})
+		a.globalSessionControl = &updated
+	}
+	if a.sessionControlOverrides == nil {
+		a.sessionControlOverrides = make(map[string]SessionControlOptions)
+	}
+	a.sessionControlOverrides[nodeID] = disable(a.sessionControlOverrides[nodeID])
+}
+
 // WithOpenSSHParser injects an explicit OpenSSHParser for Tier 4 resolution (e.g. in tests).
 func WithOpenSSHParser(parser *config.OpenSSHParser) Option {
 	return func(a *SSHAdapter) {
@@ -195,6 +304,16 @@ func WithControlMultiplexing(enabled bool) Option {
 	}
 }
 
+// WithHostTrustOverrides controls whether this adapter forwards trust-class
+// SSH options (StrictHostKeyChecking, UserKnownHostsFile) from configuration
+// or session overrides to the underlying ssh.Connector. MCP and verification
+// paths disable it to enforce fail-closed host key verification.
+func WithHostTrustOverrides(enabled bool) Option {
+	return func(a *SSHAdapter) {
+		a.disableHostTrust = !enabled
+	}
+}
+
 // SSHAdapter 实现 ssh.ConnectionProvider, ssh.SecretResolver, ssh.CredentialRecorder 接口，作为业务模型与底层 SSH 的防腐层
 type SSHAdapter struct {
 	cfgProvider             config.ConfigProvider
@@ -207,6 +326,7 @@ type SSHAdapter struct {
 	openSSHParser           *config.OpenSSHParser
 	nonInteractive          bool
 	disableControl          bool
+	disableHostTrust        bool
 	credentialRecording     bool
 	rememberConfirmation    func(context.Context, string) (bool, error)
 	enrollmentProbe         bool
@@ -327,6 +447,64 @@ func (a *SSHAdapter) GetControlConfig(nodeID string) (*ssh.ControlConfig, error)
 	return a.ResolveControl(nodeID, sessionOpts)
 }
 
+// ResolveSSHOptions resolves the effective ssh.Options for nodeName given session options,
+// enforcing the 4-tier precedence hierarchy (Tier 1 CLI > Tier 2 Node > Tier 3 Global > Tier 4 ~/.ssh/config).
+func (a *SSHAdapter) ResolveSSHOptions(nodeName string, sessionOpts SessionControlOptions) (*ssh.Options, error) {
+	if a.cfgProvider == nil {
+		return nil, fmt.Errorf("configuration provider is nil")
+	}
+
+	t2Opts, t3Opts, t4Opts := a.resolveOptionTiers(nodeName)
+	merged, err := ssh.EffectiveOptions(sessionOpts.ToSSHOptions(), t2Opts, t3Opts, t4Opts)
+	if err != nil {
+		return nil, err
+	}
+	if merged.IsEmpty() {
+		return nil, nil
+	}
+	// Multiplexing options are governed and validated by ResolveControl / GetControlConfig;
+	// strip control fields when control multiplexing is disabled on this adapter.
+	if a.disableControl {
+		merged.StripClasses(ssh.OptionClassMux)
+	}
+	if a.disableHostTrust {
+		merged.StripClasses(ssh.OptionClassTrust)
+	}
+	if merged.IsEmpty() {
+		return nil, nil
+	}
+	return merged, nil
+}
+
+func (a *SSHAdapter) resolveOptionTiers(nodeName string) (tier2Node, tier3Global, tier4OpenSSH *ssh.Options) {
+	snapshot, snapErr := a.cfgProvider.ResolveConnection(nodeName)
+	virtualOpenSSHNode := strings.HasPrefix(nodeName, config.OpenSSHNodePrefix)
+	if snapErr == nil {
+		if !virtualOpenSSHNode {
+			tier2Node = snapshot.Node.SSHOptions
+		}
+	}
+
+	if globalCfg := a.cfgProvider.Snapshot(); globalCfg != nil {
+		tier3Global = globalCfg.SSHOptions
+	}
+
+	if virtualOpenSSHNode {
+		if snapErr == nil {
+			tier4OpenSSH = snapshot.Node.SSHOptions.Clone()
+		}
+	} else {
+		tier4OpenSSH = a.resolveTier4OpenSSHOptions(nodeName, snapErr, snapshot).FilterByClasses(
+			ssh.OptionClassMux,
+			ssh.OptionClassTransport,
+		)
+	}
+	if tier4OpenSSH != nil && tier4OpenSSH.ControlConfig() != nil {
+		tier4OpenSSH.ImplicitTier4 = true
+	}
+	return tier2Node, tier3Global, tier4OpenSSH
+}
+
 // ResolveControl resolves the effective ControlConfig for nodeID given session options,
 // strictly enforcing the 4-tier precedence hierarchy and field-by-field merging semantics.
 func (a *SSHAdapter) ResolveControl(nodeName string, sessionOpts SessionControlOptions) (*ssh.ControlConfig, error) {
@@ -337,35 +515,10 @@ func (a *SSHAdapter) ResolveControl(nodeName string, sessionOpts SessionControlO
 		return nil, fmt.Errorf("configuration provider is nil")
 	}
 
-	// 1. Resolve Tier 2 (Node Config) and target context. OpenSSH virtual nodes
-	// carry their ~/.ssh/config values in Node.Control, but they remain Tier 4:
-	// they must not outrank the persisted global defaults.
-	var tier2NodeCtrl *ssh.ControlConfig
-	snapshot, snapErr := a.cfgProvider.ResolveConnection(nodeName)
-	virtualOpenSSHNode := strings.HasPrefix(nodeName, config.OpenSSHNodePrefix)
-	if snapErr == nil {
-		if virtualOpenSSHNode {
-			tier2NodeCtrl = nil
-		} else {
-			tier2NodeCtrl = snapshot.Node.Control
-		}
-	}
-
-	// 2. Resolve Tier 3 (Global Defaults)
-	var tier3GlobalCtrl *ssh.ControlConfig
-	if globalCfg := a.cfgProvider.Snapshot(); globalCfg != nil {
-		tier3GlobalCtrl = globalCfg.Control
-	}
-
-	// 3. Resolve Tier 4 (OpenSSH Config Fallback)
-	var tier4OpenSSHCtrl *ssh.ControlConfig
-	if virtualOpenSSHNode {
-		if snapErr == nil {
-			tier4OpenSSHCtrl = snapshot.Node.Control
-		}
-	} else {
-		tier4OpenSSHCtrl = a.resolveTier4OpenSSH(nodeName, snapErr, snapshot)
-	}
+	t2Opts, t3Opts, t4Opts := a.resolveOptionTiers(nodeName)
+	tier2NodeCtrl := t2Opts.ControlConfig()
+	tier3GlobalCtrl := t3Opts.ControlConfig()
+	tier4OpenSSHCtrl := t4Opts.ControlConfig()
 
 	// 4. Field-by-field merging: Tier 1 > Tier 2 > Tier 3 > Tier 4
 	merged := mergeControlFields(sessionOpts, tier2NodeCtrl, tier3GlobalCtrl, tier4OpenSSHCtrl)
@@ -381,7 +534,7 @@ func (a *SSHAdapter) ResolveControl(nodeName string, sessionOpts SessionControlO
 	return merged, nil
 }
 
-func (a *SSHAdapter) resolveTier4OpenSSH(nodeName string, snapErr error, snapshot config.ConnectionSnapshot) *ssh.ControlConfig {
+func (a *SSHAdapter) resolveTier4OpenSSHOptions(nodeName string, snapErr error, snapshot config.ConnectionSnapshot) *ssh.Options {
 	if strings.HasPrefix(nodeName, config.OpenSSHNodePrefix) {
 		return nil
 	}
@@ -393,21 +546,23 @@ func (a *SSHAdapter) resolveTier4OpenSSH(nodeName string, snapErr error, snapsho
 
 	// 1. First pass: prioritize concrete host matches (defined without wildcards like Host *)
 	// across OpenSSHAlias, nodeName, Host.Address, and Alias so specific definitions take precedence.
+	var layers []*ssh.Options
 	for _, key := range lookupKeys {
 		if parser.HasHost(key) {
-			if ctrl, err := parser.GetControlConfig(key); err == nil && ctrl != nil {
-				return ctrl
+			if opts, err := parser.GetSSHOptions(key); err == nil && !opts.IsEmpty() {
+				layers = append(layers, opts)
 			}
 		}
 	}
-
-	// 2. Second pass: fallback to generic wildcard / pattern matches (e.g. Host *).
-	for _, key := range lookupKeys {
-		if ctrl, err := parser.GetControlConfig(key); err == nil && ctrl != nil {
-			return ctrl
+	if len(layers) == 0 {
+		// 2. Second pass: fallback to generic wildcard / pattern matches (e.g. Host *).
+		for _, key := range lookupKeys {
+			if opts, err := parser.GetSSHOptions(key); err == nil && !opts.IsEmpty() {
+				layers = append(layers, opts)
+			}
 		}
 	}
-	return nil
+	return ssh.MergeOptionLayers(layers...)
 }
 
 func (a *SSHAdapter) buildTier4OpenSSHLookupKeys(parser *config.OpenSSHParser, nodeName string, snapErr error, snapshot config.ConnectionSnapshot) []string {
@@ -528,6 +683,9 @@ func resolveMergedMaster(t1 SessionControlOptions, t2, t3, t4 *ssh.ControlConfig
 	if t1.Master != nil && *t1.Master != "" {
 		return *t1.Master
 	}
+	if t1.Options != nil && t1.Options.ControlMaster() != "" {
+		return t1.Options.ControlMaster()
+	}
 	if t2 != nil && t2.Master != "" {
 		return t2.Master
 	}
@@ -544,6 +702,9 @@ func resolveMergedPath(t1 SessionControlOptions, t2, t3, t4 *ssh.ControlConfig) 
 	if t1.Path != nil {
 		return *t1.Path
 	}
+	if t1.Options != nil && t1.Options.ControlPath() != "" {
+		return t1.Options.ControlPath()
+	}
 	if t2 != nil && t2.Path != "" {
 		return t2.Path
 	}
@@ -559,6 +720,9 @@ func resolveMergedPath(t1 SessionControlOptions, t2, t3, t4 *ssh.ControlConfig) 
 func resolveMergedPersist(t1 SessionControlOptions, t2, t3, t4 *ssh.ControlConfig) string {
 	if t1.Persist != nil {
 		return *t1.Persist
+	}
+	if t1.Options != nil && t1.Options.ControlPersist() != "" {
+		return t1.Options.ControlPersist()
 	}
 	if t2 != nil && t2.Persist != "" {
 		return t2.Persist
@@ -594,6 +758,7 @@ func mergeControlFields(
 	}
 
 	hasExplicitPersist := (t1.Persist != nil && *t1.Persist != "") ||
+		(t1.Options != nil && t1.Options.ControlPersist() != "") ||
 		(t2 != nil && t2.Persist != "") ||
 		(t3 != nil && t3.Persist != "")
 
@@ -684,6 +849,12 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 		return nil, fmt.Errorf("resolve execution for node %q failed: %w", nodeID, err)
 	}
 
+	sessionCtrlOpts, _ := a.getSessionControlOverride(nodeID)
+	sshOpts, err := a.ResolveSSHOptions(nodeID, sessionCtrlOpts)
+	if err != nil {
+		return nil, fmt.Errorf("resolve ssh options for node %q failed: %w", nodeID, err)
+	}
+
 	cfg := &ssh.ClientConfig{
 		NodeID:                nodeID,
 		Address:               snapshot.Host.Address,
@@ -702,6 +873,7 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 		HasOriginalProxyJump:  true,
 		PasswordPromptPattern: snapshot.Node.PasswordPromptPattern,
 		Execution:             execCfg,
+		Options:               sshOpts,
 	}
 
 	if override, ok := a.getSessionOverride(nodeID); ok {
@@ -750,10 +922,22 @@ func (a *SSHAdapter) applySessionOverrideToConfig(nodeID string, cfg *ssh.Client
 	return nil
 }
 
+func (a *SSHAdapter) isNonInteractiveForNode(nodeID string) bool {
+	if a.nonInteractive {
+		return true
+	}
+	if a.cfgProvider == nil {
+		return false
+	}
+	sessionCtrlOpts, _ := a.getSessionControlOverride(nodeID)
+	opts, err := a.ResolveSSHOptions(nodeID, sessionCtrlOpts)
+	return err == nil && opts != nil && opts.BatchMode()
+}
+
 // UpdateAuth 处理密码或私钥密码的回写并返回本次提交后的新认证令牌
 func (a *SSHAdapter) UpdateAuth(ctx context.Context, nodeID, authUpdateToken, password, keyPath, passphrase string) (string, error) {
-	if a.nonInteractive {
-		// 非交互模式禁止写回自动发现的秘密
+	if a.isNonInteractiveForNode(nodeID) {
+		// 非交互模式或 BatchMode=yes 禁止写回自动发现的秘密
 		return authUpdateToken, nil
 	}
 	if !a.credentialRecording {
@@ -844,8 +1028,8 @@ func (a *SSHAdapter) defaultStoreID() string {
 
 // UpdateSudo 处理提权密码和模式的回写并返回本次提交后的新提权令牌
 func (a *SSHAdapter) UpdateSudo(ctx context.Context, nodeID, sudoUpdateToken string, mode ssh.SudoMode, suPwd string) (string, error) {
-	if a.nonInteractive {
-		// 非交互模式禁止写回自动发现的秘密
+	if a.isNonInteractiveForNode(nodeID) {
+		// 非交互模式或 BatchMode=yes 禁止写回自动发现的秘密
 		return sudoUpdateToken, nil
 	}
 	if !a.credentialRecording {
@@ -922,7 +1106,7 @@ func (a *SSHAdapter) ResolveSecret(ctx context.Context, req ssh.SecretRequest) (
 	if ctx == nil {
 		return nil, fmt.Errorf("secret resolution context is nil")
 	}
-	if a.nonInteractive {
+	if a.isNonInteractiveForNode(req.NodeID) {
 		ctx = credential.WithoutInteraction(ctx)
 	}
 	if ctx != nil {
@@ -1025,7 +1209,7 @@ func (a *SSHAdapter) resolveOTP(
 			Prompt:         promptText,
 			Instruction:    req.Instruction,
 			Echo:           req.Echo,
-			NonInteractive: a.nonInteractive || credential.InteractionDisabled(ctx),
+			NonInteractive: a.isNonInteractiveForNode(req.NodeID) || credential.InteractionDisabled(ctx),
 		}
 		ans, err := credentialhelper.RunAnswerCommand(ctx, opts)
 		if err != nil {
@@ -1150,7 +1334,7 @@ func (a *SSHAdapter) resolveChallengeRuleAnswer(
 			Prompt:         req.Prompt,
 			Instruction:    req.Instruction,
 			Echo:           req.Echo,
-			NonInteractive: a.nonInteractive || credential.InteractionDisabled(ctx),
+			NonInteractive: a.isNonInteractiveForNode(req.NodeID) || credential.InteractionDisabled(ctx),
 		}
 		ans, err := credentialhelper.RunAnswerCommand(ctx, opts)
 		if err != nil {

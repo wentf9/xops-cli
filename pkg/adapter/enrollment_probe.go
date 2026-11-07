@@ -42,7 +42,7 @@ func (a *SSHAdapter) ConfirmAuthenticatedConnection(ctx context.Context, nodeID 
 	repo, ok := a.cfgProvider.(enrollmentProbeRepository)
 	auth, remembering := a.getSessionOverride(nodeID)
 	_, excluded := a.enrollmentProbeExcluded[nodeID]
-	if !ok || !a.enrollmentProbe || excluded || a.nonInteractive || !a.credentialRecording || !remembering || !auth.Remember {
+	if !ok || !a.enrollmentProbe || excluded || a.isNonInteractiveForNode(nodeID) || !a.credentialRecording || !remembering || !auth.Remember {
 		return nil, a.ConfirmConnection(ctx, nodeID)
 	}
 	nodeExecution, pending := repo.PendingNodeExecution(nodeID)

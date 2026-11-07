@@ -73,6 +73,10 @@ func TestOptionFlagParsing(t *testing.T) {
 			"ControlMaster=auto",
 			"ControlPath=/tmp/opt.sock",
 			"ControlPersist=10m",
+			"ConnectTimeout=15",
+			"StrictHostKeyChecking=no",
+			"ServerAliveInterval=20s",
+			"TCPKeepAlive=no",
 		},
 	}
 	sessionOpts, err := flags.ToSessionControlOptions()
@@ -87,6 +91,11 @@ func TestOptionFlagParsing(t *testing.T) {
 	}
 	if sessionOpts.Persist == nil || *sessionOpts.Persist != "10m" {
 		t.Fatalf("expected Persist 10m, got %v", sessionOpts.Persist)
+	}
+	eff := sessionOpts.ToSSHOptions()
+	tcpKA, tcpKASet := eff.TCPKeepAlive()
+	if eff.ConnectTimeout() != 15*time.Second || eff.StrictHostKeyChecking() != ssh.StrictHostKeyCheckingNo || eff.ServerAliveInterval() != 20*time.Second || !tcpKASet || tcpKA {
+		t.Fatalf("unexpected effective options from -o flags: %+v", eff)
 	}
 
 	// Invalid format

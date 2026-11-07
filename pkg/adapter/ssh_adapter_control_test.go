@@ -21,7 +21,7 @@ func setupTestProvider(
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
 		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
 		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
-		Control:    globalCtrl,
+		SSHOptions: ssh.OptionsFromControl(globalCtrl),
 	}
 
 	cfg.Hosts.Set("host1", models.Host{Address: "192.168.1.100", Port: 2222})
@@ -30,7 +30,7 @@ func setupTestProvider(
 		HostRef:     "host1",
 		IdentityRef: "id1",
 		Alias:       []string{"node-alias"},
-		Control:     nodeCtrl,
+		SSHOptions:  ssh.OptionsFromControl(nodeCtrl),
 	})
 
 	var parser *config.OpenSSHParser
@@ -682,7 +682,7 @@ Host app1
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
 		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
 		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
-		Control:    &ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: "/tmp/global.sock", Persist: "10m"},
+		SSHOptions: ssh.OptionsFromControl(&ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: "/tmp/global.sock", Persist: "10m"}),
 	}
 	provider := config.NewProviderWithOpenSSHParser(cfg, parser)
 	adp := NewSSHAdapter(provider)
@@ -728,7 +728,7 @@ Host app2
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
 		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
 		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
-		Control:    &ssh.ControlConfig{Master: ssh.ControlMasterAuto},
+		SSHOptions: ssh.OptionsFromControl(&ssh.ControlConfig{Master: ssh.ControlMasterAuto}),
 	}
 	provider := config.NewProviderWithOpenSSHParser(cfg, parser)
 	adp := NewSSHAdapter(provider)
@@ -737,8 +737,8 @@ Host app2
 	if err != nil {
 		t.Fatalf("Resolve failed: %v", err)
 	}
-	if node.Control == nil || node.Control.Master != "" {
-		t.Fatalf("expected an unset ControlMaster for a host that omits it, got %+v", node.Control)
+	if node.SSHOptions == nil || node.SSHOptions.ControlMaster() != "" {
+		t.Fatalf("expected an unset ControlMaster for a host that omits it, got %+v", node.SSHOptions)
 	}
 
 	res, err := adp.ResolveControl(config.OpenSSHNodePrefix+"app2", SessionControlOptions{})
@@ -759,7 +759,7 @@ func TestParseOptionStrings_RejectsUnknownKey(t *testing.T) {
 	for _, option := range []string{
 		"ControlMaste=yes",
 		"EnableMultiplexing=true",
-		"Compression=yes",
+		"UnknownSSHDirective=yes",
 	} {
 		if _, err := ParseOptionStrings([]string{option}); err == nil {
 			t.Fatalf("expected %q to be rejected", option)
@@ -768,12 +768,166 @@ func TestParseOptionStrings_RejectsUnknownKey(t *testing.T) {
 		}
 	}
 
-	// Supported keys still parse, including the ones applied to the target by the CLI.
-	opts, err := ParseOptionStrings([]string{"ControlMaster=auto", "ControlPath=/tmp/x.sock", "Port=2222", "User=deploy", "IdentityFile=~/.ssh/id", "ProxyJump=bastion"})
+	// Supported keys parse cleanly, including target overrides and extended OpenSSH options.
+	opts, err := ParseOptionStrings([]string{
+		"ControlMaster=auto",
+		"ControlPath=/tmp/x.sock",
+		"Port=2222",
+		"User=deploy",
+		"IdentityFile=~/.ssh/id",
+		"ProxyJump=bastion",
+		"ConnectTimeout=12",
+		"StrictHostKeyChecking=accept-new",
+		"BatchMode=yes",
+		"TCPKeepAlive=no",
+		"PreferredAuthentications=publickey,password",
+	})
 	if err != nil {
 		t.Fatalf("expected supported options to parse: %v", err)
 	}
 	if opts.Master == nil || *opts.Master != ssh.ControlMasterAuto {
 		t.Fatalf("expected ControlMaster=auto, got %v", opts.Master)
+	}
+	sshOpts := opts.ToSSHOptions()
+	tcpKeepAlive, tcpKeepAliveSet := sshOpts.TCPKeepAlive()
+	if sshOpts == nil || sshOpts.StrictHostKeyChecking() != ssh.StrictHostKeyCheckingAcceptNew || !sshOpts.BatchMode() || !tcpKeepAliveSet || tcpKeepAlive {
+		t.Fatalf("unexpected parsed ssh.Options: %+v", sshOpts)
+	}
+}
+
+func TestResolveSSHOptions_FourTierPrecedenceAndGetConfig(t *testing.T) {
+	openSSHContent := `
+Host testnode
+    ConnectTimeout 30
+    StrictHostKeyChecking no
+    PasswordAuthentication no
+    ServerAliveInterval 60
+`
+	parser, err := config.NewOpenSSHParserFromReader(strings.NewReader(openSSHContent))
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	cfg := &config.Configuration{
+		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
+		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
+		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
+		SSHOptions: ssh.MustOptions(
+			ssh.OptionConnectTimeout, "20s",
+			ssh.OptionStrictHostKeyChecking, "accept-new",
+		),
+	}
+	cfg.Hosts.Set("host1", models.Host{Address: "192.168.1.100", Port: 2222})
+	cfg.Identities.Set("id1", models.Identity{User: "alice", AuthType: "auto"})
+	cfg.Nodes.Set("testnode", models.Node{
+		HostRef:     "host1",
+		IdentityRef: "id1",
+		SSHOptions: ssh.MustOptions(
+			ssh.OptionConnectTimeout, "10s",
+			ssh.OptionIdentitiesOnly, "yes",
+		),
+	})
+
+	provider := config.NewProviderWithOpenSSHParser(cfg, parser)
+	cliOpts, err := ParseOptionStrings([]string{"ConnectTimeout=5", "BatchMode=yes"})
+	if err != nil {
+		t.Fatalf("ParseOptionStrings failed: %v", err)
+	}
+	adp := NewSSHAdapter(provider, WithSessionControlOverride("testnode", cliOpts))
+
+	clientCfg, err := adp.GetConfig("testnode")
+	if err != nil {
+		t.Fatalf("GetConfig failed: %v", err)
+	}
+	if clientCfg.Options == nil {
+		t.Fatal("expected clientCfg.Options to be populated")
+	}
+	// Tier 1 wins for ConnectTimeout and BatchMode
+	if clientCfg.Options.Get(ssh.OptionConnectTimeout) != "5" || !clientCfg.Options.BatchMode() {
+		t.Fatalf("expected Tier 1 ConnectTimeout=5 and BatchMode=yes, got %+v", clientCfg.Options)
+	}
+	// Tier 2 wins for IdentitiesOnly
+	if !clientCfg.Options.IdentitiesOnly() {
+		t.Fatalf("expected Tier 2 IdentitiesOnly=yes, got %+v", clientCfg.Options)
+	}
+	// Tier 3 provides StrictHostKeyChecking (Tier 4 trust options are never inherited)
+	if clientCfg.Options.StrictHostKeyChecking() != ssh.StrictHostKeyCheckingAcceptNew {
+		t.Fatalf("expected Tier 3 StrictHostKeyChecking=accept-new, got %q", clientCfg.Options.StrictHostKeyChecking())
+	}
+	// Tier 4 provides ServerAliveInterval (transport class), but NOT PasswordAuthentication=no (auth class) on managed nodes
+	if clientCfg.Options.Get(ssh.OptionServerAliveInterval) != "60" {
+		t.Fatalf("expected Tier 4 ServerAliveInterval=60, got %q", clientCfg.Options.Get(ssh.OptionServerAliveInterval))
+	}
+	if _, set := clientCfg.Options.PasswordAuthentication(); set {
+		t.Fatalf("expected managed node not to inherit Tier 4 PasswordAuthentication=no")
+	}
+
+	// H1 (MCP isolation): WithHostTrustOverrides(false) strips StrictHostKeyChecking and UserKnownHostsFile
+	mcpAdp := NewSSHAdapter(provider, WithHostTrustOverrides(false), WithControlMultiplexing(false))
+	mcpCfg, err := mcpAdp.GetConfig("testnode")
+	if err != nil {
+		t.Fatalf("mcpAdp.GetConfig failed: %v", err)
+	}
+	if mcpCfg.Options != nil && mcpCfg.Options.StrictHostKeyChecking() != "" {
+		t.Fatalf("expected WithHostTrustOverrides(false) to strip StrictHostKeyChecking, got %q", mcpCfg.Options.StrictHostKeyChecking())
+	}
+}
+
+func TestResolveTier4OpenSSHOptions_MergesAcrossConcreteLookupKeys(t *testing.T) {
+	openSSHContent := `
+Host testnode
+    ConnectTimeout 15
+
+Host 192.168.1.100
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%C
+`
+	parser, err := config.NewOpenSSHParserFromReader(strings.NewReader(openSSHContent))
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	cfg := &config.Configuration{
+		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
+		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
+		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
+	}
+	cfg.Hosts.Set("host1", models.Host{Address: "192.168.1.100", Port: 22})
+	cfg.Identities.Set("id1", models.Identity{User: "alice", AuthType: "auto"})
+	cfg.Nodes.Set("testnode", models.Node{HostRef: "host1", IdentityRef: "id1"})
+
+	provider := config.NewProviderWithOpenSSHParser(cfg, parser)
+	adp := NewSSHAdapter(provider)
+
+	ctrl, err := adp.ResolveControl("testnode", SessionControlOptions{})
+	if err != nil {
+		t.Fatalf("ResolveControl failed: %v", err)
+	}
+	if ctrl == nil || ctrl.Master != ssh.ControlMasterAuto || ctrl.Path != "~/.ssh/cm-%C" {
+		t.Fatalf("expected ControlConfig from second concrete key 192.168.1.100, got %+v", ctrl)
+	}
+	opts, err := adp.ResolveSSHOptions("testnode", SessionControlOptions{})
+	if err != nil {
+		t.Fatalf("ResolveSSHOptions failed: %v", err)
+	}
+	if opts == nil || opts.Get(ssh.OptionConnectTimeout) != "15" {
+		t.Fatalf("expected ConnectTimeout=15 from first concrete key testnode, got %+v", opts)
+	}
+	if !opts.ImplicitTier4 || !ctrl.ImplicitTier4 {
+		t.Fatalf("expected ImplicitTier4=true on both ResolveSSHOptions and ResolveControl for pure Tier 4 config, got opts=%v ctrl=%v", opts.ImplicitTier4, ctrl.ImplicitTier4)
+	}
+
+	// Direct SessionControlOptions.Options population is respected by ResolveControl
+	directSession := SessionControlOptions{
+		Options: ssh.MustOptions(
+			ssh.OptionControlMaster, "yes",
+			ssh.OptionControlPath, "/tmp/direct-%C",
+			ssh.OptionControlPersist, "5m",
+		),
+	}
+	ctrlDirect, err := adp.ResolveControl("testnode", directSession)
+	if err != nil {
+		t.Fatalf("ResolveControl(directSession) failed: %v", err)
+	}
+	if ctrlDirect == nil || ctrlDirect.Master != ssh.ControlMasterYes || ctrlDirect.Path != "/tmp/direct-%C" || ctrlDirect.Persist != "5m" || ctrlDirect.ImplicitTier4 {
+		t.Fatalf("unexpected ctrlDirect: %+v", ctrlDirect)
 	}
 }

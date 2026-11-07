@@ -85,11 +85,11 @@ func TestVerifyConnection_IgnoresActiveControlSocket(t *testing.T) {
 	preview, err := repo.PreviewConnection(
 		"draft",
 		models.Node{
-			Control: &ssh.ControlConfig{
+			SSHOptions: ssh.OptionsFromControl(&ssh.ControlConfig{
 				Master:  ssh.ControlMasterAuto,
 				Path:    sockPath,
 				Persist: "10m",
-			},
+			}),
 		},
 		models.Host{Address: host, Port: uint16(port)},
 		models.Identity{User: "root", AuthType: "password", Password: "wrong-password"},
