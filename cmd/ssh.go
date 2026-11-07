@@ -11,8 +11,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/wentf9/xops-cli/cmd/utils"
 	corelog "github.com/wentf9/xops-cli/core/log"
 	"github.com/wentf9/xops-cli/core/ssh"
@@ -24,31 +26,35 @@ import (
 )
 
 type SshOptions struct {
-	interaction     *cliInteractionHandler
-	diagnostic      sshDiagnosticOptions
-	diagnostics     corelog.DiagnosticObserver
-	Host            string
-	Port            uint16
-	User            string
-	Password        string
-	PasswordStdin   bool
-	OTP             string
-	OTPStdin        bool
-	IdentityFile    string
-	Passphrase      string
-	PassphraseStdin bool
-	Remember        string
-	Sudo            bool
-	Alias           string
-	JumpHost        string
-	Tags            []string
-	LocalForwards   []string
-	RemoteForwards  []string
-	NoCmd           bool
-	DynamicForward  string
-	BgRun           bool
-	StdinRedirect   bool
-	args            []string
+	interaction        *cliInteractionHandler
+	diagnostic         sshDiagnosticOptions
+	diagnostics        corelog.DiagnosticObserver
+	control            SSHControlFlags
+	Host               string
+	Port               uint16
+	User               string
+	Password           string
+	PasswordStdin      bool
+	OTP                string
+	OTPStdin           bool
+	IdentityFile       string
+	Passphrase         string
+	PassphraseStdin    bool
+	Remember           string
+	Sudo               bool
+	Alias              string
+	JumpHost           string
+	Tags               []string
+	LocalForwards      []string
+	RemoteForwards     []string
+	NoCmd              bool
+	DynamicForward     string
+	BgRun              bool
+	StdinRedirect      bool
+	args               []string
+	dashIdx            int
+	parsedArgs         bool
+	appliedGeneralOpts bool
 
 	Target config.ConnectionTarget
 
@@ -56,14 +62,16 @@ type SshOptions struct {
 	stdinScript  bool
 	NoLoginShell bool
 
-	execution   execExecutionOptions
-	commandPlan *ssh.CommandPlan
+	execution     execExecutionOptions
+	commandPlan   *ssh.CommandPlan
+	targetNodeIDs []string
 }
 
 func NewSshOptions() *SshOptions {
 	return &SshOptions{
 		Sudo:         false,
 		NoLoginShell: false,
+		dashIdx:      -1,
 	}
 }
 
@@ -87,6 +95,7 @@ func newCmdSshWithOptions(o *SshOptions) *cobra.Command {
 		},
 	}
 	o.diagnostic.register(cmd)
+	o.control.RegisterSSHFlags(cmd)
 	// OpenSSH-compatible flags
 	cmd.Flags().Uint16VarP(&o.Port, "port", "p", 0, i18n.T("flag_port"))
 	cmd.Flags().StringVarP(&o.User, "login", "l", "", i18n.T("flag_login"))
@@ -119,6 +128,31 @@ func newCmdSshWithOptions(o *SshOptions) *cobra.Command {
 
 func (o *SshOptions) Complete(cmd *cobra.Command, args []string) error {
 	o.args = args
+	o.dashIdx = -1
+	o.parsedArgs = false
+	o.appliedGeneralOpts = false
+	var flags *pflag.FlagSet
+	if cmd != nil {
+		flags = cmd.Flags()
+		o.dashIdx = cmd.ArgsLenAtDash()
+	}
+	if err := ApplyGeneralOptions(o, o.control.Options, flags); err != nil {
+		return o.control.controlUsageError(err)
+	}
+	if isMuxDaemonChild() {
+		// The detached master daemon re-executes the original command line, but it
+		// only serves the control socket. Normalize before Complete reads stdin:
+		// with stdio on /dev/null a --password-stdin read would fail the child and
+		// silently break ControlPersist.
+		o.PasswordStdin = false
+		o.PassphraseStdin = false
+		o.OTPStdin = false
+		o.NoCmd = true
+		o.Command = ""
+		o.stdinScript = false
+		o.StdinRedirect = true
+		return nil
+	}
 	o.execution.capturePresence(cmd)
 	hadCredentialStdin := o.OTPStdin || o.PasswordStdin || o.PassphraseStdin
 	if o.OTP != "" && o.OTPStdin {
@@ -146,7 +180,8 @@ func (o *SshOptions) Complete(cmd *cobra.Command, args []string) error {
 		}
 		o.Passphrase = pass
 	}
-	if !o.StdinRedirect && !hadCredentialStdin {
+	ctlCmd := strings.ToLower(strings.TrimSpace(o.control.CtlCmd))
+	if !o.StdinRedirect && !hadCredentialStdin && (ctlCmd == "" || ctlCmd == "proxy") {
 		stat, err := os.Stdin.Stat()
 		if err == nil && (stat.Mode()&os.ModeCharDevice) == 0 {
 			o.stdinScript = true
@@ -156,6 +191,10 @@ func (o *SshOptions) Complete(cmd *cobra.Command, args []string) error {
 }
 
 func (o *SshOptions) parseArgs() error {
+	return o.parseTarget(o.control.ControlCommandWithoutTarget())
+}
+
+func (o *SshOptions) parseTarget(allowMissingHost bool) error {
 	hasUser := false
 	var finalUser string
 	hasPort := false
@@ -171,23 +210,21 @@ func (o *SshOptions) parseArgs() error {
 		finalPort = o.Port
 	}
 
+	rawSelector := finalHost
 	if len(o.args) == 0 && finalHost == "" {
-		return errors.New(i18n.T("ssh_err_no_host"))
+		if !allowMissingHost {
+			return errors.New(i18n.T("ssh_err_no_host"))
+		}
 	} else if finalHost == "" && len(o.args) >= 1 {
+		rawSelector = o.args[0]
 		u, h, p, err := utils.ParseAddr(o.args[0])
 		if err != nil {
 			return err
 		}
-		if finalHost == "" && h != "" {
-			finalHost = h
-		}
-		if !hasUser && u != "" {
-			hasUser = true
-			finalUser = u
-		}
-		if !hasPort && p != 0 {
-			hasPort = true
-			finalPort = p
+		finalHost, finalUser, hasUser, finalPort, hasPort = applyParsedAddr(finalHost, finalUser, hasUser, finalPort, hasPort, h, u, p)
+	} else if finalHost != "" && !strings.HasPrefix(finalHost, config.OpenSSHNodePrefix) {
+		if u, h, p, err := utils.ParseAddr(finalHost); err == nil && h != "" {
+			finalHost, finalUser, hasUser, finalPort, hasPort = applyParsedAddr("", finalUser, hasUser, finalPort, hasPort, h, u, p)
 		}
 	}
 
@@ -195,27 +232,59 @@ func (o *SshOptions) parseArgs() error {
 	o.User = finalUser
 	o.Port = finalPort
 
+	selector := finalHost
+	trimmedRaw := strings.TrimSpace(rawSelector)
+	if isMuxDaemonChild() && strings.Contains(trimmedRaw, "@") && strings.Contains(trimmedRaw, ":") {
+		selector = trimmedRaw
+	}
+
+	hasJump := o.JumpHost != "" || isMuxDaemonChild()
+
 	o.Target = config.ConnectionTarget{
-		Selector:     finalHost,
+		Selector:     selector,
+		RawSelector:  trimmedRaw,
 		User:         finalUser,
 		HasUser:      hasUser,
 		Port:         finalPort,
 		HasPort:      hasPort,
 		ProxyJump:    o.JumpHost,
-		HasProxyJump: o.JumpHost != "",
+		HasProxyJump: hasJump,
 	}
 	return nil
 }
 
-func (o *SshOptions) Validate() error {
-	if o.OTP != "" && o.OTPStdin {
-		return errors.New(i18n.T("err_otp_mutually_exclusive"))
+func applyParsedAddr(finalHost, finalUser string, hasUser bool, finalPort uint16, hasPort bool, h, u string, p uint16) (string, string, bool, uint16, bool) {
+	if finalHost == "" && h != "" {
+		finalHost = h
 	}
-	if err := utils.ValidateRememberPolicy(o.Remember); err != nil {
+	if !hasUser && u != "" {
+		hasUser = true
+		finalUser = u
+	}
+	if !hasPort && p != 0 {
+		hasPort = true
+		finalPort = p
+	}
+	return finalHost, finalUser, hasUser, finalPort, hasPort
+}
+
+func (o *SshOptions) ensureGeneralOptionsApplied() error {
+	if o.appliedGeneralOpts || len(o.control.Options) == 0 {
+		return nil
+	}
+	return ApplyGeneralOptions(o, o.control.Options, nil)
+}
+
+func (o *SshOptions) ensureArgsParsed() error {
+	if err := o.ensureGeneralOptionsApplied(); err != nil {
 		return err
 	}
+	if o.parsedArgs {
+		return nil
+	}
 	// A flag-selected target leaves every positional token for the command.
-	// Determine the boundary before parseArgs fills Host from a positional target.
+	// When no --host flag was given, the first positional argument is always
+	// the target host (including `xops ssh -- host cmd`).
 	commandArgs := o.args
 	if o.Host == "" && len(commandArgs) > 0 {
 		commandArgs = commandArgs[1:]
@@ -223,11 +292,47 @@ func (o *SshOptions) Validate() error {
 	if err := o.parseArgs(); err != nil {
 		return err
 	}
-	if len(commandArgs) > 0 {
+	o.parsedArgs = true
+	if isMuxDaemonChild() {
+		// parseArgs rebuilds the target from the preserved positional arguments, so
+		// the daemon normalization above must be re-applied before the command
+		// boundary is turned back into an executable command.
+		o.NoCmd = true
+		o.Command = ""
+		o.stdinScript = false
+		commandArgs = nil
+	}
+	if o.Command == "" && len(commandArgs) > 0 {
 		o.Command = strings.Join(commandArgs, " ")
 		if o.Command == "" {
 			return fmt.Errorf("explicit SSH command must not be empty")
 		}
+	}
+	return nil
+}
+
+func (o *SshOptions) Validate() error {
+	if err := o.ensureGeneralOptionsApplied(); err != nil {
+		return o.control.controlUsageError(err)
+	}
+	if err := o.control.Validate(); err != nil {
+		return err
+	}
+	if isMuxDaemonChild() {
+		// Validate runs after Complete and would otherwise rebuild a command from
+		// the preserved positional arguments that the daemon must never execute.
+		o.NoCmd = true
+		o.Command = ""
+		o.stdinScript = false
+	}
+	if o.OTP != "" && o.OTPStdin {
+		return errors.New(i18n.T("err_otp_mutually_exclusive"))
+	}
+	if err := utils.ValidateRememberPolicy(o.Remember); err != nil {
+		return err
+	}
+	if err := o.ensureArgsParsed(); err != nil {
+		return o.control.controlUsageError(err)
 	}
 	if o.BgRun && !o.NoCmd {
 		return errors.New(i18n.T("ssh_err_background_requires_nocmd"))
@@ -238,6 +343,10 @@ func (o *SshOptions) Validate() error {
 	if strings.Contains(o.Alias, "@") || strings.Contains(o.Alias, ":") {
 		return errors.New(i18n.T("ssh_err_alias_invalid"))
 	}
+	ctlCmd := strings.ToLower(strings.TrimSpace(o.control.CtlCmd))
+	if ctlCmd != "" && ctlCmd != "proxy" {
+		return nil
+	}
 	return o.prepareCommandPlan()
 }
 
@@ -247,7 +356,19 @@ func (o *SshOptions) Run() error {
 
 // RunContext starts the SSH operation and propagates caller cancellation.
 func (o *SshOptions) RunContext(ctx context.Context) (err error) {
-	isChild := os.Getenv("XOPS_CLI_SSH_BG_CHILD") == "true"
+	if o.control.CtlCmd != "" {
+		return ExecuteControlCommand(ctx, o)
+	}
+
+	isChild := os.Getenv(sshBackgroundChildEnv) == "true"
+	if isMuxDaemonChild() {
+		// A detached multiplexing daemon serves the control socket only. It must
+		// never re-run the command or read the terminal the parent handed over.
+		o.NoCmd = true
+		o.Command = ""
+		o.stdinScript = false
+		o.StdinRedirect = true
+	}
 
 	// -n 功能：如果是非后台运行或已是后台子进程，且指定了 -n，直接重定向标准输入到 /dev/null
 	if o.StdinRedirect && (!o.BgRun || isChild) {
@@ -305,9 +426,23 @@ func (o *SshOptions) runParentDaemon(ctx context.Context) (err error) {
 	if optErr != nil {
 		return optErr
 	}
-	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithInteractionHandler(o.interaction), ssh.WithDiagnostics(o.diagnostics))
+	// The parent only validates connectivity and tunnels. The background child
+	// owns the control socket, so the parent must not bind it and then exit. The
+	// disable is node-scoped on purpose: buildAdapterOptions above may have
+	// registered a node-level session override, and a node override outranks the
+	// global default used by other nodes.
+	adpOpts = append(adpOpts, disableSessionControlForParent(nodeID))
+	var connector *ssh.Connector
+	if isMuxDaemonChild() {
+		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics))
+	} else {
+		connector = newCLIConnectorWithAdapterOptions(provider, o.interaction, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics))
+	}
+	var connectorClosed bool
 	defer func() {
-		joinConnectorCloseError(&err, connector)
+		if !connectorClosed {
+			joinConnectorCloseError(&err, connector)
+		}
 	}()
 	client, err := connector.Connect(ctx, nodeID)
 	if err != nil {
@@ -340,6 +475,10 @@ func (o *SshOptions) runParentDaemon(ctx context.Context) (err error) {
 		return fmt.Errorf("close SSH daemon validation client failed: %w", err)
 	}
 	clientClosed = true
+	if closeErr := connector.CloseAll(); closeErr != nil {
+		return fmt.Errorf("close SSH daemon validation connector failed: %w", closeErr)
+	}
+	connectorClosed = true
 
 	// 启动后台子进程
 	exe, err := os.Executable()
@@ -347,7 +486,7 @@ func (o *SshOptions) runParentDaemon(ctx context.Context) (err error) {
 		return fmt.Errorf("failed to get executable path: %w", err)
 	}
 	cmd := exec.Command(exe, os.Args[1:]...)
-	cmd.Env = append(os.Environ(), "XOPS_CLI_SSH_BG_CHILD=true")
+	cmd.Env = append(os.Environ(), sshBackgroundChildEnv+"=true")
 
 	// 子进程的 stdin/stdout/stderr 均重定向到 /dev/null
 	devNull, err := os.Open(os.DevNull)
@@ -375,9 +514,17 @@ func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuratio
 		o.interaction = newCLIInteractionHandler()
 	}
 	shouldRemember, adpOpts := o.interaction.rememberOptions(utils.EffectiveRememberPolicy(o.Remember, cfg), cfg)
+	if isMuxDaemonChild() {
+		shouldRemember = false
+		adpOpts = append(adpOpts, adapter.WithNonInteractive(true))
+	}
 	// The global policy also covers ProxyJump nodes. The target-specific override
 	// below carries its explicit session material without leaking it to jumps.
 	adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{Remember: shouldRemember}))
+	proxyJumpOverride := o.JumpHost
+	if proxyJumpOverride == "" && isMuxDaemonChild() {
+		proxyJumpOverride = "none"
+	}
 	// 总是注入 SessionAuthOverride（即使密码为空），以便 UpdateAuth / UpdateSudo
 	// 能根据 Remember 策略决定是否将交互提示获得的密码回写配置，而不是绕过策略检查。
 	adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, adapter.SessionAuth{
@@ -386,6 +533,7 @@ func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuratio
 		KeyPath:    utils.ToAbsolutePath(o.IdentityFile),
 		Remember:   shouldRemember,
 		OTP:        o.OTP,
+		ProxyJump:  proxyJumpOverride,
 	}))
 	if reg, regErr := utils.GetCredentialRegistry(cfg); regErr != nil {
 		return nil, fmt.Errorf("initialize credential resolver: %w", regErr)
@@ -403,8 +551,640 @@ func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuratio
 		}
 		adpOpts = append(adpOpts, persistence...)
 	}
+
+	// Session Control Overrides (Tier 1)
+	sessionCtrlOpts, err := o.control.ToSessionControlOptions()
+	if err != nil {
+		return nil, err
+	}
+	if !sessionCtrlOpts.IsEmpty() {
+		adpOpts = append(adpOpts, adapter.WithSessionControlOverride(nodeID, sessionCtrlOpts))
+	}
+
 	return adpOpts, nil
 }
+
+// disableSessionControlForParent stops a -f parent from claiming the control
+// socket that the detached child owns, including any ProxyJump hops. It sets
+// both global and node-level overrides so neither a jump hop nor a node-scoped
+// -M/-S/-o override on the target can bind or attach to a control socket.
+func disableSessionControlForParent(nodeID string) adapter.Option {
+	disabledSharing := "none"
+	ctrl := adapter.SessionControlOptions{Path: &disabledSharing}
+	return func(a *adapter.SSHAdapter) {
+		adapter.WithGlobalSessionControl(ctrl)(a)
+		adapter.WithSessionControlOverride(nodeID, ctrl)(a)
+	}
+}
+
+// getActiveMuxServer returns the in-process master serving this node, if any. The
+// control path must be expanded from the resolved connection target, exactly as
+// Connector.buildTargetContext does, otherwise %h/%p/%r/%C expand differently.
+func (o *SshOptions) getActiveMuxServer(ctx context.Context, provider *config.Repository, nodeID string) *ssh.MuxServer {
+	expandedPath, err := controlSocketPath(o, provider, nodeID)
+	if err != nil || expandedPath == "" {
+		return nil
+	}
+	return ssh.GetActiveMuxServer(expandedPath)
+}
+
+// handoffPersistentMaster releases this process's master and starts a detached
+// master so ControlPersist survives the session, matching OpenSSH behavior for a
+// command or interactive shell that finished.
+func (o *SshOptions) handoffPersistentMaster(ctx context.Context, connector *ssh.Connector, provider *config.Repository, nodeID string) error {
+	if isMuxDaemonChild() || o.BgRun {
+		// This process owns the master for its whole lifetime.
+		return nil
+	}
+	if o.NoCmd {
+		// A -N process holds the master until it stops; there is nothing to hand
+		// over, and spawning a second daemon would duplicate the master.
+		return nil
+	}
+	if ctx != nil && ctx.Err() != nil {
+		// The session was interrupted (Ctrl-C/cancellation). Reviving the master
+		// would resurrect what the user just stopped.
+		return nil
+	}
+	if err := drainOwnedMasters(ctx, connector); err != nil {
+		return nil
+	}
+	if o.OTP != "" {
+		// A one-time code was already consumed by this process. Re-playing it in
+		// the daemon cannot succeed and may trip server-side MFA lockouts.
+		logger.DefaultLogger().Debugf("mux: skipping master handoff because a one-time password was used")
+		return nil
+	}
+	if nodeID != "" && len(o.targetNodeIDs) == 0 {
+		o.targetNodeIDs = []string{nodeID}
+	}
+	var master *ssh.MuxServer
+	expandedPath, err := controlSocketPath(o, provider, nodeID)
+	if err == nil && expandedPath != "" {
+		master = ssh.GetActiveMuxServer(expandedPath)
+	}
+	if master == nil && connector != nil {
+		for _, m := range connector.Masters() {
+			if m.Target().OriginalHost == nodeID || nodeID == "" {
+				master = m
+				break
+			}
+		}
+	}
+	if !canHandoffMaster(master) {
+		return o.handoffConnectorMasters(ctx, connector)
+	}
+	return o.handoffMasterInstance(ctx, connector, master, nodeID)
+}
+
+func canHandoffMaster(master *ssh.MuxServer) bool {
+	if master == nil || !master.PersistEnabled() {
+		return false
+	}
+	if ctrl := master.Target().Control; ctrl != nil {
+		if ctrl.ImplicitTier4 {
+			return false
+		}
+		if ctrl.Master == ssh.ControlMasterAsk || ctrl.Master == ssh.ControlMasterAutoAsk {
+			return false
+		}
+	}
+	return true
+}
+
+// handoffConnectorMasters drains and hands off any persistent multiplexing
+// masters started by connector during scp, sftp, or exec operations.
+func (o *SshOptions) handoffConnectorMasters(ctx context.Context, connector *ssh.Connector) error {
+	if connector == nil {
+		return nil
+	}
+	masters := connector.Masters()
+	if len(masters) == 0 {
+		return nil
+	}
+	if isMuxDaemonChild() || o.BgRun || o.NoCmd {
+		return nil
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return nil
+	}
+	if err := drainOwnedMasters(ctx, connector); err != nil {
+		return nil
+	}
+	if o.OTP != "" {
+		logger.DefaultLogger().Debugf("mux: skipping master handoff because a one-time password was used")
+		return nil
+	}
+	jumps := persistentJumpHops(masters)
+	var firstErr error
+	for _, m := range masters {
+		if !canHandoffMaster(m) {
+			continue
+		}
+		nodeID := m.Target().OriginalHost
+		if nodeID != "" && jumps[nodeID] {
+			continue
+		}
+		if err := o.handoffMasterInstance(ctx, connector, m, nodeID); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func persistentJumpHops(masters []*ssh.MuxServer) map[string]bool {
+	jumps := make(map[string]bool, len(masters))
+	for _, m := range masters {
+		if !canHandoffMaster(m) {
+			continue
+		}
+		if j := m.Target().JumpHost; j != "" {
+			for hop := range strings.SplitSeq(j, ",") {
+				hop = strings.TrimSpace(hop)
+				if hop != "" {
+					jumps[hop] = true
+				}
+			}
+		}
+	}
+	return jumps
+}
+
+func (o *SshOptions) handoffMasterInstance(ctx context.Context, connector *ssh.Connector, master *ssh.MuxServer, nodeID string) error {
+	if master == nil || !master.PersistEnabled() {
+		return nil
+	}
+	if ctrl := master.Target().Control; ctrl != nil {
+		// 1.A: When multiplexing comes solely from ~/.ssh/config (Tier 4) without
+		// explicit CLI or xops config, never spawn a detached background daemon.
+		if ctrl.ImplicitTier4 {
+			logger.DefaultLogger().Debugf("mux: skipping master handoff for implicit Tier 4 (OpenSSH config) control on %q", master.ControlPath())
+			return nil
+		}
+		// H11: A detached daemon has no TTY to prompt confirmation in ask/autoask mode.
+		if ctrl.Master == ssh.ControlMasterAsk || ctrl.Master == ssh.ControlMasterAutoAsk {
+			logger.DefaultLogger().Debugf("mux: skipping master handoff in %s confirmation mode on %q", ctrl.Master, master.ControlPath())
+			return nil
+		}
+	}
+	if connector != nil && !connector.OwnsMaster(master) {
+		return nil
+	}
+	expandedPath := master.ControlPath()
+	if expandedPath == "" {
+		return nil
+	}
+	ready, err := waitAndReleaseMastersForHandoff(ctx, connector, master, expandedPath)
+	if err != nil || !ready {
+		return err
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve executable for multiplexing daemon failed: %w", err)
+	}
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("open %s for multiplexing daemon failed: %w", os.DevNull, err)
+	}
+	defer func() {
+		if closeErr := devNull.Close(); closeErr != nil {
+			logger.DefaultLogger().Debugf("close multiplexing daemon stdio failed: %v", closeErr)
+		}
+	}()
+
+	cmd := exec.Command(exe, o.muxDaemonArgs(nodeID, expandedPath, master)...)
+	cmd.Env = append(os.Environ(), sshMuxDaemonEnv+"=true", sshBackgroundChildEnv+"=true")
+	cmd.Stdin = devNull
+	cmd.Stdout = devNull
+	cmd.Stderr = devNull
+	if err := startDaemonProcess(cmd); err != nil {
+		return fmt.Errorf("start multiplexing daemon failed: %w", err)
+	}
+	// The child re-authenticates on its own. Interactive-only credentials cannot
+	// be inherited, so a failed handoff is advisory: the command already ran.
+	// Watch for an early exit so a doomed daemon does not stall the shell for the
+	// whole readiness timeout.
+	daemonExited := make(chan struct{})
+	go func() {
+		defer close(daemonExited)
+		_ = cmd.Wait()
+	}()
+
+	// The command already finished, so a slow or unauthenticated daemon must not
+	// be reported as a command failure. Report it and keep the exit status.
+	if err := waitForControlSocket(ctx, expandedPath, 10*time.Second, daemonExited); err != nil {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		logger.DefaultLogger().Debugf("mux: persistent master handoff on %q failed: %v", expandedPath, err)
+		if _, writeErr := fmt.Fprintf(os.Stderr, "warning: connection sharing master could not be kept alive on %s: %v\n", expandedPath, err); writeErr != nil {
+			logger.DefaultLogger().Debugf("write handoff warning failed: %v", writeErr)
+		}
+	}
+	return nil
+}
+
+func waitAndReleaseMastersForHandoff(ctx context.Context, connector *ssh.Connector, master *ssh.MuxServer, expandedPath string) (bool, error) {
+	for {
+		if err := drainOwnedMasters(ctx, connector); err != nil {
+			return false, nil
+		}
+		if master.StoppedListening() {
+			return false, nil
+		}
+		ready, err := releaseMastersForHandoff(connector, master, expandedPath)
+		if err != nil {
+			return false, err
+		}
+		if ready {
+			return true, nil
+		}
+		if connector == nil || master.StoppedListening() {
+			return false, nil
+		}
+		select {
+		case <-ctx.Done():
+			return false, nil
+		case <-master.Wait():
+			return false, nil
+		default:
+		}
+	}
+}
+
+// drainOwnedMasters waits for any secondary client sessions or dynamic forwards
+// on masters started by connector to finish before the foreground process tears
+// down its transport or hands the control socket over to a daemon.
+func drainOwnedMasters(ctx context.Context, connector *ssh.Connector) error {
+	if connector == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for _, m := range connector.Masters() {
+		maxSessions := int32(0)
+		if connector.HasMasterSession(m) {
+			maxSessions = 1
+		}
+		if err := m.WaitForDrain(ctx, maxSessions); err != nil {
+			return err
+		}
+		if m.StoppedListening() {
+			connector.ReleaseMaster(m)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-m.Wait():
+			}
+		}
+	}
+	return nil
+}
+
+func (o *SshOptions) muxDaemonArgs(nodeID string, expandedPath string, master *ssh.MuxServer) []string {
+	targetHost, port, user := o.resolveMuxDaemonTarget(nodeID, master)
+	args := []string{"ssh", "-N", "--host", targetHost, "-S", expandedPath}
+	if port != 0 {
+		args = append(args, "-p", strconv.Itoa(port))
+	}
+	if user != "" {
+		args = append(args, "-l", user)
+	}
+	if keyPath := o.resolveMuxDaemonIdentityFile(nodeID, master); keyPath != "" {
+		args = append(args, "-i", keyPath)
+	}
+	jumpHost := o.JumpHost
+	if master != nil {
+		jumpHost = master.Target().JumpHost
+		if jumpHost == "" && strings.EqualFold(strings.TrimSpace(o.JumpHost), "none") {
+			jumpHost = "none"
+		}
+	}
+	if jumpHost != "" {
+		args = append(args, "-J", jumpHost)
+	}
+	args = append(args, "--remember", "never")
+	for _, opt := range o.control.Options {
+		if master != nil && isTargetSpecificOption(opt) {
+			continue
+		}
+		args = append(args, "-o", opt)
+	}
+	if master != nil {
+		if ctrl := master.Target().Control; ctrl != nil && ctrl.Persist != "" {
+			args = append(args, "-o", "ControlPersist="+ctrl.Persist)
+		}
+	}
+	// Force ControlMaster=yes on the detached daemon so it never attaches as a
+	// passenger to a competing master.
+	args = append(args, "-o", "ControlMaster=yes")
+	return args
+}
+
+func (o *SshOptions) resolveMuxDaemonIdentityFile(nodeID string, master *ssh.MuxServer) string {
+	if o.IdentityFile != "" && o.shouldPassIdentityFile(nodeID, master) {
+		return o.IdentityFile
+	}
+	if master != nil && master.Target().KeyPath != "" {
+		if o.IdentityFile == "" || len(o.targetNodeIDs) > 0 || master.Target().KeyPath != utils.ToAbsolutePath(o.IdentityFile) {
+			return master.Target().KeyPath
+		}
+	}
+	return ""
+}
+
+func (o *SshOptions) shouldPassIdentityFile(nodeID string, master *ssh.MuxServer) bool {
+	if master == nil {
+		return true
+	}
+	if o.JumpHost != "" && master.Target().JumpHost == "" {
+		return false
+	}
+	if len(o.targetNodeIDs) > 0 {
+		return matchesAnyTargetNodeID(nodeID, master, o.targetNodeIDs)
+	}
+	if o.Port > 0 && master.Target().Port > 0 && int(o.Port) != master.Target().Port {
+		return false
+	}
+	if o.User != "" && master.Target().User != "" && o.User != master.Target().User {
+		return false
+	}
+	if o.JumpHost != "" && isMasterInJumpSpec(nodeID, master, o.JumpHost) {
+		return false
+	}
+	if o.Host != "" || o.Target.Selector != "" {
+		return matchesTargetSelector(nodeID, master, o.Host, o.Target.Selector)
+	}
+	return true
+}
+
+func isMasterInJumpSpec(nodeID string, master *ssh.MuxServer, jumpSpec string) bool {
+	for hop := range strings.SplitSeq(jumpSpec, ",") {
+		hop = strings.TrimSpace(hop)
+		if hop == "" {
+			continue
+		}
+		if matchesTargetSelector(nodeID, master, hop, hop) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesAnyTargetNodeID(nodeID string, master *ssh.MuxServer, targetIDs []string) bool {
+	candidates := []string{
+		strings.TrimSpace(nodeID),
+		strings.TrimPrefix(strings.TrimSpace(nodeID), config.OpenSSHNodePrefix),
+	}
+	if master != nil {
+		orig := strings.TrimSpace(master.Target().OriginalHost)
+		candidates = append(candidates,
+			orig,
+			strings.TrimPrefix(orig, config.OpenSSHNodePrefix),
+		)
+	}
+	for _, tid := range targetIDs {
+		want := strings.TrimSpace(tid)
+		if want == "" {
+			continue
+		}
+		cleanWant := strings.TrimPrefix(want, config.OpenSSHNodePrefix)
+		for _, c := range candidates {
+			if c != "" && (c == want || c == cleanWant) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func matchesTargetSelector(nodeID string, master *ssh.MuxServer, host, selector string) bool {
+	candidates := []string{
+		strings.TrimSpace(nodeID),
+		strings.TrimPrefix(strings.TrimSpace(nodeID), config.OpenSSHNodePrefix),
+	}
+	if master != nil {
+		orig := strings.TrimSpace(master.Target().OriginalHost)
+		candidates = append(candidates,
+			orig,
+			strings.TrimPrefix(orig, config.OpenSSHNodePrefix),
+			strings.TrimSpace(master.Target().Host),
+		)
+	}
+	for _, want := range []string{strings.TrimSpace(host), strings.TrimSpace(selector)} {
+		if want == "" {
+			continue
+		}
+		cleanWant := strings.TrimPrefix(want, config.OpenSSHNodePrefix)
+		for _, c := range candidates {
+			if c != "" && (c == want || c == cleanWant) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isTargetSpecificOption(opt string) bool {
+	key, _, ok := strings.Cut(strings.TrimSpace(opt), "=")
+	if !ok {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "port", "user", "proxyjump", "identityfile":
+		return true
+	default:
+		return false
+	}
+}
+
+func (o *SshOptions) resolveMuxDaemonTarget(nodeID string, master *ssh.MuxServer) (host string, port int, user string) {
+	rawSelector := nodeID
+	if rawSelector == "" && master != nil {
+		rawSelector = master.Target().OriginalHost
+	}
+	if rawSelector == "" {
+		rawSelector = o.Host
+	}
+	host = strings.TrimPrefix(rawSelector, config.OpenSSHNodePrefix)
+	if host == "" && master != nil {
+		host = master.Target().Host
+	}
+	if master != nil && master.Target().Port > 0 {
+		port = master.Target().Port
+	} else {
+		port = int(o.Port)
+	}
+	if master != nil && master.Target().User != "" {
+		user = master.Target().User
+	} else {
+		user = o.User
+	}
+	return host, port, user
+}
+
+// jumpChainMasters returns the subset of ownedMasters that belong to targetMaster's
+// transitive ProxyJump chain so multi-host handoffs never shut down unrelated
+// target masters.
+func jumpChainMasters(targetMaster *ssh.MuxServer, ownedMasters []*ssh.MuxServer) []*ssh.MuxServer {
+	if targetMaster == nil || len(ownedMasters) == 0 {
+		return nil
+	}
+	byHost := make(map[string]*ssh.MuxServer, len(ownedMasters))
+	for _, m := range ownedMasters {
+		if m == nil || m == targetMaster {
+			continue
+		}
+		if host := strings.TrimSpace(m.Target().OriginalHost); host != "" {
+			byHost[host] = m
+		}
+		if host := strings.TrimSpace(m.Target().Host); host != "" {
+			byHost[host] = m
+		}
+	}
+	var chain []*ssh.MuxServer
+	seen := make(map[*ssh.MuxServer]bool)
+	queue := []string{targetMaster.Target().JumpHost}
+	for len(queue) > 0 {
+		raw := queue[0]
+		queue = queue[1:]
+		for hop := range strings.SplitSeq(raw, ",") {
+			hop = strings.TrimSpace(hop)
+			if hop == "" {
+				continue
+			}
+			if hopMaster, ok := byHost[hop]; ok && !seen[hopMaster] {
+				seen[hopMaster] = true
+				chain = append(chain, hopMaster)
+				if next := hopMaster.Target().JumpHost; next != "" {
+					queue = append(queue, next)
+				}
+			}
+		}
+	}
+	return chain
+}
+
+// releaseMastersForHandoff drops the connector's active-session references,
+// reserves the target and any intermediate jump masters for handoff, and shuts
+// them down so the detached daemon can claim the control sockets cleanly.
+func releaseMastersForHandoff(connector *ssh.Connector, master *ssh.MuxServer, expandedPath string) (bool, error) {
+	var jumpMasters []*ssh.MuxServer
+	var released []*ssh.MuxServer
+	if connector != nil {
+		if !connector.OwnsMaster(master) {
+			return false, nil
+		}
+		if connector.HasMasterSession(master) && connector.ReleaseMaster(master) {
+			released = append(released, master)
+		}
+		jumpMasters = jumpChainMasters(master, connector.Masters())
+	}
+	restoreReleased := func() {
+		if connector == nil {
+			return
+		}
+		for _, m := range released {
+			connector.AcquireMaster(m)
+		}
+	}
+	if !master.PrepareHandoff() {
+		restoreReleased()
+		logger.DefaultLogger().Debugf("mux: not handing off master on %q while it is busy or stopping", expandedPath)
+		return false, nil
+	}
+	reserved := []*ssh.MuxServer{master}
+	for _, m := range jumpMasters {
+		if !m.PersistEnabled() {
+			continue
+		}
+		if connector != nil && connector.HasMasterSession(m) && connector.ReleaseMaster(m) {
+			released = append(released, m)
+		}
+		if !m.PrepareHandoff() {
+			for _, r := range reserved {
+				r.CancelHandoff()
+			}
+			restoreReleased()
+			logger.DefaultLogger().Debugf("mux: not handing off master on %q while jump master %q is busy or stopping", expandedPath, m.ControlPath())
+			return false, nil
+		}
+		reserved = append(reserved, m)
+	}
+	if err := master.Shutdown(); err != nil {
+		return false, fmt.Errorf("release control socket before daemon handoff failed: %w", err)
+	}
+	for _, m := range jumpMasters {
+		_ = m.Shutdown()
+	}
+	return true, nil
+}
+
+// waitForControlSocket blocks until a master answers on path, the deadline
+// elapses, the caller cancels, or the daemon process we are waiting for exits.
+func waitForControlSocket(ctx context.Context, path string, timeout time.Duration, daemonExited <-chan struct{}) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	daemonExitErr := func() error {
+		if lastErr == nil {
+			return fmt.Errorf("master daemon exited before it answered on %q", path)
+		}
+		return fmt.Errorf("master daemon exited before it answered on %q: %w", path, lastErr)
+	}
+
+	for {
+		if daemonExited != nil {
+			select {
+			case <-daemonExited:
+				return daemonExitErr()
+			default:
+			}
+		}
+
+		probeCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		client, err := ssh.DialMuxClient(probeCtx, path)
+		if err == nil {
+			_, lastErr = client.AliveCheck(probeCtx)
+			_ = client.Close()
+			if lastErr == nil {
+				cancel()
+				return nil
+			}
+		} else {
+			lastErr = err
+		}
+		cancel()
+
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("waiting for master on %q canceled: %w", path, err)
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("master did not answer on %q within %s: %w", path, timeout, lastErr)
+		}
+		if remaining > controlSocketPollInterval {
+			remaining = controlSocketPollInterval
+		}
+
+		// Waiting on the timer alone would hide an early daemon exit until the
+		// next poll; wake on it (and on cancellation) instead.
+		timer := time.NewTimer(remaining)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("waiting for master on %q canceled: %w", path, ctx.Err())
+		case <-daemonExited:
+			timer.Stop()
+			return daemonExitErr()
+		case <-timer.C:
+		}
+	}
+}
+
+// controlSocketPollInterval bounds how long the handoff waits between probes.
+const controlSocketPollInterval = 100 * time.Millisecond
 
 func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error) {
 	configPath, keyPath, pathErr := utils.GetConfigFilePath()
@@ -430,7 +1210,12 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 	if optErr != nil {
 		return optErr
 	}
-	connector := newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithInteractionHandler(o.interaction), ssh.WithDiagnostics(o.diagnostics))
+	var connector *ssh.Connector
+	if isMuxDaemonChild() {
+		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics))
+	} else {
+		connector = newCLIConnectorWithAdapterOptions(provider, o.interaction, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics))
+	}
 	defer func() {
 		joinConnectorCloseError(&err, connector)
 	}()
@@ -452,6 +1237,17 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
 
+	// Keep a persistent master alive across the process boundary. Registered
+	// here so it runs after tunnels are closed but before the client and
+	// connector are torn down, and it never changes the command's exit status.
+	// Pass the outer ctx (not runCtx) so that normal tunnel closure does not
+	// look like user cancellation to handoffPersistentMaster.
+	defer func() {
+		if handoffErr := o.handoffPersistentMaster(ctx, connector, provider, nodeID); handoffErr != nil {
+			logger.DefaultLogger().Debugf("mux: master handoff failed: %v", handoffErr)
+		}
+	}()
+
 	// Keep output on the command context while tunnels own their child context.
 	tunnels, err := o.startTunnels(ctx, runCancel, client)
 	if err != nil {
@@ -463,14 +1259,18 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 		}
 	}()
 
-	if o.NoCmd {
-		if !isChild && !o.diagnostic.quiet {
-			if err := tunnels.reportReady(ctx, os.Stdout, nodeID); err != nil {
-				return err
-			}
+	return o.runConnectedSession(runCtx, connector, client, provider, nodeID, tunnels, isChild)
+}
+
+func (o *SshOptions) runConnectedSession(runCtx context.Context, connector *ssh.Connector, client *ssh.Client, provider *config.Repository, nodeID string, tunnels *sshTunnelGroup, isChild bool) error {
+	master := o.getActiveMuxServer(runCtx, provider, nodeID)
+	if isMuxDaemonChild() {
+		if err := prepareMuxDaemonSession(connector, master, nodeID); err != nil {
+			return err
 		}
-		<-runCtx.Done()
-		return nil
+	}
+	if o.NoCmd {
+		return o.runNoCmdSession(runCtx, connector, client, master, nodeID, tunnels, isChild)
 	}
 
 	if o.Command != "" || o.stdinScript {
@@ -478,6 +1278,72 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 	}
 
 	return o.runShell(runCtx, client)
+}
+
+func (o *SshOptions) runNoCmdSession(runCtx context.Context, connector *ssh.Connector, client *ssh.Client, master *ssh.MuxServer, nodeID string, tunnels *sshTunnelGroup, isChild bool) error {
+	if !isChild && !o.diagnostic.quiet {
+		if o.control.MasterCount > 0 && master == nil && (connector == nil || len(connector.Masters()) == 0) {
+			_, _ = fmt.Fprintln(os.Stderr, "warning: -M specified without an active ControlPath; connection sharing master is not listening")
+		}
+		if err := tunnels.reportReady(runCtx, os.Stdout, nodeID); err != nil {
+			return err
+		}
+	}
+	// A non-daemon -N master keeps the foreground-session reference acquired
+	// by Connector until the operator stops it, and drops that reference on
+	// -O stop so the process exits once any client sessions drain.
+	if master != nil && !isMuxDaemonChild() {
+		master.ReleaseForegroundOnStop()
+	}
+	var masterWait <-chan struct{}
+	if master != nil {
+		masterWait = master.Wait()
+	}
+	select {
+	case <-runCtx.Done():
+	case <-masterWait:
+	}
+	if isMuxDaemonChild() && runCtx.Err() == nil && connector != nil {
+		_ = client.Close()
+		waitForDaemonJumpMasters(runCtx, connector, master)
+	}
+	return nil
+}
+
+func prepareMuxDaemonSession(connector *ssh.Connector, master *ssh.MuxServer, nodeID string) error {
+	if master == nil || (connector != nil && !connector.OwnsMaster(master)) {
+		return fmt.Errorf("multiplexing daemon did not acquire control socket for %s", nodeID)
+	}
+	if connector != nil {
+		// Release the foreground reference on the terminal master so its idle
+		// timer can run. Any upstream ProxyJump masters owned by this daemon keep
+		// their reference until the terminal master exits, preventing an earlier
+		// jump idle timeout from tearing down the target's transport.
+		connector.ReleaseMaster(master)
+	}
+	return nil
+}
+
+func waitForDaemonJumpMasters(ctx context.Context, connector *ssh.Connector, targetMaster *ssh.MuxServer) {
+	masters := connector.Masters()
+	for i := len(masters) - 1; i >= 0; i-- {
+		m := masters[i]
+		if m == nil || m == targetMaster || !m.PersistEnabled() {
+			continue
+		}
+		connector.ReleaseMaster(m)
+		select {
+		case <-ctx.Done():
+			return
+		case <-m.Wait():
+		}
+	}
+}
+
+// isMuxDaemonChild reports whether this process is the detached master daemon
+// started by handoffPersistentMaster.
+func isMuxDaemonChild() bool {
+	return os.Getenv(sshMuxDaemonEnv) == "true"
 }
 
 func sshConnectionError(nodeID string, err error) error {
@@ -550,7 +1416,7 @@ func (o *SshOptions) resolveNode(ctx context.Context, provider *config.Repositor
 		}
 	}
 
-	shouldRemember := utils.EffectiveRememberPolicy(o.Remember, provider.Snapshot()) == utils.RememberPolicyAlways
+	shouldRemember := !isMuxDaemonChild() && utils.EffectiveRememberPolicy(o.Remember, provider.Snapshot()) == utils.RememberPolicyAlways
 
 	res, err := provider.PrepareNodeContext(ctx, config.EnsureNodeOptions{
 		Target:       o.Target,
@@ -564,8 +1430,8 @@ func (o *SshOptions) resolveNode(ctx context.Context, provider *config.Repositor
 	if err != nil {
 		return "", false, err
 	}
-	if res.Created {
-		return res.NodeID, true, nil
+	if res.Created || isMuxDaemonChild() {
+		return res.NodeID, res.Created, nil
 	}
 	updated, err := update(ctx, res.NodeID, o, provider, shouldRemember)
 	return res.NodeID, updated, err
@@ -785,6 +1651,14 @@ func updateIdentityFields(identity *models.Identity, o *SshOptions) bool {
 }
 
 func update(ctx context.Context, nodeID string, o *SshOptions, provider *config.Repository, shouldRemember bool) (bool, error) {
+	if strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) {
+		if o.JumpHost != "" {
+			if _, err := provider.ResolveProxyJumpChain(o.JumpHost); err != nil {
+				return false, fmt.Errorf("resolve SSH proxy jump %q failed: %w", o.JumpHost, err)
+			}
+		}
+		return false, nil
+	}
 	if o.Password == "" && o.IdentityFile == "" && o.JumpHost == "" && !o.Sudo && o.Alias == "" && len(o.Tags) == 0 {
 		return false, nil
 	}
@@ -839,27 +1713,31 @@ func (o *SshOptions) effectiveInterpreter(client *ssh.Client) ssh.Interpreter {
 	return ssh.InterpreterServer
 }
 
-func (o *SshOptions) runPipedShell(ctx context.Context, client *ssh.Client) error {
-	strict, err := commandOutputSupported(ctx)
+func (o *SshOptions) runPipedShellWithStreams(ctx context.Context, client *ssh.Client, stdin io.Reader, stdout, stderr io.Writer) error {
+	strict, err := streamOutputSupported(ctx, stdout, stderr)
 	if err != nil {
 		return err
 	}
 	if o.execution.enabled() || strict {
-		return client.RunShellWithoutPTY(ctx, os.Stdin, os.Stdout, os.Stderr)
+		return client.RunShellWithoutPTY(ctx, stdin, stdout, stderr)
 	}
-	return client.RunShellWithIO(ctx, os.Stdin, os.Stdout, os.Stderr)
+	return client.RunShellWithIO(ctx, stdin, stdout, stderr)
 }
 
 func (o *SshOptions) runCommand(ctx context.Context, client *ssh.Client, command string) error {
+	return o.runCommandWithStreams(ctx, client, command, os.Stdin, os.Stdout, os.Stderr)
+}
+
+func (o *SshOptions) runCommandWithStreams(ctx context.Context, client *ssh.Client, command string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if o.commandPlan != nil {
-		return client.RunCommandPlanWithIO(ctx, *o.commandPlan, os.Stdin, os.Stdout, os.Stderr)
+		return client.RunCommandPlanWithIO(ctx, *o.commandPlan, stdin, stdout, stderr)
 	}
 	if !o.Sudo && o.Command == "" && o.stdinScript {
 		if o.effectiveInterpreter(client) == ssh.InterpreterServer {
-			return o.runPipedShell(ctx, client)
+			return o.runPipedShellWithStreams(ctx, client, stdin, stdout, stderr)
 		}
 	}
-	if !o.Sudo && o.Command != "" {
+	if !o.Sudo && command != "" {
 		var execCfg *ssh.ExecutionConfig
 		if client != nil {
 			execCfg = client.Execution()
@@ -868,13 +1746,13 @@ func (o *SshOptions) runCommand(ctx context.Context, client *ssh.Client, command
 		if err != nil {
 			return fmt.Errorf("plan command: %w", err)
 		}
-		strict, err := commandOutputSupported(ctx)
+		strict, err := streamOutputSupported(ctx, stdout, stderr)
 		if err != nil {
 			return err
 		}
 		if strict {
-			return client.RunCommandPlanWithIO(ctx, plan, os.Stdin, os.Stdout, os.Stderr)
+			return client.RunCommandPlanWithIO(ctx, plan, stdin, stdout, stderr)
 		}
 	}
-	return client.RunCommandWithIO(ctx, command, o.Sudo, os.Stdin, os.Stdout, os.Stderr)
+	return client.RunCommandWithIO(ctx, command, o.Sudo, stdin, stdout, stderr)
 }

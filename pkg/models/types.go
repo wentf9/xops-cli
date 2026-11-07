@@ -230,6 +230,12 @@ type Node struct {
 
 	// 执行环境配置
 	Execution *ssh.ExecutionConfig `yaml:"execution,omitempty" json:"execution,omitempty"`
+
+	// 连接复用配置
+	Control *ssh.ControlConfig `yaml:"control,omitempty" json:"control,omitempty"`
+
+	// OpenSSHAlias 记录运行时从 ~/.ssh/config 具体 Host 块派生该节点时的源别名（不序列化落盘）
+	OpenSSHAlias string `yaml:"-" json:"-"`
 }
 
 // NodeFilter 用于批量操作时筛选节点

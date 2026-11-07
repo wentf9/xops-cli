@@ -9,17 +9,19 @@ import (
 
 	"github.com/wentf9/xops-cli/core/concurrent"
 	corepolicy "github.com/wentf9/xops-cli/core/mcp/policy"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/models"
 )
 
 // Provider owns one coherent in-memory configuration snapshot. All reads see
 // one revision. Repository owns durable mutations and publishes new snapshots.
 type Provider struct {
-	mu          sync.RWMutex
-	cfg         *Configuration
-	lookupIndex map[string][]string
-	aliasIndex  map[string]string
-	openSSH     *OpenSSHParser
+	mu             sync.RWMutex
+	cfg            *Configuration
+	lookupIndex    map[string][]string
+	aliasIndex     map[string]string
+	openSSH        *OpenSSHParser
+	openSSHAliases map[string]string
 }
 
 var _ ConfigProvider = (*Provider)(nil)
@@ -63,7 +65,54 @@ func newProvider(cfg *Configuration, parser *OpenSSHParser) *Provider {
 func (p *Provider) Frozen() ConfigProvider {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return newProvider(p.cfg, p.openSSH)
+	frozen := newProvider(p.cfg, p.openSSH)
+	if len(p.openSSHAliases) > 0 {
+		frozen.openSSHAliases = make(map[string]string, len(p.openSSHAliases))
+		for k, v := range p.openSSHAliases {
+			frozen.openSSHAliases[k] = v
+		}
+	}
+	return frozen
+}
+
+// GetOpenSSHControl returns multiplexing configuration from OpenSSH config for an alias.
+func (p *Provider) GetOpenSSHControl(alias string) (*ssh.ControlConfig, error) {
+	if p == nil || p.openSSH == nil {
+		return nil, nil
+	}
+	return p.openSSH.GetControlConfig(alias)
+}
+
+// GetOpenSSHParser returns the underlying OpenSSH parser.
+func (p *Provider) GetOpenSSHParser() *OpenSSHParser {
+	if p == nil {
+		return nil
+	}
+	return p.openSSH
+}
+
+// SetNodeOpenSSHAlias records the concrete OpenSSH Host alias from which nodeID
+// was derived during the current session without modifying persisted state.
+func (p *Provider) SetNodeOpenSSHAlias(nodeID, alias string) {
+	if p == nil || nodeID == "" || alias == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.openSSHAliases == nil {
+		p.openSSHAliases = make(map[string]string)
+	}
+	p.openSSHAliases[nodeID] = alias
+}
+
+// NodeOpenSSHAlias returns the session-recorded OpenSSH Host alias for nodeID.
+func (p *Provider) NodeOpenSSHAlias(nodeID string) string {
+	if p == nil || nodeID == "" {
+		return ""
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.openSSHAliases[nodeID]
 }
 
 // Snapshot returns a deep copy that callers may retain and mutate freely.
@@ -140,6 +189,7 @@ func (p *Provider) Resolve(nodeID string) (models.Node, models.Host, models.Iden
 	if node, ok := p.cfg.Nodes.Get(nodeID); ok {
 		host, hostOK := p.cfg.Hosts.Get(node.HostRef)
 		identity, identityOK := p.cfg.Identities.Get(node.IdentityRef)
+		openSSHAlias := p.openSSHAliases[nodeID]
 		p.mu.RUnlock()
 		if !hostOK {
 			return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("host ref %q for node %q: %w", node.HostRef, nodeID, ErrHostNotFound)
@@ -147,7 +197,11 @@ func (p *Provider) Resolve(nodeID string) (models.Node, models.Host, models.Iden
 		if !identityOK {
 			return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("identity ref %q for node %q: %w", node.IdentityRef, nodeID, ErrIdentityNotFound)
 		}
-		return cloneNode(node), cloneHost(host), cloneIdentity(identity), nil
+		clonedNode := cloneNode(node)
+		if clonedNode.OpenSSHAlias == "" {
+			clonedNode.OpenSSHAlias = openSSHAlias
+		}
+		return clonedNode, cloneHost(host), cloneIdentity(identity), nil
 	}
 	p.mu.RUnlock()
 
@@ -178,7 +232,11 @@ func (p *Provider) GetNode(nodeID string) (models.Node, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	node, ok := p.cfg.Nodes.Get(nodeID)
-	return cloneNode(node), ok
+	cloned := cloneNode(node)
+	if ok && cloned.OpenSSHAlias == "" {
+		cloned.OpenSSHAlias = p.openSSHAliases[nodeID]
+	}
+	return cloned, ok
 }
 
 func (p *Provider) GetHost(nodeID string) (models.Host, bool) {
@@ -318,22 +376,24 @@ func buildIndexes(cfg *Configuration, rejectAliasConflicts bool) (map[string][]s
 				return nil, nil, err
 			}
 		}
-		if identity.User == "" {
+		user := normalizedIdentityUser(identity.User)
+		if user == "" {
 			continue
 		}
+		port := normalizedHostPort(host.Port)
 		for _, address := range append(slices.Clone(host.Alias), host.Address) {
 			if address == "" {
 				continue
 			}
-			addLookup(lookup, fmt.Sprintf("%s@%s", identity.User, address), nodeID)
-			addLookup(lookup, fmt.Sprintf("%s@%s:%d", identity.User, address, host.Port), nodeID)
+			addLookup(lookup, fmt.Sprintf("%s@%s", user, address), nodeID)
+			addLookup(lookup, fmt.Sprintf("%s@%s:%d", user, address, port), nodeID)
 		}
 		for _, alias := range node.Alias {
 			if alias == "" {
 				continue
 			}
-			addLookup(lookup, fmt.Sprintf("%s@%s", identity.User, alias), nodeID)
-			addLookup(lookup, fmt.Sprintf("%s@%s:%d", identity.User, alias, host.Port), nodeID)
+			addLookup(lookup, fmt.Sprintf("%s@%s", user, alias), nodeID)
+			addLookup(lookup, fmt.Sprintf("%s@%s:%d", user, alias, port), nodeID)
 		}
 	}
 	for key := range lookup {
@@ -346,11 +406,15 @@ func addAlias(lookup map[string][]string, aliases map[string]string, alias, node
 	if alias == "" {
 		return nil
 	}
-	if existing, ok := aliases[alias]; ok && existing != nodeID {
+	if existing, ok := aliases[alias]; ok {
+		if existing == nodeID {
+			addLookup(lookup, alias, nodeID)
+			return nil
+		}
 		if rejectConflict {
 			return fmt.Errorf("alias %q is already assigned to node %q", alias, existing)
 		}
-		delete(aliases, alias)
+		aliases[alias] = ""
 		addLookup(lookup, alias, nodeID)
 		return nil
 	}
@@ -388,6 +452,7 @@ func cloneConfiguration(cfg *Configuration) *Configuration {
 	cloned.Guardrail = cloneGuardrail(cfg.Guardrail)
 	cloned.MCP = cfg.MCP.Clone()
 	cloned.Execution = cfg.Execution.Clone()
+	cloned.Control = cfg.Control.Clone()
 	if cfg.Nodes != nil {
 		for _, key := range cfg.Nodes.Keys() {
 			if node, ok := cfg.Nodes.Get(key); ok {
@@ -420,6 +485,9 @@ func cloneNode(node models.Node) models.Node {
 	}
 	if node.Execution != nil {
 		node.Execution = node.Execution.Clone()
+	}
+	if node.Control != nil {
+		node.Control = node.Control.Clone()
 	}
 	return node
 }

@@ -13,6 +13,10 @@ func (defaultAdapter) Debugf(format string, args ...any) {
 	Debugf(format, args...)
 }
 
+func (defaultAdapter) Warnf(format string, args ...any) {
+	PrintWarnf(format, args...)
+}
+
 // DefaultLogger 返回基于当前全局配置的 DebugLogger 适配器
 func DefaultLogger() corelog.DebugLogger {
 	return defaultAdapter{}

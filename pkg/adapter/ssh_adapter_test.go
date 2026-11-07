@@ -2256,3 +2256,92 @@ func newTestAdapterConfig(nodeID string, identity models.Identity) *config.Confi
 		Hosts:      hostMap,
 	}
 }
+
+func TestSSHAdapter_ZeroPortAndEmptyUserSnapshotNormalization(t *testing.T) {
+	ctx := context.Background()
+	localUser := sshenv.Discover().LocalUser
+	if localUser == "" {
+		t.Skip("local user is empty in test environment")
+	}
+
+	nodeMap := concurrent.NewMap[string, models.Node](concurrent.HashString)
+	hostMap := concurrent.NewMap[string, models.Host](concurrent.HashString)
+	identityMap := concurrent.NewMap[string, models.Identity](concurrent.HashString)
+
+	hostMap.Set("host-zero", models.Host{Address: "10.99.88.77", Port: 0})
+	identityMap.Set("id-empty-user", models.Identity{
+		User:     "",
+		AuthType: "password",
+		Password: "zero-port-secret",
+	})
+	nodeMap.Set("node-zero", models.Node{
+		HostRef:     "host-zero",
+		IdentityRef: "id-empty-user",
+	})
+	cfg := &config.Configuration{
+		Nodes:      nodeMap,
+		Identities: identityMap,
+		Hosts:      hostMap,
+	}
+
+	provider := config.NewProviderWithoutOpenSSH(cfg)
+	adp := NewSSHAdapter(provider)
+
+	// 1. GetConfig normalizes Port=0 -> 22 and User="" -> localUser
+	clientCfg, err := adp.GetConfig("node-zero")
+	if err != nil {
+		t.Fatalf("GetConfig(node-zero) failed: %v", err)
+	}
+	if clientCfg.Port != 22 {
+		t.Fatalf("expected Port=22 from GetConfig, got %d", clientCfg.Port)
+	}
+	if clientCfg.User != localUser {
+		t.Fatalf("expected User=%q from GetConfig, got %q", localUser, clientCfg.User)
+	}
+
+	// 2. ExpandControlPath normalizes %p -> 22 and %r -> localUser
+	expanded, err := adp.ExpandControlPath("node-zero", "/tmp/mux-%r@%h:%p")
+	if err != nil {
+		t.Fatalf("ExpandControlPath failed: %v", err)
+	}
+	wantExpanded := fmt.Sprintf("/tmp/mux-%s@10.99.88.77:22", localUser)
+	if expanded != wantExpanded {
+		t.Fatalf("expected ExpandControlPath=%q, got %q", wantExpanded, expanded)
+	}
+
+	// 3. ResolveSecret accepts normalized Port=22 and User=localUser without false ErrSnapshotMismatch
+	secret, err := adp.ResolveSecret(ctx, ssh.SecretRequest{
+		Kind:         ssh.SecretKindLoginPassword,
+		NodeID:       "node-zero",
+		Host:         "10.99.88.77",
+		Port:         22,
+		User:         localUser,
+		VersionToken: clientCfg.AuthUpdateToken,
+	})
+	if err != nil {
+		t.Fatalf("ResolveSecret with normalized Port=22 and User=%q failed: %v", localUser, err)
+	}
+	if string(secret) != "zero-port-secret" {
+		t.Fatalf("expected secret 'zero-port-secret', got %q", string(secret))
+	}
+
+	// 4. ResolveSecret still fails closed with ErrSnapshotMismatch on mismatched port or user
+	if _, err := adp.ResolveSecret(ctx, ssh.SecretRequest{
+		Kind:   ssh.SecretKindLoginPassword,
+		NodeID: "node-zero",
+		Host:   "10.99.88.77",
+		Port:   2222,
+		User:   localUser,
+	}); !errors.Is(err, ssh.ErrSnapshotMismatch) {
+		t.Fatalf("expected ErrSnapshotMismatch for Port=2222, got %v", err)
+	}
+	if _, err := adp.ResolveSecret(ctx, ssh.SecretRequest{
+		Kind:   ssh.SecretKindLoginPassword,
+		NodeID: "node-zero",
+		Host:   "10.99.88.77",
+		Port:   22,
+		User:   localUser + "-other",
+	}); !errors.Is(err, ssh.ErrSnapshotMismatch) {
+		t.Fatalf("expected ErrSnapshotMismatch for mismatched user, got %v", err)
+	}
+}

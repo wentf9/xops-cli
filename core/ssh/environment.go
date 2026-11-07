@@ -47,6 +47,13 @@ type Environment struct {
 	ResolveKeyPath      func(string) string
 	InteractiveIO       InteractiveIO
 	InputBridge         InputBridge
+
+	// Multiplexing and path expansion parameters injected by host
+	HomeDir   string
+	LocalUser string
+	LocalHost string
+	LocalUID  string
+	LookupEnv func(string) (string, bool)
 }
 
 func WithEnvironment(environment Environment) Option {

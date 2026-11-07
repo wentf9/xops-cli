@@ -3,6 +3,7 @@ package config
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -1943,5 +1944,171 @@ func TestEnsureNodeContext_OpenSSHInheritedJumpNotOverriddenByLocalAlias(t *test
 	expectedJump := OpenSSHNodePrefix + "bastion"
 	if node.ProxyJump != expectedJump {
 		t.Errorf("expected inherited ProxyJump %q, got %q (must not be local node root@10.0.0.99:22)", expectedJump, node.ProxyJump)
+	}
+}
+
+func TestOpenSSHPrefixedCompositeSelector_PreservesOpenSSHConfigAndAlias(t *testing.T) {
+	ctx := context.Background()
+	sshConfigContent := `
+Host jump-box
+    HostName 10.20.30.40
+    User jumpdefault
+    Port 2200
+    IdentityFile ~/.ssh/id_jump_box
+    ProxyJump gw-box
+
+Host gw-box
+    HostName 10.20.30.1
+    User gwuser
+    Port 22
+`
+	parser, err := NewOpenSSHParserFromReader(strings.NewReader(sshConfigContent))
+	if err != nil {
+		t.Fatalf("failed to create openssh parser: %v", err)
+	}
+	cfg := cloneConfiguration(nil)
+	store := &repositoryTestStore{result: PersistResult{Applied: true, Durable: true}}
+	repo, err := NewRepositoryWithOpenSSHParser(cfg, store, parser)
+	if err != nil {
+		t.Fatalf("failed to create repo: %v", err)
+	}
+
+	// 1. Bare openssh:user@alias:port selector matches virtual node and records canonical alias "jump-box".
+	bareTarget := ConnectionTarget{
+		Selector: "openssh:jumpuser@jump-box:2201",
+	}
+	bareResolved, err := ResolveTarget(repo, bareTarget)
+	if err != nil {
+		t.Fatalf("ResolveTarget(bare openssh composite) failed: %v", err)
+	}
+	if bareResolved.OpenSSHAlias != "jump-box" {
+		t.Fatalf("expected OpenSSHAlias='jump-box', got %q", bareResolved.OpenSSHAlias)
+	}
+	if bareResolved.Host != "10.20.30.40" || bareResolved.User != "jumpuser" || bareResolved.Port != 2201 {
+		t.Fatalf("unexpected resolved target for bare openssh composite: %+v", bareResolved)
+	}
+
+	// 2. Explicit port override on openssh:jumpuser@jump-box must still resolve via OpenSSHParser Step 4.
+	overrideTarget := ConnectionTarget{
+		Selector: "openssh:jumpuser@jump-box",
+		Port:     2222,
+		HasPort:  true,
+	}
+	overrideResolved, err := ResolveTarget(repo, overrideTarget)
+	if err != nil {
+		t.Fatalf("ResolveTarget(openssh composite + port override) failed: %v", err)
+	}
+	if overrideResolved.Host != "10.20.30.40" || overrideResolved.Port != 2222 || overrideResolved.OpenSSHAlias != "jump-box" {
+		t.Fatalf("expected Host=10.20.30.40 Port=2222 OpenSSHAlias=jump-box, got %+v", overrideResolved)
+	}
+	if overrideResolved.ProxyJump != "openssh:gw-box" {
+		t.Fatalf("expected inherited ProxyJump 'openssh:gw-box', got %q", overrideResolved.ProxyJump)
+	}
+
+	ensured, err := repo.EnsureNodeContext(ctx, EnsureNodeOptions{Target: overrideTarget})
+	if err != nil {
+		t.Fatalf("EnsureNodeContext(openssh composite + port override) failed: %v", err)
+	}
+	ensuredNode, ok := repo.Snapshot().Nodes.Get(ensured.NodeID)
+	if !ok {
+		t.Fatalf("expected node %q to exist in snapshot", ensured.NodeID)
+	}
+	if gotAlias := repo.effectiveNodeOpenSSHAlias(ensured.NodeID, ensuredNode); gotAlias != "jump-box" {
+		t.Fatalf("expected effectiveNodeOpenSSHAlias(%q) = 'jump-box', got %q", ensured.NodeID, gotAlias)
+	}
+}
+
+func TestTargetResolution_ZeroPortAndEmptyUserInvariants(t *testing.T) {
+	cfg := cloneConfiguration(nil)
+	store := &repositoryTestStore{result: PersistResult{Applied: true, Durable: true}}
+
+	// 1. Verify Host.Port == 0 and empty Identity.User match explicit Port=22 and default OS user.
+	defaultUser, err := resolveEffectiveUser(ConnectionTarget{}, "", "")
+	if err != nil {
+		t.Fatalf("resolveEffectiveUser failed: %v", err)
+	}
+	cfg.Hosts.Set("10.30.40.50:0", models.Host{Address: "10.30.40.50", Port: 0})
+	cfg.Identities.Set("empty-user-id", models.Identity{User: "", AuthType: "auto"})
+	cfg.Nodes.Set("zero-port-node", models.Node{
+		HostRef:     "10.30.40.50:0",
+		IdentityRef: "empty-user-id",
+		Alias:       []string{"zero-user-alias"},
+	})
+	repoZero, err := NewRepositoryWithoutOpenSSH(cfg, store)
+	if err != nil {
+		t.Fatalf("NewRepositoryWithoutOpenSSH failed: %v", err)
+	}
+	if got, err := repoZero.ResolveSelector(defaultUser + "@zero-user-alias"); err != nil || got != "zero-port-node" {
+		t.Fatalf("expected ResolveSelector(%q) = 'zero-port-node', got %q (err=%v)", defaultUser+"@zero-user-alias", got, err)
+	}
+	if got, err := repoZero.ResolveSelector(defaultUser + "@zero-user-alias:22"); err != nil || got != "zero-port-node" {
+		t.Fatalf("expected ResolveSelector(%q) = 'zero-port-node', got %q (err=%v)", defaultUser+"@zero-user-alias:22", got, err)
+	}
+	resolvedZero, err := ResolveTarget(repoZero, ConnectionTarget{
+		Selector: "zero-port-node",
+		User:     defaultUser,
+		HasUser:  true,
+		Port:     22,
+		HasPort:  true,
+	})
+	if err != nil {
+		t.Fatalf("ResolveTarget(zero-port-node with explicit -p 22 and default user) failed: %v", err)
+	}
+	if resolvedZero.MatchedNodeID != "zero-port-node" {
+		t.Fatalf("expected MatchedNodeID='zero-port-node', got %q", resolvedZero.MatchedNodeID)
+	}
+
+	// 2. Multi-candidate filtering, index lookup, and jump resolution with Port==0 / User==""
+	cfg.Hosts.Set("10.30.40.50:2222", models.Host{Address: "10.30.40.50", Port: 2222})
+	cfg.Identities.Set("other-user-id", models.Identity{User: "otheruser", AuthType: "auto"})
+	cfg.Nodes.Set("other-port-node", models.Node{
+		HostRef:     "10.30.40.50:2222",
+		IdentityRef: "other-user-id",
+	})
+	repoMulti, err := NewRepositoryWithoutOpenSSH(cfg, store)
+	if err != nil {
+		t.Fatalf("NewRepositoryWithoutOpenSSH failed: %v", err)
+	}
+	// Multi-candidate lookup by address "10.30.40.50" with explicit defaultUser and Port 22 must filter to zero-port-node
+	resolvedMulti, err := ResolveTarget(repoMulti, ConnectionTarget{
+		Selector: "10.30.40.50",
+		User:     defaultUser,
+		HasUser:  true,
+		Port:     22,
+		HasPort:  true,
+	})
+	if err != nil {
+		t.Fatalf("ResolveTarget(multi-candidate 10.30.40.50 with defaultUser and Port 22) failed: %v", err)
+	}
+	if resolvedMulti.MatchedNodeID != "zero-port-node" {
+		t.Fatalf("expected MatchedNodeID='zero-port-node' from multi-candidate filter, got %q", resolvedMulti.MatchedNodeID)
+	}
+
+	// Jump hop resolution against zero-port-node with explicit defaultUser@10.30.40.50:22
+	jumpHopSpec := fmt.Sprintf("%s@10.30.40.50:22", defaultUser)
+	resolvedJump, err := repoMulti.ResolveProxyJumpChain(jumpHopSpec)
+	if err != nil {
+		t.Fatalf("ResolveProxyJumpChain(%q) failed: %v", jumpHopSpec, err)
+	}
+	if resolvedJump != "zero-port-node" {
+		t.Fatalf("expected jump chain to resolve to 'zero-port-node', got %q", resolvedJump)
+	}
+
+	// Index lookup for Port==0 host with non-empty user must index :22
+	cfg.Identities.Set("indexed-user-id", models.Identity{User: "idxuser", AuthType: "auto"})
+	cfg.Nodes.Set("indexed-zero-port", models.Node{
+		HostRef:     "10.30.40.50:0",
+		IdentityRef: "indexed-user-id",
+		Alias:       []string{"zero-alias"},
+	})
+	repoIdx, err := NewRepositoryWithoutOpenSSH(cfg, store)
+	if err != nil {
+		t.Fatalf("NewRepositoryWithoutOpenSSH failed: %v", err)
+	}
+	if got, err := repoIdx.ResolveSelector("idxuser@10.30.40.50:22"); err != nil || got != "indexed-zero-port" {
+		t.Fatalf("expected ResolveSelector('idxuser@10.30.40.50:22') = 'indexed-zero-port', got %q (err=%v)", got, err)
+	}
+	if got, err := repoIdx.ResolveSelector("idxuser@zero-alias:22"); err != nil || got != "indexed-zero-port" {
+		t.Fatalf("expected ResolveSelector('idxuser@zero-alias:22') = 'indexed-zero-port', got %q (err=%v)", got, err)
 	}
 }

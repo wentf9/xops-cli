@@ -1,0 +1,694 @@
+package cmd
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"strconv"
+	"strings"
+	"syscall"
+
+	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/core/ssh"
+	"github.com/wentf9/xops-cli/internal/sshenv"
+	"github.com/wentf9/xops-cli/pkg/adapter"
+	"github.com/wentf9/xops-cli/pkg/config"
+	"github.com/wentf9/xops-cli/pkg/i18n"
+	"github.com/wentf9/xops-cli/pkg/logger"
+	cryptoSSH "golang.org/x/crypto/ssh"
+)
+
+// ExitCoder is implemented by errors that specify a process exit code.
+type ExitCoder interface {
+	ExitCode() int
+}
+
+// ControlExitError represents an OpenSSH control command exit status.
+type ControlExitError struct {
+	Code    int
+	Message string
+	// Reported marks a message already written to stderr in its final
+	// OpenSSH-compatible form, so the top-level handler must not print it again.
+	// Usage failures raised while parsing flags are not reported yet.
+	Reported bool
+}
+
+func (e *ControlExitError) Error() string {
+	return e.Message
+}
+
+func (e *ControlExitError) ExitCode() int {
+	return e.Code
+}
+
+// ExitCodeFromError extracts the exit code if err implements ExitCoder.
+func ExitCodeFromError(err error) (int, bool) {
+	var coder ExitCoder
+	if errors.As(err, &coder) {
+		return coder.ExitCode(), true
+	}
+	return 0, false
+}
+
+// ErrorAlreadyReported reports whether err's message was already written to
+// stderr in its final form and must not be printed a second time.
+func ErrorAlreadyReported(err error) bool {
+	var control *ControlExitError
+	if errors.As(err, &control) {
+		return control.Reported
+	}
+	return false
+}
+
+type controlStreams struct {
+	Stdin  io.Reader
+	Stdout io.Writer
+	Stderr io.Writer
+}
+
+func defaultControlStreams() controlStreams {
+	return controlStreams{
+		Stdin:  os.Stdin,
+		Stdout: os.Stdout,
+		Stderr: os.Stderr,
+	}
+}
+
+func controlError(stderr io.Writer, msg string) error {
+	_, _ = fmt.Fprintln(stderr, msg)
+	return &ControlExitError{Code: 255, Message: msg, Reported: true}
+}
+
+func controlConnectError(stderr io.Writer, socketPath string, err error) error {
+	errText := formatSyscallError(err)
+	msg := fmt.Sprintf("Control socket connect(%s): %s", socketPath, errText)
+	_, _ = fmt.Fprintln(stderr, msg)
+	return &ControlExitError{Code: 255, Message: msg, Reported: true}
+}
+
+func formatSyscallError(err error) string {
+	if err == nil {
+		return ""
+	}
+	var sysErr syscall.Errno
+	if errors.As(err, &sysErr) {
+		switch sysErr {
+		case syscall.ENOENT:
+			return "No such file or directory"
+		case syscall.ECONNREFUSED:
+			return "Connection refused"
+		case syscall.EACCES:
+			return "Permission denied"
+		default:
+			return sysErr.Error()
+		}
+	}
+	errStr := strings.ToLower(err.Error())
+	if strings.Contains(errStr, "no such file or directory") {
+		return "No such file or directory"
+	}
+	if strings.Contains(errStr, "connection refused") || strings.Contains(errStr, "wsaeconnrefused") {
+		return "Connection refused"
+	}
+	if strings.Contains(errStr, "permission denied") {
+		return "Permission denied"
+	}
+	return err.Error()
+}
+
+// ExecuteControlCommand executes the -O subcommand on the active master process.
+func ExecuteControlCommand(ctx context.Context, o *SshOptions) error {
+	return executeControlCommandWithStreams(ctx, o, defaultControlStreams())
+}
+
+func executeControlCommandWithStreams(ctx context.Context, o *SshOptions, streams controlStreams) error {
+	if err := o.control.Validate(); err != nil {
+		return controlError(streams.Stderr, err.Error())
+	}
+	// -o Port/User/IdentityFile/ProxyJump are applied by the command's Complete
+	// step, where the parsed flag set is available to keep primary flags winning.
+	if err := o.ensureArgsParsed(); err != nil {
+		return controlError(streams.Stderr, err.Error())
+	}
+
+	expandedPath, target, provider, nodeID, err := resolveControlContext(ctx, o, streams.Stderr)
+	if err != nil {
+		return err
+	}
+
+	cmdName := strings.ToLower(strings.TrimSpace(o.control.CtlCmd))
+	switch cmdName {
+	case "check":
+		return executeCheck(ctx, expandedPath, streams)
+	case "exit":
+		return executeExit(ctx, expandedPath, streams)
+	case "stop":
+		return executeStop(ctx, expandedPath, streams)
+	case "forward":
+		return executeForward(ctx, expandedPath, o, streams)
+	case "cancel":
+		return executeCancel(ctx, expandedPath, o, streams)
+	case "proxy":
+		return executeProxy(ctx, expandedPath, target, provider, nodeID, o, streams)
+	case "proxy-stream":
+		return executeProxyStream(ctx, expandedPath, streams)
+	case "conninfo":
+		return executeInfo(ctx, expandedPath, "connection", streams)
+	case "channels":
+		return executeInfo(ctx, expandedPath, "channels", streams)
+	default:
+		return controlError(streams.Stderr, fmt.Sprintf("unknown control command %q", cmdName))
+	}
+}
+
+// resolveControlSocketPath resolves the control socket for a -O request without
+// mutating configuration. A -O request is a query against an existing master, so
+// it must never create, prepare, or persist a node as a side effect.
+func resolveControlSocketPath(ctx context.Context, o *SshOptions, stderr io.Writer) (string, error) {
+	expandedPath, _, _, _, err := resolveControlContext(ctx, o, stderr)
+	return expandedPath, err
+}
+
+func resolveControlContext(ctx context.Context, o *SshOptions, stderr io.Writer) (string, ssh.TargetContext, config.ConfigProvider, string, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return "", ssh.TargetContext{}, nil, "", err
+		}
+	}
+	if o != nil {
+		if err := o.ensureGeneralOptionsApplied(); err != nil {
+			return "", ssh.TargetContext{}, nil, "", controlError(stderr, err.Error())
+		}
+	}
+
+	provider, providerErr := loadReadOnlyControlProvider()
+	nodeID := ""
+	connTarget := effectiveConnectionTarget(o, "")
+	if provider != nil && strings.TrimSpace(connTarget.Selector) != "" {
+		resolved, err := resolveControlNodeID(provider, connTarget)
+		if err != nil {
+			return "", ssh.TargetContext{}, nil, "", controlError(stderr, fmt.Sprintf("resolve target %q failed: %v", connTarget.Selector, err))
+		}
+		nodeID = resolved
+	} else if provider == nil && providerErr != nil && strings.TrimSpace(o.control.ControlPath) == "" {
+		// Without configuration only an explicit -S path can be resolved; report
+		// the configuration problem instead of silently using a wrong socket.
+		return "", ssh.TargetContext{}, nil, "", controlError(stderr, fmt.Sprintf("%s: %v", i18n.T("ssh_err_load_config"), providerErr))
+	}
+
+	rawPath := strings.TrimSpace(o.control.ControlPath)
+	if rawPath == "none" {
+		return "", ssh.TargetContext{}, nil, "", controlError(stderr, "ControlPath must be specified when using -O")
+	}
+
+	target := controlTarget(o, provider, nodeID)
+	if rawPath != "" {
+		expanded, err := ssh.ExpandControlPath(rawPath, sshenv.Discover(), target)
+		if err != nil {
+			return "", ssh.TargetContext{}, nil, "", controlError(stderr, fmt.Sprintf("expand ControlPath %q failed: %v", rawPath, err))
+		}
+		return expanded, target, provider, nodeID, nil
+	}
+
+	// No -S: resolve from session (-o) / node / global / OpenSSH layers. An empty
+	// nodeID still honours -o ControlPath and the global default for ad-hoc hosts.
+	expanded, err := controlSocketPath(o, provider, nodeID)
+	if err != nil {
+		return "", ssh.TargetContext{}, nil, "", controlError(stderr, fmt.Sprintf("resolve control path failed: %v", err))
+	}
+	if expanded == "" || expanded == "none" {
+		return "", ssh.TargetContext{}, nil, "", controlError(stderr, "ControlPath must be specified when using -O")
+	}
+	return expanded, target, provider, nodeID, nil
+}
+
+// resolveControlNodeID resolves a ConnectionTarget against a read-only
+// ConfigProvider, returning the matched saved or OpenSSH virtual node ID when
+// the effective (user, host, port) matches an existing node, or "" when the
+// target is an unremembered override or ad-hoc destination.
+func resolveControlNodeID(provider config.ConfigProvider, target config.ConnectionTarget) (string, error) {
+	selector := strings.TrimSpace(target.Selector)
+	if provider == nil || selector == "" {
+		return "", nil
+	}
+	resolved, err := config.ResolveTarget(provider, target)
+	if err != nil {
+		return "", err
+	}
+	return resolved.MatchedNodeID, nil
+}
+
+func setProviderOpenSSHAlias(provider config.ConfigProvider, nodeID, alias string) {
+	if p, ok := provider.(interface{ SetNodeOpenSSHAlias(string, string) }); ok {
+		p.SetNodeOpenSSHAlias(nodeID, alias)
+	}
+}
+
+// loadReadOnlyControlProvider loads the local configuration as a read-only view.
+// It deliberately avoids the durable repository so control queries cannot apply
+// pending node changes or rewrite configuration files.
+func loadReadOnlyControlProvider() (config.ConfigProvider, error) {
+	configPath, keyPath, err := utils.GetConfigFilePath()
+	if err != nil {
+		return nil, fmt.Errorf("get config file path: %w", err)
+	}
+	configStore := config.NewDefaultStore(configPath, keyPath)
+	cfg, err := configStore.Load()
+	if err != nil {
+		return nil, err
+	}
+	provider, err := config.NewProvider(cfg)
+	if err != nil {
+		logger.DefaultLogger().Debugf("mux: load OpenSSH config failed (%v); falling back to local config", err)
+		return config.NewProviderWithoutOpenSSH(cfg), nil
+	}
+	return provider, nil
+}
+
+func executeCheck(ctx context.Context, socketPath string, streams controlStreams) error {
+	client, err := ssh.DialMuxClient(ctx, socketPath)
+	if err != nil {
+		return controlConnectError(streams.Stderr, socketPath, err)
+	}
+	defer func() { _ = client.Close() }()
+
+	pid, err := client.AliveCheck(ctx)
+	if err != nil {
+		return controlError(streams.Stderr, fmt.Sprintf("master alive check failed: %v", err))
+	}
+
+	_, _ = fmt.Fprintf(streams.Stderr, "Master running (pid=%d)\n", pid)
+	return nil
+}
+
+func executeExit(ctx context.Context, socketPath string, streams controlStreams) error {
+	client, err := ssh.DialMuxClient(ctx, socketPath)
+	if err != nil {
+		return controlConnectError(streams.Stderr, socketPath, err)
+	}
+	defer func() { _ = client.Close() }()
+
+	if err := client.Terminate(ctx); err != nil {
+		return controlError(streams.Stderr, fmt.Sprintf("master exit failed: %v", err))
+	}
+
+	_, _ = fmt.Fprintln(streams.Stderr, "Exit request sent.")
+	return nil
+}
+
+func executeStop(ctx context.Context, socketPath string, streams controlStreams) error {
+	client, err := ssh.DialMuxClient(ctx, socketPath)
+	if err != nil {
+		return controlConnectError(streams.Stderr, socketPath, err)
+	}
+	defer func() { _ = client.Close() }()
+
+	if err := client.StopListening(ctx); err != nil {
+		return controlError(streams.Stderr, fmt.Sprintf("master stop listening failed: %v", err))
+	}
+
+	_, _ = fmt.Fprintln(streams.Stderr, "Stop listening request sent.")
+	return nil
+}
+
+func executeForward(ctx context.Context, socketPath string, o *SshOptions, streams controlStreams) error {
+	reqs, err := parseForwardRequestsFromOptions(o)
+	if err != nil {
+		return controlError(streams.Stderr, err.Error())
+	}
+	if len(reqs) == 0 {
+		return controlError(streams.Stderr, "no forwardings specified for -O forward (use -L, -R, or -D)")
+	}
+
+	client, err := ssh.DialMuxClient(ctx, socketPath)
+	if err != nil {
+		return controlConnectError(streams.Stderr, socketPath, err)
+	}
+	defer func() { _ = client.Close() }()
+
+	for _, req := range reqs {
+		allocPort, err := client.OpenForward(ctx, req)
+		if err != nil {
+			msg := err.Error()
+			if !strings.HasPrefix(msg, "forwarding request failed:") {
+				msg = fmt.Sprintf("forwarding request failed: %s", msg)
+			}
+			return controlError(streams.Stderr, msg)
+		}
+		if allocPort > 0 {
+			_, _ = fmt.Fprintf(streams.Stderr, "Allocated port %d for remote forward\n", allocPort)
+		}
+	}
+
+	_, _ = fmt.Fprintln(streams.Stderr, "Forwarding request sent.")
+	return nil
+}
+
+func executeCancel(ctx context.Context, socketPath string, o *SshOptions, streams controlStreams) error {
+	reqs, err := parseForwardRequestsFromOptions(o)
+	if err != nil {
+		return controlError(streams.Stderr, err.Error())
+	}
+	if len(reqs) == 0 {
+		return controlError(streams.Stderr, "no forwardings specified for -O cancel (use -L, -R, or -D)")
+	}
+
+	client, err := ssh.DialMuxClient(ctx, socketPath)
+	if err != nil {
+		return controlConnectError(streams.Stderr, socketPath, err)
+	}
+	defer func() { _ = client.Close() }()
+
+	for _, req := range reqs {
+		if err := client.CloseForward(ctx, req); err != nil {
+			msg := err.Error()
+			if !strings.HasPrefix(msg, "cancel forward failed:") {
+				msg = fmt.Sprintf("cancel forward failed: %s", msg)
+			}
+			return controlError(streams.Stderr, msg)
+		}
+	}
+
+	_, _ = fmt.Fprintln(streams.Stderr, "Forwarding cancel request sent.")
+	return nil
+}
+
+func executeProxy(
+	ctx context.Context,
+	socketPath string,
+	target ssh.TargetContext,
+	provider config.ConfigProvider,
+	nodeID string,
+	o *SshOptions,
+	streams controlStreams,
+) error {
+	if o.commandPlan == nil {
+		if err := o.prepareCommandPlan(); err != nil {
+			return controlError(streams.Stderr, err.Error())
+		}
+	}
+	if o.StdinRedirect {
+		devNull, err := os.Open(os.DevNull)
+		if err != nil {
+			return controlError(streams.Stderr, fmt.Sprintf("open %s for SSH stdin failed: %v", os.DevNull, err))
+		}
+		defer func() { _ = devNull.Close() }()
+		streams.Stdin = devNull
+	}
+
+	cfg, muxOpts := buildControlProxyClientConfig(target, provider, nodeID, o)
+
+	client, err := ssh.DialControlProxyClient(ctx, socketPath, target, sshenv.Discover(), cfg, logger.DefaultLogger(), muxOpts...)
+	if err != nil {
+		if errors.Is(err, ssh.ErrUnauthorizedPeer) ||
+			errors.Is(err, ssh.ErrControlProxyRejected) ||
+			errors.Is(err, ssh.ErrControlTargetMismatch) {
+			return controlError(streams.Stderr, fmt.Sprintf("Control socket connect(%s): %v", socketPath, err))
+		}
+		return controlConnectError(streams.Stderr, socketPath, err)
+	}
+	defer func() { _ = client.Close() }()
+
+	if o.NoCmd {
+		if waitErr := client.Wait(ctx); waitErr != nil && !errors.Is(waitErr, context.Canceled) {
+			return mapControlProxySessionError(streams.Stderr, waitErr)
+		}
+		return nil
+	}
+
+	var sessionErr error
+	if o.Command != "" || o.stdinScript {
+		sessionErr = o.runCommandWithStreams(ctx, client, o.Command, streams.Stdin, streams.Stdout, streams.Stderr)
+	} else {
+		stdinFile, _ := streams.Stdin.(*os.File)
+		ioStreams := ssh.InteractiveIO{
+			Stdin:  stdinFile,
+			Stdout: streams.Stdout,
+			Stderr: streams.Stderr,
+		}
+		if o.Sudo {
+			sessionErr = client.ShellWithSudoIO(ctx, ioStreams)
+		} else {
+			sessionErr = client.ShellWithIO(ctx, ioStreams)
+		}
+	}
+
+	return mapControlProxySessionError(streams.Stderr, sessionErr)
+}
+
+func buildControlProxyClientConfig(
+	target ssh.TargetContext,
+	provider config.ConfigProvider,
+	nodeID string,
+	o *SshOptions,
+) (*ssh.ClientConfig, []ssh.MuxClientOption) {
+	var (
+		cfg      *ssh.ClientConfig
+		snapshot *config.Configuration
+		muxOpts  []ssh.MuxClientOption
+	)
+	if provider != nil {
+		snapshot = provider.Snapshot()
+		sessionAuth := adapter.SessionAuth{
+			Password:   o.Password,
+			Passphrase: o.Passphrase,
+			KeyPath:    utils.ToAbsolutePath(o.IdentityFile),
+			Remember:   false,
+			OTP:        o.OTP,
+			ProxyJump:  o.JumpHost,
+		}
+		adpOpts := []adapter.Option{
+			adapter.WithCredentialRecording(false),
+			adapter.WithGlobalSessionAuth(sessionAuth),
+		}
+		if nodeID != "" {
+			adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, sessionAuth))
+		}
+		if reg, regErr := utils.GetCredentialRegistry(snapshot); regErr == nil && reg != nil {
+			adpOpts = append(adpOpts, adapter.WithCredentialSource(reg))
+		}
+		adp := adapter.NewSSHAdapter(provider, adpOpts...)
+		if nodeID != "" {
+			if resolvedCfg, err := adp.GetConfig(nodeID); err == nil && resolvedCfg != nil {
+				normalizeControlProxyResolvedConfig(resolvedCfg, target)
+				cfg = resolvedCfg
+				muxOpts = append(muxOpts, ssh.WithMuxConnectionProvider(adp), ssh.WithMuxSecretResolver(adp))
+			}
+		}
+	}
+
+	if cfg == nil {
+		port := target.Port
+		if port <= 0 {
+			port = 22
+		}
+		var globalExec *ssh.ExecutionConfig
+		var globalPattern string
+		if snapshot != nil {
+			globalExec = snapshot.Execution
+			globalPattern = snapshot.PasswordPromptPattern
+		}
+		resolvedExec, _ := ssh.ResolveExecution(nil, globalExec)
+		cfg = &ssh.ClientConfig{
+			Address:               target.Host,
+			Port:                  port,
+			User:                  target.User,
+			Password:              o.Password,
+			SudoMode:              ssh.SudoModeAuto,
+			ProxyJump:             target.JumpHost,
+			Execution:             resolvedExec,
+			PasswordPromptPattern: globalPattern,
+		}
+	}
+
+	prompter := o.interaction
+	if prompter == nil && !o.StdinRedirect && !o.stdinScript {
+		if cliHandler := newCLIInteractionHandler(); cliHandler.canRemember {
+			prompter = cliHandler
+		}
+	}
+	if prompter != nil {
+		muxOpts = append(muxOpts, ssh.WithMuxSecretPrompter(prompter))
+	}
+	if snapshot != nil && snapshot.PasswordPromptPattern != "" {
+		muxOpts = append(muxOpts, ssh.WithMuxPasswordPromptPattern(snapshot.PasswordPromptPattern))
+	}
+	return cfg, muxOpts
+}
+
+func normalizeControlProxyResolvedConfig(resolvedCfg *ssh.ClientConfig, target ssh.TargetContext) {
+	if resolvedCfg.Port <= 0 {
+		resolvedCfg.Port = target.Port
+		if resolvedCfg.Port <= 0 {
+			resolvedCfg.Port = 22
+		}
+	}
+	if resolvedCfg.User == "" {
+		resolvedCfg.User = target.User
+	}
+}
+
+func mapControlProxySessionError(stderr io.Writer, err error) error {
+	if err == nil {
+		return nil
+	}
+	var exitErr *cryptoSSH.ExitError
+	if errors.As(err, &exitErr) {
+		code := exitErr.ExitStatus()
+		if code == 0 {
+			code = 255
+		}
+		return &ControlExitError{Code: code, Message: exitErr.Error(), Reported: true}
+	}
+	var cmdExitErr *ssh.CommandExitError
+	if errors.As(err, &cmdExitErr) && cmdExitErr.ExitCode != nil {
+		return &ControlExitError{Code: int(*cmdExitErr.ExitCode), Message: cmdExitErr.Error(), Reported: true}
+	}
+	return controlError(stderr, err.Error())
+}
+
+func executeProxyStream(ctx context.Context, socketPath string, streams controlStreams) error {
+	// The shared dialer performs the same peer-UID check, HELLO exchange, and
+	// MUX_C_PROXY switch as every other client path. A private handshake here
+	// would skip the peer validation and let a forged socket pass.
+	conn, err := ssh.DialMuxProxyStream(ctx, socketPath)
+	if err != nil {
+		if errors.Is(err, ssh.ErrUnauthorizedPeer) {
+			return controlError(streams.Stderr, fmt.Sprintf("Control socket connect(%s): %v", socketPath, err))
+		}
+		if errors.Is(err, ssh.ErrControlProxyRejected) {
+			return controlError(streams.Stderr, fmt.Sprintf("Control socket connect(%s): %v", socketPath, err))
+		}
+		return controlConnectError(streams.Stderr, socketPath, err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// Bi-directional pipe between streams.Stdin/streams.Stdout and the raw socket connection.
+	// Do not call conn.CloseWrite() when streams.Stdin hits EOF immediately (e.g. `< /dev/null`),
+	// because half-closing the Unix control socket causes the Master's readUnpaddedPacket loop
+	// to observe EOF and tear down the proxy session before buffered server packets are read.
+	stdoutDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(conn, streams.Stdin)
+	}()
+	go func() {
+		_, _ = io.Copy(streams.Stdout, conn)
+		close(stdoutDone)
+	}()
+
+	select {
+	case <-ctx.Done():
+		_ = conn.Close()
+		<-stdoutDone
+		return ctx.Err()
+	case <-stdoutDone:
+		return nil
+	}
+}
+
+func executeInfo(ctx context.Context, socketPath string, infoType string, streams controlStreams) error {
+	client, err := ssh.DialMuxClient(ctx, socketPath)
+	if err != nil {
+		return controlConnectError(streams.Stderr, socketPath, err)
+	}
+	defer func() { _ = client.Close() }()
+
+	info, err := client.RequestInfo(ctx, infoType)
+	if err != nil {
+		return controlError(streams.Stderr, err.Error())
+	}
+
+	_, _ = fmt.Fprint(streams.Stdout, info)
+	return nil
+}
+
+func parseForwardRequestsFromOptions(o *SshOptions) ([]ssh.ForwardRequest, error) {
+	var reqs []ssh.ForwardRequest
+
+	for _, lArg := range o.LocalForwards {
+		req, err := parseSingleForward(lArg, ssh.ForwardLocal)
+		if err != nil {
+			return nil, err
+		}
+		reqs = append(reqs, req)
+	}
+
+	for _, rArg := range o.RemoteForwards {
+		req, err := parseSingleForward(rArg, ssh.ForwardRemote)
+		if err != nil {
+			return nil, err
+		}
+		reqs = append(reqs, req)
+	}
+
+	if o.DynamicForward != "" {
+		req, err := parseSingleDynamicForward(o.DynamicForward)
+		if err != nil {
+			return nil, err
+		}
+		reqs = append(reqs, req)
+	}
+
+	return reqs, nil
+}
+
+func parseSingleForward(arg string, fwdType ssh.ForwardType) (ssh.ForwardRequest, error) {
+	var req ssh.ForwardRequest
+	req.Type = fwdType
+
+	bAddr, dAddr, err := parseForwardArg(arg)
+	if err != nil {
+		return req, err
+	}
+
+	bHost, bPortStr, err := net.SplitHostPort(bAddr)
+	if err != nil {
+		return req, fmt.Errorf("split bind addr failed: %w", err)
+	}
+	bPort, err := strconv.ParseUint(bPortStr, 10, 16)
+	if err != nil {
+		return req, fmt.Errorf("parse bind port failed: %w", err)
+	}
+
+	dHost, dPortStr, err := net.SplitHostPort(dAddr)
+	if err != nil {
+		return req, fmt.Errorf("split dest addr failed: %w", err)
+	}
+	dPort, err := strconv.ParseUint(dPortStr, 10, 16)
+	if err != nil {
+		return req, fmt.Errorf("parse dest port failed: %w", err)
+	}
+
+	req.ListenHost = bHost
+	req.ListenPort = uint32(bPort)
+	req.ConnectHost = dHost
+	req.ConnectPort = uint32(dPort)
+
+	return req, nil
+}
+
+func parseSingleDynamicForward(arg string) (ssh.ForwardRequest, error) {
+	var req ssh.ForwardRequest
+	req.Type = ssh.ForwardDynamic
+
+	listenAddr, err := parseDynamicForwardArg(arg)
+	if err != nil {
+		return req, err
+	}
+
+	host, portStr, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		return req, fmt.Errorf("split dynamic forward addr failed: %w", err)
+	}
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		return req, fmt.Errorf("parse dynamic forward port failed: %w", err)
+	}
+
+	req.ListenHost = host
+	req.ListenPort = uint32(port)
+	return req, nil
+}

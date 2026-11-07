@@ -23,14 +23,20 @@ import (
 
 // Connector 负责创建 SSH 连接
 type Connector struct {
-	environment        Environment
-	hostKeyVerifier    HostKeyVerifier
-	keySource          KeySource
-	plans              map[string]*planEntry
-	allPlans           map[*planEntry]struct{}
-	retiredPlans       map[string]struct{}
-	disablePlanCache   bool
-	provider           ConnectionProvider
+	environment      Environment
+	hostKeyVerifier  HostKeyVerifier
+	keySource        KeySource
+	plans            map[string]*planEntry
+	allPlans         map[*planEntry]struct{}
+	retiredPlans     map[string]struct{}
+	disablePlanCache bool
+	provider         ConnectionProvider
+	controlProvider  ControlProvider
+	sessionConfirmer SessionConfirmer
+	// masters tracks the multiplexing masters this connector started so CloseAll
+	// releases the control socket and SSH transport it owns. Guarded by lifecycleMu.
+	masters            map[*MuxServer]*masterOwnership
+	masterOrder        []*MuxServer
 	secretResolver     SecretResolver
 	credentialRecorder CredentialRecorder
 	secretPrompter     SecretPrompter
@@ -191,12 +197,42 @@ func (c *Connector) getLogger() logger.DebugLogger {
 	return logger.NopLogger
 }
 
+// WithControlProvider configures the ControlProvider for multiplexing.
+func WithControlProvider(provider ControlProvider) Option {
+	return func(c *Connector) {
+		c.controlProvider = provider
+	}
+}
+
+// SessionConfirmer authorizes connection-sharing requests on an ask/autoask
+// master. Implementations must honor ctx, return promptly, and fail closed.
+type SessionConfirmer interface {
+	ConfirmSession(ctx context.Context, action string) (bool, error)
+}
+
+// WithSessionConfirmer injects the confirmation source used by ask/autoask
+// masters. Without one, every request against such a master is rejected.
+func WithSessionConfirmer(confirmer SessionConfirmer) Option {
+	if nilCapability(confirmer) {
+		confirmer = nil
+	}
+	return func(c *Connector) {
+		c.sessionConfirmer = confirmer
+	}
+}
+
 type connectionPlanNode struct {
-	name string
-	cfg  *ClientConfig
+	name    string
+	cfg     *ClientConfig
+	control *ControlConfig
 }
 
 var errProxyTransportClosed = errors.New("proxy transport generation is closed")
+
+// errJumpChainRequired reports that a jump-chained target was neither cached nor
+// reachable through an active control master, so its jump chain has to be built
+// before the target itself can be connected.
+var errJumpChainRequired = errors.New("connection requires its proxy jump chain")
 
 // Connect 根据节点名称建立 SSH 连接。
 // ProxyJump 链会先完整解析并检测环，再从最底层跳板机开始逐层建立连接。
@@ -231,14 +267,81 @@ func (c *Connector) Connect(ctx context.Context, nodeName string) (*Client, erro
 	}
 }
 
+// reuseJumpChainedTarget reuses the final target without rebuilding its jump
+// chain. Cached intermediate hops are still validated first: a bastion that
+// stops answering while it keeps forwarding would otherwise go unnoticed,
+// because the target's own probe only exercises the outermost session. A hop
+// without a cached transport contributes nothing to check, which is exactly the
+// case where the target's control master must be used without dialing the
+// bastion. Hops go through the node's shared task so the probe runs on the
+// connector lifecycle: one caller's cancellation must not interrupt a transport
+// other callers still use. The validated hops are returned so the chain build
+// can reuse them instead of probing the same transports a second time.
+func (c *Connector) reuseJumpChainedTarget(ctx context.Context, plan []connectionPlanNode) (*Client, map[string]*Client, error) {
+	validated := make(map[string]*Client, len(plan)-1)
+	for index := len(plan) - 1; index > 0; index-- {
+		planNode := plan[index]
+		cached, ok := c.clients.Get(planNode.name)
+		if !ok || cached.SSHClient.Conn == nil {
+			continue
+		}
+		hopClient, err := c.connectPlannedNode(ctx, planNode, nil, true)
+		if err != nil {
+			// Only "not reusable" falls back to building the chain; a canceled caller
+			// or a closed connector must surface as itself so the caller stops here and
+			// the failure keeps the hop it happened on.
+			c.getLogger().Debugf("mux: cached jump hop %s is not reusable (%v)", planNode.name, err)
+			if errors.Is(err, errJumpChainRequired) {
+				// The cached hop was stale and evicted; evict any in-process cached
+				// target that rode on it, but still let plan[0] attach to an external
+				// control master socket if one exists on disk.
+				if staleTarget, ok := c.clients.Get(plan[0].name); ok {
+					c.evictCachedClient(plan[0].name, staleTarget)
+					_ = staleTarget.interrupt()
+				}
+				validated = nil
+				break
+			}
+			return nil, nil, err
+		}
+		// This transport was validated a moment ago on the connector lifecycle;
+		// probing it again while the chain is rebuilt would repeat a network
+		// round trip per cached hop.
+		validated[planNode.name] = hopClient
+	}
+	client, err := c.connectPlannedNode(ctx, plan[0], nil, true)
+	return client, validated, err
+}
+
 func (c *Connector) connectPlan(ctx context.Context, plan []connectionPlanNode) (*Client, error) {
 	var connected *Client
+	// A cached target transport or an active control master already carries the
+	// whole jump chain, so reusing it must not dial (and re-authenticate to) the
+	// bastion first. Probe the final target alone before building the chain; an
+	// unreusable target reports errJumpChainRequired and falls through below.
+	var validatedHops map[string]*Client
+	if len(plan) > 1 {
+		reused, validated, err := c.reuseJumpChainedTarget(ctx, plan)
+		if err == nil {
+			return reused, nil
+		}
+		if !errors.Is(err, errJumpChainRequired) {
+			return nil, err
+		}
+		validatedHops = validated
+	}
 	for index := len(plan) - 1; index >= 0; index-- {
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("connect node '%s' canceled: %w", plan[0].name, err)
 		}
 
 		planNode := plan[index]
+		if validated, ok := validatedHops[planNode.name]; ok && validated != nil {
+			// Already validated in this call; reuse it instead of dialing the hop
+			// again. It still carries the whole chain for the next hop below.
+			connected = validated
+			continue
+		}
 		dialer := c.baseDialer
 		if dialer == nil {
 			dialer = &net.Dialer{Timeout: c.getHandshakeTimeout()}
@@ -251,7 +354,7 @@ func (c *Connector) connectPlan(ctx context.Context, plan []connectionPlanNode) 
 		}
 
 		var err error
-		connected, err = c.connectPlannedNode(ctx, planNode, dialer)
+		connected, err = c.connectPlannedNode(ctx, planNode, dialer, false)
 		if err != nil {
 			return nil, err
 		}
@@ -307,12 +410,15 @@ func (c *Connector) resolveConnectionPlan(ctx context.Context, nodeName string) 
 			return nil, fmt.Errorf("config for node '%s' is nil", current)
 		}
 		nodeCfg := *cfg
+		if nodeCfg.Port <= 0 {
+			nodeCfg.Port = 22
+		}
 		if !nodeCfg.HasOriginalProxyJump {
 			nodeCfg.OriginalProxyJump = nodeCfg.ProxyJump
 			nodeCfg.HasOriginalProxyJump = true
 		}
 		positions[current] = len(plan)
-		plan = append(plan, connectionPlanNode{name: current, cfg: &nodeCfg})
+		plan = append(plan, connectionPlanNode{name: current, cfg: &nodeCfg, control: c.resolveControl(current)})
 
 		jumps := splitProxyJumpChain(nodeCfg.ProxyJump)
 		if len(jumps) > 1 {
@@ -334,21 +440,45 @@ func (c *Connector) resolveConnectionPlan(ctx context.Context, nodeName string) 
 					return nil, fmt.Errorf("config for proxy jump %q is nil", jumpName)
 				}
 				cloned := *jumpCfg
+				if cloned.Port <= 0 {
+					cloned.Port = 22
+				}
 				cloned.OriginalProxyJump = jumpCfg.ProxyJump
 				cloned.HasOriginalProxyJump = true
 				if index > 0 {
-					cloned.ProxyJump = jumps[index-1]
+					cloned.ProxyJump = strings.Join(jumps[:index], ",")
 				} else {
 					cloned.ProxyJump = ""
 				}
 				positions[jumpName] = len(plan)
-				plan = append(plan, connectionPlanNode{name: jumpName, cfg: &cloned})
+				plan = append(plan, connectionPlanNode{name: jumpName, cfg: &cloned, control: c.resolveControl(jumpName)})
 			}
 			return plan, nil
 		}
 		current = cfg.ProxyJump
 	}
 	return plan, nil
+}
+
+// expectedPeerUID is the identity a control socket endpoint must run as. It
+// mirrors StartMuxServer so a client and the master it talks to agree even when
+// the host injects a UID that differs from the effective one (containers).
+func (c *Connector) expectedPeerUID() uint32 {
+	return expectedPeerUIDFromEnvironment(c.environment)
+}
+
+func (c *Connector) resolveControl(nodeName string) *ControlConfig {
+	if c.controlProvider != nil {
+		if ctrl, err := c.controlProvider.GetControlConfig(nodeName); err == nil && ctrl != nil {
+			return ctrl
+		}
+	}
+	if cp, ok := c.provider.(ControlProvider); ok {
+		if ctrl, err := cp.GetControlConfig(nodeName); err == nil && ctrl != nil {
+			return ctrl
+		}
+	}
+	return nil
 }
 
 func splitProxyJumpChain(proxyJump string) []string {
@@ -362,33 +492,52 @@ func splitProxyJumpChain(proxyJump string) []string {
 	return jumps
 }
 
-func (c *Connector) connectPlannedNode(ctx context.Context, planNode connectionPlanNode, dialer Dialer) (*Client, error) {
-	// 缓存复检、失效驱逐和重建位于同一个共享任务内。任务仅绑定 Connector 生命周期，
-	// 单个调用者取消只停止等待，不会关闭连接池中由其他调用者共享的连接。
-	resultCh := c.sf.DoChan(planNode.name, func() (any, error) {
-		sharedCtx, finish, err := c.beginSharedConnect()
-		if err != nil {
-			return nil, err
-		}
-		defer finish()
-		return c.connectNode(sharedCtx, planNode, dialer)
-	})
+// connectPlannedNode runs the cache/multiplex/connect decision for one node in a
+// shared task. reuseOnly stops before dialing so a jump-chained target can be
+// reused without its bastion; a caller that finds errJumpChainRequired retries
+// with the full chain once the reuse-only task has finished.
+func (c *Connector) connectPlannedNode(ctx context.Context, planNode connectionPlanNode, dialer Dialer, reuseOnly bool) (*Client, error) {
+	for {
+		// 缓存复检、失效驱逐和重建位于同一个共享任务内。任务仅绑定 Connector 生命周期，
+		// 单个调用者取消只停止等待，不会关闭连接池中由其他调用者共享的连接。
+		resultCh := c.sf.DoChan(planNode.name, func() (any, error) {
+			sharedCtx, finish, err := c.beginSharedConnect()
+			if err != nil {
+				return nil, err
+			}
+			defer finish()
+			return c.connectNode(sharedCtx, planNode, dialer, reuseOnly)
+		})
 
+		client, err := c.awaitPlannedNode(ctx, planNode.name, resultCh)
+		if err != nil && !reuseOnly && errors.Is(err, errJumpChainRequired) {
+			// This call joined another caller's reuse-only task, so the target was
+			// reported as not reusable. The task is finished; asking again runs the
+			// full chain. Each repeat needs another caller to start a fresh probe and
+			// the wait stays bounded by ctx, so a full-mode call never surfaces the
+			// internal sentinel.
+			continue
+		}
+		return client, err
+	}
+}
+
+func (c *Connector) awaitPlannedNode(ctx context.Context, nodeName string, resultCh <-chan singleflight.Result) (*Client, error) {
 	select {
 	case <-ctx.Done():
-		return nil, fmt.Errorf("connect node '%s' canceled: %w", planNode.name, ctx.Err())
+		return nil, fmt.Errorf("connect node '%s' canceled: %w", nodeName, ctx.Err())
 	case <-c.lifecycleCtx.Done():
 		return nil, ErrConnectorClosed
 	case result := <-resultCh:
 		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("connect node '%s' canceled: %w", planNode.name, err)
+			return nil, fmt.Errorf("connect node '%s' canceled: %w", nodeName, err)
 		}
 		if result.Err != nil {
 			return nil, result.Err
 		}
 		client, ok := result.Val.(*Client)
 		if !ok || client == nil {
-			return nil, fmt.Errorf("shared connect for node '%s' returned invalid client", planNode.name)
+			return nil, fmt.Errorf("shared connect for node '%s' returned invalid client", nodeName)
 		}
 		return client, nil
 	}
@@ -404,7 +553,7 @@ func (c *Connector) beginSharedConnect() (context.Context, func(), error) {
 	return c.lifecycleCtx, c.connectWG.Done, nil
 }
 
-func (c *Connector) connectNode(ctx context.Context, planNode connectionPlanNode, dialer Dialer) (*Client, error) {
+func (c *Connector) connectNode(ctx context.Context, planNode connectionPlanNode, dialer Dialer, reuseOnly bool) (*Client, error) {
 	nodeName := planNode.name
 	var probeErr error
 	if cachedClient, ok := c.clients.Get(nodeName); ok {
@@ -428,6 +577,18 @@ func (c *Connector) connectNode(ctx context.Context, planNode connectionPlanNode
 	if proxy, ok := dialer.(*SSHProxyDialer); ok && proxy.transportClosed() {
 		return nil, fmt.Errorf("rebuild proxy chain for '%s': %w", nodeName, errors.Join(errProxyTransportClosed, probeErr))
 	}
+
+	// Multiplexing Check:
+	if client, err := c.tryConnectMultiplex(ctx, planNode); err != nil {
+		return nil, err
+	} else if client != nil {
+		return client, nil
+	}
+
+	if reuseOnly {
+		return nil, errJumpChainRequired
+	}
+
 	client, err := c.initializeConnection(ctx, planNode, dialer)
 	// Another caller can invalidate the same root after the check above.
 	if proxy, ok := dialer.(*SSHProxyDialer); err != nil && ok && proxy.transportClosed() && ctx.Err() == nil {
@@ -612,11 +773,498 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 		return nil, err
 	}
 	c.startKeepAliveFor(nodeName, pooled)
+	// Start multiplexing master if configured. Pass rootConn (this hop's own
+	// connection, not the bastion's transportRoot) so shutting down a jump-target
+	// master never closes the underlying bastion TCP connection.
+	c.maybeStartMasterListener(planNode, rawClient, rootConn)
 	// 返回封装的 Client，注入组件，且 Client 不持有 AuthMaterial
 	client.cfgMu.Lock()
 	client.connCfg = cfg.ToConnectionConfig()
 	client.cfgMu.Unlock()
 	return client, nil
+}
+
+func (c *Connector) buildTargetContext(planNode connectionPlanNode) TargetContext {
+	cfg := planNode.cfg
+	port := cfg.Port
+	if port <= 0 {
+		port = 22
+	}
+	user := cfg.User
+	if user == "" {
+		user = c.environment.LocalUser
+	}
+	originalHost := cfg.NodeID
+	if originalHost == "" {
+		originalHost = planNode.name
+	}
+	return TargetContext{
+		Host:         cfg.Address,
+		Port:         port,
+		User:         user,
+		OriginalHost: originalHost,
+		JumpHost:     cfg.ProxyJump,
+		KeyPath:      cfg.KeyPath,
+		Control:      planNode.control,
+	}
+}
+
+func isFatalMultiplexSecurityError(err error) bool {
+	return errors.Is(err, ErrUnauthorizedPeer) ||
+		errors.Is(err, ErrControlTargetMismatch) ||
+		errors.Is(err, ErrControlProxyRejected)
+}
+
+func (c *Connector) verifyMuxMasterTarget(muxClient *MuxClient, expandedPath string, target TargetContext) error {
+	if muxClient == nil {
+		return nil
+	}
+	masterTarget, ok := muxClient.Extension(muxTargetExtensionName)
+	if !ok || target.MatchesMasterTarget(masterTarget) {
+		return nil
+	}
+	return fmt.Errorf("%w: control socket %q is connected to %s, cannot reuse for %s",
+		ErrControlTargetMismatch,
+		expandedPath,
+		FormatTargetIdentity(masterTarget),
+		FormatTargetIdentity(target.CanonicalTargetIdentity()),
+	)
+}
+
+// warnOrDebugf logs a warning via optional Warnf(string, ...any) capability on
+// DebugLogger when warn is true, falling back to Debugf with a "warning: " prefix.
+func (c *Connector) warnOrDebugf(warn bool, format string, args ...any) {
+	l := c.getLogger()
+	if warn {
+		if warner, ok := l.(interface{ Warnf(string, ...any) }); ok {
+			warner.Warnf(format, args...)
+			return
+		}
+		l.Debugf("warning: "+format, args...)
+		return
+	}
+	l.Debugf(format, args...)
+}
+
+func (c *Connector) tryConnectMultiplex(ctx context.Context, planNode connectionPlanNode) (*Client, error) {
+	target := c.buildTargetContext(planNode)
+	ctrl := target.Control
+	if ctrl == nil || ctrl.Path == "" || ctrl.Path == "none" {
+		return nil, nil // Multiplexing disabled
+	}
+
+	explicitMaster := ctrl.Master == ControlMasterYes || ctrl.Master == ControlMasterAsk
+
+	// 1. Expand ControlPath tokens
+	expandedPath, err := ExpandControlPath(ctrl.Path, c.environment, target)
+	if err != nil {
+		c.warnOrDebugf(explicitMaster, "mux: expand control path %q failed: %v; continuing without connection sharing", ctrl.Path, err)
+		return nil, nil
+	}
+	if err := ValidateControlPath(expandedPath); err != nil {
+		c.warnOrDebugf(explicitMaster, "mux: control path %q validation failed: %v; continuing without connection sharing", expandedPath, err)
+		return nil, nil
+	}
+
+	// 2. Check if socket file exists on disk and capture initial file identity
+	origFi, statErr := os.Lstat(expandedPath)
+	if statErr != nil || !isControlSocketFileInfo(origFi) {
+		c.getLogger().Debugf("mux: socket %q does not exist or is not a socket", expandedPath)
+		return nil, nil
+	}
+
+	// 3. Socket file exists: probe master health via AliveCheck
+	client, probeDone, probeErr := c.probeActiveMuxMaster(ctx, planNode, expandedPath, target, origFi, explicitMaster, ctrl.Master)
+	if probeDone || probeErr != nil {
+		return client, probeErr
+	}
+
+	return nil, nil
+}
+
+func (c *Connector) probeActiveMuxMaster(ctx context.Context, planNode connectionPlanNode, expandedPath string, target TargetContext, origFi os.FileInfo, explicitMaster bool, masterMode ControlMasterMode) (*Client, bool, error) {
+	probeTimeout := c.getHandshakeTimeout()
+	if probeTimeout > 2*time.Second {
+		probeTimeout = 2 * time.Second
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+
+	muxClient, dialErr := DialMuxClient(probeCtx, expandedPath, WithExpectedPeerUID(c.expectedPeerUID()))
+	if dialErr == nil {
+		if targetErr := c.verifyMuxMasterTarget(muxClient, expandedPath, target); targetErr != nil {
+			_ = muxClient.Close()
+			if explicitMaster {
+				c.warnOrDebugf(true, "mux: active master on %q belongs to a different target (%v); not attaching in %s mode", expandedPath, targetErr, masterMode)
+				return nil, true, nil
+			}
+			return nil, true, targetErr
+		}
+
+		serverPID, checkErr := muxClient.AliveCheck(probeCtx)
+		_ = muxClient.Close()
+
+		if checkErr == nil {
+			// -M means "become the master". Attaching to an existing master would
+			// silently demote the request, so the caller falls back to its own
+			// connection; the later bind reports the conflict.
+			if explicitMaster {
+				c.getLogger().Debugf("mux: master already running on %q (pid=%d); not attaching in %s mode", expandedPath, serverPID, masterMode)
+				return nil, true, nil
+			}
+			c.getLogger().Debugf("mux: active master running on %q (pid=%d) for node %s", expandedPath, serverPID, planNode.name)
+			client, proxyErr := c.tryDialAndPublishProxy(ctx, planNode, expandedPath, target)
+			if proxyErr == nil {
+				return client, true, nil
+			}
+			dialErr = proxyErr
+		} else {
+			dialErr = checkErr
+		}
+	}
+
+	// 4. Handle stale socket safely without clobbering newly started masters. Every
+	// active master mode must be able to replace a socket left by a crash,
+	// including the direct-bind fallback used on Windows. A slow/timed-out master
+	// is NOT unlinked (matches OpenSSH: only ECONNREFUSED indicates a dead listener),
+	// and ControlMaster=no never unlinks sockets it will not replace.
+	if dialErr != nil {
+		if isFatalMultiplexSecurityError(dialErr) {
+			return nil, true, dialErr
+		}
+		canReplaceStale := masterMode != "" && masterMode != ControlMasterNo
+		if isConnectionRefused(dialErr) && canReplaceStale {
+			c.getLogger().Debugf("mux: stale socket detected on %q: %v", expandedPath, dialErr)
+			client, err := c.handleStaleControlSocket(ctx, planNode, expandedPath, target, origFi)
+			return client, true, err
+		}
+		c.getLogger().Debugf("mux: error connecting to master on %q: %v", expandedPath, dialErr)
+	}
+	return nil, false, nil
+}
+
+func (c *Connector) dialAndPublishProxy(ctx context.Context, planNode connectionPlanNode, expandedPath string, target TargetContext) (*Client, error) {
+	client, err := c.tryDialAndPublishProxy(ctx, planNode, expandedPath, target)
+	if err != nil {
+		if isFatalMultiplexSecurityError(err) {
+			return nil, err
+		}
+		c.getLogger().Debugf("mux: proxy dial on %q failed: %v; falling back to direct connection", expandedPath, err)
+		return nil, nil
+	}
+	return client, nil
+}
+
+func (c *Connector) tryDialAndPublishProxy(ctx context.Context, planNode connectionPlanNode, expandedPath string, target TargetContext) (*Client, error) {
+	dialCtx, cancel := context.WithTimeout(ctx, c.getHandshakeTimeout())
+	defer cancel()
+	rawClient, proxyConn, proxyErr := DialControlProxy(dialCtx, expandedPath, target, WithExpectedPeerUID(c.expectedPeerUID()))
+	if proxyErr != nil {
+		return nil, proxyErr
+	}
+
+	pooled := &PooledClient{
+		SSHClient: rawClient,
+		RootConn:  proxyConn.RawConn(),
+	}
+	if err := c.publishClient(planNode.name, pooled); err != nil {
+		_ = rawClient.Close()
+		_ = proxyConn.Close()
+		return nil, err
+	}
+	c.startKeepAliveFor(planNode.name, pooled)
+	logger.EmitDiagnostic(c.diagnostics, logger.Diagnostic{
+		Kind:   logger.ConnectionReused,
+		NodeID: planNode.name,
+		Host:   planNode.cfg.Address,
+		User:   planNode.cfg.User,
+		Port:   planNode.cfg.Port,
+	})
+	return c.wrapCachedClient(planNode.cfg, pooled), nil
+}
+
+func (c *Connector) handleStaleControlSocket(ctx context.Context, planNode connectionPlanNode, expandedPath string, target TargetContext, origFi os.FileInfo) (*Client, error) {
+	currFi, err := os.Lstat(expandedPath)
+	if err != nil || !isControlSocketFileInfo(currFi) {
+		c.getLogger().Debugf("mux: stale socket %q already unlinked by another process", expandedPath)
+		return nil, nil
+	}
+
+	ctrl := target.Control
+	explicitMaster := ctrl != nil && (ctrl.Master == ControlMasterYes || ctrl.Master == ControlMasterAsk)
+
+	// 1. If file identity changed, another process replaced the socket
+	if !os.SameFile(origFi, currFi) {
+		return c.probeLiveSocketBeforeUnlink(ctx, planNode, expandedPath, target, explicitMaster, 2*time.Second)
+	}
+
+	// 2. File identity is unchanged. Perform a brief probe dial to ensure the socket didn't just activate
+	if client, err, handled := c.tryAttachReactivatedSocket(ctx, planNode, expandedPath, target, explicitMaster); handled {
+		return client, err
+	}
+
+	// 3. Atomically confirm file identity directly before unlinking to close TOCTOU window
+	if finalFi, finalErr := os.Lstat(expandedPath); finalErr == nil && isControlSocketFileInfo(finalFi) && os.SameFile(origFi, finalFi) {
+		c.getLogger().Debugf("mux: unlinking verified stale control socket %q", expandedPath)
+		_ = os.Remove(expandedPath)
+	}
+
+	return nil, nil
+}
+
+func (c *Connector) probeLiveSocketBeforeUnlink(
+	ctx context.Context,
+	planNode connectionPlanNode,
+	expandedPath string,
+	target TargetContext,
+	explicitMaster bool,
+	timeout time.Duration,
+) (*Client, error) {
+	c.getLogger().Debugf("mux: control socket %q was replaced by another process; probing new master", expandedPath)
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	muxCli, probeErr := DialMuxClient(probeCtx, expandedPath, WithExpectedPeerUID(c.expectedPeerUID()))
+	if probeErr != nil {
+		if isFatalMultiplexSecurityError(probeErr) {
+			return nil, probeErr
+		}
+		return nil, nil
+	}
+	if targetErr := c.verifyMuxMasterTarget(muxCli, expandedPath, target); targetErr != nil {
+		_ = muxCli.Close()
+		if explicitMaster {
+			return nil, nil
+		}
+		return nil, targetErr
+	}
+	if _, checkErr := muxCli.AliveCheck(probeCtx); checkErr == nil {
+		_ = muxCli.Close()
+		if explicitMaster {
+			return nil, nil
+		}
+		return c.dialAndPublishProxy(ctx, planNode, expandedPath, target)
+	}
+	_ = muxCli.Close()
+	// Replaced socket belongs to another process; never unlink
+	return nil, nil
+}
+
+func (c *Connector) tryAttachReactivatedSocket(
+	ctx context.Context,
+	planNode connectionPlanNode,
+	expandedPath string,
+	target TargetContext,
+	explicitMaster bool,
+) (*Client, error, bool) {
+	probeCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	muxCli, probeErr := DialMuxClient(probeCtx, expandedPath, WithExpectedPeerUID(c.expectedPeerUID()))
+	if probeErr != nil {
+		if isFatalMultiplexSecurityError(probeErr) {
+			return nil, probeErr, true
+		}
+		return nil, nil, false
+	}
+	if targetErr := c.verifyMuxMasterTarget(muxCli, expandedPath, target); targetErr != nil {
+		_ = muxCli.Close()
+		if explicitMaster {
+			return nil, nil, true
+		}
+		return nil, targetErr, true
+	}
+	if _, checkErr := muxCli.AliveCheck(probeCtx); checkErr == nil {
+		_ = muxCli.Close()
+		if explicitMaster {
+			return nil, nil, true
+		}
+		client, err := c.dialAndPublishProxy(ctx, planNode, expandedPath, target)
+		return client, err, true
+	}
+	_ = muxCli.Close()
+	return nil, nil, false
+}
+
+func (c *Connector) maybeStartMasterListener(planNode connectionPlanNode, rawClient *ssh.Client, rootConn net.Conn) {
+	target := c.buildTargetContext(planNode)
+	ctrl := target.Control
+	if ctrl == nil || ctrl.Path == "" || ctrl.Path == "none" {
+		return
+	}
+	if ctrl.Master != ControlMasterYes && ctrl.Master != ControlMasterAuto && ctrl.Master != ControlMasterAsk && ctrl.Master != ControlMasterAutoAsk {
+		return
+	}
+
+	expandedPath, err := ExpandControlPath(ctrl.Path, c.environment, target)
+	if err != nil || ValidateControlPath(expandedPath) != nil {
+		return
+	}
+
+	server, err := StartMuxServer(context.Background(), rawClient, MuxMasterOptions{
+		Path:                  expandedPath,
+		Target:                target,
+		Environment:           c.environment,
+		RootConn:              rootConn,
+		InitialActiveSessions: 1,
+		ConfirmSession:        c.confirmSessionCallback(planNode.name),
+	})
+	if err != nil {
+		// A concurrent master already owns this path (or the bind was rejected).
+		// OpenSSH reports the conflict and continues without sharing.
+		explicitMaster := ctrl.Master == ControlMasterYes || ctrl.Master == ControlMasterAsk
+		c.warnOrDebugf(explicitMaster, "mux: start master server on %q failed: %v; continuing without connection sharing", expandedPath, err)
+		return
+	}
+	c.trackMaster(server)
+}
+
+// masterOwnership records this connector's hold on a master it started.
+// A connector that keeps using a transport is a live session for that master:
+// without the reference a bounded ControlPersist idle timer, or another client
+// disconnecting, would tear down a transport still in use by this process.
+type masterOwnership struct {
+	foregroundSession bool
+}
+
+// trackMaster records an owned master so CloseAll can release it. A connector
+// that is already closed shuts the master down immediately.
+func (c *Connector) trackMaster(server *MuxServer) {
+	if server == nil {
+		return
+	}
+	c.lifecycleMu.Lock()
+	if c.closed {
+		c.lifecycleMu.Unlock()
+		_ = server.Shutdown()
+		return
+	}
+	if c.masters == nil {
+		c.masters = make(map[*MuxServer]*masterOwnership)
+	}
+	if _, exists := c.masters[server]; !exists {
+		c.masterOrder = append(c.masterOrder, server)
+	}
+	c.masters[server] = &masterOwnership{foregroundSession: true}
+	c.lifecycleMu.Unlock()
+}
+
+// ReleaseMaster drops this connector's active-session reference to a master it
+// started, without stopping the master. A ControlPersist handoff needs exactly
+// that: the connector keeps its transport counted so the idle timer cannot kill
+// a live session, but the detached daemon that inherits the socket must be able
+// to take the master over. It reports whether this connector owned server; the
+// master stays owned, so CloseAll still stops it if no handoff happens.
+func (c *Connector) ReleaseMaster(server *MuxServer) bool {
+	if c == nil || server == nil {
+		return false
+	}
+	c.lifecycleMu.Lock()
+	ownership := c.masters[server]
+	release := ownership != nil && ownership.foregroundSession
+	if release {
+		ownership.foregroundSession = false
+	}
+	c.lifecycleMu.Unlock()
+	if release {
+		server.RemoveForegroundSession()
+	}
+	return ownership != nil
+}
+
+// AcquireMaster restores this connector's active-session reference on a master
+// it owns after a handoff reservation was rolled back.
+func (c *Connector) AcquireMaster(server *MuxServer) bool {
+	if c == nil || server == nil {
+		return false
+	}
+	c.lifecycleMu.Lock()
+	if c.closed {
+		c.lifecycleMu.Unlock()
+		return false
+	}
+	ownership := c.masters[server]
+	if ownership == nil {
+		c.lifecycleMu.Unlock()
+		return false
+	}
+	if ownership.foregroundSession {
+		c.lifecycleMu.Unlock()
+		return true
+	}
+	c.lifecycleMu.Unlock()
+
+	if !server.AddForegroundSession() {
+		return false
+	}
+
+	c.lifecycleMu.Lock()
+	ownership = c.masters[server]
+	if c.closed || ownership == nil || ownership.foregroundSession {
+		c.lifecycleMu.Unlock()
+		server.RemoveForegroundSession()
+		return ownership != nil && ownership.foregroundSession
+	}
+	ownership.foregroundSession = true
+	c.lifecycleMu.Unlock()
+	return true
+}
+
+// OwnsMaster reports whether server was started by this connector.
+func (c *Connector) OwnsMaster(server *MuxServer) bool {
+	if c == nil || server == nil {
+		return false
+	}
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	_, ok := c.masters[server]
+	return ok
+}
+
+// HasMasterSession reports whether this connector still holds its initial
+// active-session reference on server.
+func (c *Connector) HasMasterSession(server *MuxServer) bool {
+	if c == nil || server == nil {
+		return false
+	}
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	ownership := c.masters[server]
+	return ownership != nil && ownership.foregroundSession
+}
+
+// Masters returns a snapshot of the multiplexing masters this connector started
+// in deterministic creation order (outermost jump master to innermost target).
+func (c *Connector) Masters() []*MuxServer {
+	if c == nil {
+		return nil
+	}
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	masters := make([]*MuxServer, 0, len(c.masterOrder))
+	for _, master := range c.masterOrder {
+		if _, ok := c.masters[master]; ok {
+			masters = append(masters, master)
+		}
+	}
+	return masters
+}
+
+// confirmSessionCallback adapts the injected SessionConfirmer into the bounded,
+// fail-closed callback a master uses for ask/autoask mode.
+func (c *Connector) confirmSessionCallback(nodeName string) func(string) bool {
+	if c.sessionConfirmer == nil {
+		return nil
+	}
+	confirmer := c.sessionConfirmer
+	return func(action string) bool {
+		ctx, cancel := context.WithTimeout(c.lifecycleCtx, c.getInteractionTimeout())
+		defer cancel()
+		approved, err := confirmer.ConfirmSession(ctx, action)
+		if err != nil {
+			c.getLogger().Debugf("mux: session confirmation for node %s (%s) failed: %v", nodeName, action, err)
+			return false
+		}
+		return approved
+	}
 }
 
 func (c *Connector) publishClient(nodeName string, client *PooledClient) error {
@@ -1031,9 +1679,29 @@ func (c *Connector) CloseAll() error {
 	for plan := range c.allPlans {
 		planConnectors = append(planConnectors, plan)
 	}
+	ownedMasters := make([]*MuxServer, 0, len(c.masterOrder))
+	for i := len(c.masterOrder) - 1; i >= 0; i-- {
+		master := c.masterOrder[i]
+		if _, ok := c.masters[master]; ok {
+			ownedMasters = append(ownedMasters, master)
+		}
+	}
+	c.masters = nil
+	c.masterOrder = nil
 	clear(c.plans)
 	clear(c.retiredPlans)
 	c.lifecycleMu.Unlock()
+
+	var closeErrs []error
+
+	// Masters own the control socket, its registry entry, and the SSH transport
+	// they serve. Closing the connector without them would leave a dead socket
+	// file that later commands must detect and unlink.
+	for _, master := range ownedMasters {
+		if err := master.Shutdown(); err != nil {
+			closeErrs = append(closeErrs, err)
+		}
+	}
 
 	// Closing forbids new publication. Snapshot the existing clients without
 	// holding map locks during network cleanup, then interrupt their physical
@@ -1044,7 +1712,6 @@ func (c *Connector) CloseAll() error {
 		pooledClients = append(pooledClients, client)
 		return true
 	})
-	var closeErrs []error
 	for _, plan := range planConnectors {
 		if err := c.closePlan(plan); err != nil {
 			closeErrs = append(closeErrs, err)

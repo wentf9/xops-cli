@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/kevinburke/ssh_config"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/models"
 )
 
@@ -92,6 +93,12 @@ func openSSHHostFromConfig(cfg *ssh_config.Config, name, defaultUser string) (Op
 		return OpenSSHHost{}, err
 	}
 
+	ctrl, err := parseOpenSSHControl(cfg, name)
+	if err != nil {
+		return OpenSSHHost{}, err
+	}
+	ctrl = normalizeImportedControl(ctrl)
+
 	return OpenSSHHost{
 		Name: name,
 		Host: models.Host{
@@ -108,8 +115,41 @@ func openSSHHostFromConfig(cfg *ssh_config.Config, name, defaultUser string) (Op
 			Tags:      []string{"openssh"},
 			ProxyJump: proxyJump,
 			SudoMode:  models.SudoModeAuto,
+			Control:   ctrl,
 		},
 	}, nil
+}
+
+// normalizeImportedControl makes an imported ControlConfig valid under the
+// persisted schema rules without weakening them. OpenSSH inherits ControlPersist
+// independently of ControlMaster, so a host that resolved to ControlMaster=no
+// can carry a ControlPersist it never asked for; that combination is contradictory
+// once materialized, and the master mode wins.
+func normalizeImportedControl(ctrl *ssh.ControlConfig) *ssh.ControlConfig {
+	if ctrl == nil {
+		return nil
+	}
+	if ctrl.Path == "" {
+		// An OpenSSH host with ControlMaster or ControlPersist but no ControlPath
+		// cannot form a standalone node ControlConfig without failing schema
+		// validation when no global ControlPath is set.
+		return nil
+	}
+	if ctrl.Master == ssh.ControlMasterNo && ctrl.Persist != "" {
+		if _, _, _, err := ssh.ParseControlPersist(ctrl.Persist); err != nil {
+			ctrl.Persist = ""
+			return ctrl
+		}
+		enabled, _, _, _ := ssh.ParseControlPersist(ctrl.Persist)
+		if enabled {
+			ctrl.Persist = ""
+		}
+	}
+	if ctrl.Path == "none" {
+		ctrl.Master = ssh.ControlMasterNo
+		ctrl.Persist = ""
+	}
+	return ctrl
 }
 
 func openSSHValue(cfg *ssh_config.Config, host, key, fallback string) (string, error) {

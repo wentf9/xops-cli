@@ -7,7 +7,14 @@ import (
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/ssh"
+	"github.com/wentf9/xops-cli/pkg/models"
 )
+
+func equalPersistedNode(a, b models.Node) bool {
+	a.OpenSSHAlias = ""
+	b.OpenSSHAlias = ""
+	return reflect.DeepEqual(a, b)
+}
 
 type pendingConnection struct {
 	provider *Provider // immutable connection bundle
@@ -40,47 +47,55 @@ func (r *Repository) PrepareNodeContext(ctx context.Context, opts EnsureNodeOpti
 	var nodeID string
 	var created bool
 	cfg, _, _, err := prepareConfiguration(r.provider.Snapshot(), func(cfg *Configuration) error {
-		lookup, aliases, err := buildIndexes(cfg, false)
-		if err != nil {
-			return fmt.Errorf("build connection indexes: %w", err)
-		}
-		if !opts.Target.HasUser && !opts.Target.HasPort {
-			return r.ensureBareTargetInTransaction(cfg, opts, lookup, aliases, selector, defaultUser, &nodeID, &created)
-		}
-		return r.ensureExplicitTargetInTransaction(cfg, opts, lookup, aliases, selector, defaultUser, &nodeID, &created)
+		return r.ensureTargetInTransaction(cfg, opts, defaultUser, &nodeID, &created)
 	})
 	if err != nil {
 		return EnsureNodeResult{}, err
 	}
 	if created {
-		// Retain only this connection's entities, never a stale copy of the
-		// whole configuration that could overwrite concurrent changes.
-		node, _ := cfg.Nodes.Get(nodeID)
-		host, _ := cfg.Hosts.Get(node.HostRef)
-		identity, _ := cfg.Identities.Get(node.IdentityRef)
-		// Concurrent first connections on different ports must not reserve the
-		// same identity and later share (or conflict over) remembered secrets.
-		node.IdentityRef = privateIdentityReference(cfg, nodeID)
-		pending := cloneConfiguration(nil)
-		pending.Nodes.Set(nodeID, node)
-		pending.Hosts.Set(node.HostRef, host)
-		pending.Identities.Set(node.IdentityRef, identity)
-		if r.pending == nil {
-			r.pending = make(map[string]*pendingConnection)
+		if err := r.registerPendingConnection(cfg, nodeID); err != nil {
+			return EnsureNodeResult{}, err
 		}
-		if previous := r.pending[nodeID]; previous != nil {
-			oldNode, oldHost, oldIdentity, err := previous.provider.Resolve(nodeID)
-			if err != nil {
-				return EnsureNodeResult{}, fmt.Errorf("resolve pending connection %q: %w", nodeID, err)
-			}
-			if !reflect.DeepEqual(oldNode, node) || !reflect.DeepEqual(oldHost, host) || !reflect.DeepEqual(oldIdentity, identity) {
-				return EnsureNodeResult{}, fmt.Errorf("pending connection %q changed: %w", nodeID, ErrConfigConflict)
-			}
-			return EnsureNodeResult{NodeID: nodeID, Created: true}, nil
-		}
-		r.pending[nodeID] = &pendingConnection{provider: NewProviderWithoutOpenSSH(pending)}
 	}
 	return EnsureNodeResult{NodeID: nodeID, Created: created}, nil
+}
+
+func (r *Repository) registerPendingConnection(cfg *Configuration, nodeID string) error {
+	// Retain only this connection's entities, never a stale copy of the
+	// whole configuration that could overwrite concurrent changes.
+	node, _ := cfg.Nodes.Get(nodeID)
+	host, _ := cfg.Hosts.Get(node.HostRef)
+	identity, _ := cfg.Identities.Get(node.IdentityRef)
+	// Concurrent first connections on different ports must not reserve the
+	// same identity and later share (or conflict over) remembered secrets.
+	node.IdentityRef = privateIdentityReference(cfg, nodeID)
+	pending := cloneConfiguration(nil)
+	pending.Nodes.Set(nodeID, node)
+	pending.Hosts.Set(node.HostRef, host)
+	pending.Identities.Set(node.IdentityRef, identity)
+	if r.pending == nil {
+		r.pending = make(map[string]*pendingConnection)
+	}
+	if previous := r.pending[nodeID]; previous != nil {
+		oldNode, oldHost, oldIdentity, err := previous.provider.Resolve(nodeID)
+		if err != nil {
+			return fmt.Errorf("resolve pending connection %q: %w", nodeID, err)
+		}
+		if !equalPersistedNode(oldNode, node) || !reflect.DeepEqual(oldHost, host) || !reflect.DeepEqual(oldIdentity, identity) {
+			return fmt.Errorf("pending connection %q changed: %w", nodeID, ErrConfigConflict)
+		}
+		if oldNode.OpenSSHAlias == "" && node.OpenSSHAlias != "" {
+			previous.provider.SetNodeOpenSSHAlias(nodeID, node.OpenSSHAlias)
+			r.SetNodeOpenSSHAlias(nodeID, node.OpenSSHAlias)
+		}
+		return nil
+	}
+	pendingProvider := NewProviderWithoutOpenSSH(pending)
+	if node.OpenSSHAlias != "" {
+		pendingProvider.SetNodeOpenSSHAlias(nodeID, node.OpenSSHAlias)
+	}
+	r.pending[nodeID] = &pendingConnection{provider: pendingProvider}
+	return nil
 }
 
 func (r *Repository) connectionProvider(nodeID string) *Provider {
@@ -90,6 +105,23 @@ func (r *Repository) connectionProvider(nodeID string) *Provider {
 		return pending.provider
 	}
 	return r.provider
+}
+
+func (r *Repository) resolvePendingNode(nodeID string) (models.Node, models.Host, models.Identity, bool) {
+	if r == nil || nodeID == "" {
+		return models.Node{}, models.Host{}, models.Identity{}, false
+	}
+	r.pendingMu.RLock()
+	pending := r.pending[nodeID]
+	r.pendingMu.RUnlock()
+	if pending == nil || pending.provider == nil {
+		return models.Node{}, models.Host{}, models.Identity{}, false
+	}
+	node, host, ident, err := pending.provider.Resolve(nodeID)
+	if err != nil {
+		return models.Node{}, models.Host{}, models.Identity{}, false
+	}
+	return node, host, ident, true
 }
 
 // ConfirmNodeContext saves exactly the prepared connection after SSH
@@ -156,7 +188,7 @@ func (r *Repository) confirmNodeContext(ctx context.Context, nodeID string, exec
 		node.Execution = execution.Clone()
 	}
 	result, err := r.commitResultContext(ctx, anyRevision, func(cfg *Configuration) error {
-		if existing, ok := cfg.Nodes.Get(nodeID); ok && !reflect.DeepEqual(existing, node) {
+		if existing, ok := cfg.Nodes.Get(nodeID); ok && !equalPersistedNode(existing, node) {
 			return fmt.Errorf("save connected node %q: %w", nodeID, ErrConfigConflict)
 		}
 		if existing, ok := cfg.Hosts.Get(node.HostRef); ok && !reflect.DeepEqual(existing, host) {
@@ -171,6 +203,9 @@ func (r *Repository) confirmNodeContext(ctx context.Context, nodeID string, exec
 		return nil
 	})
 	if result.Applied {
+		if node.OpenSSHAlias != "" {
+			r.SetNodeOpenSSHAlias(nodeID, node.OpenSSHAlias)
+		}
 		r.pendingMu.Lock()
 		delete(r.pending, nodeID)
 		r.pendingMu.Unlock()

@@ -69,6 +69,14 @@ flag_background:
   other: "在身份验证和端口转发建立后转入后台运行 (隐含 -n)"
 flag_stdin_redirect:
   other: "将标准输入重定向到 /dev/null (防止后台进程读取终端输入)"
+flag_ssh_master:
+  other: "将 ssh 客户端置于多路复用“主模式”；多次指定进入确认模式"
+flag_ssh_control_path:
+  other: "指定用于连接共享的控制套接字路径，指定 'none' 禁用共享"
+flag_ssh_option:
+  other: "以配置文件格式传递配置选项 (Key=Value)"
+flag_ssh_control_command:
+  other: "向运行中的主进程发送控制命令：check, exit, stop, forward, cancel, proxy, proxy-stream, conninfo, channels"
 ssh_err_background_requires_nocmd:
   other: "后台执行 (-f) 必须与 -N (不执行远程命令) 选项配合使用"
 prompt_enter_passphrase:

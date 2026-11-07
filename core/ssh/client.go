@@ -482,7 +482,7 @@ func (c *Client) runWithoutLoginWithConfig(ctx context.Context, cmd string, conf
 func (c *Client) runRaw(ctx context.Context, wrappedCmd string, config *RunConfig) (output string, retErr error) {
 	session, err := c.newSessionContext(ctx)
 	if err != nil {
-		return "", fmt.Errorf("failed to create new session: %w", err)
+		return "", err
 	}
 	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
 
@@ -506,7 +506,7 @@ func (c *Client) RunScript(ctx context.Context, scriptContent string, opts ...Ru
 
 	session, err := c.newSessionContext(ctx)
 	if err != nil {
-		return "", fmt.Errorf("failed to create new session: %w", err)
+		return "", err
 	}
 	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
 
@@ -563,7 +563,7 @@ func (s *streamReader) Close() error {
 func (c *Client) RunStream(ctx context.Context, cmd string) (io.ReadCloser, error) {
 	session, err := c.newSessionContext(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create new session: %w", err)
+		return nil, err
 	}
 
 	stdout, err := session.StdoutPipe()

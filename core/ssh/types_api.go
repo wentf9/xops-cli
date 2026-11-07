@@ -255,9 +255,17 @@ func validateTargetCompatibility(cur ConnectionConfig, newCfg *ClientConfig) err
 		return fmt.Errorf("%w: host address changed (expected %q, got %q)",
 			ErrSnapshotMismatch, cur.Address, newCfg.Address)
 	}
-	if newCfg.Port != cur.Port {
+	curPort := cur.Port
+	if curPort <= 0 {
+		curPort = 22
+	}
+	newPort := newCfg.Port
+	if newPort <= 0 {
+		newPort = 22
+	}
+	if newPort != curPort {
 		return fmt.Errorf("%w: host port changed (expected %d, got %d)",
-			ErrSnapshotMismatch, cur.Port, newCfg.Port)
+			ErrSnapshotMismatch, curPort, newPort)
 	}
 	if newCfg.User != cur.User {
 		return fmt.Errorf("%w: user changed (expected %q, got %q)",

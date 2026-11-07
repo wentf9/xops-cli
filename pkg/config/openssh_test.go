@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/wentf9/xops-cli/core/ssh"
 )
 
 // TestOpenSSHParser_NonExistentFile 验证当配置文件不存在时，返回空 Parser 且错误为 nil
@@ -351,5 +353,259 @@ func TestParseOpenSSHHostSpec(t *testing.T) {
 				)
 			}
 		})
+	}
+}
+
+func TestOpenSSHParser_ControlConfig_Modes(t *testing.T) {
+	configContent := `
+Host srv-auto
+    HostName 10.0.0.1
+    ControlMaster auto
+    ControlPath ~/.ssh/sockets/%r@%h-%p
+    ControlPersist 10m
+
+Host srv-yes
+    HostName 10.0.0.2
+    ControlMaster yes
+    ControlPath /tmp/mux-%C.sock
+    ControlPersist 0
+
+Host srv-ask
+    HostName 10.0.0.3
+    ControlMaster ask
+    ControlPath ~/.ssh/cm-%h
+    ControlPersist 1h
+`
+
+	parser, err := NewOpenSSHParserFromReader(strings.NewReader(configContent))
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	node1, _, _, err := parser.GetVirtualNode("srv-auto")
+	if err != nil {
+		t.Fatalf("GetVirtualNode(srv-auto) failed: %v", err)
+	}
+	if node1.Control == nil || node1.Control.Master != ssh.ControlMasterAuto ||
+		node1.Control.Path != "~/.ssh/sockets/%r@%h-%p" ||
+		node1.Control.Persist != "10m" {
+		t.Fatalf("srv-auto control mismatch: %+v", node1.Control)
+	}
+	ctrl1, err := parser.GetControlConfig("srv-auto")
+	if err != nil || !ctrl1.Equal(node1.Control) {
+		t.Fatalf("GetControlConfig(srv-auto) mismatch: %v, err=%v", ctrl1, err)
+	}
+
+	node2, _, _, err := parser.GetVirtualNode("srv-yes")
+	if err != nil {
+		t.Fatalf("GetVirtualNode(srv-yes) failed: %v", err)
+	}
+	if node2.Control == nil || node2.Control.Master != ssh.ControlMasterYes ||
+		node2.Control.Path != "/tmp/mux-%C.sock" ||
+		node2.Control.Persist != "0" {
+		t.Fatalf("srv-yes control mismatch: %+v", node2.Control)
+	}
+
+	node3, _, _, err := parser.GetVirtualNode("srv-ask")
+	if err != nil {
+		t.Fatalf("GetVirtualNode(srv-ask) failed: %v", err)
+	}
+	if node3.Control == nil || node3.Control.Master != ssh.ControlMasterAsk ||
+		node3.Control.Persist != "1h" {
+		t.Fatalf("srv-ask control mismatch: %+v", node3.Control)
+	}
+}
+
+func TestOpenSSHParser_ControlConfig_NoneAndNoControl(t *testing.T) {
+	configContent := `
+Host srv-none
+    HostName 10.0.0.4
+    ControlMaster no
+    ControlPath none
+    ControlPersist no
+
+Host srv-nocontrol
+    HostName 10.0.0.5
+`
+
+	parser, err := NewOpenSSHParserFromReader(strings.NewReader(configContent))
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	node4, _, _, err := parser.GetVirtualNode("srv-none")
+	if err != nil {
+		t.Fatalf("GetVirtualNode(srv-none) failed: %v", err)
+	}
+	if node4.Control == nil || node4.Control.Path != "none" || node4.Control.Master != ssh.ControlMasterNo {
+		t.Fatalf("srv-none control mismatch: %+v", node4.Control)
+	}
+	if node4.Control.IsEnabled() {
+		t.Fatalf("srv-none should have IsEnabled() == false")
+	}
+
+	node5, _, _, err := parser.GetVirtualNode("srv-nocontrol")
+	if err != nil {
+		t.Fatalf("GetVirtualNode(srv-nocontrol) failed: %v", err)
+	}
+	if node5.Control != nil {
+		t.Fatalf("expected srv-nocontrol Control to be nil, got: %+v", node5.Control)
+	}
+}
+
+func TestOpenSSHParser_ControlConfig_WildcardInheritance(t *testing.T) {
+	configContent := `
+Host concrete-override
+    HostName 10.0.1.1
+    ControlMaster no
+
+Host concrete-disabled
+    HostName 10.0.1.2
+    ControlPath none
+
+Host concrete-normal
+    HostName 10.0.1.3
+
+Host *
+    ControlMaster auto
+    ControlPath ~/.ssh/sockets/%r@%h-%p
+    ControlPersist 10m
+`
+
+	parser, err := NewOpenSSHParserFromReader(strings.NewReader(configContent))
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	// 1. concrete-normal inherits all from Host *
+	ctrlNormal, err := parser.GetControlConfig("concrete-normal")
+	if err != nil {
+		t.Fatalf("GetControlConfig(concrete-normal) failed: %v", err)
+	}
+	if ctrlNormal == nil {
+		t.Fatal("expected concrete-normal to inherit control options")
+	}
+	if ctrlNormal.Master != ssh.ControlMasterAuto ||
+		ctrlNormal.Path != "~/.ssh/sockets/%r@%h-%p" ||
+		ctrlNormal.Persist != "10m" {
+		t.Fatalf("inherited control mismatch: %+v", ctrlNormal)
+	}
+
+	// 2. concrete-override overrides Master to 'no', but inherits Path and Persist
+	ctrlOverride, err := parser.GetControlConfig("concrete-override")
+	if err != nil {
+		t.Fatalf("GetControlConfig(concrete-override) failed: %v", err)
+	}
+	if ctrlOverride.Master != ssh.ControlMasterNo ||
+		ctrlOverride.Path != "~/.ssh/sockets/%r@%h-%p" ||
+		ctrlOverride.Persist != "10m" {
+		t.Fatalf("overridden master mismatch: %+v", ctrlOverride)
+	}
+
+	// 3. concrete-disabled overrides Path to 'none'
+	ctrlDisabled, err := parser.GetControlConfig("concrete-disabled")
+	if err != nil {
+		t.Fatalf("GetControlConfig(concrete-disabled) failed: %v", err)
+	}
+	if ctrlDisabled.Path != "none" {
+		t.Fatalf("expected Path='none', got: %q", ctrlDisabled.Path)
+	}
+	if ctrlDisabled.IsEnabled() {
+		t.Fatal("expected IsEnabled() == false for Path='none'")
+	}
+}
+
+func TestOpenSSHParser_ControlConfig_Invalid(t *testing.T) {
+	// 1. Invalid ControlMaster
+	cfg1 := `
+Host bad-master
+    ControlMaster invalid_val
+`
+	parser1, _ := NewOpenSSHParserFromReader(strings.NewReader(cfg1))
+	_, err1 := parser1.GetControlConfig("bad-master")
+	if err1 == nil || !strings.Contains(err1.Error(), "invalid ControlMaster") {
+		t.Fatalf("expected invalid ControlMaster error, got: %v", err1)
+	}
+
+	// 2. Invalid ControlPersist
+	cfg2 := `
+Host bad-persist
+    ControlPersist 10x
+`
+	parser2, _ := NewOpenSSHParserFromReader(strings.NewReader(cfg2))
+	_, err2 := parser2.GetControlConfig("bad-persist")
+	if err2 == nil || !strings.Contains(err2.Error(), "invalid ControlPersist") {
+		t.Fatalf("expected invalid ControlPersist error, got: %v", err2)
+	}
+}
+
+// TestOpenSSHImport_NormalizesContradictoryControl verifies that a host which
+// resolved to ControlMaster=no while inheriting ControlPersist from a wildcard
+// still imports: the persisted schema rejects that combination outright.
+func TestOpenSSHImport_NormalizesContradictoryControl(t *testing.T) {
+	configContent := `
+Host no-master-host
+    HostName 10.0.0.7
+    ControlMaster no
+
+Host *
+    ControlMaster auto
+    ControlPath ~/.ssh/sockets/%r@%h-%p
+    ControlPersist 10m
+`
+	hosts, err := ParseOpenSSHHosts(strings.NewReader(configContent), "deploy")
+	if err != nil {
+		t.Fatalf("ParseOpenSSHHosts failed: %v", err)
+	}
+	var found *OpenSSHHost
+	for i := range hosts {
+		if hosts[i].Name == "no-master-host" {
+			found = &hosts[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("no-master-host was not imported")
+	}
+	if found.Node.Control == nil {
+		t.Fatal("expected imported control config")
+	}
+	if found.Node.Control.Master != ssh.ControlMasterNo {
+		t.Fatalf("expected ControlMaster=no, got %q", found.Node.Control.Master)
+	}
+	if found.Node.Control.Persist != "" {
+		t.Fatalf("expected inherited ControlPersist to be dropped for ControlMaster=no, got %q", found.Node.Control.Persist)
+	}
+	if err := ValidateControlConfig(found.Node.Control); err != nil {
+		t.Fatalf("imported control config is invalid: %v", err)
+	}
+}
+
+// TestOpenSSHParser_ControlMasterAbsentStaysUnset verifies that an omitted
+// ControlMaster is not materialized as "no"; doing so would block orthogonal
+// inheritance from a lower-priority layer.
+func TestOpenSSHParser_ControlMasterAbsentStaysUnset(t *testing.T) {
+	configContent := `
+Host path-only
+    HostName 10.0.0.8
+    ControlPath ~/.ssh/path-only.sock
+    ControlPersist 5m
+`
+	parser, err := NewOpenSSHParserFromReader(strings.NewReader(configContent))
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	ctrl, err := parser.GetControlConfig("path-only")
+	if err != nil {
+		t.Fatalf("GetControlConfig failed: %v", err)
+	}
+	if ctrl == nil {
+		t.Fatal("expected control config")
+	}
+	if ctrl.Master != "" {
+		t.Fatalf("expected an unset ControlMaster, got %q", ctrl.Master)
+	}
+	if ctrl.Path != "~/.ssh/path-only.sock" || ctrl.Persist != "5m" {
+		t.Fatalf("unexpected control config %+v", ctrl)
 	}
 }

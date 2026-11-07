@@ -1,10 +1,13 @@
 package models
 
 import (
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/credential"
+	"gopkg.in/yaml.v3"
 )
 
 func TestOTPConfig_CloneAndEqual(t *testing.T) {
@@ -183,5 +186,49 @@ func TestIdentity_CloneAndEqual(t *testing.T) {
 	}
 	if orig.KeyboardInteractive.Rules[0].PromptPattern != "OTP:" {
 		t.Fatal("mutating cloned KeyboardInteractive affected original")
+	}
+}
+
+func TestNode_ControlYAMLSerialization(t *testing.T) {
+	// 1. Without Control, field should be omitted in YAML
+	nodeWithoutControl := Node{
+		HostRef:     "srv1",
+		IdentityRef: "admin",
+	}
+	out, err := yaml.Marshal(nodeWithoutControl)
+	if err != nil {
+		t.Fatalf("marshal error: %v", err)
+	}
+	if strings.Contains(string(out), "control:") {
+		t.Fatalf("expected control to be omitted, got: %s", string(out))
+	}
+
+	// 2. With Control, field should be marshaled and unmarshaled correctly
+	nodeWithControl := Node{
+		HostRef:     "srv1",
+		IdentityRef: "admin",
+		Control: &ssh.ControlConfig{
+			Master:  ssh.ControlMasterAuto,
+			Path:    "~/.ssh/cm-%r@%h:%p",
+			Persist: "10m",
+		},
+	}
+	data, err := yaml.Marshal(nodeWithControl)
+	if err != nil {
+		t.Fatalf("marshal error: %v", err)
+	}
+	if !strings.Contains(string(data), "control:") {
+		t.Fatalf("expected control in YAML, got: %s", string(data))
+	}
+
+	var unmarshaled Node
+	if err := yaml.Unmarshal(data, &unmarshaled); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if unmarshaled.Control == nil {
+		t.Fatal("expected unmarshaled Control to be non-nil")
+	}
+	if !unmarshaled.Control.Equal(nodeWithControl.Control) {
+		t.Fatalf("expected %v, got %v", nodeWithControl.Control, unmarshaled.Control)
 	}
 }

@@ -34,7 +34,11 @@ func writeCommandOutput(ctx context.Context, target io.Writer, render func(io.Wr
 // and rechecks capabilities before starting any remote command. Never retry a
 // command on the legacy path after strict execution has begun.
 func commandOutputSupported(ctx context.Context) (bool, error) {
-	for _, target := range []*os.File{os.Stdout, os.Stderr} {
+	return streamOutputSupported(ctx, os.Stdout, os.Stderr)
+}
+
+func streamOutputSupported(ctx context.Context, stdout, stderr io.Writer) (bool, error) {
+	for _, target := range []io.Writer{stdout, stderr} {
 		_, release, supported, err := ssh.BindOutput(ctx, target)
 		err = errors.Join(err, release())
 		if err != nil {

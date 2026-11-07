@@ -183,6 +183,12 @@ func (c *Connector) acquirePlan(key string, plan ConnectionPlan) (*planEntry, er
 		for _, hop := range plan.Hops {
 			provider.configs[hop.NodeID] = clientConfigFromPlan(hop)
 		}
+		// Connection sharing is deliberately not inherited here: the capture is a
+		// frozen generation keyed by scope, hops and trust versions, while a
+		// control socket is local state addressed only by %l%h%p%r%j. Attaching a
+		// plan to an existing master would reuse a transport admitted under another
+		// scope, credential version or host-key decision, and it would bypass
+		// RetirePlan. Plans therefore always dial their own transport.
 		connector := NewConnector(provider,
 			WithEnvironment(c.environment), WithLogger(c.getLogger()), WithDialer(c.baseDialer),
 			WithHandshakeTimeout(c.getHandshakeTimeout()), WithInteractionTimeout(c.interactionTimeout),

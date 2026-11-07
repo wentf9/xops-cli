@@ -74,6 +74,7 @@ func NewCmdSftp() *cobra.Command {
 	// OpenSSH-compatible flags
 	cmd.Flags().StringVarP(&o.IdentityFile, "identity", "i", "", i18n.T("flag_identity"))
 	cmd.Flags().StringVarP(&o.JumpHost, "jump", "J", "", i18n.T("flag_jump"))
+	o.control.RegisterCommonFlags(cmd)
 
 	// xops-enhanced flags (long-form only, no short flags to avoid OpenSSH conflicts)
 	cmd.Flags().StringVar(&o.Host, "host", "", i18n.T("flag_host"))
@@ -92,6 +93,17 @@ func NewCmdSftp() *cobra.Command {
 	return cmd
 }
 
+func (o *SftpOptions) Validate() error {
+	extraArgs := o.args
+	if o.Host == "" && len(extraArgs) > 0 {
+		extraArgs = extraArgs[1:]
+	}
+	if len(extraArgs) > 0 {
+		return fmt.Errorf("unexpected positional argument %q", extraArgs[0])
+	}
+	return o.SshOptions.Validate()
+}
+
 func (o *SftpOptions) Run() error {
 	return o.RunContext(context.Background())
 }
@@ -100,6 +112,9 @@ func (o *SftpOptions) Run() error {
 //
 //nolint:gocyclo
 func (o *SftpOptions) RunContext(ctx context.Context) (err error) {
+	if err := o.ensureGeneralOptionsApplied(); err != nil {
+		return err
+	}
 	batch := !term.IsTerminal(int(os.Stdin.Fd()))
 	connectionOptions := o.SshOptions
 	if batch {
@@ -144,7 +159,7 @@ func (o *SftpOptions) RunContext(ctx context.Context) (err error) {
 		adpOpts = append(adpOpts, adapter.WithNonInteractive(true))
 		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(observer))
 	} else {
-		connector = newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithInteractionHandler(connectionOptions.interaction), ssh.WithDiagnostics(observer))
+		connector = newCLIConnectorWithAdapterOptions(provider, connectionOptions.interaction, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(observer))
 	}
 	defer func() {
 		joinConnectorCloseError(&err, connector)
@@ -185,6 +200,9 @@ func (o *SftpOptions) RunContext(ctx context.Context) (err error) {
 		runCancel()
 		if closeErr := sftpClient.Close(); closeErr != nil {
 			err = errors.Join(err, fmt.Errorf("close SFTP client failed: %w", closeErr))
+		}
+		if handoffErr := connectionOptions.handoffPersistentMaster(ctx, connector, provider, nodeID); handoffErr != nil {
+			logger.DefaultLogger().Debugf("mux: master handoff failed: %v", handoffErr)
 		}
 		if closeErr := client.Close(); closeErr != nil {
 			err = errors.Join(err, fmt.Errorf("close SSH client after SFTP shell failed: %w", closeErr))
