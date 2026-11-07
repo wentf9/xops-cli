@@ -103,6 +103,72 @@ func TestPipeCommandStdin_CancelIdempotency(t *testing.T) {
 	}
 }
 
+type mockBufferingWriteCloser struct {
+	mu          sync.Mutex
+	buf         bytes.Buffer
+	closedCount atomic.Int32
+}
+
+func (m *mockBufferingWriteCloser) Write(p []byte) (n int, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.buf.Write(p)
+}
+
+func (m *mockBufferingWriteCloser) Close() error {
+	m.closedCount.Add(1)
+	return nil
+}
+
+func (m *mockBufferingWriteCloser) String() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.buf.String()
+}
+
+// TestPipeCommandStdin_FileEOFClosesDestinationBeforeStop verifies that when an os.File
+// input reaches EOF, the destination is closed immediately so streaming commands can
+// finish before stopAndWait is called.
+func TestPipeCommandStdin_FileEOFClosesDestinationBeforeStop(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() failed: %v", err)
+	}
+	defer func() { _ = r.Close() }()
+
+	payload := "streaming file content\n"
+	if _, err := w.WriteString(payload); err != nil {
+		_ = w.Close()
+		t.Fatalf("write pipe failed: %v", err)
+	}
+	_ = w.Close() // send EOF on input file
+
+	writer := &mockBufferingWriteCloser{}
+	stopAndWait, err := pipeCommandStdin(r, writer)
+	if err != nil {
+		t.Fatalf("pipeCommandStdin failed: %v", err)
+	}
+
+	// The copying goroutine should observe EOF and close writer promptly
+	deadline := time.Now().Add(2 * time.Second)
+	for writer.closedCount.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if writer.closedCount.Load() != 1 {
+		t.Fatalf("expected writer to be closed on EOF before stopAndWait, got closedCount=%d", writer.closedCount.Load())
+	}
+	if got := writer.String(); got != payload {
+		t.Fatalf("expected payload %q, got %q", payload, got)
+	}
+
+	if err := stopAndWait(); err != nil {
+		t.Fatalf("stopAndWait failed: %v", err)
+	}
+	if writer.closedCount.Load() != 1 {
+		t.Fatalf("expected writer closed count to remain 1 after stopAndWait, got %d", writer.closedCount.Load())
+	}
+}
+
 // TestRunCommandWithIO_RejectsUncancelableStdin verifies that an arbitrary
 // blocking reader cannot start a command and leak a copy goroutine.
 func TestRunCommandWithIO_RejectsUncancelableStdin(t *testing.T) {

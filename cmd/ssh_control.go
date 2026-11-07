@@ -44,11 +44,24 @@ func (e *ControlExitError) ExitCode() int {
 	return e.Code
 }
 
-// ExitCodeFromError extracts the exit code if err implements ExitCoder.
+// ExitCodeFromError extracts the exit code if err implements ExitCoder,
+// or unwraps cryptoSSH.ExitError / ssh.CommandExitError.
 func ExitCodeFromError(err error) (int, bool) {
 	var coder ExitCoder
 	if errors.As(err, &coder) {
 		return coder.ExitCode(), true
+	}
+	var exitErr *cryptoSSH.ExitError
+	if errors.As(err, &exitErr) {
+		code := exitErr.ExitStatus()
+		if code == 0 {
+			code = 255
+		}
+		return code, true
+	}
+	var cmdExitErr *ssh.CommandExitError
+	if errors.As(err, &cmdExitErr) && cmdExitErr.ExitCode != nil {
+		return int(*cmdExitErr.ExitCode), true
 	}
 	return 0, false
 }
