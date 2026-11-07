@@ -932,20 +932,26 @@ func pipeCommandStdin(stdin io.Reader, dst io.WriteCloser, options ...inputPipel
 		if err != nil {
 			return nil, err
 		}
-		return sync.OnceValue(func() error {
-			cancelErr := cancel()
-			// The session owner closes/interrupts its channel before finishing
-			// input, unblocking any SSH window write. Join that writer before
-			// CloseWrite: x/crypto's stdin Write and Close are not concurrent-safe.
+		closeDst := sync.OnceValue(func() error {
+			if closeErr := dst.Close(); closeErr != nil && !errors.Is(closeErr, os.ErrClosed) && !errors.Is(closeErr, io.EOF) {
+				return closeErr
+			}
+			return nil
+		})
+		doneCh := make(chan error, 1)
+		go func() {
 			copyErr := <-done
 			if errors.Is(copyErr, io.EOF) || errors.Is(copyErr, os.ErrClosed) {
 				copyErr = nil
 			}
-			closeErr := dst.Close()
-			if errors.Is(closeErr, io.EOF) || errors.Is(closeErr, os.ErrClosed) {
-				closeErr = nil
-			}
-			return errors.Join(cancelErr, copyErr, closeErr)
+			// Once the input copy goroutine joins, it will not call dst.Write again.
+			// Close dst to send EOF to the remote session so stdin-reading processes can exit.
+			doneCh <- errors.Join(copyErr, closeDst())
+		}()
+		return sync.OnceValue(func() error {
+			cancelErr := cancel()
+			copyErr := <-doneCh
+			return errors.Join(cancelErr, copyErr)
 		}), nil
 	}
 
