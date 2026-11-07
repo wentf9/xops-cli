@@ -69,6 +69,14 @@ flag_background:
   other: "Requests ssh to go to background just before command execution (implies -n)"
 flag_stdin_redirect:
   other: "Redirects stdin from /dev/null (prevents reading from stdin)"
+flag_ssh_master:
+  other: "Places the ssh client into 'master' mode for connection sharing; repeated flags place ssh into confirmation mode"
+flag_ssh_control_path:
+  other: "Specify path to control socket for connection sharing, or 'none' to disable"
+flag_ssh_option:
+  other: "Can be used to give options in the format used in the configuration file (Key=Value)"
+flag_ssh_control_command:
+  other: "Send control command to active master: check, exit, stop, forward, cancel, proxy, proxy-stream, conninfo, channels"
 ssh_err_background_requires_nocmd:
   other: "Background execution (-f) requires -N (no command) option"
 prompt_enter_passphrase:

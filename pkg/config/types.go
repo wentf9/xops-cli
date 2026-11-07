@@ -18,6 +18,7 @@ type Configuration struct {
 	MCP                   *MCPConfig                               `yaml:"mcp,omitempty"`
 	PasswordPromptPattern string                                   `yaml:"password_prompt_pattern,omitempty"` // 全局级自定义密码提示正则
 	Execution             *ssh.ExecutionConfig                     `yaml:"execution,omitempty"`
+	Control               *ssh.ControlConfig                       `yaml:"control,omitempty"`
 }
 
 // CanRememberCredentials checks configured write capability without accessing a
@@ -50,6 +51,7 @@ type ConfigProvider interface {
 	FindAlias(alias string) string
 	ResolveProxyJumpChain(jumpChain string) (string, error)
 	Snapshot() *Configuration
+	GetOpenSSHControl(alias string) (*ssh.ControlConfig, error)
 }
 
 // ConnectionSnapshot is one internally consistent connection configuration.

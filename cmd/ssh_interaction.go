@@ -95,8 +95,15 @@ func (h *cliInteractionHandler) rememberOptions(policy string, cfg *config.Confi
 	return enabled, opts
 }
 
-func newCLIConnectorWithAdapterOptions(provider config.ConfigProvider, adpOpts []adapter.Option, opts ...ssh.Option) *ssh.Connector {
-	opts = append([]ssh.Option{ssh.WithInteractionHandler(newCLIInteractionHandler())}, opts...)
+// newCLIConnectorWithAdapterOptions builds the interactive CLI connector. The
+// explicit handler is required: WithInteractionHandler only installs secret and
+// host-key prompts, so the master connection-sharing confirmer must be wired to
+// the same handler (and prompt gate) as the rest of the session.
+func newCLIConnectorWithAdapterOptions(provider config.ConfigProvider, interaction *cliInteractionHandler, adpOpts []adapter.Option, opts ...ssh.Option) *ssh.Connector {
+	if interaction == nil {
+		interaction = newCLIInteractionHandler()
+	}
+	opts = append([]ssh.Option{ssh.WithInteractionHandler(interaction), ssh.WithSessionConfirmer(interaction)}, opts...)
 	return adapter.NewConnectorWithAdapterOptions(provider, adpOpts, opts...)
 }
 
@@ -173,6 +180,30 @@ func (h *cliInteractionHandler) ConfirmHostKey(ctx context.Context, request ssh.
 	response, err := h.terminal.ReadLine(ctx, prompt)
 	if err != nil {
 		return false, fmt.Errorf("read host key confirmation failed: %w", err)
+	}
+	response = strings.TrimSpace(response)
+	return strings.EqualFold(response, "yes") || strings.EqualFold(response, "y"), nil
+}
+
+// ConfirmSession implements ssh.SessionConfirmer for ControlMaster=ask/autoask
+// (-M -M). It fails closed: a non-interactive or erroring prompt denies access.
+func (h *cliInteractionHandler) ConfirmSession(ctx context.Context, action string) (bool, error) {
+	if h == nil || h.terminal == nil {
+		return false, fmt.Errorf("cli session confirmation is not configured")
+	}
+	if !h.canRemember {
+		return false, nil
+	}
+	release, err := h.acquireGate(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer release()
+
+	prompt := fmt.Sprintf("Allow connection sharing %s on this master? (yes/no) ", action)
+	response, err := h.terminal.ReadLine(ctx, prompt)
+	if err != nil {
+		return false, fmt.Errorf("read session confirmation failed: %w", err)
 	}
 	response = strings.TrimSpace(response)
 	return strings.EqualFold(response, "yes") || strings.EqualFold(response, "y"), nil

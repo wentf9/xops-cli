@@ -17,6 +17,7 @@ import (
 	"github.com/wentf9/xops-cli/core/mcp/tunnel"
 	"github.com/wentf9/xops-cli/core/sftp"
 	"github.com/wentf9/xops-cli/core/ssh"
+	"github.com/wentf9/xops-cli/internal/sshenv"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	cryptoSSH "golang.org/x/crypto/ssh"
@@ -90,7 +91,15 @@ func nodeInfo(provider config.ConfigProvider, id string) (ports.NodeInfo, error)
 	if err != nil {
 		return ports.NodeInfo{}, err
 	}
-	return ports.NodeInfo{ID: id, Alias: slices.Clone(node.Alias), Tags: slices.Clone(node.Tags), Address: fmt.Sprintf("%s:%d", host.Address, host.Port), User: identity.User, AuthType: identity.AuthType, ProxyJump: node.ProxyJump}, nil
+	port := host.Port
+	if port == 0 {
+		port = 22
+	}
+	user := strings.TrimSpace(identity.User)
+	if user == "" {
+		user = sshenv.Discover().LocalUser
+	}
+	return ports.NodeInfo{ID: id, Alias: slices.Clone(node.Alias), Tags: slices.Clone(node.Tags), Address: fmt.Sprintf("%s:%d", host.Address, port), User: user, AuthType: identity.AuthType, ProxyJump: node.ProxyJump}, nil
 }
 
 func (h *host) Resolve(ctx context.Context, request ports.ResolveRequest) (ports.OperationSnapshot, error) {
@@ -105,7 +114,7 @@ func (h *host) resolveSnapshot(ctx context.Context, request ports.ResolveRequest
 		return ports.OperationSnapshot{}, err
 	}
 	view := ports.OperationSnapshot{DomainID: h.domain, Policy: h.policy, Targets: make(map[string]ports.Target), Selectors: make(map[string]string)}
-	adp := adapter.NewSSHAdapter(p, adapter.WithNonInteractive(true), adapter.WithCredentialSource(h.config.Registry), adapter.WithCredentialRecording(false))
+	adp := adapter.NewSSHAdapter(p, adapter.WithNonInteractive(true), adapter.WithControlMultiplexing(false), adapter.WithCredentialSource(h.config.Registry), adapter.WithCredentialRecording(false))
 	for _, selector := range request.Selectors {
 		if selector == "" {
 			continue

@@ -210,7 +210,7 @@ func (c *Client) openSubsystemSFTPStream(ctx context.Context) (*SFTPStream, erro
 
 	session, err := c.newSessionContext(setupCtx)
 	if err != nil {
-		return nil, fmt.Errorf("create SSH session failed: %w", err)
+		return nil, err
 	}
 
 	stdin, err := session.StdinPipe()

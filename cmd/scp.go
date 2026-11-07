@@ -14,6 +14,7 @@ import (
 	pkgsftp "github.com/pkg/sftp"
 	"github.com/schollz/progressbar/v3"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	cmdutils "github.com/wentf9/xops-cli/cmd/utils"
 	corelog "github.com/wentf9/xops-cli/core/log"
 	"github.com/wentf9/xops-cli/core/sftp"
@@ -78,6 +79,7 @@ func NewCmdScp() *cobra.Command {
 	cmd.Flags().StringVarP(&o.IdentityFile, "identity", "i", "", i18n.T("flag_identity"))
 	cmd.Flags().StringVarP(&o.JumpHost, "jump", "J", "", i18n.T("flag_jump"))
 	cmd.Flags().BoolVarP(&o.Recursive, "recursive", "r", false, i18n.T("flag_recursive"))
+	o.control.RegisterCommonFlags(cmd)
 
 	// xops-enhanced flags (long-form only, no short flags to avoid OpenSSH conflicts)
 	cmd.Flags().StringVar(&o.Host, "host", "", i18n.T("flag_hosts"))
@@ -110,6 +112,17 @@ func NewCmdScp() *cobra.Command {
 
 func (o *ScpOptions) Complete(cmd *cobra.Command, args []string) error {
 	o.args = args
+	o.appliedGeneralOpts = false
+	var flags *pflag.FlagSet
+	if cmd != nil {
+		flags = cmd.Flags()
+	}
+	if err := ApplyGeneralOptions(&o.SshOptions, o.control.Options, flags); err != nil {
+		return err
+	}
+	if _, err := o.control.ToSessionControlOptions(); err != nil {
+		return err
+	}
 	pathFlags := o.Source != "" || o.Dest != ""
 	if cmd != nil {
 		if cmd.Flags().Changed("port") && o.Port == 0 {
@@ -172,6 +185,12 @@ func (o *ScpOptions) completeStdinCredentials() error {
 }
 
 func (o *ScpOptions) Validate() error {
+	if err := o.ensureGeneralOptionsApplied(); err != nil {
+		return err
+	}
+	if err := o.control.Validate(); err != nil {
+		return err
+	}
 	if o.OTP != "" && o.OTPStdin {
 		return errors.New(i18n.T("err_otp_mutually_exclusive"))
 	}
@@ -277,6 +296,9 @@ func (e *transferProgressErrors) Err() error {
 }
 
 func (o *ScpOptions) RunContext(ctx context.Context) (retErr error) {
+	if err := o.ensureGeneralOptionsApplied(); err != nil {
+		return err
+	}
 	if o.interaction == nil {
 		o.interaction = newCLIInteractionHandler()
 	}
@@ -307,6 +329,9 @@ func (o *ScpOptions) RunContext(ctx context.Context) (retErr error) {
 	}
 
 	defer func() {
+		if handoffErr := o.handoffConnectorMasters(ctx, connector); handoffErr != nil {
+			logger.DefaultLogger().Debugf("mux: master handoff failed: %v", handoffErr)
+		}
 		joinConnectorCloseError(&retErr, connector)
 	}()
 
@@ -315,6 +340,9 @@ func (o *ScpOptions) RunContext(ctx context.Context) (retErr error) {
 
 // runTransfer borrows the caller-owned connector for path routing and transfer.
 func (o *ScpOptions) runTransfer(ctx context.Context, provider config.ConfigProvider, connector *ssh.Connector) (retErr error) {
+	if err := o.ensureGeneralOptionsApplied(); err != nil {
+		return err
+	}
 	if diagnostics, ok := o.diagnostics.(*scpDiagnostics); ok {
 		diagnostics.transfer(o.Source, o.Dest, "starting")
 		defer func() {
@@ -761,12 +789,12 @@ func (o *ScpOptions) runBatch(ctx context.Context, provider config.ConfigProvide
 				}
 			}
 			nid := nodeID // capture
-			_, hostObj, identity, resolveErr := provider.Resolve(nid)
+			_, _, identity, resolveErr := provider.Resolve(nid)
 			if resolveErr != nil {
 				return fmt.Errorf("resolve tagged scp node %q failed: %w", nid, resolveErr)
 			}
 			wp.Execute(func() {
-				addr := PathInfo{Host: hostObj.Address, User: identity.User, Port: hostObj.Port, IsRemote: true}
+				addr := PathInfo{Host: nid, IsRemote: true}
 				if tErr := o.executeTransfer(ctx, nid, addr, identity.Password, provider, connector); tErr != nil {
 					errMu.Lock()
 					transferErrs = append(transferErrs, fmt.Errorf("[%s] %w", nid, tErr))
@@ -976,6 +1004,9 @@ func (o *ScpOptions) resolvePathInfo(path PathInfo) (string, string, uint16, err
 }
 
 func (o *ScpOptions) resolveTargetForPath(path PathInfo) (config.ConnectionTarget, error) {
+	if err := o.ensureGeneralOptionsApplied(); err != nil {
+		return config.ConnectionTarget{}, err
+	}
 	host := path.Host
 	if host == "" && o.Host != "" && !strings.Contains(o.Host, ",") {
 		host = o.Host
@@ -1047,6 +1078,14 @@ func (o *ScpOptions) getOrCreateNodeForPath(ctx context.Context, provider config
 }
 
 func (o *ScpOptions) updateNode(ctx context.Context, nodeID string, provider config.ConfigProvider, specificPassword string, shouldRemember bool) (bool, error) {
+	if strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) {
+		if o.JumpHost != "" {
+			if _, err := provider.ResolveProxyJumpChain(o.JumpHost); err != nil {
+				return false, fmt.Errorf("resolve SCP proxy jump %q failed: %w", o.JumpHost, err)
+			}
+		}
+		return false, nil
+	}
 	node, host, identity, err := provider.Resolve(nodeID)
 	if err != nil {
 		return false, fmt.Errorf("resolve scp node %q for update failed: %w", nodeID, err)
@@ -1157,6 +1196,9 @@ func (o *ScpOptions) credentialConnector(provider *config.Repository, cfg *confi
 }
 
 func (o *ScpOptions) credentialConnectorWithInteraction(provider *config.Repository, cfg *config.Configuration, interaction *cliInteractionHandler) (*ssh.Connector, error) {
+	if err := o.ensureGeneralOptionsApplied(); err != nil {
+		return nil, err
+	}
 	shouldRemember, adpOpts := interaction.rememberOptions(cmdutils.EffectiveRememberPolicy(o.Remember, cfg), cfg)
 	batch := o.Tag != "" || strings.Contains(o.Host, ",") || o.HostFile != ""
 	shouldRemember = !batch && shouldRemember
@@ -1164,17 +1206,34 @@ func (o *ScpOptions) credentialConnectorWithInteraction(provider *config.Reposit
 		adpOpts = append(adpOpts, adapter.WithNonInteractive(true))
 	}
 	targetNodes := o.resolvedTargetNodeIDs(provider)
+	o.targetNodeIDs = targetNodes
+	keyPath := cmdutils.ToAbsolutePath(o.IdentityFile)
 	if len(targetNodes) > 0 {
 		adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{Remember: shouldRemember}))
 		for _, nodeID := range targetNodes {
 			adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, adapter.SessionAuth{
-				Password: o.Password, Passphrase: o.Passphrase, Remember: shouldRemember, OTP: o.OTP,
+				Password: o.Password, Passphrase: o.Passphrase, KeyPath: keyPath, Remember: shouldRemember, OTP: o.OTP, ProxyJump: o.JumpHost,
 			}))
 		}
 	} else {
 		adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{
-			Password: o.Password, Passphrase: o.Passphrase, Remember: shouldRemember, OTP: o.OTP,
+			Password: o.Password, Passphrase: o.Passphrase, KeyPath: keyPath, Remember: shouldRemember, OTP: o.OTP,
 		}))
+	}
+
+	// Session Control Overrides (Tier 1)
+	sessionCtrlOpts, err := o.control.ToSessionControlOptions()
+	if err != nil {
+		return nil, err
+	}
+	if !sessionCtrlOpts.IsEmpty() {
+		if len(targetNodes) > 0 {
+			for _, nodeID := range targetNodes {
+				adpOpts = append(adpOpts, adapter.WithSessionControlOverride(nodeID, sessionCtrlOpts))
+			}
+		} else {
+			adpOpts = append(adpOpts, adapter.WithGlobalSessionControl(sessionCtrlOpts))
+		}
 	}
 	if shouldRemember {
 		persistence, serviceErr := interaction.automaticPersistenceOptions(provider, cfg)
@@ -1192,7 +1251,7 @@ func (o *ScpOptions) credentialConnectorWithInteraction(provider *config.Reposit
 	if batch {
 		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics))
 	} else {
-		connector = newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics), ssh.WithInteractionHandler(interaction))
+		connector = newCLIConnectorWithAdapterOptions(provider, interaction, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics))
 	}
 	return connector, nil
 }
@@ -1201,31 +1260,82 @@ func (o *ScpOptions) resolvedTargetNodeIDs(provider *config.Repository) []string
 	if provider == nil {
 		return nil
 	}
-	var paths []PathInfo
-	if o.Host != "" && !strings.Contains(o.Host, ",") {
-		paths = append(paths, PathInfo{Host: o.Host, IsRemote: true})
-	}
-	if src, err := parsePath(o.Source); err == nil && src.IsRemote {
-		paths = append(paths, src)
-	}
-	if dst, err := parsePath(o.Dest); err == nil && dst.IsRemote {
-		paths = append(paths, dst)
-	}
 	var nodeIDs []string
 	seen := make(map[string]struct{})
-	for _, p := range paths {
-		selector, _, _, err := o.resolvePathInfo(p)
-		if err != nil || selector == "" {
+	for _, p := range o.collectTargetPaths(provider) {
+		target, err := o.resolveTargetForPath(p)
+		if err != nil || target.Selector == "" {
 			continue
 		}
-		nodeID, err := provider.ResolveSelector(selector)
-		if err != nil || nodeID == "" {
-			continue
-		}
-		if _, exists := seen[nodeID]; !exists {
-			seen[nodeID] = struct{}{}
-			nodeIDs = append(nodeIDs, nodeID)
+		for _, id := range targetCandidateNodeIDs(provider, target) {
+			if id == "" {
+				continue
+			}
+			if _, exists := seen[id]; !exists {
+				seen[id] = struct{}{}
+				nodeIDs = append(nodeIDs, id)
+			}
 		}
 	}
 	return nodeIDs
+}
+
+func (o *ScpOptions) collectTargetPaths(provider *config.Repository) []PathInfo {
+	var paths []PathInfo
+	if o.Tag != "" {
+		for nodeID := range provider.GetNodesByTag(o.Tag) {
+			paths = append(paths, PathInfo{Host: nodeID, IsRemote: true})
+		}
+	}
+	if o.Host != "" || o.HostFile != "" {
+		if hosts, err := cmdutils.ParseHosts(o.Host, o.HostFile, ""); err == nil {
+			for _, h := range hosts {
+				if h.Host != "" {
+					paths = append(paths, PathInfo{Host: h.Host, User: h.User, Port: h.Port, IsRemote: true})
+				}
+			}
+		} else if o.Host != "" {
+			for h := range strings.SplitSeq(o.Host, ",") {
+				h = strings.TrimSpace(h)
+				if h != "" {
+					paths = append(paths, PathInfo{Host: h, IsRemote: true})
+				}
+			}
+		}
+	}
+	if o.Host == "" && o.Tag == "" && o.HostFile == "" {
+		if src, err := parsePath(o.Source); err == nil && src.IsRemote {
+			paths = append(paths, src)
+		}
+		if dst, err := parsePath(o.Dest); err == nil && dst.IsRemote {
+			paths = append(paths, dst)
+		}
+	}
+	return paths
+}
+
+func targetCandidateNodeIDs(provider config.ConfigProvider, target config.ConnectionTarget) []string {
+	if resolved, err := config.ResolveTarget(provider, target); err == nil && resolved.NodeID != "" {
+		if resolved.MatchedNodeID != "" && resolved.Host != "" && resolved.User != "" && resolved.Port > 0 {
+			derivedID := config.FormatNodeID(resolved.User, resolved.Host, resolved.Port)
+			if derivedID != resolved.NodeID {
+				return []string{resolved.NodeID, derivedID}
+			}
+		}
+		return []string{resolved.NodeID}
+	}
+	user := target.User
+	if user == "" {
+		if u, uErr := cmdutils.GetCurrentUser(); uErr == nil {
+			user = u
+		}
+	}
+	port := target.Port
+	if port == 0 {
+		port = 22
+	}
+	if user == "" {
+		return nil
+	}
+	return []string{config.FormatNodeID(user, target.Selector, port)}
 }

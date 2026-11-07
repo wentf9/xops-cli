@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/wentf9/xops-cli/cmd/utils"
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/adapter"
@@ -77,6 +78,7 @@ func newCmdExecWithOptions(o *ExecOptions) *cobra.Command {
 	cmd.Flags().StringVarP(&o.User, "login", "l", "", i18n.T("flag_login"))
 	cmd.Flags().StringVarP(&o.IdentityFile, "identity", "i", "", i18n.T("flag_identity"))
 	cmd.Flags().StringVarP(&o.JumpHost, "jump", "J", "", i18n.T("flag_jump"))
+	o.control.RegisterCommonFlags(cmd)
 
 	// xops-enhanced flags (long-form only, no short flags to avoid OpenSSH conflicts)
 	cmd.Flags().StringVar(&o.Host, "host", "", i18n.T("flag_hosts"))
@@ -245,6 +247,17 @@ func (o *ExecOptions) completeNonDashArgs(cmd *cobra.Command, args []string) err
 
 func (o *ExecOptions) Complete(cmd *cobra.Command, args []string) error {
 	o.args = args
+	o.appliedGeneralOpts = false
+	var flags *pflag.FlagSet
+	if cmd != nil {
+		flags = cmd.Flags()
+	}
+	if err := ApplyGeneralOptions(&o.SshOptions, o.control.Options, flags); err != nil {
+		return err
+	}
+	if _, err := o.control.ToSessionControlOptions(); err != nil {
+		return err
+	}
 	o.execution.capturePresence(cmd)
 	if cmd != nil && cmd.Flags().Changed("cmd") && o.Command == "" {
 		return fmt.Errorf("explicit command must not be empty")
@@ -303,6 +316,12 @@ func (o *ExecOptions) readStdinIfRequired(ctx context.Context) error {
 }
 
 func (o *ExecOptions) Validate() error {
+	if err := o.ensureGeneralOptionsApplied(); err != nil {
+		return err
+	}
+	if err := o.control.Validate(); err != nil {
+		return err
+	}
 	if o.OTP != "" && o.OTPStdin {
 		return errors.New(i18n.T("err_otp_mutually_exclusive"))
 	}
@@ -367,6 +386,9 @@ func (o *ExecOptions) Run() error {
 //
 //nolint:gocyclo
 func (o *ExecOptions) RunContext(ctx context.Context) (retErr error) {
+	if err := o.ensureGeneralOptionsApplied(); err != nil {
+		return err
+	}
 	configPath, keyPath, pathErr := utils.GetConfigFilePath()
 	if pathErr != nil {
 		return fmt.Errorf("get config file path failed: %w", pathErr)
@@ -429,11 +451,14 @@ func (o *ExecOptions) RunContext(ctx context.Context) (retErr error) {
 	}
 	var connector *ssh.Connector
 	if o.Interactive {
-		connector = newCLIConnectorWithAdapterOptions(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithInteractionHandler(o.interaction))
+		connector = newCLIConnectorWithAdapterOptions(provider, o.interaction, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
 	} else {
 		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
 	}
 	defer func() {
+		if handoffErr := o.handoffConnectorMasters(ctx, connector); handoffErr != nil {
+			logger.DefaultLogger().Debugf("mux: master handoff failed: %v", handoffErr)
+		}
 		joinConnectorCloseError(&retErr, connector)
 	}()
 
@@ -558,10 +583,23 @@ func (o *ExecOptions) buildAdapterOptions(tasks []execHostTask, cfg *config.Conf
 	// A global policy applies to proxy-jump nodes, which do not have a task
 	// specific override. Explicit task credentials remain scoped to their target.
 	adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{Remember: remember}))
+	o.targetNodeIDs = make([]string, 0, len(tasks))
 	for _, task := range tasks {
+		o.targetNodeIDs = append(o.targetNodeIDs, task.nodeID)
 		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(task.nodeID, adapter.SessionAuth{
-			Password: task.pass, Passphrase: task.passphrase, KeyPath: task.keyPath, Remember: remember, OTP: o.OTP,
+			Password: task.pass, Passphrase: task.passphrase, KeyPath: task.keyPath, Remember: remember, OTP: o.OTP, ProxyJump: o.JumpHost,
 		}))
+	}
+
+	// Session Control Overrides (Tier 1)
+	sessionCtrlOpts, err := o.control.ToSessionControlOptions()
+	if err != nil {
+		return nil, err
+	}
+	if !sessionCtrlOpts.IsEmpty() {
+		for _, task := range tasks {
+			adpOpts = append(adpOpts, adapter.WithSessionControlOverride(task.nodeID, sessionCtrlOpts))
+		}
 	}
 	if reg, regErr := utils.GetCredentialRegistry(cfg); regErr != nil {
 		return nil, fmt.Errorf("initialize credential resolver: %w", regErr)
@@ -859,6 +897,9 @@ func sanitizeHostForFilename(host string) string {
 }
 
 func (o *ExecOptions) buildTasksFromTags(provider config.ConfigProvider) ([]execHostTask, error) {
+	if err := o.ensureGeneralOptionsApplied(); err != nil {
+		return nil, err
+	}
 	var tasks []execHostTask
 	nodes := provider.GetNodesByTag(o.Tag)
 	if len(nodes) == 0 {
@@ -892,6 +933,9 @@ func (o *ExecOptions) buildTasksFromTags(provider config.ConfigProvider) ([]exec
 }
 
 func (o *ExecOptions) buildTasksFromHosts(ctx context.Context, repository *config.Repository) ([]execHostTask, []error, error) {
+	if err := o.ensureGeneralOptionsApplied(); err != nil {
+		return nil, nil, err
+	}
 	var tasks []execHostTask
 	var hostErrs []error
 	hosts, err := utils.ParseHosts(o.Host, o.HostFile, "")
@@ -978,6 +1022,14 @@ func appendExecAlias(slice []string, val string) ([]string, bool) {
 }
 
 func (o *ExecOptions) updateNodeFromHostInfo(ctx context.Context, nodeID string, repository *config.Repository, addr utils.HostInfo) (bool, error) {
+	if strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) {
+		if o.JumpHost != "" {
+			if _, err := repository.ResolveProxyJumpChain(o.JumpHost); err != nil {
+				return false, fmt.Errorf("resolve exec proxy jump %q failed: %w", o.JumpHost, err)
+			}
+		}
+		return false, nil
+	}
 	view := repository.View()
 	ref, ok := view.NodeRefs[nodeID]
 	if !ok {

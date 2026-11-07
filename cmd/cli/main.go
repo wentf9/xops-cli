@@ -33,6 +33,14 @@ func main() {
 	}
 
 	if err := cmd.Execute(); err != nil {
+		if code, ok := cmd.ExitCodeFromError(err); ok {
+			if !cmd.ErrorAlreadyReported(err) {
+				// Control-command diagnostics must stay byte-for-byte compatible
+				// with OpenSSH: plain stderr, no color or log prefix.
+				fmt.Fprintln(os.Stderr, err.Error())
+			}
+			os.Exit(code)
+		}
 		reportError(err)
 		os.Exit(1)
 	}

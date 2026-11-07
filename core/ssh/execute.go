@@ -378,7 +378,7 @@ func (c *Client) runWithSudo(ctx context.Context, command string, password []byt
 
 	session, err := c.newSessionContext(ctx)
 	if err != nil {
-		return "", fmt.Errorf("failed to create new session: %w", err)
+		return "", err
 	}
 	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
 
@@ -864,7 +864,7 @@ func (c *Client) runSessionWithInput(ctx context.Context, request string, start 
 	}
 	session, err := c.newSessionContext(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to create new session: %w", err)
+		return err
 	}
 	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
 

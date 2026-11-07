@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/kevinburke/ssh_config"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/models"
 )
 
@@ -109,6 +110,53 @@ func (p *OpenSSHParser) HasHost(alias string) bool {
 	return false
 }
 
+// FindConcreteHostsByAddress returns concrete Host pattern names in ssh_config
+// whose resolved HostName matches address and (when port > 0) whose resolved
+// Port matches port.
+func (p *OpenSSHParser) FindConcreteHostsByAddress(address string, port uint16) []string {
+	if p == nil || p.cfg == nil {
+		return nil
+	}
+	cleanAddr := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(address), "]"), "[")
+	if cleanAddr == "" {
+		return nil
+	}
+	var matches []string
+	seen := make(map[string]struct{})
+	for _, block := range p.cfg.Hosts {
+		for _, pattern := range block.Patterns {
+			name := pattern.String()
+			if !isConcreteSSHHost(name) {
+				continue
+			}
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			hostName, err := p.getVal(name, "HostName", name)
+			if err != nil {
+				continue
+			}
+			cleanHost := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(hostName), "]"), "[")
+			if !strings.EqualFold(cleanHost, cleanAddr) {
+				continue
+			}
+			if port > 0 {
+				portStr, err := p.getVal(name, "Port", "22")
+				if err != nil {
+					continue
+				}
+				parsedPort, parseErr := strconv.ParseUint(strings.TrimSpace(portStr), 10, 16)
+				if parseErr != nil || uint16(parsedPort) != port {
+					continue
+				}
+			}
+			matches = append(matches, name)
+		}
+	}
+	return matches
+}
+
 // GetVirtualNode 根据 alias 从 ssh_config 生成运行时的内存 Node / Host / Identity
 func (p *OpenSSHParser) GetVirtualNode(alias string) (models.Node, models.Host, models.Identity, error) {
 	if p == nil {
@@ -170,6 +218,11 @@ func (p *OpenSSHParser) GetVirtualNode(alias string) (models.Node, models.Host, 
 	}
 	proxyJump = parseOpenSSHProxyJump(proxyJump)
 
+	ctrl, err := parseOpenSSHControl(p.cfg, lookupAlias)
+	if err != nil {
+		return models.Node{}, models.Host{}, models.Identity{}, err
+	}
+
 	hostRef := fmt.Sprintf("%s:%d", hostName, port)
 	identityRef := fmt.Sprintf("%s@%s", user, hostName)
 
@@ -180,6 +233,7 @@ func (p *OpenSSHParser) GetVirtualNode(alias string) (models.Node, models.Host, 
 		SudoMode:    models.SudoModeAuto, // 对于导入节点，依然支持 auto
 		Tags:        []string{"openssh"}, // 打一个虚拟 tag
 		Alias:       []string{alias},
+		Control:     ctrl,
 	}
 
 	host := models.Host{
@@ -194,6 +248,69 @@ func (p *OpenSSHParser) GetVirtualNode(alias string) (models.Node, models.Host, 
 	}
 
 	return node, host, identity, nil
+}
+
+// GetControlConfig parses multiplexing options for a given alias/host in ssh_config.
+func (p *OpenSSHParser) GetControlConfig(alias string) (*ssh.ControlConfig, error) {
+	if p == nil || p.cfg == nil || alias == "" {
+		return nil, nil
+	}
+	cleanAlias := strings.TrimPrefix(alias, OpenSSHNodePrefix)
+	lookupAlias, _, _, err := parseOpenSSHHostSpec(cleanAlias)
+	if err != nil {
+		lookupAlias = cleanAlias
+	}
+	return parseOpenSSHControl(p.cfg, lookupAlias)
+}
+
+func parseOpenSSHControl(cfg *ssh_config.Config, host string) (*ssh.ControlConfig, error) {
+	if cfg == nil || host == "" {
+		return nil, nil
+	}
+	masterVal, err := cfg.Get(host, "ControlMaster")
+	if err != nil {
+		return nil, fmt.Errorf("read openssh ControlMaster for host %q: %w", host, err)
+	}
+	pathVal, err := cfg.Get(host, "ControlPath")
+	if err != nil {
+		return nil, fmt.Errorf("read openssh ControlPath for host %q: %w", host, err)
+	}
+	persistVal, err := cfg.Get(host, "ControlPersist")
+	if err != nil {
+		return nil, fmt.Errorf("read openssh ControlPersist for host %q: %w", host, err)
+	}
+
+	masterVal = strings.TrimSpace(masterVal)
+	pathVal = strings.TrimSpace(pathVal)
+	persistVal = strings.TrimSpace(persistVal)
+
+	if masterVal == "" && pathVal == "" && persistVal == "" {
+		return nil, nil
+	}
+
+	// An absent ControlMaster stays empty so lower-priority layers keep the
+	// ability to inherit a value orthogonally. Only an explicit directive is
+	// normalized into a mode.
+	var masterMode ssh.ControlMasterMode
+	if masterVal != "" {
+		mode, err := ssh.ParseControlMasterMode(masterVal)
+		if err != nil {
+			return nil, fmt.Errorf("invalid ControlMaster %q for %q in ssh config: %w", masterVal, host, err)
+		}
+		masterMode = mode
+	}
+
+	if persistVal != "" {
+		if _, _, _, err := ssh.ParseControlPersist(persistVal); err != nil {
+			return nil, fmt.Errorf("invalid ControlPersist %q for %q in ssh config: %w", persistVal, host, err)
+		}
+	}
+
+	return &ssh.ControlConfig{
+		Master:  masterMode,
+		Path:    pathVal,
+		Persist: persistVal,
+	}, nil
 }
 
 func parseOpenSSHHostSpec(spec string) (host, userName string, port uint16, err error) {

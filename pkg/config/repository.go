@@ -13,6 +13,7 @@ import (
 	"time"
 
 	coreauth "github.com/wentf9/xops-cli/core/auth"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
 	"gopkg.in/yaml.v3"
@@ -349,8 +350,12 @@ func (r *Repository) ResolveConnection(nodeID string) (ConnectionSnapshot, error
 		if err != nil {
 			return ConnectionSnapshot{}, fmt.Errorf("resolve sudo version for node %q: %w", nodeID, err)
 		}
+		clonedNode := cloneNode(node)
+		if clonedNode.OpenSSHAlias == "" && r.provider != nil {
+			clonedNode.OpenSSHAlias = r.provider.NodeOpenSSHAlias(nodeID)
+		}
 		return ConnectionSnapshot{
-			Node:     cloneNode(node),
+			Node:     clonedNode,
 			Host:     cloneHost(host),
 			Identity: cloneIdentity(identity),
 			UpdateRef: &ConnectionUpdateRef{
@@ -364,7 +369,27 @@ func (r *Repository) ResolveConnection(nodeID string) (ConnectionSnapshot, error
 	if err != nil {
 		return ConnectionSnapshot{}, err
 	}
+	if node.OpenSSHAlias == "" && r.provider != nil {
+		node.OpenSSHAlias = r.provider.NodeOpenSSHAlias(nodeID)
+	}
 	return ConnectionSnapshot{Node: node, Host: host, Identity: identity}, nil
+}
+
+// SetNodeOpenSSHAlias records the concrete OpenSSH Host alias from which nodeID
+// was derived during the current session without modifying persisted state.
+func (r *Repository) SetNodeOpenSSHAlias(nodeID, alias string) {
+	if r == nil || r.provider == nil {
+		return
+	}
+	r.provider.SetNodeOpenSSHAlias(nodeID, alias)
+}
+
+// NodeOpenSSHAlias returns the session-recorded OpenSSH Host alias for nodeID.
+func (r *Repository) NodeOpenSSHAlias(nodeID string) string {
+	if r == nil || r.provider == nil {
+		return ""
+	}
+	return r.provider.NodeOpenSSHAlias(nodeID)
 }
 
 func versionFromString(value string) (Version, error) {
@@ -1012,10 +1037,10 @@ func findImportedProxyByConnection(cfg *Configuration, hop string) (string, bool
 		if !hostExists || !identityExists || host.Address != hostName {
 			continue
 		}
-		if port != 0 && host.Port != port {
+		if port != 0 && normalizedHostPort(host.Port) != normalizedHostPort(port) {
 			continue
 		}
-		if userName != "" && identity.User != userName {
+		if userName != "" && normalizedIdentityUser(identity.User) != userName {
 			continue
 		}
 		candidates = append(candidates, nodeID)
@@ -1182,6 +1207,20 @@ func (r *Repository) FindAlias(alias string) string {
 
 func (r *Repository) Snapshot() *Configuration {
 	return r.provider.Snapshot()
+}
+
+func (r *Repository) GetOpenSSHControl(alias string) (*ssh.ControlConfig, error) {
+	if r == nil || r.provider == nil {
+		return nil, nil
+	}
+	return r.provider.GetOpenSSHControl(alias)
+}
+
+func (r *Repository) GetOpenSSHParser() *OpenSSHParser {
+	if r == nil || r.provider == nil {
+		return nil
+	}
+	return r.provider.GetOpenSSHParser()
 }
 
 // Frozen exposes an immutable read-only view, retaining OpenSSH diagnostics

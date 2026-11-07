@@ -3,7 +3,9 @@ package adapter
 import (
 	"context"
 	"fmt"
+	"net"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,14 +18,93 @@ import (
 	"github.com/wentf9/xops-cli/pkg/models"
 )
 
-// SessionAuth 描述单个连接会话的临时认证机密覆盖
+// SessionAuth 描述单个连接会话的临时认证机密与跳板覆盖
 type SessionAuth struct {
 	Password   string
 	Passphrase string
 	KeyPath    string
 	SuPwd      string
 	OTP        string
+	ProxyJump  string
 	Remember   bool
+}
+
+// SessionControlOptions specifies session-level multiplexing overrides (Tier 1).
+// Pointers indicate whether a flag was explicitly specified on the CLI.
+type SessionControlOptions struct {
+	Master  *ssh.ControlMasterMode
+	Path    *string
+	Persist *string
+}
+
+// IsEmpty returns true if no session control flags were provided.
+func (s SessionControlOptions) IsEmpty() bool {
+	return s.Master == nil && s.Path == nil && s.Persist == nil
+}
+
+// SetMaster sets the ControlMaster override.
+func (s *SessionControlOptions) SetMaster(m ssh.ControlMasterMode) {
+	s.Master = &m
+}
+
+// SetPath sets the ControlPath override.
+func (s *SessionControlOptions) SetPath(p string) {
+	s.Path = &p
+}
+
+// SetPersist sets the ControlPersist override.
+func (s *SessionControlOptions) SetPersist(p string) {
+	s.Persist = &p
+}
+
+// supportedSSHOptions lists the -o keys this CLI understands. Unknown keys are
+// rejected instead of ignored so a typo cannot silently disable the requested
+// behavior.
+var supportedSSHOptions = []string{
+	"controlmaster", "controlpath", "controlpersist", "port", "user", "identityfile", "proxyjump",
+}
+
+// ParseOptionStrings parses OpenSSH -o Key=Value strings into SessionControlOptions.
+func ParseOptionStrings(options []string) (SessionControlOptions, error) {
+	var opts SessionControlOptions
+	for _, opt := range options {
+		opt = strings.TrimSpace(opt)
+		if opt == "" {
+			continue
+		}
+		key, val, ok := strings.Cut(opt, "=")
+		if !ok {
+			return opts, fmt.Errorf("invalid -o option format (expected Key=Value): %q", opt)
+		}
+		key = strings.TrimSpace(key)
+		val = strings.TrimSpace(val)
+
+		switch strings.ToLower(key) {
+		case "controlmaster":
+			m, err := ssh.ParseControlMasterMode(val)
+			if err != nil {
+				return opts, fmt.Errorf("invalid ControlMaster in -o option: %w", err)
+			}
+			opts.SetMaster(m)
+		case "controlpath":
+			opts.SetPath(val)
+		case "controlpersist":
+			if _, _, _, err := ssh.ParseControlPersist(val); err != nil {
+				return opts, fmt.Errorf("invalid ControlPersist in -o option: %w", err)
+			}
+			opts.SetPersist(val)
+		case "port":
+			p, err := strconv.ParseUint(val, 10, 16)
+			if err != nil || p == 0 {
+				return opts, fmt.Errorf("invalid Port in -o option: %q", val)
+			}
+		case "user", "identityfile", "proxyjump":
+			// Applied to the connection target by the CLI, see ApplyGeneralOptions.
+		default:
+			return opts, fmt.Errorf("unsupported -o option %q (supported: %s)", key, strings.Join(supportedSSHOptions, ", "))
+		}
+	}
+	return opts, nil
 }
 
 // CredentialResolver 描述能够根据 Ref 解析 Secret 的契约（如 *credential.Registry）
@@ -58,6 +139,30 @@ func WithGlobalSessionAuth(auth SessionAuth) Option {
 	}
 }
 
+// WithSessionControlOverride registers session multiplexing overrides for a specific node.
+func WithSessionControlOverride(nodeID string, opts SessionControlOptions) Option {
+	return func(a *SSHAdapter) {
+		if a.sessionControlOverrides == nil {
+			a.sessionControlOverrides = make(map[string]SessionControlOptions)
+		}
+		a.sessionControlOverrides[nodeID] = opts
+	}
+}
+
+// WithGlobalSessionControl registers session multiplexing overrides for all nodes in the session.
+func WithGlobalSessionControl(opts SessionControlOptions) Option {
+	return func(a *SSHAdapter) {
+		a.globalSessionControl = &opts
+	}
+}
+
+// WithOpenSSHParser injects an explicit OpenSSHParser for Tier 4 resolution (e.g. in tests).
+func WithOpenSSHParser(parser *config.OpenSSHParser) Option {
+	return func(a *SSHAdapter) {
+		a.openSSHParser = parser
+	}
+}
+
 // WithNonInteractive 标记该适配器为非交互式环境（如批处理、MCP、Playbook）
 func WithNonInteractive(nonInteractive bool) Option {
 	return func(a *SSHAdapter) {
@@ -80,6 +185,16 @@ func WithRememberConfirmation(confirm func(context.Context, string) (bool, error
 	return func(a *SSHAdapter) { a.rememberConfirmation = confirm }
 }
 
+// WithControlMultiplexing controls whether this adapter exposes a
+// ControlProvider to the underlying ssh.Connector. Credential verification and
+// MCP hosts disable it so they never attach to or create external control
+// sockets on disk.
+func WithControlMultiplexing(enabled bool) Option {
+	return func(a *SSHAdapter) {
+		a.disableControl = !enabled
+	}
+}
+
 // SSHAdapter 实现 ssh.ConnectionProvider, ssh.SecretResolver, ssh.CredentialRecorder 接口，作为业务模型与底层 SSH 的防腐层
 type SSHAdapter struct {
 	cfgProvider             config.ConfigProvider
@@ -87,7 +202,11 @@ type SSHAdapter struct {
 	credentialService       *credential.Service
 	sessionOverrides        map[string]SessionAuth
 	globalSessionAuth       *SessionAuth
+	sessionControlOverrides map[string]SessionControlOptions
+	globalSessionControl    *SessionControlOptions
+	openSSHParser           *config.OpenSSHParser
 	nonInteractive          bool
+	disableControl          bool
 	credentialRecording     bool
 	rememberConfirmation    func(context.Context, string) (bool, error)
 	enrollmentProbe         bool
@@ -110,6 +229,7 @@ var (
 	_ ssh.SecretResolver     = (*SSHAdapter)(nil)
 	_ ssh.CredentialRecorder = (*SSHAdapter)(nil)
 	_ ssh.ConfigStore        = (*SSHAdapter)(nil)
+	_ ssh.ControlProvider    = (*SSHAdapter)(nil)
 )
 
 // NewSSHAdapter 创建 SSH 适配器
@@ -161,6 +281,9 @@ func newConnector(adp *SSHAdapter, opts ...ssh.Option) *ssh.Connector {
 	if cfg := adp.cfgProvider.Snapshot(); cfg != nil && cfg.PasswordPromptPattern != "" {
 		finalOpts = append(finalOpts, ssh.WithPasswordPromptPattern(cfg.PasswordPromptPattern))
 	}
+	if !adp.disableControl {
+		finalOpts = append(finalOpts, ssh.WithControlProvider(adp))
+	}
 	finalOpts = append(finalOpts, opts...)
 	return ssh.NewConnector(adp, finalOpts...)
 }
@@ -181,6 +304,349 @@ func (a *SSHAdapter) getSessionOverride(nodeID string) (SessionAuth, bool) {
 		return *a.globalSessionAuth, true
 	}
 	return SessionAuth{}, false
+}
+
+func (a *SSHAdapter) getSessionControlOverride(nodeID string) (SessionControlOptions, bool) {
+	if a.sessionControlOverrides != nil {
+		if override, ok := a.sessionControlOverrides[nodeID]; ok {
+			return override, true
+		}
+	}
+	if a.globalSessionControl != nil {
+		return *a.globalSessionControl, true
+	}
+	return SessionControlOptions{}, false
+}
+
+// GetControlConfig implements ssh.ControlProvider.
+func (a *SSHAdapter) GetControlConfig(nodeID string) (*ssh.ControlConfig, error) {
+	if a.disableControl {
+		return nil, nil
+	}
+	sessionOpts, _ := a.getSessionControlOverride(nodeID)
+	return a.ResolveControl(nodeID, sessionOpts)
+}
+
+// ResolveControl resolves the effective ControlConfig for nodeID given session options,
+// strictly enforcing the 4-tier precedence hierarchy and field-by-field merging semantics.
+func (a *SSHAdapter) ResolveControl(nodeName string, sessionOpts SessionControlOptions) (*ssh.ControlConfig, error) {
+	if a.disableControl {
+		return nil, nil
+	}
+	if a.cfgProvider == nil {
+		return nil, fmt.Errorf("configuration provider is nil")
+	}
+
+	// 1. Resolve Tier 2 (Node Config) and target context. OpenSSH virtual nodes
+	// carry their ~/.ssh/config values in Node.Control, but they remain Tier 4:
+	// they must not outrank the persisted global defaults.
+	var tier2NodeCtrl *ssh.ControlConfig
+	snapshot, snapErr := a.cfgProvider.ResolveConnection(nodeName)
+	virtualOpenSSHNode := strings.HasPrefix(nodeName, config.OpenSSHNodePrefix)
+	if snapErr == nil {
+		if virtualOpenSSHNode {
+			tier2NodeCtrl = nil
+		} else {
+			tier2NodeCtrl = snapshot.Node.Control
+		}
+	}
+
+	// 2. Resolve Tier 3 (Global Defaults)
+	var tier3GlobalCtrl *ssh.ControlConfig
+	if globalCfg := a.cfgProvider.Snapshot(); globalCfg != nil {
+		tier3GlobalCtrl = globalCfg.Control
+	}
+
+	// 3. Resolve Tier 4 (OpenSSH Config Fallback)
+	var tier4OpenSSHCtrl *ssh.ControlConfig
+	if virtualOpenSSHNode {
+		if snapErr == nil {
+			tier4OpenSSHCtrl = snapshot.Node.Control
+		}
+	} else {
+		tier4OpenSSHCtrl = a.resolveTier4OpenSSH(nodeName, snapErr, snapshot)
+	}
+
+	// 4. Field-by-field merging: Tier 1 > Tier 2 > Tier 3 > Tier 4
+	merged := mergeControlFields(sessionOpts, tier2NodeCtrl, tier3GlobalCtrl, tier4OpenSSHCtrl)
+	if merged == nil {
+		return nil, nil // No multiplexing configured
+	}
+
+	// 5. Validation
+	if err := validateMergedControl(merged); err != nil {
+		return nil, err
+	}
+
+	return merged, nil
+}
+
+func (a *SSHAdapter) resolveTier4OpenSSH(nodeName string, snapErr error, snapshot config.ConnectionSnapshot) *ssh.ControlConfig {
+	if strings.HasPrefix(nodeName, config.OpenSSHNodePrefix) {
+		return nil
+	}
+	parser := a.getOpenSSHParser()
+	if parser == nil {
+		return nil
+	}
+	lookupKeys := a.buildTier4OpenSSHLookupKeys(parser, nodeName, snapErr, snapshot)
+
+	// 1. First pass: prioritize concrete host matches (defined without wildcards like Host *)
+	// across OpenSSHAlias, nodeName, Host.Address, and Alias so specific definitions take precedence.
+	for _, key := range lookupKeys {
+		if parser.HasHost(key) {
+			if ctrl, err := parser.GetControlConfig(key); err == nil && ctrl != nil {
+				return ctrl
+			}
+		}
+	}
+
+	// 2. Second pass: fallback to generic wildcard / pattern matches (e.g. Host *).
+	for _, key := range lookupKeys {
+		if ctrl, err := parser.GetControlConfig(key); err == nil && ctrl != nil {
+			return ctrl
+		}
+	}
+	return nil
+}
+
+func (a *SSHAdapter) buildTier4OpenSSHLookupKeys(parser *config.OpenSSHParser, nodeName string, snapErr error, snapshot config.ConnectionSnapshot) []string {
+	var lookupKeys []string
+	appendUnique := func(keys ...string) {
+		for _, k := range keys {
+			k = strings.TrimSpace(k)
+			if k != "" && !slicesContain(lookupKeys, k) {
+				lookupKeys = append(lookupKeys, k)
+			}
+		}
+	}
+
+	openSSHAlias := snapshot.Node.OpenSSHAlias
+	if openSSHAlias == "" {
+		openSSHAlias = a.lookupNodeOpenSSHAlias(nodeName)
+	}
+	if openSSHAlias != "" {
+		appendUnique(openSSHAlias)
+	}
+	if snapErr != nil {
+		if !strings.Contains(nodeName, "@") && !strings.Contains(nodeName, ":") {
+			appendUnique(nodeName)
+		}
+		if addr, port, ok := parseFallbackNodeIDAddressPort(nodeName); ok {
+			appendUnique(parser.FindConcreteHostsByAddress(addr, port)...)
+			if addr != nodeName {
+				appendUnique(addr)
+			}
+		} else {
+			appendUnique(nodeName)
+		}
+		return lookupKeys
+	}
+
+	appendUnique(snapshot.Node.Alias...)
+	appendUnique(snapshot.Host.Alias...)
+	if !strings.Contains(nodeName, "@") && !strings.Contains(nodeName, ":") {
+		appendUnique(nodeName)
+	}
+	if snapshot.Host.Address != "" {
+		appendUnique(parser.FindConcreteHostsByAddress(snapshot.Host.Address, uint16(effectiveSnapshotPort(snapshot.Host.Port)))...)
+		if snapshot.Host.Address != nodeName {
+			appendUnique(snapshot.Host.Address)
+		}
+	}
+	appendUnique(nodeName)
+	return lookupKeys
+}
+
+func (a *SSHAdapter) lookupNodeOpenSSHAlias(nodeName string) string {
+	if a == nil || a.cfgProvider == nil || nodeName == "" {
+		return ""
+	}
+	if p, ok := a.cfgProvider.(interface{ NodeOpenSSHAlias(string) string }); ok {
+		return p.NodeOpenSSHAlias(nodeName)
+	}
+	return ""
+}
+
+func parseFallbackNodeIDAddressPort(nodeName string) (string, uint16, bool) {
+	spec := strings.TrimSpace(nodeName)
+	if at := strings.LastIndex(spec, "@"); at >= 0 {
+		spec = strings.TrimSpace(spec[at+1:])
+	}
+	host, portText, err := net.SplitHostPort(spec)
+	if err != nil {
+		return "", 0, false
+	}
+	host = strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(host), "]"), "[")
+	parsedPort, parseErr := strconv.ParseUint(strings.TrimSpace(portText), 10, 16)
+	if host == "" || parseErr != nil || parsedPort == 0 {
+		return "", 0, false
+	}
+	return host, uint16(parsedPort), true
+}
+
+func slicesContain(items []string, target string) bool {
+	for _, item := range items {
+		if item == target {
+			return true
+		}
+	}
+	return false
+}
+
+func validateMergedControl(merged *ssh.ControlConfig) error {
+	if merged.Master != "" {
+		m, err := ssh.ParseControlMasterMode(string(merged.Master))
+		if err != nil {
+			return err
+		}
+		merged.Master = m
+	}
+	if merged.Persist != "" {
+		if _, _, _, err := ssh.ParseControlPersist(merged.Persist); err != nil {
+			return err
+		}
+	}
+	// Path == "none" disables multiplexing: normalize Master to "no" and clear Persist
+	if merged.Path == "none" {
+		merged.Master = ssh.ControlMasterNo
+		merged.Persist = ""
+		return nil
+	}
+	if merged.Master != ssh.ControlMasterNo && merged.Master != "" {
+		if merged.Path == "" {
+			return fmt.Errorf("ControlPath is required when ControlMaster is %s", merged.Master)
+		}
+	}
+	if merged.Persist != "" && merged.Path == "" {
+		return fmt.Errorf("ControlPath is required when ControlPersist is configured")
+	}
+	return nil
+}
+
+func resolveMergedMaster(t1 SessionControlOptions, t2, t3, t4 *ssh.ControlConfig) ssh.ControlMasterMode {
+	if t1.Master != nil && *t1.Master != "" {
+		return *t1.Master
+	}
+	if t2 != nil && t2.Master != "" {
+		return t2.Master
+	}
+	if t3 != nil && t3.Master != "" {
+		return t3.Master
+	}
+	if t4 != nil && t4.Master != "" {
+		return t4.Master
+	}
+	return ssh.ControlMasterNo
+}
+
+func resolveMergedPath(t1 SessionControlOptions, t2, t3, t4 *ssh.ControlConfig) string {
+	if t1.Path != nil {
+		return *t1.Path
+	}
+	if t2 != nil && t2.Path != "" {
+		return t2.Path
+	}
+	if t3 != nil && t3.Path != "" {
+		return t3.Path
+	}
+	if t4 != nil && t4.Path != "" {
+		return t4.Path
+	}
+	return ""
+}
+
+func resolveMergedPersist(t1 SessionControlOptions, t2, t3, t4 *ssh.ControlConfig) string {
+	if t1.Persist != nil {
+		return *t1.Persist
+	}
+	if t2 != nil && t2.Persist != "" {
+		return t2.Persist
+	}
+	if t3 != nil && t3.Persist != "" {
+		return t3.Persist
+	}
+	if t4 != nil && t4.Persist != "" {
+		return t4.Persist
+	}
+	return ""
+}
+
+func mergeControlFields(
+	t1 SessionControlOptions,
+	t2 *ssh.ControlConfig,
+	t3 *ssh.ControlConfig,
+	t4 *ssh.ControlConfig,
+) *ssh.ControlConfig {
+	master := resolveMergedMaster(t1, t2, t3, t4)
+	path := resolveMergedPath(t1, t2, t3, t4)
+	persist := resolveMergedPersist(t1, t2, t3, t4)
+
+	// Handle "-S none" or Path == "none": disables connection sharing
+	if path == "none" {
+		master = ssh.ControlMasterNo
+		persist = ""
+	}
+
+	// Unconfigured check: if nothing was configured across all 4 tiers, return nil
+	if master == ssh.ControlMasterNo && path == "" && persist == "" {
+		return nil
+	}
+
+	hasExplicitPersist := (t1.Persist != nil && *t1.Persist != "") ||
+		(t2 != nil && t2.Persist != "") ||
+		(t3 != nil && t3.Persist != "")
+
+	return &ssh.ControlConfig{
+		Master:        master,
+		Path:          path,
+		Persist:       persist,
+		ImplicitTier4: !hasExplicitPersist && t4 != nil,
+	}
+}
+
+func (a *SSHAdapter) getOpenSSHParser() *config.OpenSSHParser {
+	if a.openSSHParser != nil {
+		return a.openSSHParser
+	}
+	if p, ok := a.cfgProvider.(interface{ GetOpenSSHParser() *config.OpenSSHParser }); ok {
+		return p.GetOpenSSHParser()
+	}
+	return nil
+}
+
+func effectiveSnapshotPort(port uint16) int {
+	if port == 0 {
+		return 22
+	}
+	return int(port)
+}
+
+func effectiveSnapshotUser(user string) string {
+	if u := strings.TrimSpace(user); u != "" {
+		return u
+	}
+	return sshenv.Discover().LocalUser
+}
+
+// ExpandControlPath expands tokens in rawPath for nodeID using node snapshot context.
+// Useful for CLI control commands (-O check/exit/stop) that directly connect to sockets.
+func (a *SSHAdapter) ExpandControlPath(nodeID string, rawPath string) (string, error) {
+	if rawPath == "" || rawPath == "none" {
+		return rawPath, nil
+	}
+	snapshot, err := a.cfgProvider.ResolveConnection(nodeID)
+	if err != nil {
+		return "", fmt.Errorf("resolve node %q for control path expansion: %w", nodeID, err)
+	}
+	target := ssh.TargetContext{
+		Host:         snapshot.Host.Address,
+		Port:         effectiveSnapshotPort(snapshot.Host.Port),
+		User:         effectiveSnapshotUser(snapshot.Identity.User),
+		OriginalHost: nodeID,
+		JumpHost:     snapshot.Node.ProxyJump,
+	}
+	return ssh.ExpandControlPath(rawPath, sshenv.Discover(), target)
 }
 
 // ConfirmConnection publishes a prepared node before credentials are recorded.
@@ -221,8 +687,8 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 	cfg := &ssh.ClientConfig{
 		NodeID:                nodeID,
 		Address:               snapshot.Host.Address,
-		Port:                  int(snapshot.Host.Port),
-		User:                  snapshot.Identity.User,
+		Port:                  effectiveSnapshotPort(snapshot.Host.Port),
+		User:                  effectiveSnapshotUser(snapshot.Identity.User),
 		AuthType:              snapshot.Identity.AuthType,
 		Password:              snapshot.Identity.Password,
 		KeyPath:               snapshot.Identity.KeyPath,
@@ -239,33 +705,49 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 	}
 
 	if override, ok := a.getSessionOverride(nodeID); ok {
-		if override.Password != "" {
-			cfg.Password = override.Password
-		}
-		if override.Passphrase != "" {
-			cfg.Passphrase = override.Passphrase
-		}
-		if override.KeyPath != "" {
-			cfg.KeyPath = override.KeyPath
-		}
-		// Route explicit session material through auto authentication unless the
-		// identity already uses keyboard-interactive or otp. This lets the
-		// connector record discovered credentials after a successful handshake
-		// and enables stage-0 keyboard-interactive when --otp is supplied on a
-		// default password node.
-		if cfg.AuthType != "keyboard-interactive" && cfg.AuthType != "otp" {
-			if override.Password != "" || override.Passphrase != "" || override.KeyPath != "" {
-				cfg.AuthType = "auto"
-			} else if override.OTP != "" && (cfg.AuthType == "" || cfg.AuthType == "password") {
-				cfg.AuthType = "auto"
-			}
-		}
-		if override.SuPwd != "" {
-			cfg.SuPwd = override.SuPwd
+		if err := a.applySessionOverrideToConfig(nodeID, cfg, override); err != nil {
+			return nil, err
 		}
 	}
 
 	return cfg, nil
+}
+
+func (a *SSHAdapter) applySessionOverrideToConfig(nodeID string, cfg *ssh.ClientConfig, override SessionAuth) error {
+	if override.Password != "" {
+		cfg.Password = override.Password
+	}
+	if override.Passphrase != "" {
+		cfg.Passphrase = override.Passphrase
+	}
+	if override.KeyPath != "" {
+		cfg.KeyPath = override.KeyPath
+	}
+	// Route explicit session material through auto authentication unless the
+	// identity already uses keyboard-interactive or otp. This lets the
+	// connector record discovered credentials after a successful handshake
+	// and enables stage-0 keyboard-interactive when --otp is supplied on a
+	// default password node.
+	if cfg.AuthType != "keyboard-interactive" && cfg.AuthType != "otp" {
+		if override.Password != "" || override.Passphrase != "" || override.KeyPath != "" {
+			cfg.AuthType = "auto"
+		} else if override.OTP != "" && (cfg.AuthType == "" || cfg.AuthType == "password") {
+			cfg.AuthType = "auto"
+		}
+	}
+	if override.SuPwd != "" {
+		cfg.SuPwd = override.SuPwd
+	}
+	if override.ProxyJump != "" {
+		resolvedJump, err := a.cfgProvider.ResolveProxyJumpChain(override.ProxyJump)
+		if err != nil {
+			return fmt.Errorf("resolve proxy jump %q for node %q failed: %w", override.ProxyJump, nodeID, err)
+		}
+		cfg.ProxyJump = resolvedJump
+		cfg.OriginalProxyJump = resolvedJump
+		cfg.HasOriginalProxyJump = true
+	}
+	return nil
 }
 
 // UpdateAuth 处理密码或私钥密码的回写并返回本次提交后的新认证令牌
@@ -527,9 +1009,10 @@ func (a *SSHAdapter) resolveOTP(
 		if promptText == "" {
 			promptText = "OTP"
 		}
+		effectiveUser := effectiveSnapshotUser(snapshot.Identity.User)
 		identityName := snapshot.Node.IdentityRef
 		if identityName == "" {
-			identityName = snapshot.Identity.User
+			identityName = effectiveUser
 		}
 		opts := credentialhelper.AnswerCommandOptions{
 			Command:        otpCfg.Command,
@@ -537,7 +1020,7 @@ func (a *SSHAdapter) resolveOTP(
 			Timeout:        timeout,
 			Node:           req.NodeID,
 			Host:           snapshot.Host.Address,
-			User:           snapshot.Identity.User,
+			User:           effectiveUser,
 			Identity:       identityName,
 			Prompt:         promptText,
 			Instruction:    req.Instruction,
@@ -651,9 +1134,10 @@ func (a *SSHAdapter) resolveChallengeRuleAnswer(
 		if timeout <= 0 {
 			timeout = credentialhelper.DefaultAnswerCommandTimeout
 		}
+		effectiveUser := effectiveSnapshotUser(snapshot.Identity.User)
 		identityName := snapshot.Node.IdentityRef
 		if identityName == "" {
-			identityName = snapshot.Identity.User
+			identityName = effectiveUser
 		}
 		opts := credentialhelper.AnswerCommandOptions{
 			Command:        rule.Command,
@@ -661,7 +1145,7 @@ func (a *SSHAdapter) resolveChallengeRuleAnswer(
 			Timeout:        timeout,
 			Node:           req.NodeID,
 			Host:           snapshot.Host.Address,
-			User:           snapshot.Identity.User,
+			User:           effectiveUser,
 			Identity:       identityName,
 			Prompt:         req.Prompt,
 			Instruction:    req.Instruction,
@@ -779,13 +1263,15 @@ func validateSecretRequestSnapshot(snapshot config.ConnectionSnapshot, req ssh.S
 		return fmt.Errorf("%w: host address changed for node %q: expected %q, got %q",
 			ssh.ErrSnapshotMismatch, req.NodeID, req.Host, snapshot.Host.Address)
 	}
-	if req.Port != 0 && int(snapshot.Host.Port) != req.Port {
+	effectivePort := effectiveSnapshotPort(snapshot.Host.Port)
+	if req.Port != 0 && effectivePort != req.Port {
 		return fmt.Errorf("%w: host port changed for node %q: expected %d, got %d",
-			ssh.ErrSnapshotMismatch, req.NodeID, req.Port, snapshot.Host.Port)
+			ssh.ErrSnapshotMismatch, req.NodeID, req.Port, effectivePort)
 	}
-	if req.User != "" && snapshot.Identity.User != req.User {
+	effectiveUser := effectiveSnapshotUser(snapshot.Identity.User)
+	if req.User != "" && effectiveUser != req.User {
 		return fmt.Errorf("%w: user changed for node %q: expected %q, got %q",
-			ssh.ErrSnapshotMismatch, req.NodeID, req.User, snapshot.Identity.User)
+			ssh.ErrSnapshotMismatch, req.NodeID, req.User, effectiveUser)
 	}
 	return nil
 }

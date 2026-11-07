@@ -26,6 +26,7 @@ Historical implementation records describe validation at the time; they do not i
 Each document states its implementation status and validation scope.
 
 - [Architecture and governance map](./governance/architecture-map.md)
+- [OpenSSH connection multiplexing design](./openssh-multiplexing-design.md)
 - [SSH execution and interpreter compatibility](./ssh-execution-compatibility.md)
 - [SSH execution compatibility implementation plan](./ssh-execution-implementation.md)
 - [SSH interpreter and launch dialect automated probing design](./ssh-execution-probe-design.md)
