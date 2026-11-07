@@ -53,6 +53,16 @@ func newDummySSHClient() *cryptoSSH.Client {
 	return cryptoSSH.NewClient(conn, chans, reqs)
 }
 
+func shortSocketDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "xops-mux-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp failed: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
 func TestMuxServer_SocketCreation_PermissionsAndLink(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "mux-server-test-*")
 	if err != nil {
@@ -516,7 +526,7 @@ func TestMuxServer_ForegroundSession(t *testing.T) {
 }
 
 func TestMuxServer_MalformedRequestPreservesRequestID(t *testing.T) {
-	sockPath := filepath.Join(t.TempDir(), "malformed.sock")
+	sockPath := filepath.Join(shortSocketDir(t), "malformed.sock")
 	server, err := NewMuxServer(MuxServerOptions{
 		ControlPath: sockPath,
 		SSHClient:   newDummySSHClient(),
@@ -562,7 +572,7 @@ func TestMuxServer_MalformedRequestPreservesRequestID(t *testing.T) {
 }
 
 func TestMuxServer_ForwardKeyNormalizesEmptyListenHost(t *testing.T) {
-	sockPath := filepath.Join(t.TempDir(), "fwd-norm.sock")
+	sockPath := filepath.Join(shortSocketDir(t), "fwd-norm.sock")
 	server, err := NewMuxServer(MuxServerOptions{
 		ControlPath: sockPath,
 		SSHClient:   newDummySSHClient(),

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 
@@ -1608,6 +1609,9 @@ func (c *Client) uploadLink(ctx context.Context, localPath, remotePath string, p
 	if err != nil {
 		return fmt.Errorf("read local symbolic link %q failed: %w", localPath, err)
 	}
+	if runtime.GOOS == "windows" {
+		target = filepath.ToSlash(target)
+	}
 	linkSize := int64(len(target))
 
 	skip, skipErr := c.shouldSkipUploadLink(remotePath, target)
@@ -1752,7 +1756,7 @@ func (c *Client) shouldSkipDownloadLink(localPath, target string) (bool, error) 
 		return false, fmt.Errorf("cannot overwrite local destination directory %q with symbolic link", localPath)
 	}
 	if !c.config.Force && dstLstat.Mode()&os.ModeSymlink != 0 {
-		if existingTarget, readErr := os.Readlink(localPath); readErr == nil && existingTarget == target {
+		if existingTarget, readErr := os.Readlink(localPath); readErr == nil && (existingTarget == target || (runtime.GOOS == "windows" && filepath.ToSlash(existingTarget) == target)) {
 			return true, nil
 		}
 	}

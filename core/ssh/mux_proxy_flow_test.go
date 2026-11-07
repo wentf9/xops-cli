@@ -173,7 +173,7 @@ func TestMuxServerPrepareHandoffRequiresIdleMaster(t *testing.T) {
 	newServer := func(t *testing.T) *MuxServer {
 		t.Helper()
 		server, err := NewMuxServer(MuxServerOptions{
-			ControlPath:       t.TempDir() + "/handoff.sock",
+			ControlPath:       filepath.Join(shortSocketDir(t), "handoff.sock"),
 			SSHClient:         newDummySSHClient(),
 			PersistEnabled:    true,
 			PersistIndefinite: true,
@@ -256,7 +256,7 @@ func TestMuxServerWaitForDrainAndCancelHandoff(t *testing.T) {
 	defer cancel()
 
 	server, err := NewMuxServer(MuxServerOptions{
-		ControlPath:           t.TempDir() + "/drain.sock",
+		ControlPath:           filepath.Join(shortSocketDir(t), "drain.sock"),
 		SSHClient:             newDummySSHClient(),
 		PersistEnabled:        true,
 		PersistIndefinite:     true,
@@ -535,7 +535,7 @@ func TestDialControlProxy_FailsClosedOnOversizedPacket(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	sockPath := filepath.Join(t.TempDir(), "oversized.sock")
+	sockPath := filepath.Join(shortSocketDir(t), "oversized.sock")
 	ln, err := net.Listen("unix", sockPath)
 	if err != nil {
 		t.Fatalf("Listen unix failed: %v", err)

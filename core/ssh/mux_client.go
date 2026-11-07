@@ -546,11 +546,13 @@ func isConnectionRefused(err error) bool {
 		return false
 	}
 	var sysErr syscall.Errno
-	if errors.As(err, &sysErr) && sysErr == syscall.ECONNREFUSED {
+	if errors.As(err, &sysErr) && (sysErr == syscall.ECONNREFUSED || (runtime.GOOS == "windows" && sysErr == syscall.Errno(10061))) {
 		return true
 	}
 	errStr := strings.ToLower(err.Error())
-	return strings.Contains(errStr, "connection refused") || strings.Contains(errStr, "wsaeconnrefused")
+	return strings.Contains(errStr, "connection refused") ||
+		strings.Contains(errStr, "wsaeconnrefused") ||
+		strings.Contains(errStr, "actively refused")
 }
 
 // isControlSocketFileInfo reports whether fi describes a valid control socket

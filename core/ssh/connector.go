@@ -2414,7 +2414,11 @@ func (c *Connector) openCustomKnownHostsFiles(userKH string, cfg *ClientConfig, 
 }
 
 func expandKnownHostsPath(pattern string, env Environment, target TargetContext) (string, error) {
-	return ExpandControlPath(pattern, env, target)
+	expanded, err := ExpandControlPath(pattern, env, target)
+	if err != nil || expanded == "" || strings.EqualFold(expanded, "none") || expanded == "/dev/null" {
+		return expanded, err
+	}
+	return filepath.Clean(filepath.FromSlash(expanded)), nil
 }
 
 func (c *Connector) handleKnownHostsKeyError(

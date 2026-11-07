@@ -22,6 +22,16 @@ import (
 	cryptoSSH "golang.org/x/crypto/ssh"
 )
 
+func shortControlTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "xops-ctl-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp failed: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
 // TestControlFlagsValidateRejectsInvalidOption verifies that -o is validated
 // before a command resolves or prepares a node, and also when -S makes path
 // resolution return early. Otherwise a typo is silently ignored.
@@ -200,7 +210,7 @@ func TestDrainOwnedMastersWaitsForSecondarySession(t *testing.T) {
 		t.Fatalf("Atoi failed: %v", err)
 	}
 
-	sockPath := filepath.Join(t.TempDir(), "drain.sock")
+	sockPath := filepath.Join(shortControlTempDir(t), "drain.sock")
 	cfg := &config.Configuration{
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
 		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
@@ -303,7 +313,7 @@ func TestReleaseMastersForHandoffRestoresSessionOnFailure(t *testing.T) {
 		t.Fatalf("Atoi failed: %v", err)
 	}
 
-	sockPath := filepath.Join(t.TempDir(), "restore.sock")
+	sockPath := filepath.Join(shortControlTempDir(t), "restore.sock")
 	cfg := &config.Configuration{
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
 		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
@@ -482,7 +492,7 @@ func TestMultiHostHandoff_PreservesAllTargetMasters(t *testing.T) {
 	hostB, portBStr, _ := net.SplitHostPort(fixB.Address)
 	portB, _ := strconv.Atoi(portBStr)
 
-	tmpDir := t.TempDir()
+	tmpDir := shortControlTempDir(t)
 	sockA := filepath.Join(tmpDir, "hostA.sock")
 	sockB := filepath.Join(tmpDir, "hostB.sock")
 
@@ -556,7 +566,7 @@ func TestHandoffSkipsImplicitTier4Control(t *testing.T) {
 
 	host, portStr, _ := net.SplitHostPort(fix.Address)
 	port, _ := strconv.Atoi(portStr)
-	sockPath := filepath.Join(t.TempDir(), "tier4.sock")
+	sockPath := filepath.Join(shortControlTempDir(t), "tier4.sock")
 
 	openSSHContent := "Host web-tier4\n" +
 		"    ControlMaster auto\n" +
@@ -619,7 +629,7 @@ func TestHandoffSkipsImplicitTier4Control(t *testing.T) {
 
 	// R2-5: Even if Tier 1 overrides -S (ControlPath), inheriting ControlPersist
 	// solely from Tier 4 must keep ImplicitTier4=true.
-	overridePath := filepath.Join(t.TempDir(), "override.sock")
+	overridePath := filepath.Join(shortControlTempDir(t), "override.sock")
 	adpWithPathOverride := adapter.NewSSHAdapter(
 		provider,
 		adapter.WithSessionControlOverride("web-tier4", adapter.SessionControlOptions{Path: &overridePath}),
@@ -649,7 +659,7 @@ func TestMuxDaemonArgsAndTargetResolutionForVirtualAndPendingNodes(t *testing.T)
 
 	host, portStr, _ := net.SplitHostPort(fix.Address)
 	port, _ := strconv.Atoi(portStr)
-	sockPath := filepath.Join(t.TempDir(), "r2-1.sock")
+	sockPath := filepath.Join(shortControlTempDir(t), "r2-1.sock")
 
 	rawClient, err := cryptoSSH.Dial("tcp", fix.Address, &cryptoSSH.ClientConfig{
 		User:            "fixture",
@@ -748,7 +758,7 @@ func TestMuxDaemonArgsIsolationAndRememberSuppression(t *testing.T) {
 
 	host, portStr, _ := net.SplitHostPort(fix.Address)
 	port, _ := strconv.Atoi(portStr)
-	sockPath := filepath.Join(t.TempDir(), "r3-1.sock")
+	sockPath := filepath.Join(shortControlTempDir(t), "r3-1.sock")
 
 	rawClient, err := cryptoSSH.Dial("tcp", fix.Address, &cryptoSSH.ClientConfig{
 		User:            "fixture",
@@ -1025,8 +1035,8 @@ func TestHandoffConnectorMastersDoesNotSkipPersistentJumpForNonPersistentTarget(
 
 	host, portStr, _ := net.SplitHostPort(fix.Address)
 	port, _ := strconv.Atoi(portStr)
-	jumpSock := filepath.Join(t.TempDir(), "jump.sock")
-	targetSock := filepath.Join(t.TempDir(), "target.sock")
+	jumpSock := filepath.Join(shortControlTempDir(t), "jump.sock")
+	targetSock := filepath.Join(shortControlTempDir(t), "target.sock")
 
 	cfg := &config.Configuration{
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
@@ -1107,8 +1117,8 @@ func TestMuxDaemonKeepsJumpMasterReferenceUntilTargetExits(t *testing.T) {
 
 	host, portStr, _ := net.SplitHostPort(fix.Address)
 	port, _ := strconv.Atoi(portStr)
-	jumpSock := filepath.Join(t.TempDir(), "jump-daemon.sock")
-	targetSock := filepath.Join(t.TempDir(), "target-daemon.sock")
+	jumpSock := filepath.Join(shortControlTempDir(t), "jump-daemon.sock")
+	targetSock := filepath.Join(shortControlTempDir(t), "target-daemon.sock")
 
 	cfg := &config.Configuration{
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
@@ -1705,7 +1715,7 @@ func TestAdHocOverrideWithWildcardOpenSSHAndSameIPJumpIdentityIsolation(t *testi
 	}
 	defer func() { _ = rawClient.Close() }()
 
-	tmpDir := t.TempDir()
+	tmpDir := shortControlTempDir(t)
 	jumpMaster, err := ssh.StartMuxServer(ctx, rawClient, ssh.MuxMasterOptions{
 		Path: filepath.Join(tmpDir, "jump.sock"),
 		Target: ssh.TargetContext{
@@ -1787,7 +1797,7 @@ func TestMuxDaemonKeyPathAndScpIsolationAndHostFlagAndLookupOpenSSHAlias(t *test
 	}
 	defer func() { _ = rawClient.Close() }()
 
-	tmpDir := t.TempDir()
+	tmpDir := shortControlTempDir(t)
 	derivedMaster, err := ssh.StartMuxServer(ctx, rawClient, ssh.MuxMasterOptions{
 		Path: filepath.Join(tmpDir, "derived.sock"),
 		Target: ssh.TargetContext{
@@ -2558,16 +2568,17 @@ Host jump-alias
 	}
 
 	// R13-1b: pending node with custom IdentityFile preserves KeyPath in ResolveTarget when queried by nodeID.
+	customKeyPath := filepath.Join(t.TempDir(), "pending-custom-key")
 	prep, err := repo.PrepareNodeContext(ctx, config.EnsureNodeOptions{
 		Target:       config.ConnectionTarget{Selector: "10.0.0.88", User: "ops", HasUser: true, Port: 2222, HasPort: true},
-		IdentityFile: "/tmp/pending-custom-key",
+		IdentityFile: customKeyPath,
 	})
 	if err != nil {
 		t.Fatalf("PrepareNodeContext(10.0.0.88): %v", err)
 	}
 	pendingCtx := controlTarget(NewSshOptions(), repo, prep.NodeID)
-	if pendingCtx.KeyPath != "/tmp/pending-custom-key" {
-		t.Fatalf("expected controlTarget on pending node %q to retain KeyPath '/tmp/pending-custom-key', got %q", prep.NodeID, pendingCtx.KeyPath)
+	if pendingCtx.KeyPath != customKeyPath {
+		t.Fatalf("expected controlTarget on pending node %q to retain KeyPath %q, got %q", prep.NodeID, customKeyPath, pendingCtx.KeyPath)
 	}
 
 	// R13-2: controlTarget with provider == nil matches provider != nil for composite and explicit targets.

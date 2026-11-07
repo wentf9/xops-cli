@@ -282,7 +282,7 @@ func TestPassengerSession_TTYAllocFailSentAfterSessionOpenedWithSessionID(t *tes
 	sshClient := cryptoSSH.NewClient(conn, chans, reqs)
 	defer func() { _ = sshClient.Close() }()
 
-	sockPath := filepath.Join(t.TempDir(), "pty-fail.sock")
+	sockPath := filepath.Join(shortSocketDir(t), "pty-fail.sock")
 	server, err := NewMuxServer(MuxServerOptions{
 		ControlPath:       sockPath,
 		SSHClient:         sshClient,
@@ -444,7 +444,7 @@ func TestPassengerSession_SubsystemAndStdinEOF(t *testing.T) {
 	sshClient := cryptoSSH.NewClient(conn, chans, reqs)
 	defer func() { _ = sshClient.Close() }()
 
-	sockPath := filepath.Join(t.TempDir(), "sftp-subsys.sock")
+	sockPath := filepath.Join(shortSocketDir(t), "sftp-subsys.sock")
 	server, err := NewMuxServer(MuxServerOptions{
 		ControlPath:       sockPath,
 		SSHClient:         sshClient,
@@ -581,8 +581,17 @@ func (c *immediateExitSSHConn) OpenChannel(name string, _ []byte) (cryptoSSH.Cha
 	return &immediateExitChannel{reqs: reqs}, reqs, nil
 }
 
+func mustCloexecPipe(t *testing.T, p *[2]int) {
+	t.Helper()
+	if err := unix.Pipe(p[:]); err != nil {
+		t.Fatalf("unix.Pipe failed: %v", err)
+	}
+	unix.CloseOnExec(p[0])
+	unix.CloseOnExec(p[1])
+}
+
 // TestPassengerSession_BlockingPipeDoesNotDeadlockOnExit verifies that when a
-// passenger client passes a blocking pipe fd (created via unix.Pipe2 without
+// passenger client passes a blocking pipe fd (created via unix.Pipe without
 // O_NONBLOCK, mimicking a blocking TTY or pipe from native /usr/bin/ssh) whose
 // write end remains open in the client, remote command exit wakes the stdin
 // pump immediately via unix.Poll without mutating O_NONBLOCK on the shared open
@@ -594,7 +603,7 @@ func TestPassengerSession_BlockingPipeDoesNotDeadlockOnExit(t *testing.T) {
 	sshClient := cryptoSSH.NewClient(conn, chans, reqs)
 	defer func() { _ = sshClient.Close() }()
 
-	sockPath := filepath.Join(t.TempDir(), "blocking-pipe.sock")
+	sockPath := filepath.Join(shortSocketDir(t), "blocking-pipe.sock")
 	server, err := NewMuxServer(MuxServerOptions{
 		ControlPath:       sockPath,
 		SSHClient:         sshClient,
@@ -629,17 +638,11 @@ func TestPassengerSession_BlockingPipeDoesNotDeadlockOnExit(t *testing.T) {
 	// Create raw blocking pipes (no O_NONBLOCK) so os.NewFile does not register
 	// them with the nonblocking poller. Keep stdinPipe[1] open in the test!
 	var stdinPipe, stdoutPipe, stderrPipe [2]int
-	if err := unix.Pipe2(stdinPipe[:], unix.O_CLOEXEC); err != nil {
-		t.Fatalf("unix.Pipe2(stdin) failed: %v", err)
-	}
+	mustCloexecPipe(t, &stdinPipe)
 	defer func() { _ = unix.Close(stdinPipe[1]) }()
-	if err := unix.Pipe2(stdoutPipe[:], unix.O_CLOEXEC); err != nil {
-		t.Fatalf("unix.Pipe2(stdout) failed: %v", err)
-	}
+	mustCloexecPipe(t, &stdoutPipe)
 	defer func() { _ = unix.Close(stdoutPipe[0]) }()
-	if err := unix.Pipe2(stderrPipe[:], unix.O_CLOEXEC); err != nil {
-		t.Fatalf("unix.Pipe2(stderr) failed: %v", err)
-	}
+	mustCloexecPipe(t, &stderrPipe)
 	defer func() { _ = unix.Close(stderrPipe[0]) }()
 
 	unixClient := clientConn.(*net.UnixConn)

@@ -139,7 +139,7 @@ func NewMuxServer(opts MuxServerOptions) (*MuxServer, error) {
 		return nil, err
 	}
 
-	origFi, _ := os.Stat(opts.ControlPath)
+	origFi, _ := os.Lstat(opts.ControlPath)
 
 	server := &MuxServer{
 		controlPath:       opts.ControlPath,

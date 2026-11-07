@@ -62,7 +62,7 @@ func startMuxFixture(t *testing.T, ctx context.Context, options sshfixture.Optio
 		t.Fatalf("cryptoSSH.Dial master failed: %v", err)
 	}
 
-	socketPath := filepath.Join(t.TempDir(), "master.sock")
+	socketPath := filepath.Join(shortSocketDir(t), "master.sock")
 	server, err := NewMuxServer(MuxServerOptions{
 		ControlPath:       socketPath,
 		SSHClient:         rawClient,
@@ -362,7 +362,7 @@ func TestMuxServer_ShutdownKeepsReplacementSocket(t *testing.T) {
 		t.Skip("hard-link socket replacement is not used on Windows")
 	}
 
-	directory := t.TempDir()
+	directory := shortSocketDir(t)
 	socketPath := filepath.Join(directory, "replace.sock")
 
 	draining, err := NewMuxServer(MuxServerOptions{
@@ -588,7 +588,7 @@ func TestMuxProxy_OpenChannelFailurePreservesReasonAndHintsMaxSessions(t *testin
 	rawClient := cryptoSSH.NewClient(conn, chans, reqs)
 	defer func() { _ = rawClient.Close() }()
 
-	sockPath := filepath.Join(t.TempDir(), "maxsessions.sock")
+	sockPath := filepath.Join(shortSocketDir(t), "maxsessions.sock")
 	server, err := NewMuxServer(MuxServerOptions{
 		ControlPath:       sockPath,
 		SSHClient:         rawClient,
