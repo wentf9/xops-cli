@@ -301,7 +301,7 @@ func TestAdversarial_Playbook_StaleSocketSimulatedCrashRecovery(t *testing.T) {
 	}
 	defer func() { _ = fixture.Close() }()
 
-	tmpDir := t.TempDir()
+	tmpDir := shortPlaybookSocketDir(t)
 	staleSockPath := filepath.Join(tmpDir, "crashed_playbook.sock")
 
 	// Create a dead socket on disk

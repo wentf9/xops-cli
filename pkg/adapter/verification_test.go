@@ -67,7 +67,12 @@ func TestVerifyConnection_IgnoresActiveControlSocket(t *testing.T) {
 	t.Cleanup(func() { _ = fixtureClient.Close() })
 	_ = sshfixture.Password
 
-	sockPath := filepath.Join(t.TempDir(), "verify-bypass.sock")
+	sockDir, err := os.MkdirTemp("", "xops-verify-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp failed: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
+	sockPath := filepath.Join(sockDir, "verify-bypass.sock")
 	muxServer, err := ssh.NewMuxServer(ssh.MuxServerOptions{
 		ControlPath:       sockPath,
 		SSHClient:         fixtureClient,

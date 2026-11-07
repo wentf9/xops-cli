@@ -440,7 +440,7 @@ func TestClient_DownloadDirectory_Symlink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readlink local symlink failed: %v", err)
 	}
-	if gotTarget != relativeTarget {
+	if filepath.ToSlash(gotTarget) != relativeTarget {
 		t.Errorf("expected symlink target %q, got %q", relativeTarget, gotTarget)
 	}
 }
@@ -509,7 +509,7 @@ func TestClient_DownloadDirectory_DanglingSymlink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readlink local dangling symlink failed: %v", err)
 	}
-	if gotTarget != danglingTarget {
+	if filepath.ToSlash(gotTarget) != danglingTarget {
 		t.Errorf("expected target %q, got %q", danglingTarget, gotTarget)
 	}
 }

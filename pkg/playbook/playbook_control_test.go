@@ -3,6 +3,7 @@ package playbook_test
 import (
 	"context"
 	"net"
+	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -44,6 +45,16 @@ func (r *diagnosticRecorder) hasEvent(kind corelog.DiagnosticKind, nodeID string
 	return false
 }
 
+func shortPlaybookSocketDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "xops-pb-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp failed: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
 // setupPlaybookFixture creates an sshfixture and a master connection with MuxServer listening on a socket.
 func setupPlaybookFixture(t *testing.T, ctx context.Context) (*sshfixture.Server, string, *ssh.MuxServer, string, uint16) {
 	t.Helper()
@@ -77,7 +88,7 @@ func setupPlaybookFixture(t *testing.T, ctx context.Context) (*sshfixture.Server
 		t.Fatalf("cryptoSSH.Dial master failed: %v", err)
 	}
 
-	tmpDir := t.TempDir()
+	tmpDir := shortPlaybookSocketDir(t)
 	sockPath := filepath.Join(tmpDir, "playbook_master.sock")
 
 	muxServer, err := ssh.NewMuxServer(ssh.MuxServerOptions{
@@ -336,7 +347,7 @@ func TestPlaybook_StaleSocketAutoUnlinkAndFallback(t *testing.T) {
 	port := uint16(portInt)
 
 	// Create a stale socket on disk without active listener
-	tmpDir := t.TempDir()
+	tmpDir := shortPlaybookSocketDir(t)
 	staleSockPath := filepath.Join(tmpDir, "stale.sock")
 	fd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
 	if err != nil {

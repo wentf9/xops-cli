@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -126,6 +127,17 @@ func (m *mockBufferingWriteCloser) String() string {
 	return m.buf.String()
 }
 
+type readerInputBridge struct{}
+
+func (readerInputBridge) Start(ctx context.Context, streams InteractiveIO, dst io.Writer) (InputCopy, error) {
+	done := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(dst, streams.Stdin)
+		done <- err
+	}()
+	return NewInputCopy(ctx, func() error { return nil }, done)
+}
+
 // TestPipeCommandStdin_FileEOFClosesDestinationBeforeStop verifies that when an os.File
 // input reaches EOF, the destination is closed immediately so streaming commands can
 // finish before stopAndWait is called.
@@ -144,7 +156,14 @@ func TestPipeCommandStdin_FileEOFClosesDestinationBeforeStop(t *testing.T) {
 	_ = w.Close() // send EOF on input file
 
 	writer := &mockBufferingWriteCloser{}
-	stopAndWait, err := pipeCommandStdin(r, writer)
+	var opts []inputPipelineOptions
+	if runtime.GOOS == "windows" {
+		opts = append(opts, inputPipelineOptions{
+			ctx:    context.Background(),
+			bridge: readerInputBridge{},
+		})
+	}
+	stopAndWait, err := pipeCommandStdin(r, writer, opts...)
 	if err != nil {
 		t.Fatalf("pipeCommandStdin failed: %v", err)
 	}

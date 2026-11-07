@@ -21,7 +21,7 @@ func TestControlClientRejectsForeignMaster(t *testing.T) {
 		t.Skip("peer credentials are unavailable on Windows")
 	}
 
-	socketPath := filepath.Join(t.TempDir(), "foreign.sock")
+	socketPath := filepath.Join(shortSocketDir(t), "foreign.sock")
 	server, err := NewMuxServer(MuxServerOptions{
 		ControlPath:       socketPath,
 		SSHClient:         newDummySSHClient(),
@@ -72,7 +72,7 @@ func TestControlClientRejectsForeignMaster(t *testing.T) {
 func TestMuxServer_AskModeRequiresConfirmation(t *testing.T) {
 	start := func(t *testing.T, confirm func(string) bool) *MuxServer {
 		t.Helper()
-		socketPath := filepath.Join(t.TempDir(), "ask.sock")
+		socketPath := filepath.Join(shortSocketDir(t), "ask.sock")
 		server, err := NewMuxServer(MuxServerOptions{
 			ControlPath:       socketPath,
 			SSHClient:         newDummySSHClient(),
@@ -135,7 +135,7 @@ func TestMuxServer_AskModeRequiresConfirmation(t *testing.T) {
 	})
 
 	t.Run("not-ask master skips confirmation", func(t *testing.T) {
-		socketPath := filepath.Join(t.TempDir(), "plain.sock")
+		socketPath := filepath.Join(shortSocketDir(t), "plain.sock")
 		server, err := NewMuxServer(MuxServerOptions{
 			ControlPath:       socketPath,
 			SSHClient:         newDummySSHClient(),
@@ -165,7 +165,7 @@ func TestConnectorCloseAllReleasesOwnedMaster(t *testing.T) {
 
 	fixture := startMuxFixture(t, ctx, sshfixture.Options{})
 
-	socketPath := filepath.Join(t.TempDir(), "owned.sock")
+	socketPath := filepath.Join(shortSocketDir(t), "owned.sock")
 	provider := &testMuxProvider{
 		cfg: &ClientConfig{
 			NodeID:   "owned-node",
@@ -222,7 +222,7 @@ func TestStartMuxServerDefaultsPeerUIDCheck(t *testing.T) {
 	start := func(t *testing.T, localUID string) *MuxServer {
 		t.Helper()
 		server, err := StartMuxServer(ctx, newDummySSHClient(), MuxMasterOptions{
-			Path:        filepath.Join(t.TempDir(), "peer-uid.sock"),
+			Path:        filepath.Join(shortSocketDir(t), "peer-uid.sock"),
 			Environment: Environment{LocalUID: localUID},
 		})
 		if err != nil {
@@ -272,7 +272,7 @@ func TestControlClientRequiresExactPeerUID(t *testing.T) {
 		t.Skip("this process already runs as root, so uid 0 is the correct peer")
 	}
 
-	socketPath := filepath.Join(t.TempDir(), "root-expectation.sock")
+	socketPath := filepath.Join(shortSocketDir(t), "root-expectation.sock")
 	server, err := NewMuxServer(MuxServerOptions{
 		ControlPath:       socketPath,
 		SSHClient:         newDummySSHClient(),
@@ -315,7 +315,7 @@ func TestConnectorOwnedMasterSurvivesIdleTimeout(t *testing.T) {
 	defer func() { _ = fixture.Close() }()
 	host, port := fixtureEndpoint(t, fixture.Address)
 
-	socketPath := filepath.Join(t.TempDir(), "owned-idle.sock")
+	socketPath := filepath.Join(shortSocketDir(t), "owned-idle.sock")
 	provider := &testMuxProvider{
 		cfg: &ClientConfig{
 			NodeID:   "idle-node",
@@ -380,7 +380,7 @@ func TestMuxServerStopListeningRetiresIdleMaster(t *testing.T) {
 		{name: "no-cmd master", initialSessions: 1, releaseOnStop: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			socketPath := filepath.Join(t.TempDir(), "stop-idle.sock")
+			socketPath := filepath.Join(shortSocketDir(t), "stop-idle.sock")
 			server, err := NewMuxServer(MuxServerOptions{
 				ControlPath:           socketPath,
 				SSHClient:             newDummySSHClient(),
@@ -436,7 +436,7 @@ func TestConnectorReleaseMasterDropsOnlySessionReference(t *testing.T) {
 	defer func() { _ = fixture.Close() }()
 	host, port := fixtureEndpoint(t, fixture.Address)
 
-	socketPath := filepath.Join(t.TempDir(), "release.sock")
+	socketPath := filepath.Join(shortSocketDir(t), "release.sock")
 	provider := &testMuxProvider{
 		cfg: &ClientConfig{
 			NodeID:   "release-node",

@@ -88,7 +88,7 @@ func TestConnectReusesJumpChainedTargetWithoutBastionAuth(t *testing.T) {
 
 	bastionHost, bastionPort := fixtureEndpoint(t, bastion.Address)
 	targetHost, targetPort := fixtureEndpoint(t, target.Address)
-	socketPath := filepath.Join(t.TempDir(), "chain.sock")
+	socketPath := filepath.Join(shortSocketDir(t), "chain.sock")
 
 	provider := &jumpChainProvider{
 		cfgs: map[string]*ClientConfig{
@@ -170,7 +170,7 @@ func TestPlanConnectionDoesNotAttachToControlMaster(t *testing.T) {
 	defer func() { _ = fixture.Close() }()
 	host, port := fixtureEndpoint(t, fixture.Address)
 
-	socketPath := filepath.Join(t.TempDir(), "existing.sock")
+	socketPath := filepath.Join(shortSocketDir(t), "existing.sock")
 	master, err := NewMuxServer(MuxServerOptions{
 		ControlPath:       socketPath,
 		SSHClient:         newDummySSHClient(),

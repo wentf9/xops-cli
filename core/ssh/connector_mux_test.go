@@ -216,7 +216,7 @@ func TestConnector_ControlMasterDisabled(t *testing.T) {
 // when a stale control socket is replaced by a live master before removal, a
 // caller requesting ControlMaster=yes/ask (-M) is not demoted to a proxy client.
 func TestConnector_StaleSocketRecoveryDoesNotDemoteExplicitMaster(t *testing.T) {
-	tmpDir := t.TempDir()
+	tmpDir := shortSocketDir(t)
 	staleFile := filepath.Join(tmpDir, "stale-orig")
 	if err := os.WriteFile(staleFile, []byte("x"), 0o600); err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
@@ -267,9 +267,9 @@ func TestConnector_StaleSocketRecoveryDoesNotDemoteExplicitMaster(t *testing.T) 
 		}
 
 		// 2. Same file identity that became alive before unlink (origFi == currFi)
-		sameFi, statErr := os.Stat(sockPath)
+		sameFi, statErr := os.Lstat(sockPath)
 		if statErr != nil {
-			t.Fatalf("Stat(sockPath) failed: %v", statErr)
+			t.Fatalf("Lstat(sockPath) failed: %v", statErr)
 		}
 		client, err = connector.handleStaleControlSocket(ctx, planNode, sockPath, target, sameFi)
 		if err != nil {
@@ -307,7 +307,7 @@ func (p *multiNodeMuxProvider) GetControlConfig(nodeID string) (*ControlConfig, 
 // points to an existing regular file (or non-socket), tryConnectMultiplex and
 // handleStaleControlSocket never unlink it.
 func TestTryConnectMultiplex_NeverDeletesRegularFile(t *testing.T) {
-	tmpDir := t.TempDir()
+	tmpDir := shortSocketDir(t)
 	regularFile := filepath.Join(tmpDir, "important-data.txt")
 	const wantContent = "do-not-delete-me"
 	if err := os.WriteFile(regularFile, []byte(wantContent), 0o600); err != nil {
@@ -359,7 +359,7 @@ func TestTryConnectMultiplex_NeverDeletesRegularFile(t *testing.T) {
 // unresponsive Unix socket that times out duringMUX_MSG_HELLO is not treated as
 // a dead stale socket and is NOT unlinked on disk.
 func TestTryConnectMultiplex_TimeoutDoesNotUnlinkLiveMaster(t *testing.T) {
-	tmpDir := t.TempDir()
+	tmpDir := shortSocketDir(t)
 	sockPath := filepath.Join(tmpDir, "slow-master.sock")
 	ln, err := net.Listen("unix", sockPath)
 	if err != nil {
@@ -453,7 +453,7 @@ func TestProxyJump_TargetMasterShutdownPreservesBastion(t *testing.T) {
 	}
 	tPort, _ := strconv.Atoi(tPortStr)
 
-	tmpDir := t.TempDir()
+	tmpDir := shortSocketDir(t)
 	bastionSock := filepath.Join(tmpDir, "bastion.sock")
 	targetSock := filepath.Join(tmpDir, "target.sock")
 
@@ -536,7 +536,7 @@ func TestProxyJump_TargetMasterShutdownPreservesBastion(t *testing.T) {
 // DialControlProxy unblocks immediately when its context is cancelled even if
 // the context carries no deadline.
 func TestDialAndPublishProxy_HonorsCancelWithoutDeadline(t *testing.T) {
-	tmpDir := t.TempDir()
+	tmpDir := shortSocketDir(t)
 	sockPath := filepath.Join(tmpDir, "hang-proxy.sock")
 	ln, err := net.Listen("unix", sockPath)
 	if err != nil {

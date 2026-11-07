@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -97,6 +98,11 @@ func controlError(stderr io.Writer, msg string) error {
 
 func controlConnectError(stderr io.Writer, socketPath string, err error) error {
 	errText := formatSyscallError(err)
+	if errText == "Connection refused" {
+		if _, statErr := os.Lstat(socketPath); errors.Is(statErr, os.ErrNotExist) {
+			errText = "No such file or directory"
+		}
+	}
 	msg := fmt.Sprintf("Control socket connect(%s): %s", socketPath, errText)
 	_, _ = fmt.Fprintln(stderr, msg)
 	return &ControlExitError{Code: 255, Message: msg, Reported: true}
@@ -108,26 +114,27 @@ func formatSyscallError(err error) string {
 	}
 	var sysErr syscall.Errno
 	if errors.As(err, &sysErr) {
-		switch sysErr {
-		case syscall.ENOENT:
+		switch {
+		case sysErr == syscall.ENOENT:
 			return "No such file or directory"
-		case syscall.ECONNREFUSED:
+		case sysErr == syscall.ECONNREFUSED || (runtime.GOOS == "windows" && sysErr == syscall.Errno(10061)):
 			return "Connection refused"
-		case syscall.EACCES:
+		case sysErr == syscall.EACCES || (runtime.GOOS == "windows" && sysErr == syscall.Errno(10013)):
 			return "Permission denied"
-		default:
-			return sysErr.Error()
 		}
 	}
 	errStr := strings.ToLower(err.Error())
 	if strings.Contains(errStr, "no such file or directory") {
 		return "No such file or directory"
 	}
-	if strings.Contains(errStr, "connection refused") || strings.Contains(errStr, "wsaeconnrefused") {
+	if strings.Contains(errStr, "connection refused") || strings.Contains(errStr, "wsaeconnrefused") || strings.Contains(errStr, "actively refused") {
 		return "Connection refused"
 	}
-	if strings.Contains(errStr, "permission denied") {
+	if strings.Contains(errStr, "permission denied") || strings.Contains(errStr, "access is denied") {
 		return "Permission denied"
+	}
+	if sysErr != 0 {
+		return sysErr.Error()
 	}
 	return err.Error()
 }
@@ -549,13 +556,20 @@ func resolveControlProxyFallbackOptions(adp *adapter.SSHAdapter, host string, o 
 }
 
 func buildControlProxyAdapterOptions(snapshot *config.Configuration, nodeID string, o *SshOptions) []adapter.Option {
-	sessionAuth := adapter.SessionAuth{
-		Password:   o.Password,
-		Passphrase: o.Passphrase,
-		KeyPath:    utils.ToAbsolutePath(o.IdentityFile),
-		Remember:   false,
-		OTP:        o.OTP,
-		ProxyJump:  o.JumpHost,
+	var sessionAuth adapter.SessionAuth
+	var sessionCtrlOpts adapter.SessionControlOptions
+	if o != nil {
+		sessionAuth = adapter.SessionAuth{
+			Password:   o.Password,
+			Passphrase: o.Passphrase,
+			KeyPath:    utils.ToAbsolutePath(o.IdentityFile),
+			Remember:   false,
+			OTP:        o.OTP,
+			ProxyJump:  o.JumpHost,
+		}
+		if parsed, ctrlErr := o.control.ToSessionControlOptions(); ctrlErr == nil {
+			sessionCtrlOpts = parsed
+		}
 	}
 	adpOpts := []adapter.Option{
 		adapter.WithCredentialRecording(false),
@@ -564,12 +578,10 @@ func buildControlProxyAdapterOptions(snapshot *config.Configuration, nodeID stri
 	if nodeID != "" {
 		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, sessionAuth))
 	}
-	if o != nil {
-		if sessionCtrlOpts, ctrlErr := o.control.ToSessionControlOptions(); ctrlErr == nil && !sessionCtrlOpts.IsEmpty() {
-			adpOpts = append(adpOpts, adapter.WithGlobalSessionControl(sessionCtrlOpts))
-			if nodeID != "" {
-				adpOpts = append(adpOpts, adapter.WithSessionControlOverride(nodeID, sessionCtrlOpts))
-			}
+	if !sessionCtrlOpts.IsEmpty() {
+		adpOpts = append(adpOpts, adapter.WithGlobalSessionControl(sessionCtrlOpts))
+		if nodeID != "" {
+			adpOpts = append(adpOpts, adapter.WithSessionControlOverride(nodeID, sessionCtrlOpts))
 		}
 	}
 	if reg, regErr := utils.GetCredentialRegistry(snapshot); regErr == nil && reg != nil {
