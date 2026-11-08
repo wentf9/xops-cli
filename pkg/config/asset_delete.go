@@ -31,6 +31,26 @@ func (r *Repository) DeleteNodesWithCredentialsContext(ctx context.Context, refs
 	})
 }
 
+// ReplaceNodeWithCredentialsContext atomically replaces a node bundle and,
+// when its identity reference changes, cleans up any now-unreferenced
+// credentials from the previous identity through a recoverable journal.
+func (r *Repository) ReplaceNodeWithCredentialsContext(ctx context.Context, ref NodeRef, nodeID string, node models.Node, host models.Host, identity models.Identity, service *credential.Service) error {
+	cfg := r.Snapshot()
+	if err := ensureNodeRefs(cfg, []NodeRef{ref}); err != nil {
+		return err
+	}
+	var credentials []credential.Ref
+	if oldNode, ok := cfg.Nodes.Get(ref.ID); ok && oldNode.IdentityRef != node.IdentityRef {
+		if oldIdentity, ok := cfg.Identities.Get(oldNode.IdentityRef); ok {
+			credentials = appendIdentityCredentialRefs(credentials, oldIdentity)
+		}
+	}
+	return deleteAssetsWithCredentials(ctx, service, credentials, func(ctx context.Context) (MutationOutcome, error) {
+		outcome, _, err := r.replaceNodeAtRefWithOutcome(ctx, ref, nodeID, node, host, identity)
+		return outcome, err
+	})
+}
+
 // DeleteIdentityWithCredentialsContext also retains the existing restriction
 // that an identity referenced by any node cannot be deleted.
 func (r *Repository) DeleteIdentityWithCredentialsContext(ctx context.Context, ref IdentityRef, service *credential.Service) error {

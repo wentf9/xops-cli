@@ -3,21 +3,17 @@ package cmd
 import (
 	"errors"
 	"fmt"
-	"io"
-	"os"
 	"sort"
 	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
-	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
 	"github.com/wentf9/xops-cli/pkg/models"
-	"golang.org/x/term"
 )
 
 func NewCmdIdentity() *cobra.Command {
@@ -37,6 +33,7 @@ func NewCmdIdentity() *cobra.Command {
 	cmd.AddCommand(NewCmdIdentityDelete())
 	cmd.AddCommand(NewCmdIdentityCredential())
 	cmd.AddCommand(newCmdIdentitySetSecret())
+	cmd.AddCommand(newCmdIdentityDeleteSecret())
 
 	return cmd
 }
@@ -44,7 +41,16 @@ func NewCmdIdentity() *cobra.Command {
 func newCmdIdentitySetSecret() *cobra.Command {
 	cmd := newCmdIdentityCredentialSet()
 	cmd.Use = "set-secret [name]"
+	cmd.Aliases = []string{"set", "set-cred"}
 	cmd.Short = i18n.T("identity_set_secret_short")
+	return cmd
+}
+
+func newCmdIdentityDeleteSecret() *cobra.Command {
+	cmd := newCmdIdentityCredentialDelete()
+	cmd.Use = "delete-secret [name]"
+	cmd.Aliases = []string{"rm-secret", "unset-secret", "unset", "del-secret"}
+	cmd.Short = i18n.T("identity_credential_delete_short")
 	return cmd
 }
 
@@ -56,13 +62,20 @@ func NewCmdIdentityEdit() *cobra.Command {
 
 	secretInput := &utils.InventorySecretInput{}
 	cmd := &cobra.Command{
-		Use:   "edit [name]",
-		Short: i18n.T("identity_edit_short"),
-		Args:  cobra.ExactArgs(1),
+		Use:     "edit [name]",
+		Aliases: []string{"ed", "update"},
+		Short:   i18n.T("identity_edit_short"),
+		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			password, keyPass, err := secretInput.Read(cmd)
 			if err != nil {
 				return err
+			}
+			if keyPath != "" && keyPass == "" && password == "" && !secretInput.UsesStdin() {
+				keyPass, err = utils.PromptPassphraseIfEncryptedKey(keyPath, keyPass)
+				if err != nil {
+					return err
+				}
 			}
 			name := args[0]
 			_, repository, _, err := utils.GetConfigStore()
@@ -121,8 +134,9 @@ func NewCmdIdentityEdit() *cobra.Command {
 
 func NewCmdIdentityList() *cobra.Command {
 	return &cobra.Command{
-		Use:   "list",
-		Short: i18n.T("identity_list_short"),
+		Use:     "list",
+		Aliases: []string{"ls"},
+		Short:   i18n.T("identity_list_short"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			configPath, keyPath, pathErr := utils.GetConfigFilePath()
 			if pathErr != nil {
@@ -192,74 +206,12 @@ func NewCmdIdentityAdd() *cobra.Command {
 
 	secretInput := &utils.InventorySecretInput{}
 	cmd := &cobra.Command{
-		Use:   "add",
-		Short: i18n.T("identity_add_short"),
+		Use:     "add [name] [user]",
+		Aliases: []string{"new", "create"},
+		Short:   i18n.T("identity_add_short"),
+		Args:    cobra.MaximumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			password, keyPass, err := secretInput.Read(cmd)
-			if err != nil {
-				return err
-			}
-			if name == "" {
-				return fmt.Errorf("%s", i18n.T("identity_err_no_name"))
-			}
-
-			_, repository, _, err := utils.GetConfigStore()
-			if err != nil {
-				return err
-			}
-
-			if user == "" {
-				var userErr error
-				user, userErr = utils.GetCurrentUser()
-				if userErr != nil {
-					return fmt.Errorf("get current user failed: %w", userErr)
-				}
-			}
-
-			if keyPass != "" && keyPath == "" {
-				return fmt.Errorf("private-key path is required for a passphrase (--key)")
-			}
-
-			identity := models.Identity{
-				User: user,
-			}
-
-			if keyPath != "" {
-				identity.KeyPath = utils.ToAbsolutePath(keyPath)
-				// Passphrase is saved through CredentialService after metadata creation.
-				identity.AuthType = "key"
-			} else if password != "" {
-				// Password is never published in the inventory.
-				identity.AuthType = "password"
-			} else {
-				pass, err := utils.ReadPasswordFromTerminal(i18n.Tf("prompt_enter_user_password", map[string]any{"User": user}))
-				if err != nil {
-					return err
-				}
-				password = pass
-				identity.AuthType = "password"
-			}
-
-			write, err := utils.PrepareInventoryCredential(repository, credential.Target{IdentityID: name}, identity, password, keyPass, keyPath, nil)
-			if err != nil {
-				return err
-			}
-			defer write.Clear()
-
-			if _, err := repository.CreateIdentityContext(cmd.Context(), name, identity); err != nil {
-				if errors.Is(err, config.ErrConfigConflict) {
-					return fmt.Errorf("%s", i18n.Tf("identity_err_exists", map[string]any{"Name": name}))
-				}
-				return fmt.Errorf("add identity %q failed: %w", name, err)
-			}
-
-			ref := repository.View().IdentityRefs[name]
-			if err := write.Save(cmd.Context(), string(ref.Version[:])); err != nil {
-				return err
-			}
-
-			logger.PrintSuccess(i18n.Tf("identity_add_success", map[string]any{"Name": name}))
-			return nil
+			return runIdentityAdd(cmd, args, name, user, keyPath, secretInput)
 		},
 	}
 
@@ -271,35 +223,158 @@ func NewCmdIdentityAdd() *cobra.Command {
 	return cmd
 }
 
+func runIdentityAdd(cmd *cobra.Command, args []string, name, user, keyPath string, secretInput *utils.InventorySecretInput) error {
+	password, keyPass, err := secretInput.Read(cmd)
+	if err != nil {
+		return err
+	}
+	name, user, err = resolveIdentityAddNameAndUser(args, name, user, secretInput.UsesStdin())
+	if err != nil {
+		return err
+	}
+
+	_, repository, _, err := utils.GetConfigStore()
+	if err != nil {
+		return err
+	}
+	if user == "" {
+		user, err = utils.GetCurrentUser()
+		if err != nil {
+			return fmt.Errorf("get current user failed: %w", err)
+		}
+	}
+	if keyPass != "" && keyPath == "" {
+		return fmt.Errorf("private-key path is required for a passphrase (--key)")
+	}
+	if keyPath != "" && keyPass == "" && password == "" && !secretInput.UsesStdin() {
+		keyPass, err = utils.PromptPassphraseIfEncryptedKey(keyPath, keyPass)
+		if err != nil {
+			return err
+		}
+	}
+
+	identity, password, err := buildNewIdentityModel(user, keyPath, password)
+	if err != nil {
+		return err
+	}
+
+	write, err := utils.PrepareInventoryCredential(repository, credential.Target{IdentityID: name}, identity, password, keyPass, keyPath, nil)
+	if err != nil {
+		return err
+	}
+	defer write.Clear()
+
+	if _, err := repository.CreateIdentityContext(cmd.Context(), name, identity); err != nil {
+		if errors.Is(err, config.ErrConfigConflict) {
+			return fmt.Errorf("%s", i18n.Tf("identity_err_exists", map[string]any{"Name": name}))
+		}
+		return fmt.Errorf("add identity %q failed: %w", name, err)
+	}
+
+	ref := repository.View().IdentityRefs[name]
+	if err := write.Save(cmd.Context(), string(ref.Version[:])); err != nil {
+		return err
+	}
+
+	logger.PrintSuccess(i18n.Tf("identity_add_success", map[string]any{"Name": name}))
+	return nil
+}
+
+func resolveIdentityAddNameAndUser(args []string, name, user string, usesStdin bool) (string, string, error) {
+	if len(args) >= 1 {
+		posName := strings.TrimSpace(args[0])
+		if name != "" && name != posName {
+			return "", "", fmt.Errorf("conflicting identity names %q and %q", name, posName)
+		}
+		name = posName
+	}
+	if len(args) == 2 {
+		posUser := strings.TrimSpace(args[1])
+		if user != "" && user != posUser {
+			return "", "", fmt.Errorf("conflicting identity users %q and %q", user, posUser)
+		}
+		user = posUser
+	}
+	if name == "" && !usesStdin && utils.IsInteractiveTerminal() {
+		prompted, err := utils.ReadLineFromTerminal(i18n.T("prompt_enter_identity_name"))
+		if err != nil {
+			return "", "", err
+		}
+		name = prompted
+	}
+	if name == "" {
+		return "", "", fmt.Errorf("%s", i18n.T("identity_err_no_name"))
+	}
+	return name, user, nil
+}
+
+func buildNewIdentityModel(user, keyPath, password string) (models.Identity, string, error) {
+	identity := models.Identity{User: user}
+	if keyPath != "" {
+		identity.KeyPath = utils.ToAbsolutePath(keyPath)
+		identity.AuthType = "key"
+		return identity, password, nil
+	}
+	if password == "" {
+		pass, err := utils.ReadPasswordFromTerminal(i18n.Tf("prompt_enter_user_password", map[string]any{"User": user}))
+		if err != nil {
+			return models.Identity{}, "", err
+		}
+		password = pass
+	}
+	identity.AuthType = "password"
+	return identity, password, nil
+}
+
 func NewCmdIdentityDelete() *cobra.Command {
 	return &cobra.Command{
-		Use:   "delete [name]",
-		Short: i18n.T("identity_delete_short"),
-		Args:  cobra.ExactArgs(1),
+		Use:     "delete <name> [name2...]",
+		Aliases: []string{"rm", "del", "remove"},
+		Short:   i18n.T("identity_delete_short"),
+		Args:    cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			name := args[0]
+			var names []string
+			seen := make(map[string]struct{})
+			for _, raw := range args {
+				for _, part := range strings.Split(raw, ",") {
+					n := strings.TrimSpace(part)
+					if n == "" {
+						continue
+					}
+					if _, exists := seen[n]; !exists {
+						seen[n] = struct{}{}
+						names = append(names, n)
+					}
+				}
+			}
+			if len(names) == 0 {
+				return fmt.Errorf("%s", i18n.T("identity_err_no_name"))
+			}
+
 			_, repository, _, err := utils.GetConfigStore()
 			if err != nil {
 				return err
 			}
 			view := repository.View()
-			if _, ok := view.Configuration.Identities.Get(name); !ok {
-				return fmt.Errorf("%s", i18n.Tf("identity_err_not_found", map[string]any{"Name": name}))
-			}
-			ref, ok := view.IdentityRefs[name]
-			if !ok {
-				return fmt.Errorf("resolve identity %q reference: %w", name, config.ErrIdentityNotFound)
-			}
-
 			service, err := utils.GetCredentialService(repository, view.Configuration)
 			if err != nil {
 				return err
 			}
-			if err := repository.DeleteIdentityWithCredentialsContext(cmd.Context(), ref, service); err != nil {
-				return fmt.Errorf("delete identity %q failed: %w", name, err)
-			}
 
-			logger.PrintSuccess(i18n.Tf("identity_delete_success", map[string]any{"Name": name}))
+			for _, name := range names {
+				view = repository.View()
+				if _, ok := view.Configuration.Identities.Get(name); !ok {
+					return fmt.Errorf("%s", i18n.Tf("identity_err_not_found", map[string]any{"Name": name}))
+				}
+				ref, ok := view.IdentityRefs[name]
+				if !ok {
+					return fmt.Errorf("resolve identity %q reference: %w", name, config.ErrIdentityNotFound)
+				}
+				if err := repository.DeleteIdentityWithCredentialsContext(cmd.Context(), ref, service); err != nil {
+					return fmt.Errorf("delete identity %q failed: %w", name, err)
+				}
+				logger.PrintSuccess(i18n.Tf("identity_delete_success", map[string]any{"Name": name}))
+			}
 			return nil
 		},
 	}
@@ -309,7 +384,7 @@ func NewCmdIdentityDelete() *cobra.Command {
 func NewCmdIdentityCredential() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "credential",
-		Aliases: []string{"cred"},
+		Aliases: []string{"cred", "cr"},
 		Short:   i18n.T("identity_credential_short"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return cmd.Help()
@@ -322,231 +397,31 @@ func NewCmdIdentityCredential() *cobra.Command {
 }
 
 func newCmdIdentityCredentialSet() *cobra.Command {
-	var (
-		kindStr       string
-		storeID       string
-		ruleName      string
-		passwordStdin bool
-	)
-
+	opts := &utils.CredentialCommandOptions{Scope: utils.CredentialScopeIdentity}
 	cmd := &cobra.Command{
-		Use:   "set [name]",
-		Short: i18n.T("identity_credential_set_short"),
-		Args:  cobra.ExactArgs(1),
+		Use:     "set [name]",
+		Aliases: []string{"s"},
+		Short:   i18n.T("identity_credential_set_short"),
+		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			name := args[0]
-			kind := credential.Kind(kindStr)
-			if err := kind.Validate(); err != nil {
-				return fmt.Errorf("invalid credential kind %q: must be login_password, passphrase, totp_secret, or challenge_answer", kindStr)
-			}
-			if kind == credential.KindChallengeAnswer && strings.TrimSpace(ruleName) == "" {
-				return errors.New(i18n.T("err_rule_required_for_challenge"))
-			}
-
-			_, repo, cfg, err := utils.GetConfigStore()
-			if err != nil {
-				return err
-			}
-
-			view := repo.View()
-			ident, ok := view.Configuration.Identities.Get(name)
-			if !ok {
-				return fmt.Errorf("%s", i18n.Tf("identity_err_not_found", map[string]any{"Name": name}))
-			}
-			ref, ok := view.IdentityRefs[name]
-			if !ok {
-				return fmt.Errorf("resolve identity %q reference: %w", name, config.ErrIdentityNotFound)
-			}
-
-			if kind == credential.KindChallengeAnswer {
-				if err := validateIdentityChallengeRule(ident, ruleName, name); err != nil {
-					return err
-				}
-			}
-
-			secretStr, err := resolveSecretInput(cmd.InOrStdin(), passwordStdin, kindStr)
-			if err != nil {
-				return err
-			}
-
-			if kind == credential.KindTOTPSecret {
-				totpCfg, err := coreauth.ParseTOTPSecret(secretStr)
-				if err != nil {
-					return fmt.Errorf("invalid TOTP secret: %w", err)
-				}
-				clear(totpCfg.Secret)
-			}
-
-			targetStore := storeID
-			if targetStore == "" {
-				if cfg.Credential != nil && cfg.Credential.DefaultStore != "" {
-					targetStore = cfg.Credential.DefaultStore
-				} else {
-					targetStore = "none"
-				}
-			}
-
-			oldRef := findIdentityOldRef(kind, ident, ruleName)
-
-			svc, err := utils.GetCredentialService(repo, cfg)
-			if err != nil {
-				return fmt.Errorf("initialize credential service: %w", err)
-			}
-
-			target := credential.Target{
-				IdentityID: name,
-				Kind:       kind,
-				RuleName:   ruleName,
-			}
-			if kind == credential.KindPassphrase {
-				target.KeyPath = ident.KeyPath
-				target, err = config.BindPrivateKeyFingerprint(cfg, target, []byte(secretStr))
-				if err != nil {
-					return err
-				}
-			}
-			secret := credential.NewSecret([]byte(secretStr))
-			defer secret.Zero()
-			newRef, _, err := svc.Rotate(
-				cmd.Context(),
-				target,
-				string(ref.Version[:]),
-				oldRef,
-				targetStore,
-				secret,
-			)
-			if err != nil {
-				return fmt.Errorf("rotate credential in store failed: %w", err)
-			}
-
-			logger.PrintSuccessf("Set credential for identity %q (kind: %s, store: %s, itemID: %s)", name, kindStr, targetStore, newRef.ItemID)
-			return nil
+			return opts.RunSet(cmd, args[0])
 		},
 	}
-
-	cmd.Flags().StringVar(&kindStr, "kind", "login_password", i18n.T("flag_credential_kind"))
-	cmd.Flags().StringVar(&storeID, "store", "", i18n.T("flag_credential_store"))
-	cmd.Flags().StringVar(&ruleName, "rule", "", i18n.T("flag_credential_rule"))
-	cmd.Flags().BoolVar(&passwordStdin, "password-stdin", false, i18n.T("flag_password_stdin"))
+	opts.RegisterSetFlags(cmd)
 	return cmd
-}
-
-func resolveSecretInput(r io.Reader, stdin bool, kindStr string) (string, error) {
-	if stdin {
-		return utils.ReadSecretFromReader(r)
-	}
-	if term.IsTerminal(int(os.Stdin.Fd())) {
-		prompt := fmt.Sprintf("Enter %s: ", kindStr)
-		return utils.ReadPasswordFromTerminal(prompt)
-	}
-	return "", errors.New("terminal is not interactive, please provide secret via --password-stdin")
 }
 
 func newCmdIdentityCredentialDelete() *cobra.Command {
-	var (
-		kindStr  string
-		ruleName string
-	)
-
+	opts := &utils.CredentialCommandOptions{Scope: utils.CredentialScopeIdentity}
 	cmd := &cobra.Command{
-		Use:   "delete [name]",
-		Short: i18n.T("identity_credential_delete_short"),
-		Args:  cobra.ExactArgs(1),
+		Use:     "delete [name]",
+		Aliases: []string{"rm", "del", "remove", "unset"},
+		Short:   i18n.T("identity_credential_delete_short"),
+		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			name := args[0]
-			kind := credential.Kind(kindStr)
-			if err := kind.Validate(); err != nil {
-				return fmt.Errorf("invalid credential kind %q: must be login_password, passphrase, totp_secret, or challenge_answer", kindStr)
-			}
-			if kind == credential.KindChallengeAnswer && strings.TrimSpace(ruleName) == "" {
-				return errors.New(i18n.T("err_rule_required_for_challenge"))
-			}
-
-			_, repo, cfg, err := utils.GetConfigStore()
-			if err != nil {
-				return err
-			}
-
-			view := repo.View()
-			ident, ok := view.Configuration.Identities.Get(name)
-			if !ok {
-				return fmt.Errorf("%s", i18n.Tf("identity_err_not_found", map[string]any{"Name": name}))
-			}
-			ref, ok := view.IdentityRefs[name]
-			if !ok {
-				return fmt.Errorf("resolve identity %q reference: %w", name, config.ErrIdentityNotFound)
-			}
-
-			if kind == credential.KindChallengeAnswer {
-				if err := validateIdentityChallengeRule(ident, ruleName, name); err != nil {
-					return err
-				}
-			}
-
-			oldRef := findIdentityOldRef(kind, ident, ruleName)
-
-			target := credential.Target{
-				IdentityID: name,
-				Kind:       kind,
-				RuleName:   ruleName,
-			}
-
-			svc, err := utils.GetCredentialService(repo, cfg)
-			if err != nil {
-				return fmt.Errorf("initialize credential service: %w", err)
-			}
-
-			if oldRef != nil && !oldRef.IsEmpty() {
-				if _, err := svc.Delete(cmd.Context(), target, string(ref.Version[:]), *oldRef); err != nil {
-					return fmt.Errorf("delete credential for identity %q: %w", name, err)
-				}
-			} else {
-				// 没有持久化引用，但可能存在明文，清空明文
-				updater := repo.AsConfigUpdater()
-				if _, _, err := updater.ApplyCredentialRefAtVersion(cmd.Context(), target, string(ref.Version[:]), nil); err != nil {
-					return fmt.Errorf("clear credential for identity %q: %w", name, err)
-				}
-			}
-
-			logger.PrintSuccessf("Successfully deleted %s credential for identity %q", kindStr, name)
-			return nil
+			return opts.RunDelete(cmd, args[0])
 		},
 	}
-
-	cmd.Flags().StringVar(&kindStr, "kind", "login_password", i18n.T("flag_credential_kind"))
-	cmd.Flags().StringVar(&ruleName, "rule", "", i18n.T("flag_credential_rule"))
+	opts.RegisterDeleteFlags(cmd)
 	return cmd
-}
-
-func validateIdentityChallengeRule(ident models.Identity, ruleName, identityName string) error {
-	if ident.KeyboardInteractive != nil {
-		for _, r := range ident.KeyboardInteractive.Rules {
-			if r.Name == ruleName {
-				return nil
-			}
-		}
-	}
-	return fmt.Errorf("challenge rule %q not found in identity %q", ruleName, identityName)
-}
-
-func findIdentityOldRef(kind credential.Kind, ident models.Identity, ruleName string) *credential.Ref {
-	switch kind {
-	case credential.KindLoginPassword:
-		return ident.LoginPasswordRef
-	case credential.KindPassphrase:
-		return ident.PassphraseRef
-	case credential.KindTOTPSecret:
-		if ident.OTP != nil {
-			return ident.OTP.TOTPSecretRef
-		}
-	case credential.KindChallengeAnswer:
-		if ident.KeyboardInteractive != nil {
-			for _, r := range ident.KeyboardInteractive.Rules {
-				if r.Name == ruleName {
-					return r.SecretRef
-				}
-			}
-		}
-	}
-	return nil
 }

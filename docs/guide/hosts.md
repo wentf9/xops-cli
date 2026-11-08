@@ -5,21 +5,28 @@ XOps 将网络地址（**Host**）、认证身份（**Identity**）和连接节�
 ## 快速上手
 
 ```bash
-# 手动添加单台主机（默认自动验证 SSH 连接并探测远端 Shell）
+# 手动添加单台主机（支持 [别名] [user@]host[:port] 位置参数简写，默认自动验证 SSH 连接并探测远端 Shell）
+xops host add web-01 deploy@192.0.2.10 -k ~/.ssh/id_ed25519 -t web
+# 完整参数写法（等价）
 xops host add --address 192.0.2.10 --user deploy --key ~/.ssh/id_ed25519 --alias web-01 --tags web
 
 # 从 CSV 批量导入主机并打上 web 标签
 xops host import hosts.csv --tag web
 
-# 查看主机列表与标签汇总
+# 查看主机列表与标签汇总（可使用缩写 xops h ls）
 xops host list
 xops host tags
+
+# 快捷管理节点标签与模板绑定
+xops host tag prod web-01 web-02
+xops host tag -d prod web-02
+xops host edit web-01 --add-tag frontend --rm-tag legacy -I deploy-id
 
 # 导出 CSV 导入模板（仅生成空白表头模板，非导出已有主机）
 xops host import --template
 ```
 
-`inventory` 仍可作为 `host` 的兼容别名，`host load` 仍可作为 `host import` 的兼容别名；新脚本建议统一使用 `host` 与 `host import`。
+常用命令均提供简短别名：`host`（`h`、`inventory`、`inv`）、`identity`（`id`、`auth`）、`credential`（`cred`、`cr`），以及子命令 `list`（`ls`）、`edit`（`ed`）、`delete`（`rm`、`del`）、`probe`（`pr`）、`import`（`imp`、`load`）。
 
 以不同用户名直接连接同一台主机时，XOps 会自动复用同一个 `Host`，并创建独立的 `Identity` 和 `Node`：
 
@@ -163,9 +170,14 @@ nodes:
 
 `host add|edit` 和 `identity add|edit` 已移除明文参数 `--password`、`--key-pass` 及其短参数，避免密码泄露在命令行参数和 Shell 历史中；旧命令 `loadHost` 也已移除（请改用 `xops host import`）。
 
-请使用交互式密码提示、`xops identity credential set`，或通过可信管道/重定向传入 `--password-stdin`（登录密码）与 `--passphrase-stdin`（私钥口令）：
+请使用交互式密码提示（`--ask-pass` / `--ask-passphrase`）、`xops cred set <节点或身份>`（或 `xops host set-secret` / `xops id set`），或通过可信管道/重定向传入 `--password-stdin`（登录密码）与 `--passphrase-stdin`（私钥口令）：
 
 ```bash
+# 在终端交互式输入新密码或直接为节点/身份设置凭据
+xops host edit web-01 --ask-pass
+xops cred set web-01 --password
+xops cred set web-01 --sudo
+
 # 从标准输入更新身份密码
 xops identity edit admin --password-stdin
 
@@ -173,5 +185,5 @@ xops identity edit admin --password-stdin
 xops host edit web-01 --key ~/.ssh/id_ed25519 --passphrase-stdin
 ```
 
-- `--password-stdin` 与 `--passphrase-stdin` 互斥，`--password-stdin` 不能与 `--key` 同用，`host add` 中两者均不能与 `--identity` 同用。
+- `--password-stdin`、`--passphrase-stdin`、`--ask-pass` 与 `--ask-passphrase` 互斥，`--password-stdin`/`--ask-pass` 不能与 `--key` 同用，`host add|edit` 中均不能与 `--identity` 同用。
 - 空输入会在保存前被拒绝；编辑节点或身份时若省略这些选项，将保留原有凭据（切换认证方式或更换私钥路径时会同步更新凭据引用）。

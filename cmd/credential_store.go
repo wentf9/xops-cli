@@ -40,7 +40,10 @@ func newOfflineStoreCommand(op string) *cobra.Command {
 	cmd := &cobra.Command{Use: op + " <storeID>", Short: "Offline encrypted store: " + op, Args: cobra.ExactArgs(1), SilenceErrors: true, SilenceUsage: true}
 	switch op {
 	case "probe":
+		cmd.Aliases = []string{"pr"}
 		cmd.Long = "Probe locking, exclusive publication, atomic replacement and synchronization using temporary test data. No credentials are read or written. The report names the tested directory; this is not a power-loss certification."
+	case "inspect":
+		cmd.Aliases = []string{"insp"}
 	case "init", "rewrap", "reencrypt", "clone", "restore":
 		cmd.Long = "For new key-file wrapping material, a missing configured key_file is generated as 32 random bytes with mode 0600. Existing valid key files are reused without changes. The parent directory must exist. Unlock and resume require the original key file."
 	}

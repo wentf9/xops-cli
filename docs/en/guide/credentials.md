@@ -83,12 +83,13 @@ SSH login and `sudo`/`su` escalation are verified and stored separately:
 For hosts with multi-factor authentication (2FA/MFA) enabled, XOps can store and manage TOTP shared secrets and static challenge answers in secure credential vaults:
 - **TOTP secrets (`totp_secret`)**: Stores Base32-encoded TOTP secrets, automatically evaluated by the native time-step algorithm during connection establishment.
 - **Challenge answers (`challenge_answer`)**: Stores static response texts bound to a specific challenge rule (`rule`).
-- **CLI setup**: Use `xops identity credential set` with `--password-stdin` to safely record secrets without writing plaintext into configuration files or shell histories:
+- **CLI setup**: Use `xops cred set <node-or-identity>` (or `xops host set-secret` / `xops id set`) with kind flags (`--password`, `--passphrase`, `--totp`, `--sudo`, `--challenge <rule>`) and either interactive prompts or `--password-stdin` to safely record secrets without writing plaintext into configuration files or shell histories:
   ```bash
-  # Store a TOTP secret for an identity
-  xops identity credential set my-id --kind totp_secret --password-stdin
-  # Store a challenge answer for a specific rule
-  xops identity credential set my-id --kind challenge_answer --rule security_question --password-stdin
+  # Set login password, sudo password, TOTP secret, or challenge answer directly
+  xops cred set web-01 --password
+  xops cred set web-01 --sudo
+  xops cred set my-id --totp --password-stdin
+  xops cred set my-id --challenge security_question --password-stdin
   ```
 
 ## Backup and recovery

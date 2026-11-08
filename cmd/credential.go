@@ -26,7 +26,7 @@ import (
 func NewCmdCredential() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "credential",
-		Aliases: []string{"cred"},
+		Aliases: []string{"cred", "cr"},
 		Short:   i18n.T("credential_short"),
 		Long:    i18n.T("credential_long"),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -34,6 +34,8 @@ func NewCmdCredential() *cobra.Command {
 		},
 	}
 
+	cmd.AddCommand(newCmdCredentialSet())
+	cmd.AddCommand(newCmdCredentialDelete())
 	cmd.AddCommand(newCmdCredentialStore())
 	cmd.AddCommand(newCmdCredentialDoctor())
 	cmd.AddCommand(newCmdCredentialGC())
@@ -43,10 +45,41 @@ func NewCmdCredential() *cobra.Command {
 	return cmd
 }
 
+func newCmdCredentialSet() *cobra.Command {
+	opts := &utils.CredentialCommandOptions{Scope: utils.CredentialScopeAuto}
+	cmd := &cobra.Command{
+		Use:     "set <target>",
+		Aliases: []string{"s"},
+		Short:   i18n.T("credential_set_short"),
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return opts.RunSet(cmd, args[0])
+		},
+	}
+	opts.RegisterSetFlags(cmd)
+	return cmd
+}
+
+func newCmdCredentialDelete() *cobra.Command {
+	opts := &utils.CredentialCommandOptions{Scope: utils.CredentialScopeAuto}
+	cmd := &cobra.Command{
+		Use:     "delete <target>",
+		Aliases: []string{"rm", "del", "remove", "unset"},
+		Short:   i18n.T("credential_delete_short"),
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return opts.RunDelete(cmd, args[0])
+		},
+	}
+	opts.RegisterDeleteFlags(cmd)
+	return cmd
+}
+
 func newCmdCredentialStore() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "store",
-		Short: i18n.T("credential_store_short"),
+		Use:     "store",
+		Aliases: []string{"st"},
+		Short:   i18n.T("credential_store_short"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return cmd.Help()
 		},
@@ -61,8 +94,9 @@ func newCmdCredentialStore() *cobra.Command {
 
 func newCmdCredentialStoreList() *cobra.Command {
 	return &cobra.Command{
-		Use:   "list",
-		Short: i18n.T("credential_store_list_short"),
+		Use:     "list",
+		Aliases: []string{"ls"},
+		Short:   i18n.T("credential_store_list_short"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, _, cfg, err := utils.GetConfigStore()
 			if err != nil {
@@ -129,9 +163,10 @@ type DoctorCheckItem struct {
 
 func newCmdCredentialDoctor() *cobra.Command {
 	return &cobra.Command{
-		Use:   "doctor",
-		Short: i18n.T("credential_doctor_short"),
-		Long:  i18n.T("credential_doctor_long"),
+		Use:     "doctor",
+		Aliases: []string{"doc", "check"},
+		Short:   i18n.T("credential_doctor_short"),
+		Long:    i18n.T("credential_doctor_long"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			items := runDoctorChecks(cmd.Context())
 

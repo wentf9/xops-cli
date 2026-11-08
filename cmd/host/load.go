@@ -33,7 +33,7 @@ type ImportOptions struct {
 
 func NewCmdInventoryLoad() *cobra.Command {
 	cmd := &cobra.Command{
-		Use: "import [csv_file]", Aliases: []string{"load"},
+		Use: "import [csv_file]", Aliases: []string{"load", "imp"},
 		Short: i18n.T("inventory_load_short"), Long: i18n.T("inventory_load_long"),
 		Args: cobra.MaximumNArgs(1), RunE: RunInventoryLoad,
 	}

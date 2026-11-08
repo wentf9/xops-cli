@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"net"
@@ -190,6 +191,24 @@ func ReadPasswordFromTerminal(prompt string) (string, error) {
 		return "", err
 	}
 	return string(password), nil
+}
+
+// IsInteractiveTerminal 判断标准输入是否为交互式终端
+func IsInteractiveTerminal() bool {
+	return term.IsTerminal(int(os.Stdin.Fd()))
+}
+
+// ReadLineFromTerminal 从交互式终端读取一行文本输入
+func ReadLineFromTerminal(prompt string) (string, error) {
+	if _, err := fmt.Print(prompt); err != nil {
+		return "", fmt.Errorf("write prompt failed: %w", err)
+	}
+	reader := bufio.NewReader(os.Stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil && len(line) == 0 {
+		return "", fmt.Errorf("read terminal input failed: %w", err)
+	}
+	return strings.TrimSpace(line), nil
 }
 
 // IsValidIP 检查给定的字符串是否是有效的IP地址

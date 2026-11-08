@@ -12,7 +12,7 @@ import (
 func newCmdCredentialMigrate() *cobra.Command {
 	var opts config.MigrationOptions
 	cmd := &cobra.Command{
-		Use: "migrate --to <store>", Short: i18n.T("credential_migrate_short"), Long: i18n.T("credential_migrate_long"), Args: cobra.NoArgs,
+		Use: "migrate --to <store>", Aliases: []string{"mig"}, Short: i18n.T("credential_migrate_short"), Long: i18n.T("credential_migrate_long"), Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if opts.ToStore == "" {
 				return fmt.Errorf("--to must name a configured writable credential store")
@@ -46,7 +46,7 @@ func newCmdCredentialMigrate() *cobra.Command {
 
 func newCmdCredentialFinalizeMigration() *cobra.Command {
 	return &cobra.Command{
-		Use: "finalize-migration", Short: i18n.T("credential_finalize_short"), Long: i18n.T("credential_finalize_long"), Args: cobra.NoArgs,
+		Use: "finalize-migration", Aliases: []string{"finalize", "fin"}, Short: i18n.T("credential_finalize_short"), Long: i18n.T("credential_finalize_long"), Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			migrator, err := commandCredentialMigrator()
 			if err != nil {

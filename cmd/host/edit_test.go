@@ -71,4 +71,18 @@ func TestApplyNodeUpdates(t *testing.T) {
 	if identity.Password != "" || identity.AuthType != "" {
 		t.Errorf("secret replacement changed inventory before credential transaction")
 	}
+
+	// Test 4: addTags and rmTags
+	node.Tags = []string{"legacy", "web"}
+	flags4 := &editFlags{
+		addTags: []string{"prod,api"},
+		rmTags:  []string{"legacy"},
+	}
+	updated, nameChanged = applyNodeUpdates(cmd, provider, oldName, host, identity, node, flags4)
+	if !updated || nameChanged {
+		t.Errorf("expected updated=true, nameChanged=false, got %v/%v", updated, nameChanged)
+	}
+	if !reflect.DeepEqual(node.Tags, []string{"web", "prod", "api"}) {
+		t.Errorf("tags did not update as expected: got %v", node.Tags)
+	}
 }

@@ -966,3 +966,51 @@ flag_scp_verbose:
   other: "Print SSH/SFTP diagnostics (-vv includes file ops, -vvv includes SFTP packets; independent of --debug)"
 flag_sftp_verbose:
   other: "Print SSH/SFTP diagnostics (-vv includes file ops, -vvv includes SFTP packets; independent of --debug)"
+identity_flag_name:
+  other: "Authentication template name/alias"
+identity_flag_user:
+  other: "SSH username"
+identity_flag_key:
+  other: "SSH private key path"
+prompt_enter_identity_name:
+  other: "Enter authentication template name: "
+prompt_enter_host_target:
+  other: "Enter target host ([user@]host[:port]): "
+prompt_enter_host_alias:
+  other: "Enter node alias (optional, press Enter to skip): "
+flag_ask_pass:
+  other: "Prompt for a new password interactively on the terminal"
+flag_ask_passphrase:
+  other: "Prompt for a private key passphrase interactively on the terminal"
+prompt_enter_key_passphrase:
+  other: "Enter passphrase for private key: "
+flag_inv_edit_add_tag:
+  other: "Append tags to the node (comma-separated or repeatable)"
+flag_inv_edit_rm_tag:
+  other: "Remove tags from the node (comma-separated or repeatable)"
+flag_inv_tag_delete:
+  other: "Remove the tag from the specified nodes"
+host_credential_short:
+  other: "Manage persistent credentials for a node"
+host_set_secret_short:
+  other: "Set persistent credential for a node (supports --password, --passphrase, --totp, --sudo, --challenge)"
+host_delete_secret_short:
+  other: "Delete persistent credential reference for a node"
+credential_set_short:
+  other: "Set persistent credential for a node or identity template (auto-detects target)"
+credential_delete_short:
+  other: "Delete persistent credential for a node or identity template"
+flag_cred_kind_password:
+  other: "Target login password (shorthand for --kind login_password)"
+flag_cred_kind_passphrase:
+  other: "Target private key passphrase (shorthand for --kind passphrase)"
+flag_cred_kind_totp:
+  other: "Target TOTP secret (shorthand for --kind totp_secret)"
+flag_cred_kind_sudo:
+  other: "Target node privilege escalation password (shorthand for --kind privilege_password)"
+flag_cred_kind_challenge:
+  other: "Target challenge-response secret for rule (shorthand for --kind challenge_answer --rule <rule>)"
+flag_cred_target_node:
+  other: "Force resolving target as a host node"
+flag_cred_target_identity:
+  other: "Force resolving target as an identity template"

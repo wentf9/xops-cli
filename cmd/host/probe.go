@@ -23,7 +23,7 @@ func NewCmdInventoryProbe() *cobra.Command {
 func newCmdInventoryProbe(verify inventoryVerifier) *cobra.Command {
 	var save, all bool
 	cmd := &cobra.Command{
-		Use: "probe [node-id]", Short: i18n.T("inventory_probe_short"), Long: i18n.T("inventory_probe_long"),
+		Use: "probe [node-id]", Aliases: []string{"pr", "check"}, Short: i18n.T("inventory_probe_short"), Long: i18n.T("inventory_probe_long"),
 		Args: func(cmd *cobra.Command, args []string) error {
 			if all {
 				return cobra.NoArgs(cmd, args)

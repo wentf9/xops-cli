@@ -234,3 +234,155 @@ func TestIdentityCredentialSet_NotFound(t *testing.T) {
 		t.Errorf("expected error when setting credential for non-existent identity, got nil")
 	}
 }
+
+func TestUnifiedCredentialAndSimplifiedWorkflows(t *testing.T) {
+	store := setupWorkflowTestStore(t)
+
+	// 1. Positional `id add <name> <user>`
+	mustExecRoot(t, "id-secret-1\n", "id", "add", "prod-id", "deploy", "--password-stdin")
+	mustExecRoot(t, "id-secret-2\n", "id", "add", "temp-id", "ops", "--password-stdin")
+	mustExecRoot(t, "id-secret-3\n", "id", "add", "temp-id-2", "audit", "--password-stdin")
+
+	// 2. Positional `h add <alias> <user>@<host>:<port> --skip-verify`
+	mustExecRoot(t, "", "h", "add", "web-01", "root@192.0.2.10:2222", "--skip-verify")
+	mustExecRoot(t, "", "h", "add", "ops@192.0.2.11", "--skip-verify")
+
+	// 3. Direct credential set on node via `cred set <alias> --password` and `--sudo`
+	mustExecRoot(t, "node-login-pwd\n", "cred", "set", "web-01", "--password", "--password-stdin")
+	mustExecRoot(t, "node-sudo-pwd\n", "cred", "set", "web-01", "--sudo", "--password-stdin")
+
+	// 4. Direct credential set on identity via `id set <name> --totp`
+	mustExecRoot(t, "JBSWY3DPEHPK3PXP\n", "id", "set", "prod-id", "--totp", "--password-stdin")
+	assertSavedNodeAndIdentityCredentials(t, store)
+
+	// 5. Direct `h tag <tag> <node1> <node2>` and `h tag -d <tag> <node2>`
+	mustExecRoot(t, "", "h", "tag", "cluster", "web-01", "ops@192.0.2.11:22")
+	mustExecRoot(t, "", "h", "tag", "-d", "cluster", "ops@192.0.2.11:22")
+
+	// 6. `h ed` with `--add-tag`, `--rm-tag`, and `-I` (rebind identity template)
+	mustExecRoot(t, "", "h", "ed", "web-01", "--add-tag", "frontend,canary", "--rm-tag", "cluster", "-I", "prod-id")
+	assertEditedNodeState(t, store)
+
+	// 7. Delete sudo secret via `h rm-secret <node> --sudo` and multi-delete
+	mustExecRoot(t, "", "h", "rm-secret", "web-01", "--sudo")
+	mustExecRoot(t, "", "h", "rm", "web-01", "ops@192.0.2.11:22")
+	mustExecRoot(t, "", "id", "rm", "temp-id", "temp-id-2")
+	assertAllDeleted(t, store)
+}
+
+func setupWorkflowTestStore(t *testing.T) config.Store {
+	t.Helper()
+	tempDir := setupTestEnvironment(t)
+	helperDataFile := filepath.Join(tempDir, "helper_data.json")
+	t.Setenv("TEST_IDENTITY_HELPER", "1")
+	t.Setenv("TEST_HELPER_DATA_FILE", helperDataFile)
+
+	cfgPath, keyPath, err := utils.GetConfigFilePath()
+	if err != nil {
+		t.Fatalf("GetConfigFilePath failed: %v", err)
+	}
+	store := config.NewDefaultStore(cfgPath, keyPath)
+	cfg := &config.Configuration{
+		SchemaVersion: 2,
+		Nodes:         concurrent.NewMap[string, models.Node](concurrent.HashString),
+		Hosts:         concurrent.NewMap[string, models.Host](concurrent.HashString),
+		Identities:    concurrent.NewMap[string, models.Identity](concurrent.HashString),
+		Credential: &config.CredentialConfig{
+			DefaultStore: "helper-store",
+			Stores: map[string]config.StoreConfig{
+				"helper-store": {
+					Type:    config.StoreTypeHelper,
+					Command: os.Args[0],
+				},
+			},
+		},
+	}
+	if err := store.Save(cfg); err != nil {
+		t.Fatalf("failed to save initial config: %v", err)
+	}
+	return store
+}
+
+func mustExecRoot(t *testing.T, stdin string, args ...string) {
+	t.Helper()
+	root := newRootCmd()
+	initRootFlags(root)
+	registerCommands(root)
+	root.PersistentPreRunE = nil
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&out)
+	if stdin != "" {
+		root.SetIn(strings.NewReader(stdin))
+	}
+	root.SetArgs(args)
+	if err := root.Execute(); err != nil {
+		t.Fatalf("execute %v failed: %v", args, err)
+	}
+}
+
+func assertSavedNodeAndIdentityCredentials(t *testing.T, store config.Store) {
+	t.Helper()
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config failed: %v", err)
+	}
+	webNode, ok := loaded.Nodes.Get("root@192.0.2.10:2222")
+	if !ok {
+		t.Fatalf("expected node root@192.0.2.10:2222 to exist")
+	}
+	if webNode.PrivilegePasswordRef == nil || webNode.PrivilegePasswordRef.IsEmpty() {
+		t.Fatalf("expected PrivilegePasswordRef on web-01 to be set")
+	}
+	webIdent, ok := loaded.Identities.Get(webNode.IdentityRef)
+	if !ok || webIdent.LoginPasswordRef == nil || webIdent.LoginPasswordRef.IsEmpty() {
+		t.Fatalf("expected LoginPasswordRef on web-01 identity to be set, got %+v", webIdent)
+	}
+	prodIdent, ok := loaded.Identities.Get("prod-id")
+	if !ok || prodIdent.OTP == nil || prodIdent.OTP.TOTPSecretRef == nil {
+		t.Fatalf("expected TOTPSecretRef on prod-id to be set, got %+v", prodIdent)
+	}
+}
+
+func assertEditedNodeState(t *testing.T, store config.Store) {
+	t.Helper()
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config after edit failed: %v", err)
+	}
+	renamedNode, ok := loaded.Nodes.Get("deploy@192.0.2.10:2222")
+	if !ok {
+		t.Fatalf("expected node to be renamed to deploy@192.0.2.10:2222 after switching to prod-id")
+	}
+	if renamedNode.IdentityRef != "prod-id" {
+		t.Errorf("expected IdentityRef = prod-id, got %q", renamedNode.IdentityRef)
+	}
+	if !slices.Equal(renamedNode.Tags, []string{"frontend", "canary"}) {
+		t.Errorf("expected tags [frontend canary], got %v", renamedNode.Tags)
+	}
+}
+
+func assertAllDeleted(t *testing.T, store config.Store) {
+	t.Helper()
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config after multi-delete failed: %v", err)
+	}
+	if loaded.Nodes.Count() != 0 {
+		t.Errorf("expected 0 nodes after h rm, got %d", loaded.Nodes.Count())
+	}
+	if loaded.Identities.Count() != 0 {
+		t.Errorf("expected 0 identities after id rm, got %d", loaded.Identities.Count())
+	}
+	raw, err := os.ReadFile(os.Getenv("TEST_HELPER_DATA_FILE"))
+	if err != nil {
+		t.Fatalf("read helper store file failed: %v", err)
+	}
+	var remaining map[string]string
+	if err := json.Unmarshal(raw, &remaining); err != nil {
+		t.Fatalf("unmarshal helper store file failed: %v", err)
+	}
+	if len(remaining) != 0 {
+		t.Errorf("expected 0 credentials remaining in helper store after cleanup, got %v", remaining)
+	}
+}

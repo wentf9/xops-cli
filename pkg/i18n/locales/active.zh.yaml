@@ -967,3 +967,51 @@ flag_scp_verbose:
   other: "输出 SSH/SFTP 诊断信息（-vv 含文件操作，-vvv 含 SFTP 数据包；独立于 --debug）"
 flag_sftp_verbose:
   other: "输出 SSH/SFTP 诊断信息（-vv 含文件操作，-vvv 含 SFTP 数据包；独立于 --debug）"
+identity_flag_name:
+  other: "认证信息模板名称/别名"
+identity_flag_user:
+  other: "SSH 用户名"
+identity_flag_key:
+  other: "SSH 私钥路径"
+prompt_enter_identity_name:
+  other: "请输入认证模板名称: "
+prompt_enter_host_target:
+  other: "请输入目标主机 ([user@]host[:port]): "
+prompt_enter_host_alias:
+  other: "请输入节点别名 (可选，直接回车跳过): "
+flag_ask_pass:
+  other: "在交互式终端安全输入新密码"
+flag_ask_passphrase:
+  other: "在交互式终端安全输入私钥密码"
+prompt_enter_key_passphrase:
+  other: "请输入私钥密码: "
+flag_inv_edit_add_tag:
+  other: "为节点追加标签 (逗号分隔或多次指定)"
+flag_inv_edit_rm_tag:
+  other: "从节点移除标签 (逗号分隔或多次指定)"
+flag_inv_tag_delete:
+  other: "从指定节点移除该标签"
+host_credential_short:
+  other: "管理指定节点的持久化凭据"
+host_set_secret_short:
+  other: "为指定节点设置持久化凭据 (支持 --password, --passphrase, --totp, --sudo, --challenge)"
+host_delete_secret_short:
+  other: "删除指定节点的持久化凭据引用"
+credential_set_short:
+  other: "为节点或认证模板设置持久化凭据 (自动识别节点/身份)"
+credential_delete_short:
+  other: "删除节点或认证模板的持久化凭据"
+flag_cred_kind_password:
+  other: "操作登录密码 (等同于 --kind login_password)"
+flag_cred_kind_passphrase:
+  other: "操作私钥密码 (等同于 --kind passphrase)"
+flag_cred_kind_totp:
+  other: "操作 TOTP 动态口令密钥 (等同于 --kind totp_secret)"
+flag_cred_kind_sudo:
+  other: "操作节点提权密码 (等同于 --kind privilege_password)"
+flag_cred_kind_challenge:
+  other: "操作指定质询规则的应答机密 (等同于 --kind challenge_answer --rule <rule>)"
+flag_cred_target_node:
+  other: "强制将目标解析为主机节点"
+flag_cred_target_identity:
+  other: "强制将目标解析为认证模板"

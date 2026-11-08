@@ -16,8 +16,9 @@ import (
 func NewCmdInventoryList() *cobra.Command {
 	var tagFilter string
 	cmd := &cobra.Command{
-		Use:   "list",
-		Short: i18n.T("inventory_list_short"),
+		Use:     "list",
+		Aliases: []string{"ls"},
+		Short:   i18n.T("inventory_list_short"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, provider, _, err := utils.GetConfigStore()
 			if err != nil {

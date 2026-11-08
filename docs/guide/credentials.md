@@ -83,12 +83,13 @@ SSH 登录密码与 `sudo`/`su` 提权密码独立验证、分开存储：
 针对开启多因素认证（2FA/MFA）的主机，XOps 支持在安全凭据库中托管 TOTP 共享密钥与静态安全质询答案：
 - **TOTP 密钥（`totp_secret`）**：保存 Base32 编码的 TOTP 密钥，由内置算法自动生成当前动态口令。
 - **质询答案（`challenge_answer`）**：保存与指定质询规则（`rule`）关联的静态回答文本。
-- **命令行录入**：可通过 `xops identity credential set` 配合 `--password-stdin` 安全录入，避免明文落盘或暴露于命令行参数中：
+- **命令行录入**：可通过 `xops cred set <节点或身份>`（或 `xops host set-secret` / `xops id set`）配合类型标志（`--password`、`--passphrase`、`--totp`、`--sudo`、`--challenge <rule>`）与终端交互提示或 `--password-stdin` 安全录入，避免明文落盘或暴露于命令行参数中：
   ```bash
-  # 录入身份的 TOTP 密钥
-  xops identity credential set my-id --kind totp_secret --password-stdin
-  # 录入身份指定规则的安全问题答案
-  xops identity credential set my-id --kind challenge_answer --rule security_question --password-stdin
+  # 直接为节点或身份录入登录密码 / 提权密码 / TOTP 密钥 / 质询答案
+  xops cred set web-01 --password
+  xops cred set web-01 --sudo
+  xops cred set my-id --totp --password-stdin
+  xops cred set my-id --challenge security_question --password-stdin
   ```
 
 ## 备份与恢复

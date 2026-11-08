@@ -724,17 +724,20 @@ func (r *Repository) ReplaceNodeAtRefContext(ctx context.Context, ref NodeRef, n
 
 // ReplaceNodeAtRefWithAuthVersionContext replaces a node bundle and returns
 // the authentication version produced by that same committed mutation.
-//
-//nolint:gocyclo // replacement preserves host and identity copy-on-write invariants in one CAS transaction
 func (r *Repository) ReplaceNodeAtRefWithAuthVersionContext(ctx context.Context, ref NodeRef, nodeID string, node models.Node, host models.Host, identity models.Identity) (string, error) {
+	_, authVersion, err := r.replaceNodeAtRefWithOutcome(ctx, ref, nodeID, node, host, identity)
+	return authVersion, err
+}
+
+func (r *Repository) replaceNodeAtRefWithOutcome(ctx context.Context, ref NodeRef, nodeID string, node models.Node, host models.Host, identity models.Identity) (MutationOutcome, string, error) {
 	if nodeID == "" {
-		return "", fmt.Errorf("node ID is empty")
+		return MutationOutcome{}, "", fmt.Errorf("node ID is empty")
 	}
 	if ref.ID == "" {
-		return "", fmt.Errorf("replace node %q without a versioned reference: %w", nodeID, ErrConfigConflict)
+		return MutationOutcome{}, "", fmt.Errorf("replace node %q without a versioned reference: %w", nodeID, ErrConfigConflict)
 	}
 	var authVersion string
-	err := r.commitContext(ctx, anyRevision, func(cfg *Configuration) error {
+	result, err := r.commitResultContext(ctx, anyRevision, func(cfg *Configuration) error {
 		if err := replaceNodeAtRef(cfg, ref, nodeID, node, host, identity); err != nil {
 			return err
 		}
@@ -745,7 +748,7 @@ func (r *Repository) ReplaceNodeAtRefWithAuthVersionContext(ctx context.Context,
 		authVersion = string(version[:])
 		return nil
 	})
-	return authVersion, err
+	return MutationOutcome{Applied: result.Applied, Durable: result.Durable}, authVersion, err
 }
 
 // replaceNodeAtRef mutates a transaction-local snapshot. Both ordinary edits

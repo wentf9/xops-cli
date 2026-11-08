@@ -5,21 +5,28 @@ XOps manages network addresses (**Host**), authentication profiles (**Identity**
 ## Quick start
 
 ```bash
-# Add a single host (verifies SSH authentication and probes the remote shell by default)
+# Add a single host (supports positional [alias] [user@]host[:port] shorthand; verifies SSH and probes the remote shell by default)
+xops host add web-01 deploy@192.0.2.10 -k ~/.ssh/id_ed25519 -t web
+# Equivalent explicit-flag form
 xops host add --address 192.0.2.10 --user deploy --key ~/.ssh/id_ed25519 --alias web-01 --tags web
 
 # Bulk-import hosts from CSV and assign the 'web' tag
 xops host import hosts.csv --tag web
 
-# List hosts or tags
+# List hosts or tags (short alias: xops h ls)
 xops host list
 xops host tags
+
+# Manage node tags and identity templates directly
+xops host tag prod web-01 web-02
+xops host tag -d prod web-02
+xops host edit web-01 --add-tag frontend --rm-tag legacy -I deploy-id
 
 # Export a blank CSV import template (does not export your existing inventory)
 xops host import --template
 ```
 
-`inventory` remains a compatibility alias for `host`, and `host load` remains an alias for `host import`; prefer `host` and `host import` in new scripts.
+Concise aliases are available across commands: `host` (`h`, `inventory`, `inv`), `identity` (`id`, `auth`), `credential` (`cred`, `cr`), and subcommands `list` (`ls`), `edit` (`ed`), `delete` (`rm`, `del`), `probe` (`pr`), and `import` (`imp`, `load`).
 
 Connecting to an existing host with an explicit different username automatically reuses the `Host` record while creating a separate `Identity` and `Node`:
 
@@ -163,9 +170,14 @@ nodes:
 
 Plaintext flags `--password` and `--key-pass` (and their short forms) have been removed from `host add|edit` and `identity add|edit` to keep secrets out of command arguments and shell history; the legacy `loadHost` command has also been removed (use `xops host import`).
 
-Use interactive prompts, `xops identity credential set`, or pipe secrets through `--password-stdin` (login password) and `--passphrase-stdin` (private-key passphrase):
+Use interactive prompts (`--ask-pass` / `--ask-passphrase`), `xops cred set <node-or-identity>` (or `xops host set-secret` / `xops id set`), or pipe secrets through `--password-stdin` (login password) and `--passphrase-stdin` (private-key passphrase):
 
 ```bash
+# Prompt for a new password interactively or set node/identity secrets directly
+xops host edit web-01 --ask-pass
+xops cred set web-01 --password
+xops cred set web-01 --sudo
+
 # Update an identity's login password from stdin
 xops identity edit admin --password-stdin
 
@@ -173,5 +185,5 @@ xops identity edit admin --password-stdin
 xops host edit web-01 --key ~/.ssh/id_ed25519 --passphrase-stdin
 ```
 
-- `--password-stdin` and `--passphrase-stdin` are mutually exclusive; `--password-stdin` cannot be combined with `--key`; on `host add`, neither stdin flag can be combined with `--identity`.
+- `--password-stdin`, `--passphrase-stdin`, `--ask-pass`, and `--ask-passphrase` are mutually exclusive; `--password-stdin`/`--ask-pass` cannot be combined with `--key`; on `host add|edit`, none of them can be combined with `--identity`.
 - Empty input is rejected before changes are saved. Omitting these flags when editing preserves existing credentials (unless you change the authentication method or private-key path).

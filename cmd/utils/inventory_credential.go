@@ -2,14 +2,17 @@ package utils
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 
 	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
+	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/models"
 	sshcrypto "golang.org/x/crypto/ssh"
+	"golang.org/x/term"
 )
 
 // InventoryCredentialWrite keeps secret material outside inventory models.
@@ -131,4 +134,46 @@ func validateUnencryptedKey(path string) error {
 		return fmt.Errorf("replacement key must be an unencrypted private key, or supply --passphrase-stdin: %w", err)
 	}
 	return nil
+}
+
+const maxPrivateKeyCheckBytes = 16 << 20
+
+// KeyNeedsPassphrase checks whether the private key at path is encrypted and requires a passphrase.
+func KeyNeedsPassphrase(path string) (bool, error) {
+	resolved := ToAbsolutePath(path)
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return false, fmt.Errorf("inspect private key: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Size() > maxPrivateKeyCheckBytes {
+		return false, fmt.Errorf("private key target must be a regular file no larger than 16 MiB")
+	}
+	data, err := os.ReadFile(resolved)
+	if err != nil {
+		return false, fmt.Errorf("read private key: %w", err)
+	}
+	defer clear(data)
+	_, err = sshcrypto.ParsePrivateKey(data)
+	if err == nil {
+		return false, nil
+	}
+	var passMissing *sshcrypto.PassphraseMissingError
+	if errors.As(err, &passMissing) {
+		return true, nil
+	}
+	return false, nil
+}
+
+// PromptPassphraseIfEncryptedKey prompts for a passphrase on interactive terminals
+// when keyPath points to an encrypted private key and no passphrase has been provided.
+func PromptPassphraseIfEncryptedKey(keyPath, currentPassphrase string) (string, error) {
+	if keyPath == "" || currentPassphrase != "" || !term.IsTerminal(int(os.Stdin.Fd())) {
+		return currentPassphrase, nil
+	}
+	needs, err := KeyNeedsPassphrase(keyPath)
+	if err != nil || !needs {
+		return currentPassphrase, nil
+	}
+	resolved := ToAbsolutePath(keyPath)
+	return ReadPasswordFromTerminal(i18n.Tf("prompt_enter_passphrase", map[string]any{"Path": resolved}))
 }
