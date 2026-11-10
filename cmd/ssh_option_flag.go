@@ -83,6 +83,9 @@ func (f *SSHControlFlags) ToSessionControlOptions() (adapter.SessionControlOptio
 
 	// 3. Command-line -S flag overrides any ControlPath from -o
 	if f.ControlPath != "" {
+		if !strings.EqualFold(strings.TrimSpace(f.ControlPath), "none") && f.MasterCount == 0 && sessionOpts.Master == nil {
+			sessionOpts.AllowReuse = true
+		}
 		sessionOpts.SetPath(f.ControlPath)
 	}
 
@@ -238,15 +241,22 @@ func resolveControlConfig(provider config.ConfigProvider, nodeID, selector strin
 func mergeSessionControl(sessionOpts adapter.SessionControlOptions) *ssh.ControlConfig {
 	if opts := sessionOpts.ToSSHOptions(); opts != nil {
 		if ctrl := opts.ControlConfig(); ctrl != nil {
+			ctrl.AllowReuse = sessionOpts.AllowReuse && ctrl.Master == "" && ctrl.Path != "none"
 			return ctrl
 		}
 	}
-	ctrl := &ssh.ControlConfig{}
+	ctrl := &ssh.ControlConfig{
+		AllowReuse: sessionOpts.AllowReuse,
+	}
 	if sessionOpts.Master != nil {
 		ctrl.Master = *sessionOpts.Master
+		ctrl.AllowReuse = false
 	}
 	if sessionOpts.Path != nil {
 		ctrl.Path = *sessionOpts.Path
+		if ctrl.Path == "none" {
+			ctrl.AllowReuse = false
+		}
 	}
 	if sessionOpts.Persist != nil {
 		ctrl.Persist = *sessionOpts.Persist

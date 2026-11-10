@@ -64,6 +64,10 @@ type ControlConfig struct {
 	// ImplicitTier4 is true when multiplexing was resolved solely from ~/.ssh/config
 	// (Tier 4) without any CLI flag or xops node/global configuration.
 	ImplicitTier4 bool `json:"-" yaml:"-"`
+	// AllowReuse is true when the CLI explicitly specified -S <path> without -M or
+	// -o ControlMaster=..., allowing attachment to an existing master even when a
+	// lower-priority config layer sets ControlMaster=yes or ControlMaster=ask.
+	AllowReuse bool `json:"-" yaml:"-"`
 }
 
 // IsEnabled returns true if multiplexing is enabled (either master or reuse).
@@ -112,18 +116,21 @@ func ResolveControl(child, parent *ControlConfig) (*ControlConfig, error) {
 		if res.Path == "none" {
 			res.Master = ControlMasterNo
 			res.Persist = ""
+			res.AllowReuse = false
 		}
 		return res, nil
 	}
 
 	res := &ControlConfig{
-		Master:  parent.Master,
-		Path:    parent.Path,
-		Persist: parent.Persist,
+		Master:     parent.Master,
+		Path:       parent.Path,
+		Persist:    parent.Persist,
+		AllowReuse: parent.AllowReuse,
 	}
 
 	if child.Master != "" {
 		res.Master = child.Master
+		res.AllowReuse = false
 	}
 	if child.Path != "" {
 		res.Path = child.Path
@@ -131,11 +138,15 @@ func ResolveControl(child, parent *ControlConfig) (*ControlConfig, error) {
 	if child.Persist != "" {
 		res.Persist = child.Persist
 	}
+	if child.AllowReuse && child.Master == "" {
+		res.AllowReuse = true
+	}
 
 	// If child sets Path="none", multiplexing is disabled for the child.
 	if child.Path == "none" {
 		res.Master = ControlMasterNo
 		res.Persist = ""
+		res.AllowReuse = false
 	}
 
 	return res, nil

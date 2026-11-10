@@ -32,10 +32,11 @@ type SessionAuth struct {
 // SessionControlOptions specifies session-level OpenSSH option overrides (Tier 1).
 // Pointers indicate whether a multiplexing flag was explicitly specified on the CLI.
 type SessionControlOptions struct {
-	Master  *ssh.ControlMasterMode
-	Path    *string
-	Persist *string
-	Options *ssh.Options
+	Master     *ssh.ControlMasterMode
+	Path       *string
+	Persist    *string
+	Options    *ssh.Options
+	AllowReuse bool
 }
 
 // IsEmpty returns true if no session control or SSH option flags were provided.
@@ -762,11 +763,15 @@ func mergeControlFields(
 		(t2 != nil && t2.Persist != "") ||
 		(t3 != nil && t3.Persist != "")
 
+	hasExplicitSessionMaster := (t1.Master != nil && *t1.Master != "") ||
+		(t1.Options != nil && t1.Options.ControlMaster() != "")
+
 	return &ssh.ControlConfig{
 		Master:        master,
 		Path:          path,
 		Persist:       persist,
 		ImplicitTier4: !hasExplicitPersist && t4 != nil,
+		AllowReuse:    t1.AllowReuse && !hasExplicitSessionMaster && path != "none" && path != "",
 	}
 }
 

@@ -434,7 +434,7 @@ func (o *SshOptions) runParentDaemon(ctx context.Context) (err error) {
 	adpOpts = append(adpOpts, disableSessionControlForParent(nodeID))
 	var connector *ssh.Connector
 	if isMuxDaemonChild() {
-		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics))
+		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithSessionConfirmer(o.interaction), ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics))
 	} else {
 		connector = newCLIConnectorWithAdapterOptions(provider, o.interaction, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics))
 	}
@@ -643,9 +643,6 @@ func canHandoffMaster(master *ssh.MuxServer) bool {
 		if ctrl.ImplicitTier4 {
 			return false
 		}
-		if ctrl.Master == ssh.ControlMasterAsk || ctrl.Master == ssh.ControlMasterAutoAsk {
-			return false
-		}
 	}
 	return true
 }
@@ -717,11 +714,6 @@ func (o *SshOptions) handoffMasterInstance(ctx context.Context, connector *ssh.C
 		// explicit CLI or xops config, never spawn a detached background daemon.
 		if ctrl.ImplicitTier4 {
 			logger.DefaultLogger().Debugf("mux: skipping master handoff for implicit Tier 4 (OpenSSH config) control on %q", master.ControlPath())
-			return nil
-		}
-		// H11: A detached daemon has no TTY to prompt confirmation in ask/autoask mode.
-		if ctrl.Master == ssh.ControlMasterAsk || ctrl.Master == ssh.ControlMasterAutoAsk {
-			logger.DefaultLogger().Debugf("mux: skipping master handoff in %s confirmation mode on %q", ctrl.Master, master.ControlPath())
 			return nil
 		}
 	}
@@ -872,14 +864,21 @@ func (o *SshOptions) muxDaemonArgs(nodeID string, expandedPath string, master *s
 			args = append(args, "-o", opt)
 		}
 	}
+	masterMode := ssh.ControlMasterYes
 	if master != nil {
-		if ctrl := master.Target().Control; ctrl != nil && ctrl.Persist != "" {
-			args = append(args, "-o", "ControlPersist="+ctrl.Persist)
+		if ctrl := master.Target().Control; ctrl != nil {
+			if ctrl.Persist != "" {
+				args = append(args, "-o", "ControlPersist="+ctrl.Persist)
+			}
+			if ctrl.Master == ssh.ControlMasterAsk || ctrl.Master == ssh.ControlMasterAutoAsk {
+				masterMode = ssh.ControlMasterAsk
+			}
 		}
 	}
-	// Force ControlMaster=yes on the detached daemon so it never attaches as a
-	// passenger to a competing master.
-	args = append(args, "-o", "ControlMaster=yes")
+	// Force an explicit master mode (yes or ask) on the detached daemon so it
+	// never attaches as a passenger to a competing master while preserving
+	// confirmation semantics across ControlPersist handoff.
+	args = append(args, "-o", "ControlMaster="+string(masterMode))
 	return args
 }
 
@@ -1212,7 +1211,7 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 	}
 	var connector *ssh.Connector
 	if isMuxDaemonChild() {
-		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics))
+		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithSessionConfirmer(o.interaction), ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics))
 	} else {
 		connector = newCLIConnectorWithAdapterOptions(provider, o.interaction, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics))
 	}

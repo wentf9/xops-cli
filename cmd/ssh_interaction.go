@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"regexp"
 	"strings"
 	"unicode"
@@ -186,12 +187,16 @@ func (h *cliInteractionHandler) ConfirmHostKey(ctx context.Context, request ssh.
 }
 
 // ConfirmSession implements ssh.SessionConfirmer for ControlMaster=ask/autoask
-// (-M -M). It fails closed: a non-interactive or erroring prompt denies access.
+// (-M -M). Aligned with OpenSSH mux_master_confirm (read_passphrase with
+// RP_USE_ASKPASS), confirmation is delegated exclusively to SSH_ASKPASS without
+// falling back to the local terminal, supporting SSH_ASKPASS,
+// SSH_ASKPASS_REQUIRE, SSH_ASKPASS_PROMPT, DISPLAY, and WAYLAND_DISPLAY.
 func (h *cliInteractionHandler) ConfirmSession(ctx context.Context, action string) (bool, error) {
-	if h == nil || h.terminal == nil {
+	if h == nil {
 		return false, fmt.Errorf("cli session confirmation is not configured")
 	}
-	if !h.canRemember {
+	askpassProg := resolveAskpassProgram()
+	if askpassProg == "" {
 		return false, nil
 	}
 	release, err := h.acquireGate(ctx)
@@ -201,12 +206,76 @@ func (h *cliInteractionHandler) ConfirmSession(ctx context.Context, action strin
 	defer release()
 
 	prompt := fmt.Sprintf("Allow connection sharing %s on this master? (yes/no) ", action)
-	response, err := h.terminal.ReadLine(ctx, prompt)
-	if err != nil {
-		return false, fmt.Errorf("read session confirmation failed: %w", err)
+	return confirmSessionWithAskpass(ctx, askpassProg, prompt)
+}
+
+var defaultSystemAskpassCandidates = []string{
+	"ssh-askpass",
+	"/usr/libexec/openssh/ssh-askpass",
+	"/usr/lib/openssh/ssh-askpass",
+	"/usr/lib/ssh/ssh-askpass",
+	"/usr/bin/ssh-askpass",
+	"/usr/X11R6/bin/ssh-askpass",
+}
+
+func findSystemAskpass() string {
+	for _, candidate := range defaultSystemAskpassCandidates {
+		if path, err := exec.LookPath(candidate); err == nil && path != "" {
+			return path
+		}
 	}
-	response = strings.TrimSpace(response)
-	return strings.EqualFold(response, "yes") || strings.EqualFold(response, "y"), nil
+	return ""
+}
+
+func resolveAskpassProgram() string {
+	requireMode := strings.ToLower(strings.TrimSpace(os.Getenv("SSH_ASKPASS_REQUIRE")))
+	if requireMode == "never" {
+		return ""
+	}
+	hasDisplay := strings.TrimSpace(os.Getenv("DISPLAY")) != "" || strings.TrimSpace(os.Getenv("WAYLAND_DISPLAY")) != ""
+	if !hasDisplay && requireMode != "force" && requireMode != "prefer" {
+		return ""
+	}
+	prog := strings.TrimSpace(os.Getenv("SSH_ASKPASS"))
+	if prog == "" {
+		prog = findSystemAskpass()
+	}
+	return prog
+}
+
+func askpassCommandEnv(base []string) []string {
+	env := make([]string, 0, len(base)+1)
+	for _, kv := range base {
+		if !strings.HasPrefix(kv, "SSH_ASKPASS_PROMPT=") {
+			env = append(env, kv)
+		}
+	}
+	return append(env, "SSH_ASKPASS_PROMPT=confirm")
+}
+
+func isAskpassApproved(out []byte) bool {
+	resp := strings.TrimSpace(string(out))
+	switch strings.ToLower(resp) {
+	case "", "yes", "y", "true", "ok":
+		return true
+	default:
+		return false
+	}
+}
+
+func confirmSessionWithAskpass(ctx context.Context, askpassProg, prompt string) (bool, error) {
+	cmd := exec.CommandContext(ctx, askpassProg, prompt)
+	cmd.Stdin = nil
+	cmd.Stderr = io.Discard
+	cmd.Env = askpassCommandEnv(os.Environ())
+	out, runErr := cmd.Output()
+	if runErr == nil {
+		return isAskpassApproved(out), nil
+	}
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+	return false, nil
 }
 
 func formatSecretPrompt(req ssh.SecretRequest) string {

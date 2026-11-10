@@ -885,7 +885,7 @@ func (c *Connector) tryConnectMultiplex(ctx context.Context, planNode connection
 		return nil, nil // Multiplexing disabled
 	}
 
-	explicitMaster := ctrl.Master == ControlMasterYes || ctrl.Master == ControlMasterAsk
+	explicitMaster := (ctrl.Master == ControlMasterYes || ctrl.Master == ControlMasterAsk) && !ctrl.AllowReuse
 
 	// 1. Expand ControlPath tokens
 	expandedPath, err := ExpandControlPath(ctrl.Path, c.environment, target)
@@ -988,7 +988,8 @@ func (c *Connector) dialAndPublishProxy(ctx context.Context, planNode connection
 }
 
 func (c *Connector) tryDialAndPublishProxy(ctx context.Context, planNode connectionPlanNode, expandedPath string, target TargetContext) (*Client, error) {
-	dialCtx, cancel := context.WithTimeout(ctx, c.getNodeHandshakeTimeout(planNode.cfg))
+	dialTimeout := max(c.getNodeHandshakeTimeout(planNode.cfg), c.getInteractionTimeout())
+	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
 	rawClient, proxyConn, proxyErr := DialControlProxy(dialCtx, expandedPath, target, WithExpectedPeerUID(c.expectedPeerUID()))
 	if proxyErr != nil {
@@ -1023,7 +1024,7 @@ func (c *Connector) handleStaleControlSocket(ctx context.Context, planNode conne
 	}
 
 	ctrl := target.Control
-	explicitMaster := ctrl != nil && (ctrl.Master == ControlMasterYes || ctrl.Master == ControlMasterAsk)
+	explicitMaster := ctrl != nil && (ctrl.Master == ControlMasterYes || ctrl.Master == ControlMasterAsk) && !ctrl.AllowReuse
 
 	// 1. If file identity changed, another process replaced the socket
 	if !os.SameFile(origFi, currFi) {
@@ -1142,7 +1143,7 @@ func (c *Connector) maybeStartMasterListener(planNode connectionPlanNode, rawCli
 	if err != nil {
 		// A concurrent master already owns this path (or the bind was rejected).
 		// OpenSSH reports the conflict and continues without sharing.
-		explicitMaster := ctrl.Master == ControlMasterYes || ctrl.Master == ControlMasterAsk
+		explicitMaster := (ctrl.Master == ControlMasterYes || ctrl.Master == ControlMasterAsk) && !ctrl.AllowReuse
 		c.warnOrDebugf(explicitMaster, "mux: start master server on %q failed: %v; continuing without connection sharing", expandedPath, err)
 		return
 	}

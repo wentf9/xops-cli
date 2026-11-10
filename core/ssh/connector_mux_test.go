@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -646,5 +648,112 @@ func TestConnectorMastersOrderAndMultiHopProxyJumpChain(t *testing.T) {
 				t.Fatalf("iter %d: masters[%d] = %v, want %v", iter, i, got[i].Target().OriginalHost, want[i].Target().OriginalHost)
 			}
 		}
+	}
+}
+
+type funcSessionConfirmer func(ctx context.Context, action string) (bool, error)
+
+func (f funcSessionConfirmer) ConfirmSession(ctx context.Context, action string) (bool, error) {
+	return f(ctx, action)
+}
+
+func TestConnectorMultiplex_ControlMasterAskAllowReuse(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	fix, err := sshfixture.New(ctx)
+	if err != nil {
+		t.Fatalf("sshfixture.New failed: %v", err)
+	}
+	defer func() { _ = fix.Close() }()
+
+	host, portStr, err := net.SplitHostPort(fix.Address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, _ := strconv.Atoi(portStr)
+	sockPath := filepath.Join(shortSocketDir(t), "ask-reuse.sock")
+
+	var confirmCalls atomic.Int32
+	confirmer := funcSessionConfirmer(func(ctx context.Context, action string) (bool, error) {
+		confirmCalls.Add(1)
+		return true, nil
+	})
+
+	masterProvider := &testMuxProvider{
+		cfg: &ClientConfig{
+			NodeID:   "ask-node",
+			Address:  host,
+			Port:     port,
+			User:     "fixture",
+			Password: sshfixture.Password,
+			AuthType: "password",
+		},
+		ctrl: &ControlConfig{
+			Master:  ControlMasterAsk,
+			Path:    sockPath,
+			Persist: "5m",
+		},
+	}
+	masterConn := newTestConnector(masterProvider, WithHostKeyVerifier(&fixtureTrust{}), WithSessionConfirmer(confirmer))
+	defer func() { _ = masterConn.CloseAll() }()
+
+	masterClient, err := masterConn.Connect(ctx, "ask-node")
+	if err != nil {
+		t.Fatalf("master Connect failed: %v", err)
+	}
+	defer func() { _ = masterClient.Close() }()
+
+	if GetActiveMuxServer(sockPath) == nil {
+		t.Fatalf("expected active mux server on %q", sockPath)
+	}
+
+	// 1. Without AllowReuse (e.g. config has ControlMaster=ask and CLI did not pass -S),
+	// a second connector treats itself as an explicit master and does NOT attach to the existing master.
+	noReuseProvider := &testMuxProvider{
+		cfg: masterProvider.cfg,
+		ctrl: &ControlConfig{
+			Master:     ControlMasterAsk,
+			Path:       sockPath,
+			AllowReuse: false,
+		},
+	}
+	noReuseConn := newTestConnector(noReuseProvider, WithHostKeyVerifier(&fixtureTrust{}))
+	defer func() { _ = noReuseConn.CloseAll() }()
+
+	noReuseClient, err := noReuseConn.Connect(ctx, "ask-node")
+	if err != nil {
+		t.Fatalf("noReuse Connect failed: %v", err)
+	}
+	_ = noReuseClient.Close()
+	if confirmCalls.Load() != 0 {
+		t.Fatalf("expected 0 ConfirmSession calls when AllowReuse=false, got %d", confirmCalls.Load())
+	}
+
+	// 2. With AllowReuse=true (CLI explicitly passed -S <path> without -M),
+	// the second connector attaches to the existing ask master and triggers ConfirmSession.
+	reuseProvider := &testMuxProvider{
+		cfg: masterProvider.cfg,
+		ctrl: &ControlConfig{
+			Master:     ControlMasterAsk,
+			Path:       sockPath,
+			AllowReuse: true,
+		},
+	}
+	reuseConn := newTestConnector(reuseProvider, WithHostKeyVerifier(&fixtureTrust{}))
+	defer func() { _ = reuseConn.CloseAll() }()
+
+	reuseClient, err := reuseConn.Connect(ctx, "ask-node")
+	if err != nil {
+		t.Fatalf("reuse Connect failed: %v", err)
+	}
+	defer func() { _ = reuseClient.Close() }()
+
+	if confirmCalls.Load() != 1 {
+		t.Fatalf("expected ConfirmSession to be called once on reuse with AllowReuse=true, got %d", confirmCalls.Load())
+	}
+	out, err := reuseClient.Run(ctx, "echo ask-reused")
+	if err != nil || !strings.Contains(out, "fixture-output") {
+		t.Fatalf("expected command over reused ask master to succeed, got out=%q err=%v", out, err)
 	}
 }

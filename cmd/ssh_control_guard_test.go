@@ -1102,9 +1102,10 @@ func TestHandoffConnectorMastersDoesNotSkipPersistentJumpForNonPersistentTarget(
 //     shorter jump ControlPersist cannot tear down targetMaster's tunnel.
 //  2. waitForDaemonJumpMasters releases and waits for jumpMaster after
 //     targetMaster exits.
-//  3. canHandoffMaster returns false for ImplicitTier4 or ControlMasterAsk, so
-//     persistentJumpHops does not suppress a persistent jump hop when the target
-//     master cannot be handed off.
+//  3. canHandoffMaster returns true for explicit ControlMasterAsk/AutoAsk (handed
+//     off with -o ControlMaster=ask and SSH_ASKPASS support), and false for
+//     ImplicitTier4 so persistentJumpHops does not suppress a persistent jump hop
+//     when the target master cannot be handed off.
 func TestMuxDaemonKeepsJumpMasterReferenceUntilTargetExits(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -1166,17 +1167,27 @@ func TestMuxDaemonKeepsJumpMasterReferenceUntilTargetExits(t *testing.T) {
 		t.Fatalf("expected both jumpMaster (%v) and targetMaster (%v) to be active", jumpMaster, targetMaster)
 	}
 
-	// Because targetMaster has ControlMasterAutoAsk, canHandoffMaster(targetMaster)
-	// must be false and persistentJumpHops must not suppress "bastion".
-	if canHandoffMaster(targetMaster) {
-		t.Fatal("expected canHandoffMaster(targetMaster) == false for ControlMasterAutoAsk")
+	// Explicit ControlMasterAutoAsk with Persist is eligible for daemon handoff.
+	if !canHandoffMaster(targetMaster) {
+		t.Fatal("expected canHandoffMaster(targetMaster) == true for explicit ControlMasterAutoAsk")
 	}
 	if !canHandoffMaster(jumpMaster) {
 		t.Fatal("expected canHandoffMaster(jumpMaster) == true")
 	}
-	if jumps := persistentJumpHops(connector.Masters()); jumps["bastion"] {
-		t.Fatal("expected bastion NOT to be suppressed when targetMaster has ControlMasterAutoAsk")
+	if jumps := persistentJumpHops(connector.Masters()); !jumps["bastion"] {
+		t.Fatal("expected bastion to be suppressed when targetMaster is handoff-eligible")
 	}
+
+	// When targetMaster comes from ImplicitTier4, canHandoffMaster must be false
+	// and persistentJumpHops must not suppress "bastion".
+	targetMaster.Target().Control.ImplicitTier4 = true
+	if canHandoffMaster(targetMaster) {
+		t.Fatal("expected canHandoffMaster(targetMaster) == false for ImplicitTier4")
+	}
+	if jumps := persistentJumpHops(connector.Masters()); jumps["bastion"] {
+		t.Fatal("expected bastion NOT to be suppressed when targetMaster has ImplicitTier4")
+	}
+	targetMaster.Target().Control.ImplicitTier4 = false
 
 	if err := prepareMuxDaemonSession(connector, targetMaster, "app"); err != nil {
 		t.Fatalf("prepareMuxDaemonSession failed: %v", err)
@@ -2744,5 +2755,151 @@ func verifyRound16ControlEdgeCases(t *testing.T) {
 	_, redirectMuxOpts := buildControlProxyClientConfig(target, nil, "", redirectOpts)
 	if len(redirectMuxOpts) != 0 {
 		t.Fatalf("expected no default CLI prompter mux option when StdinRedirect is true and interaction is nil, got %d options", len(redirectMuxOpts))
+	}
+}
+
+func TestControlMasterAsk_HandoffAskpassAndControlPathReuse(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	assertAllowReuseControlFlags(t)
+
+	sshOpts := NewSshOptions()
+	sshOpts.Host = "10.0.0.50"
+
+	fix, err := sshfixture.New(ctx)
+	if err != nil {
+		t.Fatalf("sshfixture.New failed: %v", err)
+	}
+	defer func() { _ = fix.Close() }()
+
+	host, portStr, _ := net.SplitHostPort(fix.Address)
+	port, _ := strconv.Atoi(portStr)
+	sockPath := filepath.Join(shortControlTempDir(t), "ask-daemon.sock")
+
+	cfg := newEmptyTestConfig()
+	cfg.Hosts.Set("h1", models.Host{Address: host, Port: uint16(port)})
+	cfg.Identities.Set("id1", models.Identity{User: "fixture", AuthType: "password", Password: sshfixture.Password})
+	cfg.Nodes.Set("ask-node", models.Node{
+		HostRef:     "h1",
+		IdentityRef: "id1",
+		SSHOptions: ssh.OptionsFromControl(&ssh.ControlConfig{
+			Master:  ssh.ControlMasterAsk,
+			Path:    sockPath,
+			Persist: "10m",
+		}),
+	})
+	provider := config.NewProviderWithoutOpenSSH(cfg)
+	adp := adapter.NewSSHAdapter(provider)
+	connector := ssh.NewConnector(adp, ssh.WithHostKeyVerifier(staticHostKeyTrust{}))
+	connector.AcceptNewHostKey.Store(true)
+	defer func() { _ = connector.CloseAll() }()
+
+	client, err := connector.Connect(ctx, "ask-node")
+	if err != nil {
+		t.Fatalf("Connect(ask-node) failed: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	liveAskMaster := ssh.GetActiveMuxServer(sockPath)
+	if liveAskMaster == nil {
+		t.Fatalf("expected active ask master on %q", sockPath)
+	}
+	if !canHandoffMaster(liveAskMaster) {
+		t.Fatal("expected canHandoffMaster(liveAskMaster) == true for ControlMaster=ask with ControlPersist=10m")
+	}
+	daemonArgs := sshOpts.muxDaemonArgs("ask-node", sockPath, liveAskMaster)
+	if !containsOptionArg(daemonArgs, "ControlMaster=ask") {
+		t.Fatalf("expected muxDaemonArgs to include '-o ControlMaster=ask', got %v", daemonArgs)
+	}
+
+	assertDetachedAskpassConfirmSession(t, ctx)
+}
+
+func assertAllowReuseControlFlags(t *testing.T) {
+	t.Helper()
+	flagsOnlyS := SSHControlFlags{ControlPath: "/tmp/test-reuse.sock"}
+	optsOnlyS, err := flagsOnlyS.ToSessionControlOptions()
+	if err != nil || !optsOnlyS.AllowReuse {
+		t.Fatalf("expected AllowReuse=true when only -S <path> is specified, got opts=%+v err=%v", optsOnlyS, err)
+	}
+
+	flagsMandS := SSHControlFlags{MasterCount: 1, ControlPath: "/tmp/test-reuse.sock"}
+	optsMandS, err := flagsMandS.ToSessionControlOptions()
+	if err != nil || optsMandS.AllowReuse {
+		t.Fatalf("expected AllowReuse=false when -M and -S are both specified, got opts=%+v err=%v", optsMandS, err)
+	}
+
+	flagsOptMasterAndS := SSHControlFlags{
+		ControlPath: "/tmp/test-reuse.sock",
+		Options:     []string{"ControlMaster=ask"},
+	}
+	optsOptMasterAndS, err := flagsOptMasterAndS.ToSessionControlOptions()
+	if err != nil || optsOptMasterAndS.AllowReuse {
+		t.Fatalf("expected AllowReuse=false when -o ControlMaster=ask and -S are both specified, got opts=%+v err=%v", optsOptMasterAndS, err)
+	}
+}
+
+func containsOptionArg(args []string, want string) bool {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "-o" && args[i+1] == want {
+			return true
+		}
+	}
+	return false
+}
+
+func assertDetachedAskpassConfirmSession(t *testing.T, ctx context.Context) {
+	t.Helper()
+	askpassDir := t.TempDir()
+	approveScript := filepath.Join(askpassDir, "approve.sh")
+	if err := os.WriteFile(approveScript, []byte("#!/bin/sh\nif [ \"$SSH_ASKPASS_PROMPT\" != \"confirm\" ]; then exit 2; fi\necho yes\n"), 0o700); err != nil {
+		t.Fatalf("write approve script: %v", err)
+	}
+	denyScript := filepath.Join(askpassDir, "deny.sh")
+	if err := os.WriteFile(denyScript, []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
+		t.Fatalf("write deny script: %v", err)
+	}
+
+	// Even when a terminal prompter with "yes\n" is attached (canRemember: true),
+	// ConfirmSession must delegate exclusively to SSH_ASKPASS and never fall back to stdin.
+	handler := newCLIInteractionHandlerWithStreams(strings.NewReader("yes\n"), os.Stderr)
+
+	t.Setenv("SSH_ASKPASS", approveScript)
+	t.Setenv("SSH_ASKPASS_REQUIRE", "force")
+	t.Setenv("DISPLAY", "")
+	t.Setenv("WAYLAND_DISPLAY", "")
+	if approved, err := handler.ConfirmSession(ctx, "new session"); err != nil || !approved {
+		t.Fatalf("expected ConfirmSession with SSH_ASKPASS_REQUIRE=force to return true, got approved=%v err=%v", approved, err)
+	}
+
+	t.Setenv("SSH_ASKPASS_REQUIRE", "prefer")
+	if approved, err := handler.ConfirmSession(ctx, "new session"); err != nil || !approved {
+		t.Fatalf("expected ConfirmSession with SSH_ASKPASS_REQUIRE=prefer to return true, got approved=%v err=%v", approved, err)
+	}
+
+	t.Setenv("SSH_ASKPASS_REQUIRE", "never")
+	t.Setenv("DISPLAY", ":0")
+	if approved, err := handler.ConfirmSession(ctx, "new session"); err != nil || approved {
+		t.Fatalf("expected ConfirmSession with SSH_ASKPASS_REQUIRE=never to reject without terminal fallback, got approved=%v err=%v", approved, err)
+	}
+
+	t.Setenv("SSH_ASKPASS_REQUIRE", "")
+	t.Setenv("DISPLAY", ":0")
+	if approved, err := handler.ConfirmSession(ctx, "new session"); err != nil || !approved {
+		t.Fatalf("expected ConfirmSession with DISPLAY=:0 and SSH_ASKPASS to return true, got approved=%v err=%v", approved, err)
+	}
+
+	t.Setenv("SSH_ASKPASS", denyScript)
+	if approved, err := handler.ConfirmSession(ctx, "new session"); err != nil || approved {
+		t.Fatalf("expected ConfirmSession with denying SSH_ASKPASS to reject without terminal fallback, got approved=%v err=%v", approved, err)
+	}
+
+	t.Setenv("SSH_ASKPASS", approveScript)
+	t.Setenv("SSH_ASKPASS_REQUIRE", "")
+	t.Setenv("DISPLAY", "")
+	t.Setenv("WAYLAND_DISPLAY", "")
+	if approved, err := handler.ConfirmSession(ctx, "new session"); err != nil || approved {
+		t.Fatalf("expected ConfirmSession without DISPLAY/WAYLAND_DISPLAY or force/prefer to fail closed without terminal fallback, got approved=%v err=%v", approved, err)
 	}
 }

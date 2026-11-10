@@ -20,20 +20,17 @@ import (
 // caller's context carries no deadline of its own.
 const DefaultMuxHandshakeTimeout = 10 * time.Second
 
-// bindConnContext bounds I/O on conn by the earlier of ctx.Deadline() and
-// defaultTimeout, and interrupts in-flight reads/writes immediately if ctx is
-// canceled even when ctx has no deadline.
+// bindConnContext bounds I/O on conn by ctx.Deadline() (or defaultTimeout when
+// ctx has no deadline), and interrupts in-flight reads/writes immediately if ctx
+// is canceled even when ctx has no deadline.
 func bindConnContext(ctx context.Context, conn net.Conn, defaultTimeout time.Duration) func() {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	deadline, hasDeadline := ctx.Deadline()
-	if defaultTimeout > 0 {
-		fallback := time.Now().Add(defaultTimeout)
-		if !hasDeadline || fallback.Before(deadline) {
-			deadline = fallback
-			hasDeadline = true
-		}
+	if !hasDeadline && defaultTimeout > 0 {
+		deadline = time.Now().Add(defaultTimeout)
+		hasDeadline = true
 	}
 	if hasDeadline {
 		_ = conn.SetDeadline(deadline)
@@ -329,7 +326,7 @@ func (m *MuxClient) OpenForward(ctx context.Context, req ForwardRequest) (uint32
 	m.ioMu.Lock()
 	defer m.ioMu.Unlock()
 
-	unbind := bindConnContext(ctx, m.conn, DefaultMuxHandshakeTimeout)
+	unbind := bindConnContext(ctx, m.conn, DefaultInteractionTimeout)
 	defer unbind()
 
 	reqID := m.nextID()
@@ -481,7 +478,7 @@ func DialMuxProxyStream(ctx context.Context, socketPath string, opts ...MuxClien
 		return nil, fmt.Errorf("dial control socket %q: %w", socketPath, err)
 	}
 
-	unbind := bindConnContext(ctx, conn, DefaultMuxHandshakeTimeout)
+	unbind := bindConnContext(ctx, conn, DefaultInteractionTimeout)
 	defer unbind()
 	fail := func(err error) (net.Conn, error) {
 		_ = conn.Close()

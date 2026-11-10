@@ -931,3 +931,47 @@ Host 192.168.1.100
 		t.Fatalf("unexpected ctrlDirect: %+v", ctrlDirect)
 	}
 }
+
+func TestResolveControl_AllowReuseWithConfiguredAsk(t *testing.T) {
+	t2 := &ssh.ControlConfig{
+		Master:  ssh.ControlMasterAsk,
+		Path:    "~/.ssh/cm-%C",
+		Persist: "10m",
+	}
+	provider := setupTestProvider(t, t2, nil, "")
+	adp := NewSSHAdapter(provider)
+
+	// 1. No -S flag on CLI: AllowReuse is false.
+	ctrlDefault, err := adp.ResolveControl("testnode", SessionControlOptions{})
+	if err != nil {
+		t.Fatalf("ResolveControl(default) failed: %v", err)
+	}
+	if ctrlDefault == nil || ctrlDefault.Master != ssh.ControlMasterAsk || ctrlDefault.AllowReuse {
+		t.Fatalf("expected Master=ask and AllowReuse=false when -S is not passed, got %+v", ctrlDefault)
+	}
+
+	// 2. Explicit -S <path> on CLI without -M or -o ControlMaster: AllowReuse is true.
+	var withS SessionControlOptions
+	withS.SetPath("/tmp/custom.sock")
+	withS.AllowReuse = true
+	ctrlWithS, err := adp.ResolveControl("testnode", withS)
+	if err != nil {
+		t.Fatalf("ResolveControl(withS) failed: %v", err)
+	}
+	if ctrlWithS == nil || ctrlWithS.Master != ssh.ControlMasterAsk || ctrlWithS.Path != "/tmp/custom.sock" || !ctrlWithS.AllowReuse {
+		t.Fatalf("expected Master=ask, Path=/tmp/custom.sock, AllowReuse=true when -S is passed alone, got %+v", ctrlWithS)
+	}
+
+	// 3. Explicit -M alongside -S: AllowReuse is false.
+	var withMandS SessionControlOptions
+	withMandS.SetMaster(ssh.ControlMasterAsk)
+	withMandS.SetPath("/tmp/custom.sock")
+	withMandS.AllowReuse = true
+	ctrlWithMandS, err := adp.ResolveControl("testnode", withMandS)
+	if err != nil {
+		t.Fatalf("ResolveControl(withMandS) failed: %v", err)
+	}
+	if ctrlWithMandS == nil || ctrlWithMandS.AllowReuse {
+		t.Fatalf("expected AllowReuse=false when Master is explicitly set in SessionControlOptions, got %+v", ctrlWithMandS)
+	}
+}

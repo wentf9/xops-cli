@@ -226,7 +226,7 @@ func DialControlProxy(ctx context.Context, socketPath string, target TargetConte
 		return nil, nil, fmt.Errorf("dial control socket %q: %w", socketPath, err)
 	}
 
-	unbind := bindConnContext(ctx, rawConn, DefaultMuxHandshakeTimeout)
+	unbind := bindConnContext(ctx, rawConn, DefaultInteractionTimeout)
 	defer unbind()
 
 	if err := checkPeerUID(rawConn, options.expectedUID); err != nil {

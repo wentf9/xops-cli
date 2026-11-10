@@ -660,6 +660,13 @@ func (s *MuxServer) handleExtInfo(conn net.Conn, reqID uint32, name string) erro
 // socket's owner: a master configured without a confirmer must stay stoppable,
 // and the 0600 socket plus the peer-UID check already bound who may send one.
 func (s *MuxServer) handleTerminate(conn net.Conn, reqID uint32) error {
+	if s.stoppedListening.CompareAndSwap(false, true) {
+		_ = s.listener.Close()
+		s.unlinkControlSocketFileIfOurs()
+		s.idleMu.Lock()
+		s.notifyIdleLocked()
+		s.idleMu.Unlock()
+	}
 	_ = sendOk(conn, reqID)
 	go func() {
 		time.Sleep(10 * time.Millisecond) // Allow response packet to flush
