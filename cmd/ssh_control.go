@@ -405,6 +405,9 @@ func executeProxy(
 	o *SshOptions,
 	streams controlStreams,
 ) error {
+	if err := o.validateForwardAndSessionFlags(); err != nil {
+		return controlError(streams.Stderr, err.Error())
+	}
 	if o.commandPlan == nil {
 		if err := o.prepareCommandPlan(); err != nil {
 			return controlError(streams.Stderr, err.Error())
@@ -420,6 +423,7 @@ func executeProxy(
 	}
 
 	cfg, muxOpts := buildControlProxyClientConfig(target, provider, nodeID, o)
+	o.effectiveSSHOptions = cfg.Options
 	if err := o.prepareControlProxyCommandPlan(cfg.Execution); err != nil {
 		return controlError(streams.Stderr, err.Error())
 	}
@@ -435,18 +439,40 @@ func executeProxy(
 	}
 	defer func() { _ = client.Close() }()
 
-	if o.NoCmd {
-		if waitErr := client.Wait(ctx); waitErr != nil && !errors.Is(waitErr, context.Canceled) {
-			return mapControlProxySessionError(streams.Stderr, waitErr)
-		}
-		return nil
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+
+	tunnels, tunnelErr := o.startTunnelsWithStderr(ctx, runCancel, client, streams.Stderr)
+	if tunnelErr != nil {
+		return controlError(streams.Stderr, tunnelErr.Error())
 	}
 
-	return mapControlProxySessionError(streams.Stderr, o.runControlProxySession(ctx, client, streams))
+	var sessionErr error
+	switch {
+	case o.StdioForward != "":
+		destHost, destPort, fwdErr := ssh.ParseStdioForward(o.StdioForward)
+		if fwdErr != nil {
+			_ = tunnels.Close()
+			return controlError(streams.Stderr, fwdErr.Error())
+		}
+		sessionErr = client.ForwardStdio(runCtx, destHost, destPort, streams.Stdin, streams.Stdout)
+	case o.NoCmd:
+		<-runCtx.Done()
+	default:
+		sessionErr = o.runControlProxySession(runCtx, client, streams)
+	}
+	closeErr := tunnels.Close()
+	if sessionErr != nil {
+		return mapControlProxySessionError(streams.Stderr, sessionErr)
+	}
+	if closeErr != nil {
+		return mapControlProxySessionError(streams.Stderr, fmt.Errorf("stop SSH tunnels failed: %w", closeErr))
+	}
+	return nil
 }
 
 func (o *SshOptions) prepareControlProxyCommandPlan(nodeExec *ssh.ExecutionConfig) error {
-	if o.NoCmd || o.Sudo || o.Command == "" || o.commandPlan != nil || (!o.execution.enabled() && !o.execution.noLoginSet) {
+	if o.NoCmd || o.StdioForward != "" || o.Sudo || o.Command == "" || o.commandPlan != nil || (!o.execution.enabled() && !o.execution.noLoginSet) {
 		return nil
 	}
 	plan, err := o.resolveCommandPlan(o.Command, nodeExec)
@@ -460,6 +486,16 @@ func (o *SshOptions) prepareControlProxyCommandPlan(nodeExec *ssh.ExecutionConfi
 func (o *SshOptions) runControlProxySession(ctx context.Context, client *ssh.Client, streams controlStreams) error {
 	if o.Command != "" || o.stdinScript {
 		return o.runCommandWithStreams(ctx, client, o.Command, streams.Stdin, streams.Stdout, streams.Stderr)
+	}
+	if !o.Sudo {
+		switch o.effectiveRequestTTY() {
+		case ssh.RequestTTYNo:
+			return o.runPipedShellWithStreams(ctx, client, streams.Stdin, streams.Stdout, streams.Stderr)
+		case ssh.RequestTTYForce:
+			if _, isTerm := isLocalTerminal(streams.Stdin); !isTerm {
+				return client.RunShellWithRemotePTY(ctx, streams.Stdin, streams.Stdout, streams.Stderr)
+			}
+		}
 	}
 	stdinFile, _ := streams.Stdin.(*os.File)
 	ioStreams := ssh.InteractiveIO{
@@ -540,7 +576,7 @@ func buildControlProxyClientConfig(
 func resolveControlProxyFallbackOptions(adp *adapter.SSHAdapter, host string, o *SshOptions) *ssh.Options {
 	var sessionCtrlOpts adapter.SessionControlOptions
 	if o != nil {
-		if parsed, err := o.control.ToSessionControlOptions(); err == nil {
+		if parsed, err := o.toSessionControlOptions(); err == nil {
 			sessionCtrlOpts = parsed
 		}
 	}
@@ -567,7 +603,7 @@ func buildControlProxyAdapterOptions(snapshot *config.Configuration, nodeID stri
 			OTP:        o.OTP,
 			ProxyJump:  o.JumpHost,
 		}
-		if parsed, ctrlErr := o.control.ToSessionControlOptions(); ctrlErr == nil {
+		if parsed, ctrlErr := o.toSessionControlOptions(); ctrlErr == nil {
 			sessionCtrlOpts = parsed
 		}
 	}
@@ -677,28 +713,48 @@ func executeInfo(ctx context.Context, socketPath string, infoType string, stream
 }
 
 func parseForwardRequestsFromOptions(o *SshOptions) ([]ssh.ForwardRequest, error) {
-	var reqs []ssh.ForwardRequest
+	sessionOpts, err := o.toSessionControlOptions()
+	if err != nil {
+		return nil, err
+	}
+	effOpts := sessionOpts.ToSSHOptions()
 
-	for _, lArg := range o.LocalForwards {
-		req, err := parseSingleForward(lArg, ssh.ForwardLocal)
-		if err != nil {
-			return nil, err
+	localSpecs, err := collectUniqueForwardSpecs(o.LocalForwards, effOpts.LocalForwards())
+	if err != nil {
+		return nil, err
+	}
+	remoteSpecs, err := collectUniqueForwardSpecs(o.RemoteForwards, effOpts.RemoteForwards())
+	if err != nil {
+		return nil, err
+	}
+	dynamicSpecs, err := collectUniqueDynamicSpecs(o.cliDynamicForwards(), effOpts.DynamicForwards())
+	if err != nil {
+		return nil, err
+	}
+
+	if clearAll, ok := effOpts.ClearAllForwardings(); ok && clearAll {
+		return nil, nil
+	}
+
+	reqs := make([]ssh.ForwardRequest, 0, len(localSpecs)+len(remoteSpecs)+len(dynamicSpecs))
+	for _, lSpec := range localSpecs {
+		req, parseErr := parseSingleForward(lSpec.String(), ssh.ForwardLocal)
+		if parseErr != nil {
+			return nil, parseErr
 		}
 		reqs = append(reqs, req)
 	}
-
-	for _, rArg := range o.RemoteForwards {
-		req, err := parseSingleForward(rArg, ssh.ForwardRemote)
-		if err != nil {
-			return nil, err
+	for _, rSpec := range remoteSpecs {
+		req, parseErr := parseSingleForward(rSpec.String(), ssh.ForwardRemote)
+		if parseErr != nil {
+			return nil, parseErr
 		}
 		reqs = append(reqs, req)
 	}
-
-	if o.DynamicForward != "" {
-		req, err := parseSingleDynamicForward(o.DynamicForward)
-		if err != nil {
-			return nil, err
+	for _, dSpec := range dynamicSpecs {
+		req, parseErr := parseSingleDynamicForward(dSpec)
+		if parseErr != nil {
+			return nil, parseErr
 		}
 		reqs = append(reqs, req)
 	}

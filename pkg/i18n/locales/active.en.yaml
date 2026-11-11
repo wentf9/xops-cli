@@ -79,6 +79,22 @@ flag_ssh_control_command:
   other: "Send control command to active master: check, exit, stop, forward, cancel, proxy, proxy-stream, conninfo, channels"
 ssh_err_background_requires_nocmd:
   other: "Background execution (-f) requires -N (no command) option"
+ssh_flag_stdio_forward:
+  other: "Forward standard input and output to host:port over the secure channel"
+ssh_flag_tunnel_device:
+  other: "Request tun/tap tunnel device forwarding (local_tun[:remote_tun])"
+ssh_flag_disable_tty:
+  other: "Disable pseudo-terminal allocation"
+ssh_flag_force_tty:
+  other: "Force pseudo-terminal allocation (-tt forces allocation even if local stdin is not a tty)"
+ssh_err_stdio_forward_with_cmd:
+  other: "cannot specify remote command with -W stdio forwarding"
+ssh_err_stdio_forward_with_bg:
+  other: "cannot fork into background (-f) with -W stdio forwarding"
+ssh_err_stdio_forward_with_sudo:
+  other: "cannot combine --sudo with -W stdio forwarding"
+ssh_err_stdio_forward_with_mux_cmd:
+  other: "cannot specify multiplexing command (-O) with -W stdio forwarding"
 prompt_enter_passphrase:
   other: "Enter passphrase for key '{{.Path}}': "
 prompt_enter_password:

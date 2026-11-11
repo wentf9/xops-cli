@@ -130,7 +130,7 @@ func normalizePlan(plan ConnectionPlan) (ConnectionPlan, error) {
 		}
 		hop.Execution = hop.Execution.Clone()
 		hop.Options = hop.Options.Clone()
-		hop.Options.StripClasses(OptionClassMux)
+		hop.Options.StripClasses(OptionClassMux, OptionClassForward, OptionClassSession)
 		if hop.Options.IsEmpty() {
 			hop.Options = nil
 		}
@@ -222,7 +222,7 @@ func (c *Connector) acquirePlan(key string, plan ConnectionPlan) (*planEntry, er
 
 func clientConfigFromPlan(cfg ConnectionConfig) ClientConfig {
 	opts := cfg.Options.Clone()
-	opts.StripClasses(OptionClassMux)
+	opts.StripClasses(OptionClassMux, OptionClassForward, OptionClassSession)
 	if opts.IsEmpty() {
 		opts = nil
 	}

@@ -46,6 +46,9 @@ xops ssh --host linux-01 --interpreter bash --launch-dialect posix --login-shell
 
 - **解释器选择**：默认使用远端 Shell；需要指定时，可选择 `server`、`bash`、`sh`、`zsh`、`fish`、`powershell`、`pwsh` 或 `cmd`。参数搭配见[命令执行](./exec#解释器选择与跨平台执行)。Windows、macOS 和 Linux 均可在终端中运行。
 - **登录环境控制**：使用 `bash`、`zsh` 或 `fish` 时可通过 `--login-shell` 控制是否加载登录环境；`--no-login` 为 Bash 兼容参数（等效于非登录 `bash -c`）；`server` 模式不接受登录选项。
+- **伪终端控制（PTY）**：
+  - `-T`（`--disable-tty`）：禁止为会话分配伪终端（对应 `-o RequestTTY=no`）。
+  - `-t`（`--force-tty`）：在本地输入为终端时强制为远程命令分配 PTY；多次指定（`-tt`）即使本地标准输入被重定向或非终端也强制请求远端分配 PTY（对应 `-o RequestTTY=no|yes|force|auto`）。命令行出现多个 `-T` 与 `-t` 时按最后出现的选项生效，显式 Flag 优先于 `-o RequestTTY` 选项。
 - **输入流与 Shell 路由**：
   - **终端无命令**：标准输入为终端且未传命令时，打开交互式 PTY 登录 Shell。
   - **管道脚本（如 `cat script.sh | xops ssh web-01`）**：默认由远端 Shell 读取并执行；若节点配置了 `bash`、`sh`、`zsh` 或 `fish`，则使用该解释器和节点的登录设置。
@@ -214,8 +217,26 @@ xops ssh -D 1080 -N web-01
 
 # 远程转发（-R）：将远端 127.0.0.1:9000 转发至本机 127.0.0.1:3000
 xops ssh -R 9000:127.0.0.1:3000 -N web-01
+
+# 标准输入输出转发（-W）：将 stdin/stdout 通过安全通道转发至目标 host:port（常用作 ProxyCommand 跳板）
+xops ssh -W 192.0.2.20:22 bastion
+
+# 隧道设备转发（-w）：建立点对点 (tun) 虚拟网卡隧道（需服务端开启 PermitTunnel）
+xops ssh -w 0:0 -N gw
+
+# 二层以太网 (tap) 隧道转发（须在 -w 之前指定 -o Tunnel=ethernet）
+xops ssh -o Tunnel=ethernet -w 1:any -N gw
 ```
 
 - **绑定与校验时机**：`-L` 和 `-D` 在本地端口收到连接时才按需打开 SSH 通道；`-R` 在启动时立即向服务器申请远端监听（建立与关闭各有 10 秒超时上限），若被服务器拒绝则立即报错退出。
+- **标准输入输出转发 (`-W host:port` / `--stdio-forward`)**：
+  - 将客户端 `stdin`/`stdout` 通过 SSH `direct-tcpip` 安全通道转发至远端可访问的 `host:port`（如配合原生 `ssh -o ProxyCommand="xops ssh -W %h:%p bastion" target` 作为跳板通道）。
+  - 默认隐含 `-N`（不执行远程命令）、`-T`（禁止分配 PTY）、`ExitOnForwardFailure=yes` 与 `ClearAllForwardings=yes`（可通过配置文件或 `-o` 显式覆盖，例如 `-o ClearAllForwardings=no`、`-o ExitOnForwardFailure=no`）。
+  - `-W` 转发为专用纯净二进制流通道，不可与远程命令、`-f` 后台运行、`--sudo` 或 `-O` 多路复用控制命令（`-O proxy` 除外）同时使用。
+- **隧道设备转发 (`-w local_tun[:remote_tun]` / `--tunnel-device`)**：
+  - 建立客户端与服务端（需 `sshd` 开启 `PermitTunnel`）之间的三层（`point-to-point`）或二层（`ethernet`）虚拟网卡隧道。
+  - 单元号可为非负整数或 `any`（由系统自动分配空闲设备），省略 `:remote_tun` 时默认为 `any`（例如 `-w 0` 等价于 `-w 0:any`）。
+  - **模式与顺序规则**：若未提前指定 `Tunnel` 指令，默认采用 `point-to-point` 模式；如需 `ethernet` 二层模式，需在 `-w` **之前**指定 `-o Tunnel=ethernet`（例如 `xops ssh -o Tunnel=ethernet -w 0:0 gw`）。
+  - **平台支持说明**：Linux 原生支持 `tun` (`point-to-point`) 与 `tap` (`ethernet`)；macOS 原生支持 `utun` (`point-to-point`)；Windows 暂不支持本地内核虚拟网卡创建（配置项与 `-o` 解析仍全平台可用）。
 - **单连接故障隔离**：单次转发连接失败（如 `administratively prohibited` 或目标端口未监听）通过受控队列提示到 `stderr`，但不会中断主 SSH 会话或转发监听器。`-N` 就绪提示仍写 stdout。堵塞输出不会卡住转发回调，输出失败在结束时作为错误返回；不支持的管道可能略过辅助提示，可将对应输出流重定向到普通文件。
-- **连接保活与断开退出**：使用 `-L`、`-R`、`-D` 或 `-N` 时自动启用连接监测——连续 15 秒无远端数据时发送 SSH 心跳，等待期间若连续 10 秒既无心跳回复也无数据进展则判定断线，自动关闭本地监听端口并以非零状态退出。后台运行可组合 `-f -N`。
+- **连接保活与断开退出**：使用 `-L`、`-R`、`-D`、`-w` 或 `-N` 时自动启用连接监测——连续 15 秒无远端数据时发送 SSH 心跳，等待期间若连续 10 秒既无心跳回复也无数据进展则判定断线，自动关闭本地监听端口并以非零状态退出。后台运行可组合 `-f -N`。

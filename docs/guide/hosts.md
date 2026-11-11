@@ -166,6 +166,25 @@ nodes:
 
 **生效优先级**：CLI `-M`/`-S`/`-o` > 节点配置 (`node.ssh_options`) > 全局配置 (`cfg.ssh_options`) > `~/.ssh/config`（其中 `StrictHostKeyChecking` 与 `UserKnownHostsFile` 等主机信任选项仅从 CLI `-o` 或 `xops_config.yaml` 显式配置中读取，不从 `~/.ssh/config` 隐式继承）。
 
+### 常用选项与端口转发/隧道选项
+
+| 选项名 (`snake_case`) | OpenSSH 名称 (`PascalCase`) | 适用值与格式 | 说明 |
+| --- | --- | --- | --- |
+| `control_master` | `ControlMaster` | `auto` / `yes` / `no` / `ask` / `autoask` | 连接多路复用主连接模式 |
+| `control_path` | `ControlPath` | 路径字符串（如 `~/.ssh/cm-%C`）或 `none` | 多路复用控制套接字路径 |
+| `control_persist` | `ControlPersist` | `no` / `yes` / 时间跨度（如 `10m`、`1h`） | 主连接空闲保活与后台驻留时间 |
+| `connect_timeout` | `ConnectTimeout` | 时间跨度（如 `15s`） | 连接与握手超时时间 |
+| `server_alive_interval` | `ServerAliveInterval` | 时间跨度（如 `30s`） | 客户端向服务器发送保活心跳的间隔 |
+| `strict_host_key_checking` | `StrictHostKeyChecking` | `yes` / `no` / `ask` / `accept-new` / `off` | 远端主机公钥严格检查策略 |
+| `exit_on_forward_failure` | `ExitOnForwardFailure` | `yes` / `no` | 端口转发或隧道建立失败时是否立即退出会话 |
+| `clear_all_forwardings` | `ClearAllForwardings` | `yes` / `no` | 是否清除所有配置文件或命令行中此前声明的转发规则 |
+| `tunnel` | `Tunnel` | `yes` / `point-to-point` / `ethernet` / `no` | 请求虚拟网卡隧道转发（`yes` 等价于 `point-to-point`） |
+| `tunnel_device` | `TunnelDevice` | `local_tun[:remote_tun]`（如 `0:0`, `any:any`） | 指定本地与远程 tun/tap 设备单元号 |
+| `request_tty` | `RequestTTY` | `no` / `yes` / `force` / `auto` | 伪终端 (PTY) 分配策略 |
+| `local_forward` | `LocalForward` | 字符串或字符串数组 | 本地端口转发；支持 `"[bind_address:]port host:hostport"` 或 `"[bind_address:]port:host:hostport"` |
+| `remote_forward` | `RemoteForward` | 字符串或字符串数组 | 远程端口转发；格式同 `local_forward` |
+| `dynamic_forward` | `DynamicForward` | 字符串或字符串数组 | 动态应用级 SOCKS5 转发；格式为 `"[bind_address:]port"` |
+
 ## 已删除的凭据参数
 
 `host add|edit` 和 `identity add|edit` 已移除明文参数 `--password`、`--key-pass` 及其短参数，避免密码泄露在命令行参数和 Shell 历史中；旧命令 `loadHost` 也已移除（请改用 `xops host import`）。

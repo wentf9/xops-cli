@@ -79,6 +79,22 @@ flag_ssh_control_command:
   other: "向运行中的主进程发送控制命令：check, exit, stop, forward, cancel, proxy, proxy-stream, conninfo, channels"
 ssh_err_background_requires_nocmd:
   other: "后台执行 (-f) 必须与 -N (不执行远程命令) 选项配合使用"
+ssh_flag_stdio_forward:
+  other: "将标准输入输出通过安全通道转发至 host:port"
+ssh_flag_tunnel_device:
+  other: "请求 tun/tap 隧道设备转发 (local_tun[:remote_tun])"
+ssh_flag_disable_tty:
+  other: "禁止分配伪终端 (PTY)"
+ssh_flag_force_tty:
+  other: "强制分配伪终端 (指定 -tt 时即使本地标准输入非终端也强制分配)"
+ssh_err_stdio_forward_with_cmd:
+  other: "使用 -W 标准输入输出转发时不能同时指定远程命令"
+ssh_err_stdio_forward_with_bg:
+  other: "使用 -W 标准输入输出转发时不能使用 -f 后台模式"
+ssh_err_stdio_forward_with_sudo:
+  other: "使用 -W 标准输入输出转发时不能同时启用 --sudo"
+ssh_err_stdio_forward_with_mux_cmd:
+  other: "使用 -W 标准输入输出转发时不能同时指定多路复用控制命令 (-O)"
 prompt_enter_passphrase:
   other: "请输入密钥 {{.Path}} 的密码: "
 prompt_enter_password:

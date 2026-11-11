@@ -40,24 +40,33 @@ var validControlCommands = map[string]bool{
 
 // SSHControlFlags encapsulates OpenSSH-compatible multiplexing and session control flags.
 type SSHControlFlags struct {
-	MasterCount int      // -M count: 1 -> ControlMaster=yes, >=2 -> ControlMaster=ask
-	ControlPath string   // -S <path> or "none"
-	CtlCmd      string   // -O <command>
-	Options     []string // -o Key=Value options
+	MasterCount   int      // -M count: 1 -> ControlMaster=yes, >=2 -> ControlMaster=ask
+	ControlPath   string   // -S <path> or "none"
+	CtlCmd        string   // -O <command>
+	Options       []string // -o Key=Value options
+	onOptionAdded func(string)
 }
 
 // RegisterSSHFlags registers -M, -S, -o, -O flags for xops ssh.
 func (f *SSHControlFlags) RegisterSSHFlags(cmd *cobra.Command) {
 	cmd.Flags().CountVarP(&f.MasterCount, "master", "M", i18n.T("flag_ssh_master"))
 	cmd.Flags().StringVarP(&f.ControlPath, "control-path", "S", "", i18n.T("flag_ssh_control_path"))
-	cmd.Flags().StringArrayVarP(&f.Options, "option", "o", nil, i18n.T("flag_ssh_option"))
+	cmd.Flags().VarP(newOptionArrayFlagValue(&f.Options, func(val string) {
+		if f.onOptionAdded != nil {
+			f.onOptionAdded(val)
+		}
+	}), "option", "o", i18n.T("flag_ssh_option"))
 	cmd.Flags().StringVarP(&f.CtlCmd, "control-command", "O", "", i18n.T("flag_ssh_control_command"))
 }
 
 // RegisterCommonFlags registers -S and -o flags for scp, sftp, and exec.
 func (f *SSHControlFlags) RegisterCommonFlags(cmd *cobra.Command) {
 	cmd.Flags().StringVarP(&f.ControlPath, "control-path", "S", "", i18n.T("flag_ssh_control_path"))
-	cmd.Flags().StringArrayVarP(&f.Options, "option", "o", nil, i18n.T("flag_ssh_option"))
+	cmd.Flags().VarP(newOptionArrayFlagValue(&f.Options, func(val string) {
+		if f.onOptionAdded != nil {
+			f.onOptionAdded(val)
+		}
+	}), "option", "o", i18n.T("flag_ssh_option"))
 }
 
 // ToSessionControlOptions converts SSHControlFlags into adapter.SessionControlOptions.
@@ -180,7 +189,7 @@ func controlSocketPath(opts *SshOptions, provider config.ConfigProvider, nodeID 
 	if err := opts.ensureGeneralOptionsApplied(); err != nil {
 		return "", err
 	}
-	sessionOpts, err := opts.control.ToSessionControlOptions()
+	sessionOpts, err := opts.toSessionControlOptions()
 	if err != nil {
 		return "", err
 	}
@@ -335,18 +344,15 @@ func targetContextFromResolvedTarget(resolved config.ResolvedTarget) ssh.TargetC
 // if they were not already explicitly set via primary CLI flags.
 func ApplyGeneralOptions(opts *SshOptions, optionStrings []string, flags *pflag.FlagSet) error {
 	for _, opt := range optionStrings {
-		opt = strings.TrimSpace(opt)
-		if opt == "" {
+		key, val, err := adapter.SplitOptionKeyValue(opt)
+		if err != nil {
+			return err
+		}
+		if key == "" {
 			continue
 		}
-		key, val, ok := strings.Cut(opt, "=")
-		if !ok {
-			return fmt.Errorf("invalid -o option format (expected Key=Value): %q", opt)
-		}
-		key = strings.ToLower(strings.TrimSpace(key))
-		val = strings.TrimSpace(val)
 
-		switch key {
+		switch strings.ToLower(key) {
 		case "port":
 			p, err := strconv.ParseUint(val, 10, 16)
 			if err != nil || p == 0 {
@@ -356,14 +362,23 @@ func ApplyGeneralOptions(opts *SshOptions, optionStrings []string, flags *pflag.
 				opts.Port = uint16(p)
 			}
 		case "user":
+			if val == "" {
+				return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
+			}
 			if shouldApplyGeneralOption(flags, "login", opts.User == "") {
 				opts.User = val
 			}
 		case "identityfile":
+			if val == "" {
+				return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
+			}
 			if shouldApplyGeneralOption(flags, "identity", opts.IdentityFile == "") {
 				opts.IdentityFile = val
 			}
 		case "proxyjump":
+			if val == "" {
+				return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
+			}
 			if shouldApplyGeneralOption(flags, "jump", opts.JumpHost == "") {
 				opts.JumpHost = val
 			}

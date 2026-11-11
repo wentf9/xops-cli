@@ -38,6 +38,14 @@ const (
 	OptionCiphers                      = "ciphers"
 	OptionMACs                         = "macs"
 	OptionKexAlgorithms                = "kex_algorithms"
+	OptionExitOnForwardFailure         = "exit_on_forward_failure"
+	OptionClearAllForwardings          = "clear_all_forwardings"
+	OptionTunnel                       = "tunnel"
+	OptionTunnelDevice                 = "tunnel_device"
+	OptionRequestTTY                   = "request_tty"
+	OptionLocalForward                 = "local_forward"
+	OptionRemoteForward                = "remote_forward"
+	OptionDynamicForward               = "dynamic_forward"
 )
 
 // OptionClass categorizes OpenSSH options by security and functional domain.
@@ -48,6 +56,8 @@ const (
 	OptionClassTransport OptionClass = "transport"
 	OptionClassAuth      OptionClass = "auth"
 	OptionClassTrust     OptionClass = "trust"
+	OptionClassForward   OptionClass = "forward"
+	OptionClassSession   OptionClass = "session"
 )
 
 // StrictHostKeyCheckingMode defines OpenSSH StrictHostKeyChecking values.
@@ -65,6 +75,7 @@ type OptionSpec struct {
 	Class        OptionClass // Functional/security category
 	Aliases      []string    // Accepted aliases (e.g. "ChallengeResponseAuthentication")
 	AllowList    bool        // Whether YAML sequence values are accepted and joined with ","
+	MultiValue   bool        // Whether multiple directives accumulate (newline-delimited internally, YAML/JSON array externally)
 	Normalize    func(raw string) (string, error)
 }
 
@@ -271,6 +282,91 @@ var optionRegistry = []OptionSpec{
 				defaults,
 				cryptoSSH.InsecureAlgorithms().KeyExchanges,
 			))
+		},
+	},
+	{
+		CanonicalKey: OptionExitOnForwardFailure,
+		OpenSSHName:  "ExitOnForwardFailure",
+		Class:        OptionClassForward,
+		Normalize: func(raw string) (string, error) {
+			return normalizeYesNoOption("ExitOnForwardFailure", raw)
+		},
+	},
+	{
+		CanonicalKey: OptionClearAllForwardings,
+		OpenSSHName:  "ClearAllForwardings",
+		Class:        OptionClassForward,
+		Normalize: func(raw string) (string, error) {
+			return normalizeYesNoOption("ClearAllForwardings", raw)
+		},
+	},
+	{
+		CanonicalKey: OptionTunnel,
+		OpenSSHName:  "Tunnel",
+		Class:        OptionClassForward,
+		Normalize:    ParseTunnelOption,
+	},
+	{
+		CanonicalKey: OptionTunnelDevice,
+		OpenSSHName:  "TunnelDevice",
+		Class:        OptionClassForward,
+		Normalize: func(raw string) (string, error) {
+			spec, err := ParseTunnelDevice(raw)
+			if err != nil {
+				return "", err
+			}
+			return spec.String(), nil
+		},
+	},
+	{
+		CanonicalKey: OptionRequestTTY,
+		OpenSSHName:  "RequestTTY",
+		Class:        OptionClassSession,
+		Normalize: func(raw string) (string, error) {
+			mode, err := ParseRequestTTYMode(raw)
+			if err != nil {
+				return "", err
+			}
+			return string(mode), nil
+		},
+	},
+	{
+		CanonicalKey: OptionLocalForward,
+		OpenSSHName:  "LocalForward",
+		Class:        OptionClassForward,
+		MultiValue:   true,
+		Normalize: func(raw string) (string, error) {
+			return normalizeMultiForwardEntries("LocalForward", raw, func(item string) (string, error) {
+				spec, err := ParseForwardSpec(item)
+				if err != nil {
+					return "", err
+				}
+				return spec.String(), nil
+			})
+		},
+	},
+	{
+		CanonicalKey: OptionRemoteForward,
+		OpenSSHName:  "RemoteForward",
+		Class:        OptionClassForward,
+		MultiValue:   true,
+		Normalize: func(raw string) (string, error) {
+			return normalizeMultiForwardEntries("RemoteForward", raw, func(item string) (string, error) {
+				spec, err := ParseForwardSpec(item)
+				if err != nil {
+					return "", err
+				}
+				return spec.String(), nil
+			})
+		},
+	},
+	{
+		CanonicalKey: OptionDynamicForward,
+		OpenSSHName:  "DynamicForward",
+		Class:        OptionClassForward,
+		MultiValue:   true,
+		Normalize: func(raw string) (string, error) {
+			return normalizeMultiForwardEntries("DynamicForward", raw, ParseDynamicForwardSpec)
 		},
 	},
 }
@@ -1046,6 +1142,11 @@ func MergeOptionLayers(layers ...*Options) *Options {
 			hasImplicitTier4 = true
 		}
 		for k, v := range layer.values {
+			spec, ok := LookupOptionSpec(k)
+			if ok && spec.MultiValue {
+				res.appendNormalizedRaw(spec.CanonicalKey, v)
+				continue
+			}
 			if _, exists := res.values[k]; !exists {
 				res.setRaw(k, v)
 			}
@@ -1096,6 +1197,19 @@ func (o Options) MarshalYAML() (any, error) {
 		if !ok || val == "" {
 			continue
 		}
+		if spec.MultiValue {
+			seq := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+			for item := range strings.SplitSeq(val, "\n") {
+				if item != "" {
+					seq.Content = append(seq.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: item})
+				}
+			}
+			node.Content = append(node.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: spec.CanonicalKey},
+				seq,
+			)
+			continue
+		}
 		node.Content = append(node.Content,
 			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: spec.CanonicalKey},
 			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: val},
@@ -1130,6 +1244,10 @@ func (o *Options) UnmarshalYAML(value *yaml.Node) error {
 		}
 		seen[spec.CanonicalKey] = rawKey
 
+		if spec.MultiValue && valNode != nil && valNode.Kind == yaml.SequenceNode && len(valNode.Content) == 0 {
+			continue
+		}
+
 		rawVal, err := extractYAMLOptionValue(spec, valNode)
 		if err != nil {
 			return fmt.Errorf("%w: option %q: %w", ErrSSHOptionsValidation, rawKey, err)
@@ -1156,7 +1274,7 @@ func extractYAMLOptionValue(spec OptionSpec, valNode *yaml.Node) (string, error)
 	case yaml.ScalarNode:
 		return valNode.Value, nil
 	case yaml.SequenceNode:
-		if !spec.AllowList {
+		if !spec.AllowList && !spec.MultiValue {
 			return "", fmt.Errorf("%s does not accept a list value", spec.OpenSSHName)
 		}
 		var items []string
@@ -1165,6 +1283,9 @@ func extractYAMLOptionValue(spec OptionSpec, valNode *yaml.Node) (string, error)
 				return "", fmt.Errorf("%s list elements must be scalar strings", spec.OpenSSHName)
 			}
 			items = append(items, elem.Value)
+		}
+		if spec.MultiValue {
+			return strings.Join(items, "\n"), nil
 		}
 		return strings.Join(items, ","), nil
 	default:
@@ -1190,7 +1311,12 @@ func (o Options) MarshalJSON() ([]byte, error) {
 		}
 		first = false
 		keyBytes, _ := json.Marshal(spec.CanonicalKey)
-		valBytes, _ := json.Marshal(val)
+		var valBytes []byte
+		if spec.MultiValue {
+			valBytes, _ = json.Marshal(strings.Split(val, "\n"))
+		} else {
+			valBytes, _ = json.Marshal(val)
+		}
 		buf.Write(keyBytes)
 		buf.WriteByte(':')
 		buf.Write(valBytes)
@@ -1220,6 +1346,16 @@ func (o *Options) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("%w: duplicate ssh option %q (conflicts with %q)", ErrSSHOptionsValidation, rawKey, prevKey)
 		}
 		seen[spec.CanonicalKey] = rawKey
+
+		if spec.MultiValue {
+			trimmedMsg := bytes.TrimSpace(rawMsg)
+			if len(trimmedMsg) > 0 && trimmedMsg[0] == '[' {
+				var listVal []string
+				if json.Unmarshal(trimmedMsg, &listVal) == nil && len(listVal) == 0 {
+					continue
+				}
+			}
+		}
 
 		rawVal, err := extractJSONOptionValue(spec, rawMsg)
 		if err != nil {
@@ -1254,9 +1390,12 @@ func extractJSONOptionValue(spec OptionSpec, rawMsg json.RawMessage) (string, er
 	if err := json.Unmarshal(rawMsg, &intVal); err == nil {
 		return strconv.FormatInt(intVal, 10), nil
 	}
-	if spec.AllowList {
+	if spec.AllowList || spec.MultiValue {
 		var listVal []string
 		if err := json.Unmarshal(rawMsg, &listVal); err == nil {
+			if spec.MultiValue {
+				return strings.Join(listVal, "\n"), nil
+			}
 			return strings.Join(listVal, ","), nil
 		}
 	}

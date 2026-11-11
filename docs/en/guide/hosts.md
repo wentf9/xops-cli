@@ -166,6 +166,25 @@ nodes:
 
 **Configuration precedence**: CLI `-M`/`-S`/`-o` > Node configuration (`node.ssh_options`) > Global configuration (`cfg.ssh_options`) > `~/.ssh/config` (host-trust options such as `StrictHostKeyChecking` and `UserKnownHostsFile` are read only from explicit CLI `-o` flags or `xops_config.yaml`, never implicitly inherited from `~/.ssh/config`).
 
+### Supported options and forwarding/tunnel options
+
+| Option (`snake_case`) | OpenSSH Name (`PascalCase`) | Accepted values and format | Description |
+| --- | --- | --- | --- |
+| `control_master` | `ControlMaster` | `auto` / `yes` / `no` / `ask` / `autoask` | Multiplexing master connection mode |
+| `control_path` | `ControlPath` | Path string (e.g. `~/.ssh/cm-%C`) or `none` | Control socket path for connection sharing |
+| `control_persist` | `ControlPersist` | `no` / `yes` / duration (e.g. `10m`, `1h`) | Master connection idle persistence and background daemon lifetime |
+| `connect_timeout` | `ConnectTimeout` | Duration (e.g. `15s`) | Connection and handshake timeout |
+| `server_alive_interval` | `ServerAliveInterval` | Duration (e.g. `30s`) | Keepalive heartbeat interval sent to the server |
+| `strict_host_key_checking` | `StrictHostKeyChecking` | `yes` / `no` / `ask` / `accept-new` / `off` | Remote host key verification policy |
+| `exit_on_forward_failure` | `ExitOnForwardFailure` | `yes` / `no` | Whether to terminate the session immediately if any port forwarding or tunnel setup fails |
+| `clear_all_forwardings` | `ClearAllForwardings` | `yes` / `no` | Whether to clear all port and tunnel device forwardings previously declared in config files or command lines |
+| `tunnel` | `Tunnel` | `yes` / `point-to-point` / `ethernet` / `no` | Request tun/tap device forwarding (`yes` maps to `point-to-point`) |
+| `tunnel_device` | `TunnelDevice` | `local_tun[:remote_tun]` (e.g. `0:0`, `any:any`) | Specifies local and remote tun/tap interface unit numbers |
+| `request_tty` | `RequestTTY` | `no` / `yes` / `force` / `auto` | Pseudo-terminal (PTY) allocation policy |
+| `local_forward` | `LocalForward` | String or array of strings | Local port forwarding; supports `"[bind_address:]port host:hostport"` or `"[bind_address:]port:host:hostport"` |
+| `remote_forward` | `RemoteForward` | String or array of strings | Remote port forwarding; same format as `local_forward` |
+| `dynamic_forward` | `DynamicForward` | String or array of strings | Dynamic application-level SOCKS5 forwarding; format `"[bind_address:]port"` |
+
 ## Removed credential arguments
 
 Plaintext flags `--password` and `--key-pass` (and their short forms) have been removed from `host add|edit` and `identity add|edit` to keep secrets out of command arguments and shell history; the legacy `loadHost` command has also been removed (use `xops host import`).

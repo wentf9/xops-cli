@@ -838,6 +838,164 @@ func TestControl_Proxy_DeferredInterpreterValidationBeforeDial(t *testing.T) {
 	}
 }
 
+func TestControl_Proxy_StdioForward(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	sockPath, targetAddr := setupControlProxySessionFixture(ctx, t)
+
+	bannerLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen for bannerLn failed: %v", err)
+	}
+	defer func() { _ = bannerLn.Close() }()
+	bannerAddr := bannerLn.Addr().String()
+
+	go func() {
+		for {
+			conn, bErr := bannerLn.Accept()
+			if bErr != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				_, _ = io.WriteString(c, "BANNER_FROM_DEST\n")
+			}(conn)
+		}
+	}()
+
+	stdout, stderr, err := runControlProxyTestCommandWithStdin(
+		ctx, t,
+		[]string{"-O", "proxy", "-S", sockPath, "-W", bannerAddr, targetAddr},
+		strings.NewReader(""),
+		false,
+	)
+	if err != nil {
+		t.Fatalf("-O proxy -W failed: %v, stderr: %q", err, stderr)
+	}
+	if !strings.Contains(stdout, "BANNER_FROM_DEST\n") {
+		t.Fatalf("expected banner in stdout, got: %q", stdout)
+	}
+}
+
+func TestControl_Proxy_LocalForwardLifecycleAndTeardown(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	sockPath, targetAddr := setupControlProxySessionFixture(ctx, t)
+
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen for backend failed: %v", err)
+	}
+	defer func() { _ = backendLn.Close() }()
+	backendAddr := backendLn.Addr().String()
+
+	go func() {
+		for {
+			conn, acceptErr := backendLn.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				_, _ = io.Copy(c, c)
+			}(conn)
+		}
+	}()
+
+	// 1. Verify -O proxy with -L <fwdAddr>:<backend> -N starts local forward listener
+	// over control proxy session, successfully proxies traffic, and tears down cleanly when ctx is canceled.
+	freeLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen for free port failed: %v", err)
+	}
+	fwdPort := freeLn.Addr().(*net.TCPAddr).Port
+	_ = freeLn.Close()
+	localFwdSpec := fmt.Sprintf("127.0.0.1:%d:%s", fwdPort, backendAddr)
+	localFwdAddr := fmt.Sprintf("127.0.0.1:%d", fwdPort)
+
+	proxyCtx, proxyCancel := context.WithCancel(ctx)
+	defer proxyCancel()
+
+	type proxyResult struct {
+		stdout string
+		stderr string
+		err    error
+	}
+	resCh := make(chan proxyResult, 1)
+	go func() {
+		out, serr, pErr := runControlProxyTestCommand(
+			proxyCtx, t,
+			[]string{"-O", "proxy", "-S", sockPath, "-L", localFwdSpec, "-N", targetAddr},
+		)
+		resCh <- proxyResult{stdout: out, stderr: serr, err: pErr}
+	}()
+
+	var fwdConn net.Conn
+	dialDeadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(dialDeadline) {
+		c, dErr := net.DialTimeout("tcp", localFwdAddr, 100*time.Millisecond)
+		if dErr == nil {
+			fwdConn = c
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if fwdConn == nil {
+		t.Fatalf("failed to connect to local forward listener at %s", localFwdAddr)
+	}
+	defer func() { _ = fwdConn.Close() }()
+
+	payload := []byte("ping local forward over proxy\n")
+	if _, err := fwdConn.Write(payload); err != nil {
+		t.Fatalf("write to fwdConn failed: %v", err)
+	}
+	reply := make([]byte, len(payload))
+	if _, err := io.ReadFull(fwdConn, reply); err != nil {
+		t.Fatalf("read from fwdConn failed: %v", err)
+	}
+	if string(reply) != string(payload) {
+		t.Fatalf("got reply %q, want %q", string(reply), string(payload))
+	}
+	_ = fwdConn.Close()
+
+	// Cancel proxyCtx and ensure clean teardown.
+	proxyCancel()
+
+	select {
+	case res := <-resCh:
+		if res.err != nil {
+			t.Fatalf("expected nil error on clean teardown, got: %v (stderr: %q)", res.err, res.stderr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for proxy tunnel session to tear down after ctx cancel")
+	}
+
+	// 2. Verify -O proxy with -L 127.0.0.1:0:<backend> -N starts ephemeral listener and tears down cleanly.
+	proxyCtx0, proxyCancel0 := context.WithCancel(ctx)
+	resCh0 := make(chan proxyResult, 1)
+	go func() {
+		out, serr, pErr := runControlProxyTestCommand(
+			proxyCtx0, t,
+			[]string{"-O", "proxy", "-S", sockPath, "-L", "127.0.0.1:0:" + backendAddr, "-N", targetAddr},
+		)
+		resCh0 <- proxyResult{stdout: out, stderr: serr, err: pErr}
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	proxyCancel0()
+
+	select {
+	case res := <-resCh0:
+		if res.err != nil {
+			t.Fatalf("expected nil error on clean teardown of :0 forward, got: %v (stderr: %q)", res.err, res.stderr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for proxy :0 tunnel session to tear down after ctx cancel")
+	}
+}
+
 func TestProgrammaticGeneralOptions_AppliedWithoutComplete(t *testing.T) {
 	// 1. Programmatic SshOptions (without Complete) applies -o Port/User/IdentityFile/ProxyJump,
 	// while explicit struct fields take precedence over -o options.

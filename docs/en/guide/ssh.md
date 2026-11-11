@@ -46,6 +46,9 @@ xops ssh --host linux-01 --interpreter bash --launch-dialect posix --login-shell
 
 - **Interpreter selection**: Uses the remote shell by default. To choose an interpreter, use `server`, `bash`, `sh`, `zsh`, `fish`, `powershell`, `pwsh`, or `cmd`. See [Command execution](./exec#interpreters-and-cross-platform-execution) for flag combinations. Terminal use is supported on Windows, macOS, and Linux.
 - **Login environment**: `bash`, `zsh`, and `fish` support `--login-shell`; `--no-login` remains a Bash compatibility flag (non-login `bash -c`); `server` mode rejects login flags.
+- **Pseudo-terminal (PTY) control**:
+  - `-T` (`--disable-tty`): Disables pseudo-terminal allocation for the session (equivalent to `-o RequestTTY=no`).
+  - `-t` (`--force-tty`): Forces PTY allocation for remote commands when local input is a terminal; specifying multiple times (`-tt`) forces remote PTY allocation even if local stdin is redirected or not a terminal (equivalent to `-o RequestTTY=no|yes|force|auto`). When multiple `-T` and `-t` flags appear on the command line, the last flag takes precedence, and explicit flags override `-o RequestTTY`.
 - **Input and shell routing**:
   - **Terminal with no command**: Opens an interactive PTY login shell.
   - **Piped script with no command (e.g. `cat script.sh | xops ssh web-01`)**: The remote shell reads and runs the script by default. If the node specifies `bash`, `sh`, `zsh`, or `fish`, that interpreter and the node's login settings are used instead.
@@ -214,8 +217,33 @@ xops ssh -D 1080 -N web-01
 
 # Remote forward (-R): forward remote 127.0.0.1:9000 to local 127.0.0.1:3000
 xops ssh -R 9000:127.0.0.1:3000 -N web-01
+
+# Standard I/O forward (-W): forward stdin/stdout over a secure channel to host:port (commonly used with ProxyCommand)
+xops ssh -W 192.0.2.20:22 bastion
+
+# Tunnel device forward (-w): create a point-to-point (tun) virtual network interface tunnel (requires PermitTunnel on the server)
+xops ssh -w 0:0 -N gw
+
+# Layer 2 Ethernet (tap) tunnel forwarding (-o Tunnel=ethernet must precede -w)
+xops ssh -o Tunnel=ethernet -w 1:any -N gw
 ```
 
 - **Binding and verification timing**: `-L` and `-D` open SSH channels on demand when local connections arrive; `-R` requests remote listening immediately at startup (with independent 10-second setup and teardown deadlines) and exits with an error if the server refuses.
+- **Standard I/O forwarding (`-W host:port` / `--stdio-forward`)**:
+  - Forwards the client's `stdin`/`stdout` over a secure SSH `direct-tcpip` channel to `host:port` reachable from the remote server. Commonly used as a jump proxy command with native OpenSSH in `~/.ssh/config`:
+    ```sshconfig
+    Host internal-host
+        ProxyCommand xops ssh -W %h:%p bastion
+    ```
+  - Implicitly enables `-N` (no remote command), `-T` (no PTY), `ExitOnForwardFailure=yes`, and `ClearAllForwardings=yes` by default (can be explicitly overridden in configuration files or via `-o`, such as `-o ClearAllForwardings=no` or `-o ExitOnForwardFailure=no`).
+  - `-W` provides a clean binary data stream channel and cannot be combined with a remote command, background mode (`-f`), `--sudo`, or multiplexing control commands (`-O`, except `-O proxy`).
+- **Tunnel device forwarding (`-w local_tun[:remote_tun]` / `--tunnel-device`)**:
+  - Creates a Layer 3 (`point-to-point`) or Layer 2 (`ethernet`) virtual network interface tunnel between client and server (requires `PermitTunnel yes` or appropriate permissions in the server's `sshd_config`).
+  - Device unit numbers can be non-negative integers or `any` (system-assigned unused device). Omitting `:remote_tun` defaults to `any` (e.g. `-w 0` is equivalent to `-w 0:any`).
+  - **Mode and ordering rules**: Defaults to `point-to-point` (Layer 3) mode unless `Tunnel` is specified beforehand. To use `ethernet` (Layer 2) mode, specify `-o Tunnel=ethernet` **before** `-w` (e.g. `xops ssh -o Tunnel=ethernet -w 0:0 gw`).
+  - **Platform support notes**:
+    - **Linux**: Natively supports `tun` (`point-to-point`) and `tap` (`ethernet`).
+    - **macOS**: Natively supports `utun` (`point-to-point`); `tap` devices are not supported natively.
+    - **Windows**: Local kernel virtual network interface creation is currently not supported (configuration items and `-o` parsing remain available and cross-platform compatible).
 - **Per-connection error isolation**: Individual forwarding errors (such as `administratively prohibited` or an unreachable target port) are queued to controlled stderr output without tearing down the main SSH session or listener. `-N` ready status remains on stdout. Blocked output does not hold up forwarding callbacks; output failures are returned at shutdown. Unsupported pipes may omit auxiliary messages; redirect the affected stream to a regular file instead.
-- **Keepalive and disconnect handling**: Sessions with `-L`, `-R`, `-D`, or `-N` actively monitor the connection—sending an SSH heartbeat after 15 seconds of idle traffic and declaring a timeout only after 10 consecutive seconds with neither a reply nor data progress. When the connection drops, XOps closes local listeners and exits with a nonzero status. Combine `-f -N` to run tunnels in the background.
+- **Keepalive and disconnect handling**: Sessions with `-L`, `-R`, `-D`, `-w`, or `-N` actively monitor the connection—sending an SSH heartbeat after 15 seconds of idle traffic and declaring a timeout only after 10 consecutive seconds with neither a reply nor data progress. When the connection drops, XOps closes local listeners and exits with a nonzero status. Combine `-f -N` to run tunnels in the background.
