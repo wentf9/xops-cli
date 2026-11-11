@@ -5,6 +5,10 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      go-dependencies:
+        patterns:
+          - "*"
     open-pull-requests-limit: 10
     labels:
       - "dependencies"
@@ -15,6 +19,10 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
     open-pull-requests-limit: 5
     labels:
       - "ci"
@@ -25,6 +33,10 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      npm-dependencies:
+        patterns:
+          - "*"
     open-pull-requests-limit: 5
     labels:
       - "dependencies"

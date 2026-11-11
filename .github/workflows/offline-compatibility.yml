@@ -2,25 +2,41 @@ name: Offline vault native compatibility
 
 on:
   push:
-    branches: [work/offline-vault-compatibility, feat/credential-persistence]
-  pull_request:
+    branches: [master]
     paths:
       - '.gitattributes'
-      - 'internal/sshenv/**'
-      - 'core/**'
-      - 'pkg/config/**'
-      - 'pkg/credential/**'
-      - 'internal/credentialhelper/**'
-      - 'internal/terminal/**'
-      - 'pkg/adapter/**'
-      - 'pkg/tui/**'
       - 'go.mod'
       - 'go.sum'
-      - 'cmd/**'
       - 'internal/credentialfile/**'
       - 'internal/vaultsys/**'
       - 'internal/kdfhelper/**'
+      - 'internal/credentialhelper/**'
+      - 'pkg/credential/**'
+      - 'pkg/crypto/**'
+      - 'pkg/config/**'
+      - 'pkg/adapter/credential*'
+      - 'pkg/adapter/remember*'
       - 'scripts/offline-platform-verify/**'
+      - 'scripts/offline-vault-verify/**'
+      - '.github/workflows/offline-compatibility.yml'
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - '.gitattributes'
+      - 'go.mod'
+      - 'go.sum'
+      - 'internal/credentialfile/**'
+      - 'internal/vaultsys/**'
+      - 'internal/kdfhelper/**'
+      - 'internal/credentialhelper/**'
+      - 'pkg/credential/**'
+      - 'pkg/crypto/**'
+      - 'pkg/config/**'
+      - 'pkg/adapter/credential*'
+      - 'pkg/adapter/remember*'
+      - 'scripts/offline-platform-verify/**'
+      - 'scripts/offline-vault-verify/**'
       - '.github/workflows/offline-compatibility.yml'
   workflow_dispatch:
 
@@ -28,14 +44,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: offline-compatibility-${{ github.ref }}
-  cancel-in-progress: true
+  group: offline-compatibility-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   native:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     strategy:
       fail-fast: false
-      max-parallel: 2
       matrix:
         include:
           - { os: macos-15, arch: arm64, race: '-race' }
@@ -45,10 +61,8 @@ jobs:
           - { os: windows-latest, arch: amd64, race: '-race' }
           - { os: windows-11-arm, arch: arm64, race: '' }
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 15
     env:
-      GOMAXPROCS: '2'
-      GOFLAGS: '-p=2'
       GORACE: atexit_sleep_ms=0
       RACE_FLAGS: ${{ matrix.race }}
     steps:
@@ -61,22 +75,18 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
           architecture: ${{ matrix.arch }}
       - name: Report native platform
         run: go env GOOS GOARCH CGO_ENABLED
       - name: Build
         run: go build ./...
-      - name: Install native Unix shell test dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y fish zsh
-      # Native runtime startup must not compete with parallel KDF/helper tests.
-      # Keep these tests mandatory, with the same per-process watchdog.
-      - name: Native shell probe regressions
-        run: go test ${{ env.RACE_FLAGS }} -parallel 1 -shuffle=on -count=1 ./core/ssh -run '^TestProbeShell'
-      - name: Full native shuffled tests
-        run: go test ${{ env.RACE_FLAGS }} -parallel 2 -shuffle=on ./... -skip '^TestProbeShell'
+      - name: Native credential and vault unit tests
+        run: >-
+          go test ${{ env.RACE_FLAGS }} -shuffle=on -count=1
+          ./internal/credentialfile/... ./internal/vaultsys/... ./internal/kdfhelper/...
+          ./internal/credentialhelper/... ./pkg/credential/... ./pkg/crypto/... ./pkg/config/...
       - name: Native vault and real KDF helper (release configuration)
         env:
           CGO_ENABLED: '0'
@@ -85,14 +95,11 @@ jobs:
         run: go test ${{ env.RACE_FLAGS }} -parallel 2 -count=1 -tags=integration ./internal/credentialfile/...
       - name: Native credential initialization, recovery and migration
         run: go test ${{ env.RACE_FLAGS }} -parallel 2 -count=1 -tags=integration ./pkg/config ./pkg/adapter -run '^(TestEncrypted|TestBackendMigration|TestRecoveryCorruptOfflineVault)'
-      - name: Windows ConPTY integration
-        if: runner.os == 'Windows'
-        run: go test ${{ env.RACE_FLAGS }} -count=1 -tags=integration ./cmd/sftpshell -run '^TestWindowsLineEditorConPTY$'
       - name: Provision Linux Secret Service
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y dbus-x11 gnome-keyring libsecret-tools
+          sudo apt-get install -y --no-install-recommends dbus-x11 gnome-keyring libsecret-tools
       - name: Native Linux system migration round-trip
         if: runner.os == 'Linux'
         env:

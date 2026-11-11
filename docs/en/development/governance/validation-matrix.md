@@ -22,7 +22,7 @@ go test ./...
 golangci-lint run ./...
 ```
 
-GitHub CI additionally covers: Linux race+shuffle+coverage, fish/zsh, native sudo, offline credential integration, Windows build/test+ConPTY, macOS native tests, and core isolation. See `.github/workflows/ci.yml` and `.github/workflows/offline-compatibility.yml`.
+GitHub CI additionally covers: Linux race+shuffle, fish/zsh, native sudo, offline credential integration, Windows build/test+ConPTY, macOS native tests, and core isolation (tiered by Draft state and changed paths on PRs, with full-platform verification on `master`). See `.github/workflows/ci.yml` and `.github/workflows/offline-compatibility.yml`.
 
 **During read-only investigations**, do not run `make ci`, `go mod tidy`, `npm run docs:build`, or commands that connect to real networks/SSH hosts, create credentials, or modify user configuration.
 

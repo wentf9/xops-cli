@@ -22,7 +22,7 @@ go test ./...
 golangci-lint run ./...
 ```
 
-GitHub CI 还覆盖：Linux race+shuffle+coverage、fish/zsh、原生 sudo、离线凭据 integration，Windows 构建/测试+ConPTY，macOS 原生测试，core isolation。详见 `.github/workflows/ci.yml` 与 `.github/workflows/offline-compatibility.yml`。
+GitHub CI 还覆盖：Linux race+shuffle、fish/zsh、原生 sudo、离线凭据 integration，Windows 构建/测试+ConPTY，macOS 原生测试，core isolation（按 Draft/变更路径分层触发，`master` 合入全平台兜底）。详见 `.github/workflows/ci.yml` 与 `.github/workflows/offline-compatibility.yml`。
 
 **只读调查时不执行** `make ci` / `go mod tidy` / `npm run docs:build` / 涉及真实网络、SSH、凭据创建和用户配置写入的命令。
 

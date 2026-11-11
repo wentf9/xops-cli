@@ -4,10 +4,9 @@ on:
   push:
     branches:
       - master
-      - 'feat/**'
-      - 'feature/**'
   pull_request:
     branches: [master]
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
       debug_enabled:
@@ -25,10 +24,48 @@ env:
   GORACE: atexit_sleep_ms=0
 
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      code: ${{ steps.changes.outputs.code }}
+      core: ${{ steps.changes.outputs.core }}
+      cross_platform: ${{ steps.changes.outputs.cross_platform }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Detect relevant changes
+        id: changes
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GITHUB_BEFORE_SHA: ${{ github.event.before }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+        run: python3 scripts/ci_changes.py >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        if: steps.changes.outputs.code == 'true'
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: golangci-lint
+        if: steps.changes.outputs.code == 'true'
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.11
+          args: ./...
+
   test:
     name: Build and Test
     runs-on: ubuntu-latest
@@ -36,8 +73,20 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Detect relevant changes
+        id: changes
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GITHUB_BEFORE_SHA: ${{ github.event.before }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+        run: python3 scripts/ci_changes.py >> "$GITHUB_OUTPUT"
 
       - name: Set up Go
+        if: steps.changes.outputs.code == 'true'
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
@@ -45,27 +94,36 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Verify dependencies
+        if: steps.changes.outputs.code == 'true'
         run: |
           go mod tidy
           git diff --exit-code -- go.mod go.sum
 
       - name: Install native Unix shell test dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y fish zsh
+        if: steps.changes.outputs.code == 'true'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends fish zsh
 
       - name: Build all packages
+        if: steps.changes.outputs.code == 'true'
         run: go build ./...
 
       - name: Verify shared core isolation
+        if: steps.changes.outputs.code == 'true'
         run: |
           python3 -m unittest discover -s scripts -p test_check_core.py
-          python3 scripts/check_core.py --race
+          python3 -m unittest discover -s scripts -p test_ci_changes.py
+          if [ "${{ steps.changes.outputs.core }}" = "true" ]; then
+            python3 scripts/check_core.py
+          else
+            python3 scripts/check_core.py --graph-only
+          fi
 
       - name: Run tests
-        run: go test -race -shuffle=on -covermode=atomic -coverprofile=coverage.out ./...
+        if: steps.changes.outputs.code == 'true'
+        run: go test -race -shuffle=on -count=1 ./...
 
       - name: Run native password sudo PTY regression
+        if: steps.changes.outputs.code == 'true'
         env:
           XOPS_TEST_NATIVE_SUDO_PASSWORD: public-ci-sudo-password
         run: |
@@ -78,6 +136,7 @@ jobs:
           sudo -u xops-sudo-ci env XOPS_TEST_NATIVE_SUDO_PASSWORD="$XOPS_TEST_NATIVE_SUDO_PASSWORD" /tmp/xops-sudo-ci.test -test.run '^TestPrivilegeNativePasswordSudoPTY$' -test.count=1 -test.timeout=30s -test.v
 
       - name: Run offline credential business integration tests
+        if: steps.changes.outputs.code == 'true'
         env:
           GORACE: atexit_sleep_ms=0
         run: |
@@ -85,15 +144,10 @@ jobs:
           go test -tags=integration -race -shuffle=on -count=1 -timeout=120s \
             -run '^(TestEncrypted|TestOffline)' ./pkg/config ./cmd
 
-      - name: Upload coverage
-        uses: actions/upload-artifact@v7
-        with:
-          name: coverage
-          path: coverage.out
-          if-no-files-found: error
-
   windows-test:
     name: Windows Build and Test
+    needs: lint
+    if: needs.lint.outputs.cross_platform == 'true'
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
@@ -129,23 +183,26 @@ jobs:
       - name: Run native Windows shell probe regressions
         run: go test -race -parallel 1 -shuffle=on -count=1 ./core/ssh -run '^TestProbeShell'
 
-      - name: Run Windows tests
+      - name: Run Windows tests (PR fast path)
+        if: github.event_name == 'pull_request'
+        run: go test -shuffle=on -count=1 ./... -skip '^TestProbeShell'
+
+      - name: Run Windows race tests on platform-critical packages
+        if: github.event_name == 'pull_request'
+        run: go test -race -shuffle=on -count=1 ./internal/terminal ./internal/sshenv ./internal/credentialfile/... ./internal/vaultsys/... ./internal/credentialhelper ./cmd/sftpshell
+
+      - name: Run Windows tests (full race suite)
+        if: github.event_name != 'pull_request'
         run: go test -race -shuffle=on -count=1 ./... -skip '^TestProbeShell'
 
-      - name: Run Windows ConPTY integration test
+      - name: Run Windows ConPTY integration regressions
         if: ${{ !cancelled() }}
-        run: go test -race -tags=integration -run '^TestWindowsLineEditorConPTY$' -count=1 ./cmd/sftpshell
-
-      - name: Run Windows terminal input ConPTY integration test
-        if: ${{ !cancelled() }}
-        run: go test -race -tags=integration -run '^TestWindows(InteractiveInputConPTY|ConPTYOutputClosedHandle)$' -count=1 -timeout=60s ./internal/terminal
-
-      - name: Run native Windows console output fallback regression
-        if: ${{ !cancelled() }}
-        run: go test -race -tags=integration -run '^TestWindowsOutputConPTYFallback$' -count=1 -timeout=60s ./core/ssh
+        run: go test -race -tags=integration -run '^TestWindows(LineEditorConPTY|InteractiveInputConPTY|ConPTYOutputClosedHandle|OutputConPTYFallback)$' -count=1 -timeout=120s ./cmd/sftpshell ./internal/terminal ./core/ssh
 
   macos-test:
     name: macOS Build and Test
+    needs: lint
+    if: needs.lint.outputs.cross_platform == 'true'
     runs-on: macos-latest
     timeout-minutes: 15
     steps:
@@ -185,24 +242,3 @@ jobs:
       - name: Setup tmate debug session on failure
         if: ${{ failure() && github.event_name == 'workflow_dispatch' && inputs.debug_enabled }}
         uses: mxschmitt/action-tmate@v3
-
-  lint:
-    name: Lint
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version-file: 'go.mod'
-          cache: true
-          cache-dependency-path: go.sum
-
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@v9
-        with:
-          version: v2.11
-          args: ./...

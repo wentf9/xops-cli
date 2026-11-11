@@ -8,6 +8,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -17,9 +18,9 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: '1.26.x'
           go-version-file: 'go.mod'
           cache: true
+          cache-dependency-path: go.sum
 
       - name: Build all platforms
         run: make release

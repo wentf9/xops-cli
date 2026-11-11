@@ -7,9 +7,8 @@ import { childCommands } from './help.mjs';
 const temporary = mkdtempSync(join(tmpdir(), 'xops-docs-'));
 const binary = join(temporary, process.platform === 'win32' ? 'xops.exe' : 'xops');
 try {
-  execFileSync('go', ['build', '-p=2', '-o', binary, './cmd/cli'], {
-    stdio: 'inherit', timeout: 300000,
-    env: { ...process.env, GOMAXPROCS: process.env.GOMAXPROCS || '2' }
+  execFileSync('go', ['build', '-o', binary, './cmd/cli'], {
+    stdio: 'inherit', timeout: 300000
   });
   for (const [language, prefix] of [['zh', ''], ['en', 'en/']]) {
     const output = resolve('docs', prefix, 'reference/commands');
