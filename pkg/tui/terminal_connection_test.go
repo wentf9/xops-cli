@@ -189,11 +189,6 @@ func terminalTestModel(t *testing.T, store credential.Store, ui ssh.InteractionH
 	}
 	cfg := newFormCredentialTestConfiguration("")
 	cfg.SchemaVersion = 2
-	// The list hides exact localhost entries. A bracketed mapped IPv4 literal stays
-	// visible without requiring an extra loopback alias on macOS or Windows.
-	if host == "127.0.0.1" {
-		host = "[::ffff:127.0.0.1]"
-	}
 	cfg.Hosts.Set("192.168.1.50:22", models.Host{Address: host, Port: uint16(port)})
 	cfg.Credential.RememberPrompted = "always"
 	cfg.Credential.Stores = map[string]config.StoreConfig{"mem": {Type: config.StoreTypeHelper, Command: "unused", Timeout: time.Second}}
@@ -471,9 +466,6 @@ func TestTUITerminalConnectionDoesNotReuseOldTarget(t *testing.T) {
 	node, host, identity, err := repo.Resolve(formCredentialTestNodeID)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if hostText == "127.0.0.1" {
-		hostText = "[::ffff:127.0.0.1]"
 	}
 	host.Address, host.Port = hostText, uint16(port)
 	ref := repo.View().NodeRefs[formCredentialTestNodeID]

@@ -301,59 +301,75 @@ func TestListIdentities(t *testing.T) {
 	}
 }
 
-func TestLocalNodeFiltering(t *testing.T) {
+func TestLocalNodesIncludedInListAndTagQueries(t *testing.T) {
 	cfg := &Configuration{
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
 		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
 		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
 	}
-	// 1. 添加正常节点 (remote node)
+	cfg.Identities.Set("id-common", models.Identity{User: "user", AuthType: "password"})
+
+	// 1. 添加正常远程节点 (remote node)
 	cfg.Hosts.Set("host-remote", models.Host{Address: "192.168.1.10", Port: 22})
-	cfg.Identities.Set("id-remote", models.Identity{User: "remote-user", AuthType: "password"})
 	cfg.Nodes.Set("remote-node", models.Node{
 		HostRef:     "host-remote",
-		IdentityRef: "id-remote",
+		IdentityRef: "id-common",
 		Tags:        []string{"web"},
 	})
 
-	// 2. 添加本地节点 (localhost node)
+	// 2. 添加本地/回环节点 (local/loopback nodes)
 	cfg.Hosts.Set("host-local", models.Host{Address: "127.0.0.1", Port: 22})
-	cfg.Identities.Set("id-local", models.Identity{User: "local-user", AuthType: "password"})
-	cfg.Nodes.Set("local-node", models.Node{
+	cfg.Nodes.Set("local", models.Node{
+		Alias:       []string{"local"},
 		HostRef:     "host-local",
-		IdentityRef: "id-local",
+		IdentityRef: "id-common",
+		Tags:        []string{"web"},
+	})
+
+	cfg.Hosts.Set("host-localhost", models.Host{Address: "localhost", Port: 22})
+	cfg.Nodes.Set("localhost-node", models.Node{
+		HostRef:     "host-localhost",
+		IdentityRef: "id-common",
+		Tags:        []string{"web"},
+	})
+
+	cfg.Hosts.Set("host-ipv6", models.Host{Address: "::1", Port: 22})
+	cfg.Nodes.Set("ipv6-loopback", models.Node{
+		HostRef:     "host-ipv6",
+		IdentityRef: "id-common",
 		Tags:        []string{"web"},
 	})
 
 	p := NewProviderWithoutOpenSSH(cfg)
 
-	// 验证 ListNodes
+	// 验证 ListNodes 包含所有 4 个节点
 	nodes := p.ListNodes()
-	if len(nodes) != 1 {
-		t.Errorf("ListNodes() returned %d nodes, want 1 (should exclude local node)", len(nodes))
+	if len(nodes) != 4 {
+		t.Fatalf("ListNodes() returned %d nodes, want 4", len(nodes))
 	}
-	if _, ok := nodes["remote-node"]; !ok {
-		t.Error("expected remote-node to be in ListNodes()")
-	}
-	if _, ok := nodes["local-node"]; ok {
-		t.Error("expected local-node to be excluded from ListNodes()")
+	for _, id := range []string{"remote-node", "local", "localhost-node", "ipv6-loopback"} {
+		if _, ok := nodes[id]; !ok {
+			t.Errorf("expected %q to be included in ListNodes()", id)
+		}
 	}
 
-	// 验证 GetNodesByTag
+	// 验证 GetNodesByTag("web") 包含所有 4 个节点
 	taggedNodes := p.GetNodesByTag("web")
-	if len(taggedNodes) != 1 {
-		t.Errorf("GetNodesByTag() returned %d nodes, want 1", len(taggedNodes))
+	if len(taggedNodes) != 4 {
+		t.Fatalf("GetNodesByTag(\"web\") returned %d nodes, want 4", len(taggedNodes))
 	}
-	if _, ok := taggedNodes["local-node"]; ok {
-		t.Error("expected local-node to be excluded from GetNodesByTag()")
+	for _, id := range []string{"remote-node", "local", "localhost-node", "ipv6-loopback"} {
+		if _, ok := taggedNodes[id]; !ok {
+			t.Errorf("expected %q to be included in GetNodesByTag(\"web\")", id)
+		}
 	}
 
-	// 验证 Find 和 GetNode 依然保留单节点寻址能力
-	if got := p.Find("local-node"); got != "local-node" {
-		t.Errorf("Find('local-node') = %q, want 'local-node' (should preserve indexing)", got)
+	// 验证 Find 和 GetNode
+	if got := p.Find("local"); got != "local" {
+		t.Errorf("Find(\"local\") = %q, want \"local\"", got)
 	}
-	if _, ok := p.GetNode("local-node"); !ok {
-		t.Error("GetNode('local-node') failed, should preserve point-to-point query")
+	if _, ok := p.GetNode("local"); !ok {
+		t.Error("GetNode(\"local\") failed, want true")
 	}
 }
 

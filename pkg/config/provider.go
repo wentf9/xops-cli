@@ -284,7 +284,7 @@ func (p *Provider) ListNodes() map[string]models.Node {
 	defer p.mu.RUnlock()
 	for _, nodeID := range p.cfg.Nodes.Keys() {
 		node, ok := p.cfg.Nodes.Get(nodeID)
-		if !ok || isLocalNode(p.cfg, node) {
+		if !ok {
 			continue
 		}
 		result[nodeID] = cloneNode(node)
@@ -301,7 +301,7 @@ func (p *Provider) GetNodesByTag(tag string) map[string]models.Node {
 	defer p.mu.RUnlock()
 	for _, nodeID := range p.cfg.Nodes.Keys() {
 		node, ok := p.cfg.Nodes.Get(nodeID)
-		if !ok || isLocalNode(p.cfg, node) || !slices.Contains(node.Tags, tag) {
+		if !ok || !slices.Contains(node.Tags, tag) {
 			continue
 		}
 		result[nodeID] = cloneNode(node)
@@ -322,15 +322,6 @@ func (p *Provider) ListIdentities() map[string]models.Identity {
 		}
 	}
 	return result
-}
-
-func isLocalNode(cfg *Configuration, node models.Node) bool {
-	host, ok := cfg.Hosts.Get(node.HostRef)
-	if !ok {
-		return false
-	}
-	address := strings.ToLower(strings.TrimSpace(host.Address))
-	return address == "127.0.0.1" || address == "localhost" || address == "::1"
 }
 
 func removeNodeAndUnusedRefs(cfg *Configuration, nodeID string) {
