@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"regexp"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/wentf9/xops-cli/cmd/utils"
@@ -205,27 +205,11 @@ func (h *cliInteractionHandler) ConfirmSession(ctx context.Context, action strin
 	}
 	defer release()
 
-	prompt := fmt.Sprintf("Allow connection sharing %s on this master? (yes/no) ", action)
+	prompt := fmt.Sprintf("Allow connection sharing %s on this master? (yes/no) ", sanitizeInteractiveText(action))
 	return confirmSessionWithAskpass(ctx, askpassProg, prompt)
 }
 
-var defaultSystemAskpassCandidates = []string{
-	"ssh-askpass",
-	"/usr/libexec/openssh/ssh-askpass",
-	"/usr/lib/openssh/ssh-askpass",
-	"/usr/lib/ssh/ssh-askpass",
-	"/usr/bin/ssh-askpass",
-	"/usr/X11R6/bin/ssh-askpass",
-}
-
-func findSystemAskpass() string {
-	for _, candidate := range defaultSystemAskpassCandidates {
-		if path, err := exec.LookPath(candidate); err == nil && path != "" {
-			return path
-		}
-	}
-	return ""
-}
+const defaultAskpassWaitDelay = 200 * time.Millisecond
 
 func resolveAskpassProgram() string {
 	requireMode := strings.ToLower(strings.TrimSpace(os.Getenv("SSH_ASKPASS_REQUIRE")))
@@ -244,13 +228,15 @@ func resolveAskpassProgram() string {
 }
 
 func askpassCommandEnv(base []string) []string {
+	const prefix = "SSH_ASKPASS_PROMPT="
 	env := make([]string, 0, len(base)+1)
 	for _, kv := range base {
-		if !strings.HasPrefix(kv, "SSH_ASKPASS_PROMPT=") {
-			env = append(env, kv)
+		if len(kv) >= len(prefix) && strings.EqualFold(kv[:len(prefix)], prefix) {
+			continue
 		}
+		env = append(env, kv)
 	}
-	return append(env, "SSH_ASKPASS_PROMPT=confirm")
+	return append(env, prefix+"confirm")
 }
 
 func isAskpassApproved(out []byte) bool {
@@ -264,10 +250,17 @@ func isAskpassApproved(out []byte) bool {
 }
 
 func confirmSessionWithAskpass(ctx context.Context, askpassProg, prompt string) (bool, error) {
-	cmd := exec.CommandContext(ctx, askpassProg, prompt)
+	cmd, err := buildAskpassCommand(ctx, askpassProg, prompt)
+	if err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		return false, nil
+	}
 	cmd.Stdin = nil
 	cmd.Stderr = io.Discard
 	cmd.Env = askpassCommandEnv(os.Environ())
+	cmd.WaitDelay = defaultAskpassWaitDelay
 	out, runErr := cmd.Output()
 	if runErr == nil {
 		return isAskpassApproved(out), nil
