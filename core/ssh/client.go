@@ -38,6 +38,11 @@ type Client struct {
 	diagnostics        logger.DiagnosticObserver // Immutable; connector owns its lifetime.
 	handshakeTimeout   time.Duration
 	interactionTimeout time.Duration
+	muxSocketPath      string
+	muxExpectedUID     uint32
+	transportOnce      sync.Once
+	transportDone      chan struct{}
+	transportErr       error
 }
 
 type compatSecretResolver struct {
@@ -1074,6 +1079,20 @@ func (c *Client) passwordPromptRegex() *regexp.Regexp {
 
 func (c *Client) SSHClient() *ssh.Client {
 	return c.sshClient
+}
+
+func (c *Client) watchTransport() <-chan struct{} {
+	if c == nil || c.sshClient == nil {
+		return nil
+	}
+	c.transportOnce.Do(func() {
+		c.transportDone = make(chan struct{})
+		go func() {
+			defer close(c.transportDone)
+			c.transportErr = c.sshClient.Wait()
+		}()
+	})
+	return c.transportDone
 }
 
 // Keep verified session-local discovery when a recorder intentionally does not

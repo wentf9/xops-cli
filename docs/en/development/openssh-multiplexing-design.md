@@ -447,7 +447,7 @@ nodes:
 | `check` | Verify if master is alive and return PID | `Master running (pid=<pid>)` | 0 |
 | `exit` | Request master to disconnect and exit | `Exit request sent.` | 0 |
 | `stop` | Request master to stop listening on socket while retaining existing sessions; a master with nothing to drain retires immediately | `Stop listening request sent.` | 0 |
-| `forward` | Request dynamic/local/remote port forwarding on master (`-L`, `-R`, `-D`) | `Allocated port <port>...` / `Forwarding request sent.` | 0 |
+| `forward` | Request dynamic/local/remote port forwarding on master (`-L`, `-R`, `-D`) | Dynamic port allocation (`-R 0:...`) outputs `<port>` to stdout; stderr prints `Forwarding request sent.` | 0 |
 | `cancel` | Cancel an existing port forwarding on master (`-L`, `-R`, `-D`) | `Forwarding cancel request sent.` | 0 |
 | `proxy` | Align with OpenSSH `-O proxy` semantics: connect to the active master via `MUX_C_PROXY` and execute the requested remote command or session over the multiplexed connection (requires a target `<host>` or `--host <host>`) | Remote command/session stdout & stderr | Remote exit status (255 on socket/proxy/validation failure) |
 | `proxy-stream` | (Extension) Transition current stdio to a raw `MUX_C_PROXY` bidirectional byte-stream pipe with the master (`<host>` may be omitted when `-S` is specified) | Binary stdio stream | 0 |

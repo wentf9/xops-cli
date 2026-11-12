@@ -288,7 +288,7 @@ func parseOpenSSHOptions(cfg *ssh_config.Config, host string) (*ssh.Options, err
 			for _, rawVal := range allMatchingOpenSSHOptions(cfg, host, spec) {
 				if err := opts.Append(spec.CanonicalKey, rawVal); err != nil {
 					// Leniently skip invalid or unsupported multi-value entries
-					// (e.g. Unix domain socket paths in RemoteForward).
+					// (e.g. malformed multi-value entries).
 					continue
 				}
 			}

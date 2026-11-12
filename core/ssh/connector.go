@@ -649,6 +649,8 @@ func (c *Connector) wrapCachedClient(cfg *ClientConfig, cachedClient *PooledClie
 	}
 	client.probeCache = cachedClient.probeCache
 	cachedClient.probeMu.Unlock()
+	client.muxSocketPath = cachedClient.ControlSocketPath
+	client.muxExpectedUID = cachedClient.ControlExpectedUID
 	return client
 }
 
@@ -997,8 +999,10 @@ func (c *Connector) tryDialAndPublishProxy(ctx context.Context, planNode connect
 	}
 
 	pooled := &PooledClient{
-		SSHClient: rawClient,
-		RootConn:  proxyConn.RawConn(),
+		SSHClient:          rawClient,
+		RootConn:           proxyConn.RawConn(),
+		ControlSocketPath:  expandedPath,
+		ControlExpectedUID: c.expectedPeerUID(),
 	}
 	if err := c.publishClient(planNode.name, pooled); err != nil {
 		_ = rawClient.Close()
@@ -1132,13 +1136,30 @@ func (c *Connector) maybeStartMasterListener(planNode connectionPlanNode, rawCli
 		return
 	}
 
+	var gatewayPorts bool
+	var streamLocalBindUnlink bool
+	var streamLocalBindMask uint32
+	var hasStreamLocalBindMask bool
+	if planNode.cfg != nil && planNode.cfg.Options != nil {
+		gatewayPorts = planNode.cfg.Options.EffectiveGatewayPorts()
+		streamLocalBindUnlink = planNode.cfg.Options.EffectiveStreamLocalBindUnlink()
+		if mask, ok := planNode.cfg.Options.StreamLocalBindMask(); ok {
+			streamLocalBindMask = mask
+			hasStreamLocalBindMask = true
+		}
+	}
+
 	server, err := StartMuxServer(context.Background(), rawClient, MuxMasterOptions{
-		Path:                  expandedPath,
-		Target:                target,
-		Environment:           c.environment,
-		RootConn:              rootConn,
-		InitialActiveSessions: 1,
-		ConfirmSession:        c.confirmSessionCallback(planNode.name, planNode.cfg),
+		Path:                   expandedPath,
+		Target:                 target,
+		Environment:            c.environment,
+		RootConn:               rootConn,
+		InitialActiveSessions:  1,
+		ConfirmSession:         c.confirmSessionCallback(planNode.name, planNode.cfg),
+		GatewayPorts:           gatewayPorts,
+		StreamLocalBindUnlink:  streamLocalBindUnlink,
+		StreamLocalBindMask:    streamLocalBindMask,
+		HasStreamLocalBindMask: hasStreamLocalBindMask,
 	})
 	if err != nil {
 		// A concurrent master already owns this path (or the bind was rejected).
@@ -2543,10 +2564,12 @@ func appendKnownHost(knownHostsFile, hostname string, key ssh.PublicKey) (err er
 // PooledClient retains the outermost transport, including for ProxyJump clients.
 // Interrupting it also terminates other clients sharing that transport.
 type PooledClient struct {
-	SSHClient  *ssh.Client
-	RootConn   net.Conn
-	probeMu    sync.Mutex
-	probeCache *executionProbeCache
+	SSHClient          *ssh.Client
+	RootConn           net.Conn
+	probeMu            sync.Mutex
+	probeCache         *executionProbeCache
+	ControlSocketPath  string
+	ControlExpectedUID uint32
 }
 
 func (c *PooledClient) interrupt() error {

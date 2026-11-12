@@ -6,9 +6,52 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 )
+
+type streamLocalListener struct {
+	net.Listener
+	socketPath string
+	origFi     os.FileInfo
+	closeOnce  sync.Once
+	closeErr   error
+}
+
+func (l *streamLocalListener) Addr() net.Addr {
+	return &net.UnixAddr{Name: l.socketPath, Net: "unix"}
+}
+
+func (l *streamLocalListener) Close() error {
+	l.closeOnce.Do(func() {
+		l.closeErr = l.Listener.Close()
+		if l.origFi != nil {
+			if currFi, err := os.Lstat(l.socketPath); err == nil && os.SameFile(l.origFi, currFi) {
+				if rmErr := os.Remove(l.socketPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+					l.closeErr = errors.Join(l.closeErr, rmErr)
+				}
+			}
+		}
+	})
+	return l.closeErr
+}
+
+type forwardTCPAddr struct {
+	addr string
+}
+
+func (a forwardTCPAddr) Network() string { return "tcp" }
+func (a forwardTCPAddr) String() string  { return a.addr }
+
+type staticAddrListener struct {
+	addr net.Addr
+}
+
+func (s staticAddrListener) Addr() net.Addr            { return s.addr }
+func (s staticAddrListener) Accept() (net.Conn, error) { return nil, net.ErrClosed }
+func (s staticAddrListener) Close() error              { return nil }
 
 // Forward represents one running SSH port forward. Callers must either wait
 // for it or cancel the context passed to its constructor.
@@ -31,9 +74,25 @@ func (f *Forward) Done() <-chan struct{} { return f.done }
 type ForwardOption func(*forwardOptions)
 
 type forwardOptions struct {
-	onConnectionError func(error)
-	maxConnections    int
-	observe           func(string) // Optional lifecycle callback; no I/O in core.
+	onConnectionError     func(error)
+	maxConnections        int
+	observe               func(string) // Optional lifecycle callback; no I/O in core.
+	streamLocalBindMask   uint32
+	streamLocalBindUnlink bool
+}
+
+// WithStreamLocalBindMask configures the file mode mask for local StreamLocal socket binding.
+func WithStreamLocalBindMask(mask uint32) ForwardOption {
+	return func(options *forwardOptions) {
+		options.streamLocalBindMask = mask
+	}
+}
+
+// WithStreamLocalBindUnlink configures whether an existing Unix socket file is unlinked before binding.
+func WithStreamLocalBindUnlink(unlink bool) ForwardOption {
+	return func(options *forwardOptions) {
+		options.streamLocalBindUnlink = unlink
+	}
 }
 
 // WithForwardConnectionLimit bounds concurrent accepted connections. Excess
@@ -90,11 +149,65 @@ func (c *Client) handleLocalForward(ctx context.Context, localConn net.Conn, rem
 	return c.copyStream(ctx, localConn, remoteConn)
 }
 
+// LocalForwardEndpoint starts local port forwarding using parsed ForwardEndpoints.
+// Supports all 4 combinations (TCP->TCP, TCP->Unix, Unix->TCP, Unix->Unix).
+func (c *Client) LocalForwardEndpoint(ctx context.Context, bind ForwardEndpoint, dest ForwardEndpoint, gatewayPorts bool, opts ...ForwardOption) (*Forward, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("local forward context is nil")
+	}
+	fopts := c.forwardOptions(opts...)
+	listenNet, listenAddr := bind.LocalListenAddress(gatewayPorts)
+	var listener net.Listener
+	var err error
+	if listenNet == "unix" {
+		listener, err = listenLocalStreamLocal(ctx, listenAddr, fopts.streamLocalBindMask, fopts.streamLocalBindUnlink)
+	} else {
+		listener, err = (&net.ListenConfig{}).Listen(ctx, "tcp", listenAddr)
+	}
+	if err != nil {
+		c.observeForward("local", "listen failed", listenAddr, dest.String())
+		return nil, fmt.Errorf("listen on local address %s failed: %w", listenAddr, err)
+	}
+	connectNet, connectAddr := dest.ConnectAddress()
+	return runForwardListener(ctx, listener, c.forwardDiagnostics(fopts, "local", listener, dest.String()), func(runCtx context.Context, conn net.Conn) error {
+		return c.observedForwardHandler("local", listener.Addr().String(), dest.String(), func() error {
+			return c.handleLocalForwardEndpoint(runCtx, conn, connectNet, connectAddr)
+		})
+	}), nil
+}
+
+func (c *Client) handleLocalForwardEndpoint(ctx context.Context, localConn net.Conn, connectNet, connectAddr string) (retErr error) {
+	defer joinResourceCloseError(&retErr, localConn, "local forwarding client connection")
+	remoteConn, err := c.dialSSH(ctx, connectNet, connectAddr)
+	if err != nil {
+		return fmt.Errorf("dial local forwarding destination %s failed: %w", connectAddr, err)
+	}
+	defer joinResourceCloseError(&retErr, remoteConn, "local forwarding remote connection")
+	return c.copyStream(ctx, localConn, remoteConn)
+}
+
 // RemoteForward starts remote port forwarding.
 // Asks SSH server to listen on remoteAddr, forwards connections to localAddr.
 // Startup and listener shutdown have independent, bounded request lifetimes.
 // Canceling startup or timing out a request interrupts the shared SSH transport.
 func (c *Client) RemoteForward(ctx context.Context, remoteAddr, localAddr string, opts ...ForwardOption) (*Forward, error) {
+	if c.muxSocketPath != "" {
+		bindEp, err := parseBindEndpoint(remoteAddr)
+		if err != nil {
+			return nil, fmt.Errorf("parse remote forward bind endpoint %q failed: %w", remoteAddr, err)
+		}
+		destEp, err := parseDestEndpoint(localAddr)
+		if err != nil {
+			return nil, fmt.Errorf("parse remote forward dest endpoint %q failed: %w", localAddr, err)
+		}
+		spec := ForwardSpec{
+			Bind:     bindEp,
+			Dest:     destEp,
+			BindAddr: remoteAddr,
+			DestAddr: localAddr,
+		}
+		return c.remoteForwardViaMux(ctx, spec, opts...)
+	}
 	return c.remoteForward(ctx, remoteAddr, localAddr, remoteForwardRequestTimeout, opts...)
 }
 
@@ -102,7 +215,7 @@ func (c *Client) remoteForward(ctx context.Context, remoteAddr, localAddr string
 	if ctx == nil {
 		return nil, fmt.Errorf("remote forward context is nil")
 	}
-	listener, err := c.listenRemoteContext(ctx, remoteAddr, timeout)
+	listener, err := c.listenRemoteContext(ctx, "tcp", remoteAddr, timeout)
 	if err != nil {
 		c.observeForward("remote", "listen failed", remoteAddr, localAddr)
 		return nil, fmt.Errorf("listen on remote address %s failed: %w", remoteAddr, err)
@@ -123,10 +236,147 @@ func (c *Client) handleRemoteForward(ctx context.Context, remoteConn net.Conn, l
 	return c.copyStream(ctx, remoteConn, localConn)
 }
 
+// RemoteForwardEndpoint starts remote port forwarding using a normalized ForwardSpec.
+func (c *Client) RemoteForwardEndpoint(ctx context.Context, spec ForwardSpec, opts ...ForwardOption) (*Forward, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("remote forward context is nil")
+	}
+	if c.muxSocketPath != "" {
+		return c.remoteForwardViaMux(ctx, spec, opts...)
+	}
+	listenNet, listenAddr := spec.Bind.RemoteListenAddress()
+	listener, err := c.listenRemoteContext(ctx, listenNet, listenAddr, remoteForwardRequestTimeout)
+	if err != nil {
+		c.observeForward("remote", "listen failed", listenAddr, spec.Dest.String())
+		return nil, fmt.Errorf("listen on remote address %s failed: %w", listenAddr, err)
+	}
+	fopts := c.forwardOptions(opts...)
+	if spec.IsDynamic {
+		return runForwardListener(ctx, listener, c.forwardDiagnostics(fopts, "remote", listener, "dynamic"), func(runCtx context.Context, conn net.Conn) error {
+			return c.observedForwardHandler("remote", listener.Addr().String(), "dynamic", func() error {
+				return serveSocksConn(runCtx, conn, func(dCtx context.Context, destAddr string) (net.Conn, error) {
+					dialer := net.Dialer{Timeout: 5 * time.Second}
+					return dialer.DialContext(dCtx, "tcp", destAddr)
+				}, c.copyStream)
+			})
+		}), nil
+	}
+	connectNet, connectAddr := spec.Dest.ConnectAddress()
+	return runForwardListener(ctx, listener, c.forwardDiagnostics(fopts, "remote", listener, spec.Dest.String()), func(runCtx context.Context, conn net.Conn) error {
+		return c.observedForwardHandler("remote", listener.Addr().String(), spec.Dest.String(), func() error {
+			return c.handleRemoteForwardEndpoint(runCtx, conn, connectNet, connectAddr)
+		})
+	}), nil
+}
+
+func (c *Client) handleRemoteForwardEndpoint(ctx context.Context, remoteConn net.Conn, connectNet, connectAddr string) (retErr error) {
+	defer joinResourceCloseError(&retErr, remoteConn, "remote forwarding client connection")
+	dialer := net.Dialer{Timeout: 5 * time.Second}
+	localConn, err := dialer.DialContext(ctx, connectNet, connectAddr)
+	if err != nil {
+		return fmt.Errorf("dial remote forwarding destination %s failed: %w", connectAddr, err)
+	}
+	defer joinResourceCloseError(&retErr, localConn, "remote forwarding local connection")
+	return c.copyStream(ctx, remoteConn, localConn)
+}
+
+func (c *Client) remoteForwardViaMux(ctx context.Context, spec ForwardSpec, opts ...ForwardOption) (*Forward, error) {
+	req := ForwardRequest{Type: ForwardRemote}
+	req.ListenHost, req.ListenPort = spec.Bind.MuxListenEndpoint()
+	if !spec.IsDynamic {
+		req.ConnectHost, req.ConnectPort = spec.Dest.MuxConnectEndpoint()
+	}
+
+	muxCli, err := DialMuxClient(ctx, c.muxSocketPath, WithExpectedPeerUID(c.muxExpectedUID))
+	if err != nil {
+		c.observeForward("remote", "listen failed", spec.Bind.String(), spec.Dest.String())
+		return nil, fmt.Errorf("dial mux master %q failed: %w", c.muxSocketPath, err)
+	}
+	allocPort, err := muxCli.OpenForward(ctx, req)
+	_ = muxCli.Close()
+	if err != nil {
+		c.observeForward("remote", "listen failed", spec.Bind.String(), spec.Dest.String())
+		return nil, fmt.Errorf("mux open remote forward failed: %w", err)
+	}
+
+	var addr net.Addr
+	effPort := spec.Bind.Port
+	if spec.Bind.IsUnix() {
+		addr = &net.UnixAddr{Name: spec.Bind.SocketPath, Net: "unix"}
+	} else {
+		if spec.Bind.Port == 0 && allocPort > 0 {
+			effPort = uint16(allocPort)
+		}
+		var hostForAddr string
+		if spec.Bind.Wildcard {
+			hostForAddr = ""
+		} else if !spec.Bind.HasHost {
+			hostForAddr = "localhost"
+		} else {
+			hostForAddr = spec.Bind.Host
+		}
+		addr = forwardTCPAddr{addr: net.JoinHostPort(hostForAddr, strconv.Itoa(int(effPort)))}
+	}
+
+	closeReq := req
+	if spec.Bind.Port == 0 && allocPort > 0 {
+		closeReq.ListenPort = allocPort
+	}
+
+	fopts := c.forwardDiagnostics(c.forwardOptions(opts...), "remote", staticAddrListener{addr: addr}, spec.Dest.String())
+	forward := &Forward{done: make(chan struct{}), addr: addr}
+	if fopts.observe != nil {
+		fopts.observe("listening")
+	}
+
+	transportDone := c.watchTransport()
+
+	go func() {
+		defer close(forward.done)
+		defer func() {
+			if fopts.observe != nil {
+				outcome := "closed"
+				if forward.err != nil {
+					outcome = "failed"
+				}
+				fopts.observe(outcome)
+			}
+		}()
+
+		select {
+		case <-ctx.Done():
+		case <-transportDone:
+			if ctx.Err() == nil {
+				waitErr := c.transportErr
+				if waitErr == nil {
+					waitErr = io.EOF
+				}
+				forward.err = fmt.Errorf("SSH connection lost: %w", waitErr)
+			}
+		}
+
+		// Best-effort cleanup on the master whenever the passenger forward stops,
+		// including when the passenger Client is closed directly without canceling
+		// ctx first. If the master itself exited, DialMuxClient fails immediately.
+		closeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		closeCli, dialErr := DialMuxClient(closeCtx, c.muxSocketPath, WithExpectedPeerUID(c.muxExpectedUID))
+		if dialErr == nil {
+			_ = closeCli.CloseForward(closeCtx, closeReq)
+			_ = closeCli.Close()
+		}
+	}()
+
+	return forward, nil
+}
+
 func (c *Client) forwardOptions(opts ...ForwardOption) forwardOptions {
-	options := forwardOptions{onConnectionError: func(err error) {
-		c.getLogger().Debugf("ssh forwarding connection failed: %v", err)
-	}}
+	options := forwardOptions{
+		onConnectionError: func(err error) {
+			c.getLogger().Debugf("ssh forwarding connection failed: %v", err)
+		},
+		streamLocalBindMask: DefaultStreamLocalBindMask,
+	}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&options)

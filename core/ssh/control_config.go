@@ -474,6 +474,46 @@ func ValidateControlPath(expandedPath string) error {
 	return nil
 }
 
+// ValidateStreamLocalPathSyntax verifies raw StreamLocal socket path token syntax without environment dependencies.
+// Rejects empty strings and strings containing null bytes.
+func ValidateStreamLocalPathSyntax(rawPath string) error {
+	if rawPath == "" {
+		return errors.New("StreamLocal path cannot be empty")
+	}
+	if strings.Contains(rawPath, "\x00") {
+		return errors.New("StreamLocal path cannot contain null bytes")
+	}
+	return validatePathTokenSyntax(rawPath, "StreamLocal path")
+}
+
+// ExpandStreamLocalPath expands tokens (%%, %h, %p, %r, %n, %u, %l, %L, %i, %d, %j, %C),
+// environment variables (${VAR}), and optionally local tilde (~) in rawPath for StreamLocal forwarding endpoints.
+func ExpandStreamLocalPath(rawPath string, env Environment, target TargetContext, expandLocalTilde bool) (string, error) {
+	if rawPath == "" {
+		return "", errors.New("StreamLocal path cannot be empty")
+	}
+	if strings.Contains(rawPath, "\x00") {
+		return "", errors.New("StreamLocal path cannot contain null bytes")
+	}
+
+	// 1. Expand ${VAR} environment variables
+	expanded, err := expandEnvironmentVariables(rawPath, env)
+	if err != nil {
+		return "", err
+	}
+
+	// 2. Expand leading tilde (~) if enabled
+	if expandLocalTilde {
+		expanded, err = expandTilde(expanded, env.HomeDir)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	// 3. Expand percent tokens (%)
+	return expandPercentTokens(expanded, env, target)
+}
+
 // ParseControlPersist parses OpenSSH ControlPersist specifications:
 // - "no" / "false" / "": disabled
 // - "yes" / "true" / "0": enabled indefinitely (indefinite=true, timeout=0)

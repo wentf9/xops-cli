@@ -286,9 +286,16 @@ func TestSSHForward_DynamicForwardAccumulation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("resolveSessionForwardConfig failed: %v", err)
 		}
-		wantResolved := []string{"127.0.0.1:1080", "127.0.0.1:1081"}
-		if !slices.Equal(cfg.dynamicForwards, wantResolved) {
-			t.Fatalf("cfg.dynamicForwards = %v, want %v", cfg.dynamicForwards, wantResolved)
+		if len(cfg.dynamicForwards) != 2 {
+			t.Fatalf("len(cfg.dynamicForwards) = %d, want 2", len(cfg.dynamicForwards))
+		}
+		net0, addr0 := cfg.dynamicForwards[0].LocalListenAddress(cfg.gatewayPorts)
+		if net0 != "tcp" || addr0 != "127.0.0.1:1080" {
+			t.Fatalf("dynamic forward 0 = %s, %s, want tcp, 127.0.0.1:1080", net0, addr0)
+		}
+		net1, addr1 := cfg.dynamicForwards[1].LocalListenAddress(cfg.gatewayPorts)
+		if net1 != "tcp" || addr1 != "127.0.0.1:1081" {
+			t.Fatalf("dynamic forward 1 = %s, %s, want tcp, 127.0.0.1:1081", net1, addr1)
 		}
 	})
 
@@ -300,9 +307,12 @@ func TestSSHForward_DynamicForwardAccumulation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("resolveSessionForwardConfig failed: %v", err)
 		}
-		wantResolved := []string{"127.0.0.1:1080"}
-		if !slices.Equal(cfg.dynamicForwards, wantResolved) {
-			t.Fatalf("cfg.dynamicForwards = %v, want %v", cfg.dynamicForwards, wantResolved)
+		if len(cfg.dynamicForwards) != 1 {
+			t.Fatalf("len(cfg.dynamicForwards) = %d, want 1", len(cfg.dynamicForwards))
+		}
+		net0, addr0 := cfg.dynamicForwards[0].LocalListenAddress(cfg.gatewayPorts)
+		if net0 != "tcp" || addr0 != "127.0.0.1:1080" {
+			t.Fatalf("dynamic forward 0 = %s, %s, want tcp, 127.0.0.1:1080", net0, addr0)
 		}
 	})
 }

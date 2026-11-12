@@ -40,6 +40,12 @@ const (
 	OptionKexAlgorithms                = "kex_algorithms"
 	OptionExitOnForwardFailure         = "exit_on_forward_failure"
 	OptionClearAllForwardings          = "clear_all_forwardings"
+	OptionGatewayPorts                 = "gateway_ports"
+	OptionStreamLocalBindUnlink        = "stream_local_bind_unlink"
+	OptionStreamLocalBindMask          = "stream_local_bind_mask"
+	OptionForkAfterAuthentication      = "fork_after_authentication"
+	OptionStdinNull                    = "stdin_null"
+	OptionSessionType                  = "session_type"
 	OptionTunnel                       = "tunnel"
 	OptionTunnelDevice                 = "tunnel_device"
 	OptionRequestTTY                   = "request_tty"
@@ -301,6 +307,56 @@ var optionRegistry = []OptionSpec{
 		},
 	},
 	{
+		CanonicalKey: OptionGatewayPorts,
+		OpenSSHName:  "GatewayPorts",
+		Class:        OptionClassForward,
+		Normalize: func(raw string) (string, error) {
+			return normalizeYesNoOption("GatewayPorts", raw)
+		},
+	},
+	{
+		CanonicalKey: OptionStreamLocalBindUnlink,
+		OpenSSHName:  "StreamLocalBindUnlink",
+		Class:        OptionClassForward,
+		Normalize: func(raw string) (string, error) {
+			return normalizeYesNoOption("StreamLocalBindUnlink", raw)
+		},
+	},
+	{
+		CanonicalKey: OptionStreamLocalBindMask,
+		OpenSSHName:  "StreamLocalBindMask",
+		Class:        OptionClassForward,
+		Normalize:    ParseStreamLocalBindMaskOption,
+	},
+	{
+		CanonicalKey: OptionForkAfterAuthentication,
+		OpenSSHName:  "ForkAfterAuthentication",
+		Class:        OptionClassSession,
+		Normalize: func(raw string) (string, error) {
+			return normalizeYesNoOption("ForkAfterAuthentication", raw)
+		},
+	},
+	{
+		CanonicalKey: OptionStdinNull,
+		OpenSSHName:  "StdinNull",
+		Class:        OptionClassSession,
+		Normalize: func(raw string) (string, error) {
+			return normalizeYesNoOption("StdinNull", raw)
+		},
+	},
+	{
+		CanonicalKey: OptionSessionType,
+		OpenSSHName:  "SessionType",
+		Class:        OptionClassSession,
+		Normalize: func(raw string) (string, error) {
+			m, err := ParseSessionTypeMode(raw)
+			if err != nil {
+				return "", err
+			}
+			return string(m), nil
+		},
+	},
+	{
 		CanonicalKey: OptionTunnel,
 		OpenSSHName:  "Tunnel",
 		Class:        OptionClassForward,
@@ -352,7 +408,7 @@ var optionRegistry = []OptionSpec{
 		MultiValue:   true,
 		Normalize: func(raw string) (string, error) {
 			return normalizeMultiForwardEntries("RemoteForward", raw, func(item string) (string, error) {
-				spec, err := ParseForwardSpec(item)
+				spec, err := ParseRemoteForwardSpec(item)
 				if err != nil {
 					return "", err
 				}
@@ -617,7 +673,10 @@ func ValidateControlPathSyntax(rawPath string) error {
 	if rawPath == "" || rawPath == "none" {
 		return nil
 	}
+	return validatePathTokenSyntax(rawPath, "ControlPath")
+}
 
+func validatePathTokenSyntax(rawPath, kind string) error {
 	if strings.Contains(rawPath, "${") {
 		idx := 0
 		for {
@@ -628,12 +687,12 @@ func ValidateControlPathSyntax(rawPath string) error {
 			start += idx
 			end := strings.Index(rawPath[start:], "}")
 			if end == -1 {
-				return fmt.Errorf("unclosed environment variable in ControlPath: %q", rawPath[start:])
+				return fmt.Errorf("unclosed environment variable in %s: %q", kind, rawPath[start:])
 			}
 			end += start
 			varName := rawPath[start+2 : end]
 			if varName == "" || !isValidEnvIdentifier(varName) {
-				return fmt.Errorf("invalid environment variable name ${%s} in ControlPath", varName)
+				return fmt.Errorf("invalid environment variable name ${%s} in %s", varName, kind)
 			}
 			idx = end + 1
 		}
@@ -642,13 +701,13 @@ func ValidateControlPathSyntax(rawPath string) error {
 	for i := 0; i < len(rawPath); i++ {
 		if rawPath[i] == '%' {
 			if i+1 >= len(rawPath) {
-				return errors.New("trailing '%' in ControlPath")
+				return fmt.Errorf("trailing '%%' in %s", kind)
 			}
 			i++
 			switch rawPath[i] {
 			case '%', 'h', 'p', 'r', 'n', 'u', 'l', 'L', 'i', 'd', 'j', 'C':
 			default:
-				return fmt.Errorf("unknown ControlPath token %%%c", rawPath[i])
+				return fmt.Errorf("unknown %s token %%%c", kind, rawPath[i])
 			}
 		}
 	}

@@ -74,6 +74,12 @@ func TestParseOptionStrings_MultiValueAndForwardOptions(t *testing.T) {
 		"RequestTTY force",
 		"ExitOnForwardFailure yes",
 		"ClearAllForwardings yes",
+		"GatewayPorts yes",
+		"StreamLocalBindUnlink yes",
+		"StreamLocalBindMask 0117",
+		"ForkAfterAuthentication yes",
+		"StdinNull yes",
+		"SessionType none",
 	})
 	if err != nil {
 		t.Fatalf("ParseOptionStrings failed: %v", err)
@@ -123,6 +129,29 @@ func assertParsedForwardOptions(t *testing.T, sshOpts *ssh.Options) {
 	if clearFwd, ok := sshOpts.ClearAllForwardings(); !ok || !clearFwd {
 		t.Errorf("ClearAllForwardings = (%v, %v), want (true, true)", clearFwd, ok)
 	}
+	assertParsedStreamLocalAndSessionOptions(t, sshOpts)
+}
+
+func assertParsedStreamLocalAndSessionOptions(t *testing.T, sshOpts *ssh.Options) {
+	t.Helper()
+	if !sshOpts.EffectiveGatewayPorts() {
+		t.Errorf("EffectiveGatewayPorts = false, want true")
+	}
+	if !sshOpts.EffectiveStreamLocalBindUnlink() {
+		t.Errorf("EffectiveStreamLocalBindUnlink = false, want true")
+	}
+	if mask, ok := sshOpts.StreamLocalBindMask(); !ok || mask != 0o117 {
+		t.Errorf("StreamLocalBindMask = (%04o, %v), want (0117, true)", mask, ok)
+	}
+	if fork, ok := sshOpts.ForkAfterAuthentication(); !ok || !fork {
+		t.Errorf("ForkAfterAuthentication = (%v, %v), want (true, true)", fork, ok)
+	}
+	if stdinNull, ok := sshOpts.StdinNull(); !ok || !stdinNull {
+		t.Errorf("StdinNull = (%v, %v), want (true, true)", stdinNull, ok)
+	}
+	if sshOpts.SessionType() != ssh.SessionTypeNone {
+		t.Errorf("SessionType = %q, want %q", sshOpts.SessionType(), ssh.SessionTypeNone)
+	}
 }
 
 func TestResolveSSHOptions_Tier4Filtering_ManagedVsVirtual(t *testing.T) {
@@ -157,7 +186,7 @@ func TestResolveSSHOptions_Tier4Filtering_ManagedVsVirtual(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveSSHOptions with CLI opts failed: %v", err)
 	}
-	if len(managedWithCLIOpts.LocalForwards()) != 1 || managedWithCLIOpts.LocalForwards()[0] != "127.0.0.1:9999 127.0.0.1:99" {
+	if len(managedWithCLIOpts.LocalForwards()) != 1 || managedWithCLIOpts.LocalForwards()[0] != "9999 127.0.0.1:99" {
 		t.Errorf("expected Tier 1 LocalForward on managed node, got %v", managedWithCLIOpts.LocalForwards())
 	}
 }
@@ -175,6 +204,12 @@ Host srv
     RequestTTY force
     ExitOnForwardFailure yes
     ClearAllForwardings yes
+    GatewayPorts yes
+    StreamLocalBindUnlink yes
+    StreamLocalBindMask 0117
+    ForkAfterAuthentication yes
+    StdinNull yes
+    SessionType none
     LocalForward 8080 127.0.0.1:80
     RemoteForward 9090 127.0.0.1:90
     DynamicForward 1080
@@ -226,6 +261,27 @@ func assertManagedTier4Filtered(t *testing.T, managedOpts *ssh.Options) {
 	if _, ok := managedOpts.ExitOnForwardFailure(); ok {
 		t.Errorf("ExitOnForwardFailure should be filtered for managed node")
 	}
+	if _, ok := managedOpts.ClearAllForwardings(); ok {
+		t.Errorf("ClearAllForwardings should be filtered for managed node")
+	}
+	if managedOpts.EffectiveGatewayPorts() {
+		t.Errorf("GatewayPorts should be filtered for managed node")
+	}
+	if managedOpts.EffectiveStreamLocalBindUnlink() {
+		t.Errorf("StreamLocalBindUnlink should be filtered for managed node")
+	}
+	if _, ok := managedOpts.StreamLocalBindMask(); ok {
+		t.Errorf("StreamLocalBindMask should be filtered for managed node")
+	}
+	if _, ok := managedOpts.ForkAfterAuthentication(); ok {
+		t.Errorf("ForkAfterAuthentication should be filtered for managed node")
+	}
+	if _, ok := managedOpts.StdinNull(); ok {
+		t.Errorf("StdinNull should be filtered for managed node")
+	}
+	if managedOpts.SessionType() != "" {
+		t.Errorf("SessionType should be filtered for managed node, got %q", managedOpts.SessionType())
+	}
 }
 
 func assertVirtualTier4Preserved(t *testing.T, virtualOpts *ssh.Options) {
@@ -233,13 +289,13 @@ func assertVirtualTier4Preserved(t *testing.T, virtualOpts *ssh.Options) {
 	if virtualOpts.Get(ssh.OptionConnectTimeout) != "15" {
 		t.Errorf("expected ConnectTimeout=15 on virtual node, got %q", virtualOpts.Get(ssh.OptionConnectTimeout))
 	}
-	if len(virtualOpts.LocalForwards()) != 1 || virtualOpts.LocalForwards()[0] != "127.0.0.1:8080 127.0.0.1:80" {
+	if len(virtualOpts.LocalForwards()) != 1 || virtualOpts.LocalForwards()[0] != "8080 127.0.0.1:80" {
 		t.Errorf("expected LocalForward preserved on virtual node, got %v", virtualOpts.LocalForwards())
 	}
-	if len(virtualOpts.RemoteForwards()) != 1 || virtualOpts.RemoteForwards()[0] != "127.0.0.1:9090 127.0.0.1:90" {
+	if len(virtualOpts.RemoteForwards()) != 1 || virtualOpts.RemoteForwards()[0] != "9090 127.0.0.1:90" {
 		t.Errorf("expected RemoteForward preserved on virtual node, got %v", virtualOpts.RemoteForwards())
 	}
-	if len(virtualOpts.DynamicForwards()) != 1 || virtualOpts.DynamicForwards()[0] != "127.0.0.1:1080" {
+	if len(virtualOpts.DynamicForwards()) != 1 || virtualOpts.DynamicForwards()[0] != "1080" {
 		t.Errorf("expected DynamicForward preserved on virtual node, got %v", virtualOpts.DynamicForwards())
 	}
 	if virtualOpts.Tunnel() != "ethernet" {
@@ -251,4 +307,11 @@ func assertVirtualTier4Preserved(t *testing.T, virtualOpts *ssh.Options) {
 	if virtualOpts.RequestTTY() != ssh.RequestTTYForce {
 		t.Errorf("expected RequestTTY=force on virtual node, got %q", virtualOpts.RequestTTY())
 	}
+	if exitFail, ok := virtualOpts.ExitOnForwardFailure(); !ok || !exitFail {
+		t.Errorf("expected ExitOnForwardFailure=true on virtual node, got (%v, %v)", exitFail, ok)
+	}
+	if clearFwd, ok := virtualOpts.ClearAllForwardings(); !ok || !clearFwd {
+		t.Errorf("expected ClearAllForwardings=true on virtual node, got (%v, %v)", clearFwd, ok)
+	}
+	assertParsedStreamLocalAndSessionOptions(t, virtualOpts)
 }

@@ -54,15 +54,15 @@ flag_alias:
 flag_tag:
   other: "为节点添加标签(分组)"
 flag_dynamic_forward:
-  other: "动态端口转发（SOCKS5 代理）在本地监听 [bind_address:]port"
+  other: "动态端口转发（SOCKS4/SOCKS4a/SOCKS5 代理），监听本地 [bind_address:]port 或本地 Unix 套接字"
 flag_login:
   other: "SSH 登录用户名"
 flag_identity:
   other: "SSH 身份(私钥)文件路径"
 flag_local_forward:
-  other: "本地端口转发 [bind_address:]port:host:hostport"
+  other: "本地端口或 Unix 域套接字转发 ([bind_address:]port:host:hostport 或 local_socket:remote_socket)"
 flag_remote_forward:
-  other: "远程端口转发 [bind_address:]port:host:hostport"
+  other: "远程端口、Unix 域套接字或反向动态转发 ([bind_address:]port[:host:hostport] 或 remote_socket[:local_socket])"
 flag_no_cmd:
   other: "不执行远程命令 (通常与端口转发配合使用)"
 flag_background:
@@ -78,7 +78,7 @@ flag_ssh_option:
 flag_ssh_control_command:
   other: "向运行中的主进程发送控制命令：check, exit, stop, forward, cancel, proxy, proxy-stream, conninfo, channels"
 ssh_err_background_requires_nocmd:
-  other: "后台执行 (-f) 必须与 -N (不执行远程命令) 选项配合使用"
+  other: "后台运行 (-f) 需要指定要执行的远程命令或配合 -N 使用"
 ssh_flag_stdio_forward:
   other: "将标准输入输出通过安全通道转发至 host:port"
 ssh_flag_tunnel_device:
@@ -87,6 +87,10 @@ ssh_flag_disable_tty:
   other: "禁止分配伪终端 (PTY)"
 ssh_flag_force_tty:
   other: "强制分配伪终端 (指定 -tt 时即使本地标准输入非终端也强制分配)"
+ssh_flag_gateway_ports:
+  other: "允许远程主机连接到本地转发的端口"
+ssh_err_nocmd_with_command:
+  other: "指定 -N (或 SessionType=none) 时不能同时提供远程命令"
 ssh_err_stdio_forward_with_cmd:
   other: "使用 -W 标准输入输出转发时不能同时指定远程命令"
 ssh_err_stdio_forward_with_bg:

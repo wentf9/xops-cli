@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/wentf9/xops-cli/core/ssh"
+	"github.com/wentf9/xops-cli/internal/sshenv"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
@@ -228,6 +229,7 @@ func (v *dynamicForwardFlagValue) String() string {
 func (o *SshOptions) registerForwardAndSessionFlags(cmd *cobra.Command) {
 	o.control.onOptionAdded = o.recordOptionFlag
 
+	cmd.Flags().BoolVarP(&o.GatewayPorts, "gateway-ports", "g", false, i18n.T("ssh_flag_gateway_ports"))
 	cmd.Flags().VarP(&dynamicForwardFlagValue{opts: o}, "dynamic-forward", "D", i18n.T("flag_dynamic_forward"))
 	cmd.Flags().VarP(&stdioForwardFlagValue{opts: o}, "stdio-forward", "W", i18n.T("ssh_flag_stdio_forward"))
 	cmd.Flags().VarP(&tunnelDeviceFlagValue{opts: o}, "tunnel-device", "w", i18n.T("ssh_flag_tunnel_device"))
@@ -304,36 +306,71 @@ func (o *SshOptions) toSessionControlOptions() (adapter.SessionControlOptions, e
 	if err != nil {
 		return sessionOpts, err
 	}
+	if err := o.applyCLISessionFlags(&sessionOpts.Options); err != nil {
+		return sessionOpts, err
+	}
+	return sessionOpts, nil
+}
+
+func (o *SshOptions) applyCLISessionFlags(opts **ssh.Options) error {
+	ensureOpts := func() *ssh.Options {
+		if *opts == nil {
+			*opts = &ssh.Options{}
+		}
+		return *opts
+	}
+	if o.GatewayPorts {
+		if setErr := ensureOpts().Set(ssh.OptionGatewayPorts, "yes"); setErr != nil {
+			return setErr
+		}
+	}
+	if o.BgRun {
+		if setErr := ensureOpts().Set(ssh.OptionForkAfterAuthentication, "yes"); setErr != nil {
+			return setErr
+		}
+	}
+	if o.NoCmd {
+		if setErr := ensureOpts().Set(ssh.OptionSessionType, string(ssh.SessionTypeNone)); setErr != nil {
+			return setErr
+		}
+	}
+	if o.StdinRedirect {
+		if setErr := ensureOpts().Set(ssh.OptionStdinNull, "yes"); setErr != nil {
+			return setErr
+		}
+	}
 	if o.TunnelDevice != "" {
-		devSpec, parseErr := ssh.ParseTunnelDevice(o.TunnelDevice)
-		if parseErr != nil {
-			return sessionOpts, fmt.Errorf("invalid tunnel device (-w): %w", parseErr)
-		}
-		if sessionOpts.Options == nil {
-			sessionOpts.Options = &ssh.Options{}
-		}
-		if setErr := sessionOpts.Options.Set(ssh.OptionTunnelDevice, devSpec.String()); setErr != nil {
-			return sessionOpts, setErr
-		}
-		if o.cliTunnelMode != "" {
-			if setErr := sessionOpts.Options.Set(ssh.OptionTunnel, o.cliTunnelMode); setErr != nil {
-				return sessionOpts, setErr
-			}
-		} else if sessionOpts.Options.Tunnel() == "" {
-			if setErr := sessionOpts.Options.Set(ssh.OptionTunnel, string(ssh.TunnelModePointToPoint)); setErr != nil {
-				return sessionOpts, setErr
-			}
+		if setErr := o.applyCLITunnelDevice(ensureOpts); setErr != nil {
+			return setErr
 		}
 	}
 	if ttyMode := o.explicitCLITTYMode(); ttyMode != "" {
-		if sessionOpts.Options == nil {
-			sessionOpts.Options = &ssh.Options{}
-		}
-		if setErr := sessionOpts.Options.Set(ssh.OptionRequestTTY, string(ttyMode)); setErr != nil {
-			return sessionOpts, setErr
+		if setErr := ensureOpts().Set(ssh.OptionRequestTTY, string(ttyMode)); setErr != nil {
+			return setErr
 		}
 	}
-	return sessionOpts, nil
+	return nil
+}
+
+func (o *SshOptions) applyCLITunnelDevice(ensureOpts func() *ssh.Options) error {
+	devSpec, parseErr := ssh.ParseTunnelDevice(o.TunnelDevice)
+	if parseErr != nil {
+		return fmt.Errorf("invalid tunnel device (-w): %w", parseErr)
+	}
+	opts := ensureOpts()
+	if setErr := opts.Set(ssh.OptionTunnelDevice, devSpec.String()); setErr != nil {
+		return setErr
+	}
+	if o.cliTunnelMode != "" {
+		if setErr := opts.Set(ssh.OptionTunnel, o.cliTunnelMode); setErr != nil {
+			return setErr
+		}
+	} else if opts.Tunnel() == "" {
+		if setErr := opts.Set(ssh.OptionTunnel, string(ssh.TunnelModePointToPoint)); setErr != nil {
+			return setErr
+		}
+	}
+	return nil
 }
 
 func (o *SshOptions) normalizeForMuxDaemon() {
@@ -346,6 +383,7 @@ func (o *SshOptions) normalizeForMuxDaemon() {
 	o.RemoteForwards = nil
 	o.DynamicForward = ""
 	o.DynamicForwards = nil
+	o.BgRun = false
 }
 
 func (o *SshOptions) validateForwardAndSessionFlags() error {
@@ -356,7 +394,7 @@ func (o *SshOptions) validateForwardAndSessionFlags() error {
 		if o.Command != "" || o.stdinScript {
 			return errors.New(i18n.T("ssh_err_stdio_forward_with_cmd"))
 		}
-		if o.BgRun {
+		if o.effectiveBgRun() {
 			return errors.New(i18n.T("ssh_err_stdio_forward_with_bg"))
 		}
 		if o.Sudo {
@@ -366,6 +404,9 @@ func (o *SshOptions) validateForwardAndSessionFlags() error {
 		if ctlCmd != "" && ctlCmd != "proxy" {
 			return errors.New(i18n.T("ssh_err_stdio_forward_with_mux_cmd"))
 		}
+	}
+	if (o.NoCmd || (!o.NoCmd && o.cliSessionTypeNone())) && o.Command != "" {
+		return errors.New(i18n.T("ssh_err_nocmd_with_command"))
 	}
 	if o.TunnelDevice != "" {
 		if _, err := ssh.ParseTunnelDevice(o.TunnelDevice); err != nil {
@@ -396,6 +437,7 @@ func (o *SshOptions) resolveAndCacheSessionOptions(provider config.ConfigProvide
 	}
 	connTarget := effectiveConnectionTarget(o, nodeID)
 	target := controlTarget(o, provider, nodeID)
+	o.resolvedTarget = &target
 	lookupKey := resolveEffectiveControlNodeID(provider, nodeID, target.OriginalHost)
 	if lookupKey == "" {
 		lookupKey = connTarget.Selector
@@ -422,6 +464,63 @@ func (o *SshOptions) effectiveSessionOptions() (*ssh.Options, error) {
 	return ssh.EffectiveOptions(sessionOpts.ToSSHOptions())
 }
 
+func (o *SshOptions) effectiveNoCmd() bool {
+	if o == nil {
+		return false
+	}
+	if o.NoCmd || o.StdioForward != "" {
+		return true
+	}
+	eff, err := o.effectiveSessionOptions()
+	if err == nil && eff != nil && eff.SessionType() == ssh.SessionTypeNone {
+		return true
+	}
+	return false
+}
+
+func (o *SshOptions) effectiveBgRun() bool {
+	if o == nil {
+		return false
+	}
+	if o.BgRun {
+		return true
+	}
+	eff, err := o.effectiveSessionOptions()
+	if err == nil && eff != nil {
+		if fork, ok := eff.ForkAfterAuthentication(); ok && fork {
+			return true
+		}
+	}
+	return false
+}
+
+func (o *SshOptions) effectiveStdinNull() bool {
+	if o == nil {
+		return false
+	}
+	if o.StdinRedirect || o.effectiveBgRun() {
+		return true
+	}
+	eff, err := o.effectiveSessionOptions()
+	if err == nil && eff != nil {
+		if sn, ok := eff.StdinNull(); ok && sn {
+			return true
+		}
+	}
+	return false
+}
+
+func (o *SshOptions) cliSessionTypeNone() bool {
+	if o == nil {
+		return false
+	}
+	eff, err := o.effectiveSessionOptions()
+	if err == nil && eff != nil {
+		return eff.SessionType() == ssh.SessionTypeNone
+	}
+	return false
+}
+
 func (o *SshOptions) effectiveRequestTTY() ssh.RequestTTYMode {
 	if o == nil {
 		return ssh.RequestTTYAuto
@@ -434,21 +533,24 @@ func (o *SshOptions) effectiveRequestTTY() ssh.RequestTTYMode {
 			return mode
 		}
 	}
-	if o.StdioForward != "" || o.NoCmd {
+	if o.StdioForward != "" || o.effectiveNoCmd() {
 		return ssh.RequestTTYNo
 	}
 	return ssh.RequestTTYAuto
 }
 
 type sessionForwardConfig struct {
-	localForwards        []ssh.ForwardSpec
-	remoteForwards       []ssh.ForwardSpec
-	dynamicForwards      []string
-	hasTunnelDevice      bool
-	tunnelMode           ssh.TunnelMode
-	tunnelDevice         ssh.TunnelDeviceSpec
-	exitOnForwardFailure bool
-	clearAllForwardings  bool
+	localForwards         []ssh.ForwardSpec
+	remoteForwards        []ssh.ForwardSpec
+	dynamicForwards       []ssh.ForwardEndpoint
+	gatewayPorts          bool
+	streamLocalBindUnlink bool
+	streamLocalBindMask   uint32
+	hasTunnelDevice       bool
+	tunnelMode            ssh.TunnelMode
+	tunnelDevice          ssh.TunnelDeviceSpec
+	exitOnForwardFailure  bool
+	clearAllForwardings   bool
 }
 
 func collectUniqueForwardSpecs(primary, secondary []string) ([]ssh.ForwardSpec, error) {
@@ -458,6 +560,16 @@ func collectUniqueForwardSpecs(primary, secondary []string) ([]ssh.ForwardSpec, 
 		spec, err := ssh.ParseForwardSpec(raw)
 		if err != nil {
 			return err
+		}
+		if spec.Bind.IsUnix() {
+			if err := ssh.ValidateStreamLocalPathSyntax(spec.Bind.SocketPath); err != nil {
+				return err
+			}
+		}
+		if spec.Dest.IsUnix() {
+			if err := ssh.ValidateStreamLocalPathSyntax(spec.Dest.SocketPath); err != nil {
+				return err
+			}
 		}
 		key := spec.String()
 		if _, exists := seen[key]; !exists {
@@ -479,27 +591,71 @@ func collectUniqueForwardSpecs(primary, secondary []string) ([]ssh.ForwardSpec, 
 	return out, nil
 }
 
-func collectUniqueDynamicSpecs(primary, secondary []string) ([]string, error) {
+func collectUniqueRemoteForwardSpecs(primary, secondary []string) ([]ssh.ForwardSpec, error) {
 	seen := make(map[string]struct{})
-	var out []string
-	appendAddr := func(raw string) error {
-		addr, err := ssh.ParseDynamicForwardSpec(raw)
+	var out []ssh.ForwardSpec
+	appendSpec := func(raw string) error {
+		spec, err := ssh.ParseRemoteForwardSpec(raw)
 		if err != nil {
 			return err
 		}
-		if _, exists := seen[addr]; !exists {
-			seen[addr] = struct{}{}
-			out = append(out, addr)
+		if spec.Bind.IsUnix() {
+			if err := ssh.ValidateStreamLocalPathSyntax(spec.Bind.SocketPath); err != nil {
+				return err
+			}
+		}
+		if !spec.IsDynamic && spec.Dest.IsUnix() {
+			if err := ssh.ValidateStreamLocalPathSyntax(spec.Dest.SocketPath); err != nil {
+				return err
+			}
+		}
+		key := spec.String()
+		if _, exists := seen[key]; !exists {
+			seen[key] = struct{}{}
+			out = append(out, spec)
 		}
 		return nil
 	}
 	for _, raw := range primary {
-		if err := appendAddr(raw); err != nil {
+		if err := appendSpec(raw); err != nil {
 			return nil, err
 		}
 	}
 	for _, raw := range secondary {
-		if err := appendAddr(raw); err != nil {
+		if err := appendSpec(raw); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func collectUniqueDynamicEndpoints(primary, secondary []string) ([]ssh.ForwardEndpoint, error) {
+	seen := make(map[string]struct{})
+	var out []ssh.ForwardEndpoint
+	appendEp := func(raw string) error {
+		ep, err := ssh.ParseDynamicForwardEndpoint(raw)
+		if err != nil {
+			return err
+		}
+		if ep.IsUnix() {
+			if err := ssh.ValidateStreamLocalPathSyntax(ep.SocketPath); err != nil {
+				return err
+			}
+		}
+		key := ep.String()
+		if _, exists := seen[key]; !exists {
+			seen[key] = struct{}{}
+			out = append(out, ep)
+		}
+		return nil
+	}
+	for _, raw := range primary {
+		if err := appendEp(raw); err != nil {
+			return nil, err
+		}
+	}
+	for _, raw := range secondary {
+		if err := appendEp(raw); err != nil {
 			return nil, err
 		}
 	}
@@ -510,16 +666,115 @@ func (o *SshOptions) validateCLIForwardArgs() error {
 	if _, err := collectUniqueForwardSpecs(o.LocalForwards, nil); err != nil {
 		return err
 	}
-	if _, err := collectUniqueForwardSpecs(o.RemoteForwards, nil); err != nil {
+	if _, err := collectUniqueRemoteForwardSpecs(o.RemoteForwards, nil); err != nil {
 		return err
 	}
-	if _, err := collectUniqueDynamicSpecs(o.cliDynamicForwards(), nil); err != nil {
+	if _, err := collectUniqueDynamicEndpoints(o.cliDynamicForwards(), nil); err != nil {
 		return err
 	}
 	return nil
 }
 
+func expandForwardSpecs(cfg *sessionForwardConfig, env ssh.Environment, target ssh.TargetContext) error {
+	for i := range cfg.localForwards {
+		if cfg.localForwards[i].Bind.IsUnix() {
+			expanded, err := ssh.ExpandStreamLocalPath(cfg.localForwards[i].Bind.SocketPath, env, target, true)
+			if err != nil {
+				return err
+			}
+			cfg.localForwards[i].Bind.SocketPath = expanded
+			cfg.localForwards[i].BindAddr = expanded
+		}
+		if cfg.localForwards[i].Dest.IsUnix() {
+			expanded, err := ssh.ExpandStreamLocalPath(cfg.localForwards[i].Dest.SocketPath, env, target, false)
+			if err != nil {
+				return err
+			}
+			cfg.localForwards[i].Dest.SocketPath = expanded
+			cfg.localForwards[i].DestAddr = expanded
+		}
+	}
+	for i := range cfg.remoteForwards {
+		if cfg.remoteForwards[i].Bind.IsUnix() {
+			expanded, err := ssh.ExpandStreamLocalPath(cfg.remoteForwards[i].Bind.SocketPath, env, target, false)
+			if err != nil {
+				return err
+			}
+			cfg.remoteForwards[i].Bind.SocketPath = expanded
+			cfg.remoteForwards[i].BindAddr = expanded
+		}
+		if !cfg.remoteForwards[i].IsDynamic && cfg.remoteForwards[i].Dest.IsUnix() {
+			expanded, err := ssh.ExpandStreamLocalPath(cfg.remoteForwards[i].Dest.SocketPath, env, target, true)
+			if err != nil {
+				return err
+			}
+			cfg.remoteForwards[i].Dest.SocketPath = expanded
+			cfg.remoteForwards[i].DestAddr = expanded
+		}
+	}
+	for i := range cfg.dynamicForwards {
+		if cfg.dynamicForwards[i].IsUnix() {
+			expanded, err := ssh.ExpandStreamLocalPath(cfg.dynamicForwards[i].SocketPath, env, target, true)
+			if err != nil {
+				return err
+			}
+			cfg.dynamicForwards[i].SocketPath = expanded
+		}
+	}
+	deduplicateExpandedForwards(cfg)
+	return nil
+}
+
+func deduplicateExpandedForwards(cfg *sessionForwardConfig) {
+	if len(cfg.localForwards) > 1 {
+		seen := make(map[string]struct{}, len(cfg.localForwards))
+		dedup := cfg.localForwards[:0]
+		for _, spec := range cfg.localForwards {
+			key := spec.String()
+			if _, exists := seen[key]; !exists {
+				seen[key] = struct{}{}
+				dedup = append(dedup, spec)
+			}
+		}
+		cfg.localForwards = dedup
+	}
+	if len(cfg.remoteForwards) > 1 {
+		seen := make(map[string]struct{}, len(cfg.remoteForwards))
+		dedup := cfg.remoteForwards[:0]
+		for _, spec := range cfg.remoteForwards {
+			key := spec.String()
+			if _, exists := seen[key]; !exists {
+				seen[key] = struct{}{}
+				dedup = append(dedup, spec)
+			}
+		}
+		cfg.remoteForwards = dedup
+	}
+	if len(cfg.dynamicForwards) > 1 {
+		seen := make(map[string]struct{}, len(cfg.dynamicForwards))
+		dedup := cfg.dynamicForwards[:0]
+		for _, ep := range cfg.dynamicForwards {
+			key := ep.String()
+			if _, exists := seen[key]; !exists {
+				seen[key] = struct{}{}
+				dedup = append(dedup, ep)
+			}
+		}
+		cfg.dynamicForwards = dedup
+	}
+}
+
 func (o *SshOptions) resolveSessionForwardConfig() (sessionForwardConfig, error) {
+	var target ssh.TargetContext
+	if o != nil && o.resolvedTarget != nil {
+		target = *o.resolvedTarget
+	} else {
+		target = controlTarget(o, nil, "")
+	}
+	return o.resolveSessionForwardConfigWithTarget(nil, "", target)
+}
+
+func (o *SshOptions) resolveSessionForwardConfigWithTarget(provider config.ConfigProvider, nodeID string, target ssh.TargetContext) (sessionForwardConfig, error) {
 	var out sessionForwardConfig
 	out.exitOnForwardFailure = true
 
@@ -528,9 +783,19 @@ func (o *SshOptions) resolveSessionForwardConfig() (sessionForwardConfig, error)
 		return out, err
 	}
 
-	eff, err := o.effectiveSessionOptions()
-	if err != nil {
-		return out, err
+	var eff *ssh.Options
+	var err error
+	if provider != nil {
+		eff, err = o.resolveAndCacheSessionOptions(provider, nodeID)
+		if err != nil {
+			return out, err
+		}
+		target = controlTarget(o, provider, nodeID)
+	} else {
+		eff, err = o.effectiveSessionOptions()
+		if err != nil {
+			return out, err
+		}
 	}
 
 	if clearVal, ok := eff.ClearAllForwardings(); ok {
@@ -550,10 +815,10 @@ func (o *SshOptions) resolveSessionForwardConfig() (sessionForwardConfig, error)
 	if out.localForwards, err = collectUniqueForwardSpecs(o.LocalForwards, eff.LocalForwards()); err != nil {
 		return out, err
 	}
-	if out.remoteForwards, err = collectUniqueForwardSpecs(o.RemoteForwards, eff.RemoteForwards()); err != nil {
+	if out.remoteForwards, err = collectUniqueRemoteForwardSpecs(o.RemoteForwards, eff.RemoteForwards()); err != nil {
 		return out, err
 	}
-	if out.dynamicForwards, err = collectUniqueDynamicSpecs(o.cliDynamicForwards(), eff.DynamicForwards()); err != nil {
+	if out.dynamicForwards, err = collectUniqueDynamicEndpoints(o.cliDynamicForwards(), eff.DynamicForwards()); err != nil {
 		return out, err
 	}
 
@@ -570,7 +835,38 @@ func (o *SshOptions) resolveSessionForwardConfig() (sessionForwardConfig, error)
 		out.tunnelDevice = devSpec
 	}
 
+	out.gatewayPorts = o.GatewayPorts || eff.EffectiveGatewayPorts()
+	out.streamLocalBindUnlink = eff.EffectiveStreamLocalBindUnlink()
+	out.streamLocalBindMask = eff.EffectiveStreamLocalBindMask()
+
+	if err := expandForwardSpecs(&out, sshenv.Discover(), target); err != nil {
+		return out, err
+	}
+
 	return out, nil
+}
+
+func isMuxDaemonPreservedOption(opt string) bool {
+	key, _, err := adapter.SplitOptionKeyValue(opt)
+	if err != nil || key == "" {
+		return false
+	}
+	spec, ok := ssh.LookupOptionSpec(key)
+	if !ok {
+		return false
+	}
+	return spec.CanonicalKey == ssh.OptionGatewayPorts ||
+		spec.CanonicalKey == ssh.OptionStreamLocalBindUnlink ||
+		spec.CanonicalKey == ssh.OptionStreamLocalBindMask
+}
+
+func isGatewayPortsOption(opt string) bool {
+	key, _, err := adapter.SplitOptionKeyValue(opt)
+	if err != nil || key == "" {
+		return false
+	}
+	spec, ok := ssh.LookupOptionSpec(key)
+	return ok && spec.CanonicalKey == ssh.OptionGatewayPorts
 }
 
 func isLocalTerminal(r io.Reader) (*os.File, bool) {

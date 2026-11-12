@@ -33,12 +33,12 @@ func (c *Client) runRemoteForwardRequest(ctx context.Context, request func() err
 	return request()
 }
 
-func (c *Client) listenRemoteContext(ctx context.Context, addr string, timeout time.Duration) (net.Listener, error) {
+func (c *Client) listenRemoteContext(ctx context.Context, network, addr string, timeout time.Duration) (net.Listener, error) {
 	requestCtx, cancel := withTimeoutOrDefault(ctx, timeout, remoteForwardRequestTimeout)
 	defer cancel()
 	var listener net.Listener
 	err := c.runRemoteForwardRequest(requestCtx, func() (err error) {
-		listener, err = c.sshClient.Listen("tcp", addr)
+		listener, err = c.sshClient.Listen(network, addr)
 		return err
 	})
 	if listener == nil {
