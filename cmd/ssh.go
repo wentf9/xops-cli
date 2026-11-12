@@ -48,13 +48,24 @@ type SshOptions struct {
 	LocalForwards      []string
 	RemoteForwards     []string
 	NoCmd              bool
+	GatewayPorts       bool
 	DynamicForward     string
+	DynamicForwards    []string
+	StdioForward       string
+	TunnelDevice       string
+	DisableTTY         bool
+	ForceTTYCount      int
+	cliTTYMode         ssh.RequestTTYMode
+	cliTunnelMode      string
+	cliTunnelLockedByW bool
 	BgRun              bool
 	StdinRedirect      bool
 	args               []string
 	dashIdx            int
 	parsedArgs         bool
 	appliedGeneralOpts bool
+	stdinRedirected    bool
+	isParentValidation bool
 
 	Target config.ConnectionTarget
 
@@ -62,9 +73,11 @@ type SshOptions struct {
 	stdinScript  bool
 	NoLoginShell bool
 
-	execution     execExecutionOptions
-	commandPlan   *ssh.CommandPlan
-	targetNodeIDs []string
+	execution           execExecutionOptions
+	commandPlan         *ssh.CommandPlan
+	effectiveSSHOptions *ssh.Options
+	resolvedTarget      *ssh.TargetContext
+	targetNodeIDs       []string
 }
 
 func NewSshOptions() *SshOptions {
@@ -101,10 +114,10 @@ func newCmdSshWithOptions(o *SshOptions) *cobra.Command {
 	cmd.Flags().StringVarP(&o.User, "login", "l", "", i18n.T("flag_login"))
 	cmd.Flags().StringVarP(&o.IdentityFile, "identity", "i", "", i18n.T("flag_identity"))
 	cmd.Flags().StringVarP(&o.JumpHost, "jump", "J", "", i18n.T("flag_jump"))
-	cmd.Flags().StringSliceVarP(&o.LocalForwards, "local-forward", "L", []string{}, i18n.T("flag_local_forward"))
-	cmd.Flags().StringSliceVarP(&o.RemoteForwards, "remote-forward", "R", []string{}, i18n.T("flag_remote_forward"))
+	cmd.Flags().StringArrayVarP(&o.LocalForwards, "local-forward", "L", []string{}, i18n.T("flag_local_forward"))
+	cmd.Flags().StringArrayVarP(&o.RemoteForwards, "remote-forward", "R", []string{}, i18n.T("flag_remote_forward"))
 	cmd.Flags().BoolVarP(&o.NoCmd, "no-cmd", "N", false, i18n.T("flag_no_cmd"))
-	cmd.Flags().StringVarP(&o.DynamicForward, "dynamic-forward", "D", "", i18n.T("flag_dynamic_forward"))
+	o.registerForwardAndSessionFlags(cmd)
 	cmd.Flags().BoolVarP(&o.BgRun, "background", "f", false, i18n.T("flag_background"))
 	cmd.Flags().BoolVarP(&o.StdinRedirect, "stdin-redirect", "n", false, i18n.T("flag_stdin_redirect"))
 
@@ -124,6 +137,36 @@ func newCmdSshWithOptions(o *SshOptions) *cobra.Command {
 	cmd.MarkFlagsMutuallyExclusive("otp", "otp-stdin")
 
 	return cmd
+}
+
+func (o *SshOptions) readSecretsFromStdin() (bool, error) {
+	hadCredentialStdin := o.OTPStdin || o.PasswordStdin || o.PassphraseStdin
+	if o.OTP != "" && o.OTPStdin {
+		return false, errors.New(i18n.T("err_otp_mutually_exclusive"))
+	}
+	if o.OTPStdin {
+		otp, err := utils.ReadSecretLineFromStdin()
+		if err != nil {
+			return false, fmt.Errorf("read otp from stdin: %w", err)
+		}
+		o.OTP = otp
+		o.OTPStdin = false
+	}
+	if o.PasswordStdin {
+		pwd, err := utils.ReadSecretFromStdin()
+		if err != nil {
+			return false, fmt.Errorf("read password from stdin: %w", err)
+		}
+		o.Password = pwd
+	}
+	if o.PassphraseStdin {
+		pass, err := utils.ReadSecretFromStdin()
+		if err != nil {
+			return false, fmt.Errorf("read passphrase from stdin: %w", err)
+		}
+		o.Passphrase = pass
+	}
+	return hadCredentialStdin, nil
 }
 
 func (o *SshOptions) Complete(cmd *cobra.Command, args []string) error {
@@ -147,41 +190,17 @@ func (o *SshOptions) Complete(cmd *cobra.Command, args []string) error {
 		o.PasswordStdin = false
 		o.PassphraseStdin = false
 		o.OTPStdin = false
-		o.NoCmd = true
-		o.Command = ""
-		o.stdinScript = false
+		o.normalizeForMuxDaemon()
 		o.StdinRedirect = true
 		return nil
 	}
 	o.execution.capturePresence(cmd)
-	hadCredentialStdin := o.OTPStdin || o.PasswordStdin || o.PassphraseStdin
-	if o.OTP != "" && o.OTPStdin {
-		return errors.New(i18n.T("err_otp_mutually_exclusive"))
-	}
-	if o.OTPStdin {
-		otp, err := utils.ReadSecretLineFromStdin()
-		if err != nil {
-			return fmt.Errorf("read otp from stdin: %w", err)
-		}
-		o.OTP = otp
-		o.OTPStdin = false
-	}
-	if o.PasswordStdin {
-		pwd, err := utils.ReadSecretFromStdin()
-		if err != nil {
-			return fmt.Errorf("read password from stdin: %w", err)
-		}
-		o.Password = pwd
-	}
-	if o.PassphraseStdin {
-		pass, err := utils.ReadSecretFromStdin()
-		if err != nil {
-			return fmt.Errorf("read passphrase from stdin: %w", err)
-		}
-		o.Passphrase = pass
+	hadCredentialStdin, err := o.readSecretsFromStdin()
+	if err != nil {
+		return err
 	}
 	ctlCmd := strings.ToLower(strings.TrimSpace(o.control.CtlCmd))
-	if !o.StdinRedirect && !hadCredentialStdin && (ctlCmd == "" || ctlCmd == "proxy") {
+	if !o.effectiveStdinNull() && !o.effectiveNoCmd() && !hadCredentialStdin && o.StdioForward == "" && (ctlCmd == "" || ctlCmd == "proxy") {
 		stat, err := os.Stdin.Stat()
 		if err == nil && (stat.Mode()&os.ModeCharDevice) == 0 {
 			o.stdinScript = true
@@ -297,9 +316,7 @@ func (o *SshOptions) ensureArgsParsed() error {
 		// parseArgs rebuilds the target from the preserved positional arguments, so
 		// the daemon normalization above must be re-applied before the command
 		// boundary is turned back into an executable command.
-		o.NoCmd = true
-		o.Command = ""
-		o.stdinScript = false
+		o.normalizeForMuxDaemon()
 		commandArgs = nil
 	}
 	if o.Command == "" && len(commandArgs) > 0 {
@@ -321,9 +338,7 @@ func (o *SshOptions) Validate() error {
 	if isMuxDaemonChild() {
 		// Validate runs after Complete and would otherwise rebuild a command from
 		// the preserved positional arguments that the daemon must never execute.
-		o.NoCmd = true
-		o.Command = ""
-		o.stdinScript = false
+		o.normalizeForMuxDaemon()
 	}
 	if o.OTP != "" && o.OTPStdin {
 		return errors.New(i18n.T("err_otp_mutually_exclusive"))
@@ -334,10 +349,13 @@ func (o *SshOptions) Validate() error {
 	if err := o.ensureArgsParsed(); err != nil {
 		return o.control.controlUsageError(err)
 	}
-	if o.BgRun && !o.NoCmd {
-		return errors.New(i18n.T("ssh_err_background_requires_nocmd"))
+	if err := o.validateForwardAndSessionFlags(); err != nil {
+		return o.control.controlUsageError(err)
 	}
-	if o.BgRun && (o.OTP != "" || o.OTPStdin) {
+	if o.effectiveBgRun() && !o.effectiveNoCmd() && o.Command == "" && !o.stdinScript {
+		return o.control.controlUsageError(errors.New(i18n.T("ssh_err_background_requires_nocmd")))
+	}
+	if o.effectiveBgRun() && (o.OTP != "" || o.OTPStdin) {
 		return fmt.Errorf("background mode (-f) cannot be combined with one-time --otp or --otp-stdin; configure persistent identity otp instead")
 	}
 	if strings.Contains(o.Alias, "@") || strings.Contains(o.Alias, ":") {
@@ -364,22 +382,25 @@ func (o *SshOptions) RunContext(ctx context.Context) (err error) {
 	if isMuxDaemonChild() {
 		// A detached multiplexing daemon serves the control socket only. It must
 		// never re-run the command or read the terminal the parent handed over.
-		o.NoCmd = true
-		o.Command = ""
-		o.stdinScript = false
+		o.normalizeForMuxDaemon()
 		o.StdinRedirect = true
 	}
 
+	ecBg := o.effectiveBgRun()
+	ecStdin := o.effectiveStdinNull()
+
 	// -n 功能：如果是非后台运行或已是后台子进程，且指定了 -n，直接重定向标准输入到 /dev/null
-	if o.StdinRedirect && (!o.BgRun || isChild) {
+	if ecStdin && (!ecBg || isChild) {
 		devNull, err := os.Open(os.DevNull)
 		if err != nil {
 			return fmt.Errorf("open %s for SSH stdin failed: %w", os.DevNull, err)
 		}
 		oldStdin := os.Stdin
 		os.Stdin = devNull
+		o.stdinRedirected = true
 		defer func() {
 			os.Stdin = oldStdin
+			o.stdinRedirected = false
 			if closeErr := devNull.Close(); closeErr != nil {
 				err = errors.Join(err, fmt.Errorf("close SSH stdin redirect failed: %w", closeErr))
 			}
@@ -395,7 +416,7 @@ func (o *SshOptions) RunContext(ctx context.Context) (err error) {
 		o.diagnostics = nil
 		err = errors.Join(err, finishDiagnostics())
 	}()
-	if o.BgRun && !isChild {
+	if ecBg && !isChild {
 		return o.runParentDaemon(ctx)
 	}
 
@@ -422,6 +443,35 @@ func (o *SshOptions) runParentDaemon(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
+	if _, err := o.resolveAndCacheSessionOptions(provider, nodeID); err != nil {
+		return err
+	}
+	if err := o.validatePostResolutionSessionInvariants(); err != nil {
+		return err
+	}
+	return o.runParentDaemonWithNode(ctx, cfg, provider, nodeID)
+}
+
+func (o *SshOptions) validatePostResolutionSessionInvariants() error {
+	if o.effectiveStdinNull() || o.effectiveNoCmd() {
+		o.stdinScript = false
+	}
+	if o.effectiveNoCmd() && o.StdioForward == "" && o.Command != "" {
+		return errors.New(i18n.T("ssh_err_nocmd_with_command"))
+	}
+	if o.effectiveBgRun() && o.StdioForward != "" {
+		return errors.New(i18n.T("ssh_err_stdio_forward_with_bg"))
+	}
+	if o.effectiveBgRun() && (o.OTP != "" || o.OTPStdin) {
+		return fmt.Errorf("background mode (-f) cannot be combined with one-time --otp or --otp-stdin; configure persistent identity otp instead")
+	}
+	if o.effectiveBgRun() && !o.effectiveNoCmd() && o.Command == "" && !o.stdinScript {
+		return errors.New(i18n.T("ssh_err_background_requires_nocmd"))
+	}
+	return nil
+}
+
+func (o *SshOptions) runParentDaemonWithNode(ctx context.Context, cfg *config.Configuration, provider *config.Repository, nodeID string) (err error) {
 	adpOpts, optErr := o.buildAdapterOptions(nodeID, cfg, provider)
 	if optErr != nil {
 		return optErr
@@ -462,6 +512,8 @@ func (o *SshOptions) runParentDaemon(ctx context.Context) (err error) {
 
 	// Validation tunnels own their child context. Closing them must leave the
 	// command-owned output context alive until auxiliary output has flushed.
+	o.isParentValidation = true
+	defer func() { o.isParentValidation = false }()
 	tunnels, err := o.startTunnels(ctx, nil, client)
 	if err != nil {
 		return err
@@ -480,6 +532,10 @@ func (o *SshOptions) runParentDaemon(ctx context.Context) (err error) {
 	}
 	connectorClosed = true
 
+	return spawnBackgroundSSHChild()
+}
+
+func spawnBackgroundSSHChild() (err error) {
 	// 启动后台子进程
 	exe, err := os.Executable()
 	if err != nil {
@@ -542,7 +598,7 @@ func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuratio
 	}
 	if shouldRemember {
 		adpOpts = append(adpOpts, enrollmentProbeOption())
-		if o.execution.enabled() || o.execution.noLoginSet {
+		if o.execution.enabled() || o.execution.noLoginSet || o.StdioForward != "" {
 			adpOpts = append(adpOpts, adapter.WithEnrollmentProbeExclusions(nodeID))
 		}
 		persistence, err := o.interaction.automaticPersistenceOptions(repository, cfg)
@@ -553,7 +609,7 @@ func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuratio
 	}
 
 	// Session Control Overrides (Tier 1)
-	sessionCtrlOpts, err := o.control.ToSessionControlOptions()
+	sessionCtrlOpts, err := o.toSessionControlOptions()
 	if err != nil {
 		return nil, err
 	}
@@ -579,7 +635,11 @@ func disableSessionControlForParent(nodeID string) adapter.Option {
 // control path must be expanded from the resolved connection target, exactly as
 // Connector.buildTargetContext does, otherwise %h/%p/%r/%C expand differently.
 func (o *SshOptions) getActiveMuxServer(ctx context.Context, provider *config.Repository, nodeID string) *ssh.MuxServer {
-	expandedPath, err := controlSocketPath(o, provider, nodeID)
+	var cfgProvider config.ConfigProvider
+	if provider != nil {
+		cfgProvider = provider
+	}
+	expandedPath, err := controlSocketPath(o, cfgProvider, nodeID)
 	if err != nil || expandedPath == "" {
 		return nil
 	}
@@ -590,11 +650,11 @@ func (o *SshOptions) getActiveMuxServer(ctx context.Context, provider *config.Re
 // master so ControlPersist survives the session, matching OpenSSH behavior for a
 // command or interactive shell that finished.
 func (o *SshOptions) handoffPersistentMaster(ctx context.Context, connector *ssh.Connector, provider *config.Repository, nodeID string) error {
-	if isMuxDaemonChild() || o.BgRun {
+	if isMuxDaemonChild() || o.effectiveBgRun() {
 		// This process owns the master for its whole lifetime.
 		return nil
 	}
-	if o.NoCmd {
+	if o.effectiveNoCmd() {
 		// A -N process holds the master until it stops; there is nothing to hand
 		// over, and spawning a second daemon would duplicate the master.
 		return nil
@@ -617,7 +677,11 @@ func (o *SshOptions) handoffPersistentMaster(ctx context.Context, connector *ssh
 		o.targetNodeIDs = []string{nodeID}
 	}
 	var master *ssh.MuxServer
-	expandedPath, err := controlSocketPath(o, provider, nodeID)
+	var cfgProvider config.ConfigProvider
+	if provider != nil {
+		cfgProvider = provider
+	}
+	expandedPath, err := controlSocketPath(o, cfgProvider, nodeID)
 	if err == nil && expandedPath != "" {
 		master = ssh.GetActiveMuxServer(expandedPath)
 	}
@@ -657,7 +721,7 @@ func (o *SshOptions) handoffConnectorMasters(ctx context.Context, connector *ssh
 	if len(masters) == 0 {
 		return nil
 	}
-	if isMuxDaemonChild() || o.BgRun || o.NoCmd {
+	if isMuxDaemonChild() || o.effectiveBgRun() || o.effectiveNoCmd() {
 		return nil
 	}
 	if ctx != nil && ctx.Err() != nil {
@@ -857,12 +921,7 @@ func (o *SshOptions) muxDaemonArgs(nodeID string, expandedPath string, master *s
 	}
 	args = append(args, "--remember", "never")
 	if o.shouldPassIdentityFile(nodeID, master) {
-		for _, opt := range o.control.Options {
-			if master != nil && isTargetSpecificOption(opt) {
-				continue
-			}
-			args = append(args, "-o", opt)
-		}
+		args = o.appendMuxDaemonForwardedOptions(args, master)
 	}
 	masterMode := ssh.ControlMasterYes
 	if master != nil {
@@ -875,10 +934,32 @@ func (o *SshOptions) muxDaemonArgs(nodeID string, expandedPath string, master *s
 			}
 		}
 	}
+	// Ensure the detached multiplexing daemon never opens configured port or
+	// tunnel device forwardings from user/global SSH options.
+	args = append(args, "-o", "ClearAllForwardings=yes")
 	// Force an explicit master mode (yes or ask) on the detached daemon so it
 	// never attaches as a passenger to a competing master while preserving
 	// confirmation semantics across ControlPersist handoff.
 	args = append(args, "-o", "ControlMaster="+string(masterMode))
+	return args
+}
+
+func (o *SshOptions) appendMuxDaemonForwardedOptions(args []string, master *ssh.MuxServer) []string {
+	if o.GatewayPorts {
+		args = append(args, "-o", "GatewayPorts=yes")
+	}
+	for _, opt := range o.control.Options {
+		if o.GatewayPorts && isGatewayPortsOption(opt) {
+			continue
+		}
+		if isSessionOrForwardOption(opt) && !isMuxDaemonPreservedOption(opt) {
+			continue
+		}
+		if master != nil && isTargetSpecificOption(opt) {
+			continue
+		}
+		args = append(args, "-o", opt)
+	}
 	return args
 }
 
@@ -987,11 +1068,11 @@ func matchesTargetSelector(nodeID string, master *ssh.MuxServer, host, selector 
 }
 
 func isTargetSpecificOption(opt string) bool {
-	key, _, ok := strings.Cut(strings.TrimSpace(opt), "=")
-	if !ok {
+	key, _, err := adapter.SplitOptionKeyValue(opt)
+	if err != nil || key == "" {
 		return false
 	}
-	switch strings.ToLower(strings.TrimSpace(key)) {
+	switch strings.ToLower(key) {
 	case "port", "user", "proxyjump", "identityfile":
 		return true
 	default:
@@ -1185,25 +1266,54 @@ func waitForControlSocket(ctx context.Context, path string, timeout time.Duratio
 // controlSocketPollInterval bounds how long the handoff waits between probes.
 const controlSocketPollInterval = 100 * time.Millisecond
 
-func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error) {
+func (o *SshOptions) loadConfigRepository() (*config.Repository, *config.Configuration, error) {
 	configPath, keyPath, pathErr := utils.GetConfigFilePath()
 	if pathErr != nil {
-		return fmt.Errorf("get config file path failed: %w", pathErr)
+		return nil, nil, fmt.Errorf("get config file path failed: %w", pathErr)
 	}
 	configStore := config.NewDefaultStore(configPath, keyPath)
 	cfg, err := configStore.Load()
 	if err != nil {
-		return fmt.Errorf("%s: %w", i18n.T("ssh_err_load_config"), err)
+		return nil, nil, fmt.Errorf("%s: %w", i18n.T("ssh_err_load_config"), err)
 	}
-
 	provider, err := config.NewRepository(cfg, configStore)
 	if err != nil {
-		return fmt.Errorf("create configuration repository: %w", err)
+		return nil, nil, fmt.Errorf("create configuration repository: %w", err)
+	}
+	return provider, cfg, nil
+}
+
+func (o *SshOptions) connectClient(ctx context.Context, connector *ssh.Connector, nodeID string, isChild bool) (*ssh.Client, error) {
+	client, err := connector.Connect(ctx, nodeID)
+	if err != nil {
+		if isChild || o.StdioForward != "" {
+			// 子进程或 -W 标准流转发静默退出或记录错误，不污染二进制 stdout
+			return nil, sshConnectionError(nodeID, err)
+		}
+		promptErr := promptPressEnterIfTUI(os.Stdin, os.Stdout)
+		return nil, errors.Join(sshConnectionError(nodeID, err), promptErr)
+	}
+	return client, nil
+}
+
+func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error) {
+	provider, cfg, err := o.loadConfigRepository()
+	if err != nil {
+		return err
 	}
 
 	nodeID, _, err := o.resolveNode(ctx, provider)
 	if err != nil {
 		return err
+	}
+	if _, err := o.resolveAndCacheSessionOptions(provider, nodeID); err != nil {
+		return err
+	}
+	if err := o.validatePostResolutionSessionInvariants(); err != nil {
+		return err
+	}
+	if !isChild && !isMuxDaemonChild() && o.effectiveBgRun() {
+		return o.runParentDaemonWithNode(ctx, cfg, provider, nodeID)
 	}
 	adpOpts, optErr := o.buildAdapterOptions(nodeID, cfg, provider)
 	if optErr != nil {
@@ -1218,14 +1328,9 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 	defer func() {
 		joinConnectorCloseError(&err, connector)
 	}()
-	client, err := connector.Connect(ctx, nodeID)
+	client, err := o.connectClient(ctx, connector, nodeID, isChild)
 	if err != nil {
-		if isChild {
-			// 子进程静默退出或记录错误，不进行交互式阻塞
-			return sshConnectionError(nodeID, err)
-		}
-		promptErr := promptPressEnterIfTUI(os.Stdin, os.Stdout)
-		return errors.Join(sshConnectionError(nodeID, err), promptErr)
+		return err
 	}
 	defer func() {
 		if closeErr := client.Close(); closeErr != nil {
@@ -1258,6 +1363,23 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 		}
 	}()
 
+	if o.effectiveStdinNull() && !o.stdinRedirected {
+		devNull, devErr := os.Open(os.DevNull)
+		if devErr != nil {
+			return fmt.Errorf("open %s for SSH stdin failed: %w", os.DevNull, devErr)
+		}
+		oldStdin := os.Stdin
+		os.Stdin = devNull
+		o.stdinRedirected = true
+		defer func() {
+			os.Stdin = oldStdin
+			o.stdinRedirected = false
+			if closeErr := devNull.Close(); closeErr != nil {
+				err = errors.Join(err, fmt.Errorf("close SSH stdin redirect failed: %w", closeErr))
+			}
+		}()
+	}
+
 	return o.runConnectedSession(runCtx, connector, client, provider, nodeID, tunnels, isChild)
 }
 
@@ -1268,7 +1390,14 @@ func (o *SshOptions) runConnectedSession(runCtx context.Context, connector *ssh.
 			return err
 		}
 	}
-	if o.NoCmd {
+	if o.StdioForward != "" {
+		destHost, destPort, err := ssh.ParseStdioForward(o.StdioForward)
+		if err != nil {
+			return err
+		}
+		return client.ForwardStdio(runCtx, destHost, destPort, os.Stdin, os.Stdout)
+	}
+	if o.effectiveNoCmd() {
 		return o.runNoCmdSession(runCtx, connector, client, master, nodeID, tunnels, isChild)
 	}
 
@@ -1354,55 +1483,36 @@ func (o *SshOptions) runShell(ctx context.Context, client *ssh.Client) error {
 		if err := client.ShellWithSudo(ctx); err != nil {
 			return fmt.Errorf("%s: %w", i18n.T("sudo_exec_failed"), err)
 		}
-	} else {
-		if err := client.Shell(ctx); err != nil {
+		return nil
+	}
+	switch o.effectiveRequestTTY() {
+	case ssh.RequestTTYNo:
+		if err := o.runPipedShellWithStreams(ctx, client, os.Stdin, os.Stdout, os.Stderr); err != nil {
 			return fmt.Errorf("%s: %w", i18n.T("ssh_err_shell"), err)
 		}
+		return nil
+	case ssh.RequestTTYForce:
+		if _, isTerm := isLocalTerminal(os.Stdin); !isTerm {
+			if err := client.RunShellWithRemotePTY(ctx, os.Stdin, os.Stdout, os.Stderr); err != nil {
+				return fmt.Errorf("%s: %w", i18n.T("ssh_err_shell"), err)
+			}
+			return nil
+		}
+	}
+	if err := client.Shell(ctx); err != nil {
+		return fmt.Errorf("%s: %w", i18n.T("ssh_err_shell"), err)
 	}
 	return nil
 }
 
 // parseForwardArg parses standard SSH forward argument limits.
-// Expected format: [bind_address:]port:host:hostport
-// E.g: 8080:localhost:80 -> bind_address="127.0.0.1", port="8080", host="localhost", hostport="80"
+// Supports both [bind_address:]port:host:hostport and "[bind_address:]port host:hostport".
 func parseForwardArg(arg string) (bindAddr, destAddr string, err error) {
-	parts := splitTunnels(arg)
-	if len(parts) < 3 || len(parts) > 4 {
-		return "", "", fmt.Errorf("invalid forward format '%s', expected [bind_address:]port:host:hostport", arg)
+	spec, err := ssh.ParseForwardSpec(arg)
+	if err != nil {
+		return "", "", err
 	}
-	destPort := parts[len(parts)-1]
-	destHost := strings.Trim(parts[len(parts)-2], "[]")
-	destAddr = net.JoinHostPort(destHost, destPort)
-
-	if len(parts) == 3 {
-		bindAddr = net.JoinHostPort("127.0.0.1", parts[0])
-	} else {
-		bindHost := strings.Trim(parts[0], "[]")
-		bindAddr = net.JoinHostPort(bindHost, parts[1])
-	}
-	return bindAddr, destAddr, nil
-}
-
-func splitTunnels(s string) []string {
-	var parts []string
-	var current string
-	inBracket := false
-	for _, r := range s {
-		if r == '[' {
-			inBracket = true
-			current += string(r)
-		} else if r == ']' {
-			inBracket = false
-			current += string(r)
-		} else if r == ':' && !inBracket {
-			parts = append(parts, current)
-			current = ""
-		} else {
-			current += string(r)
-		}
-	}
-	parts = append(parts, current)
-	return parts
+	return spec.BindAddr, spec.DestAddr, nil
 }
 
 func (o *SshOptions) resolveNode(ctx context.Context, provider *config.Repository) (string, bool, error) {
@@ -1509,92 +1619,161 @@ func (g *sshTunnelGroup) reportReady(ctx context.Context, target io.Writer, node
 	return nil
 }
 
+func (o *SshOptions) attachTunnelDiagnostics(ctx context.Context, group *sshTunnelGroup, stderr io.Writer) error {
+	if diagnostics, ok := o.diagnostics.(*sshDiagnostics); ok && diagnostics != nil {
+		group.stderr = diagnostics
+		return nil
+	}
+	if stderr == nil {
+		stderr = os.Stderr
+	}
+	var gates []chan struct{}
+	if o.interaction != nil {
+		gates = append(gates, o.interaction.promptGate)
+	}
+	output, err := newSSHDiagnostics(ctx, stderr, 0, gates...)
+	if err != nil {
+		return err
+	}
+	group.stderr, group.ownsStderr = output, true
+	return nil
+}
+
+func (g *sshTunnelGroup) registerForward(forward *ssh.Forward, setupErr error, exitOnFailure bool) error {
+	if setupErr != nil {
+		if !exitOnFailure {
+			g.stderr.message(logger.Yellow(fmt.Sprintf("warning: %v", setupErr)) + "\n")
+			return nil
+		}
+		return setupErr
+	}
+	g.Add(forward)
+	return nil
+}
+
+func startLocalForwards(tunnelCtx context.Context, group *sshTunnelGroup, client *ssh.Client, fwdCfg sessionForwardConfig, commonOpts []ssh.ForwardOption) error {
+	for _, spec := range fwdCfg.localForwards {
+		opts := append([]ssh.ForwardOption{
+			ssh.WithForwardErrorHandler(func(err error) {
+				group.stderr.message(logger.Red(fmt.Sprintf("ssh local forward connection failed: %v", err)) + "\n")
+			}),
+		}, commonOpts...)
+		forward, err := client.LocalForwardEndpoint(tunnelCtx, spec.Bind, spec.Dest, fwdCfg.gatewayPorts, opts...)
+		if err != nil {
+			err = fmt.Errorf("setup local forward failed: %w", err)
+		}
+		if fatalErr := group.registerForward(forward, err, fwdCfg.exitOnForwardFailure); fatalErr != nil {
+			return fatalErr
+		}
+	}
+	return nil
+}
+
+func startRemoteForwards(tunnelCtx context.Context, group *sshTunnelGroup, client *ssh.Client, fwdCfg sessionForwardConfig, commonOpts []ssh.ForwardOption, reportAllocPort bool) error {
+	for _, spec := range fwdCfg.remoteForwards {
+		opts := append([]ssh.ForwardOption{
+			ssh.WithForwardErrorHandler(func(err error) {
+				group.stderr.message(logger.Red(fmt.Sprintf("ssh remote forward connection failed: %v", err)) + "\n")
+			}),
+		}, commonOpts...)
+		forward, err := client.RemoteForwardEndpoint(tunnelCtx, spec, opts...)
+		if err != nil {
+			err = fmt.Errorf("setup remote forward failed: %w", err)
+		}
+		if fatalErr := group.registerForward(forward, err, fwdCfg.exitOnForwardFailure); fatalErr != nil {
+			return fatalErr
+		}
+		if err == nil && reportAllocPort && !spec.Bind.IsUnix() && spec.Bind.Port == 0 && forward != nil && forward.Addr() != nil {
+			_, portStr, splitErr := net.SplitHostPort(forward.Addr().String())
+			if splitErr == nil && portStr != "" && portStr != "0" {
+				targetDesc := spec.Dest.String()
+				if spec.IsDynamic {
+					targetDesc = "dynamic"
+				}
+				group.stderr.message(fmt.Sprintf("Allocated port %s for remote forward to %s\n", portStr, targetDesc))
+			}
+		}
+	}
+	return nil
+}
+
+func startDynamicForwards(tunnelCtx context.Context, group *sshTunnelGroup, client *ssh.Client, fwdCfg sessionForwardConfig, commonOpts []ssh.ForwardOption) error {
+	for _, ep := range fwdCfg.dynamicForwards {
+		opts := append([]ssh.ForwardOption{
+			ssh.WithForwardErrorHandler(func(err error) {
+				group.stderr.message(logger.Red(fmt.Sprintf("ssh SOCKS5 forward connection failed: %v", err)) + "\n")
+			}),
+		}, commonOpts...)
+		forward, err := client.DynamicForwardEndpoint(tunnelCtx, ep, fwdCfg.gatewayPorts, opts...)
+		if err != nil {
+			err = fmt.Errorf("setup SOCKS5 proxy failed: %w", err)
+		}
+		if fatalErr := group.registerForward(forward, err, fwdCfg.exitOnForwardFailure); fatalErr != nil {
+			return fatalErr
+		}
+	}
+	return nil
+}
+
+func startConfiguredForwards(tunnelCtx context.Context, group *sshTunnelGroup, client *ssh.Client, fwdCfg sessionForwardConfig, reportAllocPort bool) error {
+	commonOpts := []ssh.ForwardOption{
+		ssh.WithStreamLocalBindMask(fwdCfg.streamLocalBindMask),
+		ssh.WithStreamLocalBindUnlink(fwdCfg.streamLocalBindUnlink),
+	}
+	if err := startLocalForwards(tunnelCtx, group, client, fwdCfg, commonOpts); err != nil {
+		return err
+	}
+	if err := startRemoteForwards(tunnelCtx, group, client, fwdCfg, commonOpts, reportAllocPort); err != nil {
+		return err
+	}
+	if err := startDynamicForwards(tunnelCtx, group, client, fwdCfg, commonOpts); err != nil {
+		return err
+	}
+	if fwdCfg.hasTunnelDevice {
+		forward, err := client.TunnelDeviceForward(tunnelCtx, fwdCfg.tunnelMode, fwdCfg.tunnelDevice, ssh.WithForwardErrorHandler(func(err error) {
+			group.stderr.message(logger.Red(fmt.Sprintf("ssh tunnel device forward failed: %v", err)) + "\n")
+		}))
+		if err != nil {
+			err = fmt.Errorf("setup tunnel device forward failed: %w", err)
+		}
+		if fatalErr := group.registerForward(forward, err, fwdCfg.exitOnForwardFailure); fatalErr != nil {
+			return fatalErr
+		}
+	}
+	return nil
+}
+
 func (o *SshOptions) startTunnels(ctx context.Context, cancelParent context.CancelFunc, client *ssh.Client) (*sshTunnelGroup, error) {
+	return o.startTunnelsWithStderr(ctx, cancelParent, client, os.Stderr)
+}
+
+func (o *SshOptions) startTunnelsWithStderr(ctx context.Context, cancelParent context.CancelFunc, client *ssh.Client, stderr io.Writer) (*sshTunnelGroup, error) {
 	group, tunnelCtx := newSSHTunnelGroup(ctx, cancelParent)
 	fail := func(err error) (*sshTunnelGroup, error) {
 		return nil, errors.Join(err, group.Close())
 	}
-	hasForwards := len(o.LocalForwards) > 0 || len(o.RemoteForwards) > 0 || o.DynamicForward != ""
+	fwdCfg, err := o.resolveSessionForwardConfig()
+	if err != nil {
+		return fail(err)
+	}
+	hasForwards := len(fwdCfg.localForwards) > 0 ||
+		len(fwdCfg.remoteForwards) > 0 ||
+		len(fwdCfg.dynamicForwards) > 0 ||
+		fwdCfg.hasTunnelDevice
 	if hasForwards {
-		if diagnostics, ok := o.diagnostics.(*sshDiagnostics); ok && diagnostics != nil {
-			group.stderr = diagnostics
-		} else {
-			var gates []chan struct{}
-			if o.interaction != nil {
-				gates = append(gates, o.interaction.promptGate)
-			}
-			output, err := newSSHDiagnostics(ctx, os.Stderr, 0, gates...)
-			if err != nil {
-				return fail(err)
-			}
-			group.stderr, group.ownsStderr = output, true
+		if err := o.attachTunnelDiagnostics(ctx, group, stderr); err != nil {
+			return fail(err)
 		}
 	}
-	if o.NoCmd || hasForwards {
+	if o.effectiveNoCmd() || hasForwards {
 		group.addWait(func() error { return client.Wait(tunnelCtx) })
 	}
-	// Connection failures stay visible even without verbose logging, but callbacks
-	// only enqueue: a failed stderr must never hold up Forward.Wait or cancellation.
-	for _, lArg := range o.LocalForwards {
-		bAddr, dAddr, err := parseForwardArg(lArg)
-		if err != nil {
-			return fail(err)
-		}
-		forward, err := client.LocalForward(tunnelCtx, bAddr, dAddr, ssh.WithForwardErrorHandler(func(err error) {
-			group.stderr.message(logger.Red(fmt.Sprintf("ssh local forward connection failed: %v", err)) + "\n")
-		}))
-		if err != nil {
-			return fail(fmt.Errorf("setup local forward failed: %w", err))
-		}
-		group.Add(forward)
-	}
-	for _, rArg := range o.RemoteForwards {
-		bAddr, dAddr, err := parseForwardArg(rArg)
-		if err != nil {
-			return fail(err)
-		}
-		forward, err := client.RemoteForward(tunnelCtx, bAddr, dAddr, ssh.WithForwardErrorHandler(func(err error) {
-			group.stderr.message(logger.Red(fmt.Sprintf("ssh remote forward connection failed: %v", err)) + "\n")
-		}))
-		if err != nil {
-			return fail(fmt.Errorf("setup remote forward failed: %w", err))
-		}
-		group.Add(forward)
-	}
-	if o.DynamicForward != "" {
-		listenAddr, err := parseDynamicForwardArg(o.DynamicForward)
-		if err != nil {
-			return fail(err)
-		}
-		forward, err := client.Socks5Forward(tunnelCtx, listenAddr, ssh.WithForwardErrorHandler(func(err error) {
-			group.stderr.message(logger.Red(fmt.Sprintf("ssh SOCKS5 forward connection failed: %v", err)) + "\n")
-		}))
-		if err != nil {
-			return fail(fmt.Errorf("setup SOCKS5 proxy failed: %w", err))
-		}
-		group.Add(forward)
+	isChild := os.Getenv(sshBackgroundChildEnv) == "true"
+	reportAllocPort := !o.diagnostic.quiet && !isChild && !o.isParentValidation
+	if err := startConfiguredForwards(tunnelCtx, group, client, fwdCfg, reportAllocPort); err != nil {
+		return fail(err)
 	}
 	return group, nil
-}
-
-func parseDynamicForwardArg(arg string) (string, error) {
-	// If only a port is specified (e.g. "1080")
-	if _, err := strconv.Atoi(arg); err == nil {
-		return net.JoinHostPort("127.0.0.1", arg), nil
-	}
-
-	host, port, err := net.SplitHostPort(arg)
-	if err != nil {
-		if strings.HasPrefix(arg, ":") {
-			return net.JoinHostPort("127.0.0.1", arg[1:]), nil
-		}
-		return "", fmt.Errorf("invalid dynamic forward format '%s', expected [bind_address:]port", arg)
-	}
-
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	return net.JoinHostPort(host, port), nil
 }
 
 func updateNodeFields(node *models.Node, nodeID string, o *SshOptions, provider config.ConfigProvider) (bool, error) {
@@ -1727,31 +1906,119 @@ func (o *SshOptions) runCommand(ctx context.Context, client *ssh.Client, command
 	return o.runCommandWithStreams(ctx, client, command, os.Stdin, os.Stdout, os.Stderr)
 }
 
+func (o *SshOptions) commandPlanForPTY(client *ssh.Client, command string) (ssh.CommandPlan, error) {
+	if o.commandPlan != nil {
+		if o.commandPlan.Command() != command {
+			return ssh.CommandPlan{}, fmt.Errorf("command changed after execution planning")
+		}
+		return *o.commandPlan, nil
+	}
+	var execCfg *ssh.ExecutionConfig
+	if client != nil {
+		execCfg = client.Execution()
+	}
+	if o.execution.enabled() || o.execution.noLoginSet {
+		return o.resolveCommandPlan(command, execCfg)
+	}
+	plan, err := ssh.PlanCommand(command, execCfg.CommandOptions())
+	if err != nil {
+		return ssh.CommandPlan{}, fmt.Errorf("plan command: %w", err)
+	}
+	return plan, nil
+}
+
+func (o *SshOptions) runPTYCommandIfRequested(ctx context.Context, client *ssh.Client, command string, reqTTY ssh.RequestTTYMode, stdin io.Reader, stdout, stderr io.Writer) (bool, error) {
+	if o.Sudo || command == "" || (reqTTY != ssh.RequestTTYYes && reqTTY != ssh.RequestTTYForce) {
+		return false, nil
+	}
+	plan, err := o.commandPlanForPTY(client, command)
+	if err != nil {
+		return true, err
+	}
+	if stdinFile, isTerm := isLocalTerminal(stdin); isTerm {
+		return true, client.RunInteractivePlanWithIO(ctx, plan, ssh.InteractiveIO{
+			Stdin:  stdinFile,
+			Stdout: stdout,
+			Stderr: stderr,
+		})
+	}
+	if reqTTY == ssh.RequestTTYForce {
+		if o.execution.enabled() || o.execution.noLoginSet {
+			return true, client.RunCommandPlanWithRemotePTY(ctx, plan, stdin, stdout, stderr)
+		}
+		strict, err := streamOutputSupported(ctx, stdout, stderr)
+		if err != nil {
+			return true, err
+		}
+		if strict {
+			return true, client.RunCommandPlanWithRemotePTY(ctx, plan, stdin, stdout, stderr)
+		}
+		return true, client.RunCommandWithRemotePTY(ctx, command, stdin, stdout, stderr)
+	}
+	if !o.diagnostic.quiet && stderr != nil {
+		_, _ = fmt.Fprintln(stderr, "Pseudo-terminal will not be allocated because stdin is not a terminal.")
+	}
+	return false, nil
+}
+
+func (o *SshOptions) runPipedScriptIfRequested(ctx context.Context, client *ssh.Client, reqTTY ssh.RequestTTYMode, stdin io.Reader, stdout, stderr io.Writer) (bool, error) {
+	if o.Sudo || o.Command != "" || !o.stdinScript {
+		return false, nil
+	}
+	if o.effectiveInterpreter(client) != ssh.InterpreterServer {
+		switch reqTTY {
+		case ssh.RequestTTYForce:
+			return true, client.RunCommandWithRemotePTY(ctx, "", stdin, stdout, stderr)
+		case ssh.RequestTTYYes:
+			if !o.diagnostic.quiet && stderr != nil {
+				_, _ = fmt.Fprintln(stderr, "Pseudo-terminal will not be allocated because stdin is not a terminal.")
+			}
+			return true, client.RunCommandWithIO(ctx, "", false, stdin, stdout, stderr)
+		default:
+			return false, nil
+		}
+	}
+	if reqTTY == ssh.RequestTTYForce {
+		if o.execution.enabled() {
+			strict, err := streamOutputSupported(ctx, stdout, stderr)
+			if err != nil {
+				return true, err
+			}
+			if !strict {
+				return true, fmt.Errorf("unsupported shell output: provide a ContextWriter, terminal, pipe, or regular file")
+			}
+		}
+		return true, client.RunShellWithRemotePTY(ctx, stdin, stdout, stderr)
+	}
+	if reqTTY == ssh.RequestTTYYes && !o.diagnostic.quiet && stderr != nil {
+		_, _ = fmt.Fprintln(stderr, "Pseudo-terminal will not be allocated because stdin is not a terminal.")
+	}
+	return true, o.runPipedShellWithStreams(ctx, client, stdin, stdout, stderr)
+}
+
 func (o *SshOptions) runCommandWithStreams(ctx context.Context, client *ssh.Client, command string, stdin io.Reader, stdout, stderr io.Writer) error {
+	reqTTY := o.effectiveRequestTTY()
+	if handled, err := o.runPTYCommandIfRequested(ctx, client, command, reqTTY, stdin, stdout, stderr); handled {
+		return err
+	}
 	if o.commandPlan != nil {
 		return client.RunCommandPlanWithIO(ctx, *o.commandPlan, stdin, stdout, stderr)
 	}
+	var execCfg *ssh.ExecutionConfig
+	if client != nil {
+		execCfg = client.Execution()
+	}
 	if (o.execution.enabled() || o.execution.noLoginSet) && !o.Sudo && command != "" {
-		var execCfg *ssh.ExecutionConfig
-		if client != nil {
-			execCfg = client.Execution()
-		}
 		plan, err := o.resolveCommandPlan(command, execCfg)
 		if err != nil {
 			return err
 		}
 		return client.RunCommandPlanWithIO(ctx, plan, stdin, stdout, stderr)
 	}
-	if !o.Sudo && o.Command == "" && o.stdinScript {
-		if o.effectiveInterpreter(client) == ssh.InterpreterServer {
-			return o.runPipedShellWithStreams(ctx, client, stdin, stdout, stderr)
-		}
+	if handled, err := o.runPipedScriptIfRequested(ctx, client, reqTTY, stdin, stdout, stderr); handled {
+		return err
 	}
 	if !o.Sudo && command != "" {
-		var execCfg *ssh.ExecutionConfig
-		if client != nil {
-			execCfg = client.Execution()
-		}
 		plan, err := ssh.PlanCommand(command, execCfg.CommandOptions())
 		if err != nil {
 			return fmt.Errorf("plan command: %w", err)

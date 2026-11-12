@@ -117,24 +117,50 @@ func (s SessionControlOptions) ToSSHOptions() *ssh.Options {
 	return opts
 }
 
+// SplitOptionKeyValue parses an OpenSSH -o directive into its key and value tokens.
+// It supports "Key=Value", "Key Value", and "Key = Value" syntax, matching standard
+// OpenSSH -o CLI argument conventions.
+func SplitOptionKeyValue(opt string) (key, val string, err error) {
+	opt = strings.TrimSpace(opt)
+	if opt == "" {
+		return "", "", nil
+	}
+	eqIdx := strings.IndexByte(opt, '=')
+	wsIdx := strings.IndexAny(opt, " \t")
+	if eqIdx >= 0 && (wsIdx == -1 || eqIdx < wsIdx) {
+		key = strings.TrimSpace(opt[:eqIdx])
+		val = strings.TrimSpace(opt[eqIdx+1:])
+		if key == "" {
+			return "", "", fmt.Errorf("invalid -o option format (expected Key=Value): %q", opt)
+		}
+		return key, val, nil
+	}
+	if wsIdx > 0 {
+		key = strings.TrimSpace(opt[:wsIdx])
+		val = strings.TrimSpace(opt[wsIdx+1:])
+		if strings.HasPrefix(val, "=") {
+			val = strings.TrimSpace(strings.TrimPrefix(val, "="))
+		}
+		if key == "" {
+			return "", "", fmt.Errorf("invalid -o option format (expected Key=Value): %q", opt)
+		}
+		return key, val, nil
+	}
+	return "", "", fmt.Errorf("invalid -o option format (expected Key=Value): %q", opt)
+}
+
 // ParseOptionStrings parses OpenSSH -o Key=Value strings into SessionControlOptions.
 // Unknown keys are rejected instead of ignored so a typo cannot silently disable
 // the requested behavior.
 func ParseOptionStrings(options []string) (SessionControlOptions, error) {
 	var opts SessionControlOptions
 	for _, opt := range options {
-		opt = strings.TrimSpace(opt)
-		if opt == "" {
-			continue
+		key, val, err := SplitOptionKeyValue(opt)
+		if err != nil {
+			return opts, err
 		}
-		key, val, ok := strings.Cut(opt, "=")
-		if !ok {
-			return opts, fmt.Errorf("invalid -o option format (expected Key=Value): %q", opt)
-		}
-		key = strings.TrimSpace(key)
-		val = strings.TrimSpace(val)
 		if key == "" {
-			return opts, fmt.Errorf("invalid -o option format (expected Key=Value): %q", opt)
+			continue
 		}
 		if err := applyParsedOption(&opts, key, val); err != nil {
 			return opts, err
@@ -184,8 +210,14 @@ func applyParsedOption(opts *SessionControlOptions, key, val string) error {
 		if val == "" {
 			return fmt.Errorf("invalid %s in -o option: value cannot be empty", spec.OpenSSHName)
 		}
-		if err := opts.ensureOptions().Set(spec.CanonicalKey, val); err != nil {
-			return fmt.Errorf("invalid %s in -o option: %w", spec.OpenSSHName, err)
+		if spec.MultiValue {
+			if err := opts.ensureOptions().Append(spec.CanonicalKey, val); err != nil {
+				return fmt.Errorf("invalid %s in -o option: %w", spec.OpenSSHName, err)
+			}
+		} else {
+			if err := opts.ensureOptions().Set(spec.CanonicalKey, val); err != nil {
+				return fmt.Errorf("invalid %s in -o option: %w", spec.OpenSSHName, err)
+			}
 		}
 	}
 	return nil

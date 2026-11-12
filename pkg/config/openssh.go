@@ -284,6 +284,16 @@ func parseOpenSSHOptions(cfg *ssh_config.Config, host string) (*ssh.Options, err
 		if spec.Class == ssh.OptionClassTrust {
 			continue
 		}
+		if spec.MultiValue {
+			for _, rawVal := range allMatchingOpenSSHOptions(cfg, host, spec) {
+				if err := opts.Append(spec.CanonicalKey, rawVal); err != nil {
+					// Leniently skip invalid or unsupported multi-value entries
+					// (e.g. malformed multi-value entries).
+					continue
+				}
+			}
+			continue
+		}
 		val, err := firstMatchingOpenSSHOption(cfg, host, spec)
 		if err != nil {
 			return nil, err
@@ -312,6 +322,41 @@ func parseOpenSSHOptions(cfg *ssh_config.Config, host string) (*ssh.Options, err
 		return nil, nil
 	}
 	return opts, nil
+}
+
+// allMatchingOpenSSHOptions resolves all entries for a multi-value option across matching
+// ssh_config Host blocks in appearance order.
+func allMatchingOpenSSHOptions(cfg *ssh_config.Config, host string, spec ssh.OptionSpec) []string {
+	if cfg == nil || host == "" {
+		return nil
+	}
+	keys := make([]string, 0, 1+len(spec.Aliases))
+	keys = append(keys, strings.ToLower(spec.OpenSSHName))
+	for _, alias := range spec.Aliases {
+		keys = append(keys, strings.ToLower(alias))
+	}
+	var matches []string
+	for _, h := range cfg.Hosts {
+		if !h.Matches(host) {
+			continue
+		}
+		for _, node := range h.Nodes {
+			kv, ok := node.(*ssh_config.KV)
+			if !ok || kv == nil {
+				continue
+			}
+			lkey := strings.ToLower(strings.TrimSpace(kv.Key))
+			for _, candidate := range keys {
+				if lkey == candidate {
+					if v := strings.TrimSpace(kv.Value); v != "" {
+						matches = append(matches, v)
+					}
+					break
+				}
+			}
+		}
+	}
+	return matches
 }
 
 // firstMatchingOpenSSHOption resolves an option across ssh_config Host blocks in

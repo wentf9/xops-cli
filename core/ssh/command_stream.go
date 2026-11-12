@@ -94,6 +94,118 @@ func (c *Client) RunShellWithIO(ctx context.Context, stdin io.Reader, stdout, st
 	return c.runSessionWithInput(work, "shell", func(session *cryptoSSH.Session) error { return session.Shell() }, "", stdin, boundOut, boundErr, cancel)
 }
 
+// RunShellWithRemotePTY sends an SSH pty-req followed by a shell request using
+// caller-provided non-terminal I/O streams (supporting -tt / RequestTTY=force
+// when local stdin is not a terminal).
+func (c *Client) RunShellWithRemotePTY(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) (retErr error) {
+	if ctx == nil {
+		return fmt.Errorf("shell execution context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("shell execution canceled: %w", err)
+	}
+	if c == nil || c.sshClient == nil {
+		return fmt.Errorf("SSH client is not connected")
+	}
+	if err := validateCommandStdin(stdin, c.environment.InputBridge); err != nil {
+		return err
+	}
+	work, cancel := context.WithCancel(ctx)
+	defer cancel()
+	boundOut, boundErr, closeOutput, err := c.bindCommandOutputs(work, stdout, stderr, false)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, closeOutput()) }()
+	modes := cryptoSSH.TerminalModes{cryptoSSH.ECHO: 1, cryptoSSH.TTY_OP_ISPEED: 14400, cryptoSSH.TTY_OP_OSPEED: 14400}
+	return c.runSessionWithInput(work, "shell", func(session *cryptoSSH.Session) error {
+		if err := session.RequestPty("xterm-256color", 24, 80, modes); err != nil {
+			return err
+		}
+		return session.Shell()
+	}, "", stdin, boundOut, boundErr, cancel)
+}
+
+// RunCommandPlanWithRemotePTY executes a validated command plan after requesting
+// a remote PTY without placing local stdin into raw mode (supporting -tt /
+// RequestTTY=force when local stdin is redirected or piped).
+// stdout and stderr must be non-nil and cancelable as described by BindOutput.
+func (c *Client) RunCommandPlanWithRemotePTY(ctx context.Context, plan CommandPlan, stdin io.Reader, stdout, stderr io.Writer) (retErr error) {
+	if err := validateCommandExecution(ctx, c, plan); err != nil {
+		return err
+	}
+	if plan.input != "" {
+		return fmt.Errorf("streaming command plan must not include finite input")
+	}
+	if err := validateCommandStdin(stdin, c.environment.InputBridge); err != nil {
+		return err
+	}
+	work, cancel := context.WithTimeout(ctx, plan.timeout)
+	defer cancel()
+	boundOut, boundErr, closeOutput, err := bindStrictOutputs(work, stdout, stderr)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, closeOutput()) }()
+	modes := cryptoSSH.TerminalModes{cryptoSSH.ECHO: 1, cryptoSSH.TTY_OP_ISPEED: 14400, cryptoSSH.TTY_OP_OSPEED: 14400}
+	return c.runSessionWithInput(work, "exec", func(session *cryptoSSH.Session) error {
+		if err := session.RequestPty("xterm-256color", 24, 80, modes); err != nil {
+			return err
+		}
+		return session.Start(plan.payload)
+	}, "", stdin, boundOut, boundErr, cancel)
+}
+
+// RunCommandWithRemotePTY executes a command (or the client's configured
+// interpreter shell when command is empty) after requesting a remote PTY
+// without placing local stdin into raw mode. Unlike RunCommandPlanWithRemotePTY,
+// it allows uncancelable outputs on platforms where native cancelable output is
+// unavailable, matching RunCommandWithIO and RunShellWithIO.
+func (c *Client) RunCommandWithRemotePTY(ctx context.Context, command string, stdin io.Reader, stdout, stderr io.Writer) (retErr error) {
+	if _, ok := c.configSnapshot(); !ok {
+		return fmt.Errorf("ssh client or config is nil")
+	}
+	if ctx == nil {
+		return fmt.Errorf("command execution context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("command execution canceled: %w", err)
+	}
+	if c.sshClient == nil {
+		return fmt.Errorf("SSH client is not connected")
+	}
+	if err := validateCommandStdin(stdin, c.environment.InputBridge); err != nil {
+		return err
+	}
+	interp, err := c.resolveCommandIOInterpreter(false, command)
+	if err != nil {
+		if command == "" {
+			if probeInterp, probeErr := c.resolveCommandIOInterpreter(false, "probe"); probeErr == nil && probeInterp == InterpreterServer {
+				return c.RunShellWithRemotePTY(ctx, stdin, stdout, stderr)
+			}
+		}
+		return err
+	}
+	if interp == InterpreterServer && command == "" {
+		return c.RunShellWithRemotePTY(ctx, stdin, stdout, stderr)
+	}
+	work, cancel := context.WithCancel(ctx)
+	defer cancel()
+	boundOut, boundErr, closeOutput, err := c.bindCommandOutputs(work, stdout, stderr, false)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, closeOutput()) }()
+	payload := c.resolveCommandIOPayload(interp, command)
+	modes := cryptoSSH.TerminalModes{cryptoSSH.ECHO: 1, cryptoSSH.TTY_OP_ISPEED: 14400, cryptoSSH.TTY_OP_OSPEED: 14400}
+	return c.runSessionWithInput(work, "exec", func(session *cryptoSSH.Session) error {
+		if err := session.RequestPty("xterm-256color", 24, 80, modes); err != nil {
+			return err
+		}
+		return session.Start(payload)
+	}, "", stdin, boundOut, boundErr, cancel)
+}
+
 // bindStrictOutputs is the new-API counterpart of bindCommandOutputs: output
 // that cannot be canceled is rejected rather than silently used.
 func bindStrictOutputs(ctx context.Context, stdout, stderr io.Writer) (io.Writer, io.Writer, func() error, error) {

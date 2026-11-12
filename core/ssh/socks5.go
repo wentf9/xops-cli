@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
+	"sync"
 	"time"
 )
 
@@ -15,142 +17,267 @@ func (c *Client) Socks5Forward(ctx context.Context, listenAddr string, opts ...F
 	if ctx == nil {
 		return nil, fmt.Errorf("socks5 forward context is nil")
 	}
-	listener, err := net.Listen("tcp", listenAddr)
+	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", listenAddr)
 	if err != nil {
 		c.observeForward("dynamic", "listen failed", listenAddr, "")
 		return nil, fmt.Errorf("listen on local SOCKS5 address %s failed: %w", listenAddr, err)
 	}
-	return runForwardListener(ctx, listener, c.forwardDiagnostics(c.forwardOptions(opts...), "dynamic", listener, ""), func(runCtx context.Context, conn net.Conn) error {
-		return c.observedForwardHandler("dynamic", listener.Addr().String(), "", func() error { return c.handleSocks5(runCtx, conn) })
+	fopts := c.forwardOptions(opts...)
+	return runForwardListener(ctx, listener, c.forwardDiagnostics(fopts, "dynamic", listener, ""), func(runCtx context.Context, conn net.Conn) error {
+		return c.observedForwardHandler("dynamic", listener.Addr().String(), "", func() error {
+			return c.handleSocks5(runCtx, conn)
+		})
 	}), nil
 }
 
-func (c *Client) handleSocks5(ctx context.Context, conn net.Conn) (retErr error) {
-	defer joinResourceCloseError(&retErr, conn, "SOCKS5 client connection")
-	destAddr, err := handshakeAndParseRequest(conn)
+// DynamicForwardEndpoint starts a dynamic SOCKS4/4a/5 forwarder on the given endpoint.
+func (c *Client) DynamicForwardEndpoint(ctx context.Context, bind ForwardEndpoint, gatewayPorts bool, opts ...ForwardOption) (*Forward, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("dynamic forward context is nil")
+	}
+	fopts := c.forwardOptions(opts...)
+	listenNet, listenAddr := bind.LocalListenAddress(gatewayPorts)
+	var listener net.Listener
+	var err error
+	if listenNet == "unix" {
+		listener, err = listenLocalStreamLocal(ctx, listenAddr, fopts.streamLocalBindMask, fopts.streamLocalBindUnlink)
+	} else {
+		listener, err = (&net.ListenConfig{}).Listen(ctx, "tcp", listenAddr)
+	}
 	if err != nil {
-		return fmt.Errorf("socks5 handshake failed: %w", err)
+		c.observeForward("dynamic", "listen failed", listenAddr, "")
+		return nil, fmt.Errorf("listen on dynamic forward address %s failed: %w", listenAddr, err)
 	}
-
-	// 3. Dial remote via SSH client
-	remoteConn, err := c.dialSSH(ctx, "tcp", destAddr)
-	if err != nil {
-		// Send reply: host unreachable / network unreachable (0x03 / 0x04)
-		writeErr := writeSocks5Reply(conn, []byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return errors.Join(fmt.Errorf("dial SOCKS5 destination %s failed: %w", destAddr, err), writeErr)
-	}
-	defer joinResourceCloseError(&retErr, remoteConn, "SOCKS5 remote connection")
-
-	// Remove deadline for TCP data copy phase after successful dial
-	if err := conn.SetDeadline(time.Time{}); err != nil {
-		return fmt.Errorf("clear SOCKS5 connection deadline failed: %w", err)
-	}
-
-	// Send reply: success
-	// SOCKS5 success reply: VER (0x05), REP (0x00), RSV (0x00), ATYP (0x01), BND.ADDR (0.0.0.0), BND.PORT (0)
-	if err := writeSocks5Reply(conn, []byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
-		return err
-	}
-
-	// 4. Data transfer
-	return c.copyStream(ctx, conn, remoteConn)
+	return runForwardListener(ctx, listener, c.forwardDiagnostics(fopts, "dynamic", listener, ""), func(runCtx context.Context, conn net.Conn) error {
+		return c.observedForwardHandler("dynamic", listener.Addr().String(), "", func() error {
+			return c.handleSocks5(runCtx, conn)
+		})
+	}), nil
 }
 
-func writeSocks5Reply(conn net.Conn, reply []byte) error {
-	if err := conn.SetWriteDeadline(time.Now().Add(15 * time.Second)); err != nil {
-		return fmt.Errorf("set SOCKS5 reply deadline failed: %w", err)
+func (c *Client) handleSocks5(ctx context.Context, conn net.Conn) error {
+	return serveSocksConn(ctx, conn, func(dCtx context.Context, destAddr string) (net.Conn, error) {
+		return c.dialSSH(dCtx, "tcp", destAddr)
+	}, c.copyStream)
+}
+
+func serveSocksConn(
+	ctx context.Context,
+	conn net.Conn,
+	dialFn func(ctx context.Context, destAddr string) (net.Conn, error),
+	pipeFn func(ctx context.Context, c1, c2 net.Conn) error,
+) (retErr error) {
+	defer joinResourceCloseError(&retErr, conn, "SOCKS client connection")
+	stopHandshake := startHandshakeDeadline(conn, 15*time.Second)
+	defer func() {
+		if stopHandshake != nil {
+			_ = stopHandshake()
+		}
+	}()
+
+	var verBuf [1]byte
+	if _, err := io.ReadFull(conn, verBuf[:]); err != nil {
+		return fmt.Errorf("failed to read SOCKS version: %w", err)
 	}
+	ver := verBuf[0]
+
+	var destAddr string
+	var err error
+	switch ver {
+	case 0x05:
+		destAddr, err = handleSocks5Handshake(conn)
+	case 0x04:
+		destAddr, err = handleSocks4Handshake(conn)
+	default:
+		return fmt.Errorf("unsupported SOCKS version: 0x%02x", ver)
+	}
+	if err != nil {
+		return fmt.Errorf("socks handshake failed: %w", err)
+	}
+
+	remoteConn, dialErr := dialFn(ctx, destAddr)
+	if dialErr != nil {
+		var rejectErr error
+		if ver == 0x05 {
+			rejectErr = writeSocksReply(conn, []byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		} else {
+			rejectErr = writeSocksReply(conn, []byte{0x00, 0x5B, 0, 0, 0, 0, 0, 0})
+		}
+		return errors.Join(fmt.Errorf("dial SOCKS destination %s failed: %w", destAddr, dialErr), rejectErr)
+	}
+	defer joinResourceCloseError(&retErr, remoteConn, "SOCKS remote connection")
+
+	if err := stopHandshake(); err != nil {
+		return err
+	}
+	stopHandshake = nil
+
+	if ver == 0x05 {
+		if err := writeSocksReply(conn, []byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
+			return err
+		}
+	} else {
+		if err := writeSocksReply(conn, []byte{0x00, 0x5A, 0, 0, 0, 0, 0, 0}); err != nil {
+			return err
+		}
+	}
+
+	return pipeFn(ctx, conn, remoteConn)
+}
+
+func startHandshakeDeadline(conn net.Conn, d time.Duration) func() error {
+	if err := conn.SetDeadline(time.Now().Add(d)); err == nil {
+		return func() error {
+			return conn.SetDeadline(time.Time{})
+		}
+	}
+	timedOut := make(chan struct{})
+	var closeErr error
+	var once sync.Once
+	timer := time.AfterFunc(d, func() {
+		once.Do(func() {
+			closeErr = conn.Close()
+			close(timedOut)
+		})
+	})
+	return func() error {
+		if timer.Stop() {
+			return nil
+		}
+		<-timedOut
+		return errors.Join(fmt.Errorf("socks handshake timed out after %s", d), closeErr)
+	}
+}
+
+func writeSocksReply(conn net.Conn, reply []byte) error {
+	_ = conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
 	for len(reply) > 0 {
 		n, err := conn.Write(reply)
 		if err != nil {
-			return fmt.Errorf("write SOCKS5 reply failed: %w", err)
+			return fmt.Errorf("write SOCKS reply failed: %w", err)
 		}
 		if n == 0 {
-			return fmt.Errorf("write SOCKS5 reply failed: %w", io.ErrShortWrite)
+			return fmt.Errorf("write SOCKS reply failed: %w", io.ErrShortWrite)
 		}
 		reply = reply[n:]
 	}
 	return nil
 }
 
-func handshakeAndParseRequest(conn net.Conn) (string, error) {
-	// Set deadline for greeting and request phases to avoid leakage
-	if err := conn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
-		return "", fmt.Errorf("failed to set connection deadline: %w", err)
+func drainSocksResponse(conn net.Conn) error {
+	cw, ok := conn.(interface{ CloseWrite() error })
+	if !ok {
+		return nil
+	}
+	var errs []error
+	if err := cw.CloseWrite(); err != nil && !errors.Is(err, net.ErrClosed) {
+		errs = append(errs, fmt.Errorf("close SOCKS response writer failed: %w", err))
+	}
+	stop := startHandshakeDeadline(conn, 2*time.Second)
+	defer func() { _ = stop() }()
+	var temp [1]byte
+	if _, err := conn.Read(temp[:]); err != nil {
+		var netErr net.Error
+		if !errors.Is(err, io.EOF) && (!errors.As(err, &netErr) || !netErr.Timeout()) {
+			errs = append(errs, fmt.Errorf("drain SOCKS response failed: %w", err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func readNulTerminatedString(r io.Reader, maxBytes int) (string, error) {
+	var buf []byte
+	var b [1]byte
+	for {
+		if _, err := io.ReadFull(r, b[:]); err != nil {
+			return "", err
+		}
+		if b[0] == 0 {
+			return string(buf), nil
+		}
+		if len(buf) >= maxBytes {
+			return "", fmt.Errorf("string exceeded maximum length of %d bytes", maxBytes)
+		}
+		buf = append(buf, b[0])
+	}
+}
+
+func handleSocks5Handshake(conn net.Conn) (string, error) {
+	var nmethodsBuf [1]byte
+	if _, err := io.ReadFull(conn, nmethodsBuf[:]); err != nil {
+		return "", fmt.Errorf("failed to read SOCKS5 methods count: %w", err)
+	}
+	numMethods := int(nmethodsBuf[0])
+	methods := make([]byte, numMethods)
+	if _, err := io.ReadFull(conn, methods); err != nil {
+		return "", fmt.Errorf("failed to read SOCKS5 methods: %w", err)
+	}
+	if err := writeSocksReply(conn, []byte{0x05, 0x00}); err != nil {
+		return "", fmt.Errorf("failed to write greeting reply: %w", err)
 	}
 
-	// 1. Negotiation (Greeting)
-	if err := handleGreeting(conn); err != nil {
-		return "", fmt.Errorf("negotiation failed: %w", err)
-	}
-
-	// 2. Request phase
 	var buf [4]byte
-	if _, err := io.ReadFull(conn, buf[:4]); err != nil {
+	if _, err := io.ReadFull(conn, buf[:]); err != nil {
 		return "", fmt.Errorf("failed to read request header: %w", err)
 	}
 	if buf[0] != 0x05 {
 		return "", fmt.Errorf("unsupported request version: 0x%02x", buf[0])
 	}
 	if buf[1] != 0x01 { // CMD: CONNECT only
-		// Send reply: command not supported (0x07)
-		var responseErrs []error
-		if _, err := conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
-			responseErrs = append(responseErrs, fmt.Errorf("write unsupported command reply failed: %w", err))
-		}
-		if cw, ok := conn.(interface{ CloseWrite() error }); ok {
-			if err := cw.CloseWrite(); err != nil && !errors.Is(err, net.ErrClosed) {
-				responseErrs = append(responseErrs, fmt.Errorf("close SOCKS5 response writer failed: %w", err))
-			}
-			// Wait a bit for client to read the response and close its end (up to 2 seconds)
-			if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-				responseErrs = append(responseErrs, fmt.Errorf("set SOCKS5 response drain deadline failed: %w", err))
-			}
-			var temp [1]byte
-			if _, err := conn.Read(temp[:]); err != nil {
-				var netErr net.Error
-				if !errors.Is(err, io.EOF) && (!errors.As(err, &netErr) || !netErr.Timeout()) {
-					responseErrs = append(responseErrs, fmt.Errorf("drain SOCKS5 response failed: %w", err))
-				}
-			}
-		}
-		return "", errors.Join(
-			fmt.Errorf("unsupported command: 0x%02x (only CONNECT is supported)", buf[1]),
-			errors.Join(responseErrs...),
-		)
+		writeErr := writeSocksReply(conn, []byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		drainErr := drainSocksResponse(conn)
+		return "", errors.Join(fmt.Errorf("unsupported command: 0x%02x (only CONNECT is supported)", buf[1]), writeErr, drainErr)
 	}
 
 	atyp := buf[3]
 	destAddr, err := readSocks5Address(conn, atyp)
 	if err != nil {
 		if atyp != 0x01 && atyp != 0x03 && atyp != 0x04 {
-			// Send reply: address type not supported (0x08)
-			if _, writeErr := conn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); writeErr != nil {
-				err = errors.Join(err, fmt.Errorf("write unsupported address reply failed: %w", writeErr))
-			}
+			_ = writeSocksReply(conn, []byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		}
 		return "", fmt.Errorf("failed to read destination address: %w", err)
 	}
-
 	return destAddr, nil
 }
 
-func handleGreeting(conn net.Conn) error {
-	var buf [257]byte
-	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
-		return fmt.Errorf("failed to read greeting header: %w", err)
+func handleSocks4Handshake(conn net.Conn) (string, error) {
+	var header [7]byte
+	if _, err := io.ReadFull(conn, header[:]); err != nil {
+		return "", fmt.Errorf("failed to read SOCKS4 header: %w", err)
 	}
-	if buf[0] != 0x05 {
-		return fmt.Errorf("unsupported version: 0x%02x", buf[0])
+	cmd := header[0]
+	port := binary.BigEndian.Uint16(header[1:3])
+	ipBuf := header[3:7]
+
+	_, userErr := readNulTerminatedString(conn, 1024)
+	if userErr != nil {
+		return "", fmt.Errorf("failed to read SOCKS4 userid: %w", userErr)
 	}
-	numMethods := int(buf[1])
-	if _, err := io.ReadFull(conn, buf[:numMethods]); err != nil {
-		return fmt.Errorf("failed to read methods: %w", err)
+
+	if cmd != 0x01 {
+		writeErr := writeSocksReply(conn, []byte{0x00, 0x5B, 0, 0, 0, 0, 0, 0})
+		drainErr := drainSocksResponse(conn)
+		return "", errors.Join(fmt.Errorf("unsupported SOCKS4 command: 0x%02x (only CONNECT is supported)", cmd), writeErr, drainErr)
 	}
-	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
-		return fmt.Errorf("failed to write greeting reply: %w", err)
+
+	if port == 0 {
+		writeErr := writeSocksReply(conn, []byte{0x00, 0x5B, 0, 0, 0, 0, 0, 0})
+		return "", errors.Join(errors.New("invalid SOCKS4 destination port 0"), writeErr)
 	}
-	return nil
+
+	if ipBuf[0] == 0 && ipBuf[1] == 0 && ipBuf[2] == 0 && ipBuf[3] != 0 {
+		hostname, hostErr := readNulTerminatedString(conn, 255)
+		if hostErr != nil || hostname == "" {
+			writeErr := writeSocksReply(conn, []byte{0x00, 0x5B, 0, 0, 0, 0, 0, 0})
+			if hostErr == nil {
+				hostErr = errors.New("empty SOCKS4a hostname")
+			}
+			return "", errors.Join(fmt.Errorf("failed to read SOCKS4a hostname: %w", hostErr), writeErr)
+		}
+		return net.JoinHostPort(hostname, strconv.Itoa(int(port))), nil
+	}
+
+	return fmt.Sprintf("%d.%d.%d.%d:%d", ipBuf[0], ipBuf[1], ipBuf[2], ipBuf[3], port), nil
 }
 
 func readSocks5Address(conn net.Conn, atyp byte) (string, error) {

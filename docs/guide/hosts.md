@@ -166,6 +166,31 @@ nodes:
 
 **生效优先级**：CLI `-M`/`-S`/`-o` > 节点配置 (`node.ssh_options`) > 全局配置 (`cfg.ssh_options`) > `~/.ssh/config`（其中 `StrictHostKeyChecking` 与 `UserKnownHostsFile` 等主机信任选项仅从 CLI `-o` 或 `xops_config.yaml` 显式配置中读取，不从 `~/.ssh/config` 隐式继承）。
 
+### 常用选项与端口转发/隧道选项
+
+| 选项名 (`snake_case`) | OpenSSH 名称 (`PascalCase`) | 适用值与格式 | 说明 |
+| --- | --- | --- | --- |
+| `control_master` | `ControlMaster` | `auto` / `yes` / `no` / `ask` / `autoask` | 连接多路复用主连接模式 |
+| `control_path` | `ControlPath` | 路径字符串（如 `~/.ssh/cm-%C`）或 `none` | 多路复用控制套接字路径 |
+| `control_persist` | `ControlPersist` | `no` / `yes` / 时间跨度（如 `10m`、`1h`） | 主连接空闲保活与后台驻留时间 |
+| `connect_timeout` | `ConnectTimeout` | 时间跨度（如 `15s`） | 连接与握手超时时间 |
+| `server_alive_interval` | `ServerAliveInterval` | 时间跨度（如 `30s`） | 客户端向服务器发送保活心跳的间隔 |
+| `strict_host_key_checking` | `StrictHostKeyChecking` | `yes` / `no` / `ask` / `accept-new` / `off` | 远端主机公钥严格检查策略 |
+| `exit_on_forward_failure` | `ExitOnForwardFailure` | `yes` / `no` | 端口转发或隧道建立失败时是否立即退出会话 |
+| `clear_all_forwardings` | `ClearAllForwardings` | `yes` / `no` | 是否清除所有配置文件或命令行中此前声明的转发规则 |
+| `gateway_ports` | `GatewayPorts` | `yes` / `no` | 允许外部主机连接本地转发的端口（默认为 `no`） |
+| `stream_local_bind_unlink` | `StreamLocalBindUnlink` | `yes` / `no` | 绑定 Unix 域套接字前自动删除已存在的旧套接字文件（默认为 `no`） |
+| `stream_local_bind_mask` | `StreamLocalBindMask` | 八进制掩码（如 `0177`、`0117`） | 创建 Unix 域套接字文件时的权限掩码（umask，默认 `0177`） |
+| `fork_after_authentication` | `ForkAfterAuthentication` | `yes` / `no` | 认证及转发建立完成后进入后台运行（对应 `-f`，隐含 `stdin_null`） |
+| `stdin_null` | `StdinNull` | `yes` / `no` | 将标准输入重定向至 `/dev/null`（对应 `-n`） |
+| `session_type` | `SessionType` | `default` / `none` | 会话模式；`none` 表示仅转发端口或隧道，不打开远端会话（对应 `-N`） |
+| `tunnel` | `Tunnel` | `yes` / `point-to-point` / `ethernet` / `no` | 请求虚拟网卡隧道转发（`yes` 等价于 `point-to-point`） |
+| `tunnel_device` | `TunnelDevice` | `local_tun[:remote_tun]`（如 `0:0`, `any:any`） | 指定本地与远程 tun/tap 设备单元号 |
+| `request_tty` | `RequestTTY` | `no` / `yes` / `force` / `auto` | 伪终端 (PTY) 分配策略 |
+| `local_forward` | `LocalForward` | 字符串或字符串数组 | 本地端口或 Unix 域套接字转发；支持 `"[bind_address:]port host:hostport"` 或 `"local_socket:remote_socket"` |
+| `remote_forward` | `RemoteForward` | 字符串或字符串数组 | 远程端口、Unix 域套接字或反向动态转发；支持 `"[bind_address:]port[:host:hostport]"` 或 `"remote_socket[:local_socket]"` |
+| `dynamic_forward` | `DynamicForward` | 字符串或字符串数组 | 动态应用级 SOCKS4/SOCKS4a/SOCKS5 转发；支持 `"[bind_address:]port"` 或本地 Unix 域套接字路径 |
+
 ## 已删除的凭据参数
 
 `host add|edit` 和 `identity add|edit` 已移除明文参数 `--password`、`--key-pass` 及其短参数，避免密码泄露在命令行参数和 Shell 历史中；旧命令 `loadHost` 也已移除（请改用 `xops host import`）。

@@ -447,7 +447,7 @@ nodes:
 | `check` | 查询 Master 进程是否存活并获取其 PID | `Master running (pid=<pid>)` | 0 |
 | `exit` | 请求 Master 进程立即切断连接并退出 | `Exit request sent.` | 0 |
 | `stop` | 请求 Master 停止监听新连接，但保留既有会话；没有会话需要排空时立即退出 | `Stop listening request sent.` | 0 |
-| `forward` | 在活动 Master 上动态增加本地/远程/动态端口转发（配合 `-L`、`-R`、`-D`） | `Allocated port <port>...` / `Forwarding request sent.` | 0 |
+| `forward` | 在活动 Master 上动态增加本地/远程/动态端口转发（配合 `-L`、`-R`、`-D`） | `-R 0:...` 动态分配端口输出到 stdout（如 `<port>`）；stderr 输出 `Forwarding request sent.` | 0 |
 | `cancel` | 取消活动 Master 上的指定端口转发（配合 `-L`、`-R`、`-D`） | `Forwarding cancel request sent.` | 0 |
 | `proxy` | 对齐 OpenSSH `-O proxy` 语义：通过 `MUX_C_PROXY` 连接活动 Master 并在该复用连接上执行请求的远程命令或交互会话（需指定目标 `<host>` 或 `--host <host>`） | 远程命令或会话的标准输出/错误输出 | 远程命令退出码（连接或校验失败为 255） |
 | `proxy-stream` | （扩展指令）将当前进程标准输入输出切换为与 Master 的原始 `MUX_C_PROXY` 二进制字节流管道（指定 `-S` 时可省略 `<host>`） | 二进制标准输入输出流转发 | 0 |

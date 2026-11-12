@@ -47,6 +47,7 @@ type Environment struct {
 	ResolveKeyPath      func(string) string
 	InteractiveIO       InteractiveIO
 	InputBridge         InputBridge
+	TunnelOpener        TunnelDeviceOpener
 
 	// Multiplexing and path expansion parameters injected by host
 	HomeDir   string
@@ -60,6 +61,9 @@ func WithEnvironment(environment Environment) Option {
 	environment.DefaultKeyPaths = slices.Clone(environment.DefaultKeyPaths)
 	if nilCapability(environment.InputBridge) {
 		environment.InputBridge = nil
+	}
+	if nilCapability(environment.TunnelOpener) {
+		environment.TunnelOpener = nil
 	}
 	return func(c *Connector) {
 		c.environment = environment

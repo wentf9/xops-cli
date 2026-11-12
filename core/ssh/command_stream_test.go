@@ -477,3 +477,119 @@ func TestRunShellWithoutPTY_DrainTimeoutUnblocksStalledPipe(t *testing.T) {
 		t.Fatalf("expected DeadlineExceeded on drain timeout, got: %v", err)
 	}
 }
+
+func TestRunCommandPlanWithRemotePTY_StrictOutputs(t *testing.T) {
+	baseline := goleak.IgnoreCurrent()
+	t.Cleanup(func() { goleak.VerifyNone(t, baseline) })
+
+	plan, err := PlanCommand("echo hello", CommandOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scenario := &commandFixture{output: "hello\n", status: 0}
+	client := commandTestClient(t, scenario)
+	unknown := &unknownTerminalWriter{}
+
+	if err := client.RunCommandPlanWithRemotePTY(t.Context(), plan, nil, unknown, io.Discard); err == nil {
+		t.Fatal("expected error with uncancelable stdout")
+	}
+	if err := client.RunCommandPlanWithRemotePTY(t.Context(), plan, nil, io.Discard, unknown); err == nil {
+		t.Fatal("expected error with uncancelable stderr")
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := client.RunCommandPlanWithRemotePTY(t.Context(), plan, nil, &stdout, &stderr); err != nil {
+		t.Fatalf("expected success with cancelable outputs, got: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "hello") {
+		t.Fatalf("expected stdout containing hello, got %q", stdout.String())
+	}
+}
+
+func assertRecordedChannelValue(t *testing.T, ch <-chan string, want, label string) {
+	t.Helper()
+	select {
+	case got := <-ch:
+		if got != want {
+			t.Fatalf("expected %s %q, got %q", label, want, got)
+		}
+	default:
+		t.Fatalf("missing %s %q", label, want)
+	}
+}
+
+func TestRunCommandWithRemotePTY(t *testing.T) {
+	baseline := goleak.IgnoreCurrent()
+	t.Cleanup(func() { goleak.VerifyNone(t, baseline) })
+
+	t.Run("BashInterpreter_EmptyCommand_SendsExecBash", func(t *testing.T) {
+		scenario := &commandFixture{
+			requestTypes: make(chan string, 4),
+			commands:     make(chan string, 4),
+			output:       "bash prompt\n",
+			status:       0,
+		}
+		client := commandTestClient(t, scenario)
+		client.cfgMu.Lock()
+		client.connCfg.Execution = &ExecutionConfig{Interpreter: InterpreterBash, LaunchDialect: LaunchPOSIX}
+		client.cfgMu.Unlock()
+
+		unknownOut := &unknownTerminalWriter{}
+		unknownErr := &unknownTerminalWriter{}
+		if err := client.RunCommandWithRemotePTY(t.Context(), "", nil, unknownOut, unknownErr); err != nil {
+			t.Fatalf("RunCommandWithRemotePTY failed: %v", err)
+		}
+
+		assertRecordedChannelValue(t, scenario.requestTypes, "pty-req", "request")
+		assertRecordedChannelValue(t, scenario.requestTypes, "exec", "request")
+		assertRecordedChannelValue(t, scenario.commands, "bash", "exec command")
+		if unknownOut.calls.Load() == 0 {
+			t.Fatal("expected uncancelable stdout writer to receive data")
+		}
+	})
+
+	t.Run("ServerInterpreter_EmptyCommand_DelegatesToShell", func(t *testing.T) {
+		scenario := &commandFixture{
+			requestTypes: make(chan string, 4),
+			output:       "server shell\n",
+			status:       0,
+		}
+		client := commandTestClient(t, scenario)
+
+		unknownOut := &unknownTerminalWriter{}
+		unknownErr := &unknownTerminalWriter{}
+		if err := client.RunCommandWithRemotePTY(t.Context(), "", nil, unknownOut, unknownErr); err != nil {
+			t.Fatalf("RunCommandWithRemotePTY delegating to shell failed: %v", err)
+		}
+
+		assertRecordedChannelValue(t, scenario.requestTypes, "pty-req", "request")
+		assertRecordedChannelValue(t, scenario.requestTypes, "shell", "request")
+		if unknownOut.calls.Load() == 0 {
+			t.Fatal("expected uncancelable stdout writer to receive data")
+		}
+	})
+
+	t.Run("ServerInterpreter_NonEmptyCommand_SendsExec", func(t *testing.T) {
+		scenario := &commandFixture{
+			requestTypes: make(chan string, 4),
+			commands:     make(chan string, 4),
+			output:       "uptime output\n",
+			status:       0,
+		}
+		client := commandTestClient(t, scenario)
+
+		unknownOut := &unknownTerminalWriter{}
+		unknownErr := &unknownTerminalWriter{}
+		if err := client.RunCommandWithRemotePTY(t.Context(), "uptime", nil, unknownOut, unknownErr); err != nil {
+			t.Fatalf("RunCommandWithRemotePTY with command failed: %v", err)
+		}
+
+		assertRecordedChannelValue(t, scenario.requestTypes, "pty-req", "request")
+		assertRecordedChannelValue(t, scenario.requestTypes, "exec", "request")
+		assertRecordedChannelValue(t, scenario.commands, "uptime", "exec command")
+		if unknownOut.calls.Load() == 0 {
+			t.Fatal("expected uncancelable stdout writer to receive data")
+		}
+	})
+}

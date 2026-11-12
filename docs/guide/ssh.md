@@ -46,6 +46,9 @@ xops ssh --host linux-01 --interpreter bash --launch-dialect posix --login-shell
 
 - **解释器选择**：默认使用远端 Shell；需要指定时，可选择 `server`、`bash`、`sh`、`zsh`、`fish`、`powershell`、`pwsh` 或 `cmd`。参数搭配见[命令执行](./exec#解释器选择与跨平台执行)。Windows、macOS 和 Linux 均可在终端中运行。
 - **登录环境控制**：使用 `bash`、`zsh` 或 `fish` 时可通过 `--login-shell` 控制是否加载登录环境；`--no-login` 为 Bash 兼容参数（等效于非登录 `bash -c`）；`server` 模式不接受登录选项。
+- **伪终端控制（PTY）**：
+  - `-T`（`--disable-tty`）：禁止为会话分配伪终端（对应 `-o RequestTTY=no`）。
+  - `-t`（`--force-tty`）：在本地输入为终端时强制为远程命令分配 PTY；多次指定（`-tt`）即使本地标准输入被重定向或非终端也强制请求远端分配 PTY（对应 `-o RequestTTY=no|yes|force|auto`）。命令行出现多个 `-T` 与 `-t` 时按最后出现的选项生效，显式 Flag 优先于 `-o RequestTTY` 选项。
 - **输入流与 Shell 路由**：
   - **终端无命令**：标准输入为终端且未传命令时，打开交互式 PTY 登录 Shell。
   - **管道脚本（如 `cat script.sh | xops ssh web-01`）**：默认由远端 Shell 读取并执行；若节点配置了 `bash`、`sh`、`zsh` 或 `fish`，则使用该解释器和节点的登录设置。
@@ -206,16 +209,74 @@ xops exec -x --sudo web-01 id
 ## 端口转发与隧道
 
 ```bash
-# 本地转发（-L）：将本机 127.0.0.1:8080 转发至远端看到的 127.0.0.1:80
+# 本地端口转发（-L）：将本机 127.0.0.1:8080 转发至远端看到的 127.0.0.1:80
 xops ssh -L 8080:127.0.0.1:80 -N web-01
 
-# 动态 SOCKS5 代理（-D）：在本机 127.0.0.1:1080 开启 SOCKS5 代理
-xops ssh -D 1080 -N web-01
+# 本地 Unix 域套接字（StreamLocal）转发：
+xops ssh -L /tmp/local.sock:/var/run/docker.sock -N web-01
 
-# 远程转发（-R）：将远端 127.0.0.1:9000 转发至本机 127.0.0.1:3000
+# 动态 SOCKS 代理（-D）：在本机 127.0.0.1:1080 开启 SOCKS4/SOCKS4a/SOCKS5 代理（也支持本地 Unix 套接字）
+xops ssh -D 1080 -N web-01
+xops ssh -D /tmp/socks.sock -N web-01
+
+# 远程端口转发（-R）：将远端 127.0.0.1:9000 转发至本机 127.0.0.1:3000
 xops ssh -R 9000:127.0.0.1:3000 -N web-01
+
+# 远程动态分配端口（-R 0:...）：远端动态分配空闲端口并在 stderr 输出分配提示
+xops ssh -R 0:127.0.0.1:8080 -N web-01
+
+# 远程反向动态 SOCKS 代理（-R）：在远端开放 SOCKS 代理并回传本地
+xops ssh -R 1080 -N web-01
+
+# 远程 Unix 域套接字转发：
+xops ssh -R /run/user/1000/gnupg/S.gpg-agent:/run/user/1000/gnupg/S.gpg-agent.extra -N web-01
+
+# 开启网关端口（-g）：允许外部网络主机连接本地转发的端口
+xops ssh -g -L 8080:127.0.0.1:80 -N web-01
+
+# 后台静默运行转发（-f -N 或执行单条远程命令）：
+xops ssh -f -N -L 8080:127.0.0.1:80 web-01
+xops ssh -f web-01 "sleep 10"
+
+# 多路复用控制指令动态添加转发并捕获动态分配端口：
+PORT=$(xops ssh -O forward -R 0:127.0.0.1:8080 web-01)
+
+# 标准输入输出转发（-W）：将 stdin/stdout 通过安全通道转发至目标 host:port（常用作 ProxyCommand 跳板）
+xops ssh -W 192.0.2.20:22 bastion
+
+# 隧道设备转发（-w）：建立点对点 (tun) 虚拟网卡隧道（需服务端开启 PermitTunnel）
+xops ssh -w 0:0 -N gw
+
+# 二层以太网 (tap) 隧道转发（须在 -w 之前指定 -o Tunnel=ethernet）
+xops ssh -o Tunnel=ethernet -w 1:any -N gw
 ```
 
+- **本地端口转发 (`-L [bind_address:]port:host:hostport` 或 `-L local_socket:remote_socket`)**：
+  - 将本地监听端口或 Unix 域套接字（StreamLocal）请求通过加密隧道转发至远端目标。
+  - 省略 `bind_address` 时默认仅监听本地 `127.0.0.1`；配合 `-g` (`--gateway-ports`) 或 `-o GatewayPorts=yes` 可允许外部网络主机连接本地转发端口。
+- **远程端口转发 (`-R [bind_address:]port[:host:hostport]` 或 `-R remote_socket[:local_socket]`)**：
+  - 将远程服务端监听的端口或 Unix 域套接字请求反向转发至本地目标。
+  - **动态端口分配 (`-R 0:...`)**：当远程端口指定为 `0` 时（如 `-R 0:127.0.0.1:8080`），服务器动态分配可用端口。普通连接会话在标准错误 (`stderr`) 输出 `Allocated port <port> for remote forward to ...`（避免污染远程命令的 `stdout` 数据流）；使用多路复用控制命令 `-O forward -R 0:...` 时则将纯端口号输出至标准输出 (`stdout`)，便于脚本直接捕获（例如 `PORT=$(xops ssh -O forward -R 0:127.0.0.1:8080 host)`），状态与确认信息写入 `stderr`。注意，因 `-f` 后台运行会在分离子进程中重建连接并将标准输入输出重定向至 `/dev/null`，直接将 `-f` 与 `-R 0:...` 连用不会输出后台进程分配的端口号；若脚本需要捕获后台隧道的动态分配端口，可先启动后台 Master（`-M -f -N`）再执行 `PORT=$(xops ssh -O forward -R 0:... <host>)`。
+  - **反向动态代理**：省略目标 `host:hostport` 时（如 `-R 1080` 或 `-R remote_socket`），在远端开启反向 SOCKS 代理通道。
+- **动态应用级转发 (`-D [bind_address:]port` 或 `-D local_socket`)**：
+  - 在本地开启 SOCKS 代理服务器，支持 SOCKS4、SOCKS4a 与 SOCKS5 协议，亦支持绑定到本地 Unix 域套接字。
+- **网关端口 (`-g` / `--gateway-ports`)**：
+  - 允许外部网络主机连接本地转发的端口（对应 `-o GatewayPorts=yes`）。
+- **会话控制与后台运行 (`-f`, `-N`, `-n`)**：
+  - `-N`（`--no-cmd`）：不执行远程命令也不分配 Shell，专用于端口转发与隧道（对应 `-o SessionType=none`）。与显式远程命令互斥。
+  - `-f`（`--background`）：在身份验证和端口转发建立后转入后台运行。支持 `xops ssh -f host <cmd>`（后台执行远程命令）以及 `xops ssh -f -N ...`（后台运行转发隧道），后台模式自动隐含 `-n`（标准输入重定向至 `/dev/null`）。若未指定远程命令且未指定 `-N`，则直接报错拒绝。
+  - `-n`（`--stdin-redirect`）：将标准输入重定向到 `/dev/null`，防止后台读取终端输入（对应 `-o StdinNull=yes`）。
+- **多路复用动态转发 (`-O forward`)**：
+  - 向活动 Master 发送控制命令动态增减转发。建立 `-R 0:...` 动态分配端口转发时，动态分配的端口号输出到 `stdout`，而 `Forwarding request sent.` 提示写入 `stderr`。
 - **绑定与校验时机**：`-L` 和 `-D` 在本地端口收到连接时才按需打开 SSH 通道；`-R` 在启动时立即向服务器申请远端监听（建立与关闭各有 10 秒超时上限），若被服务器拒绝则立即报错退出。
+- **标准输入输出转发 (`-W host:port` / `--stdio-forward`)**：
+  - 将客户端 `stdin`/`stdout` 通过 SSH `direct-tcpip` 安全通道转发至远端可访问的 `host:port`（如配合原生 `ssh -o ProxyCommand="xops ssh -W %h:%p bastion" target` 作为跳板通道）。
+  - 默认隐含 `-N`（不执行远程命令）、`-T`（禁止分配 PTY）、`ExitOnForwardFailure=yes` 与 `ClearAllForwardings=yes`（可通过配置文件或 `-o` 显式覆盖，例如 `-o ClearAllForwardings=no`、`-o ExitOnForwardFailure=no`）。
+  - `-W` 转发为专用纯净二进制流通道，不可与远程命令、`-f` 后台运行、`--sudo` 或 `-O` 多路复用控制命令（`-O proxy` 除外）同时使用。
+- **隧道设备转发 (`-w local_tun[:remote_tun]` / `--tunnel-device`)**：
+  - 建立客户端与服务端（需 `sshd` 开启 `PermitTunnel`）之间的三层（`point-to-point`）或二层（`ethernet`）虚拟网卡隧道。
+  - 单元号可为非负整数或 `any`（由系统自动分配空闲设备），省略 `:remote_tun` 时默认为 `any`（例如 `-w 0` 等价于 `-w 0:any`）。
+  - **模式与顺序规则**：若未提前指定 `Tunnel` 指令，默认采用 `point-to-point` 模式；如需 `ethernet` 二层模式，需在 `-w` **之前**指定 `-o Tunnel=ethernet`（例如 `xops ssh -o Tunnel=ethernet -w 0:0 gw`）。
+  - **平台支持说明**：Linux 原生支持 `tun` (`point-to-point`) 与 `tap` (`ethernet`)；macOS 原生支持 `utun` (`point-to-point`)；Windows 暂不支持本地内核虚拟网卡创建（配置项与 `-o` 解析仍全平台可用）。
 - **单连接故障隔离**：单次转发连接失败（如 `administratively prohibited` 或目标端口未监听）通过受控队列提示到 `stderr`，但不会中断主 SSH 会话或转发监听器。`-N` 就绪提示仍写 stdout。堵塞输出不会卡住转发回调，输出失败在结束时作为错误返回；不支持的管道可能略过辅助提示，可将对应输出流重定向到普通文件。
-- **连接保活与断开退出**：使用 `-L`、`-R`、`-D` 或 `-N` 时自动启用连接监测——连续 15 秒无远端数据时发送 SSH 心跳，等待期间若连续 10 秒既无心跳回复也无数据进展则判定断线，自动关闭本地监听端口并以非零状态退出。后台运行可组合 `-f -N`。
+- **连接保活与断开退出**：使用 `-L`、`-R`、`-D`、`-w` 或 `-N` 时自动启用连接监测——连续 15 秒无远端数据时发送 SSH 心跳，等待期间若连续 10 秒既无心跳回复也无数据进展则判定断线，自动关闭本地监听端口并以非零状态退出。后台运行可组合 `-f -N`。

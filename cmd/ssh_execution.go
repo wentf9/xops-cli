@@ -16,6 +16,9 @@ func (o *SshOptions) prepareCommandPlan() error {
 	if o.NoCmd {
 		return fmt.Errorf("explicit execution cannot be combined with -N / --no-cmd")
 	}
+	if o.StdioForward != "" {
+		return fmt.Errorf("explicit execution cannot be combined with -W / --stdio-forward")
+	}
 	if o.Command == "" {
 		return o.validateEmptyCommandExecution()
 	}

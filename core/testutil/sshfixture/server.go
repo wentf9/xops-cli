@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -26,25 +27,26 @@ import (
 const Password = "synthetic-ssh-fixture-password"
 
 type Server struct {
-	Address       string
-	HostKey       ssh.PublicKey
-	Executed      atomic.Int32
-	Authenticated atomic.Int32 // Successful SSH authentications, independent of exec channels.
-	Forwards      atomic.Int32
-	ctx           context.Context
-	cancel        context.CancelFunc
-	listener      net.Listener
-	config        *ssh.ServerConfig
-	handlers      sftp.Handlers
-	mu            sync.Mutex
-	connections   map[net.Conn]struct{}
-	forwards      map[string]net.Listener
-	errors        []error
-	workers       sync.WaitGroup
-	closeOnce     sync.Once
-	closeErr      error
-	execHandler   func(command string, channel ssh.Channel)
-	shellHandler  func(channel ssh.Channel, requests <-chan *ssh.Request)
+	Address           string
+	HostKey           ssh.PublicKey
+	Executed          atomic.Int32
+	Authenticated     atomic.Int32 // Successful SSH authentications, independent of exec channels.
+	Forwards          atomic.Int32
+	ctx               context.Context
+	cancel            context.CancelFunc
+	listener          net.Listener
+	config            *ssh.ServerConfig
+	handlers          sftp.Handlers
+	mu                sync.Mutex
+	connections       map[net.Conn]struct{}
+	forwards          map[string]net.Listener
+	requestedForwards []string
+	errors            []error
+	workers           sync.WaitGroup
+	closeOnce         sync.Once
+	closeErr          error
+	execHandler       func(command string, channel ssh.Channel)
+	shellHandler      func(channel ssh.Channel, requests <-chan *ssh.Request)
 }
 
 type Options struct {
@@ -88,7 +90,8 @@ func NewWithOptions(ctx context.Context, options Options) (*Server, error) {
 	}
 	work, cancel := context.WithCancel(ctx)
 	s := &Server{Address: listener.Addr().String(), HostKey: hostKeys[0].PublicKey(), ctx: work, cancel: cancel, listener: listener,
-		connections: make(map[net.Conn]struct{}), handlers: sftp.InMemHandler(), execHandler: options.ExecHandler, shellHandler: options.ShellHandler, config: &ssh.ServerConfig{PasswordCallback: func(_ ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+		connections: make(map[net.Conn]struct{}), handlers: sftp.InMemHandler(), execHandler: options.ExecHandler, shellHandler: options.ShellHandler,
+		requestedForwards: make([]string, 0), config: &ssh.ServerConfig{PasswordCallback: func(_ ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
 			if string(password) != Password {
 				return nil, errors.New("fixture password rejected")
 			}
@@ -198,6 +201,11 @@ func (s *Server) serve(conn net.Conn) {
 			go s.direct(incoming)
 			continue
 		}
+		if incoming.ChannelType() == "direct-streamlocal@openssh.com" {
+			s.workers.Add(1)
+			go s.directStreamLocal(incoming)
+			continue
+		}
 		if incoming.ChannelType() != "session" {
 			s.record(incoming.Reject(ssh.UnknownChannelType, "session required"))
 			continue
@@ -267,9 +275,12 @@ func (s *Server) Close() error {
 		s.cancel()
 		s.record(s.listener.Close())
 		s.mu.Lock()
-		for _, listener := range s.forwards {
+		for key, listener := range s.forwards {
 			if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 				s.errors = append(s.errors, err)
+			}
+			if strings.HasPrefix(key, "unix:") {
+				_ = os.Remove(strings.TrimPrefix(key, "unix:"))
 			}
 		}
 		connections := make([]net.Conn, 0, len(s.connections))
@@ -320,6 +331,33 @@ func (s *Server) direct(incoming ssh.NewChannel) {
 	s.pipe(channel, requests, connection)
 }
 
+func (s *Server) directStreamLocal(incoming ssh.NewChannel) {
+	defer s.workers.Done()
+	var target struct {
+		SocketPath string
+		Reserved0  string
+		Reserved1  uint32
+	}
+	if err := ssh.Unmarshal(incoming.ExtraData(), &target); err != nil || target.SocketPath == "" {
+		s.record(incoming.Reject(ssh.Prohibited, "invalid streamlocal target"))
+		return
+	}
+	dialer := net.Dialer{}
+	connection, err := dialer.DialContext(s.ctx, "unix", target.SocketPath)
+	if err != nil {
+		s.record(incoming.Reject(ssh.ConnectionFailed, "fixture streamlocal target unavailable"))
+		return
+	}
+	defer func() { s.record(connection.Close()) }()
+	channel, requests, err := incoming.Accept()
+	if err != nil {
+		s.record(err)
+		return
+	}
+	s.Forwards.Add(1)
+	s.pipe(channel, requests, connection)
+}
+
 func (s *Server) pipe(channel ssh.Channel, requests <-chan *ssh.Request, connection net.Conn) {
 	defer func() { s.record(channel.Close()) }()
 	deadline, _ := s.ctx.Deadline()
@@ -342,57 +380,143 @@ func (s *Server) pipe(channel ssh.Channel, requests <-chan *ssh.Request, connect
 func (s *Server) globalRequests(connection *ssh.ServerConn, requests <-chan *ssh.Request) {
 	defer s.workers.Done()
 	for request := range requests {
-		if request.Type == "keepalive@openssh.com" {
+		switch request.Type {
+		case "keepalive@openssh.com":
 			if request.WantReply {
 				s.record(request.Reply(true, nil))
 			}
-			continue
-		}
-		var address struct {
-			Host string
-			Port uint32
-		}
-		if err := ssh.Unmarshal(request.Payload, &address); err != nil {
+		case "streamlocal-forward@openssh.com":
+			s.streamLocalForward(connection, request)
+		case "cancel-streamlocal-forward@openssh.com":
+			s.cancelStreamLocalForward(request)
+		case "cancel-tcpip-forward":
+			s.cancelTCPIPForward(request)
+		case "tcpip-forward":
+			s.tcpipForward(connection, request)
+		default:
 			s.record(request.Reply(false, nil))
-			continue
 		}
-		key := net.JoinHostPort(address.Host, strconv.Itoa(int(address.Port)))
-		if request.Type == "cancel-tcpip-forward" {
-			s.mu.Lock()
-			listener := s.forwards[key]
-			delete(s.forwards, key)
-			s.mu.Unlock()
-			if listener != nil {
-				s.record(listener.Close())
-			}
-			s.record(request.Reply(true, nil))
-			continue
-		}
-		if request.Type != "tcpip-forward" {
-			s.record(request.Reply(false, nil))
-			continue
-		}
-		config := net.ListenConfig{}
-		listener, err := config.Listen(s.ctx, "tcp", key)
-		if err != nil {
-			s.record(request.Reply(false, nil))
-			continue
-		}
-		actual := uint32(listener.Addr().(*net.TCPAddr).Port)
-		key = net.JoinHostPort(address.Host, strconv.Itoa(int(actual)))
-		s.mu.Lock()
-		if s.ctx.Err() != nil {
-			s.mu.Unlock()
-			s.record(listener.Close())
-			return
-		}
-		s.forwards[key] = listener
-		s.mu.Unlock()
-		s.record(request.Reply(true, ssh.Marshal(struct{ Port uint32 }{actual})))
-		s.Forwards.Add(1)
-		s.workers.Add(1)
-		go s.acceptForward(connection, listener, address.Host, actual)
 	}
+}
+
+func (s *Server) streamLocalForward(connection *ssh.ServerConn, request *ssh.Request) {
+	var slPayload struct {
+		SocketPath string
+	}
+	if err := ssh.Unmarshal(request.Payload, &slPayload); err != nil {
+		s.record(request.Reply(false, nil))
+		return
+	}
+	lc := net.ListenConfig{}
+	listener, err := lc.Listen(s.ctx, "unix", slPayload.SocketPath)
+	if err != nil {
+		s.record(request.Reply(false, nil))
+		return
+	}
+	key := "unix:" + slPayload.SocketPath
+	s.mu.Lock()
+	if s.ctx.Err() != nil {
+		s.mu.Unlock()
+		s.record(listener.Close())
+		_ = os.Remove(slPayload.SocketPath)
+		return
+	}
+	if _, exists := s.forwards[key]; exists {
+		s.mu.Unlock()
+		s.record(listener.Close())
+		_ = os.Remove(slPayload.SocketPath)
+		s.record(request.Reply(false, nil))
+		return
+	}
+	s.forwards[key] = listener
+	s.requestedForwards = append(s.requestedForwards, key)
+	s.mu.Unlock()
+	s.record(request.Reply(true, nil))
+	s.Forwards.Add(1)
+	s.workers.Add(1)
+	go s.acceptStreamLocalForward(connection, listener, slPayload.SocketPath)
+}
+
+func (s *Server) cancelStreamLocalForward(request *ssh.Request) {
+	var slPayload struct {
+		SocketPath string
+	}
+	if err := ssh.Unmarshal(request.Payload, &slPayload); err != nil {
+		s.record(request.Reply(false, nil))
+		return
+	}
+	key := "unix:" + slPayload.SocketPath
+	s.mu.Lock()
+	listener := s.forwards[key]
+	delete(s.forwards, key)
+	s.mu.Unlock()
+	if listener == nil {
+		s.record(request.Reply(false, nil))
+		return
+	}
+	s.record(listener.Close())
+	if err := os.Remove(slPayload.SocketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		s.record(err)
+	}
+	s.record(request.Reply(true, nil))
+}
+
+func (s *Server) cancelTCPIPForward(request *ssh.Request) {
+	var address struct {
+		Host string
+		Port uint32
+	}
+	if err := ssh.Unmarshal(request.Payload, &address); err != nil {
+		s.record(request.Reply(false, nil))
+		return
+	}
+	key := net.JoinHostPort(address.Host, strconv.Itoa(int(address.Port)))
+	s.mu.Lock()
+	listener := s.forwards[key]
+	delete(s.forwards, key)
+	s.mu.Unlock()
+	if listener != nil {
+		s.record(listener.Close())
+	}
+	s.record(request.Reply(true, nil))
+}
+
+func (s *Server) tcpipForward(connection *ssh.ServerConn, request *ssh.Request) {
+	var address struct {
+		Host string
+		Port uint32
+	}
+	if err := ssh.Unmarshal(request.Payload, &address); err != nil {
+		s.record(request.Reply(false, nil))
+		return
+	}
+	key := net.JoinHostPort(address.Host, strconv.Itoa(int(address.Port)))
+	s.mu.Lock()
+	s.requestedForwards = append(s.requestedForwards, key)
+	s.mu.Unlock()
+	config := net.ListenConfig{}
+	listener, err := config.Listen(s.ctx, "tcp", key)
+	if err != nil && address.Host == "localhost" {
+		listener, err = config.Listen(s.ctx, "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(address.Port))))
+	}
+	if err != nil {
+		s.record(request.Reply(false, nil))
+		return
+	}
+	actual := uint32(listener.Addr().(*net.TCPAddr).Port)
+	key = net.JoinHostPort(address.Host, strconv.Itoa(int(actual)))
+	s.mu.Lock()
+	if s.ctx.Err() != nil {
+		s.mu.Unlock()
+		s.record(listener.Close())
+		return
+	}
+	s.forwards[key] = listener
+	s.mu.Unlock()
+	s.record(request.Reply(true, ssh.Marshal(struct{ Port uint32 }{actual})))
+	s.Forwards.Add(1)
+	s.workers.Add(1)
+	go s.acceptForward(connection, listener, address.Host, actual)
 }
 
 func (s *Server) acceptForward(connection *ssh.ServerConn, listener net.Listener, host string, port uint32) {
@@ -419,6 +543,36 @@ func (s *Server) acceptForward(connection *ssh.ServerConn, listener net.Listener
 			s.pipe(channel, requests, client)
 		}()
 	}
+}
+
+func (s *Server) acceptStreamLocalForward(connection *ssh.ServerConn, listener net.Listener, socketPath string) {
+	defer s.workers.Done()
+	for {
+		client, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		channel, requests, err := connection.OpenChannel("forwarded-streamlocal@openssh.com", ssh.Marshal(struct {
+			SocketPath string
+			Reserved0  string
+		}{socketPath, ""}))
+		if err != nil {
+			s.record(client.Close())
+			continue
+		}
+		s.workers.Add(1)
+		go func() {
+			defer s.workers.Done()
+			defer func() { s.record(client.Close()) }()
+			s.pipe(channel, requests, client)
+		}()
+	}
+}
+
+func (s *Server) RequestedForwards() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.requestedForwards...)
 }
 
 func (s *Server) defaultShell(channel ssh.Channel, requests <-chan *ssh.Request) {
