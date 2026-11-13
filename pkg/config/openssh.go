@@ -386,7 +386,10 @@ func parseOpenSSHOptions(cfg *ssh_config.Config, host string) (*ssh.Options, err
 }
 
 // allMatchingOpenSSHOptions resolves all entries for a multi-value option across matching
-// ssh_config Host blocks in appearance order.
+// ssh_config Host blocks. For SendEnv/SetEnv (which MergeOptionLayers/ResolveSessionEnv evaluate
+// low-to-high so later entries override/exclude earlier ones), matching Host blocks are traversed
+// from lowest specificity (bottom) to highest specificity (top) while keeping top-to-bottom order
+// within each Host block.
 func allMatchingOpenSSHOptions(cfg *ssh_config.Config, host string, spec ssh.OptionSpec) []string {
 	if cfg == nil || host == "" {
 		return nil
@@ -396,8 +399,13 @@ func allMatchingOpenSSHOptions(cfg *ssh_config.Config, host string, spec ssh.Opt
 	for _, alias := range spec.Aliases {
 		keys = append(keys, strings.ToLower(alias))
 	}
+	reverseHosts := spec.CanonicalKey == ssh.OptionSendEnv || spec.CanonicalKey == ssh.OptionSetEnv
 	var matches []string
-	for _, h := range cfg.Hosts {
+	for idx := range cfg.Hosts {
+		h := cfg.Hosts[idx]
+		if reverseHosts {
+			h = cfg.Hosts[len(cfg.Hosts)-1-idx]
+		}
 		if !h.Matches(host) {
 			continue
 		}

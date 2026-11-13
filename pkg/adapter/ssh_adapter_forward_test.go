@@ -213,6 +213,10 @@ Host srv
     LocalForward 8080 127.0.0.1:80
     RemoteForward 9090 127.0.0.1:90
     DynamicForward 1080
+    SendEnv LANG LC_*
+    SetEnv FOO=bar
+    RemoteCommand echo %h
+    EscapeChar ^
 `
 	parser, err := config.NewOpenSSHParserFromReader(strings.NewReader(openSSHContent))
 	if err != nil {
@@ -282,6 +286,18 @@ func assertManagedTier4Filtered(t *testing.T, managedOpts *ssh.Options) {
 	if managedOpts.SessionType() != "" {
 		t.Errorf("SessionType should be filtered for managed node, got %q", managedOpts.SessionType())
 	}
+	if len(managedOpts.SendEnvPatterns()) != 0 {
+		t.Errorf("SendEnv should be filtered for managed node, got %v", managedOpts.SendEnvPatterns())
+	}
+	if len(managedOpts.SetEnvDirectives()) != 0 {
+		t.Errorf("SetEnv should be filtered for managed node, got %v", managedOpts.SetEnvDirectives())
+	}
+	if managedOpts.RemoteCommand() != "" {
+		t.Errorf("RemoteCommand should be filtered for managed node, got %q", managedOpts.RemoteCommand())
+	}
+	if managedOpts.EscapeChar() != "" {
+		t.Errorf("EscapeChar should be filtered for managed node, got %q", managedOpts.EscapeChar())
+	}
 }
 
 func assertVirtualTier4Preserved(t *testing.T, virtualOpts *ssh.Options) {
@@ -314,4 +330,71 @@ func assertVirtualTier4Preserved(t *testing.T, virtualOpts *ssh.Options) {
 		t.Errorf("expected ClearAllForwardings=true on virtual node, got (%v, %v)", clearFwd, ok)
 	}
 	assertParsedStreamLocalAndSessionOptions(t, virtualOpts)
+	assertVirtualTier4SessionOptions(t, virtualOpts)
+}
+
+func assertVirtualTier4SessionOptions(t *testing.T, virtualOpts *ssh.Options) {
+	t.Helper()
+	if len(virtualOpts.SendEnvPatterns()) != 2 || virtualOpts.SendEnvPatterns()[0] != "LANG" || virtualOpts.SendEnvPatterns()[1] != "LC_*" {
+		t.Errorf("expected SendEnv preserved on virtual node, got %v", virtualOpts.SendEnvPatterns())
+	}
+	if len(virtualOpts.SetEnvDirectives()) != 1 || virtualOpts.SetEnvDirectives()[0] != "FOO=bar" {
+		t.Errorf("expected SetEnv preserved on virtual node, got %v", virtualOpts.SetEnvDirectives())
+	}
+	if virtualOpts.RemoteCommand() != "echo %h" {
+		t.Errorf("expected RemoteCommand preserved on virtual node, got %q", virtualOpts.RemoteCommand())
+	}
+	if virtualOpts.EscapeChar() != "^" {
+		t.Errorf("expected EscapeChar preserved on virtual node, got %q", virtualOpts.EscapeChar())
+	}
+}
+
+func TestResolveSSHOptions_WithSessionAndForwardOptionsDisabled(t *testing.T) {
+	openSSHContent := `
+Host srv
+    HostName 192.168.1.100
+    Port 2222
+    User bob
+    ConnectTimeout 15
+    RequestTTY force
+    LocalForward 8080 127.0.0.1:80
+    SendEnv LANG
+    SetEnv FOO=bar
+    RemoteCommand echo %h
+    EscapeChar ^
+`
+	parser, err := config.NewOpenSSHParserFromReader(strings.NewReader(openSSHContent))
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	provider := config.NewProviderWithOpenSSHParser(nil, parser)
+	adp := NewNonInteractiveSSHAdapter(
+		provider,
+		WithControlMultiplexing(false),
+		WithHostTrustOverrides(false),
+		WithSessionAndForwardOptions(false),
+	)
+
+	cliOpts, err := ParseOptionStrings([]string{
+		"SendEnv=LC_ALL",
+		"SetEnv=BAZ=qux",
+		"RemoteCommand=ls",
+		"EscapeChar=~",
+		"LocalForward=9999 127.0.0.1:99",
+	})
+	if err != nil {
+		t.Fatalf("ParseOptionStrings failed: %v", err)
+	}
+
+	opts, err := adp.ResolveSSHOptions(config.OpenSSHNodePrefix+"srv", cliOpts)
+	if err != nil {
+		t.Fatalf("ResolveSSHOptions() error = %v", err)
+	}
+	if opts == nil || opts.Get(ssh.OptionConnectTimeout) != "15" {
+		t.Fatalf("expected transport option ConnectTimeout=15 preserved, got %+v", opts)
+	}
+	if len(opts.LocalForwards()) != 0 || opts.RequestTTY() != "" || len(opts.SendEnvPatterns()) != 0 ||
+		len(opts.SetEnvDirectives()) != 0 || opts.RemoteCommand() != "" || opts.EscapeChar() != "" {
+		t.Fatalf("Gate 4 violation: expected all forward and session options stripped, got %+v", opts)
+	}
 }

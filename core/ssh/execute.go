@@ -203,7 +203,7 @@ func (c *Client) RunWithSudo(ctx context.Context, command string, opts ...RunOpt
 	case SudoModeRoot:
 		return c.Run(ctx, command, func(target *RunConfig) { *target = *config })
 	case SudoModeSudoer:
-		return c.runWithSudo(ctx, wrappedCmd, nil, nil, config)
+		return c.runWithSudo(ctx, wrappedCmd, nil, nil, config, true)
 	case SudoModeSudo:
 		return c.runPrivilegeWithConfig(ctx, connCfg.SudoMode, wrappedCmd, nil, config, mat)
 	case SudoModeSu:
@@ -252,7 +252,7 @@ func (c *Client) RunScriptWithSudo(ctx context.Context, scriptContent string, op
 	case SudoModeRoot:
 		return c.RunScript(ctx, scriptContent, func(target *RunConfig) { *target = *config })
 	case SudoModeSudoer:
-		return c.runWithSudo(ctx, bashArgs, nil, strings.NewReader(scriptContent), config)
+		return c.runWithSudo(ctx, bashArgs, nil, strings.NewReader(scriptContent), config, true)
 	case SudoModeSudo:
 		return c.runPrivilegeWithConfig(ctx, connCfg.SudoMode, bashArgs, strings.NewReader(scriptContent), config, mat)
 	case SudoModeSu:
@@ -364,7 +364,7 @@ func interactivePrivilegeCommand(mode SudoMode, command string) (string, error) 
 	}
 }
 
-func (c *Client) runWithSudo(ctx context.Context, command string, password []byte, extraStdin io.Reader, config *RunConfig, material ...*PrivilegeMaterial) (output string, retErr error) {
+func (c *Client) runWithSudo(ctx context.Context, command string, password []byte, extraStdin io.Reader, config *RunConfig, sendSessionEnv bool, material ...*PrivilegeMaterial) (output string, retErr error) {
 	connCfg := c.ConnectionConfig()
 	mode := SudoModeSudoer
 	if len(password) > 0 || connCfg.SudoMode == SudoModeSudo {
@@ -381,6 +381,12 @@ func (c *Client) runWithSudo(ctx context.Context, command string, password []byt
 		return "", err
 	}
 	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
+
+	if sendSessionEnv {
+		if err := c.applySessionEnv(ctx, session); err != nil {
+			return "", err
+		}
+	}
 
 	if len(password) > 0 {
 		pwdStr := string(password) + "\n"
@@ -854,8 +860,8 @@ func resolveSessionErrors(workErr, waitErr, outputFailedErr, closeErr, inputErr,
 	return errors.Join(closeErr, inputErr, outputErr)
 }
 
-// runSessionWithInput owns one non-PTY SSH session. request names the protocol
-// request ("exec" or "shell") for deadline and error reporting; start sends it.
+// runSessionWithInput owns one SSH session. request names the protocol request
+// ("exec", "shell", or "subsystem") for deadline and error reporting; start sends it.
 // cancelOutput registers cancellation callbacks for the output-binding contexts
 // so drain timeouts and session aborts interrupt blocked output writes.
 func (c *Client) runSessionWithInput(ctx context.Context, request string, start func(*ssh.Session) error, initialPayload string, stdin io.Reader, stdout, stderr io.Writer, cancelOutput ...context.CancelFunc) (retErr error) {
@@ -867,6 +873,12 @@ func (c *Client) runSessionWithInput(ctx context.Context, request string, start 
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
+	untrackSession := c.trackActiveSession("client-session (" + request + ")")
+	defer untrackSession()
+
+	if err := c.applySessionEnv(ctx, session); err != nil {
+		return err
+	}
 
 	stdinPipe, stdoutPipe, stderrPipe, pipeErr := openSessionPipes(session)
 	if pipeErr != nil {

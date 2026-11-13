@@ -51,6 +51,10 @@ const (
 	OptionTunnel                       = "tunnel"
 	OptionTunnelDevice                 = "tunnel_device"
 	OptionRequestTTY                   = "request_tty"
+	OptionSendEnv                      = "send_env"
+	OptionSetEnv                       = "set_env"
+	OptionRemoteCommand                = "remote_command"
+	OptionEscapeChar                   = "escape_char"
 	OptionLocalForward                 = "local_forward"
 	OptionRemoteForward                = "remote_forward"
 	OptionDynamicForward               = "dynamic_forward"
@@ -453,6 +457,32 @@ var optionRegistry = []OptionSpec{
 			return normalizeMultiForwardEntries("DynamicForward", raw, ParseDynamicForwardSpec)
 		},
 	},
+	{
+		CanonicalKey: OptionSendEnv,
+		OpenSSHName:  "SendEnv",
+		Class:        OptionClassSession,
+		MultiValue:   true,
+		Normalize:    validateSendEnvOption,
+	},
+	{
+		CanonicalKey: OptionSetEnv,
+		OpenSSHName:  "SetEnv",
+		Class:        OptionClassSession,
+		MultiValue:   true,
+		Normalize:    validateSetEnvOption,
+	},
+	{
+		CanonicalKey: OptionRemoteCommand,
+		OpenSSHName:  "RemoteCommand",
+		Class:        OptionClassSession,
+		Normalize:    validateRemoteCommandOption,
+	},
+	{
+		CanonicalKey: OptionEscapeChar,
+		OpenSSHName:  "EscapeChar",
+		Class:        OptionClassSession,
+		Normalize:    validateEscapeCharOption,
+	},
 }
 
 var optionLookupMap = buildOptionLookupMap()
@@ -608,6 +638,143 @@ func ExpandHostName(pattern, originalHost string) (string, error) {
 		return "", fmt.Errorf("expanded HostName %q contains invalid ASCII control characters", expanded)
 	}
 	return expanded, nil
+}
+
+func validateRemoteCommandOption(raw string) (string, error) {
+	if strings.ContainsAny(raw, "\x00\r\n") {
+		return "", errors.New("invalid RemoteCommand: value cannot contain null bytes or newlines")
+	}
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", errors.New("invalid RemoteCommand: value cannot be empty")
+	}
+	if strings.EqualFold(trimmed, "none") {
+		return "none", nil
+	}
+	return trimmed, nil
+}
+
+// ParseEscapeChar parses an OpenSSH EscapeChar specification:
+//   - "none" (case-insensitive) -> (0, false, nil)
+//   - "^A".."^Z" / "^a".."^z"   -> (upper-'@', true, nil)
+//   - "^?"                      -> (0x7f, true, nil)
+//   - single printable ASCII (0x21..0x7e) -> (b, true, nil)
+//
+// Any other input returns an error wrapping ErrSSHOptionsValidation.
+func ParseEscapeChar(spec string) (ch byte, enabled bool, err error) {
+	ch, enabled, _, err = parseEscapeCharNormalized(spec)
+	if err != nil {
+		return 0, false, fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
+	}
+	return ch, enabled, nil
+}
+
+func validateEscapeCharOption(raw string) (string, error) {
+	_, _, norm, err := parseEscapeCharNormalized(raw)
+	return norm, err
+}
+
+func parseEscapeCharNormalized(spec string) (byte, bool, string, error) {
+	trimmed := strings.TrimSpace(spec)
+	if trimmed == "" {
+		return 0, false, "", fmt.Errorf("invalid EscapeChar %q: value cannot be empty", spec)
+	}
+	if strings.EqualFold(trimmed, "none") {
+		return 0, false, "none", nil
+	}
+	if len(trimmed) == 1 {
+		b := trimmed[0]
+		if b >= 0x21 && b <= 0x7e {
+			return b, true, trimmed, nil
+		}
+		return 0, false, "", fmt.Errorf("invalid EscapeChar %q: expected printable ASCII character, ^A-^Z, ^?, or none", spec)
+	}
+	if len(trimmed) == 2 && trimmed[0] == '^' {
+		c := trimmed[1]
+		if c == '?' {
+			return 0x7f, true, "^?", nil
+		}
+		if c >= 'a' && c <= 'z' {
+			c = c - 'a' + 'A'
+		}
+		if c >= 'A' && c <= 'Z' {
+			return c - '@', true, "^" + string(c), nil
+		}
+		return 0, false, "", fmt.Errorf("invalid EscapeChar control sequence %q: expected ^A-^Z or ^?", spec)
+	}
+	return 0, false, "", fmt.Errorf("invalid EscapeChar %q: expected single character, ^A-^Z, ^?, or none", spec)
+}
+
+// ExpandRemoteCommand expands OpenSSH RemoteCommand percent tokens (%%, %C, %d, %h, %i,
+// %l, %L, %n, %p, %r, %u) against env and target without mutating slashes or cleaning paths.
+func ExpandRemoteCommand(pattern string, env Environment, target TargetContext) (string, error) {
+	if strings.ContainsRune(pattern, 0) {
+		return "", errors.New("RemoteCommand cannot contain null bytes")
+	}
+	trimmed := strings.TrimSpace(pattern)
+	if trimmed == "" {
+		return "", nil
+	}
+	if strings.EqualFold(trimmed, "none") {
+		return "none", nil
+	}
+
+	tokens := buildRemoteCommandTokenMap(env, target)
+	var sb strings.Builder
+	sb.Grow(len(pattern) + 32)
+	for i := 0; i < len(pattern); i++ {
+		if pattern[i] != '%' {
+			sb.WriteByte(pattern[i])
+			continue
+		}
+		if i+1 >= len(pattern) {
+			return "", errors.New("trailing '%' in RemoteCommand")
+		}
+		i++
+		repl, ok := tokens[pattern[i]]
+		if !ok {
+			return "", fmt.Errorf("unknown RemoteCommand token %%%c", pattern[i])
+		}
+		sb.WriteString(repl)
+	}
+	expanded := sb.String()
+	if strings.ContainsRune(expanded, 0) {
+		return "", errors.New("expanded RemoteCommand cannot contain null bytes")
+	}
+	return expanded, nil
+}
+
+func buildRemoteCommandTokenMap(env Environment, target TargetContext) map[byte]string {
+	portStr := "22"
+	if target.Port > 0 {
+		portStr = strconv.Itoa(target.Port)
+	}
+	origHost := target.OriginalHost
+	if origHost == "" {
+		origHost = target.Host
+	}
+	remoteUser := target.User
+	if remoteUser == "" {
+		remoteUser = env.LocalUser
+	}
+	shortLocalHost := env.LocalHost
+	if idx := strings.Index(shortLocalHost, "."); idx != -1 {
+		shortLocalHost = shortLocalHost[:idx]
+	}
+	connHash := ComputeConnectionHash(env.LocalHost, target.Host, portStr, remoteUser, target.JumpHost)
+	return map[byte]string{
+		'%': "%",
+		'C': connHash,
+		'd': env.HomeDir,
+		'h': target.Host,
+		'i': env.LocalUID,
+		'l': env.LocalHost,
+		'L': shortLocalHost,
+		'n': origHost,
+		'p': portStr,
+		'r': remoteUser,
+		'u': env.LocalUser,
+	}
 }
 
 func normalizeOptionalDurationOption(name, raw string) (string, error) {
@@ -1249,6 +1416,53 @@ func (o *Options) KexAlgorithms() string {
 	return o.Get(OptionKexAlgorithms)
 }
 
+// SendEnvPatterns returns all configured SendEnv pattern tokens in evaluation order, or nil if unset.
+func (o *Options) SendEnvPatterns() []string {
+	entries := o.GetAll(OptionSendEnv)
+	if len(entries) == 0 {
+		return nil
+	}
+	var out []string
+	for _, entry := range entries {
+		for tok := range strings.FieldsSeq(entry) {
+			out = append(out, tok)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// SetEnvDirectives returns all configured SetEnv directives in evaluation order, or nil if unset.
+func (o *Options) SetEnvDirectives() []string {
+	entries := o.GetAll(OptionSetEnv)
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		trimmed := strings.TrimSpace(entry)
+		if trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// RemoteCommand returns the configured RemoteCommand (or "none"), or "" if unset.
+func (o *Options) RemoteCommand() string {
+	return o.Get(OptionRemoteCommand)
+}
+
+// EscapeChar returns the normalized EscapeChar specification (or "none"), or "" if unset.
+func (o *Options) EscapeChar() string {
+	return o.Get(OptionEscapeChar)
+}
+
 // FilterByClasses returns a new Options containing only keys matching the allowed OptionClasses.
 // Returns nil if the filtered result is empty.
 func (o *Options) FilterByClasses(allowed ...OptionClass) *Options {
@@ -1356,8 +1570,17 @@ func isActiveControlMaster(mode string) bool {
 		mode == string(ControlMasterAutoAsk)
 }
 
+// isOrderedOverrideMultiValue reports whether canonicalKey represents an order-sensitive
+// override sequence (SendEnv '-PATTERN' exclusions, SetEnv KEY=VALUE overrides) that must
+// accumulate from lowest-priority layer to highest-priority layer without dropping repeated entries.
+func isOrderedOverrideMultiValue(canonicalKey string) bool {
+	return canonicalKey == OptionSendEnv || canonicalKey == OptionSetEnv
+}
+
 // MergeOptionLayers merges a slice of Options from highest priority to lowest priority
 // using first-match-wins per option key, without applying cross-field effective finalization.
+// Order-sensitive session environment options (SendEnv, SetEnv) merge from lowest priority to
+// highest priority so higher-tier exclusions and overrides win left-to-right.
 func MergeOptionLayers(layers ...*Options) *Options {
 	res := &Options{}
 	hasExplicitPersist := false
@@ -1375,11 +1598,25 @@ func MergeOptionLayers(layers ...*Options) *Options {
 		for k, v := range layer.values {
 			spec, ok := LookupOptionSpec(k)
 			if ok && spec.MultiValue {
+				if isOrderedOverrideMultiValue(spec.CanonicalKey) {
+					continue
+				}
 				res.appendNormalizedRaw(spec.CanonicalKey, v)
 				continue
 			}
 			if _, exists := res.values[k]; !exists {
 				res.setRaw(k, v)
+			}
+		}
+	}
+	for i := len(layers) - 1; i >= 0; i-- {
+		layer := layers[i]
+		if layer.IsEmpty() {
+			continue
+		}
+		for _, key := range []string{OptionSendEnv, OptionSetEnv} {
+			if v, ok := layer.values[key]; ok && v != "" {
+				res.appendOrderedRaw(key, v)
 			}
 		}
 	}

@@ -56,7 +56,7 @@ func (c *Client) runPortableWithSudo(ctx context.Context, content string, script
 		if script {
 			return c.RunScript(ctx, content, func(target *RunConfig) { *target = *config })
 		}
-		return c.runRaw(ctx, portableUserCommand(content, config, config.LaunchDialect), config)
+		return c.runRaw(ctx, portableUserCommand(content, config, config.LaunchDialect), config, true)
 	case SudoModeSudoer, SudoModeSudo, SudoModeSu:
 		return c.runPrivilegeWithConfig(ctx, mode, inner, input, config, mat...)
 	default:

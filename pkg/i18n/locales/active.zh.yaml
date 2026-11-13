@@ -85,6 +85,22 @@ flag_ipv4:
   other: "强制仅使用 IPv4 地址"
 flag_ipv6:
   other: "强制仅使用 IPv6 地址"
+flag_ssh_subsystem:
+  other: "请求在远程系统上调用指定的子系统 (subsystem)"
+flag_ssh_escape_char:
+  other: "设置 PTY 会话的转义字符（默认 '~'，或 'none' 禁用）"
+ssh_err_subsystem_requires_name:
+  other: "子系统模式 (-s) 必须指定子系统名称"
+ssh_err_subsystem_with_nocmd:
+  other: "子系统模式 (-s) 不能与 -N 同时使用"
+ssh_err_subsystem_with_stdio_forward:
+  other: "子系统模式 (-s) 不能与 -W 同时使用"
+ssh_err_subsystem_with_sudo:
+  other: "子系统模式 (-s) 不能与 --sudo 同时使用"
+ssh_err_subsystem_with_stdin_script:
+  other: "子系统模式 (-s) 不能与标准输入脚本模式同时使用"
+ssh_err_subsystem_with_exec_flags:
+  other: "子系统模式 (-s) 不能与 --interpreter、--login-shell 或 --no-login 同时使用"
 ssh_err_background_requires_nocmd:
   other: "后台运行 (-f) 需要指定要执行的远程命令或配合 -N 使用"
 ssh_flag_stdio_forward:

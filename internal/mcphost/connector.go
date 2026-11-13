@@ -29,6 +29,7 @@ func newNonInteractiveMCPConnector(provider config.ConfigProvider, l corelog.Deb
 		adapter.WithNonInteractive(true),
 		adapter.WithControlMultiplexing(false),
 		adapter.WithHostTrustOverrides(false),
+		adapter.WithSessionAndForwardOptions(false),
 	}
 	if credentialRegistry != nil {
 		adpOpts = append(adpOpts, adapter.WithCredentialSource(credentialRegistry))

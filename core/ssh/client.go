@@ -19,30 +19,35 @@ import (
 )
 
 type Client struct {
-	environment        Environment
-	sshClient          *ssh.Client
-	rootConn           net.Conn
-	cfgMu              sync.RWMutex
-	probeMu            sync.Mutex
-	probeCache         *executionProbeCache
-	sudoMu             sync.Mutex
-	connCfg            ConnectionConfig
-	provider           ConnectionProvider
-	resolver           SecretResolver
-	prompter           SecretPrompter
-	recorder           CredentialRecorder
-	connectorPattern   string         // Connector 全局级密码提示正则，当节点级为空时回落到此字段
-	promptRegex        *regexp.Regexp // 缓存预编译好的正则
-	sudoPromptFallback *regexp.Regexp // Immutable, valid explicit node/global pattern only; never the implicit default.
-	logger             logger.DebugLogger
-	diagnostics        logger.DiagnosticObserver // Immutable; connector owns its lifetime.
-	handshakeTimeout   time.Duration
-	interactionTimeout time.Duration
-	muxSocketPath      string
-	muxExpectedUID     uint32
-	transportOnce      sync.Once
-	transportDone      chan struct{}
-	transportErr       error
+	environment            Environment
+	sshClient              *ssh.Client
+	rootConn               net.Conn
+	cfgMu                  sync.RWMutex
+	probeMu                sync.Mutex
+	probeCache             *executionProbeCache
+	sudoMu                 sync.Mutex
+	connCfg                ConnectionConfig
+	provider               ConnectionProvider
+	resolver               SecretResolver
+	prompter               SecretPrompter
+	recorder               CredentialRecorder
+	connectorPattern       string         // Connector 全局级密码提示正则，当节点级为空时回落到此字段
+	promptRegex            *regexp.Regexp // 缓存预编译好的正则
+	sudoPromptFallback     *regexp.Regexp // Immutable, valid explicit node/global pattern only; never the implicit default.
+	logger                 logger.DebugLogger
+	diagnostics            logger.DiagnosticObserver // Immutable; connector owns its lifetime.
+	handshakeTimeout       time.Duration
+	interactionTimeout     time.Duration
+	muxSocketPath          string
+	muxExpectedUID         uint32
+	activeMu               sync.Mutex
+	activeSeq              uint64
+	activeSessions         map[uint64]string
+	activeForwardListeners map[string]struct{}
+	activeForwardConns     map[string]int
+	transportOnce          sync.Once
+	transportDone          chan struct{}
+	transportErr           error
 }
 
 type compatSecretResolver struct {
@@ -468,7 +473,7 @@ func (c *Client) Run(ctx context.Context, cmd string, opts ...RunOption) (string
 		if err != nil {
 			return "", fmt.Errorf("plan Unix execution: %w", err)
 		}
-		return c.runRaw(ctx, plan.Payload(), config)
+		return c.runRaw(ctx, plan.Payload(), config, true)
 	}
 	switch config.Interpreter {
 	case "", InterpreterServer:
@@ -480,28 +485,34 @@ func (c *Client) Run(ctx context.Context, cmd string, opts ...RunOption) (string
 	default:
 		return "", fmt.Errorf("%w: unsupported interpreter %q for Run (only server, bash, sh and configured zsh/fish are supported)", ErrExecutionValidation, config.Interpreter)
 	}
-	return c.runRaw(ctx, payload, config)
+	return c.runRaw(ctx, payload, config, true)
 }
 
 // RunWithoutLogin 执行命令并在非登录 Shell 中运行，避免加载 profile 脚本产生干扰输出
 func (c *Client) RunWithoutLogin(ctx context.Context, cmd string) (string, error) {
-	return c.runWithoutLoginWithConfig(ctx, cmd, c.defaultRunConfig())
+	return c.runWithoutLoginWithConfig(ctx, cmd, c.defaultRunConfig(), true)
 }
 
-func (c *Client) runWithoutLoginWithConfig(ctx context.Context, cmd string, config *RunConfig) (string, error) {
+func (c *Client) runWithoutLoginWithConfig(ctx context.Context, cmd string, config *RunConfig, sendSessionEnv bool) (string, error) {
 	probeCfg := c.probeRunConfig(config)
 	if usesPortableShellAdapter(probeCfg) || probeCfg.Interpreter == InterpreterSh {
-		return c.runRaw(ctx, unixCommandPayload(InterpreterSh, cmd, false, probeCfg.LaunchDialect), probeCfg)
+		return c.runRaw(ctx, unixCommandPayload(InterpreterSh, cmd, false, probeCfg.LaunchDialect), probeCfg, sendSessionEnv)
 	}
-	return c.runRaw(ctx, bashCommandPayload(cmd, false), DefaultRunConfig())
+	return c.runRaw(ctx, bashCommandPayload(cmd, false), DefaultRunConfig(), sendSessionEnv)
 }
 
-func (c *Client) runRaw(ctx context.Context, wrappedCmd string, config *RunConfig) (output string, retErr error) {
+func (c *Client) runRaw(ctx context.Context, wrappedCmd string, config *RunConfig, sendSessionEnv bool) (output string, retErr error) {
 	session, err := c.newSessionContext(ctx)
 	if err != nil {
 		return "", err
 	}
 	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
+
+	if sendSessionEnv {
+		if err := c.applySessionEnv(ctx, session); err != nil {
+			return "", err
+		}
+	}
 
 	return c.startWithTimeout(ctx, session, wrappedCmd, config)
 }
@@ -526,6 +537,10 @@ func (c *Client) RunScript(ctx context.Context, scriptContent string, opts ...Ru
 		return "", err
 	}
 	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
+
+	if err := c.applySessionEnv(ctx, session); err != nil {
+		return "", err
+	}
 
 	session.Stdin = strings.NewReader(scriptContent)
 
@@ -581,6 +596,10 @@ func (c *Client) RunStream(ctx context.Context, cmd string) (io.ReadCloser, erro
 	session, err := c.newSessionContext(ctx)
 	if err != nil {
 		return nil, err
+	}
+
+	if err := c.applySessionEnv(ctx, session); err != nil {
+		return nil, errors.Join(err, c.closeSessionBounded(session))
 	}
 
 	stdout, err := session.StdoutPipe()
@@ -798,7 +817,7 @@ func (c *Client) detectRootOrSudoer(ctx context.Context, config *RunConfig) (boo
 	// 1. 探测是否已经是 root
 	// 使用 runWithoutLoginWithConfig 避免 MOTD 干扰输出
 	c.observePrivilege(SudoModeAuto, "root_probe", 2, 0)
-	if out, err := c.runWithoutLoginWithConfig(ctx, "id -u", probeCfg); err == nil {
+	if out, err := c.runWithoutLoginWithConfig(ctx, "id -u", probeCfg, false); err == nil {
 		// 稳健检查：只要最后一行输出是 0，即认为是 root
 		lines := strings.Split(strings.TrimSpace(out), "\n")
 		if len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "0" {
@@ -812,7 +831,7 @@ func (c *Client) detectRootOrSudoer(ctx context.Context, config *RunConfig) (boo
 	c.observePrivilege(SudoModeAuto, "root_probe_unconfirmed", 2, 0)
 	// 2. 探测是否有免密 sudo 权限
 	c.observePrivilege(SudoModeAuto, "passwordless_probe", 2, 0)
-	if _, err := c.runWithoutLoginWithConfig(ctx, "sudo -n true", probeCfg); err == nil {
+	if _, err := c.runWithoutLoginWithConfig(ctx, "sudo -n true", probeCfg, false); err == nil {
 		c.observePrivilege(SudoModeSudoer, "passwordless_available", 1, 0)
 		return true, c.updateSudoMode(ctx, SudoModeSudoer)
 	} else if err := ctx.Err(); err != nil {
@@ -877,7 +896,7 @@ func (c *Client) maybeDetectSudoMode(ctx context.Context, configs ...*RunConfig)
 	if err == nil {
 		defer priv.Zero()
 		priv.deferSave = true
-		if _, testErr := c.runWithSudo(ctx, "true", priv.Password, nil, probeCfg, priv); testErr == nil {
+		if _, testErr := c.runWithSudo(ctx, "true", priv.Password, nil, probeCfg, false, priv); testErr == nil {
 			return c.confirmDetectedSudo(ctx, priv)
 		} else if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr

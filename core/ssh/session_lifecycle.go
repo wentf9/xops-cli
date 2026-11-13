@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"sync"
 
 	corelog "github.com/wentf9/xops-cli/core/log"
 	cryptoSSH "golang.org/x/crypto/ssh"
@@ -90,48 +92,32 @@ func (c *Client) runTerminalSession(ctx context.Context, payload string, streams
 	if err != nil {
 		return err
 	}
+	escapeByte, escapeEnabled, err := resolveInteractiveEscapeChar(c.ConnectionConfig().Options)
+	if err != nil {
+		return err
+	}
 	session, err := c.newSessionContext(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
-	width, height, err := term.GetSize(fdOut)
-	if err != nil || width <= 0 || height <= 0 {
-		width, height = 80, 40
-	}
-	modes := cryptoSSH.TerminalModes{cryptoSSH.ECHO: 1, cryptoSSH.TTY_OP_ISPEED: 14400, cryptoSSH.TTY_OP_OSPEED: 14400}
-	if err := c.sessionRequest(ctx, session, "pty", func() error { return session.RequestPty("xterm-256color", height, width, modes) }); err != nil {
-		return err
-	}
-	stdin, err := session.StdinPipe()
-	if err != nil {
-		return fmt.Errorf("open terminal stdin: %w", err)
-	}
-	stdout, err := session.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("open terminal stdout: %w", err)
-	}
-	stderr, err := session.StderrPipe()
-	if err != nil {
-		return fmt.Errorf("open terminal stderr: %w", err)
-	}
-	request := func() error { return session.Start(payload) }
-	name := "exec"
+	request, name := func() error { return session.Start(payload) }, "exec"
 	if shellRequest {
 		request, name = session.Shell, "shell"
 	}
-	if err := c.sessionRequest(ctx, session, name, request); err != nil {
+	untrackSession := c.trackActiveSession("client-session (" + name + ")")
+	defer untrackSession()
+
+	stdin, stdout, stderr, width, height, err := c.prepareTerminalSessionChannel(ctx, session, fdOut, name, request)
+	if err != nil {
 		return err
 	}
-	state, err := term.MakeRaw(fdIn)
+	suspendTerminal, restoreRaw, err := c.enterTerminalRawMode(fdIn, fdOut, session)
 	if err != nil {
-		return fmt.Errorf("set terminal raw mode: %w", err)
+		return err
 	}
-	defer func() {
-		if err := term.Restore(fdIn, state); err != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("restore terminal: %w", err))
-		}
-	}()
+	defer func() { retErr = errors.Join(retErr, restoreRaw()) }()
+
 	work, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stopResize := startWindowResizeLoop(work, session, fdOut, width, height, c.getLogger(), c.Interrupt)
@@ -141,13 +127,10 @@ func (c *Client) runTerminalSession(ctx context.Context, payload string, streams
 	// Start before input initialization: even that failure must join Wait and
 	// force transport interruption if the peer ignores channel closure.
 	go func() { waitDone <- c.waitSession(session) }()
-	abort := func() {
-		cancel()
-		if len(cancelOutput) > 0 {
-			cancelOutput[0]()
-		}
-	}
-	stopInput, inputDone, err := startInputCopy(work, c.environment.InputBridge, streams, stdin)
+	abort := combineOutputCancels(cancel, cancelOutput)
+
+	inputDst, escapeFilter := c.wrapTerminalEscapeInput(stdin, streams, escapeByte, escapeEnabled, abort, suspendTerminal)
+	stopInput, inputDone, err := startInputCopy(work, c.environment.InputBridge, streams, inputDst)
 	if err != nil {
 		abort()
 		return errors.Join(err, c.closeCanceledSession(work, session, waitDone), output.wait())
@@ -163,13 +146,128 @@ func (c *Client) runTerminalSession(ctx context.Context, payload string, streams
 	if ignoreExit {
 		waitErr = ignoreShellExitError(waitErr)
 	}
-	var outputErr error
-	if len(cancelOutput) > 0 {
-		outputErr = waitTerminalOutput(ctx, output.wait, cancelOutput[0])
-	} else {
-		outputErr = output.wait()
+	outputErr := joinTerminalOutput(ctx, output.wait, cancelOutput)
+	if escapeFilter.Disconnected() && ctx.Err() == nil {
+		return closeErr
 	}
 	return errors.Join(waitErr, closeErr, inputErr, outputErr)
+}
+
+func (c *Client) prepareTerminalSessionChannel(
+	ctx context.Context,
+	session *cryptoSSH.Session,
+	fdOut int,
+	name string,
+	request func() error,
+) (io.WriteCloser, io.Reader, io.Reader, int, int, error) {
+	if err := c.applySessionEnv(ctx, session); err != nil {
+		return nil, nil, nil, 0, 0, err
+	}
+	width, height, err := term.GetSize(fdOut)
+	if err != nil || width <= 0 || height <= 0 {
+		width, height = 80, 40
+	}
+	modes := cryptoSSH.TerminalModes{cryptoSSH.ECHO: 1, cryptoSSH.TTY_OP_ISPEED: 14400, cryptoSSH.TTY_OP_OSPEED: 14400}
+	if err := c.sessionRequest(ctx, session, "pty", func() error { return session.RequestPty("xterm-256color", height, width, modes) }); err != nil {
+		return nil, nil, nil, 0, 0, err
+	}
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		return nil, nil, nil, 0, 0, fmt.Errorf("open terminal stdin: %w", err)
+	}
+	stdout, err := session.StdoutPipe()
+	if err != nil {
+		return nil, nil, nil, 0, 0, fmt.Errorf("open terminal stdout: %w", err)
+	}
+	stderr, err := session.StderrPipe()
+	if err != nil {
+		return nil, nil, nil, 0, 0, fmt.Errorf("open terminal stderr: %w", err)
+	}
+	if err := c.sessionRequest(ctx, session, name, request); err != nil {
+		return nil, nil, nil, 0, 0, err
+	}
+	return stdin, stdout, stderr, width, height, nil
+}
+
+func (c *Client) enterTerminalRawMode(
+	fdIn, fdOut int,
+	session *cryptoSSH.Session,
+) (onSuspend func() error, restore func() error, err error) {
+	state, err := term.MakeRaw(fdIn)
+	if err != nil {
+		return nil, nil, fmt.Errorf("set terminal raw mode: %w", err)
+	}
+	var termMu sync.Mutex
+	rawActive := true
+	restore = func() error {
+		termMu.Lock()
+		defer termMu.Unlock()
+		if !rawActive {
+			return nil
+		}
+		rawActive = false
+		if err := term.Restore(fdIn, state); err != nil {
+			return fmt.Errorf("restore terminal: %w", err)
+		}
+		return nil
+	}
+	onSuspend = func() error {
+		suspendFn := c.environment.SuspendProcess
+		if suspendFn == nil {
+			return nil
+		}
+		termMu.Lock()
+		defer termMu.Unlock()
+		if rawActive {
+			if err := term.Restore(fdIn, state); err != nil {
+				return fmt.Errorf("restore terminal before suspend: %w", err)
+			}
+			rawActive = false
+		}
+		suspendErr := suspendFn()
+		if _, rawErr := term.MakeRaw(fdIn); rawErr != nil {
+			return errors.Join(suspendErr, fmt.Errorf("re-enter terminal raw mode after suspend: %w", rawErr))
+		}
+		rawActive = true
+		if currW, currH, szErr := term.GetSize(fdOut); szErr == nil && currW > 0 && currH > 0 {
+			_ = session.WindowChange(currH, currW)
+		}
+		return suspendErr
+	}
+	return onSuspend, restore, nil
+}
+
+func (c *Client) wrapTerminalEscapeInput(
+	stdin io.Writer,
+	streams InteractiveIO,
+	escapeByte byte,
+	escapeEnabled bool,
+	abort func(),
+	onSuspend func() error,
+) (io.Writer, *escapeFilterWriter) {
+	if !escapeEnabled {
+		return stdin, nil
+	}
+	localOut := streams.Stderr
+	if localOut == nil {
+		localOut = streams.Stdout
+	}
+	filter := newEscapeFilterWriter(stdin, escapeFilterConfig{
+		escapeByte:   escapeByte,
+		host:         c.ConnectionConfig().Address,
+		localOut:     localOut,
+		onDisconnect: abort,
+		onSuspend:    onSuspend,
+		summaryFn:    c.formatOpenChannelsSummary,
+	})
+	return filter, filter
+}
+
+func joinTerminalOutput(ctx context.Context, wait func() error, cancelOutput []context.CancelFunc) error {
+	if len(cancelOutput) > 0 {
+		return waitTerminalOutput(ctx, wait, cancelOutput[0])
+	}
+	return wait()
 }
 
 // Bound output pumps use this join. Cancellation never abandons the waiter or

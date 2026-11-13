@@ -45,6 +45,7 @@ func Discover() core.Environment {
 		LocalUID:            localUID,
 		LookupEnv:           os.LookupEnv,
 		Environ:             os.Environ,
+		SuspendProcess:      platformSuspendProcess(),
 		DialAgent: func(ctx context.Context, socket string) (net.Conn, error) {
 			dialer := net.Dialer{Timeout: 2 * time.Second}
 			return dialer.DialContext(ctx, "unix", socket)

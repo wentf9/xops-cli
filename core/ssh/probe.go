@@ -189,7 +189,7 @@ func (c *Client) executeProbeCommand(ctx context.Context, command string) (strin
 	if err != nil {
 		return "", fmt.Errorf("plan probe command: %w", err)
 	}
-	result := c.ExecuteCommand(ctx, plan)
+	result := c.executeCommand(ctx, plan, false)
 	if err := result.Err(); err != nil {
 		return "", fmt.Errorf("execute probe command: %w", err)
 	}

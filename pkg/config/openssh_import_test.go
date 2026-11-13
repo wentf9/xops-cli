@@ -216,6 +216,10 @@ Host gate3-node
     RequestTTY force
     BatchMode yes
     IdentityFile ~/.ssh/id_gate3
+    SendEnv LANG LC_*
+    SetEnv FOO=bar
+    RemoteCommand top -b
+    EscapeChar none
 `
 	hosts, err := ParseOpenSSHHosts(strings.NewReader(input), "local-user")
 	if err != nil {
@@ -238,5 +242,50 @@ Host gate3-node
 				t.Fatalf("Gate 3 violation: class %s key %s (%q) leaked into imported config.yaml", spec.Class, spec.CanonicalKey, v)
 			}
 		}
+	}
+}
+
+func TestOpenSSHConfig_SendEnvSetEnvHostBlockPrecedence(t *testing.T) {
+	t.Parallel()
+
+	const input = `
+Host app-prod
+    HostName 10.0.0.60
+    SendEnv -LC_*
+    SetEnv APP_ENV=prod
+
+Host *
+    SendEnv LANG LC_*
+    SetEnv APP_ENV=dev
+`
+	parser, err := NewOpenSSHParserFromReader(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("NewOpenSSHParserFromReader() error = %v", err)
+	}
+	opts, err := parser.GetSSHOptions("app-prod")
+	if err != nil {
+		t.Fatalf("GetSSHOptions(app-prod) error = %v", err)
+	}
+	envVars, err := ssh.ResolveSessionEnv(opts, func() []string {
+		return []string{"LANG=en_US.UTF-8", "LC_ALL=C", "LC_CTYPE=UTF-8"}
+	})
+	if err != nil {
+		t.Fatalf("ResolveSessionEnv() error = %v", err)
+	}
+	got := make(map[string]string, len(envVars))
+	for _, ev := range envVars {
+		got[ev.Name] = ev.Value
+	}
+	if got["LANG"] != "en_US.UTF-8" {
+		t.Fatalf("expected LANG=en_US.UTF-8 preserved from Host *, got %q", got["LANG"])
+	}
+	if _, ok := got["LC_ALL"]; ok {
+		t.Fatalf("expected LC_ALL excluded by Host app-prod SendEnv -LC_*, got %+v", got)
+	}
+	if _, ok := got["LC_CTYPE"]; ok {
+		t.Fatalf("expected LC_CTYPE excluded by Host app-prod SendEnv -LC_*, got %+v", got)
+	}
+	if got["APP_ENV"] != "prod" {
+		t.Fatalf("expected Host app-prod SetEnv APP_ENV=prod to win over Host * APP_ENV=dev, got %q", got["APP_ENV"])
 	}
 }

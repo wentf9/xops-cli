@@ -338,7 +338,7 @@ func DialControlProxyClient(
 		0,
 		l,
 	)
-	client.environment = env
+	client.environment = sanitizeEnvironment(env)
 	client.muxSocketPath = socketPath
 	client.muxExpectedUID = options.expectedUID
 	return client, nil

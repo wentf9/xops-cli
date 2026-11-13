@@ -574,8 +574,22 @@ func (o *SshOptions) prepareControlProxyCommandPlan(nodeExec *ssh.ExecutionConfi
 }
 
 func (o *SshOptions) runControlProxySession(ctx context.Context, client *ssh.Client, streams controlStreams) error {
+	if o.Subsystem {
+		return client.RunSubsystemWithIO(ctx, strings.TrimSpace(o.Command), streams.Stdin, streams.Stdout, streams.Stderr, o.subsystemAllocatePTY(streams.Stdin))
+	}
 	if o.Command != "" || o.stdinScript {
 		return o.runCommandWithStreams(ctx, client, o.Command, streams.Stdin, streams.Stdout, streams.Stderr)
+	}
+	var target ssh.TargetContext
+	if o.resolvedTarget != nil {
+		target = *o.resolvedTarget
+	}
+	rc, rcErr := o.resolveEffectiveRemoteCommand(target)
+	if rcErr != nil {
+		return rcErr
+	}
+	if rc != "" {
+		return o.runCommandWithStreams(ctx, client, rc, streams.Stdin, streams.Stdout, streams.Stderr)
 	}
 	if !o.Sudo {
 		switch o.effectiveRequestTTY() {

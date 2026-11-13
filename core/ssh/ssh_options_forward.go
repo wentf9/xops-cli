@@ -963,8 +963,27 @@ func (o *Options) Append(key, rawValue string) error {
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
 	}
-	o.appendNormalizedRaw(spec.CanonicalKey, normalized)
+	if isOrderedOverrideMultiValue(spec.CanonicalKey) {
+		o.appendOrderedRaw(spec.CanonicalKey, normalized)
+	} else {
+		o.appendNormalizedRaw(spec.CanonicalKey, normalized)
+	}
 	return nil
+}
+
+func (o *Options) appendOrderedRaw(canonicalKey, normalized string) {
+	if normalized == "" {
+		return
+	}
+	existing := o.GetAll(canonicalKey)
+	for item := range strings.SplitSeq(normalized, "\n") {
+		if item != "" {
+			existing = append(existing, item)
+		}
+	}
+	if len(existing) > 0 {
+		o.setRaw(canonicalKey, strings.Join(existing, "\n"))
+	}
 }
 
 func (o *Options) appendNormalizedRaw(canonicalKey, normalized string) {

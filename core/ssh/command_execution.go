@@ -78,13 +78,26 @@ func (o *commandObservation) snapshot() CommandResult {
 // PTY, perform privilege escalation, probe the server, or retry execution.
 // All workers are joined; closing a stuck channel may interrupt the shared
 // transport, including other operations using the same ProxyJump connection.
-func (c *Client) ExecuteCommand(ctx context.Context, plan CommandPlan) (result CommandResult) {
+func (c *Client) ExecuteCommand(ctx context.Context, plan CommandPlan) CommandResult {
+	return c.executeCommand(ctx, plan, true)
+}
+
+func (c *Client) executeCommand(ctx context.Context, plan CommandPlan, sendSessionEnv bool) (result CommandResult) {
 	observation := &commandObservation{result: CommandResult{
 		PlanDigest: plan.digest, Phase: "validate", Outcome: ExecutionNotStarted,
 	}}
 	if err := validateCommandExecution(ctx, c, plan); err != nil {
 		observation.result.ExecutionErr = err
 		return observation.snapshot()
+	}
+	var envVars []EnvVar
+	if sendSessionEnv {
+		var err error
+		envVars, err = c.resolveClientSessionEnv()
+		if err != nil {
+			observation.result.ExecutionErr = err
+			return observation.snapshot()
+		}
 	}
 	defer func() { c.observeCommandResult(result) }()
 	work, cancel := context.WithTimeout(ctx, plan.timeout)
@@ -95,8 +108,10 @@ func (c *Client) ExecuteCommand(ctx context.Context, plan CommandPlan) (result C
 		observation.result.ExecutionErr = err
 		return observation.snapshot()
 	}
+	untrackSession := c.trackActiveSession("client-session (exec)")
+	defer untrackSession()
 	output := newOutputWriter(&RunConfig{OutMode: OutputModeRingBuffer, RingMaxBytes: plan.outputLimit})
-	workersDone, startDone := c.startCommandWorkers(work, channel, requests, plan, output, observation)
+	workersDone, startDone := c.startCommandWorkers(work, channel, requests, plan, envVars, output, observation)
 	waitErr := c.waitCommandWorkers(work, workersDone, startDone)
 	cleanupErr := c.closeCommandChannel(channel, workersDone)
 	result = observation.snapshot()
@@ -167,7 +182,7 @@ type commandStartResult struct {
 }
 
 func (c *Client) startCommandWorkers(ctx context.Context, channel cryptoSSH.Channel, requests <-chan *cryptoSSH.Request,
-	plan CommandPlan, output *outputWriter, observation *commandObservation,
+	plan CommandPlan, envVars []EnvVar, output *outputWriter, observation *commandObservation,
 ) (<-chan struct{}, <-chan commandStartResult) {
 	var workers sync.WaitGroup
 	// Readers and request handling exit when the server closes the channel, or
@@ -183,17 +198,40 @@ func (c *Client) startCommandWorkers(ctx context.Context, channel cryptoSSH.Chan
 		})
 	}
 	startDone := make(chan commandStartResult, 1)
-	workers.Go(func() { c.sendCommandInput(ctx, channel, plan, observation, startDone) })
+	workers.Go(func() { c.sendCommandInput(ctx, channel, plan, envVars, observation, startDone) })
 	done := make(chan struct{})
 	// Every worker is unblocked by the supervisor's channel/transport closure.
 	go func() { workers.Wait(); close(done) }()
 	return done, startDone
 }
 
-func (c *Client) sendCommandInput(ctx context.Context, channel cryptoSSH.Channel, plan CommandPlan, observation *commandObservation, startDone chan<- commandStartResult) {
+func (c *Client) sendCommandInput(ctx context.Context, channel cryptoSSH.Channel, plan CommandPlan, envVars []EnvVar, observation *commandObservation, startDone chan<- commandStartResult) {
 	if err := ctx.Err(); err != nil {
 		startDone <- commandStartResult{err: err}
 		return
+	}
+	for _, ev := range envVars {
+		if err := ctx.Err(); err != nil {
+			startDone <- commandStartResult{err: err}
+			return
+		}
+		c.observeSession(logger.SessionRequest, 2, "env", "sending")
+		accepted, err := channel.SendRequest("env", true, cryptoSSH.Marshal(struct{ Name, Value string }{ev.Name, ev.Value}))
+		if err != nil {
+			c.observeSession(logger.SessionRequest, 2, "env", "failed or interrupted")
+			observation.update(func(r *CommandResult) {
+				r.Phase, r.Outcome = "request", ExecutionNotStarted
+				r.ExecutionErr = fmt.Errorf("send SSH env request: %w", err)
+			})
+			startDone <- commandStartResult{accepted: false, err: err}
+			return
+		}
+		if accepted {
+			c.observeSession(logger.SessionRequest, 2, "env", "accepted")
+		} else {
+			c.observeSession(logger.SessionRequest, 2, "env", "rejected")
+			c.getLogger().Debugf("SSH server rejected env variable %q", ev.Name)
+		}
 	}
 	observation.update(func(r *CommandResult) { r.Phase, r.Outcome = "request", ExecutionUnknown })
 	c.observeSession(logger.SessionRequest, 2, "exec", "sending")

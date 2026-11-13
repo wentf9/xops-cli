@@ -29,6 +29,13 @@ func TestDiscoverEnvironmentContracts(t *testing.T) {
 	if env.DialProxyCommand != nil || env.RunLocalCommand != nil || env.LookupSSHFP != nil {
 		t.Fatal("expected local execution and DNS SSHFP hooks to remain nil by default")
 	}
+	if runtime.GOOS == "windows" {
+		if env.SuspendProcess != nil {
+			t.Fatal("expected SuspendProcess to be nil on Windows")
+		}
+	} else if env.SuspendProcess == nil {
+		t.Fatal("expected Discover() to populate SuspendProcess on Unix")
+	}
 
 	if runtime.GOOS != "windows" {
 		sockDir := t.TempDir()

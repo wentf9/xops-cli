@@ -57,6 +57,8 @@ func (c *Client) observeCommandResult(result CommandResult) {
 // observedForwardHandler wraps the existing handler, without taking ownership
 // of connections or introducing workers. runForwardListener remains the owner.
 func (c *Client) observedForwardHandler(operation, source, destination string, handle func() error) error {
+	c.trackForwardConnection(operation, source, destination, 1)
+	defer c.trackForwardConnection(operation, source, destination, -1)
 	c.observeDiagnostic(corelog.Diagnostic{Kind: corelog.ForwardLifecycle, Level: 2, Operation: operation, Outcome: "connection accepted", Source: source, Destination: destination})
 	err := handle()
 	outcome := "connection closed"
@@ -68,6 +70,7 @@ func (c *Client) observedForwardHandler(operation, source, destination string, h
 }
 
 func (c *Client) observeForward(operation, outcome, source, destination string) {
+	c.trackForwardListener(operation, outcome, source, destination)
 	c.observeDiagnostic(corelog.Diagnostic{Kind: corelog.ForwardLifecycle, Operation: operation, Outcome: outcome, Source: source, Destination: destination})
 }
 

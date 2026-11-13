@@ -81,9 +81,11 @@ type Environment struct {
 	RunLocalCommand func(ctx context.Context, command string) error
 	// LookupSSHFP performs bounded DNS SSHFP queries; nil treats no records as available.
 	LookupSSHFP func(ctx context.Context, hostname string) (SSHFPResult, error)
+	// SuspendProcess suspends the local foreground CLI process/group on '~^Z' (nil disables suspend).
+	SuspendProcess func() error
 }
 
-func WithEnvironment(environment Environment) Option {
+func sanitizeEnvironment(environment Environment) Environment {
 	environment.DefaultKeyPaths = slices.Clone(environment.DefaultKeyPaths)
 	environment.GlobalKnownHostsFiles = slices.Clone(environment.GlobalKnownHostsFiles)
 	if nilCapability(environment.ResolveKeyPath) {
@@ -113,6 +115,14 @@ func WithEnvironment(environment Environment) Option {
 	if nilCapability(environment.LookupSSHFP) {
 		environment.LookupSSHFP = nil
 	}
+	if nilCapability(environment.SuspendProcess) {
+		environment.SuspendProcess = nil
+	}
+	return environment
+}
+
+func WithEnvironment(environment Environment) Option {
+	environment = sanitizeEnvironment(environment)
 	return func(c *Connector) {
 		c.environment = environment
 	}

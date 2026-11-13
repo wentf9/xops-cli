@@ -386,25 +386,36 @@ func WithLocalExecution(enabled bool) Option {
 	}
 }
 
+// WithSessionAndForwardOptions controls whether Forward-class and Session-class
+// SSH options (port forwards, SendEnv, SetEnv, RemoteCommand, EscapeChar, RequestTTY)
+// are forwarded by this adapter. Interactive CLI keeps this enabled (default), while
+// MCP hosts disable it (Gate 4) so user session/forwarding options cannot leak.
+func WithSessionAndForwardOptions(enabled bool) Option {
+	return func(a *SSHAdapter) {
+		a.disableSessionAndForward = !enabled
+	}
+}
+
 // SSHAdapter 实现 ssh.ConnectionProvider, ssh.SecretResolver, ssh.CredentialRecorder 接口，作为业务模型与底层 SSH 的防腐层
 type SSHAdapter struct {
-	cfgProvider             config.ConfigProvider
-	credentialResolver      CredentialResolver
-	credentialService       *credential.Service
-	sessionOverrides        map[string]SessionAuth
-	globalSessionAuth       *SessionAuth
-	sessionControlOverrides map[string]SessionControlOptions
-	globalSessionControl    *SessionControlOptions
-	openSSHParser           *config.OpenSSHParser
-	nonInteractive          bool
-	disableControl          bool
-	disableHostTrust        bool
-	localExecution          bool
-	credentialRecording     bool
-	rememberConfirmation    func(context.Context, string) (bool, error)
-	enrollmentProbe         bool
-	enrollmentProbeWarning  func(string, error)
-	enrollmentProbeExcluded map[string]struct{}
+	cfgProvider              config.ConfigProvider
+	credentialResolver       CredentialResolver
+	credentialService        *credential.Service
+	sessionOverrides         map[string]SessionAuth
+	globalSessionAuth        *SessionAuth
+	sessionControlOverrides  map[string]SessionControlOptions
+	globalSessionControl     *SessionControlOptions
+	openSSHParser            *config.OpenSSHParser
+	nonInteractive           bool
+	disableControl           bool
+	disableHostTrust         bool
+	disableSessionAndForward bool
+	localExecution           bool
+	credentialRecording      bool
+	rememberConfirmation     func(context.Context, string) (bool, error)
+	enrollmentProbe          bool
+	enrollmentProbeWarning   func(string, error)
+	enrollmentProbeExcluded  map[string]struct{}
 }
 
 // WithCredentialService injects the transactional writer used when an
@@ -544,6 +555,9 @@ func (a *SSHAdapter) ResolveSSHOptions(nodeName string, sessionOpts SessionContr
 	}
 	if a.disableHostTrust {
 		merged.StripClasses(ssh.OptionClassTrust)
+	}
+	if a.disableSessionAndForward {
+		merged.StripClasses(ssh.OptionClassForward, ssh.OptionClassSession)
 	}
 	if !a.localExecution {
 		if key := firstLocalExecOption(merged); key != "" {

@@ -85,6 +85,22 @@ flag_ipv4:
   other: "Forces ssh to use IPv4 addresses only"
 flag_ipv6:
   other: "Forces ssh to use IPv6 addresses only"
+flag_ssh_subsystem:
+  other: "May be used to request invocation of a subsystem on the remote system"
+flag_ssh_escape_char:
+  other: "Sets the escape character for sessions with a pty (default: '~', or 'none' to disable)"
+ssh_err_subsystem_requires_name:
+  other: "Subsystem mode (-s) requires a subsystem name"
+ssh_err_subsystem_with_nocmd:
+  other: "Subsystem mode (-s) cannot be combined with -N"
+ssh_err_subsystem_with_stdio_forward:
+  other: "Subsystem mode (-s) cannot be combined with -W"
+ssh_err_subsystem_with_sudo:
+  other: "Subsystem mode (-s) cannot be combined with --sudo"
+ssh_err_subsystem_with_stdin_script:
+  other: "Subsystem mode (-s) cannot be combined with stdin script input"
+ssh_err_subsystem_with_exec_flags:
+  other: "Subsystem mode (-s) cannot be combined with --interpreter, --login-shell, or --no-login"
 ssh_err_background_requires_nocmd:
   other: "Cannot fork into background (-f) without a command to execute or -N"
 ssh_flag_stdio_forward:

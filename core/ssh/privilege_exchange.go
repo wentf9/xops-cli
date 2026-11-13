@@ -339,6 +339,11 @@ func (c *Client) runPrivilegeAttempt(ctx context.Context, mode SudoMode, command
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
+	untrackSession := c.trackActiveSession("client-session (privilege)")
+	defer untrackSession()
+	if err := c.applySessionEnv(ctx, session); err != nil {
+		return err
+	}
 	exchange.session = session
 	if mode == SudoModeSu || terminal != nil {
 		width, height := 40, 80

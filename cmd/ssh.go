@@ -53,6 +53,8 @@ type SshOptions struct {
 	LocalForwards          []string
 	RemoteForwards         []string
 	NoCmd                  bool
+	Subsystem              bool
+	EscapeCharSpec         string
 	GatewayPorts           bool
 	DynamicForward         string
 	DynamicForwards        []string
@@ -123,6 +125,8 @@ func newCmdSshWithOptions(o *SshOptions) *cobra.Command {
 	cmd.Flags().StringArrayVarP(&o.LocalForwards, "local-forward", "L", []string{}, i18n.T("flag_local_forward"))
 	cmd.Flags().StringArrayVarP(&o.RemoteForwards, "remote-forward", "R", []string{}, i18n.T("flag_remote_forward"))
 	cmd.Flags().BoolVarP(&o.NoCmd, "no-cmd", "N", false, i18n.T("flag_no_cmd"))
+	cmd.Flags().BoolVarP(&o.Subsystem, "subsystem", "s", false, i18n.T("flag_ssh_subsystem"))
+	cmd.Flags().StringVarP(&o.EscapeCharSpec, "escape-char", "e", "", i18n.T("flag_ssh_escape_char"))
 	o.registerForwardAndSessionFlags(cmd)
 	cmd.Flags().BoolVarP(&o.BgRun, "background", "f", false, i18n.T("flag_background"))
 	cmd.Flags().BoolVarP(&o.StdinRedirect, "stdin-redirect", "n", false, i18n.T("flag_stdin_redirect"))
@@ -298,7 +302,7 @@ func (o *SshOptions) Complete(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	ctlCmd := strings.ToLower(strings.TrimSpace(o.control.CtlCmd))
-	if !o.effectiveStdinNull() && !o.effectiveNoCmd() && !hadCredentialStdin && o.StdioForward == "" && (ctlCmd == "" || ctlCmd == "proxy") {
+	if !o.effectiveStdinNull() && !o.effectiveNoCmd() && !hadCredentialStdin && o.StdioForward == "" && !o.Subsystem && (ctlCmd == "" || ctlCmd == "proxy") {
 		stat, err := os.Stdin.Stat()
 		if err == nil && (stat.Mode()&os.ModeCharDevice) == 0 {
 			o.stdinScript = true
@@ -450,11 +454,8 @@ func (o *SshOptions) Validate() error {
 	if err := o.validateForwardAndSessionFlags(); err != nil {
 		return o.control.controlUsageError(err)
 	}
-	if o.effectiveBgRun() && !o.effectiveNoCmd() && o.Command == "" && !o.stdinScript {
-		return o.control.controlUsageError(errors.New(i18n.T("ssh_err_background_requires_nocmd")))
-	}
-	if o.effectiveBgRun() && (o.OTP != "" || o.OTPStdin) {
-		return fmt.Errorf("background mode (-f) cannot be combined with one-time --otp or --otp-stdin; configure persistent identity otp instead")
+	if err := o.validateBackgroundFlags(); err != nil {
+		return o.control.controlUsageError(err)
 	}
 	if strings.Contains(o.Alias, "@") || strings.Contains(o.Alias, ":") {
 		return errors.New(i18n.T("ssh_err_alias_invalid"))
@@ -464,6 +465,19 @@ func (o *SshOptions) Validate() error {
 		return nil
 	}
 	return o.prepareCommandPlan()
+}
+
+func (o *SshOptions) validateBackgroundFlags() error {
+	if !o.effectiveBgRun() {
+		return nil
+	}
+	if !o.effectiveNoCmd() && o.Command == "" && !o.stdinScript && !o.hasNonEmptyRemoteCommand() {
+		return errors.New(i18n.T("ssh_err_background_requires_nocmd"))
+	}
+	if o.OTP != "" || o.OTPStdin {
+		return fmt.Errorf("background mode (-f) cannot be combined with one-time --otp or --otp-stdin; configure persistent identity otp instead")
+	}
+	return nil
 }
 
 func (o *SshOptions) Run() error {
@@ -558,6 +572,9 @@ func (o *SshOptions) validatePostResolutionSessionInvariants() error {
 	if o.effectiveStdinNull() || o.effectiveNoCmd() {
 		o.stdinScript = false
 	}
+	if err := o.validateSubsystemFlags(); err != nil {
+		return err
+	}
 	if o.effectiveNoCmd() && o.StdioForward == "" && o.Command != "" {
 		return errors.New(i18n.T("ssh_err_nocmd_with_command"))
 	}
@@ -567,7 +584,7 @@ func (o *SshOptions) validatePostResolutionSessionInvariants() error {
 	if o.effectiveBgRun() && (o.OTP != "" || o.OTPStdin) {
 		return fmt.Errorf("background mode (-f) cannot be combined with one-time --otp or --otp-stdin; configure persistent identity otp instead")
 	}
-	if o.effectiveBgRun() && !o.effectiveNoCmd() && o.Command == "" && !o.stdinScript {
+	if o.effectiveBgRun() && !o.effectiveNoCmd() && o.Command == "" && !o.stdinScript && !o.hasNonEmptyRemoteCommand() {
 		return errors.New(i18n.T("ssh_err_background_requires_nocmd"))
 	}
 	return nil
@@ -713,7 +730,7 @@ func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuratio
 	}
 	if shouldRemember {
 		adpOpts = append(adpOpts, enrollmentProbeOption())
-		if o.execution.enabled() || o.execution.noLoginSet || o.StdioForward != "" {
+		if o.execution.enabled() || o.execution.noLoginSet || o.StdioForward != "" || o.Subsystem {
 			adpOpts = append(adpOpts, adapter.WithEnrollmentProbeExclusions(nodeID))
 		}
 		if repo, ok := repository.(*config.Repository); ok {
@@ -1421,7 +1438,7 @@ func (o *SshOptions) loadConfigRepository() (*config.Repository, *config.Configu
 func (o *SshOptions) connectClient(ctx context.Context, connector *ssh.Connector, nodeID string, isChild bool) (*ssh.Client, error) {
 	client, err := connector.Connect(ctx, nodeID)
 	if err != nil {
-		if isChild || o.StdioForward != "" {
+		if isChild || o.StdioForward != "" || o.Subsystem {
 			// 子进程或 -W 标准流转发静默退出或记录错误，不污染二进制 stdout
 			return nil, sshConnectionError(nodeID, err)
 		}
@@ -1540,8 +1557,26 @@ func (o *SshOptions) runConnectedSession(runCtx context.Context, connector *ssh.
 		return o.runNoCmdSession(runCtx, connector, client, master, nodeID, tunnels, isChild)
 	}
 
+	if o.Subsystem {
+		return client.RunSubsystemWithIO(runCtx, strings.TrimSpace(o.Command), os.Stdin, os.Stdout, os.Stderr, o.subsystemAllocatePTY(os.Stdin))
+	}
+
 	if o.Command != "" || o.stdinScript {
 		return o.runCommand(runCtx, client, o.Command)
+	}
+
+	var target ssh.TargetContext
+	if o.resolvedTarget != nil {
+		target = *o.resolvedTarget
+	} else {
+		target = controlTarget(o, provider, nodeID)
+	}
+	rc, rcErr := o.resolveEffectiveRemoteCommand(target)
+	if rcErr != nil {
+		return rcErr
+	}
+	if rc != "" {
+		return o.runCommand(runCtx, client, rc)
 	}
 
 	return o.runShell(runCtx, client)

@@ -354,6 +354,11 @@ func (o *SshOptions) applyCLISessionFlags(opts **ssh.Options) error {
 			return setErr
 		}
 	}
+	if o.EscapeCharSpec != "" {
+		if setErr := ensureOpts().Set(ssh.OptionEscapeChar, o.EscapeCharSpec); setErr != nil {
+			return setErr
+		}
+	}
 	return nil
 }
 
@@ -380,6 +385,8 @@ func (o *SshOptions) applyCLITunnelDevice(ensureOpts func() *ssh.Options) error 
 
 func (o *SshOptions) normalizeForMuxDaemon() {
 	o.NoCmd = true
+	o.Subsystem = false
+	o.EscapeCharSpec = ""
 	o.Command = ""
 	o.stdinScript = false
 	o.StdioForward = ""
@@ -389,6 +396,31 @@ func (o *SshOptions) normalizeForMuxDaemon() {
 	o.DynamicForward = ""
 	o.DynamicForwards = nil
 	o.BgRun = false
+}
+
+func (o *SshOptions) validateSubsystemFlags() error {
+	if !o.Subsystem {
+		return nil
+	}
+	if strings.TrimSpace(o.Command) == "" {
+		return errors.New(i18n.T("ssh_err_subsystem_requires_name"))
+	}
+	if o.effectiveNoCmd() {
+		return errors.New(i18n.T("ssh_err_subsystem_with_nocmd"))
+	}
+	if o.StdioForward != "" {
+		return errors.New(i18n.T("ssh_err_subsystem_with_stdio_forward"))
+	}
+	if o.Sudo {
+		return errors.New(i18n.T("ssh_err_subsystem_with_sudo"))
+	}
+	if o.stdinScript {
+		return errors.New(i18n.T("ssh_err_subsystem_with_stdin_script"))
+	}
+	if o.execution.enabled() || o.execution.noLoginSet || o.NoLoginShell || o.execution.interpreter != "" || o.execution.login {
+		return errors.New(i18n.T("ssh_err_subsystem_with_exec_flags"))
+	}
+	return nil
 }
 
 func (o *SshOptions) validateForwardAndSessionFlags() error {
@@ -412,6 +444,9 @@ func (o *SshOptions) validateForwardAndSessionFlags() error {
 	}
 	if (o.NoCmd || (!o.NoCmd && o.cliSessionTypeNone())) && o.Command != "" {
 		return errors.New(i18n.T("ssh_err_nocmd_with_command"))
+	}
+	if err := o.validateSubsystemFlags(); err != nil {
+		return err
 	}
 	if o.TunnelDevice != "" {
 		if _, err := ssh.ParseTunnelDevice(o.TunnelDevice); err != nil {
@@ -437,6 +472,9 @@ func (o *SshOptions) resolveAndCacheSessionOptions(provider config.ConfigProvide
 		if effErr != nil {
 			return nil, effErr
 		}
+		if isMuxDaemonChild() && eff != nil {
+			eff.StripClasses(ssh.OptionClassSession)
+		}
 		o.effectiveSSHOptions = eff
 		return eff, nil
 	}
@@ -450,6 +488,9 @@ func (o *SshOptions) resolveAndCacheSessionOptions(provider config.ConfigProvide
 	eff, err := adapter.NewSSHAdapter(provider).ResolveSSHOptions(lookupKey, sessionOpts)
 	if err != nil {
 		return nil, err
+	}
+	if isMuxDaemonChild() && eff != nil {
+		eff.StripClasses(ssh.OptionClassSession)
 	}
 	o.effectiveSSHOptions = eff
 	return eff, nil
@@ -542,6 +583,56 @@ func (o *SshOptions) effectiveRequestTTY() ssh.RequestTTYMode {
 		return ssh.RequestTTYNo
 	}
 	return ssh.RequestTTYAuto
+}
+
+// subsystemAllocatePTY reports whether `-s <subsystem>` should request a PTY.
+// Subsystems default to raw non-PTY streams unless -t / RequestTTY=yes|force is explicitly set.
+func (o *SshOptions) subsystemAllocatePTY(stdin io.Reader) bool {
+	if o == nil {
+		return false
+	}
+	switch o.effectiveRequestTTY() {
+	case ssh.RequestTTYForce:
+		return true
+	case ssh.RequestTTYYes:
+		if stdin == nil {
+			return false
+		}
+		_, isTerm := isLocalTerminal(stdin)
+		return isTerm
+	default:
+		return false
+	}
+}
+
+// hasNonEmptyRemoteCommand reports whether an effective RemoteCommand (not "none") is configured.
+func (o *SshOptions) hasNonEmptyRemoteCommand() bool {
+	if o == nil || o.NoCmd || o.StdioForward != "" || o.Subsystem || isMuxDaemonChild() {
+		return false
+	}
+	eff, err := o.effectiveSessionOptions()
+	if err != nil || eff == nil {
+		return false
+	}
+	rc := strings.TrimSpace(eff.RemoteCommand())
+	return rc != "" && !strings.EqualFold(rc, "none")
+}
+
+// resolveEffectiveRemoteCommand returns the expanded RemoteCommand option when no explicit CLI command,
+// stdin script, -N, -W, -s, or mux-daemon child mode is active.
+func (o *SshOptions) resolveEffectiveRemoteCommand(target ssh.TargetContext) (string, error) {
+	if o == nil || o.Command != "" || o.stdinScript || o.effectiveNoCmd() || o.StdioForward != "" || o.Subsystem || isMuxDaemonChild() {
+		return "", nil
+	}
+	eff, err := o.effectiveSessionOptions()
+	if err != nil || eff == nil {
+		return "", err
+	}
+	rc := strings.TrimSpace(eff.RemoteCommand())
+	if rc == "" || strings.EqualFold(rc, "none") {
+		return "", nil
+	}
+	return ssh.ExpandRemoteCommand(rc, sshenv.Discover(), target)
 }
 
 type sessionForwardConfig struct {
