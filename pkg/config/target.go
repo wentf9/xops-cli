@@ -7,6 +7,7 @@ import (
 	"net"
 	"os/user"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/wentf9/xops-cli/pkg/i18n"
@@ -83,10 +84,7 @@ type canonicalTargetInfo struct {
 // FormatHostPort formats host and port, enclosing IPv6 addresses in brackets.
 func FormatHostPort(address string, port uint16) string {
 	cleaned := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(address), "]"), "[")
-	if strings.Contains(cleaned, ":") {
-		return fmt.Sprintf("[%s]:%d", cleaned, port)
-	}
-	return fmt.Sprintf("%s:%d", cleaned, port)
+	return net.JoinHostPort(cleaned, strconv.Itoa(int(port)))
 }
 
 // FormatNodeID formats node ID using user@host:port (with IPv6 bracketed if necessary).

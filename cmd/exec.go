@@ -618,6 +618,9 @@ func (o *ExecOptions) buildAdapterOptions(tasks []execHostTask, cfg *config.Conf
 		return nil, err
 	}
 	if !sessionCtrlOpts.IsEmpty() {
+		if globalCtrl := sessionCtrlOpts.ConnectionWideOptions(); !globalCtrl.IsEmpty() {
+			adpOpts = append(adpOpts, adapter.WithGlobalSessionControl(globalCtrl))
+		}
 		for _, task := range tasks {
 			adpOpts = append(adpOpts, adapter.WithSessionControlOverride(task.nodeID, sessionCtrlOpts))
 		}
@@ -1070,7 +1073,8 @@ func (o *ExecOptions) updateNodeFromHostInfo(ctx context.Context, nodeID string,
 	if !ok {
 		return false, nil
 	}
-	if strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) {
+	if strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) ||
+		utils.EffectiveRememberPolicy(o.Remember, repository.Snapshot()) == utils.RememberPolicyNever {
 		if o.JumpHost != "" {
 			if _, err := repository.ResolveProxyJumpChain(o.JumpHost); err != nil {
 				return false, fmt.Errorf("resolve exec proxy jump %q failed: %w", o.JumpHost, err)

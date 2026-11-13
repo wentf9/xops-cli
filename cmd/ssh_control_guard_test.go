@@ -2567,14 +2567,14 @@ Host jump-alias
 	}
 
 	// R13-1a: controlSocketPath and controlTarget with empty opts.Host and nodeID="openssh:app-alias"
-	// must keep OriginalHost="openssh:app-alias" (not strip "openssh:" into "dev@10.0.0.20:2200").
+	// must strip internal "openssh:" prefix to OriginalHost="app-alias" (not rewrite into "dev@10.0.0.20:2200").
 	emptyHostOpts := NewSshOptions()
 	tCtx := controlTarget(emptyHostOpts, repo, "openssh:app-alias")
-	if tCtx.OriginalHost != "openssh:app-alias" {
-		t.Fatalf("expected OriginalHost='openssh:app-alias' when opts.Host is empty, got %q", tCtx.OriginalHost)
+	if tCtx.OriginalHost != "app-alias" {
+		t.Fatalf("expected OriginalHost='app-alias' when opts.Host is empty, got %q", tCtx.OriginalHost)
 	}
 	sock, err := controlSocketPath(emptyHostOpts, repo, "openssh:app-alias")
-	if err != nil || sock != "/tmp/tier4-app-openssh:app-alias-openssh:jump-alias" {
+	if err != nil || sock != "/tmp/tier4-app-app-alias-openssh:jump-alias" {
 		t.Fatalf("unexpected socket path for openssh:app-alias with empty opts.Host: %q (err=%v)", sock, err)
 	}
 
@@ -2614,7 +2614,7 @@ Host jump-alias
 	noneOpts.Host = "app-alias"
 	noneOpts.JumpHost = "none"
 	noneSock, err := controlSocketPath(noneOpts, repo, "openssh:app-alias")
-	if err != nil || noneSock != "/tmp/tier4-app-openssh:app-alias-" {
+	if err != nil || noneSock != "/tmp/tier4-app-app-alias-" {
 		t.Fatalf("expected -J none to clear %s in ControlPath, got %q (err=%v)", "%j", noneSock, err)
 	}
 	adp := adapter.NewSSHAdapter(repo, adapter.WithSessionAuthOverride("openssh:app-alias", adapter.SessionAuth{ProxyJump: "none"}))

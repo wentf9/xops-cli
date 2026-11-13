@@ -351,58 +351,80 @@ func ResolveSessionEnv(opts *Options, hostEnviron func() []string) ([]EnvVar, er
 		return nil, err
 	}
 
-	var resolved []EnvVar
-	indexByName := make(map[string]int)
-	upsert := func(ev EnvVar) error {
-		if len(ev.Name)+1+len(ev.Value) > MaxSessionEnvEntryBytes {
-			return fmt.Errorf("%w: environment variable %q exceeds %d bytes", ErrSSHOptionsValidation, ev.Name, MaxSessionEnvEntryBytes)
-		}
-		if idx, exists := indexByName[ev.Name]; exists {
-			resolved[idx].Value = ev.Value
-			return nil
-		}
-		if len(resolved) >= MaxSessionEnvVars {
-			return fmt.Errorf("%w: session environment exceeds maximum of %d variables", ErrSSHOptionsValidation, MaxSessionEnvVars)
-		}
-		indexByName[ev.Name] = len(resolved)
-		resolved = append(resolved, ev)
-		return nil
-	}
-
+	acc := newSessionEnvAccumulator()
 	if hasPositiveSendEnv && hostEnviron != nil {
-		for _, raw := range hostEnviron() {
-			name, val, ok := strings.Cut(raw, "=")
-			if !ok || !isValidEnvVarName(name) || strings.ContainsRune(val, 0) {
-				continue
-			}
-			if isDeniedSendEnvName(name) {
-				continue
-			}
-			if !shouldSendEnvVar(rules, name) {
-				continue
-			}
-			if err := upsert(EnvVar{Name: name, Value: val}); err != nil {
-				return nil, err
-			}
+		if err := acc.addMatchingHostEnv(hostEnviron(), rules); err != nil {
+			return nil, err
 		}
 	}
 
-	for _, directive := range opts.SetEnvDirectives() {
-		pairs, err := parseSetEnvDirective(directive)
-		if err != nil {
-			return nil, fmt.Errorf("%w: invalid SetEnv %q: %w", ErrSSHOptionsValidation, directive, err)
-		}
-		for _, ev := range pairs {
-			if err := upsert(ev); err != nil {
-				return nil, err
-			}
-		}
+	if err := acc.addSetEnvDirectives(opts.SetEnvDirectives()); err != nil {
+		return nil, err
 	}
 
-	if len(resolved) == 0 {
+	if len(acc.resolved) == 0 {
 		return nil, nil
 	}
-	return resolved, nil
+	return acc.resolved, nil
+}
+
+type sessionEnvAccumulator struct {
+	resolved    []EnvVar
+	indexByName map[string]int
+}
+
+func newSessionEnvAccumulator() *sessionEnvAccumulator {
+	return &sessionEnvAccumulator{indexByName: make(map[string]int)}
+}
+
+func (a *sessionEnvAccumulator) upsert(ev EnvVar) error {
+	if len(ev.Name)+1+len(ev.Value) > MaxSessionEnvEntryBytes {
+		return fmt.Errorf("%w: environment variable %q exceeds %d bytes", ErrSSHOptionsValidation, ev.Name, MaxSessionEnvEntryBytes)
+	}
+	if idx, exists := a.indexByName[ev.Name]; exists {
+		a.resolved[idx].Value = ev.Value
+		return nil
+	}
+	if len(a.resolved) >= MaxSessionEnvVars {
+		return fmt.Errorf("%w: session environment exceeds maximum of %d variables", ErrSSHOptionsValidation, MaxSessionEnvVars)
+	}
+	a.indexByName[ev.Name] = len(a.resolved)
+	a.resolved = append(a.resolved, ev)
+	return nil
+}
+
+func (a *sessionEnvAccumulator) addMatchingHostEnv(environ []string, rules []sendEnvRule) error {
+	for _, raw := range environ {
+		name, val, ok := strings.Cut(raw, "=")
+		if !ok || !isValidEnvVarName(name) || strings.ContainsRune(val, 0) {
+			continue
+		}
+		if isDeniedSendEnvName(name) || !shouldSendEnvVar(rules, name) {
+			continue
+		}
+		if err := a.upsert(EnvVar{Name: name, Value: val}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *sessionEnvAccumulator) addSetEnvDirectives(directives []string) error {
+	for _, directive := range directives {
+		pairs, err := parseSetEnvDirective(directive)
+		if err != nil {
+			return fmt.Errorf("%w: invalid SetEnv %q: %w", ErrSSHOptionsValidation, directive, err)
+		}
+		for _, ev := range pairs {
+			if isDeniedSendEnvName(ev.Name) {
+				continue
+			}
+			if err := a.upsert(ev); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (c *Client) resolveClientSessionEnv() ([]EnvVar, error) {

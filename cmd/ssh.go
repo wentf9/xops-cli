@@ -273,9 +273,13 @@ func (o *SshOptions) effectiveHostName() (string, error) {
 		return "", nil
 	}
 	if o.cliHostName != "" {
-		return ssh.ExpandHostName(o.cliHostName, o.originalHostForExpansion())
+		expanded, err := ssh.ExpandHostName(o.cliHostName, o.originalHostForExpansion())
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(expanded), "]"), "["), nil
 	}
-	return o.HostName, nil
+	return strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(o.HostName), "]"), "["), nil
 }
 
 func (o *SshOptions) Complete(cmd *cobra.Command, args []string) error {
@@ -759,6 +763,9 @@ func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuratio
 		return nil, err
 	}
 	if !sessionCtrlOpts.IsEmpty() {
+		if globalCtrl := sessionCtrlOpts.ConnectionWideOptions(); !globalCtrl.IsEmpty() {
+			adpOpts = append(adpOpts, adapter.WithGlobalSessionControl(globalCtrl))
+		}
 		adpOpts = append(adpOpts, adapter.WithSessionControlOverride(nodeID, sessionCtrlOpts))
 	}
 
@@ -891,8 +898,10 @@ func (o *SshOptions) handoffPersistentMaster(ctx context.Context, connector *ssh
 		master = ssh.GetActiveMuxServer(expandedPath)
 	}
 	if master == nil && connector != nil {
+		cleanNodeID, _ := config.OpenSSHOriginalHost(nodeID)
 		for _, m := range connector.Masters() {
-			if m.Target().OriginalHost == nodeID || nodeID == "" {
+			orig := m.Target().OriginalHost
+			if orig == nodeID || (cleanNodeID != "" && orig == cleanNodeID) || nodeID == "" {
 				master = m
 				break
 			}
@@ -967,6 +976,9 @@ func persistentJumpHops(masters []*ssh.MuxServer) map[string]bool {
 				hop = strings.TrimSpace(hop)
 				if hop != "" {
 					jumps[hop] = true
+					if cleanHop, ok := config.OpenSSHOriginalHost(hop); ok {
+						jumps[cleanHop] = true
+					}
 				}
 			}
 		}
@@ -1391,7 +1403,13 @@ func jumpChainMasters(targetMaster *ssh.MuxServer, ownedMasters []*ssh.MuxServer
 			if hop == "" {
 				continue
 			}
-			if hopMaster, ok := byHost[hop]; ok && !seen[hopMaster] {
+			hopMaster, ok := byHost[hop]
+			if !ok {
+				if cleanHop, isOpenSSH := config.OpenSSHOriginalHost(hop); isOpenSSH {
+					hopMaster, ok = byHost[cleanHop]
+				}
+			}
+			if ok && !seen[hopMaster] {
 				seen[hopMaster] = true
 				chain = append(chain, hopMaster)
 				if next := hopMaster.Target().JumpHost; next != "" {
@@ -2183,7 +2201,8 @@ func updateIdentityFields(identity *models.Identity, o *SshOptions) bool {
 }
 
 func update(ctx context.Context, nodeID string, o *SshOptions, provider *config.Repository, shouldRemember bool) (bool, error) {
-	if strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) {
+	if strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) ||
+		utils.EffectiveRememberPolicy(o.Remember, provider.Snapshot()) == utils.RememberPolicyNever {
 		if o.JumpHost != "" {
 			if _, err := provider.ResolveProxyJumpChain(o.JumpHost); err != nil {
 				return false, fmt.Errorf("resolve SSH proxy jump %q failed: %w", o.JumpHost, err)

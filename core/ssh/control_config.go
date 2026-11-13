@@ -277,7 +277,7 @@ func FormatTargetIdentity(identity string) string {
 	if host == "" {
 		return identity
 	}
-	base := fmt.Sprintf("%s:%d", host, port)
+	base := joinHostPort(host, port)
 	if user != "" {
 		base = fmt.Sprintf("%s@%s", user, base)
 	}

@@ -384,8 +384,13 @@ func buildIndexes(cfg *Configuration, rejectAliasConflicts bool) (map[string][]s
 			if address == "" {
 				continue
 			}
-			addLookup(lookup, fmt.Sprintf("%s@%s", user, address), nodeID)
-			addLookup(lookup, fmt.Sprintf("%s@%s:%d", user, address, port), nodeID)
+			cleanAddr := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(address), "]"), "[")
+			addLookup(lookup, fmt.Sprintf("%s@%s", user, cleanAddr), nodeID)
+			addLookup(lookup, FormatNodeID(user, cleanAddr, port), nodeID)
+			if strings.Contains(cleanAddr, ":") {
+				addLookup(lookup, fmt.Sprintf("[%s]", cleanAddr), nodeID)
+				addLookup(lookup, fmt.Sprintf("%s@[%s]", user, cleanAddr), nodeID)
+			}
 		}
 		for _, alias := range node.Alias {
 			if alias == "" {

@@ -997,6 +997,9 @@ func (c *Client) refreshConnectionTokens(kind tokenRefreshKind, committedToken s
 	if newCfg == nil {
 		return fmt.Errorf("%w: config not found for node %q", ErrSnapshotMismatch, nodeID)
 	}
+	newClone := *newCfg
+	newClone.Address = normalizeHostAddress(newCfg.Address)
+	newCfg = &newClone
 
 	// [P1] 校验完整连接目标（Address, Port, User, KeyPath, ProxyJump）是否仍然与当前已建立的连接一致
 	if err := validateTargetCompatibility(curCfg, newCfg); err != nil {

@@ -755,9 +755,13 @@ func buildControlProxyAdapterOptions(snapshot *config.Configuration, nodeID stri
 		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, sessionAuth))
 	}
 	if !sessionCtrlOpts.IsEmpty() {
-		adpOpts = append(adpOpts, adapter.WithGlobalSessionControl(sessionCtrlOpts))
 		if nodeID != "" {
+			if globalCtrl := sessionCtrlOpts.ConnectionWideOptions(); !globalCtrl.IsEmpty() {
+				adpOpts = append(adpOpts, adapter.WithGlobalSessionControl(globalCtrl))
+			}
 			adpOpts = append(adpOpts, adapter.WithSessionControlOverride(nodeID, sessionCtrlOpts))
+		} else {
+			adpOpts = append(adpOpts, adapter.WithGlobalSessionControl(sessionCtrlOpts))
 		}
 	}
 	if reg, regErr := utils.GetCredentialRegistry(snapshot); regErr == nil && reg != nil {

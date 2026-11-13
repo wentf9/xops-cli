@@ -262,6 +262,9 @@ func resolveEffectiveControlNodeID(provider config.ConfigProvider, nodeID, origi
 		return nodeID
 	}
 	if strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) {
+		if cleanOrig, ok := config.OpenSSHOriginalHost(nodeID); ok && originalHost == cleanOrig {
+			return nodeID
+		}
 		alias := strings.TrimPrefix(nodeID, config.OpenSSHNodePrefix)
 		if _, parsedHost, _, err := utils.ParseAddr(alias); err == nil && parsedHost != "" {
 			alias = parsedHost
@@ -357,8 +360,12 @@ func controlTarget(opts *SshOptions, provider config.ConfigProvider, nodeID stri
 	if strings.EqualFold(jump, "none") {
 		jump = ""
 	}
+	orig := connTarget.Selector
+	if cleanOrig, ok := config.OpenSSHOriginalHost(orig); ok {
+		orig = cleanOrig
+	}
 	target := ssh.TargetContext{
-		OriginalHost: connTarget.Selector,
+		OriginalHost: orig,
 		JumpHost:     jump,
 	}
 	if opts != nil {
@@ -402,6 +409,9 @@ func targetContextFromResolvedTarget(resolved config.ResolvedTarget) ssh.TargetC
 		port = 22
 	}
 	orig := resolved.NodeID
+	if cleanOrig, ok := config.OpenSSHOriginalHost(orig); ok {
+		orig = cleanOrig
+	}
 	if orig == "" && resolved.Host != "" && user != "" && port > 0 {
 		orig = config.FormatNodeID(user, resolved.Host, uint16(port))
 	}
@@ -487,7 +497,7 @@ func applyHostNameOption(opts *SshOptions, key, val string) error {
 		if expErr != nil {
 			return expErr
 		}
-		opts.HostName = expanded
+		opts.HostName = strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(expanded), "]"), "[")
 		return nil
 	}
 	if _, expErr := ssh.ExpandHostName(val, "host"); expErr != nil {

@@ -1108,7 +1108,8 @@ func (o *ScpOptions) getOrCreateNodeForPath(ctx context.Context, provider config
 }
 
 func (o *ScpOptions) updateNode(ctx context.Context, nodeID string, provider config.ConfigProvider, specificPassword string, shouldRemember bool) (bool, error) {
-	if strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) {
+	if strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) ||
+		cmdutils.EffectiveRememberPolicy(o.Remember, provider.Snapshot()) == cmdutils.RememberPolicyNever {
 		if o.JumpHost != "" {
 			if _, err := provider.ResolveProxyJumpChain(o.JumpHost); err != nil {
 				return false, fmt.Errorf("resolve SCP proxy jump %q failed: %w", o.JumpHost, err)
@@ -1261,6 +1262,9 @@ func (o *ScpOptions) credentialConnectorWithInteraction(provider config.ConfigPr
 	}
 	if !sessionCtrlOpts.IsEmpty() {
 		if len(targetNodes) > 0 {
+			if globalCtrl := sessionCtrlOpts.ConnectionWideOptions(); !globalCtrl.IsEmpty() {
+				adpOpts = append(adpOpts, adapter.WithGlobalSessionControl(globalCtrl))
+			}
 			for _, nodeID := range targetNodes {
 				adpOpts = append(adpOpts, adapter.WithSessionControlOverride(nodeID, sessionCtrlOpts))
 			}

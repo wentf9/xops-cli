@@ -42,7 +42,7 @@ func newMuxProxySSHConn(underlying cryptoSSH.Conn, raw net.Conn, target TargetCo
 	if port <= 0 {
 		port = 22
 	}
-	remoteStr := fmt.Sprintf("%s:%d", target.Host, port)
+	remoteStr := joinHostPort(target.Host, port)
 	remoteAddr := &targetTCPAddr{network: "tcp", address: remoteStr}
 
 	localAddr := raw.LocalAddr()

@@ -126,6 +126,38 @@ func (*openSSHOverrideProvider) ConfirmNodeContext(context.Context, string) erro
 	return nil
 }
 
+// ConfirmNodeWithExecutionContext is a no-op on the read-only override provider
+// so post-authentication enrollment probing under -F never attempts Save on
+// readOnlyRejectStore.
+func (*openSSHOverrideProvider) ConfirmNodeWithExecutionContext(context.Context, string, *ssh.ExecutionConfig) error {
+	return nil
+}
+
+func (*openSSHOverrideProvider) UpdateAuthAtVersionContext(_ context.Context, _, authVersion, _, _, _ string) (string, error) {
+	return authVersion, nil
+}
+
+func (*openSSHOverrideProvider) UpdateSudoAtVersionContext(_ context.Context, _, sudoVersion string, _ models.SudoMode, _ string) (string, error) {
+	return sudoVersion, nil
+}
+
+// OpenSSHOriginalHost extracts the effective original host (%n) for an
+// "openssh:" virtual node ID by stripping OpenSSHNodePrefix and decomposing
+// composite user@host[:port] specs into their host token.
+func OpenSSHOriginalHost(nodeID string) (string, bool) {
+	if !strings.HasPrefix(nodeID, OpenSSHNodePrefix) {
+		return "", false
+	}
+	clean := strings.TrimSpace(strings.TrimPrefix(nodeID, OpenSSHNodePrefix))
+	if clean == "" {
+		return "", false
+	}
+	if parsedHost, _, _, err := parseOpenSSHHostSpec(clean); err == nil && parsedHost != "" {
+		return parsedHost, true
+	}
+	return clean, true
+}
+
 // Find 尝试在 ssh_config 中寻找匹配的主机名
 // 如果用户输入了未知主机，我们一律返回带前缀的虚拟 NodeID，
 // 在连接时利用 ssh_config 的默认回退属性来尝试连接，
@@ -225,10 +257,15 @@ func (p *OpenSSHParser) GetVirtualNode(alias string) (models.Node, models.Host, 
 		return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("parse openssh host %q failed: %w", alias, err)
 	}
 	// 从配置中提取各种字段
-	hostName, err := p.getVal(lookupAlias, "HostName", lookupAlias)
+	rawHostName, err := p.getVal(lookupAlias, "HostName", lookupAlias)
 	if err != nil {
 		return models.Node{}, models.Host{}, models.Identity{}, err
 	}
+	expandedHostName, expHostErr := ssh.ExpandHostName(rawHostName, lookupAlias)
+	if expHostErr != nil {
+		return models.Node{}, models.Host{}, models.Identity{}, expHostErr
+	}
+	hostName := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(expandedHostName), "]"), "[")
 	userVal, err := p.getVal(lookupAlias, "User", "")
 	if err != nil {
 		return models.Node{}, models.Host{}, models.Identity{}, err
@@ -277,7 +314,7 @@ func (p *OpenSSHParser) GetVirtualNode(alias string) (models.Node, models.Host, 
 		return models.Node{}, models.Host{}, models.Identity{}, err
 	}
 
-	hostRef := fmt.Sprintf("%s:%d", hostName, port)
+	hostRef := FormatHostPort(hostName, port)
 	identityRef := fmt.Sprintf("%s@%s", user, hostName)
 
 	node := models.Node{

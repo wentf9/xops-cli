@@ -136,6 +136,32 @@ func (s SessionControlOptions) ToSSHOptions() *ssh.Options {
 	return opts
 }
 
+// ConnectionWideOptions returns a SessionControlOptions containing only the
+// explicit CLI Tier-1 options that OpenSSH applies across the entire connection
+// chain (including ProxyJump hops): OptionClassTrust (StrictHostKeyChecking,
+// UserKnownHostsFile, GlobalKnownHostsFile, HashKnownHosts, VerifyHostKeyDNS)
+// plus AddressFamily, ConnectTimeout, and IdentityAgent. Target-scoped options
+// (such as HostName, RemoteCommand, Control*, LocalCommand, ProxyCommand,
+// ForwardAgent, RequestTTY, EscapeChar) are excluded.
+func (s SessionControlOptions) ConnectionWideOptions() SessionControlOptions {
+	var out SessionControlOptions
+	out.AllowReuse = s.AllowReuse
+	if s.Options.IsEmpty() {
+		return out
+	}
+	filtered := s.Options.FilterByClasses(ssh.OptionClassTrust)
+	for _, key := range []string{ssh.OptionAddressFamily, ssh.OptionConnectTimeout, ssh.OptionIdentityAgent} {
+		if val := s.Options.Get(key); val != "" {
+			if filtered == nil {
+				filtered = &ssh.Options{}
+			}
+			_ = filtered.Set(key, val)
+		}
+	}
+	out.Options = filtered
+	return out
+}
+
 // SplitOptionKeyValue parses an OpenSSH -o directive into its key and value tokens.
 // It supports "Key=Value", "Key Value", and "Key = Value" syntax, matching standard
 // OpenSSH -o CLI argument conventions.
@@ -296,7 +322,7 @@ func WithSessionControlOverride(nodeID string, opts SessionControlOptions) Optio
 	}
 }
 
-// WithGlobalSessionControl registers session multiplexing overrides for all nodes in the session.
+// WithGlobalSessionControl registers connection-wide session control and SSH option overrides for all nodes in the session.
 func WithGlobalSessionControl(opts SessionControlOptions) Option {
 	return func(a *SSHAdapter) {
 		a.globalSessionControl = &opts
@@ -1014,11 +1040,17 @@ func (a *SSHAdapter) ExpandControlPath(nodeID string, rawPath string) (string, e
 		return "", fmt.Errorf("resolve node %q for control path expansion: %w", nodeID, err)
 	}
 	origHost := nodeID
+	if cleanOrig, ok := config.OpenSSHOriginalHost(nodeID); ok {
+		origHost = cleanOrig
+	}
 	if ov, ok := a.getSessionOverride(nodeID); ok && strings.TrimSpace(ov.OriginalHost) != "" {
 		origHost = strings.TrimSpace(ov.OriginalHost)
+		if cleanOrig, ok := config.OpenSSHOriginalHost(origHost); ok {
+			origHost = cleanOrig
+		}
 	}
 	target := ssh.TargetContext{
-		Host:         snapshot.Host.Address,
+		Host:         strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(snapshot.Host.Address), "]"), "["),
 		Port:         effectiveSnapshotPort(snapshot.Host.Port),
 		User:         effectiveSnapshotUser(snapshot.Identity.User),
 		OriginalHost: origHost,
@@ -1068,11 +1100,17 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 		return nil, fmt.Errorf("resolve ssh options for node %q failed: %w", nodeID, err)
 	}
 
+	var origHost string
+	if cleanOrig, ok := config.OpenSSHOriginalHost(nodeID); ok {
+		origHost = cleanOrig
+	}
+
 	cfg := &ssh.ClientConfig{
 		NodeID:                nodeID,
-		Address:               snapshot.Host.Address,
+		Address:               strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(snapshot.Host.Address), "]"), "["),
 		Port:                  effectiveSnapshotPort(snapshot.Host.Port),
 		User:                  effectiveSnapshotUser(snapshot.Identity.User),
+		OriginalHost:          origHost,
 		AuthType:              snapshot.Identity.AuthType,
 		Password:              snapshot.Identity.Password,
 		KeyPath:               snapshot.Identity.KeyPath,
@@ -1160,9 +1198,12 @@ func buildOrderedKeyPaths(cliFlagKeys, cliOptKeys []string, managedNodeKey strin
 
 func (a *SSHAdapter) applySessionOverrideToConfig(nodeID string, cfg *ssh.ClientConfig, override SessionAuth) error {
 	if override.HostName != "" {
-		cfg.Address = override.HostName
+		cfg.Address = strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(override.HostName), "]"), "[")
 	}
 	if orig := strings.TrimSpace(override.OriginalHost); orig != "" {
+		if cleanOrig, ok := config.OpenSSHOriginalHost(orig); ok {
+			orig = cleanOrig
+		}
 		cfg.OriginalHost = orig
 	}
 	if override.Password != "" {
