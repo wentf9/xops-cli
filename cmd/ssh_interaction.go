@@ -365,15 +365,34 @@ func formatHostKeyPrompt(req ssh.HostKeyConfirmation) string {
 	if algo != "" {
 		algo = algo + " "
 	}
+	var sshfpLine string
+	switch req.SSHFPStatus {
+	case ssh.SSHFPStatusMatchedVerified:
+		sshfpLine = translateWithFallback("prompt_host_key_sshfp_matched_verified", "Matching host key fingerprint found in DNS (DNSSEC verified).")
+	case ssh.SSHFPStatusMatchedUnverified:
+		sshfpLine = translateWithFallback("prompt_host_key_sshfp_matched_unverified", "Matching host key fingerprint found in DNS (NOT DNSSEC verified).")
+	case ssh.SSHFPStatusMismatch:
+		sshfpLine = translateWithFallback("prompt_host_key_sshfp_mismatch", "WARNING: DNS SSHFP record DOES NOT MATCH the presented host key!")
+	}
 	text := i18n.Tf("prompt_host_key_confirm", map[string]any{
 		"Hostname":    req.Hostname,
 		"Algorithm":   algo,
 		"Fingerprint": req.Fingerprint,
 	})
 	if text == "prompt_host_key_confirm" {
-		return fmt.Sprintf("The authenticity of host '%s' can't be established.\n%skey fingerprint is %s.\nAre you sure you want to continue connecting (yes/no)? ", req.Hostname, algo, req.Fingerprint)
+		text = fmt.Sprintf("The authenticity of host '%s' can't be established.\n%skey fingerprint is %s.\nAre you sure you want to continue connecting (yes/no)? ", req.Hostname, algo, req.Fingerprint)
 	}
-	return text
+	if sshfpLine == "" {
+		return text
+	}
+	return sshfpLine + "\n" + text
+}
+
+func translateWithFallback(key, fallback string) string {
+	if s := i18n.T(key); s != "" && s != key {
+		return s
+	}
+	return fallback
 }
 
 // confirmRemember shares the cancellable terminal prompt gate with SSH prompts.

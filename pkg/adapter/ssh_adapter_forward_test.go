@@ -472,3 +472,128 @@ Host play-target
 		t.Fatalf("expected play adapter to keep SendEnv, got %v", playOpts.SendEnvPatterns())
 	}
 }
+
+func TestResolveSSHOptions_Phase4TrustGateAndHashKnownHosts(t *testing.T) {
+	openSSHContent := `
+Host srv-hash-yes
+    HostName 192.168.1.210
+    User ops
+    HashKnownHosts yes
+    GlobalKnownHostsFile /etc/ssh/custom_known_hosts
+    VerifyHostKeyDNS yes
+
+Host srv-hash-no
+    HostName 192.168.1.211
+    User ops
+    HashKnownHosts no
+`
+	parser, err := config.NewOpenSSHParserFromReader(strings.NewReader(openSSHContent))
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	cfg := &config.Configuration{
+		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
+		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
+		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
+	}
+	cfg.Hosts.Set("h1", models.Host{Address: "192.168.1.210", Port: 22})
+	cfg.Hosts.Set("h2", models.Host{Address: "192.168.1.211", Port: 22})
+	cfg.Identities.Set("id1", models.Identity{User: "ops", AuthType: "auto"})
+	tier2Yes, _ := ssh.NewOptions()
+	_ = tier2Yes.Set(ssh.OptionHashKnownHosts, "yes")
+	cfg.Nodes.Set("srv-hash-yes", models.Node{HostRef: "h1", IdentityRef: "id1"})
+	cfg.Nodes.Set("srv-hash-no", models.Node{HostRef: "h2", IdentityRef: "id1", SSHOptions: tier2Yes})
+
+	provider := config.NewProviderWithOpenSSHParser(cfg, parser)
+
+	// 1. Managed node inherits one-way HashKnownHosts=yes from Tier 4, never GlobalKnownHostsFile or VerifyHostKeyDNS
+	adp := NewSSHAdapter(provider)
+	managedOpts, err := adp.ResolveSSHOptions("srv-hash-yes", SessionControlOptions{})
+	if err != nil {
+		t.Fatalf("ResolveSSHOptions(srv-hash-yes) error = %v", err)
+	}
+	if !managedOpts.HashKnownHosts() {
+		t.Fatalf("expected one-way HashKnownHosts=yes inherited on managed node")
+	}
+	if managedOpts.GlobalKnownHostsFile() != "" || managedOpts.VerifyHostKeyDNS() != "" {
+		t.Fatalf("Gate 2 violation: GlobalKnownHostsFile/VerifyHostKeyDNS leaked to managed node: %+v", managedOpts)
+	}
+
+	// 2. Tier 4 HashKnownHosts=no never downgrades Tier 2 HashKnownHosts=yes
+	managedNoDowngrade, err := adp.ResolveSSHOptions("srv-hash-no", SessionControlOptions{})
+	if err != nil {
+		t.Fatalf("ResolveSSHOptions(srv-hash-no) error = %v", err)
+	}
+	if !managedNoDowngrade.HashKnownHosts() {
+		t.Fatalf("expected Tier 4 HashKnownHosts=no NOT to downgrade Tier 2 HashKnownHosts=yes")
+	}
+
+	// 3. Gate 1 & Gate 4 assertions
+	assertPhase4VirtualAndMCPTrustGate(t, adp, provider)
+}
+
+func assertPhase4VirtualAndMCPTrustGate(t *testing.T, adp *SSHAdapter, provider config.ConfigProvider) {
+	t.Helper()
+	virtualOpts, err := adp.ResolveSSHOptions(config.OpenSSHNodePrefix+"srv-hash-yes", SessionControlOptions{})
+	if err != nil {
+		t.Fatalf("ResolveSSHOptions(openssh:srv-hash-yes) error = %v", err)
+	}
+	if !virtualOpts.HashKnownHosts() || virtualOpts.GlobalKnownHostsFile() != "" || virtualOpts.VerifyHostKeyDNS() != "" {
+		t.Fatalf("Gate 1 mismatch on virtual node: got hash=%v global=%q dns=%q",
+			virtualOpts.HashKnownHosts(), virtualOpts.GlobalKnownHostsFile(), virtualOpts.VerifyHostKeyDNS())
+	}
+
+	// 4. Tier 1 CLI -o GlobalKnownHostsFile / VerifyHostKeyDNS is preserved for CLI,
+	// and stripped by Gate 4 MCP (WithHostTrustOverrides(false)).
+	cliTrustOpts, err := ParseOptionStrings([]string{
+		"GlobalKnownHostsFile=/etc/ssh/custom_known_hosts",
+		"VerifyHostKeyDNS=yes",
+	})
+	if err != nil {
+		t.Fatalf("ParseOptionStrings() error = %v", err)
+	}
+	cliResolved, err := adp.ResolveSSHOptions(config.OpenSSHNodePrefix+"srv-hash-yes", cliTrustOpts)
+	if err != nil {
+		t.Fatalf("ResolveSSHOptions(cli) error = %v", err)
+	}
+	if cliResolved.GlobalKnownHostsFile() != "/etc/ssh/custom_known_hosts" || cliResolved.VerifyHostKeyDNS() != ssh.VerifyHostKeyDNSYes {
+		t.Fatalf("expected Tier 1 trust options preserved for CLI, got global=%q dns=%q",
+			cliResolved.GlobalKnownHostsFile(), cliResolved.VerifyHostKeyDNS())
+	}
+
+	mcpAdp := NewNonInteractiveSSHAdapter(provider, WithHostTrustOverrides(false))
+	mcpOpts, err := mcpAdp.ResolveSSHOptions(config.OpenSSHNodePrefix+"srv-hash-yes", cliTrustOpts)
+	if err != nil {
+		t.Fatalf("ResolveSSHOptions(mcp) error = %v", err)
+	}
+	if mcpOpts != nil && (mcpOpts.HashKnownHosts() || mcpOpts.GlobalKnownHostsFile() != "" || mcpOpts.VerifyHostKeyDNS() != "") {
+		t.Fatalf("Gate 4 violation: MCP WithHostTrustOverrides(false) leaked trust options: %+v", mcpOpts)
+	}
+}
+
+func TestGetConfig_PropagatesOriginalHost(t *testing.T) {
+	cfg := &config.Configuration{
+		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
+		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
+		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
+	}
+	cfg.Hosts.Set("h1", models.Host{Address: "web.corp.example.com", Port: 22})
+	cfg.Identities.Set("id1", models.Identity{User: "ops", AuthType: "auto"})
+	cfg.Nodes.Set("web.corp.example.com", models.Node{HostRef: "h1", IdentityRef: "id1"})
+
+	provider := config.NewProviderWithOpenSSHParser(cfg, nil)
+	adp := NewNonInteractiveSSHAdapter(provider, WithSessionAuthOverride("web.corp.example.com", SessionAuth{
+		HostName:     "10.20.30.40",
+		OriginalHost: "web",
+	}))
+	clientCfg, err := adp.GetConfig("web.corp.example.com")
+	if err != nil {
+		t.Fatalf("GetConfig() error = %v", err)
+	}
+	if clientCfg.Address != "10.20.30.40" {
+		t.Fatalf("ClientConfig.Address = %q, want %q", clientCfg.Address, "10.20.30.40")
+	}
+	if clientCfg.OriginalHost != "web" {
+		t.Fatalf("ClientConfig.OriginalHost = %q, want %q", clientCfg.OriginalHost, "web")
+	}
+}

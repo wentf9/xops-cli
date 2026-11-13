@@ -842,7 +842,7 @@ func (c *Connector) buildTargetContext(planNode connectionPlanNode) TargetContex
 	if user == "" {
 		user = c.environment.LocalUser
 	}
-	originalHost := cfg.NodeID
+	originalHost := effectiveOriginalHost(cfg.OriginalHost, cfg.NodeID)
 	if originalHost == "" {
 		originalHost = planNode.name
 	}
@@ -1934,7 +1934,7 @@ func (c *Connector) authTargetContext(cfg *ClientConfig) TargetContext {
 		Host:         cfg.Address,
 		Port:         port,
 		User:         user,
-		OriginalHost: cfg.NodeID,
+		OriginalHost: effectiveOriginalHost(cfg.OriginalHost, cfg.NodeID),
 		JumpHost:     cfg.ProxyJump,
 	}
 }
@@ -2726,7 +2726,7 @@ func (c *Connector) getHostKeyCallback(ctx context.Context, coordinator *handsha
 		}
 
 		if keyErr, ok := errors.AsType[*knownhosts.KeyError](err); ok {
-			return c.handleKnownHostsKeyError(ctx, coordinator, keyErr, strictMode, batchMode, noKnownHostsFile, knownHostsFile, hostname, remote, key, hostKeyChanged)
+			return c.handleKnownHostsKeyError(ctx, coordinator, cfg, keyErr, strictMode, batchMode, noKnownHostsFile, knownHostsFile, hostname, remote, key, hostKeyChanged)
 		}
 		return err
 	}, nil
@@ -2762,59 +2762,80 @@ func extractHostKeyPolicy(cfg *ClientConfig) (strictMode string, userKH string, 
 	return strictMode, userKH, batchMode
 }
 
+// openKnownHostsCallback returns the single writable user known_hosts file (only
+// ever derived from UserKnownHostsFile), whether writes are disabled, and a
+// callback that verifies against user files followed by read-only global files.
 func (c *Connector) openKnownHostsCallback(userKH string, cfg *ClientConfig) (string, bool, ssh.HostKeyCallback, error) {
 	emptyCallback := func(string, net.Addr, ssh.PublicKey) error {
 		return &knownhosts.KeyError{}
 	}
-	if strings.EqualFold(userKH, "none") || userKH == "/dev/null" {
-		return "", true, emptyCallback, nil
-	}
+	target := knownHostsTarget(cfg)
 
-	if userKH != "" {
-		return c.openCustomKnownHostsFiles(userKH, cfg, emptyCallback)
+	var primaryWriteFile string
+	var userFiles []string
+	switch {
+	case strings.EqualFold(userKH, "none") || userKH == "/dev/null":
+	case userKH != "":
+		var err error
+		primaryWriteFile, userFiles, err = c.resolveCustomKnownHostsFiles(userKH, target)
+		if err != nil {
+			return "", false, nil, err
+		}
+	default:
+		if err := validateEnvironment(c.environment); err != nil {
+			return "", false, nil, err
+		}
+		primaryWriteFile = c.environment.KnownHostsFile
+		if _, err := os.Stat(primaryWriteFile); os.IsNotExist(err) {
+			if mkdirErr := os.MkdirAll(filepath.Dir(primaryWriteFile), 0700); mkdirErr != nil {
+				return "", false, nil, fmt.Errorf("create .ssh directory failed: %w", mkdirErr)
+			}
+			if writeErr := os.WriteFile(primaryWriteFile, []byte(""), 0600); writeErr != nil {
+				return "", false, nil, fmt.Errorf("create known_hosts file failed: %w", writeErr)
+			}
+		}
+		userFiles = []string{primaryWriteFile}
 	}
+	noWrite := primaryWriteFile == ""
 
-	if err := validateEnvironment(c.environment); err != nil {
+	globalFiles, err := c.resolveGlobalKnownHostsFiles(cfg, target, userFiles)
+	if err != nil {
 		return "", false, nil, err
 	}
-	knownHostsFile := c.environment.KnownHostsFile
-	if _, err := os.Stat(knownHostsFile); os.IsNotExist(err) {
-		if mkdirErr := os.MkdirAll(filepath.Dir(knownHostsFile), 0700); mkdirErr != nil {
-			return "", false, nil, fmt.Errorf("create .ssh directory failed: %w", mkdirErr)
-		}
-		if writeErr := os.WriteFile(knownHostsFile, []byte(""), 0600); writeErr != nil {
-			return "", false, nil, fmt.Errorf("create known_hosts file failed: %w", writeErr)
-		}
+	files := append(slices.Clone(userFiles), globalFiles...)
+	if len(files) == 0 {
+		return primaryWriteFile, noWrite, emptyCallback, nil
 	}
-
-	hostKeyCallback, err := knownhosts.New(knownHostsFile)
+	hostKeyCallback, err := knownhosts.New(files...)
 	if err != nil {
 		return "", false, nil, fmt.Errorf("parse known_hosts file failed: %w", err)
 	}
-	return knownHostsFile, false, hostKeyCallback, nil
+	return primaryWriteFile, noWrite, hostKeyCallback, nil
 }
 
-func (c *Connector) openCustomKnownHostsFiles(userKH string, cfg *ClientConfig, emptyCallback ssh.HostKeyCallback) (string, bool, ssh.HostKeyCallback, error) {
-	fields := strings.Fields(userKH)
+func knownHostsTarget(cfg *ClientConfig) TargetContext {
+	if cfg == nil {
+		return TargetContext{}
+	}
+	return TargetContext{
+		Host:         cfg.Address,
+		Port:         cfg.Port,
+		User:         cfg.User,
+		OriginalHost: effectiveOriginalHost(cfg.OriginalHost, cfg.NodeID),
+		JumpHost:     cfg.ProxyJump,
+	}
+}
+
+func (c *Connector) resolveCustomKnownHostsFiles(userKH string, target TargetContext) (string, []string, error) {
 	var existingFiles []string
 	var primaryWriteFile string
-	target := TargetContext{}
-	if cfg != nil {
-		target = TargetContext{
-			Host:         cfg.Address,
-			Port:         cfg.Port,
-			User:         cfg.User,
-			OriginalHost: cfg.NodeID,
-			JumpHost:     cfg.ProxyJump,
-		}
-	}
-	for _, tokenPath := range fields {
+	for _, tokenPath := range strings.Fields(userKH) {
 		if strings.EqualFold(tokenPath, "none") || tokenPath == "/dev/null" {
 			continue
 		}
 		expanded, expErr := expandKnownHostsPath(tokenPath, c.environment, target)
 		if expErr != nil {
-			return "", false, nil, fmt.Errorf("expand UserKnownHostsFile %q failed: %w", tokenPath, expErr)
+			return "", nil, fmt.Errorf("expand UserKnownHostsFile %q failed: %w", tokenPath, expErr)
 		}
 		if primaryWriteFile == "" {
 			primaryWriteFile = expanded
@@ -2822,23 +2843,75 @@ func (c *Connector) openCustomKnownHostsFiles(userKH string, cfg *ClientConfig, 
 		st, err := os.Stat(expanded)
 		if err != nil {
 			if !errors.Is(err, os.ErrNotExist) {
-				return "", false, nil, fmt.Errorf("stat UserKnownHostsFile %q failed: %w", expanded, err)
+				return "", nil, fmt.Errorf("stat UserKnownHostsFile %q failed: %w", expanded, err)
 			}
 			continue
 		}
 		if st.IsDir() {
-			return "", false, nil, fmt.Errorf("UserKnownHostsFile %q is a directory", expanded)
+			return "", nil, fmt.Errorf("UserKnownHostsFile %q is a directory", expanded)
 		}
 		existingFiles = append(existingFiles, expanded)
 	}
-	if len(existingFiles) == 0 {
-		return primaryWriteFile, primaryWriteFile == "", emptyCallback, nil
+	return primaryWriteFile, existingFiles, nil
+}
+
+// resolveGlobalKnownHostsFiles returns existing, readable, regular global
+// known_hosts files. They are verification-only: never created or written.
+// Missing or unreadable global files are skipped so a system default cannot
+// block connections.
+func (c *Connector) resolveGlobalKnownHostsFiles(cfg *ClientConfig, target TargetContext, userFiles []string) ([]string, error) {
+	var candidates []string
+	spec := ""
+	if cfg != nil && cfg.Options != nil {
+		spec = cfg.Options.GlobalKnownHostsFile()
 	}
-	hostKeyCallback, err := knownhosts.New(existingFiles...)
+	switch {
+	case strings.EqualFold(spec, "none"):
+		return nil, nil
+	case spec != "":
+		for _, tokenPath := range strings.Fields(spec) {
+			if tokenPath == "/dev/null" {
+				continue
+			}
+			expanded, err := expandKnownHostsPath(tokenPath, c.environment, target)
+			if err != nil {
+				return nil, fmt.Errorf("expand GlobalKnownHostsFile %q failed: %w", tokenPath, err)
+			}
+			candidates = append(candidates, expanded)
+		}
+	default:
+		for _, path := range c.environment.GlobalKnownHostsFiles {
+			if path = strings.TrimSpace(path); path != "" {
+				candidates = append(candidates, filepath.Clean(path))
+			}
+		}
+	}
+
+	var files []string
+	for _, path := range candidates {
+		if path == "" || slices.Contains(userFiles, path) || slices.Contains(files, path) {
+			continue
+		}
+		if !isReadableRegularFile(path) {
+			c.getLogger().Debugf("skipping global known_hosts file %q: missing, unreadable, or not a regular file", path)
+			continue
+		}
+		files = append(files, path)
+	}
+	return files, nil
+}
+
+func isReadableRegularFile(path string) bool {
+	st, err := os.Stat(path)
+	if err != nil || !st.Mode().IsRegular() {
+		return false
+	}
+	f, err := os.Open(path)
 	if err != nil {
-		return "", false, nil, fmt.Errorf("parse known_hosts file failed: %w", err)
+		return false
 	}
-	return primaryWriteFile, primaryWriteFile == "", hostKeyCallback, nil
+	_ = f.Close()
+	return true
 }
 
 func expandKnownHostsPath(pattern string, env Environment, target TargetContext) (string, error) {
@@ -2852,6 +2925,7 @@ func expandKnownHostsPath(pattern string, env Environment, target TargetContext)
 func (c *Connector) handleKnownHostsKeyError(
 	ctx context.Context,
 	coordinator *handshakeCoordinator,
+	cfg *ClientConfig,
 	keyErr *knownhosts.KeyError,
 	strictMode string,
 	batchMode bool,
@@ -2861,7 +2935,8 @@ func (c *Connector) handleKnownHostsKeyError(
 	remote net.Addr,
 	key ssh.PublicKey,
 	hostKeyChanged *atomic.Bool,
-) (retErr error) {
+) error {
+	// A conflicting known key always wins over DNS evidence.
 	if len(keyErr.Want) > 0 {
 		if strictMode == StrictHostKeyCheckingNo {
 			if hostKeyChanged != nil {
@@ -2873,47 +2948,82 @@ func (c *Connector) handleKnownHostsKeyError(
 		return fmt.Errorf("%w: remote host identification has changed for %s: %w", ErrHostKeyMismatch, hostname, keyErr)
 	}
 
+	hashHosts := cfg != nil && cfg.Options.HashKnownHosts()
+	record := func() error {
+		if noKnownHostsFile || knownHostsFile == "" {
+			return nil
+		}
+		return appendKnownHost(knownHostsFile, hostname, key, hashHosts)
+	}
+
 	switch strictMode {
 	case StrictHostKeyCheckingYes:
 		return fmt.Errorf("%w: no host key is known for %s and StrictHostKeyChecking=yes", ErrHostKeyMismatch, hostname)
 	case StrictHostKeyCheckingNo:
-		if !noKnownHostsFile && knownHostsFile != "" {
-			_ = appendKnownHost(knownHostsFile, hostname, key)
-		}
+		_ = record()
 		return nil
-	case StrictHostKeyCheckingAcceptNew:
-		if noKnownHostsFile || knownHostsFile == "" {
-			return nil
-		}
-		return appendKnownHost(knownHostsFile, hostname, key)
 	default:
-		if batchMode && !c.AcceptNewHostKey.Load() {
-			return ErrInteractionRequired
-		}
-		if coordinator != nil {
-			if pauseErr := coordinator.Pause(); pauseErr != nil {
-				return pauseErr
-			}
-			defer func() {
-				if resumeErr := coordinator.Resume(); resumeErr != nil {
-					retErr = errors.Join(retErr, resumeErr)
-				}
-			}()
-		}
-
-		if promptErr := c.promptHostKeyVerification(ctx, hostname, remote, key); promptErr != nil {
-			return promptErr
-		}
-
-		if noKnownHostsFile || knownHostsFile == "" {
-			return nil
-		}
-		return appendKnownHost(knownHostsFile, hostname, key)
+		return c.handleUnknownHostKey(ctx, coordinator, cfg, strictMode, batchMode, hostname, remote, key, record)
 	}
 }
 
-func (c *Connector) promptHostKeyVerification(ctx context.Context, hostname string, remote net.Addr, key ssh.PublicKey) error {
-	if c.AcceptNewHostKey.Load() {
+// handleUnknownHostKey applies StrictHostKeyChecking=ask/accept-new with the
+// VerifyHostKeyDNS fail-closed matrix:
+//   - only an AD=1 SHA-256 match under VerifyHostKeyDNS=yes skips the prompt;
+//   - an SSHFP mismatch is never auto-accepted (not even by accept-new or
+//     AcceptNewHostKey) and fails closed when no interactive prompt is possible;
+//   - unverified matches and VerifyHostKeyDNS=ask only annotate the prompt.
+func (c *Connector) handleUnknownHostKey(
+	ctx context.Context,
+	coordinator *handshakeCoordinator,
+	cfg *ClientConfig,
+	strictMode string,
+	batchMode bool,
+	hostname string,
+	remote net.Addr,
+	key ssh.PublicKey,
+	record func() error,
+) (retErr error) {
+	dnsMode := ""
+	if cfg != nil {
+		dnsMode = cfg.Options.VerifyHostKeyDNS()
+	}
+	status := c.lookupSSHFPStatus(ctx, coordinator, cfg, key)
+	if status == SSHFPStatusMatchedVerified && dnsMode == VerifyHostKeyDNSYes {
+		c.getLogger().Debugf("host key for %s accepted via DNSSEC-authenticated SSHFP record", hostname)
+		if strictMode == StrictHostKeyCheckingAcceptNew {
+			return record()
+		}
+		return nil
+	}
+	if strictMode == StrictHostKeyCheckingAcceptNew && status != SSHFPStatusMismatch {
+		return record()
+	}
+	if status == SSHFPStatusMismatch && (batchMode || c.AcceptNewHostKey.Load()) {
+		return fmt.Errorf("%w: SSHFP DNS records for %s do not match the presented %s host key", ErrHostKeyMismatch, hostname, key.Type())
+	}
+	if batchMode && !c.AcceptNewHostKey.Load() {
+		return ErrInteractionRequired
+	}
+	if coordinator != nil {
+		if pauseErr := coordinator.Pause(); pauseErr != nil {
+			return pauseErr
+		}
+		defer func() {
+			if resumeErr := coordinator.Resume(); resumeErr != nil {
+				retErr = errors.Join(retErr, resumeErr)
+			}
+		}()
+	}
+
+	if promptErr := c.promptHostKeyVerification(ctx, hostname, remote, key, status); promptErr != nil {
+		return promptErr
+	}
+	return record()
+}
+
+func (c *Connector) promptHostKeyVerification(ctx context.Context, hostname string, remote net.Addr, key ssh.PublicKey, sshfpStatus SSHFPVerifyStatus) error {
+	if c.AcceptNewHostKey.Load() && sshfpStatus != SSHFPStatusMismatch {
 		return nil
 	}
 
@@ -2931,6 +3041,7 @@ func (c *Connector) promptHostKeyVerification(ctx context.Context, hostname stri
 		RemoteAddress: remoteAddr,
 		Algorithm:     key.Type(),
 		Fingerprint:   fingerprint,
+		SSHFPStatus:   sshfpStatus,
 	})
 	if err != nil {
 		return fmt.Errorf("read response failed: %w", err)
@@ -2942,7 +3053,9 @@ func (c *Connector) promptHostKeyVerification(ctx context.Context, hostname stri
 	return ErrHostKeyMismatch
 }
 
-func appendKnownHost(knownHostsFile, hostname string, key ssh.PublicKey) (err error) {
+// appendKnownHost appends one known_hosts line. With hash, the normalized host
+// ("host" or "[host]:port" for non-22 ports) is written as an HMAC-SHA1 |1| entry.
+func appendKnownHost(knownHostsFile, hostname string, key ssh.PublicKey, hash bool) (err error) {
 	knownHostsFileMutex.Lock()
 	defer knownHostsFileMutex.Unlock()
 
@@ -2960,7 +3073,11 @@ func appendKnownHost(knownHostsFile, hostname string, key ssh.PublicKey) (err er
 		}
 	}()
 
-	line := knownhosts.Line([]string{knownhosts.Normalize(hostname)}, key)
+	host := knownhosts.Normalize(hostname)
+	if hash {
+		host = knownhosts.HashHostname(host)
+	}
+	line := knownhosts.Line([]string{host}, key)
 	if _, writeErr := f.WriteString(line + "\n"); writeErr != nil {
 		return fmt.Errorf("write known_hosts file failed: %w", writeErr)
 	}

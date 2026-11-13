@@ -190,6 +190,16 @@ func resolveControlSocketPath(ctx context.Context, o *SshOptions, stderr io.Writ
 	return expandedPath, err
 }
 
+func canonicalizeControlOptions(o *SshOptions, provider config.ConfigProvider, stderr io.Writer) error {
+	if o == nil || provider == nil {
+		return nil
+	}
+	if err := o.applyHostnameCanonicalization(context.Background(), provider, nil); err != nil {
+		return controlError(stderr, err.Error())
+	}
+	return nil
+}
+
 func resolveControlContext(ctx context.Context, o *SshOptions, stderr io.Writer) (string, ssh.TargetContext, config.ConfigProvider, string, error) {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
@@ -206,6 +216,9 @@ func resolveControlContext(ctx context.Context, o *SshOptions, stderr io.Writer)
 	if providerErr != nil && o != nil && o.control.ConfigFile != "" {
 		return "", ssh.TargetContext{}, nil, "", controlError(stderr, fmt.Sprintf("%s: %v", i18n.T("ssh_err_load_config"), providerErr))
 	}
+	if err := canonicalizeControlOptions(o, provider, stderr); err != nil {
+		return "", ssh.TargetContext{}, nil, "", err
+	}
 	nodeID := ""
 	connTarget := effectiveConnectionTarget(o, "")
 	if provider != nil && strings.TrimSpace(connTarget.Selector) != "" {
@@ -220,30 +233,37 @@ func resolveControlContext(ctx context.Context, o *SshOptions, stderr io.Writer)
 		return "", ssh.TargetContext{}, nil, "", controlError(stderr, fmt.Sprintf("%s: %v", i18n.T("ssh_err_load_config"), providerErr))
 	}
 
+	target := controlTarget(o, provider, nodeID)
+	expanded, err := expandControlSocketPath(o, provider, nodeID, target, stderr)
+	if err != nil {
+		return "", ssh.TargetContext{}, nil, "", err
+	}
+	return expanded, target, provider, nodeID, nil
+}
+
+func expandControlSocketPath(o *SshOptions, provider config.ConfigProvider, nodeID string, target ssh.TargetContext, stderr io.Writer) (string, error) {
 	rawPath := strings.TrimSpace(o.control.ControlPath)
 	if rawPath == "none" {
-		return "", ssh.TargetContext{}, nil, "", controlError(stderr, "ControlPath must be specified when using -O")
+		return "", controlError(stderr, "ControlPath must be specified when using -O")
 	}
-
-	target := controlTarget(o, provider, nodeID)
 	if rawPath != "" {
 		expanded, err := ssh.ExpandControlPath(rawPath, sshenv.Discover(), target)
 		if err != nil {
-			return "", ssh.TargetContext{}, nil, "", controlError(stderr, fmt.Sprintf("expand ControlPath %q failed: %v", rawPath, err))
+			return "", controlError(stderr, fmt.Sprintf("expand ControlPath %q failed: %v", rawPath, err))
 		}
-		return expanded, target, provider, nodeID, nil
+		return expanded, nil
 	}
 
 	// No -S: resolve from session (-o) / node / global / OpenSSH layers. An empty
 	// nodeID still honours -o ControlPath and the global default for ad-hoc hosts.
 	expanded, err := controlSocketPath(o, provider, nodeID)
 	if err != nil {
-		return "", ssh.TargetContext{}, nil, "", controlError(stderr, fmt.Sprintf("resolve control path failed: %v", err))
+		return "", controlError(stderr, fmt.Sprintf("resolve control path failed: %v", err))
 	}
 	if expanded == "" || expanded == "none" {
-		return "", ssh.TargetContext{}, nil, "", controlError(stderr, "ControlPath must be specified when using -O")
+		return "", controlError(stderr, "ControlPath must be specified when using -O")
 	}
-	return expanded, target, provider, nodeID, nil
+	return expanded, nil
 }
 
 // resolveControlNodeID resolves a ConnectionTarget against a read-only

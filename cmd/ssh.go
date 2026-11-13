@@ -31,6 +31,7 @@ type SshOptions struct {
 	diagnostics            corelog.DiagnosticObserver
 	control                SSHControlFlags
 	Host                   string
+	originalHost           string
 	HostName               string
 	cliHostName            string
 	Port                   uint16
@@ -248,6 +249,9 @@ func (o *SshOptions) controlSessionOptions() (adapter.SessionControlOptions, err
 func (o *SshOptions) originalHostForExpansion() string {
 	if o == nil {
 		return ""
+	}
+	if o.originalHost != "" {
+		return o.originalHost
 	}
 	if s := strings.TrimSpace(o.Target.Selector); s != "" {
 		return strings.TrimPrefix(s, config.OpenSSHNodePrefix)
@@ -717,14 +721,15 @@ func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuratio
 	// 总是注入 SessionAuthOverride（即使密码为空），以便 UpdateAuth / UpdateSudo
 	// 能根据 Remember 策略决定是否将交互提示获得的密码回写配置，而不是绕过策略检查。
 	adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, adapter.SessionAuth{
-		Password:   o.Password,
-		Passphrase: o.Passphrase,
-		KeyPath:    firstKey,
-		KeyPaths:   absKeys,
-		HostName:   hostNameOverride,
-		Remember:   shouldRemember,
-		OTP:        o.OTP,
-		ProxyJump:  proxyJumpOverride,
+		Password:     o.Password,
+		Passphrase:   o.Passphrase,
+		KeyPath:      firstKey,
+		KeyPaths:     absKeys,
+		HostName:     hostNameOverride,
+		OriginalHost: o.originalHost,
+		Remember:     shouldRemember,
+		OTP:          o.OTP,
+		ProxyJump:    proxyJumpOverride,
 	}))
 	if reg, regErr := utils.GetCredentialRegistry(cfg); regErr != nil {
 		return nil, fmt.Errorf("initialize credential resolver: %w", regErr)
@@ -1692,8 +1697,48 @@ func parseForwardArg(arg string) (bindAddr, destAddr string, err error) {
 	return spec.BindAddr, spec.DestAddr, nil
 }
 
+func (o *SshOptions) applyHostnameCanonicalization(ctx context.Context, provider config.ConfigProvider, resolver config.CanonicalResolver) error {
+	if o == nil || provider == nil || isMuxDaemonChild() {
+		return nil
+	}
+	host := strings.TrimSpace(o.Target.Selector)
+	if host == "" {
+		host = strings.TrimSpace(o.Host)
+	}
+	if host == "" || strings.HasPrefix(host, config.OpenSSHNodePrefix) {
+		return nil
+	}
+	var matchedSavedNode bool
+	if resolved, err := config.ResolveTarget(provider, o.Target); err == nil {
+		matchedSavedNode = resolved.MatchedNodeID != "" &&
+			!strings.HasPrefix(resolved.MatchedNodeID, config.OpenSSHNodePrefix) &&
+			strings.TrimSpace(resolved.Host) != ""
+	}
+	res, err := config.CanonicalizeHost(ctx, config.CanonicalizeInput{
+		Provider:         provider,
+		Host:             host,
+		RawCLIOptions:    o.control.Options,
+		CLIProxyJump:     o.JumpHost,
+		MatchedSavedNode: matchedSavedNode,
+		Resolver:         resolver,
+	})
+	if err != nil {
+		return err
+	}
+	if !res.Canonicalized {
+		return nil
+	}
+	o.originalHost = res.OriginalHost
+	o.Host = res.CanonicalHost
+	o.Target.Selector = res.CanonicalHost
+	return nil
+}
+
 func (o *SshOptions) resolveNode(ctx context.Context, provider config.ConfigProvider) (string, bool, error) {
 	o.syncIdentityFiles()
+	if err := o.applyHostnameCanonicalization(ctx, provider, nil); err != nil {
+		return "", false, err
+	}
 	preparer, isPreparer := provider.(interface {
 		PrepareNodeContext(context.Context, config.EnsureNodeOptions) (config.EnsureNodeResult, error)
 	})

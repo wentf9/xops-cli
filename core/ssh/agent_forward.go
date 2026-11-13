@@ -399,7 +399,7 @@ func (c *Client) resolveClientForwardAgent() (socket string, enabled bool) {
 		Host:         connCfg.Address,
 		Port:         port,
 		User:         user,
-		OriginalHost: connCfg.NodeID,
+		OriginalHost: effectiveOriginalHost(connCfg.OriginalHost, connCfg.NodeID),
 		JumpHost:     connCfg.ProxyJump,
 		KeyPath:      connCfg.KeyPath,
 	}

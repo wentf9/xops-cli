@@ -117,7 +117,12 @@ func (c *Client) RunSubsystemWithIO(ctx context.Context, subsystem string, stdin
 
 	work, cancel := context.WithCancel(ctx)
 	defer cancel()
-	boundOut, boundErr, closeOutput, err := c.bindSubsystemOutputs(work, stdout, stderr)
+	// Outputs use their own context so a normal completion (which cancels work)
+	// cannot abort draining stdout/stderr still buffered in the channel.
+	outputCtx, cancelOutput := context.WithCancel(ctx)
+	defer cancelOutput()
+	cancelAllOutputs := combineOutputCancels(cancel, []context.CancelFunc{cancelOutput})
+	boundOut, boundErr, closeOutput, err := c.bindSubsystemOutputs(outputCtx, stdout, stderr)
 	if err != nil {
 		return err
 	}
@@ -173,12 +178,13 @@ func (c *Client) RunSubsystemWithIO(ctx context.Context, subsystem string, stdin
 	finishStdinOnce := sync.OnceValue(finishStdin)
 
 	output := startSessionOutput(channel, channel.Stderr(), boundOut, boundErr)
-	outputFailedErr := waitSubsystemCompletion(work, reqDone, output.failed, cancel)
+	outputFailedErr := waitSubsystemCompletion(work, reqDone, output.failed, cancelAllOutputs)
 	cancel()
 	cleanupErr := c.closeCommandChannel(channel, reqDone)
 	releaseAgent()
 	inputErr := finishStdinOnce()
-	outputErr := waitSessionOutput(ctx, output.wait, cancel)
+	outputErr := waitSessionOutput(ctx, output.wait, cancelAllOutputs)
+	cancelOutput()
 
 	return finalizeSubsystemResult(ctx, observation.snapshot(), outputFailedErr, cleanupErr, inputErr, outputErr)
 }

@@ -758,7 +758,7 @@ func TestConnector_DefaultFailClosed_RejectsHostKey(t *testing.T) {
 
 	_, sshPub := generateTestEncryptedKey(t, "unused")
 
-	promptErr := connector.promptHostKeyVerification(context.Background(), "unknown-host", nil, sshPub)
+	promptErr := connector.promptHostKeyVerification(context.Background(), "unknown-host", nil, sshPub, SSHFPStatusNone)
 	if promptErr == nil {
 		t.Fatal("expected error, got nil")
 	}

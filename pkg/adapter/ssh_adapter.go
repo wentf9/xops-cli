@@ -25,15 +25,16 @@ var ErrLocalExecutionDisabled = errors.New("local execution is disabled")
 
 // SessionAuth 描述单个连接会话的临时认证机密与跳板覆盖
 type SessionAuth struct {
-	Password   string
-	Passphrase string
-	KeyPath    string
-	KeyPaths   []string
-	HostName   string
-	SuPwd      string
-	OTP        string
-	ProxyJump  string
-	Remember   bool
+	Password     string
+	Passphrase   string
+	KeyPath      string
+	KeyPaths     []string
+	HostName     string
+	OriginalHost string
+	SuPwd        string
+	OTP          string
+	ProxyJump    string
+	Remember     bool
 }
 
 // SessionControlOptions specifies session-level OpenSSH option overrides (Tier 1).
@@ -639,11 +640,11 @@ func (a *SSHAdapter) resolveOptionTiers(nodeName string) (tier2Node, tier3Global
 			ssh.OptionClassMux,
 			ssh.OptionClassTransport,
 		)
-		if rawTier4 != nil && strings.EqualFold(strings.TrimSpace(rawTier4.Get("hash_known_hosts")), "yes") {
+		if rawTier4 != nil && strings.EqualFold(strings.TrimSpace(rawTier4.Get(ssh.OptionHashKnownHosts)), "yes") {
 			if tier4OpenSSH == nil {
 				tier4OpenSSH = &ssh.Options{}
 			}
-			_ = tier4OpenSSH.Set("hash_known_hosts", "yes")
+			_ = tier4OpenSSH.Set(ssh.OptionHashKnownHosts, "yes")
 		}
 	}
 	if tier4OpenSSH != nil && tier4OpenSSH.ControlConfig() != nil {
@@ -955,11 +956,15 @@ func (a *SSHAdapter) ExpandControlPath(nodeID string, rawPath string) (string, e
 	if err != nil {
 		return "", fmt.Errorf("resolve node %q for control path expansion: %w", nodeID, err)
 	}
+	origHost := nodeID
+	if ov, ok := a.getSessionOverride(nodeID); ok && strings.TrimSpace(ov.OriginalHost) != "" {
+		origHost = strings.TrimSpace(ov.OriginalHost)
+	}
 	target := ssh.TargetContext{
 		Host:         snapshot.Host.Address,
 		Port:         effectiveSnapshotPort(snapshot.Host.Port),
 		User:         effectiveSnapshotUser(snapshot.Identity.User),
-		OriginalHost: nodeID,
+		OriginalHost: origHost,
 		JumpHost:     snapshot.Node.ProxyJump,
 	}
 	return ssh.ExpandControlPath(rawPath, sshenv.Discover(), target)
@@ -1095,6 +1100,9 @@ func buildOrderedKeyPaths(cliFlagKeys, cliOptKeys []string, managedNodeKey strin
 func (a *SSHAdapter) applySessionOverrideToConfig(nodeID string, cfg *ssh.ClientConfig, override SessionAuth) error {
 	if override.HostName != "" {
 		cfg.Address = override.HostName
+	}
+	if orig := strings.TrimSpace(override.OriginalHost); orig != "" {
+		cfg.OriginalHost = orig
 	}
 	if override.Password != "" {
 		cfg.Password = override.Password

@@ -44,6 +44,10 @@ func Discover() core.Environment {
 		Environ:             os.Environ,
 		SuspendProcess:      platformSuspendProcess(),
 		DialAgent:           platformDialAgent(),
+		// Global files are read-only verification sources; missing files are skipped.
+		GlobalKnownHostsFiles: defaultGlobalKnownHostsFiles(),
+		// Only consulted when VerifyHostKeyDNS=yes|ask.
+		LookupSSHFP: newSystemSSHFPLookup(),
 	}
 	if userDirectory != "" {
 		environment.KnownHostsFile = filepath.Join(userDirectory, ".ssh", "known_hosts")

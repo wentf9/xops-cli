@@ -1062,3 +1062,9 @@ flag_ssh_forward_agent:
   other: "Enables forwarding of connections from an authentication agent (overrides -a and ForwardAgent)"
 flag_ssh_no_forward_agent:
   other: "Disables forwarding of the authentication agent connection (overrides -A and ForwardAgent)"
+prompt_host_key_sshfp_matched_verified:
+  other: "Matching host key fingerprint found in DNS (DNSSEC verified)."
+prompt_host_key_sshfp_matched_unverified:
+  other: "Matching host key fingerprint found in DNS (NOT DNSSEC verified)."
+prompt_host_key_sshfp_mismatch:
+  other: "WARNING: DNS SSHFP record DOES NOT MATCH the presented host key!"

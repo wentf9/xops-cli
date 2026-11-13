@@ -173,6 +173,9 @@ Host imported-node
     ControlPath ~/.ssh/cm-%C
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
+    GlobalKnownHostsFile /etc/ssh/ssh_known_hosts
+    HashKnownHosts yes
+    VerifyHostKeyDNS yes
     PasswordAuthentication no
     BatchMode yes
 `
@@ -212,6 +215,9 @@ Host gate3-node
     ControlPath ~/.ssh/cm-%C
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
+    GlobalKnownHostsFile /etc/ssh/ssh_known_hosts
+    HashKnownHosts yes
+    VerifyHostKeyDNS yes
     GatewayPorts clientspecified
     RequestTTY force
     BatchMode yes

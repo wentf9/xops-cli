@@ -27,8 +27,14 @@ func TestDiscoverEnvironmentContracts(t *testing.T) {
 	if env.DialAgent == nil {
 		t.Fatal("expected Discover() to populate DialAgent callback")
 	}
-	if env.DialProxyCommand != nil || env.RunLocalCommand != nil || env.LookupSSHFP != nil {
-		t.Fatal("expected local execution and DNS SSHFP hooks to remain nil by default")
+	if env.DialProxyCommand != nil || env.RunLocalCommand != nil {
+		t.Fatal("expected local execution hooks to remain nil by default")
+	}
+	if env.LookupSSHFP == nil {
+		t.Fatal("expected Discover() to populate LookupSSHFP (only used when VerifyHostKeyDNS is enabled)")
+	}
+	if len(env.GlobalKnownHostsFiles) == 0 {
+		t.Fatal("expected Discover() to populate default GlobalKnownHostsFiles")
 	}
 	if runtime.GOOS == "windows" {
 		if env.SuspendProcess != nil {

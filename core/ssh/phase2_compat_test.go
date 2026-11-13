@@ -945,8 +945,9 @@ func assertPhase2ControlEscape(t *testing.T) {
 
 type freezableServerConn struct {
 	net.Conn
-	frozen  atomic.Bool
-	unblock chan struct{}
+	frozen    atomic.Bool
+	unblock   chan struct{}
+	closeOnce sync.Once
 }
 
 func (c *freezableServerConn) Write(p []byte) (int, error) {
@@ -958,12 +959,10 @@ func (c *freezableServerConn) Write(p []byte) (int, error) {
 	return c.Conn.Write(p)
 }
 
+// Close is called concurrently by the kex loop and test cleanup, so closing
+// unblock must be serialized; a select/default guard races.
 func (c *freezableServerConn) Close() error {
-	select {
-	case <-c.unblock:
-	default:
-		close(c.unblock)
-	}
+	c.closeOnce.Do(func() { close(c.unblock) })
 	return c.Conn.Close()
 }
 

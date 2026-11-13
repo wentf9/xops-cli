@@ -242,6 +242,7 @@ func (c *Client) configSnapshot() (ClientConfig, bool) {
 		KeyRef:                c.connCfg.KeyRef,
 		TrustVersion:          c.connCfg.TrustVersion,
 		NodeID:                c.connCfg.NodeID,
+		OriginalHost:          c.connCfg.OriginalHost,
 		Address:               c.connCfg.Address,
 		Port:                  c.connCfg.Port,
 		User:                  c.connCfg.User,

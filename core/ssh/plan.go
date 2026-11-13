@@ -228,7 +228,7 @@ func clientConfigFromPlan(cfg ConnectionConfig) ClientConfig {
 		opts = nil
 	}
 	return ClientConfig{
-		NodeID: cfg.NodeID, Address: cfg.Address, Port: cfg.Port, User: cfg.User, AuthType: cfg.AuthType,
+		NodeID: cfg.NodeID, OriginalHost: cfg.OriginalHost, Address: cfg.Address, Port: cfg.Port, User: cfg.User, AuthType: cfg.AuthType,
 		KeyPath: cfg.KeyPath, KeyPaths: slices.Clone(cfg.KeyPaths), KeyRef: cfg.KeyRef, TrustVersion: cfg.TrustVersion,
 		AuthUpdateToken: cfg.AuthUpdateToken, SudoUpdateToken: cfg.SudoUpdateToken, SudoMode: cfg.SudoMode,
 		ProxyJump: cfg.ProxyJump, OriginalProxyJump: cfg.OriginalProxyJump, HasOriginalProxyJump: cfg.HasOriginalProxyJump,

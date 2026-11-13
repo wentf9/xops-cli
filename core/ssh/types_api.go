@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 )
 
 // SudoMode 定义了 SSH 连接执行命令时的提权方式
@@ -24,6 +25,10 @@ type ClientConfig struct {
 	KeyRef       string
 	TrustVersion string
 	NodeID       string // 逻辑标识
+	// OriginalHost is the user's original command-line host or alias (%n).
+	// Empty falls back to NodeID. It differs from Address (%h) after
+	// CanonicalizeHostname rewrites the target.
+	OriginalHost string
 	Address      string
 	Port         int
 	User         string
@@ -64,6 +69,7 @@ func (c *ClientConfig) ToConnectionConfig() ConnectionConfig {
 		KeyRef:                c.KeyRef,
 		TrustVersion:          c.TrustVersion,
 		NodeID:                c.NodeID,
+		OriginalHost:          c.OriginalHost,
 		Address:               c.Address,
 		Port:                  c.Port,
 		User:                  c.User,
@@ -87,6 +93,7 @@ type ConnectionConfig struct {
 	KeyRef                string
 	TrustVersion          string
 	NodeID                string
+	OriginalHost          string
 	Address               string
 	Port                  int
 	User                  string
@@ -231,12 +238,28 @@ type SecretRequest struct {
 	NumPrompts   int
 }
 
+// SSHFPVerifyStatus summarizes how DNS SSHFP records relate to a presented host key.
+type SSHFPVerifyStatus string
+
+const (
+	// SSHFPStatusNone means DNS verification was disabled, unavailable, or found no usable SHA-256 record.
+	SSHFPStatusNone SSHFPVerifyStatus = ""
+	// SSHFPStatusMatchedVerified means a SHA-256 record matched and the resolver set AD=1.
+	SSHFPStatusMatchedVerified SSHFPVerifyStatus = "matched_verified"
+	// SSHFPStatusMatchedUnverified means a SHA-256 record matched but the answer was not DNSSEC-authenticated.
+	SSHFPStatusMatchedUnverified SSHFPVerifyStatus = "matched_unverified"
+	// SSHFPStatusMismatch means SHA-256 records exist for the key algorithm but none match.
+	SSHFPStatusMismatch SSHFPVerifyStatus = "mismatch"
+)
+
 // HostKeyConfirmation 描述主机密钥指纹确认请求
 type HostKeyConfirmation struct {
 	Hostname      string
 	RemoteAddress string
 	Algorithm     string
 	Fingerprint   string
+	// SSHFPStatus reports the DNS SSHFP evaluation when VerifyHostKeyDNS is enabled.
+	SSHFPStatus SSHFPVerifyStatus
 }
 
 // SecretPrompter 负责提示用户输入敏感凭据（如密码、私钥密码短语等）
@@ -326,4 +349,12 @@ func validateTargetCompatibility(cur ConnectionConfig, newCfg *ClientConfig) err
 			ErrSnapshotMismatch, expectedJump, actualJump)
 	}
 	return nil
+}
+
+// effectiveOriginalHost returns the %n value: an explicit OriginalHost, else nodeID.
+func effectiveOriginalHost(originalHost, nodeID string) string {
+	if trimmed := strings.TrimSpace(originalHost); trimmed != "" {
+		return trimmed
+	}
+	return nodeID
 }

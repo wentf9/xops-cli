@@ -29,6 +29,14 @@ const (
 	OptionTCPKeepAlive                 = "tcp_keep_alive"
 	OptionStrictHostKeyChecking        = "strict_host_key_checking"
 	OptionUserKnownHostsFile           = "user_known_hosts_file"
+	OptionGlobalKnownHostsFile         = "global_known_hosts_file"
+	OptionHashKnownHosts               = "hash_known_hosts"
+	OptionVerifyHostKeyDNS             = "verify_host_key_dns"
+	OptionCanonicalizeHostname         = "canonicalize_hostname"
+	OptionCanonicalDomains             = "canonical_domains"
+	OptionCanonicalizeMaxDots          = "canonicalize_max_dots"
+	OptionCanonicalizeFallbackLocal    = "canonicalize_fallback_local"
+	OptionCanonicalizePermittedCNAMEs  = "canonicalize_permitted_cnames"
 	OptionIdentityFile                 = "identity_file"
 	OptionCertificateFile              = "certificate_file"
 	OptionIdentityAgent                = "identity_agent"
@@ -97,6 +105,25 @@ const (
 	StrictHostKeyCheckingAsk       = "ask"
 	StrictHostKeyCheckingAcceptNew = "accept-new"
 )
+
+// VerifyHostKeyDNS values supported by OpenSSH.
+const (
+	VerifyHostKeyDNSNo  = "no"
+	VerifyHostKeyDNSYes = "yes"
+	VerifyHostKeyDNSAsk = "ask"
+)
+
+// CanonicalizeHostname values supported by OpenSSH.
+const (
+	CanonicalizeHostnameNo     = "no"
+	CanonicalizeHostnameYes    = "yes"
+	CanonicalizeHostnameAlways = "always"
+)
+
+// DefaultCanonicalizeMaxDots is OpenSSH's CanonicalizeMaxDots default.
+const DefaultCanonicalizeMaxDots = 1
+
+const maxCanonicalizeMaxDots = 64
 
 // OptionSpec describes a supported OpenSSH client option in the registry.
 type OptionSpec struct {
@@ -219,6 +246,58 @@ var optionRegistry = []OptionSpec{
 			}
 			return trimmed, nil
 		},
+	},
+	{
+		CanonicalKey: OptionGlobalKnownHostsFile,
+		OpenSSHName:  "GlobalKnownHostsFile",
+		Class:        OptionClassTrust,
+		Normalize:    validateGlobalKnownHostsFile,
+	},
+	{
+		CanonicalKey: OptionHashKnownHosts,
+		OpenSSHName:  "HashKnownHosts",
+		Class:        OptionClassTrust,
+		Normalize: func(raw string) (string, error) {
+			return normalizeYesNoOption("HashKnownHosts", raw)
+		},
+	},
+	{
+		CanonicalKey: OptionVerifyHostKeyDNS,
+		OpenSSHName:  "VerifyHostKeyDNS",
+		Class:        OptionClassTrust,
+		Normalize:    validateVerifyHostKeyDNS,
+	},
+	{
+		CanonicalKey: OptionCanonicalizeHostname,
+		OpenSSHName:  "CanonicalizeHostname",
+		Class:        OptionClassTransport,
+		Normalize:    validateCanonicalizeHostname,
+	},
+	{
+		CanonicalKey: OptionCanonicalDomains,
+		OpenSSHName:  "CanonicalDomains",
+		Class:        OptionClassTransport,
+		Normalize:    validateCanonicalDomains,
+	},
+	{
+		CanonicalKey: OptionCanonicalizeMaxDots,
+		OpenSSHName:  "CanonicalizeMaxDots",
+		Class:        OptionClassTransport,
+		Normalize:    validateCanonicalizeMaxDots,
+	},
+	{
+		CanonicalKey: OptionCanonicalizeFallbackLocal,
+		OpenSSHName:  "CanonicalizeFallbackLocal",
+		Class:        OptionClassTransport,
+		Normalize: func(raw string) (string, error) {
+			return normalizeYesNoOption("CanonicalizeFallbackLocal", raw)
+		},
+	},
+	{
+		CanonicalKey: OptionCanonicalizePermittedCNAMEs,
+		OpenSSHName:  "CanonicalizePermittedCNAMEs",
+		Class:        OptionClassTransport,
+		Normalize:    validateCanonicalizePermittedCNAMEs,
 	},
 	{
 		CanonicalKey: OptionIdentityFile,

@@ -966,6 +966,29 @@ func (o *ScpOptions) prepareRemoteToRemoteFile(ctx context.Context, dstSftp *sft
 }
 
 func (o *ScpOptions) connectSftpForPath(ctx context.Context, p PathInfo, specificPassword string, provider config.ConfigProvider, connector *ssh.Connector) (string, *sftp.Client, error) {
+	if p.Host != "" && o.Tag == "" && o.HostFile == "" && !strings.Contains(o.Host, ",") && !strings.HasPrefix(p.Host, config.OpenSSHNodePrefix) {
+		var matchedSavedNode bool
+		if target, tErr := o.resolveTargetForPath(p); tErr == nil {
+			if resolved, rErr := config.ResolveTarget(provider, target); rErr == nil {
+				matchedSavedNode = resolved.MatchedNodeID != "" &&
+					!strings.HasPrefix(resolved.MatchedNodeID, config.OpenSSHNodePrefix) &&
+					strings.TrimSpace(resolved.Host) != ""
+			}
+		}
+		res, cErr := config.CanonicalizeHost(ctx, config.CanonicalizeInput{
+			Provider:         provider,
+			Host:             p.Host,
+			RawCLIOptions:    o.control.Options,
+			CLIProxyJump:     o.JumpHost,
+			MatchedSavedNode: matchedSavedNode,
+		})
+		if cErr != nil {
+			return "", nil, cErr
+		}
+		if res.Canonicalized {
+			p.Host = res.CanonicalHost
+		}
+	}
 	nodeID, _, err := o.getOrCreateNodeForPath(ctx, provider, p, specificPassword)
 	if err != nil {
 		return "", nil, err

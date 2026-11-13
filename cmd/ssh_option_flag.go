@@ -324,6 +324,18 @@ func mergeSessionControl(sessionOpts adapter.SessionControlOptions) *ssh.Control
 	return ctrl
 }
 
+func applyTargetControlNodeOverrides(opts *SshOptions, nodeID string, target *ssh.TargetContext) {
+	if target == nil || !isTargetControlNode(opts, nodeID) {
+		return
+	}
+	if opts != nil && opts.originalHost != "" {
+		target.OriginalHost = opts.originalHost
+	}
+	if expandedHost, err := opts.effectiveHostName(); err == nil && expandedHost != "" {
+		target.Host = expandedHost
+	}
+}
+
 // controlTarget builds the token expansion context. The resolved target supplies
 // address, port, user, and jump host; explicit CLI values still win, mirroring
 // Connector.buildTargetContext.
@@ -336,11 +348,7 @@ func controlTarget(opts *SshOptions, provider config.ConfigProvider, nodeID stri
 		}
 		if resolved, err := config.ResolveTarget(effectiveProvider, connTarget); err == nil {
 			target := targetContextFromResolvedTarget(resolved)
-			if isTargetControlNode(opts, nodeID) {
-				if expandedHost, hErr := opts.effectiveHostName(); hErr == nil && expandedHost != "" {
-					target.Host = expandedHost
-				}
-			}
+			applyTargetControlNodeOverrides(opts, nodeID, &target)
 			return target
 		}
 	}
@@ -355,11 +363,7 @@ func controlTarget(opts *SshOptions, provider config.ConfigProvider, nodeID stri
 	}
 	if opts != nil {
 		target.Host = strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(opts.Host), "]"), "[")
-		if isTargetControlNode(opts, nodeID) {
-			if expandedHost, err := opts.effectiveHostName(); err == nil && expandedHost != "" {
-				target.Host = expandedHost
-			}
-		}
+		applyTargetControlNodeOverrides(opts, nodeID, &target)
 		target.Port = int(opts.Port)
 		target.User = opts.User
 	}
