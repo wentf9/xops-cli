@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"regexp"
@@ -18,11 +19,17 @@ import (
 	"github.com/wentf9/xops-cli/pkg/models"
 )
 
+// ErrLocalExecutionDisabled is returned when a LocalExec-class option
+// (such as ProxyCommand) is present while local execution is disabled.
+var ErrLocalExecutionDisabled = errors.New("local execution is disabled")
+
 // SessionAuth 描述单个连接会话的临时认证机密与跳板覆盖
 type SessionAuth struct {
 	Password   string
 	Passphrase string
 	KeyPath    string
+	KeyPaths   []string
+	HostName   string
 	SuPwd      string
 	OTP        string
 	ProxyJump  string
@@ -88,6 +95,17 @@ func (s *SessionControlOptions) SetPersist(p string) {
 	}
 	s.Persist = &p
 	s.ensureOptions().SetControlPersist(p)
+}
+
+// SetAddressFamily sets the AddressFamily override in Tier 1 options.
+func (s *SessionControlOptions) SetAddressFamily(family string) error {
+	if family == "" {
+		if s.Options != nil {
+			s.Options.Delete(ssh.OptionAddressFamily)
+		}
+		return nil
+	}
+	return s.ensureOptions().Set(ssh.OptionAddressFamily, family)
 }
 
 // ToSSHOptions returns the session-level ssh.Options representation (including Master/Path/Persist fields).
@@ -197,28 +215,40 @@ func applyParsedOption(opts *SessionControlOptions, key, val string) error {
 		if err != nil || p == 0 {
 			return fmt.Errorf("invalid Port in -o option: %q", val)
 		}
-	case "user", "identityfile", "proxyjump":
+	case "user", "proxyjump", "hostname":
 		if val == "" {
 			return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
 		}
 		// Applied to the connection target by the CLI, see ApplyGeneralOptions.
-	default:
-		spec, supported := ssh.LookupOptionSpec(key)
-		if !supported {
-			return fmt.Errorf("unsupported -o option %q", key)
-		}
+	case "identityfile":
 		if val == "" {
-			return fmt.Errorf("invalid %s in -o option: value cannot be empty", spec.OpenSSHName)
+			return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
 		}
-		if spec.MultiValue {
-			if err := opts.ensureOptions().Append(spec.CanonicalKey, val); err != nil {
-				return fmt.Errorf("invalid %s in -o option: %w", spec.OpenSSHName, err)
-			}
-		} else {
-			if err := opts.ensureOptions().Set(spec.CanonicalKey, val); err != nil {
-				return fmt.Errorf("invalid %s in -o option: %w", spec.OpenSSHName, err)
-			}
+		if err := opts.ensureOptions().Append(ssh.OptionIdentityFile, val); err != nil {
+			return fmt.Errorf("invalid IdentityFile in -o option: %w", err)
 		}
+	default:
+		return applySupportedOption(opts, key, val)
+	}
+	return nil
+}
+
+func applySupportedOption(opts *SessionControlOptions, key, val string) error {
+	spec, supported := ssh.LookupOptionSpec(key)
+	if !supported {
+		return fmt.Errorf("unsupported -o option %q", key)
+	}
+	if val == "" {
+		return fmt.Errorf("invalid %s in -o option: value cannot be empty", spec.OpenSSHName)
+	}
+	if spec.MultiValue {
+		if err := opts.ensureOptions().Append(spec.CanonicalKey, val); err != nil {
+			return fmt.Errorf("invalid %s in -o option: %w", spec.OpenSSHName, err)
+		}
+		return nil
+	}
+	if err := opts.ensureOptions().Set(spec.CanonicalKey, val); err != nil {
+		return fmt.Errorf("invalid %s in -o option: %w", spec.OpenSSHName, err)
 	}
 	return nil
 }
@@ -347,6 +377,15 @@ func WithHostTrustOverrides(enabled bool) Option {
 	}
 }
 
+// WithLocalExecution controls whether LocalExec-class options (such as
+// ProxyCommand) are permitted. Non-interactive, verification, probe, and mux
+// daemon adapters keep this disabled (default false) and fail closed.
+func WithLocalExecution(enabled bool) Option {
+	return func(a *SSHAdapter) {
+		a.localExecution = enabled
+	}
+}
+
 // SSHAdapter 实现 ssh.ConnectionProvider, ssh.SecretResolver, ssh.CredentialRecorder 接口，作为业务模型与底层 SSH 的防腐层
 type SSHAdapter struct {
 	cfgProvider             config.ConfigProvider
@@ -360,6 +399,7 @@ type SSHAdapter struct {
 	nonInteractive          bool
 	disableControl          bool
 	disableHostTrust        bool
+	localExecution          bool
 	credentialRecording     bool
 	rememberConfirmation    func(context.Context, string) (bool, error)
 	enrollmentProbe         bool
@@ -402,8 +442,10 @@ func NewSSHAdapter(cfgProvider config.ConfigProvider, opts ...Option) *SSHAdapte
 
 // NewNonInteractiveSSHAdapter 创建非交互式的 SSH 适配器
 func NewNonInteractiveSSHAdapter(cfgProvider config.ConfigProvider, opts ...Option) *SSHAdapter {
-	opts = append([]Option{WithNonInteractive(true)}, opts...)
-	return NewSSHAdapter(cfgProvider, opts...)
+	opts = append([]Option{WithNonInteractive(true), WithLocalExecution(false)}, opts...)
+	adp := NewSSHAdapter(cfgProvider, opts...)
+	adp.localExecution = false
+	return adp
 }
 
 // NewConnector 是一个辅助方法，快速创建组装好 Adapter 的 ssh.Connector，支持传入 Option 进行显式注入配置。
@@ -503,10 +545,30 @@ func (a *SSHAdapter) ResolveSSHOptions(nodeName string, sessionOpts SessionContr
 	if a.disableHostTrust {
 		merged.StripClasses(ssh.OptionClassTrust)
 	}
+	if !a.localExecution {
+		if key := firstLocalExecOption(merged); key != "" {
+			return nil, fmt.Errorf("%w: %s", ErrLocalExecutionDisabled, key)
+		}
+	}
 	if merged.IsEmpty() {
 		return nil, nil
 	}
 	return merged, nil
+}
+
+func firstLocalExecOption(opts *ssh.Options) string {
+	if opts == nil {
+		return ""
+	}
+	for _, spec := range ssh.RegisteredOptionSpecs() {
+		if spec.Class == ssh.OptionClassLocalExec && strings.TrimSpace(opts.Get(spec.CanonicalKey)) != "" {
+			return spec.OpenSSHName
+		}
+	}
+	if strings.TrimSpace(opts.Get("proxy_command")) != "" {
+		return "ProxyCommand"
+	}
+	return ""
 }
 
 func (a *SSHAdapter) resolveOptionTiers(nodeName string) (tier2Node, tier3Global, tier4OpenSSH *ssh.Options) {
@@ -527,10 +589,17 @@ func (a *SSHAdapter) resolveOptionTiers(nodeName string) (tier2Node, tier3Global
 			tier4OpenSSH = snapshot.Node.SSHOptions.Clone()
 		}
 	} else {
-		tier4OpenSSH = a.resolveTier4OpenSSHOptions(nodeName, snapErr, snapshot).FilterByClasses(
+		rawTier4 := a.resolveTier4OpenSSHOptions(nodeName, snapErr, snapshot)
+		tier4OpenSSH = rawTier4.FilterByClasses(
 			ssh.OptionClassMux,
 			ssh.OptionClassTransport,
 		)
+		if rawTier4 != nil && strings.EqualFold(strings.TrimSpace(rawTier4.Get("hash_known_hosts")), "yes") {
+			if tier4OpenSSH == nil {
+				tier4OpenSSH = &ssh.Options{}
+			}
+			_ = tier4OpenSSH.Set("hash_known_hosts", "yes")
+		}
 	}
 	if tier4OpenSSH != nil && tier4OpenSSH.ControlConfig() != nil {
 		tier4OpenSSH.ImplicitTier4 = true
@@ -913,23 +982,84 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 		Options:               sshOpts,
 	}
 
-	if override, ok := a.getSessionOverride(nodeID); ok {
+	var override SessionAuth
+	var hasOverride bool
+	if ov, ok := a.getSessionOverride(nodeID); ok {
+		override = ov
+		hasOverride = true
 		if err := a.applySessionOverrideToConfig(nodeID, cfg, override); err != nil {
 			return nil, err
 		}
 	}
 
+	var cliOptKeys []string
+	if sessionCtrlOpts.Options != nil {
+		cliOptKeys = sessionCtrlOpts.Options.IdentityFiles()
+	}
+	var managedNodeKey string
+	if !strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) {
+		managedNodeKey = snapshot.Identity.KeyPath
+	}
+	var mergedOptKeys []string
+	if sshOpts != nil {
+		mergedOptKeys = sshOpts.IdentityFiles()
+	}
+	var cliFlagKeys []string
+	if hasOverride {
+		if len(override.KeyPaths) > 0 {
+			cliFlagKeys = override.KeyPaths
+		} else if override.KeyPath != "" {
+			cliFlagKeys = []string{override.KeyPath}
+		}
+	}
+	cfg.KeyPaths = buildOrderedKeyPaths(cliFlagKeys, cliOptKeys, managedNodeKey, mergedOptKeys)
+	if cfg.KeyPath == "" && len(cfg.KeyPaths) > 0 {
+		cfg.KeyPath = cfg.KeyPaths[0]
+	}
+
 	return cfg, nil
 }
 
+func buildOrderedKeyPaths(cliFlagKeys, cliOptKeys []string, managedNodeKey string, mergedOptKeys []string) []string {
+	var out []string
+	seen := make(map[string]struct{})
+	add := func(k string) {
+		k = strings.TrimSpace(k)
+		if k == "" {
+			return
+		}
+		if _, ok := seen[k]; ok {
+			return
+		}
+		seen[k] = struct{}{}
+		out = append(out, k)
+	}
+	for _, k := range cliFlagKeys {
+		add(k)
+	}
+	for _, k := range cliOptKeys {
+		add(k)
+	}
+	add(managedNodeKey)
+	for _, k := range mergedOptKeys {
+		add(k)
+	}
+	return out
+}
+
 func (a *SSHAdapter) applySessionOverrideToConfig(nodeID string, cfg *ssh.ClientConfig, override SessionAuth) error {
+	if override.HostName != "" {
+		cfg.Address = override.HostName
+	}
 	if override.Password != "" {
 		cfg.Password = override.Password
 	}
 	if override.Passphrase != "" {
 		cfg.Passphrase = override.Passphrase
 	}
-	if override.KeyPath != "" {
+	if len(override.KeyPaths) > 0 {
+		cfg.KeyPath = override.KeyPaths[0]
+	} else if override.KeyPath != "" {
 		cfg.KeyPath = override.KeyPath
 	}
 	// Route explicit session material through auto authentication unless the
@@ -938,7 +1068,7 @@ func (a *SSHAdapter) applySessionOverrideToConfig(nodeID string, cfg *ssh.Client
 	// and enables stage-0 keyboard-interactive when --otp is supplied on a
 	// default password node.
 	if cfg.AuthType != "keyboard-interactive" && cfg.AuthType != "otp" {
-		if override.Password != "" || override.Passphrase != "" || override.KeyPath != "" {
+		if override.Password != "" || override.Passphrase != "" || override.KeyPath != "" || len(override.KeyPaths) > 0 {
 			cfg.AuthType = "auto"
 		} else if override.OTP != "" && (cfg.AuthType == "" || cfg.AuthType == "password") {
 			cfg.AuthType = "auto"

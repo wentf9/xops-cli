@@ -77,6 +77,14 @@ flag_ssh_option:
   other: "Can be used to give options in the format used in the configuration file (Key=Value)"
 flag_ssh_control_command:
   other: "Send control command to active master: check, exit, stop, forward, cancel, proxy, proxy-stream, conninfo, channels"
+flag_ssh_config_file:
+  other: "Specify an alternative per-user OpenSSH configuration file, or 'none' to skip ~/.ssh/config"
+flag_ssh_cipher:
+  other: "Select the cipher specification for encrypting the session"
+flag_ipv4:
+  other: "Forces ssh to use IPv4 addresses only"
+flag_ipv6:
+  other: "Forces ssh to use IPv6 addresses only"
 ssh_err_background_requires_nocmd:
   other: "Cannot fork into background (-f) without a command to execute or -N"
 ssh_flag_stdio_forward:

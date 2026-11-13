@@ -1,6 +1,7 @@
 package config
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -66,6 +67,63 @@ func NewOpenSSHParserFromReader(r io.Reader) (*OpenSSHParser, error) {
 		return nil, fmt.Errorf("decode ssh config failed: %w", err)
 	}
 	return &OpenSSHParser{cfg: cfg}, nil
+}
+
+// WithOpenSSHConfigOverride returns a read-only ConfigProvider whose OpenSSH
+// configuration is overridden by configPath:
+//   - "" returns base unchanged;
+//   - "none" (case-insensitive) attaches an empty OpenSSHParser so ~/.ssh/config is skipped;
+//   - Any other path loads that file via NewOpenSSHParserFromPath and returns an
+//     explicit error if the file does not exist or cannot be read.
+func WithOpenSSHConfigOverride(base ConfigProvider, configPath string) (ConfigProvider, error) {
+	if configPath == "" {
+		return base, nil
+	}
+	var parser *OpenSSHParser
+	if strings.EqualFold(strings.TrimSpace(configPath), "none") {
+		parser = &OpenSSHParser{cfg: nil}
+	} else {
+		info, err := os.Stat(configPath)
+		if err != nil {
+			return nil, fmt.Errorf("open ssh config %q failed: %w", configPath, err)
+		}
+		if info.IsDir() {
+			return nil, fmt.Errorf("open ssh config %q failed: path is a directory", configPath)
+		}
+		parser, err = NewOpenSSHParserFromPath(configPath)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var snap *Configuration
+	if base != nil {
+		snap = base.Snapshot()
+	}
+	repo, err := NewRepositoryWithOpenSSHParser(snap, readOnlyRejectStore{}, parser)
+	if err != nil {
+		return nil, fmt.Errorf("create ephemeral ssh config override provider: %w", err)
+	}
+	return &openSSHOverrideProvider{Repository: repo}, nil
+}
+
+type readOnlyRejectStore struct{}
+
+func (readOnlyRejectStore) Load() (*Configuration, error) {
+	return nil, errors.New("read-only OpenSSH override store does not support Load")
+}
+
+func (readOnlyRejectStore) Save(*Configuration) error {
+	return errors.New("read-only OpenSSH override store does not support Save")
+}
+
+type openSSHOverrideProvider struct {
+	*Repository
+}
+
+// ConfirmNodeContext is a no-op on the read-only override provider so ephemeral
+// pending nodes prepared under -F are never persisted to disk.
+func (*openSSHOverrideProvider) ConfirmNodeContext(context.Context, string) error {
+	return nil
 }
 
 // Find 尝试在 ssh_config 中寻找匹配的主机名
@@ -280,8 +338,8 @@ func parseOpenSSHOptions(cfg *ssh_config.Config, host string) (*ssh.Options, err
 	for _, spec := range ssh.RegisteredOptionSpecs() {
 		// Trust-class options (StrictHostKeyChecking, UserKnownHostsFile) are never
 		// inherited from ~/.ssh/config so wildcard host blocks cannot implicitly
-		// weaken host key verification.
-		if spec.Class == ssh.OptionClassTrust {
+		// weaken host key verification. Only one-way HashKnownHosts=yes is allowed.
+		if spec.Class == ssh.OptionClassTrust && !isAllowedOpenSSHTrustOption(spec.CanonicalKey) {
 			continue
 		}
 		if spec.MultiValue {
@@ -299,6 +357,9 @@ func parseOpenSSHOptions(cfg *ssh_config.Config, host string) (*ssh.Options, err
 			return nil, err
 		}
 		if val == "" {
+			continue
+		}
+		if spec.Class == ssh.OptionClassTrust && !strings.EqualFold(strings.TrimSpace(val), "yes") {
 			continue
 		}
 		if spec.AllowList {
@@ -361,6 +422,10 @@ func allMatchingOpenSSHOptions(cfg *ssh_config.Config, host string, spec ssh.Opt
 
 // firstMatchingOpenSSHOption resolves an option across ssh_config Host blocks in
 // OpenSSH first-match-wins order across both the primary OpenSSHName and its aliases.
+func isAllowedOpenSSHTrustOption(canonicalKey string) bool {
+	return strings.EqualFold(strings.TrimSpace(canonicalKey), "hash_known_hosts")
+}
+
 func firstMatchingOpenSSHOption(cfg *ssh_config.Config, host string, spec ssh.OptionSpec) (string, error) {
 	if len(spec.Aliases) == 0 {
 		val, err := cfg.Get(host, spec.OpenSSHName)

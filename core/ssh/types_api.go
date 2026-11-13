@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 )
 
 // SudoMode 定义了 SSH 连接执行命令时的提权方式
@@ -29,6 +30,7 @@ type ClientConfig struct {
 	AuthType     string // "password", "key", "agent", "auto"
 	Password     string
 	KeyPath      string
+	KeyPaths     []string
 	Passphrase   string
 	// AuthUpdateToken conditionally authorizes persistence of discovered
 	// authentication values. An empty token makes discovery session-local.
@@ -67,6 +69,7 @@ func (c *ClientConfig) ToConnectionConfig() ConnectionConfig {
 		User:                  c.User,
 		AuthType:              c.AuthType,
 		KeyPath:               c.KeyPath,
+		KeyPaths:              slices.Clone(c.KeyPaths),
 		AuthUpdateToken:       c.AuthUpdateToken,
 		SudoMode:              c.SudoMode,
 		SudoUpdateToken:       c.SudoUpdateToken,
@@ -89,6 +92,7 @@ type ConnectionConfig struct {
 	User                  string
 	AuthType              string
 	KeyPath               string
+	KeyPaths              []string
 	AuthUpdateToken       string
 	SudoMode              SudoMode
 	SudoUpdateToken       string
@@ -103,6 +107,7 @@ type ConnectionConfig struct {
 // Clone returns a deep copy of ConnectionConfig, isolating mutable Execution and Options pointers.
 func (c ConnectionConfig) Clone() ConnectionConfig {
 	out := c
+	out.KeyPaths = slices.Clone(c.KeyPaths)
 	out.Execution = c.Execution.Clone()
 	out.Options = c.Options.Clone()
 	return out
@@ -292,6 +297,17 @@ func validateTargetCompatibility(cur ConnectionConfig, newCfg *ClientConfig) err
 	if newCfg.KeyPath != cur.KeyPath {
 		return fmt.Errorf("%w: key path changed (expected %q, got %q)",
 			ErrSnapshotMismatch, cur.KeyPath, newCfg.KeyPath)
+	}
+	if !slices.Equal(newCfg.KeyPaths, cur.KeyPaths) {
+		return fmt.Errorf("%w: key paths changed (expected %v, got %v)",
+			ErrSnapshotMismatch, cur.KeyPaths, newCfg.KeyPaths)
+	}
+	if !slices.Equal(newCfg.Options.IdentityFiles(), cur.Options.IdentityFiles()) {
+		return fmt.Errorf("%w: identity files changed", ErrSnapshotMismatch)
+	}
+	if newCfg.Options.AddressFamily() != cur.Options.AddressFamily() {
+		return fmt.Errorf("%w: address family changed (expected %q, got %q)",
+			ErrSnapshotMismatch, cur.Options.AddressFamily(), newCfg.Options.AddressFamily())
 	}
 	expectedJump := cur.ProxyJump
 	if cur.HasOriginalProxyJump {

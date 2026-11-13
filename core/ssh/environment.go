@@ -36,6 +36,19 @@ type HostKeyAlgorithmSource interface {
 	HostKeyAlgorithms(context.Context, HostKeyRequest) ([]string, error)
 }
 
+// SSHFPRecord represents a single DNS SSHFP resource record (RFC 4255 / RFC 6594 / RFC 7479).
+type SSHFPRecord struct {
+	Algorithm       uint8
+	FingerprintType uint8
+	Fingerprint     []byte
+}
+
+// SSHFPResult holds DNS SSHFP lookup records alongside their DNSSEC authentication state.
+type SSHFPResult struct {
+	Records       []SSHFPRecord
+	Authenticated bool
+}
+
 // Environment supplies explicitly selected local resources. The core never
 // discovers a home directory, SSH_AUTH_SOCK, or process standard streams.
 // Slices are copied by WithEnvironment; callbacks must be concurrency-safe.
@@ -55,15 +68,50 @@ type Environment struct {
 	LocalHost string
 	LocalUID  string
 	LookupEnv func(string) (string, bool)
+
+	// GlobalKnownHostsFiles lists read-only system-wide known_hosts paths.
+	GlobalKnownHostsFiles []string
+	// Environ returns a snapshot of host environment variables ("KEY=VALUE") for SendEnv matching.
+	Environ func() []string
+	// DialAgent connects to a local SSH agent (Unix socket or Windows Named Pipe).
+	DialAgent func(ctx context.Context, socket string) (net.Conn, error)
+	// DialProxyCommand executes ProxyCommand and bridges its stdio as a bounded net.Conn; nil fails closed.
+	DialProxyCommand func(ctx context.Context, command string) (net.Conn, error)
+	// RunLocalCommand executes a foreground LocalCommand; nil fails closed.
+	RunLocalCommand func(ctx context.Context, command string) error
+	// LookupSSHFP performs bounded DNS SSHFP queries; nil treats no records as available.
+	LookupSSHFP func(ctx context.Context, hostname string) (SSHFPResult, error)
 }
 
 func WithEnvironment(environment Environment) Option {
 	environment.DefaultKeyPaths = slices.Clone(environment.DefaultKeyPaths)
+	environment.GlobalKnownHostsFiles = slices.Clone(environment.GlobalKnownHostsFiles)
+	if nilCapability(environment.ResolveKeyPath) {
+		environment.ResolveKeyPath = nil
+	}
 	if nilCapability(environment.InputBridge) {
 		environment.InputBridge = nil
 	}
 	if nilCapability(environment.TunnelOpener) {
 		environment.TunnelOpener = nil
+	}
+	if nilCapability(environment.LookupEnv) {
+		environment.LookupEnv = nil
+	}
+	if nilCapability(environment.Environ) {
+		environment.Environ = nil
+	}
+	if nilCapability(environment.DialAgent) {
+		environment.DialAgent = nil
+	}
+	if nilCapability(environment.DialProxyCommand) {
+		environment.DialProxyCommand = nil
+	}
+	if nilCapability(environment.RunLocalCommand) {
+		environment.RunLocalCommand = nil
+	}
+	if nilCapability(environment.LookupSSHFP) {
+		environment.LookupSSHFP = nil
 	}
 	return func(c *Connector) {
 		c.environment = environment

@@ -86,6 +86,8 @@ type MuxServerOptions struct {
 	InitialActiveSessions  int32         // Initial active session count (e.g. 1 for foreground master)
 	Target                 TargetContext // Optional target identity advertised via target@xops hello extension
 	GatewayPorts           bool
+	GatewayPortsMode       string
+	DialNetwork            string
 	StreamLocalBindUnlink  bool
 	StreamLocalBindMask    uint32
 	HasStreamLocalBindMask bool
@@ -103,6 +105,8 @@ type MuxServer struct {
 	rootConn          net.Conn
 
 	gatewayPorts          bool
+	gatewayPortsMode      string
+	dialNetwork           string
 	streamLocalBindUnlink bool
 	streamLocalBindMask   uint32
 
@@ -178,6 +182,8 @@ func NewMuxServer(opts MuxServerOptions) (*MuxServer, error) {
 		confirmSession:        opts.ConfirmSession,
 		target:                opts.Target,
 		gatewayPorts:          opts.GatewayPorts,
+		gatewayPortsMode:      opts.GatewayPortsMode,
+		dialNetwork:           normalizeTCPDialNetwork(opts.DialNetwork),
 		streamLocalBindUnlink: opts.StreamLocalBindUnlink,
 		streamLocalBindMask:   mask,
 	}
@@ -225,6 +231,8 @@ type MuxMasterOptions struct {
 	// forwarding requests on an ask/autoask master. Nil rejects them.
 	ConfirmSession         func(action string) bool
 	GatewayPorts           bool
+	GatewayPortsMode       string
+	DialNetwork            string
 	StreamLocalBindUnlink  bool
 	StreamLocalBindMask    uint32
 	HasStreamLocalBindMask bool
@@ -270,6 +278,8 @@ func StartMuxServer(ctx context.Context, sshClient *cryptoSSH.Client, opts MuxMa
 		AskConfirmation:        askConfirmation,
 		ConfirmSession:         opts.ConfirmSession,
 		GatewayPorts:           opts.GatewayPorts,
+		GatewayPortsMode:       opts.GatewayPortsMode,
+		DialNetwork:            opts.DialNetwork,
 		StreamLocalBindUnlink:  opts.StreamLocalBindUnlink,
 		StreamLocalBindMask:    opts.StreamLocalBindMask,
 		HasStreamLocalBindMask: opts.HasStreamLocalBindMask,
@@ -800,6 +810,36 @@ func normalizeMuxForwardHost(host string, port uint32) string {
 	return trimmed
 }
 
+func (s *MuxServer) effectiveDialNetwork() string {
+	if s == nil {
+		return "tcp"
+	}
+	return normalizeTCPDialNetwork(s.dialNetwork)
+}
+
+func (s *MuxServer) effectiveGatewayPortsMode() string {
+	if s == nil {
+		return ""
+	}
+	switch strings.ToLower(strings.TrimSpace(s.gatewayPortsMode)) {
+	case GatewayPortsYes:
+		return GatewayPortsYes
+	case GatewayPortsClientSpecified:
+		return GatewayPortsClientSpecified
+	case GatewayPortsNo:
+		return GatewayPortsNo
+	default:
+		if s.gatewayPorts {
+			return GatewayPortsYes
+		}
+		return ""
+	}
+}
+
+func isTCPNetwork(network string) bool {
+	return network == "tcp" || network == "tcp4" || network == "tcp6"
+}
+
 func (s *MuxServer) resolveMuxForwardListen(fwdType uint32, listenHost string, listenPort uint32) (network, listenAddr, keyHost string, err error) {
 	if listenPort == MUX_SPECIAL_PORT_UNIX {
 		if strings.TrimSpace(listenHost) == "" {
@@ -807,28 +847,39 @@ func (s *MuxServer) resolveMuxForwardListen(fwdType uint32, listenHost string, l
 		}
 		return "unix", listenHost, listenHost, nil
 	}
+	dialNet := s.effectiveDialNetwork()
 	trimmed := normalizeMuxForwardHost(listenHost, listenPort)
 	portStr := strconv.Itoa(int(listenPort))
 	switch fwdType {
 	case MUX_FWD_LOCAL, MUX_FWD_DYNAMIC:
 		if trimmed == "*" {
-			return "tcp", ":" + portStr, "*", nil
+			return dialNet, ":" + portStr, "*", nil
 		}
 		if trimmed == "" {
-			if s.gatewayPorts {
-				return "tcp", ":" + portStr, "*", nil
+			if s.gatewayPorts || s.effectiveGatewayPortsMode() == GatewayPortsYes {
+				return dialNet, ":" + portStr, "*", nil
 			}
-			return "tcp", net.JoinHostPort("127.0.0.1", portStr), "127.0.0.1", nil
+			return dialNet, net.JoinHostPort("127.0.0.1", portStr), "127.0.0.1", nil
 		}
-		return "tcp", net.JoinHostPort(trimmed, portStr), trimmed, nil
+		return dialNet, net.JoinHostPort(trimmed, portStr), trimmed, nil
 	case MUX_FWD_REMOTE:
-		if trimmed == "*" {
-			return "tcp", ":" + portStr, "*", nil
+		switch s.effectiveGatewayPortsMode() {
+		case GatewayPortsYes:
+			return dialNet, ":" + portStr, "*", nil
+		case GatewayPortsNo:
+			if trimmed == "" || trimmed == "*" {
+				return dialNet, net.JoinHostPort("localhost", portStr), "localhost", nil
+			}
+			return dialNet, net.JoinHostPort(trimmed, portStr), trimmed, nil
+		default: // GatewayPortsClientSpecified or unset ("")
+			if trimmed == "*" {
+				return dialNet, ":" + portStr, "*", nil
+			}
+			if trimmed == "" {
+				return dialNet, net.JoinHostPort("localhost", portStr), "localhost", nil
+			}
+			return dialNet, net.JoinHostPort(trimmed, portStr), trimmed, nil
 		}
-		if trimmed == "" {
-			return "tcp", net.JoinHostPort("localhost", portStr), "localhost", nil
-		}
-		return "tcp", net.JoinHostPort(trimmed, portStr), trimmed, nil
 	default:
 		return "", "", "", fmt.Errorf("unsupported forward type %d", fwdType)
 	}
@@ -1019,7 +1070,7 @@ func (s *MuxServer) handleOpenFwd(conn net.Conn, req MuxFwdRequest) error {
 			ln, err = listenLocalStreamLocal(s.baseContext(), listenAddr, s.streamLocalBindMask, s.streamLocalBindUnlink)
 		} else {
 			var lc net.ListenConfig
-			ln, err = lc.Listen(s.baseContext(), "tcp", listenAddr)
+			ln, err = lc.Listen(s.baseContext(), network, listenAddr)
 		}
 		if err != nil {
 			return sendFailure(conn, req.RequestID, fmt.Sprintf("bind local port %s failed: %v", listenAddr, err))
@@ -1053,7 +1104,7 @@ func (s *MuxServer) handleOpenFwd(conn net.Conn, req MuxFwdRequest) error {
 			ln, err = listenLocalStreamLocal(s.baseContext(), listenAddr, s.streamLocalBindMask, s.streamLocalBindUnlink)
 		} else {
 			var lc net.ListenConfig
-			ln, err = lc.Listen(s.baseContext(), "tcp", listenAddr)
+			ln, err = lc.Listen(s.baseContext(), network, listenAddr)
 		}
 		if err != nil {
 			return sendFailure(conn, req.RequestID, fmt.Sprintf("bind dynamic port %s failed: %v", listenAddr, err))
@@ -1090,13 +1141,13 @@ func (s *MuxServer) openRemoteForward(conn net.Conn, req MuxFwdRequest, network,
 	}
 	key := forwardKey(req.FwdType, keyHost, req.ListenPort, normConnectHost, req.ConnectPort)
 	var allocatedPort uint32
-	if network == "tcp" && req.ListenPort == 0 {
+	if isTCPNetwork(network) && req.ListenPort == 0 {
 		allocatedPort = extractAllocatedPort(ln.Addr())
 		if allocatedPort > 0 {
 			key = forwardKey(req.FwdType, keyHost, allocatedPort, normConnectHost, req.ConnectPort)
 		}
 	}
-	dynamicAlloc := network == "tcp" && req.ListenPort == 0 && allocatedPort > 0
+	dynamicAlloc := isTCPNetwork(network) && req.ListenPort == 0 && allocatedPort > 0
 	entry, duplicate, shuttingDown := s.publishForward(key, &muxForwardEntry{
 		closer:       ln,
 		fwdType:      req.FwdType,
@@ -1199,12 +1250,13 @@ func (s *MuxServer) serveLocalForward(ln net.Listener, connectHost string, conne
 			}()
 			var remote net.Conn
 			var dialErr error
+			dialNet := s.effectiveDialNetwork()
 			if len(connectPort) > 0 && connectPort[0] == MUX_SPECIAL_PORT_UNIX {
 				remote, dialErr = s.dialSSHMux(s.baseContext(), "unix", connectHost)
 			} else if len(connectPort) > 0 {
-				remote, dialErr = s.dialSSHMux(s.baseContext(), "tcp", net.JoinHostPort(connectHost, strconv.Itoa(int(connectPort[0]))))
+				remote, dialErr = s.dialSSHMux(s.baseContext(), dialNet, net.JoinHostPort(connectHost, strconv.Itoa(int(connectPort[0]))))
 			} else {
-				remote, dialErr = s.dialSSHMux(s.baseContext(), "tcp", connectHost)
+				remote, dialErr = s.dialSSHMux(s.baseContext(), dialNet, connectHost)
 			}
 			if dialErr != nil {
 				return
@@ -1239,6 +1291,7 @@ func (s *MuxServer) serveRemoteForward(ln net.Listener, connectHost string, conn
 				s.removeActiveForwardStream()
 			}()
 
+			dialNet := s.effectiveDialNetwork()
 			if isDynamic {
 				var dialedLocal net.Conn
 				defer func() {
@@ -1248,7 +1301,7 @@ func (s *MuxServer) serveRemoteForward(ln net.Listener, connectHost string, conn
 				}()
 				_ = serveSocksConn(s.baseContext(), remote, func(ctx context.Context, destAddr string) (net.Conn, error) {
 					dialer := net.Dialer{Timeout: 5 * time.Second}
-					local, err := dialer.DialContext(ctx, "tcp", destAddr)
+					local, err := dialer.DialContext(ctx, dialNet, destAddr)
 					if err != nil {
 						return nil, err
 					}
@@ -1269,7 +1322,7 @@ func (s *MuxServer) serveRemoteForward(ln net.Listener, connectHost string, conn
 				local, dialErr = dialer.DialContext(s.baseContext(), "unix", connectHost)
 			} else {
 				localAddr := net.JoinHostPort(connectHost, strconv.Itoa(int(connectPort)))
-				local, dialErr = dialer.DialContext(s.baseContext(), "tcp", localAddr)
+				local, dialErr = dialer.DialContext(s.baseContext(), dialNet, localAddr)
 			}
 			if dialErr != nil {
 				return
@@ -1315,8 +1368,9 @@ func (s *MuxServer) serveDynamicConn(conn net.Conn) {
 			s.untrackStream(dialedRemote)
 		}
 	}()
+	dialNet := s.effectiveDialNetwork()
 	_ = serveSocksConn(s.baseContext(), conn, func(ctx context.Context, destAddr string) (net.Conn, error) {
-		remoteConn, err := s.dialSSHMux(ctx, "tcp", destAddr)
+		remoteConn, err := s.dialSSHMux(ctx, dialNet, destAddr)
 		if err != nil {
 			return nil, err
 		}
@@ -1360,7 +1414,7 @@ func (s *MuxServer) handleCloseFwd(conn net.Conn, req MuxFwdRequest) error {
 
 	s.idleMu.Lock()
 	val, ok := s.forwards.Load(matchedKey)
-	if !ok && req.FwdType == MUX_FWD_REMOTE && req.ListenPort == 0 && network == "tcp" {
+	if !ok && req.FwdType == MUX_FWD_REMOTE && req.ListenPort == 0 && isTCPNetwork(network) {
 		s.forwards.Range(func(k, v any) bool {
 			ks, isStr := k.(string)
 			entry, isEntry := v.(*muxForwardEntry)

@@ -202,7 +202,10 @@ func resolveControlContext(ctx context.Context, o *SshOptions, stderr io.Writer)
 		}
 	}
 
-	provider, providerErr := loadReadOnlyControlProvider()
+	provider, providerErr := loadControlProviderWithOverride(o)
+	if providerErr != nil && o != nil && o.control.ConfigFile != "" {
+		return "", ssh.TargetContext{}, nil, "", controlError(stderr, fmt.Sprintf("%s: %v", i18n.T("ssh_err_load_config"), providerErr))
+	}
 	nodeID := ""
 	connTarget := effectiveConnectionTarget(o, "")
 	if provider != nil && strings.TrimSpace(connTarget.Selector) != "" {
@@ -263,6 +266,18 @@ func setProviderOpenSSHAlias(provider config.ConfigProvider, nodeID, alias strin
 	if p, ok := provider.(interface{ SetNodeOpenSSHAlias(string, string) }); ok {
 		p.SetNodeOpenSSHAlias(nodeID, alias)
 	}
+}
+
+func loadControlProviderWithOverride(o *SshOptions) (config.ConfigProvider, error) {
+	provider, err := loadReadOnlyControlProvider()
+	if provider != nil && o != nil && o.control.ConfigFile != "" {
+		overrideProvider, overrideErr := config.WithOpenSSHConfigOverride(provider, o.control.ConfigFile)
+		if overrideErr != nil {
+			return nil, overrideErr
+		}
+		return overrideProvider, nil
+	}
+	return provider, err
 }
 
 // loadReadOnlyControlProvider loads the local configuration as a read-only view.

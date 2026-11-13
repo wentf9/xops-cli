@@ -9,7 +9,9 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,6 +33,19 @@ func dialSSHAgent(ctx context.Context, socket string) (net.Conn, error) {
 		return nil, fmt.Errorf("dial ssh-agent socket %q failed: %w", socket, err)
 	}
 	return conn, nil
+}
+
+func dialAgentConn(ctx context.Context, dialFn func(context.Context, string) (net.Conn, error), socket string) (net.Conn, error) {
+	if dialFn != nil {
+		if ctx == nil {
+			return nil, fmt.Errorf("ssh-agent dial context is nil")
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return dialFn(ctx, socket)
+	}
+	return dialSSHAgent(ctx, socket)
 }
 
 // AuthMethod 定义获取 SSH 认证方法的接口
@@ -417,8 +432,11 @@ func resolveKeyAuthMethod(keyPath string, secProvider *autoSecretProvider, passp
 // AutoAuthOptions 封装 auto 认证的完整上下文选项。
 type AutoAuthOptions struct {
 	AgentSocket               string
+	DialAgent                 func(ctx context.Context, socket string) (net.Conn, error)
 	DefaultKeyPaths           []string
 	ResolveKeyPath            func(string) string
+	Environment               Environment
+	Target                    TargetContext
 	LifecycleCtx              context.Context
 	NodeID                    string
 	User                      string
@@ -432,6 +450,7 @@ type AutoAuthOptions struct {
 	FailClosed                func(error)
 	RecoveryPrompter          SecretPrompter
 	KeyPath                   string
+	KeyPaths                  []string
 	PasswordCallback          func(string)
 	PassphraseCallback        func(keyPath, passphrase string)
 	CandidateRejectedCallback func(protocol string)
@@ -643,6 +662,221 @@ func buildAutoAuthPlan(ctx context.Context, opts AutoAuthOptions, first ...ssh.A
 	}
 }
 
+func expandIdentityKeyPath(rawPath string, env Environment, target TargetContext, resolve func(string) string) (string, error) {
+	trimmed := strings.TrimSpace(rawPath)
+	if trimmed == "" || strings.EqualFold(trimmed, "none") {
+		return "", nil
+	}
+	path := trimmed
+	if strings.Contains(path, "${") {
+		var err error
+		path, err = expandEnvironmentVariables(path, env)
+		if err != nil {
+			return "", err
+		}
+	}
+	if strings.HasPrefix(path, "~") {
+		if env.HomeDir != "" {
+			var err error
+			path, err = expandTilde(path, env.HomeDir)
+			if err != nil {
+				return "", err
+			}
+		} else if resolve != nil {
+			path = resolve(path)
+		} else {
+			return "", errors.New("cannot expand '~': home directory is not set")
+		}
+	}
+	if strings.Contains(path, "%") {
+		var err error
+		path, err = expandPercentTokens(path, env, target)
+		if err != nil {
+			return "", err
+		}
+	}
+	path = resolveKeyPath(path, resolve)
+	if path == "" || strings.EqualFold(path, "none") {
+		return "", nil
+	}
+	return filepath.Clean(filepath.FromSlash(path)), nil
+}
+
+func collectExplicitKeyCandidates(
+	keyPaths []string,
+	keyPath string,
+	sshOpts *Options,
+	env Environment,
+	target TargetContext,
+	resolve func(string) string,
+	l logger.DebugLogger,
+) ([]string, bool) {
+	if l == nil {
+		l = logger.NopLogger
+	}
+	var rawEntries []string
+	rawEntries = append(rawEntries, keyPaths...)
+	if strings.TrimSpace(keyPath) != "" {
+		rawEntries = append(rawEntries, keyPath)
+	}
+	rawEntries = append(rawEntries, sshOpts.IdentityFiles()...)
+
+	var paths []string
+	seen := make(map[string]struct{}, len(rawEntries))
+	hasExplicit := false
+	for _, raw := range rawEntries {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			continue
+		}
+		hasExplicit = true
+		if strings.EqualFold(trimmed, "none") {
+			continue
+		}
+		expanded, err := expandIdentityKeyPath(trimmed, env, target, resolve)
+		if err != nil {
+			l.Debugf("Failed to expand identity key path %q: %v", raw, err)
+			continue
+		}
+		if expanded == "" {
+			continue
+		}
+		if _, exists := seen[expanded]; exists {
+			continue
+		}
+		seen[expanded] = struct{}{}
+		paths = append(paths, expanded)
+	}
+	return paths, hasExplicit
+}
+
+func extractIdentityPublicKey(keyPath string) ssh.PublicKey {
+	if keyPath == "" {
+		return nil
+	}
+	if keyData, err := os.ReadFile(keyPath); err == nil {
+		if signer, parseErr := ssh.ParsePrivateKey(keyData); parseErr == nil {
+			return signer.PublicKey()
+		}
+		if pub, _, _, _, parseErr := ssh.ParseAuthorizedKey(keyData); parseErr == nil {
+			return pub
+		}
+		if pub, parseErr := parseOpenSSHPublicKeyFromEncryptedPrivate(keyData); parseErr == nil {
+			return pub
+		}
+	}
+	if pubData, err := os.ReadFile(keyPath + ".pub"); err == nil {
+		if pub, _, _, _, parseErr := ssh.ParseAuthorizedKey(pubData); parseErr == nil {
+			return pub
+		}
+	}
+	return nil
+}
+
+func effectiveAuthTargetContext(opts AutoAuthOptions) TargetContext {
+	target := opts.Target
+	if target.Host == "" {
+		target.Host = opts.Host
+	}
+	if target.Port <= 0 {
+		target.Port = opts.Port
+	}
+	if target.User == "" {
+		target.User = opts.User
+	}
+	if target.OriginalHost == "" {
+		target.OriginalHost = opts.NodeID
+	}
+	return target
+}
+
+func dialAgentSignersByPubKey(
+	ctx context.Context,
+	dialFn func(context.Context, string) (net.Conn, error),
+	socket string,
+	l logger.DebugLogger,
+) (map[string]ssh.Signer, func()) {
+	if socket == "" {
+		return nil, nil
+	}
+	conn, err := dialAgentConn(ctx, dialFn, socket)
+	if err != nil {
+		l.Debugf("connect to ssh-agent failed: %v", err)
+		return nil, nil
+	}
+	cleanup := func() { debugCloseResource(l, conn, "ssh agent connection") }
+	signers, signersErr := agent.NewClient(conn).Signers()
+	if signersErr != nil {
+		l.Debugf("list ssh-agent signers failed: %v", signersErr)
+		return nil, cleanup
+	}
+	agentByPub := make(map[string]ssh.Signer, len(signers))
+	for _, s := range signers {
+		pubKeyBytes := string(s.PublicKey().Marshal())
+		if _, exists := agentByPub[pubKeyBytes]; !exists {
+			agentByPub[pubKeyBytes] = s
+		}
+	}
+	return agentByPub, cleanup
+}
+
+func expandDefaultIdentityPaths(opts AutoAuthOptions, target TargetContext, l logger.DebugLogger) []string {
+	var defaults []string
+	for _, raw := range opts.DefaultKeyPaths {
+		expanded, err := expandIdentityKeyPath(raw, opts.Environment, target, opts.ResolveKeyPath)
+		if err != nil {
+			l.Debugf("Failed to expand default key path %q: %v", raw, err)
+			continue
+		}
+		if expanded != "" {
+			defaults = append(defaults, expanded)
+		}
+	}
+	return defaults
+}
+
+func appendExpandedKeyCandidate(
+	pubkeyCandidates []autoAuthCandidate,
+	seenKeyPaths map[string]struct{},
+	keyPath string,
+	label string,
+	secProvider *autoSecretProvider,
+	passphraseCallback func(string, string),
+	rejectPublicKey func(),
+	l logger.DebugLogger,
+) []autoAuthCandidate {
+	if keyPath == "" {
+		return pubkeyCandidates
+	}
+	if _, seen := seenKeyPaths[keyPath]; seen {
+		return pubkeyCandidates
+	}
+	seenKeyPaths[keyPath] = struct{}{}
+
+	l.Debugf("Checking SSH key: %s", keyPath)
+	if _, err := os.Stat(keyPath); err != nil {
+		if os.IsNotExist(err) {
+			l.Debugf("Key file does not exist: %s", keyPath)
+		} else {
+			l.Debugf("Failed to stat key: %s, error: %v", keyPath, err)
+		}
+		return pubkeyCandidates
+	}
+
+	method, err := resolveKeyAuthMethod(keyPath, secProvider, passphraseCallback, l)
+	if err != nil {
+		l.Debugf("Failed to resolve key: %s, error: %v", keyPath, err)
+		return pubkeyCandidates
+	}
+
+	return append(pubkeyCandidates, autoAuthCandidate{
+		protocol:   autoAuthProtocolPublicKey,
+		label:      label + ": " + keyPath,
+		method:     method,
+		onRejected: rejectPublicKey,
+	})
+}
+
 func buildAutoPubkeyCandidates(
 	ctx context.Context,
 	opts AutoAuthOptions,
@@ -658,68 +892,107 @@ func buildAutoPubkeyCandidates(
 		pubkeyCandidates = append(pubkeyCandidates, autoAuthCandidate{protocol: autoAuthProtocolPublicKey, label: "explicit signer", method: method, onRejected: rejectPublicKey})
 	}
 	seenKeyPaths := make(map[string]struct{})
-
-	addKey := func(path, label string) {
-		keyPath := resolveKeyPath(path, opts.ResolveKeyPath)
-		if keyPath == "" {
-			return
-		}
-		if _, seen := seenKeyPaths[keyPath]; seen {
-			return
-		}
-		seenKeyPaths[keyPath] = struct{}{}
-
-		l.Debugf("Checking SSH key: %s", keyPath)
-		if _, err := os.Stat(keyPath); err != nil {
-			if os.IsNotExist(err) {
-				l.Debugf("Key file does not exist: %s", keyPath)
-			} else {
-				l.Debugf("Failed to stat key: %s, error: %v", keyPath, err)
-			}
-			return
-		}
-
-		method, err := resolveKeyAuthMethod(keyPath, secProvider, opts.PassphraseCallback, l)
-		if err != nil {
-			l.Debugf("Failed to resolve key: %s, error: %v", keyPath, err)
-			return
-		}
-
-		pubkeyCandidates = append(pubkeyCandidates, autoAuthCandidate{
-			protocol:   autoAuthProtocolPublicKey,
-			label:      label + ": " + keyPath,
-			method:     method,
-			onRejected: rejectPublicKey,
-		})
+	target := effectiveAuthTargetContext(opts)
+	dialAgentFn := opts.DialAgent
+	if dialAgentFn == nil {
+		dialAgentFn = opts.Environment.DialAgent
 	}
 
-	hasExplicitIdentity := len(first) > 0 || opts.KeyPath != ""
+	explicitPaths, hasExplicit := collectExplicitKeyCandidates(
+		opts.KeyPaths,
+		opts.KeyPath,
+		opts.SSHOptions,
+		opts.Environment,
+		target,
+		opts.ResolveKeyPath,
+		l,
+	)
+	hasExplicitIdentity := len(first) > 0 || hasExplicit
+
+	if identitiesOnly {
+		return buildIdentitiesOnlyPubkeyCandidates(
+			ctx,
+			opts,
+			target,
+			dialAgentFn,
+			explicitPaths,
+			hasExplicitIdentity,
+			pubkeyCandidates,
+			seenKeyPaths,
+			secProvider,
+			rejectPublicKey,
+			l,
+		)
+	}
+
 	// 显式身份必须优先于任何自动发现来源。
-	if opts.KeyPath != "" {
-		addKey(opts.KeyPath, "explicit key")
+	for _, keyPath := range explicitPaths {
+		pubkeyCandidates = appendExpandedKeyCandidate(pubkeyCandidates, seenKeyPaths, keyPath, "explicit key", secProvider, opts.PassphraseCallback, rejectPublicKey, l)
 	}
 
-	if !identitiesOnly {
-		if socket := opts.AgentSocket; socket != "" {
-			conn, err := dialSSHAgent(ctx, socket)
-			if err == nil {
-				agentClient := agent.NewClient(conn)
-				pubkeyCandidates = append(pubkeyCandidates, autoAuthCandidate{
-					protocol: autoAuthProtocolPublicKey,
-					label:    "ssh-agent",
-					method:   ssh.PublicKeysCallback(agentClient.Signers),
-				})
-				cleanup = func() { debugCloseResource(l, conn, "ssh agent connection") }
-			} else {
-				l.Debugf("connect to ssh-agent failed: %v", err)
+	if socket := opts.AgentSocket; socket != "" {
+		conn, err := dialAgentConn(ctx, dialAgentFn, socket)
+		if err == nil {
+			agentClient := agent.NewClient(conn)
+			pubkeyCandidates = append(pubkeyCandidates, autoAuthCandidate{
+				protocol: autoAuthProtocolPublicKey,
+				label:    "ssh-agent",
+				method:   ssh.PublicKeysCallback(agentClient.Signers),
+			})
+			cleanup = func() { debugCloseResource(l, conn, "ssh agent connection") }
+		} else {
+			l.Debugf("connect to ssh-agent failed: %v", err)
+		}
+	}
+
+	for _, keyPath := range expandDefaultIdentityPaths(opts, target, l) {
+		pubkeyCandidates = appendExpandedKeyCandidate(pubkeyCandidates, seenKeyPaths, keyPath, "default key", secProvider, opts.PassphraseCallback, rejectPublicKey, l)
+	}
+	return pubkeyCandidates, cleanup
+}
+
+func buildIdentitiesOnlyPubkeyCandidates(
+	ctx context.Context,
+	opts AutoAuthOptions,
+	target TargetContext,
+	dialAgentFn func(context.Context, string) (net.Conn, error),
+	explicitPaths []string,
+	hasExplicitIdentity bool,
+	pubkeyCandidates []autoAuthCandidate,
+	seenKeyPaths map[string]struct{},
+	secProvider *autoSecretProvider,
+	rejectPublicKey func(),
+	l logger.DebugLogger,
+) ([]autoAuthCandidate, func()) {
+	candidatePaths := explicitPaths
+	candidateLabel := "explicit key"
+	if !hasExplicitIdentity {
+		candidatePaths = expandDefaultIdentityPaths(opts, target, l)
+		candidateLabel = "default key"
+	}
+
+	var agentByPub map[string]ssh.Signer
+	var cleanup func()
+	if len(candidatePaths) > 0 {
+		agentByPub, cleanup = dialAgentSignersByPubKey(ctx, dialAgentFn, opts.AgentSocket, l)
+	}
+
+	for _, keyPath := range candidatePaths {
+		if pub := extractIdentityPublicKey(keyPath); len(agentByPub) > 0 && pub != nil {
+			if signer, ok := agentByPub[string(pub.Marshal())]; ok {
+				if _, seen := seenKeyPaths[keyPath]; !seen {
+					seenKeyPaths[keyPath] = struct{}{}
+					pubkeyCandidates = append(pubkeyCandidates, autoAuthCandidate{
+						protocol:   autoAuthProtocolPublicKey,
+						label:      candidateLabel + " (ssh-agent): " + keyPath,
+						method:     ssh.PublicKeys(signer),
+						onRejected: rejectPublicKey,
+					})
+				}
+				continue
 			}
 		}
-	}
-
-	if !identitiesOnly || !hasExplicitIdentity {
-		for _, path := range opts.DefaultKeyPaths {
-			addKey(path, "default key")
-		}
+		pubkeyCandidates = appendExpandedKeyCandidate(pubkeyCandidates, seenKeyPaths, keyPath, candidateLabel, secProvider, opts.PassphraseCallback, rejectPublicKey, l)
 	}
 	return pubkeyCandidates, cleanup
 }

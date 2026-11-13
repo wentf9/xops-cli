@@ -3,6 +3,8 @@ package config
 import (
 	"strings"
 	"testing"
+
+	"github.com/wentf9/xops-cli/core/ssh"
 )
 
 func TestParseOpenSSHHosts(t *testing.T) {
@@ -195,5 +197,46 @@ Host imported-node
 	}
 	if opts.Get("password_authentication") != "" || opts.Get("batch_mode") != "" {
 		t.Fatalf("expected auth options to be stripped on import, got %+v", opts)
+	}
+}
+
+func TestParseOpenSSHHosts_Gate3StripsNonMuxTransportClasses(t *testing.T) {
+	t.Parallel()
+
+	const input = `
+Host gate3-node
+    HostName 10.0.0.51
+    User deploy
+    AddressFamily inet6
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%C
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    GatewayPorts clientspecified
+    RequestTTY force
+    BatchMode yes
+    IdentityFile ~/.ssh/id_gate3
+`
+	hosts, err := ParseOpenSSHHosts(strings.NewReader(input), "local-user")
+	if err != nil {
+		t.Fatalf("ParseOpenSSHHosts() error = %v", err)
+	}
+	if len(hosts) != 1 {
+		t.Fatalf("expected 1 host, got %d", len(hosts))
+	}
+	opts := hosts[0].Node.SSHOptions
+	if opts == nil {
+		t.Fatal("expected imported SSHOptions to be non-nil")
+	}
+	if opts.AddressFamily() != "inet6" || opts.ControlMaster() != "auto" {
+		t.Fatalf("expected transport and mux options preserved, got %+v", opts)
+	}
+	for _, spec := range ssh.RegisteredOptionSpecs() {
+		switch spec.Class {
+		case ssh.OptionClassLocalExec, ssh.OptionClassTrust, ssh.OptionClassForward, ssh.OptionClassSession, ssh.OptionClassAuth:
+			if v := opts.Get(spec.CanonicalKey); v != "" {
+				t.Fatalf("Gate 3 violation: class %s key %s (%q) leaked into imported config.yaml", spec.Class, spec.CanonicalKey, v)
+			}
+		}
 	}
 }

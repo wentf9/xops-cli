@@ -42,6 +42,9 @@ func (s OperationSnapshot) Clone() OperationSnapshot {
 	for id, target := range s.Targets {
 		target.Info = cloneNode(target.Info)
 		target.Plan.Hops = slices.Clone(target.Plan.Hops)
+		for i := range target.Plan.Hops {
+			target.Plan.Hops[i] = target.Plan.Hops[i].Clone()
+		}
 		if target.Execution != nil {
 			target.Execution = target.Execution.Clone()
 		}

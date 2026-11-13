@@ -77,6 +77,14 @@ flag_ssh_option:
   other: "以配置文件格式传递配置选项 (Key=Value)"
 flag_ssh_control_command:
   other: "向运行中的主进程发送控制命令：check, exit, stop, forward, cancel, proxy, proxy-stream, conninfo, channels"
+flag_ssh_config_file:
+  other: "指定替代的 OpenSSH 配置文件路径，或指定 'none' 跳过 ~/.ssh/config"
+flag_ssh_cipher:
+  other: "指定用于加密会话的密码算法规范"
+flag_ipv4:
+  other: "强制仅使用 IPv4 地址"
+flag_ipv6:
+  other: "强制仅使用 IPv6 地址"
 ssh_err_background_requires_nocmd:
   other: "后台运行 (-f) 需要指定要执行的远程命令或配合 -N 使用"
 ssh_flag_stdio_forward:

@@ -20,6 +20,8 @@ func credentialVersion(provider config.ConfigProvider, plan ssh.ConnectionPlan) 
 	type dependency struct {
 		NodeID, IdentityRef  string
 		Identity             models.Identity
+		KeyPaths             []string
+		IdentityFiles        []string
 		SudoMode             models.SudoMode
 		SuPassword           string
 		PrivilegePasswordRef *credential.Ref
@@ -32,8 +34,16 @@ func credentialVersion(provider config.ConfigProvider, plan ssh.ConnectionPlan) 
 		if err != nil {
 			return "", fmt.Errorf("resolve MCP credential dependencies for %q: %w", hop.NodeID, err)
 		}
+		var identityFiles []string
+		if hop.Options != nil {
+			identityFiles = hop.Options.IdentityFiles()
+		}
+		if len(identityFiles) == 0 && snapshot.Node.SSHOptions != nil {
+			identityFiles = snapshot.Node.SSHOptions.IdentityFiles()
+		}
 		dependencies = append(dependencies, dependency{
 			NodeID: hop.NodeID, IdentityRef: snapshot.Node.IdentityRef, Identity: snapshot.Identity,
+			KeyPaths: append([]string(nil), hop.KeyPaths...), IdentityFiles: identityFiles,
 			SudoMode: snapshot.Node.SudoMode, SuPassword: snapshot.Node.SuPwd, PrivilegePasswordRef: snapshot.Node.PrivilegePasswordRef,
 		})
 		for _, ref := range hopCredentialRefs(snapshot) {

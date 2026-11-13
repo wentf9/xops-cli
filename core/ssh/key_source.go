@@ -102,6 +102,19 @@ func (c *Connector) buildOwnedAutoAuth(ctx context.Context, cfg *ClientConfig, o
 	if err != nil {
 		return autoAuthPlan{}, nil, err
 	}
+	if cfg.KeyPath != "" && len(options.KeyPaths) > 0 {
+		target := effectiveAuthTargetContext(options)
+		if sourcedExpanded, expErr := expandIdentityKeyPath(cfg.KeyPath, options.Environment, target, options.ResolveKeyPath); expErr == nil && sourcedExpanded != "" {
+			filtered := make([]string, 0, len(options.KeyPaths))
+			for _, p := range options.KeyPaths {
+				if pExp, pErr := expandIdentityKeyPath(p, options.Environment, target, options.ResolveKeyPath); pErr == nil && pExp == sourcedExpanded {
+					continue
+				}
+				filtered = append(filtered, p)
+			}
+			options.KeyPaths = filtered
+		}
+	}
 	options.KeyPath = ""
 	plan := buildAutoAuthPlan(ctx, options, method)
 	return plan, func() error {

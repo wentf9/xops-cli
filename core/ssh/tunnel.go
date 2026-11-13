@@ -7,7 +7,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"strconv"
 	"sync"
 	"time"
 )
@@ -123,13 +122,27 @@ func (f *Forward) Wait() error {
 	return f.err
 }
 
+func (c *Client) dialNetwork() string {
+	if c == nil {
+		return "tcp"
+	}
+	return c.ConnectionConfig().Options.DialNetwork()
+}
+
+func (c *Client) gatewayPortsMode() string {
+	if c == nil {
+		return ""
+	}
+	return c.ConnectionConfig().Options.GatewayPortsMode()
+}
+
 // LocalForward starts local port forwarding.
 // Listens on localAddr, forwards connections to remoteAddr via SSH.
 func (c *Client) LocalForward(ctx context.Context, localAddr, remoteAddr string, opts ...ForwardOption) (*Forward, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("local forward context is nil")
 	}
-	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", localAddr)
+	listener, err := (&net.ListenConfig{}).Listen(ctx, c.dialNetwork(), localAddr)
 	if err != nil {
 		c.observeForward("local", "listen failed", localAddr, remoteAddr)
 		return nil, fmt.Errorf("listen on local address %s failed: %w", localAddr, err)
@@ -141,7 +154,7 @@ func (c *Client) LocalForward(ctx context.Context, localAddr, remoteAddr string,
 
 func (c *Client) handleLocalForward(ctx context.Context, localConn net.Conn, remoteAddr string) (retErr error) {
 	defer joinResourceCloseError(&retErr, localConn, "local forwarding client connection")
-	remoteConn, err := c.dialSSH(ctx, "tcp", remoteAddr)
+	remoteConn, err := c.dialSSH(ctx, c.dialNetwork(), remoteAddr)
 	if err != nil {
 		return fmt.Errorf("dial local forwarding destination %s failed: %w", remoteAddr, err)
 	}
@@ -156,19 +169,20 @@ func (c *Client) LocalForwardEndpoint(ctx context.Context, bind ForwardEndpoint,
 		return nil, fmt.Errorf("local forward context is nil")
 	}
 	fopts := c.forwardOptions(opts...)
-	listenNet, listenAddr := bind.LocalListenAddress(gatewayPorts)
+	dialNet := c.dialNetwork()
+	listenNet, listenAddr := bind.LocalListenAddressWithNetwork(gatewayPorts, dialNet)
 	var listener net.Listener
 	var err error
 	if listenNet == "unix" {
 		listener, err = listenLocalStreamLocal(ctx, listenAddr, fopts.streamLocalBindMask, fopts.streamLocalBindUnlink)
 	} else {
-		listener, err = (&net.ListenConfig{}).Listen(ctx, "tcp", listenAddr)
+		listener, err = (&net.ListenConfig{}).Listen(ctx, listenNet, listenAddr)
 	}
 	if err != nil {
 		c.observeForward("local", "listen failed", listenAddr, dest.String())
 		return nil, fmt.Errorf("listen on local address %s failed: %w", listenAddr, err)
 	}
-	connectNet, connectAddr := dest.ConnectAddress()
+	connectNet, connectAddr := dest.ConnectAddressWithNetwork(dialNet)
 	return runForwardListener(ctx, listener, c.forwardDiagnostics(fopts, "local", listener, dest.String()), func(runCtx context.Context, conn net.Conn) error {
 		return c.observedForwardHandler("local", listener.Addr().String(), dest.String(), func() error {
 			return c.handleLocalForwardEndpoint(runCtx, conn, connectNet, connectAddr)
@@ -215,7 +229,7 @@ func (c *Client) remoteForward(ctx context.Context, remoteAddr, localAddr string
 	if ctx == nil {
 		return nil, fmt.Errorf("remote forward context is nil")
 	}
-	listener, err := c.listenRemoteContext(ctx, "tcp", remoteAddr, timeout)
+	listener, err := c.listenRemoteContext(ctx, c.dialNetwork(), remoteAddr, timeout)
 	if err != nil {
 		c.observeForward("remote", "listen failed", remoteAddr, localAddr)
 		return nil, fmt.Errorf("listen on remote address %s failed: %w", remoteAddr, err)
@@ -228,7 +242,7 @@ func (c *Client) remoteForward(ctx context.Context, remoteAddr, localAddr string
 func (c *Client) handleRemoteForward(ctx context.Context, remoteConn net.Conn, localAddr string) (retErr error) {
 	defer joinResourceCloseError(&retErr, remoteConn, "remote forwarding client connection")
 	dialer := net.Dialer{Timeout: 5 * time.Second}
-	localConn, err := dialer.DialContext(ctx, "tcp", localAddr)
+	localConn, err := dialer.DialContext(ctx, c.dialNetwork(), localAddr)
 	if err != nil {
 		return fmt.Errorf("dial remote forwarding destination %s failed: %w", localAddr, err)
 	}
@@ -244,7 +258,8 @@ func (c *Client) RemoteForwardEndpoint(ctx context.Context, spec ForwardSpec, op
 	if c.muxSocketPath != "" {
 		return c.remoteForwardViaMux(ctx, spec, opts...)
 	}
-	listenNet, listenAddr := spec.Bind.RemoteListenAddress()
+	dialNet := c.dialNetwork()
+	listenNet, listenAddr := spec.Bind.RemoteListenAddressForMode(c.gatewayPortsMode(), dialNet)
 	listener, err := c.listenRemoteContext(ctx, listenNet, listenAddr, remoteForwardRequestTimeout)
 	if err != nil {
 		c.observeForward("remote", "listen failed", listenAddr, spec.Dest.String())
@@ -256,12 +271,12 @@ func (c *Client) RemoteForwardEndpoint(ctx context.Context, spec ForwardSpec, op
 			return c.observedForwardHandler("remote", listener.Addr().String(), "dynamic", func() error {
 				return serveSocksConn(runCtx, conn, func(dCtx context.Context, destAddr string) (net.Conn, error) {
 					dialer := net.Dialer{Timeout: 5 * time.Second}
-					return dialer.DialContext(dCtx, "tcp", destAddr)
+					return dialer.DialContext(dCtx, dialNet, destAddr)
 				}, c.copyStream)
 			})
 		}), nil
 	}
-	connectNet, connectAddr := spec.Dest.ConnectAddress()
+	connectNet, connectAddr := spec.Dest.ConnectAddressWithNetwork(dialNet)
 	return runForwardListener(ctx, listener, c.forwardDiagnostics(fopts, "remote", listener, spec.Dest.String()), func(runCtx context.Context, conn net.Conn) error {
 		return c.observedForwardHandler("remote", listener.Addr().String(), spec.Dest.String(), func() error {
 			return c.handleRemoteForwardEndpoint(runCtx, conn, connectNet, connectAddr)
@@ -307,15 +322,10 @@ func (c *Client) remoteForwardViaMux(ctx context.Context, spec ForwardSpec, opts
 		if spec.Bind.Port == 0 && allocPort > 0 {
 			effPort = uint16(allocPort)
 		}
-		var hostForAddr string
-		if spec.Bind.Wildcard {
-			hostForAddr = ""
-		} else if !spec.Bind.HasHost {
-			hostForAddr = "localhost"
-		} else {
-			hostForAddr = spec.Bind.Host
-		}
-		addr = forwardTCPAddr{addr: net.JoinHostPort(hostForAddr, strconv.Itoa(int(effPort)))}
+		epCopy := spec.Bind
+		epCopy.Port = effPort
+		_, resolvedAddr := epCopy.RemoteListenAddressForMode(c.gatewayPortsMode(), c.dialNetwork())
+		addr = forwardTCPAddr{addr: resolvedAddr}
 	}
 
 	closeReq := req

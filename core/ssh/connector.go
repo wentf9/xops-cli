@@ -433,6 +433,7 @@ func (c *Connector) resolveConnectionPlan(ctx context.Context, nodeName string) 
 			return nil, fmt.Errorf("config for node '%s' is nil", current)
 		}
 		nodeCfg := *cfg
+		nodeCfg.KeyPaths = slices.Clone(cfg.KeyPaths)
 		if nodeCfg.Port <= 0 {
 			nodeCfg.Port = 22
 		}
@@ -463,6 +464,7 @@ func (c *Connector) resolveConnectionPlan(ctx context.Context, nodeName string) 
 					return nil, fmt.Errorf("config for proxy jump %q is nil", jumpName)
 				}
 				cloned := *jumpCfg
+				cloned.KeyPaths = slices.Clone(jumpCfg.KeyPaths)
 				if cloned.Port <= 0 {
 					cloned.Port = 22
 				}
@@ -717,6 +719,44 @@ func shouldRecordDiscoveredAuth(discoveredAuth bool, oldAuthToken string, cfg *C
 	return cfg.Password != "" || cfg.Passphrase != ""
 }
 
+func (c *Connector) recordAndSyncAuthAfterHandshake(
+	ctx context.Context,
+	nodeName string,
+	cfg *ClientConfig,
+	originalKeyPath string,
+	discoveredAuth bool,
+	rootConn net.Conn,
+) error {
+	oldAuthToken := cfg.AuthUpdateToken
+	hasAuthUpdate := shouldRecordDiscoveredAuth(discoveredAuth, oldAuthToken, cfg)
+	var committedAuthToken string
+	recordingFailed := false
+	if hasAuthUpdate {
+		var err error
+		committedAuthToken, err = c.recordAuthUpdate(ctx, nodeName, cfg, rootConn)
+		if errors.Is(err, errCredentialNotSaved) {
+			recordingFailed = true
+			hasAuthUpdate = false
+		} else if err != nil {
+			return err
+		}
+	}
+
+	if !hasAuthUpdate && !recordingFailed && oldAuthToken == "" {
+		cfg.KeyPath = originalKeyPath
+	}
+
+	if err := c.syncConnectionAfterRecording(nodeName, cfg, committedAuthToken, hasAuthUpdate, recordingFailed, originalKeyPath, rootConn); err != nil {
+		return err
+	}
+
+	if recordingFailed {
+		cfg.AuthUpdateToken = ""
+		cfg.SudoUpdateToken = ""
+	}
+	return nil
+}
+
 func (c *Connector) initializeConnection(ctx context.Context, planNode connectionPlanNode, dialer Dialer) (_ *Client, retErr error) {
 	nodeName := planNode.name
 	cfg := planNode.cfg
@@ -761,34 +801,8 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 		return nil, err
 	}
 
-	// 认证并连接成功后，检查我们是否通过 "auto" 下的终端交互获取到了新凭证（密码或密钥密码）。
-	oldAuthToken := cfg.AuthUpdateToken
-	hasAuthUpdate := shouldRecordDiscoveredAuth(discoveredAuth, oldAuthToken, cfg)
-	var committedAuthToken string
-	recordingFailed := false
-	if hasAuthUpdate {
-		var err error
-		committedAuthToken, err = c.recordAuthUpdate(ctx, nodeName, cfg, rootConn)
-		if errors.Is(err, errCredentialNotSaved) {
-			recordingFailed = true
-			hasAuthUpdate = false
-		} else if err != nil {
-			return nil, err
-		}
-	}
-
-	// [P1] 认证写回可能更新了 Repository 的认证版本（如 auto 认证交互记录了新密码/私钥密码），
-	// 必须从底层 provider 重新刷新 cfg 中的最新版本令牌并校验目标与版本推进兼容性。
-	if err := c.syncConnectionAfterRecording(nodeName, cfg, committedAuthToken, hasAuthUpdate, recordingFailed, originalKeyPath, rootConn); err != nil {
+	if err := c.recordAndSyncAuthAfterHandshake(ctx, nodeName, cfg, originalKeyPath, discoveredAuth, rootConn); err != nil {
 		return nil, err
-	}
-
-	if recordingFailed {
-		// The write may have applied without durable confirmation. Keep the
-		// authenticated connection, but never authorize subsequent writes using
-		// either stale tokens or an unrelated refreshed configuration version.
-		cfg.AuthUpdateToken = ""
-		cfg.SudoUpdateToken = ""
 	}
 
 	// 连接与凭证记录完成后，立即抹除单次握手使用的明文机密，防止敏感材料残留在池化 Client 中
@@ -1137,11 +1151,15 @@ func (c *Connector) maybeStartMasterListener(planNode connectionPlanNode, rawCli
 	}
 
 	var gatewayPorts bool
+	var gatewayPortsMode string
+	var dialNetwork string
 	var streamLocalBindUnlink bool
 	var streamLocalBindMask uint32
 	var hasStreamLocalBindMask bool
 	if planNode.cfg != nil && planNode.cfg.Options != nil {
 		gatewayPorts = planNode.cfg.Options.EffectiveGatewayPorts()
+		gatewayPortsMode = planNode.cfg.Options.GatewayPortsMode()
+		dialNetwork = planNode.cfg.Options.DialNetwork()
 		streamLocalBindUnlink = planNode.cfg.Options.EffectiveStreamLocalBindUnlink()
 		if mask, ok := planNode.cfg.Options.StreamLocalBindMask(); ok {
 			streamLocalBindMask = mask
@@ -1157,6 +1175,8 @@ func (c *Connector) maybeStartMasterListener(planNode connectionPlanNode, rawCli
 		InitialActiveSessions:  1,
 		ConfirmSession:         c.confirmSessionCallback(planNode.name, planNode.cfg),
 		GatewayPorts:           gatewayPorts,
+		GatewayPortsMode:       gatewayPortsMode,
+		DialNetwork:            dialNetwork,
 		StreamLocalBindUnlink:  streamLocalBindUnlink,
 		StreamLocalBindMask:    streamLocalBindMask,
 		HasStreamLocalBindMask: hasStreamLocalBindMask,
@@ -1625,7 +1645,7 @@ func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, cfg *
 	_, proxied := dialer.(*SSHProxyDialer)
 	event := logger.Diagnostic{Kind: logger.Connecting, NodeID: nodeName, Host: cfg.Address, User: cfg.User, Port: cfg.Port, Proxied: proxied}
 	logger.EmitDiagnostic(c.diagnostics, event)
-	conn, err := dialer.DialContext(ctx, "tcp", targetAddr)
+	conn, err := dialer.DialContext(ctx, cfg.Options.DialNetwork(), targetAddr)
 	if err != nil {
 		event.Kind = logger.HandshakeFailed
 		logger.EmitDiagnostic(c.diagnostics, event)
@@ -1883,18 +1903,190 @@ func (c *Connector) resolveKeyAuth(cfg *ClientConfig) (ssh.AuthMethod, error) {
 	return buildKeyAuthMethod(cfg, secret, c.environment.ResolveKeyPath)
 }
 
+func (c *Connector) authTargetContext(cfg *ClientConfig) TargetContext {
+	if cfg == nil {
+		return TargetContext{}
+	}
+	port := cfg.Port
+	if port <= 0 {
+		port = 22
+	}
+	user := cfg.User
+	if user == "" {
+		user = c.environment.LocalUser
+	}
+	return TargetContext{
+		Host:         cfg.Address,
+		Port:         port,
+		User:         user,
+		OriginalHost: cfg.NodeID,
+		JumpHost:     cfg.ProxyJump,
+	}
+}
+
+func (c *Connector) explicitKeyPaths(cfg *ClientConfig) ([]string, bool) {
+	if cfg == nil {
+		return nil, false
+	}
+	return collectExplicitKeyCandidates(
+		cfg.KeyPaths,
+		cfg.KeyPath,
+		cfg.Options,
+		c.environment,
+		c.authTargetContext(cfg),
+		c.environment.ResolveKeyPath,
+		c.getLogger(),
+	)
+}
+
 func (c *Connector) resolveAgentAuth(ctx context.Context) (ssh.AuthMethod, func(), error) {
 	socket := c.environment.AgentSocket
 	if socket == "" {
 		return nil, nil, ErrAgentNotAvailable
 	}
-	conn, err := dialSSHAgent(ctx, socket)
+	conn, err := dialAgentConn(ctx, c.environment.DialAgent, socket)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to connect to ssh-agent: %w", err)
 	}
 	agentClient := agent.NewClient(conn)
 	cleanup := func() { debugCloseResource(c.getLogger(), conn, "ssh agent connection") }
 	return ssh.PublicKeysCallback(agentClient.Signers), cleanup, nil
+}
+
+func (c *Connector) resolveFilteredAgentAuth(ctx context.Context, explicitPaths []string) ([]autoAuthCandidate, func(), error) {
+	socket := c.environment.AgentSocket
+	if socket == "" {
+		return nil, nil, ErrAgentNotAvailable
+	}
+	conn, err := dialAgentConn(ctx, c.environment.DialAgent, socket)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to connect to ssh-agent: %w", err)
+	}
+	cleanup := func() { debugCloseResource(c.getLogger(), conn, "ssh agent connection") }
+	signers, err := agent.NewClient(conn).Signers()
+	if err != nil {
+		cleanup()
+		return nil, nil, fmt.Errorf("list ssh-agent signers: %w", err)
+	}
+	agentByPub := make(map[string]ssh.Signer, len(signers))
+	for _, s := range signers {
+		pubKeyBytes := string(s.PublicKey().Marshal())
+		if _, exists := agentByPub[pubKeyBytes]; !exists {
+			agentByPub[pubKeyBytes] = s
+		}
+	}
+	var candidates []autoAuthCandidate
+	for _, keyPath := range explicitPaths {
+		pub := extractIdentityPublicKey(keyPath)
+		if pub == nil {
+			continue
+		}
+		if signer, ok := agentByPub[string(pub.Marshal())]; ok {
+			candidates = append(candidates, autoAuthCandidate{
+				protocol: autoAuthProtocolPublicKey,
+				label:    "ssh-agent (IdentitiesOnly): " + keyPath,
+				method:   ssh.PublicKeys(signer),
+			})
+		}
+	}
+	if len(candidates) == 0 {
+		cleanup()
+		return nil, nil, errors.New("no ssh-agent identity matches explicit identity files under IdentitiesOnly=yes")
+	}
+	return candidates, cleanup, nil
+}
+
+func (c *Connector) buildMultiKeyAuth(
+	authCtx context.Context,
+	cfg *ClientConfig,
+	explicitPaths []string,
+	policy authPolicy,
+	prompter SecretPrompter,
+	coordinator *handshakeCoordinator,
+	onAuthDiscovered func(),
+	observer logger.DiagnosticObserver,
+) (ssh.ClientAuthCallback, func() error, error) {
+	if len(explicitPaths) == 0 {
+		return nil, nil, ErrKeyPathRequired
+	}
+	var failClosed func(error)
+	if coordinator != nil {
+		failClosed = coordinator.FailClosed
+	}
+	basePrompter := c.getNodeSecretPrompter(cfg)
+	recovery := credentialRecoveryPrompter(basePrompter)
+	var activePrompter SecretPrompter = rejectInteraction{}
+	if recovery != nil {
+		activePrompter = prompter
+	}
+	resolver := &initialKeySecretResolver{value: []byte(cfg.Passphrase), next: c.secretResolver}
+	cfg.Passphrase = ""
+	cleanup := func() error {
+		resolver.mu.Lock()
+		defer resolver.mu.Unlock()
+		zeroBytes(resolver.value)
+		resolver.value = nil
+		return nil
+	}
+	provider := &autoSecretProvider{
+		lifecycleCtx:       authCtx,
+		nodeID:             cfg.NodeID,
+		user:               cfg.User,
+		host:               cfg.Address,
+		port:               cfg.Port,
+		versionToken:       cfg.AuthUpdateToken,
+		resolver:           resolver,
+		prompter:           activePrompter,
+		recoveryPrompter:   recovery,
+		handshakeTimeout:   c.getNodeHandshakeTimeout(cfg),
+		interactionTimeout: c.interactionTimeout,
+		failClosed:         failClosed,
+	}
+
+	var candidates []autoAuthCandidate
+	var firstErr error
+	for _, keyPath := range explicitPaths {
+		method, err := resolveKeyAuthMethod(keyPath, provider, func(path, passphrase string) {
+			if recovery != nil && passphrase != "" {
+				cfg.KeyPath = path
+				cfg.Passphrase = passphrase
+				cfg.Password = ""
+				if onAuthDiscovered != nil {
+					onAuthDiscovered()
+				}
+			}
+		}, c.getLogger())
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		candidates = append(candidates, autoAuthCandidate{
+			protocol: autoAuthProtocolPublicKey,
+			label:    "explicit key: " + keyPath,
+			method:   method,
+		})
+	}
+	if len(candidates) == 0 {
+		_ = cleanup()
+		if firstErr != nil {
+			return nil, nil, firstErr
+		}
+		return nil, nil, ErrKeyPathRequired
+	}
+	if policy.kbAllowed {
+		kbProvider := c.newAutoSecretProvider(authCtx, cfg, prompter, coordinator)
+		candidates = append(candidates, autoAuthCandidate{
+			protocol: autoAuthProtocolKeyboardInteractive,
+			label:    "keyboard-interactive",
+			method:   buildKeyboardInteractiveAuthMethod(kbProvider),
+			allow: func(ctx *ssh.ClientAuthContext) bool {
+				return len(ctx.PartialSuccessMethods) > 0
+			},
+		})
+	}
+	return newSequentialAuthCallbackWithPolicy(candidates, policy, provider, c.getLogger(), observer), cleanup, nil
 }
 
 // buildSSHConfig 根据 Identity 模型构建 ssh.ClientConfig
@@ -1935,8 +2127,11 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 		originalKeyPath := cfg.KeyPath
 		plan, release, err := c.buildOwnedAutoAuth(ctx, cfg, AutoAuthOptions{
 			AgentSocket:        c.environment.AgentSocket,
+			DialAgent:          c.environment.DialAgent,
 			DefaultKeyPaths:    c.environment.DefaultKeyPaths,
 			ResolveKeyPath:     c.environment.ResolveKeyPath,
+			Environment:        c.environment,
+			Target:             c.authTargetContext(cfg),
 			LifecycleCtx:       authCtx,
 			NodeID:             cfg.NodeID,
 			User:               cfg.User,
@@ -1950,6 +2145,7 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 			FailClosed:         failClosed,
 			RecoveryPrompter:   credentialRecoveryPrompter(basePrompter),
 			KeyPath:            cfg.KeyPath,
+			KeyPaths:           cfg.KeyPaths,
 			SSHOptions:         cfg.Options,
 			HostKeyChanged:     hostKeyChanged,
 			PasswordCallback: func(s string) {
@@ -2028,6 +2224,16 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 		if !pubkeyAllowed {
 			return nil, nil, errors.New("publickey authentication disabled by SSH options")
 		}
+		if c.keySource == nil && (len(cfg.KeyPaths) > 0 || len(cfg.Options.IdentityFiles()) > 0 || strings.ContainsAny(cfg.KeyPath, "%~$")) {
+			explicitPaths, _ := c.explicitKeyPaths(cfg)
+			cb, release, err := c.buildMultiKeyAuth(authCtx, cfg, explicitPaths, policy, prompter, coordinator, onAuthDiscovered, observer)
+			if err != nil {
+				return nil, nil, err
+			}
+			authCallback = cb
+			cleanup = release
+			break
+		}
 		method, release, err := c.keyAuth(authCtx, cfg, prompter, onAuthDiscovered)
 		if err != nil {
 			return nil, nil, err
@@ -2040,7 +2246,17 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 			return nil, nil, errors.New("publickey authentication disabled by SSH options")
 		}
 		if policy.identitiesOnly {
-			return nil, nil, errors.New("ssh-agent authentication disabled by IdentitiesOnly=yes")
+			explicitPaths, _ := c.explicitKeyPaths(cfg)
+			if len(explicitPaths) == 0 {
+				return nil, nil, errors.New("ssh-agent authentication disabled by IdentitiesOnly=yes")
+			}
+			candidates, agentCleanup, err := c.resolveFilteredAgentAuth(ctx, explicitPaths)
+			if err != nil {
+				return nil, nil, err
+			}
+			authCallback = newSequentialAuthCallbackWithPolicy(candidates, policy, c.newAutoSecretProvider(authCtx, cfg, prompter, coordinator), c.getLogger(), observer)
+			cleanup = legacyAuthCleanup(agentCleanup)
+			break
 		}
 		method, agentCleanup, err := c.resolveAgentAuth(ctx)
 		if err != nil {

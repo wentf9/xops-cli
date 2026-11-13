@@ -17,7 +17,7 @@ func (c *Client) Socks5Forward(ctx context.Context, listenAddr string, opts ...F
 	if ctx == nil {
 		return nil, fmt.Errorf("socks5 forward context is nil")
 	}
-	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", listenAddr)
+	listener, err := (&net.ListenConfig{}).Listen(ctx, c.dialNetwork(), listenAddr)
 	if err != nil {
 		c.observeForward("dynamic", "listen failed", listenAddr, "")
 		return nil, fmt.Errorf("listen on local SOCKS5 address %s failed: %w", listenAddr, err)
@@ -36,13 +36,13 @@ func (c *Client) DynamicForwardEndpoint(ctx context.Context, bind ForwardEndpoin
 		return nil, fmt.Errorf("dynamic forward context is nil")
 	}
 	fopts := c.forwardOptions(opts...)
-	listenNet, listenAddr := bind.LocalListenAddress(gatewayPorts)
+	listenNet, listenAddr := bind.LocalListenAddressWithNetwork(gatewayPorts, c.dialNetwork())
 	var listener net.Listener
 	var err error
 	if listenNet == "unix" {
 		listener, err = listenLocalStreamLocal(ctx, listenAddr, fopts.streamLocalBindMask, fopts.streamLocalBindUnlink)
 	} else {
-		listener, err = (&net.ListenConfig{}).Listen(ctx, "tcp", listenAddr)
+		listener, err = (&net.ListenConfig{}).Listen(ctx, listenNet, listenAddr)
 	}
 	if err != nil {
 		c.observeForward("dynamic", "listen failed", listenAddr, "")
@@ -56,8 +56,9 @@ func (c *Client) DynamicForwardEndpoint(ctx context.Context, bind ForwardEndpoin
 }
 
 func (c *Client) handleSocks5(ctx context.Context, conn net.Conn) error {
+	dialNet := c.dialNetwork()
 	return serveSocksConn(ctx, conn, func(dCtx context.Context, destAddr string) (net.Conn, error) {
-		return c.dialSSH(dCtx, "tcp", destAddr)
+		return c.dialSSH(dCtx, dialNet, destAddr)
 	}, c.copyStream)
 }
 

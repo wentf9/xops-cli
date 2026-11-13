@@ -302,7 +302,7 @@ func (o *SshOptions) toSessionControlOptions() (adapter.SessionControlOptions, e
 	if o == nil {
 		return adapter.SessionControlOptions{}, nil
 	}
-	sessionOpts, err := o.control.ToSessionControlOptions()
+	sessionOpts, err := o.controlSessionOptions()
 	if err != nil {
 		return sessionOpts, err
 	}
@@ -346,6 +346,11 @@ func (o *SshOptions) applyCLISessionFlags(opts **ssh.Options) error {
 	}
 	if ttyMode := o.explicitCLITTYMode(); ttyMode != "" {
 		if setErr := ensureOpts().Set(ssh.OptionRequestTTY, string(ttyMode)); setErr != nil {
+			return setErr
+		}
+	}
+	if o.CipherSpec != "" {
+		if setErr := ensureOpts().Set(ssh.OptionCiphers, o.CipherSpec); setErr != nil {
 			return setErr
 		}
 	}

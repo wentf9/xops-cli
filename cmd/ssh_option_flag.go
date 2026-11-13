@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -43,11 +44,45 @@ type SSHControlFlags struct {
 	MasterCount   int      // -M count: 1 -> ControlMaster=yes, >=2 -> ControlMaster=ask
 	ControlPath   string   // -S <path> or "none"
 	CtlCmd        string   // -O <command>
+	ConfigFile    string   // -F <configfile|none>
+	AddressFamily string   // -4 ("inet") or -6 ("inet6"), last flag wins
 	Options       []string // -o Key=Value options
 	onOptionAdded func(string)
 }
 
-// RegisterSSHFlags registers -M, -S, -o, -O flags for xops ssh.
+type addressFamilyFlagValue struct {
+	target *string
+	value  string
+}
+
+func (v *addressFamilyFlagValue) String() string {
+	if v == nil || v.target == nil {
+		return "false"
+	}
+	return strconv.FormatBool(*v.target == v.value)
+}
+
+func (v *addressFamilyFlagValue) Set(s string) error {
+	if v == nil || v.target == nil {
+		return nil
+	}
+	b, err := strconv.ParseBool(s)
+	if err != nil {
+		return err
+	}
+	if b {
+		*v.target = v.value
+	} else if *v.target == v.value {
+		*v.target = ""
+	}
+	return nil
+}
+
+func (v *addressFamilyFlagValue) Type() string { return "bool" }
+
+func (v *addressFamilyFlagValue) IsBoolFlag() bool { return true }
+
+// RegisterSSHFlags registers -M, -S, -o, -O, -F, -4, -6 flags for xops ssh.
 func (f *SSHControlFlags) RegisterSSHFlags(cmd *cobra.Command) {
 	cmd.Flags().CountVarP(&f.MasterCount, "master", "M", i18n.T("flag_ssh_master"))
 	cmd.Flags().StringVarP(&f.ControlPath, "control-path", "S", "", i18n.T("flag_ssh_control_path"))
@@ -57,9 +92,11 @@ func (f *SSHControlFlags) RegisterSSHFlags(cmd *cobra.Command) {
 		}
 	}), "option", "o", i18n.T("flag_ssh_option"))
 	cmd.Flags().StringVarP(&f.CtlCmd, "control-command", "O", "", i18n.T("flag_ssh_control_command"))
+	cmd.Flags().StringVarP(&f.ConfigFile, "config-file", "F", "", i18n.T("flag_ssh_config_file"))
+	f.RegisterAddressFamilyFlags(cmd)
 }
 
-// RegisterCommonFlags registers -S and -o flags for scp, sftp, and exec.
+// RegisterCommonFlags registers -S, -o, -F flags for scp, sftp, and exec.
 func (f *SSHControlFlags) RegisterCommonFlags(cmd *cobra.Command) {
 	cmd.Flags().StringVarP(&f.ControlPath, "control-path", "S", "", i18n.T("flag_ssh_control_path"))
 	cmd.Flags().VarP(newOptionArrayFlagValue(&f.Options, func(val string) {
@@ -67,6 +104,13 @@ func (f *SSHControlFlags) RegisterCommonFlags(cmd *cobra.Command) {
 			f.onOptionAdded(val)
 		}
 	}), "option", "o", i18n.T("flag_ssh_option"))
+	cmd.Flags().StringVarP(&f.ConfigFile, "config-file", "F", "", i18n.T("flag_ssh_config_file"))
+}
+
+// RegisterAddressFamilyFlags registers -4/--ipv4 and -6/--ipv6 with last-flag-wins semantics.
+func (f *SSHControlFlags) RegisterAddressFamilyFlags(cmd *cobra.Command) {
+	cmd.Flags().VarP(&addressFamilyFlagValue{target: &f.AddressFamily, value: "inet"}, "ipv4", "4", i18n.T("flag_ipv4"))
+	cmd.Flags().VarP(&addressFamilyFlagValue{target: &f.AddressFamily, value: "inet6"}, "ipv6", "6", i18n.T("flag_ipv6"))
 }
 
 // ToSessionControlOptions converts SSHControlFlags into adapter.SessionControlOptions.
@@ -96,6 +140,13 @@ func (f *SSHControlFlags) ToSessionControlOptions() (adapter.SessionControlOptio
 			sessionOpts.AllowReuse = true
 		}
 		sessionOpts.SetPath(f.ControlPath)
+	}
+
+	// 4. Command-line -4 / -6 flag overrides any AddressFamily from -o
+	if f.AddressFamily != "" {
+		if err := sessionOpts.SetAddressFamily(f.AddressFamily); err != nil {
+			return sessionOpts, err
+		}
 	}
 
 	return sessionOpts, nil
@@ -284,7 +335,13 @@ func controlTarget(opts *SshOptions, provider config.ConfigProvider, nodeID stri
 			effectiveProvider = config.NewProviderWithoutOpenSSH(nil)
 		}
 		if resolved, err := config.ResolveTarget(effectiveProvider, connTarget); err == nil {
-			return targetContextFromResolvedTarget(resolved)
+			target := targetContextFromResolvedTarget(resolved)
+			if isTargetControlNode(opts, nodeID) {
+				if expandedHost, hErr := opts.effectiveHostName(); hErr == nil && expandedHost != "" {
+					target.Host = expandedHost
+				}
+			}
+			return target
 		}
 	}
 
@@ -298,6 +355,11 @@ func controlTarget(opts *SshOptions, provider config.ConfigProvider, nodeID stri
 	}
 	if opts != nil {
 		target.Host = strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(opts.Host), "]"), "[")
+		if isTargetControlNode(opts, nodeID) {
+			if expandedHost, err := opts.effectiveHostName(); err == nil && expandedHost != "" {
+				target.Host = expandedHost
+			}
+		}
 		target.Port = int(opts.Port)
 		target.User = opts.User
 	}
@@ -314,6 +376,16 @@ func controlTarget(opts *SshOptions, provider config.ConfigProvider, nodeID stri
 		target.Port = 22
 	}
 	return target
+}
+
+func isTargetControlNode(opts *SshOptions, nodeID string) bool {
+	if opts == nil {
+		return false
+	}
+	if nodeID == "" || len(opts.targetNodeIDs) == 0 {
+		return true
+	}
+	return slices.Contains(opts.targetNodeIDs, nodeID)
 }
 
 func targetContextFromResolvedTarget(resolved config.ResolvedTarget) ssh.TargetContext {
@@ -343,6 +415,7 @@ func targetContextFromResolvedTarget(resolved config.ResolvedTarget) ssh.TargetC
 // (such as Port, User, IdentityFile, ProxyJump) and applies them to SshOptions
 // if they were not already explicitly set via primary CLI flags.
 func ApplyGeneralOptions(opts *SshOptions, optionStrings []string, flags *pflag.FlagSet) error {
+	opts.syncIdentityFiles()
 	for _, opt := range optionStrings {
 		key, val, err := adapter.SplitOptionKeyValue(opt)
 		if err != nil {
@@ -351,40 +424,71 @@ func ApplyGeneralOptions(opts *SshOptions, optionStrings []string, flags *pflag.
 		if key == "" {
 			continue
 		}
-
-		switch strings.ToLower(key) {
-		case "port":
-			p, err := strconv.ParseUint(val, 10, 16)
-			if err != nil || p == 0 {
-				return fmt.Errorf("invalid Port in -o option: %q", val)
-			}
-			if shouldApplyGeneralOption(flags, "port", opts.Port == 0) {
-				opts.Port = uint16(p)
-			}
-		case "user":
-			if val == "" {
-				return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
-			}
-			if shouldApplyGeneralOption(flags, "login", opts.User == "") {
-				opts.User = val
-			}
-		case "identityfile":
-			if val == "" {
-				return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
-			}
-			if shouldApplyGeneralOption(flags, "identity", opts.IdentityFile == "") {
-				opts.IdentityFile = val
-			}
-		case "proxyjump":
-			if val == "" {
-				return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
-			}
-			if shouldApplyGeneralOption(flags, "jump", opts.JumpHost == "") {
-				opts.JumpHost = val
-			}
+		if err := applyGeneralOption(opts, key, val, flags); err != nil {
+			return err
 		}
 	}
 	opts.appliedGeneralOpts = true
+	return nil
+}
+
+func applyGeneralOption(opts *SshOptions, key, val string, flags *pflag.FlagSet) error {
+	switch strings.ToLower(key) {
+	case "port":
+		p, err := strconv.ParseUint(val, 10, 16)
+		if err != nil || p == 0 {
+			return fmt.Errorf("invalid Port in -o option: %q", val)
+		}
+		if shouldApplyGeneralOption(flags, "port", opts.Port == 0) {
+			opts.Port = uint16(p)
+		}
+	case "user":
+		if val == "" {
+			return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
+		}
+		if shouldApplyGeneralOption(flags, "login", opts.User == "") {
+			opts.User = val
+		}
+	case "identityfile":
+		if val == "" {
+			return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
+		}
+		if shouldApplyGeneralOption(flags, "identity", opts.IdentityFile == "" && len(opts.IdentityFiles) == 0) {
+			opts.IdentityFiles = append(opts.IdentityFiles, val)
+			opts.identityFromCLIOptions = true
+			if opts.IdentityFile == "" {
+				opts.IdentityFile = val
+			}
+		}
+	case "proxyjump":
+		if val == "" {
+			return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
+		}
+		if shouldApplyGeneralOption(flags, "jump", opts.JumpHost == "") {
+			opts.JumpHost = val
+		}
+	case "hostname":
+		return applyHostNameOption(opts, key, val)
+	}
+	return nil
+}
+
+func applyHostNameOption(opts *SshOptions, key, val string) error {
+	if val == "" {
+		return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
+	}
+	opts.cliHostName = val
+	if orig := opts.originalHostForExpansion(); orig != "" {
+		expanded, expErr := ssh.ExpandHostName(val, orig)
+		if expErr != nil {
+			return expErr
+		}
+		opts.HostName = expanded
+		return nil
+	}
+	if _, expErr := ssh.ExpandHostName(val, "host"); expErr != nil {
+		return expErr
+	}
 	return nil
 }
 

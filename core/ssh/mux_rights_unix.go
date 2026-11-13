@@ -559,7 +559,7 @@ func handlePassengerStdioFwd(s *MuxServer, conn net.Conn, reqID uint32, payload 
 	defer s.untrackStream(conn)
 
 	targetAddr := net.JoinHostPort(fwdReq.ConnectHost, strconv.FormatUint(uint64(fwdReq.ConnectPort), 10))
-	stream, err := s.sshClient.Dial("tcp", targetAddr)
+	stream, err := s.sshClient.Dial(s.effectiveDialNetwork(), targetAddr)
 	if err != nil {
 		return sendFailure(conn, reqID, fmt.Sprintf("remote dial failed: %v", err))
 	}

@@ -76,7 +76,7 @@ func newCmdExecWithOptions(o *ExecOptions) *cobra.Command {
 	// OpenSSH-compatible flags
 	cmd.Flags().Uint16VarP(&o.Port, "port", "p", 0, i18n.T("flag_port"))
 	cmd.Flags().StringVarP(&o.User, "login", "l", "", i18n.T("flag_login"))
-	cmd.Flags().StringVarP(&o.IdentityFile, "identity", "i", "", i18n.T("flag_identity"))
+	cmd.Flags().StringArrayVarP(&o.IdentityFiles, "identity", "i", nil, i18n.T("flag_identity"))
 	cmd.Flags().StringVarP(&o.JumpHost, "jump", "J", "", i18n.T("flag_jump"))
 	o.control.RegisterCommonFlags(cmd)
 
@@ -398,9 +398,13 @@ func (o *ExecOptions) RunContext(ctx context.Context) (retErr error) {
 	if err != nil {
 		return fmt.Errorf("%s: %w", i18n.T("config_load_error"), err)
 	}
-	provider, err := config.NewRepository(cfg, configStore)
+	repo, err := config.NewRepository(cfg, configStore)
 	if err != nil {
 		return fmt.Errorf("create configuration repository: %w", err)
+	}
+	provider, err := config.WithOpenSSHConfigOverride(repo, o.control.ConfigFile)
+	if err != nil {
+		return err
 	}
 	// 准备执行内容
 	var execCmd string
@@ -577,7 +581,7 @@ func (o *ExecOptions) runInteractive(
 	return execErr
 }
 
-func (o *ExecOptions) buildAdapterOptions(tasks []execHostTask, cfg *config.Configuration, repository *config.Repository) ([]adapter.Option, error) {
+func (o *ExecOptions) buildAdapterOptions(tasks []execHostTask, cfg *config.Configuration, repository config.ConfigProvider) ([]adapter.Option, error) {
 	if o.interaction == nil {
 		o.interaction = newCLIInteractionHandler()
 	}
@@ -591,16 +595,25 @@ func (o *ExecOptions) buildAdapterOptions(tasks []execHostTask, cfg *config.Conf
 	// A global policy applies to proxy-jump nodes, which do not have a task
 	// specific override. Explicit task credentials remain scoped to their target.
 	adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{Remember: remember}))
+	hostNameOverride, hostErr := o.effectiveHostName()
+	if hostErr != nil {
+		return nil, hostErr
+	}
+	cliAbsKeys := o.absIdentityFiles()
 	o.targetNodeIDs = make([]string, 0, len(tasks))
 	for _, task := range tasks {
 		o.targetNodeIDs = append(o.targetNodeIDs, task.nodeID)
+		taskKeys := cliAbsKeys
+		if task.keyPath != "" && (len(taskKeys) == 0 || taskKeys[0] != task.keyPath) {
+			taskKeys = append([]string{task.keyPath}, taskKeys...)
+		}
 		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(task.nodeID, adapter.SessionAuth{
-			Password: task.pass, Passphrase: task.passphrase, KeyPath: task.keyPath, Remember: remember, OTP: o.OTP, ProxyJump: o.JumpHost,
+			Password: task.pass, Passphrase: task.passphrase, KeyPath: task.keyPath, KeyPaths: taskKeys, HostName: hostNameOverride, Remember: remember, OTP: o.OTP, ProxyJump: o.JumpHost,
 		}))
 	}
 
 	// Session Control Overrides (Tier 1)
-	sessionCtrlOpts, err := o.control.ToSessionControlOptions()
+	sessionCtrlOpts, err := o.controlSessionOptions()
 	if err != nil {
 		return nil, err
 	}
@@ -621,11 +634,13 @@ func (o *ExecOptions) buildAdapterOptions(tasks []execHostTask, cfg *config.Conf
 				adpOpts = append(adpOpts, adapter.WithEnrollmentProbeExclusions(task.nodeID))
 			}
 		}
-		persistence, err := o.interaction.automaticPersistenceOptions(repository, cfg)
-		if err != nil {
-			return nil, err
+		if repo, ok := repository.(*config.Repository); ok {
+			persistence, err := o.interaction.automaticPersistenceOptions(repo, cfg)
+			if err != nil {
+				return nil, err
+			}
+			adpOpts = append(adpOpts, persistence...)
 		}
-		adpOpts = append(adpOpts, persistence...)
 	}
 	return adpOpts, nil
 }
@@ -637,7 +652,21 @@ func (o *ExecOptions) shouldRememberCredential(target string, cfg *config.Config
 	return utils.ShouldRememberConfiguredCredential(utils.EffectiveRememberPolicy(o.Remember, cfg), target, cfg)
 }
 
-func (o *ExecOptions) getOrCreateNode(ctx context.Context, repository *config.Repository, target config.ConnectionTarget, addr utils.HostInfo) (string, bool, error) {
+func (o *ExecOptions) getOrCreateNode(ctx context.Context, provider config.ConfigProvider, target config.ConnectionTarget, addr utils.HostInfo) (string, bool, error) {
+	o.syncIdentityFiles()
+	preparer, isPreparer := provider.(interface {
+		PrepareNodeContext(context.Context, config.EnsureNodeOptions) (config.EnsureNodeResult, error)
+	})
+	if !isPreparer {
+		resolved, err := config.ResolveTarget(provider, target)
+		if err != nil {
+			return "", false, err
+		}
+		if resolved.MatchedNodeID != "" {
+			return resolved.MatchedNodeID, false, nil
+		}
+		return resolved.NodeID, false, nil
+	}
 	identityFile := addr.KeyPath
 	if identityFile == "" {
 		identityFile = o.IdentityFile
@@ -651,7 +680,7 @@ func (o *ExecOptions) getOrCreateNode(ctx context.Context, repository *config.Re
 	if o.Sudo {
 		sudoMode = models.SudoModeSudo
 	}
-	res, err := repository.PrepareNodeContext(ctx, config.EnsureNodeOptions{
+	res, err := preparer.PrepareNodeContext(ctx, config.EnsureNodeOptions{
 		Target:       target,
 		Password:     "",
 		IdentityFile: identityFile,
@@ -668,7 +697,7 @@ func (o *ExecOptions) getOrCreateNode(ctx context.Context, repository *config.Re
 		return res.NodeID, true, nil
 	}
 
-	updated, updateErr := o.updateNodeFromHostInfo(ctx, res.NodeID, repository, addr)
+	updated, updateErr := o.updateNodeFromHostInfo(ctx, res.NodeID, provider, addr)
 	if updateErr != nil {
 		return "", false, updateErr
 	}
@@ -947,7 +976,7 @@ func (o *ExecOptions) buildTasksFromTags(provider config.ConfigProvider) ([]exec
 	return tasks, nil
 }
 
-func (o *ExecOptions) buildTasksFromHosts(ctx context.Context, repository *config.Repository) ([]execHostTask, []error, error) {
+func (o *ExecOptions) buildTasksFromHosts(ctx context.Context, repository config.ConfigProvider) ([]execHostTask, []error, error) {
 	if err := o.ensureGeneralOptionsApplied(); err != nil {
 		return nil, nil, err
 	}
@@ -1036,7 +1065,11 @@ func appendExecAlias(slice []string, val string) ([]string, bool) {
 	return append(slice, val), true
 }
 
-func (o *ExecOptions) updateNodeFromHostInfo(ctx context.Context, nodeID string, repository *config.Repository, addr utils.HostInfo) (bool, error) {
+func (o *ExecOptions) updateNodeFromHostInfo(ctx context.Context, nodeID string, provider config.ConfigProvider, addr utils.HostInfo) (bool, error) {
+	repository, ok := provider.(*config.Repository)
+	if !ok {
+		return false, nil
+	}
 	if strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) {
 		if o.JumpHost != "" {
 			if _, err := repository.ResolveProxyJumpChain(o.JumpHost); err != nil {

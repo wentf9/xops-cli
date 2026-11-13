@@ -128,9 +128,10 @@ func normalizePlan(plan ConnectionPlan) (ConnectionPlan, error) {
 		if !hop.HasOriginalProxyJump {
 			hop.OriginalProxyJump, hop.HasOriginalProxyJump = hop.ProxyJump, true
 		}
+		hop.KeyPaths = slices.Clone(hop.KeyPaths)
 		hop.Execution = hop.Execution.Clone()
 		hop.Options = hop.Options.Clone()
-		hop.Options.StripClasses(OptionClassMux, OptionClassForward, OptionClassSession)
+		hop.Options.StripClasses(OptionClassMux, OptionClassForward, OptionClassSession, OptionClassLocalExec)
 		if hop.Options.IsEmpty() {
 			hop.Options = nil
 		}
@@ -222,13 +223,13 @@ func (c *Connector) acquirePlan(key string, plan ConnectionPlan) (*planEntry, er
 
 func clientConfigFromPlan(cfg ConnectionConfig) ClientConfig {
 	opts := cfg.Options.Clone()
-	opts.StripClasses(OptionClassMux, OptionClassForward, OptionClassSession)
+	opts.StripClasses(OptionClassMux, OptionClassForward, OptionClassSession, OptionClassLocalExec)
 	if opts.IsEmpty() {
 		opts = nil
 	}
 	return ClientConfig{
 		NodeID: cfg.NodeID, Address: cfg.Address, Port: cfg.Port, User: cfg.User, AuthType: cfg.AuthType,
-		KeyPath: cfg.KeyPath, KeyRef: cfg.KeyRef, TrustVersion: cfg.TrustVersion,
+		KeyPath: cfg.KeyPath, KeyPaths: slices.Clone(cfg.KeyPaths), KeyRef: cfg.KeyRef, TrustVersion: cfg.TrustVersion,
 		AuthUpdateToken: cfg.AuthUpdateToken, SudoUpdateToken: cfg.SudoUpdateToken, SudoMode: cfg.SudoMode,
 		ProxyJump: cfg.ProxyJump, OriginalProxyJump: cfg.OriginalProxyJump, HasOriginalProxyJump: cfg.HasOriginalProxyJump,
 		PasswordPromptPattern: cfg.PasswordPromptPattern,

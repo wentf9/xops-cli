@@ -22,12 +22,14 @@ const (
 	OptionControlMaster                = "control_master"
 	OptionControlPath                  = "control_path"
 	OptionControlPersist               = "control_persist"
+	OptionAddressFamily                = "address_family"
 	OptionConnectTimeout               = "connect_timeout"
 	OptionServerAliveInterval          = "server_alive_interval"
 	OptionServerAliveCountMax          = "server_alive_count_max"
 	OptionTCPKeepAlive                 = "tcp_keep_alive"
 	OptionStrictHostKeyChecking        = "strict_host_key_checking"
 	OptionUserKnownHostsFile           = "user_known_hosts_file"
+	OptionIdentityFile                 = "identity_file"
 	OptionPubkeyAuthentication         = "pubkey_authentication"
 	OptionPasswordAuthentication       = "password_authentication"
 	OptionKbdInteractiveAuthentication = "kbd_interactive_authentication"
@@ -64,6 +66,21 @@ const (
 	OptionClassTrust     OptionClass = "trust"
 	OptionClassForward   OptionClass = "forward"
 	OptionClassSession   OptionClass = "session"
+	OptionClassLocalExec OptionClass = "local_exec"
+)
+
+// AddressFamily values supported by OpenSSH.
+const (
+	AddressFamilyAny   = "any"
+	AddressFamilyInet  = "inet"
+	AddressFamilyInet6 = "inet6"
+)
+
+// GatewayPorts values supported by OpenSSH.
+const (
+	GatewayPortsYes             = "yes"
+	GatewayPortsNo              = "no"
+	GatewayPortsClientSpecified = "clientspecified"
 )
 
 // StrictHostKeyCheckingMode defines OpenSSH StrictHostKeyChecking values.
@@ -136,6 +153,12 @@ var optionRegistry = []OptionSpec{
 		},
 	},
 	{
+		CanonicalKey: OptionAddressFamily,
+		OpenSSHName:  "AddressFamily",
+		Class:        OptionClassTransport,
+		Normalize:    validateAddressFamily,
+	},
+	{
 		CanonicalKey: OptionConnectTimeout,
 		OpenSSHName:  "ConnectTimeout",
 		Class:        OptionClassTransport,
@@ -189,6 +212,13 @@ var optionRegistry = []OptionSpec{
 			}
 			return trimmed, nil
 		},
+	},
+	{
+		CanonicalKey: OptionIdentityFile,
+		OpenSSHName:  "IdentityFile",
+		Class:        OptionClassAuth,
+		MultiValue:   true,
+		Normalize:    validateIdentityFiles,
 	},
 	{
 		CanonicalKey: OptionPubkeyAuthentication,
@@ -310,9 +340,7 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionGatewayPorts,
 		OpenSSHName:  "GatewayPorts",
 		Class:        OptionClassForward,
-		Normalize: func(raw string) (string, error) {
-			return normalizeYesNoOption("GatewayPorts", raw)
-		},
+		Normalize:    validateGatewayPorts,
 	},
 	{
 		CanonicalKey: OptionStreamLocalBindUnlink,
@@ -482,6 +510,104 @@ func normalizeYesNoOption(name, raw string) (string, error) {
 	default:
 		return "", fmt.Errorf("invalid %s option %q (expected yes or no)", name, raw)
 	}
+}
+
+func validateAddressFamily(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case AddressFamilyAny:
+		return AddressFamilyAny, nil
+	case AddressFamilyInet:
+		return AddressFamilyInet, nil
+	case AddressFamilyInet6:
+		return AddressFamilyInet6, nil
+	default:
+		return "", fmt.Errorf("invalid AddressFamily option %q (expected any, inet, or inet6)", raw)
+	}
+}
+
+func validateGatewayPorts(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "yes", "true":
+		return GatewayPortsYes, nil
+	case "no", "false":
+		return GatewayPortsNo, nil
+	case GatewayPortsClientSpecified:
+		return GatewayPortsClientSpecified, nil
+	default:
+		return "", fmt.Errorf("invalid GatewayPorts option %q (expected yes, no, or clientspecified)", raw)
+	}
+}
+
+func validateIdentityFiles(raw string) (string, error) {
+	return normalizeMultiForwardEntries("IdentityFile", raw, func(item string) (string, error) {
+		trimmed := strings.TrimSpace(item)
+		if trimmed == "" {
+			return "", errors.New("value cannot be empty")
+		}
+		if hasASCIIControlChar(trimmed) {
+			return "", errors.New("value contains invalid ASCII control character")
+		}
+		if strings.EqualFold(trimmed, "none") {
+			return "none", nil
+		}
+		if err := validatePathTokenSyntax(trimmed, "IdentityFile"); err != nil {
+			return "", err
+		}
+		return trimmed, nil
+	})
+}
+
+func hasASCIIControlChar(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
+// ExpandHostName expands OpenSSH HostName tokens (%% -> % and %h -> originalHost)
+// and rejects any other %x token, empty result, or ASCII control characters (< 0x20 or 0x7f).
+func ExpandHostName(pattern, originalHost string) (string, error) {
+	trimmed := strings.TrimSpace(pattern)
+	if trimmed == "" {
+		return "", errors.New("HostName cannot be empty")
+	}
+	origTrimmed := strings.TrimSpace(originalHost)
+
+	var sb strings.Builder
+	sb.Grow(len(trimmed))
+	for i := 0; i < len(trimmed); i++ {
+		ch := trimmed[i]
+		if ch != '%' {
+			sb.WriteByte(ch)
+			continue
+		}
+		if i+1 >= len(trimmed) {
+			return "", fmt.Errorf("trailing '%%' in HostName %q", pattern)
+		}
+		i++
+		switch trimmed[i] {
+		case '%':
+			sb.WriteByte('%')
+		case 'h':
+			if origTrimmed == "" {
+				return "", fmt.Errorf("cannot expand %%h in HostName %q: original host is empty", pattern)
+			}
+			sb.WriteString(origTrimmed)
+		default:
+			return "", fmt.Errorf("unsupported token %%%c in HostName %q", trimmed[i], pattern)
+		}
+	}
+
+	expanded := strings.TrimSpace(sb.String())
+	if expanded == "" {
+		return "", errors.New("expanded HostName cannot be empty")
+	}
+	if hasASCIIControlChar(expanded) {
+		return "", fmt.Errorf("expanded HostName %q contains invalid ASCII control characters", expanded)
+	}
+	return expanded, nil
 }
 
 func normalizeOptionalDurationOption(name, raw string) (string, error) {
@@ -842,7 +968,7 @@ func (o *Options) Set(key, rawValue string) error {
 	if !ok {
 		return fmt.Errorf("%w: unknown ssh option %q", ErrSSHOptionsValidation, key)
 	}
-	if strings.TrimSpace(rawValue) == "" {
+	if rawValue == "" {
 		o.Delete(spec.CanonicalKey)
 		return nil
 	}
@@ -965,6 +1091,52 @@ func (o *Options) ControlConfig() *ControlConfig {
 		Persist:       persist,
 		ImplicitTier4: o.ImplicitTier4,
 	}
+}
+
+// AddressFamily returns the normalized AddressFamily ("any", "inet", "inet6"), or "" if unset.
+func (o *Options) AddressFamily() string {
+	return o.Get(OptionAddressFamily)
+}
+
+// DialNetwork maps AddressFamily to Go's net dial/listen network string:
+// "inet" -> "tcp4", "inet6" -> "tcp6", nil/empty/"any" -> "tcp".
+func (o *Options) DialNetwork() string {
+	switch o.AddressFamily() {
+	case AddressFamilyInet:
+		return "tcp4"
+	case AddressFamilyInet6:
+		return "tcp6"
+	default:
+		return "tcp"
+	}
+}
+
+// IdentityFiles returns all configured IdentityFile entries in order, trimmed and non-empty.
+func (o *Options) IdentityFiles() []string {
+	entries := o.GetAll(OptionIdentityFile)
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		trimmed := strings.TrimSpace(entry)
+		if trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// IdentityFile returns the first configured IdentityFile entry, or "" if unset.
+func (o *Options) IdentityFile() string {
+	files := o.IdentityFiles()
+	if len(files) == 0 {
+		return ""
+	}
+	return files[0]
 }
 
 // ConnectTimeout returns the configured ConnectTimeout duration, or 0 if unset/disabled.
@@ -1341,6 +1513,9 @@ func extractYAMLOptionValue(spec OptionSpec, valNode *yaml.Node) (string, error)
 			if elem.Kind != yaml.ScalarNode || elem.Tag == "!!null" {
 				return "", fmt.Errorf("%s list elements must be scalar strings", spec.OpenSSHName)
 			}
+			if spec.MultiValue && strings.TrimSpace(elem.Value) == "" {
+				return "", fmt.Errorf("invalid %s: list element cannot be empty", spec.OpenSSHName)
+			}
 			items = append(items, elem.Value)
 		}
 		if spec.MultiValue {
@@ -1453,6 +1628,11 @@ func extractJSONOptionValue(spec OptionSpec, rawMsg json.RawMessage) (string, er
 		var listVal []string
 		if err := json.Unmarshal(rawMsg, &listVal); err == nil {
 			if spec.MultiValue {
+				for _, elem := range listVal {
+					if strings.TrimSpace(elem) == "" {
+						return "", fmt.Errorf("invalid %s: list element cannot be empty", spec.OpenSSHName)
+					}
+				}
 				return strings.Join(listVal, "\n"), nil
 			}
 			return strings.Join(listVal, ","), nil

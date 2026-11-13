@@ -12,6 +12,7 @@ import (
 	"github.com/wentf9/xops-cli/core/mcp/ports"
 	mcpruntime "github.com/wentf9/xops-cli/core/mcp/runtime"
 	"github.com/wentf9/xops-cli/core/mcp/transfer"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
@@ -54,6 +55,7 @@ func credentialBindingConfig() *config.Configuration {
 		IdentityRef:          "identity",
 		SudoMode:             models.SudoModeSu,
 		PrivilegePasswordRef: &credential.Ref{StoreID: "fixture", ItemID: "privilege-1"},
+		SSHOptions:           ssh.MustOptions(ssh.OptionIdentityFile, "/keys/id_a", ssh.OptionIdentityFile, "/keys/id_b"),
 	})
 	return cfg
 }
@@ -97,6 +99,7 @@ func TestCLIRecoveryBindsCredentialDependenciesWithoutUpdateRef(t *testing.T) {
 			"totp-ref", "totp-command", "totp-store",
 			"challenge-ref", "challenge-command", "challenge-rule-added", "challenge-store",
 			"jump-totp-ref", "jump-challenge-ref",
+			"identity-file-added", "identity-file-reordered", "jump-identity-file-added",
 		} {
 			t.Run(edit+map[bool]string{false: "-provider", true: "-frozen"}[frozen], func(t *testing.T) {
 				ctx, cancel := context.WithTimeout(t.Context(), time.Second)
@@ -227,6 +230,14 @@ func editCredentialBinding(cfg *config.Configuration, edit string) {
 			},
 		}
 		cfg.Identities.Set("jump-identity", jump)
+	case "identity-file-added":
+		node.SSHOptions = ssh.MustOptions(ssh.OptionIdentityFile, "/keys/id_a", ssh.OptionIdentityFile, "/keys/id_b", ssh.OptionIdentityFile, "/keys/id_c")
+	case "identity-file-reordered":
+		node.SSHOptions = ssh.MustOptions(ssh.OptionIdentityFile, "/keys/id_b", ssh.OptionIdentityFile, "/keys/id_a")
+	case "jump-identity-file-added":
+		jumpNode, _ := cfg.Nodes.Get("jump")
+		jumpNode.SSHOptions = ssh.MustOptions(ssh.OptionIdentityFile, "/keys/jump_extra")
+		cfg.Nodes.Set("jump", jumpNode)
 	}
 	cfg.Nodes.Set("node", node)
 	cfg.Identities.Set("identity", identity)
@@ -258,5 +269,41 @@ func TestCLICredentialBindingDoesNotPersistSecretsOrInventWriteAuthority(t *test
 		if hop.AuthUpdateToken != "" || hop.SudoUpdateToken != "" {
 			t.Fatal("read-only dependency hash became a credential-write token")
 		}
+	}
+}
+
+func TestCredentialVersionBindsHopKeyPathsAndOrder(t *testing.T) {
+	cfg := credentialBindingConfig()
+	provider := config.NewProviderWithoutOpenSSH(cfg)
+	baseHop := ssh.ConnectionConfig{
+		NodeID:   "node",
+		Address:  "192.0.2.1",
+		Port:     22,
+		User:     "fixture",
+		KeyPaths: []string{"/keys/first", "/keys/second"},
+	}
+	vBase, err := credentialVersion(provider, ssh.ConnectionPlan{Scope: "scope", Hops: []ssh.ConnectionConfig{baseHop}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reorderedHop := baseHop.Clone()
+	reorderedHop.KeyPaths = []string{"/keys/second", "/keys/first"}
+	vReordered, err := credentialVersion(provider, ssh.ConnectionPlan{Scope: "scope", Hops: []ssh.ConnectionConfig{reorderedHop}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vBase == vReordered {
+		t.Fatal("reordering hop.KeyPaths must change credentialVersion")
+	}
+
+	extendedHop := baseHop.Clone()
+	extendedHop.KeyPaths = []string{"/keys/first", "/keys/second", "/keys/third"}
+	vExtended, err := credentialVersion(provider, ssh.ConnectionPlan{Scope: "scope", Hops: []ssh.ConnectionConfig{extendedHop}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vBase == vExtended || vReordered == vExtended {
+		t.Fatal("adding to hop.KeyPaths must change credentialVersion")
 	}
 }

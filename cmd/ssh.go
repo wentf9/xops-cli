@@ -26,46 +26,51 @@ import (
 )
 
 type SshOptions struct {
-	interaction        *cliInteractionHandler
-	diagnostic         sshDiagnosticOptions
-	diagnostics        corelog.DiagnosticObserver
-	control            SSHControlFlags
-	Host               string
-	Port               uint16
-	User               string
-	Password           string
-	PasswordStdin      bool
-	OTP                string
-	OTPStdin           bool
-	IdentityFile       string
-	Passphrase         string
-	PassphraseStdin    bool
-	Remember           string
-	Sudo               bool
-	Alias              string
-	JumpHost           string
-	Tags               []string
-	LocalForwards      []string
-	RemoteForwards     []string
-	NoCmd              bool
-	GatewayPorts       bool
-	DynamicForward     string
-	DynamicForwards    []string
-	StdioForward       string
-	TunnelDevice       string
-	DisableTTY         bool
-	ForceTTYCount      int
-	cliTTYMode         ssh.RequestTTYMode
-	cliTunnelMode      string
-	cliTunnelLockedByW bool
-	BgRun              bool
-	StdinRedirect      bool
-	args               []string
-	dashIdx            int
-	parsedArgs         bool
-	appliedGeneralOpts bool
-	stdinRedirected    bool
-	isParentValidation bool
+	interaction            *cliInteractionHandler
+	diagnostic             sshDiagnosticOptions
+	diagnostics            corelog.DiagnosticObserver
+	control                SSHControlFlags
+	Host                   string
+	HostName               string
+	cliHostName            string
+	Port                   uint16
+	User                   string
+	Password               string
+	PasswordStdin          bool
+	OTP                    string
+	OTPStdin               bool
+	IdentityFile           string
+	IdentityFiles          []string
+	identityFromCLIOptions bool
+	CipherSpec             string
+	Passphrase             string
+	PassphraseStdin        bool
+	Remember               string
+	Sudo                   bool
+	Alias                  string
+	JumpHost               string
+	Tags                   []string
+	LocalForwards          []string
+	RemoteForwards         []string
+	NoCmd                  bool
+	GatewayPorts           bool
+	DynamicForward         string
+	DynamicForwards        []string
+	StdioForward           string
+	TunnelDevice           string
+	DisableTTY             bool
+	ForceTTYCount          int
+	cliTTYMode             ssh.RequestTTYMode
+	cliTunnelMode          string
+	cliTunnelLockedByW     bool
+	BgRun                  bool
+	StdinRedirect          bool
+	args                   []string
+	dashIdx                int
+	parsedArgs             bool
+	appliedGeneralOpts     bool
+	stdinRedirected        bool
+	isParentValidation     bool
 
 	Target config.ConnectionTarget
 
@@ -112,7 +117,8 @@ func newCmdSshWithOptions(o *SshOptions) *cobra.Command {
 	// OpenSSH-compatible flags
 	cmd.Flags().Uint16VarP(&o.Port, "port", "p", 0, i18n.T("flag_port"))
 	cmd.Flags().StringVarP(&o.User, "login", "l", "", i18n.T("flag_login"))
-	cmd.Flags().StringVarP(&o.IdentityFile, "identity", "i", "", i18n.T("flag_identity"))
+	cmd.Flags().StringArrayVarP(&o.IdentityFiles, "identity", "i", nil, i18n.T("flag_identity"))
+	cmd.Flags().StringVarP(&o.CipherSpec, "cipher", "c", "", i18n.T("flag_ssh_cipher"))
 	cmd.Flags().StringVarP(&o.JumpHost, "jump", "J", "", i18n.T("flag_jump"))
 	cmd.Flags().StringArrayVarP(&o.LocalForwards, "local-forward", "L", []string{}, i18n.T("flag_local_forward"))
 	cmd.Flags().StringArrayVarP(&o.RemoteForwards, "remote-forward", "R", []string{}, i18n.T("flag_remote_forward"))
@@ -167,6 +173,98 @@ func (o *SshOptions) readSecretsFromStdin() (bool, error) {
 		o.Passphrase = pass
 	}
 	return hadCredentialStdin, nil
+}
+
+func (o *SshOptions) syncIdentityFiles() {
+	if o == nil {
+		return
+	}
+	if len(o.IdentityFiles) > 0 && o.IdentityFile == "" {
+		o.IdentityFile = o.IdentityFiles[0]
+	} else if o.IdentityFile != "" && len(o.IdentityFiles) == 0 {
+		o.IdentityFiles = []string{o.IdentityFile}
+	}
+}
+
+func (o *SshOptions) effectiveIdentityFiles() []string {
+	if o == nil {
+		return nil
+	}
+	o.syncIdentityFiles()
+	if len(o.IdentityFiles) > 0 {
+		return append([]string(nil), o.IdentityFiles...)
+	}
+	if o.IdentityFile != "" {
+		return []string{o.IdentityFile}
+	}
+	return nil
+}
+
+// normalizeCLIIdentityPath converts plain relative or ~/ paths to absolute paths
+// while preserving "none" and token/env-bearing patterns (%d, ${VAR}) for core/ssh.
+func normalizeCLIIdentityPath(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.EqualFold(trimmed, "none") || strings.Contains(trimmed, "%") || strings.Contains(trimmed, "${") {
+		return trimmed
+	}
+	return utils.ToAbsolutePath(trimmed)
+}
+
+func (o *SshOptions) absIdentityFiles() []string {
+	keys := o.effectiveIdentityFiles()
+	if len(keys) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if norm := normalizeCLIIdentityPath(k); norm != "" {
+			out = append(out, norm)
+		}
+	}
+	return out
+}
+
+func (o *SshOptions) controlSessionOptions() (adapter.SessionControlOptions, error) {
+	sessionOpts, err := o.control.ToSessionControlOptions()
+	if err != nil {
+		return sessionOpts, err
+	}
+	if o.identityFromCLIOptions && sessionOpts.Options != nil {
+		sessionOpts.Options.Delete(ssh.OptionIdentityFile)
+	}
+	return sessionOpts, nil
+}
+
+func (o *SshOptions) originalHostForExpansion() string {
+	if o == nil {
+		return ""
+	}
+	if s := strings.TrimSpace(o.Target.Selector); s != "" {
+		return strings.TrimPrefix(s, config.OpenSSHNodePrefix)
+	}
+	if s := strings.TrimSpace(o.Host); s != "" {
+		return strings.TrimPrefix(s, config.OpenSSHNodePrefix)
+	}
+	if len(o.args) > 0 {
+		if _, h, _, err := utils.ParseAddr(o.args[0]); err == nil && h != "" {
+			return strings.TrimPrefix(h, config.OpenSSHNodePrefix)
+		}
+		return strings.TrimSpace(o.args[0])
+	}
+	return ""
+}
+
+func (o *SshOptions) effectiveHostName() (string, error) {
+	if o == nil {
+		return "", nil
+	}
+	if o.cliHostName != "" {
+		return ssh.ExpandHostName(o.cliHostName, o.originalHostForExpansion())
+	}
+	return o.HostName, nil
 }
 
 func (o *SshOptions) Complete(cmd *cobra.Command, args []string) error {
@@ -434,9 +532,13 @@ func (o *SshOptions) runParentDaemon(ctx context.Context) (err error) {
 		return fmt.Errorf("%s: %w", i18n.T("ssh_err_load_config"), err)
 	}
 
-	provider, err := config.NewRepository(cfg, configStore)
+	repo, err := config.NewRepository(cfg, configStore)
 	if err != nil {
 		return fmt.Errorf("create configuration repository: %w", err)
+	}
+	provider, err := config.WithOpenSSHConfigOverride(repo, o.control.ConfigFile)
+	if err != nil {
+		return err
 	}
 
 	nodeID, _, err := o.resolveNode(ctx, provider)
@@ -471,7 +573,7 @@ func (o *SshOptions) validatePostResolutionSessionInvariants() error {
 	return nil
 }
 
-func (o *SshOptions) runParentDaemonWithNode(ctx context.Context, cfg *config.Configuration, provider *config.Repository, nodeID string) (err error) {
+func (o *SshOptions) runParentDaemonWithNode(ctx context.Context, cfg *config.Configuration, provider config.ConfigProvider, nodeID string) (err error) {
 	adpOpts, optErr := o.buildAdapterOptions(nodeID, cfg, provider)
 	if optErr != nil {
 		return optErr
@@ -565,7 +667,7 @@ func spawnBackgroundSSHChild() (err error) {
 	return nil
 }
 
-func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuration, repository *config.Repository) ([]adapter.Option, error) {
+func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuration, repository config.ConfigProvider) ([]adapter.Option, error) {
 	if o.interaction == nil {
 		o.interaction = newCLIInteractionHandler()
 	}
@@ -573,6 +675,8 @@ func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuratio
 	if isMuxDaemonChild() {
 		shouldRemember = false
 		adpOpts = append(adpOpts, adapter.WithNonInteractive(true))
+	} else {
+		adpOpts = append(adpOpts, adapter.WithLocalExecution(true))
 	}
 	// The global policy also covers ProxyJump nodes. The target-specific override
 	// below carries its explicit session material without leaking it to jumps.
@@ -581,12 +685,23 @@ func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuratio
 	if proxyJumpOverride == "" && isMuxDaemonChild() {
 		proxyJumpOverride = "none"
 	}
+	hostNameOverride, hostErr := o.effectiveHostName()
+	if hostErr != nil {
+		return nil, hostErr
+	}
+	absKeys := o.absIdentityFiles()
+	firstKey := normalizeCLIIdentityPath(o.IdentityFile)
+	if firstKey == "" && len(absKeys) > 0 {
+		firstKey = absKeys[0]
+	}
 	// 总是注入 SessionAuthOverride（即使密码为空），以便 UpdateAuth / UpdateSudo
 	// 能根据 Remember 策略决定是否将交互提示获得的密码回写配置，而不是绕过策略检查。
 	adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, adapter.SessionAuth{
 		Password:   o.Password,
 		Passphrase: o.Passphrase,
-		KeyPath:    utils.ToAbsolutePath(o.IdentityFile),
+		KeyPath:    firstKey,
+		KeyPaths:   absKeys,
+		HostName:   hostNameOverride,
 		Remember:   shouldRemember,
 		OTP:        o.OTP,
 		ProxyJump:  proxyJumpOverride,
@@ -601,11 +716,13 @@ func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuratio
 		if o.execution.enabled() || o.execution.noLoginSet || o.StdioForward != "" {
 			adpOpts = append(adpOpts, adapter.WithEnrollmentProbeExclusions(nodeID))
 		}
-		persistence, err := o.interaction.automaticPersistenceOptions(repository, cfg)
-		if err != nil {
-			return nil, err
+		if repo, ok := repository.(*config.Repository); ok {
+			persistence, err := o.interaction.automaticPersistenceOptions(repo, cfg)
+			if err != nil {
+				return nil, err
+			}
+			adpOpts = append(adpOpts, persistence...)
 		}
-		adpOpts = append(adpOpts, persistence...)
 	}
 
 	// Session Control Overrides (Tier 1)
@@ -634,12 +751,8 @@ func disableSessionControlForParent(nodeID string) adapter.Option {
 // getActiveMuxServer returns the in-process master serving this node, if any. The
 // control path must be expanded from the resolved connection target, exactly as
 // Connector.buildTargetContext does, otherwise %h/%p/%r/%C expand differently.
-func (o *SshOptions) getActiveMuxServer(ctx context.Context, provider *config.Repository, nodeID string) *ssh.MuxServer {
-	var cfgProvider config.ConfigProvider
-	if provider != nil {
-		cfgProvider = provider
-	}
-	expandedPath, err := controlSocketPath(o, cfgProvider, nodeID)
+func (o *SshOptions) getActiveMuxServer(ctx context.Context, provider config.ConfigProvider, nodeID string) *ssh.MuxServer {
+	expandedPath, err := controlSocketPath(o, provider, nodeID)
 	if err != nil || expandedPath == "" {
 		return nil
 	}
@@ -649,7 +762,7 @@ func (o *SshOptions) getActiveMuxServer(ctx context.Context, provider *config.Re
 // handoffPersistentMaster releases this process's master and starts a detached
 // master so ControlPersist survives the session, matching OpenSSH behavior for a
 // command or interactive shell that finished.
-func (o *SshOptions) handoffPersistentMaster(ctx context.Context, connector *ssh.Connector, provider *config.Repository, nodeID string) error {
+func (o *SshOptions) handoffPersistentMaster(ctx context.Context, connector *ssh.Connector, provider config.ConfigProvider, nodeID string) error {
 	if isMuxDaemonChild() || o.effectiveBgRun() {
 		// This process owns the master for its whole lifetime.
 		return nil
@@ -922,6 +1035,8 @@ func (o *SshOptions) muxDaemonArgs(nodeID string, expandedPath string, master *s
 	args = append(args, "--remember", "never")
 	if o.shouldPassIdentityFile(nodeID, master) {
 		args = o.appendMuxDaemonForwardedOptions(args, master)
+	} else if o.control.ConfigFile != "" {
+		args = append(args, "-F", o.control.ConfigFile)
 	}
 	masterMode := ssh.ControlMasterYes
 	if master != nil {
@@ -945,6 +1060,25 @@ func (o *SshOptions) muxDaemonArgs(nodeID string, expandedPath string, master *s
 }
 
 func (o *SshOptions) appendMuxDaemonForwardedOptions(args []string, master *ssh.MuxServer) []string {
+	if o.control.ConfigFile != "" {
+		args = append(args, "-F", o.control.ConfigFile)
+	}
+	if o.CipherSpec != "" {
+		args = append(args, "-c", o.CipherSpec)
+	}
+	switch o.control.AddressFamily {
+	case "inet":
+		args = append(args, "-4")
+	case "inet6":
+		args = append(args, "-6")
+	}
+	if keys := o.effectiveIdentityFiles(); len(keys) > 1 {
+		for _, k := range keys[1:] {
+			if k != "" {
+				args = append(args, "-i", k)
+			}
+		}
+	}
 	if o.GatewayPorts {
 		args = append(args, "-o", "GatewayPorts=yes")
 	}
@@ -964,6 +1098,7 @@ func (o *SshOptions) appendMuxDaemonForwardedOptions(args []string, master *ssh.
 }
 
 func (o *SshOptions) resolveMuxDaemonIdentityFile(nodeID string, master *ssh.MuxServer) string {
+	o.syncIdentityFiles()
 	if o.IdentityFile != "" && o.shouldPassIdentityFile(nodeID, master) {
 		return o.IdentityFile
 	}
@@ -1073,7 +1208,7 @@ func isTargetSpecificOption(opt string) bool {
 		return false
 	}
 	switch strings.ToLower(key) {
-	case "port", "user", "proxyjump", "identityfile":
+	case "port", "user", "proxyjump", "identityfile", "hostname":
 		return true
 	default:
 		return false
@@ -1297,7 +1432,11 @@ func (o *SshOptions) connectClient(ctx context.Context, connector *ssh.Connector
 }
 
 func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error) {
-	provider, cfg, err := o.loadConfigRepository()
+	repo, cfg, err := o.loadConfigRepository()
+	if err != nil {
+		return err
+	}
+	provider, err := config.WithOpenSSHConfigOverride(repo, o.control.ConfigFile)
 	if err != nil {
 		return err
 	}
@@ -1383,7 +1522,7 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 	return o.runConnectedSession(runCtx, connector, client, provider, nodeID, tunnels, isChild)
 }
 
-func (o *SshOptions) runConnectedSession(runCtx context.Context, connector *ssh.Connector, client *ssh.Client, provider *config.Repository, nodeID string, tunnels *sshTunnelGroup, isChild bool) error {
+func (o *SshOptions) runConnectedSession(runCtx context.Context, connector *ssh.Connector, client *ssh.Client, provider config.ConfigProvider, nodeID string, tunnels *sshTunnelGroup, isChild bool) error {
 	master := o.getActiveMuxServer(runCtx, provider, nodeID)
 	if isMuxDaemonChild() {
 		if err := prepareMuxDaemonSession(connector, master, nodeID); err != nil {
@@ -1515,7 +1654,22 @@ func parseForwardArg(arg string) (bindAddr, destAddr string, err error) {
 	return spec.BindAddr, spec.DestAddr, nil
 }
 
-func (o *SshOptions) resolveNode(ctx context.Context, provider *config.Repository) (string, bool, error) {
+func (o *SshOptions) resolveNode(ctx context.Context, provider config.ConfigProvider) (string, bool, error) {
+	o.syncIdentityFiles()
+	preparer, isPreparer := provider.(interface {
+		PrepareNodeContext(context.Context, config.EnsureNodeOptions) (config.EnsureNodeResult, error)
+	})
+	if !isPreparer {
+		resolved, err := config.ResolveTarget(provider, o.Target)
+		if err != nil {
+			return "", false, err
+		}
+		if resolved.MatchedNodeID != "" {
+			return resolved.MatchedNodeID, false, nil
+		}
+		return resolved.NodeID, false, nil
+	}
+
 	var defaultUser string
 	if !o.Target.HasUser {
 		var err error
@@ -1527,7 +1681,7 @@ func (o *SshOptions) resolveNode(ctx context.Context, provider *config.Repositor
 
 	shouldRemember := !isMuxDaemonChild() && utils.EffectiveRememberPolicy(o.Remember, provider.Snapshot()) == utils.RememberPolicyAlways
 
-	res, err := provider.PrepareNodeContext(ctx, config.EnsureNodeOptions{
+	res, err := preparer.PrepareNodeContext(ctx, config.EnsureNodeOptions{
 		Target:       o.Target,
 		DefaultUser:  defaultUser,
 		Password:     "",
@@ -1542,7 +1696,11 @@ func (o *SshOptions) resolveNode(ctx context.Context, provider *config.Repositor
 	if res.Created || isMuxDaemonChild() {
 		return res.NodeID, res.Created, nil
 	}
-	updated, err := update(ctx, res.NodeID, o, provider, shouldRemember)
+	repo, isRepo := provider.(*config.Repository)
+	if !isRepo {
+		return res.NodeID, false, nil
+	}
+	updated, err := update(ctx, res.NodeID, o, repo, shouldRemember)
 	return res.NodeID, updated, err
 }
 

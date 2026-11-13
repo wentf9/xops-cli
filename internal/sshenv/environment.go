@@ -1,10 +1,13 @@
 package sshenv
 
 import (
+	"context"
+	"net"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strings"
+	"time"
 
 	core "github.com/wentf9/xops-cli/core/ssh"
 )
@@ -41,6 +44,11 @@ func Discover() core.Environment {
 		LocalHost:           hostname,
 		LocalUID:            localUID,
 		LookupEnv:           os.LookupEnv,
+		Environ:             os.Environ,
+		DialAgent: func(ctx context.Context, socket string) (net.Conn, error) {
+			dialer := net.Dialer{Timeout: 2 * time.Second}
+			return dialer.DialContext(ctx, "unix", socket)
+		},
 	}
 	if userDirectory != "" {
 		environment.KnownHostsFile = filepath.Join(userDirectory, ".ssh", "known_hosts")

@@ -132,43 +132,84 @@ func (e ForwardEndpoint) String() string {
 	return net.JoinHostPort(e.Host, strconv.Itoa(int(e.Port)))
 }
 
+func normalizeTCPDialNetwork(dialNetwork string) string {
+	switch dialNetwork {
+	case "tcp4", "tcp6":
+		return dialNetwork
+	default:
+		return "tcp"
+	}
+}
+
 // LocalListenAddress returns the network and address for local listening.
 func (e ForwardEndpoint) LocalListenAddress(gatewayPorts bool) (network, addr string) {
+	return e.LocalListenAddressWithNetwork(gatewayPorts, "tcp")
+}
+
+// LocalListenAddressWithNetwork returns the network and address for local listening,
+// honoring dialNetwork ("tcp", "tcp4", "tcp6") for TCP endpoints while leaving Unix sockets untouched.
+func (e ForwardEndpoint) LocalListenAddressWithNetwork(gatewayPorts bool, dialNetwork string) (network, addr string) {
 	if e.IsUnix() {
 		return "unix", e.SocketPath
 	}
+	netw := normalizeTCPDialNetwork(dialNetwork)
 	if e.Wildcard {
-		return "tcp", ":" + strconv.Itoa(int(e.Port))
+		return netw, ":" + strconv.Itoa(int(e.Port))
 	}
 	if !e.HasHost {
 		if gatewayPorts {
-			return "tcp", ":" + strconv.Itoa(int(e.Port))
+			return netw, ":" + strconv.Itoa(int(e.Port))
 		}
-		return "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(e.Port)))
+		return netw, net.JoinHostPort("127.0.0.1", strconv.Itoa(int(e.Port)))
 	}
-	return "tcp", net.JoinHostPort(e.Host, strconv.Itoa(int(e.Port)))
+	return netw, net.JoinHostPort(e.Host, strconv.Itoa(int(e.Port)))
 }
 
-// RemoteListenAddress returns the network and address for remote listening.
+// RemoteListenAddress returns the network and address for remote listening using client-specified bind semantics.
 func (e ForwardEndpoint) RemoteListenAddress() (network, addr string) {
+	return e.RemoteListenAddressForMode(GatewayPortsClientSpecified, "tcp")
+}
+
+// RemoteListenAddressForMode returns the network and address for remote listening according to
+// OpenSSH GatewayPorts semantics ("no", "yes", "clientspecified") and dialNetwork ("tcp", "tcp4", "tcp6"),
+// leaving Unix domain socket endpoints untouched.
+func (e ForwardEndpoint) RemoteListenAddressForMode(gatewayPortsMode, dialNetwork string) (network, addr string) {
 	if e.IsUnix() {
 		return "unix", e.SocketPath
 	}
-	if e.Wildcard {
-		return "tcp", ":" + strconv.Itoa(int(e.Port))
+	netw := normalizeTCPDialNetwork(dialNetwork)
+	portStr := strconv.Itoa(int(e.Port))
+	switch strings.ToLower(strings.TrimSpace(gatewayPortsMode)) {
+	case GatewayPortsYes:
+		return netw, ":" + portStr
+	case GatewayPortsNo:
+		if !e.HasHost || e.Wildcard {
+			return netw, net.JoinHostPort("localhost", portStr)
+		}
+		return netw, net.JoinHostPort(e.Host, portStr)
+	default: // GatewayPortsClientSpecified or unset ("")
+		if e.Wildcard {
+			return netw, ":" + portStr
+		}
+		if !e.HasHost {
+			return netw, net.JoinHostPort("localhost", portStr)
+		}
+		return netw, net.JoinHostPort(e.Host, portStr)
 	}
-	if !e.HasHost {
-		return "tcp", net.JoinHostPort("localhost", strconv.Itoa(int(e.Port)))
-	}
-	return "tcp", net.JoinHostPort(e.Host, strconv.Itoa(int(e.Port)))
 }
 
 // ConnectAddress returns the network and address for outbound connection.
 func (e ForwardEndpoint) ConnectAddress() (network, addr string) {
+	return e.ConnectAddressWithNetwork("tcp")
+}
+
+// ConnectAddressWithNetwork returns the network and address for outbound connection,
+// honoring dialNetwork ("tcp", "tcp4", "tcp6") for TCP endpoints while leaving Unix sockets untouched.
+func (e ForwardEndpoint) ConnectAddressWithNetwork(dialNetwork string) (network, addr string) {
 	if e.IsUnix() {
 		return "unix", e.SocketPath
 	}
-	return "tcp", net.JoinHostPort(e.Host, strconv.Itoa(int(e.Port)))
+	return normalizeTCPDialNetwork(dialNetwork), net.JoinHostPort(e.Host, strconv.Itoa(int(e.Port)))
 }
 
 // MuxListenEndpoint returns the host string and port uint32 for multiplexing protocol listen requests.
@@ -971,12 +1012,36 @@ func (o *Options) ClearAllForwardings() (bool, bool) {
 	return o.boolOption(OptionClearAllForwardings)
 }
 
-// GatewayPorts returns (enabled, true) if explicitly configured, or (false, false) if unset.
+// GatewayPorts returns (enabled, true) if explicitly configured ("yes" -> true,
+// "no"/"clientspecified" -> false), or (false, false) if unset.
 func (o *Options) GatewayPorts() (bool, bool) {
-	return o.boolOption(OptionGatewayPorts)
+	switch o.GatewayPortsMode() {
+	case GatewayPortsYes:
+		return true, true
+	case GatewayPortsNo, GatewayPortsClientSpecified:
+		return false, true
+	default:
+		return false, false
+	}
 }
 
-// EffectiveGatewayPorts returns true if GatewayPorts is enabled, false otherwise.
+// GatewayPortsMode returns the normalized GatewayPorts mode ("yes", "no", "clientspecified"),
+// or "" if unset.
+func (o *Options) GatewayPortsMode() string {
+	val := strings.ToLower(strings.TrimSpace(o.Get(OptionGatewayPorts)))
+	switch val {
+	case "yes", "true":
+		return GatewayPortsYes
+	case "no", "false":
+		return GatewayPortsNo
+	case GatewayPortsClientSpecified:
+		return GatewayPortsClientSpecified
+	default:
+		return ""
+	}
+}
+
+// EffectiveGatewayPorts returns true if GatewayPorts is enabled ("yes"), false otherwise.
 func (o *Options) EffectiveGatewayPorts() bool {
 	v, _ := o.GatewayPorts()
 	return v

@@ -1083,8 +1083,19 @@ func testNewOptions_GatewayPorts(t *testing.T, opts *Options) {
 		t.Errorf("EffectiveGatewayPorts after 'no' should be false")
 	}
 
-	if err := opts.Set("gateway_ports", "clientspecified"); err == nil {
-		t.Errorf("expected gateway_ports 'clientspecified' to fail")
+	mustSetTestOption(t, opts, "gateway_ports", "ClientSpecified")
+	if got := opts.GatewayPortsMode(); got != GatewayPortsClientSpecified {
+		t.Errorf("GatewayPortsMode after 'ClientSpecified' = %q, want %q", got, GatewayPortsClientSpecified)
+	}
+	if v, ok := opts.GatewayPorts(); !ok || v {
+		t.Errorf("GatewayPorts after 'clientspecified' = (%v, %v), want (false, true)", v, ok)
+	}
+	if opts.EffectiveGatewayPorts() {
+		t.Errorf("EffectiveGatewayPorts after 'clientspecified' should be false")
+	}
+
+	if err := opts.Set("gateway_ports", "invalid"); err == nil {
+		t.Errorf("expected gateway_ports 'invalid' to fail")
 	}
 }
 

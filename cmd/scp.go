@@ -76,10 +76,11 @@ func NewCmdScp() *cobra.Command {
 	// OpenSSH-compatible flags
 	cmd.Flags().Uint16VarP(&o.Port, "port", "P", 0, i18n.T("flag_port"))
 	cmd.Flags().StringVarP(&o.User, "login", "l", "", i18n.T("flag_login"))
-	cmd.Flags().StringVarP(&o.IdentityFile, "identity", "i", "", i18n.T("flag_identity"))
+	cmd.Flags().StringArrayVarP(&o.IdentityFiles, "identity", "i", nil, i18n.T("flag_identity"))
 	cmd.Flags().StringVarP(&o.JumpHost, "jump", "J", "", i18n.T("flag_jump"))
 	cmd.Flags().BoolVarP(&o.Recursive, "recursive", "r", false, i18n.T("flag_recursive"))
 	o.control.RegisterCommonFlags(cmd)
+	o.control.RegisterAddressFamilyFlags(cmd)
 
 	// xops-enhanced flags (long-form only, no short flags to avoid OpenSSH conflicts)
 	cmd.Flags().StringVar(&o.Host, "host", "", i18n.T("flag_hosts"))
@@ -319,9 +320,13 @@ func (o *ScpOptions) RunContext(ctx context.Context) (retErr error) {
 	if err != nil {
 		return fmt.Errorf("%s: %w", i18n.T("config_load_error"), err)
 	}
-	provider, err := config.NewRepository(cfg, configStore)
+	repo, err := config.NewRepository(cfg, configStore)
 	if err != nil {
 		return fmt.Errorf("create configuration repository: %w", err)
+	}
+	provider, err := config.WithOpenSSHConfigOverride(repo, o.control.ConfigFile)
+	if err != nil {
+		return err
 	}
 	connector, err := o.credentialConnector(provider, cfg)
 	if err != nil {
@@ -1047,9 +1052,11 @@ func (o *ScpOptions) resolveTargetForPath(path PathInfo) (config.ConnectionTarge
 }
 
 func (o *ScpOptions) getOrCreateNodeForPath(ctx context.Context, provider config.ConfigProvider, path PathInfo, specificPassword string) (string, bool, error) {
-	repo, ok := provider.(*config.Repository)
+	preparer, ok := provider.(interface {
+		PrepareNodeContext(context.Context, config.EnsureNodeOptions) (config.EnsureNodeResult, error)
+	})
 	if !ok {
-		return "", false, fmt.Errorf("provider does not support node mutation")
+		return "", false, fmt.Errorf("provider does not support node preparation")
 	}
 
 	target, err := o.resolveTargetForPath(path)
@@ -1058,7 +1065,7 @@ func (o *ScpOptions) getOrCreateNodeForPath(ctx context.Context, provider config
 	}
 
 	shouldRemember := cmdutils.EffectiveRememberPolicy(o.Remember, provider.Snapshot()) == cmdutils.RememberPolicyAlways
-	res, err := repo.PrepareNodeContext(ctx, config.EnsureNodeOptions{
+	res, err := preparer.PrepareNodeContext(ctx, config.EnsureNodeOptions{
 		Target:       target,
 		Password:     "",
 		IdentityFile: o.IdentityFile,
@@ -1188,18 +1195,19 @@ func (o *ScpOptions) validateRemoteRelayResumePrefix(ctx context.Context, srcFil
 
 var errPrefixMismatch = errors.New("resume prefix mismatch")
 
-func (o *ScpOptions) credentialConnector(provider *config.Repository, cfg *config.Configuration) (*ssh.Connector, error) {
+func (o *ScpOptions) credentialConnector(provider config.ConfigProvider, cfg *config.Configuration) (*ssh.Connector, error) {
 	if o.interaction == nil {
 		o.interaction = newCLIInteractionHandler()
 	}
 	return o.credentialConnectorWithInteraction(provider, cfg, o.interaction)
 }
 
-func (o *ScpOptions) credentialConnectorWithInteraction(provider *config.Repository, cfg *config.Configuration, interaction *cliInteractionHandler) (*ssh.Connector, error) {
+func (o *ScpOptions) credentialConnectorWithInteraction(provider config.ConfigProvider, cfg *config.Configuration, interaction *cliInteractionHandler) (*ssh.Connector, error) {
 	if err := o.ensureGeneralOptionsApplied(); err != nil {
 		return nil, err
 	}
 	shouldRemember, adpOpts := interaction.rememberOptions(cmdutils.EffectiveRememberPolicy(o.Remember, cfg), cfg)
+	adpOpts = append(adpOpts, adapter.WithLocalExecution(true))
 	batch := o.Tag != "" || strings.Contains(o.Host, ",") || o.HostFile != ""
 	shouldRemember = !batch && shouldRemember
 	if batch {
@@ -1207,22 +1215,24 @@ func (o *ScpOptions) credentialConnectorWithInteraction(provider *config.Reposit
 	}
 	targetNodes := o.resolvedTargetNodeIDs(provider)
 	o.targetNodeIDs = targetNodes
-	keyPath := cmdutils.ToAbsolutePath(o.IdentityFile)
+	hostNameOverride, hostErr := o.effectiveHostName()
+	if hostErr != nil {
+		return nil, hostErr
+	}
+	authOverride := o.buildSessionAuthOverride(hostNameOverride, shouldRemember)
 	if len(targetNodes) > 0 {
 		adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{Remember: shouldRemember}))
 		for _, nodeID := range targetNodes {
-			adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, adapter.SessionAuth{
-				Password: o.Password, Passphrase: o.Passphrase, KeyPath: keyPath, Remember: shouldRemember, OTP: o.OTP, ProxyJump: o.JumpHost,
-			}))
+			adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, authOverride))
 		}
 	} else {
-		adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{
-			Password: o.Password, Passphrase: o.Passphrase, KeyPath: keyPath, Remember: shouldRemember, OTP: o.OTP,
-		}))
+		globalAuth := authOverride
+		globalAuth.ProxyJump = ""
+		adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(globalAuth))
 	}
 
 	// Session Control Overrides (Tier 1)
-	sessionCtrlOpts, err := o.control.ToSessionControlOptions()
+	sessionCtrlOpts, err := o.controlSessionOptions()
 	if err != nil {
 		return nil, err
 	}
@@ -1236,11 +1246,13 @@ func (o *ScpOptions) credentialConnectorWithInteraction(provider *config.Reposit
 		}
 	}
 	if shouldRemember {
-		persistence, serviceErr := interaction.automaticPersistenceOptions(provider, cfg)
-		if serviceErr != nil {
-			return nil, serviceErr
+		if repo, ok := provider.(*config.Repository); ok {
+			persistence, serviceErr := interaction.automaticPersistenceOptions(repo, cfg)
+			if serviceErr != nil {
+				return nil, serviceErr
+			}
+			adpOpts = append(adpOpts, persistence...)
 		}
-		adpOpts = append(adpOpts, persistence...)
 	}
 	if reg, regErr := cmdutils.GetCredentialRegistry(cfg); regErr != nil {
 		return nil, fmt.Errorf("initialize credential resolver: %w", regErr)
@@ -1256,7 +1268,25 @@ func (o *ScpOptions) credentialConnectorWithInteraction(provider *config.Reposit
 	return connector, nil
 }
 
-func (o *ScpOptions) resolvedTargetNodeIDs(provider *config.Repository) []string {
+func (o *ScpOptions) buildSessionAuthOverride(hostNameOverride string, shouldRemember bool) adapter.SessionAuth {
+	absKeys := o.absIdentityFiles()
+	keyPath := normalizeCLIIdentityPath(o.IdentityFile)
+	if keyPath == "" && len(absKeys) > 0 {
+		keyPath = absKeys[0]
+	}
+	return adapter.SessionAuth{
+		Password:   o.Password,
+		Passphrase: o.Passphrase,
+		KeyPath:    keyPath,
+		KeyPaths:   absKeys,
+		HostName:   hostNameOverride,
+		Remember:   shouldRemember,
+		OTP:        o.OTP,
+		ProxyJump:  o.JumpHost,
+	}
+}
+
+func (o *ScpOptions) resolvedTargetNodeIDs(provider config.ConfigProvider) []string {
 	if provider == nil {
 		return nil
 	}
@@ -1280,7 +1310,7 @@ func (o *ScpOptions) resolvedTargetNodeIDs(provider *config.Repository) []string
 	return nodeIDs
 }
 
-func (o *ScpOptions) collectTargetPaths(provider *config.Repository) []PathInfo {
+func (o *ScpOptions) collectTargetPaths(provider config.ConfigProvider) []PathInfo {
 	var paths []PathInfo
 	if o.Tag != "" {
 		for nodeID := range provider.GetNodesByTag(o.Tag) {

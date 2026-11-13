@@ -72,9 +72,10 @@ func NewCmdSftp() *cobra.Command {
 	cmd.Flags().BoolVarP(&o.noOverwrite, "no-clobber", "n", false, i18n.T("flag_no_overwrite"))
 
 	// OpenSSH-compatible flags
-	cmd.Flags().StringVarP(&o.IdentityFile, "identity", "i", "", i18n.T("flag_identity"))
+	cmd.Flags().StringArrayVarP(&o.IdentityFiles, "identity", "i", nil, i18n.T("flag_identity"))
 	cmd.Flags().StringVarP(&o.JumpHost, "jump", "J", "", i18n.T("flag_jump"))
 	o.control.RegisterCommonFlags(cmd)
+	o.control.RegisterAddressFamilyFlags(cmd)
 
 	// xops-enhanced flags (long-form only, no short flags to avoid OpenSSH conflicts)
 	cmd.Flags().StringVar(&o.Host, "host", "", i18n.T("flag_host"))
@@ -131,9 +132,13 @@ func (o *SftpOptions) RunContext(ctx context.Context) (err error) {
 		return fmt.Errorf("%s: %w", i18n.T("config_load_error"), err)
 	}
 
-	provider, err := config.NewRepository(cfg, configStore)
+	repo, err := config.NewRepository(cfg, configStore)
 	if err != nil {
 		return fmt.Errorf("create configuration repository: %w", err)
+	}
+	provider, err := config.WithOpenSSHConfigOverride(repo, connectionOptions.control.ConfigFile)
+	if err != nil {
+		return err
 	}
 
 	var nodeID string
@@ -145,6 +150,7 @@ func (o *SftpOptions) RunContext(ctx context.Context) (err error) {
 	if optErr != nil {
 		return optErr
 	}
+	adpOpts = append(adpOpts, adapter.WithLocalExecution(true))
 	var connector *ssh.Connector
 	// The diagnostic sink must outlive the connector, SFTP client and shell, which
 	// are the event producers. Deferring it first makes it the last cleanup to run.

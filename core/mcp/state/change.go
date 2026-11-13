@@ -46,7 +46,7 @@ func validateSnapshot(view ports.OperationSnapshot) error {
 	for id, target := range view.Targets {
 		for _, hop := range target.Plan.Hops {
 			identity := endpoint(hop)
-			if previous, ok := seen[hop.NodeID]; ok && previous != identity {
+			if previous, ok := seen[hop.NodeID]; ok && !reflect.DeepEqual(previous, identity) {
 				return fmt.Errorf("node %q contains an inconsistent snapshot of shared hop %q", id, hop.NodeID)
 			}
 			seen[hop.NodeID] = identity
@@ -133,7 +133,7 @@ func authenticationChanged(old, next ssh.ConnectionPlan) bool {
 		if !ok {
 			continue
 		}
-		if before.AuthType != hop.AuthType || before.AuthUpdateToken != hop.AuthUpdateToken || before.SudoUpdateToken != hop.SudoUpdateToken || before.KeyRef != hop.KeyRef || before.KeyPath != hop.KeyPath || before.TrustVersion != hop.TrustVersion {
+		if before.AuthType != hop.AuthType || before.AuthUpdateToken != hop.AuthUpdateToken || before.SudoUpdateToken != hop.SudoUpdateToken || before.KeyRef != hop.KeyRef || before.KeyPath != hop.KeyPath || !slices.Equal(before.KeyPaths, hop.KeyPaths) || !slices.Equal(before.Options.IdentityFiles(), hop.Options.IdentityFiles()) || before.TrustVersion != hop.TrustVersion {
 			return true
 		}
 	}
