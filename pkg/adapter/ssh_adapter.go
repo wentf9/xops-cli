@@ -505,8 +505,17 @@ func NewConnectorWithInteraction(cfgProvider config.ConfigProvider, interaction 
 	return NewConnector(cfgProvider, finalOpts...)
 }
 
+func (a *SSHAdapter) localExecEnabled() bool {
+	return a != nil && a.localExecution && !a.nonInteractive
+}
+
 func newConnector(adp *SSHAdapter, opts ...ssh.Option) *ssh.Connector {
-	finalOpts := []ssh.Option{ssh.WithEnvironment(sshenv.Discover())}
+	env := sshenv.Discover()
+	if adp.localExecEnabled() {
+		env.DialProxyCommand = sshenv.DefaultDialProxyCommand
+		env.RunLocalCommand = sshenv.DefaultRunLocalCommand
+	}
+	finalOpts := []ssh.Option{ssh.WithEnvironment(env)}
 	if cfg := adp.cfgProvider.Snapshot(); cfg != nil && cfg.PasswordPromptPattern != "" {
 		finalOpts = append(finalOpts, ssh.WithPasswordPromptPattern(cfg.PasswordPromptPattern))
 	}
@@ -564,9 +573,14 @@ func (a *SSHAdapter) ResolveSSHOptions(nodeName string, sessionOpts SessionContr
 	}
 
 	t2Opts, t3Opts, t4Opts := a.resolveOptionTiers(nodeName)
+	tier1ActiveJump := a.hasActiveTier1ProxyJump(nodeName)
+	t2Opts, t3Opts, t4Opts = a.maskLowerProxyCommandForProxyJump(nodeName, tier1ActiveJump, t2Opts, t3Opts, t4Opts)
 	merged, err := ssh.EffectiveOptions(sessionOpts.ToSSHOptions(), t2Opts, t3Opts, t4Opts)
 	if err != nil {
 		return nil, err
+	}
+	if tier1ActiveJump && merged != nil {
+		merged.Delete(ssh.OptionProxyCommand)
 	}
 	if merged.IsEmpty() {
 		return nil, nil
@@ -591,7 +605,9 @@ func (a *SSHAdapter) ResolveSSHOptions(nodeName string, sessionOpts SessionContr
 	if a.nonInteractive {
 		merged.Delete(ssh.OptionForwardAgent)
 	}
-	if !a.localExecution {
+	if !a.localExecEnabled() {
+		merged.Delete(ssh.OptionLocalCommand)
+		merged.Delete(ssh.OptionPermitLocalCommand)
 		if key := firstLocalExecOption(merged); key != "" {
 			return nil, fmt.Errorf("%w: %s", ErrLocalExecutionDisabled, key)
 		}
@@ -606,15 +622,56 @@ func firstLocalExecOption(opts *ssh.Options) string {
 	if opts == nil {
 		return ""
 	}
-	for _, spec := range ssh.RegisteredOptionSpecs() {
-		if spec.Class == ssh.OptionClassLocalExec && strings.TrimSpace(opts.Get(spec.CanonicalKey)) != "" {
-			return spec.OpenSSHName
-		}
-	}
-	if strings.TrimSpace(opts.Get("proxy_command")) != "" {
+	if opts.ActiveProxyCommand() != "" {
 		return "ProxyCommand"
 	}
 	return ""
+}
+
+func cloneWithoutProxyCommand(opts *ssh.Options) *ssh.Options {
+	if opts == nil || opts.Get(ssh.OptionProxyCommand) == "" {
+		return opts
+	}
+	cloned := opts.Clone()
+	cloned.Delete(ssh.OptionProxyCommand)
+	return cloned
+}
+
+func isActiveProxyJumpValue(val string) bool {
+	trimmed := strings.TrimSpace(val)
+	return trimmed != "" && !strings.EqualFold(trimmed, "none")
+}
+
+func (a *SSHAdapter) hasActiveTier1ProxyJump(nodeName string) bool {
+	override, ok := a.getSessionOverride(nodeName)
+	return ok && isActiveProxyJumpValue(override.ProxyJump)
+}
+
+func (a *SSHAdapter) maskLowerProxyCommandForProxyJump(nodeName string, tier1ActiveJump bool, t2Opts, t3Opts, t4Opts *ssh.Options) (*ssh.Options, *ssh.Options, *ssh.Options) {
+	if tier1ActiveJump {
+		return cloneWithoutProxyCommand(t2Opts), cloneWithoutProxyCommand(t3Opts), cloneWithoutProxyCommand(t4Opts)
+	}
+	if !strings.HasPrefix(nodeName, config.OpenSSHNodePrefix) {
+		if snap, err := a.cfgProvider.ResolveConnection(nodeName); err == nil && isActiveProxyJumpValue(snap.Node.ProxyJump) {
+			return t2Opts, cloneWithoutProxyCommand(t3Opts), cloneWithoutProxyCommand(t4Opts)
+		}
+	}
+	return t2Opts, t3Opts, t4Opts
+}
+
+func (a *SSHAdapter) higherTierProxyCommandOverridesJump(nodeID string, sessionCtrlOpts SessionControlOptions, hasTier1ProxyJump bool, nodeProxyJump string) bool {
+	if hasTier1ProxyJump || !isActiveProxyJumpValue(nodeProxyJump) {
+		return false
+	}
+	if sessionCtrlOpts.Options != nil && sessionCtrlOpts.Options.ActiveProxyCommand() != "" {
+		return true
+	}
+	if strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) {
+		if globalCfg := a.cfgProvider.Snapshot(); globalCfg != nil && globalCfg.SSHOptions != nil && globalCfg.SSHOptions.ActiveProxyCommand() != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *SSHAdapter) resolveOptionTiers(nodeName string) (tier2Node, tier3Global, tier4OpenSSH *ssh.Options) {
@@ -1040,6 +1097,10 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 		if err := a.applySessionOverrideToConfig(nodeID, cfg, override); err != nil {
 			return nil, err
 		}
+	}
+	if a.higherTierProxyCommandOverridesJump(nodeID, sessionCtrlOpts, hasOverride && isActiveProxyJumpValue(override.ProxyJump), snapshot.Node.ProxyJump) {
+		cfg.ProxyJump = ""
+		cfg.OriginalProxyJump = ""
 	}
 
 	var cliOptKeys []string

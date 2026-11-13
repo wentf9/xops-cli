@@ -270,11 +270,7 @@ func (p *OpenSSHParser) GetVirtualNode(alias string) (models.Node, models.Host, 
 		}
 	}
 
-	proxyJump, err := p.getVal(lookupAlias, "ProxyJump", "")
-	if err != nil {
-		return models.Node{}, models.Host{}, models.Identity{}, err
-	}
-	proxyJump = parseOpenSSHProxyJump(proxyJump)
+	_, proxyJump, _ := firstMatchingOpenSSHProxy(p.cfg, lookupAlias)
 
 	sshOpts, err := parseOpenSSHOptions(p.cfg, lookupAlias)
 	if err != nil {
@@ -352,11 +348,11 @@ func parseOpenSSHOptions(cfg *ssh_config.Config, host string) (*ssh.Options, err
 			}
 			continue
 		}
-		val, err := firstMatchingOpenSSHOption(cfg, host, spec)
+		val, skip, err := resolveOpenSSHSingleOption(cfg, host, spec)
 		if err != nil {
 			return nil, err
 		}
-		if val == "" {
+		if skip || val == "" {
 			continue
 		}
 		if spec.Class == ssh.OptionClassTrust && !strings.EqualFold(strings.TrimSpace(val), "yes") {
@@ -432,6 +428,19 @@ func allMatchingOpenSSHOptions(cfg *ssh_config.Config, host string, spec ssh.Opt
 // OpenSSH first-match-wins order across both the primary OpenSSHName and its aliases.
 func isAllowedOpenSSHTrustOption(canonicalKey string) bool {
 	return strings.EqualFold(strings.TrimSpace(canonicalKey), "hash_known_hosts")
+}
+
+func resolveOpenSSHSingleOption(cfg *ssh_config.Config, host string, spec ssh.OptionSpec) (val string, skip bool, err error) {
+	if spec.CanonicalKey == ssh.OptionProxyCommand {
+		var winner string
+		winner, _, val = firstMatchingOpenSSHProxy(cfg, host)
+		if winner == "proxyjump" {
+			return "", true, nil
+		}
+		return val, false, nil
+	}
+	val, err = firstMatchingOpenSSHOption(cfg, host, spec)
+	return val, false, err
 }
 
 func firstMatchingOpenSSHOption(cfg *ssh_config.Config, host string, spec ssh.OptionSpec) (string, error) {
@@ -578,4 +587,59 @@ func parseOpenSSHProxyJump(raw string) string {
 		parsedHops = append(parsedHops, OpenSSHNodePrefix+hop)
 	}
 	return strings.Join(parsedHops, ",")
+}
+
+// firstMatchingOpenSSHProxy resolves ProxyJump and ProxyCommand in OpenSSH
+// first-match-wins order across matching Host blocks, including "none" stopping
+// further search for that directive.
+func firstMatchingOpenSSHProxy(cfg *ssh_config.Config, host string) (winner, proxyJump, proxyCommand string) {
+	if cfg == nil || host == "" {
+		return "", "", ""
+	}
+	var sawJump, sawCmd bool
+	var jumpVal, cmdVal string
+	for _, h := range cfg.Hosts {
+		if !h.Matches(host) {
+			continue
+		}
+		for _, node := range h.Nodes {
+			kv, ok := node.(*ssh_config.KV)
+			if !ok || kv == nil {
+				continue
+			}
+			v := strings.TrimSpace(kv.Value)
+			if v == "" {
+				continue
+			}
+			switch strings.ToLower(strings.TrimSpace(kv.Key)) {
+			case "proxyjump":
+				if !sawJump {
+					sawJump = true
+					jumpVal = v
+					if winner == "" && !strings.EqualFold(v, "none") {
+						winner = "proxyjump"
+					}
+				}
+			case "proxycommand":
+				if !sawCmd {
+					sawCmd = true
+					cmdVal = v
+					if winner == "" && !strings.EqualFold(v, "none") {
+						winner = "proxycommand"
+					}
+				}
+			}
+		}
+	}
+	switch winner {
+	case "proxyjump":
+		return winner, parseOpenSSHProxyJump(jumpVal), ""
+	case "proxycommand":
+		return winner, "", cmdVal
+	default:
+		if sawCmd {
+			return "", "", cmdVal
+		}
+		return "", "", ""
+	}
 }

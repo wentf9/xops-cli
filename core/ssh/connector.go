@@ -343,15 +343,19 @@ func (c *Connector) connectPlan(ctx context.Context, plan []connectionPlanNode) 
 			connected = validated
 			continue
 		}
-		dialer := c.baseDialer
-		if dialer == nil {
-			dialer = c.directDialerFor(planNode.cfg)
-		}
-		if planNode.cfg.ProxyJump != "" {
+		var dialer Dialer
+		switch {
+		case planNode.cfg.ProxyJump != "":
 			if connected == nil {
 				return nil, fmt.Errorf("resolved proxy jump '%s' for node '%s' has no client", planNode.cfg.ProxyJump, planNode.name)
 			}
 			dialer = &SSHProxyDialer{Client: connected.sshClient, RootConn: connected.rootConn}
+		case planNode.cfg.Options.ActiveProxyCommand() != "":
+			dialer = &proxyCommandDialer{connector: c, planNode: planNode}
+		case c.baseDialer != nil:
+			dialer = c.baseDialer
+		default:
+			dialer = c.directDialerFor(planNode.cfg)
 		}
 
 		var err error
@@ -1646,19 +1650,32 @@ func (c *Connector) handleHandshakeFailure(ctx context.Context, coordinator *han
 	return &HandshakeError{NodeID: nodeName, Err: handshakeErr}
 }
 
-func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, cfg *ClientConfig, dialer Dialer, sshConfig *ssh.ClientConfig, coordinator *handshakeCoordinator, authentication *authenticationTrace) (*ssh.Client, net.Conn, error) {
+func (c *Connector) resolveHandshakeDialer(nodeName string, cfg *ClientConfig, dialer Dialer) (Dialer, bool, bool) {
+	if dialer == nil && cfg != nil && cfg.ProxyJump == "" && cfg.Options.ActiveProxyCommand() != "" {
+		dialer = &proxyCommandDialer{
+			connector: c,
+			planNode:  connectionPlanNode{name: nodeName, cfg: cfg},
+		}
+	}
 	if dialer == nil {
 		dialer = c.baseDialer
 	}
 	if dialer == nil {
 		dialer = c.directDialerFor(cfg)
 	}
+	_, isJump := dialer.(*SSHProxyDialer)
+	_, isProxyCmd := dialer.(*proxyCommandDialer)
+	return dialer, isJump, isProxyCmd
+}
+
+func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, cfg *ClientConfig, dialer Dialer, sshConfig *ssh.ClientConfig, coordinator *handshakeCoordinator, authentication *authenticationTrace) (*ssh.Client, net.Conn, error) {
+	var isJump, isProxyCmd bool
+	dialer, isJump, isProxyCmd = c.resolveHandshakeDialer(nodeName, cfg, dialer)
 	if cfg.Port == 0 {
 		cfg.Port = 22
 	}
 	targetAddr := fmt.Sprintf("%s:%d", cfg.Address, cfg.Port)
-	_, proxied := dialer.(*SSHProxyDialer)
-	event := logger.Diagnostic{Kind: logger.Connecting, NodeID: nodeName, Host: cfg.Address, User: cfg.User, Port: cfg.Port, Proxied: proxied}
+	event := logger.Diagnostic{Kind: logger.Connecting, NodeID: nodeName, Host: cfg.Address, User: cfg.User, Port: cfg.Port, Proxied: isJump || isProxyCmd}
 	logger.EmitDiagnostic(c.diagnostics, event)
 	conn, err := dialer.DialContext(ctx, cfg.Options.DialNetwork(), targetAddr)
 	if err != nil {
@@ -1683,7 +1700,7 @@ func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, cfg *
 	}
 	event.Kind = logger.Connected
 	logger.EmitDiagnostic(c.diagnostics, event)
-	if _, proxied := dialer.(*SSHProxyDialer); !proxied {
+	if !isJump {
 		conn = &physicalSSHConn{Conn: conn}
 	}
 	if err := c.initHandshakeDeadline(ctx, conn, nodeName, c.getNodeHandshakeTimeout(cfg), coordinator); err != nil {

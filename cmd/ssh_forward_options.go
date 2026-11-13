@@ -492,12 +492,16 @@ func (o *SshOptions) resolveAndCacheSessionOptions(provider config.ConfigProvide
 	if lookupKey == "" {
 		lookupKey = connTarget.Selector
 	}
-	eff, err := adapter.NewSSHAdapter(provider).ResolveSSHOptions(lookupKey, sessionOpts)
+	adpOpts := []adapter.Option{adapter.WithLocalExecution(!isMuxDaemonChild())}
+	if jump := strings.TrimSpace(o.JumpHost); jump != "" {
+		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(lookupKey, adapter.SessionAuth{ProxyJump: jump}))
+	}
+	eff, err := adapter.NewSSHAdapter(provider, adpOpts...).ResolveSSHOptions(lookupKey, sessionOpts)
 	if err != nil {
 		return nil, err
 	}
 	if isMuxDaemonChild() && eff != nil {
-		eff.StripClasses(ssh.OptionClassSession)
+		eff.StripClasses(ssh.OptionClassSession, ssh.OptionClassLocalExec)
 		eff.Delete(ssh.OptionForwardAgent)
 	}
 	o.effectiveSSHOptions = eff

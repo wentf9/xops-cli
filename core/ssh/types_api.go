@@ -332,6 +332,10 @@ func validateTargetCompatibility(cur ConnectionConfig, newCfg *ClientConfig) err
 		return fmt.Errorf("%w: address family changed (expected %q, got %q)",
 			ErrSnapshotMismatch, cur.Options.AddressFamily(), newCfg.Options.AddressFamily())
 	}
+	return validateRoutingTargetCompatibility(cur, newCfg)
+}
+
+func validateRoutingTargetCompatibility(cur ConnectionConfig, newCfg *ClientConfig) error {
 	expectedJump := cur.ProxyJump
 	if cur.HasOriginalProxyJump {
 		expectedJump = cur.OriginalProxyJump
@@ -347,6 +351,18 @@ func validateTargetCompatibility(cur ConnectionConfig, newCfg *ClientConfig) err
 	if actualJump != expectedJump {
 		return fmt.Errorf("%w: proxy jump changed (expected %q, got %q)",
 			ErrSnapshotMismatch, expectedJump, actualJump)
+	}
+	expectedProxyCmd := ""
+	if expectedJump == "" {
+		expectedProxyCmd = cur.Options.ActiveProxyCommand()
+	}
+	actualProxyCmd := ""
+	if actualJump == "" {
+		actualProxyCmd = newCfg.Options.ActiveProxyCommand()
+	}
+	if actualProxyCmd != expectedProxyCmd {
+		return fmt.Errorf("%w: proxy command changed (expected %q, got %q)",
+			ErrSnapshotMismatch, expectedProxyCmd, actualProxyCmd)
 	}
 	return nil
 }

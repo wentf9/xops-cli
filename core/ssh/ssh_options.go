@@ -69,6 +69,9 @@ const (
 	OptionLocalForward                 = "local_forward"
 	OptionRemoteForward                = "remote_forward"
 	OptionDynamicForward               = "dynamic_forward"
+	OptionProxyCommand                 = "proxy_command"
+	OptionLocalCommand                 = "local_command"
+	OptionPermitLocalCommand           = "permit_local_command"
 )
 
 // OptionClass categorizes OpenSSH options by security and functional domain.
@@ -583,6 +586,30 @@ var optionRegistry = []OptionSpec{
 		OpenSSHName:  "EscapeChar",
 		Class:        OptionClassSession,
 		Normalize:    validateEscapeCharOption,
+	},
+	{
+		CanonicalKey: OptionProxyCommand,
+		OpenSSHName:  "ProxyCommand",
+		Class:        OptionClassLocalExec,
+		Normalize: func(raw string) (string, error) {
+			return validateLocalExecCommandOption("ProxyCommand", raw)
+		},
+	},
+	{
+		CanonicalKey: OptionLocalCommand,
+		OpenSSHName:  "LocalCommand",
+		Class:        OptionClassLocalExec,
+		Normalize: func(raw string) (string, error) {
+			return validateLocalExecCommandOption("LocalCommand", raw)
+		},
+	},
+	{
+		CanonicalKey: OptionPermitLocalCommand,
+		OpenSSHName:  "PermitLocalCommand",
+		Class:        OptionClassLocalExec,
+		Normalize: func(raw string) (string, error) {
+			return normalizeYesNoOption("PermitLocalCommand", raw)
+		},
 	},
 }
 

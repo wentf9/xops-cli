@@ -635,6 +635,9 @@ func (o *SshOptions) runParentDaemonWithNode(ctx context.Context, cfg *config.Co
 			}
 		}
 	}()
+	if lcErr := runPostAuthLocalCommand(ctx, client, o.effectiveSSHOptions, os.Stderr, false); lcErr != nil {
+		return lcErr
+	}
 
 	// Validation tunnels own their child context. Closing them must leave the
 	// command-owned output context alive until auxiliary output has flushed.
@@ -787,28 +790,92 @@ func (o *SshOptions) getActiveMuxServer(ctx context.Context, provider config.Con
 // handoffPersistentMaster releases this process's master and starts a detached
 // master so ControlPersist survives the session, matching OpenSSH behavior for a
 // command or interactive shell that finished.
-func (o *SshOptions) handoffPersistentMaster(ctx context.Context, connector *ssh.Connector, provider config.ConfigProvider, nodeID string) error {
-	if isMuxDaemonChild() || o.effectiveBgRun() {
-		// This process owns the master for its whole lifetime.
-		return nil
-	}
-	if o.effectiveNoCmd() {
-		// A -N process holds the master until it stops; there is nothing to hand
-		// over, and spawning a second daemon would duplicate the master.
-		return nil
+func (o *SshOptions) shouldSkipMasterHandoff(ctx context.Context, connector *ssh.Connector, provider config.ConfigProvider, nodeID string) bool {
+	if isMuxDaemonChild() || o.effectiveBgRun() || o.effectiveNoCmd() {
+		return true
 	}
 	if ctx != nil && ctx.Err() != nil {
 		// The session was interrupted (Ctrl-C/cancellation). Reviving the master
 		// would resurrect what the user just stopped.
-		return nil
+		return true
 	}
 	if err := drainOwnedMasters(ctx, connector); err != nil {
-		return nil
+		return true
 	}
 	if o.OTP != "" {
 		// A one-time code was already consumed by this process. Re-playing it in
 		// the daemon cannot succeed and may trip server-side MFA lockouts.
 		logger.DefaultLogger().Debugf("mux: skipping master handoff because a one-time password was used")
+		return true
+	}
+	if o.hasActiveProxyCommandInPath(provider, nodeID, connector) {
+		// Detached --mux-daemon runs with localExecution disabled; keep ProxyCommand
+		// masters in foreground instead of handing off to a daemon that cannot re-dial.
+		logger.DefaultLogger().Debugf("mux: skipping master handoff because ProxyCommand is active")
+		return true
+	}
+	return false
+}
+
+func (o *SshOptions) hasActiveProxyCommandInPath(provider config.ConfigProvider, nodeID string, connector *ssh.Connector) bool {
+	if o != nil && o.effectiveSSHOptions != nil && o.effectiveSSHOptions.ActiveProxyCommand() != "" {
+		return true
+	}
+	if provider == nil {
+		return false
+	}
+	checkAdp := adapter.NewSSHAdapter(provider, adapter.WithLocalExecution(true))
+	if jumpChain := o.effectiveProxyJumpChain(provider, nodeID); jumpChain != "" {
+		for _, hop := range strings.Split(jumpChain, ",") {
+			hop = strings.TrimSpace(hop)
+			if hop == "" {
+				continue
+			}
+			if hopOpts, err := checkAdp.ResolveSSHOptions(hop, adapter.SessionControlOptions{}); err == nil && hopOpts != nil && hopOpts.ActiveProxyCommand() != "" {
+				return true
+			}
+		}
+	}
+	if connector != nil {
+		for _, m := range connector.Masters() {
+			if m == nil {
+				continue
+			}
+			targetHost := strings.TrimSpace(m.Target().OriginalHost)
+			if targetHost == "" {
+				continue
+			}
+			if mOpts, err := checkAdp.ResolveSSHOptions(targetHost, adapter.SessionControlOptions{}); err == nil && mOpts != nil && mOpts.ActiveProxyCommand() != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (o *SshOptions) effectiveProxyJumpChain(provider config.ConfigProvider, nodeID string) string {
+	if o != nil {
+		jump := strings.TrimSpace(o.JumpHost)
+		if strings.EqualFold(jump, "none") {
+			return ""
+		}
+		if jump != "" {
+			if resolved, err := provider.ResolveProxyJumpChain(jump); err == nil {
+				return resolved
+			}
+			return jump
+		}
+	}
+	if nodeID != "" {
+		if snap, err := provider.ResolveConnection(nodeID); err == nil {
+			return strings.TrimSpace(snap.Node.ProxyJump)
+		}
+	}
+	return ""
+}
+
+func (o *SshOptions) handoffPersistentMaster(ctx context.Context, connector *ssh.Connector, provider config.ConfigProvider, nodeID string) error {
+	if o.shouldSkipMasterHandoff(ctx, connector, provider, nodeID) {
 		return nil
 	}
 	if nodeID != "" && len(o.targetNodeIDs) == 0 {
@@ -1233,11 +1300,40 @@ func isTargetSpecificOption(opt string) bool {
 		return false
 	}
 	switch strings.ToLower(key) {
-	case "port", "user", "proxyjump", "identityfile", "hostname":
+	case "port", "user", "proxyjump", "identityfile", "hostname",
+		"proxycommand", "proxy_command",
+		"localcommand", "local_command",
+		"permitlocalcommand", "permit_local_command":
 		return true
 	default:
 		return false
 	}
+}
+
+type postAuthLocalRunner interface {
+	RunPostAuthLocalCommand(ctx context.Context) error
+}
+
+func runPostAuthLocalCommand(ctx context.Context, client postAuthLocalRunner, effOpts *ssh.Options, stderr io.Writer, isChild bool) error {
+	if isChild || isMuxDaemonChild() || client == nil || effOpts == nil {
+		return nil
+	}
+	if !effOpts.PermitLocalCommand() {
+		return nil
+	}
+	cmd := strings.TrimSpace(effOpts.LocalCommand())
+	if cmd == "" || cmd == "none" {
+		return nil
+	}
+	if err := client.RunPostAuthLocalCommand(ctx); err != nil {
+		if exitOnFail, _ := effOpts.ExitOnForwardFailure(); exitOnFail {
+			return fmt.Errorf("LocalCommand failed: %w", err)
+		}
+		if stderr != nil {
+			_, _ = fmt.Fprintf(stderr, "Warning: LocalCommand failed: %v\n", err)
+		}
+	}
+	return nil
 }
 
 func (o *SshOptions) resolveMuxDaemonTarget(nodeID string, master *ssh.MuxServer) (host string, port int, user string) {
@@ -1456,6 +1552,27 @@ func (o *SshOptions) connectClient(ctx context.Context, connector *ssh.Connector
 	return client, nil
 }
 
+func (o *SshOptions) maybeRedirectStdinNull() (func() error, error) {
+	if !o.effectiveStdinNull() || o.stdinRedirected {
+		return func() error { return nil }, nil
+	}
+	devNull, devErr := os.Open(os.DevNull)
+	if devErr != nil {
+		return nil, fmt.Errorf("open %s for SSH stdin failed: %w", os.DevNull, devErr)
+	}
+	oldStdin := os.Stdin
+	os.Stdin = devNull
+	o.stdinRedirected = true
+	return func() error {
+		os.Stdin = oldStdin
+		o.stdinRedirected = false
+		if closeErr := devNull.Close(); closeErr != nil {
+			return fmt.Errorf("close SSH stdin redirect failed: %w", closeErr)
+		}
+		return nil
+	}, nil
+}
+
 func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error) {
 	repo, cfg, err := o.loadConfigRepository()
 	if err != nil {
@@ -1501,6 +1618,9 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 			err = errors.Join(err, fmt.Errorf("close SSH client failed: %w", closeErr))
 		}
 	}()
+	if lcErr := runPostAuthLocalCommand(ctx, client, o.effectiveSSHOptions, os.Stderr, isChild); lcErr != nil {
+		return lcErr
+	}
 	// Setup background context for tunnels and execution (runs until SigInt or command exit)
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
@@ -1527,22 +1647,15 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 		}
 	}()
 
-	if o.effectiveStdinNull() && !o.stdinRedirected {
-		devNull, devErr := os.Open(os.DevNull)
-		if devErr != nil {
-			return fmt.Errorf("open %s for SSH stdin failed: %w", os.DevNull, devErr)
-		}
-		oldStdin := os.Stdin
-		os.Stdin = devNull
-		o.stdinRedirected = true
-		defer func() {
-			os.Stdin = oldStdin
-			o.stdinRedirected = false
-			if closeErr := devNull.Close(); closeErr != nil {
-				err = errors.Join(err, fmt.Errorf("close SSH stdin redirect failed: %w", closeErr))
-			}
-		}()
+	restoreStdin, err := o.maybeRedirectStdinNull()
+	if err != nil {
+		return err
 	}
+	defer func() {
+		if restoreErr := restoreStdin(); restoreErr != nil {
+			err = errors.Join(err, restoreErr)
+		}
+	}()
 
 	return o.runConnectedSession(runCtx, connector, client, provider, nodeID, tunnels, isChild)
 }
