@@ -150,7 +150,7 @@ func (o *SftpOptions) RunContext(ctx context.Context) (err error) {
 	if optErr != nil {
 		return optErr
 	}
-	adpOpts = append(adpOpts, adapter.WithLocalExecution(true))
+	adpOpts = append(adpOpts, adapter.WithLocalExecution(true), adapter.WithSessionAndForwardOptions(false))
 	var connector *ssh.Connector
 	// The diagnostic sink must outlive the connector, SFTP client and shell, which
 	// are the event producers. Deferring it first makes it the last cleanup to run.

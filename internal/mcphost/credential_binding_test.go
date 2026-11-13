@@ -2,8 +2,12 @@ package mcphost
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +20,7 @@ import (
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
+	cryptoSSH "golang.org/x/crypto/ssh"
 )
 
 func credentialBindingConfig() *config.Configuration {
@@ -305,5 +310,215 @@ func TestCredentialVersionBindsHopKeyPathsAndOrder(t *testing.T) {
 	}
 	if vBase == vExtended || vReordered == vExtended {
 		t.Fatal("adding to hop.KeyPaths must change credentialVersion")
+	}
+}
+
+func writeTestUserCertForBinding(t *testing.T, path string, serial uint64, validBefore uint64) {
+	t.Helper()
+	caPub, caPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caSigner, err := cryptoSSH.NewSignerFromKey(caPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	userPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sshUserPub, err := cryptoSSH.NewPublicKey(userPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = caPub
+	cert := &cryptoSSH.Certificate{
+		Key:             sshUserPub,
+		Serial:          serial,
+		CertType:        cryptoSSH.UserCert,
+		KeyId:           "mcp-binding-test",
+		ValidPrincipals: []string{"fixture"},
+		ValidAfter:      100,
+		ValidBefore:     validBefore,
+	}
+	if err := cert.SignCert(rand.Reader, caSigner); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, cryptoSSH.MarshalAuthorizedKey(cert), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCredentialVersionBindsCertificatesAndIdentityAgent(t *testing.T) {
+	cfg := credentialBindingConfig()
+	provider := config.NewProviderWithoutOpenSSH(cfg)
+
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "id_ed25519")
+	if err := os.WriteFile(keyPath, []byte("placeholder-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	baseHop := ssh.ConnectionConfig{
+		NodeID:   "node",
+		Address:  "192.0.2.1",
+		Port:     22,
+		User:     "fixture",
+		KeyPaths: []string{keyPath},
+	}
+
+	vPlain, err := credentialVersion(provider, ssh.ConnectionPlan{Scope: "scope", Hops: []ssh.ConnectionConfig{baseHop}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Auto-discovered <key>-cert.pub sidecar creation and rotation must change credentialVersion.
+	sidecarCert := keyPath + "-cert.pub"
+	writeTestUserCertForBinding(t, sidecarCert, 1, 2000)
+	vSidecar1, err := credentialVersion(provider, ssh.ConnectionPlan{Scope: "scope", Hops: []ssh.ConnectionConfig{baseHop}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vSidecar1 == vPlain {
+		t.Fatal("creating sidecar user certificate must change credentialVersion")
+	}
+
+	writeTestUserCertForBinding(t, sidecarCert, 2, 4000)
+	vSidecar2, err := credentialVersion(provider, ssh.ConnectionPlan{Scope: "scope", Hops: []ssh.ConnectionConfig{baseHop}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vSidecar2 == vSidecar1 {
+		t.Fatal("rotating sidecar user certificate serial/validity must change credentialVersion")
+	}
+
+	// 2. Explicit CertificateFile and IdentityAgent options must bind and track in-place cert rotation.
+	explicitCert := filepath.Join(dir, "explicit-cert.pub")
+	writeTestUserCertForBinding(t, explicitCert, 10, 5000)
+	hopWithOpts := baseHop.Clone()
+	opts := &ssh.Options{}
+	if err := opts.Set(ssh.OptionCertificateFile, explicitCert); err != nil {
+		t.Fatal(err)
+	}
+	if err := opts.Set(ssh.OptionIdentityAgent, "/run/agent-a.sock"); err != nil {
+		t.Fatal(err)
+	}
+	hopWithOpts.Options = opts
+
+	vExplicit1, err := credentialVersion(provider, ssh.ConnectionPlan{Scope: "scope", Hops: []ssh.ConnectionConfig{hopWithOpts}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vExplicit1 == vSidecar2 {
+		t.Fatal("explicit CertificateFile + IdentityAgent must change credentialVersion")
+	}
+
+	writeTestUserCertForBinding(t, explicitCert, 11, 9000)
+	vExplicit2, err := credentialVersion(provider, ssh.ConnectionPlan{Scope: "scope", Hops: []ssh.ConnectionConfig{hopWithOpts}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vExplicit2 == vExplicit1 {
+		t.Fatal("rotating explicit CertificateFile must change credentialVersion")
+	}
+
+	hopAgentChanged := hopWithOpts.Clone()
+	if err := hopAgentChanged.Options.Set(ssh.OptionIdentityAgent, "none"); err != nil {
+		t.Fatal(err)
+	}
+	vAgentNone, err := credentialVersion(provider, ssh.ConnectionPlan{Scope: "scope", Hops: []ssh.ConnectionConfig{hopAgentChanged}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vAgentNone == vExplicit2 {
+		t.Fatal("changing IdentityAgent must change credentialVersion")
+	}
+}
+
+func TestCredentialVersionBindsDefaultIdentitySidecarCert(t *testing.T) {
+	homeDir := t.TempDir()
+	sshDir := filepath.Join(homeDir, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+
+	defaultKey := filepath.Join(sshDir, "id_ed25519")
+	if err := os.WriteFile(defaultKey, []byte("placeholder-default-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	defaultSidecar := defaultKey + "-cert.pub"
+
+	cfg := credentialBindingConfig()
+	node, _ := cfg.Nodes.Get("node")
+	node.SSHOptions = nil
+	cfg.Nodes.Set("node", node)
+	provider := config.NewProviderWithoutOpenSSH(cfg)
+
+	baseHop := ssh.ConnectionConfig{
+		NodeID:  "node",
+		Address: "192.0.2.1",
+		Port:    22,
+		User:    "fixture",
+	}
+
+	vNoCert, err := credentialVersion(provider, ssh.ConnectionPlan{Scope: "scope", Hops: []ssh.ConnectionConfig{baseHop}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writeTestUserCertForBinding(t, defaultSidecar, 50, 5000)
+	vCert1, err := credentialVersion(provider, ssh.ConnectionPlan{Scope: "scope", Hops: []ssh.ConnectionConfig{baseHop}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vCert1 == vNoCert {
+		t.Fatal("creating ~/.ssh/id_ed25519-cert.pub must change credentialVersion")
+	}
+
+	writeTestUserCertForBinding(t, defaultSidecar, 51, 9000)
+	vCert2, err := credentialVersion(provider, ssh.ConnectionPlan{Scope: "scope", Hops: []ssh.ConnectionConfig{baseHop}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vCert2 == vCert1 {
+		t.Fatal("rotating ~/.ssh/id_ed25519-cert.pub must change credentialVersion")
+	}
+
+	// With IdentitiesOnly=yes and an explicit key, default sidecar rotation is ignored;
+	// with IdentitiesOnly=yes and NO explicit key, default sidecar rotation is still bound.
+	explicitKey := filepath.Join(homeDir, "explicit_id")
+	if err := os.WriteFile(explicitKey, []byte("explicit"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	idOnlyHop := baseHop.Clone()
+	idOnlyHop.KeyPaths = []string{explicitKey}
+	idOnlyHop.Options = ssh.MustOptions(ssh.OptionIdentitiesOnly, "yes")
+	vExplicitIDOnly1, err := credentialVersion(provider, ssh.ConnectionPlan{Scope: "scope", Hops: []ssh.ConnectionConfig{idOnlyHop}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestUserCertForBinding(t, defaultSidecar, 52, 12000)
+	vExplicitIDOnly2, err := credentialVersion(provider, ssh.ConnectionPlan{Scope: "scope", Hops: []ssh.ConnectionConfig{idOnlyHop}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vExplicitIDOnly1 != vExplicitIDOnly2 {
+		t.Fatal("IdentitiesOnly=yes with explicit key must ignore default sidecar cert rotation")
+	}
+
+	noExplicitIDOnlyHop := baseHop.Clone()
+	noExplicitIDOnlyHop.Options = ssh.MustOptions(ssh.OptionIdentitiesOnly, "yes")
+	vNoExplicit1, err := credentialVersion(provider, ssh.ConnectionPlan{Scope: "scope", Hops: []ssh.ConnectionConfig{noExplicitIDOnlyHop}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestUserCertForBinding(t, defaultSidecar, 53, 15000)
+	vNoExplicit2, err := credentialVersion(provider, ssh.ConnectionPlan{Scope: "scope", Hops: []ssh.ConnectionConfig{noExplicitIDOnlyHop}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vNoExplicit1 == vNoExplicit2 {
+		t.Fatal("IdentitiesOnly=yes without explicit key must bind default sidecar cert rotation")
 	}
 }

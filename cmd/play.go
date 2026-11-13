@@ -134,7 +134,7 @@ func (o *PlayOptions) RunContext(ctx context.Context) (retErr error) {
 		return fmt.Errorf("%s: %w", i18n.T("config_load_error"), err)
 	}
 
-	adpOpts := []adapter.Option{adapter.WithNonInteractive(true)}
+	adpOpts := []adapter.Option{adapter.WithNonInteractive(true), adapter.WithForwardOptions(false)}
 	if reg, regErr := utils.GetCredentialRegistry(cfg); regErr != nil {
 		return fmt.Errorf("initialize credential resolver: %w", regErr)
 	} else if reg != nil {

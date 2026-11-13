@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	logger "github.com/wentf9/xops-cli/core/log"
 	cryptoSSH "golang.org/x/crypto/ssh"
 )
 
@@ -91,6 +92,10 @@ type MuxServerOptions struct {
 	StreamLocalBindUnlink  bool
 	StreamLocalBindMask    uint32
 	HasStreamLocalBindMask bool
+	AllowAgentForward      bool
+	AgentSocket            string
+	DialAgent              func(ctx context.Context, socket string) (net.Conn, error)
+	Logger                 logger.DebugLogger
 }
 
 // MuxServer implements the OpenSSH PROTOCOL.mux v4 server engine.
@@ -109,6 +114,10 @@ type MuxServer struct {
 	dialNetwork           string
 	streamLocalBindUnlink bool
 	streamLocalBindMask   uint32
+	allowAgentForward     bool
+	agentSocket           string
+	dialAgent             func(ctx context.Context, socket string) (net.Conn, error)
+	logger                logger.DebugLogger
 
 	listener             net.Listener
 	activeSessions       atomic.Int32
@@ -186,6 +195,10 @@ func NewMuxServer(opts MuxServerOptions) (*MuxServer, error) {
 		dialNetwork:           normalizeTCPDialNetwork(opts.DialNetwork),
 		streamLocalBindUnlink: opts.StreamLocalBindUnlink,
 		streamLocalBindMask:   mask,
+		allowAgentForward:     opts.AllowAgentForward,
+		agentSocket:           strings.TrimSpace(opts.AgentSocket),
+		dialAgent:             opts.DialAgent,
+		logger:                opts.Logger,
 	}
 
 	if opts.InitialActiveSessions > 0 {
@@ -236,6 +249,10 @@ type MuxMasterOptions struct {
 	StreamLocalBindUnlink  bool
 	StreamLocalBindMask    uint32
 	HasStreamLocalBindMask bool
+	AllowAgentForward      bool
+	AgentSocket            string
+	DialAgent              func(ctx context.Context, socket string) (net.Conn, error)
+	Logger                 logger.DebugLogger
 }
 
 // StartMuxServer starts the master for opts.Path and returns it. The caller owns
@@ -265,6 +282,11 @@ func StartMuxServer(ctx context.Context, sshClient *cryptoSSH.Client, opts MuxMa
 	}
 	askConfirmation := masterMode == ControlMasterAsk || masterMode == ControlMasterAutoAsk
 
+	dialAgent := opts.DialAgent
+	if dialAgent == nil {
+		dialAgent = env.DialAgent
+	}
+
 	server, err := NewMuxServer(MuxServerOptions{
 		ControlPath:            opts.Path,
 		ExpectedUID:            expectedUID,
@@ -283,6 +305,10 @@ func StartMuxServer(ctx context.Context, sshClient *cryptoSSH.Client, opts MuxMa
 		StreamLocalBindUnlink:  opts.StreamLocalBindUnlink,
 		StreamLocalBindMask:    opts.StreamLocalBindMask,
 		HasStreamLocalBindMask: opts.HasStreamLocalBindMask,
+		AllowAgentForward:      opts.AllowAgentForward,
+		AgentSocket:            opts.AgentSocket,
+		DialAgent:              dialAgent,
+		Logger:                 opts.Logger,
 	})
 	if err != nil {
 		return nil, err
@@ -1481,6 +1507,46 @@ type proxyChan struct {
 	// SSH_MSG_CHANNEL_CLOSE for this channel has been written, so no later packet
 	// can follow it.
 	closeSent bool
+
+	leaseMu         sync.Mutex
+	leaseReleased   bool
+	agentProxyLease *agentForwardLease
+	onDone          func()
+}
+
+func (pc *proxyChan) attachAgentProxyLease(lease *agentForwardLease) bool {
+	if lease == nil {
+		return false
+	}
+	pc.leaseMu.Lock()
+	if pc.leaseReleased {
+		pc.leaseMu.Unlock()
+		lease.Release()
+		return false
+	}
+	prev := pc.agentProxyLease
+	pc.agentProxyLease = lease
+	pc.leaseMu.Unlock()
+	if prev != nil {
+		prev.Release()
+	}
+	return true
+}
+
+func (pc *proxyChan) releaseAgentProxyLease() {
+	pc.leaseMu.Lock()
+	pc.leaseReleased = true
+	lease := pc.agentProxyLease
+	pc.agentProxyLease = nil
+	onDone := pc.onDone
+	pc.onDone = nil
+	pc.leaseMu.Unlock()
+	if lease != nil {
+		lease.Release()
+	}
+	if onDone != nil {
+		onDone()
+	}
 }
 
 // proxyChannelInput is one ordered client-to-master channel event.
@@ -1671,6 +1737,15 @@ func (q *orderedQueue[T]) pop() (T, bool) {
 	}
 }
 
+type proxyServerOpenResult struct {
+	confirmed bool
+	clientCh  uint32
+	window    uint32
+	maxPacket uint32
+	reason    uint32
+	message   string
+}
+
 type proxySessionState struct {
 	server   *MuxServer
 	conn     net.Conn
@@ -1678,8 +1753,9 @@ type proxySessionState struct {
 	channels sync.Map // serverChID (uint32) -> *proxyChan
 	// byClientCh indexes the same records by the proxy client's channel ID, which
 	// is what channel responses carry back.
-	byClientCh sync.Map // clientChID (uint32) -> *proxyChan
-	nextChID   atomic.Uint32
+	byClientCh   sync.Map // clientChID (uint32) -> *proxyChan
+	pendingOpens sync.Map // serverChID (uint32) -> chan proxyServerOpenResult
+	nextChID     atomic.Uint32
 	// global serializes client-to-server global requests. RFC 4254 global
 	// replies carry no request ID, so they can only be answered in wire order.
 	global *orderedQueue[proxyGlobalRequest]
@@ -1693,6 +1769,16 @@ func (ps *proxySessionState) closeAll() {
 	if ps.global != nil {
 		ps.global.close()
 	}
+	ps.pendingOpens.Range(func(key, val any) bool {
+		ps.pendingOpens.Delete(key)
+		if ch, ok := val.(chan proxyServerOpenResult); ok {
+			select {
+			case ch <- proxyServerOpenResult{confirmed: false, reason: uint32(cryptoSSH.Prohibited), message: "proxy session closed"}:
+			default:
+			}
+		}
+		return true
+	})
 	ps.channels.Range(func(key, val any) bool {
 		if pc, ok := val.(*proxyChan); ok {
 			ps.byClientCh.CompareAndDelete(pc.clientCh, pc)
@@ -1701,6 +1787,7 @@ func (ps *proxySessionState) closeAll() {
 			pc.requests.close()
 			pc.pendingRemoteReqs.drain()
 			_ = pc.remoteCh.Close()
+			pc.releaseAgentProxyLease()
 		}
 		return true
 	})
@@ -1786,6 +1873,10 @@ func (ps *proxySessionState) dispatch(packet []byte) {
 	switch packet[0] {
 	case msgChannelOpen:
 		ps.handleOpen(packet[1:])
+	case msgChannelOpenConfirmation:
+		ps.handleOpenConfirmation(packet[1:])
+	case msgChannelOpenFailure:
+		ps.handleOpenFailure(packet[1:])
 	case msgChannelData:
 		ps.handleData(packet[1:])
 	case msgChannelEOF:
@@ -2095,6 +2186,7 @@ func (ps *proxySessionState) streamChannelData(pc *proxyChan) {
 	pc.clientWindow.close()
 	pc.input.close()
 	_ = pc.remoteCh.Close()
+	pc.releaseAgentProxyLease()
 }
 
 func (ps *proxySessionState) handleData(payload []byte) {
@@ -2232,6 +2324,7 @@ func (ps *proxySessionState) handleClose(payload []byte) {
 		pc.requests.close()
 		pc.pendingRemoteReqs.drain()
 		_ = pc.remoteCh.Close()
+		pc.releaseAgentProxyLease()
 		// RFC 4254 requires answering a close this side did not initiate, and the
 		// client only frees its channel (and unblocks its readers) after receiving
 		// that answer. closeChannel also blocks every later packet for the channel.
@@ -2271,6 +2364,169 @@ func (ps *proxySessionState) handleRequest(payload []byte) {
 	pc.requests.push(proxyChannelRequest{requestType: reqType, wantReply: wantReply, payload: reqPayload})
 }
 
+func (ps *proxySessionState) handleOpenConfirmation(payload []byte) {
+	r := newMuxReader(payload)
+	serverChID, err := r.ReadUint32()
+	if err != nil {
+		return
+	}
+	clientChID, err := r.ReadUint32()
+	if err != nil {
+		return
+	}
+	window, err := r.ReadUint32()
+	if err != nil {
+		return
+	}
+	maxPacket, err := r.ReadUint32()
+	if err != nil {
+		return
+	}
+	if val, ok := ps.pendingOpens.LoadAndDelete(serverChID); ok {
+		if ch, ok := val.(chan proxyServerOpenResult); ok {
+			select {
+			case ch <- proxyServerOpenResult{
+				confirmed: true,
+				clientCh:  clientChID,
+				window:    window,
+				maxPacket: maxPacket,
+			}:
+			default:
+			}
+		}
+	}
+}
+
+func (ps *proxySessionState) handleOpenFailure(payload []byte) {
+	r := newMuxReader(payload)
+	serverChID, err := r.ReadUint32()
+	if err != nil {
+		return
+	}
+	reason, err := r.ReadUint32()
+	if err != nil {
+		return
+	}
+	msg, err := r.ReadString()
+	if err != nil {
+		msg = "channel open failed"
+	}
+	if val, ok := ps.pendingOpens.LoadAndDelete(serverChID); ok {
+		if ch, ok := val.(chan proxyServerOpenResult); ok {
+			select {
+			case ch <- proxyServerOpenResult{
+				confirmed: false,
+				reason:    reason,
+				message:   msg,
+			}:
+			default:
+			}
+		}
+	}
+}
+
+func (ps *proxySessionState) forwardUpstreamAgentChannelOpen(newCh cryptoSSH.NewChannel, releaseSlot func()) {
+	slotOnce := sync.OnceFunc(releaseSlot)
+	if ps == nil || ps.closed.Load() {
+		slotOnce()
+		_ = newCh.Reject(cryptoSSH.Prohibited, "proxy session closed")
+		return
+	}
+
+	serverCh := ps.nextChID.Add(1)
+	resCh := make(chan proxyServerOpenResult, 1)
+	ps.pendingOpens.Store(serverCh, resCh)
+	if ps.closed.Load() {
+		ps.pendingOpens.Delete(serverCh)
+		slotOnce()
+		_ = newCh.Reject(cryptoSSH.Prohibited, "proxy session closed")
+		return
+	}
+
+	openPkt := newMuxWriter()
+	openPkt.buf = append(openPkt.buf, msgChannelOpen)
+	openPkt.WriteString(newCh.ChannelType())
+	openPkt.WriteUint32(serverCh)
+	openPkt.WriteUint32(proxyAdvertisedWindow)
+	openPkt.WriteUint32(proxyAdvertisedMaxPacket)
+	openPkt.buf = append(openPkt.buf, newCh.ExtraData()...)
+	if err := ps.writePacket(openPkt.Bytes()); err != nil {
+		ps.pendingOpens.Delete(serverCh)
+		slotOnce()
+		_ = newCh.Reject(cryptoSSH.ConnectionFailed, "proxy write failed")
+		return
+	}
+
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	var res proxyServerOpenResult
+	select {
+	case res = <-resCh:
+	case <-timer.C:
+		ps.pendingOpens.Delete(serverCh)
+		slotOnce()
+		_ = newCh.Reject(cryptoSSH.ConnectionFailed, "proxy channel open timed out")
+		return
+	}
+
+	if !res.confirmed {
+		slotOnce()
+		reason := cryptoSSH.RejectionReason(res.reason)
+		if reason == 0 {
+			reason = cryptoSSH.ConnectionFailed
+		}
+		_ = newCh.Reject(reason, res.message)
+		return
+	}
+	if res.maxPacket < minProxyChannelPacket || int64(res.maxPacket) > maxFlowWindow || int64(res.window) > maxFlowWindow {
+		slotOnce()
+		_ = newCh.Reject(cryptoSSH.ConnectionFailed, "invalid proxy channel window")
+		return
+	}
+
+	remoteCh, reqs, err := newCh.Accept()
+	if err != nil {
+		slotOnce()
+		cw := newMuxWriter()
+		cw.buf = append(cw.buf, msgChannelClose)
+		cw.WriteUint32(res.clientCh)
+		_ = ps.writePacket(cw.Bytes())
+		return
+	}
+
+	pc := &proxyChan{
+		remoteCh:          remoteCh,
+		clientCh:          res.clientCh,
+		serverCh:          serverCh,
+		clientWindow:      newClientFlowWindow(res.window),
+		clientMaxPacket:   int(res.maxPacket),
+		reqsDone:          make(chan struct{}),
+		requests:          newOrderedQueue[proxyChannelRequest](),
+		requestsDone:      make(chan struct{}),
+		input:             newOrderedQueue[proxyChannelInput](),
+		pendingRemoteReqs: newRemoteRequestQueue(),
+		onDone:            slotOnce,
+	}
+	ps.channels.Store(pc.serverCh, pc)
+	ps.byClientCh.Store(pc.clientCh, pc)
+	if ps.closed.Load() {
+		ps.channels.CompareAndDelete(pc.serverCh, pc)
+		ps.byClientCh.CompareAndDelete(pc.clientCh, pc)
+		pc.clientWindow.close()
+		pc.input.close()
+		pc.requests.close()
+		pc.pendingRemoteReqs.drain()
+		_ = remoteCh.Close()
+		pc.releaseAgentProxyLease()
+		return
+	}
+
+	go ps.forwardRequests(pc, reqs)
+	go ps.serveChannelRequests(pc)
+	go ps.relayChannelInput(pc)
+	go ps.streamChannelData(pc)
+}
+
 // serveChannelRequests forwards queued channel requests in wire order and
 // answers want-reply requests in the same order.
 func (ps *proxySessionState) serveChannelRequests(pc *proxyChan) {
@@ -2283,7 +2539,20 @@ func (ps *proxySessionState) serveChannelRequests(pc *proxyChan) {
 		if !ok {
 			return
 		}
+		var newAgentLease *agentForwardLease
+		if req.requestType == agentForwardRequestType && ps.server != nil && ps.server.sshClient != nil {
+			if router, rErr := getOrCreateAgentRouter(ps.server.sshClient); rErr == nil {
+				newAgentLease = router.acquireProxyLease(ps)
+			}
+		}
 		accepted, err := pc.remoteCh.SendRequest(req.requestType, req.wantReply, req.payload)
+		if newAgentLease != nil {
+			if err == nil && (!req.wantReply || accepted) && !ps.closed.Load() {
+				pc.attachAgentProxyLease(newAgentLease)
+			} else {
+				newAgentLease.Release()
+			}
+		}
 		if !req.wantReply {
 			continue
 		}

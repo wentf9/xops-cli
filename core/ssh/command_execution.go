@@ -110,10 +110,23 @@ func (c *Client) executeCommand(ctx context.Context, plan CommandPlan, sendSessi
 	}
 	untrackSession := c.trackActiveSession("client-session (exec)")
 	defer untrackSession()
+	var agentLease *agentForwardLease
+	releaseAgent := func() {}
+	if sendSessionEnv {
+		agentLease = c.acquireSessionAgentLease(work)
+		if agentLease != nil {
+			releaseAgent = sync.OnceFunc(func() {
+				c.untrackAgentLease(agentLease)
+				agentLease.Release()
+			})
+		}
+	}
+	defer releaseAgent()
 	output := newOutputWriter(&RunConfig{OutMode: OutputModeRingBuffer, RingMaxBytes: plan.outputLimit})
-	workersDone, startDone := c.startCommandWorkers(work, channel, requests, plan, envVars, output, observation)
+	workersDone, startDone := c.startCommandWorkers(work, channel, requests, plan, envVars, agentLease != nil, releaseAgent, output, observation)
 	waitErr := c.waitCommandWorkers(work, workersDone, startDone)
 	cleanupErr := c.closeCommandChannel(channel, workersDone)
+	releaseAgent()
 	result = observation.snapshot()
 	result.Output, result.Truncated = output.String(), output.truncated
 	result.CleanupErr = cleanupErr
@@ -182,7 +195,7 @@ type commandStartResult struct {
 }
 
 func (c *Client) startCommandWorkers(ctx context.Context, channel cryptoSSH.Channel, requests <-chan *cryptoSSH.Request,
-	plan CommandPlan, envVars []EnvVar, output *outputWriter, observation *commandObservation,
+	plan CommandPlan, envVars []EnvVar, wantAgent bool, releaseAgent func(), output *outputWriter, observation *commandObservation,
 ) (<-chan struct{}, <-chan commandStartResult) {
 	var workers sync.WaitGroup
 	// Readers and request handling exit when the server closes the channel, or
@@ -198,17 +211,47 @@ func (c *Client) startCommandWorkers(ctx context.Context, channel cryptoSSH.Chan
 		})
 	}
 	startDone := make(chan commandStartResult, 1)
-	workers.Go(func() { c.sendCommandInput(ctx, channel, plan, envVars, observation, startDone) })
+	workers.Go(func() {
+		c.sendCommandInput(ctx, channel, plan, envVars, wantAgent, releaseAgent, observation, startDone)
+	})
 	done := make(chan struct{})
 	// Every worker is unblocked by the supervisor's channel/transport closure.
 	go func() { workers.Wait(); close(done) }()
 	return done, startDone
 }
 
-func (c *Client) sendCommandInput(ctx context.Context, channel cryptoSSH.Channel, plan CommandPlan, envVars []EnvVar, observation *commandObservation, startDone chan<- commandStartResult) {
+func (c *Client) requestCommandAgentForward(channel cryptoSSH.Channel, releaseAgent func(), observation *commandObservation, startDone chan<- commandStartResult) bool {
+	c.observeSession(logger.SessionRequest, 2, agentForwardRequestType, "sending")
+	accepted, err := channel.SendRequest(agentForwardRequestType, true, nil)
+	if err != nil {
+		releaseAgent()
+		c.observeSession(logger.SessionRequest, 2, agentForwardRequestType, "failed or interrupted")
+		observation.update(func(r *CommandResult) {
+			r.Phase, r.Outcome = "request", ExecutionNotStarted
+			r.ExecutionErr = fmt.Errorf("send SSH %s request: %w", agentForwardRequestType, err)
+		})
+		startDone <- commandStartResult{accepted: false, err: err}
+		return false
+	}
+	if accepted {
+		c.observeSession(logger.SessionRequest, 2, agentForwardRequestType, "accepted")
+	} else {
+		releaseAgent()
+		c.observeSession(logger.SessionRequest, 2, agentForwardRequestType, "rejected")
+		c.getLogger().Debugf("SSH server rejected %s; continuing without agent forwarding", agentForwardRequestType)
+	}
+	return true
+}
+
+func (c *Client) sendCommandInput(ctx context.Context, channel cryptoSSH.Channel, plan CommandPlan, envVars []EnvVar, wantAgent bool, releaseAgent func(), observation *commandObservation, startDone chan<- commandStartResult) {
 	if err := ctx.Err(); err != nil {
 		startDone <- commandStartResult{err: err}
 		return
+	}
+	if wantAgent {
+		if !c.requestCommandAgentForward(channel, releaseAgent, observation, startDone) {
+			return
+		}
 	}
 	for _, ev := range envVars {
 		if err := ctx.Err(); err != nil {

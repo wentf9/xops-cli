@@ -220,6 +220,9 @@ Host gate3-node
     SetEnv FOO=bar
     RemoteCommand top -b
     EscapeChar none
+    CertificateFile ~/.ssh/id_gate3-cert.pub
+    IdentityAgent /tmp/gate3-agent.sock
+    ForwardAgent yes
 `
 	hosts, err := ParseOpenSSHHosts(strings.NewReader(input), "local-user")
 	if err != nil {

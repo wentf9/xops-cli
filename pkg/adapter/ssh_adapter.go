@@ -387,12 +387,32 @@ func WithLocalExecution(enabled bool) Option {
 }
 
 // WithSessionAndForwardOptions controls whether Forward-class and Session-class
-// SSH options (port forwards, SendEnv, SetEnv, RemoteCommand, EscapeChar, RequestTTY)
+// SSH options (port forwards, ForwardAgent, SendEnv, SetEnv, RemoteCommand, EscapeChar, RequestTTY)
 // are forwarded by this adapter. Interactive CLI keeps this enabled (default), while
 // MCP hosts disable it (Gate 4) so user session/forwarding options cannot leak.
 func WithSessionAndForwardOptions(enabled bool) Option {
 	return func(a *SSHAdapter) {
 		a.disableSessionAndForward = !enabled
+	}
+}
+
+// WithForwardOptions controls whether Forward-class SSH options (port forwards,
+// ForwardAgent, GatewayPorts, etc.) are forwarded by this adapter. Batch/transfer
+// callers such as `xops exec` and `xops play` disable Forward-class options while
+// retaining Session-class options (SendEnv/SetEnv).
+func WithForwardOptions(enabled bool) Option {
+	return func(a *SSHAdapter) {
+		a.disableForward = !enabled
+	}
+}
+
+// WithSessionOptions controls whether Session-class SSH options (SendEnv, SetEnv,
+// RemoteCommand, EscapeChar, RequestTTY) are forwarded by this adapter. Mux daemon
+// children disable Session-class options while preserving server-level forwarding
+// policies (GatewayPorts, StreamLocalBindUnlink, StreamLocalBindMask).
+func WithSessionOptions(enabled bool) Option {
+	return func(a *SSHAdapter) {
+		a.disableSession = !enabled
 	}
 }
 
@@ -409,6 +429,8 @@ type SSHAdapter struct {
 	nonInteractive           bool
 	disableControl           bool
 	disableHostTrust         bool
+	disableForward           bool
+	disableSession           bool
 	disableSessionAndForward bool
 	localExecution           bool
 	credentialRecording      bool
@@ -556,8 +578,17 @@ func (a *SSHAdapter) ResolveSSHOptions(nodeName string, sessionOpts SessionContr
 	if a.disableHostTrust {
 		merged.StripClasses(ssh.OptionClassTrust)
 	}
+	if a.disableForward {
+		merged.StripClasses(ssh.OptionClassForward)
+	}
+	if a.disableSession {
+		merged.StripClasses(ssh.OptionClassSession)
+	}
 	if a.disableSessionAndForward {
 		merged.StripClasses(ssh.OptionClassForward, ssh.OptionClassSession)
+	}
+	if a.nonInteractive {
+		merged.Delete(ssh.OptionForwardAgent)
 	}
 	if !a.localExecution {
 		if key := firstLocalExecOption(merged); key != "" {

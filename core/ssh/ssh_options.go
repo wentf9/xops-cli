@@ -30,6 +30,8 @@ const (
 	OptionStrictHostKeyChecking        = "strict_host_key_checking"
 	OptionUserKnownHostsFile           = "user_known_hosts_file"
 	OptionIdentityFile                 = "identity_file"
+	OptionCertificateFile              = "certificate_file"
+	OptionIdentityAgent                = "identity_agent"
 	OptionPubkeyAuthentication         = "pubkey_authentication"
 	OptionPasswordAuthentication       = "password_authentication"
 	OptionKbdInteractiveAuthentication = "kbd_interactive_authentication"
@@ -42,6 +44,7 @@ const (
 	OptionKexAlgorithms                = "kex_algorithms"
 	OptionExitOnForwardFailure         = "exit_on_forward_failure"
 	OptionClearAllForwardings          = "clear_all_forwardings"
+	OptionForwardAgent                 = "forward_agent"
 	OptionGatewayPorts                 = "gateway_ports"
 	OptionStreamLocalBindUnlink        = "stream_local_bind_unlink"
 	OptionStreamLocalBindMask          = "stream_local_bind_mask"
@@ -225,6 +228,19 @@ var optionRegistry = []OptionSpec{
 		Normalize:    validateIdentityFiles,
 	},
 	{
+		CanonicalKey: OptionCertificateFile,
+		OpenSSHName:  "CertificateFile",
+		Class:        OptionClassAuth,
+		MultiValue:   true,
+		Normalize:    validateCertificateFiles,
+	},
+	{
+		CanonicalKey: OptionIdentityAgent,
+		OpenSSHName:  "IdentityAgent",
+		Class:        OptionClassAuth,
+		Normalize:    validateIdentityAgent,
+	},
+	{
 		CanonicalKey: OptionPubkeyAuthentication,
 		OpenSSHName:  "PubkeyAuthentication",
 		Class:        OptionClassAuth,
@@ -339,6 +355,12 @@ var optionRegistry = []OptionSpec{
 		Normalize: func(raw string) (string, error) {
 			return normalizeYesNoOption("ClearAllForwardings", raw)
 		},
+	},
+	{
+		CanonicalKey: OptionForwardAgent,
+		OpenSSHName:  "ForwardAgent",
+		Class:        OptionClassForward,
+		Normalize:    validateForwardAgent,
 	},
 	{
 		CanonicalKey: OptionGatewayPorts,
@@ -585,6 +607,79 @@ func validateIdentityFiles(raw string) (string, error) {
 		}
 		return trimmed, nil
 	})
+}
+
+func validateCertificateFiles(raw string) (string, error) {
+	return normalizeMultiForwardEntries("CertificateFile", raw, func(item string) (string, error) {
+		trimmed := strings.TrimSpace(item)
+		if trimmed == "" {
+			return "", errors.New("value cannot be empty")
+		}
+		if hasASCIIControlChar(trimmed) {
+			return "", errors.New("value contains invalid ASCII control character")
+		}
+		if strings.EqualFold(trimmed, "none") {
+			return "none", nil
+		}
+		if err := validatePathTokenSyntax(trimmed, "CertificateFile"); err != nil {
+			return "", err
+		}
+		return trimmed, nil
+	})
+}
+
+func validateIdentityAgent(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", errors.New("invalid IdentityAgent: value cannot be empty")
+	}
+	if hasASCIIControlChar(trimmed) {
+		return "", fmt.Errorf("invalid IdentityAgent %q: contains invalid ASCII control character", raw)
+	}
+	if strings.EqualFold(trimmed, "none") {
+		return "none", nil
+	}
+	if trimmed == "SSH_AUTH_SOCK" {
+		return "SSH_AUTH_SOCK", nil
+	}
+	if err := validateAgentSocketSyntax(trimmed, "IdentityAgent"); err != nil {
+		return "", err
+	}
+	return trimmed, nil
+}
+
+func validateForwardAgent(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", errors.New("invalid ForwardAgent: value cannot be empty")
+	}
+	if hasASCIIControlChar(trimmed) {
+		return "", fmt.Errorf("invalid ForwardAgent %q: contains invalid ASCII control character", raw)
+	}
+	switch strings.ToLower(trimmed) {
+	case "yes", "true":
+		return "yes", nil
+	case "no", "false":
+		return "no", nil
+	}
+	if trimmed == "SSH_AUTH_SOCK" {
+		return "SSH_AUTH_SOCK", nil
+	}
+	if err := validateAgentSocketSyntax(trimmed, "ForwardAgent"); err != nil {
+		return "", err
+	}
+	return trimmed, nil
+}
+
+func validateAgentSocketSyntax(rawPath, kind string) error {
+	if strings.HasPrefix(rawPath, "$") && !strings.HasPrefix(rawPath, "${") {
+		varName := rawPath[1:]
+		if !isValidEnvIdentifier(varName) {
+			return fmt.Errorf("invalid environment variable name %q in %s", rawPath, kind)
+		}
+		return nil
+	}
+	return validatePathTokenSyntax(rawPath, kind)
 }
 
 func hasASCIIControlChar(s string) bool {
@@ -1304,6 +1399,35 @@ func (o *Options) IdentityFile() string {
 		return ""
 	}
 	return files[0]
+}
+
+// CertificateFiles returns all configured CertificateFile entries in order, trimmed and non-empty.
+func (o *Options) CertificateFiles() []string {
+	entries := o.GetAll(OptionCertificateFile)
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		trimmed := strings.TrimSpace(entry)
+		if trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// IdentityAgent returns the configured IdentityAgent specification, or "" if unset.
+func (o *Options) IdentityAgent() string {
+	return o.Get(OptionIdentityAgent)
+}
+
+// ForwardAgent returns the configured ForwardAgent specification, or "" if unset.
+func (o *Options) ForwardAgent() string {
+	return o.Get(OptionForwardAgent)
 }
 
 // ConnectTimeout returns the configured ConnectTimeout duration, or 0 if unset/disabled.

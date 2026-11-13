@@ -359,6 +359,11 @@ func (o *SshOptions) applyCLISessionFlags(opts **ssh.Options) error {
 			return setErr
 		}
 	}
+	if o.ForwardAgentSpec != "" {
+		if setErr := ensureOpts().Set(ssh.OptionForwardAgent, o.ForwardAgentSpec); setErr != nil {
+			return setErr
+		}
+	}
 	return nil
 }
 
@@ -387,6 +392,7 @@ func (o *SshOptions) normalizeForMuxDaemon() {
 	o.NoCmd = true
 	o.Subsystem = false
 	o.EscapeCharSpec = ""
+	o.ForwardAgentSpec = ""
 	o.Command = ""
 	o.stdinScript = false
 	o.StdioForward = ""
@@ -474,6 +480,7 @@ func (o *SshOptions) resolveAndCacheSessionOptions(provider config.ConfigProvide
 		}
 		if isMuxDaemonChild() && eff != nil {
 			eff.StripClasses(ssh.OptionClassSession)
+			eff.Delete(ssh.OptionForwardAgent)
 		}
 		o.effectiveSSHOptions = eff
 		return eff, nil
@@ -491,6 +498,7 @@ func (o *SshOptions) resolveAndCacheSessionOptions(provider config.ConfigProvide
 	}
 	if isMuxDaemonChild() && eff != nil {
 		eff.StripClasses(ssh.OptionClassSession)
+		eff.Delete(ssh.OptionForwardAgent)
 	}
 	o.effectiveSSHOptions = eff
 	return eff, nil

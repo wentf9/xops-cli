@@ -338,6 +338,8 @@ func (c *Client) runPrivilegeAttempt(ctx context.Context, mode SudoMode, command
 	if err != nil {
 		return err
 	}
+	releaseAgent := c.enableSessionAgentForward(ctx, session)
+	defer releaseAgent()
 	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
 	untrackSession := c.trackActiveSession("client-session (privilege)")
 	defer untrackSession()

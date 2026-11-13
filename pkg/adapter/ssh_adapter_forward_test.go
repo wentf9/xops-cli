@@ -217,6 +217,9 @@ Host srv
     SetEnv FOO=bar
     RemoteCommand echo %h
     EscapeChar ^
+    CertificateFile ~/.ssh/id_test-cert.pub
+    IdentityAgent /tmp/test-agent.sock
+    ForwardAgent yes
 `
 	parser, err := config.NewOpenSSHParserFromReader(strings.NewReader(openSSHContent))
 	if err != nil {
@@ -298,6 +301,20 @@ func assertManagedTier4Filtered(t *testing.T, managedOpts *ssh.Options) {
 	if managedOpts.EscapeChar() != "" {
 		t.Errorf("EscapeChar should be filtered for managed node, got %q", managedOpts.EscapeChar())
 	}
+	assertManagedTier4Phase3Filtered(t, managedOpts)
+}
+
+func assertManagedTier4Phase3Filtered(t *testing.T, managedOpts *ssh.Options) {
+	t.Helper()
+	if len(managedOpts.CertificateFiles()) != 0 {
+		t.Errorf("CertificateFiles should be filtered for managed node, got %v", managedOpts.CertificateFiles())
+	}
+	if managedOpts.IdentityAgent() != "" {
+		t.Errorf("IdentityAgent should be filtered for managed node, got %q", managedOpts.IdentityAgent())
+	}
+	if managedOpts.ForwardAgent() != "" {
+		t.Errorf("ForwardAgent should be filtered for managed node, got %q", managedOpts.ForwardAgent())
+	}
 }
 
 func assertVirtualTier4Preserved(t *testing.T, virtualOpts *ssh.Options) {
@@ -347,6 +364,15 @@ func assertVirtualTier4SessionOptions(t *testing.T, virtualOpts *ssh.Options) {
 	if virtualOpts.EscapeChar() != "^" {
 		t.Errorf("expected EscapeChar preserved on virtual node, got %q", virtualOpts.EscapeChar())
 	}
+	if len(virtualOpts.CertificateFiles()) != 1 || virtualOpts.CertificateFiles()[0] != "~/.ssh/id_test-cert.pub" {
+		t.Errorf("expected CertificateFiles preserved on virtual node, got %v", virtualOpts.CertificateFiles())
+	}
+	if virtualOpts.IdentityAgent() != "/tmp/test-agent.sock" {
+		t.Errorf("expected IdentityAgent preserved on virtual node, got %q", virtualOpts.IdentityAgent())
+	}
+	if virtualOpts.ForwardAgent() != "yes" {
+		t.Errorf("expected ForwardAgent preserved on virtual node, got %q", virtualOpts.ForwardAgent())
+	}
 }
 
 func TestResolveSSHOptions_WithSessionAndForwardOptionsDisabled(t *testing.T) {
@@ -362,6 +388,9 @@ Host srv
     SetEnv FOO=bar
     RemoteCommand echo %h
     EscapeChar ^
+    CertificateFile ~/.ssh/id_test-cert.pub
+    IdentityAgent /tmp/test-agent.sock
+    ForwardAgent yes
 `
 	parser, err := config.NewOpenSSHParserFromReader(strings.NewReader(openSSHContent))
 	if err != nil {
@@ -396,5 +425,50 @@ Host srv
 	if len(opts.LocalForwards()) != 0 || opts.RequestTTY() != "" || len(opts.SendEnvPatterns()) != 0 ||
 		len(opts.SetEnvDirectives()) != 0 || opts.RemoteCommand() != "" || opts.EscapeChar() != "" {
 		t.Fatalf("Gate 4 violation: expected all forward and session options stripped, got %+v", opts)
+	}
+}
+
+func TestResolveSSHOptions_NonInteractiveStripsForwardAgent(t *testing.T) {
+	openSSHContent := `
+Host play-target
+    HostName 192.168.1.200
+    Port 22
+    User ops
+    ForwardAgent yes
+    LocalForward 8080 127.0.0.1:80
+    SendEnv LANG
+`
+	parser, err := config.NewOpenSSHParserFromReader(strings.NewReader(openSSHContent))
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	provider := config.NewProviderWithOpenSSHParser(nil, parser)
+	cliOpts, err := ParseOptionStrings([]string{"ForwardAgent=yes"})
+	if err != nil {
+		t.Fatalf("ParseOptionStrings failed: %v", err)
+	}
+
+	// 1. Default NewNonInteractiveSSHAdapter strips ForwardAgent
+	adp := NewNonInteractiveSSHAdapter(provider)
+	opts, err := adp.ResolveSSHOptions(config.OpenSSHNodePrefix+"play-target", cliOpts)
+	if err != nil {
+		t.Fatalf("ResolveSSHOptions() error = %v", err)
+	}
+	if opts.ForwardAgent() != "" {
+		t.Fatalf("expected NewNonInteractiveSSHAdapter to strip ForwardAgent, got %q", opts.ForwardAgent())
+	}
+
+	// 2. Playbook adapter (WithNonInteractive(true), WithForwardOptions(false)) strips ForwardAgent and LocalForward while keeping SendEnv
+	playAdp := NewNonInteractiveSSHAdapter(provider, WithForwardOptions(false))
+	playOpts, err := playAdp.ResolveSSHOptions(config.OpenSSHNodePrefix+"play-target", cliOpts)
+	if err != nil {
+		t.Fatalf("ResolveSSHOptions() error = %v", err)
+	}
+	if playOpts.ForwardAgent() != "" || len(playOpts.LocalForwards()) != 0 {
+		t.Fatalf("expected play adapter to strip ForwardAgent and LocalForward, got forward=%q local=%v",
+			playOpts.ForwardAgent(), playOpts.LocalForwards())
+	}
+	if len(playOpts.SendEnvPatterns()) != 1 || playOpts.SendEnvPatterns()[0] != "LANG" {
+		t.Fatalf("expected play adapter to keep SendEnv, got %v", playOpts.SendEnvPatterns())
 	}
 }

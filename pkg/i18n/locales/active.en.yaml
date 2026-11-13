@@ -1058,3 +1058,7 @@ flag_cred_target_node:
   other: "Force resolving target as a host node"
 flag_cred_target_identity:
   other: "Force resolving target as an identity template"
+flag_ssh_forward_agent:
+  other: "Enables forwarding of connections from an authentication agent (overrides -a and ForwardAgent)"
+flag_ssh_no_forward_agent:
+  other: "Disables forwarding of the authentication agent connection (overrides -A and ForwardAgent)"

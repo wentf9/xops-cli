@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	logger "github.com/wentf9/xops-cli/core/log"
 	cryptoSSH "golang.org/x/crypto/ssh"
 	"golang.org/x/sys/unix"
 )
@@ -229,6 +230,8 @@ func handlePassengerSession(s *MuxServer, conn net.Conn, reqID uint32, payload [
 	if err != nil {
 		return sendFailure(conn, reqID, fmt.Sprintf("open ssh session failed: %v", err))
 	}
+	releasePassengerAgent := enablePassengerAgentForward(s, ch, req.WantAgent)
+	defer releasePassengerAgent()
 	defer func() { _ = ch.Close() }()
 
 	for _, env := range req.Env {
@@ -282,6 +285,35 @@ func handlePassengerSession(s *MuxServer, conn net.Conn, reqID uint32, payload [
 
 	exitCode := runPassengerChannelIO(conn, ch, reqs, files)
 	return sendExitMessage(conn, sessionID, exitCode)
+}
+
+func enablePassengerAgentForward(s *MuxServer, ch cryptoSSH.Channel, wantAgent bool) func() {
+	if !wantAgent {
+		return func() {}
+	}
+	if !s.allowAgentForward || s.agentSocket == "" || s.dialAgent == nil {
+		s.getLogger().Debugf("mux: ignoring passenger WantAgent request because master AllowAgentForward is disabled")
+		return func() {}
+	}
+	router, err := getOrCreateAgentRouter(s.sshClient)
+	if err != nil {
+		s.getLogger().Debugf("mux: failed to initialize agent router for passenger session: %v", err)
+		return func() {}
+	}
+	lease := router.acquireLocalLease(s.serverCtx, s.agentSocket, s.dialAgent, s.getLogger())
+	if accepted, reqErr := ch.SendRequest(agentForwardRequestType, true, nil); reqErr != nil || !accepted {
+		lease.Release()
+		s.getLogger().Debugf("mux: server rejected %s for passenger session (accepted=%v, err=%v)", agentForwardRequestType, accepted, reqErr)
+		return func() {}
+	}
+	return lease.Release
+}
+
+func (s *MuxServer) getLogger() logger.DebugLogger {
+	if s == nil || s.logger == nil {
+		return logger.NopLogger
+	}
+	return s.logger
 }
 
 func startPassengerChannel(ch cryptoSSH.Channel, req MuxNewSessionRequest) error {

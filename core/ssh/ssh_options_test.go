@@ -65,6 +65,12 @@ func TestOptionRegistry_LookupAndNormalization(t *testing.T) {
 		{"MACs", "hmac-sha2-256", OptionMACs, "hmac-sha2-256"},
 		{"kex_algorithms", "curve25519-sha256", OptionKexAlgorithms, "curve25519-sha256"},
 		{"KexAlgorithms", "+diffie-hellman-group14-sha256", OptionKexAlgorithms, "+diffie-hellman-group14-sha256"},
+		{"certificate_file", "~/.ssh/id_ed25519-cert.pub", OptionCertificateFile, "~/.ssh/id_ed25519-cert.pub"},
+		{"CertificateFile", "NONE", OptionCertificateFile, "none"},
+		{"identity_agent", "NONE", OptionIdentityAgent, "none"},
+		{"IdentityAgent", "SSH_AUTH_SOCK", OptionIdentityAgent, "SSH_AUTH_SOCK"},
+		{"forward_agent", "True", OptionForwardAgent, "yes"},
+		{"ForwardAgent", "SSH_AUTH_SOCK", OptionForwardAgent, "SSH_AUTH_SOCK"},
 	}
 
 	opts := &Options{}
@@ -84,7 +90,7 @@ func TestOptionRegistry_LookupAndNormalization(t *testing.T) {
 		}
 	}
 
-	for _, removed := range []string{"compression", "Compression", "forward_agent", "ForwardAgent"} {
+	for _, removed := range []string{"compression", "Compression"} {
 		if _, ok := LookupOptionSpec(removed); ok {
 			t.Fatalf("expected %q to be removed from optionRegistry", removed)
 		}

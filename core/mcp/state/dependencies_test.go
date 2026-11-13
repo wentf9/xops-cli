@@ -199,3 +199,60 @@ func TestAliasesCannotRedirectCanonicalIdentities(t *testing.T) {
 		t.Fatal("alias pointed outside the published inventory")
 	}
 }
+
+func TestPhase3AuthOptionsRevokeActiveAdmissions(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(opts *ssh.Options) error
+	}{
+		{
+			name:   "CertificateFile rotation",
+			mutate: func(opts *ssh.Options) error { return opts.Set(ssh.OptionCertificateFile, "/certs/user-v2-cert.pub") },
+		},
+		{
+			name:   "IdentityAgent change",
+			mutate: func(opts *ssh.Options) error { return opts.Set(ssh.OptionIdentityAgent, "/run/agent-v2.sock") },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
+			c, err := New(fixtureView(), Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := c.Close(); err != nil {
+					t.Error(err)
+				}
+			}()
+			permit := enter(t, c, ctx, admission(t, c, ctx, "a", ports.Execute))
+			next := c.Snapshot()
+			next.Revision = "2"
+			target := next.Targets["a"]
+			opts := &ssh.Options{}
+			if err := tc.mutate(opts); err != nil {
+				t.Fatal(err)
+			}
+			target.Plan.Hops[0].Options = opts
+			next.Targets["a"] = target
+			u, err := c.BeginUpdate(ctx, "1", next)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := u.ConfirmCommit(); err != nil {
+				t.Fatal(err)
+			}
+			var retired int
+			if err := u.Publish(ctx, func(_ context.Context, plans []ssh.ConnectionPlan) error {
+				retired = len(plans)
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if retired != 1 || permit.Context().Err() == nil {
+				t.Fatalf("expected active permit to be revoked and plan retired, retired=%d ctxErr=%v", retired, permit.Context().Err())
+			}
+		})
+	}
+}

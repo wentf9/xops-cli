@@ -55,6 +55,7 @@ type SshOptions struct {
 	NoCmd                  bool
 	Subsystem              bool
 	EscapeCharSpec         string
+	ForwardAgentSpec       string
 	GatewayPorts           bool
 	DynamicForward         string
 	DynamicForwards        []string
@@ -127,6 +128,8 @@ func newCmdSshWithOptions(o *SshOptions) *cobra.Command {
 	cmd.Flags().BoolVarP(&o.NoCmd, "no-cmd", "N", false, i18n.T("flag_no_cmd"))
 	cmd.Flags().BoolVarP(&o.Subsystem, "subsystem", "s", false, i18n.T("flag_ssh_subsystem"))
 	cmd.Flags().StringVarP(&o.EscapeCharSpec, "escape-char", "e", "", i18n.T("flag_ssh_escape_char"))
+	cmd.Flags().VarP(&addressFamilyFlagValue{target: &o.ForwardAgentSpec, value: "yes"}, "forward-agent", "A", i18n.T("flag_ssh_forward_agent"))
+	cmd.Flags().VarP(&addressFamilyFlagValue{target: &o.ForwardAgentSpec, value: "no"}, "no-forward-agent", "a", i18n.T("flag_ssh_no_forward_agent"))
 	o.registerForwardAndSessionFlags(cmd)
 	cmd.Flags().BoolVarP(&o.BgRun, "background", "f", false, i18n.T("flag_background"))
 	cmd.Flags().BoolVarP(&o.StdinRedirect, "stdin-redirect", "n", false, i18n.T("flag_stdin_redirect"))
@@ -691,7 +694,7 @@ func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuratio
 	shouldRemember, adpOpts := o.interaction.rememberOptions(utils.EffectiveRememberPolicy(o.Remember, cfg), cfg)
 	if isMuxDaemonChild() {
 		shouldRemember = false
-		adpOpts = append(adpOpts, adapter.WithNonInteractive(true))
+		adpOpts = append(adpOpts, adapter.WithNonInteractive(true), adapter.WithSessionOptions(false))
 	} else {
 		adpOpts = append(adpOpts, adapter.WithLocalExecution(true))
 	}

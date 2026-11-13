@@ -18,15 +18,25 @@ func TestDialSSHAgent_RespectsCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	conn, err := dialSSHAgent(ctx, "unused-agent-socket")
+	conn, err := dialAgentConn(ctx, fixtureEnvironment().DialAgent, "unused-agent-socket")
 	if conn != nil {
 		if closeErr := conn.Close(); closeErr != nil {
 			t.Fatalf("close unexpected ssh-agent connection failed: %v", closeErr)
 		}
-		t.Fatal("dialSSHAgent() returned a connection for canceled context")
+		t.Fatal("dialAgentConn() returned a connection for canceled context")
 	}
 	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("dialSSHAgent() error = %v, want context.Canceled", err)
+		t.Fatalf("dialAgentConn() error = %v, want context.Canceled", err)
+	}
+
+	// Also verify fail-closed when DialAgent is nil.
+	conn, err = dialAgentConn(context.Background(), nil, "unused-agent-socket")
+	if conn != nil {
+		_ = conn.Close()
+		t.Fatal("dialAgentConn() returned a connection when DialAgent is nil")
+	}
+	if err == nil {
+		t.Fatal("dialAgentConn() expected error when DialAgent is nil")
 	}
 }
 

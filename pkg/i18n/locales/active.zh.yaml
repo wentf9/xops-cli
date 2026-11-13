@@ -1059,3 +1059,7 @@ flag_cred_target_node:
   other: "强制将目标解析为主机节点"
 flag_cred_target_identity:
   other: "强制将目标解析为认证模板"
+flag_ssh_forward_agent:
+  other: "启用 SSH 认证代理转发 (覆盖 -a 和 ForwardAgent)"
+flag_ssh_no_forward_agent:
+  other: "禁用 SSH 认证代理转发 (覆盖 -A 和 ForwardAgent)"

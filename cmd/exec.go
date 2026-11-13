@@ -594,7 +594,7 @@ func (o *ExecOptions) buildAdapterOptions(tasks []execHostTask, cfg *config.Conf
 	}
 	// A global policy applies to proxy-jump nodes, which do not have a task
 	// specific override. Explicit task credentials remain scoped to their target.
-	adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{Remember: remember}))
+	adpOpts = append(adpOpts, adapter.WithForwardOptions(false), adapter.WithGlobalSessionAuth(adapter.SessionAuth{Remember: remember}))
 	hostNameOverride, hostErr := o.effectiveHostName()
 	if hostErr != nil {
 		return nil, hostErr

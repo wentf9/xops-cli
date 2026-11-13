@@ -133,7 +133,7 @@ func authenticationChanged(old, next ssh.ConnectionPlan) bool {
 		if !ok {
 			continue
 		}
-		if before.AuthType != hop.AuthType || before.AuthUpdateToken != hop.AuthUpdateToken || before.SudoUpdateToken != hop.SudoUpdateToken || before.KeyRef != hop.KeyRef || before.KeyPath != hop.KeyPath || !slices.Equal(before.KeyPaths, hop.KeyPaths) || !slices.Equal(before.Options.IdentityFiles(), hop.Options.IdentityFiles()) || before.TrustVersion != hop.TrustVersion {
+		if before.AuthType != hop.AuthType || before.AuthUpdateToken != hop.AuthUpdateToken || before.SudoUpdateToken != hop.SudoUpdateToken || before.KeyRef != hop.KeyRef || before.KeyPath != hop.KeyPath || !slices.Equal(before.KeyPaths, hop.KeyPaths) || !slices.Equal(before.Options.IdentityFiles(), hop.Options.IdentityFiles()) || !slices.Equal(before.Options.CertificateFiles(), hop.Options.CertificateFiles()) || before.Options.IdentityAgent() != hop.Options.IdentityAgent() || before.TrustVersion != hop.TrustVersion {
 			return true
 		}
 	}

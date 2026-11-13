@@ -380,9 +380,16 @@ func (c *Client) runWithSudo(ctx context.Context, command string, password []byt
 	if err != nil {
 		return "", err
 	}
+	var releaseAgent func()
+	defer func() {
+		if releaseAgent != nil {
+			releaseAgent()
+		}
+	}()
 	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
 
 	if sendSessionEnv {
+		releaseAgent = c.enableSessionAgentForward(ctx, session)
 		if err := c.applySessionEnv(ctx, session); err != nil {
 			return "", err
 		}
@@ -872,6 +879,10 @@ func (c *Client) runSessionWithInput(ctx context.Context, request string, start 
 	if err != nil {
 		return err
 	}
+	work, cancel := context.WithCancel(ctx)
+	defer cancel()
+	releaseAgent := c.enableSessionAgentForward(work, session)
+	defer releaseAgent()
 	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
 	untrackSession := c.trackActiveSession("client-session (" + request + ")")
 	defer untrackSession()
@@ -884,9 +895,6 @@ func (c *Client) runSessionWithInput(ctx context.Context, request string, start 
 	if pipeErr != nil {
 		return pipeErr
 	}
-
-	work, cancel := context.WithCancel(ctx)
-	defer cancel()
 
 	finishStdin, setupErr := startCommandWithStdinPipeline(
 		func() error {

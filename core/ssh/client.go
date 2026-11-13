@@ -43,6 +43,7 @@ type Client struct {
 	activeMu               sync.Mutex
 	activeSeq              uint64
 	activeSessions         map[uint64]string
+	activeAgentLeases      map[*agentForwardLease]struct{}
 	activeForwardListeners map[string]struct{}
 	activeForwardConns     map[string]int
 	transportOnce          sync.Once
@@ -216,6 +217,7 @@ func interruptSSHTransport(root net.Conn, client *ssh.Client) error {
 }
 
 func (c *Client) Close() error {
+	c.releaseAllAgentLeases()
 	return closeResource(c.sshClient, "SSH transport")
 }
 
@@ -506,9 +508,16 @@ func (c *Client) runRaw(ctx context.Context, wrappedCmd string, config *RunConfi
 	if err != nil {
 		return "", err
 	}
+	var releaseAgent func()
+	defer func() {
+		if releaseAgent != nil {
+			releaseAgent()
+		}
+	}()
 	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
 
 	if sendSessionEnv {
+		releaseAgent = c.enableSessionAgentForward(ctx, session)
 		if err := c.applySessionEnv(ctx, session); err != nil {
 			return "", err
 		}
@@ -536,6 +545,8 @@ func (c *Client) RunScript(ctx context.Context, scriptContent string, opts ...Ru
 	if err != nil {
 		return "", err
 	}
+	releaseAgent := c.enableSessionAgentForward(ctx, session)
+	defer releaseAgent()
 	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
 
 	if err := c.applySessionEnv(ctx, session); err != nil {
@@ -598,28 +609,37 @@ func (c *Client) RunStream(ctx context.Context, cmd string) (io.ReadCloser, erro
 		return nil, err
 	}
 
+	derivedCtx, cancel := context.WithCancel(ctx)
+	releaseAgent := c.enableSessionAgentForward(derivedCtx, session)
+	abortSetup := func(setupErr error) (io.ReadCloser, error) {
+		cancel()
+		closeErr := c.closeSessionBounded(session)
+		releaseAgent()
+		return nil, errors.Join(setupErr, closeErr)
+	}
+
 	if err := c.applySessionEnv(ctx, session); err != nil {
-		return nil, errors.Join(err, c.closeSessionBounded(session))
+		return abortSetup(err)
 	}
 
 	stdout, err := session.StdoutPipe()
 	if err != nil {
-		return nil, errors.Join(fmt.Errorf("failed to create stdout pipe: %w", err), c.closeSessionBounded(session))
+		return abortSetup(fmt.Errorf("failed to create stdout pipe: %w", err))
 	}
 
 	wrappedCmd := bashCommandPayload(cmd, false)
 
 	if err := c.sessionRequest(ctx, session, "stream exec", func() error { return session.Start(wrappedCmd) }); err != nil {
-		return nil, errors.Join(fmt.Errorf("failed to start command: %w", err), c.closeSessionBounded(session))
+		return abortSetup(fmt.Errorf("failed to start command: %w", err))
 	}
-
-	derivedCtx, cancel := context.WithCancel(ctx)
 
 	closed := make(chan error, 1)
 	// Close or caller cancellation ends this watcher and unblocks stream reads.
 	go func() {
 		<-derivedCtx.Done()
-		closed <- c.closeSessionBounded(session)
+		closeErr := c.closeSessionBounded(session)
+		releaseAgent()
+		closed <- closeErr
 	}()
 	return &streamReader{ReadCloser: io.NopCloser(stdout), cancel: cancel, close: sync.OnceValue(func() error { return <-closed })}, nil
 }

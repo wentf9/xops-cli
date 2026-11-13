@@ -129,18 +129,31 @@ func (c *Client) RunSubsystemWithIO(ctx context.Context, subsystem string, stdin
 	}
 	untrackSession := c.trackActiveSession("client-session (subsystem:" + subsystem + ")")
 	defer untrackSession()
+	agentLease := c.acquireSessionAgentLease(work)
+	releaseAgent := func() {}
+	if agentLease != nil {
+		releaseAgent = sync.OnceFunc(func() {
+			c.untrackAgentLease(agentLease)
+			agentLease.Release()
+		})
+	}
+	defer releaseAgent()
 
 	observation, reqDone := startSubsystemRequestObserver(channel, requests)
-	if setupErr := c.setupSubsystemChannel(work, channel, subsystem, envVars, allocatePTY, width, height); setupErr != nil {
+	if setupErr := c.setupSubsystemChannel(work, channel, subsystem, envVars, agentLease != nil, releaseAgent, allocatePTY, width, height); setupErr != nil {
 		cancel()
-		return errors.Join(setupErr, c.closeCommandChannel(channel, reqDone))
+		closeErr := c.closeCommandChannel(channel, reqDone)
+		releaseAgent()
+		return errors.Join(setupErr, closeErr)
 	}
 
 	if isRealTTY {
 		cleanupTTY, ttyErr := c.activateSubsystemTTY(work, channel, fdIn, fdOut, width, height)
 		if ttyErr != nil {
 			cancel()
-			return errors.Join(ttyErr, c.closeCommandChannel(channel, reqDone))
+			closeErr := c.closeCommandChannel(channel, reqDone)
+			releaseAgent()
+			return errors.Join(ttyErr, closeErr)
 		}
 		defer func() { retErr = errors.Join(retErr, cleanupTTY()) }()
 	}
@@ -153,7 +166,9 @@ func (c *Client) RunSubsystemWithIO(ctx context.Context, subsystem string, stdin
 	)
 	if setupPipeErr != nil {
 		cancel()
-		return errors.Join(setupPipeErr, c.closeCommandChannel(channel, reqDone))
+		closeErr := c.closeCommandChannel(channel, reqDone)
+		releaseAgent()
+		return errors.Join(setupPipeErr, closeErr)
 	}
 	finishStdinOnce := sync.OnceValue(finishStdin)
 
@@ -161,6 +176,7 @@ func (c *Client) RunSubsystemWithIO(ctx context.Context, subsystem string, stdin
 	outputFailedErr := waitSubsystemCompletion(work, reqDone, output.failed, cancel)
 	cancel()
 	cleanupErr := c.closeCommandChannel(channel, reqDone)
+	releaseAgent()
 	inputErr := finishStdinOnce()
 	outputErr := waitSessionOutput(ctx, output.wait, cancel)
 
@@ -277,9 +293,22 @@ func (c *Client) setupSubsystemChannel(
 	channel cryptoSSH.Channel,
 	subsystem string,
 	envVars []EnvVar,
+	wantAgent bool,
+	releaseAgent func(),
 	allocatePTY bool,
 	width, height int,
 ) error {
+	if wantAgent {
+		accepted, err := c.sendBoundedChannelRequest(ctx, channel, agentForwardRequestType, nil, false)
+		if err != nil {
+			releaseAgent()
+			return err
+		}
+		if !accepted {
+			releaseAgent()
+			c.getLogger().Debugf("SSH server rejected %s; continuing without agent forwarding", agentForwardRequestType)
+		}
+	}
 	for _, ev := range envVars {
 		accepted, err := c.sendBoundedChannelRequest(ctx, channel, "env", cryptoSSH.Marshal(struct{ Name, Value string }{ev.Name, ev.Value}), false)
 		if err != nil {

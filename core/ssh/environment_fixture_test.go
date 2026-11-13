@@ -2,9 +2,11 @@ package ssh
 
 import (
 	"context"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Historical SSH fixtures set HOME/USERPROFILE to test-owned directories.
@@ -15,6 +17,12 @@ func fixtureEnvironment() Environment {
 		InitializationError: err,
 		AgentSocket:         os.Getenv("SSH_AUTH_SOCK"),
 		InteractiveIO:       InteractiveIO{Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr},
+		LookupEnv:           os.LookupEnv,
+		Environ:             os.Environ,
+		DialAgent: func(ctx context.Context, socket string) (net.Conn, error) {
+			dialer := net.Dialer{Timeout: 5 * time.Second}
+			return dialer.DialContext(ctx, "unix", socket)
+		},
 	}
 	if err != nil {
 		return environment
@@ -38,8 +46,17 @@ func newTestConnector(provider ConnectionProvider, opts ...Option) *Connector {
 
 func buildTestAutoAuthPlan(ctx context.Context, options AutoAuthOptions) autoAuthPlan {
 	environment := fixtureEnvironment()
-	options.AgentSocket = environment.AgentSocket
-	options.DefaultKeyPaths = environment.DefaultKeyPaths
-	options.ResolveKeyPath = environment.ResolveKeyPath
+	if options.AgentSocket == "" {
+		options.AgentSocket = environment.AgentSocket
+	}
+	if options.DialAgent == nil {
+		options.DialAgent = environment.DialAgent
+	}
+	if len(options.DefaultKeyPaths) == 0 {
+		options.DefaultKeyPaths = environment.DefaultKeyPaths
+	}
+	if options.ResolveKeyPath == nil {
+		options.ResolveKeyPath = environment.ResolveKeyPath
+	}
 	return buildAutoAuthPlan(ctx, options)
 }

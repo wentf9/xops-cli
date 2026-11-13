@@ -2,6 +2,7 @@ package sshenv
 
 import (
 	"context"
+	"errors"
 	"net"
 	"path/filepath"
 	"runtime"
@@ -74,5 +75,54 @@ func TestDiscoverEnvironmentContracts(t *testing.T) {
 		}
 		_ = conn.Close()
 		<-accepted
+	}
+}
+
+func TestNormalizeWindowsAgentPipePath(t *testing.T) {
+	if _, ok := normalizeWindowsAgentPipePath(""); ok {
+		t.Fatal("expected empty socket not to match named pipe prefix directly")
+	}
+	if _, ok := normalizeWindowsAgentPipePath(`\\.\pipe\`); ok {
+		t.Fatal("expected bare \\\\.\\pipe\\ without name to be rejected")
+	}
+	pipe, ok := normalizeWindowsAgentPipePath(defaultWindowsOpenSSHAgentPipe)
+	if !ok || pipe != defaultWindowsOpenSSHAgentPipe {
+		t.Fatalf("default pipe = (%q, %v), want (%q, true)", pipe, ok, defaultWindowsOpenSSHAgentPipe)
+	}
+	pipe, ok = normalizeWindowsAgentPipePath(`//./pipe/custom-agent`)
+	if !ok || pipe != `\\.\pipe\custom-agent` {
+		t.Fatalf("slash pipe = (%q, %v), want (\\\\.\\pipe\\custom-agent, true)", pipe, ok)
+	}
+	if _, ok := normalizeWindowsAgentPipePath(`/tmp/ssh-agent.sock`); ok {
+		t.Fatal("expected unix socket path not to match Windows named pipe prefix")
+	}
+}
+
+func TestDiscoverAgentSocketAndDialAgentCancellation(t *testing.T) {
+	t.Setenv("SSH_AUTH_SOCK", "/custom/test-agent.sock")
+	env := Discover()
+	if env.AgentSocket != "/custom/test-agent.sock" {
+		t.Fatalf("Discover().AgentSocket = %q, want /custom/test-agent.sock", env.AgentSocket)
+	}
+
+	t.Setenv("SSH_AUTH_SOCK", "")
+	envUnset := Discover()
+	if runtime.GOOS == "windows" {
+		if envUnset.AgentSocket != defaultWindowsOpenSSHAgentPipe {
+			t.Fatalf("Windows default AgentSocket = %q, want %q", envUnset.AgentSocket, defaultWindowsOpenSSHAgentPipe)
+		}
+	} else if envUnset.AgentSocket != "" {
+		t.Fatalf("Unix unset AgentSocket = %q, want empty", envUnset.AgentSocket)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	conn, err := env.DialAgent(ctx, "/nonexistent/canceled.sock")
+	if conn != nil {
+		_ = conn.Close()
+		t.Fatal("expected DialAgent on canceled context to fail")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("DialAgent canceled error = %v, want context.Canceled", err)
 	}
 }

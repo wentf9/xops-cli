@@ -100,6 +100,10 @@ func (c *Client) runTerminalSession(ctx context.Context, payload string, streams
 	if err != nil {
 		return err
 	}
+	work, cancel := context.WithCancel(ctx)
+	defer cancel()
+	releaseAgent := c.enableSessionAgentForward(work, session)
+	defer releaseAgent()
 	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
 	request, name := func() error { return session.Start(payload) }, "exec"
 	if shellRequest {
@@ -118,8 +122,6 @@ func (c *Client) runTerminalSession(ctx context.Context, payload string, streams
 	}
 	defer func() { retErr = errors.Join(retErr, restoreRaw()) }()
 
-	work, cancel := context.WithCancel(ctx)
-	defer cancel()
 	stopResize := startWindowResizeLoop(work, session, fdOut, width, height, c.getLogger(), c.Interrupt)
 	defer func() { retErr = errors.Join(retErr, stopResize()) }()
 	output := startSessionOutput(stdout, stderr, streams.Stdout, streams.Stderr)

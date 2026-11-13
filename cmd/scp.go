@@ -1207,7 +1207,7 @@ func (o *ScpOptions) credentialConnectorWithInteraction(provider config.ConfigPr
 		return nil, err
 	}
 	shouldRemember, adpOpts := interaction.rememberOptions(cmdutils.EffectiveRememberPolicy(o.Remember, cfg), cfg)
-	adpOpts = append(adpOpts, adapter.WithLocalExecution(true))
+	adpOpts = append(adpOpts, adapter.WithLocalExecution(true), adapter.WithSessionAndForwardOptions(false))
 	batch := o.Tag != "" || strings.Contains(o.Host, ",") || o.HostFile != ""
 	shouldRemember = !batch && shouldRemember
 	if batch {
