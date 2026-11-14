@@ -143,11 +143,8 @@ func (*openSSHOverrideProvider) ConfirmNodeContext(context.Context, string) erro
 	return nil
 }
 
-func (p *openSSHOverrideProvider) PendingNodeExecution(nodeID string) (*ssh.ExecutionConfig, bool) {
-	if p == nil || p.repo == nil {
-		return nil, false
-	}
-	return p.repo.PendingNodeExecution(nodeID)
+func (p *openSSHOverrideProvider) PendingNodeExecution(string) (*ssh.ExecutionConfig, bool) {
+	return nil, false
 }
 
 // ConfirmNodeWithExecutionContext is a no-op on the read-only override provider

@@ -661,6 +661,27 @@ func runPassengerChannelIO(conn net.Conn, ch cryptoSSH.Channel, reqs <-chan *cry
 	return exitCode.Load()
 }
 
+func resolvePassengerStdioFwdTarget(s *MuxServer, payload []byte) (dialNetwork, targetAddr, errMsg string) {
+	fwdReq, err := DecodeMuxNewStdioFwd(payload)
+	if err != nil {
+		return "", "", fmt.Sprintf("malformed stdio fwd request: %v", err)
+	}
+	connectHost := normalizeMuxForwardHost(fwdReq.ConnectHost, fwdReq.ConnectPort)
+	if fwdReq.ConnectPort == MUX_SPECIAL_PORT_UNIX {
+		if strings.TrimSpace(connectHost) == "" {
+			return "", "", "invalid stdio forward streamlocal socket path: path cannot be empty"
+		}
+		return "unix", connectHost, ""
+	}
+	if connectHost == "" {
+		return "", "", "invalid stdio forward target host: host cannot be empty"
+	}
+	if fwdReq.ConnectPort < 1 || fwdReq.ConnectPort > 65535 {
+		return "", "", fmt.Sprintf("invalid stdio forward port %d: must be in 1..65535", fwdReq.ConnectPort)
+	}
+	return s.effectiveDialNetwork(), net.JoinHostPort(connectHost, strconv.FormatUint(uint64(fwdReq.ConnectPort), 10)), ""
+}
+
 func handlePassengerStdioFwd(s *MuxServer, conn net.Conn, reqID uint32, payload []byte) error {
 	if err := s.authorize("passenger stdio forward"); err != nil {
 		return sendPermissionDenied(conn, reqID, err.Error())
@@ -677,9 +698,9 @@ func handlePassengerStdioFwd(s *MuxServer, conn net.Conn, reqID uint32, payload 
 	// The received descriptors belong to these files; see handlePassengerSession.
 	defer closeFiles(files)
 
-	fwdReq, err := DecodeMuxNewStdioFwd(payload)
-	if err != nil {
-		return sendFailure(conn, reqID, fmt.Sprintf("malformed stdio fwd request: %v", err))
+	dialNetwork, targetAddr, errMsg := resolvePassengerStdioFwdTarget(s, payload)
+	if errMsg != "" {
+		return sendFailure(conn, reqID, errMsg)
 	}
 
 	if !s.addActiveSession() {
@@ -690,8 +711,7 @@ func handlePassengerStdioFwd(s *MuxServer, conn net.Conn, reqID uint32, payload 
 	s.trackStream(conn)
 	defer s.untrackStream(conn)
 
-	targetAddr := net.JoinHostPort(fwdReq.ConnectHost, strconv.FormatUint(uint64(fwdReq.ConnectPort), 10))
-	stream, err := s.dialSSHMux(s.baseContext(), s.effectiveDialNetwork(), targetAddr)
+	stream, err := s.dialSSHMux(s.baseContext(), dialNetwork, targetAddr)
 	if err != nil {
 		return sendFailure(conn, reqID, fmt.Sprintf("remote dial failed: %v", err))
 	}

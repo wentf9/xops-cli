@@ -41,9 +41,55 @@ type privilegeExchange struct {
 	terminalToken                     string
 	terminalReady                     chan struct{}
 	terminalOnce                      sync.Once
+	escapeFilter                      *escapeFilterWriter
+	restoreErr                        error
+	abort                             context.CancelFunc
+	localOut                          io.Writer
 	interpreter                       Interpreter
 	launchDialect                     LaunchDialect
 	commandPreview                    string // Setup-owned; populated by the same wrapper as the actual invocation.
+}
+
+type exchangeLocalOutWriter struct {
+	exchange *privilegeExchange
+	target   io.Writer
+}
+
+func (w *exchangeLocalOutWriter) Write(p []byte) (int, error) {
+	if w == nil || w.target == nil {
+		return len(p), nil
+	}
+	w.exchange.outputMu.Lock()
+	defer w.exchange.outputMu.Unlock()
+	return w.target.Write(p)
+}
+
+func (e *privilegeExchange) setEscapeFilter(filter *escapeFilterWriter) {
+	e.mu.Lock()
+	e.escapeFilter = filter
+	e.mu.Unlock()
+}
+
+func (e *privilegeExchange) escapeDisconnected() bool {
+	e.mu.Lock()
+	filter := e.escapeFilter
+	e.mu.Unlock()
+	return filter != nil && filter.Disconnected()
+}
+
+func (e *privilegeExchange) recordTerminalRestoreError(err error) {
+	if err == nil {
+		return
+	}
+	e.mu.Lock()
+	e.restoreErr = errors.Join(e.restoreErr, err)
+	e.mu.Unlock()
+}
+
+func (e *privilegeExchange) terminalRestoreError() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.restoreErr
 }
 
 func newPrivilegeExchange(c *Client, mode SudoMode, force bool, interp ...Interpreter) *privilegeExchange {
@@ -370,6 +416,7 @@ func (c *Client) runPrivilegeAttempt(ctx context.Context, mode SudoMode, command
 	work, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	hasStderr := stderr != nil
 	if stdout == nil {
 		stdout = io.Discard
 	}
@@ -392,6 +439,12 @@ func (c *Client) runPrivilegeAttempt(ctx context.Context, mode SudoMode, command
 			cancelOuterOutput()
 		}
 	}
+	localOutTarget := stderr
+	if !hasStderr {
+		localOutTarget = stdout
+	}
+	exchange.abort = abort
+	exchange.localOut = &exchangeLocalOutWriter{exchange: exchange, target: localOutTarget}
 	pattern := regexp.MustCompile(regexp.QuoteMeta(exchange.promptToken))
 	if mode == SudoModeSu {
 		pattern = c.passwordPromptRegex()
@@ -563,9 +616,26 @@ type privilegeOutcome struct {
 	outputFailed                          bool
 }
 
+func (e *privilegeExchange) finishEscapeDisconnect(ctx context.Context) (error, bool) {
+	if !e.escapeDisconnected() || ctx.Err() != nil {
+		return nil, false
+	}
+	var confirmErr error
+	if e.started() && e.passwordSent {
+		if e.material != nil {
+			e.material.verified = true
+		}
+		confirmErr = e.client.confirmPrivilege(ctx, e.material)
+	}
+	return errors.Join(ErrEscapeDisconnect, e.terminalRestoreError(), confirmErr), true
+}
+
 func (e *privilegeExchange) finish(ctx context.Context, o privilegeOutcome) error {
 	if !e.started() {
 		e.client.observePrivilege(e.mode, "elevation_not_confirmed", 1, 0)
+	}
+	if escErr, ok := e.finishEscapeDisconnect(ctx); ok {
+		return escErr
 	}
 	waitErr := e.interactiveWaitError(o.waitErr)
 	result := errors.Join(o.flushErr, waitErr, o.inputErr, o.closeErr)

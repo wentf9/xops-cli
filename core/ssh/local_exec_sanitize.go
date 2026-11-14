@@ -129,7 +129,7 @@ func validateSafeHostToken(kind, val string) error {
 		}
 	}
 
-	if bracketed || hasZone {
+	if bracketed || hasZone || strings.IndexByte(addrPart, ':') >= 0 {
 		if strings.IndexByte(addrPart, ':') < 0 {
 			return fmt.Errorf("%w: %s %q requires an IPv6 literal", ErrUnsafeExecToken, kind, val)
 		}
@@ -164,7 +164,7 @@ func isSafeHostTokenChar(c byte) bool {
 	return (c >= 'a' && c <= 'z') ||
 		(c >= 'A' && c <= 'Z') ||
 		(c >= '0' && c <= '9') ||
-		c == '.' || c == '_' || c == ':' || c == '-'
+		c == '.' || c == '_' || c == '-'
 }
 
 func isSafeIPv6ZoneChar(c byte) bool {
@@ -266,16 +266,16 @@ func isSafeHomeTokenChar(c byte) bool {
 
 // ExpandProxyCommand expands OpenSSH ProxyCommand percent tokens (%%, %h, %p, %r, %n)
 // after validating the target host/port and any referenced percent-token values against
-// ValidateSafeExecToken. Note that bracketed IPv6 literals contain '[' and ']'; shell
-// command templates should quote expanded tokens (e.g. '%h') to prevent pathname globbing.
+// ValidateSafeExecToken. Enclosing '[' and ']' around valid IPv6 host tokens are stripped
+// (matching OpenSSH cleanhostname) so templates like "ssh -W [%h]:%p" expand cleanly.
 func ExpandProxyCommand(pattern string, env Environment, target TargetContext) (string, error) {
 	return expandLocalExecTemplate("ProxyCommand", pattern, env, target, false)
 }
 
 // ExpandLocalCommand expands OpenSSH LocalCommand percent tokens
 // (%%, %C, %d, %h, %i, %l, %L, %n, %p, %r, %u) after validating the target host/port and
-// any referenced percent-token values against ValidateSafeExecToken. Shell command templates
-// should quote expanded tokens (e.g. '%h', '%n') to prevent pathname globbing on '['/']'.
+// any referenced percent-token values against ValidateSafeExecToken. Enclosing '[' and ']'
+// around valid IPv6 host tokens are stripped (matching OpenSSH cleanhostname).
 func ExpandLocalCommand(pattern string, env Environment, target TargetContext) (string, error) {
 	return expandLocalExecTemplate("LocalCommand", pattern, env, target, true)
 }
@@ -303,6 +303,7 @@ func expandLocalExecTemplate(optionName, pattern string, env Environment, target
 	if target.Port < 0 || target.Port > 65535 {
 		return "", fmt.Errorf("%w: invalid port %d", ErrUnsafeExecToken, target.Port)
 	}
+	target.Host = stripEnclosingBrackets(target.Host)
 
 	tokens := buildRemoteCommandTokenMap(env, target)
 	var sb strings.Builder
@@ -325,8 +326,12 @@ func expandLocalExecTemplate(optionName, pattern string, env Environment, target
 			return "", fmt.Errorf("unknown %s token %%%c", optionName, tok)
 		}
 		val := tokens[tok]
-		if err := ValidateSafeExecToken("%"+string(tok), val); err != nil {
+		kind := "%" + string(tok)
+		if err := ValidateSafeExecToken(kind, val); err != nil {
 			return "", err
+		}
+		if normalizeExecTokenKind(kind) == "host" {
+			val = stripEnclosingBrackets(val)
 		}
 		sb.WriteString(val)
 	}
@@ -336,6 +341,13 @@ func expandLocalExecTemplate(optionName, pattern string, env Environment, target
 		return "", fmt.Errorf("expanded %s cannot contain control characters or null bytes", optionName)
 	}
 	return expanded, nil
+}
+
+func stripEnclosingBrackets(val string) string {
+	if len(val) >= 2 && val[0] == '[' && val[len(val)-1] == ']' {
+		return val[1 : len(val)-1]
+	}
+	return val
 }
 
 func isAllowedLocalExecToken(tok byte, allowLocalTokens bool) bool {

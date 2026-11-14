@@ -1314,15 +1314,13 @@ func assertPhase3MuxAgentForwarding(
 		t.Fatal("expected Master to reject auth-agent@openssh.com once MUX_C_PROXY session ended")
 	}
 
-	assertPhase3MuxProxyWantReplyFalseAndCloseRace(t, sockPath, port, agentSock, env, state)
+	assertPhase3MuxProxyWantReplyFalseAndCloseRace(t, sockPath, port, state)
 }
 
 func assertPhase3MuxProxyWantReplyFalseAndCloseRace(
 	t *testing.T,
 	sockPath string,
 	port int,
-	agentSock string,
-	env Environment,
 	state *phase3AgentServerState,
 ) {
 	t.Helper()
@@ -1341,7 +1339,9 @@ func assertPhase3MuxProxyWantReplyFalseAndCloseRace(
 		t.Fatal("expected late lease to be released immediately when proxyChan is already closed")
 	}
 
-	// Native OpenSSH MUX_C_PROXY behavior: auth-agent-req@openssh.com sent with wantReply=false!
+	// Native OpenSSH MUX_C_PROXY behavior: auth-agent-req@openssh.com sent with wantReply=false
+	// is fulfilled strictly by the ControlMaster's own verified local agent socket (without any
+	// agent handler registered on the passenger's multiplexed proxy SSH client).
 	rawProxySSH, _, err := DialControlProxy(t.Context(), sockPath, TargetContext{
 		Host: "127.0.0.1",
 		Port: port,
@@ -1352,36 +1352,23 @@ func assertPhase3MuxProxyWantReplyFalseAndCloseRace(
 	}
 	t.Cleanup(func() { _ = rawProxySSH.Close() })
 
-	router, err := getOrCreateAgentRouter(rawProxySSH)
-	if err != nil {
-		t.Fatalf("getOrCreateAgentRouter on proxy SSH client failed: %v", err)
-	}
-	clientLease, err := router.acquireLocalLease(t.Context(), agentSock, env.DialAgent, nil)
-	if err != nil {
-		t.Fatalf("acquireLocalLease on proxy SSH client failed: %v", err)
-	}
-
 	ch, chReqs, err := rawProxySSH.OpenChannel("session", nil)
 	if err != nil {
-		clientLease.Release()
 		t.Fatalf("OpenChannel(session) over MUX_C_PROXY failed: %v", err)
 	}
 	go cryptoSSH.DiscardRequests(chReqs)
 
 	if _, err := ch.SendRequest(agentForwardRequestType, false, nil); err != nil {
 		_ = ch.Close()
-		clientLease.Release()
 		t.Fatalf("SendRequest(auth-agent-req, wantReply=false) failed: %v", err)
 	}
 	execPayload := cryptoSSH.Marshal(struct{ Command string }{Command: "query-agent"})
 	if accepted, err := ch.SendRequest("exec", true, execPayload); err != nil || !accepted {
 		_ = ch.Close()
-		clientLease.Release()
 		t.Fatalf("SendRequest(exec query-agent) accepted=%v err=%v", accepted, err)
 	}
 	data, err := io.ReadAll(ch)
 	_ = ch.Close()
-	clientLease.Release()
 	if err != nil || !strings.Contains(string(data), "keys=1") {
 		t.Fatalf("MUX_C_PROXY wantReply=false query-agent = %q, err = %v", string(data), err)
 	}

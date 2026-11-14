@@ -433,7 +433,7 @@ func recordSSHFPCNAME(cnames *map[string]string, owner string, resp []byte, off,
 		return errDNSMalformed
 	}
 	if owner == target {
-		return nil
+		return errDNSMalformed
 	}
 	if *cnames == nil {
 		*cnames = make(map[string]string)

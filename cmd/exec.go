@@ -453,23 +453,6 @@ func (o *ExecOptions) RunContext(ctx context.Context) (retErr error) {
 		return errTask
 	}
 
-	adpOpts, optErr := o.buildAdapterOptions(tasks, cfg, provider)
-	if optErr != nil {
-		return optErr
-	}
-	var connector *ssh.Connector
-	if o.Interactive {
-		connector = newCLIConnectorWithAdapterOptions(provider, o.interaction, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
-	} else {
-		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
-	}
-	defer func() {
-		if handoffErr := o.handoffConnectorMasters(ctx, provider, connector); handoffErr != nil {
-			logger.DefaultLogger().Debugf("mux: master handoff failed: %v", handoffErr)
-		}
-		joinConnectorCloseError(&retErr, connector)
-	}()
-
 	// 应用 --exclude 排除规则
 	if len(o.Exclude) > 0 {
 		excludes, err := utils.ResolveExcludes(provider, utils.ParseExcludeFlag(o.Exclude))
@@ -491,6 +474,23 @@ func (o *ExecOptions) RunContext(ctx context.Context) (retErr error) {
 		}
 		return fmt.Errorf("%s", i18n.T("err_no_nodes_found"))
 	}
+
+	adpOpts, optErr := o.buildAdapterOptions(tasks, cfg, provider)
+	if optErr != nil {
+		return optErr
+	}
+	var connector *ssh.Connector
+	if o.Interactive {
+		connector = newCLIConnectorWithAdapterOptions(provider, o.interaction, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
+	} else {
+		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
+	}
+	defer func() {
+		if handoffErr := o.handoffConnectorMasters(ctx, provider, connector); handoffErr != nil {
+			logger.DefaultLogger().Debugf("mux: master handoff failed: %v", handoffErr)
+		}
+		joinConnectorCloseError(&retErr, connector)
+	}()
 
 	// 交互模式：单主机 PTY 执行
 	if o.Interactive {
@@ -608,6 +608,9 @@ func (o *ExecOptions) buildAdapterOptions(tasks []execHostTask, cfg *config.Conf
 		SuppressNodeConfirmation: suppressConfirm,
 	}))
 	cliAbsKeys := o.absIdentityFiles()
+	if err := o.validateMultiHostStaticHostName(tasks); err != nil {
+		return nil, err
+	}
 	o.targetNodeIDs = make([]string, 0, len(tasks))
 	for _, task := range tasks {
 		o.targetNodeIDs = append(o.targetNodeIDs, task.nodeID)
@@ -636,22 +639,47 @@ func (o *ExecOptions) buildAdapterOptions(tasks []execHostTask, cfg *config.Conf
 	} else if reg != nil {
 		adpOpts = append(adpOpts, adapter.WithCredentialSource(reg))
 	}
-	if remember {
+	if repo, isRepo := repository.(*config.Repository); !isRepo {
+		adpOpts = append(adpOpts, adapter.WithCredentialRecording(false), adapter.WithSuppressNodeConfirmation(true))
+	} else if remember {
 		adpOpts = append(adpOpts, enrollmentProbeOption())
 		if o.execution.enabled() || o.execution.noLoginSet {
 			for _, task := range tasks {
 				adpOpts = append(adpOpts, adapter.WithEnrollmentProbeExclusions(task.nodeID))
 			}
 		}
-		if repo, ok := repository.(*config.Repository); ok {
-			persistence, err := o.interaction.automaticPersistenceOptions(repo, cfg)
-			if err != nil {
-				return nil, err
-			}
-			adpOpts = append(adpOpts, persistence...)
+		persistence, err := o.interaction.automaticPersistenceOptions(repo, cfg)
+		if err != nil {
+			return nil, err
 		}
+		adpOpts = append(adpOpts, persistence...)
 	}
 	return adpOpts, nil
+}
+
+func (o *ExecOptions) validateMultiHostStaticHostName(tasks []execHostTask) error {
+	if len(tasks) <= 1 {
+		return nil
+	}
+	staticHostName := o.staticHostNameOverride()
+	if staticHostName == "" {
+		return nil
+	}
+	distinctHosts := make(map[string]struct{}, len(tasks))
+	for _, task := range tasks {
+		h := strings.TrimSpace(task.originalHost)
+		if h == "" {
+			h = strings.TrimSpace(task.host)
+		}
+		if h == "" {
+			h = strings.TrimSpace(task.nodeID)
+		}
+		distinctHosts[h] = struct{}{}
+	}
+	if len(distinctHosts) > 1 {
+		return fmt.Errorf("static HostName %q cannot be used with multiple distinct remote hosts; use %%h or omit -o HostName", staticHostName)
+	}
+	return nil
 }
 
 func (o *ExecOptions) buildTaskSessionAuth(task execHostTask, cliAbsKeys []string, remember, suppressConfirm bool) (adapter.SessionAuth, error) {
@@ -1061,7 +1089,7 @@ func (o *ExecOptions) buildTasksFromHosts(ctx context.Context, repository config
 			ProxyJump:    o.JumpHost,
 			HasProxyJump: o.JumpHost != "",
 		}
-		originalHost := ""
+		originalHost := strings.TrimPrefix(target.Selector, config.OpenSSHNodePrefix)
 		if target.Selector != "" && !strings.HasPrefix(target.Selector, config.OpenSSHNodePrefix) {
 			var matchedSavedNode bool
 			if resolved, rErr := config.ResolveTarget(repository, target); rErr == nil {

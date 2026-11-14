@@ -2908,19 +2908,36 @@ func (c *Connector) getHostKeyCallbackWithState(
 	var acceptedMu sync.Mutex
 	var acceptedHost string
 	var acceptedKey []byte
+	var verifiedOnce bool
+
+	isRekey := func() bool {
+		if initialHandshakeDone != nil && initialHandshakeDone.Load() {
+			return true
+		}
+		acceptedMu.Lock()
+		done := verifiedOnce
+		acceptedMu.Unlock()
+		return done
+	}
+	recordAccepted := func(hostname string, key ssh.PublicKey) {
+		acceptedMu.Lock()
+		verifiedOnce = true
+		if key != nil {
+			acceptedHost = hostname
+			acceptedKey = slices.Clone(key.Marshal())
+		}
+		acceptedMu.Unlock()
+	}
 
 	return func(hostname string, remote net.Addr, key ssh.PublicKey) (retErr error) {
 		if remote == nil {
 			remote = proxyEndpointAddr("0.0.0.0:22")
 		}
-		rekey := initialHandshakeDone != nil && initialHandshakeDone.Load()
+		rekey := isRekey()
 		err := hostKeyCallback(hostname, remote, key)
 		if err == nil {
-			if !rekey && key != nil {
-				acceptedMu.Lock()
-				acceptedHost = hostname
-				acceptedKey = slices.Clone(key.Marshal())
-				acceptedMu.Unlock()
+			if !rekey {
+				recordAccepted(hostname, key)
 			}
 			return nil
 		}
@@ -2945,12 +2962,7 @@ func (c *Connector) getHostKeyCallbackWithState(
 			if handleErr := c.handleKnownHostsKeyError(ctx, coordinator, cfg, keyErr, strictMode, batchMode, noKnownHostsFile, knownHostsFile, hostname, remote, key, hostKeyChanged, initialHandshakeDone); handleErr != nil {
 				return handleErr
 			}
-			if key != nil {
-				acceptedMu.Lock()
-				acceptedHost = hostname
-				acceptedKey = slices.Clone(key.Marshal())
-				acceptedMu.Unlock()
-			}
+			recordAccepted(hostname, key)
 			return nil
 		}
 		return err
@@ -3027,28 +3039,20 @@ func (c *Connector) openKnownHostsCallback(userKH string, cfg *ClientConfig) (st
 	}
 	noWrite := primaryWriteFile == ""
 
-	globalFiles, hasMalformedGlobal, err := c.resolveGlobalKnownHostsFiles(cfg, target, userFiles)
+	globalFiles, err := c.resolveGlobalKnownHostsFiles(cfg, target, userFiles)
 	if err != nil {
 		return "", false, nil, err
 	}
-	if hasMalformedGlobal {
-		db := newKnownHostsDB()
-		for _, uf := range userFiles {
-			if parseErr := db.parseFileStrict(uf); parseErr != nil {
-				return "", false, nil, fmt.Errorf("parse known_hosts file failed: %w", parseErr)
-			}
+	db := newKnownHostsDB()
+	for _, uf := range userFiles {
+		if parseErr := db.parseFileStrict(uf); parseErr != nil {
+			return "", false, nil, fmt.Errorf("parse known_hosts file failed: %w", parseErr)
 		}
-		for _, gf := range globalFiles {
-			db.parseFileLenient(gf, c.getLogger())
-		}
-		return primaryWriteFile, noWrite, db.hostKeyCallback(), nil
 	}
-	files := append(slices.Clone(userFiles), globalFiles...)
-	hostKeyCallback, err := knownhosts.New(files...)
-	if err != nil {
-		return "", false, nil, fmt.Errorf("parse known_hosts file failed: %w", err)
+	for _, gf := range globalFiles {
+		db.parseFileLenient(gf, c.getLogger())
 	}
-	return primaryWriteFile, noWrite, wrapNilRemoteHostKeyCallback(hostKeyCallback), nil
+	return primaryWriteFile, noWrite, db.hostKeyCallback(), nil
 }
 
 func knownHostsTarget(cfg *ClientConfig) TargetContext {
@@ -3097,12 +3101,12 @@ func (c *Connector) resolveCustomKnownHostsFiles(userKH string, target TargetCon
 }
 
 // resolveGlobalKnownHostsFiles returns existing, readable, regular global
-// known_hosts files and reports whether any file requires line-by-line
-// sanitization due to malformed entries. Global files are verification-only:
-// never created or written. Missing or unreadable global files are skipped with
-// a debug log, while valid @revoked/@cert-authority/host entries in partially
-// malformed global files are preserved; UserKnownHostsFile parsing remains strict.
-func (c *Connector) resolveGlobalKnownHostsFiles(cfg *ClientConfig, target TargetContext, userFiles []string) ([]string, bool, error) {
+// known_hosts files. Global files are verification-only: never created or
+// written. Missing or unreadable global files are skipped with a debug log,
+// while valid @revoked/@cert-authority/host entries in partially malformed
+// global files are preserved via knownHostsDB.parseFileLenient; UserKnownHostsFile
+// parsing remains strict.
+func (c *Connector) resolveGlobalKnownHostsFiles(cfg *ClientConfig, target TargetContext, userFiles []string) ([]string, error) {
 	var candidates []string
 	spec := ""
 	if cfg != nil && cfg.Options != nil {
@@ -3110,7 +3114,7 @@ func (c *Connector) resolveGlobalKnownHostsFiles(cfg *ClientConfig, target Targe
 	}
 	switch {
 	case strings.EqualFold(spec, "none"):
-		return nil, false, nil
+		return nil, nil
 	case spec != "":
 		for _, tokenPath := range strings.Fields(spec) {
 			if strings.EqualFold(tokenPath, "none") || tokenPath == "/dev/null" {
@@ -3118,7 +3122,7 @@ func (c *Connector) resolveGlobalKnownHostsFiles(cfg *ClientConfig, target Targe
 			}
 			expanded, err := expandKnownHostsPath(tokenPath, c.environment, target)
 			if err != nil {
-				return nil, false, fmt.Errorf("expand GlobalKnownHostsFile %q failed: %w", tokenPath, err)
+				return nil, fmt.Errorf("expand GlobalKnownHostsFile %q failed: %w", tokenPath, err)
 			}
 			if expanded == "" || strings.EqualFold(expanded, "none") || expanded == "/dev/null" {
 				continue
@@ -3134,7 +3138,6 @@ func (c *Connector) resolveGlobalKnownHostsFiles(cfg *ClientConfig, target Targe
 	}
 
 	var files []string
-	hasMalformed := false
 	for _, path := range candidates {
 		if path == "" || slices.Contains(userFiles, path) || slices.Contains(files, path) {
 			continue
@@ -3143,13 +3146,9 @@ func (c *Connector) resolveGlobalKnownHostsFiles(cfg *ClientConfig, target Targe
 			c.getLogger().Debugf("skipping global known_hosts file %q: missing, unreadable, or not a regular file", path)
 			continue
 		}
-		if _, err := knownhosts.New(path); err != nil {
-			c.getLogger().Debugf("sanitizing partially malformed global known_hosts file %q: %v", path, err)
-			hasMalformed = true
-		}
 		files = append(files, path)
 	}
-	return files, hasMalformed, nil
+	return files, nil
 }
 
 func isReadableRegularFile(path string) bool {
@@ -3338,7 +3337,7 @@ func appendKnownHost(knownHostsFile, hostname string, key ssh.PublicKey, hash bo
 		}
 	}()
 
-	host := knownhosts.Normalize(hostname)
+	host := strings.ToLower(knownhosts.Normalize(hostname))
 	if hash {
 		host = knownhosts.HashHostname(host)
 	}

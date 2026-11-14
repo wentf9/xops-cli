@@ -48,13 +48,13 @@ func buildMockDNSResponse(query []byte, b mockDNSBehavior, overUDP bool) []byte 
 	binary.BigEndian.PutUint16(resp[6:], uint16(len(records)+1))
 	binary.BigEndian.PutUint16(resp[8:], 0)
 	binary.BigEndian.PutUint16(resp[10:], 0)
-	// A non-SSHFP answer (self-CNAME type 5) that must be tolerated without looping.
+	// A non-SSHFP answer (A record type 1) that must be tolerated alongside SSHFP RRs.
 	resp = append(resp, 0xc0, 0x0c)
-	resp = binary.BigEndian.AppendUint16(resp, dnsTypeCNAME)
+	resp = binary.BigEndian.AppendUint16(resp, 1) // A
 	resp = binary.BigEndian.AppendUint16(resp, dnsClassIN)
 	resp = binary.BigEndian.AppendUint32(resp, 60)
-	resp = binary.BigEndian.AppendUint16(resp, 2)
-	resp = append(resp, 0xc0, 0x0c)
+	resp = binary.BigEndian.AppendUint16(resp, 4)
+	resp = append(resp, 127, 0, 0, 1)
 	for _, r := range records {
 		resp = append(resp, 0xc0, 0x0c)
 		resp = binary.BigEndian.AppendUint16(resp, dnsTypeSSHFP)
@@ -659,4 +659,40 @@ func bytesRepeat(b byte, n int) []byte {
 		out[i] = b
 	}
 	return out
+}
+
+func TestSSHFPResolver_SelfCNAMEFailover(t *testing.T) {
+	records := loopbackRecords()
+	// Primary DNS returns a malformed self-referential CNAME (host -> host) with no SSHFP.
+	primaryUDP, primaryTCP := startMockDNS(t, mockDNSBehavior{
+		ad: true,
+		customUDP: func(pc net.PacketConn, from net.Addr, query []byte) {
+			qEnd := sshfpQuestionEnd(query)
+			resp := append([]byte(nil), query[:qEnd]...)
+			binary.BigEndian.PutUint16(resp[2:], dnsFlagQR|dnsFlagRD|dnsFlagAD)
+			binary.BigEndian.PutUint16(resp[6:], 1)
+			binary.BigEndian.PutUint16(resp[8:], 0)
+			binary.BigEndian.PutUint16(resp[10:], 0)
+			resp = append(resp, 0xc0, 0x0c)
+			resp = binary.BigEndian.AppendUint16(resp, dnsTypeCNAME)
+			resp = binary.BigEndian.AppendUint16(resp, dnsClassIN)
+			resp = binary.BigEndian.AppendUint32(resp, 60)
+			resp = binary.BigEndian.AppendUint16(resp, 2)
+			resp = append(resp, 0xc0, 0x0c)
+			_, _ = pc.WriteTo(resp, from)
+		},
+	})
+	// Secondary DNS returns a valid AD=1 SSHFP answer.
+	secondaryUDP, secondaryTCP := startMockDNS(t, mockDNSBehavior{ad: true, records: records})
+
+	res, err := testResolver(
+		[]string{primaryUDP, secondaryUDP},
+		map[string]string{primaryUDP: primaryTCP, secondaryUDP: secondaryTCP},
+	).Lookup(t.Context(), "host.example.com.")
+	if err != nil {
+		t.Fatalf("expected failover to secondary DNS on self-CNAME, got error: %v", err)
+	}
+	if !res.Authenticated || len(res.Records) != len(records) {
+		t.Fatalf("unexpected failover result: %+v", res)
+	}
 }

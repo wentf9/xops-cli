@@ -100,13 +100,16 @@ func (c *Connector) getHostKeyAlgorithms(ctx context.Context, coordinator *hands
 
 // defaultKnownHostsHostKeyAlgorithms mirrors OpenSSH order_hostkeyalgs when no
 // custom HostKeyVerifier or explicit HostKeyAlgorithms option is configured:
-// unless a non-revoked @cert-authority in known_hosts matches the target host,
-// plain host key algorithms (prioritizing any pinned key types for the host)
-// are ordered ahead of *-cert-v01@openssh.com so servers configured with both a
-// pinned plain HostKey and an untrusted HostCertificate negotiate the plain key.
+// the returned list is always built strictly from SupportedAlgorithms().HostKeys
+// (never nil, which would re-enable SHA-1/DSA defaults in x/crypto/ssh). When a
+// non-revoked @cert-authority in known_hosts matches the target host, modern
+// *-cert-v01@openssh.com algorithms come first, followed by any pinned plain key
+// types and remaining modern plain algorithms; otherwise plain algorithms (with
+// pinned types first) precede *-cert-v01@openssh.com.
 func (c *Connector) defaultKnownHostsHostKeyAlgorithms(cfg *ClientConfig) []string {
+	supported := cryptoSSH.SupportedAlgorithms().HostKeys
 	if cfg == nil || strings.TrimSpace(cfg.Address) == "" {
-		return nil
+		return supported
 	}
 	db := c.loadReadOnlyKnownHostsDB(cfg)
 	port := cfg.Port
@@ -118,38 +121,45 @@ func (c *Connector) defaultKnownHostsHostKeyAlgorithms(cfg *ClientConfig) []stri
 		port: strconv.Itoa(port),
 	}
 	hasCertAuthority, pinnedPlainTypes := db.matchingHostKeyTypes(targetAddr)
-	if hasCertAuthority {
-		return nil
-	}
 
-	supported := cryptoSSH.SupportedAlgorithms().HostKeys
 	ordered := make([]string, 0, len(supported))
 	appendUnique := func(alg string) {
 		if slices.Contains(supported, alg) && !slices.Contains(ordered, alg) {
 			ordered = append(ordered, alg)
 		}
 	}
-	for _, kt := range pinnedPlainTypes {
-		for _, sigAlg := range hostKeySigAlgsForKeyType(kt) {
-			appendUnique(sigAlg)
+	appendCerts := func() {
+		for _, alg := range supported {
+			if strings.HasSuffix(alg, "-cert-v01@openssh.com") {
+				appendUnique(alg)
+			}
 		}
 	}
-	for _, alg := range supported {
-		if !strings.HasSuffix(alg, "-cert-v01@openssh.com") {
-			appendUnique(alg)
+	appendPlain := func() {
+		for _, kt := range pinnedPlainTypes {
+			for _, sigAlg := range hostKeySigAlgsForKeyType(kt) {
+				appendUnique(sigAlg)
+			}
+		}
+		for _, alg := range supported {
+			if !strings.HasSuffix(alg, "-cert-v01@openssh.com") {
+				appendUnique(alg)
+			}
 		}
 	}
-	for _, alg := range supported {
-		if strings.HasSuffix(alg, "-cert-v01@openssh.com") {
-			appendUnique(alg)
-		}
+	if hasCertAuthority {
+		appendCerts()
+		appendPlain()
+	} else {
+		appendPlain()
+		appendCerts()
 	}
 	return ordered
 }
 
 func hostKeySigAlgsForKeyType(keyType string) []string {
 	if keyType == cryptoSSH.KeyAlgoRSA {
-		return []string{cryptoSSH.KeyAlgoRSASHA512, cryptoSSH.KeyAlgoRSASHA256, cryptoSSH.KeyAlgoRSA}
+		return []string{cryptoSSH.KeyAlgoRSASHA512, cryptoSSH.KeyAlgoRSASHA256}
 	}
 	return []string{keyType}
 }
@@ -181,7 +191,7 @@ func (c *Connector) loadReadOnlyKnownHostsDB(cfg *ClientConfig) *knownHostsDB {
 		}
 	}
 
-	globalFiles, _, err := c.resolveGlobalKnownHostsFiles(cfg, target, userFiles)
+	globalFiles, err := c.resolveGlobalKnownHostsFiles(cfg, target, userFiles)
 	if err != nil {
 		globalFiles = nil
 	}
@@ -223,7 +233,8 @@ type khHostPattern struct {
 }
 
 func (p khHostPattern) match(a khAddr) bool {
-	return khWildcardMatch([]byte(p.addr.host), []byte(a.host)) && p.addr.port == a.port
+	return khWildcardMatch([]byte(p.addr.host), []byte(strings.ToLower(a.host))) &&
+		khWildcardMatch([]byte(p.addr.port), []byte(a.port))
 }
 
 type khHostPatterns []khHostPattern
@@ -243,31 +254,29 @@ func (ps khHostPatterns) match(a khAddr) bool {
 }
 
 func khWildcardMatch(pat, str []byte) bool {
-	for {
-		if len(pat) == 0 {
-			return len(str) == 0
-		}
-		if len(str) == 0 {
-			return false
-		}
-		if pat[0] == '*' {
-			if len(pat) == 1 {
-				return true
-			}
-			for j := range str {
-				if khWildcardMatch(pat[1:], str[j:]) {
-					return true
-				}
-			}
-			return false
-		}
-		if pat[0] == '?' || pat[0] == str[0] {
-			pat = pat[1:]
-			str = str[1:]
+	p, s := 0, 0
+	starIdx := -1
+	matchIdx := 0
+	for s < len(str) {
+		if p < len(pat) && (pat[p] == '?' || pat[p] == str[s]) {
+			p++
+			s++
+		} else if p < len(pat) && pat[p] == '*' {
+			starIdx = p
+			matchIdx = s
+			p++
+		} else if starIdx != -1 {
+			p = starIdx + 1
+			matchIdx++
+			s = matchIdx
 		} else {
 			return false
 		}
 	}
+	for p < len(pat) && pat[p] == '*' {
+		p++
+	}
+	return p == len(pat)
 }
 
 type khHashedHost struct {
@@ -298,8 +307,9 @@ func newKHHashedHost(encoded string) (*khHashedHost, error) {
 }
 
 func (h *khHashedHost) match(a khAddr) bool {
+	lower := khAddr{host: strings.ToLower(a.host), port: a.port}
 	mac := hmac.New(sha1.New, h.salt)
-	_, _ = mac.Write([]byte(knownhosts.Normalize(a.String())))
+	_, _ = mac.Write([]byte(knownhosts.Normalize(lower.String())))
 	return hmac.Equal(mac.Sum(nil), h.hash)
 }
 
@@ -403,7 +413,7 @@ func (db *knownHostsDB) check(address string, remote net.Addr, remoteKey cryptoS
 			continue
 		}
 		keyErr.Want = append(keyErr.Want, l.knownKey)
-		if bytes.Equal(l.knownKey.Key.Marshal(), remoteKey.Marshal()) {
+		if !l.cert && bytes.Equal(l.knownKey.Key.Marshal(), remoteKey.Marshal()) {
 			return nil
 		}
 	}
@@ -416,7 +426,12 @@ func (db *knownHostsDB) hostKeyCallback() cryptoSSH.HostKeyCallback {
 		IsRevoked:       db.isRevoked,
 		HostKeyFallback: db.check,
 	}
-	return wrapNilRemoteHostKeyCallback(certChecker.CheckHostKey)
+	return wrapNilRemoteHostKeyCallback(func(hostname string, remote net.Addr, key cryptoSSH.PublicKey) error {
+		if h, p, err := net.SplitHostPort(hostname); err == nil {
+			hostname = net.JoinHostPort(strings.ToLower(h), p)
+		}
+		return certChecker.CheckHostKey(hostname, remote, key)
+	})
 }
 
 func wrapNilRemoteHostKeyCallback(cb cryptoSSH.HostKeyCallback) cryptoSSH.HostKeyCallback {
@@ -561,6 +576,7 @@ func newKHHostnameMatcher(pattern string) (khMatcher, error) {
 		if len(p) == 0 {
 			return nil, errors.New("knownhosts: negation without following hostname")
 		}
+		p = strings.ToLower(p)
 		var err error
 		if p[0] == '[' {
 			a.host, a.port, err = net.SplitHostPort(p)

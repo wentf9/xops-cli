@@ -797,6 +797,11 @@ func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuratio
 }
 
 func (o *SshOptions) appendRememberPersistenceOptions(adpOpts *[]adapter.Option, nodeID string, cfg *config.Configuration, repository config.ConfigProvider, shouldRemember bool) error {
+	repo, isRepo := repository.(*config.Repository)
+	if !isRepo {
+		*adpOpts = append(*adpOpts, adapter.WithCredentialRecording(false), adapter.WithSuppressNodeConfirmation(true))
+		return nil
+	}
 	if !shouldRemember {
 		return nil
 	}
@@ -804,13 +809,11 @@ func (o *SshOptions) appendRememberPersistenceOptions(adpOpts *[]adapter.Option,
 	if o.execution.enabled() || o.execution.noLoginSet || o.StdioForward != "" || o.Subsystem {
 		*adpOpts = append(*adpOpts, adapter.WithEnrollmentProbeExclusions(nodeID))
 	}
-	if repo, ok := repository.(*config.Repository); ok {
-		persistence, err := o.interaction.automaticPersistenceOptions(repo, cfg)
-		if err != nil {
-			return err
-		}
-		*adpOpts = append(*adpOpts, persistence...)
+	persistence, err := o.interaction.automaticPersistenceOptions(repo, cfg)
+	if err != nil {
+		return err
 	}
+	*adpOpts = append(*adpOpts, persistence...)
 	return nil
 }
 

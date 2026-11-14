@@ -322,8 +322,20 @@ func TestL7_PendingConnectionDistinctOpenSSHAliases(t *testing.T) {
 	if _, _, identB, err := provider.Resolve(resB.NodeID); err != nil || !strings.HasSuffix(identB.KeyPath, "id_b") {
 		t.Fatalf("Resolve(role-b) = (%q, %v), want id_b", identB.KeyPath, err)
 	}
-	if _, pending := preparer.PendingNodeExecution(resA.NodeID); !pending {
-		t.Fatalf("expected PendingNodeExecution(%q) to be true", resA.NodeID)
+	if _, pending := preparer.PendingNodeExecution(resA.NodeID); pending {
+		t.Fatalf("expected read-only override PendingNodeExecution(%q) to be false", resA.NodeID)
+	}
+	underlyingRepo := provider.(*openSSHOverrideProvider).repo
+	if _, pending := underlyingRepo.PendingNodeExecution(resA.NodeID); !pending {
+		t.Fatalf("expected underlying repo.PendingNodeExecution(%q) to be true", resA.NodeID)
+	}
+	if _, pending := underlyingRepo.PendingNodeExecution(resB.NodeID); pending {
+		t.Fatalf("expected underlying repo.PendingNodeExecution(%q) to be false for OpenSSH-prefixed disambiguated node", resB.NodeID)
+	}
+	if snapB, snapErr := underlyingRepo.ResolveConnection(resB.NodeID); snapErr != nil {
+		t.Fatalf("ResolveConnection(%q): %v", resB.NodeID, snapErr)
+	} else if snapB.UpdateRef != nil {
+		t.Fatalf("expected UpdateRef == nil for OpenSSH-prefixed disambiguated node %q, got %+v", resB.NodeID, snapB.UpdateRef)
 	}
 	if err := preparer.ConfirmNodeWithExecutionContext(t.Context(), resA.NodeID, nil); err != nil {
 		t.Fatalf("ConfirmNodeWithExecutionContext on read-only override provider failed: %v", err)

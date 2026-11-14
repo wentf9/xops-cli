@@ -32,7 +32,10 @@ const (
 // so this uses DefaultInteractionTimeout rather than a sub-second grace window.
 var agentNonHalfCloseTimeout = DefaultInteractionTimeout
 
-var errAgentLeaseConflict = errors.New("conflicting agent forwarding target is already active on this SSH connection")
+var (
+	errAgentLeaseConflict = errors.New("conflicting agent forwarding target is already active on this SSH connection")
+	errEmptyAgentSocket   = errors.New("agent forwarding socket path cannot be empty")
+)
 
 // ResolveForwardAgent resolves an OpenSSH ForwardAgent specification against
 // identityAgentSpec, env, and target.
@@ -58,7 +61,11 @@ func ResolveForwardAgent(forwardSpec, identityAgentSpec string, env Environment,
 		return sock, sock != "", nil
 	}
 	if trimmed == "SSH_AUTH_SOCK" {
-		sock := normalizeExpandedAgentSocketPath(strings.TrimSpace(env.AgentSocket), env)
+		rawSock := strings.TrimSpace(env.AgentSocket)
+		if rawSock == "" {
+			return "", false, nil
+		}
+		sock := normalizeExpandedAgentSocketPath(rawSock, env)
 		return sock, sock != "", nil
 	}
 	expanded, err := expandAgentSocketPath(trimmed, env, target, "ForwardAgent")
@@ -85,7 +92,6 @@ type agentForwardLease struct {
 	cancel    context.CancelFunc
 	socket    string
 	dialAgent func(context.Context, string) (net.Conn, error)
-	proxy     *proxySessionState
 	logger    logger.DebugLogger
 
 	mu          sync.Mutex
@@ -230,44 +236,15 @@ func getOrCreateAgentRouter(sshClient *cryptoSSH.Client) (*sshAgentChannelRouter
 }
 
 func isLeaseActiveLocked(cand *agentForwardLease) bool {
-	if cand == nil || cand.isClosed() {
-		return false
-	}
-	if cand.proxy != nil && cand.proxy.closed.Load() {
-		return false
-	}
-	return true
+	return cand != nil && !cand.isClosed()
 }
 
-func isAuthorizedServerProxy(ps *proxySessionState) bool {
-	return ps != nil && ps.server != nil && ps.server.allowAgentForward
-}
-
-func proxyLeaseSocket(ps *proxySessionState) string {
-	if ps == nil || ps.server == nil {
-		return ""
-	}
-	return ps.server.agentSocket
-}
-
-func (r *sshAgentChannelRouter) hasConflictingActiveLeaseLocked(socket string, proxy *proxySessionState) bool {
+func (r *sshAgentChannelRouter) hasConflictingActiveLeaseLocked(socket string) bool {
 	for _, cand := range r.leases {
 		if !isLeaseActiveLocked(cand) {
 			continue
 		}
-		if (proxy != nil && !isAuthorizedServerProxy(proxy)) || (cand.proxy != nil && !isAuthorizedServerProxy(cand.proxy)) {
-			if proxy != nil && cand.proxy == proxy {
-				continue
-			}
-			return true
-		}
-		if proxy == nil && cand.proxy == nil {
-			if cand.socket != socket {
-				return true
-			}
-			continue
-		}
-		if cand.socket != "" && socket != "" && cand.socket != socket {
+		if socket == "" || cand.socket == "" || cand.socket != socket {
 			return true
 		}
 	}
@@ -286,9 +263,14 @@ func (r *sshAgentChannelRouter) acquireLocalLease(
 	if l == nil {
 		l = logger.NopLogger
 	}
+	socket = strings.TrimSpace(socket)
+	if socket == "" {
+		l.Debugf("ForwardAgent: rejecting empty local agent socket path")
+		return nil, errEmptyAgentSocket
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.hasConflictingActiveLeaseLocked(socket, nil) {
+	if r.hasConflictingActiveLeaseLocked(socket) {
 		l.Debugf("ForwardAgent: rejecting conflicting local agent lease for %q on shared SSH connection", socket)
 		return nil, errAgentLeaseConflict
 	}
@@ -300,30 +282,6 @@ func (r *sshAgentChannelRouter) acquireLocalLease(
 		socket:    socket,
 		dialAgent: dialAgent,
 		logger:    l,
-	}
-	r.leases = append(r.leases, lease)
-	return lease, nil
-}
-
-func (r *sshAgentChannelRouter) acquireProxyLease(ps *proxySessionState, l logger.DebugLogger) (*agentForwardLease, error) {
-	if l == nil {
-		l = logger.NopLogger
-	}
-	sock := proxyLeaseSocket(ps)
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.hasConflictingActiveLeaseLocked(sock, ps) {
-		l.Debugf("ForwardAgent: rejecting conflicting MUX_C_PROXY agent lease on shared SSH connection")
-		return nil, errAgentLeaseConflict
-	}
-	leaseCtx, cancel := context.WithCancel(context.Background())
-	lease := &agentForwardLease{
-		router: r,
-		ctx:    leaseCtx,
-		cancel: cancel,
-		socket: sock,
-		proxy:  ps,
-		logger: l,
 	}
 	r.leases = append(r.leases, lease)
 	return lease, nil
@@ -343,9 +301,6 @@ func (r *sshAgentChannelRouter) beginActiveLease() *agentForwardLease {
 	for i := len(r.leases) - 1; i >= 0; i-- {
 		cand := r.leases[i]
 		if cand == nil {
-			continue
-		}
-		if cand.proxy != nil && cand.proxy.closed.Load() {
 			continue
 		}
 		if cand.tryBeginPump() {
@@ -382,12 +337,6 @@ func (r *sshAgentChannelRouter) dispatchLoop(chans <-chan cryptoSSH.NewChannel) 
 		if !r.tryAcquireChannelSlot() {
 			lease.pumps.Done()
 			_ = newCh.Reject(cryptoSSH.ResourceShortage, "too many concurrent agent forwarding channels")
-			continue
-		}
-		if lease.proxy != nil {
-			go func(l *agentForwardLease, ch cryptoSSH.NewChannel) {
-				l.proxy.forwardUpstreamAgentChannelOpen(l, ch, r.releaseChannelSlot)
-			}(lease, newCh)
 			continue
 		}
 		go func(l *agentForwardLease, ch cryptoSSH.NewChannel) {
@@ -589,7 +538,56 @@ func (c *Client) acquireSessionAgentLease(ctx context.Context) *agentForwardLeas
 	return lease
 }
 
+func (c *Client) isMultiplexedProxy() bool {
+	if c == nil {
+		return false
+	}
+	if c.muxSocketPath != "" {
+		return true
+	}
+	if c.sshClient != nil && c.sshClient.Conn != nil {
+		if _, ok := c.sshClient.Conn.(*muxProxySSHConn); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// shouldRequestMuxProxyAgentForward reports whether a multiplexed control-proxy
+// passenger should send auth-agent-req@openssh.com to ask the ControlMaster to
+// forward the Master's own verified ssh-agent (matching native OpenSSH mux.c).
+func (c *Client) shouldRequestMuxProxyAgentForward() bool {
+	if c == nil || c.sshClient == nil {
+		return false
+	}
+	connCfg := c.ConnectionConfig()
+	if connCfg.Options == nil {
+		return false
+	}
+	fwdSpec := strings.TrimSpace(connCfg.Options.ForwardAgent())
+	if fwdSpec == "" || strings.EqualFold(fwdSpec, "no") || strings.EqualFold(fwdSpec, "false") {
+		return false
+	}
+	idSpec := strings.TrimSpace(connCfg.Options.IdentityAgent())
+	return !strings.EqualFold(idSpec, "none")
+}
+
 func (c *Client) enableSessionAgentForward(ctx context.Context, session *cryptoSSH.Session) func() {
+	if c.isMultiplexedProxy() {
+		if !c.shouldRequestMuxProxyAgentForward() {
+			return func() {}
+		}
+		var accepted bool
+		err := c.sessionRequest(ctx, session, agentForwardRequestType, func() error {
+			var reqErr error
+			accepted, reqErr = session.SendRequest(agentForwardRequestType, true, nil)
+			return reqErr
+		})
+		if err != nil || !accepted {
+			c.getLogger().Debugf("SSH server rejected or failed %s over mux proxy (accepted=%v, err=%v); continuing without agent forwarding", agentForwardRequestType, accepted, err)
+		}
+		return func() {}
+	}
 	lease := c.acquireSessionAgentLease(ctx)
 	if lease == nil {
 		return func() {}

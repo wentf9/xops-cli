@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 
 	cryptoSSH "golang.org/x/crypto/ssh"
 	"golang.org/x/term"
@@ -19,6 +20,38 @@ type privilegeTerminal struct {
 	ignoreExit    bool
 	// Explicit execution keeps the control shell separate from user login mode.
 	portableControl bool
+
+	escapeByte    byte
+	escapeEnabled bool
+	suspendMu     sync.Mutex
+	onSuspend     func() error
+}
+
+func (t *privilegeTerminal) setSuspend(fn func() error) {
+	if t == nil {
+		return
+	}
+	t.suspendMu.Lock()
+	t.onSuspend = fn
+	t.suspendMu.Unlock()
+}
+
+func (t *privilegeTerminal) suspend() error {
+	if t == nil {
+		return nil
+	}
+	t.suspendMu.Lock()
+	fn := t.onSuspend
+	t.suspendMu.Unlock()
+	if fn == nil {
+		return nil
+	}
+	return fn()
+}
+
+type escapePipeWriteCloser struct {
+	io.Writer
+	io.Closer
 }
 
 func (c *Client) runInteractivePrivilege(ctx context.Context, mode SudoMode, command string, streams InteractiveIO, extra ...any) error {
@@ -26,6 +59,10 @@ func (c *Client) runInteractivePrivilege(ctx context.Context, mode SudoMode, com
 }
 
 func (c *Client) runInteractivePrivilegeSession(ctx context.Context, mode SudoMode, command string, streams InteractiveIO, ignoreExit bool, config *RunConfig, extra ...any) error {
+	escapeByte, escapeEnabled, err := resolveInteractiveEscapeChar(c.ConnectionConfig().Options)
+	if err != nil {
+		return err
+	}
 	fdIn, fdOut, err := validateInteractiveIO(streams)
 	if err != nil {
 		return err
@@ -34,19 +71,28 @@ func (c *Client) runInteractivePrivilegeSession(ctx context.Context, mode SudoMo
 	if err != nil || width <= 0 || height <= 0 {
 		width, height = 80, 40
 	}
-	terminal := &privilegeTerminal{width: width, height: height, ignoreExit: ignoreExit, portableControl: config != nil}
+	terminal := &privilegeTerminal{
+		width:           width,
+		height:          height,
+		ignoreExit:      ignoreExit,
+		portableControl: config != nil,
+		escapeByte:      escapeByte,
+		escapeEnabled:   escapeEnabled,
+	}
 	terminal.activate = func(work context.Context, session *cryptoSSH.Session) (func() error, error) {
 		if err := work.Err(); err != nil {
 			return nil, err
 		}
-		state, err := term.MakeRaw(fdIn)
+		onSuspend, restoreRaw, err := c.enterTerminalRawMode(fdIn, fdOut, session)
 		if err != nil {
 			return nil, fmt.Errorf("set interactive privilege terminal raw mode: %w", err)
 		}
+		terminal.setSuspend(onSuspend)
 		stopResize := startWindowResizeLoop(work, session, fdOut, width, height, c.getLogger(), c.Interrupt)
 		return func() error {
+			terminal.setSuspend(nil)
 			resizeErr := stopResize()
-			if err := term.Restore(fdIn, state); err != nil {
+			if err := restoreRaw(); err != nil {
 				return errors.Join(resizeErr, fmt.Errorf("restore interactive privilege terminal: %w", err))
 			}
 			return resizeErr
@@ -78,6 +124,7 @@ func (e *privilegeExchange) forwardInput(ctx context.Context, stdin io.Reader, p
 			if restoreErr != nil {
 				phase = "terminal_restore_failed"
 			}
+			e.recordTerminalRestoreError(restoreErr)
 			e.client.observePrivilege(e.mode, phase, 3, 0)
 			retErr = errors.Join(retErr, restoreErr)
 		}()
@@ -89,6 +136,7 @@ func (e *privilegeExchange) forwardInput(ctx context.Context, stdin io.Reader, p
 		return fmt.Errorf("confirm privilege readiness: %w", err)
 	}
 	e.client.observePrivilege(e.mode, "handoff_ack_sent", 3, 0)
+	inputDst := pipe
 	if e.terminal != nil {
 		handoff, cancel := withTimeoutOrDefault(ctx, e.client.handshakeTimeout, defaultSSHHandshakeTimeout)
 		defer cancel()
@@ -97,8 +145,20 @@ func (e *privilegeExchange) forwardInput(ctx context.Context, stdin io.Reader, p
 		case <-handoff.Done():
 			return fmt.Errorf("wait for remote terminal handoff: %w", handoff.Err())
 		}
+		if e.terminal.escapeEnabled {
+			wrapped, filter := e.client.wrapTerminalEscapeInput(
+				pipe,
+				InteractiveIO{Stdout: e.localOut, Stderr: e.localOut},
+				e.terminal.escapeByte,
+				true,
+				e.abort,
+				e.terminal.suspend,
+			)
+			e.setEscapeFilter(filter)
+			inputDst = escapePipeWriteCloser{Writer: wrapped, Closer: pipe}
+		}
 	}
-	finish, err := setupStdinPipeline(stdin, pipe, "", inputPipelineOptions{ctx: ctx, bridge: e.client.environment.InputBridge})
+	finish, err := setupStdinPipeline(stdin, inputDst, "", inputPipelineOptions{ctx: ctx, bridge: e.client.environment.InputBridge})
 	if err != nil {
 		return err
 	}

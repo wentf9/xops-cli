@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -205,7 +206,8 @@ type MuxServer struct {
 	serverCtx    context.Context
 	serverCancel context.CancelFunc
 
-	forwards sync.Map // string -> *muxForwardEntry
+	forwards        sync.Map                                      // string -> *muxForwardEntry
+	listenEndpoints map[forwardListenKey]*muxForwardEndpointState // protected by idleMu
 	// liveStreams holds every accepted connection the master is currently piping:
 	// proxy sockets and forwarded client connections. Shutdown closes them so
 	// idle readers unblock instead of outliving the master.
@@ -231,6 +233,11 @@ func NewMuxServer(opts MuxServerOptions) (*MuxServer, error) {
 	mask := DefaultStreamLocalBindMask
 	if opts.HasStreamLocalBindMask {
 		mask = opts.StreamLocalBindMask
+	}
+
+	var normAgentSocket string
+	if rawAgentSock := strings.TrimSpace(opts.AgentSocket); rawAgentSock != "" {
+		normAgentSocket = normalizeExpandedAgentSocketPath(rawAgentSock, Environment{})
 	}
 
 	serverCtx, serverCancel := context.WithCancel(context.Background())
@@ -259,7 +266,7 @@ func NewMuxServer(opts MuxServerOptions) (*MuxServer, error) {
 		streamLocalBindUnlink: opts.StreamLocalBindUnlink,
 		streamLocalBindMask:   mask,
 		allowAgentForward:     opts.AllowAgentForward,
-		agentSocket:           normalizeExpandedAgentSocketPath(strings.TrimSpace(opts.AgentSocket), Environment{}),
+		agentSocket:           normAgentSocket,
 		dialAgent:             opts.DialAgent,
 		logger:                opts.Logger,
 	}
@@ -353,7 +360,9 @@ func StartMuxServer(ctx context.Context, sshClient *cryptoSSH.Client, opts MuxMa
 	if agentSocket == "" && opts.AllowAgentForward {
 		agentSocket = strings.TrimSpace(env.AgentSocket)
 	}
-	agentSocket = normalizeExpandedAgentSocketPath(agentSocket, env)
+	if agentSocket != "" {
+		agentSocket = normalizeExpandedAgentSocketPath(agentSocket, env)
+	}
 
 	server, err := NewMuxServer(MuxServerOptions{
 		ControlPath:            opts.Path,
@@ -466,7 +475,7 @@ func (s *MuxServer) PrepareHandoff() bool {
 	if s.shuttingDown || s.closed.Load() || s.stoppedListening.Load() || s.activeSessions.Load() > 0 {
 		return false
 	}
-	if s.forwardCount() > 0 || s.activeForwardStreams.Load() > 0 {
+	if s.forwardCount() > 0 || len(s.listenEndpoints) > 0 || s.activeForwardStreams.Load() > 0 {
 		return false
 	}
 	s.shuttingDown = true
@@ -519,7 +528,7 @@ func (s *MuxServer) WaitForDrain(ctx context.Context, maxSessions int32) error {
 	for {
 		s.idleMu.Lock()
 		ready := s.shuttingDown || s.closed.Load() || s.stoppedListening.Load() ||
-			(s.activeSessions.Load() <= maxSessions && s.forwardCount() == 0 && s.activeForwardStreams.Load() == 0)
+			(s.activeSessions.Load() <= maxSessions && s.forwardCount() == 0 && len(s.listenEndpoints) == 0 && s.activeForwardStreams.Load() == 0)
 		notify := s.idleNotify
 		s.idleMu.Unlock()
 		if ready {
@@ -1117,32 +1126,193 @@ func (s *MuxServer) dialSSHMux(parent context.Context, network, addr string) (ne
 	return s.sshClient.DialContext(dialCtx, network, addr)
 }
 
+type muxForwardScope uint8
+
+const (
+	muxForwardScopeLocal muxForwardScope = iota + 1
+	muxForwardScopeRemote
+)
+
+type forwardListenKey struct {
+	fwdScope   muxForwardScope
+	network    string
+	keyHost    string
+	listenPort uint32
+}
+
+type muxForwardEndpointState struct {
+	inFlight bool
+	done     chan struct{}
+	entry    *muxForwardEntry
+}
+
+type muxEndpointAcquireOutcome uint8
+
+const (
+	muxEndpointReserved muxEndpointAcquireOutcome = iota + 1
+	muxEndpointRetained
+	muxEndpointConflict
+	muxEndpointShuttingDown
+)
+
 type muxForwardEntry struct {
 	closer       io.Closer
 	fwdType      uint32
 	keyHost      string
 	connectHost  string
 	connectPort  uint32
+	listenKey    forwardListenKey
+	hasListenKey bool
 	dynamicAlloc bool
 	remote       bool
 	refs         int
 }
 
-func (s *MuxServer) tryRetainExistingForward(key string, refCounted bool) (retained bool, shuttingDown bool) {
-	s.idleMu.Lock()
-	defer s.idleMu.Unlock()
-	if s.shuttingDown || s.closed.Load() {
-		return false, true
+func makeForwardListenKey(fwdType uint32, network, keyHost string, listenPort uint32) (forwardListenKey, bool) {
+	if fwdType == MUX_FWD_REMOTE && listenPort == 0 {
+		return forwardListenKey{}, false
 	}
-	if val, exists := s.forwards.Load(key); exists {
-		if entry, ok := val.(*muxForwardEntry); ok {
-			if refCounted {
-				entry.refs++
+	scope := muxForwardScopeLocal
+	if fwdType == MUX_FWD_REMOTE {
+		scope = muxForwardScopeRemote
+	}
+	endpointHost := keyHost
+	if network == "unix" {
+		endpointHost = filepath.Clean(keyHost)
+	}
+	return forwardListenKey{
+		fwdScope:   scope,
+		network:    network,
+		keyHost:    endpointHost,
+		listenPort: listenPort,
+	}, true
+}
+
+func sameMuxForwardDestination(entry *muxForwardEntry, fwdType uint32, normConnectHost string, connectPort uint32) bool {
+	if entry == nil || entry.dynamicAlloc || entry.fwdType != fwdType {
+		return false
+	}
+	if fwdType == MUX_FWD_DYNAMIC {
+		return true
+	}
+	return entry.connectHost == normConnectHost && entry.connectPort == connectPort
+}
+
+func (s *MuxServer) acquireForwardEndpoint(
+	listenKey forwardListenKey,
+	fwdType uint32,
+	normConnectHost string,
+	connectPort uint32,
+) (*muxForwardEndpointState, muxEndpointAcquireOutcome) {
+	for {
+		s.idleMu.Lock()
+		if s.shuttingDown || s.closed.Load() {
+			s.idleMu.Unlock()
+			return nil, muxEndpointShuttingDown
+		}
+		if s.listenEndpoints == nil {
+			s.listenEndpoints = make(map[forwardListenKey]*muxForwardEndpointState)
+		}
+		cur, exists := s.listenEndpoints[listenKey]
+		if !exists {
+			slot := &muxForwardEndpointState{
+				inFlight: true,
+				done:     make(chan struct{}),
 			}
-			return true, false
+			s.listenEndpoints[listenKey] = slot
+			s.idleMu.Unlock()
+			return slot, muxEndpointReserved
+		}
+		if cur.inFlight {
+			waitCh := cur.done
+			s.idleMu.Unlock()
+			select {
+			case <-waitCh:
+				continue
+			case <-s.baseContext().Done():
+				return nil, muxEndpointShuttingDown
+			}
+		}
+		if cur.entry != nil && sameMuxForwardDestination(cur.entry, fwdType, normConnectHost, connectPort) {
+			if fwdType == MUX_FWD_REMOTE {
+				cur.entry.refs++
+			}
+			s.idleMu.Unlock()
+			return nil, muxEndpointRetained
+		}
+		s.idleMu.Unlock()
+		return nil, muxEndpointConflict
+	}
+}
+
+func (s *MuxServer) abortReservedForward(listenKey forwardListenKey, slot *muxForwardEndpointState) {
+	if slot == nil {
+		return
+	}
+	s.idleMu.Lock()
+	if s.listenEndpoints != nil && s.listenEndpoints[listenKey] == slot {
+		delete(s.listenEndpoints, listenKey)
+	}
+	close(slot.done)
+	s.notifyIdleLocked()
+	s.idleMu.Unlock()
+}
+
+func (s *MuxServer) commitReservedForward(
+	listenKey forwardListenKey,
+	slot *muxForwardEndpointState,
+	key string,
+	cand *muxForwardEntry,
+) (entry *muxForwardEntry, duplicate bool, shuttingDown bool) {
+	s.idleMu.Lock()
+	if s.shuttingDown || s.closed.Load() {
+		if slot != nil {
+			if s.listenEndpoints != nil && s.listenEndpoints[listenKey] == slot {
+				delete(s.listenEndpoints, listenKey)
+			}
+			close(slot.done)
+			s.notifyIdleLocked()
+		}
+		s.idleMu.Unlock()
+		s.closeUnpublishedMuxForward(cand)
+		return nil, false, true
+	}
+	if cand.refs <= 0 {
+		cand.refs = 1
+	}
+	if existing, loaded := s.forwards.LoadOrStore(key, cand); loaded {
+		if existingEntry, ok := existing.(*muxForwardEntry); ok {
+			if cand.fwdType == MUX_FWD_REMOTE {
+				existingEntry.refs++
+			}
+			if slot != nil {
+				slot.entry = existingEntry
+				slot.inFlight = false
+				close(slot.done)
+			}
+			s.idleMu.Unlock()
+			s.closeUnpublishedMuxForward(cand)
+			return existingEntry, true, false
 		}
 	}
-	return false, false
+	if slot != nil {
+		cand.listenKey = listenKey
+		cand.hasListenKey = true
+		slot.entry = cand
+		slot.inFlight = false
+		close(slot.done)
+	}
+	s.idleMu.Unlock()
+	return cand, false, false
+}
+
+func (s *MuxServer) deleteEndpointEntryLocked(entry *muxForwardEntry) {
+	if entry == nil || !entry.hasListenKey || s.listenEndpoints == nil {
+		return
+	}
+	if cur, exists := s.listenEndpoints[entry.listenKey]; exists && !cur.inFlight && cur.entry == entry {
+		delete(s.listenEndpoints, entry.listenKey)
+	}
 }
 
 func (s *MuxServer) handleOpenFwd(conn net.Conn, req MuxFwdRequest) error {
@@ -1160,13 +1330,22 @@ func (s *MuxServer) handleOpenFwd(conn net.Conn, req MuxFwdRequest) error {
 	}
 	normConnectHost := normalizeMuxForwardHost(req.ConnectHost, req.ConnectPort)
 	key := forwardKey(req.FwdType, keyHost, req.ListenPort, normConnectHost, req.ConnectPort)
-	if req.FwdType != MUX_FWD_REMOTE || req.ListenPort != 0 {
-		retained, shuttingDown := s.tryRetainExistingForward(key, req.FwdType == MUX_FWD_REMOTE)
-		if shuttingDown {
+
+	var (
+		listenKey    forwardListenKey
+		hasListenKey bool
+		reservedSlot *muxForwardEndpointState
+	)
+	if listenKey, hasListenKey = makeForwardListenKey(req.FwdType, network, keyHost, req.ListenPort); hasListenKey {
+		var outcome muxEndpointAcquireOutcome
+		reservedSlot, outcome = s.acquireForwardEndpoint(listenKey, req.FwdType, normConnectHost, req.ConnectPort)
+		switch outcome {
+		case muxEndpointShuttingDown:
 			return sendFailure(conn, req.RequestID, "mux master is shutting down")
-		}
-		if retained {
+		case muxEndpointRetained:
 			return sendOk(conn, req.RequestID)
+		case muxEndpointConflict:
+			return sendFailure(conn, req.RequestID, "port forwarding conflict on listen endpoint")
 		}
 	}
 
@@ -1180,9 +1359,10 @@ func (s *MuxServer) handleOpenFwd(conn net.Conn, req MuxFwdRequest) error {
 			ln, err = lc.Listen(s.baseContext(), network, listenAddr)
 		}
 		if err != nil {
+			s.abortReservedForward(listenKey, reservedSlot)
 			return sendFailure(conn, req.RequestID, fmt.Sprintf("bind local port %s failed: %v", listenAddr, err))
 		}
-		entry, duplicate, shuttingDown := s.publishForward(key, &muxForwardEntry{
+		entry, duplicate, shuttingDown := s.commitReservedForward(listenKey, reservedSlot, key, &muxForwardEntry{
 			closer:      ln,
 			fwdType:     req.FwdType,
 			keyHost:     keyHost,
@@ -1203,7 +1383,7 @@ func (s *MuxServer) handleOpenFwd(conn net.Conn, req MuxFwdRequest) error {
 		return sendOk(conn, req.RequestID)
 
 	case MUX_FWD_REMOTE:
-		return s.openRemoteForward(conn, req, network, listenAddr, keyHost, normConnectHost)
+		return s.openRemoteForward(conn, req, network, listenAddr, keyHost, normConnectHost, listenKey, reservedSlot)
 
 	case MUX_FWD_DYNAMIC:
 		var ln net.Listener
@@ -1214,9 +1394,10 @@ func (s *MuxServer) handleOpenFwd(conn net.Conn, req MuxFwdRequest) error {
 			ln, err = lc.Listen(s.baseContext(), network, listenAddr)
 		}
 		if err != nil {
+			s.abortReservedForward(listenKey, reservedSlot)
 			return sendFailure(conn, req.RequestID, fmt.Sprintf("bind dynamic port %s failed: %v", listenAddr, err))
 		}
-		entry, duplicate, shuttingDown := s.publishForward(key, &muxForwardEntry{
+		entry, duplicate, shuttingDown := s.commitReservedForward(listenKey, reservedSlot, key, &muxForwardEntry{
 			closer:      ln,
 			fwdType:     req.FwdType,
 			keyHost:     keyHost,
@@ -1237,13 +1418,21 @@ func (s *MuxServer) handleOpenFwd(conn net.Conn, req MuxFwdRequest) error {
 		return sendOk(conn, req.RequestID)
 
 	default:
+		s.abortReservedForward(listenKey, reservedSlot)
 		return sendFailure(conn, req.RequestID, fmt.Sprintf("unsupported forward type %d", req.FwdType))
 	}
 }
 
-func (s *MuxServer) openRemoteForward(conn net.Conn, req MuxFwdRequest, network, listenAddr, keyHost, normConnectHost string) error {
+func (s *MuxServer) openRemoteForward(
+	conn net.Conn,
+	req MuxFwdRequest,
+	network, listenAddr, keyHost, normConnectHost string,
+	listenKey forwardListenKey,
+	reservedSlot *muxForwardEndpointState,
+) error {
 	ln, err := s.listenRemoteMux(network, listenAddr)
 	if err != nil {
+		s.abortReservedForward(listenKey, reservedSlot)
 		return sendFailure(conn, req.RequestID, fmt.Sprintf("remote listen %s failed: %v", listenAddr, err))
 	}
 	key := forwardKey(req.FwdType, keyHost, req.ListenPort, normConnectHost, req.ConnectPort)
@@ -1255,7 +1444,7 @@ func (s *MuxServer) openRemoteForward(conn net.Conn, req MuxFwdRequest, network,
 		}
 	}
 	dynamicAlloc := isTCPNetwork(network) && req.ListenPort == 0 && allocatedPort > 0
-	entry, duplicate, shuttingDown := s.publishForward(key, &muxForwardEntry{
+	cand := &muxForwardEntry{
 		closer:       ln,
 		fwdType:      req.FwdType,
 		keyHost:      keyHost,
@@ -1264,7 +1453,17 @@ func (s *MuxServer) openRemoteForward(conn net.Conn, req MuxFwdRequest, network,
 		dynamicAlloc: dynamicAlloc,
 		remote:       true,
 		refs:         1,
-	})
+	}
+	var (
+		entry        *muxForwardEntry
+		duplicate    bool
+		shuttingDown bool
+	)
+	if reservedSlot != nil {
+		entry, duplicate, shuttingDown = s.commitReservedForward(listenKey, reservedSlot, key, cand)
+	} else {
+		entry, duplicate, shuttingDown = s.publishForward(key, cand)
+	}
 	if shuttingDown {
 		return sendFailure(conn, req.RequestID, "mux master is shutting down")
 	}
@@ -1282,10 +1481,9 @@ func (s *MuxServer) openRemoteForward(conn net.Conn, req MuxFwdRequest, network,
 	return sendOk(conn, req.RequestID)
 }
 
-// publishForward registers a listener this master now owns. Shutdown and
-// PrepareHandoff synchronize on idleMu, so a forward never slips in after the
-// master committed to handoff or shutdown, and LoadOrStore prevents concurrent
-// identical requests from overwriting and leaking an existing listener.
+// publishForward registers a dynamically allocated remote listener this master
+// now owns. Shutdown and PrepareHandoff synchronize on idleMu, so a forward
+// never slips in after the master committed to handoff or shutdown.
 func (s *MuxServer) publishForward(key string, cand *muxForwardEntry) (entry *muxForwardEntry, duplicate bool, shuttingDown bool) {
 	s.idleMu.Lock()
 	if s.shuttingDown || s.closed.Load() {
@@ -1306,6 +1504,26 @@ func (s *MuxServer) publishForward(key string, cand *muxForwardEntry) (entry *mu
 			return existingEntry, true, false
 		}
 	}
+	if cand.dynamicAlloc && cand.closer != nil {
+		if ln, ok := cand.closer.(net.Listener); ok {
+			if port := extractAllocatedPort(ln.Addr()); port > 0 {
+				dynKey := forwardListenKey{
+					fwdScope:   muxForwardScopeRemote,
+					network:    s.effectiveDialNetwork(),
+					keyHost:    cand.keyHost,
+					listenPort: port,
+				}
+				if s.listenEndpoints == nil {
+					s.listenEndpoints = make(map[forwardListenKey]*muxForwardEndpointState)
+				}
+				if _, exists := s.listenEndpoints[dynKey]; !exists {
+					cand.listenKey = dynKey
+					cand.hasListenKey = true
+					s.listenEndpoints[dynKey] = &muxForwardEndpointState{entry: cand}
+				}
+			}
+		}
+	}
 	s.idleMu.Unlock()
 	return cand, false, false
 }
@@ -1313,7 +1531,9 @@ func (s *MuxServer) publishForward(key string, cand *muxForwardEntry) (entry *mu
 func (s *MuxServer) retireForward(key string, entry *muxForwardEntry) {
 	s.idleMu.Lock()
 	defer s.idleMu.Unlock()
-	if s.forwards.CompareAndDelete(key, entry) {
+	deleted := s.forwards.CompareAndDelete(key, entry)
+	s.deleteEndpointEntryLocked(entry)
+	if deleted {
 		s.notifyIdleLocked()
 	}
 }
@@ -1549,6 +1769,7 @@ func (s *MuxServer) handleCloseFwd(conn net.Conn, req MuxFwdRequest) error {
 		return sendOk(conn, req.RequestID)
 	}
 	s.forwards.Delete(matchedKey)
+	s.deleteEndpointEntryLocked(entry)
 	s.notifyIdleLocked()
 	s.idleMu.Unlock()
 
@@ -1592,7 +1813,6 @@ type proxyChan struct {
 	leaseMu         sync.Mutex
 	leaseReleased   bool
 	agentProxyLease *agentForwardLease
-	onDone          func()
 }
 
 func (pc *proxyChan) attachAgentProxyLease(lease *agentForwardLease) bool {
@@ -1619,14 +1839,9 @@ func (pc *proxyChan) releaseAgentProxyLease() {
 	pc.leaseReleased = true
 	lease := pc.agentProxyLease
 	pc.agentProxyLease = nil
-	onDone := pc.onDone
-	pc.onDone = nil
 	pc.leaseMu.Unlock()
 	if lease != nil {
 		lease.Release()
-	}
-	if onDone != nil {
-		onDone()
 	}
 }
 
@@ -1818,15 +2033,6 @@ func (q *orderedQueue[T]) pop() (T, bool) {
 	}
 }
 
-type proxyServerOpenResult struct {
-	confirmed bool
-	clientCh  uint32
-	window    uint32
-	maxPacket uint32
-	reason    uint32
-	message   string
-}
-
 type proxySessionState struct {
 	server   *MuxServer
 	conn     net.Conn
@@ -1834,9 +2040,8 @@ type proxySessionState struct {
 	channels sync.Map // serverChID (uint32) -> *proxyChan
 	// byClientCh indexes the same records by the proxy client's channel ID, which
 	// is what channel responses carry back.
-	byClientCh   sync.Map // clientChID (uint32) -> *proxyChan
-	pendingOpens sync.Map // serverChID (uint32) -> chan proxyServerOpenResult
-	nextChID     atomic.Uint32
+	byClientCh sync.Map // clientChID (uint32) -> *proxyChan
+	nextChID   atomic.Uint32
 	// global serializes client-to-server global requests. RFC 4254 global
 	// replies carry no request ID, so they can only be answered in wire order.
 	global   *orderedQueue[proxyGlobalRequest]
@@ -1870,16 +2075,6 @@ func (ps *proxySessionState) closeAll() {
 	if ps.global != nil {
 		ps.global.close()
 	}
-	ps.pendingOpens.Range(func(key, val any) bool {
-		ps.pendingOpens.Delete(key)
-		if ch, ok := val.(chan proxyServerOpenResult); ok {
-			select {
-			case ch <- proxyServerOpenResult{confirmed: false, reason: uint32(cryptoSSH.Prohibited), message: "proxy session closed"}:
-			default:
-			}
-		}
-		return true
-	})
 	ps.channels.Range(func(key, val any) bool {
 		if pc, ok := val.(*proxyChan); ok {
 			ps.byClientCh.CompareAndDelete(pc.clientCh, pc)
@@ -1974,10 +2169,6 @@ func (ps *proxySessionState) dispatch(packet []byte) {
 	switch packet[0] {
 	case msgChannelOpen:
 		ps.handleOpen(packet[1:])
-	case msgChannelOpenConfirmation:
-		ps.handleOpenConfirmation(packet[1:])
-	case msgChannelOpenFailure:
-		ps.handleOpenFailure(packet[1:])
 	case msgChannelData:
 		ps.handleData(packet[1:])
 	case msgChannelEOF:
@@ -2240,6 +2431,7 @@ func (ps *proxySessionState) sendChannelData(pc *proxyChan, extended bool, data 
 // streamChannelData drains both remote streams, then reports EOF and close to
 // the proxy client once pending replies have settled.
 func (ps *proxySessionState) streamChannelData(pc *proxyChan) {
+	defer pc.releaseAgentProxyLease()
 	var streams sync.WaitGroup
 	streams.Add(2)
 	go func() {
@@ -2466,269 +2658,14 @@ func (ps *proxySessionState) handleRequest(payload []byte) {
 	pc.requests.push(proxyChannelRequest{requestType: reqType, wantReply: wantReply, payload: reqPayload})
 }
 
-func (ps *proxySessionState) handleOpenConfirmation(payload []byte) {
-	r := newMuxReader(payload)
-	serverChID, err := r.ReadUint32()
-	if err != nil {
-		return
-	}
-	clientChID, err := r.ReadUint32()
-	if err != nil {
-		return
-	}
-	window, err := r.ReadUint32()
-	if err != nil {
-		return
-	}
-	maxPacket, err := r.ReadUint32()
-	if err != nil {
-		return
-	}
-	if val, ok := ps.pendingOpens.LoadAndDelete(serverChID); ok {
-		if ch, ok := val.(chan proxyServerOpenResult); ok {
-			select {
-			case ch <- proxyServerOpenResult{
-				confirmed: true,
-				clientCh:  clientChID,
-				window:    window,
-				maxPacket: maxPacket,
-			}:
-			default:
-			}
-		}
-	}
-}
-
-func (ps *proxySessionState) handleOpenFailure(payload []byte) {
-	r := newMuxReader(payload)
-	serverChID, err := r.ReadUint32()
-	if err != nil {
-		return
-	}
-	reason, err := r.ReadUint32()
-	if err != nil {
-		return
-	}
-	msg, err := r.ReadString()
-	if err != nil {
-		msg = "channel open failed"
-	}
-	if val, ok := ps.pendingOpens.LoadAndDelete(serverChID); ok {
-		if ch, ok := val.(chan proxyServerOpenResult); ok {
-			select {
-			case ch <- proxyServerOpenResult{
-				confirmed: false,
-				reason:    reason,
-				message:   msg,
-			}:
-			default:
-			}
-		}
-	}
-}
-
-func (ps *proxySessionState) forwardUpstreamAgentChannelOpen(lease *agentForwardLease, newCh cryptoSSH.NewChannel, releaseSlot func()) {
-	pumpDoneOnce := func() {}
-	var leaseDone <-chan struct{}
-	if lease != nil {
-		pumpDoneOnce = sync.OnceFunc(lease.pumps.Done)
-		if lease.ctx != nil {
-			leaseDone = lease.ctx.Done()
-		}
-	}
-	slotOnce := sync.OnceFunc(releaseSlot)
-	finishAll := func() {
-		slotOnce()
-		pumpDoneOnce()
-	}
-
-	serverCh, res, ok := ps.negotiateUpstreamAgentOpen(lease, leaseDone, newCh)
-	if !ok {
-		finishAll()
-		return
-	}
-
-	remoteCh, reqs, err := newCh.Accept()
-	if err != nil {
-		finishAll()
-		cw := newMuxWriter()
-		cw.buf = append(cw.buf, msgChannelClose)
-		cw.WriteUint32(res.clientCh)
-		_ = ps.writePacket(cw.Bytes())
-		return
-	}
-
-	ps.bridgeUpstreamAgentChannel(lease, serverCh, res, remoteCh, reqs, slotOnce, pumpDoneOnce)
-}
-
-func (ps *proxySessionState) negotiateUpstreamAgentOpen(
-	lease *agentForwardLease,
-	leaseDone <-chan struct{},
-	newCh cryptoSSH.NewChannel,
-) (uint32, proxyServerOpenResult, bool) {
-	if ps == nil || ps.closed.Load() || (lease != nil && lease.isClosed()) {
-		_ = newCh.Reject(cryptoSSH.Prohibited, "proxy session closed")
-		return 0, proxyServerOpenResult{}, false
-	}
-
-	serverCh := ps.nextChID.Add(1)
-	resCh := make(chan proxyServerOpenResult, 1)
-	ps.pendingOpens.Store(serverCh, resCh)
-	if ps.closed.Load() || (lease != nil && lease.isClosed()) {
-		ps.pendingOpens.Delete(serverCh)
-		_ = newCh.Reject(cryptoSSH.Prohibited, "proxy session closed")
-		return 0, proxyServerOpenResult{}, false
-	}
-
-	openPkt := newMuxWriter()
-	openPkt.buf = append(openPkt.buf, msgChannelOpen)
-	openPkt.WriteString(newCh.ChannelType())
-	openPkt.WriteUint32(serverCh)
-	openPkt.WriteUint32(proxyAdvertisedWindow)
-	openPkt.WriteUint32(proxyAdvertisedMaxPacket)
-	openPkt.buf = append(openPkt.buf, newCh.ExtraData()...)
-	if err := ps.writePacket(openPkt.Bytes()); err != nil {
-		ps.pendingOpens.Delete(serverCh)
-		_ = newCh.Reject(cryptoSSH.ConnectionFailed, "proxy write failed")
-		return 0, proxyServerOpenResult{}, false
-	}
-
-	res, ok := ps.awaitUpstreamAgentOpenConfirmation(serverCh, resCh, leaseDone, newCh)
-	if !ok {
-		return 0, proxyServerOpenResult{}, false
-	}
-	return serverCh, res, true
-}
-
-func (ps *proxySessionState) awaitUpstreamAgentOpenConfirmation(
-	serverCh uint32,
-	resCh <-chan proxyServerOpenResult,
-	leaseDone <-chan struct{},
-	newCh cryptoSSH.NewChannel,
-) (proxyServerOpenResult, bool) {
-	timer := time.NewTimer(5 * time.Second)
-	defer timer.Stop()
-	var res proxyServerOpenResult
-	select {
-	case res = <-resCh:
-	case <-ps.closedSignal():
-		ps.pendingOpens.Delete(serverCh)
-		_ = newCh.Reject(cryptoSSH.Prohibited, "proxy session closed")
-		return proxyServerOpenResult{}, false
-	case <-leaseDone:
-		ps.pendingOpens.Delete(serverCh)
-		_ = newCh.Reject(cryptoSSH.Prohibited, "agent forwarding session closed")
-		return proxyServerOpenResult{}, false
-	case <-timer.C:
-		ps.pendingOpens.Delete(serverCh)
-		_ = newCh.Reject(cryptoSSH.ConnectionFailed, "proxy channel open timed out")
-		return proxyServerOpenResult{}, false
-	}
-
-	if !res.confirmed {
-		reason := cryptoSSH.RejectionReason(res.reason)
-		if reason == 0 {
-			reason = cryptoSSH.ConnectionFailed
-		}
-		_ = newCh.Reject(reason, res.message)
-		return proxyServerOpenResult{}, false
-	}
-	if res.maxPacket < minProxyChannelPacket || int64(res.maxPacket) > maxFlowWindow || int64(res.window) > maxFlowWindow {
-		_ = newCh.Reject(cryptoSSH.ConnectionFailed, "invalid proxy channel window")
-		return proxyServerOpenResult{}, false
-	}
-	return res, true
-}
-
-func (ps *proxySessionState) bridgeUpstreamAgentChannel(
-	lease *agentForwardLease,
-	serverCh uint32,
-	res proxyServerOpenResult,
-	remoteCh cryptoSSH.Channel,
-	reqs <-chan *cryptoSSH.Request,
-	slotOnce, pumpDoneOnce func(),
-) {
-	pc := &proxyChan{
-		remoteCh:          remoteCh,
-		clientCh:          res.clientCh,
-		serverCh:          serverCh,
-		clientWindow:      newClientFlowWindow(res.window),
-		clientMaxPacket:   int(res.maxPacket),
-		reqsDone:          make(chan struct{}),
-		requests:          newOrderedQueue[proxyChannelRequest](),
-		requestsDone:      make(chan struct{}),
-		input:             newOrderedQueue[proxyChannelInput](),
-		pendingRemoteReqs: newRemoteRequestQueue(),
-		onDone:            slotOnce,
-	}
-
-	var entry *activeAgentChannel
-	if lease != nil {
-		entry = &activeAgentChannel{
-			sshCh: remoteCh,
-			closeFn: func() {
-				ps.closeChannel(pc)
-				ps.channels.CompareAndDelete(pc.serverCh, pc)
-				ps.byClientCh.CompareAndDelete(pc.clientCh, pc)
-				pc.clientWindow.close()
-				pc.input.close()
-				pc.requests.close()
-				pc.pendingRemoteReqs.drain()
-				_ = remoteCh.Close()
-			},
-		}
-		if !lease.registerActive(entry) {
-			ps.closeChannel(pc)
-			pc.clientWindow.close()
-			pc.input.close()
-			pc.requests.close()
-			pc.pendingRemoteReqs.drain()
-			go discardAbortedChannelRequests(ps.serverBaseContext(), reqs)
-			_ = remoteCh.Close()
-			slotOnce()
-			pumpDoneOnce()
-			return
-		}
-	}
-
-	ps.channels.Store(pc.serverCh, pc)
-	ps.byClientCh.Store(pc.clientCh, pc)
-	if ps.closed.Load() {
-		if lease != nil && entry != nil {
-			lease.removeActive(entry)
-		}
-		ps.channels.CompareAndDelete(pc.serverCh, pc)
-		ps.byClientCh.CompareAndDelete(pc.clientCh, pc)
-		pc.clientWindow.close()
-		pc.input.close()
-		pc.requests.close()
-		pc.pendingRemoteReqs.drain()
-		go discardAbortedChannelRequests(ps.serverBaseContext(), reqs)
-		_ = remoteCh.Close()
-		pc.releaseAgentProxyLease()
-		pumpDoneOnce()
-		return
-	}
-
-	go ps.forwardRequests(pc, reqs)
-	go ps.serveChannelRequests(pc)
-	go ps.relayChannelInput(pc)
-	go func() {
-		defer func() {
-			if lease != nil && entry != nil {
-				lease.removeActive(entry)
-			}
-			slotOnce()
-			pumpDoneOnce()
-		}()
-		ps.streamChannelData(pc)
-	}()
-}
-
 func (ps *proxySessionState) acquireChannelAgentLease() (*agentForwardLease, bool) {
-	if ps.server == nil || ps.server.sshClient == nil || !ps.server.allowAgentForward {
-		if ps.server != nil {
-			ps.server.getLogger().Debugf("mux: rejecting MUX_C_PROXY %s because master AllowAgentForward is disabled", agentForwardRequestType)
+	if ps == nil || ps.server == nil || ps.server.sshClient == nil ||
+		!ps.server.allowAgentForward || ps.server.agentSocket == "" || ps.server.dialAgent == nil {
+		if ps != nil && ps.server != nil {
+			ps.server.getLogger().Debugf(
+				"mux: rejecting MUX_C_PROXY %s because master AllowAgentForward is disabled or master agent is unavailable",
+				agentForwardRequestType,
+			)
 		}
 		return nil, false
 	}
@@ -2737,7 +2674,12 @@ func (ps *proxySessionState) acquireChannelAgentLease() (*agentForwardLease, boo
 		ps.server.getLogger().Debugf("mux: failed to initialize agent router for MUX_C_PROXY session: %v", rErr)
 		return nil, false
 	}
-	lease, lErr := router.acquireProxyLease(ps, ps.server.getLogger())
+	lease, lErr := router.acquireLocalLease(
+		ps.server.baseContext(),
+		ps.server.agentSocket,
+		ps.server.dialAgent,
+		ps.server.getLogger(),
+	)
 	if lErr != nil || lease == nil {
 		return nil, false
 	}

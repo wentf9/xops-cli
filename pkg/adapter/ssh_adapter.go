@@ -684,12 +684,19 @@ func (a *SSHAdapter) hasActiveTier1ProxyJump(nodeName string) bool {
 	return ok && isActiveProxyJumpValue(override.ProxyJump)
 }
 
+func isPendingAliasOpenSSHNode(nodeName string, snapErr error, snapshot config.ConnectionSnapshot) bool {
+	return strings.HasPrefix(nodeName, config.OpenSSHNodePrefix) &&
+		snapErr == nil &&
+		snapshot.Node.SSHOptions == nil &&
+		snapshot.Node.OpenSSHAlias != ""
+}
+
 func (a *SSHAdapter) maskLowerProxyCommandForProxyJump(nodeName string, tier1ActiveJump bool, t2Opts, t3Opts, t4Opts *ssh.Options) (*ssh.Options, *ssh.Options, *ssh.Options) {
 	if tier1ActiveJump {
 		return cloneWithoutProxyCommand(t2Opts), cloneWithoutProxyCommand(t3Opts), cloneWithoutProxyCommand(t4Opts)
 	}
-	if !strings.HasPrefix(nodeName, config.OpenSSHNodePrefix) {
-		if snap, err := a.cfgProvider.ResolveConnection(nodeName); err == nil && isActiveProxyJumpValue(snap.Node.ProxyJump) {
+	if snap, err := a.cfgProvider.ResolveConnection(nodeName); err == nil && isActiveProxyJumpValue(snap.Node.ProxyJump) {
+		if !strings.HasPrefix(nodeName, config.OpenSSHNodePrefix) || isPendingAliasOpenSSHNode(nodeName, nil, snap) {
 			return t2Opts, cloneWithoutProxyCommand(t3Opts), cloneWithoutProxyCommand(t4Opts)
 		}
 	}
@@ -704,6 +711,9 @@ func (a *SSHAdapter) higherTierProxyCommandOverridesJump(nodeID string, sessionC
 		return true
 	}
 	if strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) {
+		if snap, err := a.cfgProvider.ResolveConnection(nodeID); err == nil && isPendingAliasOpenSSHNode(nodeID, nil, snap) {
+			return false
+		}
 		if globalCfg := a.cfgProvider.Snapshot(); globalCfg != nil && globalCfg.SSHOptions != nil && globalCfg.SSHOptions.ActiveProxyCommand() != "" {
 			return true
 		}
@@ -714,6 +724,7 @@ func (a *SSHAdapter) higherTierProxyCommandOverridesJump(nodeID string, sessionC
 func (a *SSHAdapter) resolveOptionTiers(nodeName string) (tier2Node, tier3Global, tier4OpenSSH *ssh.Options) {
 	snapshot, snapErr := a.cfgProvider.ResolveConnection(nodeName)
 	virtualOpenSSHNode := strings.HasPrefix(nodeName, config.OpenSSHNodePrefix)
+	pendingAliasOpenSSHNode := isPendingAliasOpenSSHNode(nodeName, snapErr, snapshot)
 	if snapErr == nil {
 		if !virtualOpenSSHNode {
 			tier2Node = snapshot.Node.SSHOptions
@@ -724,7 +735,7 @@ func (a *SSHAdapter) resolveOptionTiers(nodeName string) (tier2Node, tier3Global
 		tier3Global = globalCfg.SSHOptions
 	}
 
-	if virtualOpenSSHNode {
+	if virtualOpenSSHNode && !pendingAliasOpenSSHNode {
 		if snapErr == nil {
 			tier4OpenSSH = snapshot.Node.SSHOptions.Clone()
 		}
@@ -778,6 +789,13 @@ func (a *SSHAdapter) ResolveControl(nodeName string, sessionOpts SessionControlO
 
 func (a *SSHAdapter) resolveTier4OpenSSHOptions(nodeName string, snapErr error, snapshot config.ConnectionSnapshot) *ssh.Options {
 	if strings.HasPrefix(nodeName, config.OpenSSHNodePrefix) {
+		if isPendingAliasOpenSSHNode(nodeName, snapErr, snapshot) {
+			if parser := a.getOpenSSHParser(); parser != nil {
+				if opts, err := parser.GetSSHOptions(snapshot.Node.OpenSSHAlias); err == nil && !opts.IsEmpty() {
+					return opts
+				}
+			}
+		}
 		return nil
 	}
 	parser := a.getOpenSSHParser()
@@ -1162,10 +1180,7 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 	if sessionCtrlOpts.Options != nil {
 		cliOptKeys = sessionCtrlOpts.Options.IdentityFiles()
 	}
-	var managedNodeKey string
-	if !strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) {
-		managedNodeKey = snapshot.Identity.KeyPath
-	}
+	managedNodeKey := resolveManagedNodeKey(nodeID, snapshot)
 	var mergedOptKeys []string
 	if sshOpts != nil {
 		mergedOptKeys = sshOpts.IdentityFiles()
@@ -1184,6 +1199,13 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 	}
 
 	return cfg, nil
+}
+
+func resolveManagedNodeKey(nodeID string, snapshot config.ConnectionSnapshot) string {
+	if !strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) || isPendingAliasOpenSSHNode(nodeID, nil, snapshot) {
+		return snapshot.Identity.KeyPath
+	}
+	return ""
 }
 
 func buildOrderedKeyPaths(cliFlagKeys, cliOptKeys []string, managedNodeKey string, mergedOptKeys []string) []string {

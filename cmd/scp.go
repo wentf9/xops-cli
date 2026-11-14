@@ -834,22 +834,24 @@ func (o *ScpOptions) runBatch(ctx context.Context, provider config.ConfigProvide
 			if h.Port == 0 {
 				h.Port = o.Port
 			}
+			addr := PathInfo{Host: h.Host, User: h.User, Port: h.Port, IsRemote: true}
+			canonAddr, canonErr := o.canonicalizePathInfo(ctx, provider, addr)
+			if canonErr != nil {
+				return fmt.Errorf("canonicalize host %q: %w", h.Host, canonErr)
+			}
 			// 若主机已映射到已知节点且在排除集合中，则跳过
 			if excludes != nil {
-				nid, resolveErr := provider.ResolveSelector(h.Host)
-				if resolveErr != nil {
-					return fmt.Errorf("resolve excluded host %q: %w", h.Host, resolveErr)
+				excluded, exclErr := o.isBatchHostExcluded(provider, excludes, h.Host, canonAddr)
+				if exclErr != nil {
+					return exclErr
 				}
-				if nid != "" {
-					if _, excluded := excludes[nid]; excluded {
-						continue
-					}
+				if excluded {
+					continue
 				}
 			}
 
 			wp.Execute(func() {
-				addr := PathInfo{Host: h.Host, User: h.User, Port: h.Port, IsRemote: true}
-				if tErr := o.executeTransfer(ctx, h.Host, addr, h.Password, provider, connector); tErr != nil {
+				if tErr := o.executeTransfer(ctx, h.Host, canonAddr, h.Password, provider, connector); tErr != nil {
 					errMu.Lock()
 					transferErrs = append(transferErrs, fmt.Errorf("[%s] %w", h.Host, tErr))
 					errMu.Unlock()
@@ -860,6 +862,42 @@ func (o *ScpOptions) runBatch(ctx context.Context, provider config.ConfigProvide
 
 	wp.Wait()
 	return errors.Join(transferErrs...)
+}
+
+func (o *ScpOptions) isBatchHostExcluded(provider config.ConfigProvider, excludes map[string]struct{}, rawHost string, canonAddr PathInfo) (bool, error) {
+	if _, ok := excludes[rawHost]; ok {
+		return true, nil
+	}
+	if _, ok := excludes[canonAddr.Host]; ok {
+		return true, nil
+	}
+	if target, tErr := o.resolveTargetForPath(canonAddr); tErr == nil && target.Selector != "" {
+		resolved, rErr := config.ResolveTarget(provider, target)
+		if rErr != nil {
+			return false, fmt.Errorf("resolve excluded host %q: %w", canonAddr.Host, rErr)
+		}
+		if resolved.NodeID != "" {
+			if _, ok := excludes[resolved.NodeID]; ok {
+				return true, nil
+			}
+		}
+		if resolved.MatchedNodeID != "" {
+			if _, ok := excludes[resolved.MatchedNodeID]; ok {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	nid, resolveErr := provider.ResolveSelector(canonAddr.Host)
+	if resolveErr != nil {
+		return false, fmt.Errorf("resolve excluded host %q: %w", canonAddr.Host, resolveErr)
+	}
+	if nid != "" {
+		if _, ok := excludes[nid]; ok {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (o *ScpOptions) executeTransfer(ctx context.Context, label string, addr PathInfo, specificPassword string, provider config.ConfigProvider, connector *ssh.Connector) (err error) {
@@ -987,6 +1025,25 @@ func (o *ScpOptions) canonicalizeEndpoints(ctx context.Context, provider config.
 	return nil
 }
 
+func (o *ScpOptions) canonicalCacheKey(p PathInfo) string {
+	host := p.Host
+	if host == "" && o.Host != "" && !strings.Contains(o.Host, ",") {
+		host = o.Host
+	}
+	user := o.User
+	if user == "" {
+		user = p.User
+	}
+	port := o.Port
+	if port == 0 {
+		port = p.Port
+	}
+	if user == "" && port == 0 {
+		return host
+	}
+	return fmt.Sprintf("%s\x00%s\x00%d", host, user, port)
+}
+
 func (o *ScpOptions) canonicalizePathInfo(ctx context.Context, provider config.ConfigProvider, p PathInfo) (PathInfo, error) {
 	if p.Host == "" {
 		return p, nil
@@ -997,8 +1054,9 @@ func (o *ScpOptions) canonicalizePathInfo(ctx context.Context, provider config.C
 		}
 		return p, nil
 	}
+	cacheKey := o.canonicalCacheKey(p)
 	o.canonicalMu.Lock()
-	res, ok := o.canonicalCache[p.Host]
+	res, ok := o.canonicalCache[cacheKey]
 	o.canonicalMu.Unlock()
 	if ok {
 		if res.Canonicalized {
@@ -1031,7 +1089,7 @@ func (o *ScpOptions) canonicalizePathInfo(ctx context.Context, provider config.C
 	if o.canonicalCache == nil {
 		o.canonicalCache = make(map[string]config.CanonicalizeResult)
 	}
-	o.canonicalCache[p.Host] = res
+	o.canonicalCache[cacheKey] = res
 	o.canonicalMu.Unlock()
 	if res.Canonicalized {
 		if p.OriginalHost == "" {
@@ -1302,14 +1360,14 @@ func (o *ScpOptions) credentialConnectorWithInteraction(provider config.ConfigPr
 	if err := o.appendScpSessionControlOptions(&adpOpts, targetNodes); err != nil {
 		return nil, err
 	}
-	if shouldRemember {
-		if repo, ok := provider.(*config.Repository); ok {
-			persistence, serviceErr := interaction.automaticPersistenceOptions(repo, cfg)
-			if serviceErr != nil {
-				return nil, serviceErr
-			}
-			adpOpts = append(adpOpts, persistence...)
+	if repo, isRepo := provider.(*config.Repository); !isRepo {
+		adpOpts = append(adpOpts, adapter.WithCredentialRecording(false), adapter.WithSuppressNodeConfirmation(true))
+	} else if shouldRemember {
+		persistence, serviceErr := interaction.automaticPersistenceOptions(repo, cfg)
+		if serviceErr != nil {
+			return nil, serviceErr
 		}
+		adpOpts = append(adpOpts, persistence...)
 	}
 	if reg, regErr := cmdutils.GetCredentialRegistry(cfg); regErr != nil {
 		return nil, fmt.Errorf("initialize credential resolver: %w", regErr)
@@ -1393,11 +1451,14 @@ func (o *ScpOptions) appendScpSessionAuthOverrides(adpOpts *[]adapter.Option, pr
 	return nil
 }
 
-func (o *ScpOptions) staticHostNameOverride() string {
+func (o *SshOptions) staticHostNameOverride() string {
+	if o == nil {
+		return ""
+	}
 	if o.cliHostName != "" && !hostNameHasHostToken(o.cliHostName) {
 		return o.cliHostName
 	}
-	if o.cliHostName == "" && strings.TrimSpace(o.HostName) != "" {
+	if o.cliHostName == "" && strings.TrimSpace(o.HostName) != "" && !hostNameHasHostToken(strings.TrimSpace(o.HostName)) {
 		return strings.TrimSpace(o.HostName)
 	}
 	return ""
@@ -1500,7 +1561,7 @@ func (o *ScpOptions) resolvedTargetNodeIDsWithHosts(provider config.ConfigProvid
 func (o *ScpOptions) resolvePathTargetAndHosts(provider config.ConfigProvider, p PathInfo) (config.ConnectionTarget, string, string, bool) {
 	origHost := p.OriginalHost
 	o.canonicalMu.Lock()
-	res, ok := o.canonicalCache[p.Host]
+	res, ok := o.canonicalCache[o.canonicalCacheKey(p)]
 	o.canonicalMu.Unlock()
 	if ok && res.Canonicalized {
 		if origHost == "" {

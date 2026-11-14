@@ -354,14 +354,18 @@ func (r *Repository) ResolveConnection(nodeID string) (ConnectionSnapshot, error
 		if clonedNode.OpenSSHAlias == "" && r.provider != nil {
 			clonedNode.OpenSSHAlias = r.provider.NodeOpenSSHAlias(nodeID)
 		}
-		return ConnectionSnapshot{
-			Node:     clonedNode,
-			Host:     cloneHost(host),
-			Identity: cloneIdentity(identity),
-			UpdateRef: &ConnectionUpdateRef{
+		var updateRef *ConnectionUpdateRef
+		if !strings.HasPrefix(nodeID, OpenSSHNodePrefix) {
+			updateRef = &ConnectionUpdateRef{
 				AuthVersion: authVersion,
 				SudoVersion: sudoVersion,
-			},
+			}
+		}
+		return ConnectionSnapshot{
+			Node:      clonedNode,
+			Host:      cloneHost(host),
+			Identity:  cloneIdentity(identity),
+			UpdateRef: updateRef,
 		}, nil
 	}
 

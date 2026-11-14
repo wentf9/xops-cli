@@ -127,13 +127,30 @@ func TestReviewSess_M3_AddressFamilyDefaultLoopbackForwarding(t *testing.T) {
 
 // TestReviewSess_M5_L4_AgentRouterConflictAndMuxProxyGate verifies:
 //   - identical local socket paths share a connection router cleanly;
-//   - conflicting local socket paths or local-vs-proxy / proxy-vs-proxy leases are rejected with debug logs;
+//   - empty socket paths and conflicting local/master socket paths are rejected with debug logs;
 //   - MUX_C_PROXY with wantReply=false never attaches a lease when master AllowAgentForward=false.
 func TestReviewSess_M5_L4_AgentRouterConflictAndMuxProxyGate(t *testing.T) {
 	log := &captureDebugLogger{}
-	router := &sshAgentChannelRouter{}
+	chans := make(chan cryptoSSH.NewChannel)
+	reqs := make(chan *cryptoSSH.Request)
+	rawCli := cryptoSSH.NewClient(&dummyMuxGateConn{}, chans, reqs)
+	defer func() {
+		close(chans)
+		close(reqs)
+		_ = rawCli.Close()
+	}()
+
+	router, err := getOrCreateAgentRouter(rawCli)
+	if err != nil {
+		t.Fatalf("getOrCreateAgentRouter: %v", err)
+	}
 	dialStub := func(context.Context, string) (net.Conn, error) {
 		return nil, errors.New("unused")
+	}
+
+	// 0. Empty socket path MUST be rejected rather than acting as a wildcard!
+	if emptyLease, err := router.acquireLocalLease(t.Context(), "", dialStub, log); !errors.Is(err, errEmptyAgentSocket) || emptyLease != nil {
+		t.Fatalf("expected empty local socket lease to fail with errEmptyAgentSocket, got lease=%v err=%v", emptyLease, err)
 	}
 
 	// 1. Two local leases for the identical socket path may share.
@@ -147,43 +164,45 @@ func TestReviewSess_M5_L4_AgentRouterConflictAndMuxProxyGate(t *testing.T) {
 	}
 
 	// 2. Different local socket path while l1/l2 active MUST be rejected!
-	if badLocal, err := router.acquireLocalLease(t.Context(), "/tmp/agent-b.sock", dialStub, log); err == nil || badLocal != nil {
-		t.Fatal("expected conflicting local socket lease to be rejected")
+	if badLocal, err := router.acquireLocalLease(t.Context(), "/tmp/agent-b.sock", dialStub, log); !errors.Is(err, errAgentLeaseConflict) || badLocal != nil {
+		t.Fatalf("expected conflicting local socket lease to be rejected, got lease=%v err=%v", badLocal, err)
 	}
 	if !log.contains("rejecting conflicting local agent lease") {
 		t.Fatalf("expected debug log for conflicting local lease, got %v", log.msgs)
 	}
 
-	// 3. Proxy lease while local lease is active MUST be rejected!
-	ps1 := &proxySessionState{}
-	if badProxy, err := router.acquireProxyLease(ps1, log); err == nil || badProxy != nil {
-		t.Fatal("expected proxy lease conflicting with active local lease to be rejected")
+	// 3. MUX_C_PROXY channel lease on a Master with a different socket while l1/l2 active MUST be rejected!
+	srvB := &MuxServer{
+		sshClient:         rawCli,
+		allowAgentForward: true,
+		agentSocket:       "/tmp/agent-b.sock",
+		dialAgent:         dialStub,
+		logger:            log,
 	}
-	if !log.contains("rejecting conflicting MUX_C_PROXY agent lease") {
-		t.Fatalf("expected debug log for conflicting proxy lease, got %v", log.msgs)
+	ps1 := &proxySessionState{server: srvB}
+	if badProxy, ok := ps1.acquireChannelAgentLease(); ok || badProxy != nil {
+		t.Fatal("expected MUX_C_PROXY lease with conflicting master socket to be rejected")
 	}
 
-	// 4. Once both local leases release, ps1 can acquire; another proxy ps2 or local lease conflicts; same ps1 shares!
+	// 4. Once l1/l2 release, MUX_C_PROXY channels on srvB share Master's local socket lease,
+	// while a conflicting socket (/tmp/agent-a.sock) is rejected.
 	l1.Release()
 	l2.Release()
 
-	pLease1, err := router.acquireProxyLease(ps1, log)
-	if err != nil || pLease1 == nil {
-		t.Fatalf("proxy lease after local release failed: %v", err)
+	pLease1, ok := ps1.acquireChannelAgentLease()
+	if !ok || pLease1 == nil {
+		t.Fatal("MUX_C_PROXY lease after local release failed")
 	}
-	pLease1b, err := router.acquireProxyLease(ps1, log)
-	if err != nil || pLease1b == nil {
-		t.Fatalf("second channel on same proxy session should share, got err=%v", err)
+	ps2 := &proxySessionState{server: srvB}
+	pLease2, ok := ps2.acquireChannelAgentLease()
+	if !ok || pLease2 == nil {
+		t.Fatal("second MUX_C_PROXY session on same master should share master socket lease")
 	}
-	ps2 := &proxySessionState{}
-	if badProxy2, err := router.acquireProxyLease(ps2, log); err == nil || badProxy2 != nil {
-		t.Fatal("expected second distinct proxy session lease to be rejected while ps1 is active")
-	}
-	if badLocal2, err := router.acquireLocalLease(t.Context(), "/tmp/agent-a.sock", dialStub, log); err == nil || badLocal2 != nil {
-		t.Fatal("expected local lease to be rejected while proxy lease is active")
+	if badLocal2, err := router.acquireLocalLease(t.Context(), "/tmp/agent-a.sock", dialStub, log); !errors.Is(err, errAgentLeaseConflict) || badLocal2 != nil {
+		t.Fatal("expected conflicting local lease to be rejected while master proxy lease is active")
 	}
 	pLease1.Release()
-	pLease1b.Release()
+	pLease2.Release()
 
 	assertMuxProxyAgentGateWhenDisabled(t)
 }

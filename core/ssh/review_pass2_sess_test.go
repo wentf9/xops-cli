@@ -254,36 +254,40 @@ func assertPass2MuxAgentCoexistence(t *testing.T) {
 
 	base := t.TempDir()
 	cleanSock := filepath.Join(base, "master-agent.sock")
+	dialStub := func(context.Context, string) (net.Conn, error) {
+		return nil, errors.New("unused")
+	}
 	muxMaster := &MuxServer{
 		sshClient:         rawCli,
 		allowAgentForward: true,
 		agentSocket:       normalizeExpandedAgentSocketPath(filepath.Join(base, "dir", "..", "master-agent.sock"), Environment{}),
+		dialAgent:         dialStub,
 	}
 
 	// 1. Master holds local lease on cleanSock.
-	localLease, err := router.acquireLocalLease(t.Context(), cleanSock, nil, nil)
+	localLease, err := router.acquireLocalLease(t.Context(), cleanSock, dialStub, nil)
 	if err != nil {
 		t.Fatalf("acquireLocalLease(master): %v", err)
 	}
 	defer localLease.Release()
 
-	// 2. Two concurrent MUX_C_PROXY sessions on the same authorized master must coexist!
+	// 2. Two concurrent MUX_C_PROXY sessions on the same authorized master share Master's local lease!
 	ps1 := &proxySessionState{server: muxMaster}
 	ps2 := &proxySessionState{server: muxMaster}
-	proxyLease1, err := router.acquireProxyLease(ps1, nil)
-	if err != nil {
-		t.Fatalf("expected authorized MUX_C_PROXY ps1 to coexist with master local lease, got: %v", err)
+	proxyLease1, ok := ps1.acquireChannelAgentLease()
+	if !ok || proxyLease1 == nil {
+		t.Fatal("expected authorized MUX_C_PROXY ps1 to coexist with master local lease")
 	}
 	defer proxyLease1.Release()
 
-	proxyLease2, err := router.acquireProxyLease(ps2, nil)
-	if err != nil {
-		t.Fatalf("expected sibling MUX_C_PROXY ps2 to coexist on same master, got: %v", err)
+	proxyLease2, ok := ps2.acquireChannelAgentLease()
+	if !ok || proxyLease2 == nil {
+		t.Fatal("expected sibling MUX_C_PROXY ps2 to coexist on same master")
 	}
 	defer proxyLease2.Release()
 
 	// 3. Another local session forwarding the SAME normalized socket also coexists.
-	passengerLease, err := router.acquireLocalLease(t.Context(), cleanSock, nil, nil)
+	passengerLease, err := router.acquireLocalLease(t.Context(), cleanSock, dialStub, nil)
 	if err != nil {
 		t.Fatalf("expected passenger local lease on same socket to coexist, got: %v", err)
 	}
@@ -291,25 +295,40 @@ func assertPass2MuxAgentCoexistence(t *testing.T) {
 
 	// 4. Concurrent local lease attempting to route to a DIFFERENT socket MUST fail closed!
 	otherSock := filepath.Join(base, "different-agent.sock")
-	if conflictLease, err := router.acquireLocalLease(t.Context(), otherSock, nil, nil); !errors.Is(err, errAgentLeaseConflict) {
+	if conflictLease, err := router.acquireLocalLease(t.Context(), otherSock, dialStub, nil); !errors.Is(err, errAgentLeaseConflict) {
 		if conflictLease != nil {
 			conflictLease.Release()
 		}
 		t.Fatalf("expected conflicting socket %q to fail with errAgentLeaseConflict, got %v", otherSock, err)
 	}
 
-	// 5. Proxy session bound to a master with a DIFFERENT explicit agent socket MUST also fail closed!
+	// 5. Proxy session bound to a master with a DIFFERENT explicit agent socket or empty socket MUST fail closed!
 	otherMaster := &MuxServer{
 		sshClient:         rawCli,
 		allowAgentForward: true,
 		agentSocket:       otherSock,
+		dialAgent:         dialStub,
 	}
 	psOther := &proxySessionState{server: otherMaster}
-	if conflictProxy, err := router.acquireProxyLease(psOther, nil); !errors.Is(err, errAgentLeaseConflict) {
+	if conflictProxy, ok := psOther.acquireChannelAgentLease(); ok || conflictProxy != nil {
 		if conflictProxy != nil {
 			conflictProxy.Release()
 		}
-		t.Fatalf("expected proxy lease with different master socket to fail with errAgentLeaseConflict, got %v", err)
+		t.Fatal("expected proxy lease with different master socket to fail closed")
+	}
+
+	emptyMaster := &MuxServer{
+		sshClient:         rawCli,
+		allowAgentForward: true,
+		agentSocket:       "",
+		dialAgent:         dialStub,
+	}
+	psEmpty := &proxySessionState{server: emptyMaster}
+	if emptyProxy, ok := psEmpty.acquireChannelAgentLease(); ok || emptyProxy != nil {
+		if emptyProxy != nil {
+			emptyProxy.Release()
+		}
+		t.Fatal("expected proxy lease on master with empty agentSocket to fail closed")
 	}
 }
 
