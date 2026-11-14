@@ -378,7 +378,7 @@ func assertPass5CertAuthorityWithPlusLegacyCert(t *testing.T) {
 	}
 	seenPlain := false
 	for _, alg := range algs {
-		if strings.HasSuffix(alg, "-cert-v01@openssh.com") {
+		if isCertAlgorithm(alg) {
 			if seenPlain {
 				t.Fatalf("expected %q inside leading cert block before plain algorithms: %v", alg, algs)
 			}

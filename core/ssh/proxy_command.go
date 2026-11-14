@@ -204,23 +204,23 @@ func resolveLocalExecOriginalHost(explicitOriginalHost, nodeID, fallbackName, fa
 func extractLocalExecHostSpec(hostSpec string) (string, error) {
 	if strings.HasPrefix(hostSpec, "[") {
 		if strings.HasSuffix(hostSpec, "]") {
-			inner := hostSpec[1 : len(hostSpec)-1]
-			if err := ValidateSafeExecToken("%n", inner); err != nil {
+			if err := ValidateSafeExecToken("%n", hostSpec); err != nil {
 				return "", err
 			}
-			return inner, nil
+			return cleanHostLiteral(hostSpec), nil
 		}
-		host, port, err := net.SplitHostPort(hostSpec)
+		_, port, err := net.SplitHostPort(hostSpec)
 		if err != nil {
 			return "", fmt.Errorf("%w: malformed host specification %q", ErrUnsafeExecToken, hostSpec)
 		}
 		if err := ValidateSafeExecToken("%p", port); err != nil {
 			return "", err
 		}
-		if err := ValidateSafeExecToken("%n", host); err != nil {
+		rawBracketedHost := hostSpec[:len(hostSpec)-len(port)-1]
+		if err := ValidateSafeExecToken("%n", rawBracketedHost); err != nil {
 			return "", err
 		}
-		return host, nil
+		return cleanHostLiteral(rawBracketedHost), nil
 	}
 
 	if strings.Count(hostSpec, ":") == 1 {
@@ -240,5 +240,5 @@ func extractLocalExecHostSpec(hostSpec string) (string, error) {
 	if err := ValidateSafeExecToken("%n", hostSpec); err != nil {
 		return "", err
 	}
-	return hostSpec, nil
+	return cleanHostLiteral(hostSpec), nil
 }

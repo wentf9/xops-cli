@@ -216,8 +216,7 @@ func assertAllPlainBeforeCertAlgorithms(t *testing.T, spec string, algs []string
 	t.Helper()
 	seenCert := false
 	for _, alg := range algs {
-		isCert := strings.HasSuffix(alg, "-cert-v01@openssh.com")
-		if isCert {
+		if isCertAlgorithm(alg) {
 			seenCert = true
 			continue
 		}
@@ -266,12 +265,12 @@ func assertPass4CertAuthorityKeepsCertsFirstUnderRelativeModifiers(t *testing.T)
 
 	var wantCerts []string
 	for _, alg := range cryptoSSH.SupportedAlgorithms().HostKeys {
-		if strings.HasSuffix(alg, "-cert-v01@openssh.com") {
+		if isCertAlgorithm(alg) {
 			wantCerts = append(wantCerts, alg)
 		}
 	}
 	if len(algs) < len(wantCerts) || !slices.Equal(algs[:len(wantCerts)], wantCerts) {
-		t.Fatalf("expected -cert-v01@openssh.com first when @cert-authority matches, got %v (want prefix %v)", algs, wantCerts)
+		t.Fatalf("expected certificate algorithms first when @cert-authority matches, got %v (want prefix %v)", algs, wantCerts)
 	}
 }
 

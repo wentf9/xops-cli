@@ -154,10 +154,10 @@ func (c *Connector) defaultKnownHostsHostKeyAlgorithms(cfg *ClientConfig) []stri
 
 // orderKnownHostsHostKeyAlgorithms orders the candidate algorithm pool against
 // matching non-revoked entries in known_hosts (matching OpenSSH order_hostkeyalgs):
-// when an @cert-authority matches the target host, *-cert-v01@openssh.com
-// algorithms in pool come first followed by pinned plain key types and remaining
-// plain algorithms in pool; otherwise plain algorithms in pool (with pinned types
-// first) precede *-cert-v01@openssh.com algorithms.
+// when an @cert-authority matches the target host, certificate algorithms in pool
+// come first followed by pinned plain key types and remaining plain algorithms in
+// pool; otherwise plain algorithms in pool (with pinned types first) precede
+// certificate algorithms.
 func (c *Connector) orderKnownHostsHostKeyAlgorithms(cfg *ClientConfig, pool []string) []string {
 	if cfg == nil || cleanHostLiteral(cfg.Address) == "" {
 		return slices.Clone(pool)
@@ -181,7 +181,7 @@ func (c *Connector) orderKnownHostsHostKeyAlgorithms(cfg *ClientConfig, pool []s
 	}
 	appendCerts := func() {
 		for _, alg := range pool {
-			if strings.HasSuffix(alg, "-cert-v01@openssh.com") {
+			if isCertAlgorithm(alg) {
 				appendUnique(alg)
 			}
 		}
@@ -193,7 +193,7 @@ func (c *Connector) orderKnownHostsHostKeyAlgorithms(cfg *ClientConfig, pool []s
 			}
 		}
 		for _, alg := range pool {
-			if !strings.HasSuffix(alg, "-cert-v01@openssh.com") {
+			if !isCertAlgorithm(alg) {
 				appendUnique(alg)
 			}
 		}

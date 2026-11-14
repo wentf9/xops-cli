@@ -614,12 +614,12 @@ func TestPass3Conn_M1_CertAuthorityHostKeyAlgorithmsExcludeSHA1AndDSA(t *testing
 	supported := cryptoSSH.SupportedAlgorithms().HostKeys
 	var wantCerts []string
 	for _, alg := range supported {
-		if strings.HasSuffix(alg, "-cert-v01@openssh.com") {
+		if isCertAlgorithm(alg) {
 			wantCerts = append(wantCerts, alg)
 		}
 	}
 	if len(algs) < len(wantCerts)+2 || !slices.Equal(algs[:len(wantCerts)], wantCerts) {
-		t.Fatalf("expected modern -cert-v01@openssh.com algorithms first, got %v (want prefix %v)", algs, wantCerts)
+		t.Fatalf("expected modern certificate algorithms first, got %v (want prefix %v)", algs, wantCerts)
 	}
 	// Pinned plain RSA key in user known_hosts must order rsa-sha2-512, rsa-sha2-256 right after certs.
 	afterCerts := algs[len(wantCerts):]

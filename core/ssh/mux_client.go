@@ -22,7 +22,9 @@ const DefaultMuxHandshakeTimeout = 10 * time.Second
 
 // bindConnContext bounds I/O on conn by ctx.Deadline() (or defaultTimeout when
 // ctx has no deadline), and interrupts in-flight reads/writes immediately if ctx
-// is canceled even when ctx has no deadline.
+// is canceled even when ctx has no deadline. Calling the returned unbind function
+// synchronizes against context.AfterFunc so an already-unbound connection can
+// never have a stale cancellation deadline applied asynchronously later.
 func bindConnContext(ctx context.Context, conn net.Conn, defaultTimeout time.Duration) func() {
 	if ctx == nil {
 		ctx = context.Background()
@@ -32,15 +34,41 @@ func bindConnContext(ctx context.Context, conn net.Conn, defaultTimeout time.Dur
 		deadline = time.Now().Add(defaultTimeout)
 		hasDeadline = true
 	}
-	if hasDeadline {
+
+	var (
+		mu       sync.Mutex
+		unbound  bool
+		canceled bool
+	)
+	mu.Lock()
+	if ctx.Err() != nil {
+		canceled = true
+		_ = conn.SetDeadline(time.Now())
+	} else if hasDeadline {
 		_ = conn.SetDeadline(deadline)
+	} else {
+		_ = conn.SetDeadline(time.Time{})
 	}
+	mu.Unlock()
+
 	stop := context.AfterFunc(ctx, func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if unbound || canceled {
+			return
+		}
+		canceled = true
 		_ = conn.SetDeadline(time.Now())
 	})
 	return func() {
 		stop()
-		if ctx.Err() == nil {
+		mu.Lock()
+		defer mu.Unlock()
+		if unbound {
+			return
+		}
+		unbound = true
+		if !canceled && ctx.Err() == nil {
 			_ = conn.SetDeadline(time.Time{})
 		}
 	}
@@ -160,6 +188,16 @@ func DialMuxClient(ctx context.Context, socketPath string, opts ...MuxClientOpti
 	}
 
 	if err := client.handshake(); err != nil {
+		unbind()
+		_ = conn.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("mux handshake failed on %q: %w", socketPath, ctxErr)
+		}
+		return nil, fmt.Errorf("mux handshake failed on %q: %w", socketPath, err)
+	}
+
+	unbind()
+	if err := ctx.Err(); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("mux handshake failed on %q: %w", socketPath, err)
 	}
@@ -481,8 +519,17 @@ func DialMuxProxyStream(ctx context.Context, socketPath string, opts ...MuxClien
 	unbind := bindConnContext(ctx, conn, DefaultInteractionTimeout)
 	defer unbind()
 	fail := func(err error) (net.Conn, error) {
+		unbind()
 		_ = conn.Close()
 		return nil, err
+	}
+	failIO := func(op string, err error) (net.Conn, error) {
+		unbind()
+		_ = conn.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("%s on %q: %w", op, socketPath, ctxErr)
+		}
+		return nil, fmt.Errorf("%s on %q: %w", op, socketPath, err)
 	}
 
 	if err := checkPeerUID(conn, options.expectedUID); err != nil {
@@ -491,11 +538,11 @@ func DialMuxProxyStream(ctx context.Context, socketPath string, opts ...MuxClien
 
 	const requestID uint32 = 1
 	if err := WriteMuxPacket(conn, MUX_MSG_HELLO, EncodeMuxHello(MuxProtoVersion, nil)); err != nil {
-		return fail(fmt.Errorf("send hello on %q: %w", socketPath, err))
+		return failIO("send hello", err)
 	}
 	msgType, payload, err := ReadMuxPacket(conn)
 	if err != nil {
-		return fail(fmt.Errorf("read hello on %q: %w", socketPath, err))
+		return failIO("read hello", err)
 	}
 	if msgType != MUX_MSG_HELLO {
 		return fail(fmt.Errorf("unexpected hello response 0x%08x on %q", msgType, socketPath))
@@ -509,11 +556,11 @@ func DialMuxProxyStream(ctx context.Context, socketPath string, opts ...MuxClien
 	}
 
 	if err := WriteMuxPacket(conn, MUX_C_PROXY, EncodeMuxRequestID(requestID)); err != nil {
-		return fail(fmt.Errorf("send proxy request on %q: %w", socketPath, err))
+		return failIO("send proxy request", err)
 	}
 	msgType, payload, err = ReadMuxPacket(conn)
 	if err != nil {
-		return fail(fmt.Errorf("read proxy response on %q: %w", socketPath, err))
+		return failIO("read proxy response", err)
 	}
 	switch msgType {
 	case MUX_S_PROXY:
@@ -531,6 +578,7 @@ func DialMuxProxyStream(ctx context.Context, socketPath string, opts ...MuxClien
 		return fail(fmt.Errorf("%w on %q: unexpected response 0x%08x", ErrControlProxyRejected, socketPath, msgType))
 	}
 
+	unbind()
 	if err := ctx.Err(); err != nil {
 		return fail(err)
 	}

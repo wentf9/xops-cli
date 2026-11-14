@@ -245,6 +245,7 @@ func DialControlProxy(ctx context.Context, socketPath string, target TargetConte
 	sshConn, chans, reqs, err := cryptoSSH.NewControlClientConn(inspector)
 	inspector.inspecting.Store(false)
 	inspector.readBuf.Reset()
+	unbind()
 	if err != nil {
 		_ = rawConn.Close()
 		if inspector.mismatchErr != nil {
@@ -258,12 +259,20 @@ func DialControlProxy(ctx context.Context, socketPath string, target TargetConte
 			strings.Contains(strings.ToLower(errMsg), "permission denied") {
 			return nil, nil, fmt.Errorf("control proxy handshake failed on %q: %w: %w", socketPath, ErrControlProxyRejected, err)
 		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, nil, fmt.Errorf("control proxy handshake failed on %q: %w", socketPath, ctxErr)
+		}
 		return nil, nil, fmt.Errorf("control proxy handshake failed on %q: %w", socketPath, err)
 	}
 	if inspector.mismatchErr != nil {
 		_ = sshConn.Close()
 		_ = rawConn.Close()
 		return nil, nil, inspector.mismatchErr
+	}
+	if err := ctx.Err(); err != nil {
+		_ = sshConn.Close()
+		_ = rawConn.Close()
+		return nil, nil, fmt.Errorf("control proxy handshake failed on %q: %w", socketPath, err)
 	}
 
 	proxyConn := newMuxProxySSHConn(sshConn, rawConn, target)
@@ -341,5 +350,10 @@ func DialControlProxyClient(
 	client.environment = sanitizeEnvironment(env)
 	client.muxSocketPath = socketPath
 	client.muxExpectedUID = options.expectedUID
+	if err := ctx.Err(); err != nil {
+		_ = client.Close()
+		_ = proxyConn.Close()
+		return nil, fmt.Errorf("control proxy handshake failed on %q: %w", socketPath, err)
+	}
 	return client, nil
 }

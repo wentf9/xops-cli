@@ -775,6 +775,10 @@ func (o *ScpOptions) doRemoteToRemote(ctx context.Context, srcSftp *sftp.Client,
 	return nil
 }
 
+func taggedNodePathInfo(nodeID string) PathInfo {
+	return PathInfo{Host: nodeID, IsRemote: true}
+}
+
 func (o *ScpOptions) runBatch(ctx context.Context, provider config.ConfigProvider, connector *ssh.Connector) error {
 	// 解析 --exclude 排除规则（在 Worker Pool 启动前完成，确保无歧义）
 	var excludes map[string]struct{}
@@ -791,75 +795,115 @@ func (o *ScpOptions) runBatch(ctx context.Context, provider config.ConfigProvide
 		transferErrs []error
 	)
 	wp := pkgutils.NewWorkerPool(uint(o.TaskCount))
+	recordTransferErr := func(label string, err error) {
+		errMu.Lock()
+		transferErrs = append(transferErrs, fmt.Errorf("[%s] %w", label, err))
+		errMu.Unlock()
+	}
 
+	var prepErr error
 	if o.Tag != "" {
-		nodes := provider.GetNodesByTag(o.Tag)
-		if len(nodes) == 0 {
-			return fmt.Errorf("%s", i18n.Tf("err_tag_empty", map[string]any{"Tag": o.Tag}))
-		}
-		for nodeID := range nodes {
-			if cmdutils.IsTargetExcluded(excludes, cmdutils.ExcludeTargetInfo{NodeID: nodeID, MatchedNodeID: nodeID}) {
-				continue
-			}
-			nid := nodeID // capture
-			_, _, identity, resolveErr := provider.Resolve(nid)
-			if resolveErr != nil {
-				return fmt.Errorf("resolve tagged scp node %q failed: %w", nid, resolveErr)
-			}
-			wp.Execute(func() {
-				addr := PathInfo{Host: nid, IsRemote: true}
-				if tErr := o.executeTransfer(ctx, nid, addr, identity.Password, provider, connector); tErr != nil {
-					errMu.Lock()
-					transferErrs = append(transferErrs, fmt.Errorf("[%s] %w", nid, tErr))
-					errMu.Unlock()
-				}
-			})
-		}
+		prepErr = o.runBatchTagged(ctx, provider, connector, excludes, wp, recordTransferErr)
 	} else {
-		hosts, err := cmdutils.ParseHosts(o.Host, o.HostFile, "")
-		if err != nil {
-			return err
-		}
-
-		// 处理 普通主机列表
-		for _, h := range hosts {
-			if h.User == "" {
-				h.User = o.User
-			}
-			if h.Password == "" {
-				h.Password = o.Password
-			}
-			if h.Port == 0 {
-				h.Port = o.Port
-			}
-			addr := PathInfo{Host: h.Host, User: h.User, Port: h.Port, IsRemote: true}
-			canonAddr, canonErr := o.canonicalizePathInfo(ctx, provider, addr)
-			if canonErr != nil {
-				return fmt.Errorf("canonicalize host %q: %w", h.Host, canonErr)
-			}
-			// 若主机已映射到已知节点且在排除集合中，则跳过
-			if excludes != nil {
-				excluded, exclErr := o.isBatchHostExcluded(provider, excludes, h.Host, canonAddr)
-				if exclErr != nil {
-					return exclErr
-				}
-				if excluded {
-					continue
-				}
-			}
-
-			wp.Execute(func() {
-				if tErr := o.executeTransfer(ctx, h.Host, canonAddr, h.Password, provider, connector); tErr != nil {
-					errMu.Lock()
-					transferErrs = append(transferErrs, fmt.Errorf("[%s] %w", h.Host, tErr))
-					errMu.Unlock()
-				}
-			})
-		}
+		prepErr = o.runBatchHosts(ctx, provider, connector, excludes, wp, recordTransferErr)
 	}
 
 	wp.Wait()
+	if prepErr != nil {
+		return errors.Join(prepErr, errors.Join(transferErrs...))
+	}
 	return errors.Join(transferErrs...)
+}
+
+func (o *ScpOptions) runBatchTagged(
+	ctx context.Context,
+	provider config.ConfigProvider,
+	connector *ssh.Connector,
+	excludes map[string]struct{},
+	wp pkgutils.WorkerPool,
+	recordErr func(string, error),
+) error {
+	nodes := provider.GetNodesByTag(o.Tag)
+	if len(nodes) == 0 {
+		return fmt.Errorf("%s", i18n.Tf("err_tag_empty", map[string]any{"Tag": o.Tag}))
+	}
+	for nodeID := range nodes {
+		addr := taggedNodePathInfo(nodeID)
+		canonAddr, canonErr := o.canonicalizePathInfo(ctx, provider, addr)
+		if canonErr != nil {
+			return fmt.Errorf("canonicalize tagged host %q: %w", nodeID, canonErr)
+		}
+		if excludes != nil {
+			excluded, exclErr := o.isBatchHostExcluded(provider, excludes, nodeID, canonAddr)
+			if exclErr != nil {
+				return exclErr
+			}
+			if excluded {
+				continue
+			}
+		}
+		nid := nodeID // capture
+		_, _, identity, resolveErr := provider.Resolve(nid)
+		if resolveErr != nil {
+			return fmt.Errorf("resolve tagged scp node %q failed: %w", nid, resolveErr)
+		}
+		wp.Execute(func() {
+			if tErr := o.executeTransfer(ctx, nid, canonAddr, identity.Password, provider, connector); tErr != nil {
+				recordErr(nid, tErr)
+			}
+		})
+	}
+	return nil
+}
+
+func (o *ScpOptions) runBatchHosts(
+	ctx context.Context,
+	provider config.ConfigProvider,
+	connector *ssh.Connector,
+	excludes map[string]struct{},
+	wp pkgutils.WorkerPool,
+	recordErr func(string, error),
+) error {
+	hosts, err := cmdutils.ParseHosts(o.Host, o.HostFile, "")
+	if err != nil {
+		return err
+	}
+
+	// 处理 普通主机列表
+	for _, h := range hosts {
+		if h.User == "" {
+			h.User = o.User
+		}
+		if h.Password == "" {
+			h.Password = o.Password
+		}
+		if h.Port == 0 {
+			h.Port = o.Port
+		}
+		addr := PathInfo{Host: h.Host, User: h.User, Port: h.Port, IsRemote: true}
+		canonAddr, canonErr := o.canonicalizePathInfo(ctx, provider, addr)
+		if canonErr != nil {
+			return fmt.Errorf("canonicalize host %q: %w", h.Host, canonErr)
+		}
+		// 若主机已映射到已知节点且在排除集合中，则跳过
+		if excludes != nil {
+			excluded, exclErr := o.isBatchHostExcluded(provider, excludes, h.Host, canonAddr)
+			if exclErr != nil {
+				return exclErr
+			}
+			if excluded {
+				continue
+			}
+		}
+
+		hostItem := h
+		wp.Execute(func() {
+			if tErr := o.executeTransfer(ctx, hostItem.Host, canonAddr, hostItem.Password, provider, connector); tErr != nil {
+				recordErr(hostItem.Host, tErr)
+			}
+		})
+	}
+	return nil
 }
 
 func (o *ScpOptions) isBatchHostExcluded(provider config.ConfigProvider, excludes map[string]struct{}, rawHost string, canonAddr PathInfo) (bool, error) {
@@ -874,9 +918,18 @@ func (o *ScpOptions) isBatchHostExcluded(provider config.ConfigProvider, exclude
 }
 
 func (o *ScpOptions) excludeTargetInfoForPath(provider config.ConfigProvider, rawHost string, canonAddr PathInfo) (cmdutils.ExcludeTargetInfo, error) {
+	_ = o.ensureGeneralOptionsApplied()
+	user := canonAddr.User
+	if user == "" {
+		user = o.User
+	}
+	port := canonAddr.Port
+	if port == 0 {
+		port = o.Port
+	}
 	info := cmdutils.ExcludeTargetInfo{
-		User:           canonAddr.User,
-		Port:           canonAddr.Port,
+		User:           user,
+		Port:           port,
 		UnmanagedHosts: []string{rawHost, canonAddr.Host, canonAddr.OriginalHost},
 	}
 	if provider == nil {
@@ -896,6 +949,9 @@ func (o *ScpOptions) excludeTargetInfoForPath(provider config.ConfigProvider, ra
 		}
 		if resolved.Port > 0 {
 			info.Port = resolved.Port
+		}
+		if isResolvedSavedNode(resolved) && resolved.Host != "" && !slices.Contains(info.UnmanagedHosts, resolved.Host) {
+			info.UnmanagedHosts = append(info.UnmanagedHosts, resolved.Host)
 		}
 		return info, nil
 	}
@@ -1601,11 +1657,7 @@ func (o *ScpOptions) resolvePathTargetAndHosts(provider config.ConfigProvider, p
 	return target, origHost, expandHost, true
 }
 
-func (o *ScpOptions) isCollectedPathExcluded(provider config.ConfigProvider, excludes map[string]struct{}, p PathInfo) bool {
-	if len(excludes) == 0 || provider == nil {
-		return false
-	}
-	rawHost := p.Host
+func (o *ScpOptions) cachedCanonicalPathInfo(p PathInfo) PathInfo {
 	canonP := p
 	o.canonicalMu.Lock()
 	res, ok := o.canonicalCache[o.canonicalCacheKey(p)]
@@ -1616,11 +1668,19 @@ func (o *ScpOptions) isCollectedPathExcluded(provider config.ConfigProvider, exc
 		}
 		canonP.Host = res.CanonicalHost
 	}
-	excluded, exErr := o.isBatchHostExcluded(provider, excludes, rawHost, canonP)
+	return canonP
+}
+
+func (o *ScpOptions) isCollectedPathExcluded(provider config.ConfigProvider, excludes map[string]struct{}, p PathInfo) bool {
+	if len(excludes) == 0 || provider == nil {
+		return false
+	}
+	canonP := o.cachedCanonicalPathInfo(p)
+	excluded, exErr := o.isBatchHostExcluded(provider, excludes, p.Host, canonP)
 	return exErr == nil && excluded
 }
 
-func (o *ScpOptions) collectHostTargetPaths(provider config.ConfigProvider, excludes map[string]struct{}) []PathInfo {
+func (o *ScpOptions) rawHostTargetPaths() []PathInfo {
 	var paths []PathInfo
 	appendHostPath := func(p PathInfo) {
 		if p.Host == "" {
@@ -1632,9 +1692,7 @@ func (o *ScpOptions) collectHostTargetPaths(provider config.ConfigProvider, excl
 		if p.Port == 0 {
 			p.Port = o.Port
 		}
-		if !o.isCollectedPathExcluded(provider, excludes, p) {
-			paths = append(paths, p)
-		}
+		paths = append(paths, p)
 	}
 	if hosts, err := cmdutils.ParseHosts(o.Host, o.HostFile, ""); err == nil {
 		for _, h := range hosts {
@@ -1650,6 +1708,27 @@ func (o *ScpOptions) collectHostTargetPaths(provider config.ConfigProvider, excl
 	return paths
 }
 
+func (o *ScpOptions) rawTargetPaths(provider config.ConfigProvider) []PathInfo {
+	var paths []PathInfo
+	if o.Tag != "" && provider != nil {
+		for nodeID := range provider.GetNodesByTag(o.Tag) {
+			paths = append(paths, taggedNodePathInfo(nodeID))
+		}
+	}
+	if o.Host != "" || o.HostFile != "" {
+		paths = append(paths, o.rawHostTargetPaths()...)
+	}
+	if o.Host == "" && o.Tag == "" && o.HostFile == "" {
+		if src, err := parsePath(o.Source); err == nil && src.IsRemote {
+			paths = append(paths, src)
+		}
+		if dst, err := parsePath(o.Dest); err == nil && dst.IsRemote {
+			paths = append(paths, dst)
+		}
+	}
+	return paths
+}
+
 func (o *ScpOptions) resolveExcludes(provider config.ConfigProvider) (map[string]struct{}, error) {
 	if len(o.Exclude) == 0 {
 		return nil, nil
@@ -1659,59 +1738,15 @@ func (o *ScpOptions) resolveExcludes(provider config.ConfigProvider) (map[string
 }
 
 func (o *ScpOptions) buildExcludeCandidates(provider config.ConfigProvider) []cmdutils.ExcludeTargetInfo {
-	var candidates []cmdutils.ExcludeTargetInfo
-	if o.Tag != "" && provider != nil {
-		for nodeID := range provider.GetNodesByTag(o.Tag) {
-			info := cmdutils.ExcludeTargetInfo{
-				NodeID:        nodeID,
-				MatchedNodeID: nodeID,
-				BaseNodeID:    nodeID,
-			}
-			if _, hostObj, identity, err := provider.Resolve(nodeID); err == nil {
-				info.User = identity.User
-				info.Port = hostObj.Port
-				info.UnmanagedHosts = []string{hostObj.Address}
-			}
-			candidates = append(candidates, info)
-		}
-	}
-	if o.Host == "" && o.HostFile == "" {
-		return candidates
-	}
-	appendCandidate := func(p PathInfo) {
+	rawPaths := o.rawTargetPaths(provider)
+	candidates := make([]cmdutils.ExcludeTargetInfo, 0, len(rawPaths))
+	for _, p := range rawPaths {
 		if p.Host == "" {
-			return
+			continue
 		}
-		if p.User == "" {
-			p.User = o.User
-		}
-		if p.Port == 0 {
-			p.Port = o.Port
-		}
-		rawHost := p.Host
-		canonP := p
-		o.canonicalMu.Lock()
-		res, ok := o.canonicalCache[o.canonicalCacheKey(p)]
-		o.canonicalMu.Unlock()
-		if ok && res.Canonicalized {
-			if canonP.OriginalHost == "" {
-				canonP.OriginalHost = res.OriginalHost
-			}
-			canonP.Host = res.CanonicalHost
-		}
-		if info, err := o.excludeTargetInfoForPath(provider, rawHost, canonP); err == nil {
+		canonP := o.cachedCanonicalPathInfo(p)
+		if info, err := o.excludeTargetInfoForPath(provider, p.Host, canonP); err == nil {
 			candidates = append(candidates, info)
-		}
-	}
-	if hosts, err := cmdutils.ParseHosts(o.Host, o.HostFile, ""); err == nil {
-		for _, h := range hosts {
-			appendCandidate(PathInfo{Host: h.Host, User: h.User, Port: h.Port, IsRemote: true})
-		}
-		return candidates
-	}
-	if o.Host != "" {
-		for h := range strings.SplitSeq(o.Host, ",") {
-			appendCandidate(PathInfo{Host: strings.TrimSpace(h), IsRemote: true})
 		}
 	}
 	return candidates
@@ -1724,23 +1759,11 @@ func (o *ScpOptions) collectTargetPaths(provider config.ConfigProvider) []PathIn
 			excludes = resolved
 		}
 	}
-	var paths []PathInfo
-	if o.Tag != "" {
-		for nodeID := range provider.GetNodesByTag(o.Tag) {
-			if !cmdutils.IsTargetExcluded(excludes, cmdutils.ExcludeTargetInfo{NodeID: nodeID, MatchedNodeID: nodeID}) {
-				paths = append(paths, PathInfo{Host: nodeID, IsRemote: true})
-			}
-		}
-	}
-	if o.Host != "" || o.HostFile != "" {
-		paths = append(paths, o.collectHostTargetPaths(provider, excludes)...)
-	}
-	if o.Host == "" && o.Tag == "" && o.HostFile == "" {
-		if src, err := parsePath(o.Source); err == nil && src.IsRemote {
-			paths = append(paths, src)
-		}
-		if dst, err := parsePath(o.Dest); err == nil && dst.IsRemote {
-			paths = append(paths, dst)
+	rawPaths := o.rawTargetPaths(provider)
+	paths := make([]PathInfo, 0, len(rawPaths))
+	for _, p := range rawPaths {
+		if !o.isCollectedPathExcluded(provider, excludes, p) {
+			paths = append(paths, p)
 		}
 	}
 	return paths

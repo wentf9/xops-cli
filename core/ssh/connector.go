@@ -1221,7 +1221,7 @@ func (c *Connector) maybeStartMasterListener(planNode connectionPlanNode, rawCli
 		c.warnOrDebugf(explicitMaster, "mux: start master server on %q failed: %v; continuing without connection sharing", expandedPath, err)
 		return
 	}
-	c.trackMaster(server)
+	c.trackMaster(server, planNode.name)
 }
 
 // masterOwnership records this connector's hold on a master it started.
@@ -1229,14 +1229,19 @@ func (c *Connector) maybeStartMasterListener(planNode connectionPlanNode, rawCli
 // without the reference a bounded ControlPersist idle timer, or another client
 // disconnecting, would tear down a transport still in use by this process.
 type masterOwnership struct {
+	nodeID            string
 	foregroundSession bool
 }
 
 // trackMaster records an owned master so CloseAll can release it. A connector
 // that is already closed shuts the master down immediately.
-func (c *Connector) trackMaster(server *MuxServer) {
+func (c *Connector) trackMaster(server *MuxServer, nodeIDs ...string) {
 	if server == nil {
 		return
+	}
+	var nodeID string
+	if len(nodeIDs) > 0 {
+		nodeID = nodeIDs[0]
 	}
 	c.lifecycleMu.Lock()
 	if c.closed {
@@ -1250,7 +1255,10 @@ func (c *Connector) trackMaster(server *MuxServer) {
 	if _, exists := c.masters[server]; !exists {
 		c.masterOrder = append(c.masterOrder, server)
 	}
-	c.masters[server] = &masterOwnership{foregroundSession: true}
+	c.masters[server] = &masterOwnership{
+		nodeID:            nodeID,
+		foregroundSession: true,
+	}
 	c.lifecycleMu.Unlock()
 }
 
@@ -1336,6 +1344,21 @@ func (c *Connector) HasMasterSession(server *MuxServer) bool {
 	defer c.lifecycleMu.Unlock()
 	ownership := c.masters[server]
 	return ownership != nil && ownership.foregroundSession
+}
+
+// MasterNodeID returns the logical node identifier recorded when this connector
+// started server, or "" if server is nil or not owned by this connector.
+func (c *Connector) MasterNodeID(server *MuxServer) string {
+	if c == nil || server == nil {
+		return ""
+	}
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	ownership := c.masters[server]
+	if ownership == nil {
+		return ""
+	}
+	return ownership.nodeID
 }
 
 // Masters returns a snapshot of the multiplexing masters this connector started

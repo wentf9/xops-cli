@@ -13,9 +13,42 @@ import (
 	cryptoSSH "golang.org/x/crypto/ssh"
 )
 
-// normalizeCertSignAlgorithm maps OpenSSH certificate signature algorithm names
-// (such as "rsa-sha2-256-cert-v01@openssh.com") to the underlying private-key
-// signature algorithm expected by cryptoSSH.AlgorithmSigner implementations.
+const (
+	openSSHCertAlgoSuffix = "-cert-v01@openssh.com"
+	goCertAlgoSuffix      = "-cert-v01@golang.org"
+	dsaCertAlgoV01        = "ssh-dss-cert-v01@openssh.com"
+	dsaKeyAlgo            = "ssh-dss"
+)
+
+// isCertAlgorithm reports whether alg is an SSH certificate public-key or
+// signature algorithm name (covering OpenSSH *-cert-v01@openssh.com and Go
+// ML-DSA *-cert-v01@golang.org certificate algorithms).
+func isCertAlgorithm(alg string) bool {
+	switch alg {
+	case cryptoSSH.CertAlgoRSAv01,
+		cryptoSSH.CertAlgoRSASHA256v01,
+		cryptoSSH.CertAlgoRSASHA512v01,
+		dsaCertAlgoV01,
+		cryptoSSH.CertAlgoECDSA256v01,
+		cryptoSSH.CertAlgoECDSA384v01,
+		cryptoSSH.CertAlgoECDSA521v01,
+		cryptoSSH.CertAlgoSKECDSA256v01,
+		cryptoSSH.CertAlgoED25519v01,
+		cryptoSSH.CertAlgoSKED25519v01,
+		cryptoSSH.CertAlgoMLDSA44v01Go,
+		cryptoSSH.CertAlgoMLDSA65v01Go,
+		cryptoSSH.CertAlgoMLDSA87v01Go:
+		return true
+	default:
+		return (len(alg) > len(openSSHCertAlgoSuffix) && strings.HasSuffix(alg, openSSHCertAlgoSuffix)) ||
+			(len(alg) > len(goCertAlgoSuffix) && strings.HasSuffix(alg, goCertAlgoSuffix))
+	}
+}
+
+// normalizeCertSignAlgorithm maps SSH certificate signature algorithm names
+// (such as "rsa-sha2-256-cert-v01@openssh.com" or "ssh-mldsa-65-cert-v01@golang.org")
+// to the underlying private-key signature algorithm expected by
+// cryptoSSH.AlgorithmSigner implementations.
 func normalizeCertSignAlgorithm(algorithm string) string {
 	switch algorithm {
 	case cryptoSSH.CertAlgoRSAv01:
@@ -24,6 +57,8 @@ func normalizeCertSignAlgorithm(algorithm string) string {
 		return cryptoSSH.KeyAlgoRSASHA256
 	case cryptoSSH.CertAlgoRSASHA512v01:
 		return cryptoSSH.KeyAlgoRSASHA512
+	case dsaCertAlgoV01:
+		return dsaKeyAlgo
 	case cryptoSSH.CertAlgoECDSA256v01:
 		return cryptoSSH.KeyAlgoECDSA256
 	case cryptoSSH.CertAlgoECDSA384v01:
@@ -36,6 +71,12 @@ func normalizeCertSignAlgorithm(algorithm string) string {
 		return cryptoSSH.KeyAlgoED25519
 	case cryptoSSH.CertAlgoSKED25519v01:
 		return cryptoSSH.KeyAlgoSKED25519
+	case cryptoSSH.CertAlgoMLDSA44v01Go:
+		return cryptoSSH.KeyAlgoMLDSA44
+	case cryptoSSH.CertAlgoMLDSA65v01Go:
+		return cryptoSSH.KeyAlgoMLDSA65
+	case cryptoSSH.CertAlgoMLDSA87v01Go:
+		return cryptoSSH.KeyAlgoMLDSA87
 	default:
 		return algorithm
 	}
@@ -100,8 +141,9 @@ func signCertWithNormalizedAlgorithm(
 }
 
 // normalizedCertSigner wraps cryptoSSH.NewCertSigner so direct callers passing
-// *-cert-v01@openssh.com algorithm names to SignWithAlgorithm are normalized to
-// the underlying key signature algorithm (e.g. rsa-sha2-256 / rsa-sha2-512).
+// SSH certificate algorithm names (*-cert-v01@openssh.com or *-cert-v01@golang.org)
+// to SignWithAlgorithm are normalized to the underlying key signature algorithm
+// (e.g. rsa-sha2-256, rsa-sha2-512, or ssh-mldsa-65).
 type normalizedCertSigner struct {
 	cert       *cryptoSSH.Certificate
 	certSigner cryptoSSH.Signer
@@ -178,7 +220,7 @@ func extractCertFromPublicKey(pub cryptoSSH.PublicKey) (*cryptoSSH.Certificate, 
 	if cert, ok := pub.(*cryptoSSH.Certificate); ok && cert.Key != nil {
 		return cert, true
 	}
-	if !strings.HasSuffix(pub.Type(), "-cert-v01@openssh.com") {
+	if !isCertAlgorithm(pub.Type()) {
 		return nil, false
 	}
 	parsed, err := cryptoSSH.ParsePublicKey(pub.Marshal())

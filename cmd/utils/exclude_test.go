@@ -443,3 +443,197 @@ func verifyPass5SavedNodeOverrideExcludes(t *testing.T, noSSHProv config.ConfigP
 		}
 	})
 }
+
+func newPass6WildcardOpenSSHFixtures(t *testing.T) (config.ConfigProvider, config.ConfigProvider, *config.Repository) {
+	t.Helper()
+	sshCfg := `
+Host web
+  HostName 10.0.0.10
+  User ops
+  Port 22
+
+Host *.corp.example.com
+  User ops
+  Port 2222
+
+Host *
+  ServerAliveInterval 15
+`
+	parser, err := config.NewOpenSSHParserFromReader(strings.NewReader(sshCfg))
+	if err != nil {
+		t.Fatalf("NewOpenSSHParserFromReader failed: %v", err)
+	}
+	cfg := &config.Configuration{
+		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
+		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
+		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
+	}
+	cfg.Hosts.Set("h-saved", models.Host{Address: "10.238.221.181", Port: 22})
+	cfg.Identities.Set("id-iaas", models.Identity{User: "iaas", AuthType: "auto"})
+	cfg.Nodes.Set("iaas@10.238.221.181:22", models.Node{
+		HostRef:     "h-saved",
+		IdentityRef: "id-iaas",
+		Alias:       []string{"prod-web"},
+	})
+	openSSHProv := config.NewProviderWithOpenSSHParser(cfg, parser)
+	noSSHProv := config.NewProviderWithoutOpenSSH(cfg)
+	repo, err := config.NewRepositoryWithOpenSSHParser(cfg, pass6NoopStore{}, parser)
+	if err != nil {
+		t.Fatalf("NewRepositoryWithOpenSSHParser failed: %v", err)
+	}
+	return openSSHProv, noSSHProv, repo
+}
+
+type pass6NoopStore struct{}
+
+func (pass6NoopStore) Load() (*config.Configuration, error) { return nil, nil }
+func (pass6NoopStore) Save(*config.Configuration) error     { return nil }
+
+func TestPass6_H2_OpenSSHConcreteHostFailClosed(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	openSSHProv, noSSHProv, repo := newPass6WildcardOpenSSHFixtures(t)
+	frozenProv := repo.Frozen()
+
+	for _, prov := range []config.ConfigProvider{openSSHProv, frozenProv} {
+		for _, concrete := range []string{"web", "openssh:web", "openssh:alice@web:2222"} {
+			if !providerOpenSSHHasConcreteHost(prov, concrete) {
+				t.Fatalf("expected providerOpenSSHHasConcreteHost(%T, %q) == true", prov, concrete)
+			}
+		}
+		for _, nonConcrete := range []string{"", "typo-host", "openssh:typo-host", "wild.corp.example.com", "openssh:wild.corp.example.com", "prod-web", "openssh:prod-web"} {
+			if providerOpenSSHHasConcreteHost(prov, nonConcrete) {
+				t.Fatalf("expected providerOpenSSHHasConcreteHost(%T, %q) == false", prov, nonConcrete)
+			}
+		}
+	}
+	if providerOpenSSHHasConcreteHost(noSSHProv, "web") || providerOpenSSHHasConcreteHost(nil, "web") {
+		t.Fatal("expected providerOpenSSHHasConcreteHost to be false without loaded ssh_config")
+	}
+
+	savedCand := ExcludeTargetInfo{
+		NodeID:         "iaas@10.238.221.181:22",
+		MatchedNodeID:  "iaas@10.238.221.181:22",
+		BaseNodeID:     "iaas@10.238.221.181:22",
+		User:           "iaas",
+		Port:           22,
+		UnmanagedHosts: []string{"prod-web", "10.238.221.181"},
+	}
+	unmatchedSpecs := []string{
+		"typo-host",
+		"openssh:typo-host",
+		"openssh:ops@typo-host:22",
+		"alice@typo-host",
+		"typo-host:2222",
+		"wild.corp.example.com",
+		"openssh:wild.corp.example.com",
+		"openssh:prod-web",
+	}
+	for _, spec := range unmatchedSpecs {
+		if _, err := ResolveExcludes(openSSHProv, []string{spec}); err == nil || !strings.Contains(err.Error(), "no matching node") {
+			t.Fatalf("ResolveExcludes(%q) expected fail-closed error, got: %v", spec, err)
+		}
+		if _, err := ResolveExcludesForTargets(openSSHProv, []string{spec}, []ExcludeTargetInfo{savedCand}); err == nil || !strings.Contains(err.Error(), "no matching node") {
+			t.Fatalf("ResolveExcludesForTargets(%q) expected fail-closed error, got: %v", spec, err)
+		}
+	}
+
+	wildCand := ExcludeTargetInfo{
+		NodeID:         "ops@wild.corp.example.com:2222",
+		User:           "ops",
+		Port:           2222,
+		UnmanagedHosts: []string{"wild.corp.example.com"},
+	}
+	exclWild, err := ResolveExcludesForTargets(openSSHProv, []string{"wild.corp.example.com"}, []ExcludeTargetInfo{savedCand, wildCand})
+	if err != nil {
+		t.Fatalf("ResolveExcludesForTargets(wild target in candidates) failed: %v", err)
+	}
+	if !IsTargetExcluded(exclWild, wildCand) || IsTargetExcluded(exclWild, savedCand) {
+		t.Fatal("expected wildcard-matched ad-hoc candidate to be excluded without affecting savedCand")
+	}
+}
+
+func TestPass6_H3_AddSavedBaseCandidatesUserPortOverrides(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	openSSHProv, noSSHProv, _ := newPass6WildcardOpenSSHFixtures(t)
+
+	savedDefault := ExcludeTargetInfo{
+		NodeID:         "iaas@10.238.221.181:22",
+		MatchedNodeID:  "iaas@10.238.221.181:22",
+		BaseNodeID:     "iaas@10.238.221.181:22",
+		User:           "iaas",
+		Port:           22,
+		UnmanagedHosts: []string{"prod-web", "10.238.221.181"},
+	}
+	savedPortOverride := ExcludeTargetInfo{
+		NodeID:         "iaas@10.238.221.181:2222",
+		BaseNodeID:     "iaas@10.238.221.181:22",
+		User:           "iaas",
+		Port:           2222,
+		UnmanagedHosts: []string{"prod-web", "10.238.221.181"},
+	}
+	savedRootOverride := ExcludeTargetInfo{
+		NodeID:         "root@10.238.221.181:22",
+		BaseNodeID:     "iaas@10.238.221.181:22",
+		User:           "root",
+		Port:           22,
+		UnmanagedHosts: []string{"prod-web", "10.238.221.181"},
+	}
+	savedRootPortOverride := ExcludeTargetInfo{
+		NodeID:         "root@10.238.221.181:2222",
+		BaseNodeID:     "iaas@10.238.221.181:22",
+		User:           "root",
+		Port:           2222,
+		UnmanagedHosts: []string{"prod-web", "10.238.221.181"},
+	}
+	allCands := []ExcludeTargetInfo{savedPortOverride, savedRootOverride, savedRootPortOverride}
+
+	for _, prov := range []config.ConfigProvider{noSSHProv, openSSHProv} {
+		verifySavedUserPortExcludeCases(t, prov, savedDefault, savedPortOverride, savedRootOverride, savedRootPortOverride, allCands)
+	}
+}
+
+func verifySavedUserPortExcludeCases(
+	t *testing.T,
+	prov config.ConfigProvider,
+	savedDefault, savedPortOverride, savedRootOverride, savedRootPortOverride ExcludeTargetInfo,
+	allCands []ExcludeTargetInfo,
+) {
+	t.Helper()
+	exclIaas, err := ResolveExcludesForTargets(prov, []string{"iaas@prod-web"}, allCands)
+	if err != nil {
+		t.Fatalf("ResolveExcludesForTargets(iaas@prod-web) failed: %v", err)
+	}
+	if !IsTargetExcluded(exclIaas, savedPortOverride) {
+		t.Fatal("expected --exclude iaas@prod-web to exclude -p 2222 overridden iaas@10.238.221.181:2222")
+	}
+	if IsTargetExcluded(exclIaas, savedRootOverride) || IsTargetExcluded(exclIaas, savedRootPortOverride) {
+		t.Fatal("expected --exclude iaas@prod-web NOT to exclude -u root overridden targets")
+	}
+
+	exclPort22, err := ResolveExcludesForTargets(prov, []string{"iaas@prod-web:22"}, allCands)
+	if err != nil {
+		t.Fatalf("ResolveExcludesForTargets(iaas@prod-web:22) failed: %v", err)
+	}
+	if IsTargetExcluded(exclPort22, savedPortOverride) {
+		t.Fatal("expected --exclude iaas@prod-web:22 NOT to exclude -p 2222 target")
+	}
+	if !IsTargetExcluded(exclPort22, savedDefault) {
+		t.Fatal("expected --exclude iaas@prod-web:22 to exclude port 22 target")
+	}
+
+	exclPort2222, err := ResolveExcludesForTargets(prov, []string{"iaas@prod-web:2222"}, allCands)
+	if err != nil {
+		t.Fatalf("ResolveExcludesForTargets(iaas@prod-web:2222) failed: %v", err)
+	}
+	if !IsTargetExcluded(exclPort2222, savedPortOverride) || IsTargetExcluded(exclPort2222, savedRootPortOverride) {
+		t.Fatal("expected --exclude iaas@prod-web:2222 to exclude only iaas on port 2222")
+	}
+
+	exclRoot, err := ResolveExcludesForTargets(prov, []string{"root@prod-web"}, allCands)
+	if err != nil {
+		t.Fatalf("ResolveExcludesForTargets(root@prod-web) failed: %v", err)
+	}
+	if !IsTargetExcluded(exclRoot, savedRootOverride) || !IsTargetExcluded(exclRoot, savedRootPortOverride) || IsTargetExcluded(exclRoot, savedPortOverride) {
+		t.Fatal("expected --exclude root@prod-web to exclude root overrides and preserve iaas")
+	}
+}
