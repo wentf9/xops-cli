@@ -131,6 +131,14 @@ func normalizePlan(plan ConnectionPlan) (ConnectionPlan, error) {
 		hop.KeyPaths = slices.Clone(hop.KeyPaths)
 		hop.Execution = hop.Execution.Clone()
 		hop.Options = hop.Options.Clone()
+		// Plans never spawn local processes. An active ProxyCommand defines the
+		// routing path to this hop (bastion, egress policy, audit); silently
+		// stripping it would dial the endpoint directly, so fail closed instead.
+		// Passive local-exec options (LocalCommand/PermitLocalCommand and an
+		// explicit ProxyCommand=none) are still stripped below.
+		if hop.Options.ActiveProxyCommand() != "" {
+			return ConnectionPlan{}, fmt.Errorf("connection plan hop %q: %w", hop.NodeID, ErrProxyCommandUnavailable)
+		}
 		hop.Options.StripClasses(OptionClassMux, OptionClassForward, OptionClassSession, OptionClassLocalExec)
 		if hop.Options.IsEmpty() {
 			hop.Options = nil

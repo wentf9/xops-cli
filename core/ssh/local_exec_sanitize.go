@@ -213,14 +213,17 @@ func isSafeHomeTokenChar(c byte) bool {
 }
 
 // ExpandProxyCommand expands OpenSSH ProxyCommand percent tokens (%%, %h, %p, %r, %n)
-// after validating target and interpolated values against ValidateSafeExecToken.
+// after validating the target host/port and any referenced percent-token values against
+// ValidateSafeExecToken. Note that bracketed IPv6 literals contain '[' and ']'; shell
+// command templates should quote expanded tokens (e.g. '%h') to prevent pathname globbing.
 func ExpandProxyCommand(pattern string, env Environment, target TargetContext) (string, error) {
 	return expandLocalExecTemplate("ProxyCommand", pattern, env, target, false)
 }
 
 // ExpandLocalCommand expands OpenSSH LocalCommand percent tokens
-// (%%, %C, %d, %h, %i, %l, %L, %n, %p, %r, %u) after validating target and
-// interpolated values against ValidateSafeExecToken.
+// (%%, %C, %d, %h, %i, %l, %L, %n, %p, %r, %u) after validating the target host/port and
+// any referenced percent-token values against ValidateSafeExecToken. Shell command templates
+// should quote expanded tokens (e.g. '%h', '%n') to prevent pathname globbing on '['/']'.
 func ExpandLocalCommand(pattern string, env Environment, target TargetContext) (string, error) {
 	return expandLocalExecTemplate("LocalCommand", pattern, env, target, true)
 }
@@ -237,20 +240,13 @@ func expandLocalExecTemplate(optionName, pattern string, env Environment, target
 		return "none", nil
 	}
 
-	// Proactively validate any non-empty target host/originalHost/user on the TargetContext
-	// even if the command string omits the corresponding % token.
+	// Always validate TargetContext.Host (%h) and Port up front so a hostile
+	// endpoint is rejected even when the command string omits %h. Other tokens
+	// (%r, %n, %d, %u, etc.) are validated lazily below only when referenced in
+	// pattern so unused values (e.g. Windows DOMAIN\user or spaces in LocalUser/HomeDir)
+	// do not reject commands like "nc %h %p".
 	if target.Host != "" {
 		if err := ValidateSafeExecToken("%h", target.Host); err != nil {
-			return "", err
-		}
-	}
-	if target.OriginalHost != "" {
-		if err := ValidateSafeExecToken("%n", target.OriginalHost); err != nil {
-			return "", err
-		}
-	}
-	if target.User != "" {
-		if err := ValidateSafeExecToken("%r", target.User); err != nil {
 			return "", err
 		}
 	}
@@ -301,4 +297,21 @@ func isAllowedLocalExecToken(tok byte, allowLocalTokens bool) bool {
 	default:
 		return false
 	}
+}
+
+// templateUsesPercentToken reports whether pattern references %want (ignoring %%).
+func templateUsesPercentToken(pattern string, want byte) bool {
+	for i := 0; i < len(pattern); i++ {
+		if pattern[i] != '%' || i+1 >= len(pattern) {
+			continue
+		}
+		i++
+		if pattern[i] == '%' {
+			continue
+		}
+		if pattern[i] == want {
+			return true
+		}
+	}
+	return false
 }

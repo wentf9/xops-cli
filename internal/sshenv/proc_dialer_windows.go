@@ -17,7 +17,10 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+var procNtResumeProcess = windows.NewLazySystemDLL("ntdll.dll").NewProc("NtResumeProcess")
+
 type platformProc struct {
+	process *os.Process
 	job     windows.Handle
 	jobOnce sync.Once
 }
@@ -31,7 +34,8 @@ func startPlatformShellCommand(command string, stdin io.Reader, stdout, stderr i
 	cmdExe := resolveWindowsCmdExe()
 	cmd := exec.Command(cmdExe)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		CmdLine: fmt.Sprintf(`"%s" /d /s /c "%s"`, cmdExe, command),
+		CmdLine:       fmt.Sprintf(`"%s" /d /s /c "%s"`, cmdExe, command),
+		CreationFlags: windows.CREATE_SUSPENDED,
 	}
 	attachCommandIO(cmd, stdin, stdout, stderr)
 
@@ -40,8 +44,11 @@ func startPlatformShellCommand(command string, stdin io.Reader, stdout, stderr i
 		return nil, nil, fmt.Errorf("start Windows shell command via %s: %w", cmdExe, err)
 	}
 
-	proc := &platformProc{job: job}
-	if err := assignPIDToJobObject(job, cmd.Process.Pid); err != nil {
+	proc := &platformProc{
+		process: cmd.Process,
+		job:     job,
+	}
+	if err := assignAndResumeSuspendedProcess(job, cmd.Process.Pid); err != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		proc.closeJob()
@@ -69,28 +76,37 @@ func createKillOnCloseJobObject() (windows.Handle, error) {
 	return job, nil
 }
 
-func assignPIDToJobObject(job windows.Handle, pid int) error {
+// assignAndResumeSuspendedProcess attaches the CREATE_SUSPENDED child to job
+// before resuming its threads via NtResumeProcess, closing the race window
+// where fast grandchildren could escape JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
+func assignAndResumeSuspendedProcess(job windows.Handle, pid int) error {
 	procHandle, err := windows.OpenProcess(
-		windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE|windows.SYNCHRONIZE,
+		windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE|windows.PROCESS_SUSPEND_RESUME|windows.SYNCHRONIZE,
 		false,
 		uint32(pid),
 	)
 	if err != nil {
-		// Short-lived command may have exited before OpenProcess ran.
-		return nil
+		return fmt.Errorf("open child process %d for Windows job assignment: %w", pid, err)
 	}
 	defer func() {
 		_ = windows.CloseHandle(procHandle)
 	}()
 
 	if err := windows.AssignProcessToJobObject(job, procHandle); err != nil {
-		// AssignProcessToJobObject returns ERROR_ACCESS_DENIED when the child
-		// has already terminated before assignment completes.
 		waitRes, waitErr := windows.WaitForSingleObject(procHandle, 0)
 		if waitErr == nil && waitRes == windows.WAIT_OBJECT_0 {
 			return nil
 		}
 		return fmt.Errorf("assign process %d to Windows job object: %w", pid, err)
+	}
+
+	r1, _, _ := procNtResumeProcess.Call(uintptr(procHandle))
+	if status := windows.NTStatus(r1); status != 0 {
+		waitRes, waitErr := windows.WaitForSingleObject(procHandle, 0)
+		if waitErr == nil && waitRes == windows.WAIT_OBJECT_0 {
+			return nil
+		}
+		return fmt.Errorf("resume process %d after Windows job assignment: %w", pid, status)
 	}
 	return nil
 }
@@ -123,13 +139,31 @@ func (p *platformProc) closeJob() {
 }
 
 func (p *platformProc) terminateTree(_ time.Duration, _ <-chan struct{}) {
+	if p == nil {
+		return
+	}
 	p.closeJob()
+	if p.process != nil {
+		_ = p.process.Kill()
+	}
 }
 
 func (p *platformProc) reapRemainingGroup(_ time.Duration, _ <-chan struct{}) {
+	if p == nil {
+		return
+	}
 	p.closeJob()
+	if p.process != nil {
+		_ = p.process.Kill()
+	}
 }
 
-func (p *platformProc) cleanupAfterWait() {
+func (p *platformProc) cleanupAfterWait(canceled bool) {
+	if p == nil {
+		return
+	}
 	p.closeJob()
+	if canceled && p.process != nil {
+		_ = p.process.Kill()
+	}
 }

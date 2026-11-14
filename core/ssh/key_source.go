@@ -39,7 +39,7 @@ func WithKeySource(source KeySource) Option {
 	return func(c *Connector) { c.keySource = source }
 }
 
-func (c *Connector) sourcedKeyMethods(ctx context.Context, cfg *ClientConfig) ([]certAuthCandidateMethod, cryptoSSH.AuthMethod, func() error, error) {
+func (c *Connector) sourcedKeyMethods(ctx context.Context, cfg *ClientConfig) ([]certAuthCandidateMethod, cryptoSSH.AuthMethod, cryptoSSH.PublicKey, func() error, error) {
 	lease, err := c.keySource.OpenKey(ctx, KeyRequest{
 		NodeID: cfg.NodeID, Host: cfg.Address, Port: cfg.Port, User: cfg.User,
 		Reference: cfg.KeyRef, Path: cfg.KeyPath, VersionToken: cfg.AuthUpdateToken,
@@ -52,17 +52,17 @@ func (c *Connector) sourcedKeyMethods(ctx context.Context, cfg *ClientConfig) ([
 		if cleanup != nil {
 			err = errors.Join(err, cleanup())
 		}
-		return nil, nil, nil, fmt.Errorf("resolve private key signer: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("resolve private key signer: %w", err)
 	}
 	if nilCapability(lease) {
-		return nil, nil, nil, errors.New("private key source returned no lease")
+		return nil, nil, nil, nil, errors.New("private key source returned no lease")
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, nil, nil, errors.Join(err, cleanup())
+		return nil, nil, nil, nil, errors.Join(err, cleanup())
 	}
 	signer := lease.Signer()
 	if nilCapability(signer) {
-		return nil, nil, nil, errors.Join(errors.New("private key source returned no signer"), cleanup())
+		return nil, nil, nil, nil, errors.Join(errors.New("private key source returned no signer"), cleanup())
 	}
 
 	l := c.getLogger()
@@ -82,11 +82,11 @@ func (c *Connector) sourcedKeyMethods(ctx context.Context, cfg *ClientConfig) ([
 			method:   cryptoSSH.PublicKeys(cs),
 		})
 	}
-	return certMethods, cryptoSSH.PublicKeys(signer), cleanup, nil
+	return certMethods, cryptoSSH.PublicKeys(signer), signer.PublicKey(), cleanup, nil
 }
 
 func (c *Connector) sourcedKeyAuth(ctx context.Context, cfg *ClientConfig) (cryptoSSH.AuthMethod, func() error, error) {
-	_, plainMethod, cleanup, err := c.sourcedKeyMethods(ctx, cfg)
+	_, plainMethod, _, cleanup, err := c.sourcedKeyMethods(ctx, cfg)
 	return plainMethod, cleanup, err
 }
 
@@ -121,9 +121,12 @@ func (c *Connector) buildOwnedAutoAuth(ctx context.Context, cfg *ClientConfig, o
 	if c.keySource == nil {
 		return autoAuthPlan{}, nil, errors.New("referenced SSH key requires an explicit key source")
 	}
-	certMethods, plainMethod, release, err := c.sourcedKeyMethods(options.LifecycleCtx, cfg)
+	certMethods, plainMethod, sourcedPub, release, err := c.sourcedKeyMethods(options.LifecycleCtx, cfg)
 	if err != nil {
 		return autoAuthPlan{}, nil, err
+	}
+	if sourcedPub != nil {
+		options.FirstPublicKeys = append(options.FirstPublicKeys, sourcedPub)
 	}
 	for _, cm := range certMethods {
 		options.FirstCertMethods = append(options.FirstCertMethods, cm.method)

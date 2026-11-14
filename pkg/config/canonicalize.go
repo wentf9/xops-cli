@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -55,7 +56,10 @@ type CanonicalizeResult struct {
 	OriginalHost  string
 	CanonicalHost string
 	Canonicalized bool
-	Pass2Options  *ssh.Options
+	// Pass2Options captures the OpenSSHParser options for CanonicalHost; in
+	// production CLI/adapter flows, SSHAdapter.ResolveSSHOptions re-evaluates
+	// Pass 2 options directly on the canonicalized selector.
+	Pass2Options *ssh.Options
 }
 
 type canonicalizePolicy struct {
@@ -64,7 +68,8 @@ type canonicalizePolicy struct {
 	maxDots         int
 	fallbackLocal   bool
 	permittedCNAMEs []cnameRule
-	hasProxy        bool
+	hasProxyJump    bool
+	hasProxyCommand bool
 	timeout         time.Duration
 }
 
@@ -109,15 +114,18 @@ func CanonicalizeHost(ctx context.Context, in CanonicalizeInput) (CanonicalizeRe
 	probeCtx, cancel := context.WithTimeout(ctx, policy.timeout)
 	defer cancel()
 
-	if chosen, ok := probeCanonicalDomains(probeCtx, resolver, orig, policy); ok {
-		res.CanonicalHost = chosen
-		res.Canonicalized = !strings.EqualFold(chosen, orig)
-		res.Pass2Options = pass2OpenSSHOptions(parser, chosen)
-		return res, nil
-	}
+	trailingDot := strings.HasSuffix(orig, ".")
+	if !trailingDot && len(policy.domains) > 0 {
+		if chosen, ok := probeCanonicalDomains(probeCtx, resolver, orig, policy); ok {
+			res.CanonicalHost = chosen
+			res.Canonicalized = !strings.EqualFold(chosen, orig)
+			res.Pass2Options = pass2OpenSSHOptions(parser, chosen)
+			return res, nil
+		}
 
-	if !policy.fallbackLocal {
-		return res, fmt.Errorf("%w: %s", ErrCanonicalizeFailed, orig)
+		if !policy.fallbackLocal {
+			return res, fmt.Errorf("%w: %s", ErrCanonicalizeFailed, orig)
+		}
 	}
 
 	if addrs, err := resolver.LookupHost(probeCtx, orig); err == nil && len(addrs) > 0 {
@@ -174,18 +182,18 @@ func shouldCanonicalize(host string, policy canonicalizePolicy) bool {
 	if policy.mode != "yes" && policy.mode != "always" {
 		return false
 	}
-	if policy.hasProxy && policy.mode != "always" {
+	if (policy.hasProxyJump || policy.hasProxyCommand) && policy.mode != "always" {
 		return false
 	}
 	if strings.Count(host, ".") > policy.maxDots {
 		return false
 	}
-	return len(policy.domains) > 0
+	return len(policy.domains) > 0 || len(policy.permittedCNAMEs) > 0
 }
 
 func isIPOrLocalhost(host string) bool {
 	trimmed := strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
-	if net.ParseIP(trimmed) != nil {
+	if _, err := netip.ParseAddr(trimmed); err == nil {
 		return true
 	}
 	lower := strings.TrimSuffix(strings.ToLower(trimmed), ".")
@@ -206,6 +214,9 @@ func resolveCanonicalizePolicy(parser *OpenSSHParser, tier3Opts *ssh.Options, ho
 		applySSHOptionsCanonicalDirectives(&policy, tier3Opts)
 	}
 	applyCLICanonicalDirectives(&policy, rawCLI, cliProxyJump)
+	if policy.hasProxyJump {
+		policy.hasProxyCommand = false
+	}
 	return policy
 }
 
@@ -225,11 +236,11 @@ func applySSHConfigCanonicalDirectives(policy *canonicalizePolicy, cfg *ssh_conf
 	if v := firstSSHConfigKeyValue(cfg, host, "canonicalizepermittedcnames"); v != "" {
 		policy.setPermittedCNAMEs(v)
 	}
-	if v := firstSSHConfigKeyValue(cfg, host, "proxyjump"); v != "" {
-		policy.hasProxy = !strings.EqualFold(v, "none")
+	if v := firstSSHConfigKeyValue(cfg, host, "proxycommand"); v != "" {
+		policy.setProxyCommand(v)
 	}
-	if v := firstSSHConfigKeyValue(cfg, host, "proxycommand"); v != "" && !strings.EqualFold(v, "none") {
-		policy.hasProxy = true
+	if v := firstSSHConfigKeyValue(cfg, host, "proxyjump"); v != "" {
+		policy.setProxyJump(v)
 	}
 	if v := firstSSHConfigKeyValue(cfg, host, "connecttimeout"); v != "" {
 		policy.setTimeoutSeconds(v)
@@ -255,11 +266,11 @@ func applySSHOptionsCanonicalDirectives(policy *canonicalizePolicy, opts *ssh.Op
 	if cnames := opts.CanonicalizePermittedCNAMEs(); len(cnames) > 0 {
 		policy.setPermittedCNAMEs(strings.Join(cnames, " "))
 	}
-	if v := strings.TrimSpace(opts.Get("proxy_jump")); v != "" {
-		policy.hasProxy = !strings.EqualFold(v, "none")
+	if v := strings.TrimSpace(opts.Get("proxy_command")); v != "" {
+		policy.setProxyCommand(v)
 	}
-	if v := strings.TrimSpace(opts.Get("proxy_command")); v != "" && !strings.EqualFold(v, "none") {
-		policy.hasProxy = true
+	if v := strings.TrimSpace(opts.Get("proxy_jump")); v != "" {
+		policy.setProxyJump(v)
 	}
 	if v := strings.TrimSpace(opts.Get(ssh.OptionConnectTimeout)); v != "" {
 		policy.setTimeoutSeconds(v)
@@ -284,18 +295,28 @@ func applyCLICanonicalDirectives(policy *canonicalizePolicy, rawCLI []string, cl
 		case "canonicalizepermittedcnames":
 			policy.setPermittedCNAMEs(v)
 		case "proxyjump":
-			policy.hasProxy = v != "" && !strings.EqualFold(v, "none")
+			if v != "" {
+				policy.setProxyJump(v)
+			}
 		case "proxycommand":
-			if v != "" && !strings.EqualFold(v, "none") {
-				policy.hasProxy = true
+			if v != "" {
+				policy.setProxyCommand(v)
 			}
 		case "connecttimeout":
 			policy.setTimeoutSeconds(v)
 		}
 	}
 	if pj := strings.TrimSpace(cliProxyJump); pj != "" {
-		policy.hasProxy = !strings.EqualFold(pj, "none")
+		policy.setProxyJump(pj)
 	}
+}
+
+func (p *canonicalizePolicy) setProxyJump(v string) {
+	p.hasProxyJump = !strings.EqualFold(strings.TrimSpace(v), "none")
+}
+
+func (p *canonicalizePolicy) setProxyCommand(v string) {
+	p.hasProxyCommand = !strings.EqualFold(strings.TrimSpace(v), "none")
 }
 
 func (p *canonicalizePolicy) setMode(v string) {

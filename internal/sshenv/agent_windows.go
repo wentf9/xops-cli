@@ -5,6 +5,7 @@ package sshenv
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"strings"
@@ -14,6 +15,8 @@ import (
 )
 
 const agentDialDefaultTimeout = 2 * time.Second
+
+var errUntrustedAgentPipeOwner = errors.New("ssh-agent named pipe server is owned by an untrusted local user")
 
 func defaultAgentSocket() string {
 	if sock := strings.TrimSpace(os.Getenv("SSH_AUTH_SOCK")); sock != "" {
@@ -87,6 +90,10 @@ func dialWindowsNamedPipe(ctx context.Context, pipePath string) (net.Conn, error
 			0,
 		)
 		if createErr == nil {
+			if ownerErr := verifyWindowsAgentPipeServerOwner(handle); ownerErr != nil {
+				_ = windows.CloseHandle(handle)
+				return nil, &net.OpError{Op: "dial", Net: "pipe", Addr: windowsPipeAddr(pipePath), Err: ownerErr}
+			}
 			file := os.NewFile(uintptr(handle), pipePath)
 			if file == nil {
 				_ = windows.CloseHandle(handle)
@@ -122,4 +129,46 @@ func dialWindowsNamedPipe(ctx context.Context, pipePath string) (net.Conn, error
 		case <-timer.C:
 		}
 	}
+}
+
+// verifyWindowsAgentPipeServerOwner checks, when accessible, that the named
+// pipe server belongs to SYSTEM, Builtin\Administrators, or the current user.
+// When querying a privileged service token returns ERROR_ACCESS_DENIED, it also
+// checks the pipe kernel object's owner SID (readable via GENERIC_READ) so a
+// pipe squatted by another unprivileged local user still fails closed.
+func verifyWindowsAgentPipeServerOwner(pipeHandle windows.Handle) error {
+	currSID, _ := currentWindowsProcessUserSID()
+
+	var serverPID uint32
+	if err := windows.GetNamedPipeServerProcessId(pipeHandle, &serverPID); err == nil && serverPID != 0 {
+		if serverPID == uint32(os.Getpid()) {
+			return nil
+		}
+		procHandle, openErr := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, serverPID)
+		if openErr == nil {
+			var tok windows.Token
+			tokErr := windows.OpenProcessToken(procHandle, windows.TOKEN_QUERY, &tok)
+			_ = windows.CloseHandle(procHandle)
+			if tokErr == nil {
+				tu, userErr := tok.GetTokenUser()
+				_ = tok.Close()
+				if userErr == nil && tu != nil && tu.User.Sid != nil {
+					if !isTrustedWindowsPrincipalSID(tu.User.Sid, currSID) {
+						return fmt.Errorf("%w (pid %d)", errUntrustedAgentPipeOwner, serverPID)
+					}
+					return nil
+				}
+			}
+		}
+	}
+
+	sd, err := windows.GetSecurityInfo(pipeHandle, windows.SE_KERNEL_OBJECT, windows.OWNER_SECURITY_INFORMATION)
+	if err == nil && sd != nil {
+		if owner, _, ownerErr := sd.Owner(); ownerErr == nil && owner != nil {
+			if !isTrustedWindowsPrincipalSID(owner, currSID) {
+				return errUntrustedAgentPipeOwner
+			}
+		}
+	}
+	return nil
 }

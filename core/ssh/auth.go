@@ -34,6 +34,302 @@ func dialAgentConn(ctx context.Context, dialFn func(context.Context, string) (ne
 	return dialFn(ctx, socket)
 }
 
+// boundedAgentClient wraps an ssh-agent connection so every protocol operation
+// (List, Signers, Sign, SignWithFlags) is bounded by opTimeout and immediately
+// interrupted when either ctx or lifecycleCtx is canceled. Deadlines are armed
+// before each RPC and cleared afterward so idle intervals (such as interactive
+// host-key prompts) never expire a healthy agent connection prematurely.
+type boundedAgentClient struct {
+	mu           sync.Mutex
+	conn         net.Conn
+	raw          agent.ExtendedAgent
+	ctx          context.Context
+	lifecycleCtx context.Context
+	opTimeout    time.Duration
+	timedOut     atomic.Bool
+	closeOnce    sync.Once
+	closeErr     error
+	stopCtx      func() bool
+	stopLife     func() bool
+}
+
+func dialBoundedAgentClient(
+	ctx context.Context,
+	lifecycleCtx context.Context,
+	dialFn func(context.Context, string) (net.Conn, error),
+	socket string,
+	timeout time.Duration,
+	l logger.DebugLogger,
+) (*boundedAgentClient, func(), error) {
+	if l == nil {
+		l = logger.NopLogger
+	}
+	if ctx == nil {
+		return nil, nil, fmt.Errorf("ssh-agent dial context is nil")
+	}
+	if socket == "" {
+		return nil, nil, ErrAgentNotAvailable
+	}
+	opTimeout := timeout
+	if opTimeout <= 0 {
+		opTimeout = defaultSSHHandshakeTimeout
+	}
+
+	dialCtx, dialCancel := context.WithTimeout(ctx, opTimeout)
+	var stopDialLife func() bool
+	if lifecycleCtx != nil && lifecycleCtx != ctx {
+		stopDialLife = context.AfterFunc(lifecycleCtx, dialCancel)
+	}
+	conn, err := dialAgentConn(dialCtx, dialFn, socket)
+	if stopDialLife != nil {
+		stopDialLife()
+	}
+	dialCancel()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	b := &boundedAgentClient{
+		conn:         conn,
+		raw:          agent.NewClient(conn),
+		ctx:          ctx,
+		lifecycleCtx: lifecycleCtx,
+		opTimeout:    opTimeout,
+	}
+	b.stopCtx = context.AfterFunc(ctx, func() { _ = b.closeConn() })
+	if lifecycleCtx != nil && lifecycleCtx != ctx {
+		b.stopLife = context.AfterFunc(lifecycleCtx, func() { _ = b.closeConn() })
+	}
+
+	var cleanupOnce sync.Once
+	cleanup := func() {
+		cleanupOnce.Do(func() {
+			if b.stopCtx != nil {
+				b.stopCtx()
+			}
+			if b.stopLife != nil {
+				b.stopLife()
+			}
+			b.closeOnce.Do(func() {
+				debugCloseResource(l, conn, "ssh agent connection")
+			})
+		})
+	}
+	return b, cleanup, nil
+}
+
+func (b *boundedAgentClient) closeConn() error {
+	b.closeOnce.Do(func() {
+		b.closeErr = b.conn.Close()
+	})
+	return b.closeErr
+}
+
+func (b *boundedAgentClient) contextErr() error {
+	if b.ctx != nil {
+		if err := context.Cause(b.ctx); err != nil {
+			return err
+		}
+	}
+	if b.lifecycleCtx != nil && b.lifecycleCtx != b.ctx {
+		if err := context.Cause(b.lifecycleCtx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func runBoundedAgentOp[T any](b *boundedAgentClient, op string, fn func() (T, error)) (T, error) {
+	var zero T
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if err := b.contextErr(); err != nil {
+		return zero, err
+	}
+	if err := b.conn.SetDeadline(time.Now().Add(b.opTimeout)); err != nil && !isIgnorableDeadlineError(err) {
+		return zero, fmt.Errorf("set ssh-agent %s deadline: %w", op, err)
+	}
+	watchdog := time.AfterFunc(b.opTimeout, func() {
+		b.timedOut.Store(true)
+		_ = b.closeConn()
+	})
+	res, err := fn()
+	stopped := watchdog.Stop()
+	if stopped && err == nil {
+		if clearErr := b.conn.SetDeadline(time.Time{}); clearErr != nil && !isIgnorableDeadlineError(clearErr) {
+			return zero, fmt.Errorf("clear ssh-agent %s deadline: %w", op, clearErr)
+		}
+		return res, nil
+	}
+	if ctxErr := b.contextErr(); ctxErr != nil {
+		return zero, fmt.Errorf("ssh-agent %s canceled: %w", op, errors.Join(err, ctxErr))
+	}
+	if b.timedOut.Load() || errors.Is(err, os.ErrDeadlineExceeded) {
+		return zero, fmt.Errorf("ssh-agent %s timed out after %s: %w", op, b.opTimeout, errors.Join(err, context.DeadlineExceeded))
+	}
+	return zero, err
+}
+
+func (b *boundedAgentClient) List() ([]*agent.Key, error) {
+	return runBoundedAgentOp(b, "list", b.raw.List)
+}
+
+func (b *boundedAgentClient) Signers() ([]ssh.Signer, error) {
+	signers, err := runBoundedAgentOp(b, "signers", b.raw.Signers)
+	if err != nil {
+		return nil, err
+	}
+	wrapped := make([]ssh.Signer, 0, len(signers))
+	for _, s := range signers {
+		if s == nil {
+			continue
+		}
+		wrapped = append(wrapped, &boundedAgentSigner{
+			client: b,
+			inner:  s,
+			pub:    s.PublicKey(),
+		})
+	}
+	return wrapped, nil
+}
+
+type boundedAgentSigner struct {
+	client *boundedAgentClient
+	inner  ssh.Signer
+	pub    ssh.PublicKey
+}
+
+var _ ssh.AlgorithmSigner = (*boundedAgentSigner)(nil)
+
+func (s *boundedAgentSigner) PublicKey() ssh.PublicKey {
+	return s.pub
+}
+
+func (s *boundedAgentSigner) Sign(rand io.Reader, data []byte) (*ssh.Signature, error) {
+	return runBoundedAgentOp(s.client, "sign", func() (*ssh.Signature, error) {
+		return s.inner.Sign(rand, data)
+	})
+}
+
+func (s *boundedAgentSigner) SignWithAlgorithm(rand io.Reader, data []byte, algorithm string) (*ssh.Signature, error) {
+	return runBoundedAgentOp(s.client, "sign", func() (*ssh.Signature, error) {
+		if algoSigner, ok := s.inner.(ssh.AlgorithmSigner); ok {
+			return algoSigner.SignWithAlgorithm(rand, data, algorithm)
+		}
+		return s.inner.Sign(rand, data)
+	})
+}
+
+// offeredPubKeyTracker deduplicates ssh-agent and default-key signers whose
+// public key has already been offered by an earlier explicit candidate.
+type offeredPubKeyTracker struct {
+	mu           sync.Mutex
+	staticPubs   map[string]struct{}
+	lazySigners  map[string][]*lazySigner
+	agentOffered map[string]struct{}
+}
+
+func newOfferedPubKeyTracker() *offeredPubKeyTracker {
+	return &offeredPubKeyTracker{
+		staticPubs:   make(map[string]struct{}),
+		lazySigners:  make(map[string][]*lazySigner),
+		agentOffered: make(map[string]struct{}),
+	}
+}
+
+func (t *offeredPubKeyTracker) recordStatic(pub ssh.PublicKey) {
+	if t == nil || pub == nil {
+		return
+	}
+	raw := string(pub.Marshal())
+	t.mu.Lock()
+	t.staticPubs[raw] = struct{}{}
+	t.mu.Unlock()
+}
+
+func (t *offeredPubKeyTracker) recordLazy(ls *lazySigner) {
+	if t == nil || ls == nil || ls.pubKey == nil {
+		return
+	}
+	raw := string(ls.pubKey.Marshal())
+	t.mu.Lock()
+	t.lazySigners[raw] = append(t.lazySigners[raw], ls)
+	t.mu.Unlock()
+}
+
+func (t *offeredPubKeyTracker) wasOfferedBeforeAgent(pubRaw string) bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, ok := t.staticPubs[pubRaw]; ok {
+		return true
+	}
+	for _, ls := range t.lazySigners[pubRaw] {
+		// If decryption was never attempted (server rejected PK_OK probe) or
+		// decryption succeeded, the public key has already been evaluated by
+		// the server. Only when local decryption failed (e.g. BatchMode with
+		// key unlocked in ssh-agent) should ssh-agent still try signing with it.
+		if !ls.decryptFailed.Load() {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *offeredPubKeyTracker) wasOfferedByAgentOrStatic(pubRaw string) bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, ok := t.staticPubs[pubRaw]; ok {
+		return true
+	}
+	if _, ok := t.agentOffered[pubRaw]; ok {
+		return true
+	}
+	for _, ls := range t.lazySigners[pubRaw] {
+		if !ls.decryptFailed.Load() {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *offeredPubKeyTracker) filterAgentSigners(signersFn func() ([]ssh.Signer, error)) func() ([]ssh.Signer, error) {
+	return func() ([]ssh.Signer, error) {
+		signers, err := signersFn()
+		if err != nil {
+			return nil, err
+		}
+		filtered := make([]ssh.Signer, 0, len(signers))
+		seenInAgent := make(map[string]struct{}, len(signers))
+		for _, s := range signers {
+			if s == nil {
+				continue
+			}
+			pubRaw := string(s.PublicKey().Marshal())
+			if _, dup := seenInAgent[pubRaw]; dup {
+				continue
+			}
+			seenInAgent[pubRaw] = struct{}{}
+			if t.wasOfferedBeforeAgent(pubRaw) {
+				continue
+			}
+			if t != nil {
+				t.mu.Lock()
+				t.agentOffered[pubRaw] = struct{}{}
+				t.mu.Unlock()
+			}
+			filtered = append(filtered, s)
+		}
+		return filtered, nil
+	}
+}
+
 // ResolveIdentityAgent resolves an OpenSSH IdentityAgent specification against env and target.
 //   - "none" (case-insensitive) returns ("", true, nil), disabling SSH agent authentication completely.
 //   - "" or "SSH_AUTH_SOCK" returns (strings.TrimSpace(env.AgentSocket), false, nil).
@@ -294,6 +590,7 @@ type lazySigner struct {
 	prompter           SecretPrompter
 	passphraseCallback func(string, string)
 	decryptedSigner    ssh.Signer
+	decryptFailed      atomic.Bool
 	logger             logger.DebugLogger
 	mu                 sync.RWMutex
 }
@@ -336,8 +633,10 @@ func (s *lazySigner) getDecryptedSigner() (ssh.Signer, error) {
 	}
 	decSigner, passphrase, err := provider.decryptPrivateKey(s.keyData, s.keyPath)
 	if err != nil {
+		s.decryptFailed.Store(true)
 		return nil, err
 	}
+	s.decryptFailed.Store(false)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.decryptedSigner != nil {
@@ -448,6 +747,8 @@ func resolveKeySigners(
 	hasExplicitCerts bool,
 	secProvider *autoSecretProvider,
 	passphraseCallback func(string, string),
+	tracker *offeredPubKeyTracker,
+	postAgent bool,
 	l logger.DebugLogger,
 ) ([]certAuthCandidateMethod, ssh.AuthMethod, error) {
 	if l == nil {
@@ -460,7 +761,19 @@ func resolveKeySigners(
 
 	signer, err := ssh.ParsePrivateKey(keyData)
 	if err == nil {
-		certMethods := buildKeyCertCandidateMethods(keyPath, signer.PublicKey(), signer, explicitCerts, hasExplicitCerts, l)
+		pub := signer.PublicKey()
+		pubRaw := string(pub.Marshal())
+		certMethods := buildKeyCertCandidateMethods(keyPath, pub, signer, explicitCerts, hasExplicitCerts, l)
+		if postAgent && tracker != nil {
+			return certMethods, ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
+				if tracker.wasOfferedByAgentOrStatic(pubRaw) {
+					return nil, nil
+				}
+				tracker.recordStatic(pub)
+				return []ssh.Signer{signer}, nil
+			}), nil
+		}
+		tracker.recordStatic(pub)
 		return certMethods, ssh.PublicKeys(signer), nil
 	}
 
@@ -475,7 +788,18 @@ func resolveKeySigners(
 			passphraseCallback: passphraseCallback,
 			logger:             l,
 		}
+		pubRaw := string(pubKey.Marshal())
 		certMethods := buildKeyCertCandidateMethods(keyPath, pubKey, lazy, explicitCerts, hasExplicitCerts, l)
+		if postAgent && tracker != nil {
+			return certMethods, ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
+				if tracker.wasOfferedByAgentOrStatic(pubRaw) {
+					return nil, nil
+				}
+				tracker.recordLazy(lazy)
+				return []ssh.Signer{lazy}, nil
+			}), nil
+		}
+		tracker.recordLazy(lazy)
 		return certMethods, ssh.PublicKeys(lazy), nil
 	}
 
@@ -495,6 +819,10 @@ func resolveKeySigners(
 			if passphraseCallback != nil {
 				passphraseCallback(keyPathCopy, passphrase)
 			}
+			if postAgent && tracker != nil && tracker.wasOfferedByAgentOrStatic(string(resolvedSigner.PublicKey().Marshal())) {
+				return nil, nil
+			}
+			tracker.recordStatic(resolvedSigner.PublicKey())
 			return []ssh.Signer{resolvedSigner}, nil
 		}), nil
 	}
@@ -562,7 +890,7 @@ func extractUnencryptedPublicKey(
 // resolveKeyAuthMethod 将单个私钥路径解析为一个独立的 publickey 认证候选。
 // 对能够免密获得公钥的加密私钥继续使用 lazySigner，仅在服务器接受公钥后才请求 passphrase。
 func resolveKeyAuthMethod(keyPath string, secProvider *autoSecretProvider, passphraseCallback func(string, string), l logger.DebugLogger) (ssh.AuthMethod, error) {
-	_, plainMethod, err := resolveKeySigners(keyPath, nil, true, secProvider, passphraseCallback, l)
+	_, plainMethod, err := resolveKeySigners(keyPath, nil, true, secProvider, passphraseCallback, nil, false, l)
 	return plainMethod, err
 }
 
@@ -589,6 +917,7 @@ type AutoAuthOptions struct {
 	KeyPath                   string
 	KeyPaths                  []string
 	FirstCertMethods          []ssh.AuthMethod
+	FirstPublicKeys           []ssh.PublicKey
 	PasswordCallback          func(string)
 	PassphraseCallback        func(keyPath, passphrase string)
 	CandidateRejectedCallback func(protocol string)
@@ -953,23 +1282,28 @@ func effectiveAutoAuthAgentSocket(opts AutoAuthOptions, target TargetContext, l 
 
 func dialAgentSignersByPubKey(
 	ctx context.Context,
+	lifecycleCtx context.Context,
 	dialFn func(context.Context, string) (net.Conn, error),
 	socket string,
+	timeout time.Duration,
 	l logger.DebugLogger,
 ) (map[string]ssh.Signer, func()) {
+	if l == nil {
+		l = logger.NopLogger
+	}
 	if socket == "" {
 		return nil, nil
 	}
-	conn, err := dialAgentConn(ctx, dialFn, socket)
+	agentClient, cleanup, err := dialBoundedAgentClient(ctx, lifecycleCtx, dialFn, socket, timeout, l)
 	if err != nil {
 		l.Debugf("connect to ssh-agent failed: %v", err)
 		return nil, nil
 	}
-	cleanup := func() { debugCloseResource(l, conn, "ssh agent connection") }
-	signers, signersErr := agent.NewClient(conn).Signers()
+	signers, signersErr := agentClient.Signers()
 	if signersErr != nil {
 		l.Debugf("list ssh-agent signers failed: %v", signersErr)
-		return nil, cleanup
+		cleanup()
+		return nil, nil
 	}
 	agentByPub := make(map[string]ssh.Signer, len(signers))
 	for _, s := range signers {
@@ -1008,15 +1342,24 @@ func appendExpandedKeyAndCertCandidates(
 	secProvider *autoSecretProvider,
 	passphraseCallback func(string, string),
 	rejectPublicKey func(),
+	tracker *offeredPubKeyTracker,
+	postAgent bool,
 	l logger.DebugLogger,
-) {
+) bool {
 	if keyPath == "" {
-		return
+		return false
 	}
 	if _, seen := seenKeyPaths[keyPath]; seen {
-		return
+		return false
 	}
 	seenKeyPaths[keyPath] = struct{}{}
+
+	if postAgent && tracker != nil {
+		if pub := extractIdentityPublicKey(keyPath); pub != nil && tracker.wasOfferedBeforeAgent(string(pub.Marshal())) {
+			l.Debugf("Skipping duplicate SSH key already offered earlier: %s", keyPath)
+			return false
+		}
+	}
 
 	l.Debugf("Checking SSH key: %s", keyPath)
 	if _, err := os.Stat(keyPath); err != nil {
@@ -1025,13 +1368,13 @@ func appendExpandedKeyAndCertCandidates(
 		} else {
 			l.Debugf("Failed to stat key: %s, error: %v", keyPath, err)
 		}
-		return
+		return false
 	}
 
-	certMethods, plainMethod, err := resolveKeySigners(keyPath, explicitCerts, hasExplicitCerts, secProvider, passphraseCallback, l)
+	certMethods, plainMethod, err := resolveKeySigners(keyPath, explicitCerts, hasExplicitCerts, secProvider, passphraseCallback, tracker, postAgent, l)
 	if err != nil {
 		l.Debugf("Failed to resolve key: %s, error: %v", keyPath, err)
-		return
+		return false
 	}
 
 	for _, cm := range certMethods {
@@ -1051,6 +1394,55 @@ func appendExpandedKeyAndCertCandidates(
 		method:     plainMethod,
 		onRejected: rejectPublicKey,
 	})
+	return true
+}
+
+func appendAgentMatchedKeyPath(
+	certCandidates *[]autoAuthCandidate,
+	plainCandidates *[]autoAuthCandidate,
+	pairedCertPaths map[string]struct{},
+	agentByPub map[string]ssh.Signer,
+	keyPath string,
+	label string,
+	explicitCerts []loadedUserCert,
+	hasExplicitCerts bool,
+	rejectPublicKey func(),
+	tracker *offeredPubKeyTracker,
+	l logger.DebugLogger,
+) bool {
+	if len(agentByPub) == 0 {
+		return false
+	}
+	pub := extractIdentityPublicKey(keyPath)
+	if pub == nil {
+		return false
+	}
+	signer, ok := agentByPub[string(pub.Marshal())]
+	if !ok {
+		return false
+	}
+	matched := matchCertsForKey(keyPath, pub, explicitCerts, hasExplicitCerts, l)
+	for _, mc := range matched {
+		if cs, csErr := newWrappedCertSigner(mc.cert, signer); csErr == nil {
+			if pairedCertPaths != nil {
+				pairedCertPaths[mc.path] = struct{}{}
+			}
+			*certCandidates = append(*certCandidates, autoAuthCandidate{
+				protocol:   autoAuthProtocolPublicKey,
+				label:      label + " (ssh-agent cert): " + mc.path,
+				method:     ssh.PublicKeys(cs),
+				onRejected: rejectPublicKey,
+			})
+		}
+	}
+	tracker.recordStatic(pub)
+	*plainCandidates = append(*plainCandidates, autoAuthCandidate{
+		protocol:   autoAuthProtocolPublicKey,
+		label:      label + " (ssh-agent): " + keyPath,
+		method:     ssh.PublicKeys(signer),
+		onRejected: rejectPublicKey,
+	})
+	return true
 }
 
 func buildAutoPubkeyCandidates(
@@ -1065,6 +1457,10 @@ func buildAutoPubkeyCandidates(
 	var certCandidates []autoAuthCandidate
 	var plainCandidates []autoAuthCandidate
 	var cleanup func()
+	tracker := newOfferedPubKeyTracker()
+	for _, pub := range opts.FirstPublicKeys {
+		tracker.recordStatic(pub)
+	}
 	for _, method := range opts.FirstCertMethods {
 		certCandidates = append(certCandidates, autoAuthCandidate{
 			protocol:   autoAuthProtocolPublicKey,
@@ -1126,69 +1522,125 @@ func buildAutoPubkeyCandidates(
 			seenKeyPaths,
 			secProvider,
 			rejectPublicKey,
+			tracker,
 			l,
 		)
 	}
 
+	var unresolvedExplicitPaths []string
 	// 显式身份必须优先于任何自动发现来源。
 	for _, keyPath := range explicitPaths {
-		appendExpandedKeyAndCertCandidates(
+		if !appendExpandedKeyAndCertCandidates(
 			&certCandidates, &plainCandidates, pairedCertPaths, seenKeyPaths,
 			keyPath, "explicit key", explicitCerts, hasExplicitCerts,
-			secProvider, opts.PassphraseCallback, rejectPublicKey, l,
-		)
+			secProvider, opts.PassphraseCallback, rejectPublicKey, tracker, false, l,
+		) {
+			unresolvedExplicitPaths = append(unresolvedExplicitPaths, keyPath)
+		}
 	}
 
+	hasAgent := false
 	if !agentDisabled && agentSocket != "" {
-		conn, err := dialAgentConn(ctx, dialAgentFn, agentSocket)
-		if err == nil {
-			agentClient := agent.NewClient(conn)
-			if len(explicitCerts) > 0 {
-				if signers, signersErr := agentClient.Signers(); signersErr == nil {
-					agentByPub := make(map[string]ssh.Signer, len(signers))
-					for _, s := range signers {
-						pubRaw := string(s.PublicKey().Marshal())
-						if _, exists := agentByPub[pubRaw]; !exists {
-							agentByPub[pubRaw] = s
-						}
-					}
-					for _, ec := range explicitCerts {
-						if _, already := pairedCertPaths[ec.path]; already {
-							continue
-						}
-						if s, ok := agentByPub[ec.keyRaw]; ok {
-							if cs, csErr := newWrappedCertSigner(ec.cert, s); csErr == nil {
-								pairedCertPaths[ec.path] = struct{}{}
-								certCandidates = append(certCandidates, autoAuthCandidate{
-									protocol:   autoAuthProtocolPublicKey,
-									label:      "ssh-agent (cert): " + ec.path,
-									method:     ssh.PublicKeys(cs),
-									onRejected: rejectPublicKey,
-								})
-							}
-						}
-					}
-				}
-			}
-			plainCandidates = append(plainCandidates, autoAuthCandidate{
-				protocol: autoAuthProtocolPublicKey,
-				label:    "ssh-agent",
-				method:   ssh.PublicKeysCallback(agentClient.Signers),
-			})
-			cleanup = func() { debugCloseResource(l, conn, "ssh agent connection") }
-		} else {
-			l.Debugf("connect to ssh-agent failed: %v", err)
-		}
+		hasAgent, cleanup = appendAutoAgentCandidates(
+			ctx, opts.LifecycleCtx, dialAgentFn, agentSocket, opts.HandshakeTimeout,
+			unresolvedExplicitPaths, explicitCerts, hasExplicitCerts,
+			pairedCertPaths, rejectPublicKey, tracker, &certCandidates, &plainCandidates, l,
+		)
 	}
 
 	for _, keyPath := range expandDefaultIdentityPaths(opts, target, l) {
 		appendExpandedKeyAndCertCandidates(
 			&certCandidates, &plainCandidates, pairedCertPaths, seenKeyPaths,
 			keyPath, "default key", explicitCerts, hasExplicitCerts,
-			secProvider, opts.PassphraseCallback, rejectPublicKey, l,
+			secProvider, opts.PassphraseCallback, rejectPublicKey, tracker, hasAgent, l,
 		)
 	}
 	return append(certCandidates, plainCandidates...), cleanup
+}
+
+func appendAutoAgentCandidates(
+	ctx context.Context,
+	lifecycleCtx context.Context,
+	dialAgentFn func(context.Context, string) (net.Conn, error),
+	agentSocket string,
+	timeout time.Duration,
+	unresolvedExplicitPaths []string,
+	explicitCerts []loadedUserCert,
+	hasExplicitCerts bool,
+	pairedCertPaths map[string]struct{},
+	rejectPublicKey func(),
+	tracker *offeredPubKeyTracker,
+	certCandidates *[]autoAuthCandidate,
+	plainCandidates *[]autoAuthCandidate,
+	l logger.DebugLogger,
+) (bool, func()) {
+	agentClient, agentCleanup, err := dialBoundedAgentClient(ctx, lifecycleCtx, dialAgentFn, agentSocket, timeout, l)
+	if err != nil {
+		l.Debugf("connect to ssh-agent failed: %v", err)
+		return false, nil
+	}
+	pairExplicitPathsAndCertsWithAgent(
+		agentClient, unresolvedExplicitPaths, explicitCerts, hasExplicitCerts,
+		pairedCertPaths, rejectPublicKey, tracker, certCandidates, plainCandidates, l,
+	)
+	*plainCandidates = append(*plainCandidates, autoAuthCandidate{
+		protocol: autoAuthProtocolPublicKey,
+		label:    "ssh-agent",
+		method:   ssh.PublicKeysCallback(tracker.filterAgentSigners(agentClient.Signers)),
+	})
+	return true, agentCleanup
+}
+
+func pairExplicitPathsAndCertsWithAgent(
+	agentClient *boundedAgentClient,
+	unresolvedExplicitPaths []string,
+	explicitCerts []loadedUserCert,
+	hasExplicitCerts bool,
+	pairedCertPaths map[string]struct{},
+	rejectPublicKey func(),
+	tracker *offeredPubKeyTracker,
+	certCandidates *[]autoAuthCandidate,
+	plainCandidates *[]autoAuthCandidate,
+	l logger.DebugLogger,
+) {
+	if len(explicitCerts) == 0 && len(unresolvedExplicitPaths) == 0 {
+		return
+	}
+	signers, signersErr := agentClient.Signers()
+	if signersErr != nil {
+		l.Debugf("list ssh-agent signers failed: %v", signersErr)
+		return
+	}
+	agentByPub := make(map[string]ssh.Signer, len(signers))
+	for _, s := range signers {
+		pubRaw := string(s.PublicKey().Marshal())
+		if _, exists := agentByPub[pubRaw]; !exists {
+			agentByPub[pubRaw] = s
+		}
+	}
+	for _, keyPath := range unresolvedExplicitPaths {
+		appendAgentMatchedKeyPath(
+			certCandidates, plainCandidates, pairedCertPaths, agentByPub,
+			keyPath, "explicit key", explicitCerts, hasExplicitCerts,
+			rejectPublicKey, tracker, l,
+		)
+	}
+	for _, ec := range explicitCerts {
+		if _, already := pairedCertPaths[ec.path]; already {
+			continue
+		}
+		if s, ok := agentByPub[ec.keyRaw]; ok {
+			if cs, csErr := newWrappedCertSigner(ec.cert, s); csErr == nil {
+				pairedCertPaths[ec.path] = struct{}{}
+				*certCandidates = append(*certCandidates, autoAuthCandidate{
+					protocol:   autoAuthProtocolPublicKey,
+					label:      "ssh-agent (cert): " + ec.path,
+					method:     ssh.PublicKeys(cs),
+					onRejected: rejectPublicKey,
+				})
+			}
+		}
+	}
 }
 
 func buildIdentitiesOnlyPubkeyCandidates(
@@ -1208,6 +1660,7 @@ func buildIdentitiesOnlyPubkeyCandidates(
 	seenKeyPaths map[string]struct{},
 	secProvider *autoSecretProvider,
 	rejectPublicKey func(),
+	tracker *offeredPubKeyTracker,
 	l logger.DebugLogger,
 ) ([]autoAuthCandidate, func()) {
 	candidatePaths := explicitPaths
@@ -1220,40 +1673,25 @@ func buildIdentitiesOnlyPubkeyCandidates(
 	var agentByPub map[string]ssh.Signer
 	var cleanup func()
 	if !agentDisabled && agentSocket != "" && (len(candidatePaths) > 0 || len(explicitCerts) > 0) {
-		agentByPub, cleanup = dialAgentSignersByPubKey(ctx, dialAgentFn, agentSocket, l)
+		agentByPub, cleanup = dialAgentSignersByPubKey(ctx, opts.LifecycleCtx, dialAgentFn, agentSocket, opts.HandshakeTimeout, l)
 	}
 
 	for _, keyPath := range candidatePaths {
-		if pub := extractIdentityPublicKey(keyPath); len(agentByPub) > 0 && pub != nil {
-			if signer, ok := agentByPub[string(pub.Marshal())]; ok {
-				if _, seen := seenKeyPaths[keyPath]; !seen {
-					seenKeyPaths[keyPath] = struct{}{}
-					matched := matchCertsForKey(keyPath, pub, explicitCerts, hasExplicitCerts, l)
-					for _, mc := range matched {
-						if cs, csErr := newWrappedCertSigner(mc.cert, signer); csErr == nil {
-							pairedCertPaths[mc.path] = struct{}{}
-							certCandidates = append(certCandidates, autoAuthCandidate{
-								protocol:   autoAuthProtocolPublicKey,
-								label:      candidateLabel + " (ssh-agent cert): " + mc.path,
-								method:     ssh.PublicKeys(cs),
-								onRejected: rejectPublicKey,
-							})
-						}
-					}
-					plainCandidates = append(plainCandidates, autoAuthCandidate{
-						protocol:   autoAuthProtocolPublicKey,
-						label:      candidateLabel + " (ssh-agent): " + keyPath,
-						method:     ssh.PublicKeys(signer),
-						onRejected: rejectPublicKey,
-					})
-				}
-				continue
-			}
+		if _, seen := seenKeyPaths[keyPath]; seen {
+			continue
+		}
+		if appendAgentMatchedKeyPath(
+			&certCandidates, &plainCandidates, pairedCertPaths, agentByPub,
+			keyPath, candidateLabel, explicitCerts, hasExplicitCerts,
+			rejectPublicKey, tracker, l,
+		) {
+			seenKeyPaths[keyPath] = struct{}{}
+			continue
 		}
 		appendExpandedKeyAndCertCandidates(
 			&certCandidates, &plainCandidates, pairedCertPaths, seenKeyPaths,
 			keyPath, candidateLabel, explicitCerts, hasExplicitCerts,
-			secProvider, opts.PassphraseCallback, rejectPublicKey, l,
+			secProvider, opts.PassphraseCallback, rejectPublicKey, tracker, false, l,
 		)
 	}
 

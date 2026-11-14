@@ -97,7 +97,7 @@ func (m logSelectModel) scanLogs() tea.Cmd {
 		// Include docker logs if docker exists
 		cmd += `; if command -v docker >/dev/null 2>&1; then docker ps --format 'docker:{{.Names}}' 2>/dev/null; fi`
 
-		out, err := m.client.RunWithoutLogin(ctx, cmd)
+		out, err := m.client.RunProbeWithoutLogin(ctx, cmd)
 		if err != nil {
 			return logScanResultMsg{err: err}
 		}

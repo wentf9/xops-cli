@@ -217,8 +217,15 @@ func interruptSSHTransport(root net.Conn, client *ssh.Client) error {
 }
 
 func (c *Client) Close() error {
+	if c == nil {
+		return nil
+	}
+	var closeErr error
+	if c.sshClient != nil {
+		closeErr = closeResource(c.sshClient, "SSH transport")
+	}
 	c.releaseAllAgentLeases()
-	return closeResource(c.sshClient, "SSH transport")
+	return closeErr
 }
 
 // Config returns a snapshot of the node configuration. Mutating the returned
@@ -494,6 +501,12 @@ func (c *Client) Run(ctx context.Context, cmd string, opts ...RunOption) (string
 // RunWithoutLogin 执行命令并在非登录 Shell 中运行，避免加载 profile 脚本产生干扰输出
 func (c *Client) RunWithoutLogin(ctx context.Context, cmd string) (string, error) {
 	return c.runWithoutLoginWithConfig(ctx, cmd, c.defaultRunConfig(), true)
+}
+
+// RunProbeWithoutLogin executes a background probe or inspection command in a
+// non-login shell without forwarding ssh-agent or sending user session env vars.
+func (c *Client) RunProbeWithoutLogin(ctx context.Context, cmd string) (string, error) {
+	return c.runWithoutLoginWithConfig(ctx, cmd, c.defaultRunConfig(), false)
 }
 
 func (c *Client) runWithoutLoginWithConfig(ctx context.Context, cmd string, config *RunConfig, sendSessionEnv bool) (string, error) {

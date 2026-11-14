@@ -313,10 +313,6 @@ func validateTargetCompatibility(cur ConnectionConfig, newCfg *ClientConfig) err
 	if newCfg.KeyRef != cur.KeyRef || newCfg.TrustVersion != cur.TrustVersion {
 		return fmt.Errorf("%w: key reference or host trust version changed", ErrSnapshotMismatch)
 	}
-	if cur.Options.StrictHostKeyChecking() != newCfg.Options.StrictHostKeyChecking() ||
-		cur.Options.UserKnownHostsFile() != newCfg.Options.UserKnownHostsFile() {
-		return fmt.Errorf("%w: host trust options changed", ErrSnapshotMismatch)
-	}
 	if newCfg.KeyPath != cur.KeyPath {
 		return fmt.Errorf("%w: key path changed (expected %q, got %q)",
 			ErrSnapshotMismatch, cur.KeyPath, newCfg.KeyPath)
@@ -325,14 +321,44 @@ func validateTargetCompatibility(cur ConnectionConfig, newCfg *ClientConfig) err
 		return fmt.Errorf("%w: key paths changed (expected %v, got %v)",
 			ErrSnapshotMismatch, cur.KeyPaths, newCfg.KeyPaths)
 	}
-	if !slices.Equal(newCfg.Options.IdentityFiles(), cur.Options.IdentityFiles()) {
-		return fmt.Errorf("%w: identity files changed", ErrSnapshotMismatch)
-	}
-	if newCfg.Options.AddressFamily() != cur.Options.AddressFamily() {
-		return fmt.Errorf("%w: address family changed (expected %q, got %q)",
-			ErrSnapshotMismatch, cur.Options.AddressFamily(), newCfg.Options.AddressFamily())
+	if err := validateOptionsTargetCompatibility(cur.Options, newCfg.Options); err != nil {
+		return err
 	}
 	return validateRoutingTargetCompatibility(cur, newCfg)
+}
+
+func validateOptionsTargetCompatibility(curOpts, newOpts *Options) error {
+	if curOpts.StrictHostKeyChecking() != newOpts.StrictHostKeyChecking() ||
+		curOpts.UserKnownHostsFile() != newOpts.UserKnownHostsFile() ||
+		curOpts.GlobalKnownHostsFile() != newOpts.GlobalKnownHostsFile() ||
+		curOpts.VerifyHostKeyDNS() != newOpts.VerifyHostKeyDNS() ||
+		curOpts.HashKnownHosts() != newOpts.HashKnownHosts() {
+		return fmt.Errorf("%w: host trust options changed", ErrSnapshotMismatch)
+	}
+	if !slices.Equal(newOpts.IdentityFiles(), curOpts.IdentityFiles()) {
+		return fmt.Errorf("%w: identity files changed", ErrSnapshotMismatch)
+	}
+	if !slices.Equal(newOpts.CertificateFiles(), curOpts.CertificateFiles()) {
+		return fmt.Errorf("%w: certificate files changed", ErrSnapshotMismatch)
+	}
+	curPub, curPubOK := curOpts.PubkeyAuthentication()
+	newPub, newPubOK := newOpts.PubkeyAuthentication()
+	if curOpts.IdentityAgent() != newOpts.IdentityAgent() ||
+		curOpts.IdentitiesOnly() != newOpts.IdentitiesOnly() ||
+		curPub != newPub || curPubOK != newPubOK {
+		return fmt.Errorf("%w: publickey or agent authentication options changed", ErrSnapshotMismatch)
+	}
+	if curOpts.Ciphers() != newOpts.Ciphers() ||
+		curOpts.MACs() != newOpts.MACs() ||
+		curOpts.KexAlgorithms() != newOpts.KexAlgorithms() ||
+		curOpts.HostKeyAlgorithms() != newOpts.HostKeyAlgorithms() {
+		return fmt.Errorf("%w: transport algorithm options changed", ErrSnapshotMismatch)
+	}
+	if newOpts.AddressFamily() != curOpts.AddressFamily() {
+		return fmt.Errorf("%w: address family changed (expected %q, got %q)",
+			ErrSnapshotMismatch, curOpts.AddressFamily(), newOpts.AddressFamily())
+	}
+	return nil
 }
 
 func validateRoutingTargetCompatibility(cur ConnectionConfig, newCfg *ClientConfig) error {

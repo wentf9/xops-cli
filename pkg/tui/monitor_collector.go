@@ -134,7 +134,7 @@ func (mc *MetricsCollector) Start(ctx context.Context) error {
 	}
 
 	// 发送探针前，先探测系统平台
-	osName, err := mc.client.RunWithoutLogin(derivedCtx, "uname -s")
+	osName, err := mc.client.RunProbeWithoutLogin(derivedCtx, "uname -s")
 	if err != nil {
 		mc.finishStart(generation, cancel)
 		return fmt.Errorf("failed to detect OS platform: %w", err)

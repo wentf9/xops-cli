@@ -394,6 +394,7 @@ func TestPhase4_VerifyHostKeyDNSFailClosedMatrix(t *testing.T) {
 	cases := []tc{
 		{name: "conflict beats verified DNS", strict: "ask", dns: "yes", conflict: true, result: verified, wantErr: ErrHostKeyMismatch, wantNoLookup: true},
 		{name: "strict yes beats verified DNS", strict: "yes", dns: "yes", result: verified, wantErr: ErrHostKeyMismatch, wantNoLookup: true},
+		{name: "strict no opts out of SSHFP lookup even on mismatch", strict: "no", dns: "yes", result: mismatch, wantWritten: true, wantNoLookup: true},
 		{name: "ask + verified + dns yes accepts without prompt or write", strict: "ask", dns: "yes", result: verified},
 		{name: "ask + batch + verified + dns yes accepts", strict: "ask", dns: "yes", batch: true, result: verified},
 		{name: "accept-new + verified writes", strict: "accept-new", dns: "yes", result: verified, wantWritten: true},

@@ -5,6 +5,7 @@ package ssh
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -257,8 +258,8 @@ func assertPhase2PTYShellEscapes(t *testing.T, ctx context.Context, fix *phase2P
 	}
 	select {
 	case shellErr := <-done:
-		if shellErr != nil {
-			t.Fatalf("ShellWithIO after ~. returned error %v, want nil", shellErr)
+		if !errors.Is(shellErr, ErrEscapeDisconnect) {
+			t.Fatalf("ShellWithIO after ~. returned error %v, want ErrEscapeDisconnect", shellErr)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("ShellWithIO did not terminate on ~.")

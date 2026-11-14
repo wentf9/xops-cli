@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,9 +18,13 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const maxMCPCertBindingBytes = 256 * 1024
+
 type certificateFileBinding struct {
 	Path        string
 	Missing     bool
+	NonRegular  bool
+	Truncated   bool
 	RawSHA256   string
 	CertType    uint32
 	Serial      uint64
@@ -133,7 +138,37 @@ func expandMCPBindingPath(raw string, env ssh.Environment, target ssh.TargetCont
 }
 
 func inspectCertificateBinding(certPath string, includeMissing bool) (certificateFileBinding, bool) {
-	data, err := os.ReadFile(certPath)
+	info, err := os.Lstat(certPath)
+	if err != nil {
+		if includeMissing {
+			return certificateFileBinding{Path: certPath, Missing: true}, true
+		}
+		return certificateFileBinding{}, false
+	}
+	if !info.Mode().IsRegular() {
+		if includeMissing {
+			return certificateFileBinding{Path: certPath, NonRegular: true}, true
+		}
+		return certificateFileBinding{}, false
+	}
+	f, err := os.Open(certPath)
+	if err != nil {
+		if includeMissing {
+			return certificateFileBinding{Path: certPath, Missing: true}, true
+		}
+		return certificateFileBinding{}, false
+	}
+	defer func() { _ = f.Close() }()
+
+	fInfo, err := f.Stat()
+	if err != nil || !fInfo.Mode().IsRegular() {
+		if includeMissing {
+			return certificateFileBinding{Path: certPath, NonRegular: true}, true
+		}
+		return certificateFileBinding{}, false
+	}
+
+	data, err := io.ReadAll(io.LimitReader(f, maxMCPCertBindingBytes))
 	if err != nil {
 		if includeMissing {
 			return certificateFileBinding{Path: certPath, Missing: true}, true
@@ -143,6 +178,7 @@ func inspectCertificateBinding(certPath string, includeMissing bool) (certificat
 	rawSum := sha256.Sum256(data)
 	binding := certificateFileBinding{
 		Path:      certPath,
+		Truncated: fInfo.Size() > maxMCPCertBindingBytes,
 		RawSHA256: hex.EncodeToString(rawSum[:]),
 	}
 	if pub, _, _, _, parseErr := cryptoSSH.ParseAuthorizedKey(data); parseErr == nil {
@@ -160,14 +196,7 @@ func inspectCertificateBinding(certPath string, includeMissing bool) (certificat
 	return binding, true
 }
 
-func collectHopCertificateBindings(
-	env ssh.Environment,
-	hop ssh.ConnectionConfig,
-	identityKeyPath string,
-	identityFiles []string,
-	certificateFiles []string,
-	identitiesOnly bool,
-) []certificateFileBinding {
+func buildHopBindingTarget(env ssh.Environment, hop ssh.ConnectionConfig, identityKeyPath string) ssh.TargetContext {
 	port := hop.Port
 	if port <= 0 {
 		port = 22
@@ -176,13 +205,36 @@ func collectHopCertificateBindings(
 	if user == "" {
 		user = env.LocalUser
 	}
-	target := ssh.TargetContext{
+	originalHost := strings.TrimSpace(hop.OriginalHost)
+	if originalHost == "" {
+		originalHost = hop.NodeID
+	}
+	if cleanOrig, ok := config.OpenSSHOriginalHost(originalHost); ok {
+		originalHost = cleanOrig
+	}
+	keyPath := hop.KeyPath
+	if keyPath == "" {
+		keyPath = identityKeyPath
+	}
+	return ssh.TargetContext{
 		Host:         hop.Address,
 		Port:         port,
 		User:         user,
-		OriginalHost: hop.NodeID,
+		OriginalHost: originalHost,
 		JumpHost:     hop.ProxyJump,
+		KeyPath:      keyPath,
 	}
+}
+
+func collectHopCertificateBindings(
+	env ssh.Environment,
+	hop ssh.ConnectionConfig,
+	identityKeyPath string,
+	identityFiles []string,
+	certificateFiles []string,
+	identitiesOnly bool,
+) []certificateFileBinding {
+	target := buildHopBindingTarget(env, hop, identityKeyPath)
 
 	var bindings []certificateFileBinding
 	seen := make(map[string]struct{})

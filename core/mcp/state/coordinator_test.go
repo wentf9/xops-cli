@@ -114,6 +114,54 @@ func TestUpdateBarrierAndAdmissionVersionAreAtomic(t *testing.T) {
 	enter(t, c, ctx, admission(t, c, ctx, "a", ports.Execute))
 }
 
+func TestAuthClassOptionChangesRevokeActivePermitsWhileTransportEditsDoNot(t *testing.T) {
+	authOptionCases := []struct {
+		name string
+		key  string
+		val  string
+	}{
+		{name: "IdentitiesOnly", key: ssh.OptionIdentitiesOnly, val: "yes"},
+		{name: "PubkeyAuthentication", key: ssh.OptionPubkeyAuthentication, val: "no"},
+		{name: "PasswordAuthentication", key: ssh.OptionPasswordAuthentication, val: "no"},
+		{name: "KbdInteractiveAuthentication", key: ssh.OptionKbdInteractiveAuthentication, val: "no"},
+		{name: "PreferredAuthentications", key: ssh.OptionPreferredAuthentications, val: "publickey"},
+		{name: "BatchMode", key: ssh.OptionBatchMode, val: "yes"},
+		{name: "IdentityAgent", key: ssh.OptionIdentityAgent, val: "none"},
+		{name: "CertificateFile", key: ssh.OptionCertificateFile, val: "/etc/ssh/id_ed25519-cert.pub"},
+		{name: "IdentityFile", key: ssh.OptionIdentityFile, val: "/etc/ssh/id_ed25519"},
+	}
+
+	for _, tc := range authOptionCases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, ctx := setup(t)
+			active := enter(t, c, ctx, admission(t, c, ctx, "a", ports.Execute))
+			next := c.Snapshot()
+			next.Revision = "2"
+			target := next.Targets["a"]
+			target.Plan.Hops[0].Options = ssh.MustOptions(tc.key, tc.val)
+			next.Targets["a"] = target
+			publish(t, c, ctx, next)
+			if active.Context().Err() == nil {
+				t.Fatalf("changing auth-class option %s did not revoke active permit", tc.name)
+			}
+		})
+	}
+
+	t.Run("TransportOnlyDoesNotRevoke", func(t *testing.T) {
+		c, ctx := setup(t)
+		active := enter(t, c, ctx, admission(t, c, ctx, "a", ports.Execute))
+		next := c.Snapshot()
+		next.Revision = "2"
+		target := next.Targets["a"]
+		target.Plan.Hops[0].Options = ssh.MustOptions(ssh.OptionCiphers, "aes256-gcm@openssh.com")
+		next.Targets["a"] = target
+		publish(t, c, ctx, next)
+		if active.Context().Err() != nil {
+			t.Fatalf("changing transport-only option Ciphers unexpectedly revoked active permit: %v", active.Context().Err())
+		}
+	})
+}
+
 func TestCommittedPublicationFailureStaysBlocked(t *testing.T) {
 	c, ctx := setup(t)
 	a := admission(t, c, ctx, "a", ports.Execute)

@@ -25,16 +25,17 @@ var ErrLocalExecutionDisabled = errors.New("local execution is disabled")
 
 // SessionAuth 描述单个连接会话的临时认证机密与跳板覆盖
 type SessionAuth struct {
-	Password     string
-	Passphrase   string
-	KeyPath      string
-	KeyPaths     []string
-	HostName     string
-	OriginalHost string
-	SuPwd        string
-	OTP          string
-	ProxyJump    string
-	Remember     bool
+	Password                 string
+	Passphrase               string
+	KeyPath                  string
+	KeyPaths                 []string
+	HostName                 string
+	OriginalHost             string
+	SuPwd                    string
+	OTP                      string
+	ProxyJump                string
+	Remember                 bool
+	SuppressNodeConfirmation bool
 }
 
 // SessionControlOptions specifies session-level OpenSSH option overrides (Tier 1).
@@ -140,7 +141,7 @@ func (s SessionControlOptions) ToSSHOptions() *ssh.Options {
 // explicit CLI Tier-1 options that OpenSSH applies across the entire connection
 // chain (including ProxyJump hops): OptionClassTrust (StrictHostKeyChecking,
 // UserKnownHostsFile, GlobalKnownHostsFile, HashKnownHosts, VerifyHostKeyDNS)
-// plus AddressFamily, ConnectTimeout, and IdentityAgent. Target-scoped options
+// plus AddressFamily, BatchMode, ConnectTimeout, and IdentityAgent. Target-scoped options
 // (such as HostName, RemoteCommand, Control*, LocalCommand, ProxyCommand,
 // ForwardAgent, RequestTTY, EscapeChar) are excluded.
 func (s SessionControlOptions) ConnectionWideOptions() SessionControlOptions {
@@ -150,7 +151,7 @@ func (s SessionControlOptions) ConnectionWideOptions() SessionControlOptions {
 		return out
 	}
 	filtered := s.Options.FilterByClasses(ssh.OptionClassTrust)
-	for _, key := range []string{ssh.OptionAddressFamily, ssh.OptionConnectTimeout, ssh.OptionIdentityAgent} {
+	for _, key := range []string{ssh.OptionAddressFamily, ssh.OptionBatchMode, ssh.OptionConnectTimeout, ssh.OptionIdentityAgent} {
 		if val := s.Options.Get(key); val != "" {
 			if filtered == nil {
 				filtered = &ssh.Options{}
@@ -443,6 +444,15 @@ func WithSessionOptions(enabled bool) Option {
 	}
 }
 
+// WithSuppressNodeConfirmation prevents ConfirmConnection from committing pending
+// ad-hoc nodes to persistent configuration (e.g., under --remember=never or in
+// detached background child processes).
+func WithSuppressNodeConfirmation(suppress bool) Option {
+	return func(a *SSHAdapter) {
+		a.suppressNodeConfirmation = suppress
+	}
+}
+
 // SSHAdapter 实现 ssh.ConnectionProvider, ssh.SecretResolver, ssh.CredentialRecorder 接口，作为业务模型与底层 SSH 的防腐层
 type SSHAdapter struct {
 	cfgProvider              config.ConfigProvider
@@ -461,6 +471,7 @@ type SSHAdapter struct {
 	disableSessionAndForward bool
 	localExecution           bool
 	credentialRecording      bool
+	suppressNodeConfirmation bool
 	rememberConfirmation     func(context.Context, string) (bool, error)
 	enrollmentProbe          bool
 	enrollmentProbeWarning   func(string, error)
@@ -1062,6 +1073,12 @@ func (a *SSHAdapter) ExpandControlPath(nodeID string, rawPath string) (string, e
 // ConfirmConnection publishes a prepared node before credentials are recorded.
 // Providers without pending connections require no additional mutation.
 func (a *SSHAdapter) ConfirmConnection(ctx context.Context, nodeID string) error {
+	if a.suppressNodeConfirmation {
+		return nil
+	}
+	if auth, ok := a.getSessionOverride(nodeID); ok && auth.SuppressNodeConfirmation {
+		return nil
+	}
 	if provider, ok := a.cfgProvider.(interface {
 		ConfirmNodeContext(context.Context, string) error
 	}); ok {

@@ -45,16 +45,18 @@ func (d *proxyCommandDialer) DialContext(ctx context.Context, _, _ string) (net.
 	}
 
 	target := d.connector.buildTargetContext(d.planNode)
-	origHost, err := resolveLocalExecOriginalHost(
-		d.planNode.cfg.OriginalHost,
-		d.planNode.cfg.NodeID,
-		d.planNode.name,
-		d.planNode.cfg.Address,
-	)
-	if err != nil {
-		return nil, err
+	if templateUsesPercentToken(rawCmd, 'n') {
+		origHost, err := resolveLocalExecOriginalHost(
+			d.planNode.cfg.OriginalHost,
+			d.planNode.cfg.NodeID,
+			d.planNode.name,
+			d.planNode.cfg.Address,
+		)
+		if err != nil {
+			return nil, err
+		}
+		target.OriginalHost = origHost
 	}
-	target.OriginalHost = origHost
 	expanded, err := ExpandProxyCommand(rawCmd, d.connector.environment, target)
 	if err != nil {
 		return nil, err
@@ -131,9 +133,13 @@ func (c *Client) RunPostAuthLocalCommand(ctx context.Context) error {
 	if user == "" {
 		user = c.environment.LocalUser
 	}
-	origHost, err := resolveLocalExecOriginalHost(connCfg.OriginalHost, connCfg.NodeID, "", connCfg.Address)
-	if err != nil {
-		return err
+	var origHost string
+	if templateUsesPercentToken(rawCmd, 'n') {
+		var err error
+		origHost, err = resolveLocalExecOriginalHost(connCfg.OriginalHost, connCfg.NodeID, "", connCfg.Address)
+		if err != nil {
+			return err
+		}
 	}
 	target := TargetContext{
 		Host:         connCfg.Address,

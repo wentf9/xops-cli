@@ -6,6 +6,8 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,6 +23,7 @@ type mockDNSBehavior struct {
 	silent    bool
 	records   []core.SSHFPRecord
 	queryFlag func(flags uint16, hasDO bool)
+	customUDP func(pc net.PacketConn, from net.Addr, query []byte)
 }
 
 // buildMockDNSResponse echoes the question and answers with compressed-name SSHFP RRs.
@@ -45,9 +48,9 @@ func buildMockDNSResponse(query []byte, b mockDNSBehavior, overUDP bool) []byte 
 	binary.BigEndian.PutUint16(resp[6:], uint16(len(records)+1))
 	binary.BigEndian.PutUint16(resp[8:], 0)
 	binary.BigEndian.PutUint16(resp[10:], 0)
-	// A non-SSHFP answer (CNAME-like type 5) that must be skipped.
+	// A non-SSHFP answer (self-CNAME type 5) that must be tolerated without looping.
 	resp = append(resp, 0xc0, 0x0c)
-	resp = binary.BigEndian.AppendUint16(resp, 5)
+	resp = binary.BigEndian.AppendUint16(resp, dnsTypeCNAME)
 	resp = binary.BigEndian.AppendUint16(resp, dnsClassIN)
 	resp = binary.BigEndian.AppendUint32(resp, 60)
 	resp = binary.BigEndian.AppendUint16(resp, 2)
@@ -62,6 +65,18 @@ func buildMockDNSResponse(query []byte, b mockDNSBehavior, overUDP bool) []byte 
 		resp = append(resp, r.Fingerprint...)
 	}
 	return resp
+}
+
+func appendWireDNSName(dst []byte, name string) []byte {
+	trimmed := strings.TrimSuffix(name, ".")
+	if trimmed == "" {
+		return append(dst, 0)
+	}
+	for _, label := range strings.Split(trimmed, ".") {
+		dst = append(dst, byte(len(label)))
+		dst = append(dst, label...)
+	}
+	return append(dst, 0)
 }
 
 func inspectQuery(query []byte, b mockDNSBehavior) {
@@ -105,6 +120,10 @@ func startMockDNS(t *testing.T, b mockDNSBehavior) (udpAddr, tcpAddr string) {
 			if b.silent {
 				continue
 			}
+			if b.customUDP != nil {
+				b.customUDP(pc, from, query)
+				continue
+			}
 			_, _ = pc.WriteTo(buildMockDNSResponse(query, b, true), from)
 		}
 	})
@@ -134,12 +153,23 @@ func startMockDNS(t *testing.T, b mockDNSBehavior) (udpAddr, tcpAddr string) {
 }
 
 func testResolver(servers []string, tcpAddrs map[string]string) *sshfpResolver {
+	return testResolverWithConfig(dnsConfig{servers: servers}, nil, tcpAddrs)
+}
+
+func testResolverWithConfig(cfg dnsConfig, udpAddrs, tcpAddrs map[string]string) *sshfpResolver {
 	var dialer net.Dialer
 	return &sshfpResolver{
-		servers: func() []string { return servers },
+		config: func() dnsConfig { return cfg },
 		dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			if network == "tcp" {
-				address = tcpAddrs[address]
+			switch network {
+			case "tcp":
+				if mapped, ok := tcpAddrs[address]; ok {
+					address = mapped
+				}
+			case "udp":
+				if mapped, ok := udpAddrs[address]; ok {
+					address = mapped
+				}
 			}
 			return dialer.DialContext(ctx, network, address)
 		},
@@ -178,6 +208,59 @@ func TestSSHFPResolver_AuthenticatedAnswerWithRdAdDoQueryFlags(t *testing.T) {
 	}
 }
 
+func TestSSHFPResolver_ADBitTrustedOnlyOnLoopbackOrTrustAD(t *testing.T) {
+	records := loopbackRecords()
+	udp, tcp := startMockDNS(t, mockDNSBehavior{ad: true, records: records})
+
+	// 1. Non-loopback server with AD=1 on wire and trustAD=false MUST return Authenticated=false.
+	nonLoopback := "192.0.2.53:53"
+	rUntrusted := testResolverWithConfig(
+		dnsConfig{servers: []string{nonLoopback}, trustAD: false},
+		map[string]string{nonLoopback: udp},
+		map[string]string{nonLoopback: tcp},
+	)
+	res, err := rUntrusted.Lookup(t.Context(), "host.example.com")
+	if err != nil {
+		t.Fatalf("non-loopback lookup failed: %v", err)
+	}
+	if res.Authenticated {
+		t.Fatalf("non-loopback AD=1 without trust-ad must force Authenticated=false, got %+v", res)
+	}
+	if len(res.Records) != 2 {
+		t.Fatalf("expected 2 unauthenticated SSHFP records, got %d", len(res.Records))
+	}
+
+	// 2. systemd-resolved loopback stub 127.0.0.53:53 and IPv6 [::1]:53 with AD=1 and trustAD=false return Authenticated=true.
+	for _, lb := range []string{"127.0.0.53:53", "[::1]:53"} {
+		rLoopback := testResolverWithConfig(
+			dnsConfig{servers: []string{lb}, trustAD: false},
+			map[string]string{lb: udp},
+			map[string]string{lb: tcp},
+		)
+		lbRes, lbErr := rLoopback.Lookup(t.Context(), "host.example.com")
+		if lbErr != nil {
+			t.Fatalf("loopback %s lookup failed: %v", lb, lbErr)
+		}
+		if !lbRes.Authenticated || len(lbRes.Records) != 2 {
+			t.Fatalf("loopback %s AD=1 should be Authenticated=true, got %+v", lb, lbRes)
+		}
+	}
+
+	// 3. Non-loopback server with AD=1 AND options trust-ad (trustAD=true) returns Authenticated=true.
+	rTrustAD := testResolverWithConfig(
+		dnsConfig{servers: []string{nonLoopback}, trustAD: true},
+		map[string]string{nonLoopback: udp},
+		map[string]string{nonLoopback: tcp},
+	)
+	trustRes, err := rTrustAD.Lookup(t.Context(), "host.example.com")
+	if err != nil {
+		t.Fatalf("trust-ad lookup failed: %v", err)
+	}
+	if !trustRes.Authenticated || len(trustRes.Records) != 2 {
+		t.Fatalf("non-loopback AD=1 with trust-ad should be Authenticated=true, got %+v", trustRes)
+	}
+}
+
 func TestSSHFPResolver_UnauthenticatedAnswer(t *testing.T) {
 	records := loopbackRecords()
 	udp, tcp := startMockDNS(t, mockDNSBehavior{records: records})
@@ -209,13 +292,58 @@ func TestSSHFPResolver_ServfailAndBadIdFallThroughToNextServer(t *testing.T) {
 	failUDP, failTCP := startMockDNS(t, mockDNSBehavior{rcode: 2})
 	spoofUDP, spoofTCP := startMockDNS(t, mockDNSBehavior{badID: true, ad: true, records: records})
 	okUDP, okTCP := startMockDNS(t, mockDNSBehavior{records: records[:1]})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer cancel()
 	r := testResolver([]string{failUDP, spoofUDP, okUDP}, map[string]string{failUDP: failTCP, spoofUDP: spoofTCP, okUDP: okTCP})
-	res, err := r.Lookup(t.Context(), "host.example.com")
+	res, err := r.Lookup(ctx, "host.example.com")
 	if err != nil || res.Authenticated || len(res.Records) != 1 {
 		t.Fatalf("res=%+v err=%v", res, err)
 	}
-	if _, err := testResolver([]string{spoofUDP}, map[string]string{spoofUDP: spoofTCP}).Lookup(t.Context(), "host.example.com"); err == nil {
+
+	spoofCtx, spoofCancel := context.WithTimeout(t.Context(), 120*time.Millisecond)
+	defer spoofCancel()
+	if _, err := testResolver([]string{spoofUDP}, map[string]string{spoofUDP: spoofTCP}).Lookup(spoofCtx, "host.example.com"); err == nil {
 		t.Fatal("spoofed ID response must be rejected")
+	}
+}
+
+func TestSSHFPResolver_BlackholedFirstServerDoesNotStarveFallbackAndDropsStrayUDP(t *testing.T) {
+	records := loopbackRecords()
+	silentUDP, silentTCP := startMockDNS(t, mockDNSBehavior{silent: true})
+
+	// Second server sends a wrong-txid datagram and a wrong-question datagram BEFORE the valid reply!
+	resilientUDP, resilientTCP := startMockDNS(t, mockDNSBehavior{
+		ad:      true,
+		records: records[:1],
+		customUDP: func(pc net.PacketConn, from net.Addr, query []byte) {
+			badTx := buildMockDNSResponse(query, mockDNSBehavior{badID: true, ad: true, records: records}, true)
+			_, _ = pc.WriteTo(badTx, from)
+
+			otherQuery, _, qErr := buildSSHFPQuery("other.example.com")
+			if qErr == nil {
+				binary.BigEndian.PutUint16(otherQuery[0:], binary.BigEndian.Uint16(query[0:]))
+				badQ := buildMockDNSResponse(otherQuery, mockDNSBehavior{ad: true, records: records}, true)
+				_, _ = pc.WriteTo(badQ, from)
+			}
+
+			good := buildMockDNSResponse(query, mockDNSBehavior{ad: true, records: records[:1]}, true)
+			_, _ = pc.WriteTo(good, from)
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer cancel()
+	r := testResolver(
+		[]string{silentUDP, resilientUDP},
+		map[string]string{silentUDP: silentTCP, resilientUDP: resilientTCP},
+	)
+	res, err := r.Lookup(ctx, "host.example.com")
+	if err != nil {
+		t.Fatalf("expected failover to second server and recovery past stray UDP packets, got err: %v", err)
+	}
+	if !res.Authenticated || len(res.Records) != 1 || res.Records[0].Algorithm != 4 {
+		t.Fatalf("unexpected failover result: %+v", res)
 	}
 }
 
@@ -245,6 +373,134 @@ func TestSSHFPResolver_InvalidNamesRejectedWithoutNetwork(t *testing.T) {
 	}
 }
 
+func TestParseSSHFPAnswers_RejectsUnrelatedOwnerAndFollowsCNAMEChain(t *testing.T) {
+	query, id, err := buildSSHFPQuery("App.Example.COM")
+	if err != nil {
+		t.Fatal(err)
+	}
+	qEnd := sshfpQuestionEnd(query)
+	fpEvil := bytesRepeat(0xaa, 32)
+	fpMid := bytesRepeat(0xbb, 32)
+	fpCanon := bytesRepeat(0xcc, 32)
+
+	// 1. Unrelated owner injection alone -> 0 accepted records.
+	unrelated := append([]byte(nil), query[:qEnd]...)
+	binary.BigEndian.PutUint16(unrelated[0:], id)
+	binary.BigEndian.PutUint16(unrelated[2:], dnsFlagQR|dnsFlagRD|dnsFlagAD)
+	binary.BigEndian.PutUint16(unrelated[6:], 1) // ANCOUNT = 1
+	binary.BigEndian.PutUint16(unrelated[10:], 0)
+	unrelated = appendWireDNSName(unrelated, "evil.example.com")
+	unrelated = binary.BigEndian.AppendUint16(unrelated, dnsTypeSSHFP)
+	unrelated = binary.BigEndian.AppendUint16(unrelated, dnsClassIN)
+	unrelated = binary.BigEndian.AppendUint32(unrelated, 60)
+	unrelated = binary.BigEndian.AppendUint16(unrelated, uint16(2+len(fpEvil)))
+	unrelated = append(unrelated, 4, 2)
+	unrelated = append(unrelated, fpEvil...)
+
+	gotUnrelated, err := parseSSHFPAnswers(unrelated)
+	if err != nil {
+		t.Fatalf("parseSSHFPAnswers(unrelated) failed: %v", err)
+	}
+	if len(gotUnrelated) != 0 {
+		t.Fatalf("unrelated owner SSHFP must be ignored, got %+v", gotUnrelated)
+	}
+
+	// 2. Valid 2-hop case-insensitive CNAME chain:
+	//    app.example.com -> mid.example.com -> canon.example.net
+	//    plus injected SSHFP at evil.example.com and mid.example.com; only canon.example.net SSHFP is accepted!
+	cnameResp := append([]byte(nil), query[:qEnd]...)
+	binary.BigEndian.PutUint16(cnameResp[0:], id)
+	binary.BigEndian.PutUint16(cnameResp[2:], dnsFlagQR|dnsFlagRD|dnsFlagAD)
+	binary.BigEndian.PutUint16(cnameResp[6:], 5) // 2 CNAME + 3 SSHFP
+	binary.BigEndian.PutUint16(cnameResp[10:], 0)
+
+	// RR 1: app.example.com (compressed 0xc0 0x0c) CNAME MID.example.com
+	cnameResp = append(cnameResp, 0xc0, 0x0c)
+	cnameResp = binary.BigEndian.AppendUint16(cnameResp, dnsTypeCNAME)
+	cnameResp = binary.BigEndian.AppendUint16(cnameResp, dnsClassIN)
+	cnameResp = binary.BigEndian.AppendUint32(cnameResp, 60)
+	midTarget := appendWireDNSName(nil, "MID.example.com")
+	cnameResp = binary.BigEndian.AppendUint16(cnameResp, uint16(len(midTarget)))
+	cnameResp = append(cnameResp, midTarget...)
+
+	// RR 2: mid.example.com CNAME Canon.Example.NET
+	cnameResp = appendWireDNSName(cnameResp, "mid.example.com")
+	cnameResp = binary.BigEndian.AppendUint16(cnameResp, dnsTypeCNAME)
+	cnameResp = binary.BigEndian.AppendUint16(cnameResp, dnsClassIN)
+	cnameResp = binary.BigEndian.AppendUint32(cnameResp, 60)
+	canonTarget := appendWireDNSName(nil, "Canon.Example.NET")
+	cnameResp = binary.BigEndian.AppendUint16(cnameResp, uint16(len(canonTarget)))
+	cnameResp = append(cnameResp, canonTarget...)
+
+	// RR 3: evil.example.com SSHFP (must be rejected)
+	cnameResp = appendWireDNSName(cnameResp, "evil.example.com")
+	cnameResp = binary.BigEndian.AppendUint16(cnameResp, dnsTypeSSHFP)
+	cnameResp = binary.BigEndian.AppendUint16(cnameResp, dnsClassIN)
+	cnameResp = binary.BigEndian.AppendUint32(cnameResp, 60)
+	cnameResp = binary.BigEndian.AppendUint16(cnameResp, uint16(2+len(fpEvil)))
+	cnameResp = append(cnameResp, 1, 2)
+	cnameResp = append(cnameResp, fpEvil...)
+
+	// RR 4: mid.example.com SSHFP (intermediate CNAME hop, not canonical target; must be rejected)
+	cnameResp = appendWireDNSName(cnameResp, "mid.example.com")
+	cnameResp = binary.BigEndian.AppendUint16(cnameResp, dnsTypeSSHFP)
+	cnameResp = binary.BigEndian.AppendUint16(cnameResp, dnsClassIN)
+	cnameResp = binary.BigEndian.AppendUint32(cnameResp, 60)
+	cnameResp = binary.BigEndian.AppendUint16(cnameResp, uint16(2+len(fpMid)))
+	cnameResp = append(cnameResp, 2, 2)
+	cnameResp = append(cnameResp, fpMid...)
+
+	// RR 5: canon.example.net SSHFP (canonical target; must be accepted!)
+	cnameResp = appendWireDNSName(cnameResp, "canon.example.net")
+	cnameResp = binary.BigEndian.AppendUint16(cnameResp, dnsTypeSSHFP)
+	cnameResp = binary.BigEndian.AppendUint16(cnameResp, dnsClassIN)
+	cnameResp = binary.BigEndian.AppendUint32(cnameResp, 60)
+	cnameResp = binary.BigEndian.AppendUint16(cnameResp, uint16(2+len(fpCanon)))
+	cnameResp = append(cnameResp, 4, 2)
+	cnameResp = append(cnameResp, fpCanon...)
+
+	gotCNAME, err := parseSSHFPAnswers(cnameResp)
+	if err != nil {
+		t.Fatalf("parseSSHFPAnswers(cnameResp) failed: %v", err)
+	}
+	if len(gotCNAME) != 1 || gotCNAME[0].Algorithm != 4 || string(gotCNAME[0].Fingerprint) != string(fpCanon) {
+		t.Fatalf("expected only canonical CNAME target SSHFP record, got %+v", gotCNAME)
+	}
+}
+
+func TestReadCanonicalDNSName_RejectsSelfForwardAndExcessivePointers(t *testing.T) {
+	// Self-compression pointer at offset 12 (0xc0 0x0c) -> rejected!
+	selfMsg := append(make([]byte, 12), 0xc0, 0x0c)
+	if _, _, err := readCanonicalDNSName(selfMsg, 12); !errors.Is(err, errDNSMalformed) {
+		t.Fatalf("self-pointer error = %v, want errDNSMalformed", err)
+	}
+
+	// Forward compression pointer at offset 12 -> offset 14 -> rejected!
+	fwdMsg := append(make([]byte, 12), 0xc0, 0x0e, 0x01, 'a', 0x00)
+	if _, _, err := readCanonicalDNSName(fwdMsg, 12); !errors.Is(err, errDNSMalformed) {
+		t.Fatalf("forward-pointer error = %v, want errDNSMalformed", err)
+	}
+
+	// Pointer into 12-byte DNS header (0xc0 0x04) -> rejected!
+	hdrMsg := append(make([]byte, 12), 0x01, 'a', 0xc0, 0x04)
+	if _, _, err := readCanonicalDNSName(hdrMsg, 12); !errors.Is(err, errDNSMalformed) {
+		t.Fatalf("header-pointer error = %v, want errDNSMalformed", err)
+	}
+
+	// Backward pointer chain exceeding dnsMaxCompressionJumps -> rejected!
+	chain := make([]byte, 12)
+	chain = append(chain, 0x01, 'z', 0x00) // offset 12..14
+	prev := 12
+	for range dnsMaxCompressionJumps + 2 {
+		cur := len(chain)
+		chain = append(chain, 0x01, 'a', 0xc0|byte(prev>>8), byte(prev))
+		prev = cur
+	}
+	if _, _, err := readCanonicalDNSName(chain, prev); !errors.Is(err, errDNSMalformed) {
+		t.Fatalf("excessive compression jump chain error = %v, want errDNSMalformed", err)
+	}
+}
+
 func TestParseSSHFPAnswersRejectsMalformed(t *testing.T) {
 	query, _, err := buildSSHFPQuery("host.example.com")
 	if err != nil {
@@ -259,4 +515,34 @@ func TestParseSSHFPAnswersRejectsMalformed(t *testing.T) {
 	if !errors.Is(func() error { _, err := skipDNSName([]byte{0x80}, 0); return err }(), errDNSMalformed) {
 		t.Fatal("reserved label type must be malformed")
 	}
+}
+
+func TestFormatWindowsDNSServerIPv6_PreservesScopeIDZone(t *testing.T) {
+	ll := netip.MustParseAddr("fe80::1").As16()
+	got, ok := formatWindowsDNSServerIPv6(ll, 12)
+	if !ok || got != "[fe80::1%12]:53" {
+		t.Fatalf("link-local with ScopeId=12 = (%q, %v), want ([fe80::1%%12]:53, true)", got, ok)
+	}
+
+	global := netip.MustParseAddr("2001:4860:4860::8888").As16()
+	gotGlobal, ok := formatWindowsDNSServerIPv6(global, 0)
+	if !ok || gotGlobal != "[2001:4860:4860::8888]:53" {
+		t.Fatalf("global IPv6 = (%q, %v), want ([2001:4860:4860::8888]:53, true)", gotGlobal, ok)
+	}
+
+	siteLocal := netip.MustParseAddr("fec0:0:0:ffff::1").As16()
+	if _, ok := formatWindowsDNSServerIPv6(siteLocal, 0); ok {
+		t.Fatal("fec0::/10 site-local Windows placeholder DNS address must be skipped")
+	}
+	if _, ok := formatWindowsDNSServerIPv6([16]byte{}, 0); ok {
+		t.Fatal("unspecified :: address must be skipped")
+	}
+}
+
+func bytesRepeat(b byte, n int) []byte {
+	out := make([]byte, n)
+	for i := range out {
+		out[i] = b
+	}
+	return out
 }

@@ -369,13 +369,14 @@ func (o *ExecOptions) validateInteractiveOptions() error {
 }
 
 type execHostTask struct {
-	nodeID     string
-	host       string
-	port       uint16
-	user       string
-	pass       string
-	passphrase string
-	keyPath    string
+	nodeID       string
+	host         string
+	originalHost string
+	port         uint16
+	user         string
+	pass         string
+	passphrase   string
+	keyPath      string
 }
 
 func (o *ExecOptions) Run() error {
@@ -460,7 +461,7 @@ func (o *ExecOptions) RunContext(ctx context.Context) (retErr error) {
 		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
 	}
 	defer func() {
-		if handoffErr := o.handoffConnectorMasters(ctx, connector); handoffErr != nil {
+		if handoffErr := o.handoffConnectorMasters(ctx, provider, connector); handoffErr != nil {
 			logger.DefaultLogger().Debugf("mux: master handoff failed: %v", handoffErr)
 		}
 		joinConnectorCloseError(&retErr, connector)
@@ -585,31 +586,33 @@ func (o *ExecOptions) buildAdapterOptions(tasks []execHostTask, cfg *config.Conf
 	if o.interaction == nil {
 		o.interaction = newCLIInteractionHandler()
 	}
-	remember, adpOpts := o.interaction.rememberOptions(utils.EffectiveRememberPolicy(o.Remember, cfg), cfg)
+	policy := utils.EffectiveRememberPolicy(o.Remember, cfg)
+	remember, adpOpts := o.interaction.rememberOptions(policy, cfg)
 	if !o.Interactive {
 		remember = false
 		// Batch execution must fail closed instead of waiting for a terminal
 		// prompt, and must never record automatically discovered credentials.
 		adpOpts = append(adpOpts, adapter.WithNonInteractive(true))
 	}
+	suppressConfirm := policy == utils.RememberPolicyNever
+	if suppressConfirm {
+		adpOpts = append(adpOpts, adapter.WithSuppressNodeConfirmation(true))
+	}
 	// A global policy applies to proxy-jump nodes, which do not have a task
 	// specific override. Explicit task credentials remain scoped to their target.
-	adpOpts = append(adpOpts, adapter.WithForwardOptions(false), adapter.WithGlobalSessionAuth(adapter.SessionAuth{Remember: remember}))
-	hostNameOverride, hostErr := o.effectiveHostName()
-	if hostErr != nil {
-		return nil, hostErr
-	}
+	adpOpts = append(adpOpts, adapter.WithForwardOptions(false), adapter.WithGlobalSessionAuth(adapter.SessionAuth{
+		Remember:                 remember,
+		SuppressNodeConfirmation: suppressConfirm,
+	}))
 	cliAbsKeys := o.absIdentityFiles()
 	o.targetNodeIDs = make([]string, 0, len(tasks))
 	for _, task := range tasks {
 		o.targetNodeIDs = append(o.targetNodeIDs, task.nodeID)
-		taskKeys := cliAbsKeys
-		if task.keyPath != "" && (len(taskKeys) == 0 || taskKeys[0] != task.keyPath) {
-			taskKeys = append([]string{task.keyPath}, taskKeys...)
+		auth, err := o.buildTaskSessionAuth(task, cliAbsKeys, remember, suppressConfirm)
+		if err != nil {
+			return nil, err
 		}
-		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(task.nodeID, adapter.SessionAuth{
-			Password: task.pass, Passphrase: task.passphrase, KeyPath: task.keyPath, KeyPaths: taskKeys, HostName: hostNameOverride, Remember: remember, OTP: o.OTP, ProxyJump: o.JumpHost,
-		}))
+		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(task.nodeID, auth))
 	}
 
 	// Session Control Overrides (Tier 1)
@@ -646,6 +649,33 @@ func (o *ExecOptions) buildAdapterOptions(tasks []execHostTask, cfg *config.Conf
 		}
 	}
 	return adpOpts, nil
+}
+
+func (o *ExecOptions) buildTaskSessionAuth(task execHostTask, cliAbsKeys []string, remember, suppressConfirm bool) (adapter.SessionAuth, error) {
+	hostForExpansion := task.originalHost
+	if hostForExpansion == "" {
+		hostForExpansion = task.host
+	}
+	hostNameOverride, hostErr := o.effectiveHostNameForHost(hostForExpansion)
+	if hostErr != nil {
+		return adapter.SessionAuth{}, hostErr
+	}
+	taskKeys := cliAbsKeys
+	if task.keyPath != "" && (len(taskKeys) == 0 || taskKeys[0] != task.keyPath) {
+		taskKeys = append([]string{task.keyPath}, taskKeys...)
+	}
+	return adapter.SessionAuth{
+		Password:                 task.pass,
+		Passphrase:               task.passphrase,
+		KeyPath:                  task.keyPath,
+		KeyPaths:                 taskKeys,
+		HostName:                 hostNameOverride,
+		OriginalHost:             task.originalHost,
+		Remember:                 remember,
+		SuppressNodeConfirmation: suppressConfirm,
+		OTP:                      o.OTP,
+		ProxyJump:                o.JumpHost,
+	}, nil
 }
 
 func (o *ExecOptions) shouldRememberCredential(target string, cfg *config.Configuration) bool {
@@ -1028,6 +1058,31 @@ func (o *ExecOptions) buildTasksFromHosts(ctx context.Context, repository config
 			ProxyJump:    o.JumpHost,
 			HasProxyJump: o.JumpHost != "",
 		}
+		originalHost := ""
+		if target.Selector != "" && !strings.HasPrefix(target.Selector, config.OpenSSHNodePrefix) {
+			var matchedSavedNode bool
+			if resolved, rErr := config.ResolveTarget(repository, target); rErr == nil {
+				matchedSavedNode = resolved.MatchedNodeID != "" &&
+					!strings.HasPrefix(resolved.MatchedNodeID, config.OpenSSHNodePrefix) &&
+					strings.TrimSpace(resolved.Host) != ""
+			}
+			canonRes, cErr := config.CanonicalizeHost(ctx, config.CanonicalizeInput{
+				Provider:         repository,
+				Host:             target.Selector,
+				RawCLIOptions:    o.control.Options,
+				CLIProxyJump:     o.JumpHost,
+				MatchedSavedNode: matchedSavedNode,
+			})
+			if cErr != nil {
+				hostErrs = append(hostErrs, fmt.Errorf("[%s] %w", h.Host, cErr))
+				continue
+			}
+			if canonRes.Canonicalized {
+				originalHost = canonRes.OriginalHost
+				target.Selector = canonRes.CanonicalHost
+				h.Host = canonRes.CanonicalHost
+			}
+		}
 
 		addr := utils.HostInfo{
 			Host:       h.Host,
@@ -1044,13 +1099,14 @@ func (o *ExecOptions) buildTasksFromHosts(ctx context.Context, repository config
 			continue
 		}
 		tasks = append(tasks, execHostTask{
-			nodeID:     nodeID,
-			host:       h.Host,
-			port:       port,
-			user:       user,
-			pass:       password,
-			passphrase: passphrase,
-			keyPath:    utils.ToAbsolutePath(keyPath),
+			nodeID:       nodeID,
+			host:         h.Host,
+			originalHost: originalHost,
+			port:         port,
+			user:         user,
+			pass:         password,
+			passphrase:   passphrase,
+			keyPath:      utils.ToAbsolutePath(keyPath),
 		})
 	}
 	return tasks, hostErrs, nil

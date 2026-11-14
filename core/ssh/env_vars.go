@@ -50,21 +50,26 @@ func isValidEnvVarName(name string) bool {
 }
 
 // isDeniedSendEnvName enforces the non-bypassable denylist when matching host environment
-// variables via SendEnv so wildcard patterns (such as "SendEnv *") never leak local secrets
-// or dynamic linker injection variables.
+// variables via SendEnv (and filtering SetEnv) so wildcard patterns or explicit directives
+// never leak local secrets or dynamic linker injection variables.
 func isDeniedSendEnvName(name string) bool {
 	upper := strings.ToUpper(name)
 	switch upper {
 	case "SSH_AUTH_SOCK",
 		"SSH_AGENT_PID",
 		"KRB5CCNAME",
-		"LD_PRELOAD",
-		"LD_LIBRARY_PATH",
-		"GITHUB_TOKEN":
+		"GITHUB_TOKEN",
+		"GH_TOKEN",
+		"GITLAB_TOKEN",
+		"VAULT_TOKEN",
+		"NPM_TOKEN",
+		"AWS_SESSION_TOKEN",
+		"AWS_ACCESS_KEY_ID":
 		return true
 	}
 	return strings.HasPrefix(upper, "XOPS_") ||
 		strings.HasPrefix(upper, "SSH_ASKPASS") ||
+		strings.HasPrefix(upper, "LD_") ||
 		strings.HasPrefix(upper, "DYLD_") ||
 		strings.HasPrefix(upper, "AWS_SECRET_")
 }
@@ -342,8 +347,15 @@ func shouldSendEnvVar(rules []sendEnvRule, name string) bool {
 // accumulated SendEnv patterns, and later SetEnv directives override earlier SetEnv directives
 // as well as SendEnv values.
 func ResolveSessionEnv(opts *Options, hostEnviron func() []string) ([]EnvVar, error) {
+	return resolveSessionEnvWithLogger(opts, hostEnviron, corelog.NopLogger)
+}
+
+func resolveSessionEnvWithLogger(opts *Options, hostEnviron func() []string, log corelog.DebugLogger) ([]EnvVar, error) {
 	if opts.IsEmpty() {
 		return nil, nil
+	}
+	if log == nil {
+		log = corelog.NopLogger
 	}
 
 	rules, hasPositiveSendEnv, err := buildSendEnvRules(opts.SendEnvPatterns())
@@ -351,21 +363,52 @@ func ResolveSessionEnv(opts *Options, hostEnviron func() []string) ([]EnvVar, er
 		return nil, err
 	}
 
-	acc := newSessionEnvAccumulator()
-	if hasPositiveSendEnv && hostEnviron != nil {
-		if err := acc.addMatchingHostEnv(hostEnviron(), rules); err != nil {
-			return nil, err
-		}
+	setEnvPairs, setEnvNames, err := collectValidatedSetEnv(opts.SetEnvDirectives(), log)
+	if err != nil {
+		return nil, err
 	}
 
-	if err := acc.addSetEnvDirectives(opts.SetEnvDirectives()); err != nil {
-		return nil, err
+	acc := newSessionEnvAccumulator()
+	if hasPositiveSendEnv && hostEnviron != nil {
+		acc.addMatchingHostEnv(hostEnviron(), rules, setEnvNames, log)
+	}
+
+	for _, ev := range setEnvPairs {
+		if err := acc.upsert(ev); err != nil {
+			return nil, err
+		}
 	}
 
 	if len(acc.resolved) == 0 {
 		return nil, nil
 	}
 	return acc.resolved, nil
+}
+
+func collectValidatedSetEnv(directives []string, log corelog.DebugLogger) ([]EnvVar, map[string]struct{}, error) {
+	if len(directives) == 0 {
+		return nil, nil, nil
+	}
+	var pairs []EnvVar
+	uniqueNames := make(map[string]struct{})
+	for _, directive := range directives {
+		parsed, err := parseSetEnvDirective(directive)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w: invalid SetEnv %q: %w", ErrSSHOptionsValidation, directive, err)
+		}
+		for _, ev := range parsed {
+			if isDeniedSendEnvName(ev.Name) {
+				log.Debugf("SetEnv %q blocked by denylist", ev.Name)
+				continue
+			}
+			uniqueNames[ev.Name] = struct{}{}
+			if len(uniqueNames) > MaxSessionEnvVars {
+				return nil, nil, fmt.Errorf("%w: session environment exceeds maximum of %d variables", ErrSSHOptionsValidation, MaxSessionEnvVars)
+			}
+			pairs = append(pairs, ev)
+		}
+	}
+	return pairs, uniqueNames, nil
 }
 
 type sessionEnvAccumulator struct {
@@ -393,7 +436,14 @@ func (a *sessionEnvAccumulator) upsert(ev EnvVar) error {
 	return nil
 }
 
-func (a *sessionEnvAccumulator) addMatchingHostEnv(environ []string, rules []sendEnvRule) error {
+func (a *sessionEnvAccumulator) addMatchingHostEnv(
+	environ []string,
+	rules []sendEnvRule,
+	reservedSetEnv map[string]struct{},
+	log corelog.DebugLogger,
+) {
+	maxSendEnvOnly := MaxSessionEnvVars - len(reservedSetEnv)
+	sendEnvOnlyCount := 0
 	for _, raw := range environ {
 		name, val, ok := strings.Cut(raw, "=")
 		if !ok || !isValidEnvVarName(name) || strings.ContainsRune(val, 0) {
@@ -402,29 +452,25 @@ func (a *sessionEnvAccumulator) addMatchingHostEnv(environ []string, rules []sen
 		if isDeniedSendEnvName(name) || !shouldSendEnvVar(rules, name) {
 			continue
 		}
-		if err := a.upsert(EnvVar{Name: name, Value: val}); err != nil {
-			return err
+		if entryLen := len(name) + 1 + len(val); entryLen > MaxSessionEnvEntryBytes {
+			log.Debugf("SendEnv: skipping host variable %q (%d bytes exceeds %d-byte limit)", name, entryLen, MaxSessionEnvEntryBytes)
+			continue
 		}
-	}
-	return nil
-}
-
-func (a *sessionEnvAccumulator) addSetEnvDirectives(directives []string) error {
-	for _, directive := range directives {
-		pairs, err := parseSetEnvDirective(directive)
-		if err != nil {
-			return fmt.Errorf("%w: invalid SetEnv %q: %w", ErrSSHOptionsValidation, directive, err)
+		if idx, exists := a.indexByName[name]; exists {
+			a.resolved[idx].Value = val
+			continue
 		}
-		for _, ev := range pairs {
-			if isDeniedSendEnvName(ev.Name) {
+		_, overriddenBySetEnv := reservedSetEnv[name]
+		if !overriddenBySetEnv {
+			if sendEnvOnlyCount >= maxSendEnvOnly {
+				log.Debugf("SendEnv: skipping host variable %q (session limit of %d variables reached)", name, MaxSessionEnvVars)
 				continue
 			}
-			if err := a.upsert(ev); err != nil {
-				return err
-			}
+			sendEnvOnlyCount++
 		}
+		a.indexByName[name] = len(a.resolved)
+		a.resolved = append(a.resolved, EnvVar{Name: name, Value: val})
 	}
-	return nil
 }
 
 func (c *Client) resolveClientSessionEnv() ([]EnvVar, error) {
@@ -435,7 +481,7 @@ func (c *Client) resolveClientSessionEnv() ([]EnvVar, error) {
 	if connCfg.Options.IsEmpty() {
 		return nil, nil
 	}
-	return ResolveSessionEnv(connCfg.Options, c.environment.Environ)
+	return resolveSessionEnvWithLogger(connCfg.Options, c.environment.Environ, c.getLogger())
 }
 
 func isProtocolSetenvRejected(err error) bool {

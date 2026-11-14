@@ -17,7 +17,6 @@ import (
 	"github.com/wentf9/xops-cli/core/concurrent"
 	logger "github.com/wentf9/xops-cli/core/log"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
 	"golang.org/x/sync/singleflight"
 )
@@ -2001,17 +2000,15 @@ func (c *Connector) resolveConfigAgentSocket(cfg *ClientConfig) (string, error) 
 	return sock, nil
 }
 
-func (c *Connector) resolveAgentAuth(ctx context.Context, cfg *ClientConfig) ([]autoAuthCandidate, ssh.AuthMethod, func(), error) {
+func (c *Connector) resolveAgentAuth(ctx context.Context, authCtx context.Context, cfg *ClientConfig) ([]autoAuthCandidate, ssh.AuthMethod, func(), error) {
 	socket, err := c.resolveConfigAgentSocket(cfg)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	conn, err := dialAgentConn(ctx, c.environment.DialAgent, socket)
+	agentClient, cleanup, err := dialBoundedAgentClient(ctx, authCtx, c.environment.DialAgent, socket, c.getNodeHandshakeTimeout(cfg), c.getLogger())
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to connect to ssh-agent: %w", err)
 	}
-	agentClient := agent.NewClient(conn)
-	cleanup := func() { debugCloseResource(c.getLogger(), conn, "ssh agent connection") }
 
 	var sshOpts *Options
 	if cfg != nil {
@@ -2059,17 +2056,16 @@ func (c *Connector) resolveAgentAuth(ctx context.Context, cfg *ClientConfig) ([]
 	return nil, ssh.PublicKeysCallback(agentClient.Signers), cleanup, nil
 }
 
-func (c *Connector) resolveFilteredAgentAuth(ctx context.Context, cfg *ClientConfig, explicitPaths []string) ([]autoAuthCandidate, func(), error) {
+func (c *Connector) resolveFilteredAgentAuth(ctx context.Context, authCtx context.Context, cfg *ClientConfig, explicitPaths []string) ([]autoAuthCandidate, func(), error) {
 	socket, err := c.resolveConfigAgentSocket(cfg)
 	if err != nil {
 		return nil, nil, err
 	}
-	conn, err := dialAgentConn(ctx, c.environment.DialAgent, socket)
+	agentClient, cleanup, err := dialBoundedAgentClient(ctx, authCtx, c.environment.DialAgent, socket, c.getNodeHandshakeTimeout(cfg), c.getLogger())
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to connect to ssh-agent: %w", err)
 	}
-	cleanup := func() { debugCloseResource(c.getLogger(), conn, "ssh agent connection") }
-	signers, err := agent.NewClient(conn).Signers()
+	signers, err := agentClient.Signers()
 	if err != nil {
 		cleanup()
 		return nil, nil, fmt.Errorf("list ssh-agent signers: %w", err)
@@ -2187,7 +2183,7 @@ func (c *Connector) buildMultiKeyAuth(
 		c.environment.ResolveKeyPath,
 		l,
 	)
-	if len(explicitPaths) == 0 && (policy.identitiesOnly || len(explicitCerts) == 0) {
+	if len(explicitPaths) == 0 && len(explicitCerts) == 0 {
 		return nil, nil, ErrKeyPathRequired
 	}
 	var failClosed func(error)
@@ -2209,6 +2205,7 @@ func (c *Connector) buildMultiKeyAuth(
 		resolver.value = nil
 		return nil
 	}
+	handshakeTimeout := c.getNodeHandshakeTimeout(cfg)
 	provider := &autoSecretProvider{
 		lifecycleCtx:       authCtx,
 		nodeID:             cfg.NodeID,
@@ -2219,54 +2216,32 @@ func (c *Connector) buildMultiKeyAuth(
 		resolver:           resolver,
 		prompter:           activePrompter,
 		recoveryPrompter:   recovery,
-		handshakeTimeout:   c.getNodeHandshakeTimeout(cfg),
+		handshakeTimeout:   handshakeTimeout,
 		interactionTimeout: c.interactionTimeout,
 		failClosed:         failClosed,
 	}
 
-	var certCandidates []autoAuthCandidate
-	var plainCandidates []autoAuthCandidate
-	pairedCertPaths := make(map[string]struct{})
+	passphraseCb := newMultiKeyPassphraseCallback(cfg, recovery != nil, onAuthDiscovered)
+	var candidates []autoAuthCandidate
 	var firstErr error
-	for _, keyPath := range explicitPaths {
-		certMethods, plainMethod, err := resolveKeySigners(keyPath, explicitCerts, hasExplicitCerts, provider, func(path, passphrase string) {
-			if recovery != nil && passphrase != "" {
-				cfg.KeyPath = path
-				cfg.Passphrase = passphrase
-				cfg.Password = ""
-				if onAuthDiscovered != nil {
-					onAuthDiscovered()
-				}
-			}
-		}, l)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		for _, cm := range certMethods {
-			pairedCertPaths[cm.certPath] = struct{}{}
-			certCandidates = append(certCandidates, autoAuthCandidate{
-				protocol: autoAuthProtocolPublicKey,
-				label:    "explicit key (cert): " + cm.certPath,
-				method:   cm.method,
-			})
-		}
-		plainCandidates = append(plainCandidates, autoAuthCandidate{
-			protocol: autoAuthProtocolPublicKey,
-			label:    "explicit key: " + keyPath,
-			method:   plainMethod,
-		})
-	}
-	candidates := append(certCandidates, plainCandidates...)
-	if !policy.identitiesOnly {
-		candidates = append(candidates, c.appendMultiKeyAgentCandidates(ctx, cfg, explicitCerts, pairedCertPaths, &cleanup)...)
+	if policy.identitiesOnly {
+		candidates, firstErr = c.buildIdentitiesOnlyMultiKeyCandidates(
+			ctx, authCtx, cfg, explicitPaths, explicitCerts, hasExplicitCerts,
+			provider, passphraseCb, handshakeTimeout, &cleanup, l,
+		)
+	} else {
+		candidates, firstErr = c.buildAgentFallbackMultiKeyCandidates(
+			ctx, authCtx, cfg, explicitPaths, explicitCerts, hasExplicitCerts,
+			provider, passphraseCb, &cleanup, l,
+		)
 	}
 	if len(candidates) == 0 {
 		_ = cleanup()
 		if firstErr != nil {
 			return nil, nil, firstErr
+		}
+		if policy.identitiesOnly && len(explicitCerts) > 0 {
+			return nil, nil, errors.New("no ssh-agent or file identity matches explicit CertificateFile under IdentitiesOnly=yes")
 		}
 		return nil, nil, ErrKeyPathRequired
 	}
@@ -2274,63 +2249,187 @@ func (c *Connector) buildMultiKeyAuth(
 	return newSequentialAuthCallbackWithPolicy(candidates, policy, provider, l, observer), cleanup, nil
 }
 
+func (c *Connector) buildIdentitiesOnlyMultiKeyCandidates(
+	ctx context.Context,
+	authCtx context.Context,
+	cfg *ClientConfig,
+	explicitPaths []string,
+	explicitCerts []loadedUserCert,
+	hasExplicitCerts bool,
+	provider *autoSecretProvider,
+	passphraseCb func(string, string),
+	handshakeTimeout time.Duration,
+	cleanup *func() error,
+	l logger.DebugLogger,
+) ([]autoAuthCandidate, error) {
+	var certCandidates []autoAuthCandidate
+	var plainCandidates []autoAuthCandidate
+	pairedCertPaths := make(map[string]struct{})
+	tracker := newOfferedPubKeyTracker()
+
+	var agentByPub map[string]ssh.Signer
+	if socket, sockErr := c.resolveConfigAgentSocket(cfg); sockErr == nil {
+		var agentCleanup func()
+		agentByPub, agentCleanup = dialAgentSignersByPubKey(ctx, authCtx, c.environment.DialAgent, socket, handshakeTimeout, l)
+		if agentCleanup != nil {
+			prevCleanup := *cleanup
+			*cleanup = func() error {
+				agentCleanup()
+				return prevCleanup()
+			}
+		}
+	}
+
+	var firstErr error
+	for _, keyPath := range explicitPaths {
+		if appendAgentMatchedKeyPath(
+			&certCandidates, &plainCandidates, pairedCertPaths, agentByPub,
+			keyPath, "explicit key", explicitCerts, hasExplicitCerts,
+			nil, tracker, l,
+		) {
+			continue
+		}
+		certMethods, plainMethod, err := resolveKeySigners(keyPath, explicitCerts, hasExplicitCerts, provider, passphraseCb, tracker, false, l)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		appendResolvedMultiKeyCandidate(keyPath, certMethods, plainMethod, pairedCertPaths, &certCandidates, &plainCandidates)
+	}
+
+	for _, ec := range explicitCerts {
+		if _, already := pairedCertPaths[ec.path]; already {
+			continue
+		}
+		if signer, ok := agentByPub[ec.keyRaw]; ok {
+			if cs, csErr := newWrappedCertSigner(ec.cert, signer); csErr == nil {
+				pairedCertPaths[ec.path] = struct{}{}
+				certCandidates = append(certCandidates, autoAuthCandidate{
+					protocol: autoAuthProtocolPublicKey,
+					label:    "ssh-agent (IdentitiesOnly cert): " + ec.path,
+					method:   ssh.PublicKeys(cs),
+				})
+			}
+		}
+	}
+	return append(certCandidates, plainCandidates...), firstErr
+}
+
+func (c *Connector) buildAgentFallbackMultiKeyCandidates(
+	ctx context.Context,
+	authCtx context.Context,
+	cfg *ClientConfig,
+	explicitPaths []string,
+	explicitCerts []loadedUserCert,
+	hasExplicitCerts bool,
+	provider *autoSecretProvider,
+	passphraseCb func(string, string),
+	cleanup *func() error,
+	l logger.DebugLogger,
+) ([]autoAuthCandidate, error) {
+	var certCandidates []autoAuthCandidate
+	var plainCandidates []autoAuthCandidate
+	pairedCertPaths := make(map[string]struct{})
+	tracker := newOfferedPubKeyTracker()
+
+	var unresolvedExplicitPaths []string
+	var firstErr error
+	for _, keyPath := range explicitPaths {
+		certMethods, plainMethod, err := resolveKeySigners(keyPath, explicitCerts, hasExplicitCerts, provider, passphraseCb, tracker, false, l)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			unresolvedExplicitPaths = append(unresolvedExplicitPaths, keyPath)
+			continue
+		}
+		appendResolvedMultiKeyCandidate(keyPath, certMethods, plainMethod, pairedCertPaths, &certCandidates, &plainCandidates)
+	}
+	c.appendMultiKeyAgentCandidates(
+		ctx, authCtx, cfg, unresolvedExplicitPaths, explicitCerts, hasExplicitCerts,
+		pairedCertPaths, tracker, &certCandidates, &plainCandidates, cleanup,
+	)
+	return append(certCandidates, plainCandidates...), firstErr
+}
+
+func appendResolvedMultiKeyCandidate(
+	keyPath string,
+	certMethods []certAuthCandidateMethod,
+	plainMethod ssh.AuthMethod,
+	pairedCertPaths map[string]struct{},
+	certCandidates *[]autoAuthCandidate,
+	plainCandidates *[]autoAuthCandidate,
+) {
+	for _, cm := range certMethods {
+		pairedCertPaths[cm.certPath] = struct{}{}
+		*certCandidates = append(*certCandidates, autoAuthCandidate{
+			protocol: autoAuthProtocolPublicKey,
+			label:    "explicit key (cert): " + cm.certPath,
+			method:   cm.method,
+		})
+	}
+	*plainCandidates = append(*plainCandidates, autoAuthCandidate{
+		protocol: autoAuthProtocolPublicKey,
+		label:    "explicit key: " + keyPath,
+		method:   plainMethod,
+	})
+}
+
+func newMultiKeyPassphraseCallback(cfg *ClientConfig, allowRecord bool, onAuthDiscovered func()) func(string, string) {
+	return func(path, passphrase string) {
+		if allowRecord && passphrase != "" {
+			cfg.KeyPath = path
+			cfg.Passphrase = passphrase
+			cfg.Password = ""
+			if onAuthDiscovered != nil {
+				onAuthDiscovered()
+			}
+		}
+	}
+}
+
 func (c *Connector) appendMultiKeyAgentCandidates(
 	ctx context.Context,
+	authCtx context.Context,
 	cfg *ClientConfig,
+	unresolvedExplicitPaths []string,
 	explicitCerts []loadedUserCert,
+	hasExplicitCerts bool,
 	pairedCertPaths map[string]struct{},
+	tracker *offeredPubKeyTracker,
+	certCandidates *[]autoAuthCandidate,
+	plainCandidates *[]autoAuthCandidate,
 	cleanup *func() error,
-) []autoAuthCandidate {
+) {
 	socket, err := c.resolveConfigAgentSocket(cfg)
 	if err != nil {
-		return nil
+		return
 	}
-	conn, err := dialAgentConn(ctx, c.environment.DialAgent, socket)
+	l := c.getLogger()
+	agentClient, agentCleanup, err := dialBoundedAgentClient(ctx, authCtx, c.environment.DialAgent, socket, c.getNodeHandshakeTimeout(cfg), l)
 	if err != nil {
-		c.getLogger().Debugf("ssh-agent fallback unavailable: %v", err)
-		return nil
+		l.Debugf("ssh-agent fallback unavailable: %v", err)
+		return
 	}
 	prevCleanup := *cleanup
 	*cleanup = func() error {
-		debugCloseResource(c.getLogger(), conn, "ssh agent connection")
+		agentCleanup()
 		if prevCleanup != nil {
 			return prevCleanup()
 		}
 		return nil
 	}
-	agentClient := agent.NewClient(conn)
-	var agentCandidates []autoAuthCandidate
-	if len(explicitCerts) > 0 {
-		if signers, signersErr := agentClient.Signers(); signersErr == nil {
-			agentByPub := make(map[string]ssh.Signer, len(signers))
-			for _, s := range signers {
-				pubRaw := string(s.PublicKey().Marshal())
-				if _, exists := agentByPub[pubRaw]; !exists {
-					agentByPub[pubRaw] = s
-				}
-			}
-			for _, ec := range explicitCerts {
-				if _, already := pairedCertPaths[ec.path]; already {
-					continue
-				}
-				if s, ok := agentByPub[ec.keyRaw]; ok {
-					if cs, csErr := newWrappedCertSigner(ec.cert, s); csErr == nil {
-						agentCandidates = append(agentCandidates, autoAuthCandidate{
-							protocol: autoAuthProtocolPublicKey,
-							label:    "ssh-agent (cert): " + ec.path,
-							method:   ssh.PublicKeys(cs),
-						})
-					}
-				}
-			}
-		}
-	}
-	agentCandidates = append(agentCandidates, autoAuthCandidate{
+	pairExplicitPathsAndCertsWithAgent(
+		agentClient, unresolvedExplicitPaths, explicitCerts, hasExplicitCerts,
+		pairedCertPaths, nil, tracker, certCandidates, plainCandidates, l,
+	)
+	*plainCandidates = append(*plainCandidates, autoAuthCandidate{
 		protocol: autoAuthProtocolPublicKey,
 		label:    "ssh-agent",
-		method:   ssh.PublicKeysCallback(agentClient.Signers),
+		method:   ssh.PublicKeysCallback(tracker.filterAgentSigners(agentClient.Signers)),
 	})
-	return agentCandidates
 }
 
 // buildSSHConfig 根据 Identity 模型构建 ssh.ClientConfig
@@ -2469,7 +2568,7 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 			return nil, nil, errors.New("publickey authentication disabled by SSH options")
 		}
 		if c.keySource != nil {
-			certMethods, plainMethod, release, err := c.sourcedKeyMethods(authCtx, cfg)
+			certMethods, plainMethod, _, release, err := c.sourcedKeyMethods(authCtx, cfg)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -2495,23 +2594,12 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 			authMethods = append(authMethods, plainMethod)
 			break
 		}
-		hasCertConfig := len(cfg.Options.CertificateFiles()) > 0 ||
-			hasPotentialSidecarCert(cfg.KeyPath, c.environment, c.authTargetContext(cfg), c.environment.ResolveKeyPath)
-		if len(cfg.KeyPaths) > 0 || len(cfg.Options.IdentityFiles()) > 0 || hasCertConfig || strings.ContainsAny(cfg.KeyPath, "%~$") {
-			explicitPaths, _ := c.explicitKeyPaths(cfg)
-			cb, release, err := c.buildMultiKeyAuth(ctx, authCtx, cfg, explicitPaths, policy, prompter, coordinator, onAuthDiscovered, observer)
-			if err != nil {
-				return nil, nil, err
-			}
-			authCallback = cb
-			cleanup = release
-			break
-		}
-		method, release, err := c.keyAuth(authCtx, cfg, prompter, onAuthDiscovered)
+		explicitPaths, _ := c.explicitKeyPaths(cfg)
+		cb, release, err := c.buildMultiKeyAuth(ctx, authCtx, cfg, explicitPaths, policy, prompter, coordinator, onAuthDiscovered, observer)
 		if err != nil {
 			return nil, nil, err
 		}
-		authMethods = append(authMethods, method)
+		authCallback = cb
 		cleanup = release
 
 	case "agent":
@@ -2530,7 +2618,7 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 			if len(explicitPaths) == 0 && len(explicitCerts) == 0 {
 				return nil, nil, errors.New("ssh-agent authentication disabled by IdentitiesOnly=yes")
 			}
-			candidates, agentCleanup, err := c.resolveFilteredAgentAuth(ctx, cfg, explicitPaths)
+			candidates, agentCleanup, err := c.resolveFilteredAgentAuth(ctx, authCtx, cfg, explicitPaths)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -2539,7 +2627,7 @@ func (c *Connector) buildSSHConfig(ctx context.Context, cfg *ClientConfig, coord
 			cleanup = legacyAuthCleanup(agentCleanup)
 			break
 		}
-		candidates, method, agentCleanup, err := c.resolveAgentAuth(ctx, cfg)
+		candidates, method, agentCleanup, err := c.resolveAgentAuth(ctx, authCtx, cfg)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -2951,10 +3039,11 @@ func (c *Connector) resolveCustomKnownHostsFiles(userKH string, target TargetCon
 	return primaryWriteFile, existingFiles, nil
 }
 
-// resolveGlobalKnownHostsFiles returns existing, readable, regular global
+// resolveGlobalKnownHostsFiles returns existing, readable, regular, valid global
 // known_hosts files. They are verification-only: never created or written.
-// Missing or unreadable global files are skipped so a system default cannot
-// block connections.
+// Missing, unreadable, or malformed global files are skipped with a debug log
+// so a system default (e.g. /etc/ssh/ssh_known_hosts) cannot block connections;
+// UserKnownHostsFile parsing remains strict.
 func (c *Connector) resolveGlobalKnownHostsFiles(cfg *ClientConfig, target TargetContext, userFiles []string) ([]string, error) {
 	var candidates []string
 	spec := ""
@@ -2990,6 +3079,10 @@ func (c *Connector) resolveGlobalKnownHostsFiles(cfg *ClientConfig, target Targe
 		}
 		if !isReadableRegularFile(path) {
 			c.getLogger().Debugf("skipping global known_hosts file %q: missing, unreadable, or not a regular file", path)
+			continue
+		}
+		if _, err := knownhosts.New(path); err != nil {
+			c.getLogger().Debugf("skipping malformed global known_hosts file %q: %v", path, err)
 			continue
 		}
 		files = append(files, path)
@@ -3056,6 +3149,8 @@ func (c *Connector) handleKnownHostsKeyError(
 	case StrictHostKeyCheckingYes:
 		return fmt.Errorf("%w: no host key is known for %s and StrictHostKeyChecking=yes", ErrHostKeyMismatch, hostname)
 	case StrictHostKeyCheckingNo:
+		// Explicit opt-out (matching OpenSSH): unknown keys are accepted and
+		// recorded without consulting SSHFP DNS records.
 		_ = record()
 		return nil
 	default:
@@ -3064,10 +3159,13 @@ func (c *Connector) handleKnownHostsKeyError(
 }
 
 // handleUnknownHostKey applies StrictHostKeyChecking=ask/accept-new with the
-// VerifyHostKeyDNS fail-closed matrix:
+// VerifyHostKeyDNS fail-closed matrix (StrictHostKeyChecking=yes/no return in
+// handleKnownHostsKeyError before reaching DNS lookup, matching OpenSSH opt-out
+// semantics for StrictHostKeyChecking=no):
 //   - only an AD=1 SHA-256 match under VerifyHostKeyDNS=yes skips the prompt;
-//   - an SSHFP mismatch is never auto-accepted (not even by accept-new or
-//     AcceptNewHostKey) and fails closed when no interactive prompt is possible;
+//   - under ask/accept-new, an SSHFP mismatch is never auto-accepted (not even
+//     by accept-new or AcceptNewHostKey) and fails closed when no interactive
+//     prompt is possible;
 //   - unverified matches and VerifyHostKeyDNS=ask only annotate the prompt.
 func (c *Connector) handleUnknownHostKey(
 	ctx context.Context,

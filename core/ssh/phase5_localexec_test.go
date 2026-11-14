@@ -112,7 +112,7 @@ func assertPhase5PlanIsolation(t *testing.T) {
 			AuthType: "auto",
 			Options: MustOptions(
 				OptionAddressFamily, "inet",
-				OptionProxyCommand, "nc %h %p",
+				OptionProxyCommand, "none",
 				OptionLocalCommand, "touch /tmp/pwn",
 				OptionPermitLocalCommand, "yes",
 			),
@@ -137,6 +137,23 @@ func assertPhase5PlanIsolation(t *testing.T) {
 	cfgFromPlan := clientConfigFromPlan(withLocalExec.Hops[0])
 	if cfgFromPlan.Options.ActiveProxyCommand() != "" || cfgFromPlan.Options.PermitLocalCommand() {
 		t.Fatal("OptionClassLocalExec leaked into clientConfigFromPlan")
+	}
+
+	// An active ProxyCommand defines routing; plans must fail closed rather
+	// than silently dialing the endpoint directly (review M1).
+	withProxy := withLocalExec
+	withProxy.Hops = []ConnectionConfig{withLocalExec.Hops[0]}
+	withProxy.Hops[0].Options = MustOptions(OptionAddressFamily, "inet", OptionProxyCommand, "nc %h %p")
+	if _, err := normalizePlan(withProxy); !errors.Is(err, ErrProxyCommandUnavailable) {
+		t.Fatalf("normalizePlan with active ProxyCommand: err=%v, want ErrProxyCommandUnavailable", err)
+	}
+	if _, err := ConnectionKey(withProxy); !errors.Is(err, ErrProxyCommandUnavailable) {
+		t.Fatalf("ConnectionKey with active ProxyCommand: err=%v, want ErrProxyCommandUnavailable", err)
+	}
+	connector := NewConnector(&planProvider{configs: map[string]ClientConfig{}})
+	defer func() { _ = connector.CloseAll() }()
+	if _, err := connector.ConnectPlan(context.Background(), withProxy); !errors.Is(err, ErrProxyCommandUnavailable) {
+		t.Fatalf("ConnectPlan with active ProxyCommand: err=%v, want ErrProxyCommandUnavailable", err)
 	}
 }
 
@@ -249,7 +266,7 @@ func TestPhase5_ValidateSafeExecTokenAndExpansion_CVE202351385(t *testing.T) {
 
 func TestPhase5_ConnectorProxyCommand_FailClosedAndInjectionBlocked(t *testing.T) {
 	opts := MustOptions(
-		OptionProxyCommand, "ssh -W %h:%p jump",
+		OptionProxyCommand, "ssh -W %h:%p %n",
 		OptionStrictHostKeyChecking, "no",
 	)
 
@@ -917,9 +934,9 @@ func assertPhase5UnsafeNodeIDsFailClosed(t *testing.T) {
 	for _, tc := range unsafeCases {
 		var dialCalls, localCalls atomic.Int32
 		opts := MustOptions(
-			OptionProxyCommand, "nc %h %p",
+			OptionProxyCommand, "nc %n %p -u %r",
 			OptionPermitLocalCommand, "yes",
-			OptionLocalCommand, "echo ok",
+			OptionLocalCommand, "echo %n %r",
 			OptionStrictHostKeyChecking, "no",
 		)
 		store := &mapTestProvider{

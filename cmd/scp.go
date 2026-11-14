@@ -29,22 +29,23 @@ import (
 
 type ScpOptions struct {
 	SshOptions
-	Recursive    bool
-	Quiet        bool
-	Verbose      bool
-	Force        bool
-	NoOverwrite  bool
-	TaskCount    int
-	ThreadCount  int
-	Source       string
-	Dest         string
-	HostFile     string
-	Tag          string
-	Exclude      []string
-	sshLogLevel  int
-	verboseSeen  bool
-	verboseLevel int
-	diagnostics  corelog.DiagnosticObserver
+	Recursive      bool
+	Quiet          bool
+	Verbose        bool
+	Force          bool
+	NoOverwrite    bool
+	TaskCount      int
+	ThreadCount    int
+	Source         string
+	Dest           string
+	HostFile       string
+	Tag            string
+	Exclude        []string
+	sshLogLevel    int
+	verboseSeen    bool
+	verboseLevel   int
+	diagnostics    corelog.DiagnosticObserver
+	canonicalCache map[string]config.CanonicalizeResult
 }
 
 func NewScpOptions() *ScpOptions {
@@ -208,11 +209,12 @@ func (o *ScpOptions) Validate() error {
 }
 
 type PathInfo struct {
-	IsRemote bool
-	User     string
-	Host     string
-	Port     uint16
-	Path     string
+	IsRemote     bool
+	User         string
+	Host         string
+	OriginalHost string
+	Port         uint16
+	Path         string
 }
 
 //nolint:gocyclo
@@ -328,13 +330,16 @@ func (o *ScpOptions) RunContext(ctx context.Context) (retErr error) {
 	if err != nil {
 		return err
 	}
+	if err := o.canonicalizeEndpoints(ctx, provider); err != nil {
+		return err
+	}
 	connector, err := o.credentialConnector(provider, cfg)
 	if err != nil {
 		return err
 	}
 
 	defer func() {
-		if handoffErr := o.handoffConnectorMasters(ctx, connector); handoffErr != nil {
+		if handoffErr := o.handoffConnectorMasters(ctx, provider, connector); handoffErr != nil {
 			logger.DefaultLogger().Debugf("mux: master handoff failed: %v", handoffErr)
 		}
 		joinConnectorCloseError(&retErr, connector)
@@ -965,29 +970,73 @@ func (o *ScpOptions) prepareRemoteToRemoteFile(ctx context.Context, dstSftp *sft
 	return startOffset, dstFile, nil
 }
 
-func (o *ScpOptions) connectSftpForPath(ctx context.Context, p PathInfo, specificPassword string, provider config.ConfigProvider, connector *ssh.Connector) (string, *sftp.Client, error) {
-	if p.Host != "" && o.Tag == "" && o.HostFile == "" && !strings.Contains(o.Host, ",") && !strings.HasPrefix(p.Host, config.OpenSSHNodePrefix) {
-		var matchedSavedNode bool
-		if target, tErr := o.resolveTargetForPath(p); tErr == nil {
-			if resolved, rErr := config.ResolveTarget(provider, target); rErr == nil {
-				matchedSavedNode = resolved.MatchedNodeID != "" &&
-					!strings.HasPrefix(resolved.MatchedNodeID, config.OpenSSHNodePrefix) &&
-					strings.TrimSpace(resolved.Host) != ""
-			}
+func (o *ScpOptions) canonicalizeEndpoints(ctx context.Context, provider config.ConfigProvider) error {
+	if provider == nil || o.Tag != "" || o.HostFile != "" || strings.Contains(o.Host, ",") {
+		return nil
+	}
+	for _, p := range o.collectTargetPaths(provider) {
+		if _, err := o.canonicalizePathInfo(ctx, provider, p); err != nil {
+			return err
 		}
-		res, cErr := config.CanonicalizeHost(ctx, config.CanonicalizeInput{
-			Provider:         provider,
-			Host:             p.Host,
-			RawCLIOptions:    o.control.Options,
-			CLIProxyJump:     o.JumpHost,
-			MatchedSavedNode: matchedSavedNode,
-		})
-		if cErr != nil {
-			return "", nil, cErr
+	}
+	return nil
+}
+
+func (o *ScpOptions) canonicalizePathInfo(ctx context.Context, provider config.ConfigProvider, p PathInfo) (PathInfo, error) {
+	if p.Host == "" || o.Tag != "" || o.HostFile != "" || strings.Contains(o.Host, ",") {
+		return p, nil
+	}
+	if strings.HasPrefix(p.Host, config.OpenSSHNodePrefix) {
+		if stripped, ok := config.OpenSSHOriginalHost(p.Host); ok && p.OriginalHost == "" {
+			p.OriginalHost = stripped
+		}
+		return p, nil
+	}
+	if res, ok := o.canonicalCache[p.Host]; ok {
+		if p.OriginalHost == "" {
+			p.OriginalHost = res.OriginalHost
 		}
 		if res.Canonicalized {
 			p.Host = res.CanonicalHost
 		}
+		return p, nil
+	}
+	var matchedSavedNode bool
+	if target, tErr := o.resolveTargetForPath(p); tErr == nil {
+		if resolved, rErr := config.ResolveTarget(provider, target); rErr == nil {
+			matchedSavedNode = resolved.MatchedNodeID != "" &&
+				!strings.HasPrefix(resolved.MatchedNodeID, config.OpenSSHNodePrefix) &&
+				strings.TrimSpace(resolved.Host) != ""
+		}
+	}
+	res, cErr := config.CanonicalizeHost(ctx, config.CanonicalizeInput{
+		Provider:         provider,
+		Host:             p.Host,
+		RawCLIOptions:    o.control.Options,
+		CLIProxyJump:     o.JumpHost,
+		MatchedSavedNode: matchedSavedNode,
+	})
+	if cErr != nil {
+		return p, cErr
+	}
+	if o.canonicalCache == nil {
+		o.canonicalCache = make(map[string]config.CanonicalizeResult)
+	}
+	o.canonicalCache[p.Host] = res
+	if p.OriginalHost == "" {
+		p.OriginalHost = res.OriginalHost
+	}
+	if res.Canonicalized {
+		p.Host = res.CanonicalHost
+	}
+	return p, nil
+}
+
+func (o *ScpOptions) connectSftpForPath(ctx context.Context, p PathInfo, specificPassword string, provider config.ConfigProvider, connector *ssh.Connector) (string, *sftp.Client, error) {
+	var cErr error
+	p, cErr = o.canonicalizePathInfo(ctx, provider, p)
+	if cErr != nil {
+		return "", nil, cErr
 	}
 	nodeID, _, err := o.getOrCreateNodeForPath(ctx, provider, p, specificPassword)
 	if err != nil {
@@ -1108,7 +1157,8 @@ func (o *ScpOptions) getOrCreateNodeForPath(ctx context.Context, provider config
 }
 
 func (o *ScpOptions) updateNode(ctx context.Context, nodeID string, provider config.ConfigProvider, specificPassword string, shouldRemember bool) (bool, error) {
-	if strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) ||
+	if _, isRepo := provider.(*config.Repository); !isRepo ||
+		strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) ||
 		cmdutils.EffectiveRememberPolicy(o.Remember, provider.Snapshot()) == cmdutils.RememberPolicyNever {
 		if o.JumpHost != "" {
 			if _, err := provider.ResolveProxyJumpChain(o.JumpHost); err != nil {
@@ -1164,14 +1214,6 @@ func (o *ScpOptions) updateNodeAuth(identity *models.Identity, specificPassword 
 				identity.AuthType = "key"
 				updated = true
 			}
-		}
-
-	} else if o.IdentityFile != "" {
-		absKeyPath := cmdutils.ToAbsolutePath(o.IdentityFile)
-		if identity.KeyPath != absKeyPath || identity.AuthType != "key" {
-			identity.KeyPath = absKeyPath
-			identity.AuthType = "key"
-			updated = true
 		}
 	}
 
@@ -1230,24 +1272,37 @@ func (o *ScpOptions) credentialConnectorWithInteraction(provider config.ConfigPr
 	if err := o.ensureGeneralOptionsApplied(); err != nil {
 		return nil, err
 	}
-	shouldRemember, adpOpts := interaction.rememberOptions(cmdutils.EffectiveRememberPolicy(o.Remember, cfg), cfg)
+	policy := cmdutils.EffectiveRememberPolicy(o.Remember, cfg)
+	shouldRemember, adpOpts := interaction.rememberOptions(policy, cfg)
 	batch := o.Tag != "" || strings.Contains(o.Host, ",") || o.HostFile != ""
 	adpOpts = append(adpOpts, adapter.WithLocalExecution(!batch), adapter.WithSessionAndForwardOptions(false))
 	shouldRemember = !batch && shouldRemember
+	suppressConfirm := policy == cmdutils.RememberPolicyNever || batch
+	if suppressConfirm {
+		adpOpts = append(adpOpts, adapter.WithSuppressNodeConfirmation(true))
+	}
 	if batch {
 		adpOpts = append(adpOpts, adapter.WithNonInteractive(true))
 	}
-	targetNodes := o.resolvedTargetNodeIDs(provider)
+	targetNodes, nodeOriginalHosts := o.resolvedTargetNodeIDsWithOriginals(provider)
 	o.targetNodeIDs = targetNodes
 	hostNameOverride, hostErr := o.effectiveHostName()
 	if hostErr != nil {
 		return nil, hostErr
 	}
 	authOverride := o.buildSessionAuthOverride(hostNameOverride, shouldRemember)
+	authOverride.SuppressNodeConfirmation = suppressConfirm
 	if len(targetNodes) > 0 {
-		adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{Remember: shouldRemember}))
+		adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{
+			Remember:                 shouldRemember,
+			SuppressNodeConfirmation: suppressConfirm,
+		}))
 		for _, nodeID := range targetNodes {
-			adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, authOverride))
+			nodeAuth := authOverride
+			if origHost := nodeOriginalHosts[nodeID]; origHost != "" {
+				nodeAuth.OriginalHost = origHost
+			}
+			adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, nodeAuth))
 		}
 	} else {
 		globalAuth := authOverride
@@ -1255,22 +1310,8 @@ func (o *ScpOptions) credentialConnectorWithInteraction(provider config.ConfigPr
 		adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(globalAuth))
 	}
 
-	// Session Control Overrides (Tier 1)
-	sessionCtrlOpts, err := o.controlSessionOptions()
-	if err != nil {
+	if err := o.appendScpSessionControlOptions(&adpOpts, targetNodes); err != nil {
 		return nil, err
-	}
-	if !sessionCtrlOpts.IsEmpty() {
-		if len(targetNodes) > 0 {
-			if globalCtrl := sessionCtrlOpts.ConnectionWideOptions(); !globalCtrl.IsEmpty() {
-				adpOpts = append(adpOpts, adapter.WithGlobalSessionControl(globalCtrl))
-			}
-			for _, nodeID := range targetNodes {
-				adpOpts = append(adpOpts, adapter.WithSessionControlOverride(nodeID, sessionCtrlOpts))
-			}
-		} else {
-			adpOpts = append(adpOpts, adapter.WithGlobalSessionControl(sessionCtrlOpts))
-		}
 	}
 	if shouldRemember {
 		if repo, ok := provider.(*config.Repository); ok {
@@ -1295,6 +1336,23 @@ func (o *ScpOptions) credentialConnectorWithInteraction(provider config.ConfigPr
 	return connector, nil
 }
 
+func (o *ScpOptions) appendScpSessionControlOptions(adpOpts *[]adapter.Option, targetNodes []string) error {
+	sessionCtrlOpts, err := o.controlSessionOptions()
+	if err != nil {
+		return err
+	}
+	if sessionCtrlOpts.IsEmpty() {
+		return nil
+	}
+	if globalCtrl := sessionCtrlOpts.ConnectionWideOptions(); !globalCtrl.IsEmpty() {
+		*adpOpts = append(*adpOpts, adapter.WithGlobalSessionControl(globalCtrl))
+	}
+	for _, nodeID := range targetNodes {
+		*adpOpts = append(*adpOpts, adapter.WithSessionControlOverride(nodeID, sessionCtrlOpts))
+	}
+	return nil
+}
+
 func (o *ScpOptions) buildSessionAuthOverride(hostNameOverride string, shouldRemember bool) adapter.SessionAuth {
 	absKeys := o.absIdentityFiles()
 	keyPath := normalizeCLIIdentityPath(o.IdentityFile)
@@ -1314,12 +1372,32 @@ func (o *ScpOptions) buildSessionAuthOverride(hostNameOverride string, shouldRem
 }
 
 func (o *ScpOptions) resolvedTargetNodeIDs(provider config.ConfigProvider) []string {
+	nodeIDs, _ := o.resolvedTargetNodeIDsWithOriginals(provider)
+	return nodeIDs
+}
+
+func (o *ScpOptions) resolvedTargetNodeIDsWithOriginals(provider config.ConfigProvider) ([]string, map[string]string) {
 	if provider == nil {
-		return nil
+		return nil, nil
 	}
 	var nodeIDs []string
+	originals := make(map[string]string)
 	seen := make(map[string]struct{})
 	for _, p := range o.collectTargetPaths(provider) {
+		origHost := p.OriginalHost
+		if res, ok := o.canonicalCache[p.Host]; ok {
+			if origHost == "" {
+				origHost = res.OriginalHost
+			}
+			if res.Canonicalized {
+				p.Host = res.CanonicalHost
+			}
+		}
+		if origHost == "" {
+			if stripped, ok := config.OpenSSHOriginalHost(p.Host); ok {
+				origHost = stripped
+			}
+		}
 		target, err := o.resolveTargetForPath(p)
 		if err != nil || target.Selector == "" {
 			continue
@@ -1332,9 +1410,16 @@ func (o *ScpOptions) resolvedTargetNodeIDs(provider config.ConfigProvider) []str
 				seen[id] = struct{}{}
 				nodeIDs = append(nodeIDs, id)
 			}
+			if origHost != "" && originals[id] == "" {
+				originals[id] = origHost
+			} else if originals[id] == "" {
+				if stripped, ok := config.OpenSSHOriginalHost(id); ok {
+					originals[id] = stripped
+				}
+			}
 		}
 	}
-	return nodeIDs
+	return nodeIDs, originals
 }
 
 func (o *ScpOptions) collectTargetPaths(provider config.ConfigProvider) []PathInfo {

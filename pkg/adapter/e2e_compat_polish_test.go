@@ -100,6 +100,7 @@ func TestSessionControlOptions_ConnectionWideOptionsIsolation(t *testing.T) {
 		"HashKnownHosts=yes",
 		"VerifyHostKeyDNS=ask",
 		"ConnectTimeout=7",
+		"BatchMode=yes",
 		"IdentityAgent=/tmp/test-agent.sock",
 		"RemoteCommand=id",
 		"RequestTTY=force",
@@ -181,8 +182,9 @@ func assertJumpInheritedConnectionWide(t *testing.T, jumpCfg *ssh.ClientConfig, 
 	if opts.VerifyHostKeyDNS() != ssh.VerifyHostKeyDNSAsk ||
 		opts.AddressFamily() != ssh.AddressFamilyInet ||
 		opts.ConnectTimeout() != 7*time.Second ||
-		opts.IdentityAgent() != "/tmp/test-agent.sock" {
-		t.Fatalf("jump hop did not inherit transport/agent options: %+v", opts)
+		opts.IdentityAgent() != "/tmp/test-agent.sock" ||
+		!opts.BatchMode() {
+		t.Fatalf("jump hop did not inherit transport/agent/BatchMode options: %+v (BatchMode=%v)", opts, opts.BatchMode())
 	}
 }
 

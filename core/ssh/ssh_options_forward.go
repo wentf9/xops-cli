@@ -160,9 +160,19 @@ func (e ForwardEndpoint) LocalListenAddressWithNetwork(gatewayPorts bool, dialNe
 		if gatewayPorts {
 			return netw, ":" + strconv.Itoa(int(e.Port))
 		}
-		return netw, net.JoinHostPort("127.0.0.1", strconv.Itoa(int(e.Port)))
+		return netw, net.JoinHostPort(loopbackListenHost(netw), strconv.Itoa(int(e.Port)))
 	}
 	return netw, net.JoinHostPort(e.Host, strconv.Itoa(int(e.Port)))
+}
+
+// loopbackListenHost returns the loopback literal matching the listen network so
+// that a default (no bind host) local forward is listenable under AddressFamily:
+// "tcp6" binds "::1" (OpenSSH -6 behaviour); "tcp4" and "tcp" bind "127.0.0.1".
+func loopbackListenHost(network string) string {
+	if normalizeTCPDialNetwork(network) == "tcp6" {
+		return "::1"
+	}
+	return "127.0.0.1"
 }
 
 // RemoteListenAddress returns the network and address for remote listening using client-specified bind semantics.
@@ -377,6 +387,12 @@ func isASCIILetter(c byte) bool {
 }
 
 func formatSpecBindAddr(e ForwardEndpoint) string {
+	return formatSpecBindAddrForNetwork(e, "tcp")
+}
+
+// formatSpecBindAddrForNetwork renders the default local bind string for network
+// ("tcp", "tcp4", "tcp6"), choosing the loopback family when no bind host is set.
+func formatSpecBindAddrForNetwork(e ForwardEndpoint, network string) string {
 	if e.IsUnix() {
 		return e.SocketPath
 	}
@@ -385,7 +401,7 @@ func formatSpecBindAddr(e ForwardEndpoint) string {
 		return ":" + portStr
 	}
 	if !e.HasHost {
-		return net.JoinHostPort("127.0.0.1", portStr)
+		return net.JoinHostPort(loopbackListenHost(network), portStr)
 	}
 	return net.JoinHostPort(e.Host, portStr)
 }

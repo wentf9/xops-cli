@@ -668,9 +668,9 @@ func verifyKeyPartialSuccessMismatch(
 	if err := sshCfgKey.HostKeyCallback("10.0.0.1:22", remoteAddr, mismatchedServerKey); err != nil {
 		t.Fatalf("HostKeyCallback(key) failed: %v", err)
 	}
-	// Stage 0 (publickey): allowed (returns nil, nil so ClientConfig.Auth[0] runs)
-	if m, err := sshCfgKey.AuthCallback(&cryptoSSH.ClientAuthContext{AllowedMethods: []string{"publickey"}}); err != nil || m != nil {
-		t.Fatalf("expected stage 0 publickey to proceed, got method=%v err=%v", m, err)
+	// Stage 0 (publickey): allowed (either returns candidate method or delegates to ClientConfig.Auth[0])
+	if m, err := sshCfgKey.AuthCallback(&cryptoSSH.ClientAuthContext{AllowedMethods: []string{"publickey"}}); err != nil || (m == nil && len(sshCfgKey.Auth) == 0) {
+		t.Fatalf("expected stage 0 publickey to proceed, got method=%v authLen=%d err=%v", m, len(sshCfgKey.Auth), err)
 	}
 	// Stage 1 (after publickey PartialSuccess, server asks for keyboard-interactive): must fail closed with ErrHostKeyMismatch
 	if _, err := sshCfgKey.AuthCallback(&cryptoSSH.ClientAuthContext{

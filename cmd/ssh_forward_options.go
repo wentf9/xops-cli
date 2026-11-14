@@ -414,6 +414,9 @@ func (o *SshOptions) validateSubsystemFlags() error {
 	if o.effectiveNoCmd() {
 		return errors.New(i18n.T("ssh_err_subsystem_with_nocmd"))
 	}
+	if o.effectiveBgRun() {
+		return errors.New("subsystem (-s) cannot be combined with background mode (-f)")
+	}
 	if o.StdioForward != "" {
 		return errors.New(i18n.T("ssh_err_subsystem_with_stdio_forward"))
 	}
@@ -473,6 +476,7 @@ func (o *SshOptions) resolveAndCacheSessionOptions(provider config.ConfigProvide
 	if err != nil {
 		return nil, err
 	}
+	isChild := os.Getenv(sshBackgroundChildEnv) == "true"
 	if provider == nil {
 		eff, effErr := ssh.EffectiveOptions(sessionOpts.ToSSHOptions())
 		if effErr != nil {
@@ -481,6 +485,8 @@ func (o *SshOptions) resolveAndCacheSessionOptions(provider config.ConfigProvide
 		if isMuxDaemonChild() && eff != nil {
 			eff.StripClasses(ssh.OptionClassSession)
 			eff.Delete(ssh.OptionForwardAgent)
+		} else if isChild && eff != nil {
+			eff.StripClasses(ssh.OptionClassLocalExec)
 		}
 		o.effectiveSSHOptions = eff
 		return eff, nil
@@ -492,7 +498,7 @@ func (o *SshOptions) resolveAndCacheSessionOptions(provider config.ConfigProvide
 	if lookupKey == "" {
 		lookupKey = connTarget.Selector
 	}
-	adpOpts := []adapter.Option{adapter.WithLocalExecution(!isMuxDaemonChild())}
+	adpOpts := []adapter.Option{adapter.WithLocalExecution(!isMuxDaemonChild() && !isChild)}
 	if jump := strings.TrimSpace(o.JumpHost); jump != "" {
 		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(lookupKey, adapter.SessionAuth{ProxyJump: jump}))
 	}
@@ -503,6 +509,8 @@ func (o *SshOptions) resolveAndCacheSessionOptions(provider config.ConfigProvide
 	if isMuxDaemonChild() && eff != nil {
 		eff.StripClasses(ssh.OptionClassSession, ssh.OptionClassLocalExec)
 		eff.Delete(ssh.OptionForwardAgent)
+	} else if isChild && eff != nil {
+		eff.StripClasses(ssh.OptionClassLocalExec)
 	}
 	o.effectiveSSHOptions = eff
 	return eff, nil

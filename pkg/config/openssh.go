@@ -103,7 +103,7 @@ func WithOpenSSHConfigOverride(base ConfigProvider, configPath string) (ConfigPr
 	if err != nil {
 		return nil, fmt.Errorf("create ephemeral ssh config override provider: %w", err)
 	}
-	return &openSSHOverrideProvider{Repository: repo}, nil
+	return &openSSHOverrideProvider{ConfigProvider: repo, repo: repo}, nil
 }
 
 type readOnlyRejectStore struct{}
@@ -117,7 +117,24 @@ func (readOnlyRejectStore) Save(*Configuration) error {
 }
 
 type openSSHOverrideProvider struct {
-	*Repository
+	ConfigProvider
+	repo *Repository
+}
+
+func (p *openSSHOverrideProvider) PrepareNodeContext(ctx context.Context, opts EnsureNodeOptions) (EnsureNodeResult, error) {
+	return p.repo.PrepareNodeContext(ctx, opts)
+}
+
+func (p *openSSHOverrideProvider) GetOpenSSHParser() *OpenSSHParser {
+	return p.repo.GetOpenSSHParser()
+}
+
+func (p *openSSHOverrideProvider) SetNodeOpenSSHAlias(nodeID, alias string) {
+	p.repo.SetNodeOpenSSHAlias(nodeID, alias)
+}
+
+func (p *openSSHOverrideProvider) NodeOpenSSHAlias(nodeID string) string {
+	return p.repo.NodeOpenSSHAlias(nodeID)
 }
 
 // ConfirmNodeContext is a no-op on the read-only override provider so ephemeral

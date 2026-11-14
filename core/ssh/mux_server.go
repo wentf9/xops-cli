@@ -117,6 +117,7 @@ type MuxServer struct {
 	allowAgentForward     bool
 	agentSocket           string
 	dialAgent             func(ctx context.Context, socket string) (net.Conn, error)
+	requestTimeout        time.Duration
 	logger                logger.DebugLogger
 
 	listener             net.Listener
@@ -836,6 +837,13 @@ func normalizeMuxForwardHost(host string, port uint32) string {
 	return trimmed
 }
 
+func (s *MuxServer) getLogger() logger.DebugLogger {
+	if s == nil || s.logger == nil {
+		return logger.NopLogger
+	}
+	return s.logger
+}
+
 func (s *MuxServer) effectiveDialNetwork() string {
 	if s == nil {
 		return "tcp"
@@ -885,7 +893,8 @@ func (s *MuxServer) resolveMuxForwardListen(fwdType uint32, listenHost string, l
 			if s.gatewayPorts || s.effectiveGatewayPortsMode() == GatewayPortsYes {
 				return dialNet, ":" + portStr, "*", nil
 			}
-			return dialNet, net.JoinHostPort("127.0.0.1", portStr), "127.0.0.1", nil
+			loopback := loopbackListenHost(dialNet)
+			return dialNet, net.JoinHostPort(loopback, portStr), loopback, nil
 		}
 		return dialNet, net.JoinHostPort(trimmed, portStr), trimmed, nil
 	case MUX_FWD_REMOTE:
@@ -2527,6 +2536,36 @@ func (ps *proxySessionState) forwardUpstreamAgentChannelOpen(newCh cryptoSSH.New
 	go ps.streamChannelData(pc)
 }
 
+func (ps *proxySessionState) acquireChannelAgentLease() (*agentForwardLease, bool) {
+	if ps.server == nil || ps.server.sshClient == nil || !ps.server.allowAgentForward {
+		if ps.server != nil {
+			ps.server.getLogger().Debugf("mux: rejecting MUX_C_PROXY %s because master AllowAgentForward is disabled", agentForwardRequestType)
+		}
+		return nil, false
+	}
+	router, rErr := getOrCreateAgentRouter(ps.server.sshClient)
+	if rErr != nil {
+		ps.server.getLogger().Debugf("mux: failed to initialize agent router for MUX_C_PROXY session: %v", rErr)
+		return nil, false
+	}
+	lease, lErr := router.acquireProxyLease(ps, ps.server.getLogger())
+	if lErr != nil || lease == nil {
+		return nil, false
+	}
+	return lease, true
+}
+
+func (ps *proxySessionState) writeChannelReply(pc *proxyChan, success bool) error {
+	w := newMuxWriter()
+	if success {
+		w.buf = append(w.buf, msgChannelSuccess)
+	} else {
+		w.buf = append(w.buf, msgChannelFailure)
+	}
+	w.WriteUint32(pc.clientCh)
+	return ps.writeChannelPacket(pc, w.Bytes())
+}
+
 // serveChannelRequests forwards queued channel requests in wire order and
 // answers want-reply requests in the same order.
 func (ps *proxySessionState) serveChannelRequests(pc *proxyChan) {
@@ -2540,9 +2579,14 @@ func (ps *proxySessionState) serveChannelRequests(pc *proxyChan) {
 			return
 		}
 		var newAgentLease *agentForwardLease
-		if req.requestType == agentForwardRequestType && ps.server != nil && ps.server.sshClient != nil {
-			if router, rErr := getOrCreateAgentRouter(ps.server.sshClient); rErr == nil {
-				newAgentLease = router.acquireProxyLease(ps)
+		if req.requestType == agentForwardRequestType {
+			var allowed bool
+			newAgentLease, allowed = ps.acquireChannelAgentLease()
+			if !allowed {
+				if req.wantReply && ps.writeChannelReply(pc, false) != nil {
+					return
+				}
+				continue
 			}
 		}
 		accepted, err := pc.remoteCh.SendRequest(req.requestType, req.wantReply, req.payload)
@@ -2556,14 +2600,7 @@ func (ps *proxySessionState) serveChannelRequests(pc *proxyChan) {
 		if !req.wantReply {
 			continue
 		}
-		w := newMuxWriter()
-		if err == nil && accepted {
-			w.buf = append(w.buf, msgChannelSuccess)
-		} else {
-			w.buf = append(w.buf, msgChannelFailure)
-		}
-		w.WriteUint32(pc.clientCh)
-		if err := ps.writeChannelPacket(pc, w.Bytes()); err != nil {
+		if ps.writeChannelReply(pc, err == nil && accepted) != nil {
 			return
 		}
 	}

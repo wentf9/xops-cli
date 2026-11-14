@@ -522,3 +522,65 @@ func TestCredentialVersionBindsDefaultIdentitySidecarCert(t *testing.T) {
 		t.Fatal("IdentitiesOnly=yes without explicit key must bind default sidecar cert rotation")
 	}
 }
+
+func TestCredentialVersionExpandsPercentNWithoutOpenSSHPrefixAndCapsOversizedCert(t *testing.T) {
+	dir := t.TempDir()
+	openSSHText := "Host web\n" +
+		" HostName 192.0.2.10\n" +
+		" Port 22\n" +
+		" User fixture\n" +
+		" CertificateFile " + filepath.ToSlash(filepath.Join(dir, "%n-cert.pub")) + "\n"
+	parser, err := config.NewOpenSSHParserFromReader(strings.NewReader(openSSHText))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := credentialBindingConfig()
+	provider := config.NewProviderWithOpenSSHParser(cfg, parser)
+
+	// Pass NodeID="openssh:web" with empty OriginalHost to verify OpenSSHOriginalHost stripping on %n.
+	hop := ssh.ConnectionConfig{
+		NodeID:  "openssh:web",
+		Address: "192.0.2.10",
+		Port:    22,
+		User:    "fixture",
+		Options: ssh.MustOptions(ssh.OptionCertificateFile, filepath.Join(dir, "%n-cert.pub")),
+	}
+	vMissing, err := credentialVersion(provider, ssh.ConnectionPlan{Scope: "scope", Hops: []ssh.ConnectionConfig{hop}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Write cert at <dir>/web-cert.pub (NOT <dir>/openssh:web-cert.pub!).
+	webCert := filepath.Join(dir, "web-cert.pub")
+	writeTestUserCertForBinding(t, webCert, 77, 8000)
+	vPresent, err := credentialVersion(provider, ssh.ConnectionPlan{Scope: "scope", Hops: []ssh.ConnectionConfig{hop}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vPresent == vMissing {
+		t.Fatal("CertificateFile %n expansion on openssh:web must bind <dir>/web-cert.pub")
+	}
+
+	writeTestUserCertForBinding(t, webCert, 78, 9000)
+	vRotated, err := credentialVersion(provider, ssh.ConnectionPlan{Scope: "scope", Hops: []ssh.ConnectionConfig{hop}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vRotated == vPresent {
+		t.Fatal("rotating <dir>/web-cert.pub must change credentialVersion")
+	}
+
+	// Oversized regular file (> 256 KiB) is bounded via LimitReader without failing or reading unboundedly.
+	hugePath := filepath.Join(dir, "huge-cert.pub")
+	hugePayload := make([]byte, maxMCPCertBindingBytes+64*1024)
+	for i := range hugePayload {
+		hugePayload[i] = byte('a' + (i % 26))
+	}
+	if err := os.WriteFile(hugePath, hugePayload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	binding, ok := inspectCertificateBinding(hugePath, true)
+	if !ok || !binding.Truncated || binding.RawSHA256 == "" || binding.NonRegular || binding.Missing {
+		t.Fatalf("unexpected oversized cert binding: %+v ok=%v", binding, ok)
+	}
+}

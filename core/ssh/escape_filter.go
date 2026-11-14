@@ -13,6 +13,24 @@ import (
 
 type escapeState uint8
 
+type escapeDisconnectError struct{}
+
+func (escapeDisconnectError) Error() string {
+	return "ssh session disconnected via escape sequence"
+}
+
+func (escapeDisconnectError) ExitCode() int {
+	return 255
+}
+
+func (escapeDisconnectError) AlreadyReported() bool {
+	return true
+}
+
+// ErrEscapeDisconnect is returned when an interactive PTY session terminates
+// locally via the OpenSSH `<newline><EscapeChar>.` disconnect sequence.
+var ErrEscapeDisconnect error = escapeDisconnectError{}
+
 const (
 	escapeStateLineStart escapeState = iota
 	escapeStateNormal

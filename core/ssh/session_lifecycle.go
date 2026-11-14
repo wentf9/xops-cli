@@ -150,7 +150,10 @@ func (c *Client) runTerminalSession(ctx context.Context, payload string, streams
 	}
 	outputErr := joinTerminalOutput(ctx, output.wait, cancelOutput)
 	if escapeFilter.Disconnected() && ctx.Err() == nil {
-		return closeErr
+		if closeErr == nil {
+			return ErrEscapeDisconnect
+		}
+		return errors.Join(ErrEscapeDisconnect, closeErr)
 	}
 	return errors.Join(waitErr, closeErr, inputErr, outputErr)
 }

@@ -362,14 +362,26 @@ func assertPhase2SessionEnvBounds(t *testing.T) {
 	for i := range MaxSessionEnvVars + 1 {
 		manyEnv = append(manyEnv, fmt.Sprintf("VAR_%03d=val", i))
 	}
-	if _, err := ResolveSessionEnv(tooManyOpts, func() []string { return manyEnv }); !errors.Is(err, ErrSSHOptionsValidation) {
-		t.Fatalf("expected >%d env vars to fail with ErrSSHOptionsValidation, got %v", MaxSessionEnvVars, err)
+	capped, err := ResolveSessionEnv(tooManyOpts, func() []string { return manyEnv })
+	if err != nil || len(capped) != MaxSessionEnvVars {
+		t.Fatalf("expected >%d SendEnv host vars to skip past cap without error, got len=%d err=%v", MaxSessionEnvVars, len(capped), err)
 	}
 
 	hugeVal := strings.Repeat("a", MaxSessionEnvEntryBytes)
 	hugeOpts := MustOptions(OptionSendEnv, "HUGE_VAR")
-	if _, err := ResolveSessionEnv(hugeOpts, func() []string { return []string{"HUGE_VAR=" + hugeVal} }); !errors.Is(err, ErrSSHOptionsValidation) {
-		t.Fatalf("expected >32KiB env entry to fail with ErrSSHOptionsValidation, got %v", err)
+	skippedHuge, err := ResolveSessionEnv(hugeOpts, func() []string { return []string{"HUGE_VAR=" + hugeVal} })
+	if err != nil || len(skippedHuge) != 0 {
+		t.Fatalf("expected >32KiB SendEnv host entry to be skipped without error, got %+v err=%v", skippedHuge, err)
+	}
+
+	tooManySetEnv := &Options{}
+	for i := range MaxSessionEnvVars + 1 {
+		if err := tooManySetEnv.Append("SetEnv", fmt.Sprintf("SET_%03d=val", i)); err != nil {
+			t.Fatalf("Append(SetEnv, %d): %v", i, err)
+		}
+	}
+	if _, err := ResolveSessionEnv(tooManySetEnv, nil); !errors.Is(err, ErrSSHOptionsValidation) {
+		t.Fatalf("expected >%d explicit SetEnv vars to fail with ErrSSHOptionsValidation, got %v", MaxSessionEnvVars, err)
 	}
 
 	badOpts := &Options{}

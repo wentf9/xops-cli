@@ -11,13 +11,15 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const (
-	proxyCloseGracePeriod = 200 * time.Millisecond
-	proxyTermGracePeriod  = 100 * time.Millisecond
-	stderrLineChunkSize   = 4096
+	proxyCloseGracePeriod       = 200 * time.Millisecond
+	proxyTermGracePeriod        = 100 * time.Millisecond
+	proxyStderrCloseGracePeriod = 250 * time.Millisecond
+	stderrLineChunkSize         = 4096
 )
 
 type processAddr string
@@ -25,9 +27,9 @@ type processAddr string
 func (processAddr) Network() string  { return "stdio" }
 func (a processAddr) String() string { return string(a) }
 
-// ProcessStdioConn wraps a localProxyCommand child process's stdin and stdout pipes
+// ProcessStdioConn wraps a local ProxyCommand child process's stdin and stdout pipes
 // as a net.Conn while isolating stderr onto a bounded background forwarder and ensuring
-// idempotent process-group / Job-Object cleanup on Close.
+// idempotent child / process-group / Job-Object cleanup on Close.
 type ProcessStdioConn struct {
 	stdinW  *os.File
 	stdoutR *os.File
@@ -41,6 +43,8 @@ type ProcessStdioConn struct {
 	closed        bool
 	readTimer     *time.Timer
 	writeTimer    *time.Timer
+	readGen       uint64
+	writeGen      uint64
 	readTimedOut  bool
 	writeTimedOut bool
 
@@ -52,8 +56,8 @@ type ProcessStdioConn struct {
 var _ net.Conn = (*ProcessStdioConn)(nil)
 
 // DefaultDialProxyCommand spawns command under the platform shell ($SHELL -c on Unix,
-// cmd.exe /d /s /c on Windows) in an isolated process group / Job Object, wrapping only
-// stdin/stdout as a net.Conn and forwarding stderr lines to os.Stderr.
+// cmd.exe /d /s /c on Windows), wrapping only stdin/stdout as a net.Conn and forwarding
+// stderr lines to os.Stderr.
 func DefaultDialProxyCommand(ctx context.Context, command string) (net.Conn, error) {
 	return DialProxyCommandWithStderr(ctx, command, os.Stderr)
 }
@@ -133,13 +137,13 @@ func DialProxyCommandWithStderr(ctx context.Context, command string, stderr io.W
 }
 
 // DefaultRunLocalCommand executes command locally with stdin bound to os.DevNull and
-// stdout/stderr connected to os.Stdout/os.Stderr inside an isolated process group / Job Object.
+// stdout/stderr connected to os.Stdout/os.Stderr.
 func DefaultRunLocalCommand(ctx context.Context, command string) error {
 	return RunLocalCommandWithIO(ctx, command, os.Stdout, os.Stderr)
 }
 
 // RunLocalCommandWithIO executes command locally with stdin bound to os.DevNull and
-// stdout/stderr connected to the supplied writers inside an isolated process group / Job Object.
+// stdout/stderr connected to the supplied writers.
 func RunLocalCommandWithIO(ctx context.Context, command string, stdout, stderr io.Writer) error {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
@@ -173,12 +177,14 @@ func RunLocalCommandWithIO(ctx context.Context, command string, stdout, stderr i
 		waitErr = cmd.Wait()
 	}()
 
+	var canceledByCtx atomic.Bool
 	var stopCancel func() bool
 	var cancelDone chan struct{}
 	if ctx != nil {
 		cancelDone = make(chan struct{})
 		stopCancel = context.AfterFunc(ctx, func() {
 			defer close(cancelDone)
+			canceledByCtx.Store(true)
 			proc.terminateTree(proxyTermGracePeriod, waitDone)
 		})
 	}
@@ -186,7 +192,7 @@ func RunLocalCommandWithIO(ctx context.Context, command string, stdout, stderr i
 	if stopCancel != nil && !stopCancel() {
 		<-cancelDone
 	}
-	proc.cleanupAfterWait()
+	proc.cleanupAfterWait(canceledByCtx.Load())
 
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
@@ -281,7 +287,6 @@ func (c *ProcessStdioConn) setPipeDeadline(f *os.File, t time.Time, isRead bool)
 		c.mu.Unlock()
 		return net.ErrClosed
 	}
-	c.stopTimerLocked(isRead)
 	c.mu.Unlock()
 
 	var err error
@@ -291,6 +296,13 @@ func (c *ProcessStdioConn) setPipeDeadline(f *os.File, t time.Time, isRead bool)
 		err = f.SetWriteDeadline(t)
 	}
 	if err == nil {
+		c.mu.Lock()
+		c.advanceTimerGenLocked(isRead)
+		closed := c.closed
+		c.mu.Unlock()
+		if closed {
+			return net.ErrClosed
+		}
 		return nil
 	}
 	if !errors.Is(err, os.ErrNoDeadline) {
@@ -299,53 +311,70 @@ func (c *ProcessStdioConn) setPipeDeadline(f *os.File, t time.Time, isRead bool)
 		}
 		return err
 	}
+	return c.setFallbackDeadline(f, t, isRead)
+}
 
+func (c *ProcessStdioConn) setFallbackDeadline(closer io.Closer, t time.Time, isRead bool) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.closed {
+		c.mu.Unlock()
 		return net.ErrClosed
 	}
+	gen := c.advanceTimerGenLocked(isRead)
 	if t.IsZero() {
+		c.mu.Unlock()
 		return nil
 	}
 	d := time.Until(t)
 	if d <= 0 {
 		c.markTimedOutLocked(isRead)
-		_ = f.Close()
+		c.mu.Unlock()
+		_ = closer.Close()
 		return nil
 	}
 	timer := time.AfterFunc(d, func() {
 		c.mu.Lock()
-		if c.closed {
+		if c.closed || c.timerGenLocked(isRead) != gen {
 			c.mu.Unlock()
 			return
 		}
 		c.markTimedOutLocked(isRead)
 		c.mu.Unlock()
-		_ = f.Close()
+		_ = closer.Close()
 	})
 	if isRead {
 		c.readTimer = timer
 	} else {
 		c.writeTimer = timer
 	}
+	c.mu.Unlock()
 	return nil
 }
 
-func (c *ProcessStdioConn) stopTimerLocked(isRead bool) {
+func (c *ProcessStdioConn) advanceTimerGenLocked(isRead bool) uint64 {
 	if isRead {
+		c.readGen++
 		if c.readTimer != nil {
 			c.readTimer.Stop()
 			c.readTimer = nil
 		}
 		c.readTimedOut = false
-		return
+		return c.readGen
 	}
+	c.writeGen++
 	if c.writeTimer != nil {
 		c.writeTimer.Stop()
 		c.writeTimer = nil
 	}
 	c.writeTimedOut = false
+	return c.writeGen
+}
+
+func (c *ProcessStdioConn) timerGenLocked(isRead bool) uint64 {
+	if isRead {
+		return c.readGen
+	}
+	return c.writeGen
 }
 
 func (c *ProcessStdioConn) markTimedOutLocked(isRead bool) {
@@ -357,14 +386,14 @@ func (c *ProcessStdioConn) markTimedOutLocked(isRead bool) {
 }
 
 // Close idempotently closes the child's stdin/stdout pipes, waits up to 200ms for
-// graceful EOF exit, terminates the entire process group / Job Object if still alive,
-// and joins both the stderr forwarder and cmd.Wait() so no zombies or goroutines leak.
+// graceful EOF exit, terminates the child / process group / Job Object if still alive,
+// and joins cmd.Wait() plus a bounded stderr forwarder drain so Close never hangs.
 func (c *ProcessStdioConn) Close() error {
 	c.closeOnce.Do(func() {
 		c.mu.Lock()
 		c.closed = true
-		c.stopTimerLocked(true)
-		c.stopTimerLocked(false)
+		c.advanceTimerGenLocked(true)
+		c.advanceTimerGenLocked(false)
 		c.mu.Unlock()
 
 		var errs []error
@@ -386,7 +415,13 @@ func (c *ProcessStdioConn) Close() error {
 		<-c.waitDone
 		c.proc.reapRemainingGroup(proxyTermGracePeriod, c.stderrDone)
 		_ = c.stderrR.Close()
-		<-c.stderrDone
+
+		stderrTimer := time.NewTimer(proxyStderrCloseGracePeriod)
+		select {
+		case <-c.stderrDone:
+			stderrTimer.Stop()
+		case <-stderrTimer.C:
+		}
 
 		c.closeErr = errors.Join(errs...)
 	})

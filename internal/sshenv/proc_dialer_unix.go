@@ -11,23 +11,70 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
+	"golang.org/x/term"
 )
 
 const fallbackPosixShell = "/bin/sh"
 
+var probeControllingTTY = defaultHasControllingTTY
+
 type platformProc struct {
-	pgid int
+	process       *os.Process
+	pgid          int // > 0 only when isolated with Setpgid: true (headless mode)
+	foregroundTTY bool
+}
+
+// defaultHasControllingTTY reports whether the current process is attached to a
+// controlling terminal in its foreground process group. Matching OpenSSH
+// ssh_proxy_connect, foreground TTY invocations keep ProxyCommand / LocalCommand
+// in the caller's process group so /dev/tty prompts and tcsetattr succeed
+// without SIGTTIN / SIGTTOU stops, whereas headless invocations isolate the
+// child in its own process group.
+func defaultHasControllingTTY() bool {
+	fd, err := unix.Open("/dev/tty", unix.O_RDWR|unix.O_NOCTTY|unix.O_CLOEXEC, 0)
+	if err == nil {
+		fgPGID, pgrpErr := unix.IoctlGetInt(fd, unix.TIOCGPGRP)
+		_ = unix.Close(fd)
+		if pgrpErr == nil && fgPGID > 0 {
+			return fgPGID == unix.Getpgrp()
+		}
+		return true
+	}
+	return isForegroundTerminalFD(int(os.Stdin.Fd())) || isForegroundTerminalFD(int(os.Stderr.Fd()))
+}
+
+func isForegroundTerminalFD(fd int) bool {
+	if !term.IsTerminal(fd) {
+		return false
+	}
+	if fgPGID, err := unix.IoctlGetInt(fd, unix.TIOCGPGRP); err == nil && fgPGID > 0 {
+		return fgPGID == unix.Getpgrp()
+	}
+	return true
 }
 
 func startPlatformShellCommand(command string, stdin io.Reader, stdout, stderr io.Writer) (*platformProc, *exec.Cmd, error) {
 	shell := resolveUserShell(os.Getenv("SHELL"))
 	cmd := exec.Command(shell, "-c", command)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	foregroundTTY := probeControllingTTY()
+	if !foregroundTTY {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	}
 	attachCommandIO(cmd, stdin, stdout, stderr)
 	if err := cmd.Start(); err != nil {
 		return nil, nil, fmt.Errorf("start local shell command via %s: %w", shell, err)
 	}
-	return &platformProc{pgid: cmd.Process.Pid}, cmd, nil
+	pgid := 0
+	if !foregroundTTY {
+		pgid = cmd.Process.Pid
+	}
+	return &platformProc{
+		process:       cmd.Process,
+		pgid:          pgid,
+		foregroundTTY: foregroundTTY,
+	}, cmd, nil
 }
 
 func resolveUserShell(raw string) string {
@@ -43,10 +90,33 @@ func resolveUserShell(raw string) string {
 }
 
 func (p *platformProc) terminateTree(termGrace time.Duration, done <-chan struct{}) {
-	if p == nil || p.pgid <= 0 {
+	if p == nil {
 		return
 	}
+	if p.foregroundTTY || p.pgid <= 0 {
+		if p.process == nil {
+			return
+		}
+		_ = p.process.Signal(syscall.SIGHUP)
+		_ = p.process.Signal(syscall.SIGTERM)
+		if done == nil {
+			return
+		}
+		timer := time.NewTimer(termGrace)
+		defer timer.Stop()
+		select {
+		case <-done:
+			return
+		case <-timer.C:
+			_ = p.process.Kill()
+		}
+		return
+	}
+
 	_ = syscall.Kill(-p.pgid, syscall.SIGTERM)
+	if p.process != nil {
+		_ = p.process.Signal(syscall.SIGTERM)
+	}
 	if done == nil {
 		return
 	}
@@ -57,11 +127,14 @@ func (p *platformProc) terminateTree(termGrace time.Duration, done <-chan struct
 		return
 	case <-timer.C:
 		_ = syscall.Kill(-p.pgid, syscall.SIGKILL)
+		if p.process != nil {
+			_ = p.process.Kill()
+		}
 	}
 }
 
 func (p *platformProc) reapRemainingGroup(termGrace time.Duration, stderrDone <-chan struct{}) {
-	if p == nil || p.pgid <= 0 {
+	if p == nil || p.foregroundTTY || p.pgid <= 0 {
 		return
 	}
 	if syscall.Kill(-p.pgid, 0) != nil {
@@ -83,8 +156,8 @@ func (p *platformProc) reapRemainingGroup(termGrace time.Duration, stderrDone <-
 	_ = syscall.Kill(-p.pgid, syscall.SIGKILL)
 }
 
-func (p *platformProc) cleanupAfterWait() {
-	if p == nil || p.pgid <= 0 {
+func (p *platformProc) cleanupAfterWait(canceled bool) {
+	if p == nil || p.foregroundTTY || p.pgid <= 0 || !canceled {
 		return
 	}
 	if syscall.Kill(-p.pgid, 0) == nil {

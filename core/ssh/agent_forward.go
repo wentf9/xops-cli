@@ -23,7 +23,10 @@ const (
 	agentForwardChannelType  = "auth-agent@openssh.com"
 	agentForwardRequestType  = "auth-agent-req@openssh.com"
 	agentForwardDrainTimeout = time.Second
+	agentNonHalfCloseGrace   = 250 * time.Millisecond
 )
+
+var errAgentLeaseConflict = errors.New("conflicting agent forwarding target is already active on this SSH connection")
 
 // ResolveForwardAgent resolves an OpenSSH ForwardAgent specification against
 // identityAgentSpec, env, and target.
@@ -85,6 +88,10 @@ type agentForwardLease struct {
 }
 
 func (l *agentForwardLease) Release() {
+	l.releaseWithDeadline(time.Now().Add(agentForwardDrainTimeout))
+}
+
+func (l *agentForwardLease) releaseWithDeadline(deadline time.Time) {
 	if l == nil {
 		return
 	}
@@ -119,7 +126,18 @@ func (l *agentForwardLease) Release() {
 			close(drained)
 		}()
 
-		timer := time.NewTimer(agentForwardDrainTimeout)
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			select {
+			case <-drained:
+			default:
+				if l.logger != nil {
+					l.logger.Debugf("ForwardAgent: timed out after %s waiting for forwarded agent channels to drain", agentForwardDrainTimeout)
+				}
+			}
+			return
+		}
+		timer := time.NewTimer(remaining)
 		defer timer.Stop()
 		select {
 		case <-drained:
@@ -200,17 +218,51 @@ func getOrCreateAgentRouter(sshClient *cryptoSSH.Client) (*sshAgentChannelRouter
 	return router, nil
 }
 
+func isLeaseActiveLocked(cand *agentForwardLease) bool {
+	if cand == nil || cand.isClosed() {
+		return false
+	}
+	if cand.proxy != nil && cand.proxy.closed.Load() {
+		return false
+	}
+	return true
+}
+
+func (r *sshAgentChannelRouter) hasConflictingActiveLeaseLocked(socket string, proxy *proxySessionState) bool {
+	for _, cand := range r.leases {
+		if !isLeaseActiveLocked(cand) {
+			continue
+		}
+		if proxy != nil {
+			if cand.proxy != proxy {
+				return true
+			}
+			continue
+		}
+		if cand.proxy != nil || cand.socket != socket {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *sshAgentChannelRouter) acquireLocalLease(
 	ctx context.Context,
 	socket string,
 	dialAgent func(context.Context, string) (net.Conn, error),
 	l logger.DebugLogger,
-) *agentForwardLease {
+) (*agentForwardLease, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if l == nil {
 		l = logger.NopLogger
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.hasConflictingActiveLeaseLocked(socket, nil) {
+		l.Debugf("ForwardAgent: rejecting conflicting local agent lease for %q on shared SSH connection", socket)
+		return nil, errAgentLeaseConflict
 	}
 	leaseCtx, cancel := context.WithCancel(ctx)
 	lease := &agentForwardLease{
@@ -221,25 +273,30 @@ func (r *sshAgentChannelRouter) acquireLocalLease(
 		dialAgent: dialAgent,
 		logger:    l,
 	}
-	r.mu.Lock()
 	r.leases = append(r.leases, lease)
-	r.mu.Unlock()
-	return lease
+	return lease, nil
 }
 
-func (r *sshAgentChannelRouter) acquireProxyLease(ps *proxySessionState) *agentForwardLease {
+func (r *sshAgentChannelRouter) acquireProxyLease(ps *proxySessionState, l logger.DebugLogger) (*agentForwardLease, error) {
+	if l == nil {
+		l = logger.NopLogger
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.hasConflictingActiveLeaseLocked("", ps) {
+		l.Debugf("ForwardAgent: rejecting conflicting MUX_C_PROXY agent lease on shared SSH connection")
+		return nil, errAgentLeaseConflict
+	}
 	leaseCtx, cancel := context.WithCancel(context.Background())
 	lease := &agentForwardLease{
 		router: r,
 		ctx:    leaseCtx,
 		cancel: cancel,
 		proxy:  ps,
-		logger: logger.NopLogger,
+		logger: l,
 	}
-	r.mu.Lock()
 	r.leases = append(r.leases, lease)
-	r.mu.Unlock()
-	return lease
+	return lease, nil
 }
 
 func (r *sshAgentChannelRouter) removeLease(lease *agentForwardLease) {
@@ -250,15 +307,21 @@ func (r *sshAgentChannelRouter) removeLease(lease *agentForwardLease) {
 	r.mu.Unlock()
 }
 
-func (r *sshAgentChannelRouter) currentActiveLease() *agentForwardLease {
+func (r *sshAgentChannelRouter) beginActiveLease() *agentForwardLease {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for i := len(r.leases) - 1; i >= 0; i-- {
 		cand := r.leases[i]
-		if !cand.isClosed() {
-			if cand.proxy != nil && cand.proxy.closed.Load() {
-				continue
+		if cand == nil {
+			continue
+		}
+		if cand.proxy != nil {
+			if !cand.isClosed() && !cand.proxy.closed.Load() {
+				return cand
 			}
+			continue
+		}
+		if cand.tryBeginPump() {
 			return cand
 		}
 	}
@@ -284,12 +347,15 @@ func (r *sshAgentChannelRouter) releaseChannelSlot() {
 func (r *sshAgentChannelRouter) dispatchLoop(chans <-chan cryptoSSH.NewChannel) {
 	defer sshAgentRouters.Delete(r.sshClient)
 	for newCh := range chans {
-		lease := r.currentActiveLease()
+		lease := r.beginActiveLease()
 		if lease == nil {
 			_ = newCh.Reject(cryptoSSH.Prohibited, "agent forwarding is not enabled")
 			continue
 		}
 		if !r.tryAcquireChannelSlot() {
+			if lease.proxy == nil {
+				lease.pumps.Done()
+			}
 			_ = newCh.Reject(cryptoSSH.ResourceShortage, "too many concurrent agent forwarding channels")
 			continue
 		}
@@ -297,11 +363,6 @@ func (r *sshAgentChannelRouter) dispatchLoop(chans <-chan cryptoSSH.NewChannel) 
 			go func(ps *proxySessionState, ch cryptoSSH.NewChannel) {
 				ps.forwardUpstreamAgentChannelOpen(ch, r.releaseChannelSlot)
 			}(lease.proxy, newCh)
-			continue
-		}
-		if !lease.tryBeginPump() {
-			r.releaseChannelSlot()
-			_ = newCh.Reject(cryptoSSH.Prohibited, "agent forwarding session closed")
 			continue
 		}
 		go func(l *agentForwardLease, ch cryptoSSH.NewChannel) {
@@ -344,17 +405,23 @@ func (r *sshAgentChannelRouter) serveLocalAgentChannel(lease *agentForwardLease,
 		return
 	}
 
-	go cryptoSSH.DiscardRequests(reqs)
-
+	reverseDone := make(chan struct{})
+	closedCh := make(chan struct{})
 	var closeOnce sync.Once
 	closeBoth := func() {
 		closeOnce.Do(func() {
+			close(closedCh)
 			_ = agentConn.Close()
 			_ = sshCh.Close()
 			lease.removeActive(entry)
 			r.releaseChannelSlot()
 		})
 	}
+
+	go func() {
+		cryptoSSH.DiscardRequests(reqs)
+		closeBoth()
+	}()
 
 	var copyWG sync.WaitGroup
 	copyWG.Add(2)
@@ -364,13 +431,22 @@ func (r *sshAgentChannelRouter) serveLocalAgentChannel(lease *agentForwardLease,
 		_, _ = io.Copy(agentConn, sshCh)
 		if cw, ok := agentConn.(interface{ CloseWrite() error }); ok {
 			_ = cw.CloseWrite()
-		} else {
-			_ = agentConn.Close()
+			return
 		}
+		timer := time.NewTimer(agentNonHalfCloseGrace)
+		defer timer.Stop()
+		select {
+		case <-reverseDone:
+		case <-closedCh:
+		case <-lease.ctx.Done():
+		case <-timer.C:
+		}
+		_ = agentConn.Close()
 	}()
 
 	go func() {
 		defer copyWG.Done()
+		defer close(reverseDone)
 		_, _ = io.Copy(sshCh, agentConn)
 		_ = sshCh.CloseWrite()
 	}()
@@ -455,9 +531,19 @@ func (c *Client) releaseAllAgentLeases() {
 	}
 	clear(c.activeAgentLeases)
 	c.activeMu.Unlock()
-	for _, lease := range leases {
-		lease.Release()
+	if len(leases) == 0 {
+		return
 	}
+	deadline := time.Now().Add(agentForwardDrainTimeout)
+	var wg sync.WaitGroup
+	wg.Add(len(leases))
+	for _, lease := range leases {
+		go func(l *agentForwardLease) {
+			defer wg.Done()
+			l.releaseWithDeadline(deadline)
+		}(lease)
+	}
+	wg.Wait()
 }
 
 func (c *Client) acquireSessionAgentLease(ctx context.Context) *agentForwardLease {
@@ -470,7 +556,10 @@ func (c *Client) acquireSessionAgentLease(ctx context.Context) *agentForwardLeas
 		c.getLogger().Debugf("ForwardAgent disabled: %v", err)
 		return nil
 	}
-	lease := router.acquireLocalLease(ctx, sock, c.environment.DialAgent, c.getLogger())
+	lease, err := router.acquireLocalLease(ctx, sock, c.environment.DialAgent, c.getLogger())
+	if err != nil {
+		return nil
+	}
 	c.trackAgentLease(lease)
 	return lease
 }

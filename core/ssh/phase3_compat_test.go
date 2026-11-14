@@ -1234,12 +1234,50 @@ func assertPhase3MuxAgentForwarding(
 	sockPath := filepath.Join(os.TempDir(), fmt.Sprintf("xops-p3-mux-%d.sock", time.Now().UnixNano()))
 	t.Cleanup(func() { _ = os.Remove(sockPath) })
 
-	// Master has ForwardAgent=no (AllowAgentForward=false).
+	// 1. Master with ForwardAgent=no (AllowAgentForward=false) MUST gate MUX_C_PROXY
+	// auth-agent-req@openssh.com (both wantReply=true and wantReply=false).
+	deniedSockPath := filepath.Join(os.TempDir(), fmt.Sprintf("xops-p3-mux-deny-%d.sock", time.Now().UnixNano()))
+	t.Cleanup(func() { _ = os.Remove(deniedSockPath) })
+
+	deniedMasterOpts := newPhase3TrustAllOptions(t, dir)
+	_ = deniedMasterOpts.Set(OptionControlMaster, "yes")
+	_ = deniedMasterOpts.Set(OptionControlPath, deniedSockPath)
+	_ = deniedMasterOpts.Set(OptionControlPersist, "yes")
+	_ = deniedMasterOpts.Set(OptionForwardAgent, "no")
+
+	deniedMasterConn := NewConnector(&mapConfigProvider{configs: map[string]*ClientConfig{
+		"m": {NodeID: "m", Address: "127.0.0.1", Port: port, User: "alice", AuthType: "key", KeyPath: keyPath, Options: deniedMasterOpts},
+	}}, WithEnvironment(env))
+	t.Cleanup(func() { _ = deniedMasterConn.CloseAll() })
+	if _, err := deniedMasterConn.Connect(t.Context(), "m"); err != nil {
+		t.Fatalf("start denied mux master failed: %v", err)
+	}
+
+	deniedProxyOpts := newPhase3TrustAllOptions(t, dir)
+	_ = deniedProxyOpts.Set(OptionControlMaster, "no")
+	_ = deniedProxyOpts.Set(OptionControlPath, deniedSockPath)
+	_ = deniedProxyOpts.Set(OptionForwardAgent, "yes")
+	_ = deniedProxyOpts.Set(OptionIdentityAgent, agentSock)
+	deniedProxyConn := NewConnector(&mapConfigProvider{configs: map[string]*ClientConfig{
+		"m": {NodeID: "m", Address: "127.0.0.1", Port: port, User: "alice", AuthType: "key", KeyPath: keyPath, Options: deniedProxyOpts},
+	}}, WithEnvironment(env))
+	t.Cleanup(func() { _ = deniedProxyConn.CloseAll() })
+	deniedProxyCli, err := deniedProxyConn.Connect(t.Context(), "m")
+	if err != nil {
+		t.Fatalf("connect via denied mux proxy failed: %v", err)
+	}
+	deniedOut, err := deniedProxyCli.Run(t.Context(), "query-agent")
+	if !strings.Contains(deniedOut, "no-agent-req") || strings.Contains(deniedOut, "keys=1") {
+		t.Fatalf("expected master ForwardAgent=no to block MUX_C_PROXY agent forwarding, got out=%q err=%v", deniedOut, err)
+	}
+
+	// 2. Master with ForwardAgent=yes (AllowAgentForward=true) allows MUX_C_PROXY agent forwarding.
 	masterOpts := newPhase3TrustAllOptions(t, dir)
 	_ = masterOpts.Set(OptionControlMaster, "yes")
 	_ = masterOpts.Set(OptionControlPath, sockPath)
 	_ = masterOpts.Set(OptionControlPersist, "yes")
-	_ = masterOpts.Set(OptionForwardAgent, "no")
+	_ = masterOpts.Set(OptionForwardAgent, "yes")
+	_ = masterOpts.Set(OptionIdentityAgent, agentSock)
 
 	masterConn := NewConnector(&mapConfigProvider{configs: map[string]*ClientConfig{
 		"m": {NodeID: "m", Address: "127.0.0.1", Port: port, User: "alice", AuthType: "key", KeyPath: keyPath, Options: masterOpts},
@@ -1250,7 +1288,7 @@ func assertPhase3MuxAgentForwarding(
 		t.Fatalf("start mux master failed: %v", err)
 	}
 
-	// Passenger via MUX_C_PROXY (ControlMaster=no, ForwardAgent=yes) MUST forward agent to passenger's local agent!
+	// Passenger via MUX_C_PROXY (ControlMaster=no, ForwardAgent=yes) forwards agent when master allows it.
 	proxyOpts := newPhase3TrustAllOptions(t, dir)
 	_ = proxyOpts.Set(OptionControlMaster, "no")
 	_ = proxyOpts.Set(OptionControlPath, sockPath)
@@ -1318,7 +1356,10 @@ func assertPhase3MuxProxyWantReplyFalseAndCloseRace(
 	if err != nil {
 		t.Fatalf("getOrCreateAgentRouter on proxy SSH client failed: %v", err)
 	}
-	clientLease := router.acquireLocalLease(t.Context(), agentSock, env.DialAgent, nil)
+	clientLease, err := router.acquireLocalLease(t.Context(), agentSock, env.DialAgent, nil)
+	if err != nil {
+		t.Fatalf("acquireLocalLease on proxy SSH client failed: %v", err)
+	}
 
 	ch, chReqs, err := rawProxySSH.OpenChannel("session", nil)
 	if err != nil {

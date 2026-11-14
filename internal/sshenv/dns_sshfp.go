@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,12 +17,16 @@ import (
 )
 
 const (
-	dnsTypeSSHFP      = 44
-	dnsTypeOPT        = 41
-	dnsClassIN        = 1
-	dnsUDPPayloadSize = 4096
-	dnsMaxLookupTime  = 5 * time.Second
-	dnsMaxServers     = 3
+	dnsTypeCNAME           = 5
+	dnsTypeOPT             = 41
+	dnsTypeSSHFP           = 44
+	dnsClassIN             = 1
+	dnsUDPPayloadSize      = 4096
+	dnsMaxLookupTime       = 5 * time.Second
+	dnsMaxServers          = 3
+	dnsMaxCompressionJumps = 16
+	dnsMaxCNAMEHops        = 8
+	dnsMaxWireNameBytes    = 255
 
 	dnsFlagQR = 1 << 15
 	dnsFlagTC = 1 << 9
@@ -33,18 +39,35 @@ const (
 
 var errDNSMalformed = errors.New("malformed DNS response")
 
+type dnsConfig struct {
+	servers []string
+	trustAD bool
+}
+
 // sshfpResolver is a minimal RFC 1035 + EDNS0 (DO=1) stub resolver for SSHFP.
-// It sets RD and AD on queries and reports the response AD bit as
-// Authenticated, so DNSSEC validation is delegated to the configured resolver.
+// Matching OpenSSH/glibc resolver hardening, the response AD bit is only
+// trusted when the answering server is loopback (127.0.0.0/8 or ::1) or when
+// resolv.conf explicitly sets "options trust-ad".
 type sshfpResolver struct {
+	config  func() dnsConfig
 	servers func() []string
 	dial    func(ctx context.Context, network, address string) (net.Conn, error)
 }
 
 func newSystemSSHFPLookup() func(context.Context, string) (core.SSHFPResult, error) {
 	var dialer net.Dialer
-	r := &sshfpResolver{servers: systemDNSServers, dial: dialer.DialContext}
+	r := &sshfpResolver{config: systemDNSConfig, dial: dialer.DialContext}
 	return r.Lookup
+}
+
+func (r *sshfpResolver) resolveConfig() dnsConfig {
+	if r.config != nil {
+		return r.config()
+	}
+	if r.servers != nil {
+		return dnsConfig{servers: r.servers()}
+	}
+	return dnsConfig{}
 }
 
 // Lookup queries the configured servers in order and returns the first
@@ -57,25 +80,68 @@ func (r *sshfpResolver) Lookup(ctx context.Context, hostname string) (core.SSHFP
 	ctx, cancel := context.WithTimeout(ctx, dnsMaxLookupTime)
 	defer cancel()
 
-	servers := r.servers()
+	cfg := r.resolveConfig()
+	servers := cfg.servers
 	if len(servers) > dnsMaxServers {
 		servers = servers[:dnsMaxServers]
 	}
 	if len(servers) == 0 {
 		return core.SSHFPResult{}, errors.New("no DNS servers configured")
 	}
+
+	deadline, _ := ctx.Deadline()
 	var errs []error
-	for _, server := range servers {
-		result, err := r.exchange(ctx, server, name)
-		if err == nil {
+	for i, server := range servers {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				errs = append(errs, ctxErr)
+			} else {
+				errs = append(errs, context.DeadlineExceeded)
+			}
+			break
+		}
+		perServer := remaining / time.Duration(len(servers)-i)
+		srvCtx, srvCancel := context.WithTimeout(ctx, perServer)
+		result, exchErr := r.exchange(srvCtx, server, name, cfg.trustAD)
+		srvCancel()
+		if exchErr == nil {
 			return result, nil
 		}
-		errs = append(errs, fmt.Errorf("%s: %w", server, err))
+		errs = append(errs, fmt.Errorf("%s: %w", server, exchErr))
 		if ctx.Err() != nil {
 			break
 		}
 	}
 	return core.SSHFPResult{}, fmt.Errorf("SSHFP lookup %q failed: %w", name, errors.Join(errs...))
+}
+
+func isLoopbackDNSServer(server string) bool {
+	trimmed := strings.TrimSpace(server)
+	host, _, err := net.SplitHostPort(trimmed)
+	if err != nil {
+		host = trimmed
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	return addr.Unmap().IsLoopback()
+}
+
+func formatWindowsDNSServerIPv6(raw [16]byte, scopeID uint32) (string, bool) {
+	// Skip IPv6 site-local "fec0::/10" defaults Windows reports when unconfigured.
+	if raw[0] == 0xfe && (raw[1]&0xc0) == 0xc0 {
+		return "", false
+	}
+	addr := netip.AddrFrom16(raw)
+	if !addr.IsValid() || addr.IsUnspecified() {
+		return "", false
+	}
+	if scopeID != 0 {
+		addr = addr.WithZone(strconv.FormatUint(uint64(scopeID), 10))
+	}
+	return net.JoinHostPort(addr.String(), "53"), true
 }
 
 func normalizeDNSName(hostname string) (string, error) {
@@ -99,25 +165,18 @@ func normalizeDNSName(hostname string) (string, error) {
 	return name, nil
 }
 
-func (r *sshfpResolver) exchange(ctx context.Context, server, name string) (core.SSHFPResult, error) {
+func (r *sshfpResolver) exchange(ctx context.Context, server, name string, trustAD bool) (core.SSHFPResult, error) {
 	query, id, err := buildSSHFPQuery(name)
 	if err != nil {
 		return core.SSHFPResult{}, err
 	}
-	resp, err := r.roundTrip(ctx, "udp", server, query)
-	if err != nil {
-		return core.SSHFPResult{}, err
-	}
-	header, err := checkDNSResponse(resp, id, query)
+	resp, header, err := r.roundTrip(ctx, "udp", server, id, query)
 	if err != nil {
 		return core.SSHFPResult{}, err
 	}
 	if header&dnsFlagTC != 0 {
-		resp, err = r.roundTrip(ctx, "tcp", server, query)
+		resp, header, err = r.roundTrip(ctx, "tcp", server, id, query)
 		if err != nil {
-			return core.SSHFPResult{}, err
-		}
-		if header, err = checkDNSResponse(resp, id, query); err != nil {
 			return core.SSHFPResult{}, err
 		}
 		if header&dnsFlagTC != 0 {
@@ -135,15 +194,19 @@ func (r *sshfpResolver) exchange(ctx context.Context, server, name string) (core
 	if err != nil {
 		return core.SSHFPResult{}, err
 	}
-	return core.SSHFPResult{Records: records, Authenticated: header&dnsFlagAD != 0}, nil
+	adTrusted := trustAD || isLoopbackDNSServer(server)
+	authenticated := adTrusted && (header&dnsFlagAD != 0)
+	return core.SSHFPResult{Records: records, Authenticated: authenticated}, nil
 }
 
 // roundTrip owns conn for the duration of one exchange and closes it on return;
-// ctx cancellation closes the connection to unblock reads.
-func (r *sshfpResolver) roundTrip(ctx context.Context, network, server string, query []byte) ([]byte, error) {
+// ctx cancellation expires the socket deadline to unblock reads. On UDP, stray
+// datagrams with a mismatched transaction ID or question section are ignored
+// until a matching response arrives or the per-server deadline expires.
+func (r *sshfpResolver) roundTrip(ctx context.Context, network, server string, id uint16, query []byte) ([]byte, uint16, error) {
 	conn, err := r.dial(ctx, network, server)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer func() { _ = conn.Close() }()
 	if deadline, ok := ctx.Deadline(); ok {
@@ -157,28 +220,47 @@ func (r *sshfpResolver) roundTrip(ctx context.Context, network, server string, q
 		binary.BigEndian.PutUint16(msg, uint16(len(query)))
 		copy(msg[2:], query)
 		if _, err := conn.Write(msg); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		var lenBuf [2]byte
 		if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		resp := make([]byte, binary.BigEndian.Uint16(lenBuf[:]))
 		if _, err := io.ReadFull(conn, resp); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
-		return resp, nil
+		header, err := checkDNSResponse(resp, id, query)
+		if err != nil {
+			return nil, 0, err
+		}
+		return resp, header, nil
 	}
 
 	if _, err := conn.Write(query); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	buf := make([]byte, dnsUDPPayloadSize)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return nil, err
+	var lastDropErr error
+	for {
+		n, readErr := conn.Read(buf)
+		if readErr != nil {
+			if lastDropErr != nil {
+				return nil, 0, fmt.Errorf("%w (after dropping mismatched packet: %w)", readErr, lastDropErr)
+			}
+			return nil, 0, readErr
+		}
+		pkt := buf[:n]
+		header, checkErr := checkDNSResponse(pkt, id, query)
+		if checkErr != nil {
+			lastDropErr = checkErr
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, 0, fmt.Errorf("%w (after dropping mismatched packet: %w)", ctxErr, lastDropErr)
+			}
+			continue
+		}
+		return append([]byte(nil), pkt...), header, nil
 	}
-	return buf[:n], nil
 }
 
 func buildSSHFPQuery(name string) ([]byte, uint16, error) {
@@ -224,10 +306,29 @@ func checkDNSResponse(resp []byte, id uint16, query []byte) (uint16, error) {
 		return 0, errors.New("DNS response question count mismatch")
 	}
 	questionEnd := sshfpQuestionEnd(query)
-	if len(resp) < questionEnd || !strings.EqualFold(string(resp[12:questionEnd]), string(query[12:questionEnd])) {
+	if len(resp) < questionEnd || !equalFoldASCIIBytes(resp[12:questionEnd], query[12:questionEnd]) {
 		return 0, errors.New("DNS response question mismatch")
 	}
 	return header, nil
+}
+
+func equalFoldASCIIBytes(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		ca, cb := a[i], b[i]
+		if ca >= 'A' && ca <= 'Z' {
+			ca += 'a' - 'A'
+		}
+		if cb >= 'A' && cb <= 'Z' {
+			cb += 'a' - 'A'
+		}
+		if ca != cb {
+			return false
+		}
+	}
+	return true
 }
 
 func sshfpQuestionEnd(query []byte) int {
@@ -239,17 +340,32 @@ func sshfpQuestionEnd(query []byte) int {
 }
 
 func parseSSHFPAnswers(resp []byte) ([]core.SSHFPRecord, error) {
+	if len(resp) < 12 {
+		return nil, errDNSMalformed
+	}
 	ancount := int(binary.BigEndian.Uint16(resp[6:]))
-	off, err := skipDNSName(resp, 12)
+	qname, off, err := readCanonicalDNSName(resp, 12)
 	if err != nil {
 		return nil, err
 	}
+	if off+4 > len(resp) {
+		return nil, errDNSMalformed
+	}
 	off += 4 // QTYPE + QCLASS
-	var records []core.SSHFPRecord
+
+	type candidateSSHFP struct {
+		owner  string
+		record core.SSHFPRecord
+	}
+	var cnames map[string]string
+	var candidates []candidateSSHFP
+
 	for range ancount {
-		if off, err = skipDNSName(resp, off); err != nil {
+		owner, nextOff, err := readCanonicalDNSName(resp, off)
+		if err != nil {
 			return nil, err
 		}
+		off = nextOff
 		if off+10 > len(resp) {
 			return nil, errDNSMalformed
 		}
@@ -260,38 +376,134 @@ func parseSSHFPAnswers(resp []byte) ([]core.SSHFPRecord, error) {
 		if off+rdLen > len(resp) {
 			return nil, errDNSMalformed
 		}
-		if rrType == dnsTypeSSHFP && rrClass == dnsClassIN && rdLen >= 2 {
-			rdata := resp[off : off+rdLen]
-			records = append(records, core.SSHFPRecord{
-				Algorithm:       rdata[0],
-				FingerprintType: rdata[1],
-				Fingerprint:     append([]byte(nil), rdata[2:]...),
-			})
+		if rrClass == dnsClassIN {
+			switch rrType {
+			case dnsTypeCNAME:
+				target, targetEnd, err := readCanonicalDNSName(resp[:off+rdLen], off)
+				if err != nil || targetEnd != off+rdLen {
+					return nil, errDNSMalformed
+				}
+				if cnames == nil {
+					cnames = make(map[string]string)
+				}
+				if _, exists := cnames[owner]; !exists {
+					cnames[owner] = target
+				}
+			case dnsTypeSSHFP:
+				if rdLen >= 2 {
+					rdata := resp[off : off+rdLen]
+					candidates = append(candidates, candidateSSHFP{
+						owner: owner,
+						record: core.SSHFPRecord{
+							Algorithm:       rdata[0],
+							FingerprintType: rdata[1],
+							Fingerprint:     append([]byte(nil), rdata[2:]...),
+						},
+					})
+				}
+			}
 		}
 		off += rdLen
+	}
+
+	canonicalTarget := resolveCNAMEChainTarget(qname, cnames)
+	var records []core.SSHFPRecord
+	for _, c := range candidates {
+		if c.owner == qname || c.owner == canonicalTarget {
+			records = append(records, c.record)
+		}
 	}
 	return records, nil
 }
 
-// skipDNSName returns the offset after a (possibly compressed) name at off.
-func skipDNSName(msg []byte, off int) (int, error) {
-	for {
-		if off >= len(msg) {
-			return 0, errDNSMalformed
+func resolveCNAMEChainTarget(qname string, cnames map[string]string) string {
+	if len(cnames) == 0 {
+		return qname
+	}
+	canonicalTarget := qname
+	visited := map[string]struct{}{qname: {}}
+	for range dnsMaxCNAMEHops {
+		next, ok := cnames[canonicalTarget]
+		if !ok {
+			break
 		}
-		length := int(msg[off])
+		if _, seen := visited[next]; seen {
+			break
+		}
+		visited[next] = struct{}{}
+		canonicalTarget = next
+	}
+	return canonicalTarget
+}
+
+// readCanonicalDNSName decompresses a DNS wire name at msg[off:] into canonical
+// lowercased wire format (<len><lower-label>...<0x00>) and returns the offset
+// immediately after the name in msg. Compression pointers are strictly limited
+// to backward offsets (12 <= ptr < cur) and capped at dnsMaxCompressionJumps.
+func readCanonicalDNSName(msg []byte, off int) (string, int, error) {
+	var wire [dnsMaxWireNameBytes]byte
+	wireLen := 0
+	cur := off
+	nextOff := 0
+	jumped := false
+	jumps := 0
+
+	for {
+		if cur < 0 || cur >= len(msg) {
+			return "", 0, errDNSMalformed
+		}
+		length := int(msg[cur])
 		switch {
 		case length == 0:
-			return off + 1, nil
-		case length&0xc0 == 0xc0:
-			if off+2 > len(msg) {
-				return 0, errDNSMalformed
+			if wireLen+1 > dnsMaxWireNameBytes {
+				return "", 0, errDNSMalformed
 			}
-			return off + 2, nil
+			wire[wireLen] = 0
+			wireLen++
+			if !jumped {
+				nextOff = cur + 1
+			}
+			return string(wire[:wireLen]), nextOff, nil
+		case length&0xc0 == 0xc0:
+			if cur+2 > len(msg) {
+				return "", 0, errDNSMalformed
+			}
+			ptr := int(binary.BigEndian.Uint16(msg[cur:cur+2]) & 0x3fff)
+			if ptr < 12 || ptr >= cur {
+				return "", 0, errDNSMalformed
+			}
+			jumps++
+			if jumps > dnsMaxCompressionJumps {
+				return "", 0, errDNSMalformed
+			}
+			if !jumped {
+				nextOff = cur + 2
+				jumped = true
+			}
+			cur = ptr
 		case length&0xc0 != 0:
-			return 0, errDNSMalformed
+			return "", 0, errDNSMalformed
 		default:
-			off += length + 1
+			if cur+1+length > len(msg) || wireLen+1+length >= dnsMaxWireNameBytes {
+				return "", 0, errDNSMalformed
+			}
+			wire[wireLen] = byte(length)
+			wireLen++
+			for i := range length {
+				b := msg[cur+1+i]
+				if b >= 'A' && b <= 'Z' {
+					b += 'a' - 'A'
+				}
+				wire[wireLen] = b
+				wireLen++
+			}
+			cur += 1 + length
 		}
 	}
+}
+
+// skipDNSName returns the offset after a (possibly compressed) name at off.
+func skipDNSName(msg []byte, off int) (int, error) {
+	_, nextOff, err := readCanonicalDNSName(msg, off)
+	return nextOff, err
 }

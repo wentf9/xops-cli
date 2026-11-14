@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -366,4 +367,114 @@ func assertGoroutinesSettled(t *testing.T, baseline int) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("goroutine count did not settle: got %d, baseline %d", runtime.NumGoroutine(), baseline)
+}
+
+type countingCloser struct {
+	closed atomic.Int32
+}
+
+func (c *countingCloser) Close() error {
+	c.closed.Add(1)
+	return nil
+}
+
+func TestProcessStdioConn_FallbackDeadlineGenerationPreventsStaleClose(t *testing.T) {
+	conn := &ProcessStdioConn{}
+	readCloser := &countingCloser{}
+	writeCloser := &countingCloser{}
+
+	// Arm short deadlines, then immediately clear or extend them; stale callbacks must not close!
+	for range 25 {
+		if err := conn.setFallbackDeadline(readCloser, time.Now().Add(3*time.Millisecond), true); err != nil {
+			t.Fatal(err)
+		}
+		if err := conn.setFallbackDeadline(readCloser, time.Time{}, true); err != nil {
+			t.Fatal(err)
+		}
+		if err := conn.setFallbackDeadline(writeCloser, time.Now().Add(3*time.Millisecond), false); err != nil {
+			t.Fatal(err)
+		}
+		if err := conn.setFallbackDeadline(writeCloser, time.Now().Add(5*time.Second), false); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Go(func() {
+			for range 40 {
+				_ = conn.setFallbackDeadline(readCloser, time.Now().Add(50*time.Millisecond), true)
+				_ = conn.setFallbackDeadline(readCloser, time.Time{}, true)
+			}
+		})
+	}
+	wg.Wait()
+	_ = conn.setFallbackDeadline(readCloser, time.Time{}, true)
+	_ = conn.setFallbackDeadline(writeCloser, time.Time{}, false)
+
+	time.Sleep(25 * time.Millisecond)
+	if got := readCloser.closed.Load(); got != 0 {
+		t.Fatalf("stale read timer closed pipe %d times after deadline clear", got)
+	}
+	if got := writeCloser.closed.Load(); got != 0 {
+		t.Fatalf("stale write timer closed pipe %d times after deadline clear", got)
+	}
+
+	// An un-cleared short fallback deadline DOES fire and mark timedOut.
+	if err := conn.setFallbackDeadline(readCloser, time.Now().Add(8*time.Millisecond), true); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for readCloser.closed.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("expected active fallback deadline to close pipe")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := conn.normalizeIOError(os.ErrClosed, true); !errors.Is(got, os.ErrDeadlineExceeded) {
+		t.Fatalf("normalizeIOError after fallback expiry = %v, want os.ErrDeadlineExceeded", got)
+	}
+}
+
+type blockingStderrWriter struct {
+	startedOnce sync.Once
+	started     chan struct{}
+	unblock     chan struct{}
+}
+
+func (w *blockingStderrWriter) Write(p []byte) (int, error) {
+	w.startedOnce.Do(func() { close(w.started) })
+	<-w.unblock
+	return len(p), nil
+}
+
+func TestProcessStdioConn_CloseDoesNotHangWhenStderrWriterBlocks(t *testing.T) {
+	t.Setenv("XOPS_SSHENV_HELPER_MODE", "echo-with-stderr")
+	bw := &blockingStderrWriter{
+		started: make(chan struct{}),
+		unblock: make(chan struct{}),
+	}
+	t.Cleanup(func() {
+		close(bw.unblock)
+	})
+
+	conn, err := DialProxyCommandWithStderr(t.Context(), helperSubprocessCommand(t), bw)
+	if err != nil {
+		t.Fatalf("DialProxyCommandWithStderr failed: %v", err)
+	}
+
+	select {
+	case <-bw.started:
+	case <-time.After(3 * time.Second):
+		_ = conn.Close()
+		t.Fatal("timed out waiting for child stderr write to enter blocking writer")
+	}
+
+	start := time.Now()
+	if err := conn.Close(); err != nil {
+		t.Fatalf("conn.Close() with blocked stderr writer failed: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("conn.Close() took %v with blocked stderr writer, expected bounded wait", elapsed)
+	}
 }

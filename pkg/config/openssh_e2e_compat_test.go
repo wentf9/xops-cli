@@ -1,6 +1,7 @@
 package config
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -147,5 +148,13 @@ func TestOpenSSHOverrideProvider_ConfirmNodeWithExecutionContextNoOp(t *testing.
 	}
 	if repo.Snapshot().Nodes.Count() != 0 {
 		t.Fatalf("expected base repository to remain untouched under -F, got %d nodes", repo.Snapshot().Nodes.Count())
+	}
+	if _, ok := override.(interface{ Save(*Configuration) error }); ok {
+		t.Fatalf("expected openSSHOverrideProvider not to promote Repository.Save")
+	}
+	if _, ok := override.(interface {
+		DeleteNodeAtRefContext(context.Context, string, Version) error
+	}); ok {
+		t.Fatalf("expected openSSHOverrideProvider not to promote Repository.DeleteNodeAtRefContext")
 	}
 }

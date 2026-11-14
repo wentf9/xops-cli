@@ -72,6 +72,10 @@ func ErrorAlreadyReported(err error) bool {
 	if errors.As(err, &control) {
 		return control.Reported
 	}
+	var reported interface{ AlreadyReported() bool }
+	if errors.As(err, &reported) {
+		return reported.AlreadyReported()
+	}
 	return false
 }
 
@@ -190,11 +194,14 @@ func resolveControlSocketPath(ctx context.Context, o *SshOptions, stderr io.Writ
 	return expandedPath, err
 }
 
-func canonicalizeControlOptions(o *SshOptions, provider config.ConfigProvider, stderr io.Writer) error {
+func canonicalizeControlOptions(ctx context.Context, o *SshOptions, provider config.ConfigProvider, stderr io.Writer) error {
 	if o == nil || provider == nil {
 		return nil
 	}
-	if err := o.applyHostnameCanonicalization(context.Background(), provider, nil); err != nil {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := o.applyHostnameCanonicalization(ctx, provider, nil); err != nil {
 		return controlError(stderr, err.Error())
 	}
 	return nil
@@ -216,7 +223,7 @@ func resolveControlContext(ctx context.Context, o *SshOptions, stderr io.Writer)
 	if providerErr != nil && o != nil && o.control.ConfigFile != "" {
 		return "", ssh.TargetContext{}, nil, "", controlError(stderr, fmt.Sprintf("%s: %v", i18n.T("ssh_err_load_config"), providerErr))
 	}
-	if err := canonicalizeControlOptions(o, provider, stderr); err != nil {
+	if err := canonicalizeControlOptions(ctx, o, provider, stderr); err != nil {
 		return "", ssh.TargetContext{}, nil, "", err
 	}
 	nodeID := ""
@@ -673,6 +680,7 @@ func buildControlProxyClientConfig(
 			Address:               target.Host,
 			Port:                  port,
 			User:                  target.User,
+			OriginalHost:          target.OriginalHost,
 			Password:              o.Password,
 			SudoMode:              ssh.SudoModeAuto,
 			ProxyJump:             target.JumpHost,
@@ -735,13 +743,26 @@ func buildControlProxyAdapterOptions(snapshot *config.Configuration, nodeID stri
 	var sessionAuth adapter.SessionAuth
 	var sessionCtrlOpts adapter.SessionControlOptions
 	if o != nil {
+		origHost := o.originalHost
+		if stripped, ok := config.OpenSSHOriginalHost(origHost); ok {
+			origHost = stripped
+		}
+		absKeys := o.absIdentityFiles()
+		firstKey := normalizeCLIIdentityPath(o.IdentityFile)
+		if firstKey == "" && len(absKeys) > 0 {
+			firstKey = absKeys[0]
+		}
+		hostNameOverride, _ := o.effectiveHostName()
 		sessionAuth = adapter.SessionAuth{
-			Password:   o.Password,
-			Passphrase: o.Passphrase,
-			KeyPath:    utils.ToAbsolutePath(o.IdentityFile),
-			Remember:   false,
-			OTP:        o.OTP,
-			ProxyJump:  o.JumpHost,
+			Password:     o.Password,
+			Passphrase:   o.Passphrase,
+			KeyPath:      firstKey,
+			KeyPaths:     absKeys,
+			HostName:     hostNameOverride,
+			OriginalHost: origHost,
+			Remember:     false,
+			OTP:          o.OTP,
+			ProxyJump:    o.JumpHost,
 		}
 		if parsed, ctrlErr := o.toSessionControlOptions(); ctrlErr == nil {
 			sessionCtrlOpts = parsed
@@ -755,13 +776,11 @@ func buildControlProxyAdapterOptions(snapshot *config.Configuration, nodeID stri
 		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, sessionAuth))
 	}
 	if !sessionCtrlOpts.IsEmpty() {
+		if globalCtrl := sessionCtrlOpts.ConnectionWideOptions(); !globalCtrl.IsEmpty() {
+			adpOpts = append(adpOpts, adapter.WithGlobalSessionControl(globalCtrl))
+		}
 		if nodeID != "" {
-			if globalCtrl := sessionCtrlOpts.ConnectionWideOptions(); !globalCtrl.IsEmpty() {
-				adpOpts = append(adpOpts, adapter.WithGlobalSessionControl(globalCtrl))
-			}
 			adpOpts = append(adpOpts, adapter.WithSessionControlOverride(nodeID, sessionCtrlOpts))
-		} else {
-			adpOpts = append(adpOpts, adapter.WithGlobalSessionControl(sessionCtrlOpts))
 		}
 	}
 	if reg, regErr := utils.GetCredentialRegistry(snapshot); regErr == nil && reg != nil {

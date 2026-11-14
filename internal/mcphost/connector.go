@@ -5,9 +5,17 @@ import (
 
 	corelog "github.com/wentf9/xops-cli/core/log"
 	"github.com/wentf9/xops-cli/core/ssh"
+	"github.com/wentf9/xops-cli/internal/sshenv"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 )
+
+func newMCPEnvironment() ssh.Environment {
+	env := sshenv.Discover()
+	// Isolate MCP host-key verification from unversioned system-global known_hosts files.
+	env.GlobalKnownHostsFiles = nil
+	return env
+}
 
 func newMCPConnector(ctx context.Context, provider config.ConfigProvider, l corelog.DebugLogger, credentialRegistry adapter.CredentialResolver) *ssh.Connector {
 	conn := newNonInteractiveMCPConnector(provider, l, credentialRegistry)
@@ -16,7 +24,7 @@ func newMCPConnector(ctx context.Context, provider config.ConfigProvider, l core
 }
 
 func newNonInteractiveMCPConnector(provider config.ConfigProvider, l corelog.DebugLogger, credentialRegistry adapter.CredentialResolver) *ssh.Connector {
-	var sshOpts []ssh.Option
+	sshOpts := []ssh.Option{ssh.WithEnvironment(newMCPEnvironment())}
 	if l != nil {
 		sshOpts = append(sshOpts, ssh.WithLogger(l))
 	} else {

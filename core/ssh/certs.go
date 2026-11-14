@@ -3,6 +3,7 @@ package ssh
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -70,11 +71,29 @@ func (s *certLazySigner) SignWithAlgorithm(rand io.Reader, data []byte, algorith
 	if err != nil {
 		return nil, err
 	}
+	return signCertWithNormalizedAlgorithm(s.cert, certSigner, rand, data, algorithm)
+}
+
+func signCertWithNormalizedAlgorithm(
+	cert *cryptoSSH.Certificate,
+	certSigner cryptoSSH.Signer,
+	rand io.Reader,
+	data []byte,
+	algorithm string,
+) (*cryptoSSH.Signature, error) {
 	normAlgo := normalizeCertSignAlgorithm(algorithm)
-	if normAlgo != "" {
-		if algoSigner, ok := certSigner.(cryptoSSH.AlgorithmSigner); ok {
-			return algoSigner.SignWithAlgorithm(rand, data, normAlgo)
-		}
+	if normAlgo == "" {
+		return certSigner.Sign(rand, data)
+	}
+	if algoSigner, ok := certSigner.(cryptoSSH.AlgorithmSigner); ok {
+		return algoSigner.SignWithAlgorithm(rand, data, normAlgo)
+	}
+	var keyFormat string
+	if cert != nil && cert.Key != nil {
+		keyFormat = cert.Key.Type()
+	}
+	if normAlgo != keyFormat {
+		return nil, fmt.Errorf("ssh: certificate signer does not support signature algorithm %q (key type %q)", normAlgo, keyFormat)
 	}
 	return certSigner.Sign(rand, data)
 }
@@ -88,6 +107,20 @@ type normalizedCertSigner struct {
 }
 
 var _ cryptoSSH.AlgorithmSigner = (*normalizedCertSigner)(nil)
+
+// normalizedMultiAlgoCertSigner preserves MultiAlgorithmSigner restrictions
+// (such as RSA signers constrained to rsa-sha2-512) so x/crypto/ssh negotiates
+// only algorithms supported by the underlying signer.
+type normalizedMultiAlgoCertSigner struct {
+	normalizedCertSigner
+	multi cryptoSSH.MultiAlgorithmSigner
+}
+
+var _ cryptoSSH.MultiAlgorithmSigner = (*normalizedMultiAlgoCertSigner)(nil)
+
+func (s *normalizedMultiAlgoCertSigner) Algorithms() []string {
+	return s.multi.Algorithms()
+}
 
 func newWrappedCertSigner(cert *cryptoSSH.Certificate, base cryptoSSH.Signer) (cryptoSSH.Signer, error) {
 	if cert == nil {
@@ -103,7 +136,11 @@ func newWrappedCertSigner(cert *cryptoSSH.Certificate, base cryptoSSH.Signer) (c
 	if err != nil {
 		return nil, err
 	}
-	return &normalizedCertSigner{cert: cert, certSigner: cs}, nil
+	wrapped := normalizedCertSigner{cert: cert, certSigner: cs}
+	if mas, ok := cs.(cryptoSSH.MultiAlgorithmSigner); ok {
+		return &normalizedMultiAlgoCertSigner{normalizedCertSigner: wrapped, multi: mas}, nil
+	}
+	return &wrapped, nil
 }
 
 func (s *normalizedCertSigner) PublicKey() cryptoSSH.PublicKey {
@@ -115,13 +152,7 @@ func (s *normalizedCertSigner) Sign(rand io.Reader, data []byte) (*cryptoSSH.Sig
 }
 
 func (s *normalizedCertSigner) SignWithAlgorithm(rand io.Reader, data []byte, algorithm string) (*cryptoSSH.Signature, error) {
-	normAlgo := normalizeCertSignAlgorithm(algorithm)
-	if normAlgo != "" {
-		if algoSigner, ok := s.certSigner.(cryptoSSH.AlgorithmSigner); ok {
-			return algoSigner.SignWithAlgorithm(rand, data, normAlgo)
-		}
-	}
-	return s.certSigner.Sign(rand, data)
+	return signCertWithNormalizedAlgorithm(s.cert, s.certSigner, rand, data, algorithm)
 }
 
 type loadedUserCert struct {
@@ -241,16 +272,4 @@ func matchCertsForKey(
 		l.Debugf("Skipping SSH certificate %q: certificate public key does not match private key %q", sidecar.path, keyPath)
 	}
 	return nil
-}
-
-func hasPotentialSidecarCert(rawKeyPath string, env Environment, target TargetContext, resolve func(string) string) bool {
-	if strings.TrimSpace(rawKeyPath) == "" {
-		return false
-	}
-	expanded, err := expandIdentityKeyPath(rawKeyPath, env, target, resolve)
-	if err != nil || expanded == "" {
-		return false
-	}
-	_, statErr := os.Stat(expanded + "-cert.pub")
-	return statErr == nil
 }

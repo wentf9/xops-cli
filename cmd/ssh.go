@@ -272,8 +272,19 @@ func (o *SshOptions) effectiveHostName() (string, error) {
 	if o == nil {
 		return "", nil
 	}
+	return o.effectiveHostNameForHost(o.originalHostForExpansion())
+}
+
+func (o *SshOptions) effectiveHostNameForHost(host string) (string, error) {
+	if o == nil {
+		return "", nil
+	}
 	if o.cliHostName != "" {
-		expanded, err := ssh.ExpandHostName(o.cliHostName, o.originalHostForExpansion())
+		base := strings.TrimSpace(host)
+		if base == "" {
+			base = o.originalHostForExpansion()
+		}
+		expanded, err := ssh.ExpandHostName(o.cliHostName, base)
 		if err != nil {
 			return "", err
 		}
@@ -576,7 +587,24 @@ func (o *SshOptions) runParentDaemon(ctx context.Context) (err error) {
 	if err := o.validatePostResolutionSessionInvariants(); err != nil {
 		return err
 	}
+	if err := o.validateBackgroundProxyCommand(provider, nodeID); err != nil {
+		return err
+	}
 	return o.runParentDaemonWithNode(ctx, cfg, provider, nodeID)
+}
+
+func (o *SshOptions) runParentDaemonWithValidatedNode(ctx context.Context, cfg *config.Configuration, provider config.ConfigProvider, nodeID string) error {
+	if err := o.validateBackgroundProxyCommand(provider, nodeID); err != nil {
+		return err
+	}
+	return o.runParentDaemonWithNode(ctx, cfg, provider, nodeID)
+}
+
+func (o *SshOptions) validateBackgroundProxyCommand(provider config.ConfigProvider, nodeID string) error {
+	if o != nil && o.effectiveBgRun() && o.hasActiveProxyCommandInPath(provider, nodeID, nil) {
+		return fmt.Errorf("background mode (-f) cannot be combined with ProxyCommand")
+	}
+	return nil
 }
 
 func (o *SshOptions) validatePostResolutionSessionInvariants() error {
@@ -702,16 +730,28 @@ func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuratio
 	if o.interaction == nil {
 		o.interaction = newCLIInteractionHandler()
 	}
-	shouldRemember, adpOpts := o.interaction.rememberOptions(utils.EffectiveRememberPolicy(o.Remember, cfg), cfg)
+	policy := utils.EffectiveRememberPolicy(o.Remember, cfg)
+	shouldRemember, adpOpts := o.interaction.rememberOptions(policy, cfg)
+	isChild := os.Getenv(sshBackgroundChildEnv) == "true"
+	suppressConfirm := policy == utils.RememberPolicyNever || isMuxDaemonChild() || isChild
 	if isMuxDaemonChild() {
 		shouldRemember = false
 		adpOpts = append(adpOpts, adapter.WithNonInteractive(true), adapter.WithSessionOptions(false))
+	} else if isChild {
+		shouldRemember = false
+		adpOpts = append(adpOpts, adapter.WithNonInteractive(true), adapter.WithCredentialRecording(false))
 	} else {
 		adpOpts = append(adpOpts, adapter.WithLocalExecution(true))
 	}
+	if suppressConfirm {
+		adpOpts = append(adpOpts, adapter.WithSuppressNodeConfirmation(true))
+	}
 	// The global policy also covers ProxyJump nodes. The target-specific override
 	// below carries its explicit session material without leaking it to jumps.
-	adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{Remember: shouldRemember}))
+	adpOpts = append(adpOpts, adapter.WithGlobalSessionAuth(adapter.SessionAuth{
+		Remember:                 shouldRemember,
+		SuppressNodeConfirmation: suppressConfirm,
+	}))
 	proxyJumpOverride := o.JumpHost
 	if proxyJumpOverride == "" && isMuxDaemonChild() {
 		proxyJumpOverride = "none"
@@ -728,48 +768,64 @@ func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuratio
 	// 总是注入 SessionAuthOverride（即使密码为空），以便 UpdateAuth / UpdateSudo
 	// 能根据 Remember 策略决定是否将交互提示获得的密码回写配置，而不是绕过策略检查。
 	adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, adapter.SessionAuth{
-		Password:     o.Password,
-		Passphrase:   o.Passphrase,
-		KeyPath:      firstKey,
-		KeyPaths:     absKeys,
-		HostName:     hostNameOverride,
-		OriginalHost: o.originalHost,
-		Remember:     shouldRemember,
-		OTP:          o.OTP,
-		ProxyJump:    proxyJumpOverride,
+		Password:                 o.Password,
+		Passphrase:               o.Passphrase,
+		KeyPath:                  firstKey,
+		KeyPaths:                 absKeys,
+		HostName:                 hostNameOverride,
+		OriginalHost:             o.originalHost,
+		Remember:                 shouldRemember,
+		SuppressNodeConfirmation: suppressConfirm,
+		OTP:                      o.OTP,
+		ProxyJump:                proxyJumpOverride,
 	}))
 	if reg, regErr := utils.GetCredentialRegistry(cfg); regErr != nil {
 		return nil, fmt.Errorf("initialize credential resolver: %w", regErr)
 	} else if reg != nil {
 		adpOpts = append(adpOpts, adapter.WithCredentialSource(reg))
 	}
-	if shouldRemember {
-		adpOpts = append(adpOpts, enrollmentProbeOption())
-		if o.execution.enabled() || o.execution.noLoginSet || o.StdioForward != "" || o.Subsystem {
-			adpOpts = append(adpOpts, adapter.WithEnrollmentProbeExclusions(nodeID))
-		}
-		if repo, ok := repository.(*config.Repository); ok {
-			persistence, err := o.interaction.automaticPersistenceOptions(repo, cfg)
-			if err != nil {
-				return nil, err
-			}
-			adpOpts = append(adpOpts, persistence...)
-		}
-	}
-
-	// Session Control Overrides (Tier 1)
-	sessionCtrlOpts, err := o.toSessionControlOptions()
-	if err != nil {
+	if err := o.appendRememberPersistenceOptions(&adpOpts, nodeID, cfg, repository, shouldRemember); err != nil {
 		return nil, err
 	}
-	if !sessionCtrlOpts.IsEmpty() {
-		if globalCtrl := sessionCtrlOpts.ConnectionWideOptions(); !globalCtrl.IsEmpty() {
-			adpOpts = append(adpOpts, adapter.WithGlobalSessionControl(globalCtrl))
-		}
-		adpOpts = append(adpOpts, adapter.WithSessionControlOverride(nodeID, sessionCtrlOpts))
+
+	if err := o.appendSessionControlOverrides(&adpOpts, nodeID); err != nil {
+		return nil, err
 	}
 
 	return adpOpts, nil
+}
+
+func (o *SshOptions) appendRememberPersistenceOptions(adpOpts *[]adapter.Option, nodeID string, cfg *config.Configuration, repository config.ConfigProvider, shouldRemember bool) error {
+	if !shouldRemember {
+		return nil
+	}
+	*adpOpts = append(*adpOpts, enrollmentProbeOption())
+	if o.execution.enabled() || o.execution.noLoginSet || o.StdioForward != "" || o.Subsystem {
+		*adpOpts = append(*adpOpts, adapter.WithEnrollmentProbeExclusions(nodeID))
+	}
+	if repo, ok := repository.(*config.Repository); ok {
+		persistence, err := o.interaction.automaticPersistenceOptions(repo, cfg)
+		if err != nil {
+			return err
+		}
+		*adpOpts = append(*adpOpts, persistence...)
+	}
+	return nil
+}
+
+func (o *SshOptions) appendSessionControlOverrides(adpOpts *[]adapter.Option, nodeID string) error {
+	sessionCtrlOpts, err := o.toSessionControlOptions()
+	if err != nil {
+		return err
+	}
+	if sessionCtrlOpts.IsEmpty() {
+		return nil
+	}
+	if globalCtrl := sessionCtrlOpts.ConnectionWideOptions(); !globalCtrl.IsEmpty() {
+		*adpOpts = append(*adpOpts, adapter.WithGlobalSessionControl(globalCtrl))
+	}
+	*adpOpts = append(*adpOpts, adapter.WithSessionControlOverride(nodeID, sessionCtrlOpts))
+	return nil
 }
 
 // disableSessionControlForParent stops a -f parent from claiming the control
@@ -825,36 +881,96 @@ func (o *SshOptions) shouldSkipMasterHandoff(ctx context.Context, connector *ssh
 }
 
 func (o *SshOptions) hasActiveProxyCommandInPath(provider config.ConfigProvider, nodeID string, connector *ssh.Connector) bool {
-	if o != nil && o.effectiveSSHOptions != nil && o.effectiveSSHOptions.ActiveProxyCommand() != "" {
-		return true
-	}
-	if provider == nil {
-		return false
-	}
-	checkAdp := adapter.NewSSHAdapter(provider, adapter.WithLocalExecution(true))
-	if jumpChain := o.effectiveProxyJumpChain(provider, nodeID); jumpChain != "" {
-		for _, hop := range strings.Split(jumpChain, ",") {
-			hop = strings.TrimSpace(hop)
-			if hop == "" {
-				continue
-			}
-			if hopOpts, err := checkAdp.ResolveSSHOptions(hop, adapter.SessionControlOptions{}); err == nil && hopOpts != nil && hopOpts.ActiveProxyCommand() != "" {
+	var sessionCtrlOpts adapter.SessionControlOptions
+	if o != nil {
+		if o.effectiveSSHOptions != nil && o.effectiveSSHOptions.ActiveProxyCommand() != "" {
+			return true
+		}
+		if parsed, err := o.toSessionControlOptions(); err == nil {
+			sessionCtrlOpts = parsed
+			if opts := sessionCtrlOpts.ToSSHOptions(); opts != nil && opts.ActiveProxyCommand() != "" {
 				return true
 			}
 		}
 	}
-	if connector != nil {
-		for _, m := range connector.Masters() {
-			if m == nil {
-				continue
-			}
-			targetHost := strings.TrimSpace(m.Target().OriginalHost)
-			if targetHost == "" {
-				continue
-			}
-			if mOpts, err := checkAdp.ResolveSSHOptions(targetHost, adapter.SessionControlOptions{}); err == nil && mOpts != nil && mOpts.ActiveProxyCommand() != "" {
+	if provider == nil {
+		return false
+	}
+	checker := &proxyCommandPathChecker{
+		opts:            o,
+		provider:        provider,
+		adp:             adapter.NewSSHAdapter(provider, adapter.WithLocalExecution(true)),
+		sessionCtrlOpts: sessionCtrlOpts,
+		visited:         make(map[string]struct{}),
+	}
+	if checker.checkNode(nodeID, true) {
+		return true
+	}
+	if nodeID == "" {
+		for _, hop := range strings.Split(o.effectiveProxyJumpChain(provider, ""), ",") {
+			if checker.checkNode(hop, false) {
 				return true
 			}
+		}
+	}
+	return checker.checkConnectorMasters(connector)
+}
+
+type proxyCommandPathChecker struct {
+	opts            *SshOptions
+	provider        config.ConfigProvider
+	adp             *adapter.SSHAdapter
+	sessionCtrlOpts adapter.SessionControlOptions
+	visited         map[string]struct{}
+}
+
+func (c *proxyCommandPathChecker) checkNode(id string, isTarget bool) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	if _, seen := c.visited[id]; seen {
+		return false
+	}
+	c.visited[id] = struct{}{}
+	ctrlOpts := c.sessionCtrlOpts.ConnectionWideOptions()
+	if isTarget {
+		ctrlOpts = c.sessionCtrlOpts
+	}
+	if opts, err := c.adp.ResolveSSHOptions(id, ctrlOpts); err == nil && opts != nil && opts.ActiveProxyCommand() != "" {
+		return true
+	}
+	var jumpChain string
+	if isTarget {
+		jumpChain = c.opts.effectiveProxyJumpChain(c.provider, id)
+	} else if snap, err := c.provider.ResolveConnection(id); err == nil {
+		jumpChain = strings.TrimSpace(snap.Node.ProxyJump)
+	}
+	for _, hop := range strings.Split(jumpChain, ",") {
+		if c.checkNode(hop, false) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *proxyCommandPathChecker) checkConnectorMasters(connector *ssh.Connector) bool {
+	if connector == nil {
+		return false
+	}
+	for _, m := range connector.Masters() {
+		if m == nil {
+			continue
+		}
+		targetHost := strings.TrimSpace(m.Target().OriginalHost)
+		if targetHost == "" {
+			continue
+		}
+		if c.checkNode(targetHost, false) {
+			return true
+		}
+		if !strings.HasPrefix(targetHost, config.OpenSSHNodePrefix) && c.checkNode(config.OpenSSHNodePrefix+targetHost, false) {
+			return true
 		}
 	}
 	return false
@@ -908,7 +1024,7 @@ func (o *SshOptions) handoffPersistentMaster(ctx context.Context, connector *ssh
 		}
 	}
 	if !canHandoffMaster(master) {
-		return o.handoffConnectorMasters(ctx, connector)
+		return o.handoffConnectorMasters(ctx, provider, connector)
 	}
 	return o.handoffMasterInstance(ctx, connector, master, nodeID)
 }
@@ -927,7 +1043,7 @@ func canHandoffMaster(master *ssh.MuxServer) bool {
 
 // handoffConnectorMasters drains and hands off any persistent multiplexing
 // masters started by connector during scp, sftp, or exec operations.
-func (o *SshOptions) handoffConnectorMasters(ctx context.Context, connector *ssh.Connector) error {
+func (o *SshOptions) handoffConnectorMasters(ctx context.Context, provider config.ConfigProvider, connector *ssh.Connector) error {
 	if connector == nil {
 		return nil
 	}
@@ -954,8 +1070,12 @@ func (o *SshOptions) handoffConnectorMasters(ctx context.Context, connector *ssh
 		if !canHandoffMaster(m) {
 			continue
 		}
-		nodeID := m.Target().OriginalHost
+		nodeID := resolveMasterNodeID(provider, m)
 		if nodeID != "" && jumps[nodeID] {
+			continue
+		}
+		if o.hasActiveProxyCommandInPath(provider, nodeID, connector) {
+			logger.DefaultLogger().Debugf("mux: skipping master handoff because ProxyCommand is active")
 			continue
 		}
 		if err := o.handoffMasterInstance(ctx, connector, m, nodeID); err != nil && firstErr == nil {
@@ -963,6 +1083,23 @@ func (o *SshOptions) handoffConnectorMasters(ctx context.Context, connector *ssh
 		}
 	}
 	return firstErr
+}
+
+func resolveMasterNodeID(provider config.ConfigProvider, m *ssh.MuxServer) string {
+	orig := strings.TrimSpace(m.Target().OriginalHost)
+	if orig == "" || provider == nil {
+		return orig
+	}
+	if _, err := provider.ResolveConnection(orig); err == nil {
+		return orig
+	}
+	if !strings.HasPrefix(orig, config.OpenSSHNodePrefix) {
+		prefixed := config.OpenSSHNodePrefix + orig
+		if _, err := provider.ResolveConnection(prefixed); err == nil {
+			return prefixed
+		}
+	}
+	return orig
 }
 
 func persistentJumpHops(masters []*ssh.MuxServer) map[string]bool {
@@ -1612,14 +1749,14 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 		return err
 	}
 	if !isChild && !isMuxDaemonChild() && o.effectiveBgRun() {
-		return o.runParentDaemonWithNode(ctx, cfg, provider, nodeID)
+		return o.runParentDaemonWithValidatedNode(ctx, cfg, provider, nodeID)
 	}
 	adpOpts, optErr := o.buildAdapterOptions(nodeID, cfg, provider)
 	if optErr != nil {
 		return optErr
 	}
 	var connector *ssh.Connector
-	if isMuxDaemonChild() {
+	if isMuxDaemonChild() || isChild {
 		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithSessionConfirmer(o.interaction), ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics))
 	} else {
 		connector = newCLIConnectorWithAdapterOptions(provider, o.interaction, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics))
@@ -1791,6 +1928,17 @@ func sshConnectionError(nodeID string, err error) error {
 	return fmt.Errorf("[%s] %s: %w", nodeID, i18n.T("ssh_connection_failed_label"), err)
 }
 
+func passthroughOrWrapShellError(err error) error {
+	var exitReported interface {
+		ExitCode() int
+		AlreadyReported() bool
+	}
+	if errors.As(err, &exitReported) && exitReported.AlreadyReported() {
+		return err
+	}
+	return fmt.Errorf("%s: %w", i18n.T("ssh_err_shell"), err)
+}
+
 func (o *SshOptions) runShell(ctx context.Context, client *ssh.Client) error {
 	if o.Sudo {
 		if err := client.ShellWithSudo(ctx); err != nil {
@@ -1801,19 +1949,19 @@ func (o *SshOptions) runShell(ctx context.Context, client *ssh.Client) error {
 	switch o.effectiveRequestTTY() {
 	case ssh.RequestTTYNo:
 		if err := o.runPipedShellWithStreams(ctx, client, os.Stdin, os.Stdout, os.Stderr); err != nil {
-			return fmt.Errorf("%s: %w", i18n.T("ssh_err_shell"), err)
+			return passthroughOrWrapShellError(err)
 		}
 		return nil
 	case ssh.RequestTTYForce:
 		if _, isTerm := isLocalTerminal(os.Stdin); !isTerm {
 			if err := client.RunShellWithRemotePTY(ctx, os.Stdin, os.Stdout, os.Stderr); err != nil {
-				return fmt.Errorf("%s: %w", i18n.T("ssh_err_shell"), err)
+				return passthroughOrWrapShellError(err)
 			}
 			return nil
 		}
 	}
 	if err := client.Shell(ctx); err != nil {
-		return fmt.Errorf("%s: %w", i18n.T("ssh_err_shell"), err)
+		return passthroughOrWrapShellError(err)
 	}
 	return nil
 }

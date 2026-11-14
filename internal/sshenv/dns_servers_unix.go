@@ -12,33 +12,47 @@ import (
 
 const resolvConfPath = "/etc/resolv.conf"
 
-func systemDNSServers() []string {
+func systemDNSConfig() dnsConfig {
 	return parseResolvConf(resolvConfPath)
 }
 
-func parseResolvConf(path string) []string {
+func parseResolvConf(path string) dnsConfig {
 	f, err := os.Open(path)
 	if err != nil {
-		return []string{"127.0.0.1:53"}
+		return dnsConfig{servers: []string{"127.0.0.1:53"}}
 	}
 	defer func() { _ = f.Close() }()
-	var servers []string
+
+	var cfg dnsConfig
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		if len(fields) < 2 || fields[0] != "nameserver" {
+		line := scanner.Text()
+		if cut := strings.IndexAny(line, "#;"); cut >= 0 {
+			line = line[:cut]
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
 			continue
 		}
-		host := fields[1]
-		if _, err := netip.ParseAddr(host); err != nil {
-			continue
+		switch fields[0] {
+		case "nameserver":
+			host := fields[1]
+			if _, err := netip.ParseAddr(host); err != nil {
+				continue
+			}
+			cfg.servers = append(cfg.servers, net.JoinHostPort(host, "53"))
+		case "options":
+			for _, opt := range fields[1:] {
+				if opt == "trust-ad" {
+					cfg.trustAD = true
+				}
+			}
 		}
-		servers = append(servers, net.JoinHostPort(host, "53"))
 	}
-	if len(servers) == 0 {
-		return []string{"127.0.0.1:53"}
+	if len(cfg.servers) == 0 {
+		cfg.servers = []string{"127.0.0.1:53"}
 	}
-	return servers
+	return cfg
 }
 
 func defaultGlobalKnownHostsFiles() []string {

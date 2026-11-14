@@ -3,6 +3,7 @@
 package ssh
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -230,46 +231,19 @@ func handlePassengerSession(s *MuxServer, conn net.Conn, reqID uint32, payload [
 	if err != nil {
 		return sendFailure(conn, reqID, fmt.Sprintf("open ssh session failed: %v", err))
 	}
-	releasePassengerAgent := enablePassengerAgentForward(s, ch, req.WantAgent)
+	releasePassengerAgent, err := enablePassengerAgentForward(s, ch, req.WantAgent)
 	defer releasePassengerAgent()
 	defer func() { _ = ch.Close() }()
-
-	for _, env := range req.Env {
-		if k, v, ok := strings.Cut(env, "="); ok && k != "" {
-			_, _ = ch.SendRequest("env", false, cryptoSSH.Marshal(struct {
-				Name  string
-				Value string
-			}{Name: k, Value: v}))
-		}
+	if err != nil {
+		return sendFailure(conn, reqID, fmt.Sprintf("agent forward request failed: %v", err))
 	}
 
-	ttyAllocFailed := false
-	if req.WantTTY {
-		termType := req.TermType
-		if termType == "" {
-			termType = "xterm"
-		}
-		ptyReq := struct {
-			Term     string
-			Columns  uint32
-			Rows     uint32
-			Width    uint32
-			Height   uint32
-			Modelist string
-		}{
-			Term:     termType,
-			Columns:  80,
-			Rows:     24,
-			Width:    640,
-			Height:   480,
-			Modelist: "\x00",
-		}
-		if accepted, err := ch.SendRequest("pty-req", true, cryptoSSH.Marshal(ptyReq)); err != nil || !accepted {
-			ttyAllocFailed = true
-		}
+	var ttyAllocFailed bool
+	if err := applyPassengerEnvAndPTY(s, ch, req, &ttyAllocFailed); err != nil {
+		return sendFailure(conn, reqID, err.Error())
 	}
 
-	if err := startPassengerChannel(ch, req); err != nil {
+	if err := startPassengerChannel(s, ch, req); err != nil {
 		return sendFailure(conn, reqID, err.Error())
 	}
 
@@ -287,40 +261,115 @@ func handlePassengerSession(s *MuxServer, conn net.Conn, reqID uint32, payload [
 	return sendExitMessage(conn, sessionID, exitCode)
 }
 
-func enablePassengerAgentForward(s *MuxServer, ch cryptoSSH.Channel, wantAgent bool) func() {
+func applyPassengerEnvAndPTY(s *MuxServer, ch cryptoSSH.Channel, req MuxNewSessionRequest, ttyAllocFailed *bool) error {
+	for _, env := range req.Env {
+		if k, v, ok := strings.Cut(env, "="); ok && k != "" {
+			envPayload := cryptoSSH.Marshal(struct {
+				Name  string
+				Value string
+			}{Name: k, Value: v})
+			accepted, envErr := s.sendBoundedPassengerRequest(ch, "env", envPayload)
+			if envErr != nil {
+				return fmt.Errorf("set env %q failed: %w", k, envErr)
+			}
+			if !accepted {
+				s.getLogger().Debugf("mux: server rejected env variable %q for passenger session", k)
+			}
+		}
+	}
+	if !req.WantTTY {
+		return nil
+	}
+	termType := req.TermType
+	if termType == "" {
+		termType = "xterm"
+	}
+	ptyReq := struct {
+		Term     string
+		Columns  uint32
+		Rows     uint32
+		Width    uint32
+		Height   uint32
+		Modelist string
+	}{
+		Term:     termType,
+		Columns:  80,
+		Rows:     24,
+		Width:    640,
+		Height:   480,
+		Modelist: "\x00",
+	}
+	accepted, ptyErr := s.sendBoundedPassengerRequest(ch, "pty-req", cryptoSSH.Marshal(ptyReq))
+	if ptyErr != nil {
+		return fmt.Errorf("pty-req failed: %w", ptyErr)
+	}
+	if !accepted {
+		*ttyAllocFailed = true
+	}
+	return nil
+}
+
+func (s *MuxServer) sendBoundedPassengerRequest(ch cryptoSSH.Channel, reqType string, payload []byte) (bool, error) {
+	ctx := context.Background()
+	if s != nil && s.serverCtx != nil {
+		ctx = s.serverCtx
+	}
+	var (
+		sshCli  *cryptoSSH.Client
+		root    net.Conn
+		timeout time.Duration
+		log     logger.DebugLogger
+	)
+	if s != nil {
+		sshCli = s.sshClient
+		root = s.rootConn
+		timeout = s.requestTimeout
+		log = s.logger
+	}
+	helper := &Client{
+		sshClient:        sshCli,
+		rootConn:         root,
+		handshakeTimeout: timeout,
+		logger:           log,
+	}
+	return helper.sendBoundedChannelRequest(ctx, ch, reqType, payload, false)
+}
+
+func enablePassengerAgentForward(s *MuxServer, ch cryptoSSH.Channel, wantAgent bool) (func(), error) {
 	if !wantAgent {
-		return func() {}
+		return func() {}, nil
 	}
 	if !s.allowAgentForward || s.agentSocket == "" || s.dialAgent == nil {
 		s.getLogger().Debugf("mux: ignoring passenger WantAgent request because master AllowAgentForward is disabled")
-		return func() {}
+		return func() {}, nil
 	}
 	router, err := getOrCreateAgentRouter(s.sshClient)
 	if err != nil {
 		s.getLogger().Debugf("mux: failed to initialize agent router for passenger session: %v", err)
-		return func() {}
+		return func() {}, nil
 	}
-	lease := router.acquireLocalLease(s.serverCtx, s.agentSocket, s.dialAgent, s.getLogger())
-	if accepted, reqErr := ch.SendRequest(agentForwardRequestType, true, nil); reqErr != nil || !accepted {
+	lease, err := router.acquireLocalLease(s.serverCtx, s.agentSocket, s.dialAgent, s.getLogger())
+	if err != nil {
+		return func() {}, nil
+	}
+	accepted, reqErr := s.sendBoundedPassengerRequest(ch, agentForwardRequestType, nil)
+	if reqErr != nil {
 		lease.Release()
-		s.getLogger().Debugf("mux: server rejected %s for passenger session (accepted=%v, err=%v)", agentForwardRequestType, accepted, reqErr)
-		return func() {}
+		return func() {}, reqErr
 	}
-	return lease.Release
+	if !accepted {
+		lease.Release()
+		s.getLogger().Debugf("mux: server rejected %s for passenger session", agentForwardRequestType)
+		return func() {}, nil
+	}
+	return lease.Release, nil
 }
 
-func (s *MuxServer) getLogger() logger.DebugLogger {
-	if s == nil || s.logger == nil {
-		return logger.NopLogger
-	}
-	return s.logger
-}
-
-func startPassengerChannel(ch cryptoSSH.Channel, req MuxNewSessionRequest) error {
+func startPassengerChannel(s *MuxServer, ch cryptoSSH.Channel, req MuxNewSessionRequest) error {
 	switch {
 	case req.Subsystem:
 		payload := cryptoSSH.Marshal(struct{ Subsystem string }{Subsystem: req.Command})
-		accepted, err := ch.SendRequest("subsystem", true, payload)
+		accepted, err := s.sendBoundedPassengerRequest(ch, "subsystem", payload)
 		if err != nil {
 			return fmt.Errorf("subsystem failed: %w", err)
 		}
@@ -328,7 +377,7 @@ func startPassengerChannel(ch cryptoSSH.Channel, req MuxNewSessionRequest) error
 			return fmt.Errorf("subsystem %q request rejected", req.Command)
 		}
 	case req.Command == "":
-		accepted, err := ch.SendRequest("shell", true, nil)
+		accepted, err := s.sendBoundedPassengerRequest(ch, "shell", nil)
 		if err != nil {
 			return fmt.Errorf("shell failed: %w", err)
 		}
@@ -337,7 +386,7 @@ func startPassengerChannel(ch cryptoSSH.Channel, req MuxNewSessionRequest) error
 		}
 	default:
 		payload := cryptoSSH.Marshal(struct{ Command string }{Command: req.Command})
-		accepted, err := ch.SendRequest("exec", true, payload)
+		accepted, err := s.sendBoundedPassengerRequest(ch, "exec", payload)
 		if err != nil {
 			return fmt.Errorf("start command failed: %w", err)
 		}
@@ -683,6 +732,11 @@ func recvFDs(conn *net.UnixConn, count int) ([]int, error) {
 	}
 	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
 
+	rawConn, err := conn.SyscallConn()
+	if err != nil {
+		return nil, fmt.Errorf("access unix socket raw connection failed: %w", err)
+	}
+
 	fds := make([]int, 0, count)
 	fail := func(format string, args ...any) ([]int, error) {
 		closeFDRange(fds)
@@ -697,24 +751,16 @@ func recvFDs(conn *net.UnixConn, count int) ([]int, error) {
 		// only a single descriptor, so extra slack lets recvFDs receive and close
 		// surplus descriptors instead of hitting MSG_CTRUNC.
 		oob := make([]byte, unix.CmsgSpace((count-len(fds)+surplusFDSlack)*4))
-		_, oobn, flags, _, err := conn.ReadMsgUnix(data[:], oob)
+		received, flags, parseCtrlErr, err := recvOneControlMsgCloexec(rawConn, data[:], oob)
 		if err != nil {
 			return fail("receive descriptors: %w", err)
 		}
-		messages, parseCtrlErr := unix.ParseSocketControlMessage(oob[:oobn])
-		for messageIndex := range messages {
-			received, parseErr := unix.ParseUnixRights(&messages[messageIndex])
-			if parseErr != nil {
+		for _, fd := range received {
+			if flags&unix.MSG_CTRUNC != 0 || parseCtrlErr != nil || len(fds) >= count {
+				_ = unix.Close(fd)
 				continue
 			}
-			for _, fd := range received {
-				unix.CloseOnExec(fd)
-				if flags&unix.MSG_CTRUNC != 0 || parseCtrlErr != nil || len(fds) >= count {
-					_ = unix.Close(fd)
-					continue
-				}
-				fds = append(fds, fd)
-			}
+			fds = append(fds, fd)
 		}
 		if flags&unix.MSG_CTRUNC != 0 {
 			return fail("control message truncated")
@@ -724,6 +770,22 @@ func recvFDs(conn *net.UnixConn, count int) ([]int, error) {
 		}
 	}
 	return fds, nil
+}
+
+func extractReceivedFDsMarkCloexec(oob []byte) ([]int, error) {
+	messages, parseCtrlErr := unix.ParseSocketControlMessage(oob)
+	var allFDs []int
+	for messageIndex := range messages {
+		received, parseErr := unix.ParseUnixRights(&messages[messageIndex])
+		if parseErr != nil {
+			continue
+		}
+		for _, fd := range received {
+			unix.CloseOnExec(fd)
+			allFDs = append(allFDs, fd)
+		}
+	}
+	return allFDs, parseCtrlErr
 }
 
 func closeFDRange(fds []int) {
