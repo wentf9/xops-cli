@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -950,51 +951,175 @@ func isTCPNetwork(network string) bool {
 	return network == "tcp" || network == "tcp4" || network == "tcp6"
 }
 
-func (s *MuxServer) resolveMuxForwardListen(fwdType uint32, listenHost string, listenPort uint32) (network, listenAddr, keyHost string, err error) {
-	if listenPort == MUX_SPECIAL_PORT_UNIX {
-		if strings.TrimSpace(listenHost) == "" {
-			return "", "", "", errors.New("streamlocal listen socket path cannot be empty")
+type resolvedMuxListen struct {
+	network       string
+	listenAddr    string
+	keyHost       string
+	endpointHost  string
+	listenPort    uint32
+	isDynamicPort bool
+}
+
+func cleanMuxUnixSocketPath(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", errors.New("streamlocal listen socket path cannot be empty")
+	}
+	if filepath.Separator == '\\' && strings.HasPrefix(trimmed, "/") && !strings.Contains(trimmed, `\`) {
+		return path.Clean(trimmed), nil
+	}
+	return filepath.Clean(trimmed), nil
+}
+
+func canonicalTCPMuxEndpointHost(network, host string) string {
+	if host == "" || host == "*" {
+		return "*"
+	}
+	if strings.EqualFold(host, "localhost") {
+		switch network {
+		case "tcp4":
+			return "127.0.0.1"
+		case "tcp6":
+			return "::1"
+		default:
+			return "localhost"
 		}
-		return "unix", listenHost, listenHost, nil
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsUnspecified() {
+			if (network == "tcp4" && ip.To4() != nil) || (network == "tcp6" && ip.To4() == nil) {
+				return "*"
+			}
+		}
+		return ip.String()
+	}
+	return strings.ToLower(host)
+}
+
+func (s *MuxServer) resolveMuxForwardListenSpec(fwdType uint32, listenHost string, listenPort uint32) (resolvedMuxListen, error) {
+	if listenPort == MUX_SPECIAL_PORT_UNIX {
+		cleanPath, err := cleanMuxUnixSocketPath(listenHost)
+		if err != nil {
+			return resolvedMuxListen{}, err
+		}
+		return resolvedMuxListen{
+			network:       "unix",
+			listenAddr:    cleanPath,
+			keyHost:       cleanPath,
+			endpointHost:  cleanPath,
+			listenPort:    listenPort,
+			isDynamicPort: false,
+		}, nil
 	}
 	dialNet := s.effectiveDialNetwork()
 	trimmed := normalizeMuxForwardHost(listenHost, listenPort)
 	portStr := strconv.Itoa(int(listenPort))
+	isDyn := isTCPNetwork(dialNet) && listenPort == 0
+
 	switch fwdType {
 	case MUX_FWD_LOCAL, MUX_FWD_DYNAMIC:
-		if trimmed == "*" {
-			return dialNet, ":" + portStr, "*", nil
+		if trimmed == "*" || (trimmed == "" && (s.gatewayPorts || s.effectiveGatewayPortsMode() == GatewayPortsYes)) {
+			return resolvedMuxListen{
+				network:       dialNet,
+				listenAddr:    ":" + portStr,
+				keyHost:       "*",
+				endpointHost:  "*",
+				listenPort:    listenPort,
+				isDynamicPort: isDyn,
+			}, nil
 		}
 		if trimmed == "" {
-			if s.gatewayPorts || s.effectiveGatewayPortsMode() == GatewayPortsYes {
-				return dialNet, ":" + portStr, "*", nil
-			}
 			loopback := loopbackListenHost(dialNet)
-			return dialNet, net.JoinHostPort(loopback, portStr), loopback, nil
+			return resolvedMuxListen{
+				network:       dialNet,
+				listenAddr:    net.JoinHostPort(loopback, portStr),
+				keyHost:       loopback,
+				endpointHost:  loopback,
+				listenPort:    listenPort,
+				isDynamicPort: isDyn,
+			}, nil
 		}
-		return dialNet, net.JoinHostPort(trimmed, portStr), trimmed, nil
+		return resolvedMuxListen{
+			network:       dialNet,
+			listenAddr:    net.JoinHostPort(trimmed, portStr),
+			keyHost:       trimmed,
+			endpointHost:  canonicalTCPMuxEndpointHost(dialNet, trimmed),
+			listenPort:    listenPort,
+			isDynamicPort: isDyn,
+		}, nil
+
 	case MUX_FWD_REMOTE:
 		loopback := remoteLoopbackListenHost(dialNet)
 		switch s.effectiveGatewayPortsMode() {
 		case GatewayPortsYes:
-			return dialNet, remoteWildcardListenAddr(dialNet, portStr), "*", nil
+			return resolvedMuxListen{
+				network:       dialNet,
+				listenAddr:    remoteWildcardListenAddr(dialNet, portStr),
+				keyHost:       "*",
+				endpointHost:  "*",
+				listenPort:    listenPort,
+				isDynamicPort: isDyn,
+			}, nil
 		case GatewayPortsNo:
 			if trimmed == "" || trimmed == "*" {
-				return dialNet, net.JoinHostPort(loopback, portStr), "localhost", nil
+				return resolvedMuxListen{
+					network:       dialNet,
+					listenAddr:    net.JoinHostPort(loopback, portStr),
+					keyHost:       "localhost",
+					endpointHost:  loopback,
+					listenPort:    listenPort,
+					isDynamicPort: isDyn,
+				}, nil
 			}
-			return dialNet, net.JoinHostPort(trimmed, portStr), trimmed, nil
+			return resolvedMuxListen{
+				network:       dialNet,
+				listenAddr:    net.JoinHostPort(trimmed, portStr),
+				keyHost:       trimmed,
+				endpointHost:  canonicalTCPMuxEndpointHost(dialNet, trimmed),
+				listenPort:    listenPort,
+				isDynamicPort: isDyn,
+			}, nil
 		default: // GatewayPortsClientSpecified or unset ("")
 			if trimmed == "*" {
-				return dialNet, remoteWildcardListenAddr(dialNet, portStr), "*", nil
+				return resolvedMuxListen{
+					network:       dialNet,
+					listenAddr:    remoteWildcardListenAddr(dialNet, portStr),
+					keyHost:       "*",
+					endpointHost:  "*",
+					listenPort:    listenPort,
+					isDynamicPort: isDyn,
+				}, nil
 			}
 			if trimmed == "" {
-				return dialNet, net.JoinHostPort(loopback, portStr), "localhost", nil
+				return resolvedMuxListen{
+					network:       dialNet,
+					listenAddr:    net.JoinHostPort(loopback, portStr),
+					keyHost:       "localhost",
+					endpointHost:  loopback,
+					listenPort:    listenPort,
+					isDynamicPort: isDyn,
+				}, nil
 			}
-			return dialNet, net.JoinHostPort(trimmed, portStr), trimmed, nil
+			return resolvedMuxListen{
+				network:       dialNet,
+				listenAddr:    net.JoinHostPort(trimmed, portStr),
+				keyHost:       trimmed,
+				endpointHost:  canonicalTCPMuxEndpointHost(dialNet, trimmed),
+				listenPort:    listenPort,
+				isDynamicPort: isDyn,
+			}, nil
 		}
 	default:
-		return "", "", "", fmt.Errorf("unsupported forward type %d", fwdType)
+		return resolvedMuxListen{}, fmt.Errorf("unsupported forward type %d", fwdType)
 	}
+}
+
+func (s *MuxServer) resolveMuxForwardListen(fwdType uint32, listenHost string, listenPort uint32) (network, listenAddr, keyHost string, err error) {
+	resolved, err := s.resolveMuxForwardListenSpec(fwdType, listenHost, listenPort)
+	if err != nil {
+		return "", "", "", err
+	}
+	return resolved.network, resolved.listenAddr, resolved.keyHost, nil
 }
 
 func forwardKey(fwdType uint32, keyHost string, listenPort uint32, connectHost string, connectPort uint32) string {
@@ -1158,7 +1283,9 @@ const (
 type muxForwardEntry struct {
 	closer       io.Closer
 	fwdType      uint32
+	forwardKey   string
 	keyHost      string
+	endpointHost string
 	connectHost  string
 	connectPort  uint32
 	listenKey    forwardListenKey
@@ -1168,34 +1295,40 @@ type muxForwardEntry struct {
 	refs         int
 }
 
-func makeForwardListenKey(fwdType uint32, network, keyHost string, listenPort uint32) (forwardListenKey, bool) {
-	if fwdType == MUX_FWD_REMOTE && listenPort == 0 {
+func muxForwardScopeForType(fwdType uint32) muxForwardScope {
+	if fwdType == MUX_FWD_REMOTE {
+		return muxForwardScopeRemote
+	}
+	return muxForwardScopeLocal
+}
+
+func makeForwardListenKey(fwdType uint32, resolved resolvedMuxListen) (forwardListenKey, bool) {
+	if resolved.isDynamicPort {
 		return forwardListenKey{}, false
 	}
-	scope := muxForwardScopeLocal
-	if fwdType == MUX_FWD_REMOTE {
-		scope = muxForwardScopeRemote
-	}
-	endpointHost := keyHost
-	if network == "unix" {
-		endpointHost = filepath.Clean(keyHost)
-	}
 	return forwardListenKey{
-		fwdScope:   scope,
-		network:    network,
-		keyHost:    endpointHost,
-		listenPort: listenPort,
+		fwdScope:   muxForwardScopeForType(fwdType),
+		network:    resolved.network,
+		keyHost:    resolved.endpointHost,
+		listenPort: resolved.listenPort,
 	}, true
 }
 
-func sameMuxForwardDestination(entry *muxForwardEntry, fwdType uint32, normConnectHost string, connectPort uint32) bool {
-	if entry == nil || entry.dynamicAlloc || entry.fwdType != fwdType {
+func matchesMuxForwardCancelTarget(entry *muxForwardEntry, fwdType uint32, normConnectHost string, connectPort uint32) bool {
+	if entry == nil || entry.fwdType != fwdType {
 		return false
 	}
 	if fwdType == MUX_FWD_DYNAMIC {
 		return true
 	}
 	return entry.connectHost == normConnectHost && entry.connectPort == connectPort
+}
+
+func sameMuxForwardDestination(entry *muxForwardEntry, fwdType uint32, normConnectHost string, connectPort uint32) bool {
+	if entry == nil || entry.dynamicAlloc {
+		return false
+	}
+	return matchesMuxForwardCancelTarget(entry, fwdType, normConnectHost, connectPort)
 }
 
 func (s *MuxServer) acquireForwardEndpoint(
@@ -1280,14 +1413,24 @@ func (s *MuxServer) commitReservedForward(
 	if cand.refs <= 0 {
 		cand.refs = 1
 	}
+	cand.forwardKey = key
 	if existing, loaded := s.forwards.LoadOrStore(key, cand); loaded {
 		if existingEntry, ok := existing.(*muxForwardEntry); ok {
 			if cand.fwdType == MUX_FWD_REMOTE {
 				existingEntry.refs++
 			}
 			if slot != nil {
-				slot.entry = existingEntry
-				slot.inFlight = false
+				if !existingEntry.hasListenKey {
+					existingEntry.listenKey = listenKey
+					existingEntry.hasListenKey = true
+					slot.entry = existingEntry
+					slot.inFlight = false
+				} else if existingEntry.listenKey == listenKey {
+					slot.entry = existingEntry
+					slot.inFlight = false
+				} else if s.listenEndpoints != nil && s.listenEndpoints[listenKey] == slot {
+					delete(s.listenEndpoints, listenKey)
+				}
 				close(slot.done)
 			}
 			s.idleMu.Unlock()
@@ -1306,6 +1449,44 @@ func (s *MuxServer) commitReservedForward(
 	return cand, false, false
 }
 
+func (s *MuxServer) registerBoundMuxForward(
+	fwdType uint32,
+	resolved resolvedMuxListen,
+	normConnectHost string,
+	connectPort uint32,
+	listenKey forwardListenKey,
+	reservedSlot *muxForwardEndpointState,
+	ln net.Listener,
+) (key string, entry *muxForwardEntry, allocatedPort uint32, dynamicAlloc, duplicate, shuttingDown bool) {
+	keyPort := resolved.listenPort
+	if resolved.isDynamicPort {
+		allocatedPort = extractAllocatedPort(ln.Addr())
+		if allocatedPort > 0 {
+			keyPort = allocatedPort
+		}
+	}
+	dynamicAlloc = resolved.isDynamicPort && allocatedPort > 0
+	key = forwardKey(fwdType, resolved.keyHost, keyPort, normConnectHost, connectPort)
+	cand := &muxForwardEntry{
+		closer:       ln,
+		fwdType:      fwdType,
+		forwardKey:   key,
+		keyHost:      resolved.keyHost,
+		endpointHost: resolved.endpointHost,
+		connectHost:  normConnectHost,
+		connectPort:  connectPort,
+		dynamicAlloc: dynamicAlloc,
+		remote:       fwdType == MUX_FWD_REMOTE,
+		refs:         1,
+	}
+	if reservedSlot != nil {
+		entry, duplicate, shuttingDown = s.commitReservedForward(listenKey, reservedSlot, key, cand)
+	} else {
+		entry, duplicate, shuttingDown = s.publishForward(resolved, allocatedPort, key, cand)
+	}
+	return key, entry, allocatedPort, dynamicAlloc, duplicate, shuttingDown
+}
+
 func (s *MuxServer) deleteEndpointEntryLocked(entry *muxForwardEntry) {
 	if entry == nil || !entry.hasListenKey || s.listenEndpoints == nil {
 		return
@@ -1321,7 +1502,7 @@ func (s *MuxServer) handleOpenFwd(conn net.Conn, req MuxFwdRequest) error {
 		// leave a listener that outlives the master it belongs to.
 		return sendFailure(conn, req.RequestID, "mux master is shutting down")
 	}
-	network, listenAddr, keyHost, err := s.resolveMuxForwardListen(req.FwdType, req.ListenHost, req.ListenPort)
+	resolved, err := s.resolveMuxForwardListenSpec(req.FwdType, req.ListenHost, req.ListenPort)
 	if err != nil {
 		return sendFailure(conn, req.RequestID, err.Error())
 	}
@@ -1329,14 +1510,13 @@ func (s *MuxServer) handleOpenFwd(conn net.Conn, req MuxFwdRequest) error {
 		return sendPermissionDenied(conn, req.RequestID, err.Error())
 	}
 	normConnectHost := normalizeMuxForwardHost(req.ConnectHost, req.ConnectPort)
-	key := forwardKey(req.FwdType, keyHost, req.ListenPort, normConnectHost, req.ConnectPort)
 
 	var (
 		listenKey    forwardListenKey
 		hasListenKey bool
 		reservedSlot *muxForwardEndpointState
 	)
-	if listenKey, hasListenKey = makeForwardListenKey(req.FwdType, network, keyHost, req.ListenPort); hasListenKey {
+	if listenKey, hasListenKey = makeForwardListenKey(req.FwdType, resolved); hasListenKey {
 		var outcome muxEndpointAcquireOutcome
 		reservedSlot, outcome = s.acquireForwardEndpoint(listenKey, req.FwdType, normConnectHost, req.ConnectPort)
 		switch outcome {
@@ -1352,24 +1532,19 @@ func (s *MuxServer) handleOpenFwd(conn net.Conn, req MuxFwdRequest) error {
 	switch req.FwdType {
 	case MUX_FWD_LOCAL:
 		var ln net.Listener
-		if network == "unix" {
-			ln, err = listenLocalStreamLocal(s.baseContext(), listenAddr, s.streamLocalBindMask, s.streamLocalBindUnlink)
+		if resolved.network == "unix" {
+			ln, err = listenLocalStreamLocal(s.baseContext(), resolved.listenAddr, s.streamLocalBindMask, s.streamLocalBindUnlink)
 		} else {
 			var lc net.ListenConfig
-			ln, err = lc.Listen(s.baseContext(), network, listenAddr)
+			ln, err = lc.Listen(s.baseContext(), resolved.network, resolved.listenAddr)
 		}
 		if err != nil {
 			s.abortReservedForward(listenKey, reservedSlot)
-			return sendFailure(conn, req.RequestID, fmt.Sprintf("bind local port %s failed: %v", listenAddr, err))
+			return sendFailure(conn, req.RequestID, fmt.Sprintf("bind local port %s failed: %v", resolved.listenAddr, err))
 		}
-		entry, duplicate, shuttingDown := s.commitReservedForward(listenKey, reservedSlot, key, &muxForwardEntry{
-			closer:      ln,
-			fwdType:     req.FwdType,
-			keyHost:     keyHost,
-			connectHost: normConnectHost,
-			connectPort: req.ConnectPort,
-			refs:        1,
-		})
+		key, entry, _, _, duplicate, shuttingDown := s.registerBoundMuxForward(
+			req.FwdType, resolved, normConnectHost, req.ConnectPort, listenKey, reservedSlot, ln,
+		)
 		if shuttingDown {
 			return sendFailure(conn, req.RequestID, "mux master is shutting down")
 		}
@@ -1383,28 +1558,23 @@ func (s *MuxServer) handleOpenFwd(conn net.Conn, req MuxFwdRequest) error {
 		return sendOk(conn, req.RequestID)
 
 	case MUX_FWD_REMOTE:
-		return s.openRemoteForward(conn, req, network, listenAddr, keyHost, normConnectHost, listenKey, reservedSlot)
+		return s.openRemoteForward(conn, req, resolved, normConnectHost, listenKey, reservedSlot)
 
 	case MUX_FWD_DYNAMIC:
 		var ln net.Listener
-		if network == "unix" {
-			ln, err = listenLocalStreamLocal(s.baseContext(), listenAddr, s.streamLocalBindMask, s.streamLocalBindUnlink)
+		if resolved.network == "unix" {
+			ln, err = listenLocalStreamLocal(s.baseContext(), resolved.listenAddr, s.streamLocalBindMask, s.streamLocalBindUnlink)
 		} else {
 			var lc net.ListenConfig
-			ln, err = lc.Listen(s.baseContext(), network, listenAddr)
+			ln, err = lc.Listen(s.baseContext(), resolved.network, resolved.listenAddr)
 		}
 		if err != nil {
 			s.abortReservedForward(listenKey, reservedSlot)
-			return sendFailure(conn, req.RequestID, fmt.Sprintf("bind dynamic port %s failed: %v", listenAddr, err))
+			return sendFailure(conn, req.RequestID, fmt.Sprintf("bind dynamic port %s failed: %v", resolved.listenAddr, err))
 		}
-		entry, duplicate, shuttingDown := s.commitReservedForward(listenKey, reservedSlot, key, &muxForwardEntry{
-			closer:      ln,
-			fwdType:     req.FwdType,
-			keyHost:     keyHost,
-			connectHost: normConnectHost,
-			connectPort: req.ConnectPort,
-			refs:        1,
-		})
+		key, entry, _, _, duplicate, shuttingDown := s.registerBoundMuxForward(
+			req.FwdType, resolved, normConnectHost, req.ConnectPort, listenKey, reservedSlot, ln,
+		)
 		if shuttingDown {
 			return sendFailure(conn, req.RequestID, "mux master is shutting down")
 		}
@@ -1426,44 +1596,19 @@ func (s *MuxServer) handleOpenFwd(conn net.Conn, req MuxFwdRequest) error {
 func (s *MuxServer) openRemoteForward(
 	conn net.Conn,
 	req MuxFwdRequest,
-	network, listenAddr, keyHost, normConnectHost string,
+	resolved resolvedMuxListen,
+	normConnectHost string,
 	listenKey forwardListenKey,
 	reservedSlot *muxForwardEndpointState,
 ) error {
-	ln, err := s.listenRemoteMux(network, listenAddr)
+	ln, err := s.listenRemoteMux(resolved.network, resolved.listenAddr)
 	if err != nil {
 		s.abortReservedForward(listenKey, reservedSlot)
-		return sendFailure(conn, req.RequestID, fmt.Sprintf("remote listen %s failed: %v", listenAddr, err))
+		return sendFailure(conn, req.RequestID, fmt.Sprintf("remote listen %s failed: %v", resolved.listenAddr, err))
 	}
-	key := forwardKey(req.FwdType, keyHost, req.ListenPort, normConnectHost, req.ConnectPort)
-	var allocatedPort uint32
-	if isTCPNetwork(network) && req.ListenPort == 0 {
-		allocatedPort = extractAllocatedPort(ln.Addr())
-		if allocatedPort > 0 {
-			key = forwardKey(req.FwdType, keyHost, allocatedPort, normConnectHost, req.ConnectPort)
-		}
-	}
-	dynamicAlloc := isTCPNetwork(network) && req.ListenPort == 0 && allocatedPort > 0
-	cand := &muxForwardEntry{
-		closer:       ln,
-		fwdType:      req.FwdType,
-		keyHost:      keyHost,
-		connectHost:  normConnectHost,
-		connectPort:  req.ConnectPort,
-		dynamicAlloc: dynamicAlloc,
-		remote:       true,
-		refs:         1,
-	}
-	var (
-		entry        *muxForwardEntry
-		duplicate    bool
-		shuttingDown bool
+	key, entry, allocatedPort, dynamicAlloc, duplicate, shuttingDown := s.registerBoundMuxForward(
+		req.FwdType, resolved, normConnectHost, req.ConnectPort, listenKey, reservedSlot, ln,
 	)
-	if reservedSlot != nil {
-		entry, duplicate, shuttingDown = s.commitReservedForward(listenKey, reservedSlot, key, cand)
-	} else {
-		entry, duplicate, shuttingDown = s.publishForward(key, cand)
-	}
 	if shuttingDown {
 		return sendFailure(conn, req.RequestID, "mux master is shutting down")
 	}
@@ -1481,10 +1626,15 @@ func (s *MuxServer) openRemoteForward(
 	return sendOk(conn, req.RequestID)
 }
 
-// publishForward registers a dynamically allocated remote listener this master
-// now owns. Shutdown and PrepareHandoff synchronize on idleMu, so a forward
-// never slips in after the master committed to handoff or shutdown.
-func (s *MuxServer) publishForward(key string, cand *muxForwardEntry) (entry *muxForwardEntry, duplicate bool, shuttingDown bool) {
+// publishForward registers a dynamically allocated listener this master now
+// owns. Shutdown and PrepareHandoff synchronize on idleMu, so a forward never
+// slips in after the master committed to handoff or shutdown.
+func (s *MuxServer) publishForward(
+	resolved resolvedMuxListen,
+	allocatedPort uint32,
+	key string,
+	cand *muxForwardEntry,
+) (entry *muxForwardEntry, duplicate bool, shuttingDown bool) {
 	s.idleMu.Lock()
 	if s.shuttingDown || s.closed.Load() {
 		s.idleMu.Unlock()
@@ -1494,6 +1644,7 @@ func (s *MuxServer) publishForward(key string, cand *muxForwardEntry) (entry *mu
 	if cand.refs <= 0 {
 		cand.refs = 1
 	}
+	cand.forwardKey = key
 	if existing, loaded := s.forwards.LoadOrStore(key, cand); loaded {
 		if existingEntry, ok := existing.(*muxForwardEntry); ok {
 			if cand.fwdType == MUX_FWD_REMOTE {
@@ -1504,24 +1655,20 @@ func (s *MuxServer) publishForward(key string, cand *muxForwardEntry) (entry *mu
 			return existingEntry, true, false
 		}
 	}
-	if cand.dynamicAlloc && cand.closer != nil {
-		if ln, ok := cand.closer.(net.Listener); ok {
-			if port := extractAllocatedPort(ln.Addr()); port > 0 {
-				dynKey := forwardListenKey{
-					fwdScope:   muxForwardScopeRemote,
-					network:    s.effectiveDialNetwork(),
-					keyHost:    cand.keyHost,
-					listenPort: port,
-				}
-				if s.listenEndpoints == nil {
-					s.listenEndpoints = make(map[forwardListenKey]*muxForwardEndpointState)
-				}
-				if _, exists := s.listenEndpoints[dynKey]; !exists {
-					cand.listenKey = dynKey
-					cand.hasListenKey = true
-					s.listenEndpoints[dynKey] = &muxForwardEndpointState{entry: cand}
-				}
-			}
+	if cand.dynamicAlloc && allocatedPort > 0 {
+		dynKey := forwardListenKey{
+			fwdScope:   muxForwardScopeForType(cand.fwdType),
+			network:    resolved.network,
+			keyHost:    resolved.endpointHost,
+			listenPort: allocatedPort,
+		}
+		if s.listenEndpoints == nil {
+			s.listenEndpoints = make(map[forwardListenKey]*muxForwardEndpointState)
+		}
+		if _, exists := s.listenEndpoints[dynKey]; !exists {
+			cand.listenKey = dynKey
+			cand.hasListenKey = true
+			s.listenEndpoints[dynKey] = &muxForwardEndpointState{entry: cand}
 		}
 	}
 	s.idleMu.Unlock()
@@ -1731,25 +1878,35 @@ func pipeBidirectional(c1, c2 io.ReadWriteCloser) {
 }
 
 func (s *MuxServer) handleCloseFwd(conn net.Conn, req MuxFwdRequest) error {
-	network, _, keyHost, err := s.resolveMuxForwardListen(req.FwdType, req.ListenHost, req.ListenPort)
+	resolved, err := s.resolveMuxForwardListenSpec(req.FwdType, req.ListenHost, req.ListenPort)
 	if err != nil {
 		return sendFailure(conn, req.RequestID, err.Error())
 	}
 	normConnectHost := normalizeMuxForwardHost(req.ConnectHost, req.ConnectPort)
-	key := forwardKey(req.FwdType, keyHost, req.ListenPort, normConnectHost, req.ConnectPort)
+	key := forwardKey(req.FwdType, resolved.keyHost, req.ListenPort, normConnectHost, req.ConnectPort)
 	matchedKey := key
 
 	s.idleMu.Lock()
 	val, ok := s.forwards.Load(matchedKey)
-	if !ok && req.FwdType == MUX_FWD_REMOTE && req.ListenPort == 0 && isTCPNetwork(network) {
+	if !ok && !resolved.isDynamicPort {
+		if listenKey, hasListenKey := makeForwardListenKey(req.FwdType, resolved); hasListenKey && s.listenEndpoints != nil {
+			if cur := s.listenEndpoints[listenKey]; cur != nil && !cur.inFlight &&
+				matchesMuxForwardCancelTarget(cur.entry, req.FwdType, normConnectHost, req.ConnectPort) {
+				if cur.entry.forwardKey != "" {
+					matchedKey = cur.entry.forwardKey
+				}
+				val = cur.entry
+				ok = true
+			}
+		}
+	}
+	if !ok && resolved.isDynamicPort {
 		s.forwards.Range(func(k, v any) bool {
 			ks, isStr := k.(string)
 			entry, isEntry := v.(*muxForwardEntry)
 			if isStr && isEntry && entry.dynamicAlloc &&
-				entry.fwdType == req.FwdType &&
-				entry.keyHost == keyHost &&
-				entry.connectHost == normConnectHost &&
-				entry.connectPort == req.ConnectPort {
+				(entry.keyHost == resolved.keyHost || entry.endpointHost == resolved.endpointHost) &&
+				matchesMuxForwardCancelTarget(entry, req.FwdType, normConnectHost, req.ConnectPort) {
 				matchedKey = ks
 				val = entry
 				ok = true

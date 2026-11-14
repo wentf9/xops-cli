@@ -134,18 +134,11 @@ func (c *Client) RunSubsystemWithIO(ctx context.Context, subsystem string, stdin
 	}
 	untrackSession := c.trackActiveSession("client-session (subsystem:" + subsystem + ")")
 	defer untrackSession()
-	agentLease := c.acquireSessionAgentLease(work)
-	releaseAgent := func() {}
-	if agentLease != nil {
-		releaseAgent = sync.OnceFunc(func() {
-			c.untrackAgentLease(agentLease)
-			agentLease.Release()
-		})
-	}
+	wantAgent, releaseAgent := c.prepareChannelAgentForward(work)
 	defer releaseAgent()
 
 	observation, reqDone := startSubsystemRequestObserver(channel, requests)
-	if setupErr := c.setupSubsystemChannel(work, channel, subsystem, envVars, agentLease != nil, releaseAgent, allocatePTY, width, height); setupErr != nil {
+	if setupErr := c.setupSubsystemChannel(work, channel, subsystem, envVars, wantAgent, releaseAgent, allocatePTY, width, height); setupErr != nil {
 		cancel()
 		closeErr := c.closeCommandChannel(channel, reqDone)
 		releaseAgent()

@@ -255,14 +255,14 @@ func (o *SshOptions) originalHostForExpansion() string {
 		return o.originalHost
 	}
 	if s := strings.TrimSpace(o.Target.Selector); s != "" {
-		return strings.TrimPrefix(s, config.OpenSSHNodePrefix)
+		return config.UnwrapOpenSSHSelector(s)
 	}
 	if s := strings.TrimSpace(o.Host); s != "" && !strings.Contains(s, ",") {
-		return strings.TrimPrefix(s, config.OpenSSHNodePrefix)
+		return config.UnwrapOpenSSHSelector(s)
 	}
 	if !o.nonHostArgs && len(o.args) > 0 {
 		if _, h, _, err := utils.ParseAddr(o.args[0]); err == nil && h != "" {
-			return strings.TrimPrefix(h, config.OpenSSHNodePrefix)
+			return config.UnwrapOpenSSHSelector(h)
 		}
 		return strings.TrimSpace(o.args[0])
 	}
@@ -1402,21 +1402,24 @@ func isMasterInJumpSpec(nodeID string, master *ssh.MuxServer, jumpSpec string) b
 func matchesAnyTargetNodeID(nodeID string, master *ssh.MuxServer, targetIDs []string) bool {
 	candidates := []string{
 		strings.TrimSpace(nodeID),
-		strings.TrimPrefix(strings.TrimSpace(nodeID), config.OpenSSHNodePrefix),
+		config.UnwrapOpenSSHSelector(nodeID),
 	}
 	if master != nil {
 		orig := strings.TrimSpace(master.Target().OriginalHost)
 		candidates = append(candidates,
 			orig,
-			strings.TrimPrefix(orig, config.OpenSSHNodePrefix),
+			config.UnwrapOpenSSHSelector(orig),
 		)
+		if master.Target().Host != "" && master.Target().User != "" && master.Target().Port > 0 {
+			candidates = append(candidates, config.FormatNodeID(master.Target().User, master.Target().Host, uint16(master.Target().Port)))
+		}
 	}
 	for _, tid := range targetIDs {
 		want := strings.TrimSpace(tid)
 		if want == "" {
 			continue
 		}
-		cleanWant := strings.TrimPrefix(want, config.OpenSSHNodePrefix)
+		cleanWant := config.UnwrapOpenSSHSelector(want)
 		for _, c := range candidates {
 			if c != "" && (c == want || c == cleanWant) {
 				return true
@@ -1429,21 +1432,24 @@ func matchesAnyTargetNodeID(nodeID string, master *ssh.MuxServer, targetIDs []st
 func matchesTargetSelector(nodeID string, master *ssh.MuxServer, host, selector string) bool {
 	candidates := []string{
 		strings.TrimSpace(nodeID),
-		strings.TrimPrefix(strings.TrimSpace(nodeID), config.OpenSSHNodePrefix),
+		config.UnwrapOpenSSHSelector(nodeID),
 	}
 	if master != nil {
 		orig := strings.TrimSpace(master.Target().OriginalHost)
 		candidates = append(candidates,
 			orig,
-			strings.TrimPrefix(orig, config.OpenSSHNodePrefix),
+			config.UnwrapOpenSSHSelector(orig),
 			strings.TrimSpace(master.Target().Host),
 		)
+		if master.Target().Host != "" && master.Target().User != "" && master.Target().Port > 0 {
+			candidates = append(candidates, config.FormatNodeID(master.Target().User, master.Target().Host, uint16(master.Target().Port)))
+		}
 	}
 	for _, want := range []string{strings.TrimSpace(host), strings.TrimSpace(selector)} {
 		if want == "" {
 			continue
 		}
-		cleanWant := strings.TrimPrefix(want, config.OpenSSHNodePrefix)
+		cleanWant := config.UnwrapOpenSSHSelector(want)
 		for _, c := range candidates {
 			if c != "" && (c == want || c == cleanWant) {
 				return true
@@ -1503,7 +1509,7 @@ func (o *SshOptions) resolveMuxDaemonTarget(nodeID string, master *ssh.MuxServer
 	if rawSelector == "" {
 		rawSelector = o.Host
 	}
-	host = strings.TrimPrefix(rawSelector, config.OpenSSHNodePrefix)
+	host = config.UnwrapOpenSSHSelector(rawSelector)
 	if host == "" && master != nil {
 		host = master.Target().Host
 	}

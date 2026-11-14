@@ -110,20 +110,14 @@ func (c *Client) executeCommand(ctx context.Context, plan CommandPlan, sendSessi
 	}
 	untrackSession := c.trackActiveSession("client-session (exec)")
 	defer untrackSession()
-	var agentLease *agentForwardLease
+	wantAgent := false
 	releaseAgent := func() {}
 	if sendSessionEnv {
-		agentLease = c.acquireSessionAgentLease(work)
-		if agentLease != nil {
-			releaseAgent = sync.OnceFunc(func() {
-				c.untrackAgentLease(agentLease)
-				agentLease.Release()
-			})
-		}
+		wantAgent, releaseAgent = c.prepareChannelAgentForward(work)
 	}
 	defer releaseAgent()
 	output := newOutputWriter(&RunConfig{OutMode: OutputModeRingBuffer, RingMaxBytes: plan.outputLimit})
-	workersDone, startDone := c.startCommandWorkers(work, channel, requests, plan, envVars, agentLease != nil, releaseAgent, output, observation)
+	workersDone, startDone := c.startCommandWorkers(work, channel, requests, plan, envVars, wantAgent, releaseAgent, output, observation)
 	waitErr := c.waitCommandWorkers(work, workersDone, startDone)
 	cleanupErr := c.closeCommandChannel(channel, workersDone)
 	releaseAgent()

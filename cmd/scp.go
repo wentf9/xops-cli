@@ -798,10 +798,8 @@ func (o *ScpOptions) runBatch(ctx context.Context, provider config.ConfigProvide
 			return fmt.Errorf("%s", i18n.Tf("err_tag_empty", map[string]any{"Tag": o.Tag}))
 		}
 		for nodeID := range nodes {
-			if excludes != nil {
-				if _, excluded := excludes[nodeID]; excluded {
-					continue
-				}
+			if cmdutils.IsTargetExcluded(excludes, cmdutils.ExcludeTargetInfo{NodeID: nodeID, MatchedNodeID: nodeID}) {
+				continue
 			}
 			nid := nodeID // capture
 			_, _, identity, resolveErr := provider.Resolve(nid)
@@ -865,39 +863,39 @@ func (o *ScpOptions) runBatch(ctx context.Context, provider config.ConfigProvide
 }
 
 func (o *ScpOptions) isBatchHostExcluded(provider config.ConfigProvider, excludes map[string]struct{}, rawHost string, canonAddr PathInfo) (bool, error) {
-	if _, ok := excludes[rawHost]; ok {
-		return true, nil
+	if len(excludes) == 0 {
+		return false, nil
 	}
-	if _, ok := excludes[canonAddr.Host]; ok {
-		return true, nil
+	info := cmdutils.ExcludeTargetInfo{
+		User:           canonAddr.User,
+		Port:           canonAddr.Port,
+		UnmanagedHosts: []string{rawHost, canonAddr.Host, canonAddr.OriginalHost},
 	}
 	if target, tErr := o.resolveTargetForPath(canonAddr); tErr == nil && target.Selector != "" {
 		resolved, rErr := config.ResolveTarget(provider, target)
 		if rErr != nil {
 			return false, fmt.Errorf("resolve excluded host %q: %w", canonAddr.Host, rErr)
 		}
-		if resolved.NodeID != "" {
-			if _, ok := excludes[resolved.NodeID]; ok {
-				return true, nil
-			}
+		info.NodeID = resolved.NodeID
+		info.MatchedNodeID = resolved.MatchedNodeID
+		info.BaseNodeID = resolved.BaseNodeID
+		info.OpenSSHAlias = resolved.OpenSSHAlias
+		if resolved.User != "" {
+			info.User = resolved.User
 		}
-		if resolved.MatchedNodeID != "" {
-			if _, ok := excludes[resolved.MatchedNodeID]; ok {
-				return true, nil
-			}
+		if resolved.Port > 0 {
+			info.Port = resolved.Port
 		}
-		return false, nil
+		return cmdutils.IsTargetExcluded(excludes, info), nil
 	}
 	nid, resolveErr := provider.ResolveSelector(canonAddr.Host)
 	if resolveErr != nil {
 		return false, fmt.Errorf("resolve excluded host %q: %w", canonAddr.Host, resolveErr)
 	}
 	if nid != "" {
-		if _, ok := excludes[nid]; ok {
-			return true, nil
-		}
+		info.NodeID = nid
 	}
-	return false, nil
+	return cmdutils.IsTargetExcluded(excludes, info), nil
 }
 
 func (o *ScpOptions) executeTransfer(ctx context.Context, label string, addr PathInfo, specificPassword string, provider config.ConfigProvider, connector *ssh.Connector) (err error) {
@@ -1052,6 +1050,9 @@ func (o *ScpOptions) canonicalizePathInfo(ctx context.Context, provider config.C
 		if stripped, ok := config.OpenSSHOriginalHost(p.Host); ok && p.OriginalHost == "" {
 			p.OriginalHost = stripped
 		}
+		return p, nil
+	}
+	if p.OriginalHost != "" {
 		return p, nil
 	}
 	cacheKey := o.canonicalCacheKey(p)
@@ -1497,14 +1498,20 @@ func (o *ScpOptions) distinctRemoteHosts(provider config.ConfigProvider) []strin
 	seen := make(map[string]struct{})
 	var hosts []string
 	for _, p := range o.collectTargetPaths(provider) {
-		h := strings.TrimSpace(p.OriginalHost)
-		if h == "" && provider != nil && p.Host != "" && !strings.HasPrefix(p.Host, config.OpenSSHNodePrefix) {
-			if _, hostObj, _, rErr := provider.Resolve(p.Host); rErr == nil && strings.TrimSpace(hostObj.Address) != "" {
-				h = strings.TrimSpace(hostObj.Address)
+		var h string
+		if provider != nil {
+			if _, origHost, expandHost, ok := o.resolvePathTargetAndHosts(provider, p); ok {
+				h = strings.TrimSpace(origHost)
+				if h == "" {
+					h = strings.TrimSpace(expandHost)
+				}
 			}
 		}
 		if h == "" {
-			h = strings.TrimSpace(strings.TrimPrefix(p.Host, config.OpenSSHNodePrefix))
+			h = strings.TrimSpace(p.OriginalHost)
+		}
+		if h == "" {
+			h = config.UnwrapOpenSSHSelector(p.Host)
 		}
 		if h == "" {
 			continue
@@ -1559,63 +1566,93 @@ func (o *ScpOptions) resolvedTargetNodeIDsWithHosts(provider config.ConfigProvid
 }
 
 func (o *ScpOptions) resolvePathTargetAndHosts(provider config.ConfigProvider, p PathInfo) (config.ConnectionTarget, string, string, bool) {
-	origHost := p.OriginalHost
+	canonOriginalHost := p.OriginalHost
+	canonicalized := canonOriginalHost != ""
 	o.canonicalMu.Lock()
 	res, ok := o.canonicalCache[o.canonicalCacheKey(p)]
 	o.canonicalMu.Unlock()
 	if ok && res.Canonicalized {
-		if origHost == "" {
-			origHost = res.OriginalHost
+		canonicalized = true
+		if canonOriginalHost == "" {
+			canonOriginalHost = res.OriginalHost
 		}
 		p.Host = res.CanonicalHost
-	}
-	if origHost == "" {
-		if stripped, ok := config.OpenSSHOriginalHost(p.Host); ok {
-			origHost = stripped
-		}
-	}
-	expandHost := origHost
-	if expandHost == "" {
-		if _, hostObj, _, rErr := provider.Resolve(p.Host); rErr == nil && strings.TrimSpace(hostObj.Address) != "" {
-			expandHost = strings.TrimSpace(hostObj.Address)
-		} else if p.Host != "" {
-			expandHost = strings.TrimPrefix(p.Host, config.OpenSSHNodePrefix)
-		}
 	}
 	target, err := o.resolveTargetForPath(p)
 	if err != nil || target.Selector == "" {
 		return config.ConnectionTarget{}, "", "", false
 	}
-	if origHost == "" {
-		if resolved, rErr := config.ResolveTarget(provider, target); rErr == nil && resolved.MatchedNodeID == "" && resolved.OpenSSHAlias != "" {
-			origHost = resolved.OpenSSHAlias
-		}
-	}
+	resolved, rErr := config.ResolveTarget(provider, target)
+	origHost, expandHost := resolveTargetOriginalAndExpandHosts(canonicalized, canonOriginalHost, target.Selector, resolved, rErr == nil)
 	return target, origHost, expandHost, true
 }
 
+func (o *ScpOptions) isCollectedPathExcluded(provider config.ConfigProvider, excludes map[string]struct{}, p PathInfo) bool {
+	if len(excludes) == 0 || provider == nil {
+		return false
+	}
+	rawHost := p.Host
+	canonP := p
+	o.canonicalMu.Lock()
+	res, ok := o.canonicalCache[o.canonicalCacheKey(p)]
+	o.canonicalMu.Unlock()
+	if ok && res.Canonicalized {
+		if canonP.OriginalHost == "" {
+			canonP.OriginalHost = res.OriginalHost
+		}
+		canonP.Host = res.CanonicalHost
+	}
+	excluded, exErr := o.isBatchHostExcluded(provider, excludes, rawHost, canonP)
+	return exErr == nil && excluded
+}
+
+func (o *ScpOptions) collectHostTargetPaths(provider config.ConfigProvider, excludes map[string]struct{}) []PathInfo {
+	var paths []PathInfo
+	appendHostPath := func(p PathInfo) {
+		if p.Host == "" {
+			return
+		}
+		if p.User == "" {
+			p.User = o.User
+		}
+		if p.Port == 0 {
+			p.Port = o.Port
+		}
+		if !o.isCollectedPathExcluded(provider, excludes, p) {
+			paths = append(paths, p)
+		}
+	}
+	if hosts, err := cmdutils.ParseHosts(o.Host, o.HostFile, ""); err == nil {
+		for _, h := range hosts {
+			appendHostPath(PathInfo{Host: h.Host, User: h.User, Port: h.Port, IsRemote: true})
+		}
+		return paths
+	}
+	if o.Host != "" {
+		for h := range strings.SplitSeq(o.Host, ",") {
+			appendHostPath(PathInfo{Host: strings.TrimSpace(h), IsRemote: true})
+		}
+	}
+	return paths
+}
+
 func (o *ScpOptions) collectTargetPaths(provider config.ConfigProvider) []PathInfo {
+	var excludes map[string]struct{}
+	if provider != nil && len(o.Exclude) > 0 {
+		if resolved, err := cmdutils.ResolveExcludes(provider, cmdutils.ParseExcludeFlag(o.Exclude)); err == nil {
+			excludes = resolved
+		}
+	}
 	var paths []PathInfo
 	if o.Tag != "" {
 		for nodeID := range provider.GetNodesByTag(o.Tag) {
-			paths = append(paths, PathInfo{Host: nodeID, IsRemote: true})
+			if !cmdutils.IsTargetExcluded(excludes, cmdutils.ExcludeTargetInfo{NodeID: nodeID, MatchedNodeID: nodeID}) {
+				paths = append(paths, PathInfo{Host: nodeID, IsRemote: true})
+			}
 		}
 	}
 	if o.Host != "" || o.HostFile != "" {
-		if hosts, err := cmdutils.ParseHosts(o.Host, o.HostFile, ""); err == nil {
-			for _, h := range hosts {
-				if h.Host != "" {
-					paths = append(paths, PathInfo{Host: h.Host, User: h.User, Port: h.Port, IsRemote: true})
-				}
-			}
-		} else if o.Host != "" {
-			for h := range strings.SplitSeq(o.Host, ",") {
-				h = strings.TrimSpace(h)
-				if h != "" {
-					paths = append(paths, PathInfo{Host: h, IsRemote: true})
-				}
-			}
-		}
+		paths = append(paths, o.collectHostTargetPaths(provider, excludes)...)
 	}
 	if o.Host == "" && o.Tag == "" && o.HostFile == "" {
 		if src, err := parsePath(o.Source); err == nil && src.IsRemote {

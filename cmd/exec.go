@@ -372,14 +372,19 @@ func (o *ExecOptions) validateInteractiveOptions() error {
 }
 
 type execHostTask struct {
-	nodeID       string
-	host         string
-	originalHost string
-	port         uint16
-	user         string
-	pass         string
-	passphrase   string
-	keyPath      string
+	nodeID        string
+	matchedNodeID string
+	baseNodeID    string
+	openSSHAlias  string
+	rawHost       string
+	host          string
+	originalHost  string
+	expandHost    string
+	port          uint16
+	user          string
+	pass          string
+	passphrase    string
+	keyPath       string
 }
 
 func (o *ExecOptions) Run() error {
@@ -461,7 +466,16 @@ func (o *ExecOptions) RunContext(ctx context.Context) (retErr error) {
 		}
 		filtered := tasks[:0]
 		for _, t := range tasks {
-			if _, excluded := excludes[t.nodeID]; !excluded {
+			info := utils.ExcludeTargetInfo{
+				NodeID:         t.nodeID,
+				MatchedNodeID:  t.matchedNodeID,
+				BaseNodeID:     t.baseNodeID,
+				OpenSSHAlias:   t.openSSHAlias,
+				User:           t.user,
+				Port:           t.port,
+				UnmanagedHosts: []string{t.rawHost, t.host, t.originalHost},
+			}
+			if !utils.IsTargetExcluded(excludes, info) {
 				filtered = append(filtered, t)
 			}
 		}
@@ -669,6 +683,9 @@ func (o *ExecOptions) validateMultiHostStaticHostName(tasks []execHostTask) erro
 	for _, task := range tasks {
 		h := strings.TrimSpace(task.originalHost)
 		if h == "" {
+			h = strings.TrimSpace(task.expandHost)
+		}
+		if h == "" {
 			h = strings.TrimSpace(task.host)
 		}
 		if h == "" {
@@ -683,7 +700,10 @@ func (o *ExecOptions) validateMultiHostStaticHostName(tasks []execHostTask) erro
 }
 
 func (o *ExecOptions) buildTaskSessionAuth(task execHostTask, cliAbsKeys []string, remember, suppressConfirm bool) (adapter.SessionAuth, error) {
-	hostForExpansion := task.originalHost
+	hostForExpansion := task.expandHost
+	if hostForExpansion == "" {
+		hostForExpansion = task.originalHost
+	}
 	if hostForExpansion == "" {
 		hostForExpansion = task.host
 	}
@@ -1028,16 +1048,75 @@ func (o *ExecOptions) buildTasksFromTags(provider config.ConfigProvider) ([]exec
 			keyPath = utils.ToAbsolutePath(o.IdentityFile)
 		}
 		tasks = append(tasks, execHostTask{
-			nodeID:     nodeID,
-			host:       hostObj.Address,
-			port:       hostObj.Port,
-			user:       identity.User,
-			pass:       password,
-			passphrase: passphrase,
-			keyPath:    keyPath,
+			nodeID:        nodeID,
+			matchedNodeID: nodeID,
+			host:          hostObj.Address,
+			port:          hostObj.Port,
+			user:          identity.User,
+			pass:          password,
+			passphrase:    passphrase,
+			keyPath:       keyPath,
 		})
 	}
 	return tasks, nil
+}
+
+func isResolvedSavedNode(r config.ResolvedTarget) bool {
+	return r.MatchedNodeID != "" &&
+		!strings.HasPrefix(r.MatchedNodeID, config.OpenSSHNodePrefix) &&
+		strings.TrimSpace(r.Host) != ""
+}
+
+func resolveTargetOriginalAndExpandHosts(canonicalized bool, canonOriginalHost, selector string, resolved config.ResolvedTarget, hasResolved bool) (originalHost, expandHost string) {
+	if canonicalized {
+		return canonOriginalHost, canonOriginalHost
+	}
+	if hasResolved && isResolvedSavedNode(resolved) {
+		return "", strings.TrimSpace(resolved.Host)
+	}
+	originalHost = config.UnwrapOpenSSHSelector(selector)
+	if originalHost == "" && hasResolved && resolved.OpenSSHAlias != "" {
+		originalHost = resolved.OpenSSHAlias
+	}
+	return originalHost, originalHost
+}
+
+func (o *ExecOptions) resolveExecHostTarget(ctx context.Context, repository config.ConfigProvider, target config.ConnectionTarget) (config.ConnectionTarget, config.ResolvedTarget, bool, string, string, error) {
+	var (
+		matchedSavedNode  bool
+		canonicalized     bool
+		canonOriginalHost string
+		resolved          config.ResolvedTarget
+		hasResolved       bool
+	)
+	if r, rErr := config.ResolveTarget(repository, target); rErr == nil {
+		resolved = r
+		hasResolved = true
+		matchedSavedNode = isResolvedSavedNode(r)
+	}
+	if target.Selector != "" && !strings.HasPrefix(target.Selector, config.OpenSSHNodePrefix) {
+		canonRes, cErr := config.CanonicalizeHost(ctx, config.CanonicalizeInput{
+			Provider:         repository,
+			Host:             target.Selector,
+			RawCLIOptions:    o.control.Options,
+			CLIProxyJump:     o.JumpHost,
+			MatchedSavedNode: matchedSavedNode,
+		})
+		if cErr != nil {
+			return target, resolved, hasResolved, "", "", cErr
+		}
+		if canonRes.Canonicalized {
+			canonicalized = true
+			canonOriginalHost = canonRes.OriginalHost
+			target.Selector = canonRes.CanonicalHost
+			if r, rErr := config.ResolveTarget(repository, target); rErr == nil {
+				resolved = r
+				hasResolved = true
+			}
+		}
+	}
+	originalHost, expandHost := resolveTargetOriginalAndExpandHosts(canonicalized, canonOriginalHost, target.Selector, resolved, hasResolved)
+	return target, resolved, hasResolved, originalHost, expandHost, nil
 }
 
 func (o *ExecOptions) buildTasksFromHosts(ctx context.Context, repository config.ConfigProvider) ([]execHostTask, []error, error) {
@@ -1080,8 +1159,9 @@ func (o *ExecOptions) buildTasksFromHosts(ctx context.Context, repository config
 			alias = o.Alias
 		}
 
+		rawHost := strings.TrimSpace(h.Host)
 		target := config.ConnectionTarget{
-			Selector:     strings.TrimSpace(h.Host),
+			Selector:     rawHost,
 			User:         strings.TrimSpace(user),
 			HasUser:      hasUser,
 			Port:         port,
@@ -1089,31 +1169,16 @@ func (o *ExecOptions) buildTasksFromHosts(ctx context.Context, repository config
 			ProxyJump:    o.JumpHost,
 			HasProxyJump: o.JumpHost != "",
 		}
-		originalHost := strings.TrimPrefix(target.Selector, config.OpenSSHNodePrefix)
-		if target.Selector != "" && !strings.HasPrefix(target.Selector, config.OpenSSHNodePrefix) {
-			var matchedSavedNode bool
-			if resolved, rErr := config.ResolveTarget(repository, target); rErr == nil {
-				matchedSavedNode = resolved.MatchedNodeID != "" &&
-					!strings.HasPrefix(resolved.MatchedNodeID, config.OpenSSHNodePrefix) &&
-					strings.TrimSpace(resolved.Host) != ""
-			}
-			canonRes, cErr := config.CanonicalizeHost(ctx, config.CanonicalizeInput{
-				Provider:         repository,
-				Host:             target.Selector,
-				RawCLIOptions:    o.control.Options,
-				CLIProxyJump:     o.JumpHost,
-				MatchedSavedNode: matchedSavedNode,
-			})
-			if cErr != nil {
-				hostErrs = append(hostErrs, fmt.Errorf("[%s] %w", h.Host, cErr))
-				continue
-			}
-			if canonRes.Canonicalized {
-				originalHost = canonRes.OriginalHost
-				target.Selector = canonRes.CanonicalHost
-				h.Host = canonRes.CanonicalHost
-			}
+		var resolved config.ResolvedTarget
+		var hasResolved bool
+		var originalHost, expandHost string
+		var cErr error
+		target, resolved, hasResolved, originalHost, expandHost, cErr = o.resolveExecHostTarget(ctx, repository, target)
+		if cErr != nil {
+			hostErrs = append(hostErrs, fmt.Errorf("[%s] %w", h.Host, cErr))
+			continue
 		}
+		h.Host = target.Selector
 
 		addr := utils.HostInfo{
 			Host:       h.Host,
@@ -1129,15 +1194,28 @@ func (o *ExecOptions) buildTasksFromHosts(ctx context.Context, repository config
 			hostErrs = append(hostErrs, fmt.Errorf("[%s] %w", h.Host, err))
 			continue
 		}
+		taskUser := user
+		if taskUser == "" && hasResolved {
+			taskUser = resolved.User
+		}
+		taskPort := port
+		if taskPort == 0 && hasResolved {
+			taskPort = resolved.Port
+		}
 		tasks = append(tasks, execHostTask{
-			nodeID:       nodeID,
-			host:         h.Host,
-			originalHost: originalHost,
-			port:         port,
-			user:         user,
-			pass:         password,
-			passphrase:   passphrase,
-			keyPath:      utils.ToAbsolutePath(keyPath),
+			nodeID:        nodeID,
+			matchedNodeID: resolved.MatchedNodeID,
+			baseNodeID:    resolved.BaseNodeID,
+			openSSHAlias:  resolved.OpenSSHAlias,
+			rawHost:       rawHost,
+			host:          h.Host,
+			originalHost:  originalHost,
+			expandHost:    expandHost,
+			port:          taskPort,
+			user:          taskUser,
+			pass:          password,
+			passphrase:    passphrase,
+			keyPath:       utils.ToAbsolutePath(keyPath),
 		})
 	}
 	return tasks, hostErrs, nil

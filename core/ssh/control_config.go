@@ -193,7 +193,7 @@ var ErrControlTargetMismatch = errors.New("control socket target mismatch")
 // reused across different destination hosts, ports, users, or jump hosts.
 // Returns "" if Host is empty.
 func (t TargetContext) CanonicalTargetIdentity() string {
-	host := strings.ToLower(strings.TrimSpace(t.Host))
+	host := strings.ToLower(cleanHostLiteral(t.Host))
 	if host == "" {
 		return ""
 	}
@@ -209,7 +209,8 @@ func (t TargetContext) CanonicalTargetIdentity() string {
 // MatchesMasterTarget reports whether the requested target is compatible with
 // the master target identity advertised via the "target@xops" hello extension.
 func (t TargetContext) MatchesMasterTarget(masterIdentity string) bool {
-	if strings.TrimSpace(masterIdentity) == "" || strings.TrimSpace(t.Host) == "" {
+	tHost := strings.ToLower(cleanHostLiteral(t.Host))
+	if strings.TrimSpace(masterIdentity) == "" || tHost == "" {
 		return true
 	}
 	var mHost, mUser, mJump string
@@ -221,7 +222,7 @@ func (t TargetContext) MatchesMasterTarget(masterIdentity string) bool {
 		}
 		switch kv[0] {
 		case "host":
-			mHost = strings.ToLower(strings.TrimSpace(kv[1]))
+			mHost = strings.ToLower(cleanHostLiteral(kv[1]))
 		case "port":
 			if p, err := strconv.Atoi(strings.TrimSpace(kv[1])); err == nil && p > 0 {
 				mPort = p
@@ -235,7 +236,6 @@ func (t TargetContext) MatchesMasterTarget(masterIdentity string) bool {
 	if mHost == "" {
 		return true
 	}
-	tHost := strings.ToLower(strings.TrimSpace(t.Host))
 	tPort := t.Port
 	if tPort <= 0 {
 		tPort = 22
@@ -263,7 +263,7 @@ func FormatTargetIdentity(identity string) string {
 		}
 		switch kv[0] {
 		case "host":
-			host = kv[1]
+			host = cleanHostLiteral(kv[1])
 		case "port":
 			if p, err := strconv.Atoi(kv[1]); err == nil && p > 0 {
 				port = p
@@ -368,6 +368,8 @@ func expandTilde(path string, homeDir string) (string, error) {
 }
 
 func expandPercentTokens(raw string, env Environment, target TargetContext) (string, error) {
+	host := cleanHostLiteral(target.Host)
+
 	portStr := "22"
 	if target.Port > 0 {
 		portStr = strconv.Itoa(target.Port)
@@ -375,7 +377,7 @@ func expandPercentTokens(raw string, env Environment, target TargetContext) (str
 
 	origHost := target.OriginalHost
 	if origHost == "" {
-		origHost = target.Host
+		origHost = host
 	}
 
 	remoteUser := target.User
@@ -389,7 +391,7 @@ func expandPercentTokens(raw string, env Environment, target TargetContext) (str
 	}
 
 	// Compute %C connection hash: SHA-1 over %l%h%p%r%j
-	connHash := ComputeConnectionHash(env.LocalHost, target.Host, portStr, remoteUser, target.JumpHost)
+	connHash := ComputeConnectionHash(env.LocalHost, host, portStr, remoteUser, target.JumpHost)
 
 	var sb strings.Builder
 	sb.Grow(len(raw) + 32)
@@ -404,7 +406,7 @@ func expandPercentTokens(raw string, env Environment, target TargetContext) (str
 			case '%':
 				sb.WriteByte('%')
 			case 'h':
-				sb.WriteString(target.Host)
+				sb.WriteString(host)
 			case 'p':
 				sb.WriteString(portStr)
 			case 'r':

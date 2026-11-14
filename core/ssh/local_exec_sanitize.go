@@ -303,7 +303,7 @@ func expandLocalExecTemplate(optionName, pattern string, env Environment, target
 	if target.Port < 0 || target.Port > 65535 {
 		return "", fmt.Errorf("%w: invalid port %d", ErrUnsafeExecToken, target.Port)
 	}
-	target.Host = stripEnclosingBrackets(target.Host)
+	target.Host = cleanHostLiteral(target.Host)
 
 	tokens := buildRemoteCommandTokenMap(env, target)
 	var sb strings.Builder
@@ -331,7 +331,7 @@ func expandLocalExecTemplate(optionName, pattern string, env Environment, target
 			return "", err
 		}
 		if normalizeExecTokenKind(kind) == "host" {
-			val = stripEnclosingBrackets(val)
+			val = cleanHostLiteral(val)
 		}
 		sb.WriteString(val)
 	}
@@ -341,6 +341,13 @@ func expandLocalExecTemplate(optionName, pattern string, env Environment, target
 		return "", fmt.Errorf("expanded %s cannot contain control characters or null bytes", optionName)
 	}
 	return expanded, nil
+}
+
+// cleanHostLiteral trims surrounding whitespace and strips a single balanced
+// outer "[...]" pair (matching OpenSSH cleanhostname for bracketed IPv6 literals
+// such as "[2001:db8::1]" or "[fe80::1%eth0]") without altering unbalanced brackets.
+func cleanHostLiteral(host string) string {
+	return stripEnclosingBrackets(strings.TrimSpace(host))
 }
 
 func stripEnclosingBrackets(val string) string {

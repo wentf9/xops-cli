@@ -54,3 +54,70 @@ func ResolveExcludes(provider config.ConfigProvider, excludes []string) (map[str
 	}
 	return resolved, nil
 }
+
+// ExcludeTargetInfo describes a candidate target host or node for unified
+// --exclude matching across scp and exec.
+type ExcludeTargetInfo struct {
+	NodeID         string
+	MatchedNodeID  string
+	BaseNodeID     string
+	OpenSSHAlias   string
+	User           string
+	Port           uint16
+	UnmanagedHosts []string
+}
+
+func hasAnyExcludeKey(excludes map[string]struct{}, keys ...string) bool {
+	for _, k := range keys {
+		if k == "" {
+			continue
+		}
+		if _, ok := excludes[k]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// IsTargetExcluded reports whether the target described by info matches any
+// entry in excludes, handling saved NodeIDs, OpenSSH "openssh:" aliases,
+// disambiguated "openssh:user@alias:port" IDs, and pre-canonicalized names.
+func IsTargetExcluded(excludes map[string]struct{}, info ExcludeTargetInfo) bool {
+	if len(excludes) == 0 {
+		return false
+	}
+	if hasAnyExcludeKey(excludes, info.NodeID, info.MatchedNodeID) {
+		return true
+	}
+	if strings.HasPrefix(info.BaseNodeID, config.OpenSSHNodePrefix) {
+		if hasAnyExcludeKey(excludes, info.BaseNodeID, config.OpenSSHNodePrefix+config.UnwrapOpenSSHSelector(info.BaseNodeID)) {
+			return true
+		}
+	}
+	if info.OpenSSHAlias != "" {
+		var aliasID string
+		if info.User != "" && info.Port > 0 {
+			aliasID = config.OpenSSHNodePrefix + config.FormatNodeID(info.User, info.OpenSSHAlias, info.Port)
+		}
+		if hasAnyExcludeKey(excludes, config.OpenSSHNodePrefix+info.OpenSSHAlias, info.OpenSSHAlias, aliasID) {
+			return true
+		}
+	}
+	if info.MatchedNodeID == "" {
+		for _, h := range info.UnmanagedHosts {
+			h = strings.TrimSpace(h)
+			if h == "" {
+				continue
+			}
+			unwrapped := config.UnwrapOpenSSHSelector(h)
+			var prefixed string
+			if unwrapped != "" {
+				prefixed = config.OpenSSHNodePrefix + unwrapped
+			}
+			if hasAnyExcludeKey(excludes, h, unwrapped, prefixed) {
+				return true
+			}
+		}
+	}
+	return false
+}

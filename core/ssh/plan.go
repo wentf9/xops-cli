@@ -115,6 +115,7 @@ func normalizePlan(plan ConnectionPlan) (ConnectionPlan, error) {
 		if hop.NodeID == "" || len(hop.NodeID) > 1024 || strings.ContainsAny(hop.NodeID, ",\x00\r\n") || seen[hop.NodeID] {
 			return ConnectionPlan{}, errors.New("connection plan contains an invalid or duplicate node ID")
 		}
+		hop.Address = cleanHostLiteral(hop.Address)
 		if hop.Address == "" || hop.User == "" || hop.Port < 0 || hop.Port > 65535 {
 			return ConnectionPlan{}, errors.New("connection plan contains an invalid SSH endpoint")
 		}

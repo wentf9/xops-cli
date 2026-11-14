@@ -940,13 +940,14 @@ func ExpandRemoteCommand(pattern string, env Environment, target TargetContext) 
 }
 
 func buildRemoteCommandTokenMap(env Environment, target TargetContext) map[byte]string {
+	host := cleanHostLiteral(target.Host)
 	portStr := "22"
 	if target.Port > 0 {
 		portStr = strconv.Itoa(target.Port)
 	}
 	origHost := target.OriginalHost
 	if origHost == "" {
-		origHost = target.Host
+		origHost = host
 	}
 	remoteUser := target.User
 	if remoteUser == "" {
@@ -956,12 +957,12 @@ func buildRemoteCommandTokenMap(env Environment, target TargetContext) map[byte]
 	if idx := strings.Index(shortLocalHost, "."); idx != -1 {
 		shortLocalHost = shortLocalHost[:idx]
 	}
-	connHash := ComputeConnectionHash(env.LocalHost, target.Host, portStr, remoteUser, target.JumpHost)
+	connHash := ComputeConnectionHash(env.LocalHost, host, portStr, remoteUser, target.JumpHost)
 	return map[byte]string{
 		'%': "%",
 		'C': connHash,
 		'd': env.HomeDir,
-		'h': target.Host,
+		'h': host,
 		'i': env.LocalUID,
 		'l': env.LocalHost,
 		'L': shortLocalHost,

@@ -40,25 +40,49 @@ func (c *Connector) getHostKeyOptionsWithState(
 	return callback, algorithms, nil
 }
 
+func isRelativeAlgorithmSpec(spec string) bool {
+	return len(spec) > 0 && (spec[0] == '+' || spec[0] == '-' || spec[0] == '^')
+}
+
 func (c *Connector) getHostKeyAlgorithms(ctx context.Context, coordinator *handshakeCoordinator, cfg *ClientConfig) ([]string, error) {
-	var optionAlgos []string
-	if cfg != nil && cfg.Options != nil && cfg.Options.HostKeyAlgorithms() != "" {
-		algos, err := ResolveAlgorithmList(cfg.Options.HostKeyAlgorithms(), cryptoSSH.SupportedAlgorithms().HostKeys)
+	rawSpec := ""
+	if cfg != nil && cfg.Options != nil {
+		rawSpec = strings.TrimSpace(cfg.Options.HostKeyAlgorithms())
+	}
+	if c.hostKeyVerifier != nil {
+		return c.getVerifierHostKeyAlgorithms(ctx, coordinator, cfg, rawSpec)
+	}
+	if rawSpec == "" {
+		return c.defaultKnownHostsHostKeyAlgorithms(cfg), nil
+	}
+	base := cryptoSSH.SupportedAlgorithms().HostKeys
+	if isRelativeAlgorithmSpec(rawSpec) {
+		base = c.defaultKnownHostsHostKeyAlgorithms(cfg)
+	}
+	algos, err := ResolveAlgorithmList(rawSpec, base)
+	if err != nil {
+		return nil, fmt.Errorf("resolve HostKeyAlgorithms option: %w", err)
+	}
+	return algos, nil
+}
+
+func (c *Connector) getVerifierHostKeyAlgorithms(
+	ctx context.Context,
+	coordinator *handshakeCoordinator,
+	cfg *ClientConfig,
+	rawSpec string,
+) ([]string, error) {
+	source, ok := c.hostKeyVerifier.(HostKeyAlgorithmSource)
+	if !ok {
+		if rawSpec == "" {
+			return nil, nil
+		}
+		algos, err := ResolveAlgorithmList(rawSpec, cryptoSSH.SupportedAlgorithms().HostKeys)
 		if err != nil {
 			return nil, fmt.Errorf("resolve HostKeyAlgorithms option: %w", err)
 		}
-		optionAlgos = algos
-	}
-	if c.hostKeyVerifier == nil {
-		if len(optionAlgos) > 0 {
-			return optionAlgos, nil
-		}
-		return c.defaultKnownHostsHostKeyAlgorithms(cfg), nil
-	}
-	source, ok := c.hostKeyVerifier.(HostKeyAlgorithmSource)
-	if !ok {
-		return optionAlgos, nil
-	} // Existing verifiers retain the SSH library defaults (or optionAlgos when specified).
+		return algos, nil
+	} // Existing verifiers retain the SSH library defaults (or resolved rawSpec when specified).
 	if coordinator != nil {
 		ctx = coordinator.Context()
 	}
@@ -67,7 +91,10 @@ func (c *Connector) getHostKeyAlgorithms(ctx context.Context, coordinator *hands
 	if err := selection.Err(); err != nil {
 		return nil, err
 	}
-	request := HostKeyRequest{NodeID: cfg.NodeID, Host: cfg.Address, Port: cfg.Port, User: cfg.User, VersionToken: cfg.TrustVersion}
+	var request HostKeyRequest
+	if cfg != nil {
+		request = HostKeyRequest{NodeID: cfg.NodeID, Host: cleanHostLiteral(cfg.Address), Port: cfg.Port, User: cfg.User, VersionToken: cfg.TrustVersion}
+	}
 	algorithms, err := source.HostKeyAlgorithms(selection, request)
 	if err != nil {
 		return nil, fmt.Errorf("resolve host key algorithms: %w", err)
@@ -83,23 +110,31 @@ func (c *Connector) getHostKeyAlgorithms(ctx context.Context, coordinator *hands
 			return nil, fmt.Errorf("host key algorithm source returned unsupported algorithm %q", algorithm)
 		}
 	}
-	if len(optionAlgos) > 0 {
-		var intersected []string
-		for _, alg := range optionAlgos {
-			if slices.Contains(algorithms, alg) {
-				intersected = append(intersected, alg)
-			}
-		}
-		if len(intersected) == 0 {
-			return nil, errors.New("no host key algorithms in common between HostKeyAlgorithms option and pinned host key verifier")
-		}
-		return intersected, nil
+	if rawSpec == "" {
+		return slices.Clone(algorithms), nil
 	}
-	return slices.Clone(algorithms), nil
+	return intersectVerifierHostKeyAlgorithms(rawSpec, algorithms)
+}
+
+func intersectVerifierHostKeyAlgorithms(rawSpec string, verifierAlgos []string) ([]string, error) {
+	optionAlgos, err := ResolveAlgorithmList(rawSpec, verifierAlgos)
+	if err != nil {
+		return nil, fmt.Errorf("resolve HostKeyAlgorithms option: %w", err)
+	}
+	var intersected []string
+	for _, alg := range optionAlgos {
+		if slices.Contains(verifierAlgos, alg) {
+			intersected = append(intersected, alg)
+		}
+	}
+	if len(intersected) == 0 {
+		return nil, errors.New("no host key algorithms in common between HostKeyAlgorithms option and pinned host key verifier")
+	}
+	return intersected, nil
 }
 
 // defaultKnownHostsHostKeyAlgorithms mirrors OpenSSH order_hostkeyalgs when no
-// custom HostKeyVerifier or explicit HostKeyAlgorithms option is configured:
+// custom HostKeyVerifier or explicit replacement HostKeyAlgorithms list is set:
 // the returned list is always built strictly from SupportedAlgorithms().HostKeys
 // (never nil, which would re-enable SHA-1/DSA defaults in x/crypto/ssh). When a
 // non-revoked @cert-authority in known_hosts matches the target host, modern
@@ -108,8 +143,8 @@ func (c *Connector) getHostKeyAlgorithms(ctx context.Context, coordinator *hands
 // pinned types first) precede *-cert-v01@openssh.com.
 func (c *Connector) defaultKnownHostsHostKeyAlgorithms(cfg *ClientConfig) []string {
 	supported := cryptoSSH.SupportedAlgorithms().HostKeys
-	if cfg == nil || strings.TrimSpace(cfg.Address) == "" {
-		return supported
+	if cfg == nil || cleanHostLiteral(cfg.Address) == "" {
+		return slices.Clone(supported)
 	}
 	db := c.loadReadOnlyKnownHostsDB(cfg)
 	port := cfg.Port
@@ -117,7 +152,7 @@ func (c *Connector) defaultKnownHostsHostKeyAlgorithms(cfg *ClientConfig) []stri
 		port = 22
 	}
 	targetAddr := khAddr{
-		host: normalizeHostAddress(cfg.Address),
+		host: cleanHostLiteral(cfg.Address),
 		port: strconv.Itoa(port),
 	}
 	hasCertAuthority, pinnedPlainTypes := db.matchingHostKeyTypes(targetAddr)

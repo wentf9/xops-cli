@@ -856,7 +856,7 @@ func (c *Connector) buildTargetContext(planNode connectionPlanNode) TargetContex
 		originalHost = planNode.name
 	}
 	return TargetContext{
-		Host:         cfg.Address,
+		Host:         cleanHostLiteral(cfg.Address),
 		Port:         port,
 		User:         user,
 		OriginalHost: originalHost,
@@ -1677,7 +1677,7 @@ func (c *Connector) resolveHandshakeDialer(nodeName string, cfg *ClientConfig, d
 }
 
 func normalizeHostAddress(host string) string {
-	return strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(host), "]"), "[")
+	return cleanHostLiteral(host)
 }
 
 func joinHostPort(host string, port int) string {
@@ -1965,7 +1965,7 @@ func (c *Connector) authTargetContext(cfg *ClientConfig) TargetContext {
 		user = c.environment.LocalUser
 	}
 	return TargetContext{
-		Host:         cfg.Address,
+		Host:         cleanHostLiteral(cfg.Address),
 		Port:         port,
 		User:         user,
 		OriginalHost: effectiveOriginalHost(cfg.OriginalHost, cfg.NodeID),
@@ -2974,7 +2974,7 @@ func (c *Connector) verifierHostKeyCallback(ctx context.Context, coordinator *ha
 	if len(initialHandshakeDone) > 0 {
 		handshakeDone = initialHandshakeDone[0]
 	}
-	request := HostKeyRequest{NodeID: cfg.NodeID, Host: cfg.Address, Port: cfg.Port, User: cfg.User, VersionToken: cfg.TrustVersion}
+	request := HostKeyRequest{NodeID: cfg.NodeID, Host: cleanHostLiteral(cfg.Address), Port: cfg.Port, User: cfg.User, VersionToken: cfg.TrustVersion}
 	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
 		verificationParent := ctx
 		if verificationParent == nil {
@@ -3060,7 +3060,7 @@ func knownHostsTarget(cfg *ClientConfig) TargetContext {
 		return TargetContext{}
 	}
 	return TargetContext{
-		Host:         cfg.Address,
+		Host:         cleanHostLiteral(cfg.Address),
 		Port:         cfg.Port,
 		User:         cfg.User,
 		OriginalHost: effectiveOriginalHost(cfg.OriginalHost, cfg.NodeID),

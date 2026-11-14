@@ -265,7 +265,7 @@ func resolveEffectiveControlNodeID(provider config.ConfigProvider, nodeID, origi
 		if cleanOrig, ok := config.OpenSSHOriginalHost(nodeID); ok && originalHost == cleanOrig {
 			return nodeID
 		}
-		alias := strings.TrimPrefix(nodeID, config.OpenSSHNodePrefix)
+		alias := config.UnwrapOpenSSHSelector(nodeID)
 		if _, parsedHost, _, err := utils.ParseAddr(alias); err == nil && parsedHost != "" {
 			alias = parsedHost
 		}

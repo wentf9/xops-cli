@@ -45,11 +45,41 @@ var (
 //   - "SSH_AUTH_SOCK" -> uses normalized env.AgentSocket
 //   - custom path / "$VAR" / "${VAR}" / "~" / "%" tokens -> expands via env and target
 func ResolveForwardAgent(forwardSpec, identityAgentSpec string, env Environment, target TargetContext) (socket string, enabled bool, err error) {
+	return resolveForwardAgentSpec(forwardSpec, identityAgentSpec, env, target, false)
+}
+
+func resolveEnvAgentSocket(env Environment, allowEmptyEnvSocket bool) (socket string, enabled bool, err error) {
+	rawSock := strings.TrimSpace(env.AgentSocket)
+	if rawSock != "" {
+		sock := normalizeExpandedAgentSocketPath(rawSock, env)
+		if sock != "" {
+			return sock, true, nil
+		}
+	}
+	if allowEmptyEnvSocket {
+		return "", true, nil
+	}
+	return "", false, nil
+}
+
+func resolveForwardAgentSpec(
+	forwardSpec, identityAgentSpec string,
+	env Environment,
+	target TargetContext,
+	allowEmptyEnvSocket bool,
+) (socket string, enabled bool, err error) {
 	trimmed := strings.TrimSpace(forwardSpec)
 	if trimmed == "" || strings.EqualFold(trimmed, "no") || strings.EqualFold(trimmed, "false") {
 		return "", false, nil
 	}
 	if strings.EqualFold(trimmed, "yes") || strings.EqualFold(trimmed, "true") {
+		idTrimmed := strings.TrimSpace(identityAgentSpec)
+		if strings.EqualFold(idTrimmed, "none") {
+			return "", false, nil
+		}
+		if idTrimmed == "" || idTrimmed == "SSH_AUTH_SOCK" {
+			return resolveEnvAgentSocket(env, allowEmptyEnvSocket)
+		}
 		sock, disabled, err := ResolveIdentityAgent(identityAgentSpec, env, target)
 		if err != nil {
 			return "", false, err
@@ -61,12 +91,7 @@ func ResolveForwardAgent(forwardSpec, identityAgentSpec string, env Environment,
 		return sock, sock != "", nil
 	}
 	if trimmed == "SSH_AUTH_SOCK" {
-		rawSock := strings.TrimSpace(env.AgentSocket)
-		if rawSock == "" {
-			return "", false, nil
-		}
-		sock := normalizeExpandedAgentSocketPath(rawSock, env)
-		return sock, sock != "", nil
+		return resolveEnvAgentSocket(env, allowEmptyEnvSocket)
 	}
 	expanded, err := expandAgentSocketPath(trimmed, env, target, "ForwardAgent")
 	if err != nil {
@@ -429,14 +454,7 @@ func (r *sshAgentChannelRouter) serveLocalAgentChannel(lease *agentForwardLease,
 	closeBoth()
 }
 
-func (c *Client) resolveClientForwardAgent() (socket string, enabled bool) {
-	if c == nil || c.sshClient == nil {
-		return "", false
-	}
-	connCfg := c.ConnectionConfig()
-	if connCfg.Options == nil {
-		return "", false
-	}
+func (c *Client) clientForwardAgentTarget(connCfg ConnectionConfig) TargetContext {
 	port := connCfg.Port
 	if port <= 0 {
 		port = 22
@@ -445,7 +463,7 @@ func (c *Client) resolveClientForwardAgent() (socket string, enabled bool) {
 	if user == "" {
 		user = c.environment.LocalUser
 	}
-	target := TargetContext{
+	return TargetContext{
 		Host:         connCfg.Address,
 		Port:         port,
 		User:         user,
@@ -453,11 +471,21 @@ func (c *Client) resolveClientForwardAgent() (socket string, enabled bool) {
 		JumpHost:     connCfg.ProxyJump,
 		KeyPath:      connCfg.KeyPath,
 	}
+}
+
+func (c *Client) resolveClientForwardAgent() (socket string, enabled bool) {
+	if c == nil || c.sshClient == nil {
+		return "", false
+	}
+	connCfg := c.ConnectionConfig()
+	if connCfg.Options == nil {
+		return "", false
+	}
 	sock, ok, err := ResolveForwardAgent(
 		connCfg.Options.ForwardAgent(),
 		connCfg.Options.IdentityAgent(),
 		c.environment,
-		target,
+		c.clientForwardAgentTarget(connCfg),
 	)
 	if err != nil {
 		c.getLogger().Debugf("ForwardAgent disabled: %v", err)
@@ -564,38 +592,42 @@ func (c *Client) shouldRequestMuxProxyAgentForward() bool {
 	if connCfg.Options == nil {
 		return false
 	}
-	fwdSpec := strings.TrimSpace(connCfg.Options.ForwardAgent())
-	if fwdSpec == "" || strings.EqualFold(fwdSpec, "no") || strings.EqualFold(fwdSpec, "false") {
+	_, enabled, err := resolveForwardAgentSpec(
+		connCfg.Options.ForwardAgent(),
+		connCfg.Options.IdentityAgent(),
+		c.environment,
+		c.clientForwardAgentTarget(connCfg),
+		true,
+	)
+	if err != nil {
+		c.getLogger().Debugf("ForwardAgent disabled over mux proxy: %v", err)
 		return false
 	}
-	idSpec := strings.TrimSpace(connCfg.Options.IdentityAgent())
-	return !strings.EqualFold(idSpec, "none")
+	return enabled
 }
 
-func (c *Client) enableSessionAgentForward(ctx context.Context, session *cryptoSSH.Session) func() {
+func (c *Client) prepareChannelAgentForward(ctx context.Context) (wantAgent bool, release func()) {
+	if c == nil || c.sshClient == nil {
+		return false, func() {}
+	}
 	if c.isMultiplexedProxy() {
-		if !c.shouldRequestMuxProxyAgentForward() {
-			return func() {}
-		}
-		var accepted bool
-		err := c.sessionRequest(ctx, session, agentForwardRequestType, func() error {
-			var reqErr error
-			accepted, reqErr = session.SendRequest(agentForwardRequestType, true, nil)
-			return reqErr
-		})
-		if err != nil || !accepted {
-			c.getLogger().Debugf("SSH server rejected or failed %s over mux proxy (accepted=%v, err=%v); continuing without agent forwarding", agentForwardRequestType, accepted, err)
-		}
-		return func() {}
+		return c.shouldRequestMuxProxyAgentForward(), func() {}
 	}
 	lease := c.acquireSessionAgentLease(ctx)
 	if lease == nil {
-		return func() {}
+		return false, func() {}
 	}
-	release := sync.OnceFunc(func() {
+	return true, sync.OnceFunc(func() {
 		c.untrackAgentLease(lease)
 		lease.Release()
 	})
+}
+
+func (c *Client) enableSessionAgentForward(ctx context.Context, session *cryptoSSH.Session) func() {
+	wantAgent, release := c.prepareChannelAgentForward(ctx)
+	if !wantAgent {
+		return func() {}
+	}
 	var accepted bool
 	err := c.sessionRequest(ctx, session, agentForwardRequestType, func() error {
 		var reqErr error

@@ -179,6 +179,20 @@ func OpenSSHOriginalHost(nodeID string) (string, bool) {
 	return clean, true
 }
 
+// UnwrapOpenSSHSelector extracts the host/alias token from an optional
+// "openssh:" virtual selector (including disambiguated "openssh:user@alias:port"),
+// or returns the trimmed input unchanged if it does not carry OpenSSHNodePrefix.
+func UnwrapOpenSSHSelector(selector string) string {
+	trimmed := strings.TrimSpace(selector)
+	if orig, ok := OpenSSHOriginalHost(trimmed); ok {
+		return orig
+	}
+	if strings.HasPrefix(trimmed, OpenSSHNodePrefix) {
+		return ""
+	}
+	return trimmed
+}
+
 // Find 尝试在 ssh_config 中寻找匹配的主机名
 // 如果用户输入了未知主机，我们一律返回带前缀的虚拟 NodeID，
 // 在连接时利用 ssh_config 的默认回退属性来尝试连接，

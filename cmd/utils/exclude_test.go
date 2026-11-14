@@ -155,3 +155,64 @@ func TestResolveExcludes(t *testing.T) {
 		}
 	})
 }
+
+func TestIsTargetExcluded(t *testing.T) {
+	t.Run("empty excludes returns false", func(t *testing.T) {
+		if IsTargetExcluded(nil, ExcludeTargetInfo{NodeID: "ops@10.0.0.5:22"}) {
+			t.Fatal("expected false for nil excludes")
+		}
+	})
+
+	t.Run("openssh alias matches BaseNodeID and OpenSSHAlias", func(t *testing.T) {
+		excludes := map[string]struct{}{"openssh:web": {}}
+		info := ExcludeTargetInfo{
+			NodeID:       "ops@10.0.0.5:22",
+			BaseNodeID:   "openssh:web",
+			OpenSSHAlias: "web",
+			User:         "ops",
+			Port:         22,
+		}
+		if !IsTargetExcluded(excludes, info) {
+			t.Fatal("expected OpenSSH alias web to be excluded")
+		}
+	})
+
+	t.Run("disambiguated openssh:user@alias:port matches openssh:alias", func(t *testing.T) {
+		excludes := map[string]struct{}{"openssh:role-b": {}}
+		info := ExcludeTargetInfo{
+			NodeID:       "openssh:ops@role-b:22",
+			BaseNodeID:   "openssh:role-b",
+			OpenSSHAlias: "role-b",
+			User:         "ops",
+			Port:         22,
+		}
+		if !IsTargetExcluded(excludes, info) {
+			t.Fatal("expected disambiguated openssh:ops@role-b:22 to match openssh:role-b")
+		}
+	})
+
+	t.Run("pre-canonicalized unmanaged host matches openssh:rawHost", func(t *testing.T) {
+		excludes := map[string]struct{}{"openssh:web": {}}
+		info := ExcludeTargetInfo{
+			NodeID:         "ops@web.corp.example.com:22",
+			UnmanagedHosts: []string{"web", "web.corp.example.com", "web"},
+		}
+		if !IsTargetExcluded(excludes, info) {
+			t.Fatal("expected pre-canonicalized unmanaged host to match openssh:web")
+		}
+	})
+
+	t.Run("saved node different user not falsely excluded via BaseNodeID", func(t *testing.T) {
+		excludes := map[string]struct{}{"ops@web.corp.example.com:22": {}}
+		info := ExcludeTargetInfo{
+			NodeID:         "root@web.corp.example.com:22",
+			BaseNodeID:     "ops@web.corp.example.com:22",
+			User:           "root",
+			Port:           22,
+			UnmanagedHosts: []string{"web.corp.example.com"},
+		}
+		if IsTargetExcluded(excludes, info) {
+			t.Fatal("expected root@web.corp.example.com:22 NOT to be excluded when only ops@web.corp.example.com:22 is excluded")
+		}
+	})
+}
