@@ -35,9 +35,11 @@ type ProcessStdioConn struct {
 	stdoutR *os.File
 	stderrR *os.File
 
-	proc       *platformProc
-	waitDone   chan struct{}
-	stderrDone chan struct{}
+	proc            *platformProc
+	waitDone        chan struct{}
+	stderrDone      chan struct{}
+	closing         atomic.Bool
+	spontaneousExit atomic.Bool
 
 	mu            sync.Mutex
 	closed        bool
@@ -119,8 +121,11 @@ func DialProxyCommandWithStderr(ctx context.Context, command string, stderr io.W
 	}
 
 	go func() {
-		defer close(conn.waitDone)
 		_ = cmd.Wait()
+		if !conn.closing.Load() {
+			conn.spontaneousExit.Store(true)
+		}
+		close(conn.waitDone)
 	}()
 	go func() {
 		defer close(conn.stderrDone)
@@ -385,11 +390,26 @@ func (c *ProcessStdioConn) markTimedOutLocked(isRead bool) {
 	c.writeTimedOut = true
 }
 
+func isClosedChan(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
 // Close idempotently closes the child's stdin/stdout pipes, waits up to 200ms for
 // graceful EOF exit, terminates the child / process group / Job Object if still alive,
 // and joins cmd.Wait() plus a bounded stderr forwarder drain so Close never hangs.
 func (c *ProcessStdioConn) Close() error {
 	c.closeOnce.Do(func() {
+		alreadyExited := isClosedChan(c.waitDone) && isClosedChan(c.stderrDone)
+		c.closing.Store(true)
+		if alreadyExited {
+			c.spontaneousExit.Store(true)
+		}
+
 		c.mu.Lock()
 		c.closed = true
 		c.advanceTimerGenLocked(true)
@@ -404,16 +424,18 @@ func (c *ProcessStdioConn) Close() error {
 			errs = append(errs, err)
 		}
 
-		graceTimer := time.NewTimer(proxyCloseGracePeriod)
-		select {
-		case <-c.waitDone:
-			graceTimer.Stop()
-		case <-graceTimer.C:
-			c.proc.terminateTree(proxyTermGracePeriod, c.waitDone)
+		if !alreadyExited {
+			graceTimer := time.NewTimer(proxyCloseGracePeriod)
+			select {
+			case <-c.waitDone:
+				graceTimer.Stop()
+			case <-graceTimer.C:
+				c.proc.terminateTree(proxyTermGracePeriod, c.waitDone)
+			}
 		}
 
 		<-c.waitDone
-		c.proc.reapRemainingGroup(proxyTermGracePeriod, c.stderrDone)
+		c.proc.reapRemainingGroup(proxyTermGracePeriod, c.stderrDone, alreadyExited)
 		_ = c.stderrR.Close()
 
 		stderrTimer := time.NewTimer(proxyStderrCloseGracePeriod)

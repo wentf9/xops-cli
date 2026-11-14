@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -93,10 +94,13 @@ func newTunnelTestClient(t *testing.T) (*xssh.Client, net.Conn) {
 		workers.Wait()
 	}()
 	addr := listener.Addr().(*net.TCPAddr)
+	env := sshenv.Discover()
+	env.KnownHostsFile = filepath.Join(t.TempDir(), "known_hosts")
+	env.GlobalKnownHostsFiles = nil
 	connector := xssh.NewConnector(tunnelTestProvider{&xssh.ClientConfig{
 		NodeID: "test", Address: "127.0.0.1", Port: addr.Port,
 		User: "test", AuthType: "password", Password: "test",
-	}}, xssh.WithEnvironment(sshenv.Discover()))
+	}}, xssh.WithEnvironment(env))
 	connector.AcceptNewHostKey.Store(true)
 	t.Cleanup(func() {
 		if err := connector.CloseAll(); err != nil {

@@ -148,12 +148,12 @@ func (p *platformProc) terminateTree(_ time.Duration, _ <-chan struct{}) {
 	}
 }
 
-func (p *platformProc) reapRemainingGroup(_ time.Duration, _ <-chan struct{}) {
+func (p *platformProc) reapRemainingGroup(_ time.Duration, _ <-chan struct{}, alreadyExited bool) {
 	if p == nil {
 		return
 	}
 	p.closeJob()
-	if p.process != nil {
+	if !alreadyExited && p.process != nil {
 		_ = p.process.Kill()
 	}
 }

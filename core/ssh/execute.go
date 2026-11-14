@@ -304,9 +304,11 @@ func (c *Client) RunInteractiveWithSudoExecutionIO(ctx context.Context, command 
 	for _, opt := range opts {
 		opt(config)
 	}
-	work, cancelOutput := context.WithCancel(ctx)
+	work, cancelWork := context.WithCancel(ctx)
+	defer cancelWork()
+	outCtx, cancelOutput := context.WithCancel(work)
 	defer cancelOutput()
-	stdout, stderr, closeOutput, err := bindStrictOutputs(work, streams.Stdout, streams.Stderr)
+	stdout, stderr, closeOutput, err := bindStrictOutputs(outCtx, streams.Stdout, streams.Stderr)
 	if err != nil {
 		return err
 	}

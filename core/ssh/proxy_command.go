@@ -33,6 +33,9 @@ func (d *proxyCommandDialer) Dial(network, addr string) (net.Conn, error) {
 }
 
 func (d *proxyCommandDialer) DialContext(ctx context.Context, _, _ string) (net.Conn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if d == nil || d.connector == nil || d.connector.environment.DialProxyCommand == nil {
 		return nil, ErrProxyCommandUnavailable
 	}

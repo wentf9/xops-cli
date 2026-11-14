@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 
 	logger "github.com/wentf9/xops-cli/core/log"
@@ -113,13 +114,86 @@ var _ cryptoSSH.AlgorithmSigner = (*normalizedCertSigner)(nil)
 // only algorithms supported by the underlying signer.
 type normalizedMultiAlgoCertSigner struct {
 	normalizedCertSigner
-	multi cryptoSSH.MultiAlgorithmSigner
+	algos []string
 }
 
 var _ cryptoSSH.MultiAlgorithmSigner = (*normalizedMultiAlgoCertSigner)(nil)
 
 func (s *normalizedMultiAlgoCertSigner) Algorithms() []string {
+	return slices.Clone(s.algos)
+}
+
+type plainKeyOverrideSigner struct {
+	inner cryptoSSH.Signer
+	pub   cryptoSSH.PublicKey
+}
+
+func (s *plainKeyOverrideSigner) PublicKey() cryptoSSH.PublicKey {
+	return s.pub
+}
+
+func (s *plainKeyOverrideSigner) Sign(rand io.Reader, data []byte) (*cryptoSSH.Signature, error) {
+	return s.inner.Sign(rand, data)
+}
+
+type plainKeyOverrideAlgoSigner struct {
+	plainKeyOverrideSigner
+	algo cryptoSSH.AlgorithmSigner
+}
+
+func (s *plainKeyOverrideAlgoSigner) SignWithAlgorithm(rand io.Reader, data []byte, algorithm string) (*cryptoSSH.Signature, error) {
+	return s.algo.SignWithAlgorithm(rand, data, algorithm)
+}
+
+type plainKeyOverrideMultiAlgoSigner struct {
+	plainKeyOverrideAlgoSigner
+	multi cryptoSSH.MultiAlgorithmSigner
+}
+
+func (s *plainKeyOverrideMultiAlgoSigner) Algorithms() []string {
 	return s.multi.Algorithms()
+}
+
+func adaptPlainKeySigner(base cryptoSSH.Signer, wantPub cryptoSSH.PublicKey) cryptoSSH.Signer {
+	if base == nil || wantPub == nil || bytes.Equal(base.PublicKey().Marshal(), wantPub.Marshal()) {
+		return base
+	}
+	baseWrap := plainKeyOverrideSigner{inner: base, pub: wantPub}
+	if mas, ok := base.(cryptoSSH.MultiAlgorithmSigner); ok {
+		return &plainKeyOverrideMultiAlgoSigner{
+			plainKeyOverrideAlgoSigner: plainKeyOverrideAlgoSigner{plainKeyOverrideSigner: baseWrap, algo: mas},
+			multi:                      mas,
+		}
+	}
+	if as, ok := base.(cryptoSSH.AlgorithmSigner); ok {
+		return &plainKeyOverrideAlgoSigner{plainKeyOverrideSigner: baseWrap, algo: as}
+	}
+	return &baseWrap
+}
+
+func extractCertFromPublicKey(pub cryptoSSH.PublicKey) (*cryptoSSH.Certificate, bool) {
+	if pub == nil {
+		return nil, false
+	}
+	if cert, ok := pub.(*cryptoSSH.Certificate); ok && cert.Key != nil {
+		return cert, true
+	}
+	if !strings.HasSuffix(pub.Type(), "-cert-v01@openssh.com") {
+		return nil, false
+	}
+	parsed, err := cryptoSSH.ParsePublicKey(pub.Marshal())
+	if err != nil {
+		return nil, false
+	}
+	cert, ok := parsed.(*cryptoSSH.Certificate)
+	return cert, ok && cert.Key != nil
+}
+
+func sidecarCertPath(keyPath string) string {
+	if keyPath == "" {
+		return ""
+	}
+	return strings.TrimSuffix(keyPath, ".pub") + "-cert.pub"
 }
 
 func newWrappedCertSigner(cert *cryptoSSH.Certificate, base cryptoSSH.Signer) (cryptoSSH.Signer, error) {
@@ -132,13 +206,24 @@ func newWrappedCertSigner(cert *cryptoSSH.Certificate, base cryptoSSH.Signer) (c
 		}
 		return &certLazySigner{cert: cert, base: lazy}, nil
 	}
+	if base != nil && cert.Key != nil {
+		if baseCert, ok := extractCertFromPublicKey(base.PublicKey()); ok && bytes.Equal(baseCert.Key.Marshal(), cert.Key.Marshal()) {
+			base = adaptPlainKeySigner(base, cert.Key)
+		}
+	}
 	cs, err := cryptoSSH.NewCertSigner(cert, base)
 	if err != nil {
 		return nil, err
 	}
 	wrapped := normalizedCertSigner{cert: cert, certSigner: cs}
 	if mas, ok := cs.(cryptoSSH.MultiAlgorithmSigner); ok {
-		return &normalizedMultiAlgoCertSigner{normalizedCertSigner: wrapped, multi: mas}, nil
+		return &normalizedMultiAlgoCertSigner{normalizedCertSigner: wrapped, algos: mas.Algorithms()}, nil
+	}
+	if _, ok := cs.(cryptoSSH.AlgorithmSigner); !ok && cert.Key != nil {
+		return &normalizedMultiAlgoCertSigner{
+			normalizedCertSigner: wrapped,
+			algos:                []string{cert.Key.Type()},
+		}, nil
 	}
 	return &wrapped, nil
 }
@@ -265,7 +350,7 @@ func matchCertsForKey(
 	if keyPath == "" {
 		return nil
 	}
-	if sidecar, ok := parseUserCertFile(keyPath+"-cert.pub", true, l); ok {
+	if sidecar, ok := parseUserCertFile(sidecarCertPath(keyPath), true, l); ok {
 		if sidecar.keyRaw == pubRaw {
 			return []loadedUserCert{*sidecar}
 		}

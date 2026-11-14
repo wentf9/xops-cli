@@ -11,7 +11,7 @@ import (
 func TestParseResolvConf(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "resolv.conf")
-	content := "# comment\nsearch example.com\nnameserver 192.0.2.53\nnameserver fe80::1%eth0\nnameserver not-an-ip\noptions edns0 trust-ad\n"
+	content := "# comment\nsearch example.com\nnameserver 192.0.2.53\nnameserver 192.0.2.53\nnameserver fe80::1%eth0\nnameserver FE80::0001%eth0\nnameserver not-an-ip\noptions edns0 trust-ad\n"
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}

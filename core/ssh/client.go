@@ -618,13 +618,27 @@ func (s *streamReader) Close() error {
 
 // RunStream 执行命令并返回流式输出
 func (c *Client) RunStream(ctx context.Context, cmd string) (io.ReadCloser, error) {
+	return c.runStream(ctx, cmd, true)
+}
+
+// RunProbeStream executes an internal monitoring or log inspection command and
+// returns its streaming stdout without forwarding ssh-agent or sending user
+// session environment variables.
+func (c *Client) RunProbeStream(ctx context.Context, cmd string) (io.ReadCloser, error) {
+	return c.runStream(ctx, cmd, false)
+}
+
+func (c *Client) runStream(ctx context.Context, cmd string, sendSessionEnv bool) (io.ReadCloser, error) {
 	session, err := c.newSessionContext(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	derivedCtx, cancel := context.WithCancel(ctx)
-	releaseAgent := c.enableSessionAgentForward(derivedCtx, session)
+	releaseAgent := func() {}
+	if sendSessionEnv {
+		releaseAgent = c.enableSessionAgentForward(derivedCtx, session)
+	}
 	abortSetup := func(setupErr error) (io.ReadCloser, error) {
 		cancel()
 		closeErr := c.closeSessionBounded(session)
@@ -632,8 +646,10 @@ func (c *Client) RunStream(ctx context.Context, cmd string) (io.ReadCloser, erro
 		return nil, errors.Join(setupErr, closeErr)
 	}
 
-	if err := c.applySessionEnv(ctx, session); err != nil {
-		return abortSetup(err)
+	if sendSessionEnv {
+		if err := c.applySessionEnv(ctx, session); err != nil {
+			return abortSetup(err)
+		}
 	}
 
 	stdout, err := session.StdoutPipe()
@@ -641,7 +657,17 @@ func (c *Client) RunStream(ctx context.Context, cmd string) (io.ReadCloser, erro
 		return abortSetup(fmt.Errorf("failed to create stdout pipe: %w", err))
 	}
 
-	wrappedCmd := bashCommandPayload(cmd, false)
+	var wrappedCmd string
+	if !sendSessionEnv {
+		probeCfg := c.probeRunConfig(c.defaultRunConfig())
+		if usesPortableShellAdapter(probeCfg) || probeCfg.Interpreter == InterpreterSh {
+			wrappedCmd = unixCommandPayload(InterpreterSh, cmd, false, probeCfg.LaunchDialect)
+		} else {
+			wrappedCmd = bashCommandPayload(cmd, false)
+		}
+	} else {
+		wrappedCmd = bashCommandPayload(cmd, false)
+	}
 
 	if err := c.sessionRequest(ctx, session, "stream exec", func() error { return session.Start(wrappedCmd) }); err != nil {
 		return abortSetup(fmt.Errorf("failed to start command: %w", err))

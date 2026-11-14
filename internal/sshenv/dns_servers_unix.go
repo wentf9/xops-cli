@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"slices"
 	"strings"
 )
 
@@ -36,11 +37,14 @@ func parseResolvConf(path string) dnsConfig {
 		}
 		switch fields[0] {
 		case "nameserver":
-			host := fields[1]
-			if _, err := netip.ParseAddr(host); err != nil {
+			addr, err := netip.ParseAddr(fields[1])
+			if err != nil {
 				continue
 			}
-			cfg.servers = append(cfg.servers, net.JoinHostPort(host, "53"))
+			srv := net.JoinHostPort(addr.String(), "53")
+			if !slices.Contains(cfg.servers, srv) {
+				cfg.servers = append(cfg.servers, srv)
+			}
 		case "options":
 			for _, opt := range fields[1:] {
 				if opt == "trust-ad" {

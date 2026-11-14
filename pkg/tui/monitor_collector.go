@@ -145,7 +145,7 @@ func (mc *MetricsCollector) Start(ctx context.Context) error {
 		return fmt.Errorf("dashboard monitoring is not supported on %s (Linux only)", osName)
 	}
 
-	stream, err := mc.client.RunStream(derivedCtx, probeScript)
+	stream, err := mc.client.RunProbeStream(derivedCtx, probeScript)
 	if err != nil {
 		mc.finishStart(generation, cancel)
 		return fmt.Errorf("failed to start stream: %w", err)

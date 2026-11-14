@@ -2,6 +2,7 @@ package ssh
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"slices"
@@ -145,6 +146,13 @@ func (w *escapeFilterWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+type fatalSuspendTerminalError struct {
+	err error
+}
+
+func (e fatalSuspendTerminalError) Error() string { return e.err.Error() }
+func (e fatalSuspendTerminalError) Unwrap() error { return e.err }
+
 func (w *escapeFilterWriter) handleEscapedByte(b byte, out *[]byte, flush func() error) (bool, error) {
 	switch b {
 	case '.':
@@ -167,7 +175,11 @@ func (w *escapeFilterWriter) handleEscapedByte(b byte, out *[]byte, flush func()
 		w.state = escapeStateLineStart
 		if w.onSuspend != nil {
 			if err := w.onSuspend(); err != nil {
-				return false, err
+				var fatalErr fatalSuspendTerminalError
+				if errors.As(err, &fatalErr) {
+					return false, fatalErr.err
+				}
+				_, _ = fmt.Fprintf(w.localOut, "\r\n[suspend failed: %v]\r\n", err)
 			}
 		}
 		return false, nil

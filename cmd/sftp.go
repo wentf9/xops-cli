@@ -94,7 +94,19 @@ func NewCmdSftp() *cobra.Command {
 	return cmd
 }
 
+func (o *SftpOptions) Complete(cmd *cobra.Command, args []string) error {
+	if err := o.SshOptions.Complete(cmd, args); err != nil {
+		return err
+	}
+	o.stdinScript = false
+	return nil
+}
+
 func (o *SftpOptions) Validate() error {
+	o.stdinScript = false
+	if o.effectiveBgRun() {
+		return fmt.Errorf("background mode (-f / ForkAfterAuthentication) is not supported for sftp")
+	}
 	extraArgs := o.args
 	if o.Host == "" && len(extraArgs) > 0 {
 		extraArgs = extraArgs[1:]
@@ -150,7 +162,7 @@ func (o *SftpOptions) RunContext(ctx context.Context) (err error) {
 	if optErr != nil {
 		return optErr
 	}
-	adpOpts = append(adpOpts, adapter.WithLocalExecution(!batch), adapter.WithSessionAndForwardOptions(false))
+	adpOpts = append(adpOpts, adapter.WithLocalExecution(!batch), adapter.WithSessionAndForwardOptions(false), adapter.WithEnrollmentProbeExclusions(nodeID))
 	var connector *ssh.Connector
 	// The diagnostic sink must outlive the connector, SFTP client and shell, which
 	// are the event producers. Deferring it first makes it the last cleanup to run.

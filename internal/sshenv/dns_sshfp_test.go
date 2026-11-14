@@ -466,6 +466,120 @@ func TestParseSSHFPAnswers_RejectsUnrelatedOwnerAndFollowsCNAMEChain(t *testing.
 	if len(gotCNAME) != 1 || gotCNAME[0].Algorithm != 4 || string(gotCNAME[0].Fingerprint) != string(fpCanon) {
 		t.Fatalf("expected only canonical CNAME target SSHFP record, got %+v", gotCNAME)
 	}
+
+	// 3. Alias-owned SSHFP forged alongside a CNAME (app.example.com CNAME canon.example.net + app.example.com SSHFP)
+	//    must NOT be accepted (only canonicalTarget SSHFP is valid).
+	aliasForged := append([]byte(nil), query[:qEnd]...)
+	binary.BigEndian.PutUint16(aliasForged[0:], id)
+	binary.BigEndian.PutUint16(aliasForged[2:], dnsFlagQR|dnsFlagRD|dnsFlagAD)
+	binary.BigEndian.PutUint16(aliasForged[6:], 2) // 1 CNAME + 1 SSHFP on qname
+	binary.BigEndian.PutUint16(aliasForged[10:], 0)
+	aliasForged = append(aliasForged, 0xc0, 0x0c)
+	aliasForged = binary.BigEndian.AppendUint16(aliasForged, dnsTypeCNAME)
+	aliasForged = binary.BigEndian.AppendUint16(aliasForged, dnsClassIN)
+	aliasForged = binary.BigEndian.AppendUint32(aliasForged, 60)
+	aliasForged = binary.BigEndian.AppendUint16(aliasForged, uint16(len(canonTarget)))
+	aliasForged = append(aliasForged, canonTarget...)
+	aliasForged = append(aliasForged, 0xc0, 0x0c) // owner == qname (alias, NOT canonicalTarget!)
+	aliasForged = binary.BigEndian.AppendUint16(aliasForged, dnsTypeSSHFP)
+	aliasForged = binary.BigEndian.AppendUint16(aliasForged, dnsClassIN)
+	aliasForged = binary.BigEndian.AppendUint32(aliasForged, 60)
+	aliasForged = binary.BigEndian.AppendUint16(aliasForged, uint16(2+len(fpEvil)))
+	aliasForged = append(aliasForged, 4, 2)
+	aliasForged = append(aliasForged, fpEvil...)
+
+	gotAliasForged, err := parseSSHFPAnswers(aliasForged)
+	if err != nil {
+		t.Fatalf("parseSSHFPAnswers(aliasForged) failed: %v", err)
+	}
+	if len(gotAliasForged) != 0 {
+		t.Fatalf("SSHFP owned by alias qname must be ignored when CNAME points elsewhere, got %+v", gotAliasForged)
+	}
+
+	// 4. Multi-node CNAME cycle (app -> mid -> app) with SSHFP on mid must fail closed (errDNSMalformed),
+	//    never accepting intermediate alias SSHFP RRs!
+	cycleResp := append([]byte(nil), query[:qEnd]...)
+	binary.BigEndian.PutUint16(cycleResp[0:], id)
+	binary.BigEndian.PutUint16(cycleResp[2:], dnsFlagQR|dnsFlagRD|dnsFlagAD)
+	binary.BigEndian.PutUint16(cycleResp[6:], 3)
+	binary.BigEndian.PutUint16(cycleResp[10:], 0)
+	// app.example.com -> mid.example.com
+	cycleResp = append(cycleResp, 0xc0, 0x0c)
+	cycleResp = binary.BigEndian.AppendUint16(cycleResp, dnsTypeCNAME)
+	cycleResp = binary.BigEndian.AppendUint16(cycleResp, dnsClassIN)
+	cycleResp = binary.BigEndian.AppendUint32(cycleResp, 60)
+	cycleResp = binary.BigEndian.AppendUint16(cycleResp, uint16(len(midTarget)))
+	cycleResp = append(cycleResp, midTarget...)
+	// mid.example.com -> app.example.com
+	appTarget := appendWireDNSName(nil, "app.example.com")
+	cycleResp = appendWireDNSName(cycleResp, "mid.example.com")
+	cycleResp = binary.BigEndian.AppendUint16(cycleResp, dnsTypeCNAME)
+	cycleResp = binary.BigEndian.AppendUint16(cycleResp, dnsClassIN)
+	cycleResp = binary.BigEndian.AppendUint32(cycleResp, 60)
+	cycleResp = binary.BigEndian.AppendUint16(cycleResp, uint16(len(appTarget)))
+	cycleResp = append(cycleResp, appTarget...)
+	// mid.example.com SSHFP
+	cycleResp = appendWireDNSName(cycleResp, "mid.example.com")
+	cycleResp = binary.BigEndian.AppendUint16(cycleResp, dnsTypeSSHFP)
+	cycleResp = binary.BigEndian.AppendUint16(cycleResp, dnsClassIN)
+	cycleResp = binary.BigEndian.AppendUint32(cycleResp, 60)
+	cycleResp = binary.BigEndian.AppendUint16(cycleResp, uint16(2+len(fpMid)))
+	cycleResp = append(cycleResp, 4, 2)
+	cycleResp = append(cycleResp, fpMid...)
+
+	if gotCycle, cycleErr := parseSSHFPAnswers(cycleResp); !errors.Is(cycleErr, errDNSMalformed) || len(gotCycle) != 0 {
+		t.Fatalf("multi-node CNAME cycle = (%+v, %v), want (nil, errDNSMalformed)", gotCycle, cycleErr)
+	}
+
+	// 5. >8-hop CNAME chain (9 hops) with intermediate SSHFP must also fail closed (errDNSMalformed).
+	longResp := append([]byte(nil), query[:qEnd]...)
+	binary.BigEndian.PutUint16(longResp[0:], id)
+	binary.BigEndian.PutUint16(longResp[2:], dnsFlagQR|dnsFlagRD|dnsFlagAD)
+	binary.BigEndian.PutUint16(longResp[6:], uint16(dnsMaxCNAMEHops+2)) // 9 CNAMEs + 1 intermediate SSHFP
+	binary.BigEndian.PutUint16(longResp[10:], 0)
+	curOwner := "app.example.com"
+	for hopIdx := range dnsMaxCNAMEHops + 1 {
+		nextOwner := "hop" + string(rune('a'+hopIdx)) + ".example.net"
+		longResp = appendWireDNSName(longResp, curOwner)
+		longResp = binary.BigEndian.AppendUint16(longResp, dnsTypeCNAME)
+		longResp = binary.BigEndian.AppendUint16(longResp, dnsClassIN)
+		longResp = binary.BigEndian.AppendUint32(longResp, 60)
+		targetWire := appendWireDNSName(nil, nextOwner)
+		longResp = binary.BigEndian.AppendUint16(longResp, uint16(len(targetWire)))
+		longResp = append(longResp, targetWire...)
+		curOwner = nextOwner
+	}
+	hop8Name := "hop" + string(rune('a'+dnsMaxCNAMEHops-1)) + ".example.net"
+	longResp = appendWireDNSName(longResp, hop8Name)
+	longResp = binary.BigEndian.AppendUint16(longResp, dnsTypeSSHFP)
+	longResp = binary.BigEndian.AppendUint16(longResp, dnsClassIN)
+	longResp = binary.BigEndian.AppendUint32(longResp, 60)
+	longResp = binary.BigEndian.AppendUint16(longResp, uint16(2+len(fpMid)))
+	longResp = append(longResp, 4, 2)
+	longResp = append(longResp, fpMid...)
+
+	if gotLong, longErr := parseSSHFPAnswers(longResp); !errors.Is(longErr, errDNSMalformed) || len(gotLong) != 0 {
+		t.Fatalf(">8-hop CNAME chain = (%+v, %v), want (nil, errDNSMalformed)", gotLong, longErr)
+	}
+}
+
+func TestSSHFPResolver_DeduplicatesServersBeforeMaxServerCap(t *testing.T) {
+	records := loopbackRecords()
+	failUDP, failTCP := startMockDNS(t, mockDNSBehavior{rcode: 2})
+	okUDP, okTCP := startMockDNS(t, mockDNSBehavior{ad: true, records: records[:1]})
+
+	// Without deduplication before dnsMaxServers (3), three copies of failUDP would crowd out okUDP!
+	r := testResolver(
+		[]string{failUDP, failUDP, failUDP, okUDP},
+		map[string]string{failUDP: failTCP, okUDP: okTCP},
+	)
+	res, err := r.Lookup(t.Context(), "host.example.com")
+	if err != nil {
+		t.Fatalf("Lookup with duplicate servers before fallback failed: %v", err)
+	}
+	if !res.Authenticated || len(res.Records) != 1 {
+		t.Fatalf("unexpected deduplicated failover result: %+v", res)
+	}
 }
 
 func TestReadCanonicalDNSName_RejectsSelfForwardAndExcessivePointers(t *testing.T) {

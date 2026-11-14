@@ -129,6 +129,11 @@ func TestAuthClassOptionChangesRevokeActivePermitsWhileTransportEditsDoNot(t *te
 		{name: "IdentityAgent", key: ssh.OptionIdentityAgent, val: "none"},
 		{name: "CertificateFile", key: ssh.OptionCertificateFile, val: "/etc/ssh/id_ed25519-cert.pub"},
 		{name: "IdentityFile", key: ssh.OptionIdentityFile, val: "/etc/ssh/id_ed25519"},
+		{name: "StrictHostKeyChecking", key: ssh.OptionStrictHostKeyChecking, val: "yes"},
+		{name: "UserKnownHostsFile", key: ssh.OptionUserKnownHostsFile, val: "/etc/ssh/custom_known_hosts"},
+		{name: "GlobalKnownHostsFile", key: ssh.OptionGlobalKnownHostsFile, val: "/etc/ssh/global_known_hosts"},
+		{name: "VerifyHostKeyDNS", key: ssh.OptionVerifyHostKeyDNS, val: "yes"},
+		{name: "HashKnownHosts", key: ssh.OptionHashKnownHosts, val: "yes"},
 	}
 
 	for _, tc := range authOptionCases {
@@ -330,5 +335,163 @@ func TestDeletedNodeIDCannotBeReused(t *testing.T) {
 	next.Revision = "3"
 	if _, err := c.BeginUpdate(ctx, "2", next); !errors.Is(err, ErrIdentityReuse) {
 		t.Fatalf("deleted ID reused: %v", err)
+	}
+}
+
+func TestJumpTopologyAndHopPrincipalEditsRevokeActivePermits(t *testing.T) {
+	jump1 := ssh.ConnectionConfig{
+		NodeID:          "jump1",
+		Address:         "192.0.2.101",
+		Port:            22,
+		User:            "jump-user",
+		AuthType:        "key",
+		KeyRef:          "jump1-key",
+		AuthUpdateToken: "j1-auth-1",
+		TrustVersion:    "j1-trust-1",
+	}
+	jump2 := ssh.ConnectionConfig{
+		NodeID:          "jump2",
+		Address:         "192.0.2.102",
+		Port:            22,
+		User:            "jump-user",
+		AuthType:        "key",
+		KeyRef:          "jump2-key",
+		AuthUpdateToken: "j2-auth-1",
+		TrustVersion:    "j2-trust-1",
+	}
+
+	newTwoBastionCoordinator := func(t *testing.T, withInitialJump1 bool) (*Coordinator, context.Context) {
+		t.Helper()
+		t.Cleanup(func() { goleak.VerifyNone(t) })
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		t.Cleanup(cancel)
+
+		view := fixtureView()
+		view.Targets["jump1"] = ports.Target{
+			Info:    ports.NodeInfo{ID: "jump1"},
+			Version: "1",
+			Plan:    ssh.ConnectionPlan{Scope: "scope", Hops: []ssh.ConnectionConfig{jump1}},
+		}
+		view.Targets["jump2"] = ports.Target{
+			Info:    ports.NodeInfo{ID: "jump2"},
+			Version: "1",
+			Plan:    ssh.ConnectionPlan{Scope: "scope", Hops: []ssh.ConnectionConfig{jump2}},
+		}
+		if withInitialJump1 {
+			targetA := view.Targets["a"]
+			targetA.Plan.Hops[0].ProxyJump = "jump1"
+			targetA.Plan.Hops = []ssh.ConnectionConfig{jump1, targetA.Plan.Hops[0]}
+			view.Targets["a"] = targetA
+		}
+		c, err := New(view, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := c.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		return c, ctx
+	}
+
+	t.Run("JumpChainRemoved", func(t *testing.T) {
+		c, ctx := newTwoBastionCoordinator(t, true)
+		activeA := enter(t, c, ctx, admission(t, c, ctx, "a", ports.Execute))
+		activeB := enter(t, c, ctx, admission(t, c, ctx, "b", ports.Execute))
+
+		next := c.Snapshot()
+		next.Revision = "2"
+		targetA := next.Targets["a"]
+		finalHop := targetA.Plan.Hops[1]
+		finalHop.ProxyJump = ""
+		targetA.Plan.Hops = []ssh.ConnectionConfig{finalHop}
+		next.Targets["a"] = targetA
+		publish(t, c, ctx, next)
+
+		if activeA.Context().Err() == nil {
+			t.Fatal("removing jump hop [jump1, a] -> [a] did not revoke active permit on a")
+		}
+		if activeB.Context().Err() != nil {
+			t.Fatal("unrelated permit on b was unexpectedly revoked")
+		}
+	})
+
+	t.Run("JumpChainAdded", func(t *testing.T) {
+		c, ctx := newTwoBastionCoordinator(t, false)
+		activeA := enter(t, c, ctx, admission(t, c, ctx, "a", ports.Execute))
+
+		next := c.Snapshot()
+		next.Revision = "2"
+		targetA := next.Targets["a"]
+		finalHop := targetA.Plan.Hops[0]
+		finalHop.ProxyJump = "jump1"
+		targetA.Plan.Hops = []ssh.ConnectionConfig{jump1, finalHop}
+		next.Targets["a"] = targetA
+		publish(t, c, ctx, next)
+
+		if activeA.Context().Err() == nil {
+			t.Fatal("adding jump hop [a] -> [jump1, a] did not revoke active permit on a")
+		}
+	})
+
+	t.Run("JumpChainReplaced", func(t *testing.T) {
+		c, ctx := newTwoBastionCoordinator(t, true)
+		activeA := enter(t, c, ctx, admission(t, c, ctx, "a", ports.Execute))
+		activeB := enter(t, c, ctx, admission(t, c, ctx, "b", ports.Execute))
+
+		next := c.Snapshot()
+		next.Revision = "2"
+		targetA := next.Targets["a"]
+		finalHop := targetA.Plan.Hops[1]
+		finalHop.ProxyJump = "jump2"
+		targetA.Plan.Hops = []ssh.ConnectionConfig{jump2, finalHop}
+		next.Targets["a"] = targetA
+		publish(t, c, ctx, next)
+
+		if activeA.Context().Err() == nil {
+			t.Fatal("replacing jump hop [jump1, a] -> [jump2, a] did not revoke active permit on a")
+		}
+		if activeB.Context().Err() != nil {
+			t.Fatal("unrelated permit on b was unexpectedly revoked")
+		}
+	})
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(hop *ssh.ConnectionConfig)
+	}{
+		{
+			name:   "HopUserChanged",
+			mutate: func(hop *ssh.ConnectionConfig) { hop.User = "readonly" },
+		},
+		{
+			name:   "HopSudoModeChanged",
+			mutate: func(hop *ssh.ConnectionConfig) { hop.SudoMode = "sudo" },
+		},
+		{
+			name:   "HopOriginalHostChanged",
+			mutate: func(hop *ssh.ConnectionConfig) { hop.OriginalHost = "web-alias" },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, ctx := setup(t)
+			activeA := enter(t, c, ctx, admission(t, c, ctx, "a", ports.Execute))
+			activeB := enter(t, c, ctx, admission(t, c, ctx, "b", ports.Execute))
+
+			next := c.Snapshot()
+			next.Revision = "2"
+			targetA := next.Targets["a"]
+			tc.mutate(&targetA.Plan.Hops[0])
+			next.Targets["a"] = targetA
+			publish(t, c, ctx, next)
+
+			if activeA.Context().Err() == nil {
+				t.Fatalf("%s did not revoke active permit on a", tc.name)
+			}
+			if activeB.Context().Err() != nil {
+				t.Fatalf("%s unexpectedly revoked unrelated permit on b", tc.name)
+			}
+		})
 	}
 }

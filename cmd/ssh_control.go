@@ -817,6 +817,17 @@ func mapControlProxySessionError(stderr io.Writer, err error) error {
 	if errors.As(err, &cmdExitErr) && cmdExitErr.ExitCode != nil {
 		return &ControlExitError{Code: int(*cmdExitErr.ExitCode), Message: cmdExitErr.Error(), Reported: true}
 	}
+	var reportedErr interface {
+		ExitCode() int
+		AlreadyReported() bool
+	}
+	if errors.As(err, &reportedErr) && reportedErr.AlreadyReported() {
+		code := reportedErr.ExitCode()
+		if code == 0 {
+			code = 255
+		}
+		return &ControlExitError{Code: code, Message: err.Error(), Reported: true}
+	}
 	return controlError(stderr, err.Error())
 }
 

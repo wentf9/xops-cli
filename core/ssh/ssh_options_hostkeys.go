@@ -8,9 +8,49 @@ import (
 	"strings"
 )
 
+func hasKnownHostsControlChar(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if (s[i] < 0x20 && s[i] != '\t') || s[i] == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
+// validateUserKnownHostsFile accepts "none", "/dev/null", and/or whitespace-separated
+// paths with ~, ${ENV} and % token syntax.
+func validateUserKnownHostsFile(raw string) (string, error) {
+	if hasKnownHostsControlChar(raw) {
+		return "", fmt.Errorf("invalid UserKnownHostsFile %q: contains invalid ASCII control character", raw)
+	}
+	fields := strings.Fields(raw)
+	if len(fields) == 0 {
+		return "", errors.New("invalid UserKnownHostsFile: value cannot be empty")
+	}
+	if len(fields) == 1 && strings.EqualFold(fields[0], "none") {
+		return "none", nil
+	}
+	for i, field := range fields {
+		if strings.EqualFold(field, "none") {
+			fields[i] = "none"
+			continue
+		}
+		if field == "/dev/null" {
+			continue
+		}
+		if err := validatePathTokenSyntax(field, "UserKnownHostsFile"); err != nil {
+			return "", err
+		}
+	}
+	return strings.Join(fields, " "), nil
+}
+
 // validateGlobalKnownHostsFile accepts "none" alone or whitespace-separated
 // paths with ~, ${ENV} and % token syntax shared with UserKnownHostsFile.
 func validateGlobalKnownHostsFile(raw string) (string, error) {
+	if hasKnownHostsControlChar(raw) {
+		return "", fmt.Errorf("invalid GlobalKnownHostsFile %q: contains invalid ASCII control character", raw)
+	}
 	fields := strings.Fields(raw)
 	if len(fields) == 0 {
 		return "", errors.New("invalid GlobalKnownHostsFile: value cannot be empty")

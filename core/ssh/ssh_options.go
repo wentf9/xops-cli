@@ -242,13 +242,7 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionUserKnownHostsFile,
 		OpenSSHName:  "UserKnownHostsFile",
 		Class:        OptionClassTrust,
-		Normalize: func(raw string) (string, error) {
-			trimmed := strings.TrimSpace(raw)
-			if trimmed == "" {
-				return "", errors.New("invalid UserKnownHostsFile: value cannot be empty")
-			}
-			return trimmed, nil
-		},
+		Normalize:    validateUserKnownHostsFile,
 	},
 	{
 		CanonicalKey: OptionGlobalKnownHostsFile,

@@ -53,19 +53,59 @@ func (r *Repository) PrepareNodeContext(ctx context.Context, opts EnsureNodeOpti
 		return EnsureNodeResult{}, err
 	}
 	if created {
-		if err := r.registerPendingConnection(cfg, nodeID); err != nil {
+		effectiveID, err := r.registerPendingConnection(cfg, nodeID)
+		if err != nil {
 			return EnsureNodeResult{}, err
 		}
+		nodeID = effectiveID
 	}
 	return EnsureNodeResult{NodeID: nodeID, Created: created}, nil
 }
 
-func (r *Repository) registerPendingConnection(cfg *Configuration, nodeID string) error {
+func (r *Repository) registerPendingConnection(cfg *Configuration, nodeID string) (string, error) {
 	// Retain only this connection's entities, never a stale copy of the
 	// whole configuration that could overwrite concurrent changes.
 	node, _ := cfg.Nodes.Get(nodeID)
 	host, _ := cfg.Hosts.Get(node.HostRef)
 	identity, _ := cfg.Identities.Get(node.IdentityRef)
+	if r.pending == nil {
+		r.pending = make(map[string]*pendingConnection)
+	}
+	if previous := r.pending[nodeID]; previous != nil {
+		oldNode, oldHost, oldIdentity, err := previous.provider.Resolve(nodeID)
+		if err != nil {
+			return "", fmt.Errorf("resolve pending connection %q: %w", nodeID, err)
+		}
+		// Compare with the same IdentityRef normalization used when storing.
+		normalizedNode := node
+		normalizedNode.IdentityRef = privateIdentityReference(cfg, nodeID)
+		if equalPersistedNode(oldNode, normalizedNode) && reflect.DeepEqual(oldHost, host) && reflect.DeepEqual(oldIdentity, identity) {
+			if oldNode.OpenSSHAlias == "" && node.OpenSSHAlias != "" {
+				previous.provider.SetNodeOpenSSHAlias(nodeID, node.OpenSSHAlias)
+				r.SetNodeOpenSSHAlias(nodeID, node.OpenSSHAlias)
+			}
+			return nodeID, nil
+		}
+		if node.OpenSSHAlias == "" || oldNode.OpenSSHAlias == node.OpenSSHAlias {
+			return "", fmt.Errorf("pending connection %q changed: %w", nodeID, ErrConfigConflict)
+		}
+		// Distinct OpenSSH aliases sharing the same (User, HostName, Port) under
+		// ephemeral/pending resolution must not collide in r.pending.
+		altID := OpenSSHNodePrefix + FormatNodeID(identity.User, node.OpenSSHAlias, host.Port)
+		if altPrev := r.pending[altID]; altPrev != nil {
+			altOldNode, altOldHost, altOldIdentity, altErr := altPrev.provider.Resolve(altID)
+			if altErr != nil {
+				return "", fmt.Errorf("resolve pending connection %q: %w", altID, altErr)
+			}
+			altNormalized := node
+			altNormalized.IdentityRef = privateIdentityReference(cfg, altID)
+			if !equalPersistedNode(altOldNode, altNormalized) || !reflect.DeepEqual(altOldHost, host) || !reflect.DeepEqual(altOldIdentity, identity) {
+				return "", fmt.Errorf("pending connection %q changed: %w", altID, ErrConfigConflict)
+			}
+			return altID, nil
+		}
+		nodeID = altID
+	}
 	// Concurrent first connections on different ports must not reserve the
 	// same identity and later share (or conflict over) remembered secrets.
 	node.IdentityRef = privateIdentityReference(cfg, nodeID)
@@ -73,29 +113,13 @@ func (r *Repository) registerPendingConnection(cfg *Configuration, nodeID string
 	pending.Nodes.Set(nodeID, node)
 	pending.Hosts.Set(node.HostRef, host)
 	pending.Identities.Set(node.IdentityRef, identity)
-	if r.pending == nil {
-		r.pending = make(map[string]*pendingConnection)
-	}
-	if previous := r.pending[nodeID]; previous != nil {
-		oldNode, oldHost, oldIdentity, err := previous.provider.Resolve(nodeID)
-		if err != nil {
-			return fmt.Errorf("resolve pending connection %q: %w", nodeID, err)
-		}
-		if !equalPersistedNode(oldNode, node) || !reflect.DeepEqual(oldHost, host) || !reflect.DeepEqual(oldIdentity, identity) {
-			return fmt.Errorf("pending connection %q changed: %w", nodeID, ErrConfigConflict)
-		}
-		if oldNode.OpenSSHAlias == "" && node.OpenSSHAlias != "" {
-			previous.provider.SetNodeOpenSSHAlias(nodeID, node.OpenSSHAlias)
-			r.SetNodeOpenSSHAlias(nodeID, node.OpenSSHAlias)
-		}
-		return nil
-	}
 	pendingProvider := NewProviderWithoutOpenSSH(pending)
 	if node.OpenSSHAlias != "" {
 		pendingProvider.SetNodeOpenSSHAlias(nodeID, node.OpenSSHAlias)
+		r.SetNodeOpenSSHAlias(nodeID, node.OpenSSHAlias)
 	}
 	r.pending[nodeID] = &pendingConnection{provider: pendingProvider}
-	return nil
+	return nodeID, nil
 }
 
 func (r *Repository) connectionProvider(nodeID string) *Provider {
@@ -161,6 +185,9 @@ func (r *Repository) ConfirmNodeWithExecutionContext(ctx context.Context, nodeID
 func (r *Repository) confirmNodeContext(ctx context.Context, nodeID string, execution *ssh.ExecutionConfig) error {
 	if r == nil || ctx == nil {
 		return fmt.Errorf("confirm connection requires repository and context")
+	}
+	if strings.HasPrefix(nodeID, OpenSSHNodePrefix) {
+		return nil
 	}
 	r.pendingMu.RLock()
 	pending := r.pending[nodeID]

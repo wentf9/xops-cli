@@ -584,3 +584,137 @@ func TestCredentialVersionExpandsPercentNWithoutOpenSSHPrefixAndCapsOversizedCer
 		t.Fatalf("unexpected oversized cert binding: %+v ok=%v", binding, ok)
 	}
 }
+
+func TestCredentialVersionCoversIdentitiesOnlyInheritanceEnvIdentityAgentAndMultiHopJumpTokens(t *testing.T) {
+	// 1. L5a: hop.Options != nil (e.g., AddressFamily=inet) without IdentitiesOnly must still
+	//    fall back to snapshot.Node.SSHOptions.IdentitiesOnly().
+	homeDir := t.TempDir()
+	sshDir := filepath.Join(homeDir, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+
+	defaultSidecar := filepath.Join(sshDir, "id_ed25519-cert.pub")
+	writeTestUserCertForBinding(t, defaultSidecar, 201, 5000)
+
+	explicitKey := filepath.Join(homeDir, "explicit_node_key")
+	if err := os.WriteFile(explicitKey, []byte("explicit"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := credentialBindingConfig()
+	node, _ := cfg.Nodes.Get("node")
+	node.SSHOptions = ssh.MustOptions(
+		ssh.OptionIdentityFile, explicitKey,
+		ssh.OptionIdentitiesOnly, "yes",
+	)
+	cfg.Nodes.Set("node", node)
+	provider := config.NewProviderWithoutOpenSSH(cfg)
+
+	hopNonNilOpts := ssh.ConnectionConfig{
+		NodeID:  "node",
+		Address: "192.0.2.1",
+		Port:    22,
+		User:    "fixture",
+		Options: ssh.MustOptions(ssh.OptionAddressFamily, "inet"),
+	}
+	vBeforeDefaultRotate, err := credentialVersion(provider, ssh.ConnectionPlan{Scope: "scope", Hops: []ssh.ConnectionConfig{hopNonNilOpts}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestUserCertForBinding(t, defaultSidecar, 202, 8000)
+	vAfterDefaultRotate, err := credentialVersion(provider, ssh.ConnectionPlan{Scope: "scope", Hops: []ssh.ConnectionConfig{hopNonNilOpts}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vBeforeDefaultRotate != vAfterDefaultRotate {
+		t.Fatal("hop.Options without IdentitiesOnly failed to inherit IdentitiesOnly=yes from snapshot.Node.SSHOptions")
+	}
+
+	// 2. L5b: IdentityAgent using $VAR / ${VAR} must bind resolved socket path via ssh.ResolveIdentityAgent.
+	hopEnvAgent := ssh.ConnectionConfig{
+		NodeID:  "node",
+		Address: "192.0.2.1",
+		Port:    22,
+		User:    "fixture",
+		Options: ssh.MustOptions(ssh.OptionIdentityAgent, "$XOPS_MCP_AGENT_TEST_SOCK"),
+	}
+	t.Setenv("XOPS_MCP_AGENT_TEST_SOCK", "/tmp/mcp-agent-v1.sock")
+	vAgent1, err := credentialVersion(provider, ssh.ConnectionPlan{Scope: "scope", Hops: []ssh.ConnectionConfig{hopEnvAgent}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XOPS_MCP_AGENT_TEST_SOCK", "/tmp/mcp-agent-v2.sock")
+	vAgent2, err := credentialVersion(provider, ssh.ConnectionPlan{Scope: "scope", Hops: []ssh.ConnectionConfig{hopEnvAgent}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vAgent1 == vAgent2 {
+		t.Fatal("rotating $VAR target for IdentityAgent must change credentialVersion")
+	}
+
+	// 3. L5c: Multi-hop ProxyJump ("jump1,jump2") must bind certificate paths expanded with BOTH
+	//    hop.ProxyJump ("jump2" for ConnectPlan) AND snapshot.Node.ProxyJump ("jump1,jump2" for direct Connect).
+	certDir := t.TempDir()
+	cfgMultiJump := credentialBindingConfig()
+	cfgMultiJump.Nodes.Set("jump1", models.Node{HostRef: "host", IdentityRef: "identity"})
+	cfgMultiJump.Nodes.Set("jump2", models.Node{HostRef: "host", IdentityRef: "identity"})
+	nodeMJ, _ := cfgMultiJump.Nodes.Get("node")
+	nodeMJ.ProxyJump = "jump1,jump2"
+	certTemplate := filepath.ToSlash(filepath.Join(certDir, "%j-cert.pub"))
+	nodeMJ.SSHOptions = ssh.MustOptions(ssh.OptionCertificateFile, certTemplate)
+	cfgMultiJump.Nodes.Set("node", nodeMJ)
+	providerMJ := config.NewProviderWithoutOpenSSH(cfgMultiJump)
+
+	planMJ := ssh.ConnectionPlan{
+		Scope: "scope",
+		Hops: []ssh.ConnectionConfig{
+			{NodeID: "jump1", Address: "192.0.2.1", Port: 22, User: "fixture"},
+			{NodeID: "jump2", Address: "192.0.2.1", Port: 22, User: "fixture", ProxyJump: "jump1"},
+			{
+				NodeID:    "node",
+				Address:   "192.0.2.1",
+				Port:      22,
+				User:      "fixture",
+				ProxyJump: "jump2", // Rewritten by CapturePlan
+				Options:   ssh.MustOptions(ssh.OptionCertificateFile, certTemplate),
+			},
+		},
+	}
+
+	vMJ0, err := credentialVersion(providerMJ, planMJ)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Rotating the ConnectPlan-expanded cert ("jump2-cert.pub") changes credentialVersion.
+	writeTestUserCertForBinding(t, filepath.Join(certDir, "jump2-cert.pub"), 301, 5000)
+	vMJ1, err := credentialVersion(providerMJ, planMJ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vMJ1 == vMJ0 {
+		t.Fatal("creating jump2-cert.pub must change credentialVersion")
+	}
+
+	// Rotating the direct-Connect-expanded cert ("jump1,jump2-cert.pub") ALSO changes credentialVersion!
+	fullJumpCert := filepath.Join(certDir, "jump1,jump2-cert.pub")
+	writeTestUserCertForBinding(t, fullJumpCert, 401, 6000)
+	vMJ2, err := credentialVersion(providerMJ, planMJ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vMJ2 == vMJ1 {
+		t.Fatal("creating jump1,jump2-cert.pub must change credentialVersion for direct SFTP/tunnel Connect")
+	}
+	writeTestUserCertForBinding(t, fullJumpCert, 402, 9000)
+	vMJ3, err := credentialVersion(providerMJ, planMJ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vMJ3 == vMJ2 {
+		t.Fatal("rotating jump1,jump2-cert.pub must change credentialVersion")
+	}
+}

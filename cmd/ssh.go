@@ -34,6 +34,7 @@ type SshOptions struct {
 	originalHost           string
 	HostName               string
 	cliHostName            string
+	nonHostArgs            bool
 	Port                   uint16
 	User                   string
 	Password               string
@@ -256,10 +257,10 @@ func (o *SshOptions) originalHostForExpansion() string {
 	if s := strings.TrimSpace(o.Target.Selector); s != "" {
 		return strings.TrimPrefix(s, config.OpenSSHNodePrefix)
 	}
-	if s := strings.TrimSpace(o.Host); s != "" {
+	if s := strings.TrimSpace(o.Host); s != "" && !strings.Contains(s, ",") {
 		return strings.TrimPrefix(s, config.OpenSSHNodePrefix)
 	}
-	if len(o.args) > 0 {
+	if !o.nonHostArgs && len(o.args) > 0 {
 		if _, h, _, err := utils.ParseAddr(o.args[0]); err == nil && h != "" {
 			return strings.TrimPrefix(h, config.OpenSSHNodePrefix)
 		}
@@ -896,10 +897,16 @@ func (o *SshOptions) hasActiveProxyCommandInPath(provider config.ConfigProvider,
 	if provider == nil {
 		return false
 	}
+	adpOpts := []adapter.Option{adapter.WithLocalExecution(true)}
+	if o != nil && strings.TrimSpace(o.JumpHost) != "" && nodeID != "" {
+		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, adapter.SessionAuth{
+			ProxyJump: strings.TrimSpace(o.JumpHost),
+		}))
+	}
 	checker := &proxyCommandPathChecker{
 		opts:            o,
 		provider:        provider,
-		adp:             adapter.NewSSHAdapter(provider, adapter.WithLocalExecution(true)),
+		adp:             adapter.NewSSHAdapter(provider, adpOpts...),
 		sessionCtrlOpts: sessionCtrlOpts,
 		visited:         make(map[string]struct{}),
 	}
@@ -1074,7 +1081,7 @@ func (o *SshOptions) handoffConnectorMasters(ctx context.Context, provider confi
 		if nodeID != "" && jumps[nodeID] {
 			continue
 		}
-		if o.hasActiveProxyCommandInPath(provider, nodeID, connector) {
+		if o.hasActiveProxyCommandInPath(provider, nodeID, nil) {
 			logger.DefaultLogger().Debugf("mux: skipping master handoff because ProxyCommand is active")
 			continue
 		}

@@ -96,7 +96,7 @@ func (m *logStreamerModel) startStream() tea.Cmd {
 			cmd = fmt.Sprintf("docker logs --tail 100 -f %s", container)
 		}
 
-		stdout, err := m.client.RunStream(m.ctx, cmd)
+		stdout, err := m.client.RunProbeStream(m.ctx, cmd)
 		if err != nil {
 			return logStreamClosedMsg{sessionID: m.sessionID, err: err}
 		}

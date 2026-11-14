@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/models"
 )
 
@@ -268,5 +271,69 @@ func TestPrepareConnectionHonorsCancellation(t *testing.T) {
 	}
 	if len(repo.Snapshot().Nodes.Keys()) != 0 {
 		t.Fatal("canceled confirmation saved a node")
+	}
+}
+
+func TestL7_PendingConnectionDistinctOpenSSHAliases(t *testing.T) {
+	sshCfgPath := filepath.Join(t.TempDir(), "ssh_config")
+	sshCfg := strings.Join([]string{
+		"Host role-a",
+		"  HostName 10.0.0.5",
+		"  User reader",
+		"  IdentityFile ~/.ssh/id_a",
+		"Host role-b",
+		"  HostName 10.0.0.5",
+		"  User writer",
+		"  IdentityFile ~/.ssh/id_b",
+	}, "\n") + "\n"
+	if err := os.WriteFile(sshCfgPath, []byte(sshCfg), 0o600); err != nil {
+		t.Fatalf("write ssh_config: %v", err)
+	}
+
+	repo, _ := pendingDiskRepository(t)
+	provider, err := WithOpenSSHConfigOverride(repo, sshCfgPath)
+	if err != nil {
+		t.Fatalf("WithOpenSSHConfigOverride: %v", err)
+	}
+	preparer := provider.(interface {
+		PrepareNodeContext(context.Context, EnsureNodeOptions) (EnsureNodeResult, error)
+		PendingNodeExecution(string) (*ssh.ExecutionConfig, bool)
+		ConfirmNodeWithExecutionContext(context.Context, string, *ssh.ExecutionConfig) error
+	})
+
+	resA, err := preparer.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+		Target: ConnectionTarget{Selector: "role-a", User: "ops", HasUser: true},
+	})
+	if err != nil {
+		t.Fatalf("PrepareNodeContext(role-a): %v", err)
+	}
+	resB, err := preparer.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+		Target: ConnectionTarget{Selector: "role-b", User: "ops", HasUser: true},
+	})
+	if err != nil {
+		t.Fatalf("PrepareNodeContext(role-b): %v", err)
+	}
+	if resA.NodeID == resB.NodeID {
+		t.Fatalf("expected distinct pending NodeIDs for role-a and role-b, both got %q", resA.NodeID)
+	}
+	if _, _, identA, err := provider.Resolve(resA.NodeID); err != nil || !strings.HasSuffix(identA.KeyPath, "id_a") {
+		t.Fatalf("Resolve(role-a) = (%q, %v), want id_a", identA.KeyPath, err)
+	}
+	if _, _, identB, err := provider.Resolve(resB.NodeID); err != nil || !strings.HasSuffix(identB.KeyPath, "id_b") {
+		t.Fatalf("Resolve(role-b) = (%q, %v), want id_b", identB.KeyPath, err)
+	}
+	if _, pending := preparer.PendingNodeExecution(resA.NodeID); !pending {
+		t.Fatalf("expected PendingNodeExecution(%q) to be true", resA.NodeID)
+	}
+	if err := preparer.ConfirmNodeWithExecutionContext(t.Context(), resA.NodeID, nil); err != nil {
+		t.Fatalf("ConfirmNodeWithExecutionContext on read-only override provider failed: %v", err)
+	}
+	if err := repo.ConfirmNodeContext(t.Context(), resB.NodeID); err != nil {
+		t.Fatalf("ConfirmNodeContext(openssh altID) failed: %v", err)
+	}
+	for _, id := range repo.Snapshot().Nodes.Keys() {
+		if strings.HasPrefix(id, OpenSSHNodePrefix) {
+			t.Fatalf("ConfirmNodeContext persisted OpenSSH virtual node ID %q into durable config", id)
+		}
 	}
 }

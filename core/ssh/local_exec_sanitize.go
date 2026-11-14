@@ -3,6 +3,7 @@ package ssh
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"strconv"
 	"strings"
 )
@@ -107,9 +108,53 @@ func validateSafeHostToken(kind, val string) error {
 	if val[0] == '-' {
 		return fmt.Errorf("%w: %s %q cannot start with '-'", ErrUnsafeExecToken, kind, val)
 	}
+
+	body := val
+	bracketed := false
+	if strings.ContainsAny(val, "[]") {
+		if len(val) < 4 || val[0] != '[' || val[len(val)-1] != ']' {
+			return fmt.Errorf("%w: %s %q contains invalid bracket syntax", ErrUnsafeExecToken, kind, val)
+		}
+		body = val[1 : len(val)-1]
+		if strings.ContainsAny(body, "[]") {
+			return fmt.Errorf("%w: %s %q contains nested brackets", ErrUnsafeExecToken, kind, val)
+		}
+		bracketed = true
+	}
+
+	addrPart, zonePart, hasZone := strings.Cut(body, "%")
+	if hasZone {
+		if err := validateSafeIPv6Zone(kind, val, zonePart); err != nil {
+			return err
+		}
+	}
+
+	if bracketed || hasZone {
+		if strings.IndexByte(addrPart, ':') < 0 {
+			return fmt.Errorf("%w: %s %q requires an IPv6 literal", ErrUnsafeExecToken, kind, val)
+		}
+		ip, err := netip.ParseAddr(addrPart)
+		if err != nil || !ip.Is6() {
+			return fmt.Errorf("%w: %s %q contains invalid IPv6 literal", ErrUnsafeExecToken, kind, val)
+		}
+		return nil
+	}
+
 	for i := 0; i < len(val); i++ {
 		if !isSafeHostTokenChar(val[i]) {
 			return fmt.Errorf("%w: %s %q contains disallowed character %q", ErrUnsafeExecToken, kind, val, val[i])
+		}
+	}
+	return nil
+}
+
+func validateSafeIPv6Zone(kind, val, zonePart string) error {
+	if zonePart == "" || strings.IndexByte(zonePart, '%') >= 0 {
+		return fmt.Errorf("%w: %s %q contains invalid zone identifier", ErrUnsafeExecToken, kind, val)
+	}
+	for i := 0; i < len(zonePart); i++ {
+		if !isSafeIPv6ZoneChar(zonePart[i]) {
+			return fmt.Errorf("%w: %s %q contains disallowed character %q in zone identifier", ErrUnsafeExecToken, kind, val, zonePart[i])
 		}
 	}
 	return nil
@@ -119,7 +164,14 @@ func isSafeHostTokenChar(c byte) bool {
 	return (c >= 'a' && c <= 'z') ||
 		(c >= 'A' && c <= 'Z') ||
 		(c >= '0' && c <= '9') ||
-		c == '.' || c == '_' || c == ':' || c == '-' || c == '[' || c == ']' || c == '%'
+		c == '.' || c == '_' || c == ':' || c == '-'
+}
+
+func isSafeIPv6ZoneChar(c byte) bool {
+	return (c >= 'a' && c <= 'z') ||
+		(c >= 'A' && c <= 'Z') ||
+		(c >= '0' && c <= '9') ||
+		c == '.' || c == '_' || c == '-'
 }
 
 func validateSafeUserToken(kind, val string) error {
@@ -245,10 +297,8 @@ func expandLocalExecTemplate(optionName, pattern string, env Environment, target
 	// (%r, %n, %d, %u, etc.) are validated lazily below only when referenced in
 	// pattern so unused values (e.g. Windows DOMAIN\user or spaces in LocalUser/HomeDir)
 	// do not reject commands like "nc %h %p".
-	if target.Host != "" {
-		if err := ValidateSafeExecToken("%h", target.Host); err != nil {
-			return "", err
-		}
+	if err := ValidateSafeExecToken("%h", target.Host); err != nil {
+		return "", err
 	}
 	if target.Port < 0 || target.Port > 65535 {
 		return "", fmt.Errorf("%w: invalid port %d", ErrUnsafeExecToken, target.Port)

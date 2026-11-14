@@ -136,7 +136,7 @@ func normalizePlan(plan ConnectionPlan) (ConnectionPlan, error) {
 		// stripping it would dial the endpoint directly, so fail closed instead.
 		// Passive local-exec options (LocalCommand/PermitLocalCommand and an
 		// explicit ProxyCommand=none) are still stripped below.
-		if hop.Options.ActiveProxyCommand() != "" {
+		if hasUnroutablePlanProxyCommand(hop) {
 			return ConnectionPlan{}, fmt.Errorf("connection plan hop %q: %w", hop.NodeID, ErrProxyCommandUnavailable)
 		}
 		hop.Options.StripClasses(OptionClassMux, OptionClassForward, OptionClassSession, OptionClassLocalExec)
@@ -147,6 +147,10 @@ func normalizePlan(plan ConnectionPlan) (ConnectionPlan, error) {
 		plan.Hops[index], previous = hop, hop.NodeID
 	}
 	return plan, nil
+}
+
+func hasUnroutablePlanProxyCommand(hop ConnectionConfig) bool {
+	return hop.ProxyJump == "" && hop.Options.ActiveProxyCommand() != ""
 }
 
 // ConnectPlan never reads the connector's mutable ConnectionProvider. The

@@ -175,6 +175,28 @@ func loopbackListenHost(network string) string {
 	return "127.0.0.1"
 }
 
+func remoteLoopbackListenHost(dialNetwork string) string {
+	switch normalizeTCPDialNetwork(dialNetwork) {
+	case "tcp4":
+		return "127.0.0.1"
+	case "tcp6":
+		return "::1"
+	default:
+		return "localhost"
+	}
+}
+
+func remoteWildcardListenAddr(dialNetwork, portStr string) string {
+	switch normalizeTCPDialNetwork(dialNetwork) {
+	case "tcp4":
+		return "0.0.0.0:" + portStr
+	case "tcp6":
+		return "[::]:" + portStr
+	default:
+		return ":" + portStr
+	}
+}
+
 // RemoteListenAddress returns the network and address for remote listening using client-specified bind semantics.
 func (e ForwardEndpoint) RemoteListenAddress() (network, addr string) {
 	return e.RemoteListenAddressForMode(GatewayPortsClientSpecified, "tcp")
@@ -191,18 +213,18 @@ func (e ForwardEndpoint) RemoteListenAddressForMode(gatewayPortsMode, dialNetwor
 	portStr := strconv.Itoa(int(e.Port))
 	switch strings.ToLower(strings.TrimSpace(gatewayPortsMode)) {
 	case GatewayPortsYes:
-		return netw, ":" + portStr
+		return netw, remoteWildcardListenAddr(netw, portStr)
 	case GatewayPortsNo:
 		if !e.HasHost || e.Wildcard {
-			return netw, net.JoinHostPort("localhost", portStr)
+			return netw, net.JoinHostPort(remoteLoopbackListenHost(netw), portStr)
 		}
 		return netw, net.JoinHostPort(e.Host, portStr)
 	default: // GatewayPortsClientSpecified or unset ("")
 		if e.Wildcard {
-			return netw, ":" + portStr
+			return netw, remoteWildcardListenAddr(netw, portStr)
 		}
 		if !e.HasHost {
-			return netw, net.JoinHostPort("localhost", portStr)
+			return netw, net.JoinHostPort(remoteLoopbackListenHost(netw), portStr)
 		}
 		return netw, net.JoinHostPort(e.Host, portStr)
 	}

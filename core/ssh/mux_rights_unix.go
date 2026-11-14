@@ -231,6 +231,12 @@ func handlePassengerSession(s *MuxServer, conn net.Conn, reqID uint32, payload [
 	if err != nil {
 		return sendFailure(conn, reqID, fmt.Sprintf("open ssh session failed: %v", err))
 	}
+	handoffReqs := false
+	defer func() {
+		if !handoffReqs {
+			go discardAbortedChannelRequests(s.baseContext(), reqs)
+		}
+	}()
 	releasePassengerAgent, err := enablePassengerAgentForward(s, ch, req.WantAgent)
 	defer releasePassengerAgent()
 	defer func() { _ = ch.Close() }()
@@ -257,24 +263,46 @@ func handlePassengerSession(s *MuxServer, conn net.Conn, reqID uint32, payload [
 		}
 	}
 
+	handoffReqs = true
 	exitCode := runPassengerChannelIO(conn, ch, reqs, files)
 	return sendExitMessage(conn, sessionID, exitCode)
 }
 
 func applyPassengerEnvAndPTY(s *MuxServer, ch cryptoSSH.Channel, req MuxNewSessionRequest, ttyAllocFailed *bool) error {
+	if len(req.Env) > MaxSessionEnvVars {
+		return fmt.Errorf("%w: passenger session environment exceeds maximum of %d variables", ErrSSHOptionsValidation, MaxSessionEnvVars)
+	}
+	envAcc := newSessionEnvAccumulator()
 	for _, env := range req.Env {
-		if k, v, ok := strings.Cut(env, "="); ok && k != "" {
-			envPayload := cryptoSSH.Marshal(struct {
-				Name  string
-				Value string
-			}{Name: k, Value: v})
-			accepted, envErr := s.sendBoundedPassengerRequest(ch, "env", envPayload)
-			if envErr != nil {
-				return fmt.Errorf("set env %q failed: %w", k, envErr)
-			}
-			if !accepted {
-				s.getLogger().Debugf("mux: server rejected env variable %q for passenger session", k)
-			}
+		k, v, ok := strings.Cut(env, "=")
+		if !ok || !isValidEnvVarName(k) {
+			return fmt.Errorf("%w: invalid passenger environment variable %q", ErrSSHOptionsValidation, env)
+		}
+		if strings.ContainsRune(v, 0) {
+			return fmt.Errorf("%w: passenger environment variable %q contains NUL byte", ErrSSHOptionsValidation, k)
+		}
+		if len(k)+1+len(v) > MaxSessionEnvEntryBytes {
+			return fmt.Errorf("%w: passenger environment variable %q exceeds %d bytes", ErrSSHOptionsValidation, k, MaxSessionEnvEntryBytes)
+		}
+		if isDeniedSendEnvName(k) {
+			s.getLogger().Debugf("mux: passenger env variable %q blocked by denylist", k)
+			continue
+		}
+		if err := envAcc.upsert(EnvVar{Name: k, Value: v}); err != nil {
+			return err
+		}
+	}
+	for _, ev := range envAcc.resolved {
+		envPayload := cryptoSSH.Marshal(struct {
+			Name  string
+			Value string
+		}{Name: ev.Name, Value: ev.Value})
+		accepted, envErr := s.sendBoundedPassengerRequest(ch, "env", envPayload)
+		if envErr != nil {
+			return fmt.Errorf("set env %q failed: %w", ev.Name, envErr)
+		}
+		if !accepted {
+			s.getLogger().Debugf("mux: server rejected env variable %q for passenger session", ev.Name)
 		}
 	}
 	if !req.WantTTY {
@@ -309,16 +337,32 @@ func applyPassengerEnvAndPTY(s *MuxServer, ch cryptoSSH.Channel, req MuxNewSessi
 	return nil
 }
 
+type muxTransportInterruptConn struct {
+	net.Conn
+	onClose func()
+}
+
+func (c *muxTransportInterruptConn) Close() error {
+	if c.onClose != nil {
+		c.onClose()
+	}
+	if c.Conn != nil {
+		return c.Conn.Close()
+	}
+	return nil
+}
+
 func (s *MuxServer) sendBoundedPassengerRequest(ch cryptoSSH.Channel, reqType string, payload []byte) (bool, error) {
 	ctx := context.Background()
 	if s != nil && s.serverCtx != nil {
 		ctx = s.serverCtx
 	}
 	var (
-		sshCli  *cryptoSSH.Client
-		root    net.Conn
-		timeout time.Duration
-		log     logger.DebugLogger
+		sshCli      *cryptoSSH.Client
+		root        net.Conn
+		timeout     time.Duration
+		log         logger.DebugLogger
+		interrupted atomic.Bool
 	)
 	if s != nil {
 		sshCli = s.sshClient
@@ -327,12 +371,19 @@ func (s *MuxServer) sendBoundedPassengerRequest(ch cryptoSSH.Channel, reqType st
 		log = s.logger
 	}
 	helper := &Client{
-		sshClient:        sshCli,
-		rootConn:         root,
+		sshClient: sshCli,
+		rootConn: &muxTransportInterruptConn{
+			Conn:    root,
+			onClose: func() { interrupted.Store(true) },
+		},
 		handshakeTimeout: timeout,
 		logger:           log,
 	}
-	return helper.sendBoundedChannelRequest(ctx, ch, reqType, payload, false)
+	accepted, err := helper.sendBoundedChannelRequest(ctx, ch, reqType, payload, false)
+	if s != nil && interrupted.Load() {
+		_ = s.Shutdown()
+	}
+	return accepted, err
 }
 
 func enablePassengerAgentForward(s *MuxServer, ch cryptoSSH.Channel, wantAgent bool) (func(), error) {
@@ -640,7 +691,7 @@ func handlePassengerStdioFwd(s *MuxServer, conn net.Conn, reqID uint32, payload 
 	defer s.untrackStream(conn)
 
 	targetAddr := net.JoinHostPort(fwdReq.ConnectHost, strconv.FormatUint(uint64(fwdReq.ConnectPort), 10))
-	stream, err := s.sshClient.Dial(s.effectiveDialNetwork(), targetAddr)
+	stream, err := s.dialSSHMux(s.baseContext(), s.effectiveDialNetwork(), targetAddr)
 	if err != nil {
 		return sendFailure(conn, reqID, fmt.Sprintf("remote dial failed: %v", err))
 	}
@@ -653,6 +704,7 @@ func handlePassengerStdioFwd(s *MuxServer, conn net.Conn, reqID uint32, payload 
 	stdinFile, stdoutFile := files[0], files[1]
 
 	stopStdin := make(chan struct{})
+	cancelStdin := sync.OnceFunc(func() { close(stopStdin) })
 	stdinDone := make(chan error, 1)
 	stdoutDone := make(chan error, 1)
 	go func() {
@@ -667,16 +719,54 @@ func handlePassengerStdioFwd(s *MuxServer, conn net.Conn, reqID uint32, payload 
 		stdoutDone <- copyErr
 	}()
 
-	// Wait for remote -> stdout to finish (or stdin error if it fails), while
+	// Watch the control socket while stdio forwarding runs: if the passenger
+	// client terminates early (closing conn), abort the remote stream and close
+	// inherited descriptors immediately so neither remote forward nor copy workers leak.
+	connClosed := make(chan struct{})
+	var stopConnWatch func() bool
+	if d, ok := conn.(interface{ SetReadDeadline(time.Time) error }); ok {
+		go func() {
+			defer close(connClosed)
+			var buf [1]byte
+			_, _ = conn.Read(buf[:])
+		}()
+		stopConnWatch = func() bool {
+			_ = d.SetReadDeadline(time.Now())
+			<-connClosed
+			_ = d.SetReadDeadline(time.Time{})
+			return true
+		}
+	} else {
+		stopConnWatch = func() bool { return false }
+	}
+
+	// Wait for remote -> stdout to finish (or control-socket disconnect), while
 	// allowing stdin EOF to half-close the remote stream so request/response
 	// protocols (like HTTP or banner probes with short stdin) still receive the
 	// remote server's response before tearing down both descriptors.
-	outErr := <-stdoutDone
-	close(stopStdin)
+	var (
+		outErr       error
+		disconnected bool
+	)
+	select {
+	case outErr = <-stdoutDone:
+		stopConnWatch()
+	case <-connClosed:
+		disconnected = true
+		cancelStdin()
+		_ = stream.Close()
+		closeFiles(files)
+		outErr = <-stdoutDone
+	}
+
+	cancelStdin()
 	inErr := <-stdinDone
 	_ = stream.Close()
 	_ = stdinFile.Close()
 	_ = stdoutFile.Close()
+	if disconnected {
+		return nil
+	}
 
 	firstErr := outErr
 	if firstErr == nil && !errors.Is(inErr, os.ErrClosed) {
@@ -768,16 +858,26 @@ func recvFDs(conn *net.UnixConn, count int) ([]int, error) {
 		if parseCtrlErr != nil {
 			return fail("parse control message: %w", parseCtrlErr)
 		}
+		if len(received) == 0 {
+			return fail("expected ancillary file descriptor, got none")
+		}
 	}
 	return fds, nil
 }
 
 func extractReceivedFDsMarkCloexec(oob []byte) ([]int, error) {
-	messages, parseCtrlErr := unix.ParseSocketControlMessage(oob)
 	var allFDs []int
-	for messageIndex := range messages {
-		received, parseErr := unix.ParseUnixRights(&messages[messageIndex])
+	for len(oob) > 0 {
+		if len(oob) < unix.CmsgLen(0) {
+			return allFDs, unix.EINVAL
+		}
+		hdr, data, rest, parseErr := unix.ParseOneSocketControlMessage(oob)
 		if parseErr != nil {
+			return allFDs, parseErr
+		}
+		oob = rest
+		received, rightsErr := unix.ParseUnixRights(&unix.SocketControlMessage{Header: hdr, Data: data})
+		if rightsErr != nil {
 			continue
 		}
 		for _, fd := range received {
@@ -785,7 +885,7 @@ func extractReceivedFDsMarkCloexec(oob []byte) ([]int, error) {
 			allFDs = append(allFDs, fd)
 		}
 	}
-	return allFDs, parseCtrlErr
+	return allFDs, nil
 }
 
 func closeFDRange(fds []int) {

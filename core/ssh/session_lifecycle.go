@@ -230,9 +230,13 @@ func (c *Client) enterTerminalRawMode(
 			rawActive = false
 		}
 		suspendErr := suspendFn()
-		if _, rawErr := term.MakeRaw(fdIn); rawErr != nil {
-			return errors.Join(suspendErr, fmt.Errorf("re-enter terminal raw mode after suspend: %w", rawErr))
+		newState, rawErr := term.MakeRaw(fdIn)
+		if rawErr != nil {
+			return fatalSuspendTerminalError{
+				err: errors.Join(suspendErr, fmt.Errorf("re-enter terminal raw mode after suspend: %w", rawErr)),
+			}
 		}
+		state = newState
 		rawActive = true
 		if currW, currH, szErr := term.GetSize(fdOut); szErr == nil && currW > 0 && currH > 0 {
 			_ = session.WindowChange(currH, currW)
@@ -302,18 +306,20 @@ func (c *Client) RunInteractivePlanWithIO(ctx context.Context, plan CommandPlan,
 	}
 	work, cancel := context.WithTimeout(ctx, plan.timeout)
 	defer cancel()
-	stdout, closeOut, err := prepareContextOutput(work, streams.Stdout)
+	outCtx, cancelOut := context.WithCancel(work)
+	defer cancelOut()
+	stdout, closeOut, err := prepareContextOutput(outCtx, streams.Stdout)
 	if err != nil {
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, closeOut()) }()
-	stderr, closeErr, err := prepareContextOutput(work, streams.Stderr)
+	stderr, closeErr, err := prepareContextOutput(outCtx, streams.Stderr)
 	if err != nil {
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, closeErr()) }()
 	streams.Stdout, streams.Stderr = stdout, stderr
-	return c.runTerminalSession(work, plan.payload, streams, false, false, cancel)
+	return c.runTerminalSession(work, plan.payload, streams, false, false, cancelOut)
 }
 
 // RunInteractiveWithOptions preserves the legacy login default while honoring

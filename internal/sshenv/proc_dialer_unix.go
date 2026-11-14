@@ -18,7 +18,10 @@ import (
 
 const fallbackPosixShell = "/bin/sh"
 
-var probeControllingTTY = defaultHasControllingTTY
+var (
+	probeControllingTTY      = defaultHasControllingTTY
+	onUnixReapRemainingGroup func(pgid int)
+)
 
 type platformProc struct {
 	process       *os.Process
@@ -37,10 +40,7 @@ func defaultHasControllingTTY() bool {
 	if err == nil {
 		fgPGID, pgrpErr := unix.IoctlGetInt(fd, unix.TIOCGPGRP)
 		_ = unix.Close(fd)
-		if pgrpErr == nil && fgPGID > 0 {
-			return fgPGID == unix.Getpgrp()
-		}
-		return true
+		return pgrpErr == nil && fgPGID > 0 && fgPGID == unix.Getpgrp()
 	}
 	return isForegroundTerminalFD(int(os.Stdin.Fd())) || isForegroundTerminalFD(int(os.Stderr.Fd()))
 }
@@ -49,10 +49,8 @@ func isForegroundTerminalFD(fd int) bool {
 	if !term.IsTerminal(fd) {
 		return false
 	}
-	if fgPGID, err := unix.IoctlGetInt(fd, unix.TIOCGPGRP); err == nil && fgPGID > 0 {
-		return fgPGID == unix.Getpgrp()
-	}
-	return true
+	fgPGID, err := unix.IoctlGetInt(fd, unix.TIOCGPGRP)
+	return err == nil && fgPGID > 0 && fgPGID == unix.Getpgrp()
 }
 
 func startPlatformShellCommand(command string, stdin io.Reader, stdout, stderr io.Writer) (*platformProc, *exec.Cmd, error) {
@@ -133,9 +131,12 @@ func (p *platformProc) terminateTree(termGrace time.Duration, done <-chan struct
 	}
 }
 
-func (p *platformProc) reapRemainingGroup(termGrace time.Duration, stderrDone <-chan struct{}) {
-	if p == nil || p.foregroundTTY || p.pgid <= 0 {
+func (p *platformProc) reapRemainingGroup(termGrace time.Duration, stderrDone <-chan struct{}, alreadyExited bool) {
+	if p == nil || p.foregroundTTY || p.pgid <= 0 || alreadyExited {
 		return
+	}
+	if hook := onUnixReapRemainingGroup; hook != nil {
+		hook(p.pgid)
 	}
 	if syscall.Kill(-p.pgid, 0) != nil {
 		return

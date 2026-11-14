@@ -44,8 +44,10 @@ type ExecOptions struct {
 }
 
 func NewExecOptions() *ExecOptions {
+	sshOpts := *NewSshOptions()
+	sshOpts.nonHostArgs = true
 	return &ExecOptions{
-		SshOptions: *NewSshOptions(),
+		SshOptions: sshOpts,
 		TaskCount:  1,
 	}
 }
@@ -247,6 +249,7 @@ func (o *ExecOptions) completeNonDashArgs(cmd *cobra.Command, args []string) err
 
 func (o *ExecOptions) Complete(cmd *cobra.Command, args []string) error {
 	o.args = args
+	o.nonHostArgs = true
 	o.appliedGeneralOpts = false
 	var flags *pflag.FlagSet
 	if cmd != nil {

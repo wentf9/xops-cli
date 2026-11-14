@@ -310,6 +310,10 @@ func validateTargetCompatibility(cur ConnectionConfig, newCfg *ClientConfig) err
 		return fmt.Errorf("%w: user changed (expected %q, got %q)",
 			ErrSnapshotMismatch, cur.User, newCfg.User)
 	}
+	if curOrig, newOrig := effectiveOriginalHost(cur.OriginalHost, cur.NodeID), effectiveOriginalHost(newCfg.OriginalHost, newCfg.NodeID); curOrig != newOrig {
+		return fmt.Errorf("%w: original host changed (expected %q, got %q)",
+			ErrSnapshotMismatch, curOrig, newOrig)
+	}
 	if newCfg.KeyRef != cur.KeyRef || newCfg.TrustVersion != cur.TrustVersion {
 		return fmt.Errorf("%w: key reference or host trust version changed", ErrSnapshotMismatch)
 	}
@@ -341,12 +345,8 @@ func validateOptionsTargetCompatibility(curOpts, newOpts *Options) error {
 	if !slices.Equal(newOpts.CertificateFiles(), curOpts.CertificateFiles()) {
 		return fmt.Errorf("%w: certificate files changed", ErrSnapshotMismatch)
 	}
-	curPub, curPubOK := curOpts.PubkeyAuthentication()
-	newPub, newPubOK := newOpts.PubkeyAuthentication()
-	if curOpts.IdentityAgent() != newOpts.IdentityAgent() ||
-		curOpts.IdentitiesOnly() != newOpts.IdentitiesOnly() ||
-		curPub != newPub || curPubOK != newPubOK {
-		return fmt.Errorf("%w: publickey or agent authentication options changed", ErrSnapshotMismatch)
+	if err := validateAuthOptionsTargetCompatibility(curOpts, newOpts); err != nil {
+		return err
 	}
 	if curOpts.Ciphers() != newOpts.Ciphers() ||
 		curOpts.MACs() != newOpts.MACs() ||
@@ -357,6 +357,41 @@ func validateOptionsTargetCompatibility(curOpts, newOpts *Options) error {
 	if newOpts.AddressFamily() != curOpts.AddressFamily() {
 		return fmt.Errorf("%w: address family changed (expected %q, got %q)",
 			ErrSnapshotMismatch, curOpts.AddressFamily(), newOpts.AddressFamily())
+	}
+	return validateCanonicalizeOptionsTargetCompatibility(curOpts, newOpts)
+}
+
+func validateAuthOptionsTargetCompatibility(curOpts, newOpts *Options) error {
+	curPub, curPubOK := curOpts.PubkeyAuthentication()
+	newPub, newPubOK := newOpts.PubkeyAuthentication()
+	if curOpts.IdentityAgent() != newOpts.IdentityAgent() ||
+		curOpts.IdentitiesOnly() != newOpts.IdentitiesOnly() ||
+		curPub != newPub || curPubOK != newPubOK {
+		return fmt.Errorf("%w: publickey or agent authentication options changed", ErrSnapshotMismatch)
+	}
+	curPwd, curPwdOK := curOpts.PasswordAuthentication()
+	newPwd, newPwdOK := newOpts.PasswordAuthentication()
+	curKbd, curKbdOK := curOpts.KbdInteractiveAuthentication()
+	newKbd, newKbdOK := newOpts.KbdInteractiveAuthentication()
+	if curPwd != newPwd || curPwdOK != newPwdOK ||
+		curKbd != newKbd || curKbdOK != newKbdOK ||
+		!slices.Equal(curOpts.PreferredAuthentications(), newOpts.PreferredAuthentications()) {
+		return fmt.Errorf("%w: authentication policy options changed", ErrSnapshotMismatch)
+	}
+	return nil
+}
+
+func validateCanonicalizeOptionsTargetCompatibility(curOpts, newOpts *Options) error {
+	curDots, curDotsOK := curOpts.CanonicalizeMaxDots()
+	newDots, newDotsOK := newOpts.CanonicalizeMaxDots()
+	curFallback, curFallbackOK := curOpts.CanonicalizeFallbackLocal()
+	newFallback, newFallbackOK := newOpts.CanonicalizeFallbackLocal()
+	if curOpts.CanonicalizeHostname() != newOpts.CanonicalizeHostname() ||
+		!slices.Equal(curOpts.CanonicalDomains(), newOpts.CanonicalDomains()) ||
+		curDots != newDots || curDotsOK != newDotsOK ||
+		curFallback != newFallback || curFallbackOK != newFallbackOK ||
+		!slices.Equal(curOpts.CanonicalizePermittedCNAMEs(), newOpts.CanonicalizePermittedCNAMEs()) {
+		return fmt.Errorf("%w: hostname canonicalization options changed", ErrSnapshotMismatch)
 	}
 	return nil
 }

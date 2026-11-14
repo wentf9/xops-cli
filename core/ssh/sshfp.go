@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"net"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	cryptoSSH "golang.org/x/crypto/ssh"
@@ -90,9 +91,10 @@ func sshfpLookupHost(address string) string {
 // resolver is injected. Lookup failures degrade to SSHFPStatusNone, which never
 // grants trust.
 //
-// The lookup is parented to the handshake coordinator (when present) and bounded
+// The lookup is parented to the handshake coordinator during the initial
+// handshake and falls back to ctx on post-handshake transport rekeys, bounded
 // by min(handshake/ConnectTimeout, 5s).
-func (c *Connector) lookupSSHFPStatus(ctx context.Context, coordinator *handshakeCoordinator, cfg *ClientConfig, key cryptoSSH.PublicKey) SSHFPVerifyStatus {
+func (c *Connector) lookupSSHFPStatus(ctx context.Context, coordinator *handshakeCoordinator, cfg *ClientConfig, key cryptoSSH.PublicKey, initialHandshakeDone ...*atomic.Bool) SSHFPVerifyStatus {
 	if cfg == nil || cfg.Options == nil || c.environment.LookupSSHFP == nil {
 		return SSHFPStatusNone
 	}
@@ -106,7 +108,14 @@ func (c *Connector) lookupSSHFPStatus(ctx context.Context, coordinator *handshak
 		return SSHFPStatusNone
 	}
 	parent := ctx
-	if coordinator != nil {
+	if parent == nil {
+		parent = c.lifecycleCtx
+	}
+	var handshakeDone *atomic.Bool
+	if len(initialHandshakeDone) > 0 {
+		handshakeDone = initialHandshakeDone[0]
+	}
+	if coordinator != nil && (handshakeDone == nil || !handshakeDone.Load()) {
 		parent = coordinator.Context()
 	}
 	timeout := sshfpLookupTimeout

@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -48,68 +49,129 @@ func TestHelperUnixSubprocess(t *testing.T) {
 		time.Sleep(30 * time.Second)
 		os.Exit(0)
 	case "pty-leader":
-		if !defaultHasControllingTTY() {
-			_, _ = fmt.Fprintln(os.Stderr, "expected defaultHasControllingTTY() == true in PTY session leader")
-			os.Exit(3)
-		}
-		exe, err := os.Executable()
-		if err != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "os.Executable: %v\n", err)
-			os.Exit(4)
-		}
-		proxyCmd := fmt.Sprintf(`XOPS_SSHENV_UNIX_HELPER=devtty-proxy "%s" -test.run=^TestHelperUnixSubprocess$`, exe)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		conn, err := DialProxyCommandWithStderr(ctx, proxyCmd, io.Discard)
-		if err != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "DialProxyCommandWithStderr: %v\n", err)
-			os.Exit(5)
-		}
-		line, err := bufio.NewReader(conn).ReadString('\n')
-		_ = conn.Close()
-		if err != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "read proxy stdout: %v\n", err)
-			os.Exit(6)
-		}
-		if strings.TrimSpace(line) != "PROXY-OK:654321" {
-			_, _ = fmt.Fprintf(os.Stderr, "unexpected proxy stdout %q\n", line)
-			os.Exit(7)
-		}
-		os.Exit(0)
+		runPTYLeaderSubprocessHelper()
 	case "devtty-proxy":
-		tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
-		if err != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "open /dev/tty: %v\n", err)
-			os.Exit(11)
-		}
-		defer func() { _ = tty.Close() }()
-
-		// Exercise both tcgetattr and tcsetattr (MakeRaw + Restore); a background
-		// process group receives SIGTTOU immediately on tcsetattr!
-		origState, err := term.MakeRaw(int(tty.Fd()))
-		if err != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "term.MakeRaw(/dev/tty): %v\n", err)
-			os.Exit(12)
-		}
-		if err := term.Restore(int(tty.Fd()), origState); err != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "term.Restore(/dev/tty): %v\n", err)
-			os.Exit(13)
-		}
-
-		if _, err := io.WriteString(tty, "OTP-PROMPT:"); err != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "write /dev/tty prompt: %v\n", err)
-			os.Exit(14)
-		}
-		// Reading /dev/tty from a background process group triggers SIGTTIN!
-		code, err := bufio.NewReader(tty).ReadString('\n')
-		if err != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "read /dev/tty answer: %v\n", err)
-			os.Exit(15)
-		}
-		_, _ = fmt.Fprintf(os.Stdout, "PROXY-OK:%s\n", strings.TrimSpace(code))
-		_, _ = io.Copy(os.Stdout, os.Stdin)
-		os.Exit(0)
+		runDevTTYProxySubprocessHelper()
+	case "detached-inherited-pty":
+		runDetachedInheritedPTYSubprocessHelper()
 	}
+}
+
+func runPTYLeaderSubprocessHelper() {
+	if !defaultHasControllingTTY() {
+		_, _ = fmt.Fprintln(os.Stderr, "expected defaultHasControllingTTY() == true in PTY session leader")
+		os.Exit(3)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "os.Executable: %v\n", err)
+		os.Exit(4)
+	}
+	proxyCmd := fmt.Sprintf(`XOPS_SSHENV_UNIX_HELPER=devtty-proxy "%s" -test.run=^TestHelperUnixSubprocess$`, exe)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := DialProxyCommandWithStderr(ctx, proxyCmd, io.Discard)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "DialProxyCommandWithStderr: %v\n", err)
+		os.Exit(5)
+	}
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	_ = conn.Close()
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "read proxy stdout: %v\n", err)
+		os.Exit(6)
+	}
+	if strings.TrimSpace(line) != "PROXY-OK:654321" {
+		_, _ = fmt.Fprintf(os.Stderr, "unexpected proxy stdout %q\n", line)
+		os.Exit(7)
+	}
+	os.Exit(0)
+}
+
+func runDevTTYProxySubprocessHelper() {
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "open /dev/tty: %v\n", err)
+		os.Exit(11)
+	}
+	defer func() { _ = tty.Close() }()
+
+	// Exercise both tcgetattr and tcsetattr (MakeRaw + Restore); a background
+	// process group receives SIGTTOU immediately on tcsetattr!
+	origState, err := term.MakeRaw(int(tty.Fd()))
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "term.MakeRaw(/dev/tty): %v\n", err)
+		os.Exit(12)
+	}
+	if err := term.Restore(int(tty.Fd()), origState); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "term.Restore(/dev/tty): %v\n", err)
+		os.Exit(13)
+	}
+
+	if _, err := io.WriteString(tty, "OTP-PROMPT:"); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "write /dev/tty prompt: %v\n", err)
+		os.Exit(14)
+	}
+	// Reading /dev/tty from a background process group triggers SIGTTIN!
+	code, err := bufio.NewReader(tty).ReadString('\n')
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "read /dev/tty answer: %v\n", err)
+		os.Exit(15)
+	}
+	_, _ = fmt.Fprintf(os.Stdout, "PROXY-OK:%s\n", strings.TrimSpace(code))
+	_, _ = io.Copy(os.Stdout, os.Stdin)
+	os.Exit(0)
+}
+
+func runDetachedInheritedPTYSubprocessHelper() {
+	// Regression helper for M11: called after Setsid: true WITHOUT Setctty,
+	// with stdin and stderr attached to a non-controlling PTY slave.
+	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stderr.Fd())) {
+		_, _ = fmt.Fprintln(os.Stderr, "expected stdin/stderr to be PTY slave FDs")
+		os.Exit(21)
+	}
+	if isForegroundTerminalFD(int(os.Stdin.Fd())) || isForegroundTerminalFD(int(os.Stderr.Fd())) {
+		_, _ = fmt.Fprintln(os.Stderr, "isForegroundTerminalFD returned true on non-controlling PTY")
+		os.Exit(22)
+	}
+	if defaultHasControllingTTY() {
+		_, _ = fmt.Fprintln(os.Stderr, "defaultHasControllingTTY returned true in detached setsid process")
+		os.Exit(23)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rawConn, err := DialProxyCommandWithStderr(ctx, `trap '' TERM; (sleep 60) & printf 'D'; sleep 60`, io.Discard)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "DialProxyCommandWithStderr: %v\n", err)
+		os.Exit(24)
+	}
+	pConn := rawConn.(*ProcessStdioConn)
+	if pConn.proc.foregroundTTY || pConn.proc.pgid <= 0 {
+		_ = pConn.Close()
+		_, _ = fmt.Fprintf(os.Stderr, "expected isolated process group, got foregroundTTY=%v pgid=%d\n", pConn.proc.foregroundTTY, pConn.proc.pgid)
+		os.Exit(25)
+	}
+	pgid := pConn.proc.pgid
+	ready := make([]byte, 1)
+	if _, err := io.ReadFull(pConn, ready); err != nil {
+		_ = pConn.Close()
+		_, _ = fmt.Fprintf(os.Stderr, "read readiness byte: %v\n", err)
+		os.Exit(26)
+	}
+	if err := pConn.Close(); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "Close: %v\n", err)
+		os.Exit(27)
+	}
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for !errors.Is(syscall.Kill(-pgid, 0), syscall.ESRCH) {
+		if time.Now().After(deadline) {
+			_, _ = fmt.Fprintf(os.Stderr, "process group %d survived Close()\n", pgid)
+			os.Exit(28)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	_, _ = fmt.Fprintln(os.Stdout, "DETACHED-PTY-ISOLATED-OK")
+	os.Exit(0)
 }
 
 func TestProcessStdioConn_ReapsTrappedProcessGroupAndGrandchildren(t *testing.T) {
@@ -370,6 +432,99 @@ func TestResolveUserShellFallback(t *testing.T) {
 	}
 	if got := resolveUserShell("/bin/sh"); got != "/bin/sh" {
 		t.Fatalf("resolveUserShell(/bin/sh) = %q, want /bin/sh", got)
+	}
+}
+
+func TestDetachedSetsidInheritingNonControllingPTY_IsolatesAndReapsProcessGroup(t *testing.T) {
+	master, slave, err := testpty.Open()
+	if err != nil {
+		t.Fatalf("testpty.Open failed: %v", err)
+	}
+	defer func() { _ = master.Close() }()
+	defer func() { _ = slave.Close() }()
+
+	// Drain master so any diagnostic writes to stderr never block.
+	go func() {
+		_, _ = io.Copy(io.Discard, master)
+	}()
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	var stdoutBuf syncBuffer
+	cmd := exec.CommandContext(ctx, exe, "-test.run=^TestHelperUnixSubprocess$")
+	cmd.Env = append(os.Environ(), "XOPS_SSHENV_UNIX_HELPER=detached-inherited-pty")
+	cmd.Stdin = slave
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = slave
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid: true, // Detached session without Setctty -> TIOCGPGRP returns ENOTTY!
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start detached helper failed: %v", err)
+	}
+	_ = slave.Close()
+
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("detached inherited-PTY helper failed: %v (stdout=%q)", err, stdoutBuf.String())
+	}
+	if !strings.Contains(stdoutBuf.String(), "DETACHED-PTY-ISOLATED-OK") {
+		t.Fatalf("missing success marker in helper stdout %q", stdoutBuf.String())
+	}
+}
+
+func TestProcessStdioConn_SpontaneousExitBeforeCloseSkipsDelayedGroupReap(t *testing.T) {
+	forceHeadlessModeForTest(t)
+
+	var reapCalls atomic.Int32
+	origHook := onUnixReapRemainingGroup
+	onUnixReapRemainingGroup = func(int) {
+		reapCalls.Add(1)
+	}
+	t.Cleanup(func() {
+		onUnixReapRemainingGroup = origHook
+	})
+
+	rawConn, err := DialProxyCommandWithStderr(t.Context(), `printf 'E'; exit 0`, io.Discard)
+	if err != nil {
+		t.Fatalf("DialProxyCommandWithStderr failed: %v", err)
+	}
+	pConn := rawConn.(*ProcessStdioConn)
+
+	buf := make([]byte, 8)
+	n, err := pConn.Read(buf)
+	if n != 1 || buf[0] != 'E' {
+		_ = pConn.Close()
+		t.Fatalf("Read = (%d, %v), want ('E')", n, err)
+	}
+
+	// Wait until both cmd.Wait() (waitDone) and stderr EOF (stderrDone) have naturally completed.
+	select {
+	case <-pConn.waitDone:
+	case <-time.After(2 * time.Second):
+		_ = pConn.Close()
+		t.Fatal("timed out waiting for spontaneous waitDone")
+	}
+	select {
+	case <-pConn.stderrDone:
+	case <-time.After(2 * time.Second):
+		_ = pConn.Close()
+		t.Fatal("timed out waiting for spontaneous stderrDone")
+	}
+
+	if !pConn.spontaneousExit.Load() {
+		t.Fatal("expected spontaneousExit=true after natural exit prior to Close()")
+	}
+	if err := pConn.Close(); err != nil {
+		t.Fatalf("Close() failed: %v", err)
+	}
+	if got := reapCalls.Load(); got != 0 {
+		t.Fatalf("expected reapRemainingGroup to be skipped when waitDone and stderrDone already closed prior to Close(), got %d calls", got)
 	}
 }
 

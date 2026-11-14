@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -81,7 +82,7 @@ func (r *sshfpResolver) Lookup(ctx context.Context, hostname string) (core.SSHFP
 	defer cancel()
 
 	cfg := r.resolveConfig()
-	servers := cfg.servers
+	servers := deduplicateDNSServers(cfg.servers)
 	if len(servers) > dnsMaxServers {
 		servers = servers[:dnsMaxServers]
 	}
@@ -114,6 +115,20 @@ func (r *sshfpResolver) Lookup(ctx context.Context, hostname string) (core.SSHFP
 		}
 	}
 	return core.SSHFPResult{}, fmt.Errorf("SSHFP lookup %q failed: %w", name, errors.Join(errs...))
+}
+
+func deduplicateDNSServers(raw []string) []string {
+	if len(raw) <= 1 {
+		return raw
+	}
+	dedup := make([]string, 0, len(raw))
+	for _, srv := range raw {
+		if srv == "" || slices.Contains(dedup, srv) {
+			continue
+		}
+		dedup = append(dedup, srv)
+	}
+	return dedup
 }
 
 func isLoopbackDNSServer(server string) bool {
@@ -379,15 +394,8 @@ func parseSSHFPAnswers(resp []byte) ([]core.SSHFPRecord, error) {
 		if rrClass == dnsClassIN {
 			switch rrType {
 			case dnsTypeCNAME:
-				target, targetEnd, err := readCanonicalDNSName(resp[:off+rdLen], off)
-				if err != nil || targetEnd != off+rdLen {
-					return nil, errDNSMalformed
-				}
-				if cnames == nil {
-					cnames = make(map[string]string)
-				}
-				if _, exists := cnames[owner]; !exists {
-					cnames[owner] = target
+				if err := recordSSHFPCNAME(&cnames, owner, resp, off, rdLen); err != nil {
+					return nil, err
 				}
 			case dnsTypeSSHFP:
 				if rdLen >= 2 {
@@ -406,34 +414,58 @@ func parseSSHFPAnswers(resp []byte) ([]core.SSHFPRecord, error) {
 		off += rdLen
 	}
 
-	canonicalTarget := resolveCNAMEChainTarget(qname, cnames)
+	canonicalTarget, ok := resolveCNAMEChainTarget(qname, cnames)
+	if !ok {
+		return nil, errDNSMalformed
+	}
 	var records []core.SSHFPRecord
 	for _, c := range candidates {
-		if c.owner == qname || c.owner == canonicalTarget {
+		if c.owner == canonicalTarget {
 			records = append(records, c.record)
 		}
 	}
 	return records, nil
 }
 
-func resolveCNAMEChainTarget(qname string, cnames map[string]string) string {
+func recordSSHFPCNAME(cnames *map[string]string, owner string, resp []byte, off, rdLen int) error {
+	target, targetEnd, err := readCanonicalDNSName(resp[:off+rdLen], off)
+	if err != nil || targetEnd != off+rdLen {
+		return errDNSMalformed
+	}
+	if owner == target {
+		return nil
+	}
+	if *cnames == nil {
+		*cnames = make(map[string]string)
+	}
+	if existing, exists := (*cnames)[owner]; exists && existing != target {
+		return errDNSMalformed
+	}
+	(*cnames)[owner] = target
+	return nil
+}
+
+func resolveCNAMEChainTarget(qname string, cnames map[string]string) (string, bool) {
 	if len(cnames) == 0 {
-		return qname
+		return qname, true
 	}
 	canonicalTarget := qname
 	visited := map[string]struct{}{qname: {}}
 	for range dnsMaxCNAMEHops {
 		next, ok := cnames[canonicalTarget]
 		if !ok {
-			break
+			return canonicalTarget, true
 		}
 		if _, seen := visited[next]; seen {
-			break
+			return "", false
 		}
 		visited[next] = struct{}{}
 		canonicalTarget = next
 	}
-	return canonicalTarget
+	if _, hasMore := cnames[canonicalTarget]; hasMore {
+		return "", false
+	}
+	return canonicalTarget, true
 }
 
 // readCanonicalDNSName decompresses a DNS wire name at msg[off:] into canonical

@@ -33,8 +33,8 @@ func TestDiscoverEnvironmentContracts(t *testing.T) {
 	if env.LookupSSHFP == nil {
 		t.Fatal("expected Discover() to populate LookupSSHFP (only used when VerifyHostKeyDNS is enabled)")
 	}
-	if len(env.GlobalKnownHostsFiles) == 0 {
-		t.Fatal("expected Discover() to populate default GlobalKnownHostsFiles")
+	if runtime.GOOS != "windows" && len(env.GlobalKnownHostsFiles) == 0 {
+		t.Fatal("expected Discover() to populate default GlobalKnownHostsFiles on Unix")
 	}
 	if runtime.GOOS == "windows" {
 		if env.SuspendProcess != nil {
@@ -85,22 +85,42 @@ func TestDiscoverEnvironmentContracts(t *testing.T) {
 }
 
 func TestNormalizeWindowsAgentPipePath(t *testing.T) {
-	if _, ok := normalizeWindowsAgentPipePath(""); ok {
-		t.Fatal("expected empty socket not to match named pipe prefix directly")
+	for _, invalid := range []string{
+		"",
+		"   ",
+		`\\.\pipe\`,
+		`\\.\PIPE\`,
+		`\\?\pipe\`,
+		`\\.\pipe\\`,
+		`//./pipe/`,
+		`//?/PIPE/`,
+		`/tmp/ssh-agent.sock`,
+		`C:\Users\alice\agent.sock`,
+	} {
+		if got, ok := normalizeWindowsAgentPipePath(invalid); ok {
+			t.Fatalf("normalizeWindowsAgentPipePath(%q) = (%q, true), want false", invalid, got)
+		}
 	}
-	if _, ok := normalizeWindowsAgentPipePath(`\\.\pipe\`); ok {
-		t.Fatal("expected bare \\\\.\\pipe\\ without name to be rejected")
+
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{defaultWindowsOpenSSHAgentPipe, defaultWindowsOpenSSHAgentPipe},
+		{`  \\.\PIPE\openssh-ssh-agent  `, `\\.\pipe\openssh-ssh-agent`},
+		{`\\?\pipe\openssh-ssh-agent`, `\\.\pipe\openssh-ssh-agent`},
+		{`\\?\PIPE\openssh-ssh-agent`, `\\.\pipe\openssh-ssh-agent`},
+		{`//./pipe/custom-agent`, `\\.\pipe\custom-agent`},
+		{`//./PIPE/custom-agent`, `\\.\pipe\custom-agent`},
+		{`//?/pipe/custom-agent`, `\\.\pipe\custom-agent`},
+		{`\\.\pipe/sub/mixed-agent`, `\\.\pipe\sub\mixed-agent`},
+		{`\\?\PIPE/sub\mixed-agent`, `\\.\pipe\sub\mixed-agent`},
 	}
-	pipe, ok := normalizeWindowsAgentPipePath(defaultWindowsOpenSSHAgentPipe)
-	if !ok || pipe != defaultWindowsOpenSSHAgentPipe {
-		t.Fatalf("default pipe = (%q, %v), want (%q, true)", pipe, ok, defaultWindowsOpenSSHAgentPipe)
-	}
-	pipe, ok = normalizeWindowsAgentPipePath(`//./pipe/custom-agent`)
-	if !ok || pipe != `\\.\pipe\custom-agent` {
-		t.Fatalf("slash pipe = (%q, %v), want (\\\\.\\pipe\\custom-agent, true)", pipe, ok)
-	}
-	if _, ok := normalizeWindowsAgentPipePath(`/tmp/ssh-agent.sock`); ok {
-		t.Fatal("expected unix socket path not to match Windows named pipe prefix")
+	for _, tc := range cases {
+		pipe, ok := normalizeWindowsAgentPipePath(tc.in)
+		if !ok || pipe != tc.want {
+			t.Fatalf("normalizeWindowsAgentPipePath(%q) = (%q, %v), want (%q, true)", tc.in, pipe, ok, tc.want)
+		}
 	}
 }
 

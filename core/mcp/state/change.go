@@ -124,16 +124,16 @@ func calculateChange(old, next ports.OperationSnapshot) (Change, error) {
 }
 
 func authenticationChanged(old, next ssh.ConnectionPlan) bool {
-	previous := make(map[string]ssh.ConnectionConfig)
-	for _, hop := range old.Hops {
-		previous[hop.NodeID] = hop
+	if len(old.Hops) != len(next.Hops) {
+		return true
 	}
-	for _, hop := range next.Hops {
-		before, ok := previous[hop.NodeID]
-		if !ok {
-			continue
-		}
-		if before.AuthType != hop.AuthType ||
+	for i, hop := range next.Hops {
+		before := old.Hops[i]
+		if before.NodeID != hop.NodeID ||
+			before.User != hop.User ||
+			before.SudoMode != hop.SudoMode ||
+			before.OriginalHost != hop.OriginalHost ||
+			before.AuthType != hop.AuthType ||
 			before.AuthUpdateToken != hop.AuthUpdateToken ||
 			before.SudoUpdateToken != hop.SudoUpdateToken ||
 			before.KeyRef != hop.KeyRef ||
@@ -148,7 +148,9 @@ func authenticationChanged(old, next ssh.ConnectionPlan) bool {
 }
 
 func authOptionsEqual(a, b *ssh.Options) bool {
-	return a.FilterByClasses(ssh.OptionClassAuth).Equal(b.FilterByClasses(ssh.OptionClassAuth))
+	return a.FilterByClasses(ssh.OptionClassAuth, ssh.OptionClassTrust).Equal(
+		b.FilterByClasses(ssh.OptionClassAuth, ssh.OptionClassTrust),
+	)
 }
 
 func expandAffected(view ports.OperationSnapshot, set map[string]struct{}) {

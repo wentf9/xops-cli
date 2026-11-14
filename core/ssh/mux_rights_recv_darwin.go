@@ -25,7 +25,7 @@ func recvOneControlMsgCloexec(rawConn syscall.RawConn, data, oob []byte) ([]int,
 	readErr := rawConn.Read(func(fd uintptr) bool {
 		for {
 			syscall.ForkLock.RLock()
-			n, oobn, recvFlags, _, err := unix.Recvmsg(int(fd), data, oob, 0)
+			n, oobn, recvFlags, _, err := unix.Recvmsg(int(fd), data, oob, unix.MSG_DONTWAIT)
 			if err == nil {
 				flags = recvFlags
 				if n == 0 && oobn == 0 {
