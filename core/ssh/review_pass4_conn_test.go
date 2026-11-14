@@ -221,9 +221,8 @@ func assertAllPlainBeforeCertAlgorithms(t *testing.T, spec string, algs []string
 			seenCert = true
 			continue
 		}
-		// Appended "+ssh-rsa" comes at the tail of defaults; all base plain algorithms must precede certs.
-		if seenCert && alg != cryptoSSH.KeyAlgoRSA {
-			t.Fatalf("spec %q placed cert algorithm ahead of base plain algorithm %q: %v", spec, alg, algs)
+		if seenCert {
+			t.Fatalf("spec %q placed cert algorithm ahead of plain algorithm %q: %v", spec, alg, algs)
 		}
 	}
 }
@@ -462,12 +461,19 @@ func assertPass4PlanIPv6BracketParityAndRetirement(t *testing.T) {
 		t.Fatalf("Zone IPv6 ConnectionKey mismatch: %q (%v) vs %q (%v)", kZone1, err1, kZone2, err2)
 	}
 
-	// Empty "[]" address must fail closed in normalizePlan.
+	// Whitespace address must fail closed in normalizePlan, while literal "[]"
+	// is preserved verbatim by cleanHostLiteral rather than collapsing to "".
+	blankAddr := planBare
+	blankAddr.Hops = slices.Clone(planBare.Hops)
+	blankAddr.Hops[0].Address = "   "
+	if _, err := ConnectionKey(blankAddr); err == nil {
+		t.Fatal("expected ConnectionKey with whitespace Address to fail closed")
+	}
 	emptyBrackets := planBare
 	emptyBrackets.Hops = slices.Clone(planBare.Hops)
 	emptyBrackets.Hops[0].Address = "[]"
-	if _, err := ConnectionKey(emptyBrackets); err == nil {
-		t.Fatal("expected ConnectionKey with Address=\"[]\" to fail closed")
+	if kEmptyBrackets, err := ConnectionKey(emptyBrackets); err != nil || kEmptyBrackets == keyBare {
+		t.Fatalf("expected Address=\"[]\" to remain non-empty literal, got key=%q err=%v", kEmptyBrackets, err)
 	}
 
 	dialer := &dialCountingRedirectDialer{targetAddr: peer.Address}

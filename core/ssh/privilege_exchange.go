@@ -384,27 +384,21 @@ func (c *Client) runPrivilegeAttempt(ctx context.Context, mode SudoMode, command
 	if err != nil {
 		return err
 	}
-	releaseAgent := c.enableSessionAgentForward(ctx, session)
-	defer releaseAgent()
+	releaseAgent := func() {}
+	defer func() { releaseAgent() }()
 	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
 	untrackSession := c.trackActiveSession("client-session (privilege)")
 	defer untrackSession()
+	releaseAgent, err = c.enableSessionAgentForward(ctx, session)
+	if err != nil {
+		return err
+	}
 	if err := c.applySessionEnv(ctx, session); err != nil {
 		return err
 	}
 	exchange.session = session
-	if mode == SudoModeSu || terminal != nil {
-		width, height := 40, 80
-		ptyType := "xterm"
-		if terminal != nil {
-			width, height = terminal.width, terminal.height
-			ptyType = "xterm-256color"
-		}
-		if err := c.sessionRequest(ctx, session, "privilege pty", func() error {
-			return session.RequestPty(ptyType, height, width, cryptoSSH.TerminalModes{cryptoSSH.ECHO: 0})
-		}); err != nil {
-			return fmt.Errorf("request su terminal: %w", err)
-		}
+	if err := c.requestPrivilegeTerminalPty(ctx, session, mode, terminal); err != nil {
+		return err
 	}
 	pipe, err := session.StdinPipe()
 	if err != nil {
@@ -469,6 +463,24 @@ func (c *Client) runPrivilegeAttempt(ctx context.Context, mode SudoMode, command
 	_ = diagnostic.flush()
 	flushErr := exchange.writeErr
 	return exchange.finish(ctx, privilegeOutcome{waitErr: waitErr, inputErr: inputErr, closeErr: closeErr, flushErr: flushErr, outputFailed: out.failed || diagnostic.failed})
+}
+
+func (c *Client) requestPrivilegeTerminalPty(ctx context.Context, session *cryptoSSH.Session, mode SudoMode, terminal *privilegeTerminal) error {
+	if mode != SudoModeSu && terminal == nil {
+		return nil
+	}
+	width, height := 40, 80
+	ptyType := "xterm"
+	if terminal != nil {
+		width, height = terminal.width, terminal.height
+		ptyType = "xterm-256color"
+	}
+	if err := c.sessionRequest(ctx, session, "privilege pty", func() error {
+		return session.RequestPty(ptyType, height, width, cryptoSSH.TerminalModes{cryptoSSH.ECHO: 0})
+	}); err != nil {
+		return fmt.Errorf("request su terminal: %w", err)
+	}
+	return nil
 }
 
 func (e *privilegeExchange) waitSession(session *cryptoSSH.Session, out, diagnostic *privilegeFrameWriter) error {

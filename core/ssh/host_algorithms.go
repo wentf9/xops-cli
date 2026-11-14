@@ -55,11 +55,22 @@ func (c *Connector) getHostKeyAlgorithms(ctx context.Context, coordinator *hands
 	if rawSpec == "" {
 		return c.defaultKnownHostsHostKeyAlgorithms(cfg), nil
 	}
-	base := cryptoSSH.SupportedAlgorithms().HostKeys
 	if isRelativeAlgorithmSpec(rawSpec) {
-		base = c.defaultKnownHostsHostKeyAlgorithms(cfg)
+		pool, err := ResolveAlgorithmList(rawSpec, cryptoSSH.SupportedAlgorithms().HostKeys)
+		if err != nil {
+			return nil, fmt.Errorf("resolve HostKeyAlgorithms option: %w", err)
+		}
+		ordered := c.orderKnownHostsHostKeyAlgorithms(cfg, pool)
+		if strings.HasPrefix(rawSpec, "^") {
+			algos, err := ResolveAlgorithmList(rawSpec, ordered)
+			if err != nil {
+				return nil, fmt.Errorf("resolve HostKeyAlgorithms option: %w", err)
+			}
+			return algos, nil
+		}
+		return ordered, nil
 	}
-	algos, err := ResolveAlgorithmList(rawSpec, base)
+	algos, err := ResolveAlgorithmList(rawSpec, cryptoSSH.SupportedAlgorithms().HostKeys)
 	if err != nil {
 		return nil, fmt.Errorf("resolve HostKeyAlgorithms option: %w", err)
 	}
@@ -134,17 +145,22 @@ func intersectVerifierHostKeyAlgorithms(rawSpec string, verifierAlgos []string) 
 }
 
 // defaultKnownHostsHostKeyAlgorithms mirrors OpenSSH order_hostkeyalgs when no
-// custom HostKeyVerifier or explicit replacement HostKeyAlgorithms list is set:
-// the returned list is always built strictly from SupportedAlgorithms().HostKeys
-// (never nil, which would re-enable SHA-1/DSA defaults in x/crypto/ssh). When a
-// non-revoked @cert-authority in known_hosts matches the target host, modern
-// *-cert-v01@openssh.com algorithms come first, followed by any pinned plain key
-// types and remaining modern plain algorithms; otherwise plain algorithms (with
-// pinned types first) precede *-cert-v01@openssh.com.
+// custom HostKeyVerifier or HostKeyAlgorithms option is set: the returned list is
+// always built strictly from SupportedAlgorithms().HostKeys (never nil, which would
+// re-enable SHA-1/DSA defaults in x/crypto/ssh).
 func (c *Connector) defaultKnownHostsHostKeyAlgorithms(cfg *ClientConfig) []string {
-	supported := cryptoSSH.SupportedAlgorithms().HostKeys
+	return c.orderKnownHostsHostKeyAlgorithms(cfg, cryptoSSH.SupportedAlgorithms().HostKeys)
+}
+
+// orderKnownHostsHostKeyAlgorithms orders the candidate algorithm pool against
+// matching non-revoked entries in known_hosts (matching OpenSSH order_hostkeyalgs):
+// when an @cert-authority matches the target host, *-cert-v01@openssh.com
+// algorithms in pool come first followed by pinned plain key types and remaining
+// plain algorithms in pool; otherwise plain algorithms in pool (with pinned types
+// first) precede *-cert-v01@openssh.com algorithms.
+func (c *Connector) orderKnownHostsHostKeyAlgorithms(cfg *ClientConfig, pool []string) []string {
 	if cfg == nil || cleanHostLiteral(cfg.Address) == "" {
-		return slices.Clone(supported)
+		return slices.Clone(pool)
 	}
 	db := c.loadReadOnlyKnownHostsDB(cfg)
 	port := cfg.Port
@@ -157,14 +173,14 @@ func (c *Connector) defaultKnownHostsHostKeyAlgorithms(cfg *ClientConfig) []stri
 	}
 	hasCertAuthority, pinnedPlainTypes := db.matchingHostKeyTypes(targetAddr)
 
-	ordered := make([]string, 0, len(supported))
+	ordered := make([]string, 0, len(pool))
 	appendUnique := func(alg string) {
-		if slices.Contains(supported, alg) && !slices.Contains(ordered, alg) {
+		if slices.Contains(pool, alg) && !slices.Contains(ordered, alg) {
 			ordered = append(ordered, alg)
 		}
 	}
 	appendCerts := func() {
-		for _, alg := range supported {
+		for _, alg := range pool {
 			if strings.HasSuffix(alg, "-cert-v01@openssh.com") {
 				appendUnique(alg)
 			}
@@ -176,7 +192,7 @@ func (c *Connector) defaultKnownHostsHostKeyAlgorithms(cfg *ClientConfig) []stri
 				appendUnique(sigAlg)
 			}
 		}
-		for _, alg := range supported {
+		for _, alg := range pool {
 			if !strings.HasSuffix(alg, "-cert-v01@openssh.com") {
 				appendUnique(alg)
 			}
@@ -194,7 +210,7 @@ func (c *Connector) defaultKnownHostsHostKeyAlgorithms(cfg *ClientConfig) []stri
 
 func hostKeySigAlgsForKeyType(keyType string) []string {
 	if keyType == cryptoSSH.KeyAlgoRSA {
-		return []string{cryptoSSH.KeyAlgoRSASHA512, cryptoSSH.KeyAlgoRSASHA256}
+		return []string{cryptoSSH.KeyAlgoRSASHA512, cryptoSSH.KeyAlgoRSASHA256, cryptoSSH.KeyAlgoRSA}
 	}
 	return []string{keyType}
 }

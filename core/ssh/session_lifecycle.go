@@ -102,9 +102,13 @@ func (c *Client) runTerminalSession(ctx context.Context, payload string, streams
 	}
 	work, cancel := context.WithCancel(ctx)
 	defer cancel()
-	releaseAgent := c.enableSessionAgentForward(work, session)
-	defer releaseAgent()
+	releaseAgent := func() {}
+	defer func() { releaseAgent() }()
 	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
+	releaseAgent, err = c.enableSessionAgentForward(work, session)
+	if err != nil {
+		return err
+	}
 	request, name := func() error { return session.Start(payload) }, "exec"
 	if shellRequest {
 		request, name = session.Shell, "shell"

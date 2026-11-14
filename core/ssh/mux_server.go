@@ -1266,9 +1266,20 @@ type forwardListenKey struct {
 }
 
 type muxForwardEndpointState struct {
-	inFlight bool
-	done     chan struct{}
-	entry    *muxForwardEntry
+	inFlight      bool
+	done          chan struct{}
+	entry         *muxForwardEntry
+	fallbackEntry *muxForwardEntry
+}
+
+func (st *muxForwardEndpointState) cancelCandidateEntry() *muxForwardEntry {
+	if st == nil {
+		return nil
+	}
+	if st.inFlight {
+		return st.fallbackEntry
+	}
+	return st.entry
 }
 
 type muxEndpointAcquireOutcome uint8
@@ -1378,16 +1389,29 @@ func (s *MuxServer) acquireForwardEndpoint(
 	}
 }
 
+func (s *MuxServer) releaseInFlightEndpointSlotLocked(listenKey forwardListenKey, slot *muxForwardEndpointState) {
+	if slot == nil {
+		return
+	}
+	if s.listenEndpoints != nil && s.listenEndpoints[listenKey] == slot {
+		if slot.fallbackEntry != nil {
+			slot.entry = slot.fallbackEntry
+			slot.fallbackEntry = nil
+			slot.inFlight = false
+		} else {
+			delete(s.listenEndpoints, listenKey)
+		}
+	}
+	close(slot.done)
+	s.notifyIdleLocked()
+}
+
 func (s *MuxServer) abortReservedForward(listenKey forwardListenKey, slot *muxForwardEndpointState) {
 	if slot == nil {
 		return
 	}
 	s.idleMu.Lock()
-	if s.listenEndpoints != nil && s.listenEndpoints[listenKey] == slot {
-		delete(s.listenEndpoints, listenKey)
-	}
-	close(slot.done)
-	s.notifyIdleLocked()
+	s.releaseInFlightEndpointSlotLocked(listenKey, slot)
 	s.idleMu.Unlock()
 }
 
@@ -1397,18 +1421,28 @@ func (s *MuxServer) commitReservedForward(
 	key string,
 	cand *muxForwardEntry,
 ) (entry *muxForwardEntry, duplicate bool, shuttingDown bool) {
+	entry, duplicate, _, shuttingDown = s.commitReservedForwardSlot(listenKey, slot, key, cand)
+	return entry, duplicate, shuttingDown
+}
+
+func (s *MuxServer) commitReservedForwardSlot(
+	listenKey forwardListenKey,
+	slot *muxForwardEndpointState,
+	key string,
+	cand *muxForwardEntry,
+) (entry *muxForwardEntry, duplicate bool, conflict bool, shuttingDown bool) {
 	s.idleMu.Lock()
 	if s.shuttingDown || s.closed.Load() {
-		if slot != nil {
-			if s.listenEndpoints != nil && s.listenEndpoints[listenKey] == slot {
-				delete(s.listenEndpoints, listenKey)
-			}
-			close(slot.done)
-			s.notifyIdleLocked()
-		}
+		s.releaseInFlightEndpointSlotLocked(listenKey, slot)
 		s.idleMu.Unlock()
 		s.closeUnpublishedMuxForward(cand)
-		return nil, false, true
+		return nil, false, false, true
+	}
+	if slot != nil && slot.fallbackEntry != nil {
+		s.releaseInFlightEndpointSlotLocked(listenKey, slot)
+		s.idleMu.Unlock()
+		s.closeUnpublishedMuxForward(cand)
+		return nil, false, true, false
 	}
 	if cand.refs <= 0 {
 		cand.refs = 1
@@ -1435,7 +1469,7 @@ func (s *MuxServer) commitReservedForward(
 			}
 			s.idleMu.Unlock()
 			s.closeUnpublishedMuxForward(cand)
-			return existingEntry, true, false
+			return existingEntry, true, false, false
 		}
 	}
 	if slot != nil {
@@ -1446,7 +1480,7 @@ func (s *MuxServer) commitReservedForward(
 		close(slot.done)
 	}
 	s.idleMu.Unlock()
-	return cand, false, false
+	return cand, false, false, false
 }
 
 func (s *MuxServer) registerBoundMuxForward(
@@ -1457,7 +1491,7 @@ func (s *MuxServer) registerBoundMuxForward(
 	listenKey forwardListenKey,
 	reservedSlot *muxForwardEndpointState,
 	ln net.Listener,
-) (key string, entry *muxForwardEntry, allocatedPort uint32, dynamicAlloc, duplicate, shuttingDown bool) {
+) (key string, entry *muxForwardEntry, allocatedPort uint32, dynamicAlloc, duplicate, conflict, shuttingDown bool) {
 	keyPort := resolved.listenPort
 	if resolved.isDynamicPort {
 		allocatedPort = extractAllocatedPort(ln.Addr())
@@ -1480,18 +1514,28 @@ func (s *MuxServer) registerBoundMuxForward(
 		refs:         1,
 	}
 	if reservedSlot != nil {
-		entry, duplicate, shuttingDown = s.commitReservedForward(listenKey, reservedSlot, key, cand)
+		entry, duplicate, conflict, shuttingDown = s.commitReservedForwardSlot(listenKey, reservedSlot, key, cand)
 	} else {
 		entry, duplicate, shuttingDown = s.publishForward(resolved, allocatedPort, key, cand)
 	}
-	return key, entry, allocatedPort, dynamicAlloc, duplicate, shuttingDown
+	return key, entry, allocatedPort, dynamicAlloc, duplicate, conflict, shuttingDown
 }
 
 func (s *MuxServer) deleteEndpointEntryLocked(entry *muxForwardEntry) {
 	if entry == nil || !entry.hasListenKey || s.listenEndpoints == nil {
 		return
 	}
-	if cur, exists := s.listenEndpoints[entry.listenKey]; exists && !cur.inFlight && cur.entry == entry {
+	cur, exists := s.listenEndpoints[entry.listenKey]
+	if !exists || cur == nil {
+		return
+	}
+	if cur.inFlight {
+		if cur.fallbackEntry == entry {
+			cur.fallbackEntry = nil
+		}
+		return
+	}
+	if cur.entry == entry {
 		delete(s.listenEndpoints, entry.listenKey)
 	}
 }
@@ -1531,66 +1575,63 @@ func (s *MuxServer) handleOpenFwd(conn net.Conn, req MuxFwdRequest) error {
 
 	switch req.FwdType {
 	case MUX_FWD_LOCAL:
-		var ln net.Listener
-		if resolved.network == "unix" {
-			ln, err = listenLocalStreamLocal(s.baseContext(), resolved.listenAddr, s.streamLocalBindMask, s.streamLocalBindUnlink)
-		} else {
-			var lc net.ListenConfig
-			ln, err = lc.Listen(s.baseContext(), resolved.network, resolved.listenAddr)
-		}
-		if err != nil {
-			s.abortReservedForward(listenKey, reservedSlot)
-			return sendFailure(conn, req.RequestID, fmt.Sprintf("bind local port %s failed: %v", resolved.listenAddr, err))
-		}
-		key, entry, _, _, duplicate, shuttingDown := s.registerBoundMuxForward(
-			req.FwdType, resolved, normConnectHost, req.ConnectPort, listenKey, reservedSlot, ln,
-		)
-		if shuttingDown {
-			return sendFailure(conn, req.RequestID, "mux master is shutting down")
-		}
-		if duplicate {
-			return sendOk(conn, req.RequestID)
-		}
-		go func(k string, e *muxForwardEntry, l net.Listener) {
-			defer s.retireForward(k, e)
+		return s.openLocalOrDynamicForward(conn, req, resolved, normConnectHost, listenKey, reservedSlot, "local", func(l net.Listener) {
 			s.serveLocalForward(l, normConnectHost, req.ConnectPort)
-		}(key, entry, ln)
-		return sendOk(conn, req.RequestID)
+		})
 
 	case MUX_FWD_REMOTE:
 		return s.openRemoteForward(conn, req, resolved, normConnectHost, listenKey, reservedSlot)
 
 	case MUX_FWD_DYNAMIC:
-		var ln net.Listener
-		if resolved.network == "unix" {
-			ln, err = listenLocalStreamLocal(s.baseContext(), resolved.listenAddr, s.streamLocalBindMask, s.streamLocalBindUnlink)
-		} else {
-			var lc net.ListenConfig
-			ln, err = lc.Listen(s.baseContext(), resolved.network, resolved.listenAddr)
-		}
-		if err != nil {
-			s.abortReservedForward(listenKey, reservedSlot)
-			return sendFailure(conn, req.RequestID, fmt.Sprintf("bind dynamic port %s failed: %v", resolved.listenAddr, err))
-		}
-		key, entry, _, _, duplicate, shuttingDown := s.registerBoundMuxForward(
-			req.FwdType, resolved, normConnectHost, req.ConnectPort, listenKey, reservedSlot, ln,
-		)
-		if shuttingDown {
-			return sendFailure(conn, req.RequestID, "mux master is shutting down")
-		}
-		if duplicate {
-			return sendOk(conn, req.RequestID)
-		}
-		go func(k string, e *muxForwardEntry, l net.Listener) {
-			defer s.retireForward(k, e)
-			s.serveDynamicForward(l)
-		}(key, entry, ln)
-		return sendOk(conn, req.RequestID)
+		return s.openLocalOrDynamicForward(conn, req, resolved, normConnectHost, listenKey, reservedSlot, "dynamic", s.serveDynamicForward)
 
 	default:
 		s.abortReservedForward(listenKey, reservedSlot)
 		return sendFailure(conn, req.RequestID, fmt.Sprintf("unsupported forward type %d", req.FwdType))
 	}
+}
+
+func (s *MuxServer) openLocalOrDynamicForward(
+	conn net.Conn,
+	req MuxFwdRequest,
+	resolved resolvedMuxListen,
+	normConnectHost string,
+	listenKey forwardListenKey,
+	reservedSlot *muxForwardEndpointState,
+	kind string,
+	serve func(net.Listener),
+) error {
+	var (
+		ln  net.Listener
+		err error
+	)
+	if resolved.network == "unix" {
+		ln, err = listenLocalStreamLocal(s.baseContext(), resolved.listenAddr, s.streamLocalBindMask, s.streamLocalBindUnlink)
+	} else {
+		var lc net.ListenConfig
+		ln, err = lc.Listen(s.baseContext(), resolved.network, resolved.listenAddr)
+	}
+	if err != nil {
+		s.abortReservedForward(listenKey, reservedSlot)
+		return sendFailure(conn, req.RequestID, fmt.Sprintf("bind %s port %s failed: %v", kind, resolved.listenAddr, err))
+	}
+	key, entry, _, _, duplicate, conflict, shuttingDown := s.registerBoundMuxForward(
+		req.FwdType, resolved, normConnectHost, req.ConnectPort, listenKey, reservedSlot, ln,
+	)
+	if shuttingDown {
+		return sendFailure(conn, req.RequestID, "mux master is shutting down")
+	}
+	if conflict {
+		return sendFailure(conn, req.RequestID, "port forwarding conflict on listen endpoint")
+	}
+	if duplicate {
+		return sendOk(conn, req.RequestID)
+	}
+	go func(k string, e *muxForwardEntry, l net.Listener) {
+		defer s.retireForward(k, e)
+		serve(l)
+	}(key, entry, ln)
+	return sendOk(conn, req.RequestID)
 }
 
 func (s *MuxServer) openRemoteForward(
@@ -1606,11 +1647,14 @@ func (s *MuxServer) openRemoteForward(
 		s.abortReservedForward(listenKey, reservedSlot)
 		return sendFailure(conn, req.RequestID, fmt.Sprintf("remote listen %s failed: %v", resolved.listenAddr, err))
 	}
-	key, entry, allocatedPort, dynamicAlloc, duplicate, shuttingDown := s.registerBoundMuxForward(
+	key, entry, allocatedPort, dynamicAlloc, duplicate, conflict, shuttingDown := s.registerBoundMuxForward(
 		req.FwdType, resolved, normConnectHost, req.ConnectPort, listenKey, reservedSlot, ln,
 	)
 	if shuttingDown {
 		return sendFailure(conn, req.RequestID, "mux master is shutting down")
+	}
+	if conflict {
+		return sendFailure(conn, req.RequestID, "port forwarding conflict on listen endpoint")
 	}
 	if duplicate {
 		return sendOk(conn, req.RequestID)
@@ -1665,10 +1709,14 @@ func (s *MuxServer) publishForward(
 		if s.listenEndpoints == nil {
 			s.listenEndpoints = make(map[forwardListenKey]*muxForwardEndpointState)
 		}
-		if _, exists := s.listenEndpoints[dynKey]; !exists {
+		if cur, exists := s.listenEndpoints[dynKey]; !exists {
 			cand.listenKey = dynKey
 			cand.hasListenKey = true
 			s.listenEndpoints[dynKey] = &muxForwardEndpointState{entry: cand}
+		} else if cur.inFlight && cur.fallbackEntry == nil {
+			cand.listenKey = dynKey
+			cand.hasListenKey = true
+			cur.fallbackEntry = cand
 		}
 	}
 	s.idleMu.Unlock()
@@ -1890,12 +1938,12 @@ func (s *MuxServer) handleCloseFwd(conn net.Conn, req MuxFwdRequest) error {
 	val, ok := s.forwards.Load(matchedKey)
 	if !ok && !resolved.isDynamicPort {
 		if listenKey, hasListenKey := makeForwardListenKey(req.FwdType, resolved); hasListenKey && s.listenEndpoints != nil {
-			if cur := s.listenEndpoints[listenKey]; cur != nil && !cur.inFlight &&
-				matchesMuxForwardCancelTarget(cur.entry, req.FwdType, normConnectHost, req.ConnectPort) {
-				if cur.entry.forwardKey != "" {
-					matchedKey = cur.entry.forwardKey
+			candEntry := s.listenEndpoints[listenKey].cancelCandidateEntry()
+			if matchesMuxForwardCancelTarget(candEntry, req.FwdType, normConnectHost, req.ConnectPort) {
+				if candEntry.forwardKey != "" {
+					matchedKey = candEntry.forwardKey
 				}
-				val = cur.entry
+				val = candEntry
 				ok = true
 			}
 		}

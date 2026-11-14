@@ -343,16 +343,20 @@ func expandLocalExecTemplate(optionName, pattern string, env Environment, target
 	return expanded, nil
 }
 
-// cleanHostLiteral trims surrounding whitespace and strips a single balanced
-// outer "[...]" pair (matching OpenSSH cleanhostname for bracketed IPv6 literals
-// such as "[2001:db8::1]" or "[fe80::1%eth0]") without altering unbalanced brackets.
+// cleanHostLiteral trims surrounding whitespace and strips a single non-empty
+// outer "[...]" pair containing no internal '[' or ']' characters (matching
+// OpenSSH cleanhostname for bracketed IPv6 literals such as "[2001:db8::1]" or
+// "[fe80::1%eth0]") without altering nested, multi-segment, empty, or unbalanced brackets.
 func cleanHostLiteral(host string) string {
 	return stripEnclosingBrackets(strings.TrimSpace(host))
 }
 
 func stripEnclosingBrackets(val string) string {
-	if len(val) >= 2 && val[0] == '[' && val[len(val)-1] == ']' {
-		return val[1 : len(val)-1]
+	if len(val) > 2 && val[0] == '[' && val[len(val)-1] == ']' {
+		inner := val[1 : len(val)-1]
+		if !strings.ContainsAny(inner, "[]") && strings.TrimSpace(inner) == inner {
+			return inner
+		}
 	}
 	return val
 }

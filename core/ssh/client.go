@@ -522,16 +522,15 @@ func (c *Client) runRaw(ctx context.Context, wrappedCmd string, config *RunConfi
 	if err != nil {
 		return "", err
 	}
-	var releaseAgent func()
-	defer func() {
-		if releaseAgent != nil {
-			releaseAgent()
-		}
-	}()
+	releaseAgent := func() {}
+	defer func() { releaseAgent() }()
 	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
 
 	if sendSessionEnv {
-		releaseAgent = c.enableSessionAgentForward(ctx, session)
+		releaseAgent, err = c.enableSessionAgentForward(ctx, session)
+		if err != nil {
+			return "", err
+		}
 		if err := c.applySessionEnv(ctx, session); err != nil {
 			return "", err
 		}
@@ -559,10 +558,14 @@ func (c *Client) RunScript(ctx context.Context, scriptContent string, opts ...Ru
 	if err != nil {
 		return "", err
 	}
-	releaseAgent := c.enableSessionAgentForward(ctx, session)
-	defer releaseAgent()
+	releaseAgent := func() {}
+	defer func() { releaseAgent() }()
 	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
 
+	releaseAgent, err = c.enableSessionAgentForward(ctx, session)
+	if err != nil {
+		return "", err
+	}
 	if err := c.applySessionEnv(ctx, session); err != nil {
 		return "", err
 	}
@@ -636,9 +639,6 @@ func (c *Client) runStream(ctx context.Context, cmd string, sendSessionEnv bool)
 
 	derivedCtx, cancel := context.WithCancel(ctx)
 	releaseAgent := func() {}
-	if sendSessionEnv {
-		releaseAgent = c.enableSessionAgentForward(derivedCtx, session)
-	}
 	abortSetup := func(setupErr error) (io.ReadCloser, error) {
 		cancel()
 		closeErr := c.closeSessionBounded(session)
@@ -647,6 +647,10 @@ func (c *Client) runStream(ctx context.Context, cmd string, sendSessionEnv bool)
 	}
 
 	if sendSessionEnv {
+		releaseAgent, err = c.enableSessionAgentForward(derivedCtx, session)
+		if err != nil {
+			return abortSetup(err)
+		}
 		if err := c.applySessionEnv(ctx, session); err != nil {
 			return abortSetup(err)
 		}

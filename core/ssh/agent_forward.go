@@ -3,6 +3,7 @@ package ssh
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"slices"
@@ -623,21 +624,53 @@ func (c *Client) prepareChannelAgentForward(ctx context.Context) (wantAgent bool
 	})
 }
 
-func (c *Client) enableSessionAgentForward(ctx context.Context, session *cryptoSSH.Session) func() {
+func (c *Client) enableSessionAgentForward(ctx context.Context, session *cryptoSSH.Session) (func(), error) {
+	if ctx == nil {
+		return func() {}, fmt.Errorf("SSH %s request context is nil", agentForwardRequestType)
+	}
+	if err := ctx.Err(); err != nil {
+		return func() {}, fmt.Errorf("SSH %s request canceled: %w", agentForwardRequestType, err)
+	}
 	wantAgent, release := c.prepareChannelAgentForward(ctx)
 	if !wantAgent {
-		return func() {}
+		if err := ctx.Err(); err != nil {
+			return func() {}, fmt.Errorf("SSH %s request canceled: %w", agentForwardRequestType, err)
+		}
+		return func() {}, nil
 	}
+	if err := ctx.Err(); err != nil {
+		release()
+		return func() {}, fmt.Errorf("SSH %s request canceled: %w", agentForwardRequestType, err)
+	}
+	c.observeSession(logger.SessionRequest, 2, agentForwardRequestType, "sending")
+	work, cancel := withTimeoutOrDefault(ctx, c.handshakeTimeout, defaultSSHHandshakeTimeout)
+	defer cancel()
 	var accepted bool
-	err := c.sessionRequest(ctx, session, agentForwardRequestType, func() error {
+	done := make(chan error, 1)
+	go func() {
 		var reqErr error
 		accepted, reqErr = session.SendRequest(agentForwardRequestType, true, nil)
-		return reqErr
-	})
-	if err != nil || !accepted {
+		done <- reqErr
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			c.observeSession(logger.SessionRequest, 2, agentForwardRequestType, "failed or interrupted")
+			release()
+			return func() {}, fmt.Errorf("SSH %s request failed: %w", agentForwardRequestType, err)
+		}
+		if !accepted {
+			c.observeSession(logger.SessionRequest, 2, agentForwardRequestType, "rejected")
+			release()
+			c.getLogger().Debugf("SSH server rejected %s; continuing without agent forwarding", agentForwardRequestType)
+			return func() {}, nil
+		}
+		c.observeSession(logger.SessionRequest, 2, agentForwardRequestType, "accepted")
+		return release, nil
+	case <-work.Done():
+		cancelErr := c.closeCanceledSession(work, session, done)
+		c.observeSession(logger.SessionRequest, 2, agentForwardRequestType, "failed or interrupted")
 		release()
-		c.getLogger().Debugf("SSH server rejected or failed %s (accepted=%v, err=%v); continuing without agent forwarding", agentForwardRequestType, accepted, err)
-		return func() {}
+		return func() {}, fmt.Errorf("SSH %s request interrupted: %w", agentForwardRequestType, cancelErr)
 	}
-	return release
 }

@@ -460,22 +460,17 @@ func (o *ExecOptions) RunContext(ctx context.Context) (retErr error) {
 
 	// 应用 --exclude 排除规则
 	if len(o.Exclude) > 0 {
-		excludes, err := utils.ResolveExcludes(provider, utils.ParseExcludeFlag(o.Exclude))
+		candidates := make([]utils.ExcludeTargetInfo, 0, len(tasks))
+		for _, t := range tasks {
+			candidates = append(candidates, execTaskExcludeInfo(t))
+		}
+		excludes, err := utils.ResolveExcludesForTargets(provider, utils.ParseExcludeFlag(o.Exclude), candidates)
 		if err != nil {
 			return fmt.Errorf("%s: %w", i18n.T("exec_err_exclude"), err)
 		}
 		filtered := tasks[:0]
-		for _, t := range tasks {
-			info := utils.ExcludeTargetInfo{
-				NodeID:         t.nodeID,
-				MatchedNodeID:  t.matchedNodeID,
-				BaseNodeID:     t.baseNodeID,
-				OpenSSHAlias:   t.openSSHAlias,
-				User:           t.user,
-				Port:           t.port,
-				UnmanagedHosts: []string{t.rawHost, t.host, t.originalHost},
-			}
-			if !utils.IsTargetExcluded(excludes, info) {
+		for i, t := range tasks {
+			if !utils.IsTargetExcluded(excludes, candidates[i]) {
 				filtered = append(filtered, t)
 			}
 		}
@@ -1050,6 +1045,7 @@ func (o *ExecOptions) buildTasksFromTags(provider config.ConfigProvider) ([]exec
 		tasks = append(tasks, execHostTask{
 			nodeID:        nodeID,
 			matchedNodeID: nodeID,
+			baseNodeID:    nodeID,
 			host:          hostObj.Address,
 			port:          hostObj.Port,
 			user:          identity.User,
@@ -1061,10 +1057,24 @@ func (o *ExecOptions) buildTasksFromTags(provider config.ConfigProvider) ([]exec
 	return tasks, nil
 }
 
+func execTaskExcludeInfo(t execHostTask) utils.ExcludeTargetInfo {
+	return utils.ExcludeTargetInfo{
+		NodeID:         t.nodeID,
+		MatchedNodeID:  t.matchedNodeID,
+		BaseNodeID:     t.baseNodeID,
+		OpenSSHAlias:   t.openSSHAlias,
+		User:           t.user,
+		Port:           t.port,
+		UnmanagedHosts: []string{t.rawHost, t.host, t.originalHost},
+	}
+}
+
 func isResolvedSavedNode(r config.ResolvedTarget) bool {
-	return r.MatchedNodeID != "" &&
-		!strings.HasPrefix(r.MatchedNodeID, config.OpenSSHNodePrefix) &&
-		strings.TrimSpace(r.Host) != ""
+	if strings.TrimSpace(r.Host) == "" {
+		return false
+	}
+	return (r.MatchedNodeID != "" && !strings.HasPrefix(r.MatchedNodeID, config.OpenSSHNodePrefix)) ||
+		(r.BaseNodeID != "" && !strings.HasPrefix(r.BaseNodeID, config.OpenSSHNodePrefix))
 }
 
 func resolveTargetOriginalAndExpandHosts(canonicalized bool, canonOriginalHost, selector string, resolved config.ResolvedTarget, hasResolved bool) (originalHost, expandHost string) {

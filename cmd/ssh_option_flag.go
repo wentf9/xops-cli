@@ -24,6 +24,9 @@ const (
 	// sshMuxDaemonEnv marks the child that only serves a persistent control
 	// socket, keeping the master alive after the foreground session ended.
 	sshMuxDaemonEnv = "XOPS_CLI_SSH_MUX_DAEMON"
+	// sshMuxOriginalHostEnv carries the foreground master's OriginalHost into the
+	// detached ControlPersist daemon so %n and %C stay identical across handoff.
+	sshMuxOriginalHostEnv = "XOPS_MUX_ORIGINAL_HOST"
 )
 
 // Valid control commands for -O
@@ -275,6 +278,10 @@ func resolveEffectiveControlNodeID(provider config.ConfigProvider, nodeID, origi
 	if provider != nil {
 		if baseNode, ok := provider.GetNode(nodeID); ok && baseNode.OpenSSHAlias != "" {
 			setProviderOpenSSHAlias(provider, originalHost, baseNode.OpenSSHAlias)
+		} else if parser := providerOpenSSHParser(provider); parser != nil && !parser.HasHost(originalHost) {
+			if snap, err := provider.ResolveConnection(nodeID); err == nil && !strings.Contains(originalHost, "@") && snap.Host.Address != "" && !strings.EqualFold(snap.Host.Address, originalHost) {
+				setProviderOpenSSHAlias(provider, originalHost, snap.Host.Address)
+			}
 		}
 	}
 	return originalHost
@@ -343,6 +350,9 @@ func applyTargetControlNodeOverrides(opts *SshOptions, nodeID string, target *ss
 // address, port, user, and jump host; explicit CLI values still win, mirroring
 // Connector.buildTargetContext.
 func controlTarget(opts *SshOptions, provider config.ConfigProvider, nodeID string) ssh.TargetContext {
+	if opts != nil && provider != nil {
+		opts.syncResolvedTargetHosts(provider)
+	}
 	connTarget := effectiveConnectionTarget(opts, nodeID)
 	if strings.TrimSpace(connTarget.Selector) != "" {
 		effectiveProvider := provider
@@ -411,6 +421,8 @@ func targetContextFromResolvedTarget(resolved config.ResolvedTarget) ssh.TargetC
 	orig := resolved.NodeID
 	if cleanOrig, ok := config.OpenSSHOriginalHost(orig); ok {
 		orig = cleanOrig
+	} else if !isResolvedSavedNode(resolved) && resolved.OpenSSHAlias != "" {
+		orig = resolved.OpenSSHAlias
 	}
 	if orig == "" && resolved.Host != "" && user != "" && port > 0 {
 		orig = config.FormatNodeID(user, resolved.Host, uint16(port))
@@ -491,17 +503,14 @@ func applyHostNameOption(opts *SshOptions, key, val string) error {
 	if val == "" {
 		return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
 	}
-	opts.cliHostName = val
-	if orig := opts.originalHostForExpansion(); orig != "" {
-		expanded, expErr := ssh.ExpandHostName(val, orig)
-		if expErr != nil {
-			return expErr
-		}
-		opts.HostName = strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(expanded), "]"), "[")
-		return nil
-	}
 	if _, expErr := ssh.ExpandHostName(val, "host"); expErr != nil {
 		return expErr
+	}
+	opts.cliHostName = val
+	if orig := opts.originalHostForExpansion(); orig != "" {
+		if expanded, expErr := ssh.ExpandHostName(val, orig); expErr == nil {
+			opts.HostName = strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(expanded), "]"), "[")
+		}
 	}
 	return nil
 }

@@ -96,6 +96,16 @@ type openSSHParserSource interface {
 	GetOpenSSHParser() *OpenSSHParser
 }
 
+// HasOpenSSHConfig reports whether provider has an active loaded OpenSSH config
+// (false when provider is nil, -F none was specified, or ~/.ssh/config is absent).
+func HasOpenSSHConfig(provider ConfigProvider) bool {
+	if provider == nil {
+		return false
+	}
+	r, _ := resolveTargetHelper(provider)
+	return r != nil && r.provider != nil && r.provider.openSSH != nil && r.provider.openSSH.cfg != nil
+}
+
 type openSSHAliasStore interface {
 	SetNodeOpenSSHAlias(nodeID, alias string)
 	NodeOpenSSHAlias(nodeID string) string
@@ -982,6 +992,7 @@ func (r *Repository) consistentCandidateOpenSSHAlias(cfg *Configuration, candida
 }
 
 func (r *Repository) resolveConsistentCandidates(cfg *Configuration, selector string, candidates []string) (canonicalTargetInfo, error) {
+	var firstBaseID string
 	var firstAddr string
 	var firstPort uint16
 	var firstUser string
@@ -1005,6 +1016,7 @@ func (r *Repository) resolveConsistentCandidates(cfg *Configuration, selector st
 		clean := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(host.Address), "]"), "[")
 		port := normalizedHostPort(host.Port)
 		if !initialized {
+			firstBaseID = cid
 			firstAddr = clean
 			firstPort = port
 			firstUser = user
@@ -1024,7 +1036,11 @@ func (r *Repository) resolveConsistentCandidates(cfg *Configuration, selector st
 		if userConsistent {
 			defUser = firstUser
 		}
+		if firstBaseID == "" && len(candidates) > 0 {
+			firstBaseID = candidates[0]
+		}
 		return canonicalTargetInfo{
+			BaseNodeID:           firstBaseID,
 			Address:              firstAddr,
 			Port:                 firstPort,
 			DefaultUser:          defUser,
@@ -1037,6 +1053,7 @@ func (r *Repository) resolveConsistentCandidates(cfg *Configuration, selector st
 }
 
 func (r *Repository) resolveCandidateAddressFallback(cfg *Configuration, selector string, candidates []string, target ConnectionTarget) (canonicalTargetInfo, error) {
+	var firstBaseID string
 	var firstAddr string
 	var firstPort uint16
 	var firstUser string
@@ -1061,6 +1078,7 @@ func (r *Repository) resolveCandidateAddressFallback(cfg *Configuration, selecto
 		clean := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(host.Address), "]"), "[")
 		port := normalizedHostPort(host.Port)
 		if !initialized {
+			firstBaseID = cid
 			firstAddr = clean
 			firstPort = port
 			firstUser = user
@@ -1100,8 +1118,12 @@ func (r *Repository) resolveCandidateAddressFallback(cfg *Configuration, selecto
 	} else if userConsistent {
 		defUser = firstUser
 	}
+	if firstBaseID == "" && len(candidates) > 0 {
+		firstBaseID = candidates[0]
+	}
 
 	return canonicalTargetInfo{
+		BaseNodeID:           firstBaseID,
 		Address:              firstAddr,
 		Port:                 effectivePort,
 		DefaultUser:          defUser,

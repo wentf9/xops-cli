@@ -382,16 +382,15 @@ func (c *Client) runWithSudo(ctx context.Context, command string, password []byt
 	if err != nil {
 		return "", err
 	}
-	var releaseAgent func()
-	defer func() {
-		if releaseAgent != nil {
-			releaseAgent()
-		}
-	}()
+	releaseAgent := func() {}
+	defer func() { releaseAgent() }()
 	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
 
 	if sendSessionEnv {
-		releaseAgent = c.enableSessionAgentForward(ctx, session)
+		releaseAgent, err = c.enableSessionAgentForward(ctx, session)
+		if err != nil {
+			return "", err
+		}
 		if err := c.applySessionEnv(ctx, session); err != nil {
 			return "", err
 		}
@@ -883,12 +882,16 @@ func (c *Client) runSessionWithInput(ctx context.Context, request string, start 
 	}
 	work, cancel := context.WithCancel(ctx)
 	defer cancel()
-	releaseAgent := c.enableSessionAgentForward(work, session)
-	defer releaseAgent()
+	releaseAgent := func() {}
+	defer func() { releaseAgent() }()
 	defer func() { retErr = errors.Join(retErr, c.closeSessionBounded(session)) }()
 	untrackSession := c.trackActiveSession("client-session (" + request + ")")
 	defer untrackSession()
 
+	releaseAgent, err = c.enableSessionAgentForward(work, session)
+	if err != nil {
+		return err
+	}
 	if err := c.applySessionEnv(ctx, session); err != nil {
 		return err
 	}

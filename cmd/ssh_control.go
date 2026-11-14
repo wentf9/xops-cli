@@ -226,6 +226,16 @@ func resolveControlContext(ctx context.Context, o *SshOptions, stderr io.Writer)
 	if err := canonicalizeControlOptions(ctx, o, provider, stderr); err != nil {
 		return "", ssh.TargetContext{}, nil, "", err
 	}
+	if o != nil {
+		if provider != nil {
+			o.syncResolvedTargetHosts(provider)
+		}
+		if o.cliHostName != "" {
+			if _, err := o.effectiveHostName(); err != nil {
+				return "", ssh.TargetContext{}, nil, "", controlError(stderr, err.Error())
+			}
+		}
+	}
 	nodeID := ""
 	connTarget := effectiveConnectionTarget(o, "")
 	if provider != nil && strings.TrimSpace(connTarget.Selector) != "" {
@@ -653,6 +663,9 @@ func buildControlProxyClientConfig(
 		muxOpts  []ssh.MuxClientOption
 	)
 	if provider != nil {
+		if o != nil {
+			o.syncResolvedTargetHosts(provider)
+		}
 		snapshot = provider.Snapshot()
 		adp = adapter.NewSSHAdapter(provider, buildControlProxyAdapterOptions(snapshot, nodeID, o)...)
 		if nodeID != "" {

@@ -903,12 +903,21 @@ func (c *Connector) warnOrDebugf(warn bool, format string, args ...any) {
 	l.Debugf(format, args...)
 }
 
+func isMultiplexControlEnabled(target TargetContext) bool {
+	ctrl := target.Control
+	return ctrl != nil && ctrl.Path != "" && ctrl.Path != "none" && target.Host != ""
+}
+
+func isMasterListenerMode(mode ControlMasterMode) bool {
+	return mode == ControlMasterYes || mode == ControlMasterAuto || mode == ControlMasterAsk || mode == ControlMasterAutoAsk
+}
+
 func (c *Connector) tryConnectMultiplex(ctx context.Context, planNode connectionPlanNode) (*Client, error) {
 	target := c.buildTargetContext(planNode)
-	ctrl := target.Control
-	if ctrl == nil || ctrl.Path == "" || ctrl.Path == "none" {
+	if !isMultiplexControlEnabled(target) {
 		return nil, nil // Multiplexing disabled
 	}
+	ctrl := target.Control
 
 	explicitMaster := (ctrl.Master == ControlMasterYes || ctrl.Master == ControlMasterAsk) && !ctrl.AllowReuse
 
@@ -1146,11 +1155,11 @@ func (c *Connector) tryAttachReactivatedSocket(
 
 func (c *Connector) maybeStartMasterListener(planNode connectionPlanNode, rawClient *ssh.Client, rootConn net.Conn) {
 	target := c.buildTargetContext(planNode)
-	ctrl := target.Control
-	if ctrl == nil || ctrl.Path == "" || ctrl.Path == "none" {
+	if !isMultiplexControlEnabled(target) {
 		return
 	}
-	if ctrl.Master != ControlMasterYes && ctrl.Master != ControlMasterAuto && ctrl.Master != ControlMasterAsk && ctrl.Master != ControlMasterAutoAsk {
+	ctrl := target.Control
+	if !isMasterListenerMode(ctrl.Master) {
 		return
 	}
 

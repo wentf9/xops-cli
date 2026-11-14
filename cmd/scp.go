@@ -779,7 +779,7 @@ func (o *ScpOptions) runBatch(ctx context.Context, provider config.ConfigProvide
 	// 解析 --exclude 排除规则（在 Worker Pool 启动前完成，确保无歧义）
 	var excludes map[string]struct{}
 	if len(o.Exclude) > 0 {
-		resolved, err := cmdutils.ResolveExcludes(provider, cmdutils.ParseExcludeFlag(o.Exclude))
+		resolved, err := o.resolveExcludes(provider)
 		if err != nil {
 			return fmt.Errorf("%s: %w", i18n.T("scp_err_exclude"), err)
 		}
@@ -866,15 +866,26 @@ func (o *ScpOptions) isBatchHostExcluded(provider config.ConfigProvider, exclude
 	if len(excludes) == 0 {
 		return false, nil
 	}
+	info, err := o.excludeTargetInfoForPath(provider, rawHost, canonAddr)
+	if err != nil {
+		return false, err
+	}
+	return cmdutils.IsTargetExcluded(excludes, info), nil
+}
+
+func (o *ScpOptions) excludeTargetInfoForPath(provider config.ConfigProvider, rawHost string, canonAddr PathInfo) (cmdutils.ExcludeTargetInfo, error) {
 	info := cmdutils.ExcludeTargetInfo{
 		User:           canonAddr.User,
 		Port:           canonAddr.Port,
 		UnmanagedHosts: []string{rawHost, canonAddr.Host, canonAddr.OriginalHost},
 	}
+	if provider == nil {
+		return info, nil
+	}
 	if target, tErr := o.resolveTargetForPath(canonAddr); tErr == nil && target.Selector != "" {
 		resolved, rErr := config.ResolveTarget(provider, target)
 		if rErr != nil {
-			return false, fmt.Errorf("resolve excluded host %q: %w", canonAddr.Host, rErr)
+			return info, fmt.Errorf("resolve excluded host %q: %w", canonAddr.Host, rErr)
 		}
 		info.NodeID = resolved.NodeID
 		info.MatchedNodeID = resolved.MatchedNodeID
@@ -886,16 +897,16 @@ func (o *ScpOptions) isBatchHostExcluded(provider config.ConfigProvider, exclude
 		if resolved.Port > 0 {
 			info.Port = resolved.Port
 		}
-		return cmdutils.IsTargetExcluded(excludes, info), nil
+		return info, nil
 	}
 	nid, resolveErr := provider.ResolveSelector(canonAddr.Host)
 	if resolveErr != nil {
-		return false, fmt.Errorf("resolve excluded host %q: %w", canonAddr.Host, resolveErr)
+		return info, fmt.Errorf("resolve excluded host %q: %w", canonAddr.Host, resolveErr)
 	}
 	if nid != "" {
 		info.NodeID = nid
 	}
-	return cmdutils.IsTargetExcluded(excludes, info), nil
+	return info, nil
 }
 
 func (o *ScpOptions) executeTransfer(ctx context.Context, label string, addr PathInfo, specificPassword string, provider config.ConfigProvider, connector *ssh.Connector) (err error) {
@@ -1071,9 +1082,7 @@ func (o *ScpOptions) canonicalizePathInfo(ctx context.Context, provider config.C
 	var matchedSavedNode bool
 	if target, tErr := o.resolveTargetForPath(p); tErr == nil {
 		if resolved, rErr := config.ResolveTarget(provider, target); rErr == nil {
-			matchedSavedNode = resolved.MatchedNodeID != "" &&
-				!strings.HasPrefix(resolved.MatchedNodeID, config.OpenSSHNodePrefix) &&
-				strings.TrimSpace(resolved.Host) != ""
+			matchedSavedNode = isResolvedSavedNode(resolved)
 		}
 	}
 	res, cErr := config.CanonicalizeHost(ctx, config.CanonicalizeInput{
@@ -1402,6 +1411,11 @@ func (o *ScpOptions) appendScpSessionControlOptions(adpOpts *[]adapter.Option, t
 }
 
 func (o *ScpOptions) appendScpSessionAuthOverrides(adpOpts *[]adapter.Option, provider config.ConfigProvider, shouldRemember, suppressConfirm bool) error {
+	if provider != nil && len(o.Exclude) > 0 && (o.Host != "" || o.Tag != "" || o.HostFile != "") {
+		if _, err := o.resolveExcludes(provider); err != nil {
+			return fmt.Errorf("%s: %w", i18n.T("scp_err_exclude"), err)
+		}
+	}
 	targetNodes, nodeOriginalHosts, expandHosts := o.resolvedTargetNodeIDsWithHosts(provider)
 	o.targetNodeIDs = targetNodes
 	distinctHosts := o.distinctRemoteHosts(provider)
@@ -1636,10 +1650,77 @@ func (o *ScpOptions) collectHostTargetPaths(provider config.ConfigProvider, excl
 	return paths
 }
 
+func (o *ScpOptions) resolveExcludes(provider config.ConfigProvider) (map[string]struct{}, error) {
+	if len(o.Exclude) == 0 {
+		return nil, nil
+	}
+	candidates := o.buildExcludeCandidates(provider)
+	return cmdutils.ResolveExcludesForTargets(provider, cmdutils.ParseExcludeFlag(o.Exclude), candidates)
+}
+
+func (o *ScpOptions) buildExcludeCandidates(provider config.ConfigProvider) []cmdutils.ExcludeTargetInfo {
+	var candidates []cmdutils.ExcludeTargetInfo
+	if o.Tag != "" && provider != nil {
+		for nodeID := range provider.GetNodesByTag(o.Tag) {
+			info := cmdutils.ExcludeTargetInfo{
+				NodeID:        nodeID,
+				MatchedNodeID: nodeID,
+				BaseNodeID:    nodeID,
+			}
+			if _, hostObj, identity, err := provider.Resolve(nodeID); err == nil {
+				info.User = identity.User
+				info.Port = hostObj.Port
+				info.UnmanagedHosts = []string{hostObj.Address}
+			}
+			candidates = append(candidates, info)
+		}
+	}
+	if o.Host == "" && o.HostFile == "" {
+		return candidates
+	}
+	appendCandidate := func(p PathInfo) {
+		if p.Host == "" {
+			return
+		}
+		if p.User == "" {
+			p.User = o.User
+		}
+		if p.Port == 0 {
+			p.Port = o.Port
+		}
+		rawHost := p.Host
+		canonP := p
+		o.canonicalMu.Lock()
+		res, ok := o.canonicalCache[o.canonicalCacheKey(p)]
+		o.canonicalMu.Unlock()
+		if ok && res.Canonicalized {
+			if canonP.OriginalHost == "" {
+				canonP.OriginalHost = res.OriginalHost
+			}
+			canonP.Host = res.CanonicalHost
+		}
+		if info, err := o.excludeTargetInfoForPath(provider, rawHost, canonP); err == nil {
+			candidates = append(candidates, info)
+		}
+	}
+	if hosts, err := cmdutils.ParseHosts(o.Host, o.HostFile, ""); err == nil {
+		for _, h := range hosts {
+			appendCandidate(PathInfo{Host: h.Host, User: h.User, Port: h.Port, IsRemote: true})
+		}
+		return candidates
+	}
+	if o.Host != "" {
+		for h := range strings.SplitSeq(o.Host, ",") {
+			appendCandidate(PathInfo{Host: strings.TrimSpace(h), IsRemote: true})
+		}
+	}
+	return candidates
+}
+
 func (o *ScpOptions) collectTargetPaths(provider config.ConfigProvider) []PathInfo {
 	var excludes map[string]struct{}
 	if provider != nil && len(o.Exclude) > 0 {
-		if resolved, err := cmdutils.ResolveExcludes(provider, cmdutils.ParseExcludeFlag(o.Exclude)); err == nil {
+		if resolved, err := o.resolveExcludes(provider); err == nil {
 			excludes = resolved
 		}
 	}
