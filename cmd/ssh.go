@@ -1089,7 +1089,7 @@ func (o *SshOptions) handoffPersistentMaster(ctx context.Context, connector *ssh
 	if err == nil && expandedPath != "" {
 		master = ssh.GetActiveMuxServer(expandedPath)
 	}
-	if master == nil && connector != nil {
+	if isMasterClosed(master) && connector != nil {
 		master = findOwnedMasterForNode(connector, nodeID)
 	}
 	if !canHandoffMaster(master) {
@@ -1097,7 +1097,23 @@ func (o *SshOptions) handoffPersistentMaster(ctx context.Context, connector *ssh
 	}
 	handoffNodeID := resolvePersistentHandoffNodeID(provider, connector, master, nodeID)
 	o.recordTargetHandoffNodeID(nodeID, handoffNodeID)
-	return o.handoffMasterInstance(ctx, connector, master, handoffNodeID)
+	return o.handoffMasterInstanceWithProvider(ctx, provider, connector, master, handoffNodeID)
+}
+
+func isMasterClosed(m *ssh.MuxServer) bool {
+	if m == nil {
+		return true
+	}
+	select {
+	case <-m.Wait():
+		return true
+	default:
+		return false
+	}
+}
+
+func isMasterDeadOrStopped(m *ssh.MuxServer) bool {
+	return m == nil || m.StoppedListening() || isMasterClosed(m)
 }
 
 func findOwnedMasterForNode(connector *ssh.Connector, nodeID string) *ssh.MuxServer {
@@ -1106,15 +1122,17 @@ func findOwnedMasterForNode(connector *ssh.Connector, nodeID string) *ssh.MuxSer
 	}
 	masters := connector.Masters()
 	if nodeID != "" {
-		for _, m := range masters {
-			if m != nil && strings.TrimSpace(connector.MasterNodeID(m)) == nodeID {
+		for i := len(masters) - 1; i >= 0; i-- {
+			m := masters[i]
+			if !isMasterClosed(m) && strings.TrimSpace(connector.MasterNodeID(m)) == nodeID {
 				return m
 			}
 		}
 	}
 	cleanNodeID, _ := config.OpenSSHOriginalHost(nodeID)
-	for _, m := range masters {
-		if m == nil {
+	for i := len(masters) - 1; i >= 0; i-- {
+		m := masters[i]
+		if isMasterClosed(m) {
 			continue
 		}
 		orig := m.Target().OriginalHost
@@ -1187,7 +1205,7 @@ func (o *SshOptions) handoffConnectorMasters(ctx context.Context, provider confi
 		logger.DefaultLogger().Debugf("mux: skipping master handoff because a one-time password was used")
 		return nil
 	}
-	jumps := persistentJumpHops(masters)
+	jumps := persistentJumpHopsWithProvider(connector, provider, masters)
 	var firstErr error
 	for _, m := range masters {
 		if !canHandoffMaster(m) {
@@ -1205,25 +1223,50 @@ func (o *SshOptions) handoffConnectorMasters(ctx context.Context, provider confi
 			logger.DefaultLogger().Debugf("mux: skipping master handoff because ProxyCommand is active")
 			continue
 		}
-		if err := o.handoffMasterInstance(ctx, connector, m, nodeID); err != nil && firstErr == nil {
+		if err := o.handoffMasterInstanceWithProvider(ctx, provider, connector, m, nodeID); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
 	return firstErr
 }
 
+func parseJumpHopSpec(spec string) (user, host string, port uint16, hasExplicit bool) {
+	trimmed := strings.TrimSpace(spec)
+	if trimmed == "" {
+		return "", "", 0, false
+	}
+	unwrapped := strings.TrimPrefix(trimmed, config.OpenSSHNodePrefix)
+	u, h, p, err := utils.ParseAddr(unwrapped)
+	if err != nil {
+		clean, _ := config.OpenSSHOriginalHost(trimmed)
+		return "", clean, 0, false
+	}
+	return u, h, p, u != "" || p != 0
+}
+
 func isSuppressedJumpMaster(jumps map[string]bool, rawOwnedID, resolvedNodeID string) bool {
 	if len(jumps) == 0 {
 		return false
 	}
-	for _, candidate := range []string{resolvedNodeID, rawOwnedID} {
-		if candidate == "" {
-			continue
-		}
-		if jumps[candidate] {
+	_, _, _, rawExplicit := parseJumpHopSpec(rawOwnedID)
+	if rawOwnedID != "" {
+		if jumps[rawOwnedID] {
 			return true
 		}
-		if clean, ok := config.OpenSSHOriginalHost(candidate); ok && (jumps[clean] || jumps[config.OpenSSHNodePrefix+clean]) {
+		if !rawExplicit {
+			if clean, ok := config.OpenSSHOriginalHost(rawOwnedID); ok && (jumps[clean] || jumps[config.OpenSSHNodePrefix+clean]) {
+				return true
+			}
+		}
+	}
+	if resolvedNodeID == "" || (strings.HasPrefix(rawOwnedID, config.OpenSSHNodePrefix) && rawExplicit) {
+		return false
+	}
+	if jumps[resolvedNodeID] {
+		return true
+	}
+	if _, _, _, resExplicit := parseJumpHopSpec(resolvedNodeID); !resExplicit {
+		if clean, ok := config.OpenSSHOriginalHost(resolvedNodeID); ok && (jumps[clean] || jumps[config.OpenSSHNodePrefix+clean]) {
 			return true
 		}
 	}
@@ -1380,29 +1423,106 @@ func cleanMuxHost(h string) string {
 	return strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(h), "]"), "[")
 }
 
-func persistentJumpHops(masters []*ssh.MuxServer) map[string]bool {
-	jumps := make(map[string]bool, len(masters))
-	for _, m := range masters {
-		if !canHandoffMaster(m) {
+func resolveJumpHopConnection(provider config.ConfigProvider, hop string, hasExplicit bool) (config.ConnectionSnapshot, bool) {
+	if provider == nil || hop == "" {
+		return config.ConnectionSnapshot{}, false
+	}
+	unwrapped := strings.TrimPrefix(hop, config.OpenSSHNodePrefix)
+	candidates := []string{hop, config.OpenSSHNodePrefix + unwrapped}
+	if !hasExplicit {
+		if cleanHop, ok := config.OpenSSHOriginalHost(hop); ok && cleanHop != "" {
+			candidates = append(candidates, cleanHop)
+		}
+		if selID, err := provider.ResolveSelector(unwrapped); err == nil && selID != "" {
+			candidates = append(candidates, selID)
+		}
+	}
+	for _, cand := range candidates {
+		if cand == "" {
 			continue
 		}
-		if j := m.Target().JumpHost; j != "" {
-			for hop := range strings.SplitSeq(j, ",") {
-				hop = strings.TrimSpace(hop)
-				if hop != "" {
-					jumps[hop] = true
-					if cleanHop, ok := config.OpenSSHOriginalHost(hop); ok {
-						jumps[cleanHop] = true
-						jumps[config.OpenSSHNodePrefix+cleanHop] = true
-					}
-				}
-			}
+		if snap, err := provider.ResolveConnection(cand); err == nil {
+			return snap, true
 		}
+	}
+	return config.ConnectionSnapshot{}, false
+}
+
+func addPersistentJumpHopKeys(jumps map[string]bool, hop string, hasExplicit bool) {
+	jumps[hop] = true
+	unwrapped := strings.TrimPrefix(hop, config.OpenSSHNodePrefix)
+	if unwrapped != "" {
+		jumps[unwrapped] = true
+		jumps[config.OpenSSHNodePrefix+unwrapped] = true
+	}
+	if !hasExplicit {
+		if cleanHop, ok := config.OpenSSHOriginalHost(hop); ok && cleanHop != "" {
+			jumps[cleanHop] = true
+			jumps[config.OpenSSHNodePrefix+cleanHop] = true
+		}
+	}
+}
+
+func persistentJumpHops(masters []*ssh.MuxServer) map[string]bool {
+	return persistentJumpHopsWithProvider(nil, nil, masters)
+}
+
+func persistentJumpHopsWithProvider(connector *ssh.Connector, provider config.ConfigProvider, masters []*ssh.MuxServer) map[string]bool {
+	jumps := make(map[string]bool, len(masters))
+	for _, m := range masters {
+		if !canHandoffMaster(m) || m.Target().JumpHost == "" {
+			continue
+		}
+		collectPersistentJumpHopsForTarget(jumps, connector, provider, m, masters)
 	}
 	return jumps
 }
 
+func collectPersistentJumpHopsForTarget(
+	jumps map[string]bool,
+	connector *ssh.Connector,
+	provider config.ConfigProvider,
+	targetMaster *ssh.MuxServer,
+	masters []*ssh.MuxServer,
+) {
+	byHost := indexJumpChainMasters(connector, targetMaster, masters)
+	visitedHops := make(map[string]bool)
+	queue := []string{targetMaster.Target().JumpHost}
+	for len(queue) > 0 {
+		raw := queue[0]
+		queue = queue[1:]
+		for hop := range strings.SplitSeq(raw, ",") {
+			hop = strings.TrimSpace(hop)
+			if hop == "" || visitedHops[hop] {
+				continue
+			}
+			visitedHops[hop] = true
+			_, _, _, hasExplicit := parseJumpHopSpec(hop)
+			addPersistentJumpHopKeys(jumps, hop, hasExplicit)
+			hopMaster, nextJump := lookupJumpHopMaster(connector, byHost, provider, hop, hasExplicit)
+			if hopMaster != nil && connector != nil {
+				if ownedID := strings.TrimSpace(connector.MasterNodeID(hopMaster)); ownedID != "" {
+					jumps[ownedID] = true
+				}
+			}
+			if nextJump != "" {
+				queue = append(queue, nextJump)
+			}
+		}
+	}
+}
+
 func (o *SshOptions) handoffMasterInstance(ctx context.Context, connector *ssh.Connector, master *ssh.MuxServer, nodeID string) error {
+	return o.handoffMasterInstanceWithProvider(ctx, nil, connector, master, nodeID)
+}
+
+func (o *SshOptions) handoffMasterInstanceWithProvider(
+	ctx context.Context,
+	provider config.ConfigProvider,
+	connector *ssh.Connector,
+	master *ssh.MuxServer,
+	nodeID string,
+) error {
 	if master == nil || !master.PersistEnabled() {
 		return nil
 	}
@@ -1421,7 +1541,7 @@ func (o *SshOptions) handoffMasterInstance(ctx context.Context, connector *ssh.C
 	if expandedPath == "" {
 		return nil
 	}
-	ready, err := waitAndReleaseMastersForHandoff(ctx, connector, master, expandedPath)
+	ready, err := waitAndReleaseMastersForHandoffWithProvider(ctx, connector, provider, master, expandedPath)
 	if err != nil || !ready {
 		return err
 	}
@@ -1476,22 +1596,34 @@ func (o *SshOptions) handoffMasterInstance(ctx context.Context, connector *ssh.C
 	return nil
 }
 
-func waitAndReleaseMastersForHandoff(ctx context.Context, connector *ssh.Connector, master *ssh.MuxServer, expandedPath string) (bool, error) {
+func waitAndReleaseMastersForHandoffWithProvider(
+	ctx context.Context,
+	connector *ssh.Connector,
+	provider config.ConfigProvider,
+	master *ssh.MuxServer,
+	expandedPath string,
+) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	for {
+		if isMasterDeadOrStopped(master) {
+			return false, nil
+		}
 		if err := drainOwnedMasters(ctx, connector); err != nil {
 			return false, nil
 		}
-		if master.StoppedListening() {
+		if isMasterDeadOrStopped(master) {
 			return false, nil
 		}
-		ready, err := releaseMastersForHandoff(connector, master, expandedPath)
+		ready, terminalAbort, err := releaseMastersForHandoffWithProvider(connector, provider, master, expandedPath)
 		if err != nil {
 			return false, err
 		}
 		if ready {
 			return true, nil
 		}
-		if connector == nil || master.StoppedListening() {
+		if terminalAbort || connector == nil || isMasterDeadOrStopped(master) {
 			return false, nil
 		}
 		select {
@@ -1499,7 +1631,7 @@ func waitAndReleaseMastersForHandoff(ctx context.Context, connector *ssh.Connect
 			return false, nil
 		case <-master.Wait():
 			return false, nil
-		default:
+		case <-time.After(10 * time.Millisecond):
 		}
 	}
 }
@@ -1559,8 +1691,8 @@ func (o *SshOptions) muxDaemonArgs(nodeID string, expandedPath string, master *s
 	args = append(args, "--remember", "never")
 	if o.shouldPassIdentityFile(nodeID, master) {
 		args = o.appendMuxDaemonForwardedOptions(args, master)
-	} else if o.control.ConfigFile != "" {
-		args = append(args, "-F", o.control.ConfigFile)
+	} else {
+		args = o.appendMuxDaemonJumpOptions(args)
 	}
 	args = appendMuxDaemonHostNameOption(args, targetHost, master)
 	masterMode := ssh.ControlMasterYes
@@ -1591,6 +1723,44 @@ func appendMuxDaemonHostNameOption(args []string, targetHost string, master *ssh
 	dialHost := cleanMuxHost(master.Target().Host)
 	if dialHost != "" && dialHost != cleanMuxHost(targetHost) {
 		args = append(args, "-o", "HostName="+strings.ReplaceAll(dialHost, "%", "%%"))
+	}
+	return args
+}
+
+func isConnectionWideMuxDaemonOption(opt string) bool {
+	key, _, err := adapter.SplitOptionKeyValue(opt)
+	if err != nil || key == "" {
+		return false
+	}
+	spec, ok := ssh.LookupOptionSpec(key)
+	if !ok {
+		return false
+	}
+	if spec.Class == ssh.OptionClassTrust {
+		return true
+	}
+	switch spec.CanonicalKey {
+	case ssh.OptionAddressFamily, ssh.OptionBatchMode, ssh.OptionConnectTimeout, ssh.OptionIdentityAgent:
+		return true
+	default:
+		return false
+	}
+}
+
+func (o *SshOptions) appendMuxDaemonJumpOptions(args []string) []string {
+	if o.control.ConfigFile != "" {
+		args = append(args, "-F", o.control.ConfigFile)
+	}
+	switch o.control.AddressFamily {
+	case "inet":
+		args = append(args, "-4")
+	case "inet6":
+		args = append(args, "-6")
+	}
+	for _, opt := range o.control.Options {
+		if isConnectionWideMuxDaemonOption(opt) {
+			args = append(args, "-o", opt)
+		}
 	}
 	return args
 }
@@ -1833,37 +2003,92 @@ func (o *SshOptions) resolveMuxDaemonTarget(nodeID string, master *ssh.MuxServer
 // transitive ProxyJump chain so multi-host handoffs never shut down unrelated
 // target masters.
 func jumpChainMasters(connector *ssh.Connector, targetMaster *ssh.MuxServer, ownedMasters []*ssh.MuxServer) []*ssh.MuxServer {
+	return jumpChainMastersWithProvider(connector, nil, targetMaster, ownedMasters)
+}
+
+func jumpChainMastersWithProvider(
+	connector *ssh.Connector,
+	provider config.ConfigProvider,
+	targetMaster *ssh.MuxServer,
+	ownedMasters []*ssh.MuxServer,
+) []*ssh.MuxServer {
 	if targetMaster == nil || len(ownedMasters) == 0 {
 		return nil
 	}
 	byHost := indexJumpChainMasters(connector, targetMaster, ownedMasters)
 	var chain []*ssh.MuxServer
 	seen := make(map[*ssh.MuxServer]bool)
+	visitedHops := make(map[string]bool)
 	queue := []string{targetMaster.Target().JumpHost}
 	for len(queue) > 0 {
 		raw := queue[0]
 		queue = queue[1:]
 		for hop := range strings.SplitSeq(raw, ",") {
 			hop = strings.TrimSpace(hop)
-			if hop == "" {
+			if hop == "" || visitedHops[hop] {
 				continue
 			}
-			hopMaster, ok := byHost[hop]
-			if !ok {
-				if cleanHop, isOpenSSH := config.OpenSSHOriginalHost(hop); isOpenSSH {
-					hopMaster, ok = byHost[cleanHop]
-				}
-			}
-			if ok && !seen[hopMaster] {
+			visitedHops[hop] = true
+			_, _, _, hasExplicit := parseJumpHopSpec(hop)
+			hopMaster, nextJump := lookupJumpHopMaster(connector, byHost, provider, hop, hasExplicit)
+			if hopMaster != nil && !seen[hopMaster] {
 				seen[hopMaster] = true
 				chain = append(chain, hopMaster)
-				if next := hopMaster.Target().JumpHost; next != "" {
-					queue = append(queue, next)
-				}
+			}
+			if nextJump != "" {
+				queue = append(queue, nextJump)
 			}
 		}
 	}
 	return chain
+}
+
+func lookupJumpHopMaster(
+	connector *ssh.Connector,
+	byHost map[string]*ssh.MuxServer,
+	provider config.ConfigProvider,
+	hop string,
+	hasExplicit bool,
+) (*ssh.MuxServer, string) {
+	unwrapped := strings.TrimPrefix(hop, config.OpenSSHNodePrefix)
+	candidates := []string{hop, unwrapped, config.OpenSSHNodePrefix + unwrapped}
+	if !hasExplicit {
+		if cleanHop, isOpenSSH := config.OpenSSHOriginalHost(hop); isOpenSSH && cleanHop != "" {
+			candidates = append(candidates, cleanHop, config.OpenSSHNodePrefix+cleanHop)
+		}
+	}
+	for _, cand := range candidates {
+		if cand == "" {
+			continue
+		}
+		if hopMaster, ok := byHost[cand]; ok && hopMaster != nil {
+			return hopMaster, strings.TrimSpace(hopMaster.Target().JumpHost)
+		}
+	}
+	snap, resolved := resolveJumpHopConnection(provider, hop, hasExplicit)
+	if !resolved {
+		return nil, ""
+	}
+	if snap.Node.SSHOptions != nil && strings.EqualFold(snap.Node.SSHOptions.Get(ssh.OptionControlMaster), "no") {
+		return nil, strings.TrimSpace(snap.Node.ProxyJump)
+	}
+	if snap.Identity.User != "" && snap.Host.Address != "" && snap.Host.Port > 0 {
+		compKey := config.FormatNodeID(snap.Identity.User, cleanMuxHost(snap.Host.Address), snap.Host.Port)
+		if hopMaster, ok := byHost[compKey]; ok && hopMaster != nil {
+			ownedID := ""
+			if connector != nil {
+				ownedID = strings.TrimSpace(connector.MasterNodeID(hopMaster))
+			}
+			if ownedID == "" || ownedID == compKey {
+				nextJump := strings.TrimSpace(hopMaster.Target().JumpHost)
+				if nextJump == "" {
+					nextJump = strings.TrimSpace(snap.Node.ProxyJump)
+				}
+				return hopMaster, nextJump
+			}
+		}
+	}
+	return nil, strings.TrimSpace(snap.Node.ProxyJump)
 }
 
 func indexJumpChainMasters(connector *ssh.Connector, targetMaster *ssh.MuxServer, ownedMasters []*ssh.MuxServer) map[string]*ssh.MuxServer {
@@ -1872,81 +2097,178 @@ func indexJumpChainMasters(connector *ssh.Connector, targetMaster *ssh.MuxServer
 		if m == nil || m == targetMaster {
 			continue
 		}
-		if connector != nil {
-			if ownedID := strings.TrimSpace(connector.MasterNodeID(m)); ownedID != "" {
-				byHost[ownedID] = m
+		indexSingleJumpChainMaster(byHost, connector, m)
+	}
+	return byHost
+}
+
+func indexSingleJumpChainMaster(byHost map[string]*ssh.MuxServer, connector *ssh.Connector, m *ssh.MuxServer) {
+	var ownedExplicit bool
+	if connector != nil {
+		if ownedID := strings.TrimSpace(connector.MasterNodeID(m)); ownedID != "" {
+			byHost[ownedID] = m
+			_, _, _, ownedExplicit = parseJumpHopSpec(ownedID)
+			unwrapped := strings.TrimPrefix(ownedID, config.OpenSSHNodePrefix)
+			if unwrapped != "" {
+				byHost[unwrapped] = m
+				byHost[config.OpenSSHNodePrefix+unwrapped] = m
+			}
+			if !ownedExplicit {
 				if cleanID, ok := config.OpenSSHOriginalHost(ownedID); ok && cleanID != "" {
 					byHost[cleanID] = m
 					byHost[config.OpenSSHNodePrefix+cleanID] = m
 				}
 			}
 		}
-		if host := strings.TrimSpace(m.Target().OriginalHost); host != "" {
-			byHost[host] = m
+	}
+	t := m.Target()
+	if orig := strings.TrimSpace(t.OriginalHost); orig != "" {
+		cleanOrig := config.UnwrapOpenSSHSelector(orig)
+		if cleanOrig != "" && t.User != "" && t.Port > 0 {
+			comp := config.FormatNodeID(t.User, cleanOrig, uint16(t.Port))
+			byHost[comp] = m
+			byHost[config.OpenSSHNodePrefix+comp] = m
 		}
-		if host := strings.TrimSpace(m.Target().Host); host != "" {
-			byHost[host] = m
-			if m.Target().User != "" && m.Target().Port > 0 {
-				byHost[config.FormatNodeID(m.Target().User, host, uint16(m.Target().Port))] = m
-			}
+		if !ownedExplicit {
+			byHost[orig] = m
 		}
 	}
-	return byHost
+	if host := strings.TrimSpace(t.Host); host != "" {
+		if t.User != "" && t.Port > 0 {
+			byHost[config.FormatNodeID(t.User, cleanMuxHost(host), uint16(t.Port))] = m
+		}
+		if !ownedExplicit {
+			byHost[host] = m
+		}
+	}
 }
 
 // releaseMastersForHandoff drops the connector's active-session references,
 // reserves the target and any intermediate jump masters for handoff, and shuts
 // them down so the detached daemon can claim the control sockets cleanly.
 func releaseMastersForHandoff(connector *ssh.Connector, master *ssh.MuxServer, expandedPath string) (bool, error) {
-	var jumpMasters []*ssh.MuxServer
-	var released []*ssh.MuxServer
-	if connector != nil {
-		if !connector.OwnsMaster(master) {
-			return false, nil
-		}
-		if connector.HasMasterSession(master) && connector.ReleaseMaster(master) {
-			released = append(released, master)
-		}
-		jumpMasters = jumpChainMasters(connector, master, connector.Masters())
+	ready, _, err := releaseMastersForHandoffWithProvider(connector, nil, master, expandedPath)
+	return ready, err
+}
+
+func collectLiveJumpMastersForHandoff(
+	connector *ssh.Connector,
+	provider config.ConfigProvider,
+	master *ssh.MuxServer,
+) (jumpMasters []*ssh.MuxServer, ok bool) {
+	if connector == nil {
+		return nil, true
 	}
-	restoreReleased := func() {
-		if connector == nil {
-			return
+	if !connector.OwnsMaster(master) {
+		return nil, false
+	}
+	jumpMasters = jumpChainMastersWithProvider(connector, provider, master, connector.Masters())
+	for _, m := range jumpMasters {
+		if isMasterDeadOrStopped(m) {
+			return nil, false
 		}
-		for _, m := range released {
-			connector.AcquireMaster(m)
-		}
+	}
+	return jumpMasters, true
+}
+
+func rollbackHandoffReservation(connector *ssh.Connector, reserved, released []*ssh.MuxServer) {
+	for _, r := range reserved {
+		r.CancelHandoff()
+	}
+	if connector == nil {
+		return
+	}
+	for _, m := range released {
+		connector.AcquireMaster(m)
+	}
+}
+
+func isConnectorOwnedNonPersistentMasterIdle(m *ssh.MuxServer) (idle bool, deadOrStopped bool) {
+	if isMasterDeadOrStopped(m) {
+		return false, true
+	}
+	probeCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := m.WaitForDrain(probeCtx, 1); err != nil {
+		return false, isMasterDeadOrStopped(m)
+	}
+	if isMasterDeadOrStopped(m) {
+		return false, true
+	}
+	return true, false
+}
+
+func reserveJumpMasterForHandoff(
+	connector *ssh.Connector,
+	m *ssh.MuxServer,
+	reserved, released *[]*ssh.MuxServer,
+) (ok bool, deadOrStopped bool) {
+	// Connector-owned non-persistent masters trigger immediate async Shutdown() inside
+	// RemoveForegroundSession() when activeSessions reaches 0 (causing PrepareHandoff
+	// to fail with s.shuttingDown == true and tearing down active forwards). Probe
+	// their exact idleMu busy state with maxSessions=1 while keeping the session ref
+	// until commit.
+	if !m.PersistEnabled() && connector != nil && connector.HasMasterSession(m) {
+		return isConnectorOwnedNonPersistentMasterIdle(m)
+	}
+	if connector != nil && connector.HasMasterSession(m) && connector.ReleaseMaster(m) {
+		*released = append(*released, m)
+	}
+	if !m.PrepareHandoff() {
+		return false, isMasterDeadOrStopped(m)
+	}
+	*reserved = append(*reserved, m)
+	return true, false
+}
+
+func releaseMastersForHandoffWithProvider(
+	connector *ssh.Connector,
+	provider config.ConfigProvider,
+	master *ssh.MuxServer,
+	expandedPath string,
+) (ready bool, terminalAbort bool, err error) {
+	if isMasterDeadOrStopped(master) {
+		return false, true, nil
+	}
+	jumpMasters, ok := collectLiveJumpMastersForHandoff(connector, provider, master)
+	if !ok {
+		return false, true, nil
+	}
+	var released []*ssh.MuxServer
+	if connector != nil && connector.HasMasterSession(master) && connector.ReleaseMaster(master) {
+		released = append(released, master)
 	}
 	if !master.PrepareHandoff() {
-		restoreReleased()
+		rollbackHandoffReservation(connector, nil, released)
+		if isMasterDeadOrStopped(master) {
+			return false, true, nil
+		}
 		logger.DefaultLogger().Debugf("mux: not handing off master on %q while it is busy or stopping", expandedPath)
-		return false, nil
+		return false, false, nil
 	}
 	reserved := []*ssh.MuxServer{master}
 	for _, m := range jumpMasters {
-		if !m.PersistEnabled() {
-			continue
-		}
-		if connector != nil && connector.HasMasterSession(m) && connector.ReleaseMaster(m) {
-			released = append(released, m)
-		}
-		if !m.PrepareHandoff() {
-			for _, r := range reserved {
-				r.CancelHandoff()
+		jumpOK, jumpDead := reserveJumpMasterForHandoff(connector, m, &reserved, &released)
+		if !jumpOK {
+			rollbackHandoffReservation(connector, reserved, released)
+			if jumpDead || isMasterDeadOrStopped(master) {
+				return false, true, nil
 			}
-			restoreReleased()
 			logger.DefaultLogger().Debugf("mux: not handing off master on %q while jump master %q is busy or stopping", expandedPath, m.ControlPath())
-			return false, nil
+			return false, false, nil
 		}
-		reserved = append(reserved, m)
 	}
 	if err := master.Shutdown(); err != nil {
-		return false, fmt.Errorf("release control socket before daemon handoff failed: %w", err)
+		rollbackHandoffReservation(connector, reserved[1:], released)
+		return false, false, fmt.Errorf("release control socket before daemon handoff failed: %w", err)
 	}
 	for _, m := range jumpMasters {
+		if connector != nil && connector.HasMasterSession(m) {
+			connector.ReleaseMaster(m)
+		}
 		_ = m.Shutdown()
 	}
-	return true, nil
+	return true, false, nil
 }
 
 // waitForControlSocket blocks until a master answers on path, the deadline
@@ -2153,7 +2475,7 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 
 func (o *SshOptions) runConnectedSession(runCtx context.Context, connector *ssh.Connector, client *ssh.Client, provider config.ConfigProvider, nodeID string, tunnels *sshTunnelGroup, isChild bool) error {
 	master := o.getActiveMuxServer(runCtx, provider, nodeID)
-	if master == nil && connector != nil {
+	if isMasterClosed(master) && connector != nil {
 		master = findOwnedMasterForNode(connector, nodeID)
 	}
 	if isMuxDaemonChild() {

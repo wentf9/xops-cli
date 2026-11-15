@@ -18,10 +18,11 @@ import (
 )
 
 type dummySSHConn struct {
-	chans  chan cryptoSSH.NewChannel
-	reqs   chan *cryptoSSH.Request
-	closed bool
-	mu     sync.Mutex
+	chans    chan cryptoSSH.NewChannel
+	reqs     chan *cryptoSSH.Request
+	closed   bool
+	closedCh chan struct{}
+	mu       sync.Mutex
 }
 
 func (d *dummySSHConn) User() string                                           { return "test" }
@@ -34,17 +35,36 @@ func (d *dummySSHConn) SendRequest(string, bool, []byte) (bool, []byte, error) {
 func (d *dummySSHConn) OpenChannel(string, []byte) (cryptoSSH.Channel, <-chan *cryptoSSH.Request, error) {
 	return nil, nil, errors.New("open channel not implemented in dummy")
 }
+func (d *dummySSHConn) closedChan() chan struct{} {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closedCh == nil {
+		d.closedCh = make(chan struct{})
+	}
+	return d.closedCh
+}
 func (d *dummySSHConn) Close() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if !d.closed {
 		d.closed = true
-		close(d.chans)
-		close(d.reqs)
+		if d.chans != nil {
+			close(d.chans)
+		}
+		if d.reqs != nil {
+			close(d.reqs)
+		}
+		if d.closedCh == nil {
+			d.closedCh = make(chan struct{})
+		}
+		close(d.closedCh)
 	}
 	return nil
 }
-func (d *dummySSHConn) Wait() error { return nil }
+func (d *dummySSHConn) Wait() error {
+	<-d.closedChan()
+	return nil
+}
 
 func newDummySSHClient() *cryptoSSH.Client {
 	chans := make(chan cryptoSSH.NewChannel)
@@ -324,8 +344,6 @@ func TestMuxServer_LongSocketPaths(t *testing.T) {
 	}
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 
-	mockClient := newDummySSHClient()
-
 	// Test boundary lengths up to maxLen - 1
 	lengthsToTest := []int{50, 70, 75, 80, 85, 90, 95, 100, maxLen - 1}
 
@@ -348,7 +366,7 @@ func TestMuxServer_LongSocketPaths(t *testing.T) {
 
 		server, err := NewMuxServer(MuxServerOptions{
 			ControlPath: sockName,
-			SSHClient:   mockClient,
+			SSHClient:   newDummySSHClient(),
 		})
 		if err != nil {
 			t.Fatalf("NewMuxServer failed for valid length %d: %v", targetLen, err)
@@ -375,7 +393,6 @@ func TestMuxServer_UmaskIsolationConcurrent(t *testing.T) {
 	}
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 
-	mockClient := newDummySSHClient()
 	stopChan := make(chan struct{})
 	var wg sync.WaitGroup
 
@@ -417,7 +434,7 @@ func TestMuxServer_UmaskIsolationConcurrent(t *testing.T) {
 		sockPath := filepath.Join(tmpDir, fmt.Sprintf("server_%d.sock", i))
 		server, err := NewMuxServer(MuxServerOptions{
 			ControlPath: sockPath,
-			SSHClient:   mockClient,
+			SSHClient:   newDummySSHClient(),
 		})
 		if err != nil {
 			t.Fatalf("NewMuxServer iteration %d failed: %v", i, err)

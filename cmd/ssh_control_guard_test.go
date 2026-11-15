@@ -822,13 +822,19 @@ func TestMuxDaemonArgsIsolationAndRememberSuppression(t *testing.T) {
 		"targetuser",
 		"target-only-id",
 		"-i ",
-		"StrictHostKeyChecking=no",
 		"PubkeyAuthentication=no",
-		"UserKnownHostsFile=",
 		"ControlMaster=auto",
 	} {
 		if strings.Contains(joined, forbidden) {
 			t.Fatalf("expected target-scoped option %q to be stripped for jumpMaster, got %q", forbidden, joined)
+		}
+	}
+	for _, wantConnWide := range []string{
+		"-o StrictHostKeyChecking=no",
+		"-o UserKnownHostsFile=/tmp/target_kh",
+	} {
+		if !strings.Contains(joined, wantConnWide) {
+			t.Fatalf("expected connection-wide option %q on jumpMaster, got %q", wantConnWide, joined)
 		}
 	}
 	if !strings.Contains(joined, "-o ControlPersist=5m") || !strings.Contains(joined, "-o ControlMaster=yes") {

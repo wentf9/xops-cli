@@ -1233,6 +1233,67 @@ type masterOwnership struct {
 	foregroundSession bool
 }
 
+func isMuxServerClosed(srv *MuxServer) bool {
+	if srv == nil {
+		return true
+	}
+	waitCh := srv.Wait()
+	if waitCh == nil {
+		return false
+	}
+	select {
+	case <-waitCh:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Connector) pruneClosedMastersLocked() {
+	if len(c.masterOrder) == 0 && len(c.masters) == 0 {
+		return
+	}
+	for srv := range c.masters {
+		if isMuxServerClosed(srv) {
+			delete(c.masters, srv)
+		}
+	}
+	n := 0
+	for _, srv := range c.masterOrder {
+		if srv == nil {
+			continue
+		}
+		if _, ok := c.masters[srv]; ok && !isMuxServerClosed(srv) {
+			c.masterOrder[n] = srv
+			n++
+		}
+	}
+	clear(c.masterOrder[n:])
+	c.masterOrder = c.masterOrder[:n]
+}
+
+func (c *Connector) watchMasterShutdown(lifecycleCtx context.Context, waitCh <-chan struct{}) {
+	if waitCh == nil {
+		return
+	}
+	go func() {
+		if lifecycleCtx != nil {
+			select {
+			case <-waitCh:
+			case <-lifecycleCtx.Done():
+				return
+			}
+		} else {
+			<-waitCh
+		}
+		c.lifecycleMu.Lock()
+		if !c.closed {
+			c.pruneClosedMastersLocked()
+		}
+		c.lifecycleMu.Unlock()
+	}()
+}
+
 // trackMaster records an owned master so CloseAll can release it. A connector
 // that is already closed shuts the master down immediately.
 func (c *Connector) trackMaster(server *MuxServer, nodeIDs ...string) {
@@ -1249,17 +1310,28 @@ func (c *Connector) trackMaster(server *MuxServer, nodeIDs ...string) {
 		_ = server.Shutdown()
 		return
 	}
+	c.pruneClosedMastersLocked()
+	if isMuxServerClosed(server) {
+		c.lifecycleMu.Unlock()
+		return
+	}
 	if c.masters == nil {
 		c.masters = make(map[*MuxServer]*masterOwnership)
 	}
-	if _, exists := c.masters[server]; !exists {
+	_, exists := c.masters[server]
+	if !exists {
 		c.masterOrder = append(c.masterOrder, server)
 	}
 	c.masters[server] = &masterOwnership{
 		nodeID:            nodeID,
 		foregroundSession: true,
 	}
+	lifecycleCtx := c.lifecycleCtx
 	c.lifecycleMu.Unlock()
+
+	if !exists {
+		c.watchMasterShutdown(lifecycleCtx, server.Wait())
+	}
 }
 
 // ReleaseMaster drops this connector's active-session reference to a master it
@@ -1273,6 +1345,7 @@ func (c *Connector) ReleaseMaster(server *MuxServer) bool {
 		return false
 	}
 	c.lifecycleMu.Lock()
+	c.pruneClosedMastersLocked()
 	ownership := c.masters[server]
 	release := ownership != nil && ownership.foregroundSession
 	if release {
@@ -1296,6 +1369,7 @@ func (c *Connector) AcquireMaster(server *MuxServer) bool {
 		c.lifecycleMu.Unlock()
 		return false
 	}
+	c.pruneClosedMastersLocked()
 	ownership := c.masters[server]
 	if ownership == nil {
 		c.lifecycleMu.Unlock()
@@ -1312,6 +1386,7 @@ func (c *Connector) AcquireMaster(server *MuxServer) bool {
 	}
 
 	c.lifecycleMu.Lock()
+	c.pruneClosedMastersLocked()
 	ownership = c.masters[server]
 	if c.closed || ownership == nil || ownership.foregroundSession {
 		c.lifecycleMu.Unlock()
@@ -1330,6 +1405,7 @@ func (c *Connector) OwnsMaster(server *MuxServer) bool {
 	}
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
+	c.pruneClosedMastersLocked()
 	_, ok := c.masters[server]
 	return ok
 }
@@ -1342,6 +1418,7 @@ func (c *Connector) HasMasterSession(server *MuxServer) bool {
 	}
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
+	c.pruneClosedMastersLocked()
 	ownership := c.masters[server]
 	return ownership != nil && ownership.foregroundSession
 }
@@ -1354,6 +1431,7 @@ func (c *Connector) MasterNodeID(server *MuxServer) string {
 	}
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
+	c.pruneClosedMastersLocked()
 	ownership := c.masters[server]
 	if ownership == nil {
 		return ""
@@ -1369,6 +1447,7 @@ func (c *Connector) Masters() []*MuxServer {
 	}
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
+	c.pruneClosedMastersLocked()
 	masters := make([]*MuxServer, 0, len(c.masterOrder))
 	for _, master := range c.masterOrder {
 		if _, ok := c.masters[master]; ok {
@@ -1773,7 +1852,7 @@ func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, cfg *
 	}
 	stoppedCancelClose := stopCancelClose()
 	if ctx.Err() != nil || !stoppedCancelClose {
-		closeErr := ncc.Close()
+		closeErr := abortUnclaimedSSHConn(ncc, chans, reqs)
 		cancelErr := handshakeCancelError(ctx, coordinator, nodeName)
 		if cancelErr == nil {
 			cancelErr = fmt.Errorf("ssh handshake canceled for '%s': %w", nodeName, context.Canceled)
@@ -1782,7 +1861,7 @@ func (c *Connector) dialAndHandshake(ctx context.Context, nodeName string, cfg *
 	}
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		if !strings.Contains(err.Error(), "deadline not supported") {
-			if closeErr := ncc.Close(); closeErr != nil {
+			if closeErr := abortUnclaimedSSHConn(ncc, chans, reqs); closeErr != nil {
 				return nil, nil, fmt.Errorf(
 					"clear SSH connection deadline for '%s' failed: %w; close SSH connection after clearing deadline failed: %w",
 					nodeName,

@@ -190,7 +190,7 @@ func DialMuxClient(ctx context.Context, socketPath string, opts ...MuxClientOpti
 	if err := client.handshake(); err != nil {
 		unbind()
 		_ = conn.Close()
-		if ctxErr := ctx.Err(); ctxErr != nil {
+		if ctxErr := contextErrForConnIO(ctx, err); ctxErr != nil {
 			return nil, fmt.Errorf("mux handshake failed on %q: %w", socketPath, ctxErr)
 		}
 		return nil, fmt.Errorf("mux handshake failed on %q: %w", socketPath, err)
@@ -260,42 +260,153 @@ func (m *MuxClient) handshake() error {
 	return nil
 }
 
+func contextErrForConnIO(ctx context.Context, err error) error {
+	if ctx == nil {
+		return nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if err != nil && errors.Is(err, os.ErrDeadlineExceeded) {
+		if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+			return context.DeadlineExceeded
+		}
+	}
+	return nil
+}
+
+func wrapMuxRPCContextErr(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if ctxErr := contextErrForConnIO(ctx, err); ctxErr != nil && !errors.Is(err, ctxErr) {
+		return errors.Join(ctxErr, err)
+	}
+	return err
+}
+
+func verifyMuxReplyReqID(reqID, respID uint32) error {
+	if respID != reqID {
+		return fmt.Errorf("request id mismatch: expected %d, got %d", reqID, respID)
+	}
+	return nil
+}
+
+func expectMuxOKPayload(reqID uint32, payload []byte) error {
+	respID, err := DecodeMuxClientRequestID(payload)
+	if err != nil {
+		return fmt.Errorf("decode ok response: %w", err)
+	}
+	return verifyMuxReplyReqID(reqID, respID)
+}
+
+func decodeMuxRejectionPayload(opName string, reqID uint32, payload []byte) (string, error) {
+	respID, reason, err := DecodeMuxError(payload)
+	if err != nil {
+		return "", fmt.Errorf("decode %s error response: %w", opName, err)
+	}
+	if err := verifyMuxReplyReqID(reqID, respID); err != nil {
+		return "", err
+	}
+	return reason, nil
+}
+
+// roundTripMuxRPCLocked executes one request/response exchange on m.conn while
+// m.ioMu is held. Any transport I/O failure, frame decode error, unexpected
+// opcode, or requestID mismatch closes m.conn so subsequent callers cannot
+// observe a desynchronized control stream; clean server rejections matching
+// reqID leave m.conn open. If ctx is canceled or timed out on failure, ctx.Err()
+// is joined into the returned error.
+func (m *MuxClient) roundTripMuxRPCLocked(
+	ctx context.Context,
+	timeout time.Duration,
+	opName string,
+	reqType uint32,
+	buildPayload func(reqID uint32) []byte,
+	formatReject func(msgType uint32, reason string) error,
+	handle func(reqID, msgType uint32, payload []byte) (poison bool, err error),
+) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("%s canceled: %w", opName, err)
+		}
+	}
+	if m.conn == nil {
+		return wrapMuxRPCContextErr(ctx, fmt.Errorf("%s failed: %w", opName, net.ErrClosed))
+	}
+
+	unbind := bindConnContext(ctx, m.conn, timeout)
+	defer unbind()
+
+	reqID := m.nextID()
+	if err := WriteMuxPacket(m.conn, reqType, buildPayload(reqID)); err != nil {
+		unbind()
+		_ = m.Close()
+		return wrapMuxRPCContextErr(ctx, fmt.Errorf("send %s: %w", opName, err))
+	}
+
+	msgType, payload, err := ReadMuxPacket(m.conn)
+	if err != nil {
+		unbind()
+		_ = m.Close()
+		return wrapMuxRPCContextErr(ctx, fmt.Errorf("read %s response: %w", opName, err))
+	}
+
+	if msgType == MUX_S_FAILURE || msgType == MUX_S_PERMISSION_DENIED {
+		reason, decErr := decodeMuxRejectionPayload(opName, reqID, payload)
+		if decErr != nil {
+			unbind()
+			_ = m.Close()
+			return wrapMuxRPCContextErr(ctx, decErr)
+		}
+		return wrapMuxRPCContextErr(ctx, formatReject(msgType, reason))
+	}
+
+	poison, handleErr := handle(reqID, msgType, payload)
+	if handleErr != nil {
+		if poison {
+			unbind()
+			_ = m.Close()
+		}
+		return wrapMuxRPCContextErr(ctx, handleErr)
+	}
+	return nil
+}
+
 // AliveCheck queries the master process alive status and returns the server PID.
 func (m *MuxClient) AliveCheck(ctx context.Context) (uint32, error) {
 	m.ioMu.Lock()
 	defer m.ioMu.Unlock()
 
-	unbind := bindConnContext(ctx, m.conn, DefaultMuxHandshakeTimeout)
-	defer unbind()
-
-	reqID := m.nextID()
-	if err := WriteMuxPacket(m.conn, MUX_C_ALIVE_CHECK, EncodeMuxRequestID(reqID)); err != nil {
-		return 0, fmt.Errorf("send alive check: %w", err)
-	}
-
-	msgType, payload, err := ReadMuxPacket(m.conn)
+	var pid uint32
+	err := m.roundTripMuxRPCLocked(
+		ctx,
+		DefaultMuxHandshakeTimeout,
+		"alive check",
+		MUX_C_ALIVE_CHECK,
+		EncodeMuxRequestID,
+		func(msgType uint32, reason string) error {
+			return fmt.Errorf("alive check rejected (0x%08x): %s", msgType, reason)
+		},
+		func(reqID, msgType uint32, payload []byte) (bool, error) {
+			if msgType != MUX_S_ALIVE {
+				return true, fmt.Errorf("unexpected alive check response type: 0x%08x", msgType)
+			}
+			respID, parsedPID, err := DecodeMuxAlive(payload)
+			if err != nil {
+				return true, fmt.Errorf("decode alive response: %w", err)
+			}
+			if err := verifyMuxReplyReqID(reqID, respID); err != nil {
+				return true, err
+			}
+			pid = parsedPID
+			return false, nil
+		},
+	)
 	if err != nil {
-		return 0, fmt.Errorf("read alive check response: %w", err)
+		return 0, err
 	}
-
-	switch msgType {
-	case MUX_S_ALIVE:
-		respID, pid, err := DecodeMuxAlive(payload)
-		if err != nil {
-			return 0, fmt.Errorf("decode alive response: %w", err)
-		}
-		if respID != reqID {
-			return 0, fmt.Errorf("request id mismatch: expected %d, got %d", reqID, respID)
-		}
-		return pid, nil
-
-	case MUX_S_PERMISSION_DENIED, MUX_S_FAILURE:
-		_, reason, _ := DecodeMuxError(payload)
-		return 0, fmt.Errorf("alive check rejected (0x%08x): %s", msgType, reason)
-
-	default:
-		return 0, fmt.Errorf("unexpected alive check response type: 0x%08x", msgType)
-	}
+	return pid, nil
 }
 
 // Terminate requests the master process to terminate and disconnect the session.
@@ -303,31 +414,28 @@ func (m *MuxClient) Terminate(ctx context.Context) error {
 	m.ioMu.Lock()
 	defer m.ioMu.Unlock()
 
-	unbind := bindConnContext(ctx, m.conn, DefaultMuxHandshakeTimeout)
-	defer unbind()
-
-	reqID := m.nextID()
-	if err := WriteMuxPacket(m.conn, MUX_C_TERMINATE, EncodeMuxRequestID(reqID)); err != nil {
-		return fmt.Errorf("send terminate: %w", err)
-	}
-
-	msgType, payload, err := ReadMuxPacket(m.conn)
-	if err != nil {
-		return fmt.Errorf("read terminate response: %w", err)
-	}
-
-	switch msgType {
-	case MUX_S_OK:
-		return nil
-	case MUX_S_PERMISSION_DENIED:
-		_, reason, _ := DecodeMuxError(payload)
-		return fmt.Errorf("master refused termination request: %s", reason)
-	case MUX_S_FAILURE:
-		_, reason, _ := DecodeMuxError(payload)
-		return fmt.Errorf("termination failed: %s", reason)
-	default:
-		return fmt.Errorf("unexpected terminate response type: 0x%08x", msgType)
-	}
+	return m.roundTripMuxRPCLocked(
+		ctx,
+		DefaultMuxHandshakeTimeout,
+		"terminate",
+		MUX_C_TERMINATE,
+		EncodeMuxRequestID,
+		func(msgType uint32, reason string) error {
+			if msgType == MUX_S_PERMISSION_DENIED {
+				return fmt.Errorf("master refused termination request: %s", reason)
+			}
+			return fmt.Errorf("termination failed: %s", reason)
+		},
+		func(reqID, msgType uint32, payload []byte) (bool, error) {
+			if msgType != MUX_S_OK {
+				return true, fmt.Errorf("unexpected terminate response type: 0x%08x", msgType)
+			}
+			if err := expectMuxOKPayload(reqID, payload); err != nil {
+				return true, err
+			}
+			return false, nil
+		},
+	)
 }
 
 // StopListening requests the master to unlink the control socket and stop accepting new clients.
@@ -335,27 +443,37 @@ func (m *MuxClient) StopListening(ctx context.Context) error {
 	m.ioMu.Lock()
 	defer m.ioMu.Unlock()
 
-	unbind := bindConnContext(ctx, m.conn, DefaultMuxHandshakeTimeout)
-	defer unbind()
+	return m.roundTripMuxRPCLocked(
+		ctx,
+		DefaultMuxHandshakeTimeout,
+		"stop listening",
+		MUX_C_STOP_LISTENING,
+		EncodeMuxRequestID,
+		func(_ uint32, reason string) error {
+			return fmt.Errorf("master refused stop listening request: %s", reason)
+		},
+		func(reqID, msgType uint32, payload []byte) (bool, error) {
+			if msgType != MUX_S_OK {
+				return true, fmt.Errorf("unexpected stop listening response type: 0x%08x", msgType)
+			}
+			if err := expectMuxOKPayload(reqID, payload); err != nil {
+				return true, err
+			}
+			return false, nil
+		},
+	)
+}
 
-	reqID := m.nextID()
-	if err := WriteMuxPacket(m.conn, MUX_C_STOP_LISTENING, EncodeMuxRequestID(reqID)); err != nil {
-		return fmt.Errorf("send stop listening: %w", err)
-	}
-
-	msgType, payload, err := ReadMuxPacket(m.conn)
-	if err != nil {
-		return fmt.Errorf("read stop listening response: %w", err)
-	}
-
-	switch msgType {
-	case MUX_S_OK:
-		return nil
-	case MUX_S_FAILURE:
-		_, reason, _ := DecodeMuxError(payload)
-		return fmt.Errorf("master refused stop listening request: %s", reason)
-	default:
-		return fmt.Errorf("unexpected stop listening response type: 0x%08x", msgType)
+func encodeMuxClientForwardReq(req ForwardRequest) func(uint32) []byte {
+	return func(reqID uint32) []byte {
+		return EncodeMuxFwdRequest(MuxFwdRequest{
+			RequestID:   reqID,
+			FwdType:     uint32(req.Type),
+			ListenHost:  req.ListenHost,
+			ListenPort:  req.ListenPort,
+			ConnectHost: req.ConnectHost,
+			ConnectPort: req.ConnectPort,
+		})
 	}
 }
 
@@ -364,43 +482,42 @@ func (m *MuxClient) OpenForward(ctx context.Context, req ForwardRequest) (uint32
 	m.ioMu.Lock()
 	defer m.ioMu.Unlock()
 
-	unbind := bindConnContext(ctx, m.conn, DefaultInteractionTimeout)
-	defer unbind()
-
-	reqID := m.nextID()
-	fwdReq := MuxFwdRequest{
-		RequestID:   reqID,
-		FwdType:     uint32(req.Type),
-		ListenHost:  req.ListenHost,
-		ListenPort:  req.ListenPort,
-		ConnectHost: req.ConnectHost,
-		ConnectPort: req.ConnectPort,
-	}
-
-	if err := WriteMuxPacket(m.conn, MUX_C_OPEN_FWD, EncodeMuxFwdRequest(fwdReq)); err != nil {
-		return 0, fmt.Errorf("send open forward: %w", err)
-	}
-
-	msgType, respPayload, err := ReadMuxPacket(m.conn)
+	var allocatedPort uint32
+	err := m.roundTripMuxRPCLocked(
+		ctx,
+		DefaultInteractionTimeout,
+		"open forward",
+		MUX_C_OPEN_FWD,
+		encodeMuxClientForwardReq(req),
+		func(_ uint32, reason string) error {
+			return fmt.Errorf("forwarding request failed: %s", reason)
+		},
+		func(reqID, msgType uint32, payload []byte) (bool, error) {
+			switch msgType {
+			case MUX_S_OK:
+				if err := expectMuxOKPayload(reqID, payload); err != nil {
+					return true, err
+				}
+				return false, nil
+			case MUX_S_REMOTE_PORT:
+				respID, port, err := DecodeMuxRemotePort(payload)
+				if err != nil {
+					return true, fmt.Errorf("decode remote port: %w", err)
+				}
+				if err := verifyMuxReplyReqID(reqID, respID); err != nil {
+					return true, err
+				}
+				allocatedPort = port
+				return false, nil
+			default:
+				return true, fmt.Errorf("unexpected open forward response: 0x%08x", msgType)
+			}
+		},
+	)
 	if err != nil {
-		return 0, fmt.Errorf("read open forward response: %w", err)
+		return 0, err
 	}
-
-	switch msgType {
-	case MUX_S_OK:
-		return 0, nil
-	case MUX_S_REMOTE_PORT:
-		_, allocatedPort, err := DecodeMuxRemotePort(respPayload)
-		if err != nil {
-			return 0, fmt.Errorf("decode remote port: %w", err)
-		}
-		return allocatedPort, nil
-	case MUX_S_FAILURE, MUX_S_PERMISSION_DENIED:
-		_, reason, _ := DecodeMuxError(respPayload)
-		return 0, fmt.Errorf("forwarding request failed: %s", reason)
-	default:
-		return 0, fmt.Errorf("unexpected open forward response: 0x%08x", msgType)
-	}
+	return allocatedPort, nil
 }
 
 // CloseForward cancels an active port forwarding on the master.
@@ -408,37 +525,25 @@ func (m *MuxClient) CloseForward(ctx context.Context, req ForwardRequest) error 
 	m.ioMu.Lock()
 	defer m.ioMu.Unlock()
 
-	unbind := bindConnContext(ctx, m.conn, DefaultMuxHandshakeTimeout)
-	defer unbind()
-
-	reqID := m.nextID()
-	fwdReq := MuxFwdRequest{
-		RequestID:   reqID,
-		FwdType:     uint32(req.Type),
-		ListenHost:  req.ListenHost,
-		ListenPort:  req.ListenPort,
-		ConnectHost: req.ConnectHost,
-		ConnectPort: req.ConnectPort,
-	}
-
-	if err := WriteMuxPacket(m.conn, MUX_C_CLOSE_FWD, EncodeMuxFwdRequest(fwdReq)); err != nil {
-		return fmt.Errorf("send close forward: %w", err)
-	}
-
-	msgType, respPayload, err := ReadMuxPacket(m.conn)
-	if err != nil {
-		return fmt.Errorf("read close forward response: %w", err)
-	}
-
-	switch msgType {
-	case MUX_S_OK:
-		return nil
-	case MUX_S_FAILURE:
-		_, reason, _ := DecodeMuxError(respPayload)
-		return fmt.Errorf("cancel forward failed: %s", reason)
-	default:
-		return fmt.Errorf("unexpected close forward response: 0x%08x", msgType)
-	}
+	return m.roundTripMuxRPCLocked(
+		ctx,
+		DefaultMuxHandshakeTimeout,
+		"close forward",
+		MUX_C_CLOSE_FWD,
+		encodeMuxClientForwardReq(req),
+		func(_ uint32, reason string) error {
+			return fmt.Errorf("cancel forward failed: %s", reason)
+		},
+		func(reqID, msgType uint32, payload []byte) (bool, error) {
+			if msgType != MUX_S_OK {
+				return true, fmt.Errorf("unexpected close forward response: 0x%08x", msgType)
+			}
+			if err := expectMuxOKPayload(reqID, payload); err != nil {
+				return true, err
+			}
+			return false, nil
+		},
+	)
 }
 
 // HasExtension returns true if the master server advertised the specified extension.
@@ -455,43 +560,43 @@ func (m *MuxClient) RequestInfo(ctx context.Context, name string) (string, error
 	defer m.ioMu.Unlock()
 
 	if !m.HasExtension("info") {
-		return "", fmt.Errorf("mux server does not support info request")
+		return "", wrapMuxRPCContextErr(ctx, fmt.Errorf("mux server does not support info request"))
 	}
 
-	unbind := bindConnContext(ctx, m.conn, DefaultMuxHandshakeTimeout)
-	defer unbind()
-
-	reqID := m.nextID()
-	if err := WriteMuxPacket(m.conn, MUX_C_EXT_INFO, EncodeMuxExtInfo(reqID, name)); err != nil {
-		return "", fmt.Errorf("send ext info: %w", err)
-	}
-
-	msgType, payload, err := ReadMuxPacket(m.conn)
+	var info string
+	err := m.roundTripMuxRPCLocked(
+		ctx,
+		DefaultMuxHandshakeTimeout,
+		"ext info",
+		MUX_C_EXT_INFO,
+		func(reqID uint32) []byte {
+			return EncodeMuxExtInfo(reqID, name)
+		},
+		func(_ uint32, reason string) error {
+			return fmt.Errorf("ext info rejected: %s", reason)
+		},
+		func(reqID, msgType uint32, payload []byte) (bool, error) {
+			if msgType != MUX_S_EXT_INFO {
+				return true, fmt.Errorf("unexpected ext info response type: 0x%08x", msgType)
+			}
+			respID, status, msg, err := DecodeMuxExtInfoResponse(payload)
+			if err != nil {
+				return true, fmt.Errorf("decode ext info response: %w", err)
+			}
+			if err := verifyMuxReplyReqID(reqID, respID); err != nil {
+				return true, err
+			}
+			if status == 0 {
+				return false, fmt.Errorf("master returned error: %s", msg)
+			}
+			info = msg
+			return false, nil
+		},
+	)
 	if err != nil {
-		return "", fmt.Errorf("read ext info response: %w", err)
+		return "", err
 	}
-
-	switch msgType {
-	case MUX_S_EXT_INFO:
-		respID, status, msg, err := DecodeMuxExtInfoResponse(payload)
-		if err != nil {
-			return "", fmt.Errorf("decode ext info response: %w", err)
-		}
-		if respID != reqID {
-			return "", fmt.Errorf("request id mismatch: expected %d, got %d", reqID, respID)
-		}
-		if status == 0 {
-			return "", fmt.Errorf("master returned error: %s", msg)
-		}
-		return msg, nil
-
-	case MUX_S_FAILURE, MUX_S_PERMISSION_DENIED:
-		_, reason, _ := DecodeMuxError(payload)
-		return "", fmt.Errorf("ext info rejected: %s", reason)
-
-	default:
-		return "", fmt.Errorf("unexpected ext info response type: 0x%08x", msgType)
-	}
+	return info, nil
 }
 
 // ErrControlProxyRejected reports that the master refused a MUX_C_PROXY request.
@@ -526,7 +631,7 @@ func DialMuxProxyStream(ctx context.Context, socketPath string, opts ...MuxClien
 	failIO := func(op string, err error) (net.Conn, error) {
 		unbind()
 		_ = conn.Close()
-		if ctxErr := ctx.Err(); ctxErr != nil {
+		if ctxErr := contextErrForConnIO(ctx, err); ctxErr != nil {
 			return nil, fmt.Errorf("%s on %q: %w", op, socketPath, ctxErr)
 		}
 		return nil, fmt.Errorf("%s on %q: %w", op, socketPath, err)

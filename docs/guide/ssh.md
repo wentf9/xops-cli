@@ -15,6 +15,10 @@ xops ssh -J bastion.example.com deploy@192.0.2.10
 
 直连跳板支持 IP、FQDN 或 `host:port`；不带域名后缀的单标签跳板名称（如 `-J jumphost`）需预先保存为节点或别名。以显式用户名连接同一台主机时，凭据保持独立隔离。
 
+- **用户名与端口参数优先级**（遵循 OpenSSH 原生语义）：
+  - `xops ssh`、`xops sftp` 与单目标 `xops exec`：显式 `-l`/`-p`/`-P` 以及 `-o User`/`-o Port` 覆盖目标地址中的 `user@` 与 `:port`。
+  - `xops scp` 与批量 `xops exec`（`--ifile` 或多 `--host`）：单个端点内联的 `user@`/`:port` 优先于全局 `-l`/`-P`/`-p`；未写内联用户名或端口的端点再回退使用全局标志。
+
 ## 连接诊断
 
 ```bash
@@ -60,7 +64,7 @@ xops ssh --host linux-01 --interpreter bash --launch-dialect posix --login-shell
 通过 `ssh`、`sftp`、`scp` 或 `exec` 首次连接新主机时，XOps **仅在连接和身份认证成功后**才保存节点、主机和身份信息：
 - 连接超时、拒绝连接、认证失败或认证前取消不会留下垃圾节点。
 - 节点保存在打开 Shell 或执行命令之前完成，后续命令失败不会删除已认证节点；已有节点连接失败也不会被删除。
-- `--remember never` 仅禁止保存密码/口令机密，认证成功的节点地址信息仍会保存。
+- `--remember never` 既不保存密码/口令机密，也不会自动保存新的节点地址条目（已预先保存的节点保持不变）。
 
 例如，首次执行 `xops ssh root@192.0.2.10`（默认 22 端口）连接失败不会创建 `:22` 节点；随后执行 `xops ssh root@192.0.2.10:2222` 认证成功后仅保存 `:2222` 节点，下次省略端口即可直接匹配它（若同一主机保存了多个不同端口，仍需指定端口或使用别名）。
 

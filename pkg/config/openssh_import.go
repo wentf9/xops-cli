@@ -21,33 +21,31 @@ type OpenSSHHost struct {
 	Node     models.Node
 }
 
-// ParseOpenSSHHosts parses concrete Host entries from an OpenSSH configuration.
-// It does not connect to any remote host or modify the source configuration.
+// ParseOpenSSHHosts parses concrete Host entries from an OpenSSH configuration
+// (including Include directives). It does not connect to any remote host or
+// modify the source configuration.
 func ParseOpenSSHHosts(r io.Reader, defaultUser string) ([]OpenSSHHost, error) {
-	cfg, err := ssh_config.Decode(r)
+	if r == nil {
+		return nil, nil
+	}
+	cfg, err := decodeOpenSSHReader(r)
 	if err != nil {
 		return nil, fmt.Errorf("parse openssh configuration: %w", err)
 	}
 
 	hosts := make([]OpenSSHHost, 0)
-	seen := make(map[string]struct{})
-	for _, block := range cfg.Hosts {
-		for _, pattern := range block.Patterns {
-			name := pattern.String()
-			if !isConcreteSSHHost(name) {
-				continue
-			}
-			if _, ok := seen[name]; ok {
-				continue
-			}
-
-			host, err := openSSHHostFromConfig(cfg, name, defaultUser)
-			if err != nil {
-				return nil, err
-			}
-			hosts = append(hosts, host)
-			seen[name] = struct{}{}
+	var walkErr error
+	walkConcreteSSHHostNames(cfg, func(name string) bool {
+		host, hErr := openSSHHostFromConfig(cfg, name, defaultUser)
+		if hErr != nil {
+			walkErr = hErr
+			return false
 		}
+		hosts = append(hosts, host)
+		return true
+	})
+	if walkErr != nil {
+		return nil, walkErr
 	}
 
 	return hosts, nil
@@ -60,32 +58,21 @@ func isConcreteSSHHost(pattern string) bool {
 }
 
 func openSSHHostFromConfig(cfg *ssh_config.Config, name, defaultUser string) (OpenSSHHost, error) {
-	address, err := openSSHValue(cfg, name, "HostName", name)
-	if err != nil {
-		return OpenSSHHost{}, err
-	}
-	user, err := openSSHValue(cfg, name, "User", defaultUser)
-	if err != nil {
-		return OpenSSHHost{}, err
-	}
-	portValue, err := openSSHValue(cfg, name, "Port", "22")
-	if err != nil {
-		return OpenSSHHost{}, err
-	}
+	address := openSSHValue(cfg, name, "HostName", name)
+	user := openSSHValue(cfg, name, "User", defaultUser)
+	portValue := openSSHValue(cfg, name, "Port", "22")
 	port, err := strconv.ParseUint(strings.TrimSpace(portValue), 10, 16)
 	if err != nil || port == 0 {
 		return OpenSSHHost{}, fmt.Errorf("parse openssh port for host %q: %q", name, portValue)
 	}
-	keyPath, err := openSSHValue(cfg, name, "IdentityFile", "")
-	if err != nil {
-		return OpenSSHHost{}, err
-	}
-	proxyJump, err := openSSHValue(cfg, name, "ProxyJump", "")
-	if err != nil {
-		return OpenSSHHost{}, err
-	}
-	if strings.EqualFold(proxyJump, "none") {
-		proxyJump = ""
+	keyPath := openSSHValue(cfg, name, "IdentityFile", "")
+	proxyWinner, _, _ := firstMatchingOpenSSHProxy(cfg, name)
+	var proxyJump string
+	if proxyWinner != "proxycommand" {
+		proxyJump = openSSHValue(cfg, name, "ProxyJump", "")
+		if strings.EqualFold(proxyJump, "none") {
+			proxyJump = ""
+		}
 	}
 
 	expandedKeyPath, err := expandHomeDir(keyPath)
@@ -163,14 +150,10 @@ func normalizeImportedSSHOptions(opts *ssh.Options) *ssh.Options {
 	return cloned
 }
 
-func openSSHValue(cfg *ssh_config.Config, host, key, fallback string) (string, error) {
-	value, err := cfg.Get(host, key)
-	if err != nil {
-		return "", fmt.Errorf("read openssh %s for host %q: %w", key, host, err)
-	}
-	value = strings.TrimSpace(value)
+func openSSHValue(cfg *ssh_config.Config, host, key, fallback string) string {
+	value := firstSSHConfigKeyValue(cfg, host, key)
 	if value == "" {
-		return fallback, nil
+		return fallback
 	}
-	return value, nil
+	return value
 }

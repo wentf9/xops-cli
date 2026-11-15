@@ -250,22 +250,48 @@ func assertMuxProxyAgentGateWhenDisabled(t *testing.T) {
 	}
 }
 
-type dummyMuxGateConn struct{}
+type dummyMuxGateConn struct {
+	mu       sync.Mutex
+	closed   bool
+	closedCh chan struct{}
+}
 
-func (dummyMuxGateConn) User() string          { return "u" }
-func (dummyMuxGateConn) SessionID() []byte     { return []byte("s") }
-func (dummyMuxGateConn) ClientVersion() []byte { return []byte("SSH-2.0-c") }
-func (dummyMuxGateConn) ServerVersion() []byte { return []byte("SSH-2.0-s") }
-func (dummyMuxGateConn) RemoteAddr() net.Addr  { return &net.TCPAddr{} }
-func (dummyMuxGateConn) LocalAddr() net.Addr   { return &net.TCPAddr{} }
-func (dummyMuxGateConn) SendRequest(string, bool, []byte) (bool, []byte, error) {
+func (*dummyMuxGateConn) User() string          { return "u" }
+func (*dummyMuxGateConn) SessionID() []byte     { return []byte("s") }
+func (*dummyMuxGateConn) ClientVersion() []byte { return []byte("SSH-2.0-c") }
+func (*dummyMuxGateConn) ServerVersion() []byte { return []byte("SSH-2.0-s") }
+func (*dummyMuxGateConn) RemoteAddr() net.Addr  { return &net.TCPAddr{} }
+func (*dummyMuxGateConn) LocalAddr() net.Addr   { return &net.TCPAddr{} }
+func (*dummyMuxGateConn) SendRequest(string, bool, []byte) (bool, []byte, error) {
 	return false, nil, nil
 }
-func (dummyMuxGateConn) OpenChannel(string, []byte) (cryptoSSH.Channel, <-chan *cryptoSSH.Request, error) {
+func (*dummyMuxGateConn) OpenChannel(string, []byte) (cryptoSSH.Channel, <-chan *cryptoSSH.Request, error) {
 	return nil, nil, errors.New("closed")
 }
-func (dummyMuxGateConn) Close() error { return nil }
-func (dummyMuxGateConn) Wait() error  { return nil }
+func (d *dummyMuxGateConn) closedChan() chan struct{} {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closedCh == nil {
+		d.closedCh = make(chan struct{})
+	}
+	return d.closedCh
+}
+func (d *dummyMuxGateConn) Close() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.closed {
+		d.closed = true
+		if d.closedCh == nil {
+			d.closedCh = make(chan struct{})
+		}
+		close(d.closedCh)
+	}
+	return nil
+}
+func (d *dummyMuxGateConn) Wait() error {
+	<-d.closedChan()
+	return nil
+}
 
 type recordingRemoteChannel struct {
 	calls atomic.Int32

@@ -259,18 +259,18 @@ func DialControlProxy(ctx context.Context, socketPath string, target TargetConte
 			strings.Contains(strings.ToLower(errMsg), "permission denied") {
 			return nil, nil, fmt.Errorf("control proxy handshake failed on %q: %w: %w", socketPath, ErrControlProxyRejected, err)
 		}
-		if ctxErr := ctx.Err(); ctxErr != nil {
+		if ctxErr := contextErrForConnIO(ctx, err); ctxErr != nil {
 			return nil, nil, fmt.Errorf("control proxy handshake failed on %q: %w", socketPath, ctxErr)
 		}
 		return nil, nil, fmt.Errorf("control proxy handshake failed on %q: %w", socketPath, err)
 	}
 	if inspector.mismatchErr != nil {
-		_ = sshConn.Close()
+		_ = abortUnclaimedSSHConn(sshConn, chans, reqs)
 		_ = rawConn.Close()
 		return nil, nil, inspector.mismatchErr
 	}
 	if err := ctx.Err(); err != nil {
-		_ = sshConn.Close()
+		_ = abortUnclaimedSSHConn(sshConn, chans, reqs)
 		_ = rawConn.Close()
 		return nil, nil, fmt.Errorf("control proxy handshake failed on %q: %w", socketPath, err)
 	}
@@ -279,6 +279,29 @@ func DialControlProxy(ctx context.Context, socketPath string, target TargetConte
 	sshClient := cryptoSSH.NewClient(proxyConn, chans, reqs)
 
 	return sshClient, proxyConn, nil
+}
+
+// abortUnclaimedSSHConn closes an already-handshaked ssh.Conn that has not been
+// handed to cryptoSSH.NewClient while draining incoming global requests and
+// rejecting incoming channel-open requests concurrently. Without draining chans
+// and reqs, x/crypto/ssh mux.loop blocks permanently if the peer pipelined >= 17
+// frames right after authentication or MUX_S_PROXY. Both drain goroutines exit
+// once conn.Close() causes mux.loop to close chans and reqs.
+func abortUnclaimedSSHConn(conn cryptoSSH.Conn, chans <-chan cryptoSSH.NewChannel, reqs <-chan *cryptoSSH.Request) error {
+	if reqs != nil {
+		go cryptoSSH.DiscardRequests(reqs)
+	}
+	if chans != nil {
+		go func() {
+			for ch := range chans {
+				_ = ch.Reject(cryptoSSH.Prohibited, "connection aborted")
+			}
+		}()
+	}
+	if conn == nil {
+		return nil
+	}
+	return conn.Close()
 }
 
 // DialControlProxyClient connects to an OpenSSH ControlMaster socket in

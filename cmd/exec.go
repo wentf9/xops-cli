@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 
@@ -449,7 +451,7 @@ func (o *ExecOptions) RunContext(ctx context.Context) (retErr error) {
 	)
 
 	if o.Tag != "" {
-		tasks, errTask = o.buildTasksFromTags(provider)
+		tasks, errTask = o.buildTasksFromTags(ctx, provider)
 	} else {
 		tasks, hostErrs, errTask = o.buildTasksFromHosts(ctx, provider)
 	}
@@ -462,7 +464,7 @@ func (o *ExecOptions) RunContext(ctx context.Context) (retErr error) {
 	if len(o.Exclude) > 0 {
 		candidates := make([]utils.ExcludeTargetInfo, 0, len(tasks))
 		for _, t := range tasks {
-			candidates = append(candidates, execTaskExcludeInfo(t))
+			candidates = append(candidates, o.execTaskExcludeInfo(t))
 		}
 		excludes, err := utils.ResolveExcludesForTargets(provider, utils.ParseExcludeFlag(o.Exclude), candidates)
 		if err != nil {
@@ -1019,45 +1021,160 @@ func sanitizeHostForFilename(host string) string {
 	return host
 }
 
-func (o *ExecOptions) buildTasksFromTags(provider config.ConfigProvider) ([]execHostTask, error) {
+func (o *ExecOptions) buildTasksFromTags(ctx context.Context, provider config.ConfigProvider) ([]execHostTask, error) {
 	if err := o.ensureGeneralOptionsApplied(); err != nil {
 		return nil, err
 	}
-	var tasks []execHostTask
+	o.syncIdentityFiles()
 	nodes := provider.GetNodesByTag(o.Tag)
 	if len(nodes) == 0 {
 		return nil, fmt.Errorf("%s", i18n.Tf("err_tag_empty", map[string]any{"Tag": o.Tag}))
 	}
-	for nodeID := range nodes {
-		_, hostObj, identity, resolveErr := provider.Resolve(nodeID)
-		if resolveErr != nil {
-			return nil, fmt.Errorf("resolve tagged node %q failed: %w", nodeID, resolveErr)
+	tasks := make([]execHostTask, 0, len(nodes))
+	userOverride := strings.TrimSpace(o.User)
+	keyPath := ""
+	if o.IdentityFile != "" {
+		keyPath = utils.ToAbsolutePath(o.IdentityFile)
+	}
+	for _, nodeID := range slices.Sorted(maps.Keys(nodes)) {
+		task, err := o.buildTaggedHostTask(ctx, provider, nodeID, userOverride, keyPath)
+		if err != nil {
+			return nil, err
 		}
-		password := identity.Password
-		if o.Password != "" {
-			password = o.Password
-		}
-		passphrase := o.Passphrase
-		keyPath := ""
-		if o.IdentityFile != "" {
-			keyPath = utils.ToAbsolutePath(o.IdentityFile)
-		}
-		tasks = append(tasks, execHostTask{
-			nodeID:        nodeID,
-			matchedNodeID: nodeID,
-			baseNodeID:    nodeID,
-			host:          hostObj.Address,
-			port:          hostObj.Port,
-			user:          identity.User,
-			pass:          password,
-			passphrase:    passphrase,
-			keyPath:       keyPath,
-		})
+		tasks = append(tasks, task)
 	}
 	return tasks, nil
 }
 
-func execTaskExcludeInfo(t execHostTask) utils.ExcludeTargetInfo {
+func (o *ExecOptions) resolveTaggedCredentials(
+	userOverride string,
+	identity models.Identity,
+	resolved config.ResolvedTarget,
+	hasResolved bool,
+) (effectiveUser, password string) {
+	effectiveUser = userOverride
+	if effectiveUser == "" {
+		if hasResolved && resolved.User != "" {
+			effectiveUser = resolved.User
+		} else {
+			effectiveUser = identity.User
+		}
+	}
+	if o.Password != "" {
+		password = o.Password
+	} else if effectiveUser == "" || effectiveUser == identity.User {
+		password = identity.Password
+	}
+	return effectiveUser, password
+}
+
+func resolveTaggedHostAndPort(
+	portOverride uint16,
+	nodeID, targetSelector string,
+	hostObj models.Host,
+	resolved config.ResolvedTarget,
+	hasResolved bool,
+) (taskHost string, taskPort uint16) {
+	taskPort = portOverride
+	if taskPort == 0 {
+		if hasResolved && resolved.Port > 0 {
+			taskPort = resolved.Port
+		} else {
+			taskPort = hostObj.Port
+		}
+	}
+	if taskPort == 0 {
+		taskPort = 22
+	}
+	taskHost = hostObj.Address
+	if targetSelector != nodeID {
+		taskHost = targetSelector
+	} else if hasResolved && strings.TrimSpace(resolved.Host) != "" {
+		taskHost = strings.TrimSpace(resolved.Host)
+	}
+	return taskHost, taskPort
+}
+
+func (o *ExecOptions) buildTaggedHostTask(
+	ctx context.Context,
+	provider config.ConfigProvider,
+	nodeID, userOverride, keyPath string,
+) (execHostTask, error) {
+	_, hostObj, identity, resolveErr := provider.Resolve(nodeID)
+	if resolveErr != nil {
+		return execHostTask{}, fmt.Errorf("resolve tagged node %q failed: %w", nodeID, resolveErr)
+	}
+	target := config.ConnectionTarget{
+		Selector:     nodeID,
+		User:         userOverride,
+		HasUser:      o.User != "",
+		Port:         o.Port,
+		HasPort:      o.Port != 0,
+		ProxyJump:    o.JumpHost,
+		HasProxyJump: o.JumpHost != "",
+	}
+	target, resolved, hasResolved, originalHost, expandHost, cErr := o.resolveExecHostTarget(ctx, provider, target)
+	if cErr != nil {
+		return execHostTask{}, fmt.Errorf("canonicalize tagged host %q: %w", nodeID, cErr)
+	}
+	effectiveUser, password := o.resolveTaggedCredentials(userOverride, identity, resolved, hasResolved)
+	hasOverrides := o.User != "" || o.Port != 0 || o.JumpHost != "" || target.Selector != nodeID
+	taskNodeID := nodeID
+	if hasOverrides {
+		addr := utils.HostInfo{
+			Host:       target.Selector,
+			Port:       o.Port,
+			User:       userOverride,
+			Password:   password,
+			Alias:      o.Alias,
+			KeyPath:    o.IdentityFile,
+			Passphrase: o.Passphrase,
+		}
+		var prepErr error
+		taskNodeID, _, prepErr = o.getOrCreateNode(ctx, provider, target, addr)
+		if prepErr != nil {
+			return execHostTask{}, fmt.Errorf("prepare tagged node %q failed: %w", nodeID, prepErr)
+		}
+	}
+	taskHost, taskPort := resolveTaggedHostAndPort(o.Port, nodeID, target.Selector, hostObj, resolved, hasResolved)
+	matchedNodeID, baseNodeID := resolved.MatchedNodeID, resolved.BaseNodeID
+	if !hasResolved {
+		baseNodeID = nodeID
+		if !hasOverrides {
+			matchedNodeID = nodeID
+		}
+	}
+	return execHostTask{
+		nodeID:        taskNodeID,
+		matchedNodeID: matchedNodeID,
+		baseNodeID:    baseNodeID,
+		openSSHAlias:  resolved.OpenSSHAlias,
+		rawHost:       nodeID,
+		host:          taskHost,
+		originalHost:  originalHost,
+		expandHost:    expandHost,
+		port:          taskPort,
+		user:          effectiveUser,
+		pass:          password,
+		passphrase:    o.Passphrase,
+		keyPath:       keyPath,
+	}, nil
+}
+
+func (o *ExecOptions) execTaskExcludeInfo(t execHostTask) utils.ExcludeTargetInfo {
+	unmanaged := []string{t.rawHost, t.host, t.originalHost}
+	hostForExpansion := t.expandHost
+	if hostForExpansion == "" {
+		hostForExpansion = t.originalHost
+	}
+	if hostForExpansion == "" {
+		hostForExpansion = t.host
+	}
+	if o != nil {
+		if hostNameOverride, err := o.effectiveHostNameForHost(hostForExpansion); err == nil && hostNameOverride != "" && !slices.Contains(unmanaged, hostNameOverride) {
+			unmanaged = append(unmanaged, hostNameOverride)
+		}
+	}
 	return utils.ExcludeTargetInfo{
 		NodeID:         t.nodeID,
 		MatchedNodeID:  t.matchedNodeID,
@@ -1065,7 +1182,7 @@ func execTaskExcludeInfo(t execHostTask) utils.ExcludeTargetInfo {
 		OpenSSHAlias:   t.openSSHAlias,
 		User:           t.user,
 		Port:           t.port,
-		UnmanagedHosts: []string{t.rawHost, t.host, t.originalHost},
+		UnmanagedHosts: unmanaged,
 	}
 }
 
@@ -1129,6 +1246,39 @@ func (o *ExecOptions) resolveExecHostTarget(ctx context.Context, repository conf
 	return target, resolved, hasResolved, originalHost, expandHost, nil
 }
 
+func (o *ExecOptions) resolveExecEntryCredentials(h utils.HostInfo, isBatchHosts bool) (user string, hasUser bool, port uint16, hasPort bool, password string) {
+	hasUser = o.User != "" || h.User != ""
+	hasPort = o.Port != 0 || h.Port != 0
+	if isBatchHosts {
+		user = h.User
+		if user == "" {
+			user = o.User
+		}
+		port = h.Port
+		if port == 0 {
+			port = o.Port
+		}
+	} else {
+		user = o.User
+		if user == "" {
+			user = h.User
+		}
+		port = o.Port
+		if port == 0 {
+			port = h.Port
+		}
+	}
+	if !isBatchHosts && o.User != "" && h.User != "" && strings.TrimSpace(o.User) != strings.TrimSpace(h.User) {
+		password = o.Password
+	} else {
+		password = h.Password
+		if password == "" {
+			password = o.Password
+		}
+	}
+	return user, hasUser, port, hasPort, password
+}
+
 func (o *ExecOptions) buildTasksFromHosts(ctx context.Context, repository config.ConfigProvider) ([]execHostTask, []error, error) {
 	if err := o.ensureGeneralOptionsApplied(); err != nil {
 		return nil, nil, err
@@ -1139,23 +1289,9 @@ func (o *ExecOptions) buildTasksFromHosts(ctx context.Context, repository config
 	if err != nil {
 		return nil, nil, err
 	}
+	isBatchHosts := o.HostFile != "" || len(hosts) > 1 || strings.Contains(o.Host, ",")
 	for _, h := range hosts {
-		hasUser := o.User != "" || h.User != ""
-		user := o.User
-		if user == "" {
-			user = h.User
-		}
-
-		hasPort := o.Port != 0 || h.Port != 0
-		port := o.Port
-		if port == 0 {
-			port = h.Port
-		}
-
-		password := h.Password
-		if password == "" {
-			password = o.Password
-		}
+		user, hasUser, port, hasPort, password := o.resolveExecEntryCredentials(h, isBatchHosts)
 		passphrase := h.Passphrase
 		if passphrase == "" {
 			passphrase = o.Passphrase
@@ -1211,6 +1347,9 @@ func (o *ExecOptions) buildTasksFromHosts(ctx context.Context, repository config
 		taskPort := port
 		if taskPort == 0 && hasResolved {
 			taskPort = resolved.Port
+		}
+		if taskPort == 0 {
+			taskPort = 22
 		}
 		tasks = append(tasks, execHostTask{
 			nodeID:        nodeID,

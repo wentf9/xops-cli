@@ -118,11 +118,22 @@ func TestResolvePathInfo(t *testing.T) {
 		wantErr  bool
 	}{
 		{
-			name:     "flags override path info",
+			name:     "inline path info overrides global flags",
 			optHost:  "default_host",
 			optUser:  "default_user",
 			optPort:  2222,
 			path:     PathInfo{Host: "h1", User: "u1", Port: 22},
+			wantHost: "h1",
+			wantUser: "u1",
+			wantPort: 22,
+			wantErr:  false,
+		},
+		{
+			name:     "flags apply when path has host only",
+			optHost:  "default_host",
+			optUser:  "default_user",
+			optPort:  2222,
+			path:     PathInfo{Host: "h1"},
 			wantHost: "h1",
 			wantUser: "default_user",
 			wantPort: 2222,

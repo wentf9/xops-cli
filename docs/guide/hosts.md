@@ -164,7 +164,7 @@ nodes:
       strict_host_key_checking: accept-new
 ```
 
-**生效优先级**：CLI `-M`/`-S`/`-o` > 节点配置 (`node.ssh_options`) > 全局配置 (`cfg.ssh_options`) > `~/.ssh/config`（其中 `StrictHostKeyChecking` 与 `UserKnownHostsFile` 等主机信任选项仅从 CLI `-o` 或 `xops_config.yaml` 显式配置中读取，不从 `~/.ssh/config` 隐式继承）。
+**生效优先级**：CLI `-M`/`-S`/`-o` > 节点配置 (`node.ssh_options`) > 全局配置 (`cfg.ssh_options`) > `~/.ssh/config`（其中 `StrictHostKeyChecking` 与 `UserKnownHostsFile` 等主机信任选项仅从 CLI `-o` 或 `xops_config.yaml` 显式配置中读取，不从 `~/.ssh/config` 隐式继承；对于 `HashKnownHosts`，当 xops `hash_known_hosts` 未设置或为 `false` 时会继承 `~/.ssh/config` 中的 `HashKnownHosts yes`，但采用单向安全保护合并——xops 中显式启用的 `hash_known_hosts: true` 不会被 `~/.ssh/config` 的 `HashKnownHosts no` 降级，除非通过 CLI `-o HashKnownHosts=no` 显式覆盖）。
 
 ### 常用选项与端口转发/隧道选项
 
@@ -178,7 +178,7 @@ nodes:
 | `strict_host_key_checking` | `StrictHostKeyChecking` | `yes` / `no` / `ask` / `accept-new` / `off` | 远端主机公钥严格检查策略 |
 | `exit_on_forward_failure` | `ExitOnForwardFailure` | `yes` / `no` | 端口转发或隧道建立失败时是否立即退出会话 |
 | `clear_all_forwardings` | `ClearAllForwardings` | `yes` / `no` | 是否清除所有配置文件或命令行中此前声明的转发规则 |
-| `gateway_ports` | `GatewayPorts` | `yes` / `no` | 允许外部主机连接本地转发的端口（默认为 `no`） |
+| `gateway_ports` | `GatewayPorts` | `yes` / `no` / `clientspecified` | 允许外部主机连接本地转发的端口（默认为 `no`；`clientspecified` 按转发指定的绑定地址决定） |
 | `stream_local_bind_unlink` | `StreamLocalBindUnlink` | `yes` / `no` | 绑定 Unix 域套接字前自动删除已存在的旧套接字文件（默认为 `no`） |
 | `stream_local_bind_mask` | `StreamLocalBindMask` | 八进制掩码（如 `0177`、`0117`） | 创建 Unix 域套接字文件时的权限掩码（umask，默认 `0177`） |
 | `fork_after_authentication` | `ForkAfterAuthentication` | `yes` / `no` | 认证及转发建立完成后进入后台运行（对应 `-f`，隐含 `stdin_null`） |

@@ -164,7 +164,7 @@ nodes:
       strict_host_key_checking: accept-new
 ```
 
-**Configuration precedence**: CLI `-M`/`-S`/`-o` > Node configuration (`node.ssh_options`) > Global configuration (`cfg.ssh_options`) > `~/.ssh/config` (host-trust options such as `StrictHostKeyChecking` and `UserKnownHostsFile` are read only from explicit CLI `-o` flags or `xops_config.yaml`, never implicitly inherited from `~/.ssh/config`).
+**Configuration precedence**: CLI `-M`/`-S`/`-o` > Node configuration (`node.ssh_options`) > Global configuration (`cfg.ssh_options`) > `~/.ssh/config` (host-trust options such as `StrictHostKeyChecking` and `UserKnownHostsFile` are read only from explicit CLI `-o` flags or `xops_config.yaml`, never implicitly inherited from `~/.ssh/config`; for `HashKnownHosts`, when xops `hash_known_hosts` is unset or `false`, `HashKnownHosts yes` from `~/.ssh/config` is inherited via a one-way security-preserving merge, so xops `hash_known_hosts: true` is not downgraded by `HashKnownHosts no` unless explicitly overridden via CLI `-o HashKnownHosts=no`).
 
 ### Supported options and forwarding/tunnel options
 
@@ -178,7 +178,7 @@ nodes:
 | `strict_host_key_checking` | `StrictHostKeyChecking` | `yes` / `no` / `ask` / `accept-new` / `off` | Remote host key verification policy |
 | `exit_on_forward_failure` | `ExitOnForwardFailure` | `yes` / `no` | Whether to terminate the session immediately if any port forwarding or tunnel setup fails |
 | `clear_all_forwardings` | `ClearAllForwardings` | `yes` / `no` | Whether to clear all port and tunnel device forwardings previously declared in config files or command lines |
-| `gateway_ports` | `GatewayPorts` | `yes` / `no` | Allows external hosts to connect to local forwarded ports (defaults to `no`) |
+| `gateway_ports` | `GatewayPorts` | `yes` / `no` / `clientspecified` | Allows external hosts to connect to local forwarded ports (defaults to `no`; `clientspecified` honors the client-specified bind address) |
 | `stream_local_bind_unlink` | `StreamLocalBindUnlink` | `yes` / `no` | Whether to remove an existing Unix domain socket file before binding (defaults to `no`) |
 | `stream_local_bind_mask` | `StreamLocalBindMask` | Octal mask (e.g. `0177`, `0117`) | File mode creation mask (umask) for Unix domain socket files (defaults to `0177`) |
 | `fork_after_authentication` | `ForkAfterAuthentication` | `yes` / `no` | Run in background after authentication and forwardings are established (corresponds to `-f`, implies `stdin_null`) |

@@ -413,17 +413,13 @@ func validateRoutingTargetCompatibility(cur ConnectionConfig, newCfg *ClientConf
 		return fmt.Errorf("%w: proxy jump changed (expected %q, got %q)",
 			ErrSnapshotMismatch, expectedJump, actualJump)
 	}
-	expectedProxyCmd := ""
-	if expectedJump == "" {
-		expectedProxyCmd = cur.Options.ActiveProxyCommand()
-	}
-	actualProxyCmd := ""
-	if actualJump == "" {
-		actualProxyCmd = newCfg.Options.ActiveProxyCommand()
-	}
-	if actualProxyCmd != expectedProxyCmd {
-		return fmt.Errorf("%w: proxy command changed (expected %q, got %q)",
-			ErrSnapshotMismatch, expectedProxyCmd, actualProxyCmd)
+	if strings.TrimSpace(cur.ProxyJump) == "" {
+		expectedProxyCmd := cur.Options.ActiveProxyCommand()
+		actualProxyCmd := newCfg.Options.ActiveProxyCommand()
+		if actualProxyCmd != expectedProxyCmd {
+			return fmt.Errorf("%w: proxy command changed (expected %q, got %q)",
+				ErrSnapshotMismatch, expectedProxyCmd, actualProxyCmd)
+		}
 	}
 	return nil
 }

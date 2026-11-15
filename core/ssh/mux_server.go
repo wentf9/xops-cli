@@ -191,7 +191,10 @@ type MuxServer struct {
 	idleGen              uint64        // generation counter for idle timer, protected by idleMu
 	shuttingDown         bool          // true when server committed to shutdown, protected by idleMu
 	handoffReserved      bool          // true while PrepareHandoff holds a reservation, protected by idleMu
+	hadActiveSession     bool          // true once an initial or dynamic session was admitted, protected by idleMu
 	stopRepliesInFlight  int           // count of in-flight -O stop replies, protected by idleMu
+	openFwdsInFlight     int           // count of in-flight MUX_C_OPEN_FWD requests, protected by idleMu
+	closeFwdsInFlight    int           // count of in-flight MUX_C_CLOSE_FWD requests, protected by idleMu
 	idleNotify           chan struct{} // closed and replaced under idleMu when session/forward/stop state changes
 	idleMu               sync.Mutex
 	target               TargetContext
@@ -276,6 +279,7 @@ func NewMuxServer(opts MuxServerOptions) (*MuxServer, error) {
 
 	if opts.InitialActiveSessions > 0 {
 		server.activeSessions.Store(opts.InitialActiveSessions)
+		server.hadActiveSession = true
 	}
 
 	if server.persistEnabled && !server.persistIndefinite && server.persistDuration > 0 && server.activeSessions.Load() == 0 {
@@ -288,7 +292,27 @@ func NewMuxServer(opts MuxServerOptions) (*MuxServer, error) {
 		server.idleMu.Unlock()
 	}
 
+	if server.sshClient != nil && server.sshClient.Conn != nil {
+		go server.monitorSSHTransport()
+	}
+
 	return server, nil
+}
+
+func (s *MuxServer) monitorSSHTransport() {
+	if s == nil || s.sshClient == nil || s.sshClient.Conn == nil {
+		return
+	}
+	waitDone := make(chan struct{})
+	go func() {
+		defer close(waitDone)
+		_ = s.sshClient.Wait()
+	}()
+	select {
+	case <-waitDone:
+		_ = s.Shutdown()
+	case <-s.shutdownChan:
+	}
 }
 
 var activeMuxServers sync.Map // string (controlPath) -> *MuxServer
@@ -464,6 +488,22 @@ func (s *MuxServer) isShuttingDown() bool {
 	return s.shuttingDown
 }
 
+func (s *MuxServer) hasInFlightEndpointsLocked() bool {
+	for _, ep := range s.listenEndpoints {
+		if ep != nil && ep.inFlight {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *MuxServer) hasInFlightControlOrForwardLocked() bool {
+	return s.stopRepliesInFlight > 0 ||
+		s.openFwdsInFlight > 0 ||
+		s.closeFwdsInFlight > 0 ||
+		s.hasInFlightEndpointsLocked()
+}
+
 // PrepareHandoff reserves the master for a ControlPersist handoff. It succeeds
 // only when no other session or forward depends on this process: shutting the
 // master down would otherwise cut those users off. On success the server is
@@ -475,7 +515,7 @@ func (s *MuxServer) PrepareHandoff() bool {
 	}
 	s.idleMu.Lock()
 	defer s.idleMu.Unlock()
-	if s.shuttingDown || s.closed.Load() || s.stoppedListening.Load() || s.stopRepliesInFlight > 0 || s.activeSessions.Load() > 0 {
+	if s.shuttingDown || s.closed.Load() || s.stoppedListening.Load() || s.hasInFlightControlOrForwardLocked() || s.activeSessions.Load() > 0 {
 		return false
 	}
 	if s.forwardCount() > 0 || len(s.listenEndpoints) > 0 || s.activeForwardStreams.Load() > 0 {
@@ -504,7 +544,7 @@ func (s *MuxServer) CancelHandoff() {
 	}
 	s.handoffReserved = false
 	if s.stoppedListening.Load() {
-		shouldShutdown := s.stopRepliesInFlight == 0 &&
+		shouldShutdown := !s.hasInFlightControlOrForwardLocked() &&
 			s.activeSessions.Load() <= 0 &&
 			s.activeForwardStreams.Load() <= 0
 		if shouldShutdown {
@@ -527,6 +567,7 @@ func (s *MuxServer) CancelHandoff() {
 	s.shuttingDown = false
 	s.notifyIdleLocked()
 	if s.persistEnabled && !s.persistIndefinite && s.persistDuration > 0 &&
+		!s.hasInFlightControlOrForwardLocked() &&
 		s.activeSessions.Load() <= 0 && s.activeForwardStreams.Load() <= 0 {
 		s.scheduleIdleOrShutdownLocked()
 	}
@@ -559,7 +600,11 @@ func (s *MuxServer) WaitForDrain(ctx context.Context, maxSessions int32) error {
 	for {
 		s.idleMu.Lock()
 		ready := s.shuttingDown || s.closed.Load() || s.stoppedListening.Load() ||
-			(s.activeSessions.Load() <= maxSessions && s.forwardCount() == 0 && len(s.listenEndpoints) == 0 && s.activeForwardStreams.Load() == 0)
+			(s.activeSessions.Load() <= maxSessions &&
+				!s.hasInFlightControlOrForwardLocked() &&
+				s.forwardCount() == 0 &&
+				len(s.listenEndpoints) == 0 &&
+				s.activeForwardStreams.Load() == 0)
 		notify := s.idleNotify
 		s.idleMu.Unlock()
 		if ready {
@@ -879,6 +924,7 @@ func (s *MuxServer) handleStopListening(conn net.Conn, reqID uint32) error {
 
 	s.idleMu.Lock()
 	s.stopRepliesInFlight--
+	s.notifyIdleLocked()
 	s.idleMu.Unlock()
 
 	if s.releaseForegroundOnStop.Swap(false) {
@@ -895,7 +941,7 @@ func (s *MuxServer) handleStopListening(conn net.Conn, reqID uint32) error {
 // addActiveSession, which refuses to start sessions on a shutting-down master.
 func (s *MuxServer) shutdownWhenIdle() {
 	s.idleMu.Lock()
-	if s.shuttingDown || s.handoffReserved || s.stopRepliesInFlight > 0 || s.closed.Load() || s.activeSessions.Load() > 0 || s.activeForwardStreams.Load() > 0 {
+	if s.shuttingDown || s.handoffReserved || s.hasInFlightControlOrForwardLocked() || s.closed.Load() || s.activeSessions.Load() > 0 || s.activeForwardStreams.Load() > 0 {
 		s.idleMu.Unlock()
 		return
 	}
@@ -1041,7 +1087,81 @@ func canonicalTCPMuxEndpointHost(network, host string) string {
 	return strings.ToLower(host)
 }
 
+func validateAndNormalizeMuxFwdSpec(
+	fwdType uint32,
+	listenHost string,
+	listenPort uint32,
+	connectHost string,
+	connectPort uint32,
+) (normListenHost string, normConnectHost string, err error) {
+	if strings.IndexByte(listenHost, 0) >= 0 {
+		return "", "", errors.New("forward listen host contains NUL byte")
+	}
+	if strings.IndexByte(connectHost, 0) >= 0 {
+		return "", "", errors.New("forward connect host contains NUL byte")
+	}
+	switch fwdType {
+	case MUX_FWD_LOCAL, MUX_FWD_REMOTE, MUX_FWD_DYNAMIC:
+	default:
+		return "", "", fmt.Errorf("unsupported forward type %d", fwdType)
+	}
+
+	normListenHost, err = validateMuxFwdListenEndpoint(listenHost, listenPort)
+	if err != nil {
+		return "", "", err
+	}
+	normConnectHost, err = validateMuxFwdConnectEndpoint(fwdType, connectHost, connectPort)
+	if err != nil {
+		return "", "", err
+	}
+	return normListenHost, normConnectHost, nil
+}
+
+func validateMuxFwdListenEndpoint(listenHost string, listenPort uint32) (string, error) {
+	if listenPort == MUX_SPECIAL_PORT_UNIX {
+		return cleanMuxUnixSocketPath(listenHost)
+	}
+	if listenPort > 65535 {
+		return "", fmt.Errorf("invalid forward listen port %s", strconv.FormatUint(uint64(listenPort), 10))
+	}
+	return normalizeMuxForwardHost(listenHost, listenPort), nil
+}
+
+func validateMuxFwdConnectEndpoint(fwdType uint32, connectHost string, connectPort uint32) (string, error) {
+	if fwdType == MUX_FWD_DYNAMIC {
+		if connectPort != 0 {
+			return "", fmt.Errorf("invalid dynamic forward connect port %s", strconv.FormatUint(uint64(connectPort), 10))
+		}
+		return normalizeMuxForwardHost(connectHost, connectPort), nil
+	}
+	if connectPort == MUX_SPECIAL_PORT_UNIX {
+		cleanTarget, err := cleanMuxUnixSocketPath(connectHost)
+		if err != nil {
+			return "", errors.New("streamlocal connect socket path cannot be empty")
+		}
+		return cleanTarget, nil
+	}
+	if fwdType == MUX_FWD_REMOTE && connectPort == 0 {
+		norm := normalizeMuxForwardHost(connectHost, connectPort)
+		if norm == "" {
+			return "", nil
+		}
+		return "", fmt.Errorf("invalid forward connect port %s", strconv.FormatUint(uint64(connectPort), 10))
+	}
+	if connectPort < 1 || connectPort > 65535 {
+		return "", fmt.Errorf("invalid forward connect port %s", strconv.FormatUint(uint64(connectPort), 10))
+	}
+	norm := normalizeMuxForwardHost(connectHost, connectPort)
+	if norm == "" {
+		return "", errors.New("forward connect host cannot be empty")
+	}
+	return norm, nil
+}
+
 func (s *MuxServer) resolveMuxForwardListenSpec(fwdType uint32, listenHost string, listenPort uint32) (resolvedMuxListen, error) {
+	if strings.IndexByte(listenHost, 0) >= 0 {
+		return resolvedMuxListen{}, errors.New("forward listen host contains NUL byte")
+	}
 	if listenPort == MUX_SPECIAL_PORT_UNIX {
 		cleanPath, err := cleanMuxUnixSocketPath(listenHost)
 		if err != nil {
@@ -1056,9 +1176,12 @@ func (s *MuxServer) resolveMuxForwardListenSpec(fwdType uint32, listenHost strin
 			isDynamicPort: false,
 		}, nil
 	}
+	if listenPort > 65535 {
+		return resolvedMuxListen{}, fmt.Errorf("invalid forward listen port %s", strconv.FormatUint(uint64(listenPort), 10))
+	}
 	dialNet := s.effectiveDialNetwork()
 	trimmed := normalizeMuxForwardHost(listenHost, listenPort)
-	portStr := strconv.Itoa(int(listenPort))
+	portStr := strconv.FormatUint(uint64(listenPort), 10)
 	isDyn := isTCPNetwork(dialNet) && listenPort == 0
 
 	switch fwdType {
@@ -1311,14 +1434,22 @@ func (s *MuxServer) closeMuxForwardEntryWithShadows(entry *muxForwardEntry, shad
 	}
 }
 
+func (e *muxForwardEntry) takeShadowClosers() []io.Closer {
+	if e == nil {
+		return nil
+	}
+	e.closed = true
+	shadows := e.shadowClosers
+	e.shadowClosers = nil
+	return shadows
+}
+
 func (s *MuxServer) takeShadowClosers(entry *muxForwardEntry) []io.Closer {
 	if entry == nil {
 		return nil
 	}
 	s.idleMu.Lock()
-	entry.closed = true
-	shadows := entry.shadowClosers
-	entry.shadowClosers = nil
+	shadows := entry.takeShadowClosers()
 	s.idleMu.Unlock()
 	return shadows
 }
@@ -1395,7 +1526,9 @@ type forwardListenKey struct {
 
 type muxForwardEndpointState struct {
 	inFlight      bool
+	closing       bool
 	done          chan struct{}
+	closingWait   chan struct{}
 	entry         *muxForwardEntry
 	fallbackEntry *muxForwardEntry
 }
@@ -1552,7 +1685,10 @@ func (s *MuxServer) releaseInFlightEndpointSlotLocked(listenKey forwardListenKey
 			slot.entry = slot.fallbackEntry
 			slot.fallbackEntry = nil
 			slot.inFlight = false
+			slot.closing = false
 		} else {
+			slot.inFlight = false
+			slot.closing = false
 			delete(s.listenEndpoints, listenKey)
 		}
 	}
@@ -1565,6 +1701,12 @@ func (s *MuxServer) abortReservedForward(listenKey forwardListenKey, slot *muxFo
 		return
 	}
 	s.idleMu.Lock()
+	for slot.closingWait != nil {
+		waitCh := slot.closingWait
+		s.idleMu.Unlock()
+		<-waitCh
+		s.idleMu.Lock()
+	}
 	s.releaseInFlightEndpointSlotLocked(listenKey, slot)
 	s.idleMu.Unlock()
 }
@@ -1586,6 +1728,14 @@ func (s *MuxServer) commitReservedForwardSlot(
 	cand *muxForwardEntry,
 ) (entry *muxForwardEntry, duplicate bool, conflict bool, shuttingDown bool) {
 	s.idleMu.Lock()
+	if slot != nil {
+		for slot.closingWait != nil {
+			waitCh := slot.closingWait
+			s.idleMu.Unlock()
+			<-waitCh
+			s.idleMu.Lock()
+		}
+	}
 	if s.shuttingDown || s.closed.Load() {
 		s.releaseInFlightEndpointSlotLocked(listenKey, slot)
 		s.idleMu.Unlock()
@@ -1707,19 +1857,42 @@ func (s *MuxServer) deleteEndpointEntryLocked(entry *muxForwardEntry) {
 }
 
 func (s *MuxServer) handleOpenFwd(conn net.Conn, req MuxFwdRequest) error {
-	if s.isShuttingDown() {
+	s.idleMu.Lock()
+	if s.shuttingDown || s.closed.Load() || s.stoppedListening.Load() {
 		// Shutdown already took its listener snapshot; accepting a forward now would
 		// leave a listener that outlives the master it belongs to.
+		s.idleMu.Unlock()
 		return sendFailure(conn, req.RequestID, "mux master is shutting down")
 	}
-	resolved, err := s.resolveMuxForwardListenSpec(req.FwdType, req.ListenHost, req.ListenPort)
+	s.openFwdsInFlight++
+	s.idleGen++
+	if s.idleTimer != nil {
+		s.idleTimer.Stop()
+		s.idleTimer = nil
+	}
+	s.idleMu.Unlock()
+
+	defer func() {
+		s.idleMu.Lock()
+		s.openFwdsInFlight--
+		s.scheduleIdleOrShutdownLocked()
+		s.notifyIdleLocked()
+		s.idleMu.Unlock()
+	}()
+
+	normListenHost, normConnectHost, err := validateAndNormalizeMuxFwdSpec(
+		req.FwdType, req.ListenHost, req.ListenPort, req.ConnectHost, req.ConnectPort,
+	)
+	if err != nil {
+		return sendFailure(conn, req.RequestID, err.Error())
+	}
+	resolved, err := s.resolveMuxForwardListenSpec(req.FwdType, normListenHost, req.ListenPort)
 	if err != nil {
 		return sendFailure(conn, req.RequestID, err.Error())
 	}
 	if err := s.authorize("forward"); err != nil {
 		return sendPermissionDenied(conn, req.RequestID, err.Error())
 	}
-	normConnectHost := normalizeMuxForwardHost(req.ConnectHost, req.ConnectPort)
 
 	var (
 		listenKey    forwardListenKey
@@ -1879,6 +2052,25 @@ func (s *MuxServer) recordDynamicEndpointLocked(dynKey forwardListenKey, cand *m
 	}
 }
 
+func (s *MuxServer) lockForPublishForward(hasDynKey bool, dynKey forwardListenKey) bool {
+	for {
+		s.idleMu.Lock()
+		if s.shuttingDown || s.closed.Load() {
+			s.idleMu.Unlock()
+			return false
+		}
+		if hasDynKey {
+			if waited, aborted := s.waitClosingEndpointLocked(dynKey); waited {
+				if aborted {
+					return false
+				}
+				continue
+			}
+		}
+		return true
+	}
+}
+
 // publishForward registers a dynamically allocated listener this master now
 // owns. Shutdown and PrepareHandoff synchronize on idleMu, so a forward never
 // slips in after the master committed to handoff or shutdown.
@@ -1888,17 +2080,6 @@ func (s *MuxServer) publishForward(
 	key string,
 	cand *muxForwardEntry,
 ) (entry *muxForwardEntry, duplicate bool, conflict bool, shuttingDown bool) {
-	s.idleMu.Lock()
-	if s.shuttingDown || s.closed.Load() {
-		s.idleMu.Unlock()
-		s.closeUnpublishedMuxForward(cand)
-		return nil, false, false, true
-	}
-	if cand.refs <= 0 {
-		cand.refs = 1
-	}
-	cand.forwardKey = key
-
 	var (
 		dynKey    forwardListenKey
 		hasDynKey bool
@@ -1911,6 +2092,19 @@ func (s *MuxServer) publishForward(
 			listenPort: allocatedPort,
 		}
 		hasDynKey = true
+	}
+
+	if !s.lockForPublishForward(hasDynKey, dynKey) {
+		s.closeUnpublishedMuxForward(cand)
+		return nil, false, false, true
+	}
+
+	if cand.refs <= 0 {
+		cand.refs = 1
+	}
+	cand.forwardKey = key
+
+	if hasDynKey {
 		if epConflict, retained := s.checkDynamicEndpointConflictLocked(dynKey, cand); epConflict {
 			s.idleMu.Unlock()
 			if !retained {
@@ -1952,20 +2146,37 @@ func (s *MuxServer) publishForward(
 func (s *MuxServer) retireForward(key string, entry *muxForwardEntry) {
 	s.idleMu.Lock()
 	deleted := s.forwards.CompareAndDelete(key, entry)
-	s.deleteEndpointEntryLocked(entry)
-	var shadows []io.Closer
-	if entry != nil {
-		entry.closed = true
-		shadows = entry.shadowClosers
-		entry.shadowClosers = nil
-	}
-	if deleted {
-		s.notifyIdleLocked()
+	shadows := entry.takeShadowClosers()
+	var closingSlot *muxForwardEndpointState
+	if deleted && len(shadows) > 0 && entry != nil && entry.hasListenKey && !s.shuttingDown && !s.closed.Load() {
+		if s.listenEndpoints == nil {
+			s.listenEndpoints = make(map[forwardListenKey]*muxForwardEndpointState)
+		}
+		if cur := s.listenEndpoints[entry.listenKey]; cur == nil || (!cur.inFlight && cur.entry == entry) {
+			closingSlot = &muxForwardEndpointState{
+				inFlight: true,
+				closing:  true,
+				done:     make(chan struct{}),
+			}
+			s.listenEndpoints[entry.listenKey] = closingSlot
+		} else {
+			s.deleteEndpointEntryLocked(entry)
+		}
+	} else {
+		s.deleteEndpointEntryLocked(entry)
+		if deleted {
+			s.notifyIdleLocked()
+		}
 	}
 	s.idleMu.Unlock()
 
 	if len(shadows) > 0 {
 		s.closeMuxForwardEntryWithShadows(&muxForwardEntry{remote: entry.remote}, shadows)
+	}
+	if closingSlot != nil {
+		s.idleMu.Lock()
+		s.releaseInFlightEndpointSlotLocked(entry.listenKey, closingSlot)
+		s.idleMu.Unlock()
 	}
 }
 
@@ -2012,7 +2223,7 @@ func (s *MuxServer) serveLocalForward(ln net.Listener, connectHost string, conne
 			if len(connectPort) > 0 && connectPort[0] == MUX_SPECIAL_PORT_UNIX {
 				remote, dialErr = s.dialSSHMux(s.baseContext(), "unix", connectHost)
 			} else if len(connectPort) > 0 {
-				remote, dialErr = s.dialSSHMux(s.baseContext(), dialNet, net.JoinHostPort(connectHost, strconv.Itoa(int(connectPort[0]))))
+				remote, dialErr = s.dialSSHMux(s.baseContext(), dialNet, net.JoinHostPort(connectHost, strconv.FormatUint(uint64(connectPort[0]), 10)))
 			} else {
 				remote, dialErr = s.dialSSHMux(s.baseContext(), dialNet, connectHost)
 			}
@@ -2079,7 +2290,7 @@ func (s *MuxServer) serveRemoteForward(ln net.Listener, connectHost string, conn
 			if connectPort == MUX_SPECIAL_PORT_UNIX {
 				local, dialErr = dialer.DialContext(s.baseContext(), "unix", connectHost)
 			} else {
-				localAddr := net.JoinHostPort(connectHost, strconv.Itoa(int(connectPort)))
+				localAddr := net.JoinHostPort(connectHost, strconv.FormatUint(uint64(connectPort), 10))
 				local, dialErr = dialer.DialContext(s.baseContext(), dialNet, localAddr)
 			}
 			if dialErr != nil {
@@ -2161,64 +2372,196 @@ func pipeBidirectional(c1, c2 io.ReadWriteCloser) {
 	copies.Wait()
 }
 
-func (s *MuxServer) handleCloseFwd(conn net.Conn, req MuxFwdRequest) error {
-	resolved, err := s.resolveMuxForwardListenSpec(req.FwdType, req.ListenHost, req.ListenPort)
-	if err != nil {
-		return sendFailure(conn, req.RequestID, err.Error())
-	}
-	normConnectHost := normalizeMuxForwardHost(req.ConnectHost, req.ConnectPort)
-	key := forwardKey(req.FwdType, resolved.keyHost, req.ListenPort, normConnectHost, req.ConnectPort)
-	matchedKey := key
-
-	s.idleMu.Lock()
-	val, ok := s.forwards.Load(matchedKey)
-	if !ok && !resolved.isDynamicPort {
-		if listenKey, hasListenKey := makeForwardListenKey(req.FwdType, resolved); hasListenKey && s.listenEndpoints != nil {
-			candEntry := s.listenEndpoints[listenKey].cancelCandidateEntry()
-			if matchesMuxForwardCancelTarget(candEntry, req.FwdType, normConnectHost, req.ConnectPort) {
-				if candEntry.forwardKey != "" {
-					matchedKey = candEntry.forwardKey
-				}
-				val = candEntry
-				ok = true
-			}
+func (s *MuxServer) lookupCloseFwdTargetLocked(
+	key string,
+	req MuxFwdRequest,
+	resolved resolvedMuxListen,
+	reqListenKey forwardListenKey,
+	hasReqListenKey bool,
+	normConnectHost string,
+) (matchedKey string, entry *muxForwardEntry, ok bool) {
+	matchedKey = key
+	if val, found := s.forwards.Load(matchedKey); found {
+		if e, isEntry := val.(*muxForwardEntry); isEntry {
+			return matchedKey, e, true
 		}
 	}
-	if !ok && resolved.isDynamicPort {
+	if !resolved.isDynamicPort && hasReqListenKey && s.listenEndpoints != nil {
+		candEntry := s.listenEndpoints[reqListenKey].cancelCandidateEntry()
+		if matchesMuxForwardCancelTarget(candEntry, req.FwdType, normConnectHost, req.ConnectPort) {
+			if candEntry.forwardKey != "" {
+				matchedKey = candEntry.forwardKey
+			}
+			return matchedKey, candEntry, true
+		}
+	}
+	if resolved.isDynamicPort {
 		s.forwards.Range(func(k, v any) bool {
 			ks, isStr := k.(string)
-			entry, isEntry := v.(*muxForwardEntry)
-			if isStr && isEntry && entry.dynamicAlloc &&
-				(entry.keyHost == resolved.keyHost || entry.endpointHost == resolved.endpointHost) &&
-				matchesMuxForwardCancelTarget(entry, req.FwdType, normConnectHost, req.ConnectPort) {
+			e, isEntry := v.(*muxForwardEntry)
+			if isStr && isEntry && e.dynamicAlloc &&
+				(e.keyHost == resolved.keyHost || e.endpointHost == resolved.endpointHost) &&
+				matchesMuxForwardCancelTarget(e, req.FwdType, normConnectHost, req.ConnectPort) {
 				matchedKey = ks
-				val = entry
+				entry = e
 				ok = true
 				return false
 			}
 			return true
 		})
 	}
-	if !ok {
-		s.idleMu.Unlock()
-		return sendFailure(conn, req.RequestID, "forwarding not found")
+	return matchedKey, entry, ok
+}
+
+func (s *MuxServer) beginEndpointCloseBarrierLocked(entry *muxForwardEntry) (
+	closingSlot *muxForwardEndpointState,
+	inFlightCur *muxForwardEndpointState,
+	closingWaitDone chan struct{},
+) {
+	if entry == nil || !entry.hasListenKey {
+		return nil, nil, nil
 	}
-	entry := val.(*muxForwardEntry)
-	entry.refs--
-	if entry.refs > 0 {
-		s.idleMu.Unlock()
-		return sendOk(conn, req.RequestID)
+	if s.listenEndpoints == nil {
+		s.listenEndpoints = make(map[forwardListenKey]*muxForwardEndpointState)
 	}
-	s.forwards.Delete(matchedKey)
-	s.deleteEndpointEntryLocked(entry)
-	entry.closed = true
-	shadows := entry.shadowClosers
-	entry.shadowClosers = nil
-	s.notifyIdleLocked()
+	cur := s.listenEndpoints[entry.listenKey]
+	if cur != nil && cur.inFlight && !cur.closing {
+		if cur.fallbackEntry == entry {
+			cur.fallbackEntry = nil
+		}
+		closingWaitDone = make(chan struct{})
+		cur.closingWait = closingWaitDone
+		return nil, cur, closingWaitDone
+	}
+	closingSlot = &muxForwardEndpointState{
+		inFlight: true,
+		closing:  true,
+		done:     make(chan struct{}),
+	}
+	s.listenEndpoints[entry.listenKey] = closingSlot
+	return closingSlot, nil, nil
+}
+
+func (s *MuxServer) finishEndpointCloseBarrierLocked(
+	entry *muxForwardEntry,
+	closingSlot *muxForwardEndpointState,
+	inFlightCur *muxForwardEndpointState,
+	closingWaitDone chan struct{},
+) {
+	if closingSlot != nil && entry != nil {
+		s.releaseInFlightEndpointSlotLocked(entry.listenKey, closingSlot)
+	}
+	if closingWaitDone != nil {
+		if inFlightCur != nil && inFlightCur.closingWait == closingWaitDone {
+			inFlightCur.closingWait = nil
+		}
+		close(closingWaitDone)
+	}
+}
+
+func (s *MuxServer) waitClosingEndpointLocked(listenKey forwardListenKey) (waited bool, aborted bool) {
+	if s.listenEndpoints == nil {
+		return false, false
+	}
+	cur := s.listenEndpoints[listenKey]
+	if cur == nil || !cur.closing {
+		return false, false
+	}
+	waitCh := cur.done
+	s.idleMu.Unlock()
+	select {
+	case <-waitCh:
+		return true, false
+	case <-s.baseContext().Done():
+		return true, true
+	}
+}
+
+func (s *MuxServer) handleCloseFwd(conn net.Conn, req MuxFwdRequest) error {
+	s.idleMu.Lock()
+	if s.shuttingDown || s.closed.Load() {
+		s.idleMu.Unlock()
+		return sendFailure(conn, req.RequestID, "mux master is shutting down")
+	}
+	s.closeFwdsInFlight++
+	s.idleGen++
+	if s.idleTimer != nil {
+		s.idleTimer.Stop()
+		s.idleTimer = nil
+	}
 	s.idleMu.Unlock()
 
-	s.closeMuxForwardEntryWithShadows(entry, shadows)
-	return sendOk(conn, req.RequestID)
+	defer func() {
+		s.idleMu.Lock()
+		s.closeFwdsInFlight--
+		s.scheduleIdleOrShutdownLocked()
+		s.notifyIdleLocked()
+		s.idleMu.Unlock()
+	}()
+
+	normListenHost, normConnectHost, err := validateAndNormalizeMuxFwdSpec(
+		req.FwdType, req.ListenHost, req.ListenPort, req.ConnectHost, req.ConnectPort,
+	)
+	if err != nil {
+		return sendFailure(conn, req.RequestID, err.Error())
+	}
+	resolved, err := s.resolveMuxForwardListenSpec(req.FwdType, normListenHost, req.ListenPort)
+	if err != nil {
+		return sendFailure(conn, req.RequestID, err.Error())
+	}
+	key := forwardKey(req.FwdType, resolved.keyHost, req.ListenPort, normConnectHost, req.ConnectPort)
+	reqListenKey, hasReqListenKey := makeForwardListenKey(req.FwdType, resolved)
+
+	for {
+		s.idleMu.Lock()
+		if s.shuttingDown || s.closed.Load() {
+			s.idleMu.Unlock()
+			return sendFailure(conn, req.RequestID, "mux master is shutting down")
+		}
+		if hasReqListenKey {
+			if waited, aborted := s.waitClosingEndpointLocked(reqListenKey); waited {
+				if aborted {
+					return sendFailure(conn, req.RequestID, "mux master is shutting down")
+				}
+				continue
+			}
+		}
+
+		matchedKey, entry, ok := s.lookupCloseFwdTargetLocked(
+			key, req, resolved, reqListenKey, hasReqListenKey, normConnectHost,
+		)
+		if !ok {
+			s.idleMu.Unlock()
+			return sendFailure(conn, req.RequestID, "forwarding not found")
+		}
+		if entry.hasListenKey {
+			if waited, aborted := s.waitClosingEndpointLocked(entry.listenKey); waited {
+				if aborted {
+					return sendFailure(conn, req.RequestID, "mux master is shutting down")
+				}
+				continue
+			}
+		}
+
+		entry.refs--
+		if entry.refs > 0 {
+			s.idleMu.Unlock()
+			return sendOk(conn, req.RequestID)
+		}
+
+		s.forwards.Delete(matchedKey)
+		shadows := entry.takeShadowClosers()
+		closingSlot, inFlightCur, closingWaitDone := s.beginEndpointCloseBarrierLocked(entry)
+		s.idleMu.Unlock()
+
+		s.closeMuxForwardEntryWithShadows(entry, shadows)
+
+		s.idleMu.Lock()
+		s.finishEndpointCloseBarrierLocked(entry, closingSlot, inFlightCur, closingWaitDone)
+		s.idleMu.Unlock()
+
+		return sendOk(conn, req.RequestID)
+	}
 }
 
 type proxyChan struct {
@@ -3354,6 +3697,7 @@ func (s *MuxServer) addActiveSession() bool {
 	}
 
 	s.activeSessions.Add(1)
+	s.hadActiveSession = true
 	s.idleGen++
 	if s.idleTimer != nil {
 		s.idleTimer.Stop()
@@ -3404,11 +3748,11 @@ func (s *MuxServer) scheduleIdleOrShutdownLocked() {
 	if s.shuttingDown || s.handoffReserved || s.closed.Load() {
 		return
 	}
+	if s.activeSessions.Load() > 0 || s.activeForwardStreams.Load() > 0 || s.hasInFlightControlOrForwardLocked() {
+		return
+	}
 
 	if s.stoppedListening.Load() {
-		if s.stopRepliesInFlight > 0 {
-			return
-		}
 		s.shuttingDown = true
 		go func() { _ = s.Shutdown() }()
 		return
@@ -3423,7 +3767,7 @@ func (s *MuxServer) scheduleIdleOrShutdownLocked() {
 		s.idleTimer = time.AfterFunc(s.persistDuration, func() {
 			s.onIdleTimeout(gen)
 		})
-	} else if !s.persistEnabled {
+	} else if !s.persistEnabled && s.hadActiveSession {
 		s.shuttingDown = true
 		go func() { _ = s.Shutdown() }()
 	}
@@ -3436,7 +3780,7 @@ func (s *MuxServer) onIdleTimeout(gen uint64) {
 		return
 	}
 
-	if s.activeSessions.Load() > 0 || s.activeForwardStreams.Load() > 0 {
+	if s.activeSessions.Load() > 0 || s.activeForwardStreams.Load() > 0 || s.hasInFlightControlOrForwardLocked() {
 		s.idleMu.Unlock()
 		return
 	}

@@ -417,7 +417,7 @@ func TestCommands_ExecTagUsesExplicitSessionCredentials(t *testing.T) {
 	execOpt.Password = "tag-password"
 	execOpt.Passphrase = "tag-passphrase"
 	execOpt.Remember = "never"
-	tasks, err := execOpt.buildTasksFromTags(repo)
+	tasks, err := execOpt.buildTasksFromTags(t.Context(), repo)
 	if err != nil {
 		t.Fatalf("build tag tasks: %v", err)
 	}
@@ -595,28 +595,35 @@ func TestCommands_ExecUsesSelectedSessionKey(t *testing.T) {
 func TestCommands_SCP_FlagPrecedence(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("scp_flag_user_overrides_path_user", func(t *testing.T) {
-		repo := setupTestRepository(t)
-		scpOpt := NewScpOptions()
-		scpOpt.User = "test"
-		target, err := scpOpt.resolveTargetForPath(PathInfo{Host: "10.238.221.181", User: "iaas", Port: 22})
-		if err != nil {
-			t.Fatalf("resolveTargetForPath failed: %v", err)
-		}
-		res, err := repo.EnsureNodeContext(ctx, config.EnsureNodeOptions{Target: target})
-		if err != nil {
-			t.Fatalf("EnsureNodeContext failed: %v", err)
-		}
-		if !res.Created || res.NodeID != "test@10.238.221.181:22" {
-			t.Errorf("expected nodeID 'test@10.238.221.181:22', got %q", res.NodeID)
+	t.Run("scp_global_flags_override_saved_node_without_inline_user_or_port", func(t *testing.T) {
+		for _, path := range []PathInfo{
+			{Host: "10.238.221.181", IsRemote: true},
+			{Host: "iaas@10.238.221.181:22", IsRemote: true},
+		} {
+			repo := setupTestRepository(t)
+			scpOpt := NewScpOptions()
+			scpOpt.User = "test"
+			scpOpt.Port = 2222
+			target, err := scpOpt.resolveTargetForPath(path)
+			if err != nil {
+				t.Fatalf("resolveTargetForPath(%+v) failed: %v", path, err)
+			}
+			res, err := repo.EnsureNodeContext(ctx, config.EnsureNodeOptions{Target: target})
+			if err != nil {
+				t.Fatalf("EnsureNodeContext(%+v) failed: %v", path, err)
+			}
+			if !res.Created || res.NodeID != "test@10.238.221.181:2222" {
+				t.Errorf("path %+v: expected nodeID 'test@10.238.221.181:2222', got %q (created=%v)", path, res.NodeID, res.Created)
+			}
 		}
 	})
 
-	t.Run("scp_flag_port_overrides_selected_node_port", func(t *testing.T) {
+	t.Run("scp_inline_user_and_port_override_global_flags", func(t *testing.T) {
 		repo := setupTestRepository(t)
 		scpOpt := NewScpOptions()
+		scpOpt.User = "test"
 		scpOpt.Port = 2222
-		target, err := scpOpt.resolveTargetForPath(PathInfo{Host: "10.238.221.181", User: "test", Port: 22})
+		target, err := scpOpt.resolveTargetForPath(PathInfo{Host: "10.238.221.181", User: "alice", Port: 2223, IsRemote: true})
 		if err != nil {
 			t.Fatalf("resolveTargetForPath failed: %v", err)
 		}
@@ -624,8 +631,8 @@ func TestCommands_SCP_FlagPrecedence(t *testing.T) {
 		if err != nil {
 			t.Fatalf("EnsureNodeContext failed: %v", err)
 		}
-		if !res.Created || res.NodeID != "test@10.238.221.181:2222" {
-			t.Errorf("expected nodeID 'test@10.238.221.181:2222', got %q", res.NodeID)
+		if !res.Created || res.NodeID != "alice@10.238.221.181:2223" {
+			t.Errorf("expected nodeID 'alice@10.238.221.181:2223', got %q (created=%v)", res.NodeID, res.Created)
 		}
 	})
 }

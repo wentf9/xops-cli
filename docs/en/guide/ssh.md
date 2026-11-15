@@ -15,6 +15,10 @@ xops ssh -J bastion.example.com deploy@192.0.2.10
 
 Direct jump hosts accept an IP, FQDN, or `host:port`; a single-label jump name (such as `-J jumphost`) must already exist as a saved node or alias. Connecting to the same host as a different user keeps credentials isolated per user.
 
+- **Username and port flag precedence** (OpenSSH native semantics):
+  - `xops ssh`, `xops sftp`, and single-target `xops exec`: explicit `-l`/`-p`/`-P` and `-o User`/`-o Port` override inline `user@` and `:port` in the destination.
+  - `xops scp` and batch `xops exec` (`--ifile` or multiple `--host`): inline per-endpoint `user@`/`:port` takes precedence over global `-l`/`-P`/`-p`, while global flags apply to endpoints that omit inline `user@`/`:port`.
+
 ## Connection diagnostics
 
 ```bash
@@ -60,7 +64,7 @@ xops ssh --host linux-01 --interpreter bash --launch-dialect posix --login-shell
 When `ssh`, `sftp`, `scp`, or `exec` connects to a new host for the first time, XOps **saves the node, host, and identity only after the connection and authentication succeed**:
 - Timeouts, refused connections, authentication failures, or cancellations before authentication leave no stale entries behind.
 - Saving occurs before opening a shell or running a command, so a subsequent command failure does not delete an authenticated node (nor do connection failures remove existing saved nodes).
-- `--remember never` only prevents saving password/passphrase secrets; authenticated node address details are still saved.
+- `--remember never` neither saves password/passphrase secrets nor auto-saves new node address entries (pre-existing saved nodes remain untouched).
 
 For example, if `xops ssh root@192.0.2.10` fails on default port 22, no `:22` node is created. If `xops ssh root@192.0.2.10:2222` then authenticates, only the `:2222` node is saved, and future commands that omit the port will match it automatically (if multiple ports are saved for the same host, specify the port or use a unique alias).
 

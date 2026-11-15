@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -827,7 +828,7 @@ func (o *ScpOptions) runBatchTagged(
 	if len(nodes) == 0 {
 		return fmt.Errorf("%s", i18n.Tf("err_tag_empty", map[string]any{"Tag": o.Tag}))
 	}
-	for nodeID := range nodes {
+	for _, nodeID := range slices.Sorted(maps.Keys(nodes)) {
 		addr := taggedNodePathInfo(nodeID)
 		canonAddr, canonErr := o.canonicalizePathInfo(ctx, provider, addr)
 		if canonErr != nil {
@@ -847,8 +848,14 @@ func (o *ScpOptions) runBatchTagged(
 		if resolveErr != nil {
 			return fmt.Errorf("resolve tagged scp node %q failed: %w", nid, resolveErr)
 		}
+		specificPass := ""
+		if o.Password != "" {
+			specificPass = o.Password
+		} else if o.User == "" || strings.TrimSpace(o.User) == identity.User {
+			specificPass = identity.Password
+		}
 		wp.Execute(func() {
-			if tErr := o.executeTransfer(ctx, nid, canonAddr, identity.Password, provider, connector); tErr != nil {
+			if tErr := o.executeTransfer(ctx, nid, canonAddr, specificPass, provider, connector); tErr != nil {
 				recordErr(nid, tErr)
 			}
 		})
@@ -871,14 +878,9 @@ func (o *ScpOptions) runBatchHosts(
 
 	// 处理 普通主机列表
 	for _, h := range hosts {
-		if h.User == "" {
-			h.User = o.User
-		}
+		h.User, _, h.Port, _ = o.resolveUserAndPort(PathInfo{Host: h.Host, User: h.User, Port: h.Port, IsRemote: true})
 		if h.Password == "" {
 			h.Password = o.Password
-		}
-		if h.Port == 0 {
-			h.Port = o.Port
 		}
 		addr := PathInfo{Host: h.Host, User: h.User, Port: h.Port, IsRemote: true}
 		canonAddr, canonErr := o.canonicalizePathInfo(ctx, provider, addr)
@@ -917,22 +919,50 @@ func (o *ScpOptions) isBatchHostExcluded(provider config.ConfigProvider, exclude
 	return cmdutils.IsTargetExcluded(excludes, info), nil
 }
 
+func (o *ScpOptions) resolveUserAndPort(path PathInfo) (user string, hasUser bool, port uint16, hasPort bool) {
+	if path.User != "" {
+		user = path.User
+		hasUser = true
+	} else if o.User != "" {
+		user = o.User
+		hasUser = true
+	}
+	if path.Port != 0 {
+		port = path.Port
+		hasPort = true
+	} else if o.Port != 0 {
+		port = o.Port
+		hasPort = true
+	}
+	return user, hasUser, port, hasPort
+}
+
+func (o *ScpOptions) appendOverriddenExcludeHost(info *cmdutils.ExcludeTargetInfo, expandHost string) {
+	if o == nil || info == nil {
+		return
+	}
+	if hostNameOverride, err := o.effectiveHostNameForHost(expandHost); err == nil && hostNameOverride != "" && !slices.Contains(info.UnmanagedHosts, hostNameOverride) {
+		info.UnmanagedHosts = append(info.UnmanagedHosts, hostNameOverride)
+	}
+}
+
 func (o *ScpOptions) excludeTargetInfoForPath(provider config.ConfigProvider, rawHost string, canonAddr PathInfo) (cmdutils.ExcludeTargetInfo, error) {
 	_ = o.ensureGeneralOptionsApplied()
-	user := canonAddr.User
-	if user == "" {
-		user = o.User
-	}
-	port := canonAddr.Port
-	if port == 0 {
-		port = o.Port
-	}
+	user, _, port, _ := o.resolveUserAndPort(canonAddr)
 	info := cmdutils.ExcludeTargetInfo{
 		User:           user,
 		Port:           port,
 		UnmanagedHosts: []string{rawHost, canonAddr.Host, canonAddr.OriginalHost},
 	}
+	fallbackExpandHost := canonAddr.OriginalHost
+	if fallbackExpandHost == "" {
+		fallbackExpandHost = config.UnwrapOpenSSHSelector(canonAddr.Host)
+	}
+	if fallbackExpandHost == "" {
+		fallbackExpandHost = config.UnwrapOpenSSHSelector(rawHost)
+	}
 	if provider == nil {
+		o.appendOverriddenExcludeHost(&info, fallbackExpandHost)
 		return info, nil
 	}
 	if target, tErr := o.resolveTargetForPath(canonAddr); tErr == nil && target.Selector != "" {
@@ -953,6 +983,11 @@ func (o *ScpOptions) excludeTargetInfoForPath(provider config.ConfigProvider, ra
 		if isResolvedSavedNode(resolved) && resolved.Host != "" && !slices.Contains(info.UnmanagedHosts, resolved.Host) {
 			info.UnmanagedHosts = append(info.UnmanagedHosts, resolved.Host)
 		}
+		_, expandHost := resolveTargetOriginalAndExpandHosts(canonAddr.OriginalHost != "", canonAddr.OriginalHost, target.Selector, resolved, true)
+		if expandHost == "" {
+			expandHost = fallbackExpandHost
+		}
+		o.appendOverriddenExcludeHost(&info, expandHost)
 		return info, nil
 	}
 	nid, resolveErr := provider.ResolveSelector(canonAddr.Host)
@@ -962,6 +997,7 @@ func (o *ScpOptions) excludeTargetInfoForPath(provider config.ConfigProvider, ra
 	if nid != "" {
 		info.NodeID = nid
 	}
+	o.appendOverriddenExcludeHost(&info, fallbackExpandHost)
 	return info, nil
 }
 
@@ -1095,14 +1131,7 @@ func (o *ScpOptions) canonicalCacheKey(p PathInfo) string {
 	if host == "" && o.Host != "" && !strings.Contains(o.Host, ",") {
 		host = o.Host
 	}
-	user := o.User
-	if user == "" {
-		user = p.User
-	}
-	port := o.Port
-	if port == 0 {
-		port = p.Port
-	}
+	user, _, port, _ := o.resolveUserAndPort(p)
 	if user == "" && port == 0 {
 		return host
 	}
@@ -1226,25 +1255,7 @@ func (o *ScpOptions) resolveTargetForPath(path PathInfo) (config.ConnectionTarge
 		return config.ConnectionTarget{}, fmt.Errorf("%s", i18n.T("scp_err_no_host_addr"))
 	}
 
-	hasUser := false
-	var user string
-	if o.User != "" {
-		hasUser = true
-		user = o.User
-	} else if path.User != "" {
-		hasUser = true
-		user = path.User
-	}
-
-	hasPort := false
-	var port uint16
-	if o.Port != 0 {
-		hasPort = true
-		port = o.Port
-	} else if path.Port != 0 {
-		hasPort = true
-		port = path.Port
-	}
+	user, hasUser, port, hasPort := o.resolveUserAndPort(path)
 
 	return config.ConnectionTarget{
 		Selector:     strings.TrimSpace(host),
@@ -1686,12 +1697,7 @@ func (o *ScpOptions) rawHostTargetPaths() []PathInfo {
 		if p.Host == "" {
 			return
 		}
-		if p.User == "" {
-			p.User = o.User
-		}
-		if p.Port == 0 {
-			p.Port = o.Port
-		}
+		p.User, _, p.Port, _ = o.resolveUserAndPort(p)
 		paths = append(paths, p)
 	}
 	if hosts, err := cmdutils.ParseHosts(o.Host, o.HostFile, ""); err == nil {
@@ -1711,7 +1717,7 @@ func (o *ScpOptions) rawHostTargetPaths() []PathInfo {
 func (o *ScpOptions) rawTargetPaths(provider config.ConfigProvider) []PathInfo {
 	var paths []PathInfo
 	if o.Tag != "" && provider != nil {
-		for nodeID := range provider.GetNodesByTag(o.Tag) {
+		for _, nodeID := range slices.Sorted(maps.Keys(provider.GetNodesByTag(o.Tag))) {
 			paths = append(paths, taggedNodePathInfo(nodeID))
 		}
 	}

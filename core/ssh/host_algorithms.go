@@ -274,18 +274,33 @@ func (a khAddr) String() string {
 	return h + ":" + a.port
 }
 
+func khOpenSSHHostPort(a khAddr) string {
+	h := strings.ToLower(a.host)
+	if a.port == "" || a.port == "22" {
+		return h
+	}
+	return "[" + h + "]:" + a.port
+}
+
 type khMatcher interface {
 	match(khAddr) bool
 }
 
 type khHostPattern struct {
-	negate bool
-	addr   khAddr
+	negate         bool
+	wildcard       bool
+	wildcardNoPort bool
+	rawPattern     string
+	addr           khAddr
 }
 
 func (p khHostPattern) match(a khAddr) bool {
-	return khWildcardMatch([]byte(p.addr.host), []byte(strings.ToLower(a.host))) &&
-		khWildcardMatch([]byte(p.addr.port), []byte(a.port))
+	if khWildcardMatch([]byte(p.addr.host), []byte(strings.ToLower(a.host))) &&
+		khWildcardMatch([]byte(p.addr.port), []byte(a.port)) {
+		return true
+	}
+	return p.wildcard && p.wildcardNoPort &&
+		khWildcardMatch([]byte(p.rawPattern), []byte(khOpenSSHHostPort(a)))
 }
 
 type khHostPatterns []khHostPattern
@@ -471,6 +486,19 @@ func (db *knownHostsDB) check(address string, remote net.Addr, remoteKey cryptoS
 	return keyErr
 }
 
+func validateHostCertCASignature(cert *cryptoSSH.Certificate) error {
+	if cert == nil {
+		return nil
+	}
+	if cert.Signature == nil {
+		return fmt.Errorf("%w: host certificate missing CA signature", ErrHostKeyMismatch)
+	}
+	if !slices.Contains(cryptoSSH.SupportedAlgorithms().PublicKeyAuths, cert.Signature.Format) {
+		return fmt.Errorf("%w: unsupported or insecure host certificate CA signature algorithm %q", ErrHostKeyMismatch, cert.Signature.Format)
+	}
+	return nil
+}
+
 func (db *knownHostsDB) hostKeyCallback() cryptoSSH.HostKeyCallback {
 	certChecker := cryptoSSH.CertChecker{
 		IsHostAuthority: db.isHostAuthority,
@@ -480,6 +508,11 @@ func (db *knownHostsDB) hostKeyCallback() cryptoSSH.HostKeyCallback {
 	return wrapNilRemoteHostKeyCallback(func(hostname string, remote net.Addr, key cryptoSSH.PublicKey) error {
 		if h, p, err := net.SplitHostPort(hostname); err == nil {
 			hostname = net.JoinHostPort(strings.ToLower(h), p)
+		}
+		if cert, ok := key.(*cryptoSSH.Certificate); ok {
+			if err := validateHostCertCASignature(cert); err != nil {
+				return err
+			}
 		}
 		return certChecker.CheckHostKey(hostname, remote, key)
 	})
@@ -628,6 +661,9 @@ func newKHHostnameMatcher(pattern string) (khMatcher, error) {
 			return nil, errors.New("knownhosts: negation without following hostname")
 		}
 		p = strings.ToLower(p)
+		wildcard := strings.ContainsAny(p, "*?")
+		var wildcardNoPort bool
+		var rawPattern string
 		var err error
 		if p[0] == '[' {
 			a.host, a.port, err = net.SplitHostPort(p)
@@ -639,9 +675,19 @@ func newKHHostnameMatcher(pattern string) (khMatcher, error) {
 			if err != nil {
 				a.host = p
 				a.port = "22"
+				if wildcard {
+					wildcardNoPort = true
+					rawPattern = p
+				}
 			}
 		}
-		hps = append(hps, khHostPattern{negate: negate, addr: a})
+		hps = append(hps, khHostPattern{
+			negate:         negate,
+			wildcard:       wildcard,
+			wildcardNoPort: wildcardNoPort,
+			rawPattern:     rawPattern,
+			addr:           a,
+		})
 	}
 	return hps, nil
 }

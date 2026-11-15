@@ -397,24 +397,6 @@ func (p *canonicalizePolicy) setTimeoutSeconds(v string) {
 	}
 }
 
-func firstSSHConfigKeyValue(cfg *ssh_config.Config, host, keyLower string) string {
-	for _, h := range cfg.Hosts {
-		if !h.Matches(host) {
-			continue
-		}
-		for _, node := range h.Nodes {
-			kv, ok := node.(*ssh_config.KV)
-			if !ok || kv == nil {
-				continue
-			}
-			if strings.ToLower(strings.TrimSpace(kv.Key)) == keyLower {
-				return strings.TrimSpace(kv.Value)
-			}
-		}
-	}
-	return ""
-}
-
 func splitCanonicalOptionKV(raw string) (string, string, bool) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {

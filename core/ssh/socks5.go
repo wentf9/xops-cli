@@ -1,6 +1,7 @@
 package ssh
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -62,17 +64,33 @@ func (c *Client) handleSocks5(ctx context.Context, conn net.Conn) error {
 	}, c.copyStream)
 }
 
+const defaultSocksHandshakeTimeout = 15 * time.Second
+
 func serveSocksConn(
 	ctx context.Context,
 	conn net.Conn,
 	dialFn func(ctx context.Context, destAddr string) (net.Conn, error),
 	pipeFn func(ctx context.Context, c1, c2 net.Conn) error,
+) error {
+	return serveSocksConnWithTimeout(ctx, conn, defaultSocksHandshakeTimeout, dialFn, pipeFn)
+}
+
+func serveSocksConnWithTimeout(
+	ctx context.Context,
+	conn net.Conn,
+	handshakeTimeout time.Duration,
+	dialFn func(ctx context.Context, destAddr string) (net.Conn, error),
+	pipeFn func(ctx context.Context, c1, c2 net.Conn) error,
 ) (retErr error) {
 	defer joinResourceCloseError(&retErr, conn, "SOCKS client connection")
-	stopHandshake := startHandshakeDeadline(conn, 15*time.Second)
+	if handshakeTimeout <= 0 {
+		handshakeTimeout = defaultSocksHandshakeTimeout
+	}
+	stopHandshake := startHandshakeDeadline(conn, handshakeTimeout)
+	handshakeDone := false
 	defer func() {
-		if stopHandshake != nil {
-			_ = stopHandshake()
+		if !handshakeDone && stopHandshake != nil {
+			retErr = errors.Join(retErr, stopHandshake())
 		}
 	}()
 
@@ -108,11 +126,6 @@ func serveSocksConn(
 	}
 	defer joinResourceCloseError(&retErr, remoteConn, "SOCKS remote connection")
 
-	if err := stopHandshake(); err != nil {
-		return err
-	}
-	stopHandshake = nil
-
 	if ver == 0x05 {
 		if err := writeSocksReply(conn, []byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
 			return err
@@ -122,6 +135,12 @@ func serveSocksConn(
 			return err
 		}
 	}
+
+	if err := stopHandshake(); err != nil {
+		return err
+	}
+	stopHandshake = nil
+	handshakeDone = true
 
 	return pipeFn(ctx, conn, remoteConn)
 }
@@ -151,7 +170,6 @@ func startHandshakeDeadline(conn net.Conn, d time.Duration) func() error {
 }
 
 func writeSocksReply(conn net.Conn, reply []byte) error {
-	_ = conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
 	for len(reply) > 0 {
 		n, err := conn.Write(reply)
 		if err != nil {
@@ -203,6 +221,15 @@ func readNulTerminatedString(r io.Reader, maxBytes int) (string, error) {
 	}
 }
 
+type socks5AddrValidationError struct {
+	rep byte
+	msg string
+}
+
+func (e *socks5AddrValidationError) Error() string {
+	return e.msg
+}
+
 func handleSocks5Handshake(conn net.Conn) (string, error) {
 	var nmethodsBuf [1]byte
 	if _, err := io.ReadFull(conn, nmethodsBuf[:]); err != nil {
@@ -233,8 +260,9 @@ func handleSocks5Handshake(conn net.Conn) (string, error) {
 	atyp := buf[3]
 	destAddr, err := readSocks5Address(conn, atyp)
 	if err != nil {
-		if atyp != 0x01 && atyp != 0x03 && atyp != 0x04 {
-			_ = writeSocksReply(conn, []byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		var vErr *socks5AddrValidationError
+		if errors.As(err, &vErr) {
+			_ = writeSocksReply(conn, []byte{0x05, vErr.rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		}
 		return "", fmt.Errorf("failed to read destination address: %w", err)
 	}
@@ -261,14 +289,20 @@ func handleSocks4Handshake(conn net.Conn) (string, error) {
 		return "", errors.Join(fmt.Errorf("unsupported SOCKS4 command: 0x%02x (only CONNECT is supported)", cmd), writeErr, drainErr)
 	}
 
+	isSocks4a := ipBuf[0] == 0 && ipBuf[1] == 0 && ipBuf[2] == 0 && ipBuf[3] != 0
+	var hostname string
+	var hostErr error
+	if isSocks4a {
+		hostname, hostErr = readNulTerminatedString(conn, 255)
+	}
+
 	if port == 0 {
 		writeErr := writeSocksReply(conn, []byte{0x00, 0x5B, 0, 0, 0, 0, 0, 0})
 		return "", errors.Join(errors.New("invalid SOCKS4 destination port 0"), writeErr)
 	}
 
-	if ipBuf[0] == 0 && ipBuf[1] == 0 && ipBuf[2] == 0 && ipBuf[3] != 0 {
-		hostname, hostErr := readNulTerminatedString(conn, 255)
-		if hostErr != nil || hostname == "" {
+	if isSocks4a {
+		if hostErr != nil || hostname == "" || strings.IndexByte(hostname, 0) >= 0 {
 			writeErr := writeSocksReply(conn, []byte{0x00, 0x5B, 0, 0, 0, 0, 0, 0})
 			if hostErr == nil {
 				hostErr = errors.New("empty SOCKS4a hostname")
@@ -288,43 +322,71 @@ func readSocks5Address(conn net.Conn, atyp byte) (string, error) {
 		if _, err := io.ReadFull(conn, ipBuf[:]); err != nil {
 			return "", fmt.Errorf("failed to read IPv4 body: %w", err)
 		}
-		var portBuf [2]byte
-		if _, err := io.ReadFull(conn, portBuf[:]); err != nil {
-			return "", fmt.Errorf("failed to read IPv4 port: %w", err)
+		port, err := readSocks5Port(conn, "IPv4")
+		if err != nil {
+			return "", err
 		}
-		port := binary.BigEndian.Uint16(portBuf[:])
 		return fmt.Sprintf("%d.%d.%d.%d:%d", ipBuf[0], ipBuf[1], ipBuf[2], ipBuf[3], port), nil
 
 	case 0x03: // Domain name
-		var lenBuf [1]byte
-		if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
-			return "", fmt.Errorf("failed to read domain length: %w", err)
-		}
-		domainLen := int(lenBuf[0])
-		domainBuf := make([]byte, domainLen)
-		if _, err := io.ReadFull(conn, domainBuf); err != nil {
-			return "", fmt.Errorf("failed to read domain body: %w", err)
-		}
-		var portBuf [2]byte
-		if _, err := io.ReadFull(conn, portBuf[:]); err != nil {
-			return "", fmt.Errorf("failed to read domain port: %w", err)
-		}
-		port := binary.BigEndian.Uint16(portBuf[:])
-		return net.JoinHostPort(string(domainBuf), fmt.Sprintf("%d", port)), nil
+		return readSocks5DomainAddress(conn)
 
 	case 0x04: // IPv6
 		var ipBuf [16]byte
 		if _, err := io.ReadFull(conn, ipBuf[:]); err != nil {
 			return "", fmt.Errorf("failed to read IPv6 body: %w", err)
 		}
-		var portBuf [2]byte
-		if _, err := io.ReadFull(conn, portBuf[:]); err != nil {
-			return "", fmt.Errorf("failed to read IPv6 port: %w", err)
+		port, err := readSocks5Port(conn, "IPv6")
+		if err != nil {
+			return "", err
 		}
-		port := binary.BigEndian.Uint16(portBuf[:])
-		return net.JoinHostPort(net.IP(ipBuf[:]).String(), fmt.Sprintf("%d", port)), nil
+		return net.JoinHostPort(net.IP(ipBuf[:]).String(), strconv.Itoa(int(port))), nil
 
 	default:
-		return "", fmt.Errorf("unsupported address type: 0x%02x", atyp)
+		return "", &socks5AddrValidationError{rep: 0x08, msg: fmt.Sprintf("unsupported address type: 0x%02x", atyp)}
 	}
+}
+
+func readSocks5Port(conn net.Conn, kind string) (uint16, error) {
+	var portBuf [2]byte
+	if _, err := io.ReadFull(conn, portBuf[:]); err != nil {
+		return 0, fmt.Errorf("failed to read %s port: %w", kind, err)
+	}
+	port := binary.BigEndian.Uint16(portBuf[:])
+	if port == 0 {
+		return 0, &socks5AddrValidationError{rep: 0x01, msg: "invalid SOCKS5 destination port 0"}
+	}
+	return port, nil
+}
+
+func readSocks5DomainAddress(conn net.Conn) (string, error) {
+	var lenBuf [1]byte
+	if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
+		return "", fmt.Errorf("failed to read domain length: %w", err)
+	}
+	domainLen := int(lenBuf[0])
+	domainBuf := make([]byte, domainLen)
+	if domainLen > 0 {
+		if _, err := io.ReadFull(conn, domainBuf); err != nil {
+			return "", fmt.Errorf("failed to read domain body: %w", err)
+		}
+	}
+	var portBuf [2]byte
+	if _, err := io.ReadFull(conn, portBuf[:]); err != nil {
+		if domainLen == 0 {
+			return "", &socks5AddrValidationError{rep: 0x04, msg: "empty SOCKS5 domain"}
+		}
+		return "", fmt.Errorf("failed to read domain port: %w", err)
+	}
+	if domainLen == 0 {
+		return "", &socks5AddrValidationError{rep: 0x04, msg: "empty SOCKS5 domain"}
+	}
+	if bytes.IndexByte(domainBuf, 0) >= 0 {
+		return "", &socks5AddrValidationError{rep: 0x04, msg: "SOCKS5 domain contains NUL byte"}
+	}
+	port := binary.BigEndian.Uint16(portBuf[:])
+	if port == 0 {
+		return "", &socks5AddrValidationError{rep: 0x01, msg: "invalid SOCKS5 destination port 0"}
+	}
+	return net.JoinHostPort(string(domainBuf), strconv.Itoa(int(port))), nil
 }
