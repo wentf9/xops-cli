@@ -453,12 +453,71 @@ type generalOptionState struct {
 // ApplyGeneralOptions parses non-multiplexing OpenSSH options from -o
 // (such as Port, User, IdentityFile, ProxyJump) and applies them to SshOptions
 // if they were not already explicitly set via primary CLI flags.
+func validateExplicitNonEmptyFlags(flags *pflag.FlagSet) error {
+	if flags == nil {
+		return nil
+	}
+	for _, name := range []string{"cipher", "escape-char", "control-path", "config-file", "login", "jump", "control-command"} {
+		f := flags.Lookup(name)
+		if f == nil || !f.Changed || f.Value.Type() != "string" {
+			continue
+		}
+		val, err := flags.GetString(name)
+		if err == nil && strings.TrimSpace(val) == "" {
+			if name == "control-command" {
+				return (&SSHControlFlags{CtlCmd: val}).controlUsageError(fmt.Errorf("unknown control command %q (supported: check, exit, stop, forward, cancel, proxy, proxy-stream, conninfo, channels)", val))
+			}
+			return fmt.Errorf("flag --%s must not be empty", name)
+		}
+	}
+	if f := flags.Lookup("identity"); f != nil && f.Changed {
+		return validateNonEmptyIdentityFlag(f, flags)
+	}
+	return nil
+}
+
+func validateNonEmptyIdentityFlag(f *pflag.Flag, flags *pflag.FlagSet) error {
+	switch f.Value.Type() {
+	case "stringArray":
+		vals, err := flags.GetStringArray("identity")
+		if err == nil && (len(vals) == 0 || slices.ContainsFunc(vals, func(v string) bool { return strings.TrimSpace(v) == "" })) {
+			return fmt.Errorf("flag --identity (-i) must not be empty")
+		}
+	case "stringSlice":
+		vals, err := flags.GetStringSlice("identity")
+		if err == nil && (len(vals) == 0 || slices.ContainsFunc(vals, func(v string) bool { return strings.TrimSpace(v) == "" })) {
+			return fmt.Errorf("flag --identity (-i) must not be empty")
+		}
+	case "string":
+		val, err := flags.GetString("identity")
+		if err == nil && strings.TrimSpace(val) == "" {
+			return fmt.Errorf("flag --identity (-i) must not be empty")
+		}
+	}
+	return nil
+}
+
 func ApplyGeneralOptions(opts *SshOptions, optionStrings []string, flags *pflag.FlagSet) error {
+	if err := validateExplicitNonEmptyFlags(flags); err != nil {
+		return err
+	}
 	opts.syncIdentityFiles()
+	if flags != nil && flags.Changed("identity") && len(opts.IdentityFiles) > 0 {
+		normalized := make([]string, 0, len(opts.IdentityFiles))
+		for _, k := range opts.IdentityFiles {
+			if trimmed := strings.TrimSpace(k); trimmed != "" {
+				normalized = append(normalized, utils.ToAbsolutePath(trimmed))
+			}
+		}
+		opts.IdentityFiles = normalized
+		if len(normalized) > 0 {
+			opts.IdentityFile = normalized[0]
+		}
+	}
 	st := generalOptionState{
 		allowPort:     shouldApplyGeneralOption(flags, "port", opts.Port == 0),
 		allowUser:     shouldApplyGeneralOption(flags, "login", opts.User == ""),
-		allowIdentity: shouldApplyGeneralOption(flags, "identity", opts.IdentityFile == "" && len(opts.IdentityFiles) == 0),
+		allowIdentity: true,
 		allowJump:     shouldApplyGeneralOption(flags, "jump", opts.JumpHost == ""),
 		allowHostName: opts.cliHostName == "" && opts.HostName == "",
 	}
@@ -509,16 +568,14 @@ func applyGeneralOption(opts *SshOptions, st *generalOptionState, key, val strin
 	return nil
 }
 
-func applyIdentityFileGeneralOption(opts *SshOptions, st *generalOptionState, key, val string) error {
+func applyIdentityFileGeneralOption(opts *SshOptions, _ *generalOptionState, key, val string) error {
 	if val == "" {
 		return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
 	}
-	if st.allowIdentity {
-		opts.IdentityFiles = append(opts.IdentityFiles, val)
-		opts.identityFromCLIOptions = true
-		if opts.IdentityFile == "" {
-			opts.IdentityFile = val
-		}
+	opts.IdentityFiles = append(opts.IdentityFiles, val)
+	opts.identityFromCLIOptions = true
+	if opts.IdentityFile == "" && config.IsPersistableIdentityPath(val) {
+		opts.IdentityFile = val
 	}
 	return nil
 }

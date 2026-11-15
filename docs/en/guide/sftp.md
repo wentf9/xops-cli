@@ -28,7 +28,7 @@ Basic syntax: `xops scp [options] <source> <destination>`. Both source and desti
 
 - **Single-host and relay transfers**: Without `--host`, `--tag`, or `-I/--ifile`, either path can use `[[user@]host:]file` (where the host part is a node name, alias, or host address). Local-to-remote uploads, remote-to-local downloads, and remote-to-remote relays through the local client are all supported (local-to-local is not).
 - **Ports and special paths**:
-  - Like OpenSSH `scp`, use `-P 122` (or `--port 122`) to set the SSH port; lowercase `-p` is not used for ports.
+  - Like OpenSSH `scp(1)`, use `-P 122` (or `--port 122`) to set the SSH port and `-c`/`--cipher` to select ciphers; specify usernames via `user@host:` or `-o User=...` (`-l` and `-p` are not provided).
   - Everything after the host colon is treated as the file path, not a port—for example, `user@host:22:file` refers to a remote file named `22:file`. Enclose IPv6 addresses in brackets, such as `user@[::1]:file`.
   - When `-P` is omitted, XOps uses the matched node's configured port. If a host matches multiple saved ports, XOps reports the ambiguity rather than guessing port 22—specify `-P` or use a unique alias. To relay between two hosts on different ports, assign each host an alias.
   - Windows remote paths accept `vm:C:/Users/example/file.txt`. Prefix local filenames containing colons with `./` (e.g., `./22:file`).

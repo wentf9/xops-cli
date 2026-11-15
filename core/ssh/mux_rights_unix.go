@@ -197,6 +197,9 @@ func localPeerUID() uint32 {
 }
 
 func handlePassengerSession(s *MuxServer, conn net.Conn, reqID uint32, payload []byte) error {
+	if !s.canAdmitNewSession() {
+		return sendFailure(conn, reqID, "mux master is shutting down")
+	}
 	if err := s.authorize("passenger session"); err != nil {
 		return sendPermissionDenied(conn, reqID, err.Error())
 	}
@@ -683,6 +686,9 @@ func resolvePassengerStdioFwdTarget(s *MuxServer, payload []byte) (dialNetwork, 
 }
 
 func handlePassengerStdioFwd(s *MuxServer, conn net.Conn, reqID uint32, payload []byte) error {
+	if !s.canAdmitNewSession() {
+		return sendFailure(conn, reqID, "mux master is shutting down")
+	}
 	if err := s.authorize("passenger stdio forward"); err != nil {
 		return sendPermissionDenied(conn, reqID, err.Error())
 	}

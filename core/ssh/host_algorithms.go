@@ -274,8 +274,15 @@ func (a khAddr) String() string {
 	return h + ":" + a.port
 }
 
+func lowercaseSSHHostPreservingZone(host string) string {
+	if pct := strings.IndexByte(host, '%'); pct >= 0 {
+		return strings.ToLower(host[:pct]) + host[pct:]
+	}
+	return strings.ToLower(host)
+}
+
 func khOpenSSHHostPort(a khAddr) string {
-	h := strings.ToLower(a.host)
+	h := lowercaseSSHHostPreservingZone(a.host)
 	if a.port == "" || a.port == "22" {
 		return h
 	}
@@ -365,9 +372,8 @@ func newKHHashedHost(encoded string) (*khHashedHost, error) {
 }
 
 func (h *khHashedHost) match(a khAddr) bool {
-	lower := khAddr{host: strings.ToLower(a.host), port: a.port}
 	mac := hmac.New(sha1.New, h.salt)
-	_, _ = mac.Write([]byte(knownhosts.Normalize(lower.String())))
+	_, _ = mac.Write([]byte(khOpenSSHHostPort(a)))
 	return hmac.Equal(mac.Sum(nil), h.hash)
 }
 
@@ -499,7 +505,7 @@ func (db *knownHostsDB) hostKeyCallback() cryptoSSH.HostKeyCallback {
 	}
 	return wrapNilRemoteHostKeyCallback(func(hostname string, remote net.Addr, key cryptoSSH.PublicKey) error {
 		if h, p, err := net.SplitHostPort(hostname); err == nil {
-			hostname = net.JoinHostPort(strings.ToLower(h), p)
+			hostname = net.JoinHostPort(lowercaseSSHHostPreservingZone(h), p)
 		}
 		if cert, ok := key.(*cryptoSSH.Certificate); ok {
 			if err := validateHostCertCASignature(cert); err != nil {
@@ -651,16 +657,42 @@ func newKHHostnameMatcher(pattern string) (khMatcher, error) {
 		if len(p) == 0 {
 			return nil, errors.New("knownhosts: negation without following hostname")
 		}
-		p = strings.ToLower(p)
-		if p[0] == '[' {
-			if _, _, err := net.SplitHostPort(p); err != nil {
-				return nil, err
-			}
+		normalized, err := normalizeKHPatternEntry(p)
+		if err != nil {
+			return nil, err
 		}
 		hps = append(hps, khHostPattern{
 			negate:     negate,
-			rawPattern: p,
+			rawPattern: normalized,
 		})
 	}
 	return hps, nil
+}
+
+func normalizeKHPatternEntry(p string) (string, error) {
+	if p == "" {
+		return "", errors.New("knownhosts: empty host pattern")
+	}
+	if p[0] != '[' {
+		return lowercaseSSHHostPreservingZone(p), nil
+	}
+	closeIdx := strings.IndexByte(p, ']')
+	if closeIdx <= 1 {
+		return "", fmt.Errorf("knownhosts: invalid bracketed host pattern %q", p)
+	}
+	inner := lowercaseSSHHostPreservingZone(p[1:closeIdx])
+	rest := p[closeIdx+1:]
+	if rest == "" {
+		return "", fmt.Errorf("knownhosts: address %s: missing port in address", p)
+	}
+	switch rest[0] {
+	case ':':
+		if len(rest) < 2 || strings.Contains(rest[1:], ":") {
+			return "", fmt.Errorf("knownhosts: invalid port in bracketed host pattern %q", p)
+		}
+	case '*', '?':
+	default:
+		return "", fmt.Errorf("knownhosts: invalid suffix in bracketed host pattern %q", p)
+	}
+	return "[" + inner + "]" + strings.ToLower(rest), nil
 }

@@ -2,6 +2,7 @@ package file
 
 import (
 	"os"
+	"os/user"
 	"path/filepath"
 	"testing"
 )
@@ -44,5 +45,29 @@ func TestCreateFileRecursive_EmptyContent(t *testing.T) {
 	}
 	if info.Size() != 0 {
 		t.Errorf("file size = %d, want 0", info.Size())
+	}
+}
+
+func TestToAbsolutePath_TildeAndUserExpansion(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skipf("UserHomeDir unavailable: %v", err)
+	}
+	if got := ToAbsolutePath("~"); got != home {
+		t.Errorf("ToAbsolutePath(~) = %q, want %q", got, home)
+	}
+	wantSub := filepath.Join(home, "sub", "key")
+	if got := ToAbsolutePath("~/sub/key"); got != wantSub {
+		t.Errorf("ToAbsolutePath(~/sub/key) = %q, want %q", got, wantSub)
+	}
+	if cur, err := user.Current(); err == nil && cur != nil && cur.Username != "" && cur.HomeDir != "" {
+		wantUserSub := filepath.Join(cur.HomeDir, "sub", "key")
+		if got := ToAbsolutePath("~" + cur.Username + "/sub/key"); got != wantUserSub {
+			t.Errorf("ToAbsolutePath(~%s/sub/key) = %q, want %q", cur.Username, got, wantUserSub)
+		}
+	}
+	unknown := "~nonexistent_xops_user_999/key"
+	if got := ToAbsolutePath(unknown); got != unknown {
+		t.Errorf("ToAbsolutePath(%q) = %q, want unchanged (must not turn into <cwd>/...)", unknown, got)
 	}
 }

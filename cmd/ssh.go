@@ -193,7 +193,9 @@ func (o *SshOptions) syncIdentityFiles() {
 		return
 	}
 	if len(o.IdentityFiles) > 0 && o.IdentityFile == "" {
-		o.IdentityFile = o.IdentityFiles[0]
+		if config.IsPersistableIdentityPath(o.IdentityFiles[0]) {
+			o.IdentityFile = o.IdentityFiles[0]
+		}
 	} else if o.IdentityFile != "" && len(o.IdentityFiles) == 0 {
 		o.IdentityFiles = []string{o.IdentityFile}
 	}
@@ -928,7 +930,7 @@ func (o *SshOptions) shouldSkipMasterHandoff(ctx context.Context, connector *ssh
 		// would resurrect what the user just stopped.
 		return true
 	}
-	if err := drainOwnedMasters(ctx, connector); err != nil {
+	if err := drainOwnedMastersWithProvider(ctx, provider, connector); err != nil {
 		return true
 	}
 	if o.OTP != "" {
@@ -1208,7 +1210,7 @@ func (o *SshOptions) handoffConnectorMasters(ctx context.Context, provider confi
 	if ctx != nil && ctx.Err() != nil {
 		return nil
 	}
-	if err := drainOwnedMasters(ctx, connector); err != nil {
+	if err := drainOwnedMastersWithProvider(ctx, provider, connector); err != nil {
 		return nil
 	}
 	if o.OTP != "" {
@@ -1623,7 +1625,7 @@ func waitAndReleaseMastersForHandoffWithProvider(
 		if _, ok := collectLiveJumpMastersForHandoff(connector, provider, master); !ok {
 			return false, nil
 		}
-		if err := drainOwnedMasters(ctx, connector); err != nil {
+		if err := drainOwnedMastersWithProvider(ctx, provider, connector); err != nil {
 			return false, nil
 		}
 		if isMasterDeadOrStopped(master) {
@@ -1653,6 +1655,10 @@ func waitAndReleaseMastersForHandoffWithProvider(
 // on masters started by connector to finish before the foreground process tears
 // down its transport or hands the control socket over to a daemon.
 func drainOwnedMasters(ctx context.Context, connector *ssh.Connector) error {
+	return drainOwnedMastersWithProvider(ctx, nil, connector)
+}
+
+func drainOwnedMastersWithProvider(ctx context.Context, provider config.ConfigProvider, connector *ssh.Connector) error {
 	if connector == nil {
 		return nil
 	}
@@ -1673,7 +1679,7 @@ func drainOwnedMasters(ctx context.Context, connector *ssh.Connector) error {
 			return err
 		}
 		if m.StoppedListening() {
-			if err := retireStoppedOwnedMaster(ctx, connector, m, masters, masters[i+1:]); err != nil {
+			if err := retireStoppedOwnedMaster(ctx, provider, connector, m, masters, masters[i+1:]); err != nil {
 				return err
 			}
 		}
@@ -1683,6 +1689,7 @@ func drainOwnedMasters(ctx context.Context, connector *ssh.Connector) error {
 
 func retireStoppedOwnedMaster(
 	ctx context.Context,
+	provider config.ConfigProvider,
 	connector *ssh.Connector,
 	m *ssh.MuxServer,
 	allMasters []*ssh.MuxServer,
@@ -1693,7 +1700,7 @@ func retireStoppedOwnedMaster(
 		if dep == nil || isMasterClosed(dep) {
 			continue
 		}
-		if slices.Contains(jumpChainMasters(connector, dep, allMasters), m) {
+		if slices.Contains(jumpChainMastersWithProvider(connector, provider, dep, allMasters), m) {
 			deps = append(deps, dep)
 		}
 	}
@@ -1720,7 +1727,7 @@ func (o *SshOptions) muxDaemonArgs(nodeID string, expandedPath string, master *s
 		args = append(args, "-l", user)
 	}
 	if keyPath := o.resolveMuxDaemonIdentityFile(nodeID, master); keyPath != "" {
-		args = append(args, "-i", keyPath)
+		args = appendMuxDaemonIdentityArg(args, keyPath)
 	}
 	jumpHost := o.JumpHost
 	if master != nil {
@@ -1822,16 +1829,13 @@ func (o *SshOptions) appendMuxDaemonForwardedOptions(args []string, master *ssh.
 	case "inet6":
 		args = append(args, "-6")
 	}
-	if keys := o.effectiveIdentityFiles(); len(keys) > 1 {
-		for _, k := range keys[1:] {
-			if k != "" {
-				args = append(args, "-i", k)
-			}
-		}
-	}
+	keys := o.effectiveIdentityFiles()
+	args = appendMuxDaemonExtraIdentities(args, keys, o.firstCLIIdentityFile(keys))
 	if o.GatewayPorts {
 		args = append(args, "-o", "GatewayPorts=yes")
 	}
+	preserveProxyNone := isEffectiveCLIProxyCommandNone(o.control.Options)
+	emittedProxyNone := false
 	for _, opt := range o.control.Options {
 		if o.GatewayPorts && isGatewayPortsOption(opt) {
 			continue
@@ -1840,6 +1844,10 @@ func (o *SshOptions) appendMuxDaemonForwardedOptions(args []string, master *ssh.
 			continue
 		}
 		if master != nil && isTargetSpecificOption(opt) {
+			if preserveProxyNone && !emittedProxyNone && isProxyCommandNoneOption(opt) {
+				emittedProxyNone = true
+				args = append(args, "-o", opt)
+			}
 			continue
 		}
 		args = append(args, "-o", opt)
@@ -1847,13 +1855,78 @@ func (o *SshOptions) appendMuxDaemonForwardedOptions(args []string, master *ssh.
 	return args
 }
 
-func (o *SshOptions) resolveMuxDaemonIdentityFile(nodeID string, master *ssh.MuxServer) string {
-	o.syncIdentityFiles()
-	if o.IdentityFile != "" && o.shouldPassIdentityFile(nodeID, master) {
+func appendMuxDaemonExtraIdentities(args []string, keys []string, firstCLIKey string) []string {
+	skippedFirst := false
+	for _, k := range keys {
+		if k == "" {
+			continue
+		}
+		if !skippedFirst && firstCLIKey != "" && k == firstCLIKey {
+			skippedFirst = true
+			continue
+		}
+		args = appendMuxDaemonIdentityArg(args, k)
+	}
+	return args
+}
+
+func (o *SshOptions) firstCLIIdentityFile(keys []string) string {
+	if o == nil {
+		return ""
+	}
+	if o.IdentityFile != "" {
 		return o.IdentityFile
 	}
+	if len(keys) > 0 {
+		return keys[0]
+	}
+	return ""
+}
+
+func appendMuxDaemonIdentityArg(args []string, keyPath string) []string {
+	trimmed := strings.TrimSpace(keyPath)
+	if trimmed == "" {
+		return args
+	}
+	if strings.EqualFold(trimmed, "none") || strings.Contains(trimmed, "%") || strings.Contains(trimmed, "${") {
+		return append(args, "-o", "IdentityFile="+trimmed)
+	}
+	return append(args, "-i", trimmed)
+}
+
+func isProxyCommandOptionKey(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "proxycommand", "proxy_command":
+		return true
+	default:
+		return false
+	}
+}
+
+func isProxyCommandNoneOption(opt string) bool {
+	key, val, err := adapter.SplitOptionKeyValue(opt)
+	return err == nil && isProxyCommandOptionKey(key) && strings.EqualFold(strings.TrimSpace(val), "none")
+}
+
+func isEffectiveCLIProxyCommandNone(opts []string) bool {
+	for _, opt := range opts {
+		key, val, err := adapter.SplitOptionKeyValue(opt)
+		if err != nil || !isProxyCommandOptionKey(key) {
+			continue
+		}
+		return strings.EqualFold(strings.TrimSpace(val), "none")
+	}
+	return false
+}
+
+func (o *SshOptions) resolveMuxDaemonIdentityFile(nodeID string, master *ssh.MuxServer) string {
+	keys := o.effectiveIdentityFiles()
+	firstCLIKey := o.firstCLIIdentityFile(keys)
+	if firstCLIKey != "" && o.shouldPassIdentityFile(nodeID, master) {
+		return firstCLIKey
+	}
 	if master != nil && master.Target().KeyPath != "" {
-		if o.IdentityFile == "" || len(o.targetNodeIDs) > 0 || master.Target().KeyPath != utils.ToAbsolutePath(o.IdentityFile) {
+		if firstCLIKey == "" || len(o.targetNodeIDs) > 0 || master.Target().KeyPath != normalizeCLIIdentityPath(firstCLIKey) {
 			return master.Target().KeyPath
 		}
 	}
@@ -2289,6 +2362,16 @@ func releaseMastersForHandoffWithProvider(
 			}
 			logger.DefaultLogger().Debugf("mux: not handing off master on %q while jump master %q is busy or stopping", expandedPath, m.ControlPath())
 			return false, false, nil
+		}
+	}
+	if !master.CommitHandoffReady() {
+		rollbackHandoffReservation(connector, reserved, released)
+		return false, true, nil
+	}
+	for _, m := range jumpMasters {
+		if m != nil && !m.CommitHandoffReady() {
+			rollbackHandoffReservation(connector, reserved, released)
+			return false, true, nil
 		}
 	}
 	if err := master.Shutdown(); err != nil {
@@ -3035,8 +3118,8 @@ func updateIdentityFields(identity *models.Identity, o *SshOptions) bool {
 			identity.AuthType = "password"
 			identityUpdated = true
 		}
-	} else if o.IdentityFile != "" {
-		identity.KeyPath = utils.ToAbsolutePath(o.IdentityFile)
+	} else if absKeyPath := config.NormalizePersistableIdentityPath(o.IdentityFile); absKeyPath != "" {
+		identity.KeyPath = absKeyPath
 		identity.AuthType = "key"
 		identityUpdated = true
 	}

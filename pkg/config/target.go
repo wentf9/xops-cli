@@ -92,6 +92,45 @@ func FormatNodeID(user, address string, port uint16) string {
 	return fmt.Sprintf("%s@%s", user, FormatHostPort(address, port))
 }
 
+// IsPersistableIdentityPath reports whether raw is a concrete identity key path
+// suitable for persisting into Identity.KeyPath (excluding "none", OpenSSH % tokens,
+// ${ENV} placeholders, and unresolved ~user prefixes).
+func IsPersistableIdentityPath(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || strings.EqualFold(trimmed, "none") {
+		return false
+	}
+	if strings.Contains(trimmed, "%") || strings.Contains(trimmed, "${") {
+		return false
+	}
+	expanded := fileutils.ToAbsolutePath(trimmed)
+	return expanded != "" && !strings.HasPrefix(expanded, "~")
+}
+
+// NormalizePersistableIdentityPath converts a persistable identity key path into an
+// absolute path, returning "" for non-persistable syntaxes ("none", %tokens, ${ENV},
+// or unresolved ~user).
+func NormalizePersistableIdentityPath(raw string) string {
+	if !IsPersistableIdentityPath(raw) {
+		return ""
+	}
+	return fileutils.ToAbsolutePath(strings.TrimSpace(raw))
+}
+
+// ValidateNodeAlias ensures custom node aliases do not collide with the reserved
+// "openssh" virtual namespace.
+func ValidateNodeAlias(alias string) error {
+	trimmed := strings.TrimSpace(alias)
+	if trimmed == "" {
+		return nil
+	}
+	lower := strings.ToLower(trimmed)
+	if lower == "openssh" || strings.HasPrefix(lower, OpenSSHNodePrefix) {
+		return fmt.Errorf("alias %q is reserved for OpenSSH virtual targets", trimmed)
+	}
+	return nil
+}
+
 type openSSHParserSource interface {
 	GetOpenSSHParser() *OpenSSHParser
 }
@@ -297,6 +336,77 @@ func (r *Repository) evaluateTargetDecision(
 	return decision, nil
 }
 
+func (r *Repository) resolveExplicitOpenSSHVirtualTarget(
+	selector string,
+	target ConnectionTarget,
+	explicitDefaultUser string,
+) (targetDecision, bool, error) {
+	if !strings.HasPrefix(selector, OpenSSHNodePrefix) {
+		return targetDecision{}, false, nil
+	}
+	clean := strings.TrimSpace(strings.TrimPrefix(selector, OpenSSHNodePrefix))
+	if clean == "" {
+		return targetDecision{}, true, fmt.Errorf("parse openssh host %q failed: host is empty", selector)
+	}
+	lookupHost, inlineUser, inlinePort, err := parseOpenSSHHostSpec(clean)
+	if err != nil {
+		return targetDecision{}, true, fmt.Errorf("parse openssh host %q failed: %w", selector, err)
+	}
+	parser := r.openSSHParserOrEmpty()
+	vnode, vhost, vident, err := parser.GetVirtualNode(lookupHost)
+	if err != nil {
+		return targetDecision{}, true, fmt.Errorf("resolve openssh host %q: %w", clean, err)
+	}
+	basePort := normalizedHostPort(vhost.Port)
+	baseUser := strings.TrimSpace(vident.User)
+
+	effectiveUser := inlineUser
+	if target.HasUser && strings.TrimSpace(target.User) != "" {
+		effectiveUser = strings.TrimSpace(target.User)
+	}
+	if effectiveUser == "" {
+		effectiveUser, err = resolveEffectiveUser(target, explicitDefaultUser, baseUser)
+		if err != nil {
+			return targetDecision{}, true, err
+		}
+	}
+
+	effectivePort := basePort
+	if inlinePort != 0 {
+		effectivePort = inlinePort
+	}
+	if target.HasPort && target.Port != 0 {
+		effectivePort = target.Port
+	}
+
+	matchedID := OpenSSHNodePrefix + FormatNodeID(effectiveUser, lookupHost, effectivePort)
+	if !target.HasUser && !target.HasPort {
+		matchedID = OpenSSHNodePrefix + clean
+	} else if inlineUser == "" && inlinePort == 0 && effectiveUser == baseUser && effectivePort == basePort {
+		matchedID = OpenSSHNodePrefix + lookupHost
+	}
+
+	canonicalInfo := canonicalTargetInfo{
+		BaseNodeID:   OpenSSHNodePrefix + lookupHost,
+		Address:      strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(vhost.Address), "]"), "["),
+		Port:         basePort,
+		IdentityFile: vident.KeyPath,
+		ProxyJump:    vnode.ProxyJump,
+		DefaultUser:  baseUser,
+		OpenSSHAlias: resolveOpenSSHAliasName(parser, clean),
+	}
+	return targetDecision{
+		NormalizedTarget: target,
+		Selector:         selector,
+		MatchedNodeID:    matchedID,
+		BaseNodeID:       canonicalInfo.BaseNodeID,
+		OpenSSHAlias:     canonicalInfo.OpenSSHAlias,
+		Canonical:        canonicalInfo,
+		EffectiveUser:    effectiveUser,
+		EffectivePort:    effectivePort,
+	}, true, nil
+}
+
 func (r *Repository) evaluateBareTargetDecision(
 	cfg *Configuration,
 	lookup map[string][]string,
@@ -305,6 +415,9 @@ func (r *Repository) evaluateBareTargetDecision(
 	target ConnectionTarget,
 	explicitDefaultUser string,
 ) (targetDecision, error) {
+	if decision, handled, err := r.resolveExplicitOpenSSHVirtualTarget(selector, target, explicitDefaultUser); handled {
+		return decision, err
+	}
 	if _, exists := cfg.Nodes.Get(selector); exists {
 		return targetDecision{
 			NormalizedTarget: target,
@@ -375,6 +488,9 @@ func (r *Repository) evaluateExplicitTargetDecision(
 	target ConnectionTarget,
 	explicitDefaultUser string,
 ) (targetDecision, error) {
+	if decision, handled, err := r.resolveExplicitOpenSSHVirtualTarget(selector, target, explicitDefaultUser); handled {
+		return decision, err
+	}
 	canonicalInfo, err := r.resolveCanonicalTargetInfo(cfg, lookup, aliases, selector, target)
 	if err != nil {
 		return targetDecision{}, err
@@ -528,10 +644,7 @@ func (r *Repository) buildCreatedResolvedTargetWithUserPort(
 		}
 	}
 	openSSHAlias := canonicalInfo.OpenSSHAlias
-	keyPath := ""
-	if canonicalInfo.IdentityFile != "" {
-		keyPath = fileutils.ToAbsolutePath(canonicalInfo.IdentityFile)
-	}
+	keyPath := NormalizePersistableIdentityPath(canonicalInfo.IdentityFile)
 	if pNode, _, pIdent, ok := r.resolvePendingNode(targetNodeID); ok {
 		if !target.HasProxyJump && jump == "" && pNode.ProxyJump != "" {
 			jump = pNode.ProxyJump
@@ -832,6 +945,27 @@ func findMatchingNodes(snapshot *Configuration, user, addr string, port uint16) 
 //
 //nolint:gocyclo // canonical target resolution sequentially evaluates direct, alias, lookup, OpenSSH, and raw fallback tiers
 func (r *Repository) resolveCanonicalTargetInfo(cfg *Configuration, lookup map[string][]string, aliases map[string]string, selector string, target ConnectionTarget) (canonicalTargetInfo, error) {
+	if strings.HasPrefix(selector, OpenSSHNodePrefix) {
+		clean := strings.TrimSpace(strings.TrimPrefix(selector, OpenSSHNodePrefix))
+		if clean == "" {
+			return canonicalTargetInfo{}, fmt.Errorf("parse openssh host %q failed: host is empty", selector)
+		}
+		parser := r.openSSHParserOrEmpty()
+		vnode, vhost, vident, err := parser.GetVirtualNode(clean)
+		if err != nil {
+			return canonicalTargetInfo{}, fmt.Errorf("resolve openssh host %q: %w", clean, err)
+		}
+		return canonicalTargetInfo{
+			BaseNodeID:   OpenSSHNodePrefix + clean,
+			Address:      strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(vhost.Address), "]"), "["),
+			Port:         normalizedHostPort(vhost.Port),
+			IdentityFile: vident.KeyPath,
+			ProxyJump:    vnode.ProxyJump,
+			DefaultUser:  vident.User,
+			OpenSSHAlias: resolveOpenSSHAliasName(parser, clean),
+		}, nil
+	}
+
 	// 1 & 2. Direct Node ID or Alias match (checking RawSelector first when split from user@host:port)
 	if info, ok := r.resolveDirectOrAliasTargetInfo(cfg, aliases, strings.TrimSpace(target.RawSelector), selector); ok {
 		return info, nil
@@ -1197,6 +1331,9 @@ func (r *Repository) createNodeInTransaction(
 	}
 	if opts.Alias != "" {
 		trimmedAlias := strings.TrimSpace(opts.Alias)
+		if err := ValidateNodeAlias(trimmedAlias); err != nil {
+			return err
+		}
 		if existingNode := findAliasInConfig(cfg, trimmedAlias); existingNode != "" && existingNode != targetNodeID {
 			return fmt.Errorf("%s", i18n.Tf("alias_err_exists", map[string]any{"Alias": trimmedAlias, "Node": existingNode}))
 		}
@@ -1329,20 +1466,23 @@ func (r *Repository) createIdentityForNode(
 	identity := models.Identity{
 		User: effectiveUser,
 	}
-	effectiveKeyPath := opts.IdentityFile
-	if effectiveKeyPath == "" && canonicalInfo.IdentityFile != "" {
-		effectiveKeyPath = canonicalInfo.IdentityFile
-	}
+	cliKeyPath := NormalizePersistableIdentityPath(opts.IdentityFile)
+	configKeyPath := NormalizePersistableIdentityPath(canonicalInfo.IdentityFile)
 
-	if opts.Password == "" && effectiveKeyPath == "" {
-		identity.AuthType = "auto"
-	} else if opts.Password != "" {
+	switch {
+	case opts.Password != "":
 		identity.Password = opts.Password
 		identity.AuthType = "password"
-	} else if effectiveKeyPath != "" {
-		identity.KeyPath = fileutils.ToAbsolutePath(effectiveKeyPath)
+	case cliKeyPath != "":
+		identity.KeyPath = cliKeyPath
 		identity.Passphrase = opts.Passphrase
 		identity.AuthType = "key"
+	case configKeyPath != "":
+		identity.KeyPath = configKeyPath
+		identity.Passphrase = opts.Passphrase
+		identity.AuthType = "auto"
+	default:
+		identity.AuthType = "auto"
 	}
 
 	preferredIdentRef := fmt.Sprintf("%s@%s", effectiveUser, canonicalAddr)

@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strings"
 )
 
 // CreateFileRecursive 递归创建文件并写入内容
@@ -44,17 +46,31 @@ func ToAbsolutePath(path string) string {
 		return path
 	}
 	if path[0] == '~' {
-		home, err := os.UserHomeDir()
-		if err == nil {
-			rest := path[1:]
-			if len(rest) > 0 && (rest[0] == '/' || rest[0] == '\\') {
-				rest = rest[1:]
-			}
-			if rest == "" {
-				return home
-			}
-			return filepath.Join(home, rest)
+		rest := path[1:]
+		userPart := rest
+		subPath := ""
+		if sepIdx := strings.IndexAny(rest, `/\`); sepIdx >= 0 {
+			userPart = rest[:sepIdx]
+			subPath = rest[sepIdx+1:]
 		}
+		var home string
+		if userPart == "" {
+			resolvedHome, err := os.UserHomeDir()
+			if err != nil || resolvedHome == "" {
+				return path
+			}
+			home = resolvedHome
+		} else {
+			u, err := user.Lookup(userPart)
+			if err != nil || u == nil || u.HomeDir == "" {
+				return path
+			}
+			home = u.HomeDir
+		}
+		if subPath == "" {
+			return filepath.Clean(home)
+		}
+		return filepath.Join(home, subPath)
 	}
 	if filepath.IsAbs(path) {
 		return path

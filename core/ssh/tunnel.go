@@ -298,45 +298,79 @@ func (c *Client) handleRemoteForwardEndpoint(ctx context.Context, remoteConn net
 	return c.copyStream(ctx, remoteConn, localConn)
 }
 
+func (c *Client) openMuxRemoteForwardWithMeta(ctx context.Context, spec ForwardSpec, req ForwardRequest) (gwMode, dialNet string, allocPort uint32, err error) {
+	muxCli, err := DialMuxClient(ctx, c.muxSocketPath, WithExpectedPeerUID(c.muxExpectedUID))
+	if err != nil {
+		c.observeForward("remote", "listen failed", spec.Bind.String(), spec.Dest.String())
+		return "", "", 0, fmt.Errorf("dial mux master %q failed: %w", c.muxSocketPath, err)
+	}
+	defer func() { _ = muxCli.Close() }()
+
+	gwMode = c.gatewayPortsMode()
+	if v, ok := muxCli.Extension(muxExtGatewayPorts); ok && v != "" {
+		gwMode = v
+	}
+	dialNet = c.dialNetwork()
+	if v, ok := muxCli.Extension(muxExtDialNetwork); ok && v != "" {
+		dialNet = v
+	}
+	allocPort, err = muxCli.OpenForward(ctx, req)
+	if err != nil {
+		c.observeForward("remote", "listen failed", spec.Bind.String(), spec.Dest.String())
+		return "", "", 0, fmt.Errorf("mux open remote forward failed: %w", err)
+	}
+	if !spec.Bind.IsUnix() && spec.Bind.Port == 0 && (allocPort == 0 || allocPort > 65535) {
+		if allocPort > 0 {
+			cleanupReq := req
+			cleanupReq.ListenPort = allocPort
+			_ = muxCli.CloseForward(ctx, cleanupReq)
+		}
+		c.observeForward("remote", "listen failed", spec.Bind.String(), spec.Dest.String())
+		return "", "", 0, fmt.Errorf("mux open remote forward returned out-of-range dynamic port %d", allocPort)
+	}
+	return gwMode, dialNet, allocPort, nil
+}
+
+func resolveMuxRemoteForwardAddr(spec ForwardSpec, allocPort uint32, gwMode, dialNet string) net.Addr {
+	if spec.Bind.IsUnix() {
+		return &net.UnixAddr{Name: spec.Bind.SocketPath, Net: "unix"}
+	}
+	effPort := spec.Bind.Port
+	if spec.Bind.Port == 0 {
+		effPort = uint16(allocPort)
+	}
+	epCopy := spec.Bind
+	epCopy.Port = effPort
+	_, resolvedAddr := epCopy.RemoteListenAddressForMode(gwMode, dialNet)
+	return forwardTCPAddr{addr: resolvedAddr}
+}
+
 func (c *Client) remoteForwardViaMux(ctx context.Context, spec ForwardSpec, opts ...ForwardOption) (*Forward, error) {
+	parsedOpts := c.forwardOptions(opts...)
+	if parsedOpts.maxConnections > 0 {
+		c.observeForward("remote", "listen failed", spec.Bind.String(), spec.Dest.String())
+		return nil, errors.New("connection limit ForwardOption is not supported over a multiplexed connection")
+	}
+
 	req := ForwardRequest{Type: ForwardRemote}
 	req.ListenHost, req.ListenPort = spec.Bind.MuxListenEndpoint()
 	if !spec.IsDynamic {
 		req.ConnectHost, req.ConnectPort = spec.Dest.MuxConnectEndpoint()
 	}
 
-	muxCli, err := DialMuxClient(ctx, c.muxSocketPath, WithExpectedPeerUID(c.muxExpectedUID))
+	gwMode, dialNet, allocPort, err := c.openMuxRemoteForwardWithMeta(ctx, spec, req)
 	if err != nil {
-		c.observeForward("remote", "listen failed", spec.Bind.String(), spec.Dest.String())
-		return nil, fmt.Errorf("dial mux master %q failed: %w", c.muxSocketPath, err)
-	}
-	allocPort, err := muxCli.OpenForward(ctx, req)
-	_ = muxCli.Close()
-	if err != nil {
-		c.observeForward("remote", "listen failed", spec.Bind.String(), spec.Dest.String())
-		return nil, fmt.Errorf("mux open remote forward failed: %w", err)
+		return nil, err
 	}
 
-	var addr net.Addr
-	effPort := spec.Bind.Port
-	if spec.Bind.IsUnix() {
-		addr = &net.UnixAddr{Name: spec.Bind.SocketPath, Net: "unix"}
-	} else {
-		if spec.Bind.Port == 0 && allocPort > 0 {
-			effPort = uint16(allocPort)
-		}
-		epCopy := spec.Bind
-		epCopy.Port = effPort
-		_, resolvedAddr := epCopy.RemoteListenAddressForMode(c.gatewayPortsMode(), c.dialNetwork())
-		addr = forwardTCPAddr{addr: resolvedAddr}
-	}
+	addr := resolveMuxRemoteForwardAddr(spec, allocPort, gwMode, dialNet)
 
 	closeReq := req
-	if spec.Bind.Port == 0 && allocPort > 0 {
+	if spec.Bind.Port == 0 {
 		closeReq.ListenPort = allocPort
 	}
 
-	fopts := c.forwardDiagnostics(c.forwardOptions(opts...), "remote", staticAddrListener{addr: addr}, spec.Dest.String())
+	fopts := c.forwardDiagnostics(parsedOpts, "remote", staticAddrListener{addr: addr}, spec.Dest.String())
 	forward := &Forward{done: make(chan struct{}), addr: addr}
 	if fopts.observe != nil {
 		fopts.observe("listening")

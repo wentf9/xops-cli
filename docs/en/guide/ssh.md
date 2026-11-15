@@ -18,7 +18,7 @@ Direct jump hosts accept an IP, FQDN, or `host:port`; a single-label jump name (
 - **Username and port flag precedence** (OpenSSH native semantics):
   - `xops ssh` and single-target `xops exec`: explicit `-l`/`-p` and `-o User`/`-o Port` override inline `user@` and `:port` in the destination.
   - `xops sftp` (aligned with OpenSSH `sftp(1)`): explicit `-P` (`--port`) and `-o User`/`-o Port` override inline `user@` and `:port` (also supports `-c`/`--cipher`; `-l` and `-p` are not registered).
-  - `xops scp` and batch `xops exec` (`--ifile` or multiple `--host`): inline per-endpoint `user@`/`:port` takes precedence over global flags (`-l`/`-P` on `scp`; `-l`/`-p` on batch `exec`), while global flags apply to endpoints that omit inline `user@`/`:port`.
+  - `xops scp` (aligned with OpenSSH `scp(1)`): inline per-endpoint `user@`/`:port` takes precedence over global options (`-P`/`--port`, `-c`/`--cipher`, `-o User`/`-o Port`; `-l` and `-p` are not registered), while endpoints that omit inline `user@`/`:port` fall back to global options. Batch `xops exec` (`--ifile` or multiple `--host`): inline per-endpoint `user@`/`:port` takes precedence over global `-l`/`-p`, while endpoints that omit them fall back to global flags.
 
 ## Connection diagnostics
 

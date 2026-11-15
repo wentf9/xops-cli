@@ -759,11 +759,18 @@ func (a *SSHAdapter) hasActiveTier1ProxyJump(nodeName string) bool {
 	return ok && isActiveProxyJumpValue(override.ProxyJump)
 }
 
-func isPendingAliasOpenSSHNode(nodeName string, snapErr error, snapshot config.ConnectionSnapshot) bool {
-	return strings.HasPrefix(nodeName, config.OpenSSHNodePrefix) &&
-		snapErr == nil &&
-		snapshot.Node.SSHOptions == nil &&
-		snapshot.Node.OpenSSHAlias != ""
+func (a *SSHAdapter) isUnpersistedOpenSSHAliasNode(nodeName string, snapErr error, snapshot config.ConnectionSnapshot) bool {
+	if snapErr != nil || snapshot.Node.SSHOptions != nil || snapshot.Node.OpenSSHAlias == "" {
+		return false
+	}
+	if strings.HasPrefix(nodeName, config.OpenSSHNodePrefix) {
+		return true
+	}
+	if a == nil || a.cfgProvider == nil {
+		return false
+	}
+	_, isSaved := a.cfgProvider.GetNode(nodeName)
+	return !isSaved
 }
 
 func (a *SSHAdapter) maskLowerProxyCommandForProxyJump(nodeName string, tier1ActiveJump bool, t2Opts, t3Opts, t4Opts *ssh.Options) (*ssh.Options, *ssh.Options, *ssh.Options) {
@@ -771,7 +778,7 @@ func (a *SSHAdapter) maskLowerProxyCommandForProxyJump(nodeName string, tier1Act
 		return cloneWithoutProxyCommand(t2Opts), cloneWithoutProxyCommand(t3Opts), cloneWithoutProxyCommand(t4Opts)
 	}
 	if snap, err := a.cfgProvider.ResolveConnection(nodeName); err == nil && isActiveProxyJumpValue(snap.Node.ProxyJump) {
-		if !strings.HasPrefix(nodeName, config.OpenSSHNodePrefix) || isPendingAliasOpenSSHNode(nodeName, nil, snap) {
+		if !strings.HasPrefix(nodeName, config.OpenSSHNodePrefix) && !a.isUnpersistedOpenSSHAliasNode(nodeName, nil, snap) {
 			return t2Opts, cloneWithoutProxyCommand(t3Opts), cloneWithoutProxyCommand(t4Opts)
 		}
 	}
@@ -785,10 +792,13 @@ func (a *SSHAdapter) higherTierProxyCommandOverridesJump(nodeID string, sessionC
 	if sessionCtrlOpts.Options != nil && sessionCtrlOpts.Options.ActiveProxyCommand() != "" {
 		return true
 	}
-	if strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) {
-		if snap, err := a.cfgProvider.ResolveConnection(nodeID); err == nil && isPendingAliasOpenSSHNode(nodeID, nil, snap) {
-			return false
+	isUnpersistedOpenSSH := strings.HasPrefix(nodeID, config.OpenSSHNodePrefix)
+	if !isUnpersistedOpenSSH && a.cfgProvider != nil {
+		if snap, err := a.cfgProvider.ResolveConnection(nodeID); err == nil && a.isUnpersistedOpenSSHAliasNode(nodeID, nil, snap) {
+			isUnpersistedOpenSSH = true
 		}
+	}
+	if isUnpersistedOpenSSH {
 		if globalCfg := a.cfgProvider.Snapshot(); globalCfg != nil && globalCfg.SSHOptions != nil && globalCfg.SSHOptions.ActiveProxyCommand() != "" {
 			return true
 		}
@@ -799,9 +809,9 @@ func (a *SSHAdapter) higherTierProxyCommandOverridesJump(nodeID string, sessionC
 func (a *SSHAdapter) resolveOptionTiers(nodeName string) (tier2Node, tier3Global, tier4OpenSSH *ssh.Options) {
 	snapshot, snapErr := a.cfgProvider.ResolveConnection(nodeName)
 	virtualOpenSSHNode := strings.HasPrefix(nodeName, config.OpenSSHNodePrefix)
-	pendingAliasOpenSSHNode := isPendingAliasOpenSSHNode(nodeName, snapErr, snapshot)
+	unpersistedAliasNode := a.isUnpersistedOpenSSHAliasNode(nodeName, snapErr, snapshot)
 	if snapErr == nil {
-		if !virtualOpenSSHNode {
+		if !virtualOpenSSHNode && !unpersistedAliasNode {
 			tier2Node = snapshot.Node.SSHOptions
 		}
 	}
@@ -810,8 +820,8 @@ func (a *SSHAdapter) resolveOptionTiers(nodeName string) (tier2Node, tier3Global
 		tier3Global = globalCfg.SSHOptions
 	}
 
-	if virtualOpenSSHNode {
-		if pendingAliasOpenSSHNode {
+	if virtualOpenSSHNode || unpersistedAliasNode {
+		if unpersistedAliasNode {
 			tier4OpenSSH = a.resolveTier4OpenSSHOptions(nodeName, snapErr, snapshot).Clone()
 		} else if snapErr == nil {
 			tier4OpenSSH = snapshot.Node.SSHOptions.Clone()
@@ -865,14 +875,15 @@ func (a *SSHAdapter) ResolveControl(nodeName string, sessionOpts SessionControlO
 }
 
 func (a *SSHAdapter) resolveTier4OpenSSHOptions(nodeName string, snapErr error, snapshot config.ConnectionSnapshot) *ssh.Options {
-	if strings.HasPrefix(nodeName, config.OpenSSHNodePrefix) {
-		if isPendingAliasOpenSSHNode(nodeName, snapErr, snapshot) {
-			if parser := a.getOpenSSHParser(); parser != nil {
-				if opts, err := parser.GetSSHOptions(snapshot.Node.OpenSSHAlias); err == nil && !opts.IsEmpty() {
-					return opts
-				}
+	if a.isUnpersistedOpenSSHAliasNode(nodeName, snapErr, snapshot) {
+		if parser := a.getOpenSSHParser(); parser != nil {
+			if opts, err := parser.GetSSHOptions(snapshot.Node.OpenSSHAlias); err == nil && !opts.IsEmpty() {
+				return opts
 			}
 		}
+		return nil
+	}
+	if strings.HasPrefix(nodeName, config.OpenSSHNodePrefix) {
 		return nil
 	}
 	parser := a.getOpenSSHParser()
@@ -1148,6 +1159,8 @@ func (a *SSHAdapter) ExpandControlPath(nodeID string, rawPath string) (string, e
 	origHost := nodeID
 	if cleanOrig, ok := config.OpenSSHOriginalHost(nodeID); ok {
 		origHost = cleanOrig
+	} else if a.isUnpersistedOpenSSHAliasNode(nodeID, nil, snapshot) {
+		origHost = snapshot.Node.OpenSSHAlias
 	}
 	if ov, ok := a.getSessionOverride(nodeID); ok && strings.TrimSpace(ov.OriginalHost) != "" {
 		origHost = strings.TrimSpace(ov.OriginalHost)
@@ -1215,6 +1228,8 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 	var origHost string
 	if cleanOrig, ok := config.OpenSSHOriginalHost(nodeID); ok {
 		origHost = cleanOrig
+	} else if a.isUnpersistedOpenSSHAliasNode(nodeID, nil, snapshot) {
+		origHost = snapshot.Node.OpenSSHAlias
 	}
 
 	cfg := &ssh.ClientConfig{
@@ -1257,7 +1272,7 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 	if sessionCtrlOpts.Options != nil {
 		cliOptKeys = sessionCtrlOpts.Options.IdentityFiles()
 	}
-	managedNodeKey := resolveManagedNodeKey(nodeID, snapshot)
+	managedNodeKey := a.resolveManagedNodeKey(nodeID, snapshot)
 	var mergedOptKeys []string
 	if sshOpts != nil {
 		mergedOptKeys = sshOpts.IdentityFiles()
@@ -1278,11 +1293,14 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 	return cfg, nil
 }
 
-func resolveManagedNodeKey(nodeID string, snapshot config.ConnectionSnapshot) string {
-	if !strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) || isPendingAliasOpenSSHNode(nodeID, nil, snapshot) {
-		return snapshot.Identity.KeyPath
+func (a *SSHAdapter) resolveManagedNodeKey(nodeID string, snapshot config.ConnectionSnapshot) string {
+	if strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) || a.isUnpersistedOpenSSHAliasNode(nodeID, nil, snapshot) {
+		return ""
 	}
-	return ""
+	if !config.IsPersistableIdentityPath(snapshot.Identity.KeyPath) {
+		return ""
+	}
+	return snapshot.Identity.KeyPath
 }
 
 func buildOrderedKeyPaths(cliFlagKeys, cliOptKeys []string, managedNodeKey string, mergedOptKeys []string) []string {

@@ -81,7 +81,7 @@ func NewCmdScp() *cobra.Command {
 
 	// OpenSSH-compatible flags
 	cmd.Flags().Uint16VarP(&o.Port, "port", "P", 0, i18n.T("flag_port"))
-	cmd.Flags().StringVarP(&o.User, "login", "l", "", i18n.T("flag_login"))
+	cmd.Flags().StringVarP(&o.CipherSpec, "cipher", "c", "", i18n.T("flag_ssh_cipher"))
 	cmd.Flags().StringArrayVarP(&o.IdentityFiles, "identity", "i", nil, i18n.T("flag_identity"))
 	cmd.Flags().StringVarP(&o.JumpHost, "jump", "J", "", i18n.T("flag_jump"))
 	cmd.Flags().BoolVarP(&o.Recursive, "recursive", "r", false, i18n.T("flag_recursive"))
@@ -128,7 +128,7 @@ func (o *ScpOptions) Complete(cmd *cobra.Command, args []string) error {
 	if err := ApplyGeneralOptions(&o.SshOptions, o.control.Options, flags); err != nil {
 		return err
 	}
-	if _, err := o.control.ToSessionControlOptions(); err != nil {
+	if _, err := o.toSessionControlOptions(); err != nil {
 		return err
 	}
 	pathFlags := o.Source != "" || o.Dest != ""
@@ -197,6 +197,9 @@ func (o *ScpOptions) Validate() error {
 		return err
 	}
 	if err := o.control.Validate(); err != nil {
+		return err
+	}
+	if _, err := o.toSessionControlOptions(); err != nil {
 		return err
 	}
 	if o.OTP != "" && o.OTPStdin {
@@ -1390,8 +1393,7 @@ func (o *ScpOptions) updateNodeAuth(identity *models.Identity, specificPassword 
 				identity.AuthType = "password"
 				updated = true
 			}
-		} else if o.IdentityFile != "" {
-			absKeyPath := cmdutils.ToAbsolutePath(o.IdentityFile)
+		} else if absKeyPath := config.NormalizePersistableIdentityPath(o.IdentityFile); absKeyPath != "" {
 			if identity.KeyPath != absKeyPath || identity.AuthType != "key" {
 				identity.KeyPath = absKeyPath
 				identity.AuthType = "key"
@@ -1499,7 +1501,7 @@ func (o *ScpOptions) credentialConnectorWithInteraction(provider config.ConfigPr
 }
 
 func (o *ScpOptions) appendScpSessionControlOptions(adpOpts *[]adapter.Option, targetNodes []string) error {
-	sessionCtrlOpts, err := o.controlSessionOptions()
+	sessionCtrlOpts, err := o.toSessionControlOptions()
 	if err != nil {
 		return err
 	}

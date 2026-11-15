@@ -147,7 +147,15 @@ func validateSendEnvOption(raw string) (string, error) {
 	}
 	var tokens []string
 	for line := range strings.SplitSeq(trimmed, "\n") {
-		for tok := range strings.FieldsSeq(line) {
+		item := strings.TrimSpace(line)
+		if item == "" {
+			continue
+		}
+		parsed, err := splitQuotedEnvTokens(item)
+		if err != nil {
+			return "", fmt.Errorf("invalid SendEnv %q: %w", item, err)
+		}
+		for _, tok := range parsed {
 			if err := validateSendEnvToken(tok); err != nil {
 				return "", fmt.Errorf("invalid SendEnv %q: %w", tok, err)
 			}
@@ -299,7 +307,11 @@ func stepQuotedEnvByte(s string, i int, quote byte, sb *strings.Builder) (int, b
 func buildSendEnvRules(patterns []string) ([]sendEnvRule, bool, error) {
 	var rules []sendEnvRule
 	for _, entry := range patterns {
-		for tok := range strings.FieldsSeq(entry) {
+		parsed, err := splitQuotedEnvTokens(entry)
+		if err != nil {
+			return nil, false, fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
+		}
+		for _, tok := range parsed {
 			if err := validateSendEnvToken(tok); err != nil {
 				return nil, false, fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
 			}

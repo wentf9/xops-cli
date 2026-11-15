@@ -162,6 +162,11 @@ type MuxServerOptions struct {
 	Logger                 logger.DebugLogger
 }
 
+const (
+	muxExtGatewayPorts = "gateway-ports@xops-cli"
+	muxExtDialNetwork  = "dial-network@xops-cli"
+)
+
 // MuxServer implements the OpenSSH PROTOCOL.mux v4 server engine.
 type MuxServer struct {
 	controlPath       string
@@ -201,8 +206,9 @@ type MuxServer struct {
 
 	closed                   atomic.Bool
 	stoppedListening         atomic.Bool
-	releaseForegroundOnStop  atomic.Bool
-	foregroundReleasedOnStop atomic.Bool
+	terminated               bool // protected by idleMu
+	releaseForegroundOnStop  bool // protected by idleMu
+	foregroundReleasedByStop bool // protected by idleMu
 	shutdownOnce             sync.Once
 	shutdownChan             chan struct{}
 	origFi                   os.FileInfo
@@ -543,6 +549,17 @@ func (s *MuxServer) PrepareHandoffWithSessions(maxSessions int32) bool {
 	return true
 }
 
+// CommitHandoffReady reports whether a reservation created by PrepareHandoff*
+// is still intact and has not been invalidated by -O stop, -O exit, or shutdown.
+func (s *MuxServer) CommitHandoffReady() bool {
+	if s == nil {
+		return false
+	}
+	s.idleMu.Lock()
+	defer s.idleMu.Unlock()
+	return s.handoffReserved && !s.stoppedListening.Load() && !s.terminated && !s.closed.Load()
+}
+
 // CancelHandoff releases a reservation made by PrepareHandoff when a multi-hop
 // handoff could not reserve every master in the chain.
 func (s *MuxServer) CancelHandoff() {
@@ -555,10 +572,11 @@ func (s *MuxServer) CancelHandoff() {
 		return
 	}
 	s.handoffReserved = false
-	if s.stoppedListening.Load() {
-		shouldShutdown := !s.hasInFlightControlOrForwardLocked() &&
-			s.activeSessions.Load() <= 0 &&
-			s.activeForwardStreams.Load() <= 0
+	if s.stoppedListening.Load() || s.terminated {
+		shouldShutdown := s.terminated ||
+			(!s.hasInFlightControlOrForwardLocked() &&
+				s.activeSessions.Load() <= 0 &&
+				s.activeForwardStreams.Load() <= 0)
 		if shouldShutdown {
 			s.shuttingDown = true
 			s.idleGen++
@@ -578,8 +596,7 @@ func (s *MuxServer) CancelHandoff() {
 	}
 	s.shuttingDown = false
 	s.notifyIdleLocked()
-	if s.persistEnabled && !s.persistIndefinite && s.persistDuration > 0 &&
-		!s.hasInFlightControlOrForwardLocked() &&
+	if !s.hasInFlightControlOrForwardLocked() &&
 		s.activeSessions.Load() <= 0 && s.activeForwardStreams.Load() <= 0 {
 		s.scheduleIdleOrShutdownLocked()
 	}
@@ -704,9 +721,7 @@ func (s *MuxServer) retireUnlinkedOrReplacedListener() {
 		s.notifyIdleLocked()
 		s.idleMu.Unlock()
 	}
-	if s.releaseForegroundOnStop.Swap(false) {
-		s.foregroundReleasedOnStop.Store(true)
-		s.removeActiveSession()
+	if s.releaseForegroundOnStopIfArmed() {
 		return
 	}
 	s.shutdownWhenIdle()
@@ -760,6 +775,12 @@ func (s *MuxServer) handshakeHello(conn net.Conn) error {
 	exts := []MuxExtension{{Name: "info", Value: "1"}}
 	if targetID := s.target.CanonicalTargetIdentity(); targetID != "" {
 		exts = append(exts, MuxExtension{Name: muxTargetExtensionName, Value: targetID})
+	}
+	if gwMode := s.effectiveGatewayPortsMode(); gwMode != "" {
+		exts = append(exts, MuxExtension{Name: muxExtGatewayPorts, Value: gwMode})
+	}
+	if dialNet := s.effectiveDialNetwork(); dialNet != "" {
+		exts = append(exts, MuxExtension{Name: muxExtDialNetwork, Value: dialNet})
 	}
 	return WriteMuxPacket(conn, MUX_MSG_HELLO, EncodeMuxHello(MuxProtoVersion, exts))
 }
@@ -902,6 +923,7 @@ func (s *MuxServer) handleTerminate(conn net.Conn, reqID uint32) error {
 	}
 	s.idleMu.Lock()
 	s.shuttingDown = true
+	s.terminated = true
 	s.handoffReserved = false
 	s.notifyIdleLocked()
 	s.idleMu.Unlock()
@@ -939,9 +961,7 @@ func (s *MuxServer) handleStopListening(conn net.Conn, reqID uint32) error {
 	s.notifyIdleLocked()
 	s.idleMu.Unlock()
 
-	if s.releaseForegroundOnStop.Swap(false) {
-		s.foregroundReleasedOnStop.Store(true)
-		s.removeActiveSession()
+	if s.releaseForegroundOnStopIfArmed() {
 		return sendErr
 	}
 	s.shutdownWhenIdle()
@@ -969,6 +989,9 @@ func (s *MuxServer) shutdownWhenIdle() {
 }
 
 func (s *MuxServer) handleProxy(conn net.Conn, reqID uint32) error {
+	if !s.canAdmitNewSession() {
+		return sendFailure(conn, reqID, "mux master is shutting down")
+	}
 	if err := s.authorize("proxy session"); err != nil {
 		return sendPermissionDenied(conn, reqID, err.Error())
 	}
@@ -3748,11 +3771,20 @@ func writeUnpaddedPacket(w io.Writer, payload []byte) error {
 	return err
 }
 
+func (s *MuxServer) canAdmitNewSession() bool {
+	if s == nil {
+		return false
+	}
+	s.idleMu.Lock()
+	defer s.idleMu.Unlock()
+	return !s.shuttingDown && !s.terminated && !s.closed.Load() && !s.stoppedListening.Load() && !s.handoffReserved
+}
+
 func (s *MuxServer) addActiveSession() bool {
 	s.idleMu.Lock()
 	defer s.idleMu.Unlock()
 
-	if s.shuttingDown || s.closed.Load() {
+	if s.shuttingDown || s.terminated || s.closed.Load() || s.stoppedListening.Load() || s.handoffReserved {
 		return false
 	}
 
@@ -3870,6 +3902,7 @@ func (s *MuxServer) Shutdown() error {
 
 		s.idleMu.Lock()
 		s.shuttingDown = true
+		s.terminated = true
 		s.handoffReserved = false
 		s.idleGen++
 		if s.idleTimer != nil {
@@ -3956,13 +3989,26 @@ func (s *MuxServer) unlinkControlSocketFileIfOurs() {
 
 // AddForegroundSession adds an active in-process foreground session to prevent idle timeout.
 func (s *MuxServer) AddForegroundSession() bool {
-	return s.addActiveSession()
+	if !s.addActiveSession() {
+		return false
+	}
+	s.idleMu.Lock()
+	s.foregroundReleasedByStop = false
+	s.idleMu.Unlock()
+	return true
 }
 
 // RemoveForegroundSession removes an in-process foreground session and arms the idle timer if sessions reach 0.
 func (s *MuxServer) RemoveForegroundSession() {
-	s.releaseForegroundOnStop.Store(false)
-	if s.foregroundReleasedOnStop.Swap(false) {
+	if s == nil {
+		return
+	}
+	s.idleMu.Lock()
+	alreadyReleased := s.foregroundReleasedByStop
+	s.releaseForegroundOnStop = false
+	s.foregroundReleasedByStop = false
+	s.idleMu.Unlock()
+	if alreadyReleased {
 		return
 	}
 	s.removeActiveSession()
@@ -3975,7 +4021,36 @@ func (s *MuxServer) ReleaseForegroundOnStop() {
 	if s == nil {
 		return
 	}
-	s.releaseForegroundOnStop.Store(true)
+	s.idleMu.Lock()
+	alreadyStopped := s.stoppedListening.Load() && !s.foregroundReleasedByStop
+	if alreadyStopped {
+		s.releaseForegroundOnStop = false
+		s.foregroundReleasedByStop = true
+	} else {
+		s.releaseForegroundOnStop = true
+		s.foregroundReleasedByStop = false
+	}
+	s.idleMu.Unlock()
+	if alreadyStopped {
+		s.removeActiveSession()
+	}
+}
+
+func (s *MuxServer) releaseForegroundOnStopIfArmed() bool {
+	if s == nil {
+		return false
+	}
+	s.idleMu.Lock()
+	shouldRelease := s.releaseForegroundOnStop && !s.foregroundReleasedByStop
+	if shouldRelease {
+		s.releaseForegroundOnStop = false
+		s.foregroundReleasedByStop = true
+	}
+	s.idleMu.Unlock()
+	if shouldRelease {
+		s.removeActiveSession()
+	}
+	return shouldRelease
 }
 
 // ActiveSessions returns the current number of active multiplex sessions.

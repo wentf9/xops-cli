@@ -768,6 +768,10 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 	nodeName := planNode.name
 	cfg := planNode.cfg
 	originalKeyPath := cfg.KeyPath
+	if cfg.Port <= 0 {
+		cfg.Port = 22
+	}
+	cfg.Address = normalizeHostAddress(cfg.Address)
 
 	coordinator := newHandshakeCoordinator(ctx, c.getNodeHandshakeTimeout(cfg))
 	defer coordinator.Close()
@@ -3449,7 +3453,12 @@ func appendKnownHost(knownHostsFile, hostname string, key ssh.PublicKey, hash bo
 		}
 	}()
 
-	host := strings.ToLower(knownhosts.Normalize(hostname))
+	var host string
+	if h, p, splitErr := net.SplitHostPort(hostname); splitErr == nil {
+		host = khOpenSSHHostPort(khAddr{host: h, port: p})
+	} else {
+		host = lowercaseSSHHostPreservingZone(knownhosts.Normalize(hostname))
+	}
 	if hash {
 		host = knownhosts.HashHostname(host)
 	}

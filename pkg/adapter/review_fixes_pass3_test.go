@@ -98,6 +98,39 @@ func TestH6_DisambiguatedOpenSSHPendingNodePreservesOptionsAndIdentity(t *testin
 	)
 
 	verifyDisambiguatedRoleB(t, adp, resB.NodeID, extraKey, keyB, cmPathB)
+
+	// Without Tier-3 global ProxyCommand, collided role-b retains Tier-4 ProxyJump.
+	cfgNoProxy := config.NewProviderWithoutOpenSSH(nil).Snapshot()
+	repoNoProxy, err := config.NewRepositoryWithoutOpenSSH(cfgNoProxy, store)
+	if err != nil {
+		t.Fatalf("NewRepositoryWithoutOpenSSH(no-proxy): %v", err)
+	}
+	provNoProxy, err := config.WithOpenSSHConfigOverride(repoNoProxy, sshCfgPath)
+	if err != nil {
+		t.Fatalf("WithOpenSSHConfigOverride(no-proxy): %v", err)
+	}
+	prepNoProxy := provNoProxy.(interface {
+		PrepareNodeContext(context.Context, config.EnsureNodeOptions) (config.EnsureNodeResult, error)
+	})
+	if _, err := prepNoProxy.PrepareNodeContext(t.Context(), config.EnsureNodeOptions{
+		Target: config.ConnectionTarget{Selector: "role-a", User: "ops", HasUser: true},
+	}); err != nil {
+		t.Fatalf("PrepareNodeContext(role-a, no-proxy): %v", err)
+	}
+	resBNoProxy, err := prepNoProxy.PrepareNodeContext(t.Context(), config.EnsureNodeOptions{
+		Target: config.ConnectionTarget{Selector: "role-b", User: "ops", HasUser: true},
+	})
+	if err != nil {
+		t.Fatalf("PrepareNodeContext(role-b, no-proxy): %v", err)
+	}
+	adpNoProxy := NewSSHAdapter(provNoProxy, WithLocalExecution(true))
+	cfgBNoProxy, err := adpNoProxy.GetConfig(resBNoProxy.NodeID)
+	if err != nil {
+		t.Fatalf("GetConfig(role-b, no-proxy): %v", err)
+	}
+	if cfgBNoProxy.ProxyJump != "openssh:bastion.example.com" {
+		t.Fatalf("role-b (no Tier-3 ProxyCommand) ProxyJump = %q, want openssh:bastion.example.com", cfgBNoProxy.ProxyJump)
+	}
 }
 
 func verifyDisambiguatedRoleB(t *testing.T, adp *SSHAdapter, nodeID, extraKey, keyB, cmPathB string) {
@@ -119,14 +152,14 @@ func verifyDisambiguatedRoleB(t *testing.T, adp *SSHAdapter, nodeID, extraKey, k
 	if got := optsB.Get(ssh.OptionHashKnownHosts); got != "yes" {
 		t.Fatalf("role-b HashKnownHosts = %q, want yes", got)
 	}
-	if got := optsB.Get(ssh.OptionProxyCommand); got != "" {
-		t.Fatalf("expected role-b ProxyJump to mask Tier-3 global ProxyCommand, got %q", got)
+	if got := optsB.Get(ssh.OptionProxyCommand); got != "global-proxy %h %p" {
+		t.Fatalf("expected Tier-3 global ProxyCommand to override Tier-4 ProxyJump, got %q", got)
 	}
 	if cfgB.Options == nil || cfgB.Options.Get(ssh.OptionCiphers) != "chacha20-poly1305@openssh.com" {
 		t.Fatalf("role-b cfgB.Options Ciphers = %v, want chacha20-poly1305@openssh.com", cfgB.Options)
 	}
-	if cfgB.ProxyJump != "openssh:bastion.example.com" {
-		t.Fatalf("role-b ProxyJump = %q, want openssh:bastion.example.com", cfgB.ProxyJump)
+	if cfgB.ProxyJump != "" {
+		t.Fatalf("expected Tier-3 global ProxyCommand to clear Tier-4 ProxyJump, got %q", cfgB.ProxyJump)
 	}
 	if len(cfgB.KeyPaths) != 2 || cfgB.KeyPaths[0] != extraKey || cfgB.KeyPaths[1] != keyB {
 		t.Fatalf("role-b KeyPaths = %v, want [%s %s]", cfgB.KeyPaths, extraKey, keyB)

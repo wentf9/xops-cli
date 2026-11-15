@@ -59,7 +59,11 @@ func runInventoryEdit(cmd *cobra.Command, args []string, flags *editFlags, secre
 	if err != nil {
 		return err
 	}
-	if err := applyEditTargetArgs(args[1:], flags, cmd.Flags().Changed("port")); err != nil {
+	portChanged := cmd.Flags().Changed("port")
+	if portChanged && flags.port == 0 {
+		return fmt.Errorf("%s", i18n.T("scp_err_port_zero"))
+	}
+	if err := applyEditTargetArgs(args[1:], flags, portChanged); err != nil {
 		return err
 	}
 	if flags.keyPath != "" && flags.keyPass == "" && flags.password == "" && !secretInput.UsesStdin() {
@@ -77,6 +81,11 @@ func runInventoryEdit(cmd *cobra.Command, args []string, flags *editFlags, secre
 	oldName, node, host, identity, err := resolveNodeForEdit(repository, view, args[0])
 	if err != nil {
 		return err
+	}
+	if cmd.Flags().Changed("alias") {
+		if err := validateEditNodeAliases(repository, oldName, flags.alias); err != nil {
+			return err
+		}
 	}
 
 	updated, nameChanged := applyNodeUpdates(cmd, repository, oldName, &host, &identity, &node, flags)
@@ -178,6 +187,18 @@ type aliasResolver interface {
 	FindAlias(string) string
 }
 
+func validateEditNodeAliases(provider aliasResolver, oldName string, aliases []string) error {
+	for _, a := range aliases {
+		if err := config.ValidateNodeAlias(a); err != nil {
+			return err
+		}
+		if existingNode := provider.FindAlias(a); existingNode != "" && existingNode != oldName {
+			return fmt.Errorf("%s", i18n.Tf("alias_err_exists", map[string]any{"Alias": a, "Node": existingNode}))
+		}
+	}
+	return nil
+}
+
 func applyNodeUpdates(cmd *cobra.Command, provider aliasResolver, oldName string, host *models.Host, identity *models.Identity, node *models.Node, flags *editFlags) (updated, nameChanged bool) {
 	if flags.address != "" {
 		host.Address, updated, nameChanged = flags.address, true, true
@@ -194,12 +215,17 @@ func applyNodeUpdates(cmd *cobra.Command, provider aliasResolver, oldName string
 	}
 
 	if cmd.Flags().Changed("alias") {
+		filtered := make([]string, 0, len(flags.alias))
 		for _, a := range flags.alias {
+			if err := config.ValidateNodeAlias(a); err != nil {
+				continue
+			}
 			if existingNode := provider.FindAlias(a); existingNode != "" && existingNode != oldName {
 				continue
 			}
+			filtered = append(filtered, a)
 		}
-		node.Alias, updated = flags.alias, true
+		node.Alias, updated = filtered, true
 	}
 	if cmd.Flags().Changed("jump") {
 		node.ProxyJump, updated = flags.jump, true

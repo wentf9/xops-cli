@@ -717,10 +717,14 @@ func (o *ExecOptions) buildTaskSessionAuth(task execHostTask, cliAbsKeys []strin
 	if task.keyPath != "" && (len(taskKeys) == 0 || taskKeys[0] != task.keyPath) {
 		taskKeys = append([]string{task.keyPath}, taskKeys...)
 	}
+	keyPath := task.keyPath
+	if keyPath == "" && len(taskKeys) > 0 {
+		keyPath = taskKeys[0]
+	}
 	return adapter.SessionAuth{
 		Password:                 task.pass,
 		Passphrase:               task.passphrase,
-		KeyPath:                  task.keyPath,
+		KeyPath:                  keyPath,
 		KeyPaths:                 taskKeys,
 		HostName:                 hostNameOverride,
 		OriginalHost:             task.originalHost,
@@ -1039,7 +1043,7 @@ func (o *ExecOptions) buildTasksFromTags(ctx context.Context, provider config.Co
 	userOverride := strings.TrimSpace(o.User)
 	keyPath := ""
 	if o.IdentityFile != "" {
-		keyPath = utils.ToAbsolutePath(o.IdentityFile)
+		keyPath = normalizeCLIIdentityPath(o.IdentityFile)
 	}
 	for _, nodeID := range slices.Sorted(maps.Keys(nodes)) {
 		task, err := o.buildTaggedHostTask(ctx, provider, nodeID, userOverride, keyPath)
@@ -1369,7 +1373,7 @@ func (o *ExecOptions) buildTasksFromHosts(ctx context.Context, repository config
 			user:          taskUser,
 			pass:          password,
 			passphrase:    passphrase,
-			keyPath:       utils.ToAbsolutePath(keyPath),
+			keyPath:       normalizeCLIIdentityPath(keyPath),
 		})
 	}
 	return tasks, hostErrs, nil
@@ -1449,8 +1453,7 @@ func (o *ExecOptions) updateIdentity(identity *models.Identity, addr utils.HostI
 			identity.AuthType = "password"
 			updated = true
 		}
-	} else if addr.KeyPath != "" {
-		absKeyPath := utils.ToAbsolutePath(addr.KeyPath)
+	} else if absKeyPath := config.NormalizePersistableIdentityPath(addr.KeyPath); absKeyPath != "" {
 		if identity.KeyPath != absKeyPath || identity.AuthType != "key" {
 			identity.KeyPath = absKeyPath
 			identity.AuthType = "key"

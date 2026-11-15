@@ -236,11 +236,20 @@ func applySSHConfigCanonicalDirectives(policy *canonicalizePolicy, cfg *ssh_conf
 	if v := firstSSHConfigKeyValue(cfg, host, "canonicalizepermittedcnames"); v != "" {
 		policy.setPermittedCNAMEs(v)
 	}
-	if v := firstSSHConfigKeyValue(cfg, host, "proxycommand"); v != "" {
-		policy.setProxyCommand(v)
-	}
-	if v := firstSSHConfigKeyValue(cfg, host, "proxyjump"); v != "" {
-		policy.setProxyJump(v)
+	winner, _, cmdVal := firstMatchingOpenSSHProxy(cfg, host)
+	switch winner {
+	case "proxyjump":
+		if v := firstSSHConfigKeyValue(cfg, host, "proxyjump"); v != "" {
+			policy.setProxyJump(v)
+		}
+	case "proxycommand", "none":
+		if cmdVal != "" {
+			policy.setProxyCommand(cmdVal)
+		}
+	default:
+		if v := firstSSHConfigKeyValue(cfg, host, "proxyjump"); strings.EqualFold(v, "none") {
+			policy.setProxyJump("none")
+		}
 	}
 	if v := firstSSHConfigKeyValue(cfg, host, "connecttimeout"); v != "" {
 		policy.setTimeoutSeconds(v)
@@ -277,37 +286,91 @@ func applySSHOptionsCanonicalDirectives(policy *canonicalizePolicy, opts *ssh.Op
 	}
 }
 
+type cliCanonicalTracker struct {
+	seenMode           bool
+	seenDomains        bool
+	seenMaxDots        bool
+	seenFallbackLocal  bool
+	seenPermittedCNAME bool
+	seenTimeout        bool
+	seenProxyJump      bool
+	seenProxyCmd       bool
+	activeCLIJump      bool
+}
+
+func (s *cliCanonicalTracker) applyDirective(policy *canonicalizePolicy, key, v string) {
+	switch strings.ToLower(key) {
+	case "proxyjump", "proxycommand":
+		s.applyProxyDirective(policy, strings.ToLower(key), v)
+	case "canonicalizehostname":
+		if !s.seenMode {
+			s.seenMode = true
+			policy.setMode(v)
+		}
+	case "canonicaldomains":
+		if !s.seenDomains {
+			s.seenDomains = true
+			policy.setDomains(v)
+		}
+	case "canonicalizemaxdots":
+		if !s.seenMaxDots {
+			s.seenMaxDots = true
+			policy.setMaxDots(v)
+		}
+	case "canonicalizefallbacklocal":
+		if !s.seenFallbackLocal {
+			s.seenFallbackLocal = true
+			policy.setFallbackLocal(v)
+		}
+	case "canonicalizepermittedcnames":
+		if !s.seenPermittedCNAME {
+			s.seenPermittedCNAME = true
+			policy.setPermittedCNAMEs(v)
+		}
+	case "connecttimeout":
+		if !s.seenTimeout {
+			s.seenTimeout = true
+			policy.setTimeoutSeconds(v)
+		}
+	}
+}
+
+func (s *cliCanonicalTracker) applyProxyDirective(policy *canonicalizePolicy, lowerKey, v string) {
+	if v == "" {
+		return
+	}
+	switch lowerKey {
+	case "proxyjump":
+		if !s.seenProxyJump {
+			s.seenProxyJump = true
+			if !s.seenProxyCmd {
+				s.activeCLIJump = !strings.EqualFold(strings.TrimSpace(v), "none")
+				policy.setProxyJump(v)
+			}
+		}
+	case "proxycommand":
+		if !s.seenProxyCmd {
+			s.seenProxyCmd = true
+			if !s.activeCLIJump {
+				policy.setProxyCommand(v)
+			}
+		}
+	}
+}
+
 func applyCLICanonicalDirectives(policy *canonicalizePolicy, rawCLI []string, cliProxyJump string) {
+	var state cliCanonicalTracker
+	if pj := strings.TrimSpace(cliProxyJump); pj != "" {
+		state.seenProxyJump = true
+		state.activeCLIJump = !strings.EqualFold(pj, "none")
+		policy.setProxyJump(pj)
+	}
 	for _, raw := range rawCLI {
 		k, v, ok := splitCanonicalOptionKV(raw)
 		if !ok {
 			continue
 		}
-		switch strings.ToLower(k) {
-		case "canonicalizehostname":
-			policy.setMode(v)
-		case "canonicaldomains":
-			policy.setDomains(v)
-		case "canonicalizemaxdots":
-			policy.setMaxDots(v)
-		case "canonicalizefallbacklocal":
-			policy.setFallbackLocal(v)
-		case "canonicalizepermittedcnames":
-			policy.setPermittedCNAMEs(v)
-		case "proxyjump":
-			if v != "" {
-				policy.setProxyJump(v)
-			}
-		case "proxycommand":
-			if v != "" {
-				policy.setProxyCommand(v)
-			}
-		case "connecttimeout":
-			policy.setTimeoutSeconds(v)
-		}
-	}
-	if pj := strings.TrimSpace(cliProxyJump); pj != "" {
-		policy.setProxyJump(pj)
+		state.applyDirective(policy, k, v)
 	}
 }
 

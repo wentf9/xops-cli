@@ -71,14 +71,14 @@ func openSSHHostFromConfig(cfg *ssh_config.Config, name, defaultUser string) (Op
 	keyPath := openSSHValue(cfg, name, "IdentityFile", "")
 	proxyWinner, _, _ := firstMatchingOpenSSHProxy(cfg, name)
 	var proxyJump string
-	if proxyWinner != "proxycommand" {
+	if proxyWinner == "proxyjump" {
 		proxyJump = openSSHValue(cfg, name, "ProxyJump", "")
 		if strings.EqualFold(proxyJump, "none") {
 			proxyJump = ""
 		}
 	}
 
-	expandedKeyPath, err := expandHomeDir(keyPath)
+	expandedKeyPath, err := normalizeConfigIdentityKeyPath(keyPath)
 	if err != nil {
 		return OpenSSHHost{}, err
 	}

@@ -72,6 +72,9 @@ func runInventoryAdd(cmd *cobra.Command, args []string, flags *addFlags, secretI
 	}
 
 	portChanged := cmd.Flags().Changed("port")
+	if portChanged && flags.port == 0 {
+		return fmt.Errorf("%s", i18n.T("scp_err_port_zero"))
+	}
 	if err := resolveAddTargetAndAlias(args, flags, secretInput.UsesStdin(), portChanged); err != nil {
 		return err
 	}
@@ -83,17 +86,7 @@ func runInventoryAdd(cmd *cobra.Command, args []string, flags *addFlags, secretI
 	if flags.port == 0 {
 		flags.port = 22
 	}
-	if keyPass != "" && flags.keyPath == "" {
-		return fmt.Errorf("private-key path is required for a passphrase (--key)")
-	}
-	if flags.keyPath != "" && keyPass == "" && password == "" && !secretInput.UsesStdin() {
-		keyPass, err = utils.PromptPassphraseIfEncryptedKey(flags.keyPath, keyPass)
-		if err != nil {
-			return err
-		}
-	}
-
-	identity, identityRef, password, err := resolveAddedIdentity(cfg, flags, password)
+	identity, identityRef, password, keyPass, err := resolveValidatedAddedIdentity(cfg, flags, password, keyPass, secretInput.UsesStdin())
 	if err != nil {
 		return err
 	}
@@ -130,6 +123,24 @@ func runInventoryAdd(cmd *cobra.Command, args []string, flags *addFlags, secretI
 		}
 	}
 	return commitAddedNode(cmd, repository, name, node, hostObj, identity, password, keyPass, flags.keyPath)
+}
+
+func resolveValidatedAddedIdentity(cfg *config.Configuration, flags *addFlags, password, keyPass string, stdinUsed bool) (models.Identity, string, string, string, error) {
+	if keyPass != "" && flags.keyPath == "" {
+		return models.Identity{}, "", "", "", fmt.Errorf("private-key path is required for a passphrase (--key)")
+	}
+	if flags.keyPath != "" && keyPass == "" && password == "" && !stdinUsed {
+		var err error
+		keyPass, err = utils.PromptPassphraseIfEncryptedKey(flags.keyPath, keyPass)
+		if err != nil {
+			return models.Identity{}, "", "", "", err
+		}
+	}
+	identity, identityRef, password, err := resolveAddedIdentity(cfg, flags, password)
+	if err != nil {
+		return models.Identity{}, "", "", "", err
+	}
+	return identity, identityRef, password, keyPass, nil
 }
 
 func commitAddedNode(cmd *cobra.Command, repository *config.Repository, name string, node models.Node, hostObj models.Host, identity models.Identity, password, keyPass, keyPath string) error {
@@ -256,6 +267,9 @@ func mergeTargetAddressSpec(spec string, address, user *string, port *uint16, po
 
 func validateNewNodeAliases(repo *config.Repository, aliases []string) error {
 	for _, alias := range aliases {
+		if err := config.ValidateNodeAlias(alias); err != nil {
+			return err
+		}
 		if existing := repo.FindAlias(alias); existing != "" {
 			return fmt.Errorf("%s", i18n.Tf("alias_err_exists", map[string]any{"Alias": alias, "Node": existing}))
 		}

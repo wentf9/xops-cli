@@ -527,6 +527,13 @@ func parseDestEndpoint(token string) (ForwardEndpoint, error) {
 	}, nil
 }
 
+func splitForwardFields(trimmed string) ([]string, error) {
+	if !strings.ContainsAny(trimmed, `"'`) {
+		return strings.Fields(trimmed), nil
+	}
+	return splitQuotedEnvTokens(trimmed)
+}
+
 // ParseForwardSpec parses a LocalForward or RemoteForward specification in either
 // OpenSSH two-token whitespace form ("[bind_address:]port host:hostport") or CLI
 // colon-delimited form ("[bind_address:]port:host:hostport").
@@ -535,8 +542,11 @@ func ParseForwardSpec(raw string) (ForwardSpec, error) {
 	if trimmed == "" {
 		return ForwardSpec{}, errors.New("forward specification cannot be empty")
 	}
-	fields := strings.Fields(trimmed)
-	if len(fields) > 2 {
+	fields, err := splitForwardFields(trimmed)
+	if err != nil {
+		return ForwardSpec{}, fmt.Errorf("invalid forward specification %q: %w", raw, err)
+	}
+	if len(fields) == 0 || len(fields) > 2 {
 		return ForwardSpec{}, fmt.Errorf("invalid forward specification %q: expected '[bind_address:]port host:hostport'", raw)
 	}
 	if len(fields) == 2 {
@@ -752,8 +762,11 @@ func ParseRemoteForwardSpec(raw string) (ForwardSpec, error) {
 	if trimmed == "" {
 		return ForwardSpec{}, errors.New("remote forward specification cannot be empty")
 	}
-	fields := strings.Fields(trimmed)
-	if len(fields) > 2 {
+	fields, err := splitForwardFields(trimmed)
+	if err != nil {
+		return ForwardSpec{}, fmt.Errorf("invalid remote forward specification %q: %w", raw, err)
+	}
+	if len(fields) == 0 || len(fields) > 2 {
 		return ForwardSpec{}, fmt.Errorf("invalid remote forward specification %q: expected at most two fields", raw)
 	}
 	if len(fields) == 2 {
@@ -838,10 +851,11 @@ func ParseDynamicForwardEndpoint(raw string) (ForwardEndpoint, error) {
 	if trimmed == "" {
 		return ForwardEndpoint{}, errors.New("dynamic forward specification cannot be empty")
 	}
-	if len(strings.Fields(trimmed)) != 1 {
+	fields, err := splitForwardFields(trimmed)
+	if err != nil || len(fields) != 1 || fields[0] == "" {
 		return ForwardEndpoint{}, fmt.Errorf("invalid dynamic forward specification %q: expected [bind_address:]port or socket path", raw)
 	}
-	return parseBindEndpoint(trimmed)
+	return parseBindEndpoint(fields[0])
 }
 
 // ParseDynamicForwardSpec parses a DynamicForward specification into its canonical OpenSSH string representation.

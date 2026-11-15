@@ -18,7 +18,7 @@ xops ssh -J bastion.example.com deploy@192.0.2.10
 - **用户名与端口参数优先级**（遵循 OpenSSH 原生语义）：
   - `xops ssh` 与单目标 `xops exec`：显式 `-l`/`-p` 以及 `-o User`/`-o Port` 覆盖目标地址中的 `user@` 与 `:port`。
   - `xops sftp`（对齐原生 `sftp(1)`）：显式 `-P`（`--port`）以及 `-o User`/`-o Port` 覆盖目标地址中的 `user@` 与 `:port`（同时支持 `-c`/`--cipher`；不注册 `-l` 与 `-p`）。
-  - `xops scp` 与批量 `xops exec`（`--ifile` 或多 `--host`）：单个端点内联的 `user@`/`:port` 优先于全局标志（`scp` 使用 `-l`/`-P`，批量 `exec` 使用 `-l`/`-p`）；未写内联用户名或端口的端点再回退使用全局标志。
+  - `xops scp`（对齐原生 `scp(1)`）：单个端点内联的 `user@`/`:port` 优先于全局标志（支持 `-P`/`--port`、`-c`/`--cipher`、`-o User`/`-o Port`；不注册 `-l` 与 `-p`）；未写内联用户名或端口的端点再回退使用全局选项。批量 `xops exec`（`--ifile` 或多 `--host`）：单个端点内联 `user@`/`:port` 优先于全局 `-l`/`-p`；未写内联用户名或端口的端点再回退使用全局标志。
 
 ## 连接诊断
 

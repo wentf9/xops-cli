@@ -421,10 +421,10 @@ func assertInMemoryASTCycleGuard(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg1.Hosts[0].Nodes = append(cfg1.Hosts[0].Nodes, &openSSHIncludeNode{
-		files: map[string]*ssh_config.Config{"cfg2": cfg2},
+		files: []includedSSHConfigFile{{path: "cfg2", cfg: cfg2}},
 	})
 	cfg2.Hosts[0].Nodes = append(cfg2.Hosts[0].Nodes, &openSSHIncludeNode{
-		files: map[string]*ssh_config.Config{"cfg1": cfg1},
+		files: []includedSSHConfigFile{{path: "cfg1", cfg: cfg1}},
 	})
 	memParser := &OpenSSHParser{cfg: cfg1}
 	if !memParser.HasHost("mem-1") || !memParser.HasHost("mem-2") || memParser.HasHost("missing") {

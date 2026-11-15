@@ -1989,6 +1989,11 @@ Host gw-box
 	}
 
 	// 2. Explicit port override on openssh:jumpuser@jump-box must still resolve via OpenSSHParser Step 4.
+	verifyOpenSSHCompositePortOverride(t, ctx, repo)
+}
+
+func verifyOpenSSHCompositePortOverride(t *testing.T, ctx context.Context, repo *Repository) {
+	t.Helper()
 	overrideTarget := ConnectionTarget{
 		Selector: "openssh:jumpuser@jump-box",
 		Port:     2222,
@@ -2009,12 +2014,21 @@ Host gw-box
 	if err != nil {
 		t.Fatalf("EnsureNodeContext(openssh composite + port override) failed: %v", err)
 	}
-	ensuredNode, ok := repo.Snapshot().Nodes.Get(ensured.NodeID)
-	if !ok {
-		t.Fatalf("expected node %q to exist in snapshot", ensured.NodeID)
+	if ensured.Created {
+		t.Fatalf("expected explicit openssh composite + port override not to create persisted node, got %+v", ensured)
 	}
-	if gotAlias := repo.effectiveNodeOpenSSHAlias(ensured.NodeID, ensuredNode); gotAlias != "jump-box" {
-		t.Fatalf("expected effectiveNodeOpenSSHAlias(%q) = 'jump-box', got %q", ensured.NodeID, gotAlias)
+	if !strings.HasPrefix(ensured.NodeID, OpenSSHNodePrefix) {
+		t.Fatalf("expected virtual openssh NodeID prefix, got %q", ensured.NodeID)
+	}
+	if _, exists := repo.Snapshot().Nodes.Get(ensured.NodeID); exists {
+		t.Fatalf("expected virtual node %q not to exist in persisted snapshot", ensured.NodeID)
+	}
+	snap, err := repo.ResolveConnection(ensured.NodeID)
+	if err != nil {
+		t.Fatalf("ResolveConnection(%q) failed: %v", ensured.NodeID, err)
+	}
+	if snap.Host.Address != "10.20.30.40" || snap.Host.Port != 2222 || snap.Identity.User != "jumpuser" || snap.Node.ProxyJump != "openssh:gw-box" {
+		t.Fatalf("unexpected resolved snapshot for %q: %+v", ensured.NodeID, snap)
 	}
 }
 
