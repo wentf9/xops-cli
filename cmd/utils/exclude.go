@@ -113,7 +113,7 @@ func parseExcludeSpec(ex string) (hasOpenSSHPrefix bool, user, host string, port
 		hasOpenSSHPrefix = true
 		rawSpec = strings.TrimSpace(after)
 	}
-	if rawSpec == "" {
+	if rawSpec == "" || (hasOpenSSHPrefix && strings.HasPrefix(rawSpec, config.OpenSSHNodePrefix)) {
 		return false, "", "", 0, false
 	}
 	u, h, p, err := ParseAddr(rawSpec)

@@ -191,12 +191,15 @@ func validateSetEnvOption(raw string) (string, error) {
 
 // parseSetEnvDirective splits a single SetEnv directive into one or more KEY=VALUE pairs,
 // honoring single and double quotes around either VALUE or the entire "KEY=VALUE" token.
+// Following OpenSSH semantics, all tokens are validated and duplicate variable names
+// within the same SetEnv directive retain the first occurrence.
 func parseSetEnvDirective(directive string) ([]EnvVar, error) {
 	tokens, err := splitQuotedEnvTokens(directive)
 	if err != nil {
 		return nil, err
 	}
 	vars := make([]EnvVar, 0, len(tokens))
+	seen := make(map[string]struct{}, len(tokens))
 	for _, tok := range tokens {
 		name, val, ok := strings.Cut(tok, "=")
 		if !ok {
@@ -211,6 +214,10 @@ func parseSetEnvDirective(directive string) ([]EnvVar, error) {
 		if len(name)+1+len(val) > MaxSessionEnvEntryBytes {
 			return nil, fmt.Errorf("environment variable %q exceeds %d bytes", name, MaxSessionEnvEntryBytes)
 		}
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
 		vars = append(vars, EnvVar{Name: name, Value: val})
 	}
 	return vars, nil

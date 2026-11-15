@@ -193,7 +193,10 @@ func assertPass7AppSSHOptions(t *testing.T, opts *ssh.Options) {
 	for _, ev := range envVars {
 		envMap[ev.Name] = ev.Value
 	}
-	if _, excluded := envMap["LC_ALL"]; excluded || envMap["LANG"] != "en_US.UTF-8" || envMap["APP_ENV"] != "included-prod" {
+	// Under native OpenSSH_10.6p2 top-to-bottom SendEnv evaluation:
+	// 10-hosts.conf has `SendEnv -LC_*` BEFORE 20-canonical.conf's `SendEnv LANG LC_*`,
+	// so `-LC_*` only clears earlier entries and both LANG and LC_* remain active.
+	if envMap["LANG"] != "en_US.UTF-8" || envMap["LC_ALL"] != "C" || envMap["LC_CTYPE"] != "UTF-8" || envMap["APP_ENV"] != "included-prod" {
 		t.Fatalf("unexpected resolved session env: %+v", envMap)
 	}
 }

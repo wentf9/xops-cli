@@ -22,6 +22,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/testutil/sshfixture"
 	cryptoSSH "golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 func TestPass5Conn_H1_RelativeHostKeyAlgorithmsKnownHostsOrdering(t *testing.T) {
@@ -349,7 +350,7 @@ func assertPass5CertAuthorityWithPlusLegacyCert(t *testing.T) {
 	host, portStr, port := splitFixtureHostPort(t, peer.Address)
 	dir := t.TempDir()
 	userKH := filepath.Join(dir, "known_hosts")
-	caLine := "@cert-authority " + net.JoinHostPort(host, portStr) + " " + strings.TrimSpace(string(cryptoSSH.MarshalAuthorizedKey(caFix.caSigner.PublicKey()))) + "\n"
+	caLine := "@cert-authority " + knownhosts.Normalize(net.JoinHostPort(host, portStr)) + " " + strings.TrimSpace(string(cryptoSSH.MarshalAuthorizedKey(caFix.caSigner.PublicKey()))) + "\n"
 	if err := os.WriteFile(userKH, []byte(caLine), 0o600); err != nil {
 		t.Fatal(err)
 	}

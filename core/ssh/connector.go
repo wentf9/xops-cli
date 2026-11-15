@@ -1389,9 +1389,10 @@ func (c *Connector) AcquireMaster(server *MuxServer) bool {
 	c.pruneClosedMastersLocked()
 	ownership = c.masters[server]
 	if c.closed || ownership == nil || ownership.foregroundSession {
+		alreadyHeld := !c.closed && ownership != nil && ownership.foregroundSession
 		c.lifecycleMu.Unlock()
 		server.RemoveForegroundSession()
-		return ownership != nil && ownership.foregroundSession
+		return alreadyHeld
 	}
 	ownership.foregroundSession = true
 	c.lifecycleMu.Unlock()

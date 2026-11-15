@@ -257,15 +257,19 @@ Host gate3-node
 func TestOpenSSHConfig_SendEnvSetEnvHostBlockPrecedence(t *testing.T) {
 	t.Parallel()
 
+	// Matches native OpenSSH_10.6p2 (ssh -G) top-to-bottom evaluation:
+	// - SendEnv applies top-to-bottom across matching Host blocks, so -LC_* clears earlier patterns.
+	// - SetEnv uses first-directive-wins across directives and first-key-wins within a directive.
 	const input = `
 Host app-prod
     HostName 10.0.0.60
+    SendEnv LANG LC_*
     SendEnv -LC_*
-    SetEnv APP_ENV=prod
+    SetEnv APP_ENV=prod DUP=first DUP=second
 
 Host *
-    SendEnv LANG LC_*
-    SetEnv APP_ENV=dev
+    SendEnv EXTRA_*
+    SetEnv APP_ENV=dev OTHER=fallback
 `
 	parser, err := NewOpenSSHParserFromReader(strings.NewReader(input))
 	if err != nil {
@@ -276,7 +280,7 @@ Host *
 		t.Fatalf("GetSSHOptions(app-prod) error = %v", err)
 	}
 	envVars, err := ssh.ResolveSessionEnv(opts, func() []string {
-		return []string{"LANG=en_US.UTF-8", "LC_ALL=C", "LC_CTYPE=UTF-8"}
+		return []string{"LANG=en_US.UTF-8", "LC_ALL=C", "LC_CTYPE=UTF-8", "EXTRA_FOO=bar"}
 	})
 	if err != nil {
 		t.Fatalf("ResolveSessionEnv() error = %v", err)
@@ -286,15 +290,24 @@ Host *
 		got[ev.Name] = ev.Value
 	}
 	if got["LANG"] != "en_US.UTF-8" {
-		t.Fatalf("expected LANG=en_US.UTF-8 preserved from Host *, got %q", got["LANG"])
+		t.Fatalf("expected LANG=en_US.UTF-8 preserved, got %q", got["LANG"])
 	}
 	if _, ok := got["LC_ALL"]; ok {
-		t.Fatalf("expected LC_ALL excluded by Host app-prod SendEnv -LC_*, got %+v", got)
+		t.Fatalf("expected LC_ALL excluded by later SendEnv -LC_*, got %+v", got)
 	}
 	if _, ok := got["LC_CTYPE"]; ok {
-		t.Fatalf("expected LC_CTYPE excluded by Host app-prod SendEnv -LC_*, got %+v", got)
+		t.Fatalf("expected LC_CTYPE excluded by later SendEnv -LC_*, got %+v", got)
+	}
+	if got["EXTRA_FOO"] != "bar" {
+		t.Fatalf("expected EXTRA_FOO=bar preserved from later Host * SendEnv, got %+v", got)
 	}
 	if got["APP_ENV"] != "prod" {
-		t.Fatalf("expected Host app-prod SetEnv APP_ENV=prod to win over Host * APP_ENV=dev, got %q", got["APP_ENV"])
+		t.Fatalf("expected first SetEnv APP_ENV=prod to win over Host * APP_ENV=dev, got %q", got["APP_ENV"])
+	}
+	if got["DUP"] != "first" {
+		t.Fatalf("expected first occurrence DUP=first within SetEnv directive, got %q", got["DUP"])
+	}
+	if _, ok := got["OTHER"]; ok {
+		t.Fatalf("expected subsequent SetEnv directive in Host * (OTHER=fallback) ignored after first SetEnv directive, got %+v", got)
 	}
 }

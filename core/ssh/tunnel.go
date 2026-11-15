@@ -205,6 +205,9 @@ func (c *Client) handleLocalForwardEndpoint(ctx context.Context, localConn net.C
 // Startup and listener shutdown have independent, bounded request lifetimes.
 // Canceling startup or timing out a request interrupts the shared SSH transport.
 func (c *Client) RemoteForward(ctx context.Context, remoteAddr, localAddr string, opts ...ForwardOption) (*Forward, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("remote forward context is nil")
+	}
 	if c.muxSocketPath != "" {
 		bindEp, err := parseBindEndpoint(remoteAddr)
 		if err != nil {

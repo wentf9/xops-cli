@@ -223,19 +223,28 @@ type PathInfo struct {
 	Path         string
 }
 
-//nolint:gocyclo
+func isWindowsDrivePath(p string) bool {
+	if len(p) < 2 || p[1] != ':' {
+		return false
+	}
+	isLetter := (p[0] >= 'a' && p[0] <= 'z') || (p[0] >= 'A' && p[0] <= 'Z')
+	return isLetter && (len(p) == 2 || p[2] == '\\' || p[2] == '/')
+}
+
 func parsePath(p string) (PathInfo, error) {
 	if p == "" {
 		return PathInfo{IsRemote: false, Path: ""}, nil
 	}
-
-	// 检查是否是 Windows 盘符
-	if len(p) >= 2 && p[1] == ':' && ((p[0] >= 'a' && p[0] <= 'z') || (p[0] >= 'A' && p[0] <= 'Z')) {
-		if len(p) == 2 || p[2] == '\\' || p[2] == '/' {
-			return PathInfo{IsRemote: false, Path: p}, nil
-		}
+	if strings.HasPrefix(p, config.OpenSSHNodePrefix) {
+		return parseOpenSSHPath(p)
 	}
+	if isWindowsDrivePath(p) {
+		return PathInfo{IsRemote: false, Path: p}, nil
+	}
+	return parsePlainScpPath(p)
+}
 
+func parsePlainScpPath(p string) (PathInfo, error) {
 	firstColon := strings.Index(p, ":")
 	if firstColon == -1 || strings.ContainsAny(p[:firstColon], "/\\") {
 		return PathInfo{Path: p}, nil
@@ -254,28 +263,57 @@ func parsePath(p string) (PathInfo, error) {
 	}
 	// The address/path delimiter is final: numeric prefixes are filenames, not ports.
 	addrPart, pathPart := p[:separator], p[separator+1:]
-
 	if addrPart != "" {
 		if strings.Contains(addrPart, "/") || strings.Contains(addrPart, "\\") {
 			return PathInfo{IsRemote: false, Path: p}, nil
 		}
-
-		u, h, port, err := cmdutils.ParseAddr(addrPart)
-		if err != nil {
-			return PathInfo{}, fmt.Errorf("invalid remote address %q in %q: %w", addrPart, p, err)
-		}
-		if h == "" {
-			return PathInfo{}, fmt.Errorf("invalid remote address %q: host cannot be empty", addrPart)
-		}
-		return PathInfo{
-			IsRemote: true,
-			User:     u,
-			Host:     h,
-			Port:     port,
-			Path:     pathPart,
-		}, nil
+		return parseRemotePath(addrPart, pathPart, p)
 	}
 	return PathInfo{IsRemote: false, Path: p}, nil
+}
+
+func parseOpenSSHPath(p string) (PathInfo, error) {
+	rest := p[len(config.OpenSSHNodePrefix):]
+	if rest == "" || strings.HasPrefix(rest, config.OpenSSHNodePrefix) {
+		return PathInfo{}, fmt.Errorf("invalid openssh remote path %q", p)
+	}
+	firstColon := strings.Index(rest, ":")
+	if firstColon == -1 || strings.ContainsAny(rest[:firstColon], "/\\") {
+		return PathInfo{}, fmt.Errorf("missing or invalid remote path delimiter ':' in %q", p)
+	}
+	separator := firstColon
+	if openBracket := strings.Index(rest, "["); openBracket != -1 && openBracket < firstColon {
+		closeBracket := strings.Index(rest[openBracket:], "]")
+		if closeBracket == -1 {
+			return PathInfo{}, fmt.Errorf("malformed bracketed address in %q", p)
+		}
+		separator = openBracket + closeBracket + 1
+		if separator >= len(rest) || rest[separator] != ':' {
+			return PathInfo{}, fmt.Errorf("missing or invalid remote path delimiter ':' in %q", p)
+		}
+	}
+	addrRest, pathPart := rest[:separator], rest[separator+1:]
+	if strings.ContainsAny(addrRest, "/\\") {
+		return PathInfo{}, fmt.Errorf("invalid openssh remote address in %q", p)
+	}
+	return parseRemotePath(config.OpenSSHNodePrefix+addrRest, pathPart, p)
+}
+
+func parseRemotePath(addrPart, pathPart, raw string) (PathInfo, error) {
+	u, h, port, err := cmdutils.ParseAddr(addrPart)
+	if err != nil {
+		return PathInfo{}, fmt.Errorf("invalid remote address %q in %q: %w", addrPart, raw, err)
+	}
+	if h == "" {
+		return PathInfo{}, fmt.Errorf("invalid remote address %q: host cannot be empty", addrPart)
+	}
+	return PathInfo{
+		IsRemote: true,
+		User:     u,
+		Host:     h,
+		Port:     port,
+		Path:     pathPart,
+	}, nil
 }
 
 func (o *ScpOptions) Run() error {

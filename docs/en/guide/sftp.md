@@ -82,6 +82,8 @@ xops scp -qvv ./file web-01:~/file
 xops sftp web-01
 ```
 
+- **Connection flags** (aligned with OpenSSH `sftp(1)`): supports `-P`/`--port` for port, `-c`/`--cipher` for ciphers, `-i` (identity), `-J` (ProxyJump), `-F` (config file), and `-o` (SSH options); specify username via `user@host` or `-o User=...` (`-l` and `-p` are not provided).
+
 Type `help` at the SFTP prompt to list all commands. Common operations:
 
 ```text

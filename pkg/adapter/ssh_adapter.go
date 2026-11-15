@@ -198,8 +198,14 @@ func SplitOptionKeyValue(opt string) (key, val string, err error) {
 // ParseOptionStrings parses OpenSSH -o Key=Value strings into SessionControlOptions.
 // Unknown keys are rejected instead of ignored so a typo cannot silently disable
 // the requested behavior.
+type optionParseState struct {
+	seen            map[string]bool
+	proxyJumpActive bool
+}
+
 func ParseOptionStrings(options []string) (SessionControlOptions, error) {
 	var opts SessionControlOptions
+	state := optionParseState{seen: make(map[string]bool)}
 	for _, opt := range options {
 		key, val, err := SplitOptionKeyValue(opt)
 		if err != nil {
@@ -208,44 +214,45 @@ func ParseOptionStrings(options []string) (SessionControlOptions, error) {
 		if key == "" {
 			continue
 		}
-		if err := applyParsedOption(&opts, key, val); err != nil {
+		if err := applyParsedOption(&opts, &state, key, val); err != nil {
 			return opts, err
 		}
 	}
 	return opts, nil
 }
 
-func applyParsedOption(opts *SessionControlOptions, key, val string) error {
+func applyParsedOption(opts *SessionControlOptions, state *optionParseState, key, val string) error {
+	if handled, err := applyControlOption(opts, state, key, val); handled || err != nil {
+		return err
+	}
 	switch strings.ToLower(key) {
-	case "controlmaster", "control_master":
-		m, err := ssh.ParseControlMasterMode(val)
-		if err != nil {
-			return fmt.Errorf("invalid ControlMaster in -o option: %w", err)
-		}
-		opts.SetMaster(m)
-	case "controlpath", "control_path":
-		if val == "" {
-			return fmt.Errorf("invalid ControlPath in -o option: value cannot be empty")
-		}
-		if strings.EqualFold(val, "none") {
-			val = "none"
-		} else if err := ssh.ValidateControlPathSyntax(val); err != nil {
-			return fmt.Errorf("invalid ControlPath in -o option: %w", err)
-		}
-		opts.SetPath(val)
-	case "controlpersist", "control_persist":
-		if _, _, _, err := ssh.ParseControlPersist(val); err != nil {
-			return fmt.Errorf("invalid ControlPersist in -o option: %w", err)
-		}
-		opts.SetPersist(strings.ToLower(val))
 	case "port":
 		p, err := strconv.ParseUint(val, 10, 16)
 		if err != nil || p == 0 {
 			return fmt.Errorf("invalid Port in -o option: %q", val)
 		}
-	case "user", "proxyjump", "hostname":
+	case "user":
 		if val == "" {
 			return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
+		}
+		// Applied to the connection target by the CLI, see ApplyGeneralOptions.
+	case "hostname":
+		if val == "" {
+			return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
+		}
+		if _, err := ssh.ExpandHostName(val, "host"); err != nil {
+			return fmt.Errorf("invalid HostName in -o option: %w", err)
+		}
+		// Applied to the connection target by the CLI, see ApplyGeneralOptions.
+	case "proxyjump":
+		if val == "" {
+			return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
+		}
+		if !state.seen["proxyjump"] && !state.seen[ssh.OptionProxyCommand] {
+			state.seen["proxyjump"] = true
+			if !strings.EqualFold(strings.TrimSpace(val), "none") {
+				state.proxyJumpActive = true
+			}
 		}
 		// Applied to the connection target by the CLI, see ApplyGeneralOptions.
 	case "identityfile":
@@ -256,12 +263,51 @@ func applyParsedOption(opts *SessionControlOptions, key, val string) error {
 			return fmt.Errorf("invalid IdentityFile in -o option: %w", err)
 		}
 	default:
-		return applySupportedOption(opts, key, val)
+		return applySupportedOption(opts, state, key, val)
 	}
 	return nil
 }
 
-func applySupportedOption(opts *SessionControlOptions, key, val string) error {
+func applyControlOption(opts *SessionControlOptions, state *optionParseState, key, val string) (bool, error) {
+	switch strings.ToLower(key) {
+	case "controlmaster", "control_master":
+		m, err := ssh.ParseControlMasterMode(val)
+		if err != nil {
+			return true, fmt.Errorf("invalid ControlMaster in -o option: %w", err)
+		}
+		if !state.seen[ssh.OptionControlMaster] {
+			opts.SetMaster(m)
+		}
+		state.seen[ssh.OptionControlMaster] = true
+		return true, nil
+	case "controlpath", "control_path":
+		if val == "" {
+			return true, fmt.Errorf("invalid ControlPath in -o option: value cannot be empty")
+		}
+		if strings.EqualFold(val, "none") {
+			val = "none"
+		} else if err := ssh.ValidateControlPathSyntax(val); err != nil {
+			return true, fmt.Errorf("invalid ControlPath in -o option: %w", err)
+		}
+		if !state.seen[ssh.OptionControlPath] {
+			opts.SetPath(val)
+		}
+		state.seen[ssh.OptionControlPath] = true
+		return true, nil
+	case "controlpersist", "control_persist":
+		if _, _, _, err := ssh.ParseControlPersist(val); err != nil {
+			return true, fmt.Errorf("invalid ControlPersist in -o option: %w", err)
+		}
+		if !state.seen[ssh.OptionControlPersist] {
+			opts.SetPersist(strings.ToLower(val))
+		}
+		state.seen[ssh.OptionControlPersist] = true
+		return true, nil
+	}
+	return false, nil
+}
+
+func applySupportedOption(opts *SessionControlOptions, state *optionParseState, key, val string) error {
 	spec, supported := ssh.LookupOptionSpec(key)
 	if !supported {
 		return fmt.Errorf("unsupported -o option %q", key)
@@ -270,14 +316,43 @@ func applySupportedOption(opts *SessionControlOptions, key, val string) error {
 		return fmt.Errorf("invalid %s in -o option: value cannot be empty", spec.OpenSSHName)
 	}
 	if spec.MultiValue {
+		if spec.CanonicalKey == ssh.OptionSetEnv {
+			var scratch ssh.Options
+			if err := scratch.Append(spec.CanonicalKey, val); err != nil {
+				return fmt.Errorf("invalid %s in -o option: %w", spec.OpenSSHName, err)
+			}
+			if !state.seen[ssh.OptionSetEnv] {
+				if err := opts.ensureOptions().Append(spec.CanonicalKey, val); err != nil {
+					return fmt.Errorf("invalid %s in -o option: %w", spec.OpenSSHName, err)
+				}
+			}
+			state.seen[ssh.OptionSetEnv] = true
+			return nil
+		}
 		if err := opts.ensureOptions().Append(spec.CanonicalKey, val); err != nil {
 			return fmt.Errorf("invalid %s in -o option: %w", spec.OpenSSHName, err)
 		}
 		return nil
 	}
-	if err := opts.ensureOptions().Set(spec.CanonicalKey, val); err != nil {
+	var scratch ssh.Options
+	if err := scratch.Set(spec.CanonicalKey, val); err != nil {
 		return fmt.Errorf("invalid %s in -o option: %w", spec.OpenSSHName, err)
 	}
+	if spec.CanonicalKey == ssh.OptionProxyCommand {
+		if !state.seen[ssh.OptionProxyCommand] && !state.proxyJumpActive {
+			if err := opts.ensureOptions().Set(spec.CanonicalKey, val); err != nil {
+				return fmt.Errorf("invalid %s in -o option: %w", spec.OpenSSHName, err)
+			}
+		}
+		state.seen[ssh.OptionProxyCommand] = true
+		return nil
+	}
+	if !state.seen[spec.CanonicalKey] {
+		if err := opts.ensureOptions().Set(spec.CanonicalKey, val); err != nil {
+			return fmt.Errorf("invalid %s in -o option: %w", spec.OpenSSHName, err)
+		}
+	}
+	state.seen[spec.CanonicalKey] = true
 	return nil
 }
 
@@ -735,8 +810,10 @@ func (a *SSHAdapter) resolveOptionTiers(nodeName string) (tier2Node, tier3Global
 		tier3Global = globalCfg.SSHOptions
 	}
 
-	if virtualOpenSSHNode && !pendingAliasOpenSSHNode {
-		if snapErr == nil {
+	if virtualOpenSSHNode {
+		if pendingAliasOpenSSHNode {
+			tier4OpenSSH = a.resolveTier4OpenSSHOptions(nodeName, snapErr, snapshot).Clone()
+		} else if snapErr == nil {
 			tier4OpenSSH = snapshot.Node.SSHOptions.Clone()
 		}
 	} else {

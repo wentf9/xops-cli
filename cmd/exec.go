@@ -260,6 +260,11 @@ func (o *ExecOptions) Complete(cmd *cobra.Command, args []string) error {
 	if err := ApplyGeneralOptions(&o.SshOptions, o.control.Options, flags); err != nil {
 		return err
 	}
+	if flags != nil && flags.Changed("port") {
+		if portVal, err := flags.GetUint16("port"); err == nil && portVal == 0 {
+			return errors.New(i18n.T("scp_err_port_zero"))
+		}
+	}
 	if _, err := o.control.ToSessionControlOptions(); err != nil {
 		return err
 	}

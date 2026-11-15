@@ -353,6 +353,11 @@ func (o *SshOptions) Complete(cmd *cobra.Command, args []string) error {
 	if err := ApplyGeneralOptions(o, o.control.Options, flags); err != nil {
 		return o.control.controlUsageError(err)
 	}
+	if flags != nil && flags.Changed("port") {
+		if portVal, err := flags.GetUint16("port"); err == nil && portVal == 0 {
+			return o.control.controlUsageError(errors.New(i18n.T("scp_err_port_zero")))
+		}
+	}
 	if isMuxDaemonChild() {
 		// The detached master daemon re-executes the original command line, but it
 		// only serves the control socket. Normalize before Complete reads stdin:
@@ -413,8 +418,13 @@ func (o *SshOptions) parseTarget(allowMissingHost bool) error {
 			return err
 		}
 		finalHost, finalUser, hasUser, finalPort, hasPort = applyParsedAddr(finalHost, finalUser, hasUser, finalPort, hasPort, h, u, p)
-	} else if finalHost != "" && !strings.HasPrefix(finalHost, config.OpenSSHNodePrefix) {
-		if u, h, p, err := utils.ParseAddr(finalHost); err == nil && h != "" {
+	} else if finalHost != "" {
+		u, h, p, err := utils.ParseAddr(finalHost)
+		if err != nil {
+			if strings.HasPrefix(strings.TrimSpace(finalHost), config.OpenSSHNodePrefix) {
+				return err
+			}
+		} else if h != "" {
 			finalHost, finalUser, hasUser, finalPort, hasPort = applyParsedAddr("", finalUser, hasUser, finalPort, hasPort, h, u, p)
 		}
 	}
@@ -1610,6 +1620,9 @@ func waitAndReleaseMastersForHandoffWithProvider(
 		if isMasterDeadOrStopped(master) {
 			return false, nil
 		}
+		if _, ok := collectLiveJumpMastersForHandoff(connector, provider, master); !ok {
+			return false, nil
+		}
 		if err := drainOwnedMasters(ctx, connector); err != nil {
 			return false, nil
 		}
@@ -1646,7 +1659,12 @@ func drainOwnedMasters(ctx context.Context, connector *ssh.Connector) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	for _, m := range connector.Masters() {
+	masters := connector.Masters()
+	for i := len(masters) - 1; i >= 0; i-- {
+		m := masters[i]
+		if m == nil || isMasterClosed(m) {
+			continue
+		}
 		maxSessions := int32(0)
 		if connector.HasMasterSession(m) {
 			maxSessions = 1
@@ -1655,13 +1673,39 @@ func drainOwnedMasters(ctx context.Context, connector *ssh.Connector) error {
 			return err
 		}
 		if m.StoppedListening() {
-			connector.ReleaseMaster(m)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-m.Wait():
+			if err := retireStoppedOwnedMaster(ctx, connector, m, masters, masters[i+1:]); err != nil {
+				return err
 			}
 		}
+	}
+	return nil
+}
+
+func retireStoppedOwnedMaster(
+	ctx context.Context,
+	connector *ssh.Connector,
+	m *ssh.MuxServer,
+	allMasters []*ssh.MuxServer,
+	innerMasters []*ssh.MuxServer,
+) error {
+	var deps []*ssh.MuxServer
+	for _, dep := range innerMasters {
+		if dep == nil || isMasterClosed(dep) {
+			continue
+		}
+		if slices.Contains(jumpChainMasters(connector, dep, allMasters), m) {
+			deps = append(deps, dep)
+		}
+	}
+	connector.ReleaseMaster(m)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-m.Wait():
+	}
+	for _, dep := range deps {
+		connector.ReleaseMaster(dep)
+		_ = dep.Shutdown()
 	}
 	return nil
 }
@@ -2183,21 +2227,6 @@ func rollbackHandoffReservation(connector *ssh.Connector, reserved, released []*
 	}
 }
 
-func isConnectorOwnedNonPersistentMasterIdle(m *ssh.MuxServer) (idle bool, deadOrStopped bool) {
-	if isMasterDeadOrStopped(m) {
-		return false, true
-	}
-	probeCtx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := m.WaitForDrain(probeCtx, 1); err != nil {
-		return false, isMasterDeadOrStopped(m)
-	}
-	if isMasterDeadOrStopped(m) {
-		return false, true
-	}
-	return true, false
-}
-
 func reserveJumpMasterForHandoff(
 	connector *ssh.Connector,
 	m *ssh.MuxServer,
@@ -2205,11 +2234,15 @@ func reserveJumpMasterForHandoff(
 ) (ok bool, deadOrStopped bool) {
 	// Connector-owned non-persistent masters trigger immediate async Shutdown() inside
 	// RemoveForegroundSession() when activeSessions reaches 0 (causing PrepareHandoff
-	// to fail with s.shuttingDown == true and tearing down active forwards). Probe
-	// their exact idleMu busy state with maxSessions=1 while keeping the session ref
+	// to fail with s.shuttingDown == true and tearing down active forwards). Reserve
+	// them atomically with maxSessions=1 while keeping the foreground session ref
 	// until commit.
 	if !m.PersistEnabled() && connector != nil && connector.HasMasterSession(m) {
-		return isConnectorOwnedNonPersistentMasterIdle(m)
+		if !m.PrepareHandoffWithSessions(1) {
+			return false, isMasterDeadOrStopped(m)
+		}
+		*reserved = append(*reserved, m)
+		return true, false
 	}
 	if connector != nil && connector.HasMasterSession(m) && connector.ReleaseMaster(m) {
 		*released = append(*released, m)

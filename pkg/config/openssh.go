@@ -260,6 +260,18 @@ func hostBlockMatchesConcretePattern(block *ssh_config.Host, lookupAlias string)
 	return false
 }
 
+func resolveOpenSSHHostName(cfg *ssh_config.Config, alias string) (string, error) {
+	rawHostName := firstSSHConfigKeyValue(cfg, alias, "HostName")
+	if rawHostName == "" {
+		rawHostName = alias
+	}
+	expanded, err := ssh.ExpandHostName(rawHostName, alias)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(expanded), "]"), "["), nil
+}
+
 // FindConcreteHostsByAddress returns concrete Host pattern names in ssh_config
 // whose resolved HostName matches address and (when port > 0) whose resolved
 // Port matches port.
@@ -273,12 +285,8 @@ func (p *OpenSSHParser) FindConcreteHostsByAddress(address string, port uint16) 
 	}
 	var matches []string
 	walkConcreteSSHHostNames(p.cfg, func(name string) bool {
-		hostName := p.getVal(name, "HostName", name)
-		if expanded, expErr := ssh.ExpandHostName(hostName, name); expErr == nil {
-			hostName = expanded
-		}
-		cleanHost := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(hostName), "]"), "[")
-		if !strings.EqualFold(cleanHost, cleanAddr) {
+		cleanHost, expErr := resolveOpenSSHHostName(p.cfg, name)
+		if expErr != nil || !strings.EqualFold(cleanHost, cleanAddr) {
 			return true
 		}
 		if port > 0 {
@@ -304,12 +312,10 @@ func (p *OpenSSHParser) GetVirtualNode(alias string) (models.Node, models.Host, 
 		return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("parse openssh host %q failed: %w", alias, err)
 	}
 	// 从配置中提取各种字段
-	rawHostName := p.getVal(lookupAlias, "HostName", lookupAlias)
-	expandedHostName, expHostErr := ssh.ExpandHostName(rawHostName, lookupAlias)
+	hostName, expHostErr := resolveOpenSSHHostName(p.cfg, lookupAlias)
 	if expHostErr != nil {
 		return models.Node{}, models.Host{}, models.Identity{}, expHostErr
 	}
-	hostName := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(expandedHostName), "]"), "[")
 	user := p.getVal(lookupAlias, "User", "")
 	if user == "" {
 		defUser, userErr := getCurrentUser()
@@ -415,6 +421,11 @@ func parseOpenSSHOptions(cfg *ssh_config.Config, host string) (*ssh.Options, err
 					// (e.g. malformed multi-value entries).
 					continue
 				}
+				if spec.CanonicalKey == ssh.OptionSetEnv {
+					// OpenSSH evaluates only the first matching SetEnv directive
+					// in ssh_config (and retains the first occurrence per key inside it).
+					break
+				}
 			}
 			continue
 		}
@@ -448,11 +459,9 @@ func parseOpenSSHOptions(cfg *ssh_config.Config, host string) (*ssh.Options, err
 	return opts, nil
 }
 
-// allMatchingOpenSSHOptions resolves all entries for a multi-value option across matching
-// ssh_config Host blocks (including Include files). For SendEnv/SetEnv (which
-// MergeOptionLayers/ResolveSessionEnv evaluate low-to-high so later entries override/exclude
-// earlier ones), matching stanzas are traversed from lowest specificity (bottom) to highest
-// specificity (top) while keeping top-to-bottom order within each stanza segment.
+// allMatchingOpenSSHOptions resolves all entries for a multi-value option strictly
+// top-to-bottom across matching ssh_config Host blocks (including Include files),
+// matching OpenSSH readconf.c evaluation order for SendEnv, IdentityFile, SetEnv, etc.
 func allMatchingOpenSSHOptions(cfg *ssh_config.Config, host string, spec ssh.OptionSpec) []string {
 	if cfg == nil || host == "" {
 		return nil
@@ -462,7 +471,7 @@ func allMatchingOpenSSHOptions(cfg *ssh_config.Config, host string, spec ssh.Opt
 	keys = append(keys, spec.Aliases...)
 
 	var matches []string
-	collectKV := func(kv *ssh_config.KV) {
+	walkMatchingSSHConfigKVs(cfg, host, func(kv *ssh_config.KV) bool {
 		k := strings.TrimSpace(kv.Key)
 		for _, candidate := range keys {
 			if strings.EqualFold(k, candidate) {
@@ -472,15 +481,6 @@ func allMatchingOpenSSHOptions(cfg *ssh_config.Config, host string, spec ssh.Opt
 				break
 			}
 		}
-	}
-
-	reverseHosts := spec.CanonicalKey == ssh.OptionSendEnv || spec.CanonicalKey == ssh.OptionSetEnv
-	if reverseHosts {
-		walkMatchingSSHConfigKVsReverseHosts(cfg, host, collectKV)
-		return matches
-	}
-	walkMatchingSSHConfigKVs(cfg, host, func(kv *ssh_config.KV) bool {
-		collectKV(kv)
 		return true
 	})
 	return matches
@@ -848,58 +848,85 @@ func parseOpenSSHIncludeLine(line string) (openSSHIncludeSpec, bool, error) {
 }
 
 func parseOpenSSHIncludeArgs(rest string) (patterns []string, comment string, err error) {
-	var cur strings.Builder
-	inToken := false
-	inQuotes := false
-	flushToken := func() error {
-		if !inToken {
-			return nil
-		}
-		if cur.Len() == 0 {
-			return errors.New("empty pattern in Include directive")
-		}
-		patterns = append(patterns, cur.String())
-		cur.Reset()
-		inToken = false
-		return nil
-	}
-
-	for i := 0; i < len(rest); i++ {
-		ch := rest[i]
-		if inQuotes {
-			if ch == '"' {
-				inQuotes = false
-			} else {
-				cur.WriteByte(ch)
-			}
+	for i := 0; i < len(rest); {
+		if rest[i] == ' ' || rest[i] == '\t' {
+			i++
 			continue
 		}
-		switch ch {
-		case '"':
-			inQuotes = true
-			inToken = true
-		case ' ', '\t':
-			if err := flushToken(); err != nil {
-				return nil, "", err
-			}
-		case '#':
+		if rest[i] == '#' {
 			comment = rest[i+1:]
-			i = len(rest)
-		default:
-			inToken = true
-			cur.WriteByte(ch)
+			break
 		}
-	}
-	if inQuotes {
-		return nil, "", errors.New("unterminated quote in Include directive")
-	}
-	if err := flushToken(); err != nil {
-		return nil, "", err
+		tok, nextIdx, tokErr := readNextOpenSSHIncludeToken(rest, i)
+		if tokErr != nil {
+			return nil, "", tokErr
+		}
+		patterns = append(patterns, tok)
+		i = nextIdx
 	}
 	if len(patterns) == 0 {
 		return nil, "", errors.New("include directive requires at least one pattern")
 	}
 	return patterns, comment, nil
+}
+
+func readNextOpenSSHIncludeToken(rest string, start int) (string, int, error) {
+	var cur strings.Builder
+	var quoteChar byte
+	i := start
+	for i < len(rest) {
+		ch := rest[i]
+		if quoteChar != 0 {
+			if next, adv, closed := consumeOpenSSHIncludeQuotedChar(rest, i, quoteChar); closed {
+				quoteChar = 0
+				i += adv
+			} else {
+				cur.WriteByte(next)
+				i += adv
+			}
+			continue
+		}
+		if ch == ' ' || ch == '\t' || ch == '#' {
+			break
+		}
+		if ch == '"' || ch == '\'' {
+			quoteChar = ch
+			i++
+			continue
+		}
+		b, adv := consumeOpenSSHIncludeUnquotedChar(rest, i)
+		cur.WriteByte(b)
+		i += adv
+	}
+	if quoteChar != 0 {
+		return "", 0, errors.New("unterminated quote in Include directive")
+	}
+	if cur.Len() == 0 {
+		return "", 0, errors.New("empty pattern in Include directive")
+	}
+	return cur.String(), i, nil
+}
+
+func consumeOpenSSHIncludeQuotedChar(rest string, i int, quoteChar byte) (ch byte, advance int, closed bool) {
+	if quoteChar == '"' && rest[i] == '\\' && i+1 < len(rest) {
+		if next := rest[i+1]; next == '"' || next == '\\' {
+			return next, 2, false
+		}
+	}
+	if rest[i] == quoteChar {
+		return 0, 1, true
+	}
+	return rest[i], 1, false
+}
+
+func consumeOpenSSHIncludeUnquotedChar(rest string, i int) (ch byte, advance int) {
+	if rest[i] == '\\' && i+1 < len(rest) {
+		next := rest[i+1]
+		if next == ' ' || next == '\t' || next == '"' || next == '\'' || next == '#' {
+			return next, 2
+		}
+	}
+	return rest[i], 1
 }
 
 func resolveOpenSSHIncludePlaceholders(
@@ -951,9 +978,12 @@ func loadOpenSSHIncludeFiles(
 	}
 	files := make(map[string]*ssh_config.Config)
 	for _, pat := range patterns {
-		globPat, err := expandOpenSSHIncludePattern(pat, system)
+		globPat, skip, err := expandOpenSSHIncludePattern(pat, system)
 		if err != nil {
 			return nil, err
+		}
+		if skip || globPat == "" {
+			continue
 		}
 		matches, err := filepath.Glob(globPat)
 		if err != nil {
@@ -990,32 +1020,152 @@ func loadOpenSSHIncludeFiles(
 	return files, nil
 }
 
-func expandOpenSSHIncludePattern(pat string, system bool) (string, error) {
-	if pat == "~" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", fmt.Errorf("expand home dir for Include %q: %w", pat, err)
+func expandOpenSSHIncludePattern(pat string, system bool) (string, bool, error) {
+	prefix := ""
+	rest := pat
+	if strings.HasPrefix(pat, "~") {
+		sep := strings.IndexAny(pat[1:], `/\`)
+		var userPart string
+		if sep < 0 {
+			userPart = pat[1:]
+			rest = ""
+		} else {
+			userPart = pat[1 : 1+sep]
+			rest = pat[1+sep+1:]
 		}
-		return home, nil
-	}
-	if strings.HasPrefix(pat, "~/") || strings.HasPrefix(pat, `~\`) {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", fmt.Errorf("expand home dir for Include %q: %w", pat, err)
+		if userPart == "" {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return "", false, fmt.Errorf("expand home dir for Include %q: %w", pat, err)
+			}
+			prefix = home
+		} else {
+			u, err := user.Lookup(userPart)
+			if err != nil || u.HomeDir == "" {
+				return "", true, nil
+			}
+			prefix = u.HomeDir
 		}
-		return filepath.Join(home, pat[2:]), nil
 	}
-	if filepath.IsAbs(pat) {
-		return pat, nil
+
+	expandedRest, skip, err := expandIncludeTokens(rest, pat, system)
+	if err != nil || skip {
+		return "", skip, err
+	}
+
+	var combined string
+	switch {
+	case prefix != "" && expandedRest != "":
+		combined = filepath.Join(prefix, expandedRest)
+	case prefix != "":
+		combined = prefix
+	default:
+		combined = expandedRest
+	}
+	if combined == "" {
+		return "", true, nil
+	}
+	if filepath.IsAbs(combined) {
+		return combined, false, nil
 	}
 	if system {
-		return filepath.Join("/etc/ssh", pat), nil
+		return filepath.Join("/etc/ssh", combined), false, nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "", fmt.Errorf("expand user ssh dir for Include %q: %w", pat, err)
+		return "", false, fmt.Errorf("expand user ssh dir for Include %q: %w", pat, err)
 	}
-	return filepath.Join(home, ".ssh", pat), nil
+	return filepath.Join(home, ".ssh", combined), false, nil
+}
+
+func expandIncludeTokens(s, rawPat string, system bool) (string, bool, error) {
+	if !strings.ContainsAny(s, "$%") {
+		return s, false, nil
+	}
+	var out strings.Builder
+	out.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if ch == '$' && i+1 < len(s) && s[i+1] == '{' {
+			closeIdx := strings.IndexByte(s[i+2:], '}')
+			if closeIdx < 0 {
+				return "", false, fmt.Errorf("unterminated environment variable in Include %q", rawPat)
+			}
+			name := s[i+2 : i+2+closeIdx]
+			if name == "" {
+				return "", false, fmt.Errorf("empty environment variable name in Include %q", rawPat)
+			}
+			val, ok := os.LookupEnv(name)
+			if !ok || val == "" {
+				return "", true, nil
+			}
+			out.WriteString(val)
+			i += 2 + closeIdx
+			continue
+		}
+		if ch == '%' {
+			if i+1 >= len(s) {
+				return "", false, fmt.Errorf("trailing '%%' token in Include %q", rawPat)
+			}
+			tok := s[i+1]
+			i++
+			rep, skip, err := resolveIncludePercentToken(tok, rawPat, system)
+			if err != nil || skip {
+				return "", skip, err
+			}
+			out.WriteString(rep)
+			continue
+		}
+		out.WriteByte(ch)
+	}
+	return out.String(), false, nil
+}
+
+func resolveIncludePercentToken(tok byte, rawPat string, system bool) (string, bool, error) {
+	switch tok {
+	case '%':
+		return "%", false, nil
+	case 'd':
+		if system {
+			return "", true, nil
+		}
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", false, fmt.Errorf("expand %%d for Include %q: %w", rawPat, err)
+		}
+		return home, false, nil
+	case 'u':
+		u, err := getCurrentUser()
+		if err != nil || u == "" {
+			return "", false, fmt.Errorf("expand %%u for Include %q: %w", rawPat, err)
+		}
+		return u, false, nil
+	case 'i':
+		uid := os.Getuid()
+		if uid < 0 {
+			return "", true, nil
+		}
+		return strconv.Itoa(uid), false, nil
+	case 'l':
+		hn, err := os.Hostname()
+		if err != nil || hn == "" {
+			return "", true, nil
+		}
+		return hn, false, nil
+	case 'L':
+		hn, err := os.Hostname()
+		if err != nil || hn == "" {
+			return "", true, nil
+		}
+		short, _, _ := strings.Cut(hn, ".")
+		return short, false, nil
+	case 'h', 'n', 'r', 'p', 'C', 'k':
+		// Target-dependent OpenSSH tokens are unavailable at config-load time;
+		// OpenSSH skips expanding them quietly during Include loading.
+		return "", true, nil
+	default:
+		return "", false, fmt.Errorf("unsupported Include token %%%c in %q", tok, rawPat)
+	}
 }
 
 func isSystemSSHConfigPath(path string) bool {
@@ -1086,40 +1236,7 @@ func walkMatchingSSHConfigKVs(cfg *ssh_config.Config, alias string, visit func(k
 	if cfg == nil || alias == "" || visit == nil {
 		return
 	}
-	walkMatchingSSHConfigAST(cfg, alias, nil, visit, nil)
-}
-
-func walkMatchingSSHConfigKVsReverseHosts(cfg *ssh_config.Config, alias string, visit func(kv *ssh_config.KV)) {
-	if cfg == nil || alias == "" || visit == nil {
-		return
-	}
-	var segments [][]*ssh_config.KV
-	var current []*ssh_config.KV
-	flush := func() {
-		if len(current) > 0 {
-			segments = append(segments, current)
-			current = nil
-		}
-	}
-	walkMatchingSSHConfigAST(
-		cfg,
-		alias,
-		func(*ssh_config.Host) bool {
-			flush()
-			return true
-		},
-		func(kv *ssh_config.KV) bool {
-			current = append(current, kv)
-			return true
-		},
-		flush,
-	)
-	flush()
-	for i := len(segments) - 1; i >= 0; i-- {
-		for _, kv := range segments[i] {
-			visit(kv)
-		}
-	}
+	walkMatchingSSHConfigAST(cfg, alias, nil, visit)
 }
 
 func walkMatchingSSHConfigHostBlocks(
@@ -1130,7 +1247,7 @@ func walkMatchingSSHConfigHostBlocks(
 	if cfg == nil || alias == "" || visit == nil {
 		return
 	}
-	walkMatchingSSHConfigAST(cfg, alias, visit, nil, nil)
+	walkMatchingSSHConfigAST(cfg, alias, visit, nil)
 }
 
 func walkMatchingSSHConfigAST(
@@ -1138,10 +1255,9 @@ func walkMatchingSSHConfigAST(
 	alias string,
 	onBlock func(block *ssh_config.Host) bool,
 	onKV func(kv *ssh_config.KV) bool,
-	onIncludeBoundary func(),
 ) {
 	active := make(map[*ssh_config.Config]struct{}, 4)
-	_ = walkMatchingSSHConfigASTRec(cfg, alias, 0, active, onBlock, onKV, onIncludeBoundary)
+	_ = walkMatchingSSHConfigASTRec(cfg, alias, 0, active, onBlock, onKV)
 }
 
 func walkMatchingSSHConfigASTRec(
@@ -1151,7 +1267,6 @@ func walkMatchingSSHConfigASTRec(
 	active map[*ssh_config.Config]struct{},
 	onBlock func(block *ssh_config.Host) bool,
 	onKV func(kv *ssh_config.KV) bool,
-	onIncludeBoundary func(),
 ) bool {
 	if cfg == nil || depth > maxIncludeDepth {
 		return true
@@ -1180,16 +1295,10 @@ func walkMatchingSSHConfigASTRec(
 			if len(incFiles) == 0 || depth >= maxIncludeDepth {
 				continue
 			}
-			if onIncludeBoundary != nil {
-				onIncludeBoundary()
-			}
 			for _, path := range slices.Sorted(maps.Keys(incFiles)) {
-				if !walkMatchingSSHConfigASTRec(incFiles[path], alias, depth+1, active, onBlock, onKV, onIncludeBoundary) {
+				if !walkMatchingSSHConfigASTRec(incFiles[path], alias, depth+1, active, onBlock, onKV) {
 					return false
 				}
-			}
-			if onIncludeBoundary != nil {
-				onIncludeBoundary()
 			}
 		}
 	}

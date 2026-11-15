@@ -231,6 +231,9 @@ func mergeTargetAddressSpec(spec string, address, user *string, port *uint16, po
 	if err != nil {
 		return err
 	}
+	if strings.HasPrefix(posHost, config.OpenSSHNodePrefix) {
+		return fmt.Errorf("invalid host address %q: openssh selector cannot be used as a concrete host address", spec)
+	}
 	if *address != "" && *address != posHost {
 		return fmt.Errorf("conflicting host addresses %q and %q", *address, posHost)
 	}

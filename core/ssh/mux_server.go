@@ -490,7 +490,7 @@ func (s *MuxServer) isShuttingDown() bool {
 
 func (s *MuxServer) hasInFlightEndpointsLocked() bool {
 	for _, ep := range s.listenEndpoints {
-		if ep != nil && ep.inFlight {
+		if ep != nil && (ep.inFlight || ep.closingWait != nil) {
 			return true
 		}
 	}
@@ -510,12 +510,24 @@ func (s *MuxServer) hasInFlightControlOrForwardLocked() bool {
 // marked as shutting down so no new session or forward is admitted before the
 // caller releases it.
 func (s *MuxServer) PrepareHandoff() bool {
+	return s.PrepareHandoffWithSessions(0)
+}
+
+// PrepareHandoffWithSessions atomically reserves the master for handoff when
+// activeSessions is at most maxSessions and no forwards or in-flight endpoint
+// operations remain. Callers keeping a single foreground reference (maxSessions=1)
+// still prevent concurrent mux clients from being admitted until ReleaseMaster
+// + Shutdown or CancelHandoff runs.
+func (s *MuxServer) PrepareHandoffWithSessions(maxSessions int32) bool {
 	if s == nil {
 		return false
 	}
+	if maxSessions < 0 {
+		maxSessions = 0
+	}
 	s.idleMu.Lock()
 	defer s.idleMu.Unlock()
-	if s.shuttingDown || s.closed.Load() || s.stoppedListening.Load() || s.hasInFlightControlOrForwardLocked() || s.activeSessions.Load() > 0 {
+	if s.shuttingDown || s.closed.Load() || s.stoppedListening.Load() || s.hasInFlightControlOrForwardLocked() || s.activeSessions.Load() > maxSessions {
 		return false
 	}
 	if s.forwardCount() > 0 || len(s.listenEndpoints) > 0 || s.activeForwardStreams.Load() > 0 {
@@ -1664,6 +1676,16 @@ func (s *MuxServer) acquireForwardEndpoint(
 				return nil, muxEndpointShuttingDown
 			}
 		}
+		if cur.closingWait != nil {
+			waitCh := cur.closingWait
+			s.idleMu.Unlock()
+			select {
+			case <-waitCh:
+				continue
+			case <-s.baseContext().Done():
+				return nil, muxEndpointShuttingDown
+			}
+		}
 		if cur.entry != nil && sameMuxForwardDestination(cur.entry, fwdType, normConnectHost, connectPort) {
 			if fwdType == MUX_FWD_REMOTE {
 				cur.entry.refs++
@@ -1708,6 +1730,7 @@ func (s *MuxServer) abortReservedForward(listenKey forwardListenKey, slot *muxFo
 		s.idleMu.Lock()
 	}
 	s.releaseInFlightEndpointSlotLocked(listenKey, slot)
+	s.scheduleIdleOrShutdownLocked()
 	s.idleMu.Unlock()
 }
 
@@ -2147,35 +2170,54 @@ func (s *MuxServer) retireForward(key string, entry *muxForwardEntry) {
 	s.idleMu.Lock()
 	deleted := s.forwards.CompareAndDelete(key, entry)
 	shadows := entry.takeShadowClosers()
-	var closingSlot *muxForwardEndpointState
-	if deleted && len(shadows) > 0 && entry != nil && entry.hasListenKey && !s.shuttingDown && !s.closed.Load() {
-		if s.listenEndpoints == nil {
-			s.listenEndpoints = make(map[forwardListenKey]*muxForwardEndpointState)
+	s.deleteEndpointEntryLocked(entry)
+
+	var (
+		closingSlot      *muxForwardEndpointState
+		inFlightCur      *muxForwardEndpointState
+		closingWaitDone  chan struct{}
+		closeFwdsCounted bool
+	)
+	if deleted && len(shadows) > 0 && entry != nil && entry.hasListenKey {
+		s.closeFwdsInFlight++
+		closeFwdsCounted = true
+		s.idleGen++
+		if s.idleTimer != nil {
+			s.idleTimer.Stop()
+			s.idleTimer = nil
 		}
-		if cur := s.listenEndpoints[entry.listenKey]; cur == nil || (!cur.inFlight && cur.entry == entry) {
-			closingSlot = &muxForwardEndpointState{
-				inFlight: true,
-				closing:  true,
-				done:     make(chan struct{}),
+		abortedWait := false
+		for !s.shuttingDown && !s.closed.Load() {
+			waited, aborted := s.waitClosingEndpointLocked(entry.listenKey)
+			if !waited {
+				break
 			}
-			s.listenEndpoints[entry.listenKey] = closingSlot
-		} else {
-			s.deleteEndpointEntryLocked(entry)
+			s.idleMu.Lock()
+			if aborted {
+				abortedWait = true
+				break
+			}
 		}
-	} else {
-		s.deleteEndpointEntryLocked(entry)
-		if deleted {
-			s.notifyIdleLocked()
+		if !abortedWait && !s.shuttingDown && !s.closed.Load() {
+			closingSlot, inFlightCur, closingWaitDone = s.beginEndpointCloseBarrierLocked(entry)
 		}
+	} else if deleted {
+		s.scheduleIdleOrShutdownLocked()
+		s.notifyIdleLocked()
 	}
 	s.idleMu.Unlock()
 
 	if len(shadows) > 0 {
 		s.closeMuxForwardEntryWithShadows(&muxForwardEntry{remote: entry.remote}, shadows)
 	}
-	if closingSlot != nil {
+	if closingSlot != nil || closingWaitDone != nil || closeFwdsCounted {
 		s.idleMu.Lock()
-		s.releaseInFlightEndpointSlotLocked(entry.listenKey, closingSlot)
+		s.finishEndpointCloseBarrierLocked(entry, closingSlot, inFlightCur, closingWaitDone)
+		if closeFwdsCounted {
+			s.closeFwdsInFlight--
+		}
+		s.scheduleIdleOrShutdownLocked()
+		s.notifyIdleLocked()
 		s.idleMu.Unlock()
 	}
 }
@@ -2425,13 +2467,18 @@ func (s *MuxServer) beginEndpointCloseBarrierLocked(entry *muxForwardEntry) (
 		s.listenEndpoints = make(map[forwardListenKey]*muxForwardEndpointState)
 	}
 	cur := s.listenEndpoints[entry.listenKey]
-	if cur != nil && cur.inFlight && !cur.closing {
+	if cur != nil {
+		if cur.entry == entry {
+			cur.entry = nil
+		}
 		if cur.fallbackEntry == entry {
 			cur.fallbackEntry = nil
 		}
-		closingWaitDone = make(chan struct{})
-		cur.closingWait = closingWaitDone
-		return nil, cur, closingWaitDone
+		if !cur.closing && (cur.inFlight || cur.entry != nil || cur.fallbackEntry != nil) {
+			closingWaitDone = make(chan struct{})
+			cur.closingWait = closingWaitDone
+			return nil, cur, closingWaitDone
+		}
 	}
 	closingSlot = &muxForwardEndpointState{
 		inFlight: true,
@@ -2454,8 +2501,13 @@ func (s *MuxServer) finishEndpointCloseBarrierLocked(
 	if closingWaitDone != nil {
 		if inFlightCur != nil && inFlightCur.closingWait == closingWaitDone {
 			inFlightCur.closingWait = nil
+			if entry != nil && !inFlightCur.inFlight && inFlightCur.entry == nil && inFlightCur.fallbackEntry == nil &&
+				s.listenEndpoints != nil && s.listenEndpoints[entry.listenKey] == inFlightCur {
+				delete(s.listenEndpoints, entry.listenKey)
+			}
 		}
 		close(closingWaitDone)
+		s.notifyIdleLocked()
 	}
 }
 
@@ -2464,10 +2516,18 @@ func (s *MuxServer) waitClosingEndpointLocked(listenKey forwardListenKey) (waite
 		return false, false
 	}
 	cur := s.listenEndpoints[listenKey]
-	if cur == nil || !cur.closing {
+	if cur == nil {
 		return false, false
 	}
-	waitCh := cur.done
+	var waitCh chan struct{}
+	switch {
+	case cur.closingWait != nil:
+		waitCh = cur.closingWait
+	case cur.closing:
+		waitCh = cur.done
+	default:
+		return false, false
+	}
 	s.idleMu.Unlock()
 	select {
 	case <-waitCh:

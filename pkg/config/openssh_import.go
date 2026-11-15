@@ -58,7 +58,10 @@ func isConcreteSSHHost(pattern string) bool {
 }
 
 func openSSHHostFromConfig(cfg *ssh_config.Config, name, defaultUser string) (OpenSSHHost, error) {
-	address := openSSHValue(cfg, name, "HostName", name)
+	address, err := resolveOpenSSHHostName(cfg, name)
+	if err != nil {
+		return OpenSSHHost{}, fmt.Errorf("resolve openssh HostName for host %q: %w", name, err)
+	}
 	user := openSSHValue(cfg, name, "User", defaultUser)
 	portValue := openSSHValue(cfg, name, "Port", "22")
 	port, err := strconv.ParseUint(strings.TrimSpace(portValue), 10, 16)

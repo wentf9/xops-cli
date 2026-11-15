@@ -98,13 +98,28 @@ func ParseHost(input string) (string, uint16, error) {
 	return input, 0, nil
 }
 
-// ParseAddr 解析 [user@]host[:port] 格式的字符串，支持 IPv6
+// ParseAddr 解析 [user@]host[:port] 或 openssh:[user@]host[:port] 格式的字符串，支持 IPv6
 func ParseAddr(input string) (user, host string, port uint16, err error) {
 	input = strings.TrimSpace(input)
 	if input == "" {
 		return "", "", 0, fmt.Errorf("address cannot be empty")
 	}
 
+	if rest, ok := strings.CutPrefix(input, config.OpenSSHNodePrefix); ok {
+		if rest == "" || strings.TrimSpace(rest) != rest || strings.HasPrefix(rest, config.OpenSSHNodePrefix) {
+			return "", "", 0, fmt.Errorf("invalid openssh selector %q", input)
+		}
+		u, h, p, parseErr := parsePlainAddr(rest)
+		if parseErr != nil {
+			return "", "", 0, parseErr
+		}
+		return u, config.OpenSSHNodePrefix + h, p, nil
+	}
+
+	return parsePlainAddr(input)
+}
+
+func parsePlainAddr(input string) (user, host string, port uint16, err error) {
 	if atIndex := strings.Index(input, "@"); atIndex != -1 {
 		user = strings.TrimSpace(input[:atIndex])
 		rest := strings.TrimSpace(input[atIndex+1:])

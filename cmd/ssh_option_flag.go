@@ -437,11 +437,31 @@ func targetContextFromResolvedTarget(resolved config.ResolvedTarget) ssh.TargetC
 	}
 }
 
+type generalOptionState struct {
+	allowPort     bool
+	allowUser     bool
+	allowIdentity bool
+	allowJump     bool
+	allowHostName bool
+	seenPort      bool
+	seenUser      bool
+	seenJump      bool
+	seenProxyCmd  bool
+	seenHostName  bool
+}
+
 // ApplyGeneralOptions parses non-multiplexing OpenSSH options from -o
 // (such as Port, User, IdentityFile, ProxyJump) and applies them to SshOptions
 // if they were not already explicitly set via primary CLI flags.
 func ApplyGeneralOptions(opts *SshOptions, optionStrings []string, flags *pflag.FlagSet) error {
 	opts.syncIdentityFiles()
+	st := generalOptionState{
+		allowPort:     shouldApplyGeneralOption(flags, "port", opts.Port == 0),
+		allowUser:     shouldApplyGeneralOption(flags, "login", opts.User == ""),
+		allowIdentity: shouldApplyGeneralOption(flags, "identity", opts.IdentityFile == "" && len(opts.IdentityFiles) == 0),
+		allowJump:     shouldApplyGeneralOption(flags, "jump", opts.JumpHost == ""),
+		allowHostName: opts.cliHostName == "" && opts.HostName == "",
+	}
 	for _, opt := range optionStrings {
 		key, val, err := adapter.SplitOptionKeyValue(opt)
 		if err != nil {
@@ -450,7 +470,7 @@ func ApplyGeneralOptions(opts *SshOptions, optionStrings []string, flags *pflag.
 		if key == "" {
 			continue
 		}
-		if err := applyGeneralOption(opts, key, val, flags); err != nil {
+		if err := applyGeneralOption(opts, &st, key, val); err != nil {
 			return err
 		}
 	}
@@ -458,60 +478,92 @@ func ApplyGeneralOptions(opts *SshOptions, optionStrings []string, flags *pflag.
 	return nil
 }
 
-func applyGeneralOption(opts *SshOptions, key, val string, flags *pflag.FlagSet) error {
+func applyGeneralOption(opts *SshOptions, st *generalOptionState, key, val string) error {
 	switch strings.ToLower(key) {
 	case "port":
 		p, err := strconv.ParseUint(val, 10, 16)
 		if err != nil || p == 0 {
 			return fmt.Errorf("invalid Port in -o option: %q", val)
 		}
-		if shouldApplyGeneralOption(flags, "port", opts.Port == 0) {
+		if st.allowPort && !st.seenPort {
 			opts.Port = uint16(p)
 		}
+		st.seenPort = true
 	case "user":
 		if val == "" {
 			return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
 		}
-		if shouldApplyGeneralOption(flags, "login", opts.User == "") {
+		if st.allowUser && !st.seenUser {
 			opts.User = val
 		}
+		st.seenUser = true
 	case "identityfile":
-		if val == "" {
-			return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
-		}
-		if shouldApplyGeneralOption(flags, "identity", opts.IdentityFile == "" && len(opts.IdentityFiles) == 0) {
-			opts.IdentityFiles = append(opts.IdentityFiles, val)
-			opts.identityFromCLIOptions = true
-			if opts.IdentityFile == "" {
-				opts.IdentityFile = val
-			}
-		}
+		return applyIdentityFileGeneralOption(opts, st, key, val)
 	case "proxyjump":
-		if val == "" {
-			return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
-		}
-		if shouldApplyGeneralOption(flags, "jump", opts.JumpHost == "") {
-			opts.JumpHost = val
-		}
+		return applyProxyJumpGeneralOption(opts, st, key, val)
+	case "proxycommand":
+		return applyProxyCommandGeneralOption(st, key, val)
 	case "hostname":
-		return applyHostNameOption(opts, key, val)
+		return applyHostNameOption(opts, st, key, val)
 	}
 	return nil
 }
 
-func applyHostNameOption(opts *SshOptions, key, val string) error {
+func applyIdentityFileGeneralOption(opts *SshOptions, st *generalOptionState, key, val string) error {
+	if val == "" {
+		return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
+	}
+	if st.allowIdentity {
+		opts.IdentityFiles = append(opts.IdentityFiles, val)
+		opts.identityFromCLIOptions = true
+		if opts.IdentityFile == "" {
+			opts.IdentityFile = val
+		}
+	}
+	return nil
+}
+
+func applyProxyJumpGeneralOption(opts *SshOptions, st *generalOptionState, key, val string) error {
+	if val == "" {
+		return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
+	}
+	if st.allowJump && !st.seenJump && !st.seenProxyCmd {
+		opts.JumpHost = val
+	}
+	st.seenJump = true
+	return nil
+}
+
+func applyProxyCommandGeneralOption(st *generalOptionState, key, val string) error {
+	if val == "" {
+		return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
+	}
+	var scratch ssh.Options
+	if err := scratch.Set(ssh.OptionProxyCommand, val); err != nil {
+		return fmt.Errorf("invalid ProxyCommand in -o option: %w", err)
+	}
+	if !st.seenJump {
+		st.seenProxyCmd = true
+	}
+	return nil
+}
+
+func applyHostNameOption(opts *SshOptions, st *generalOptionState, key, val string) error {
 	if val == "" {
 		return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
 	}
 	if _, expErr := ssh.ExpandHostName(val, "host"); expErr != nil {
 		return expErr
 	}
-	opts.cliHostName = val
-	if orig := opts.originalHostForExpansion(); orig != "" {
-		if expanded, expErr := ssh.ExpandHostName(val, orig); expErr == nil {
-			opts.HostName = strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(expanded), "]"), "[")
+	if st.allowHostName && !st.seenHostName {
+		opts.cliHostName = val
+		if orig := opts.originalHostForExpansion(); orig != "" {
+			if expanded, expErr := ssh.ExpandHostName(val, orig); expErr == nil {
+				opts.HostName = strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(expanded), "]"), "[")
+			}
 		}
 	}
+	st.seenHostName = true
 	return nil
 }
 

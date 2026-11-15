@@ -25,6 +25,7 @@ import (
 	"github.com/wentf9/xops-cli/core/testutil/sshfixture"
 	cryptoSSH "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 type rawBlobCertPubKey struct {
@@ -462,7 +463,7 @@ func assertPass6MLDSACertAuthorityAndAgentAuth(
 	host, portStr, port := splitFixtureHostPort(t, peerCA.Address)
 	dir := t.TempDir()
 	caKH := filepath.Join(dir, "ca_known_hosts")
-	caLine := "@cert-authority " + net.JoinHostPort(host, portStr) + " " + strings.TrimSpace(string(cryptoSSH.MarshalAuthorizedKey(caSigner.PublicKey()))) + "\n"
+	caLine := "@cert-authority " + knownhosts.Normalize(net.JoinHostPort(host, portStr)) + " " + strings.TrimSpace(string(cryptoSSH.MarshalAuthorizedKey(caSigner.PublicKey()))) + "\n"
 	if err := os.WriteFile(caKH, []byte(caLine), 0o600); err != nil {
 		t.Fatal(err)
 	}

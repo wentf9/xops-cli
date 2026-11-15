@@ -187,7 +187,7 @@ func parseHostRecord(record []string, mapping csvHostMapping) (HostInfo, bool, e
 		return HostInfo{}, false, fmt.Errorf("host field is required")
 	}
 
-	host, port, err := ParseHost(hostStr)
+	inlineUser, host, port, err := ParseAddr(hostStr)
 	if err != nil {
 		return HostInfo{}, false, fmt.Errorf("parse host %q failed: %w", hostStr, err)
 	}
@@ -200,11 +200,16 @@ func parseHostRecord(record []string, mapping csvHostMapping) (HostInfo, bool, e
 		port = p
 	}
 
+	user := getVal(mapping.user)
+	if user == "" {
+		user = inlineUser
+	}
+
 	return HostInfo{
 		Host:       host,
 		Port:       port,
 		Alias:      getVal(mapping.alias),
-		User:       getVal(mapping.user),
+		User:       user,
 		Password:   getVal(mapping.pass),
 		KeyPath:    getVal(mapping.key),
 		Passphrase: getVal(mapping.keyPass),

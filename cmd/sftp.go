@@ -71,7 +71,9 @@ func NewCmdSftp() *cobra.Command {
 	cmd.Flags().BoolVarP(&o.force, "force", "f", false, i18n.T("flag_force"))
 	cmd.Flags().BoolVarP(&o.noOverwrite, "no-clobber", "n", false, i18n.T("flag_no_overwrite"))
 
-	// OpenSSH-compatible flags
+	// OpenSSH-compatible flags (aligned with sftp(1): -P port, -c cipher)
+	cmd.Flags().Uint16VarP(&o.Port, "port", "P", 0, i18n.T("flag_port"))
+	cmd.Flags().StringVarP(&o.CipherSpec, "cipher", "c", "", i18n.T("flag_ssh_cipher"))
 	cmd.Flags().StringArrayVarP(&o.IdentityFiles, "identity", "i", nil, i18n.T("flag_identity"))
 	cmd.Flags().StringVarP(&o.JumpHost, "jump", "J", "", i18n.T("flag_jump"))
 	o.control.RegisterCommonFlags(cmd)

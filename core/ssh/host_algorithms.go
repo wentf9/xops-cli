@@ -287,20 +287,12 @@ type khMatcher interface {
 }
 
 type khHostPattern struct {
-	negate         bool
-	wildcard       bool
-	wildcardNoPort bool
-	rawPattern     string
-	addr           khAddr
+	negate     bool
+	rawPattern string
 }
 
 func (p khHostPattern) match(a khAddr) bool {
-	if khWildcardMatch([]byte(p.addr.host), []byte(strings.ToLower(a.host))) &&
-		khWildcardMatch([]byte(p.addr.port), []byte(a.port)) {
-		return true
-	}
-	return p.wildcard && p.wildcardNoPort &&
-		khWildcardMatch([]byte(p.rawPattern), []byte(khOpenSSHHostPort(a)))
+	return khWildcardMatch([]byte(p.rawPattern), []byte(khOpenSSHHostPort(a)))
 }
 
 type khHostPatterns []khHostPattern
@@ -651,7 +643,6 @@ func newKHHostnameMatcher(pattern string) (khMatcher, error) {
 		if len(p) == 0 {
 			continue
 		}
-		var a khAddr
 		var negate bool
 		if p[0] == '!' {
 			negate = true
@@ -661,32 +652,14 @@ func newKHHostnameMatcher(pattern string) (khMatcher, error) {
 			return nil, errors.New("knownhosts: negation without following hostname")
 		}
 		p = strings.ToLower(p)
-		wildcard := strings.ContainsAny(p, "*?")
-		var wildcardNoPort bool
-		var rawPattern string
-		var err error
 		if p[0] == '[' {
-			a.host, a.port, err = net.SplitHostPort(p)
-			if err != nil {
+			if _, _, err := net.SplitHostPort(p); err != nil {
 				return nil, err
-			}
-		} else {
-			a.host, a.port, err = net.SplitHostPort(p)
-			if err != nil {
-				a.host = p
-				a.port = "22"
-				if wildcard {
-					wildcardNoPort = true
-					rawPattern = p
-				}
 			}
 		}
 		hps = append(hps, khHostPattern{
-			negate:         negate,
-			wildcard:       wildcard,
-			wildcardNoPort: wildcardNoPort,
-			rawPattern:     rawPattern,
-			addr:           a,
+			negate:     negate,
+			rawPattern: p,
 		})
 	}
 	return hps, nil

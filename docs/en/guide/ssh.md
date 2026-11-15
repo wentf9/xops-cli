@@ -16,8 +16,9 @@ xops ssh -J bastion.example.com deploy@192.0.2.10
 Direct jump hosts accept an IP, FQDN, or `host:port`; a single-label jump name (such as `-J jumphost`) must already exist as a saved node or alias. Connecting to the same host as a different user keeps credentials isolated per user.
 
 - **Username and port flag precedence** (OpenSSH native semantics):
-  - `xops ssh`, `xops sftp`, and single-target `xops exec`: explicit `-l`/`-p`/`-P` and `-o User`/`-o Port` override inline `user@` and `:port` in the destination.
-  - `xops scp` and batch `xops exec` (`--ifile` or multiple `--host`): inline per-endpoint `user@`/`:port` takes precedence over global `-l`/`-P`/`-p`, while global flags apply to endpoints that omit inline `user@`/`:port`.
+  - `xops ssh` and single-target `xops exec`: explicit `-l`/`-p` and `-o User`/`-o Port` override inline `user@` and `:port` in the destination.
+  - `xops sftp` (aligned with OpenSSH `sftp(1)`): explicit `-P` (`--port`) and `-o User`/`-o Port` override inline `user@` and `:port` (also supports `-c`/`--cipher`; `-l` and `-p` are not registered).
+  - `xops scp` and batch `xops exec` (`--ifile` or multiple `--host`): inline per-endpoint `user@`/`:port` takes precedence over global flags (`-l`/`-P` on `scp`; `-l`/`-p` on batch `exec`), while global flags apply to endpoints that omit inline `user@`/`:port`.
 
 ## Connection diagnostics
 

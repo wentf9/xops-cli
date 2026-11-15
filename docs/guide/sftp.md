@@ -82,6 +82,8 @@ xops scp -qvv ./file web-01:~/file
 xops sftp web-01
 ```
 
+- **连接标志**（对齐 OpenSSH `sftp(1)`）：支持 `-P`/`--port` 指定端口、`-c`/`--cipher` 指定加密套件、`-i`（私钥）、`-J`（跳板）、`-F`（配置文件）与 `-o`（SSH 选项）；用户名通过 `user@host` 或 `-o User=...` 指定（不提供 `-l`/`-p`）。
+
 进入 SFTP 提示符后可输入 `help` 查看全部命令。常用操作：
 
 ```text
