@@ -37,15 +37,16 @@ func credentialRecoveryPrompter(prompter SecretPrompter) SecretPrompter {
 	return nil
 }
 
-func (c *Connector) recoverablePasswordAuth(ctx context.Context, cfg *ClientConfig, prompter SecretPrompter, discovered func()) cryptoSSH.AuthMethod {
+func (c *Connector) recoverablePasswordAuth(ctx context.Context, policy dialPolicy, attempt *handshakeAttempt, prompter SecretPrompter) cryptoSSH.AuthMethod {
+	roCfg := policy.readOnlyConfig()
 	provider := &autoSecretProvider{
-		lifecycleCtx: ctx, nodeID: cfg.NodeID, user: cfg.User,
-		host: cfg.Address, port: cfg.Port, versionToken: cfg.AuthUpdateToken,
-		resolver: c.secretResolver, prompter: prompter, recoveryPrompter: credentialRecoveryPrompter(c.getNodeSecretPrompter(cfg)),
-		handshakeTimeout: c.getNodeHandshakeTimeout(cfg), interactionTimeout: c.interactionTimeout,
+		lifecycleCtx: ctx, nodeID: policy.nodeID, user: policy.user,
+		host: policy.address, port: policy.port, versionToken: policy.authUpdateToken,
+		resolver: c.secretResolver, prompter: prompter, recoveryPrompter: credentialRecoveryPrompter(c.getNodeSecretPrompter(roCfg)),
+		handshakeTimeout: c.getNodeHandshakeTimeout(roCfg), interactionTimeout: c.interactionTimeout,
 	}
 	attempts := 0
-	initial := cfg.Password
+	initial := attempt.consumeInitialPassword()
 	return cryptoSSH.RetryableAuthMethod(cryptoSSH.PasswordCallback(func() (string, error) {
 		retry := attempts > 0
 		attempts++
@@ -58,29 +59,22 @@ func (c *Connector) recoverablePasswordAuth(ctx context.Context, cfg *ClientConf
 				return "", err
 			}
 		}
-		cfg.Password = password
-		cfg.Passphrase = ""
-		if discovered != nil {
-			discovered()
-		}
+		attempt.recordPassword(password, true)
 		return password, nil
 	}), 3)
 }
 
-func (c *Connector) recoverableKeyAuth(ctx context.Context, cfg *ClientConfig, prompter SecretPrompter, discovered func()) (cryptoSSH.AuthMethod, func(), error) {
-	resolver := &initialKeySecretResolver{value: []byte(cfg.Passphrase), next: c.secretResolver}
-	cfg.Passphrase = ""
+func (c *Connector) recoverableKeyAuth(ctx context.Context, policy dialPolicy, attempt *handshakeAttempt, prompter SecretPrompter) (cryptoSSH.AuthMethod, func(), error) {
+	roCfg := policy.readOnlyConfig()
+	resolver := &initialKeySecretResolver{value: attempt.consumeInitialPassphrase(), next: c.secretResolver}
 	provider := &autoSecretProvider{
-		lifecycleCtx: ctx, nodeID: cfg.NodeID, user: cfg.User,
-		host: cfg.Address, port: cfg.Port, versionToken: cfg.AuthUpdateToken,
-		resolver: resolver, prompter: prompter, recoveryPrompter: credentialRecoveryPrompter(c.getNodeSecretPrompter(cfg)),
-		handshakeTimeout: c.getNodeHandshakeTimeout(cfg), interactionTimeout: c.interactionTimeout,
+		lifecycleCtx: ctx, nodeID: policy.nodeID, user: policy.user,
+		host: policy.address, port: policy.port, versionToken: policy.authUpdateToken,
+		resolver: resolver, prompter: prompter, recoveryPrompter: credentialRecoveryPrompter(c.getNodeSecretPrompter(roCfg)),
+		handshakeTimeout: c.getNodeHandshakeTimeout(roCfg), interactionTimeout: c.interactionTimeout,
 	}
-	method, err := resolveKeyAuthMethod(resolveKeyPath(cfg.KeyPath, c.environment.ResolveKeyPath), provider, func(_ string, passphrase string) {
-		cfg.Passphrase, cfg.Password = passphrase, ""
-		if discovered != nil {
-			discovered()
-		}
+	method, err := resolveKeyAuthMethod(resolveKeyPath(policy.keyPath, c.environment.ResolveKeyPath), provider, func(_ string, passphrase string) {
+		attempt.recordPassphrase(policy.keyPath, passphrase)
 	}, c.getLogger())
 	cleanup := func() {
 		resolver.mu.Lock()

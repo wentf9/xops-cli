@@ -102,11 +102,24 @@ func (c *Connector) keyAuth(ctx context.Context, cfg *ClientConfig, prompter Sec
 	if c.keySource != nil {
 		return c.sourcedKeyAuth(ctx, cfg)
 	}
-	if credentialRecoveryPrompter(c.getNodeSecretPrompter(cfg)) != nil {
-		method, release, err := c.recoverableKeyAuth(ctx, cfg, prompter, discovered)
-		return method, legacyAuthCleanup(release), err
+	policy := freezeDialPolicy(cfg)
+	attempt := newHandshakeAttempt(cfg, discovered)
+	if credentialRecoveryPrompter(c.getNodeSecretPrompter(policy.readOnlyConfig())) != nil {
+		method, release, err := c.recoverableKeyAuth(ctx, policy, attempt, prompter)
+		if err != nil {
+			attempt.scrub()
+			return nil, nil, err
+		}
+		return method, func() error {
+			attempt.scrub()
+			if release != nil {
+				release()
+			}
+			return nil
+		}, nil
 	}
-	method, err := c.resolveKeyAuth(cfg)
+	defer attempt.scrub()
+	method, err := c.resolveKeyAuthWithPolicy(policy, attempt)
 	return method, nil, err
 }
 

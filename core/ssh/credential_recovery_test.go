@@ -77,13 +77,19 @@ func TestRecoveryPasswordRetriesRejectedStoredValue(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	method := c.recoverablePasswordAuth(t.Context(), cfg, ui, nil)
+	policy := freezeDialPolicy(cfg)
+	attempt := newHandshakeAttempt(cfg, nil)
+	defer attempt.scrub()
+	method := c.recoverablePasswordAuth(t.Context(), policy, attempt, ui)
 	callback := newSequentialAuthCallback([]autoAuthCandidate{{protocol: "password", method: method}}, nil, nil)
 	if err := runAuthCallbackHandshake(t, callback, nil, "valid-password"); err != nil {
 		t.Fatal(err)
 	}
-	if ui.prompts != 1 || cfg.Password != "valid-password" {
+	if ui.prompts != 1 || attempt.outcome().password != "valid-password" {
 		t.Fatal("did not replace rejected value with one prompted attempt")
+	}
+	if cfg.Password != "rejected-password" {
+		t.Fatalf("caller cfg.Password mutated: got %q, want %q", cfg.Password, "rejected-password")
 	}
 }
 
@@ -218,7 +224,10 @@ func TestRecoveryPasswordRetriesAreBounded(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	callback := newSequentialAuthCallback([]autoAuthCandidate{{protocol: "password", method: c.recoverablePasswordAuth(t.Context(), cfg, ui, nil)}}, nil, nil)
+	policy := freezeDialPolicy(cfg)
+	attempt := newHandshakeAttempt(cfg, nil)
+	defer attempt.scrub()
+	callback := newSequentialAuthCallback([]autoAuthCandidate{{protocol: "password", method: c.recoverablePasswordAuth(t.Context(), policy, attempt, ui)}}, nil, nil)
 	if err := runAuthCallbackHandshake(t, callback, nil, "different-password"); err == nil {
 		t.Fatal("incorrect passwords accepted")
 	}
@@ -257,8 +266,8 @@ func TestRecoveryFailedKeySavePreservesTargetChecks(t *testing.T) {
 					t.Error(err)
 				}
 			}()
-			cfg := &ClientConfig{Address: "host", User: "user", KeyPath: "discovered-key"}
-			err := c.syncConnectionAfterRecording("test", cfg, "", false, true, "configured-key", left)
+			policy := freezeDialPolicy(&ClientConfig{Address: "host", User: "user", KeyPath: "configured-key"})
+			_, err := c.syncConnectionAfterRecording("test", policy, authOutcome{keyPath: "discovered-key"}, "", false, true, left)
 			if path == "unrelated-key" {
 				if !errors.Is(err, ErrSnapshotMismatch) {
 					t.Fatalf("unrelated target accepted: %v", err)
