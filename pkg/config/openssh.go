@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -539,56 +538,8 @@ func firstMatchingOpenSSHOption(doc *sshConfigDoc, host string, spec ssh.OptionS
 }
 
 func parseOpenSSHHostSpec(spec string) (host, userName string, port uint16, err error) {
-	spec = strings.TrimSpace(spec)
-	if spec == "" {
-		return "", "", 0, fmt.Errorf("host is empty")
-	}
-	if at := strings.LastIndex(spec, "@"); at >= 0 {
-		userName = strings.TrimSpace(spec[:at])
-		spec = strings.TrimSpace(spec[at+1:])
-		if userName == "" || spec == "" {
-			return "", "", 0, fmt.Errorf("invalid user or host")
-		}
-	}
-
-	portText := ""
-	portSpecified := false
-	switch {
-	case strings.HasPrefix(spec, "["):
-		end := strings.Index(spec, "]")
-		if end < 0 {
-			return "", "", 0, fmt.Errorf("invalid bracketed host")
-		}
-		host = spec[1:end]
-		if suffix := spec[end+1:]; suffix != "" {
-			if !strings.HasPrefix(suffix, ":") {
-				return "", "", 0, fmt.Errorf("invalid host suffix %q", suffix)
-			}
-			portSpecified = true
-			portText = strings.TrimPrefix(suffix, ":")
-		}
-	case strings.Count(spec, ":") == 1:
-		portSpecified = true
-		var splitErr error
-		host, portText, splitErr = net.SplitHostPort(spec)
-		if splitErr != nil {
-			return "", "", 0, fmt.Errorf("parse host and port failed: %w", splitErr)
-		}
-	default:
-		host = spec
-	}
-	host = strings.TrimSpace(host)
-	if host == "" {
-		return "", "", 0, fmt.Errorf("host is empty")
-	}
-	if !portSpecified {
-		return host, userName, 0, nil
-	}
-	parsedPort, parseErr := strconv.ParseUint(portText, 10, 16)
-	if parseErr != nil || parsedPort == 0 {
-		return "", "", 0, fmt.Errorf("invalid port %q", portText)
-	}
-	return host, userName, uint16(parsedPort), nil
+	host, userName, port, _, err = parseTargetRefPlain(spec)
+	return host, userName, port, err
 }
 
 // getVal 是封装获取的方法

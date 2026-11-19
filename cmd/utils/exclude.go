@@ -108,24 +108,11 @@ func resolveSingleExclude(provider config.ConfigProvider, ex string, candidates 
 }
 
 func parseExcludeSpec(ex string) (hasOpenSSHPrefix bool, user, host string, port uint16, ok bool) {
-	rawSpec := strings.TrimSpace(ex)
-	if after, found := strings.CutPrefix(rawSpec, config.OpenSSHNodePrefix); found {
-		hasOpenSSHPrefix = true
-		rawSpec = strings.TrimSpace(after)
-	}
-	if rawSpec == "" || (hasOpenSSHPrefix && strings.HasPrefix(rawSpec, config.OpenSSHNodePrefix)) {
+	ref, err := config.ParseTargetRef(ex)
+	if err != nil {
 		return false, "", "", 0, false
 	}
-	u, h, p, err := ParseAddr(rawSpec)
-	if err == nil && h != "" {
-		return hasOpenSSHPrefix, u, h, p, true
-	}
-	// Support IPv6 literals with zone IDs such as [fe80::1%eth0] or fe80::1%eth0.
-	clean := strings.TrimPrefix(strings.TrimSuffix(rawSpec, "]"), "[")
-	if addr, addrErr := netip.ParseAddr(clean); addrErr == nil && addr.Is6() {
-		return hasOpenSSHPrefix, "", clean, 0, true
-	}
-	return false, "", "", 0, false
+	return ref.OpenSSH, ref.User, ref.Host, ref.Port, true
 }
 
 func resolveExcludeViaTarget(

@@ -50,97 +50,17 @@ func ParsePort(input string) (uint16, error) {
 
 // ParseHost 解析 host:port 或 [ipv6]:port 或裸 ipv6 格式的字符串
 func ParseHost(input string) (string, uint16, error) {
-	input = strings.TrimSpace(input)
-	if input == "" {
-		return "", 0, fmt.Errorf("host cannot be empty")
-	}
-
-	if strings.HasSuffix(input, ":") {
-		return "", 0, fmt.Errorf("invalid host-port format %q: missing port after colon", input)
-	}
-
-	// 1. 尝试使用标准 net.SplitHostPort 拆分（适用于 host:port, 1.2.3.4:22, [::1]:22 等）
-	if h, pStr, err := net.SplitHostPort(input); err == nil {
-		port, pErr := ParsePort(pStr)
-		if pErr != nil {
-			return "", 0, pErr
-		}
-		h = strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(h), "]"), "[")
-		if h == "" {
-			return "", 0, fmt.Errorf("host cannot be empty")
-		}
-		return h, port, nil
-	}
-
-	// 2. 如果是带方括号的 IPv6 地址，如 [::1] 或 [2001:db8::1]
-	if strings.HasPrefix(input, "[") && strings.HasSuffix(input, "]") {
-		rawIP := input[1 : len(input)-1]
-		if ip := net.ParseIP(rawIP); ip != nil {
-			return rawIP, 0, nil
-		}
-		return "", 0, fmt.Errorf("invalid bracketed IPv6 address %q", input)
-	}
-	if strings.Contains(input, "[") || strings.Contains(input, "]") {
-		return "", 0, fmt.Errorf("malformed bracketed address %q", input)
-	}
-
-	// 3. 检查是否为不带方括号的裸 IPv6 地址，如 ::1 或 2001:db8::1
-	if ip := net.ParseIP(input); ip != nil {
-		return input, 0, nil
-	}
-
-	// 4. 如果包含冒号且不是有效 IP，说明格式错误
-	if strings.Contains(input, ":") {
-		return "", 0, fmt.Errorf("invalid address or host-port %q", input)
-	}
-
-	// 5. 普通主机名或 IPv4（未带端口）
-	return input, 0, nil
+	host, port, _, err := config.ParseHostPort(input)
+	return host, port, err
 }
 
 // ParseAddr 解析 [user@]host[:port] 或 openssh:[user@]host[:port] 格式的字符串，支持 IPv6
 func ParseAddr(input string) (user, host string, port uint16, err error) {
-	input = strings.TrimSpace(input)
-	if input == "" {
-		return "", "", 0, fmt.Errorf("address cannot be empty")
-	}
-
-	if rest, ok := strings.CutPrefix(input, config.OpenSSHNodePrefix); ok {
-		if rest == "" || strings.TrimSpace(rest) != rest || strings.HasPrefix(rest, config.OpenSSHNodePrefix) {
-			return "", "", 0, fmt.Errorf("invalid openssh selector %q", input)
-		}
-		u, h, p, parseErr := parsePlainAddr(rest)
-		if parseErr != nil {
-			return "", "", 0, parseErr
-		}
-		return u, config.OpenSSHNodePrefix + h, p, nil
-	}
-
-	return parsePlainAddr(input)
-}
-
-func parsePlainAddr(input string) (user, host string, port uint16, err error) {
-	if atIndex := strings.Index(input, "@"); atIndex != -1 {
-		user = strings.TrimSpace(input[:atIndex])
-		rest := strings.TrimSpace(input[atIndex+1:])
-		if user == "" {
-			return "", "", 0, fmt.Errorf("invalid address %q: username before '@' cannot be empty", input)
-		}
-		if rest == "" {
-			return "", "", 0, fmt.Errorf("invalid address %q: host after '@' cannot be empty", input)
-		}
-		host, port, err = ParseHost(rest)
-		if err != nil {
-			return "", "", 0, err
-		}
-		return user, host, port, nil
-	}
-
-	host, port, err = ParseHost(input)
+	ref, err := config.ParseTargetRef(input)
 	if err != nil {
 		return "", "", 0, err
 	}
-	return "", host, port, nil
+	return ref.User, ref.Selector(), ref.Port, nil
 }
 
 // GetCurrentUser 获取当前用户名

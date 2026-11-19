@@ -59,9 +59,10 @@ func TestPreparedConnectionDoesNotPolluteSavedTargets(t *testing.T) {
 		t.Fatal(err)
 	}
 	after, err := repo.ResolveConnection(correct.NodeID)
-	if err != nil || !reflect.DeepEqual(before, after) {
-		t.Fatalf("confirmation changed authenticated target or credential versions: %v", err)
+	if err != nil {
+		t.Fatalf("resolve confirmed connection: %v", err)
 	}
+	assertConfirmedSnapshotPreserved(t, before, after)
 	disk, err := store.Load()
 	if err != nil {
 		t.Fatal(err)
@@ -76,6 +77,17 @@ func TestPreparedConnectionDoesNotPolluteSavedTargets(t *testing.T) {
 	resolved, err := reloaded.PrepareNodeContext(t.Context(), pendingTestOptions(0))
 	if err != nil || resolved.Created || resolved.NodeID != correct.NodeID {
 		t.Fatalf("omitted port after successful connection = %+v, %v", resolved, err)
+	}
+}
+
+func assertConfirmedSnapshotPreserved(t *testing.T, before, after ConnectionSnapshot) {
+	t.Helper()
+	if before.Provenance != ProvenanceAdHocPending || after.Provenance != ProvenanceSavedManaged {
+		t.Fatalf("provenance transition = (%s -> %s), want (adhoc_pending -> saved_managed)", before.Provenance, after.Provenance)
+	}
+	before.Provenance = after.Provenance
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("confirmation changed authenticated target or credential versions: before=%+v after=%+v", before, after)
 	}
 }
 

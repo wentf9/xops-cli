@@ -331,7 +331,7 @@ func (r *Repository) ResolveConnection(nodeID string) (ConnectionSnapshot, error
 		return ConnectionSnapshot{}, fmt.Errorf("configuration repository is nil")
 	}
 
-	provider := r.connectionProvider(nodeID)
+	provider, pendingProv := r.connectionProviderWithProvenance(nodeID)
 	configuration := provider.Snapshot()
 	if node, exists := configuration.Nodes.Get(nodeID); exists {
 		host, hostExists := configuration.Hosts.Get(node.HostRef)
@@ -355,28 +355,33 @@ func (r *Repository) ResolveConnection(nodeID string) (ConnectionSnapshot, error
 			clonedNode.OpenSSHAlias = r.provider.NodeOpenSSHAlias(nodeID)
 		}
 		var updateRef *ConnectionUpdateRef
-		if !strings.HasPrefix(nodeID, OpenSSHNodePrefix) {
+		if !IsOpenSSHNodeID(nodeID) {
 			updateRef = &ConnectionUpdateRef{
 				AuthVersion: authVersion,
 				SudoVersion: sudoVersion,
 			}
 		}
+		prov := pendingProv
+		if prov == ProvenanceUnknown {
+			prov = ProvenanceSavedManaged
+		}
 		return ConnectionSnapshot{
-			Node:      clonedNode,
-			Host:      cloneHost(host),
-			Identity:  cloneIdentity(identity),
-			UpdateRef: updateRef,
+			Node:       clonedNode,
+			Host:       cloneHost(host),
+			Identity:   cloneIdentity(identity),
+			UpdateRef:  updateRef,
+			Provenance: prov,
 		}, nil
 	}
 
-	node, host, identity, err := provider.Resolve(nodeID)
+	snap, err := provider.ResolveConnection(nodeID)
 	if err != nil {
 		return ConnectionSnapshot{}, err
 	}
-	if node.OpenSSHAlias == "" && r.provider != nil {
-		node.OpenSSHAlias = r.provider.NodeOpenSSHAlias(nodeID)
+	if snap.Node.OpenSSHAlias == "" && r.provider != nil {
+		snap.Node.OpenSSHAlias = r.provider.NodeOpenSSHAlias(nodeID)
 	}
-	return ConnectionSnapshot{Node: node, Host: host, Identity: identity}, nil
+	return snap, nil
 }
 
 // SetNodeOpenSSHAlias records the concrete OpenSSH Host alias from which nodeID
@@ -1189,7 +1194,8 @@ func (r *Repository) UpdateSudoAtVersionContext(ctx context.Context, nodeID, sud
 }
 
 func (r *Repository) Resolve(nodeID string) (models.Node, models.Host, models.Identity, error) {
-	return r.connectionProvider(nodeID).Resolve(nodeID)
+	provider, _ := r.connectionProviderWithProvenance(nodeID)
+	return provider.Resolve(nodeID)
 }
 
 func (r *Repository) GetNode(nodeID string) (models.Node, bool) {

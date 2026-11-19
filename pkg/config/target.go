@@ -66,6 +66,7 @@ type ResolvedTarget struct {
 	ProxyJump    string
 	KeyPath      string
 	OpenSSHAlias string
+	Provenance   NodeProvenance
 	Created      bool
 }
 
@@ -612,6 +613,10 @@ func (r *Repository) buildMatchedResolvedTarget(
 			alias = resolveOpenSSHAliasName(r.provider.openSSH, matchedID)
 		}
 	}
+	prov := ProvenanceSavedManaged
+	if IsOpenSSHNodeID(matchedID) {
+		prov = ProvenanceOpenSSHVirtual
+	}
 	return ResolvedTarget{
 		NodeID:        matchedID,
 		MatchedNodeID: matchedID,
@@ -622,6 +627,7 @@ func (r *Repository) buildMatchedResolvedTarget(
 		ProxyJump:     jump,
 		KeyPath:       ident.KeyPath,
 		OpenSSHAlias:  alias,
+		Provenance:    prov,
 		Created:       false,
 	}, nil
 }
@@ -669,6 +675,10 @@ func (r *Repository) buildCreatedResolvedTargetWithUserPort(
 	if openSSHAlias != "" {
 		recordResolvedOpenSSHAlias(r, provider, targetNodeID, openSSHAlias)
 	}
+	prov := ProvenanceAdHocPending
+	if openSSHAlias != "" {
+		prov = ProvenanceOpenSSHDerived
+	}
 	return ResolvedTarget{
 		NodeID:        targetNodeID,
 		MatchedNodeID: "",
@@ -679,6 +689,7 @@ func (r *Repository) buildCreatedResolvedTargetWithUserPort(
 		ProxyJump:     jump,
 		KeyPath:       keyPath,
 		OpenSSHAlias:  openSSHAlias,
+		Provenance:    prov,
 		Created:       true,
 	}, nil
 }

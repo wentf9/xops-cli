@@ -17,8 +17,9 @@ func equalPersistedNode(a, b models.Node) bool {
 }
 
 type pendingConnection struct {
-	provider *Provider // immutable connection bundle
-	gate     contextGate
+	provider   *Provider // immutable connection bundle
+	provenance NodeProvenance
+	gate       contextGate
 }
 
 // PrepareNodeContext resolves a connection without writing configuration. New
@@ -83,6 +84,9 @@ func (r *Repository) registerPendingConnection(cfg *Configuration, nodeID string
 			if oldNode.OpenSSHAlias == "" && node.OpenSSHAlias != "" {
 				previous.provider.SetNodeOpenSSHAlias(nodeID, node.OpenSSHAlias)
 				r.SetNodeOpenSSHAlias(nodeID, node.OpenSSHAlias)
+				if oldNode.SSHOptions == nil {
+					previous.provenance = ProvenanceOpenSSHDerived
+				}
 			}
 			return nodeID, nil
 		}
@@ -114,21 +118,25 @@ func (r *Repository) registerPendingConnection(cfg *Configuration, nodeID string
 	pending.Hosts.Set(node.HostRef, host)
 	pending.Identities.Set(node.IdentityRef, identity)
 	pendingProvider := NewProviderWithoutOpenSSH(pending)
+	prov := ProvenanceAdHocPending
 	if node.OpenSSHAlias != "" {
 		pendingProvider.SetNodeOpenSSHAlias(nodeID, node.OpenSSHAlias)
 		r.SetNodeOpenSSHAlias(nodeID, node.OpenSSHAlias)
+		if node.SSHOptions == nil {
+			prov = ProvenanceOpenSSHDerived
+		}
 	}
-	r.pending[nodeID] = &pendingConnection{provider: pendingProvider}
+	r.pending[nodeID] = &pendingConnection{provider: pendingProvider, provenance: prov}
 	return nodeID, nil
 }
 
-func (r *Repository) connectionProvider(nodeID string) *Provider {
+func (r *Repository) connectionProviderWithProvenance(nodeID string) (*Provider, NodeProvenance) {
 	r.pendingMu.RLock()
 	defer r.pendingMu.RUnlock()
 	if pending := r.pending[nodeID]; pending != nil {
-		return pending.provider
+		return pending.provider, pending.provenance
 	}
-	return r.provider
+	return r.provider, ProvenanceUnknown
 }
 
 func (r *Repository) resolvePendingNode(nodeID string) (models.Node, models.Host, models.Identity, bool) {
@@ -186,13 +194,13 @@ func (r *Repository) confirmNodeContext(ctx context.Context, nodeID string, exec
 	if r == nil || ctx == nil {
 		return fmt.Errorf("confirm connection requires repository and context")
 	}
-	if strings.HasPrefix(nodeID, OpenSSHNodePrefix) {
+	if IsOpenSSHNodeID(nodeID) {
 		return nil
 	}
 	r.pendingMu.RLock()
 	pending := r.pending[nodeID]
 	r.pendingMu.RUnlock()
-	if pending == nil {
+	if pending == nil || pending.provenance == ProvenanceOpenSSHVirtual {
 		return nil
 	}
 	// Serialize confirmation of this node without holding the pending map

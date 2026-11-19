@@ -58,10 +58,11 @@ type ConfigProvider interface {
 // ConnectionSnapshot is one internally consistent connection configuration.
 // UpdateRef is nil for read-only sources, including OpenSSH virtual nodes.
 type ConnectionSnapshot struct {
-	Node      models.Node
-	Host      models.Host
-	Identity  models.Identity
-	UpdateRef *ConnectionUpdateRef
+	Node       models.Node
+	Host       models.Host
+	Identity   models.Identity
+	UpdateRef  *ConnectionUpdateRef
+	Provenance NodeProvenance
 }
 
 // ConnectionUpdateRef carries the field versions observed with a persistent

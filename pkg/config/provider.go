@@ -190,8 +190,13 @@ func (p *Provider) ResolveProxyJumpChain(jumpChain string) (string, error) {
 // Resolve returns one internally consistent, defensive-copy configuration
 // triple. OpenSSH virtual nodes remain read-only fallbacks.
 func (p *Provider) Resolve(nodeID string) (models.Node, models.Host, models.Identity, error) {
+	node, host, identity, _, err := p.resolveWithProvenance(nodeID)
+	return node, host, identity, err
+}
+
+func (p *Provider) resolveWithProvenance(nodeID string) (models.Node, models.Host, models.Identity, NodeProvenance, error) {
 	if p == nil {
-		return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("config provider is nil")
+		return models.Node{}, models.Host{}, models.Identity{}, ProvenanceUnknown, fmt.Errorf("config provider is nil")
 	}
 	p.mu.RLock()
 	if node, ok := p.cfg.Nodes.Get(nodeID); ok {
@@ -200,37 +205,46 @@ func (p *Provider) Resolve(nodeID string) (models.Node, models.Host, models.Iden
 		openSSHAlias := p.openSSHAliases[nodeID]
 		p.mu.RUnlock()
 		if !hostOK {
-			return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("host ref %q for node %q: %w", node.HostRef, nodeID, ErrHostNotFound)
+			return models.Node{}, models.Host{}, models.Identity{}, ProvenanceUnknown, fmt.Errorf("host ref %q for node %q: %w", node.HostRef, nodeID, ErrHostNotFound)
 		}
 		if !identityOK {
-			return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("identity ref %q for node %q: %w", node.IdentityRef, nodeID, ErrIdentityNotFound)
+			return models.Node{}, models.Host{}, models.Identity{}, ProvenanceUnknown, fmt.Errorf("identity ref %q for node %q: %w", node.IdentityRef, nodeID, ErrIdentityNotFound)
 		}
 		clonedNode := cloneNode(node)
 		if clonedNode.OpenSSHAlias == "" {
 			clonedNode.OpenSSHAlias = openSSHAlias
 		}
-		return clonedNode, cloneHost(host), cloneIdentity(identity), nil
+		return clonedNode, cloneHost(host), cloneIdentity(identity), ProvenanceSavedManaged, nil
 	}
 	p.mu.RUnlock()
 
-	if strings.HasPrefix(nodeID, OpenSSHNodePrefix) {
+	if IsOpenSSHNodeID(nodeID) {
 		parser := p.openSSH
 		if parser == nil {
 			parser = &OpenSSHParser{cfg: nil}
 		}
-		return parser.GetVirtualNode(strings.TrimPrefix(nodeID, OpenSSHNodePrefix))
+		node, host, identity, err := parser.GetVirtualNode(strings.TrimPrefix(nodeID, OpenSSHNodePrefix))
+		if err != nil {
+			return models.Node{}, models.Host{}, models.Identity{}, ProvenanceUnknown, err
+		}
+		return node, host, identity, ProvenanceOpenSSHVirtual, nil
 	}
-	return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("node %q: %w", nodeID, ErrNodeNotFound)
+	return models.Node{}, models.Host{}, models.Identity{}, ProvenanceUnknown, fmt.Errorf("node %q: %w", nodeID, ErrNodeNotFound)
 }
 
 // ResolveConnection returns a read-only connection snapshot. Provider does not
 // own durable mutations, so discovery values must remain session-local.
 func (p *Provider) ResolveConnection(nodeID string) (ConnectionSnapshot, error) {
-	node, host, identity, err := p.Resolve(nodeID)
+	node, host, identity, prov, err := p.resolveWithProvenance(nodeID)
 	if err != nil {
 		return ConnectionSnapshot{}, err
 	}
-	return ConnectionSnapshot{Node: node, Host: host, Identity: identity}, nil
+	return ConnectionSnapshot{
+		Node:       node,
+		Host:       host,
+		Identity:   identity,
+		Provenance: prov,
+	}, nil
 }
 
 func (p *Provider) GetNode(nodeID string) (models.Node, bool) {
