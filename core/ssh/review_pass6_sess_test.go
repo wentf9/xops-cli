@@ -726,7 +726,9 @@ func assertPass6HandoffStopActiveCancel(t *testing.T) {
 	runPass4MuxFwdCall(t, func(c net.Conn) error {
 		return srvDuring.handleStopListening(c, 77)
 	})
-	srvDuring.activeSessions.Add(1)
+	srvDuring.idleMu.Lock()
+	srvDuring.activeSessions++
+	srvDuring.idleMu.Unlock()
 
 	srvDuring.CancelHandoff()
 	if srvDuring.isShuttingDown() {

@@ -139,6 +139,20 @@ func (b *boundedAgentClient) contextErr() error {
 	return nil
 }
 
+func isAgentDeadlineError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "i/o timeout")
+}
+
 func runBoundedAgentOp[T any](b *boundedAgentClient, op string, fn func() (T, error)) (T, error) {
 	var zero T
 	b.mu.Lock()
@@ -147,7 +161,8 @@ func runBoundedAgentOp[T any](b *boundedAgentClient, op string, fn func() (T, er
 	if err := b.contextErr(); err != nil {
 		return zero, err
 	}
-	if err := b.conn.SetDeadline(time.Now().Add(b.opTimeout)); err != nil && !isIgnorableDeadlineError(err) {
+	deadline := time.Now().Add(b.opTimeout)
+	if err := b.conn.SetDeadline(deadline); err != nil && !isIgnorableDeadlineError(err) {
 		return zero, fmt.Errorf("set ssh-agent %s deadline: %w", op, err)
 	}
 	watchdog := time.AfterFunc(b.opTimeout, func() {
@@ -166,7 +181,7 @@ func runBoundedAgentOp[T any](b *boundedAgentClient, op string, fn func() (T, er
 	if ctxErr := b.contextErr(); ctxErr != nil {
 		return zero, fmt.Errorf("ssh-agent %s canceled: %w", op, errors.Join(err, ctxErr))
 	}
-	if b.timedOut.Load() || errors.Is(err, os.ErrDeadlineExceeded) {
+	if b.timedOut.Load() || !stopped || isAgentDeadlineError(err) {
 		return zero, fmt.Errorf("ssh-agent %s timed out after %s: %w", op, b.opTimeout, errors.Join(err, context.DeadlineExceeded))
 	}
 	return zero, err

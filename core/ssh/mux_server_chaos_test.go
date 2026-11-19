@@ -183,12 +183,30 @@ func chaosMuxPacketCall(fn func(net.Conn) error) (uint32, []byte, error) {
 func checkMuxServerInvariants(t *testing.T, srv *MuxServer) bool {
 	t.Helper()
 	ok := true
-	if got := srv.ActiveSessions(); got < 0 {
-		t.Errorf("invariant violation: negative activeSessions = %d", got)
+	srv.idleMu.Lock()
+	sessions := srv.activeSessions
+	streams := srv.activeForwardStreams
+	stopReplies := srv.stopRepliesInFlight
+	openInFlight := srv.openFwdsInFlight
+	closeInFlight := srv.closeFwdsInFlight
+	phase := srv.phase
+	stopped := srv.stoppedListening
+	srv.idleMu.Unlock()
+
+	if sessions < 0 {
+		t.Errorf("invariant violation: negative activeSessions = %d", sessions)
 		ok = false
 	}
-	if got := srv.activeForwardStreams.Load(); got < 0 {
-		t.Errorf("invariant violation: negative activeForwardStreams = %d", got)
+	if streams < 0 {
+		t.Errorf("invariant violation: negative activeForwardStreams = %d", streams)
+		ok = false
+	}
+	if stopReplies < 0 || openInFlight < 0 || closeInFlight < 0 {
+		t.Errorf("invariant violation: negative in-flight ops stop=%d open=%d close=%d", stopReplies, openInFlight, closeInFlight)
+		ok = false
+	}
+	if phase == muxPhaseRunning && stopped {
+		t.Errorf("invariant violation: phase=Running while stoppedListening=true")
 		ok = false
 	}
 	return ok
@@ -271,11 +289,13 @@ func runChaosForwardOpenCloseRound(t *testing.T, roundSeed uint64, round int) {
 	}
 	waitForCondition(t, 2*time.Second, func() bool {
 		srv.idleMu.Lock()
-		endpoints := len(srv.listenEndpoints)
-		fwds := srv.forwardCount()
+		endpoints := srv.forwardTable.endpointCountLocked()
+		fwds := srv.forwardTable.entryCountLocked()
+		inFlight := srv.stopRepliesInFlight + srv.openFwdsInFlight + srv.closeFwdsInFlight
+		phase := srv.phase
 		srv.idleMu.Unlock()
-		return endpoints == 0 && fwds == 0
-	}, "forward tables did not drain to empty after Shutdown")
+		return endpoints == 0 && fwds == 0 && inFlight == 0 && phase == muxPhaseClosed
+	}, "forward tables and lifecycle phase did not drain to Closed after Shutdown")
 	cleanup()
 }
 

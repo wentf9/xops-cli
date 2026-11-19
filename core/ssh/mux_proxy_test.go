@@ -521,7 +521,12 @@ func TestMuxServer_ShutdownClosesForwardedStreams(t *testing.T) {
 		t.Fatalf("listen forward port failed: %v", err)
 	}
 	t.Cleanup(func() { _ = forwardListener.Close() })
-	fixture.Master.forwards.Store("mux-test-local-forward", forwardListener)
+	fixture.Master.idleMu.Lock()
+	fixture.Master.forwardTable.putEntryLocked("mux-test-local-forward", &muxForwardEntry{
+		closer:     forwardListener,
+		forwardKey: "mux-test-local-forward",
+	})
+	fixture.Master.idleMu.Unlock()
 	go fixture.Master.serveLocalForward(forwardListener, echoListener.Addr().String())
 
 	clientConn, err := net.Dial("tcp", forwardListener.Addr().String())

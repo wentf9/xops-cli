@@ -195,10 +195,10 @@ func TestPass9_H5_ForegroundReleaseRace_HandoffStopInvalidation_CancelHandoffShu
 	nonPersist := &MuxServer{
 		persistEnabled:   false,
 		hadActiveSession: true,
+		activeSessions:   1,
 		idleNotify:       make(chan struct{}),
 		shutdownChan:     make(chan struct{}),
 	}
-	nonPersist.activeSessions.Store(1)
 	if !nonPersist.PrepareHandoffWithSessions(1) {
 		t.Fatal("PrepareHandoffWithSessions(1) on non-persistent master failed")
 	}

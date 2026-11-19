@@ -166,9 +166,9 @@ func verifyPass8WaitClosingEndpointInFlight(t *testing.T) {
 		listenPort: 45810,
 	}
 	waitCh := make(chan struct{})
-	srv.listenEndpoints = map[forwardListenKey]*muxForwardEndpointState{
+	srv.forwardTable.endpoints = map[forwardListenKey]*muxForwardEndpointSlot{
 		lk: {
-			inFlight:    true,
+			state:       forwardSlotOpening,
 			closingWait: waitCh,
 		},
 	}
@@ -235,10 +235,10 @@ func verifyPass8RetireFallbackBarrier(t *testing.T) {
 		remote:        true,
 		shadowClosers: []io.Closer{blocker},
 	}
-	srv.forwards.Store(fwdKey, entry)
-	srv.listenEndpoints = map[forwardListenKey]*muxForwardEndpointState{
+	srv.forwardTable.putEntryLocked(fwdKey, entry)
+	srv.forwardTable.endpoints = map[forwardListenKey]*muxForwardEndpointSlot{
 		lk: {
-			inFlight:      true,
+			state:         forwardSlotOpening,
 			fallbackEntry: entry,
 		},
 	}
@@ -256,8 +256,8 @@ func verifyPass8RetireFallbackBarrier(t *testing.T) {
 	}
 
 	srv.idleMu.Lock()
-	ep := srv.listenEndpoints[lk]
-	inFlightBusy := srv.hasInFlightEndpointsLocked()
+	ep := srv.forwardTable.endpoints[lk]
+	inFlightBusy := srv.forwardTable.hasInFlightEndpointsLocked()
 	srv.idleMu.Unlock()
 	if ep == nil || ep.closingWait == nil || ep.fallbackEntry != nil || !inFlightBusy {
 		t.Fatalf("expected active closingWait and cleared fallbackEntry on inFlight slot, got ep=%+v inFlightBusy=%v", ep, inFlightBusy)
@@ -292,9 +292,9 @@ func verifyPass8RetireFallbackBarrier(t *testing.T) {
 	<-retireDone
 
 	srv.idleMu.Lock()
-	epAfter := srv.listenEndpoints[lk]
+	epAfter := srv.forwardTable.endpoints[lk]
 	srv.idleMu.Unlock()
-	if epAfter == nil || !epAfter.inFlight || epAfter.closingWait != nil {
+	if epAfter == nil || epAfter.state != forwardSlotOpening || epAfter.closingWait != nil {
 		t.Fatalf("expected original inFlight slot preserved with closingWait=nil, got %+v", epAfter)
 	}
 }
@@ -331,9 +331,9 @@ func TestPass8_M3_RetireForwardSchedulesShutdownAfterCloseBarrier(t *testing.T) 
 		remote:        true,
 		shadowClosers: []io.Closer{&pass8BlockingCloser{entered: entered, release: release}},
 	}
-	srv.forwards.Store(fwdKey, entry)
-	srv.listenEndpoints = map[forwardListenKey]*muxForwardEndpointState{
-		lk: {entry: entry},
+	srv.forwardTable.putEntryLocked(fwdKey, entry)
+	srv.forwardTable.endpoints = map[forwardListenKey]*muxForwardEndpointSlot{
+		lk: {state: forwardSlotActive, entry: entry},
 	}
 
 	go srv.retireForward(fwdKey, entry)

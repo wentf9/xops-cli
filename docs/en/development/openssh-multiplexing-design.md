@@ -77,7 +77,9 @@ flowchart TD
         MuxProto["core/ssh/mux_protocol.go\n(PROTOCOL.mux v4 Framing & Codecs)"]
         MuxClient["core/ssh/mux_client.go\n(DialMuxClient, AliveCheck, Proxy, Forward)"]
         MuxProxy["core/ssh/mux_proxy_conn.go\n(muxProxySSHConn -> cryptoSSH.Conn)"]
-        MuxServer["core/ssh/mux_server.go\n(MuxServer, IdleTimer, PeerUID, Dispatcher)"]
+        MuxServer["core/ssh/mux_server.go\n(MuxServer, muxPhase FSM, Dispatcher)"]
+        MuxFwdTable["core/ssh/mux_forward_table.go\n(muxForwardTable, Forward Lifecycle & Barriers)"]
+        MuxRelay["core/ssh/mux_proxy_relay.go\n(proxySessionState, Packet & Flow Relay)"]
         MuxUnix["core/ssh/mux_rights_unix.go\n(bindAndLinkSocket, SCM_RIGHTS, SO_PEERCRED)"]
         MuxOther["core/ssh/mux_rights_other.go\n(Windows AF_UNIX Direct Bind)"]
     end
@@ -262,7 +264,7 @@ For internal CLI sessions (`ssh`, `scp`, `sftp`, `exec`, `play`), `xops-cli` pri
    }
    ```
 6. The client constructs `*cryptoSSH.Client` using `cryptoSSH.NewClient(proxyConn, chans, reqs)`. This client is completely transparent to upper-layer services (SFTP subsystem clients, interactive PTY requests, environment variable passing, probe dialect caches) with zero feature degradation.
-7. **Flow control and channel ordering** (`core/ssh/mux_server.go:proxySessionState`):
+7. **Flow control and channel ordering** (`core/ssh/mux_proxy_relay.go:proxySessionState`):
    - The master-to-client direction honours the receive window and maximum packet size the client advertised in its channel open. Every data packet reserves its exact size through `clientFlowWindow.reserve` first and the credit is refunded by `SSH_MSG_CHANNEL_WINDOW_ADJUST`. Ignoring the window makes `x/crypto` fail the whole multiplexed connection with `ssh: remote side wrote too much` once 2 MiB is outstanding, which large downloads and high-throughput commands would hit.
    - The client-to-master direction never blocks the read loop: client data is queued per channel (`orderedQueue`) and written to the remote channel by a dedicated relay goroutine, which credits the client window only after the write succeeded. Relaying inline would let one channel whose remote end stopped reading stdin stall the shared read loop, and with it every other channel on the master (including `-O` queries and new sessions).
    - Global requests (`tcpip-forward`, keepalive probes) also go through one ordered worker: RFC 4254 global replies carry no request ID, so concurrent replies would be paired with the wrong request.
@@ -483,14 +485,15 @@ OpenSSH control commands observe strict conventions:
 
 ### 7.2 Foreground Session Protection & Idle State Machine
 
-`core/ssh/mux_server.go` maintains thread-safe state management:
-1. **Active Session Counter (`activeSessions atomic.Int32`)**:
+`core/ssh/mux_server.go` and `core/ssh/mux_forward_table.go` maintain an explicit lifecycle FSM (`muxPhase`: `Running` / `HandoffReserved` / `StoppingListen` / `ShuttingDown` / `Closed`) serialized under a single `idleMu` mutex:
+1. **Active Session Counter (`activeSessions int32`, protected by `idleMu`)**:
    - Starting a foreground master invokes `srv.AddForegroundSession()`, setting count to 1.
    - Incoming passenger or proxy clients increment the counter.
    - While `activeSessions > 0`, the idle timer is held inactive.
-2. **Session Release & Idle Trigger**:
-   - When a client disconnects and `removeActiveSession()` drops `activeSessions` to 0:
-     - If `Persist` is disabled: master immediately executes graceful shutdown (`s.Shutdown()`).
+2. **Session Release & Single Transition Exit (`onWorkCountChangedLocked`)**:
+   - Whenever a client disconnects, a forward stream finishes, or `CancelHandoff()` / `-O stop` settles and all active work reaches 0, `onWorkCountChangedLocked()` evaluates the next phase:
+     - If in `StoppingListen`: transitions to `ShuttingDown` and triggers `s.Shutdown()`.
+     - If `Persist` is disabled and a session had been admitted: triggers `s.Shutdown()`.
      - If `Persist` is indefinite: master remains running with no timer scheduled.
      - If `Persist` specifies a duration: starts `time.Timer` tracked by generation counter (`idleGen`).
 3. **Generation Counter Race Protection (TOCTOU Defense)**:

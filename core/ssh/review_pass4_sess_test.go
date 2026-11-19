@@ -200,12 +200,12 @@ func collectPass4AllocatedPorts(t *testing.T, srv *MuxServer) []uint32 {
 	defer srv.idleMu.Unlock()
 	seen := make(map[uint32]struct{})
 	var localPorts []uint32
-	for k, state := range srv.listenEndpoints {
+	for k, state := range srv.forwardTable.endpoints {
 		if k.listenPort == 0 {
-			t.Fatalf("unexpected listenPort=0 singleton key in listenEndpoints: %+v", k)
+			t.Fatalf("unexpected listenPort=0 singleton key in forwardTable.endpoints: %+v", k)
 		}
-		if state == nil || state.entry == nil {
-			t.Fatalf("unexpected nil entry in listenEndpoints[%+v]", k)
+		if state == nil || state.state != forwardSlotActive || state.entry == nil {
+			t.Fatalf("unexpected invalid state in forwardTable.endpoints[%+v]: %+v", k, state)
 		}
 		if k.fwdScope == muxForwardScopeLocal {
 			if _, dup := seen[k.listenPort]; dup {
@@ -444,7 +444,9 @@ func assertPass4CommitReservedForwardBackfillsListenKey(t *testing.T) {
 		remote:       true,
 		refs:         1,
 	}
-	srv.forwards.Store(key, existing)
+	srv.idleMu.Lock()
+	srv.forwardTable.putEntryLocked(key, existing)
+	srv.idleMu.Unlock()
 
 	cand := &muxForwardEntry{
 		fwdType:      MUX_FWD_REMOTE,
@@ -577,11 +579,11 @@ func assertPass4CloseFwdNotFound(t *testing.T, srv *MuxServer, req MuxFwdRequest
 func assertPass4MuxForwardTablesEmpty(t *testing.T, srv *MuxServer) {
 	t.Helper()
 	srv.idleMu.Lock()
-	endpoints := len(srv.listenEndpoints)
-	forwards := srv.forwardCount()
+	endpoints := srv.forwardTable.endpointCountLocked()
+	forwards := srv.forwardTable.entryCountLocked()
 	srv.idleMu.Unlock()
 	if endpoints != 0 || forwards != 0 {
-		t.Fatalf("MuxServer forward tables not empty: forwards=%d listenEndpoints=%d", forwards, endpoints)
+		t.Fatalf("MuxServer forward tables not empty: forwards=%d endpoints=%d", forwards, endpoints)
 	}
 }
 

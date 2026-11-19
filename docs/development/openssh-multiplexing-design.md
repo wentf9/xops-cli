@@ -77,7 +77,9 @@ flowchart TD
         MuxProto["core/ssh/mux_protocol.go\n(PROTOCOL.mux v4 Framing & Codecs)"]
         MuxClient["core/ssh/mux_client.go\n(DialMuxClient, AliveCheck, Proxy, Forward)"]
         MuxProxy["core/ssh/mux_proxy_conn.go\n(muxProxySSHConn -> cryptoSSH.Conn)"]
-        MuxServer["core/ssh/mux_server.go\n(MuxServer, IdleTimer, PeerUID, Dispatcher)"]
+        MuxServer["core/ssh/mux_server.go\n(MuxServer, muxPhase FSM, Dispatcher)"]
+        MuxFwdTable["core/ssh/mux_forward_table.go\n(muxForwardTable, Forward Lifecycle & Barriers)"]
+        MuxRelay["core/ssh/mux_proxy_relay.go\n(proxySessionState, Packet & Flow Relay)"]
         MuxUnix["core/ssh/mux_rights_unix.go\n(bindAndLinkSocket, SCM_RIGHTS, SO_PEERCRED)"]
         MuxOther["core/ssh/mux_rights_other.go\n(Windows AF_UNIX Direct Bind)"]
     end
@@ -262,7 +264,7 @@ const (
    }
    ```
 6. 调用 `cryptoSSH.NewClient(proxyConn, chans, reqs)` 构筑完备的 `*cryptoSSH.Client`。此对象对上层逻辑（如 SFTP 客户端创建、Interactive PTY 请求、环境变量注入、Probe 方言探测缓存）完全透明，无任何行为差异。
-7. **流量控制与通道保序**（`core/ssh/mux_server.go:proxySessionState`）：
+7. **流量控制与通道保序**（`core/ssh/mux_proxy_relay.go:proxySessionState`）：
    - 下行方向严格遵循客户端在通道 open 中声明的接收窗口与最大包长。Master 在发送每个数据包前先 `clientFlowWindow.reserve` 精确预留额度，并在 `SSH_MSG_CHANNEL_WINDOW_ADJUST` 中归还额度；忽略该窗口会让客户端 `x/crypto` 在 2 MiB 后以 `ssh: remote side wrote too much` 终止整条复用连接（大文件下载/高吞吐命令才会暴露）。
    - 上行方向不阻塞读循环：客户端数据经每通道 `orderedQueue` 交给专属 relay goroutine 写入远端通道，仅在写入成功后才回窗口额度。否则一个远端不再读取 stdin 的通道会占住共享读循环，导致同一 Master 上所有其他通道（含 `-O` 查询与新会话）一起挂死。
    - 全局请求（`tcpip-forward`、keepalive 等）同样经有序列化 worker 转发：RFC 4254 的全局回复不携带请求 ID，并发回复会把结果错配到别的请求。
@@ -491,14 +493,15 @@ OpenSSH 客户端对控制指令有明确的行业契约：
 
 ### 7.2 前台会话保护与空闲超时状态机
 
-`core/ssh/mux_server.go` 内部维护了并发安全的状态机：
-1. **活跃会话计数器 (`activeSessions atomic.Int32`)**：
+`core/ssh/mux_server.go` 与 `core/ssh/mux_forward_table.go` 在单一 `idleMu` 互斥锁下维护显式生命周期状态机（`muxPhase`：`Running` / `HandoffReserved` / `StoppingListen` / `ShuttingDown` / `Closed`）：
+1. **活跃会话计数器 (`activeSessions int32`，由 `idleMu` 保护)**：
    - 启动前台 Master（如交互式终端）时，调用 `srv.AddForegroundSession()`，会话数设为 1。
    - 连入 Passenger 或 Proxy 客户端时，会话数相应自增。
    - 只要 `activeSessions > 0`，空闲定时器处于绝对停止状态，绝不会发生会话中途断开。
-2. **会话释放与倒计时触发**：
-   - 当客户端退出调用 `removeActiveSession()` 使 `activeSessions` 归零时：
-     - 若 `Persist` 未启用：Master 立即触发优雅停机（`s.Shutdown()`）。
+2. **会话释放与统一状态出口 (`onWorkCountChangedLocked`)**：
+   - 当客户端退出、转发流关闭或 `CancelHandoff()` / `-O stop` 释放引用并使会话与转发均归零时，统一经 `onWorkCountChangedLocked()` 决策：
+     - 若处于 `StoppingListen`：直接转为 `ShuttingDown` 并触发优雅停机（`s.Shutdown()`）。
+     - 若 `Persist` 未启用且曾有过会话：触发优雅停机（`s.Shutdown()`）。
      - 若 `Persist` 为无限期（`indefinite=true`）：Master 保持运行，不设定时器。
      - 若 `Persist` 为指定时长：使用代际递增计数器（`idleGen`）启动 `time.Timer`。
 3. **竞态防范 (Generation-based TOCTOU Protection)**：

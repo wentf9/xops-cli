@@ -263,10 +263,10 @@ func TestReviewPass3_M2_ConcurrentDuplicateRemoteForwardNoCancelTcpipForward(t *
 		t.Fatalf("cancel-tcpip-forward after final CloseForward = %d, want >= 1", got)
 	}
 	srv.idleMu.Lock()
-	remainingEndpoints := len(srv.listenEndpoints)
+	remainingEndpoints := srv.forwardTable.endpointCountLocked()
 	srv.idleMu.Unlock()
 	if remainingEndpoints != 0 {
-		t.Fatalf("srv.listenEndpoints len = %d after close, want 0", remainingEndpoints)
+		t.Fatalf("srv.forwardTable.endpoints len = %d after close, want 0", remainingEndpoints)
 	}
 }
 
