@@ -1536,14 +1536,18 @@ func TestSSHMuxDaemon_MuxDaemonArgsIsolation(t *testing.T) {
 		"ServerAliveInterval=15",
 	}
 
-	args := opts.muxDaemonArgs("web-01", sockPath, master)
-	joined := strings.Join(args, " ")
-
-	if !strings.Contains(joined, "-o ClearAllForwardings=yes") {
-		t.Fatalf("expected '-o ClearAllForwardings=yes' in muxDaemonArgs, got %q", joined)
+	spec := opts.buildMuxDaemonSpec("web-01", sockPath, master)
+	child := NewSshOptions()
+	if err := child.applyMuxDaemonSpec(spec); err != nil {
+		t.Fatalf("applyMuxDaemonSpec: %v", err)
 	}
-	if !strings.Contains(joined, "-o ServerAliveInterval=15") {
-		t.Fatalf("expected '-o ServerAliveInterval=15' in muxDaemonArgs, got %q", joined)
+	joined := strings.Join(child.control.Options, " ")
+
+	if !strings.Contains(joined, "ClearAllForwardings=yes") {
+		t.Fatalf("expected 'ClearAllForwardings=yes' in daemon options, got %q", joined)
+	}
+	if !strings.Contains(joined, "ServerAliveInterval=15") {
+		t.Fatalf("expected 'ServerAliveInterval=15' in daemon options, got %q", joined)
 	}
 
 	forbiddenOptions := []string{
@@ -1558,8 +1562,11 @@ func TestSSHMuxDaemon_MuxDaemonArgsIsolation(t *testing.T) {
 	}
 	for _, forbidden := range forbiddenOptions {
 		if strings.Contains(joined, forbidden) {
-			t.Fatalf("muxDaemonArgs contains forbidden option %q: %q", forbidden, joined)
+			t.Fatalf("daemon options contain forbidden option %q: %q", forbidden, joined)
 		}
+	}
+	if child.Port == 2222 {
+		t.Fatalf("expected daemon child Port not to inherit target option Port 2222, got %d", child.Port)
 	}
 }
 

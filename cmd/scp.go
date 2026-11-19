@@ -133,8 +133,8 @@ func (o *ScpOptions) Complete(cmd *cobra.Command, args []string) error {
 	}
 	pathFlags := o.Source != "" || o.Dest != ""
 	if cmd != nil {
-		if cmd.Flags().Changed("port") && o.Port == 0 {
-			return errors.New(i18n.T("scp_err_port_zero"))
+		if err := validateExplicitZeroPort(cmd.Flags()); err != nil {
+			return err
 		}
 		pathFlags = pathFlags || cmd.Flags().Changed("src") || cmd.Flags().Changed("dest")
 		for _, name := range []string{"host", "tag", "ifile"} {
@@ -164,32 +164,8 @@ func (o *ScpOptions) Complete(cmd *cobra.Command, args []string) error {
 }
 
 func (o *ScpOptions) completeStdinCredentials() error {
-	if o.OTP != "" && o.OTPStdin {
-		return errors.New(i18n.T("err_otp_mutually_exclusive"))
-	}
-	if o.OTPStdin {
-		otp, err := cmdutils.ReadSecretLineFromStdin()
-		if err != nil {
-			return fmt.Errorf("read otp from stdin: %w", err)
-		}
-		o.OTP = otp
-		o.OTPStdin = false
-	}
-	if o.PasswordStdin {
-		pwd, err := cmdutils.ReadSecretFromStdin()
-		if err != nil {
-			return fmt.Errorf("read password from stdin: %w", err)
-		}
-		o.Password = pwd
-	}
-	if o.PassphraseStdin {
-		pass, err := cmdutils.ReadSecretFromStdin()
-		if err != nil {
-			return fmt.Errorf("read passphrase from stdin: %w", err)
-		}
-		o.Passphrase = pass
-	}
-	return nil
+	_, err := readCLISecretsFromStdin(&o.SshOptions)
+	return err
 }
 
 func (o *ScpOptions) Validate() error {
@@ -202,13 +178,7 @@ func (o *ScpOptions) Validate() error {
 	if _, err := o.toSessionControlOptions(); err != nil {
 		return err
 	}
-	if o.OTP != "" && o.OTPStdin {
-		return errors.New(i18n.T("err_otp_mutually_exclusive"))
-	}
-	if err := cmdutils.ValidateRememberPolicy(o.Remember); err != nil {
-		return err
-	}
-	if err := validateCLIAlias(o.Alias); err != nil {
+	if err := validateCommonSSHBaseOptions(&o.SshOptions); err != nil {
 		return err
 	}
 	if o.Source == "" {

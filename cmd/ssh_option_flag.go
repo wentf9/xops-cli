@@ -25,9 +25,6 @@ const (
 	// sshMuxDaemonEnv marks the child that only serves a persistent control
 	// socket, keeping the master alive after the foreground session ended.
 	sshMuxDaemonEnv = "XOPS_CLI_SSH_MUX_DAEMON"
-	// sshMuxOriginalHostEnv carries the foreground master's OriginalHost into the
-	// detached ControlPersist daemon so %n and %C stay identical across handoff.
-	sshMuxOriginalHostEnv = "XOPS_MUX_ORIGINAL_HOST"
 )
 
 // Valid control commands for -O

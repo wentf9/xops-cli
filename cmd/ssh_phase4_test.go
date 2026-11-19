@@ -11,10 +11,18 @@ import (
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
+	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/models"
 )
 
 func TestPhase4_FormatHostKeyPromptSSHFPStatus(t *testing.T) {
+	prevLang := i18n.Lang()
+	i18n.SetLang("en")
+	t.Cleanup(func() {
+		if prevLang != "" {
+			i18n.SetLang(prevLang)
+		}
+	})
 	baseReq := ssh.HostKeyConfirmation{
 		Hostname:    "db.example.com",
 		Algorithm:   "ssh-ed25519",

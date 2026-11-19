@@ -129,14 +129,14 @@ func TestPhase3Flags_MuxDaemonForwardsCertAndAgentAuthWhileStrippingForwardAgent
 		"ConnectTimeout=5",
 	}
 
-	forwarded := opts.appendMuxDaemonForwardedOptions(nil, nil)
+	spec := opts.buildMuxDaemonSpec(opts.Host, "/tmp/phase3.sock", nil)
 	want := []string{
-		"-o", "CertificateFile=~/.ssh/id_ed25519-cert.pub",
-		"-o", "IdentityAgent=/tmp/agent.sock",
-		"-o", "ConnectTimeout=5",
+		"CertificateFile=~/.ssh/id_ed25519-cert.pub",
+		"IdentityAgent=/tmp/agent.sock",
+		"ConnectTimeout=5",
 	}
-	if !slices.Equal(forwarded, want) {
-		t.Fatalf("appendMuxDaemonForwardedOptions() = %v, want %v", forwarded, want)
+	if !slices.Equal(spec.Options, want) {
+		t.Fatalf("buildMuxDaemonSpec().Options = %v, want %v", spec.Options, want)
 	}
 
 	t.Setenv("XOPS_CLI_SSH_MUX_DAEMON", "true")

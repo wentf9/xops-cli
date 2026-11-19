@@ -132,18 +132,18 @@ func TestPhase1Flags_MuxDaemonForwardsFlags(t *testing.T) {
 	opts.IdentityFiles = []string{"/tmp/id_one", "/tmp/id_two"}
 	opts.syncIdentityFiles()
 
-	args := opts.muxDaemonArgs("node1", "/tmp/mux.sock", nil)
-	joined := strings.Join(args, " ")
-	for _, want := range []string{
-		"-F /tmp/custom_ssh_cfg",
-		"-c chacha20-poly1305@openssh.com",
-		"-6",
-		"-i /tmp/id_one",
-		"-i /tmp/id_two",
-	} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("muxDaemonArgs missing %q in %q", want, joined)
-		}
+	spec := opts.buildMuxDaemonSpec("node1", "/tmp/mux.sock", nil)
+	if spec.ConfigFile != "/tmp/custom_ssh_cfg" {
+		t.Fatalf("ConfigFile = %q, want /tmp/custom_ssh_cfg", spec.ConfigFile)
+	}
+	if spec.CipherSpec != "chacha20-poly1305@openssh.com" {
+		t.Fatalf("CipherSpec = %q, want chacha20-poly1305@openssh.com", spec.CipherSpec)
+	}
+	if spec.AddressFamily != "inet6" {
+		t.Fatalf("AddressFamily = %q, want inet6", spec.AddressFamily)
+	}
+	if want := []string{"/tmp/id_one", "/tmp/id_two"}; !slices.Equal(spec.IdentityFiles, want) {
+		t.Fatalf("IdentityFiles = %v, want %v", spec.IdentityFiles, want)
 	}
 }
 
@@ -174,7 +174,7 @@ func TestPhase1Flags_HostNameExpansionAndJumpIsolation(t *testing.T) {
 	if got != "mybox.corp.%local" {
 		t.Fatalf("effectiveHostName = %q, want %q", got, "mybox.corp.%local")
 	}
-	if !isTargetSpecificOption("HostName=10.0.0.5") {
+	if !isTargetOnlyMuxDaemonOption("HostName=10.0.0.5") {
 		t.Fatalf("expected HostName to be target-specific so jump hosts never inherit it")
 	}
 }

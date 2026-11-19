@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 
-	"github.com/wentf9/xops-cli/cmd/utils"
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/internal/terminal"
 	"github.com/wentf9/xops-cli/pkg/i18n"
@@ -21,27 +20,8 @@ func (o *ExecOptions) completeInput(ctx context.Context) error {
 	if !o.Interactive && o.Command == "" && o.ShellFile == "" && (o.PasswordStdin || o.PassphraseStdin || o.OTPStdin) {
 		return fmt.Errorf("stdin cannot supply both credentials and a script; use --cmd or --shell")
 	}
-	if o.OTPStdin {
-		otp, err := utils.ReadSecretLineFromStdin()
-		if err != nil {
-			return fmt.Errorf("read otp from stdin: %w", err)
-		}
-		o.OTP = otp
-		o.OTPStdin = false
-	}
-	if o.PasswordStdin {
-		pwd, err := utils.ReadSecretFromStdin()
-		if err != nil {
-			return fmt.Errorf("read password from stdin: %w", err)
-		}
-		o.Password = pwd
-	}
-	if o.PassphraseStdin {
-		pass, err := utils.ReadSecretFromStdin()
-		if err != nil {
-			return fmt.Errorf("read passphrase from stdin: %w", err)
-		}
-		o.Passphrase = pass
+	if _, err := readCLISecretsFromStdin(&o.SshOptions); err != nil {
+		return err
 	}
 	if err := o.readStdinIfRequired(ctx); err != nil {
 		return err

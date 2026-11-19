@@ -12,14 +12,15 @@ import (
 	"github.com/wentf9/xops-cli/pkg/models"
 )
 
-func optionArgsFromDaemonArgs(args []string) []string {
-	var opts []string
-	for i := 0; i < len(args)-1; i++ {
-		if args[i] == "-o" {
-			opts = append(opts, args[i+1])
-		}
+func buildAppliedDaemonSpecForTest(t *testing.T, opts *SshOptions, nodeID, sockPath string, master *ssh.MuxServer) (MuxDaemonSpec, *SshOptions) {
+	t.Helper()
+	spec := opts.buildMuxDaemonSpec(nodeID, sockPath, master)
+	decoded := roundTripMuxDaemonSpecThroughPipe(t, spec)
+	child := NewSshOptions()
+	if err := child.applyMuxDaemonSpec(decoded); err != nil {
+		t.Fatalf("applyMuxDaemonSpec: %v", err)
 	}
-	return opts
+	return decoded, child
 }
 
 func TestPass10_H3_MuxDaemonAuthoritativeControlAndIdentityOrder(t *testing.T) {
@@ -51,24 +52,24 @@ func assertPass10MMNoDowngrade(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = liveAskMaster.Shutdown() })
 	for _, m := range []*ssh.MuxServer{nil, liveAskMaster} {
-		assertPass10MMDaemonArgs(t, opts.muxDaemonArgs("openssh:edge", sockPath, m), m != nil)
+		_, child := buildAppliedDaemonSpecForTest(t, opts, "openssh:edge", sockPath, m)
+		assertPass10MMDaemonOptions(t, child.control.Options, m != nil)
 	}
 }
 
-func assertPass10MMDaemonArgs(t *testing.T, args []string, withMaster bool) {
+func assertPass10MMDaemonOptions(t *testing.T, optVals []string, withMaster bool) {
 	t.Helper()
-	optVals := optionArgsFromDaemonArgs(args)
 	if slices.Contains(optVals, "ControlMaster=yes") {
-		t.Fatalf("downgraded ControlMaster=yes leaked into daemon args (master=%v): %v", withMaster, args)
+		t.Fatalf("downgraded ControlMaster=yes leaked into daemon options (master=%v): %v", withMaster, optVals)
 	}
 	if !slices.Contains(optVals, "ControlMaster=ask") {
-		t.Fatalf("expected authoritative ControlMaster=ask in daemon args (master=%v): %v", withMaster, args)
+		t.Fatalf("expected authoritative ControlMaster=ask in daemon options (master=%v): %v", withMaster, optVals)
 	}
 	if slices.Contains(optVals, "ClearAllForwardings=no") {
-		t.Fatalf("stale ClearAllForwardings=no leaked before ClearAllForwardings=yes: %v", args)
+		t.Fatalf("stale ClearAllForwardings=no leaked before ClearAllForwardings=yes: %v", optVals)
 	}
 	if count := countStrings(optVals, "ControlPersist=60s"); count != 1 {
-		t.Fatalf("ControlPersist=60s count = %d, want 1 in %v", count, args)
+		t.Fatalf("ControlPersist=60s count = %d, want 1 in %v", count, optVals)
 	}
 	ctrl, err := (&SSHControlFlags{Options: optVals}).ToSessionControlOptions()
 	if err != nil {
@@ -98,13 +99,16 @@ func assertPass10MAndAutoConverge(t *testing.T) {
 			if err := opts.Complete(c, []string{"edge"}); err != nil {
 				t.Fatalf("Complete: %v", err)
 			}
-			args := opts.muxDaemonArgs("openssh:edge", "/tmp/edge.sock", nil)
-			ctrl, err := (&SSHControlFlags{Options: optionArgsFromDaemonArgs(args)}).ToSessionControlOptions()
+			spec, child := buildAppliedDaemonSpecForTest(t, opts, "openssh:edge", "/tmp/edge.sock", nil)
+			if spec.ControlMaster != tc.wantMaster {
+				t.Fatalf("spec.ControlMaster = %v, want %v", spec.ControlMaster, tc.wantMaster)
+			}
+			ctrl, err := (&SSHControlFlags{Options: child.control.Options}).ToSessionControlOptions()
 			if err != nil {
 				t.Fatalf("daemon ToSessionControlOptions: %v", err)
 			}
 			if ctrl.Master == nil || *ctrl.Master != tc.wantMaster {
-				t.Fatalf("daemon resolved Master = %v, want %v (args=%v)", ctrl.Master, tc.wantMaster, args)
+				t.Fatalf("daemon resolved Master = %v, want %v (opts=%v)", ctrl.Master, tc.wantMaster, child.control.Options)
 			}
 		})
 	}
@@ -119,22 +123,16 @@ func assertPass10LeadingIdentityNoneOrder(t *testing.T) {
 	if err := opts.Complete(c, []string{"edge"}); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	args := opts.muxDaemonArgs("openssh:edge", "/tmp/auth.sock", nil)
-	optVals := optionArgsFromDaemonArgs(args)
-	if slices.Contains(optVals, "ControlPath=/tmp/stale.sock") {
-		t.Fatalf("stale ControlPath leaked into daemon args: %v", args)
+	spec, child := buildAppliedDaemonSpecForTest(t, opts, "openssh:edge", "/tmp/auth.sock", nil)
+	if slices.Contains(child.control.Options, "ControlPath=/tmp/stale.sock") {
+		t.Fatalf("stale ControlPath leaked into daemon options: %v", child.control.Options)
 	}
-	joined := strings.Join(args, " ")
-	noneIdx := strings.Index(joined, "-o IdentityFile=none")
-	k2Idx := strings.Index(joined, "-i /tmp/k2")
-	if noneIdx < 0 || k2Idx < 0 || noneIdx > k2Idx {
-		t.Fatalf("expected '-o IdentityFile=none' before '-i /tmp/k2', got %q", joined)
+	wantIDs := []string{"none", "/tmp/k2"}
+	if !slices.Equal(spec.IdentityFiles, wantIDs) {
+		t.Fatalf("spec.IdentityFiles = %v, want %v", spec.IdentityFiles, wantIDs)
 	}
-	if strings.Contains(joined, "-o IdentityFile=/tmp/k2") {
-		t.Fatalf("unexpected duplicate '-o IdentityFile=/tmp/k2' in %q", joined)
-	}
-	if count := strings.Count(joined, "IdentityFile=none"); count != 1 {
-		t.Fatalf("IdentityFile=none count = %d, want 1 in %q", count, joined)
+	if !slices.Equal(child.IdentityFiles, wantIDs) {
+		t.Fatalf("child.IdentityFiles = %v, want %v", child.IdentityFiles, wantIDs)
 	}
 }
 

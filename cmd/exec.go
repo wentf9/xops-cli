@@ -260,10 +260,8 @@ func (o *ExecOptions) Complete(cmd *cobra.Command, args []string) error {
 	if err := ApplyGeneralOptions(&o.SshOptions, o.control.Options, flags); err != nil {
 		return err
 	}
-	if flags != nil && flags.Changed("port") {
-		if portVal, err := flags.GetUint16("port"); err == nil && portVal == 0 {
-			return errors.New(i18n.T("scp_err_port_zero"))
-		}
+	if err := validateExplicitZeroPort(flags); err != nil {
+		return err
 	}
 	if _, err := o.control.ToSessionControlOptions(); err != nil {
 		return err
@@ -332,16 +330,10 @@ func (o *ExecOptions) Validate() error {
 	if err := o.control.Validate(); err != nil {
 		return err
 	}
-	if o.OTP != "" && o.OTPStdin {
-		return errors.New(i18n.T("err_otp_mutually_exclusive"))
+	if err := validateCommonSSHBaseOptions(&o.SshOptions); err != nil {
+		return err
 	}
 	if err := o.prepareCommandPlan(); err != nil {
-		return err
-	}
-	if err := utils.ValidateRememberPolicy(o.Remember); err != nil {
-		return err
-	}
-	if err := validateCLIAlias(o.Alias); err != nil {
 		return err
 	}
 	if o.Command == "" && o.ShellFile == "" {

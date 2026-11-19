@@ -490,7 +490,7 @@ func (o *SshOptions) resolveAndCacheSessionOptions(provider config.ConfigProvide
 		if effErr != nil {
 			return nil, effErr
 		}
-		if isMuxDaemonChild() && eff != nil {
+		if o.isMuxDaemon() && eff != nil {
 			eff.StripClasses(ssh.OptionClassSession)
 			eff.Delete(ssh.OptionForwardAgent)
 		} else if isChild && eff != nil {
@@ -506,7 +506,7 @@ func (o *SshOptions) resolveAndCacheSessionOptions(provider config.ConfigProvide
 	if lookupKey == "" {
 		lookupKey = connTarget.Selector
 	}
-	adpOpts := []adapter.Option{adapter.WithLocalExecution(!isMuxDaemonChild() && !isChild)}
+	adpOpts := []adapter.Option{adapter.WithLocalExecution(!o.isMuxDaemon() && !isChild)}
 	if jump := strings.TrimSpace(o.JumpHost); jump != "" {
 		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(lookupKey, adapter.SessionAuth{ProxyJump: jump}))
 	}
@@ -514,7 +514,7 @@ func (o *SshOptions) resolveAndCacheSessionOptions(provider config.ConfigProvide
 	if err != nil {
 		return nil, err
 	}
-	if isMuxDaemonChild() && eff != nil {
+	if o.isMuxDaemon() && eff != nil {
 		eff.StripClasses(ssh.OptionClassSession, ssh.OptionClassLocalExec)
 		eff.Delete(ssh.OptionForwardAgent)
 	} else if isChild && eff != nil {
@@ -635,7 +635,7 @@ func (o *SshOptions) subsystemAllocatePTY(stdin io.Reader) bool {
 
 // hasNonEmptyRemoteCommand reports whether an effective RemoteCommand (not "none") is configured.
 func (o *SshOptions) hasNonEmptyRemoteCommand() bool {
-	if o == nil || o.NoCmd || o.StdioForward != "" || o.Subsystem || isMuxDaemonChild() {
+	if o == nil || o.NoCmd || o.StdioForward != "" || o.Subsystem || o.isMuxDaemon() {
 		return false
 	}
 	eff, err := o.effectiveSessionOptions()
@@ -649,7 +649,7 @@ func (o *SshOptions) hasNonEmptyRemoteCommand() bool {
 // resolveEffectiveRemoteCommand returns the expanded RemoteCommand option when no explicit CLI command,
 // stdin script, -N, -W, -s, or mux-daemon child mode is active.
 func (o *SshOptions) resolveEffectiveRemoteCommand(target ssh.TargetContext) (string, error) {
-	if o == nil || o.Command != "" || o.stdinScript || o.effectiveNoCmd() || o.StdioForward != "" || o.Subsystem || isMuxDaemonChild() {
+	if o == nil || o.Command != "" || o.stdinScript || o.effectiveNoCmd() || o.StdioForward != "" || o.Subsystem || o.isMuxDaemon() {
 		return "", nil
 	}
 	eff, err := o.effectiveSessionOptions()
@@ -932,7 +932,7 @@ func (o *SshOptions) resolveSessionForwardConfigWithTarget(provider config.Confi
 		out.exitOnForwardFailure = exitVal
 	}
 
-	if out.clearAllForwardings || isMuxDaemonChild() {
+	if out.clearAllForwardings || o.isMuxDaemon() {
 		return out, nil
 	}
 

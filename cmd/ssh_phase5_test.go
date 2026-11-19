@@ -22,8 +22,8 @@ func TestPhase5_TargetSpecificLocalExecOptions(t *testing.T) {
 		"PermitLocalCommand=yes",
 		"permit_local_command=yes",
 	} {
-		if !isTargetSpecificOption(opt) {
-			t.Fatalf("isTargetSpecificOption(%q) = false, want true", opt)
+		if !isTargetOnlyMuxDaemonOption(opt) {
+			t.Fatalf("isTargetOnlyMuxDaemonOption(%q) = false, want true", opt)
 		}
 	}
 }

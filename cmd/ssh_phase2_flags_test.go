@@ -264,9 +264,9 @@ Host mux-target
 		t.Fatalf("expected transport option ConnectTimeout=5 preserved, got %q", eff.Get(ssh.OptionConnectTimeout))
 	}
 
-	forwarded := opts.appendMuxDaemonForwardedOptions(nil, nil)
-	if !slices.Equal(forwarded, []string{"-o", "ConnectTimeout=5"}) {
-		t.Fatalf("appendMuxDaemonForwardedOptions() = %v, want [-o ConnectTimeout=5]", forwarded)
+	spec := opts.buildMuxDaemonSpec(opts.Host, "/tmp/phase2.sock", nil)
+	if !slices.Equal(spec.Options, []string{"ConnectTimeout=5"}) {
+		t.Fatalf("buildMuxDaemonSpec().Options = %v, want [ConnectTimeout=5]", spec.Options)
 	}
 }
 

@@ -115,23 +115,18 @@ func TestPass9_H2_IdentityOptionPersistenceAndLiteralFlag(t *testing.T) {
 }
 
 func TestPass9_H6_MuxDaemonArgsAndDrainAcrossControlMasterNo(t *testing.T) {
-	// 1. H6.2 & H6.3: muxDaemonArgs keeps -i + -o IdentityFile (including none) and -o ProxyCommand=none.
+	// 1. H6.2 & H6.3: buildMuxDaemonSpec keeps ordered IdentityFiles (including none) and ProxyCommand=none.
 	opts := NewSshOptions()
 	opts.Host = "edge"
 	opts.IdentityFiles = []string{"/tmp/k1", "none", "/tmp/k2"}
 	opts.IdentityFile = "/tmp/k1"
 	opts.control.Options = []string{"ProxyCommand=none", "ProxyCommand=nc %h %p", "IdentityFile=/tmp/k2"}
-	args := opts.muxDaemonArgs("openssh:edge", "/tmp/edge.sock", nil)
-	joined := strings.Join(args, " ")
-	for _, want := range []string{
-		"-i /tmp/k1",
-		"-o IdentityFile=none",
-		"-i /tmp/k2",
-		"-o ProxyCommand=none",
-	} {
-		if !strings.Contains(joined, want) {
-			t.Errorf("muxDaemonArgs(nil) missing %q in %q", want, joined)
-		}
+	spec := opts.buildMuxDaemonSpec("openssh:edge", "/tmp/edge.sock", nil)
+	if !slices.Equal(spec.IdentityFiles, []string{"/tmp/k1", "none", "/tmp/k2"}) {
+		t.Errorf("buildMuxDaemonSpec(nil).IdentityFiles = %v, want [/tmp/k1 none /tmp/k2]", spec.IdentityFiles)
+	}
+	if !slices.Contains(spec.Options, "ProxyCommand=none") {
+		t.Errorf("buildMuxDaemonSpec(nil) missing ProxyCommand=none in %v", spec.Options)
 	}
 
 	// Non-nil master (real target handoff) preserves -o ProxyCommand=none as well.
@@ -204,9 +199,9 @@ func TestPass9_H6_MuxDaemonArgsAndDrainAcrossControlMasterNo(t *testing.T) {
 	optsTarget := NewSshOptions()
 	optsTarget.Host = "p9-target"
 	optsTarget.control.Options = []string{"ProxyCommand=none", "ProxyCommand=nc %h %p"}
-	withMasterArgs := strings.Join(optsTarget.muxDaemonArgs("p9-target", targetSock, tMaster), " ")
-	if !strings.Contains(withMasterArgs, "-o ProxyCommand=none") {
-		t.Errorf("muxDaemonArgs(with master) stripped -o ProxyCommand=none: %q", withMasterArgs)
+	withMasterSpec := optsTarget.buildMuxDaemonSpec("p9-target", targetSock, tMaster)
+	if !slices.Contains(withMasterSpec.Options, "ProxyCommand=none") {
+		t.Errorf("buildMuxDaemonSpec(with master) stripped ProxyCommand=none: %v", withMasterSpec.Options)
 	}
 
 	// Stop outer j1Master and confirm drainOwnedMastersWithProvider traverses p9-jump2-nocm to retire tMaster.

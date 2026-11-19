@@ -458,9 +458,9 @@ func verifyPass5M6MasterNodeIDAndDaemonArgs(t *testing.T, ctx context.Context, r
 		t.Fatalf("resolveMasterNodeID(canonicalized web) = %q, want %q", canonNodeID, wantComposite)
 	}
 	daemonOpts := NewSshOptions()
-	canonArgs := strings.Join(daemonOpts.muxDaemonArgs(canonNodeID, canonMaster.ControlPath(), canonMaster), " ")
-	if !strings.Contains(canonArgs, "--host web.corp.example.com") {
-		t.Fatalf("muxDaemonArgs(canonicalized) = %q, expected --host web.corp.example.com", canonArgs)
+	canonSpec := daemonOpts.buildMuxDaemonSpec(canonNodeID, canonMaster.ControlPath(), canonMaster)
+	if canonSpec.TargetHost != "web.corp.example.com" || canonSpec.OpenSSHNamespace {
+		t.Fatalf("buildMuxDaemonSpec(canonicalized) = %+v, expected TargetHost=web.corp.example.com OpenSSHNamespace=false", canonSpec)
 	}
 
 	aliasMaster, err := ssh.StartMuxServer(ctx, rawClient, ssh.MuxMasterOptions{
@@ -482,9 +482,9 @@ func verifyPass5M6MasterNodeIDAndDaemonArgs(t *testing.T, ctx context.Context, r
 	if aliasNodeID != "openssh:app-alias" {
 		t.Fatalf("resolveMasterNodeID(app-alias) = %q, want openssh:app-alias", aliasNodeID)
 	}
-	aliasArgs := strings.Join(daemonOpts.muxDaemonArgs(aliasNodeID, aliasMaster.ControlPath(), aliasMaster), " ")
-	if !strings.Contains(aliasArgs, "--host app-alias") {
-		t.Fatalf("muxDaemonArgs(app-alias) = %q, expected --host app-alias", aliasArgs)
+	aliasSpec := daemonOpts.buildMuxDaemonSpec(aliasNodeID, aliasMaster.ControlPath(), aliasMaster)
+	if aliasSpec.TargetHost != "app-alias" || !aliasSpec.OpenSSHNamespace {
+		t.Fatalf("buildMuxDaemonSpec(app-alias) = %+v, expected TargetHost=app-alias OpenSSHNamespace=true", aliasSpec)
 	}
 }
 
@@ -494,16 +494,19 @@ func verifyPass5M6DaemonOriginalHostEnvRestore(t *testing.T, ctx context.Context
 
 	t.Setenv(sshMuxDaemonEnv, "true")
 	t.Setenv(sshBackgroundChildEnv, "true")
-	t.Setenv(sshMuxOriginalHostEnv, "web")
 
 	childOpts := NewSshOptions()
-	childCmd := newCmdSshWithOptions(childOpts)
-	rawDaemonCLI := []string{"-N", "--host", "web.corp.example.com", "-S", filepath.Join(tmpDir, "d.sock"), "-p", strconv.Itoa(port), "-l", "ops", "--remember", "never", "-o", "ControlMaster=yes"}
-	if err := childCmd.ParseFlags(rawDaemonCLI); err != nil {
-		t.Fatalf("ParseFlags(child): %v", err)
+	spec := MuxDaemonSpec{
+		Version:       muxDaemonSpecVersion,
+		TargetHost:    "web.corp.example.com",
+		OriginalHost:  "web",
+		Port:          uint16(port),
+		User:          "ops",
+		ControlPath:   filepath.Join(tmpDir, "d.sock"),
+		ControlMaster: ssh.ControlMasterYes,
 	}
-	if err := childOpts.Complete(childCmd, childCmd.Flags().Args()); err != nil {
-		t.Fatalf("Complete(child): %v", err)
+	if err := childOpts.applyMuxDaemonSpec(roundTripMuxDaemonSpecThroughPipe(t, spec)); err != nil {
+		t.Fatalf("applyMuxDaemonSpec(child): %v", err)
 	}
 	if err := childOpts.Validate(); err != nil {
 		t.Fatalf("Validate(child): %v", err)
@@ -531,9 +534,6 @@ func verifyPass5M6DaemonOriginalHostEnvRestore(t *testing.T, ctx context.Context
 		t.Fatalf("Unsetenv: %v", err)
 	}
 	if err := os.Unsetenv(sshBackgroundChildEnv); err != nil {
-		t.Fatalf("Unsetenv: %v", err)
-	}
-	if err := os.Unsetenv(sshMuxOriginalHostEnv); err != nil {
 		t.Fatalf("Unsetenv: %v", err)
 	}
 

@@ -3,8 +3,8 @@ package cmd
 import (
 	"context"
 	"net"
-	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -103,28 +103,16 @@ func parsePass6MuxDaemonChild(
 	t *testing.T,
 	ctx context.Context,
 	repo *config.Repository,
-	daemonArgs []string,
-	origHost string,
+	spec MuxDaemonSpec,
 ) (string, *ssh.ClientConfig, *ssh.Options) {
 	t.Helper()
-	if len(daemonArgs) == 0 || daemonArgs[0] != "ssh" {
-		t.Fatalf("expected daemonArgs to start with 'ssh', got %v", daemonArgs)
-	}
+	decoded := roundTripMuxDaemonSpecThroughPipe(t, spec)
 	t.Setenv(sshMuxDaemonEnv, "true")
 	t.Setenv(sshBackgroundChildEnv, "true")
-	if origHost != "" {
-		t.Setenv(sshMuxOriginalHostEnv, origHost)
-	} else {
-		_ = os.Unsetenv(sshMuxOriginalHostEnv)
-	}
 
 	childOpts := NewSshOptions()
-	childCmd := newCmdSshWithOptions(childOpts)
-	if err := childCmd.ParseFlags(daemonArgs[1:]); err != nil {
-		t.Fatalf("ParseFlags(child %v): %v", daemonArgs[1:], err)
-	}
-	if err := childOpts.Complete(childCmd, childCmd.Flags().Args()); err != nil {
-		t.Fatalf("Complete(child): %v", err)
+	if err := childOpts.applyMuxDaemonSpec(decoded); err != nil {
+		t.Fatalf("applyMuxDaemonSpec(child %+v): %v", decoded, err)
 	}
 	if err := childOpts.Validate(); err != nil {
 		t.Fatalf("Validate(child): %v", err)
@@ -216,20 +204,20 @@ func verifyPass6M5AliasHostNameOverride(
 	parentOpts.targetNodeIDs = []string{"openssh:app-alias"}
 	parentOpts.control.Options = []string{"HostName=%h.ignored.internal", "ServerAliveInterval=15"}
 
-	args := parentOpts.muxDaemonArgs("openssh:app-alias", sockPath, master)
-	joined := strings.Join(args, " ")
-	if strings.Contains(joined, "ignored.internal") {
-		t.Fatalf("expected raw CLI HostName option to be replaced by resolved dial host, got %q", joined)
+	spec := parentOpts.buildMuxDaemonSpec("openssh:app-alias", sockPath, master)
+	joinedOpts := strings.Join(spec.Options, " ")
+	if strings.Contains(joinedOpts, "ignored.internal") {
+		t.Fatalf("expected raw CLI HostName option to be stripped in favor of DialHost, got %q", joinedOpts)
 	}
-	if !strings.Contains(joined, "--host app-alias") || !strings.Contains(joined, "-o HostName=10.0.0.99") {
-		t.Fatalf("expected --host app-alias and -o HostName=10.0.0.99, got %q", joined)
+	if spec.TargetHost != "app-alias" || !spec.OpenSSHNamespace || spec.DialHost != "10.0.0.99" {
+		t.Fatalf("expected TargetHost=app-alias, OpenSSHNamespace=true, DialHost=10.0.0.99, got %+v", spec)
 	}
-	if !strings.Contains(joined, "-o ServerAliveInterval=15") {
-		t.Fatalf("expected connection-wide ServerAliveInterval=15 to survive, got %q", joined)
+	if !slices.Contains(spec.Options, "ServerAliveInterval=15") {
+		t.Fatalf("expected connection-wide ServerAliveInterval=15 to survive, got %v", spec.Options)
 	}
 
 	childRepo := buildPass6Repo(t, sshCfg)
-	_, childCfg, effOpts := parsePass6MuxDaemonChild(t, ctx, childRepo, args, "app-alias")
+	_, childCfg, effOpts := parsePass6MuxDaemonChild(t, ctx, childRepo, spec)
 	if childCfg.Address != "10.0.0.99" || childCfg.Port != 2222 || childCfg.OriginalHost != "app-alias" {
 		t.Fatalf("childCfg = (Address=%q, Port=%d, OriginalHost=%q), want (10.0.0.99, 2222, app-alias)",
 			childCfg.Address, childCfg.Port, childCfg.OriginalHost)
@@ -253,7 +241,6 @@ func verifyPass6M5IPv6ZoneEscaping(
 		nodeID       string
 		origHost     string
 		masterHost   string
-		wantEscaped  string
 		wantDialAddr string
 	}{
 		{
@@ -261,7 +248,6 @@ func verifyPass6M5IPv6ZoneEscaping(
 			nodeID:       "openssh:app-alias",
 			origHost:     "app-alias",
 			masterHost:   "fe80::1%eth0",
-			wantEscaped:  "HostName=fe80::1%%eth0",
 			wantDialAddr: "fe80::1%eth0",
 		},
 		{
@@ -269,7 +255,6 @@ func verifyPass6M5IPv6ZoneEscaping(
 			nodeID:       "web-01",
 			origHost:     "",
 			masterHost:   "[fe80::1%h0]",
-			wantEscaped:  "HostName=fe80::1%%h0",
 			wantDialAddr: "fe80::1%h0",
 		},
 	}
@@ -293,14 +278,13 @@ func verifyPass6M5IPv6ZoneEscaping(
 
 		parentOpts := NewSshOptions()
 		parentOpts.targetNodeIDs = []string{tc.nodeID}
-		args := parentOpts.muxDaemonArgs(tc.nodeID, sockPath, master)
-		joined := strings.Join(args, " ")
-		if !strings.Contains(joined, "-o "+tc.wantEscaped) {
-			t.Fatalf("%s: expected -o %s in muxDaemonArgs, got %q", tc.name, tc.wantEscaped, joined)
+		spec := parentOpts.buildMuxDaemonSpec(tc.nodeID, sockPath, master)
+		if spec.DialHost != tc.wantDialAddr {
+			t.Fatalf("%s: spec.DialHost = %q, want verbatim %q", tc.name, spec.DialHost, tc.wantDialAddr)
 		}
 
 		childRepo := buildPass6Repo(t, sshCfg)
-		_, childCfg, _ := parsePass6MuxDaemonChild(t, ctx, childRepo, args, tc.origHost)
+		_, childCfg, _ := parsePass6MuxDaemonChild(t, ctx, childRepo, spec)
 		if childCfg.Address != tc.wantDialAddr {
 			t.Fatalf("%s: childCfg.Address = %q, want %q", tc.name, childCfg.Address, tc.wantDialAddr)
 		}
@@ -331,9 +315,9 @@ func verifyPass6M5NoRedundantAndJumpIsolation(
 	defer func() { _ = directMaster.Shutdown() }()
 
 	directOpts := NewSshOptions()
-	directArgs := strings.Join(directOpts.muxDaemonArgs("[2001:db8::1]", directSock, directMaster), " ")
-	if strings.Contains(directArgs, "HostName=") {
-		t.Fatalf("expected no redundant HostName= when dialHost equals cleanMuxHost(targetHost), got %q", directArgs)
+	directSpec := directOpts.buildMuxDaemonSpec("[2001:db8::1]", directSock, directMaster)
+	if directSpec.DialHost != "" {
+		t.Fatalf("expected no redundant DialHost when dialHost equals cleanMuxHost(targetHost), got %+v", directSpec)
 	}
 
 	jumpSameSock := filepath.Join(tmpDir, "jsame.sock")
@@ -374,13 +358,13 @@ func verifyPass6M5NoRedundantAndJumpIsolation(
 	targetOpts.targetNodeIDs = []string{"openssh:app"}
 	targetOpts.control.Options = []string{"HostName=10.0.0.99"}
 
-	sameJoined := strings.Join(targetOpts.muxDaemonArgs("openssh:bastion.internal", jumpSameSock, jumpSameMaster), " ")
-	if strings.Contains(sameJoined, "HostName=") {
-		t.Fatalf("expected target HostName override not to leak onto jumpSameMaster, got %q", sameJoined)
+	sameSpec := targetOpts.buildMuxDaemonSpec("openssh:bastion.internal", jumpSameSock, jumpSameMaster)
+	if sameSpec.DialHost != "" || strings.Contains(strings.Join(sameSpec.Options, " "), "HostName=") {
+		t.Fatalf("expected target HostName override not to leak onto jumpSameMaster, got %+v", sameSpec)
 	}
-	aliasJoined := strings.Join(targetOpts.muxDaemonArgs("openssh:bastion-alias", jumpAliasSock, jumpAliasMaster), " ")
-	if strings.Contains(aliasJoined, "10.0.0.99") || !strings.Contains(aliasJoined, "-o HostName=10.0.0.1") {
-		t.Fatalf("expected jumpAliasMaster to emit its own -o HostName=10.0.0.1 without target leak, got %q", aliasJoined)
+	aliasSpec := targetOpts.buildMuxDaemonSpec("openssh:bastion-alias", jumpAliasSock, jumpAliasMaster)
+	if strings.Contains(strings.Join(aliasSpec.Options, " "), "10.0.0.99") || aliasSpec.DialHost != "10.0.0.1" {
+		t.Fatalf("expected jumpAliasMaster to set DialHost=10.0.0.1 without target leak, got %+v", aliasSpec)
 	}
 }
 
@@ -477,14 +461,13 @@ func verifyPass6M6CanonicalizedConnectorMaster(
 
 	opts := NewSshOptions()
 	opts.targetNodeIDs = []string{canonNodeID}
-	daemonArgs := opts.muxDaemonArgs(canonNodeID, sockPath, m)
-	joined := strings.Join(daemonArgs, " ")
-	if !strings.Contains(joined, "--host web.corp.example.com") || !strings.Contains(joined, "-o HostName="+fixHost) {
-		t.Fatalf("expected canonicalized --host web.corp.example.com and -o HostName=%s, got %q", fixHost, joined)
+	spec := opts.buildMuxDaemonSpec(canonNodeID, sockPath, m)
+	if spec.TargetHost != "web.corp.example.com" || !spec.OpenSSHNamespace || spec.DialHost != fixHost || spec.OriginalHost != "web" {
+		t.Fatalf("expected canonicalized TargetHost=web.corp.example.com, OpenSSHNamespace=true, DialHost=%s, OriginalHost=web, got %+v", fixHost, spec)
 	}
 
 	childRepo := buildPass6Repo(t, sshCfg)
-	_, childCfg, effOpts := parsePass6MuxDaemonChild(t, ctx, childRepo, daemonArgs, "web")
+	_, childCfg, effOpts := parsePass6MuxDaemonChild(t, ctx, childRepo, spec)
 	if childCfg.Address != fixHost || childCfg.Port != fixPort || childCfg.OriginalHost != "web" {
 		t.Fatalf("childCfg = (Address=%q, Port=%d, OriginalHost=%q), want (%s, %d, web)",
 			childCfg.Address, childCfg.Port, childCfg.OriginalHost, fixHost, fixPort)
@@ -681,20 +664,34 @@ func verifyPass6M6PendingAliasResolution(
 
 	// Verify targetNodeIDs tracking + daemon child re-resolution in a fresh OS-like Repository
 	// where r.pending is empty.
+	verifyPass6M6FreshChildRecovery(t, ctx, sshCfg, fixHost, fixPort, res1.NodeID, sock1, m1, resolveOwnedMasterNodeID(repo, connector, m1))
+	verifyPass6M6PendingRewrittenHostNameFallback(t, ctx, tmpDir, fixHost, fixPort)
+}
+
+func verifyPass6M6FreshChildRecovery(
+	t *testing.T,
+	ctx context.Context,
+	sshCfg string,
+	fixHost string,
+	fixPort int,
+	resNodeID string,
+	sock1 string,
+	m1 *ssh.MuxServer,
+	handoffID string,
+) {
+	t.Helper()
 	opts := NewSshOptions()
 	opts.IdentityFile = "/tmp/cli-target-key"
-	opts.targetNodeIDs = []string{res1.NodeID}
-	handoffID := resolveOwnedMasterNodeID(repo, connector, m1)
-	opts.recordTargetHandoffNodeID(res1.NodeID, handoffID)
+	opts.targetNodeIDs = []string{resNodeID}
+	opts.recordTargetHandoffNodeID(resNodeID, handoffID)
 
-	daemonArgs := opts.muxDaemonArgs(handoffID, sock1, m1)
-	joined := strings.Join(daemonArgs, " ")
-	if !strings.Contains(joined, "--host app-alias") || !strings.Contains(joined, "-i /tmp/cli-target-key") || !strings.Contains(joined, "-o HostName="+fixHost) {
-		t.Fatalf("expected --host app-alias, -i /tmp/cli-target-key, and -o HostName=%s, got %q", fixHost, joined)
+	spec := opts.buildMuxDaemonSpec(handoffID, sock1, m1)
+	if spec.TargetHost != "app-alias" || !spec.OpenSSHNamespace || !slices.Equal(spec.IdentityFiles, []string{"/tmp/cli-target-key"}) || spec.DialHost != fixHost {
+		t.Fatalf("expected TargetHost=app-alias, OpenSSHNamespace=true, IdentityFiles=[/tmp/cli-target-key], DialHost=%s, got %+v", fixHost, spec)
 	}
 
 	freshChildRepo := buildPass6Repo(t, sshCfg)
-	_, childCfg, effOpts := parsePass6MuxDaemonChild(t, ctx, freshChildRepo, daemonArgs, "app-alias")
+	_, childCfg, effOpts := parsePass6MuxDaemonChild(t, ctx, freshChildRepo, spec)
 	if childCfg.Address != fixHost || childCfg.Port != fixPort || childCfg.User != "fixture" {
 		t.Fatalf("fresh childCfg = (Address=%q, Port=%d, User=%q), want (%s, %d, fixture)",
 			childCfg.Address, childCfg.Port, childCfg.User, fixHost, fixPort)
@@ -702,7 +699,6 @@ func verifyPass6M6PendingAliasResolution(
 	if effOpts == nil || effOpts.ServerAliveCountMax() != 9 {
 		t.Fatalf("expected fresh daemon child to recover ServerAliveCountMax=9, got %v", effOpts)
 	}
-	verifyPass6M6PendingRewrittenHostNameFallback(t, ctx, tmpDir, fixHost, fixPort)
 }
 
 func verifyPass6M6PendingRewrittenHostNameFallback(

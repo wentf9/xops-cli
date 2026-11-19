@@ -143,7 +143,7 @@ func TestPortForward_StringArrayFlagPreservesCommas(t *testing.T) {
 	}
 }
 
-// 3. muxDaemonArgs preserves GatewayPorts, StreamLocalBindUnlink, StreamLocalBindMask
+// 3. buildMuxDaemonSpec + applyMuxDaemonSpec preserves GatewayPorts, StreamLocalBindUnlink, StreamLocalBindMask
 func TestPortForward_MuxDaemonArgsPreservation(t *testing.T) {
 	opts := NewSshOptions()
 	opts.GatewayPorts = true
@@ -163,17 +163,31 @@ func TestPortForward_MuxDaemonArgsPreservation(t *testing.T) {
 	}
 	opts.targetNodeIDs = []string{"node1"}
 
-	args := opts.muxDaemonArgs("node1", "/tmp/sock", nil)
-	joined := strings.Join(args, " ")
+	spec := opts.buildMuxDaemonSpec("node1", "/tmp/sock", nil)
+	child := NewSshOptions()
+	if err := child.applyMuxDaemonSpec(spec); err != nil {
+		t.Fatalf("applyMuxDaemonSpec: %v", err)
+	}
+	if !child.GatewayPorts {
+		t.Fatal("expected daemon child GatewayPorts == true")
+	}
+	joined := strings.Join(child.control.Options, " ")
 
 	// Preserved
-	for _, preserved := range []string{"GatewayPorts=yes", "StreamLocalBindUnlink=yes", "StreamLocalBindMask=0177"} {
+	for _, preserved := range []string{"StreamLocalBindUnlink=yes", "StreamLocalBindMask=0177"} {
 		if !strings.Contains(joined, preserved) {
-			t.Fatalf("expected muxDaemonArgs to contain %q, got: %s", preserved, joined)
+			t.Fatalf("expected daemon spec options to contain %q, got: %s", preserved, joined)
 		}
 	}
+	sessionOpts, err := child.toSessionControlOptions()
+	if err != nil {
+		t.Fatalf("toSessionControlOptions: %v", err)
+	}
+	if gw, ok := sessionOpts.Options.GatewayPorts(); !ok || !gw {
+		t.Fatalf("expected GatewayPorts=true on applied daemon options, got %v (ok=%v)", gw, ok)
+	}
 	if !strings.Contains(joined, "ClearAllForwardings=yes") {
-		t.Fatalf("expected muxDaemonArgs to contain ClearAllForwardings=yes, got: %s", joined)
+		t.Fatalf("expected daemon options to contain ClearAllForwardings=yes, got: %s", joined)
 	}
 
 	// Stripped
@@ -189,7 +203,7 @@ func TestPortForward_MuxDaemonArgsPreservation(t *testing.T) {
 		"SessionType",
 	} {
 		if strings.Contains(joined, stripped) {
-			t.Fatalf("muxDaemonArgs must NOT contain stripped option %q, got: %s", stripped, joined)
+			t.Fatalf("daemon options must NOT contain stripped option %q, got: %s", stripped, joined)
 		}
 	}
 

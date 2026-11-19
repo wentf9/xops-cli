@@ -153,8 +153,9 @@ func TestSftpExecScpValidateControlAndExtraArgs(t *testing.T) {
 }
 
 // TestMuxDaemonArgsBuildsSSHCommandForNonSSHInvocations verifies that when a
-// persistent master is started by scp/sftp/exec, muxDaemonArgs constructs an
-// `ssh -N` command line rather than re-running the transfer/batch subcommand.
+// persistent master is started by scp/sftp/exec, buildMuxDaemonSpec +
+// applyMuxDaemonSpec restores a detached `ssh -N` session configuration rather
+// than re-running the transfer/batch subcommand.
 func TestMuxDaemonArgsBuildsSSHCommandForNonSSHInvocations(t *testing.T) {
 	opts := NewSshOptions()
 	opts.Port = 2222
@@ -164,20 +165,18 @@ func TestMuxDaemonArgsBuildsSSHCommandForNonSSHInvocations(t *testing.T) {
 	opts.Remember = "never"
 	opts.control.Options = []string{"ControlPersist=10m"}
 
-	args := opts.muxDaemonArgs("web-01", "/tmp/cm.sock", nil)
-	joined := strings.Join(args, " ")
-	for _, want := range []string{
-		"ssh -N --host web-01 -S /tmp/cm.sock",
-		"-p 2222",
-		"-l deploy",
-		"-i /tmp/id_ed25519",
-		"-J bastion",
-		"--remember never",
-		"-o ControlPersist=10m",
-	} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("muxDaemonArgs = %q, missing %q", joined, want)
-		}
+	spec := opts.buildMuxDaemonSpec("web-01", "/tmp/cm.sock", nil)
+	if spec.TargetHost != "web-01" || spec.ControlPath != "/tmp/cm.sock" || spec.Port != 2222 || spec.User != "deploy" ||
+		spec.JumpHost != "bastion" || spec.ControlPersist != "10m" || spec.ControlMaster != ssh.ControlMasterYes ||
+		!slices.Equal(spec.IdentityFiles, []string{"/tmp/id_ed25519"}) {
+		t.Fatalf("buildMuxDaemonSpec = %+v, unexpected fields", spec)
+	}
+	child := NewSshOptions()
+	if err := child.applyMuxDaemonSpec(spec); err != nil {
+		t.Fatalf("applyMuxDaemonSpec: %v", err)
+	}
+	if !child.NoCmd || child.Remember != "never" || !slices.Contains(child.control.Options, "ControlPersist=10m") {
+		t.Fatalf("child after applyMuxDaemonSpec = (NoCmd=%v, Remember=%q, Options=%v)", child.NoCmd, child.Remember, child.control.Options)
 	}
 }
 
@@ -644,9 +643,9 @@ func TestHandoffSkipsImplicitTier4Control(t *testing.T) {
 }
 
 // TestMuxDaemonArgsAndTargetResolutionForVirtualAndPendingNodes verifies R2-1:
-// muxDaemonArgs strips "openssh:" and falls back to master.Target() for port/user,
-// and PrepareNodeContext resolves "openssh:<ip>" and unconfirmed "user@ip:port"
-// selectors without wrapping them as IPv6 literals.
+// buildMuxDaemonSpec preserves OpenSSH namespace separately from TargetHost and falls back
+// to master.Target() for port/user, and PrepareNodeContext resolves "openssh:<ip>" and
+// unconfirmed "user@ip:port" selectors without wrapping them as IPv6 literals.
 func TestMuxDaemonArgsAndTargetResolutionForVirtualAndPendingNodes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -692,14 +691,12 @@ func TestMuxDaemonArgsAndTargetResolutionForVirtualAndPendingNodes(t *testing.T)
 
 	// Simulate scp/exec where o.Port == 0 and o.User == "" on SshOptions.
 	opts := NewSshOptions()
-	args := opts.muxDaemonArgs("openssh:"+host, sockPath, master)
-	joined := strings.Join(args, " ")
-	wantPrefix := "ssh -N --host " + host + " -S " + sockPath
-	if !strings.Contains(joined, wantPrefix) {
-		t.Fatalf("muxDaemonArgs = %q, expected %q (with openssh: stripped)", joined, wantPrefix)
+	spec := opts.buildMuxDaemonSpec("openssh:"+host, sockPath, master)
+	if spec.TargetHost != host || !spec.OpenSSHNamespace || spec.ControlPath != sockPath {
+		t.Fatalf("buildMuxDaemonSpec = %+v, expected TargetHost=%q OpenSSHNamespace=true ControlPath=%q", spec, host, sockPath)
 	}
-	if !strings.Contains(joined, "-p "+strconv.Itoa(port)) || !strings.Contains(joined, "-l fixture") {
-		t.Fatalf("muxDaemonArgs = %q, expected fallback -p %d and -l fixture from master.Target()", joined, port)
+	if spec.Port != uint16(port) || spec.User != "fixture" {
+		t.Fatalf("buildMuxDaemonSpec = %+v, expected fallback port=%d user=fixture from master.Target()", spec, port)
 	}
 
 	// Verify PrepareNodeContext resolves unconfirmed "user@host:port" and "openssh:host"
@@ -739,8 +736,8 @@ func TestMuxDaemonArgsAndTargetResolutionForVirtualAndPendingNodes(t *testing.T)
 }
 
 // TestMuxDaemonArgsIsolationAndRememberSuppression verifies R3-1:
-//   - muxDaemonArgs always appends "--remember never".
-//   - When master != nil, muxDaemonArgs prefers master.Target().Port, User, and
+//   - Detached mux daemon spec application enforces Remember="never".
+//   - When master != nil, buildMuxDaemonSpec prefers master.Target().Port, User, and
 //     JumpHost over SshOptions fields and drops target-specific -o options
 //     (Port, User, ProxyJump) so jump-master or multi-host handoffs never inherit
 //     the foreground target's flags.
@@ -807,38 +804,39 @@ func TestMuxDaemonArgsIsolationAndRememberSuppression(t *testing.T) {
 		"UserKnownHostsFile=/tmp/target_kh",
 	}
 
-	args := opts.muxDaemonArgs("bastion", sockPath, jumpMaster)
-	joined := strings.Join(args, " ")
-	if !strings.Contains(joined, "--remember never") {
-		t.Fatalf("expected --remember never in muxDaemonArgs, got %q", joined)
+	spec := opts.buildMuxDaemonSpec("bastion", sockPath, jumpMaster)
+	child := NewSshOptions()
+	if err := child.applyMuxDaemonSpec(spec); err != nil {
+		t.Fatalf("applyMuxDaemonSpec: %v", err)
 	}
-	if !strings.Contains(joined, "-p "+strconv.Itoa(port)) || !strings.Contains(joined, "-l jumpuser") {
-		t.Fatalf("expected jumpMaster's port %d and user jumpuser, got %q", port, joined)
+	if child.Remember != "never" {
+		t.Fatalf("expected Remember=never on daemon child, got %q", child.Remember)
 	}
+	if spec.Port != uint16(port) || spec.User != "jumpuser" || spec.JumpHost != "" || len(spec.IdentityFiles) > 0 {
+		t.Fatalf("expected jumpMaster's port %d, user jumpuser, empty jump/keys; got %+v", port, spec)
+	}
+	joinedOpts := strings.Join(child.control.Options, " ")
 	for _, forbidden := range []string{
-		"-J ",
 		"ProxyJump=",
 		"2222",
 		"targetuser",
 		"target-only-id",
-		"-i ",
 		"PubkeyAuthentication=no",
 		"ControlMaster=auto",
 	} {
-		if strings.Contains(joined, forbidden) {
-			t.Fatalf("expected target-scoped option %q to be stripped for jumpMaster, got %q", forbidden, joined)
+		if strings.Contains(joinedOpts, forbidden) {
+			t.Fatalf("expected target-scoped option %q to be stripped for jumpMaster, got %q", forbidden, joinedOpts)
 		}
 	}
-	for _, wantConnWide := range []string{
-		"-o StrictHostKeyChecking=no",
-		"-o UserKnownHostsFile=/tmp/target_kh",
+	for _, wantOpt := range []string{
+		"StrictHostKeyChecking=no",
+		"UserKnownHostsFile=/tmp/target_kh",
+		"ControlPersist=5m",
+		"ControlMaster=yes",
 	} {
-		if !strings.Contains(joined, wantConnWide) {
-			t.Fatalf("expected connection-wide option %q on jumpMaster, got %q", wantConnWide, joined)
+		if !slices.Contains(child.control.Options, wantOpt) {
+			t.Fatalf("expected %q on jumpMaster options, got %v", wantOpt, child.control.Options)
 		}
-	}
-	if !strings.Contains(joined, "-o ControlPersist=5m") || !strings.Contains(joined, "-o ControlMaster=yes") {
-		t.Fatalf("expected jumpMaster's own ControlPersist=5m and ControlMaster=yes, got %q", joined)
 	}
 
 	// Verify resolveNode in mux daemon child mode never persists an unconfirmed target.
@@ -1771,18 +1769,18 @@ func TestAdHocOverrideWithWildcardOpenSSHAndSameIPJumpIdentityIsolation(t *testi
 	sameIPOpts.IdentityFile = "/tmp/target-key"
 	sameIPOpts.targetNodeIDs = []string{"root@" + host + ":" + strconv.Itoa(port)}
 
-	jumpArgs := strings.Join(sameIPOpts.muxDaemonArgs(jumpMaster.Target().OriginalHost, jumpMaster.ControlPath(), jumpMaster), " ")
-	if strings.Contains(jumpArgs, "-i ") || strings.Contains(jumpArgs, "target-key") {
-		t.Fatalf("expected jumpMaster on same IP different port to strip -i, got %q", jumpArgs)
+	jumpSpec := sameIPOpts.buildMuxDaemonSpec(jumpMaster.Target().OriginalHost, jumpMaster.ControlPath(), jumpMaster)
+	if len(jumpSpec.IdentityFiles) > 0 {
+		t.Fatalf("expected jumpMaster on same IP different port to strip IdentityFiles, got %v", jumpSpec.IdentityFiles)
 	}
-	targetArgs := strings.Join(sameIPOpts.muxDaemonArgs(targetMaster.Target().OriginalHost, targetMaster.ControlPath(), targetMaster), " ")
-	if !strings.Contains(targetArgs, "-i /tmp/target-key") {
-		t.Fatalf("expected targetMaster on same IP to keep -i /tmp/target-key, got %q", targetArgs)
+	targetSpec := sameIPOpts.buildMuxDaemonSpec(targetMaster.Target().OriginalHost, targetMaster.ControlPath(), targetMaster)
+	if !slices.Equal(targetSpec.IdentityFiles, []string{"/tmp/target-key"}) {
+		t.Fatalf("expected targetMaster on same IP to keep /tmp/target-key, got %v", targetSpec.IdentityFiles)
 	}
 }
 
 // TestMuxDaemonKeyPathAndScpIsolationAndHostFlagAndLookupOpenSSHAlias verifies R9-1 through R9-4:
-//   - R9-1: muxDaemonArgs forwards master.Target().KeyPath when o.IdentityFile is empty or when
+//   - R9-1: buildMuxDaemonSpec forwards master.Target().KeyPath when o.IdentityFile is empty or when
 //     a jump master has its own configured KeyPath distinct from the target's CLI -i.
 //   - R9-2: ScpOptions.resolvedTargetNodeIDs excludes the un-overridden base node when user/port
 //     is overridden (preventing ProxyJump self-loops) and ignores colons in o.Source/o.Dest when
@@ -1795,7 +1793,7 @@ func TestMuxDaemonKeyPathAndScpIsolationAndHostFlagAndLookupOpenSSHAlias(t *test
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	// 1. Verify R9-1: master.Target().KeyPath is passed to muxDaemonArgs.
+	// 1. Verify R9-1: master.Target().KeyPath is forwarded in MuxDaemonSpec.
 	fix, err := sshfixture.New(ctx)
 	if err != nil {
 		t.Fatalf("sshfixture.New failed: %v", err)
@@ -1831,11 +1829,11 @@ func TestMuxDaemonKeyPathAndScpIsolationAndHostFlagAndLookupOpenSSHAlias(t *test
 	}
 	defer func() { _ = derivedMaster.Shutdown() }()
 
-	// Even when o.IdentityFile is empty, muxDaemonArgs passes -i master.Target().KeyPath.
+	// Even when o.IdentityFile is empty, buildMuxDaemonSpec passes master.Target().KeyPath.
 	noFlagOpts := NewSshOptions()
-	derivedArgs := strings.Join(noFlagOpts.muxDaemonArgs(derivedMaster.Target().OriginalHost, derivedMaster.ControlPath(), derivedMaster), " ")
-	if !strings.Contains(derivedArgs, "-i /tmp/ssh-config-derived-key") {
-		t.Fatalf("expected muxDaemonArgs to include -i /tmp/ssh-config-derived-key from master.Target().KeyPath, got %q", derivedArgs)
+	derivedSpec := noFlagOpts.buildMuxDaemonSpec(derivedMaster.Target().OriginalHost, derivedMaster.ControlPath(), derivedMaster)
+	if !slices.Equal(derivedSpec.IdentityFiles, []string{"/tmp/ssh-config-derived-key"}) {
+		t.Fatalf("expected buildMuxDaemonSpec to include /tmp/ssh-config-derived-key from master.Target().KeyPath, got %v", derivedSpec.IdentityFiles)
 	}
 
 	// Jump master with its own KeyPath keeps its own KeyPath instead of inheriting target's CLI -i.
@@ -1858,17 +1856,18 @@ func TestMuxDaemonKeyPathAndScpIsolationAndHostFlagAndLookupOpenSSHAlias(t *test
 	withTargetFlagOpts := NewSshOptions()
 	withTargetFlagOpts.IdentityFile = "/tmp/target-cli-key"
 	withTargetFlagOpts.targetNodeIDs = []string{"ops@" + host + ":" + strconv.Itoa(port)}
-	jumpWithKeyArgs := strings.Join(withTargetFlagOpts.muxDaemonArgs(jumpWithKey.Target().OriginalHost, jumpWithKey.ControlPath(), jumpWithKey), " ")
-	if !strings.Contains(jumpWithKeyArgs, "-i /tmp/jump-own-key") || strings.Contains(jumpWithKeyArgs, "target-cli-key") {
-		t.Fatalf("expected jumpWithKey muxDaemonArgs to use -i /tmp/jump-own-key and strip target-cli-key, got %q", jumpWithKeyArgs)
+	jumpWithKeySpec := withTargetFlagOpts.buildMuxDaemonSpec(jumpWithKey.Target().OriginalHost, jumpWithKey.ControlPath(), jumpWithKey)
+	if !slices.Equal(jumpWithKeySpec.IdentityFiles, []string{"/tmp/jump-own-key"}) || strings.Contains(strings.Join(jumpWithKeySpec.Options, " "), "target-cli-key") {
+		t.Fatalf("expected jumpWithKey spec to use /tmp/jump-own-key and strip target-cli-key, got %+v", jumpWithKeySpec)
 	}
 
-	// R10-4: when jump master's own configured KeyPath equals target's CLI -i, jump master keeps -i.
+	// R10-4: when jump master's own configured KeyPath equals target's CLI -i, jump master keeps KeyPath.
 	withSharedKeyOpts := NewSshOptions()
 	withSharedKeyOpts.IdentityFile = "/tmp/jump-own-key"
 	withSharedKeyOpts.targetNodeIDs = []string{"ops@" + host + ":" + strconv.Itoa(port)}
-	if gotKey := withSharedKeyOpts.resolveMuxDaemonIdentityFile(jumpWithKey.Target().OriginalHost, jumpWithKey); gotKey != "/tmp/jump-own-key" {
-		t.Fatalf("expected jump master to keep its configured KeyPath when equal to target -i, got %q", gotKey)
+	sharedKeySpec := withSharedKeyOpts.buildMuxDaemonSpec(jumpWithKey.Target().OriginalHost, jumpWithKey.ControlPath(), jumpWithKey)
+	if !slices.Equal(sharedKeySpec.IdentityFiles, []string{"/tmp/jump-own-key"}) {
+		t.Fatalf("expected jump master to keep its configured KeyPath when equal to target -i, got %v", sharedKeySpec.IdentityFiles)
 	}
 
 	// 2. Verify R9-2, R9-3, and R9-4.
@@ -2814,9 +2813,16 @@ func TestControlMasterAsk_HandoffAskpassAndControlPathReuse(t *testing.T) {
 	if !canHandoffMaster(liveAskMaster) {
 		t.Fatal("expected canHandoffMaster(liveAskMaster) == true for ControlMaster=ask with ControlPersist=10m")
 	}
-	daemonArgs := sshOpts.muxDaemonArgs("ask-node", sockPath, liveAskMaster)
-	if !containsOptionArg(daemonArgs, "ControlMaster=ask") {
-		t.Fatalf("expected muxDaemonArgs to include '-o ControlMaster=ask', got %v", daemonArgs)
+	spec := sshOpts.buildMuxDaemonSpec("ask-node", sockPath, liveAskMaster)
+	if spec.ControlMaster != ssh.ControlMasterAsk {
+		t.Fatalf("expected ControlMaster=ask in mux daemon spec, got %+v", spec)
+	}
+	childAsk := NewSshOptions()
+	if err := childAsk.applyMuxDaemonSpec(spec); err != nil {
+		t.Fatalf("applyMuxDaemonSpec: %v", err)
+	}
+	if !slices.Contains(childAsk.control.Options, "ControlMaster=ask") {
+		t.Fatalf("expected applied daemon options to include ControlMaster=ask, got %v", childAsk.control.Options)
 	}
 
 	assertDetachedAskpassConfirmSession(t, ctx)
@@ -2844,15 +2850,6 @@ func assertAllowReuseControlFlags(t *testing.T) {
 	if err != nil || optsOptMasterAndS.AllowReuse {
 		t.Fatalf("expected AllowReuse=false when -o ControlMaster=ask and -S are both specified, got opts=%+v err=%v", optsOptMasterAndS, err)
 	}
-}
-
-func containsOptionArg(args []string, want string) bool {
-	for i := 0; i+1 < len(args); i++ {
-		if args[i] == "-o" && args[i+1] == want {
-			return true
-		}
-	}
-	return false
 }
 
 func assertDetachedAskpassConfirmSession(t *testing.T, ctx context.Context) {

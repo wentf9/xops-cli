@@ -871,22 +871,27 @@ func verifyPass7M73JumpDaemonConnectionWideOptions(t *testing.T, ctx context.Con
 		"ForwardAgent=yes",
 	}
 
-	joined := strings.Join(opts.muxDaemonArgs("bastion", jumpSock, jumpMaster), " ")
+	spec := opts.buildMuxDaemonSpec("bastion", jumpSock, jumpMaster)
+	if spec.ConfigFile != "/tmp/custom_ssh_config" || spec.AddressFamily != "inet6" {
+		t.Fatalf("expected jump daemon spec to preserve ConfigFile/AddressFamily, got %+v", spec)
+	}
+	joined := strings.Join(spec.Options, " ")
 	for _, want := range []string{
-		"-F /tmp/custom_ssh_config",
-		"-6",
-		"-o StrictHostKeyChecking=accept-new",
-		"-o UserKnownHostsFile=/tmp/custom_kh",
-		"-o GlobalKnownHostsFile=/tmp/global_kh",
-		"-o HashKnownHosts=yes",
-		"-o VerifyHostKeyDNS=ask",
-		"-o BatchMode=yes",
-		"-o ConnectTimeout=7",
-		"-o IdentityAgent=/tmp/custom-agent.sock",
+		"StrictHostKeyChecking=accept-new",
+		"UserKnownHostsFile=/tmp/custom_kh",
+		"GlobalKnownHostsFile=/tmp/global_kh",
+		"HashKnownHosts=yes",
+		"VerifyHostKeyDNS=ask",
+		"BatchMode=yes",
+		"ConnectTimeout=7",
+		"IdentityAgent=/tmp/custom-agent.sock",
 	} {
 		if !strings.Contains(joined, want) {
-			t.Fatalf("expected jump daemon args to preserve connection-wide option %q, got %q", want, joined)
+			t.Fatalf("expected jump daemon spec to preserve connection-wide option %q, got %q", want, joined)
 		}
+	}
+	if len(spec.IdentityFiles) > 0 || spec.CipherSpec != "" || spec.GatewayPorts {
+		t.Fatalf("expected target-specific key/cipher/gateway-ports excluded from jump daemon spec, got %+v", spec)
 	}
 	for _, forbidden := range []string{
 		"target-only-key",
@@ -901,7 +906,7 @@ func verifyPass7M73JumpDaemonConnectionWideOptions(t *testing.T, ctx context.Con
 		"ForwardAgent",
 	} {
 		if strings.Contains(joined, forbidden) {
-			t.Fatalf("expected target-specific option %q to be excluded from jump daemon args, got %q", forbidden, joined)
+			t.Fatalf("expected target-specific option %q to be excluded from jump daemon spec options, got %q", forbidden, joined)
 		}
 	}
 }

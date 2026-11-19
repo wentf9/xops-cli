@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -82,6 +81,8 @@ type SshOptions struct {
 	appliedGeneralOpts     bool
 	stdinRedirected        bool
 	isParentValidation     bool
+	muxDaemonSpecFD        int
+	muxDaemonMode          bool
 
 	Target config.ConnectionTarget
 
@@ -98,9 +99,10 @@ type SshOptions struct {
 
 func NewSshOptions() *SshOptions {
 	return &SshOptions{
-		Sudo:         false,
-		NoLoginShell: false,
-		dashIdx:      -1,
+		Sudo:            false,
+		NoLoginShell:    false,
+		dashIdx:         -1,
+		muxDaemonSpecFD: -1,
 	}
 }
 
@@ -154,6 +156,8 @@ func newCmdSshWithOptions(o *SshOptions) *cobra.Command {
 	cmd.Flags().StringSliceVar(&o.Tags, "tag", []string{}, i18n.T("flag_tag"))
 	o.execution.register(cmd)
 	cmd.Flags().BoolVar(&o.NoLoginShell, "no-login", false, i18n.T("flag_exec_no_login"))
+	cmd.Flags().IntVar(&o.muxDaemonSpecFD, muxDaemonSpecFDFlag, -1, "")
+	_ = cmd.Flags().MarkHidden(muxDaemonSpecFDFlag)
 
 	cmd.MarkFlagsMutuallyExclusive("otp", "otp-stdin")
 
@@ -161,33 +165,7 @@ func newCmdSshWithOptions(o *SshOptions) *cobra.Command {
 }
 
 func (o *SshOptions) readSecretsFromStdin() (bool, error) {
-	hadCredentialStdin := o.OTPStdin || o.PasswordStdin || o.PassphraseStdin
-	if o.OTP != "" && o.OTPStdin {
-		return false, errors.New(i18n.T("err_otp_mutually_exclusive"))
-	}
-	if o.OTPStdin {
-		otp, err := utils.ReadSecretLineFromStdin()
-		if err != nil {
-			return false, fmt.Errorf("read otp from stdin: %w", err)
-		}
-		o.OTP = otp
-		o.OTPStdin = false
-	}
-	if o.PasswordStdin {
-		pwd, err := utils.ReadSecretFromStdin()
-		if err != nil {
-			return false, fmt.Errorf("read password from stdin: %w", err)
-		}
-		o.Password = pwd
-	}
-	if o.PassphraseStdin {
-		pass, err := utils.ReadSecretFromStdin()
-		if err != nil {
-			return false, fmt.Errorf("read passphrase from stdin: %w", err)
-		}
-		o.Passphrase = pass
-	}
-	return hadCredentialStdin, nil
+	return readCLISecretsFromStdin(o)
 }
 
 func (o *SshOptions) syncIdentityFiles() {
@@ -287,21 +265,9 @@ func (o *SshOptions) effectiveHostName() (string, error) {
 	return o.effectiveHostNameForHost(o.originalHostForExpansion())
 }
 
-func (o *SshOptions) restoreMuxDaemonOriginalHost() {
-	if o == nil || !isMuxDaemonChild() || o.originalHost != "" {
-		return
-	}
-	if orig := strings.TrimSpace(os.Getenv(sshMuxOriginalHostEnv)); orig != "" {
-		o.originalHost = orig
-	}
-}
-
 func (o *SshOptions) syncResolvedTargetHosts(provider config.ConfigProvider) {
 	if o == nil || provider == nil {
 		return
-	}
-	if isMuxDaemonChild() {
-		o.restoreMuxDaemonOriginalHost()
 	}
 	connTarget := effectiveConnectionTarget(o, "")
 	selector := strings.TrimSpace(connTarget.Selector)
@@ -318,7 +284,7 @@ func (o *SshOptions) syncResolvedTargetHosts(provider config.ConfigProvider) {
 		err == nil,
 	)
 	o.syncedTargetHosts = true
-	if (!isMuxDaemonChild() && !hasPresetOriginal) || o.originalHost == "" {
+	if (!o.isMuxDaemon() && !hasPresetOriginal) || o.originalHost == "" {
 		o.originalHost = origHost
 	}
 	if expandHost != "" {
@@ -354,15 +320,20 @@ func (o *SshOptions) Complete(cmd *cobra.Command, args []string) error {
 		flags = cmd.Flags()
 		o.dashIdx = cmd.ArgsLenAtDash()
 	}
+	if flags != nil && flags.Changed(muxDaemonSpecFDFlag) {
+		spec, err := readMuxDaemonSpecFromFD(o.muxDaemonSpecFD)
+		if err != nil {
+			return err
+		}
+		return o.applyMuxDaemonSpec(spec)
+	}
 	if err := ApplyGeneralOptions(o, o.control.Options, flags); err != nil {
 		return o.control.controlUsageError(err)
 	}
-	if flags != nil && flags.Changed("port") {
-		if portVal, err := flags.GetUint16("port"); err == nil && portVal == 0 {
-			return o.control.controlUsageError(errors.New(i18n.T("scp_err_port_zero")))
-		}
+	if err := validateExplicitZeroPort(flags); err != nil {
+		return o.control.controlUsageError(err)
 	}
-	if isMuxDaemonChild() {
+	if o.isMuxDaemon() {
 		// The detached master daemon re-executes the original command line, but it
 		// only serves the control socket. Normalize before Complete reads stdin:
 		// with stdio on /dev/null a --password-stdin read would fail the child and
@@ -371,7 +342,6 @@ func (o *SshOptions) Complete(cmd *cobra.Command, args []string) error {
 		o.PassphraseStdin = false
 		o.OTPStdin = false
 		o.normalizeForMuxDaemon()
-		o.restoreMuxDaemonOriginalHost()
 		o.StdinRedirect = true
 		return nil
 	}
@@ -439,11 +409,11 @@ func (o *SshOptions) parseTarget(allowMissingHost bool) error {
 
 	selector := finalHost
 	trimmedRaw := strings.TrimSpace(rawSelector)
-	if isMuxDaemonChild() && strings.Contains(trimmedRaw, "@") && strings.Contains(trimmedRaw, ":") {
+	if o.isMuxDaemon() && strings.Contains(trimmedRaw, "@") && strings.Contains(trimmedRaw, ":") {
 		selector = trimmedRaw
 	}
 
-	hasJump := o.JumpHost != "" || isMuxDaemonChild()
+	hasJump := o.JumpHost != "" || o.isMuxDaemon()
 
 	o.Target = config.ConnectionTarget{
 		Selector:     selector,
@@ -498,12 +468,11 @@ func (o *SshOptions) ensureArgsParsed() error {
 		return err
 	}
 	o.parsedArgs = true
-	if isMuxDaemonChild() {
+	if o.isMuxDaemon() {
 		// parseArgs rebuilds the target from the preserved positional arguments, so
 		// the daemon normalization above must be re-applied before the command
 		// boundary is turned back into an executable command.
 		o.normalizeForMuxDaemon()
-		o.restoreMuxDaemonOriginalHost()
 		commandArgs = nil
 	}
 	if o.Command == "" && len(commandArgs) > 0 {
@@ -522,16 +491,12 @@ func (o *SshOptions) Validate() error {
 	if err := o.control.Validate(); err != nil {
 		return err
 	}
-	if isMuxDaemonChild() {
+	if o.isMuxDaemon() {
 		// Validate runs after Complete and would otherwise rebuild a command from
 		// the preserved positional arguments that the daemon must never execute.
 		o.normalizeForMuxDaemon()
-		o.restoreMuxDaemonOriginalHost()
 	}
-	if o.OTP != "" && o.OTPStdin {
-		return errors.New(i18n.T("err_otp_mutually_exclusive"))
-	}
-	if err := utils.ValidateRememberPolicy(o.Remember); err != nil {
+	if err := validateCommonSSHBaseOptions(o); err != nil {
 		return err
 	}
 	if err := o.ensureArgsParsed(); err != nil {
@@ -542,9 +507,6 @@ func (o *SshOptions) Validate() error {
 	}
 	if err := o.validateBackgroundFlags(); err != nil {
 		return o.control.controlUsageError(err)
-	}
-	if err := validateCLIAlias(o.Alias); err != nil {
-		return err
 	}
 	ctlCmd := strings.ToLower(strings.TrimSpace(o.control.CtlCmd))
 	if ctlCmd != "" && ctlCmd != "proxy" {
@@ -577,11 +539,10 @@ func (o *SshOptions) RunContext(ctx context.Context) (err error) {
 	}
 
 	isChild := os.Getenv(sshBackgroundChildEnv) == "true"
-	if isMuxDaemonChild() {
+	if o.isMuxDaemon() {
 		// A detached multiplexing daemon serves the control socket only. It must
 		// never re-run the command or read the terminal the parent handed over.
 		o.normalizeForMuxDaemon()
-		o.restoreMuxDaemonOriginalHost()
 		o.StdinRedirect = true
 	}
 
@@ -706,7 +667,7 @@ func (o *SshOptions) runParentDaemonWithNode(ctx context.Context, cfg *config.Co
 	// global default used by other nodes.
 	adpOpts = append(adpOpts, disableSessionControlForParent(nodeID))
 	var connector *ssh.Connector
-	if isMuxDaemonChild() {
+	if o.isMuxDaemon() {
 		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithSessionConfirmer(o.interaction), ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics))
 	} else {
 		connector = newCLIConnectorWithAdapterOptions(provider, o.interaction, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics))
@@ -798,9 +759,8 @@ func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuratio
 	policy := utils.EffectiveRememberPolicy(o.Remember, cfg)
 	shouldRemember, adpOpts := o.interaction.rememberOptions(policy, cfg)
 	isChild := os.Getenv(sshBackgroundChildEnv) == "true"
-	suppressConfirm := policy == utils.RememberPolicyNever || isMuxDaemonChild() || isChild
-	if isMuxDaemonChild() {
-		o.restoreMuxDaemonOriginalHost()
+	suppressConfirm := policy == utils.RememberPolicyNever || o.isMuxDaemon() || isChild
+	if o.isMuxDaemon() {
 		shouldRemember = false
 		adpOpts = append(adpOpts, adapter.WithNonInteractive(true), adapter.WithSessionOptions(false))
 	} else if isChild {
@@ -819,7 +779,7 @@ func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuratio
 		SuppressNodeConfirmation: suppressConfirm,
 	}))
 	proxyJumpOverride := o.JumpHost
-	if proxyJumpOverride == "" && isMuxDaemonChild() {
+	if proxyJumpOverride == "" && o.isMuxDaemon() {
 		proxyJumpOverride = "none"
 	}
 	o.syncResolvedTargetHosts(repository)
@@ -924,7 +884,7 @@ func (o *SshOptions) getActiveMuxServer(ctx context.Context, provider config.Con
 // master so ControlPersist survives the session, matching OpenSSH behavior for a
 // command or interactive shell that finished.
 func (o *SshOptions) shouldSkipMasterHandoff(ctx context.Context, connector *ssh.Connector, provider config.ConfigProvider, nodeID string) bool {
-	if isMuxDaemonChild() || o.effectiveBgRun() || o.effectiveNoCmd() {
+	if o.isMuxDaemon() || o.effectiveBgRun() || o.effectiveNoCmd() {
 		return true
 	}
 	if ctx != nil && ctx.Err() != nil {
@@ -1206,7 +1166,7 @@ func (o *SshOptions) handoffConnectorMasters(ctx context.Context, provider confi
 	if len(masters) == 0 {
 		return nil
 	}
-	if isMuxDaemonChild() || o.effectiveBgRun() || o.effectiveNoCmd() {
+	if o.isMuxDaemon() || o.effectiveBgRun() || o.effectiveNoCmd() {
 		return nil
 	}
 	if ctx != nil && ctx.Err() != nil {
@@ -1574,16 +1534,9 @@ func (o *SshOptions) handoffMasterInstanceWithProvider(
 		}
 	}()
 
-	cmd := exec.Command(exe, o.muxDaemonArgs(nodeID, expandedPath, master)...)
-	env := append(os.Environ(), sshMuxDaemonEnv+"=true", sshBackgroundChildEnv+"=true")
-	if orig := strings.TrimSpace(master.Target().OriginalHost); orig != "" {
-		env = append(env, sshMuxOriginalHostEnv+"="+orig)
-	}
-	cmd.Env = env
-	cmd.Stdin = devNull
-	cmd.Stdout = devNull
-	cmd.Stderr = devNull
-	if err := startDaemonProcess(cmd); err != nil {
+	spec := o.buildMuxDaemonSpec(nodeID, expandedPath, master)
+	cmd, err := startMuxDaemonCommand(exe, spec, devNull)
+	if err != nil {
 		return fmt.Errorf("start multiplexing daemon failed: %w", err)
 	}
 	// The child re-authenticates on its own. Interactive-only credentials cannot
@@ -1719,401 +1672,6 @@ func retireStoppedOwnedMaster(
 	return nil
 }
 
-func (o *SshOptions) muxDaemonArgs(nodeID string, expandedPath string, master *ssh.MuxServer) []string {
-	targetHost, port, user := o.resolveMuxDaemonTarget(nodeID, master)
-	args := []string{"ssh", "-N", "--host", targetHost, "-S", expandedPath}
-	if port != 0 {
-		args = append(args, "-p", strconv.Itoa(port))
-	}
-	if user != "" {
-		args = append(args, "-l", user)
-	}
-	if keyPath := o.resolveMuxDaemonIdentityFile(nodeID, master); keyPath != "" {
-		args = appendMuxDaemonIdentityArg(args, keyPath)
-	}
-	jumpHost := o.JumpHost
-	if master != nil {
-		jumpHost = master.Target().JumpHost
-		if jumpHost == "" && strings.EqualFold(strings.TrimSpace(o.JumpHost), "none") {
-			jumpHost = "none"
-		}
-	}
-	if jumpHost != "" {
-		args = append(args, "-J", jumpHost)
-	}
-	args = append(args, "--remember", "never")
-	if o.shouldPassIdentityFile(nodeID, master) {
-		args = o.appendMuxDaemonForwardedOptions(args, master)
-	} else {
-		args = o.appendMuxDaemonJumpOptions(args)
-	}
-	args = appendMuxDaemonHostNameOption(args, targetHost, master)
-	masterMode, persist := o.resolveMuxDaemonControl(master)
-	if persist != "" {
-		args = append(args, "-o", "ControlPersist="+persist)
-	}
-	// Ensure the detached multiplexing daemon never opens configured port or
-	// tunnel device forwardings from user/global SSH options.
-	args = append(args, "-o", "ClearAllForwardings=yes")
-	// Force an explicit master mode (yes or ask) on the detached daemon so it
-	// never attaches as a passenger to a competing master while preserving
-	// confirmation semantics across ControlPersist handoff.
-	args = append(args, "-o", "ControlMaster="+string(masterMode))
-	return args
-}
-
-func (o *SshOptions) resolveMuxDaemonControl(master *ssh.MuxServer) (ssh.ControlMasterMode, string) {
-	masterMode := ssh.ControlMasterYes
-	if master != nil {
-		if ctrl := master.Target().Control; ctrl != nil {
-			if ctrl.Master == ssh.ControlMasterAsk || ctrl.Master == ssh.ControlMasterAutoAsk {
-				masterMode = ssh.ControlMasterAsk
-			}
-			return masterMode, ctrl.Persist
-		}
-		return masterMode, ""
-	}
-	if o == nil {
-		return masterMode, ""
-	}
-	if ctrlOpts, err := o.control.ToSessionControlOptions(); err == nil {
-		var persist string
-		if ctrlOpts.Persist != nil {
-			persist = *ctrlOpts.Persist
-		}
-		if ctrlOpts.Master != nil && (*ctrlOpts.Master == ssh.ControlMasterAsk || *ctrlOpts.Master == ssh.ControlMasterAutoAsk) {
-			masterMode = ssh.ControlMasterAsk
-		}
-		return masterMode, persist
-	}
-	return masterMode, firstCLIControlPersistOption(o.control.Options)
-}
-
-func firstCLIControlPersistOption(opts []string) string {
-	for _, opt := range opts {
-		key, val, err := adapter.SplitOptionKeyValue(opt)
-		if err != nil || key == "" {
-			continue
-		}
-		if spec, ok := ssh.LookupOptionSpec(key); ok && spec.CanonicalKey == ssh.OptionControlPersist {
-			return val
-		}
-	}
-	return ""
-}
-
-func isMuxDaemonAuthoritativeOption(opt string) bool {
-	key, _, err := adapter.SplitOptionKeyValue(opt)
-	if err != nil || key == "" {
-		return false
-	}
-	spec, ok := ssh.LookupOptionSpec(key)
-	if !ok {
-		return false
-	}
-	switch spec.CanonicalKey {
-	case ssh.OptionControlMaster, ssh.OptionControlPath, ssh.OptionControlPersist, ssh.OptionClearAllForwardings:
-		return true
-	default:
-		return false
-	}
-}
-
-func isIdentityFileOption(opt string) bool {
-	key, _, err := adapter.SplitOptionKeyValue(opt)
-	if err != nil || key == "" {
-		return false
-	}
-	spec, ok := ssh.LookupOptionSpec(key)
-	return ok && spec.CanonicalKey == ssh.OptionIdentityFile
-}
-
-func appendMuxDaemonHostNameOption(args []string, targetHost string, master *ssh.MuxServer) []string {
-	if master == nil {
-		return args
-	}
-	dialHost := cleanMuxHost(master.Target().Host)
-	if dialHost != "" && dialHost != cleanMuxHost(targetHost) {
-		args = append(args, "-o", "HostName="+strings.ReplaceAll(dialHost, "%", "%%"))
-	}
-	return args
-}
-
-func isConnectionWideMuxDaemonOption(opt string) bool {
-	key, _, err := adapter.SplitOptionKeyValue(opt)
-	if err != nil || key == "" {
-		return false
-	}
-	spec, ok := ssh.LookupOptionSpec(key)
-	if !ok {
-		return false
-	}
-	if spec.Class == ssh.OptionClassTrust {
-		return true
-	}
-	switch spec.CanonicalKey {
-	case ssh.OptionAddressFamily, ssh.OptionBatchMode, ssh.OptionConnectTimeout, ssh.OptionIdentityAgent:
-		return true
-	default:
-		return false
-	}
-}
-
-func (o *SshOptions) appendMuxDaemonJumpOptions(args []string) []string {
-	if o.control.ConfigFile != "" {
-		args = append(args, "-F", o.control.ConfigFile)
-	}
-	switch o.control.AddressFamily {
-	case "inet":
-		args = append(args, "-4")
-	case "inet6":
-		args = append(args, "-6")
-	}
-	for _, opt := range o.control.Options {
-		if isConnectionWideMuxDaemonOption(opt) {
-			args = append(args, "-o", opt)
-		}
-	}
-	return args
-}
-
-func (o *SshOptions) appendMuxDaemonForwardedOptions(args []string, master *ssh.MuxServer) []string {
-	if o.control.ConfigFile != "" {
-		args = append(args, "-F", o.control.ConfigFile)
-	}
-	if o.CipherSpec != "" {
-		args = append(args, "-c", o.CipherSpec)
-	}
-	switch o.control.AddressFamily {
-	case "inet":
-		args = append(args, "-4")
-	case "inet6":
-		args = append(args, "-6")
-	}
-	keys := o.effectiveIdentityFiles()
-	args = appendMuxDaemonExtraIdentities(args, keys, o.firstCLIIdentityFile(keys))
-	if o.GatewayPorts {
-		args = append(args, "-o", "GatewayPorts=yes")
-	}
-	preserveProxyNone := isEffectiveCLIProxyCommandNone(o.control.Options)
-	emittedProxyNone := false
-	for _, opt := range o.control.Options {
-		if isMuxDaemonAuthoritativeOption(opt) {
-			continue
-		}
-		if len(keys) > 0 && isIdentityFileOption(opt) {
-			continue
-		}
-		if o.GatewayPorts && isGatewayPortsOption(opt) {
-			continue
-		}
-		if isSessionOrForwardOption(opt) && !isMuxDaemonPreservedOption(opt) {
-			continue
-		}
-		if master != nil && isTargetSpecificOption(opt) {
-			if preserveProxyNone && !emittedProxyNone && isProxyCommandNoneOption(opt) {
-				emittedProxyNone = true
-				args = append(args, "-o", opt)
-			}
-			continue
-		}
-		args = append(args, "-o", opt)
-	}
-	return args
-}
-
-func appendMuxDaemonExtraIdentities(args []string, keys []string, firstCLIKey string) []string {
-	skippedFirst := false
-	for _, k := range keys {
-		if k == "" {
-			continue
-		}
-		if !skippedFirst && firstCLIKey != "" && k == firstCLIKey {
-			skippedFirst = true
-			continue
-		}
-		args = appendMuxDaemonIdentityArg(args, k)
-	}
-	return args
-}
-
-func (o *SshOptions) firstCLIIdentityFile(keys []string) string {
-	if o == nil {
-		return ""
-	}
-	if len(keys) > 0 {
-		return keys[0]
-	}
-	if o.IdentityFile != "" {
-		return o.IdentityFile
-	}
-	return ""
-}
-
-func appendMuxDaemonIdentityArg(args []string, keyPath string) []string {
-	trimmed := strings.TrimSpace(keyPath)
-	if trimmed == "" {
-		return args
-	}
-	if strings.EqualFold(trimmed, "none") || strings.Contains(trimmed, "%") || strings.Contains(trimmed, "${") {
-		return append(args, "-o", "IdentityFile="+trimmed)
-	}
-	return append(args, "-i", trimmed)
-}
-
-func isProxyCommandOptionKey(key string) bool {
-	switch strings.ToLower(strings.TrimSpace(key)) {
-	case "proxycommand", "proxy_command":
-		return true
-	default:
-		return false
-	}
-}
-
-func isProxyCommandNoneOption(opt string) bool {
-	key, val, err := adapter.SplitOptionKeyValue(opt)
-	return err == nil && isProxyCommandOptionKey(key) && strings.EqualFold(strings.TrimSpace(val), "none")
-}
-
-func isEffectiveCLIProxyCommandNone(opts []string) bool {
-	for _, opt := range opts {
-		key, val, err := adapter.SplitOptionKeyValue(opt)
-		if err != nil || !isProxyCommandOptionKey(key) {
-			continue
-		}
-		return strings.EqualFold(strings.TrimSpace(val), "none")
-	}
-	return false
-}
-
-func (o *SshOptions) resolveMuxDaemonIdentityFile(nodeID string, master *ssh.MuxServer) string {
-	keys := o.effectiveIdentityFiles()
-	firstCLIKey := o.firstCLIIdentityFile(keys)
-	if firstCLIKey != "" && o.shouldPassIdentityFile(nodeID, master) {
-		return firstCLIKey
-	}
-	if master != nil && master.Target().KeyPath != "" {
-		if firstCLIKey == "" || len(o.targetNodeIDs) > 0 || master.Target().KeyPath != normalizeCLIIdentityPath(firstCLIKey) {
-			return master.Target().KeyPath
-		}
-	}
-	return ""
-}
-
-func (o *SshOptions) shouldPassIdentityFile(nodeID string, master *ssh.MuxServer) bool {
-	if master == nil {
-		return true
-	}
-	if o.JumpHost != "" && master.Target().JumpHost == "" {
-		return false
-	}
-	if len(o.targetNodeIDs) > 0 {
-		return matchesAnyTargetNodeID(nodeID, master, o.targetNodeIDs)
-	}
-	if o.Port > 0 && master.Target().Port > 0 && int(o.Port) != master.Target().Port {
-		return false
-	}
-	if o.User != "" && master.Target().User != "" && o.User != master.Target().User {
-		return false
-	}
-	if o.JumpHost != "" && isMasterInJumpSpec(nodeID, master, o.JumpHost) {
-		return false
-	}
-	if o.Host != "" || o.Target.Selector != "" {
-		return matchesTargetSelector(nodeID, master, o.Host, o.Target.Selector)
-	}
-	return true
-}
-
-func isMasterInJumpSpec(nodeID string, master *ssh.MuxServer, jumpSpec string) bool {
-	for hop := range strings.SplitSeq(jumpSpec, ",") {
-		hop = strings.TrimSpace(hop)
-		if hop == "" {
-			continue
-		}
-		if matchesTargetSelector(nodeID, master, hop, hop) {
-			return true
-		}
-	}
-	return false
-}
-
-func matchesAnyTargetNodeID(nodeID string, master *ssh.MuxServer, targetIDs []string) bool {
-	candidates := []string{
-		strings.TrimSpace(nodeID),
-		config.UnwrapOpenSSHSelector(nodeID),
-	}
-	if master != nil {
-		orig := strings.TrimSpace(master.Target().OriginalHost)
-		candidates = append(candidates,
-			orig,
-			config.UnwrapOpenSSHSelector(orig),
-		)
-		if master.Target().Host != "" && master.Target().User != "" && master.Target().Port > 0 {
-			candidates = append(candidates, config.FormatNodeID(master.Target().User, master.Target().Host, uint16(master.Target().Port)))
-		}
-	}
-	for _, tid := range targetIDs {
-		want := strings.TrimSpace(tid)
-		if want == "" {
-			continue
-		}
-		cleanWant := config.UnwrapOpenSSHSelector(want)
-		for _, c := range candidates {
-			if c != "" && (c == want || c == cleanWant) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func matchesTargetSelector(nodeID string, master *ssh.MuxServer, host, selector string) bool {
-	candidates := []string{
-		strings.TrimSpace(nodeID),
-		config.UnwrapOpenSSHSelector(nodeID),
-	}
-	if master != nil {
-		orig := strings.TrimSpace(master.Target().OriginalHost)
-		candidates = append(candidates,
-			orig,
-			config.UnwrapOpenSSHSelector(orig),
-			strings.TrimSpace(master.Target().Host),
-		)
-		if master.Target().Host != "" && master.Target().User != "" && master.Target().Port > 0 {
-			candidates = append(candidates, config.FormatNodeID(master.Target().User, master.Target().Host, uint16(master.Target().Port)))
-		}
-	}
-	for _, want := range []string{strings.TrimSpace(host), strings.TrimSpace(selector)} {
-		if want == "" {
-			continue
-		}
-		cleanWant := config.UnwrapOpenSSHSelector(want)
-		for _, c := range candidates {
-			if c != "" && (c == want || c == cleanWant) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func isTargetSpecificOption(opt string) bool {
-	key, _, err := adapter.SplitOptionKeyValue(opt)
-	if err != nil || key == "" {
-		return false
-	}
-	switch strings.ToLower(key) {
-	case "port", "user", "proxyjump", "identityfile", "hostname",
-		"proxycommand", "proxy_command",
-		"localcommand", "local_command",
-		"permitlocalcommand", "permit_local_command":
-		return true
-	default:
-		return false
-	}
-}
-
 type postAuthLocalRunner interface {
 	RunPostAuthLocalCommand(ctx context.Context) error
 }
@@ -2138,49 +1696,6 @@ func runPostAuthLocalCommand(ctx context.Context, client postAuthLocalRunner, ef
 		}
 	}
 	return nil
-}
-
-func (o *SshOptions) resolveMuxDaemonTarget(nodeID string, master *ssh.MuxServer) (host string, port int, user string) {
-	rawSelector := strings.TrimSpace(nodeID)
-	if rawSelector == "" && master != nil {
-		rawSelector = strings.TrimSpace(master.Target().OriginalHost)
-	}
-	if rawSelector == "" {
-		rawSelector = strings.TrimSpace(o.Host)
-	}
-	var parsedUser string
-	var parsedPort int
-	if strings.HasPrefix(rawSelector, config.OpenSSHNodePrefix) {
-		host = config.UnwrapOpenSSHSelector(rawSelector)
-		if u, _, p, err := utils.ParseAddr(strings.TrimPrefix(rawSelector, config.OpenSSHNodePrefix)); err == nil {
-			parsedUser = u
-			parsedPort = int(p)
-		}
-	} else if u, h, p, err := utils.ParseAddr(rawSelector); err == nil && u != "" && p != 0 && h != "" {
-		host = h
-		parsedUser = u
-		parsedPort = int(p)
-	} else {
-		host = rawSelector
-	}
-	if host == "" && master != nil {
-		host = master.Target().Host
-	}
-	if master != nil && master.Target().Port > 0 {
-		port = master.Target().Port
-	} else if o.Port > 0 {
-		port = int(o.Port)
-	} else {
-		port = parsedPort
-	}
-	if master != nil && master.Target().User != "" {
-		user = master.Target().User
-	} else if o.User != "" {
-		user = o.User
-	} else {
-		user = parsedUser
-	}
-	return host, port, user
 }
 
 // jumpChainMasters returns the subset of ownedMasters that belong to targetMaster's
@@ -2589,7 +2104,7 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 	if err := o.validatePostResolutionSessionInvariants(); err != nil {
 		return err
 	}
-	if !isChild && !isMuxDaemonChild() && o.effectiveBgRun() {
+	if !isChild && !o.isMuxDaemon() && o.effectiveBgRun() {
 		return o.runParentDaemonWithValidatedNode(ctx, cfg, provider, nodeID)
 	}
 	adpOpts, optErr := o.buildAdapterOptions(nodeID, cfg, provider)
@@ -2597,7 +2112,7 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 		return optErr
 	}
 	var connector *ssh.Connector
-	if isMuxDaemonChild() || isChild {
+	if o.isMuxDaemon() || isChild {
 		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithSessionConfirmer(o.interaction), ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics))
 	} else {
 		connector = newCLIConnectorWithAdapterOptions(provider, o.interaction, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics))
@@ -2661,7 +2176,7 @@ func (o *SshOptions) runConnectedSession(runCtx context.Context, connector *ssh.
 	if isMasterClosed(master) && connector != nil {
 		master = findOwnedMasterForNode(connector, nodeID)
 	}
-	if isMuxDaemonChild() {
+	if o.isMuxDaemon() {
 		if err := prepareMuxDaemonSession(connector, master, nodeID); err != nil {
 			return err
 		}
@@ -2714,7 +2229,7 @@ func (o *SshOptions) runNoCmdSession(runCtx context.Context, connector *ssh.Conn
 	// A non-daemon -N master keeps the foreground-session reference acquired
 	// by Connector until the operator stops it, and drops that reference on
 	// -O stop so the process exits once any client sessions drain.
-	if master != nil && !isMuxDaemonChild() {
+	if master != nil && !o.isMuxDaemon() {
 		master.ReleaseForegroundOnStop()
 	}
 	var masterWait <-chan struct{}
@@ -2725,7 +2240,7 @@ func (o *SshOptions) runNoCmdSession(runCtx context.Context, connector *ssh.Conn
 	case <-runCtx.Done():
 	case <-masterWait:
 	}
-	if isMuxDaemonChild() && runCtx.Err() == nil && connector != nil {
+	if o.isMuxDaemon() && runCtx.Err() == nil && connector != nil {
 		_ = client.Close()
 		waitForDaemonJumpMasters(runCtx, connector, master)
 	}
@@ -2766,6 +2281,10 @@ func waitForDaemonJumpMasters(ctx context.Context, connector *ssh.Connector, tar
 // started by handoffPersistentMaster.
 func isMuxDaemonChild() bool {
 	return os.Getenv(sshMuxDaemonEnv) == "true"
+}
+
+func (o *SshOptions) isMuxDaemon() bool {
+	return (o != nil && o.muxDaemonMode) || isMuxDaemonChild()
 }
 
 func sshConnectionError(nodeID string, err error) error {
@@ -2821,7 +2340,7 @@ func parseForwardArg(arg string) (bindAddr, destAddr string, err error) {
 }
 
 func (o *SshOptions) applyHostnameCanonicalization(ctx context.Context, provider config.ConfigProvider, resolver config.CanonicalResolver) error {
-	if o == nil || provider == nil || isMuxDaemonChild() {
+	if o == nil || provider == nil || o.isMuxDaemon() {
 		return nil
 	}
 	host := strings.TrimSpace(o.Target.Selector)
@@ -2886,7 +2405,7 @@ func (o *SshOptions) resolveNode(ctx context.Context, provider config.ConfigProv
 		}
 	}
 
-	shouldRemember := !isMuxDaemonChild() && utils.EffectiveRememberPolicy(o.Remember, provider.Snapshot()) == utils.RememberPolicyAlways
+	shouldRemember := !o.isMuxDaemon() && utils.EffectiveRememberPolicy(o.Remember, provider.Snapshot()) == utils.RememberPolicyAlways
 
 	res, err := preparer.PrepareNodeContext(ctx, config.EnsureNodeOptions{
 		Target:       o.Target,
@@ -2900,7 +2419,7 @@ func (o *SshOptions) resolveNode(ctx context.Context, provider config.ConfigProv
 	if err != nil {
 		return "", false, err
 	}
-	if res.Created || isMuxDaemonChild() {
+	if res.Created || o.isMuxDaemon() {
 		return res.NodeID, res.Created, nil
 	}
 	repo, isRepo := provider.(*config.Repository)

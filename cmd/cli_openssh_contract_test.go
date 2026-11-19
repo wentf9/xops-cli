@@ -604,29 +604,34 @@ func TestCLIContract_MuxDaemonArgsPreservation(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = master.Shutdown() })
 
-	args := opts.muxDaemonArgs("openssh:app.corp.example.com", sockPath, master)
-	optVals := optionArgsFromDaemonArgs(args)
+	spec := opts.buildMuxDaemonSpec("openssh:app.corp.example.com", sockPath, master)
+	decoded := roundTripMuxDaemonSpecThroughPipe(t, spec)
 
-	// Phase A baseline: muxDaemonArgs emits canonicalized OriginalHost via --host alongside -p / -l
-	// (Phase C replaces CLI string reconstruction with typed MuxDaemonSpec FD handoff preserving NodeID + Provenance).
-	joined := strings.Join(args, " ")
-	if !strings.Contains(joined, "--host app.corp.example.com") || !strings.Contains(joined, "-p 2222") || !strings.Contains(joined, "-l ops") {
-		t.Errorf("muxDaemonArgs dropped target host/port/user: %v", args)
+	if decoded.TargetHost != "app.corp.example.com" || !decoded.OpenSSHNamespace || decoded.Port != 2222 || decoded.User != "ops" {
+		t.Errorf("buildMuxDaemonSpec dropped target host/port/user/namespace: %+v", decoded)
 	}
-	if !slices.Contains(optVals, "HostName=fe80::1%%eth0") {
-		t.Errorf("muxDaemonArgs dropped or unescaped HostName=fe80::1%%%%eth0: %v", args)
+	if decoded.DialHost != "fe80::1%eth0" {
+		t.Errorf("buildMuxDaemonSpec dropped or altered IPv6 zone DialHost: %+v", decoded)
 	}
-	if !slices.Contains(optVals, "ProxyCommand=none") {
-		t.Errorf("muxDaemonArgs dropped ProxyCommand=none: %v", args)
+	if !slices.Contains(decoded.Options, "ProxyCommand=none") {
+		t.Errorf("buildMuxDaemonSpec dropped ProxyCommand=none: %v", decoded.Options)
 	}
-	if !slices.Contains(optVals, "ControlMaster=ask") || !slices.Contains(optVals, "ControlPersist=5m") {
-		t.Errorf("muxDaemonArgs dropped authoritative ControlMaster=ask / ControlPersist=5m: %v", args)
+	if decoded.ControlMaster != ssh.ControlMasterAsk || decoded.ControlPersist != "5m" {
+		t.Errorf("buildMuxDaemonSpec dropped authoritative ControlMaster=ask / ControlPersist=5m: %+v", decoded)
+	}
+	wantIDs := []string{filepath.Join("/", "tmp", "k1"), "none", "/tmp/k2"}
+	if !slices.Equal(decoded.IdentityFiles, wantIDs) {
+		t.Errorf("buildMuxDaemonSpec identity order broken: got %v, want %v", decoded.IdentityFiles, wantIDs)
 	}
 
-	k1Pos := strings.Index(joined, "-i "+filepath.Join("/", "tmp", "k1"))
-	nonePos := strings.Index(joined, "-o IdentityFile=none")
-	k2Pos := strings.Index(joined, "-i /tmp/k2")
-	if k1Pos < 0 || nonePos < 0 || k2Pos < 0 || k1Pos >= nonePos || nonePos >= k2Pos {
-		t.Errorf("muxDaemonArgs identity order broken: %q", joined)
+	childOpts := NewSshOptions()
+	if err := childOpts.applyMuxDaemonSpec(decoded); err != nil {
+		t.Fatalf("applyMuxDaemonSpec: %v", err)
+	}
+	if effHost, err := childOpts.effectiveHostName(); err != nil || effHost != "fe80::1%eth0" {
+		t.Errorf("effectiveHostName = (%q, %v), want %q", effHost, err, "fe80::1%eth0")
+	}
+	if !slices.Contains(childOpts.control.Options, "ControlMaster=ask") || !slices.Contains(childOpts.control.Options, "ControlPersist=5m") {
+		t.Errorf("childOpts lost authoritative control options: %v", childOpts.control.Options)
 	}
 }
