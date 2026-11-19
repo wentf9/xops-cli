@@ -9,7 +9,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/kevinburke/ssh_config"
 	"github.com/wentf9/xops-cli/core/ssh"
 )
 
@@ -412,21 +411,21 @@ func setupCyclicAndDeepIncludeParser(t *testing.T) *OpenSSHParser {
 
 func assertInMemoryASTCycleGuard(t *testing.T) {
 	t.Helper()
-	cfg1, err := ssh_config.DecodeBytes([]byte("Host mem-1\n    HostName 10.1.1.1\n"))
+	doc1, err := decodeOpenSSHBytes([]byte("Host mem-1\n    HostName 10.1.1.1\n"), false, 0, make(map[string]struct{}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg2, err := ssh_config.DecodeBytes([]byte("Host mem-2\n    HostName 10.1.1.2\n"))
+	doc2, err := decodeOpenSSHBytes([]byte("Host mem-2\n    HostName 10.1.1.2\n"), false, 0, make(map[string]struct{}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg1.Hosts[0].Nodes = append(cfg1.Hosts[0].Nodes, &openSSHIncludeNode{
-		files: []includedSSHConfigFile{{path: "cfg2", cfg: cfg2}},
+	doc1.blocks[0].nodes = append(doc1.blocks[0].nodes, &sshConfigInclude{
+		files: []includedSSHConfigFile{{path: "doc2", doc: doc2}},
 	})
-	cfg2.Hosts[0].Nodes = append(cfg2.Hosts[0].Nodes, &openSSHIncludeNode{
-		files: []includedSSHConfigFile{{path: "cfg1", cfg: cfg1}},
+	doc2.blocks[0].nodes = append(doc2.blocks[0].nodes, &sshConfigInclude{
+		files: []includedSSHConfigFile{{path: "doc1", doc: doc1}},
 	})
-	memParser := &OpenSSHParser{cfg: cfg1}
+	memParser := &OpenSSHParser{cfg: doc1}
 	if !memParser.HasHost("mem-1") || !memParser.HasHost("mem-2") || memParser.HasHost("missing") {
 		t.Fatal("unexpected HasHost result on cyclic in-memory AST")
 	}

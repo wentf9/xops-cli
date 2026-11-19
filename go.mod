@@ -19,7 +19,6 @@ require (
 	github.com/godbus/dbus/v5 v5.2.4
 	github.com/google/jsonschema-go v0.4.3
 	github.com/hinshun/vt10x v0.0.0-20220301184237-5011da428d02
-	github.com/kevinburke/ssh_config v1.6.0
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	github.com/nicksnyder/go-i18n/v2 v2.7.0
 	github.com/pkg/sftp v1.13.12

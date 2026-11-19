@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kevinburke/ssh_config"
 	"github.com/wentf9/xops-cli/core/ssh"
 )
 
@@ -220,26 +219,26 @@ func resolveCanonicalizePolicy(parser *OpenSSHParser, tier3Opts *ssh.Options, ho
 	return policy
 }
 
-func applySSHConfigCanonicalDirectives(policy *canonicalizePolicy, cfg *ssh_config.Config, host string) {
-	if v := firstSSHConfigKeyValue(cfg, host, "canonicalizehostname"); v != "" {
+func applySSHConfigCanonicalDirectives(policy *canonicalizePolicy, doc *sshConfigDoc, host string) {
+	if v := firstSSHConfigKeyValue(doc, host, "canonicalizehostname"); v != "" {
 		policy.setMode(v)
 	}
-	if v := firstSSHConfigKeyValue(cfg, host, "canonicaldomains"); v != "" {
+	if v := firstSSHConfigKeyValue(doc, host, "canonicaldomains"); v != "" {
 		policy.setDomains(v)
 	}
-	if v := firstSSHConfigKeyValue(cfg, host, "canonicalizemaxdots"); v != "" {
+	if v := firstSSHConfigKeyValue(doc, host, "canonicalizemaxdots"); v != "" {
 		policy.setMaxDots(v)
 	}
-	if v := firstSSHConfigKeyValue(cfg, host, "canonicalizefallbacklocal"); v != "" {
+	if v := firstSSHConfigKeyValue(doc, host, "canonicalizefallbacklocal"); v != "" {
 		policy.setFallbackLocal(v)
 	}
-	if v := firstSSHConfigKeyValue(cfg, host, "canonicalizepermittedcnames"); v != "" {
+	if v := firstSSHConfigKeyValue(doc, host, "canonicalizepermittedcnames"); v != "" {
 		policy.setPermittedCNAMEs(v)
 	}
-	winner, _, cmdVal := firstMatchingOpenSSHProxy(cfg, host)
+	winner, _, cmdVal := firstMatchingOpenSSHProxy(doc, host)
 	switch winner {
 	case "proxyjump":
-		if v := firstSSHConfigKeyValue(cfg, host, "proxyjump"); v != "" {
+		if v := firstSSHConfigKeyValue(doc, host, "proxyjump"); v != "" {
 			policy.setProxyJump(v)
 		}
 	case "proxycommand", "none":
@@ -247,11 +246,11 @@ func applySSHConfigCanonicalDirectives(policy *canonicalizePolicy, cfg *ssh_conf
 			policy.setProxyCommand(cmdVal)
 		}
 	default:
-		if v := firstSSHConfigKeyValue(cfg, host, "proxyjump"); strings.EqualFold(v, "none") {
+		if v := firstSSHConfigKeyValue(doc, host, "proxyjump"); strings.EqualFold(v, "none") {
 			policy.setProxyJump("none")
 		}
 	}
-	if v := firstSSHConfigKeyValue(cfg, host, "connecttimeout"); v != "" {
+	if v := firstSSHConfigKeyValue(doc, host, "connecttimeout"); v != "" {
 		policy.setTimeoutSeconds(v)
 	}
 }

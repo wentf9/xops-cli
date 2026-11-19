@@ -6,7 +6,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/kevinburke/ssh_config"
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/models"
 )
@@ -57,22 +56,22 @@ func isConcreteSSHHost(pattern string) bool {
 		!strings.ContainsAny(pattern, "*?")
 }
 
-func openSSHHostFromConfig(cfg *ssh_config.Config, name, defaultUser string) (OpenSSHHost, error) {
-	address, err := resolveOpenSSHHostName(cfg, name)
+func openSSHHostFromConfig(doc *sshConfigDoc, name, defaultUser string) (OpenSSHHost, error) {
+	address, err := resolveOpenSSHHostName(doc, name)
 	if err != nil {
 		return OpenSSHHost{}, fmt.Errorf("resolve openssh HostName for host %q: %w", name, err)
 	}
-	user := openSSHValue(cfg, name, "User", defaultUser)
-	portValue := openSSHValue(cfg, name, "Port", "22")
+	user := openSSHValue(doc, name, "User", defaultUser)
+	portValue := openSSHValue(doc, name, "Port", "22")
 	port, err := strconv.ParseUint(strings.TrimSpace(portValue), 10, 16)
 	if err != nil || port == 0 {
 		return OpenSSHHost{}, fmt.Errorf("parse openssh port for host %q: %q", name, portValue)
 	}
-	keyPath := openSSHValue(cfg, name, "IdentityFile", "")
-	proxyWinner, _, _ := firstMatchingOpenSSHProxy(cfg, name)
+	keyPath := openSSHValue(doc, name, "IdentityFile", "")
+	proxyWinner, _, _ := firstMatchingOpenSSHProxy(doc, name)
 	var proxyJump string
 	if proxyWinner == "proxyjump" {
-		proxyJump = openSSHValue(cfg, name, "ProxyJump", "")
+		proxyJump = openSSHValue(doc, name, "ProxyJump", "")
 		if strings.EqualFold(proxyJump, "none") {
 			proxyJump = ""
 		}
@@ -83,7 +82,7 @@ func openSSHHostFromConfig(cfg *ssh_config.Config, name, defaultUser string) (Op
 		return OpenSSHHost{}, err
 	}
 
-	sshOpts, err := parseOpenSSHOptions(cfg, name)
+	sshOpts, err := parseOpenSSHOptions(doc, name)
 	if err != nil {
 		return OpenSSHHost{}, err
 	}
@@ -153,8 +152,8 @@ func normalizeImportedSSHOptions(opts *ssh.Options) *ssh.Options {
 	return cloned
 }
 
-func openSSHValue(cfg *ssh_config.Config, host, key, fallback string) string {
-	value := firstSSHConfigKeyValue(cfg, host, key)
+func openSSHValue(doc *sshConfigDoc, host, key, fallback string) string {
+	value := firstSSHConfigKeyValue(doc, host, key)
 	if value == "" {
 		return fallback
 	}
