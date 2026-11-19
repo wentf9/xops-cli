@@ -1286,11 +1286,22 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 		}
 	}
 	cfg.KeyPaths = buildOrderedKeyPaths(cliFlagKeys, cliOptKeys, managedNodeKey, mergedOptKeys)
-	if cfg.KeyPath == "" && len(cfg.KeyPaths) > 0 {
-		cfg.KeyPath = cfg.KeyPaths[0]
+	if cfg.KeyPath == "" {
+		cfg.KeyPath = firstConcreteKeyPath(cfg.KeyPaths)
 	}
 
 	return cfg, nil
+}
+
+func firstConcreteKeyPath(paths []string) string {
+	for _, p := range paths {
+		trimmed := strings.TrimSpace(p)
+		if trimmed == "" || strings.EqualFold(trimmed, "none") {
+			continue
+		}
+		return trimmed
+	}
+	return ""
 }
 
 func (a *SSHAdapter) resolveManagedNodeKey(nodeID string, snapshot config.ConnectionSnapshot) string {
@@ -1346,10 +1357,10 @@ func (a *SSHAdapter) applySessionOverrideToConfig(nodeID string, cfg *ssh.Client
 	if override.Passphrase != "" {
 		cfg.Passphrase = override.Passphrase
 	}
-	if len(override.KeyPaths) > 0 {
-		cfg.KeyPath = override.KeyPaths[0]
-	} else if override.KeyPath != "" {
-		cfg.KeyPath = override.KeyPath
+	if p := firstConcreteKeyPath(override.KeyPaths); p != "" {
+		cfg.KeyPath = p
+	} else if p := firstConcreteKeyPath([]string{override.KeyPath}); p != "" {
+		cfg.KeyPath = p
 	}
 	// Route explicit session material through auto authentication unless the
 	// identity already uses keyboard-interactive or otp. This lets the

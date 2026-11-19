@@ -208,6 +208,9 @@ func (o *ScpOptions) Validate() error {
 	if err := cmdutils.ValidateRememberPolicy(o.Remember); err != nil {
 		return err
 	}
+	if err := validateCLIAlias(o.Alias); err != nil {
+		return err
+	}
 	if o.Source == "" {
 		return fmt.Errorf("%s", i18n.T("scp_err_no_src"))
 	}

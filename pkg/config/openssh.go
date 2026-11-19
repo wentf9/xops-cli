@@ -23,6 +23,8 @@ const (
 	OpenSSHNodePrefix            = "openssh:"
 	maxIncludeDepth              = 16
 	openSSHIncludePlaceholderKey = "__xops_include__"
+	openSSHHostPlaceholder       = "__xops_host__"
+	openSSHKVPlaceholder         = "__xops_kv__"
 )
 
 // OpenSSHParser 提供针对 ~/.ssh/config 的解析和模型映射功能
@@ -868,39 +870,55 @@ func decodeOpenSSHFile(path string, system bool, depth int, active map[string]st
 	return decodeOpenSSHBytes(b, system || isSystemSSHConfigPath(path), depth, active)
 }
 
+type openSSHKVOverride struct {
+	value   string
+	comment string
+}
+
+type openSSHPreprocessResult struct {
+	rewritten     []byte
+	includes      []openSSHIncludeSpec
+	hostOverrides map[int][]string
+	kvOverrides   map[int]openSSHKVOverride
+}
+
 func decodeOpenSSHBytes(b []byte, system bool, depth int, active map[string]struct{}) (*ssh_config.Config, error) {
-	rewritten, specs, err := rewriteOpenSSHIncludes(b)
+	prep, err := preprocessOpenSSHBytes(b)
 	if err != nil {
 		return nil, err
 	}
-	cfg, err := ssh_config.DecodeBytes(rewritten)
+	cfg, err := ssh_config.DecodeBytes(prep.rewritten)
 	if err != nil {
 		return nil, err
 	}
-	if len(specs) == 0 {
+	if err := applyOpenSSHOverrides(cfg, prep); err != nil {
+		return nil, err
+	}
+	if len(prep.includes) == 0 {
 		return cfg, nil
 	}
-	if err := resolveOpenSSHIncludePlaceholders(cfg, specs, system, depth, active); err != nil {
+	if err := resolveOpenSSHIncludePlaceholders(cfg, prep.includes, system, depth, active); err != nil {
 		return nil, err
 	}
 	return cfg, nil
 }
 
-func rewriteOpenSSHIncludes(b []byte) ([]byte, []openSSHIncludeSpec, error) {
+func preprocessOpenSSHBytes(b []byte) (openSSHPreprocessResult, error) {
+	res := openSSHPreprocessResult{rewritten: b}
 	if len(b) == 0 {
-		return b, nil, nil
+		return res, nil
 	}
 	lines := strings.Split(string(b), "\n")
-	var specs []openSSHIncludeSpec
 	var out bytes.Buffer
 	rewrittenAny := false
+	blockIdx := 0
 
 	for idx, rawLine := range lines {
 		hasCR := strings.HasSuffix(rawLine, "\r")
 		line := strings.TrimSuffix(rawLine, "\r")
-		spec, matched, err := parseOpenSSHIncludeLine(line)
+		replacement, matched, err := preprocessOpenSSHLine(idx+1, line, &blockIdx, &res)
 		if err != nil {
-			return nil, nil, fmt.Errorf("line %d: %w", idx+1, err)
+			return res, fmt.Errorf("line %d: %w", idx+1, err)
 		}
 		if matched {
 			if !rewrittenAny {
@@ -911,12 +929,7 @@ func rewriteOpenSSHIncludes(b []byte) ([]byte, []openSSHIncludeSpec, error) {
 					out.WriteByte('\n')
 				}
 			}
-			specIdx := len(specs)
-			specs = append(specs, spec)
-			out.WriteString(line[:spec.leadingSpace])
-			out.WriteString(openSSHIncludePlaceholderKey)
-			out.WriteByte(' ')
-			out.WriteString(strconv.Itoa(specIdx))
+			out.WriteString(replacement)
 			if hasCR {
 				out.WriteByte('\r')
 			}
@@ -927,10 +940,323 @@ func rewriteOpenSSHIncludes(b []byte) ([]byte, []openSSHIncludeSpec, error) {
 			out.WriteByte('\n')
 		}
 	}
-	if !rewrittenAny {
-		return b, nil, nil
+	if rewrittenAny {
+		res.rewritten = out.Bytes()
 	}
-	return out.Bytes(), specs, nil
+	return res, nil
+}
+
+func preprocessOpenSSHLine(lineNum int, line string, blockIdx *int, res *openSSHPreprocessResult) (string, bool, error) {
+	if spec, matched, err := parseOpenSSHIncludeLine(line); err != nil {
+		return "", false, err
+	} else if matched {
+		specIdx := len(res.includes)
+		res.includes = append(res.includes, spec)
+		return line[:spec.leadingSpace] + openSSHIncludePlaceholderKey + " " + strconv.Itoa(specIdx), true, nil
+	}
+	indent, key, sep, rest, ok := splitOpenSSHDirectiveLine(line)
+	if !ok {
+		return "", false, nil
+	}
+	lowerKey := strings.ToLower(key)
+	switch lowerKey {
+	case "host":
+		*blockIdx++
+		return preprocessOpenSSHHostLine(*blockIdx, indent, key, sep, rest, res)
+	case "match":
+		*blockIdx++
+		return preprocessOpenSSHMatchLine(*blockIdx, indent, key, sep, rest, res)
+	default:
+		return preprocessOpenSSHKVLine(lineNum, indent, key, lowerKey, sep, rest, res)
+	}
+}
+
+func splitOpenSSHDirectiveLine(line string) (indent, key, sep, rest string, ok bool) {
+	trimmed := strings.TrimLeft(line, " \t")
+	if trimmed == "" || trimmed[0] == '#' {
+		return "", "", "", "", false
+	}
+	leadingSpace := len(line) - len(trimmed)
+	indent = line[:leadingSpace]
+	kEnd := strings.IndexAny(trimmed, " \t=")
+	if kEnd < 0 {
+		kEnd = len(trimmed)
+	}
+	key = trimmed[:kEnd]
+	if key == "" || strings.ContainsRune(key, '#') {
+		return "", "", "", "", false
+	}
+	afterKey := strings.TrimLeft(trimmed[kEnd:], " \t")
+	sep = " "
+	if strings.HasPrefix(afterKey, "=") {
+		sep = " = "
+		afterKey = strings.TrimLeft(afterKey[1:], " \t")
+	}
+	return indent, key, sep, afterKey, true
+}
+
+func preprocessOpenSSHHostLine(blockIdx int, indent, key, sep, rest string, res *openSSHPreprocessResult) (string, bool, error) {
+	if !strings.ContainsAny(rest, "#\t\"'\\") {
+		return "", false, nil
+	}
+	argsPart, comment, unclosed := splitOpenSSHArgvComment(rest)
+	if unclosed {
+		return "", false, errors.New("unterminated quote in Host directive")
+	}
+	patterns, err := splitOpenSSHArgvTokens(argsPart)
+	if err != nil {
+		return "", false, fmt.Errorf("invalid Host directive: %w", err)
+	}
+	if res.hostOverrides == nil {
+		res.hostOverrides = make(map[int][]string)
+	}
+	if patterns == nil {
+		patterns = []string{}
+	}
+	res.hostOverrides[blockIdx] = patterns
+	repl := indent + key + sep + openSSHHostPlaceholder
+	if comment != "" {
+		repl += " #" + comment
+	}
+	return repl, true, nil
+}
+
+func preprocessOpenSSHMatchLine(blockIdx int, indent, key, sep, rest string, res *openSSHPreprocessResult) (string, bool, error) {
+	if !strings.ContainsAny(rest, "#\t\"'\\") {
+		return "", false, nil
+	}
+	argsPart, comment, unclosed := splitOpenSSHArgvComment(rest)
+	if unclosed {
+		trimmedRest := strings.TrimLeft(rest, " \t")
+		if len(trimmedRest) >= 4 && strings.EqualFold(trimmedRest[:4], "host") && (len(trimmedRest) == 4 || trimmedRest[4] == ' ' || trimmedRest[4] == '\t') {
+			return "", false, errors.New("unterminated quote in Match Host directive")
+		}
+		return "", false, nil
+	}
+	toks, err := splitOpenSSHArgvTokens(argsPart)
+	if err != nil || len(toks) < 2 || !strings.EqualFold(toks[0], "host") {
+		return "", false, nil
+	}
+	if res.hostOverrides == nil {
+		res.hostOverrides = make(map[int][]string)
+	}
+	res.hostOverrides[blockIdx] = toks[1:]
+	repl := indent + key + sep + toks[0] + " " + openSSHHostPlaceholder
+	if comment != "" {
+		repl += " #" + comment
+	}
+	return repl, true, nil
+}
+
+func preprocessOpenSSHKVLine(lineNum int, indent, key, lowerKey, sep, rest string, res *openSSHPreprocessResult) (string, bool, error) {
+	if isOpenSSHIgnoredQuoteHashDirective(lowerKey) {
+		return "", false, nil
+	}
+	if isOpenSSHWholeLineCommandDirective(lowerKey) {
+		trimmedRest := strings.TrimSpace(rest)
+		if trimmedRest == "" || !strings.ContainsAny(trimmedRest, "#\t\"'") {
+			return "", false, nil
+		}
+		return recordOpenSSHKVOverride(lineNum, indent, key, sep, openSSHKVOverride{value: trimmedRest}, res), true, nil
+	}
+	if !strings.ContainsAny(rest, "#\t\"'\\") {
+		return "", false, nil
+	}
+	argsPart, comment, unclosed := splitOpenSSHArgvComment(rest)
+	if isOpenSSHRawTokenListDirective(lowerKey) {
+		return recordOpenSSHKVOverride(lineNum, indent, key, sep, openSSHKVOverride{value: argsPart, comment: comment}, res), true, nil
+	}
+	val := argsPart
+	if !unclosed {
+		if toks, err := splitOpenSSHArgvTokens(argsPart); err == nil && len(toks) == 1 {
+			val = toks[0]
+		}
+	}
+	return recordOpenSSHKVOverride(lineNum, indent, key, sep, openSSHKVOverride{value: val, comment: comment}, res), true, nil
+}
+
+func recordOpenSSHKVOverride(lineNum int, indent, key, sep string, ov openSSHKVOverride, res *openSSHPreprocessResult) string {
+	if res.kvOverrides == nil {
+		res.kvOverrides = make(map[int]openSSHKVOverride)
+	}
+	res.kvOverrides[lineNum] = ov
+	return indent + key + sep + openSSHKVPlaceholder
+}
+
+func isOpenSSHWholeLineCommandDirective(lowerKey string) bool {
+	switch lowerKey {
+	case "proxycommand", "proxy_command",
+		"localcommand", "local_command",
+		"remotecommand", "remote_command":
+		return true
+	default:
+		return false
+	}
+}
+
+func isOpenSSHRawTokenListDirective(lowerKey string) bool {
+	switch lowerKey {
+	case "setenv", "set_env",
+		"sendenv", "send_env",
+		"localforward", "local_forward",
+		"remoteforward", "remote_forward",
+		"dynamicforward", "dynamic_forward":
+		return true
+	default:
+		return false
+	}
+}
+
+func isOpenSSHIgnoredQuoteHashDirective(lowerKey string) bool {
+	return lowerKey == "proxyjump" || lowerKey == "proxy_jump"
+}
+
+func isOpenSSHArgvEscapable(ch byte) bool {
+	return ch == ' ' || ch == '\t' || ch == '"' || ch == '\'' || ch == '\\'
+}
+
+func splitOpenSSHArgvComment(rest string) (argsPart, comment string, unclosedQuote bool) {
+	var quote byte
+	atWordStart := true
+	for i := 0; i < len(rest); {
+		ch := rest[i]
+		if quote != 0 {
+			if quote == '"' && ch == '\\' && i+1 < len(rest) && (rest[i+1] == '"' || rest[i+1] == '\\') {
+				i += 2
+				atWordStart = false
+				continue
+			}
+			if ch == quote {
+				quote = 0
+			}
+			i++
+			atWordStart = false
+			continue
+		}
+		if ch == ' ' || ch == '\t' {
+			atWordStart = true
+			i++
+			continue
+		}
+		if ch == '#' && atWordStart {
+			return strings.TrimRight(rest[:i], " \t"), rest[i+1:], false
+		}
+		if ch == '\'' || ch == '"' {
+			quote = ch
+			atWordStart = false
+			i++
+			continue
+		}
+		if ch == '\\' && i+1 < len(rest) && isOpenSSHArgvEscapable(rest[i+1]) {
+			atWordStart = false
+			i += 2
+			continue
+		}
+		atWordStart = false
+		i++
+	}
+	return strings.TrimRight(rest, " \t"), "", quote != 0
+}
+
+func splitOpenSSHArgvTokens(s string) ([]string, error) {
+	var tokens []string
+	i := 0
+	for i < len(s) {
+		for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+			i++
+		}
+		if i >= len(s) {
+			break
+		}
+		var sb strings.Builder
+		nextIdx, err := consumeOpenSSHArgvToken(s, i, &sb)
+		if err != nil {
+			return nil, err
+		}
+		tokens = append(tokens, sb.String())
+		i = nextIdx
+	}
+	return tokens, nil
+}
+
+func consumeOpenSSHArgvToken(s string, i int, sb *strings.Builder) (int, error) {
+	var quote byte
+	for i < len(s) {
+		ch := s[i]
+		if quote != 0 {
+			if quote == '"' && ch == '\\' && i+1 < len(s) && (s[i+1] == '"' || s[i+1] == '\\') {
+				sb.WriteByte(s[i+1])
+				i += 2
+				continue
+			}
+			if ch == quote {
+				quote = 0
+				i++
+				continue
+			}
+			sb.WriteByte(ch)
+			i++
+			continue
+		}
+		if ch == ' ' || ch == '\t' {
+			break
+		}
+		if ch == '\'' || ch == '"' {
+			quote = ch
+			i++
+			continue
+		}
+		if ch == '\\' && i+1 < len(s) && isOpenSSHArgvEscapable(s[i+1]) {
+			sb.WriteByte(s[i+1])
+			i += 2
+			continue
+		}
+		sb.WriteByte(ch)
+		i++
+	}
+	if quote != 0 {
+		return i, fmt.Errorf("unterminated %c quote", quote)
+	}
+	return i, nil
+}
+
+func applyOpenSSHOverrides(cfg *ssh_config.Config, res openSSHPreprocessResult) error {
+	if cfg == nil || (len(res.hostOverrides) == 0 && len(res.kvOverrides) == 0) {
+		return nil
+	}
+	for idx, block := range cfg.Hosts {
+		if block == nil {
+			continue
+		}
+		if rawPatterns, ok := res.hostOverrides[idx]; ok {
+			compiled := make([]*ssh_config.Pattern, 0, len(rawPatterns))
+			for _, pat := range rawPatterns {
+				p, err := ssh_config.NewPattern(pat)
+				if err != nil {
+					return fmt.Errorf("invalid host pattern %q: %w", pat, err)
+				}
+				compiled = append(compiled, p)
+			}
+			block.Patterns = compiled
+		}
+		if len(res.kvOverrides) == 0 {
+			continue
+		}
+		for i, node := range block.Nodes {
+			kv, ok := node.(*ssh_config.KV)
+			if !ok || kv == nil {
+				continue
+			}
+			if ov, has := res.kvOverrides[kv.Pos().Line]; has {
+				block.Nodes[i] = &ssh_config.KV{
+					Key:     kv.Key,
+					Value:   ov.value,
+					Comment: ov.comment,
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func parseOpenSSHIncludeLine(line string) (openSSHIncludeSpec, bool, error) {
@@ -939,7 +1265,7 @@ func parseOpenSSHIncludeLine(line string) (openSSHIncludeSpec, bool, error) {
 	if trimmed == "" || trimmed[0] == '#' {
 		return openSSHIncludeSpec{}, false, nil
 	}
-	kEnd := strings.IndexAny(trimmed, " \t=#")
+	kEnd := strings.IndexAny(trimmed, " \t=")
 	if kEnd < 0 {
 		kEnd = len(trimmed)
 	}
@@ -1003,7 +1329,7 @@ func readNextOpenSSHIncludeToken(rest string, start int) (string, int, error) {
 			}
 			continue
 		}
-		if ch == ' ' || ch == '\t' || ch == '#' {
+		if ch == ' ' || ch == '\t' {
 			break
 		}
 		if ch == '"' || ch == '\'' {

@@ -341,6 +341,9 @@ func (o *ExecOptions) Validate() error {
 	if err := utils.ValidateRememberPolicy(o.Remember); err != nil {
 		return err
 	}
+	if err := validateCLIAlias(o.Alias); err != nil {
+		return err
+	}
 	if o.Command == "" && o.ShellFile == "" {
 		return fmt.Errorf("%s", i18n.T("exec_err_no_cmd"))
 	}
@@ -1466,7 +1469,7 @@ func (o *ExecOptions) updateIdentity(identity *models.Identity, addr utils.HostI
 
 // updateNodeAlias updates node alias and returns true if changed
 func (o *ExecOptions) updateNodeAlias(nodeID string, node *models.Node, alias string, provider config.ConfigProvider) bool {
-	if alias == "" {
+	if alias == "" || config.ValidateNodeAlias(alias) != nil {
 		return false
 	}
 	// 检查别名是否已被其他节点使用

@@ -100,6 +100,7 @@ func (v *stdioForwardFlagValue) Set(val string) error {
 	}
 	v.set = true
 	v.opts.StdioForward = val
+	v.opts.stdioForwardSet = true
 	return nil
 }
 
@@ -120,7 +121,10 @@ type tunnelDeviceFlagValue struct {
 
 func (v *tunnelDeviceFlagValue) Set(val string) error {
 	v.opts.TunnelDevice = val
-	v.opts.recordTunnelDeviceFlag()
+	v.opts.tunnelDeviceSet = true
+	if strings.TrimSpace(val) != "" {
+		v.opts.recordTunnelDeviceFlag()
+	}
 	return nil
 }
 
@@ -396,7 +400,11 @@ func (o *SshOptions) normalizeForMuxDaemon() {
 	o.Command = ""
 	o.stdinScript = false
 	o.StdioForward = ""
+	o.stdioForwardSet = false
 	o.TunnelDevice = ""
+	o.tunnelDeviceSet = false
+	o.cliTunnelMode = ""
+	o.cliTunnelLockedByW = false
 	o.LocalForwards = nil
 	o.RemoteForwards = nil
 	o.DynamicForward = ""
@@ -433,7 +441,7 @@ func (o *SshOptions) validateSubsystemFlags() error {
 }
 
 func (o *SshOptions) validateForwardAndSessionFlags() error {
-	if o.StdioForward != "" {
+	if o.stdioForwardSet || o.StdioForward != "" {
 		if _, _, err := ssh.ParseStdioForward(o.StdioForward); err != nil {
 			return err
 		}
@@ -457,7 +465,7 @@ func (o *SshOptions) validateForwardAndSessionFlags() error {
 	if err := o.validateSubsystemFlags(); err != nil {
 		return err
 	}
-	if o.TunnelDevice != "" {
+	if o.tunnelDeviceSet || o.TunnelDevice != "" {
 		if _, err := ssh.ParseTunnelDevice(o.TunnelDevice); err != nil {
 			return fmt.Errorf("invalid tunnel device (-w): %w", err)
 		}

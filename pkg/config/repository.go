@@ -643,6 +643,12 @@ func (r *Repository) CreateNodeContext(ctx context.Context, nodeID string, node 
 	if nodeID == "" {
 		return NodeMutation{}, fmt.Errorf("node ID is empty")
 	}
+	if err := ValidateNodeAlias(nodeID); err != nil {
+		return NodeMutation{}, err
+	}
+	if err := ValidateNodeAliases(node.Alias); err != nil {
+		return NodeMutation{}, err
+	}
 	result, err := r.commitResultContext(ctx, anyRevision, func(cfg *Configuration) error {
 		if _, exists := cfg.Nodes.Get(nodeID); exists {
 			return fmt.Errorf("create node %q: %w", nodeID, ErrConfigConflict)
@@ -758,6 +764,12 @@ func (r *Repository) replaceNodeAtRefWithOutcome(ctx context.Context, ref NodeRe
 // replaceNodeAtRef mutates a transaction-local snapshot. Both ordinary edits
 // and credential transactions use the same conflict and shared-reference rules.
 func replaceNodeAtRef(cfg *Configuration, ref NodeRef, nodeID string, node models.Node, host models.Host, identity models.Identity) error {
+	if err := ValidateNodeAlias(nodeID); err != nil {
+		return err
+	}
+	if err := ValidateNodeAliases(node.Alias); err != nil {
+		return err
+	}
 	oldNodeID := ref.ID
 	var oldNode models.Node
 	if oldNodeID != "" {
@@ -942,6 +954,11 @@ func (r *Repository) ImportOpenSSHHostsContext(ctx context.Context, hosts []Open
 				result.Issues = append(result.Issues, ImportIssue{Name: item.Name, Err: fmt.Errorf("openssh host name is empty")})
 				continue
 			}
+			if err := ValidateNodeAlias(item.Name); err != nil {
+				result.Skipped++
+				result.Issues = append(result.Issues, ImportIssue{Name: item.Name, Err: err})
+				continue
+			}
 			if _, exists := cfg.Nodes.Get(item.Name); exists {
 				result.Skipped++
 				continue
@@ -985,6 +1002,9 @@ func reserveOpenSSHAliases(aliases map[string]string, item OpenSSHHost) error {
 	for _, alias := range item.Node.Alias {
 		if alias == "" {
 			continue
+		}
+		if err := ValidateNodeAlias(alias); err != nil {
+			return err
 		}
 		if existingNodeID, exists := aliases[alias]; exists && existingNodeID != item.Name {
 			return fmt.Errorf("alias %q is already assigned to node %q", alias, existingNodeID)

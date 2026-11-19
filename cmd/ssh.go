@@ -66,7 +66,9 @@ type SshOptions struct {
 	DynamicForward         string
 	DynamicForwards        []string
 	StdioForward           string
+	stdioForwardSet        bool
 	TunnelDevice           string
+	tunnelDeviceSet        bool
 	DisableTTY             bool
 	ForceTTYCount          int
 	cliTTYMode             ssh.RequestTTYMode
@@ -541,8 +543,8 @@ func (o *SshOptions) Validate() error {
 	if err := o.validateBackgroundFlags(); err != nil {
 		return o.control.controlUsageError(err)
 	}
-	if strings.Contains(o.Alias, "@") || strings.Contains(o.Alias, ":") {
-		return errors.New(i18n.T("ssh_err_alias_invalid"))
+	if err := validateCLIAlias(o.Alias); err != nil {
+		return err
 	}
 	ctlCmd := strings.ToLower(strings.TrimSpace(o.control.CtlCmd))
 	if ctlCmd != "" && ctlCmd != "proxy" {
@@ -1746,16 +1748,9 @@ func (o *SshOptions) muxDaemonArgs(nodeID string, expandedPath string, master *s
 		args = o.appendMuxDaemonJumpOptions(args)
 	}
 	args = appendMuxDaemonHostNameOption(args, targetHost, master)
-	masterMode := ssh.ControlMasterYes
-	if master != nil {
-		if ctrl := master.Target().Control; ctrl != nil {
-			if ctrl.Persist != "" {
-				args = append(args, "-o", "ControlPersist="+ctrl.Persist)
-			}
-			if ctrl.Master == ssh.ControlMasterAsk || ctrl.Master == ssh.ControlMasterAutoAsk {
-				masterMode = ssh.ControlMasterAsk
-			}
-		}
+	masterMode, persist := o.resolveMuxDaemonControl(master)
+	if persist != "" {
+		args = append(args, "-o", "ControlPersist="+persist)
 	}
 	// Ensure the detached multiplexing daemon never opens configured port or
 	// tunnel device forwardings from user/global SSH options.
@@ -1765,6 +1760,72 @@ func (o *SshOptions) muxDaemonArgs(nodeID string, expandedPath string, master *s
 	// confirmation semantics across ControlPersist handoff.
 	args = append(args, "-o", "ControlMaster="+string(masterMode))
 	return args
+}
+
+func (o *SshOptions) resolveMuxDaemonControl(master *ssh.MuxServer) (ssh.ControlMasterMode, string) {
+	masterMode := ssh.ControlMasterYes
+	if master != nil {
+		if ctrl := master.Target().Control; ctrl != nil {
+			if ctrl.Master == ssh.ControlMasterAsk || ctrl.Master == ssh.ControlMasterAutoAsk {
+				masterMode = ssh.ControlMasterAsk
+			}
+			return masterMode, ctrl.Persist
+		}
+		return masterMode, ""
+	}
+	if o == nil {
+		return masterMode, ""
+	}
+	if ctrlOpts, err := o.control.ToSessionControlOptions(); err == nil {
+		var persist string
+		if ctrlOpts.Persist != nil {
+			persist = *ctrlOpts.Persist
+		}
+		if ctrlOpts.Master != nil && (*ctrlOpts.Master == ssh.ControlMasterAsk || *ctrlOpts.Master == ssh.ControlMasterAutoAsk) {
+			masterMode = ssh.ControlMasterAsk
+		}
+		return masterMode, persist
+	}
+	return masterMode, firstCLIControlPersistOption(o.control.Options)
+}
+
+func firstCLIControlPersistOption(opts []string) string {
+	for _, opt := range opts {
+		key, val, err := adapter.SplitOptionKeyValue(opt)
+		if err != nil || key == "" {
+			continue
+		}
+		if spec, ok := ssh.LookupOptionSpec(key); ok && spec.CanonicalKey == ssh.OptionControlPersist {
+			return val
+		}
+	}
+	return ""
+}
+
+func isMuxDaemonAuthoritativeOption(opt string) bool {
+	key, _, err := adapter.SplitOptionKeyValue(opt)
+	if err != nil || key == "" {
+		return false
+	}
+	spec, ok := ssh.LookupOptionSpec(key)
+	if !ok {
+		return false
+	}
+	switch spec.CanonicalKey {
+	case ssh.OptionControlMaster, ssh.OptionControlPath, ssh.OptionControlPersist, ssh.OptionClearAllForwardings:
+		return true
+	default:
+		return false
+	}
+}
+
+func isIdentityFileOption(opt string) bool {
+	key, _, err := adapter.SplitOptionKeyValue(opt)
+	if err != nil || key == "" {
+		return false
+	}
+	spec, ok := ssh.LookupOptionSpec(key)
+	return ok && spec.CanonicalKey == ssh.OptionIdentityFile
 }
 
 func appendMuxDaemonHostNameOption(args []string, targetHost string, master *ssh.MuxServer) []string {
@@ -1837,6 +1898,12 @@ func (o *SshOptions) appendMuxDaemonForwardedOptions(args []string, master *ssh.
 	preserveProxyNone := isEffectiveCLIProxyCommandNone(o.control.Options)
 	emittedProxyNone := false
 	for _, opt := range o.control.Options {
+		if isMuxDaemonAuthoritativeOption(opt) {
+			continue
+		}
+		if len(keys) > 0 && isIdentityFileOption(opt) {
+			continue
+		}
 		if o.GatewayPorts && isGatewayPortsOption(opt) {
 			continue
 		}
@@ -1874,11 +1941,11 @@ func (o *SshOptions) firstCLIIdentityFile(keys []string) string {
 	if o == nil {
 		return ""
 	}
-	if o.IdentityFile != "" {
-		return o.IdentityFile
-	}
 	if len(keys) > 0 {
 		return keys[0]
+	}
+	if o.IdentityFile != "" {
+		return o.IdentityFile
 	}
 	return ""
 }
@@ -3088,10 +3155,13 @@ func updateNodeFields(node *models.Node, nodeID string, o *SshOptions, provider 
 	}
 
 	if o.Alias != "" {
+		if err := config.ValidateNodeAlias(o.Alias); err != nil {
+			return false, err
+		}
 		// 检查别名是否已被其他节点使用
 		if existingNode := provider.FindAlias(o.Alias); existingNode != "" && existingNode != nodeID {
 			// 别名已存在，跳过
-		} else {
+		} else if !slices.Contains(node.Alias, o.Alias) {
 			node.Alias = append(node.Alias, o.Alias)
 			nodeUpdated = true
 		}

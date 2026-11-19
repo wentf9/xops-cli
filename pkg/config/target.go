@@ -131,6 +131,16 @@ func ValidateNodeAlias(alias string) error {
 	return nil
 }
 
+// ValidateNodeAliases ensures every custom alias in aliases satisfies ValidateNodeAlias.
+func ValidateNodeAliases(aliases []string) error {
+	for _, alias := range aliases {
+		if err := ValidateNodeAlias(alias); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 type openSSHParserSource interface {
 	GetOpenSSHParser() *OpenSSHParser
 }

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -472,6 +473,19 @@ func validateExplicitNonEmptyFlags(flags *pflag.FlagSet) error {
 	}
 	if f := flags.Lookup("identity"); f != nil && f.Changed {
 		return validateNonEmptyIdentityFlag(f, flags)
+	}
+	return nil
+}
+
+func validateCLIAlias(alias string) error {
+	if alias == "" {
+		return nil
+	}
+	if err := config.ValidateNodeAlias(alias); err != nil {
+		return err
+	}
+	if strings.Contains(alias, "@") || strings.Contains(alias, ":") {
+		return errors.New(i18n.T("ssh_err_alias_invalid"))
 	}
 	return nil
 }

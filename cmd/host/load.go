@@ -301,6 +301,9 @@ func prepareImport(repo *config.Repository, addr utils.HostInfo, tag string) (*i
 		}
 	}
 	if addr.Alias != "" {
+		if err := config.ValidateNodeAlias(addr.Alias); err != nil {
+			return nil, err
+		}
 		if existing := repo.FindAlias(addr.Alias); existing != "" && existing != draft.nodeID {
 			return nil, fmt.Errorf("%s", i18n.Tf("alias_err_exists", map[string]any{"Alias": addr.Alias, "Node": existing}))
 		}

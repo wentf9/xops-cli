@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 )
 
@@ -76,5 +78,27 @@ func TestRunInventoryLoad_TemplateExport(t *testing.T) {
 	expectedEn := "host,port,alias,user,password,key,keypass\n"
 	if string(contentEn) != expectedEn {
 		t.Errorf("expected header %q, got %q", expectedEn, string(contentEn))
+	}
+}
+
+func TestPass10_M1_LoadRejectsReservedOpenSSHAliases(t *testing.T) {
+	dir := t.TempDir()
+	repo, err := config.NewRepositoryWithoutOpenSSH(
+		config.NewProviderWithoutOpenSSH(nil).Snapshot(),
+		config.NewDefaultStore(filepath.Join(dir, "xops_config.yaml"), filepath.Join(dir, "xops.key")),
+	)
+	if err != nil {
+		t.Fatalf("NewRepositoryWithoutOpenSSH: %v", err)
+	}
+	for _, badAlias := range []string{"openssh", "OPENSSH", "openssh:prod"} {
+		_, err := prepareImport(repo, utils.HostInfo{
+			Host:  "10.0.0.50",
+			Port:  22,
+			User:  "ops",
+			Alias: badAlias,
+		}, "imported")
+		if err == nil {
+			t.Errorf("prepareImport allowed reserved alias %q", badAlias)
+		}
 	}
 }

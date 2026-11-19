@@ -703,10 +703,17 @@ func (c *Connector) resolveSecret(cfg *ClientConfig, req SecretRequest) ([]byte,
 }
 
 func (c *Connector) recordAuthUpdate(ctx context.Context, nodeName string, cfg *ClientConfig, rootConn net.Conn) (string, error) {
+	return c.recordAuthUpdateWithKeyPath(ctx, nodeName, cfg, cfg.KeyPath, rootConn)
+}
+
+func (c *Connector) recordAuthUpdateWithKeyPath(ctx context.Context, nodeName string, cfg *ClientConfig, recordKeyPath string, rootConn net.Conn) (string, error) {
 	if (cfg.Password == "" && cfg.Passphrase == "") || cfg.AuthUpdateToken == "" {
 		return cfg.AuthUpdateToken, nil
 	}
-	committedToken, err := c.credentialRecorder.UpdateAuth(ctx, nodeName, cfg.AuthUpdateToken, cfg.Password, cfg.KeyPath, cfg.Passphrase)
+	if recordKeyPath == "" {
+		recordKeyPath = cfg.KeyPath
+	}
+	committedToken, err := c.credentialRecorder.UpdateAuth(ctx, nodeName, cfg.AuthUpdateToken, cfg.Password, recordKeyPath, cfg.Passphrase)
 	if err != nil {
 		if reportCredentialFailure(ctx, c.getNodeSecretPrompter(cfg), "save", err) {
 			return "", errCredentialNotSaved
@@ -731,16 +738,29 @@ func (c *Connector) recordAndSyncAuthAfterHandshake(
 	nodeName string,
 	cfg *ClientConfig,
 	originalKeyPath string,
+	originalKeyPaths []string,
 	discoveredAuth bool,
 	rootConn net.Conn,
 ) error {
 	oldAuthToken := cfg.AuthUpdateToken
+	discoveredKeyPath := ""
+	if cfg.Passphrase != "" && cfg.KeyPath != "" {
+		discoveredKeyPath = cfg.KeyPath
+	}
+	// Restore the pre-handshake snapshot baseline so discovered passphrase key
+	// paths never mutate cfg.KeyPath before target compatibility checks.
+	cfg.KeyPath = originalKeyPath
+
 	hasAuthUpdate := shouldRecordDiscoveredAuth(discoveredAuth, oldAuthToken, cfg)
 	var committedAuthToken string
 	recordingFailed := false
 	if hasAuthUpdate {
+		recordKeyPath := cfg.KeyPath
+		if discoveredKeyPath != "" {
+			recordKeyPath = discoveredKeyPath
+		}
 		var err error
-		committedAuthToken, err = c.recordAuthUpdate(ctx, nodeName, cfg, rootConn)
+		committedAuthToken, err = c.recordAuthUpdateWithKeyPath(ctx, nodeName, cfg, recordKeyPath, rootConn)
 		if errors.Is(err, errCredentialNotSaved) {
 			recordingFailed = true
 			hasAuthUpdate = false
@@ -749,11 +769,10 @@ func (c *Connector) recordAndSyncAuthAfterHandshake(
 		}
 	}
 
-	if !hasAuthUpdate && !recordingFailed && oldAuthToken == "" {
-		cfg.KeyPath = originalKeyPath
-	}
-
-	if err := c.syncConnectionAfterRecording(nodeName, cfg, committedAuthToken, hasAuthUpdate, recordingFailed, originalKeyPath, rootConn); err != nil {
+	if err := c.syncRecordedConnection(
+		nodeName, cfg, oldAuthToken, committedAuthToken, hasAuthUpdate, recordingFailed,
+		originalKeyPath, originalKeyPaths, discoveredKeyPath, rootConn,
+	); err != nil {
 		return err
 	}
 
@@ -768,6 +787,7 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 	nodeName := planNode.name
 	cfg := planNode.cfg
 	originalKeyPath := cfg.KeyPath
+	originalKeyPaths := slices.Clone(cfg.KeyPaths)
 	if cfg.Port <= 0 {
 		cfg.Port = 22
 	}
@@ -814,7 +834,7 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 		return nil, err
 	}
 
-	if err := c.recordAndSyncAuthAfterHandshake(ctx, nodeName, cfg, originalKeyPath, discoveredAuth, rootConn); err != nil {
+	if err := c.recordAndSyncAuthAfterHandshake(ctx, nodeName, cfg, originalKeyPath, originalKeyPaths, discoveredAuth, rootConn); err != nil {
 		return nil, err
 	}
 
@@ -1500,56 +1520,153 @@ func checkInitializedTransport(nodeID string, cfg *ClientConfig, client *Client)
 	return nil
 }
 
-func (c *Connector) syncAuthTokensAfterConnection(nodeName string, cfg *ClientConfig, committedAuthToken string, hasAuthUpdate bool, rootConn net.Conn, originalKeyPaths ...string) error {
+func (c *Connector) syncRecordedConnection(
+	nodeName string,
+	cfg *ClientConfig,
+	oldAuthToken string,
+	committedAuthToken string,
+	hasAuthUpdate bool,
+	recordingFailed bool,
+	originalKeyPath string,
+	originalKeyPaths []string,
+	discoveredKeyPath string,
+	rootConn net.Conn,
+) error {
 	if c.provider == nil {
+		if hasAuthUpdate && discoveredKeyPath != "" && committedAuthToken != oldAuthToken {
+			cfg.KeyPath = discoveredKeyPath
+		}
 		return nil
 	}
+	newCfg, err := c.reloadConfigAfterRecording(nodeName, hasAuthUpdate, rootConn)
+	if err != nil || newCfg == nil {
+		return err
+	}
+
+	expected := cfg.ToConnectionConfig()
+	expected.KeyPath = originalKeyPath
+	expected.KeyPaths = slices.Clone(originalKeyPaths)
+	mayHavePersistedKey := discoveredKeyPath != "" && ((hasAuthUpdate && committedAuthToken != "" && committedAuthToken != oldAuthToken) || recordingFailed)
+	if mayHavePersistedKey && isCompatibleRecordedKeyProjection(originalKeyPath, originalKeyPaths, discoveredKeyPath, newCfg.KeyPath, newCfg.KeyPaths) {
+		expected.KeyPath = newCfg.KeyPath
+		expected.KeyPaths = slices.Clone(newCfg.KeyPaths)
+	}
+
+	// [P1] 校验完整连接目标（Address, Port, User, KeyPath, ProxyJump）是否仍然与当前已建立的连接一致
+	if err := validateTargetCompatibility(expected, newCfg); err != nil {
+		return closeRootConnWithError(rootConn, fmt.Sprintf("incompatible target update for node %q during connection setup", nodeName), err)
+	}
+
+	if hasAuthUpdate {
+		if err := applyCommittedAuthMetadata(cfg, newCfg, nodeName, committedAuthToken, rootConn); err != nil {
+			return err
+		}
+	}
+	cfg.KeyPath = newCfg.KeyPath
+	cfg.KeyPaths = slices.Clone(newCfg.KeyPaths)
+	return nil
+}
+
+func (c *Connector) reloadConfigAfterRecording(nodeName string, hasAuthUpdate bool, rootConn net.Conn) (*ClientConfig, error) {
 	newCfg, err := c.provider.GetConfig(nodeName)
 	if err != nil {
 		if hasAuthUpdate {
-			if closeErr := rootConn.Close(); closeErr != nil {
-				return fmt.Errorf("reload config for node %q after auth update failed: %w; close unpublished SSH client failed: %w", nodeName, err, closeErr)
-			}
-			return fmt.Errorf("reload config for node %q after auth update failed: %w", nodeName, err)
+			return nil, closeRootConnWithError(rootConn, fmt.Sprintf("reload config for node %q after auth update failed", nodeName), err)
 		}
-		return nil
+		return nil, nil
 	}
 	if newCfg == nil {
-		return nil
+		return nil, nil
 	}
 	newClone := *newCfg
 	newClone.Address = normalizeHostAddress(newCfg.Address)
-	newCfg = &newClone
+	return &newClone, nil
+}
 
-	reconcileFailedWriteKeyPath(cfg, newCfg, originalKeyPaths)
-
-	// [P1] 校验完整连接目标（Address, Port, User, KeyPath, ProxyJump）是否仍然与当前已建立的连接一致
-	if err := validateTargetCompatibility(cfg.ToConnectionConfig(), newCfg); err != nil {
-		if closeErr := rootConn.Close(); closeErr != nil {
-			return fmt.Errorf("incompatible target update for node %q during connection setup: %w; close unpublished SSH client failed: %w", nodeName, err, closeErr)
-		}
-		return fmt.Errorf("incompatible target update for node %q during connection setup: %w", nodeName, err)
-	}
-
+func applyCommittedAuthMetadata(cfg, newCfg *ClientConfig, nodeName, committedAuthToken string, rootConn net.Conn) error {
 	// [P1] 校验刷新版本与本次写回的对应关系：必须严格等于本次事务实际提交的版本，拒绝采纳后续无关更新，且允许幂等未变
-	if hasAuthUpdate {
-		if committedAuthToken != "" && newCfg.AuthUpdateToken != committedAuthToken {
-			if closeErr := rootConn.Close(); closeErr != nil {
-				return fmt.Errorf("%w: auth version mismatch after update for node %q (expected %q, got %q); close unpublished SSH client failed: %w",
-					ErrSnapshotMismatch, nodeName, committedAuthToken, newCfg.AuthUpdateToken, closeErr)
-			}
-			return fmt.Errorf("%w: auth version mismatch after update for node %q (expected %q, got %q)",
-				ErrSnapshotMismatch, nodeName, committedAuthToken, newCfg.AuthUpdateToken)
+	if committedAuthToken != "" && newCfg.AuthUpdateToken != committedAuthToken {
+		mismatchErr := fmt.Errorf("%w: auth version mismatch after update for node %q (expected %q, got %q)",
+			ErrSnapshotMismatch, nodeName, committedAuthToken, newCfg.AuthUpdateToken)
+		if closeErr := rootConn.Close(); closeErr != nil {
+			return fmt.Errorf("%w; close unpublished SSH client failed: %w", mismatchErr, closeErr)
 		}
-		cfg.AuthUpdateToken = newCfg.AuthUpdateToken
-		if newCfg.HasOriginalProxyJump {
-			cfg.OriginalProxyJump = newCfg.OriginalProxyJump
-			cfg.HasOriginalProxyJump = true
-		} else if newCfg.OriginalProxyJump != "" {
-			cfg.OriginalProxyJump = newCfg.OriginalProxyJump
-		}
+		return mismatchErr
+	}
+	cfg.AuthUpdateToken = newCfg.AuthUpdateToken
+	if newCfg.HasOriginalProxyJump {
+		cfg.OriginalProxyJump = newCfg.OriginalProxyJump
+		cfg.HasOriginalProxyJump = true
+	} else if newCfg.OriginalProxyJump != "" {
+		cfg.OriginalProxyJump = newCfg.OriginalProxyJump
 	}
 	return nil
+}
+
+func closeRootConnWithError(rootConn net.Conn, contextMsg string, cause error) error {
+	if closeErr := rootConn.Close(); closeErr != nil {
+		return fmt.Errorf("%s: %w; close unpublished SSH client failed: %w", contextMsg, cause, closeErr)
+	}
+	return fmt.Errorf("%s: %w", contextMsg, cause)
+}
+
+func isCompatibleRecordedKeyProjection(origKeyPath string, origKeyPaths []string, discoveredKeyPath, newKeyPath string, newKeyPaths []string) bool {
+	if newKeyPath != origKeyPath && newKeyPath != discoveredKeyPath {
+		return false
+	}
+	if slices.Equal(newKeyPaths, origKeyPaths) {
+		return true
+	}
+	if countKeyOccurrences(newKeyPaths, discoveredKeyPath) != 1 {
+		return false
+	}
+	remNew := filterOutKeyPath(newKeyPaths, discoveredKeyPath)
+	remOrig := filterOutKeyPath(origKeyPaths, discoveredKeyPath)
+	if slices.Equal(remNew, remOrig) {
+		return true
+	}
+	return len(remOrig) == len(remNew)+1 && isSingleDeletionSubsequence(remNew, remOrig)
+}
+
+func countKeyOccurrences(paths []string, target string) int {
+	count := 0
+	for _, p := range paths {
+		if p == target {
+			count++
+		}
+	}
+	return count
+}
+
+func filterOutKeyPath(paths []string, target string) []string {
+	var out []string
+	for _, p := range paths {
+		if p != target {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func isSingleDeletionSubsequence(shorter, longer []string) bool {
+	if len(longer) != len(shorter)+1 {
+		return false
+	}
+	i, j := 0, 0
+	skipped := false
+	for i < len(shorter) && j < len(longer) {
+		if shorter[i] == longer[j] {
+			i++
+			j++
+			continue
+		}
+		if skipped {
+			return false
+		}
+		skipped = true
+		j++
+	}
+	return i == len(shorter)
 }
 
 // EnableKeepAlive 启用连接池周期心跳（opt-in，幂等）。
@@ -3513,16 +3630,14 @@ func (c *Connector) confirmAuthenticatedConnection(ctx context.Context, nodeID s
 }
 
 func (c *Connector) syncConnectionAfterRecording(node string, cfg *ClientConfig, token string, updated, failed bool, originalKeyPath string, root net.Conn) error {
-	if failed || !updated || token == cfg.AuthUpdateToken {
-		return c.syncAuthTokensAfterConnection(node, cfg, token, updated, root, originalKeyPath)
+	oldAuthToken := cfg.AuthUpdateToken
+	discoveredKeyPath := ""
+	if cfg.KeyPath != "" && cfg.KeyPath != originalKeyPath {
+		discoveredKeyPath = cfg.KeyPath
 	}
-	return c.syncAuthTokensAfterConnection(node, cfg, token, updated, root)
-}
-
-func reconcileFailedWriteKeyPath(cfg, latest *ClientConfig, original []string) {
-	// A failed write may retain the original path or publish the discovered one.
-	// An unrelated path must still fail normal target compatibility checks.
-	if len(original) == 1 && latest.KeyPath == original[0] {
-		cfg.KeyPath = latest.KeyPath
-	}
+	cfg.KeyPath = originalKeyPath
+	return c.syncRecordedConnection(
+		node, cfg, oldAuthToken, token, updated, failed,
+		originalKeyPath, slices.Clone(cfg.KeyPaths), discoveredKeyPath, root,
+	)
 }
