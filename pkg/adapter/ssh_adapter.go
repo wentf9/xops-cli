@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"regexp"
 	"strconv"
 	"strings"
@@ -680,54 +679,11 @@ func (a *SSHAdapter) GetControlConfig(nodeID string) (*ssh.ControlConfig, error)
 // ResolveSSHOptions resolves the effective ssh.Options for nodeName given session options,
 // enforcing the 4-tier precedence hierarchy (Tier 1 CLI > Tier 2 Node > Tier 3 Global > Tier 4 ~/.ssh/config).
 func (a *SSHAdapter) ResolveSSHOptions(nodeName string, sessionOpts SessionControlOptions) (*ssh.Options, error) {
-	if a.cfgProvider == nil {
-		return nil, fmt.Errorf("configuration provider is nil")
-	}
-
-	t2Opts, t3Opts, t4Opts := a.resolveOptionTiers(nodeName)
-	tier1ActiveJump := a.hasActiveTier1ProxyJump(nodeName)
-	t2Opts, t3Opts, t4Opts = a.maskLowerProxyCommandForProxyJump(nodeName, tier1ActiveJump, t2Opts, t3Opts, t4Opts)
-	merged, err := ssh.EffectiveOptions(sessionOpts.ToSSHOptions(), t2Opts, t3Opts, t4Opts)
+	pol, err := a.solvePolicy(nodeName, sessionOpts, policySolveMode{resolveOptions: true})
 	if err != nil {
 		return nil, err
 	}
-	if tier1ActiveJump && merged != nil {
-		merged.Delete(ssh.OptionProxyCommand)
-	}
-	if merged.IsEmpty() {
-		return nil, nil
-	}
-	// Multiplexing options are governed and validated by ResolveControl / GetControlConfig;
-	// strip control fields when control multiplexing is disabled on this adapter.
-	if a.disableControl {
-		merged.StripClasses(ssh.OptionClassMux)
-	}
-	if a.disableHostTrust {
-		merged.StripClasses(ssh.OptionClassTrust)
-	}
-	if a.disableForward {
-		merged.StripClasses(ssh.OptionClassForward)
-	}
-	if a.disableSession {
-		merged.StripClasses(ssh.OptionClassSession)
-	}
-	if a.disableSessionAndForward {
-		merged.StripClasses(ssh.OptionClassForward, ssh.OptionClassSession)
-	}
-	if a.nonInteractive {
-		merged.Delete(ssh.OptionForwardAgent)
-	}
-	if !a.localExecEnabled() {
-		merged.Delete(ssh.OptionLocalCommand)
-		merged.Delete(ssh.OptionPermitLocalCommand)
-		if key := firstLocalExecOption(merged); key != "" {
-			return nil, fmt.Errorf("%w: %s", ErrLocalExecutionDisabled, key)
-		}
-	}
-	if merged.IsEmpty() {
-		return nil, nil
-	}
-	return merged, nil
+	return pol.effectiveOpts, nil
 }
 
 func firstLocalExecOption(opts *ssh.Options) string {
@@ -754,246 +710,17 @@ func isActiveProxyJumpValue(val string) bool {
 	return trimmed != "" && !strings.EqualFold(trimmed, "none")
 }
 
-func (a *SSHAdapter) hasActiveTier1ProxyJump(nodeName string) bool {
-	override, ok := a.getSessionOverride(nodeName)
-	return ok && isActiveProxyJumpValue(override.ProxyJump)
-}
-
-func (a *SSHAdapter) maskLowerProxyCommandForProxyJump(nodeName string, tier1ActiveJump bool, t2Opts, t3Opts, t4Opts *ssh.Options) (*ssh.Options, *ssh.Options, *ssh.Options) {
-	if tier1ActiveJump {
-		return cloneWithoutProxyCommand(t2Opts), cloneWithoutProxyCommand(t3Opts), cloneWithoutProxyCommand(t4Opts)
-	}
-	if snap, err := a.cfgProvider.ResolveConnection(nodeName); err == nil && isActiveProxyJumpValue(snap.Node.ProxyJump) {
-		if !snap.Provenance.IsUnpersistedOpenSSH() {
-			return t2Opts, cloneWithoutProxyCommand(t3Opts), cloneWithoutProxyCommand(t4Opts)
-		}
-	}
-	return t2Opts, t3Opts, t4Opts
-}
-
-func (a *SSHAdapter) higherTierProxyCommandOverridesJump(nodeID string, sessionCtrlOpts SessionControlOptions, hasTier1ProxyJump bool, nodeProxyJump string) bool {
-	if hasTier1ProxyJump || !isActiveProxyJumpValue(nodeProxyJump) {
-		return false
-	}
-	if sessionCtrlOpts.Options != nil && sessionCtrlOpts.Options.ActiveProxyCommand() != "" {
-		return true
-	}
-	var isUnpersistedOpenSSH bool
-	if a.cfgProvider != nil {
-		if snap, err := a.cfgProvider.ResolveConnection(nodeID); err == nil {
-			isUnpersistedOpenSSH = snap.Provenance.IsUnpersistedOpenSSH()
-		} else {
-			isUnpersistedOpenSSH = config.IsOpenSSHNodeID(nodeID)
-		}
-	} else {
-		isUnpersistedOpenSSH = config.IsOpenSSHNodeID(nodeID)
-	}
-	if isUnpersistedOpenSSH && a.cfgProvider != nil {
-		if globalCfg := a.cfgProvider.Snapshot(); globalCfg != nil && globalCfg.SSHOptions != nil && globalCfg.SSHOptions.ActiveProxyCommand() != "" {
-			return true
-		}
-	}
-	return false
-}
-
-func (a *SSHAdapter) resolveOptionTiers(nodeName string) (tier2Node, tier3Global, tier4OpenSSH *ssh.Options) {
-	snapshot, snapErr := a.cfgProvider.ResolveConnection(nodeName)
-	if globalCfg := a.cfgProvider.Snapshot(); globalCfg != nil {
-		tier3Global = globalCfg.SSHOptions
-	}
-
-	if snapErr == nil {
-		switch snapshot.Provenance {
-		case config.ProvenanceOpenSSHDerived:
-			tier4OpenSSH = a.resolveTier4OpenSSHOptions(nodeName, snapErr, snapshot).Clone()
-		case config.ProvenanceOpenSSHVirtual:
-			tier4OpenSSH = snapshot.Node.SSHOptions.Clone()
-		default:
-			tier2Node = snapshot.Node.SSHOptions
-			tier4OpenSSH = filterNonVirtualTier4Options(a.resolveTier4OpenSSHOptions(nodeName, snapErr, snapshot))
-		}
-	} else if !config.IsOpenSSHNodeID(nodeName) {
-		tier4OpenSSH = filterNonVirtualTier4Options(a.resolveTier4OpenSSHOptions(nodeName, snapErr, snapshot))
-	}
-
-	if tier4OpenSSH != nil && tier4OpenSSH.ControlConfig() != nil {
-		tier4OpenSSH.ImplicitTier4 = true
-	}
-	return tier2Node, tier3Global, tier4OpenSSH
-}
-
-func filterNonVirtualTier4Options(rawTier4 *ssh.Options) *ssh.Options {
-	if rawTier4 == nil {
-		return nil
-	}
-	filtered := rawTier4.FilterByClasses(
-		ssh.OptionClassMux,
-		ssh.OptionClassTransport,
-	)
-	if strings.EqualFold(strings.TrimSpace(rawTier4.Get(ssh.OptionHashKnownHosts)), "yes") {
-		if filtered == nil {
-			filtered = &ssh.Options{}
-		}
-		_ = filtered.Set(ssh.OptionHashKnownHosts, "yes")
-	}
-	return filtered
-}
-
 // ResolveControl resolves the effective ControlConfig for nodeID given session options,
 // strictly enforcing the 4-tier precedence hierarchy and field-by-field merging semantics.
 func (a *SSHAdapter) ResolveControl(nodeName string, sessionOpts SessionControlOptions) (*ssh.ControlConfig, error) {
-	if a.disableControl {
+	if a != nil && a.disableControl {
 		return nil, nil
 	}
-	if a.cfgProvider == nil {
-		return nil, fmt.Errorf("configuration provider is nil")
-	}
-
-	t2Opts, t3Opts, t4Opts := a.resolveOptionTiers(nodeName)
-	tier2NodeCtrl := t2Opts.ControlConfig()
-	tier3GlobalCtrl := t3Opts.ControlConfig()
-	tier4OpenSSHCtrl := t4Opts.ControlConfig()
-
-	// 4. Field-by-field merging: Tier 1 > Tier 2 > Tier 3 > Tier 4
-	merged := mergeControlFields(sessionOpts, tier2NodeCtrl, tier3GlobalCtrl, tier4OpenSSHCtrl)
-	if merged == nil {
-		return nil, nil // No multiplexing configured
-	}
-
-	// 5. Validation
-	if err := validateMergedControl(merged); err != nil {
+	pol, err := a.solvePolicy(nodeName, sessionOpts, policySolveMode{resolveControl: true})
+	if err != nil {
 		return nil, err
 	}
-
-	return merged, nil
-}
-
-func (a *SSHAdapter) resolveTier4OpenSSHOptions(nodeName string, snapErr error, snapshot config.ConnectionSnapshot) *ssh.Options {
-	if snapErr == nil {
-		switch snapshot.Provenance {
-		case config.ProvenanceOpenSSHDerived:
-			if parser := a.getOpenSSHParser(); parser != nil {
-				if opts, err := parser.GetSSHOptions(snapshot.Node.OpenSSHAlias); err == nil && !opts.IsEmpty() {
-					return opts
-				}
-			}
-			return nil
-		case config.ProvenanceOpenSSHVirtual:
-			return nil
-		}
-	}
-	if config.IsOpenSSHNodeID(nodeName) {
-		return nil
-	}
-	parser := a.getOpenSSHParser()
-	if parser == nil {
-		return nil
-	}
-	lookupKeys := a.buildTier4OpenSSHLookupKeys(parser, nodeName, snapErr, snapshot)
-
-	// 1. First pass: prioritize concrete host matches (defined without wildcards like Host *)
-	// across OpenSSHAlias, nodeName, Host.Address, and Alias so specific definitions take precedence.
-	var layers []*ssh.Options
-	for _, key := range lookupKeys {
-		if parser.HasHost(key) {
-			if opts, err := parser.GetSSHOptions(key); err == nil && !opts.IsEmpty() {
-				layers = append(layers, opts)
-			}
-		}
-	}
-	if len(layers) == 0 {
-		// 2. Second pass: fallback to generic wildcard / pattern matches (e.g. Host *).
-		for _, key := range lookupKeys {
-			if opts, err := parser.GetSSHOptions(key); err == nil && !opts.IsEmpty() {
-				layers = append(layers, opts)
-			}
-		}
-	}
-	return ssh.MergeOptionLayers(layers...)
-}
-
-func (a *SSHAdapter) buildTier4OpenSSHLookupKeys(parser *config.OpenSSHParser, nodeName string, snapErr error, snapshot config.ConnectionSnapshot) []string {
-	var lookupKeys []string
-	appendUnique := func(keys ...string) {
-		for _, k := range keys {
-			k = strings.TrimSpace(k)
-			if k != "" && !slicesContain(lookupKeys, k) {
-				lookupKeys = append(lookupKeys, k)
-			}
-		}
-	}
-
-	openSSHAlias := snapshot.Node.OpenSSHAlias
-	if openSSHAlias == "" {
-		openSSHAlias = a.lookupNodeOpenSSHAlias(nodeName)
-	}
-	if openSSHAlias != "" {
-		appendUnique(openSSHAlias)
-	}
-	if snapErr != nil {
-		if !strings.Contains(nodeName, "@") && !strings.Contains(nodeName, ":") {
-			appendUnique(nodeName)
-		}
-		if addr, port, ok := parseFallbackNodeIDAddressPort(nodeName); ok {
-			appendUnique(parser.FindConcreteHostsByAddress(addr, port)...)
-			if addr != nodeName {
-				appendUnique(addr)
-			}
-		} else {
-			appendUnique(nodeName)
-		}
-		return lookupKeys
-	}
-
-	appendUnique(snapshot.Node.Alias...)
-	appendUnique(snapshot.Host.Alias...)
-	if !strings.Contains(nodeName, "@") && !strings.Contains(nodeName, ":") {
-		appendUnique(nodeName)
-	}
-	if snapshot.Host.Address != "" {
-		appendUnique(parser.FindConcreteHostsByAddress(snapshot.Host.Address, uint16(effectiveSnapshotPort(snapshot.Host.Port)))...)
-		if snapshot.Host.Address != nodeName {
-			appendUnique(snapshot.Host.Address)
-		}
-	}
-	appendUnique(nodeName)
-	return lookupKeys
-}
-
-func (a *SSHAdapter) lookupNodeOpenSSHAlias(nodeName string) string {
-	if a == nil || a.cfgProvider == nil || nodeName == "" {
-		return ""
-	}
-	if p, ok := a.cfgProvider.(interface{ NodeOpenSSHAlias(string) string }); ok {
-		return p.NodeOpenSSHAlias(nodeName)
-	}
-	return ""
-}
-
-func parseFallbackNodeIDAddressPort(nodeName string) (string, uint16, bool) {
-	spec := strings.TrimSpace(nodeName)
-	if at := strings.LastIndex(spec, "@"); at >= 0 {
-		spec = strings.TrimSpace(spec[at+1:])
-	}
-	host, portText, err := net.SplitHostPort(spec)
-	if err != nil {
-		return "", 0, false
-	}
-	host = strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(host), "]"), "[")
-	parsedPort, parseErr := strconv.ParseUint(strings.TrimSpace(portText), 10, 16)
-	if host == "" || parseErr != nil || parsedPort == 0 {
-		return "", 0, false
-	}
-	return host, uint16(parsedPort), true
-}
-
-func slicesContain(items []string, target string) bool {
-	for _, item := range items {
-		if item == target {
-			return true
-		}
-	}
-	return false
+	return pol.effectiveCtrl, nil
 }
 
 func validateMergedControl(merged *ssh.ControlConfig) error {
@@ -1151,28 +878,11 @@ func (a *SSHAdapter) ExpandControlPath(nodeID string, rawPath string) (string, e
 	if rawPath == "" || rawPath == "none" {
 		return rawPath, nil
 	}
-	snapshot, err := a.cfgProvider.ResolveConnection(nodeID)
+	pol, err := a.solvePolicy(nodeID, SessionControlOptions{}, policySolveMode{requireSnapshot: true})
 	if err != nil {
 		return "", fmt.Errorf("resolve node %q for control path expansion: %w", nodeID, err)
 	}
-	origHost := nodeID
-	if cleanOrig := openSSHSnapshotOriginalHost(nodeID, snapshot); cleanOrig != "" {
-		origHost = cleanOrig
-	}
-	if ov, ok := a.getSessionOverride(nodeID); ok && strings.TrimSpace(ov.OriginalHost) != "" {
-		origHost = strings.TrimSpace(ov.OriginalHost)
-		if cleanOrig, ok := config.OpenSSHOriginalHost(origHost); ok {
-			origHost = cleanOrig
-		}
-	}
-	target := ssh.TargetContext{
-		Host:         strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(snapshot.Host.Address), "]"), "["),
-		Port:         effectiveSnapshotPort(snapshot.Host.Port),
-		User:         effectiveSnapshotUser(snapshot.Identity.User),
-		OriginalHost: origHost,
-		JumpHost:     snapshot.Node.ProxyJump,
-	}
-	return ssh.ExpandControlPath(rawPath, sshenv.Discover(), target)
+	return ssh.ExpandControlPath(rawPath, sshenv.Discover(), pol.controlTargetContext(nodeID))
 }
 
 // ConfirmConnection publishes a prepared node before credentials are recorded.
@@ -1197,10 +907,18 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 	if a.cfgProvider == nil {
 		return nil, fmt.Errorf("configuration provider is nil")
 	}
-	snapshot, err := a.cfgProvider.ResolveConnection(nodeID)
+	sessionCtrlOpts, _ := a.getSessionControlOverride(nodeID)
+	pol, err := a.solvePolicy(nodeID, sessionCtrlOpts, policySolveMode{
+		requireSnapshot: true,
+		resolveOptions:  true,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("resolve node %q failed: %w", nodeID, err)
+		if !pol.hasSnapshot {
+			return nil, fmt.Errorf("resolve node %q failed: %w", nodeID, err)
+		}
+		return nil, fmt.Errorf("resolve ssh options for node %q failed: %w", nodeID, err)
 	}
+	snapshot := pol.snapshot
 	var authUpdateToken, sudoUpdateToken string
 	if snapshot.UpdateRef != nil {
 		authUpdateToken = string(snapshot.UpdateRef.AuthVersion[:])
@@ -1208,28 +926,21 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 	}
 
 	var globalExec *ssh.ExecutionConfig
-	if globalCfg := a.cfgProvider.Snapshot(); globalCfg != nil {
-		globalExec = globalCfg.Execution
+	if pol.globalCfg != nil {
+		globalExec = pol.globalCfg.Execution
 	}
 	execCfg, err := ssh.ResolveExecution(snapshot.Node.Execution, globalExec)
 	if err != nil {
 		return nil, fmt.Errorf("resolve execution for node %q failed: %w", nodeID, err)
 	}
 
-	sessionCtrlOpts, _ := a.getSessionControlOverride(nodeID)
-	sshOpts, err := a.ResolveSSHOptions(nodeID, sessionCtrlOpts)
-	if err != nil {
-		return nil, fmt.Errorf("resolve ssh options for node %q failed: %w", nodeID, err)
-	}
-
-	origHost := openSSHSnapshotOriginalHost(nodeID, snapshot)
-
+	sshOpts := pol.effectiveOpts
 	cfg := &ssh.ClientConfig{
 		NodeID:                nodeID,
 		Address:               strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(snapshot.Host.Address), "]"), "["),
 		Port:                  effectiveSnapshotPort(snapshot.Host.Port),
 		User:                  effectiveSnapshotUser(snapshot.Identity.User),
-		OriginalHost:          origHost,
+		OriginalHost:          pol.originalHost,
 		AuthType:              snapshot.Identity.AuthType,
 		Password:              snapshot.Identity.Password,
 		KeyPath:               snapshot.Identity.KeyPath,
@@ -1246,16 +957,14 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 		Options:               sshOpts,
 	}
 
-	var override SessionAuth
-	var hasOverride bool
-	if ov, ok := a.getSessionOverride(nodeID); ok {
-		override = ov
-		hasOverride = true
+	override := pol.tier1Auth
+	hasOverride := pol.hasTier1Auth
+	if hasOverride {
 		if err := a.applySessionOverrideToConfig(nodeID, cfg, override); err != nil {
 			return nil, err
 		}
 	}
-	if a.higherTierProxyCommandOverridesJump(nodeID, sessionCtrlOpts, hasOverride && isActiveProxyJumpValue(override.ProxyJump), snapshot.Node.ProxyJump) {
+	if pol.higherTierCmdWins {
 		cfg.ProxyJump = ""
 		cfg.OriginalProxyJump = ""
 	}
