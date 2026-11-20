@@ -40,12 +40,13 @@ func TestRound6_P1_1_CustomSavedNodeIPv6AndSharedIPExcludeSafety(t *testing.T) {
 
 	// 1. Direct Round-5 regression: custom-named saved node my-v6-box with non-canonical IPv6 target
 	// (even if candidate arrived with BaseNodeID=="") MUST be excluded by --exclude 2001:0DB8::1.
-	rawV6Cand := ExcludeTargetInfo{
+	rawV6Cand := BuildExcludeTargetInfo(ExcludeTargetBuildInput{
 		NodeID:         "ops@[2001:0DB8::1]:22",
+		ResolvedHost:   "2001:0DB8::1",
 		User:           "ops",
 		Port:           22,
 		UnmanagedHosts: []string{"2001:0DB8::1"},
-	}
+	})
 	excludes, err := ResolveExcludesForTargets(prov, []string{"2001:0DB8::1"}, []ExcludeTargetInfo{rawV6Cand})
 	if err != nil {
 		t.Fatalf("ResolveExcludesForTargets(2001:0DB8::1): %v", err)

@@ -34,6 +34,7 @@ type SshOptions struct {
 	originalHost           string
 	expandHost             string
 	canonicalized          bool
+	canonicalResolver      config.CanonicalResolver
 	syncedTargetHosts      bool
 	HostName               string
 	cliHostName            string
@@ -2680,8 +2681,11 @@ func (o *SshOptions) applyHostnameCanonicalization(ctx context.Context, provider
 		return nil
 	}
 	var matchedSavedNode bool
-	if resolved, err := config.ResolveTarget(provider, o.Target); err == nil {
+	if resolved, err := config.ResolveTarget(provider, effectiveConnectionTarget(o, "")); err == nil {
 		matchedSavedNode = isResolvedSavedNode(resolved)
+	}
+	if resolver == nil {
+		resolver = o.canonicalResolver
 	}
 	res, err := config.CanonicalizeHost(ctx, config.CanonicalizeInput{
 		Provider:         provider,

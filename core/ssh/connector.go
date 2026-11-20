@@ -442,10 +442,10 @@ func (c *Connector) resolveConnectionPlan(ctx context.Context, nodeName string) 
 			nodeCfg.OriginalProxyJump = nodeCfg.ProxyJump
 			nodeCfg.HasOriginalProxyJump = true
 		}
+		jumps := splitProxyJumpChain(nodeCfg.ProxyJump)
+		nodeCfg.ProxyJump = strings.Join(jumps, ",")
 		positions[current] = len(plan)
 		plan = append(plan, connectionPlanNode{name: current, cfg: &nodeCfg, control: c.resolveControl(current, &nodeCfg)})
-
-		jumps := splitProxyJumpChain(nodeCfg.ProxyJump)
 		if len(jumps) > 1 {
 			for index := len(jumps) - 1; index >= 0; index-- {
 				jumpName := jumps[index]
@@ -470,8 +470,10 @@ func (c *Connector) resolveConnectionPlan(ctx context.Context, nodeName string) 
 				if cloned.Port <= 0 {
 					cloned.Port = 22
 				}
-				cloned.OriginalProxyJump = jumpCfg.ProxyJump
-				cloned.HasOriginalProxyJump = true
+				if !cloned.HasOriginalProxyJump {
+					cloned.OriginalProxyJump = jumpCfg.ProxyJump
+					cloned.HasOriginalProxyJump = true
+				}
 				if index > 0 {
 					cloned.ProxyJump = strings.Join(jumps[:index], ",")
 				} else {
@@ -739,7 +741,7 @@ func (c *Connector) buildTargetContext(planNode connectionPlanNode) TargetContex
 		User:          user,
 		OriginalHost:  originalHost,
 		CanonicalHost: strings.TrimSpace(cfg.CanonicalHost),
-		JumpHost:      cfg.ProxyJump,
+		JumpHost:      NormalizeProxyJump(cfg.ProxyJump),
 		KeyPath:       cfg.KeyPath,
 		Control:       planNode.control,
 	}
@@ -800,8 +802,8 @@ func (c *Connector) tryConnectMultiplex(ctx context.Context, planNode connection
 
 	explicitMaster := (ctrl.Master == ControlMasterYes || ctrl.Master == ControlMasterAsk) && !ctrl.AllowReuse
 
-	// 1. Expand ControlPath tokens
-	expandedPath, err := ExpandControlPath(ctrl.Path, c.environment, target)
+	// 1. Expand ControlPath tokens (or validate literal pre-expanded path)
+	expandedPath, err := ctrl.ResolvePath(c.environment, target)
 	if err != nil {
 		c.warnOrDebugf(explicitMaster, "mux: expand control path %q failed: %v; continuing without connection sharing", ctrl.Path, err)
 		return nil, nil
@@ -1045,7 +1047,7 @@ func (c *Connector) maybeStartMasterListener(planNode connectionPlanNode, resolv
 		return
 	}
 
-	expandedPath, err := ExpandControlPath(ctrl.Path, c.environment, target)
+	expandedPath, err := ctrl.ResolvePath(c.environment, target)
 	if err != nil || ValidateControlPath(expandedPath) != nil {
 		return
 	}

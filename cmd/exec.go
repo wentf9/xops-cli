@@ -379,6 +379,7 @@ type execHostTask struct {
 	baseNodeID    string
 	openSSHAlias  string
 	canonicalHost string
+	resolvedHost  string
 	rawHost       string
 	host          string
 	originalHost  string
@@ -1145,7 +1146,7 @@ func (o *ExecOptions) planTaggedHostTask(
 		ProxyJump:    o.JumpHost,
 		HasProxyJump: o.JumpHost != "",
 	}
-	target, resolved, hasResolved, originalHost, expandHost, cErr := o.resolveExecHostTarget(ctx, provider, target)
+	target, resolved, hasResolved, originalHost, expandHost, cErr := o.resolveExecHostTargetWithHint(ctx, provider, target, true)
 	if cErr != nil {
 		return execHostTask{}, fmt.Errorf("canonicalize tagged host %q: %w", nodeID, cErr)
 	}
@@ -1177,10 +1178,14 @@ func (o *ExecOptions) planTaggedHostTask(
 	}
 	taskHost, taskPort := resolveTaggedHostAndPort(o.Port, nodeID, target.Selector, hostObj, resolved, hasResolved)
 	matchedNodeID, baseNodeID := resolved.MatchedNodeID, resolved.BaseNodeID
+	resolvedHost := resolved.Host
 	if !hasResolved {
 		baseNodeID = nodeID
 		if !hasOverrides {
 			matchedNodeID = nodeID
+		}
+		if resolvedHost == "" {
+			resolvedHost = config.StripHostBrackets(hostObj.Address)
 		}
 	}
 	return execHostTask{
@@ -1189,6 +1194,7 @@ func (o *ExecOptions) planTaggedHostTask(
 		baseNodeID:    baseNodeID,
 		openSSHAlias:  resolved.OpenSSHAlias,
 		canonicalHost: resolved.CanonicalHost,
+		resolvedHost:  resolvedHost,
 		rawHost:       nodeID,
 		host:          taskHost,
 		originalHost:  originalHost,
@@ -1205,7 +1211,6 @@ func (o *ExecOptions) planTaggedHostTask(
 }
 
 func (o *ExecOptions) execTaskExcludeInfo(t execHostTask) utils.ExcludeTargetInfo {
-	unmanaged := []string{t.rawHost, t.host, t.originalHost}
 	hostForExpansion := t.expandHost
 	if hostForExpansion == "" {
 		hostForExpansion = t.originalHost
@@ -1213,21 +1218,24 @@ func (o *ExecOptions) execTaskExcludeInfo(t execHostTask) utils.ExcludeTargetInf
 	if hostForExpansion == "" {
 		hostForExpansion = t.host
 	}
+	var hostNameOverride string
 	if o != nil {
-		if hostNameOverride, err := o.effectiveHostNameForHost(hostForExpansion); err == nil && hostNameOverride != "" && !slices.Contains(unmanaged, hostNameOverride) {
-			unmanaged = append(unmanaged, hostNameOverride)
+		if v, err := o.effectiveHostNameForHost(hostForExpansion); err == nil {
+			hostNameOverride = v
 		}
 	}
-	return utils.ExcludeTargetInfo{
-		NodeID:         t.nodeID,
-		MatchedNodeID:  t.matchedNodeID,
-		BaseNodeID:     t.baseNodeID,
-		OpenSSHAlias:   t.openSSHAlias,
-		CanonicalHost:  t.canonicalHost,
-		User:           t.user,
-		Port:           t.port,
-		UnmanagedHosts: unmanaged,
-	}
+	return utils.BuildExcludeTargetInfo(utils.ExcludeTargetBuildInput{
+		NodeID:           t.nodeID,
+		MatchedNodeID:    t.matchedNodeID,
+		BaseNodeID:       t.baseNodeID,
+		OpenSSHAlias:     t.openSSHAlias,
+		CanonicalHost:    t.canonicalHost,
+		ResolvedHost:     t.resolvedHost,
+		User:             t.user,
+		Port:             t.port,
+		UnmanagedHosts:   []string{t.rawHost, t.host, t.originalHost},
+		HostNameOverride: hostNameOverride,
+	})
 }
 
 func isResolvedSavedNode(r config.ResolvedTarget) bool {
@@ -1253,8 +1261,12 @@ func resolveTargetOriginalAndExpandHosts(canonicalized bool, canonOriginalHost, 
 }
 
 func (o *ExecOptions) resolveExecHostTarget(ctx context.Context, repository config.ConfigProvider, target config.ConnectionTarget) (config.ConnectionTarget, config.ResolvedTarget, bool, string, string, error) {
+	return o.resolveExecHostTargetWithHint(ctx, repository, target, false)
+}
+
+func (o *ExecOptions) resolveExecHostTargetWithHint(ctx context.Context, repository config.ConfigProvider, target config.ConnectionTarget, knownSavedNode bool) (config.ConnectionTarget, config.ResolvedTarget, bool, string, string, error) {
 	var (
-		matchedSavedNode  bool
+		matchedSavedNode  = knownSavedNode
 		canonicalized     bool
 		canonOriginalHost string
 		resolved          config.ResolvedTarget
@@ -1263,7 +1275,7 @@ func (o *ExecOptions) resolveExecHostTarget(ctx context.Context, repository conf
 	if r, rErr := config.ResolveTarget(repository, target); rErr == nil {
 		resolved = r
 		hasResolved = true
-		matchedSavedNode = isResolvedSavedNode(r)
+		matchedSavedNode = matchedSavedNode || isResolvedSavedNode(r)
 	}
 	if target.Selector != "" && !strings.HasPrefix(target.Selector, config.OpenSSHNodePrefix) {
 		canonRes, cErr := config.CanonicalizeHost(ctx, config.CanonicalizeInput{
@@ -1272,6 +1284,7 @@ func (o *ExecOptions) resolveExecHostTarget(ctx context.Context, repository conf
 			RawCLIOptions:    o.control.Options,
 			CLIProxyJump:     o.effectiveCLIJumpHost(),
 			MatchedSavedNode: matchedSavedNode,
+			Resolver:         o.canonicalResolver,
 		})
 		if cErr != nil {
 			return target, resolved, hasResolved, "", "", cErr
@@ -1420,6 +1433,7 @@ func (o *ExecOptions) planTasksFromHosts(ctx context.Context, repository config.
 			baseNodeID:    resolved.BaseNodeID,
 			openSSHAlias:  resolved.OpenSSHAlias,
 			canonicalHost: resolved.CanonicalHost,
+			resolvedHost:  resolved.Host,
 			rawHost:       rawHost,
 			host:          h.Host,
 			originalHost:  originalHost,

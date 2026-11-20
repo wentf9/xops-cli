@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"slices"
 	"strings"
@@ -216,25 +217,26 @@ func (w *clientFlowWindow) add(delta uint32) error {
 	return nil
 }
 
-// reserve blocks until the client has granted exactly n bytes and consumes that
-// credit. n must not exceed the client's advertised maximum packet size, so the
-// reservation is always written by one data packet and never over-reserves the
-// window shared with the other remote stream. io.EOF reports that the channel
+// reserve blocks only while the client window is exhausted (credit == 0) and
+// grants up to n bytes from the currently available credit. Returning a smaller
+// positive grant prevents deadlocks when InitialWindow < MaxPacket or when stdout
+// and stderr share a partial remaining window. io.EOF reports that the channel
 // ended while waiting for credit.
-func (w *clientFlowWindow) reserve(n int) error {
-	if n == 0 {
-		return nil
+func (w *clientFlowWindow) reserve(n int) (int, error) {
+	if n <= 0 {
+		return 0, nil
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	for int64(n) > w.credit {
-		if w.closed {
-			return io.EOF
-		}
+	for w.credit == 0 && !w.closed {
 		w.cond.Wait()
 	}
-	w.credit -= int64(n)
-	return nil
+	if w.closed {
+		return 0, io.EOF
+	}
+	granted := int(min(int64(n), w.credit))
+	w.credit -= int64(granted)
+	return granted, nil
 }
 
 // close releases every sender blocked in reserve.
@@ -384,6 +386,7 @@ type proxySessionState struct {
 	closedMu   sync.Mutex
 	closedCh   chan struct{}
 	closedDone bool
+	closeWG    sync.WaitGroup
 }
 
 func (ps *proxySessionState) closedSignal() <-chan struct{} {
@@ -434,6 +437,7 @@ func (ps *proxySessionState) closeAll() {
 		}
 		return true
 	})
+	ps.closeWG.Wait()
 }
 
 // writeChannelPacket writes one channel-scoped packet unless the session ended or
@@ -591,8 +595,9 @@ func (ps *proxySessionState) handleOpen(payload []byte) {
 	}
 
 	// The client's window and maximum packet size bound every packet this master
-	// sends it. Reject values SSH cannot represent instead of trusting them.
-	if clientMaxPacket < minProxyChannelPacket || int64(clientMaxPacket) > maxFlowWindow || int64(clientWindow) > maxFlowWindow {
+	// sends it. Reject values SSH cannot represent (or that would overflow 32-bit
+	// signed int on 32-bit platforms) instead of trusting them.
+	if clientMaxPacket < minProxyChannelPacket || clientMaxPacket > math.MaxInt32 || int64(clientWindow) > maxFlowWindow {
 		w := newMuxWriter()
 		w.buf = append(w.buf, msgChannelOpenFailure)
 		w.WriteUint32(clientChID)
@@ -777,9 +782,17 @@ func (ps *proxySessionState) streamRemoteStderr(pc *proxyChan) {
 // within the client's maximum packet size; a larger packet makes the client's
 // SSH mux abort the whole multiplexed connection.
 func (ps *proxySessionState) sendChannelData(pc *proxyChan, extended bool, data []byte) error {
+	if pc.clientMaxPacket <= 0 {
+		if ps.conn != nil {
+			_ = ps.conn.Close()
+		}
+		ps.retireChannel(pc, true)
+		return fmt.Errorf("invalid client maximum packet size: %d", pc.clientMaxPacket)
+	}
 	for len(data) > 0 {
 		chunk := min(len(data), pc.clientMaxPacket)
-		if err := pc.clientWindow.reserve(chunk); err != nil {
+		granted, err := pc.clientWindow.reserve(chunk)
+		if err != nil {
 			return err
 		}
 
@@ -792,7 +805,7 @@ func (ps *proxySessionState) sendChannelData(pc *proxyChan, extended bool, data 
 			w.buf = append(w.buf, msgChannelData)
 			w.WriteUint32(pc.clientCh)
 		}
-		w.WriteBytes(data[:chunk])
+		w.WriteBytes(data[:granted])
 		if err := ps.writeChannelPacket(pc, w.Bytes()); err != nil {
 			if errors.Is(err, io.EOF) {
 				// The channel closed while data was in flight; nothing may follow its
@@ -804,7 +817,7 @@ func (ps *proxySessionState) sendChannelData(pc *proxyChan, extended bool, data 
 			_ = ps.conn.Close()
 			return err
 		}
-		data = data[chunk:]
+		data = data[granted:]
 	}
 	return nil
 }
@@ -984,7 +997,12 @@ func (ps *proxySessionState) handleWindowAdjust(payload []byte) {
 	if !ok {
 		return
 	}
-	_ = pcVal.(*proxyChan).clientWindow.add(delta)
+	pc := pcVal.(*proxyChan)
+	if err := pc.clientWindow.add(delta); err != nil && !errors.Is(err, net.ErrClosed) {
+		// RFC 4254 forbids growing the channel window beyond 2^31; retire the
+		// offending channel instead of silently dropping the protocol violation.
+		ps.retireChannel(pc, true)
+	}
 }
 
 func (ps *proxySessionState) handleEOF(payload []byte) {
@@ -1224,9 +1242,30 @@ func (ps *proxySessionState) retireChannel(pc *proxyChan, closeRemote bool) {
 		pc.pendingRemoteReqs.drain()
 	}
 	if closeRemote && pc.remoteCh != nil {
-		_ = ps.server.closeMuxChannelBounded(pc.remoteCh, nil)
+		ps.startAsyncRemoteClose(pc.remoteCh)
 	}
 	pc.releaseAgentProxyLease()
+}
+
+// startAsyncRemoteClose offloads bounded remote channel closing so a slow or
+// stalled peer channel does not stall the proxy read loop for sibling channels,
+// while tracking the goroutine under ps.closeWG so closeAll waits for exit.
+func (ps *proxySessionState) startAsyncRemoteClose(remoteCh io.Closer) {
+	if remoteCh == nil {
+		return
+	}
+	ps.closedMu.Lock()
+	if ps.closed.Load() {
+		ps.closedMu.Unlock()
+		_ = ps.server.closeMuxChannelBounded(remoteCh, nil)
+		return
+	}
+	ps.closeWG.Add(1)
+	ps.closedMu.Unlock()
+	go func() {
+		defer ps.closeWG.Done()
+		_ = ps.server.closeMuxChannelBounded(remoteCh, nil)
+	}()
 }
 
 func (ps *proxySessionState) forwardOneChannelRequest(pc *proxyChan, req proxyChannelRequest) (stop, eof bool) {

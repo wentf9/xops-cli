@@ -215,6 +215,15 @@ func ValidateV2(cfg *ConfigurationV2) error {
 		return err
 	}
 
+	for hostName, host := range cfg.Hosts {
+		if err := ValidateConcreteHostAddress(host.Address); err != nil {
+			return fmt.Errorf("%w: host %q address invalid: %w", ErrSchemaValidation, hostName, err)
+		}
+		if err := ValidateNodeAliases(host.Alias); err != nil {
+			return fmt.Errorf("%w: host %q alias invalid: %w", ErrSchemaValidation, hostName, err)
+		}
+	}
+
 	for idName, id := range cfg.Identities {
 		if err := validateIdentityRefs(idName, id, cfg.Credential.Stores); err != nil {
 			return err
@@ -222,6 +231,12 @@ func ValidateV2(cfg *ConfigurationV2) error {
 	}
 
 	for nodeName, node := range cfg.Nodes {
+		if err := ValidateNodeAlias(nodeName); err != nil {
+			return fmt.Errorf("%w: node %q name invalid: %w", ErrSchemaValidation, nodeName, err)
+		}
+		if err := ValidateNodeAliases(node.Alias); err != nil {
+			return fmt.Errorf("%w: node %q alias invalid: %w", ErrSchemaValidation, nodeName, err)
+		}
 		if err := validateNodeRefs(nodeName, node, cfg); err != nil {
 			return err
 		}

@@ -66,7 +66,7 @@ func TestResolveTunnelOpenSSHNode(t *testing.T) {
 					t.Errorf("canonical ID %q did not reach connection validation: %v", selector, err)
 				}
 			}
-			for _, selector := range []string{"openssh:web ", "openssh: web", "openssh:web\u00a0", "web ", "openssh:\tweb", "openssh:web\n", "openssh:fixture @web", "openssh:fixture@ web"} {
+			for _, selector := range []string{"openssh:web ", "openssh: web", "openssh:web\u00a0", "web ", "node ", " node", "web\u00a0", "openssh:\tweb", "openssh:web\n", "openssh:fixture @web", "openssh:fixture@ web"} {
 				if _, err := resolveTestNode(t.Context(), host, selector); err == nil || !strings.Contains(err.Error(), "whitespace or control") {
 					t.Errorf("noncanonical ID %q was not rejected: %v", selector, err)
 				}

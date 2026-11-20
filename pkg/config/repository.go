@@ -762,6 +762,12 @@ func (r *Repository) CreateNodeContext(ctx context.Context, nodeID string, node 
 	if err := ValidateNodeAliases(node.Alias); err != nil {
 		return NodeMutation{}, err
 	}
+	if err := ValidateNodeAliases(host.Alias); err != nil {
+		return NodeMutation{}, err
+	}
+	if err := ValidateConcreteHostAddress(host.Address); err != nil {
+		return NodeMutation{}, err
+	}
 	initAlias := strings.TrimSpace(node.OpenSSHAlias)
 	initCanon := strings.TrimSpace(node.CanonicalHost)
 	var action *publishAction
@@ -901,43 +907,22 @@ func replaceNodeAtRef(cfg *Configuration, ref NodeRef, nodeID string, node model
 	if err := ValidateNodeAliases(node.Alias); err != nil {
 		return err
 	}
+	if err := ValidateNodeAliases(host.Alias); err != nil {
+		return err
+	}
+	if err := ValidateConcreteHostAddress(host.Address); err != nil {
+		return err
+	}
 	oldNodeID := ref.ID
 	var oldNode models.Node
 	if oldNodeID != "" {
 		if err := ensureNodeRefs(cfg, []NodeRef{ref}); err != nil {
 			return err
 		}
-		var exists bool
-		oldNode, exists = cfg.Nodes.Get(oldNodeID)
-		if !exists {
-			return fmt.Errorf("resolve node %q for replacement: %w", oldNodeID, ErrNodeNotFound)
-		}
-		if existingHost, exists := cfg.Hosts.Get(node.HostRef); exists && !reflect.DeepEqual(existingHost, host) {
-			hostReferences := countNodeReferences(cfg, func(candidate models.Node) bool {
-				return candidate.HostRef == node.HostRef
-			})
-			if oldNode.HostRef == node.HostRef {
-				hostReferences--
-			}
-			if hostReferences > 0 {
-				node.HostRef = privateHostReference(cfg, nodeID)
-			}
-		}
-		if existingIdentity, exists := cfg.Identities.Get(node.IdentityRef); exists && !reflect.DeepEqual(existingIdentity, identity) {
-			identityReferences := countNodeReferences(cfg, func(candidate models.Node) bool {
-				return candidate.IdentityRef == node.IdentityRef
-			})
-			if oldNode.IdentityRef == node.IdentityRef {
-				identityReferences--
-			}
-			if identityReferences > 0 {
-				node.IdentityRef = privateIdentityReference(cfg, nodeID)
-			}
-		}
-	}
-	if oldNodeID != "" && oldNodeID != nodeID {
-		if _, exists := cfg.Nodes.Get(nodeID); exists {
-			return fmt.Errorf("rename node %q to %q: destination already exists", oldNodeID, nodeID)
+		var err error
+		oldNode, err = detachSharedNodeRefs(cfg, ref, nodeID, &node, host, identity)
+		if err != nil {
+			return err
 		}
 	}
 	cfg.Hosts.Set(node.HostRef, cloneHost(host))
@@ -949,6 +934,42 @@ func replaceNodeAtRef(cfg *Configuration, ref NodeRef, nodeID string, node model
 		removeUnusedRefs(cfg, oldNode.HostRef, oldNode.IdentityRef)
 	}
 	return nil
+}
+
+func detachSharedNodeRefs(cfg *Configuration, ref NodeRef, nodeID string, node *models.Node, host models.Host, identity models.Identity) (models.Node, error) {
+	oldNodeID := ref.ID
+	oldNode, exists := cfg.Nodes.Get(oldNodeID)
+	if !exists {
+		return models.Node{}, fmt.Errorf("resolve node %q for replacement: %w", oldNodeID, ErrNodeNotFound)
+	}
+	if existingHost, ok := cfg.Hosts.Get(node.HostRef); ok && !reflect.DeepEqual(existingHost, host) {
+		hostRefs := countNodeReferences(cfg, func(candidate models.Node) bool {
+			return candidate.HostRef == node.HostRef
+		})
+		if oldNode.HostRef == node.HostRef {
+			hostRefs--
+		}
+		if hostRefs > 0 {
+			node.HostRef = privateHostReference(cfg, nodeID)
+		}
+	}
+	if existingIdentity, ok := cfg.Identities.Get(node.IdentityRef); ok && !reflect.DeepEqual(existingIdentity, identity) {
+		idRefs := countNodeReferences(cfg, func(candidate models.Node) bool {
+			return candidate.IdentityRef == node.IdentityRef
+		})
+		if oldNode.IdentityRef == node.IdentityRef {
+			idRefs--
+		}
+		if idRefs > 0 {
+			node.IdentityRef = privateIdentityReference(cfg, nodeID)
+		}
+	}
+	if oldNodeID != nodeID {
+		if _, destExists := cfg.Nodes.Get(nodeID); destExists {
+			return models.Node{}, fmt.Errorf("rename node %q to %q: destination already exists", oldNodeID, nodeID)
+		}
+	}
+	return oldNode, nil
 }
 
 // DeleteNodeAtRefContext removes one node only if its complete bundle still
@@ -1090,6 +1111,11 @@ func (r *Repository) ImportOpenSSHHostsContext(ctx context.Context, hosts []Open
 				result.Issues = append(result.Issues, ImportIssue{Name: item.Name, Err: err})
 				continue
 			}
+			if err := ValidateConcreteHostAddress(item.Host.Address); err != nil {
+				result.Skipped++
+				result.Issues = append(result.Issues, ImportIssue{Name: item.Name, Err: err})
+				continue
+			}
 			if _, exists := cfg.Nodes.Get(item.Name); exists {
 				result.Skipped++
 				continue
@@ -1130,6 +1156,9 @@ func (r *Repository) ImportOpenSSHHostsContext(ctx context.Context, hosts []Open
 }
 
 func reserveOpenSSHAliases(aliases map[string]string, item OpenSSHHost) error {
+	if err := ValidateNodeAliases(item.Host.Alias); err != nil {
+		return err
+	}
 	for _, alias := range item.Node.Alias {
 		if alias == "" {
 			continue

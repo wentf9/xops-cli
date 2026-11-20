@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"path/filepath"
 	"slices"
 	"strings"
 
@@ -61,6 +60,7 @@ func credentialVersion(provider config.ConfigProvider, plan ssh.ConnectionPlan) 
 	stores := make(map[string]*config.StoreConfig)
 	configuration := provider.Snapshot()
 	env := sshenv.Discover()
+	prevHopIDs := make([]string, 0, len(plan.Hops))
 	for _, hop := range plan.Hops {
 		snapshot, err := provider.ResolveConnection(hop.NodeID)
 		if err != nil {
@@ -90,7 +90,9 @@ func credentialVersion(provider config.ConfigProvider, plan ssh.ConnectionPlan) 
 				identitiesOnly = snapshot.Node.SSHOptions.IdentitiesOnly()
 			}
 		}
-		targets := buildHopBindingTargets(env, hop, snapshot.Identity.KeyPath, snapshot.Node.ProxyJump)
+		cumulativeJump := strings.Join(prevHopIDs, ",")
+		targets := buildHopBindingTargets(env, hop, snapshot.Identity.KeyPath, snapshot.Node.ProxyJump, cumulativeJump)
+		prevHopIDs = append(prevHopIDs, hop.NodeID)
 		certBindings := collectHopCertificateBindings(
 			env,
 			hop,
@@ -158,28 +160,15 @@ func resolveHopIdentityAgentBindings(
 }
 
 func expandMCPBindingPath(raw string, env ssh.Environment, target ssh.TargetContext) string {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" || strings.EqualFold(trimmed, "none") {
-		return ""
-	}
-	expanded, err := ssh.ExpandControlPath(trimmed, env, target)
+	expanded, err := ssh.ExpandIdentityPath(raw, env, target)
 	if err != nil {
-		if env.ResolveKeyPath != nil {
-			expanded = env.ResolveKeyPath(trimmed)
-		} else {
-			expanded = trimmed
-		}
-	} else if env.ResolveKeyPath != nil {
-		expanded = env.ResolveKeyPath(expanded)
-	}
-	if expanded == "" || strings.EqualFold(expanded, "none") {
 		return ""
 	}
-	return filepath.Clean(filepath.FromSlash(expanded))
+	return expanded
 }
 
 func inspectCertificateBinding(certPath string, includeMissing bool) (certificateFileBinding, bool) {
-	f, fInfo, nonRegular, err := openRegularCertFile(certPath)
+	f, _, nonRegular, err := openRegularCertFile(certPath)
 	if nonRegular {
 		if includeMissing {
 			return certificateFileBinding{Path: certPath, NonRegular: true}, true
@@ -194,17 +183,21 @@ func inspectCertificateBinding(certPath string, includeMissing bool) (certificat
 	}
 	defer func() { _ = f.Close() }()
 
-	data, err := io.ReadAll(io.LimitReader(f, maxMCPCertBindingBytes))
+	data, err := io.ReadAll(io.LimitReader(f, maxMCPCertBindingBytes+1))
 	if err != nil {
 		if includeMissing {
 			return certificateFileBinding{Path: certPath, Missing: true}, true
 		}
 		return certificateFileBinding{}, false
 	}
+	truncated := len(data) > maxMCPCertBindingBytes
+	if truncated {
+		data = data[:maxMCPCertBindingBytes]
+	}
 	rawSum := sha256.Sum256(data)
 	binding := certificateFileBinding{
 		Path:      certPath,
-		Truncated: fInfo.Size() > maxMCPCertBindingBytes,
+		Truncated: truncated,
 		RawSHA256: hex.EncodeToString(rawSum[:]),
 	}
 	if pub, _, _, _, parseErr := cryptoSSH.ParseAuthorizedKey(data); parseErr == nil {
@@ -247,7 +240,7 @@ func buildHopBindingTarget(env ssh.Environment, hop ssh.ConnectionConfig, identi
 		Port:         port,
 		User:         user,
 		OriginalHost: originalHost,
-		JumpHost:     hop.ProxyJump,
+		JumpHost:     ssh.NormalizeProxyJump(hop.ProxyJump),
 		KeyPath:      keyPath,
 	}
 }
@@ -257,13 +250,17 @@ func buildHopBindingTargets(
 	hop ssh.ConnectionConfig,
 	identityKeyPath string,
 	nodeProxyJump string,
+	extraJumps ...string,
 ) []ssh.TargetContext {
 	base := buildHopBindingTarget(env, hop, identityKeyPath)
 	targets := []ssh.TargetContext{base}
 	seenJumps := []string{base.JumpHost}
 
 	addAltJump := func(raw string) {
-		jump := strings.TrimSpace(raw)
+		if !ssh.HasActiveProxyJump(raw) {
+			return
+		}
+		jump := ssh.NormalizeProxyJump(raw)
 		if jump == "" || slices.Contains(seenJumps, jump) {
 			return
 		}
@@ -275,6 +272,9 @@ func buildHopBindingTargets(
 	addAltJump(nodeProxyJump)
 	if hop.HasOriginalProxyJump {
 		addAltJump(hop.OriginalProxyJump)
+	}
+	for _, extra := range extraJumps {
+		addAltJump(extra)
 	}
 	return targets
 }

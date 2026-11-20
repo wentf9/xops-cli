@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wentf9/xops-cli/core/testutil/sshfixture"
 	cryptoSSH "golang.org/x/crypto/ssh"
 )
 
@@ -227,13 +228,22 @@ func TestRound6_P2_2_HandleCloseSetsCloseSentBeforeRemoteCloseAndDrains(t *testi
 		clientCh:          11,
 		serverCh:          2,
 		remoteCh:          slowCh,
-		clientWindow:      newClientFlowWindow(1 << 20),
+		clientWindow:      newClientFlowWindow(0),
 		pendingRemoteReqs: newRemoteRequestQueue(),
 		input:             newOrderedQueue[proxyChannelInput](),
 		requests:          newOrderedQueue[proxyChannelRequest](),
 		reqsDone:          make(chan struct{}),
 		requestsDone:      make(chan struct{}),
 	}
+	// Pre-populate queued items and start a blocked reserve(1) on pc itself so we
+	// verify handleClose genuinely wakes pc.clientWindow and closes pc's queues.
+	pc.input.push(proxyChannelInput{kind: msgChannelData, payload: []byte("pending")})
+	pc.requests.push(proxyChannelRequest{requestType: "keepalive@test"})
+	blockedReserve := make(chan error, 1)
+	go func() {
+		_, rErr := pc.clientWindow.reserve(1)
+		blockedReserve <- rErr
+	}()
 	ps.channels.Store(pc.serverCh, pc)
 
 	// Drain client side of net.Pipe and record when msgChannelClose arrives.
@@ -277,17 +287,125 @@ func TestRound6_P2_2_HandleCloseSetsCloseSentBeforeRemoteCloseAndDrains(t *testi
 		close(slowCh.unblockClose)
 		t.Fatalf("writeChannelPacket after handleClose closeChannel = %v, want io.EOF", err)
 	}
-	close(slowCh.unblockClose)
+
+	// Verify window/queues/channel table on pc are retired before remoteCh.Close() finishes.
+	assertRound6RetireDrainsQueues(t, ps, pc, slowCh, blockedReserve)
+
 	select {
 	case <-handleDone:
 	case <-time.After(2 * time.Second):
-		t.Fatal("handleClose did not exit after remoteCh.Close() unblocked")
+		close(slowCh.unblockClose)
+		t.Fatal("handleClose blocked read loop behind slow remoteCh.Close()")
+	}
+	close(slowCh.unblockClose)
+	ps.closeAll()
+
+	verifyRound6LiveWantReplyDrainOnClose(t)
+}
+
+func assertRound6RetireDrainsQueues(
+	t *testing.T,
+	ps *proxySessionState,
+	pc *proxyChan,
+	slowCh *round6SlowCloseChannel,
+	blockedReserve <-chan error,
+) {
+	t.Helper()
+	select {
+	case rErr := <-blockedReserve:
+		if !errors.Is(rErr, io.EOF) {
+			close(slowCh.unblockClose)
+			t.Fatalf("blocked reserve on pc = %v, want io.EOF", rErr)
+		}
+	case <-time.After(2 * time.Second):
+		close(slowCh.unblockClose)
+		t.Fatal("blocked reserve on pc did not wake on retireChannel")
+	}
+	if _, err := pc.clientWindow.reserve(1); !errors.Is(err, io.EOF) {
+		close(slowCh.unblockClose)
+		t.Fatalf("clientWindow.reserve after retireChannel = %v, want io.EOF", err)
+	}
+	if item, ok := pc.input.pop(); !ok || string(item.payload) != "pending" {
+		close(slowCh.unblockClose)
+		t.Fatalf("expected pre-queued pc.input item, got (%v, %v)", item, ok)
+	}
+	if _, ok := pc.input.pop(); ok {
+		close(slowCh.unblockClose)
+		t.Fatal("pc.input was not closed on retireChannel")
+	}
+	if req, ok := pc.requests.pop(); !ok || req.requestType != "keepalive@test" {
+		close(slowCh.unblockClose)
+		t.Fatalf("expected pre-queued pc.requests item, got (%v, %v)", req, ok)
+	}
+	if _, ok := pc.requests.pop(); ok {
+		close(slowCh.unblockClose)
+		t.Fatal("pc.requests was not closed on retireChannel")
+	}
+	if _, ok := ps.channels.Load(pc.serverCh); ok {
+		close(slowCh.unblockClose)
+		t.Fatal("ps.channels still holds serverCh after closeChannel")
 	}
 }
 
-func TestRound6_P2_6_ClassifyNormalizeProxyJumpAndConnectorSingleHop(t *testing.T) {
-	t.Parallel()
+func verifyRound6LiveWantReplyDrainOnClose(t *testing.T) {
+	t.Helper()
+	// Live MUX_C_PROXY verification: remote sends a WantReply=true channel request
+	// and blocks until the proxy client closes the channel without answering.
+	liveCtx, liveCancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer liveCancel()
+	reqSent := make(chan struct{})
+	type probeResult struct {
+		accepted bool
+		err      error
+	}
+	reqResult := make(chan probeResult, 1)
+	fixture := startMuxFixture(t, liveCtx, sshfixture.Options{
+		ExecHandler: func(_ string, ch cryptoSSH.Channel) {
+			close(reqSent)
+			accepted, err := ch.SendRequest("probe@xops", true, []byte("ping"))
+			reqResult <- probeResult{accepted: accepted, err: err}
+		},
+	})
+	rawConn, serverCh, closeRaw := openRawMuxProxyChannel(t, liveCtx, fixture.SocketPath, "exec-probe", 65536, 32768)
+	defer closeRaw()
 
+	<-reqSent
+	// Wait until the master forwards msgChannelRequest("probe@xops", wantReply=true) onto rawConn,
+	// then send msgChannelClose without answering so pendingRemoteReqs must drain it.
+	seenProbe := false
+	for !seenProbe {
+		pkt, pErr := readUnpaddedPacket(rawConn)
+		if pErr != nil {
+			t.Fatalf("readUnpaddedPacket waiting for probe@xops: %v", pErr)
+		}
+		if len(pkt) >= 5 && pkt[0] == msgChannelRequest {
+			r := newMuxReader(pkt[5:])
+			if rType, rErr := r.ReadString(); rErr == nil && rType == "probe@xops" {
+				seenProbe = true
+			}
+		}
+	}
+	closePkt := newMuxWriter()
+	closePkt.buf = append(closePkt.buf, msgChannelClose)
+	closePkt.WriteUint32(serverCh)
+	if wErr := writeUnpaddedPacket(rawConn, closePkt.Bytes()); wErr != nil {
+		t.Fatalf("write msgChannelClose: %v", wErr)
+	}
+	select {
+	case res := <-reqResult:
+		if res.err != nil {
+			t.Fatalf("expected pending WantReply=true request to receive explicit SSH_MSG_CHANNEL_FAILURE (err==nil) from pendingRemoteReqs.drain(), got err=%v", res.err)
+		}
+		if res.accepted {
+			t.Fatal("expected pending WantReply=true request to be rejected on channel close, got accepted=true")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("remote WantReply=true SendRequest remained blocked after proxy client closed channel")
+	}
+}
+
+func verifyRound6ProxyJumpTable(t *testing.T) {
+	t.Helper()
 	for _, tc := range []struct {
 		raw      string
 		wantKind ProxyJumpKind
@@ -310,24 +428,43 @@ func TestRound6_P2_6_ClassifyNormalizeProxyJumpAndConnectorSingleHop(t *testing.
 			t.Errorf("NormalizeProxyJump(%q) = %q, want %q", tc.raw, got, tc.wantNorm)
 		}
 	}
+}
 
-	// Verify resolveConnectionPlan filters "none" and trailing commas on single-hop and disabled chains.
+func TestRound6_P2_6_ClassifyNormalizeProxyJumpAndConnectorSingleHop(t *testing.T) {
+	t.Parallel()
+	verifyRound6ProxyJumpTable(t)
+
+	// Verify resolveConnectionPlan filters "none" and trailing commas on single-hop, multi-hop,
+	// and disabled chains and normalizes nodeCfg.ProxyJump for downstream connectPlan & TargetContext.
 	store := &multiMockConfigStore{
 		configs: map[string]*ClientConfig{
 			"target-disabled": {NodeID: "target-disabled", Address: "10.0.0.2", Port: 22, User: "ops", ProxyJump: " , "},
+			"target-none":     {NodeID: "target-none", Address: "10.0.0.2", Port: 22, User: "ops", ProxyJump: "none"},
 			"target-mixed":    {NodeID: "target-mixed", Address: "10.0.0.2", Port: 22, User: "ops", ProxyJump: "none,bastion,"},
+			"target-multi":    {NodeID: "target-multi", Address: "10.0.0.3", Port: 22, User: "ops", ProxyJump: "jump1, none , jump2"},
 			"bastion":         {NodeID: "bastion", Address: "10.0.0.1", Port: 22, User: "ops"},
+			"jump1":           {NodeID: "jump1", Address: "10.0.0.11", Port: 22, User: "ops"},
+			"jump2":           {NodeID: "jump2", Address: "10.0.0.12", Port: 22, User: "ops"},
 		},
 	}
 	conn := NewConnector(store)
 	defer closePlanConnector(t, conn)
 
-	planDisabled, err := conn.resolveConnectionPlan(context.Background(), "target-disabled")
-	if err != nil {
-		t.Fatalf("resolveConnectionPlan(target-disabled): %v", err)
-	}
-	if len(planDisabled) != 1 || planDisabled[0].name != "target-disabled" {
-		t.Fatalf("planDisabled = %d nodes, want 1 (direct)", len(planDisabled))
+	for _, id := range []string{"target-disabled", "target-none"} {
+		planDisabled, err := conn.resolveConnectionPlan(context.Background(), id)
+		if err != nil {
+			t.Fatalf("resolveConnectionPlan(%s): %v", id, err)
+		}
+		if len(planDisabled) != 1 || planDisabled[0].name != id {
+			t.Fatalf("planDisabled(%s) = %d nodes, want 1 (direct)", id, len(planDisabled))
+		}
+		if planDisabled[0].cfg.ProxyJump != "" {
+			t.Fatalf("%s normalized ProxyJump = %q, want empty", id, planDisabled[0].cfg.ProxyJump)
+		}
+		if !planDisabled[0].cfg.HasOriginalProxyJump || planDisabled[0].cfg.OriginalProxyJump != store.configs[id].ProxyJump {
+			t.Fatalf("%s OriginalProxyJump = (%q, %v), want (%q, true)", id,
+				planDisabled[0].cfg.OriginalProxyJump, planDisabled[0].cfg.HasOriginalProxyJump, store.configs[id].ProxyJump)
+		}
 	}
 
 	planMixed, err := conn.resolveConnectionPlan(context.Background(), "target-mixed")
@@ -336,6 +473,62 @@ func TestRound6_P2_6_ClassifyNormalizeProxyJumpAndConnectorSingleHop(t *testing.
 	}
 	if len(planMixed) != 2 || planMixed[0].name != "target-mixed" || planMixed[1].name != "bastion" {
 		t.Fatalf("planMixed = %+v, want [target-mixed, bastion]", planMixed)
+	}
+	if planMixed[0].cfg.ProxyJump != "bastion" || planMixed[0].cfg.OriginalProxyJump != "none,bastion," {
+		t.Fatalf("planMixed[0] = (ProxyJump=%q Orig=%q), want (bastion, none,bastion,)",
+			planMixed[0].cfg.ProxyJump, planMixed[0].cfg.OriginalProxyJump)
+	}
+
+	planMulti, err := conn.resolveConnectionPlan(context.Background(), "target-multi")
+	if err != nil {
+		t.Fatalf("resolveConnectionPlan(target-multi): %v", err)
+	}
+	if len(planMulti) != 3 || planMulti[0].cfg.ProxyJump != "jump1,jump2" ||
+		planMulti[0].cfg.OriginalProxyJump != "jump1, none , jump2" ||
+		planMulti[1].cfg.ProxyJump != "jump1" || planMulti[2].cfg.ProxyJump != "" {
+		t.Fatalf("planMulti jumps = [(%q,%q), %q, %q]",
+			planMulti[0].cfg.ProxyJump, planMulti[0].cfg.OriginalProxyJump,
+			planMulti[1].cfg.ProxyJump, planMulti[2].cfg.ProxyJump)
+	}
+
+	verifyRound6ConnectorLiveDisabledJump(t)
+}
+
+func verifyRound6ConnectorLiveDisabledJump(t *testing.T) {
+	t.Helper()
+	// Verify real Connector.Connect against sshfixture succeeds when ProxyJump is " , " or "none".
+	fixCtx, fixCancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer fixCancel()
+	fix, err := sshfixture.New(fixCtx)
+	if err != nil {
+		t.Fatalf("sshfixture.New: %v", err)
+	}
+	defer func() { _ = fix.Close() }()
+	fixHost, fixPort, err := sshfixtureSplitHostPort(fix.Address)
+	if err != nil {
+		t.Fatalf("sshfixtureSplitHostPort: %v", err)
+	}
+	for _, rawJump := range []string{" , ", "none"} {
+		liveConn := NewConnector(&multiMockConfigStore{
+			configs: map[string]*ClientConfig{
+				"live-disabled": {
+					NodeID:    "live-disabled",
+					Address:   fixHost,
+					Port:      fixPort,
+					User:      "tester",
+					AuthType:  "password",
+					Password:  sshfixture.Password,
+					ProxyJump: rawJump,
+				},
+			},
+		}, WithHostKeyVerifier(trustAnyFixtureHostKey{}))
+		client, connErr := liveConn.Connect(fixCtx, "live-disabled")
+		if connErr != nil {
+			_ = liveConn.CloseAll()
+			t.Fatalf("Connector.Connect(ProxyJump=%q) failed: %v", rawJump, connErr)
+		}
+		_ = client.Close()
+		_ = liveConn.CloseAll()
 	}
 }
 

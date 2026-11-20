@@ -342,15 +342,19 @@ func collectExplicitUserCerts(
 	seenPaths := make(map[string]struct{}, len(rawCerts))
 	hasExplicit := false
 	for _, raw := range rawCerts {
+		if hasControlOrLineSepChar(raw) {
+			l.Debugf("Failed to expand CertificateFile %q: contains invalid control character", raw)
+			continue
+		}
 		trimmed := strings.TrimSpace(raw)
 		if trimmed == "" {
 			continue
 		}
 		hasExplicit = true
-		if strings.EqualFold(trimmed, "none") {
+		if IsNoneValue(trimmed) {
 			continue
 		}
-		expanded, err := expandIdentityKeyPath(trimmed, env, target, resolve)
+		expanded, err := expandIdentityKeyPath(raw, env, target, resolve)
 		if err != nil {
 			l.Debugf("Failed to expand CertificateFile %q: %v", raw, err)
 			continue

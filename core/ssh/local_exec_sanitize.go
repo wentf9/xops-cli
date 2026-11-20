@@ -20,7 +20,7 @@ const (
 )
 
 func validateLocalExecCommandOption(name, raw string) (string, error) {
-	if hasASCIIControlChar(raw) {
+	if hasControlOrLineSepChar(raw) {
 		return "", fmt.Errorf("invalid %s: value cannot contain control characters, null bytes, or newlines", name)
 	}
 	trimmed := strings.TrimSpace(raw)
@@ -281,7 +281,7 @@ func ExpandLocalCommand(pattern string, env Environment, target TargetContext) (
 }
 
 func expandLocalExecTemplate(optionName, pattern string, env Environment, target TargetContext, allowLocalTokens bool) (string, error) {
-	if hasASCIIControlChar(pattern) {
+	if hasControlOrLineSepChar(pattern) {
 		return "", fmt.Errorf("%s cannot contain control characters or null bytes", optionName)
 	}
 	trimmed := strings.TrimSpace(pattern)
@@ -337,7 +337,7 @@ func expandLocalExecTemplate(optionName, pattern string, env Environment, target
 	}
 
 	expanded := sb.String()
-	if hasASCIIControlChar(expanded) {
+	if hasControlOrLineSepChar(expanded) {
 		return "", fmt.Errorf("expanded %s cannot contain control characters or null bytes", optionName)
 	}
 	return expanded, nil

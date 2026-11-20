@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	cryptoSSH "golang.org/x/crypto/ssh"
 	"gopkg.in/yaml.v3"
@@ -153,6 +154,9 @@ var optionRegistry = []OptionSpec{
 		OpenSSHName:  "ControlMaster",
 		Class:        OptionClassMux,
 		Normalize: func(raw string) (string, error) {
+			if hasControlOrLineSepChar(raw) {
+				return "", fmt.Errorf("unsupported ControlMaster option %q: contains invalid control character", raw)
+			}
 			trimmed := strings.TrimSpace(raw)
 			if trimmed == "" {
 				return "", fmt.Errorf("unsupported ControlMaster option %q", raw)
@@ -169,14 +173,14 @@ var optionRegistry = []OptionSpec{
 		OpenSSHName:  "ControlPath",
 		Class:        OptionClassMux,
 		Normalize: func(raw string) (string, error) {
-			if hasASCIIControlChar(raw) {
+			if hasControlOrLineSepChar(raw) {
 				return "", fmt.Errorf("invalid ControlPath %q: contains invalid ASCII control character", raw)
 			}
 			trimmed := strings.TrimSpace(raw)
 			if trimmed == "" {
 				return "", errors.New("invalid ControlPath: value cannot be empty")
 			}
-			if strings.EqualFold(trimmed, "none") {
+			if IsNoneValue(trimmed) {
 				return "none", nil
 			}
 			if err := ValidateControlPathSyntax(trimmed); err != nil {
@@ -190,6 +194,9 @@ var optionRegistry = []OptionSpec{
 		OpenSSHName:  "ControlPersist",
 		Class:        OptionClassMux,
 		Normalize: func(raw string) (string, error) {
+			if hasControlOrLineSepChar(raw) {
+				return "", fmt.Errorf("invalid ControlPersist %q: contains invalid control character", raw)
+			}
 			trimmed := strings.ToLower(strings.TrimSpace(raw))
 			if trimmed == "" {
 				return "", errors.New("invalid ControlPersist: value cannot be empty")
@@ -227,6 +234,9 @@ var optionRegistry = []OptionSpec{
 		OpenSSHName:  "ServerAliveCountMax",
 		Class:        OptionClassTransport,
 		Normalize: func(raw string) (string, error) {
+			if hasControlOrLineSepChar(raw) {
+				return "", fmt.Errorf("invalid ServerAliveCountMax %q: contains invalid control character", raw)
+			}
 			trimmed := strings.TrimSpace(raw)
 			val, err := strconv.Atoi(trimmed)
 			if err != nil || val < 0 {
@@ -701,14 +711,7 @@ func ClassifyProxyJump(raw string) ProxyJumpKind {
 // NormalizeProxyJump extracts active non-"none" hops joined by ",", or returns ""
 // when ProxyJump is unset or disabled.
 func NormalizeProxyJump(raw string) string {
-	var hops []string
-	for part := range strings.SplitSeq(raw, ",") {
-		tok := strings.TrimSpace(part)
-		if tok != "" && !strings.EqualFold(tok, "none") {
-			hops = append(hops, tok)
-		}
-	}
-	return strings.Join(hops, ",")
+	return strings.Join(splitProxyJumpChain(raw), ",")
 }
 
 // IsDisabledProxyJump reports whether raw explicitly disables ProxyJump
@@ -723,8 +726,17 @@ func HasActiveProxyJump(raw string) bool {
 	return ClassifyProxyJump(raw) == ProxyJumpActive
 }
 
+// IsNoneValue reports whether s is the OpenSSH sentinel value "none"
+// (case-insensitive after trimming surrounding whitespace).
+func IsNoneValue(s string) bool {
+	return strings.EqualFold(strings.TrimSpace(s), "none")
+}
+
 // ParseStrictHostKeyChecking validates and normalizes StrictHostKeyChecking values.
 func ParseStrictHostKeyChecking(raw string) (string, error) {
+	if hasControlOrLineSepChar(raw) {
+		return "", fmt.Errorf("unsupported StrictHostKeyChecking option %q: contains invalid control character", raw)
+	}
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "yes", "true":
 		return StrictHostKeyCheckingYes, nil
@@ -740,6 +752,9 @@ func ParseStrictHostKeyChecking(raw string) (string, error) {
 }
 
 func normalizeYesNoOption(name, raw string) (string, error) {
+	if hasControlOrLineSepChar(raw) {
+		return "", fmt.Errorf("invalid %s option %q: contains invalid control character", name, raw)
+	}
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "yes", "true":
 		return "yes", nil
@@ -751,6 +766,9 @@ func normalizeYesNoOption(name, raw string) (string, error) {
 }
 
 func validateAddressFamily(raw string) (string, error) {
+	if hasControlOrLineSepChar(raw) {
+		return "", fmt.Errorf("invalid AddressFamily option %q: contains invalid control character", raw)
+	}
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case AddressFamilyAny:
 		return AddressFamilyAny, nil
@@ -764,6 +782,9 @@ func validateAddressFamily(raw string) (string, error) {
 }
 
 func validateGatewayPorts(raw string) (string, error) {
+	if hasControlOrLineSepChar(raw) {
+		return "", fmt.Errorf("invalid GatewayPorts option %q: contains invalid control character", raw)
+	}
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "yes", "true":
 		return GatewayPortsYes, nil
@@ -782,7 +803,7 @@ func normalizeMultiPathEntries(optionName, raw string, normalizeItem func(string
 	}
 	var normalized []string
 	for line := range strings.SplitSeq(raw, "\n") {
-		if hasASCIIControlChar(line) {
+		if hasControlOrLineSepChar(line) {
 			return "", fmt.Errorf("invalid %s %q: value contains invalid ASCII control character", optionName, line)
 		}
 		item := strings.TrimSpace(line)
@@ -828,7 +849,7 @@ func validateCertificateFiles(raw string) (string, error) {
 }
 
 func validateIdentityAgent(raw string) (string, error) {
-	if hasASCIIControlChar(raw) {
+	if hasControlOrLineSepChar(raw) {
 		return "", fmt.Errorf("invalid IdentityAgent %q: contains invalid ASCII control character", raw)
 	}
 	trimmed := strings.TrimSpace(raw)
@@ -848,7 +869,7 @@ func validateIdentityAgent(raw string) (string, error) {
 }
 
 func validateForwardAgent(raw string) (string, error) {
-	if hasASCIIControlChar(raw) {
+	if hasControlOrLineSepChar(raw) {
 		return "", fmt.Errorf("invalid ForwardAgent %q: contains invalid ASCII control character", raw)
 	}
 	trimmed := strings.TrimSpace(raw)
@@ -881,9 +902,19 @@ func validateAgentSocketSyntax(rawPath, kind string) error {
 	return validatePathTokenSyntax(rawPath, kind)
 }
 
-func hasASCIIControlChar(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] < 0x20 || s[i] == 0x7f {
+func hasControlOrLineSepChar(s string) bool {
+	for _, r := range s {
+		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
+			return true
+		}
+	}
+	return false
+}
+
+func hasMultiValueDelimiterOrLineBreak(s string) bool {
+	for _, r := range s {
+		switch r {
+		case '\n', '\r', '\x00', '\u0085', '\u2028', '\u2029':
 			return true
 		}
 	}
@@ -891,9 +922,9 @@ func hasASCIIControlChar(s string) bool {
 }
 
 // ExpandHostName expands OpenSSH HostName tokens (%% -> % and %h -> originalHost)
-// and rejects any other %x token, empty result, or ASCII control characters (< 0x20 or 0x7f).
+// and rejects any other %x token, empty result, or control/line-separator characters.
 func ExpandHostName(pattern, originalHost string) (string, error) {
-	if hasASCIIControlChar(pattern) {
+	if hasControlOrLineSepChar(pattern) {
 		return "", fmt.Errorf("HostName %q contains invalid ASCII control characters", pattern)
 	}
 	trimmed := strings.TrimSpace(pattern)
@@ -918,7 +949,7 @@ func ExpandHostName(pattern, originalHost string) (string, error) {
 		case '%':
 			sb.WriteByte('%')
 		case 'h':
-			if hasASCIIControlChar(originalHost) {
+			if hasControlOrLineSepChar(originalHost) {
 				return "", fmt.Errorf("cannot expand %%h in HostName %q: original host contains invalid ASCII control characters", pattern)
 			}
 			if origTrimmed == "" {
@@ -934,14 +965,14 @@ func ExpandHostName(pattern, originalHost string) (string, error) {
 	if expanded == "" {
 		return "", errors.New("expanded HostName cannot be empty")
 	}
-	if hasASCIIControlChar(expanded) {
+	if hasControlOrLineSepChar(expanded) {
 		return "", fmt.Errorf("expanded HostName %q contains invalid ASCII control characters", expanded)
 	}
 	return expanded, nil
 }
 
 func validateRemoteCommandOption(raw string) (string, error) {
-	if strings.ContainsAny(raw, "\x00\r\n") {
+	if hasMultiValueDelimiterOrLineBreak(raw) {
 		return "", errors.New("invalid RemoteCommand: value cannot contain null bytes or newlines")
 	}
 	trimmed := strings.TrimSpace(raw)
@@ -975,11 +1006,14 @@ func validateEscapeCharOption(raw string) (string, error) {
 }
 
 func parseEscapeCharNormalized(spec string) (byte, bool, string, error) {
+	if hasControlOrLineSepChar(spec) {
+		return 0, false, "", fmt.Errorf("invalid EscapeChar %q: contains invalid control character", spec)
+	}
 	trimmed := strings.TrimSpace(spec)
 	if trimmed == "" {
 		return 0, false, "", fmt.Errorf("invalid EscapeChar %q: value cannot be empty", spec)
 	}
-	if strings.EqualFold(trimmed, "none") {
+	if IsNoneValue(trimmed) {
 		return 0, false, "none", nil
 	}
 	if len(trimmed) == 1 {
@@ -1008,14 +1042,14 @@ func parseEscapeCharNormalized(spec string) (byte, bool, string, error) {
 // ExpandRemoteCommand expands OpenSSH RemoteCommand percent tokens (%%, %C, %d, %h, %i,
 // %l, %L, %n, %p, %r, %u) against env and target without mutating slashes or cleaning paths.
 func ExpandRemoteCommand(pattern string, env Environment, target TargetContext) (string, error) {
-	if strings.ContainsRune(pattern, 0) {
-		return "", errors.New("RemoteCommand cannot contain null bytes")
+	if hasMultiValueDelimiterOrLineBreak(pattern) {
+		return "", errors.New("RemoteCommand cannot contain null bytes or line breaks")
 	}
 	trimmed := strings.TrimSpace(pattern)
 	if trimmed == "" {
 		return "", nil
 	}
-	if strings.EqualFold(trimmed, "none") {
+	if IsNoneValue(trimmed) {
 		return "none", nil
 	}
 
@@ -1038,8 +1072,8 @@ func ExpandRemoteCommand(pattern string, env Environment, target TargetContext) 
 		sb.WriteString(repl)
 	}
 	expanded := sb.String()
-	if strings.ContainsRune(expanded, 0) {
-		return "", errors.New("expanded RemoteCommand cannot contain null bytes")
+	if hasMultiValueDelimiterOrLineBreak(expanded) {
+		return "", errors.New("expanded RemoteCommand cannot contain null bytes or line breaks")
 	}
 	return expanded, nil
 }
@@ -1062,7 +1096,7 @@ func buildRemoteCommandTokenMap(env Environment, target TargetContext) map[byte]
 	if idx := strings.Index(shortLocalHost, "."); idx != -1 {
 		shortLocalHost = shortLocalHost[:idx]
 	}
-	connHash := ComputeConnectionHash(env.LocalHost, host, portStr, remoteUser, target.JumpHost)
+	connHash := ComputeConnectionHash(env.LocalHost, host, portStr, remoteUser, NormalizeProxyJump(target.JumpHost))
 	return map[byte]string{
 		'%': "%",
 		'C': connHash,
@@ -1079,6 +1113,9 @@ func buildRemoteCommandTokenMap(env Environment, target TargetContext) map[byte]
 }
 
 func normalizeOptionalDurationOption(name, raw string) (string, error) {
+	if hasControlOrLineSepChar(raw) {
+		return "", fmt.Errorf("invalid %s %q: contains invalid control character", name, raw)
+	}
 	trimmed := strings.ToLower(strings.TrimSpace(raw))
 	switch trimmed {
 	case "none", "0", "0s":
@@ -1091,6 +1128,9 @@ func normalizeOptionalDurationOption(name, raw string) (string, error) {
 }
 
 func normalizePreferredAuthentications(raw string) (string, error) {
+	if hasControlOrLineSepChar(raw) {
+		return "", fmt.Errorf("invalid PreferredAuthentications %q: contains invalid control character", raw)
+	}
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return "", errors.New("invalid PreferredAuthentications: value cannot be empty")
@@ -1125,33 +1165,59 @@ func allSupportedAlgorithms(secure, insecure []string) []string {
 	return out
 }
 
+func isValidAlgorithmName(algo string) bool {
+	if algo == "" {
+		return false
+	}
+	for i := 0; i < len(algo); i++ {
+		c := algo[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+			c == '-' || c == '_' || c == '.' || c == '@' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 func normalizeAlgorithmSpec(name, raw string, defaults, supported []string) (string, error) {
+	if hasControlOrLineSepChar(raw) {
+		return "", fmt.Errorf("invalid %s %q: contains invalid control character", name, raw)
+	}
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return "", fmt.Errorf("invalid %s: value cannot be empty", name)
 	}
 	checkSpec := trimmed
+	var prefix string
 	var modifier byte
 	if checkSpec[0] == '+' || checkSpec[0] == '-' || checkSpec[0] == '^' {
 		modifier = checkSpec[0]
+		prefix = checkSpec[:1]
 		checkSpec = strings.TrimSpace(checkSpec[1:])
 	}
 	if checkSpec == "" {
 		return "", fmt.Errorf("invalid %s %q: empty algorithm list", name, raw)
 	}
+	var cleanAlgos []string
 	for part := range strings.SplitSeq(checkSpec, ",") {
 		algo := strings.TrimSpace(part)
 		if algo == "" {
 			return "", fmt.Errorf("invalid %s %q: empty algorithm name in list", name, raw)
 		}
+		if !isValidAlgorithmName(algo) {
+			return "", fmt.Errorf("invalid %s %q: invalid algorithm name %q", name, raw, algo)
+		}
 		if modifier != '-' && !slices.Contains(supported, algo) {
 			return "", fmt.Errorf("invalid %s %q: unsupported algorithm %q", name, raw, algo)
 		}
+		cleanAlgos = append(cleanAlgos, algo)
 	}
-	if _, err := ResolveAlgorithmList(trimmed, defaults); err != nil {
+	rebuilt := prefix + strings.Join(cleanAlgos, ",")
+	if _, err := ResolveAlgorithmList(rebuilt, defaults); err != nil {
 		return "", fmt.Errorf("invalid %s %q: %w", name, raw, err)
 	}
-	return trimmed, nil
+	return rebuilt, nil
 }
 
 // FilterSupportedListValue filters a comma-separated option value (for algorithm lists
@@ -1192,7 +1258,7 @@ func FilterSupportedListValue(canonicalKey, raw string) string {
 		if canonicalKey == OptionPreferredAuthentications {
 			tok = strings.ToLower(tok)
 		}
-		if tok != "" && (prefix == "-" || slices.Contains(supported, tok)) {
+		if tok != "" && ((prefix == "-" && isValidAlgorithmName(tok)) || slices.Contains(supported, tok)) {
 			kept = append(kept, tok)
 		}
 	}
@@ -1264,49 +1330,53 @@ func ResolveAlgorithmList(spec string, defaults []string) ([]string, error) {
 
 // ValidateControlPathSyntax verifies raw ControlPath string token syntax without environment dependencies.
 func ValidateControlPathSyntax(rawPath string) error {
-	if hasASCIIControlChar(rawPath) {
+	if hasControlOrLineSepChar(rawPath) {
 		return fmt.Errorf("ControlPath %q contains invalid ASCII control character", rawPath)
 	}
-	if rawPath == "" || rawPath == "none" {
+	if rawPath == "" || IsNoneValue(rawPath) {
 		return nil
 	}
 	return validatePathTokenSyntax(rawPath, "ControlPath")
 }
 
+func validateLiteralControlPath(rawPath string) error {
+	if hasControlOrLineSepChar(rawPath) {
+		return fmt.Errorf("invalid ControlPath %q: contains invalid ASCII control character", rawPath)
+	}
+	if strings.TrimSpace(rawPath) == "" {
+		return errors.New("invalid ControlPath: value cannot be empty")
+	}
+	return nil
+}
+
 func validatePathTokenSyntax(rawPath, kind string) error {
-	if strings.Contains(rawPath, "${") {
-		idx := 0
-		for {
-			start := strings.Index(rawPath[idx:], "${")
-			if start == -1 {
-				break
+	for i := 0; i < len(rawPath); {
+		if rawPath[i] == '$' && i+1 < len(rawPath) && rawPath[i+1] == '{' {
+			relEnd := strings.IndexByte(rawPath[i+2:], '}')
+			if relEnd < 0 {
+				return fmt.Errorf("unclosed environment variable in %s: %q", kind, rawPath[i:])
 			}
-			start += idx
-			end := strings.Index(rawPath[start:], "}")
-			if end == -1 {
-				return fmt.Errorf("unclosed environment variable in %s: %q", kind, rawPath[start:])
-			}
-			end += start
-			varName := rawPath[start+2 : end]
+			end := i + 2 + relEnd
+			varName := rawPath[i+2 : end]
 			if varName == "" || !isValidEnvIdentifier(varName) {
 				return fmt.Errorf("invalid environment variable name ${%s} in %s", varName, kind)
 			}
-			idx = end + 1
+			i = end + 1
+			continue
 		}
-	}
-
-	for i := 0; i < len(rawPath); i++ {
 		if rawPath[i] == '%' {
 			if i+1 >= len(rawPath) {
 				return fmt.Errorf("trailing '%%' in %s", kind)
 			}
-			i++
-			switch rawPath[i] {
+			switch rawPath[i+1] {
 			case '%', 'h', 'p', 'r', 'n', 'u', 'l', 'L', 'i', 'd', 'j', 'C':
 			default:
-				return fmt.Errorf("unknown %s token %%%c", kind, rawPath[i])
+				return fmt.Errorf("unknown %s token %%%c", kind, rawPath[i+1])
 			}
+			i += 2
+			continue
 		}
+		i++
 	}
 	return nil
 }
@@ -1337,6 +1407,9 @@ type Options struct {
 	// ImplicitTier4 is true when multiplexing was resolved solely from ~/.ssh/config
 	// without any CLI flag or xops node/global configuration.
 	ImplicitTier4 bool `json:"-" yaml:"-"`
+	// LiteralControlPath marks OptionControlPath as an already-expanded literal
+	// socket path so Validate and resolution skip ~, ${VAR}, and % token parsing.
+	LiteralControlPath bool `json:"-" yaml:"-"`
 }
 
 // NewOptions creates an Options instance from alternating key, value pairs.
@@ -1370,7 +1443,10 @@ func OptionsFromControl(ctrl *ControlConfig) *Options {
 	if ctrl.Master == "" && ctrl.Path == "" && ctrl.Persist == "" {
 		return nil
 	}
-	opts := &Options{ImplicitTier4: ctrl.ImplicitTier4}
+	opts := &Options{
+		ImplicitTier4:      ctrl.ImplicitTier4,
+		LiteralControlPath: ctrl.Path != "" && !IsNoneValue(ctrl.Path) && ctrl.LiteralPath,
+	}
 	if ctrl.Master != "" {
 		opts.setRaw(OptionControlMaster, string(ctrl.Master))
 	}
@@ -1399,7 +1475,8 @@ func (o *Options) Clone() *Options {
 		return nil
 	}
 	cloned := &Options{
-		ImplicitTier4: o.ImplicitTier4,
+		ImplicitTier4:      o.ImplicitTier4,
+		LiteralControlPath: o.LiteralControlPath,
 	}
 	if len(o.values) > 0 {
 		cloned.values = make(map[string]string, len(o.values))
@@ -1410,12 +1487,23 @@ func (o *Options) Clone() *Options {
 	return cloned
 }
 
-// Equal reports whether two Options contain identical key-value pairs.
+func (o *Options) hasEffectiveLiteralControlPath() bool {
+	if o == nil || !o.LiteralControlPath {
+		return false
+	}
+	path := o.ControlPath()
+	return strings.TrimSpace(path) != "" && !IsNoneValue(path)
+}
+
+// Equal reports whether two Options contain identical key-value pairs and effective control-path mode.
 func (o *Options) Equal(other *Options) bool {
 	if o.IsEmpty() && other.IsEmpty() {
 		return true
 	}
 	if o.IsEmpty() || other.IsEmpty() {
+		return false
+	}
+	if o.hasEffectiveLiteralControlPath() != other.hasEffectiveLiteralControlPath() {
 		return false
 	}
 	if len(o.values) != len(other.values) {
@@ -1447,6 +1535,9 @@ func (o *Options) Set(key, rawValue string) error {
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
 	}
+	if spec.CanonicalKey == OptionControlPath {
+		o.LiteralControlPath = false
+	}
 	o.setRaw(spec.CanonicalKey, normalized)
 	return nil
 }
@@ -1465,12 +1556,24 @@ func (o *Options) setRaw(canonicalKey, val string) {
 
 // Delete removes an option by key.
 func (o *Options) Delete(key string) {
-	if o == nil || len(o.values) == 0 {
+	if o == nil {
 		return
 	}
 	if spec, ok := LookupOptionSpec(key); ok {
+		if spec.CanonicalKey == OptionControlPath {
+			o.LiteralControlPath = false
+		}
+		if len(o.values) == 0 {
+			return
+		}
 		delete(o.values, spec.CanonicalKey)
 	} else {
+		if key == OptionControlPath {
+			o.LiteralControlPath = false
+		}
+		if len(o.values) == 0 {
+			return
+		}
 		delete(o.values, key)
 	}
 	if len(o.values) == 0 {
@@ -1531,7 +1634,33 @@ func (o *Options) ControlPath() string {
 
 // SetControlPath sets the ControlPath directly.
 func (o *Options) SetControlPath(path string) {
+	if o != nil {
+		o.LiteralControlPath = false
+	}
 	o.setRaw(OptionControlPath, path)
+}
+
+// SetLiteralControlPath sets ControlPath directly as a pre-expanded literal
+// path (bypassing ~, ${VAR}, and % token validation/expansion).
+func (o *Options) SetLiteralControlPath(path string) error {
+	if o == nil {
+		return fmt.Errorf("%w: options receiver is nil", ErrSSHOptionsValidation)
+	}
+	if path == "" {
+		o.Delete(OptionControlPath)
+		return nil
+	}
+	if err := validateLiteralControlPath(path); err != nil {
+		return fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
+	}
+	if IsNoneValue(path) {
+		o.LiteralControlPath = false
+		o.setRaw(OptionControlPath, "none")
+		return nil
+	}
+	o.LiteralControlPath = true
+	o.setRaw(OptionControlPath, path)
+	return nil
 }
 
 // ControlPersist returns the configured ControlPersist, or "" if unset.
@@ -1559,6 +1688,7 @@ func (o *Options) ControlConfig() *ControlConfig {
 	return &ControlConfig{
 		Master:        master,
 		Path:          path,
+		LiteralPath:   o.LiteralControlPath && path != "" && !IsNoneValue(path),
 		Persist:       persist,
 		ImplicitTier4: o.ImplicitTier4,
 	}
@@ -1810,6 +1940,9 @@ func (o *Options) FilterByClasses(allowed ...OptionClass) *Options {
 		}
 		if slices.Contains(allowed, spec.Class) {
 			res.setRaw(k, v)
+			if spec.CanonicalKey == OptionControlPath {
+				res.LiteralControlPath = o.LiteralControlPath && !IsNoneValue(v)
+			}
 		}
 	}
 	if res.IsEmpty() {
@@ -1827,6 +1960,9 @@ func (o *Options) StripClasses(classes ...OptionClass) {
 		spec, ok := LookupOptionSpec(k)
 		if ok && slices.Contains(classes, spec.Class) {
 			delete(o.values, k)
+			if spec.CanonicalKey == OptionControlPath {
+				o.LiteralControlPath = false
+			}
 		}
 	}
 }
@@ -1849,6 +1985,12 @@ func (o *Options) Validate() error {
 		return nil
 	}
 	for k, v := range o.values {
+		if k == OptionControlPath && o.LiteralControlPath {
+			if err := validateLiteralControlPath(v); err != nil {
+				return fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
+			}
+			continue
+		}
 		spec, ok := LookupOptionSpec(k)
 		if !ok {
 			return fmt.Errorf("%w: unknown ssh option %q", ErrSSHOptionsValidation, k)
@@ -1867,7 +2009,7 @@ func (o *Options) Validate() error {
 		return fmt.Errorf("%w: ControlPersist %q cannot be specified when ControlMaster is 'no'", ErrSSHOptionsValidation, persist)
 	}
 
-	if path == "none" && isActiveControlMaster(normMaster) {
+	if IsNoneValue(path) && isActiveControlMaster(normMaster) {
 		return fmt.Errorf("%w: ControlPath cannot be 'none' when ControlMaster is %q", ErrSSHOptionsValidation, o.ControlMaster())
 	}
 
@@ -1886,11 +2028,11 @@ func (o *Options) ValidateEffective() error {
 	path := o.ControlPath()
 	persist := o.ControlPersist()
 	if isActiveControlMaster(normMaster) {
-		if path == "" || path == "none" {
+		if strings.TrimSpace(path) == "" || IsNoneValue(path) {
 			return fmt.Errorf("%w: ControlMaster %q requires non-empty ControlPath", ErrSSHOptionsValidation, o.ControlMaster())
 		}
 	}
-	if persist != "" && !strings.EqualFold(persist, "no") && !strings.EqualFold(persist, "false") && path == "" {
+	if persist != "" && !strings.EqualFold(persist, "no") && !strings.EqualFold(persist, "false") && strings.TrimSpace(path) == "" {
 		return fmt.Errorf("%w: ControlPath is required when ControlPersist is configured", ErrSSHOptionsValidation)
 	}
 	return nil
@@ -1939,6 +2081,9 @@ func MergeOptionLayers(layers ...*Options) *Options {
 			}
 			if _, exists := res.values[k]; !exists {
 				res.setRaw(k, v)
+				if k == OptionControlPath {
+					res.LiteralControlPath = layer.LiteralControlPath && !IsNoneValue(v)
+				}
 			}
 		}
 	}
@@ -1964,9 +2109,11 @@ func finalizeEffectiveOptions(opts *Options) *Options {
 	if opts.IsEmpty() {
 		return nil
 	}
-	if opts.ControlPath() == "none" {
+	if IsNoneValue(opts.ControlPath()) {
+		opts.SetControlPath("none")
 		opts.SetControlMaster(ControlMasterNo)
 		opts.Delete(OptionControlPersist)
+		opts.LiteralControlPath = false
 	}
 	return opts
 }
@@ -2083,8 +2230,15 @@ func extractYAMLOptionValue(spec OptionSpec, valNode *yaml.Node) (string, error)
 			if elem.Kind != yaml.ScalarNode || elem.Tag == "!!null" {
 				return "", fmt.Errorf("%s list elements must be scalar strings", spec.OpenSSHName)
 			}
-			if spec.MultiValue && strings.TrimSpace(elem.Value) == "" {
-				return "", fmt.Errorf("invalid %s: list element cannot be empty", spec.OpenSSHName)
+			if spec.MultiValue {
+				if strings.TrimSpace(elem.Value) == "" {
+					return "", fmt.Errorf("invalid %s: list element cannot be empty", spec.OpenSSHName)
+				}
+				if hasMultiValueDelimiterOrLineBreak(elem.Value) {
+					return "", fmt.Errorf("invalid %s: list element cannot contain newlines or control characters", spec.OpenSSHName)
+				}
+			} else if spec.AllowList && hasControlOrLineSepChar(elem.Value) {
+				return "", fmt.Errorf("invalid %s: list element contains invalid control character", spec.OpenSSHName)
 			}
 			items = append(items, elem.Value)
 		}
@@ -2202,8 +2356,16 @@ func extractJSONOptionValue(spec OptionSpec, rawMsg json.RawMessage) (string, er
 					if strings.TrimSpace(elem) == "" {
 						return "", fmt.Errorf("invalid %s: list element cannot be empty", spec.OpenSSHName)
 					}
+					if hasMultiValueDelimiterOrLineBreak(elem) {
+						return "", fmt.Errorf("invalid %s: list element cannot contain newlines or control characters", spec.OpenSSHName)
+					}
 				}
 				return strings.Join(listVal, "\n"), nil
+			}
+			for _, elem := range listVal {
+				if hasControlOrLineSepChar(elem) {
+					return "", fmt.Errorf("invalid %s: list element contains invalid control character", spec.OpenSSHName)
+				}
 			}
 			return strings.Join(listVal, ","), nil
 		}

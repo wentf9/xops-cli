@@ -172,3 +172,46 @@ func TestGetConfigFilePath_And_GetCurrentUser(t *testing.T) {
 		t.Errorf("GetCurrentUser failed: user=%q, err=%v", user, err)
 	}
 }
+
+func TestGetConfigFilePath_RespectsConfigDirAndHome(t *testing.T) {
+	customHome := t.TempDir()
+	t.Setenv("XOPS_CONFIG_DIR", "")
+	t.Setenv("HOME", customHome)
+	t.Setenv("USERPROFILE", customHome)
+
+	cfgPath, keyPath, err := GetConfigFilePath()
+	if err != nil {
+		t.Fatalf("GetConfigFilePath(HOME) failed: %v", err)
+	}
+	wantCfg := filepath.Join(customHome, ".xops", ConfigFileName)
+	wantKey := filepath.Join(customHome, ".xops", ConfigKeyName)
+	if cfgPath != wantCfg || keyPath != wantKey {
+		t.Fatalf("GetConfigFilePath(HOME) = (%q, %q), want (%q, %q)", cfgPath, keyPath, wantCfg, wantKey)
+	}
+
+	pwPath, err := GetPasswordFilePath()
+	if err != nil {
+		t.Fatalf("GetPasswordFilePath(HOME) failed: %v", err)
+	}
+	wantPW := filepath.Join(customHome, ".xops", PasswordFileName)
+	if pwPath != wantPW {
+		t.Fatalf("GetPasswordFilePath(HOME) = %q, want %q", pwPath, wantPW)
+	}
+
+	customCfgDir := t.TempDir()
+	t.Setenv("XOPS_CONFIG_DIR", customCfgDir)
+	cfgPath, keyPath, err = GetConfigFilePath()
+	if err != nil {
+		t.Fatalf("GetConfigFilePath(XOPS_CONFIG_DIR) failed: %v", err)
+	}
+	if cfgPath != filepath.Join(customCfgDir, ConfigFileName) || keyPath != filepath.Join(customCfgDir, ConfigKeyName) {
+		t.Fatalf("XOPS_CONFIG_DIR did not override HOME: got (%q, %q)", cfgPath, keyPath)
+	}
+	pwPath, err = GetPasswordFilePath()
+	if err != nil {
+		t.Fatalf("GetPasswordFilePath(XOPS_CONFIG_DIR) failed: %v", err)
+	}
+	if pwPath != filepath.Join(customCfgDir, PasswordFileName) {
+		t.Fatalf("GetPasswordFilePath(XOPS_CONFIG_DIR) = %q, want %q", pwPath, filepath.Join(customCfgDir, PasswordFileName))
+	}
+}

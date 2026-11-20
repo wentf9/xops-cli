@@ -31,13 +31,18 @@ type ClientConfig struct {
 	OriginalHost  string
 	CanonicalHost string
 	Address       string
-	Port          int
-	User          string
-	AuthType      string // "password", "key", "agent", "auto"
-	Password      string
-	KeyPath       string
-	KeyPaths      []string
-	Passphrase    string
+	// BaseHost records the underlying saved host address when a session-level
+	// HostName override rewrites Address, allowing SecretResolver snapshot checks
+	// to verify both the dialed override host and the underlying saved address
+	// without mutable adapter-wide state.
+	BaseHost   string
+	Port       int
+	User       string
+	AuthType   string // "password", "key", "agent", "auto"
+	Password   string
+	KeyPath    string
+	KeyPaths   []string
+	Passphrase string
 	// AuthUpdateToken conditionally authorizes persistence of discovered
 	// authentication values. An empty token makes discovery session-local.
 	AuthUpdateToken string
@@ -73,6 +78,7 @@ func (c *ClientConfig) ToConnectionConfig() ConnectionConfig {
 		OriginalHost:          c.OriginalHost,
 		CanonicalHost:         c.CanonicalHost,
 		Address:               c.Address,
+		BaseHost:              c.BaseHost,
 		Port:                  c.Port,
 		User:                  c.User,
 		AuthType:              c.AuthType,
@@ -98,6 +104,7 @@ type ConnectionConfig struct {
 	OriginalHost          string
 	CanonicalHost         string
 	Address               string
+	BaseHost              string `json:"base_host,omitempty"`
 	Port                  int
 	User                  string
 	AuthType              string
@@ -231,6 +238,7 @@ type SecretRequest struct {
 	NodeID       string
 	User         string
 	Host         string
+	BaseHost     string
 	Port         int
 	KeyPath      string
 	VersionToken string
@@ -420,7 +428,7 @@ func validateRoutingTargetCompatibility(cur ConnectionConfig, newCfg *ClientConf
 		return fmt.Errorf("%w: proxy jump changed (expected %q, got %q)",
 			ErrSnapshotMismatch, expectedJump, actualJump)
 	}
-	if strings.TrimSpace(cur.ProxyJump) == "" {
+	if !HasActiveProxyJump(cur.ProxyJump) {
 		expectedProxyCmd := cur.Options.ActiveProxyCommand()
 		actualProxyCmd := newCfg.Options.ActiveProxyCommand()
 		if actualProxyCmd != expectedProxyCmd {

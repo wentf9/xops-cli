@@ -15,7 +15,7 @@ func openRegularCertFile(certPath string) (*os.File, os.FileInfo, bool, error) {
 		err error
 	)
 	for {
-		fd, err = unix.Open(certPath, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+		fd, err = unix.Open(certPath, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC|unix.O_NOCTTY, 0)
 		if !errors.Is(err, unix.EINTR) {
 			break
 		}

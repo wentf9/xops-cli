@@ -170,7 +170,7 @@ func commitEditedNode(cmd *cobra.Command, repository *config.Repository, ref con
 }
 
 func applyEditTargetArgs(extraArgs []string, flags *editFlags, portChanged bool) error {
-	if flags.address != "" && (strings.Contains(flags.address, "@") || strings.Contains(flags.address, ":")) {
+	if flags.address != "" {
 		raw := flags.address
 		flags.address = ""
 		if err := mergeTargetAddressSpec(raw, &flags.address, &flags.user, &flags.port, &portChanged); err != nil {

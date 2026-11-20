@@ -35,7 +35,7 @@ OpenSSH 原生通过连接多路复用（Connection Multiplexing，基于 `-M`�
 | :--- | :--- |
 | OpenSSH `PROTOCOL.mux` 版本 4 二进制协议编解码 | 兼容历史已被废弃的 Version 1–3 废弃协议 |
 | `xops ssh` 完整支持 `-M`（单 master）、`-M -M`（确认 master）、`-S`、`-o`、`-O` | 在未安装原生 `AF_UNIX` 的古董 Windows（Win10 1803 之前）上提供模拟套接字 |
-| `-O` 控制指令支持：`check`、`exit`、`stop`、`forward`、`cancel`、`proxy`、`conninfo`、`channels` | 支持无需 Master 存在的无状态控制指令 |
+| `-O` 控制指令支持：`check`、`exit`、`stop`、`forward`、`cancel`、`proxy`、`proxy-stream`、`conninfo`、`channels` | 支持无需 Master 存在的无状态控制指令 |
 | `ControlMaster` 模式支持：`no`、`yes`、`ask`、`auto`、`autoask` | 绕过本地系统文件权限体系创建全局可写的公开控制套接字 |
 | `ControlPath` 令牌展开：`%%`, `%h`, `%p`, `%r`, `%n`, `%u`, `%l`, `%L`, `%i`, `%d`, `%j`, `%C`（SHA-1 哈希）及 `~`、`${ENV}` | 允许未经校验的任意超长路径（突破 OS `sockaddr_un` 108/104 字节上限） |
 | `ControlPersist` 支持：`no`、`yes`/`0`（永久驻留）、时间格式（`10m`, `1h`, `600s`, `1d`, `1w` 等）及空闲超时自动退出 | 保证不受操作系统 OOM 杀进程或宿主意外断电影响的套接字存续 |
@@ -61,10 +61,10 @@ flowchart TD
     end
 
     subgraph ConfigAdapter["pkg/adapter/ & pkg/config/ (Resolution & Configuration)"]
-        Adapter["pkg/adapter/ssh_adapter.go\n(ResolveControl: 4-Tier Precedence)"]
+        Adapter["pkg/adapter/ssh_adapter.go & policy_solver.go\n(4-Tier Policy & Proxy/Control Resolution)"]
         CfgRepo["pkg/config/repository.go\n(Configuration Snapshot)"]
-        OpenSSHParser["pkg/config/openssh.go\n(Parse ControlMaster/Path/Persist)"]
-        Models["pkg/models/types.go & pkg/config/schema_v2.go\n(Node.Control, Schema V2 CAS Hash)"]
+        OpenSSHParser["pkg/config/openssh.go & openssh_parser.go\n(Parse OpenSSH Config & SSHOptions)"]
+        Models["pkg/models/types.go & pkg/config/schema_v2.go\n(Node.SSHOptions, Schema V2 CAS Hash)"]
     end
 
     subgraph EnvDiscovery["internal/sshenv/ (Host Context)"]
@@ -81,7 +81,8 @@ flowchart TD
         MuxFwdTable["core/ssh/mux_forward_table.go\n(muxForwardTable, Forward Lifecycle & Barriers)"]
         MuxRelay["core/ssh/mux_proxy_relay.go\n(proxySessionState, Packet & Flow Relay)"]
         MuxUnix["core/ssh/mux_rights_unix.go\n(bindAndLinkSocket, SCM_RIGHTS, SO_PEERCRED)"]
-        MuxOther["core/ssh/mux_rights_other.go\n(Windows AF_UNIX Direct Bind)"]
+        MuxWindows["core/ssh/mux_rights_windows.go\n(Windows AF_UNIX Direct Bind)"]
+        MuxOther["core/ssh/mux_rights_other.go\n(Unsupported Platform Fail-Closed Stub)"]
     end
 
     SSHCmd --> SSHFlag
@@ -105,6 +106,7 @@ flowchart TD
     Connector --> MuxServer
     MuxServer --> MuxProto
     MuxServer --> MuxUnix
+    MuxServer --> MuxWindows
     MuxServer --> MuxOther
     MuxClient --> MuxProto
     MuxClient --> MuxProxy
@@ -278,7 +280,7 @@ const (
 - **描述符接收契约**：OpenSSH `mm_send_fd` 每个描述符单独发送一条控制消息，因此 `recvFDs` 必须循环累加直到收满，不能假设一次 `recvmsg` 携带全部 fd；接收上限为 5s（`passengerFDReceiveTimeout`），每个 fd 立即 `SetFD(FD_CLOEXEC)`，超出请求数量的 fd 直接关闭而不是交给调用方。
 - **单一所有权**：接收到的 fd 由 `recvFiles` 交给 `*os.File`，此后只能通过 `File.Close()` 释放。handler 不得再次 `unix.Close` 同一 fd 编号——第二次关闭可能命中并发 goroutine 刚复用的无关描述符；`MUX_C_NEW_STDIO_FWD` 在两个方向的复制都退出后才返回，避免 deferred 清理与在途写竞态。
 - **`MUX_C_NEW_STDIO_FWD`**：`connect_port` 遵循 `PROTOCOL.mux` v4 编码为 `uint32`；接收 2 个文件描述符（输入与输出），通过 Master 的 `Client.Dial("tcp", host:port)` 进行流式转发，并在本地输入 EOF 时调用半关闭 `CloseWrite()` 等待远端响应排空。
-- **跨平台降级**：在 Windows 平台（`core/ssh/mux_rights_other.go`），由于 Windows 的 Winsock `AF_UNIX` 不支持文件描述符传递机制（fd passing / `SCM_RIGHTS`），若接收到 Passenger 模式请求，服务安全拒绝并明确提示使用 `MUX_C_PROXY`。
+- **跨平台降级**：在 Windows 平台（`core/ssh/mux_rights_windows.go`），由于 Windows 的 Winsock `AF_UNIX` 不支持文件描述符传递机制（fd passing / `SCM_RIGHTS`），若接收到 Passenger 模式请求，服务安全拒绝并明确提示使用 `MUX_C_PROXY`；除 Linux/macOS/FreeBSD/Windows 外的其余平台（`!linux && !darwin && !freebsd && !windows`）在 `core/ssh/mux_rights_other.go` 中以 fail-closed 桩安全拒绝。
 
 ### 3.4 资源限制与 DOS 防护
 
@@ -318,7 +320,7 @@ const (
 - **macOS / FreeBSD** (`mux_peer_darwin.go` / `mux_peer_freebsd.go`)：通过 `unix.GetsockoptXucred(fd, unix.SOL_LOCAL, unix.LOCAL_PEERCRED)` 获取 `xucred.Uid`。
 - **校验逻辑**：Master 校验连入对端的 UID 必须与期望 UID（当前执行用户 UID）完全一致；若不匹配立即切断连接并记录安全审计日志，返回 `ErrUnauthorizedPeer`。
 - **客户端侧同等校验**：`DialMuxClient` / `DialMuxProxyStream` / `DialControlProxy` 在握手前调用同一个 `checkPeerUID`，要求 Master 端 UID 等于本进程有效 UID（默认 `localPeerUID()`）或 `0`（root）。否则任何本地用户在 `/tmp` 等共享目录抢先创建同名套接字，即可冒充 Master 收取受害者的命令、提权口令与传输内容。`WithExpectedPeerUID` 只能改期望的 UID，不能关闭校验：`0` 表示“期望对端是 root”，因此以 root 运行的客户端同样会拒绝普通用户预先植入的套接字（先前把 `0` 当作“跳过校验”会让 root 会话被劫持）。仅缺少对端凭据能力的平台（Windows）由 `checkPeerUID` 自身 no-op。
-- **Windows** (`mux_rights_other.go`)：由于 Windows AF_UNIX 依赖 NTFS 安全描述符（DACL）隔离用户安全边界且不支持 `SO_PEERCRED`，因此在此平台上 `localPeerUID()` 返回 `0` 并安全跳过 UID 检查。
+- **Windows** (`mux_rights_windows.go`)：由于 Windows AF_UNIX 依赖 NTFS 安全描述符（DACL）隔离用户安全边界且不支持 `SO_PEERCRED`，因此在此平台上 `localPeerUID()` 返回 `0` 并安全跳过 UID 检查（`mux_rights_other.go` 为除 Linux/macOS/FreeBSD/Windows 外的其余平台 `!linux && !darwin && !freebsd && !windows` 的 fail-closed 桩）。
 - **服务端默认值**：`StartMuxServer` 在 `Environment.LocalUID` 缺失或无法解析时回退到 `localPeerUID()`（Unix 下即有效 UID），绝不因宿主漏注入宿主上下文而静默关闭 Master 侧校验；显式 `LocalUID` 仍优先。`Connector` 用同一个 `expectedPeerUIDFromEnvironment` 派生客户端侧期望值，使容器等注入 UID 与有效 UID 不一致时两端仍然一致。
 
 ### 4.4 僵死套接字（Stale Socket）探测与清理
@@ -409,15 +411,18 @@ nodes:
       tcp_keep_alive: "yes"
 ```
 
-- **受支持的 OpenSSH 选项注册表（`core/ssh/ssh_options.go`，共 19 项，按 `OptionClass` 分类隔离）**：
+- **受支持的 OpenSSH 选项注册表（`core/ssh/ssh_options.go`，共 53 项，划分为 7 个 `OptionClass` 分类由 `pkg/adapter/policy_solver.go` 按层裁决）**：
   - **多路复用 (`OptionClassMux`)**：`control_master` (`ControlMaster`), `control_path` (`ControlPath`), `control_persist` (`ControlPersist`)
-  - **传输与算法 (`OptionClassTransport`)**：`connect_timeout` (`ConnectTimeout`), `server_alive_interval` (`ServerAliveInterval`), `server_alive_count_max` (`ServerAliveCountMax`), `tcp_keep_alive` (`TCPKeepAlive`), `host_key_algorithms` (`HostKeyAlgorithms`), `ciphers` (`Ciphers`), `macs` (`MACs`), `kex_algorithms` (`KexAlgorithms`；均支持完整列表、`+` 追加、`^` 前置、`-` 移除语法)
-  - **认证控制 (`OptionClassAuth`)**：`pubkey_authentication` (`PubkeyAuthentication`), `password_authentication` (`PasswordAuthentication`), `kbd_interactive_authentication` (`KbdInteractiveAuthentication` / `ChallengeResponseAuthentication`), `identities_only` (`IdentitiesOnly`), `preferred_authentications` (`PreferredAuthentications`), `batch_mode` (`BatchMode`)
-  - **主机密钥信任 (`OptionClassTrust`)**：`strict_host_key_checking` (`StrictHostKeyChecking`: `yes`/`ask`/`accept-new`/`no`/`off`), `user_known_hosts_file` (`UserKnownHostsFile`)
+  - **传输与算法 (`OptionClassTransport`)**：`address_family` (`AddressFamily`), `connect_timeout` (`ConnectTimeout`), `server_alive_interval` (`ServerAliveInterval`), `server_alive_count_max` (`ServerAliveCountMax`), `tcp_keep_alive` (`TCPKeepAlive`), `canonicalize_hostname` (`CanonicalizeHostname`), `canonical_domains` (`CanonicalDomains`), `canonicalize_max_dots` (`CanonicalizeMaxDots`), `canonicalize_fallback_local` (`CanonicalizeFallbackLocal`), `canonicalize_permitted_cnames` (`CanonicalizePermittedCNAMEs`), `host_key_algorithms` (`HostKeyAlgorithms`), `ciphers` (`Ciphers`), `macs` (`MACs`), `kex_algorithms` (`KexAlgorithms`)（算法列表均支持完整替换、`+` 追加、`^` 前置、`-` 移除语法）
+  - **认证控制 (`OptionClassAuth`)**：`identity_file` (`IdentityFile`), `certificate_file` (`CertificateFile`), `identity_agent` (`IdentityAgent`), `pubkey_authentication` (`PubkeyAuthentication`), `password_authentication` (`PasswordAuthentication`), `kbd_interactive_authentication` (`KbdInteractiveAuthentication` / `ChallengeResponseAuthentication`), `identities_only` (`IdentitiesOnly`), `preferred_authentications` (`PreferredAuthentications`), `batch_mode` (`BatchMode`)
+  - **主机密钥信任 (`OptionClassTrust`)**：`strict_host_key_checking` (`StrictHostKeyChecking`: `yes`/`ask`/`accept-new`/`no`/`off`), `user_known_hosts_file` (`UserKnownHostsFile`), `global_known_hosts_file` (`GlobalKnownHostsFile`), `hash_known_hosts` (`HashKnownHosts`), `verify_host_key_dns` (`VerifyHostKeyDNS`)
+  - **转发 (`OptionClassForward`)**：`exit_on_forward_failure` (`ExitOnForwardFailure`), `clear_all_forwardings` (`ClearAllForwardings`), `forward_agent` (`ForwardAgent`), `gateway_ports` (`GatewayPorts`), `stream_local_bind_unlink` (`StreamLocalBindUnlink`), `stream_local_bind_mask` (`StreamLocalBindMask`), `tunnel` (`Tunnel`), `tunnel_device` (`TunnelDevice`), `local_forward` (`LocalForward`), `remote_forward` (`RemoteForward`), `dynamic_forward` (`DynamicForward`)
+  - **会话行为 (`OptionClassSession`)**：`fork_after_authentication` (`ForkAfterAuthentication`), `stdin_null` (`StdinNull`), `session_type` (`SessionType`), `request_tty` (`RequestTTY`), `send_env` (`SendEnv`), `set_env` (`SetEnv`), `remote_command` (`RemoteCommand`), `escape_char` (`EscapeChar`)
+  - **本地命令执行 (`OptionClassLocalExec`)**：`proxy_command` (`ProxyCommand`), `local_command` (`LocalCommand`), `permit_local_command` (`PermitLocalCommand`)
 - **信任与继承边界**：
-  - `OptionClassTrust` 选项**不从 `~/.ssh/config`（Tier 4）继承**，仅接受来自 CLI `-o`（Tier 1）与 `xops` 显式配置（Tier 2 / Tier 3）；当主机指纹发生变更（`known_hosts` 不匹配）且显式指定 `StrictHostKeyChecking=no` 时，遵循 OpenSSH 原生语义自动禁用密码与键盘交互认证（仅允许公钥认证），防止凭据泄露给中间人。
-  - 已纳管的 `xops` 节点在回退查询 Tier 4 (`~/.ssh/config`) 时仅继承 `OptionClassMux` 与 `OptionClassTransport`；`ParseOpenSSHHosts` 导入节点时同样仅持久化这两类选项。
-  - MCP Host 与凭据校验路径显式启用 `WithHostTrustOverrides(false)` 与 `WithControlMultiplexing(false)`，剥离 `OptionClassTrust` 与 `OptionClassMux`，保持 fail-closed 主机密钥校验。
+  - `OptionClassTrust` 中安全敏感指令（`StrictHostKeyChecking`、`UserKnownHostsFile`、`GlobalKnownHostsFile`、`VerifyHostKeyDNS`）**不从 `~/.ssh/config`（Tier 4）继承**，仅接受来自 CLI `-o`（Tier 1）与 `xops` 显式配置（Tier 2 / Tier 3）；仅 `HashKnownHosts=yes`（`yes`/`true`）支持单向 Tier-4 安全加强继承。当主机指纹发生变更（`known_hosts` 不匹配）且显式指定 `StrictHostKeyChecking=no` 时，遵循 OpenSSH 原生语义自动禁用密码与键盘交互认证（仅允许公钥认证），防止凭据泄露给中间人。
+  - 已纳管的 `xops` 节点在回退查询 Tier 4 (`~/.ssh/config`) 时仅继承 `OptionClassMux` 与 `OptionClassTransport`（外加单向 `HashKnownHosts=yes`）；`ParseOpenSSHHosts` 导入节点时仅持久化复用与传输安全选项。
+  - MCP Host 与凭据校验路径（`adapter.VerifyConnection`）统一调用单一预设 `adapter.WithStrictIsolation()`（组合 `WithNonInteractive(true)`、`WithControlMultiplexing(false)`、`WithHostTrustOverrides(false)`、`WithSessionAndForwardOptions(false)` 与 `WithLocalExecution(false)`），全面剥离信任覆写、连接复用、会话转发与本地命令执行选项，保持 fail-closed 隔离边界。
 - **CAS 版本哈希**：`SSHOptions` 纳入 `nodeEntityVersion`（`NodeRef`）的 CAS 内容哈希计算（`pkg/config/repository.go:nodeEntityVersion`），配置变更自动使依赖该节点的上层 `NodeRef` 乐观并发校验失效；认证机密版本 `nodeAuthVersion` 仍只覆盖认证材料。
 
 ---
@@ -432,7 +437,7 @@ nodes:
   - `-M`：启用 Master 模式（相当于 `-o ControlMaster=yes`）。
   - `-M -M`（重复指定）：启用确认 Master 模式（相当于 `-o ControlMaster=ask`）。
   - `-S <path>`：指定控制套接字路径（或 `-S none` 显式禁用连接共享）。
-  - `-o Key=Value`：传递 OpenSSH 客户端选项（支持 `Port`、`User`、`IdentityFile`、`ProxyJump` 以及第 5.5 节列出的全部 19 项 `ssh_options` 选项，大小写不敏感并同时支持 `PascalCase` 与 `snake_case`）。
+  - `-o Key=Value`：传递 OpenSSH 客户端选项（支持 `Port`、`User`、`HostName`、`ProxyJump` 以及第 5.5 节列出的全部 53 项 `ssh_options` 选项，大小写不敏感并同时支持 `PascalCase` 与 `snake_case`）。
   - `-O <ctl_cmd>`：向正在运行的 Master 进程发送控制指令。
 - **`xops scp`、`xops sftp`、`xops exec`**：
   - 注册 `-S` 与 `-o` 参数。
@@ -460,8 +465,8 @@ nodes:
 
 `-O` 是"对既有 Master 的查询"，不得产生任何配置副作用：
 
-- 配置通过只读 `config.Provider` 加载（`cmd/ssh_control.go:loadReadOnlyControlProvider`），绝不走 `Repository.PrepareNodeContext` 或任何持久化路径；`-O check` 不会因为 `remember=always` 之类策略改写 `xops_config.yaml`。
-- 目标解析使用 `ResolveSelector`，歧义（`AmbiguousNodeError`）与未找到一律返回退出码 `255`，不再静默降级为空节点。
+- 配置通过只读 `config.Provider` 加载（`cmd/ssh_control.go:loadReadOnlyControlProvider`），结合 `cmd/ssh_option_flag.go:resolveControlSessionLookup` 解析只读连接快照，绝不走 `Repository.PrepareNodeContext` 或任何持久化写回路径；`-O check` 等查询不会因 `remember=always` 改写 `xops_config.yaml`。
+- 目标解析使用 `ResolveSelector` 与只读 `ResolveTarget`，歧义（`AmbiguousNodeError`）与未找到一律返回退出码 `255`，不再静默降级为空节点。
 - `ControlPath` 令牌（`%h/%p/%r/%j/%C`）始终基于**解析后的连接目标**展开（`cmd/ssh_option_flag.go:controlSocketPath`），与 `Connector.buildTargetContext` 完全一致；即使显式传入 `-S`，也先解析节点再展开，避免用户用节点别名调用时算出与 Master 实际路径不同的套接字。
 
 ### 6.4 严格错误格式与退出码传递
@@ -523,8 +528,8 @@ OpenSSH 客户端对控制指令有明确的行业契约：
    - **`ReleaseMaster` 只释放引用、不停机**：交接前用它把 Master 变为"可空闲"，Master 仍留在 `Connector.masters` 中，交接失败时 `CloseAll` 依旧负责收尾，重复调用也不会把计数减成负数。
 2. **`-N` 进程持有 Master 直到停机**：`xops ssh -M -N`（含 `-f -N` 子进程）直接保留 `Connector` 创建 Master 时持有的唯一前台会话引用（`InitialActiveSessions = 1`），并在 `runConnectedSession` 中等待 `select { <-runCtx.Done(); <-srv.Wait() }`，既避免重复计数（`activeSessions == 2`），也防止空闲倒计时或首个客户端断开误杀 `-N` 进程。
 3. **一次性/交互会话结束后交接给后台守护**：当 `ControlPersist` 启用且前台会话（命令或交互 Shell）结束时，`SshOptions.handoffPersistentMaster` 先释放并关闭本 `Connector` 启动的全部 Master（含 `ProxyJump` 跳板节点 Master）以释放套接字，再以 `XOPS_CLI_SSH_MUX_DAEMON=1` + `XOPS_CLI_SSH_BG_CHILD=1` re-exec 一个只服务控制套接字的子进程（强制 `-N`、清空命令、跳过 `--*-stdin` 读取、标准流指向 `/dev/null`），最后在 `waitForControlSocket` 的有界等待（10s）内确认新 Master 可用。交接失败只写 stderr 警告，不改变已执行命令的退出状态。
-   - **不交接的场景**：`-N` 进程本身持有 Master（无需二次 fork）、`-f` 后台子进程、守护子进程自身（`XOPS_CLI_SSH_MUX_DAEMON=1`）、**仅来自 Tier 4 (`~/.ssh/config`) 的隐式复用配置**（`ControlConfig.ImplicitTier4 == true`，当用户未在 CLI 参数或 `xops` Node/Global 配置中显式声明复用时，允许透明复用既有套接字，但在单次命令退出时不静默拉起长生命周期后台守护进程），以及会话被取消（`Ctrl-C`/context 取消）——后者若再拉起守护进程，等于复活用户刚刚停止的连接。对于 `ControlMaster=ask/autoask`，后台守护进程以 `-o ControlMaster=ask` 启动并挂载 `SessionConfirmer`，脱离终端后通过 `SSH_ASKPASS`（或 `DISPLAY`/`WAYLAND_DISPLAY` 下的系统 `ssh-askpass`）弹窗确认；若无可用 `ssh-askpass` 或用户拒绝则 fail-closed 拒绝该次复用请求。
-   - **安全与凭据校验隔离**：凭据有效性验证（`adapter.VerifyConnection`）与 MCP Host 运行时连接器显式调用 `adapter.WithControlMultiplexing(false)` 禁用外部控制套接字复用与创建，确保凭据校验始终对远端执行真实认证握手，且受控的 MCP 会话不会跨边界复用或暴露本地共享套接字。
+   - **不交接的场景**：`-N` 进程本身持有 Master（无需二次 fork）、`-f` 后台子进程、守护子进程自身（`XOPS_CLI_SSH_MUX_DAEMON=1`）、启用了活跃 `ProxyCommand` 的会话（本地子进程代理与单次交互流绑定，不脱离重放）、**仅来自 Tier 4 (`~/.ssh/config`) 的隐式复用配置**（`ControlConfig.ImplicitTier4 == true`，当用户未在 CLI 参数或 `xops` Node/Global 配置中显式声明复用时，允许透明复用既有套接字，但在单次命令退出时不静默拉起长生命周期后台守护进程），以及会话被取消（`Ctrl-C`/context 取消）——后者若再拉起守护进程，等于复活用户刚刚停止的连接。交接传递 `MuxDaemonSpec` 时通过 `ControlPathLiteral: true` 原样保留父进程已展开的套接字路径（如包含 IPv6 `%zone` 或字面 `${VAR}`），避免守护子进程二次令牌展开。对于 `ControlMaster=ask/autoask`，后台守护进程以 `-o ControlMaster=ask` 启动并挂载 `SessionConfirmer`，脱离终端后通过 `SSH_ASKPASS`（或 `DISPLAY`/`WAYLAND_DISPLAY` 下的系统 `ssh-askpass`）弹窗确认；若无可用 `ssh-askpass` 或用户拒绝则 fail-closed 拒绝该次复用请求。
+   - **安全与凭据校验隔离**：凭据有效性验证（`adapter.VerifyConnection`）与 MCP Host 运行时连接器统一调用 `adapter.WithStrictIsolation()` 禁用外部控制套接字复用/创建、主机信任覆写、会话转发选项与本地命令执行，确保凭据校验始终对远端执行真实认证握手，且受控的 MCP 会话不会跨边界复用或暴露本地共享套接字。
    - **一次性凭据不交接**：使用 `--otp` 的会话不会拉起守护进程——该验证码已被父进程消费，子进程重放必然失败并可能触发服务端 MFA 失败锁定。
    - **守护进程早退不再阻塞**：父进程通过 `cmd.Wait()` 监听子进程退出，`waitForControlSocket` 一旦发现子进程先于套接字就绪退出就立刻返回并告警，而不是空等满 10 秒就绪超时。
    - **守护进程不占用前台会话计数**：`ControlPersist=10m` 等有界持久化必须让空闲定时器正常到期退出；守护进程启动连接后立即 `Connector.ReleaseMaster` 放弃自己那份引用，`activeSessions` 因此归零，空闲定时器正常布防。若守护进程像前台进程一样保留引用，`activeSessions` 恒大于 0，空闲定时器永不触发，进程将永久泄漏。`-N` 前台主进程则相反，必须计入前台会话，否则首个客户端断开就会误杀它。

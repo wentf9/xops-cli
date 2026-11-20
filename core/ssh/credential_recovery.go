@@ -41,7 +41,7 @@ func (c *Connector) recoverablePasswordAuth(ctx context.Context, policy dialPoli
 	roCfg := policy.readOnlyConfig()
 	provider := &autoSecretProvider{
 		lifecycleCtx: ctx, nodeID: policy.nodeID, user: policy.user,
-		host: policy.address, port: policy.port, versionToken: policy.authUpdateToken,
+		host: policy.address, baseHost: policy.baseHost, port: policy.port, versionToken: policy.authUpdateToken,
 		resolver: c.secretResolver, prompter: prompter, recoveryPrompter: credentialRecoveryPrompter(c.getNodeSecretPrompter(roCfg)),
 		handshakeTimeout: c.getNodeHandshakeTimeout(roCfg), interactionTimeout: c.interactionTimeout,
 	}

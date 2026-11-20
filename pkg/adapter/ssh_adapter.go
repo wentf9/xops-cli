@@ -42,16 +42,17 @@ type SessionAuth struct {
 // SessionControlOptions specifies session-level OpenSSH option overrides (Tier 1).
 // Pointers indicate whether a multiplexing flag was explicitly specified on the CLI.
 type SessionControlOptions struct {
-	Master     *ssh.ControlMasterMode
-	Path       *string
-	Persist    *string
-	Options    *ssh.Options
-	AllowReuse bool
+	Master      *ssh.ControlMasterMode
+	Path        *string
+	LiteralPath bool
+	Persist     *string
+	Options     *ssh.Options
+	AllowReuse  bool
 }
 
 // IsEmpty returns true if no session control or SSH option flags were provided.
 func (s SessionControlOptions) IsEmpty() bool {
-	return s.Master == nil && s.Path == nil && s.Persist == nil && s.Options.IsEmpty()
+	return s.Master == nil && s.Path == nil && !s.LiteralPath && s.Persist == nil && s.Options.IsEmpty()
 }
 
 func (s *SessionControlOptions) ensureOptions() *ssh.Options {
@@ -76,6 +77,7 @@ func (s *SessionControlOptions) SetMaster(m ssh.ControlMasterMode) {
 
 // SetPath sets the ControlPath override.
 func (s *SessionControlOptions) SetPath(p string) {
+	s.LiteralPath = false
 	if p == "" {
 		s.Path = nil
 		if s.Options != nil {
@@ -83,8 +85,36 @@ func (s *SessionControlOptions) SetPath(p string) {
 		}
 		return
 	}
+	if ssh.IsNoneValue(p) {
+		p = "none"
+	}
 	s.Path = &p
 	s.ensureOptions().SetControlPath(p)
+}
+
+// SetLiteralPath sets an already-expanded literal ControlPath override so
+// downstream option validation and path resolution do not rescan ~, ${VAR}, or % tokens.
+func (s *SessionControlOptions) SetLiteralPath(p string) {
+	if p == "" {
+		s.LiteralPath = false
+		s.SetPath("")
+		return
+	}
+	if ssh.IsNoneValue(p) {
+		s.LiteralPath = false
+		s.SetPath("none")
+		return
+	}
+	s.Path = &p
+	s.LiteralPath = true
+	opts := s.ensureOptions()
+	if err := opts.SetLiteralControlPath(p); err != nil {
+		// Preserve LiteralControlPath=true on invalid literal input so downstream
+		// Validate()/ResolvePath() fails closed instead of silently degrading to
+		// template expansion.
+		opts.SetControlPath(p)
+		opts.LiteralControlPath = true
+	}
 }
 
 // SetPersist sets the ControlPersist override.
@@ -124,7 +154,16 @@ func (s SessionControlOptions) ToSSHOptions() *ssh.Options {
 		if opts == nil {
 			opts = &ssh.Options{}
 		}
-		opts.SetControlPath(*s.Path)
+		if ssh.IsNoneValue(*s.Path) {
+			opts.SetControlPath("none")
+		} else if s.LiteralPath {
+			if err := opts.SetLiteralControlPath(*s.Path); err != nil {
+				opts.SetControlPath(*s.Path)
+				opts.LiteralControlPath = true
+			}
+		} else {
+			opts.SetControlPath(*s.Path)
+		}
 	}
 	if s.Persist != nil && *s.Persist != "" {
 		if opts == nil {
@@ -540,6 +579,20 @@ func WithSessionOptions(enabled bool) Option {
 	}
 }
 
+// WithStrictIsolation enforces the shared fail-closed isolation preset used by
+// credential verification and MCP hosts: non-interactive, no control-socket
+// multiplexing, no host-trust overrides, no session/forwarding options, and no
+// local execution (ProxyCommand/LocalCommand).
+func WithStrictIsolation() Option {
+	return func(a *SSHAdapter) {
+		a.nonInteractive = true
+		a.disableControl = true
+		a.disableHostTrust = true
+		a.disableSessionAndForward = true
+		a.localExecution = false
+	}
+}
+
 // WithSuppressNodeConfirmation prevents ConfirmConnection from committing pending
 // ad-hoc nodes to persistent configuration (e.g., under --remember=never or in
 // detached background child processes).
@@ -761,18 +814,25 @@ func validateMergedControl(merged *ssh.ControlConfig) error {
 			return err
 		}
 	}
-	// Path == "none" disables multiplexing: normalize Master to "no" and clear Persist
-	if merged.Path == "none" {
+	// Path == "none" (case-insensitive) disables multiplexing: normalize Master to "no" and clear Persist
+	if ssh.IsNoneValue(merged.Path) {
+		merged.Path = "none"
 		merged.Master = ssh.ControlMasterNo
 		merged.Persist = ""
+		merged.LiteralPath = false
 		return nil
 	}
+	if merged.LiteralPath {
+		if _, err := (&ssh.ControlConfig{Path: merged.Path, LiteralPath: true}).ResolvePath(ssh.Environment{}, ssh.TargetContext{}); err != nil {
+			return err
+		}
+	}
 	if merged.Master != ssh.ControlMasterNo && merged.Master != "" {
-		if merged.Path == "" {
+		if strings.TrimSpace(merged.Path) == "" {
 			return fmt.Errorf("ControlPath is required when ControlMaster is %s", merged.Master)
 		}
 	}
-	if merged.Persist != "" && merged.Path == "" {
+	if merged.Persist != "" && strings.TrimSpace(merged.Path) == "" {
 		return fmt.Errorf("ControlPath is required when ControlPersist is configured")
 	}
 	return nil
@@ -797,23 +857,24 @@ func resolveMergedMaster(t1 SessionControlOptions, t2, t3, t4 *ssh.ControlConfig
 	return ssh.ControlMasterNo
 }
 
-func resolveMergedPath(t1 SessionControlOptions, t2, t3, t4 *ssh.ControlConfig) string {
+func resolveMergedPathAndLiteral(t1 SessionControlOptions, t2, t3, t4 *ssh.ControlConfig) (string, bool) {
 	if t1.Path != nil {
-		return *t1.Path
+		return *t1.Path, t1.LiteralPath && *t1.Path != "" && !ssh.IsNoneValue(*t1.Path)
 	}
 	if t1.Options != nil && t1.Options.ControlPath() != "" {
-		return t1.Options.ControlPath()
+		p := t1.Options.ControlPath()
+		return p, t1.Options.LiteralControlPath && !ssh.IsNoneValue(p)
 	}
 	if t2 != nil && t2.Path != "" {
-		return t2.Path
+		return t2.Path, t2.LiteralPath && !ssh.IsNoneValue(t2.Path)
 	}
 	if t3 != nil && t3.Path != "" {
-		return t3.Path
+		return t3.Path, t3.LiteralPath && !ssh.IsNoneValue(t3.Path)
 	}
 	if t4 != nil && t4.Path != "" {
-		return t4.Path
+		return t4.Path, t4.LiteralPath && !ssh.IsNoneValue(t4.Path)
 	}
-	return ""
+	return "", false
 }
 
 func resolveMergedPersist(t1 SessionControlOptions, t2, t3, t4 *ssh.ControlConfig) string {
@@ -842,13 +903,15 @@ func mergeControlFields(
 	t4 *ssh.ControlConfig,
 ) *ssh.ControlConfig {
 	master := resolveMergedMaster(t1, t2, t3, t4)
-	path := resolveMergedPath(t1, t2, t3, t4)
+	path, literalPath := resolveMergedPathAndLiteral(t1, t2, t3, t4)
 	persist := resolveMergedPersist(t1, t2, t3, t4)
 
-	// Handle "-S none" or Path == "none": disables connection sharing
-	if path == "none" {
+	// Handle "-S none" or Path == "none" (case-insensitive): disables connection sharing
+	if ssh.IsNoneValue(path) {
+		path = "none"
 		master = ssh.ControlMasterNo
 		persist = ""
+		literalPath = false
 	}
 
 	// Unconfigured check: if nothing was configured across all 4 tiers, return nil
@@ -867,9 +930,10 @@ func mergeControlFields(
 	return &ssh.ControlConfig{
 		Master:        master,
 		Path:          path,
+		LiteralPath:   literalPath,
 		Persist:       persist,
 		ImplicitTier4: !hasExplicitPersist && t4 != nil,
-		AllowReuse:    t1.AllowReuse && !hasExplicitSessionMaster && path != "none" && path != "",
+		AllowReuse:    t1.AllowReuse && !hasExplicitSessionMaster && !ssh.IsNoneValue(path) && strings.TrimSpace(path) != "",
 	}
 }
 
@@ -900,8 +964,11 @@ func effectiveSnapshotUser(user string) string {
 // ExpandControlPath expands tokens in rawPath for nodeID using node snapshot context.
 // Useful for CLI control commands (-O check/exit/stop) that directly connect to sockets.
 func (a *SSHAdapter) ExpandControlPath(nodeID string, rawPath string) (string, error) {
-	if rawPath == "" || rawPath == "none" {
-		return rawPath, nil
+	if rawPath == "" {
+		return "", nil
+	}
+	if ssh.IsNoneValue(rawPath) {
+		return "none", nil
 	}
 	sessionCtrlOpts, _ := a.getSessionControlOverride(nodeID)
 	pol, err := a.solvePolicy(nodeID, sessionCtrlOpts, policySolveMode{
@@ -975,7 +1042,7 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 	}
 	cfg := &ssh.ClientConfig{
 		NodeID:                nodeID,
-		Address:               strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(snapshot.Host.Address), "]"), "["),
+		Address:               effectiveSnapshotHost(snapshot, false, SessionAuth{}),
 		Port:                  effectiveSnapshotPort(snapshot.Host.Port),
 		User:                  effectiveSnapshotUser(snapshot.Identity.User),
 		OriginalHost:          pol.originalHost,
@@ -1001,6 +1068,9 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 	if hasOverride {
 		if err := a.applySessionOverrideToConfig(nodeID, cfg, override); err != nil {
 			return nil, err
+		}
+		if strings.TrimSpace(override.HostName) != "" {
+			cfg.BaseHost = config.StripHostBrackets(snapshot.Host.Address)
 		}
 	}
 	if pol.higherTierCmdWins {
@@ -1091,9 +1161,17 @@ func buildOrderedKeyPaths(cliFlagKeys, cliOptKeys []string, managedNodeKey strin
 	return out
 }
 
+func effectiveSnapshotHost(snapshot config.ConnectionSnapshot, hasOverride bool, override SessionAuth) string {
+	host := config.StripHostBrackets(snapshot.Host.Address)
+	if hasOverride && strings.TrimSpace(override.HostName) != "" {
+		host = config.StripHostBrackets(override.HostName)
+	}
+	return host
+}
+
 func (a *SSHAdapter) applySessionOverrideToConfig(nodeID string, cfg *ssh.ClientConfig, override SessionAuth) error {
-	if override.HostName != "" {
-		cfg.Address = strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(override.HostName), "]"), "[")
+	if strings.TrimSpace(override.HostName) != "" {
+		cfg.Address = config.StripHostBrackets(override.HostName)
 	}
 	if orig := strings.TrimSpace(override.OriginalHost); orig != "" {
 		if cleanOrig, ok := config.OpenSSHOriginalHost(orig); ok {
@@ -1350,7 +1428,7 @@ func (a *SSHAdapter) ResolveSecret(ctx context.Context, req ssh.SecretRequest) (
 		return nil, fmt.Errorf("resolve node %q failed: %w", req.NodeID, err)
 	}
 
-	if err := validateSecretRequestSnapshot(snapshot, req); err != nil {
+	if err := a.validateSecretRequestSnapshot(snapshot, hasOverride, override, req); err != nil {
 		return nil, err
 	}
 
@@ -1650,7 +1728,22 @@ func (a *SSHAdapter) resolveSuPassword(
 	return nil, ssh.ErrInteractionRequired
 }
 
-func validateSecretRequestSnapshot(snapshot config.ConnectionSnapshot, req ssh.SecretRequest) error {
+func (a *SSHAdapter) validateSecretRequestSnapshot(
+	snapshot config.ConnectionSnapshot,
+	hasOverride bool,
+	override SessionAuth,
+	req ssh.SecretRequest,
+) error {
+	return validateSecretRequestSnapshotWithState(snapshot, hasOverride, override, req.BaseHost, req)
+}
+
+func validateSecretRequestSnapshotWithState(
+	snapshot config.ConnectionSnapshot,
+	hasOverride bool,
+	override SessionAuth,
+	observedBaseHost string,
+	req ssh.SecretRequest,
+) error {
 	// 1. 版本一致性校验：若请求携带了 VersionToken，必须与当前快照的版本严格匹配
 	if req.VersionToken != "" {
 		var currentVersion string
@@ -1668,10 +1761,17 @@ func validateSecretRequestSnapshot(snapshot config.ConnectionSnapshot, req ssh.S
 		}
 	}
 
+	// 1b. 若会话启用了 -o HostName 覆盖，仍须确认底层持久节点地址未被并发篡改
+	if observedBaseHost != "" && !config.SameHostAddress(observedBaseHost, snapshot.Host.Address) {
+		return fmt.Errorf("%w: underlying host address changed for node %q: expected %q, got %q",
+			ssh.ErrSnapshotMismatch, req.NodeID, observedBaseHost, snapshot.Host.Address)
+	}
+
 	// 2. 目标主机与用户一致性校验：防止节点目标地址、端口或用户名发生变动时将新机密用于旧目标
-	if req.Host != "" && snapshot.Host.Address != req.Host {
+	effectiveHost := effectiveSnapshotHost(snapshot, hasOverride, override)
+	if req.Host != "" && !config.SameHostAddress(effectiveHost, req.Host) {
 		return fmt.Errorf("%w: host address changed for node %q: expected %q, got %q",
-			ssh.ErrSnapshotMismatch, req.NodeID, req.Host, snapshot.Host.Address)
+			ssh.ErrSnapshotMismatch, req.NodeID, req.Host, effectiveHost)
 	}
 	effectivePort := effectiveSnapshotPort(snapshot.Host.Port)
 	if req.Port != 0 && effectivePort != req.Port {

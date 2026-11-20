@@ -6,11 +6,15 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 func hasKnownHostsControlChar(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if (s[i] < 0x20 && s[i] != '\t') || s[i] == 0x7f {
+	for _, r := range s {
+		if r == '\t' {
+			continue
+		}
+		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
 			return true
 		}
 	}
@@ -55,7 +59,7 @@ func validateGlobalKnownHostsFile(raw string) (string, error) {
 	if len(fields) == 0 {
 		return "", errors.New("invalid GlobalKnownHostsFile: value cannot be empty")
 	}
-	if hasASCIIControlChar(strings.Join(fields, " ")) {
+	if hasControlOrLineSepChar(strings.Join(fields, " ")) {
 		return "", fmt.Errorf("invalid GlobalKnownHostsFile %q: contains invalid ASCII control character", raw)
 	}
 	for _, field := range fields {
@@ -73,6 +77,9 @@ func validateGlobalKnownHostsFile(raw string) (string, error) {
 }
 
 func validateVerifyHostKeyDNS(raw string) (string, error) {
+	if hasControlOrLineSepChar(raw) {
+		return "", fmt.Errorf("invalid VerifyHostKeyDNS option %q: contains invalid control character", raw)
+	}
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "yes", "true":
 		return VerifyHostKeyDNSYes, nil
@@ -86,6 +93,9 @@ func validateVerifyHostKeyDNS(raw string) (string, error) {
 }
 
 func validateCanonicalizeHostname(raw string) (string, error) {
+	if hasControlOrLineSepChar(raw) {
+		return "", fmt.Errorf("invalid CanonicalizeHostname option %q: contains invalid control character", raw)
+	}
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "yes", "true":
 		return CanonicalizeHostnameYes, nil
@@ -99,6 +109,9 @@ func validateCanonicalizeHostname(raw string) (string, error) {
 }
 
 func validateCanonicalizeMaxDots(raw string) (string, error) {
+	if hasControlOrLineSepChar(raw) {
+		return "", fmt.Errorf("invalid CanonicalizeMaxDots %q: contains invalid control character", raw)
+	}
 	val, err := strconv.Atoi(strings.TrimSpace(raw))
 	if err != nil || val < 0 || val > maxCanonicalizeMaxDots {
 		return "", fmt.Errorf("invalid CanonicalizeMaxDots %q: must be an integer between 0 and %d", raw, maxCanonicalizeMaxDots)
@@ -109,6 +122,9 @@ func validateCanonicalizeMaxDots(raw string) (string, error) {
 // validateCanonicalDomains accepts "none" alone or whitespace-separated DNS
 // suffixes. Suffixes are lower-cased, stripped of one trailing dot and deduplicated.
 func validateCanonicalDomains(raw string) (string, error) {
+	if hasKnownHostsControlChar(raw) {
+		return "", fmt.Errorf("invalid CanonicalDomains %q: contains invalid control character", raw)
+	}
 	fields := strings.Fields(raw)
 	if len(fields) == 0 {
 		return "", errors.New("invalid CanonicalDomains: value cannot be empty")
@@ -127,6 +143,15 @@ func validateCanonicalDomains(raw string) (string, error) {
 		}
 	}
 	return strings.Join(domains, " "), nil
+}
+
+// MaxCanonicalizeMaxDots is the maximum supported CanonicalizeMaxDots value.
+const MaxCanonicalizeMaxDots = maxCanonicalizeMaxDots
+
+// IsValidCanonicalDomain reports whether domain (already lowercased with at most
+// one trailing dot stripped) is a valid DNS suffix for CanonicalDomains.
+func IsValidCanonicalDomain(domain string) bool {
+	return isValidCanonicalDomain(domain)
 }
 
 func isValidCanonicalDomain(domain string) bool {
@@ -161,6 +186,9 @@ func isCanonicalNameChar(c byte, allowPattern bool) bool {
 // "source_patterns:target_patterns" rules, where each side is a comma-separated
 // list of hostname glob patterns.
 func validateCanonicalizePermittedCNAMEs(raw string) (string, error) {
+	if hasKnownHostsControlChar(raw) {
+		return "", fmt.Errorf("invalid CanonicalizePermittedCNAMEs %q: contains invalid control character", raw)
+	}
 	fields := strings.Fields(raw)
 	if len(fields) == 0 {
 		return "", errors.New("invalid CanonicalizePermittedCNAMEs: value cannot be empty")

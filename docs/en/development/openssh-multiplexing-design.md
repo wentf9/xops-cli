@@ -35,7 +35,7 @@ To ensure deep interoperability with modern DevOps ecosystems (including Ansible
 | :--- | :--- |
 | OpenSSH `PROTOCOL.mux` version 4 binary wire encoding/decoding | Supporting deprecated protocol versions 1–3 |
 | Full support in `xops ssh` for `-M` (single master), `-M -M` (confirmation master), `-S`, `-o`, and `-O` | Providing simulated sockets on legacy Windows versions lacking `AF_UNIX` (prior to Windows 10 1803) |
-| `-O` control commands: `check`, `exit`, `stop`, `forward`, `cancel`, `proxy`, `conninfo`, `channels` | Supporting stateless control commands without an active master process |
+| `-O` control commands: `check`, `exit`, `stop`, `forward`, `cancel`, `proxy`, `proxy-stream`, `conninfo`, `channels` | Supporting stateless control commands without an active master process |
 | `ControlMaster` modes: `no`, `yes`, `ask`, `auto`, `autoask` | Bypassing local OS file permissions to create world-writable sockets |
 | `ControlPath` token expansion: `%%`, `%h`, `%p`, `%r`, `%n`, `%u`, `%l`, `%L`, `%i`, `%d`, `%j`, `%C` (SHA-1 hash), `~`, and `${ENV}` | Allowing unchecked paths that exceed OS `sockaddr_un` limits (108/104 bytes) |
 | `ControlPersist` support: `no`, `yes`/`0` (indefinite), duration syntax (`10m`, `1h`, `600s`, `1d`, `1w`), and idle timeout termination | Guaranteeing socket survival across kernel OOM kills or host power loss |
@@ -61,10 +61,10 @@ flowchart TD
     end
 
     subgraph ConfigAdapter["pkg/adapter/ & pkg/config/ (Resolution & Configuration)"]
-        Adapter["pkg/adapter/ssh_adapter.go\n(ResolveControl: 4-Tier Precedence)"]
+        Adapter["pkg/adapter/ssh_adapter.go & policy_solver.go\n(4-Tier Policy & Proxy/Control Resolution)"]
         CfgRepo["pkg/config/repository.go\n(Configuration Snapshot)"]
-        OpenSSHParser["pkg/config/openssh.go\n(Parse ControlMaster/Path/Persist)"]
-        Models["pkg/models/types.go & pkg/config/schema_v2.go\n(Node.Control, Schema V2 CAS Hash)"]
+        OpenSSHParser["pkg/config/openssh.go & openssh_parser.go\n(Parse OpenSSH Config & SSHOptions)"]
+        Models["pkg/models/types.go & pkg/config/schema_v2.go\n(Node.SSHOptions, Schema V2 CAS Hash)"]
     end
 
     subgraph EnvDiscovery["internal/sshenv/ (Host Context)"]
@@ -81,7 +81,8 @@ flowchart TD
         MuxFwdTable["core/ssh/mux_forward_table.go\n(muxForwardTable, Forward Lifecycle & Barriers)"]
         MuxRelay["core/ssh/mux_proxy_relay.go\n(proxySessionState, Packet & Flow Relay)"]
         MuxUnix["core/ssh/mux_rights_unix.go\n(bindAndLinkSocket, SCM_RIGHTS, SO_PEERCRED)"]
-        MuxOther["core/ssh/mux_rights_other.go\n(Windows AF_UNIX Direct Bind)"]
+        MuxWindows["core/ssh/mux_rights_windows.go\n(Windows AF_UNIX Direct Bind)"]
+        MuxOther["core/ssh/mux_rights_other.go\n(Unsupported Platform Fail-Closed Stub)"]
     end
 
     SSHCmd --> SSHFlag
@@ -105,6 +106,7 @@ flowchart TD
     Connector --> MuxServer
     MuxServer --> MuxProto
     MuxServer --> MuxUnix
+    MuxServer --> MuxWindows
     MuxServer --> MuxOther
     MuxClient --> MuxProto
     MuxClient --> MuxProxy
@@ -278,7 +280,7 @@ To maintain full compatibility with system-native `/usr/bin/ssh` connecting to a
 - **Descriptor receive contract**: OpenSSH's `mm_send_fd` transmits one descriptor per control message, so `recvFDs` accumulates until the request is satisfied instead of assuming one `recvmsg` carries them all. Receiving is bounded (5s, `passengerFDReceiveTimeout`), every descriptor is marked `FD_CLOEXEC` immediately, and descriptors beyond the requested count are closed rather than handed to the caller.
 - **Single ownership**: `recvFiles` hands each descriptor to an `*os.File` and only `File.Close()` may release it afterwards. A handler must never `unix.Close` the same descriptor number again: the second close can hit an unrelated descriptor a concurrent goroutine has since reused. `MUX_C_NEW_STDIO_FWD` returns only after both copy directions exit, so deferred cleanup cannot race an in-flight write.
 - **`MUX_C_NEW_STDIO_FWD`**: Encodes `connect_port` as `uint32` per `PROTOCOL.mux` v4; receives 2 file descriptors (stdin and stdout), establishing bidirectional streaming over `Client.Dial("tcp", host:port)` and calling `CloseWrite()` on local stdin EOF while draining remote output.
-- **Cross-Platform Fallback**: On Windows (`core/ssh/mux_rights_other.go`), because Winsock `AF_UNIX` does not support Unix file descriptor passing (`SCM_RIGHTS`), passenger requests are rejected with a clear diagnostic directing clients to use `MUX_C_PROXY`.
+- **Cross-Platform Fallback**: On Windows (`core/ssh/mux_rights_windows.go`), because Winsock `AF_UNIX` does not support Unix file descriptor passing (`SCM_RIGHTS`), passenger requests are rejected with a clear diagnostic directing clients to use `MUX_C_PROXY`; platforms other than Linux/macOS/FreeBSD/Windows (`!linux && !darwin && !freebsd && !windows`) fail closed via the stub in `core/ssh/mux_rights_other.go`.
 
 ### 3.4 Resource Limits & DOS Defense
 
@@ -318,7 +320,7 @@ Even with `0600` file permissions, local root or users with elevated capabilitie
 - **macOS / FreeBSD** (`mux_peer_darwin.go` / `mux_peer_freebsd.go`): Queries peer credentials via `unix.GetsockoptXucred(fd, unix.SOL_LOCAL, unix.LOCAL_PEERCRED)`.
 - **Validation**: The master verifies that the peer UID matches the expected local user UID. Any mismatch causes immediate connection termination with an audit entry and `ErrUnauthorizedPeer`.
 - **Client-side parity**: `DialMuxClient` / `DialMuxProxyStream` / `DialControlProxy` run the same `checkPeerUID` before the handshake and require the master endpoint to belong to the effective local UID (default `localPeerUID()`) or `0` (root). Without it, any local user could win the race for a socket path in a shared directory such as `/tmp` and impersonate the master to collect commands, privilege passwords, and transferred data. `WithExpectedPeerUID` only changes the expectation and can never disable the check: `0` means "expect root", so a client running as root also rejects a socket planted by another user (treating `0` as "skip the check" allowed exactly that hijack). Only platforms without peer credentials (Windows) make `checkPeerUID` a no-op.
-- **Windows** (`mux_rights_other.go`): Because Windows AF_UNIX relies on NTFS security descriptors (DACLs) and lacks `SO_PEERCRED`, `localPeerUID()` returns `0` and peer UID checks are safely bypassed on this platform.
+- **Windows** (`mux_rights_windows.go`): Because Windows AF_UNIX relies on NTFS security descriptors (DACLs) and lacks `SO_PEERCRED`, `localPeerUID()` returns `0` and peer UID checks are safely bypassed on this platform (`mux_rights_other.go` provides the fail-closed stub for platforms other than Linux/macOS/FreeBSD/Windows, i.e., `!linux && !darwin && !freebsd && !windows`).
 - **Master-side default**: `StartMuxServer` falls back to `localPeerUID()` (the effective UID on Unix) when `Environment.LocalUID` is missing or unparseable, so a host that forgets to inject its context can never silently disable the master-side credential check; an explicit `LocalUID` still wins. `Connector` derives its client-side expectation from the same `expectedPeerUIDFromEnvironment`, so both ends agree even when a host injects a UID that differs from the effective one (containers).
 
 ### 4.4 Stale Socket Detection and Safe Unlinking
@@ -409,15 +411,18 @@ nodes:
       tcp_keep_alive: "yes"
 ```
 
-- **Supported OpenSSH Options Registry (`core/ssh/ssh_options.go`, 19 options isolated by `OptionClass`)**:
+- **Supported OpenSSH Options Registry (`core/ssh/ssh_options.go`, 53 options across 7 `OptionClass` categories resolved by `pkg/adapter/policy_solver.go`)**:
   - **Multiplexing (`OptionClassMux`)**: `control_master` (`ControlMaster`), `control_path` (`ControlPath`), `control_persist` (`ControlPersist`)
-  - **Transport & Algorithms (`OptionClassTransport`)**: `connect_timeout` (`ConnectTimeout`), `server_alive_interval` (`ServerAliveInterval`), `server_alive_count_max` (`ServerAliveCountMax`), `tcp_keep_alive` (`TCPKeepAlive`), `host_key_algorithms` (`HostKeyAlgorithms`), `ciphers` (`Ciphers`), `macs` (`MACs`), `kex_algorithms` (`KexAlgorithms`; all supporting full list, `+` append, `^` prepend, and `-` remove modifiers)
-  - **Authentication Control (`OptionClassAuth`)**: `pubkey_authentication` (`PubkeyAuthentication`), `password_authentication` (`PasswordAuthentication`), `kbd_interactive_authentication` (`KbdInteractiveAuthentication` / `ChallengeResponseAuthentication`), `identities_only` (`IdentitiesOnly`), `preferred_authentications` (`PreferredAuthentications`), `batch_mode` (`BatchMode`)
-  - **Host Key Trust (`OptionClassTrust`)**: `strict_host_key_checking` (`StrictHostKeyChecking`: `yes`/`ask`/`accept-new`/`no`/`off`), `user_known_hosts_file` (`UserKnownHostsFile`)
+  - **Transport & Algorithms (`OptionClassTransport`)**: `address_family` (`AddressFamily`), `connect_timeout` (`ConnectTimeout`), `server_alive_interval` (`ServerAliveInterval`), `server_alive_count_max` (`ServerAliveCountMax`), `tcp_keep_alive` (`TCPKeepAlive`), `canonicalize_hostname` (`CanonicalizeHostname`), `canonical_domains` (`CanonicalDomains`), `canonicalize_max_dots` (`CanonicalizeMaxDots`), `canonicalize_fallback_local` (`CanonicalizeFallbackLocal`), `canonicalize_permitted_cnames` (`CanonicalizePermittedCNAMEs`), `host_key_algorithms` (`HostKeyAlgorithms`), `ciphers` (`Ciphers`), `macs` (`MACs`), `kex_algorithms` (`KexAlgorithms`) (algorithm lists support full replacement, `+` append, `^` prepend, and `-` remove modifiers)
+  - **Authentication Control (`OptionClassAuth`)**: `identity_file` (`IdentityFile`), `certificate_file` (`CertificateFile`), `identity_agent` (`IdentityAgent`), `pubkey_authentication` (`PubkeyAuthentication`), `password_authentication` (`PasswordAuthentication`), `kbd_interactive_authentication` (`KbdInteractiveAuthentication` / `ChallengeResponseAuthentication`), `identities_only` (`IdentitiesOnly`), `preferred_authentications` (`PreferredAuthentications`), `batch_mode` (`BatchMode`)
+  - **Host Key Trust (`OptionClassTrust`)**: `strict_host_key_checking` (`StrictHostKeyChecking`: `yes`/`ask`/`accept-new`/`no`/`off`), `user_known_hosts_file` (`UserKnownHostsFile`), `global_known_hosts_file` (`GlobalKnownHostsFile`), `hash_known_hosts` (`HashKnownHosts`), `verify_host_key_dns` (`VerifyHostKeyDNS`)
+  - **Forwarding (`OptionClassForward`)**: `exit_on_forward_failure` (`ExitOnForwardFailure`), `clear_all_forwardings` (`ClearAllForwardings`), `forward_agent` (`ForwardAgent`), `gateway_ports` (`GatewayPorts`), `stream_local_bind_unlink` (`StreamLocalBindUnlink`), `stream_local_bind_mask` (`StreamLocalBindMask`), `tunnel` (`Tunnel`), `tunnel_device` (`TunnelDevice`), `local_forward` (`LocalForward`), `remote_forward` (`RemoteForward`), `dynamic_forward` (`DynamicForward`)
+  - **Session Behavior (`OptionClassSession`)**: `fork_after_authentication` (`ForkAfterAuthentication`), `stdin_null` (`StdinNull`), `session_type` (`SessionType`), `request_tty` (`RequestTTY`), `send_env` (`SendEnv`), `set_env` (`SetEnv`), `remote_command` (`RemoteCommand`), `escape_char` (`EscapeChar`)
+  - **Local Command Execution (`OptionClassLocalExec`)**: `proxy_command` (`ProxyCommand`), `local_command` (`LocalCommand`), `permit_local_command` (`PermitLocalCommand`)
 - **Trust & Inheritance Boundaries**:
-  - `OptionClassTrust` options are **never inherited from `~/.ssh/config` (Tier 4)**; they are accepted only from CLI `-o` (Tier 1) and explicit `xops` configuration (Tier 2 / Tier 3). When a remote host key has changed (`known_hosts` mismatch) and `StrictHostKeyChecking=no` is explicitly set, XOps follows OpenSSH native semantics by disabling password and keyboard-interactive authentication (allowing only public-key authentication) to prevent credential disclosure.
-  - Managed `xops` nodes only inherit `OptionClassMux` and `OptionClassTransport` from Tier 4 (`~/.ssh/config`), and `ParseOpenSSHHosts` persists only those two classes when importing nodes.
-  - MCP Host and credential-verification paths pass `WithHostTrustOverrides(false)` and `WithControlMultiplexing(false)`, stripping `OptionClassTrust` and `OptionClassMux` to preserve fail-closed host key verification.
+  - Security-sensitive `OptionClassTrust` directives (`StrictHostKeyChecking`, `UserKnownHostsFile`, `GlobalKnownHostsFile`, `VerifyHostKeyDNS`) are **never inherited from `~/.ssh/config` (Tier 4)**; they are accepted only from CLI `-o` (Tier 1) and explicit `xops` configuration (Tier 2 / Tier 3). Only `HashKnownHosts=yes` (`yes`/`true`) supports one-way Tier-4 hardening inheritance. When a remote host key has changed (`known_hosts` mismatch) and `StrictHostKeyChecking=no` is explicitly set, XOps follows OpenSSH native semantics by disabling password and keyboard-interactive authentication (allowing only public-key authentication) to prevent credential disclosure.
+  - Managed `xops` nodes only inherit `OptionClassMux` and `OptionClassTransport` (plus one-way `HashKnownHosts=yes`) from Tier 4 (`~/.ssh/config`), and `ParseOpenSSHHosts` persists only multiplexing and transport-safe options when importing nodes.
+  - MCP Host and credential-verification paths (`adapter.VerifyConnection`) share the single `adapter.WithStrictIsolation()` preset (combining `WithNonInteractive(true)`, `WithControlMultiplexing(false)`, `WithHostTrustOverrides(false)`, `WithSessionAndForwardOptions(false)`, and `WithLocalExecution(false)`) to strip trust overrides, multiplexing, session/forwarding options, and local command execution, preserving a fail-closed isolation boundary.
 - **CAS Versioning**: `SSHOptions` participates in the `NodeRef` CAS content hash (`pkg/config/repository.go:nodeEntityVersion`), so a change invalidates dependent optimistic-concurrency preconditions for that node. `nodeAuthVersion` stays scoped to authentication material.
 
 ---
@@ -432,7 +437,7 @@ nodes:
   - `-M`: Enable master mode (equivalent to `-o ControlMaster=yes`).
   - `-M -M` (repeated): Enable confirmation master mode (equivalent to `-o ControlMaster=ask`).
   - `-S <path>`: Specify control socket path (or `-S none` to disable connection sharing).
-  - `-o Key=Value`: Pass OpenSSH client options (supports `Port`, `User`, `IdentityFile`, `ProxyJump`, and all 19 `ssh_options` listed in section 5.5, case-insensitively in either `PascalCase` or `snake_case`).
+  - `-o Key=Value`: Pass OpenSSH client options (supports `Port`, `User`, `HostName`, `ProxyJump`, and all 53 `ssh_options` listed in section 5.5, case-insensitively in either `PascalCase` or `snake_case`).
   - `-O <ctl_cmd>`: Send control command to active master.
 - **`xops scp`, `xops sftp`, `xops exec`**:
   - Register `-S` and `-o` flags.
@@ -456,7 +461,15 @@ nodes:
 | `conninfo` | (Extension) Query master connection metadata | Connection summary text | 0 |
 | `channels` | (Extension) Query active open channels on master | Channel list text | 0 |
 
-### 6.3 Strict Error Formatting and Exit Code Propagation
+### 6.3 Read-Only Resolution Contract for `-O` Queries
+
+`-O` queries target an already-running master and must never produce configuration side effects:
+
+- Configuration is loaded exclusively through a read-only `config.Provider` (`cmd/ssh_control.go:loadReadOnlyControlProvider`) paired with `cmd/ssh_option_flag.go:resolveControlSessionLookup` for read-only connection snapshots, never invoking `Repository.PrepareNodeContext` or any persistence writeback path; commands such as `-O check` never rewrite `xops_config.yaml` even under policies like `remember=always`.
+- Target lookup uses `ResolveSelector` and read-only `ResolveTarget`: ambiguous selectors (`AmbiguousNodeError`) and missing targets return exit code `255` immediately instead of silently degrading to an empty node.
+- `ControlPath` tokens (`%h/%p/%r/%j/%C`) are always expanded against the **resolved connection target** (`cmd/ssh_option_flag.go:controlSocketPath`), matching `Connector.buildTargetContext`; even when `-S` is supplied explicitly, target resolution runs first so invoking `-O` by node alias never derives a socket path different from the active master.
+
+### 6.4 Strict Error Formatting and Exit Code Propagation
 
 OpenSSH control commands observe strict conventions:
 1. **Exit Code Specification**: Returns `0` on success, and strictly `255` on any failure (missing socket, connection refused, master error, invalid arguments). Flag-level failures behave the same: `-O restart`, `-O check -M`, `-O check -S none`, and `-O` with an invalid `-o` all return `ControlExitError{Code: 255}` before any socket is contacted, and the top-level handler prints the message once in plain text (the `Reported` marker prevents double printing).
@@ -515,8 +528,8 @@ Multiplexing configuration only matters while a master is alive, so ownership mu
    - **`ReleaseMaster` drops the reference without stopping the master**: the handoff uses it to make the master idle-eligible. The master stays in `Connector.masters`, so `CloseAll` still cleans up when the handoff fails, and a repeated release cannot drive the counter negative.
 2. **A `-N` process holds its master until shutdown**: `xops ssh -M -N` (including the `-f -N` child) retains the single foreground-session reference acquired by `Connector` (`InitialActiveSessions = 1`) and waits on `select { <-runCtx.Done(); <-srv.Wait() }` in `runConnectedSession`, avoiding double-counting (`activeSessions == 2`) while ensuring the first client disconnect never kills the `-N` process.
 3. **One-shot and interactive sessions hand the master to a background daemon**: when `ControlPersist` is enabled and the foreground session ends, `SshOptions.handoffPersistentMaster` releases and shuts down every master started by this `Connector` (including intermediate `ProxyJump` masters) to free the sockets, re-execs a child marked `XOPS_CLI_SSH_MUX_DAEMON=1` and `XOPS_CLI_SSH_BG_CHILD=1` that only serves the control socket (forced `-N`, empty command, `--*-stdin` reads skipped, stdio on `/dev/null`), then confirms the new master within a bounded `waitForControlSocket` (10s). A failed handoff writes a stderr warning and never changes the exit status of the command that already ran.
-   - **No handoff** for a `-N` process (it already owns the master, so a second fork would duplicate it), for the `-f` background child, for the daemon itself (`XOPS_CLI_SSH_MUX_DAEMON=1`), for **implicit Tier 4 (`~/.ssh/config`) configurations** (`ControlConfig.ImplicitTier4 == true`: when multiplexing comes solely from `~/.ssh/config` without explicit CLI flags or `xops` Node/Global configuration, existing sockets are reused transparently during the command, but no detached background daemon is spawned on command exit), or when the session was cancelled (Ctrl-C / context cancellation): reviving the master there would resurrect what the operator just stopped. For `ControlMaster=ask/autoask`, the detached daemon starts with `-o ControlMaster=ask` and a `SessionConfirmer` that invokes `SSH_ASKPASS` (or system `ssh-askpass` when `DISPLAY`/`WAYLAND_DISPLAY` is set), failing closed if no askpass program is available or if confirmation is denied.
-   - **Isolation for credential verification and MCP**: Credential verification (`adapter.VerifyConnection`) and MCP Host runtime connectors explicitly pass `adapter.WithControlMultiplexing(false)` so they never attach to or create external control sockets on disk, guaranteeing that credential checks always perform a real authentication handshake and MCP sessions remain isolated.
+   - **No handoff** for a `-N` process (it already owns the master, so a second fork would duplicate it), for the `-f` background child, for the daemon itself (`XOPS_CLI_SSH_MUX_DAEMON=1`), for sessions with an active `ProxyCommand` (bound to a single local subprocess proxy stream rather than replayable in a detached daemon), for **implicit Tier 4 (`~/.ssh/config`) configurations** (`ControlConfig.ImplicitTier4 == true`: when multiplexing comes solely from `~/.ssh/config` without explicit CLI flags or `xops` Node/Global configuration, existing sockets are reused transparently during the command, but no detached background daemon is spawned on command exit), or when the session was cancelled (Ctrl-C / context cancellation): reviving the master there would resurrect what the operator just stopped. When transferring `MuxDaemonSpec`, `ControlPathLiteral: true` preserves the pre-expanded socket path verbatim (such as an IPv6 `%zone` suffix or literal `${VAR}`) so the daemon child never re-expands tokens. For `ControlMaster=ask/autoask`, the detached daemon starts with `-o ControlMaster=ask` and a `SessionConfirmer` that invokes `SSH_ASKPASS` (or system `ssh-askpass` when `DISPLAY`/`WAYLAND_DISPLAY` is set), failing closed if no askpass program is available or if confirmation is denied.
+   - **Isolation for credential verification and MCP**: Credential verification (`adapter.VerifyConnection`) and MCP Host runtime connectors share `adapter.WithStrictIsolation()` to disable external control-socket reuse/creation, host-trust overrides, session/forwarding options, and local command execution, guaranteeing that credential checks always perform a real authentication handshake and MCP sessions remain isolated.
    - **One-time credentials are never handed off**: a session that used `--otp` does not start a daemon. The code was already consumed by the parent; replaying it in the child cannot succeed and can trip server-side MFA lockouts.
    - **An early daemon exit no longer stalls the shell**: the parent watches the child with `cmd.Wait()`, so `waitForControlSocket` returns and warns as soon as the child dies instead of waiting out the 10s readiness timeout.
    - **The daemon must not hold a foreground session**: a bounded `ControlPersist=10m` relies on the idle timer expiring. The daemon calls `Connector.ReleaseMaster` right after connecting, so `activeSessions` returns to 0 and the idle timer arms normally; keeping the reference like a foreground process would leave `activeSessions > 0` forever, so the timer never fires and the process leaks. A `-N` foreground master is the opposite case and must be counted, otherwise the first client disconnect kills it.

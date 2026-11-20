@@ -23,25 +23,26 @@ const (
 // session to the detached ControlPersist daemon over an inherited pipe FD,
 // avoiding lossy CLI argv reconstruction and secret exposure in process lists.
 type MuxDaemonSpec struct {
-	Version          int                   `json:"version"`
-	TargetHost       string                `json:"target_host"`
-	OpenSSHNamespace bool                  `json:"openssh_namespace,omitempty"`
-	DialHost         string                `json:"dial_host,omitempty"`
-	OriginalHost     string                `json:"original_host,omitempty"`
-	Port             uint16                `json:"port,omitempty"`
-	User             string                `json:"user,omitempty"`
-	ControlPath      string                `json:"control_path"`
-	ControlMaster    ssh.ControlMasterMode `json:"control_master"`
-	ControlPersist   string                `json:"control_persist,omitempty"`
-	JumpHost         string                `json:"jump_host,omitempty"`
-	ConfigFile       string                `json:"config_file,omitempty"`
-	CipherSpec       string                `json:"cipher_spec,omitempty"`
-	AddressFamily    string                `json:"address_family,omitempty"`
-	GatewayPorts     bool                  `json:"gateway_ports,omitempty"`
-	IdentityFiles    []string              `json:"identity_files,omitempty"`
-	Options          []string              `json:"options,omitempty"`
-	PreserveSelector bool                  `json:"preserve_selector,omitempty"`
-	Canonicalized    bool                  `json:"canonicalized,omitempty"`
+	Version            int                   `json:"version"`
+	TargetHost         string                `json:"target_host"`
+	OpenSSHNamespace   bool                  `json:"openssh_namespace,omitempty"`
+	DialHost           string                `json:"dial_host,omitempty"`
+	OriginalHost       string                `json:"original_host,omitempty"`
+	Port               uint16                `json:"port,omitempty"`
+	User               string                `json:"user,omitempty"`
+	ControlPath        string                `json:"control_path"`
+	ControlPathLiteral bool                  `json:"control_path_literal,omitempty"`
+	ControlMaster      ssh.ControlMasterMode `json:"control_master"`
+	ControlPersist     string                `json:"control_persist,omitempty"`
+	JumpHost           string                `json:"jump_host,omitempty"`
+	ConfigFile         string                `json:"config_file,omitempty"`
+	CipherSpec         string                `json:"cipher_spec,omitempty"`
+	AddressFamily      string                `json:"address_family,omitempty"`
+	GatewayPorts       bool                  `json:"gateway_ports,omitempty"`
+	IdentityFiles      []string              `json:"identity_files,omitempty"`
+	Options            []string              `json:"options,omitempty"`
+	PreserveSelector   bool                  `json:"preserve_selector,omitempty"`
+	Canonicalized      bool                  `json:"canonicalized,omitempty"`
 }
 
 // Validate checks that s contains well-formed detached daemon parameters.
@@ -53,8 +54,13 @@ func (s MuxDaemonSpec) Validate() error {
 		return fmt.Errorf("mux daemon spec requires non-empty target host")
 	}
 	cp := strings.TrimSpace(s.ControlPath)
-	if cp == "" || strings.EqualFold(cp, "none") {
+	if cp == "" || ssh.IsNoneValue(cp) {
 		return fmt.Errorf("mux daemon spec requires active control path")
+	}
+	if s.ControlPathLiteral {
+		if err := ssh.ValidateControlPath(s.ControlPath); err != nil {
+			return fmt.Errorf("mux daemon spec invalid literal control path: %w", err)
+		}
 	}
 	if s.ControlMaster != ssh.ControlMasterYes && s.ControlMaster != ssh.ControlMasterAsk {
 		return fmt.Errorf("mux daemon spec requires ControlMaster yes or ask, got %q", s.ControlMaster)
@@ -100,19 +106,20 @@ func (o *SshOptions) buildMuxDaemonSpecWithRawNode(provider config.ConfigProvide
 	masterMode, persist := o.resolveMuxDaemonControl(master)
 
 	spec := MuxDaemonSpec{
-		Version:          muxDaemonSpecVersion,
-		TargetHost:       targetHost,
-		OpenSSHNamespace: config.IsOpenSSHNodeID(strings.TrimSpace(nodeID)),
-		Port:             uint16(port),
-		User:             user,
-		ControlPath:      expandedPath,
-		ControlMaster:    masterMode,
-		ControlPersist:   persist,
-		JumpHost:         o.resolveMuxDaemonJumpHost(master),
-		ConfigFile:       o.control.ConfigFile,
-		AddressFamily:    o.control.AddressFamily,
-		IdentityFiles:    o.resolveMuxDaemonIdentityFiles(nodeID, master, forTarget),
-		PreserveSelector: preserveSelector,
+		Version:            muxDaemonSpecVersion,
+		TargetHost:         targetHost,
+		OpenSSHNamespace:   config.IsOpenSSHNodeID(strings.TrimSpace(nodeID)),
+		Port:               uint16(port),
+		User:               user,
+		ControlPath:        expandedPath,
+		ControlPathLiteral: true,
+		ControlMaster:      masterMode,
+		ControlPersist:     persist,
+		JumpHost:           o.resolveMuxDaemonJumpHost(master),
+		ConfigFile:         o.control.ConfigFile,
+		AddressFamily:      o.control.AddressFamily,
+		IdentityFiles:      o.resolveMuxDaemonIdentityFiles(nodeID, master, forTarget),
+		PreserveSelector:   preserveSelector,
 	}
 	canonHost := ""
 	if master != nil {
@@ -240,6 +247,7 @@ func (o *SshOptions) applyMuxDaemonSpec(spec MuxDaemonSpec) error {
 	o.control.ConfigFile = spec.ConfigFile
 	o.control.AddressFamily = spec.AddressFamily
 	o.control.ControlPath = spec.ControlPath
+	o.control.controlPathLiteral = spec.ControlPathLiteral
 	o.control.MasterCount = 0
 	o.CipherSpec = spec.CipherSpec
 	o.GatewayPorts = spec.GatewayPorts

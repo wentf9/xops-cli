@@ -13,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -226,15 +228,20 @@ func RunLocalCommandWithIO(ctx context.Context, command string, stdout, stderr i
 }
 
 func validateExecCommandString(command string) error {
+	if !utf8.ValidString(command) {
+		return errors.New("local execution command contains invalid UTF-8")
+	}
+	for _, r := range command {
+		if r == '\t' {
+			continue
+		}
+		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
+			return errors.New("local execution command contains disallowed control characters")
+		}
+	}
 	trimmed := strings.TrimSpace(command)
 	if trimmed == "" || strings.EqualFold(trimmed, "none") {
 		return errors.New("local execution command cannot be empty")
-	}
-	for i := 0; i < len(command); i++ {
-		c := command[i]
-		if c == 0 || (c < 0x20 && c != '\t') || c == 0x7f {
-			return errors.New("local execution command contains disallowed control characters")
-		}
 	}
 	return nil
 }

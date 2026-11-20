@@ -50,7 +50,7 @@ func ResolveForwardAgent(forwardSpec, identityAgentSpec string, env Environment,
 }
 
 func resolveEnvAgentSocket(env Environment, allowEmptyEnvSocket bool) (socket string, enabled bool, err error) {
-	if hasASCIIControlChar(env.AgentSocket) {
+	if hasControlOrLineSepChar(env.AgentSocket) {
 		return "", false, fmt.Errorf("invalid SSH_AUTH_SOCK %q: contains invalid ASCII control character", env.AgentSocket)
 	}
 	rawSock := strings.TrimSpace(env.AgentSocket)
@@ -72,7 +72,7 @@ func resolveForwardAgentSpec(
 	target TargetContext,
 	allowEmptyEnvSocket bool,
 ) (socket string, enabled bool, err error) {
-	if hasASCIIControlChar(forwardSpec) {
+	if hasControlOrLineSepChar(forwardSpec) {
 		return "", false, fmt.Errorf("invalid ForwardAgent %q: contains invalid ASCII control character", forwardSpec)
 	}
 	trimmed := strings.TrimSpace(forwardSpec)
@@ -80,7 +80,7 @@ func resolveForwardAgentSpec(
 		return "", false, nil
 	}
 	if strings.EqualFold(trimmed, "yes") || strings.EqualFold(trimmed, "true") {
-		if hasASCIIControlChar(identityAgentSpec) {
+		if hasControlOrLineSepChar(identityAgentSpec) {
 			return "", false, fmt.Errorf("invalid IdentityAgent %q: contains invalid ASCII control character", identityAgentSpec)
 		}
 		idTrimmed := strings.TrimSpace(identityAgentSpec)
@@ -97,7 +97,7 @@ func resolveForwardAgentSpec(
 		if disabled || sock == "" {
 			return "", false, nil
 		}
-		sock = normalizeExpandedAgentSocketPath(sock, env)
+		sock = normalizeExpandedAgentSocketPathWithTilde(sock, env, false)
 		return sock, sock != "", nil
 	}
 	if trimmed == "SSH_AUTH_SOCK" {
@@ -478,7 +478,7 @@ func (c *Client) clientForwardAgentTarget(connCfg ConnectionConfig) TargetContex
 		Port:         port,
 		User:         user,
 		OriginalHost: effectiveOriginalHost(connCfg.OriginalHost, connCfg.NodeID),
-		JumpHost:     connCfg.ProxyJump,
+		JumpHost:     NormalizeProxyJump(connCfg.ProxyJump),
 		KeyPath:      connCfg.KeyPath,
 	}
 }

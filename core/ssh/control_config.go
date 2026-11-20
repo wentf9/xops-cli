@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -59,9 +58,10 @@ func ParseControlMasterMode(val string) (ControlMasterMode, error) {
 // ControlConfig specifies the connection multiplexing parameters for an SSH connection.
 // Matches the contract defined in PROJECT.md and Schema V2.
 type ControlConfig struct {
-	Master  ControlMasterMode `json:"master,omitempty" yaml:"master,omitempty"`
-	Path    string            `json:"path,omitempty" yaml:"path,omitempty"`
-	Persist string            `json:"persist,omitempty" yaml:"persist,omitempty"`
+	Master      ControlMasterMode `json:"master,omitempty" yaml:"master,omitempty"`
+	Path        string            `json:"path,omitempty" yaml:"path,omitempty"`
+	LiteralPath bool              `json:"-" yaml:"-"`
+	Persist     string            `json:"persist,omitempty" yaml:"persist,omitempty"`
 	// ImplicitTier4 is true when multiplexing was resolved solely from ~/.ssh/config
 	// (Tier 4) without any CLI flag or xops node/global configuration.
 	ImplicitTier4 bool `json:"-" yaml:"-"`
@@ -71,12 +71,37 @@ type ControlConfig struct {
 	AllowReuse bool `json:"-" yaml:"-"`
 }
 
+// ResolvePath returns the concrete socket path for c. When LiteralPath is true,
+// c.Path is treated as an already-expanded path and validated without rescanning
+// ~, ${VAR}, or % tokens; otherwise c.Path is expanded with ExpandControlPath.
+func (c *ControlConfig) ResolvePath(env Environment, target TargetContext) (string, error) {
+	if c == nil {
+		return "", nil
+	}
+	if c.Path == "" {
+		return "", nil
+	}
+	if hasControlOrLineSepChar(c.Path) {
+		return "", fmt.Errorf("invalid ControlPath %q: contains invalid control character", c.Path)
+	}
+	if IsNoneValue(c.Path) {
+		return "none", nil
+	}
+	if c.LiteralPath {
+		if strings.TrimSpace(c.Path) == "" {
+			return "", errors.New("ControlPath is empty")
+		}
+		return c.Path, nil
+	}
+	return ExpandControlPath(c.Path, env, target)
+}
+
 // IsEnabled returns true if multiplexing is enabled (either master or reuse).
 func (c *ControlConfig) IsEnabled() bool {
 	if c == nil {
 		return false
 	}
-	return c.Path != "" && c.Path != "none"
+	return strings.TrimSpace(c.Path) != "" && !IsNoneValue(c.Path)
 }
 
 // Clone returns a deep copy of ControlConfig.
@@ -96,7 +121,7 @@ func (c *ControlConfig) Equal(other *ControlConfig) bool {
 	if c == nil || other == nil {
 		return false
 	}
-	return c.Master == other.Master && c.Path == other.Path && c.Persist == other.Persist
+	return c.Master == other.Master && c.Path == other.Path && c.LiteralPath == other.LiteralPath && c.Persist == other.Persist
 }
 
 // ResolveControl merges a child (higher priority) multiplexing config with a
@@ -110,23 +135,34 @@ func ResolveControl(child, parent *ControlConfig) (*ControlConfig, error) {
 		return nil, nil
 	}
 	if child == nil {
-		return parent.Clone(), nil
-	}
-	if parent == nil {
-		res := child.Clone()
-		if res.Path == "none" {
+		res := parent.Clone()
+		if IsNoneValue(res.Path) {
+			res.Path = "none"
 			res.Master = ControlMasterNo
 			res.Persist = ""
 			res.AllowReuse = false
+			res.LiteralPath = false
+		}
+		return res, nil
+	}
+	if parent == nil {
+		res := child.Clone()
+		if IsNoneValue(res.Path) {
+			res.Path = "none"
+			res.Master = ControlMasterNo
+			res.Persist = ""
+			res.AllowReuse = false
+			res.LiteralPath = false
 		}
 		return res, nil
 	}
 
 	res := &ControlConfig{
-		Master:     parent.Master,
-		Path:       parent.Path,
-		Persist:    parent.Persist,
-		AllowReuse: parent.AllowReuse,
+		Master:      parent.Master,
+		Path:        parent.Path,
+		LiteralPath: parent.LiteralPath,
+		Persist:     parent.Persist,
+		AllowReuse:  parent.AllowReuse,
 	}
 
 	if child.Master != "" {
@@ -135,6 +171,7 @@ func ResolveControl(child, parent *ControlConfig) (*ControlConfig, error) {
 	}
 	if child.Path != "" {
 		res.Path = child.Path
+		res.LiteralPath = child.LiteralPath
 	}
 	if child.Persist != "" {
 		res.Persist = child.Persist
@@ -144,10 +181,12 @@ func ResolveControl(child, parent *ControlConfig) (*ControlConfig, error) {
 	}
 
 	// If child sets Path="none", multiplexing is disabled for the child.
-	if child.Path == "none" {
+	if IsNoneValue(child.Path) {
+		res.Path = "none"
 		res.Master = ControlMasterNo
 		res.Persist = ""
 		res.AllowReuse = false
+		res.LiteralPath = false
 	}
 
 	return res, nil
@@ -204,7 +243,7 @@ func (t TargetContext) CanonicalTargetIdentity() string {
 		port = 22
 	}
 	user := strings.TrimSpace(t.User)
-	jump := strings.ToLower(strings.TrimSpace(t.JumpHost))
+	jump := strings.ToLower(NormalizeProxyJump(t.JumpHost))
 	return fmt.Sprintf("host=%s;port=%d;user=%s;jump=%s", host, port, user, jump)
 }
 
@@ -232,7 +271,7 @@ func (t TargetContext) MatchesMasterTarget(masterIdentity string) bool {
 		case "user":
 			mUser = strings.TrimSpace(kv[1])
 		case "jump":
-			mJump = strings.ToLower(strings.TrimSpace(kv[1]))
+			mJump = strings.ToLower(NormalizeProxyJump(kv[1]))
 		}
 	}
 	if mHost == "" {
@@ -243,7 +282,7 @@ func (t TargetContext) MatchesMasterTarget(masterIdentity string) bool {
 		tPort = 22
 	}
 	tUser := strings.TrimSpace(t.User)
-	tJump := strings.ToLower(strings.TrimSpace(t.JumpHost))
+	tJump := strings.ToLower(NormalizeProxyJump(t.JumpHost))
 
 	if tHost != mHost || tPort != mPort || tJump != mJump {
 		return false
@@ -289,87 +328,64 @@ func FormatTargetIdentity(identity string) string {
 	return base
 }
 
-var envVarRegex = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+type pathExpandOptions struct {
+	kind          string
+	tildeFallback func(string) string
+	expandTilde   bool
+}
 
 // ExpandControlPath expands tokens (%%, %h, %p, %r, %n, %u, %l, %L, %i, %d, %j, %C), tilde (~),
-// and environment variables (${VAR}) in rawPath according to OpenSSH ssh_config(5) rules.
+// and environment variables (${VAR}) in rawPath in a single pass according to OpenSSH ssh_config(5) rules.
 func ExpandControlPath(rawPath string, env Environment, target TargetContext) (string, error) {
+	if hasControlOrLineSepChar(rawPath) {
+		return "", fmt.Errorf("ControlPath %q contains invalid control character", rawPath)
+	}
 	if rawPath == "" || rawPath == "none" {
 		return rawPath, nil
 	}
-
-	// 1. Expand ${VAR} environment variables
-	expanded, err := expandEnvironmentVariables(rawPath, env)
-	if err != nil {
-		return "", err
-	}
-
-	// 2. Expand leading tilde (~)
-	expanded, err = expandTilde(expanded, env.HomeDir)
-	if err != nil {
-		return "", err
-	}
-
-	// 3. Expand percent tokens (%)
-	return expandPercentTokens(expanded, env, target)
-}
-
-func expandEnvironmentVariables(raw string, env Environment) (string, error) {
-	if !strings.Contains(raw, "${") {
-		return raw, nil
-	}
-
-	var matchErr error
-	result := envVarRegex.ReplaceAllStringFunc(raw, func(m string) string {
-		if matchErr != nil {
-			return m
-		}
-		varName := m[2 : len(m)-1]
-		val, ok := lookupEnv(env, varName)
-		if !ok || val == "" {
-			matchErr = fmt.Errorf("env var ${%s} has no value", varName)
-			return m
-		}
-		return val
+	expanded, err := expandPathTokensSinglePass(rawPath, env, target, pathExpandOptions{
+		kind:        "ControlPath",
+		expandTilde: true,
 	})
-	if matchErr != nil {
-		return "", fmt.Errorf("invalid environment variable expansion: %w", matchErr)
+	if err != nil {
+		return "", err
 	}
-	return result, nil
+	if hasControlOrLineSepChar(expanded) {
+		return "", fmt.Errorf("expanded ControlPath %q contains invalid control character", expanded)
+	}
+	return expanded, nil
 }
 
-// lookupEnv reads a ControlPath ${VAR} value from the injected environment. The
-// core never inspects the process environment on its own.
-func lookupEnv(env Environment, key string) (string, bool) {
-	if env.LookupEnv != nil {
-		return env.LookupEnv(key)
+func expandPathTokensSinglePass(rawPath string, env Environment, target TargetContext, opts pathExpandOptions) (string, error) {
+	if opts.expandTilde {
+		if rawPath == "~" {
+			if env.HomeDir != "" {
+				return env.HomeDir, nil
+			}
+			if opts.tildeFallback != nil {
+				return opts.tildeFallback("~"), nil
+			}
+			return "", errors.New("cannot expand '~': home directory is not set")
+		}
+		if strings.HasPrefix(rawPath, "~/") || (runtime.GOOS == "windows" && strings.HasPrefix(rawPath, `~\`)) {
+			if env.HomeDir == "" && opts.tildeFallback == nil {
+				return "", errors.New("cannot expand '~': home directory is not set")
+			}
+			tildePrefix := rawPath[:2]
+			expandedRest, err := expandPathBodySinglePass(rawPath[2:], env, target, opts.kind)
+			if err != nil {
+				return "", err
+			}
+			if env.HomeDir != "" {
+				return filepath.Join(env.HomeDir, expandedRest), nil
+			}
+			return opts.tildeFallback(tildePrefix + expandedRest), nil
+		}
 	}
-	return "", false
+	return expandPathBodySinglePass(rawPath, env, target, opts.kind)
 }
 
-func expandTilde(path string, homeDir string) (string, error) {
-	if path == "~" {
-		if homeDir == "" {
-			return "", errors.New("cannot expand '~': home directory is not set")
-		}
-		return homeDir, nil
-	}
-	if strings.HasPrefix(path, "~/") {
-		if homeDir == "" {
-			return "", errors.New("cannot expand '~': home directory is not set")
-		}
-		return filepath.Join(homeDir, path[2:]), nil
-	}
-	if runtime.GOOS == "windows" && strings.HasPrefix(path, `~\`) {
-		if homeDir == "" {
-			return "", errors.New("cannot expand '~': home directory is not set")
-		}
-		return filepath.Join(homeDir, path[2:]), nil
-	}
-	return path, nil
-}
-
-func expandPercentTokens(raw string, env Environment, target TargetContext) (string, error) {
+func expandPathBodySinglePass(raw string, env Environment, target TargetContext, kind string) (string, error) {
 	host := cleanHostLiteral(target.Host)
 
 	portStr := "22"
@@ -392,51 +408,107 @@ func expandPercentTokens(raw string, env Environment, target TargetContext) (str
 		shortLocalHost = shortLocalHost[:idx]
 	}
 
-	// Compute %C connection hash: SHA-1 over %l%h%p%r%j
-	connHash := ComputeConnectionHash(env.LocalHost, host, portStr, remoteUser, target.JumpHost)
+	connHash := ""
+	connHashReady := false
 
 	var sb strings.Builder
 	sb.Grow(len(raw) + 32)
 
-	for i := 0; i < len(raw); i++ {
+	for i := 0; i < len(raw); {
+		if raw[i] == '$' && i+1 < len(raw) && raw[i+1] == '{' {
+			val, nextIdx, err := expandPathEnvToken(raw, i, env, kind)
+			if err != nil {
+				return "", err
+			}
+			sb.WriteString(val)
+			i = nextIdx
+			continue
+		}
 		if raw[i] == '%' {
 			if i+1 >= len(raw) {
-				return "", errors.New("trailing '%' in ControlPath")
+				return "", fmt.Errorf("trailing '%%' in %s", kind)
 			}
-			i++
-			switch raw[i] {
-			case '%':
-				sb.WriteByte('%')
-			case 'h':
-				sb.WriteString(host)
-			case 'p':
-				sb.WriteString(portStr)
-			case 'r':
-				sb.WriteString(remoteUser)
-			case 'n':
-				sb.WriteString(origHost)
-			case 'u':
-				sb.WriteString(env.LocalUser)
-			case 'l':
-				sb.WriteString(env.LocalHost)
-			case 'L':
-				sb.WriteString(shortLocalHost)
-			case 'i':
-				sb.WriteString(env.LocalUID)
-			case 'd':
-				sb.WriteString(env.HomeDir)
-			case 'j':
-				sb.WriteString(target.JumpHost)
-			case 'C':
-				sb.WriteString(connHash)
-			default:
-				return "", fmt.Errorf("unknown ControlPath token %%%c", raw[i])
+			expanded, err := expandPathPercentToken(raw[i+1], target, env, host, portStr, origHost, remoteUser, shortLocalHost, &connHash, &connHashReady, kind)
+			if err != nil {
+				return "", err
 			}
-		} else {
-			sb.WriteByte(raw[i])
+			sb.WriteString(expanded)
+			i += 2
+			continue
 		}
+		sb.WriteByte(raw[i])
+		i++
 	}
 	return sb.String(), nil
+}
+
+func expandPathEnvToken(raw string, i int, env Environment, kind string) (string, int, error) {
+	relEnd := strings.IndexByte(raw[i+2:], '}')
+	if relEnd < 0 {
+		return "", 0, fmt.Errorf("invalid environment variable expansion: unclosed environment variable in %s: %q", kind, raw[i:])
+	}
+	end := i + 2 + relEnd
+	varName := raw[i+2 : end]
+	if !isValidEnvIdentifier(varName) {
+		return "", 0, fmt.Errorf("invalid environment variable expansion: invalid environment variable name ${%s} in %s", varName, kind)
+	}
+	val, ok := lookupEnv(env, varName)
+	if !ok || val == "" {
+		return "", 0, fmt.Errorf("invalid environment variable expansion: env var ${%s} has no value", varName)
+	}
+	return val, end + 1, nil
+}
+
+func expandPathPercentToken(
+	tok byte,
+	target TargetContext,
+	env Environment,
+	host, portStr, origHost, remoteUser, shortLocalHost string,
+	connHash *string,
+	connHashReady *bool,
+	kind string,
+) (string, error) {
+	switch tok {
+	case '%':
+		return "%", nil
+	case 'h':
+		return host, nil
+	case 'p':
+		return portStr, nil
+	case 'r':
+		return remoteUser, nil
+	case 'n':
+		return origHost, nil
+	case 'u':
+		return env.LocalUser, nil
+	case 'l':
+		return env.LocalHost, nil
+	case 'L':
+		return shortLocalHost, nil
+	case 'i':
+		return env.LocalUID, nil
+	case 'd':
+		return env.HomeDir, nil
+	case 'j':
+		return NormalizeProxyJump(target.JumpHost), nil
+	case 'C':
+		if !*connHashReady {
+			*connHash = ComputeConnectionHash(env.LocalHost, host, portStr, remoteUser, NormalizeProxyJump(target.JumpHost))
+			*connHashReady = true
+		}
+		return *connHash, nil
+	default:
+		return "", fmt.Errorf("unknown %s token %%%c", kind, tok)
+	}
+}
+
+// lookupEnv reads a ControlPath ${VAR} value from the injected environment. The
+// core never inspects the process environment on its own.
+func lookupEnv(env Environment, key string) (string, bool) {
+	if env.LookupEnv != nil {
+		return env.LookupEnv(key)
+	}
+	return "", false
 }
 
 // ComputeConnectionHash computes the 40-character lowercase hexadecimal SHA-1 hash
@@ -463,12 +535,16 @@ func MaxControlPathLength() int {
 	}
 }
 
-// ValidateControlPath validates that the expanded socket path is non-empty and fits within OS limits.
+// ValidateControlPath validates that the expanded socket path is non-empty, free of
+// control characters, and fits within OS limits.
 func ValidateControlPath(expandedPath string) error {
-	if expandedPath == "" {
+	if hasControlOrLineSepChar(expandedPath) {
+		return fmt.Errorf("ControlPath %q contains invalid control character", expandedPath)
+	}
+	if strings.TrimSpace(expandedPath) == "" {
 		return errors.New("ControlPath is empty")
 	}
-	if expandedPath == "none" {
+	if IsNoneValue(expandedPath) {
 		return nil
 	}
 	maxLen := MaxControlPathLength()
@@ -479,43 +555,46 @@ func ValidateControlPath(expandedPath string) error {
 }
 
 // ValidateStreamLocalPathSyntax verifies raw StreamLocal socket path token syntax without environment dependencies.
-// Rejects empty strings and strings containing null bytes.
+// Rejects empty strings and strings containing null bytes or control characters.
 func ValidateStreamLocalPathSyntax(rawPath string) error {
 	if rawPath == "" {
 		return errors.New("StreamLocal path cannot be empty")
 	}
-	if strings.Contains(rawPath, "\x00") {
+	if strings.ContainsRune(rawPath, 0) {
 		return errors.New("StreamLocal path cannot contain null bytes")
+	}
+	if hasControlOrLineSepChar(rawPath) {
+		return fmt.Errorf("StreamLocal path %q contains invalid control character", rawPath)
 	}
 	return validatePathTokenSyntax(rawPath, "StreamLocal path")
 }
 
 // ExpandStreamLocalPath expands tokens (%%, %h, %p, %r, %n, %u, %l, %L, %i, %d, %j, %C),
-// environment variables (${VAR}), and optionally local tilde (~) in rawPath for StreamLocal forwarding endpoints.
+// environment variables (${VAR}), and optionally local tilde (~) in rawPath in a single pass.
 func ExpandStreamLocalPath(rawPath string, env Environment, target TargetContext, expandLocalTilde bool) (string, error) {
 	if rawPath == "" {
 		return "", errors.New("StreamLocal path cannot be empty")
 	}
-	if strings.Contains(rawPath, "\x00") {
+	if strings.ContainsRune(rawPath, 0) {
 		return "", errors.New("StreamLocal path cannot contain null bytes")
 	}
-
-	// 1. Expand ${VAR} environment variables
-	expanded, err := expandEnvironmentVariables(rawPath, env)
+	if hasControlOrLineSepChar(rawPath) {
+		return "", fmt.Errorf("StreamLocal path %q contains invalid control character", rawPath)
+	}
+	expanded, err := expandPathTokensSinglePass(rawPath, env, target, pathExpandOptions{
+		kind:        "StreamLocal path",
+		expandTilde: expandLocalTilde,
+	})
 	if err != nil {
 		return "", err
 	}
-
-	// 2. Expand leading tilde (~) if enabled
-	if expandLocalTilde {
-		expanded, err = expandTilde(expanded, env.HomeDir)
-		if err != nil {
-			return "", err
-		}
+	if strings.ContainsRune(expanded, 0) {
+		return "", errors.New("StreamLocal path cannot contain null bytes")
 	}
-
-	// 3. Expand percent tokens (%)
-	return expandPercentTokens(expanded, env, target)
+	if hasControlOrLineSepChar(expanded) {
+		return "", fmt.Errorf("expanded StreamLocal path %q contains invalid control character", expanded)
+	}
+	return expanded, nil
 }
 
 // ParseControlPersist parses OpenSSH ControlPersist specifications:

@@ -121,7 +121,7 @@ func validateSendEnvToken(tok string) error {
 	if strings.ContainsRune(tok, '=') {
 		return fmt.Errorf("SendEnv pattern %q must not contain '=' (use SetEnv for KEY=VALUE)", tok)
 	}
-	if hasASCIIControlChar(tok) {
+	if hasControlOrLineSepChar(tok) {
 		return fmt.Errorf("SendEnv pattern %q contains invalid ASCII control character", tok)
 	}
 	body := strings.TrimPrefix(tok, "-")
@@ -141,12 +141,14 @@ func validateSendEnvToken(tok string) error {
 }
 
 func validateSendEnvOption(raw string) (string, error) {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
+	if strings.TrimSpace(raw) == "" {
 		return "", errors.New("invalid SendEnv: value cannot be empty")
 	}
 	var tokens []string
-	for line := range strings.SplitSeq(trimmed, "\n") {
+	for line := range strings.SplitSeq(raw, "\n") {
+		if hasKnownHostsControlChar(line) {
+			return "", fmt.Errorf("invalid SendEnv %q: value contains invalid control character", line)
+		}
 		item := strings.TrimSpace(line)
 		if item == "" {
 			continue
@@ -169,15 +171,14 @@ func validateSendEnvOption(raw string) (string, error) {
 }
 
 func validateSetEnvOption(raw string) (string, error) {
-	if strings.ContainsAny(raw, "\x00\r") {
-		return "", errors.New("invalid SetEnv: value contains invalid control character")
-	}
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
+	if strings.TrimSpace(raw) == "" {
 		return "", errors.New("invalid SetEnv: value cannot be empty")
 	}
 	var lines []string
-	for line := range strings.SplitSeq(trimmed, "\n") {
+	for line := range strings.SplitSeq(raw, "\n") {
+		if hasKnownHostsControlChar(line) {
+			return "", errors.New("invalid SetEnv: value contains invalid control character")
+		}
 		item := strings.TrimSpace(line)
 		if item == "" {
 			continue

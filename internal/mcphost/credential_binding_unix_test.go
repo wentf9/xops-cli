@@ -95,6 +95,12 @@ func TestCredentialVersionSkipsFIFOAndSymlinkToFIFOWithoutBlocking(t *testing.T)
 	if b, ok := inspectCertificateBinding(symlinkToFIFO, true); !ok || !b.NonRegular {
 		t.Fatalf("explicit symlink-to-FIFO must record NonRegular=true, got (%+v, %v)", b, ok)
 	}
+	if b, ok := inspectCertificateBinding("/dev/null", true); !ok || !b.NonRegular {
+		t.Fatalf("/dev/null must record NonRegular=true via nonblocking+NOCTTY open, got (%+v, %v)", b, ok)
+	}
+	if b, ok := inspectCertificateBinding("/dev/null", false); ok {
+		t.Fatalf("/dev/null sidecar must be skipped, got %+v", b)
+	}
 }
 
 func atomicFlipSymlink(t *testing.T, linkPath, newTarget string) {

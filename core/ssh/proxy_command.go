@@ -152,7 +152,7 @@ func (c *Client) RunPostAuthLocalCommand(ctx context.Context) error {
 		Port:         port,
 		User:         user,
 		OriginalHost: origHost,
-		JumpHost:     connCfg.ProxyJump,
+		JumpHost:     NormalizeProxyJump(connCfg.ProxyJump),
 		KeyPath:      connCfg.KeyPath,
 	}
 	expanded, err := ExpandLocalCommand(rawCmd, c.environment, target)

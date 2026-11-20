@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"slices"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -114,7 +116,7 @@ func (h *host) resolveSnapshot(ctx context.Context, request ports.ResolveRequest
 		return ports.OperationSnapshot{}, err
 	}
 	view := ports.OperationSnapshot{DomainID: h.domain, Policy: h.policy, Targets: make(map[string]ports.Target), Selectors: make(map[string]string)}
-	adp := adapter.NewSSHAdapter(p, adapter.WithNonInteractive(true), adapter.WithControlMultiplexing(false), adapter.WithHostTrustOverrides(false), adapter.WithSessionAndForwardOptions(false), adapter.WithCredentialSource(h.config.Registry), adapter.WithCredentialRecording(false))
+	adp := adapter.NewSSHAdapter(p, adapter.WithStrictIsolation(), adapter.WithCredentialSource(h.config.Registry), adapter.WithCredentialRecording(false))
 	for _, selector := range request.Selectors {
 		if selector == "" {
 			continue
@@ -160,12 +162,136 @@ func (h *host) resolveSnapshot(ctx context.Context, request ports.ResolveRequest
 	return view, nil
 }
 
-func resolveSelector(provider config.ConfigProvider, selector string) (string, error) {
-	if strings.HasPrefix(selector, config.OpenSSHNodePrefix) {
-		if strings.IndexFunc(selector, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
-			return "", errors.New("OpenSSH node IDs must not contain whitespace or control characters")
+func hasWhitespaceOrControl(s string) bool {
+	return strings.IndexFunc(s, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r) || r == '\u2028' || r == '\u2029'
+	}) >= 0
+}
+
+func hasControlOrLineSep(s string) bool {
+	return strings.IndexFunc(s, func(r rune) bool {
+		return unicode.IsControl(r) || r == '\u2028' || r == '\u2029'
+	}) >= 0
+}
+
+func isExactSavedSelector(provider config.ConfigProvider, selector string) bool {
+	if provider == nil || selector == "" {
+		return false
+	}
+	if snap := provider.Snapshot(); snap != nil && snap.Nodes != nil {
+		if _, ok := snap.Nodes.Get(selector); ok {
+			return true
 		}
-		return selector, nil
+	}
+	if fa, ok := provider.(interface{ FindAlias(string) string }); ok && fa.FindAlias(selector) != "" {
+		return true
+	}
+	return false
+}
+
+func isConcreteOpenSSHHost(provider config.ConfigProvider, host string) bool {
+	if provider == nil || host == "" {
+		return false
+	}
+	if src, ok := provider.(interface{ GetOpenSSHParser() *config.OpenSSHParser }); ok {
+		if parser := src.GetOpenSSHParser(); parser != nil {
+			return parser.HasHost(host)
+		}
+	}
+	return false
+}
+
+func isIPLiteralHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	clean := config.StripHostBrackets(host)
+	if zoneIdx := strings.IndexByte(clean, '%'); zoneIdx >= 0 {
+		clean = clean[:zoneIdx]
+	}
+	_, err := netip.ParseAddr(clean)
+	return err == nil
+}
+
+func hasLeadingZeroPortInOpenSSHSpec(raw string, ref config.TargetRef) bool {
+	if !ref.HasPort {
+		return false
+	}
+	spec := strings.TrimPrefix(raw, config.OpenSSHNodePrefix)
+	lastColon := strings.LastIndexByte(spec, ':')
+	if lastColon < 0 || lastColon+1 >= len(spec) {
+		return false
+	}
+	return spec[lastColon+1:] != strconv.Itoa(int(ref.Port))
+}
+
+func canonicalizeOpenSSHSelector(provider config.ConfigProvider, raw string) (string, error) {
+	if hasWhitespaceOrControl(raw) {
+		return "", errors.New("OpenSSH node IDs must not contain whitespace or control characters")
+	}
+	ref, err := config.ParseTargetRef(raw)
+	if err != nil {
+		// Let malformed explicit openssh: specs (e.g. "openssh:", "openssh:web:65536")
+		// reach connection validation so they fail closed with a config error.
+		return raw, nil
+	}
+	if hasLeadingZeroPortInOpenSSHSpec(raw, ref) {
+		return "", fmt.Errorf("non-canonical OpenSSH node ID %q: leading-zero port is not allowed", raw)
+	}
+	host := config.StripHostBrackets(ref.Host)
+	canonHost := host
+	if isIPLiteralHost(host) {
+		canonHost = config.NormalizeHostAddress(host)
+	} else if !isConcreteOpenSSHHost(provider, host) {
+		canonHost = strings.ToLower(strings.TrimSuffix(host, "."))
+	}
+	baseID := config.OpenSSHNodePrefix + canonHost
+
+	effUser := ref.User
+	effPort := ref.Port
+	hasPort := ref.HasPort
+	if effUser != "" || hasPort {
+		if _, baseHost, baseIdent, baseErr := provider.Resolve(baseID); baseErr == nil {
+			baseUser := strings.TrimSpace(baseIdent.User)
+			if baseUser == "" {
+				baseUser = sshenv.Discover().LocalUser
+			}
+			basePort := baseHost.Port
+			if basePort == 0 {
+				basePort = 22
+			}
+			if effUser != "" && effUser == baseUser {
+				effUser = ""
+			}
+			if hasPort && effPort == basePort {
+				hasPort = false
+				effPort = 0
+			}
+		}
+	}
+	return config.TargetRef{
+		OpenSSH: true,
+		User:    effUser,
+		Host:    canonHost,
+		Port:    effPort,
+		HasPort: hasPort,
+	}.NormalizedString(), nil
+}
+
+func resolveSelector(provider config.ConfigProvider, selector string) (string, error) {
+	if len(selector) >= len(config.OpenSSHNodePrefix) &&
+		strings.EqualFold(selector[:len(config.OpenSSHNodePrefix)], config.OpenSSHNodePrefix) &&
+		!strings.HasPrefix(selector, config.OpenSSHNodePrefix) {
+		return "", errors.New("OpenSSH node IDs must use lowercase \"openssh:\" prefix")
+	}
+	if strings.HasPrefix(selector, config.OpenSSHNodePrefix) {
+		return canonicalizeOpenSSHSelector(provider, selector)
+	}
+	if strings.TrimSpace(selector) != selector || hasControlOrLineSep(selector) {
+		return "", errors.New("node selectors must not contain leading/trailing whitespace or control characters")
+	}
+	if !isExactSavedSelector(provider, selector) && hasWhitespaceOrControl(selector) {
+		return "", errors.New("node selectors must not contain whitespace or control characters")
 	}
 	id, err := provider.ResolveSelector(selector)
 	if err != nil {
@@ -174,8 +300,8 @@ func resolveSelector(provider config.ConfigProvider, selector string) (string, e
 	if id == "" {
 		return "", ports.ErrNotFound
 	}
-	if strings.HasPrefix(id, config.OpenSSHNodePrefix) && strings.IndexFunc(id, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
-		return "", errors.New("OpenSSH node IDs must not contain whitespace or control characters")
+	if strings.HasPrefix(id, config.OpenSSHNodePrefix) {
+		return canonicalizeOpenSSHSelector(provider, id)
 	}
 	return id, nil
 }

@@ -302,12 +302,23 @@ func StartMuxServer(ctx context.Context, sshClient *cryptoSSH.Client, opts MuxMa
 	if dialAgent == nil {
 		dialAgent = env.DialAgent
 	}
-	agentSocket := strings.TrimSpace(opts.AgentSocket)
-	if agentSocket == "" && opts.AllowAgentForward {
+	var agentSocket string
+	expandAgentTilde := false
+	if opts.AgentSocket != "" {
+		if hasControlOrLineSepChar(opts.AgentSocket) {
+			return nil, fmt.Errorf("invalid AgentSocket %q: contains invalid control character", opts.AgentSocket)
+		}
+		agentSocket = strings.TrimSpace(opts.AgentSocket)
+	}
+	if agentSocket == "" && opts.AllowAgentForward && env.AgentSocket != "" {
+		if hasControlOrLineSepChar(env.AgentSocket) {
+			return nil, fmt.Errorf("invalid AgentSocket %q: contains invalid control character", env.AgentSocket)
+		}
 		agentSocket = strings.TrimSpace(env.AgentSocket)
+		expandAgentTilde = true
 	}
 	if agentSocket != "" {
-		agentSocket = normalizeExpandedAgentSocketPath(agentSocket, env)
+		agentSocket = normalizeExpandedAgentSocketPathWithTilde(agentSocket, env, expandAgentTilde)
 	}
 
 	server, err := NewMuxServer(MuxServerOptions{

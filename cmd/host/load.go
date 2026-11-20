@@ -244,6 +244,20 @@ func normalizeImportAddress(addr utils.HostInfo) (utils.HostInfo, error) {
 	if addr.Host == "" {
 		return utils.HostInfo{}, fmt.Errorf("import host is empty")
 	}
+	if err := config.ValidateConcreteHostAddress(addr.Host); err != nil {
+		return utils.HostInfo{}, err
+	}
+	if strings.Contains(addr.Host, "@") {
+		return utils.HostInfo{}, fmt.Errorf("invalid import host %q: must not include user specifier", addr.Host)
+	}
+	parsedHost, _, hasPort, err := config.ParseHostPort(addr.Host)
+	if err != nil {
+		return utils.HostInfo{}, fmt.Errorf("invalid import host %q: %w", addr.Host, err)
+	}
+	if hasPort {
+		return utils.HostInfo{}, fmt.Errorf("invalid import host %q: must not include embedded port", addr.Host)
+	}
+	addr.Host = parsedHost
 	if addr.User == "" {
 		var err error
 		addr.User, err = utils.GetCurrentUser()

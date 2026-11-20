@@ -21,6 +21,7 @@ import (
 type dialPolicy struct {
 	nodeID                string
 	address               string
+	baseHost              string
 	port                  int
 	user                  string
 	authType              string
@@ -57,6 +58,7 @@ func freezeDialPolicy(cfg *ClientConfig) dialPolicy {
 	return dialPolicy{
 		nodeID:                cfg.NodeID,
 		address:               normalizeHostAddress(cfg.Address),
+		baseHost:              normalizeHostAddress(cfg.BaseHost),
 		port:                  port,
 		user:                  cfg.User,
 		authType:              cfg.AuthType,
@@ -66,7 +68,7 @@ func freezeDialPolicy(cfg *ClientConfig) dialPolicy {
 		authUpdateToken:       cfg.AuthUpdateToken,
 		sudoMode:              cfg.SudoMode,
 		sudoUpdateToken:       cfg.SudoUpdateToken,
-		proxyJump:             cfg.ProxyJump,
+		proxyJump:             NormalizeProxyJump(cfg.ProxyJump),
 		originalHost:          cfg.OriginalHost,
 		canonicalHost:         cfg.CanonicalHost,
 		originalProxyJump:     origJump,
@@ -82,6 +84,7 @@ func (p dialPolicy) readOnlyConfig() *ClientConfig {
 	return &ClientConfig{
 		NodeID:                p.nodeID,
 		Address:               p.address,
+		BaseHost:              p.baseHost,
 		Port:                  p.port,
 		User:                  p.user,
 		AuthType:              p.authType,
@@ -111,6 +114,7 @@ func (p dialPolicy) toConnectionConfig() ConnectionConfig {
 		OriginalHost:          p.originalHost,
 		CanonicalHost:         p.canonicalHost,
 		Address:               p.address,
+		BaseHost:              p.baseHost,
 		Port:                  p.port,
 		User:                  p.user,
 		AuthType:              p.authType,
@@ -488,7 +492,7 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 		return nil, err
 	}
 	outcome := attempt.outcome()
-	if err := checkInitializedTransport(nodeName, policy, outcome, client); err != nil {
+	if err := checkInitializedTransport(nodeName, policy, outcome, rootConn, client); err != nil {
 		return nil, err
 	}
 
@@ -498,7 +502,7 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 	}
 	attempt.scrub()
 
-	if err := checkInitializedTransport(nodeName, policy, outcome, client); err != nil {
+	if err := checkInitializedTransport(nodeName, policy, outcome, rootConn, client); err != nil {
 		return nil, err
 	}
 	client.cfgMu.Lock()
@@ -519,7 +523,7 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 	return client, nil
 }
 
-func checkInitializedTransport(nodeID string, policy dialPolicy, outcome authOutcome, client *Client) error {
+func checkInitializedTransport(nodeID string, policy dialPolicy, outcome authOutcome, hopConn net.Conn, client *Client) error {
 	if err := client.transportError(); err != nil {
 		authType := outcome.authType
 		if authType == "" {
@@ -532,7 +536,11 @@ func checkInitializedTransport(nodeID string, policy dialPolicy, outcome authOut
 			AuthType: authType,
 			Err:      fmt.Errorf("SSH transport closed during initialization: %w", err),
 		}
-		return errors.Join(connectionErr, client.Interrupt())
+		var rawClient *ssh.Client
+		if client != nil {
+			rawClient = client.sshClient
+		}
+		return errors.Join(connectionErr, interruptSSHTransport(hopConn, rawClient))
 	}
 	return nil
 }
@@ -755,7 +763,7 @@ func (c *Connector) handleHandshakeFailure(ctx context.Context, coordinator *han
 }
 
 func (c *Connector) resolveHandshakeDialer(nodeName string, policy dialPolicy, dialer Dialer) (Dialer, bool, bool) {
-	if dialer == nil && policy.proxyJump == "" && policy.options.ActiveProxyCommand() != "" {
+	if dialer == nil && !HasActiveProxyJump(policy.proxyJump) && policy.options.ActiveProxyCommand() != "" {
 		roCfg := policy.readOnlyConfig()
 		dialer = &proxyCommandDialer{
 			connector: c,
@@ -887,6 +895,7 @@ func (c *Connector) resolvePasswordAuthWithPolicy(policy dialPolicy, attempt *ha
 			NodeID:       policy.nodeID,
 			User:         policy.user,
 			Host:         policy.address,
+			BaseHost:     policy.baseHost,
 			Port:         policy.port,
 			VersionToken: policy.authUpdateToken,
 		})
@@ -922,7 +931,7 @@ func (c *Connector) authTargetContext(cfg *ClientConfig) TargetContext {
 		Port:         port,
 		User:         user,
 		OriginalHost: effectiveOriginalHost(cfg.OriginalHost, cfg.NodeID),
-		JumpHost:     cfg.ProxyJump,
+		JumpHost:     NormalizeProxyJump(cfg.ProxyJump),
 	}
 }
 
@@ -1177,6 +1186,7 @@ func (c *Connector) buildMultiKeyAuth(
 		nodeID:             cfg.NodeID,
 		user:               cfg.User,
 		host:               cfg.Address,
+		baseHost:           cfg.BaseHost,
 		port:               cfg.Port,
 		versionToken:       cfg.AuthUpdateToken,
 		resolver:           resolver,
@@ -1464,6 +1474,7 @@ func (c *Connector) buildSSHConfigWithState(ctx context.Context, dialPolicy dial
 			NodeID:             dialPolicy.nodeID,
 			User:               dialPolicy.user,
 			Host:               dialPolicy.address,
+			BaseHost:           dialPolicy.baseHost,
 			Port:               dialPolicy.port,
 			VersionToken:       dialPolicy.authUpdateToken,
 			Resolver:           c.secretResolver,
@@ -1694,6 +1705,7 @@ func (c *Connector) newAutoSecretProvider(authCtx context.Context, cfg *ClientCo
 		nodeID:             cfg.NodeID,
 		user:               cfg.User,
 		host:               cfg.Address,
+		baseHost:           cfg.BaseHost,
 		port:               cfg.Port,
 		versionToken:       cfg.AuthUpdateToken,
 		resolver:           c.secretResolver,

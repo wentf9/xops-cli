@@ -213,7 +213,7 @@ func resolveAddedIdentity(cfg *config.Configuration, flags *addFlags, password s
 }
 
 func applyAddTargetArgs(args []string, alias *[]string, address, user *string, port *uint16, portChanged bool) error {
-	if *address != "" && (strings.Contains(*address, "@") || strings.Contains(*address, ":")) {
+	if *address != "" {
 		raw := *address
 		*address = ""
 		if err := mergeTargetAddressSpec(raw, address, user, port, &portChanged); err != nil {
@@ -238,12 +238,15 @@ func applyAddTargetArgs(args []string, alias *[]string, address, user *string, p
 }
 
 func mergeTargetAddressSpec(spec string, address, user *string, port *uint16, portChanged *bool) error {
+	if err := config.ValidateConcreteHostAddress(spec); err != nil {
+		return err
+	}
 	posUser, posHost, posPort, err := utils.ParseAddr(spec)
 	if err != nil {
 		return err
 	}
-	if strings.HasPrefix(posHost, config.OpenSSHNodePrefix) {
-		return fmt.Errorf("invalid host address %q: openssh selector cannot be used as a concrete host address", spec)
+	if err := config.ValidateConcreteHostAddress(posHost); err != nil {
+		return fmt.Errorf("invalid host address %q: %w", spec, err)
 	}
 	if *address != "" && *address != posHost {
 		return fmt.Errorf("conflicting host addresses %q and %q", *address, posHost)

@@ -360,6 +360,18 @@ func (r *Repository) acquirePendingConfirmationGate(ctx context.Context, nodeID 
 }
 
 func mergeConfirmedNodeConfig(cfg *Configuration, nodeID string, node models.Node, host models.Host, identity models.Identity) error {
+	if err := ValidateNodeAlias(nodeID); err != nil {
+		return fmt.Errorf("save connected node %q: %w", nodeID, err)
+	}
+	if err := ValidateNodeAliases(node.Alias); err != nil {
+		return fmt.Errorf("save connected node %q: %w", nodeID, err)
+	}
+	if err := ValidateNodeAliases(host.Alias); err != nil {
+		return fmt.Errorf("save connected host %q: %w", node.HostRef, err)
+	}
+	if err := ValidateConcreteHostAddress(host.Address); err != nil {
+		return fmt.Errorf("save connected host %q: %w", node.HostRef, err)
+	}
 	if existing, ok := cfg.Nodes.Get(nodeID); ok && !equalPersistedNode(existing, node) {
 		return fmt.Errorf("save connected node %q: %w", nodeID, ErrConfigConflict)
 	}

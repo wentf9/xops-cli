@@ -3,14 +3,58 @@
 package sshenv
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
+
+var testWindowsPipeSeq atomic.Uint64
+
+type testACESpec struct {
+	sid         *windows.SID
+	trusteeType windows.TRUSTEE_TYPE
+	permissions windows.ACCESS_MASK
+}
+
+// buildPinnedTestACL pins every SID for the full duration of windows.ACLFromEntries
+// because TrusteeValueFromSID stores an opaque pointer hidden from Go's GC.
+func buildPinnedTestACL(t *testing.T, oldACL *windows.ACL, specs ...testACESpec) *windows.ACL {
+	t.Helper()
+	var pinner runtime.Pinner
+	defer pinner.Unpin()
+
+	entries := make([]windows.EXPLICIT_ACCESS, 0, len(specs))
+	for _, spec := range specs {
+		pinner.Pin(spec.sid)
+		entries = append(entries, windows.EXPLICIT_ACCESS{
+			AccessPermissions: spec.permissions,
+			AccessMode:        windows.GRANT_ACCESS,
+			Inheritance:       windows.NO_INHERITANCE,
+			Trustee: windows.TRUSTEE{
+				TrusteeForm:  windows.TRUSTEE_IS_SID,
+				TrusteeType:  spec.trusteeType,
+				TrusteeValue: windows.TrusteeValueFromSID(spec.sid),
+			},
+		})
+	}
+	acl, err := windows.ACLFromEntries(entries, oldACL)
+	if err != nil {
+		t.Fatalf("ACLFromEntries failed: %v", err)
+	}
+	return acl
+}
 
 func TestWindowsSecurityHelpersAndSocketAddr(t *testing.T) {
 	baseDir := t.TempDir()
@@ -93,31 +137,10 @@ func TestWindowsACLAllowlistAndObjectACEFailClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	daclInteractiveWrite, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{
-		{
-			AccessPermissions: windows.GENERIC_ALL,
-			AccessMode:        windows.GRANT_ACCESS,
-			Inheritance:       windows.NO_INHERITANCE,
-			Trustee: windows.TRUSTEE{
-				TrusteeForm:  windows.TRUSTEE_IS_SID,
-				TrusteeType:  windows.TRUSTEE_IS_USER,
-				TrusteeValue: windows.TrusteeValueFromSID(currSID),
-			},
-		},
-		{
-			AccessPermissions: windows.FILE_WRITE_DATA,
-			AccessMode:        windows.GRANT_ACCESS,
-			Inheritance:       windows.NO_INHERITANCE,
-			Trustee: windows.TRUSTEE{
-				TrusteeForm:  windows.TRUSTEE_IS_SID,
-				TrusteeType:  windows.TRUSTEE_IS_WELL_KNOWN_GROUP,
-				TrusteeValue: windows.TrusteeValueFromSID(interactiveSID),
-			},
-		},
-	}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	daclInteractiveWrite := buildPinnedTestACL(t, nil,
+		testACESpec{sid: currSID, trusteeType: windows.TRUSTEE_IS_USER, permissions: windows.GENERIC_ALL},
+		testACESpec{sid: interactiveSID, trusteeType: windows.TRUSTEE_IS_WELL_KNOWN_GROUP, permissions: windows.FILE_WRITE_DATA},
+	)
 	parsedInteractive, ok := parseWindowsACL(daclInteractiveWrite, currSID)
 	if !ok {
 		t.Fatal("parseWindowsACL failed on valid ACL")
@@ -162,21 +185,9 @@ func TestWindowsGlobalKnownHostsAndPipeOwnerFailClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	daclOwnerOnly, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{
-		{
-			AccessPermissions: windows.GENERIC_ALL,
-			AccessMode:        windows.GRANT_ACCESS,
-			Inheritance:       windows.NO_INHERITANCE,
-			Trustee: windows.TRUSTEE{
-				TrusteeForm:  windows.TRUSTEE_IS_SID,
-				TrusteeType:  windows.TRUSTEE_IS_USER,
-				TrusteeValue: windows.TrusteeValueFromSID(currSID),
-			},
-		},
-	}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	daclOwnerOnly := buildPinnedTestACL(t, nil,
+		testACESpec{sid: currSID, trusteeType: windows.TRUSTEE_IS_USER, permissions: windows.GENERIC_ALL},
+	)
 	for _, target := range []string{sshDir, knownHosts} {
 		if err := windows.SetNamedSecurityInfo(
 			target,
@@ -194,21 +205,9 @@ func TestWindowsGlobalKnownHostsAndPipeOwnerFailClosed(t *testing.T) {
 		t.Fatal("owner-only ssh directory and ssh_known_hosts must be accepted")
 	}
 
-	daclDirDeleteChild, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{
-		{
-			AccessPermissions: windows.ACCESS_MASK(windowsAccessFileDeleteChild),
-			AccessMode:        windows.GRANT_ACCESS,
-			Inheritance:       windows.NO_INHERITANCE,
-			Trustee: windows.TRUSTEE{
-				TrusteeForm:  windows.TRUSTEE_IS_SID,
-				TrusteeType:  windows.TRUSTEE_IS_WELL_KNOWN_GROUP,
-				TrusteeValue: windows.TrusteeValueFromSID(interactiveSID),
-			},
-		},
-	}, daclOwnerOnly)
-	if err != nil {
-		t.Fatal(err)
-	}
+	daclDirDeleteChild := buildPinnedTestACL(t, daclOwnerOnly,
+		testACESpec{sid: interactiveSID, trusteeType: windows.TRUSTEE_IS_WELL_KNOWN_GROUP, permissions: windows.ACCESS_MASK(windowsAccessFileDeleteChild)},
+	)
 	if err := windows.SetNamedSecurityInfo(
 		sshDir,
 		windows.SE_FILE_OBJECT,
@@ -261,5 +260,209 @@ func TestWindowsGlobalKnownHostsAndPipeOwnerFailClosed(t *testing.T) {
 	aclPtr := (*windows.ACL)(unsafe.Pointer(&rawACL[0]))
 	if _, ok := parseWindowsACL(aclPtr, currSID); ok {
 		t.Fatal("parseWindowsACL accepted 12-byte truncated ACE smaller than 16-byte minimum SID header")
+	}
+}
+
+func startTestWindowsNamedPipeServer(t *testing.T, acl *windows.ACL) (string, <-chan error, func()) {
+	t.Helper()
+	sd, err := windows.NewSecurityDescriptor()
+	if err != nil {
+		t.Fatalf("NewSecurityDescriptor: %v", err)
+	}
+	var pinner runtime.Pinner
+	defer pinner.Unpin()
+	pinner.Pin(acl)
+	pinner.Pin(sd)
+	if err := sd.SetDACL(acl, true, false); err != nil {
+		t.Fatalf("SetDACL: %v", err)
+	}
+	sa := &windows.SecurityAttributes{
+		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
+		SecurityDescriptor: sd,
+	}
+	ev, err := windows.CreateEvent(nil, 1, 0, nil)
+	if err != nil {
+		t.Fatalf("CreateEvent: %v", err)
+	}
+	pipeName := fmt.Sprintf(`\\.\pipe\xops-test-agent-%d-%d-%d`, os.Getpid(), time.Now().UnixNano(), testWindowsPipeSeq.Add(1))
+	namePtr, err := windows.UTF16PtrFromString(pipeName)
+	if err != nil {
+		_ = windows.CloseHandle(ev)
+		t.Fatalf("UTF16PtrFromString: %v", err)
+	}
+	h, err := windows.CreateNamedPipe(
+		namePtr,
+		windows.PIPE_ACCESS_DUPLEX|windows.FILE_FLAG_OVERLAPPED,
+		windows.PIPE_TYPE_BYTE|windows.PIPE_WAIT,
+		1,
+		4096,
+		4096,
+		0,
+		sa,
+	)
+	if err != nil {
+		_ = windows.CloseHandle(ev)
+		t.Fatalf("CreateNamedPipe(%s): %v", pipeName, err)
+	}
+
+	var ioMu sync.Mutex
+	closed := false
+	srvDone := make(chan error, 1)
+	exited := make(chan struct{})
+
+	runOverlapped := func(op func(ov *windows.Overlapped) error, okIfErr ...error) (uint32, error) {
+		ioMu.Lock()
+		if closed || h == windows.InvalidHandle {
+			ioMu.Unlock()
+			return 0, windows.ERROR_OPERATION_ABORTED
+		}
+		_ = windows.ResetEvent(ev)
+		ov := windows.Overlapped{HEvent: ev}
+		opErr := op(&ov)
+		ioMu.Unlock()
+
+		for _, benign := range okIfErr {
+			if errors.Is(opErr, benign) {
+				return 0, nil
+			}
+		}
+		if opErr == nil || errors.Is(opErr, windows.ERROR_IO_PENDING) {
+			var n uint32
+			waitErr := windows.GetOverlappedResult(h, &ov, &n, true)
+			return n, waitErr
+		}
+		return 0, opErr
+	}
+
+	var once sync.Once
+	go func() {
+		defer func() {
+			ioMu.Lock()
+			closed = true
+			if h != windows.InvalidHandle {
+				_ = windows.CloseHandle(h)
+				h = windows.InvalidHandle
+			}
+			if ev != windows.InvalidHandle {
+				_ = windows.CloseHandle(ev)
+				ev = windows.InvalidHandle
+			}
+			ioMu.Unlock()
+			close(srvDone)
+			close(exited)
+		}()
+		if _, cErr := runOverlapped(func(ov *windows.Overlapped) error {
+			return windows.ConnectNamedPipe(h, ov)
+		}, windows.ERROR_PIPE_CONNECTED); cErr != nil {
+			srvDone <- cErr
+			return
+		}
+		var buf [4]byte
+		readOff := 0
+		for readOff < len(buf) {
+			n, rErr := runOverlapped(func(ov *windows.Overlapped) error {
+				var immediate uint32
+				return windows.ReadFile(h, buf[readOff:], &immediate, ov)
+			})
+			readOff += int(n)
+			if rErr != nil {
+				srvDone <- rErr
+				return
+			}
+			if n == 0 {
+				srvDone <- windows.ERROR_BROKEN_PIPE
+				return
+			}
+		}
+		reply := []byte("pong:" + string(buf[:]))
+		for len(reply) > 0 {
+			n, wErr := runOverlapped(func(ov *windows.Overlapped) error {
+				var immediate uint32
+				return windows.WriteFile(h, reply, &immediate, ov)
+			})
+			if wErr != nil {
+				srvDone <- wErr
+				return
+			}
+			if n == 0 {
+				srvDone <- windows.ERROR_BROKEN_PIPE
+				return
+			}
+			reply = reply[int(n):]
+		}
+	}()
+	cleanup := func() {
+		once.Do(func() {
+			ioMu.Lock()
+			closed = true
+			if h != windows.InvalidHandle {
+				_ = windows.CancelIoEx(h, nil)
+			}
+			ioMu.Unlock()
+			<-exited
+		})
+	}
+	return pipeName, srvDone, cleanup
+}
+
+func TestWindowsAgentPipeLiveDialAndDACLEnforcement(t *testing.T) {
+	systemSID, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auSID, err := windows.CreateWellKnownSid(windows.WinAuthenticatedUserSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	interactiveSID, err := windows.CreateWellKnownSid(windows.WinInteractiveSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// (a) Win32-OpenSSH style DACL: SYSTEM gets GENERIC_ALL, Authenticated Users gets ONLY
+	// 0x0012019b (no FILE_CREATE_PIPE_INSTANCE, currSID not explicitly granted GENERIC_ALL).
+	// dialWindowsNamedPipe must succeed using 0x0012008b and support full-duplex pipe I/O.
+	win32OpenSSHACL := buildPinnedTestACL(t, nil,
+		testACESpec{sid: systemSID, trusteeType: windows.TRUSTEE_IS_WELL_KNOWN_GROUP, permissions: windows.GENERIC_ALL},
+		testACESpec{sid: auSID, trusteeType: windows.TRUSTEE_IS_WELL_KNOWN_GROUP, permissions: windows.ACCESS_MASK(win32OpenSSHAgentAUAccessMask)},
+	)
+	pipeOK, srvDone, cleanupOK := startTestWindowsNamedPipeServer(t, win32OpenSSHACL)
+	defer cleanupOK()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	conn, dialErr := dialWindowsNamedPipe(ctx, pipeOK)
+	if dialErr != nil {
+		t.Fatalf("dialWindowsNamedPipe on Win32-OpenSSH 0x0012019b DACL failed: %v", dialErr)
+	}
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		_ = conn.Close()
+		t.Fatalf("pipe Write failed: %v", err)
+	}
+	var reply [9]byte
+	if _, err := io.ReadFull(conn, reply[:]); err != nil {
+		_ = conn.Close()
+		t.Fatalf("pipe Read failed: %v", err)
+	}
+	_ = conn.Close()
+	if string(reply[:]) != "pong:ping" {
+		t.Fatalf("pipe reply = %q, want pong:ping", string(reply[:]))
+	}
+	if sErr := <-srvDone; sErr != nil {
+		t.Fatalf("pipe server error: %v", sErr)
+	}
+
+	// (b) Untrusted principal granted FILE_CREATE_PIPE_INSTANCE must fail closed with errInsecureAgentPipeDACL.
+	insecureACL := buildPinnedTestACL(t, win32OpenSSHACL,
+		testACESpec{sid: interactiveSID, trusteeType: windows.TRUSTEE_IS_WELL_KNOWN_GROUP, permissions: windows.ACCESS_MASK(windowsAccessFileCreatePipeInstance | windows.FILE_GENERIC_READ)},
+	)
+	pipeBad, _, cleanupBad := startTestWindowsNamedPipeServer(t, insecureACL)
+	defer cleanupBad()
+
+	if badConn, badErr := dialWindowsNamedPipe(ctx, pipeBad); !errors.Is(badErr, errInsecureAgentPipeDACL) {
+		if badConn != nil {
+			_ = badConn.Close()
+		}
+		t.Fatalf("dialWindowsNamedPipe on insecure DACL = %v, want errInsecureAgentPipeDACL", badErr)
 	}
 }

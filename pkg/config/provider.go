@@ -77,36 +77,41 @@ func NewProviderWithOpenSSHParser(cfg *Configuration, parser *OpenSSHParser) *Pr
 	return newProvider(cfg, parser)
 }
 
+// StripHostBrackets removes one surrounding bracket pair from a bracketed IPv6
+// address literal (preserving zone IDs). Malformed single brackets and
+// non-IPv6 bracketed values are returned trimmed without modification.
+func StripHostBrackets(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if len(trimmed) >= 2 && trimmed[0] == '[' && trimmed[len(trimmed)-1] == ']' {
+		inner := trimmed[1 : len(trimmed)-1]
+		if ip, err := netip.ParseAddr(inner); err == nil && ip.Is6() {
+			return inner
+		}
+	}
+	return trimmed
+}
+
 // NormalizeHostAddress trims whitespace and surrounding IPv6 brackets, returning
 // the canonical RFC 5952 representation for IP literals (preserving IPv6 zone IDs
-// and keeping IPv4-mapped IPv6 addresses distinct from IPv4) while preserving
-// non-IP hostname case verbatim.
+// and keeping IPv4-mapped IPv6 addresses distinct from IPv4) and lowercasing
+// non-IP DNS hostnames so equality and index keys share one canonical representative.
 func NormalizeHostAddress(raw string) string {
-	clean := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(raw), "]"), "[")
+	clean := StripHostBrackets(raw)
 	if clean == "" {
 		return ""
 	}
 	if ip, err := netip.ParseAddr(clean); err == nil {
 		return ip.String()
 	}
-	return clean
+	return strings.ToLower(clean)
 }
 
-// SameHostAddress reports whether a and b represent the same host address.
-// IP literals are compared by parsed netip.Addr equality before falling back
-// to case-insensitive hostname comparison so IPv6 zone-ID matching stays symmetric.
+// SameHostAddress reports whether a and b share the same non-empty canonical
+// host representative induced by NormalizeHostAddress.
 func SameHostAddress(a, b string) bool {
-	ca := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(a), "]"), "[")
-	cb := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(b), "]"), "[")
-	if ca == "" || cb == "" {
-		return false
-	}
-	ipA, errA := netip.ParseAddr(ca)
-	ipB, errB := netip.ParseAddr(cb)
-	if errA == nil || errB == nil {
-		return errA == nil && errB == nil && ipA == ipB
-	}
-	return strings.EqualFold(ca, cb)
+	na := NormalizeHostAddress(a)
+	nb := NormalizeHostAddress(b)
+	return na != "" && na == nb
 }
 
 func stripTransientNodeMetadata(cfg *Configuration) {
@@ -366,7 +371,7 @@ func resolveConfigNodeHostAddrPort(cfg *Configuration, nodeID string) (string, u
 	if !ok {
 		return "", 0, false
 	}
-	cleanAddr := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(host.Address), "]"), "[")
+	cleanAddr := StripHostBrackets(host.Address)
 	return cleanAddr, normalizedHostPort(host.Port), true
 }
 
@@ -422,21 +427,13 @@ func (p *Provider) ResolveSelector(input string) (string, error) {
 	if p == nil {
 		return "", nil
 	}
+	trimmed := strings.TrimSpace(input)
 	p.mu.RLock()
-	if _, ok := p.cfg.Nodes.Get(input); ok {
+	if nid, ok := p.resolveDirectSelectorLocked(input, trimmed); ok {
 		p.mu.RUnlock()
-		return input, nil
+		return nid, nil
 	}
-	candidates := slices.Clone(p.lookupIndex[input])
-	if len(candidates) == 0 {
-		if norm := normalizeLookupSelector(input); norm != "" && norm != input {
-			if _, ok := p.cfg.Nodes.Get(norm); ok {
-				p.mu.RUnlock()
-				return norm, nil
-			}
-			candidates = slices.Clone(p.lookupIndex[norm])
-		}
-	}
+	candidates := p.resolveLookupCandidatesLocked(input, trimmed)
 	p.mu.RUnlock()
 
 	switch len(candidates) {
@@ -448,7 +445,11 @@ func (p *Provider) ResolveSelector(input string) (string, error) {
 				return "", fmt.Errorf("resolve openssh selector %q: %w", input, err)
 			}
 			if p.openSSH.cfg != nil {
-				if nodeID, ok := p.openSSH.Find(input); ok {
+				openSSHQuery := trimmed
+				if openSSHQuery == "" {
+					openSSHQuery = input
+				}
+				if nodeID, ok := p.openSSH.Find(openSSHQuery); ok {
 					return nodeID, nil
 				}
 			}
@@ -457,6 +458,72 @@ func (p *Provider) ResolveSelector(input string) (string, error) {
 	default:
 		return "", &AmbiguousNodeError{Selector: input, Candidates: candidates}
 	}
+}
+
+func (p *Provider) resolveDirectSelectorLocked(input, trimmed string) (string, bool) {
+	if _, ok := p.cfg.Nodes.Get(input); ok {
+		return input, true
+	}
+	if trimmed != "" && trimmed != input {
+		if _, ok := p.cfg.Nodes.Get(trimmed); ok {
+			return trimmed, true
+		}
+	}
+	if nid := p.aliasIndex[input]; nid != "" {
+		return nid, true
+	}
+	if trimmed != "" && trimmed != input {
+		if nid := p.aliasIndex[trimmed]; nid != "" {
+			return nid, true
+		}
+	}
+	return "", false
+}
+
+func (p *Provider) resolveLookupCandidatesLocked(input, trimmed string) []string {
+	if candidates := slices.Clone(p.lookupIndex[input]); len(candidates) > 0 {
+		return candidates
+	}
+	if trimmed != "" && trimmed != input {
+		if candidates := slices.Clone(p.lookupIndex[trimmed]); len(candidates) > 0 {
+			return candidates
+		}
+	}
+	if portNorm := normalizeLookupSelectorPreserveHostCase(trimmed); portNorm != "" && portNorm != input && portNorm != trimmed {
+		if candidates := slices.Clone(p.lookupIndex[portNorm]); len(candidates) > 0 {
+			return candidates
+		}
+	}
+	if norm := normalizeLookupSelector(input); norm != "" && norm != input && norm != trimmed {
+		if candidates := slices.Clone(p.lookupIndex[norm]); len(candidates) > 0 {
+			return candidates
+		}
+	}
+	return nil
+}
+
+func normalizeLookupSelectorPreserveHostCase(trimmed string) string {
+	if trimmed == "" {
+		return ""
+	}
+	ref, err := ParseTargetRef(trimmed)
+	if err != nil || ref.OpenSSH || ref.Host == "" {
+		return ""
+	}
+	host := StripHostBrackets(ref.Host)
+	if host == "" {
+		return ""
+	}
+	if ref.User != "" {
+		if ref.HasPort {
+			return FormatNodeID(ref.User, host, ref.Port)
+		}
+		return ref.User + "@" + host
+	}
+	if ref.HasPort {
+		return FormatHostPort(host, ref.Port)
+	}
+	return host
 }
 
 func (p *Provider) FindAlias(alias string) string {
@@ -741,16 +808,20 @@ func normalizeLookupSelector(raw string) string {
 	}
 	if ref, err := ParseTargetRef(trimmed); err == nil && !ref.OpenSSH && ref.Host != "" {
 		normHost := NormalizeHostAddress(ref.Host)
-		if normHost != "" && normHost != ref.Host {
-			return TargetRef{
+		if normHost != "" {
+			norm := TargetRef{
 				User:    ref.User,
 				Host:    normHost,
 				Port:    ref.Port,
 				HasPort: ref.HasPort,
 			}.NormalizedString()
+			if norm != raw {
+				return norm
+			}
+			return ""
 		}
 	}
-	if norm := NormalizeHostAddress(trimmed); norm != "" && norm != trimmed {
+	if norm := NormalizeHostAddress(trimmed); norm != "" && norm != raw {
 		return norm
 	}
 	return ""
@@ -767,7 +838,7 @@ func lookupBySelector(lookup map[string][]string, key string) []string {
 }
 
 func indexAddressLookups(lookup map[string][]string, user, address string, port uint16, nodeID string) {
-	cleanAddr := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(address), "]"), "[")
+	cleanAddr := StripHostBrackets(address)
 	if cleanAddr == "" {
 		return
 	}
@@ -805,7 +876,7 @@ func buildIndexes(cfg *Configuration, rejectAliasConflicts bool) (map[string][]s
 			continue
 		}
 		addLookup(lookup, host.Address, nodeID)
-		cleanHost := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(host.Address), "]"), "[")
+		cleanHost := StripHostBrackets(host.Address)
 		addLookup(lookup, cleanHost, nodeID)
 		canonHost := NormalizeHostAddress(cleanHost)
 		addLookup(lookup, canonHost, nodeID)
@@ -818,6 +889,9 @@ func buildIndexes(cfg *Configuration, rejectAliasConflicts bool) (map[string][]s
 		for _, alias := range host.Alias {
 			if err := addAlias(lookup, aliases, alias, nodeID, rejectAliasConflicts); err != nil {
 				return nil, nil, err
+			}
+			if normAlias := NormalizeHostAddress(alias); normAlias != "" && normAlias != alias {
+				addLookup(lookup, normAlias, nodeID)
 			}
 		}
 		user := normalizedIdentityUser(identity.User)

@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	core "github.com/wentf9/xops-cli/core/ssh"
@@ -52,8 +53,14 @@ func Discover() core.Environment {
 	if userDirectory != "" {
 		environment.KnownHostsFile = filepath.Join(userDirectory, ".ssh", "known_hosts")
 		environment.ResolveKeyPath = func(path string) string {
-			if strings.HasPrefix(path, "~") {
-				return filepath.Join(userDirectory, path[1:])
+			if path == "~" {
+				return userDirectory
+			}
+			if strings.HasPrefix(path, "~/") {
+				return filepath.Join(userDirectory, path[2:])
+			}
+			if runtime.GOOS == "windows" && strings.HasPrefix(path, `~\`) {
+				return filepath.Join(userDirectory, path[2:])
 			}
 			return path
 		}

@@ -114,10 +114,13 @@ func CanonicalizeHost(ctx context.Context, in CanonicalizeInput) (CanonicalizeRe
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := ctx.Err(); err != nil {
+		return CanonicalizeResult{}, err
+	}
 	probeCtx, cancel := context.WithTimeout(ctx, policy.timeout)
 	defer cancel()
 
-	return executeCanonicalizeProbe(probeCtx, resolver, parser, policy, probeTarget, res)
+	return executeCanonicalizeProbe(ctx, probeCtx, resolver, parser, policy, probeTarget, res)
 }
 
 // CanonicalDomainCandidates returns the ordered FQDN candidates considered for host
@@ -170,6 +173,7 @@ func canonicalProviderTier3Options(provider ConfigProvider) *ssh.Options {
 }
 
 func executeCanonicalizeProbe(
+	parentCtx context.Context,
 	probeCtx context.Context,
 	resolver CanonicalResolver,
 	parser *OpenSSHParser,
@@ -177,9 +181,16 @@ func executeCanonicalizeProbe(
 	probeTarget string,
 	res CanonicalizeResult,
 ) (CanonicalizeResult, error) {
+	if parentCtx != nil && parentCtx.Err() != nil {
+		return CanonicalizeResult{}, parentCtx.Err()
+	}
 	trailingDot := strings.HasSuffix(probeTarget, ".")
 	if !trailingDot && len(policy.domains) > 0 {
-		if chosen, ok := probeCanonicalDomains(probeCtx, resolver, probeTarget, policy); ok {
+		chosen, ok, pErr := probeCanonicalDomains(parentCtx, probeCtx, resolver, probeTarget, policy)
+		if pErr != nil {
+			return CanonicalizeResult{}, pErr
+		}
+		if ok {
 			res.CanonicalHost = chosen
 			res.Canonicalized = !strings.EqualFold(chosen, res.OriginalHost)
 			if res.Canonicalized {
@@ -189,18 +200,29 @@ func executeCanonicalizeProbe(
 			}
 			return res, nil
 		}
+		if parentCtx != nil && parentCtx.Err() != nil {
+			return CanonicalizeResult{}, parentCtx.Err()
+		}
 		if !policy.fallbackLocal {
 			return res, fmt.Errorf("%w: %s", ErrCanonicalizeFailed, probeTarget)
 		}
 	}
 
+	if parentCtx != nil && parentCtx.Err() != nil {
+		return CanonicalizeResult{}, parentCtx.Err()
+	}
 	if addrs, err := resolver.LookupHost(probeCtx, probeTarget); err == nil && len(addrs) > 0 {
-		chosen := resolveCanonicalCNAME(probeCtx, resolver, probeTarget, policy.permittedCNAMEs)
+		chosen, cErr := resolveCanonicalCNAME(parentCtx, probeCtx, resolver, probeTarget, policy.permittedCNAMEs)
+		if cErr != nil {
+			return CanonicalizeResult{}, cErr
+		}
 		if !strings.EqualFold(chosen, probeTarget) {
 			res.CanonicalHost = chosen
 			res.Canonicalized = true
 			res.Pass2Options = pass2OpenSSHOptionsWithCanonical(parser, res.OriginalHost, chosen)
 		}
+	} else if parentCtx != nil && parentCtx.Err() != nil {
+		return CanonicalizeResult{}, parentCtx.Err()
 	}
 	return res, nil
 }
@@ -216,7 +238,7 @@ func resolveCanonicalEffectiveInputHost(parser *OpenSSHParser, rawCLI []string, 
 			continue
 		}
 		if expanded, err := ssh.ExpandHostName(trimmed, orig); err == nil {
-			clean := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(expanded), "]"), "[")
+			clean := unwrapExpandedHostName(trimmed, expanded)
 			if clean != "" {
 				return clean
 			}
@@ -231,16 +253,26 @@ func resolveCanonicalEffectiveInputHost(parser *OpenSSHParser, rawCLI []string, 
 	return orig
 }
 
-func probeCanonicalDomains(ctx context.Context, resolver CanonicalResolver, orig string, policy canonicalizePolicy) (string, bool) {
+func probeCanonicalDomains(parentCtx, probeCtx context.Context, resolver CanonicalResolver, orig string, policy canonicalizePolicy) (string, bool, error) {
 	for _, domain := range policy.domains {
+		if parentCtx != nil && parentCtx.Err() != nil {
+			return "", false, parentCtx.Err()
+		}
 		fqdn := orig + "." + domain
-		addrs, err := resolver.LookupHost(ctx, fqdn)
+		addrs, err := resolver.LookupHost(probeCtx, fqdn)
 		if err != nil || len(addrs) == 0 {
+			if parentCtx != nil && parentCtx.Err() != nil {
+				return "", false, parentCtx.Err()
+			}
 			continue
 		}
-		return resolveCanonicalCNAME(ctx, resolver, fqdn, policy.permittedCNAMEs), true
+		chosen, cErr := resolveCanonicalCNAME(parentCtx, probeCtx, resolver, fqdn, policy.permittedCNAMEs)
+		if cErr != nil {
+			return "", false, cErr
+		}
+		return chosen, true, nil
 	}
-	return "", false
+	return "", false, nil
 }
 
 func pass2OpenSSHOptionsWithCanonical(parser *OpenSSHParser, origAlias, canonicalHost string) *ssh.Options {
@@ -273,20 +305,26 @@ func pass2OpenSSHOptions(parser *OpenSSHParser, host string) *ssh.Options {
 	return opts
 }
 
-func resolveCanonicalCNAME(ctx context.Context, resolver CanonicalResolver, host string, rules []cnameRule) string {
-	if len(rules) == 0 {
-		return host
+func resolveCanonicalCNAME(parentCtx, probeCtx context.Context, resolver CanonicalResolver, host string, rules []cnameRule) (string, error) {
+	if parentCtx != nil && parentCtx.Err() != nil {
+		return "", parentCtx.Err()
 	}
-	cname, err := resolver.LookupCNAME(ctx, host)
+	if len(rules) == 0 {
+		return host, nil
+	}
+	cname, err := resolver.LookupCNAME(probeCtx, host)
 	if err != nil {
-		return host
+		if parentCtx != nil && parentCtx.Err() != nil {
+			return "", parentCtx.Err()
+		}
+		return host, nil
 	}
 	normHost := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
 	normCNAME := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(cname)), ".")
 	if normCNAME != "" && normCNAME != normHost && isPermittedCNAME(normHost, normCNAME, rules) {
-		return normCNAME
+		return normCNAME, nil
 	}
-	return host
+	return host, nil
 }
 
 func shouldCanonicalize(host string, policy canonicalizePolicy) bool {
@@ -303,7 +341,7 @@ func shouldCanonicalize(host string, policy canonicalizePolicy) bool {
 }
 
 func isIPOrLocalhost(host string) bool {
-	trimmed := strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+	trimmed := StripHostBrackets(host)
 	if _, err := netip.ParseAddr(trimmed); err == nil {
 		return true
 	}
@@ -413,33 +451,27 @@ func (s *cliCanonicalTracker) applyDirective(policy *canonicalizePolicy, key, v 
 		s.applyProxyDirective(policy, lookupKey, v)
 	case ssh.OptionCanonicalizeHostname:
 		if !s.seenMode {
-			s.seenMode = true
-			policy.setMode(v)
+			s.seenMode = policy.setMode(v)
 		}
 	case ssh.OptionCanonicalDomains:
 		if !s.seenDomains {
-			s.seenDomains = true
-			policy.setDomains(v)
+			s.seenDomains = policy.setDomains(v)
 		}
 	case ssh.OptionCanonicalizeMaxDots:
 		if !s.seenMaxDots {
-			s.seenMaxDots = true
-			policy.setMaxDots(v)
+			s.seenMaxDots = policy.setMaxDots(v)
 		}
 	case ssh.OptionCanonicalizeFallbackLocal:
 		if !s.seenFallbackLocal {
-			s.seenFallbackLocal = true
-			policy.setFallbackLocal(v)
+			s.seenFallbackLocal = policy.setFallbackLocal(v)
 		}
 	case ssh.OptionCanonicalizePermittedCNAMEs:
 		if !s.seenPermittedCNAME {
-			s.seenPermittedCNAME = true
-			policy.setPermittedCNAMEs(v)
+			s.seenPermittedCNAME = policy.setPermittedCNAMEs(v)
 		}
 	case ssh.OptionConnectTimeout:
 		if !s.seenTimeout {
-			s.seenTimeout = true
-			policy.setTimeoutSeconds(v)
+			s.seenTimeout = policy.setTimeoutSeconds(v)
 		}
 	}
 }
@@ -492,41 +524,79 @@ func (p *canonicalizePolicy) setProxyCommand(v string) {
 	p.hasProxyCommand = !strings.EqualFold(strings.TrimSpace(v), "none")
 }
 
-func (p *canonicalizePolicy) setMode(v string) {
+func (p *canonicalizePolicy) setMode(v string) bool {
 	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "yes", "always", "no":
-		p.mode = strings.ToLower(strings.TrimSpace(v))
+	case "yes", "true":
+		p.mode = "yes"
+		return true
+	case "always":
+		p.mode = "always"
+		return true
+	case "no", "false":
+		p.mode = "no"
+		return true
+	default:
+		return false
 	}
 }
 
-func (p *canonicalizePolicy) setDomains(v string) {
-	if strings.EqualFold(strings.TrimSpace(v), "none") {
-		p.domains = nil
-		return
+func (p *canonicalizePolicy) setDomains(v string) bool {
+	if hasControlOrLineSepChar(strings.ReplaceAll(v, "\t", " ")) {
+		return false
 	}
-	fields := strings.Fields(strings.ReplaceAll(v, ",", " "))
+	trimmed := strings.TrimSpace(v)
+	if trimmed == "" {
+		return false
+	}
+	fields := strings.Fields(strings.ReplaceAll(trimmed, ",", " "))
+	if len(fields) == 0 {
+		return false
+	}
+	if len(fields) == 1 && strings.EqualFold(fields[0], "none") {
+		p.domains = nil
+		return true
+	}
 	var out []string
 	for _, f := range fields {
-		clean := strings.Trim(strings.TrimSpace(f), ".")
-		if clean != "" {
+		if strings.EqualFold(f, "none") {
+			return false
+		}
+		clean := strings.ToLower(strings.TrimSuffix(f, "."))
+		if !ssh.IsValidCanonicalDomain(clean) {
+			return false
+		}
+		if !slices.Contains(out, clean) {
 			out = append(out, clean)
 		}
 	}
-	p.domains = out
-}
-
-func (p *canonicalizePolicy) setMaxDots(v string) {
-	if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
-		p.maxDots = n
+	if len(out) == 0 {
+		return false
 	}
+	p.domains = out
+	return true
 }
 
-func (p *canonicalizePolicy) setFallbackLocal(v string) {
+func (p *canonicalizePolicy) setMaxDots(v string) bool {
+	if hasControlOrLineSepChar(v) {
+		return false
+	}
+	if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 && n <= ssh.MaxCanonicalizeMaxDots {
+		p.maxDots = n
+		return true
+	}
+	return false
+}
+
+func (p *canonicalizePolicy) setFallbackLocal(v string) bool {
 	switch strings.ToLower(strings.TrimSpace(v)) {
 	case "yes", "true":
 		p.fallbackLocal = true
+		return true
 	case "no", "false":
 		p.fallbackLocal = false
+		return true
+	default:
+		return false
 	}
 }
 
@@ -551,13 +621,17 @@ func normalizeCanonicalPatternList(list string) string {
 	return strings.Join(cleaned, ",")
 }
 
-func (p *canonicalizePolicy) setPermittedCNAMEs(v string) {
-	if strings.EqualFold(strings.TrimSpace(v), "none") {
+func (p *canonicalizePolicy) setPermittedCNAMEs(v string) bool {
+	trimmed := strings.TrimSpace(v)
+	if trimmed == "" {
+		return false
+	}
+	if strings.EqualFold(trimmed, "none") {
 		p.permittedCNAMEs = nil
-		return
+		return true
 	}
 	var rules []cnameRule
-	for _, token := range strings.Fields(v) {
+	for _, token := range strings.Fields(trimmed) {
 		srcList, dstList, ok := strings.Cut(token, ":")
 		if !ok || strings.TrimSpace(srcList) == "" || strings.TrimSpace(dstList) == "" {
 			continue
@@ -572,7 +646,11 @@ func (p *canonicalizePolicy) setPermittedCNAMEs(v string) {
 			targetPatternList: dstPatternList,
 		})
 	}
+	if len(rules) == 0 {
+		return false
+	}
 	p.permittedCNAMEs = rules
+	return true
 }
 
 var canonicalTimeoutUnitSeconds = map[byte]uint64{
@@ -635,10 +713,12 @@ func parseCanonicalConnectTimeout(raw string) (time.Duration, bool) {
 	return time.Duration(totalSeconds) * time.Second, true
 }
 
-func (p *canonicalizePolicy) setTimeoutSeconds(v string) {
+func (p *canonicalizePolicy) setTimeoutSeconds(v string) bool {
 	if d, ok := parseCanonicalConnectTimeout(v); ok {
 		p.timeout = d
+		return true
 	}
+	return false
 }
 
 func splitCanonicalOptionKV(raw string) (string, string, bool) {

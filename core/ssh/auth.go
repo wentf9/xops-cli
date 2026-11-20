@@ -380,7 +380,7 @@ func (t *offeredPubKeyTracker) filterAgentSigners(signersFn func() ([]ssh.Signer
 //   - "" or "SSH_AUTH_SOCK" returns (strings.TrimSpace(env.AgentSocket), false, nil).
 //   - "$VAR", "${VAR}", "~", and percent tokens are expanded via env and target.
 func ResolveIdentityAgent(spec string, env Environment, target TargetContext) (socket string, disabled bool, err error) {
-	if hasASCIIControlChar(spec) {
+	if hasControlOrLineSepChar(spec) {
 		return "", false, fmt.Errorf("invalid IdentityAgent %q: contains invalid ASCII control character", spec)
 	}
 	trimmed := strings.TrimSpace(spec)
@@ -388,7 +388,7 @@ func ResolveIdentityAgent(spec string, env Environment, target TargetContext) (s
 		return "", true, nil
 	}
 	if trimmed == "" || trimmed == "SSH_AUTH_SOCK" {
-		if hasASCIIControlChar(env.AgentSocket) {
+		if hasControlOrLineSepChar(env.AgentSocket) {
 			return "", false, fmt.Errorf("invalid SSH_AUTH_SOCK %q: contains invalid ASCII control character", env.AgentSocket)
 		}
 		trimmedEnv := strings.TrimSpace(env.AgentSocket)
@@ -405,7 +405,7 @@ func ResolveIdentityAgent(spec string, env Environment, target TargetContext) (s
 }
 
 func expandAgentSocketPath(rawPath string, env Environment, target TargetContext, kind string) (string, error) {
-	if hasASCIIControlChar(rawPath) {
+	if hasControlOrLineSepChar(rawPath) {
 		return "", fmt.Errorf("invalid %s %q: contains invalid ASCII control character", kind, rawPath)
 	}
 	trimmed := strings.TrimSpace(rawPath)
@@ -422,52 +422,32 @@ func expandAgentSocketPath(rawPath string, env Environment, target TargetContext
 		if !ok {
 			return "", fmt.Errorf("invalid environment variable expansion: env var $%s has no value", varName)
 		}
-		if hasASCIIControlChar(val) {
+		if hasControlOrLineSepChar(val) {
 			return "", fmt.Errorf("invalid %s %q: expanded value contains ASCII control character", kind, rawPath)
 		}
 		val = strings.TrimSpace(val)
 		if val == "" {
 			return "", fmt.Errorf("invalid environment variable expansion: env var $%s has no value", varName)
 		}
-		return normalizeExpandedAgentSocketPath(val, env), nil
+		return normalizeExpandedAgentSocketPathWithTilde(val, env, false), nil
 	}
 
-	expanded := trimmed
-	if strings.Contains(expanded, "${") {
-		var err error
-		expanded, err = expandEnvironmentVariables(expanded, env)
-		if err != nil {
-			return "", err
-		}
+	expanded, err := expandPathTokensSinglePass(trimmed, env, target, pathExpandOptions{
+		kind:          kind,
+		tildeFallback: env.ResolveKeyPath,
+		expandTilde:   true,
+	})
+	if err != nil {
+		return "", err
 	}
-	if strings.HasPrefix(expanded, "~") {
-		if env.HomeDir != "" {
-			var err error
-			expanded, err = expandTilde(expanded, env.HomeDir)
-			if err != nil {
-				return "", err
-			}
-		} else if env.ResolveKeyPath != nil {
-			expanded = env.ResolveKeyPath(expanded)
-		} else {
-			return "", errors.New("cannot expand '~': home directory is not set")
-		}
-	}
-	if strings.Contains(expanded, "%") {
-		var err error
-		expanded, err = expandPercentTokens(expanded, env, target)
-		if err != nil {
-			return "", err
-		}
-	}
-	if hasASCIIControlChar(expanded) {
+	if hasControlOrLineSepChar(expanded) {
 		return "", fmt.Errorf("invalid %s %q: expanded value contains ASCII control character", kind, rawPath)
 	}
 	expanded = strings.TrimSpace(expanded)
 	if expanded == "" {
 		return "", fmt.Errorf("invalid %s %q: expanded path is empty", kind, rawPath)
 	}
-	return normalizeExpandedAgentSocketPath(expanded, env), nil
+	return normalizeExpandedAgentSocketPathWithTilde(expanded, env, false), nil
 }
 
 func isAgentPathSlash(c byte) bool {
@@ -496,10 +476,16 @@ func normalizeWindowsNamedPipePath(path string) (string, bool) {
 }
 
 func normalizeExpandedAgentSocketPath(path string, env Environment) string {
+	return normalizeExpandedAgentSocketPathWithTilde(path, env, true)
+}
+
+func normalizeExpandedAgentSocketPathWithTilde(path string, env Environment, expandTildeViaResolver bool) string {
 	if pipePath, ok := normalizeWindowsNamedPipePath(path); ok {
 		return pipePath
 	}
-	path = resolveKeyPath(path, env.ResolveKeyPath)
+	if expandTildeViaResolver || !strings.HasPrefix(path, "~") {
+		path = resolveKeyPath(path, env.ResolveKeyPath)
+	}
 	if pipePath, ok := normalizeWindowsNamedPipePath(path); ok {
 		return pipePath
 	}
@@ -555,6 +541,7 @@ type autoSecretProvider struct {
 	nodeID             string
 	user               string
 	host               string
+	baseHost           string
 	port               int
 	versionToken       string
 	resolver           SecretResolver
@@ -602,6 +589,7 @@ func (p *autoSecretProvider) resolveOrPromptAttempt(req SecretRequest, retry boo
 	req.NodeID = p.nodeID
 	req.User = p.user
 	req.Host = p.host
+	req.BaseHost = p.baseHost
 	req.Port = p.port
 	req.VersionToken = p.versionToken
 
@@ -1039,6 +1027,7 @@ type AutoAuthOptions struct {
 	NodeID                    string
 	User                      string
 	Host                      string
+	BaseHost                  string
 	Port                      int
 	VersionToken              string
 	Resolver                  SecretResolver
@@ -1216,6 +1205,7 @@ func buildAutoAuthPlan(ctx context.Context, opts AutoAuthOptions, first ...ssh.A
 		nodeID:             opts.NodeID,
 		user:               opts.User,
 		host:               opts.Host,
+		baseHost:           opts.BaseHost,
 		port:               opts.Port,
 		versionToken:       opts.VersionToken,
 		resolver:           opts.Resolver,
@@ -1264,41 +1254,38 @@ func buildAutoAuthPlan(ctx context.Context, opts AutoAuthOptions, first ...ssh.A
 	}
 }
 
+// ExpandIdentityPath expands an IdentityFile or CertificateFile path in a single
+// pass using env and target, enforcing control-character rejection, post-expansion
+// trimming, single-pass tilde handling, and fail-closed error semantics.
+// Returns "", nil for empty or "none" values.
+func ExpandIdentityPath(rawPath string, env Environment, target TargetContext) (string, error) {
+	return expandIdentityKeyPath(rawPath, env, target, env.ResolveKeyPath)
+}
+
 func expandIdentityKeyPath(rawPath string, env Environment, target TargetContext, resolve func(string) string) (string, error) {
+	if hasControlOrLineSepChar(rawPath) {
+		return "", fmt.Errorf("invalid key path %q: contains invalid control character", rawPath)
+	}
 	trimmed := strings.TrimSpace(rawPath)
-	if trimmed == "" || strings.EqualFold(trimmed, "none") {
+	if trimmed == "" || IsNoneValue(trimmed) {
 		return "", nil
 	}
-	path := trimmed
-	if strings.Contains(path, "${") {
-		var err error
-		path, err = expandEnvironmentVariables(path, env)
-		if err != nil {
-			return "", err
-		}
+	path, err := expandPathTokensSinglePass(trimmed, env, target, pathExpandOptions{
+		kind:          "IdentityFile",
+		tildeFallback: resolve,
+		expandTilde:   true,
+	})
+	if err != nil {
+		return "", err
 	}
-	if strings.HasPrefix(path, "~") {
-		if env.HomeDir != "" {
-			var err error
-			path, err = expandTilde(path, env.HomeDir)
-			if err != nil {
-				return "", err
-			}
-		} else if resolve != nil {
-			path = resolve(path)
-		} else {
-			return "", errors.New("cannot expand '~': home directory is not set")
-		}
+	if hasControlOrLineSepChar(path) {
+		return "", fmt.Errorf("invalid key path %q: expanded value contains invalid control character", rawPath)
 	}
-	if strings.Contains(path, "%") {
-		var err error
-		path, err = expandPercentTokens(path, env, target)
-		if err != nil {
-			return "", err
-		}
+	path = strings.TrimSpace(path)
+	if !strings.HasPrefix(path, "~") {
+		path = resolveKeyPath(path, resolve)
 	}
-	path = resolveKeyPath(path, resolve)
-	if path == "" || strings.EqualFold(path, "none") {
+	if path == "" || IsNoneValue(path) {
 		return "", nil
 	}
 	return filepath.Clean(filepath.FromSlash(path)), nil
@@ -1327,15 +1314,19 @@ func collectExplicitKeyCandidates(
 	seen := make(map[string]struct{}, len(rawEntries))
 	hasExplicit := false
 	for _, raw := range rawEntries {
+		if hasControlOrLineSepChar(raw) {
+			l.Debugf("Failed to expand identity key path %q: contains invalid control character", raw)
+			continue
+		}
 		trimmed := strings.TrimSpace(raw)
 		if trimmed == "" {
 			continue
 		}
 		hasExplicit = true
-		if strings.EqualFold(trimmed, "none") {
+		if IsNoneValue(trimmed) {
 			continue
 		}
-		expanded, err := expandIdentityKeyPath(trimmed, env, target, resolve)
+		expanded, err := expandIdentityKeyPath(raw, env, target, resolve)
 		if err != nil {
 			l.Debugf("Failed to expand identity key path %q: %v", raw, err)
 			continue

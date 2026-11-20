@@ -203,7 +203,7 @@ func knownHostsTarget(cfg *ClientConfig) TargetContext {
 		Port:         cfg.Port,
 		User:         cfg.User,
 		OriginalHost: effectiveOriginalHost(cfg.OriginalHost, cfg.NodeID),
-		JumpHost:     cfg.ProxyJump,
+		JumpHost:     NormalizeProxyJump(cfg.ProxyJump),
 	}
 }
 

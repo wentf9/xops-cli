@@ -31,25 +31,24 @@ import (
 
 type ScpOptions struct {
 	SshOptions
-	Recursive         bool
-	Quiet             bool
-	Verbose           bool
-	Force             bool
-	NoOverwrite       bool
-	TaskCount         int
-	ThreadCount       int
-	Source            string
-	Dest              string
-	HostFile          string
-	Tag               string
-	Exclude           []string
-	sshLogLevel       int
-	verboseSeen       bool
-	verboseLevel      int
-	diagnostics       corelog.DiagnosticObserver
-	canonicalMu       sync.Mutex
-	canonicalCache    map[string]config.CanonicalizeResult
-	canonicalResolver config.CanonicalResolver
+	Recursive      bool
+	Quiet          bool
+	Verbose        bool
+	Force          bool
+	NoOverwrite    bool
+	TaskCount      int
+	ThreadCount    int
+	Source         string
+	Dest           string
+	HostFile       string
+	Tag            string
+	Exclude        []string
+	sshLogLevel    int
+	verboseSeen    bool
+	verboseLevel   int
+	diagnostics    corelog.DiagnosticObserver
+	canonicalMu    sync.Mutex
+	canonicalCache map[string]config.CanonicalizeResult
 }
 
 func NewScpOptions() *ScpOptions {
@@ -986,13 +985,15 @@ func (o *ScpOptions) resolveUserAndPort(path PathInfo) (user string, hasUser boo
 	return user, hasUser, port, hasPort
 }
 
-func (o *ScpOptions) appendOverriddenExcludeHost(info *cmdutils.ExcludeTargetInfo, expandHost string) {
-	if o == nil || info == nil {
-		return
+func (o *ScpOptions) overriddenExcludeHost(expandHost string) string {
+	if o == nil {
+		return ""
 	}
-	if hostNameOverride, err := o.effectiveHostNameForHost(expandHost); err == nil && hostNameOverride != "" && !slices.Contains(info.UnmanagedHosts, hostNameOverride) {
-		info.UnmanagedHosts = append(info.UnmanagedHosts, hostNameOverride)
+	hostNameOverride, err := o.effectiveHostNameForHost(expandHost)
+	if err != nil {
+		return ""
 	}
+	return hostNameOverride
 }
 
 func (o *ScpOptions) excludeTargetInfoForPath(provider config.ConfigProvider, rawHost string, canonAddr PathInfo) (cmdutils.ExcludeTargetInfo, error) {
@@ -1000,7 +1001,7 @@ func (o *ScpOptions) excludeTargetInfoForPath(provider config.ConfigProvider, ra
 		return cmdutils.ExcludeTargetInfo{}, err
 	}
 	user, _, port, _ := o.resolveUserAndPort(canonAddr)
-	info := cmdutils.ExcludeTargetInfo{
+	in := cmdutils.ExcludeTargetBuildInput{
 		User:           user,
 		Port:           port,
 		UnmanagedHosts: []string{rawHost, canonAddr.Host, canonAddr.OriginalHost},
@@ -1013,44 +1014,42 @@ func (o *ScpOptions) excludeTargetInfoForPath(provider config.ConfigProvider, ra
 		fallbackExpandHost = config.UnwrapOpenSSHSelector(rawHost)
 	}
 	if provider == nil {
-		o.appendOverriddenExcludeHost(&info, fallbackExpandHost)
-		return info, nil
+		in.HostNameOverride = o.overriddenExcludeHost(fallbackExpandHost)
+		return cmdutils.BuildExcludeTargetInfo(in), nil
 	}
 	if target, tErr := o.resolveTargetForPath(canonAddr); tErr == nil && target.Selector != "" {
 		resolved, rErr := config.ResolveTarget(provider, target)
 		if rErr != nil {
-			return info, fmt.Errorf("resolve excluded host %q: %w", canonAddr.Host, rErr)
+			return cmdutils.BuildExcludeTargetInfo(in), fmt.Errorf("resolve excluded host %q: %w", canonAddr.Host, rErr)
 		}
-		info.NodeID = resolved.NodeID
-		info.MatchedNodeID = resolved.MatchedNodeID
-		info.BaseNodeID = resolved.BaseNodeID
-		info.OpenSSHAlias = resolved.OpenSSHAlias
-		info.CanonicalHost = resolved.CanonicalHost
+		in.NodeID = resolved.NodeID
+		in.MatchedNodeID = resolved.MatchedNodeID
+		in.BaseNodeID = resolved.BaseNodeID
+		in.OpenSSHAlias = resolved.OpenSSHAlias
+		in.CanonicalHost = resolved.CanonicalHost
+		in.ResolvedHost = resolved.Host
 		if resolved.User != "" {
-			info.User = resolved.User
+			in.User = resolved.User
 		}
 		if resolved.Port > 0 {
-			info.Port = resolved.Port
-		}
-		if isResolvedSavedNode(resolved) && resolved.Host != "" && !slices.Contains(info.UnmanagedHosts, resolved.Host) {
-			info.UnmanagedHosts = append(info.UnmanagedHosts, resolved.Host)
+			in.Port = resolved.Port
 		}
 		_, expandHost := resolveTargetOriginalAndExpandHosts(canonAddr.OriginalHost != "", canonAddr.OriginalHost, target.Selector, resolved, true)
 		if expandHost == "" {
 			expandHost = fallbackExpandHost
 		}
-		o.appendOverriddenExcludeHost(&info, expandHost)
-		return info, nil
+		in.HostNameOverride = o.overriddenExcludeHost(expandHost)
+		return cmdutils.BuildExcludeTargetInfo(in), nil
 	}
 	nid, resolveErr := provider.ResolveSelector(canonAddr.Host)
 	if resolveErr != nil {
-		return info, fmt.Errorf("resolve excluded host %q: %w", canonAddr.Host, resolveErr)
+		return cmdutils.BuildExcludeTargetInfo(in), fmt.Errorf("resolve excluded host %q: %w", canonAddr.Host, resolveErr)
 	}
 	if nid != "" {
-		info.NodeID = nid
+		in.NodeID = nid
 	}
-	o.appendOverriddenExcludeHost(&info, fallbackExpandHost)
-	return info, nil
+	in.HostNameOverride = o.overriddenExcludeHost(fallbackExpandHost)
+	return cmdutils.BuildExcludeTargetInfo(in), nil
 }
 
 func (o *ScpOptions) executeTransfer(ctx context.Context, label string, addr PathInfo, specificPassword string, provider config.ConfigProvider, connector *ssh.Connector) (err error) {

@@ -100,6 +100,7 @@ func TestProxyEchoesClientInitiatedChannelClose(t *testing.T) {
 	if channel := binary.BigEndian.Uint32(packet[1:5]); channel != pc.clientCh {
 		t.Fatalf("close echo addressed channel %d, want %d", channel, pc.clientCh)
 	}
+	ps.closeWG.Wait()
 	if !pc.remoteCh.(*stubRemoteChannel).closed.Load() {
 		t.Fatal("handleClose did not close the remote channel")
 	}

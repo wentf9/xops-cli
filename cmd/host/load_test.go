@@ -102,3 +102,45 @@ func TestPass10_M1_LoadRejectsReservedOpenSSHAliases(t *testing.T) {
 		}
 	}
 }
+
+func TestRound7_P2_9_HostCommandsRejectOpenSSHSelectorsWhileCSVPreserves(t *testing.T) {
+	t.Parallel()
+
+	for _, bad := range []string{"openssh:web", "OPENSSH:prod", "openssh:user@web", "  openssh:web  "} {
+		if _, err := normalizeImportAddress(utils.HostInfo{Host: bad, Port: 22, User: "ops"}); err == nil {
+			t.Errorf("normalizeImportAddress(%q) unexpectedly succeeded", bad)
+		}
+		var addAliases []string
+		addAddr, addUser, addPort := bad, "", uint16(22)
+		if err := applyAddTargetArgs(nil, &addAliases, &addAddr, &addUser, &addPort, false); err == nil {
+			t.Errorf("applyAddTargetArgs(--address %q) unexpectedly succeeded", bad)
+		}
+		addAliases, addAddr, addUser, addPort = nil, "", "", 22
+		if err := applyAddTargetArgs([]string{bad}, &addAliases, &addAddr, &addUser, &addPort, false); err == nil {
+			t.Errorf("applyAddTargetArgs(arg %q) unexpectedly succeeded", bad)
+		}
+		editFlagsVal := &editFlags{address: bad, port: 22}
+		if err := applyEditTargetArgs(nil, editFlagsVal, false); err == nil {
+			t.Errorf("applyEditTargetArgs(--address %q) unexpectedly succeeded", bad)
+		}
+		editFlagsPos := &editFlags{port: 22}
+		if err := applyEditTargetArgs([]string{bad}, editFlagsPos, false); err == nil {
+			t.Errorf("applyEditTargetArgs(arg %q) unexpectedly succeeded", bad)
+		}
+	}
+	var addAliases []string
+	addAddr, addUser, addPort := "", "", uint16(22)
+	if err := applyAddTargetArgs([]string{"user@openssh:web"}, &addAliases, &addAddr, &addUser, &addPort, false); err == nil {
+		t.Errorf("applyAddTargetArgs(user@openssh:web) unexpectedly succeeded")
+	}
+
+	// Ensure utils.ReadCSVFile still permits openssh: rows for exec/scp batch inventory.
+	csvPath := filepath.Join(t.TempDir(), "hosts.csv")
+	if err := os.WriteFile(csvPath, []byte("host,port,alias,user\nopenssh:web,22,,ops\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	rows, err := utils.ReadCSVFile(csvPath)
+	if err != nil || len(rows) != 1 || rows[0].Host != "openssh:web" {
+		t.Fatalf("utils.ReadCSVFile(openssh:web) = (%+v, %v), want preserved openssh:web row", rows, err)
+	}
+}

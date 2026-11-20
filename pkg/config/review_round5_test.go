@@ -41,6 +41,7 @@ func TestRound5_P1_3_VirtualCanonicalTargetZeroPendingAndZeroProviderMutation(t 
 		"  Port 2202",
 		"",
 		"Host *.corp.example.com",
+		"  User direct-user",
 		"  HostName 10.50.0.10",
 		"  ServerAliveInterval 31",
 	}, "\n") + "\n"
@@ -94,7 +95,7 @@ func TestRound5_P1_3_VirtualCanonicalTargetZeroPendingAndZeroProviderMutation(t 
 	if err != nil {
 		t.Fatalf("ResolveTarget(%q): %v", canonTarget, err)
 	}
-	if resDirect.Host != "10.50.0.10" || resDirect.User == "alice" || resDirect.OpenSSHAlias != "" || resDirect.CanonicalHost != "" {
+	if resDirect.Host != "10.50.0.10" || resDirect.User != "direct-user" || resDirect.OpenSSHAlias != "" || resDirect.CanonicalHost != "" {
 		t.Fatalf("ResolveTarget(%q) hijacked by prior PrepareNodeContext: %+v", canonTarget, resDirect)
 	}
 }
@@ -344,13 +345,29 @@ func TestRound5_P2_11_P3_8_P3_9_HostNameNoneCanonicalKeyAndProxyJumpNormalize(t 
 		t.Fatalf("HostName=none did not behave literally: %+v", canonRes)
 	}
 
-	// P3-9: baseJump="none,none" or " , " normalizes resolved ProxyJump to "".
+	// P3-9: baseJump="none,none" or " , " normalizes resolved ProxyJump to "" across
+	// both OpenSSH virtual targets and saved nodes (exercising normalizeTargetJump directly).
 	res, err := ResolveTarget(prov, ConnectionTarget{Selector: OpenSSHNodePrefix + "app.corp.example.com"})
 	if err != nil {
 		t.Fatalf("ResolveTarget failed: %v", err)
 	}
 	if res.ProxyJump != "" {
 		t.Fatalf("ResolveTarget ProxyJump = %q, want empty when baseJump is disabled", res.ProxyJump)
+	}
+	savedJumpCfg := cloneConfiguration(nil)
+	savedJumpCfg.Hosts.Set("hj", models.Host{Address: "10.50.0.99", Port: 22})
+	savedJumpCfg.Identities.Set("ij", models.Identity{User: "ops"})
+	savedJumpCfg.Nodes.Set("saved-none-jump", models.Node{HostRef: "hj", IdentityRef: "ij", ProxyJump: "none, ,none"})
+	savedJumpProv := NewProviderWithoutOpenSSH(savedJumpCfg)
+	savedRes, err := ResolveTarget(savedJumpProv, ConnectionTarget{Selector: "saved-none-jump"})
+	if err != nil {
+		t.Fatalf("ResolveTarget(saved-none-jump) failed: %v", err)
+	}
+	if savedRes.ProxyJump != "" {
+		t.Fatalf("saved-none-jump ProxyJump = %q, want empty", savedRes.ProxyJump)
+	}
+	if got := normalizeTargetJump(savedJumpProv, " , ", ConnectionTarget{}); got != "" {
+		t.Fatalf("normalizeTargetJump(\" , \") = %q, want empty", got)
 	}
 }
 

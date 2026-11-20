@@ -72,16 +72,27 @@ func GetCurrentUser() (string, error) {
 	return currentUser.Username, nil
 }
 
+func defaultUserHomeDir() (string, error) {
+	if homeDir, err := os.UserHomeDir(); err == nil && strings.TrimSpace(homeDir) != "" {
+		return homeDir, nil
+	}
+	currUser, err := user.Current()
+	if err != nil {
+		return "", fmt.Errorf("get current user failed: %w", err)
+	}
+	return currUser.HomeDir, nil
+}
+
 // GetConfigFilePath 获取默认配置与密钥路径
 func GetConfigFilePath() (configPath, keyPath string, err error) {
 	if cfgDir := os.Getenv("XOPS_CONFIG_DIR"); cfgDir != "" {
 		return filepath.Join(cfgDir, ConfigFileName), filepath.Join(cfgDir, ConfigKeyName), nil
 	}
-	currUser, err := user.Current()
+	homeDir, err := defaultUserHomeDir()
 	if err != nil {
-		return "", "", fmt.Errorf("get current user failed: %w", err)
+		return "", "", err
 	}
-	return filepath.Join(currUser.HomeDir, ".xops", ConfigFileName), filepath.Join(currUser.HomeDir, ".xops", ConfigKeyName), nil
+	return filepath.Join(homeDir, ".xops", ConfigFileName), filepath.Join(homeDir, ".xops", ConfigKeyName), nil
 }
 
 // GetPasswordFilePath 获取默认密码本文件路径
@@ -89,11 +100,11 @@ func GetPasswordFilePath() (string, error) {
 	if cfgDir := os.Getenv("XOPS_CONFIG_DIR"); cfgDir != "" {
 		return filepath.Join(cfgDir, PasswordFileName), nil
 	}
-	currUser, err := user.Current()
+	homeDir, err := defaultUserHomeDir()
 	if err != nil {
-		return "", fmt.Errorf("get current user failed: %w", err)
+		return "", err
 	}
-	return filepath.Join(currUser.HomeDir, ".xops", PasswordFileName), nil
+	return filepath.Join(homeDir, ".xops", PasswordFileName), nil
 }
 
 // AskConfirmation 弹出提示，获取用户确认

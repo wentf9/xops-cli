@@ -313,6 +313,81 @@ func TestCredentialVersionBindsHopKeyPathsAndOrder(t *testing.T) {
 	}
 }
 
+func TestRound7_P3_4_MCPBindingNormalizesDisabledProxyJumpAndSkipsTildeVarRescan(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "id_ed25519")
+	if err := os.WriteFile(keyPath, []byte("k"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	noneCertPath := filepath.Join(dir, "none-cert.pub")
+	if err := os.WriteFile(noneCertPath, []byte("phantom"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Remove(noneCertPath) }()
+
+	cfgNone := credentialBindingConfig()
+	nodeNone, _ := cfgNone.Nodes.Get("node")
+	nodeNone.ProxyJump = "none"
+	nodeNone.SSHOptions = ssh.MustOptions(
+		ssh.OptionIdentityFile, keyPath,
+		ssh.OptionCertificateFile, filepath.Join(dir, "%j-cert.pub"),
+	)
+	cfgNone.Nodes.Set("node", nodeNone)
+
+	cfgEmpty := credentialBindingConfig()
+	nodeEmpty, _ := cfgEmpty.Nodes.Get("node")
+	nodeEmpty.ProxyJump = " , "
+	nodeEmpty.SSHOptions = nodeNone.SSHOptions.Clone()
+	cfgEmpty.Nodes.Set("node", nodeEmpty)
+
+	admNone := persistedAdmission(t, t.Context(), credentialBindingHost(cfgNone, false))
+	admEmpty := persistedAdmission(t, t.Context(), credentialBindingHost(cfgEmpty, false))
+	if admNone.Snapshot.Targets["node"].Version != admEmpty.Snapshot.Targets["node"].Version {
+		t.Fatalf("proxy_jump:none vs ' , ' produced differing credential versions: %q vs %q",
+			admNone.Snapshot.Targets["node"].Version, admEmpty.Snapshot.Targets["node"].Version)
+	}
+
+	// Verify buildHopBindingTargets filters disabled jumps and normalizes mixed jumps.
+	targets := buildHopBindingTargets(ssh.Environment{}, ssh.ConnectionConfig{
+		Address:              "192.0.2.1",
+		Port:                 22,
+		User:                 "ops",
+		ProxyJump:            " , ",
+		OriginalProxyJump:    "none,bastion,",
+		HasOriginalProxyJump: true,
+	}, keyPath, "none")
+	for _, tgt := range targets {
+		if tgt.JumpHost == "none" || tgt.JumpHost == " , " || tgt.JumpHost == "none,bastion," {
+			t.Fatalf("unexpected unnormalized JumpHost in targets: %+v", targets)
+		}
+	}
+	if len(targets) != 2 || targets[0].JumpHost != "" || targets[1].JumpHost != "bastion" {
+		t.Fatalf("unexpected normalized binding targets: %+v", targets)
+	}
+
+	// Verify expandMCPBindingPath does NOT let ResolveKeyPath re-expand '~' from ${VAR}.
+	env := ssh.Environment{
+		HomeDir: "/home/tester",
+		LookupEnv: func(k string) (string, bool) {
+			if k == "CERT_DIR" {
+				return "~/from-env", true
+			}
+			return "", false
+		},
+		ResolveKeyPath: func(p string) string {
+			if after, ok := strings.CutPrefix(p, "~/"); ok {
+				return filepath.Join("/home/tester", after)
+			}
+			return p
+		},
+	}
+	gotExpanded := expandMCPBindingPath("${CERT_DIR}/cert.pub", env, ssh.TargetContext{Host: "192.0.2.1"})
+	wantLiteral := filepath.Clean(filepath.FromSlash("~/from-env/cert.pub"))
+	if gotExpanded != wantLiteral {
+		t.Fatalf("expandMCPBindingPath(${CERT_DIR}/cert.pub) = %q, want %q (must not re-expand ~)", gotExpanded, wantLiteral)
+	}
+}
+
 func writeTestUserCertForBinding(t *testing.T, path string, serial uint64, validBefore uint64) {
 	t.Helper()
 	caPub, caPriv, err := ed25519.GenerateKey(rand.Reader)

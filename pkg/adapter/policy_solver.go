@@ -258,6 +258,7 @@ func solveProxyPrecedence(
 		return maskedT2, maskedT3, maskedT4, false
 	}
 	if !snapshot.Provenance.IsUnpersistedOpenSSH() {
+		maskedT2 = cloneWithoutProxyCommand(t2)
 		maskedT3 = cloneWithoutProxyCommand(t3)
 		maskedT4 = cloneWithoutProxyCommand(t4)
 		return maskedT2, maskedT3, maskedT4, classifyProxyCommand(tier1Opts) == proxyActive
@@ -271,10 +272,10 @@ func solveProxyPrecedence(
 		case proxyActive:
 			return maskedT2, maskedT3, maskedT4, true
 		case proxyDisabled:
-			return maskedT2, maskedT3, maskedT4, false
+			return maskedT2, maskedT3, cloneWithoutProxyCommand(t4), false
 		}
 	}
-	return maskedT2, maskedT3, maskedT4, false
+	return maskedT2, maskedT3, cloneWithoutProxyCommand(t4), false
 }
 
 func (a *SSHAdapter) finalizeEffectiveOptions(
@@ -292,6 +293,11 @@ func (a *SSHAdapter) finalizeEffectiveOptions(
 		return nil, nil
 	}
 	a.applyOptionRestrictions(merged)
+	if merged.LiteralControlPath {
+		if _, err := (&ssh.ControlConfig{Path: merged.ControlPath(), LiteralPath: true}).ResolvePath(ssh.Environment{}, ssh.TargetContext{}); err != nil {
+			return nil, fmt.Errorf("%w: %w", ssh.ErrSSHOptionsValidation, err)
+		}
+	}
 	if a.controlProxyMode {
 		merged.Delete(ssh.OptionProxyCommand)
 	}
@@ -340,10 +346,7 @@ func (p effectivePolicy) controlTargetContext(nodeID string) ssh.TargetContext {
 			origHost = cleanOrig
 		}
 	}
-	host := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(p.snapshot.Host.Address), "]"), "[")
-	if p.hasTier1Auth && strings.TrimSpace(p.tier1Auth.HostName) != "" {
-		host = strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(p.tier1Auth.HostName), "]"), "[")
-	}
+	host := effectiveSnapshotHost(p.snapshot, p.hasTier1Auth, p.tier1Auth)
 	jumpHost := strings.TrimSpace(p.snapshot.Node.ProxyJump)
 	if !ssh.HasActiveProxyJump(jumpHost) {
 		jumpHost = ""
@@ -612,12 +615,11 @@ func (a *SSHAdapter) resolveSessionOpenSSHMetadata(
 			if alias, canon, ok := resolveScopedSavedOpenSSHAlias(parser, snapshot, t1Orig, t1Canon); ok {
 				return alias, canon
 			}
-			// Allow matching the saved node's own origin when the session echoes the
-			// same alias (with matching or omitted CanonicalHost, e.g. right after
-			// ConfirmNodeContext or in resolveSavedControlSessionLookup), while never
-			// falling back to a different alias's shared side-map entry.
+			// Allow matching the saved node's own origin only when the session echoes
+			// both the same Alias and the same CanonicalHost (case-insensitive),
+			// never falling back when CanonicalHost is omitted for a non-canonicalized session.
 			if !snapOrigin.IsZero() && t1Orig != "" && t1Orig == snapOrigin.Alias &&
-				(t1Canon == "" || strings.EqualFold(t1Canon, snapOrigin.CanonicalHost)) {
+				strings.EqualFold(t1Canon, snapOrigin.CanonicalHost) {
 				return snapOrigin.Alias, snapOrigin.CanonicalHost
 			}
 			return "", ""
@@ -732,8 +734,21 @@ func parseFallbackNodeIDAddressPort(nodeName string) (string, uint16, bool) {
 	if err != nil {
 		return "", 0, false
 	}
-	host = strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(host), "]"), "[")
-	parsedPort, parseErr := strconv.ParseUint(strings.TrimSpace(portText), 10, 16)
+	host = config.StripHostBrackets(host)
+	portPart := strings.TrimSpace(portText)
+	if base, suffix, hasDash := strings.Cut(portPart, "-"); hasDash && base != "" && suffix != "" {
+		allDigits := true
+		for i := 0; i < len(suffix); i++ {
+			if suffix[i] < '0' || suffix[i] > '9' {
+				allDigits = false
+				break
+			}
+		}
+		if allDigits {
+			portPart = base
+		}
+	}
+	parsedPort, parseErr := strconv.ParseUint(portPart, 10, 16)
 	if host == "" || parseErr != nil || parsedPort == 0 {
 		return "", 0, false
 	}

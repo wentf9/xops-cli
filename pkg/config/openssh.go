@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/models"
@@ -312,24 +314,40 @@ func (p *OpenSSHParser) HasHost(alias string) bool {
 	return found
 }
 
-func hasASCIIControlChar(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] < 0x20 || s[i] == 0x7f {
+func hasControlOrLineSepChar(s string) bool {
+	for _, r := range s {
+		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
 			return true
 		}
 	}
 	return false
 }
 
+func unwrapExpandedHostName(rawHostName, expanded string) string {
+	clean := StripHostBrackets(expanded)
+	rawTrimmed := strings.TrimSpace(rawHostName)
+	if len(rawTrimmed) >= 2 && rawTrimmed[0] == '[' && rawTrimmed[len(rawTrimmed)-1] == ']' &&
+		strings.Contains(rawTrimmed, "%") &&
+		len(clean) >= 2 && clean[0] == '[' && clean[len(clean)-1] == ']' {
+		inner := strings.TrimSpace(clean[1 : len(clean)-1])
+		if inner != "" {
+			if ip, err := netip.ParseAddr(inner); err != nil || ip.Is6() {
+				return inner
+			}
+		}
+	}
+	return clean
+}
+
 func resolveOpenSSHHostName(doc *sshConfigDoc, alias string) (string, error) {
 	rawHostName := firstSSHConfigKeyValue(doc, alias, "HostName")
 	if rawHostName == "" {
-		unwrapped := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(alias), "]"), "[")
+		if hasControlOrLineSepChar(alias) {
+			return "", fmt.Errorf("HostName %q contains invalid control characters", alias)
+		}
+		unwrapped := StripHostBrackets(alias)
 		if unwrapped == "" {
 			return "", errors.New("HostName cannot be empty")
-		}
-		if hasASCIIControlChar(unwrapped) {
-			return "", fmt.Errorf("HostName %q contains invalid ASCII control characters", unwrapped)
 		}
 		return unwrapped, nil
 	}
@@ -337,7 +355,7 @@ func resolveOpenSSHHostName(doc *sshConfigDoc, alias string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(expanded), "]"), "["), nil
+	return unwrapExpandedHostName(rawHostName, expanded), nil
 }
 
 // FindConcreteHostsByAddress returns concrete Host pattern names in ssh_config
@@ -347,7 +365,7 @@ func (p *OpenSSHParser) FindConcreteHostsByAddress(address string, port uint16) 
 	if p == nil || p.cfg == nil {
 		return nil
 	}
-	cleanAddr := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(address), "]"), "[")
+	cleanAddr := StripHostBrackets(address)
 	if cleanAddr == "" {
 		return nil
 	}
@@ -391,6 +409,24 @@ func (p *OpenSSHParser) GetVirtualNodeWithCanonical(originalAlias, canonicalHost
 	return p.getVirtualNodeWithCanonical(lookupAlias, canonicalHost, userOverride, portOverride, originalAlias)
 }
 
+func (p *OpenSSHParser) resolveVirtualHostAndPasses(lookupAlias, canonicalHost string) ([]string, string, error) {
+	cleanCanon := StripHostBrackets(canonicalHost)
+	passes := []string{lookupAlias}
+	if cleanCanon == "" || strings.EqualFold(cleanCanon, lookupAlias) {
+		hostName, err := resolveOpenSSHHostName(p.cfg, lookupAlias)
+		return passes, hostName, err
+	}
+	passes = append(passes, cleanCanon)
+	if firstSSHConfigKeyValue(p.cfg, lookupAlias, "HostName") != "" {
+		if hasControlOrLineSepChar(cleanCanon) {
+			return nil, "", fmt.Errorf("HostName %q contains invalid control characters", cleanCanon)
+		}
+		return passes, cleanCanon, nil
+	}
+	hostName, err := resolveOpenSSHHostName(p.cfg, cleanCanon)
+	return passes, hostName, err
+}
+
 func (p *OpenSSHParser) getVirtualNodeWithCanonical(
 	lookupAlias, canonicalHost, userOverride string,
 	portOverride uint16,
@@ -402,6 +438,9 @@ func (p *OpenSSHParser) getVirtualNodeWithCanonical(
 	if p.err != nil {
 		return models.Node{}, models.Host{}, models.Identity{}, p.err
 	}
+	if hasControlOrLineSepChar(lookupAlias) {
+		return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("HostName %q contains invalid control characters", lookupAlias)
+	}
 	lookupAlias = strings.TrimSpace(lookupAlias)
 	if lookupAlias == "" {
 		return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("parse openssh host %q failed: host is empty", nodeAlias)
@@ -410,29 +449,10 @@ func (p *OpenSSHParser) getVirtualNodeWithCanonical(
 	if nodeAlias == "" {
 		nodeAlias = lookupAlias
 	}
-	cleanCanon := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(canonicalHost), "]"), "[")
-	passes := []string{lookupAlias}
-	if cleanCanon != "" && !strings.EqualFold(cleanCanon, lookupAlias) {
-		passes = append(passes, cleanCanon)
-	} else {
-		cleanCanon = ""
+	if hasControlOrLineSepChar(canonicalHost) {
+		return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("HostName %q contains invalid control characters", canonicalHost)
 	}
-
-	var hostName string
-	var expHostErr error
-	if cleanCanon != "" {
-		if firstSSHConfigKeyValue(p.cfg, lookupAlias, "HostName") != "" {
-			if hasASCIIControlChar(cleanCanon) {
-				expHostErr = fmt.Errorf("HostName %q contains invalid ASCII control characters", cleanCanon)
-			} else {
-				hostName = cleanCanon
-			}
-		} else {
-			hostName, expHostErr = resolveOpenSSHHostName(p.cfg, cleanCanon)
-		}
-	} else {
-		hostName, expHostErr = resolveOpenSSHHostName(p.cfg, lookupAlias)
-	}
+	passes, hostName, expHostErr := p.resolveVirtualHostAndPasses(lookupAlias, canonicalHost)
 	if expHostErr != nil {
 		return models.Node{}, models.Host{}, models.Identity{}, expHostErr
 	}
@@ -520,7 +540,7 @@ func (p *OpenSSHParser) GetSSHOptionsWithCanonical(originalAlias, canonicalHost 
 		lookupAlias = cleanAlias
 	}
 	passes := []string{lookupAlias}
-	cleanCanon := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(canonicalHost), "]"), "[")
+	cleanCanon := StripHostBrackets(canonicalHost)
 	if cleanCanon != "" && !strings.EqualFold(cleanCanon, lookupAlias) {
 		passes = append(passes, cleanCanon)
 	}
@@ -587,8 +607,11 @@ func applyOpenSSHSpecOptionPasses(doc *sshConfigDoc, passes []string, spec ssh.O
 	if skip || val == "" {
 		return nil
 	}
-	if spec.Class == ssh.OptionClassTrust && !strings.EqualFold(strings.TrimSpace(val), "yes") {
-		return nil
+	if spec.Class == ssh.OptionClassTrust {
+		trimmedTrust := strings.TrimSpace(val)
+		if !strings.EqualFold(trimmedTrust, "yes") && !strings.EqualFold(trimmedTrust, "true") {
+			return nil
+		}
 	}
 	if spec.AllowList {
 		filtered := ssh.FilterSupportedListValue(spec.CanonicalKey, val)

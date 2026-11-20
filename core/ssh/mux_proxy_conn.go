@@ -309,7 +309,17 @@ func abortUnclaimedSSHConn(conn cryptoSSH.Conn, chans <-chan cryptoSSH.NewChanne
 // returns a wrapped *Client ready to execute SSH sessions over the multiplexed
 // connection without falling back to direct TCP. The caller owns the returned
 // *Client and must Close it when done.
+func controlProxyConfigNeedsClone(cfg *ClientConfig, target TargetContext, normJump string) bool {
+	return cfg.Port <= 0 ||
+		(cfg.User == "" && target.User != "") ||
+		(cfg.Address == "" && target.Host != "") ||
+		(cfg.OriginalHost == "" && target.OriginalHost != "") ||
+		(cfg.CanonicalHost == "" && target.CanonicalHost != "") ||
+		cfg.ProxyJump != normJump
+}
+
 func effectiveControlProxyConfig(cfg *ClientConfig, target TargetContext) *ClientConfig {
+	normTargetJump := NormalizeProxyJump(target.JumpHost)
 	if cfg == nil {
 		port := target.Port
 		if port <= 0 {
@@ -321,21 +331,20 @@ func effectiveControlProxyConfig(cfg *ClientConfig, target TargetContext) *Clien
 			Address:       target.Host,
 			Port:          port,
 			User:          target.User,
+			ProxyJump:     normTargetJump,
 		}
 	}
-	needClone := cfg.Port <= 0 ||
-		(cfg.User == "" && target.User != "") ||
-		(cfg.Address == "" && target.Host != "") ||
-		(cfg.OriginalHost == "" && target.OriginalHost != "") ||
-		(cfg.CanonicalHost == "" && target.CanonicalHost != "")
-	if !needClone {
+	normJump := NormalizeProxyJump(cfg.ProxyJump)
+	if cfg.ProxyJump == "" && normTargetJump != "" {
+		normJump = normTargetJump
+	}
+	if !controlProxyConfigNeedsClone(cfg, target, normJump) {
 		return cfg
 	}
 	cloned := *cfg
 	if cloned.Port <= 0 {
-		if target.Port > 0 {
-			cloned.Port = target.Port
-		} else {
+		cloned.Port = target.Port
+		if cloned.Port <= 0 {
 			cloned.Port = 22
 		}
 	}
@@ -351,6 +360,7 @@ func effectiveControlProxyConfig(cfg *ClientConfig, target TargetContext) *Clien
 	if cloned.CanonicalHost == "" {
 		cloned.CanonicalHost = target.CanonicalHost
 	}
+	cloned.ProxyJump = normJump
 	return &cloned
 }
 

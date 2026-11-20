@@ -114,7 +114,7 @@ func verifyConnection(ctx context.Context, preview *config.Provider, nodeID stri
 		connectionProvider = probeConnectionProvider{ConfigProvider: preview.Frozen()}
 	}
 	connector := NewConnectorWithAdapterOptions(connectionProvider, []Option{
-		WithNonInteractive(true), WithCredentialRecording(false), WithCredentialSource(resolver), WithControlMultiplexing(false), WithHostTrustOverrides(false),
+		WithStrictIsolation(), WithCredentialRecording(false), WithCredentialSource(resolver),
 	}, ssh.WithHandshakeTimeout(VerificationTimeout))
 	connector.AcceptNewHostKey.Store(true)
 	defer func() {

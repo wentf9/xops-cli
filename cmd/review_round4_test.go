@@ -426,8 +426,9 @@ func TestRound4_P2_23_ExecScpCanonicalizedDaemonHandoffAndResolveMasterNodeID(t 
 		repo,
 		adapter.WithNonInteractive(true),
 		adapter.WithSessionAuthOverride(prep.NodeID, adapter.SessionAuth{
-			Password:     sshfixture.Password,
-			OriginalHost: "short",
+			Password:      sshfixture.Password,
+			OriginalHost:  "short",
+			CanonicalHost: "short.corp.example.com",
 		}),
 		adapter.WithSessionControlOverride(prep.NodeID, newPass6SessionControl(t, sockPath)),
 	)

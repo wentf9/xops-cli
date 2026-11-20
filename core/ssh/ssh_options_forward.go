@@ -56,6 +56,9 @@ const DefaultStreamLocalBindMask uint32 = 0o177
 
 // ParseStreamLocalBindMask parses a StreamLocalBindMask octal string (1 to 4 octal digits, <= 0777).
 func ParseStreamLocalBindMask(raw string) (uint32, error) {
+	if hasControlOrLineSepChar(raw) {
+		return 0, fmt.Errorf("invalid StreamLocalBindMask %q: contains invalid control character", raw)
+	}
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return 0, errors.New("StreamLocalBindMask cannot be empty")
@@ -94,6 +97,9 @@ const (
 
 // ParseSessionTypeMode validates and normalizes an OpenSSH SessionType value ("default" or "none").
 func ParseSessionTypeMode(raw string) (SessionTypeMode, error) {
+	if hasControlOrLineSepChar(raw) {
+		return "", fmt.Errorf("invalid SessionType %q: contains invalid control character", raw)
+	}
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "default":
 		return SessionTypeDefault, nil
@@ -285,6 +291,9 @@ func (f ForwardSpec) String() string {
 
 // ParseTunnelOption validates and normalizes an OpenSSH Tunnel option value.
 func ParseTunnelOption(raw string) (string, error) {
+	if hasControlOrLineSepChar(raw) {
+		return "", fmt.Errorf("invalid Tunnel option %q: contains invalid control character", raw)
+	}
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "yes", "true":
 		return string(TunnelModeYes), nil
@@ -315,6 +324,9 @@ func EffectiveTunnelModeFromValue(val string) TunnelMode {
 // ParseTunnelDevice parses an OpenSSH -w / TunnelDevice value ("local_tun[:remote_tun]").
 // Omitted remote_tun defaults to TunnelIDAny ("any").
 func ParseTunnelDevice(raw string) (TunnelDeviceSpec, error) {
+	if hasControlOrLineSepChar(raw) {
+		return TunnelDeviceSpec{}, fmt.Errorf("invalid TunnelDevice %q: contains invalid control character", raw)
+	}
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return TunnelDeviceSpec{}, errors.New("invalid TunnelDevice: value cannot be empty")
@@ -362,6 +374,9 @@ func parseTunnelUnit(token string) (int, error) {
 
 // ParseRequestTTYMode validates and normalizes an OpenSSH RequestTTY option value.
 func ParseRequestTTYMode(raw string) (RequestTTYMode, error) {
+	if hasControlOrLineSepChar(raw) {
+		return "", fmt.Errorf("invalid RequestTTY option %q: contains invalid control character", raw)
+	}
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "no", "false":
 		return RequestTTYNo, nil
@@ -378,6 +393,9 @@ func ParseRequestTTYMode(raw string) (RequestTTYMode, error) {
 
 // ParseStdioForward parses an OpenSSH -W host:port (or [ipv6]:port) specification.
 func ParseStdioForward(raw string) (host string, port uint16, err error) {
+	if hasControlOrLineSepChar(raw) {
+		return "", 0, fmt.Errorf("invalid stdio forward %q: contains invalid control character", raw)
+	}
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return "", 0, errors.New("stdio forward specification cannot be empty")
@@ -868,6 +886,9 @@ func ParseDynamicForwardSpec(raw string) (string, error) {
 }
 
 func unwrapForwardHost(token string, allowEmpty bool) (string, error) {
+	if hasControlOrLineSepChar(token) {
+		return "", fmt.Errorf("host %q contains invalid control character", token)
+	}
 	if token == "" {
 		if allowEmpty {
 			return "", nil
@@ -970,12 +991,14 @@ func splitBracketAwareColons(s string) ([]string, error) {
 }
 
 func normalizeMultiForwardEntries(optionName, raw string, normalizeItem func(string) (string, error)) (string, error) {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
+	if strings.TrimSpace(raw) == "" {
 		return "", fmt.Errorf("invalid %s: value cannot be empty", optionName)
 	}
 	var normalized []string
-	for line := range strings.SplitSeq(trimmed, "\n") {
+	for line := range strings.SplitSeq(raw, "\n") {
+		if hasKnownHostsControlChar(line) {
+			return "", fmt.Errorf("invalid %s %q: contains invalid control character", optionName, line)
+		}
 		item := strings.TrimSpace(line)
 		if item == "" {
 			continue
@@ -1010,6 +1033,9 @@ func (o *Options) Append(key, rawValue string) error {
 	}
 	if strings.TrimSpace(rawValue) == "" {
 		return fmt.Errorf("%w: invalid %s: value cannot be empty", ErrSSHOptionsValidation, spec.OpenSSHName)
+	}
+	if hasMultiValueDelimiterOrLineBreak(rawValue) || hasKnownHostsControlChar(rawValue) {
+		return fmt.Errorf("%w: invalid %s: value cannot contain newlines or control characters", ErrSSHOptionsValidation, spec.OpenSSHName)
 	}
 	normalized, err := spec.Normalize(rawValue)
 	if err != nil {

@@ -1108,7 +1108,7 @@ func walkMatchingBlockNodes(
 			if n.lowerKey == "hostname" && !state.sawHostName && strings.TrimSpace(n.value) != "" {
 				state.sawHostName = true
 				if expanded, err := ssh.ExpandHostName(n.value, state.passTarget); err == nil {
-					clean := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(expanded), "]"), "[")
+					clean := unwrapExpandedHostName(n.value, expanded)
 					if clean != "" {
 						state.effectiveHost = clean
 					}

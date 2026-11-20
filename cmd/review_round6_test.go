@@ -151,7 +151,12 @@ func TestRound6_P3_6_P3_7_P3_8_ControlProxyTunnelAndEnsureApplied(t *testing.T) 
 	savedCfg := config.NewProviderWithoutOpenSSH(nil).Snapshot()
 	savedCfg.Hosts.Set("h5", models.Host{Address: "10.80.0.5", Port: 22})
 	savedCfg.Identities.Set("id5", models.Identity{User: "ops"})
-	savedCfg.Nodes.Set("ops@10.80.0.5:22", models.Node{HostRef: "h5", IdentityRef: "id5"})
+	savedCfg.Nodes.Set("ops@10.80.0.5:22", models.Node{
+		HostRef:       "h5",
+		IdentityRef:   "id5",
+		OpenSSHAlias:  "app-a",
+		CanonicalHost: "app-a.corp.example.com",
+	})
 	readOnlyProv := config.NewProviderWithOpenSSHParser(savedCfg, proxyParser)
 
 	proxyOpt := NewSshOptions()
@@ -163,18 +168,43 @@ func TestRound6_P3_6_P3_7_P3_8_ControlProxyTunnelAndEnsureApplied(t *testing.T) 
 	if resolvedCfg == nil || resolvedCfg.Options.Get(xssh.OptionServerAliveInterval) != "99" {
 		t.Fatalf("-O proxy resolved wrong alias ServerAliveInterval: got %q, want 99", resolvedCfg.Options.Get(xssh.OptionServerAliveInterval))
 	}
+	if resolvedCfg.CanonicalHost != "" {
+		t.Fatalf("-O proxy leaked stale Node.CanonicalHost = %q when switching alias to app-b", resolvedCfg.CanonicalHost)
+	}
 }
 
 func TestRound6_P3_12_ExecAndScpCanonicalHostPropagation(t *testing.T) {
 	t.Parallel()
 
-	// P3-12 coverage: exec buildTaskSessionAuth & scp appendScpSessionAuthOverrides propagate CanonicalHost.
+	// P3-12 coverage: real ExecOptions.planTasksFromHosts -> buildTaskSessionAuth & scp appendScpSessionAuthOverrides propagate CanonicalHost.
+	execCanonCfg := strings.Join([]string{
+		"Host edge",
+		"  User ops",
+		"Host *.corp.example.com",
+		"  HostName 10.80.0.9",
+		"  User ops",
+		"Host *",
+		"  CanonicalizeHostname yes",
+		"  CanonicalDomains corp.example.com",
+	}, "\n") + "\n"
+	execParser, err := config.NewOpenSSHParserFromReader(strings.NewReader(execCanonCfg))
+	if err != nil {
+		t.Fatalf("NewOpenSSHParserFromReader(exec): %v", err)
+	}
+	execProv := config.NewProviderWithOpenSSHParser(nil, execParser)
 	execOpt := NewExecOptions()
-	taskAuth, err := execOpt.buildTaskSessionAuth(execHostTask{
-		nodeID:        "openssh:edge.corp.example.com",
-		originalHost:  "edge",
-		canonicalHost: "edge.corp.example.com",
-	}, nil, false, false)
+	execOpt.Host = "edge"
+	execOpt.canonicalResolver = &round4FakeCanonicalResolver{
+		hosts: map[string][]string{"edge.corp.example.com": {"10.80.0.9"}},
+	}
+	tasks, hostErrs, err := execOpt.planTasksFromHosts(t.Context(), execProv)
+	if err != nil || len(hostErrs) != 0 || len(tasks) != 1 {
+		t.Fatalf("planTasksFromHosts(edge) = (len=%d, errs=%v, err=%v)", len(tasks), hostErrs, err)
+	}
+	if tasks[0].nodeID != "openssh:edge.corp.example.com" || tasks[0].canonicalHost != "edge.corp.example.com" || tasks[0].originalHost != "edge" {
+		t.Fatalf("planned exec task unexpected: %+v", tasks[0])
+	}
+	taskAuth, err := execOpt.buildTaskSessionAuth(tasks[0], nil, false, false)
 	if err != nil {
 		t.Fatalf("exec buildTaskSessionAuth: %v", err)
 	}

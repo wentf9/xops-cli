@@ -202,7 +202,7 @@ func TestExecNonInteractiveSuppressNodeConfirmation(t *testing.T) {
 }
 
 func TestExecNonInteractiveNeverMutatesSavedNodeProxyJumpOrAliasOnDisk(t *testing.T) {
-	home := t.TempDir()
+	home := setupTestEnvironment(t)
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 

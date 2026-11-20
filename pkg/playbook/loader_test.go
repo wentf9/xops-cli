@@ -242,15 +242,19 @@ steps:
 }
 
 func TestLoad_NamedLookup(t *testing.T) {
-	// 测试 ~/.xops/playbooks/ 名称查找
+	// 测试 ~/.xops/playbooks/ 名称查找（隔离到临时 HOME，避免污染真实 ~/.xops）
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("USERPROFILE", tmpHome)
+
 	home, err := os.UserHomeDir()
 	if err != nil {
-		t.Skip("cannot get home dir")
+		t.Fatalf("os.UserHomeDir() error: %v", err)
 	}
 
 	playbookDir := filepath.Join(home, ".xops", "playbooks")
 	if err := os.MkdirAll(playbookDir, 0o755); err != nil {
-		t.Skip("cannot create playbooks dir")
+		t.Fatalf("MkdirAll(%q) error: %v", playbookDir, err)
 	}
 
 	playbookPath := filepath.Join(playbookDir, "named-test.yaml")
@@ -263,9 +267,8 @@ steps:
     shell: echo hello
 `
 	if err := os.WriteFile(playbookPath, []byte(content), 0o644); err != nil {
-		t.Skip("cannot write named playbook")
+		t.Fatalf("WriteFile(%q) error: %v", playbookPath, err)
 	}
-	defer func() { _ = os.Remove(playbookPath) }()
 
 	// 使用名称查找（不加 .yaml 扩展名）
 	pb, err := playbook.Load("named-test", nil)

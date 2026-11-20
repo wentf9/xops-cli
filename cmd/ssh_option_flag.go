@@ -42,14 +42,15 @@ var validControlCommands = map[string]bool{
 
 // SSHControlFlags encapsulates OpenSSH-compatible multiplexing and session control flags.
 type SSHControlFlags struct {
-	MasterCount   int      // -M count: 1 -> ControlMaster=yes, >=2 -> ControlMaster=ask
-	ControlPath   string   // -S <path> or "none"
-	CtlCmd        string   // -O <command>
-	ConfigFile    string   // -F <configfile|none>
-	AddressFamily string   // -4 ("inet") or -6 ("inet6"), last flag wins
-	Options       []string // -o Key=Value options
-	ctlCmdSet     bool
-	onOptionAdded func(string)
+	MasterCount        int      // -M count: 1 -> ControlMaster=yes, >=2 -> ControlMaster=ask
+	ControlPath        string   // -S <path> or "none"
+	CtlCmd             string   // -O <command>
+	ConfigFile         string   // -F <configfile|none>
+	AddressFamily      string   // -4 ("inet") or -6 ("inet6"), last flag wins
+	Options            []string // -o Key=Value options
+	controlPathLiteral bool
+	ctlCmdSet          bool
+	onOptionAdded      func(string)
 }
 
 type addressFamilyFlagValue struct {
@@ -150,7 +151,11 @@ func (f *SSHControlFlags) ToSessionControlOptionsWithJump(cliJump string) (adapt
 		} else if f.MasterCount == 0 && sessionOpts.Master == nil {
 			sessionOpts.AllowReuse = true
 		}
-		sessionOpts.SetPath(controlPath)
+		if f.controlPathLiteral && controlPath != "none" {
+			sessionOpts.SetLiteralPath(controlPath)
+		} else {
+			sessionOpts.SetPath(controlPath)
+		}
 	}
 
 	// 4. Command-line -4 / -6 flag overrides any AddressFamily from -o
@@ -272,7 +277,7 @@ func controlSocketPath(opts *SshOptions, provider config.ConfigProvider, nodeID 
 	if ctrl == nil || ctrl.Path == "" || strings.EqualFold(strings.TrimSpace(ctrl.Path), "none") {
 		return "", nil
 	}
-	return ssh.ExpandControlPath(ctrl.Path, sshenv.Discover(), target)
+	return ctrl.ResolvePath(sshenv.Discover(), target)
 }
 
 func firstNonEmptySessionValue(vals ...string) string {
@@ -310,10 +315,13 @@ func resolveSavedControlSessionLookup(
 			if !config.IsOpenSSHNodeID(lookupKey) || snap.Provenance != config.ProvenanceOpenSSHVirtual {
 				resolvedAlias := snap.Node.OpenSSHAlias
 				resolvedCanon := snap.Node.CanonicalHost
-				if origHost == "" && resolvedAlias == "" && strings.TrimSpace(connTarget.Selector) != "" {
+				if origHost != "" || canonHost != "" {
+					resolvedCanon = ""
+				}
+				if origHost == "" && strings.TrimSpace(connTarget.Selector) != "" {
 					if resolved, rErr := config.ResolveTarget(provider, connTarget); rErr == nil && resolved.MatchedNodeID == lookupKey {
 						resolvedAlias = resolved.OpenSSHAlias
-						if resolvedCanon == "" {
+						if canonHost == "" {
 							resolvedCanon = resolved.CanonicalHost
 						}
 					}
@@ -330,7 +338,11 @@ func resolveSavedControlSessionLookup(
 	if strings.TrimSpace(connTarget.Selector) != "" {
 		if resolved, err := config.ResolveTarget(provider, connTarget); err == nil && resolved.MatchedNodeID != "" && !config.IsOpenSSHNodeID(resolved.MatchedNodeID) {
 			auth.OriginalHost = firstNonEmptySessionValue(origHost, resolved.OpenSSHAlias, extractOpenSSHHost(nodeID), targetOrig)
-			auth.CanonicalHost = firstNonEmptySessionValue(canonHost, resolved.CanonicalHost)
+			if origHost == "" && canonHost == "" {
+				auth.CanonicalHost = resolved.CanonicalHost
+			} else {
+				auth.CanonicalHost = canonHost
+			}
 			return resolved.MatchedNodeID, auth, true, resolvedVirtual
 		}
 	}
@@ -431,8 +443,10 @@ func mergeSessionControl(sessionOpts adapter.SessionControlOptions) *ssh.Control
 	}
 	if sessionOpts.Path != nil {
 		ctrl.Path = *sessionOpts.Path
+		ctrl.LiteralPath = sessionOpts.LiteralPath
 		if strings.EqualFold(strings.TrimSpace(ctrl.Path), "none") {
 			ctrl.AllowReuse = false
+			ctrl.LiteralPath = false
 		}
 	}
 	if sessionOpts.Persist != nil {

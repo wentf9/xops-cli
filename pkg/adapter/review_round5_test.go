@@ -60,6 +60,10 @@ func TestRound5_P1_2_ConcurrentDistinctOriginalsResolveSecretZeroMismatch(t *tes
 				errs <- err
 				return
 			}
+			if cfgA.User != "user-a" || cfgA.Port != 2201 || cfgA.Options.Get(ssh.OptionConnectTimeout) != "11" {
+				errs <- errors.New("edge-a GetConfig options/identity mismatch")
+				return
+			}
 			secA, err := adpA.ResolveSecret(t.Context(), ssh.SecretRequest{
 				NodeID:       sharedNodeID,
 				Host:         cfgA.Address,
@@ -76,6 +80,10 @@ func TestRound5_P1_2_ConcurrentDistinctOriginalsResolveSecretZeroMismatch(t *tes
 			cfgB, err := adpB.GetConfig(sharedNodeID)
 			if err != nil {
 				errs <- err
+				return
+			}
+			if cfgB.User != "user-b" || cfgB.Port != 2202 || cfgB.Options.Get(ssh.OptionConnectTimeout) != "22" {
+				errs <- errors.New("edge-b GetConfig options/identity mismatch")
 				return
 			}
 			secB, err := adpB.ResolveSecret(t.Context(), ssh.SecretRequest{
@@ -252,6 +260,16 @@ func TestRound5_P2_12_ParseOptionStringsSupportsSnakeCaseIdentityFileAndProxyJum
 	}
 	if files := parsed.Options.IdentityFiles(); len(files) != 1 || files[0] != "/tmp/r5_id" {
 		t.Fatalf("identity_file not parsed cleanly: %v", files)
+	}
+	suppressed, err := ParseOptionStrings([]string{
+		"proxy_jump=bastion-r5",
+		"ProxyCommand=nc %h %p",
+	})
+	if err != nil {
+		t.Fatalf("ParseOptionStrings(proxy_jump + ProxyCommand) failed: %v", err)
+	}
+	if sshOpts := suppressed.ToSSHOptions(); sshOpts != nil && sshOpts.Get(ssh.OptionProxyCommand) != "" {
+		t.Fatalf("proxy_jump did not activate proxyJumpActive suppression: ProxyCommand=%q", sshOpts.Get(ssh.OptionProxyCommand))
 	}
 	if _, err := ParseOptionStrings([]string{"proxy_jump="}); err == nil {
 		t.Fatal("expected empty proxy_jump value to be rejected")

@@ -195,7 +195,7 @@ func validateSubsystemArgs(ctx context.Context, c *Client, subsystem string, std
 	if strings.TrimSpace(subsystem) == "" {
 		return fmt.Errorf("%w: subsystem name must not be empty", ErrExecutionValidation)
 	}
-	if hasASCIIControlChar(subsystem) {
+	if hasControlOrLineSepChar(subsystem) {
 		return fmt.Errorf("%w: subsystem name %q contains invalid control character", ErrExecutionValidation, subsystem)
 	}
 	return validateCommandStdin(stdin, c.environment.InputBridge)

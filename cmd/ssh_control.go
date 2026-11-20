@@ -291,8 +291,21 @@ func resolveControlContext(ctx context.Context, o *SshOptions, stderr io.Writer)
 }
 
 func expandControlSocketPath(o *SshOptions, provider config.ConfigProvider, nodeID string, target ssh.TargetContext, stderr io.Writer) (string, error) {
+	if o.control.controlPathLiteral {
+		rawLiteral := o.control.ControlPath
+		if ssh.IsNoneValue(rawLiteral) {
+			return "", controlError(stderr, "ControlPath must be specified when using -O")
+		}
+		if rawLiteral != "" {
+			expanded, err := (&ssh.ControlConfig{Path: rawLiteral, LiteralPath: true}).ResolvePath(sshenv.Discover(), target)
+			if err != nil {
+				return "", controlError(stderr, fmt.Sprintf("expand ControlPath %q failed: %v", rawLiteral, err))
+			}
+			return expanded, nil
+		}
+	}
 	rawPath := strings.TrimSpace(o.control.ControlPath)
-	if strings.EqualFold(rawPath, "none") {
+	if ssh.IsNoneValue(rawPath) {
 		return "", controlError(stderr, "ControlPath must be specified when using -O")
 	}
 	if rawPath != "" {
@@ -910,9 +923,15 @@ func buildControlProxyAdapterOptionsWithLookup(
 		}
 		canonOrig, canonHost := canonicalControlOriginAndHost(o)
 		if origHost == "" {
-			origHost = firstNonEmptyControlValue(lookupAuth.OriginalHost, canonOrig)
+			if lookupAuth.OriginalHost != "" {
+				origHost = lookupAuth.OriginalHost
+				canonHost = lookupAuth.CanonicalHost
+			} else {
+				origHost = canonOrig
+			}
+		} else if origHost == lookupAuth.OriginalHost && canonHost == "" {
+			canonHost = lookupAuth.CanonicalHost
 		}
-		canonHost = firstNonEmptyControlValue(lookupAuth.CanonicalHost, canonHost)
 		absKeys := o.absIdentityFiles()
 		firstKey := normalizeCLIIdentityPath(o.IdentityFile)
 		if firstKey == "" && len(absKeys) > 0 {
