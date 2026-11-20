@@ -239,6 +239,11 @@ func (c *Client) Config() *ClientConfig {
 	return &cfg
 }
 
+// IsMultiplexed reports whether the client operates over a multiplexed control proxy socket.
+func (c *Client) IsMultiplexed() bool {
+	return c != nil && c.muxSocketPath != ""
+}
+
 func (c *Client) configSnapshot() (ClientConfig, bool) {
 	if c == nil {
 		return ClientConfig{}, false
@@ -255,6 +260,7 @@ func (c *Client) configSnapshot() (ClientConfig, bool) {
 		User:                  c.connCfg.User,
 		AuthType:              c.connCfg.AuthType,
 		KeyPath:               c.connCfg.KeyPath,
+		KeyPaths:              slices.Clone(c.connCfg.KeyPaths),
 		AuthUpdateToken:       c.connCfg.AuthUpdateToken,
 		SudoMode:              c.connCfg.SudoMode,
 		SudoUpdateToken:       c.connCfg.SudoUpdateToken,

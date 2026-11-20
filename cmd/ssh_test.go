@@ -2,11 +2,13 @@ package cmd
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
+	"github.com/wentf9/xops-cli/core/ssh"
 )
 
 func TestParseForwardArg(t *testing.T) {
@@ -386,4 +388,123 @@ func TestPreprocessArgsForSshSudoWithCommand(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSshOptions_BackgroundModeRejectsStdinAndInlineCredentialsFailClosed(t *testing.T) {
+	t.Run("CLI flag variants fail closed before reading stdin and exit 255 under -O", func(t *testing.T) {
+		cases := []struct {
+			name        string
+			args        []string
+			wantCtlCode int
+		}{
+			{
+				name: "bg-f-password-stdin",
+				args: []string{"-f", "--password-stdin", "web", "id"},
+			},
+			{
+				name: "fork-after-auth-passphrase-stdin",
+				args: []string{"-o", "ForkAfterAuthentication=yes", "--passphrase-stdin", "-N", "web"},
+			},
+			{
+				name:        "control-proxy-bg-password-stdin-exits-255",
+				args:        []string{"-O", "proxy", "-fN", "--password-stdin", "web"},
+				wantCtlCode: 255,
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				pr, pw, err := os.Pipe()
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() {
+					_ = pr.Close()
+					_ = pw.Close()
+				}()
+				origStdin := os.Stdin
+				os.Stdin = pr
+				defer func() { os.Stdin = origStdin }()
+
+				cmd := NewCmdSsh()
+				cmd.SilenceErrors = true
+				cmd.SilenceUsage = true
+				cmd.SetOut(&bytes.Buffer{})
+				cmd.SetErr(&bytes.Buffer{})
+				cmd.SetArgs(tc.args)
+				err = cmd.Execute()
+				if err == nil {
+					t.Fatalf("expected error for %v, got nil", tc.args)
+				}
+				if tc.wantCtlCode != 0 {
+					var ctlErr *ControlExitError
+					if !errors.As(err, &ctlErr) || ctlErr.Code != tc.wantCtlCode {
+						t.Fatalf("error = %v, want *ControlExitError{Code: %d}", err, tc.wantCtlCode)
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("direct Validate and post-resolution config ForkAfterAuthentication fail closed", func(t *testing.T) {
+		for _, mut := range []func(*SshOptions){
+			func(o *SshOptions) { o.PasswordStdin = true },
+			func(o *SshOptions) { o.PassphraseStdin = true },
+			func(o *SshOptions) { o.Password = "inline-secret" },
+			func(o *SshOptions) { o.Passphrase = "inline-passphrase" },
+		} {
+			o := NewSshOptions()
+			o.Host = "web"
+			o.NoCmd = true
+			o.BgRun = true
+			mut(o)
+			if err := o.Validate(); err == nil {
+				t.Fatalf("expected Validate() error for background credential %+v", o)
+			}
+			if err := o.validatePostResolutionSessionInvariants(); err == nil {
+				t.Fatalf("expected validatePostResolutionSessionInvariants() error for background credential %+v", o)
+			}
+		}
+
+		// Simulate ForkAfterAuthentication=yes resolved from ~/.ssh/config after Complete(), combined with -O proxy.
+		o := NewSshOptions()
+		o.Host = "web"
+		o.NoCmd = true
+		o.PasswordStdin = true
+		o.control.CtlCmd = "proxy"
+		o.control.ctlCmdSet = true
+		effOpts, optErr := ssh.NewOptions()
+		if optErr != nil {
+			t.Fatal(optErr)
+		}
+		if setErr := effOpts.Set(ssh.OptionForkAfterAuthentication, "yes"); setErr != nil {
+			t.Fatal(setErr)
+		}
+		o.effectiveSSHOptions = effOpts
+		err := o.validatePostResolutionSessionInvariants()
+		var ctlErr *ControlExitError
+		if !errors.As(err, &ctlErr) || ctlErr.Code != 255 {
+			t.Fatalf("post-resolution ForkAfterAuthentication under -O proxy err = %v, want *ControlExitError{Code: 255}", err)
+		}
+	})
+
+	t.Run("explicit empty -O flag returns ControlExitError 255", func(t *testing.T) {
+		for _, args := range [][]string{
+			{"-O", "", "web"},
+			{"-O", "   ", "web"},
+			{"-c", "", "-O", "", "web"},
+		} {
+			cmd := NewCmdSsh()
+			cmd.SilenceErrors = true
+			cmd.SilenceUsage = true
+			cmd.SetOut(&bytes.Buffer{})
+			cmd.SetErr(&bytes.Buffer{})
+			cmd.SetArgs(args)
+			err := cmd.Execute()
+			var ctlErr *ControlExitError
+			if !errors.As(err, &ctlErr) || ctlErr.Code != 255 {
+				t.Fatalf("args=%v error = %v, want *ControlExitError{Code: 255}", args, err)
+			}
+		}
+	})
 }

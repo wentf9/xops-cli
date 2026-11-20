@@ -42,13 +42,26 @@ func ResolveExcludes(provider config.ConfigProvider, excludes []string) (map[str
 // resolved target candidates, supporting saved nodes, composite user@host[:port] /
 // openssh: specs, IPv6 literals, and -F none / missing ssh_config ad-hoc targets.
 func ResolveExcludesForTargets(provider config.ConfigProvider, excludes []string, candidates []ExcludeTargetInfo) (map[string]struct{}, error) {
+	return ResolveExcludesForTargetsWithOptions(provider, excludes, candidates, nil, "")
+}
+
+// ResolveExcludesForTargetsWithOptions resolves --exclude entries against provider and
+// optional resolved target candidates while honoring CLI -o canonicalization/proxy
+// directives and explicit CLI -J jump overrides.
+func ResolveExcludesForTargetsWithOptions(
+	provider config.ConfigProvider,
+	excludes []string,
+	candidates []ExcludeTargetInfo,
+	rawCLIOptions []string,
+	cliProxyJump string,
+) (map[string]struct{}, error) {
 	if len(excludes) == 0 {
 		return nil, nil
 	}
 	resolved := make(map[string]struct{}, len(excludes))
 	var unmatched []string
 	for _, ex := range excludes {
-		ok, err := resolveSingleExclude(provider, ex, candidates, resolved)
+		ok, err := resolveSingleExclude(provider, ex, candidates, resolved, rawCLIOptions, cliProxyJump)
 		if err != nil {
 			return nil, err
 		}
@@ -62,31 +75,18 @@ func ResolveExcludesForTargets(provider config.ConfigProvider, excludes []string
 	return resolved, nil
 }
 
-func resolveSingleExclude(provider config.ConfigProvider, ex string, candidates []ExcludeTargetInfo, resolved map[string]struct{}) (bool, error) {
+func resolveSingleExclude(
+	provider config.ConfigProvider,
+	ex string,
+	candidates []ExcludeTargetInfo,
+	resolved map[string]struct{},
+	rawCLIOptions []string,
+	cliProxyJump string,
+) (bool, error) {
 	hasOpenSSHPrefix, addrUser, addrHost, addrPort, parsedOK := parseExcludeSpec(ex)
 
-	if provider != nil {
-		nodeID, err := provider.ResolveSelector(ex)
-		if err != nil {
-			return false, fmt.Errorf("resolve excluded node %q failed: %w", ex, err)
-		}
-		if isSavedNodeID(nodeID) {
-			resolved[nodeID] = struct{}{}
-			if !hasOpenSSHPrefix {
-				addSavedBaseCandidates(resolved, nodeID, addrUser, addrPort, candidates)
-			}
-			return true, nil
-		}
-		if strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) && providerOpenSSHHasConcreteHost(provider, nodeID) {
-			resolved[nodeID] = struct{}{}
-			if !hasOpenSSHPrefix && len(candidates) > 0 {
-				aliasHost := config.UnwrapOpenSSHSelector(nodeID)
-				if res, rErr := config.ResolveTarget(provider, config.ConnectionTarget{Selector: nodeID}); rErr == nil {
-					addOpenSSHSavedCandidates(resolved, aliasHost, res.Host, res.Port, "", 0, candidates)
-				}
-			}
-			return true, nil
-		}
+	if handled, err := resolveSingleExcludeBySelector(provider, ex, hasOpenSSHPrefix, addrUser, addrHost, addrPort, candidates, resolved, rawCLIOptions, cliProxyJump); err != nil || handled {
+		return handled, err
 	}
 
 	if !parsedOK {
@@ -97,12 +97,62 @@ func resolveSingleExclude(provider config.ConfigProvider, ex string, candidates 
 	if err != nil {
 		return false, err
 	}
-	if matched {
+	canonMatched := false
+	if !hasOpenSSHPrefix && addrHost != "" {
+		canonMatched, err = expandExcludeCanonicalCandidates(provider, addrUser, addrHost, addrPort, candidates, resolved, rawCLIOptions, cliProxyJump)
+		if err != nil {
+			return false, err
+		}
+	}
+	if matched || canonMatched {
 		return true, nil
 	}
 
 	if len(candidates) > 0 {
 		return resolveExcludeViaCandidates(hasOpenSSHPrefix, addrUser, addrHost, addrPort, candidates, resolved), nil
+	}
+	return false, nil
+}
+
+func resolveSingleExcludeBySelector(
+	provider config.ConfigProvider,
+	ex string,
+	hasOpenSSHPrefix bool,
+	addrUser, addrHost string,
+	addrPort uint16,
+	candidates []ExcludeTargetInfo,
+	resolved map[string]struct{},
+	rawCLIOptions []string,
+	cliProxyJump string,
+) (bool, error) {
+	if provider == nil {
+		return false, nil
+	}
+	nodeID, err := provider.ResolveSelector(ex)
+	if err != nil {
+		return false, fmt.Errorf("resolve excluded node %q failed: %w", ex, err)
+	}
+	if isSavedNodeID(nodeID) {
+		resolved[nodeID] = struct{}{}
+		if !hasOpenSSHPrefix {
+			addSavedBaseCandidates(resolved, nodeID, addrUser, addrPort, candidates)
+		}
+		return true, nil
+	}
+	if strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) && providerOpenSSHHasConcreteHost(provider, nodeID) {
+		resolved[nodeID] = struct{}{}
+		if !hasOpenSSHPrefix && len(candidates) > 0 {
+			aliasHost := config.UnwrapOpenSSHSelector(nodeID)
+			if res, rErr := config.ResolveTarget(provider, config.ConnectionTarget{Selector: nodeID}); rErr == nil {
+				addOpenSSHSavedCandidates(resolved, aliasHost, res.Host, res.Port, "", 0, candidates)
+			}
+		}
+		if !hasOpenSSHPrefix && addrHost != "" {
+			if _, cErr := expandExcludeCanonicalCandidates(provider, addrUser, addrHost, addrPort, candidates, resolved, rawCLIOptions, cliProxyJump); cErr != nil {
+				return false, cErr
+			}
+		}
+		return true, nil
 	}
 	return false, nil
 }
@@ -227,6 +277,91 @@ func recordCompositeTargetExclude(
 	}
 }
 
+func expandExcludeCanonicalCandidates(
+	provider config.ConfigProvider,
+	addrUser, addrHost string,
+	addrPort uint16,
+	candidates []ExcludeTargetInfo,
+	resolved map[string]struct{},
+	rawCLIOptions []string,
+	cliProxyJump string,
+) (bool, error) {
+	if provider == nil {
+		return false, nil
+	}
+	canonHosts := config.CanonicalDomainCandidatesWithOptions(provider, addrHost, rawCLIOptions, cliProxyJump)
+	matchedAny := false
+	for _, fqdn := range canonHosts {
+		concreteFQDN := providerOpenSSHHasConcreteHost(provider, fqdn)
+		matchedCandidate := false
+		for _, cand := range candidates {
+			if candidateMatchesHost(cand, fqdn, "") && matchesUserPortFilter(cand, addrUser, addrPort) {
+				matchedCandidate = true
+				break
+			}
+		}
+		if !concreteFQDN && !matchedCandidate {
+			continue
+		}
+		ok, err := resolveExcludeViaTarget(provider, fqdn, false, addrUser, fqdn, addrPort, candidates, resolved)
+		if err != nil {
+			return false, err
+		}
+		if ok {
+			matchedAny = true
+			continue
+		}
+		if matchedCandidate && resolveExcludeViaCandidates(false, addrUser, fqdn, addrPort, candidates, resolved) {
+			matchedAny = true
+		}
+	}
+	return matchedAny, nil
+}
+
+func candidateMatchesOpenSSHExcludeName(cand ExcludeTargetInfo, res config.ResolvedTarget, addrHost string) bool {
+	wantTargets := []string{addrHost, res.OpenSSHAlias, res.CanonicalHost}
+	if baseHost := unwrapExcludeBaseHost(res.BaseNodeID); baseHost != "" {
+		wantTargets = append(wantTargets, baseHost)
+	}
+	matchesAnyWant := func(name string) bool {
+		if name == "" {
+			return false
+		}
+		for _, w := range wantTargets {
+			if w != "" && sameExcludeHost(name, w) {
+				return true
+			}
+		}
+		return false
+	}
+	if matchesAnyWant(cand.OpenSSHAlias) || matchesAnyWant(cand.CanonicalHost) || matchesAnyWant(unwrapExcludeBaseHost(cand.BaseNodeID)) {
+		return true
+	}
+	if cand.OpenSSHAlias == "" && cand.CanonicalHost == "" && !strings.HasPrefix(cand.BaseNodeID, config.OpenSSHNodePrefix) {
+		for _, raw := range cand.UnmanagedHosts {
+			unwrapped := config.UnwrapOpenSSHSelector(strings.TrimSpace(raw))
+			if matchesAnyWant(unwrapped) {
+				return true
+			}
+			if _, h, _, err := ParseAddr(unwrapped); err == nil && matchesAnyWant(h) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func unwrapExcludeBaseHost(id string) string {
+	unwrapped := strings.TrimSpace(config.UnwrapOpenSSHSelector(id))
+	if unwrapped == "" {
+		return ""
+	}
+	if _, h, _, err := ParseAddr(unwrapped); err == nil && h != "" {
+		return h
+	}
+	return unwrapped
+}
+
 func recordOpenSSHCompositeTargetExclude(
 	res config.ResolvedTarget,
 	hasOpenSSHPrefix bool,
@@ -235,8 +370,12 @@ func recordOpenSSHCompositeTargetExclude(
 	candidates []ExcludeTargetInfo,
 	resolved map[string]struct{},
 ) {
-	if res.User != "" && res.Port > 0 {
-		resolved[config.OpenSSHNodePrefix+config.FormatNodeID(res.User, res.OpenSSHAlias, res.Port)] = struct{}{}
+	effResPort := effectiveExcludePort(res.Port)
+	if res.User != "" {
+		resolved[config.OpenSSHNodePrefix+config.FormatNodeID(res.User, res.OpenSSHAlias, effResPort)] = struct{}{}
+		if res.CanonicalHost != "" {
+			resolved[config.OpenSSHNodePrefix+config.FormatNodeID(res.User, res.CanonicalHost, effResPort)] = struct{}{}
+		}
 	}
 	if !hasOpenSSHPrefix && isSavedNodeID(res.BaseNodeID) {
 		if id := firstNonEmpty(res.MatchedNodeID, res.NodeID); id != "" {
@@ -245,14 +384,26 @@ func recordOpenSSHCompositeTargetExclude(
 		addSavedBaseCandidates(resolved, res.BaseNodeID, addrUser, addrPort, candidates)
 	}
 	for _, cand := range candidates {
-		if cand.OpenSSHAlias != res.OpenSSHAlias || !matchesUserPortFilter(cand, addrUser, addrPort) {
+		if !candidateMatchesOpenSSHExcludeName(cand, res, addrHost) || !matchesUserPortFilter(cand, addrUser, addrPort) {
 			continue
 		}
-		if cand.User != "" && cand.Port > 0 {
-			resolved[config.OpenSSHNodePrefix+config.FormatNodeID(cand.User, cand.OpenSSHAlias, cand.Port)] = struct{}{}
-		}
-		if cand.NodeID != "" {
-			resolved[cand.NodeID] = struct{}{}
+		if cand.User != "" {
+			candPort := effectiveExcludePort(cand.Port)
+			if res.OpenSSHAlias != "" {
+				resolved[config.OpenSSHNodePrefix+config.FormatNodeID(cand.User, res.OpenSSHAlias, candPort)] = struct{}{}
+			}
+			if cand.OpenSSHAlias != "" {
+				resolved[config.OpenSSHNodePrefix+config.FormatNodeID(cand.User, cand.OpenSSHAlias, candPort)] = struct{}{}
+			}
+			if cand.CanonicalHost != "" {
+				resolved[config.OpenSSHNodePrefix+config.FormatNodeID(cand.User, cand.CanonicalHost, candPort)] = struct{}{}
+			}
+			if res.CanonicalHost != "" {
+				resolved[config.OpenSSHNodePrefix+config.FormatNodeID(cand.User, res.CanonicalHost, candPort)] = struct{}{}
+			}
+			if addrHost != "" {
+				resolved[config.OpenSSHNodePrefix+config.FormatNodeID(cand.User, addrHost, candPort)] = struct{}{}
+			}
 		}
 	}
 	if !hasOpenSSHPrefix {
@@ -304,14 +455,26 @@ func recordCandidateTrialExclude(
 	addrPort uint16,
 ) {
 	if addrUser != "" || addrPort != 0 {
-		if cand.NodeID != "" {
-			trial[cand.NodeID] = struct{}{}
-		} else if cand.User != "" {
-			key := config.FormatNodeID(cand.User, addrHost, effectiveExcludePort(cand.Port))
-			if hasOpenSSHPrefix {
-				key = config.OpenSSHNodePrefix + key
+		recordNodeID := cand.NodeID
+		if recordNodeID != "" && (!strings.HasPrefix(recordNodeID, config.OpenSSHNodePrefix) || hasCompositeExcludeAddr(recordNodeID)) {
+			trial[recordNodeID] = struct{}{}
+		}
+		if cand.User != "" {
+			effPort := effectiveExcludePort(cand.Port)
+			recordHost := func(h string) {
+				if h == "" {
+					return
+				}
+				trial[config.OpenSSHNodePrefix+config.FormatNodeID(cand.User, h, effPort)] = struct{}{}
+				if !hasOpenSSHPrefix {
+					trial[config.FormatNodeID(cand.User, h, effPort)] = struct{}{}
+				}
 			}
-			trial[key] = struct{}{}
+			recordHost(addrHost)
+			recordHost(cand.OpenSSHAlias)
+			recordHost(cand.CanonicalHost)
+		} else if recordNodeID != "" {
+			trial[recordNodeID] = struct{}{}
 		}
 		return
 	}
@@ -473,6 +636,12 @@ func matchesUserPortFilter(cand ExcludeTargetInfo, wantUser string, wantPort uin
 	return true
 }
 
+func hasCompositeExcludeAddr(nodeID string) bool {
+	unwrapped := strings.TrimPrefix(strings.TrimSpace(nodeID), config.OpenSSHNodePrefix)
+	u, _, p, err := ParseAddr(unwrapped)
+	return err == nil && u != "" && p != 0
+}
+
 func candidateMatchesHost(cand ExcludeTargetInfo, wantHost, resolvedHost string) bool {
 	check := func(candidateHost string) bool {
 		if candidateHost == "" {
@@ -484,6 +653,9 @@ func candidateMatchesHost(cand ExcludeTargetInfo, wantHost, resolvedHost string)
 		return resolvedHost != "" && sameExcludeHost(candidateHost, resolvedHost)
 	}
 	if cand.OpenSSHAlias != "" && check(cand.OpenSSHAlias) {
+		return true
+	}
+	if cand.CanonicalHost != "" && check(cand.CanonicalHost) {
 		return true
 	}
 	for _, h := range cand.UnmanagedHosts {
@@ -524,9 +696,21 @@ type ExcludeTargetInfo struct {
 	MatchedNodeID  string
 	BaseNodeID     string
 	OpenSSHAlias   string
+	CanonicalHost  string
 	User           string
 	Port           uint16
 	UnmanagedHosts []string
+}
+
+func matchesOpenSSHHostExcludeKeys(excludes map[string]struct{}, host, user string, port uint16) bool {
+	if host == "" {
+		return false
+	}
+	var hostID string
+	if user != "" {
+		hostID = config.OpenSSHNodePrefix + config.FormatNodeID(user, host, effectiveExcludePort(port))
+	}
+	return hasAnyExcludeKey(excludes, config.OpenSSHNodePrefix+host, host, hostID)
 }
 
 func hasAnyExcludeKey(excludes map[string]struct{}, keys ...string) bool {
@@ -552,18 +736,22 @@ func IsTargetExcluded(excludes map[string]struct{}, info ExcludeTargetInfo) bool
 		return true
 	}
 	if strings.HasPrefix(info.BaseNodeID, config.OpenSSHNodePrefix) {
-		if hasAnyExcludeKey(excludes, info.BaseNodeID, config.OpenSSHNodePrefix+config.UnwrapOpenSSHSelector(info.BaseNodeID)) {
+		unwrappedBase := config.UnwrapOpenSSHSelector(info.BaseNodeID)
+		if hasAnyExcludeKey(excludes, info.BaseNodeID, config.OpenSSHNodePrefix+unwrappedBase) {
+			return true
+		}
+		if _, parsedH, _, err := ParseAddr(unwrappedBase); err == nil && parsedH != "" {
+			unwrappedBase = parsedH
+		}
+		if matchesOpenSSHHostExcludeKeys(excludes, unwrappedBase, info.User, info.Port) {
 			return true
 		}
 	}
-	if info.OpenSSHAlias != "" {
-		var aliasID string
-		if info.User != "" && info.Port > 0 {
-			aliasID = config.OpenSSHNodePrefix + config.FormatNodeID(info.User, info.OpenSSHAlias, info.Port)
-		}
-		if hasAnyExcludeKey(excludes, config.OpenSSHNodePrefix+info.OpenSSHAlias, info.OpenSSHAlias, aliasID) {
-			return true
-		}
+	if matchesOpenSSHHostExcludeKeys(excludes, info.OpenSSHAlias, info.User, info.Port) {
+		return true
+	}
+	if matchesOpenSSHHostExcludeKeys(excludes, info.CanonicalHost, info.User, info.Port) {
+		return true
 	}
 	return matchesUnmanagedHostExclude(excludes, info)
 }
@@ -589,7 +777,17 @@ func matchesUnmanagedHostExclude(excludes map[string]struct{}, info ExcludeTarge
 		if unwrapped != "" && !savedBase {
 			prefixed = config.OpenSSHNodePrefix + unwrapped
 		}
-		if hasAnyExcludeKey(excludes, h, unwrapped, prefixed) {
+		var qualified, prefixedQualified string
+		if unwrapped != "" && !savedBase && info.User != "" {
+			if ip, err := netip.ParseAddr(strings.TrimPrefix(strings.TrimSuffix(unwrapped, "]"), "[")); err == nil {
+				qualified = config.FormatNodeID(info.User, ip.String(), effectiveExcludePort(info.Port))
+				prefixedQualified = config.OpenSSHNodePrefix + qualified
+			} else if !strings.ContainsAny(unwrapped, "@:") {
+				qualified = config.FormatNodeID(info.User, unwrapped, effectiveExcludePort(info.Port))
+				prefixedQualified = config.OpenSSHNodePrefix + qualified
+			}
+		}
+		if hasAnyExcludeKey(excludes, h, unwrapped, prefixed, qualified, prefixedQualified) {
 			return true
 		}
 	}

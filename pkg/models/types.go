@@ -236,6 +236,8 @@ type Node struct {
 
 	// OpenSSHAlias 记录运行时从 ~/.ssh/config 具体 Host 块派生该节点时的源别名（不序列化落盘）
 	OpenSSHAlias string `yaml:"-" json:"-"`
+	// CanonicalHost 记录 hostname 规范化后的真实主机名（仅运行时内存携带，不序列化落盘）
+	CanonicalHost string `yaml:"-" json:"-"`
 }
 
 // NodeFilter 用于批量操作时筛选节点

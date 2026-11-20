@@ -13,7 +13,7 @@ xops ssh -i ~/.ssh/id_ed25519 deploy@192.0.2.10
 xops ssh -J bastion.example.com deploy@192.0.2.10
 ```
 
-直连跳板支持 IP、FQDN 或 `host:port`；不带域名后缀的单标签跳板名称（如 `-J jumphost`）需预先保存为节点或别名。以显式用户名连接同一台主机时，凭据保持独立隔离。
+直连跳板支持 IP、FQDN 或 `host:port`；不带域名后缀的单标签跳板名称（如 `-J jumphost`）需预先保存为节点、配置别名，或在 `~/.ssh/config` 中存在对应 `Host` 块（不支持通配符别名）。以显式用户名连接同一台主机时，凭据保持独立隔离。
 
 - **用户名与端口参数优先级**（遵循 OpenSSH 原生语义）：
   - `xops ssh` 与单目标 `xops exec`：显式 `-l`/`-p` 以及 `-o User`/`-o Port` 覆盖目标地址中的 `user@` 与 `:port`。
@@ -269,7 +269,7 @@ xops ssh -o Tunnel=ethernet -w 1:any -N gw
   - 允许外部网络主机连接本地转发的端口（对应 `-o GatewayPorts=yes`）。
 - **会话控制与后台运行 (`-f`, `-N`, `-n`)**：
   - `-N`（`--no-cmd`）：不执行远程命令也不分配 Shell，专用于端口转发与隧道（对应 `-o SessionType=none`）。与显式远程命令互斥。
-  - `-f`（`--background`）：在身份验证和端口转发建立后转入后台运行。支持 `xops ssh -f host <cmd>`（后台执行远程命令）以及 `xops ssh -f -N ...`（后台运行转发隧道），后台模式自动隐含 `-n`（标准输入重定向至 `/dev/null`）。若未指定远程命令且未指定 `-N`，则直接报错拒绝。
+  - `-f`（`--background`，或通过 `-o` / 配置启用 `ForkAfterAuthentication yes`）：在身份验证和端口转发建立后转入后台运行。支持 `xops ssh -f host <cmd>`（后台执行远程命令）、`xops ssh -f -N ...`（后台运行转发隧道）或配合 `-o RemoteCommand=...` / `-o SessionType=none`，后台模式自动隐含 `-n`（标准输入重定向至 `/dev/null`）。若未指定有效远程命令且未开启无命令模式（`-N` / `SessionType=none`），或与 `--password-stdin`、`--passphrase-stdin`、`--otp`、`--otp-stdin`、`ProxyCommand`、`-s` 或非 `proxy` 的 `-O` 控制命令组合使用，均会直接报错拒绝；需要后台运行请预先配置公钥代理或持久化凭据存储。
   - `-n`（`--stdin-redirect`）：将标准输入重定向到 `/dev/null`，防止后台读取终端输入（对应 `-o StdinNull=yes`）。
 - **多路复用动态转发 (`-O forward`)**：
   - 向活动 Master 发送控制命令动态增减转发。建立 `-R 0:...` 动态分配端口转发时，动态分配的端口号输出到 `stdout`，而 `Forwarding request sent.` 提示写入 `stderr`。

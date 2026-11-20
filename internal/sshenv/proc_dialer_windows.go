@@ -20,13 +20,14 @@ import (
 var procNtResumeProcess = windows.NewLazySystemDLL("ntdll.dll").NewProc("NtResumeProcess")
 
 type platformProc struct {
-	process *os.Process
-	job     windows.Handle
-	jobOnce sync.Once
+	process     *os.Process
+	job         windows.Handle
+	killOnClose bool
+	jobOnce     sync.Once
 }
 
-func startPlatformShellCommand(command string, stdin io.Reader, stdout, stderr io.Writer) (*platformProc, *exec.Cmd, error) {
-	job, err := createKillOnCloseJobObject()
+func startPlatformShellCommand(command string, stdin io.Reader, stdout, stderr io.Writer, killTreeOnNormalExit bool) (*platformProc, *exec.Cmd, error) {
+	job, err := createShellJobObject(killTreeOnNormalExit)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -45,33 +46,36 @@ func startPlatformShellCommand(command string, stdin io.Reader, stdout, stderr i
 	}
 
 	proc := &platformProc{
-		process: cmd.Process,
-		job:     job,
+		process:     cmd.Process,
+		job:         job,
+		killOnClose: killTreeOnNormalExit,
 	}
 	if err := assignAndResumeSuspendedProcess(job, cmd.Process.Pid); err != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
-		proc.closeJob()
+		proc.terminateAndCloseJob()
 		return nil, nil, err
 	}
 	return proc, cmd, nil
 }
 
-func createKillOnCloseJobObject() (windows.Handle, error) {
+func createShellJobObject(killOnClose bool) (windows.Handle, error) {
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
 		return 0, fmt.Errorf("create Windows job object: %w", err)
 	}
-	var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
-	info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-	if _, err := windows.SetInformationJobObject(
-		job,
-		windows.JobObjectExtendedLimitInformation,
-		uintptr(unsafe.Pointer(&info)),
-		uint32(unsafe.Sizeof(info)),
-	); err != nil {
-		_ = windows.CloseHandle(job)
-		return 0, fmt.Errorf("configure Windows job object: %w", err)
+	if killOnClose {
+		var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+		info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+		if _, err := windows.SetInformationJobObject(
+			job,
+			windows.JobObjectExtendedLimitInformation,
+			uintptr(unsafe.Pointer(&info)),
+			uint32(unsafe.Sizeof(info)),
+		); err != nil {
+			_ = windows.CloseHandle(job)
+			return 0, fmt.Errorf("configure Windows job object: %w", err)
+		}
 	}
 	return job, nil
 }
@@ -138,21 +142,38 @@ func (p *platformProc) closeJob() {
 	})
 }
 
+func (p *platformProc) terminateAndCloseJob() {
+	if p == nil {
+		return
+	}
+	p.jobOnce.Do(func() {
+		if p.job != 0 {
+			_ = windows.TerminateJobObject(p.job, 1)
+			_ = windows.CloseHandle(p.job)
+			p.job = 0
+		}
+	})
+}
+
 func (p *platformProc) terminateTree(_ time.Duration, _ <-chan struct{}) {
 	if p == nil {
 		return
 	}
-	p.closeJob()
+	p.terminateAndCloseJob()
 	if p.process != nil {
 		_ = p.process.Kill()
 	}
 }
 
-func (p *platformProc) reapRemainingGroup(_ time.Duration, _ <-chan struct{}, alreadyExited bool) {
+func (p *platformProc) detachSentinelPipe() *os.File { return nil }
+
+func pipeHasOpenWriter(_ *os.File) bool { return false }
+
+func (p *platformProc) reapRemainingGroup(_ time.Duration, _, _ <-chan struct{}, alreadyExited bool) {
 	if p == nil {
 		return
 	}
-	p.closeJob()
+	p.terminateAndCloseJob()
 	if !alreadyExited && p.process != nil {
 		_ = p.process.Kill()
 	}
@@ -162,8 +183,9 @@ func (p *platformProc) cleanupAfterWait(canceled bool) {
 	if p == nil {
 		return
 	}
-	p.closeJob()
-	if canceled && p.process != nil {
-		_ = p.process.Kill()
+	if canceled || p.killOnClose {
+		p.terminateAndCloseJob()
+	} else {
+		p.closeJob()
 	}
 }

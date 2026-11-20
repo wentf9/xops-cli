@@ -255,7 +255,7 @@ func TestParseControlPersist_Durations(t *testing.T) {
 }
 
 func TestParseControlPersist_Invalid(t *testing.T) {
-	invalids := []string{"-5", "invalid", "10x", "0m", "m"}
+	invalids := []string{"-5", "invalid", "10x", "0m", "m", "10000000000", "18446744074", "99999999999w", "1h10000000000s"}
 	for _, inv := range invalids {
 		_, _, _, err := ParseControlPersist(inv)
 		if err == nil {
@@ -569,5 +569,16 @@ func TestExpandControlPath_AndConnectorTargetContext_EmptyUserFallsBackToLocalUs
 	})
 	if targetCtx.User != "localdev" || targetCtx.Port != 22 {
 		t.Fatalf("expected buildTargetContext to populate User='localdev' and Port=22, got %+v", targetCtx)
+	}
+}
+
+func TestParseOpenSSHDuration_RejectsSignedLeadingPlus(t *testing.T) {
+	if got, err := parseOpenSSHDuration("10"); err != nil || got != 10*time.Second {
+		t.Fatalf("parseOpenSSHDuration(\"10\") = (%v, %v), want (10s, nil)", got, err)
+	}
+	for _, raw := range []string{"+10", "-10", "+10s", "-10s", "+"} {
+		if _, err := parseOpenSSHDuration(raw); err == nil {
+			t.Fatalf("parseOpenSSHDuration(%q) succeeded, want error", raw)
+		}
 	}
 }

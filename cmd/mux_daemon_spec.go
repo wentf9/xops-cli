@@ -40,6 +40,8 @@ type MuxDaemonSpec struct {
 	GatewayPorts     bool                  `json:"gateway_ports,omitempty"`
 	IdentityFiles    []string              `json:"identity_files,omitempty"`
 	Options          []string              `json:"options,omitempty"`
+	PreserveSelector bool                  `json:"preserve_selector,omitempty"`
+	Canonicalized    bool                  `json:"canonicalized,omitempty"`
 }
 
 // Validate checks that s contains well-formed detached daemon parameters.
@@ -85,7 +87,15 @@ func readMuxDaemonSpec(r io.Reader) (MuxDaemonSpec, error) {
 }
 
 func (o *SshOptions) buildMuxDaemonSpec(nodeID, expandedPath string, master *ssh.MuxServer) MuxDaemonSpec {
-	targetHost, port, user := o.resolveMuxDaemonTarget(nodeID, master)
+	return o.buildMuxDaemonSpecWithProvider(nil, nodeID, expandedPath, master)
+}
+
+func (o *SshOptions) buildMuxDaemonSpecWithProvider(provider config.ConfigProvider, nodeID, expandedPath string, master *ssh.MuxServer) MuxDaemonSpec {
+	return o.buildMuxDaemonSpecWithRawNode(provider, nodeID, nodeID, expandedPath, master)
+}
+
+func (o *SshOptions) buildMuxDaemonSpecWithRawNode(provider config.ConfigProvider, nodeID, rawNodeID, expandedPath string, master *ssh.MuxServer) MuxDaemonSpec {
+	targetHost, port, user, preserveSelector := o.resolveMuxDaemonTargetWithProvider(provider, nodeID, master)
 	forTarget := o.shouldPassIdentityFile(nodeID, master)
 	masterMode, persist := o.resolveMuxDaemonControl(master)
 
@@ -102,11 +112,31 @@ func (o *SshOptions) buildMuxDaemonSpec(nodeID, expandedPath string, master *ssh
 		ConfigFile:       o.control.ConfigFile,
 		AddressFamily:    o.control.AddressFamily,
 		IdentityFiles:    o.resolveMuxDaemonIdentityFiles(nodeID, master, forTarget),
+		PreserveSelector: preserveSelector,
 	}
+	canonHost := ""
 	if master != nil {
 		spec.OriginalHost = strings.TrimSpace(master.Target().OriginalHost)
+		canonHost = strings.TrimSpace(master.Target().CanonicalHost)
 		if dh := cleanMuxHost(master.Target().Host); dh != "" && dh != cleanMuxHost(targetHost) {
 			spec.DialHost = dh
+		}
+	}
+	if canonHost == "" {
+		canonHost = resolveNodeCanonicalHost(provider, nodeID)
+	}
+	if canonHost == "" && rawNodeID != "" && rawNodeID != nodeID {
+		canonHost = resolveNodeCanonicalHost(provider, rawNodeID)
+	}
+	spec.Canonicalized = (forTarget && o.canonicalized) || canonHost != ""
+	if spec.OriginalHost == "" {
+		if forTarget && o.canonicalized {
+			spec.OriginalHost = o.originalHostForExpansion()
+		} else if spec.Canonicalized {
+			spec.OriginalHost = resolveNodeOpenSSHAlias(provider, nodeID)
+			if spec.OriginalHost == "" && rawNodeID != "" && rawNodeID != nodeID {
+				spec.OriginalHost = resolveNodeOpenSSHAlias(provider, rawNodeID)
+			}
 		}
 	}
 	if forTarget {
@@ -123,7 +153,7 @@ func (o *SshOptions) resolveMuxDaemonJumpHost(master *ssh.MuxServer) string {
 	jumpHost := o.JumpHost
 	if master != nil {
 		jumpHost = master.Target().JumpHost
-		if jumpHost == "" && strings.EqualFold(strings.TrimSpace(o.JumpHost), "none") {
+		if jumpHost == "" && ssh.IsDisabledProxyJump(o.JumpHost) {
 			return "none"
 		}
 	}
@@ -198,12 +228,15 @@ func (o *SshOptions) applyMuxDaemonSpec(spec MuxDaemonSpec) error {
 		targetHost = config.OpenSSHNodePrefix + targetHost
 	}
 	o.muxDaemonMode = true
+	o.preserveDaemonSelector = spec.PreserveSelector
 	o.Host = targetHost
 	o.Port = spec.Port
 	o.User = spec.User
 	o.JumpHost = spec.JumpHost
+	o.cliJumpHost = strings.TrimSpace(spec.JumpHost)
 	o.HostName = spec.DialHost
 	o.cliHostName = ""
+	o.canonicalized = spec.Canonicalized
 	o.originalHost = strings.TrimSpace(spec.OriginalHost)
 	o.control.ConfigFile = spec.ConfigFile
 	o.control.AddressFamily = spec.AddressFamily
@@ -364,7 +397,8 @@ func (o *SshOptions) shouldPassIdentityFile(nodeID string, master *ssh.MuxServer
 	if master == nil {
 		return true
 	}
-	if o.JumpHost != "" && master.Target().JumpHost == "" {
+	hasActiveCLIJump := ssh.HasActiveProxyJump(o.JumpHost)
+	if hasActiveCLIJump && master.Target().JumpHost == "" {
 		return false
 	}
 	if len(o.targetNodeIDs) > 0 {
@@ -376,7 +410,7 @@ func (o *SshOptions) shouldPassIdentityFile(nodeID string, master *ssh.MuxServer
 	if o.User != "" && master.Target().User != "" && o.User != master.Target().User {
 		return false
 	}
-	if o.JumpHost != "" && isMasterInJumpSpec(nodeID, master, o.JumpHost) {
+	if hasActiveCLIJump && isMasterInJumpSpec(nodeID, master, o.JumpHost) {
 		return false
 	}
 	if o.Host != "" || o.Target.Selector != "" {
@@ -388,7 +422,7 @@ func (o *SshOptions) shouldPassIdentityFile(nodeID string, master *ssh.MuxServer
 func isMasterInJumpSpec(nodeID string, master *ssh.MuxServer, jumpSpec string) bool {
 	for hop := range strings.SplitSeq(jumpSpec, ",") {
 		hop = strings.TrimSpace(hop)
-		if hop == "" {
+		if hop == "" || ssh.IsDisabledProxyJump(hop) {
 			continue
 		}
 		if matchesTargetSelector(nodeID, master, hop, hop) {
@@ -475,6 +509,11 @@ func isTargetOnlyMuxDaemonOption(opt string) bool {
 }
 
 func (o *SshOptions) resolveMuxDaemonTarget(nodeID string, master *ssh.MuxServer) (host string, port int, user string) {
+	host, port, user, _ = o.resolveMuxDaemonTargetWithProvider(nil, nodeID, master)
+	return host, port, user
+}
+
+func (o *SshOptions) resolveMuxDaemonTargetWithProvider(provider config.ConfigProvider, nodeID string, master *ssh.MuxServer) (host string, port int, user string, preserveSelector bool) {
 	rawSelector := strings.TrimSpace(nodeID)
 	if rawSelector == "" && master != nil {
 		rawSelector = strings.TrimSpace(master.Target().OriginalHost)
@@ -482,21 +521,7 @@ func (o *SshOptions) resolveMuxDaemonTarget(nodeID string, master *ssh.MuxServer
 	if rawSelector == "" {
 		rawSelector = strings.TrimSpace(o.Host)
 	}
-	var parsedUser string
-	var parsedPort int
-	if strings.HasPrefix(rawSelector, config.OpenSSHNodePrefix) {
-		host = config.UnwrapOpenSSHSelector(rawSelector)
-		if u, _, p, err := utils.ParseAddr(strings.TrimPrefix(rawSelector, config.OpenSSHNodePrefix)); err == nil {
-			parsedUser = u
-			parsedPort = int(p)
-		}
-	} else if u, h, p, err := utils.ParseAddr(rawSelector); err == nil && u != "" && p != 0 && h != "" {
-		host = h
-		parsedUser = u
-		parsedPort = int(p)
-	} else {
-		host = rawSelector
-	}
+	host, parsedUser, parsedPort, preserveSelector := extractMuxDaemonTargetComponents(provider, rawSelector)
 	if host == "" && master != nil {
 		host = master.Target().Host
 	}
@@ -514,5 +539,25 @@ func (o *SshOptions) resolveMuxDaemonTarget(nodeID string, master *ssh.MuxServer
 	} else {
 		user = parsedUser
 	}
-	return host, port, user
+	return host, port, user, preserveSelector
+}
+
+func extractMuxDaemonTargetComponents(provider config.ConfigProvider, rawSelector string) (host, parsedUser string, parsedPort int, preserveSelector bool) {
+	if provider != nil && rawSelector != "" {
+		if _, ok := provider.GetNode(rawSelector); ok {
+			return rawSelector, "", 0, true
+		}
+	}
+	if strings.HasPrefix(rawSelector, config.OpenSSHNodePrefix) {
+		host = config.UnwrapOpenSSHSelector(rawSelector)
+		if u, _, p, err := utils.ParseAddr(strings.TrimPrefix(rawSelector, config.OpenSSHNodePrefix)); err == nil {
+			parsedUser = u
+			parsedPort = int(p)
+		}
+		return host, parsedUser, parsedPort, false
+	}
+	if u, h, p, err := utils.ParseAddr(rawSelector); err == nil && u != "" && p != 0 && h != "" {
+		return h, u, int(p), false
+	}
+	return rawSelector, "", 0, false
 }

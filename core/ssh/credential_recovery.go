@@ -64,31 +64,6 @@ func (c *Connector) recoverablePasswordAuth(ctx context.Context, policy dialPoli
 	}), 3)
 }
 
-func (c *Connector) recoverableKeyAuth(ctx context.Context, policy dialPolicy, attempt *handshakeAttempt, prompter SecretPrompter) (cryptoSSH.AuthMethod, func(), error) {
-	roCfg := policy.readOnlyConfig()
-	resolver := &initialKeySecretResolver{value: attempt.consumeInitialPassphrase(), next: c.secretResolver}
-	provider := &autoSecretProvider{
-		lifecycleCtx: ctx, nodeID: policy.nodeID, user: policy.user,
-		host: policy.address, port: policy.port, versionToken: policy.authUpdateToken,
-		resolver: resolver, prompter: prompter, recoveryPrompter: credentialRecoveryPrompter(c.getNodeSecretPrompter(roCfg)),
-		handshakeTimeout: c.getNodeHandshakeTimeout(roCfg), interactionTimeout: c.interactionTimeout,
-	}
-	method, err := resolveKeyAuthMethod(resolveKeyPath(policy.keyPath, c.environment.ResolveKeyPath), provider, func(_ string, passphrase string) {
-		attempt.recordPassphrase(policy.keyPath, passphrase)
-	}, c.getLogger())
-	cleanup := func() {
-		resolver.mu.Lock()
-		defer resolver.mu.Unlock()
-		zeroBytes(resolver.value)
-		resolver.value = nil
-	}
-	if err != nil {
-		cleanup()
-		return nil, nil, err
-	}
-	return method, cleanup, nil
-}
-
 type initialKeySecretResolver struct {
 	mu    sync.Mutex
 	value []byte
@@ -100,7 +75,7 @@ func (r *initialKeySecretResolver) ResolveSecret(ctx context.Context, req Secret
 		return nil, err
 	}
 	r.mu.Lock()
-	if len(r.value) != 0 {
+	if req.Kind == SecretKindPrivateKeyPassphrase && len(r.value) != 0 {
 		value := r.value
 		r.value = nil
 		r.mu.Unlock()

@@ -48,6 +48,7 @@ type SSHControlFlags struct {
 	ConfigFile    string   // -F <configfile|none>
 	AddressFamily string   // -4 ("inet") or -6 ("inet6"), last flag wins
 	Options       []string // -o Key=Value options
+	ctlCmdSet     bool
 	onOptionAdded func(string)
 }
 
@@ -117,11 +118,17 @@ func (f *SSHControlFlags) RegisterAddressFamilyFlags(cmd *cobra.Command) {
 // ToSessionControlOptions converts SSHControlFlags into adapter.SessionControlOptions.
 // Precedence: explicit CLI flags (-M, -S) override values parsed from -o options.
 func (f *SSHControlFlags) ToSessionControlOptions() (adapter.SessionControlOptions, error) {
+	return f.ToSessionControlOptionsWithJump("")
+}
+
+// ToSessionControlOptionsWithJump converts SSHControlFlags into adapter.SessionControlOptions
+// while preserving precedence against an explicit CLI -J / --jump override.
+func (f *SSHControlFlags) ToSessionControlOptionsWithJump(cliJump string) (adapter.SessionControlOptions, error) {
 	var sessionOpts adapter.SessionControlOptions
 
 	// 1. Parse -o options first if provided
 	if len(f.Options) > 0 {
-		parsed, err := adapter.ParseOptionStrings(f.Options)
+		parsed, err := adapter.ParseOptionStringsWithJump(f.Options, cliJump)
 		if err != nil {
 			return sessionOpts, err
 		}
@@ -137,10 +144,13 @@ func (f *SSHControlFlags) ToSessionControlOptions() (adapter.SessionControlOptio
 
 	// 3. Command-line -S flag overrides any ControlPath from -o
 	if f.ControlPath != "" {
-		if !strings.EqualFold(strings.TrimSpace(f.ControlPath), "none") && f.MasterCount == 0 && sessionOpts.Master == nil {
+		controlPath := f.ControlPath
+		if strings.EqualFold(strings.TrimSpace(controlPath), "none") {
+			controlPath = "none"
+		} else if f.MasterCount == 0 && sessionOpts.Master == nil {
 			sessionOpts.AllowReuse = true
 		}
-		sessionOpts.SetPath(f.ControlPath)
+		sessionOpts.SetPath(controlPath)
 	}
 
 	// 4. Command-line -4 / -6 flag overrides any AddressFamily from -o
@@ -161,7 +171,7 @@ func (f *SSHControlFlags) Validate() error {
 	if _, err := f.ToSessionControlOptions(); err != nil {
 		return f.controlUsageError(err)
 	}
-	if f.CtlCmd != "" {
+	if f.ctlCmdSet || f.CtlCmd != "" {
 		cmdLower := strings.ToLower(strings.TrimSpace(f.CtlCmd))
 		if !validControlCommands[cmdLower] {
 			return f.controlUsageError(fmt.Errorf("unknown control command %q (supported: check, exit, stop, forward, cancel, proxy, proxy-stream, conninfo, channels)", f.CtlCmd))
@@ -169,7 +179,7 @@ func (f *SSHControlFlags) Validate() error {
 		if f.MasterCount > 0 {
 			return f.controlUsageError(fmt.Errorf("control command (-O) cannot be combined with master mode (-M)"))
 		}
-		if strings.TrimSpace(f.ControlPath) == "none" {
+		if strings.EqualFold(strings.TrimSpace(f.ControlPath), "none") {
 			return f.controlUsageError(fmt.Errorf("control command (-O) cannot be specified with -S none"))
 		}
 	}
@@ -180,10 +190,14 @@ func (f *SSHControlFlags) Validate() error {
 // the OpenSSH exit status: every -O failure exits 255, including arguments that
 // were rejected before the socket was contacted.
 func (f *SSHControlFlags) controlUsageError(err error) error {
-	if err == nil || strings.TrimSpace(f.CtlCmd) == "" {
+	if err == nil || f == nil || (!f.ctlCmdSet && f.CtlCmd == "") {
 		return err
 	}
-	return &ControlExitError{Code: 255, Message: err.Error()}
+	var control *ControlExitError
+	if errors.As(err, &control) {
+		return err
+	}
+	return &ControlExitError{Code: 255, Message: err.Error(), Err: err}
 }
 
 // ControlCommandWithoutTarget reports whether -O addresses an explicit -S socket
@@ -198,7 +212,7 @@ func (f *SSHControlFlags) ControlCommandWithoutTarget() bool {
 		return false
 	}
 	path := strings.TrimSpace(f.ControlPath)
-	return path != "" && path != "none"
+	return path != "" && !strings.EqualFold(path, "none")
 }
 
 func effectiveConnectionTarget(opts *SshOptions, nodeID string) config.ConnectionTarget {
@@ -207,6 +221,9 @@ func effectiveConnectionTarget(opts *SshOptions, nodeID string) config.Connectio
 		target = opts.Target
 		if strings.TrimSpace(target.Selector) == "" {
 			target.Selector = strings.TrimSpace(opts.Host)
+		}
+		if strings.TrimSpace(target.OriginalHost) == "" && strings.TrimSpace(opts.originalHost) != "" {
+			target.OriginalHost = strings.TrimSpace(opts.originalHost)
 		}
 		if strings.TrimSpace(opts.User) != "" && (!target.HasUser || target.User != strings.TrimSpace(opts.User)) {
 			target.User = strings.TrimSpace(opts.User)
@@ -247,49 +264,87 @@ func controlSocketPath(opts *SshOptions, provider config.ConfigProvider, nodeID 
 	}
 	connTarget := effectiveConnectionTarget(opts, nodeID)
 	target := controlTarget(opts, provider, nodeID)
+	registerControlCanonicalTarget(provider, opts, nodeID)
 	controlNodeID := resolveEffectiveControlNodeID(provider, nodeID, target.OriginalHost)
-	ctrl, err := resolveControlConfig(provider, controlNodeID, connTarget.Selector, sessionOpts)
+	if controlNodeID == "" {
+		if _, canonHost := canonicalControlOriginAndHost(opts); canonHost != "" {
+			controlNodeID = config.OpenSSHNodePrefix + canonHost
+		}
+	}
+	ctrl, err := resolveControlConfig(provider, controlNodeID, connTarget.Selector, target.OriginalHost, sessionOpts)
 	if err != nil {
 		return "", err
 	}
-	if ctrl == nil || ctrl.Path == "" || ctrl.Path == "none" {
+	if ctrl == nil || ctrl.Path == "" || strings.EqualFold(strings.TrimSpace(ctrl.Path), "none") {
 		return "", nil
 	}
 	return ssh.ExpandControlPath(ctrl.Path, sshenv.Discover(), target)
 }
 
 func resolveEffectiveControlNodeID(provider config.ConfigProvider, nodeID, originalHost string) string {
+	if hasCanonicalControlHost(provider, nodeID) {
+		return nodeID
+	}
 	if originalHost == "" || originalHost == nodeID {
 		return nodeID
 	}
-	if strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) {
-		if cleanOrig, ok := config.OpenSSHOriginalHost(nodeID); ok && originalHost == cleanOrig {
-			return nodeID
-		}
-		alias := config.UnwrapOpenSSHSelector(nodeID)
-		if _, parsedHost, _, err := utils.ParseAddr(alias); err == nil && parsedHost != "" {
-			alias = parsedHost
-		}
-		setProviderOpenSSHAlias(provider, originalHost, alias)
-		return originalHost
-	}
-	if provider != nil {
-		if baseNode, ok := provider.GetNode(nodeID); ok && baseNode.OpenSSHAlias != "" {
-			setProviderOpenSSHAlias(provider, originalHost, baseNode.OpenSSHAlias)
-		} else if parser := providerOpenSSHParser(provider); parser != nil && !parser.HasHost(originalHost) {
-			if snap, err := provider.ResolveConnection(nodeID); err == nil && !strings.Contains(originalHost, "@") && snap.Host.Address != "" && !strings.EqualFold(snap.Host.Address, originalHost) {
-				setProviderOpenSSHAlias(provider, originalHost, snap.Host.Address)
+	if provider != nil && nodeID != "" {
+		if snap, err := provider.ResolveConnection(nodeID); err == nil {
+			if !strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) || snap.Provenance != config.ProvenanceOpenSSHVirtual {
+				return nodeID
 			}
 		}
 	}
+	if strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) {
+		return resolveOpenSSHControlNodeAlias(provider, nodeID, originalHost)
+	}
+	syncSavedControlNodeAlias(provider, nodeID, originalHost)
 	return originalHost
+}
+
+func hasCanonicalControlHost(provider config.ConfigProvider, nodeID string) bool {
+	if nodeID == "" || provider == nil {
+		return false
+	}
+	p, ok := provider.(interface{ NodeCanonicalHost(string) string })
+	return ok && p.NodeCanonicalHost(nodeID) != ""
+}
+
+func resolveOpenSSHControlNodeAlias(provider config.ConfigProvider, nodeID, originalHost string) string {
+	if cleanOrig, ok := config.OpenSSHOriginalHost(nodeID); ok && originalHost == cleanOrig {
+		return nodeID
+	}
+	alias := config.UnwrapOpenSSHSelector(nodeID)
+	if _, parsedHost, _, err := utils.ParseAddr(alias); err == nil && parsedHost != "" {
+		alias = parsedHost
+	}
+	setProviderOpenSSHAlias(provider, originalHost, alias)
+	return originalHost
+}
+
+func syncSavedControlNodeAlias(provider config.ConfigProvider, nodeID, originalHost string) {
+	if provider == nil {
+		return
+	}
+	if baseNode, ok := provider.GetNode(nodeID); ok && baseNode.OpenSSHAlias != "" {
+		setProviderOpenSSHAlias(provider, originalHost, baseNode.OpenSSHAlias)
+		return
+	}
+	parser := providerOpenSSHParser(provider)
+	if parser == nil || parser.HasHost(originalHost) {
+		return
+	}
+	snap, err := provider.ResolveConnection(nodeID)
+	if err == nil && !strings.Contains(originalHost, "@") && snap.Host.Address != "" && !strings.EqualFold(snap.Host.Address, originalHost) {
+		setProviderOpenSSHAlias(provider, originalHost, snap.Host.Address)
+	}
 }
 
 // resolveControlConfig resolves the effective multiplexing config for nodeID with
 // the given session overrides. When the selector matches no inventory node the
 // adapter still merges session, global, and OpenSSH layers, so an ad-hoc host is
 // validated exactly like a managed one.
-func resolveControlConfig(provider config.ConfigProvider, nodeID, selector string, sessionOpts adapter.SessionControlOptions) (*ssh.ControlConfig, error) {
+func resolveControlConfig(provider config.ConfigProvider, nodeID, selector, originalHost string, sessionOpts adapter.SessionControlOptions) (*ssh.ControlConfig, error) {
 	if provider == nil {
 		if sessionOpts.IsEmpty() {
 			return nil, nil
@@ -302,14 +357,18 @@ func resolveControlConfig(provider config.ConfigProvider, nodeID, selector strin
 		// back to session > global > OpenSSH, which is the ad-hoc case.
 		lookupKey = selector
 	}
-	return adapter.NewSSHAdapter(provider).ResolveControl(lookupKey, sessionOpts)
+	var adpOpts []adapter.Option
+	if orig := strings.TrimSpace(originalHost); orig != "" && lookupKey != "" {
+		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(lookupKey, adapter.SessionAuth{OriginalHost: orig}))
+	}
+	return adapter.NewSSHAdapter(provider, adpOpts...).ResolveControl(lookupKey, sessionOpts)
 }
 
 // mergeSessionControl converts session overrides into one ControlConfig layer.
 func mergeSessionControl(sessionOpts adapter.SessionControlOptions) *ssh.ControlConfig {
 	if opts := sessionOpts.ToSSHOptions(); opts != nil {
 		if ctrl := opts.ControlConfig(); ctrl != nil {
-			ctrl.AllowReuse = sessionOpts.AllowReuse && ctrl.Master == "" && ctrl.Path != "none"
+			ctrl.AllowReuse = sessionOpts.AllowReuse && ctrl.Master == "" && !strings.EqualFold(strings.TrimSpace(ctrl.Path), "none")
 			return ctrl
 		}
 	}
@@ -322,7 +381,7 @@ func mergeSessionControl(sessionOpts adapter.SessionControlOptions) *ssh.Control
 	}
 	if sessionOpts.Path != nil {
 		ctrl.Path = *sessionOpts.Path
-		if ctrl.Path == "none" {
+		if strings.EqualFold(strings.TrimSpace(ctrl.Path), "none") {
 			ctrl.AllowReuse = false
 		}
 	}
@@ -365,7 +424,7 @@ func controlTarget(opts *SshOptions, provider config.ConfigProvider, nodeID stri
 	}
 
 	jump := strings.TrimSpace(connTarget.ProxyJump)
-	if strings.EqualFold(jump, "none") {
+	if ssh.IsDisabledProxyJump(jump) {
 		jump = ""
 	}
 	orig := connTarget.Selector
@@ -463,7 +522,7 @@ func validateExplicitNonEmptyFlags(flags *pflag.FlagSet) error {
 		val, err := flags.GetString(name)
 		if err == nil && strings.TrimSpace(val) == "" {
 			if name == "control-command" {
-				return (&SSHControlFlags{CtlCmd: val}).controlUsageError(fmt.Errorf("unknown control command %q (supported: check, exit, stop, forward, cancel, proxy, proxy-stream, conninfo, channels)", val))
+				return (&SSHControlFlags{CtlCmd: val, ctlCmdSet: true}).controlUsageError(fmt.Errorf("unknown control command %q (supported: check, exit, stop, forward, cancel, proxy, proxy-stream, conninfo, channels)", val))
 			}
 			return fmt.Errorf("flag --%s must not be empty", name)
 		}
@@ -525,11 +584,15 @@ func ApplyGeneralOptions(opts *SshOptions, optionStrings []string, flags *pflag.
 			opts.IdentityFile = normalized[0]
 		}
 	}
+	allowJump := shouldApplyGeneralOption(flags, "jump", opts.JumpHost == "")
+	if !opts.appliedGeneralOpts && !allowJump && strings.TrimSpace(opts.JumpHost) != "" {
+		opts.cliJumpHost = strings.TrimSpace(opts.JumpHost)
+	}
 	st := generalOptionState{
 		allowPort:     shouldApplyGeneralOption(flags, "port", opts.Port == 0),
 		allowUser:     shouldApplyGeneralOption(flags, "login", opts.User == ""),
 		allowIdentity: true,
-		allowJump:     shouldApplyGeneralOption(flags, "jump", opts.JumpHost == ""),
+		allowJump:     allowJump,
 		allowHostName: opts.cliHostName == "" && opts.HostName == "",
 	}
 	for _, opt := range optionStrings {
@@ -569,9 +632,9 @@ func applyGeneralOption(opts *SshOptions, st *generalOptionState, key, val strin
 		st.seenUser = true
 	case "identityfile":
 		return applyIdentityFileGeneralOption(opts, st, key, val)
-	case "proxyjump":
+	case "proxyjump", "proxy_jump":
 		return applyProxyJumpGeneralOption(opts, st, key, val)
-	case "proxycommand":
+	case "proxycommand", "proxy_command":
 		return applyProxyCommandGeneralOption(st, key, val)
 	case "hostname":
 		return applyHostNameOption(opts, st, key, val)
@@ -595,8 +658,9 @@ func applyProxyJumpGeneralOption(opts *SshOptions, st *generalOptionState, key, 
 	if val == "" {
 		return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
 	}
-	if st.allowJump && !st.seenJump && !st.seenProxyCmd {
+	if st.allowJump && !st.seenJump && (!st.seenProxyCmd || ssh.IsDisabledProxyJump(val)) {
 		opts.JumpHost = val
+		opts.cliJumpHost = strings.TrimSpace(val)
 	}
 	st.seenJump = true
 	return nil

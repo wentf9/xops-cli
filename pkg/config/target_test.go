@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -2124,5 +2126,237 @@ func TestTargetResolution_ZeroPortAndEmptyUserInvariants(t *testing.T) {
 	}
 	if got, err := repoIdx.ResolveSelector("idxuser@zero-alias:22"); err != nil || got != "indexed-zero-port" {
 		t.Fatalf("expected ResolveSelector('idxuser@zero-alias:22') = 'indexed-zero-port', got %q (err=%v)", got, err)
+	}
+}
+
+func TestBrokenOpenSSHConfig_SavedWorksAndFallbacksFailClosed(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte("Match exec true\n  User bad\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := cloneConfiguration(nil)
+	cfg.Hosts.Set("h1", models.Host{Address: "10.0.0.10", Port: 22})
+	cfg.Hosts.Set("hb", models.Host{Address: "10.0.0.254", Port: 22})
+	cfg.Identities.Set("id1", models.Identity{User: "ops", AuthType: "auto"})
+	cfg.Nodes.Set("saved-jump", models.Node{HostRef: "hb", IdentityRef: "id1"})
+	cfg.Nodes.Set("saved-node", models.Node{HostRef: "h1", IdentityRef: "id1", Alias: []string{"web"}})
+
+	store := NewDefaultStore(filepath.Join(t.TempDir(), "config.yaml"), filepath.Join(t.TempDir(), "key"))
+	repo, err := NewRepository(cfg, store)
+	if err != nil {
+		t.Fatalf("NewRepository should stay usable for saved nodes when ~/.ssh/config is broken: %v", err)
+	}
+
+	// Saved inventory operations succeed.
+	if got, err := repo.ResolveSelector("web"); err != nil || got != "saved-node" {
+		t.Fatalf("ResolveSelector(saved alias) = (%q, %v), want (saved-node, nil)", got, err)
+	}
+	if res, err := repo.ResolveTarget(ConnectionTarget{Selector: "web"}); err != nil || res.MatchedNodeID != "saved-node" {
+		t.Fatalf("ResolveTarget(saved alias) = (%+v, %v)", res, err)
+	}
+	if got, err := repo.ResolveProxyJumpChain("saved-jump"); err != nil || got != "saved-jump" {
+		t.Fatalf("ResolveProxyJumpChain(saved-jump) = (%q, %v)", got, err)
+	}
+
+	// OpenSSH-backed / unmatched fallbacks fail closed across Repo, Provider, and Frozen().
+	frozen := repo.Frozen()
+	for _, tc := range []struct {
+		name string
+		fn   func() error
+	}{
+		{"Repo.ResolveSelector", func() error { _, err := repo.ResolveSelector("missing"); return err }},
+		{"Frozen.ResolveSelector", func() error { _, err := frozen.ResolveSelector("missing"); return err }},
+		{"Repo.Resolve(openssh:)", func() error { _, _, _, err := repo.Resolve("openssh:app"); return err }},
+		{"ResolveTarget(openssh:)", func() error { _, err := ResolveTarget(repo, ConnectionTarget{Selector: "openssh:app"}); return err }},
+		{"ResolveTarget(unmatched)", func() error { _, err := ResolveTarget(repo, ConnectionTarget{Selector: "10.0.0.99"}); return err }},
+		{"ResolveTarget(frozen unmatched)", func() error { _, err := ResolveTarget(frozen, ConnectionTarget{Selector: "10.0.0.99"}); return err }},
+		{"PrepareNodeContext(unmatched)", func() error {
+			_, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{Target: ConnectionTarget{Selector: "10.0.0.99"}})
+			return err
+		}},
+		{"ResolveProxyJumpChain(openssh:)", func() error { _, err := repo.ResolveProxyJumpChain("openssh:jump"); return err }},
+		{"ResolveProxyJumpChain(missing)", func() error { _, err := repo.ResolveProxyJumpChain("jump.example.com"); return err }},
+	} {
+		if gotErr := tc.fn(); gotErr == nil {
+			t.Errorf("%s: expected fail-closed OpenSSH parse error, got nil", tc.name)
+		}
+	}
+}
+
+func TestCanonicalizedTarget_TwoPassVirtualAndReadOnlyResolveNoAliasMutation(t *testing.T) {
+	sshCfg := strings.Join([]string{
+		"Host bastion",
+		"  HostName 10.0.0.254",
+		"  User ops",
+		"",
+		"Host short",
+		"  User alice",
+		"  Port 2201",
+		"  IdentityFile /tmp/id_pass1",
+		"",
+		"Host *.corp.example.com",
+		"  User bob",
+		"  ProxyJump bastion",
+	}, "\n") + "\n"
+	parser, err := NewOpenSSHParserFromReader(strings.NewReader(sshCfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewDefaultStore(filepath.Join(t.TempDir(), "config.yaml"), filepath.Join(t.TempDir(), "key"))
+	repo, err := NewRepositoryWithOpenSSHParser(cloneConfiguration(nil), store, parser)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Read-only ResolveTarget must not write into shared NodeOpenSSHAlias.
+	res, err := ResolveTarget(repo, ConnectionTarget{
+		Selector:     "short.corp.example.com",
+		OriginalHost: "short",
+	})
+	if err != nil {
+		t.Fatalf("ResolveTarget(canonicalized): %v", err)
+	}
+	if res.Host != "short.corp.example.com" || res.User != "alice" || res.Port != 2201 || res.OpenSSHAlias != "short" || res.ProxyJump != "openssh:bastion" {
+		t.Fatalf("ResolveTarget(canonicalized) = %+v", res)
+	}
+	if res.Provenance != ProvenanceOpenSSHDerived {
+		t.Fatalf("Provenance = %v, want %v", res.Provenance, ProvenanceOpenSSHDerived)
+	}
+	if alias := repo.NodeOpenSSHAlias(res.NodeID); alias != "" {
+		t.Fatalf("read-only ResolveTarget mutated NodeOpenSSHAlias(%q) = %q", res.NodeID, alias)
+	}
+}
+
+func TestTarget_SavedNodeOverrideNotHijackedByOpenSSH_AndCanonicalPortPreserved(t *testing.T) {
+	t.Run("saved node override skips openSSH fallback even with malformed config or colliding alias", assertSavedNodeOverrideNotHijackedByOpenSSH)
+	t.Run("canonicalized explicit openssh user/port and -p override not overwritten by vhost", assertCanonicalOpenSSHPortAndUserPreserved)
+}
+
+func assertSavedNodeOverrideNotHijackedByOpenSSH(t *testing.T) {
+	cfg := cloneConfiguration(nil)
+	cfg.Hosts.Set("10.0.0.10:22", models.Host{Address: "10.0.0.10", Port: 22})
+	cfg.Identities.Set("ops@10.0.0.10", models.Identity{User: "ops", AuthType: "auto"})
+	cfg.Nodes.Set("saved-web", models.Node{
+		HostRef:     "10.0.0.10:22",
+		IdentityRef: "ops@10.0.0.10",
+		Alias:       []string{"web"},
+	})
+
+	badParser := &OpenSSHParser{err: errors.New("syntax error in ssh_config")}
+	store := &repositoryTestStore{result: PersistResult{Applied: true, Durable: true}}
+	repoBad, err := NewRepositoryWithOpenSSHParser(cloneConfiguration(cfg), store, badParser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resBad, err := ResolveTarget(repoBad, ConnectionTarget{
+		Selector: "web",
+		User:     "root",
+		HasUser:  true,
+		Port:     2222,
+		HasPort:  true,
+	})
+	if err != nil {
+		t.Fatalf("saved node override failed under malformed ssh_config: %v", err)
+	}
+	if resBad.Host != "10.0.0.10" || resBad.User != "root" || resBad.Port != 2222 || resBad.NodeID != "root@10.0.0.10:2222" {
+		t.Fatalf("unexpected resolved saved override under bad ssh_config: %+v", resBad)
+	}
+
+	// Valid ssh_config defining colliding Host web -> 192.168.99.99 must NOT hijack saved-web.
+	parser, pErr := NewOpenSSHParserFromReader(strings.NewReader(strings.Join([]string{
+		"Host web",
+		"  HostName 192.168.99.99",
+		"  User root",
+		"  Port 2222",
+	}, "\n") + "\n"))
+	if pErr != nil {
+		t.Fatal(pErr)
+	}
+	repoHijack, err := NewRepositoryWithOpenSSHParser(cloneConfiguration(cfg), store, parser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := ResolveTarget(repoHijack, ConnectionTarget{
+		Selector: "web",
+		User:     "root",
+		HasUser:  true,
+		Port:     2222,
+		HasPort:  true,
+	})
+	if err != nil {
+		t.Fatalf("ResolveTarget saved override failed: %v", err)
+	}
+	if res.Host != "10.0.0.10" || res.MatchedNodeID != "" || res.NodeID != "root@10.0.0.10:2222" {
+		t.Fatalf("saved node -l/-p override was hijacked by OpenSSH Host web: %+v", res)
+	}
+}
+
+func assertCanonicalOpenSSHPortAndUserPreserved(t *testing.T) {
+	parser, err := NewOpenSSHParserFromReader(strings.NewReader(strings.Join([]string{
+		"Host short",
+		"  User alice",
+		"  Port 2201",
+		"  HostName %h.corp.example.com",
+	}, "\n") + "\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &repositoryTestStore{result: PersistResult{Applied: true, Durable: true}}
+	repo, err := NewRepositoryWithOpenSSHParser(cloneConfiguration(nil), store, parser)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resInline, err := ResolveTarget(repo, ConnectionTarget{
+		Selector:     OpenSSHNodePrefix + "bob@short.corp.example.com:2222",
+		OriginalHost: "short",
+	})
+	if err != nil {
+		t.Fatalf("ResolveTarget(inline): %v", err)
+	}
+	if resInline.User != "bob" || resInline.Port != 2222 || resInline.CanonicalHost != "short.corp.example.com" {
+		t.Fatalf("inline user/port overwritten: %+v", resInline)
+	}
+
+	resFlag, err := ResolveTarget(repo, ConnectionTarget{
+		Selector:     OpenSSHNodePrefix + "short.corp.example.com",
+		OriginalHost: "short",
+		Port:         2222,
+		HasPort:      true,
+	})
+	if err != nil {
+		t.Fatalf("ResolveTarget(-p): %v", err)
+	}
+	if resFlag.User != "alice" || resFlag.Port != 2222 || resFlag.CanonicalHost != "short.corp.example.com" {
+		t.Fatalf("-p override overwritten: %+v", resFlag)
+	}
+	if gotCanon := repo.NodeCanonicalHost(resFlag.NodeID); gotCanon != "" {
+		t.Fatalf("read-only ResolveTarget mutated NodeCanonicalHost = %q", gotCanon)
+	}
+
+	prep, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+		Target: ConnectionTarget{
+			Selector:     "short.corp.example.com",
+			OriginalHost: "short",
+			Port:         2222,
+			HasPort:      true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("PrepareNodeContext(canonical): %v", err)
+	}
+	snap, err := repo.ResolveConnection(prep.NodeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Node.CanonicalHost != "short.corp.example.com" {
+		t.Fatalf("ResolveConnection CanonicalHost = %q, want short.corp.example.com", snap.Node.CanonicalHost)
 	}
 }

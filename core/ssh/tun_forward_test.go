@@ -851,3 +851,171 @@ func TestTunnelDeviceForward_MalformedRemotePacketNonFatal(t *testing.T) {
 		t.Errorf("forward.Wait() on cancel err = %v, want nil", wErr)
 	}
 }
+
+type stalledCloseTunnelChannel struct {
+	reqs      chan *cryptoSSH.Request
+	closed    chan struct{}
+	closeOnce sync.Once
+	connDone  <-chan struct{}
+}
+
+func (c *stalledCloseTunnelChannel) Read([]byte) (int, error) {
+	<-c.closed
+	return 0, io.EOF
+}
+
+func (c *stalledCloseTunnelChannel) Write(b []byte) (int, error) {
+	return len(b), nil
+}
+
+func (c *stalledCloseTunnelChannel) CloseWrite() error { return nil }
+
+func (c *stalledCloseTunnelChannel) Stderr() io.ReadWriter { return nil }
+
+func (c *stalledCloseTunnelChannel) SendRequest(string, bool, []byte) (bool, error) {
+	return true, nil
+}
+
+func (c *stalledCloseTunnelChannel) Close() error {
+	// Stall channel close until transport Interrupt (conn.Close) closes connDone.
+	<-c.connDone
+	c.closeOnce.Do(func() {
+		close(c.closed)
+		close(c.reqs)
+	})
+	return nil
+}
+
+type stalledCloseTunnelConn struct {
+	*dummySSHConn
+	chOpened chan struct{}
+}
+
+func (s *stalledCloseTunnelConn) OpenChannel(name string, _ []byte) (cryptoSSH.Channel, <-chan *cryptoSSH.Request, error) {
+	reqs := make(chan *cryptoSSH.Request)
+	ch := &stalledCloseTunnelChannel{
+		reqs:     reqs,
+		closed:   make(chan struct{}),
+		connDone: s.closedChan(),
+	}
+	select {
+	case <-s.chOpened:
+	default:
+		close(s.chOpened)
+	}
+	return ch, reqs, nil
+}
+
+func TestTunnelDeviceForward_StalledCloseCancelTriggersInterruptBounded(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	chans := make(chan cryptoSSH.NewChannel)
+	reqs := make(chan *cryptoSSH.Request)
+	conn := &stalledCloseTunnelConn{
+		dummySSHConn: &dummySSHConn{chans: chans, reqs: reqs},
+		chOpened:     make(chan struct{}),
+	}
+	sshClient := cryptoSSH.NewClient(conn, chans, reqs)
+	defer func() { _ = sshClient.Close() }()
+
+	client := &Client{
+		sshClient: sshClient,
+		environment: Environment{
+			TunnelOpener: newFakeTunnelOpener(),
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	forward, err := client.TunnelDeviceForward(ctx, TunnelModePointToPoint, TunnelDeviceSpec{LocalUnit: 0, RemoteUnit: 0})
+	if err != nil {
+		cancel()
+		t.Fatalf("TunnelDeviceForward failed: %v", err)
+	}
+	<-conn.chOpened
+
+	start := time.Now()
+	cancel()
+	waitErr := forward.Wait()
+	elapsed := time.Since(start)
+	if waitErr != nil {
+		t.Fatalf("forward.Wait() error = %v, want nil on ctx cancel", waitErr)
+	}
+	if elapsed > sessionShutdownTimeout+1500*time.Millisecond {
+		t.Fatalf("forward.Wait() took %v, expected bounded exit after sessionShutdownTimeout", elapsed)
+	}
+	select {
+	case <-conn.closedChan():
+	default:
+		t.Fatal("expected stalled ch.Close() after ctx cancel to trigger c.Interrupt() (conn.Close)")
+	}
+}
+
+type asyncReqsCloseTunnelChannel struct {
+	reqs       chan *cryptoSSH.Request
+	closed     chan struct{}
+	closeOnce  sync.Once
+	reqsClosed atomic.Bool
+}
+
+func (c *asyncReqsCloseTunnelChannel) Read([]byte) (int, error) {
+	return 0, io.EOF
+}
+
+func (c *asyncReqsCloseTunnelChannel) Write(b []byte) (int, error) { return len(b), nil }
+func (c *asyncReqsCloseTunnelChannel) CloseWrite() error           { return nil }
+func (c *asyncReqsCloseTunnelChannel) Stderr() io.ReadWriter       { return nil }
+func (c *asyncReqsCloseTunnelChannel) SendRequest(string, bool, []byte) (bool, error) {
+	return true, nil
+}
+func (c *asyncReqsCloseTunnelChannel) Close() error {
+	c.closeOnce.Do(func() {
+		close(c.closed)
+		time.AfterFunc(80*time.Millisecond, func() {
+			c.reqsClosed.Store(true)
+			close(c.reqs)
+		})
+	})
+	return nil
+}
+
+type asyncReqsCloseTunnelConn struct {
+	*dummySSHConn
+	lastCh *asyncReqsCloseTunnelChannel
+}
+
+func (s *asyncReqsCloseTunnelConn) OpenChannel(string, []byte) (cryptoSSH.Channel, <-chan *cryptoSSH.Request, error) {
+	reqs := make(chan *cryptoSSH.Request)
+	ch := &asyncReqsCloseTunnelChannel{
+		reqs:   reqs,
+		closed: make(chan struct{}),
+	}
+	s.lastCh = ch
+	return ch, reqs, nil
+}
+
+func TestTunnelDeviceForward_RemoteEOFJoinsDiscardRequests(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	chans := make(chan cryptoSSH.NewChannel)
+	reqs := make(chan *cryptoSSH.Request)
+	conn := &asyncReqsCloseTunnelConn{dummySSHConn: &dummySSHConn{chans: chans, reqs: reqs}}
+	sshClient := cryptoSSH.NewClient(conn, chans, reqs)
+	defer func() { _ = sshClient.Close() }()
+
+	client := &Client{
+		sshClient: sshClient,
+		environment: Environment{
+			TunnelOpener: newFakeTunnelOpener(),
+		},
+	}
+
+	forward, err := client.TunnelDeviceForward(t.Context(), TunnelModePointToPoint, TunnelDeviceSpec{LocalUnit: 0, RemoteUnit: 0})
+	if err != nil {
+		t.Fatalf("TunnelDeviceForward failed: %v", err)
+	}
+
+	_ = forward.Wait()
+	if conn.lastCh == nil || !conn.lastCh.reqsClosed.Load() {
+		t.Fatal("forward.Wait() returned before DiscardRequests(reqs) completed")
+	}
+}

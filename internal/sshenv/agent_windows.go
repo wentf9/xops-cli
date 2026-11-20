@@ -5,6 +5,7 @@ package sshenv
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"strings"
@@ -27,15 +28,22 @@ func platformDialAgent() func(ctx context.Context, socket string) (net.Conn, err
 		if ctx == nil {
 			return nil, errors.New("ssh-agent dial context is nil")
 		}
-		trimmed := strings.TrimSpace(socket)
-		if trimmed == "" {
-			trimmed = defaultWindowsOpenSSHAgentPipe
+		target := socket
+		if strings.TrimSpace(target) == "" && !hasWindowsAgentControlChar(target) {
+			target = defaultWindowsOpenSSHAgentPipe
 		}
-		if pipePath, isPipe := normalizeWindowsAgentPipePath(trimmed); isPipe {
+		pipePath, isPipe, pipeErr := parseWindowsAgentPipePath(target)
+		if pipeErr != nil {
+			if isPipe {
+				return nil, &net.OpError{Op: "dial", Net: "pipe", Addr: windowsPipeAddr(strings.TrimSpace(target)), Err: pipeErr}
+			}
+			return nil, &net.OpError{Op: "dial", Net: "unix", Addr: &net.UnixAddr{Name: strings.TrimSpace(target), Net: "unix"}, Err: pipeErr}
+		}
+		if isPipe {
 			return dialWindowsNamedPipe(ctx, pipePath)
 		}
 		dialer := net.Dialer{Timeout: agentDialDefaultTimeout}
-		return dialer.DialContext(ctx, "unix", trimmed)
+		return dialer.DialContext(ctx, "unix", strings.TrimSpace(target))
 	}
 }
 
@@ -87,6 +95,25 @@ func dialWindowsNamedPipe(ctx context.Context, pipePath string) (net.Conn, error
 			0,
 		)
 		if createErr == nil {
+			fileType, typeErr := windows.GetFileType(handle)
+			if typeErr != nil {
+				_ = windows.CloseHandle(handle)
+				return nil, &net.OpError{
+					Op:   "dial",
+					Net:  "pipe",
+					Addr: windowsPipeAddr(pipePath),
+					Err:  fmt.Errorf("query windows agent pipe file type: %w", typeErr),
+				}
+			}
+			if fileType != windows.FILE_TYPE_PIPE {
+				_ = windows.CloseHandle(handle)
+				return nil, &net.OpError{
+					Op:   "dial",
+					Net:  "pipe",
+					Addr: windowsPipeAddr(pipePath),
+					Err:  fmt.Errorf("agent socket %q is not a named pipe (file type %#x)", pipePath, fileType),
+				}
+			}
 			if ownerErr := verifyWindowsAgentPipeServerOwner(handle); ownerErr != nil {
 				_ = windows.CloseHandle(handle)
 				return nil, &net.OpError{Op: "dial", Net: "pipe", Addr: windowsPipeAddr(pipePath), Err: ownerErr}
@@ -111,7 +138,11 @@ func dialWindowsNamedPipe(ctx context.Context, pipePath string) (net.Conn, error
 		if deadline, ok := dialCtx.Deadline(); ok {
 			rem := time.Until(deadline)
 			if rem <= 0 {
-				return nil, &net.OpError{Op: "dial", Net: "pipe", Addr: windowsPipeAddr(pipePath), Err: dialCtx.Err()}
+				err := dialCtx.Err()
+				if err == nil {
+					err = context.DeadlineExceeded
+				}
+				return nil, &net.OpError{Op: "dial", Net: "pipe", Addr: windowsPipeAddr(pipePath), Err: err}
 			}
 			if rem < waitDur {
 				waitDur = rem
@@ -129,14 +160,17 @@ func dialWindowsNamedPipe(ctx context.Context, pipePath string) (net.Conn, error
 }
 
 // verifyWindowsAgentPipeServerOwner verifies that the named pipe server belongs
-// to SYSTEM, Builtin\Administrators, or the current user. When querying a
-// privileged service token returns ERROR_ACCESS_DENIED, it falls back to the
-// pipe kernel object's owner SID (readable via GENERIC_READ) and fails closed
-// if neither check can establish a trusted owner.
+// to SYSTEM, Builtin\Administrators, or the current user, AND that the pipe's
+// DACL does not grant FILE_CREATE_PIPE_INSTANCE / WRITE_DAC / WRITE_OWNER /
+// GENERIC_WRITE / GENERIC_ALL to any untrusted principal.
 func verifyWindowsAgentPipeServerOwner(pipeHandle windows.Handle) error {
 	currSID, _ := currentWindowsProcessUserSID()
 
-	var serverPID uint32
+	var (
+		serverPID     uint32
+		tokenResolved bool
+		tokenTrusted  bool
+	)
 	if err := windows.GetNamedPipeServerProcessId(pipeHandle, &serverPID); err == nil && serverPID != 0 {
 		if serverPID == uint32(os.Getpid()) {
 			return nil
@@ -150,39 +184,63 @@ func verifyWindowsAgentPipeServerOwner(pipeHandle windows.Handle) error {
 				tu, userErr := tok.GetTokenUser()
 				_ = tok.Close()
 				if userErr == nil && tu != nil && tu.User.Sid != nil {
-					return evaluateWindowsAgentPipeOwner(
-						true,
-						isTrustedWindowsPrincipalSID(tu.User.Sid, currSID),
-						serverPID,
-						nil,
-						false,
-						false,
-					)
+					tokenResolved = true
+					tokenTrusted = isTrustedWindowsPrincipalSID(tu.User.Sid, currSID)
 				}
 			}
 		}
 	}
 
-	sd, err := windows.GetSecurityInfo(pipeHandle, windows.SE_KERNEL_OBJECT, windows.OWNER_SECURITY_INFORMATION)
-	if err != nil {
-		return evaluateWindowsAgentPipeOwner(false, false, serverPID, err, false, false)
+	sd, sdErr := windows.GetSecurityInfo(
+		pipeHandle,
+		windows.SE_KERNEL_OBJECT,
+		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION,
+	)
+	if sdErr == nil && sd == nil {
+		sdErr = errors.New("GetSecurityInfo returned nil security descriptor")
 	}
-	if sd == nil {
-		return evaluateWindowsAgentPipeOwner(false, false, serverPID, nil, false, false)
+	var (
+		hasSDOwner     bool
+		sdOwnerTrusted bool
+		ownerErr       error
+		hasDACL        bool
+		aces           []windowsParsedACE
+		daclErr        error
+	)
+	if sdErr == nil {
+		owner, _, oErr := sd.Owner()
+		if oErr != nil {
+			ownerErr = oErr
+		} else if owner != nil {
+			hasSDOwner = true
+			sdOwnerTrusted = isTrustedWindowsPrincipalSID(owner, currSID)
+		}
+		dacl, _, dErr := sd.DACL()
+		if dErr != nil {
+			daclErr = dErr
+		} else if dacl != nil {
+			parsed, ok := parseWindowsACL(dacl, currSID)
+			if !ok {
+				daclErr = errors.New("parse ssh-agent named pipe DACL failed")
+			} else {
+				hasDACL = true
+				aces = parsed
+			}
+		}
 	}
-	owner, _, ownerErr := sd.Owner()
-	if ownerErr != nil {
-		return evaluateWindowsAgentPipeOwner(false, false, serverPID, ownerErr, false, false)
+	effectiveSDErr := sdErr
+	if effectiveSDErr == nil && !tokenResolved {
+		effectiveSDErr = ownerErr
 	}
-	if owner == nil {
-		return evaluateWindowsAgentPipeOwner(false, false, serverPID, nil, false, false)
-	}
-	return evaluateWindowsAgentPipeOwner(
-		false,
-		false,
+	return evaluateWindowsAgentPipeSecurity(
+		tokenResolved,
+		tokenTrusted,
 		serverPID,
-		nil,
-		true,
-		isTrustedWindowsPrincipalSID(owner, currSID),
+		effectiveSDErr,
+		hasSDOwner,
+		sdOwnerTrusted,
+		daclErr,
+		hasDACL,
+		aces,
 	)
 }

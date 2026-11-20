@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -165,6 +166,7 @@ func (d *darwinTunnelDevice) Close() error {
 	d.closeOnce.Do(func() {
 		d.mu.Lock()
 		d.closed = true
+		_, _ = unix.Write(d.wakeWrite, []byte{1})
 		_ = unix.Close(d.wakeWrite)
 		d.mu.Unlock()
 
@@ -232,12 +234,15 @@ func openPlatformTunnelDevice(mode TunnelMode, localUnit int) (TunnelDevice, err
 	}
 
 	var wake [2]int
+	syscall.ForkLock.RLock()
 	if err := unix.Pipe(wake[:]); err != nil {
+		syscall.ForkLock.RUnlock()
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("create utun wake pipe failed: %w", err)
 	}
 	unix.CloseOnExec(wake[0])
 	unix.CloseOnExec(wake[1])
+	syscall.ForkLock.RUnlock()
 	_ = unix.SetNonblock(wake[0], true)
 	_ = unix.SetNonblock(wake[1], true)
 

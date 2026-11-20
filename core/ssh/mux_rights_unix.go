@@ -53,9 +53,9 @@ func isAddressAlreadyInUse(err error) bool {
 	return strings.Contains(errStr, "address already in use") || strings.Contains(errStr, "file exists")
 }
 
-func bindAndLinkSocket(targetPath string) (net.Listener, error) {
+func bindAndLinkSocket(targetPath string) (net.Listener, os.FileInfo, error) {
 	if err := os.MkdirAll(filepath.Dir(targetPath), 0700); err != nil {
-		return nil, fmt.Errorf("create socket directory failed: %w", err)
+		return nil, nil, fmt.Errorf("create socket directory failed: %w", err)
 	}
 
 	maxPathLen := MaxControlPathLength() - 1 // 107 on Linux, 103 on Darwin/BSD
@@ -72,17 +72,23 @@ func bindAndLinkSocket(targetPath string) (net.Listener, error) {
 		listener, err := net.Listen("unix", targetPath)
 		if err != nil {
 			if isAddressAlreadyInUse(err) {
-				return nil, fmt.Errorf("%w: %s", ErrMasterAlreadyExists, targetPath)
+				return nil, nil, fmt.Errorf("%w: %s", ErrMasterAlreadyExists, targetPath)
 			}
-			return nil, fmt.Errorf("listen on control socket failed: %w", err)
+			return nil, nil, fmt.Errorf("listen on control socket failed: %w", err)
 		}
 		disableUnixListenerUnlinkOnClose(listener)
 		if err := os.Chmod(targetPath, 0600); err != nil {
 			_ = listener.Close()
 			_ = os.Remove(targetPath)
-			return nil, fmt.Errorf("chmod control socket failed: %w", err)
+			return nil, nil, fmt.Errorf("chmod control socket failed: %w", err)
 		}
-		return listener, nil
+		origFi, lstatErr := os.Lstat(targetPath)
+		if lstatErr != nil {
+			_ = listener.Close()
+			_ = os.Remove(targetPath)
+			return nil, nil, fmt.Errorf("stat control socket failed: %w", lstatErr)
+		}
+		return listener, origFi, nil
 	}
 
 	// Linking Strategy: Bind tempPath -> Chmod 0600 -> Atomic Link to targetPath -> Unlink tempPath.
@@ -103,11 +109,11 @@ func bindAndLinkSocket(targetPath string) (net.Listener, error) {
 			break
 		}
 		if !isAddressAlreadyInUse(err) {
-			return nil, fmt.Errorf("listen on temp control socket failed: %w", err)
+			return nil, nil, fmt.Errorf("listen on temp control socket failed: %w", err)
 		}
 	}
 	if err != nil {
-		return nil, fmt.Errorf("listen on temp control socket failed: %w", err)
+		return nil, nil, fmt.Errorf("listen on temp control socket failed: %w", err)
 	}
 	disableUnixListenerUnlinkOnClose(listener)
 	defer func() {
@@ -117,23 +123,28 @@ func bindAndLinkSocket(targetPath string) (net.Listener, error) {
 	// Enforce 0600 permissions without mutating process-global umask.
 	if err := os.Chmod(tempPath, 0600); err != nil {
 		_ = listener.Close()
-		return nil, fmt.Errorf("chmod temp control socket failed: %w", err)
+		return nil, nil, fmt.Errorf("chmod temp control socket failed: %w", err)
+	}
+	origFi, lstatErr := os.Lstat(tempPath)
+	if lstatErr != nil {
+		_ = listener.Close()
+		return nil, nil, fmt.Errorf("stat temp control socket failed: %w", lstatErr)
 	}
 
 	err = os.Link(tempPath, targetPath)
 	if err != nil {
 		if errors.Is(err, os.ErrExist) || errors.Is(err, syscall.EEXIST) {
 			if retryReplaceStaleSocketLink(tempPath, targetPath) {
-				return listener, nil
+				return listener, origFi, nil
 			}
 			_ = listener.Close()
-			return nil, fmt.Errorf("%w: %s", ErrMasterAlreadyExists, targetPath)
+			return nil, nil, fmt.Errorf("%w: %s", ErrMasterAlreadyExists, targetPath)
 		}
 		_ = listener.Close()
-		return nil, fmt.Errorf("link control socket failed: %w", err)
+		return nil, nil, fmt.Errorf("link control socket failed: %w", err)
 	}
 
-	return listener, nil
+	return listener, origFi, nil
 }
 
 func retryReplaceStaleSocketLink(tempPath, targetPath string) bool {
@@ -230,7 +241,7 @@ func handlePassengerSession(s *MuxServer, conn net.Conn, reqID uint32, payload [
 	s.trackStream(conn)
 	defer s.untrackStream(conn)
 
-	ch, reqs, err := s.sshClient.OpenChannel("session", nil)
+	ch, reqs, err := s.openBoundedMuxChannel(s.baseContext(), "session", nil)
 	if err != nil {
 		return sendFailure(conn, reqID, fmt.Sprintf("open ssh session failed: %v", err))
 	}
@@ -242,13 +253,13 @@ func handlePassengerSession(s *MuxServer, conn net.Conn, reqID uint32, payload [
 	}()
 	releasePassengerAgent, err := enablePassengerAgentForward(s, ch, req.WantAgent)
 	defer releasePassengerAgent()
-	defer func() { _ = ch.Close() }()
+	defer func() { _ = s.closeMuxChannelBounded(ch, nil) }()
 	if err != nil {
 		return sendFailure(conn, reqID, fmt.Sprintf("agent forward request failed: %v", err))
 	}
 
 	var ttyAllocFailed bool
-	if err := applyPassengerEnvAndPTY(s, ch, req, &ttyAllocFailed); err != nil {
+	if err := applyPassengerEnvAndPTYWithFiles(s, ch, req, files, &ttyAllocFailed); err != nil {
 		return sendFailure(conn, reqID, err.Error())
 	}
 
@@ -267,11 +278,43 @@ func handlePassengerSession(s *MuxServer, conn net.Conn, reqID uint32, payload [
 	}
 
 	handoffReqs = true
-	exitCode := runPassengerChannelIO(conn, ch, reqs, files)
+	exitCode := runPassengerChannelIO(s, conn, ch, reqs, files)
 	return sendExitMessage(conn, sessionID, exitCode)
 }
 
 func applyPassengerEnvAndPTY(s *MuxServer, ch cryptoSSH.Channel, req MuxNewSessionRequest, ttyAllocFailed *bool) error {
+	return applyPassengerEnvAndPTYWithFiles(s, ch, req, nil, ttyAllocFailed)
+}
+
+func probePassengerWinsize(files []*os.File) (cols, rows, width, height uint32) {
+	const (
+		defaultCols   = 80
+		defaultRows   = 24
+		defaultWidth  = 640
+		defaultHeight = 480
+	)
+	for _, f := range files {
+		if f == nil {
+			continue
+		}
+		rawConn, err := f.SyscallConn()
+		if err != nil {
+			continue
+		}
+		var (
+			ws    *unix.Winsize
+			wsErr error
+		)
+		if ctrlErr := rawConn.Control(func(fd uintptr) {
+			ws, wsErr = unix.IoctlGetWinsize(int(fd), unix.TIOCGWINSZ)
+		}); ctrlErr == nil && wsErr == nil && ws != nil && ws.Col > 0 && ws.Row > 0 {
+			return uint32(ws.Col), uint32(ws.Row), uint32(ws.Xpixel), uint32(ws.Ypixel)
+		}
+	}
+	return defaultCols, defaultRows, defaultWidth, defaultHeight
+}
+
+func applyPassengerEnvAndPTYWithFiles(s *MuxServer, ch cryptoSSH.Channel, req MuxNewSessionRequest, files []*os.File, ttyAllocFailed *bool) error {
 	if len(req.Env) > MaxSessionEnvVars {
 		return fmt.Errorf("%w: passenger session environment exceeds maximum of %d variables", ErrSSHOptionsValidation, MaxSessionEnvVars)
 	}
@@ -315,6 +358,7 @@ func applyPassengerEnvAndPTY(s *MuxServer, ch cryptoSSH.Channel, req MuxNewSessi
 	if termType == "" {
 		termType = "xterm"
 	}
+	cols, rows, width, height := probePassengerWinsize(files)
 	ptyReq := struct {
 		Term     string
 		Columns  uint32
@@ -324,10 +368,10 @@ func applyPassengerEnvAndPTY(s *MuxServer, ch cryptoSSH.Channel, req MuxNewSessi
 		Modelist string
 	}{
 		Term:     termType,
-		Columns:  80,
-		Rows:     24,
-		Width:    640,
-		Height:   480,
+		Columns:  cols,
+		Rows:     rows,
+		Width:    width,
+		Height:   height,
 		Modelist: "\x00",
 	}
 	accepted, ptyErr := s.sendBoundedPassengerRequest(ch, "pty-req", cryptoSSH.Marshal(ptyReq))
@@ -373,6 +417,9 @@ func (s *MuxServer) sendBoundedPassengerRequest(ch cryptoSSH.Channel, reqType st
 		timeout = s.requestTimeout
 		log = s.logger
 	}
+	if ch == nil || (sshCli != nil && sshCli.Conn == nil) {
+		return false, net.ErrClosed
+	}
 	helper := &Client{
 		sshClient: sshCli,
 		rootConn: &muxTransportInterruptConn{
@@ -393,8 +440,8 @@ func enablePassengerAgentForward(s *MuxServer, ch cryptoSSH.Channel, wantAgent b
 	if !wantAgent {
 		return func() {}, nil
 	}
-	if !s.allowAgentForward || s.agentSocket == "" || s.dialAgent == nil {
-		s.getLogger().Debugf("mux: ignoring passenger WantAgent request because master AllowAgentForward is disabled")
+	if s == nil || !s.allowAgentForward || s.agentSocket == "" || s.dialAgent == nil || s.sshClient == nil || s.sshClient.Conn == nil {
+		s.getLogger().Debugf("mux: ignoring passenger WantAgent request because master AllowAgentForward is disabled or transport closed")
 		return func() {}, nil
 	}
 	router, err := getOrCreateAgentRouter(s.sshClient)
@@ -402,7 +449,7 @@ func enablePassengerAgentForward(s *MuxServer, ch cryptoSSH.Channel, wantAgent b
 		s.getLogger().Debugf("mux: failed to initialize agent router for passenger session: %v", err)
 		return func() {}, nil
 	}
-	lease, err := router.acquireLocalLease(s.serverCtx, s.agentSocket, s.dialAgent, s.getLogger())
+	lease, err := router.acquireLocalLease(s.baseContext(), s.agentSocket, s.dialAgent, s.getLogger())
 	if err != nil {
 		return func() {}, nil
 	}
@@ -457,92 +504,453 @@ func startPassengerChannel(s *MuxServer, ch cryptoSSH.Channel, req MuxNewSession
 //  1. mutating O_NONBLOCK on a shared open file description (which would corrupt
 //     the caller's parent shell TTY), and
 //  2. blocking inside a raw read() syscall that os.File.Close() cannot interrupt.
-func copyFromPollableFD(dst io.Writer, src *os.File, stop <-chan struct{}) error {
-	rawConn, err := src.SyscallConn()
+const (
+	passengerPipeWriteCap       = 512
+	passengerCharDeviceWriteCap = 32
+)
+
+func isClosedChan(ch <-chan struct{}) bool {
+	if ch == nil {
+		return false
+	}
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+// openWakePipeMonitor creates an internal O_CLOEXEC wakeup pipe via os.Pipe()
+// and writes a wake byte before closing the write end when stop closes so
+// poll(2) wakes via POLLIN even if another fd reference lingers briefly.
+func openWakePipeMonitor(stop <-chan struct{}) (*os.File, func(), error) {
+	wakeR, wakeW, err := os.Pipe()
 	if err != nil {
-		_, copyErr := io.Copy(dst, src)
-		return copyErr
+		return nil, nil, err
 	}
 
-	var wakePipe [2]int
-	if err := unix.Pipe(wakePipe[:]); err != nil {
-		_, copyErr := io.Copy(dst, src)
-		return copyErr
-	}
-	unix.CloseOnExec(wakePipe[0])
-	unix.CloseOnExec(wakePipe[1])
-	_ = unix.SetNonblock(wakePipe[0], true)
-	_ = unix.SetNonblock(wakePipe[1], true)
-
-	var closeWakeWrite sync.Once
-	triggerWake := func() {
-		closeWakeWrite.Do(func() {
-			_ = unix.Close(wakePipe[1])
-		})
-	}
+	triggerWake := sync.OnceFunc(func() {
+		_, _ = wakeW.Write([]byte{1})
+		_ = wakeW.Close()
+	})
 	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		select {
 		case <-stop:
 			triggerWake()
 		case <-done:
 		}
 	}()
-	defer func() {
+	cleanup := func() {
 		close(done)
+		wg.Wait()
 		triggerWake()
-		_ = unix.Close(wakePipe[0])
-	}()
+		_ = wakeR.Close()
+	}
+	return wakeR, cleanup, nil
+}
 
-	buf := make([]byte, 32*1024)
-	var copyErr error
+func pollReadChunkFD(rawConn, wakeConn syscall.RawConn, buf []byte) (int, error) {
+	var (
+		n       int
+		readErr error
+	)
 	ctrlErr := rawConn.Control(func(fd uintptr) {
 		srcFD := int(fd)
-		for {
+		wErr := wakeConn.Control(func(wfd uintptr) {
+			wakeFD := int(wfd)
 			pfds := []unix.PollFd{
 				{Fd: int32(srcFD), Events: unix.POLLIN},
-				{Fd: int32(wakePipe[0]), Events: unix.POLLIN},
+				{Fd: int32(wakeFD), Events: unix.POLLIN},
 			}
-			_, pollErr := unix.Poll(pfds, -1)
-			if pollErr != nil {
-				if errors.Is(pollErr, syscall.EINTR) {
-					continue
-				}
-				copyErr = pollErr
-				return
-			}
-			if pfds[1].Revents != 0 {
-				return
-			}
-			if pfds[0].Revents&(unix.POLLIN|unix.POLLHUP|unix.POLLERR|unix.POLLNVAL) == 0 {
-				continue
-			}
-			n, readErr := unix.Read(srcFD, buf)
-			if n > 0 {
-				if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
-					copyErr = writeErr
+			for {
+				pfds[0].Revents = 0
+				pfds[1].Revents = 0
+				_, pollErr := unix.Poll(pfds, -1)
+				if pollErr != nil {
+					if errors.Is(pollErr, syscall.EINTR) {
+						continue
+					}
+					readErr = pollErr
 					return
 				}
-			}
-			if readErr != nil {
-				if errors.Is(readErr, syscall.EINTR) || errors.Is(readErr, syscall.EAGAIN) {
+				if pfds[1].Revents != 0 {
+					return
+				}
+				if pfds[0].Revents&(unix.POLLIN|unix.POLLHUP|unix.POLLERR|unix.POLLNVAL) == 0 {
 					continue
 				}
-				copyErr = readErr
+				n, readErr = unix.Read(srcFD, buf)
+				if errors.Is(readErr, syscall.EINTR) || errors.Is(readErr, syscall.EAGAIN) {
+					readErr = nil
+					continue
+				}
 				return
 			}
-			if n == 0 {
+		})
+		if wErr != nil && readErr == nil {
+			readErr = wErr
+		}
+	})
+	if readErr != nil {
+		return n, readErr
+	}
+	return n, ctrlErr
+}
+
+func copyFromPollableFD(dst io.Writer, src *os.File, stop <-chan struct{}) error {
+	rawConn, err := src.SyscallConn()
+	if err != nil {
+		_, copyErr := io.Copy(dst, src)
+		return copyErr
+	}
+	wakeFile, cleanup, err := openWakePipeMonitor(stop)
+	if err != nil {
+		_, copyErr := io.Copy(dst, src)
+		return copyErr
+	}
+	defer cleanup()
+
+	wakeConn, err := wakeFile.SyscallConn()
+	if err != nil {
+		_, copyErr := io.Copy(dst, src)
+		return copyErr
+	}
+
+	buf := make([]byte, 32*1024)
+	for {
+		if isClosedChan(stop) {
+			return nil
+		}
+		n, readErr := pollReadChunkFD(rawConn, wakeConn, buf)
+		if n > 0 {
+			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
+				return writeErr
+			}
+		}
+		if readErr != nil || n == 0 {
+			return readErr
+		}
+	}
+}
+
+func inspectRawConnChunkCap(rawConn syscall.RawConn) (isRegular, isNonblock, isSocket bool, maxChunk int) {
+	maxChunk = passengerPipeWriteCap
+	_ = rawConn.Control(func(fd uintptr) {
+		flags, fErr := unix.FcntlInt(fd, unix.F_GETFL, 0)
+		var st unix.Stat_t
+		sErr := unix.Fstat(int(fd), &st)
+		fmtMode := st.Mode & unix.S_IFMT
+		isRegular = sErr == nil && fmtMode == unix.S_IFREG
+		isSocket = sErr == nil && fmtMode == unix.S_IFSOCK
+		isChar := sErr == nil && fmtMode == unix.S_IFCHR
+		isNonblock = fErr == nil && (flags&unix.O_NONBLOCK) != 0
+		switch {
+		case isRegular || isNonblock || isSocket:
+			maxChunk = 32 * 1024
+		case isChar:
+			maxChunk = passengerCharDeviceWriteCap
+		}
+	})
+	return isRegular, isNonblock, isSocket, maxChunk
+}
+
+func preparePollableWriteTarget(dst *os.File) (rawConn syscall.RawConn, owned *os.File, useMsgDontWait, needSharedLock bool, maxChunk int, err error) {
+	rawConn, err = dst.SyscallConn()
+	if err != nil {
+		return nil, nil, false, false, 0, err
+	}
+	isRegular, isNonblock, isSocket, capBytes := inspectRawConnChunkCap(rawConn)
+	if isRegular || isNonblock || isSocket {
+		return rawConn, nil, isSocket && !isNonblock, false, capBytes, nil
+	}
+	reopened, reopenErr := reopenNonBlockingWriteFile(dst)
+	if reopenErr != nil || reopened == nil {
+		return rawConn, nil, false, true, capBytes, nil
+	}
+	ownedRaw, rawErr := reopened.SyscallConn()
+	if rawErr != nil {
+		_ = reopened.Close()
+		return rawConn, nil, false, true, capBytes, nil
+	}
+	_, ownedNonblock, _, ownedCap := inspectRawConnChunkCap(ownedRaw)
+	if !ownedNonblock {
+		_ = reopened.Close()
+		return rawConn, nil, false, true, capBytes, nil
+	}
+	return ownedRaw, reopened, false, false, ownedCap, nil
+}
+
+func writePollableChunk(dstFD int, remaining []byte, maxChunk int, retryEAGAIN, useMsgDontWait bool) (int, bool, error) {
+	chunk := remaining
+	if len(chunk) > maxChunk {
+		chunk = chunk[:maxChunk]
+	}
+	var (
+		nw   int
+		wErr error
+	)
+	if useMsgDontWait {
+		nw, wErr = unix.SendmsgN(dstFD, chunk, nil, nil, unix.MSG_DONTWAIT)
+	} else {
+		nw, wErr = unix.Write(dstFD, chunk)
+	}
+	if nw > 0 {
+		return nw, false, nil
+	}
+	if wErr != nil {
+		if errors.Is(wErr, syscall.EINTR) {
+			return 0, false, nil
+		}
+		if errors.Is(wErr, syscall.EAGAIN) || errors.Is(wErr, syscall.EWOULDBLOCK) {
+			return 0, retryEAGAIN, nil
+		}
+		return 0, false, wErr
+	}
+	return 0, false, io.ErrShortWrite
+}
+
+func pollWriteNonBlockingStep(dstFD int, remaining []byte, maxChunk int, useMsgDontWait bool) (nw int, needWait bool, err error) {
+	pfd := []unix.PollFd{{Fd: int32(dstFD), Events: unix.POLLOUT}}
+	for {
+		pfd[0].Revents = 0
+		nEvents, pollErr := unix.Poll(pfd, 0)
+		if pollErr != nil {
+			if errors.Is(pollErr, syscall.EINTR) {
+				continue
+			}
+			return 0, false, pollErr
+		}
+		if nEvents == 0 || pfd[0].Revents == 0 {
+			return 0, true, nil
+		}
+		if pfd[0].Revents&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0 {
+			return 0, false, syscall.EPIPE
+		}
+		if pfd[0].Revents&unix.POLLOUT == 0 {
+			return 0, true, nil
+		}
+		return writePollableChunk(dstFD, remaining, maxChunk, true, useMsgDontWait)
+	}
+}
+
+func pollWriteAllFDFast(rawConn syscall.RawConn, data []byte, maxChunk int, useMsgDontWait bool, writeMu *sync.Mutex, stop <-chan struct{}) (remaining []byte, stopped bool, err error) {
+	remaining = data
+	ctrlErr := rawConn.Control(func(fd uintptr) {
+		dstFD := int(fd)
+		for len(remaining) > 0 {
+			if isClosedChan(stop) {
+				stopped = true
+				return
+			}
+			nw, needWait, stepErr := runSerializedPollWriteStep(dstFD, remaining, maxChunk, useMsgDontWait, writeMu)
+			if nw > 0 {
+				remaining = remaining[nw:]
+				continue
+			}
+			if stepErr != nil {
+				err = stepErr
+				return
+			}
+			if needWait {
 				return
 			}
 		}
 	})
-	if copyErr != nil {
-		return copyErr
+	if err != nil {
+		return remaining, false, err
 	}
-	return ctrlErr
+	return remaining, stopped, ctrlErr
 }
 
-func runPassengerChannelIO(conn net.Conn, ch cryptoSSH.Channel, reqs <-chan *cryptoSSH.Request, files []*os.File) uint32 {
+func runSerializedPollWriteStep(dstFD int, remaining []byte, maxChunk int, useMsgDontWait bool, writeMu *sync.Mutex) (int, bool, error) {
+	if writeMu != nil {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+	}
+	return pollWriteNonBlockingStep(dstFD, remaining, maxChunk, useMsgDontWait)
+}
+
+func pollWriteAllFDWithWake(rawConn, wakeConn syscall.RawConn, data []byte, maxChunk int, useMsgDontWait bool, writeMu *sync.Mutex) (bool, error) {
+	remaining := data
+	var (
+		stopped  bool
+		writeErr error
+	)
+	ctrlErr := rawConn.Control(func(fd uintptr) {
+		dstFD := int(fd)
+		wErr := wakeConn.Control(func(wfd uintptr) {
+			wakeFD := int(wfd)
+			pfds := []unix.PollFd{
+				{Fd: int32(dstFD), Events: unix.POLLOUT},
+				{Fd: int32(wakeFD), Events: unix.POLLIN},
+			}
+			for len(remaining) > 0 {
+				pfds[0].Revents = 0
+				pfds[1].Revents = 0
+				_, pollErr := unix.Poll(pfds, -1)
+				if pollErr != nil {
+					if errors.Is(pollErr, syscall.EINTR) {
+						continue
+					}
+					writeErr = pollErr
+					return
+				}
+				if pfds[1].Revents != 0 {
+					stopped = true
+					return
+				}
+				if pfds[0].Revents&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0 {
+					writeErr = syscall.EPIPE
+					return
+				}
+				if pfds[0].Revents&unix.POLLOUT == 0 {
+					continue
+				}
+				nw, stepErr := writeAfterPollOut(dstFD, remaining, maxChunk, useMsgDontWait, writeMu)
+				if nw > 0 {
+					remaining = remaining[nw:]
+				}
+				if stepErr != nil {
+					writeErr = stepErr
+					return
+				}
+			}
+		})
+		if wErr != nil && writeErr == nil {
+			writeErr = wErr
+		}
+	})
+	if stopped {
+		return true, nil
+	}
+	if writeErr != nil {
+		return false, writeErr
+	}
+	return false, ctrlErr
+}
+
+func writeAfterPollOut(dstFD int, remaining []byte, maxChunk int, useMsgDontWait bool, writeMu *sync.Mutex) (int, error) {
+	if writeMu != nil {
+		// Re-check POLLOUT under writeMu so a concurrent writer sharing this
+		// blocking pipe cannot exhaust PIPE_BUF before we write.
+		nw, _, err := runSerializedPollWriteStep(dstFD, remaining, maxChunk, useMsgDontWait, writeMu)
+		return nw, err
+	}
+	nw, _, err := writePollableChunk(dstFD, remaining, maxChunk, false, useMsgDontWait)
+	return nw, err
+}
+
+func copyToPollableFD(dst *os.File, src io.Reader, stop <-chan struct{}) error {
+	return copyToPollableFDSerialized(dst, src, stop, nil)
+}
+
+func copyToPollableFDSerialized(dst *os.File, src io.Reader, stop <-chan struct{}, sharedMu *sync.Mutex) error {
+	rawConn, owned, useMsgDontWait, needSharedLock, maxChunk, err := preparePollableWriteTarget(dst)
+	if err != nil {
+		_, copyErr := io.Copy(dst, src)
+		return copyErr
+	}
+	if owned != nil {
+		defer func() { _ = owned.Close() }()
+	}
+	var writeMu *sync.Mutex
+	if needSharedLock {
+		writeMu = sharedMu
+	}
+
+	var (
+		wakeFile    *os.File
+		wakeConn    syscall.RawConn
+		wakeCleanup func()
+	)
+	defer func() {
+		if wakeCleanup != nil {
+			wakeCleanup()
+		}
+	}()
+	ensureWakeConn := func() (syscall.RawConn, error) {
+		if wakeConn != nil {
+			return wakeConn, nil
+		}
+		wf, cleanup, wErr := openWakePipeMonitor(stop)
+		if wErr != nil {
+			return nil, wErr
+		}
+		wc, cErr := wf.SyscallConn()
+		if cErr != nil {
+			cleanup()
+			return nil, cErr
+		}
+		wakeFile = wf
+		_ = wakeFile
+		wakeCleanup = cleanup
+		wakeConn = wc
+		return wakeConn, nil
+	}
+
+	buf := make([]byte, 32*1024)
+	for {
+		if isClosedChan(stop) {
+			return nil
+		}
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			remaining, stopped, fastErr := pollWriteAllFDFast(rawConn, buf[:n], maxChunk, useMsgDontWait, writeMu, stop)
+			if stopped {
+				return nil
+			}
+			if fastErr != nil {
+				return fastErr
+			}
+			if len(remaining) > 0 {
+				wc, wErr := ensureWakeConn()
+				if wErr != nil {
+					return wErr
+				}
+				wStopped, wWriteErr := pollWriteAllFDWithWake(rawConn, wc, remaining, maxChunk, useMsgDontWait, writeMu)
+				if wWriteErr != nil {
+					return wWriteErr
+				}
+				if wStopped {
+					return nil
+				}
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return nil
+			}
+			return readErr
+		}
+	}
+}
+
+func waitPassengerDrainBounded(done <-chan struct{}) {
+	timer := time.NewTimer(sessionShutdownTimeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+	}
+}
+
+func drainErrorBounded(ch <-chan error) error {
+	timer := time.NewTimer(sessionShutdownTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-ch:
+		return err
+	case <-timer.C:
+		return nil
+	}
+}
+
+func runPassengerChannelIO(s *MuxServer, conn net.Conn, ch cryptoSSH.Channel, reqs <-chan *cryptoSSH.Request, files []*os.File) uint32 {
 	stdinFile, stdoutFile, stderrFile := files[0], files[1], files[2]
 
 	var (
@@ -585,20 +993,29 @@ func runPassengerChannelIO(conn net.Conn, ch cryptoSSH.Channel, reqs <-chan *cry
 		}
 	}()
 
+	stopOutput := make(chan struct{})
+	cancelOutput := sync.OnceFunc(func() { close(stopOutput) })
+
+	var sharedOutMu *sync.Mutex
+	if stOut, err1 := stdoutFile.Stat(); err1 == nil {
+		if stErr, err2 := stderrFile.Stat(); err2 == nil && os.SameFile(stOut, stErr) {
+			sharedOutMu = &sync.Mutex{}
+		}
+	}
+
 	var outWG sync.WaitGroup
 	outWG.Add(2)
 	go func() {
 		defer outWG.Done()
-		_, _ = io.Copy(stdoutFile, ch)
+		_ = copyToPollableFDSerialized(stdoutFile, ch, stopOutput, sharedOutMu)
 	}()
 	go func() {
 		defer outWG.Done()
-		_, _ = io.Copy(stderrFile, ch.Stderr())
+		_ = copyToPollableFDSerialized(stderrFile, ch.Stderr(), stopOutput, sharedOutMu)
 	}()
 
 	stopStdin := make(chan struct{})
-	var stopStdinOnce sync.Once
-	cancelStdin := func() { stopStdinOnce.Do(func() { close(stopStdin) }) }
+	cancelStdin := sync.OnceFunc(func() { close(stopStdin) })
 
 	stdinDone := make(chan struct{})
 	go func() {
@@ -617,46 +1034,51 @@ func runPassengerChannelIO(conn net.Conn, ch cryptoSSH.Channel, reqs <-chan *cry
 	// Watch the control socket while the remote channel runs: if the passenger
 	// client terminates early (closing conn), abort the remote channel so neither
 	// the remote process nor the copy workers leak.
-	connClosed := make(chan struct{})
-	var stopConnWatch func() bool
-	if d, ok := conn.(interface{ SetReadDeadline(time.Time) error }); ok {
-		go func() {
-			defer close(connClosed)
-			var buf [1]byte
-			_, _ = conn.Read(buf[:])
-		}()
-		stopConnWatch = func() bool {
-			_ = d.SetReadDeadline(time.Now())
-			<-connClosed
-			_ = d.SetReadDeadline(time.Time{})
-			return true
+	connClosed, stopConnWatch := startPassengerStdioConnWatch(conn)
+
+	var serverDone <-chan struct{}
+	if s != nil {
+		serverDone = s.baseContext().Done()
+	}
+
+	abortChannel := func(needStopWatch bool) uint32 {
+		if needStopWatch {
+			stopConnWatch()
 		}
-	} else {
-		stopConnWatch = func() bool { return false }
+		cancelStdin()
+		cancelOutput()
+		_ = s.closeMuxChannelBounded(ch, nil)
+		_ = stdoutFile.Close()
+		_ = stderrFile.Close()
+		drainDone := make(chan struct{})
+		go func() {
+			<-stdinDone
+			<-outDone
+			close(drainDone)
+		}()
+		waitPassengerDrainBounded(drainDone)
+		_ = stdinFile.Close()
+		return exitCode.Load()
 	}
 
 	select {
 	case <-outDone:
 		stopConnWatch()
 	case <-connClosed:
-		cancelStdin()
-		_ = ch.Close()
-		<-stdinDone
-		closeFiles(files)
-		<-outDone
-		return exitCode.Load()
+		return abortChannel(false)
+	case <-serverDone:
+		return abortChannel(true)
 	}
 
-	// Wake the stdin poller and close inherited descriptors before sending
-	// MUX_S_EXIT_MESSAGE so the passenger client sees EOF on its stdout/stderr
-	// pipes and our local stdin reader unblocks immediately even when the caller
-	// passed a blocking TTY or pipe descriptor.
+	// Close the SSH channel before joining stdinDone so a copyFromPollableFD
+	// blocked on ch.Write or ch.CloseWrite due to exhausted remote window unblocks cleanly.
 	cancelStdin()
-	<-stdinDone
+	cancelOutput()
+	_ = s.closeMuxChannelBounded(ch, nil)
+	waitPassengerDrainBounded(stdinDone)
 	_ = stdoutFile.Close()
 	_ = stderrFile.Close()
 	_ = stdinFile.Close()
-	_ = ch.Close()
 
 	if !hasExit.Load() {
 		return 0
@@ -683,6 +1105,25 @@ func resolvePassengerStdioFwdTarget(s *MuxServer, payload []byte) (dialNetwork, 
 		return "", "", fmt.Sprintf("invalid stdio forward port %d: must be in 1..65535", fwdReq.ConnectPort)
 	}
 	return s.effectiveDialNetwork(), net.JoinHostPort(connectHost, strconv.FormatUint(uint64(fwdReq.ConnectPort), 10)), ""
+}
+
+func startPassengerStdioConnWatch(conn net.Conn) (<-chan struct{}, func() bool) {
+	connClosed := make(chan struct{})
+	d, ok := conn.(interface{ SetReadDeadline(time.Time) error })
+	if !ok {
+		return connClosed, func() bool { return false }
+	}
+	go func() {
+		defer close(connClosed)
+		var buf [1]byte
+		_, _ = conn.Read(buf[:])
+	}()
+	return connClosed, func() bool {
+		_ = d.SetReadDeadline(time.Now())
+		<-connClosed
+		_ = d.SetReadDeadline(time.Time{})
+		return true
+	}
 }
 
 func handlePassengerStdioFwd(s *MuxServer, conn net.Conn, reqID uint32, payload []byte) error {
@@ -717,82 +1158,113 @@ func handlePassengerStdioFwd(s *MuxServer, conn net.Conn, reqID uint32, payload 
 	s.trackStream(conn)
 	defer s.untrackStream(conn)
 
-	stream, err := s.dialSSHMux(s.baseContext(), dialNetwork, targetAddr)
+	ch, reqs, err := s.dialSSHMuxChannel(s.baseContext(), dialNetwork, targetAddr)
 	if err != nil {
 		return sendFailure(conn, reqID, fmt.Sprintf("remote dial failed: %v", err))
 	}
-	defer func() { _ = stream.Close() }()
+	defer func() { _ = s.closeMuxChannelBounded(ch, nil) }()
 
 	if err := sendSessionOpened(conn, reqID, 1); err != nil {
 		return err
 	}
 
+	remoteClosed := make(chan struct{})
+	go func() {
+		defer close(remoteClosed)
+		if reqs != nil {
+			cryptoSSH.DiscardRequests(reqs)
+		}
+	}()
+	stderrDone := make(chan struct{})
+	go func() {
+		defer close(stderrDone)
+		if se := ch.Stderr(); se != nil {
+			_, _ = io.Copy(io.Discard, se)
+		}
+	}()
+
 	stdinFile, stdoutFile := files[0], files[1]
 
 	stopStdin := make(chan struct{})
 	cancelStdin := sync.OnceFunc(func() { close(stopStdin) })
+	stopOutput := make(chan struct{})
+	cancelOutput := sync.OnceFunc(func() { close(stopOutput) })
 	stdinDone := make(chan error, 1)
 	stdoutDone := make(chan error, 1)
 	go func() {
-		copyErr := copyFromPollableFD(stream, stdinFile, stopStdin)
-		if cw, ok := stream.(interface{ CloseWrite() error }); ok {
-			_ = cw.CloseWrite()
-		}
+		copyErr := copyFromPollableFD(ch, stdinFile, stopStdin)
+		_ = ch.CloseWrite()
 		stdinDone <- copyErr
 	}()
 	go func() {
-		_, copyErr := io.Copy(stdoutFile, stream)
-		stdoutDone <- copyErr
+		stdoutDone <- copyToPollableFD(stdoutFile, ch, stopOutput)
 	}()
 
-	// Watch the control socket while stdio forwarding runs: if the passenger
-	// client terminates early (closing conn), abort the remote stream and close
-	// inherited descriptors immediately so neither remote forward nor copy workers leak.
-	connClosed := make(chan struct{})
-	var stopConnWatch func() bool
-	if d, ok := conn.(interface{ SetReadDeadline(time.Time) error }); ok {
-		go func() {
-			defer close(connClosed)
-			var buf [1]byte
-			_, _ = conn.Read(buf[:])
-		}()
-		stopConnWatch = func() bool {
-			_ = d.SetReadDeadline(time.Now())
-			<-connClosed
-			_ = d.SetReadDeadline(time.Time{})
-			return true
-		}
-	} else {
-		stopConnWatch = func() bool { return false }
-	}
+	return awaitPassengerStdioFwdCompletion(s, conn, ch, stdinFile, stdoutFile, cancelStdin, cancelOutput, stdinDone, stdoutDone, remoteClosed, stderrDone)
+}
 
-	// Wait for remote -> stdout to finish (or control-socket disconnect), while
-	// allowing stdin EOF to half-close the remote stream so request/response
-	// protocols (like HTTP or banner probes with short stdin) still receive the
-	// remote server's response before tearing down both descriptors.
+func awaitPassengerStdioFwdCompletion(
+	s *MuxServer,
+	conn net.Conn,
+	ch cryptoSSH.Channel,
+	stdinFile, stdoutFile *os.File,
+	cancelStdin, cancelOutput func(),
+	stdinDone, stdoutDone <-chan error,
+	remoteClosed, stderrDone <-chan struct{},
+) error {
+	connClosed, stopConnWatch := startPassengerStdioConnWatch(conn)
+
+	// Wait for remote -> stdout to finish (or control-socket disconnect). If
+	// remote sent SSH_MSG_CHANNEL_EOF while keeping the channel open, propagate
+	// EOF on stdoutFile and let remaining stdin finish uploading until local
+	// EOF or remote channel close.
 	var (
-		outErr       error
-		disconnected bool
+		outErr, inErr error
+		stdinDrained  bool
+		aborted       bool
+		serverDone    <-chan struct{}
 	)
+	if s != nil {
+		serverDone = s.baseContext().Done()
+	}
 	select {
 	case outErr = <-stdoutDone:
-		stopConnWatch()
+		if outErr == nil && !isClosedChan(remoteClosed) {
+			_ = stdoutFile.Close()
+			select {
+			case inErr = <-stdinDone:
+				stdinDrained = true
+				stopConnWatch()
+			case <-remoteClosed:
+				stopConnWatch()
+			case <-connClosed:
+				aborted = true
+			case <-serverDone:
+				stopConnWatch()
+				aborted = true
+			}
+		} else {
+			stopConnWatch()
+		}
 	case <-connClosed:
-		disconnected = true
-		cancelStdin()
-		_ = stream.Close()
-		closeFiles(files)
-		outErr = <-stdoutDone
+		aborted = true
+	case <-serverDone:
+		stopConnWatch()
+		aborted = true
+	}
+	if aborted {
+		return abortPassengerStdioFwd(s, ch, stdinFile, stdoutFile, cancelStdin, cancelOutput, stdoutDone, stdinDone, stderrDone)
 	}
 
 	cancelStdin()
-	inErr := <-stdinDone
-	_ = stream.Close()
+	cancelOutput()
+	_ = s.closeMuxChannelBounded(ch, nil)
+	if !stdinDrained {
+		inErr = drainErrorBounded(stdinDone)
+	}
+	waitPassengerDrainBounded(stderrDone)
 	_ = stdinFile.Close()
 	_ = stdoutFile.Close()
-	if disconnected {
-		return nil
-	}
 
 	firstErr := outErr
 	if firstErr == nil && !errors.Is(inErr, os.ErrClosed) {
@@ -804,6 +1276,34 @@ func handlePassengerStdioFwd(s *MuxServer, conn net.Conn, reqID uint32, payload 
 		exitStatus = 1
 	}
 	return sendExitMessage(conn, 1, exitStatus)
+}
+
+func abortPassengerStdioFwd(
+	s *MuxServer,
+	stream io.Closer,
+	stdinFile, stdoutFile *os.File,
+	cancelStdin, cancelOutput func(),
+	stdoutDone, stdinDone <-chan error,
+	stderrDone <-chan struct{},
+) error {
+	cancelStdin()
+	cancelOutput()
+	_ = s.closeMuxChannelBounded(stream, nil)
+	_ = stdoutFile.Close()
+	waitDone := make(chan struct{})
+	go func() {
+		err := <-stdoutDone
+		_ = err
+		err = <-stdinDone
+		_ = err
+		if stderrDone != nil {
+			<-stderrDone
+		}
+		close(waitDone)
+	}()
+	waitPassengerDrainBounded(waitDone)
+	_ = stdinFile.Close()
+	return nil
 }
 
 // passengerFDReceiveTimeout bounds how long a master waits for a passenger

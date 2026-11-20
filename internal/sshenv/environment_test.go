@@ -152,3 +152,93 @@ func TestDiscoverAgentSocketAndDialAgentCancellation(t *testing.T) {
 		t.Fatalf("DialAgent canceled error = %v, want context.Canceled", err)
 	}
 }
+
+func TestParseWindowsAgentPipePath_SecurityAndValidation(t *testing.T) {
+	invalid := []string{
+		`\\.\pipe\`,
+		`\\?\pipe\`,
+		`//./pipe/`,
+		`\\.\pipe\..\C:\Users\victim\.ssh\id_ed25519`,
+		`\\?\pipe\..\evil`,
+		`\\.\pipe\a\..\b`,
+		`//./pipe/a/../b`,
+		`\\.\pipe\.\agent`,
+		`\\.\pipe\foo:bar`,
+		`\\.\pipe\foo.. `,
+		`\\.\pipe\.. \bar`,
+		`\\.\pipe\...`,
+		`\\.\pipe\\foo`,
+		`\\.\pipe\foo\`,
+		`\\.\pipe\agent` + "\x00",
+		"\\\\.\\pipe\\agent\r\n",
+		"\n\\\\.\\pipe\\agent",
+		"\\\\.\\pipe\\agent\tname",
+	}
+	for _, in := range invalid {
+		pipePath, isPipe, err := parseWindowsAgentPipePath(in)
+		if !isPipe || err == nil || pipePath != "" {
+			t.Fatalf("parseWindowsAgentPipePath(%q) = (%q, %v, %v), want (\"\", true, error)", in, pipePath, isPipe, err)
+		}
+		if norm, ok := normalizeWindowsAgentPipePath(in); ok || norm != "" {
+			t.Fatalf("normalizeWindowsAgentPipePath(%q) = (%q, %v), want (\"\", false)", in, norm, ok)
+		}
+	}
+
+	valid := []struct {
+		in   string
+		want string
+	}{
+		{`\\.\pipe\sub\agent.sock`, `\\.\pipe\sub\agent.sock`},
+		{`\\?\PIPE/sub/agent.sock`, `\\.\pipe\sub\agent.sock`},
+	}
+	for _, tc := range valid {
+		pipePath, isPipe, err := parseWindowsAgentPipePath(tc.in)
+		if !isPipe || err != nil || pipePath != tc.want {
+			t.Fatalf("parseWindowsAgentPipePath(%q) = (%q, %v, %v), want (%q, true, nil)", tc.in, pipePath, isPipe, err, tc.want)
+		}
+	}
+
+	for _, nonPipe := range []string{"", `C:\Users\alice\agent.sock`, `/tmp/agent.sock`} {
+		if pipePath, isPipe, err := parseWindowsAgentPipePath(nonPipe); isPipe || err != nil || pipePath != "" {
+			t.Fatalf("parseWindowsAgentPipePath(%q) = (%q, %v, %v), want (\"\", false, nil)", nonPipe, pipePath, isPipe, err)
+		}
+	}
+
+	for _, ctrlNonPipe := range []string{"/tmp/agent\x00.sock", "/tmp/agent\r.sock", "\t"} {
+		if _, isPipe, err := parseWindowsAgentPipePath(ctrlNonPipe); isPipe || err == nil {
+			t.Fatalf("parseWindowsAgentPipePath(%q) = (isPipe=%v, err=%v), want (false, error)", ctrlNonPipe, isPipe, err)
+		}
+	}
+}
+
+func TestRound4_P1_7_P3_5_WindowsAgentPathWhitelistAndLeadingControls(t *testing.T) {
+	// Leading/trailing ASCII control chars on pipe paths must be rejected BEFORE TrimSpace.
+	for _, raw := range []string{
+		"\t\\\\.\\pipe\\openssh-ssh-agent",
+		" \v\\\\.\\pipe\\openssh-ssh-agent",
+		"\\\\.\\pipe\\agent\x7f",
+	} {
+		if _, isPipe, err := parseWindowsAgentPipePath(raw); !isPipe || err == nil {
+			t.Fatalf("parseWindowsAgentPipePath(%q) = (isPipe=%v, err=%v), want (true, error)", raw, isPipe, err)
+		}
+	}
+
+	// UNC, device namespace, and NT object manager paths must fail closed rather than falling back to AF_UNIX.
+	for _, blocked := range []string{
+		`\\attacker\share\agent.sock`,
+		`\\attacker\pipe\openssh-ssh-agent`,
+		`//attacker/pipe/openssh-ssh-agent`,
+		`\\localhost\pipe\openssh-ssh-agent`,
+		`\\.\CON`,
+		`\\.\NUL`,
+		`\\?\GLOBALROOT\Device\NamedPipe\evil`,
+		`\\?\UNC\attacker\share\agent`,
+		`\??\C:\Users\alice\agent.sock`,
+		`/??/C:/Users/alice/agent.sock`,
+		`\??`,
+	} {
+		if pipePath, isPipe, err := parseWindowsAgentPipePath(blocked); isPipe || err == nil || pipePath != "" {
+			t.Fatalf("parseWindowsAgentPipePath(%q) = (%q, %v, %v), want (\"\", false, error)", blocked, pipePath, isPipe, err)
+		}
+	}
+}

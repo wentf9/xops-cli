@@ -637,3 +637,89 @@ func verifySavedUserPortExcludeCases(
 		t.Fatal("expected --exclude root@prod-web to exclude root overrides and preserve iaas")
 	}
 }
+
+func TestExclude_OpenSSHUserAndDistinctAliasScoping(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	sshCfg := `
+Host ssh-web
+  HostName 10.238.221.181
+  User iaas
+  Port 22
+
+Host app-a
+  HostName 10.238.221.182
+  User ops
+  Port 22
+
+Host app-b
+  HostName 10.238.221.182
+  User ops
+  Port 22
+`
+	parser, err := config.NewOpenSSHParserFromReader(strings.NewReader(sshCfg))
+	if err != nil {
+		t.Fatalf("NewOpenSSHParserFromReader failed: %v", err)
+	}
+	cfg := &config.Configuration{
+		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
+		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
+		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
+	}
+	openSSHProv := config.NewProviderWithOpenSSHParser(cfg, parser)
+
+	t.Run("user-qualified OpenSSH exclude does not exclude other user on same alias", func(t *testing.T) {
+		iaasCand := ExcludeTargetInfo{
+			NodeID:         "iaas@10.238.221.181:22",
+			MatchedNodeID:  "openssh:ssh-web",
+			OpenSSHAlias:   "ssh-web",
+			User:           "iaas",
+			Port:           22,
+			UnmanagedHosts: []string{"10.238.221.181", "ssh-web"},
+		}
+		bobCand := ExcludeTargetInfo{
+			NodeID:         "bob@10.238.221.181:22",
+			MatchedNodeID:  "openssh:ssh-web",
+			OpenSSHAlias:   "ssh-web",
+			User:           "bob",
+			Port:           22,
+			UnmanagedHosts: []string{"10.238.221.181", "ssh-web"},
+		}
+		excl, err := ResolveExcludesForTargets(openSSHProv, []string{"iaas@ssh-web"}, []ExcludeTargetInfo{iaasCand, bobCand})
+		if err != nil {
+			t.Fatalf("ResolveExcludesForTargets(iaas@ssh-web) failed: %v", err)
+		}
+		if !IsTargetExcluded(excl, iaasCand) {
+			t.Fatal("expected --exclude iaas@ssh-web to exclude iaas@ssh-web")
+		}
+		if IsTargetExcluded(excl, bobCand) {
+			t.Fatal("expected --exclude iaas@ssh-web NOT to exclude bob@ssh-web")
+		}
+	})
+
+	t.Run("distinct OpenSSH aliases sharing IP/user/port exclude independently", func(t *testing.T) {
+		candA := ExcludeTargetInfo{
+			NodeID:         "ops@10.238.221.182:22",
+			OpenSSHAlias:   "app-a",
+			User:           "ops",
+			Port:           0, // exercises 0 -> 22 normalization
+			UnmanagedHosts: []string{"10.238.221.182", "app-a"},
+		}
+		candB := ExcludeTargetInfo{
+			NodeID:         "ops@10.238.221.182:22",
+			OpenSSHAlias:   "app-b",
+			User:           "ops",
+			Port:           22,
+			UnmanagedHosts: []string{"10.238.221.182", "app-b"},
+		}
+		exclA, err := ResolveExcludesForTargets(openSSHProv, []string{"ops@app-a"}, []ExcludeTargetInfo{candA, candB})
+		if err != nil {
+			t.Fatalf("ResolveExcludesForTargets(ops@app-a) failed: %v", err)
+		}
+		if !IsTargetExcluded(exclA, candA) {
+			t.Fatal("expected --exclude ops@app-a to exclude ops@app-a")
+		}
+		if IsTargetExcluded(exclA, candB) {
+			t.Fatal("expected --exclude ops@app-a NOT to exclude ops@app-b sharing IP/user/port")
+		}
+	})
+}

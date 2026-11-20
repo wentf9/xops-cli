@@ -385,8 +385,6 @@ func TestPass6_M6_ResolveOwnedMasterNodeIDAndCanonicalizedConnectorMaster(t *tes
 
 	sshCfg := strings.Join([]string{
 		"Host web",
-		"  HostName 192.0.2.250",
-		"  User wronguser",
 		"  ServerAliveCountMax 3",
 		"",
 		"Host web.corp.example.com",
@@ -394,6 +392,7 @@ func TestPass6_M6_ResolveOwnedMasterNodeIDAndCanonicalizedConnectorMaster(t *tes
 		"  Port " + strconv.Itoa(fixPort),
 		"  User fixture",
 		"  ServerAliveCountMax 13",
+		"  ServerAliveInterval 17",
 		"",
 		"Host proxy.corp.example.com",
 		"  HostName " + fixHost,
@@ -472,8 +471,10 @@ func verifyPass6M6CanonicalizedConnectorMaster(
 		t.Fatalf("childCfg = (Address=%q, Port=%d, OriginalHost=%q), want (%s, %d, web)",
 			childCfg.Address, childCfg.Port, childCfg.OriginalHost, fixHost, fixPort)
 	}
-	if effOpts == nil || effOpts.ServerAliveCountMax() != 13 {
-		t.Fatalf("expected canonicalized ServerAliveCountMax=13, got %v", effOpts)
+	// OpenSSH two-pass semantics apply Pass 1 (Host web -> ServerAliveCountMax=3)
+	// before Pass 2 (Host web.corp.example.com -> ServerAliveInterval=17).
+	if effOpts == nil || effOpts.ServerAliveCountMax() != 3 || effOpts.ServerAliveInterval() != 17*time.Second {
+		t.Fatalf("expected canonicalized ServerAliveCountMax=3 and ServerAliveInterval=17s, got %v", effOpts)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"time"
 
 	cryptoSSH "golang.org/x/crypto/ssh"
 )
@@ -73,6 +74,28 @@ type tunnelNetAddr struct {
 func (a tunnelNetAddr) Network() string { return a.network }
 func (a tunnelNetAddr) String() string  { return a.name }
 
+func validateTunnelDeviceModeAndSpec(mode TunnelMode, spec TunnelDeviceSpec) (TunnelMode, uint32, string, error) {
+	var (
+		wireMode    uint32
+		networkName string
+	)
+	switch mode {
+	case TunnelModeYes, TunnelModePointToPoint:
+		mode = TunnelModePointToPoint
+		wireMode = openSSHTunModePointToPoint
+		networkName = "tun"
+	case TunnelModeEthernet:
+		wireMode = openSSHTunModeEthernet
+		networkName = "tap"
+	default:
+		return "", 0, "", fmt.Errorf("invalid tunnel mode %q for tunnel device forwarding", mode)
+	}
+	if spec.LocalUnit < 0 || spec.LocalUnit > TunnelIDAny || spec.RemoteUnit < 0 || spec.RemoteUnit > TunnelIDAny {
+		return "", 0, "", fmt.Errorf("invalid tunnel device unit specification %+v", spec)
+	}
+	return mode, wireMode, networkName, nil
+}
+
 // TunnelDeviceForward opens a local tun/tap device and bridges packets with the
 // remote SSH server over an OpenSSH "tun@openssh.com" channel.
 //
@@ -86,25 +109,14 @@ func (c *Client) TunnelDeviceForward(ctx context.Context, mode TunnelMode, spec 
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("tunnel device forward canceled: %w", err)
 	}
-	if c == nil || c.sshClient == nil {
+	if c == nil || c.sshClient == nil || c.sshClient.Conn == nil {
 		return nil, fmt.Errorf("SSH client is not connected")
 	}
-	var wireMode uint32
-	var networkName string
-	switch mode {
-	case TunnelModeYes, TunnelModePointToPoint:
-		mode = TunnelModePointToPoint
-		wireMode = openSSHTunModePointToPoint
-		networkName = "tun"
-	case TunnelModeEthernet:
-		wireMode = openSSHTunModeEthernet
-		networkName = "tap"
-	default:
-		return nil, fmt.Errorf("invalid tunnel mode %q for tunnel device forwarding", mode)
+	normMode, wireMode, networkName, err := validateTunnelDeviceModeAndSpec(mode, spec)
+	if err != nil {
+		return nil, err
 	}
-	if spec.LocalUnit < 0 || spec.LocalUnit > TunnelIDAny || spec.RemoteUnit < 0 || spec.RemoteUnit > TunnelIDAny {
-		return nil, fmt.Errorf("invalid tunnel device unit specification %+v", spec)
-	}
+	mode = normMode
 
 	opener := c.environment.TunnelOpener
 	if nilCapability(opener) {
@@ -128,7 +140,11 @@ func (c *Client) TunnelDeviceForward(ctx context.Context, mode TunnelMode, spec 
 			closeDevErr,
 		)
 	}
-	go cryptoSSH.DiscardRequests(reqs)
+	reqsDone := make(chan struct{})
+	go func() {
+		defer close(reqsDone)
+		cryptoSSH.DiscardRequests(reqs)
+	}()
 
 	options := c.forwardOptions(opts...)
 	addr := tunnelNetAddr{network: networkName, name: dev.Name()}
@@ -137,10 +153,6 @@ func (c *Client) TunnelDeviceForward(ctx context.Context, mode TunnelMode, spec 
 	runCtx, runCancel := context.WithCancel(ctx)
 	closeEndpoints := sync.OnceValue(func() error {
 		return errors.Join(closeTunnelDevice(dev), closeSSHChannel(ch))
-	})
-
-	stopOnCancel := context.AfterFunc(runCtx, func() {
-		_ = closeEndpoints()
 	})
 
 	go func() {
@@ -160,11 +172,39 @@ func (c *Client) TunnelDeviceForward(ctx context.Context, mode TunnelMode, spec 
 			errCh <- pumpChannelToDevice(runCtx, ch, dev, mode, options.onConnectionError)
 		})
 
-		firstErr := <-errCh
+		var (
+			firstErr error
+			gotFirst bool
+		)
+		select {
+		case firstErr = <-errCh:
+			gotFirst = true
+		case <-runCtx.Done():
+		}
 		runCancel()
-		_ = stopOnCancel()
-		closeErr := closeEndpoints()
-		wg.Wait()
+		drainDone := make(chan error, 1)
+		go func() {
+			cErr := closeEndpoints()
+			wg.Wait()
+			<-reqsDone
+			drainDone <- cErr
+		}()
+		var closeErr error
+		timer := time.NewTimer(sessionShutdownTimeout)
+		select {
+		case closeErr = <-drainDone:
+			timer.Stop()
+		case <-timer.C:
+			interruptErr := c.Interrupt()
+			closeErr = errors.Join(
+				fmt.Errorf("SSH tunnel shutdown exceeded %s", sessionShutdownTimeout),
+				interruptErr,
+				<-drainDone,
+			)
+		}
+		if !gotFirst {
+			firstErr = <-errCh
+		}
 		secondErr := <-errCh
 
 		if ctx.Err() == nil {

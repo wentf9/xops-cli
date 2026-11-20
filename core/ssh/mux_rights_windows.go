@@ -14,12 +14,12 @@ import (
 
 var errPassengerUnsupported = errors.New("passenger mode with fd passing is not supported on Windows; use MUX_C_PROXY")
 
-func bindAndLinkSocket(targetPath string) (net.Listener, error) {
+func bindAndLinkSocket(targetPath string) (net.Listener, os.FileInfo, error) {
 	if err := os.MkdirAll(filepath.Dir(targetPath), 0700); err != nil {
-		return nil, fmt.Errorf("create socket directory failed: %w", err)
+		return nil, nil, fmt.Errorf("create socket directory failed: %w", err)
 	}
 	if _, err := os.Lstat(targetPath); err == nil {
-		return nil, fmt.Errorf("%w: %s", ErrMasterAlreadyExists, targetPath)
+		return nil, nil, fmt.Errorf("%w: %s", ErrMasterAlreadyExists, targetPath)
 	}
 
 	// Windows AF_UNIX does not support hard-linking socket reparse points.
@@ -33,14 +33,20 @@ func bindAndLinkSocket(targetPath string) (net.Listener, error) {
 			strings.Contains(errStr, "only one usage of each socket address") ||
 			strings.Contains(errStr, "access is denied") ||
 			strings.Contains(errStr, "file exists") {
-			return nil, fmt.Errorf("%w: %s", ErrMasterAlreadyExists, targetPath)
+			return nil, nil, fmt.Errorf("%w: %s", ErrMasterAlreadyExists, targetPath)
 		}
-		return nil, err
+		return nil, nil, err
 	}
 	if unixLn, ok := listener.(*net.UnixListener); ok {
 		unixLn.SetUnlinkOnClose(false)
 	}
-	return listener, nil
+	origFi, lstatErr := os.Lstat(targetPath)
+	if lstatErr != nil {
+		_ = listener.Close()
+		_ = os.Remove(targetPath)
+		return nil, nil, fmt.Errorf("stat control socket failed: %w", lstatErr)
+	}
+	return listener, origFi, nil
 }
 
 func checkPeerUID(conn net.Conn, expectedUID uint32) error {

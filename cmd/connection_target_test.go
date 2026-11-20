@@ -787,6 +787,7 @@ func TestCommands_ExistingNode_ProxyJumpChainUpdate(t *testing.T) {
 	t.Run("exec_updates_existing_node_multihop_proxyjump", func(t *testing.T) {
 		repo := setupTestRepository(t)
 		execOpt := NewExecOptions()
+		execOpt.Interactive = true
 		execOpt.JumpHost = "10.0.0.1:22,10.0.0.2:22"
 		execOpt.Host = "iaas@10.238.221.181"
 		tasks, hostErrs, err := execOpt.buildTasksFromHosts(ctx, repo)

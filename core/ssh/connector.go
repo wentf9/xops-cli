@@ -730,13 +730,14 @@ func (c *Connector) buildTargetContext(planNode connectionPlanNode) TargetContex
 		originalHost = planNode.name
 	}
 	return TargetContext{
-		Host:         cleanHostLiteral(cfg.Address),
-		Port:         port,
-		User:         user,
-		OriginalHost: originalHost,
-		JumpHost:     cfg.ProxyJump,
-		KeyPath:      cfg.KeyPath,
-		Control:      planNode.control,
+		Host:          cleanHostLiteral(cfg.Address),
+		Port:          port,
+		User:          user,
+		OriginalHost:  originalHost,
+		CanonicalHost: strings.TrimSpace(cfg.CanonicalHost),
+		JumpHost:      cfg.ProxyJump,
+		KeyPath:       cfg.KeyPath,
+		Control:       planNode.control,
 	}
 }
 
@@ -1108,6 +1109,7 @@ func (c *Connector) maybeStartMasterListener(planNode connectionPlanNode, resolv
 type masterOwnership struct {
 	nodeID            string
 	foregroundSession bool
+	releaseExtra      func()
 }
 
 func isMuxServerClosed(srv *MuxServer) bool {
@@ -1225,12 +1227,19 @@ func (c *Connector) ReleaseMaster(server *MuxServer) bool {
 	c.pruneClosedMastersLocked()
 	ownership := c.masters[server]
 	release := ownership != nil && ownership.foregroundSession
+	var relFn func()
 	if release {
 		ownership.foregroundSession = false
+		relFn = ownership.releaseExtra
+		ownership.releaseExtra = nil
 	}
 	c.lifecycleMu.Unlock()
 	if release {
-		server.RemoveForegroundSession()
+		if relFn != nil {
+			relFn()
+		} else {
+			server.RemoveForegroundSession()
+		}
 	}
 	return ownership != nil
 }
@@ -1258,7 +1267,8 @@ func (c *Connector) AcquireMaster(server *MuxServer) bool {
 	}
 	c.lifecycleMu.Unlock()
 
-	if !server.AddForegroundSession() {
+	rel, ok := server.AcquireForegroundSession()
+	if !ok {
 		return false
 	}
 
@@ -1268,10 +1278,11 @@ func (c *Connector) AcquireMaster(server *MuxServer) bool {
 	if c.closed || ownership == nil || ownership.foregroundSession {
 		alreadyHeld := !c.closed && ownership != nil && ownership.foregroundSession
 		c.lifecycleMu.Unlock()
-		server.RemoveForegroundSession()
+		rel()
 		return alreadyHeld
 	}
 	ownership.foregroundSession = true
+	ownership.releaseExtra = rel
 	c.lifecycleMu.Unlock()
 	return true
 }

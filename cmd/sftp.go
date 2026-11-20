@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/wentf9/xops-cli/cmd/sftpshell"
 	"github.com/wentf9/xops-cli/cmd/utils"
 	"github.com/wentf9/xops-cli/core/sftp"
@@ -51,7 +52,13 @@ func NewSftpOptions() *SftpOptions {
 }
 
 func NewCmdSftp() *cobra.Command {
-	o := NewSftpOptions()
+	return newCmdSftpWithOptions(NewSftpOptions())
+}
+
+func newCmdSftpWithOptions(o *SftpOptions) *cobra.Command {
+	if o == nil {
+		o = NewSftpOptions()
+	}
 	cmd := &cobra.Command{
 		Use:   "sftp [user@]host[:port]",
 		Short: i18n.T("sftp_short"),
@@ -97,24 +104,93 @@ func NewCmdSftp() *cobra.Command {
 }
 
 func (o *SftpOptions) Complete(cmd *cobra.Command, args []string) error {
-	if err := o.SshOptions.Complete(cmd, args); err != nil {
+	o.args = args
+	o.dashIdx = -1
+	o.parsedArgs = false
+	o.hostFromPositional = false
+	o.appliedGeneralOpts = false
+	o.stdinScript = false
+
+	var flags *pflag.FlagSet
+	if cmd != nil {
+		flags = cmd.Flags()
+		o.dashIdx = cmd.ArgsLenAtDash()
+	}
+	o.control.ctlCmdSet = flags != nil && flags.Changed("control-command")
+	if err := ApplyGeneralOptions(&o.SshOptions, o.control.Options, flags); err != nil {
+		return o.control.controlUsageError(err)
+	}
+	if err := validateExplicitZeroPort(flags); err != nil {
+		return o.control.controlUsageError(err)
+	}
+	if _, err := o.toSessionControlOptions(); err != nil {
+		return o.control.controlUsageError(err)
+	}
+
+	if o.PasswordStdin || o.PassphraseStdin || o.OTPStdin {
+		if err := o.Validate(); err != nil {
+			return o.control.controlUsageError(err)
+		}
+	} else if o.OTP != "" {
+		if err := o.validateSftpInvariants(); err != nil {
+			return o.control.controlUsageError(err)
+		}
+	}
+
+	bgRun, bgErr := o.effectiveBgRunChecked()
+	if bgErr != nil {
+		return o.control.controlUsageError(bgErr)
+	}
+	if bgRun {
+		if err := o.ensureArgsParsed(); err != nil {
+			return err
+		}
+		o.stdinScript = false
+		return nil
+	}
+
+	o.execution.capturePresence(cmd)
+	if err := o.completeStdinAndScriptInput(os.Getenv(sshBackgroundChildEnv) == "true", ""); err != nil {
 		return err
 	}
 	o.stdinScript = false
 	return nil
 }
 
+func (o *SftpOptions) extraPositionalArgs() []string {
+	if len(o.args) == 0 {
+		return nil
+	}
+	if !o.hostFromPositional && o.Host != "" {
+		return o.args
+	}
+	return o.args[1:]
+}
+
+func (o *SftpOptions) validateSftpInvariants() error {
+	if o.force && o.noOverwrite {
+		return errors.New("flags --force (-f) and --no-clobber (-n) are mutually exclusive")
+	}
+	bgRun, err := o.effectiveBgRunChecked()
+	if err != nil {
+		return err
+	}
+	if bgRun {
+		return errors.New("ForkAfterAuthentication (background mode) is not supported for sftp")
+	}
+	if extraArgs := o.extraPositionalArgs(); len(extraArgs) > 0 {
+		return fmt.Errorf("unexpected positional argument %q", extraArgs[0])
+	}
+	return nil
+}
+
 func (o *SftpOptions) Validate() error {
 	o.stdinScript = false
-	if o.effectiveBgRun() {
-		return fmt.Errorf("background mode (-f / ForkAfterAuthentication) is not supported for sftp")
+	if err := o.ensureGeneralOptionsApplied(); err != nil {
+		return err
 	}
-	extraArgs := o.args
-	if o.Host == "" && len(extraArgs) > 0 {
-		extraArgs = extraArgs[1:]
-	}
-	if len(extraArgs) > 0 {
-		return fmt.Errorf("unexpected positional argument %q", extraArgs[0])
+	if err := o.validateSftpInvariants(); err != nil {
+		return err
 	}
 	return o.SshOptions.Validate()
 }
@@ -128,6 +204,9 @@ func (o *SftpOptions) Run() error {
 //nolint:gocyclo
 func (o *SftpOptions) RunContext(ctx context.Context) (err error) {
 	if err := o.ensureGeneralOptionsApplied(); err != nil {
+		return err
+	}
+	if err := o.validateSftpInvariants(); err != nil {
 		return err
 	}
 	batch := !term.IsTerminal(int(os.Stdin.Fd()))

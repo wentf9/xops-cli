@@ -105,7 +105,6 @@ type Repository struct {
 	provider          *Provider
 	store             Store
 	revision          atomic.Uint64
-	openSSHErr        error
 	hasUndurableWrite atomic.Bool
 }
 
@@ -119,17 +118,12 @@ type outcomeStore interface {
 }
 
 // NewRepository creates a durable repository with an optional local OpenSSH
-// fallback. OpenSSH parse failures are retained and reported only if a caller
-// actually needs the fallback; local xops configuration stays usable.
+// fallback. OpenSSH parse failures are retained inside OpenSSHParser and
+// reported if a caller falls back to OpenSSH; local xops configuration stays usable.
 func NewRepository(cfg *Configuration, store Store) (*Repository, error) {
 	parser, err := NewOpenSSHParser()
 	if err != nil {
-		repository, repositoryErr := newRepository(cfg, store, &OpenSSHParser{cfg: nil})
-		if repositoryErr != nil {
-			return nil, repositoryErr
-		}
-		repository.openSSHErr = fmt.Errorf("load openssh config: %w", err)
-		return repository, nil
+		return newRepository(cfg, store, NewBrokenOpenSSHParser(fmt.Errorf("load openssh config: %w", err)))
 	}
 	return newRepository(cfg, store, parser)
 }
@@ -351,8 +345,11 @@ func (r *Repository) ResolveConnection(nodeID string) (ConnectionSnapshot, error
 			return ConnectionSnapshot{}, fmt.Errorf("resolve sudo version for node %q: %w", nodeID, err)
 		}
 		clonedNode := cloneNode(node)
-		if clonedNode.OpenSSHAlias == "" && r.provider != nil {
-			clonedNode.OpenSSHAlias = r.provider.NodeOpenSSHAlias(nodeID)
+		if clonedNode.OpenSSHAlias == "" && provider != nil {
+			clonedNode.OpenSSHAlias = provider.NodeOpenSSHAlias(nodeID)
+		}
+		if clonedNode.CanonicalHost == "" && provider != nil {
+			clonedNode.CanonicalHost = provider.NodeCanonicalHost(nodeID)
 		}
 		var updateRef *ConnectionUpdateRef
 		if !IsOpenSSHNodeID(nodeID) {
@@ -374,14 +371,26 @@ func (r *Repository) ResolveConnection(nodeID string) (ConnectionSnapshot, error
 		}, nil
 	}
 
-	snap, err := provider.ResolveConnection(nodeID)
-	if err != nil {
-		return ConnectionSnapshot{}, err
+	return provider.ResolveConnection(nodeID)
+}
+
+// ResolveConnectionWithOrigin resolves nodeID using an explicit originalHost for
+// OpenSSH virtual targets without consulting or mutating shared alias side maps.
+func (r *Repository) ResolveConnectionWithOrigin(nodeID, originalHost string) (ConnectionSnapshot, error) {
+	if r == nil {
+		return ConnectionSnapshot{}, fmt.Errorf("configuration repository is nil")
 	}
-	if snap.Node.OpenSSHAlias == "" && r.provider != nil {
-		snap.Node.OpenSSHAlias = r.provider.NodeOpenSSHAlias(nodeID)
+	if !IsOpenSSHNodeID(nodeID) {
+		return r.ResolveConnection(nodeID)
 	}
-	return snap, nil
+	_, prov := r.connectionProviderWithProvenance(nodeID)
+	if prov != ProvenanceUnknown && prov != ProvenanceOpenSSHVirtual {
+		return r.ResolveConnection(nodeID)
+	}
+	if r.provider == nil {
+		return ConnectionSnapshot{}, fmt.Errorf("configuration provider is nil")
+	}
+	return r.provider.ResolveConnectionWithOrigin(nodeID, originalHost)
 }
 
 // SetNodeOpenSSHAlias records the concrete OpenSSH Host alias from which nodeID
@@ -395,10 +404,34 @@ func (r *Repository) SetNodeOpenSSHAlias(nodeID, alias string) {
 
 // NodeOpenSSHAlias returns the session-recorded OpenSSH Host alias for nodeID.
 func (r *Repository) NodeOpenSSHAlias(nodeID string) string {
-	if r == nil || r.provider == nil {
+	if r == nil {
 		return ""
 	}
-	return r.provider.NodeOpenSSHAlias(nodeID)
+	provider, _ := r.connectionProviderWithProvenance(nodeID)
+	if provider == nil {
+		return ""
+	}
+	return provider.NodeOpenSSHAlias(nodeID)
+}
+
+// SetNodeCanonicalHost records the canonicalized host for nodeID without modifying persisted state.
+func (r *Repository) SetNodeCanonicalHost(nodeID, canonicalHost string) {
+	if r == nil || r.provider == nil {
+		return
+	}
+	r.provider.SetNodeCanonicalHost(nodeID, canonicalHost)
+}
+
+// NodeCanonicalHost returns the session-recorded canonicalized host for nodeID.
+func (r *Repository) NodeCanonicalHost(nodeID string) string {
+	if r == nil {
+		return ""
+	}
+	provider, _ := r.connectionProviderWithProvenance(nodeID)
+	if provider == nil {
+		return ""
+	}
+	return provider.NodeCanonicalHost(nodeID)
 }
 
 func versionFromString(value string) (Version, error) {
@@ -471,7 +504,22 @@ func (r *Repository) commitContext(ctx context.Context, expectedRevision uint64,
 	return err
 }
 
+type publishAction struct {
+	beforeProviderLocked func()
+	applyProviderLocked  func(p *Provider, updated *Configuration)
+	afterProviderLocked  func()
+}
+
 func (r *Repository) commitResultContext(ctx context.Context, expectedRevision uint64, fn func(*Configuration) error) (CommitResult, error) {
+	return r.commitResultWithPublishAction(ctx, expectedRevision, fn, nil)
+}
+
+func (r *Repository) commitResultWithPublishAction(
+	ctx context.Context,
+	expectedRevision uint64,
+	fn func(*Configuration) error,
+	action *publishAction,
+) (CommitResult, error) {
 	if r == nil {
 		return CommitResult{}, fmt.Errorf("configuration repository is nil")
 	}
@@ -495,7 +543,7 @@ func (r *Repository) commitResultContext(ctx context.Context, expectedRevision u
 	}
 
 	if store, ok := r.store.(TransactionStore); ok {
-		return r.commitTransactionResult(ctx, store, fn)
+		return r.commitTransactionResultWithPublishAction(ctx, store, fn, action)
 	}
 
 	updated, lookup, aliases, err := prepareConfiguration(r.provider.Snapshot(), fn)
@@ -511,7 +559,7 @@ func (r *Repository) commitResultContext(ctx context.Context, expectedRevision u
 		return CommitResult{}, fmt.Errorf("configuration store reported success without applying the update")
 	}
 
-	r.publish(updated, lookup, aliases)
+	r.publishWithAction(updated, lookup, aliases, action)
 	commitResult := CommitResult{
 		Snapshot: Snapshot{Configuration: cloneConfiguration(updated)},
 		Applied:  true,
@@ -530,7 +578,12 @@ func (r *Repository) commitResultContext(ctx context.Context, expectedRevision u
 	return commitResult, nil
 }
 
-func (r *Repository) commitTransactionResult(ctx context.Context, store TransactionStore, fn func(*Configuration) error) (CommitResult, error) {
+func (r *Repository) commitTransactionResultWithPublishAction(
+	ctx context.Context,
+	store TransactionStore,
+	fn func(*Configuration) error,
+	action *publishAction,
+) (CommitResult, error) {
 	result, err := store.Transact(ctx, func(snapshot Snapshot) (*Configuration, error) {
 		updated, _, _, prepareErr := prepareConfiguration(snapshot.Configuration, fn)
 		return updated, prepareErr
@@ -545,7 +598,7 @@ func (r *Repository) commitTransactionResult(ctx context.Context, store Transact
 	if prepareErr != nil {
 		return CommitResult{}, fmt.Errorf("validate applied configuration transaction result: %w", prepareErr)
 	}
-	r.publish(updated, lookup, aliases)
+	r.publishWithAction(updated, lookup, aliases, action)
 	result.Snapshot.Configuration = cloneConfiguration(updated)
 	if err != nil {
 		r.hasUndurableWrite.Store(true)
@@ -575,11 +628,38 @@ func prepareConfiguration(base *Configuration, fn func(*Configuration) error) (*
 }
 
 func (r *Repository) publish(updated *Configuration, lookup map[string][]string, aliases map[string]string) {
+	r.publishWithAction(updated, lookup, aliases, nil)
+}
+
+func (r *Repository) publishWithAction(
+	updated *Configuration,
+	lookup map[string][]string,
+	aliases map[string]string,
+	action *publishAction,
+) {
+	needPendingLock := action != nil && (action.beforeProviderLocked != nil || action.afterProviderLocked != nil)
+	if needPendingLock {
+		r.pendingMu.Lock()
+		defer r.pendingMu.Unlock()
+		if action.beforeProviderLocked != nil {
+			action.beforeProviderLocked()
+		}
+	}
+
 	r.provider.mu.Lock()
+	oldCfg := r.provider.cfg
 	r.provider.cfg = updated
 	r.provider.lookupIndex = lookup
 	r.provider.aliasIndex = aliases
+	r.provider.pruneStaleOpenSSHMetadataLocked(oldCfg, updated)
+	if action != nil && action.applyProviderLocked != nil {
+		action.applyProviderLocked(r.provider, updated)
+	}
 	r.provider.mu.Unlock()
+
+	if needPendingLock && action.afterProviderLocked != nil {
+		action.afterProviderLocked()
+	}
 	r.revision.Add(1)
 }
 
@@ -1227,11 +1307,10 @@ func (r *Repository) Find(input string) string {
 }
 
 func (r *Repository) ResolveSelector(input string) (string, error) {
-	nodeID, err := r.provider.ResolveSelector(input)
-	if err != nil || nodeID != "" || r.openSSHErr == nil {
-		return nodeID, err
+	if r == nil || r.provider == nil {
+		return "", nil
 	}
-	return "", fmt.Errorf("resolve openssh selector %q: %w", input, r.openSSHErr)
+	return r.provider.ResolveSelector(input)
 }
 
 func (r *Repository) FindAlias(alias string) string {
@@ -1263,23 +1342,80 @@ func (r *Repository) GetOpenSSHParser() *OpenSSHParser {
 	return r.provider.GetOpenSSHParser()
 }
 
-// Frozen exposes an immutable read-only view, retaining OpenSSH diagnostics
-// without exposing Repository's durable mutation interfaces to the caller.
+// Frozen exposes an immutable read-only view, retaining OpenSSH parser/alias
+// inspection without exposing Repository's durable mutation interfaces to the caller.
 func (r *Repository) Frozen() ConfigProvider {
-	return &frozenRepository{ConfigProvider: r.provider.Frozen(), openSSHErr: r.openSSHErr}
+	return &frozenRepository{ConfigProvider: r.provider.Frozen()}
 }
 
 type frozenRepository struct {
 	ConfigProvider
-	openSSHErr error
 }
 
-func (r *frozenRepository) ResolveSelector(input string) (string, error) {
-	nodeID, err := r.ConfigProvider.ResolveSelector(input)
-	if err != nil || nodeID != "" || r.openSSHErr == nil {
-		return nodeID, err
+func (r *frozenRepository) GetOpenSSHParser() *OpenSSHParser {
+	if r == nil || r.ConfigProvider == nil {
+		return nil
 	}
-	return "", fmt.Errorf("resolve openssh selector %q: %w", input, r.openSSHErr)
+	if src, ok := r.ConfigProvider.(openSSHParserSource); ok {
+		return src.GetOpenSSHParser()
+	}
+	return nil
+}
+
+func (r *frozenRepository) NodeOpenSSHAlias(nodeID string) string {
+	if r == nil || r.ConfigProvider == nil {
+		return ""
+	}
+	if store, ok := r.ConfigProvider.(interface{ NodeOpenSSHAlias(string) string }); ok {
+		return store.NodeOpenSSHAlias(nodeID)
+	}
+	return ""
+}
+
+func (r *frozenRepository) ResolveConnectionWithOrigin(nodeID, originalHost string) (ConnectionSnapshot, error) {
+	if r == nil || r.ConfigProvider == nil {
+		return ConnectionSnapshot{}, fmt.Errorf("configuration repository is nil")
+	}
+	if src, ok := r.ConfigProvider.(interface {
+		ResolveConnectionWithOrigin(string, string) (ConnectionSnapshot, error)
+	}); ok {
+		return src.ResolveConnectionWithOrigin(nodeID, originalHost)
+	}
+	return r.ResolveConnection(nodeID)
+}
+
+func (r *frozenRepository) NodeCanonicalHost(nodeID string) string {
+	if r == nil || r.ConfigProvider == nil {
+		return ""
+	}
+	if store, ok := r.ConfigProvider.(interface{ NodeCanonicalHost(string) string }); ok {
+		return store.NodeCanonicalHost(nodeID)
+	}
+	return ""
+}
+
+func (r *frozenRepository) GetOpenSSHOptions(alias string) (*ssh.Options, error) {
+	if r == nil || r.ConfigProvider == nil {
+		return nil, nil
+	}
+	if src, ok := r.ConfigProvider.(interface {
+		GetOpenSSHOptions(string) (*ssh.Options, error)
+	}); ok {
+		return src.GetOpenSSHOptions(alias)
+	}
+	return nil, nil
+}
+
+func (r *frozenRepository) GetOpenSSHControl(alias string) (*ssh.ControlConfig, error) {
+	if r == nil || r.ConfigProvider == nil {
+		return nil, nil
+	}
+	if src, ok := r.ConfigProvider.(interface {
+		GetOpenSSHControl(string) (*ssh.ControlConfig, error)
+	}); ok {
+		return src.GetOpenSSHControl(alias)
+	}
+	return nil, nil
 }
 
 func validateConfiguration(cfg *Configuration) error {

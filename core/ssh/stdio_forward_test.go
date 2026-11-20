@@ -491,3 +491,283 @@ func TestForwardStdio_RemoteFullCloseExitsWithIdleStdinPipe(t *testing.T) {
 		t.Errorf("stdinR was closed or corrupted by ForwardStdio: %v", rErr)
 	}
 }
+
+type stalledStdioCloser struct {
+	unblock chan struct{}
+}
+
+func (s *stalledStdioCloser) Close() error {
+	<-s.unblock
+	return nil
+}
+
+func TestClientCloseChannelBounded_InterruptsOnStalledClose(t *testing.T) {
+	r1, r2 := net.Pipe()
+	t.Cleanup(func() { _ = r2.Close() })
+	c := &Client{rootConn: r1}
+	stalled := &stalledStdioCloser{unblock: make(chan struct{})}
+	go func() {
+		_, _ = io.Copy(io.Discard, r2)
+		close(stalled.unblock)
+	}()
+
+	start := time.Now()
+	err := c.closeChannelBounded(stalled, nil, "SSH stdio forward channel")
+	if err == nil {
+		t.Fatal("expected closeChannelBounded to report timeout error on stalled channel")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("closeChannelBounded took %v on stalled close", elapsed)
+	}
+}
+
+type zeroWindowStalledStdioChannel struct {
+	reqs      chan *cryptoSSH.Request
+	closed    chan struct{}
+	closeOnce sync.Once
+	connDone  <-chan struct{}
+	writeHit  chan struct{}
+}
+
+func (c *zeroWindowStalledStdioChannel) Read([]byte) (int, error) {
+	// Immediate remote EOF triggers ForwardStdio exit while stdin Write is blocked.
+	return 0, io.EOF
+}
+
+func (c *zeroWindowStalledStdioChannel) Write(b []byte) (int, error) {
+	select {
+	case <-c.writeHit:
+	default:
+		close(c.writeHit)
+	}
+	<-c.closed
+	return 0, net.ErrClosed
+}
+
+func (c *zeroWindowStalledStdioChannel) CloseWrite() error { return nil }
+
+func (c *zeroWindowStalledStdioChannel) Stderr() io.ReadWriter { return nil }
+
+func (c *zeroWindowStalledStdioChannel) SendRequest(string, bool, []byte) (bool, error) {
+	return false, nil
+}
+
+func (c *zeroWindowStalledStdioChannel) Close() error {
+	<-c.connDone
+	c.closeOnce.Do(func() {
+		close(c.closed)
+		close(c.reqs)
+	})
+	return nil
+}
+
+type zeroWindowStalledStdioConn struct {
+	*dummySSHConn
+	writeHit chan struct{}
+}
+
+func (s *zeroWindowStalledStdioConn) OpenChannel(string, []byte) (cryptoSSH.Channel, <-chan *cryptoSSH.Request, error) {
+	reqs := make(chan *cryptoSSH.Request)
+	ch := &zeroWindowStalledStdioChannel{
+		reqs:     reqs,
+		closed:   make(chan struct{}),
+		connDone: s.closedChan(),
+		writeHit: s.writeHit,
+	}
+	return ch, reqs, nil
+}
+
+func TestForwardStdio_BlockedStdinWriteAndStalledCloseBoundedZeroLeak(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	chans := make(chan cryptoSSH.NewChannel)
+	reqs := make(chan *cryptoSSH.Request)
+	writeHit := make(chan struct{})
+	conn := &zeroWindowStalledStdioConn{
+		dummySSHConn: &dummySSHConn{chans: chans, reqs: reqs},
+		writeHit:     writeHit,
+	}
+	sshClient := cryptoSSH.NewClient(conn, chans, reqs)
+	defer func() { _ = sshClient.Close() }()
+
+	client := &Client{sshClient: sshClient}
+	stdinR, stdinW := mustCreatePipe(t)
+	stdoutR, stdoutW := mustCreatePipe(t)
+	defer func() {
+		_ = stdinW.Close()
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
+	}()
+
+	// Write payload without closing stdinW yet; close stdinR only after ForwardStdio finishes.
+	if _, err := stdinW.Write([]byte("blocked-payload")); err != nil {
+		_ = stdinR.Close()
+		t.Fatal(err)
+	}
+	_ = stdinW.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- client.ForwardStdio(ctx, "zero.window", 8080, stdinR, stdoutW)
+	}()
+
+	select {
+	case <-writeHit:
+	case <-time.After(2 * time.Second):
+		cancel()
+		err := <-done
+		_ = err
+		_ = stdinR.Close()
+		t.Fatal("stdin pump never reached blocked zero-window Write")
+	}
+	time.Sleep(30 * time.Millisecond)
+
+	start := time.Now()
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected ForwardStdio error after cancellation and stalled Close, got nil")
+		}
+	case <-time.After(sessionShutdownTimeout + 2*time.Second):
+		_ = stdinR.Close()
+		t.Fatalf("ForwardStdio hung past bounded shutdown timeout")
+	}
+	select {
+	case <-conn.closedChan():
+	case <-time.After(time.Second):
+		t.Fatal("expected ForwardStdio to interrupt stalled SSH transport")
+	}
+	_ = stdinR.Close()
+	if elapsed := time.Since(start); elapsed > sessionShutdownTimeout+2*time.Second {
+		t.Fatalf("ForwardStdio elapsed %v exceeded bounded shutdown", elapsed)
+	}
+}
+
+type blockingUncancelableStdoutWriter struct {
+	writeHit chan struct{}
+	hitOnce  sync.Once
+	release  chan struct{}
+}
+
+func (w *blockingUncancelableStdoutWriter) Write(p []byte) (int, error) {
+	w.hitOnce.Do(func() { close(w.writeHit) })
+	<-w.release
+	return len(p), nil
+}
+
+type blockingStdioReadChannel struct {
+	reqs      chan *cryptoSSH.Request
+	closed    chan struct{}
+	closeOnce sync.Once
+	payload   []byte
+	sent      bool
+}
+
+func (c *blockingStdioReadChannel) Read(b []byte) (int, error) {
+	if !c.sent {
+		c.sent = true
+		n := copy(b, c.payload)
+		return n, nil
+	}
+	<-c.closed
+	return 0, io.EOF
+}
+
+func (c *blockingStdioReadChannel) Write(b []byte) (int, error) { return len(b), nil }
+func (c *blockingStdioReadChannel) CloseWrite() error           { return nil }
+func (c *blockingStdioReadChannel) Stderr() io.ReadWriter       { return nil }
+func (c *blockingStdioReadChannel) SendRequest(string, bool, []byte) (bool, error) {
+	return true, nil
+}
+func (c *blockingStdioReadChannel) Close() error {
+	c.closeOnce.Do(func() {
+		close(c.closed)
+		close(c.reqs)
+	})
+	return nil
+}
+
+type blockingStdioReadConn struct {
+	*dummySSHConn
+	payload []byte
+}
+
+func (c *blockingStdioReadConn) OpenChannel(string, []byte) (cryptoSSH.Channel, <-chan *cryptoSSH.Request, error) {
+	reqs := make(chan *cryptoSSH.Request)
+	return &blockingStdioReadChannel{
+		reqs:    reqs,
+		closed:  make(chan struct{}),
+		payload: c.payload,
+	}, reqs, nil
+}
+
+func TestForwardStdio_UncancelableBlockingStdoutDoesNotDeadlockOrInterruptTransport(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	chans := make(chan cryptoSSH.NewChannel)
+	reqs := make(chan *cryptoSSH.Request)
+	conn := &blockingStdioReadConn{
+		dummySSHConn: &dummySSHConn{chans: chans, reqs: reqs},
+		payload:      []byte("remote-banner"),
+	}
+	sshClient := cryptoSSH.NewClient(conn, chans, reqs)
+	defer func() { _ = sshClient.Close() }()
+
+	client := &Client{sshClient: sshClient}
+	stdinR, stdinW := mustCreatePipe(t)
+	defer func() {
+		_ = stdinR.Close()
+		_ = stdinW.Close()
+	}()
+
+	writer := &blockingUncancelableStdoutWriter{
+		writeHit: make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	defer close(writer.release)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- client.ForwardStdio(ctx, "target.uncancelable", 22, stdinR, writer)
+	}()
+
+	select {
+	case <-writer.writeHit:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("uncancelable stdout writer was never called")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("ForwardStdio(uncancelable) err = %v, want context.Canceled", err)
+		}
+	case <-time.After(sessionShutdownTimeout + 2*time.Second):
+		t.Fatal("ForwardStdio(uncancelable) deadlocked past bounded shutdown")
+	}
+
+	// Healthy SSH transport must NOT be interrupted because an uncancelable writer stalled.
+	select {
+	case <-conn.closedChan():
+		t.Fatal("ForwardStdio(uncancelable) interrupted healthy SSH transport")
+	default:
+	}
+
+	// Subsequent stdin written after cancel must remain in stdinR, never stolen by stdin pump.
+	if _, wErr := stdinW.Write([]byte("X")); wErr != nil {
+		t.Fatalf("write stdinW: %v", wErr)
+	}
+	var got [1]byte
+	if _, rErr := io.ReadFull(stdinR, got[:]); rErr != nil || got[0] != 'X' {
+		t.Fatalf("post-cancel stdin byte = (%q, %v), want 'X'", string(got[:]), rErr)
+	}
+}

@@ -325,3 +325,97 @@ func TestMuxDaemonSpec_FailClosedValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestMuxDaemonSpec_PreservesColonContainingSavedNodeID(t *testing.T) {
+	cfg := &config.Configuration{
+		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
+		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
+		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
+	}
+	cfg.Hosts.Set("h-colon", models.Host{Address: "10.20.30.40", Port: 22})
+	cfg.Identities.Set("id-colon", models.Identity{User: "ops"})
+	cfg.Nodes.Set("prod:22", models.Node{HostRef: "h-colon", IdentityRef: "id-colon"})
+	provider := config.NewProviderWithoutOpenSSH(cfg)
+
+	opts := NewSshOptions()
+	opts.Host = "prod:22"
+	spec := opts.buildMuxDaemonSpecWithProvider(provider, "prod:22", "/tmp/colon.sock", nil)
+	if !spec.PreserveSelector || spec.TargetHost != "prod:22" || spec.OpenSSHNamespace {
+		t.Fatalf("unexpected spec for colon-containing node ID: %+v", spec)
+	}
+
+	decoded := roundTripMuxDaemonSpecThroughPipe(t, spec)
+	child := NewSshOptions()
+	if err := child.applyMuxDaemonSpec(decoded); err != nil {
+		t.Fatalf("applyMuxDaemonSpec: %v", err)
+	}
+	if !child.preserveDaemonSelector || child.Host != "prod:22" {
+		t.Fatalf("expected child preserveDaemonSelector=true and Host=prod:22, got preserveDaemonSelector=%v Host=%q", child.preserveDaemonSelector, child.Host)
+	}
+	if err := child.parseTarget(false); err != nil {
+		t.Fatalf("parseTarget: %v", err)
+	}
+	if child.Target.Selector != "prod:22" {
+		t.Fatalf("expected parsed Target.Selector='prod:22', got %+v", child.Target)
+	}
+	resolved, err := config.ResolveTarget(provider, child.Target)
+	if err != nil {
+		t.Fatalf("ResolveTarget: %v", err)
+	}
+	if resolved.NodeID != "prod:22" || resolved.Host != "10.20.30.40" || resolved.Port != 22 || resolved.User != "ops" {
+		t.Fatalf("resolved colon-containing saved node mismatch: %+v", resolved)
+	}
+}
+
+func TestMuxDaemonSpec_CanonicalizedOriginalHostRoundTripAndAdHocIsolation(t *testing.T) {
+	o := NewSshOptions()
+	o.canonicalized = true
+	o.originalHost = "web"
+	o.Host = "web.corp.example.com"
+	o.User = "alice"
+	o.Port = 22
+	spec := o.buildMuxDaemonSpecWithProvider(nil, "openssh:web.corp.example.com", "/tmp/cm-canon.sock", nil)
+	if !spec.Canonicalized {
+		t.Fatal("expected buildMuxDaemonSpecWithProvider to record Canonicalized=true")
+	}
+
+	child := NewSshOptions()
+	if err := child.applyMuxDaemonSpec(MuxDaemonSpec{
+		Version:          muxDaemonSpecVersion,
+		TargetHost:       "web.corp.example.com",
+		OpenSSHNamespace: true,
+		OriginalHost:     "web",
+		Canonicalized:    true,
+		ControlPath:      "/tmp/cm-canon.sock",
+		ControlMaster:    ssh.ControlMasterYes,
+	}); err != nil {
+		t.Fatalf("applyMuxDaemonSpec(canonicalized): %v", err)
+	}
+	if err := child.parseTarget(false); err != nil {
+		t.Fatalf("parseTarget(canonicalized): %v", err)
+	}
+	if child.Target.OriginalHost != "web" {
+		t.Fatalf("child.Target.OriginalHost = %q, want %q", child.Target.OriginalHost, "web")
+	}
+
+	// Ad-hoc composite OriginalHost ("ops@10.0.0.5:2222") without Canonicalized must NOT become Target.OriginalHost.
+	adhocChild := NewSshOptions()
+	if err := adhocChild.applyMuxDaemonSpec(MuxDaemonSpec{
+		Version:       muxDaemonSpecVersion,
+		TargetHost:    "10.0.0.5",
+		OriginalHost:  "ops@10.0.0.5:2222",
+		Port:          2222,
+		User:          "ops",
+		Canonicalized: false,
+		ControlPath:   "/tmp/cm-adhoc.sock",
+		ControlMaster: ssh.ControlMasterYes,
+	}); err != nil {
+		t.Fatalf("applyMuxDaemonSpec(adhoc): %v", err)
+	}
+	if err := adhocChild.parseTarget(false); err != nil {
+		t.Fatalf("parseTarget(adhoc): %v", err)
+	}
+	if adhocChild.Target.OriginalHost != "" {
+		t.Fatalf("adhoc child.Target.OriginalHost = %q, want empty", adhocChild.Target.OriginalHost)
+	}
+}

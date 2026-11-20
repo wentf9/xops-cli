@@ -13,7 +13,7 @@ xops ssh -i ~/.ssh/id_ed25519 deploy@192.0.2.10
 xops ssh -J bastion.example.com deploy@192.0.2.10
 ```
 
-Direct jump hosts accept an IP, FQDN, or `host:port`; a single-label jump name (such as `-J jumphost`) must already exist as a saved node or alias. Connecting to the same host as a different user keeps credentials isolated per user.
+Direct jump hosts accept an IP, FQDN, or `host:port`; a single-label jump name (such as `-J jumphost`) must already exist as a saved node, alias, or concrete `Host` block in `~/.ssh/config`. Connecting to the same host as a different user keeps credentials isolated per user.
 
 - **Username and port flag precedence** (OpenSSH native semantics):
   - `xops ssh` and single-target `xops exec`: explicit `-l`/`-p` and `-o User`/`-o Port` override inline `user@` and `:port` in the destination.
@@ -269,7 +269,7 @@ xops ssh -o Tunnel=ethernet -w 1:any -N gw
   - Allows remote and external hosts to connect to locally forwarded ports (corresponds to `-o GatewayPorts=yes`).
 - **Session control and background execution flags (`-f`, `-N`, `-n`)**:
   - `-N` (`--no-cmd`): Do not execute a remote command or open a shell, useful for just forwarding ports and tunnels (corresponds to `-o SessionType=none`). Mutually exclusive with specifying a remote command.
-  - `-f` (`--background`): Puts `xops ssh` into the background after authentication and forwardings are established. Supports `xops ssh -f host <cmd>` as well as `xops ssh -f -N ...`; background mode automatically implies `-n` (redirecting stdin from `/dev/null`). Invoking `-f` without either a remote command or `-N` is rejected.
+  - `-f` (`--background`, or `ForkAfterAuthentication yes` via `-o` / config): Puts `xops ssh` into the background after authentication and forwardings are established. Supports `xops ssh -f host <cmd>`, `xops ssh -f -N ...`, or `-o RemoteCommand=...` / `-o SessionType=none`; background mode automatically implies `-n` (redirecting stdin from `/dev/null`). Combining `-f` / `ForkAfterAuthentication yes` with no remote command and no no-command mode (`-N` / `SessionType=none`), or with `--password-stdin`, `--passphrase-stdin`, `--otp`, `--otp-stdin`, `ProxyCommand`, `-s`, or non-`proxy` `-O` control commands, is rejected (configure key/agent auth or persistent credential storage instead).
   - `-n` (`--stdin-redirect`): Redirects standard input from `/dev/null` to prevent background processes from blocking on terminal reads (corresponds to `-o StdinNull=yes`).
 - **Multiplexing dynamic forwarding (`-O forward`)**:
   - Sends a control command to an active master process to add port forwarding on the fly. When establishing a `-R 0:...` dynamic port allocation, the assigned port number is printed to `stdout`, while `Forwarding request sent.` is printed to `stderr`.

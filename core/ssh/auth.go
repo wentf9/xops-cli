@@ -809,6 +809,7 @@ func parseOpenSSHPublicKeyFromEncryptedPrivate(keyData []byte) (ssh.PublicKey, e
 
 type certAuthCandidateMethod struct {
 	certPath string
+	certPub  ssh.PublicKey
 	method   ssh.AuthMethod
 }
 
@@ -838,6 +839,9 @@ func resolveKeySigners(
 		pub := signer.PublicKey()
 		pubRaw := string(pub.Marshal())
 		certMethods := buildKeyCertCandidateMethods(keyPath, pub, signer, explicitCerts, hasExplicitCerts, tracker, l)
+		if tracker != nil && tracker.wasOfferedBeforeAgent(pubRaw) {
+			return certMethods, nil, nil
+		}
 		if postAgent && tracker != nil {
 			return certMethods, ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
 				if tracker.wasOfferedByAgentOrStatic(pubRaw) {
@@ -851,13 +855,38 @@ func resolveKeySigners(
 		return certMethods, ssh.PublicKeys(signer), nil
 	}
 
-	_, isEncrypted := errors.AsType[*ssh.PassphraseMissingError](err)
-	if !isPrivateKeyCandidateData(keyPath, keyData, isEncrypted) {
+	passErr, isEncrypted := isEncryptedPrivateKeyError(keyPath, err)
+	if !isEncrypted {
 		return nil, nil, err
 	}
+	return resolveEncryptedKeySigners(keyPath, keyData, passErr, explicitCerts, hasExplicitCerts, secProvider, tracker, postAgent, passphraseCallback, l)
+}
 
-	// 私钥被密码保护。优先尝试免密读取 .pub、从 OpenSSH 私钥中提取明文公钥、或读取同目录 -cert.pub，以保持 lazy 解密。
-	if pubKey := extractUnencryptedPublicKey(keyPath, keyData, hasExplicitCerts, l); pubKey != nil {
+func resolveEncryptedKeySigners(
+	keyPath string,
+	keyData []byte,
+	passErr *ssh.PassphraseMissingError,
+	explicitCerts []loadedUserCert,
+	hasExplicitCerts bool,
+	secProvider *autoSecretProvider,
+	tracker *offeredPubKeyTracker,
+	postAgent bool,
+	passphraseCallback func(string, string),
+	l logger.DebugLogger,
+) ([]certAuthCandidateMethod, ssh.AuthMethod, error) {
+	if passErr != nil && passErr.PublicKey != nil {
+		switch passErr.PublicKey.Type() {
+		case ssh.KeyAlgoSKED25519, ssh.KeyAlgoSKECDSA256:
+			return nil, nil, fmt.Errorf("encrypted FIDO/U2F security-key stubs (%s) require ssh-agent", passErr.PublicKey.Type())
+		}
+	}
+
+	// 私钥被密码保护。优先尝试免密读取 .pub、从 OpenSSH 私钥中提取明文公钥、或读取同目录 -cert.pub（并可回退到 PassphraseMissingError 自带公钥），以保持 lazy 解密。
+	pubKey := extractUnencryptedPublicKey(keyPath, keyData, hasExplicitCerts, l)
+	if pubKey == nil && passErr != nil {
+		pubKey = passErr.PublicKey
+	}
+	if pubKey != nil {
 		lazy := &lazySigner{
 			pubKey:             pubKey,
 			keyPath:            keyPath,
@@ -868,6 +897,9 @@ func resolveKeySigners(
 		}
 		pubRaw := string(pubKey.Marshal())
 		certMethods := buildKeyCertCandidateMethods(keyPath, pubKey, lazy, explicitCerts, hasExplicitCerts, tracker, l)
+		if !postAgent && tracker != nil && tracker.wasOfferedBeforeAgent(pubRaw) {
+			return certMethods, nil, nil
+		}
 		if postAgent && tracker != nil {
 			return certMethods, ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
 				if tracker.wasOfferedByAgentOrStatic(pubRaw) {
@@ -883,40 +915,33 @@ func resolveKeySigners(
 
 	// 传统 PEM 等格式无法在解密前取得公钥。仍然把解密动作留在 PublicKeysCallback 中，
 	// 这样只有轮到这个 candidate 时才会请求 passphrase。
-	if isEncrypted {
-		keyDataCopy := keyData
-		keyPathCopy := keyPath
-		return nil, ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
-			resolvedSigner, passphrase, parseErr := secProvider.decryptPrivateKey(keyDataCopy, keyPathCopy)
-			if parseErr != nil {
-				return nil, parseErr
-			}
-			if saveErr := savePublicKey(keyPathCopy, resolvedSigner.PublicKey()); saveErr != nil {
-				l.Debugf("save public key for %q failed: %v", keyPathCopy, saveErr)
-			}
-			if passphraseCallback != nil {
-				passphraseCallback(keyPathCopy, passphrase)
-			}
-			if postAgent && tracker != nil && tracker.wasOfferedByAgentOrStatic(string(resolvedSigner.PublicKey().Marshal())) {
-				return nil, nil
-			}
-			tracker.recordStatic(resolvedSigner.PublicKey())
-			return []ssh.Signer{resolvedSigner}, nil
-		}), nil
-	}
-
-	return nil, nil, err
+	keyDataCopy := keyData
+	keyPathCopy := keyPath
+	return nil, ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
+		resolvedSigner, passphrase, parseErr := secProvider.decryptPrivateKey(keyDataCopy, keyPathCopy)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		if saveErr := savePublicKey(keyPathCopy, resolvedSigner.PublicKey()); saveErr != nil {
+			l.Debugf("save public key for %q failed: %v", keyPathCopy, saveErr)
+		}
+		if passphraseCallback != nil {
+			passphraseCallback(keyPathCopy, passphrase)
+		}
+		if tracker != nil && tracker.wasOfferedByAgentOrStatic(string(resolvedSigner.PublicKey().Marshal())) {
+			return nil, nil
+		}
+		tracker.recordStatic(resolvedSigner.PublicKey())
+		return []ssh.Signer{resolvedSigner}, nil
+	}), nil
 }
 
-func isPrivateKeyCandidateData(keyPath string, keyData []byte, isEncrypted bool) bool {
-	if isEncrypted {
-		return true
-	}
+func isEncryptedPrivateKeyError(keyPath string, parseErr error) (*ssh.PassphraseMissingError, bool) {
 	if strings.HasSuffix(strings.ToLower(keyPath), ".pub") {
-		return false
+		return nil, false
 	}
-	block, _ := pem.Decode(keyData)
-	return block != nil
+	passErr, ok := errors.AsType[*ssh.PassphraseMissingError](parseErr)
+	return passErr, ok
 }
 
 func buildKeyCertCandidateMethods(
@@ -931,6 +956,9 @@ func buildKeyCertCandidateMethods(
 	matched := matchCertsForKey(keyPath, pubKey, explicitCerts, hasExplicitCerts, l)
 	var certMethods []certAuthCandidateMethod
 	for _, mc := range matched {
+		if tracker != nil && tracker.wasOfferedBeforeAgent(string(mc.cert.Marshal())) {
+			continue
+		}
 		cs, csErr := newWrappedCertSigner(mc.cert, signer)
 		if csErr != nil {
 			l.Debugf("Skipping SSH certificate %q for key %q: %v", mc.path, keyPath, csErr)
@@ -943,6 +971,7 @@ func buildKeyCertCandidateMethods(
 		}
 		certMethods = append(certMethods, certAuthCandidateMethod{
 			certPath: mc.path,
+			certPub:  mc.cert,
 			method:   ssh.PublicKeys(cs),
 		})
 	}
@@ -1011,7 +1040,9 @@ type AutoAuthOptions struct {
 	RecoveryPrompter          SecretPrompter
 	KeyPath                   string
 	KeyPaths                  []string
+	ExcludeKeyPath            string
 	FirstCertMethods          []ssh.AuthMethod
+	FirstCertPaths            []string
 	FirstPublicKeys           []ssh.PublicKey
 	PasswordCallback          func(string)
 	PassphraseCallback        func(keyPath, passphrase string)
@@ -1530,12 +1561,14 @@ func appendExpandedKeyAndCertCandidates(
 			onRejected: rejectPublicKey,
 		})
 	}
-	*plainCandidates = append(*plainCandidates, autoAuthCandidate{
-		protocol:   autoAuthProtocolPublicKey,
-		label:      label + ": " + keyPath,
-		method:     plainMethod,
-		onRejected: rejectPublicKey,
-	})
+	if plainMethod != nil {
+		*plainCandidates = append(*plainCandidates, autoAuthCandidate{
+			protocol:   autoAuthProtocolPublicKey,
+			label:      label + ": " + keyPath,
+			method:     plainMethod,
+			onRejected: rejectPublicKey,
+		})
+	}
 	return true
 }
 
@@ -1565,6 +1598,14 @@ func appendAgentMatchedKeyPath(
 	}
 	matched := matchCertsForKey(keyPath, pub, explicitCerts, hasExplicitCerts, l)
 	for _, mc := range matched {
+		if pairedCertPaths != nil {
+			if _, already := pairedCertPaths[mc.path]; already {
+				continue
+			}
+		}
+		if tracker != nil && tracker.wasOfferedBeforeAgent(string(mc.cert.Marshal())) {
+			continue
+		}
 		if cs, csErr := newWrappedCertSigner(mc.cert, signer); csErr == nil {
 			if pairedCertPaths != nil {
 				pairedCertPaths[mc.path] = struct{}{}
@@ -1577,6 +1618,9 @@ func appendAgentMatchedKeyPath(
 				onRejected: rejectPublicKey,
 			})
 		}
+	}
+	if tracker != nil && tracker.wasOfferedBeforeAgent(string(pub.Marshal())) {
+		return true
 	}
 	tracker.recordStatic(pub)
 	*plainCandidates = append(*plainCandidates, autoAuthCandidate{
@@ -1617,6 +1661,9 @@ func appendAgentCertsForKeyPath(
 				continue
 			}
 		}
+		if tracker != nil && tracker.wasOfferedBeforeAgent(string(mc.cert.Marshal())) {
+			continue
+		}
 		cs, csErr := newWrappedCertSigner(mc.cert, signer)
 		if csErr != nil {
 			continue
@@ -1652,6 +1699,9 @@ func appendUnpairedExplicitCertsFromAgent(
 				continue
 			}
 		}
+		if tracker != nil && tracker.wasOfferedBeforeAgent(string(ec.cert.Marshal())) {
+			continue
+		}
 		signer, ok := agentByPub[ec.keyRaw]
 		if !ok {
 			continue
@@ -1673,19 +1723,12 @@ func appendUnpairedExplicitCertsFromAgent(
 	}
 }
 
-func buildAutoPubkeyCandidates(
-	ctx context.Context,
+func initAutoFirstCandidates(
 	opts AutoAuthOptions,
 	first []ssh.AuthMethod,
-	secProvider *autoSecretProvider,
 	rejectPublicKey func(),
-	identitiesOnly bool,
-	l logger.DebugLogger,
-) ([]autoAuthCandidate, func()) {
-	var certCandidates []autoAuthCandidate
-	var plainCandidates []autoAuthCandidate
-	var cleanup func()
-	tracker := newOfferedPubKeyTracker()
+	tracker *offeredPubKeyTracker,
+) (certCandidates, plainCandidates []autoAuthCandidate, pairedCertPaths map[string]struct{}) {
 	for _, pub := range opts.FirstPublicKeys {
 		tracker.recordStatic(pub)
 	}
@@ -1705,8 +1748,28 @@ func buildAutoPubkeyCandidates(
 			onRejected: rejectPublicKey,
 		})
 	}
+	pairedCertPaths = make(map[string]struct{}, len(opts.FirstCertPaths))
+	for _, certPath := range opts.FirstCertPaths {
+		if certPath != "" {
+			pairedCertPaths[certPath] = struct{}{}
+		}
+	}
+	return certCandidates, plainCandidates, pairedCertPaths
+}
+
+func buildAutoPubkeyCandidates(
+	ctx context.Context,
+	opts AutoAuthOptions,
+	first []ssh.AuthMethod,
+	secProvider *autoSecretProvider,
+	rejectPublicKey func(),
+	identitiesOnly bool,
+	l logger.DebugLogger,
+) ([]autoAuthCandidate, func()) {
+	var cleanup func()
+	tracker := newOfferedPubKeyTracker()
+	certCandidates, plainCandidates, pairedCertPaths := initAutoFirstCandidates(opts, first, rejectPublicKey, tracker)
 	seenKeyPaths := make(map[string]struct{})
-	pairedCertPaths := make(map[string]struct{})
 	target := effectiveAuthTargetContext(opts)
 	dialAgentFn := opts.DialAgent
 	if dialAgentFn == nil {
@@ -1722,6 +1785,9 @@ func buildAutoPubkeyCandidates(
 		opts.ResolveKeyPath,
 		l,
 	)
+	if opts.ExcludeKeyPath != "" {
+		explicitPaths = filterSourcedKeyPath(explicitPaths, opts.ExcludeKeyPath, opts.Environment, target, opts.ResolveKeyPath)
+	}
 	explicitCerts, hasExplicitCerts := collectExplicitUserCerts(
 		opts.SSHOptions,
 		opts.Environment,
@@ -1730,7 +1796,7 @@ func buildAutoPubkeyCandidates(
 		l,
 	)
 	agentSocket, agentDisabled := effectiveAutoAuthAgentSocket(opts, target, l)
-	hasExplicitIdentity := len(first) > 0 || hasExplicit
+	hasExplicitIdentity := len(first) > 0 || len(opts.FirstCertMethods) > 0 || hasExplicit
 
 	if identitiesOnly {
 		return buildIdentitiesOnlyPubkeyCandidates(

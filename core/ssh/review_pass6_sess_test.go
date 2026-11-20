@@ -728,6 +728,7 @@ func assertPass6HandoffStopActiveCancel(t *testing.T) {
 	})
 	srvDuring.idleMu.Lock()
 	srvDuring.activeSessions++
+	srvDuring.foregroundHeld++
 	srvDuring.idleMu.Unlock()
 
 	srvDuring.CancelHandoff()

@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/wentf9/xops-cli/core/ssh"
@@ -360,4 +361,143 @@ func TestL7_PendingConnectionDistinctOpenSSHAliases(t *testing.T) {
 			t.Fatalf("ConfirmNodeContext persisted OpenSSH virtual node ID %q into durable config", id)
 		}
 	}
+}
+
+func TestPendingConnection_ConcurrencyAndAliasIsolation(t *testing.T) {
+	sshCfgPath := filepath.Join(t.TempDir(), "ssh_config")
+	sshCfg := strings.Join([]string{
+		"Host app-alias",
+		"  HostName 10.99.0.10",
+		"  User ops",
+		"  Port 2200",
+	}, "\n") + "\n"
+	if err := os.WriteFile(sshCfgPath, []byte(sshCfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	parser, err := NewOpenSSHParserFromPath(sshCfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("raw IP does not silently reuse alias-bound pending entry", func(t *testing.T) {
+		dir := t.TempDir()
+		store := NewDefaultStore(filepath.Join(dir, "config.yaml"), filepath.Join(dir, "config.key"))
+		repo, err := NewRepositoryWithOpenSSHParser(cloneConfiguration(nil), store, parser)
+		if err != nil {
+			t.Fatal(err)
+		}
+		aliasRes, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+			Target: ConnectionTarget{Selector: "app-alias", Port: 2222, HasPort: true},
+		})
+		if err != nil {
+			t.Fatalf("PrepareNodeContext(app-alias): %v", err)
+		}
+		if _, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+			Target: ConnectionTarget{Selector: "10.99.0.10", User: "ops", HasUser: true, Port: 2222, HasPort: true},
+		}); !errors.Is(err, ErrConfigConflict) {
+			t.Fatalf("expected raw IP colliding with unconfirmed %s to fail closed with ErrConfigConflict, got %v", aliasRes.NodeID, err)
+		}
+	})
+
+	t.Run("concurrent PrepareNodeContext upgrade and ConfirmNodeContext shares contextGate strictly", func(t *testing.T) {
+		var releaseSave = make(chan struct{})
+		var saveStarted = make(chan struct{})
+		var firstSaveDone atomic.Bool
+		var concurrentSaves atomic.Int32
+		var maxConcurrent atomic.Int32
+		baseStore := &repositoryTestStore{result: PersistResult{Applied: true, Durable: true}}
+		blkStore := &blockingUpgradeStore{
+			inner:       baseStore,
+			saveStarted: saveStarted,
+			releaseSave: releaseSave,
+			onSave: func(n int32) {
+				for {
+					cur := maxConcurrent.Load()
+					if n <= cur || maxConcurrent.CompareAndSwap(cur, n) {
+						break
+					}
+				}
+			},
+			concurrent:    &concurrentSaves,
+			firstSaveDone: &firstSaveDone,
+		}
+		repo, err := NewRepositoryWithOpenSSHParser(cloneConfiguration(nil), blkStore, parser)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Raw IP on port 2222 (differs from app-alias Port 2200) -> pending with empty OpenSSHAlias.
+		prep, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+			Target: ConnectionTarget{Selector: "10.99.0.10", User: "ops", HasUser: true, Port: 2222, HasPort: true},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		confirmADone := make(chan error, 1)
+		go func() {
+			confirmADone <- repo.ConfirmNodeContext(t.Context(), prep.NodeID)
+		}()
+		<-saveStarted
+
+		// Upgrade the same NodeID to app-alias while ConfirmNodeContext A is blocked inside Store.save.
+		upgraded, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+			Target: ConnectionTarget{Selector: "app-alias", Port: 2222, HasPort: true},
+		})
+		if err != nil {
+			close(releaseSave)
+			t.Fatalf("upgrade PrepareNodeContext(app-alias): %v", err)
+		}
+		if upgraded.NodeID != prep.NodeID {
+			close(releaseSave)
+			t.Fatalf("upgraded NodeID = %q, want %q", upgraded.NodeID, prep.NodeID)
+		}
+		if gotAlias := repo.NodeOpenSSHAlias(prep.NodeID); gotAlias != "app-alias" {
+			close(releaseSave)
+			t.Fatalf("NodeOpenSSHAlias after upgrade = %q, want app-alias", gotAlias)
+		}
+
+		// Confirm B must serialize behind Confirm A on the shared *contextGate (never entering save concurrently).
+		confirmBDone := make(chan error, 1)
+		go func() {
+			confirmBDone <- repo.ConfirmNodeContext(t.Context(), prep.NodeID)
+		}()
+
+		close(releaseSave)
+		if err := <-confirmADone; err != nil {
+			t.Fatalf("Confirm A: %v", err)
+		}
+		if err := <-confirmBDone; err != nil {
+			t.Fatalf("Confirm B: %v", err)
+		}
+		if maxConcurrent.Load() != 1 {
+			t.Fatalf("max concurrent Store saves = %d, want 1 (shared *contextGate violated)", maxConcurrent.Load())
+		}
+		if _, pending := repo.PendingNodeExecution(prep.NodeID); pending {
+			t.Fatal("pending entry remained after both confirmations finished")
+		}
+	})
+}
+
+type blockingUpgradeStore struct {
+	inner         *repositoryTestStore
+	saveStarted   chan struct{}
+	releaseSave   chan struct{}
+	firstSaveDone *atomic.Bool
+	concurrent    *atomic.Int32
+	onSave        func(int32)
+}
+
+func (s *blockingUpgradeStore) Load() (*Configuration, error) { return s.inner.Load() }
+func (s *blockingUpgradeStore) Save(cfg *Configuration) error { return s.inner.Save(cfg) }
+func (s *blockingUpgradeStore) save(cfg *Configuration) (PersistResult, error) {
+	cur := s.concurrent.Add(1)
+	defer s.concurrent.Add(-1)
+	if s.onSave != nil {
+		s.onSave(cur)
+	}
+	if s.firstSaveDone.CompareAndSwap(false, true) {
+		close(s.saveStarted)
+		<-s.releaseSave
+	}
+	return s.inner.save(cfg)
 }

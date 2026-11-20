@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -119,6 +120,8 @@ func marshalOpenSSHPrivateKeyHeaderForTest(pubKey ssh.PublicKey) []byte {
 
 	// 6. pubKey0
 	writeBytes(pubKey.Marshal())
+	// 7. encrypted private key section (required by golang.org/x/crypto/ssh PassphraseMissingError check)
+	writeBytes([]byte("dummy-encrypted-privkey"))
 
 	return buf
 }
@@ -295,4 +298,125 @@ func TestBuildAutoAuthPlan_LazySigner_PEMFallback(t *testing.T) {
 	if plan.candidates[0].protocol != autoAuthProtocolPublicKey {
 		t.Fatalf("first candidate protocol = %q, want %q", plan.candidates[0].protocol, autoAuthProtocolPublicKey)
 	}
+}
+
+func TestResolveKeySigners_SkipsUnencryptedUnsupportedOpenSSHKey(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "id_ed25519_sk")
+	_, sshPub := generateTestEncryptedKey(t, "secret123")
+	if err := savePublicKey(keyPath, sshPub); err != nil {
+		t.Fatalf("savePublicKey: %v", err)
+	}
+
+	var raw []byte
+	raw = append(raw, []byte("openssh-key-v1\x00")...)
+	writeStr := func(s string) {
+		l := uint32(len(s))
+		raw = append(raw, byte(l>>24), byte(l>>16), byte(l>>8), byte(l))
+		raw = append(raw, s...)
+	}
+	writeBytes := func(b []byte) {
+		l := uint32(len(b))
+		raw = append(raw, byte(l>>24), byte(l>>16), byte(l>>8), byte(l))
+		raw = append(raw, b...)
+	}
+	writeStr("none")
+	writeStr("none")
+	writeStr("")
+	raw = append(raw, 0, 0, 0, 1)
+	writeBytes(sshPub.Marshal())
+	writeStr("stub-unencrypted-sk-payload")
+
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "OPENSSH PRIVATE KEY", Bytes: raw})
+	if err := os.WriteFile(keyPath, pemBytes, 0o600); err != nil {
+		t.Fatalf("write stub sk key: %v", err)
+	}
+
+	ui := &mockUIForTest{passphrase: "should-not-prompt"}
+	secProvider := &autoSecretProvider{
+		lifecycleCtx: t.Context(),
+		prompter:     ui,
+	}
+	_, method, err := resolveKeySigners(keyPath, nil, true, secProvider, nil, nil, false, nil)
+	if err == nil || method != nil {
+		t.Fatalf("expected unencrypted unsupported OpenSSH key to skip with error (method=nil), got method=%v err=%v", method, err)
+	}
+	if ui.called {
+		t.Fatal("PromptSecret was called on unencrypted unsupported OpenSSH key")
+	}
+}
+
+func TestResolveKeySigners_SkipsPKCS8AndEncryptedSKWithoutPrompting(t *testing.T) {
+	appendSSHString := func(dst []byte, s string) []byte {
+		n := uint32(len(s))
+		dst = append(dst, byte(n>>24), byte(n>>16), byte(n>>8), byte(n))
+		return append(dst, s...)
+	}
+
+	t.Run("pkcs8-encrypted-private-key-skipped-without-prompt", func(t *testing.T) {
+		keyPath := filepath.Join(t.TempDir(), "pkcs8_enc")
+		pemData := pem.EncodeToMemory(&pem.Block{
+			Type:  "ENCRYPTED PRIVATE KEY",
+			Bytes: []byte("dummy-pkcs8-encrypted-payload"),
+		})
+		if err := os.WriteFile(keyPath, pemData, 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		ui := &mockUIForTest{passphrase: "should-not-be-used"}
+		secProvider := &autoSecretProvider{
+			lifecycleCtx:       context.Background(),
+			prompter:           ui,
+			handshakeTimeout:   time.Second,
+			interactionTimeout: time.Second,
+		}
+		_, method, err := resolveKeySigners(keyPath, nil, true, secProvider, nil, nil, false, nil)
+		if err == nil || method != nil {
+			t.Fatalf("expected PKCS#8 encrypted key to skip with error (method=nil), got method=%v err=%v", method, err)
+		}
+		if ui.called {
+			t.Fatal("PromptSecret must not be called for unsupported PKCS#8 ENCRYPTED PRIVATE KEY")
+		}
+	})
+
+	t.Run("encrypted-sk-ed25519-skipped-without-prompt", func(t *testing.T) {
+		pubWire := appendSSHString(nil, ssh.KeyAlgoSKED25519)
+		pubWire = appendSSHString(pubWire, string(make([]byte, 32)))
+		pubWire = appendSSHString(pubWire, "ssh:")
+
+		kdfOpts := appendSSHString(nil, "0123456789abcdef")
+		kdfOpts = append(kdfOpts, 0, 0, 0, 16)
+
+		raw := append([]byte(nil), "openssh-key-v1\x00"...)
+		raw = appendSSHString(raw, "aes256-ctr")
+		raw = appendSSHString(raw, "bcrypt")
+		raw = appendSSHString(raw, string(kdfOpts))
+		raw = append(raw, 0, 0, 0, 1) // numkeys = 1
+		raw = appendSSHString(raw, string(pubWire))
+		raw = appendSSHString(raw, string(make([]byte, 16))) // dummy encrypted privblock
+
+		pemData := pem.EncodeToMemory(&pem.Block{
+			Type:  "OPENSSH PRIVATE KEY",
+			Bytes: raw,
+		})
+		keyPath := filepath.Join(t.TempDir(), "id_ed25519_sk")
+		if err := os.WriteFile(keyPath, pemData, 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		ui := &mockUIForTest{passphrase: "should-not-be-used"}
+		secProvider := &autoSecretProvider{
+			lifecycleCtx:       context.Background(),
+			prompter:           ui,
+			handshakeTimeout:   time.Second,
+			interactionTimeout: time.Second,
+		}
+		_, method, err := resolveKeySigners(keyPath, nil, true, secProvider, nil, nil, false, nil)
+		if err == nil || method != nil {
+			t.Fatalf("expected encrypted sk-* key to skip with error (method=nil), got method=%v err=%v", method, err)
+		}
+		if ui.called {
+			t.Fatal("PromptSecret must not be called for encrypted sk-* key")
+		}
+	})
 }

@@ -28,15 +28,16 @@ type ClientConfig struct {
 	// OriginalHost is the user's original command-line host or alias (%n).
 	// Empty falls back to NodeID. It differs from Address (%h) after
 	// CanonicalizeHostname rewrites the target.
-	OriginalHost string
-	Address      string
-	Port         int
-	User         string
-	AuthType     string // "password", "key", "agent", "auto"
-	Password     string
-	KeyPath      string
-	KeyPaths     []string
-	Passphrase   string
+	OriginalHost  string
+	CanonicalHost string
+	Address       string
+	Port          int
+	User          string
+	AuthType      string // "password", "key", "agent", "auto"
+	Password      string
+	KeyPath       string
+	KeyPaths      []string
+	Passphrase    string
 	// AuthUpdateToken conditionally authorizes persistence of discovered
 	// authentication values. An empty token makes discovery session-local.
 	AuthUpdateToken string
@@ -70,6 +71,7 @@ func (c *ClientConfig) ToConnectionConfig() ConnectionConfig {
 		TrustVersion:          c.TrustVersion,
 		NodeID:                c.NodeID,
 		OriginalHost:          c.OriginalHost,
+		CanonicalHost:         c.CanonicalHost,
 		Address:               c.Address,
 		Port:                  c.Port,
 		User:                  c.User,
@@ -94,6 +96,7 @@ type ConnectionConfig struct {
 	TrustVersion          string
 	NodeID                string
 	OriginalHost          string
+	CanonicalHost         string
 	Address               string
 	Port                  int
 	User                  string

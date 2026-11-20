@@ -267,8 +267,7 @@ Host *
 func TestCanonicalizeHost_ProxyNoneAndEdgeCases(t *testing.T) {
 	t.Parallel()
 
-	t.Run("M10 proxy-none precedence separates ProxyJump and ProxyCommand", func(t *testing.T) {
-		const proxyCfg = `
+	const proxyCfg = `
 Host cmd-host
     CanonicalizeHostname yes
     CanonicalDomains corp.example.com
@@ -279,71 +278,58 @@ Host jump-host
     CanonicalDomains corp.example.com
     ProxyJump bastion
 `
-		proxyParser, err := NewOpenSSHParserFromReader(strings.NewReader(proxyCfg))
-		if err != nil {
-			t.Fatalf("NewOpenSSHParserFromReader() error = %v", err)
-		}
-		proxyProv := NewProviderWithOpenSSHParser(nil, proxyParser)
+	proxyParser, err := NewOpenSSHParserFromReader(strings.NewReader(proxyCfg))
+	if err != nil {
+		t.Fatalf("NewOpenSSHParserFromReader() error = %v", err)
+	}
+	proxyProv := NewProviderWithOpenSSHParser(nil, proxyParser)
 
-		// -o ProxyCommand=none clears ssh_config ProxyCommand so canonicalization runs.
-		resCmdNone := &fakeCanonicalResolver{hosts: map[string][]string{"cmd-host.corp.example.com": {"10.0.0.1"}}}
-		outCmdNone, err := CanonicalizeHost(t.Context(), CanonicalizeInput{
-			Provider:      proxyProv,
-			Host:          "cmd-host",
-			RawCLIOptions: []string{"ProxyCommand=none"},
-			Resolver:      resCmdNone,
+	assertCanon := func(t *testing.T, prov ConfigProvider, host string, cliOpts []string, cliJump string, wantCanon bool, wantHost string, wantQueries bool) {
+		t.Helper()
+		res := &fakeCanonicalResolver{hosts: map[string][]string{host + ".corp.example.com": {"10.0.0.1"}}}
+		out, err := CanonicalizeHost(t.Context(), CanonicalizeInput{
+			Provider:      prov,
+			Host:          host,
+			RawCLIOptions: cliOpts,
+			CLIProxyJump:  cliJump,
+			Resolver:      res,
 		})
-		if err != nil || !outCmdNone.Canonicalized || outCmdNone.CanonicalHost != "cmd-host.corp.example.com" {
-			t.Fatalf("expected ProxyCommand=none to allow canonicalization, got %+v err=%v", outCmdNone, err)
+		if err != nil || out.Canonicalized != wantCanon || (wantHost != "" && out.CanonicalHost != wantHost) || (!wantQueries && len(res.queried) != 0) {
+			t.Fatalf("CanonicalizeHost(%q, opts=%v, jump=%q) = %+v queried=%v err=%v", host, cliOpts, cliJump, out, res.queried, err)
 		}
+	}
 
-		// -J none does NOT wipe out active ssh_config ProxyCommand.
-		resJNone := &fakeCanonicalResolver{hosts: map[string][]string{"cmd-host.corp.example.com": {"10.0.0.1"}}}
-		outJNone, err := CanonicalizeHost(t.Context(), CanonicalizeInput{
-			Provider:     proxyProv,
-			Host:         "cmd-host",
-			CLIProxyJump: "none",
-			Resolver:     resJNone,
-		})
-		if err != nil || outJNone.Canonicalized || len(resJNone.queried) != 0 {
-			t.Fatalf("expected -J none to preserve ProxyCommand and skip canonicalization, got %+v queried=%v err=%v", outJNone, resJNone.queried, err)
-		}
+	t.Run("M10 proxy-none CLI precedence separates ProxyJump and ProxyCommand", func(t *testing.T) {
+		assertCanon(t, proxyProv, "cmd-host", []string{"ProxyCommand=none"}, "", true, "cmd-host.corp.example.com", true)
+		assertCanon(t, proxyProv, "cmd-host", nil, "none", false, "", false)
+		assertCanon(t, proxyProv, "jump-host", []string{"ProxyCommand=none"}, "", false, "", false)
 
-		// -o ProxyCommand=none does NOT wipe out active ssh_config ProxyJump.
-		resPJPreserved := &fakeCanonicalResolver{hosts: map[string][]string{"jump-host.corp.example.com": {"10.0.0.1"}}}
-		outPJPreserved, err := CanonicalizeHost(t.Context(), CanonicalizeInput{
-			Provider:      proxyProv,
-			Host:          "jump-host",
-			RawCLIOptions: []string{"ProxyCommand=none"},
-			Resolver:      resPJPreserved,
-		})
-		if err != nil || outPJPreserved.Canonicalized || len(resPJPreserved.queried) != 0 {
-			t.Fatalf("expected ProxyCommand=none to preserve ProxyJump and skip canonicalization, got %+v queried=%v err=%v", outPJPreserved, resPJPreserved.queried, err)
-		}
-
-		// Active -J bastion overrides lower-tier ProxyCommand, and -o ProxyJump=none clears it.
 		p := resolveCanonicalizePolicy(proxyParser, nil, "cmd-host", nil, "bastion")
 		if !p.hasProxyJump || p.hasProxyCommand {
 			t.Fatalf("expected CLI ProxyJump to override lower-tier ProxyCommand, got %+v", p)
 		}
+	})
 
-		// Tier 4 ProxyCommand + Tier 3 ProxyJump + CLI -J none leaves Tier 4 ProxyCommand active.
-		t3JumpOpts, _ := ssh.NewOptions()
-		_ = t3JumpOpts.Set("proxy_jump", "bastion")
-		pT3 := resolveCanonicalizePolicy(proxyParser, t3JumpOpts, "cmd-host", nil, "none")
-		if pT3.hasProxyJump || !pT3.hasProxyCommand {
-			t.Fatalf("expected Tier 4 ProxyCommand to remain active when CLI -J none cancels Tier 3 ProxyJump, got %+v", pT3)
+	t.Run("M10 proxy-none tier-3 global interaction", func(t *testing.T) {
+		t3CmdOpts, _ := ssh.NewOptions()
+		if err := t3CmdOpts.Set(ssh.OptionProxyCommand, "nc %h %p"); err != nil {
+			t.Fatalf("t3CmdOpts.Set(ProxyCommand) error = %v", err)
 		}
-		resT3 := &fakeCanonicalResolver{hosts: map[string][]string{"cmd-host.corp.example.com": {"10.0.0.1"}}}
-		t3Prov := NewProviderWithOpenSSHParser(&Configuration{SSHOptions: t3JumpOpts}, proxyParser)
-		outT3, err := CanonicalizeHost(t.Context(), CanonicalizeInput{
-			Provider:     t3Prov,
-			Host:         "cmd-host",
-			CLIProxyJump: "none",
-			Resolver:     resT3,
-		})
-		if err != nil || outT3.Canonicalized || len(resT3.queried) != 0 {
-			t.Fatalf("expected T4 ProxyCommand + T3 ProxyJump + CLI -J none to skip canonicalization, got %+v queried=%v err=%v", outT3, resT3.queried, err)
+		pT3 := resolveCanonicalizePolicy(proxyParser, t3CmdOpts, "jump-host", nil, "none")
+		if pT3.hasProxyJump || !pT3.hasProxyCommand {
+			t.Fatalf("expected Tier 3 ProxyCommand to remain active when CLI -J none cancels Tier 4 ProxyJump, got %+v", pT3)
+		}
+		assertCanon(t, NewProviderWithOpenSSHParser(&Configuration{SSHOptions: t3CmdOpts}, proxyParser), "jump-host", nil, "none", false, "", false)
+
+		t3NoneOpts, _ := ssh.NewOptions()
+		if err := t3NoneOpts.Set(ssh.OptionProxyCommand, "none"); err != nil {
+			t.Fatalf("t3NoneOpts.Set(ProxyCommand=none) error = %v", err)
+		}
+		if p := resolveCanonicalizePolicy(proxyParser, t3NoneOpts, "cmd-host", nil, ""); p.hasProxyCommand {
+			t.Fatalf("expected Tier 3 ProxyCommand=none to clear Tier 4 ProxyCommand, got %+v", p)
+		}
+		if p := resolveCanonicalizePolicy(proxyParser, t3NoneOpts, "jump-host", nil, ""); !p.hasProxyJump || p.hasProxyCommand {
+			t.Fatalf("expected Tier 3 ProxyCommand=none to preserve Tier 4 ProxyJump under Decision 1.A, got %+v", p)
 		}
 	})
 }
@@ -415,6 +401,205 @@ Host *
 		})
 		if err != nil || !outCNAME.Canonicalized || outCNAME.CanonicalHost != "app-real.internal.example.com" {
 			t.Fatalf("expected direct CNAME canonicalization with empty CanonicalDomains, got %+v err=%v", outCNAME, err)
+		}
+	})
+}
+
+func TestCanonicalizeHost_FailClosedAndTwoPassEdgeCases(t *testing.T) {
+	t.Parallel()
+	t.Run("P1-2 P1-4 P1-8 P2-2.5 broken parser, CNAME negation, Pass-1 HostName, and = syntax", func(t *testing.T) {
+		brokenProv := NewProviderWithOpenSSHParser(nil, NewBrokenOpenSSHParser(errors.New("broken ssh config")))
+		if _, err := CanonicalizeHost(t.Context(), CanonicalizeInput{
+			Provider: brokenProv,
+			Host:     "web",
+		}); err == nil {
+			t.Fatal("expected broken parser to fail closed when !MatchedSavedNode")
+		}
+		if outSaved, err := CanonicalizeHost(t.Context(), CanonicalizeInput{
+			Provider:         brokenProv,
+			Host:             "web",
+			MatchedSavedNode: true,
+		}); err != nil || outSaved.Canonicalized {
+			t.Fatalf("expected MatchedSavedNode to skip broken parser, got out=%+v err=%v", outSaved, err)
+		}
+
+		const cfgText = `
+Host ipalias
+    HostName 10.20.30.40
+
+Host prod
+    HostName web
+
+Host *
+    CanonicalizeHostname yes
+    CanonicalDomains corp.example.com
+    CanonicalizeMaxDots 2
+    CanonicalizeFallbackLocal yes
+    CanonicalizePermittedCNAMEs *.corp.example.com:!blocked.cdn.net,*.cdn.net
+`
+		p2, err := NewOpenSSHParserFromReader(strings.NewReader(cfgText))
+		if err != nil {
+			t.Fatalf("NewOpenSSHParserFromReader: %v", err)
+		}
+		prov2 := NewProviderWithOpenSSHParser(nil, p2)
+
+		// Pass-1 HostName resolving to an IP skips canonicalization.
+		resIP := &fakeCanonicalResolver{hosts: map[string][]string{"ipalias.corp.example.com": {"1.2.3.4"}}}
+		outIP, err := CanonicalizeHost(t.Context(), CanonicalizeInput{
+			Provider: prov2,
+			Host:     "ipalias",
+			Resolver: resIP,
+		})
+		if err != nil || outIP.Canonicalized || len(resIP.queried) != 0 {
+			t.Fatalf("expected HostName IP to skip canonicalization, got out=%+v queried=%v err=%v", outIP, resIP.queried, err)
+		}
+
+		// Pass-1 HostName "web" is probed for Host "prod", preserving OriginalHost "prod".
+		resHN := &fakeCanonicalResolver{hosts: map[string][]string{"web.corp.example.com": {"10.5.5.5"}}}
+		outHN, err := CanonicalizeHost(t.Context(), CanonicalizeInput{
+			Provider: prov2,
+			Host:     "prod",
+			Resolver: resHN,
+		})
+		if err != nil || !outHN.Canonicalized || outHN.OriginalHost != "prod" || outHN.CanonicalHost != "web.corp.example.com" {
+			t.Fatalf("CanonicalizeHost(prod -> web) = %+v, err=%v", outHN, err)
+		}
+
+		// !negated pattern in CanonicalizePermittedCNAMEs blocks blocked.cdn.net while allowing ok.cdn.net.
+		resBlocked := &fakeCanonicalResolver{
+			hosts:  map[string][]string{"web.corp.example.com": {"10.5.5.5"}},
+			cnames: map[string]string{"web.corp.example.com": "blocked.cdn.net."},
+		}
+		outBlocked, err := CanonicalizeHost(t.Context(), CanonicalizeInput{
+			Provider: prov2,
+			Host:     "web",
+			Resolver: resBlocked,
+		})
+		if err != nil || outBlocked.CanonicalHost != "web.corp.example.com" {
+			t.Fatalf("expected negated CNAME blocked.cdn.net to be rejected, got %+v err=%v", outBlocked, err)
+		}
+		resAllowed := &fakeCanonicalResolver{
+			hosts:  map[string][]string{"web.corp.example.com": {"10.5.5.5"}},
+			cnames: map[string]string{"web.corp.example.com": "edge.cdn.net."},
+		}
+		outAllowed, err := CanonicalizeHost(t.Context(), CanonicalizeInput{
+			Provider: prov2,
+			Host:     "web",
+			Resolver: resAllowed,
+		})
+		if err != nil || outAllowed.CanonicalHost != "edge.cdn.net" {
+			t.Fatalf("expected positive CNAME edge.cdn.net to be permitted, got %+v err=%v", outAllowed, err)
+		}
+
+		// Space around '=' in RawCLIOptions and duration-aware ConnectTimeout.
+		polCLI := resolveCanonicalizePolicy(p2, nil, "ipalias", []string{
+			"CanonicalizeHostname = no",
+			"ConnectTimeout = 2s",
+		}, "")
+		if polCLI.mode != "no" || polCLI.timeout != 2*time.Second {
+			t.Fatalf("unexpected space-around-'=' / duration policy: mode=%q timeout=%v", polCLI.mode, polCLI.timeout)
+		}
+	})
+}
+
+func TestCanonicalizeHost_Round2PolicyAndFallbackFixes(t *testing.T) {
+	t.Run("local fallback without CNAME retains Canonicalized=false even when Pass1 HostName differs", func(t *testing.T) {
+		cfg := strings.Join([]string{
+			"Host prod",
+			"  HostName web.internal",
+			"  CanonicalizeHostname yes",
+			"  CanonicalDomains corp.example.com",
+			"  CanonicalizeFallbackLocal yes",
+		}, "\n") + "\n"
+		p, err := NewOpenSSHParserFromReader(strings.NewReader(cfg))
+		if err != nil {
+			t.Fatal(err)
+		}
+		prov := NewProviderWithOpenSSHParser(nil, p)
+		res := &fakeCanonicalResolver{hosts: map[string][]string{"web.internal": {"10.1.2.3"}}}
+		out, err := CanonicalizeHost(t.Context(), CanonicalizeInput{
+			Provider: prov,
+			Host:     "prod",
+			Resolver: res,
+		})
+		if err != nil {
+			t.Fatalf("CanonicalizeHost: %v", err)
+		}
+		if out.Canonicalized || out.CanonicalHost != "prod" {
+			t.Fatalf("local fallback without CNAME mutated Canonicalized: %+v", out)
+		}
+	})
+
+	t.Run("tier3 none clears tier4 domains and permitted CNAMEs", func(t *testing.T) {
+		cfg := strings.Join([]string{
+			"Host web",
+			"  CanonicalizeHostname yes",
+			"  CanonicalDomains corp.example.com",
+			"  CanonicalizePermittedCNAMEs *:*.cdn.net",
+		}, "\n") + "\n"
+		p, err := NewOpenSSHParserFromReader(strings.NewReader(cfg))
+		if err != nil {
+			t.Fatal(err)
+		}
+		opts, err := ssh.NewOptions()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := opts.Set(ssh.OptionCanonicalDomains, "none"); err != nil {
+			t.Fatal(err)
+		}
+		if err := opts.Set(ssh.OptionCanonicalizePermittedCNAMEs, "none"); err != nil {
+			t.Fatal(err)
+		}
+		pol := resolveCanonicalizePolicy(p, opts, "web", nil, "")
+		if len(pol.domains) != 0 || len(pol.permittedCNAMEs) != 0 {
+			t.Fatalf("Tier-3 none did not clear Tier-4 policy: domains=%v cnames=%v", pol.domains, pol.permittedCNAMEs)
+		}
+	})
+
+	t.Run("ProxyCommand=none allows ProxyJump=none to clear tier4 jump while blocking ProxyJump=bastion", func(t *testing.T) {
+		cfg := strings.Join([]string{
+			"Host web",
+			"  CanonicalizeHostname yes",
+			"  CanonicalDomains corp.example.com",
+			"  ProxyJump tier4-bastion",
+		}, "\n") + "\n"
+		p, err := NewOpenSSHParserFromReader(strings.NewReader(cfg))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		polCleared := resolveCanonicalizePolicy(p, nil, "web", []string{"ProxyCommand=none", "ProxyJump=none"}, "")
+		if polCleared.hasProxyJump || polCleared.hasProxyCommand {
+			t.Fatalf("-o ProxyCommand=none -o ProxyJump=none must clear Tier-4 ProxyJump: %+v", polCleared)
+		}
+		polBlocked := resolveCanonicalizePolicy(p, nil, "web", []string{"ProxyCommand=none", "ProxyJump=bastion"}, "")
+		if !polBlocked.hasProxyJump {
+			t.Fatalf("same-tier -o ProxyCommand=none -o ProxyJump=bastion expected Tier-4 hasProxyJump=true intact: %+v", polBlocked)
+		}
+	})
+
+	t.Run("ConnectTimeout none/0/0s resets and huge int clamps without overflow", func(t *testing.T) {
+		for _, tc := range []struct {
+			input string
+			want  time.Duration
+		}{
+			{input: "2", want: 2 * time.Second},
+			{input: "0", want: maxCanonicalProbeTimeout},
+			{input: "0s", want: maxCanonicalProbeTimeout},
+			{input: "none", want: maxCanonicalProbeTimeout},
+			{input: "100000000000000000000", want: maxCanonicalProbeTimeout},
+		} {
+			pol := canonicalizePolicy{timeout: time.Second}
+			pol.setTimeoutSeconds(tc.input)
+			if pol.timeout != tc.want {
+				t.Fatalf("setTimeoutSeconds(%q) = %v, want %v", tc.input, pol.timeout, tc.want)
+			}
+		}
+		polNeg := canonicalizePolicy{timeout: 2 * time.Second}
+		polNeg.setTimeoutSeconds("-99999999999999999999")
+		if polNeg.timeout != 2*time.Second {
+			t.Fatalf("negative overflowing timeout altered policy: %v", polNeg.timeout)
 		}
 	})
 }

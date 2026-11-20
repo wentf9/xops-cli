@@ -24,7 +24,7 @@ func TestPass10_H2_OpenSSHConfigHashCommentAndQuoteLexing(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(incUnquotedDir, "a.conf"), []byte("Host app#1\n  Port 2201 # port comment\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(incQuotedDir, "b.conf"), []byte("Match host match#1 *.example#1.com # match comment\n  User alice#1 # inline comment\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(incQuotedDir, "b.conf"), []byte("Match host match#1,*.example#1.com # match comment\n  User alice#1 # inline comment\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 

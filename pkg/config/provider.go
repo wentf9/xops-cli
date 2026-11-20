@@ -22,6 +22,7 @@ type Provider struct {
 	aliasIndex     map[string]string
 	openSSH        *OpenSSHParser
 	openSSHAliases map[string]string
+	canonicalHosts map[string]string
 }
 
 var _ ConfigProvider = (*Provider)(nil)
@@ -70,6 +71,12 @@ func (p *Provider) Frozen() ConfigProvider {
 		frozen.openSSHAliases = make(map[string]string, len(p.openSSHAliases))
 		for k, v := range p.openSSHAliases {
 			frozen.openSSHAliases[k] = v
+		}
+	}
+	if len(p.canonicalHosts) > 0 {
+		frozen.canonicalHosts = make(map[string]string, len(p.canonicalHosts))
+		for k, v := range p.canonicalHosts {
+			frozen.canonicalHosts[k] = v
 		}
 	}
 	return frozen
@@ -123,6 +130,109 @@ func (p *Provider) NodeOpenSSHAlias(nodeID string) string {
 	return p.openSSHAliases[nodeID]
 }
 
+// SetNodeCanonicalHost records the hostname-canonicalized host for nodeID
+// during the current session without modifying persisted state.
+func (p *Provider) SetNodeCanonicalHost(nodeID, canonicalHost string) {
+	if p == nil || nodeID == "" || canonicalHost == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.canonicalHosts == nil {
+		p.canonicalHosts = make(map[string]string)
+	}
+	p.canonicalHosts[nodeID] = canonicalHost
+}
+
+// NodeCanonicalHost returns the session-recorded canonicalized host for nodeID.
+func (p *Provider) NodeCanonicalHost(nodeID string) string {
+	if p == nil || nodeID == "" {
+		return ""
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.canonicalHosts[nodeID]
+}
+
+func (p *Provider) setSavedNodeOpenSSHMetadataIfPresent(nodeID, alias, canonicalHost string) {
+	if p == nil || nodeID == "" || (alias == "" && canonicalHost == "") {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cfg == nil || p.cfg.Nodes == nil {
+		return
+	}
+	if _, ok := p.cfg.Nodes.Get(nodeID); !ok {
+		return
+	}
+	p.setOpenSSHMetadataLocked(nodeID, alias, canonicalHost)
+}
+
+func (p *Provider) setOpenSSHMetadataLocked(nodeID, alias, canonicalHost string) {
+	if alias != "" {
+		if p.openSSHAliases == nil {
+			p.openSSHAliases = make(map[string]string)
+		}
+		p.openSSHAliases[nodeID] = alias
+	}
+	if canonicalHost != "" {
+		if p.canonicalHosts == nil {
+			p.canonicalHosts = make(map[string]string)
+		}
+		p.canonicalHosts[nodeID] = canonicalHost
+	}
+}
+
+func (p *Provider) clearNodeOpenSSHMetadata(nodeID string) {
+	if p == nil || nodeID == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.openSSHAliases, nodeID)
+	delete(p.canonicalHosts, nodeID)
+}
+
+func resolveConfigNodeHostAddrPort(cfg *Configuration, nodeID string) (string, uint16, bool) {
+	if cfg == nil || cfg.Nodes == nil || cfg.Hosts == nil {
+		return "", 0, false
+	}
+	node, ok := cfg.Nodes.Get(nodeID)
+	if !ok {
+		return "", 0, false
+	}
+	host, ok := cfg.Hosts.Get(node.HostRef)
+	if !ok {
+		return "", 0, false
+	}
+	cleanAddr := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(host.Address), "]"), "[")
+	return cleanAddr, normalizedHostPort(host.Port), true
+}
+
+func (p *Provider) pruneStaleOpenSSHMetadataLocked(oldCfg, updated *Configuration) {
+	if p == nil || oldCfg == nil || oldCfg.Nodes == nil {
+		return
+	}
+	pruneMap := func(m map[string]string) {
+		for nodeID := range m {
+			oldAddr, oldPort, hadOld := resolveConfigNodeHostAddrPort(oldCfg, nodeID)
+			if !hadOld {
+				if _, stillOld := oldCfg.Nodes.Get(nodeID); stillOld {
+					delete(m, nodeID)
+				}
+				continue
+			}
+			newAddr, newPort, hasNew := resolveConfigNodeHostAddrPort(updated, nodeID)
+			if !hasNew || !strings.EqualFold(oldAddr, newAddr) || oldPort != newPort {
+				delete(m, nodeID)
+			}
+		}
+	}
+	pruneMap(p.openSSHAliases)
+	pruneMap(p.canonicalHosts)
+}
+
 // Snapshot returns a deep copy that callers may retain and mutate freely.
 func (p *Provider) Snapshot() *Configuration {
 	if p == nil {
@@ -160,9 +270,14 @@ func (p *Provider) ResolveSelector(input string) (string, error) {
 	case 1:
 		return candidates[0], nil
 	case 0:
-		if p.openSSH != nil && p.openSSH.cfg != nil {
-			if nodeID, ok := p.openSSH.Find(input); ok {
-				return nodeID, nil
+		if p.openSSH != nil {
+			if err := p.openSSH.Err(); err != nil {
+				return "", fmt.Errorf("resolve openssh selector %q: %w", input, err)
+			}
+			if p.openSSH.cfg != nil {
+				if nodeID, ok := p.openSSH.Find(input); ok {
+					return nodeID, nil
+				}
 			}
 		}
 		return "", nil
@@ -203,6 +318,7 @@ func (p *Provider) resolveWithProvenance(nodeID string) (models.Node, models.Hos
 		host, hostOK := p.cfg.Hosts.Get(node.HostRef)
 		identity, identityOK := p.cfg.Identities.Get(node.IdentityRef)
 		openSSHAlias := p.openSSHAliases[nodeID]
+		canonicalHost := p.canonicalHosts[nodeID]
 		p.mu.RUnlock()
 		if !hostOK {
 			return models.Node{}, models.Host{}, models.Identity{}, ProvenanceUnknown, fmt.Errorf("host ref %q for node %q: %w", node.HostRef, nodeID, ErrHostNotFound)
@@ -214,8 +330,13 @@ func (p *Provider) resolveWithProvenance(nodeID string) (models.Node, models.Hos
 		if clonedNode.OpenSSHAlias == "" {
 			clonedNode.OpenSSHAlias = openSSHAlias
 		}
+		if clonedNode.CanonicalHost == "" {
+			clonedNode.CanonicalHost = canonicalHost
+		}
 		return clonedNode, cloneHost(host), cloneIdentity(identity), ProvenanceSavedManaged, nil
 	}
+	openSSHAlias := p.openSSHAliases[nodeID]
+	canonicalHost := p.canonicalHosts[nodeID]
 	p.mu.RUnlock()
 
 	if IsOpenSSHNodeID(nodeID) {
@@ -223,9 +344,30 @@ func (p *Provider) resolveWithProvenance(nodeID string) (models.Node, models.Hos
 		if parser == nil {
 			parser = &OpenSSHParser{cfg: nil}
 		}
-		node, host, identity, err := parser.GetVirtualNode(strings.TrimPrefix(nodeID, OpenSSHNodePrefix))
+		spec := strings.TrimPrefix(nodeID, OpenSSHNodePrefix)
+		lookupHost, inlineUser, inlinePort, specErr := parseOpenSSHHostSpec(spec)
+		if specErr != nil {
+			return models.Node{}, models.Host{}, models.Identity{}, ProvenanceUnknown, fmt.Errorf("parse openssh host %q failed: %w", spec, specErr)
+		}
+		var (
+			node     models.Node
+			host     models.Host
+			identity models.Identity
+			err      error
+		)
+		if openSSHAlias != "" && canonicalHost != "" && !strings.EqualFold(openSSHAlias, canonicalHost) {
+			node, host, identity, err = parser.getVirtualNodeWithCanonical(openSSHAlias, canonicalHost, inlineUser, inlinePort, spec)
+		} else {
+			node, host, identity, err = parser.getVirtualNodeWithCanonical(lookupHost, "", inlineUser, inlinePort, spec)
+		}
 		if err != nil {
 			return models.Node{}, models.Host{}, models.Identity{}, ProvenanceUnknown, err
+		}
+		if openSSHAlias != "" {
+			node.OpenSSHAlias = openSSHAlias
+		}
+		if canonicalHost != "" {
+			node.CanonicalHost = canonicalHost
 		}
 		return node, host, identity, ProvenanceOpenSSHVirtual, nil
 	}
@@ -247,6 +389,60 @@ func (p *Provider) ResolveConnection(nodeID string) (ConnectionSnapshot, error) 
 	}, nil
 }
 
+// ResolveConnectionWithOrigin resolves nodeID without reading or mutating
+// session-wide OpenSSH alias/canonical metadata maps for virtual OpenSSH targets.
+func (p *Provider) ResolveConnectionWithOrigin(nodeID, originalHost string) (ConnectionSnapshot, error) {
+	if p == nil {
+		return ConnectionSnapshot{}, fmt.Errorf("config provider is nil")
+	}
+	p.mu.RLock()
+	_, savedExists := p.cfg.Nodes.Get(nodeID)
+	p.mu.RUnlock()
+	if savedExists || !IsOpenSSHNodeID(nodeID) {
+		return p.ResolveConnection(nodeID)
+	}
+
+	parser := p.openSSH
+	if parser == nil {
+		parser = &OpenSSHParser{cfg: nil}
+	}
+	spec := strings.TrimPrefix(nodeID, OpenSSHNodePrefix)
+	lookupHost, inlineUser, inlinePort, specErr := parseOpenSSHHostSpec(spec)
+	if specErr != nil {
+		return ConnectionSnapshot{}, fmt.Errorf("parse openssh host %q failed: %w", spec, specErr)
+	}
+	orig := normalizeOriginalHost(originalHost)
+	var (
+		node     models.Node
+		host     models.Host
+		identity models.Identity
+		err      error
+	)
+	if orig != "" && !strings.EqualFold(orig, lookupHost) {
+		node, host, identity, err = parser.getVirtualNodeWithCanonical(orig, lookupHost, inlineUser, inlinePort, spec)
+		if err != nil {
+			return ConnectionSnapshot{}, err
+		}
+		node.OpenSSHAlias = orig
+		node.CanonicalHost = lookupHost
+	} else {
+		node, host, identity, err = parser.getVirtualNodeWithCanonical(lookupHost, "", inlineUser, inlinePort, spec)
+		if err != nil {
+			return ConnectionSnapshot{}, err
+		}
+		if alias := resolveOpenSSHAliasName(parser, spec); alias != "" {
+			node.OpenSSHAlias = alias
+		}
+		node.CanonicalHost = ""
+	}
+	return ConnectionSnapshot{
+		Node:       node,
+		Host:       host,
+		Identity:   identity,
+		Provenance: ProvenanceOpenSSHVirtual,
+	}, nil
+}
+
 func (p *Provider) GetNode(nodeID string) (models.Node, bool) {
 	if p == nil {
 		return models.Node{}, false
@@ -257,6 +453,9 @@ func (p *Provider) GetNode(nodeID string) (models.Node, bool) {
 	cloned := cloneNode(node)
 	if ok && cloned.OpenSSHAlias == "" {
 		cloned.OpenSSHAlias = p.openSSHAliases[nodeID]
+	}
+	if ok && cloned.CanonicalHost == "" {
+		cloned.CanonicalHost = p.canonicalHosts[nodeID]
 	}
 	return cloned, ok
 }

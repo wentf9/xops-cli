@@ -507,8 +507,12 @@ func (o *SshOptions) resolveAndCacheSessionOptions(provider config.ConfigProvide
 		lookupKey = connTarget.Selector
 	}
 	adpOpts := []adapter.Option{adapter.WithLocalExecution(!o.isMuxDaemon() && !isChild)}
-	if jump := strings.TrimSpace(o.JumpHost); jump != "" {
-		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(lookupKey, adapter.SessionAuth{ProxyJump: jump}))
+	sessionAuth := adapter.SessionAuth{
+		ProxyJump:    strings.TrimSpace(o.JumpHost),
+		OriginalHost: strings.TrimSpace(target.OriginalHost),
+	}
+	if lookupKey != "" && (sessionAuth.ProxyJump != "" || sessionAuth.OriginalHost != "") {
+		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(lookupKey, sessionAuth))
 	}
 	eff, err := adapter.NewSSHAdapter(provider, adpOpts...).ResolveSSHOptions(lookupKey, sessionOpts)
 	if err != nil {
@@ -552,20 +556,28 @@ func (o *SshOptions) effectiveNoCmd() bool {
 	return false
 }
 
-func (o *SshOptions) effectiveBgRun() bool {
+func (o *SshOptions) effectiveBgRunChecked() (bool, error) {
 	if o == nil {
-		return false
+		return false, nil
 	}
 	if o.BgRun {
-		return true
+		return true, nil
 	}
 	eff, err := o.effectiveSessionOptions()
-	if err == nil && eff != nil {
+	if err != nil {
+		return false, err
+	}
+	if eff != nil {
 		if fork, ok := eff.ForkAfterAuthentication(); ok && fork {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
+}
+
+func (o *SshOptions) effectiveBgRun() bool {
+	bg, _ := o.effectiveBgRunChecked()
+	return bg
 }
 
 func (o *SshOptions) effectiveStdinNull() bool {

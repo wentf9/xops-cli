@@ -502,6 +502,13 @@ func TestProcessStdioConn_SpontaneousExitBeforeCloseSkipsDelayedGroupReap(t *tes
 		_ = pConn.Close()
 		t.Fatalf("Read = (%d, %v), want ('E')", n, err)
 	}
+	// Once child closes stdout (without grandchildren inheriting the write FD), Read drains to io.EOF.
+	if err == nil {
+		if n2, err2 := pConn.Read(buf); n2 != 0 || !errors.Is(err2, io.EOF) {
+			_ = pConn.Close()
+			t.Fatalf("second Read = (%d, %v), want (0, io.EOF)", n2, err2)
+		}
+	}
 
 	// Wait until both cmd.Wait() (waitDone) and stderr EOF (stderrDone) have naturally completed.
 	select {
@@ -538,4 +545,293 @@ func countLinuxOpenFDs(t *testing.T) int {
 		return 0
 	}
 	return len(entries)
+}
+
+func TestRunLocalCommandWithIO_GrandchildInheritingNonFilePipesDoesNotHang(t *testing.T) {
+	forceHeadlessModeForTest(t)
+
+	// 1. Normal shell exit where background grandchild inherits non-*os.File stdout/stderr pipes.
+	var stdoutBuf, stderrBuf bytes.Buffer
+	start := time.Now()
+	err := RunLocalCommandWithIO(t.Context(), `sleep 2 &`, &stdoutBuf, &stderrBuf)
+	if err != nil {
+		t.Fatalf("RunLocalCommandWithIO with grandchild inheriting pipes failed: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
+		t.Fatalf("RunLocalCommandWithIO waited %v for grandchild holding pipe", elapsed)
+	}
+
+	// 2. Context cancellation under foreground TTY mode with non-*os.File pipes must also return promptly.
+	origProbe := probeControllingTTY
+	probeControllingTTY = func() bool { return true }
+	t.Cleanup(func() { probeControllingTTY = origProbe })
+
+	cancelCtx, cancel := context.WithTimeout(t.Context(), 80*time.Millisecond)
+	defer cancel()
+	var cancelOut, cancelErr bytes.Buffer
+	cStart := time.Now()
+	cErr := RunLocalCommandWithIO(cancelCtx, `sleep 2 & wait`, &cancelOut, &cancelErr)
+	if !errors.Is(cErr, context.DeadlineExceeded) {
+		t.Fatalf("canceled RunLocalCommandWithIO err = %v, want context.DeadlineExceeded", cErr)
+	}
+	if elapsed := time.Since(cStart); elapsed > 1500*time.Millisecond {
+		t.Fatalf("canceled RunLocalCommandWithIO with foregroundTTY took %v", elapsed)
+	}
+}
+
+func TestProcessStdioConn_GrandchildRedirectingStderrStillReapsGroup(t *testing.T) {
+	forceHeadlessModeForTest(t)
+
+	var reapCalls atomic.Int32
+	origHook := onUnixReapRemainingGroup
+	onUnixReapRemainingGroup = func(int) {
+		reapCalls.Add(1)
+	}
+	t.Cleanup(func() {
+		onUnixReapRemainingGroup = origHook
+	})
+
+	// Grandchild redirects stderr to /dev/null and closes stdin, but inherits stdout.
+	// Direct child exits immediately; Close() must still reap the process group because stdout has not reached EOF.
+	rawConn, err := DialProxyCommandWithStderr(t.Context(), `(sleep 5 </dev/null 2>/dev/null) & printf 'Q'; exit 0`, io.Discard)
+	if err != nil {
+		t.Fatalf("DialProxyCommandWithStderr failed: %v", err)
+	}
+	pConn := rawConn.(*ProcessStdioConn)
+
+	buf := make([]byte, 8)
+	n, err := pConn.Read(buf)
+	if n != 1 || buf[0] != 'Q' || err != nil {
+		_ = pConn.Close()
+		t.Fatalf("Read = (%d, %q, %v), want (1, 'Q', nil)", n, buf[:n], err)
+	}
+
+	select {
+	case <-pConn.waitDone:
+	case <-time.After(2 * time.Second):
+		_ = pConn.Close()
+		t.Fatal("timed out waiting for waitDone")
+	}
+	select {
+	case <-pConn.stderrDone:
+	case <-time.After(2 * time.Second):
+		_ = pConn.Close()
+		t.Fatal("timed out waiting for stderrDone")
+	}
+
+	closeStart := time.Now()
+	if err := pConn.Close(); err != nil {
+		t.Fatalf("Close() failed: %v", err)
+	}
+	if elapsed := time.Since(closeStart); elapsed > 1500*time.Millisecond {
+		t.Fatalf("Close() took %v; grandchild sleep 5 was not reaped promptly", elapsed)
+	}
+	if got := reapCalls.Load(); got != 1 {
+		t.Fatalf("reapRemainingGroup calls = %d, want 1", got)
+	}
+}
+
+func TestRunLocalCommandWithIO_NilOutputsBindDevNullWithoutWaitDelay(t *testing.T) {
+	forceHeadlessModeForTest(t)
+
+	start := time.Now()
+	err := RunLocalCommandWithIO(t.Context(), `(sleep 2 </dev/null) & exit 0`, nil, nil)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("RunLocalCommandWithIO(nil, nil) error: %v", err)
+	}
+	if elapsed >= 500*time.Millisecond {
+		t.Fatalf("RunLocalCommandWithIO(nil, nil) took %v; nil outputs must not trigger IO WaitDelay", elapsed)
+	}
+}
+
+func TestProcessStdioConn_GrandchildRedirectingStderrGetsSIGTERMGrace(t *testing.T) {
+	forceHeadlessModeForTest(t)
+
+	marker := t.TempDir() + "/term-marker"
+	// Direct child exits immediately while the background grandchild inherits
+	// stdout, redirects stderr to /dev/null, installs a SIGTERM handler, and then
+	// signals readiness by writing 'R'.
+	cmd := fmt.Sprintf("sh -c 'trap \"printf CLEAN > \\\"$1\\\"; kill \\$p 2>/dev/null; exit 0\" TERM; sleep 5 & p=$!; printf R; wait $p' _ %q </dev/null 2>/dev/null & exit 0", marker)
+	rawConn, err := DialProxyCommandWithStderr(t.Context(), cmd, io.Discard)
+	if err != nil {
+		t.Fatalf("DialProxyCommandWithStderr failed: %v", err)
+	}
+	pConn := rawConn.(*ProcessStdioConn)
+
+	buf := make([]byte, 8)
+	n, err := pConn.Read(buf)
+	if n != 1 || buf[0] != 'R' || err != nil {
+		_ = pConn.Close()
+		t.Fatalf("Read = (%d, %q, %v), want (1, 'R', nil)", n, buf[:n], err)
+	}
+
+	select {
+	case <-pConn.waitDone:
+	case <-time.After(2 * time.Second):
+		_ = pConn.Close()
+		t.Fatal("timed out waiting for waitDone")
+	}
+	select {
+	case <-pConn.stderrDone:
+	case <-time.After(2 * time.Second):
+		_ = pConn.Close()
+		t.Fatal("timed out waiting for stderrDone")
+	}
+
+	closeStart := time.Now()
+	if err := pConn.Close(); err != nil {
+		t.Fatalf("Close() failed: %v", err)
+	}
+	if elapsed := time.Since(closeStart); elapsed > 1500*time.Millisecond {
+		t.Fatalf("Close() took %v; grandchild did not exit cleanly within grace", elapsed)
+	}
+	data, err := os.ReadFile(marker)
+	if err != nil || string(data) != "CLEAN" {
+		t.Fatalf("SIGTERM trap marker = (%q, %v), want \"CLEAN\"", string(data), err)
+	}
+}
+
+func TestProcessStdioConn_GrandchildIgnoringSIGTERMIsKilledAfterGrace(t *testing.T) {
+	forceHeadlessModeForTest(t)
+
+	cmd := "sh -c 'trap \"\" TERM; printf R; exec sleep 5' </dev/null 2>/dev/null & exit 0"
+	rawConn, err := DialProxyCommandWithStderr(t.Context(), cmd, io.Discard)
+	if err != nil {
+		t.Fatalf("DialProxyCommandWithStderr failed: %v", err)
+	}
+	pConn := rawConn.(*ProcessStdioConn)
+
+	buf := make([]byte, 8)
+	n, err := pConn.Read(buf)
+	if n != 1 || buf[0] != 'R' || err != nil {
+		_ = pConn.Close()
+		t.Fatalf("Read = (%d, %q, %v), want (1, 'R', nil)", n, buf[:n], err)
+	}
+
+	select {
+	case <-pConn.waitDone:
+	case <-time.After(2 * time.Second):
+		_ = pConn.Close()
+		t.Fatal("timed out waiting for waitDone")
+	}
+	select {
+	case <-pConn.stderrDone:
+	case <-time.After(2 * time.Second):
+		_ = pConn.Close()
+		t.Fatal("timed out waiting for stderrDone")
+	}
+
+	closeStart := time.Now()
+	if err := pConn.Close(); err != nil {
+		t.Fatalf("Close() failed: %v", err)
+	}
+	elapsed := time.Since(closeStart)
+	if elapsed < proxyTermGracePeriod/2 {
+		t.Fatalf("Close() returned in %v (< %v/2), expected SIGTERM grace before SIGKILL", elapsed, proxyTermGracePeriod)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("Close() took %v, expected SIGKILL after grace", elapsed)
+	}
+}
+
+func TestRound4_P2_11_UnreadStdoutSpontaneousExitSkipsDelayedGroupReap(t *testing.T) {
+	forceHeadlessModeForTest(t)
+
+	var reapCalls atomic.Int32
+	origHook := onUnixReapRemainingGroup
+	onUnixReapRemainingGroup = func(int) {
+		reapCalls.Add(1)
+	}
+	t.Cleanup(func() {
+		onUnixReapRemainingGroup = origHook
+	})
+
+	rawConn, err := DialProxyCommandWithStderr(t.Context(), `printf 'E'; exit 0`, io.Discard)
+	if err != nil {
+		t.Fatalf("DialProxyCommandWithStderr failed: %v", err)
+	}
+	pConn := rawConn.(*ProcessStdioConn)
+
+	select {
+	case <-pConn.waitDone:
+	case <-time.After(2 * time.Second):
+		_ = pConn.Close()
+		t.Fatal("timed out waiting for waitDone")
+	}
+	select {
+	case <-pConn.stderrDone:
+	case <-time.After(2 * time.Second):
+		_ = pConn.Close()
+		t.Fatal("timed out waiting for stderrDone")
+	}
+
+	// Intentionally do NOT call pConn.Read(): POLLHUP on stdoutR and groupSentinelR
+	// must recognize spontaneous exit without triggering delayed PGID reap.
+	if err := pConn.Close(); err != nil {
+		t.Fatalf("Close() failed: %v", err)
+	}
+	if !pConn.spontaneousExit.Load() {
+		t.Fatal("expected spontaneousExit=true on unread stdout spontaneous exit")
+	}
+	if got := reapCalls.Load(); got != 0 {
+		t.Fatalf("reapRemainingGroup calls = %d, want 0 (risk of PGID reuse kill)", got)
+	}
+}
+
+func TestRound4_P2_11_GrandchildClosingAllStdioIsReapedViaSentinelFD(t *testing.T) {
+	forceHeadlessModeForTest(t)
+
+	var reapCalls atomic.Int32
+	origHook := onUnixReapRemainingGroup
+	onUnixReapRemainingGroup = func(int) {
+		reapCalls.Add(1)
+	}
+	t.Cleanup(func() {
+		onUnixReapRemainingGroup = origHook
+	})
+
+	// Grandchild closes stdin, stdout, and stderr, but still inherits the internal sentinel pipe FD 3.
+	cmd := `(exec </dev/null >/dev/null 2>/dev/null; exec sleep 5) & printf 'S'; exit 0`
+	rawConn, err := DialProxyCommandWithStderr(t.Context(), cmd, io.Discard)
+	if err != nil {
+		t.Fatalf("DialProxyCommandWithStderr failed: %v", err)
+	}
+	pConn := rawConn.(*ProcessStdioConn)
+
+	buf := make([]byte, 8)
+	n, err := pConn.Read(buf)
+	if n != 1 || buf[0] != 'S' || err != nil {
+		_ = pConn.Close()
+		t.Fatalf("Read = (%d, %q, %v), want (1, 'S', nil)", n, buf[:n], err)
+	}
+	n2, err2 := pConn.Read(buf)
+	if n2 != 0 || !errors.Is(err2, io.EOF) {
+		_ = pConn.Close()
+		t.Fatalf("second Read = (%d, %v), want (0, io.EOF)", n2, err2)
+	}
+
+	select {
+	case <-pConn.waitDone:
+	case <-time.After(2 * time.Second):
+		_ = pConn.Close()
+		t.Fatal("timed out waiting for waitDone")
+	}
+	select {
+	case <-pConn.stderrDone:
+	case <-time.After(2 * time.Second):
+		_ = pConn.Close()
+		t.Fatal("timed out waiting for stderrDone")
+	}
+
+	closeStart := time.Now()
+	if err := pConn.Close(); err != nil {
+		t.Fatalf("Close() failed: %v", err)
+	}
+	if elapsed := time.Since(closeStart); elapsed > 1500*time.Millisecond {
+		t.Fatalf("Close() took %v; grandchild holding sentinel FD was not reaped promptly", elapsed)
+	}
+	if got := reapCalls.Load(); got != 1 {
+		t.Fatalf("reapRemainingGroup calls = %d, want 1 even when grandchild closed stdin/stdout/stderr", got)
+	}
 }

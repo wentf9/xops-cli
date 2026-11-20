@@ -1,12 +1,18 @@
 package cmd
 
 import (
+	"bytes"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/core/concurrent"
 	"github.com/wentf9/xops-cli/pkg/config"
+	"github.com/wentf9/xops-cli/pkg/i18n"
+	"github.com/wentf9/xops-cli/pkg/models"
 )
 
 func TestScpOptionsCompletePaths(t *testing.T) {
@@ -354,4 +360,175 @@ func TestScpOptionsInteractionConsistency(t *testing.T) {
 	if o.interaction.promptGate != firstGate {
 		t.Fatal("expected promptGate to remain identical")
 	}
+}
+
+func TestScpBatchZeroDiskMutationAndPositionalInvalidExcludeBeforeNodePrep(t *testing.T) {
+	_ = setupTestEnvironment(t)
+	if err := i18n.Init("zh"); err != nil {
+		t.Fatalf("i18n.Init failed: %v", err)
+	}
+	cfg := &config.Configuration{
+		SchemaVersion: 2,
+		Hosts:         concurrent.NewMap[string, models.Host](concurrent.HashString),
+		Identities:    concurrent.NewMap[string, models.Identity](concurrent.HashString),
+		Nodes:         concurrent.NewMap[string, models.Node](concurrent.HashString),
+		Credential: &config.CredentialConfig{
+			DefaultStore:     "none",
+			RememberPrompted: "always",
+			Stores:           map[string]config.StoreConfig{"none": {Type: config.StoreTypeNone}},
+		},
+	}
+	cfg.Hosts.Set("h-1", models.Host{Address: "10.238.221.181", Port: 22})
+	cfg.Identities.Set("id-1", models.Identity{User: "iaas", AuthType: "auto"})
+	cfg.Nodes.Set("iaas@10.238.221.181:22", models.Node{
+		HostRef:     "h-1",
+		IdentityRef: "id-1",
+		ProxyJump:   "jump-old",
+		Alias:       []string{"web-1"},
+		Tags:        []string{"prod"},
+	})
+	path, key, err := utils.GetConfigFilePath()
+	if err != nil {
+		t.Fatalf("GetConfigFilePath: %v", err)
+	}
+	store := config.NewDefaultStore(path, key)
+	if err := store.Save(cfg); err != nil {
+		t.Fatalf("store.Save: %v", err)
+	}
+	_, repo, _, err := utils.GetConfigStore()
+	if err != nil {
+		t.Fatalf("GetConfigStore: %v", err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(before): %v", err)
+	}
+
+	t.Run("batch scp does not persist node updates on disk", func(t *testing.T) {
+		o := NewScpOptions()
+		o.Host = "iaas@10.238.221.181"
+		o.JumpHost = "10.0.0.88:22"
+		o.Remember = "always"
+		o.Source = "./local.txt"
+		o.Dest = "/tmp/remote.txt"
+		o.control.ConfigFile = "none"
+		if err := o.Complete(NewCmdScp(), nil); err != nil {
+			t.Fatalf("Complete(batch): %v", err)
+		}
+		if err := o.Validate(); err != nil {
+			t.Fatalf("Validate(batch): %v", err)
+		}
+		nodeID, mutated, err := o.getOrCreateNodeForPath(t.Context(), repo, PathInfo{
+			Host:     "10.238.221.181",
+			User:     "iaas",
+			Port:     22,
+			IsRemote: true,
+		}, "")
+		if err != nil {
+			t.Fatalf("getOrCreateNodeForPath: %v", err)
+		}
+		if nodeID != "iaas@10.238.221.181:22" || mutated {
+			t.Fatalf("expected existing node without disk mutation, got nodeID=%q mutated=%v", nodeID, mutated)
+		}
+		after, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile(after): %v", err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Fatal("expected batch scp getOrCreateNodeForPath NOT to mutate saved config on disk")
+		}
+	})
+
+	t.Run("positional scp with invalid --exclude fails before node prep", func(t *testing.T) {
+		localSrc := filepath.Join(t.TempDir(), "payload.txt")
+		if err := os.WriteFile(localSrc, []byte("hello"), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		o := NewScpOptions()
+		o.JumpHost = "10.0.0.99:22"
+		o.Remember = "always"
+		o.Exclude = []string{"nonexistent-exclude-node"}
+		o.control.ConfigFile = "none"
+		args := []string{localSrc, "iaas@10.238.221.181:/tmp/remote.txt"}
+		if err := o.Complete(NewCmdScp(), args); err != nil {
+			t.Fatalf("Complete(positional): %v", err)
+		}
+		if err := o.Validate(); err != nil {
+			t.Fatalf("Validate(positional): %v", err)
+		}
+		err := o.runTransfer(t.Context(), repo, nil)
+		if err == nil || !strings.Contains(err.Error(), "no matching node") {
+			t.Fatalf("expected fail-closed exclude error before node prep, got: %v", err)
+		}
+		after, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile(after): %v", err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Fatal("expected positional scp with invalid --exclude NOT to mutate disk before failing")
+		}
+	})
+}
+
+func TestScp_SingleHostBatchMode_CanonicalOriginalHost_AndValidateExcludesFailClosed(t *testing.T) {
+	t.Run("single --host enters batch mode cleanly across Complete and credentialConnector", func(t *testing.T) {
+		cfg := config.NewProviderWithoutOpenSSH(nil).Snapshot()
+		prov := config.NewProviderWithoutOpenSSH(cfg)
+		o := NewScpOptions()
+		o.Host = "10.0.0.55"
+		o.Remember = "always"
+		if !o.isBatchMode() {
+			t.Fatal("expected single --host to report isBatchMode() == true")
+		}
+		if _, err := o.credentialConnectorWithInteraction(prov, cfg, newCLIInteractionHandler()); err != nil {
+			t.Fatalf("credentialConnectorWithInteraction single host: %v", err)
+		}
+	})
+
+	t.Run("resolvePathTargetAndHosts preserves canonical OriginalHost on PathInfo", func(t *testing.T) {
+		p := PathInfo{IsRemote: true, Host: "short", Path: "/tmp/file"}
+		o := NewScpOptions()
+		o.canonicalCache = map[string]config.CanonicalizeResult{
+			o.canonicalCacheKey(p): {
+				Canonicalized: true,
+				OriginalHost:  "short",
+				CanonicalHost: "short.corp.example.com",
+			},
+		}
+		sshCfgPath := filepath.Join(t.TempDir(), "ssh_config")
+		if err := os.WriteFile(sshCfgPath, []byte("Host short\n  User alice\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		parser, err := config.NewOpenSSHParserFromPath(sshCfgPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prov := config.NewProviderWithOpenSSHParser(nil, parser)
+
+		target, origHost, _, ok := o.resolvePathTargetAndHosts(prov, p)
+		if !ok {
+			t.Fatal("expected resolvePathTargetAndHosts ok == true")
+		}
+		if target.OriginalHost != "short" || origHost != "short" {
+			t.Fatalf("canonical OriginalHost mismatch: target=%+v origHost=%q", target, origHost)
+		}
+	})
+
+	t.Run("validateTransferExcludes fails closed on ambiguous positional remote host", func(t *testing.T) {
+		cfg := config.NewProviderWithoutOpenSSH(nil).Snapshot()
+		cfg.Hosts.Set("10.0.0.1:22", models.Host{Address: "10.0.0.1", Port: 22})
+		cfg.Hosts.Set("10.0.0.2:22", models.Host{Address: "10.0.0.2", Port: 22})
+		cfg.Identities.Set("ops1", models.Identity{User: "ops1", AuthType: "auto"})
+		cfg.Identities.Set("ops2", models.Identity{User: "ops2", AuthType: "auto"})
+		cfg.Nodes.Set("ops1@10.0.0.1:22", models.Node{HostRef: "10.0.0.1:22", IdentityRef: "ops1", Alias: []string{"shared-host"}})
+		cfg.Nodes.Set("ops2@10.0.0.2:22", models.Node{HostRef: "10.0.0.2:22", IdentityRef: "ops2", Alias: []string{"shared-host"}})
+		prov := config.NewProviderWithoutOpenSSH(cfg)
+
+		o := NewScpOptions()
+		o.Exclude = []string{"ops1@10.0.0.1:22"}
+		err := o.validateTransferExcludes(prov, PathInfo{IsRemote: false, Path: "/tmp/local"}, PathInfo{IsRemote: true, Host: "shared-host", Path: "/tmp/remote"})
+		if err == nil {
+			t.Fatal("expected validateTransferExcludes to fail closed on ambiguous host")
+		}
+	})
 }

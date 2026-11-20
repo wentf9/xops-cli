@@ -986,3 +986,33 @@ func assertPhase5UnsafeNodeIDsFailClosed(t *testing.T) {
 		}
 	}
 }
+
+func TestRunPostAuthLocalCommand_SkippedWhenMultiplexed(t *testing.T) {
+	var localCalls atomic.Int32
+	c := &Client{
+		muxSocketPath: "/tmp/mux-slave-test.sock",
+		environment: Environment{
+			LocalUser: "localdev",
+			RunLocalCommand: func(context.Context, string) error {
+				localCalls.Add(1)
+				return nil
+			},
+		},
+		connCfg: ConnectionConfig{
+			NodeID:  "mux-node",
+			Address: "10.0.0.1",
+			Port:    22,
+			User:    "ops",
+			Options: MustOptions(OptionPermitLocalCommand, "yes", OptionLocalCommand, "echo hi"),
+		},
+	}
+	if !c.IsMultiplexed() {
+		t.Fatal("expected IsMultiplexed() == true when muxSocketPath is set")
+	}
+	if err := c.RunPostAuthLocalCommand(t.Context()); err != nil {
+		t.Fatalf("RunPostAuthLocalCommand(multiplexed) returned error: %v", err)
+	}
+	if localCalls.Load() != 0 {
+		t.Fatalf("expected multiplexed client to skip LocalCommand, got %d calls", localCalls.Load())
+	}
+}

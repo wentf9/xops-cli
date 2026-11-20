@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/models"
 	fileutils "github.com/wentf9/xops-cli/pkg/utils/file"
@@ -20,6 +21,7 @@ import (
 type ConnectionTarget struct {
 	Selector     string
 	RawSelector  string
+	OriginalHost string
 	User         string
 	HasUser      bool
 	Port         uint16
@@ -59,15 +61,16 @@ type ResolvedTarget struct {
 	MatchedNodeID string
 	// BaseNodeID is the saved or OpenSSH virtual node ID matched by Selector
 	// before applying user/port overrides, if any.
-	BaseNodeID   string
-	Host         string
-	Port         uint16
-	User         string
-	ProxyJump    string
-	KeyPath      string
-	OpenSSHAlias string
-	Provenance   NodeProvenance
-	Created      bool
+	BaseNodeID    string
+	Host          string
+	Port          uint16
+	User          string
+	ProxyJump     string
+	KeyPath       string
+	OpenSSHAlias  string
+	CanonicalHost string
+	Provenance    NodeProvenance
+	Created       bool
 }
 
 type canonicalTargetInfo struct {
@@ -78,6 +81,7 @@ type canonicalTargetInfo struct {
 	ProxyJump            string
 	DefaultUser          string
 	OpenSSHAlias         string
+	CanonicalHost        string
 	AmbiguousDefaultUser bool
 	AmbiguousCandidates  []string
 }
@@ -156,11 +160,6 @@ func HasOpenSSHConfig(provider ConfigProvider) bool {
 	return r != nil && r.provider != nil && r.provider.openSSH != nil && r.provider.openSSH.cfg != nil
 }
 
-type openSSHAliasStore interface {
-	SetNodeOpenSSHAlias(nodeID, alias string)
-	NodeOpenSSHAlias(nodeID string) string
-}
-
 func resolveTargetHelper(provider ConfigProvider) (*Repository, *Configuration) {
 	if provider == nil {
 		return nil, nil
@@ -170,6 +169,9 @@ func resolveTargetHelper(provider ConfigProvider) (*Repository, *Configuration) 
 	}
 	if p, ok := provider.(*Provider); ok && p != nil {
 		return &Repository{provider: p}, p.Snapshot()
+	}
+	if ov, ok := provider.(*openSSHOverrideProvider); ok && ov != nil && ov.repo != nil {
+		return ov.repo, ov.repo.Snapshot()
 	}
 	if fr, ok := provider.(*frozenRepository); ok && fr != nil {
 		return resolveTargetHelper(fr.ConfigProvider)
@@ -192,16 +194,50 @@ func resolveTargetHelper(provider ConfigProvider) (*Repository, *Configuration) 
 	return &Repository{provider: p}, snap
 }
 
-func recordResolvedOpenSSHAlias(r *Repository, provider ConfigProvider, nodeID, alias string) {
-	if nodeID == "" || alias == "" {
-		return
+func normalizeOriginalHost(raw string) string {
+	orig := strings.TrimSpace(UnwrapOpenSSHSelector(raw))
+	if orig == "" {
+		return ""
 	}
-	if r != nil {
-		r.SetNodeOpenSSHAlias(nodeID, alias)
+	if parsedHost, _, _, err := parseOpenSSHHostSpec(orig); err == nil && parsedHost != "" {
+		orig = parsedHost
 	}
-	if store, ok := provider.(openSSHAliasStore); ok {
-		store.SetNodeOpenSSHAlias(nodeID, alias)
+	return strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(orig), "]"), "[")
+}
+
+func canonicalOriginalAlias(parser *OpenSSHParser, rawOrig, lookupHost string) string {
+	orig := normalizeOriginalHost(rawOrig)
+	cleanLookup := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(lookupHost), "]"), "[")
+	if orig != "" && !strings.EqualFold(orig, cleanLookup) {
+		return orig
 	}
+	return resolveOpenSSHAliasName(parser, lookupHost)
+}
+
+func backfillCanonicalTargetMetadata(target ConnectionTarget, candidateHost string, openSSHAlias, canonicalHost *string) {
+	canon := canonicalTargetHost(target, candidateHost)
+	if canonicalHost != nil && *canonicalHost == "" && canon != "" {
+		*canonicalHost = canon
+	}
+	if openSSHAlias != nil && *openSSHAlias == "" && canon != "" {
+		if orig := normalizeOriginalHost(target.OriginalHost); orig != "" {
+			*openSSHAlias = orig
+		}
+	}
+}
+
+func resolveVirtualNodeForTarget(parser *OpenSSHParser, lookupHost string, target ConnectionTarget) (models.Node, models.Host, models.Identity, error) {
+	if parser == nil {
+		parser = &OpenSSHParser{}
+	}
+	cleanHost, inlineUser, inlinePort, err := parseOpenSSHHostSpec(lookupHost)
+	if err != nil {
+		cleanHost = lookupHost
+	}
+	if orig := normalizeOriginalHost(target.OriginalHost); orig != "" && !strings.EqualFold(orig, cleanHost) {
+		return parser.getVirtualNodeWithCanonical(orig, cleanHost, inlineUser, inlinePort, lookupHost)
+	}
+	return parser.GetVirtualNode(lookupHost)
 }
 
 func normalizeTargetSelector(cfg *Configuration, lookup map[string][]string, aliases map[string]string, target ConnectionTarget) (ConnectionTarget, string) {
@@ -266,6 +302,7 @@ type targetDecision struct {
 	MatchedNodeID    string
 	BaseNodeID       string
 	OpenSSHAlias     string
+	CanonicalHost    string
 	Canonical        canonicalTargetInfo
 	EffectiveUser    string
 	EffectivePort    uint16
@@ -292,7 +329,7 @@ func ResolveTarget(provider ConfigProvider, target ConnectionTarget) (ResolvedTa
 		return ResolvedTarget{}, err
 	}
 	if !decision.NeedsCreation {
-		return r.buildMatchedResolvedTarget(provider, decision.MatchedNodeID, decision.BaseNodeID, decision.OpenSSHAlias, decision.NormalizedTarget)
+		return r.buildMatchedResolvedTarget(provider, decision.MatchedNodeID, decision.BaseNodeID, decision.OpenSSHAlias, decision.CanonicalHost, decision.NormalizedTarget)
 	}
 	return r.buildCreatedResolvedTargetWithUserPort(provider, cfg, decision.Canonical, decision.EffectiveUser, decision.EffectivePort, decision.NormalizedTarget)
 }
@@ -336,10 +373,18 @@ func (r *Repository) evaluateTargetDecision(
 	}
 	if decision.NeedsCreation {
 		targetNodeID := FormatNodeID(decision.EffectiveUser, decision.Canonical.Address, decision.EffectivePort)
-		if _, exists := cfg.Nodes.Get(targetNodeID); exists {
+		if node, exists := cfg.Nodes.Get(targetNodeID); exists {
 			if decision.BaseNodeID == "" {
 				decision.BaseNodeID = targetNodeID
 			}
+			alias, canon := r.effectiveNodeMetadata(targetNodeID, node)
+			if decision.OpenSSHAlias == "" {
+				decision.OpenSSHAlias = alias
+			}
+			if decision.CanonicalHost == "" {
+				decision.CanonicalHost = canon
+			}
+			backfillCanonicalTargetMetadata(decision.NormalizedTarget, decision.Selector, &decision.OpenSSHAlias, &decision.CanonicalHost)
 			decision.MatchedNodeID = targetNodeID
 			decision.NeedsCreation = false
 		}
@@ -364,7 +409,7 @@ func (r *Repository) resolveExplicitOpenSSHVirtualTarget(
 		return targetDecision{}, true, fmt.Errorf("parse openssh host %q failed: %w", selector, err)
 	}
 	parser := r.openSSHParserOrEmpty()
-	vnode, vhost, vident, err := parser.GetVirtualNode(lookupHost)
+	vnode, vhost, vident, err := resolveVirtualNodeForTarget(parser, lookupHost, target)
 	if err != nil {
 		return targetDecision{}, true, fmt.Errorf("resolve openssh host %q: %w", clean, err)
 	}
@@ -397,14 +442,17 @@ func (r *Repository) resolveExplicitOpenSSHVirtualTarget(
 		matchedID = OpenSSHNodePrefix + lookupHost
 	}
 
+	openSSHAlias := canonicalOriginalAlias(parser, target.OriginalHost, lookupHost)
+	canonicalHost := canonicalTargetHost(target, lookupHost)
 	canonicalInfo := canonicalTargetInfo{
-		BaseNodeID:   OpenSSHNodePrefix + lookupHost,
-		Address:      strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(vhost.Address), "]"), "["),
-		Port:         basePort,
-		IdentityFile: vident.KeyPath,
-		ProxyJump:    vnode.ProxyJump,
-		DefaultUser:  baseUser,
-		OpenSSHAlias: resolveOpenSSHAliasName(parser, clean),
+		BaseNodeID:    OpenSSHNodePrefix + lookupHost,
+		Address:       strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(vhost.Address), "]"), "["),
+		Port:          basePort,
+		IdentityFile:  vident.KeyPath,
+		ProxyJump:     vnode.ProxyJump,
+		DefaultUser:   baseUser,
+		OpenSSHAlias:  openSSHAlias,
+		CanonicalHost: canonicalHost,
 	}
 	return targetDecision{
 		NormalizedTarget: target,
@@ -412,10 +460,38 @@ func (r *Repository) resolveExplicitOpenSSHVirtualTarget(
 		MatchedNodeID:    matchedID,
 		BaseNodeID:       canonicalInfo.BaseNodeID,
 		OpenSSHAlias:     canonicalInfo.OpenSSHAlias,
+		CanonicalHost:    canonicalInfo.CanonicalHost,
 		Canonical:        canonicalInfo,
 		EffectiveUser:    effectiveUser,
 		EffectivePort:    effectivePort,
 	}, true, nil
+}
+
+func (r *Repository) savedNodeDecision(
+	cfg *Configuration,
+	target ConnectionTarget,
+	selector, matchedID, baseID, openSSHAlias, canonHost string,
+) targetDecision {
+	node, _ := cfg.Nodes.Get(matchedID)
+	nodeAlias, nodeCanon := r.effectiveNodeMetadata(matchedID, node)
+	if openSSHAlias == "" {
+		openSSHAlias = nodeAlias
+	}
+	if canonHost == "" {
+		canonHost = nodeCanon
+	}
+	backfillCanonicalTargetMetadata(target, selector, &openSSHAlias, &canonHost)
+	if baseID == "" {
+		baseID = matchedID
+	}
+	return targetDecision{
+		NormalizedTarget: target,
+		Selector:         selector,
+		MatchedNodeID:    matchedID,
+		BaseNodeID:       baseID,
+		OpenSSHAlias:     openSSHAlias,
+		CanonicalHost:    canonHost,
+	}
 }
 
 func (r *Repository) evaluateBareTargetDecision(
@@ -430,38 +506,30 @@ func (r *Repository) evaluateBareTargetDecision(
 		return decision, err
 	}
 	if _, exists := cfg.Nodes.Get(selector); exists {
-		return targetDecision{
-			NormalizedTarget: target,
-			Selector:         selector,
-			MatchedNodeID:    selector,
-			BaseNodeID:       selector,
-		}, nil
+		return r.savedNodeDecision(cfg, target, selector, selector, selector, "", ""), nil
 	}
 	if nid, ok := aliases[selector]; ok && nid != "" {
-		return targetDecision{
-			NormalizedTarget: target,
-			Selector:         selector,
-			MatchedNodeID:    nid,
-			BaseNodeID:       nid,
-		}, nil
+		return r.savedNodeDecision(cfg, target, selector, nid, nid, "", ""), nil
 	}
 	candidates := lookup[selector]
 	switch len(candidates) {
 	case 1:
-		return targetDecision{
-			NormalizedTarget: target,
-			Selector:         selector,
-			MatchedNodeID:    candidates[0],
-			BaseNodeID:       candidates[0],
-		}, nil
+		return r.savedNodeDecision(cfg, target, selector, candidates[0], candidates[0], "", ""), nil
 	case 0:
-		if nid, alias, ok := r.matchBareOpenSSHSelector(selector); ok {
+		nid, alias, vErr := r.matchBareOpenSSHSelector(selector, target)
+		if vErr != nil {
+			return targetDecision{}, vErr
+		}
+		if nid != "" {
+			canonHost := canonicalTargetHost(target, selector)
+			backfillCanonicalTargetMetadata(target, selector, &alias, &canonHost)
 			return targetDecision{
 				NormalizedTarget: target,
 				Selector:         selector,
 				MatchedNodeID:    nid,
 				BaseNodeID:       nid,
 				OpenSSHAlias:     alias,
+				CanonicalHost:    canonHost,
 			}, nil
 		}
 		canonicalInfo, err := r.resolveCanonicalTargetInfo(cfg, lookup, aliases, selector, target)
@@ -481,6 +549,7 @@ func (r *Repository) evaluateBareTargetDecision(
 			Selector:         selector,
 			BaseNodeID:       canonicalInfo.BaseNodeID,
 			OpenSSHAlias:     canonicalInfo.OpenSSHAlias,
+			CanonicalHost:    canonicalInfo.CanonicalHost,
 			Canonical:        canonicalInfo,
 			EffectiveUser:    effectiveUser,
 			EffectivePort:    effectivePort,
@@ -534,34 +603,39 @@ func (r *Repository) evaluateExplicitTargetDecision(
 		if baseID == "" {
 			baseID = matches[0]
 		}
-		return targetDecision{
-			NormalizedTarget: target,
-			Selector:         selector,
-			MatchedNodeID:    matches[0],
-			BaseNodeID:       baseID,
-			OpenSSHAlias:     canonicalInfo.OpenSSHAlias,
-			Canonical:        canonicalInfo,
-			EffectiveUser:    effectiveUser,
-			EffectivePort:    effectivePort,
-		}, nil
+		decision := r.savedNodeDecision(cfg, target, selector, matches[0], baseID, canonicalInfo.OpenSSHAlias, canonicalInfo.CanonicalHost)
+		decision.Canonical = canonicalInfo
+		decision.EffectiveUser = effectiveUser
+		decision.EffectivePort = effectivePort
+		return decision, nil
 	case 0:
-		if nid, alias := r.matchOpenSSHVirtualNode(selector, effectiveUser, effectivePort); nid != "" {
-			return targetDecision{
-				NormalizedTarget: target,
-				Selector:         selector,
-				MatchedNodeID:    nid,
-				BaseNodeID:       nid,
-				OpenSSHAlias:     alias,
-				Canonical:        canonicalInfo,
-				EffectiveUser:    effectiveUser,
-				EffectivePort:    effectivePort,
-			}, nil
+		if canonicalInfo.BaseNodeID == "" || IsOpenSSHNodeID(canonicalInfo.BaseNodeID) {
+			nid, alias, vErr := r.matchOpenSSHVirtualNode(selector, effectiveUser, effectivePort, canonicalInfo.Address, target)
+			if vErr != nil {
+				return targetDecision{}, vErr
+			}
+			if nid != "" {
+				canonHost := canonicalTargetHost(target, selector)
+				backfillCanonicalTargetMetadata(target, selector, &alias, &canonHost)
+				return targetDecision{
+					NormalizedTarget: target,
+					Selector:         selector,
+					MatchedNodeID:    nid,
+					BaseNodeID:       nid,
+					OpenSSHAlias:     alias,
+					CanonicalHost:    canonHost,
+					Canonical:        canonicalInfo,
+					EffectiveUser:    effectiveUser,
+					EffectivePort:    effectivePort,
+				}, nil
+			}
 		}
 		return targetDecision{
 			NormalizedTarget: target,
 			Selector:         selector,
 			BaseNodeID:       canonicalInfo.BaseNodeID,
 			OpenSSHAlias:     canonicalInfo.OpenSSHAlias,
+			CanonicalHost:    canonicalInfo.CanonicalHost,
 			Canonical:        canonicalInfo,
 			EffectiveUser:    effectiveUser,
 			EffectivePort:    effectivePort,
@@ -574,11 +648,11 @@ func (r *Repository) evaluateExplicitTargetDecision(
 
 func (r *Repository) buildMatchedResolvedTarget(
 	provider ConfigProvider,
-	matchedID, baseID, openSSHAlias string,
+	matchedID, baseID, openSSHAlias, canonicalHost string,
 	target ConnectionTarget,
 ) (ResolvedTarget, error) {
-	if openSSHAlias != "" {
-		recordResolvedOpenSSHAlias(r, provider, matchedID, openSSHAlias)
+	if IsOpenSSHNodeID(matchedID) {
+		return r.buildMatchedOpenSSHResolvedTarget(provider, matchedID, baseID, openSSHAlias, canonicalHost, target)
 	}
 	node, host, ident, err := provider.Resolve(matchedID)
 	if err != nil {
@@ -595,28 +669,15 @@ func (r *Repository) buildMatchedResolvedTarget(
 			user = defUser
 		}
 	}
-	jump := node.ProxyJump
-	if target.HasProxyJump {
-		jump = strings.TrimSpace(target.ProxyJump)
-		if jump != "" {
-			if resolvedJump, jErr := provider.ResolveProxyJumpChain(jump); jErr == nil {
-				jump = resolvedJump
-			}
-		}
-	}
+	jump := normalizeTargetJump(provider, node.ProxyJump, target)
 	alias := openSSHAlias
 	if alias == "" {
 		alias = r.effectiveNodeOpenSSHAlias(matchedID, node)
 	}
-	if alias == "" && strings.HasPrefix(matchedID, OpenSSHNodePrefix) {
-		if r.provider != nil && r.provider.openSSH != nil {
-			alias = resolveOpenSSHAliasName(r.provider.openSSH, matchedID)
-		}
+	if canonicalHost == "" {
+		canonicalHost = r.effectiveNodeCanonicalHost(matchedID, node)
 	}
-	prov := ProvenanceSavedManaged
-	if IsOpenSSHNodeID(matchedID) {
-		prov = ProvenanceOpenSSHVirtual
-	}
+	backfillCanonicalTargetMetadata(target, target.Selector, &alias, &canonicalHost)
 	return ResolvedTarget{
 		NodeID:        matchedID,
 		MatchedNodeID: matchedID,
@@ -627,9 +688,84 @@ func (r *Repository) buildMatchedResolvedTarget(
 		ProxyJump:     jump,
 		KeyPath:       ident.KeyPath,
 		OpenSSHAlias:  alias,
-		Provenance:    prov,
+		CanonicalHost: canonicalHost,
+		Provenance:    ProvenanceSavedManaged,
 		Created:       false,
 	}, nil
+}
+
+func (r *Repository) buildMatchedOpenSSHResolvedTarget(
+	provider ConfigProvider,
+	matchedID, baseID, openSSHAlias, canonicalHost string,
+	target ConnectionTarget,
+) (ResolvedTarget, error) {
+	cleanMatched := strings.TrimPrefix(matchedID, OpenSSHNodePrefix)
+	lookupHost, inlineUser, inlinePort, parseErr := parseOpenSSHHostSpec(cleanMatched)
+	if parseErr != nil {
+		return ResolvedTarget{}, fmt.Errorf("parse openssh host %q failed: %w", cleanMatched, parseErr)
+	}
+	parser := r.openSSHParserOrEmpty()
+	node, host, ident, err := resolveVirtualNodeForTarget(parser, lookupHost, target)
+	if err != nil {
+		return ResolvedTarget{}, err
+	}
+	cleanAddr := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(host.Address), "]"), "[")
+	port := host.Port
+	if target.HasPort && target.Port > 0 {
+		port = target.Port
+	} else if inlinePort != 0 {
+		port = inlinePort
+	}
+	if port == 0 {
+		port = 22
+	}
+	user := ident.User
+	if target.HasUser && strings.TrimSpace(target.User) != "" {
+		user = strings.TrimSpace(target.User)
+	} else if inlineUser != "" {
+		user = inlineUser
+	}
+	if user == "" {
+		if defUser, uErr := resolveEffectiveUser(target, "", ""); uErr == nil {
+			user = defUser
+		}
+	}
+	jump := normalizeTargetJump(provider, node.ProxyJump, target)
+	alias := openSSHAlias
+	if alias == "" {
+		alias = canonicalOriginalAlias(parser, target.OriginalHost, lookupHost)
+	}
+	backfillCanonicalTargetMetadata(target, lookupHost, &alias, &canonicalHost)
+	return ResolvedTarget{
+		NodeID:        matchedID,
+		MatchedNodeID: matchedID,
+		BaseNodeID:    baseID,
+		Host:          cleanAddr,
+		Port:          port,
+		User:          user,
+		ProxyJump:     jump,
+		KeyPath:       ident.KeyPath,
+		OpenSSHAlias:  alias,
+		CanonicalHost: canonicalHost,
+		Provenance:    ProvenanceOpenSSHVirtual,
+		Created:       false,
+	}, nil
+}
+
+func normalizeTargetJump(provider ConfigProvider, baseJump string, target ConnectionTarget) string {
+	jump := baseJump
+	if target.HasProxyJump {
+		jump = strings.TrimSpace(target.ProxyJump)
+		if ssh.IsDisabledProxyJump(jump) {
+			return ""
+		}
+		if jump != "" && provider != nil {
+			if resolvedJump, jErr := provider.ResolveProxyJumpChain(jump); jErr == nil {
+				jump = resolvedJump
+			}
+		}
+	}
+	return jump
 }
 
 func (r *Repository) buildCreatedResolvedTargetWithUserPort(
@@ -646,13 +782,13 @@ func (r *Repository) buildCreatedResolvedTargetWithUserPort(
 		if baseID == "" {
 			baseID = targetNodeID
 		}
-		return r.buildMatchedResolvedTarget(provider, targetNodeID, baseID, canonicalInfo.OpenSSHAlias, target)
+		return r.buildMatchedResolvedTarget(provider, targetNodeID, baseID, canonicalInfo.OpenSSHAlias, canonicalInfo.CanonicalHost, target)
 	}
 	jump, err := r.resolveJumpForNode(cfg, EnsureNodeOptions{Target: target}, canonicalInfo, canonicalInfo.Address, effectivePort)
 	if err != nil {
 		if target.HasProxyJump {
 			jump = strings.TrimSpace(target.ProxyJump)
-			if strings.EqualFold(jump, "none") {
+			if ssh.IsDisabledProxyJump(jump) {
 				jump = ""
 			}
 		} else {
@@ -660,6 +796,7 @@ func (r *Repository) buildCreatedResolvedTargetWithUserPort(
 		}
 	}
 	openSSHAlias := canonicalInfo.OpenSSHAlias
+	canonHost := canonicalInfo.CanonicalHost
 	keyPath := NormalizePersistableIdentityPath(canonicalInfo.IdentityFile)
 	if pNode, _, pIdent, ok := r.resolvePendingNode(targetNodeID); ok {
 		if !target.HasProxyJump && jump == "" && pNode.ProxyJump != "" {
@@ -671,9 +808,9 @@ func (r *Repository) buildCreatedResolvedTargetWithUserPort(
 		if openSSHAlias == "" && pNode.OpenSSHAlias != "" {
 			openSSHAlias = pNode.OpenSSHAlias
 		}
-	}
-	if openSSHAlias != "" {
-		recordResolvedOpenSSHAlias(r, provider, targetNodeID, openSSHAlias)
+		if canonHost == "" && pNode.CanonicalHost != "" {
+			canonHost = pNode.CanonicalHost
+		}
 	}
 	prov := ProvenanceAdHocPending
 	if openSSHAlias != "" {
@@ -689,9 +826,17 @@ func (r *Repository) buildCreatedResolvedTargetWithUserPort(
 		ProxyJump:     jump,
 		KeyPath:       keyPath,
 		OpenSSHAlias:  openSSHAlias,
+		CanonicalHost: canonHost,
 		Provenance:    prov,
 		Created:       true,
 	}, nil
+}
+
+type ensureTransactionOutcome struct {
+	nodeID        string
+	created       bool
+	openSSHAlias  string
+	canonicalHost string
 }
 
 // EnsureNodeContext ensures a node matching the target intent exists. If not, it
@@ -711,22 +856,39 @@ func (r *Repository) EnsureNodeContext(ctx context.Context, opts EnsureNodeOptio
 
 	explicitDefaultUser := strings.TrimSpace(opts.DefaultUser)
 
-	// 1. Read-only fast-path check
-	if existingID, isAmbiguous, err := r.findExistingNodeFast(target, explicitDefaultUser); err != nil {
-		return EnsureNodeResult{}, err
-	} else if isAmbiguous {
-		return EnsureNodeResult{}, err
-	} else if existingID != "" {
-		return EnsureNodeResult{NodeID: existingID, Created: false}, nil
+	// 1. Fast-path check: inspect read-only first, then sync session metadata under pendingMu.
+	r.pendingMu.Lock()
+	decision, fastErr := r.findExistingNodeDecision(target, explicitDefaultUser)
+	if fastErr != nil {
+		r.pendingMu.Unlock()
+		return EnsureNodeResult{}, fastErr
 	}
+	if !decision.NeedsCreation && decision.MatchedNodeID != "" {
+		r.syncPreparedExistingMetadataLocked(decision)
+		r.pendingMu.Unlock()
+		return EnsureNodeResult{NodeID: decision.MatchedNodeID, Created: false}, nil
+	}
+	r.pendingMu.Unlock()
 
 	// 2. Perform atomic ensure in mutation transaction.
-	var finalNodeID string
-	var createdNode bool
+	var outcome ensureTransactionOutcome
+	action := &publishAction{
+		applyProviderLocked: func(p *Provider, updated *Configuration) {
+			if p == nil || updated == nil || updated.Nodes == nil {
+				return
+			}
+			if _, exists := updated.Nodes.Get(outcome.nodeID); !exists {
+				return
+			}
+			p.setOpenSSHMetadataLocked(outcome.nodeID, outcome.openSSHAlias, outcome.canonicalHost)
+		},
+	}
 
-	result, commitErr := r.commitResultContext(ctx, anyRevision, func(cfg *Configuration) error {
-		return r.ensureTargetInTransaction(cfg, opts, explicitDefaultUser, &finalNodeID, &createdNode)
-	})
+	result, commitErr := r.commitResultWithPublishAction(ctx, anyRevision, func(cfg *Configuration) error {
+		return r.ensureTargetInTransaction(cfg, opts, explicitDefaultUser, &outcome)
+	}, action)
+	finalNodeID := outcome.nodeID
+	createdNode := outcome.created
 
 	mutation := NodeMutation{
 		Outcome: MutationOutcome{Applied: result.Applied, Durable: result.Durable},
@@ -758,8 +920,7 @@ func (r *Repository) ensureTargetInTransaction(
 	cfg *Configuration,
 	opts EnsureNodeOptions,
 	explicitDefaultUser string,
-	finalNodeID *string,
-	createdNode *bool,
+	outcome *ensureTransactionOutcome,
 ) error {
 	lookup, aliases, err := buildIndexes(cfg, false)
 	if err != nil {
@@ -770,16 +931,17 @@ func (r *Repository) ensureTargetInTransaction(
 		return err
 	}
 	if !decision.NeedsCreation {
-		if decision.OpenSSHAlias != "" {
-			r.SetNodeOpenSSHAlias(decision.MatchedNodeID, decision.OpenSSHAlias)
+		*outcome = ensureTransactionOutcome{
+			nodeID:        decision.MatchedNodeID,
+			created:       false,
+			openSSHAlias:  decision.OpenSSHAlias,
+			canonicalHost: decision.CanonicalHost,
 		}
-		*finalNodeID = decision.MatchedNodeID
-		*createdNode = false
 		return nil
 	}
 	txOpts := opts
 	txOpts.Target = decision.NormalizedTarget
-	return r.createNodeInTransaction(cfg, txOpts, decision.Canonical, decision.EffectiveUser, decision.EffectivePort, finalNodeID, createdNode)
+	return r.createNodeInTransaction(cfg, txOpts, decision.Canonical, decision.EffectiveUser, decision.EffectivePort, outcome)
 }
 
 func narrowMatchingNodesBySelector(matches []string, aliases map[string]string, selectors ...string) []string {
@@ -825,67 +987,103 @@ func resolveOpenSSHAliasName(parser *OpenSSHParser, spec string) string {
 	return ""
 }
 
-func (r *Repository) matchBareOpenSSHSelector(selector string) (string, string, bool) {
+func (r *Repository) matchBareOpenSSHSelector(selector string, target ConnectionTarget) (string, string, error) {
+	parser := r.openSSHParserOrEmpty()
+	if err := parser.Err(); err != nil {
+		return "", "", fmt.Errorf("resolve openssh host %q: %w", selector, err)
+	}
 	if strings.HasPrefix(selector, OpenSSHNodePrefix) {
 		clean := strings.TrimSpace(strings.TrimPrefix(selector, OpenSSHNodePrefix))
 		if clean == "" {
-			return "", "", false
+			return "", "", nil
 		}
-		parser := r.openSSHParserOrEmpty()
-		if _, _, _, err := parser.GetVirtualNode(clean); err != nil {
-			return "", "", false
+		if _, _, _, err := resolveVirtualNodeForTarget(parser, clean, target); err != nil {
+			return "", "", nil
 		}
-		return OpenSSHNodePrefix + clean, resolveOpenSSHAliasName(parser, clean), true
+		alias := resolveOpenSSHAliasName(parser, clean)
+		lookupHost, _, _, parseErr := parseOpenSSHHostSpec(clean)
+		if parseErr != nil || lookupHost == "" {
+			lookupHost = clean
+		}
+		if orig := normalizeOriginalHost(target.OriginalHost); orig != "" && !strings.EqualFold(orig, lookupHost) {
+			alias = orig
+		}
+		return OpenSSHNodePrefix + clean, alias, nil
 	}
-	if r != nil && r.provider != nil && r.provider.openSSH != nil && r.provider.openSSH.cfg != nil {
-		if nid, ok := r.provider.openSSH.Find(selector); ok {
-			return nid, resolveOpenSSHAliasName(r.provider.openSSH, nid), true
+	orig := normalizeOriginalHost(target.OriginalHost)
+	hasCanonicalAlias := orig != "" && !strings.EqualFold(orig, selector)
+	if hasCanonicalAlias {
+		if !canonicalVirtualMatchesSinglePass(parser, orig, selector) {
+			return "", "", nil
 		}
 	}
-	return "", "", false
+	if parser != nil && parser.cfg != nil {
+		if nid, ok := parser.Find(selector); ok {
+			alias := resolveOpenSSHAliasName(parser, nid)
+			if hasCanonicalAlias {
+				alias = orig
+			}
+			return nid, alias, nil
+		}
+	}
+	return "", "", nil
 }
 
-func (r *Repository) matchOpenSSHVirtualNode(selector, effectiveUser string, effectivePort uint16) (string, string) {
+func (r *Repository) matchOpenSSHVirtualNode(selector, effectiveUser string, effectivePort uint16, expectedAddr string, target ConnectionTarget) (string, string, error) {
+	parser := r.openSSHParserOrEmpty()
+	if err := parser.Err(); err != nil {
+		return "", "", fmt.Errorf("resolve openssh host %q: %w", selector, err)
+	}
 	if strings.HasPrefix(selector, OpenSSHNodePrefix) {
-		clean := strings.TrimSpace(strings.TrimPrefix(selector, OpenSSHNodePrefix))
-		if clean == "" {
-			return "", ""
-		}
-		parser := r.openSSHParserOrEmpty()
-		_, vhost, vident, err := parser.GetVirtualNode(clean)
-		if err != nil {
-			return "", ""
-		}
-		vport := vhost.Port
-		if vport == 0 {
-			vport = 22
-		}
-		if vident.User == effectiveUser && vport == effectivePort {
-			return OpenSSHNodePrefix + clean, resolveOpenSSHAliasName(parser, clean)
-		}
-		return "", ""
+		return matchExplicitOpenSSHVirtualNode(parser, selector, effectiveUser, effectivePort, target)
 	}
-	if r == nil || r.provider == nil || r.provider.openSSH == nil || r.provider.openSSH.cfg == nil {
-		return "", ""
+	orig := normalizeOriginalHost(target.OriginalHost)
+	hasCanonicalAlias := orig != "" && !strings.EqualFold(orig, selector)
+	if hasCanonicalAlias {
+		if !canonicalVirtualMatchesSinglePass(parser, orig, selector) {
+			return "", "", nil
+		}
 	}
-	if selector == "" || strings.Contains(selector, "@") || strings.Contains(selector, ":") {
-		return "", ""
+	if parser == nil || parser.cfg == nil {
+		return "", "", nil
 	}
-	if !r.provider.openSSH.HasHost(selector) {
-		return "", ""
+	if selector == "" || strings.Contains(selector, "@") || strings.Contains(selector, ":") || !parser.HasHost(selector) {
+		return "", "", nil
 	}
-	_, vhost, vident, err := r.provider.openSSH.GetVirtualNode(selector)
+	_, vhost, vident, err := parser.GetVirtualNode(selector)
 	if err != nil {
-		return "", ""
+		return "", "", nil
 	}
-	vport := vhost.Port
-	if vport == 0 {
-		vport = 22
+	if cleanExpected := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(expectedAddr), "]"), "["); cleanExpected != "" {
+		cleanVHost := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(vhost.Address), "]"), "[")
+		if !strings.EqualFold(cleanExpected, cleanVHost) {
+			return "", "", nil
+		}
 	}
-	if vident.User == effectiveUser && vport == effectivePort {
-		return OpenSSHNodePrefix + selector, selector
+	if vident.User == effectiveUser && normalizedHostPort(vhost.Port) == effectivePort {
+		alias := selector
+		if hasCanonicalAlias {
+			alias = orig
+		}
+		return OpenSSHNodePrefix + selector, alias, nil
 	}
-	return "", ""
+	return "", "", nil
+}
+
+func matchExplicitOpenSSHVirtualNode(parser *OpenSSHParser, selector, effectiveUser string, effectivePort uint16, target ConnectionTarget) (string, string, error) {
+	clean := strings.TrimSpace(strings.TrimPrefix(selector, OpenSSHNodePrefix))
+	if clean == "" {
+		return "", "", nil
+	}
+	_, vhost, vident, err := resolveVirtualNodeForTarget(parser, clean, target)
+	if err != nil {
+		return "", "", nil
+	}
+	if vident.User != effectiveUser || normalizedHostPort(vhost.Port) != effectivePort {
+		return "", "", nil
+	}
+	alias := canonicalOriginalAlias(parser, target.OriginalHost, clean)
+	return OpenSSHNodePrefix + clean, alias, nil
 }
 
 func resolveEffectiveUser(target ConnectionTarget, explicitDefaultUser, canonicalDefaultUser string) (string, error) {
@@ -905,24 +1103,54 @@ func resolveEffectiveUser(target ConnectionTarget, explicitDefaultUser, canonica
 	return curr.Username, nil
 }
 
-// findExistingNodeFast checks in the current snapshot if the node already exists.
-func (r *Repository) findExistingNodeFast(target ConnectionTarget, explicitDefaultUser string) (string, bool, error) {
+// findExistingNodeDecision performs a read-only check in the current snapshot to determine
+// whether target already resolves to a saved or OpenSSH virtual node.
+func (r *Repository) findExistingNodeDecision(target ConnectionTarget, explicitDefaultUser string) (targetDecision, error) {
 	snapshot := r.provider.Snapshot()
 	lookup, aliases, err := buildIndexes(snapshot, false)
 	if err != nil {
-		return "", false, err
+		return targetDecision{}, err
 	}
-	decision, err := r.evaluateTargetDecision(snapshot, lookup, aliases, target, explicitDefaultUser)
-	if err != nil {
-		return "", true, err
+	return r.evaluateTargetDecision(snapshot, lookup, aliases, target, explicitDefaultUser)
+}
+
+// syncPreparedExistingMetadataLocked synchronizes per-node session metadata under r.pendingMu.Lock().
+func (r *Repository) syncPreparedExistingMetadataLocked(decision targetDecision) {
+	id := decision.MatchedNodeID
+	if id == "" || decision.NeedsCreation {
+		return
 	}
-	if !decision.NeedsCreation {
-		if decision.OpenSSHAlias != "" {
-			r.SetNodeOpenSSHAlias(decision.MatchedNodeID, decision.OpenSSHAlias)
+	if IsOpenSSHNodeID(id) {
+		if decision.CanonicalHost != "" {
+			if existing := r.pending[id]; existing != nil && existing.provenance != ProvenanceOpenSSHVirtual {
+				return
+			}
+			var parser *OpenSSHParser
+			if r.provider != nil {
+				parser = r.provider.GetOpenSSHParser()
+			}
+			vp := NewProviderWithOpenSSHParser(nil, parser)
+			if decision.OpenSSHAlias != "" {
+				vp.SetNodeOpenSSHAlias(id, decision.OpenSSHAlias)
+			}
+			vp.SetNodeCanonicalHost(id, decision.CanonicalHost)
+			if r.pending == nil {
+				r.pending = make(map[string]*pendingConnection)
+			}
+			r.pending[id] = &pendingConnection{provider: vp, provenance: ProvenanceOpenSSHVirtual}
+			return
 		}
-		return decision.MatchedNodeID, false, nil
+		if existing := r.pending[id]; existing != nil && existing.provenance == ProvenanceOpenSSHVirtual {
+			delete(r.pending, id)
+		}
+		if r.provider != nil {
+			r.provider.clearNodeOpenSSHMetadata(id)
+		}
+		return
 	}
-	return "", false, nil
+	if r.provider != nil {
+		r.provider.setSavedNodeOpenSSHMetadataIfPresent(id, decision.OpenSSHAlias, decision.CanonicalHost)
+	}
 }
 
 func normalizedHostPort(port uint16) uint16 {
@@ -930,6 +1158,23 @@ func normalizedHostPort(port uint16) uint16 {
 		return 22
 	}
 	return port
+}
+
+func canonicalVirtualMatchesSinglePass(parser *OpenSSHParser, orig, selector string) bool {
+	if parser == nil || parser.cfg == nil {
+		return false
+	}
+	v1, h1, i1, err1 := parser.GetVirtualNodeWithCanonical(orig, selector)
+	v2, h2, i2, err2 := parser.GetVirtualNode(selector)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return h1.Address == h2.Address &&
+		normalizedHostPort(h1.Port) == normalizedHostPort(h2.Port) &&
+		i1.User == i2.User &&
+		i1.KeyPath == i2.KeyPath &&
+		v1.ProxyJump == v2.ProxyJump &&
+		v1.SSHOptions.Equal(v2.SSHOptions)
 }
 
 func normalizedIdentityUser(rawUser string) string {
@@ -971,24 +1216,33 @@ func (r *Repository) resolveCanonicalTargetInfo(cfg *Configuration, lookup map[s
 		if clean == "" {
 			return canonicalTargetInfo{}, fmt.Errorf("parse openssh host %q failed: host is empty", selector)
 		}
+		lookupHost, _, _, parseErr := parseOpenSSHHostSpec(clean)
+		if parseErr != nil || lookupHost == "" {
+			lookupHost = clean
+		}
 		parser := r.openSSHParserOrEmpty()
-		vnode, vhost, vident, err := parser.GetVirtualNode(clean)
+		vnode, vhost, vident, err := resolveVirtualNodeForTarget(parser, clean, target)
 		if err != nil {
 			return canonicalTargetInfo{}, fmt.Errorf("resolve openssh host %q: %w", clean, err)
 		}
+		alias := canonicalOriginalAlias(parser, target.OriginalHost, lookupHost)
+		canonicalHost := canonicalTargetHost(target, lookupHost)
+		backfillCanonicalTargetMetadata(target, lookupHost, &alias, &canonicalHost)
 		return canonicalTargetInfo{
-			BaseNodeID:   OpenSSHNodePrefix + clean,
-			Address:      strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(vhost.Address), "]"), "["),
-			Port:         normalizedHostPort(vhost.Port),
-			IdentityFile: vident.KeyPath,
-			ProxyJump:    vnode.ProxyJump,
-			DefaultUser:  vident.User,
-			OpenSSHAlias: resolveOpenSSHAliasName(parser, clean),
+			BaseNodeID:    OpenSSHNodePrefix + lookupHost,
+			Address:       strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(vhost.Address), "]"), "["),
+			Port:          normalizedHostPort(vhost.Port),
+			IdentityFile:  vident.KeyPath,
+			ProxyJump:     vnode.ProxyJump,
+			DefaultUser:   vident.User,
+			OpenSSHAlias:  alias,
+			CanonicalHost: canonicalHost,
 		}, nil
 	}
 
 	// 1 & 2. Direct Node ID or Alias match (checking RawSelector first when split from user@host:port)
 	if info, ok := r.resolveDirectOrAliasTargetInfo(cfg, aliases, strings.TrimSpace(target.RawSelector), selector); ok {
+		backfillCanonicalTargetMetadata(target, selector, &info.OpenSSHAlias, &info.CanonicalHost)
 		return info, nil
 	}
 
@@ -1004,27 +1258,40 @@ func (r *Repository) resolveCanonicalTargetInfo(cfg *Configuration, lookup map[s
 	if strings.TrimSpace(target.RawSelector) == "" && target.HasUser && target.HasPort && strings.TrimSpace(target.User) != "" && target.Port > 0 {
 		composite := FormatNodeID(strings.TrimSpace(target.User), selector, target.Port)
 		if info, ok := r.resolveDirectOrAliasTargetInfo(cfg, aliases, composite); ok {
+			backfillCanonicalTargetMetadata(target, selector, &info.OpenSSHAlias, &info.CanonicalHost)
 			return info, nil
 		}
 	}
 
 	// 4. OpenSSH configuration match
-	if r != nil && r.provider != nil && r.provider.openSSH != nil && r.provider.openSSH.cfg != nil {
+	parser := r.openSSHParserOrEmpty()
+	if err := parser.Err(); err != nil {
+		return canonicalTargetInfo{}, fmt.Errorf("resolve openssh host %q: %w", selector, err)
+	}
+	if parser.cfg != nil {
 		clean := strings.TrimSpace(strings.TrimPrefix(selector, OpenSSHNodePrefix))
 		allowSpec := strings.HasPrefix(selector, OpenSSHNodePrefix) || (!strings.Contains(clean, "@") && !strings.Contains(clean, ":"))
-		if clean != "" && allowSpec && r.provider.openSSH.HasHost(clean) {
-			vnode, vhost, vident, err := r.provider.openSSH.GetVirtualNode(clean)
+		orig := normalizeOriginalHost(target.OriginalHost)
+		if clean != "" && allowSpec && ((orig != "" && !strings.EqualFold(orig, clean)) || parser.HasHost(clean)) {
+			vnode, vhost, vident, err := resolveVirtualNodeForTarget(parser, clean, target)
 			if err != nil {
 				return canonicalTargetInfo{}, fmt.Errorf("resolve openssh host %q: %w", clean, err)
 			}
+			alias := resolveOpenSSHAliasName(parser, clean)
+			if orig != "" && !strings.EqualFold(orig, clean) {
+				alias = orig
+			}
+			canonHost := canonicalTargetHost(target, clean)
+			backfillCanonicalTargetMetadata(target, clean, &alias, &canonHost)
 			return canonicalTargetInfo{
-				BaseNodeID:   OpenSSHNodePrefix + clean,
-				Address:      strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(vhost.Address), "]"), "["),
-				Port:         vhost.Port,
-				IdentityFile: vident.KeyPath,
-				ProxyJump:    vnode.ProxyJump,
-				DefaultUser:  vident.User,
-				OpenSSHAlias: resolveOpenSSHAliasName(r.provider.openSSH, clean),
+				BaseNodeID:    OpenSSHNodePrefix + clean,
+				Address:       strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(vhost.Address), "]"), "["),
+				Port:          vhost.Port,
+				IdentityFile:  vident.KeyPath,
+				ProxyJump:     vnode.ProxyJump,
+				DefaultUser:   vident.User,
+				OpenSSHAlias:  alias,
+				CanonicalHost: canonHost,
 			}, nil
 		}
 	}
@@ -1037,14 +1304,23 @@ func (r *Repository) resolveCanonicalTargetInfo(cfg *Configuration, lookup map[s
 		if port == 0 {
 			port = 22
 		}
+		cleanHost := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(parsedHost), "]"), "[")
+		var rawAlias string
+		canonHost := canonicalTargetHost(target, cleanHost)
+		backfillCanonicalTargetMetadata(target, cleanHost, &rawAlias, &canonHost)
 		return canonicalTargetInfo{
-			Address:     strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(parsedHost), "]"), "["),
-			Port:        port,
-			DefaultUser: parsedUser,
+			Address:       cleanHost,
+			Port:          port,
+			DefaultUser:   parsedUser,
+			OpenSSHAlias:  rawAlias,
+			CanonicalHost: canonHost,
 		}, nil
 	}
 	clean = strings.TrimPrefix(strings.TrimSuffix(clean, "]"), "[")
-	return canonicalTargetInfo{Address: clean, Port: 22}, nil
+	var rawAlias string
+	canonHost := canonicalTargetHost(target, clean)
+	backfillCanonicalTargetMetadata(target, clean, &rawAlias, &canonHost)
+	return canonicalTargetInfo{Address: clean, Port: 22, OpenSSHAlias: rawAlias, CanonicalHost: canonHost}, nil
 }
 
 func (r *Repository) resolveDirectOrAliasTargetInfo(cfg *Configuration, aliases map[string]string, keys ...string) (canonicalTargetInfo, bool) {
@@ -1064,11 +1340,40 @@ func (r *Repository) resolveDirectOrAliasTargetInfo(cfg *Configuration, aliases 
 	return canonicalTargetInfo{}, false
 }
 
-func (r *Repository) effectiveNodeOpenSSHAlias(nodeID string, node models.Node) string {
-	if node.OpenSSHAlias != "" {
-		return node.OpenSSHAlias
+func (r *Repository) effectiveNodeMetadata(nodeID string, node models.Node) (alias, canon string) {
+	alias = node.OpenSSHAlias
+	canon = node.CanonicalHost
+	if r != nil && r.provider != nil {
+		if alias == "" {
+			alias = r.provider.NodeOpenSSHAlias(nodeID)
+		}
+		if canon == "" {
+			canon = r.provider.NodeCanonicalHost(nodeID)
+		}
 	}
-	return r.NodeOpenSSHAlias(nodeID)
+	return alias, canon
+}
+
+func (r *Repository) effectiveNodeOpenSSHAlias(nodeID string, node models.Node) string {
+	alias, _ := r.effectiveNodeMetadata(nodeID, node)
+	return alias
+}
+
+func (r *Repository) effectiveNodeCanonicalHost(nodeID string, node models.Node) string {
+	_, canon := r.effectiveNodeMetadata(nodeID, node)
+	return canon
+}
+
+func canonicalTargetHost(target ConnectionTarget, candidateHost string) string {
+	cleanOrig := normalizeOriginalHost(target.OriginalHost)
+	if cleanOrig == "" {
+		return ""
+	}
+	cleanCandidate := normalizeOriginalHost(candidateHost)
+	if cleanCandidate == "" || strings.EqualFold(cleanOrig, cleanCandidate) {
+		return ""
+	}
+	return cleanCandidate
 }
 
 func filterCandidatesByExplicitTarget(cfg *Configuration, candidates []string, target ConnectionTarget) []string {
@@ -1117,12 +1422,13 @@ func (r *Repository) resolveCandidateNodeInfo(cfg *Configuration, candidateID st
 		keyPath = ident.KeyPath
 	}
 	return canonicalTargetInfo{
-		BaseNodeID:   candidateID,
-		Address:      clean,
-		Port:         normalizedHostPort(host.Port),
-		IdentityFile: keyPath,
-		DefaultUser:  defUser,
-		OpenSSHAlias: r.effectiveNodeOpenSSHAlias(candidateID, node),
+		BaseNodeID:    candidateID,
+		Address:       clean,
+		Port:          normalizedHostPort(host.Port),
+		IdentityFile:  keyPath,
+		DefaultUser:   defUser,
+		OpenSSHAlias:  r.effectiveNodeOpenSSHAlias(candidateID, node),
+		CanonicalHost: r.effectiveNodeCanonicalHost(candidateID, node),
 	}, true
 }
 
@@ -1144,6 +1450,26 @@ func (r *Repository) consistentCandidateOpenSSHAlias(cfg *Configuration, candida
 		}
 	}
 	return alias
+}
+
+func (r *Repository) consistentCandidateCanonicalHost(cfg *Configuration, candidates []string) string {
+	var canon string
+	for _, cid := range candidates {
+		node, ok := cfg.Nodes.Get(cid)
+		if !ok {
+			continue
+		}
+		nodeCanon := r.effectiveNodeCanonicalHost(cid, node)
+		if nodeCanon == "" {
+			continue
+		}
+		if canon == "" {
+			canon = nodeCanon
+		} else if !strings.EqualFold(canon, nodeCanon) {
+			return ""
+		}
+	}
+	return canon
 }
 
 func (r *Repository) resolveConsistentCandidates(cfg *Configuration, selector string, candidates []string) (canonicalTargetInfo, error) {
@@ -1200,6 +1526,7 @@ func (r *Repository) resolveConsistentCandidates(cfg *Configuration, selector st
 			Port:                 firstPort,
 			DefaultUser:          defUser,
 			OpenSSHAlias:         r.consistentCandidateOpenSSHAlias(cfg, candidates),
+			CanonicalHost:        r.consistentCandidateCanonicalHost(cfg, candidates),
 			AmbiguousDefaultUser: !userConsistent,
 			AmbiguousCandidates:  slices.Clone(candidates),
 		}, nil
@@ -1283,22 +1610,35 @@ func (r *Repository) resolveCandidateAddressFallback(cfg *Configuration, selecto
 		Port:                 effectivePort,
 		DefaultUser:          defUser,
 		OpenSSHAlias:         r.consistentCandidateOpenSSHAlias(cfg, candidates),
+		CanonicalHost:        r.consistentCandidateCanonicalHost(cfg, candidates),
 		AmbiguousDefaultUser: !target.HasUser && !userConsistent,
 		AmbiguousCandidates:  slices.Clone(candidates),
 	}, nil
 }
 
 func (r *Repository) resolveLookupCandidates(cfg *Configuration, selector string, candidates []string, target ConnectionTarget) (canonicalTargetInfo, error) {
+	var (
+		info canonicalTargetInfo
+		err  error
+	)
 	filtered := filterCandidatesByExplicitTarget(cfg, candidates, target)
 	if len(filtered) == 1 {
-		if info, ok := r.resolveCandidateNodeInfo(cfg, filtered[0]); ok {
-			return info, nil
+		if resolvedInfo, ok := r.resolveCandidateNodeInfo(cfg, filtered[0]); ok {
+			info = resolvedInfo
+			goto backfill
 		}
 	}
 	if len(filtered) > 1 {
-		return r.resolveConsistentCandidates(cfg, selector, filtered)
+		info, err = r.resolveConsistentCandidates(cfg, selector, filtered)
+	} else {
+		info, err = r.resolveCandidateAddressFallback(cfg, selector, candidates, target)
 	}
-	return r.resolveCandidateAddressFallback(cfg, selector, candidates, target)
+	if err != nil {
+		return canonicalTargetInfo{}, err
+	}
+backfill:
+	backfillCanonicalTargetMetadata(target, selector, &info.OpenSSHAlias, &info.CanonicalHost)
+	return info, nil
 }
 
 // createNodeInTransaction performs the atomic creation of Host, Identity, and Node.
@@ -1308,17 +1648,17 @@ func (r *Repository) createNodeInTransaction(
 	canonicalInfo canonicalTargetInfo,
 	effectiveUser string,
 	effectivePort uint16,
-	finalNodeID *string,
-	createdNode *bool,
+	outcome *ensureTransactionOutcome,
 ) error {
 	canonicalAddr := canonicalInfo.Address
 	targetNodeID := FormatNodeID(effectiveUser, canonicalAddr, effectivePort)
 	if _, exists := cfg.Nodes.Get(targetNodeID); exists {
-		if canonicalInfo.OpenSSHAlias != "" {
-			r.SetNodeOpenSSHAlias(targetNodeID, canonicalInfo.OpenSSHAlias)
+		*outcome = ensureTransactionOutcome{
+			nodeID:        targetNodeID,
+			created:       false,
+			openSSHAlias:  canonicalInfo.OpenSSHAlias,
+			canonicalHost: canonicalInfo.CanonicalHost,
 		}
-		*finalNodeID = targetNodeID
-		*createdNode = false
 		return nil
 	}
 
@@ -1343,12 +1683,13 @@ func (r *Repository) createNodeInTransaction(
 		sudoMode = opts.SudoMode
 	}
 	newNode := models.Node{
-		HostRef:      hostRef,
-		IdentityRef:  identityRef,
-		ProxyJump:    finalJump,
-		SudoMode:     sudoMode,
-		SuPwd:        opts.SuPwd,
-		OpenSSHAlias: canonicalInfo.OpenSSHAlias,
+		HostRef:       hostRef,
+		IdentityRef:   identityRef,
+		ProxyJump:     finalJump,
+		SudoMode:      sudoMode,
+		SuPwd:         opts.SuPwd,
+		OpenSSHAlias:  canonicalInfo.OpenSSHAlias,
+		CanonicalHost: canonicalInfo.CanonicalHost,
 	}
 	if opts.Alias != "" {
 		trimmedAlias := strings.TrimSpace(opts.Alias)
@@ -1365,11 +1706,12 @@ func (r *Repository) createNodeInTransaction(
 	}
 
 	cfg.Nodes.Set(targetNodeID, newNode)
-	if canonicalInfo.OpenSSHAlias != "" {
-		r.SetNodeOpenSSHAlias(targetNodeID, canonicalInfo.OpenSSHAlias)
+	*outcome = ensureTransactionOutcome{
+		nodeID:        targetNodeID,
+		created:       true,
+		openSSHAlias:  canonicalInfo.OpenSSHAlias,
+		canonicalHost: canonicalInfo.CanonicalHost,
 	}
-	*finalNodeID = targetNodeID
-	*createdNode = true
 	return nil
 }
 
@@ -1722,6 +2064,9 @@ func resolveHopFromHostCandidates(cfg *Configuration, hop, hopUser string, hopPo
 // resolveOpenSSHJumpHop handles jump targets that are explicitly prefixed with OpenSSHNodePrefix.
 func resolveOpenSSHJumpHop(openSSH *OpenSSHParser, hop string) (string, error) {
 	cleanHop := strings.TrimPrefix(hop, OpenSSHNodePrefix)
+	if err := openSSH.Err(); err != nil {
+		return "", fmt.Errorf("resolve openssh jump %q: %w", cleanHop, err)
+	}
 	if openSSH != nil && openSSH.cfg != nil && openSSH.HasHost(cleanHop) {
 		if _, _, _, vErr := openSSH.GetVirtualNode(cleanHop); vErr != nil {
 			return "", fmt.Errorf("resolve openssh jump %q: %w", cleanHop, vErr)
@@ -1757,6 +2102,9 @@ func resolveLocalOrDirectJumpHop(cfg *Configuration, openSSH *OpenSSHParser, hop
 		}
 	}
 
+	if err := openSSH.Err(); err != nil {
+		return "", fmt.Errorf("resolve openssh jump %q: %w", hop, err)
+	}
 	if openSSH != nil && openSSH.cfg != nil && openSSH.HasHost(hop) {
 		if _, _, _, vErr := openSSH.GetVirtualNode(hop); vErr != nil {
 			return "", fmt.Errorf("resolve openssh jump %q: %w", hop, vErr)

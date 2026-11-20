@@ -31,15 +31,18 @@ func (a processAddr) String() string { return string(a) }
 // as a net.Conn while isolating stderr onto a bounded background forwarder and ensuring
 // idempotent child / process-group / Job-Object cleanup on Close.
 type ProcessStdioConn struct {
-	stdinW  *os.File
-	stdoutR *os.File
-	stderrR *os.File
+	stdinW         *os.File
+	stdoutR        *os.File
+	stderrR        *os.File
+	groupSentinelR *os.File
 
-	proc            *platformProc
-	waitDone        chan struct{}
-	stderrDone      chan struct{}
-	closing         atomic.Bool
-	spontaneousExit atomic.Bool
+	proc              *platformProc
+	waitDone          chan struct{}
+	stderrDone        chan struct{}
+	groupSentinelDone chan struct{}
+	closing           atomic.Bool
+	spontaneousExit   atomic.Bool
+	stdoutEOF         atomic.Bool
 
 	mu            sync.Mutex
 	closed        bool
@@ -98,7 +101,7 @@ func DialProxyCommandWithStderr(ctx context.Context, command string, stderr io.W
 		return nil, fmt.Errorf("create ProxyCommand stderr pipe: %w", err)
 	}
 
-	proc, cmd, err := startPlatformShellCommand(command, stdinR, stdoutW, stderrW)
+	proc, cmd, err := startPlatformShellCommand(command, stdinR, stdoutW, stderrW, true)
 	// Always close child-side pipe ends in the parent immediately after Start (or on error).
 	_ = stdinR.Close()
 	_ = stdoutW.Close()
@@ -110,14 +113,21 @@ func DialProxyCommandWithStderr(ctx context.Context, command string, stderr io.W
 		return nil, err
 	}
 
+	sentinelR := proc.detachSentinelPipe()
+	var sentinelDone chan struct{}
+	if sentinelR != nil {
+		sentinelDone = make(chan struct{})
+	}
 	conn := &ProcessStdioConn{
-		stdinW:     stdinW,
-		stdoutR:    stdoutR,
-		stderrR:    stderrR,
-		proc:       proc,
-		waitDone:   make(chan struct{}),
-		stderrDone: make(chan struct{}),
-		remote:     processAddr("0.0.0.0:0"),
+		stdinW:            stdinW,
+		stdoutR:           stdoutR,
+		stderrR:           stderrR,
+		groupSentinelR:    sentinelR,
+		proc:              proc,
+		waitDone:          make(chan struct{}),
+		stderrDone:        make(chan struct{}),
+		groupSentinelDone: sentinelDone,
+		remote:            processAddr("0.0.0.0:0"),
 	}
 
 	go func() {
@@ -131,6 +141,12 @@ func DialProxyCommandWithStderr(ctx context.Context, command string, stderr io.W
 		defer close(conn.stderrDone)
 		forwardStderrLines(stderrR, stderr)
 	}()
+	if sentinelR != nil {
+		go func() {
+			defer close(conn.groupSentinelDone)
+			_, _ = io.Copy(io.Discard, sentinelR)
+		}()
+	}
 
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
@@ -158,18 +174,12 @@ func RunLocalCommandWithIO(ctx context.Context, command string, stdout, stderr i
 	if err := validateExecCommandString(command); err != nil {
 		return err
 	}
-	if stdout == nil {
-		stdout = io.Discard
-	}
-	if stderr == nil {
-		stderr = io.Discard
-	}
 
 	devNull, err := os.Open(os.DevNull)
 	if err != nil {
 		return fmt.Errorf("open %s for LocalCommand stdin: %w", os.DevNull, err)
 	}
-	proc, cmd, err := startPlatformShellCommand(command, devNull, stdout, stderr)
+	proc, cmd, err := startPlatformShellCommand(command, devNull, stdout, stderr, false)
 	_ = devNull.Close()
 	if err != nil {
 		return err
@@ -189,6 +199,9 @@ func RunLocalCommandWithIO(ctx context.Context, command string, stdout, stderr i
 		cancelDone = make(chan struct{})
 		stopCancel = context.AfterFunc(ctx, func() {
 			defer close(cancelDone)
+			if isClosedChan(waitDone) {
+				return
+			}
 			canceledByCtx.Store(true)
 			proc.terminateTree(proxyTermGracePeriod, waitDone)
 		})
@@ -203,6 +216,9 @@ func RunLocalCommandWithIO(ctx context.Context, command string, stdout, stderr i
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+	}
+	if errors.Is(waitErr, exec.ErrWaitDelay) && cmd.ProcessState != nil && cmd.ProcessState.Success() {
+		return nil
 	}
 	return waitErr
 }
@@ -238,6 +254,9 @@ func forwardStderrLines(r io.Reader, dst io.Writer) {
 func (c *ProcessStdioConn) Read(b []byte) (int, error) {
 	n, err := c.stdoutR.Read(b)
 	if err != nil {
+		if errors.Is(err, io.EOF) {
+			c.stdoutEOF.Store(true)
+		}
 		return n, c.normalizeIOError(err, true)
 	}
 	return n, nil
@@ -333,18 +352,17 @@ func (c *ProcessStdioConn) setFallbackDeadline(closer io.Closer, t time.Time, is
 	d := time.Until(t)
 	if d <= 0 {
 		c.markTimedOutLocked(isRead)
-		c.mu.Unlock()
 		_ = closer.Close()
+		c.mu.Unlock()
 		return nil
 	}
 	timer := time.AfterFunc(d, func() {
 		c.mu.Lock()
+		defer c.mu.Unlock()
 		if c.closed || c.timerGenLocked(isRead) != gen {
-			c.mu.Unlock()
 			return
 		}
 		c.markTimedOutLocked(isRead)
-		c.mu.Unlock()
 		_ = closer.Close()
 	})
 	if isRead {
@@ -399,12 +417,30 @@ func isClosedChan(ch <-chan struct{}) bool {
 	}
 }
 
+func waitBoundedDone(ch <-chan struct{}, d time.Duration) {
+	if ch == nil {
+		return
+	}
+	timer := time.NewTimer(d)
+	select {
+	case <-ch:
+		timer.Stop()
+	case <-timer.C:
+	}
+}
+
+func (c *ProcessStdioConn) hasSpontaneouslyExitedLocked() bool {
+	sentinelClosed := c.groupSentinelR == nil || isClosedChan(c.groupSentinelDone) || !pipeHasOpenWriter(c.groupSentinelR)
+	stdoutClosed := c.stdoutEOF.Load() || !pipeHasOpenWriter(c.stdoutR)
+	return isClosedChan(c.waitDone) && isClosedChan(c.stderrDone) && sentinelClosed && stdoutClosed
+}
+
 // Close idempotently closes the child's stdin/stdout pipes, waits up to 200ms for
 // graceful EOF exit, terminates the child / process group / Job Object if still alive,
 // and joins cmd.Wait() plus a bounded stderr forwarder drain so Close never hangs.
 func (c *ProcessStdioConn) Close() error {
 	c.closeOnce.Do(func() {
-		alreadyExited := isClosedChan(c.waitDone) && isClosedChan(c.stderrDone)
+		alreadyExited := c.hasSpontaneouslyExitedLocked()
 		c.closing.Store(true)
 		if alreadyExited {
 			c.spontaneousExit.Store(true)
@@ -435,15 +471,14 @@ func (c *ProcessStdioConn) Close() error {
 		}
 
 		<-c.waitDone
-		c.proc.reapRemainingGroup(proxyTermGracePeriod, c.stderrDone, alreadyExited)
+		c.proc.reapRemainingGroup(proxyTermGracePeriod, c.stderrDone, c.groupSentinelDone, alreadyExited)
 		_ = c.stderrR.Close()
-
-		stderrTimer := time.NewTimer(proxyStderrCloseGracePeriod)
-		select {
-		case <-c.stderrDone:
-			stderrTimer.Stop()
-		case <-stderrTimer.C:
+		if c.groupSentinelR != nil {
+			_ = c.groupSentinelR.Close()
 		}
+
+		waitBoundedDone(c.stderrDone, proxyStderrCloseGracePeriod)
+		waitBoundedDone(c.groupSentinelDone, proxyStderrCloseGracePeriod)
 
 		c.closeErr = errors.Join(errs...)
 	})
@@ -454,4 +489,15 @@ func attachCommandIO(cmd *exec.Cmd, stdin io.Reader, stdout, stderr io.Writer) {
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
+	if (stdout != nil && !isOSFile(stdout)) || (stderr != nil && !isOSFile(stderr)) {
+		cmd.WaitDelay = proxyStderrCloseGracePeriod
+	}
+}
+
+func isOSFile(w io.Writer) bool {
+	if w == nil {
+		return false
+	}
+	f, ok := w.(*os.File)
+	return ok && f != nil
 }

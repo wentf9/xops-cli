@@ -111,10 +111,13 @@ func (c *proxyCommandConn) RemoteAddr() net.Addr { return c.remoteAddr }
 
 // RunPostAuthLocalCommand expands and executes LocalCommand via Environment.RunLocalCommand
 // when PermitLocalCommand=yes and LocalCommand is set (and not "none").
-// Multiplexed control slaves and daemon modes must gate whether to invoke this helper at the CLI layer.
+// Multiplexed control slaves are skipped automatically; daemon modes gate whether to invoke this helper at the CLI layer.
 func (c *Client) RunPostAuthLocalCommand(ctx context.Context) error {
 	if c == nil {
 		return errors.New("nil SSH client")
+	}
+	if c.IsMultiplexed() {
+		return nil
 	}
 	connCfg := c.ConnectionConfig()
 	if !connCfg.Options.PermitLocalCommand() {

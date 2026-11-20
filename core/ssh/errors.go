@@ -14,6 +14,8 @@ var (
 	ErrPasswordRequired = errors.New("password required but empty")
 	// ErrKeyPathRequired 需要私钥路径但未提供
 	ErrKeyPathRequired = errors.New("private key path required but empty")
+	// ErrKeyNotFound indicates that the key source holds no key for the requested node.
+	ErrKeyNotFound = errors.New("ssh key not found in key source")
 	// ErrAgentNotAvailable SSH Agent 不可用
 	ErrAgentNotAvailable = errors.New("ssh-agent socket not available")
 	// ErrProxyCycle 代理跳转环路

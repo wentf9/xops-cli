@@ -13,13 +13,20 @@ import (
 func equalPersistedNode(a, b models.Node) bool {
 	a.OpenSSHAlias = ""
 	b.OpenSSHAlias = ""
+	a.CanonicalHost = ""
+	b.CanonicalHost = ""
+	if !a.SSHOptions.Equal(b.SSHOptions) {
+		return false
+	}
+	a.SSHOptions = nil
+	b.SSHOptions = nil
 	return reflect.DeepEqual(a, b)
 }
 
 type pendingConnection struct {
 	provider   *Provider // immutable connection bundle
 	provenance NodeProvenance
-	gate       contextGate
+	gate       *contextGate
 }
 
 // PrepareNodeContext resolves a connection without writing configuration. New
@@ -40,25 +47,29 @@ func (r *Repository) PrepareNodeContext(ctx context.Context, opts EnsureNodeOpti
 	r.pendingMu.Lock()
 	defer r.pendingMu.Unlock()
 	defaultUser := strings.TrimSpace(opts.DefaultUser)
-	if id, _, err := r.findExistingNodeFast(opts.Target, defaultUser); err != nil {
+	if decision, err := r.findExistingNodeDecision(opts.Target, defaultUser); err != nil {
 		return EnsureNodeResult{}, err
-	} else if id != "" {
-		return EnsureNodeResult{NodeID: id}, nil
+	} else if !decision.NeedsCreation && decision.MatchedNodeID != "" {
+		r.syncPreparedExistingMetadataLocked(decision)
+		return EnsureNodeResult{NodeID: decision.MatchedNodeID}, nil
 	}
-	var nodeID string
-	var created bool
+	var outcome ensureTransactionOutcome
 	cfg, _, _, err := prepareConfiguration(r.provider.Snapshot(), func(cfg *Configuration) error {
-		return r.ensureTargetInTransaction(cfg, opts, defaultUser, &nodeID, &created)
+		return r.ensureTargetInTransaction(cfg, opts, defaultUser, &outcome)
 	})
 	if err != nil {
 		return EnsureNodeResult{}, err
 	}
+	nodeID := outcome.nodeID
+	created := outcome.created
 	if created {
 		effectiveID, err := r.registerPendingConnection(cfg, nodeID)
 		if err != nil {
 			return EnsureNodeResult{}, err
 		}
 		nodeID = effectiveID
+	} else {
+		r.provider.setSavedNodeOpenSSHMetadataIfPresent(nodeID, outcome.openSSHAlias, outcome.canonicalHost)
 	}
 	return EnsureNodeResult{NodeID: nodeID, Created: created}, nil
 }
@@ -73,42 +84,10 @@ func (r *Repository) registerPendingConnection(cfg *Configuration, nodeID string
 		r.pending = make(map[string]*pendingConnection)
 	}
 	if previous := r.pending[nodeID]; previous != nil {
-		oldNode, oldHost, oldIdentity, err := previous.provider.Resolve(nodeID)
-		if err != nil {
-			return "", fmt.Errorf("resolve pending connection %q: %w", nodeID, err)
+		if existingID, handled, err := r.tryReuseOrDisambiguatePending(cfg, previous, nodeID, node, host, identity); handled || err != nil {
+			return existingID, err
 		}
-		// Compare with the same IdentityRef normalization used when storing.
-		normalizedNode := node
-		normalizedNode.IdentityRef = privateIdentityReference(cfg, nodeID)
-		if equalPersistedNode(oldNode, normalizedNode) && reflect.DeepEqual(oldHost, host) && reflect.DeepEqual(oldIdentity, identity) {
-			if oldNode.OpenSSHAlias == "" && node.OpenSSHAlias != "" {
-				previous.provider.SetNodeOpenSSHAlias(nodeID, node.OpenSSHAlias)
-				r.SetNodeOpenSSHAlias(nodeID, node.OpenSSHAlias)
-				if oldNode.SSHOptions == nil {
-					previous.provenance = ProvenanceOpenSSHDerived
-				}
-			}
-			return nodeID, nil
-		}
-		if node.OpenSSHAlias == "" || oldNode.OpenSSHAlias == node.OpenSSHAlias {
-			return "", fmt.Errorf("pending connection %q changed: %w", nodeID, ErrConfigConflict)
-		}
-		// Distinct OpenSSH aliases sharing the same (User, HostName, Port) under
-		// ephemeral/pending resolution must not collide in r.pending.
-		altID := OpenSSHNodePrefix + FormatNodeID(identity.User, node.OpenSSHAlias, host.Port)
-		if altPrev := r.pending[altID]; altPrev != nil {
-			altOldNode, altOldHost, altOldIdentity, altErr := altPrev.provider.Resolve(altID)
-			if altErr != nil {
-				return "", fmt.Errorf("resolve pending connection %q: %w", altID, altErr)
-			}
-			altNormalized := node
-			altNormalized.IdentityRef = privateIdentityReference(cfg, altID)
-			if !equalPersistedNode(altOldNode, altNormalized) || !reflect.DeepEqual(altOldHost, host) || !reflect.DeepEqual(altOldIdentity, identity) {
-				return "", fmt.Errorf("pending connection %q changed: %w", altID, ErrConfigConflict)
-			}
-			return altID, nil
-		}
-		nodeID = altID
+		nodeID = OpenSSHNodePrefix + FormatNodeID(identity.User, node.OpenSSHAlias, host.Port)
 	}
 	// Concurrent first connections on different ports must not reserve the
 	// same identity and later share (or conflict over) remembered secrets.
@@ -121,13 +100,98 @@ func (r *Repository) registerPendingConnection(cfg *Configuration, nodeID string
 	prov := ProvenanceAdHocPending
 	if node.OpenSSHAlias != "" {
 		pendingProvider.SetNodeOpenSSHAlias(nodeID, node.OpenSSHAlias)
-		r.SetNodeOpenSSHAlias(nodeID, node.OpenSSHAlias)
 		if node.SSHOptions == nil {
 			prov = ProvenanceOpenSSHDerived
 		}
 	}
-	r.pending[nodeID] = &pendingConnection{provider: pendingProvider, provenance: prov}
+	if node.CanonicalHost != "" {
+		pendingProvider.SetNodeCanonicalHost(nodeID, node.CanonicalHost)
+	}
+	r.pending[nodeID] = &pendingConnection{provider: pendingProvider, provenance: prov, gate: &contextGate{}}
 	return nodeID, nil
+}
+
+func (r *Repository) tryReuseOrDisambiguatePending(
+	cfg *Configuration,
+	previous *pendingConnection,
+	nodeID string,
+	node models.Node,
+	host models.Host,
+	identity models.Identity,
+) (string, bool, error) {
+	oldNode, oldHost, oldIdentity, err := previous.provider.Resolve(nodeID)
+	if err != nil {
+		return "", false, fmt.Errorf("resolve pending connection %q: %w", nodeID, err)
+	}
+	normalizedNode := node
+	normalizedNode.IdentityRef = privateIdentityReference(cfg, nodeID)
+	if equalPersistedNode(oldNode, normalizedNode) && reflect.DeepEqual(oldHost, host) && reflect.DeepEqual(oldIdentity, identity) {
+		if oldNode.OpenSSHAlias == node.OpenSSHAlias && oldNode.CanonicalHost == node.CanonicalHost {
+			return nodeID, true, nil
+		}
+		if upgradedID, ok := r.upgradePendingAliasAndCanonical(previous, nodeID, oldNode, normalizedNode, host, identity); ok {
+			return upgradedID, true, nil
+		}
+	}
+	if node.OpenSSHAlias == "" || oldNode.OpenSSHAlias == node.OpenSSHAlias {
+		return "", false, fmt.Errorf("pending connection %q changed: %w", nodeID, ErrConfigConflict)
+	}
+	altID := OpenSSHNodePrefix + FormatNodeID(identity.User, node.OpenSSHAlias, host.Port)
+	altPrev := r.pending[altID]
+	if altPrev == nil {
+		return "", false, nil
+	}
+	altOldNode, altOldHost, altOldIdentity, altErr := altPrev.provider.Resolve(altID)
+	if altErr != nil {
+		return "", false, fmt.Errorf("resolve pending connection %q: %w", altID, altErr)
+	}
+	altNormalized := node
+	altNormalized.IdentityRef = privateIdentityReference(cfg, altID)
+	if !equalPersistedNode(altOldNode, altNormalized) || !reflect.DeepEqual(altOldHost, host) || !reflect.DeepEqual(altOldIdentity, identity) {
+		return "", false, fmt.Errorf("pending connection %q changed: %w", altID, ErrConfigConflict)
+	}
+	if altOldNode.OpenSSHAlias == node.OpenSSHAlias && altOldNode.CanonicalHost == node.CanonicalHost {
+		return altID, true, nil
+	}
+	if upgradedID, ok := r.upgradePendingAliasAndCanonical(altPrev, altID, altOldNode, altNormalized, host, identity); ok {
+		return upgradedID, true, nil
+	}
+	return "", false, fmt.Errorf("pending connection %q changed: %w", altID, ErrConfigConflict)
+}
+
+func (r *Repository) upgradePendingAliasAndCanonical(
+	previous *pendingConnection,
+	nodeID string,
+	oldNode, normalizedNode models.Node,
+	host models.Host,
+	identity models.Identity,
+) (string, bool) {
+	aliasUpgradable := oldNode.OpenSSHAlias == normalizedNode.OpenSSHAlias || (oldNode.OpenSSHAlias == "" && normalizedNode.OpenSSHAlias != "")
+	canonUpgradable := oldNode.CanonicalHost == normalizedNode.CanonicalHost || (oldNode.CanonicalHost == "" && normalizedNode.CanonicalHost != "")
+	if !aliasUpgradable || !canonUpgradable {
+		return "", false
+	}
+	pending := cloneConfiguration(nil)
+	pending.Nodes.Set(nodeID, normalizedNode)
+	pending.Hosts.Set(normalizedNode.HostRef, host)
+	pending.Identities.Set(normalizedNode.IdentityRef, identity)
+	upgradedProvider := NewProviderWithoutOpenSSH(pending)
+	if normalizedNode.OpenSSHAlias != "" {
+		upgradedProvider.SetNodeOpenSSHAlias(nodeID, normalizedNode.OpenSSHAlias)
+	}
+	if normalizedNode.CanonicalHost != "" {
+		upgradedProvider.SetNodeCanonicalHost(nodeID, normalizedNode.CanonicalHost)
+	}
+	prov := previous.provenance
+	if normalizedNode.SSHOptions == nil && normalizedNode.OpenSSHAlias != "" {
+		prov = ProvenanceOpenSSHDerived
+	}
+	gate := previous.gate
+	if gate == nil {
+		gate = &contextGate{}
+	}
+	r.pending[nodeID] = &pendingConnection{provider: upgradedProvider, provenance: prov, gate: gate}
+	return nodeID, true
 }
 
 func (r *Repository) connectionProviderWithProvenance(nodeID string) (*Provider, NodeProvenance) {
@@ -190,6 +254,39 @@ func (r *Repository) ConfirmNodeWithExecutionContext(ctx context.Context, nodeID
 	return r.confirmNodeContext(ctx, nodeID, execution)
 }
 
+func (r *Repository) buildConfirmPublishAction(pending *pendingConnection, nodeID, baseAlias, baseCanon string) *publishAction {
+	mergedAlias := baseAlias
+	mergedCanon := baseCanon
+	return &publishAction{
+		beforeProviderLocked: func() {
+			current := r.pending[nodeID]
+			if current == nil || current.provider == nil {
+				return
+			}
+			if curAlias := current.provider.NodeOpenSSHAlias(nodeID); curAlias != "" {
+				mergedAlias = curAlias
+			}
+			if curCanon := current.provider.NodeCanonicalHost(nodeID); curCanon != "" {
+				mergedCanon = curCanon
+			}
+		},
+		applyProviderLocked: func(p *Provider, updated *Configuration) {
+			if p == nil || updated == nil || updated.Nodes == nil {
+				return
+			}
+			if _, exists := updated.Nodes.Get(nodeID); !exists {
+				return
+			}
+			p.setOpenSSHMetadataLocked(nodeID, mergedAlias, mergedCanon)
+		},
+		afterProviderLocked: func() {
+			if current := r.pending[nodeID]; current == pending || (current != nil && current.gate == pending.gate) {
+				delete(r.pending, nodeID)
+			}
+		},
+	}
+}
+
 func (r *Repository) confirmNodeContext(ctx context.Context, nodeID string, execution *ssh.ExecutionConfig) error {
 	if r == nil || ctx == nil {
 		return fmt.Errorf("confirm connection requires repository and context")
@@ -197,24 +294,12 @@ func (r *Repository) confirmNodeContext(ctx context.Context, nodeID string, exec
 	if IsOpenSSHNodeID(nodeID) {
 		return nil
 	}
-	r.pendingMu.RLock()
-	pending := r.pending[nodeID]
-	r.pendingMu.RUnlock()
-	if pending == nil || pending.provenance == ProvenanceOpenSSHVirtual {
-		return nil
-	}
-	// Serialize confirmation of this node without holding the pending map
-	// lock across storage I/O or blocking reads of other connections.
-	if err := pending.gate.acquire(ctx); err != nil {
-		return fmt.Errorf("lock pending connection %q: %w", nodeID, err)
+	pending, err := r.acquirePendingConfirmationGate(ctx, nodeID)
+	if err != nil || pending == nil {
+		return err
 	}
 	defer pending.gate.release()
-	r.pendingMu.RLock()
-	confirmed := r.pending[nodeID] != pending
-	r.pendingMu.RUnlock()
-	if confirmed {
-		return nil
-	}
+
 	node, host, identity, err := pending.provider.Resolve(nodeID)
 	if err != nil {
 		return fmt.Errorf("resolve pending connection %q: %w", nodeID, err)
@@ -222,31 +307,66 @@ func (r *Repository) confirmNodeContext(ctx context.Context, nodeID string, exec
 	if execution != nil && ssh.NeedsExecutionProbe(node.Execution) {
 		node.Execution = execution.Clone()
 	}
-	result, err := r.commitResultContext(ctx, anyRevision, func(cfg *Configuration) error {
-		if existing, ok := cfg.Nodes.Get(nodeID); ok && !equalPersistedNode(existing, node) {
-			return fmt.Errorf("save connected node %q: %w", nodeID, ErrConfigConflict)
-		}
-		if existing, ok := cfg.Hosts.Get(node.HostRef); ok && !reflect.DeepEqual(existing, host) {
-			return fmt.Errorf("save connected host %q: %w", node.HostRef, ErrConfigConflict)
-		}
-		if existing, ok := cfg.Identities.Get(node.IdentityRef); ok && !reflect.DeepEqual(existing, identity) {
-			return fmt.Errorf("save connected identity %q: %w", node.IdentityRef, ErrConfigConflict)
-		}
-		cfg.Nodes.Set(nodeID, node)
-		cfg.Hosts.Set(node.HostRef, host)
-		cfg.Identities.Set(node.IdentityRef, identity)
-		return nil
-	})
-	if result.Applied {
-		if node.OpenSSHAlias != "" {
-			r.SetNodeOpenSSHAlias(nodeID, node.OpenSSHAlias)
-		}
-		r.pendingMu.Lock()
-		delete(r.pending, nodeID)
-		r.pendingMu.Unlock()
-	}
+	action := r.buildConfirmPublishAction(pending, nodeID, node.OpenSSHAlias, node.CanonicalHost)
+	_, err = r.commitResultWithPublishAction(ctx, anyRevision, func(cfg *Configuration) error {
+		return mergeConfirmedNodeConfig(cfg, nodeID, node, host, identity)
+	}, action)
 	if err != nil {
 		return fmt.Errorf("save authenticated connection %q: %w", nodeID, err)
 	}
+	return nil
+}
+
+func (r *Repository) acquirePendingConfirmationGate(ctx context.Context, nodeID string) (*pendingConnection, error) {
+	for {
+		r.pendingMu.RLock()
+		pending := r.pending[nodeID]
+		var prov NodeProvenance
+		if pending != nil {
+			prov = pending.provenance
+		}
+		r.pendingMu.RUnlock()
+		if pending == nil || prov == ProvenanceOpenSSHVirtual {
+			return nil, nil
+		}
+		// Serialize confirmation of this node without holding the pending map
+		// lock across storage I/O or blocking reads of other connections.
+		if err := pending.gate.acquire(ctx); err != nil {
+			return nil, fmt.Errorf("lock pending connection %q: %w", nodeID, err)
+		}
+		r.pendingMu.RLock()
+		current := r.pending[nodeID]
+		var currentProv NodeProvenance
+		if current != nil {
+			currentProv = current.provenance
+		}
+		r.pendingMu.RUnlock()
+		if current == pending || (current != nil && current.gate == pending.gate) {
+			if currentProv == ProvenanceOpenSSHVirtual {
+				pending.gate.release()
+				return nil, nil
+			}
+			return current, nil
+		}
+		pending.gate.release()
+		if current == nil {
+			return nil, nil
+		}
+	}
+}
+
+func mergeConfirmedNodeConfig(cfg *Configuration, nodeID string, node models.Node, host models.Host, identity models.Identity) error {
+	if existing, ok := cfg.Nodes.Get(nodeID); ok && !equalPersistedNode(existing, node) {
+		return fmt.Errorf("save connected node %q: %w", nodeID, ErrConfigConflict)
+	}
+	if existing, ok := cfg.Hosts.Get(node.HostRef); ok && !reflect.DeepEqual(existing, host) {
+		return fmt.Errorf("save connected host %q: %w", node.HostRef, ErrConfigConflict)
+	}
+	if existing, ok := cfg.Identities.Get(node.IdentityRef); ok && !reflect.DeepEqual(existing, identity) {
+		return fmt.Errorf("save connected identity %q: %w", node.IdentityRef, ErrConfigConflict)
+	}
+	cfg.Nodes.Set(nodeID, node)
+	cfg.Hosts.Set(node.HostRef, host)
+	cfg.Identities.Set(node.IdentityRef, identity)
 	return nil
 }

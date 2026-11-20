@@ -54,6 +54,7 @@ type SshOptions struct {
 	Sudo                   bool
 	Alias                  string
 	JumpHost               string
+	cliJumpHost            string
 	Tags                   []string
 	LocalForwards          []string
 	RemoteForwards         []string
@@ -83,6 +84,8 @@ type SshOptions struct {
 	isParentValidation     bool
 	muxDaemonSpecFD        int
 	muxDaemonMode          bool
+	preserveDaemonSelector bool
+	hostFromPositional     bool
 
 	Target config.ConnectionTarget
 
@@ -222,8 +225,18 @@ func (o *SshOptions) absIdentityFiles() []string {
 	return out
 }
 
+func (o *SshOptions) effectiveCLIJumpHost() string {
+	if o == nil {
+		return ""
+	}
+	if o.appliedGeneralOpts {
+		return o.cliJumpHost
+	}
+	return strings.TrimSpace(o.JumpHost)
+}
+
 func (o *SshOptions) controlSessionOptions() (adapter.SessionControlOptions, error) {
-	sessionOpts, err := o.control.ToSessionControlOptions()
+	sessionOpts, err := o.control.ToSessionControlOptionsWithJump(o.effectiveCLIJumpHost())
 	if err != nil {
 		return sessionOpts, err
 	}
@@ -314,12 +327,14 @@ func (o *SshOptions) Complete(cmd *cobra.Command, args []string) error {
 	o.args = args
 	o.dashIdx = -1
 	o.parsedArgs = false
+	o.hostFromPositional = false
 	o.appliedGeneralOpts = false
 	var flags *pflag.FlagSet
 	if cmd != nil {
 		flags = cmd.Flags()
 		o.dashIdx = cmd.ArgsLenAtDash()
 	}
+	o.control.ctlCmdSet = flags != nil && flags.Changed("control-command")
 	if flags != nil && flags.Changed(muxDaemonSpecFDFlag) {
 		spec, err := readMuxDaemonSpecFromFD(o.muxDaemonSpecFD)
 		if err != nil {
@@ -333,29 +348,58 @@ func (o *SshOptions) Complete(cmd *cobra.Command, args []string) error {
 	if err := validateExplicitZeroPort(flags); err != nil {
 		return o.control.controlUsageError(err)
 	}
+	if _, err := o.toSessionControlOptions(); err != nil {
+		return o.control.controlUsageError(err)
+	}
+	isChild := os.Getenv(sshBackgroundChildEnv) == "true"
+	ctlCmd := strings.ToLower(strings.TrimSpace(o.control.CtlCmd))
+	if o.isMuxDaemon() || isChild || (ctlCmd != "" && ctlCmd != "proxy") {
+		o.PasswordStdin = false
+		o.PassphraseStdin = false
+		o.OTPStdin = false
+	}
 	if o.isMuxDaemon() {
 		// The detached master daemon re-executes the original command line, but it
 		// only serves the control socket. Normalize before Complete reads stdin:
 		// with stdio on /dev/null a --password-stdin read would fail the child and
 		// silently break ControlPersist.
-		o.PasswordStdin = false
-		o.PassphraseStdin = false
-		o.OTPStdin = false
 		o.normalizeForMuxDaemon()
 		o.StdinRedirect = true
 		return nil
 	}
 	o.execution.capturePresence(cmd)
+	return o.completeStdinAndScriptInput(isChild, ctlCmd)
+}
+
+func (o *SshOptions) completeStdinAndScriptInput(isChild bool, ctlCmd string) error {
+	if isChild || (ctlCmd != "" && ctlCmd != "proxy") {
+		return nil
+	}
+	if err := o.validateCompleteStdinCredentials(); err != nil {
+		return o.control.controlUsageError(err)
+	}
 	hadCredentialStdin, err := o.readSecretsFromStdin()
 	if err != nil {
-		return err
+		return o.control.controlUsageError(err)
 	}
-	ctlCmd := strings.ToLower(strings.TrimSpace(o.control.CtlCmd))
-	if !o.effectiveStdinNull() && !o.effectiveNoCmd() && !hadCredentialStdin && o.StdioForward == "" && !o.Subsystem && (ctlCmd == "" || ctlCmd == "proxy") {
-		stat, err := os.Stdin.Stat()
-		if err == nil && (stat.Mode()&os.ModeCharDevice) == 0 {
+	if !o.effectiveStdinNull() && !o.effectiveNoCmd() && !hadCredentialStdin && o.StdioForward == "" && !o.Subsystem {
+		if stat, err := os.Stdin.Stat(); err == nil && (stat.Mode()&os.ModeCharDevice) == 0 {
 			o.stdinScript = true
 		}
+	}
+	return nil
+}
+
+func (o *SshOptions) validateCompleteStdinCredentials() error {
+	bgRun, bgErr := o.effectiveBgRunChecked()
+	if bgErr != nil {
+		return bgErr
+	}
+	if bgRun && (o.PasswordStdin || o.PassphraseStdin || o.OTPStdin || o.OTP != "") {
+		return errors.New("background mode (-f) cannot be combined with stdin or one-time credential flags (--password-stdin, --passphrase-stdin, --otp, --otp-stdin); configure key/agent auth or persistent credentials instead")
+	}
+	if o.PasswordStdin || o.PassphraseStdin || o.OTPStdin {
+		return o.Validate()
 	}
 	return nil
 }
@@ -392,7 +436,7 @@ func (o *SshOptions) parseTarget(allowMissingHost bool) error {
 			return err
 		}
 		finalHost, finalUser, hasUser, finalPort, hasPort = applyParsedAddr(finalHost, finalUser, hasUser, finalPort, hasPort, h, u, p)
-	} else if finalHost != "" {
+	} else if finalHost != "" && !o.preserveDaemonSelector {
 		u, h, p, err := utils.ParseAddr(finalHost)
 		if err != nil {
 			if strings.HasPrefix(strings.TrimSpace(finalHost), config.OpenSSHNodePrefix) {
@@ -414,10 +458,12 @@ func (o *SshOptions) parseTarget(allowMissingHost bool) error {
 	}
 
 	hasJump := o.JumpHost != "" || o.isMuxDaemon()
+	targetOrig := o.resolveTargetOriginalHost(selector)
 
 	o.Target = config.ConnectionTarget{
 		Selector:     selector,
 		RawSelector:  trimmedRaw,
+		OriginalHost: targetOrig,
 		User:         finalUser,
 		HasUser:      hasUser,
 		Port:         finalPort,
@@ -426,6 +472,24 @@ func (o *SshOptions) parseTarget(allowMissingHost bool) error {
 		HasProxyJump: hasJump,
 	}
 	return nil
+}
+
+func (o *SshOptions) resolveTargetOriginalHost(selector string) string {
+	if targetOrig := strings.TrimSpace(o.Target.OriginalHost); targetOrig != "" {
+		return targetOrig
+	}
+	if o.canonicalized && o.originalHost != "" {
+		return o.originalHost
+	}
+	if o.isMuxDaemon() {
+		if orig := strings.TrimSpace(o.originalHost); orig != "" && !strings.ContainsAny(orig, "@:") {
+			cleanSelector := strings.TrimSpace(config.UnwrapOpenSSHSelector(selector))
+			if !strings.EqualFold(orig, cleanSelector) {
+				return orig
+			}
+		}
+	}
+	return ""
 }
 
 func applyParsedAddr(finalHost, finalUser string, hasUser bool, finalPort uint16, hasPort bool, h, u string, p uint16) (string, string, bool, uint16, bool) {
@@ -461,13 +525,15 @@ func (o *SshOptions) ensureArgsParsed() error {
 	// When no --host flag was given, the first positional argument is always
 	// the target host (including `xops ssh -- host cmd`).
 	commandArgs := o.args
-	if o.Host == "" && len(commandArgs) > 0 {
+	fromPositional := o.Host == "" && len(commandArgs) > 0
+	if fromPositional {
 		commandArgs = commandArgs[1:]
 	}
 	if err := o.parseArgs(); err != nil {
 		return err
 	}
 	o.parsedArgs = true
+	o.hostFromPositional = fromPositional
 	if o.isMuxDaemon() {
 		// parseArgs rebuilds the target from the preserved positional arguments, so
 		// the daemon normalization above must be re-applied before the command
@@ -497,7 +563,7 @@ func (o *SshOptions) Validate() error {
 		o.normalizeForMuxDaemon()
 	}
 	if err := validateCommonSSHBaseOptions(o); err != nil {
-		return err
+		return o.control.controlUsageError(err)
 	}
 	if err := o.ensureArgsParsed(); err != nil {
 		return o.control.controlUsageError(err)
@@ -505,14 +571,33 @@ func (o *SshOptions) Validate() error {
 	if err := o.validateForwardAndSessionFlags(); err != nil {
 		return o.control.controlUsageError(err)
 	}
+	ctlCmd := strings.ToLower(strings.TrimSpace(o.control.CtlCmd))
+	if ctlCmd != "" && ctlCmd != "proxy" {
+		if o.effectiveBgRun() {
+			return o.control.controlUsageError(fmt.Errorf("background mode (-f / ForkAfterAuthentication) cannot be combined with control command -O %s", ctlCmd))
+		}
+		return nil
+	}
 	if err := o.validateBackgroundFlags(); err != nil {
 		return o.control.controlUsageError(err)
 	}
-	ctlCmd := strings.ToLower(strings.TrimSpace(o.control.CtlCmd))
-	if ctlCmd != "" && ctlCmd != "proxy" {
+	if err := o.prepareCommandPlan(); err != nil {
+		return o.control.controlUsageError(err)
+	}
+	return nil
+}
+
+func (o *SshOptions) validateBackgroundCredentialInvariants() error {
+	if !o.effectiveBgRun() {
 		return nil
 	}
-	return o.prepareCommandPlan()
+	if o.PasswordStdin || o.PassphraseStdin || o.Password != "" || o.Passphrase != "" {
+		return errors.New("background mode (-f) cannot be combined with stdin or inline password/passphrase authentication; configure key/agent auth or persistent credentials instead")
+	}
+	if o.OTP != "" || o.OTPStdin {
+		return errors.New("background mode (-f) cannot be combined with one-time --otp or --otp-stdin; configure persistent identity otp instead")
+	}
+	return nil
 }
 
 func (o *SshOptions) validateBackgroundFlags() error {
@@ -522,10 +607,7 @@ func (o *SshOptions) validateBackgroundFlags() error {
 	if !o.effectiveNoCmd() && o.Command == "" && !o.stdinScript && !o.hasNonEmptyRemoteCommand() {
 		return errors.New(i18n.T("ssh_err_background_requires_nocmd"))
 	}
-	if o.OTP != "" || o.OTPStdin {
-		return fmt.Errorf("background mode (-f) cannot be combined with one-time --otp or --otp-stdin; configure persistent identity otp instead")
-	}
-	return nil
+	return o.validateBackgroundCredentialInvariants()
 }
 
 func (o *SshOptions) Run() error {
@@ -603,7 +685,7 @@ func (o *SshOptions) runParentDaemon(ctx context.Context) (err error) {
 		return err
 	}
 
-	nodeID, _, err := o.resolveNode(ctx, provider)
+	nodeID, created, err := o.prepareNode(ctx, provider)
 	if err != nil {
 		return err
 	}
@@ -614,6 +696,9 @@ func (o *SshOptions) runParentDaemon(ctx context.Context) (err error) {
 		return err
 	}
 	if err := o.validateBackgroundProxyCommand(provider, nodeID); err != nil {
+		return err
+	}
+	if _, err := o.persistPreparedNodeUpdate(ctx, provider, nodeID, created); err != nil {
 		return err
 	}
 	return o.runParentDaemonWithNode(ctx, cfg, provider, nodeID)
@@ -638,19 +723,19 @@ func (o *SshOptions) validatePostResolutionSessionInvariants() error {
 		o.stdinScript = false
 	}
 	if err := o.validateSubsystemFlags(); err != nil {
-		return err
+		return o.control.controlUsageError(err)
 	}
 	if o.effectiveNoCmd() && o.StdioForward == "" && o.Command != "" {
-		return errors.New(i18n.T("ssh_err_nocmd_with_command"))
+		return o.control.controlUsageError(errors.New(i18n.T("ssh_err_nocmd_with_command")))
 	}
 	if o.effectiveBgRun() && o.StdioForward != "" {
-		return errors.New(i18n.T("ssh_err_stdio_forward_with_bg"))
+		return o.control.controlUsageError(errors.New(i18n.T("ssh_err_stdio_forward_with_bg")))
 	}
-	if o.effectiveBgRun() && (o.OTP != "" || o.OTPStdin) {
-		return fmt.Errorf("background mode (-f) cannot be combined with one-time --otp or --otp-stdin; configure persistent identity otp instead")
+	if err := o.validateBackgroundCredentialInvariants(); err != nil {
+		return o.control.controlUsageError(err)
 	}
 	if o.effectiveBgRun() && !o.effectiveNoCmd() && o.Command == "" && !o.stdinScript && !o.hasNonEmptyRemoteCommand() {
-		return errors.New(i18n.T("ssh_err_background_requires_nocmd"))
+		return o.control.controlUsageError(errors.New(i18n.T("ssh_err_background_requires_nocmd")))
 	}
 	return nil
 }
@@ -732,7 +817,7 @@ func spawnBackgroundSSHChild() (err error) {
 	cmd.Env = append(os.Environ(), sshBackgroundChildEnv+"=true")
 
 	// 子进程的 stdin/stdout/stderr 均重定向到 /dev/null
-	devNull, err := os.Open(os.DevNull)
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 	if err != nil {
 		return fmt.Errorf("failed to open /dev/null: %w", err)
 	}
@@ -1029,7 +1114,7 @@ func (c *proxyCommandPathChecker) checkOwnedMaster(connector *ssh.Connector, m *
 func (o *SshOptions) effectiveProxyJumpChain(provider config.ConfigProvider, nodeID string) string {
 	if o != nil {
 		jump := strings.TrimSpace(o.JumpHost)
-		if strings.EqualFold(jump, "none") {
+		if ssh.IsDisabledProxyJump(jump) {
 			return ""
 		}
 		if jump != "" {
@@ -1070,8 +1155,14 @@ func (o *SshOptions) handoffPersistentMaster(ctx context.Context, connector *ssh
 		return o.handoffConnectorMasters(ctx, provider, connector)
 	}
 	handoffNodeID := resolvePersistentHandoffNodeID(provider, connector, master, nodeID)
+	rawOwnedID := nodeID
+	if connector != nil {
+		if ownedID := strings.TrimSpace(connector.MasterNodeID(master)); ownedID != "" {
+			rawOwnedID = ownedID
+		}
+	}
 	o.recordTargetHandoffNodeID(nodeID, handoffNodeID)
-	return o.handoffMasterInstanceWithProvider(ctx, provider, connector, master, handoffNodeID)
+	return o.handoffMasterInstanceWithProviderAndRawNode(ctx, provider, connector, master, handoffNodeID, rawOwnedID)
 }
 
 func isMasterClosed(m *ssh.MuxServer) bool {
@@ -1197,7 +1288,7 @@ func (o *SshOptions) handoffConnectorMasters(ctx context.Context, provider confi
 			logger.DefaultLogger().Debugf("mux: skipping master handoff because ProxyCommand is active")
 			continue
 		}
-		if err := o.handoffMasterInstanceWithProvider(ctx, provider, connector, m, nodeID); err != nil && firstErr == nil {
+		if err := o.handoffMasterInstanceWithProviderAndRawNode(ctx, provider, connector, m, nodeID, rawOwnedID); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -1268,23 +1359,56 @@ func resolveOwnedMasterNodeID(provider config.ConfigProvider, connector *ssh.Con
 
 func normalizeOwnedMasterNodeID(provider config.ConfigProvider, ownedID string, m *ssh.MuxServer) string {
 	if strings.HasPrefix(ownedID, config.OpenSSHNodePrefix) {
-		if alias := resolveNodeOpenSSHAlias(provider, ownedID); alias != "" {
-			return config.OpenSSHNodePrefix + alias
-		}
-		return ownedID
+		return normalizeOwnedOpenSSHMasterNodeID(provider, ownedID, m)
 	}
 	if provider == nil {
+		if m != nil {
+			if canon := strings.TrimSpace(m.Target().CanonicalHost); canon != "" {
+				orig := strings.TrimSpace(m.Target().OriginalHost)
+				if orig == "" || !strings.EqualFold(orig, canon) {
+					return config.OpenSSHNodePrefix + canon
+				}
+			}
+		}
 		return ownedID
 	}
 	_, isSaved := provider.GetNode(ownedID)
-	if alias := resolveNodeOpenSSHAlias(provider, ownedID); alias != "" {
-		orig := ""
-		if m != nil {
-			orig = strings.TrimSpace(m.Target().OriginalHost)
+	alias := resolveNodeOpenSSHAlias(provider, ownedID)
+	canon := resolveNodeCanonicalHost(provider, ownedID)
+	if canon == "" && m != nil {
+		canon = strings.TrimSpace(m.Target().CanonicalHost)
+	}
+	orig := ""
+	if m != nil {
+		orig = strings.TrimSpace(m.Target().OriginalHost)
+	}
+	if alias != "" && (!isSaved || (orig != "" && orig != ownedID)) {
+		if canon != "" && !strings.EqualFold(alias, canon) {
+			return config.OpenSSHNodePrefix + canon
 		}
-		if !isSaved || (orig != "" && orig != ownedID) {
-			return config.OpenSSHNodePrefix + alias
-		}
+		return config.OpenSSHNodePrefix + alias
+	}
+	if !isSaved && canon != "" {
+		return config.OpenSSHNodePrefix + canon
+	}
+	return ownedID
+}
+
+func normalizeOwnedOpenSSHMasterNodeID(provider config.ConfigProvider, ownedID string, m *ssh.MuxServer) string {
+	alias := resolveNodeOpenSSHAlias(provider, ownedID)
+	canon := resolveNodeCanonicalHost(provider, ownedID)
+	if canon == "" && m != nil {
+		canon = strings.TrimSpace(m.Target().CanonicalHost)
+	}
+	orig := alias
+	if orig == "" && m != nil {
+		orig = strings.TrimSpace(m.Target().OriginalHost)
+	}
+	if canon != "" && orig != "" && !strings.EqualFold(orig, canon) {
+		return config.OpenSSHNodePrefix + canon
+	}
+	if alias != "" {
+		return config.OpenSSHNodePrefix + alias
 	}
 	return ownedID
 }
@@ -1314,6 +1438,31 @@ func resolvePendingOpenSSHAlias(provider config.ConfigProvider, candidateID stri
 	return resolveNodeOpenSSHAlias(provider, candidateID)
 }
 
+func resolveNodeCanonicalHost(provider config.ConfigProvider, nodeID string) string {
+	if provider == nil || nodeID == "" {
+		return ""
+	}
+	if snap, err := provider.ResolveConnection(nodeID); err == nil {
+		if canon := strings.TrimSpace(snap.Node.CanonicalHost); canon != "" {
+			return canon
+		}
+	}
+	if src, ok := provider.(interface{ NodeCanonicalHost(string) string }); ok {
+		return strings.TrimSpace(src.NodeCanonicalHost(nodeID))
+	}
+	return ""
+}
+
+func resolvePendingCanonicalHost(provider config.ConfigProvider, candidateID string) string {
+	if provider == nil || candidateID == "" {
+		return ""
+	}
+	if _, isSaved := provider.GetNode(candidateID); isSaved {
+		return ""
+	}
+	return resolveNodeCanonicalHost(provider, candidateID)
+}
+
 func resolveMasterNodeID(provider config.ConfigProvider, m *ssh.MuxServer) string {
 	if m == nil {
 		return ""
@@ -1325,6 +1474,15 @@ func resolveMasterNodeID(provider config.ConfigProvider, m *ssh.MuxServer) strin
 	if port <= 0 {
 		port = 22
 	}
+	if canonical := strings.TrimSpace(t.CanonicalHost); canonical != "" && (orig == "" || !strings.EqualFold(orig, canonical)) {
+		isSaved := false
+		if provider != nil && orig != "" {
+			_, isSaved = provider.GetNode(orig)
+		}
+		if !isSaved {
+			return config.OpenSSHNodePrefix + canonical
+		}
+	}
 	if provider != nil && orig != "" {
 		if id := resolveMasterNodeIDFromOriginalHost(provider, orig, targetHost, t.User, uint16(port)); id != "" {
 			return id
@@ -1334,6 +1492,9 @@ func resolveMasterNodeID(provider config.ConfigProvider, m *ssh.MuxServer) strin
 		if t.User != "" {
 			compositeID := config.FormatNodeID(t.User, targetHost, uint16(port))
 			if alias := resolvePendingOpenSSHAlias(provider, compositeID); alias != "" {
+				if canon := resolvePendingCanonicalHost(provider, compositeID); canon != "" && !strings.EqualFold(alias, canon) {
+					return config.OpenSSHNodePrefix + canon
+				}
 				return config.OpenSSHNodePrefix + alias
 			}
 			return compositeID
@@ -1358,11 +1519,70 @@ func resolveMasterNodeIDFromOriginalHost(provider config.ConfigProvider, orig, t
 		return ""
 	}
 	if user != "" {
-		altID := config.OpenSSHNodePrefix + config.FormatNodeID(user, cleanOrig, port)
-		if alias := resolvePendingOpenSSHAlias(provider, altID); alias != "" {
-			return config.OpenSSHNodePrefix + alias
+		if id := resolveMasterNodeIDViaUserPending(provider, cleanOrig, targetHost, user, port); id != "" {
+			return id
 		}
 	}
+	if id := resolveMasterConcreteCanonicalNodeID(provider, cleanOrig, targetHost, port); id != "" {
+		return id
+	}
+	return resolveMasterVirtualOpenSSHNodeID(provider, cleanOrig, targetHost, user, port)
+}
+
+func resolveMasterNodeIDViaUserPending(provider config.ConfigProvider, cleanOrig, targetHost, user string, port uint16) string {
+	altID := config.OpenSSHNodePrefix + config.FormatNodeID(user, cleanOrig, port)
+	if alias := resolvePendingOpenSSHAlias(provider, altID); alias != "" {
+		if canon := resolvePendingCanonicalHost(provider, altID); canon != "" && !strings.EqualFold(alias, canon) {
+			return config.OpenSSHNodePrefix + canon
+		}
+		return config.OpenSSHNodePrefix + alias
+	}
+	if targetHost != "" {
+		targetPendingID := config.FormatNodeID(user, targetHost, port)
+		canon := resolvePendingCanonicalHost(provider, targetPendingID)
+		alias := resolvePendingOpenSSHAlias(provider, targetPendingID)
+		if canon == "" {
+			canon = resolveNodeCanonicalHost(provider, targetPendingID)
+		}
+		if alias == "" {
+			alias = resolveNodeOpenSSHAlias(provider, targetPendingID)
+		}
+		if canon != "" && strings.EqualFold(alias, cleanOrig) {
+			return config.OpenSSHNodePrefix + canon
+		}
+	}
+	return ""
+}
+
+func resolveMasterConcreteCanonicalNodeID(provider config.ConfigProvider, cleanOrig, targetHost string, port uint16) string {
+	if targetHost != "" {
+		canonID := config.OpenSSHNodePrefix + targetHost
+		if canon := resolveNodeCanonicalHost(provider, canonID); canon != "" && strings.EqualFold(resolveNodeOpenSSHAlias(provider, canonID), cleanOrig) {
+			return config.OpenSSHNodePrefix + canon
+		}
+	}
+	parser := providerOpenSSHParser(provider)
+	if parser == nil || targetHost == "" {
+		return ""
+	}
+	candHosts := append(parser.FindConcreteHostsByAddress(targetHost, port), config.CanonicalDomainCandidates(provider, cleanOrig)...)
+	if port != 0 {
+		for _, extra := range parser.FindConcreteHostsByAddress(targetHost, 0) {
+			if !slices.Contains(candHosts, extra) {
+				candHosts = append(candHosts, extra)
+			}
+		}
+	}
+	for _, cand := range candHosts {
+		candID := config.OpenSSHNodePrefix + cand
+		if canon := resolveNodeCanonicalHost(provider, candID); canon != "" && strings.EqualFold(canon, cand) && strings.EqualFold(resolveNodeOpenSSHAlias(provider, candID), cleanOrig) {
+			return config.OpenSSHNodePrefix + canon
+		}
+	}
+	return ""
+}
+
+func resolveMasterVirtualOpenSSHNodeID(provider config.ConfigProvider, cleanOrig, targetHost, user string, port uint16) string {
 	parser := providerOpenSSHParser(provider)
 	if parser == nil || !parser.HasHost(cleanOrig) {
 		return ""
@@ -1377,6 +1597,9 @@ func resolveMasterNodeIDFromOriginalHost(provider config.ConfigProvider, orig, t
 	if user != "" && vhost.Address != "" {
 		pendingID := config.FormatNodeID(user, cleanMuxHost(vhost.Address), port)
 		if alias := resolvePendingOpenSSHAlias(provider, pendingID); alias != "" {
+			if canon := resolvePendingCanonicalHost(provider, pendingID); canon != "" && !strings.EqualFold(alias, canon) {
+				return config.OpenSSHNodePrefix + canon
+			}
 			return config.OpenSSHNodePrefix + alias
 		}
 	}
@@ -1497,6 +1720,17 @@ func (o *SshOptions) handoffMasterInstanceWithProvider(
 	master *ssh.MuxServer,
 	nodeID string,
 ) error {
+	return o.handoffMasterInstanceWithProviderAndRawNode(ctx, provider, connector, master, nodeID, nodeID)
+}
+
+func (o *SshOptions) handoffMasterInstanceWithProviderAndRawNode(
+	ctx context.Context,
+	provider config.ConfigProvider,
+	connector *ssh.Connector,
+	master *ssh.MuxServer,
+	nodeID string,
+	rawNodeID string,
+) error {
 	if master == nil || !master.PersistEnabled() {
 		return nil
 	}
@@ -1534,7 +1768,7 @@ func (o *SshOptions) handoffMasterInstanceWithProvider(
 		}
 	}()
 
-	spec := o.buildMuxDaemonSpec(nodeID, expandedPath, master)
+	spec := o.buildMuxDaemonSpecWithRawNode(provider, nodeID, rawNodeID, expandedPath, master)
 	cmd, err := startMuxDaemonCommand(exe, spec, devNull)
 	if err != nil {
 		return fmt.Errorf("start multiplexing daemon failed: %w", err)
@@ -2084,6 +2318,31 @@ func (o *SshOptions) maybeRedirectStdinNull() (func() error, error) {
 	}, nil
 }
 
+func (o *SshOptions) prepareValidatedConnectionNode(ctx context.Context, provider config.ConfigProvider) (string, bool, error) {
+	nodeID, created, err := o.prepareNode(ctx, provider)
+	if err != nil {
+		return "", false, err
+	}
+	if _, err := o.resolveAndCacheSessionOptions(provider, nodeID); err != nil {
+		return "", false, err
+	}
+	if err := o.validatePostResolutionSessionInvariants(); err != nil {
+		return "", false, err
+	}
+	return nodeID, created, nil
+}
+
+func (o *SshOptions) newConnectionConnector(cfg *config.Configuration, provider config.ConfigProvider, nodeID string, isChild bool) (*ssh.Connector, error) {
+	adpOpts, err := o.buildAdapterOptions(nodeID, cfg, provider)
+	if err != nil {
+		return nil, err
+	}
+	if o.isMuxDaemon() || isChild {
+		return newNonInteractiveConnector(provider, adpOpts, ssh.WithSessionConfirmer(o.interaction), ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics)), nil
+	}
+	return newCLIConnectorWithAdapterOptions(provider, o.interaction, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics)), nil
+}
+
 func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error) {
 	repo, cfg, err := o.loadConfigRepository()
 	if err != nil {
@@ -2094,28 +2353,25 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 		return err
 	}
 
-	nodeID, _, err := o.resolveNode(ctx, provider)
+	nodeID, created, err := o.prepareValidatedConnectionNode(ctx, provider)
 	if err != nil {
 		return err
 	}
-	if _, err := o.resolveAndCacheSessionOptions(provider, nodeID); err != nil {
-		return err
-	}
-	if err := o.validatePostResolutionSessionInvariants(); err != nil {
-		return err
-	}
 	if !isChild && !o.isMuxDaemon() && o.effectiveBgRun() {
+		if err := o.validateBackgroundProxyCommand(provider, nodeID); err != nil {
+			return err
+		}
+		if _, err := o.persistPreparedNodeUpdate(ctx, provider, nodeID, created); err != nil {
+			return err
+		}
 		return o.runParentDaemonWithValidatedNode(ctx, cfg, provider, nodeID)
 	}
-	adpOpts, optErr := o.buildAdapterOptions(nodeID, cfg, provider)
-	if optErr != nil {
-		return optErr
+	if _, err := o.persistPreparedNodeUpdate(ctx, provider, nodeID, created); err != nil {
+		return err
 	}
-	var connector *ssh.Connector
-	if o.isMuxDaemon() || isChild {
-		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithSessionConfirmer(o.interaction), ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics))
-	} else {
-		connector = newCLIConnectorWithAdapterOptions(provider, o.interaction, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics))
+	connector, err := o.newConnectionConnector(cfg, provider, nodeID, isChild)
+	if err != nil {
+		return err
 	}
 	defer func() {
 		joinConnectorCloseError(&err, connector)
@@ -2340,7 +2596,7 @@ func parseForwardArg(arg string) (bindAddr, destAddr string, err error) {
 }
 
 func (o *SshOptions) applyHostnameCanonicalization(ctx context.Context, provider config.ConfigProvider, resolver config.CanonicalResolver) error {
-	if o == nil || provider == nil || o.isMuxDaemon() {
+	if o == nil || provider == nil || o.isMuxDaemon() || o.canonicalized {
 		return nil
 	}
 	host := strings.TrimSpace(o.Target.Selector)
@@ -2358,7 +2614,7 @@ func (o *SshOptions) applyHostnameCanonicalization(ctx context.Context, provider
 		Provider:         provider,
 		Host:             host,
 		RawCLIOptions:    o.control.Options,
-		CLIProxyJump:     o.JumpHost,
+		CLIProxyJump:     o.effectiveCLIJumpHost(),
 		MatchedSavedNode: matchedSavedNode,
 		Resolver:         resolver,
 	})
@@ -2373,10 +2629,11 @@ func (o *SshOptions) applyHostnameCanonicalization(ctx context.Context, provider
 	o.expandHost = res.OriginalHost
 	o.Host = res.CanonicalHost
 	o.Target.Selector = res.CanonicalHost
+	o.Target.OriginalHost = res.OriginalHost
 	return nil
 }
 
-func (o *SshOptions) resolveNode(ctx context.Context, provider config.ConfigProvider) (string, bool, error) {
+func (o *SshOptions) prepareNode(ctx context.Context, provider config.ConfigProvider) (string, bool, error) {
 	o.syncIdentityFiles()
 	if err := o.applyHostnameCanonicalization(ctx, provider, nil); err != nil {
 		return "", false, err
@@ -2405,8 +2662,6 @@ func (o *SshOptions) resolveNode(ctx context.Context, provider config.ConfigProv
 		}
 	}
 
-	shouldRemember := !o.isMuxDaemon() && utils.EffectiveRememberPolicy(o.Remember, provider.Snapshot()) == utils.RememberPolicyAlways
-
 	res, err := preparer.PrepareNodeContext(ctx, config.EnsureNodeOptions{
 		Target:       o.Target,
 		DefaultUser:  defaultUser,
@@ -2419,15 +2674,31 @@ func (o *SshOptions) resolveNode(ctx context.Context, provider config.ConfigProv
 	if err != nil {
 		return "", false, err
 	}
-	if res.Created || o.isMuxDaemon() {
-		return res.NodeID, res.Created, nil
+	return res.NodeID, res.Created, nil
+}
+
+func (o *SshOptions) persistPreparedNodeUpdate(ctx context.Context, provider config.ConfigProvider, nodeID string, created bool) (bool, error) {
+	if created || o.isMuxDaemon() || os.Getenv(sshBackgroundChildEnv) == "true" {
+		return false, nil
 	}
 	repo, isRepo := provider.(*config.Repository)
 	if !isRepo {
-		return res.NodeID, false, nil
+		return false, nil
 	}
-	updated, err := update(ctx, res.NodeID, o, repo, shouldRemember)
-	return res.NodeID, updated, err
+	shouldRemember := utils.EffectiveRememberPolicy(o.Remember, provider.Snapshot()) == utils.RememberPolicyAlways
+	return update(ctx, nodeID, o, repo, shouldRemember)
+}
+
+func (o *SshOptions) resolveNode(ctx context.Context, provider config.ConfigProvider) (string, bool, error) {
+	nodeID, created, err := o.prepareNode(ctx, provider)
+	if err != nil {
+		return "", false, err
+	}
+	updated, err := o.persistPreparedNodeUpdate(ctx, provider, nodeID, created)
+	if err != nil {
+		return nodeID, created, err
+	}
+	return nodeID, created || updated, nil
 }
 
 type sshTunnelGroup struct {

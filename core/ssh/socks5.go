@@ -240,6 +240,11 @@ func handleSocks5Handshake(conn net.Conn) (string, error) {
 	if _, err := io.ReadFull(conn, methods); err != nil {
 		return "", fmt.Errorf("failed to read SOCKS5 methods: %w", err)
 	}
+	if numMethods == 0 || !bytes.Contains(methods, []byte{0x00}) {
+		writeErr := writeSocksReply(conn, []byte{0x05, 0xFF})
+		drainErr := drainSocksResponse(conn)
+		return "", errors.Join(errors.New("no acceptable SOCKS5 authentication method"), writeErr, drainErr)
+	}
 	if err := writeSocksReply(conn, []byte{0x05, 0x00}); err != nil {
 		return "", fmt.Errorf("failed to write greeting reply: %w", err)
 	}

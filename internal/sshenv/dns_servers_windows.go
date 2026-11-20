@@ -60,6 +60,9 @@ func systemDNSConfig() dnsConfig {
 func systemDNSServers() []string {
 	size := uint32(15000)
 	for range 3 {
+		if size == 0 {
+			return nil
+		}
 		buf := make([]byte, size)
 		addrs := (*windows.IpAdapterAddresses)(unsafe.Pointer(&buf[0]))
 		err := windows.GetAdaptersAddresses(windows.AF_UNSPEC,
@@ -88,7 +91,7 @@ func systemDNSServers() []string {
 }
 
 func formatWindowsSocketAddressDNS(sockAddr windows.SocketAddress) (string, bool) {
-	if sockAddr.Sockaddr == nil {
+	if sockAddr.Sockaddr == nil || sockAddr.SockaddrLength <= 0 {
 		return "", false
 	}
 	switch sockAddr.Sockaddr.Addr.Family {

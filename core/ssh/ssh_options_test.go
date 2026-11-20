@@ -950,11 +950,19 @@ func TestBatchModeBlocksCredentialRecoveryAndResolveSecretHonorsConnectTimeout(t
 	)
 	defer func() { _ = conn.CloseAll() }()
 
-	// 1. Explicit AuthType: "key" with encrypted key and BatchMode=yes must not enter recoverableKeyAuth or prompt
+	// 1. Explicit AuthType: "key" with encrypted key and BatchMode=yes must not prompt or enter credential recovery
 	pemData, _ := generateTestEncryptedKey(t, "correct-passphrase")
 	encKeyPath := filepath.Join(t.TempDir(), "id_enc")
 	if err := os.WriteFile(encKeyPath, pemData, 0600); err != nil {
 		t.Fatalf("write encrypted key failed: %v", err)
+	}
+	_, hostPriv, genErr := ed25519.GenerateKey(rand.Reader)
+	if genErr != nil {
+		t.Fatalf("generate host key: %v", genErr)
+	}
+	hostKey, signerErr := cryptoSSH.NewSignerFromKey(hostPriv)
+	if signerErr != nil {
+		t.Fatalf("new host signer: %v", signerErr)
 	}
 	keyCfg := &ClientConfig{
 		NodeID:   "n-key-batch",
@@ -965,13 +973,55 @@ func TestBatchModeBlocksCredentialRecoveryAndResolveSecretHonorsConnectTimeout(t
 		KeyPath:  encKeyPath,
 		Options:  MustOptions(OptionBatchMode, "yes"),
 	}
-	// Clear resolver temporarily so resolveKeyAuth gets ErrInteractionRequired
-	conn.secretResolver = rejectSecretResolver{}
-	if _, _, err := conn.keyAuth(ctx, keyCfg, conn.getNodeSecretPrompter(keyCfg), nil); err == nil {
-		t.Fatal("expected keyAuth with encrypted key and BatchMode=yes to fail without passphrase")
+	// Clear resolver temporarily so key decryption receives ErrInteractionRequired.
+	batchConn := NewConnector(
+		nil,
+		WithSecretPrompter(prompter),
+		WithSecretResolver(rejectSecretResolver{}),
+		WithCredentialRecorder(failingCredentialRecorder{}),
+		WithHostKeyVerifier(&fixtureTrust{}),
+	)
+	defer func() { _ = batchConn.CloseAll() }()
+	sshCfg, release, err := batchConn.buildSSHConfig(ctx, keyCfg, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("buildSSHConfig unexpected error: %v", err)
 	}
+	if release != nil {
+		defer func() { _ = release() }()
+	}
+	srvCfg := &cryptoSSH.ServerConfig{
+		PublicKeyCallback: func(cryptoSSH.ConnMetadata, cryptoSSH.PublicKey) (*cryptoSSH.Permissions, error) {
+			return nil, errors.New("rejected")
+		},
+	}
+	srvCfg.AddHostKey(hostKey)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen loopback: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	srvDone := make(chan struct{})
+	go func() {
+		defer close(srvDone)
+		if sc, acceptErr := ln.Accept(); acceptErr == nil {
+			defer func() { _ = sc.Close() }()
+			_ = sc.SetDeadline(time.Now().Add(2 * time.Second))
+			_, _, _, _ = cryptoSSH.NewServerConn(sc, srvCfg)
+		}
+	}()
+	cc, dialErr := net.DialTimeout("tcp", ln.Addr().String(), 2*time.Second)
+	if dialErr != nil {
+		t.Fatalf("dial loopback: %v", dialErr)
+	}
+	_ = cc.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, _, _, hsErr := cryptoSSH.NewClientConn(cc, ln.Addr().String(), sshCfg); hsErr == nil {
+		_ = cc.Close()
+		t.Fatal("expected BatchMode=yes handshake with encrypted key and no passphrase to fail")
+	}
+	_ = cc.Close()
+	<-srvDone
 	if prompter.promptCalled || prompter.reportCalled {
-		t.Fatalf("expected BatchMode=yes to block prompt and recovery report in keyAuth, got prompt=%v report=%v", prompter.promptCalled, prompter.reportCalled)
+		t.Fatalf("expected BatchMode=yes to block prompt and recovery report, got prompt=%v report=%v", prompter.promptCalled, prompter.reportCalled)
 	}
 
 	// 2. recordAuthUpdate with BatchMode=yes must not invoke ReportCredentialFailure

@@ -23,6 +23,21 @@ const (
 // OpenSSHParser 提供针对 ~/.ssh/config 的解析和模型映射功能
 type OpenSSHParser struct {
 	cfg *sshConfigDoc
+	err error
+}
+
+// NewBrokenOpenSSHParser returns an OpenSSHParser that records a load or parse
+// failure so callers falling back to OpenSSH fail closed rather than silently degrading.
+func NewBrokenOpenSSHParser(err error) *OpenSSHParser {
+	return &OpenSSHParser{err: err}
+}
+
+// Err returns the load or parse error recorded on p, if any.
+func (p *OpenSSHParser) Err() error {
+	if p == nil {
+		return nil
+	}
+	return p.err
 }
 
 // NewOpenSSHParser 尝试从标准路径加载用户的 ~/.ssh/config 配置文件。
@@ -126,6 +141,10 @@ func (p *openSSHOverrideProvider) PrepareNodeContext(ctx context.Context, opts E
 	return p.repo.PrepareNodeContext(ctx, opts)
 }
 
+func (p *openSSHOverrideProvider) ResolveConnectionWithOrigin(nodeID, originalHost string) (ConnectionSnapshot, error) {
+	return p.repo.ResolveConnectionWithOrigin(nodeID, originalHost)
+}
+
 func (p *openSSHOverrideProvider) GetOpenSSHParser() *OpenSSHParser {
 	return p.repo.GetOpenSSHParser()
 }
@@ -136,6 +155,14 @@ func (p *openSSHOverrideProvider) SetNodeOpenSSHAlias(nodeID, alias string) {
 
 func (p *openSSHOverrideProvider) NodeOpenSSHAlias(nodeID string) string {
 	return p.repo.NodeOpenSSHAlias(nodeID)
+}
+
+func (p *openSSHOverrideProvider) SetNodeCanonicalHost(nodeID, canonicalHost string) {
+	p.repo.SetNodeCanonicalHost(nodeID, canonicalHost)
+}
+
+func (p *openSSHOverrideProvider) NodeCanonicalHost(nodeID string) string {
+	return p.repo.NodeCanonicalHost(nodeID)
 }
 
 // ConfirmNodeContext is a no-op on the read-only override provider so ephemeral
@@ -298,19 +325,72 @@ func (p *OpenSSHParser) FindConcreteHostsByAddress(address string, port uint16) 
 
 // GetVirtualNode 根据 alias 从 ssh_config 生成运行时的内存 Node / Host / Identity
 func (p *OpenSSHParser) GetVirtualNode(alias string) (models.Node, models.Host, models.Identity, error) {
+	return p.GetVirtualNodeWithCanonical(alias, "")
+}
+
+// GetVirtualNodeWithCanonical evaluates ssh_config across Pass 1 (originalAlias)
+// and Pass 2 (canonicalHost) when canonicalHost differs from originalAlias.
+func (p *OpenSSHParser) GetVirtualNodeWithCanonical(originalAlias, canonicalHost string) (models.Node, models.Host, models.Identity, error) {
 	if p == nil {
 		p = &OpenSSHParser{cfg: nil}
 	}
-	lookupAlias, userOverride, portOverride, err := parseOpenSSHHostSpec(alias)
-	if err != nil {
-		return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("parse openssh host %q failed: %w", alias, err)
+	if p.err != nil {
+		return models.Node{}, models.Host{}, models.Identity{}, p.err
 	}
-	// 从配置中提取各种字段
-	hostName, expHostErr := resolveOpenSSHHostName(p.cfg, lookupAlias)
+	lookupAlias, userOverride, portOverride, err := parseOpenSSHHostSpec(originalAlias)
+	if err != nil {
+		return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("parse openssh host %q failed: %w", originalAlias, err)
+	}
+	return p.getVirtualNodeWithCanonical(lookupAlias, canonicalHost, userOverride, portOverride, originalAlias)
+}
+
+func (p *OpenSSHParser) getVirtualNodeWithCanonical(
+	lookupAlias, canonicalHost, userOverride string,
+	portOverride uint16,
+	nodeAlias string,
+) (models.Node, models.Host, models.Identity, error) {
+	if p == nil {
+		p = &OpenSSHParser{cfg: nil}
+	}
+	if p.err != nil {
+		return models.Node{}, models.Host{}, models.Identity{}, p.err
+	}
+	lookupAlias = strings.TrimSpace(lookupAlias)
+	if lookupAlias == "" {
+		return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("parse openssh host %q failed: host is empty", nodeAlias)
+	}
+	nodeAlias = strings.TrimSpace(nodeAlias)
+	if nodeAlias == "" {
+		nodeAlias = lookupAlias
+	}
+	cleanCanon := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(canonicalHost), "]"), "[")
+	passes := []string{lookupAlias}
+	if cleanCanon != "" && !strings.EqualFold(cleanCanon, lookupAlias) {
+		passes = append(passes, cleanCanon)
+	} else {
+		cleanCanon = ""
+	}
+
+	var hostName string
+	var expHostErr error
+	if cleanCanon != "" {
+		if firstSSHConfigKeyValue(p.cfg, lookupAlias, "HostName") != "" {
+			if hasASCIIControlChar(cleanCanon) {
+				expHostErr = fmt.Errorf("HostName %q contains invalid ASCII control characters", cleanCanon)
+			} else {
+				hostName = cleanCanon
+			}
+		} else {
+			hostName, expHostErr = resolveOpenSSHHostName(p.cfg, cleanCanon)
+		}
+	} else {
+		hostName, expHostErr = resolveOpenSSHHostName(p.cfg, lookupAlias)
+	}
 	if expHostErr != nil {
 		return models.Node{}, models.Host{}, models.Identity{}, expHostErr
 	}
-	user := p.getVal(lookupAlias, "User", "")
+
+	user := firstSSHConfigKeyValuePasses(p.cfg, passes, "User")
 	if user == "" {
 		defUser, userErr := getCurrentUser()
 		if userErr != nil {
@@ -318,7 +398,10 @@ func (p *OpenSSHParser) GetVirtualNode(alias string) (models.Node, models.Host, 
 		}
 		user = defUser
 	}
-	portStr := strings.TrimSpace(p.getVal(lookupAlias, "Port", "22"))
+	portStr := strings.TrimSpace(firstSSHConfigKeyValuePasses(p.cfg, passes, "Port"))
+	if portStr == "" {
+		portStr = "22"
+	}
 	parsedPort, parseErr := strconv.ParseUint(portStr, 10, 16)
 	if parseErr != nil || parsedPort == 0 {
 		return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("invalid port %q for %q in ssh config: must be between 1 and 65535", portStr, lookupAlias)
@@ -331,14 +414,14 @@ func (p *OpenSSHParser) GetVirtualNode(alias string) (models.Node, models.Host, 
 		port = portOverride
 	}
 
-	identityFile, expErr := normalizeConfigIdentityKeyPath(p.getVal(lookupAlias, "IdentityFile", ""))
+	identityFile, expErr := normalizeConfigIdentityKeyPath(firstSSHConfigKeyValuePasses(p.cfg, passes, "IdentityFile"))
 	if expErr != nil {
 		return models.Node{}, models.Host{}, models.Identity{}, expErr
 	}
 
-	_, proxyJump, _ := firstMatchingOpenSSHProxy(p.cfg, lookupAlias)
+	_, proxyJump, _ := firstMatchingOpenSSHProxyPasses(p.cfg, passes)
 
-	sshOpts, err := parseOpenSSHOptions(p.cfg, lookupAlias)
+	sshOpts, err := parseOpenSSHOptionsPasses(p.cfg, passes)
 	if err != nil {
 		return models.Node{}, models.Host{}, models.Identity{}, err
 	}
@@ -352,7 +435,7 @@ func (p *OpenSSHParser) GetVirtualNode(alias string) (models.Node, models.Host, 
 		ProxyJump:   proxyJump,
 		SudoMode:    models.SudoModeAuto, // 对于导入节点，依然支持 auto
 		Tags:        []string{"openssh"}, // 打一个虚拟 tag
-		Alias:       []string{alias},
+		Alias:       []string{nodeAlias},
 		SSHOptions:  sshOpts,
 	}
 
@@ -372,15 +455,29 @@ func (p *OpenSSHParser) GetVirtualNode(alias string) (models.Node, models.Host, 
 
 // GetSSHOptions parses supported OpenSSH client options for a given alias/host in ssh_config.
 func (p *OpenSSHParser) GetSSHOptions(alias string) (*ssh.Options, error) {
-	if p == nil || p.cfg == nil || alias == "" {
+	return p.GetSSHOptionsWithCanonical(alias, "")
+}
+
+// GetSSHOptionsWithCanonical evaluates supported OpenSSH client options across
+// Pass 1 (originalAlias) and Pass 2 (canonicalHost) when canonicalHost differs.
+func (p *OpenSSHParser) GetSSHOptionsWithCanonical(originalAlias, canonicalHost string) (*ssh.Options, error) {
+	if p != nil && p.err != nil {
+		return nil, p.err
+	}
+	if p == nil || p.cfg == nil || originalAlias == "" {
 		return nil, nil
 	}
-	cleanAlias := strings.TrimPrefix(alias, OpenSSHNodePrefix)
+	cleanAlias := strings.TrimPrefix(originalAlias, OpenSSHNodePrefix)
 	lookupAlias, _, _, err := parseOpenSSHHostSpec(cleanAlias)
 	if err != nil {
 		lookupAlias = cleanAlias
 	}
-	return parseOpenSSHOptions(p.cfg, lookupAlias)
+	passes := []string{lookupAlias}
+	cleanCanon := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(canonicalHost), "]"), "[")
+	if cleanCanon != "" && !strings.EqualFold(cleanCanon, lookupAlias) {
+		passes = append(passes, cleanCanon)
+	}
+	return parseOpenSSHOptionsPasses(p.cfg, passes)
 }
 
 // GetControlConfig parses multiplexing options for a given alias/host in ssh_config.
@@ -393,12 +490,16 @@ func (p *OpenSSHParser) GetControlConfig(alias string) (*ssh.ControlConfig, erro
 }
 
 func parseOpenSSHOptions(doc *sshConfigDoc, host string) (*ssh.Options, error) {
-	if doc == nil || host == "" {
+	return parseOpenSSHOptionsPasses(doc, []string{host})
+}
+
+func parseOpenSSHOptionsPasses(doc *sshConfigDoc, passes []string) (*ssh.Options, error) {
+	if doc == nil || len(passes) == 0 {
 		return nil, nil
 	}
 	opts := &ssh.Options{}
 	for _, spec := range ssh.RegisteredOptionSpecs() {
-		if err := applyOpenSSHSpecOption(doc, host, spec, opts); err != nil {
+		if err := applyOpenSSHSpecOptionPasses(doc, passes, spec, opts); err != nil {
 			return nil, err
 		}
 	}
@@ -408,7 +509,7 @@ func parseOpenSSHOptions(doc *sshConfigDoc, host string) (*ssh.Options, error) {
 	return opts, nil
 }
 
-func applyOpenSSHSpecOption(doc *sshConfigDoc, host string, spec ssh.OptionSpec, opts *ssh.Options) error {
+func applyOpenSSHSpecOptionPasses(doc *sshConfigDoc, passes []string, spec ssh.OptionSpec, opts *ssh.Options) error {
 	// Trust-class options (StrictHostKeyChecking, UserKnownHostsFile) are never
 	// inherited from ~/.ssh/config so wildcard host blocks cannot implicitly
 	// weaken host key verification. Only one-way HashKnownHosts=yes is allowed.
@@ -416,7 +517,7 @@ func applyOpenSSHSpecOption(doc *sshConfigDoc, host string, spec ssh.OptionSpec,
 		return nil
 	}
 	if spec.MultiValue {
-		rawVals := allMatchingOpenSSHOptions(doc, host, spec)
+		rawVals := allMatchingOpenSSHOptionsPasses(doc, passes, spec)
 		if spec.CanonicalKey == ssh.OptionSetEnv {
 			// OpenSSH evaluates only the first matching SetEnv directive
 			// in ssh_config (and retains the first occurrence per key inside it).
@@ -435,7 +536,7 @@ func applyOpenSSHSpecOption(doc *sshConfigDoc, host string, spec ssh.OptionSpec,
 		}
 		return nil
 	}
-	val, skip := resolveOpenSSHSingleOption(doc, host, spec)
+	val, skip := resolveOpenSSHSingleOptionPasses(doc, passes, spec)
 	if skip || val == "" {
 		return nil
 	}
@@ -454,7 +555,8 @@ func applyOpenSSHSpecOption(doc *sshConfigDoc, host string, spec ssh.OptionSpec,
 		// while leniently skipping unsupported ~/.ssh/config values (e.g.
 		// ControlPath tokens like %k or PubkeyAuthentication=unbound).
 		if spec.CanonicalKey == ssh.OptionControlMaster || spec.CanonicalKey == ssh.OptionControlPersist {
-			return fmt.Errorf("invalid %s %q for %q in ssh config: %w", spec.OpenSSHName, val, host, err)
+			hostLabel := passes[0]
+			return fmt.Errorf("invalid %s %q for %q in ssh config: %w", spec.OpenSSHName, val, hostLabel, err)
 		}
 	}
 	return nil
@@ -489,19 +591,43 @@ func sshConfigOptionValue(d *sshConfigDirective, canonicalKey string) string {
 // allMatchingOpenSSHOptions resolves all entries for a multi-value option strictly
 // top-to-bottom across matching ssh_config Host blocks (including Include files),
 // matching OpenSSH readconf.c evaluation order for SendEnv, IdentityFile, SetEnv, etc.
-func allMatchingOpenSSHOptions(doc *sshConfigDoc, host string, spec ssh.OptionSpec) []string {
-	if doc == nil || host == "" {
+func allMatchingOpenSSHOptionsPasses(doc *sshConfigDoc, passes []string, spec ssh.OptionSpec) []string {
+	if doc == nil || len(passes) == 0 {
 		return nil
 	}
 	keys := make([]string, 0, 1+len(spec.Aliases))
 	keys = append(keys, spec.OpenSSHName)
 	keys = append(keys, spec.Aliases...)
 
+	multiPass := len(passes) > 1
+	dedupAcrossPasses := multiPass &&
+		(spec.CanonicalKey == ssh.OptionIdentityFile || spec.CanonicalKey == ssh.OptionCertificateFile)
+	var seen map[string]struct{}
+	if dedupAcrossPasses {
+		seen = make(map[string]struct{})
+	}
+	var seenDirectives map[*sshConfigDirective]struct{}
+	if multiPass {
+		seenDirectives = make(map[*sshConfigDirective]struct{})
+	}
 	var matches []string
-	walkMatchingSSHConfigDirectives(doc, host, func(d *sshConfigDirective) bool {
+	walkMatchingSSHConfigDirectivesPasses(doc, passes, func(passIndex int, _ string, d *sshConfigDirective) bool {
+		if seenDirectives != nil && d != nil {
+			if passIndex == 0 {
+				seenDirectives[d] = struct{}{}
+			} else if _, already := seenDirectives[d]; already {
+				return true
+			}
+		}
 		for _, candidate := range keys {
 			if strings.EqualFold(d.key, candidate) {
 				if v := sshConfigOptionValue(d, spec.CanonicalKey); v != "" {
+					if dedupAcrossPasses {
+						if _, ok := seen[v]; ok {
+							break
+						}
+						seen[v] = struct{}{}
+					}
 					matches = append(matches, v)
 				}
 				break
@@ -518,23 +644,23 @@ func isAllowedOpenSSHTrustOption(canonicalKey string) bool {
 	return strings.EqualFold(strings.TrimSpace(canonicalKey), "hash_known_hosts")
 }
 
-func resolveOpenSSHSingleOption(doc *sshConfigDoc, host string, spec ssh.OptionSpec) (val string, skip bool) {
+func resolveOpenSSHSingleOptionPasses(doc *sshConfigDoc, passes []string, spec ssh.OptionSpec) (val string, skip bool) {
 	if spec.CanonicalKey == ssh.OptionProxyCommand {
 		var winner string
-		winner, _, val = firstMatchingOpenSSHProxy(doc, host)
+		winner, _, val = firstMatchingOpenSSHProxyPasses(doc, passes)
 		if winner == "proxyjump" {
 			return "", true
 		}
 		return val, false
 	}
-	return firstMatchingOpenSSHOption(doc, host, spec), false
+	return firstMatchingOpenSSHOptionPasses(doc, passes, spec), false
 }
 
-func firstMatchingOpenSSHOption(doc *sshConfigDoc, host string, spec ssh.OptionSpec) string {
+func firstMatchingOpenSSHOptionPasses(doc *sshConfigDoc, passes []string, spec ssh.OptionSpec) string {
 	keys := make([]string, 0, 1+len(spec.Aliases))
 	keys = append(keys, spec.OpenSSHName)
 	keys = append(keys, spec.Aliases...)
-	return firstSSHConfigKeyValueRaw(doc, host, preservesSSHConfigRawValue(spec.CanonicalKey), keys...)
+	return firstSSHConfigKeyValueRawPasses(doc, passes, preservesSSHConfigRawValue(spec.CanonicalKey), keys...)
 }
 
 func parseOpenSSHHostSpec(spec string) (host, userName string, port uint16, err error) {
@@ -637,12 +763,16 @@ func parseOpenSSHProxyJump(raw string) string {
 // first-match-wins order across matching Host blocks (including Include files),
 // including "none" stopping further search for that directive.
 func firstMatchingOpenSSHProxy(doc *sshConfigDoc, host string) (winner, proxyJump, proxyCommand string) {
-	if doc == nil || host == "" {
+	return firstMatchingOpenSSHProxyPasses(doc, []string{host})
+}
+
+func firstMatchingOpenSSHProxyPasses(doc *sshConfigDoc, passes []string) (winner, proxyJump, proxyCommand string) {
+	if doc == nil || len(passes) == 0 {
 		return "", "", ""
 	}
 	var sawJump, sawCmd bool
 	var jumpVal, cmdVal string
-	walkMatchingSSHConfigDirectives(doc, host, func(d *sshConfigDirective) bool {
+	walkMatchingSSHConfigDirectivesPasses(doc, passes, func(_ int, _ string, d *sshConfigDirective) bool {
 		switch d.lowerKey {
 		case "proxyjump":
 			v := d.value
@@ -652,7 +782,7 @@ func firstMatchingOpenSSHProxy(doc *sshConfigDoc, host string) (winner, proxyJum
 			if !sawJump {
 				sawJump = true
 				jumpVal = v
-				if winner == "" && !strings.EqualFold(v, "none") {
+				if winner == "" && ssh.HasActiveProxyJump(v) {
 					winner = "proxyjump"
 				}
 			}

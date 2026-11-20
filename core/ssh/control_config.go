@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -173,13 +174,14 @@ type ControlProvider interface {
 
 // TargetContext supplies destination, port, user, and routing context for ControlPath token expansion.
 type TargetContext struct {
-	Host         string         // Target host or IP address (%h)
-	Port         int            // Target port (%p), defaults to 22 if <= 0
-	User         string         // Target remote username (%r)
-	OriginalHost string         // Original command-line host or alias (%n), defaults to Host if empty
-	JumpHost     string         // ProxyJump host if any (%j), used in %C connection hash calculation
-	KeyPath      string         // Effective private key path for this target, if any
-	Control      *ControlConfig // Multiplexing control configuration
+	Host          string         // Target host or IP address (%h)
+	Port          int            // Target port (%p), defaults to 22 if <= 0
+	User          string         // Target remote username (%r)
+	OriginalHost  string         // Original command-line host or alias (%n), defaults to Host if empty
+	CanonicalHost string         // Canonicalized FQDN when OpenSSH two-pass canonicalization resolved one
+	JumpHost      string         // ProxyJump host if any (%j), used in %C connection hash calculation
+	KeyPath       string         // Effective private key path for this target, if any
+	Control       *ControlConfig // Multiplexing control configuration
 }
 
 const muxTargetExtensionName = "target@xops"
@@ -536,7 +538,8 @@ func ParseControlPersist(val string) (enabled bool, indefinite bool, timeout tim
 	return true, false, d, nil
 }
 
-// parseOpenSSHDuration parses a sequence of integer+qualifier units according to sshd_config(5) TIME FORMATS:
+// parseOpenSSHDuration parses a sequence of integer+qualifier units into time.Duration
+// according to sshd_config(5) TIME FORMATS with int64 overflow checks:
 //
 //	<none>  seconds
 //	s | S   seconds
@@ -551,12 +554,16 @@ func parseOpenSSHDuration(s string) (time.Duration, error) {
 		return 0, errors.New("empty duration string")
 	}
 
-	// Bare integer represents seconds
-	if val, err := strconv.ParseInt(s, 10, 64); err == nil {
-		if val <= 0 {
-			return 0, fmt.Errorf("duration must be positive: %d", val)
+	const maxDuration = time.Duration(math.MaxInt64)
+	addScaledDuration := func(total time.Duration, count int64, unit time.Duration) (time.Duration, error) {
+		if count > int64(maxDuration/unit) {
+			return 0, fmt.Errorf("duration overflows int64 in %q", s)
 		}
-		return time.Duration(val) * time.Second, nil
+		part := time.Duration(count) * unit
+		if total > maxDuration-part {
+			return 0, fmt.Errorf("duration overflows int64 in %q", s)
+		}
+		return total + part, nil
 	}
 
 	var total time.Duration
@@ -577,34 +584,40 @@ func parseOpenSSHDuration(s string) (time.Duration, error) {
 		remaining = remaining[i:]
 
 		// Read unit qualifier
-		if len(remaining) == 0 {
-			total += time.Duration(num) * time.Second
-			break
+		unit := time.Second
+		if len(remaining) > 0 {
+			unitChar := remaining[0]
+			remaining = remaining[1:]
+			unit, err = parseOpenSSHDurationUnit(unitChar, s)
+			if err != nil {
+				return 0, err
+			}
 		}
-
-		unitChar := remaining[0]
-		remaining = remaining[1:]
-
-		var unit time.Duration
-		switch unitChar {
-		case 's', 'S':
-			unit = time.Second
-		case 'm', 'M':
-			unit = time.Minute
-		case 'h', 'H':
-			unit = time.Hour
-		case 'd', 'D':
-			unit = 24 * time.Hour
-		case 'w', 'W':
-			unit = 7 * 24 * time.Hour
-		default:
-			return 0, fmt.Errorf("unknown time qualifier '%c' in %q", unitChar, s)
+		total, err = addScaledDuration(total, num, unit)
+		if err != nil {
+			return 0, err
 		}
-		total += time.Duration(num) * unit
 	}
 
 	if total <= 0 {
 		return 0, fmt.Errorf("duration must be positive: %v", total)
 	}
 	return total, nil
+}
+
+func parseOpenSSHDurationUnit(unitChar byte, full string) (time.Duration, error) {
+	switch unitChar {
+	case 's', 'S':
+		return time.Second, nil
+	case 'm', 'M':
+		return time.Minute, nil
+	case 'h', 'H':
+		return time.Hour, nil
+	case 'd', 'D':
+		return 24 * time.Hour, nil
+	case 'w', 'W':
+		return 7 * 24 * time.Hour, nil
+	default:
+		return 0, fmt.Errorf("unknown time qualifier '%c' in %q", unitChar, full)
+	}
 }

@@ -9,10 +9,14 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/creack/pty"
 	cryptoSSH "golang.org/x/crypto/ssh"
 	"golang.org/x/sys/unix"
 )
@@ -292,7 +296,10 @@ func TestPassengerSession_TTYAllocFailSentAfterSessionOpenedWithSessionID(t *tes
 	if err != nil {
 		t.Fatalf("NewMuxServer failed: %v", err)
 	}
-	defer func() { _ = server.Shutdown() }()
+	defer func() {
+		_ = server.Shutdown()
+		<-server.Wait()
+	}()
 	go func() { _ = server.Serve() }()
 
 	clientConn, err := net.Dial("unix", sockPath)
@@ -454,7 +461,10 @@ func TestPassengerSession_SubsystemAndStdinEOF(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMuxServer failed: %v", err)
 	}
-	defer func() { _ = server.Shutdown() }()
+	defer func() {
+		_ = server.Shutdown()
+		<-server.Wait()
+	}()
 	go func() { _ = server.Serve() }()
 
 	clientConn, err := net.Dial("unix", sockPath)
@@ -613,7 +623,10 @@ func TestPassengerSession_BlockingPipeDoesNotDeadlockOnExit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMuxServer failed: %v", err)
 	}
-	defer func() { _ = server.Shutdown() }()
+	defer func() {
+		_ = server.Shutdown()
+		<-server.Wait()
+	}()
 	go func() { _ = server.Serve() }()
 
 	clientConn, err := net.Dial("unix", sockPath)
@@ -686,5 +699,534 @@ func TestPassengerSession_BlockingPipeDoesNotDeadlockOnExit(t *testing.T) {
 	}
 	if flags&unix.O_NONBLOCK != 0 {
 		t.Fatalf("passenger session mutated O_NONBLOCK on shared open file description (flags=0x%x)", flags)
+	}
+}
+
+func sendCustomPipeFDs(t *testing.T, clientConn net.Conn, fds [3]int) {
+	t.Helper()
+	unixClient, ok := clientConn.(*net.UnixConn)
+	if !ok {
+		t.Fatalf("expected *net.UnixConn, got %T", clientConn)
+	}
+	rawConn, err := unixClient.SyscallConn()
+	if err != nil {
+		t.Fatalf("SyscallConn failed: %v", err)
+	}
+	for _, fd := range fds {
+		var sendErr error
+		_ = rawConn.Control(func(sockFD uintptr) {
+			sendErr = unix.Sendmsg(int(sockFD), []byte{0}, unix.UnixRights(fd), nil, 0)
+		})
+		if sendErr != nil {
+			t.Fatalf("send fd %d failed: %v", fd, sendErr)
+		}
+	}
+}
+
+type floodModeChannel struct {
+	reqs         chan *cryptoSSH.Request
+	reqsOnce     sync.Once
+	closed       chan struct{}
+	closeOnce    sync.Once
+	floodPayload []byte
+	off          int
+	eofStdout    bool
+	readHit      chan struct{}
+	readOnce     sync.Once
+	zeroWrite    bool
+	writeHit     chan struct{}
+	releaseExit  chan struct{}
+}
+
+type eofReadWriter struct{}
+
+func (eofReadWriter) Read([]byte) (int, error)    { return 0, io.EOF }
+func (eofReadWriter) Write(b []byte) (int, error) { return len(b), nil }
+
+func (c *floodModeChannel) closeReqs() {
+	c.reqsOnce.Do(func() {
+		if c.reqs != nil {
+			close(c.reqs)
+		}
+	})
+}
+
+func (c *floodModeChannel) Read(b []byte) (int, error) {
+	if c.eofStdout {
+		if c.releaseExit != nil {
+			select {
+			case <-c.releaseExit:
+			case <-c.closed:
+			}
+		}
+		return 0, io.EOF
+	}
+	if c.off < len(c.floodPayload) {
+		n := copy(b, c.floodPayload[c.off:])
+		c.off += n
+		if c.readHit != nil {
+			c.readOnce.Do(func() { close(c.readHit) })
+		}
+		return n, nil
+	}
+	<-c.closed
+	return 0, io.EOF
+}
+
+func (c *floodModeChannel) Write(b []byte) (int, error) {
+	if c.zeroWrite {
+		if c.writeHit != nil {
+			select {
+			case <-c.writeHit:
+			default:
+				close(c.writeHit)
+			}
+		}
+		<-c.closed
+		return 0, net.ErrClosed
+	}
+	return len(b), nil
+}
+
+func (c *floodModeChannel) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	c.closeReqs()
+	return nil
+}
+
+func (c *floodModeChannel) CloseWrite() error     { return nil }
+func (c *floodModeChannel) Stderr() io.ReadWriter { return eofReadWriter{} }
+func (c *floodModeChannel) SendRequest(name string, _ bool, reqPayload []byte) (bool, error) {
+	if name == "exec" {
+		cmd := string(reqPayload)
+		switch {
+		case strings.Contains(cmd, "ping"):
+			c.eofStdout = true
+			c.reqs <- &cryptoSSH.Request{
+				Type:      "exit-status",
+				WantReply: false,
+				Payload:   cryptoSSH.Marshal(struct{ Status uint32 }{0}),
+			}
+			c.closeReqs()
+		case strings.Contains(cmd, "zero"):
+			c.zeroWrite = true
+			c.eofStdout = true
+			go func() {
+				if c.releaseExit != nil {
+					select {
+					case <-c.releaseExit:
+					case <-c.closed:
+						return
+					}
+				}
+				select {
+				case c.reqs <- &cryptoSSH.Request{
+					Type:      "exit-status",
+					WantReply: false,
+					Payload:   cryptoSSH.Marshal(struct{ Status uint32 }{0}),
+				}:
+				case <-c.closed:
+					return
+				}
+				c.closeReqs()
+			}()
+		default:
+			c.floodPayload = bytes.Repeat([]byte{'A'}, 256*1024)
+		}
+	}
+	return true, nil
+}
+
+type routedSessionSSHConn struct {
+	*dummySSHConn
+	readHit     chan struct{}
+	writeHit    chan struct{}
+	releaseExit chan struct{}
+}
+
+func (conn *routedSessionSSHConn) OpenChannel(name string, _ []byte) (cryptoSSH.Channel, <-chan *cryptoSSH.Request, error) {
+	if name != "session" {
+		return nil, nil, errors.New("unsupported")
+	}
+	reqs := make(chan *cryptoSSH.Request, 1)
+	return &floodModeChannel{
+		reqs:        reqs,
+		closed:      make(chan struct{}),
+		readHit:     conn.readHit,
+		writeHit:    conn.writeHit,
+		releaseExit: conn.releaseExit,
+	}, reqs, nil
+}
+
+func waitPipeWriteBackpressured(t *testing.T, writeFD int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	pfd := []unix.PollFd{{Fd: int32(writeFD), Events: unix.POLLOUT}}
+	for time.Now().Before(deadline) {
+		pfd[0].Revents = 0
+		n, err := unix.Poll(pfd, 0)
+		if err == nil && (n == 0 || pfd[0].Revents&unix.POLLOUT == 0) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("stdout pipe never became write-backpressured")
+}
+
+func waitServerActiveSessionsZero(t *testing.T, server *MuxServer) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if server.ActiveSessions() == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("MuxServer ActiveSessions() = %d, want 0", server.ActiveSessions())
+}
+
+func TestPassengerSession_FullBlockingStdoutPipeDoesNotKillMuxServerOnClientDisconnect(t *testing.T) {
+	chans := make(chan cryptoSSH.NewChannel)
+	reqs := make(chan *cryptoSSH.Request)
+	readHit := make(chan struct{})
+	conn := &routedSessionSSHConn{
+		dummySSHConn: &dummySSHConn{chans: chans, reqs: reqs},
+		readHit:      readHit,
+	}
+	sshClient := cryptoSSH.NewClient(conn, chans, reqs)
+	defer func() { _ = sshClient.Close() }()
+
+	sockPath := filepath.Join(shortSocketDir(t), "full-pipe-isolation.sock")
+	server, err := NewMuxServer(MuxServerOptions{
+		ControlPath:       sockPath,
+		SSHClient:         sshClient,
+		PersistEnabled:    true,
+		PersistIndefinite: true,
+	})
+	if err != nil {
+		t.Fatalf("NewMuxServer failed: %v", err)
+	}
+	defer func() {
+		_ = server.Shutdown()
+		<-server.Wait()
+	}()
+	go func() { _ = server.Serve() }()
+
+	// Session 1: unread blocking stdout pipe fills past kernel pipe buffer and blocks copyToPollableFD.
+	var inPipe, outPipe, errPipe [2]int
+	mustCloexecPipe(t, &inPipe)
+	mustCloexecPipe(t, &outPipe)
+	mustCloexecPipe(t, &errPipe)
+	defer func() {
+		for _, fd := range []int{inPipe[0], inPipe[1], outPipe[0], outPipe[1], errPipe[0], errPipe[1]} {
+			_ = unix.Close(fd)
+		}
+	}()
+
+	c1, err := net.Dial("unix", sockPath)
+	if err != nil {
+		t.Fatalf("dial unix socket: %v", err)
+	}
+	if err := performClientMuxHandshake(c1); err != nil {
+		_ = c1.Close()
+		t.Fatalf("handshake 1: %v", err)
+	}
+	if err := WriteMuxPacket(c1, MUX_C_NEW_SESSION, EncodeMuxNewSession(MuxNewSessionRequest{
+		RequestID: 1,
+		Command:   "flood",
+	})); err != nil {
+		_ = c1.Close()
+		t.Fatalf("send session 1: %v", err)
+	}
+	sendCustomPipeFDs(t, c1, [3]int{inPipe[0], outPipe[1], errPipe[1]})
+	_, _, err = ReadMuxPacket(c1) // MUX_S_SESSION_OPENED
+	if err != nil {
+		_ = c1.Close()
+		t.Fatalf("read session 1 opened: %v", err)
+	}
+
+	select {
+	case <-readHit:
+	case <-time.After(3 * time.Second):
+		_ = c1.Close()
+		t.Fatal("flood session never began reading payload")
+	}
+	waitPipeWriteBackpressured(t, outPipe[1])
+	_ = c1.Close()
+	waitServerActiveSessionsZero(t, server)
+
+	// Shared master must NOT be torn down when passenger 1 disconnects with a full stdout pipe.
+	select {
+	case <-server.Wait():
+		t.Fatal("MuxServer shut down after passenger with full stdout pipe disconnected")
+	default:
+	}
+
+	// Session 2 on the same master must succeed.
+	c2, err := net.Dial("unix", sockPath)
+	if err != nil {
+		t.Fatalf("dial session 2: %v", err)
+	}
+	defer func() { _ = c2.Close() }()
+	if err := performClientMuxHandshake(c2); err != nil {
+		t.Fatalf("handshake 2: %v", err)
+	}
+	if err := WriteMuxPacket(c2, MUX_C_NEW_SESSION, EncodeMuxNewSession(MuxNewSessionRequest{
+		RequestID: 2,
+		Command:   "ping",
+	})); err != nil {
+		t.Fatalf("send session 2: %v", err)
+	}
+	sendSessionPipeFDs(t, c2)
+	pt, _, err := ReadMuxPacket(c2)
+	if err != nil || pt != MUX_S_SESSION_OPENED {
+		t.Fatalf("session 2 opened = (0x%x, %v), want MUX_S_SESSION_OPENED", pt, err)
+	}
+	pt, payload, err := ReadMuxPacket(c2)
+	if err != nil || pt != MUX_S_EXIT_MESSAGE {
+		t.Fatalf("session 2 exit = (0x%x, %v), want MUX_S_EXIT_MESSAGE", pt, err)
+	}
+	_, code, _ := DecodeMuxExitMessage(payload)
+	if code != 0 {
+		t.Fatalf("session 2 exit code = %d, want 0", code)
+	}
+}
+
+func TestPassengerSession_RemoteZeroWindowWriteExitsCleanlyWithoutKillingServer(t *testing.T) {
+	chans := make(chan cryptoSSH.NewChannel)
+	reqs := make(chan *cryptoSSH.Request)
+	writeHit := make(chan struct{})
+	releaseExit := make(chan struct{})
+	conn := &routedSessionSSHConn{
+		dummySSHConn: &dummySSHConn{chans: chans, reqs: reqs},
+		writeHit:     writeHit,
+		releaseExit:  releaseExit,
+	}
+	sshClient := cryptoSSH.NewClient(conn, chans, reqs)
+	defer func() { _ = sshClient.Close() }()
+
+	sockPath := filepath.Join(shortSocketDir(t), "zero-win-exit.sock")
+	server, err := NewMuxServer(MuxServerOptions{
+		ControlPath:       sockPath,
+		SSHClient:         sshClient,
+		PersistEnabled:    true,
+		PersistIndefinite: true,
+	})
+	if err != nil {
+		t.Fatalf("NewMuxServer failed: %v", err)
+	}
+	defer func() {
+		_ = server.Shutdown()
+		<-server.Wait()
+	}()
+	go func() { _ = server.Serve() }()
+
+	var inPipe, outPipe, errPipe [2]int
+	mustCloexecPipe(t, &inPipe)
+	mustCloexecPipe(t, &outPipe)
+	mustCloexecPipe(t, &errPipe)
+	defer func() {
+		for _, fd := range []int{inPipe[0], inPipe[1], outPipe[0], outPipe[1], errPipe[0], errPipe[1]} {
+			_ = unix.Close(fd)
+		}
+	}()
+	// Seed stdin so copyFromPollableFD immediately calls ch.Write and blocks in zero-window state.
+	if _, wErr := unix.Write(inPipe[1], []byte("stdin-data")); wErr != nil {
+		t.Fatalf("seed stdin pipe: %v", wErr)
+	}
+
+	c1, err := net.Dial("unix", sockPath)
+	if err != nil {
+		t.Fatalf("dial unix socket: %v", err)
+	}
+	defer func() { _ = c1.Close() }()
+	if err := performClientMuxHandshake(c1); err != nil {
+		t.Fatalf("handshake: %v", err)
+	}
+	if err := WriteMuxPacket(c1, MUX_C_NEW_SESSION, EncodeMuxNewSession(MuxNewSessionRequest{
+		RequestID: 1,
+		Command:   "zero",
+	})); err != nil {
+		t.Fatalf("send session: %v", err)
+	}
+	sendCustomPipeFDs(t, c1, [3]int{inPipe[0], outPipe[1], errPipe[1]})
+
+	// Ensure copyFromPollableFD is genuinely blocked in ch.Write before releasing remote exit.
+	select {
+	case <-writeHit:
+	case <-time.After(3 * time.Second):
+		close(releaseExit)
+		t.Fatal("copyFromPollableFD never reached blocked zero-window ch.Write")
+	}
+	close(releaseExit)
+
+	// Wait for exit message despite blocked remote Write & open stdinPipe[1].
+	done := make(chan error, 1)
+	go func() {
+		pt, _, rErr := ReadMuxPacket(c1) // OPENED
+		if rErr != nil {
+			done <- rErr
+			return
+		}
+		if pt != MUX_S_SESSION_OPENED {
+			done <- errors.New("expected session opened")
+			return
+		}
+		pt, _, rErr = ReadMuxPacket(c1) // EXIT_MESSAGE
+		if rErr != nil {
+			done <- rErr
+			return
+		}
+		if pt != MUX_S_EXIT_MESSAGE {
+			done <- errors.New("expected exit message")
+			return
+		}
+		done <- nil
+	}()
+	select {
+	case rErr := <-done:
+		if rErr != nil {
+			t.Fatalf("zero-window exit session failed: %v", rErr)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("zero-window session deadlocked on remote exit")
+	}
+	waitServerActiveSessionsZero(t, server)
+
+	select {
+	case <-server.Wait():
+		t.Fatal("MuxServer shut down unexpectedly after zero-window session exit")
+	case <-time.After(80 * time.Millisecond):
+	}
+}
+
+func TestCopyToPollableFD_LazyWakePipeLeavesZeroOpenWakePipesWhileIdle(t *testing.T) {
+	rOut, wOut, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe stdout: %v", err)
+	}
+	defer func() {
+		_ = rOut.Close()
+		_ = wOut.Close()
+	}()
+	rSrc, wSrc, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe src: %v", err)
+	}
+	defer func() {
+		_ = rSrc.Close()
+		_ = wSrc.Close()
+	}()
+
+	stop := make(chan struct{})
+	var baseFDs int
+	if runtime.GOOS == "linux" {
+		entries, _ := os.ReadDir("/proc/self/fd")
+		baseFDs = len(entries)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- copyToPollableFD(wOut, rSrc, stop)
+	}()
+
+	if _, wErr := wSrc.Write([]byte("hello")); wErr != nil {
+		t.Fatalf("write src: %v", wErr)
+	}
+	buf := make([]byte, 5)
+	if _, rErr := io.ReadFull(rOut, buf); rErr != nil || string(buf) != "hello" {
+		t.Fatalf("read out = (%q, %v), want %q", string(buf), rErr, "hello")
+	}
+	if runtime.GOOS == "linux" {
+		entries, _ := os.ReadDir("/proc/self/fd")
+		// One goroutine stack / no wake pipe should add zero open FDs while idle.
+		if len(entries) > baseFDs {
+			t.Fatalf("open FDs grew from %d to %d while copyToPollableFD is idle", baseFDs, len(entries))
+		}
+	}
+
+	_ = wSrc.Close()
+	select {
+	case copyErr := <-done:
+		if copyErr != nil {
+			t.Fatalf("copyToPollableFD: %v", copyErr)
+		}
+	case <-time.After(2 * time.Second):
+		close(stop)
+		t.Fatal("copyToPollableFD did not exit on source EOF")
+	}
+	close(stop)
+}
+
+type newlineFloodReader struct {
+	chunk []byte
+	done  chan struct{}
+}
+
+func (r *newlineFloodReader) Read(p []byte) (int, error) {
+	select {
+	case <-r.done:
+		return 0, io.EOF
+	default:
+		n := copy(p, r.chunk)
+		return n, nil
+	}
+}
+
+func TestCopyToPollableFD_ReopenedBlockingPTYDoesNotBlockOnCancel(t *testing.T) {
+	master, slave, err := pty.Open()
+	if err != nil {
+		t.Skipf("pty.Open unavailable in environment: %v", err)
+	}
+	defer func() {
+		_ = master.Close()
+		_ = slave.Close()
+	}()
+
+	// Put slave descriptor in blocking mode (as inherited by an interactive passenger)
+	// and write '\n'-heavy lines that default OPOST|ONLCR doubles inside the kernel.
+	slaveConn, err := slave.SyscallConn()
+	if err != nil {
+		t.Fatalf("slave SyscallConn: %v", err)
+	}
+	_ = slaveConn.Control(func(fd uintptr) {
+		_ = unix.SetNonblock(int(fd), false)
+	})
+
+	stop := make(chan struct{})
+	srcDone := make(chan struct{})
+	src := &newlineFloodReader{
+		chunk: bytes.Repeat([]byte{'\n'}, 512),
+		done:  srcDone,
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- copyToPollableFD(slave, src, stop)
+	}()
+
+	// Wait deterministically until the un-drained PTY slave reports POLLOUT==0.
+	if ctrlErr := slaveConn.Control(func(fd uintptr) {
+		waitPipeWriteBackpressured(t, int(fd))
+	}); ctrlErr != nil {
+		t.Fatalf("slave Control: %v", ctrlErr)
+	}
+	close(stop)
+	close(srcDone)
+
+	select {
+	case copyErr := <-done:
+		if copyErr != nil {
+			t.Fatalf("copyToPollableFD(PTY) returned error after stop: %v", copyErr)
+		}
+	case <-time.After(2 * time.Second):
+		_ = master.Close()
+		t.Fatal("copyToPollableFD(PTY) blocked inside kernel write past stop cancellation")
+	}
+
+	var slaveFlags int
+	_ = slaveConn.Control(func(fd uintptr) {
+		slaveFlags, _ = unix.FcntlInt(fd, unix.F_GETFL, 0)
+	})
+	if slaveFlags&unix.O_NONBLOCK != 0 {
+		t.Fatalf("copyToPollableFD mutated caller's PTY O_NONBLOCK flag: flags=%#x", slaveFlags)
 	}
 }

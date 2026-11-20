@@ -280,3 +280,34 @@ func TestSocks5Forward(t *testing.T) {
 		t.Errorf("expected %q, got %q", expected, string(buf[:n]))
 	}
 }
+
+func TestHandleSocks5Handshake_RejectsUnsupportedAuthMethodsWithFF(t *testing.T) {
+	cases := [][]byte{
+		{0x05, 0x01, 0x02}, // username/password only (no 0x00)
+		{0x05, 0x00},       // NMETHODS=0
+	}
+	for _, req := range cases {
+		cConn, sConn := net.Pipe()
+		srvErr := make(chan error, 1)
+		go func() {
+			_, err := handleSocks5Handshake(sConn)
+			srvErr <- err
+		}()
+		// handleSocks5Handshake expects version byte 0x05 to have already been consumed by serveSocksConnWithTimeout.
+		_, _ = cConn.Write(req[1:])
+		reply := make([]byte, 2)
+		if _, err := io.ReadFull(cConn, reply); err != nil {
+			_ = cConn.Close()
+			_ = sConn.Close()
+			t.Fatalf("ReadFull reply for %v failed: %v", req, err)
+		}
+		_ = cConn.Close()
+		_ = sConn.Close()
+		if reply[0] != 0x05 || reply[1] != 0xFF {
+			t.Fatalf("reply for %v = [%#x %#x], want [0x05 0xFF]", req, reply[0], reply[1])
+		}
+		if err := <-srvErr; err == nil {
+			t.Fatalf("expected handleSocks5Handshake(%v) to return error", req)
+		}
+	}
+}

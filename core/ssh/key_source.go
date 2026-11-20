@@ -39,7 +39,39 @@ func WithKeySource(source KeySource) Option {
 	return func(c *Connector) { c.keySource = source }
 }
 
-func (c *Connector) sourcedKeyMethods(ctx context.Context, cfg *ClientConfig) ([]certAuthCandidateMethod, cryptoSSH.AuthMethod, cryptoSSH.PublicKey, func() error, error) {
+type sourcedKeyBundle struct {
+	certMethods []certAuthCandidateMethod
+	plainMethod cryptoSSH.AuthMethod
+	pubKey      cryptoSSH.PublicKey
+	release     func() error
+}
+
+func (b *sourcedKeyBundle) close() error {
+	if b == nil || b.release == nil {
+		return nil
+	}
+	return b.release()
+}
+
+func filterSourcedKeyPath(paths []string, sourcedKeyPath string, env Environment, target TargetContext, resolveKeyPath func(string) string) []string {
+	if sourcedKeyPath == "" || len(paths) == 0 {
+		return paths
+	}
+	sourcedExpanded, expErr := expandIdentityKeyPath(sourcedKeyPath, env, target, resolveKeyPath)
+	if expErr != nil || sourcedExpanded == "" {
+		return paths
+	}
+	filtered := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if pExp, pErr := expandIdentityKeyPath(p, env, target, resolveKeyPath); pErr == nil && pExp == sourcedExpanded {
+			continue
+		}
+		filtered = append(filtered, p)
+	}
+	return filtered
+}
+
+func (c *Connector) sourcedKeyMethods(ctx context.Context, cfg *ClientConfig) (*sourcedKeyBundle, error) {
 	lease, err := c.keySource.OpenKey(ctx, KeyRequest{
 		NodeID: cfg.NodeID, Host: cfg.Address, Port: cfg.Port, User: cfg.User,
 		Reference: cfg.KeyRef, Path: cfg.KeyPath, VersionToken: cfg.AuthUpdateToken,
@@ -52,17 +84,17 @@ func (c *Connector) sourcedKeyMethods(ctx context.Context, cfg *ClientConfig) ([
 		if cleanup != nil {
 			err = errors.Join(err, cleanup())
 		}
-		return nil, nil, nil, nil, fmt.Errorf("resolve private key signer: %w", err)
+		return nil, fmt.Errorf("resolve private key signer: %w", err)
 	}
 	if nilCapability(lease) {
-		return nil, nil, nil, nil, errors.New("private key source returned no lease")
+		return nil, errors.New("private key source returned no lease")
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, nil, nil, nil, errors.Join(err, cleanup())
+		return nil, errors.Join(err, cleanup())
 	}
 	signer := lease.Signer()
 	if nilCapability(signer) {
-		return nil, nil, nil, nil, errors.Join(errors.New("private key source returned no signer"), cleanup())
+		return nil, errors.Join(errors.New("private key source returned no signer"), cleanup())
 	}
 
 	l := c.getLogger()
@@ -79,15 +111,24 @@ func (c *Connector) sourcedKeyMethods(ctx context.Context, cfg *ClientConfig) ([
 		}
 		certMethods = append(certMethods, certAuthCandidateMethod{
 			certPath: mc.path,
+			certPub:  mc.cert,
 			method:   cryptoSSH.PublicKeys(cs),
 		})
 	}
-	return certMethods, cryptoSSH.PublicKeys(signer), signer.PublicKey(), cleanup, nil
+	return &sourcedKeyBundle{
+		certMethods: certMethods,
+		plainMethod: cryptoSSH.PublicKeys(signer),
+		pubKey:      signer.PublicKey(),
+		release:     cleanup,
+	}, nil
 }
 
 func (c *Connector) sourcedKeyAuth(ctx context.Context, cfg *ClientConfig) (cryptoSSH.AuthMethod, func() error, error) {
-	_, plainMethod, _, cleanup, err := c.sourcedKeyMethods(ctx, cfg)
-	return plainMethod, cleanup, err
+	bundle, err := c.sourcedKeyMethods(ctx, cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	return bundle.plainMethod, bundle.release, nil
 }
 
 // Adapt existing cleanup callbacks while key leases propagate close errors.
@@ -98,71 +139,44 @@ func legacyAuthCleanup(cleanup func()) func() error {
 	return func() error { cleanup(); return nil }
 }
 
-func (c *Connector) keyAuth(ctx context.Context, cfg *ClientConfig, prompter SecretPrompter, discovered func()) (cryptoSSH.AuthMethod, func() error, error) {
-	if c.keySource != nil {
-		return c.sourcedKeyAuth(ctx, cfg)
-	}
-	policy := freezeDialPolicy(cfg)
-	attempt := newHandshakeAttempt(cfg, discovered)
-	if credentialRecoveryPrompter(c.getNodeSecretPrompter(policy.readOnlyConfig())) != nil {
-		method, release, err := c.recoverableKeyAuth(ctx, policy, attempt, prompter)
-		if err != nil {
-			attempt.scrub()
-			return nil, nil, err
-		}
-		return method, func() error {
-			attempt.scrub()
-			if release != nil {
-				release()
-			}
-			return nil
-		}, nil
-	}
-	defer attempt.scrub()
-	method, err := c.resolveKeyAuthWithPolicy(policy, attempt)
-	return method, nil, err
-}
-
 // Explicit referenced signers precede agent/file/password candidates. A source
 // lookup failure cannot silently fall back to a different authentication source.
 func (c *Connector) buildOwnedAutoAuth(ctx context.Context, cfg *ClientConfig, options AutoAuthOptions) (autoAuthPlan, func() error, error) {
 	policy := newAuthPolicy(options.SSHOptions, options.HostKeyChanged)
-	if !policy.pubkeyAllowed || (cfg.KeyRef == "" && (c.keySource == nil || cfg.KeyPath == "")) {
+	if !policy.pubkeyAllowed || (cfg.KeyRef == "" && c.keySource == nil) {
 		plan := buildAutoAuthPlan(ctx, options)
 		return plan, legacyAuthCleanup(plan.cleanup), nil
 	}
 	if c.keySource == nil {
 		return autoAuthPlan{}, nil, errors.New("referenced SSH key requires an explicit key source")
 	}
-	certMethods, plainMethod, sourcedPub, release, err := c.sourcedKeyMethods(options.LifecycleCtx, cfg)
+	bundle, err := c.sourcedKeyMethods(options.LifecycleCtx, cfg)
 	if err != nil {
+		if cfg.KeyRef == "" && cfg.KeyPath == "" && errors.Is(err, ErrKeyNotFound) {
+			plan := buildAutoAuthPlan(ctx, options)
+			return plan, legacyAuthCleanup(plan.cleanup), nil
+		}
 		return autoAuthPlan{}, nil, err
 	}
-	if sourcedPub != nil {
-		options.FirstPublicKeys = append(options.FirstPublicKeys, sourcedPub)
+	if bundle.pubKey != nil {
+		options.FirstPublicKeys = append(options.FirstPublicKeys, bundle.pubKey)
 	}
-	for _, cm := range certMethods {
+	for _, cm := range bundle.certMethods {
+		if cm.certPub != nil {
+			options.FirstPublicKeys = append(options.FirstPublicKeys, cm.certPub)
+		}
+		if cm.certPath != "" {
+			options.FirstCertPaths = append(options.FirstCertPaths, cm.certPath)
+		}
 		options.FirstCertMethods = append(options.FirstCertMethods, cm.method)
 	}
-	if cfg.KeyPath != "" && len(options.KeyPaths) > 0 {
-		target := effectiveAuthTargetContext(options)
-		if sourcedExpanded, expErr := expandIdentityKeyPath(cfg.KeyPath, options.Environment, target, options.ResolveKeyPath); expErr == nil && sourcedExpanded != "" {
-			filtered := make([]string, 0, len(options.KeyPaths))
-			for _, p := range options.KeyPaths {
-				if pExp, pErr := expandIdentityKeyPath(p, options.Environment, target, options.ResolveKeyPath); pErr == nil && pExp == sourcedExpanded {
-					continue
-				}
-				filtered = append(filtered, p)
-			}
-			options.KeyPaths = filtered
-		}
-	}
+	options.ExcludeKeyPath = cfg.KeyPath
 	options.KeyPath = ""
-	plan := buildAutoAuthPlan(ctx, options, plainMethod)
+	plan := buildAutoAuthPlan(ctx, options, bundle.plainMethod)
 	return plan, func() error {
 		if plan.cleanup != nil {
 			plan.cleanup()
 		}
-		return release()
+		return bundle.close()
 	}, nil
 }

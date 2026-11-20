@@ -637,6 +637,38 @@ func LookupOptionSpec(key string) (OptionSpec, bool) {
 	return spec, ok
 }
 
+// IsDisabledProxyJump reports whether raw explicitly disables ProxyJump
+// (e.g. "none" or comma-separated "none,none" with no active hop).
+func IsDisabledProxyJump(raw string) bool {
+	sawToken := false
+	for _, part := range strings.Split(raw, ",") {
+		tok := strings.TrimSpace(part)
+		if tok == "" {
+			continue
+		}
+		sawToken = true
+		if !strings.EqualFold(tok, "none") {
+			return false
+		}
+	}
+	return sawToken
+}
+
+// HasActiveProxyJump reports whether raw contains at least one non-empty hop
+// other than "none".
+func HasActiveProxyJump(raw string) bool {
+	for _, part := range strings.Split(raw, ",") {
+		tok := strings.TrimSpace(part)
+		if tok == "" {
+			continue
+		}
+		if !strings.EqualFold(tok, "none") {
+			return true
+		}
+	}
+	return false
+}
+
 // ParseStrictHostKeyChecking validates and normalizes StrictHostKeyChecking values.
 func ParseStrictHostKeyChecking(raw string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {

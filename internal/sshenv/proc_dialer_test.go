@@ -478,3 +478,40 @@ func TestProcessStdioConn_CloseDoesNotHangWhenStderrWriterBlocks(t *testing.T) {
 		t.Fatalf("conn.Close() took %v with blocked stderr writer, expected bounded wait", elapsed)
 	}
 }
+
+type trackingCloser struct {
+	closed atomic.Int32
+}
+
+func (c *trackingCloser) Close() error {
+	c.closed.Add(1)
+	return nil
+}
+
+func TestRound4_P2_12_FallbackDeadlineClearsWithoutStaleCloseTOCTOU(t *testing.T) {
+	for range 200 {
+		closer := &trackingCloser{}
+		c := &ProcessStdioConn{}
+		if err := c.setFallbackDeadline(closer, time.Now().Add(time.Millisecond), true); err != nil {
+			t.Fatalf("setFallbackDeadline(arm): %v", err)
+		}
+		time.Sleep(time.Millisecond)
+		if err := c.setFallbackDeadline(closer, time.Time{}, true); err != nil {
+			t.Fatalf("setFallbackDeadline(clear): %v", err)
+		}
+		c.mu.Lock()
+		timedOut := c.readTimedOut
+		c.mu.Unlock()
+		if timedOut {
+			t.Fatalf("readTimedOut stayed true immediately after clearing deadline under mutex serialization")
+		}
+		time.Sleep(2 * time.Millisecond)
+		// If timer already fired before clear, closed == 1 and readTimedOut was true BEFORE clear, not set after.
+		c.mu.Lock()
+		timedOutAfter := c.readTimedOut
+		c.mu.Unlock()
+		if timedOutAfter {
+			t.Fatalf("stale timer mutated readTimedOut after clear")
+		}
+	}
+}

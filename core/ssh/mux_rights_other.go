@@ -8,8 +8,9 @@ import (
 	"runtime"
 )
 
-func bindAndLinkSocket(targetPath string) (net.Listener, error) {
-	return unsupportedUnixBindControlSocket(targetPath, runtime.GOOS)
+func bindAndLinkSocket(targetPath string) (net.Listener, os.FileInfo, error) {
+	ln, err := unsupportedUnixBindControlSocket(targetPath, runtime.GOOS)
+	return ln, nil, err
 }
 
 func checkPeerUID(conn net.Conn, expectedUID uint32) error {

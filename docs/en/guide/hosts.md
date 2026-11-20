@@ -164,7 +164,7 @@ nodes:
       strict_host_key_checking: accept-new
 ```
 
-**Configuration precedence**: CLI `-M`/`-S`/`-o` > Node configuration (`node.ssh_options`) > Global configuration (`cfg.ssh_options`) > `~/.ssh/config` (host-trust options such as `StrictHostKeyChecking` and `UserKnownHostsFile` are read only from explicit CLI `-o` flags or `xops_config.yaml`, never implicitly inherited from `~/.ssh/config`; for `HashKnownHosts`, when xops `hash_known_hosts` is unset or `false`, `HashKnownHosts yes` from `~/.ssh/config` is inherited via a one-way security-preserving merge, so xops `hash_known_hosts: true` is not downgraded by `HashKnownHosts no` unless explicitly overridden via CLI `-o HashKnownHosts=no`).
+**Configuration precedence**: CLI `-M`/`-S`/`-o` > Node configuration (`node.ssh_options`) > Global configuration (`cfg.ssh_options`) > `~/.ssh/config` (host-trust options such as `StrictHostKeyChecking` and `UserKnownHostsFile` are read only from explicit CLI `-o` flags or `xops_config.yaml`, never implicitly inherited from `~/.ssh/config`; for `HashKnownHosts`, `HashKnownHosts yes` from `~/.ssh/config` is inherited only when xops `hash_known_hosts` is unset—explicit `hash_known_hosts: false` overrides `~/.ssh/config` by normal precedence, while xops `hash_known_hosts: true` is not downgraded by `HashKnownHosts no` from `~/.ssh/config` unless explicitly overridden via CLI `-o HashKnownHosts=no`).
 
 ### Supported options and forwarding/tunnel options
 
@@ -181,7 +181,7 @@ nodes:
 | `gateway_ports` | `GatewayPorts` | `yes` / `no` / `clientspecified` | Allows external hosts to connect to local forwarded ports (defaults to `no`; `clientspecified` honors the client-specified bind address) |
 | `stream_local_bind_unlink` | `StreamLocalBindUnlink` | `yes` / `no` | Whether to remove an existing Unix domain socket file before binding (defaults to `no`) |
 | `stream_local_bind_mask` | `StreamLocalBindMask` | Octal mask (e.g. `0177`, `0117`) | File mode creation mask (umask) for Unix domain socket files (defaults to `0177`) |
-| `fork_after_authentication` | `ForkAfterAuthentication` | `yes` / `no` | Run in background after authentication and forwardings are established (corresponds to `-f`, implies `stdin_null`) |
+| `fork_after_authentication` | `ForkAfterAuthentication` | `yes` / `no` | Run in background after authentication and forwardings are established (corresponds to `-f`, implies `stdin_null`; cannot be combined with `--password-stdin`, `--passphrase-stdin`, `--otp`, or `--otp-stdin`) |
 | `stdin_null` | `StdinNull` | `yes` / `no` | Redirects stdin from `/dev/null` (corresponds to `-n`) |
 | `session_type` | `SessionType` | `default` / `none` | Session mode; `none` establishes forwards without a remote shell/command (corresponds to `-N`) |
 | `tunnel` | `Tunnel` | `yes` / `point-to-point` / `ethernet` / `no` | Request tun/tap device forwarding (`yes` maps to `point-to-point`) |

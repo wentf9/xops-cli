@@ -32,6 +32,7 @@ type dialPolicy struct {
 	sudoUpdateToken       string
 	proxyJump             string
 	originalHost          string
+	canonicalHost         string
 	originalProxyJump     string
 	hasOriginalProxyJump  bool
 	trustVersion          string
@@ -67,6 +68,7 @@ func freezeDialPolicy(cfg *ClientConfig) dialPolicy {
 		sudoUpdateToken:       cfg.SudoUpdateToken,
 		proxyJump:             cfg.ProxyJump,
 		originalHost:          cfg.OriginalHost,
+		canonicalHost:         cfg.CanonicalHost,
 		originalProxyJump:     origJump,
 		hasOriginalProxyJump:  hasOriginalJump,
 		trustVersion:          cfg.TrustVersion,
@@ -91,6 +93,7 @@ func (p dialPolicy) readOnlyConfig() *ClientConfig {
 		SudoUpdateToken:       p.sudoUpdateToken,
 		ProxyJump:             p.proxyJump,
 		OriginalHost:          p.originalHost,
+		CanonicalHost:         p.canonicalHost,
 		OriginalProxyJump:     p.originalProxyJump,
 		HasOriginalProxyJump:  p.hasOriginalProxyJump,
 		TrustVersion:          p.trustVersion,
@@ -106,6 +109,7 @@ func (p dialPolicy) toConnectionConfig() ConnectionConfig {
 		TrustVersion:          p.trustVersion,
 		NodeID:                p.nodeID,
 		OriginalHost:          p.originalHost,
+		CanonicalHost:         p.canonicalHost,
 		Address:               p.address,
 		Port:                  p.port,
 		User:                  p.user,
@@ -901,29 +905,6 @@ func (c *Connector) resolvePasswordAuthWithPolicy(policy dialPolicy, attempt *ha
 	return ssh.Password(pwd), nil
 }
 
-func (c *Connector) resolveKeyAuthWithPolicy(policy dialPolicy, attempt *handshakeAttempt) (ssh.AuthMethod, error) {
-	roCfg := policy.readOnlyConfig()
-	if passBytes := attempt.consumeInitialPassphrase(); len(passBytes) > 0 {
-		return buildKeyAuthMethod(roCfg, passBytes, c.environment.ResolveKeyPath)
-	}
-	secret, err := c.resolveSecret(roCfg, SecretRequest{
-		Kind:         SecretKindPrivateKeyPassphrase,
-		NodeID:       policy.nodeID,
-		User:         policy.user,
-		Host:         policy.address,
-		Port:         policy.port,
-		KeyPath:      policy.keyPath,
-		VersionToken: policy.authUpdateToken,
-	})
-	if len(secret) > 0 {
-		defer zeroBytes(secret)
-	}
-	if err != nil && !errors.Is(err, ErrInteractionRequired) {
-		return nil, fmt.Errorf("resolve private key passphrase failed: %w", err)
-	}
-	return buildKeyAuthMethod(roCfg, secret, c.environment.ResolveKeyPath)
-}
-
 func (c *Connector) authTargetContext(cfg *ClientConfig) TargetContext {
 	if cfg == nil {
 		return TargetContext{}
@@ -1091,19 +1072,15 @@ func (c *Connector) resolveFilteredAgentAuth(ctx context.Context, authCtx contex
 }
 
 func (c *Connector) appendMFACallbackCandidate(
-	authCtx context.Context,
-	cfg *ClientConfig,
 	policy authPolicy,
-	prompter SecretPrompter,
-	coordinator *handshakeCoordinator,
+	secProvider *autoSecretProvider,
 	candidates []autoAuthCandidate,
 ) []autoAuthCandidate {
-	if policy.kbAllowed {
-		kbProvider := c.newAutoSecretProvider(authCtx, cfg, prompter, coordinator)
+	if policy.kbAllowed && secProvider != nil {
 		candidates = append(candidates, autoAuthCandidate{
 			protocol: autoAuthProtocolKeyboardInteractive,
 			label:    "keyboard-interactive",
-			method:   buildKeyboardInteractiveAuthMethod(kbProvider),
+			method:   buildKeyboardInteractiveAuthMethod(secProvider),
 			allow: func(ctx *ssh.ClientAuthContext) bool {
 				return len(ctx.PartialSuccessMethods) > 0
 			},
@@ -1112,12 +1089,73 @@ func (c *Connector) appendMFACallbackCandidate(
 	return candidates
 }
 
+type multiKeySecretPrompter struct {
+	passphrasePrompter SecretPrompter
+	otherPrompter      SecretPrompter
+}
+
+func (p multiKeySecretPrompter) PromptSecret(ctx context.Context, req SecretRequest) (string, error) {
+	target := p.otherPrompter
+	if req.Kind == SecretKindPrivateKeyPassphrase {
+		target = p.passphrasePrompter
+	}
+	if target == nil {
+		return "", ErrInteractionRequired
+	}
+	return target.PromptSecret(ctx, req)
+}
+
+type multiKeyCandidateState struct {
+	certCandidates  []autoAuthCandidate
+	plainCandidates []autoAuthCandidate
+	pairedCertPaths map[string]struct{}
+	tracker         *offeredPubKeyTracker
+}
+
+func newMultiKeyCandidateState(sourced *sourcedKeyBundle, rejectPublicKey func()) *multiKeyCandidateState {
+	st := &multiKeyCandidateState{
+		pairedCertPaths: make(map[string]struct{}),
+		tracker:         newOfferedPubKeyTracker(),
+	}
+	if sourced == nil {
+		return st
+	}
+	if sourced.pubKey != nil {
+		st.tracker.recordStatic(sourced.pubKey)
+	}
+	for _, cm := range sourced.certMethods {
+		if _, already := st.pairedCertPaths[cm.certPath]; already {
+			continue
+		}
+		st.pairedCertPaths[cm.certPath] = struct{}{}
+		if cm.certPub != nil {
+			st.tracker.recordStatic(cm.certPub)
+		}
+		st.certCandidates = append(st.certCandidates, autoAuthCandidate{
+			protocol:   autoAuthProtocolPublicKey,
+			label:      "explicit signer (cert): " + cm.certPath,
+			method:     cm.method,
+			onRejected: rejectPublicKey,
+		})
+	}
+	if sourced.plainMethod != nil {
+		st.plainCandidates = append(st.plainCandidates, autoAuthCandidate{
+			protocol:   autoAuthProtocolPublicKey,
+			label:      "explicit signer",
+			method:     sourced.plainMethod,
+			onRejected: rejectPublicKey,
+		})
+	}
+	return st
+}
+
 func (c *Connector) buildMultiKeyAuth(
 	ctx context.Context,
 	authCtx context.Context,
 	cfg *ClientConfig,
 	attempt *handshakeAttempt,
 	explicitPaths []string,
+	sourced *sourcedKeyBundle,
 	policy authPolicy,
 	prompter SecretPrompter,
 	coordinator *handshakeCoordinator,
@@ -1131,7 +1169,7 @@ func (c *Connector) buildMultiKeyAuth(
 		c.environment.ResolveKeyPath,
 		l,
 	)
-	if len(explicitPaths) == 0 && len(explicitCerts) == 0 {
+	if sourced == nil && len(explicitPaths) == 0 && len(explicitCerts) == 0 {
 		return nil, nil, ErrKeyPathRequired
 	}
 	var failClosed func(error)
@@ -1147,10 +1185,10 @@ func (c *Connector) buildMultiKeyAuth(
 	resolver := &initialKeySecretResolver{value: attempt.consumeInitialPassphrase(), next: c.secretResolver}
 	cleanup := func() error {
 		resolver.mu.Lock()
-		defer resolver.mu.Unlock()
 		zeroBytes(resolver.value)
 		resolver.value = nil
-		return nil
+		resolver.mu.Unlock()
+		return sourced.close()
 	}
 	handshakeTimeout := c.getNodeHandshakeTimeout(cfg)
 	provider := &autoSecretProvider{
@@ -1161,7 +1199,7 @@ func (c *Connector) buildMultiKeyAuth(
 		port:               cfg.Port,
 		versionToken:       cfg.AuthUpdateToken,
 		resolver:           resolver,
-		prompter:           activePrompter,
+		prompter:           multiKeySecretPrompter{passphrasePrompter: activePrompter, otherPrompter: prompter},
 		recoveryPrompter:   recovery,
 		handshakeTimeout:   handshakeTimeout,
 		interactionTimeout: c.interactionTimeout,
@@ -1171,31 +1209,32 @@ func (c *Connector) buildMultiKeyAuth(
 	rejectPublicKey := func() {
 		attempt.rejectCandidate(autoAuthProtocolPublicKey)
 	}
+	state := newMultiKeyCandidateState(sourced, rejectPublicKey)
 	passphraseCb := newMultiKeyPassphraseCallback(attempt, recovery != nil)
 	var candidates []autoAuthCandidate
 	var firstErr error
 	if policy.identitiesOnly {
 		candidates, firstErr = c.buildIdentitiesOnlyMultiKeyCandidates(
-			ctx, authCtx, cfg, explicitPaths, explicitCerts, hasExplicitCerts,
+			ctx, authCtx, cfg, state, explicitPaths, explicitCerts, hasExplicitCerts,
 			provider, passphraseCb, rejectPublicKey, handshakeTimeout, &cleanup, l,
 		)
 	} else {
 		candidates, firstErr = c.buildAgentFallbackMultiKeyCandidates(
-			ctx, authCtx, cfg, explicitPaths, explicitCerts, hasExplicitCerts,
+			ctx, authCtx, cfg, state, explicitPaths, explicitCerts, hasExplicitCerts,
 			provider, passphraseCb, rejectPublicKey, &cleanup, l,
 		)
 	}
 	if len(candidates) == 0 {
-		_ = cleanup()
+		closeErr := cleanup()
 		if firstErr != nil {
-			return nil, nil, firstErr
+			return nil, nil, errors.Join(firstErr, closeErr)
 		}
 		if policy.identitiesOnly && len(explicitCerts) > 0 {
-			return nil, nil, errors.New("no ssh-agent or file identity matches explicit CertificateFile under IdentitiesOnly=yes")
+			return nil, nil, errors.Join(errors.New("no ssh-agent or file identity matches explicit CertificateFile under IdentitiesOnly=yes"), closeErr)
 		}
-		return nil, nil, ErrKeyPathRequired
+		return nil, nil, errors.Join(ErrKeyPathRequired, closeErr)
 	}
-	candidates = c.appendMFACallbackCandidate(authCtx, cfg, policy, prompter, coordinator, candidates)
+	candidates = c.appendMFACallbackCandidate(policy, provider, candidates)
 	return newSequentialAuthCallbackWithPolicy(candidates, policy, provider, l, observer), cleanup, nil
 }
 
@@ -1203,6 +1242,7 @@ func (c *Connector) buildIdentitiesOnlyMultiKeyCandidates(
 	ctx context.Context,
 	authCtx context.Context,
 	cfg *ClientConfig,
+	state *multiKeyCandidateState,
 	explicitPaths []string,
 	explicitCerts []loadedUserCert,
 	hasExplicitCerts bool,
@@ -1213,20 +1253,17 @@ func (c *Connector) buildIdentitiesOnlyMultiKeyCandidates(
 	cleanup *func() error,
 	l logger.DebugLogger,
 ) ([]autoAuthCandidate, error) {
-	var certCandidates []autoAuthCandidate
-	var plainCandidates []autoAuthCandidate
-	pairedCertPaths := make(map[string]struct{})
-	tracker := newOfferedPubKeyTracker()
-
 	var agentByPub map[string]ssh.Signer
-	if socket, sockErr := c.resolveConfigAgentSocket(cfg); sockErr == nil {
-		var agentCleanup func()
-		agentByPub, agentCleanup = dialAgentSignersByPubKey(ctx, authCtx, c.environment.DialAgent, socket, handshakeTimeout, l)
-		if agentCleanup != nil {
-			prevCleanup := *cleanup
-			*cleanup = func() error {
-				agentCleanup()
-				return prevCleanup()
+	if len(explicitPaths) > 0 || len(explicitCerts) > 0 {
+		if socket, sockErr := c.resolveConfigAgentSocket(cfg); sockErr == nil {
+			var agentCleanup func()
+			agentByPub, agentCleanup = dialAgentSignersByPubKey(ctx, authCtx, c.environment.DialAgent, socket, handshakeTimeout, l)
+			if agentCleanup != nil {
+				prevCleanup := *cleanup
+				*cleanup = func() error {
+					agentCleanup()
+					return prevCleanup()
+				}
 			}
 		}
 	}
@@ -1234,30 +1271,31 @@ func (c *Connector) buildIdentitiesOnlyMultiKeyCandidates(
 	var firstErr error
 	for _, keyPath := range explicitPaths {
 		if appendAgentMatchedKeyPath(
-			&certCandidates, &plainCandidates, pairedCertPaths, agentByPub,
+			&state.certCandidates, &state.plainCandidates, state.pairedCertPaths, agentByPub,
 			keyPath, "explicit key", explicitCerts, hasExplicitCerts,
-			rejectPublicKey, tracker, l,
+			rejectPublicKey, state.tracker, l,
 		) {
 			continue
 		}
-		certMethods, plainMethod, err := resolveKeySigners(keyPath, explicitCerts, hasExplicitCerts, provider, passphraseCb, tracker, false, l)
+		certMethods, plainMethod, err := resolveKeySigners(keyPath, explicitCerts, hasExplicitCerts, provider, passphraseCb, state.tracker, false, l)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
 			continue
 		}
-		appendResolvedMultiKeyCandidate(keyPath, certMethods, plainMethod, rejectPublicKey, pairedCertPaths, &certCandidates, &plainCandidates)
+		appendResolvedMultiKeyCandidate(keyPath, certMethods, plainMethod, rejectPublicKey, state.pairedCertPaths, &state.certCandidates, &state.plainCandidates)
 	}
 
-	appendUnpairedExplicitCertsFromAgent(&certCandidates, pairedCertPaths, agentByPub, explicitCerts, "ssh-agent (IdentitiesOnly cert): ", rejectPublicKey, tracker)
-	return append(certCandidates, plainCandidates...), firstErr
+	appendUnpairedExplicitCertsFromAgent(&state.certCandidates, state.pairedCertPaths, agentByPub, explicitCerts, "ssh-agent (IdentitiesOnly cert): ", rejectPublicKey, state.tracker)
+	return append(state.certCandidates, state.plainCandidates...), firstErr
 }
 
 func (c *Connector) buildAgentFallbackMultiKeyCandidates(
 	ctx context.Context,
 	authCtx context.Context,
 	cfg *ClientConfig,
+	state *multiKeyCandidateState,
 	explicitPaths []string,
 	explicitCerts []loadedUserCert,
 	hasExplicitCerts bool,
@@ -1267,11 +1305,6 @@ func (c *Connector) buildAgentFallbackMultiKeyCandidates(
 	cleanup *func() error,
 	l logger.DebugLogger,
 ) ([]autoAuthCandidate, error) {
-	var certCandidates []autoAuthCandidate
-	var plainCandidates []autoAuthCandidate
-	pairedCertPaths := make(map[string]struct{})
-	tracker := newOfferedPubKeyTracker()
-
 	agentClient, agentByPub, agentSignersFn := c.openMultiKeyFallbackAgent(
 		ctx, authCtx, cfg, explicitPaths, explicitCerts, hasExplicitCerts, cleanup, l,
 	)
@@ -1279,32 +1312,32 @@ func (c *Connector) buildAgentFallbackMultiKeyCandidates(
 	var firstErr error
 	for _, keyPath := range explicitPaths {
 		if !isUnencryptedPrivateKeyFile(keyPath) && appendAgentMatchedKeyPath(
-			&certCandidates, &plainCandidates, pairedCertPaths, agentByPub,
+			&state.certCandidates, &state.plainCandidates, state.pairedCertPaths, agentByPub,
 			keyPath, "explicit key", explicitCerts, hasExplicitCerts,
-			rejectPublicKey, tracker, l,
+			rejectPublicKey, state.tracker, l,
 		) {
 			continue
 		}
-		certMethods, plainMethod, err := resolveKeySigners(keyPath, explicitCerts, hasExplicitCerts, provider, passphraseCb, tracker, false, l)
+		certMethods, plainMethod, err := resolveKeySigners(keyPath, explicitCerts, hasExplicitCerts, provider, passphraseCb, state.tracker, false, l)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
 			continue
 		}
-		appendResolvedMultiKeyCandidate(keyPath, certMethods, plainMethod, rejectPublicKey, pairedCertPaths, &certCandidates, &plainCandidates)
+		appendResolvedMultiKeyCandidate(keyPath, certMethods, plainMethod, rejectPublicKey, state.pairedCertPaths, &state.certCandidates, &state.plainCandidates)
 	}
 
-	appendUnpairedExplicitCertsFromAgent(&certCandidates, pairedCertPaths, agentByPub, explicitCerts, "ssh-agent (cert): ", rejectPublicKey, tracker)
+	appendUnpairedExplicitCertsFromAgent(&state.certCandidates, state.pairedCertPaths, agentByPub, explicitCerts, "ssh-agent (cert): ", rejectPublicKey, state.tracker)
 	if agentClient != nil {
-		plainCandidates = append(plainCandidates, autoAuthCandidate{
+		state.plainCandidates = append(state.plainCandidates, autoAuthCandidate{
 			protocol:   autoAuthProtocolPublicKey,
 			label:      "ssh-agent",
-			method:     ssh.PublicKeysCallback(tracker.filterAgentSigners(agentSignersFn)),
+			method:     ssh.PublicKeysCallback(state.tracker.filterAgentSigners(agentSignersFn)),
 			onRejected: rejectPublicKey,
 		})
 	}
-	return append(certCandidates, plainCandidates...), firstErr
+	return append(state.certCandidates, state.plainCandidates...), firstErr
 }
 
 func (c *Connector) openMultiKeyFallbackAgent(
@@ -1370,12 +1403,14 @@ func appendResolvedMultiKeyCandidate(
 			onRejected: rejectPublicKey,
 		})
 	}
-	*plainCandidates = append(*plainCandidates, autoAuthCandidate{
-		protocol:   autoAuthProtocolPublicKey,
-		label:      "explicit key: " + keyPath,
-		method:     plainMethod,
-		onRejected: rejectPublicKey,
-	})
+	if plainMethod != nil {
+		*plainCandidates = append(*plainCandidates, autoAuthCandidate{
+			protocol:   autoAuthProtocolPublicKey,
+			label:      "explicit key: " + keyPath,
+			method:     plainMethod,
+			onRejected: rejectPublicKey,
+		})
+	}
 }
 
 func newMultiKeyPassphraseCallback(attempt *handshakeAttempt, allowRecord bool) func(string, string) {
@@ -1508,35 +1543,35 @@ func (c *Connector) buildSSHConfigWithState(ctx context.Context, dialPolicy dial
 		if !pubkeyAllowed {
 			return nil, nil, errors.New("publickey authentication disabled by SSH options")
 		}
-		if c.keySource != nil {
-			certMethods, plainMethod, _, release, err := c.sourcedKeyMethods(authCtx, cfg)
-			if err != nil {
-				return nil, nil, err
-			}
-			cleanup = release
-			if len(certMethods) > 0 {
-				var candidates []autoAuthCandidate
-				for _, cm := range certMethods {
-					candidates = append(candidates, autoAuthCandidate{
-						protocol: autoAuthProtocolPublicKey,
-						label:    "explicit signer (cert): " + cm.certPath,
-						method:   cm.method,
-					})
-				}
-				candidates = append(candidates, autoAuthCandidate{
-					protocol: autoAuthProtocolPublicKey,
-					label:    "explicit signer",
-					method:   plainMethod,
-				})
-				candidates = c.appendMFACallbackCandidate(authCtx, cfg, policy, prompter, coordinator, candidates)
-				authCallback = newSequentialAuthCallbackWithPolicy(candidates, policy, c.newAutoSecretProvider(authCtx, cfg, prompter, coordinator), c.getLogger(), observer)
-				break
-			}
-			authMethods = append(authMethods, plainMethod)
-			break
+		if dialPolicy.keyRef != "" && c.keySource == nil {
+			return nil, nil, errors.New("referenced SSH key requires an explicit key source")
 		}
 		explicitPaths, _ := c.explicitKeyPaths(cfg)
-		cb, release, err := c.buildMultiKeyAuth(ctx, authCtx, cfg, attempt, explicitPaths, policy, prompter, coordinator, observer)
+		var sourced *sourcedKeyBundle
+		if c.keySource != nil {
+			bundle, err := c.sourcedKeyMethods(authCtx, cfg)
+			if err != nil {
+				if dialPolicy.keyRef != "" || dialPolicy.keyPath != "" || !errors.Is(err, ErrKeyNotFound) {
+					return nil, nil, err
+				}
+			} else {
+				sourced = bundle
+				if dialPolicy.keyPath != "" {
+					explicitPaths = filterSourcedKeyPath(
+						explicitPaths,
+						dialPolicy.keyPath,
+						c.environment,
+						c.authTargetContext(cfg),
+						c.environment.ResolveKeyPath,
+					)
+				}
+			}
+		}
+		effectivePolicy := policy
+		if sourced != nil || dialPolicy.keyRef != "" {
+			effectivePolicy.identitiesOnly = true
+		}
+		cb, release, err := c.buildMultiKeyAuth(ctx, authCtx, cfg, attempt, explicitPaths, sourced, effectivePolicy, prompter, coordinator, observer)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1563,8 +1598,9 @@ func (c *Connector) buildSSHConfigWithState(ctx context.Context, dialPolicy dial
 			if err != nil {
 				return nil, nil, err
 			}
-			candidates = c.appendMFACallbackCandidate(authCtx, cfg, policy, prompter, coordinator, candidates)
-			authCallback = newSequentialAuthCallbackWithPolicy(candidates, policy, c.newAutoSecretProvider(authCtx, cfg, prompter, coordinator), c.getLogger(), observer)
+			secProvider := c.newAutoSecretProvider(authCtx, cfg, prompter, coordinator)
+			candidates = c.appendMFACallbackCandidate(policy, secProvider, candidates)
+			authCallback = newSequentialAuthCallbackWithPolicy(candidates, policy, secProvider, c.getLogger(), observer)
 			cleanup = legacyAuthCleanup(agentCleanup)
 			break
 		}
@@ -1574,8 +1610,9 @@ func (c *Connector) buildSSHConfigWithState(ctx context.Context, dialPolicy dial
 		}
 		cleanup = legacyAuthCleanup(agentCleanup)
 		if len(candidates) > 0 {
-			candidates = c.appendMFACallbackCandidate(authCtx, cfg, policy, prompter, coordinator, candidates)
-			authCallback = newSequentialAuthCallbackWithPolicy(candidates, policy, c.newAutoSecretProvider(authCtx, cfg, prompter, coordinator), c.getLogger(), observer)
+			secProvider := c.newAutoSecretProvider(authCtx, cfg, prompter, coordinator)
+			candidates = c.appendMFACallbackCandidate(policy, secProvider, candidates)
+			authCallback = newSequentialAuthCallbackWithPolicy(candidates, policy, secProvider, c.getLogger(), observer)
 			break
 		}
 		authMethods = append(authMethods, method)

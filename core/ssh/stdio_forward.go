@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"time"
 
 	cryptoSSH "golang.org/x/crypto/ssh"
 )
@@ -34,7 +35,7 @@ func (c *Client) openChannelContext(ctx context.Context, channelType string, pay
 	if err := ctx.Err(); err != nil {
 		return nil, nil, fmt.Errorf("open SSH channel %q canceled: %w", channelType, err)
 	}
-	if c == nil || c.sshClient == nil {
+	if c == nil || c.sshClient == nil || c.sshClient.Conn == nil {
 		return nil, nil, fmt.Errorf("SSH client is not connected")
 	}
 
@@ -53,7 +54,7 @@ func (c *Client) openChannelContext(ctx context.Context, channelType string, pay
 			return nil, nil, fmt.Errorf("open SSH channel %q failed: %w", channelType, opened.err)
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, nil, errors.Join(ctxErr, closeSSHChannel(opened.channel))
+			return nil, nil, errors.Join(ctxErr, c.abortUnclaimedChannel(opened.channel, opened.requests))
 		}
 		return opened.channel, opened.requests, nil
 	case <-work.Done():
@@ -61,7 +62,7 @@ func (c *Client) openChannelContext(ctx context.Context, channelType string, pay
 		case opened := <-result:
 			var closeErr error
 			if opened.channel != nil {
-				closeErr = closeSSHChannel(opened.channel)
+				closeErr = c.abortUnclaimedChannel(opened.channel, opened.requests)
 			}
 			return nil, nil, errors.Join(work.Err(), opened.err, closeErr)
 		default:
@@ -70,7 +71,7 @@ func (c *Client) openChannelContext(ctx context.Context, channelType string, pay
 		opened := <-result
 		var closeErr error
 		if opened.channel != nil {
-			closeErr = closeSSHChannel(opened.channel)
+			closeErr = c.abortUnclaimedChannel(opened.channel, opened.requests)
 		}
 		return nil, nil, errors.Join(work.Err(), interruptErr, opened.err, closeErr)
 	}
@@ -84,6 +85,45 @@ func closeSSHChannel(ch io.Closer) error {
 		return err
 	}
 	return nil
+}
+
+// closeChannelBounded closes ch (and optionally joins workersDone) within
+// sessionShutdownTimeout, interrupting the transport if the peer stalls.
+func (c *Client) closeChannelBounded(ch io.Closer, workersDone <-chan struct{}, label string) error {
+	if ch == nil && workersDone == nil {
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() {
+		closeErr := closeSSHChannel(ch)
+		if workersDone != nil {
+			<-workersDone
+		}
+		done <- closeErr
+	}()
+	timer := time.NewTimer(sessionShutdownTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		if label == "" {
+			label = "SSH channel"
+		}
+		if c == nil {
+			return fmt.Errorf("%s shutdown exceeded %s", label, sessionShutdownTimeout)
+		}
+		interruptErr := c.Interrupt()
+		closeErr := <-done
+		return errors.Join(fmt.Errorf("%s shutdown exceeded %s", label, sessionShutdownTimeout), interruptErr, closeErr)
+	}
+}
+
+func (c *Client) abortUnclaimedChannel(ch cryptoSSH.Channel, reqs <-chan *cryptoSSH.Request) error {
+	if reqs != nil {
+		go discardAbortedChannelRequests(context.Background(), reqs)
+	}
+	return c.closeChannelBounded(ch, nil, "unclaimed SSH channel")
 }
 
 // channelHalfCloser forwards writes to an SSH channel and sends SSH_MSG_CHANNEL_EOF
@@ -123,7 +163,7 @@ func (c *Client) validateStdioForwardArgs(ctx context.Context, destHost string, 
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("stdio forward canceled: %w", err)
 	}
-	if c == nil || c.sshClient == nil {
+	if c == nil || c.sshClient == nil || c.sshClient.Conn == nil {
 		return fmt.Errorf("SSH client is not connected")
 	}
 	if destHost == "" || destPort == 0 {
@@ -177,6 +217,22 @@ func waitStdioForward(work context.Context, readDone <-chan error, stdinEOF <-ch
 	return readErr, readDoneReceived
 }
 
+func waitStdioReadDoneBounded(readDone <-chan error, timeout time.Duration) (error, bool) {
+	select {
+	case err := <-readDone:
+		return err, true
+	default:
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-readDone:
+		return err, true
+	case <-timer.C:
+		return nil, false
+	}
+}
+
 // ForwardStdio forwards caller-provided stdin and stdout to destHost:destPort
 // over an SSH "direct-tcpip" channel (implementing OpenSSH -W host:port).
 //
@@ -211,14 +267,14 @@ func (c *Client) ForwardStdio(ctx context.Context, destHost string, destPort uin
 
 	boundOut, closeOut, outCancelable, err := BindOutput(work, stdout)
 	if err != nil {
-		_ = closeSSHChannel(ch)
+		_ = c.closeChannelBounded(ch, remoteClosed, "SSH stdio forward channel")
 		return fmt.Errorf("bind stdio forward stdout: %w", err)
 	}
 	c.logUncancelableOutput(outCancelable, stdout)
 
 	stopStdin, stdinEOF, err := c.startStdioInputPipe(work, ch, stdin)
 	if err != nil {
-		_ = closeSSHChannel(ch)
+		_ = c.closeChannelBounded(ch, remoteClosed, "SSH stdio forward channel")
 		return errors.Join(err, closeOut())
 	}
 
@@ -235,14 +291,40 @@ func (c *Client) ForwardStdio(ctx context.Context, destHost string, destPort uin
 
 	wasCanceled := work.Err() != nil
 	cancel()
-	closeChErr := closeSSHChannel(ch)
+	workersDone := make(chan struct{})
+	delayedReadErrCh := make(chan error, 1)
+	stdinErrCh := make(chan error, 1)
+	go func() {
+		defer close(workersDone)
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			stdinErrCh <- stopStdin()
+		})
+		wg.Go(func() {
+			<-remoteClosed
+		})
+		if outCancelable && !readDoneReceived {
+			wg.Go(func() {
+				delayedReadErrCh <- <-readDone
+			})
+		}
+		wg.Wait()
+	}()
+	closeChErr := c.closeChannelBounded(ch, workersDone, "SSH stdio forward channel")
 	if !readDoneReceived {
-		rErr := <-readDone
-		if !wasCanceled {
-			readErr = rErr
+		if outCancelable {
+			rErr := <-delayedReadErrCh
+			if !wasCanceled {
+				readErr = rErr
+			}
+		} else {
+			rErr, drained := waitStdioReadDoneBounded(readDone, sessionShutdownTimeout)
+			if drained && !wasCanceled {
+				readErr = rErr
+			}
 		}
 	}
-	stdinErr := stopStdin()
+	stdinErr := <-stdinErrCh
 	outErr := closeOut()
 
 	if ctxErr := ctx.Err(); ctxErr != nil {

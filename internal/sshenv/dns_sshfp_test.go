@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,7 +18,10 @@ import (
 
 type mockDNSBehavior struct {
 	rcode     uint16
+	extRcode  uint8
 	ad        bool
+	cd        bool
+	omitOPT   bool
 	truncate  bool // UDP answers with TC=1 and no records
 	badID     bool
 	silent    bool
@@ -35,9 +39,12 @@ func buildMockDNSResponse(query []byte, b mockDNSBehavior, overUDP bool) []byte 
 		id++
 	}
 	binary.BigEndian.PutUint16(resp[0:], id)
-	flags := uint16(dnsFlagQR|dnsFlagRD) | b.rcode
+	flags := uint16(dnsFlagQR|dnsFlagRD) | (b.rcode & 0x000f)
 	if b.ad {
 		flags |= dnsFlagAD
+	}
+	if b.cd {
+		flags |= dnsFlagCD
 	}
 	records := b.records
 	if overUDP && b.truncate {
@@ -47,7 +54,11 @@ func buildMockDNSResponse(query []byte, b mockDNSBehavior, overUDP bool) []byte 
 	binary.BigEndian.PutUint16(resp[2:], flags)
 	binary.BigEndian.PutUint16(resp[6:], uint16(len(records)+1))
 	binary.BigEndian.PutUint16(resp[8:], 0)
-	binary.BigEndian.PutUint16(resp[10:], 0)
+	arCount := uint16(1)
+	if b.omitOPT {
+		arCount = 0
+	}
+	binary.BigEndian.PutUint16(resp[10:], arCount)
 	// A non-SSHFP answer (A record type 1) that must be tolerated alongside SSHFP RRs.
 	resp = append(resp, 0xc0, 0x0c)
 	resp = binary.BigEndian.AppendUint16(resp, 1) // A
@@ -63,6 +74,15 @@ func buildMockDNSResponse(query []byte, b mockDNSBehavior, overUDP bool) []byte 
 		resp = binary.BigEndian.AppendUint16(resp, uint16(2+len(r.Fingerprint)))
 		resp = append(resp, r.Algorithm, r.FingerprintType)
 		resp = append(resp, r.Fingerprint...)
+	}
+	if !b.omitOPT {
+		// EDNS0 OPT pseudo-RR: root owner, UDP payload 4096, extended rcode | DO=1, RDLEN=0.
+		resp = append(resp, 0)
+		resp = binary.BigEndian.AppendUint16(resp, dnsTypeOPT)
+		resp = binary.BigEndian.AppendUint16(resp, dnsUDPPayloadSize)
+		ttl := (uint32(b.extRcode) << 24) | 0x00008000
+		resp = binary.BigEndian.AppendUint32(resp, ttl)
+		resp = binary.BigEndian.AppendUint16(resp, 0)
 	}
 	return resp
 }
@@ -153,7 +173,7 @@ func startMockDNS(t *testing.T, b mockDNSBehavior) (udpAddr, tcpAddr string) {
 }
 
 func testResolver(servers []string, tcpAddrs map[string]string) *sshfpResolver {
-	return testResolverWithConfig(dnsConfig{servers: servers}, nil, tcpAddrs)
+	return testResolverWithConfig(dnsConfig{servers: servers, trustAD: true}, nil, tcpAddrs)
 }
 
 func testResolverWithConfig(cfg dnsConfig, udpAddrs, tcpAddrs map[string]string) *sshfpResolver {
@@ -184,14 +204,14 @@ func loopbackRecords() []core.SSHFPRecord {
 	return []core.SSHFPRecord{{Algorithm: 4, FingerprintType: 2, Fingerprint: fp}, {Algorithm: 1, FingerprintType: 1, Fingerprint: fp[:20]}}
 }
 
-func TestSSHFPResolver_AuthenticatedAnswerWithRdAdDoQueryFlags(t *testing.T) {
+func TestSSHFPResolver_AuthenticatedAnswerWithRdAndDoQueryFlags(t *testing.T) {
 	records := loopbackRecords()
 	var sawFlags, sawDO bool
 	var mu sync.Mutex
 	udp, tcp := startMockDNS(t, mockDNSBehavior{ad: true, records: records, queryFlag: func(flags uint16, hasDO bool) {
 		mu.Lock()
 		defer mu.Unlock()
-		sawFlags = flags&dnsFlagRD != 0 && flags&dnsFlagAD != 0
+		sawFlags = flags&dnsFlagRD != 0 && flags&dnsFlagAD == 0
 		sawDO = hasDO
 	}})
 	res, err := testResolver([]string{udp}, map[string]string{udp: tcp}).Lookup(t.Context(), "host.example.com.")
@@ -204,7 +224,43 @@ func TestSSHFPResolver_AuthenticatedAnswerWithRdAdDoQueryFlags(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	if !sawFlags || !sawDO {
-		t.Fatalf("query flags RD+AD=%v DO=%v", sawFlags, sawDO)
+		t.Fatalf("query flags RD-only=%v DO=%v", sawFlags, sawDO)
+	}
+}
+
+func TestSSHFPResolver_RejectsSpoofedADWithoutOPTOrWithCDAndFailsOverOnBADVERS(t *testing.T) {
+	records := loopbackRecords()
+
+	// 1. Naive loopback forwarder echoing AD=1 without EDNS0 OPT must NOT produce Authenticated=true.
+	noOptUDP, noOptTCP := startMockDNS(t, mockDNSBehavior{ad: true, omitOPT: true, records: records})
+	res, err := testResolver([]string{noOptUDP}, map[string]string{noOptUDP: noOptTCP}).Lookup(t.Context(), "host.example.com")
+	if err != nil {
+		t.Fatalf("no-OPT lookup failed: %v", err)
+	}
+	if res.Authenticated || len(res.Records) != 2 {
+		t.Fatalf("AD=1 without OPT must downgrade to Authenticated=false, got %+v", res)
+	}
+
+	// 2. Response with CD=1 must NOT produce Authenticated=true.
+	cdUDP, cdTCP := startMockDNS(t, mockDNSBehavior{ad: true, cd: true, records: records})
+	cdRes, err := testResolver([]string{cdUDP}, map[string]string{cdUDP: cdTCP}).Lookup(t.Context(), "host.example.com")
+	if err != nil {
+		t.Fatalf("CD=1 lookup failed: %v", err)
+	}
+	if cdRes.Authenticated || len(cdRes.Records) != 2 {
+		t.Fatalf("AD=1 with CD=1 must force Authenticated=false, got %+v", cdRes)
+	}
+
+	// 3. EDNS0 BADVERS (extended RCODE 16, low bits 0) must be treated as error and fail over to next server.
+	badversUDP, badversTCP := startMockDNS(t, mockDNSBehavior{rcode: 0, extRcode: 1})
+	okUDP, okTCP := startMockDNS(t, mockDNSBehavior{ad: true, records: records[:1]})
+	r := testResolver([]string{badversUDP, okUDP}, map[string]string{badversUDP: badversTCP, okUDP: okTCP})
+	failoverRes, err := r.Lookup(t.Context(), "host.example.com")
+	if err != nil {
+		t.Fatalf("BADVERS failover failed: %v", err)
+	}
+	if !failoverRes.Authenticated || len(failoverRes.Records) != 1 {
+		t.Fatalf("expected authenticated failover record after BADVERS, got %+v", failoverRes)
 	}
 }
 
@@ -230,19 +286,33 @@ func TestSSHFPResolver_ADBitTrustedOnlyOnLoopbackOrTrustAD(t *testing.T) {
 		t.Fatalf("expected 2 unauthenticated SSHFP records, got %d", len(res.Records))
 	}
 
-	// 2. systemd-resolved loopback stub 127.0.0.53:53 and IPv6 [::1]:53 with AD=1 and trustAD=false return Authenticated=true.
+	// 2. Loopback stub 127.0.0.53:53 and IPv6 [::1]:53 with AD=1: trustAD=false returns Authenticated=false,
+	// whereas explicit options trust-ad (trustAD=true) returns Authenticated=true.
 	for _, lb := range []string{"127.0.0.53:53", "[::1]:53"} {
-		rLoopback := testResolverWithConfig(
+		rLoopbackUntrusted := testResolverWithConfig(
 			dnsConfig{servers: []string{lb}, trustAD: false},
 			map[string]string{lb: udp},
 			map[string]string{lb: tcp},
 		)
-		lbRes, lbErr := rLoopback.Lookup(t.Context(), "host.example.com")
+		lbUntrustedRes, lbErr := rLoopbackUntrusted.Lookup(t.Context(), "host.example.com")
 		if lbErr != nil {
-			t.Fatalf("loopback %s lookup failed: %v", lb, lbErr)
+			t.Fatalf("loopback %s untrusted lookup failed: %v", lb, lbErr)
 		}
-		if !lbRes.Authenticated || len(lbRes.Records) != 2 {
-			t.Fatalf("loopback %s AD=1 should be Authenticated=true, got %+v", lb, lbRes)
+		if lbUntrustedRes.Authenticated || len(lbUntrustedRes.Records) != 2 {
+			t.Fatalf("loopback %s AD=1 without trust-ad must be Authenticated=false, got %+v", lb, lbUntrustedRes)
+		}
+
+		rLoopbackTrusted := testResolverWithConfig(
+			dnsConfig{servers: []string{lb}, trustAD: true},
+			map[string]string{lb: udp},
+			map[string]string{lb: tcp},
+		)
+		lbTrustedRes, lbErr := rLoopbackTrusted.Lookup(t.Context(), "host.example.com")
+		if lbErr != nil {
+			t.Fatalf("loopback %s trusted lookup failed: %v", lb, lbErr)
+		}
+		if !lbTrustedRes.Authenticated || len(lbTrustedRes.Records) != 2 {
+			t.Fatalf("loopback %s AD=1 with trust-ad should be Authenticated=true, got %+v", lb, lbTrustedRes)
 		}
 	}
 
@@ -694,5 +764,297 @@ func TestSSHFPResolver_SelfCNAMEFailover(t *testing.T) {
 	}
 	if !res.Authenticated || len(res.Records) != len(records) {
 		t.Fatalf("unexpected failover result: %+v", res)
+	}
+}
+
+func appendMockOPTRR(dst []byte, owner string, extRcode uint8) []byte {
+	return appendMockOPTRRWithVersion(dst, owner, extRcode, 0)
+}
+
+func appendMockOPTRRWithVersion(dst []byte, owner string, extRcode, version uint8) []byte {
+	dst = appendWireDNSName(dst, owner)
+	dst = binary.BigEndian.AppendUint16(dst, dnsTypeOPT)
+	dst = binary.BigEndian.AppendUint16(dst, dnsUDPPayloadSize)
+	ttl := (uint32(extRcode) << 24) | (uint32(version) << 16) | 0x00008000
+	dst = binary.BigEndian.AppendUint32(dst, ttl)
+	return binary.BigEndian.AppendUint16(dst, 0)
+}
+
+func appendMockSSHFPRR(dst []byte, alg, fpType byte, fp []byte) []byte {
+	dst = append(dst, 0xc0, 0x0c)
+	dst = binary.BigEndian.AppendUint16(dst, dnsTypeSSHFP)
+	dst = binary.BigEndian.AppendUint16(dst, dnsClassIN)
+	dst = binary.BigEndian.AppendUint32(dst, 60)
+	dst = binary.BigEndian.AppendUint16(dst, uint16(2+len(fp)))
+	dst = append(dst, alg, fpType)
+	return append(dst, fp...)
+}
+
+func TestSSHFPResolver_RejectsInvalidOpcodeOPTPlacementAndDigestLengths(t *testing.T) {
+	query, id, err := buildSSHFPQuery("host.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	qEnd := sshfpQuestionEnd(query)
+
+	// 1. Non-zero OPCODE must be rejected in both checkDNSResponse and parseSSHFPAnswers.
+	badOp := buildMockDNSResponse(query, mockDNSBehavior{records: loopbackRecords()}, false)
+	binary.BigEndian.PutUint16(badOp[2:], binary.BigEndian.Uint16(badOp[2:])|(1<<11))
+	if _, err := checkDNSResponse(badOp, id, query); err == nil || !strings.Contains(err.Error(), "opcode") {
+		t.Fatalf("non-zero OPCODE checkDNSResponse err = %v, want opcode error", err)
+	}
+	if _, err := parseSSHFPAnswers(badOp); !errors.Is(err, errDNSMalformed) {
+		t.Fatalf("non-zero OPCODE parseSSHFPAnswers err = %v, want errDNSMalformed", err)
+	}
+
+	// 2. OPT RR in Answer section must fail malformed.
+	ansOPT := append([]byte(nil), query[:qEnd]...)
+	binary.BigEndian.PutUint16(ansOPT[2:], dnsFlagQR|dnsFlagRD|dnsFlagAD)
+	binary.BigEndian.PutUint16(ansOPT[6:], 1)
+	binary.BigEndian.PutUint16(ansOPT[8:], 0)
+	binary.BigEndian.PutUint16(ansOPT[10:], 1)
+	ansOPT = appendMockOPTRR(ansOPT, "", 0)
+	ansOPT = appendMockOPTRR(ansOPT, "", 0)
+	if _, err := parseSSHFPAnswers(ansOPT); !errors.Is(err, errDNSMalformed) {
+		t.Fatalf("OPT in Answer section err = %v, want errDNSMalformed", err)
+	}
+
+	// 3. OPT RR in Authority section must fail malformed.
+	authOPT := append([]byte(nil), query[:qEnd]...)
+	binary.BigEndian.PutUint16(authOPT[2:], dnsFlagQR|dnsFlagRD|dnsFlagAD)
+	binary.BigEndian.PutUint16(authOPT[6:], 1)
+	binary.BigEndian.PutUint16(authOPT[8:], 1)
+	binary.BigEndian.PutUint16(authOPT[10:], 1)
+	authOPT = appendMockSSHFPRR(authOPT, 4, 2, bytesRepeat(0x11, 32))
+	authOPT = appendMockOPTRR(authOPT, "", 0)
+	authOPT = appendMockOPTRR(authOPT, "", 0)
+	if _, err := parseSSHFPAnswers(authOPT); !errors.Is(err, errDNSMalformed) {
+		t.Fatalf("OPT in Authority section err = %v, want errDNSMalformed", err)
+	}
+
+	// 4. Duplicate OPT RR and non-root OPT owner in Additional section must fail.
+	dupOPT := buildMockDNSResponse(query, mockDNSBehavior{records: loopbackRecords()}, false)
+	binary.BigEndian.PutUint16(dupOPT[10:], 2)
+	dupOPT = appendMockOPTRR(dupOPT, "", 0)
+	if _, err := parseSSHFPAnswers(dupOPT); !errors.Is(err, errDNSMalformed) {
+		t.Fatalf("duplicate OPT in Additional err = %v, want errDNSMalformed", err)
+	}
+	nonRootOPT := append([]byte(nil), query[:qEnd]...)
+	binary.BigEndian.PutUint16(nonRootOPT[2:], dnsFlagQR|dnsFlagRD)
+	binary.BigEndian.PutUint16(nonRootOPT[6:], 1)
+	binary.BigEndian.PutUint16(nonRootOPT[8:], 0)
+	binary.BigEndian.PutUint16(nonRootOPT[10:], 1)
+	nonRootOPT = appendMockSSHFPRR(nonRootOPT, 4, 2, bytesRepeat(0x22, 32))
+	nonRootOPT = appendMockOPTRR(nonRootOPT, "bad.example", 0)
+	if _, err := parseSSHFPAnswers(nonRootOPT); !errors.Is(err, errDNSMalformed) {
+		t.Fatalf("non-root OPT owner err = %v, want errDNSMalformed", err)
+	}
+
+	// 5. Digest length mismatch for SHA-1 (fpType=1 != 20) and SHA-256 (fpType=2 != 32) must be ignored.
+	for _, tc := range []struct {
+		name   string
+		fpType byte
+		fp     []byte
+	}{
+		{name: "sha1-short", fpType: 1, fp: bytesRepeat(0xaa, 19)},
+		{name: "sha256-long", fpType: 2, fp: bytesRepeat(0xbb, 33)},
+	} {
+		pkt := append([]byte(nil), query[:qEnd]...)
+		binary.BigEndian.PutUint16(pkt[2:], dnsFlagQR|dnsFlagRD)
+		binary.BigEndian.PutUint16(pkt[6:], 1)
+		binary.BigEndian.PutUint16(pkt[8:], 0)
+		binary.BigEndian.PutUint16(pkt[10:], 0)
+		pkt = appendMockSSHFPRR(pkt, 4, tc.fpType, tc.fp)
+		parsed, pErr := parseSSHFPAnswers(pkt)
+		if pErr != nil || len(parsed) != 0 {
+			t.Fatalf("%s = (%+v, %v), want 0 records and nil error", tc.name, parsed, pErr)
+		}
+	}
+}
+
+func TestSSHFPResolver_UDPZeroQuestionErrorRCODEFailsOverFast(t *testing.T) {
+	query, id, err := buildSSHFPQuery("host.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	buildZeroQuestionResp := func(q []byte, rcode uint16, extRcode uint8) []byte {
+		resp := make([]byte, 12)
+		copy(resp[:2], q[:2])
+		binary.BigEndian.PutUint16(resp[2:], dnsFlagQR|dnsFlagRD|(rcode&0x000f))
+		binary.BigEndian.PutUint16(resp[4:], 0) // QDCOUNT=0
+		binary.BigEndian.PutUint16(resp[6:], 0)
+		binary.BigEndian.PutUint16(resp[8:], 0)
+		if extRcode != 0 {
+			binary.BigEndian.PutUint16(resp[10:], 1)
+			resp = appendMockOPTRR(resp, "", extRcode)
+		}
+		return resp
+	}
+
+	// QDCOUNT=0 with NOERROR or NXDOMAIN must still be rejected/dropped.
+	for _, rcode := range []uint16{0, 3} {
+		pkt := buildZeroQuestionResp(query, rcode, 0)
+		if _, err := checkDNSResponse(pkt, id, query); err == nil || !strings.Contains(err.Error(), "question count") {
+			t.Fatalf("QDCOUNT=0 rcode=%d checkDNSResponse err = %v, want question count error", rcode, err)
+		}
+		if _, err := parseSSHFPAnswers(pkt); !errors.Is(err, errDNSMalformed) {
+			t.Fatalf("QDCOUNT=0 rcode=%d parseSSHFPAnswers err = %v, want errDNSMalformed", rcode, err)
+		}
+	}
+
+	records := loopbackRecords()
+	secondaryUDP, secondaryTCP := startMockDNS(t, mockDNSBehavior{ad: true, records: records})
+
+	// Primary returning QDCOUNT=0 with FORMERR (1) or EDNS0 BADVERS (16) fails over fast (<300ms).
+	for _, tc := range []struct {
+		name     string
+		rcode    uint16
+		extRcode uint8
+		version  uint8
+		wantCode uint8
+	}{
+		{name: "FORMERR", rcode: 1, extRcode: 0, version: 0, wantCode: 1},
+		{name: "BADVERS", rcode: 0, extRcode: 1, version: 0, wantCode: 16},
+		{name: "BADVERS_V1", rcode: 0, extRcode: 1, version: 1, wantCode: 16},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			primaryUDP, primaryTCP := startMockDNS(t, mockDNSBehavior{
+				customUDP: func(pc net.PacketConn, from net.Addr, q []byte) {
+					resp := buildZeroQuestionResp(q, tc.rcode, 0)
+					if tc.extRcode != 0 || tc.version != 0 {
+						binary.BigEndian.PutUint16(resp[10:], 1)
+						resp = appendMockOPTRRWithVersion(resp, "", tc.extRcode, tc.version)
+					}
+					_, _ = pc.WriteTo(resp, from)
+				},
+			})
+			start := time.Now()
+			res, err := testResolver(
+				[]string{primaryUDP, secondaryUDP},
+				map[string]string{primaryUDP: primaryTCP, secondaryUDP: secondaryTCP},
+			).Lookup(t.Context(), "host.example.com")
+			if err != nil {
+				t.Fatalf("%s failover error: %v", tc.name, err)
+			}
+			if elapsed := time.Since(start); elapsed >= 300*time.Millisecond {
+				t.Fatalf("%s failover took %v, expected fast failover < 300ms", tc.name, elapsed)
+			}
+			if !res.Authenticated || len(res.Records) != len(records) {
+				t.Fatalf("%s unexpected result: %+v", tc.name, res)
+			}
+		})
+	}
+}
+
+func TestParseSSHFPAnswers_EDNSVersion(t *testing.T) {
+	query, _, err := buildSSHFPQuery("host.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	qEnd := sshfpQuestionEnd(query)
+
+	t.Run("version=0 valid OPT succeeds", func(t *testing.T) {
+		resp := append([]byte(nil), query[:qEnd]...)
+		binary.BigEndian.PutUint16(resp[2:], dnsFlagQR|dnsFlagRD|dnsFlagAD)
+		binary.BigEndian.PutUint16(resp[6:], 1)
+		binary.BigEndian.PutUint16(resp[8:], 0)
+		binary.BigEndian.PutUint16(resp[10:], 1)
+		resp = appendMockSSHFPRR(resp, 4, 2, bytesRepeat(0x33, 32))
+		resp = appendMockOPTRRWithVersion(resp, "", 0, 0)
+		recs, err := parseSSHFPAnswers(resp)
+		if err != nil || len(recs) != 1 {
+			t.Fatalf("OPT EDNS version=0 got (recs=%v, err=%v), want 1 record", recs, err)
+		}
+	})
+
+	t.Run("version=1 with BADVERS=16 fails as non-authentic DNS error", func(t *testing.T) {
+		resp := append([]byte(nil), query[:qEnd]...)
+		binary.BigEndian.PutUint16(resp[2:], dnsFlagQR|dnsFlagRD|dnsFlagAD)
+		binary.BigEndian.PutUint16(resp[6:], 0)
+		binary.BigEndian.PutUint16(resp[8:], 0)
+		binary.BigEndian.PutUint16(resp[10:], 1)
+		resp = appendMockOPTRRWithVersion(resp, "", 1, 1) // extended rcode = 1 << 4 | 0 = 16 (BADVERS)
+		recs, err := parseSSHFPAnswers(resp)
+		if err != nil || len(recs) != 0 {
+			t.Fatalf("OPT EDNS version=1 + BADVERS(16) got (recs=%v, err=%v), want empty non-malformed result", recs, err)
+		}
+	})
+
+	t.Run("version=1 without BADVERS fails closed", func(t *testing.T) {
+		resp := append([]byte(nil), query[:qEnd]...)
+		binary.BigEndian.PutUint16(resp[2:], dnsFlagQR|dnsFlagRD|dnsFlagAD)
+		binary.BigEndian.PutUint16(resp[6:], 1)
+		binary.BigEndian.PutUint16(resp[8:], 0)
+		binary.BigEndian.PutUint16(resp[10:], 1)
+		resp = appendMockSSHFPRR(resp, 4, 2, bytesRepeat(0x33, 32))
+		resp = appendMockOPTRRWithVersion(resp, "", 0, 1) // EDNS VERSION=1 without BADVERS must fail closed.
+		if _, err := parseSSHFPAnswers(resp); !errors.Is(err, errDNSMalformed) {
+			t.Fatalf("OPT EDNS version=1 without BADVERS err = %v, want errDNSMalformed", err)
+		}
+	})
+
+	t.Run("compressed OPT owner pointer fails closed", func(t *testing.T) {
+		resp := append([]byte(nil), query[:qEnd]...)
+		binary.BigEndian.PutUint16(resp[2:], dnsFlagQR|dnsFlagRD|dnsFlagAD)
+		binary.BigEndian.PutUint16(resp[6:], 1)
+		binary.BigEndian.PutUint16(resp[8:], 0)
+		binary.BigEndian.PutUint16(resp[10:], 1)
+		resp = appendMockSSHFPRR(resp, 4, 2, bytesRepeat(0x33, 32))
+		// Point OPT owner to the root byte at the end of QNAME instead of uncompressed 0x00.
+		rootOff := uint16(qEnd - 1 - 4 - 1)
+		resp = binary.BigEndian.AppendUint16(resp, 0xc000|rootOff)
+		resp = binary.BigEndian.AppendUint16(resp, dnsTypeOPT)
+		resp = binary.BigEndian.AppendUint16(resp, dnsUDPPayloadSize)
+		resp = binary.BigEndian.AppendUint32(resp, 0x00008000)
+		resp = binary.BigEndian.AppendUint16(resp, 0)
+		if _, err := parseSSHFPAnswers(resp); !errors.Is(err, errDNSMalformed) {
+			t.Fatalf("compressed OPT owner err = %v, want errDNSMalformed", err)
+		}
+	})
+}
+
+func TestRound4_P2_8_P3_6_NormalizeDNSNameAndSkipTCZeroQDCountRetry(t *testing.T) {
+	for _, literal := range []string{"[fe80::1%eth0]", "fe80::1%eth0", "[2001:db8::1]"} {
+		if _, err := normalizeDNSName(literal); err == nil {
+			t.Fatalf("normalizeDNSName(%q) expected IP literal rejection, got nil", literal)
+		}
+	}
+
+	var tcpCalls atomic.Int32
+	udpAddr, _ := startMockDNS(t, mockDNSBehavior{
+		customUDP: func(pc net.PacketConn, from net.Addr, query []byte) {
+			resp := make([]byte, 12)
+			copy(resp[:2], query[:2])
+			// QR=1, TC=1, QDCOUNT=0, RCODE=FORMERR(1) so checkDNSResponse accepts QDCOUNT=0.
+			binary.BigEndian.PutUint16(resp[2:], dnsFlagQR|dnsFlagTC|dnsFlagRD|1)
+			_, _ = pc.WriteTo(resp, from)
+		},
+	})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			tcpCalls.Add(1)
+			_ = c.Close()
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	r := testResolver([]string{udpAddr}, map[string]string{udpAddr: ln.Addr().String()})
+	_, err = r.exchange(ctx, udpAddr, "host.example.com", false)
+	if err == nil || !strings.Contains(err.Error(), "rcode 1") {
+		t.Fatalf("exchange with TC=1 and QDCOUNT=0 err = %v, want DNS rcode 1 error", err)
+	}
+	if tcpCalls.Load() != 0 {
+		t.Fatalf("expected 0 TCP retries when QDCOUNT=0, got %d", tcpCalls.Load())
 	}
 }

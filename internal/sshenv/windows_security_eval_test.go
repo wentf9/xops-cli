@@ -190,3 +190,63 @@ func TestEvaluateWindowsAgentPipeOwner_FailsClosedWhenUnverified(t *testing.T) {
 		t.Fatal("nil security descriptor / missing owner must fail closed")
 	}
 }
+
+func TestRound4_P2_10_EvaluateWindowsAgentPipeDACL(t *testing.T) {
+	// Win32-OpenSSH openssh-ssh-agent default client ACE for Authenticated Users:
+	// READ_CONTROL|SYNCHRONIZE|FILE_READ_DATA|FILE_WRITE_DATA|FILE_READ_ATTRIBUTES|FILE_WRITE_ATTRIBUTES|FILE_READ_EA = 0x0012019b.
+	openSSHAUACE := windowsParsedACE{
+		aceType:    windowsAccessAllowedACEType,
+		mask:       0x0012019b,
+		sidValid:   true,
+		sidTrusted: false,
+	}
+	trustedOwnerACE := windowsParsedACE{
+		aceType:    windowsAccessAllowedACEType,
+		mask:       windowsAccessGenericAll | windowsAccessFileCreatePipeInstance,
+		sidValid:   true,
+		sidTrusted: true,
+	}
+
+	if err := evaluateWindowsAgentPipeSecurity(
+		true, true, 100,
+		nil, true, true,
+		nil, true, []windowsParsedACE{trustedOwnerACE, openSSHAUACE},
+	); err != nil {
+		t.Fatalf("Win32-OpenSSH pipe DACL should be allowed, got %v", err)
+	}
+
+	// Null DACL must fail closed even when process token & SD owner are trusted.
+	if err := evaluateWindowsAgentPipeSecurity(
+		true, true, 100,
+		nil, true, true,
+		nil, false, nil,
+	); !errors.Is(err, errInsecureAgentPipeDACL) {
+		t.Fatalf("null DACL got %v, want errInsecureAgentPipeDACL", err)
+	}
+
+	// Untrusted SIDs granting pipe instance creation or DACL/owner mutation must fail closed.
+	for _, unsafeMask := range []uint32{
+		windowsAccessFileCreatePipeInstance,
+		windowsAccessWriteDAC,
+		windowsAccessWriteOwner,
+		windowsAccessGenericWrite,
+		windowsAccessGenericAll,
+	} {
+		err := evaluateWindowsAgentPipeSecurity(
+			true, true, 100,
+			nil, true, true,
+			nil, true, []windowsParsedACE{
+				trustedOwnerACE,
+				{
+					aceType:    windowsAccessAllowedACEType,
+					mask:       unsafeMask,
+					sidValid:   true,
+					sidTrusted: false,
+				},
+			},
+		)
+		if !errors.Is(err, errInsecureAgentPipeDACL) {
+			t.Fatalf("mask %#x for untrusted SID got %v, want errInsecureAgentPipeDACL", unsafeMask, err)
+		}
+	}
+}

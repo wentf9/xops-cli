@@ -2,8 +2,12 @@ package ssh
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 )
@@ -317,6 +321,7 @@ func TestMuxServer_FSM_ForegroundReleaseThreeState(t *testing.T) {
 			persistEnabled:    true,
 			persistIndefinite: true,
 			activeSessions:    1,
+			foregroundHeld:    1,
 			hadActiveSession:  true,
 			idleNotify:        make(chan struct{}),
 			shutdownChan:      make(chan struct{}),
@@ -340,6 +345,7 @@ func TestMuxServer_FSM_ForegroundReleaseThreeState(t *testing.T) {
 			persistEnabled:    true,
 			persistIndefinite: true,
 			activeSessions:    1,
+			foregroundHeld:    1,
 			hadActiveSession:  true,
 			idleNotify:        make(chan struct{}),
 			shutdownChan:      make(chan struct{}),
@@ -381,4 +387,203 @@ func TestMuxServer_FSM_ForegroundReleaseThreeState(t *testing.T) {
 			t.Fatalf("ActiveSessions = %d after RemoveForegroundSession, want 0", got)
 		}
 	})
+}
+
+func TestMuxServer_FSM_ForegroundSlotNeverUnderflowsOrKillsPassenger(t *testing.T) {
+	t.Run("EarlyRemoveForegroundThenReleaseOnStopAndStopKeepsPassengerAlive", func(t *testing.T) {
+		srv := &MuxServer{
+			persistEnabled:    true,
+			persistIndefinite: true,
+			activeSessions:    1,
+			foregroundHeld:    1,
+			hadActiveSession:  true,
+			idleNotify:        make(chan struct{}),
+			shutdownChan:      make(chan struct{}),
+		}
+		if !srv.addActiveSession() {
+			t.Fatal("addActiveSession (passenger) failed")
+		}
+		if got := srv.ActiveSessions(); got != 2 {
+			t.Fatalf("ActiveSessions = %d, want 2", got)
+		}
+
+		// Foreground session releases early before ReleaseForegroundOnStop / -O stop.
+		srv.RemoveForegroundSession()
+		srv.ReleaseForegroundOnStop()
+		if pt := runSyncMuxPacketCall(t, func(c net.Conn) error { return srv.handleStopListening(c, 41) }); pt != MUX_S_OK {
+			t.Fatalf("handleStopListening = 0x%x, want MUX_S_OK", pt)
+		}
+
+		if got := srv.ActiveSessions(); got != 1 {
+			t.Fatalf("ActiveSessions = %d, want 1 (must not double-decrement into active passenger)", got)
+		}
+		assertMuxNotShutdownBriefly(t, srv, 40*time.Millisecond, "passenger alive after -O stop")
+
+		srv.removeActiveSession()
+		assertMuxShutdownCompleted(t, srv, "after passenger drained")
+	})
+
+	t.Run("DuplicateRemoveForegroundNeverUnderflows", func(t *testing.T) {
+		srv := &MuxServer{
+			persistEnabled:    true,
+			persistIndefinite: true,
+			idleNotify:        make(chan struct{}),
+			shutdownChan:      make(chan struct{}),
+		}
+		srv.RemoveForegroundSession()
+		srv.ReleaseForegroundOnStop()
+		if got := srv.ActiveSessions(); got != 0 {
+			t.Fatalf("ActiveSessions = %d with InitialActiveSessions=0, want 0", got)
+		}
+	})
+}
+
+func TestMuxServer_FSM_ShutdownAlwaysUnlinksSocketAfterStopListening(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix domain mux sockets are unsupported on Windows")
+	}
+
+	sockPath := filepath.Join(shortSocketDir(t), "unlink-after-stop.sock")
+	srv, err := NewMuxServer(MuxServerOptions{
+		ControlPath:           sockPath,
+		PersistEnabled:        true,
+		PersistIndefinite:     true,
+		SSHClient:             newDummySSHClient(),
+		InitialActiveSessions: 1,
+	})
+	if err != nil {
+		t.Fatalf("NewMuxServer failed: %v", err)
+	}
+	defer func() { _ = srv.Shutdown() }()
+
+	// Simulate race where another path set stoppedListening before unlink ran, then Shutdown() executes.
+	srv.idleMu.Lock()
+	srv.stoppedListening = true
+	srv.idleMu.Unlock()
+
+	if _, statErr := os.Lstat(sockPath); statErr != nil {
+		t.Fatalf("expected socket %q to exist before Shutdown: %v", sockPath, statErr)
+	}
+	_ = srv.Shutdown()
+	<-srv.Wait()
+	if _, statErr := os.Lstat(sockPath); !os.IsNotExist(statErr) {
+		t.Fatalf("expected Shutdown() to unlink own control socket after stoppedListening, stat err=%v", statErr)
+	}
+
+	// Verify origFi == nil never blindly unlinks an unrelated socket at the same path.
+	foreignSock := filepath.Join(shortSocketDir(t), "foreign.sock")
+	if err := os.WriteFile(foreignSock, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write foreign marker: %v", err)
+	}
+	foreignSrv := &MuxServer{
+		controlPath:  foreignSock,
+		idleNotify:   make(chan struct{}),
+		shutdownChan: make(chan struct{}),
+	}
+	_ = foreignSrv.Shutdown()
+	<-foreignSrv.Wait()
+	if _, statErr := os.Lstat(foreignSock); statErr != nil {
+		t.Fatalf("Shutdown() with origFi==nil unlinked foreign file: %v", statErr)
+	}
+}
+
+func TestMuxServer_FSM_MultiForegroundStopDoesNotUnderflowOrDeadlock(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix domain mux sockets are unsupported on Windows")
+	}
+
+	srv, _, cleanup := startChaosMaster(t, 0x4d4647, "no", 1)
+	defer cleanup()
+
+	if !srv.AddForegroundSession() {
+		t.Fatal("AddForegroundSession failed on active master")
+	}
+
+	if pt := runSyncMuxPacketCall(t, func(c net.Conn) error { return srv.handleStopListening(c, 1) }); pt != MUX_S_OK {
+		t.Fatalf("handleStopListening = 0x%x, want MUX_S_OK", pt)
+	}
+	assertMuxPhase(t, srv, muxPhaseStoppingListen, true)
+	assertMuxNotShutdownBriefly(t, srv, 40*time.Millisecond, "waiting on two foreground slots")
+
+	// First ReleaseForegroundOnStop releases only the initial -N slot; repeated calls are idempotent.
+	srv.ReleaseForegroundOnStop()
+	srv.ReleaseForegroundOnStop()
+	assertMuxNotShutdownBriefly(t, srv, 40*time.Millisecond, "waiting on second foreground slot")
+
+	// Releasing the second foreground session drains remaining work and triggers clean shutdown.
+	srv.RemoveForegroundSession()
+	assertMuxShutdownCompleted(t, srv, "multi-foreground drained")
+}
+
+func TestMuxServer_FSM_ConcurrentShutdownAndStopListeningNeverUnlinksReplacementSocket(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix domain mux sockets are unsupported on Windows")
+	}
+
+	for iter := range 10 {
+		sockPath := filepath.Join(shortSocketDir(t), fmt.Sprintf("race-replace-%d.sock", iter))
+		_ = os.Remove(sockPath)
+		srv := &MuxServer{
+			controlPath:       sockPath,
+			persistEnabled:    true,
+			persistIndefinite: true,
+			idleNotify:        make(chan struct{}),
+			shutdownChan:      make(chan struct{}),
+		}
+		l, origFi, err := bindAndLinkSocket(sockPath)
+		if err != nil {
+			t.Fatalf("iter %d bindAndLinkSocket: %v", iter, err)
+		}
+		srv.listener = l
+		srv.origFi = origFi
+
+		// Replace sockPath with a fresh master's listener before stop/shutdown race.
+		_ = os.Remove(sockPath)
+		repListener, repFi, err := bindAndLinkSocket(sockPath)
+		if err != nil {
+			_ = l.Close()
+			t.Fatalf("iter %d replacement bindAndLinkSocket: %v", iter, err)
+		}
+
+		start := make(chan struct{})
+		stopErrCh := make(chan error, 1)
+		shutdownErrCh := make(chan error, 1)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, _, callErr := chaosMuxPacketCall(func(c net.Conn) error { return srv.handleStopListening(c, 1) })
+			stopErrCh <- callErr
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			shutdownErrCh <- srv.Shutdown()
+		}()
+		close(start)
+
+		wg.Wait()
+		<-srv.Wait()
+		if stopErr := <-stopErrCh; stopErr != nil {
+			_ = repListener.Close()
+			_ = os.Remove(sockPath)
+			t.Fatalf("iter %d handleStopListening: %v", iter, stopErr)
+		}
+		if shutErr := <-shutdownErrCh; shutErr != nil {
+			_ = repListener.Close()
+			_ = os.Remove(sockPath)
+			t.Fatalf("iter %d Shutdown: %v", iter, shutErr)
+		}
+
+		curFi, lstatErr := os.Lstat(sockPath)
+		_ = repListener.Close()
+		_ = os.Remove(sockPath)
+		if lstatErr != nil {
+			t.Fatalf("iter %d replacement socket disappeared during Shutdown/StopListening race: %v", iter, lstatErr)
+		}
+		if !os.SameFile(repFi, curFi) {
+			t.Fatalf("iter %d replacement socket identity changed unexpectedly", iter)
+		}
+	}
 }

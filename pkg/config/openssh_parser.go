@@ -11,6 +11,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/wentf9/xops-cli/core/ssh"
 )
 
 type sshConfigDoc struct {
@@ -101,16 +103,26 @@ func matchSSHWildcard(pattern, s string) bool {
 	return pi == len(pattern)
 }
 
-func (b *sshConfigBlock) matches(alias string) bool {
-	if b == nil {
-		return false
+func parseSSHPatternList(patternList string) []sshHostPattern {
+	if patternList == "" {
+		return nil
 	}
-	if b.implicit || b.matchAll {
-		return true
+	parts := strings.Split(patternList, ",")
+	patterns := make([]sshHostPattern, 0, len(parts))
+	for _, raw := range parts {
+		tok := strings.TrimSpace(raw)
+		if tok == "" {
+			continue
+		}
+		patterns = append(patterns, newSSHHostPattern(tok))
 	}
+	return patterns
+}
+
+func matchSSHPatterns(patterns []sshHostPattern, candidate string) bool {
 	matched := false
-	for _, p := range b.patterns {
-		if !matchSSHWildcard(p.pattern, alias) {
+	for _, p := range patterns {
+		if !matchSSHWildcard(p.pattern, candidate) {
 			continue
 		}
 		if p.negated {
@@ -119,6 +131,20 @@ func (b *sshConfigBlock) matches(alias string) bool {
 		matched = true
 	}
 	return matched
+}
+
+func matchSSHPatternList(patternList, candidate string) bool {
+	return matchSSHPatterns(parseSSHPatternList(patternList), candidate)
+}
+
+func (b *sshConfigBlock) matches(alias string) bool {
+	if b == nil {
+		return false
+	}
+	if b.implicit || b.matchAll {
+		return true
+	}
+	return matchSSHPatterns(b.patterns, alias)
 }
 
 func (b *sshConfigBlock) matchesConcretePattern(alias string) bool {
@@ -224,7 +250,11 @@ func parseOpenSSHLine(
 	case "match":
 		return parseOpenSSHMatchBlock(lineNum, rest)
 	default:
-		current.nodes = append(current.nodes, parseOpenSSHDirective(lineNum, key, lowerKey, rest))
+		dir, err := parseOpenSSHDirective(lineNum, key, lowerKey, rest)
+		if err != nil {
+			return nil, err
+		}
+		current.nodes = append(current.nodes, dir)
 		return nil, nil
 	}
 }
@@ -254,6 +284,9 @@ func parseOpenSSHHostBlock(lineNum int, rest string) (*sshConfigBlock, error) {
 	if err != nil {
 		return nil, fmt.Errorf("line %d: invalid Host directive: %w", lineNum, err)
 	}
+	if len(rawPatterns) == 0 {
+		return nil, fmt.Errorf("line %d: Host directive requires at least one pattern", lineNum)
+	}
 	patterns := make([]sshHostPattern, 0, len(rawPatterns))
 	for _, raw := range rawPatterns {
 		patterns = append(patterns, newSSHHostPattern(raw))
@@ -270,23 +303,47 @@ func parseOpenSSHMatchBlock(lineNum int, rest string) (*sshConfigBlock, error) {
 	if err != nil || len(toks) == 0 {
 		return nil, fmt.Errorf("line %d: invalid Match directive", lineNum)
 	}
-	if len(toks) == 1 && strings.EqualFold(toks[0], "all") {
-		return &sshConfigBlock{isMatch: true, matchAll: true}, nil
-	}
-	if !strings.EqualFold(toks[0], "host") || len(toks) < 2 {
+	var rawPatterns string
+	switch len(toks) {
+	case 1:
+		if strings.EqualFold(toks[0], "all") {
+			return &sshConfigBlock{isMatch: true, matchAll: true}, nil
+		}
+		k, v, hasEq := strings.Cut(toks[0], "=")
+		if !hasEq || !strings.EqualFold(k, "host") {
+			return nil, fmt.Errorf("line %d: unsupported Match directive %q", lineNum, argsPart)
+		}
+		rawPatterns = v
+	case 2:
+		k, v, hasEq := strings.Cut(toks[0], "=")
+		switch {
+		case hasEq:
+			if !strings.EqualFold(k, "host") || v != "" {
+				return nil, fmt.Errorf("line %d: unsupported Match directive %q", lineNum, argsPart)
+			}
+			rawPatterns = toks[1]
+		case strings.EqualFold(toks[0], "host"):
+			rawPatterns = strings.TrimPrefix(toks[1], "=")
+		default:
+			return nil, fmt.Errorf("line %d: unsupported Match directive %q", lineNum, argsPart)
+		}
+	case 3:
+		if !strings.EqualFold(toks[0], "host") || toks[1] != "=" {
+			return nil, fmt.Errorf("line %d: unsupported Match directive %q", lineNum, argsPart)
+		}
+		rawPatterns = toks[2]
+	default:
 		return nil, fmt.Errorf("line %d: unsupported Match directive %q", lineNum, argsPart)
 	}
+	if strings.Contains(rawPatterns, "=") {
+		return nil, fmt.Errorf("line %d: unsupported Match criterion %q", lineNum, rawPatterns)
+	}
 	var patterns []sshHostPattern
-	for _, tok := range toks[1:] {
-		if isOpenSSHMatchCriterionKeyword(strings.TrimPrefix(tok, "!")) {
-			return nil, fmt.Errorf("line %d: unsupported Match criterion %q", lineNum, tok)
+	for _, piece := range strings.Split(rawPatterns, ",") {
+		if piece == "" {
+			continue
 		}
-		for _, piece := range strings.Split(tok, ",") {
-			if piece == "" {
-				continue
-			}
-			patterns = append(patterns, newSSHHostPattern(piece))
-		}
+		patterns = append(patterns, newSSHHostPattern(piece))
 	}
 	if len(patterns) == 0 {
 		return nil, fmt.Errorf("line %d: Match host requires at least one pattern", lineNum)
@@ -294,18 +351,70 @@ func parseOpenSSHMatchBlock(lineNum int, rest string) (*sshConfigBlock, error) {
 	return &sshConfigBlock{isMatch: true, patterns: patterns}, nil
 }
 
-func isOpenSSHMatchCriterionKeyword(s string) bool {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "all", "canonical", "final", "exec", "localnetwork",
-		"host", "originalhost", "tagged", "user", "localuser",
-		"sessiontype", "command":
+func isOpenSSHMultiTokenListDirective(lowerKey string) bool {
+	switch lowerKey {
+	case "proxyjump", "proxy_jump",
+		"canonicaldomains", "canonical_domains",
+		"canonicalizepermittedcnames", "canonicalize_permitted_cnames",
+		"userknownhostsfile", "user_known_hosts_file",
+		"globalknownhostsfile", "global_known_hosts_file":
 		return true
 	default:
 		return false
 	}
 }
 
-func parseOpenSSHDirective(lineNum int, key, lowerKey, rest string) *sshConfigDirective {
+func isStrictOpenSSHScalarDirective(lowerKey string) bool {
+	switch lowerKey {
+	case "user", "port", "hostname",
+		"controlmaster", "control_master",
+		"controlpath", "control_path",
+		"controlpersist", "control_persist",
+		"identitiesonly", "identities_only",
+		"batchmode", "batch_mode",
+		"forwardagent", "forward_agent",
+		"addressfamily", "address_family",
+		"connecttimeout", "connect_timeout",
+		"serveraliveinterval", "server_alive_interval",
+		"serveralivecountmax", "server_alive_count_max",
+		"tcpkeepalive", "tcp_keep_alive",
+		"stricthostkeychecking", "strict_host_key_checking",
+		"hashknownhosts", "hash_known_hosts",
+		"verifyhostkeydns", "verify_host_key_dns",
+		"canonicalizehostname", "canonicalize_hostname",
+		"canonicalizemaxdots", "canonicalize_max_dots",
+		"canonicalizefallbacklocal", "canonicalize_fallback_local",
+		"pubkeyauthentication", "pubkey_authentication",
+		"passwordauthentication", "password_authentication",
+		"kbdinteractiveauthentication", "kbd_interactive_authentication",
+		"challengeresponseauthentication", "challenge_response_authentication",
+		"preferredauthentications", "preferred_authentications",
+		"hostkeyalgorithms", "host_key_algorithms",
+		"ciphers", "macs",
+		"kexalgorithms", "kex_algorithms",
+		"exitonforwardfailure", "exit_on_forward_failure",
+		"clearallforwardings", "clear_all_forwardings",
+		"gatewayports", "gateway_ports",
+		"streamlocalbindunlink", "stream_local_bind_unlink",
+		"streamlocalbindmask", "stream_local_bind_mask",
+		"forkafterauthentication", "fork_after_authentication",
+		"stdinnull", "stdin_null",
+		"sessiontype", "session_type",
+		"tunnel",
+		"tunneldevice", "tunnel_device",
+		"requesttty", "request_tty",
+		"escapechar", "escape_char",
+		"permitlocalcommand", "permit_local_command",
+		"identityfile", "identity_file",
+		"certificatefile", "certificate_file",
+		"identityagent", "identity_agent":
+		return true
+	default:
+		return false
+	}
+}
+
+func parseOpenSSHDirective(lineNum int, key, lowerKey, rest string) (*sshConfigDirective, error) {
 	if isOpenSSHWholeLineCommandDirective(lowerKey) {
 		trimmed := strings.TrimSpace(rest)
 		return &sshConfigDirective{
@@ -314,9 +423,12 @@ func parseOpenSSHDirective(lineNum int, key, lowerKey, rest string) *sshConfigDi
 			lowerKey: lowerKey,
 			value:    trimmed,
 			rawValue: trimmed,
-		}
+		}, nil
 	}
 	argsPart, _, unclosed := splitOpenSSHArgvComment(rest)
+	if unclosed {
+		return nil, fmt.Errorf("line %d: unterminated quote in %s directive", lineNum, key)
+	}
 	rawVal := strings.TrimSpace(argsPart)
 	if isOpenSSHRawTokenListDirective(lowerKey) {
 		return &sshConfigDirective{
@@ -325,13 +437,28 @@ func parseOpenSSHDirective(lineNum int, key, lowerKey, rest string) *sshConfigDi
 			lowerKey: lowerKey,
 			value:    rawVal,
 			rawValue: rawVal,
-		}
+		}, nil
+	}
+	toks, err := splitOpenSSHArgvTokens(argsPart)
+	if err != nil {
+		return nil, fmt.Errorf("line %d: invalid %s directive: %w", lineNum, key, err)
+	}
+	if isOpenSSHMultiTokenListDirective(lowerKey) {
+		val := strings.Join(toks, " ")
+		return &sshConfigDirective{
+			line:     lineNum,
+			key:      key,
+			lowerKey: lowerKey,
+			value:    val,
+			rawValue: rawVal,
+		}, nil
+	}
+	if isStrictOpenSSHScalarDirective(lowerKey) && len(toks) > 1 {
+		return nil, fmt.Errorf("line %d: garbage at end of line in %s directive: %q", lineNum, key, rawVal)
 	}
 	val := rawVal
-	if !unclosed {
-		if toks, err := splitOpenSSHArgvTokens(argsPart); err == nil && len(toks) == 1 {
-			val = toks[0]
-		}
+	if len(toks) == 1 {
+		val = toks[0]
 	}
 	return &sshConfigDirective{
 		line:     lineNum,
@@ -339,7 +466,7 @@ func parseOpenSSHDirective(lineNum int, key, lowerKey, rest string) *sshConfigDi
 		lowerKey: lowerKey,
 		value:    val,
 		rawValue: rawVal,
-	}
+	}, nil
 }
 
 func isOpenSSHWholeLineCommandDirective(lowerKey string) bool {
@@ -792,7 +919,7 @@ func resolveIncludePercentToken(tok byte, rawPat string, system bool) (string, b
 		}
 		short, _, _ := strings.Cut(hn, ".")
 		return short, false, nil
-	case 'h', 'n', 'r', 'p', 'C', 'k':
+	case 'h', 'n', 'r', 'p', 'C', 'k', 'j':
 		// Target-dependent OpenSSH tokens are unavailable at config-load time;
 		// OpenSSH skips expanding them quietly during Include loading.
 		return "", true, nil
@@ -820,15 +947,19 @@ func canonicalIncludePath(path string) string {
 }
 
 func firstSSHConfigKeyValue(doc *sshConfigDoc, host string, keys ...string) string {
-	return firstSSHConfigKeyValueRaw(doc, host, false, keys...)
+	return firstSSHConfigKeyValueRawPasses(doc, []string{host}, false, keys...)
 }
 
-func firstSSHConfigKeyValueRaw(doc *sshConfigDoc, host string, preserveRaw bool, keys ...string) string {
-	if doc == nil || host == "" || len(keys) == 0 {
+func firstSSHConfigKeyValuePasses(doc *sshConfigDoc, passes []string, keys ...string) string {
+	return firstSSHConfigKeyValueRawPasses(doc, passes, false, keys...)
+}
+
+func firstSSHConfigKeyValueRawPasses(doc *sshConfigDoc, passes []string, preserveRaw bool, keys ...string) string {
+	if doc == nil || len(passes) == 0 || len(keys) == 0 {
 		return ""
 	}
 	var found string
-	walkMatchingSSHConfigDirectives(doc, host, func(d *sshConfigDirective) bool {
+	walkMatchingSSHConfigDirectivesPasses(doc, passes, func(_ int, _ string, d *sshConfigDirective) bool {
 		for _, candidate := range keys {
 			if strings.EqualFold(d.key, candidate) {
 				v := d.value
@@ -847,11 +978,21 @@ func firstSSHConfigKeyValueRaw(doc *sshConfigDoc, host string, preserveRaw bool,
 	return found
 }
 
-func walkMatchingSSHConfigDirectives(doc *sshConfigDoc, alias string, visit func(d *sshConfigDirective) bool) {
-	if doc == nil || alias == "" || visit == nil {
+type sshEvalState struct {
+	passTarget    string
+	effectiveHost string
+	sawHostName   bool
+}
+
+func walkMatchingSSHConfigDirectivesPasses(
+	doc *sshConfigDoc,
+	passes []string,
+	visit func(passIndex int, passTarget string, d *sshConfigDirective) bool,
+) {
+	if doc == nil || len(passes) == 0 || visit == nil {
 		return
 	}
-	walkMatchingSSHConfigAST(doc, alias, nil, visit)
+	walkMatchingSSHConfigASTPasses(doc, passes, nil, visit)
 }
 
 func walkMatchingSSHConfigBlocks(doc *sshConfigDoc, alias string, visit func(block *sshConfigBlock) bool) {
@@ -867,17 +1008,64 @@ func walkMatchingSSHConfigAST(
 	onBlock func(block *sshConfigBlock) bool,
 	onDirective func(d *sshConfigDirective) bool,
 ) {
-	active := make(map[*sshConfigDoc]struct{}, 4)
-	_ = walkMatchingSSHConfigASTRec(doc, alias, 0, active, onBlock, onDirective)
+	var wrapped func(passIndex int, passTarget string, d *sshConfigDirective) bool
+	if onDirective != nil {
+		wrapped = func(_ int, _ string, d *sshConfigDirective) bool {
+			return onDirective(d)
+		}
+	}
+	walkMatchingSSHConfigASTPasses(doc, []string{alias}, onBlock, wrapped)
+}
+
+func walkMatchingSSHConfigASTPasses(
+	doc *sshConfigDoc,
+	passes []string,
+	onBlock func(block *sshConfigBlock) bool,
+	onDirective func(passIndex int, passTarget string, d *sshConfigDirective) bool,
+) {
+	if doc == nil {
+		return
+	}
+	sawHostName := false
+	for passIdx, rawPassTarget := range passes {
+		passTarget := strings.TrimSpace(rawPassTarget)
+		if passTarget == "" {
+			continue
+		}
+		state := &sshEvalState{
+			passTarget:    passTarget,
+			effectiveHost: passTarget,
+			sawHostName:   sawHostName,
+		}
+		active := make(map[*sshConfigDoc]struct{}, 4)
+		if !walkMatchingSSHConfigASTRec(doc, passIdx, state, 0, active, onBlock, onDirective) {
+			return
+		}
+		sawHostName = sawHostName || state.sawHostName
+	}
+}
+
+func (b *sshConfigBlock) matchesEval(state *sshEvalState) bool {
+	if b == nil || state == nil {
+		return false
+	}
+	if b.implicit || b.matchAll {
+		return true
+	}
+	if b.isMatch {
+		return b.matches(state.effectiveHost)
+	}
+	return b.matches(state.passTarget)
 }
 
 func walkMatchingSSHConfigASTRec(
 	doc *sshConfigDoc,
-	alias string,
+	passIndex int,
+	state *sshEvalState,
 	depth int,
 	active map[*sshConfigDoc]struct{},
 	onBlock func(block *sshConfigBlock) bool,
-	onDirective func(d *sshConfigDirective) bool,
+	onDirective func(passIndex int, passTarget string, d *sshConfigDirective) bool,
 ) bool {
 	if doc == nil || depth > maxIncludeDepth {
 		return true
@@ -889,13 +1077,13 @@ func walkMatchingSSHConfigASTRec(
 	defer delete(active, doc)
 
 	for _, block := range doc.blocks {
-		if block == nil || !block.matches(alias) {
+		if block == nil || !block.matchesEval(state) {
 			continue
 		}
 		if onBlock != nil && !onBlock(block) {
 			return false
 		}
-		if !walkMatchingBlockNodes(block.nodes, alias, depth, active, onBlock, onDirective) {
+		if !walkMatchingBlockNodes(block.nodes, passIndex, state, depth, active, onBlock, onDirective) {
 			return false
 		}
 	}
@@ -904,16 +1092,29 @@ func walkMatchingSSHConfigASTRec(
 
 func walkMatchingBlockNodes(
 	nodes []sshConfigNode,
-	alias string,
+	passIndex int,
+	state *sshEvalState,
 	depth int,
 	active map[*sshConfigDoc]struct{},
 	onBlock func(block *sshConfigBlock) bool,
-	onDirective func(d *sshConfigDirective) bool,
+	onDirective func(passIndex int, passTarget string, d *sshConfigDirective) bool,
 ) bool {
 	for _, node := range nodes {
 		switch n := node.(type) {
 		case *sshConfigDirective:
-			if n != nil && onDirective != nil && !onDirective(n) {
+			if n == nil {
+				continue
+			}
+			if n.lowerKey == "hostname" && !state.sawHostName && strings.TrimSpace(n.value) != "" {
+				state.sawHostName = true
+				if expanded, err := ssh.ExpandHostName(n.value, state.passTarget); err == nil {
+					clean := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(expanded), "]"), "[")
+					if clean != "" {
+						state.effectiveHost = clean
+					}
+				}
+			}
+			if onDirective != nil && !onDirective(passIndex, state.passTarget, n) {
 				return false
 			}
 		case *sshConfigInclude:
@@ -921,7 +1122,7 @@ func walkMatchingBlockNodes(
 				continue
 			}
 			for _, inc := range n.files {
-				if !walkMatchingSSHConfigASTRec(inc.doc, alias, depth+1, active, onBlock, onDirective) {
+				if !walkMatchingSSHConfigASTRec(inc.doc, passIndex, state, depth+1, active, onBlock, onDirective) {
 					return false
 				}
 			}

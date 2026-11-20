@@ -13,6 +13,7 @@ import (
 	"github.com/wentf9/xops-cli/cmd/utils"
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/internal/sshenv"
+	"github.com/wentf9/xops-cli/internal/terminal"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
@@ -29,6 +30,7 @@ type ExitCoder interface {
 type ControlExitError struct {
 	Code    int
 	Message string
+	Err     error
 	// Reported marks a message already written to stderr in its final
 	// OpenSSH-compatible form, so the top-level handler must not print it again.
 	// Usage failures raised while parsing flags are not reported yet.
@@ -41,6 +43,13 @@ func (e *ControlExitError) Error() string {
 
 func (e *ControlExitError) ExitCode() int {
 	return e.Code
+}
+
+func (e *ControlExitError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
 }
 
 // ExitCodeFromError extracts the exit code if err implements ExitCoder,
@@ -155,13 +164,16 @@ func executeControlCommandWithStreams(ctx context.Context, o *SshOptions, stream
 	if err := o.ensureArgsParsed(); err != nil {
 		return controlError(streams.Stderr, err.Error())
 	}
+	cmdName := strings.ToLower(strings.TrimSpace(o.control.CtlCmd))
+	if err := validateControlCommandBackground(o, cmdName); err != nil {
+		return controlError(streams.Stderr, err.Error())
+	}
 
 	expandedPath, target, provider, nodeID, err := resolveControlContext(ctx, o, streams.Stderr)
 	if err != nil {
 		return err
 	}
 
-	cmdName := strings.ToLower(strings.TrimSpace(o.control.CtlCmd))
 	switch cmdName {
 	case "check":
 		return executeCheck(ctx, expandedPath, streams)
@@ -184,6 +196,26 @@ func executeControlCommandWithStreams(ctx context.Context, o *SshOptions, stream
 	default:
 		return controlError(streams.Stderr, fmt.Sprintf("unknown control command %q", cmdName))
 	}
+}
+
+func validateControlCommandBackground(o *SshOptions, cmdName string) error {
+	if cmdName == "" || cmdName == "proxy" {
+		return nil
+	}
+	if o.BgRun {
+		return fmt.Errorf("control command (-O %s) cannot be combined with background mode (-f)", cmdName)
+	}
+	sessionOpts, err := o.toSessionControlOptions()
+	if err != nil {
+		return err
+	}
+	eff, effErr := ssh.EffectiveOptions(sessionOpts.ToSSHOptions())
+	if effErr == nil && eff != nil {
+		if fork, ok := eff.ForkAfterAuthentication(); ok && fork {
+			return fmt.Errorf("control command (-O %s) cannot be combined with ForkAfterAuthentication=yes", cmdName)
+		}
+	}
+	return nil
 }
 
 // resolveControlSocketPath resolves the control socket for a -O request without
@@ -210,7 +242,7 @@ func canonicalizeControlOptions(ctx context.Context, o *SshOptions, provider con
 func resolveControlContext(ctx context.Context, o *SshOptions, stderr io.Writer) (string, ssh.TargetContext, config.ConfigProvider, string, error) {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
-			return "", ssh.TargetContext{}, nil, "", err
+			return "", ssh.TargetContext{}, nil, "", &ControlExitError{Code: 255, Message: err.Error(), Err: err}
 		}
 	}
 	if o != nil {
@@ -249,6 +281,7 @@ func resolveControlContext(ctx context.Context, o *SshOptions, stderr io.Writer)
 		// the configuration problem instead of silently using a wrong socket.
 		return "", ssh.TargetContext{}, nil, "", controlError(stderr, fmt.Sprintf("%s: %v", i18n.T("ssh_err_load_config"), providerErr))
 	}
+	registerControlCanonicalTarget(provider, o, nodeID)
 
 	target := controlTarget(o, provider, nodeID)
 	expanded, err := expandControlSocketPath(o, provider, nodeID, target, stderr)
@@ -260,7 +293,7 @@ func resolveControlContext(ctx context.Context, o *SshOptions, stderr io.Writer)
 
 func expandControlSocketPath(o *SshOptions, provider config.ConfigProvider, nodeID string, target ssh.TargetContext, stderr io.Writer) (string, error) {
 	rawPath := strings.TrimSpace(o.control.ControlPath)
-	if rawPath == "none" {
+	if strings.EqualFold(rawPath, "none") {
 		return "", controlError(stderr, "ControlPath must be specified when using -O")
 	}
 	if rawPath != "" {
@@ -277,7 +310,7 @@ func expandControlSocketPath(o *SshOptions, provider config.ConfigProvider, node
 	if err != nil {
 		return "", controlError(stderr, fmt.Sprintf("resolve control path failed: %v", err))
 	}
-	if expanded == "" || expanded == "none" {
+	if expanded == "" || strings.EqualFold(strings.TrimSpace(expanded), "none") {
 		return "", controlError(stderr, "ControlPath must be specified when using -O")
 	}
 	return expanded, nil
@@ -302,6 +335,56 @@ func resolveControlNodeID(provider config.ConfigProvider, target config.Connecti
 func setProviderOpenSSHAlias(provider config.ConfigProvider, nodeID, alias string) {
 	if p, ok := provider.(interface{ SetNodeOpenSSHAlias(string, string) }); ok {
 		p.SetNodeOpenSSHAlias(nodeID, alias)
+	}
+}
+
+func setProviderCanonicalHost(provider config.ConfigProvider, nodeID, canonicalHost string) {
+	if p, ok := provider.(interface{ SetNodeCanonicalHost(string, string) }); ok {
+		p.SetNodeCanonicalHost(nodeID, canonicalHost)
+	}
+}
+
+func canonicalControlOriginAndHost(o *SshOptions) (origHost, canonHost string) {
+	if o == nil || !o.canonicalized {
+		return "", ""
+	}
+	origHost = strings.TrimSpace(config.UnwrapOpenSSHSelector(o.originalHost))
+	if _, h, _, err := utils.ParseAddr(origHost); err == nil && h != "" {
+		origHost = h
+	}
+	origHost = strings.TrimPrefix(strings.TrimSuffix(origHost, "]"), "[")
+	canonHost = strings.TrimSpace(config.UnwrapOpenSSHSelector(o.Target.Selector))
+	if canonHost == "" {
+		canonHost = strings.TrimSpace(config.UnwrapOpenSSHSelector(o.Host))
+	}
+	if _, h, _, err := utils.ParseAddr(canonHost); err == nil && h != "" {
+		canonHost = h
+	}
+	canonHost = strings.TrimPrefix(strings.TrimSuffix(canonHost, "]"), "[")
+	if origHost == "" || canonHost == "" || strings.EqualFold(origHost, canonHost) {
+		return "", ""
+	}
+	return origHost, canonHost
+}
+
+func registerControlCanonicalTarget(provider config.ConfigProvider, o *SshOptions, extraNodeIDs ...string) {
+	if provider == nil {
+		return
+	}
+	origHost, canonHost := canonicalControlOriginAndHost(o)
+	if origHost == "" || canonHost == "" {
+		return
+	}
+	targets := make([]string, 0, len(extraNodeIDs)+2)
+	targets = append(targets, config.OpenSSHNodePrefix+canonHost, origHost)
+	targets = append(targets, extraNodeIDs...)
+	for _, id := range targets {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		setProviderOpenSSHAlias(provider, id, origHost)
+		setProviderCanonicalHost(provider, id, canonHost)
 	}
 }
 
@@ -332,8 +415,8 @@ func loadReadOnlyControlProvider() (config.ConfigProvider, error) {
 	}
 	provider, err := config.NewProvider(cfg)
 	if err != nil {
-		logger.DefaultLogger().Debugf("mux: load OpenSSH config failed (%v); falling back to local config", err)
-		return config.NewProviderWithoutOpenSSH(cfg), nil
+		logger.DefaultLogger().Debugf("mux: load OpenSSH config failed (%v); preserving saved-node control only", err)
+		return config.NewProviderWithOpenSSHParser(cfg, config.NewBrokenOpenSSHParser(fmt.Errorf("load openssh config: %w", err))), nil
 	}
 	return provider, nil
 }
@@ -666,6 +749,7 @@ func buildControlProxyClientConfig(
 		if o != nil {
 			o.syncResolvedTargetHosts(provider)
 		}
+		registerControlCanonicalTarget(provider, o, nodeID)
 		snapshot = provider.Snapshot()
 		adp = adapter.NewSSHAdapter(provider, buildControlProxyAdapterOptions(snapshot, nodeID, o)...)
 		if nodeID != "" {
@@ -678,29 +762,7 @@ func buildControlProxyClientConfig(
 	}
 
 	if cfg == nil {
-		port := target.Port
-		if port <= 0 {
-			port = 22
-		}
-		var globalExec *ssh.ExecutionConfig
-		var globalPattern string
-		if snapshot != nil {
-			globalExec = snapshot.Execution
-			globalPattern = snapshot.PasswordPromptPattern
-		}
-		resolvedExec, _ := ssh.ResolveExecution(nil, globalExec)
-		cfg = &ssh.ClientConfig{
-			Address:               target.Host,
-			Port:                  port,
-			User:                  target.User,
-			OriginalHost:          target.OriginalHost,
-			Password:              o.Password,
-			SudoMode:              ssh.SudoModeAuto,
-			ProxyJump:             target.JumpHost,
-			Execution:             resolvedExec,
-			Options:               resolveControlProxyFallbackOptions(adp, target.Host, o),
-			PasswordPromptPattern: globalPattern,
-		}
+		cfg = newControlProxyFallbackConfig(target, provider, adp, snapshot, o)
 	}
 
 	prompter := o.interaction
@@ -716,6 +778,98 @@ func buildControlProxyClientConfig(
 		muxOpts = append(muxOpts, ssh.WithMuxPasswordPromptPattern(snapshot.PasswordPromptPattern))
 	}
 	return cfg, muxOpts
+}
+
+func newControlProxyFallbackConfig(
+	target ssh.TargetContext,
+	provider config.ConfigProvider,
+	adp *adapter.SSHAdapter,
+	snapshot *config.Configuration,
+	o *SshOptions,
+) *ssh.ClientConfig {
+	port := target.Port
+	if port <= 0 {
+		port = 22
+	}
+	var globalExec *ssh.ExecutionConfig
+	var globalPattern string
+	if snapshot != nil {
+		globalExec = snapshot.Execution
+		globalPattern = snapshot.PasswordPromptPattern
+	}
+	resolvedExec, _ := ssh.ResolveExecution(nil, globalExec)
+	fallbackLookup := resolveControlProxyFallbackLookup(target, provider, o)
+	registerControlCanonicalTarget(provider, o, fallbackLookup)
+	var pw string
+	if o != nil {
+		pw = o.Password
+	}
+	return &ssh.ClientConfig{
+		Address:               target.Host,
+		Port:                  port,
+		User:                  target.User,
+		OriginalHost:          target.OriginalHost,
+		Password:              pw,
+		SudoMode:              ssh.SudoModeAuto,
+		ProxyJump:             target.JumpHost,
+		Execution:             resolvedExec,
+		Options:               resolveControlProxyFallbackOptions(adp, fallbackLookup, o),
+		PasswordPromptPattern: globalPattern,
+	}
+}
+
+func resolveControlProxyFallbackLookup(target ssh.TargetContext, provider config.ConfigProvider, o *SshOptions) string {
+	if provider != nil && o != nil {
+		explicit := strings.TrimSpace(o.Target.Selector)
+		if explicit == "" {
+			explicit = strings.TrimSpace(o.Host)
+		}
+		if config.IsOpenSSHNodeID(explicit) {
+			if resolvedID, err := provider.ResolveSelector(explicit); err == nil && resolvedID != "" {
+				return resolvedID
+			}
+			return explicit
+		}
+		if resolved, err := config.ResolveTarget(provider, effectiveConnectionTarget(o, "")); err == nil {
+			if resolved.MatchedNodeID != "" {
+				return resolved.MatchedNodeID
+			}
+			if resolved.BaseNodeID != "" {
+				return resolved.BaseNodeID
+			}
+		}
+	}
+
+	candidates := make([]string, 0, 6)
+	if o != nil {
+		candidates = append(candidates,
+			strings.TrimSpace(o.Target.Selector),
+			strings.TrimSpace(o.Host),
+			strings.TrimSpace(o.originalHost),
+		)
+	}
+	candidates = append(candidates, target.OriginalHost)
+	if o != nil {
+		candidates = append(candidates, strings.TrimSpace(o.Target.OriginalHost))
+	}
+	candidates = append(candidates, target.Host)
+
+	if provider != nil {
+		for _, candidate := range candidates {
+			if candidate == "" {
+				continue
+			}
+			if resolvedID, err := provider.ResolveSelector(candidate); err == nil && resolvedID != "" {
+				return resolvedID
+			}
+		}
+	}
+	for _, candidate := range candidates {
+		if candidate != "" {
+			return candidate
+		}
+	}
+	return target.Host
 }
 
 func isControlProxyStdinNull(o *SshOptions, opts *ssh.Options) bool {
@@ -783,6 +937,7 @@ func buildControlProxyAdapterOptions(snapshot *config.Configuration, nodeID stri
 	}
 	adpOpts := []adapter.Option{
 		adapter.WithCredentialRecording(false),
+		adapter.WithControlProxyMode(true),
 		adapter.WithGlobalSessionAuth(sessionAuth),
 	}
 	if nodeID != "" {
@@ -824,11 +979,11 @@ func mapControlProxySessionError(stderr io.Writer, err error) error {
 		if code == 0 {
 			code = 255
 		}
-		return &ControlExitError{Code: code, Message: exitErr.Error(), Reported: true}
+		return &ControlExitError{Code: code, Message: exitErr.Error(), Err: err, Reported: true}
 	}
 	var cmdExitErr *ssh.CommandExitError
 	if errors.As(err, &cmdExitErr) && cmdExitErr.ExitCode != nil {
-		return &ControlExitError{Code: int(*cmdExitErr.ExitCode), Message: cmdExitErr.Error(), Reported: true}
+		return &ControlExitError{Code: int(*cmdExitErr.ExitCode), Message: cmdExitErr.Error(), Err: err, Reported: true}
 	}
 	var reportedErr interface {
 		ExitCode() int
@@ -839,7 +994,7 @@ func mapControlProxySessionError(stderr io.Writer, err error) error {
 		if code == 0 {
 			code = 255
 		}
-		return &ControlExitError{Code: code, Message: err.Error(), Reported: true}
+		return &ControlExitError{Code: code, Message: err.Error(), Err: err, Reported: true}
 	}
 	return controlError(stderr, err.Error())
 }
@@ -865,22 +1020,47 @@ func executeProxyStream(ctx context.Context, socketPath string, streams controlS
 	// because half-closing the Unix control socket causes the Master's readUnpaddedPacket loop
 	// to observe EOF and tear down the proxy session before buffered server packets are read.
 	stdoutDone := make(chan struct{})
-	go func() {
-		_, _ = io.Copy(conn, streams.Stdin)
-	}()
+	stdinDone := make(chan struct{})
+	var dupIn terminal.PromptInput
+	if stdinFile, ok := streams.Stdin.(*os.File); ok && stdinFile != nil {
+		if dup, dupErr := terminal.DuplicatePromptInput(stdinFile); dupErr == nil {
+			dupIn = dup
+		}
+	}
+	if dupIn != nil {
+		go func() {
+			defer close(stdinDone)
+			_, _ = io.Copy(conn, dupIn)
+		}()
+	} else if streams.Stdin != nil {
+		go func() {
+			defer close(stdinDone)
+			_, _ = io.Copy(conn, streams.Stdin)
+		}()
+	} else {
+		close(stdinDone)
+	}
 	go func() {
 		_, _ = io.Copy(streams.Stdout, conn)
 		close(stdoutDone)
 	}()
 
+	var streamErr error
 	select {
 	case <-ctx.Done():
 		_ = conn.Close()
 		<-stdoutDone
-		return ctx.Err()
+		ctxErr := ctx.Err()
+		streamErr = &ControlExitError{Code: 255, Message: ctxErr.Error(), Err: ctxErr}
 	case <-stdoutDone:
-		return nil
+		_ = conn.Close()
 	}
+	if dupIn != nil {
+		_ = dupIn.Interrupt()
+		<-stdinDone
+		_ = dupIn.Close()
+	}
+	return streamErr
 }
 
 func executeInfo(ctx context.Context, socketPath string, infoType string, streams controlStreams) error {

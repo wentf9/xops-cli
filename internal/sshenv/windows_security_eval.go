@@ -5,7 +5,10 @@ import (
 	"fmt"
 )
 
-var errUntrustedAgentPipeOwner = errors.New("ssh-agent named pipe server is owned by an untrusted local user")
+var (
+	errUntrustedAgentPipeOwner = errors.New("ssh-agent named pipe server is owned by an untrusted local user")
+	errInsecureAgentPipeDACL   = errors.New("ssh-agent named pipe DACL grants unsafe access to untrusted principal")
+)
 
 // Win32 file attributes, ACE flags, ACE types, and ACCESS_MASK constants from
 // winnt.h (verified via compile-time assertions on Windows in dns_servers_windows.go).
@@ -37,19 +40,29 @@ const (
 	windowsSystemScopedPolicyIDACEType        uint8 = 19
 	windowsSystemProcessTrustLabelACEType     uint8 = 20
 
-	windowsAccessFileWriteData   uint32 = 0x00000002 // FILE_WRITE_DATA / FILE_ADD_FILE
-	windowsAccessFileAppendData  uint32 = 0x00000004 // FILE_APPEND_DATA / FILE_ADD_SUBDIRECTORY
-	windowsAccessFileDeleteChild uint32 = 0x00000040 // FILE_DELETE_CHILD
-	windowsAccessDelete          uint32 = 0x00010000 // DELETE
-	windowsAccessWriteDAC        uint32 = 0x00040000 // WRITE_DAC
-	windowsAccessWriteOwner      uint32 = 0x00080000 // WRITE_OWNER
-	windowsAccessGenericAll      uint32 = 0x10000000 // GENERIC_ALL
-	windowsAccessGenericWrite    uint32 = 0x40000000 // GENERIC_WRITE
+	windowsAccessFileWriteData          uint32 = 0x00000002 // FILE_WRITE_DATA / FILE_ADD_FILE
+	windowsAccessFileAppendData         uint32 = 0x00000004 // FILE_APPEND_DATA / FILE_ADD_SUBDIRECTORY
+	windowsAccessFileCreatePipeInstance uint32 = windowsAccessFileAppendData
+	windowsAccessFileDeleteChild        uint32 = 0x00000040 // FILE_DELETE_CHILD
+	windowsAccessDelete                 uint32 = 0x00010000 // DELETE
+	windowsAccessWriteDAC               uint32 = 0x00040000 // WRITE_DAC
+	windowsAccessWriteOwner             uint32 = 0x00080000 // WRITE_OWNER
+	windowsAccessGenericAll             uint32 = 0x10000000 // GENERIC_ALL
+	windowsAccessGenericWrite           uint32 = 0x40000000 // GENERIC_WRITE
 
 	windowsInsecureSSHObjectWriteMask uint32 = windowsAccessFileWriteData |
 		windowsAccessFileAppendData |
 		windowsAccessFileDeleteChild |
 		windowsAccessDelete |
+		windowsAccessWriteDAC |
+		windowsAccessWriteOwner |
+		windowsAccessGenericWrite |
+		windowsAccessGenericAll
+
+	// Named pipes only permit FILE_CREATE_PIPE_INSTANCE, WRITE_DAC, WRITE_OWNER,
+	// GENERIC_WRITE, and GENERIC_ALL for trusted principals; client read/write
+	// (e.g., Win32-OpenSSH 0x0012019b for Authenticated Users) stays allowed.
+	windowsInsecureNamedPipeServerMask uint32 = windowsAccessFileCreatePipeInstance |
 		windowsAccessWriteDAC |
 		windowsAccessWriteOwner |
 		windowsAccessGenericWrite |
@@ -91,6 +104,14 @@ func evaluateWindowsAttributes(attrs uint32, expectDir bool) bool {
 //   - Standard/callback allow ACEs carrying write/delete/DACL/owner bits require a trusted SID.
 //   - Unknown, compound, or object-specific allow ACEs (e.g., ACCESS_ALLOWED_OBJECT_ACE_TYPE) fail closed.
 func evaluateWindowsACE(ace windowsParsedACE) bool {
+	return evaluateWindowsACEWithMask(ace, windowsInsecureSSHObjectWriteMask)
+}
+
+func evaluateWindowsNamedPipeACE(ace windowsParsedACE) bool {
+	return evaluateWindowsACEWithMask(ace, windowsInsecureNamedPipeServerMask)
+}
+
+func evaluateWindowsACEWithMask(ace windowsParsedACE, disallowedMask uint32) bool {
 	if ace.aceFlags&windowsInheritOnlyACEFlag != 0 {
 		return true
 	}
@@ -98,7 +119,7 @@ func evaluateWindowsACE(ace windowsParsedACE) bool {
 		if !ace.sidValid {
 			return false
 		}
-		if ace.mask&windowsInsecureSSHObjectWriteMask != 0 && !ace.sidTrusted {
+		if ace.mask&disallowedMask != 0 && !ace.sidTrusted {
 			return false
 		}
 		return true
@@ -143,6 +164,51 @@ func evaluateWindowsObjectSecurity(
 		}
 	}
 	return true
+}
+
+func evaluateWindowsNamedPipeDACL(hasDACL bool, aces []windowsParsedACE) bool {
+	if !hasDACL {
+		return false
+	}
+	for _, ace := range aces {
+		if !evaluateWindowsNamedPipeACE(ace) {
+			return false
+		}
+	}
+	return true
+}
+
+func evaluateWindowsAgentPipeSecurity(
+	tokenResolved bool,
+	tokenTrusted bool,
+	serverPID uint32,
+	sdErr error,
+	hasSDOwner bool,
+	sdOwnerTrusted bool,
+	daclErr error,
+	hasDACL bool,
+	aces []windowsParsedACE,
+) error {
+	if err := evaluateWindowsAgentPipeOwner(
+		tokenResolved,
+		tokenTrusted,
+		serverPID,
+		sdErr,
+		hasSDOwner,
+		sdOwnerTrusted,
+	); err != nil {
+		return err
+	}
+	if sdErr != nil {
+		return fmt.Errorf("verify ssh-agent named pipe DACL: %w", sdErr)
+	}
+	if daclErr != nil {
+		return fmt.Errorf("verify ssh-agent named pipe DACL: %w", daclErr)
+	}
+	if !evaluateWindowsNamedPipeDACL(hasDACL, aces) {
+		return errInsecureAgentPipeDACL
+	}
+	return nil
 }
 
 func evaluateWindowsAgentPipeOwner(

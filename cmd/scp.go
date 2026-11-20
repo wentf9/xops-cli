@@ -31,24 +31,25 @@ import (
 
 type ScpOptions struct {
 	SshOptions
-	Recursive      bool
-	Quiet          bool
-	Verbose        bool
-	Force          bool
-	NoOverwrite    bool
-	TaskCount      int
-	ThreadCount    int
-	Source         string
-	Dest           string
-	HostFile       string
-	Tag            string
-	Exclude        []string
-	sshLogLevel    int
-	verboseSeen    bool
-	verboseLevel   int
-	diagnostics    corelog.DiagnosticObserver
-	canonicalMu    sync.Mutex
-	canonicalCache map[string]config.CanonicalizeResult
+	Recursive         bool
+	Quiet             bool
+	Verbose           bool
+	Force             bool
+	NoOverwrite       bool
+	TaskCount         int
+	ThreadCount       int
+	Source            string
+	Dest              string
+	HostFile          string
+	Tag               string
+	Exclude           []string
+	sshLogLevel       int
+	verboseSeen       bool
+	verboseLevel      int
+	diagnostics       corelog.DiagnosticObserver
+	canonicalMu       sync.Mutex
+	canonicalCache    map[string]config.CanonicalizeResult
+	canonicalResolver config.CanonicalResolver
 }
 
 func NewScpOptions() *ScpOptions {
@@ -387,6 +388,9 @@ func (o *ScpOptions) runTransfer(ctx context.Context, provider config.ConfigProv
 	if o.Host != "" || o.Tag != "" || o.HostFile != "" {
 		return o.runBatch(ctx, provider, connector)
 	}
+	if err := o.canonicalizeEndpoints(ctx, provider); err != nil {
+		return err
+	}
 	src, srcErr := parsePath(o.Source)
 	if srcErr != nil {
 		return fmt.Errorf("parse source path failed: %w", srcErr)
@@ -398,6 +402,10 @@ func (o *ScpOptions) runTransfer(ctx context.Context, provider config.ConfigProv
 		if dstErr != nil {
 			return fmt.Errorf("parse dest path failed: %w", dstErr)
 		}
+	}
+
+	if err := o.validateTransferExcludes(provider, src, dst); err != nil {
+		return err
 	}
 
 	// 2. 远程到远程
@@ -415,6 +423,30 @@ func (o *ScpOptions) runTransfer(ctx context.Context, provider config.ConfigProv
 	}
 
 	return fmt.Errorf("%s", i18n.T("scp_err_both_local"))
+}
+
+func (o *ScpOptions) validateTransferExcludes(provider config.ConfigProvider, src, dst PathInfo) error {
+	if len(o.Exclude) == 0 || provider == nil {
+		return nil
+	}
+	excludes, err := o.resolveExcludes(provider)
+	if err != nil {
+		return fmt.Errorf("%s: %w", i18n.T("scp_err_exclude"), err)
+	}
+	for _, p := range []PathInfo{src, dst} {
+		if !p.IsRemote {
+			continue
+		}
+		canonP := o.cachedCanonicalPathInfo(p)
+		excluded, exErr := o.isBatchHostExcluded(provider, excludes, p.Host, canonP)
+		if exErr != nil {
+			return fmt.Errorf("%s: %w", i18n.T("scp_err_exclude"), exErr)
+		}
+		if excluded {
+			return fmt.Errorf("%s: target host excluded", i18n.T("scp_err_exclude"))
+		}
+	}
+	return nil
 }
 
 func (o *ScpOptions) runUpload(ctx context.Context, localPath string, dst PathInfo, provider config.ConfigProvider, connector *ssh.Connector) (err error) {
@@ -795,6 +827,9 @@ func taggedNodePathInfo(nodeID string) PathInfo {
 }
 
 func (o *ScpOptions) runBatch(ctx context.Context, provider config.ConfigProvider, connector *ssh.Connector) error {
+	if err := o.canonicalizeEndpoints(ctx, provider); err != nil {
+		return err
+	}
 	// 解析 --exclude 排除规则（在 Worker Pool 启动前完成，确保无歧义）
 	var excludes map[string]struct{}
 	if len(o.Exclude) > 0 {
@@ -988,6 +1023,7 @@ func (o *ScpOptions) excludeTargetInfoForPath(provider config.ConfigProvider, ra
 		info.MatchedNodeID = resolved.MatchedNodeID
 		info.BaseNodeID = resolved.BaseNodeID
 		info.OpenSSHAlias = resolved.OpenSSHAlias
+		info.CanonicalHost = resolved.CanonicalHost
 		if resolved.User != "" {
 			info.User = resolved.User
 		}
@@ -1132,7 +1168,7 @@ func (o *ScpOptions) canonicalizeEndpoints(ctx context.Context, provider config.
 	if provider == nil {
 		return nil
 	}
-	for _, p := range o.collectTargetPaths(provider) {
+	for _, p := range o.rawTargetPaths(provider) {
 		if _, err := o.canonicalizePathInfo(ctx, provider, p); err != nil {
 			return err
 		}
@@ -1188,8 +1224,9 @@ func (o *ScpOptions) canonicalizePathInfo(ctx context.Context, provider config.C
 		Provider:         provider,
 		Host:             p.Host,
 		RawCLIOptions:    o.control.Options,
-		CLIProxyJump:     o.JumpHost,
+		CLIProxyJump:     o.effectiveCLIJumpHost(),
 		MatchedSavedNode: matchedSavedNode,
+		Resolver:         o.canonicalResolver,
 	})
 	if cErr != nil {
 		return p, cErr
@@ -1273,6 +1310,7 @@ func (o *ScpOptions) resolveTargetForPath(path PathInfo) (config.ConnectionTarge
 
 	return config.ConnectionTarget{
 		Selector:     strings.TrimSpace(host),
+		OriginalHost: strings.TrimSpace(path.OriginalHost),
 		User:         strings.TrimSpace(user),
 		HasUser:      hasUser,
 		Port:         port,
@@ -1280,6 +1318,10 @@ func (o *ScpOptions) resolveTargetForPath(path PathInfo) (config.ConnectionTarge
 		ProxyJump:    o.JumpHost,
 		HasProxyJump: o.JumpHost != "",
 	}, nil
+}
+
+func (o *ScpOptions) isBatchMode() bool {
+	return o != nil && (o.Tag != "" || o.Host != "" || o.HostFile != "")
 }
 
 func (o *ScpOptions) getOrCreateNodeForPath(ctx context.Context, provider config.ConfigProvider, path PathInfo, specificPassword string) (string, bool, error) {
@@ -1295,7 +1337,8 @@ func (o *ScpOptions) getOrCreateNodeForPath(ctx context.Context, provider config
 		return "", false, err
 	}
 
-	shouldRemember := cmdutils.EffectiveRememberPolicy(o.Remember, provider.Snapshot()) == cmdutils.RememberPolicyAlways
+	batch := o.isBatchMode()
+	shouldRemember := !batch && cmdutils.EffectiveRememberPolicy(o.Remember, provider.Snapshot()) == cmdutils.RememberPolicyAlways
 	res, err := preparer.PrepareNodeContext(ctx, config.EnsureNodeOptions{
 		Target:       target,
 		Password:     "",
@@ -1305,6 +1348,15 @@ func (o *ScpOptions) getOrCreateNodeForPath(ctx context.Context, provider config
 	})
 	if err != nil {
 		return "", false, err
+	}
+
+	if batch {
+		if o.JumpHost != "" {
+			if _, jErr := provider.ResolveProxyJumpChain(o.JumpHost); jErr != nil {
+				return "", false, fmt.Errorf("resolve SCP proxy jump %q failed: %w", o.JumpHost, jErr)
+			}
+		}
+		return res.NodeID, false, nil
 	}
 
 	if res.Created {
@@ -1432,7 +1484,7 @@ func (o *ScpOptions) credentialConnectorWithInteraction(provider config.ConfigPr
 	}
 	policy := cmdutils.EffectiveRememberPolicy(o.Remember, cfg)
 	shouldRemember, adpOpts := interaction.rememberOptions(policy, cfg)
-	batch := o.Tag != "" || strings.Contains(o.Host, ",") || o.HostFile != ""
+	batch := o.isBatchMode()
 	adpOpts = append(adpOpts, adapter.WithLocalExecution(!batch), adapter.WithSessionAndForwardOptions(false))
 	shouldRemember = !batch && shouldRemember
 	suppressConfirm := policy == cmdutils.RememberPolicyNever || batch
@@ -1491,14 +1543,18 @@ func (o *ScpOptions) appendScpSessionControlOptions(adpOpts *[]adapter.Option, t
 }
 
 func (o *ScpOptions) appendScpSessionAuthOverrides(adpOpts *[]adapter.Option, provider config.ConfigProvider, shouldRemember, suppressConfirm bool) error {
-	if provider != nil && len(o.Exclude) > 0 && (o.Host != "" || o.Tag != "" || o.HostFile != "") {
-		if _, err := o.resolveExcludes(provider); err != nil {
+	var excludes map[string]struct{}
+	if provider != nil && len(o.Exclude) > 0 {
+		var err error
+		excludes, err = o.resolveExcludes(provider)
+		if err != nil {
 			return fmt.Errorf("%s: %w", i18n.T("scp_err_exclude"), err)
 		}
 	}
-	targetNodes, nodeOriginalHosts, expandHosts := o.resolvedTargetNodeIDsWithHosts(provider)
+	targetPaths := o.collectTargetPathsWithExcludes(provider, excludes)
+	targetNodes, nodeOriginalHosts, expandHosts := o.resolvedTargetNodeIDsWithHostsForPaths(provider, targetPaths)
 	o.targetNodeIDs = targetNodes
-	distinctHosts := o.distinctRemoteHosts(provider)
+	distinctHosts := o.distinctRemoteHostsForPaths(provider, targetPaths)
 	if len(distinctHosts) > 1 {
 		if staticHostName := o.staticHostNameOverride(); staticHostName != "" {
 			return fmt.Errorf("static HostName %q cannot be used with multiple distinct remote hosts; use %%h or omit -o HostName", staticHostName)
@@ -1589,9 +1645,13 @@ func hostNameHasHostToken(pattern string) bool {
 }
 
 func (o *ScpOptions) distinctRemoteHosts(provider config.ConfigProvider) []string {
+	return o.distinctRemoteHostsForPaths(provider, o.collectTargetPaths(provider))
+}
+
+func (o *ScpOptions) distinctRemoteHostsForPaths(provider config.ConfigProvider, targetPaths []PathInfo) []string {
 	seen := make(map[string]struct{})
 	var hosts []string
-	for _, p := range o.collectTargetPaths(provider) {
+	for _, p := range targetPaths {
 		var h string
 		if provider != nil {
 			if _, origHost, expandHost, ok := o.resolvePathTargetAndHosts(provider, p); ok {
@@ -1624,6 +1684,10 @@ func (o *ScpOptions) resolvedTargetNodeIDsWithOriginals(provider config.ConfigPr
 }
 
 func (o *ScpOptions) resolvedTargetNodeIDsWithHosts(provider config.ConfigProvider) ([]string, map[string]string, map[string]string) {
+	return o.resolvedTargetNodeIDsWithHostsForPaths(provider, o.collectTargetPaths(provider))
+}
+
+func (o *ScpOptions) resolvedTargetNodeIDsWithHostsForPaths(provider config.ConfigProvider, targetPaths []PathInfo) ([]string, map[string]string, map[string]string) {
 	if provider == nil {
 		return nil, nil, nil
 	}
@@ -1631,7 +1695,7 @@ func (o *ScpOptions) resolvedTargetNodeIDsWithHosts(provider config.ConfigProvid
 	originals := make(map[string]string)
 	expandHosts := make(map[string]string)
 	seen := make(map[string]struct{})
-	for _, p := range o.collectTargetPaths(provider) {
+	for _, p := range targetPaths {
 		target, origHost, expandHost, ok := o.resolvePathTargetAndHosts(provider, p)
 		if !ok {
 			continue
@@ -1670,6 +1734,7 @@ func (o *ScpOptions) resolvePathTargetAndHosts(provider config.ConfigProvider, p
 		if canonOriginalHost == "" {
 			canonOriginalHost = res.OriginalHost
 		}
+		p.OriginalHost = canonOriginalHost
 		p.Host = res.CanonicalHost
 	}
 	target, err := o.resolveTargetForPath(p)
@@ -1753,7 +1818,7 @@ func (o *ScpOptions) resolveExcludes(provider config.ConfigProvider) (map[string
 		return nil, nil
 	}
 	candidates := o.buildExcludeCandidates(provider)
-	return cmdutils.ResolveExcludesForTargets(provider, cmdutils.ParseExcludeFlag(o.Exclude), candidates)
+	return cmdutils.ResolveExcludesForTargetsWithOptions(provider, cmdutils.ParseExcludeFlag(o.Exclude), candidates, o.control.Options, o.effectiveCLIJumpHost())
 }
 
 func (o *ScpOptions) buildExcludeCandidates(provider config.ConfigProvider) []cmdutils.ExcludeTargetInfo {
@@ -1778,6 +1843,10 @@ func (o *ScpOptions) collectTargetPaths(provider config.ConfigProvider) []PathIn
 			excludes = resolved
 		}
 	}
+	return o.collectTargetPathsWithExcludes(provider, excludes)
+}
+
+func (o *ScpOptions) collectTargetPathsWithExcludes(provider config.ConfigProvider, excludes map[string]struct{}) []PathInfo {
 	rawPaths := o.rawTargetPaths(provider)
 	paths := make([]PathInfo, 0, len(rawPaths))
 	for _, p := range rawPaths {

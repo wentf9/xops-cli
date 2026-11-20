@@ -10,12 +10,14 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/wentf9/xops-cli/cmd/utils"
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/core/testutil/sshfixture"
 	"github.com/wentf9/xops-cli/pkg/adapter"
@@ -1188,4 +1190,489 @@ func TestDisableSessionControlForParentPreservesNonMuxOptions(t *testing.T) {
 	if parentClientCfg.Options.ControlPath() != "none" || parentClientCfg.Options.ControlMaster() != ssh.ControlMasterNo {
 		t.Fatalf("expected ControlPath=none and ControlMaster=no in -f parent Options, got %+v", parentClientCfg.Options.ControlConfig())
 	}
+}
+
+func TestSshCompleteSkipsStdinSecretsForBgChildAndNonProxyControlCommands(t *testing.T) {
+	runCompleteWithOpenPipeStdin := func(t *testing.T, args []string) (*SshOptions, error) {
+		t.Helper()
+		origStdin := os.Stdin
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe: %v", err)
+		}
+		os.Stdin = r
+		t.Cleanup(func() {
+			os.Stdin = origStdin
+			_ = r.Close()
+			_ = w.Close()
+		})
+
+		opts := NewSshOptions()
+		sshCmd := newCmdSshWithOptions(opts)
+		if err := sshCmd.Flags().Parse(args); err != nil {
+			t.Fatalf("Parse(%v): %v", args, err)
+		}
+
+		done := make(chan error, 1)
+		go func() {
+			done <- opts.Complete(sshCmd, sshCmd.Flags().Args())
+		}()
+
+		select {
+		case err := <-done:
+			return opts, err
+		case <-time.After(1 * time.Second):
+			_ = w.Close()
+			t.Fatalf("Complete(%v) blocked trying to read open stdin pipe", args)
+			return nil, nil
+		}
+	}
+
+	t.Run("bg child skips stdin secret flags", func(t *testing.T) {
+		t.Setenv("XOPS_CLI_SSH_BG_CHILD", "true")
+		opts, err := runCompleteWithOpenPipeStdin(t, []string{"--password-stdin", "--passphrase-stdin", "--otp-stdin", "example.com"})
+		if err != nil {
+			t.Fatalf("Complete(bg child) failed: %v", err)
+		}
+		if opts.PasswordStdin || opts.PassphraseStdin || opts.OTPStdin {
+			t.Fatalf("expected stdin secret flags cleared in bg child, got pwd=%v pp=%v otp=%v",
+				opts.PasswordStdin, opts.PassphraseStdin, opts.OTPStdin)
+		}
+	})
+
+	t.Run("-O proxy-stream skips stdin secret flags", func(t *testing.T) {
+		opts, err := runCompleteWithOpenPipeStdin(t, []string{"-O", "proxy-stream", "-S", "/tmp/test.sock", "--password-stdin", "example.com"})
+		if err != nil {
+			t.Fatalf("Complete(-O proxy-stream) failed: %v", err)
+		}
+		if opts.PasswordStdin {
+			t.Fatal("expected PasswordStdin cleared for -O proxy-stream")
+		}
+	})
+
+	t.Run("-O check skips stdin secret flags", func(t *testing.T) {
+		opts, err := runCompleteWithOpenPipeStdin(t, []string{"-O", "check", "-S", "/tmp/test.sock", "--passphrase-stdin", "example.com"})
+		if err != nil {
+			t.Fatalf("Complete(-O check) failed: %v", err)
+		}
+		if opts.PassphraseStdin {
+			t.Fatal("expected PassphraseStdin cleared for -O check")
+		}
+	})
+}
+
+func TestControlCommandsWrapValidationAndCompleteErrorsWithExit255AndUnwrap(t *testing.T) {
+	assertControlExit255Unwraps := func(t *testing.T, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("expected non-nil error")
+		}
+		var ctlErr *ControlExitError
+		if !errors.As(err, &ctlErr) {
+			t.Fatalf("expected *ControlExitError, got %T (%v)", err, err)
+		}
+		if ctlErr.ExitCode() != 255 {
+			t.Fatalf("expected ExitCode 255, got %d (%v)", ctlErr.ExitCode(), err)
+		}
+		underlying := ctlErr.Unwrap()
+		if underlying == nil {
+			t.Fatalf("expected non-nil Unwrap() on ControlExitError: %+v", ctlErr)
+		}
+		if !errors.Is(err, underlying) {
+			t.Fatalf("expected errors.Is(err, err.Unwrap()) to be true for %v", err)
+		}
+	}
+
+	t.Run("-O check ApplyGeneralOptions in Complete wraps 255", func(t *testing.T) {
+		opts := NewSshOptions()
+		c := newCmdSshWithOptions(opts)
+		if err := c.Flags().Parse([]string{"-O", "check", "-S", "/tmp/test.sock", "-o", "InvalidOptionWithoutEquals", "example.com"}); err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		assertControlExit255Unwraps(t, opts.Complete(c, c.Flags().Args()))
+	})
+
+	t.Run("-O check validateCommonSSHBaseOptions wraps 255", func(t *testing.T) {
+		opts := NewSshOptions()
+		c := newCmdSshWithOptions(opts)
+		if err := c.Flags().Parse([]string{"-O", "check", "-S", "/tmp/test.sock", "--remember", "invalid", "example.com"}); err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		if err := opts.Complete(c, c.Flags().Args()); err != nil {
+			t.Fatalf("Complete: %v", err)
+		}
+		assertControlExit255Unwraps(t, opts.Validate())
+	})
+
+	t.Run("-O proxy validateCommonSSHBaseOptions wraps 255", func(t *testing.T) {
+		opts := NewSshOptions()
+		c := newCmdSshWithOptions(opts)
+		if err := c.Flags().Parse([]string{"-O", "proxy", "-S", "/tmp/test.sock", "--remember", "invalid", "example.com"}); err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		if err := opts.Complete(c, c.Flags().Args()); err != nil {
+			t.Fatalf("Complete: %v", err)
+		}
+		assertControlExit255Unwraps(t, opts.Validate())
+	})
+
+	t.Run("-O proxy prepareCommandPlan wraps 255", func(t *testing.T) {
+		opts := NewSshOptions()
+		c := newCmdSshWithOptions(opts)
+		if err := c.Flags().Parse([]string{"-O", "proxy", "-S", "/tmp/test.sock", "--interpreter", "invalid-shell", "example.com", "id"}); err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		if err := opts.Complete(c, c.Flags().Args()); err != nil {
+			t.Fatalf("Complete: %v", err)
+		}
+		assertControlExit255Unwraps(t, opts.Validate())
+	})
+
+	t.Run("-O proxy readSecretsFromStdin wraps 255", func(t *testing.T) {
+		origStdin := os.Stdin
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe: %v", err)
+		}
+		_ = w.Close()
+		os.Stdin = r
+		t.Cleanup(func() {
+			os.Stdin = origStdin
+			_ = r.Close()
+		})
+
+		opts := NewSshOptions()
+		c := newCmdSshWithOptions(opts)
+		if err := c.Flags().Parse([]string{"-O", "proxy", "-S", "/tmp/test.sock", "--password-stdin", "example.com"}); err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		assertControlExit255Unwraps(t, opts.Complete(c, c.Flags().Args()))
+	})
+}
+
+func TestBuildControlProxyClientConfigStripsProxyCommandPreservesRemoteCommandAndSetEnv(t *testing.T) {
+	cfg := config.NewProviderWithoutOpenSSH(nil).Snapshot()
+	cfg.Hosts.Set("h-1", models.Host{Address: "10.55.66.77", Port: 22})
+	cfg.Identities.Set("id-1", models.Identity{User: "cfguser", AuthType: "password", Password: "pw"})
+	cfg.Nodes.Set("node-1", models.Node{HostRef: "h-1", IdentityRef: "id-1"})
+	provider := config.NewProviderWithoutOpenSSH(cfg)
+
+	targetCtx := ssh.TargetContext{
+		Host: "10.55.66.77",
+		Port: 22,
+		User: "cfguser",
+	}
+
+	t.Run("saved node strips ProxyCommand and keeps RemoteCommand and SetEnv", func(t *testing.T) {
+		proxyOpts := &SshOptions{
+			control: SSHControlFlags{
+				Options: []string{"ProxyCommand=nc %h %p", "RemoteCommand=uptime", "SetEnv=FOO=bar"},
+			},
+		}
+		clientCfg, _ := buildControlProxyClientConfig(targetCtx, provider, "node-1", proxyOpts)
+		if clientCfg == nil || clientCfg.Options == nil {
+			t.Fatalf("expected non-nil clientCfg and Options, got %+v", clientCfg)
+		}
+		if active := clientCfg.Options.ActiveProxyCommand(); active != "" {
+			t.Fatalf("expected ProxyCommand stripped for proxy mode, got ActiveProxyCommand=%q", active)
+		}
+		if gotRC := clientCfg.Options.RemoteCommand(); gotRC != "uptime" {
+			t.Fatalf("expected RemoteCommand=%q, got %q", "uptime", gotRC)
+		}
+		if gotEnv := clientCfg.Options.SetEnvDirectives(); !slices.Equal(gotEnv, []string{"FOO=bar"}) {
+			t.Fatalf("expected SetEnvDirectives=[FOO=bar], got %v", gotEnv)
+		}
+	})
+
+	t.Run("ad-hoc target with -l override strips ProxyCommand and keeps RemoteCommand and SetEnv", func(t *testing.T) {
+		cfgTier3 := config.NewProviderWithoutOpenSSH(nil).Snapshot()
+		cfgTier3.Hosts.Set("h-1", models.Host{Address: "10.55.66.77", Port: 22})
+		cfgTier3.Identities.Set("id-1", models.Identity{User: "cfguser", AuthType: "password", Password: "pw"})
+		cfgTier3.Nodes.Set("node-1", models.Node{
+			HostRef:     "h-1",
+			IdentityRef: "id-1",
+			SSHOptions:  ssh.MustOptions("ProxyCommand", "nc %h %p", "RemoteCommand", "whoami", "SetEnv", "BAZ=qux"),
+		})
+		provTier3 := config.NewProviderWithoutOpenSSH(cfgTier3)
+
+		targetCtxOverride := ssh.TargetContext{
+			Host:         "10.55.66.77",
+			Port:         22,
+			User:         "overrideuser",
+			OriginalHost: "node-1",
+		}
+		proxyOpts := &SshOptions{
+			Host: "node-1",
+			User: "overrideuser",
+			Target: config.ConnectionTarget{
+				Selector: "node-1",
+				User:     "overrideuser",
+				HasUser:  true,
+			},
+		}
+		clientCfg, _ := buildControlProxyClientConfig(targetCtxOverride, provTier3, "", proxyOpts)
+		if clientCfg == nil || clientCfg.Options == nil {
+			t.Fatalf("expected non-nil clientCfg and Options, got %+v", clientCfg)
+		}
+		if clientCfg.User != "overrideuser" {
+			t.Fatalf("expected -l overrideuser preserved, got %q", clientCfg.User)
+		}
+		if active := clientCfg.Options.ActiveProxyCommand(); active != "" {
+			t.Fatalf("expected Tier 3 ProxyCommand stripped for ad-hoc proxy mode, got ActiveProxyCommand=%q", active)
+		}
+		if gotRC := clientCfg.Options.RemoteCommand(); gotRC != "whoami" {
+			t.Fatalf("expected RemoteCommand=%q, got %q", "whoami", gotRC)
+		}
+		if gotEnv := clientCfg.Options.SetEnvDirectives(); !slices.Equal(gotEnv, []string{"BAZ=qux"}) {
+			t.Fatalf("expected SetEnvDirectives=[BAZ=qux], got %v", gotEnv)
+		}
+	})
+}
+
+func TestExecuteProxyStreamOpenPipeStdinStdoutDone(t *testing.T) {
+	sockPath, ln := createTestMuxMasterServer(t)
+	const greeting = "hello-from-mux-master\n"
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				pktType, _, err := ssh.ReadMuxPacket(c)
+				if err != nil || pktType != ssh.MUX_MSG_HELLO {
+					return
+				}
+				_ = ssh.WriteMuxPacket(c, ssh.MUX_MSG_HELLO, ssh.EncodeMuxHello(ssh.MuxProtoVersion, nil))
+				msgType, payload, err := ssh.ReadMuxPacket(c)
+				if err != nil || msgType != ssh.MUX_C_PROXY {
+					return
+				}
+				reqID, _ := ssh.DecodeMuxRequestID(payload)
+				_ = ssh.WriteMuxPacket(c, ssh.MUX_S_PROXY, ssh.EncodeMuxClientRequestID(reqID))
+				_, _ = io.WriteString(c, greeting)
+			}(conn)
+		}
+	}()
+
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer func() {
+		_ = stdinR.Close()
+		_ = stdinW.Close()
+	}()
+
+	var stdout, stderr bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- executeProxyStream(ctx, sockPath, controlStreams{
+			Stdin:  stdinR,
+			Stdout: &stdout,
+			Stderr: &stderr,
+		})
+	}()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("executeProxyStream(stdoutDone) unexpected error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("executeProxyStream(stdoutDone) hung with open pipe stdin")
+	}
+	if stdout.String() != greeting {
+		t.Fatalf("stdout = %q, want %q", stdout.String(), greeting)
+	}
+
+	// Verify caller's pipe FD is still open and no leaked goroutine steals bytes from stdinR.
+	if _, err := stdinW.Write([]byte("X")); err != nil {
+		t.Fatalf("caller stdinW closed unexpectedly: %v", err)
+	}
+	buf := make([]byte, 1)
+	if _, err := io.ReadFull(stdinR, buf); err != nil || buf[0] != 'X' {
+		t.Fatalf("caller stdinR damaged or stolen by leaked goroutine: buf=%q err=%v", buf, err)
+	}
+}
+
+func TestExecuteProxyStreamOpenPipeStdinCancel(t *testing.T) {
+	sockPath, ln := createTestMuxMasterServer(t)
+	serverRelease := make(chan struct{})
+	defer close(serverRelease)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				pktType, _, err := ssh.ReadMuxPacket(c)
+				if err != nil || pktType != ssh.MUX_MSG_HELLO {
+					return
+				}
+				_ = ssh.WriteMuxPacket(c, ssh.MUX_MSG_HELLO, ssh.EncodeMuxHello(ssh.MuxProtoVersion, nil))
+				msgType, payload, err := ssh.ReadMuxPacket(c)
+				if err != nil || msgType != ssh.MUX_C_PROXY {
+					return
+				}
+				reqID, _ := ssh.DecodeMuxRequestID(payload)
+				_ = ssh.WriteMuxPacket(c, ssh.MUX_S_PROXY, ssh.EncodeMuxClientRequestID(reqID))
+				<-serverRelease
+			}(conn)
+		}
+	}()
+
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer func() {
+		_ = stdinR.Close()
+		_ = stdinW.Close()
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(30*time.Millisecond, cancel)
+
+	var stdout, stderr bytes.Buffer
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- executeProxyStream(ctx, sockPath, controlStreams{
+			Stdin:  stdinR,
+			Stdout: &stdout,
+			Stderr: &stderr,
+		})
+	}()
+
+	var streamErr error
+	select {
+	case streamErr = <-errCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("executeProxyStream(cancel) hung with open pipe stdin")
+	}
+	if streamErr == nil {
+		t.Fatal("expected error on ctx cancellation")
+	}
+	var ctlErr *ControlExitError
+	if !errors.As(streamErr, &ctlErr) || ctlErr.ExitCode() != 255 {
+		t.Fatalf("expected *ControlExitError(255), got %T (%v)", streamErr, streamErr)
+	}
+	if !errors.Is(streamErr, context.Canceled) {
+		t.Fatalf("expected errors.Is(err, context.Canceled), got %v", streamErr)
+	}
+
+	if _, err := stdinW.Write([]byte("Y")); err != nil {
+		t.Fatalf("caller stdinW closed unexpectedly after cancel: %v", err)
+	}
+	buf := make([]byte, 1)
+	if _, err := io.ReadFull(stdinR, buf); err != nil || buf[0] != 'Y' {
+		t.Fatalf("caller stdinR damaged or stolen after cancel: buf=%q err=%v", buf, err)
+	}
+}
+
+func TestLoadReadOnlyControlProviderBrokenOpenSSHConfigPreservesSavedAndFailsClosedOnOpenSSH(t *testing.T) {
+	home := setupTestEnvironment(t)
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll(.ssh): %v", err)
+	}
+	// Empty Host directive fails strict OpenSSH parsing.
+	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte("Host\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(.ssh/config): %v", err)
+	}
+
+	cfg := config.NewProviderWithoutOpenSSH(nil).Snapshot()
+	cfg.SchemaVersion = 2
+	cfg.Hosts.Set("h-saved", models.Host{Address: "10.99.0.10", Port: 22})
+	cfg.Identities.Set("id-saved", models.Identity{User: "ops", AuthType: "auto"})
+	cfg.Nodes.Set("saved-node", models.Node{HostRef: "h-saved", IdentityRef: "id-saved"})
+
+	path, key, err := utils.GetConfigFilePath()
+	if err != nil {
+		t.Fatalf("GetConfigFilePath: %v", err)
+	}
+	if err := config.NewDefaultStore(path, key).Save(cfg); err != nil {
+		t.Fatalf("Save config: %v", err)
+	}
+
+	provider, err := loadReadOnlyControlProvider()
+	if err != nil {
+		t.Fatalf("loadReadOnlyControlProvider unexpected error: %v", err)
+	}
+	if _, _, _, err := provider.Resolve("saved-node"); err != nil {
+		t.Fatalf("expected saved node lookup to keep working when ~/.ssh/config is broken, got: %v", err)
+	}
+	if _, err := config.ResolveTarget(provider, config.ConnectionTarget{Selector: "unmatched-host"}); err == nil {
+		t.Fatal("expected unmatched target resolution to fail closed on broken ~/.ssh/config")
+	}
+}
+
+func TestControlContextCanceledExits255_AndProxyFallbackLookupViaRealControlTarget(t *testing.T) {
+	t.Run("resolveControlContext canceled ctx returns ControlExitError 255", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		o := NewSshOptions()
+		o.control.CtlCmd = "check"
+		_, _, _, _, err := resolveControlContext(ctx, o, &bytes.Buffer{})
+		var ctlErr *ControlExitError
+		if !errors.As(err, &ctlErr) || ctlErr.Code != 255 {
+			t.Fatalf("canceled resolveControlContext err = %v, want *ControlExitError{Code: 255}", err)
+		}
+	})
+
+	t.Run("resolveControlProxyFallbackLookup preserves saved node under -l override and openssh namespace", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("USERPROFILE", home)
+
+		sshCfgPath := filepath.Join(home, "ssh_config")
+		if err := os.WriteFile(sshCfgPath, []byte(strings.Join([]string{
+			"Host web",
+			"  HostName 10.55.66.77",
+			"  User other",
+		}, "\n")+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		parser, err := config.NewOpenSSHParserFromPath(sshCfgPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		cfg := config.NewProviderWithoutOpenSSH(nil).Snapshot()
+		cfg.Hosts.Set("10.55.66.77:22", models.Host{Address: "10.55.66.77", Port: 22})
+		cfg.Identities.Set("ops@10.55.66.77", models.Identity{User: "ops", AuthType: "auto"})
+		cfg.Nodes.Set("node-1", models.Node{HostRef: "10.55.66.77:22", IdentityRef: "ops@10.55.66.77"})
+		provider := config.NewProviderWithOpenSSHParser(cfg, parser)
+
+		// 1. Saved node with -l overrideuser driven through real controlTarget (which synthesizes TargetContext.OriginalHost).
+		oSaved := NewSshOptions()
+		oSaved.User = "overrideuser"
+		oSaved.Host = "node-1"
+		oSaved.Target = config.ConnectionTarget{
+			Selector: "node-1",
+			User:     "overrideuser",
+			HasUser:  true,
+		}
+		tSaved := controlTarget(oSaved, provider, "")
+		if got := resolveControlProxyFallbackLookup(tSaved, provider, oSaved); got != "node-1" {
+			t.Fatalf("saved node -l override fallbackLookup = %q, want %q (target=%+v)", got, "node-1", tSaved)
+		}
+
+		// 2. Explicit openssh:other@web sharing the same IP must remain in openssh: namespace.
+		oVirtual := NewSshOptions()
+		oVirtual.Host = "openssh:other@web"
+		oVirtual.Target = config.ConnectionTarget{Selector: "openssh:other@web"}
+		tVirtual := controlTarget(oVirtual, provider, "")
+		if got := resolveControlProxyFallbackLookup(tVirtual, provider, oVirtual); !config.IsOpenSSHNodeID(got) {
+			t.Fatalf("explicit openssh: target collapsed to non-OpenSSH ID %q", got)
+		}
+	})
 }

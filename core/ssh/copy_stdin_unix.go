@@ -13,18 +13,25 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// copyStdinTo 使用 poll(2) 将 src 复制到 dst，返回取消函数和完成通道。
-// 调用 cancel 后 goroutine 会立即退出，不会残留读取 stdin 的 goroutine 偷走后续输入。
-//
-// 实现原理：同时 poll stdin fd 和一个 cancel pipe fd，关闭 cancel pipe 写端即可
-// 立即唤醒 poll 并退出，完全避免了 os.File.SetReadDeadline 在终端 fd 上不生效的问题。
+// copyStdinTo 使用 SyscallConn + poll(2) 将 src 复制到 dst，返回取消函数和完成通道。
+// 不调用 src.Fd() 以免篡改借用文件描述符的非阻塞标志，对 EAGAIN/EINTR 干净重试。
 func copyStdinTo(src *os.File, dst io.Writer) (cancel func() error, done <-chan error, err error) {
 	if src == nil {
 		return nil, nil, fmt.Errorf("interactive stdin is nil")
 	}
+	rawSrc, err := src.SyscallConn()
+	if err != nil {
+		return nil, nil, fmt.Errorf("access interactive stdin descriptor: %w", err)
+	}
 	cancelR, cancelW, err := os.Pipe()
 	if err != nil {
 		return nil, nil, fmt.Errorf("create stdin cancellation pipe failed: %w", err)
+	}
+	rawCancel, err := cancelR.SyscallConn()
+	if err != nil {
+		_ = cancelR.Close()
+		_ = cancelW.Close()
+		return nil, nil, fmt.Errorf("access stdin cancellation pipe failed: %w", err)
 	}
 
 	ch := make(chan error, 1)
@@ -38,49 +45,24 @@ func copyStdinTo(src *os.File, dst io.Writer) (cancel func() error, done <-chan 
 			close(ch)
 		}()
 
-		stdinFd := int(src.Fd())
-		cancelFd := int(cancelR.Fd())
 		buf := make([]byte, 32*1024)
-
-		fds := []unix.PollFd{
-			{Fd: int32(stdinFd), Events: unix.POLLIN},
-			{Fd: int32(cancelFd), Events: unix.POLLIN},
-		}
-
 		for {
-			_, err := unix.Poll(fds, -1)
-			if err != nil {
-				if errors.Is(err, syscall.EINTR) {
-					continue
-				}
-				copyErr = fmt.Errorf("poll stdin failed: %w", err)
-				return
-			}
-			if fds[1].Revents&(unix.POLLIN|unix.POLLHUP) != 0 {
-				return
-			}
-			if fds[0].Revents&(unix.POLLERR|unix.POLLNVAL) != 0 {
-				copyErr = fmt.Errorf("stdin poll reported invalid or failed descriptor")
-				return
-			}
-			if fds[0].Revents&unix.POLLHUP != 0 && fds[0].Revents&unix.POLLIN == 0 {
-				return
-			}
-			if fds[0].Revents&unix.POLLIN != 0 {
-				n, err := unix.Read(stdinFd, buf)
-				if n > 0 {
-					if _, werr := dst.Write(buf[:n]); werr != nil {
-						copyErr = fmt.Errorf("copy stdin to SSH session failed: %w", werr)
-						return
-					}
-				}
-				if err != nil {
-					copyErr = fmt.Errorf("read stdin failed: %w", err)
+			n, canceled, readErr := readStdinPollStep(rawSrc, rawCancel, buf)
+			if n > 0 {
+				if _, werr := dst.Write(buf[:n]); werr != nil {
+					copyErr = fmt.Errorf("copy stdin to SSH session failed: %w", werr)
 					return
 				}
-				if n == 0 {
-					return
-				}
+			}
+			if canceled {
+				return
+			}
+			if readErr != nil {
+				copyErr = readErr
+				return
+			}
+			if n == 0 {
+				return
 			}
 		}
 	}()
@@ -91,10 +73,67 @@ func copyStdinTo(src *os.File, dst io.Writer) (cancel func() error, done <-chan 
 	)
 	return func() error {
 		cancelOnce.Do(func() {
+			_, _ = cancelW.Write([]byte{1})
 			if closeErr := cancelW.Close(); closeErr != nil {
 				cancelErr = fmt.Errorf("close stdin cancellation writer failed: %w", closeErr)
 			}
 		})
 		return cancelErr
 	}, ch, nil
+}
+
+func readStdinPollStep(rawSrc, rawCancel syscall.RawConn, buf []byte) (n int, canceled bool, readErr error) {
+	ctrlErr := rawSrc.Control(func(sfd uintptr) {
+		wErr := rawCancel.Control(func(cfd uintptr) {
+			fds := []unix.PollFd{
+				{Fd: int32(sfd), Events: unix.POLLIN},
+				{Fd: int32(cfd), Events: unix.POLLIN},
+			}
+			for {
+				fds[0].Revents = 0
+				fds[1].Revents = 0
+				_, pErr := unix.Poll(fds, -1)
+				if pErr != nil {
+					if errors.Is(pErr, syscall.EINTR) {
+						continue
+					}
+					readErr = fmt.Errorf("poll stdin failed: %w", pErr)
+					return
+				}
+				if fds[1].Revents != 0 {
+					canceled = true
+					return
+				}
+				if fds[0].Revents&(unix.POLLERR|unix.POLLNVAL) != 0 {
+					readErr = fmt.Errorf("stdin poll reported invalid or failed descriptor")
+					return
+				}
+				if fds[0].Revents&unix.POLLHUP != 0 && fds[0].Revents&unix.POLLIN == 0 {
+					return
+				}
+				if fds[0].Revents&unix.POLLIN != 0 {
+					rn, rErr := unix.Read(int(sfd), buf)
+					if rErr != nil {
+						if errors.Is(rErr, syscall.EINTR) || errors.Is(rErr, syscall.EAGAIN) || errors.Is(rErr, syscall.EWOULDBLOCK) {
+							continue
+						}
+						if rn > 0 {
+							n = rn
+						}
+						readErr = fmt.Errorf("read stdin failed: %w", rErr)
+						return
+					}
+					n = rn
+					return
+				}
+			}
+		})
+		if wErr != nil && readErr == nil && !canceled {
+			readErr = wErr
+		}
+	})
+	if ctrlErr != nil && readErr == nil && !canceled {
+		readErr = ctrlErr
+	}
+	return n, canceled, readErr
 }

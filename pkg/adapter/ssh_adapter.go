@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	coreauth "github.com/wentf9/xops-cli/core/auth"
@@ -203,8 +204,18 @@ type optionParseState struct {
 }
 
 func ParseOptionStrings(options []string) (SessionControlOptions, error) {
+	return ParseOptionStringsWithJump(options, "")
+}
+
+// ParseOptionStringsWithJump parses OpenSSH -o Key=Value strings while
+// accounting for an explicit CLI -J / --jump override supplied alongside -o.
+func ParseOptionStringsWithJump(options []string, cliProxyJump string) (SessionControlOptions, error) {
 	var opts SessionControlOptions
 	state := optionParseState{seen: make(map[string]bool)}
+	if trimmedJump := strings.TrimSpace(cliProxyJump); trimmedJump != "" {
+		state.seen["proxyjump"] = true
+		state.proxyJumpActive = ssh.HasActiveProxyJump(trimmedJump)
+	}
 	for _, opt := range options {
 		key, val, err := SplitOptionKeyValue(opt)
 		if err != nil {
@@ -243,13 +254,13 @@ func applyParsedOption(opts *SessionControlOptions, state *optionParseState, key
 			return fmt.Errorf("invalid HostName in -o option: %w", err)
 		}
 		// Applied to the connection target by the CLI, see ApplyGeneralOptions.
-	case "proxyjump":
+	case "proxyjump", "proxy_jump":
 		if val == "" {
 			return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
 		}
 		if !state.seen["proxyjump"] && !state.seen[ssh.OptionProxyCommand] {
 			state.seen["proxyjump"] = true
-			if !strings.EqualFold(strings.TrimSpace(val), "none") {
+			if ssh.HasActiveProxyJump(val) {
 				state.proxyJumpActive = true
 			}
 		}
@@ -488,6 +499,16 @@ func WithLocalExecution(enabled bool) Option {
 	}
 }
 
+// WithControlProxyMode marks this adapter for SSH -O proxy control-socket client
+// resolution: ProxyCommand directives are stripped cleanly (never executed and
+// never rejected with ErrLocalExecutionDisabled) while Session/Forward/Env/Auth
+// configuration for the multiplexed session remains intact.
+func WithControlProxyMode(enabled bool) Option {
+	return func(a *SSHAdapter) {
+		a.controlProxyMode = enabled
+	}
+}
+
 // WithSessionAndForwardOptions controls whether Forward-class and Session-class
 // SSH options (port forwards, ForwardAgent, SendEnv, SetEnv, RemoteCommand, EscapeChar, RequestTTY)
 // are forwarded by this adapter. Interactive CLI keeps this enabled (default), while
@@ -544,12 +565,15 @@ type SSHAdapter struct {
 	disableSession           bool
 	disableSessionAndForward bool
 	localExecution           bool
+	controlProxyMode         bool
 	credentialRecording      bool
 	suppressNodeConfirmation bool
 	rememberConfirmation     func(context.Context, string) (bool, error)
 	enrollmentProbe          bool
 	enrollmentProbeWarning   func(string, error)
 	enrollmentProbeExcluded  map[string]struct{}
+	batchModeMu              sync.RWMutex
+	batchModeLatched         map[string]bool
 }
 
 // WithCredentialService injects the transactional writer used when an
@@ -576,6 +600,7 @@ func NewSSHAdapter(cfgProvider config.ConfigProvider, opts ...Option) *SSHAdapte
 		cfgProvider:         cfgProvider,
 		sessionOverrides:    make(map[string]SessionAuth),
 		credentialRecording: true,
+		batchModeLatched:    make(map[string]bool),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -706,8 +731,7 @@ func cloneWithoutProxyCommand(opts *ssh.Options) *ssh.Options {
 }
 
 func isActiveProxyJumpValue(val string) bool {
-	trimmed := strings.TrimSpace(val)
-	return trimmed != "" && !strings.EqualFold(trimmed, "none")
+	return ssh.HasActiveProxyJump(val)
 }
 
 // ResolveControl resolves the effective ControlConfig for nodeID given session options,
@@ -878,7 +902,11 @@ func (a *SSHAdapter) ExpandControlPath(nodeID string, rawPath string) (string, e
 	if rawPath == "" || rawPath == "none" {
 		return rawPath, nil
 	}
-	pol, err := a.solvePolicy(nodeID, SessionControlOptions{}, policySolveMode{requireSnapshot: true})
+	sessionCtrlOpts, _ := a.getSessionControlOverride(nodeID)
+	pol, err := a.solvePolicy(nodeID, sessionCtrlOpts, policySolveMode{
+		requireSnapshot: true,
+		resolveProxy:    true,
+	})
 	if err != nil {
 		return "", fmt.Errorf("resolve node %q for control path expansion: %w", nodeID, err)
 	}
@@ -893,6 +921,12 @@ func (a *SSHAdapter) ConfirmConnection(ctx context.Context, nodeID string) error
 	}
 	if auth, ok := a.getSessionOverride(nodeID); ok && auth.SuppressNodeConfirmation {
 		return nil
+	}
+	if nodeID != "" && a.cfgProvider != nil {
+		sessionCtrlOpts, _ := a.getSessionControlOverride(nodeID)
+		if opts, err := a.ResolveSSHOptions(nodeID, sessionCtrlOpts); err == nil && opts != nil && opts.BatchMode() {
+			a.latchBatchMode(nodeID)
+		}
 	}
 	if provider, ok := a.cfgProvider.(interface {
 		ConfirmNodeContext(context.Context, string) error
@@ -935,12 +969,17 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 	}
 
 	sshOpts := pol.effectiveOpts
+	baseProxyJump := snapshot.Node.ProxyJump
+	if !ssh.HasActiveProxyJump(baseProxyJump) {
+		baseProxyJump = ""
+	}
 	cfg := &ssh.ClientConfig{
 		NodeID:                nodeID,
 		Address:               strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(snapshot.Host.Address), "]"), "["),
 		Port:                  effectiveSnapshotPort(snapshot.Host.Port),
 		User:                  effectiveSnapshotUser(snapshot.Identity.User),
 		OriginalHost:          pol.originalHost,
+		CanonicalHost:         pol.canonicalHost,
 		AuthType:              snapshot.Identity.AuthType,
 		Password:              snapshot.Identity.Password,
 		KeyPath:               snapshot.Identity.KeyPath,
@@ -949,8 +988,8 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 		SudoMode:              ssh.SudoMode(snapshot.Node.SudoMode),
 		SuPwd:                 snapshot.Node.SuPwd,
 		SudoUpdateToken:       sudoUpdateToken,
-		ProxyJump:             snapshot.Node.ProxyJump,
-		OriginalProxyJump:     snapshot.Node.ProxyJump,
+		ProxyJump:             baseProxyJump,
+		OriginalProxyJump:     baseProxyJump,
 		HasOriginalProxyJump:  true,
 		PasswordPromptPattern: snapshot.Node.PasswordPromptPattern,
 		Execution:             execCfg,
@@ -1006,11 +1045,11 @@ func firstConcreteKeyPath(paths []string) string {
 }
 
 func openSSHSnapshotOriginalHost(nodeID string, snapshot config.ConnectionSnapshot) string {
+	if (snapshot.Provenance.IsOpenSSH() || config.IsOpenSSHNodeID(nodeID)) && snapshot.Node.OpenSSHAlias != "" {
+		return snapshot.Node.OpenSSHAlias
+	}
 	if cleanOrig, ok := config.OpenSSHOriginalHost(nodeID); ok {
 		return cleanOrig
-	}
-	if snapshot.Provenance == config.ProvenanceOpenSSHDerived && snapshot.Node.OpenSSHAlias != "" {
-		return snapshot.Node.OpenSSHAlias
 	}
 	return ""
 }
@@ -1088,15 +1127,26 @@ func (a *SSHAdapter) applySessionOverrideToConfig(nodeID string, cfg *ssh.Client
 	if override.SuPwd != "" {
 		cfg.SuPwd = override.SuPwd
 	}
-	if override.ProxyJump != "" {
-		resolvedJump, err := a.cfgProvider.ResolveProxyJumpChain(override.ProxyJump)
-		if err != nil {
-			return fmt.Errorf("resolve proxy jump %q for node %q failed: %w", override.ProxyJump, nodeID, err)
-		}
-		cfg.ProxyJump = resolvedJump
-		cfg.OriginalProxyJump = resolvedJump
-		cfg.HasOriginalProxyJump = true
+	return a.applySessionProxyJumpOverride(nodeID, cfg, override.ProxyJump)
+}
+
+func (a *SSHAdapter) applySessionProxyJumpOverride(nodeID string, cfg *ssh.ClientConfig, rawJump string) error {
+	if rawJump == "" {
+		return nil
 	}
+	if ssh.IsDisabledProxyJump(rawJump) {
+		cfg.ProxyJump = ""
+		cfg.OriginalProxyJump = ""
+		cfg.HasOriginalProxyJump = true
+		return nil
+	}
+	resolvedJump, err := a.cfgProvider.ResolveProxyJumpChain(rawJump)
+	if err != nil {
+		return fmt.Errorf("resolve proxy jump %q for node %q failed: %w", rawJump, nodeID, err)
+	}
+	cfg.ProxyJump = resolvedJump
+	cfg.OriginalProxyJump = resolvedJump
+	cfg.HasOriginalProxyJump = true
 	return nil
 }
 

@@ -38,6 +38,46 @@ func (p probeConnectionProvider) ResolveConnection(nodeID string) (config.Connec
 	return snapshot, nil
 }
 
+func (p probeConnectionProvider) ResolveConnectionWithOrigin(nodeID, originalHost string) (config.ConnectionSnapshot, error) {
+	var (
+		snapshot config.ConnectionSnapshot
+		err      error
+	)
+	if origProvider, ok := p.ConfigProvider.(interface {
+		ResolveConnectionWithOrigin(string, string) (config.ConnectionSnapshot, error)
+	}); ok {
+		snapshot, err = origProvider.ResolveConnectionWithOrigin(nodeID, originalHost)
+	} else {
+		snapshot, err = p.ConfigProvider.ResolveConnection(nodeID)
+	}
+	if err != nil {
+		return config.ConnectionSnapshot{}, err
+	}
+	snapshot.Node.Execution = &ssh.ExecutionConfig{Interpreter: ssh.InterpreterServer, LaunchDialect: ssh.LaunchUnknown}
+	return snapshot, nil
+}
+
+func (p probeConnectionProvider) GetOpenSSHParser() *config.OpenSSHParser {
+	if src, ok := p.ConfigProvider.(interface{ GetOpenSSHParser() *config.OpenSSHParser }); ok {
+		return src.GetOpenSSHParser()
+	}
+	return nil
+}
+
+func (p probeConnectionProvider) NodeOpenSSHAlias(nodeID string) string {
+	if store, ok := p.ConfigProvider.(interface{ NodeOpenSSHAlias(string) string }); ok {
+		return store.NodeOpenSSHAlias(nodeID)
+	}
+	return ""
+}
+
+func (p probeConnectionProvider) NodeCanonicalHost(nodeID string) string {
+	if store, ok := p.ConfigProvider.(interface{ NodeCanonicalHost(string) string }); ok {
+		return store.NodeCanonicalHost(nodeID)
+	}
+	return ""
+}
+
 // VerifyConnection authenticates an inventory preview without opening a shell
 // or recording credentials. New host keys follow the existing import policy;
 // changed host keys are still rejected. The caller decides whether to save.

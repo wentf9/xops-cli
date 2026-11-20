@@ -320,3 +320,353 @@ func TestJumpHopProbeSurvivesCallerCancellation(t *testing.T) {
 		t.Fatalf("canceling a caller closed the shared jump transport %d times", got)
 	}
 }
+
+type blockingChannelCloseStub struct {
+	closeEntered chan struct{}
+	unblock      chan struct{}
+	once         sync.Once
+}
+
+func (c *blockingChannelCloseStub) Close() error {
+	c.once.Do(func() { close(c.closeEntered) })
+	<-c.unblock
+	return nil
+}
+
+func TestCloseMuxChannelBoundedEscalatesToShutdownOnStall(t *testing.T) {
+	ch := &blockingChannelCloseStub{
+		closeEntered: make(chan struct{}),
+		unblock:      make(chan struct{}),
+	}
+	t.Cleanup(func() {
+		select {
+		case <-ch.unblock:
+		default:
+			close(ch.unblock)
+		}
+	})
+	srv := &MuxServer{
+		idleNotify:   make(chan struct{}),
+		shutdownChan: make(chan struct{}),
+	}
+	go func() {
+		<-srv.Wait()
+		select {
+		case <-ch.unblock:
+		default:
+			close(ch.unblock)
+		}
+	}()
+
+	start := time.Now()
+	err := srv.closeMuxChannelBounded(ch, nil)
+	if err == nil {
+		t.Fatal("expected closeMuxChannelBounded to return timeout error on stalled close")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("closeMuxChannelBounded took %v, expected ~sessionShutdownTimeout", elapsed)
+	}
+	select {
+	case <-srv.Wait():
+	default:
+		t.Fatal("expected stalled channel close timeout to trigger MuxServer.Shutdown()")
+	}
+}
+
+func TestProxySessionStateClosedSignalConcurrentWithCloseAll(t *testing.T) {
+	for range 256 {
+		ps := &proxySessionState{}
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for range 4 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				_ = ps.closedSignal()
+			}()
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			ps.closeAll()
+		}()
+		close(start)
+		wg.Wait()
+
+		select {
+		case <-ps.closedSignal():
+		default:
+			t.Fatal("expected ps.closedSignal() to be closed after closeAll()")
+		}
+	}
+}
+
+type globalReqBlockingConn struct {
+	*dummySSHConn
+	reqStarted chan struct{}
+	release    chan struct{}
+	closeCount atomic.Int32
+}
+
+func (c *globalReqBlockingConn) SendRequest(name string, _ bool, _ []byte) (bool, []byte, error) {
+	if name == "tcpip-forward" {
+		select {
+		case <-c.reqStarted:
+		default:
+			close(c.reqStarted)
+		}
+		<-c.release
+		return true, []byte{0, 0, 0, 1}, nil
+	}
+	return true, nil, nil
+}
+
+func (c *globalReqBlockingConn) Close() error {
+	c.closeCount.Add(1)
+	return c.dummySSHConn.Close()
+}
+
+func TestProxySession_SendBoundedGlobalRequestClientDisconnectDoesNotKillHealthyMaster(t *testing.T) {
+	chans := make(chan cryptoSSH.NewChannel)
+	reqs := make(chan *cryptoSSH.Request)
+	conn := &globalReqBlockingConn{
+		dummySSHConn: &dummySSHConn{chans: chans, reqs: reqs},
+		reqStarted:   make(chan struct{}),
+		release:      make(chan struct{}),
+	}
+	sshClient := cryptoSSH.NewClient(conn, chans, reqs)
+	defer func() { _ = sshClient.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := &MuxServer{
+		serverCtx:      ctx,
+		serverCancel:   cancel,
+		sshClient:      sshClient,
+		requestTimeout: sessionShutdownTimeout + 2*time.Second,
+		idleNotify:     make(chan struct{}),
+		shutdownChan:   make(chan struct{}),
+	}
+	c1, c2 := net.Pipe()
+	defer func() {
+		_ = c1.Close()
+		_ = c2.Close()
+	}()
+	ps := &proxySessionState{
+		server: srv,
+		conn:   c1,
+		global: newOrderedQueue[proxyGlobalRequest](),
+	}
+
+	type reply struct {
+		accepted bool
+		err      error
+	}
+	done := make(chan reply, 1)
+	go func() {
+		ok, _, err := ps.sendBoundedGlobalRequest("tcpip-forward", true, nil)
+		done <- reply{accepted: ok, err: err}
+	}()
+
+	<-conn.reqStarted
+	// Disconnecting one proxy client must wait for the healthy master reply instead of killing MuxServer.
+	ps.closeAll()
+
+	select {
+	case res := <-done:
+		t.Fatalf("sendBoundedGlobalRequest returned early before reply (accepted=%v, err=%v)", res.accepted, res.err)
+	case <-time.After(sessionShutdownTimeout + 150*time.Millisecond):
+	}
+	if srv.isShuttingDown() || conn.closeCount.Load() != 0 {
+		t.Fatalf("client disconnect killed healthy master past sessionShutdownTimeout (shuttingDown=%v, closeCount=%d)", srv.isShuttingDown(), conn.closeCount.Load())
+	}
+
+	close(conn.release)
+	res := <-done
+	if !res.accepted || !errors.Is(res.err, net.ErrClosed) {
+		t.Fatalf("sendBoundedGlobalRequest = (accepted=%v, err=%v), want (true, net.ErrClosed)", res.accepted, res.err)
+	}
+	if srv.isShuttingDown() || conn.closeCount.Load() != 0 {
+		t.Fatalf("healthy master was torn down after client disconnect reply (shuttingDown=%v, closeCount=%d)", srv.isShuttingDown(), conn.closeCount.Load())
+	}
+}
+
+type blockingSendRequestChannel struct {
+	stubRemoteChannel
+	reqStarted  chan struct{}
+	releaseReq  chan struct{}
+	closeCalled atomic.Bool
+}
+
+func (c *blockingSendRequestChannel) Close() error {
+	c.closeCalled.Store(true)
+	return c.stubRemoteChannel.Close()
+}
+
+func (c *blockingSendRequestChannel) SendRequest(string, bool, []byte) (bool, error) {
+	select {
+	case <-c.reqStarted:
+	default:
+		close(c.reqStarted)
+	}
+	<-c.releaseReq
+	return true, nil
+}
+
+func TestProxySession_SendBoundedProxyChannelRequestClientDisconnectDoesNotKillHealthyMaster(t *testing.T) {
+	chans := make(chan cryptoSSH.NewChannel)
+	reqs := make(chan *cryptoSSH.Request)
+	conn := &globalReqBlockingConn{
+		dummySSHConn: &dummySSHConn{chans: chans, reqs: reqs},
+		reqStarted:   make(chan struct{}),
+		release:      make(chan struct{}),
+	}
+	sshClient := cryptoSSH.NewClient(conn, chans, reqs)
+	defer func() { _ = sshClient.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := &MuxServer{
+		serverCtx:      ctx,
+		serverCancel:   cancel,
+		sshClient:      sshClient,
+		requestTimeout: sessionShutdownTimeout + 2*time.Second,
+		idleNotify:     make(chan struct{}),
+		shutdownChan:   make(chan struct{}),
+	}
+	c1, c2 := net.Pipe()
+	defer func() {
+		_ = c1.Close()
+		_ = c2.Close()
+	}()
+	ps := &proxySessionState{
+		server: srv,
+		conn:   c1,
+		global: newOrderedQueue[proxyGlobalRequest](),
+	}
+	ch := &blockingSendRequestChannel{
+		reqStarted: make(chan struct{}),
+		releaseReq: make(chan struct{}),
+	}
+	pc := &proxyChan{serverCh: 1, remoteCh: ch}
+	ps.channels.Store(pc.serverCh, pc)
+
+	type reply struct {
+		accepted bool
+		err      error
+	}
+	done := make(chan reply, 1)
+	go func() {
+		ok, err := ps.sendBoundedProxyChannelRequest(pc, "exec", true, nil)
+		done <- reply{accepted: ok, err: err}
+	}()
+
+	<-ch.reqStarted
+	// Disconnecting one proxy client must close only its channel and wait up to requestTimeout,
+	// never triggering sessionShutdownTimeout transport interrupt on the shared MuxServer.
+	ps.closeAll()
+
+	select {
+	case res := <-done:
+		t.Fatalf("sendBoundedProxyChannelRequest returned early before reply (accepted=%v, err=%v)", res.accepted, res.err)
+	case <-time.After(sessionShutdownTimeout + 150*time.Millisecond):
+	}
+	if !ch.closeCalled.Load() {
+		t.Fatal("expected disconnecting proxy client to close its own SSH channel")
+	}
+	if srv.isShuttingDown() || conn.closeCount.Load() != 0 {
+		t.Fatalf("proxy client disconnect killed shared healthy MuxServer past sessionShutdownTimeout (shuttingDown=%v, closeCount=%d)", srv.isShuttingDown(), conn.closeCount.Load())
+	}
+
+	close(ch.releaseReq)
+	res := <-done
+	if res.accepted || !errors.Is(res.err, net.ErrClosed) {
+		t.Fatalf("sendBoundedProxyChannelRequest = (accepted=%v, err=%v), want (false, net.ErrClosed)", res.accepted, res.err)
+	}
+	if srv.isShuttingDown() || conn.closeCount.Load() != 0 {
+		t.Fatalf("healthy MuxServer was torn down after proxy channel reply (shuttingDown=%v, closeCount=%d)", srv.isShuttingDown(), conn.closeCount.Load())
+	}
+}
+
+func TestProxySession_SendBoundedProxyChannelRequestNilServerTimeoutDoesNotDeadlock(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer func() {
+		_ = c1.Close()
+		_ = c2.Close()
+	}()
+	ps := &proxySessionState{
+		server: nil,
+		conn:   c1,
+		global: newOrderedQueue[proxyGlobalRequest](),
+	}
+
+	stalledClose := make(chan error)
+	err := ps.waitProxyChannelClose(stalledClose)
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("waitProxyChannelClose(nil server) = %v, want timeout error", err)
+	}
+
+	reqCh := &blockingSendRequestChannel{
+		reqStarted: make(chan struct{}),
+		releaseReq: make(chan struct{}),
+	}
+	releaseClose := make(chan struct{})
+	defer close(releaseClose)
+	defer close(reqCh.releaseReq)
+	stalledPC := &proxyChan{remoteCh: &round4StalledSendCloseChannel{Channel: reqCh, releaseClose: releaseClose}}
+	go func() {
+		<-reqCh.reqStarted
+		ps.closeAll()
+	}()
+	ok, reqErr := ps.sendBoundedProxyChannelRequest(stalledPC, "exec", true, nil)
+	if ok || reqErr == nil || !strings.Contains(reqErr.Error(), "timed out") {
+		t.Fatalf("sendBoundedProxyChannelRequest(nil server) = (ok=%v, err=%v), want (false, timeout)", ok, reqErr)
+	}
+}
+
+type round4StalledSendCloseChannel struct {
+	cryptoSSH.Channel
+	releaseClose chan struct{}
+}
+
+func (c *round4StalledSendCloseChannel) Close() error {
+	<-c.releaseClose
+	return nil
+}
+
+func TestMuxNilConnGuards(t *testing.T) {
+	srv := &MuxServer{
+		sshClient:    &cryptoSSH.Client{}, // non-nil Client with nil Conn
+		idleNotify:   make(chan struct{}),
+		shutdownChan: make(chan struct{}),
+	}
+	if _, _, err := srv.openBoundedMuxChannel(context.Background(), "session", nil); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("openBoundedMuxChannel(nil Conn) err = %v, want net.ErrClosed", err)
+	}
+	if _, err := srv.listenRemoteMux("tcp", "127.0.0.1:0"); err == nil {
+		t.Fatal("listenRemoteMux(nil Conn) succeeded, want error")
+	}
+	if _, err := srv.dialSSHMux(context.Background(), "tcp", "127.0.0.1:22"); err == nil {
+		t.Fatal("dialSSHMux(nil Conn) succeeded, want error")
+	}
+
+	c1, c2 := net.Pipe()
+	defer func() {
+		_ = c1.Close()
+		_ = c2.Close()
+	}()
+	ps := &proxySessionState{
+		server: srv,
+		conn:   c1,
+		global: newOrderedQueue[proxyGlobalRequest](),
+	}
+	if lease, ok := ps.acquireChannelAgentLease(); ok || lease != nil {
+		t.Fatalf("acquireChannelAgentLease(nil Conn) = (%v, %v), want (nil, false)", lease, ok)
+	}
+	ps.handleGlobalRequest([]byte{0, 0, 0, 3, 'f', 'o', 'o', 0})
+	if ok, _, err := ps.sendBoundedGlobalRequest("keepalive@openssh.com", true, nil); ok || !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("sendBoundedGlobalRequest(nil Conn) = (%v, %v), want (false, net.ErrClosed)", ok, err)
+	}
+}

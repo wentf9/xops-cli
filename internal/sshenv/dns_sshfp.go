@@ -29,13 +29,16 @@ const (
 	dnsMaxCNAMEHops        = 8
 	dnsMaxWireNameBytes    = 255
 
-	dnsFlagQR = 1 << 15
-	dnsFlagTC = 1 << 9
-	dnsFlagRD = 1 << 8
-	dnsFlagAD = 1 << 5
+	dnsFlagQR     = 1 << 15
+	dnsMaskOpcode = 0x0f << 11
+	dnsFlagTC     = 1 << 9
+	dnsFlagRD     = 1 << 8
+	dnsFlagAD     = 1 << 5
+	dnsFlagCD     = 1 << 4
 
 	dnsRcodeSuccess  = 0
 	dnsRcodeNXDomain = 3
+	dnsRcodeBADVERS  = 16
 )
 
 var errDNSMalformed = errors.New("malformed DNS response")
@@ -46,9 +49,8 @@ type dnsConfig struct {
 }
 
 // sshfpResolver is a minimal RFC 1035 + EDNS0 (DO=1) stub resolver for SSHFP.
-// Matching OpenSSH/glibc resolver hardening, the response AD bit is only
-// trusted when the answering server is loopback (127.0.0.0/8 or ::1) or when
-// resolv.conf explicitly sets "options trust-ad".
+// Matching glibc 2.31+ (RES_TRUSTAD) resolver hardening, the response AD bit is
+// trusted only when resolv.conf explicitly configures "options trust-ad".
 type sshfpResolver struct {
 	config  func() dnsConfig
 	servers func() []string
@@ -131,19 +133,6 @@ func deduplicateDNSServers(raw []string) []string {
 	return dedup
 }
 
-func isLoopbackDNSServer(server string) bool {
-	trimmed := strings.TrimSpace(server)
-	host, _, err := net.SplitHostPort(trimmed)
-	if err != nil {
-		host = trimmed
-	}
-	addr, err := netip.ParseAddr(host)
-	if err != nil {
-		return false
-	}
-	return addr.Unmap().IsLoopback()
-}
-
 func formatWindowsDNSServerIPv6(raw [16]byte, scopeID uint32) (string, bool) {
 	// Skip IPv6 site-local "fec0::/10" defaults Windows reports when unconfigured.
 	if raw[0] == 0xfe && (raw[1]&0xc0) == 0xc0 {
@@ -164,7 +153,11 @@ func normalizeDNSName(hostname string) (string, error) {
 	if name == "" || len(name) > 253 {
 		return "", fmt.Errorf("invalid DNS name %q", hostname)
 	}
-	if net.ParseIP(name) != nil {
+	ipCandidate := name
+	if strings.HasPrefix(ipCandidate, "[") && strings.HasSuffix(ipCandidate, "]") {
+		ipCandidate = ipCandidate[1 : len(ipCandidate)-1]
+	}
+	if _, err := netip.ParseAddr(ipCandidate); err == nil {
 		return "", fmt.Errorf("SSHFP lookup not applicable to IP literal %q", hostname)
 	}
 	for _, label := range strings.Split(name, ".") {
@@ -189,7 +182,11 @@ func (r *sshfpResolver) exchange(ctx context.Context, server, name string, trust
 	if err != nil {
 		return core.SSHFPResult{}, err
 	}
-	if header&dnsFlagTC != 0 {
+	if header&dnsFlagTC != 0 && len(resp) >= 12 && binary.BigEndian.Uint16(resp[4:]) > 0 {
+		query, id, err = buildSSHFPQuery(name)
+		if err != nil {
+			return core.SSHFPResult{}, err
+		}
 		resp, header, err = r.roundTrip(ctx, "tcp", server, id, query)
 		if err != nil {
 			return core.SSHFPResult{}, err
@@ -198,20 +195,19 @@ func (r *sshfpResolver) exchange(ctx context.Context, server, name string, trust
 			return core.SSHFPResult{}, errors.New("truncated DNS response over TCP")
 		}
 	}
-	switch rcode := header & 0x000f; rcode {
+	parsed, err := parseSSHFPResponse(resp, header)
+	if err != nil {
+		return core.SSHFPResult{}, err
+	}
+	switch parsed.rcode {
 	case dnsRcodeSuccess:
 	case dnsRcodeNXDomain:
 		return core.SSHFPResult{}, nil
 	default:
-		return core.SSHFPResult{}, fmt.Errorf("DNS server returned rcode %d", rcode)
+		return core.SSHFPResult{}, fmt.Errorf("DNS server returned rcode %d", parsed.rcode)
 	}
-	records, err := parseSSHFPAnswers(resp)
-	if err != nil {
-		return core.SSHFPResult{}, err
-	}
-	adTrusted := trustAD || isLoopbackDNSServer(server)
-	authenticated := adTrusted && (header&dnsFlagAD != 0)
-	return core.SSHFPResult{Records: records, Authenticated: authenticated}, nil
+	authenticated := trustAD && parsed.hasValidOPT && (header&dnsFlagAD != 0) && (header&dnsFlagCD == 0)
+	return core.SSHFPResult{Records: parsed.records, Authenticated: authenticated}, nil
 }
 
 // roundTrip owns conn for the duration of one exchange and closes it on return;
@@ -286,7 +282,7 @@ func buildSSHFPQuery(name string) ([]byte, uint16, error) {
 	id := binary.BigEndian.Uint16(idBuf[:])
 	msg := make([]byte, 12, 12+len(name)+2+4+11)
 	binary.BigEndian.PutUint16(msg[0:], id)
-	binary.BigEndian.PutUint16(msg[2:], dnsFlagRD|dnsFlagAD)
+	binary.BigEndian.PutUint16(msg[2:], dnsFlagRD)
 	binary.BigEndian.PutUint16(msg[4:], 1)  // QDCOUNT
 	binary.BigEndian.PutUint16(msg[10:], 1) // ARCOUNT (OPT)
 	for _, label := range strings.Split(name, ".") {
@@ -305,7 +301,7 @@ func buildSSHFPQuery(name string) ([]byte, uint16, error) {
 	return msg, id, nil
 }
 
-// checkDNSResponse verifies ID, QR and that the question section echoes ours.
+// checkDNSResponse verifies ID, QR, OPCODE=0, and question (or QDCOUNT=0 non-NOERROR/non-NXDOMAIN errors for failover).
 func checkDNSResponse(resp []byte, id uint16, query []byte) (uint16, error) {
 	if len(resp) < 12 {
 		return 0, errDNSMalformed
@@ -317,7 +313,18 @@ func checkDNSResponse(resp []byte, id uint16, query []byte) (uint16, error) {
 	if header&dnsFlagQR == 0 {
 		return 0, errors.New("DNS packet is not a response")
 	}
-	if binary.BigEndian.Uint16(resp[4:]) != 1 {
+	if header&dnsMaskOpcode != 0 {
+		return 0, errors.New("DNS response opcode mismatch")
+	}
+	qdcount := binary.BigEndian.Uint16(resp[4:])
+	if qdcount == 0 {
+		parsed, err := parseSSHFPResponse(resp, header)
+		if err == nil && parsed.rcode != dnsRcodeSuccess && parsed.rcode != dnsRcodeNXDomain {
+			return header, nil
+		}
+		return 0, errors.New("DNS response question count mismatch")
+	}
+	if qdcount != 1 {
 		return 0, errors.New("DNS response question count mismatch")
 	}
 	questionEnd := sshfpQuestionEnd(query)
@@ -354,69 +361,83 @@ func sshfpQuestionEnd(query []byte) int {
 	return off + 1 + 4
 }
 
+type parsedSSHFPResponse struct {
+	records     []core.SSHFPRecord
+	rcode       uint16
+	hasValidOPT bool
+}
+
+func isValidSSHFPFingerprintLen(fpType uint8, fpLen int) bool {
+	switch fpType {
+	case 1: // SHA-1 (RFC 4255)
+		return fpLen == 20
+	case 2: // SHA-256 (RFC 6594)
+		return fpLen == 32
+	default:
+		return fpLen > 0
+	}
+}
+
 func parseSSHFPAnswers(resp []byte) ([]core.SSHFPRecord, error) {
 	if len(resp) < 12 {
 		return nil, errDNSMalformed
 	}
-	ancount := int(binary.BigEndian.Uint16(resp[6:]))
-	qname, off, err := readCanonicalDNSName(resp, 12)
+	parsed, err := parseSSHFPResponse(resp, binary.BigEndian.Uint16(resp[2:]))
 	if err != nil {
 		return nil, err
 	}
-	if off+4 > len(resp) {
-		return nil, errDNSMalformed
-	}
-	off += 4 // QTYPE + QCLASS
+	return parsed.records, nil
+}
 
-	type candidateSSHFP struct {
-		owner  string
-		record core.SSHFPRecord
-	}
-	var cnames map[string]string
-	var candidates []candidateSSHFP
+type candidateSSHFP struct {
+	owner  string
+	record core.SSHFPRecord
+}
 
-	for range ancount {
-		owner, nextOff, err := readCanonicalDNSName(resp, off)
+func parseSSHFPResponse(resp []byte, header uint16) (parsedSSHFPResponse, error) {
+	if len(resp) < 12 || header&dnsMaskOpcode != 0 {
+		return parsedSSHFPResponse{}, errDNSMalformed
+	}
+	qdcount := int(binary.BigEndian.Uint16(resp[4:]))
+	ancount := int(binary.BigEndian.Uint16(resp[6:]))
+	nscount := int(binary.BigEndian.Uint16(resp[8:]))
+	arcount := int(binary.BigEndian.Uint16(resp[10:]))
+
+	off := 12
+	var qname string
+	var err error
+	if qdcount > 0 {
+		qname, off, err = skipDNSQuestions(resp, off, qdcount)
 		if err != nil {
-			return nil, err
+			return parsedSSHFPResponse{}, err
 		}
-		off = nextOff
-		if off+10 > len(resp) {
-			return nil, errDNSMalformed
-		}
-		rrType := binary.BigEndian.Uint16(resp[off:])
-		rrClass := binary.BigEndian.Uint16(resp[off+2:])
-		rdLen := int(binary.BigEndian.Uint16(resp[off+8:]))
-		off += 10
-		if off+rdLen > len(resp) {
-			return nil, errDNSMalformed
-		}
-		if rrClass == dnsClassIN {
-			switch rrType {
-			case dnsTypeCNAME:
-				if err := recordSSHFPCNAME(&cnames, owner, resp, off, rdLen); err != nil {
-					return nil, err
-				}
-			case dnsTypeSSHFP:
-				if rdLen >= 2 {
-					rdata := resp[off : off+rdLen]
-					candidates = append(candidates, candidateSSHFP{
-						owner: owner,
-						record: core.SSHFPRecord{
-							Algorithm:       rdata[0],
-							FingerprintType: rdata[1],
-							Fingerprint:     append([]byte(nil), rdata[2:]...),
-						},
-					})
-				}
-			}
-		}
-		off += rdLen
+	}
+
+	cnames, candidates, off, err := parseSSHFPAnswerSection(resp, off, ancount)
+	if err != nil {
+		return parsedSSHFPResponse{}, err
+	}
+	off, err = skipDNSAuthoritySection(resp, off, nscount)
+	if err != nil {
+		return parsedSSHFPResponse{}, err
+	}
+	fullRcode, hasValidOPT, err := parseSSHFPAdditionalSection(resp, off, arcount, header)
+	if err != nil {
+		return parsedSSHFPResponse{}, err
+	}
+	if qdcount < 1 && (fullRcode == dnsRcodeSuccess || fullRcode == dnsRcodeNXDomain) {
+		return parsedSSHFPResponse{}, errDNSMalformed
+	}
+	if fullRcode != dnsRcodeSuccess {
+		return parsedSSHFPResponse{
+			rcode:       fullRcode,
+			hasValidOPT: hasValidOPT,
+		}, nil
 	}
 
 	canonicalTarget, ok := resolveCNAMEChainTarget(qname, cnames)
 	if !ok {
-		return nil, errDNSMalformed
+		return parsedSSHFPResponse{}, errDNSMalformed
 	}
 	var records []core.SSHFPRecord
 	for _, c := range candidates {
@@ -424,7 +445,149 @@ func parseSSHFPAnswers(resp []byte) ([]core.SSHFPRecord, error) {
 			records = append(records, c.record)
 		}
 	}
-	return records, nil
+	return parsedSSHFPResponse{
+		records:     records,
+		rcode:       fullRcode,
+		hasValidOPT: hasValidOPT,
+	}, nil
+}
+
+func parseSSHFPAnswerSection(resp []byte, off, ancount int) (map[string]string, []candidateSSHFP, int, error) {
+	var cnames map[string]string
+	var candidates []candidateSSHFP
+	for range ancount {
+		owner, nextOff, err := readCanonicalDNSName(resp, off)
+		if err != nil {
+			return nil, nil, 0, err
+		}
+		off = nextOff
+		if off+10 > len(resp) {
+			return nil, nil, 0, errDNSMalformed
+		}
+		rrType := binary.BigEndian.Uint16(resp[off:])
+		if rrType == dnsTypeOPT {
+			// RFC 6891 section 6.1.1: OPT MUST NOT appear outside the Additional section.
+			return nil, nil, 0, errDNSMalformed
+		}
+		rrClass := binary.BigEndian.Uint16(resp[off+2:])
+		rdLen := int(binary.BigEndian.Uint16(resp[off+8:]))
+		off += 10
+		if off+rdLen > len(resp) {
+			return nil, nil, 0, errDNSMalformed
+		}
+		if rrClass == dnsClassIN {
+			switch rrType {
+			case dnsTypeCNAME:
+				if err := recordSSHFPCNAME(&cnames, owner, resp, off, rdLen); err != nil {
+					return nil, nil, 0, err
+				}
+			case dnsTypeSSHFP:
+				if rdLen >= 2 {
+					rdata := resp[off : off+rdLen]
+					if isValidSSHFPFingerprintLen(rdata[1], len(rdata)-2) {
+						candidates = append(candidates, candidateSSHFP{
+							owner: owner,
+							record: core.SSHFPRecord{
+								Algorithm:       rdata[0],
+								FingerprintType: rdata[1],
+								Fingerprint:     append([]byte(nil), rdata[2:]...),
+							},
+						})
+					}
+				}
+			}
+		}
+		off += rdLen
+	}
+	return cnames, candidates, off, nil
+}
+
+func skipDNSQuestions(resp []byte, off, qdcount int) (string, int, error) {
+	qname, nextOff, err := readCanonicalDNSName(resp, off)
+	if err != nil {
+		return "", 0, err
+	}
+	off = nextOff
+	if off+4 > len(resp) {
+		return "", 0, errDNSMalformed
+	}
+	off += 4 // QTYPE + QCLASS
+	for i := 1; i < qdcount; i++ {
+		off, err = skipDNSName(resp, off)
+		if err != nil || off+4 > len(resp) {
+			return "", 0, errDNSMalformed
+		}
+		off += 4
+	}
+	return qname, off, nil
+}
+
+func skipDNSAuthoritySection(resp []byte, off, nscount int) (int, error) {
+	for range nscount {
+		nextOff, err := skipDNSName(resp, off)
+		if err != nil {
+			return 0, err
+		}
+		off = nextOff
+		if off+10 > len(resp) {
+			return 0, errDNSMalformed
+		}
+		if binary.BigEndian.Uint16(resp[off:]) == dnsTypeOPT {
+			// RFC 6891 section 6.1.1: OPT MUST NOT appear in Authority section.
+			return 0, errDNSMalformed
+		}
+		rdLen := int(binary.BigEndian.Uint16(resp[off+8:]))
+		off += 10
+		if off+rdLen > len(resp) {
+			return 0, errDNSMalformed
+		}
+		off += rdLen
+	}
+	return off, nil
+}
+
+func parseSSHFPAdditionalSection(resp []byte, off, arcount int, header uint16) (uint16, bool, error) {
+	fullRcode := header & 0x000f
+	seenOPT := false
+	hasValidOPT := false
+	for range arcount {
+		ownerStart := off
+		owner, nextOff, err := readCanonicalDNSName(resp, off)
+		if err != nil {
+			return 0, false, err
+		}
+		off = nextOff
+		if off+10 > len(resp) {
+			return 0, false, errDNSMalformed
+		}
+		rrType := binary.BigEndian.Uint16(resp[off:])
+		ttl := binary.BigEndian.Uint32(resp[off+4:])
+		rdLen := int(binary.BigEndian.Uint16(resp[off+8:]))
+		off += 10
+		if off+rdLen > len(resp) {
+			return 0, false, errDNSMalformed
+		}
+		if rrType == dnsTypeOPT {
+			// RFC 6891 section 6.1.2: OPT owner must be uncompressed single-byte root (0x00) and appear at most once.
+			if owner != "\x00" || nextOff != ownerStart+1 || resp[ownerStart] != 0x00 || seenOPT {
+				return 0, false, errDNSMalformed
+			}
+			seenOPT = true
+			extRcode := uint16(ttl >> 24)
+			fullRcode = (extRcode << 4) | (header & 0x000f)
+			ednsVersion := uint8(ttl >> 16)
+			if ednsVersion != 0 {
+				if fullRcode != dnsRcodeBADVERS {
+					return 0, false, errDNSMalformed
+				}
+				off += rdLen
+				continue
+			}
+			hasValidOPT = true
+		}
+		off += rdLen
+	}
+	return fullRcode, hasValidOPT, nil
 }
 
 func recordSSHFPCNAME(cnames *map[string]string, owner string, resp []byte, off, rdLen int) error {

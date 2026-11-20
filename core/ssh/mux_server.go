@@ -50,14 +50,6 @@ const (
 	muxPhaseClosed
 )
 
-type foregroundReleaseState uint8
-
-const (
-	foregroundReleaseUnarmed foregroundReleaseState = iota
-	foregroundReleaseArmed
-	foregroundReleaseDone
-)
-
 // MuxServerOptions configures the multiplex master server.
 type MuxServerOptions struct {
 	ControlPath       string
@@ -116,26 +108,32 @@ type MuxServer struct {
 	listener net.Listener
 	target   TargetContext
 
-	// All mutable server lifecycle, work counters, foreground-release state,
+	// All mutable server lifecycle, work counters, foreground ownership state,
 	// idle timer state, and forwarding tables are serialized by idleMu.
-	idleMu               sync.Mutex
-	phase                muxPhase
-	stoppedListening     bool
-	foregroundRelease    foregroundReleaseState
-	hadActiveSession     bool
-	activeSessions       int32
-	activeForwardStreams int32
-	stopRepliesInFlight  int
-	openFwdsInFlight     int
-	closeFwdsInFlight    int
-	idleTimer            *time.Timer
-	idleGen              uint64
-	idleNotify           chan struct{}
-	forwardTable         muxForwardTable
+	idleMu                        sync.Mutex
+	phase                         muxPhase
+	stoppedListening              bool
+	foregroundHeld                int32
+	extraForegroundHeld           int32
+	foregroundStopArmed           bool
+	stopReleasedInitialForeground bool
+	stopConsumedForeground        int32
+	hadActiveSession              bool
+	activeSessions                int32
+	activeForwardStreams          int32
+	stopRepliesInFlight           int
+	openFwdsInFlight              int
+	closeFwdsInFlight             int
+	idleTimer                     *time.Timer
+	idleGen                       uint64
+	idleNotify                    chan struct{}
+	forwardTable                  muxForwardTable
 
 	shutdownOnce    sync.Once
 	shutdownChan    chan struct{}
 	origFi          os.FileInfo
+	unlinkMu        sync.Mutex
+	unlinked        bool
 	askConfirmation bool
 	confirmSession  func(action string) bool
 
@@ -157,12 +155,10 @@ func NewMuxServer(opts MuxServerOptions) (*MuxServer, error) {
 		return nil, fmt.Errorf("ssh client cannot be nil")
 	}
 
-	listener, err := bindAndLinkSocket(opts.ControlPath)
+	listener, origFi, err := bindAndLinkSocket(opts.ControlPath)
 	if err != nil {
 		return nil, err
 	}
-
-	origFi, _ := os.Lstat(opts.ControlPath)
 
 	mask := DefaultStreamLocalBindMask
 	if opts.HasStreamLocalBindMask {
@@ -207,6 +203,7 @@ func NewMuxServer(opts MuxServerOptions) (*MuxServer, error) {
 
 	if opts.InitialActiveSessions > 0 {
 		server.activeSessions = opts.InitialActiveSessions
+		server.foregroundHeld = opts.InitialActiveSessions
 		server.hadActiveSession = true
 	} else {
 		server.idleMu.Lock()
@@ -674,6 +671,9 @@ func (s *MuxServer) retireUnlinkedOrReplacedListener() {
 		if s.listener != nil {
 			_ = s.listener.Close()
 		}
+		s.unlinkMu.Lock()
+		s.unlinked = true
+		s.unlinkMu.Unlock()
 		activeMuxServers.CompareAndDelete(s.controlPath, s)
 	}
 
@@ -1097,7 +1097,6 @@ func (s *MuxServer) Shutdown() error {
 		}
 
 		s.idleMu.Lock()
-		shouldUnlink := !s.stoppedListening
 		s.phase = muxPhaseClosed
 		s.disarmIdleTimerLocked()
 		s.notifyIdleLocked()
@@ -1107,9 +1106,7 @@ func (s *MuxServer) Shutdown() error {
 		if s.listener != nil {
 			_ = s.listener.Close()
 		}
-		if shouldUnlink {
-			s.unlinkControlSocketFileIfOurs()
-		}
+		s.unlinkControlSocketFileIfOurs()
 
 		for _, item := range localItems {
 			closeShutdownForwardItem(item)
@@ -1144,15 +1141,125 @@ func (s *MuxServer) Shutdown() error {
 // refers to the socket this server created. After -O stop or a replacement, a
 // newer master may own the same path and must not lose its listener entry.
 func (s *MuxServer) unlinkControlSocketFileIfOurs() {
-	if s.controlPath == "" {
+	if s.controlPath == "" || s.origFi == nil {
 		return
 	}
-	if s.origFi != nil {
-		if current, err := os.Lstat(s.controlPath); err != nil || !os.SameFile(s.origFi, current) {
-			return
-		}
+	s.unlinkMu.Lock()
+	defer s.unlinkMu.Unlock()
+	if s.unlinked {
+		return
 	}
-	_ = os.Remove(s.controlPath)
+	current, err := os.Lstat(s.controlPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			s.unlinked = true
+		}
+		return
+	}
+	if !os.SameFile(s.origFi, current) {
+		s.unlinked = true
+		return
+	}
+	if rmErr := os.Remove(s.controlPath); rmErr == nil || os.IsNotExist(rmErr) {
+		s.unlinked = true
+	}
+}
+
+func (s *MuxServer) interruptTransportAndShutdown() error {
+	if s == nil {
+		return nil
+	}
+	var sshCli *cryptoSSH.Client
+	if s.sshClient != nil && s.sshClient.Conn != nil {
+		sshCli = s.sshClient
+	}
+	interruptErr := interruptSSHTransport(s.rootConn, sshCli)
+	_ = s.Shutdown()
+	return interruptErr
+}
+
+// openBoundedMuxChannel opens an SSH channel on the master transport under a bounded
+// request timeout and tears down the stalled transport if cancellation races an unresponsive peer.
+func (s *MuxServer) openBoundedMuxChannel(ctx context.Context, channelType string, payload []byte) (cryptoSSH.Channel, <-chan *cryptoSSH.Request, error) {
+	if s == nil || s.sshClient == nil || s.sshClient.Conn == nil {
+		return nil, nil, net.ErrClosed
+	}
+	if ctx == nil {
+		ctx = s.baseContext()
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	work, cancel := withTimeoutOrDefault(ctx, s.requestTimeout, defaultSSHHandshakeTimeout)
+	defer cancel()
+
+	result := make(chan openChannelResult, 1)
+	go func() {
+		ch, reqs, err := s.sshClient.OpenChannel(channelType, payload)
+		result <- openChannelResult{channel: ch, requests: reqs, err: err}
+	}()
+
+	select {
+	case opened := <-result:
+		if opened.err != nil {
+			return nil, nil, opened.err
+		}
+		if ctxErr := work.Err(); ctxErr != nil {
+			go discardAbortedChannelRequests(s.baseContext(), opened.requests)
+			_ = s.closeMuxChannelBounded(opened.channel, nil)
+			return nil, nil, ctxErr
+		}
+		return opened.channel, opened.requests, nil
+	case <-work.Done():
+		select {
+		case opened := <-result:
+			if opened.channel != nil {
+				go discardAbortedChannelRequests(s.baseContext(), opened.requests)
+				_ = s.closeMuxChannelBounded(opened.channel, nil)
+			}
+			return nil, nil, errors.Join(work.Err(), opened.err)
+		default:
+		}
+		interruptErr := s.interruptTransportAndShutdown()
+		opened := <-result
+		if opened.channel != nil {
+			go discardAbortedChannelRequests(s.baseContext(), opened.requests)
+			_ = closeResource(opened.channel, "late SSH mux channel")
+		}
+		return nil, nil, errors.Join(work.Err(), interruptErr, opened.err)
+	}
+}
+
+// closeMuxChannelBounded closes a mux channel (and optionally joins its worker drain signal)
+// within sessionShutdownTimeout, escalating to transport interruption if the peer stalls.
+func (s *MuxServer) closeMuxChannelBounded(ch io.Closer, workersDone <-chan struct{}) error {
+	if ch == nil && workersDone == nil {
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() {
+		var closeErr error
+		if ch != nil {
+			closeErr = closeSSHChannel(ch)
+		}
+		if workersDone != nil {
+			<-workersDone
+		}
+		done <- closeErr
+	}()
+	timer := time.NewTimer(sessionShutdownTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		if s == nil {
+			return fmt.Errorf("mux channel shutdown exceeded %s", sessionShutdownTimeout)
+		}
+		interruptErr := s.interruptTransportAndShutdown()
+		closeErr := <-done
+		return errors.Join(fmt.Errorf("mux channel shutdown exceeded %s", sessionShutdownTimeout), interruptErr, closeErr)
+	}
 }
 
 // AddForegroundSession adds an active in-process foreground session to prevent idle timeout.
@@ -1166,8 +1273,8 @@ func (s *MuxServer) AddForegroundSession() bool {
 		return false
 	}
 	s.activeSessions++
+	s.foregroundHeld++
 	s.hadActiveSession = true
-	s.foregroundRelease = foregroundReleaseUnarmed
 	s.disarmIdleTimerLocked()
 	s.notifyIdleLocked()
 	return true
@@ -1180,12 +1287,54 @@ func (s *MuxServer) RemoveForegroundSession() {
 	}
 	s.idleMu.Lock()
 	defer s.idleMu.Unlock()
-	if s.foregroundRelease == foregroundReleaseDone {
-		s.foregroundRelease = foregroundReleaseUnarmed
+	if s.foregroundHeld > 0 {
+		s.foregroundHeld--
+		if s.foregroundHeld == 0 {
+			s.foregroundStopArmed = false
+		}
+		s.activeSessions--
+		s.onWorkCountChangedLocked()
+		return
+	}
+	if s.stopConsumedForeground > 0 {
+		s.stopConsumedForeground--
 		s.notifyIdleLocked()
 		return
 	}
-	s.foregroundRelease = foregroundReleaseUnarmed
+	s.notifyIdleLocked()
+}
+
+// AcquireForegroundSession acquires an independent, token-scoped in-process
+// foreground session lease. Releasing the returned function decrements only its
+// own lease and cannot collide with an initial -N foreground reference consumed
+// by -O stop.
+func (s *MuxServer) AcquireForegroundSession() (func(), bool) {
+	if s == nil {
+		return nil, false
+	}
+	s.idleMu.Lock()
+	defer s.idleMu.Unlock()
+	if s.phase != muxPhaseRunning || s.stoppedListening {
+		return nil, false
+	}
+	s.extraForegroundHeld++
+	s.activeSessions++
+	s.hadActiveSession = true
+	s.disarmIdleTimerLocked()
+	s.notifyIdleLocked()
+	return sync.OnceFunc(s.releaseExtraForegroundSession), true
+}
+
+func (s *MuxServer) releaseExtraForegroundSession() {
+	if s == nil {
+		return
+	}
+	s.idleMu.Lock()
+	defer s.idleMu.Unlock()
+	if s.extraForegroundHeld <= 0 {
+		return
+	}
+	s.extraForegroundHeld--
 	s.activeSessions--
 	s.onWorkCountChangedLocked()
 }
@@ -1199,23 +1348,31 @@ func (s *MuxServer) ReleaseForegroundOnStop() {
 	}
 	s.idleMu.Lock()
 	defer s.idleMu.Unlock()
-	if s.foregroundRelease == foregroundReleaseDone {
+	if s.foregroundStopArmed || s.stopReleasedInitialForeground || s.foregroundHeld <= 0 {
 		return
 	}
 	if s.stoppedListening {
-		s.foregroundRelease = foregroundReleaseDone
+		s.stopReleasedInitialForeground = true
+		s.foregroundHeld--
+		s.stopConsumedForeground++
 		s.activeSessions--
 		s.onWorkCountChangedLocked()
 		return
 	}
-	s.foregroundRelease = foregroundReleaseArmed
+	s.foregroundStopArmed = true
 }
 
 func (s *MuxServer) releaseForegroundOnStopIfArmedLocked() bool {
-	if s == nil || s.foregroundRelease != foregroundReleaseArmed {
+	if s == nil || !s.foregroundStopArmed || s.stopReleasedInitialForeground || s.foregroundHeld <= 0 {
+		if s != nil {
+			s.foregroundStopArmed = false
+		}
 		return false
 	}
-	s.foregroundRelease = foregroundReleaseDone
+	s.foregroundStopArmed = false
+	s.stopReleasedInitialForeground = true
+	s.foregroundHeld--
+	s.stopConsumedForeground++
 	s.activeSessions--
 	return true
 }

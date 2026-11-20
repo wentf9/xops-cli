@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -411,4 +412,279 @@ type staticTestVerifier struct{}
 
 func (staticTestVerifier) Verify(context.Context, HostKeyRequest, cryptoSSH.PublicKey) error {
 	return nil
+}
+
+func TestKeyAuthWithKeyRefRequiresKeySourceFailClosedAndConfigSnapshotClonesKeyPaths(t *testing.T) {
+	keyPath := filepath.Join(t.TempDir(), "id_ambient")
+	pemData, _ := generateTestEncryptedKey(t, "pass")
+	if err := os.WriteFile(keyPath, pemData, 0o600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+	cfg := &ClientConfig{
+		NodeID:   "ref-node",
+		Address:  "127.0.0.1",
+		Port:     22,
+		User:     "ops",
+		AuthType: "key",
+		KeyRef:   "opaque-key-ref",
+		KeyPaths: []string{keyPath},
+		Options:  MustOptions(OptionStrictHostKeyChecking, "no", OptionUserKnownHostsFile, "none", OptionIdentityFile, keyPath),
+	}
+	conn := NewConnector(nil, WithHostKeyVerifier(staticTestVerifier{}))
+	defer func() { _ = conn.CloseAll() }()
+
+	if _, _, err := conn.buildSSHConfig(t.Context(), cfg, nil, nil, nil); err == nil || !strings.Contains(err.Error(), "explicit key source") {
+		t.Fatalf("expected AuthType=key with KeyRef and nil keySource to fail closed, got %v", err)
+	}
+
+	c := &Client{connCfg: cfg.ToConnectionConfig()}
+	snap := c.Config()
+	if !reflect.DeepEqual(snap.KeyPaths, []string{keyPath}) {
+		t.Fatalf("Client.Config().KeyPaths = %v, want [%q]", snap.KeyPaths, keyPath)
+	}
+	snap.KeyPaths[0] = "mutated"
+	if c.Config().KeyPaths[0] != keyPath {
+		t.Fatalf("mutating Config().KeyPaths mutated live connCfg: %v", c.Config().KeyPaths)
+	}
+}
+
+type funcSecretPrompterForTest func(ctx context.Context, req SecretRequest) (string, error)
+
+func (f funcSecretPrompterForTest) PromptSecret(ctx context.Context, req SecretRequest) (string, error) {
+	return f(ctx, req)
+}
+
+func TestKeyAuthAndMultiKeyAuth_ShareSecProviderForMFA(t *testing.T) {
+	key1Path := filepath.Join(t.TempDir(), "id_unused")
+	_ = writeAuthTestPrivateKey(t, key1Path)
+	key2Path := filepath.Join(t.TempDir(), "id_accepted")
+	acceptedSigner := writeAuthTestPrivateKey(t, key2Path)
+	acceptedRaw := string(acceptedSigner.PublicKey().Marshal())
+
+	addr, stop := startTestMultiAuthSSHServer(t, nil, "", func(sc *cryptoSSH.ServerConfig) {
+		sc.PublicKeyCallback = func(conn cryptoSSH.ConnMetadata, pub cryptoSSH.PublicKey) (*cryptoSSH.Permissions, error) {
+			if string(pub.Marshal()) != acceptedRaw {
+				return nil, errors.New("key rejected")
+			}
+			return nil, &cryptoSSH.PartialSuccessError{
+				Next: cryptoSSH.ServerAuthCallbacks{
+					KeyboardInteractiveCallback: func(_ cryptoSSH.ConnMetadata, client cryptoSSH.KeyboardInteractiveChallenge) (*cryptoSSH.Permissions, error) {
+						answers, err := client("", "", []string{"OTP:"}, []bool{true})
+						if err != nil {
+							return nil, err
+						}
+						if len(answers) != 1 || answers[0] != "654321" {
+							return nil, errors.New("bad OTP")
+						}
+						return &cryptoSSH.Permissions{}, nil
+					},
+				},
+			}
+		}
+	})
+	defer stop()
+
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	baseOpts := MustOptions(OptionStrictHostKeyChecking, "no", OptionUserKnownHostsFile, "none")
+
+	t.Run("single-key-mfa-propagates-terminal-error", func(t *testing.T) {
+		wantErr := errors.New("single-key mfa prompter aborted")
+		spy := &immutableProviderSpy{cfg: &ClientConfig{
+			NodeID:   "single-key-mfa",
+			Address:  host,
+			Port:     port,
+			User:     "ops",
+			AuthType: "key",
+			KeyPath:  key2Path,
+			Options:  baseOpts.Clone(),
+		}}
+		conn := NewConnector(
+			spy,
+			WithHostKeyVerifier(staticTestVerifier{}),
+			WithSecretPrompter(funcSecretPrompterForTest(func(_ context.Context, req SecretRequest) (string, error) {
+				if req.Kind != SecretKindPrivateKeyPassphrase {
+					return "", wantErr
+				}
+				return "", nil
+			})),
+			WithHandshakeTimeout(3*time.Second),
+		)
+		defer func() { _ = conn.CloseAll() }()
+
+		_, err := conn.Connect(t.Context(), "single-key-mfa")
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("Connect error = %v, want errors.Is(_, %v)", err, wantErr)
+		}
+	})
+
+	t.Run("multi-key-mfa-succeeds-without-recorder-and-propagates-terminal-error", func(t *testing.T) {
+		okSpy := &immutableProviderSpy{cfg: &ClientConfig{
+			NodeID:   "multi-key-mfa-ok",
+			Address:  host,
+			Port:     port,
+			User:     "ops",
+			AuthType: "key",
+			KeyPaths: []string{key1Path, key2Path},
+			Options:  baseOpts.Clone(),
+		}}
+		okConn := NewConnector(
+			okSpy,
+			WithHostKeyVerifier(staticTestVerifier{}),
+			WithSecretPrompter(funcSecretPrompterForTest(func(_ context.Context, req SecretRequest) (string, error) {
+				if req.Kind != SecretKindPrivateKeyPassphrase {
+					return "654321", nil
+				}
+				return "", ErrInteractionRequired
+			})),
+			WithHandshakeTimeout(3*time.Second),
+		)
+		defer func() { _ = okConn.CloseAll() }()
+
+		cli, err := okConn.Connect(t.Context(), "multi-key-mfa-ok")
+		if err != nil || cli == nil {
+			t.Fatalf("multi-key MFA Connect failed: cli=%v err=%v", cli, err)
+		}
+
+		wantErr := errors.New("multi-key mfa prompter aborted")
+		errSpy := &immutableProviderSpy{cfg: &ClientConfig{
+			NodeID:   "multi-key-mfa-err",
+			Address:  host,
+			Port:     port,
+			User:     "ops",
+			AuthType: "key",
+			KeyPaths: []string{key1Path, key2Path},
+			Options:  baseOpts.Clone(),
+		}}
+		errConn := NewConnector(
+			errSpy,
+			WithHostKeyVerifier(staticTestVerifier{}),
+			WithSecretPrompter(funcSecretPrompterForTest(func(_ context.Context, req SecretRequest) (string, error) {
+				if req.Kind != SecretKindPrivateKeyPassphrase {
+					return "", wantErr
+				}
+				return "", ErrInteractionRequired
+			})),
+			WithHandshakeTimeout(3*time.Second),
+		)
+		defer func() { _ = errConn.CloseAll() }()
+
+		_, err = errConn.Connect(t.Context(), "multi-key-mfa-err")
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("multi-key MFA Connect error = %v, want errors.Is(_, %v)", err, wantErr)
+		}
+	})
+}
+
+func TestKeyAuthWithKeySource_MultiKeyFallbackAndNodeIDKeyed(t *testing.T) {
+	wrongPath := filepath.Join(t.TempDir(), "id_wrong")
+	wrongSigner := writeAuthTestPrivateKey(t, wrongPath)
+	goodPath := filepath.Join(t.TempDir(), "id_good")
+	goodSigner := writeAuthTestPrivateKey(t, goodPath)
+
+	var wrongAuthCount, goodAuthCount int
+	var mu sync.Mutex
+	addr, stop := startTestMultiAuthSSHServer(t, nil, "", func(sc *cryptoSSH.ServerConfig) {
+		sc.PublicKeyCallback = func(conn cryptoSSH.ConnMetadata, key cryptoSSH.PublicKey) (*cryptoSSH.Permissions, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if conn.User() != "ops" {
+				return nil, errors.New("unexpected user")
+			}
+			if string(key.Marshal()) == string(wrongSigner.PublicKey().Marshal()) {
+				wrongAuthCount++
+				return nil, errors.New("wrong key rejected")
+			}
+			if string(key.Marshal()) == string(goodSigner.PublicKey().Marshal()) {
+				goodAuthCount++
+				return &cryptoSSH.Permissions{}, nil
+			}
+			return nil, errors.New("unknown key")
+		}
+	})
+	defer stop()
+
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	baseOpts := MustOptions(
+		OptionStrictHostKeyChecking, "no",
+		OptionUserKnownHostsFile, "none",
+		OptionIdentitiesOnly, "yes",
+	)
+
+	t.Run("sourced-key-rejected-falls-back-to-remaining-KeyPaths-and-deduplicates", func(t *testing.T) {
+		mu.Lock()
+		wrongAuthCount, goodAuthCount = 0, 0
+		mu.Unlock()
+
+		lease := &fixtureKeyLease{signer: wrongSigner}
+		ks := &fixtureKeySource{lease: lease}
+		cfg := &ClientConfig{
+			NodeID:   "multi-key-sourced",
+			Address:  host,
+			Port:     port,
+			User:     "ops",
+			AuthType: "key",
+			KeyRef:   "opaque-wrong-key",
+			KeyPath:  wrongPath,
+			KeyPaths: []string{wrongPath, goodPath},
+			Options:  baseOpts.Clone(),
+		}
+		conn := NewConnector(&mockConfigStore{cfg: cfg}, WithKeySource(ks), WithHostKeyVerifier(staticTestVerifier{}))
+		defer closePlanConnector(t, conn)
+
+		cli, err := conn.Connect(t.Context(), "multi-key-sourced")
+		if err != nil || cli == nil {
+			t.Fatalf("expected fallback to second key in KeyPaths, got cli=%v err=%v", cli, err)
+		}
+		mu.Lock()
+		wCount, gCount := wrongAuthCount, goodAuthCount
+		mu.Unlock()
+		if wCount != 1 || gCount != 1 {
+			t.Fatalf("unexpected publickey offer counts: wrong=%d (want 1 deduplicated), good=%d (want 1)", wCount, gCount)
+		}
+		if lease.closed.Load() != 1 {
+			t.Fatalf("sourced lease closed %d times, want 1", lease.closed.Load())
+		}
+	})
+
+	t.Run("NodeID-keyed-KeySource-works-with-empty-KeyRef-and-KeyPath", func(t *testing.T) {
+		lease := &fixtureKeyLease{signer: goodSigner}
+		ks := &fixtureKeySource{lease: lease}
+		cfg := &ClientConfig{
+			NodeID:   "nodeid-keyed",
+			Address:  host,
+			Port:     port,
+			User:     "ops",
+			AuthType: "key",
+			Options:  baseOpts.Clone(),
+		}
+		conn := NewConnector(&mockConfigStore{cfg: cfg}, WithKeySource(ks), WithHostKeyVerifier(staticTestVerifier{}))
+		defer closePlanConnector(t, conn)
+
+		cli, err := conn.Connect(t.Context(), "nodeid-keyed")
+		if err != nil || cli == nil {
+			t.Fatalf("NodeID-keyed KeySource Connect failed: cli=%v err=%v", cli, err)
+		}
+		if ks.request.NodeID != "nodeid-keyed" {
+			t.Fatalf("KeyRequest.NodeID = %q, want %q", ks.request.NodeID, "nodeid-keyed")
+		}
+		if lease.closed.Load() != 1 {
+			t.Fatalf("NodeID-keyed lease closed %d times, want 1", lease.closed.Load())
+		}
+	})
 }
