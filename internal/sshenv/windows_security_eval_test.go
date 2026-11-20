@@ -166,8 +166,18 @@ func TestEvaluateWindowsObjectSecurity_TrustedAllowlistAndObjectACEFailClosed(t 
 }
 
 func TestEvaluateWindowsAgentPipeOwner_FailsClosedWhenUnverified(t *testing.T) {
-	if err := evaluateWindowsAgentPipeOwner(true, true, 42, nil, false, false); err != nil {
-		t.Fatalf("trusted server token should succeed, got %v", err)
+	if err := evaluateWindowsAgentPipeOwner(true, true, 42, nil, true, true); err != nil {
+		t.Fatalf("trusted server token + trusted kernel object owner should succeed, got %v", err)
+	}
+	if err := evaluateWindowsAgentPipeOwner(true, true, 42, nil, true, false); !errors.Is(err, errUntrustedAgentPipeOwner) {
+		t.Fatalf("trusted server token + untrusted kernel object owner must fail closed, got %v", err)
+	}
+	if err := evaluateWindowsAgentPipeOwner(true, true, 42, nil, false, false); err == nil {
+		t.Fatal("trusted server token + missing kernel object owner must fail closed")
+	}
+	sentinelOwnerErr := errors.New("sd.Owner failed")
+	if err := evaluateWindowsAgentPipeOwner(true, true, 42, sentinelOwnerErr, false, false); !errors.Is(err, sentinelOwnerErr) {
+		t.Fatalf("trusted server token + owner query error must fail closed wrapping error, got %v", err)
 	}
 	if err := evaluateWindowsAgentPipeOwner(true, false, 42, nil, true, true); !errors.Is(err, errUntrustedAgentPipeOwner) {
 		t.Fatalf("untrusted server token must fail with errUntrustedAgentPipeOwner, got %v", err)
@@ -215,6 +225,14 @@ func TestRound4_P2_10_EvaluateWindowsAgentPipeDACL(t *testing.T) {
 		t.Fatalf("Win32-OpenSSH pipe DACL should be allowed, got %v", err)
 	}
 
+	if err := evaluateWindowsAgentPipeSecurity(
+		true, true, 100,
+		nil, true, false,
+		nil, true, []windowsParsedACE{trustedOwnerACE, openSSHAUACE},
+	); !errors.Is(err, errUntrustedAgentPipeOwner) {
+		t.Fatalf("trusted token with untrusted SD owner got %v, want errUntrustedAgentPipeOwner", err)
+	}
+
 	// Null DACL must fail closed even when process token & SD owner are trusted.
 	if err := evaluateWindowsAgentPipeSecurity(
 		true, true, 100,
@@ -248,5 +266,61 @@ func TestRound4_P2_10_EvaluateWindowsAgentPipeDACL(t *testing.T) {
 		if !errors.Is(err, errInsecureAgentPipeDACL) {
 			t.Fatalf("mask %#x for untrusted SID got %v, want errInsecureAgentPipeDACL", unsafeMask, err)
 		}
+	}
+}
+
+func TestRound6_P1_2_And_P3_4_WindowsAgentDesiredAccessAndUnicodeControls(t *testing.T) {
+	t.Parallel()
+
+	// P1-2: dialWindowsNamedPipe desiredAccess MUST be a strict subset of Win32-OpenSSH's
+	// Authenticated Users ACE (0x0012019b) and MUST NOT include any privileged server mask bit
+	// such as FILE_CREATE_PIPE_INSTANCE (0x00000004).
+	if extra := windowsAgentPipeDesiredAccess &^ win32OpenSSHAgentAUAccessMask; extra != 0 {
+		t.Fatalf("windowsAgentPipeDesiredAccess (%#x) requests bits not in Win32-OpenSSH AU ACE (%#x): extra=%#x",
+			windowsAgentPipeDesiredAccess, win32OpenSSHAgentAUAccessMask, extra)
+	}
+	if overlap := windowsAgentPipeDesiredAccess & windowsInsecureNamedPipeServerMask; overlap != 0 {
+		t.Fatalf("windowsAgentPipeDesiredAccess (%#x) overlaps windowsInsecureNamedPipeServerMask (%#x): overlap=%#x",
+			windowsAgentPipeDesiredAccess, windowsInsecureNamedPipeServerMask, overlap)
+	}
+	// A minimal-DACL pipe granting only windowsAgentPipeDesiredAccess to AU must pass evaluation.
+	if !evaluateWindowsNamedPipeDACL(true, []windowsParsedACE{
+		{
+			aceType:    windowsAccessAllowedACEType,
+			mask:       windowsAccessGenericAll,
+			sidValid:   true,
+			sidTrusted: true,
+		},
+		{
+			aceType:    windowsAccessAllowedACEType,
+			mask:       windowsAgentPipeDesiredAccess,
+			sidValid:   true,
+			sidTrusted: false,
+		},
+	}) {
+		t.Fatal("minimal-DACL pipe granting 0x0012008b should be allowed")
+	}
+
+	// P3-4: C1 control U+0085 (NEL), line/paragraph separators U+2028/U+2029, and invalid UTF-8
+	// must be rejected before TrimSpace can launder them.
+	for _, bad := range []string{
+		"\u0085",
+		"\u0085\\\\.\\pipe\\openssh-ssh-agent",
+		"\\\\.\\pipe\\openssh-ssh-agent\u0085",
+		"\u2028\\\\.\\pipe\\openssh-ssh-agent",
+		"\\\\.\\pipe\\openssh-ssh-agent\u2029",
+		string([]byte{0x85, '\\', '\\', '.', '\\', 'p', 'i', 'p', 'e', '\\', 'a'}),
+	} {
+		if !hasWindowsAgentControlChar(bad) {
+			t.Fatalf("hasWindowsAgentControlChar(%q) = false, want true", bad)
+		}
+		if _, _, err := parseWindowsAgentPipePath(bad); err == nil {
+			t.Fatalf("parseWindowsAgentPipePath(%q) = nil, want control-char error", bad)
+		}
+	}
+	// Plain ASCII spaces around a valid pipe path remain allowed.
+	gotPipe, isPipe, err := parseWindowsAgentPipePath(`  \\.\pipe\openssh-ssh-agent  `)
+	if err != nil || !isPipe || gotPipe != defaultWindowsOpenSSHAgentPipe {
+		t.Fatalf("parseWindowsAgentPipePath(spaces) = (%q, %v, %v)", gotPipe, isPipe, err)
 	}
 }

@@ -27,7 +27,7 @@ func TestRound4_ProxyJumpHelpers(t *testing.T) {
 		wantActive bool
 	}{
 		{"", false, false},
-		{" , ", false, false},
+		{" , ", true, false},
 		{"none", true, false},
 		{"NONE", true, false},
 		{"none,none", true, false},
@@ -167,7 +167,7 @@ func TestRound4_P1_4_SlowProxyChannelOpenAndRequestDoNotKillSharedMaster(t *test
 		defer close(ch.releaseReq)
 		pc := &proxyChan{remoteCh: ch}
 
-		ok, err := ps.sendBoundedProxyChannelRequest(pc, "exec", true, nil)
+		ok, _, err := ps.sendBoundedProxyChannelRequest(pc, "exec", true, nil)
 		if ok || err == nil {
 			t.Fatalf("expected timeout error on stuck channel request, got ok=%v err=%v", ok, err)
 		}
@@ -298,7 +298,7 @@ func TestRound4_P1_6_And_P2_5_KeySourceBindingAgentSuppressionAndCertDedup(t *te
 	fileKeyPath := filepath.Join(t.TempDir(), "id_disk")
 	fileSigner := writeAuthTestPrivateKey(t, fileKeyPath)
 
-	vaultSigner, vaultKeyPath, vaultCert, vaultCertPath, agentPriv, agentSigner := prepareRound4KeySourceMaterials(t)
+	vaultSigner, vaultPriv, vaultKeyPath, vaultCert, vaultCertPath, agentPriv, agentSigner := prepareRound4KeySourceMaterials(t)
 	keyring := agent.NewKeyring()
 	if err := keyring.Add(agent.AddedKey{PrivateKey: agentPriv}); err != nil {
 		t.Fatal(err)
@@ -378,47 +378,11 @@ func TestRound4_P1_6_And_P2_5_KeySourceBindingAgentSuppressionAndCertDedup(t *te
 	})
 
 	t.Run("auto with sourced cert filters SSHOptions.IdentityFiles and deduplicates agent certs", func(t *testing.T) {
-		mu.Lock()
-		offeredKeys = nil
-		acceptVaultKey = false
-		mu.Unlock()
-
-		ks := &fixtureKeySource{lease: &fixtureKeyLease{signer: vaultSigner}}
-		cfg := &ClientConfig{
-			NodeID:   "auto-cert-dedup",
-			Address:  host,
-			Port:     port,
-			User:     "ops",
-			AuthType: "auto",
-			KeyRef:   "vault://cert-owner",
-			KeyPath:  vaultKeyPath,
-			Options: MustOptions(
-				OptionStrictHostKeyChecking, "no",
-				OptionUserKnownHostsFile, "none",
-				OptionIdentityFile, vaultKeyPath,
-				OptionCertificateFile, vaultCertPath,
-			),
-		}
-		conn := NewConnector(&mockConfigStore{cfg: cfg}, WithEnvironment(env), WithKeySource(ks), WithHostKeyVerifier(staticTestVerifier{}))
-		defer closePlanConnector(t, conn)
-
-		_, _ = conn.Connect(t.Context(), "auto-cert-dedup")
-		vaultCertRaw := string(vaultCert.Marshal())
-		vaultPubRaw := string(vaultSigner.PublicKey().Marshal())
-		mu.Lock()
-		var certOffers, plainOffers int
-		for _, k := range offeredKeys {
-			if k == vaultCertRaw {
-				certOffers++
-			}
-			if k == vaultPubRaw {
-				plainOffers++
-			}
-		}
-		mu.Unlock()
-		if certOffers != 1 || plainOffers != 1 {
-			t.Fatalf("dedup offers failed: certOffers=%d (want 1), plainOffers=%d (want 1)", certOffers, plainOffers)
-		}
+		verifyRound4AutoCertDedup(
+			t, host, port,
+			vaultSigner, vaultPriv, vaultKeyPath, vaultCert, vaultCertPath, agentPriv,
+			&mu, &offeredKeys, &acceptVaultKey,
+		)
 	})
 
 	t.Run("NodeID-keyed KeySource runs even with IdentityFile and falls back only on ErrKeyNotFound", func(t *testing.T) {
@@ -473,7 +437,94 @@ func TestRound4_P1_6_And_P2_5_KeySourceBindingAgentSuppressionAndCertDedup(t *te
 	})
 }
 
-func prepareRound4KeySourceMaterials(t *testing.T) (cryptoSSH.Signer, string, *cryptoSSH.Certificate, string, ed25519.PrivateKey, cryptoSSH.Signer) {
+func verifyRound4AutoCertDedup(
+	t *testing.T,
+	host string,
+	port int,
+	vaultSigner cryptoSSH.Signer,
+	vaultPriv ed25519.PrivateKey,
+	vaultKeyPath string,
+	vaultCert *cryptoSSH.Certificate,
+	vaultCertPath string,
+	agentPriv ed25519.PrivateKey,
+	mu *sync.Mutex,
+	offeredKeys *[]string,
+	acceptVaultKey *bool,
+) {
+	t.Helper()
+	mu.Lock()
+	*offeredKeys = nil
+	*acceptVaultKey = false
+	mu.Unlock()
+
+	// Use an agent keyring that ALSO holds vaultPriv and vaultCert so we actually
+	// exercise agent cert/key deduplication alongside KeySource and IdentityFile.
+	dedupKeyring := agent.NewKeyring()
+	if err := dedupKeyring.Add(agent.AddedKey{PrivateKey: agentPriv}); err != nil {
+		t.Fatal(err)
+	}
+	if err := dedupKeyring.Add(agent.AddedKey{PrivateKey: vaultPriv}); err != nil {
+		t.Fatal(err)
+	}
+	if err := dedupKeyring.Add(agent.AddedKey{PrivateKey: vaultPriv, Certificate: vaultCert}); err != nil {
+		t.Fatal(err)
+	}
+	var dedupAgentCalls atomic.Int32
+	dedupEnv := Environment{
+		AgentSocket: "/tmp/dedup-agent.sock",
+		DialAgent: func(ctx context.Context, socket string) (net.Conn, error) {
+			dedupAgentCalls.Add(1)
+			c1, c2 := net.Pipe()
+			go func() {
+				_ = agent.ServeAgent(dedupKeyring, c2)
+				_ = c2.Close()
+			}()
+			return c1, nil
+		},
+	}
+
+	ks := &fixtureKeySource{lease: &fixtureKeyLease{signer: vaultSigner}}
+	cfg := &ClientConfig{
+		NodeID:   "auto-cert-dedup",
+		Address:  host,
+		Port:     port,
+		User:     "ops",
+		AuthType: "auto",
+		KeyRef:   "vault://cert-owner",
+		KeyPath:  vaultKeyPath,
+		Options: MustOptions(
+			OptionStrictHostKeyChecking, "no",
+			OptionUserKnownHostsFile, "none",
+			OptionIdentityFile, vaultKeyPath,
+			OptionCertificateFile, vaultCertPath,
+		),
+	}
+	conn := NewConnector(&mockConfigStore{cfg: cfg}, WithEnvironment(dedupEnv), WithKeySource(ks), WithHostKeyVerifier(staticTestVerifier{}))
+	defer closePlanConnector(t, conn)
+
+	_, _ = conn.Connect(t.Context(), "auto-cert-dedup")
+	if dedupAgentCalls.Load() == 0 {
+		t.Fatal("expected auto mode dedup test to dial agent")
+	}
+	vaultCertRaw := string(vaultCert.Marshal())
+	vaultPubRaw := string(vaultSigner.PublicKey().Marshal())
+	mu.Lock()
+	var certOffers, plainOffers int
+	for _, k := range *offeredKeys {
+		if k == vaultCertRaw {
+			certOffers++
+		}
+		if k == vaultPubRaw {
+			plainOffers++
+		}
+	}
+	mu.Unlock()
+	if certOffers != 1 || plainOffers != 1 {
+		t.Fatalf("dedup offers failed: certOffers=%d (want 1), plainOffers=%d (want 1)", certOffers, plainOffers)
+	}
+}
+
+func prepareRound4KeySourceMaterials(t *testing.T) (cryptoSSH.Signer, ed25519.PrivateKey, string, *cryptoSSH.Certificate, string, ed25519.PrivateKey, cryptoSSH.Signer) {
 	t.Helper()
 	_, caPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -524,7 +575,7 @@ func prepareRound4KeySourceMaterials(t *testing.T) (cryptoSSH.Signer, string, *c
 	if err != nil {
 		t.Fatal(err)
 	}
-	return vaultSigner, vaultKeyPath, vaultCert, vaultCertPath, agentPriv, agentSigner
+	return vaultSigner, vaultPriv, vaultKeyPath, vaultCert, vaultCertPath, agentPriv, agentSigner
 }
 
 func TestRound4_P2_1_AcquireForegroundSessionDecouplesExtraForegroundFromInitialNStop(t *testing.T) {

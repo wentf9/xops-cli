@@ -741,6 +741,7 @@ func (o *ExecOptions) buildTaskSessionAuth(task execHostTask, cliAbsKeys []strin
 		KeyPaths:                 taskKeys,
 		HostName:                 hostNameOverride,
 		OriginalHost:             task.originalHost,
+		CanonicalHost:            task.canonicalHost,
 		Remember:                 remember,
 		SuppressNodeConfirmation: suppressConfirm,
 		OTP:                      o.OTP,

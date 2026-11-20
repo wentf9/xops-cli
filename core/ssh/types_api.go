@@ -317,6 +317,10 @@ func validateTargetCompatibility(cur ConnectionConfig, newCfg *ClientConfig) err
 		return fmt.Errorf("%w: original host changed (expected %q, got %q)",
 			ErrSnapshotMismatch, curOrig, newOrig)
 	}
+	if curCanon, newCanon := strings.TrimSpace(cur.CanonicalHost), strings.TrimSpace(newCfg.CanonicalHost); curCanon != newCanon {
+		return fmt.Errorf("%w: canonical host changed (expected %q, got %q)",
+			ErrSnapshotMismatch, curCanon, newCanon)
+	}
 	if newCfg.KeyRef != cur.KeyRef || newCfg.TrustVersion != cur.TrustVersion {
 		return fmt.Errorf("%w: key reference or host trust version changed", ErrSnapshotMismatch)
 	}

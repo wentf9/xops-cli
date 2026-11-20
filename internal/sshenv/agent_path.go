@@ -3,6 +3,8 @@ package sshenv
 import (
 	"fmt"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -31,8 +33,11 @@ func hasWindowsAgentPipePrefix(slashed string) bool {
 }
 
 func hasWindowsAgentControlChar(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] < 0x20 || s[i] == 0x7f {
+	if !utf8.ValidString(s) {
+		return true
+	}
+	for _, r := range s {
+		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
 			return true
 		}
 	}

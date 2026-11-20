@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sync"
 
 	cryptoSSH "golang.org/x/crypto/ssh"
@@ -63,7 +64,7 @@ func filterSourcedKeyPath(paths []string, sourcedKeyPath string, env Environment
 	}
 	filtered := make([]string, 0, len(paths))
 	for _, p := range paths {
-		if pExp, pErr := expandIdentityKeyPath(p, env, target, resolveKeyPath); pErr == nil && pExp == sourcedExpanded {
+		if filepath.Clean(filepath.FromSlash(p)) == sourcedExpanded {
 			continue
 		}
 		filtered = append(filtered, p)

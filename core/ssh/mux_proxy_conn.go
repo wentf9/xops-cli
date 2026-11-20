@@ -309,6 +309,51 @@ func abortUnclaimedSSHConn(conn cryptoSSH.Conn, chans <-chan cryptoSSH.NewChanne
 // returns a wrapped *Client ready to execute SSH sessions over the multiplexed
 // connection without falling back to direct TCP. The caller owns the returned
 // *Client and must Close it when done.
+func effectiveControlProxyConfig(cfg *ClientConfig, target TargetContext) *ClientConfig {
+	if cfg == nil {
+		port := target.Port
+		if port <= 0 {
+			port = 22
+		}
+		return &ClientConfig{
+			OriginalHost:  target.OriginalHost,
+			CanonicalHost: target.CanonicalHost,
+			Address:       target.Host,
+			Port:          port,
+			User:          target.User,
+		}
+	}
+	needClone := cfg.Port <= 0 ||
+		(cfg.User == "" && target.User != "") ||
+		(cfg.Address == "" && target.Host != "") ||
+		(cfg.OriginalHost == "" && target.OriginalHost != "") ||
+		(cfg.CanonicalHost == "" && target.CanonicalHost != "")
+	if !needClone {
+		return cfg
+	}
+	cloned := *cfg
+	if cloned.Port <= 0 {
+		if target.Port > 0 {
+			cloned.Port = target.Port
+		} else {
+			cloned.Port = 22
+		}
+	}
+	if cloned.User == "" {
+		cloned.User = target.User
+	}
+	if cloned.Address == "" {
+		cloned.Address = target.Host
+	}
+	if cloned.OriginalHost == "" {
+		cloned.OriginalHost = target.OriginalHost
+	}
+	if cloned.CanonicalHost == "" {
+		cloned.CanonicalHost = target.CanonicalHost
+	}
+	return &cloned
+}
+
 func DialControlProxyClient(
 	ctx context.Context,
 	socketPath string,
@@ -331,31 +376,7 @@ func DialControlProxyClient(
 		return nil, err
 	}
 
-	effectiveCfg := cfg
-	if effectiveCfg == nil {
-		port := target.Port
-		if port <= 0 {
-			port = 22
-		}
-		effectiveCfg = &ClientConfig{
-			Address: target.Host,
-			Port:    port,
-			User:    target.User,
-		}
-	} else if effectiveCfg.Port <= 0 || effectiveCfg.User == "" {
-		cloned := *effectiveCfg
-		if cloned.Port <= 0 {
-			if target.Port > 0 {
-				cloned.Port = target.Port
-			} else {
-				cloned.Port = 22
-			}
-		}
-		if cloned.User == "" {
-			cloned.User = target.User
-		}
-		effectiveCfg = &cloned
-	}
+	effectiveCfg := effectiveControlProxyConfig(cfg, target)
 
 	client := newClientWithComponents(
 		rawClient,

@@ -31,6 +31,7 @@ type SessionAuth struct {
 	KeyPaths                 []string
 	HostName                 string
 	OriginalHost             string
+	CanonicalHost            string
 	SuPwd                    string
 	OTP                      string
 	ProxyJump                string
@@ -213,7 +214,7 @@ func ParseOptionStringsWithJump(options []string, cliProxyJump string) (SessionC
 	var opts SessionControlOptions
 	state := optionParseState{seen: make(map[string]bool)}
 	if trimmedJump := strings.TrimSpace(cliProxyJump); trimmedJump != "" {
-		state.seen["proxyjump"] = true
+		state.seen[ssh.OptionProxyJump] = true
 		state.proxyJumpActive = ssh.HasActiveProxyJump(trimmedJump)
 	}
 	for _, opt := range options {
@@ -235,18 +236,18 @@ func applyParsedOption(opts *SessionControlOptions, state *optionParseState, key
 	if handled, err := applyControlOption(opts, state, key, val); handled || err != nil {
 		return err
 	}
-	switch strings.ToLower(key) {
-	case "port":
+	switch ssh.CanonicalOptionKey(key) {
+	case ssh.OptionPort:
 		p, err := strconv.ParseUint(val, 10, 16)
 		if err != nil || p == 0 {
 			return fmt.Errorf("invalid Port in -o option: %q", val)
 		}
-	case "user":
+	case ssh.OptionUser:
 		if val == "" {
 			return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
 		}
 		// Applied to the connection target by the CLI, see ApplyGeneralOptions.
-	case "hostname":
+	case ssh.OptionHostName:
 		if val == "" {
 			return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
 		}
@@ -254,18 +255,18 @@ func applyParsedOption(opts *SessionControlOptions, state *optionParseState, key
 			return fmt.Errorf("invalid HostName in -o option: %w", err)
 		}
 		// Applied to the connection target by the CLI, see ApplyGeneralOptions.
-	case "proxyjump", "proxy_jump":
+	case ssh.OptionProxyJump:
 		if val == "" {
 			return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
 		}
-		if !state.seen["proxyjump"] && !state.seen[ssh.OptionProxyCommand] {
-			state.seen["proxyjump"] = true
+		if !state.seen[ssh.OptionProxyJump] && !state.seen[ssh.OptionProxyCommand] {
+			state.seen[ssh.OptionProxyJump] = true
 			if ssh.HasActiveProxyJump(val) {
 				state.proxyJumpActive = true
 			}
 		}
 		// Applied to the connection target by the CLI, see ApplyGeneralOptions.
-	case "identityfile":
+	case ssh.OptionIdentityFile:
 		if val == "" {
 			return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
 		}
@@ -279,8 +280,8 @@ func applyParsedOption(opts *SessionControlOptions, state *optionParseState, key
 }
 
 func applyControlOption(opts *SessionControlOptions, state *optionParseState, key, val string) (bool, error) {
-	switch strings.ToLower(key) {
-	case "controlmaster", "control_master":
+	switch ssh.CanonicalOptionKey(key) {
+	case ssh.OptionControlMaster:
 		m, err := ssh.ParseControlMasterMode(val)
 		if err != nil {
 			return true, fmt.Errorf("invalid ControlMaster in -o option: %w", err)
@@ -290,7 +291,7 @@ func applyControlOption(opts *SessionControlOptions, state *optionParseState, ke
 		}
 		state.seen[ssh.OptionControlMaster] = true
 		return true, nil
-	case "controlpath", "control_path":
+	case ssh.OptionControlPath:
 		if val == "" {
 			return true, fmt.Errorf("invalid ControlPath in -o option: value cannot be empty")
 		}
@@ -304,7 +305,7 @@ func applyControlOption(opts *SessionControlOptions, state *optionParseState, ke
 		}
 		state.seen[ssh.OptionControlPath] = true
 		return true, nil
-	case "controlpersist", "control_persist":
+	case ssh.OptionControlPersist:
 		if _, _, _, err := ssh.ParseControlPersist(val); err != nil {
 			return true, fmt.Errorf("invalid ControlPersist in -o option: %w", err)
 		}
@@ -924,9 +925,7 @@ func (a *SSHAdapter) ConfirmConnection(ctx context.Context, nodeID string) error
 	}
 	if nodeID != "" && a.cfgProvider != nil {
 		sessionCtrlOpts, _ := a.getSessionControlOverride(nodeID)
-		if opts, err := a.ResolveSSHOptions(nodeID, sessionCtrlOpts); err == nil && opts != nil && opts.BatchMode() {
-			a.latchBatchMode(nodeID)
-		}
+		_, _ = a.solvePolicy(nodeID, sessionCtrlOpts, policySolveMode{resolveOptions: true, allowBatchLatch: true})
 	}
 	if provider, ok := a.cfgProvider.(interface {
 		ConfirmNodeContext(context.Context, string) error
@@ -945,6 +944,7 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 	pol, err := a.solvePolicy(nodeID, sessionCtrlOpts, policySolveMode{
 		requireSnapshot: true,
 		resolveOptions:  true,
+		allowBatchLatch: true,
 	})
 	if err != nil {
 		if !pol.hasSnapshot {
@@ -1131,10 +1131,10 @@ func (a *SSHAdapter) applySessionOverrideToConfig(nodeID string, cfg *ssh.Client
 }
 
 func (a *SSHAdapter) applySessionProxyJumpOverride(nodeID string, cfg *ssh.ClientConfig, rawJump string) error {
-	if rawJump == "" {
+	switch classifyProxyJump(rawJump) {
+	case proxyUnset:
 		return nil
-	}
-	if ssh.IsDisabledProxyJump(rawJump) {
+	case proxyDisabled:
 		cfg.ProxyJump = ""
 		cfg.OriginalProxyJump = ""
 		cfg.HasOriginalProxyJump = true
@@ -1210,7 +1210,7 @@ func (a *SSHAdapter) UpdateAuth(ctx context.Context, nodeID, authUpdateToken, pa
 }
 
 func (a *SSHAdapter) persistAuthentication(ctx context.Context, nodeID, authUpdateToken, password, keyPath, passphrase string) (string, error) {
-	snapshot, err := a.cfgProvider.ResolveConnection(nodeID)
+	snapshot, _, _, err := a.resolveConnectionSnapshot(nodeID)
 	if err != nil {
 		return "", fmt.Errorf("resolve node %q for remembered authentication: %w", nodeID, err)
 	}
@@ -1228,7 +1228,7 @@ func (a *SSHAdapter) persistAuthentication(ctx context.Context, nodeID, authUpda
 	if passphrase != "" {
 		// The first rotation may have advanced the auth version; resolve the
 		// latest snapshot before rotating the independent passphrase ref.
-		snapshot, err = a.cfgProvider.ResolveConnection(nodeID)
+		snapshot, _, _, err = a.resolveConnectionSnapshot(nodeID)
 		if err != nil {
 			return "", fmt.Errorf("refresh node %q before persisting passphrase: %w", nodeID, err)
 		}
@@ -1272,7 +1272,7 @@ func (a *SSHAdapter) UpdateSudo(ctx context.Context, nodeID, sudoUpdateToken str
 
 func (a *SSHAdapter) updateRecordedSudo(ctx context.Context, nodeID, sudoUpdateToken string, mode ssh.SudoMode, suPwd string) (string, error) {
 	if mode == ssh.SudoModeSudo {
-		snapshot, err := a.cfgProvider.ResolveConnection(nodeID)
+		snapshot, _, _, err := a.resolveConnectionSnapshot(nodeID)
 		if err != nil {
 			return "", fmt.Errorf("resolve privilege binding: %w", err)
 		}
@@ -1286,7 +1286,7 @@ func (a *SSHAdapter) updateRecordedSudo(ctx context.Context, nodeID, sudoUpdateT
 		}
 	}
 	if a.credentialService != nil && suPwd != "" {
-		snapshot, err := a.cfgProvider.ResolveConnection(nodeID)
+		snapshot, _, _, err := a.resolveConnectionSnapshot(nodeID)
 		if err != nil {
 			return "", fmt.Errorf("resolve privilege before recording: %w", err)
 		}
@@ -1308,7 +1308,7 @@ func (a *SSHAdapter) updateRecordedSudo(ctx context.Context, nodeID, sudoUpdateT
 		}
 	}
 	if a.credentialService != nil && suPwd != "" {
-		snapshot, err := a.cfgProvider.ResolveConnection(nodeID)
+		snapshot, _, _, err := a.resolveConnectionSnapshot(nodeID)
 		if err != nil {
 			return "", fmt.Errorf("resolve node %q for remembered privilege password: %w", nodeID, err)
 		}
@@ -1345,7 +1345,7 @@ func (a *SSHAdapter) ResolveSecret(ctx context.Context, req ssh.SecretRequest) (
 	if a.cfgProvider == nil {
 		return nil, fmt.Errorf("configuration provider is nil")
 	}
-	snapshot, err := a.cfgProvider.ResolveConnection(req.NodeID)
+	snapshot, override, hasOverride, err := a.resolveConnectionSnapshot(req.NodeID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve node %q failed: %w", req.NodeID, err)
 	}
@@ -1353,8 +1353,6 @@ func (a *SSHAdapter) ResolveSecret(ctx context.Context, req ssh.SecretRequest) (
 	if err := validateSecretRequestSnapshot(snapshot, req); err != nil {
 		return nil, err
 	}
-
-	override, hasOverride := a.getSessionOverride(req.NodeID)
 
 	switch req.Kind {
 	case ssh.SecretKindLoginPassword:

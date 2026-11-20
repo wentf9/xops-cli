@@ -835,3 +835,46 @@ func TestRound4_P2_11_GrandchildClosingAllStdioIsReapedViaSentinelFD(t *testing.
 		t.Fatalf("reapRemainingGroup calls = %d, want 1 even when grandchild closed stdin/stdout/stderr", got)
 	}
 }
+
+func TestRound5_P1_1_PipeHasOpenWriterMatrix(t *testing.T) {
+	t.Parallel()
+
+	// 1. Open writer, empty pipe -> true.
+	r1, w1, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = r1.Close() }()
+	if !pipeHasOpenWriter(r1) {
+		_ = w1.Close()
+		t.Fatal("pipeHasOpenWriter(open, empty) = false, want true")
+	}
+
+	// 2. Open writer, unread data buffered -> true (POLLIN without POLLHUP).
+	if _, err := w1.Write([]byte("hello")); err != nil {
+		_ = w1.Close()
+		t.Fatal(err)
+	}
+	if !pipeHasOpenWriter(r1) {
+		_ = w1.Close()
+		t.Fatal("pipeHasOpenWriter(open, unread data) = false, want true")
+	}
+
+	// 3. Closed writer, unread data still buffered -> false (POLLHUP set).
+	_ = w1.Close()
+	if pipeHasOpenWriter(r1) {
+		t.Fatal("pipeHasOpenWriter(closed, unread data) = true, want false")
+	}
+
+	// 4. Closed writer, empty pipe -> false (EOF/POLLHUP).
+	var buf [8]byte
+	if _, err := r1.Read(buf[:]); err != nil {
+		t.Fatalf("drain buffered pipe byte: %v", err)
+	}
+	if pipeHasOpenWriter(r1) {
+		t.Fatal("pipeHasOpenWriter(closed, drained) = true, want false")
+	}
+	if pipeHasOpenWriter(nil) {
+		t.Fatal("pipeHasOpenWriter(nil) = true, want false")
+	}
+}

@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/netip"
 	"slices"
 	"sort"
 	"strings"
@@ -13,6 +14,33 @@ import (
 	"github.com/wentf9/xops-cli/pkg/models"
 )
 
+// OpenSSHOrigin represents the atomic (Alias, CanonicalHost) pair associating a
+// node with the OpenSSH Host alias and optional canonicalized hostname from which
+// it was resolved during the current session.
+type OpenSSHOrigin struct {
+	Alias         string
+	CanonicalHost string
+}
+
+func normalizeOpenSSHOrigin(origin OpenSSHOrigin) OpenSSHOrigin {
+	return OpenSSHOrigin{
+		Alias:         strings.TrimSpace(origin.Alias),
+		CanonicalHost: strings.TrimSpace(origin.CanonicalHost),
+	}
+}
+
+// IsZero reports whether both Alias and CanonicalHost are empty after trimming.
+func (o OpenSSHOrigin) IsZero() bool {
+	return strings.TrimSpace(o.Alias) == "" && strings.TrimSpace(o.CanonicalHost) == ""
+}
+
+// Equal reports whether o and other represent the same OpenSSH origin pair.
+func (o OpenSSHOrigin) Equal(other OpenSSHOrigin) bool {
+	a := normalizeOpenSSHOrigin(o)
+	b := normalizeOpenSSHOrigin(other)
+	return a.Alias == b.Alias && strings.EqualFold(a.CanonicalHost, b.CanonicalHost)
+}
+
 // Provider owns one coherent in-memory configuration snapshot. All reads see
 // one revision. Repository owns durable mutations and publishes new snapshots.
 type Provider struct {
@@ -21,8 +49,7 @@ type Provider struct {
 	lookupIndex    map[string][]string
 	aliasIndex     map[string]string
 	openSSH        *OpenSSHParser
-	openSSHAliases map[string]string
-	canonicalHosts map[string]string
+	openSSHOrigins map[string]OpenSSHOrigin
 }
 
 var _ ConfigProvider = (*Provider)(nil)
@@ -50,14 +77,90 @@ func NewProviderWithOpenSSHParser(cfg *Configuration, parser *OpenSSHParser) *Pr
 	return newProvider(cfg, parser)
 }
 
-func newProvider(cfg *Configuration, parser *OpenSSHParser) *Provider {
+// NormalizeHostAddress trims whitespace and surrounding IPv6 brackets, returning
+// the canonical RFC 5952 representation for IP literals (preserving IPv6 zone IDs
+// and keeping IPv4-mapped IPv6 addresses distinct from IPv4) while preserving
+// non-IP hostname case verbatim.
+func NormalizeHostAddress(raw string) string {
+	clean := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(raw), "]"), "[")
+	if clean == "" {
+		return ""
+	}
+	if ip, err := netip.ParseAddr(clean); err == nil {
+		return ip.String()
+	}
+	return clean
+}
+
+// SameHostAddress reports whether a and b represent the same host address.
+// IP literals are compared by parsed netip.Addr equality before falling back
+// to case-insensitive hostname comparison so IPv6 zone-ID matching stays symmetric.
+func SameHostAddress(a, b string) bool {
+	ca := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(a), "]"), "[")
+	cb := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(b), "]"), "[")
+	if ca == "" || cb == "" {
+		return false
+	}
+	ipA, errA := netip.ParseAddr(ca)
+	ipB, errB := netip.ParseAddr(cb)
+	if errA == nil || errB == nil {
+		return errA == nil && errB == nil && ipA == ipB
+	}
+	return strings.EqualFold(ca, cb)
+}
+
+func stripTransientNodeMetadata(cfg *Configuration) {
+	if cfg == nil || cfg.Nodes == nil {
+		return
+	}
+	for _, nodeID := range cfg.Nodes.Keys() {
+		node, ok := cfg.Nodes.Get(nodeID)
+		if !ok || (node.OpenSSHAlias == "" && node.CanonicalHost == "") {
+			continue
+		}
+		node.OpenSSHAlias = ""
+		node.CanonicalHost = ""
+		cfg.Nodes.Set(nodeID, node)
+	}
+}
+
+func cloneConfigurationExtractingMetadata(cfg *Configuration) (*Configuration, map[string]OpenSSHOrigin) {
 	cloned := cloneConfiguration(cfg)
-	lookup, aliases, _ := buildIndexes(cloned, false)
+	if cloned == nil || cloned.Nodes == nil {
+		return cloned, nil
+	}
+	var origins map[string]OpenSSHOrigin
+	for _, nodeID := range cloned.Nodes.Keys() {
+		node, ok := cloned.Nodes.Get(nodeID)
+		if !ok || (node.OpenSSHAlias == "" && node.CanonicalHost == "") {
+			continue
+		}
+		origin := normalizeOpenSSHOrigin(OpenSSHOrigin{
+			Alias:         node.OpenSSHAlias,
+			CanonicalHost: node.CanonicalHost,
+		})
+		if !origin.IsZero() {
+			if origins == nil {
+				origins = make(map[string]OpenSSHOrigin)
+			}
+			origins[nodeID] = origin
+		}
+		node.OpenSSHAlias = ""
+		node.CanonicalHost = ""
+		cloned.Nodes.Set(nodeID, node)
+	}
+	return cloned, origins
+}
+
+func newProvider(cfg *Configuration, parser *OpenSSHParser) *Provider {
+	cloned, origins := cloneConfigurationExtractingMetadata(cfg)
+	lookup, aliasIdx, _ := buildIndexes(cloned, false)
 	return &Provider{
-		cfg:         cloned,
-		lookupIndex: lookup,
-		aliasIndex:  aliases,
-		openSSH:     parser,
+		cfg:            cloned,
+		lookupIndex:    lookup,
+		aliasIndex:     aliasIdx,
+		openSSH:        parser,
+		openSSHOrigins: origins,
 	}
 }
 
@@ -67,16 +170,10 @@ func (p *Provider) Frozen() ConfigProvider {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	frozen := newProvider(p.cfg, p.openSSH)
-	if len(p.openSSHAliases) > 0 {
-		frozen.openSSHAliases = make(map[string]string, len(p.openSSHAliases))
-		for k, v := range p.openSSHAliases {
-			frozen.openSSHAliases[k] = v
-		}
-	}
-	if len(p.canonicalHosts) > 0 {
-		frozen.canonicalHosts = make(map[string]string, len(p.canonicalHosts))
-		for k, v := range p.canonicalHosts {
-			frozen.canonicalHosts[k] = v
+	if len(p.openSSHOrigins) > 0 {
+		frozen.openSSHOrigins = make(map[string]OpenSSHOrigin, len(p.openSSHOrigins))
+		for k, v := range p.openSSHOrigins {
+			frozen.openSSHOrigins[k] = v
 		}
 	}
 	return frozen
@@ -106,56 +203,103 @@ func (p *Provider) GetOpenSSHParser() *OpenSSHParser {
 	return p.openSSH
 }
 
-// SetNodeOpenSSHAlias records the concrete OpenSSH Host alias from which nodeID
-// was derived during the current session without modifying persisted state.
-func (p *Provider) SetNodeOpenSSHAlias(nodeID, alias string) {
-	if p == nil || nodeID == "" || alias == "" {
+// NodeOpenSSHOrigin returns the atomic session-recorded OpenSSH origin pair for nodeID.
+func (p *Provider) NodeOpenSSHOrigin(nodeID string) OpenSSHOrigin {
+	if p == nil || nodeID == "" {
+		return OpenSSHOrigin{}
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.openSSHOrigins[nodeID]
+}
+
+// SetNodeOpenSSHOrigin atomically replaces the session-recorded OpenSSH origin
+// for nodeID without modifying persisted state. A zero origin clears the entry.
+func (p *Provider) SetNodeOpenSSHOrigin(nodeID string, origin OpenSSHOrigin) {
+	if p == nil || nodeID == "" {
+		return
+	}
+	norm := normalizeOpenSSHOrigin(origin)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if norm.IsZero() {
+		delete(p.openSSHOrigins, nodeID)
+		return
+	}
+	if p.openSSHOrigins == nil {
+		p.openSSHOrigins = make(map[string]OpenSSHOrigin)
+	}
+	p.openSSHOrigins[nodeID] = norm
+}
+
+// ClearNodeOpenSSHOrigin removes the session-recorded OpenSSH origin for nodeID.
+func (p *Provider) ClearNodeOpenSSHOrigin(nodeID string) {
+	if p == nil || nodeID == "" {
 		return
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.openSSHAliases == nil {
-		p.openSSHAliases = make(map[string]string)
+	delete(p.openSSHOrigins, nodeID)
+}
+
+// SetNodeOpenSSHAlias records the concrete OpenSSH Host alias from which nodeID
+// was derived during the current session without modifying persisted state.
+// Passing an empty alias clears the node's OpenSSH origin; changing the alias
+// clears any stale CanonicalHost from a prior alias.
+func (p *Provider) SetNodeOpenSSHAlias(nodeID, alias string) {
+	if p == nil || nodeID == "" {
+		return
 	}
-	p.openSSHAliases[nodeID] = alias
+	trimmed := strings.TrimSpace(alias)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if trimmed == "" {
+		delete(p.openSSHOrigins, nodeID)
+		return
+	}
+	if p.openSSHOrigins == nil {
+		p.openSSHOrigins = make(map[string]OpenSSHOrigin)
+	}
+	cur := p.openSSHOrigins[nodeID]
+	if cur.Alias != trimmed {
+		p.openSSHOrigins[nodeID] = OpenSSHOrigin{Alias: trimmed}
+	}
 }
 
 // NodeOpenSSHAlias returns the session-recorded OpenSSH Host alias for nodeID.
 func (p *Provider) NodeOpenSSHAlias(nodeID string) string {
-	if p == nil || nodeID == "" {
-		return ""
-	}
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.openSSHAliases[nodeID]
+	return p.NodeOpenSSHOrigin(nodeID).Alias
 }
 
 // SetNodeCanonicalHost records the hostname-canonicalized host for nodeID
 // during the current session without modifying persisted state.
 func (p *Provider) SetNodeCanonicalHost(nodeID, canonicalHost string) {
-	if p == nil || nodeID == "" || canonicalHost == "" {
+	if p == nil || nodeID == "" {
 		return
 	}
+	trimmed := strings.TrimSpace(canonicalHost)
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.canonicalHosts == nil {
-		p.canonicalHosts = make(map[string]string)
+	cur := p.openSSHOrigins[nodeID]
+	cur.CanonicalHost = trimmed
+	if cur.IsZero() {
+		delete(p.openSSHOrigins, nodeID)
+		return
 	}
-	p.canonicalHosts[nodeID] = canonicalHost
+	if p.openSSHOrigins == nil {
+		p.openSSHOrigins = make(map[string]OpenSSHOrigin)
+	}
+	p.openSSHOrigins[nodeID] = cur
 }
 
 // NodeCanonicalHost returns the session-recorded canonicalized host for nodeID.
 func (p *Provider) NodeCanonicalHost(nodeID string) string {
-	if p == nil || nodeID == "" {
-		return ""
-	}
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.canonicalHosts[nodeID]
+	return p.NodeOpenSSHOrigin(nodeID).CanonicalHost
 }
 
 func (p *Provider) setSavedNodeOpenSSHMetadataIfPresent(nodeID, alias, canonicalHost string) {
-	if p == nil || nodeID == "" || (alias == "" && canonicalHost == "") {
+	origin := normalizeOpenSSHOrigin(OpenSSHOrigin{Alias: alias, CanonicalHost: canonicalHost})
+	if p == nil || nodeID == "" || origin.IsZero() {
 		return
 	}
 	p.mu.Lock()
@@ -166,32 +310,48 @@ func (p *Provider) setSavedNodeOpenSSHMetadataIfPresent(nodeID, alias, canonical
 	if _, ok := p.cfg.Nodes.Get(nodeID); !ok {
 		return
 	}
-	p.setOpenSSHMetadataLocked(nodeID, alias, canonicalHost)
+	p.setOpenSSHOriginLocked(nodeID, origin)
 }
 
 func (p *Provider) setOpenSSHMetadataLocked(nodeID, alias, canonicalHost string) {
-	if alias != "" {
-		if p.openSSHAliases == nil {
-			p.openSSHAliases = make(map[string]string)
-		}
-		p.openSSHAliases[nodeID] = alias
-	}
-	if canonicalHost != "" {
-		if p.canonicalHosts == nil {
-			p.canonicalHosts = make(map[string]string)
-		}
-		p.canonicalHosts[nodeID] = canonicalHost
-	}
+	p.setOpenSSHOriginLocked(nodeID, OpenSSHOrigin{Alias: alias, CanonicalHost: canonicalHost})
 }
 
-func (p *Provider) clearNodeOpenSSHMetadata(nodeID string) {
-	if p == nil || nodeID == "" {
+func (p *Provider) setOpenSSHOriginLocked(nodeID string, origin OpenSSHOrigin) {
+	norm := normalizeOpenSSHOrigin(origin)
+	if norm.IsZero() {
 		return
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	delete(p.openSSHAliases, nodeID)
-	delete(p.canonicalHosts, nodeID)
+	if p.openSSHOrigins == nil {
+		p.openSSHOrigins = make(map[string]OpenSSHOrigin)
+	}
+	p.openSSHOrigins[nodeID] = norm
+}
+
+func (p *Provider) snapshotWithNodeOrigin(nodeID string) (*Configuration, OpenSSHOrigin) {
+	if p == nil {
+		return cloneConfiguration(nil), OpenSSHOrigin{}
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return cloneConfiguration(p.cfg), p.openSSHOrigins[nodeID]
+}
+
+func (p *Provider) snapshotWithOrigins() (*Configuration, map[string]OpenSSHOrigin) {
+	if p == nil {
+		return cloneConfiguration(nil), nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	snap := cloneConfiguration(p.cfg)
+	if len(p.openSSHOrigins) == 0 {
+		return snap, nil
+	}
+	origins := make(map[string]OpenSSHOrigin, len(p.openSSHOrigins))
+	for k, v := range p.openSSHOrigins {
+		origins[k] = v
+	}
+	return snap, origins
 }
 
 func resolveConfigNodeHostAddrPort(cfg *Configuration, nodeID string) (string, uint16, bool) {
@@ -210,27 +370,31 @@ func resolveConfigNodeHostAddrPort(cfg *Configuration, nodeID string) (string, u
 	return cleanAddr, normalizedHostPort(host.Port), true
 }
 
+func configHasNode(cfg *Configuration, nodeID string) bool {
+	if cfg == nil || cfg.Nodes == nil {
+		return false
+	}
+	_, ok := cfg.Nodes.Get(nodeID)
+	return ok
+}
+
 func (p *Provider) pruneStaleOpenSSHMetadataLocked(oldCfg, updated *Configuration) {
-	if p == nil || oldCfg == nil || oldCfg.Nodes == nil {
+	if p == nil {
 		return
 	}
-	pruneMap := func(m map[string]string) {
-		for nodeID := range m {
-			oldAddr, oldPort, hadOld := resolveConfigNodeHostAddrPort(oldCfg, nodeID)
-			if !hadOld {
-				if _, stillOld := oldCfg.Nodes.Get(nodeID); stillOld {
-					delete(m, nodeID)
-				}
-				continue
-			}
-			newAddr, newPort, hasNew := resolveConfigNodeHostAddrPort(updated, nodeID)
-			if !hasNew || !strings.EqualFold(oldAddr, newAddr) || oldPort != newPort {
-				delete(m, nodeID)
-			}
+	for nodeID := range p.openSSHOrigins {
+		oldAddr, oldPort, hadOld := resolveConfigNodeHostAddrPort(oldCfg, nodeID)
+		newAddr, newPort, hasNew := resolveConfigNodeHostAddrPort(updated, nodeID)
+		stale := false
+		if hadOld {
+			stale = !hasNew || !SameHostAddress(oldAddr, newAddr) || oldPort != newPort
+		} else if configHasNode(oldCfg, nodeID) || configHasNode(updated, nodeID) {
+			stale = true
+		}
+		if stale {
+			delete(p.openSSHOrigins, nodeID)
 		}
 	}
-	pruneMap(p.openSSHAliases)
-	pruneMap(p.canonicalHosts)
 }
 
 // Snapshot returns a deep copy that callers may retain and mutate freely.
@@ -264,6 +428,15 @@ func (p *Provider) ResolveSelector(input string) (string, error) {
 		return input, nil
 	}
 	candidates := slices.Clone(p.lookupIndex[input])
+	if len(candidates) == 0 {
+		if norm := normalizeLookupSelector(input); norm != "" && norm != input {
+			if _, ok := p.cfg.Nodes.Get(norm); ok {
+				p.mu.RUnlock()
+				return norm, nil
+			}
+			candidates = slices.Clone(p.lookupIndex[norm])
+		}
+	}
 	p.mu.RUnlock()
 
 	switch len(candidates) {
@@ -317,8 +490,7 @@ func (p *Provider) resolveWithProvenance(nodeID string) (models.Node, models.Hos
 	if node, ok := p.cfg.Nodes.Get(nodeID); ok {
 		host, hostOK := p.cfg.Hosts.Get(node.HostRef)
 		identity, identityOK := p.cfg.Identities.Get(node.IdentityRef)
-		openSSHAlias := p.openSSHAliases[nodeID]
-		canonicalHost := p.canonicalHosts[nodeID]
+		origin := p.openSSHOrigins[nodeID]
 		p.mu.RUnlock()
 		if !hostOK {
 			return models.Node{}, models.Host{}, models.Identity{}, ProvenanceUnknown, fmt.Errorf("host ref %q for node %q: %w", node.HostRef, nodeID, ErrHostNotFound)
@@ -327,16 +499,15 @@ func (p *Provider) resolveWithProvenance(nodeID string) (models.Node, models.Hos
 			return models.Node{}, models.Host{}, models.Identity{}, ProvenanceUnknown, fmt.Errorf("identity ref %q for node %q: %w", node.IdentityRef, nodeID, ErrIdentityNotFound)
 		}
 		clonedNode := cloneNode(node)
-		if clonedNode.OpenSSHAlias == "" {
-			clonedNode.OpenSSHAlias = openSSHAlias
-		}
-		if clonedNode.CanonicalHost == "" {
-			clonedNode.CanonicalHost = canonicalHost
+		if clonedNode.OpenSSHAlias == "" && clonedNode.CanonicalHost == "" {
+			clonedNode.OpenSSHAlias = origin.Alias
+			clonedNode.CanonicalHost = origin.CanonicalHost
 		}
 		return clonedNode, cloneHost(host), cloneIdentity(identity), ProvenanceSavedManaged, nil
 	}
-	openSSHAlias := p.openSSHAliases[nodeID]
-	canonicalHost := p.canonicalHosts[nodeID]
+	origin := p.openSSHOrigins[nodeID]
+	openSSHAlias := origin.Alias
+	canonicalHost := origin.CanonicalHost
 	p.mu.RUnlock()
 
 	if IsOpenSSHNodeID(nodeID) {
@@ -451,11 +622,10 @@ func (p *Provider) GetNode(nodeID string) (models.Node, bool) {
 	defer p.mu.RUnlock()
 	node, ok := p.cfg.Nodes.Get(nodeID)
 	cloned := cloneNode(node)
-	if ok && cloned.OpenSSHAlias == "" {
-		cloned.OpenSSHAlias = p.openSSHAliases[nodeID]
-	}
-	if ok && cloned.CanonicalHost == "" {
-		cloned.CanonicalHost = p.canonicalHosts[nodeID]
+	if ok && cloned.OpenSSHAlias == "" && cloned.CanonicalHost == "" {
+		origin := p.openSSHOrigins[nodeID]
+		cloned.OpenSSHAlias = origin.Alias
+		cloned.CanonicalHost = origin.CanonicalHost
 	}
 	return cloned, ok
 }
@@ -564,6 +734,58 @@ func removeUnusedRefs(cfg *Configuration, hostRef, identityRef string) {
 	}
 }
 
+func normalizeLookupSelector(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || IsOpenSSHNodeID(trimmed) {
+		return ""
+	}
+	if ref, err := ParseTargetRef(trimmed); err == nil && !ref.OpenSSH && ref.Host != "" {
+		normHost := NormalizeHostAddress(ref.Host)
+		if normHost != "" && normHost != ref.Host {
+			return TargetRef{
+				User:    ref.User,
+				Host:    normHost,
+				Port:    ref.Port,
+				HasPort: ref.HasPort,
+			}.NormalizedString()
+		}
+	}
+	if norm := NormalizeHostAddress(trimmed); norm != "" && norm != trimmed {
+		return norm
+	}
+	return ""
+}
+
+func lookupBySelector(lookup map[string][]string, key string) []string {
+	if candidates := lookup[key]; len(candidates) > 0 {
+		return candidates
+	}
+	if norm := normalizeLookupSelector(key); norm != "" && norm != key {
+		return lookup[norm]
+	}
+	return nil
+}
+
+func indexAddressLookups(lookup map[string][]string, user, address string, port uint16, nodeID string) {
+	cleanAddr := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(address), "]"), "[")
+	if cleanAddr == "" {
+		return
+	}
+	canonAddr := NormalizeHostAddress(cleanAddr)
+	variants := []string{cleanAddr}
+	if canonAddr != "" && canonAddr != cleanAddr {
+		variants = append(variants, canonAddr)
+	}
+	for _, addr := range variants {
+		addLookup(lookup, fmt.Sprintf("%s@%s", user, addr), nodeID)
+		addLookup(lookup, FormatNodeID(user, addr, port), nodeID)
+		if strings.Contains(addr, ":") {
+			addLookup(lookup, fmt.Sprintf("[%s]", addr), nodeID)
+			addLookup(lookup, fmt.Sprintf("%s@[%s]", user, addr), nodeID)
+		}
+	}
+}
+
 func buildIndexes(cfg *Configuration, rejectAliasConflicts bool) (map[string][]string, map[string]string, error) {
 	lookup := make(map[string][]string)
 	aliases := make(map[string]string)
@@ -583,6 +805,16 @@ func buildIndexes(cfg *Configuration, rejectAliasConflicts bool) (map[string][]s
 			continue
 		}
 		addLookup(lookup, host.Address, nodeID)
+		cleanHost := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(host.Address), "]"), "[")
+		addLookup(lookup, cleanHost, nodeID)
+		canonHost := NormalizeHostAddress(cleanHost)
+		addLookup(lookup, canonHost, nodeID)
+		if strings.Contains(cleanHost, ":") {
+			addLookup(lookup, fmt.Sprintf("[%s]", cleanHost), nodeID)
+		}
+		if canonHost != "" && strings.Contains(canonHost, ":") {
+			addLookup(lookup, fmt.Sprintf("[%s]", canonHost), nodeID)
+		}
 		for _, alias := range host.Alias {
 			if err := addAlias(lookup, aliases, alias, nodeID, rejectAliasConflicts); err != nil {
 				return nil, nil, err
@@ -597,13 +829,7 @@ func buildIndexes(cfg *Configuration, rejectAliasConflicts bool) (map[string][]s
 			if address == "" {
 				continue
 			}
-			cleanAddr := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(address), "]"), "[")
-			addLookup(lookup, fmt.Sprintf("%s@%s", user, cleanAddr), nodeID)
-			addLookup(lookup, FormatNodeID(user, cleanAddr, port), nodeID)
-			if strings.Contains(cleanAddr, ":") {
-				addLookup(lookup, fmt.Sprintf("[%s]", cleanAddr), nodeID)
-				addLookup(lookup, fmt.Sprintf("%s@[%s]", user, cleanAddr), nodeID)
-			}
+			indexAddressLookups(lookup, user, address, port, nodeID)
 		}
 		for _, alias := range node.Alias {
 			if alias == "" {

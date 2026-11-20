@@ -431,7 +431,10 @@ func assertPass7ScpExcludeAndRawPaths(t *testing.T, o *ScpOptions, repo *config.
 		t.Fatalf("excludeTargetInfoForPath(bare) = %+v, err=%v", exBare, err)
 	}
 
-	rawPaths := o.rawHostTargetPaths()
+	rawPaths, err := o.rawHostTargetPaths()
+	if err != nil {
+		t.Fatalf("rawHostTargetPaths failed: %v", err)
+	}
 	if len(rawPaths) != 2 ||
 		rawPaths[0].User != "alice" || rawPaths[0].Port != 2223 ||
 		rawPaths[1].User != "globaluser" || rawPaths[1].Port != 2200 {

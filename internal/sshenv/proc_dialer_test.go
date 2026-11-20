@@ -496,8 +496,19 @@ func TestRound4_P2_12_FallbackDeadlineClearsWithoutStaleCloseTOCTOU(t *testing.T
 			t.Fatalf("setFallbackDeadline(arm): %v", err)
 		}
 		time.Sleep(time.Millisecond)
-		if err := c.setFallbackDeadline(closer, time.Time{}, true); err != nil {
-			t.Fatalf("setFallbackDeadline(clear): %v", err)
+		clearErr := c.setFallbackDeadline(closer, time.Time{}, true)
+		if clearErr != nil {
+			if !errors.Is(clearErr, net.ErrClosed) {
+				t.Fatalf("setFallbackDeadline(clear): unexpected error %v", clearErr)
+			}
+			// Timer won the race and transitioned readFallbackClosed=true.
+			c.mu.Lock()
+			fbClosed := c.readFallbackClosed
+			c.mu.Unlock()
+			if !fbClosed {
+				t.Fatalf("setFallbackDeadline(clear) returned ErrClosed without readFallbackClosed=true")
+			}
+			continue
 		}
 		c.mu.Lock()
 		timedOut := c.readTimedOut
@@ -506,12 +517,111 @@ func TestRound4_P2_12_FallbackDeadlineClearsWithoutStaleCloseTOCTOU(t *testing.T
 			t.Fatalf("readTimedOut stayed true immediately after clearing deadline under mutex serialization")
 		}
 		time.Sleep(2 * time.Millisecond)
-		// If timer already fired before clear, closed == 1 and readTimedOut was true BEFORE clear, not set after.
 		c.mu.Lock()
 		timedOutAfter := c.readTimedOut
 		c.mu.Unlock()
 		if timedOutAfter {
 			t.Fatalf("stale timer mutated readTimedOut after clear")
 		}
+		if closer.closed.Load() != 0 {
+			t.Fatalf("stale timer closed pipe %d times after clear succeeded", closer.closed.Load())
+		}
+	}
+}
+
+type blockingCloser struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingCloser) Close() error {
+	b.once.Do(func() { close(b.entered) })
+	<-b.release
+	return nil
+}
+
+func TestRound5_P2_5_SetFallbackDeadlineUnlocksBeforeClose(t *testing.T) {
+	t.Parallel()
+
+	closer := &blockingCloser{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	c := &ProcessStdioConn{}
+	if err := c.setFallbackDeadline(closer, time.Now().Add(5*time.Millisecond), true); err != nil {
+		t.Fatalf("setFallbackDeadline(arm): %v", err)
+	}
+
+	select {
+	case <-closer.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for fallback timeout to invoke closer.Close()")
+	}
+
+	// Clearing the deadline or setting a future deadline while closer.Close() is
+	// blocked MUST NOT deadlock waiting for c.mu and MUST deterministically report
+	// net.ErrClosed once the fallback direction has timed out (Decision R6-3.A).
+	clearDone := make(chan error, 1)
+	go func() {
+		clearDone <- c.setFallbackDeadline(closer, time.Time{}, true)
+	}()
+	select {
+	case err := <-clearDone:
+		if !errors.Is(err, net.ErrClosed) {
+			close(closer.release)
+			t.Fatalf("setFallbackDeadline(clear) = %v, want net.ErrClosed", err)
+		}
+	case <-time.After(2 * time.Second):
+		close(closer.release)
+		t.Fatal("setFallbackDeadline(clear) deadlocked while closer.Close() was blocked")
+	}
+
+	futureErr := c.setFallbackDeadline(closer, time.Now().Add(time.Minute), true)
+	if !errors.Is(futureErr, net.ErrClosed) {
+		close(closer.release)
+		t.Fatalf("setFallbackDeadline(future) after fallback close = %v, want net.ErrClosed", futureErr)
+	}
+
+	// Opposite direction (write) stays unaffected.
+	if wErr := c.setFallbackDeadline(nil, time.Time{}, false); wErr != nil {
+		close(closer.release)
+		t.Fatalf("write setFallbackDeadline(clear) = %v, want nil", wErr)
+	}
+
+	normErr := c.normalizeIOError(fmt.Errorf("read: %w", os.ErrClosed), true)
+	if !errors.Is(normErr, os.ErrDeadlineExceeded) {
+		close(closer.release)
+		t.Fatalf("normalizeIOError = %v, want wrapped os.ErrDeadlineExceeded (sticky readFallbackClosed)", normErr)
+	}
+
+	close(closer.release)
+}
+
+func TestRound6_P2_3_FallbackPastDeadlineInitialNilThenErrClosed(t *testing.T) {
+	t.Parallel()
+
+	closer := &trackingCloser{}
+	c := &ProcessStdioConn{}
+	if err := c.setFallbackDeadline(closer, time.Now().Add(-time.Second), true); err != nil {
+		t.Fatalf("initial past setFallbackDeadline = %v, want nil", err)
+	}
+	if closer.closed.Load() != 1 {
+		t.Fatalf("closer.Close calls = %d, want 1", closer.closed.Load())
+	}
+	for _, tc := range []struct {
+		name string
+		ts   time.Time
+	}{
+		{"clear", time.Time{}},
+		{"future", time.Now().Add(time.Minute)},
+		{"past-again", time.Now().Add(-time.Second)},
+	} {
+		if err := c.setFallbackDeadline(closer, tc.ts, true); !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("post-fallback setFallbackDeadline(%s) = %v, want net.ErrClosed", tc.name, err)
+		}
+	}
+	if closer.closed.Load() != 1 {
+		t.Fatalf("subsequent setFallbackDeadline called Close again: %d", closer.closed.Load())
 	}
 }

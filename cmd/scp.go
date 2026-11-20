@@ -996,7 +996,9 @@ func (o *ScpOptions) appendOverriddenExcludeHost(info *cmdutils.ExcludeTargetInf
 }
 
 func (o *ScpOptions) excludeTargetInfoForPath(provider config.ConfigProvider, rawHost string, canonAddr PathInfo) (cmdutils.ExcludeTargetInfo, error) {
-	_ = o.ensureGeneralOptionsApplied()
+	if err := o.ensureGeneralOptionsApplied(); err != nil {
+		return cmdutils.ExcludeTargetInfo{}, err
+	}
 	user, _, port, _ := o.resolveUserAndPort(canonAddr)
 	info := cmdutils.ExcludeTargetInfo{
 		User:           user,
@@ -1165,10 +1167,17 @@ func (o *ScpOptions) prepareRemoteToRemoteFile(ctx context.Context, dstSftp *sft
 }
 
 func (o *ScpOptions) canonicalizeEndpoints(ctx context.Context, provider config.ConfigProvider) error {
+	if err := o.ensureGeneralOptionsApplied(); err != nil {
+		return err
+	}
 	if provider == nil {
 		return nil
 	}
-	for _, p := range o.rawTargetPaths(provider) {
+	rawPaths, err := o.rawTargetPaths(provider)
+	if err != nil {
+		return err
+	}
+	for _, p := range rawPaths {
 		if _, err := o.canonicalizePathInfo(ctx, provider, p); err != nil {
 			return err
 		}
@@ -1189,6 +1198,9 @@ func (o *ScpOptions) canonicalCacheKey(p PathInfo) string {
 }
 
 func (o *ScpOptions) canonicalizePathInfo(ctx context.Context, provider config.ConfigProvider, p PathInfo) (PathInfo, error) {
+	if err := o.ensureGeneralOptionsApplied(); err != nil {
+		return p, err
+	}
 	if p.Host == "" {
 		return p, nil
 	}
@@ -1543,6 +1555,9 @@ func (o *ScpOptions) appendScpSessionControlOptions(adpOpts *[]adapter.Option, t
 }
 
 func (o *ScpOptions) appendScpSessionAuthOverrides(adpOpts *[]adapter.Option, provider config.ConfigProvider, shouldRemember, suppressConfirm bool) error {
+	if err := o.ensureGeneralOptionsApplied(); err != nil {
+		return err
+	}
 	var excludes map[string]struct{}
 	if provider != nil && len(o.Exclude) > 0 {
 		var err error
@@ -1551,8 +1566,11 @@ func (o *ScpOptions) appendScpSessionAuthOverrides(adpOpts *[]adapter.Option, pr
 			return fmt.Errorf("%s: %w", i18n.T("scp_err_exclude"), err)
 		}
 	}
-	targetPaths := o.collectTargetPathsWithExcludes(provider, excludes)
-	targetNodes, nodeOriginalHosts, expandHosts := o.resolvedTargetNodeIDsWithHostsForPaths(provider, targetPaths)
+	targetPaths, err := o.collectTargetPathsWithExcludesChecked(provider, excludes)
+	if err != nil {
+		return err
+	}
+	targetNodes, nodeOriginalHosts, expandHosts, nodeCanonHosts := o.resolvedTargetNodeIDsWithHostsAndCanonForPaths(provider, targetPaths)
 	o.targetNodeIDs = targetNodes
 	distinctHosts := o.distinctRemoteHostsForPaths(provider, targetPaths)
 	if len(distinctHosts) > 1 {
@@ -1578,6 +1596,9 @@ func (o *ScpOptions) appendScpSessionAuthOverrides(adpOpts *[]adapter.Option, pr
 			nodeAuth.SuppressNodeConfirmation = suppressConfirm
 			if origHost := nodeOriginalHosts[nodeID]; origHost != "" {
 				nodeAuth.OriginalHost = origHost
+			}
+			if canonHost := nodeCanonHosts[nodeID]; canonHost != "" {
+				nodeAuth.CanonicalHost = canonHost
 			}
 			*adpOpts = append(*adpOpts, adapter.WithSessionAuthOverride(nodeID, nodeAuth))
 		}
@@ -1688,15 +1709,21 @@ func (o *ScpOptions) resolvedTargetNodeIDsWithHosts(provider config.ConfigProvid
 }
 
 func (o *ScpOptions) resolvedTargetNodeIDsWithHostsForPaths(provider config.ConfigProvider, targetPaths []PathInfo) ([]string, map[string]string, map[string]string) {
+	nodeIDs, originals, expandHosts, _ := o.resolvedTargetNodeIDsWithHostsAndCanonForPaths(provider, targetPaths)
+	return nodeIDs, originals, expandHosts
+}
+
+func (o *ScpOptions) resolvedTargetNodeIDsWithHostsAndCanonForPaths(provider config.ConfigProvider, targetPaths []PathInfo) ([]string, map[string]string, map[string]string, map[string]string) {
 	if provider == nil {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	var nodeIDs []string
 	originals := make(map[string]string)
 	expandHosts := make(map[string]string)
+	canonHosts := make(map[string]string)
 	seen := make(map[string]struct{})
 	for _, p := range targetPaths {
-		target, origHost, expandHost, ok := o.resolvePathTargetAndHosts(provider, p)
+		target, origHost, expandHost, canonHost, ok := o.resolvePathTargetDetails(provider, p)
 		if !ok {
 			continue
 		}
@@ -1711,6 +1738,9 @@ func (o *ScpOptions) resolvedTargetNodeIDsWithHostsForPaths(provider config.Conf
 			if expandHost != "" && expandHosts[id] == "" {
 				expandHosts[id] = expandHost
 			}
+			if canonHost != "" && canonHosts[id] == "" {
+				canonHosts[id] = canonHost
+			}
 			if origHost != "" && originals[id] == "" {
 				originals[id] = origHost
 			} else if originals[id] == "" {
@@ -1720,12 +1750,18 @@ func (o *ScpOptions) resolvedTargetNodeIDsWithHostsForPaths(provider config.Conf
 			}
 		}
 	}
-	return nodeIDs, originals, expandHosts
+	return nodeIDs, originals, expandHosts, canonHosts
 }
 
 func (o *ScpOptions) resolvePathTargetAndHosts(provider config.ConfigProvider, p PathInfo) (config.ConnectionTarget, string, string, bool) {
+	target, origHost, expandHost, _, ok := o.resolvePathTargetDetails(provider, p)
+	return target, origHost, expandHost, ok
+}
+
+func (o *ScpOptions) resolvePathTargetDetails(provider config.ConfigProvider, p PathInfo) (config.ConnectionTarget, string, string, string, bool) {
 	canonOriginalHost := p.OriginalHost
 	canonicalized := canonOriginalHost != ""
+	canonHost := ""
 	o.canonicalMu.Lock()
 	res, ok := o.canonicalCache[o.canonicalCacheKey(p)]
 	o.canonicalMu.Unlock()
@@ -1734,16 +1770,20 @@ func (o *ScpOptions) resolvePathTargetAndHosts(provider config.ConfigProvider, p
 		if canonOriginalHost == "" {
 			canonOriginalHost = res.OriginalHost
 		}
+		canonHost = res.CanonicalHost
 		p.OriginalHost = canonOriginalHost
 		p.Host = res.CanonicalHost
 	}
 	target, err := o.resolveTargetForPath(p)
 	if err != nil || target.Selector == "" {
-		return config.ConnectionTarget{}, "", "", false
+		return config.ConnectionTarget{}, "", "", "", false
 	}
 	resolved, rErr := config.ResolveTarget(provider, target)
 	origHost, expandHost := resolveTargetOriginalAndExpandHosts(canonicalized, canonOriginalHost, target.Selector, resolved, rErr == nil)
-	return target, origHost, expandHost, true
+	if canonHost == "" && rErr == nil {
+		canonHost = resolved.CanonicalHost
+	}
+	return target, origHost, expandHost, canonHost, true
 }
 
 func (o *ScpOptions) cachedCanonicalPathInfo(p PathInfo) PathInfo {
@@ -1769,30 +1809,30 @@ func (o *ScpOptions) isCollectedPathExcluded(provider config.ConfigProvider, exc
 	return exErr == nil && excluded
 }
 
-func (o *ScpOptions) rawHostTargetPaths() []PathInfo {
-	var paths []PathInfo
-	appendHostPath := func(p PathInfo) {
+func (o *ScpOptions) rawHostTargetPaths() ([]PathInfo, error) {
+	if err := o.ensureGeneralOptionsApplied(); err != nil {
+		return nil, err
+	}
+	hosts, err := cmdutils.ParseHosts(o.Host, o.HostFile, "")
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]PathInfo, 0, len(hosts))
+	for _, h := range hosts {
+		p := PathInfo{Host: strings.TrimSpace(h.Host), User: h.User, Port: h.Port, IsRemote: true}
 		if p.Host == "" {
-			return
+			continue
 		}
 		p.User, _, p.Port, _ = o.resolveUserAndPort(p)
 		paths = append(paths, p)
 	}
-	if hosts, err := cmdutils.ParseHosts(o.Host, o.HostFile, ""); err == nil {
-		for _, h := range hosts {
-			appendHostPath(PathInfo{Host: h.Host, User: h.User, Port: h.Port, IsRemote: true})
-		}
-		return paths
-	}
-	if o.Host != "" {
-		for h := range strings.SplitSeq(o.Host, ",") {
-			appendHostPath(PathInfo{Host: strings.TrimSpace(h), IsRemote: true})
-		}
-	}
-	return paths
+	return paths, nil
 }
 
-func (o *ScpOptions) rawTargetPaths(provider config.ConfigProvider) []PathInfo {
+func (o *ScpOptions) rawTargetPaths(provider config.ConfigProvider) ([]PathInfo, error) {
+	if err := o.ensureGeneralOptionsApplied(); err != nil {
+		return nil, err
+	}
 	var paths []PathInfo
 	if o.Tag != "" && provider != nil {
 		for _, nodeID := range slices.Sorted(maps.Keys(provider.GetNodesByTag(o.Tag))) {
@@ -1800,40 +1840,75 @@ func (o *ScpOptions) rawTargetPaths(provider config.ConfigProvider) []PathInfo {
 		}
 	}
 	if o.Host != "" || o.HostFile != "" {
-		paths = append(paths, o.rawHostTargetPaths()...)
+		hostPaths, err := o.rawHostTargetPaths()
+		if err != nil {
+			return nil, err
+		}
+		paths = append(paths, hostPaths...)
 	}
 	if o.Host == "" && o.Tag == "" && o.HostFile == "" {
-		if src, err := parsePath(o.Source); err == nil && src.IsRemote {
-			paths = append(paths, src)
+		if o.Source != "" {
+			src, err := parsePath(o.Source)
+			if err != nil {
+				return nil, fmt.Errorf("parse source path failed: %w", err)
+			}
+			if src.IsRemote {
+				paths = append(paths, src)
+			}
 		}
-		if dst, err := parsePath(o.Dest); err == nil && dst.IsRemote {
-			paths = append(paths, dst)
+		if o.Dest != "" {
+			dst, err := parsePath(o.Dest)
+			if err != nil {
+				return nil, fmt.Errorf("parse dest path failed: %w", err)
+			}
+			if dst.IsRemote {
+				paths = append(paths, dst)
+			}
 		}
 	}
-	return paths
+	return paths, nil
 }
 
 func (o *ScpOptions) resolveExcludes(provider config.ConfigProvider) (map[string]struct{}, error) {
+	if err := o.ensureGeneralOptionsApplied(); err != nil {
+		return nil, err
+	}
 	if len(o.Exclude) == 0 {
 		return nil, nil
 	}
-	candidates := o.buildExcludeCandidates(provider)
+	candidates, err := o.buildExcludeCandidatesChecked(provider)
+	if err != nil {
+		return nil, err
+	}
 	return cmdutils.ResolveExcludesForTargetsWithOptions(provider, cmdutils.ParseExcludeFlag(o.Exclude), candidates, o.control.Options, o.effectiveCLIJumpHost())
 }
 
 func (o *ScpOptions) buildExcludeCandidates(provider config.ConfigProvider) []cmdutils.ExcludeTargetInfo {
-	rawPaths := o.rawTargetPaths(provider)
+	candidates, err := o.buildExcludeCandidatesChecked(provider)
+	if err != nil {
+		return nil
+	}
+	return candidates
+}
+
+func (o *ScpOptions) buildExcludeCandidatesChecked(provider config.ConfigProvider) ([]cmdutils.ExcludeTargetInfo, error) {
+	rawPaths, err := o.rawTargetPaths(provider)
+	if err != nil {
+		return nil, err
+	}
 	candidates := make([]cmdutils.ExcludeTargetInfo, 0, len(rawPaths))
 	for _, p := range rawPaths {
 		if p.Host == "" {
 			continue
 		}
 		canonP := o.cachedCanonicalPathInfo(p)
-		if info, err := o.excludeTargetInfoForPath(provider, p.Host, canonP); err == nil {
-			candidates = append(candidates, info)
+		info, infoErr := o.excludeTargetInfoForPath(provider, p.Host, canonP)
+		if infoErr != nil {
+			return nil, infoErr
 		}
+		candidates = append(candidates, info)
 	}
-	return candidates
+	return candidates, nil
 }
 
 func (o *ScpOptions) collectTargetPaths(provider config.ConfigProvider) []PathInfo {
@@ -1847,14 +1922,25 @@ func (o *ScpOptions) collectTargetPaths(provider config.ConfigProvider) []PathIn
 }
 
 func (o *ScpOptions) collectTargetPathsWithExcludes(provider config.ConfigProvider, excludes map[string]struct{}) []PathInfo {
-	rawPaths := o.rawTargetPaths(provider)
+	paths, err := o.collectTargetPathsWithExcludesChecked(provider, excludes)
+	if err != nil {
+		return nil
+	}
+	return paths
+}
+
+func (o *ScpOptions) collectTargetPathsWithExcludesChecked(provider config.ConfigProvider, excludes map[string]struct{}) ([]PathInfo, error) {
+	rawPaths, err := o.rawTargetPaths(provider)
+	if err != nil {
+		return nil, err
+	}
 	paths := make([]PathInfo, 0, len(rawPaths))
 	for _, p := range rawPaths {
 		if !o.isCollectedPathExcluded(provider, excludes, p) {
 			paths = append(paths, p)
 		}
 	}
-	return paths
+	return paths, nil
 }
 
 func targetCandidateNodeIDs(provider config.ConfigProvider, target config.ConnectionTarget) []string {

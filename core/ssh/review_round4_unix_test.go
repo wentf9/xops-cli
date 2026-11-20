@@ -176,20 +176,42 @@ func TestRound4_P2_7_CopyStdinToPreservesNonBlockAndRetriesEAGAIN(t *testing.T) 
 
 	var out bytes.Buffer
 	var outMu sync.Mutex
-	w := &lockedBufWriter{buf: &out, mu: &outMu}
+	notify := make(chan struct{}, 16)
+	w := &lockedBufWriter{buf: &out, mu: &outMu, notify: notify}
 
 	cancel, done, err := copyStdinTo(rFile, w)
 	if err != nil {
 		t.Fatalf("copyStdinTo: %v", err)
 	}
+	waitOut := func(want string) {
+		t.Helper()
+		deadline := time.NewTimer(2 * time.Second)
+		defer deadline.Stop()
+		for {
+			outMu.Lock()
+			got := out.String()
+			outMu.Unlock()
+			if got == want {
+				return
+			}
+			select {
+			case <-notify:
+			case <-deadline.C:
+				outMu.Lock()
+				cur := out.String()
+				outMu.Unlock()
+				t.Fatalf("timed out waiting for %q, got %q", want, cur)
+			}
+		}
+	}
 	if _, err := wFile.Write([]byte("chunk-1")); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(30 * time.Millisecond)
+	waitOut("chunk-1")
 	if _, err := wFile.Write([]byte("chunk-2")); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(30 * time.Millisecond)
+	waitOut("chunk-1chunk-2")
 	_ = cancel()
 	if cErr := <-done; cErr != nil {
 		t.Fatalf("copyStdinTo returned error: %v", cErr)
@@ -212,14 +234,22 @@ func TestRound4_P2_7_CopyStdinToPreservesNonBlockAndRetriesEAGAIN(t *testing.T) 
 }
 
 type lockedBufWriter struct {
-	mu  *sync.Mutex
-	buf *bytes.Buffer
+	mu     *sync.Mutex
+	buf    *bytes.Buffer
+	notify chan struct{}
 }
 
 func (w *lockedBufWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.buf.Write(p)
+	n, err := w.buf.Write(p)
+	w.mu.Unlock()
+	if w.notify != nil && n > 0 {
+		select {
+		case w.notify <- struct{}{}:
+		default:
+		}
+	}
+	return n, err
 }
 
 func TestRound4_P2_3_BlockingSocketOutputDoesNotBlockOnDisconnect(t *testing.T) {
@@ -244,7 +274,8 @@ func TestRound4_P2_3_BlockingSocketOutputDoesNotBlockOnDisconnect(t *testing.T) 
 		done <- copyToPollableFD(sockW, src, stop)
 	}()
 
-	time.Sleep(50 * time.Millisecond)
+	cSock, _ := sockW.SyscallConn()
+	_ = cSock.Control(func(fd uintptr) { waitPipeWriteBackpressured(t, int(fd)) })
 	close(stop)
 	close(srcDone)
 	select {
@@ -279,6 +310,13 @@ func TestRound4_P2_3_SharedBlockingPipeSerializedFallbackDoesNotBlock(t *testing
 	// Put shared pipe write end in blocking mode to force shared blocking fallback.
 	c1, _ := wPipe1.SyscallConn()
 	_ = c1.Control(func(fd uintptr) { _ = unix.SetNonblock(int(fd), false) })
+	_, owned, _, needSharedLock, _, targetErr := preparePollableWriteTarget(wPipe1, false)
+	if owned != nil {
+		_ = owned.Close()
+	}
+	if targetErr != nil || !needSharedLock {
+		t.Fatalf("preparePollableWriteTarget(allowReopen=false) = (needSharedLock=%v, err=%v), want (true, nil)", needSharedLock, targetErr)
+	}
 
 	stop := make(chan struct{})
 	srcDone := make(chan struct{})
@@ -287,11 +325,11 @@ func TestRound4_P2_3_SharedBlockingPipeSerializedFallbackDoesNotBlock(t *testing
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_ = copyToPollableFDSerialized(wPipe1, &blockingFloodReader{done: srcDone}, stop, &sharedMu)
+		_ = copyToPollableFDWithReopen(wPipe1, &blockingFloodReader{done: srcDone}, stop, &sharedMu, false)
 	}()
 	go func() {
 		defer wg.Done()
-		_ = copyToPollableFDSerialized(wPipe2, &blockingFloodReader{done: srcDone}, stop, &sharedMu)
+		_ = copyToPollableFDWithReopen(wPipe2, &blockingFloodReader{done: srcDone}, stop, &sharedMu, false)
 	}()
 
 	_ = c1.Control(func(fd uintptr) { waitPipeWriteBackpressured(t, int(fd)) })

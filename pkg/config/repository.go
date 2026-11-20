@@ -147,7 +147,7 @@ func newRepository(cfg *Configuration, store Store, parser *OpenSSHParser) (*Rep
 	if store == nil {
 		return nil, fmt.Errorf("configuration store is nil")
 	}
-	cloned := cloneConfiguration(cfg)
+	cloned, origins := cloneConfigurationExtractingMetadata(cfg)
 	lookup, aliases, err := buildIndexes(cloned, true)
 	if err != nil {
 		return nil, fmt.Errorf("validate configuration indexes: %w", err)
@@ -157,10 +157,11 @@ func newRepository(cfg *Configuration, store Store, parser *OpenSSHParser) (*Rep
 	}
 	return &Repository{
 		provider: &Provider{
-			cfg:         cloned,
-			lookupIndex: lookup,
-			aliasIndex:  aliases,
-			openSSH:     parser,
+			cfg:            cloned,
+			lookupIndex:    lookup,
+			aliasIndex:     aliases,
+			openSSH:        parser,
+			openSSHOrigins: origins,
 		},
 		store: store,
 	}, nil
@@ -326,7 +327,7 @@ func (r *Repository) ResolveConnection(nodeID string) (ConnectionSnapshot, error
 	}
 
 	provider, pendingProv := r.connectionProviderWithProvenance(nodeID)
-	configuration := provider.Snapshot()
+	configuration, origin := provider.snapshotWithNodeOrigin(nodeID)
 	if node, exists := configuration.Nodes.Get(nodeID); exists {
 		host, hostExists := configuration.Hosts.Get(node.HostRef)
 		if !hostExists {
@@ -345,11 +346,9 @@ func (r *Repository) ResolveConnection(nodeID string) (ConnectionSnapshot, error
 			return ConnectionSnapshot{}, fmt.Errorf("resolve sudo version for node %q: %w", nodeID, err)
 		}
 		clonedNode := cloneNode(node)
-		if clonedNode.OpenSSHAlias == "" && provider != nil {
-			clonedNode.OpenSSHAlias = provider.NodeOpenSSHAlias(nodeID)
-		}
-		if clonedNode.CanonicalHost == "" && provider != nil {
-			clonedNode.CanonicalHost = provider.NodeCanonicalHost(nodeID)
+		if clonedNode.OpenSSHAlias == "" && clonedNode.CanonicalHost == "" {
+			clonedNode.OpenSSHAlias = origin.Alias
+			clonedNode.CanonicalHost = origin.CanonicalHost
 		}
 		var updateRef *ConnectionUpdateRef
 		if !IsOpenSSHNodeID(nodeID) {
@@ -393,6 +392,42 @@ func (r *Repository) ResolveConnectionWithOrigin(nodeID, originalHost string) (C
 	return r.provider.ResolveConnectionWithOrigin(nodeID, originalHost)
 }
 
+func (r *Repository) snapshotWithOrigins() (*Configuration, map[string]OpenSSHOrigin) {
+	if r == nil || r.provider == nil {
+		return cloneConfiguration(nil), nil
+	}
+	return r.provider.snapshotWithOrigins()
+}
+
+// NodeOpenSSHOrigin returns the atomic session-recorded OpenSSH origin pair for nodeID.
+func (r *Repository) NodeOpenSSHOrigin(nodeID string) OpenSSHOrigin {
+	if r == nil {
+		return OpenSSHOrigin{}
+	}
+	provider, _ := r.connectionProviderWithProvenance(nodeID)
+	if provider == nil {
+		return OpenSSHOrigin{}
+	}
+	return provider.NodeOpenSSHOrigin(nodeID)
+}
+
+// SetNodeOpenSSHOrigin atomically replaces the session-recorded OpenSSH origin
+// for nodeID without modifying persisted state.
+func (r *Repository) SetNodeOpenSSHOrigin(nodeID string, origin OpenSSHOrigin) {
+	if r == nil || r.provider == nil {
+		return
+	}
+	r.provider.SetNodeOpenSSHOrigin(nodeID, origin)
+}
+
+// ClearNodeOpenSSHOrigin removes the session-recorded OpenSSH origin for nodeID.
+func (r *Repository) ClearNodeOpenSSHOrigin(nodeID string) {
+	if r == nil || r.provider == nil {
+		return
+	}
+	r.provider.ClearNodeOpenSSHOrigin(nodeID)
+}
+
 // SetNodeOpenSSHAlias records the concrete OpenSSH Host alias from which nodeID
 // was derived during the current session without modifying persisted state.
 func (r *Repository) SetNodeOpenSSHAlias(nodeID, alias string) {
@@ -404,14 +439,7 @@ func (r *Repository) SetNodeOpenSSHAlias(nodeID, alias string) {
 
 // NodeOpenSSHAlias returns the session-recorded OpenSSH Host alias for nodeID.
 func (r *Repository) NodeOpenSSHAlias(nodeID string) string {
-	if r == nil {
-		return ""
-	}
-	provider, _ := r.connectionProviderWithProvenance(nodeID)
-	if provider == nil {
-		return ""
-	}
-	return provider.NodeOpenSSHAlias(nodeID)
+	return r.NodeOpenSSHOrigin(nodeID).Alias
 }
 
 // SetNodeCanonicalHost records the canonicalized host for nodeID without modifying persisted state.
@@ -424,14 +452,7 @@ func (r *Repository) SetNodeCanonicalHost(nodeID, canonicalHost string) {
 
 // NodeCanonicalHost returns the session-recorded canonicalized host for nodeID.
 func (r *Repository) NodeCanonicalHost(nodeID string) string {
-	if r == nil {
-		return ""
-	}
-	provider, _ := r.connectionProviderWithProvenance(nodeID)
-	if provider == nil {
-		return ""
-	}
-	return provider.NodeCanonicalHost(nodeID)
+	return r.NodeOpenSSHOrigin(nodeID).CanonicalHost
 }
 
 func versionFromString(value string) (Version, error) {
@@ -617,6 +638,7 @@ func prepareConfiguration(base *Configuration, fn func(*Configuration) error) (*
 	if err := fn(updated); err != nil {
 		return nil, nil, nil, err
 	}
+	stripTransientNodeMetadata(updated)
 	lookup, aliases, err := buildIndexes(updated, true)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("validate configuration indexes: %w", err)
@@ -637,13 +659,12 @@ func (r *Repository) publishWithAction(
 	aliases map[string]string,
 	action *publishAction,
 ) {
-	needPendingLock := action != nil && (action.beforeProviderLocked != nil || action.afterProviderLocked != nil)
-	if needPendingLock {
-		r.pendingMu.Lock()
-		defer r.pendingMu.Unlock()
-		if action.beforeProviderLocked != nil {
-			action.beforeProviderLocked()
-		}
+	stripTransientNodeMetadata(updated)
+
+	r.pendingMu.Lock()
+	defer r.pendingMu.Unlock()
+	if action != nil && action.beforeProviderLocked != nil {
+		action.beforeProviderLocked()
 	}
 
 	r.provider.mu.Lock()
@@ -657,8 +678,15 @@ func (r *Repository) publishWithAction(
 	}
 	r.provider.mu.Unlock()
 
-	if needPendingLock && action.afterProviderLocked != nil {
+	if action != nil && action.afterProviderLocked != nil {
 		action.afterProviderLocked()
+	}
+	if updated != nil && updated.Nodes != nil {
+		for pendingID := range r.pending {
+			if _, saved := updated.Nodes.Get(pendingID); saved {
+				delete(r.pending, pendingID)
+			}
+		}
 	}
 	r.revision.Add(1)
 }
@@ -734,7 +762,22 @@ func (r *Repository) CreateNodeContext(ctx context.Context, nodeID string, node 
 	if err := ValidateNodeAliases(node.Alias); err != nil {
 		return NodeMutation{}, err
 	}
-	result, err := r.commitResultContext(ctx, anyRevision, func(cfg *Configuration) error {
+	initAlias := strings.TrimSpace(node.OpenSSHAlias)
+	initCanon := strings.TrimSpace(node.CanonicalHost)
+	var action *publishAction
+	if initAlias != "" || initCanon != "" {
+		action = &publishAction{
+			applyProviderLocked: func(p *Provider, updated *Configuration) {
+				if p == nil || updated == nil || updated.Nodes == nil {
+					return
+				}
+				if _, exists := updated.Nodes.Get(nodeID); exists {
+					p.setOpenSSHMetadataLocked(nodeID, initAlias, initCanon)
+				}
+			},
+		}
+	}
+	result, err := r.commitResultWithPublishAction(ctx, anyRevision, func(cfg *Configuration) error {
 		if _, exists := cfg.Nodes.Get(nodeID); exists {
 			return fmt.Errorf("create node %q: %w", nodeID, ErrConfigConflict)
 		}
@@ -752,9 +795,12 @@ func (r *Repository) CreateNodeContext(ctx context.Context, nodeID string, node 
 		} else {
 			cfg.Identities.Set(node.IdentityRef, identity)
 		}
-		cfg.Nodes.Set(nodeID, cloneNode(node))
+		storedNode := cloneNode(node)
+		storedNode.OpenSSHAlias = ""
+		storedNode.CanonicalHost = ""
+		cfg.Nodes.Set(nodeID, storedNode)
 		return nil
-	})
+	}, action)
 	mutation.Outcome = MutationOutcome{Applied: result.Applied, Durable: result.Durable}
 	if !result.Applied {
 		return mutation, err
@@ -1146,7 +1192,7 @@ func findImportedProxyByConnection(cfg *Configuration, hop string) (string, bool
 		}
 		host, hostExists := cfg.Hosts.Get(node.HostRef)
 		identity, identityExists := cfg.Identities.Get(node.IdentityRef)
-		if !hostExists || !identityExists || host.Address != hostName {
+		if !hostExists || !identityExists || !SameHostAddress(host.Address, hostName) {
 			continue
 		}
 		if port != 0 && normalizedHostPort(host.Port) != normalizedHostPort(port) {
@@ -1360,6 +1406,31 @@ func (r *frozenRepository) GetOpenSSHParser() *OpenSSHParser {
 		return src.GetOpenSSHParser()
 	}
 	return nil
+}
+
+func (r *frozenRepository) snapshotWithOrigins() (*Configuration, map[string]OpenSSHOrigin) {
+	if r == nil || r.ConfigProvider == nil {
+		return cloneConfiguration(nil), nil
+	}
+	if src, ok := r.ConfigProvider.(interface {
+		snapshotWithOrigins() (*Configuration, map[string]OpenSSHOrigin)
+	}); ok {
+		return src.snapshotWithOrigins()
+	}
+	return r.Snapshot(), nil
+}
+
+func (r *frozenRepository) NodeOpenSSHOrigin(nodeID string) OpenSSHOrigin {
+	if r == nil || r.ConfigProvider == nil {
+		return OpenSSHOrigin{}
+	}
+	if store, ok := r.ConfigProvider.(interface{ NodeOpenSSHOrigin(string) OpenSSHOrigin }); ok {
+		return store.NodeOpenSSHOrigin(nodeID)
+	}
+	return OpenSSHOrigin{
+		Alias:         r.NodeOpenSSHAlias(nodeID),
+		CanonicalHost: r.NodeCanonicalHost(nodeID),
+	}
 }
 
 func (r *frozenRepository) NodeOpenSSHAlias(nodeID string) string {

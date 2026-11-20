@@ -44,14 +44,16 @@ type ProcessStdioConn struct {
 	spontaneousExit   atomic.Bool
 	stdoutEOF         atomic.Bool
 
-	mu            sync.Mutex
-	closed        bool
-	readTimer     *time.Timer
-	writeTimer    *time.Timer
-	readGen       uint64
-	writeGen      uint64
-	readTimedOut  bool
-	writeTimedOut bool
+	mu                  sync.Mutex
+	closed              bool
+	readTimer           *time.Timer
+	writeTimer          *time.Timer
+	readGen             uint64
+	writeGen            uint64
+	readTimedOut        bool
+	writeTimedOut       bool
+	readFallbackClosed  bool
+	writeFallbackClosed bool
 
 	closeOnce sync.Once
 	closeErr  error
@@ -273,13 +275,15 @@ func (c *ProcessStdioConn) Write(b []byte) (int, error) {
 func (c *ProcessStdioConn) normalizeIOError(err error, isRead bool) error {
 	c.mu.Lock()
 	timedOut := c.writeTimedOut
+	fallbackClosed := c.writeFallbackClosed
 	if isRead {
 		timedOut = c.readTimedOut
+		fallbackClosed = c.readFallbackClosed
 	}
 	closed := c.closed
 	c.mu.Unlock()
 
-	if timedOut {
+	if timedOut || (fallbackClosed && !closed && errors.Is(err, os.ErrClosed)) {
 		return os.ErrDeadlineExceeded
 	}
 	if closed && errors.Is(err, os.ErrClosed) {
@@ -307,7 +311,7 @@ func (c *ProcessStdioConn) SetWriteDeadline(t time.Time) error {
 
 func (c *ProcessStdioConn) setPipeDeadline(f *os.File, t time.Time, isRead bool) error {
 	c.mu.Lock()
-	if c.closed {
+	if c.closed || c.fallbackClosedLocked(isRead) {
 		c.mu.Unlock()
 		return net.ErrClosed
 	}
@@ -322,7 +326,7 @@ func (c *ProcessStdioConn) setPipeDeadline(f *os.File, t time.Time, isRead bool)
 	if err == nil {
 		c.mu.Lock()
 		c.advanceTimerGenLocked(isRead)
-		closed := c.closed
+		closed := c.closed || c.fallbackClosedLocked(isRead)
 		c.mu.Unlock()
 		if closed {
 			return net.ErrClosed
@@ -340,7 +344,7 @@ func (c *ProcessStdioConn) setPipeDeadline(f *os.File, t time.Time, isRead bool)
 
 func (c *ProcessStdioConn) setFallbackDeadline(closer io.Closer, t time.Time, isRead bool) error {
 	c.mu.Lock()
-	if c.closed {
+	if c.closed || c.fallbackClosedLocked(isRead) {
 		c.mu.Unlock()
 		return net.ErrClosed
 	}
@@ -351,19 +355,24 @@ func (c *ProcessStdioConn) setFallbackDeadline(closer io.Closer, t time.Time, is
 	}
 	d := time.Until(t)
 	if d <= 0 {
-		c.markTimedOutLocked(isRead)
-		_ = closer.Close()
+		shouldClose := c.markTimedOutLocked(isRead)
 		c.mu.Unlock()
+		if shouldClose && closer != nil {
+			_ = closer.Close()
+		}
 		return nil
 	}
 	timer := time.AfterFunc(d, func() {
 		c.mu.Lock()
-		defer c.mu.Unlock()
 		if c.closed || c.timerGenLocked(isRead) != gen {
+			c.mu.Unlock()
 			return
 		}
-		c.markTimedOutLocked(isRead)
-		_ = closer.Close()
+		shouldClose := c.markTimedOutLocked(isRead)
+		c.mu.Unlock()
+		if shouldClose && closer != nil {
+			_ = closer.Close()
+		}
 	})
 	if isRead {
 		c.readTimer = timer
@@ -400,12 +409,28 @@ func (c *ProcessStdioConn) timerGenLocked(isRead bool) uint64 {
 	return c.writeGen
 }
 
-func (c *ProcessStdioConn) markTimedOutLocked(isRead bool) {
+func (c *ProcessStdioConn) markTimedOutLocked(isRead bool) bool {
 	if isRead {
 		c.readTimedOut = true
-		return
+		if c.readFallbackClosed {
+			return false
+		}
+		c.readFallbackClosed = true
+		return true
 	}
 	c.writeTimedOut = true
+	if c.writeFallbackClosed {
+		return false
+	}
+	c.writeFallbackClosed = true
+	return true
+}
+
+func (c *ProcessStdioConn) fallbackClosedLocked(isRead bool) bool {
+	if isRead {
+		return c.readFallbackClosed
+	}
+	return c.writeFallbackClosed
 }
 
 func isClosedChan(ch <-chan struct{}) bool {

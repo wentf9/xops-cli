@@ -17,6 +17,7 @@ type policySolveMode struct {
 	resolveOptions  bool
 	resolveControl  bool
 	resolveProxy    bool
+	allowBatchLatch bool
 }
 
 type effectivePolicy struct {
@@ -40,26 +41,25 @@ func isTargetMissingError(err error) bool {
 	return errors.Is(err, config.ErrNodeNotFound)
 }
 
+func (a *SSHAdapter) resolveConnectionSnapshot(nodeID string) (config.ConnectionSnapshot, SessionAuth, bool, error) {
+	tier1Auth, hasTier1Auth := a.getSessionOverride(nodeID)
+	if config.IsOpenSSHNodeID(nodeID) && hasTier1Auth && strings.TrimSpace(tier1Auth.OriginalHost) != "" {
+		if origProvider, ok := a.cfgProvider.(interface {
+			ResolveConnectionWithOrigin(string, string) (config.ConnectionSnapshot, error)
+		}); ok {
+			snap, err := origProvider.ResolveConnectionWithOrigin(nodeID, tier1Auth.OriginalHost)
+			return snap, tier1Auth, hasTier1Auth, err
+		}
+	}
+	snap, err := a.cfgProvider.ResolveConnection(nodeID)
+	return snap, tier1Auth, hasTier1Auth, err
+}
+
 func (a *SSHAdapter) solvePolicy(nodeName string, sessionOpts SessionControlOptions, mode policySolveMode) (effectivePolicy, error) {
 	if a == nil || a.cfgProvider == nil {
 		return effectivePolicy{}, fmt.Errorf("configuration provider is nil")
 	}
-	tier1Auth, hasTier1Auth := a.getSessionOverride(nodeName)
-	var (
-		snapshot config.ConnectionSnapshot
-		snapErr  error
-	)
-	if config.IsOpenSSHNodeID(nodeName) && hasTier1Auth && strings.TrimSpace(tier1Auth.OriginalHost) != "" {
-		if origProvider, ok := a.cfgProvider.(interface {
-			ResolveConnectionWithOrigin(string, string) (config.ConnectionSnapshot, error)
-		}); ok {
-			snapshot, snapErr = origProvider.ResolveConnectionWithOrigin(nodeName, tier1Auth.OriginalHost)
-		} else {
-			snapshot, snapErr = a.cfgProvider.ResolveConnection(nodeName)
-		}
-	} else {
-		snapshot, snapErr = a.cfgProvider.ResolveConnection(nodeName)
-	}
+	snapshot, tier1Auth, hasTier1Auth, snapErr := a.resolveConnectionSnapshot(nodeName)
 	if snapErr != nil && (!isTargetMissingError(snapErr) || mode.requireSnapshot) {
 		return effectivePolicy{}, snapErr
 	}
@@ -72,10 +72,8 @@ func (a *SSHAdapter) solvePolicy(nodeName string, sessionOpts SessionControlOpti
 	if err != nil {
 		return effectivePolicy{}, err
 	}
-	canonHost := strings.TrimSpace(snapshot.Node.CanonicalHost)
-	if canonHost == "" {
-		canonHost = strings.TrimSpace(a.lookupNodeCanonicalHost(nodeName))
-	}
+	parser := a.getOpenSSHParser()
+	_, canonHost := a.resolveSessionOpenSSHMetadata(parser, nodeName, snapErr, snapshot, tier1Auth)
 	pol := effectivePolicy{
 		snapshot:             snapshot,
 		hasSnapshot:          snapErr == nil,
@@ -92,7 +90,7 @@ func (a *SSHAdapter) solvePolicy(nodeName string, sessionOpts SessionControlOpti
 	if !mode.resolveOptions && !mode.resolveControl && !mode.resolveProxy {
 		return pol, nil
 	}
-	t2, t3, t4, tierErr := a.resolvePolicyTiers(nodeName, snapshot, snapErr, tier3Global, pol.tier1Auth.OriginalHost)
+	t2, t3, t4, tierErr := a.resolvePolicyTiers(nodeName, snapshot, snapErr, tier3Global, pol.tier1Auth)
 	if tierErr != nil {
 		return pol, tierErr
 	}
@@ -136,7 +134,7 @@ func (a *SSHAdapter) applyPolicyMergeModes(
 		if err != nil {
 			return err
 		}
-		merged = a.applyBatchModeLatch(nodeName, merged, tier1Opts, maskedT2, maskedT3)
+		merged = a.applyBatchModeLatch(nodeName, *pol, merged, tier1Opts, maskedT2, maskedT3, t4, mode.allowBatchLatch)
 		pol.effectiveOpts = merged
 	}
 	if mode.resolveControl && !a.disableControl {
@@ -173,8 +171,14 @@ func (a *SSHAdapter) isBatchModeLatched(nodeID string) bool {
 	return latched
 }
 
-func (a *SSHAdapter) applyBatchModeLatch(nodeID string, merged, tier1Opts, t2, t3 *ssh.Options) *ssh.Options {
-	if merged != nil && merged.BatchMode() {
+func (a *SSHAdapter) applyBatchModeLatch(
+	nodeID string,
+	pol effectivePolicy,
+	merged, tier1Opts, t2, t3, t4 *ssh.Options,
+	allowLatch bool,
+) *ssh.Options {
+	if allowLatch && pol.hasSnapshot && pol.snapshot.Provenance == config.ProvenanceOpenSSHDerived &&
+		t4 != nil && t4.BatchMode() && merged != nil && merged.BatchMode() {
 		a.latchBatchMode(nodeID)
 		return merged
 	}
@@ -203,14 +207,14 @@ const (
 )
 
 func classifyProxyJump(raw string) proxyDirectiveKind {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
+	switch ssh.ClassifyProxyJump(raw) {
+	case ssh.ProxyJumpActive:
+		return proxyActive
+	case ssh.ProxyJumpDisabled:
+		return proxyDisabled
+	default:
 		return proxyUnset
 	}
-	if ssh.IsDisabledProxyJump(trimmed) {
-		return proxyDisabled
-	}
-	return proxyActive
 }
 
 func classifyProxyValue(raw string) proxyDirectiveKind {
@@ -341,7 +345,7 @@ func (p effectivePolicy) controlTargetContext(nodeID string) ssh.TargetContext {
 		host = strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(p.tier1Auth.HostName), "]"), "[")
 	}
 	jumpHost := strings.TrimSpace(p.snapshot.Node.ProxyJump)
-	if ssh.IsDisabledProxyJump(jumpHost) {
+	if !ssh.HasActiveProxyJump(jumpHost) {
 		jumpHost = ""
 	}
 	if p.hasTier1Auth {
@@ -374,14 +378,14 @@ func (a *SSHAdapter) resolvePolicyTiers(
 	snapshot config.ConnectionSnapshot,
 	snapErr error,
 	tier3Global *ssh.Options,
-	tier1OriginalHost string,
+	tier1Auth SessionAuth,
 ) (tier2Node, tier3Out, tier4OpenSSH *ssh.Options, err error) {
 	tier3Out = tier3Global
 	if snapErr == nil {
 		switch snapshot.Provenance {
 		case config.ProvenanceOpenSSHDerived:
 			var rawT4 *ssh.Options
-			rawT4, err = a.resolveTier4OpenSSHOptions(nodeName, snapErr, snapshot, tier1OriginalHost)
+			rawT4, err = a.resolveTier4OpenSSHOptions(nodeName, snapErr, snapshot, tier1Auth)
 			if err != nil {
 				return nil, nil, nil, err
 			}
@@ -391,7 +395,7 @@ func (a *SSHAdapter) resolvePolicyTiers(
 		default:
 			tier2Node = snapshot.Node.SSHOptions
 			var rawT4 *ssh.Options
-			rawT4, err = a.resolveTier4OpenSSHOptions(nodeName, snapErr, snapshot, tier1OriginalHost)
+			rawT4, err = a.resolveTier4OpenSSHOptions(nodeName, snapErr, snapshot, tier1Auth)
 			if err != nil {
 				return nil, nil, nil, err
 			}
@@ -399,7 +403,7 @@ func (a *SSHAdapter) resolvePolicyTiers(
 		}
 	} else if !config.IsOpenSSHNodeID(nodeName) {
 		var rawT4 *ssh.Options
-		rawT4, err = a.resolveTier4OpenSSHOptions(nodeName, snapErr, snapshot, tier1OriginalHost)
+		rawT4, err = a.resolveTier4OpenSSHOptions(nodeName, snapErr, snapshot, tier1Auth)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -429,7 +433,7 @@ func filterNonVirtualTier4Options(rawTier4 *ssh.Options) *ssh.Options {
 	return filtered
 }
 
-func (a *SSHAdapter) resolveTier4OpenSSHOptions(nodeName string, snapErr error, snapshot config.ConnectionSnapshot, tier1OriginalHost string) (*ssh.Options, error) {
+func (a *SSHAdapter) resolveTier4OpenSSHOptions(nodeName string, snapErr error, snapshot config.ConnectionSnapshot, tier1Auth SessionAuth) (*ssh.Options, error) {
 	parser := a.getOpenSSHParser()
 	if snapErr == nil {
 		switch snapshot.Provenance {
@@ -450,9 +454,8 @@ func (a *SSHAdapter) resolveTier4OpenSSHOptions(nodeName string, snapErr error, 
 		}
 		return nil, err
 	}
-	lookupKeys := a.buildTier4OpenSSHLookupKeys(parser, nodeName, snapErr, snapshot, tier1OriginalHost)
-	_, canonicalHost := a.resolveOpenSSHAliasAndCanonical(nodeName, snapshot)
-	openSSHAlias := a.resolveEffectiveOpenSSHAlias(parser, nodeName, snapErr, snapshot, tier1OriginalHost)
+	openSSHAlias, canonicalHost := a.resolveSessionOpenSSHMetadata(parser, nodeName, snapErr, snapshot, tier1Auth)
+	lookupKeys := a.buildTier4OpenSSHLookupKeys(parser, nodeName, snapErr, snapshot, openSSHAlias, canonicalHost)
 	isTwoPassCanon := openSSHAlias != "" && canonicalHost != "" && !strings.EqualFold(openSSHAlias, canonicalHost)
 	if isTwoPassCanon {
 		opts, err := parser.GetSSHOptionsWithCanonical(openSSHAlias, canonicalHost)
@@ -483,18 +486,6 @@ func (a *SSHAdapter) resolveTier4OpenSSHOptions(nodeName string, snapErr error, 
 	return ssh.MergeOptionLayers(layers...), nil
 }
 
-func (a *SSHAdapter) resolveOpenSSHAliasAndCanonical(nodeName string, snapshot config.ConnectionSnapshot) (string, string) {
-	alias := strings.TrimSpace(snapshot.Node.OpenSSHAlias)
-	if alias == "" {
-		alias = strings.TrimSpace(a.lookupNodeOpenSSHAlias(nodeName))
-	}
-	canonicalHost := strings.TrimSpace(snapshot.Node.CanonicalHost)
-	if canonicalHost == "" {
-		canonicalHost = strings.TrimSpace(a.lookupNodeCanonicalHost(nodeName))
-	}
-	return alias, canonicalHost
-}
-
 func (a *SSHAdapter) resolveTier4DerivedOpenSSHOptions(parser *config.OpenSSHParser, nodeName string, snapshot config.ConnectionSnapshot) (*ssh.Options, error) {
 	if parser == nil {
 		return nil, nil
@@ -502,7 +493,8 @@ func (a *SSHAdapter) resolveTier4DerivedOpenSSHOptions(parser *config.OpenSSHPar
 	if err := parser.Err(); err != nil {
 		return nil, err
 	}
-	alias, canonicalHost := a.resolveOpenSSHAliasAndCanonical(nodeName, snapshot)
+	alias := strings.TrimSpace(snapshot.Node.OpenSSHAlias)
+	canonicalHost := strings.TrimSpace(snapshot.Node.CanonicalHost)
 	if alias == "" {
 		alias = nodeName
 	}
@@ -547,49 +539,105 @@ func collectTier4OpenSSHOptLayers(
 	return layers, nil
 }
 
-func resolveScopedSavedOpenSSHAlias(
-	parser *config.OpenSSHParser,
-	nodeName string,
-	snapshot config.ConnectionSnapshot,
-	tier1OriginalHost string,
-) string {
-	if parser == nil || snapshot.Provenance != config.ProvenanceSavedManaged {
-		return ""
+func savedNodeMatchesVirtualAddress(snapshot config.ConnectionSnapshot, vhostAddr, canon string) bool {
+	if config.SameHostAddress(vhostAddr, snapshot.Host.Address) {
+		return true
 	}
-	orig := strings.TrimSpace(config.UnwrapOpenSSHSelector(tier1OriginalHost))
-	if orig == "" || strings.EqualFold(orig, nodeName) || strings.ContainsAny(orig, "@:") || !parser.HasHost(orig) {
-		return ""
+	// When Pass-2 ssh_config omits HostName (DNS resolved canon -> snapshot.Host.Address),
+	// accept an alias/FQDN match on the saved node's own aliases.
+	if canon != "" && config.SameHostAddress(vhostAddr, canon) {
+		for _, alias := range snapshot.Host.Alias {
+			if config.SameHostAddress(alias, canon) {
+				return true
+			}
+		}
+		for _, alias := range snapshot.Node.Alias {
+			if config.SameHostAddress(alias, canon) {
+				return true
+			}
+		}
 	}
-	_, vhost, _, err := parser.GetVirtualNode(orig)
-	if err != nil {
-		return ""
-	}
-	cleanVHost := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(vhost.Address), "]"), "[")
-	cleanSnapAddr := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(snapshot.Host.Address), "]"), "[")
-	if cleanVHost == "" || cleanSnapAddr == "" || !strings.EqualFold(cleanVHost, cleanSnapAddr) {
-		return ""
-	}
-	return orig
+	return false
 }
 
-func (a *SSHAdapter) resolveEffectiveOpenSSHAlias(
+func resolveScopedSavedOpenSSHAlias(
+	parser *config.OpenSSHParser,
+	snapshot config.ConnectionSnapshot,
+	tier1OriginalHost string,
+	tier1CanonicalHost string,
+) (string, string, bool) {
+	if parser == nil || snapshot.Provenance != config.ProvenanceSavedManaged {
+		return "", "", false
+	}
+	orig := strings.TrimSpace(config.UnwrapOpenSSHSelector(tier1OriginalHost))
+	if orig == "" || strings.ContainsAny(orig, "@:") {
+		return "", "", false
+	}
+	canon := strings.TrimSpace(config.UnwrapOpenSSHSelector(tier1CanonicalHost))
+	if canon != "" && !strings.EqualFold(orig, canon) {
+		_, vhost, _, err := parser.GetVirtualNodeWithCanonical(orig, canon)
+		if err != nil || !savedNodeMatchesVirtualAddress(snapshot, vhost.Address, canon) {
+			return "", "", false
+		}
+		return orig, canon, true
+	}
+	if !parser.HasHost(orig) {
+		return "", "", false
+	}
+	_, vhost, _, err := parser.GetVirtualNode(orig)
+	if err != nil || !config.SameHostAddress(vhost.Address, snapshot.Host.Address) {
+		return "", "", false
+	}
+	return orig, "", true
+}
+
+func (a *SSHAdapter) resolveSessionOpenSSHMetadata(
 	parser *config.OpenSSHParser,
 	nodeName string,
 	snapErr error,
 	snapshot config.ConnectionSnapshot,
-	tier1OriginalHost string,
-) string {
-	openSSHAlias := snapshot.Node.OpenSSHAlias
-	if openSSHAlias == "" {
-		openSSHAlias = a.lookupNodeOpenSSHAlias(nodeName)
+	tier1Auth SessionAuth,
+) (string, string) {
+	t1Orig := strings.TrimSpace(config.UnwrapOpenSSHSelector(tier1Auth.OriginalHost))
+	t1Canon := strings.TrimSpace(config.UnwrapOpenSSHSelector(tier1Auth.CanonicalHost))
+	if snapErr == nil {
+		if snapshot.Provenance != config.ProvenanceSavedManaged {
+			return strings.TrimSpace(snapshot.Node.OpenSSHAlias), strings.TrimSpace(snapshot.Node.CanonicalHost)
+		}
+		snapOrigin := config.OpenSSHOrigin{
+			Alias:         strings.TrimSpace(snapshot.Node.OpenSSHAlias),
+			CanonicalHost: strings.TrimSpace(snapshot.Node.CanonicalHost),
+		}
+		if t1Orig != "" || t1Canon != "" {
+			if alias, canon, ok := resolveScopedSavedOpenSSHAlias(parser, snapshot, t1Orig, t1Canon); ok {
+				return alias, canon
+			}
+			// Allow matching the saved node's own origin when the session echoes the
+			// same alias (with matching or omitted CanonicalHost, e.g. right after
+			// ConfirmNodeContext or in resolveSavedControlSessionLookup), while never
+			// falling back to a different alias's shared side-map entry.
+			if !snapOrigin.IsZero() && t1Orig != "" && t1Orig == snapOrigin.Alias &&
+				(t1Canon == "" || strings.EqualFold(t1Canon, snapOrigin.CanonicalHost)) {
+				return snapOrigin.Alias, snapOrigin.CanonicalHost
+			}
+			return "", ""
+		}
+		if !snapOrigin.IsZero() {
+			return snapOrigin.Alias, snapOrigin.CanonicalHost
+		}
+		if alias, canon, ok := resolveScopedSavedOpenSSHAlias(parser, snapshot, nodeName, ""); ok {
+			return alias, canon
+		}
+		return "", ""
 	}
-	if openSSHAlias == "" && snapErr == nil {
-		openSSHAlias = resolveScopedSavedOpenSSHAlias(parser, nodeName, snapshot, tier1OriginalHost)
+	if t1Orig != "" || t1Canon != "" {
+		return t1Orig, t1Canon
 	}
-	return openSSHAlias
+	origin := a.lookupNodeOpenSSHOrigin(nodeName)
+	return origin.Alias, origin.CanonicalHost
 }
 
-func (a *SSHAdapter) buildTier4OpenSSHLookupKeys(parser *config.OpenSSHParser, nodeName string, snapErr error, snapshot config.ConnectionSnapshot, tier1OriginalHost string) []string {
+func (a *SSHAdapter) buildTier4OpenSSHLookupKeys(parser *config.OpenSSHParser, nodeName string, snapErr error, snapshot config.ConnectionSnapshot, openSSHAlias, canonicalHost string) []string {
 	var lookupKeys []string
 	appendUnique := func(keys ...string) {
 		for _, k := range keys {
@@ -600,13 +648,8 @@ func (a *SSHAdapter) buildTier4OpenSSHLookupKeys(parser *config.OpenSSHParser, n
 		}
 	}
 
-	openSSHAlias := a.resolveEffectiveOpenSSHAlias(parser, nodeName, snapErr, snapshot, tier1OriginalHost)
 	if openSSHAlias != "" {
 		appendUnique(openSSHAlias)
-	}
-	canonicalHost := snapshot.Node.CanonicalHost
-	if canonicalHost == "" {
-		canonicalHost = a.lookupNodeCanonicalHost(nodeName)
 	}
 	if canonicalHost != "" {
 		appendUnique(canonicalHost)
@@ -643,6 +686,21 @@ func (a *SSHAdapter) buildTier4OpenSSHLookupKeys(parser *config.OpenSSHParser, n
 	}
 	appendUnique(nodeName)
 	return lookupKeys
+}
+
+func (a *SSHAdapter) lookupNodeOpenSSHOrigin(nodeName string) config.OpenSSHOrigin {
+	if a == nil || a.cfgProvider == nil || nodeName == "" {
+		return config.OpenSSHOrigin{}
+	}
+	if p, ok := a.cfgProvider.(interface {
+		NodeOpenSSHOrigin(string) config.OpenSSHOrigin
+	}); ok {
+		return p.NodeOpenSSHOrigin(nodeName)
+	}
+	return config.OpenSSHOrigin{
+		Alias:         strings.TrimSpace(a.lookupNodeOpenSSHAlias(nodeName)),
+		CanonicalHost: strings.TrimSpace(a.lookupNodeCanonicalHost(nodeName)),
+	}
 }
 
 func (a *SSHAdapter) lookupNodeOpenSSHAlias(nodeName string) string {

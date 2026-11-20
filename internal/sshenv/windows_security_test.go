@@ -224,4 +224,42 @@ func TestWindowsGlobalKnownHostsAndPipeOwnerFailClosed(t *testing.T) {
 	if err := verifyWindowsAgentPipeServerOwner(windows.InvalidHandle); err == nil {
 		t.Fatal("verifyWindowsAgentPipeServerOwner(InvalidHandle) must fail closed")
 	}
+
+	// R5 P3-7: truncated SockaddrLength < unsafe.Sizeof(Family) must return false safely.
+	var tinySa windows.RawSockaddrInet4
+	tinySa.Family = windows.AF_INET
+	if _, ok := formatWindowsSocketAddressDNS(windows.SocketAddress{
+		Sockaddr:       (*syscall.RawSockaddrAny)(unsafe.Pointer(&tinySa)),
+		SockaddrLength: 1,
+	}); ok {
+		t.Fatal("truncated SockaddrLength must return false")
+	}
+
+	// R5 P3-6: defaultAgentSocket preserves trailing control chars instead of silently trimming them.
+	t.Setenv("SSH_AUTH_SOCK", `\\.\pipe\openssh-ssh-agent`+"\n")
+	if gotSock := defaultAgentSocket(); gotSock != `\\.\pipe\openssh-ssh-agent`+"\n" {
+		t.Fatalf("defaultAgentSocket trimmed control char: got %q", gotSock)
+	}
+
+	// R6 P3-4: defaultAgentSocket also preserves Unicode C1 NEL (\u0085) so dial rejects it.
+	t.Setenv("SSH_AUTH_SOCK", "\u0085")
+	if gotSock := defaultAgentSocket(); gotSock != "\u0085" {
+		t.Fatalf("defaultAgentSocket trimmed U+0085 NEL: got %q", gotSock)
+	}
+
+	// R6 P3-3: synthetic ACL with AceSize in [12, 15] (< Offsetof(SidStart)+8 = 16) must fail closed
+	// without calling IsValidSid past the ACE buffer.
+	const aclHeaderSize = 8
+	const truncAceSize = 12
+	var rawACL [aclHeaderSize + truncAceSize]byte
+	rawACL[0] = 2 // ACL_REVISION
+	rawACL[2] = byte(len(rawACL))
+	rawACL[4] = 1 // AceCount = 1
+	rawACL[aclHeaderSize+0] = windowsAccessAllowedACEType
+	rawACL[aclHeaderSize+1] = 0 // AceFlags
+	rawACL[aclHeaderSize+2] = truncAceSize
+	aclPtr := (*windows.ACL)(unsafe.Pointer(&rawACL[0]))
+	if _, ok := parseWindowsACL(aclPtr, currSID); ok {
+		t.Fatal("parseWindowsACL accepted 12-byte truncated ACE smaller than 16-byte minimum SID header")
+	}
 }

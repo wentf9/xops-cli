@@ -63,7 +63,7 @@ func (r *Repository) PrepareNodeContext(ctx context.Context, opts EnsureNodeOpti
 	nodeID := outcome.nodeID
 	created := outcome.created
 	if created {
-		effectiveID, err := r.registerPendingConnection(cfg, nodeID)
+		effectiveID, err := r.registerPendingConnection(cfg, nodeID, outcome.openSSHAlias, outcome.canonicalHost)
 		if err != nil {
 			return EnsureNodeResult{}, err
 		}
@@ -74,10 +74,12 @@ func (r *Repository) PrepareNodeContext(ctx context.Context, opts EnsureNodeOpti
 	return EnsureNodeResult{NodeID: nodeID, Created: created}, nil
 }
 
-func (r *Repository) registerPendingConnection(cfg *Configuration, nodeID string) (string, error) {
+func (r *Repository) registerPendingConnection(cfg *Configuration, nodeID, openSSHAlias, canonicalHost string) (string, error) {
 	// Retain only this connection's entities, never a stale copy of the
 	// whole configuration that could overwrite concurrent changes.
 	node, _ := cfg.Nodes.Get(nodeID)
+	node.OpenSSHAlias = openSSHAlias
+	node.CanonicalHost = canonicalHost
 	host, _ := cfg.Hosts.Get(node.HostRef)
 	identity, _ := cfg.Identities.Get(node.IdentityRef)
 	if r.pending == nil {
@@ -98,14 +100,15 @@ func (r *Repository) registerPendingConnection(cfg *Configuration, nodeID string
 	pending.Identities.Set(node.IdentityRef, identity)
 	pendingProvider := NewProviderWithoutOpenSSH(pending)
 	prov := ProvenanceAdHocPending
-	if node.OpenSSHAlias != "" {
-		pendingProvider.SetNodeOpenSSHAlias(nodeID, node.OpenSSHAlias)
-		if node.SSHOptions == nil {
+	origin := normalizeOpenSSHOrigin(OpenSSHOrigin{
+		Alias:         node.OpenSSHAlias,
+		CanonicalHost: node.CanonicalHost,
+	})
+	if !origin.IsZero() {
+		pendingProvider.SetNodeOpenSSHOrigin(nodeID, origin)
+		if origin.Alias != "" && node.SSHOptions == nil {
 			prov = ProvenanceOpenSSHDerived
 		}
-	}
-	if node.CanonicalHost != "" {
-		pendingProvider.SetNodeCanonicalHost(nodeID, node.CanonicalHost)
 	}
 	r.pending[nodeID] = &pendingConnection{provider: pendingProvider, provenance: prov, gate: &contextGate{}}
 	return nodeID, nil
@@ -176,14 +179,15 @@ func (r *Repository) upgradePendingAliasAndCanonical(
 	pending.Hosts.Set(normalizedNode.HostRef, host)
 	pending.Identities.Set(normalizedNode.IdentityRef, identity)
 	upgradedProvider := NewProviderWithoutOpenSSH(pending)
-	if normalizedNode.OpenSSHAlias != "" {
-		upgradedProvider.SetNodeOpenSSHAlias(nodeID, normalizedNode.OpenSSHAlias)
-	}
-	if normalizedNode.CanonicalHost != "" {
-		upgradedProvider.SetNodeCanonicalHost(nodeID, normalizedNode.CanonicalHost)
+	upgradedOrigin := normalizeOpenSSHOrigin(OpenSSHOrigin{
+		Alias:         normalizedNode.OpenSSHAlias,
+		CanonicalHost: normalizedNode.CanonicalHost,
+	})
+	if !upgradedOrigin.IsZero() {
+		upgradedProvider.SetNodeOpenSSHOrigin(nodeID, upgradedOrigin)
 	}
 	prov := previous.provenance
-	if normalizedNode.SSHOptions == nil && normalizedNode.OpenSSHAlias != "" {
+	if normalizedNode.SSHOptions == nil && upgradedOrigin.Alias != "" {
 		prov = ProvenanceOpenSSHDerived
 	}
 	gate := previous.gate
@@ -255,19 +259,19 @@ func (r *Repository) ConfirmNodeWithExecutionContext(ctx context.Context, nodeID
 }
 
 func (r *Repository) buildConfirmPublishAction(pending *pendingConnection, nodeID, baseAlias, baseCanon string) *publishAction {
-	mergedAlias := baseAlias
-	mergedCanon := baseCanon
+	mergedOrigin := normalizeOpenSSHOrigin(OpenSSHOrigin{
+		Alias:         baseAlias,
+		CanonicalHost: baseCanon,
+	})
 	return &publishAction{
 		beforeProviderLocked: func() {
 			current := r.pending[nodeID]
 			if current == nil || current.provider == nil {
 				return
 			}
-			if curAlias := current.provider.NodeOpenSSHAlias(nodeID); curAlias != "" {
-				mergedAlias = curAlias
-			}
-			if curCanon := current.provider.NodeCanonicalHost(nodeID); curCanon != "" {
-				mergedCanon = curCanon
+			curOrigin := current.provider.NodeOpenSSHOrigin(nodeID)
+			if !curOrigin.IsZero() {
+				mergedOrigin = curOrigin
 			}
 		},
 		applyProviderLocked: func(p *Provider, updated *Configuration) {
@@ -277,7 +281,7 @@ func (r *Repository) buildConfirmPublishAction(pending *pendingConnection, nodeI
 			if _, exists := updated.Nodes.Get(nodeID); !exists {
 				return
 			}
-			p.setOpenSSHMetadataLocked(nodeID, mergedAlias, mergedCanon)
+			p.setOpenSSHOriginLocked(nodeID, mergedOrigin)
 		},
 		afterProviderLocked: func() {
 			if current := r.pending[nodeID]; current == pending || (current != nil && current.gate == pending.gate) {
@@ -365,7 +369,10 @@ func mergeConfirmedNodeConfig(cfg *Configuration, nodeID string, node models.Nod
 	if existing, ok := cfg.Identities.Get(node.IdentityRef); ok && !reflect.DeepEqual(existing, identity) {
 		return fmt.Errorf("save connected identity %q: %w", node.IdentityRef, ErrConfigConflict)
 	}
-	cfg.Nodes.Set(nodeID, node)
+	storedNode := cloneNode(node)
+	storedNode.OpenSSHAlias = ""
+	storedNode.CanonicalHost = ""
+	cfg.Nodes.Set(nodeID, storedNode)
 	cfg.Hosts.Set(node.HostRef, host)
 	cfg.Identities.Set(node.IdentityRef, identity)
 	return nil

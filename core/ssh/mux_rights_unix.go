@@ -659,7 +659,7 @@ func inspectRawConnChunkCap(rawConn syscall.RawConn) (isRegular, isNonblock, isS
 	return isRegular, isNonblock, isSocket, maxChunk
 }
 
-func preparePollableWriteTarget(dst *os.File) (rawConn syscall.RawConn, owned *os.File, useMsgDontWait, needSharedLock bool, maxChunk int, err error) {
+func preparePollableWriteTarget(dst *os.File, allowReopen bool) (rawConn syscall.RawConn, owned *os.File, useMsgDontWait, needSharedLock bool, maxChunk int, err error) {
 	rawConn, err = dst.SyscallConn()
 	if err != nil {
 		return nil, nil, false, false, 0, err
@@ -667,6 +667,9 @@ func preparePollableWriteTarget(dst *os.File) (rawConn syscall.RawConn, owned *o
 	isRegular, isNonblock, isSocket, capBytes := inspectRawConnChunkCap(rawConn)
 	if isRegular || isNonblock || isSocket {
 		return rawConn, nil, isSocket && !isNonblock, false, capBytes, nil
+	}
+	if !allowReopen {
+		return rawConn, nil, false, true, capBytes, nil
 	}
 	reopened, reopenErr := reopenNonBlockingWriteFile(dst)
 	if reopenErr != nil || reopened == nil {
@@ -850,7 +853,11 @@ func copyToPollableFD(dst *os.File, src io.Reader, stop <-chan struct{}) error {
 }
 
 func copyToPollableFDSerialized(dst *os.File, src io.Reader, stop <-chan struct{}, sharedMu *sync.Mutex) error {
-	rawConn, owned, useMsgDontWait, needSharedLock, maxChunk, err := preparePollableWriteTarget(dst)
+	return copyToPollableFDWithReopen(dst, src, stop, sharedMu, true)
+}
+
+func copyToPollableFDWithReopen(dst *os.File, src io.Reader, stop <-chan struct{}, sharedMu *sync.Mutex, allowReopen bool) error {
+	rawConn, owned, useMsgDontWait, needSharedLock, maxChunk, err := preparePollableWriteTarget(dst, allowReopen)
 	if err != nil {
 		_, copyErr := io.Copy(dst, src)
 		return copyErr
@@ -1165,6 +1172,7 @@ func handlePassengerStdioFwd(s *MuxServer, conn net.Conn, reqID uint32, payload 
 	defer func() { _ = s.closeMuxChannelBounded(ch, nil) }()
 
 	if err := sendSessionOpened(conn, reqID, 1); err != nil {
+		go discardAbortedChannelRequests(s.baseContext(), reqs)
 		return err
 	}
 

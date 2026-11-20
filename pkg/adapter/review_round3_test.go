@@ -46,7 +46,7 @@ func TestRound3_P1_1_GetConfigAndResolveControlPreservePass1AndPercentN(t *testi
 		t.Fatalf("PrepareNodeContext error = %v", err)
 	}
 
-	adp := NewSSHAdapter(repo)
+	adp := NewSSHAdapter(repo, WithSessionAuthOverride(res.NodeID, SessionAuth{OriginalHost: "short"}))
 	cfg, err := adp.GetConfig(res.NodeID)
 	if err != nil {
 		t.Fatalf("GetConfig error = %v", err)

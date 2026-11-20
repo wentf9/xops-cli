@@ -111,13 +111,41 @@ func WithOpenSSHConfigOverride(base ConfigProvider, configPath string) (ConfigPr
 			return nil, err
 		}
 	}
-	var snap *Configuration
+	var (
+		snap    *Configuration
+		origins map[string]OpenSSHOrigin
+	)
 	if base != nil {
-		snap = base.Snapshot()
+		if src, ok := base.(interface {
+			snapshotWithOrigins() (*Configuration, map[string]OpenSSHOrigin)
+		}); ok {
+			snap, origins = src.snapshotWithOrigins()
+		} else {
+			snap = base.Snapshot()
+		}
 	}
 	repo, err := NewRepositoryWithOpenSSHParser(snap, readOnlyRejectStore{}, parser)
 	if err != nil {
 		return nil, fmt.Errorf("create ephemeral ssh config override provider: %w", err)
+	}
+	if snap != nil && snap.Nodes != nil {
+		if origins != nil {
+			for nodeID, origin := range origins {
+				if _, exists := snap.Nodes.Get(nodeID); exists && !origin.IsZero() {
+					repo.provider.setSavedNodeOpenSSHMetadataIfPresent(nodeID, origin.Alias, origin.CanonicalHost)
+				}
+			}
+		} else if base != nil {
+			for _, nodeID := range snap.Nodes.Keys() {
+				baseNode, ok := base.GetNode(nodeID)
+				if !ok {
+					continue
+				}
+				if baseNode.OpenSSHAlias != "" || baseNode.CanonicalHost != "" {
+					repo.provider.setSavedNodeOpenSSHMetadataIfPresent(nodeID, baseNode.OpenSSHAlias, baseNode.CanonicalHost)
+				}
+			}
+		}
 	}
 	return &openSSHOverrideProvider{ConfigProvider: repo, repo: repo}, nil
 }
@@ -147,6 +175,25 @@ func (p *openSSHOverrideProvider) ResolveConnectionWithOrigin(nodeID, originalHo
 
 func (p *openSSHOverrideProvider) GetOpenSSHParser() *OpenSSHParser {
 	return p.repo.GetOpenSSHParser()
+}
+
+func (p *openSSHOverrideProvider) snapshotWithOrigins() (*Configuration, map[string]OpenSSHOrigin) {
+	if p == nil || p.repo == nil {
+		return cloneConfiguration(nil), nil
+	}
+	return p.repo.snapshotWithOrigins()
+}
+
+func (p *openSSHOverrideProvider) NodeOpenSSHOrigin(nodeID string) OpenSSHOrigin {
+	return p.repo.NodeOpenSSHOrigin(nodeID)
+}
+
+func (p *openSSHOverrideProvider) SetNodeOpenSSHOrigin(nodeID string, origin OpenSSHOrigin) {
+	p.repo.SetNodeOpenSSHOrigin(nodeID, origin)
+}
+
+func (p *openSSHOverrideProvider) ClearNodeOpenSSHOrigin(nodeID string) {
+	p.repo.ClearNodeOpenSSHOrigin(nodeID)
 }
 
 func (p *openSSHOverrideProvider) SetNodeOpenSSHAlias(nodeID, alias string) {
@@ -307,7 +354,7 @@ func (p *OpenSSHParser) FindConcreteHostsByAddress(address string, port uint16) 
 	var matches []string
 	walkConcreteSSHHostNames(p.cfg, func(name string) bool {
 		cleanHost, expErr := resolveOpenSSHHostName(p.cfg, name)
-		if expErr != nil || !strings.EqualFold(cleanHost, cleanAddr) {
+		if expErr != nil || !SameHostAddress(cleanHost, cleanAddr) {
 			return true
 		}
 		if port > 0 {

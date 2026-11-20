@@ -54,7 +54,6 @@ type SshOptions struct {
 	Sudo                   bool
 	Alias                  string
 	JumpHost               string
-	cliJumpHost            string
 	Tags                   []string
 	LocalForwards          []string
 	RemoteForwards         []string
@@ -228,9 +227,6 @@ func (o *SshOptions) absIdentityFiles() []string {
 func (o *SshOptions) effectiveCLIJumpHost() string {
 	if o == nil {
 		return ""
-	}
-	if o.appliedGeneralOpts {
-		return o.cliJumpHost
 	}
 	return strings.TrimSpace(o.JumpHost)
 }
@@ -508,7 +504,7 @@ func applyParsedAddr(finalHost, finalUser string, hasUser bool, finalPort uint16
 }
 
 func (o *SshOptions) ensureGeneralOptionsApplied() error {
-	if o.appliedGeneralOpts || len(o.control.Options) == 0 {
+	if o == nil || o.appliedGeneralOpts || len(o.control.Options) == 0 {
 		return nil
 	}
 	return ApplyGeneralOptions(o, o.control.Options, nil)
@@ -616,6 +612,9 @@ func (o *SshOptions) Run() error {
 
 // RunContext starts the SSH operation and propagates caller cancellation.
 func (o *SshOptions) RunContext(ctx context.Context) (err error) {
+	if err := o.ensureGeneralOptionsApplied(); err != nil {
+		return err
+	}
 	if o.control.CtlCmd != "" {
 		return ExecuteControlCommand(ctx, o)
 	}
@@ -633,9 +632,9 @@ func (o *SshOptions) RunContext(ctx context.Context) (err error) {
 
 	// -n 功能：如果是非后台运行或已是后台子进程，且指定了 -n，直接重定向标准输入到 /dev/null
 	if ecStdin && (!ecBg || isChild) {
-		devNull, err := os.Open(os.DevNull)
-		if err != nil {
-			return fmt.Errorf("open %s for SSH stdin failed: %w", os.DevNull, err)
+		devNull, openErr := os.Open(os.DevNull)
+		if openErr != nil {
+			return fmt.Errorf("open %s for SSH stdin failed: %w", os.DevNull, openErr)
 		}
 		oldStdin := os.Stdin
 		os.Stdin = devNull
@@ -879,6 +878,7 @@ func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuratio
 	}
 	// 总是注入 SessionAuthOverride（即使密码为空），以便 UpdateAuth / UpdateSudo
 	// 能根据 Remember 策略决定是否将交互提示获得的密码回写配置，而不是绕过策略检查。
+	_, canonHost := canonicalControlOriginAndHost(o)
 	adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, adapter.SessionAuth{
 		Password:                 o.Password,
 		Passphrase:               o.Passphrase,
@@ -886,6 +886,7 @@ func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuratio
 		KeyPaths:                 absKeys,
 		HostName:                 hostNameOverride,
 		OriginalHost:             o.originalHost,
+		CanonicalHost:            canonHost,
 		Remember:                 shouldRemember,
 		SuppressNodeConfirmation: suppressConfirm,
 		OTP:                      o.OTP,
@@ -1012,10 +1013,19 @@ func (o *SshOptions) hasActiveProxyCommandInPath(provider config.ConfigProvider,
 		return false
 	}
 	adpOpts := []adapter.Option{adapter.WithLocalExecution(true)}
-	if o != nil && strings.TrimSpace(o.JumpHost) != "" && nodeID != "" {
-		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, adapter.SessionAuth{
-			ProxyJump: strings.TrimSpace(o.JumpHost),
-		}))
+	if o != nil && nodeID != "" {
+		origHost, canonHost := canonicalControlOriginAndHost(o)
+		if origHost == "" {
+			origHost = strings.TrimSpace(o.originalHost)
+		}
+		jump := strings.TrimSpace(o.JumpHost)
+		if jump != "" || origHost != "" || canonHost != "" {
+			adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, adapter.SessionAuth{
+				ProxyJump:     jump,
+				OriginalHost:  origHost,
+				CanonicalHost: canonHost,
+			}))
+		}
 	}
 	checker := &proxyCommandPathChecker{
 		opts:            o,
@@ -1475,11 +1485,7 @@ func resolveMasterNodeID(provider config.ConfigProvider, m *ssh.MuxServer) strin
 		port = 22
 	}
 	if canonical := strings.TrimSpace(t.CanonicalHost); canonical != "" && (orig == "" || !strings.EqualFold(orig, canonical)) {
-		isSaved := false
-		if provider != nil && orig != "" {
-			_, isSaved = provider.GetNode(orig)
-		}
-		if !isSaved {
+		if resolveSavedMasterNodeID(provider, orig, targetHost, t.User, uint16(port)) == "" {
 			return config.OpenSSHNodePrefix + canonical
 		}
 	}
@@ -1504,15 +1510,82 @@ func resolveMasterNodeID(provider config.ConfigProvider, m *ssh.MuxServer) strin
 	return orig
 }
 
-func resolveMasterNodeIDFromOriginalHost(provider config.ConfigProvider, orig, targetHost, user string, port uint16) string {
-	if !strings.HasPrefix(orig, config.OpenSSHNodePrefix) {
-		if _, ok := provider.GetNode(orig); ok {
-			if snap, err := provider.ResolveConnection(orig); err == nil {
-				if targetHost == "" || strings.EqualFold(cleanMuxHost(snap.Host.Address), targetHost) {
-					return orig
-				}
-			}
+func sameMasterHostAddress(a, b string) bool {
+	return config.SameHostAddress(a, b)
+}
+
+func collectSavedMasterCandidates(provider config.ConfigProvider, orig, user string, port uint16) []string {
+	var candidates []string
+	addCand := func(id string) {
+		id = strings.TrimSpace(id)
+		if id != "" && !strings.HasPrefix(id, config.OpenSSHNodePrefix) && !slices.Contains(candidates, id) {
+			candidates = append(candidates, id)
 		}
+	}
+	if _, ok := provider.GetNode(orig); ok {
+		addCand(orig)
+	}
+	if aliasID := provider.FindAlias(orig); aliasID != "" {
+		addCand(aliasID)
+	}
+	if selID, err := provider.ResolveSelector(orig); err == nil && selID != "" {
+		addCand(selID)
+	}
+	if user != "" || port != 0 {
+		if res, err := config.ResolveTarget(provider, config.ConnectionTarget{
+			Selector: orig,
+			User:     user,
+			HasUser:  user != "",
+			Port:     port,
+			HasPort:  port != 0,
+		}); err == nil && res.MatchedNodeID != "" && !config.IsOpenSSHNodeID(res.BaseNodeID) {
+			addCand(res.MatchedNodeID)
+		}
+	}
+	return candidates
+}
+
+func savedMasterNodeMatches(snap config.ConnectionSnapshot, targetHost, user string, port uint16) bool {
+	if snap.Provenance.IsUnpersistedOpenSSH() {
+		return false
+	}
+	if targetHost != "" && !sameMasterHostAddress(snap.Host.Address, targetHost) {
+		return false
+	}
+	snapUser := strings.TrimSpace(snap.Identity.User)
+	if snapUser == "" {
+		snapUser = defaultLocalUser()
+	}
+	if user != "" && snapUser != "" && snapUser != user {
+		return false
+	}
+	snapPort := snap.Host.Port
+	if snapPort == 0 {
+		snapPort = 22
+	}
+	if port != 0 && snapPort != port {
+		return false
+	}
+	return true
+}
+
+func resolveSavedMasterNodeID(provider config.ConfigProvider, orig, targetHost, user string, port uint16) string {
+	orig = strings.TrimSpace(orig)
+	if provider == nil || orig == "" || strings.HasPrefix(orig, config.OpenSSHNodePrefix) {
+		return ""
+	}
+	for _, candID := range collectSavedMasterCandidates(provider, orig, user, port) {
+		snap, err := provider.ResolveConnection(candID)
+		if err == nil && savedMasterNodeMatches(snap, targetHost, user, port) {
+			return candID
+		}
+	}
+	return ""
+}
+
+func resolveMasterNodeIDFromOriginalHost(provider config.ConfigProvider, orig, targetHost, user string, port uint16) string {
+	if savedID := resolveSavedMasterNodeID(provider, orig, targetHost, user, port); savedID != "" {
+		return savedID
 	}
 	cleanOrig := config.UnwrapOpenSSHSelector(orig)
 	if cleanOrig == "" {
@@ -1591,7 +1664,7 @@ func resolveMasterVirtualOpenSSHNodeID(provider config.ConfigProvider, cleanOrig
 	if err != nil {
 		return ""
 	}
-	if targetHost == "" || strings.EqualFold(cleanMuxHost(vhost.Address), targetHost) {
+	if targetHost == "" || sameMasterHostAddress(vhost.Address, targetHost) {
 		return config.OpenSSHNodePrefix + cleanOrig
 	}
 	if user != "" && vhost.Address != "" {

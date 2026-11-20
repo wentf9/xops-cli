@@ -269,7 +269,7 @@ xops ssh -o Tunnel=ethernet -w 1:any -N gw
   - 允许外部网络主机连接本地转发的端口（对应 `-o GatewayPorts=yes`）。
 - **会话控制与后台运行 (`-f`, `-N`, `-n`)**：
   - `-N`（`--no-cmd`）：不执行远程命令也不分配 Shell，专用于端口转发与隧道（对应 `-o SessionType=none`）。与显式远程命令互斥。
-  - `-f`（`--background`，或通过 `-o` / 配置启用 `ForkAfterAuthentication yes`）：在身份验证和端口转发建立后转入后台运行。支持 `xops ssh -f host <cmd>`（后台执行远程命令）、`xops ssh -f -N ...`（后台运行转发隧道）或配合 `-o RemoteCommand=...` / `-o SessionType=none`，后台模式自动隐含 `-n`（标准输入重定向至 `/dev/null`）。若未指定有效远程命令且未开启无命令模式（`-N` / `SessionType=none`），或与 `--password-stdin`、`--passphrase-stdin`、`--otp`、`--otp-stdin`、`ProxyCommand`、`-s` 或非 `proxy` 的 `-O` 控制命令组合使用，均会直接报错拒绝；需要后台运行请预先配置公钥代理或持久化凭据存储。
+  - `-f`（`--background`，或通过 `-o` / 配置启用 `ForkAfterAuthentication yes`）：在身份验证和端口转发建立后转入后台运行。支持 `xops ssh -f host <cmd>`（后台执行远程命令）、`xops ssh -f -N ...`（后台运行转发隧道）或配合 `-o RemoteCommand=...` / `-o SessionType=none`，后台模式自动隐含 `-n`（标准输入重定向至 `/dev/null`）。若未指定有效远程命令且未开启无命令模式（`-N` / `SessionType=none`），或与 `--password-stdin`、`--passphrase-stdin`、`--otp`、`--otp-stdin`、`ProxyCommand`、`-s` 组合使用，均会直接报错拒绝；对于 `-O` 多路复用控制命令，非 `proxy` 的 `-O` 子命令仅拒绝 CLI 显式 `-f` / `-o ForkAfterAuthentication=yes`（允许主机/SSH 配置文件中的 `ForkAfterAuthentication yes`），而 `-O proxy` 会同时遵循 CLI 与配置文件中的 `ForkAfterAuthentication yes` 并校验无命令/非交互凭据不变量。需要后台运行请预先配置公钥代理或持久化凭据存储。
   - `-n`（`--stdin-redirect`）：将标准输入重定向到 `/dev/null`，防止后台读取终端输入（对应 `-o StdinNull=yes`）。
 - **多路复用动态转发 (`-O forward`)**：
   - 向活动 Master 发送控制命令动态增减转发。建立 `-R 0:...` 动态分配端口转发时，动态分配的端口号输出到 `stdout`，而 `Forwarding request sent.` 提示写入 `stderr`。

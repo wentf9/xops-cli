@@ -195,11 +195,14 @@ func openPlatformTunnelDevice(mode TunnelMode, localUnit int) (TunnelDevice, err
 		return nil, fmt.Errorf("invalid local tunnel unit %d", localUnit)
 	}
 
+	syscall.ForkLock.RLock()
 	fd, err := unix.Socket(unix.AF_SYSTEM, unix.SOCK_DGRAM, sysprotoControl)
 	if err != nil {
+		syscall.ForkLock.RUnlock()
 		return nil, fmt.Errorf("open utun control socket failed: %w", err)
 	}
 	unix.CloseOnExec(fd)
+	syscall.ForkLock.RUnlock()
 	if err := unix.SetNonblock(fd, true); err != nil {
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("set utun socket non-blocking failed: %w", err)

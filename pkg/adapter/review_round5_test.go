@@ -1,0 +1,259 @@
+package adapter
+
+import (
+	"errors"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/wentf9/xops-cli/core/ssh"
+	"github.com/wentf9/xops-cli/pkg/config"
+	"github.com/wentf9/xops-cli/pkg/models"
+)
+
+func TestRound5_P1_2_ConcurrentDistinctOriginalsResolveSecretZeroMismatch(t *testing.T) {
+	t.Parallel()
+
+	sshCfg := strings.Join([]string{
+		"Host edge-a",
+		"  HostName shared.corp.example.com",
+		"  User user-a",
+		"  Port 2201",
+		"  ConnectTimeout 11",
+		"",
+		"Host edge-b",
+		"  HostName shared.corp.example.com",
+		"  User user-b",
+		"  Port 2202",
+		"  ConnectTimeout 22",
+	}, "\n") + "\n"
+
+	parser, err := config.NewOpenSSHParserFromReader(strings.NewReader(sshCfg))
+	if err != nil {
+		t.Fatalf("NewOpenSSHParserFromReader: %v", err)
+	}
+	store := config.NewDefaultStore(filepath.Join(t.TempDir(), "c.yaml"), filepath.Join(t.TempDir(), "c.key"))
+	repo, err := config.NewRepositoryWithOpenSSHParser(nil, store, parser)
+	if err != nil {
+		t.Fatalf("NewRepositoryWithOpenSSHParser: %v", err)
+	}
+
+	sharedNodeID := config.OpenSSHNodePrefix + "shared.corp.example.com"
+	adpA := NewSSHAdapter(repo, WithSessionAuthOverride(sharedNodeID, SessionAuth{
+		OriginalHost:  "edge-a",
+		CanonicalHost: "shared.corp.example.com",
+		Password:      "secret-a",
+	}))
+	adpB := NewSSHAdapter(repo, WithSessionAuthOverride(sharedNodeID, SessionAuth{
+		OriginalHost:  "edge-b",
+		CanonicalHost: "shared.corp.example.com",
+		Password:      "secret-b",
+	}))
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 16)
+	for range 8 {
+		wg.Go(func() {
+			cfgA, err := adpA.GetConfig(sharedNodeID)
+			if err != nil {
+				errs <- err
+				return
+			}
+			secA, err := adpA.ResolveSecret(t.Context(), ssh.SecretRequest{
+				NodeID:       sharedNodeID,
+				Host:         cfgA.Address,
+				Port:         cfgA.Port,
+				User:         cfgA.User,
+				Kind:         ssh.SecretKindLoginPassword,
+				VersionToken: cfgA.AuthUpdateToken,
+			})
+			if err != nil || string(secA) != "secret-a" {
+				errs <- errors.New("edge-a ResolveSecret mismatch or error")
+			}
+		})
+		wg.Go(func() {
+			cfgB, err := adpB.GetConfig(sharedNodeID)
+			if err != nil {
+				errs <- err
+				return
+			}
+			secB, err := adpB.ResolveSecret(t.Context(), ssh.SecretRequest{
+				NodeID:       sharedNodeID,
+				Host:         cfgB.Address,
+				Port:         cfgB.Port,
+				User:         cfgB.User,
+				Kind:         ssh.SecretKindLoginPassword,
+				VersionToken: cfgB.AuthUpdateToken,
+			})
+			if err != nil || string(secB) != "secret-b" {
+				errs <- errors.New("edge-b ResolveSecret mismatch or error")
+			}
+		})
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+}
+
+func TestRound5_P2_7_SavedSameNameOpenSSHAliasIsolationAndPrecedence(t *testing.T) {
+	t.Parallel()
+
+	sshCfg := strings.Join([]string{
+		"Host short-app",
+		"  ConnectTimeout 15",
+		"  User ssh-cfg-user",
+		"",
+		"Host shared-app",
+		"  HostName 2001:db8:0::10",
+		"  ConnectTimeout 15",
+		"  User ssh-cfg-user",
+		"",
+		"Host unrelated-same-ip",
+		"  HostName [2001:0DB8::10]",
+		"  ConnectTimeout 99",
+		"  ServerAliveCountMax 7",
+		"",
+		"Host *.corp.example.com",
+		"  HostName 2001:db8::10",
+		"  ServerAliveInterval 23",
+	}, "\n") + "\n"
+
+	parser, err := config.NewOpenSSHParserFromReader(strings.NewReader(sshCfg))
+	if err != nil {
+		t.Fatalf("NewOpenSSHParserFromReader: %v", err)
+	}
+	cfg := config.NewProviderWithoutOpenSSH(nil).Snapshot()
+	cfg.Hosts.Set("h1", models.Host{Address: "2001:0db8::10", Port: 22})
+	cfg.Identities.Set("id1", models.Identity{User: "ops"})
+	cfg.Nodes.Set("shared-app", models.Node{
+		HostRef:     "h1",
+		IdentityRef: "id1",
+	})
+	store := config.NewDefaultStore(filepath.Join(t.TempDir(), "c.yaml"), filepath.Join(t.TempDir(), "c.key"))
+	repo, err := config.NewRepositoryWithOpenSSHParser(cfg, store, parser)
+	if err != nil {
+		t.Fatalf("NewRepositoryWithOpenSSHParser: %v", err)
+	}
+
+	// Simulate an unrelated stale entry in provider side-map; explicit tier1OriginalHost
+	// takes precedence over the shared side-map, and clearing the side-map exercises
+	// the same-name saved node IPv6-equivalent isolation path without leaking options
+	// from unrelated-same-ip.
+	repo.SetNodeOpenSSHAlias("shared-app", "unrelated-same-ip")
+	adpTier1 := NewSSHAdapter(repo, WithSessionAuthOverride("shared-app", SessionAuth{
+		OriginalHost:  "short-app",
+		CanonicalHost: "short-app.corp.example.com",
+	}))
+	opts1, err := adpTier1.ResolveSSHOptions("shared-app", SessionControlOptions{})
+	if err != nil {
+		t.Fatalf("ResolveSSHOptions(tier1): %v", err)
+	}
+	if opts1.Get(ssh.OptionConnectTimeout) != "15" || opts1.Get(ssh.OptionServerAliveInterval) != "23" || opts1.Get(ssh.OptionServerAliveCountMax) != "" {
+		t.Fatalf("expected Tier 1 Pass-1 (15) + Pass-2 (23) with no leak, got ConnectTimeout=%q ServerAliveInterval=%q ServerAliveCountMax=%q",
+			opts1.Get(ssh.OptionConnectTimeout), opts1.Get(ssh.OptionServerAliveInterval), opts1.Get(ssh.OptionServerAliveCountMax))
+	}
+
+	repo.SetNodeOpenSSHAlias("shared-app", "")
+	if got := repo.NodeOpenSSHAlias("shared-app"); got != "" {
+		t.Fatalf("SetNodeOpenSSHAlias(empty) did not clear side-map: got %q", got)
+	}
+	adpDefault := NewSSHAdapter(repo)
+	opts2, err := adpDefault.ResolveSSHOptions("shared-app", SessionControlOptions{})
+	if err != nil {
+		t.Fatalf("ResolveSSHOptions(same-name saved node): %v", err)
+	}
+	if opts2.Get(ssh.OptionConnectTimeout) != "15" || opts2.Get(ssh.OptionServerAliveCountMax) != "" {
+		t.Fatalf("same-name saved node with IPv6 equivalence expected ConnectTimeout=15 and no ServerAliveCountMax leak, got ConnectTimeout=%q ServerAliveCountMax=%q",
+			opts2.Get(ssh.OptionConnectTimeout), opts2.Get(ssh.OptionServerAliveCountMax))
+	}
+}
+
+func TestRound5_P2_9_ResolveSSHOptionsDoesNotLatchBatchMode(t *testing.T) {
+	t.Parallel()
+
+	sshCfg := "Host batchbox\n  HostName 10.1.2.3\n  User ops\n  BatchMode yes\n"
+	parser, err := config.NewOpenSSHParserFromReader(strings.NewReader(sshCfg))
+	if err != nil {
+		t.Fatalf("NewOpenSSHParserFromReader: %v", err)
+	}
+	store := config.NewDefaultStore(filepath.Join(t.TempDir(), "c.yaml"), filepath.Join(t.TempDir(), "c.key"))
+	repo, err := config.NewRepositoryWithOpenSSHParser(nil, store, parser)
+	if err != nil {
+		t.Fatalf("NewRepositoryWithOpenSSHParser: %v", err)
+	}
+	prep, err := repo.PrepareNodeContext(t.Context(), config.EnsureNodeOptions{
+		Target: config.ConnectionTarget{Selector: "batchbox", User: "otheruser", HasUser: true},
+	})
+	if err != nil {
+		t.Fatalf("PrepareNodeContext: %v", err)
+	}
+	if !prep.Created {
+		t.Fatalf("expected Prepared OpenSSHDerived node, got %+v", prep)
+	}
+	adp := NewSSHAdapter(repo)
+
+	opts, err := adp.ResolveSSHOptions(prep.NodeID, SessionControlOptions{})
+	if err != nil {
+		t.Fatalf("ResolveSSHOptions failed: %v", err)
+	}
+	if !opts.BatchMode() {
+		t.Fatal("expected ResolveSSHOptions to report BatchMode=yes from Tier 4")
+	}
+	if adp.isBatchModeLatched(prep.NodeID) {
+		t.Fatal("read-only ResolveSSHOptions must NOT latch BatchMode onto SSHAdapter")
+	}
+
+	if _, err := adp.GetConfig(prep.NodeID); err != nil {
+		t.Fatalf("GetConfig failed: %v", err)
+	}
+	if !adp.isBatchModeLatched(prep.NodeID) {
+		t.Fatal("GetConfig for ProvenanceOpenSSHDerived must latch BatchMode")
+	}
+}
+
+func TestRound5_P2_10_ProxyJumpCommaPreservesProxyCommand(t *testing.T) {
+	t.Parallel()
+
+	sshCfg := "Host target-box\n  HostName 10.2.3.4\n  User ops\n  ProxyCommand nc %h %p\n"
+	parser, err := config.NewOpenSSHParserFromReader(strings.NewReader(sshCfg))
+	if err != nil {
+		t.Fatalf("NewOpenSSHParserFromReader: %v", err)
+	}
+	prov := config.NewProviderWithOpenSSHParser(nil, parser)
+
+	if kind := classifyProxyJump(" , "); kind == proxyActive {
+		t.Fatalf("classifyProxyJump(\" , \") = %v, must not be proxyActive", kind)
+	}
+
+	adp := NewSSHAdapter(prov, WithLocalExecution(true), WithSessionAuthOverride(config.OpenSSHNodePrefix+"target-box", SessionAuth{
+		ProxyJump: " , ",
+	}))
+	cfg, err := adp.GetConfig(config.OpenSSHNodePrefix + "target-box")
+	if err != nil {
+		t.Fatalf("GetConfig failed: %v", err)
+	}
+	if got := cfg.Options.ActiveProxyCommand(); got != "nc %h %p" {
+		t.Fatalf("ProxyJump=\" , \" masked ProxyCommand: got %q, want \"nc %%h %%p\"", got)
+	}
+}
+
+func TestRound5_P2_12_ParseOptionStringsSupportsSnakeCaseIdentityFileAndProxyJump(t *testing.T) {
+	t.Parallel()
+
+	parsed, err := ParseOptionStrings([]string{
+		"identity_file=/tmp/r5_id",
+		"proxy_jump=bastion-r5",
+	})
+	if err != nil {
+		t.Fatalf("ParseOptionStrings failed: %v", err)
+	}
+	if files := parsed.Options.IdentityFiles(); len(files) != 1 || files[0] != "/tmp/r5_id" {
+		t.Fatalf("identity_file not parsed cleanly: %v", files)
+	}
+	if _, err := ParseOptionStrings([]string{"proxy_jump="}); err == nil {
+		t.Fatal("expected empty proxy_jump value to be rejected")
+	}
+}

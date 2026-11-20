@@ -1010,17 +1010,7 @@ func (ps *proxySessionState) handleClose(payload []byte) {
 		return
 	}
 	if pcVal, ok := ps.channels.LoadAndDelete(serverChID); ok {
-		pc := pcVal.(*proxyChan)
-		pc.clientWindow.close()
-		pc.input.close()
-		pc.requests.close()
-		pc.pendingRemoteReqs.drain()
-		_ = ps.server.closeMuxChannelBounded(pc.remoteCh, nil)
-		pc.releaseAgentProxyLease()
-		// RFC 4254 requires answering a close this side did not initiate, and the
-		// client only frees its channel (and unblocks its readers) after receiving
-		// that answer. closeChannel also blocks every later packet for the channel.
-		ps.closeChannel(pc)
+		ps.retireChannel(pcVal.(*proxyChan), true)
 	}
 }
 
@@ -1100,9 +1090,9 @@ func (ps *proxySessionState) sendBoundedProxyChannelRequest(
 	reqType string,
 	wantReply bool,
 	payload []byte,
-) (bool, error) {
+) (accepted bool, remoteClosed bool, err error) {
 	if ps == nil || pc == nil || pc.remoteCh == nil || ps.closed.Load() {
-		return false, net.ErrClosed
+		return false, false, net.ErrClosed
 	}
 	parentCtx := context.Background()
 	var timeout time.Duration
@@ -1135,7 +1125,7 @@ func (ps *proxySessionState) sendBoundedProxyChannelRequest(
 
 	select {
 	case r := <-done:
-		return r.accepted, r.err
+		return r.accepted, false, r.err
 	case <-ps.closedSignal():
 		startClose()
 		// Mirror sendBoundedGlobalRequest: a disconnecting proxy client closes
@@ -1144,7 +1134,7 @@ func (ps *proxySessionState) sendBoundedProxyChannelRequest(
 		select {
 		case r := <-done:
 			closeErr := ps.waitProxyChannelClose(closeErrCh)
-			return false, errors.Join(net.ErrClosed, closeErr, r.err)
+			return false, true, errors.Join(net.ErrClosed, closeErr, r.err)
 		case <-work.Done():
 			cause = errors.Join(net.ErrClosed, work.Err())
 		}
@@ -1162,9 +1152,9 @@ func (ps *proxySessionState) sendBoundedProxyChannelRequest(
 		// channel handler is still busy before answering SendRequest.
 		select {
 		case reply := <-done:
-			return false, errors.Join(cause, closeErr, reply.err)
+			return false, true, errors.Join(cause, closeErr, reply.err)
 		default:
-			return false, errors.Join(
+			return false, true, errors.Join(
 				cause,
 				closeErr,
 				fmt.Errorf("ssh proxy channel request %q timed out awaiting remote reply", reqType),
@@ -1172,7 +1162,7 @@ func (ps *proxySessionState) sendBoundedProxyChannelRequest(
 		}
 	case <-timer.C:
 		if ps.server == nil {
-			return false, errors.Join(
+			return false, true, errors.Join(
 				cause,
 				fmt.Errorf("ssh proxy channel request shutdown timed out after %s", sessionShutdownTimeout),
 			)
@@ -1180,7 +1170,7 @@ func (ps *proxySessionState) sendBoundedProxyChannelRequest(
 		interruptErr := ps.server.interruptTransportAndShutdown()
 		closeErr := <-closeErrCh
 		reply := <-done
-		return false, errors.Join(
+		return false, true, errors.Join(
 			cause,
 			fmt.Errorf("ssh proxy channel request shutdown timed out after %s", sessionShutdownTimeout),
 			interruptErr,
@@ -1210,6 +1200,69 @@ func (ps *proxySessionState) waitProxyChannelClose(closeErrCh <-chan error) erro
 	}
 }
 
+// retireChannel tears down a proxy channel whose remote request path failed or
+// closed pc.remoteCh, notifying the proxy client so pipelined requests do not
+// queue onto a closed SSH channel.
+func (ps *proxySessionState) retireChannel(pc *proxyChan, closeRemote bool) {
+	if ps == nil || pc == nil {
+		return
+	}
+	ps.channels.CompareAndDelete(pc.serverCh, pc)
+	if pc.requests != nil {
+		pc.requests.close()
+	}
+	if pc.input != nil {
+		pc.input.close()
+	}
+	if pc.clientWindow != nil {
+		pc.clientWindow.close()
+	}
+	ps.closeChannel(pc)
+	// Drain pendingRemoteReqs only after closeChannel sets pc.closeSent=true so
+	// concurrent forwardRequests cannot push a new orphan request afterward.
+	if pc.pendingRemoteReqs != nil {
+		pc.pendingRemoteReqs.drain()
+	}
+	if closeRemote && pc.remoteCh != nil {
+		_ = ps.server.closeMuxChannelBounded(pc.remoteCh, nil)
+	}
+	pc.releaseAgentProxyLease()
+}
+
+func (ps *proxySessionState) forwardOneChannelRequest(pc *proxyChan, req proxyChannelRequest) (stop, eof bool) {
+	var newAgentLease *agentForwardLease
+	if req.requestType == agentForwardRequestType {
+		var allowed bool
+		newAgentLease, allowed = ps.acquireChannelAgentLease()
+		if !allowed {
+			return req.wantReply && ps.writeChannelReply(pc, false) != nil, false
+		}
+	}
+	accepted, remoteClosed, err := ps.sendBoundedProxyChannelRequest(pc, req.requestType, req.wantReply, req.payload)
+	if newAgentLease != nil {
+		if err == nil && (!req.wantReply || accepted) && !ps.closed.Load() {
+			pc.attachAgentProxyLease(newAgentLease)
+		} else {
+			newAgentLease.Release()
+		}
+	}
+	var writeErr error
+	if req.wantReply {
+		writeErr = ps.writeChannelReply(pc, err == nil && accepted)
+	}
+	if err != nil {
+		if !remoteClosed && errors.Is(err, io.EOF) {
+			// Remote peer already closed the channel while buffered stdout/stderr
+			// and exit-status may still be draining; stop forwarding further
+			// outbound requests without prematurely emitting SSH_MSG_CHANNEL_CLOSE.
+			return writeErr != nil, true
+		}
+		ps.retireChannel(pc, !remoteClosed)
+		return true, false
+	}
+	return writeErr != nil, false
+}
+
 // serveChannelRequests forwards queued channel requests in wire order and
 // answers want-reply requests in the same order.
 func (ps *proxySessionState) serveChannelRequests(pc *proxyChan) {
@@ -1217,34 +1270,23 @@ func (ps *proxySessionState) serveChannelRequests(pc *proxyChan) {
 		return
 	}
 	defer close(pc.requestsDone)
+	remoteClosedEOF := false
 	for {
 		req, ok := pc.requests.pop()
 		if !ok {
 			return
 		}
-		var newAgentLease *agentForwardLease
-		if req.requestType == agentForwardRequestType {
-			var allowed bool
-			newAgentLease, allowed = ps.acquireChannelAgentLease()
-			if !allowed {
-				if req.wantReply && ps.writeChannelReply(pc, false) != nil {
-					return
-				}
-				continue
+		if remoteClosedEOF {
+			if req.wantReply && ps.writeChannelReply(pc, false) != nil {
+				return
 			}
-		}
-		accepted, err := ps.sendBoundedProxyChannelRequest(pc, req.requestType, req.wantReply, req.payload)
-		if newAgentLease != nil {
-			if err == nil && (!req.wantReply || accepted) && !ps.closed.Load() {
-				pc.attachAgentProxyLease(newAgentLease)
-			} else {
-				newAgentLease.Release()
-			}
-		}
-		if !req.wantReply {
 			continue
 		}
-		if ps.writeChannelReply(pc, err == nil && accepted) != nil {
+		stop, eof := ps.forwardOneChannelRequest(pc, req)
+		if eof {
+			remoteClosedEOF = true
+		}
+		if stop {
 			return
 		}
 	}

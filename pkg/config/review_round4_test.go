@@ -99,38 +99,48 @@ func TestRound4_P1_9a_VirtualOpenSSHIsolatedFromSideMapsAndResolveWithOrigin(t *
 	if err != nil {
 		t.Fatalf("PrepareNodeContext(short-a): %v", err)
 	}
-	if got := repo.NodeOpenSSHAlias(prepA.NodeID); got != "short-a" {
-		t.Fatalf("NodeOpenSSHAlias = %q, want short-a", got)
+	// Decision 1.A: ProvenanceOpenSSHVirtual must neither leak into r.pending nor mutate r.provider.
+	repo.pendingMu.RLock()
+	_, hasPendingVirtual := repo.pending[prepA.NodeID]
+	repo.pendingMu.RUnlock()
+	if hasPendingVirtual {
+		t.Fatalf("r.pending leaked virtual OpenSSH entry %q", prepA.NodeID)
+	}
+	if got := repo.NodeOpenSSHAlias(prepA.NodeID); got != "" {
+		t.Fatalf("NodeOpenSSHAlias = %q, want empty (stateless virtual resolution)", got)
 	}
 	if got := repo.provider.NodeOpenSSHAlias(prepA.NodeID); got != "" {
 		t.Fatalf("committed r.provider polluted with virtual alias %q", got)
 	}
 
-	// ResolveConnectionWithOrigin isolates concurrent session for short-b and direct.
-	snapB, err := repo.ResolveConnectionWithOrigin(prepA.NodeID, "openssh:short-b")
-	if err != nil {
-		t.Fatalf("ResolveConnectionWithOrigin(short-b): %v", err)
-	}
-	if snapB.Identity.User != "user-b" || snapB.Node.OpenSSHAlias != "short-b" || snapB.Node.CanonicalHost != "shared.corp.example.com" {
-		t.Fatalf("ResolveConnectionWithOrigin(short-b) = user:%q alias:%q canon:%q", snapB.Identity.User, snapB.Node.OpenSSHAlias, snapB.Node.CanonicalHost)
-	}
+	// ResolveConnectionWithOrigin isolates concurrent sessions for short-a, short-b, and direct.
+	assertResolveOriginState(t, repo, prepA.NodeID, "short-a", "user-a", "short-a", "shared.corp.example.com")
+	assertResolveOriginState(t, repo, prepA.NodeID, "openssh:short-b", "user-b", "short-b", "shared.corp.example.com")
+	assertResolveOriginState(t, repo, prepA.NodeID, "", "direct-user", "shared.corp.example.com", "")
 
-	snapDirect, err := repo.ResolveConnectionWithOrigin(prepA.NodeID, "")
+	// Unqualified ResolveConnection stays direct without cross-session hijack.
+	snapUnqualified, err := repo.ResolveConnection(prepA.NodeID)
 	if err != nil {
-		t.Fatalf("ResolveConnectionWithOrigin(direct): %v", err)
+		t.Fatalf("ResolveConnection(unqualified): %v", err)
 	}
-	if snapDirect.Identity.User != "direct-user" || snapDirect.Node.CanonicalHost != "" {
-		t.Fatalf("ResolveConnectionWithOrigin(direct) = user:%q canon:%q", snapDirect.Identity.User, snapDirect.Node.CanonicalHost)
+	if snapUnqualified.Identity.User != "direct-user" || snapUnqualified.Node.CanonicalHost != "" {
+		t.Fatalf("ResolveConnection(unqualified) = user:%q canon:%q, want direct-user / empty", snapUnqualified.Identity.User, snapUnqualified.Node.CanonicalHost)
 	}
+}
 
-	// Direct non-canonicalized PrepareNodeContext clears stale ProvenanceOpenSSHVirtual.
-	if _, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
-		Target: ConnectionTarget{Selector: OpenSSHNodePrefix + "shared.corp.example.com"},
-	}); err != nil {
-		t.Fatalf("PrepareNodeContext(direct): %v", err)
+func assertResolveOriginState(
+	t *testing.T,
+	repo *Repository,
+	nodeID, origin, wantUser, wantAlias, wantCanon string,
+) {
+	t.Helper()
+	snap, err := repo.ResolveConnectionWithOrigin(nodeID, origin)
+	if err != nil {
+		t.Fatalf("ResolveConnectionWithOrigin(%q): %v", origin, err)
 	}
-	if got := repo.NodeCanonicalHost(prepA.NodeID); got != "" {
-		t.Fatalf("stale canonical host %q remained after non-canonicalized prepare", got)
+	if snap.Identity.User != wantUser || snap.Node.OpenSSHAlias != wantAlias || snap.Node.CanonicalHost != wantCanon {
+		t.Fatalf("ResolveConnectionWithOrigin(%q) = user:%q alias:%q canon:%q, want user:%q alias:%q canon:%q",
+			origin, snap.Identity.User, snap.Node.OpenSSHAlias, snap.Node.CanonicalHost, wantUser, wantAlias, wantCanon)
 	}
 }
 
@@ -386,8 +396,9 @@ func TestRound4_P2_20_CanonicalSnakeCaseCLIOptionAndHostNameNone(t *testing.T) {
 		},
 		"",
 	)
-	if len(cands) != 1 || cands[0] != "myalias.corp.example.com" {
-		t.Fatalf("CanonicalDomainCandidatesWithOptions = %v, want [myalias.corp.example.com]", cands)
+	// Decision 2.A: OpenSSH treats HostName=none as literal host "none", not an empty reset.
+	if len(cands) != 1 || cands[0] != "none.corp.example.com" {
+		t.Fatalf("CanonicalDomainCandidatesWithOptions = %v, want [none.corp.example.com]", cands)
 	}
 }
 

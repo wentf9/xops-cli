@@ -1036,30 +1036,11 @@ func (c *Connector) resolveFilteredAgentAuth(ctx context.Context, authCtx contex
 	tracker := newOfferedPubKeyTracker()
 
 	for _, keyPath := range explicitPaths {
-		pub := extractIdentityPublicKey(keyPath)
-		if pub == nil {
-			continue
-		}
-		if signer, ok := agentByPub[string(pub.Marshal())]; ok {
-			matched := matchCertsForKey(keyPath, pub, explicitCerts, hasExplicitCerts, c.getLogger())
-			for _, mc := range matched {
-				if cs, csErr := newWrappedCertSigner(mc.cert, signer); csErr == nil {
-					pairedCertPaths[mc.path] = struct{}{}
-					tracker.recordStatic(mc.cert)
-					certCandidates = append(certCandidates, autoAuthCandidate{
-						protocol: autoAuthProtocolPublicKey,
-						label:    "ssh-agent (IdentitiesOnly cert): " + mc.path,
-						method:   ssh.PublicKeys(cs),
-					})
-				}
-			}
-			tracker.recordStatic(pub)
-			plainCandidates = append(plainCandidates, autoAuthCandidate{
-				protocol: autoAuthProtocolPublicKey,
-				label:    "ssh-agent (IdentitiesOnly): " + keyPath,
-				method:   ssh.PublicKeys(adaptPlainKeySigner(signer, pub)),
-			})
-		}
+		appendAgentMatchedKeyPath(
+			&certCandidates, &plainCandidates, pairedCertPaths, agentByPub,
+			keyPath, "explicit key", explicitCerts, hasExplicitCerts,
+			nil, tracker, c.getLogger(),
+		)
 	}
 	appendUnpairedExplicitCertsFromAgent(&certCandidates, pairedCertPaths, agentByPub, explicitCerts, "ssh-agent (IdentitiesOnly cert): ", nil, tracker)
 
@@ -1254,7 +1235,7 @@ func (c *Connector) buildIdentitiesOnlyMultiKeyCandidates(
 	l logger.DebugLogger,
 ) ([]autoAuthCandidate, error) {
 	var agentByPub map[string]ssh.Signer
-	if len(explicitPaths) > 0 || len(explicitCerts) > 0 {
+	if len(explicitPaths) > 0 || hasUnpairedExplicitCerts(explicitCerts, state.pairedCertPaths) {
 		if socket, sockErr := c.resolveConfigAgentSocket(cfg); sockErr == nil {
 			var agentCleanup func()
 			agentByPub, agentCleanup = dialAgentSignersByPubKey(ctx, authCtx, c.environment.DialAgent, socket, handshakeTimeout, l)

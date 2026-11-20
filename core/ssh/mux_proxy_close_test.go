@@ -559,7 +559,7 @@ func TestProxySession_SendBoundedProxyChannelRequestClientDisconnectDoesNotKillH
 	}
 	done := make(chan reply, 1)
 	go func() {
-		ok, err := ps.sendBoundedProxyChannelRequest(pc, "exec", true, nil)
+		ok, _, err := ps.sendBoundedProxyChannelRequest(pc, "exec", true, nil)
 		done <- reply{accepted: ok, err: err}
 	}()
 
@@ -620,7 +620,7 @@ func TestProxySession_SendBoundedProxyChannelRequestNilServerTimeoutDoesNotDeadl
 		<-reqCh.reqStarted
 		ps.closeAll()
 	}()
-	ok, reqErr := ps.sendBoundedProxyChannelRequest(stalledPC, "exec", true, nil)
+	ok, _, reqErr := ps.sendBoundedProxyChannelRequest(stalledPC, "exec", true, nil)
 	if ok || reqErr == nil || !strings.Contains(reqErr.Error(), "timed out") {
 		t.Fatalf("sendBoundedProxyChannelRequest(nil server) = (ok=%v, err=%v), want (false, timeout)", ok, reqErr)
 	}

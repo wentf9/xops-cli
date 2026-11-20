@@ -176,8 +176,17 @@ func resolveTargetHelper(provider ConfigProvider) (*Repository, *Configuration) 
 	if fr, ok := provider.(*frozenRepository); ok && fr != nil {
 		return resolveTargetHelper(fr.ConfigProvider)
 	}
-	snap := provider.Snapshot()
-	lookup, aliases, _ := buildIndexes(snap, false)
+	var (
+		snap    *Configuration
+		origins map[string]OpenSSHOrigin
+	)
+	if src, ok := provider.(interface {
+		snapshotWithOrigins() (*Configuration, map[string]OpenSSHOrigin)
+	}); ok {
+		snap, origins = src.snapshotWithOrigins()
+	} else {
+		snap = provider.Snapshot()
+	}
 	var parser *OpenSSHParser
 	if src, ok := provider.(openSSHParserSource); ok {
 		parser = src.GetOpenSSHParser()
@@ -185,13 +194,36 @@ func resolveTargetHelper(provider ConfigProvider) (*Repository, *Configuration) 
 	if parser == nil {
 		parser = &OpenSSHParser{cfg: nil}
 	}
-	p := &Provider{
-		cfg:         snap,
-		lookupIndex: lookup,
-		aliasIndex:  aliases,
-		openSSH:     parser,
-	}
+	p := newProvider(snap, parser)
+	populateProviderOriginsFromBase(p, snap, provider, origins)
 	return &Repository{provider: p}, snap
+}
+
+func populateProviderOriginsFromBase(p *Provider, snap *Configuration, provider ConfigProvider, origins map[string]OpenSSHOrigin) {
+	if p == nil || snap == nil || snap.Nodes == nil {
+		return
+	}
+	if origins != nil {
+		for nodeID, origin := range origins {
+			if _, exists := snap.Nodes.Get(nodeID); exists && !origin.IsZero() {
+				p.SetNodeOpenSSHOrigin(nodeID, origin)
+			}
+		}
+		return
+	}
+	if origSrc, ok := provider.(interface{ NodeOpenSSHOrigin(string) OpenSSHOrigin }); ok {
+		for _, nodeID := range snap.Nodes.Keys() {
+			if origin := origSrc.NodeOpenSSHOrigin(nodeID); !origin.IsZero() {
+				p.SetNodeOpenSSHOrigin(nodeID, origin)
+			}
+		}
+		return
+	}
+	for _, nodeID := range snap.Nodes.Keys() {
+		if n, ok := provider.GetNode(nodeID); ok && (n.OpenSSHAlias != "" || n.CanonicalHost != "") {
+			p.SetNodeOpenSSHOrigin(nodeID, OpenSSHOrigin{Alias: n.OpenSSHAlias, CanonicalHost: n.CanonicalHost})
+		}
+	}
 }
 
 func normalizeOriginalHost(raw string) string {
@@ -279,11 +311,16 @@ func isDirectOrIndexedSelector(cfg *Configuration, lookup map[string][]string, a
 		if _, exists := cfg.Nodes.Get(selector); exists {
 			return true
 		}
+		if norm := normalizeLookupSelector(selector); norm != "" && norm != selector {
+			if _, exists := cfg.Nodes.Get(norm); exists {
+				return true
+			}
+		}
 	}
 	if nid, ok := aliases[selector]; ok && nid != "" {
 		return true
 	}
-	return len(lookup[selector]) > 0
+	return len(lookupBySelector(lookup, selector)) > 0
 }
 
 func isAlreadySplitCompositeTarget(target ConnectionTarget, selector, parsedUser string, parsedPort uint16) bool {
@@ -377,14 +414,9 @@ func (r *Repository) evaluateTargetDecision(
 			if decision.BaseNodeID == "" {
 				decision.BaseNodeID = targetNodeID
 			}
-			alias, canon := r.effectiveNodeMetadata(targetNodeID, node)
-			if decision.OpenSSHAlias == "" {
-				decision.OpenSSHAlias = alias
-			}
-			if decision.CanonicalHost == "" {
-				decision.CanonicalHost = canon
-			}
-			backfillCanonicalTargetMetadata(decision.NormalizedTarget, decision.Selector, &decision.OpenSSHAlias, &decision.CanonicalHost)
+			decision.OpenSSHAlias, decision.CanonicalHost = r.resolveSavedNodeDecisionMetadata(
+				targetNodeID, node, decision.NormalizedTarget, decision.Selector, decision.OpenSSHAlias, decision.CanonicalHost,
+			)
 			decision.MatchedNodeID = targetNodeID
 			decision.NeedsCreation = false
 		}
@@ -467,20 +499,26 @@ func (r *Repository) resolveExplicitOpenSSHVirtualTarget(
 	}, true, nil
 }
 
+func (r *Repository) resolveSavedNodeDecisionMetadata(
+	matchedID string,
+	node models.Node,
+	target ConnectionTarget,
+	selector, openSSHAlias, canonHost string,
+) (string, string) {
+	backfillCanonicalTargetMetadata(target, selector, &openSSHAlias, &canonHost)
+	if openSSHAlias == "" && canonHost == "" {
+		openSSHAlias, canonHost = r.effectiveNodeMetadata(matchedID, node)
+	}
+	return openSSHAlias, canonHost
+}
+
 func (r *Repository) savedNodeDecision(
 	cfg *Configuration,
 	target ConnectionTarget,
 	selector, matchedID, baseID, openSSHAlias, canonHost string,
 ) targetDecision {
 	node, _ := cfg.Nodes.Get(matchedID)
-	nodeAlias, nodeCanon := r.effectiveNodeMetadata(matchedID, node)
-	if openSSHAlias == "" {
-		openSSHAlias = nodeAlias
-	}
-	if canonHost == "" {
-		canonHost = nodeCanon
-	}
-	backfillCanonicalTargetMetadata(target, selector, &openSSHAlias, &canonHost)
+	openSSHAlias, canonHost = r.resolveSavedNodeDecisionMetadata(matchedID, node, target, selector, openSSHAlias, canonHost)
 	if baseID == "" {
 		baseID = matchedID
 	}
@@ -508,10 +546,15 @@ func (r *Repository) evaluateBareTargetDecision(
 	if _, exists := cfg.Nodes.Get(selector); exists {
 		return r.savedNodeDecision(cfg, target, selector, selector, selector, "", ""), nil
 	}
+	if norm := normalizeLookupSelector(selector); norm != "" && norm != selector {
+		if _, exists := cfg.Nodes.Get(norm); exists {
+			return r.savedNodeDecision(cfg, target, selector, norm, norm, "", ""), nil
+		}
+	}
 	if nid, ok := aliases[selector]; ok && nid != "" {
 		return r.savedNodeDecision(cfg, target, selector, nid, nid, "", ""), nil
 	}
-	candidates := lookup[selector]
+	candidates := lookupBySelector(lookup, selector)
 	switch len(candidates) {
 	case 1:
 		return r.savedNodeDecision(cfg, target, selector, candidates[0], candidates[0], "", ""), nil
@@ -670,14 +713,7 @@ func (r *Repository) buildMatchedResolvedTarget(
 		}
 	}
 	jump := normalizeTargetJump(provider, node.ProxyJump, target)
-	alias := openSSHAlias
-	if alias == "" {
-		alias = r.effectiveNodeOpenSSHAlias(matchedID, node)
-	}
-	if canonicalHost == "" {
-		canonicalHost = r.effectiveNodeCanonicalHost(matchedID, node)
-	}
-	backfillCanonicalTargetMetadata(target, target.Selector, &alias, &canonicalHost)
+	alias, canon := r.resolveSavedNodeDecisionMetadata(matchedID, node, target, target.Selector, openSSHAlias, canonicalHost)
 	return ResolvedTarget{
 		NodeID:        matchedID,
 		MatchedNodeID: matchedID,
@@ -688,7 +724,7 @@ func (r *Repository) buildMatchedResolvedTarget(
 		ProxyJump:     jump,
 		KeyPath:       ident.KeyPath,
 		OpenSSHAlias:  alias,
-		CanonicalHost: canonicalHost,
+		CanonicalHost: canon,
 		Provenance:    ProvenanceSavedManaged,
 		Created:       false,
 	}, nil
@@ -753,17 +789,21 @@ func (r *Repository) buildMatchedOpenSSHResolvedTarget(
 }
 
 func normalizeTargetJump(provider ConfigProvider, baseJump string, target ConnectionTarget) string {
-	jump := baseJump
+	jump := strings.TrimSpace(baseJump)
 	if target.HasProxyJump {
 		jump = strings.TrimSpace(target.ProxyJump)
-		if ssh.IsDisabledProxyJump(jump) {
+		if !ssh.HasActiveProxyJump(jump) {
 			return ""
 		}
-		if jump != "" && provider != nil {
+		if provider != nil {
 			if resolvedJump, jErr := provider.ResolveProxyJumpChain(jump); jErr == nil {
 				jump = resolvedJump
 			}
 		}
+		return jump
+	}
+	if !ssh.HasActiveProxyJump(jump) {
+		return ""
 	}
 	return jump
 }
@@ -788,12 +828,12 @@ func (r *Repository) buildCreatedResolvedTargetWithUserPort(
 	if err != nil {
 		if target.HasProxyJump {
 			jump = strings.TrimSpace(target.ProxyJump)
-			if ssh.IsDisabledProxyJump(jump) {
-				jump = ""
-			}
 		} else {
 			jump = ""
 		}
+	}
+	if !ssh.HasActiveProxyJump(jump) {
+		jump = ""
 	}
 	openSSHAlias := canonicalInfo.OpenSSHAlias
 	canonHost := canonicalInfo.CanonicalHost
@@ -805,10 +845,8 @@ func (r *Repository) buildCreatedResolvedTargetWithUserPort(
 		if keyPath == "" && pIdent.KeyPath != "" {
 			keyPath = pIdent.KeyPath
 		}
-		if openSSHAlias == "" && pNode.OpenSSHAlias != "" {
+		if openSSHAlias == "" && canonHost == "" {
 			openSSHAlias = pNode.OpenSSHAlias
-		}
-		if canonHost == "" && pNode.CanonicalHost != "" {
 			canonHost = pNode.CanonicalHost
 		}
 	}
@@ -1055,8 +1093,7 @@ func (r *Repository) matchOpenSSHVirtualNode(selector, effectiveUser string, eff
 		return "", "", nil
 	}
 	if cleanExpected := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(expectedAddr), "]"), "["); cleanExpected != "" {
-		cleanVHost := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(vhost.Address), "]"), "[")
-		if !strings.EqualFold(cleanExpected, cleanVHost) {
+		if !SameHostAddress(cleanExpected, vhost.Address) {
 			return "", "", nil
 		}
 	}
@@ -1117,35 +1154,7 @@ func (r *Repository) findExistingNodeDecision(target ConnectionTarget, explicitD
 // syncPreparedExistingMetadataLocked synchronizes per-node session metadata under r.pendingMu.Lock().
 func (r *Repository) syncPreparedExistingMetadataLocked(decision targetDecision) {
 	id := decision.MatchedNodeID
-	if id == "" || decision.NeedsCreation {
-		return
-	}
-	if IsOpenSSHNodeID(id) {
-		if decision.CanonicalHost != "" {
-			if existing := r.pending[id]; existing != nil && existing.provenance != ProvenanceOpenSSHVirtual {
-				return
-			}
-			var parser *OpenSSHParser
-			if r.provider != nil {
-				parser = r.provider.GetOpenSSHParser()
-			}
-			vp := NewProviderWithOpenSSHParser(nil, parser)
-			if decision.OpenSSHAlias != "" {
-				vp.SetNodeOpenSSHAlias(id, decision.OpenSSHAlias)
-			}
-			vp.SetNodeCanonicalHost(id, decision.CanonicalHost)
-			if r.pending == nil {
-				r.pending = make(map[string]*pendingConnection)
-			}
-			r.pending[id] = &pendingConnection{provider: vp, provenance: ProvenanceOpenSSHVirtual}
-			return
-		}
-		if existing := r.pending[id]; existing != nil && existing.provenance == ProvenanceOpenSSHVirtual {
-			delete(r.pending, id)
-		}
-		if r.provider != nil {
-			r.provider.clearNodeOpenSSHMetadata(id)
-		}
+	if id == "" || decision.NeedsCreation || IsOpenSSHNodeID(id) {
 		return
 	}
 	if r.provider != nil {
@@ -1196,9 +1205,8 @@ func findMatchingNodes(snapshot *Configuration, user, addr string, port uint16) 
 		h, hok := snapshot.Hosts.Get(n.HostRef)
 		ident, iok := snapshot.Identities.Get(n.IdentityRef)
 		if hok && iok {
-			cleanHostAddr := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(h.Address), "]"), "[")
 			nodeUser := normalizedIdentityUser(ident.User)
-			if cleanHostAddr == addr && normalizedHostPort(h.Port) == targetPort && nodeUser == user {
+			if SameHostAddress(h.Address, addr) && normalizedHostPort(h.Port) == targetPort && nodeUser == user {
 				matches = append(matches, nid)
 			}
 		}
@@ -1247,11 +1255,11 @@ func (r *Repository) resolveCanonicalTargetInfo(cfg *Configuration, lookup map[s
 	}
 
 	// 3. Lookup match
-	if candidates := lookup[selector]; len(candidates) > 0 {
+	if candidates := lookupBySelector(lookup, selector); len(candidates) > 0 {
 		return r.resolveLookupCandidates(cfg, selector, candidates, target)
 	}
 	if raw := strings.TrimSpace(target.RawSelector); raw != "" && raw != selector {
-		if candidates := lookup[raw]; len(candidates) > 0 {
+		if candidates := lookupBySelector(lookup, raw); len(candidates) > 0 {
 			return r.resolveLookupCandidates(cfg, raw, candidates, target)
 		}
 	}
@@ -1304,7 +1312,7 @@ func (r *Repository) resolveCanonicalTargetInfo(cfg *Configuration, lookup map[s
 		if port == 0 {
 			port = 22
 		}
-		cleanHost := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(parsedHost), "]"), "[")
+		cleanHost := NormalizeHostAddress(parsedHost)
 		var rawAlias string
 		canonHost := canonicalTargetHost(target, cleanHost)
 		backfillCanonicalTargetMetadata(target, cleanHost, &rawAlias, &canonHost)
@@ -1316,7 +1324,7 @@ func (r *Repository) resolveCanonicalTargetInfo(cfg *Configuration, lookup map[s
 			CanonicalHost: canonHost,
 		}, nil
 	}
-	clean = strings.TrimPrefix(strings.TrimSuffix(clean, "]"), "[")
+	clean = NormalizeHostAddress(clean)
 	var rawAlias string
 	canonHost := canonicalTargetHost(target, clean)
 	backfillCanonicalTargetMetadata(target, clean, &rawAlias, &canonHost)
@@ -1331,6 +1339,11 @@ func (r *Repository) resolveDirectOrAliasTargetInfo(cfg *Configuration, aliases 
 		if info, ok := r.resolveCandidateNodeInfo(cfg, key); ok {
 			return info, true
 		}
+		if norm := normalizeLookupSelector(key); norm != "" && norm != key {
+			if info, ok := r.resolveCandidateNodeInfo(cfg, norm); ok {
+				return info, true
+			}
+		}
 		if nid, exists := aliases[key]; exists && nid != "" {
 			if info, ok := r.resolveCandidateNodeInfo(cfg, nid); ok {
 				return info, true
@@ -1340,28 +1353,23 @@ func (r *Repository) resolveDirectOrAliasTargetInfo(cfg *Configuration, aliases 
 	return canonicalTargetInfo{}, false
 }
 
-func (r *Repository) effectiveNodeMetadata(nodeID string, node models.Node) (alias, canon string) {
-	alias = node.OpenSSHAlias
-	canon = node.CanonicalHost
-	if r != nil && r.provider != nil {
-		if alias == "" {
-			alias = r.provider.NodeOpenSSHAlias(nodeID)
-		}
-		if canon == "" {
-			canon = r.provider.NodeCanonicalHost(nodeID)
-		}
+func (r *Repository) effectiveNodeOpenSSHOrigin(nodeID string, node models.Node) OpenSSHOrigin {
+	origin := normalizeOpenSSHOrigin(OpenSSHOrigin{
+		Alias:         node.OpenSSHAlias,
+		CanonicalHost: node.CanonicalHost,
+	})
+	if !origin.IsZero() {
+		return origin
 	}
-	return alias, canon
+	if r != nil && r.provider != nil {
+		return r.provider.NodeOpenSSHOrigin(nodeID)
+	}
+	return OpenSSHOrigin{}
 }
 
-func (r *Repository) effectiveNodeOpenSSHAlias(nodeID string, node models.Node) string {
-	alias, _ := r.effectiveNodeMetadata(nodeID, node)
-	return alias
-}
-
-func (r *Repository) effectiveNodeCanonicalHost(nodeID string, node models.Node) string {
-	_, canon := r.effectiveNodeMetadata(nodeID, node)
-	return canon
+func (r *Repository) effectiveNodeMetadata(nodeID string, node models.Node) (alias, canon string) {
+	origin := r.effectiveNodeOpenSSHOrigin(nodeID, node)
+	return origin.Alias, origin.CanonicalHost
 }
 
 func canonicalTargetHost(target ConnectionTarget, candidateHost string) string {
@@ -1421,55 +1429,36 @@ func (r *Repository) resolveCandidateNodeInfo(cfg *Configuration, candidateID st
 		defUser = normalizedIdentityUser(ident.User)
 		keyPath = ident.KeyPath
 	}
+	origin := r.effectiveNodeOpenSSHOrigin(candidateID, node)
 	return canonicalTargetInfo{
 		BaseNodeID:    candidateID,
 		Address:       clean,
 		Port:          normalizedHostPort(host.Port),
 		IdentityFile:  keyPath,
 		DefaultUser:   defUser,
-		OpenSSHAlias:  r.effectiveNodeOpenSSHAlias(candidateID, node),
-		CanonicalHost: r.effectiveNodeCanonicalHost(candidateID, node),
+		OpenSSHAlias:  origin.Alias,
+		CanonicalHost: origin.CanonicalHost,
 	}, true
 }
 
-func (r *Repository) consistentCandidateOpenSSHAlias(cfg *Configuration, candidates []string) string {
-	var alias string
+func (r *Repository) consistentCandidateOpenSSHOrigin(cfg *Configuration, candidates []string) OpenSSHOrigin {
+	var first OpenSSHOrigin
 	for _, cid := range candidates {
 		node, ok := cfg.Nodes.Get(cid)
 		if !ok {
 			continue
 		}
-		nodeAlias := r.effectiveNodeOpenSSHAlias(cid, node)
-		if nodeAlias == "" {
+		origin := r.effectiveNodeOpenSSHOrigin(cid, node)
+		if origin.IsZero() {
 			continue
 		}
-		if alias == "" {
-			alias = nodeAlias
-		} else if alias != nodeAlias {
-			return ""
+		if first.IsZero() {
+			first = origin
+		} else if !first.Equal(origin) {
+			return OpenSSHOrigin{}
 		}
 	}
-	return alias
-}
-
-func (r *Repository) consistentCandidateCanonicalHost(cfg *Configuration, candidates []string) string {
-	var canon string
-	for _, cid := range candidates {
-		node, ok := cfg.Nodes.Get(cid)
-		if !ok {
-			continue
-		}
-		nodeCanon := r.effectiveNodeCanonicalHost(cid, node)
-		if nodeCanon == "" {
-			continue
-		}
-		if canon == "" {
-			canon = nodeCanon
-		} else if !strings.EqualFold(canon, nodeCanon) {
-			return ""
-		}
-	}
-	return canon
+	return first
 }
 
 func (r *Repository) resolveConsistentCandidates(cfg *Configuration, selector string, candidates []string) (canonicalTargetInfo, error) {
@@ -1503,7 +1492,7 @@ func (r *Repository) resolveConsistentCandidates(cfg *Configuration, selector st
 			firstUser = user
 			initialized = true
 		} else {
-			if firstAddr != clean || firstPort != port {
+			if !SameHostAddress(firstAddr, clean) || firstPort != port {
 				addrPortConsistent = false
 				break
 			}
@@ -1520,13 +1509,14 @@ func (r *Repository) resolveConsistentCandidates(cfg *Configuration, selector st
 		if firstBaseID == "" && len(candidates) > 0 {
 			firstBaseID = candidates[0]
 		}
+		origin := r.consistentCandidateOpenSSHOrigin(cfg, candidates)
 		return canonicalTargetInfo{
 			BaseNodeID:           firstBaseID,
 			Address:              firstAddr,
 			Port:                 firstPort,
 			DefaultUser:          defUser,
-			OpenSSHAlias:         r.consistentCandidateOpenSSHAlias(cfg, candidates),
-			CanonicalHost:        r.consistentCandidateCanonicalHost(cfg, candidates),
+			OpenSSHAlias:         origin.Alias,
+			CanonicalHost:        origin.CanonicalHost,
 			AmbiguousDefaultUser: !userConsistent,
 			AmbiguousCandidates:  slices.Clone(candidates),
 		}, nil
@@ -1566,7 +1556,7 @@ func (r *Repository) resolveCandidateAddressFallback(cfg *Configuration, selecto
 			firstUser = user
 			initialized = true
 		} else {
-			if firstAddr != clean {
+			if !SameHostAddress(firstAddr, clean) {
 				addrConsistent = false
 				break
 			}
@@ -1603,14 +1593,15 @@ func (r *Repository) resolveCandidateAddressFallback(cfg *Configuration, selecto
 	if firstBaseID == "" && len(candidates) > 0 {
 		firstBaseID = candidates[0]
 	}
+	origin := r.consistentCandidateOpenSSHOrigin(cfg, candidates)
 
 	return canonicalTargetInfo{
 		BaseNodeID:           firstBaseID,
 		Address:              firstAddr,
 		Port:                 effectivePort,
 		DefaultUser:          defUser,
-		OpenSSHAlias:         r.consistentCandidateOpenSSHAlias(cfg, candidates),
-		CanonicalHost:        r.consistentCandidateCanonicalHost(cfg, candidates),
+		OpenSSHAlias:         origin.Alias,
+		CanonicalHost:        origin.CanonicalHost,
 		AmbiguousDefaultUser: !target.HasUser && !userConsistent,
 		AmbiguousCandidates:  slices.Clone(candidates),
 	}, nil
@@ -1683,13 +1674,11 @@ func (r *Repository) createNodeInTransaction(
 		sudoMode = opts.SudoMode
 	}
 	newNode := models.Node{
-		HostRef:       hostRef,
-		IdentityRef:   identityRef,
-		ProxyJump:     finalJump,
-		SudoMode:      sudoMode,
-		SuPwd:         opts.SuPwd,
-		OpenSSHAlias:  canonicalInfo.OpenSSHAlias,
-		CanonicalHost: canonicalInfo.CanonicalHost,
+		HostRef:     hostRef,
+		IdentityRef: identityRef,
+		ProxyJump:   finalJump,
+		SudoMode:    sudoMode,
+		SuPwd:       opts.SuPwd,
 	}
 	if opts.Alias != "" {
 		trimmedAlias := strings.TrimSpace(opts.Alias)
@@ -1724,8 +1713,7 @@ func ensureMatchingHost(cfg *Configuration, canonicalAddr string, port uint16, t
 		if !ok {
 			continue
 		}
-		clean := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(h.Address), "]"), "[")
-		if clean == canonicalAddr && normalizedHostPort(h.Port) == targetPort {
+		if SameHostAddress(h.Address, canonicalAddr) && normalizedHostPort(h.Port) == targetPort {
 			matchingHostRefs = append(matchingHostRefs, href)
 			if len(h.Alias) == 0 && unaliasedHostRef == "" {
 				unaliasedHostRef = href
@@ -1737,8 +1725,7 @@ func ensureMatchingHost(cfg *Configuration, canonicalAddr string, port uint16, t
 		candidateRef := FormatHostPort(canonicalAddr, targetPort)
 		hostRef := candidateRef
 		if existing, exists := cfg.Hosts.Get(candidateRef); exists {
-			clean := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(existing.Address), "]"), "[")
-			if clean != canonicalAddr || normalizedHostPort(existing.Port) != targetPort || len(existing.Alias) > 0 {
+			if !SameHostAddress(existing.Address, canonicalAddr) || normalizedHostPort(existing.Port) != targetPort || len(existing.Alias) > 0 {
 				hostRef = privateHostReference(cfg, targetNodeID)
 			}
 		}
@@ -1796,8 +1783,7 @@ func (r *Repository) resolveJumpForNode(
 		if !hok {
 			continue
 		}
-		clean := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(h.Address), "]"), "[")
-		if clean == canonicalAddr && normalizedHostPort(h.Port) == targetPort {
+		if SameHostAddress(h.Address, canonicalAddr) && normalizedHostPort(h.Port) == targetPort {
 			trimmedJump := strings.TrimSpace(n.ProxyJump)
 			jumpSet[trimmedJump] = struct{}{}
 		}
@@ -1903,10 +1889,15 @@ func resolveHopExactNodeMatch(cfg *Configuration, lookup map[string][]string, al
 	if _, ok := cfg.Nodes.Get(hop); ok {
 		return hop, true, nil
 	}
+	if norm := normalizeLookupSelector(hop); norm != "" && norm != hop {
+		if _, ok := cfg.Nodes.Get(norm); ok {
+			return norm, true, nil
+		}
+	}
 	if nid, ok := aliases[hop]; ok && nid != "" {
 		return nid, true, nil
 	}
-	if candidates := lookup[hop]; len(candidates) == 1 {
+	if candidates := lookupBySelector(lookup, hop); len(candidates) == 1 {
 		return candidates[0], true, nil
 	} else if len(candidates) > 1 {
 		return "", true, &AmbiguousNodeError{Selector: hop, Candidates: slices.Clone(candidates)}
@@ -1918,11 +1909,16 @@ func collectHostCandidates(cfg *Configuration, lookup map[string][]string, alias
 	if nid, ok := aliases[host]; ok && nid != "" {
 		return []string{nid}
 	}
-	if cands := lookup[host]; len(cands) > 0 {
+	if cands := lookupBySelector(lookup, host); len(cands) > 0 {
 		return slices.Clone(cands)
 	}
 	if _, ok := cfg.Nodes.Get(host); ok {
 		return []string{host}
+	}
+	if norm := normalizeLookupSelector(host); norm != "" && norm != host {
+		if _, ok := cfg.Nodes.Get(norm); ok {
+			return []string{norm}
+		}
 	}
 	return nil
 }
@@ -1964,7 +1960,7 @@ func resolveHopAddressFromCandidates(cfg *Configuration, hostCandidates []string
 		clean := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(h.Address), "]"), "[")
 		if firstAddr == "" {
 			firstAddr = clean
-		} else if firstAddr != clean {
+		} else if !SameHostAddress(firstAddr, clean) {
 			return "", false
 		}
 	}
@@ -2021,8 +2017,7 @@ func resolveHopAddressFallback(cfg *Configuration, hop, hopUser string, hopPort 
 		h, hok := cfg.Hosts.Get(n.HostRef)
 		ident, iok := cfg.Identities.Get(n.IdentityRef)
 		if hok && iok {
-			cleanHostAddr := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(h.Address), "]"), "[")
-			if cleanHostAddr == firstAddr && normalizedHostPort(h.Port) == normalizedHostPort(effectivePort) {
+			if SameHostAddress(h.Address, firstAddr) && normalizedHostPort(h.Port) == normalizedHostPort(effectivePort) {
 				if hopUser == "" || normalizedIdentityUser(ident.User) == hopUser {
 					matchingNodes = append(matchingNodes, nid)
 				}

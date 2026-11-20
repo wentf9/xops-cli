@@ -64,6 +64,18 @@ func (p probeConnectionProvider) GetOpenSSHParser() *config.OpenSSHParser {
 	return nil
 }
 
+func (p probeConnectionProvider) NodeOpenSSHOrigin(nodeID string) config.OpenSSHOrigin {
+	if store, ok := p.ConfigProvider.(interface {
+		NodeOpenSSHOrigin(string) config.OpenSSHOrigin
+	}); ok {
+		return store.NodeOpenSSHOrigin(nodeID)
+	}
+	return config.OpenSSHOrigin{
+		Alias:         p.NodeOpenSSHAlias(nodeID),
+		CanonicalHost: p.NodeCanonicalHost(nodeID),
+	}
+}
+
 func (p probeConnectionProvider) NodeOpenSSHAlias(nodeID string) string {
 	if store, ok := p.ConfigProvider.(interface{ NodeOpenSSHAlias(string) string }); ok {
 		return store.NodeOpenSSHAlias(nodeID)

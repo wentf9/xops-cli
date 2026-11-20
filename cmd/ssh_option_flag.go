@@ -264,14 +264,8 @@ func controlSocketPath(opts *SshOptions, provider config.ConfigProvider, nodeID 
 	}
 	connTarget := effectiveConnectionTarget(opts, nodeID)
 	target := controlTarget(opts, provider, nodeID)
-	registerControlCanonicalTarget(provider, opts, nodeID)
-	controlNodeID := resolveEffectiveControlNodeID(provider, nodeID, target.OriginalHost)
-	if controlNodeID == "" {
-		if _, canonHost := canonicalControlOriginAndHost(opts); canonHost != "" {
-			controlNodeID = config.OpenSSHNodePrefix + canonHost
-		}
-	}
-	ctrl, err := resolveControlConfig(provider, controlNodeID, connTarget.Selector, target.OriginalHost, sessionOpts)
+	lookupKey, sessionAuth := resolveControlSessionLookup(opts, provider, nodeID, connTarget, target)
+	ctrl, err := resolveControlConfig(provider, lookupKey, connTarget.Selector, sessionAuth, sessionOpts)
 	if err != nil {
 		return "", err
 	}
@@ -281,85 +275,141 @@ func controlSocketPath(opts *SshOptions, provider config.ConfigProvider, nodeID 
 	return ssh.ExpandControlPath(ctrl.Path, sshenv.Discover(), target)
 }
 
-func resolveEffectiveControlNodeID(provider config.ConfigProvider, nodeID, originalHost string) string {
-	if hasCanonicalControlHost(provider, nodeID) {
-		return nodeID
+func firstNonEmptySessionValue(vals ...string) string {
+	for _, v := range vals {
+		if trimmed := strings.TrimSpace(v); trimmed != "" {
+			return trimmed
+		}
 	}
-	if originalHost == "" || originalHost == nodeID {
-		return nodeID
+	return ""
+}
+
+func extractOpenSSHHost(nodeID string) string {
+	alias := strings.TrimSpace(config.UnwrapOpenSSHSelector(nodeID))
+	if alias == "" {
+		return ""
 	}
-	if provider != nil && nodeID != "" {
-		if snap, err := provider.ResolveConnection(nodeID); err == nil {
-			if !strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) || snap.Provenance != config.ProvenanceOpenSSHVirtual {
-				return nodeID
+	if _, parsedHost, _, err := utils.ParseAddr(alias); err == nil && parsedHost != "" {
+		return parsedHost
+	}
+	return alias
+}
+
+func resolveSavedControlSessionLookup(
+	provider config.ConfigProvider,
+	lookupKey, nodeID string,
+	connTarget config.ConnectionTarget,
+	origHost, canonHost, targetOrig, proxyJump string,
+) (key string, auth adapter.SessionAuth, handled bool, resolvedVirtual bool) {
+	auth.ProxyJump = proxyJump
+	if provider == nil {
+		return "", auth, false, false
+	}
+	if lookupKey != "" {
+		if snap, err := provider.ResolveConnection(lookupKey); err == nil {
+			if !config.IsOpenSSHNodeID(lookupKey) || snap.Provenance != config.ProvenanceOpenSSHVirtual {
+				resolvedAlias := snap.Node.OpenSSHAlias
+				resolvedCanon := snap.Node.CanonicalHost
+				if origHost == "" && resolvedAlias == "" && strings.TrimSpace(connTarget.Selector) != "" {
+					if resolved, rErr := config.ResolveTarget(provider, connTarget); rErr == nil && resolved.MatchedNodeID == lookupKey {
+						resolvedAlias = resolved.OpenSSHAlias
+						if resolvedCanon == "" {
+							resolvedCanon = resolved.CanonicalHost
+						}
+					}
+				}
+				auth.OriginalHost = firstNonEmptySessionValue(origHost, resolvedAlias, targetOrig)
+				auth.CanonicalHost = firstNonEmptySessionValue(canonHost, resolvedCanon)
+				return lookupKey, auth, true, false
+			}
+			if config.HasOpenSSHConfig(provider) {
+				resolvedVirtual = true
 			}
 		}
 	}
-	if strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) {
-		return resolveOpenSSHControlNodeAlias(provider, nodeID, originalHost)
+	if strings.TrimSpace(connTarget.Selector) != "" {
+		if resolved, err := config.ResolveTarget(provider, connTarget); err == nil && resolved.MatchedNodeID != "" && !config.IsOpenSSHNodeID(resolved.MatchedNodeID) {
+			auth.OriginalHost = firstNonEmptySessionValue(origHost, resolved.OpenSSHAlias, extractOpenSSHHost(nodeID), targetOrig)
+			auth.CanonicalHost = firstNonEmptySessionValue(canonHost, resolved.CanonicalHost)
+			return resolved.MatchedNodeID, auth, true, resolvedVirtual
+		}
 	}
-	syncSavedControlNodeAlias(provider, nodeID, originalHost)
-	return originalHost
+	return "", auth, false, resolvedVirtual
 }
 
-func hasCanonicalControlHost(provider config.ConfigProvider, nodeID string) bool {
-	if nodeID == "" || provider == nil {
-		return false
+// resolveControlSessionLookup computes the effective adapter lookup key and
+// SessionAuth metadata purely from caller inputs and read-only provider lookups
+// without mutating any provider state.
+func resolveControlSessionLookup(
+	opts *SshOptions,
+	provider config.ConfigProvider,
+	nodeID string,
+	connTarget config.ConnectionTarget,
+	target ssh.TargetContext,
+) (string, adapter.SessionAuth) {
+	origHost, canonHost := canonicalControlOriginAndHost(opts)
+	targetOrig := strings.TrimSpace(target.OriginalHost)
+	var auth adapter.SessionAuth
+	if opts != nil {
+		auth.ProxyJump = strings.TrimSpace(opts.JumpHost)
 	}
-	p, ok := provider.(interface{ NodeCanonicalHost(string) string })
-	return ok && p.NodeCanonicalHost(nodeID) != ""
+	lookupKey := strings.TrimSpace(nodeID)
+	key, savedAuth, handled, resolvedVirtual := resolveSavedControlSessionLookup(
+		provider, lookupKey, nodeID, connTarget, origHost, canonHost, targetOrig, auth.ProxyJump,
+	)
+	if handled {
+		return key, savedAuth
+	}
+	if canonHost != "" {
+		if lookupKey == "" || !config.IsOpenSSHNodeID(lookupKey) {
+			lookupKey = config.OpenSSHNodePrefix + canonHost
+		}
+		auth.OriginalHost = firstNonEmptySessionValue(origHost, targetOrig)
+		auth.CanonicalHost = canonHost
+		return lookupKey, auth
+	}
+	if config.IsOpenSSHNodeID(lookupKey) {
+		openSSHHost := extractOpenSSHHost(lookupKey)
+		if !resolvedVirtual {
+			if cleanOrig, ok := config.OpenSSHOriginalHost(lookupKey); ok && targetOrig != "" && targetOrig != cleanOrig && targetOrig != openSSHHost {
+				lookupKey = targetOrig
+			}
+		}
+		auth.OriginalHost = firstNonEmptySessionValue(origHost, openSSHHost, targetOrig)
+		auth.CanonicalHost = canonHost
+		return lookupKey, auth
+	}
+	if lookupKey == "" {
+		if targetOrig != "" {
+			lookupKey = targetOrig
+		} else {
+			lookupKey = strings.TrimSpace(connTarget.Selector)
+		}
+	}
+	auth.OriginalHost = firstNonEmptySessionValue(origHost, targetOrig)
+	auth.CanonicalHost = canonHost
+	return lookupKey, auth
 }
 
-func resolveOpenSSHControlNodeAlias(provider config.ConfigProvider, nodeID, originalHost string) string {
-	if cleanOrig, ok := config.OpenSSHOriginalHost(nodeID); ok && originalHost == cleanOrig {
-		return nodeID
-	}
-	alias := config.UnwrapOpenSSHSelector(nodeID)
-	if _, parsedHost, _, err := utils.ParseAddr(alias); err == nil && parsedHost != "" {
-		alias = parsedHost
-	}
-	setProviderOpenSSHAlias(provider, originalHost, alias)
-	return originalHost
-}
-
-func syncSavedControlNodeAlias(provider config.ConfigProvider, nodeID, originalHost string) {
-	if provider == nil {
-		return
-	}
-	if baseNode, ok := provider.GetNode(nodeID); ok && baseNode.OpenSSHAlias != "" {
-		setProviderOpenSSHAlias(provider, originalHost, baseNode.OpenSSHAlias)
-		return
-	}
-	parser := providerOpenSSHParser(provider)
-	if parser == nil || parser.HasHost(originalHost) {
-		return
-	}
-	snap, err := provider.ResolveConnection(nodeID)
-	if err == nil && !strings.Contains(originalHost, "@") && snap.Host.Address != "" && !strings.EqualFold(snap.Host.Address, originalHost) {
-		setProviderOpenSSHAlias(provider, originalHost, snap.Host.Address)
-	}
-}
-
-// resolveControlConfig resolves the effective multiplexing config for nodeID with
+// resolveControlConfig resolves the effective multiplexing config for lookupKey with
 // the given session overrides. When the selector matches no inventory node the
 // adapter still merges session, global, and OpenSSH layers, so an ad-hoc host is
 // validated exactly like a managed one.
-func resolveControlConfig(provider config.ConfigProvider, nodeID, selector, originalHost string, sessionOpts adapter.SessionControlOptions) (*ssh.ControlConfig, error) {
+func resolveControlConfig(provider config.ConfigProvider, lookupKey, selector string, sessionAuth adapter.SessionAuth, sessionOpts adapter.SessionControlOptions) (*ssh.ControlConfig, error) {
 	if provider == nil {
 		if sessionOpts.IsEmpty() {
 			return nil, nil
 		}
 		return ssh.EffectiveControl(mergeSessionControl(sessionOpts))
 	}
-	lookupKey := nodeID
 	if lookupKey == "" {
 		// ResolveControl treats an unknown selector as "no node layer" and falls
 		// back to session > global > OpenSSH, which is the ad-hoc case.
 		lookupKey = selector
 	}
 	var adpOpts []adapter.Option
-	if orig := strings.TrimSpace(originalHost); orig != "" && lookupKey != "" {
-		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(lookupKey, adapter.SessionAuth{OriginalHost: orig}))
+	if lookupKey != "" && (sessionAuth.OriginalHost != "" || sessionAuth.CanonicalHost != "" || sessionAuth.ProxyJump != "") {
+		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(lookupKey, sessionAuth))
 	}
 	return adapter.NewSSHAdapter(provider, adpOpts...).ResolveControl(lookupKey, sessionOpts)
 }
@@ -466,10 +516,14 @@ func isTargetControlNode(opts *SshOptions, nodeID string) bool {
 	return slices.Contains(opts.targetNodeIDs, nodeID)
 }
 
+func defaultLocalUser() string {
+	return sshenv.Discover().LocalUser
+}
+
 func targetContextFromResolvedTarget(resolved config.ResolvedTarget) ssh.TargetContext {
 	user := resolved.User
 	if user == "" {
-		user = sshenv.Discover().LocalUser
+		user = defaultLocalUser()
 	}
 	port := int(resolved.Port)
 	if port <= 0 {
@@ -485,12 +539,13 @@ func targetContextFromResolvedTarget(resolved config.ResolvedTarget) ssh.TargetC
 		orig = config.FormatNodeID(user, resolved.Host, uint16(port))
 	}
 	return ssh.TargetContext{
-		Host:         resolved.Host,
-		Port:         port,
-		User:         user,
-		OriginalHost: orig,
-		JumpHost:     resolved.ProxyJump,
-		KeyPath:      resolved.KeyPath,
+		Host:          resolved.Host,
+		Port:          port,
+		User:          user,
+		OriginalHost:  orig,
+		CanonicalHost: resolved.CanonicalHost,
+		JumpHost:      resolved.ProxyJump,
+		KeyPath:       resolved.KeyPath,
 	}
 }
 
@@ -585,9 +640,6 @@ func ApplyGeneralOptions(opts *SshOptions, optionStrings []string, flags *pflag.
 		}
 	}
 	allowJump := shouldApplyGeneralOption(flags, "jump", opts.JumpHost == "")
-	if !opts.appliedGeneralOpts && !allowJump && strings.TrimSpace(opts.JumpHost) != "" {
-		opts.cliJumpHost = strings.TrimSpace(opts.JumpHost)
-	}
 	st := generalOptionState{
 		allowPort:     shouldApplyGeneralOption(flags, "port", opts.Port == 0),
 		allowUser:     shouldApplyGeneralOption(flags, "login", opts.User == ""),
@@ -612,8 +664,8 @@ func ApplyGeneralOptions(opts *SshOptions, optionStrings []string, flags *pflag.
 }
 
 func applyGeneralOption(opts *SshOptions, st *generalOptionState, key, val string) error {
-	switch strings.ToLower(key) {
-	case "port":
+	switch ssh.CanonicalOptionKey(key) {
+	case ssh.OptionPort:
 		p, err := strconv.ParseUint(val, 10, 16)
 		if err != nil || p == 0 {
 			return fmt.Errorf("invalid Port in -o option: %q", val)
@@ -622,7 +674,7 @@ func applyGeneralOption(opts *SshOptions, st *generalOptionState, key, val strin
 			opts.Port = uint16(p)
 		}
 		st.seenPort = true
-	case "user":
+	case ssh.OptionUser:
 		if val == "" {
 			return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
 		}
@@ -630,13 +682,13 @@ func applyGeneralOption(opts *SshOptions, st *generalOptionState, key, val strin
 			opts.User = val
 		}
 		st.seenUser = true
-	case "identityfile":
+	case ssh.OptionIdentityFile:
 		return applyIdentityFileGeneralOption(opts, st, key, val)
-	case "proxyjump", "proxy_jump":
+	case ssh.OptionProxyJump:
 		return applyProxyJumpGeneralOption(opts, st, key, val)
-	case "proxycommand", "proxy_command":
+	case ssh.OptionProxyCommand:
 		return applyProxyCommandGeneralOption(st, key, val)
-	case "hostname":
+	case ssh.OptionHostName:
 		return applyHostNameOption(opts, st, key, val)
 	}
 	return nil
@@ -658,9 +710,8 @@ func applyProxyJumpGeneralOption(opts *SshOptions, st *generalOptionState, key, 
 	if val == "" {
 		return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
 	}
-	if st.allowJump && !st.seenJump && (!st.seenProxyCmd || ssh.IsDisabledProxyJump(val)) {
+	if st.allowJump && !st.seenJump && (!st.seenProxyCmd || !ssh.HasActiveProxyJump(val)) {
 		opts.JumpHost = val
-		opts.cliJumpHost = strings.TrimSpace(val)
 	}
 	st.seenJump = true
 	return nil

@@ -27,7 +27,7 @@ func (a *SSHAdapter) newAuthenticationMaterial(ctx context.Context, nodeID, pass
 	if a.credentialService == nil || a.credentialResolver == nil {
 		return password, passphrase, nil
 	}
-	snapshot, err := a.cfgProvider.ResolveConnection(nodeID)
+	snapshot, _, _, err := a.resolveConnectionSnapshot(nodeID)
 	if err != nil {
 		return "", "", fmt.Errorf("resolve authentication before recording: %w", err)
 	}

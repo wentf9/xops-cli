@@ -113,8 +113,9 @@ func pipeHasOpenWriter(f *os.File) bool {
 	}
 	hasWriter := false
 	ctlErr := raw.Control(func(fd uintptr) {
-		fds := []unix.PollFd{{Fd: int32(fd), Events: 0}}
+		fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
 		for {
+			fds[0].Revents = 0
 			_, pollErr := unix.Poll(fds, 0)
 			if pollErr == unix.EINTR {
 				continue

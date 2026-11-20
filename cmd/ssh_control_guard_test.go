@@ -2725,15 +2725,18 @@ func verifyRound16ControlEdgeCases(t *testing.T) {
 	ctx := context.Background()
 	target := ssh.TargetContext{Host: "10.0.0.50", User: "ops", Port: 22, OriginalHost: "web-50"}
 
-	// 1. Round 16: resolveEffectiveControlNodeID strips user@ and :port from openssh: composite nodeID.
+	// 1. Round 16 (updated R5 P2-13): resolveControlSessionLookup strips user@ and :port from openssh: composite nodeID without mutating provider.
 	aliasCfg := newEmptyTestConfig()
 	aliasProvider := config.NewProviderWithoutOpenSSH(aliasCfg)
-	effNodeID := resolveEffectiveControlNodeID(aliasProvider, "openssh:ops@my-jump-alias:2222", "ops@10.0.0.77:2222")
-	if effNodeID != "ops@10.0.0.77:2222" {
-		t.Fatalf("expected effective node ID 'ops@10.0.0.77:2222', got %q", effNodeID)
+	lookupKey, sessionAuth := resolveControlSessionLookup(nil, aliasProvider, "openssh:ops@my-jump-alias:2222", config.ConnectionTarget{}, ssh.TargetContext{OriginalHost: "ops@10.0.0.77:2222"})
+	if lookupKey != "ops@10.0.0.77:2222" {
+		t.Fatalf("expected lookupKey 'ops@10.0.0.77:2222', got %q", lookupKey)
 	}
-	if gotAlias := aliasProvider.NodeOpenSSHAlias("ops@10.0.0.77:2222"); gotAlias != "my-jump-alias" {
-		t.Fatalf("expected clean OpenSSH alias 'my-jump-alias', got %q", gotAlias)
+	if sessionAuth.OriginalHost != "my-jump-alias" {
+		t.Fatalf("expected clean OpenSSH alias 'my-jump-alias', got %q", sessionAuth.OriginalHost)
+	}
+	if gotAlias := aliasProvider.NodeOpenSSHAlias("ops@10.0.0.77:2222"); gotAlias != "" {
+		t.Fatalf("expected zero provider side-map mutation, got %q", gotAlias)
 	}
 
 	// 2. Round 16: Validate skips prepareCommandPlan for non-proxy -O commands, and ExecuteControlCommand validates control options.

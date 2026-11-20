@@ -246,14 +246,14 @@ func (o *SshOptions) registerForwardAndSessionFlags(cmd *cobra.Command) {
 }
 
 func (o *SshOptions) recordOptionFlag(raw string) {
-	if o == nil || o.cliTunnelLockedByW {
+	if o == nil || o.cliTunnelLockedByW || o.cliTunnelMode != "" {
 		return
 	}
 	key, val, err := adapter.SplitOptionKeyValue(raw)
 	if err != nil {
 		return
 	}
-	if strings.EqualFold(key, "tunnel") {
+	if ssh.CanonicalOptionKey(key) == ssh.OptionTunnel {
 		if mode, parseErr := ssh.ParseTunnelOption(val); parseErr == nil {
 			o.cliTunnelMode = mode
 		}
@@ -480,6 +480,9 @@ func (o *SshOptions) validateForwardAndSessionFlags() error {
 }
 
 func (o *SshOptions) resolveAndCacheSessionOptions(provider config.ConfigProvider, nodeID string) (*ssh.Options, error) {
+	if err := o.ensureGeneralOptionsApplied(); err != nil {
+		return nil, err
+	}
 	sessionOpts, err := o.toSessionControlOptions()
 	if err != nil {
 		return nil, err
@@ -491,7 +494,7 @@ func (o *SshOptions) resolveAndCacheSessionOptions(provider config.ConfigProvide
 			return nil, effErr
 		}
 		if o.isMuxDaemon() && eff != nil {
-			eff.StripClasses(ssh.OptionClassSession)
+			eff.StripClasses(ssh.OptionClassSession, ssh.OptionClassLocalExec)
 			eff.Delete(ssh.OptionForwardAgent)
 		} else if isChild && eff != nil {
 			eff.StripClasses(ssh.OptionClassLocalExec)
@@ -502,16 +505,9 @@ func (o *SshOptions) resolveAndCacheSessionOptions(provider config.ConfigProvide
 	connTarget := effectiveConnectionTarget(o, nodeID)
 	target := controlTarget(o, provider, nodeID)
 	o.resolvedTarget = &target
-	lookupKey := resolveEffectiveControlNodeID(provider, nodeID, target.OriginalHost)
-	if lookupKey == "" {
-		lookupKey = connTarget.Selector
-	}
+	lookupKey, sessionAuth := resolveControlSessionLookup(o, provider, nodeID, connTarget, target)
 	adpOpts := []adapter.Option{adapter.WithLocalExecution(!o.isMuxDaemon() && !isChild)}
-	sessionAuth := adapter.SessionAuth{
-		ProxyJump:    strings.TrimSpace(o.JumpHost),
-		OriginalHost: strings.TrimSpace(target.OriginalHost),
-	}
-	if lookupKey != "" && (sessionAuth.ProxyJump != "" || sessionAuth.OriginalHost != "") {
+	if lookupKey != "" && (sessionAuth.ProxyJump != "" || sessionAuth.OriginalHost != "" || sessionAuth.CanonicalHost != "") {
 		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(lookupKey, sessionAuth))
 	}
 	eff, err := adapter.NewSSHAdapter(provider, adpOpts...).ResolveSSHOptions(lookupKey, sessionOpts)

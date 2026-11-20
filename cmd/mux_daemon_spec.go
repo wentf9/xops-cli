@@ -233,7 +233,6 @@ func (o *SshOptions) applyMuxDaemonSpec(spec MuxDaemonSpec) error {
 	o.Port = spec.Port
 	o.User = spec.User
 	o.JumpHost = spec.JumpHost
-	o.cliJumpHost = strings.TrimSpace(spec.JumpHost)
 	o.HostName = spec.DialHost
 	o.cliHostName = ""
 	o.canonicalized = spec.Canonicalized
@@ -369,12 +368,7 @@ func (o *SshOptions) firstCLIIdentityFile(keys []string) string {
 }
 
 func isProxyCommandOptionKey(key string) bool {
-	switch strings.ToLower(strings.TrimSpace(key)) {
-	case "proxycommand", "proxy_command":
-		return true
-	default:
-		return false
-	}
+	return ssh.CanonicalOptionKey(key) == ssh.OptionProxyCommand
 }
 
 func isProxyCommandNoneOption(opt string) bool {
@@ -497,11 +491,9 @@ func isTargetOnlyMuxDaemonOption(opt string) bool {
 	if err != nil || key == "" {
 		return false
 	}
-	switch strings.ToLower(key) {
-	case "port", "user", "proxyjump", "identityfile", "hostname",
-		"proxycommand", "proxy_command",
-		"localcommand", "local_command",
-		"permitlocalcommand", "permit_local_command":
+	switch ssh.CanonicalOptionKey(key) {
+	case ssh.OptionPort, ssh.OptionUser, ssh.OptionProxyJump, ssh.OptionIdentityFile, ssh.OptionHostName,
+		ssh.OptionProxyCommand, ssh.OptionLocalCommand, ssh.OptionPermitLocalCommand:
 		return true
 	default:
 		return false

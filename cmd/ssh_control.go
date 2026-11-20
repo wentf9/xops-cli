@@ -281,7 +281,6 @@ func resolveControlContext(ctx context.Context, o *SshOptions, stderr io.Writer)
 		// the configuration problem instead of silently using a wrong socket.
 		return "", ssh.TargetContext{}, nil, "", controlError(stderr, fmt.Sprintf("%s: %v", i18n.T("ssh_err_load_config"), providerErr))
 	}
-	registerControlCanonicalTarget(provider, o, nodeID)
 
 	target := controlTarget(o, provider, nodeID)
 	expanded, err := expandControlSocketPath(o, provider, nodeID, target, stderr)
@@ -332,18 +331,6 @@ func resolveControlNodeID(provider config.ConfigProvider, target config.Connecti
 	return resolved.MatchedNodeID, nil
 }
 
-func setProviderOpenSSHAlias(provider config.ConfigProvider, nodeID, alias string) {
-	if p, ok := provider.(interface{ SetNodeOpenSSHAlias(string, string) }); ok {
-		p.SetNodeOpenSSHAlias(nodeID, alias)
-	}
-}
-
-func setProviderCanonicalHost(provider config.ConfigProvider, nodeID, canonicalHost string) {
-	if p, ok := provider.(interface{ SetNodeCanonicalHost(string, string) }); ok {
-		p.SetNodeCanonicalHost(nodeID, canonicalHost)
-	}
-}
-
 func canonicalControlOriginAndHost(o *SshOptions) (origHost, canonHost string) {
 	if o == nil || !o.canonicalized {
 		return "", ""
@@ -365,27 +352,6 @@ func canonicalControlOriginAndHost(o *SshOptions) (origHost, canonHost string) {
 		return "", ""
 	}
 	return origHost, canonHost
-}
-
-func registerControlCanonicalTarget(provider config.ConfigProvider, o *SshOptions, extraNodeIDs ...string) {
-	if provider == nil {
-		return
-	}
-	origHost, canonHost := canonicalControlOriginAndHost(o)
-	if origHost == "" || canonHost == "" {
-		return
-	}
-	targets := make([]string, 0, len(extraNodeIDs)+2)
-	targets = append(targets, config.OpenSSHNodePrefix+canonHost, origHost)
-	targets = append(targets, extraNodeIDs...)
-	for _, id := range targets {
-		id = strings.TrimSpace(id)
-		if id == "" {
-			continue
-		}
-		setProviderOpenSSHAlias(provider, id, origHost)
-		setProviderCanonicalHost(provider, id, canonHost)
-	}
 }
 
 func loadControlProviderWithOverride(o *SshOptions) (config.ConfigProvider, error) {
@@ -749,11 +715,21 @@ func buildControlProxyClientConfig(
 		if o != nil {
 			o.syncResolvedTargetHosts(provider)
 		}
-		registerControlCanonicalTarget(provider, o, nodeID)
 		snapshot = provider.Snapshot()
-		adp = adapter.NewSSHAdapter(provider, buildControlProxyAdapterOptions(snapshot, nodeID, o)...)
+		var (
+			lookupKey  string
+			lookupAuth adapter.SessionAuth
+		)
 		if nodeID != "" {
-			if resolvedCfg, err := adp.GetConfig(nodeID); err == nil && resolvedCfg != nil {
+			lookupKey, lookupAuth = resolveControlSessionLookup(o, provider, nodeID, effectiveConnectionTarget(o, nodeID), target)
+		}
+		adp = adapter.NewSSHAdapter(provider, buildControlProxyAdapterOptionsWithLookup(snapshot, nodeID, lookupKey, lookupAuth, o)...)
+		if nodeID != "" {
+			resolvedCfg, err := adp.GetConfig(firstNonEmptyControlValue(lookupKey, nodeID))
+			if (err != nil || resolvedCfg == nil) && lookupKey != "" && lookupKey != nodeID {
+				resolvedCfg, err = adp.GetConfig(nodeID)
+			}
+			if err == nil && resolvedCfg != nil {
 				normalizeControlProxyResolvedConfig(resolvedCfg, target)
 				cfg = resolvedCfg
 				muxOpts = append(muxOpts, ssh.WithMuxConnectionProvider(adp), ssh.WithMuxSecretResolver(adp))
@@ -780,6 +756,15 @@ func buildControlProxyClientConfig(
 	return cfg, muxOpts
 }
 
+func firstNonEmptyControlValue(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 func newControlProxyFallbackConfig(
 	target ssh.TargetContext,
 	provider config.ConfigProvider,
@@ -799,7 +784,6 @@ func newControlProxyFallbackConfig(
 	}
 	resolvedExec, _ := ssh.ResolveExecution(nil, globalExec)
 	fallbackLookup := resolveControlProxyFallbackLookup(target, provider, o)
-	registerControlCanonicalTarget(provider, o, fallbackLookup)
 	var pw string
 	if o != nil {
 		pw = o.Password
@@ -809,6 +793,7 @@ func newControlProxyFallbackConfig(
 		Port:                  port,
 		User:                  target.User,
 		OriginalHost:          target.OriginalHost,
+		CanonicalHost:         target.CanonicalHost,
 		Password:              pw,
 		SudoMode:              ssh.SudoModeAuto,
 		ProxyJump:             target.JumpHost,
@@ -907,6 +892,15 @@ func resolveControlProxyFallbackOptions(adp *adapter.SSHAdapter, host string, o 
 }
 
 func buildControlProxyAdapterOptions(snapshot *config.Configuration, nodeID string, o *SshOptions) []adapter.Option {
+	return buildControlProxyAdapterOptionsWithLookup(snapshot, nodeID, "", adapter.SessionAuth{}, o)
+}
+
+func buildControlProxyAdapterOptionsWithLookup(
+	snapshot *config.Configuration,
+	nodeID, lookupKey string,
+	lookupAuth adapter.SessionAuth,
+	o *SshOptions,
+) []adapter.Option {
 	var sessionAuth adapter.SessionAuth
 	var sessionCtrlOpts adapter.SessionControlOptions
 	if o != nil {
@@ -914,6 +908,11 @@ func buildControlProxyAdapterOptions(snapshot *config.Configuration, nodeID stri
 		if stripped, ok := config.OpenSSHOriginalHost(origHost); ok {
 			origHost = stripped
 		}
+		canonOrig, canonHost := canonicalControlOriginAndHost(o)
+		if origHost == "" {
+			origHost = firstNonEmptyControlValue(lookupAuth.OriginalHost, canonOrig)
+		}
+		canonHost = firstNonEmptyControlValue(lookupAuth.CanonicalHost, canonHost)
 		absKeys := o.absIdentityFiles()
 		firstKey := normalizeCLIIdentityPath(o.IdentityFile)
 		if firstKey == "" && len(absKeys) > 0 {
@@ -921,15 +920,16 @@ func buildControlProxyAdapterOptions(snapshot *config.Configuration, nodeID stri
 		}
 		hostNameOverride, _ := o.effectiveHostName()
 		sessionAuth = adapter.SessionAuth{
-			Password:     o.Password,
-			Passphrase:   o.Passphrase,
-			KeyPath:      firstKey,
-			KeyPaths:     absKeys,
-			HostName:     hostNameOverride,
-			OriginalHost: origHost,
-			Remember:     false,
-			OTP:          o.OTP,
-			ProxyJump:    o.JumpHost,
+			Password:      o.Password,
+			Passphrase:    o.Passphrase,
+			KeyPath:       firstKey,
+			KeyPaths:      absKeys,
+			HostName:      hostNameOverride,
+			OriginalHost:  origHost,
+			CanonicalHost: canonHost,
+			Remember:      false,
+			OTP:           o.OTP,
+			ProxyJump:     firstNonEmptyControlValue(o.JumpHost, lookupAuth.ProxyJump),
 		}
 		if parsed, ctrlErr := o.toSessionControlOptions(); ctrlErr == nil {
 			sessionCtrlOpts = parsed
@@ -941,14 +941,22 @@ func buildControlProxyAdapterOptions(snapshot *config.Configuration, nodeID stri
 		adapter.WithGlobalSessionAuth(sessionAuth),
 	}
 	if nodeID != "" {
-		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, sessionAuth))
+		overrideKey := firstNonEmptyControlValue(lookupKey, nodeID)
+		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(overrideKey, sessionAuth))
+		if overrideKey != nodeID {
+			adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, sessionAuth))
+		}
 	}
 	if !sessionCtrlOpts.IsEmpty() {
 		if globalCtrl := sessionCtrlOpts.ConnectionWideOptions(); !globalCtrl.IsEmpty() {
 			adpOpts = append(adpOpts, adapter.WithGlobalSessionControl(globalCtrl))
 		}
 		if nodeID != "" {
-			adpOpts = append(adpOpts, adapter.WithSessionControlOverride(nodeID, sessionCtrlOpts))
+			overrideKey := firstNonEmptyControlValue(lookupKey, nodeID)
+			adpOpts = append(adpOpts, adapter.WithSessionControlOverride(overrideKey, sessionCtrlOpts))
+			if overrideKey != nodeID {
+				adpOpts = append(adpOpts, adapter.WithSessionControlOverride(nodeID, sessionCtrlOpts))
+			}
 		}
 	}
 	if reg, regErr := utils.GetCredentialRegistry(snapshot); regErr == nil && reg != nil {

@@ -91,7 +91,8 @@ func systemDNSServers() []string {
 }
 
 func formatWindowsSocketAddressDNS(sockAddr windows.SocketAddress) (string, bool) {
-	if sockAddr.Sockaddr == nil || sockAddr.SockaddrLength <= 0 {
+	if sockAddr.Sockaddr == nil || sockAddr.SockaddrLength <= 0 ||
+		uintptr(sockAddr.SockaddrLength) < unsafe.Sizeof(sockAddr.Sockaddr.Addr.Family) {
 		return "", false
 	}
 	switch sockAddr.Sockaddr.Addr.Family {
@@ -256,11 +257,17 @@ func parseWindowsACL(dacl *windows.ACL, currSID *windows.SID) ([]windowsParsedAC
 			aceFlags: ace.Header.AceFlags,
 		}
 		if parsed.aceFlags&windowsInheritOnlyACEFlag == 0 && isStandardLayoutWindowsAllowACEType(parsed.aceType) {
-			if uintptr(ace.Header.AceSize) < unsafe.Sizeof(windows.ACCESS_ALLOWED_ACE{}) {
+			const minWindowsSIDHeaderSize = uintptr(8)
+			sidOffset := unsafe.Offsetof(ace.SidStart)
+			if uintptr(ace.Header.AceSize) < sidOffset+minWindowsSIDHeaderSize {
 				return nil, false
 			}
 			aceSID := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
-			if !aceSID.IsValid() || uintptr(ace.Header.AceSize) < unsafe.Offsetof(ace.SidStart)+uintptr(aceSID.Len()) {
+			if !aceSID.IsValid() {
+				return nil, false
+			}
+			sidLen := aceSID.Len()
+			if sidLen < int(minWindowsSIDHeaderSize) || uintptr(ace.Header.AceSize) < sidOffset+uintptr(sidLen) {
 				return nil, false
 			}
 			parsed.mask = uint32(ace.Mask)

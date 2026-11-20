@@ -482,7 +482,11 @@ func (c *Connector) resolveConnectionPlan(ctx context.Context, nodeName string) 
 			}
 			return plan, nil
 		}
-		current = cfg.ProxyJump
+		if len(jumps) == 1 {
+			current = jumps[0]
+		} else {
+			current = ""
+		}
 	}
 	return plan, nil
 }
@@ -521,7 +525,7 @@ func splitProxyJumpChain(proxyJump string) []string {
 	var jumps []string
 	for jump := range strings.SplitSeq(proxyJump, ",") {
 		jump = strings.TrimSpace(jump)
-		if jump != "" {
+		if jump != "" && !strings.EqualFold(jump, "none") {
 			jumps = append(jumps, jump)
 		}
 	}

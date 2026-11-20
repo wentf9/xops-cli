@@ -74,6 +74,14 @@ const (
 	OptionPermitLocalCommand           = "permit_local_command"
 )
 
+// Target-level OpenSSH CLI/config directives (resolved onto connection target, not stored in Options).
+const (
+	OptionPort      = "port"
+	OptionUser      = "user"
+	OptionHostName  = "hostname"
+	OptionProxyJump = "proxy_jump"
+)
+
 // OptionClass categorizes OpenSSH options by security and functional domain.
 type OptionClass string
 
@@ -161,6 +169,9 @@ var optionRegistry = []OptionSpec{
 		OpenSSHName:  "ControlPath",
 		Class:        OptionClassMux,
 		Normalize: func(raw string) (string, error) {
+			if hasASCIIControlChar(raw) {
+				return "", fmt.Errorf("invalid ControlPath %q: contains invalid ASCII control character", raw)
+			}
 			trimmed := strings.TrimSpace(raw)
 			if trimmed == "" {
 				return "", errors.New("invalid ControlPath: value cannot be empty")
@@ -637,36 +648,79 @@ func LookupOptionSpec(key string) (OptionSpec, bool) {
 	return spec, ok
 }
 
-// IsDisabledProxyJump reports whether raw explicitly disables ProxyJump
-// (e.g. "none" or comma-separated "none,none" with no active hop).
-func IsDisabledProxyJump(raw string) bool {
-	sawToken := false
-	for _, part := range strings.Split(raw, ",") {
+// CanonicalOptionKey resolves any supported OpenSSH option or target-level CLI
+// directive (in OpenSSH PascalCase, lowercase, alias, or snake_case form) to
+// its canonical key. Returns "" if key is unknown.
+func CanonicalOptionKey(key string) string {
+	trimmed := strings.ToLower(strings.TrimSpace(key))
+	switch trimmed {
+	case "":
+		return ""
+	case "port":
+		return OptionPort
+	case "user":
+		return OptionUser
+	case "hostname":
+		return OptionHostName
+	case "proxyjump", "proxy_jump":
+		return OptionProxyJump
+	}
+	if spec, ok := optionLookupMap[trimmed]; ok {
+		return spec.CanonicalKey
+	}
+	return ""
+}
+
+// ProxyJumpKind classifies a ProxyJump directive into its canonical tri-state.
+type ProxyJumpKind uint8
+
+const (
+	// ProxyJumpUnset means no ProxyJump directive was supplied (empty/whitespace).
+	ProxyJumpUnset ProxyJumpKind = iota
+	// ProxyJumpDisabled means ProxyJump was explicitly supplied with no active hop
+	// (e.g. "none", "none,none", ",", " , ").
+	ProxyJumpDisabled
+	// ProxyJumpActive means ProxyJump contains at least one concrete non-"none" hop.
+	ProxyJumpActive
+)
+
+// ClassifyProxyJump classifies raw into ProxyJumpUnset, ProxyJumpDisabled, or ProxyJumpActive.
+func ClassifyProxyJump(raw string) ProxyJumpKind {
+	if strings.TrimSpace(raw) == "" {
+		return ProxyJumpUnset
+	}
+	for part := range strings.SplitSeq(raw, ",") {
 		tok := strings.TrimSpace(part)
-		if tok == "" {
-			continue
-		}
-		sawToken = true
-		if !strings.EqualFold(tok, "none") {
-			return false
+		if tok != "" && !strings.EqualFold(tok, "none") {
+			return ProxyJumpActive
 		}
 	}
-	return sawToken
+	return ProxyJumpDisabled
+}
+
+// NormalizeProxyJump extracts active non-"none" hops joined by ",", or returns ""
+// when ProxyJump is unset or disabled.
+func NormalizeProxyJump(raw string) string {
+	var hops []string
+	for part := range strings.SplitSeq(raw, ",") {
+		tok := strings.TrimSpace(part)
+		if tok != "" && !strings.EqualFold(tok, "none") {
+			hops = append(hops, tok)
+		}
+	}
+	return strings.Join(hops, ",")
+}
+
+// IsDisabledProxyJump reports whether raw explicitly disables ProxyJump
+// (e.g. "none", "none,none", or comma-only values with no active hop).
+func IsDisabledProxyJump(raw string) bool {
+	return ClassifyProxyJump(raw) == ProxyJumpDisabled
 }
 
 // HasActiveProxyJump reports whether raw contains at least one non-empty hop
 // other than "none".
 func HasActiveProxyJump(raw string) bool {
-	for _, part := range strings.Split(raw, ",") {
-		tok := strings.TrimSpace(part)
-		if tok == "" {
-			continue
-		}
-		if !strings.EqualFold(tok, "none") {
-			return true
-		}
-	}
-	return false
+	return ClassifyProxyJump(raw) == ProxyJumpActive
 }
 
 // ParseStrictHostKeyChecking validates and normalizes StrictHostKeyChecking values.
@@ -722,51 +776,64 @@ func validateGatewayPorts(raw string) (string, error) {
 	}
 }
 
+func normalizeMultiPathEntries(optionName, raw string, normalizeItem func(string) (string, error)) (string, error) {
+	if raw == "" {
+		return "", fmt.Errorf("invalid %s: value cannot be empty", optionName)
+	}
+	var normalized []string
+	for line := range strings.SplitSeq(raw, "\n") {
+		if hasASCIIControlChar(line) {
+			return "", fmt.Errorf("invalid %s %q: value contains invalid ASCII control character", optionName, line)
+		}
+		item := strings.TrimSpace(line)
+		if item == "" {
+			return "", fmt.Errorf("invalid %s: value cannot be empty", optionName)
+		}
+		norm, err := normalizeItem(item)
+		if err != nil {
+			return "", fmt.Errorf("invalid %s %q: %w", optionName, item, err)
+		}
+		if !slices.Contains(normalized, norm) {
+			normalized = append(normalized, norm)
+		}
+	}
+	if len(normalized) == 0 {
+		return "", fmt.Errorf("invalid %s: value cannot be empty", optionName)
+	}
+	return strings.Join(normalized, "\n"), nil
+}
+
 func validateIdentityFiles(raw string) (string, error) {
-	return normalizeMultiForwardEntries("IdentityFile", raw, func(item string) (string, error) {
-		trimmed := strings.TrimSpace(item)
-		if trimmed == "" {
-			return "", errors.New("value cannot be empty")
-		}
-		if hasASCIIControlChar(trimmed) {
-			return "", errors.New("value contains invalid ASCII control character")
-		}
-		if strings.EqualFold(trimmed, "none") {
+	return normalizeMultiPathEntries("IdentityFile", raw, func(item string) (string, error) {
+		if strings.EqualFold(item, "none") {
 			return "none", nil
 		}
-		if err := validatePathTokenSyntax(trimmed, "IdentityFile"); err != nil {
+		if err := validatePathTokenSyntax(item, "IdentityFile"); err != nil {
 			return "", err
 		}
-		return trimmed, nil
+		return item, nil
 	})
 }
 
 func validateCertificateFiles(raw string) (string, error) {
-	return normalizeMultiForwardEntries("CertificateFile", raw, func(item string) (string, error) {
-		trimmed := strings.TrimSpace(item)
-		if trimmed == "" {
-			return "", errors.New("value cannot be empty")
-		}
-		if hasASCIIControlChar(trimmed) {
-			return "", errors.New("value contains invalid ASCII control character")
-		}
-		if strings.EqualFold(trimmed, "none") {
+	return normalizeMultiPathEntries("CertificateFile", raw, func(item string) (string, error) {
+		if strings.EqualFold(item, "none") {
 			return "none", nil
 		}
-		if err := validatePathTokenSyntax(trimmed, "CertificateFile"); err != nil {
+		if err := validatePathTokenSyntax(item, "CertificateFile"); err != nil {
 			return "", err
 		}
-		return trimmed, nil
+		return item, nil
 	})
 }
 
 func validateIdentityAgent(raw string) (string, error) {
+	if hasASCIIControlChar(raw) {
+		return "", fmt.Errorf("invalid IdentityAgent %q: contains invalid ASCII control character", raw)
+	}
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return "", errors.New("invalid IdentityAgent: value cannot be empty")
-	}
-	if hasASCIIControlChar(trimmed) {
-		return "", fmt.Errorf("invalid IdentityAgent %q: contains invalid ASCII control character", raw)
 	}
 	if strings.EqualFold(trimmed, "none") {
 		return "none", nil
@@ -781,12 +848,12 @@ func validateIdentityAgent(raw string) (string, error) {
 }
 
 func validateForwardAgent(raw string) (string, error) {
+	if hasASCIIControlChar(raw) {
+		return "", fmt.Errorf("invalid ForwardAgent %q: contains invalid ASCII control character", raw)
+	}
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return "", errors.New("invalid ForwardAgent: value cannot be empty")
-	}
-	if hasASCIIControlChar(trimmed) {
-		return "", fmt.Errorf("invalid ForwardAgent %q: contains invalid ASCII control character", raw)
 	}
 	switch strings.ToLower(trimmed) {
 	case "yes", "true":
@@ -826,6 +893,9 @@ func hasASCIIControlChar(s string) bool {
 // ExpandHostName expands OpenSSH HostName tokens (%% -> % and %h -> originalHost)
 // and rejects any other %x token, empty result, or ASCII control characters (< 0x20 or 0x7f).
 func ExpandHostName(pattern, originalHost string) (string, error) {
+	if hasASCIIControlChar(pattern) {
+		return "", fmt.Errorf("HostName %q contains invalid ASCII control characters", pattern)
+	}
 	trimmed := strings.TrimSpace(pattern)
 	if trimmed == "" {
 		return "", errors.New("HostName cannot be empty")
@@ -848,6 +918,9 @@ func ExpandHostName(pattern, originalHost string) (string, error) {
 		case '%':
 			sb.WriteByte('%')
 		case 'h':
+			if hasASCIIControlChar(originalHost) {
+				return "", fmt.Errorf("cannot expand %%h in HostName %q: original host contains invalid ASCII control characters", pattern)
+			}
 			if origTrimmed == "" {
 				return "", fmt.Errorf("cannot expand %%h in HostName %q: original host is empty", pattern)
 			}
@@ -1191,6 +1264,9 @@ func ResolveAlgorithmList(spec string, defaults []string) ([]string, error) {
 
 // ValidateControlPathSyntax verifies raw ControlPath string token syntax without environment dependencies.
 func ValidateControlPathSyntax(rawPath string) error {
+	if hasASCIIControlChar(rawPath) {
+		return fmt.Errorf("ControlPath %q contains invalid ASCII control character", rawPath)
+	}
 	if rawPath == "" || rawPath == "none" {
 		return nil
 	}

@@ -75,9 +75,17 @@ func TestRound3_P1_1_ProviderResolveWithProvenancePreservesPass1AndInlineOverrid
 		t.Fatalf("NodeID = %q, want %q", res.NodeID, wantID)
 	}
 
-	snap, err := repo.ResolveConnection(wantID)
+	// Decision 1.A: virtual OpenSSH targets are stateless and never retained in r.pending.
+	repo.pendingMu.RLock()
+	_, pendingStored := repo.pending[wantID]
+	repo.pendingMu.RUnlock()
+	if pendingStored {
+		t.Fatalf("r.pending unexpectedly retained virtual OpenSSH entry %q", wantID)
+	}
+
+	snap, err := repo.ResolveConnectionWithOrigin(wantID, "short")
 	if err != nil {
-		t.Fatalf("ResolveConnection error = %v", err)
+		t.Fatalf("ResolveConnectionWithOrigin error = %v", err)
 	}
 	if snap.Identity.User != "alice" || snap.Host.Port != 2222 {
 		t.Fatalf("inline user/port lost: user=%q port=%d, want alice:2222", snap.Identity.User, snap.Host.Port)

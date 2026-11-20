@@ -380,11 +380,17 @@ func (t *offeredPubKeyTracker) filterAgentSigners(signersFn func() ([]ssh.Signer
 //   - "" or "SSH_AUTH_SOCK" returns (strings.TrimSpace(env.AgentSocket), false, nil).
 //   - "$VAR", "${VAR}", "~", and percent tokens are expanded via env and target.
 func ResolveIdentityAgent(spec string, env Environment, target TargetContext) (socket string, disabled bool, err error) {
+	if hasASCIIControlChar(spec) {
+		return "", false, fmt.Errorf("invalid IdentityAgent %q: contains invalid ASCII control character", spec)
+	}
 	trimmed := strings.TrimSpace(spec)
 	if strings.EqualFold(trimmed, "none") {
 		return "", true, nil
 	}
 	if trimmed == "" || trimmed == "SSH_AUTH_SOCK" {
+		if hasASCIIControlChar(env.AgentSocket) {
+			return "", false, fmt.Errorf("invalid SSH_AUTH_SOCK %q: contains invalid ASCII control character", env.AgentSocket)
+		}
 		trimmedEnv := strings.TrimSpace(env.AgentSocket)
 		if trimmedEnv == "" {
 			return "", false, nil
@@ -399,12 +405,12 @@ func ResolveIdentityAgent(spec string, env Environment, target TargetContext) (s
 }
 
 func expandAgentSocketPath(rawPath string, env Environment, target TargetContext, kind string) (string, error) {
+	if hasASCIIControlChar(rawPath) {
+		return "", fmt.Errorf("invalid %s %q: contains invalid ASCII control character", kind, rawPath)
+	}
 	trimmed := strings.TrimSpace(rawPath)
 	if trimmed == "" {
 		return "", fmt.Errorf("invalid %s: value cannot be empty", kind)
-	}
-	if hasASCIIControlChar(trimmed) {
-		return "", fmt.Errorf("invalid %s %q: contains invalid ASCII control character", kind, rawPath)
 	}
 
 	if strings.HasPrefix(trimmed, "$") && !strings.HasPrefix(trimmed, "${") {
@@ -413,12 +419,15 @@ func expandAgentSocketPath(rawPath string, env Environment, target TargetContext
 			return "", fmt.Errorf("invalid environment variable name %q in %s", rawPath, kind)
 		}
 		val, ok := lookupEnv(env, varName)
-		val = strings.TrimSpace(val)
-		if !ok || val == "" {
+		if !ok {
 			return "", fmt.Errorf("invalid environment variable expansion: env var $%s has no value", varName)
 		}
 		if hasASCIIControlChar(val) {
 			return "", fmt.Errorf("invalid %s %q: expanded value contains ASCII control character", kind, rawPath)
+		}
+		val = strings.TrimSpace(val)
+		if val == "" {
+			return "", fmt.Errorf("invalid environment variable expansion: env var $%s has no value", varName)
 		}
 		return normalizeExpandedAgentSocketPath(val, env), nil
 	}
@@ -451,12 +460,12 @@ func expandAgentSocketPath(rawPath string, env Environment, target TargetContext
 			return "", err
 		}
 	}
+	if hasASCIIControlChar(expanded) {
+		return "", fmt.Errorf("invalid %s %q: expanded value contains ASCII control character", kind, rawPath)
+	}
 	expanded = strings.TrimSpace(expanded)
 	if expanded == "" {
 		return "", fmt.Errorf("invalid %s %q: expanded path is empty", kind, rawPath)
-	}
-	if hasASCIIControlChar(expanded) {
-		return "", fmt.Errorf("invalid %s %q: expanded value contains ASCII control character", kind, rawPath)
 	}
 	return normalizeExpandedAgentSocketPath(expanded, env), nil
 }
@@ -1921,6 +1930,15 @@ func shouldPreloadAgentSigners(
 	return false
 }
 
+func hasUnpairedExplicitCerts(explicitCerts []loadedUserCert, pairedCertPaths map[string]struct{}) bool {
+	for _, ec := range explicitCerts {
+		if _, paired := pairedCertPaths[ec.path]; !paired {
+			return true
+		}
+	}
+	return false
+}
+
 func buildIdentitiesOnlyPubkeyCandidates(
 	ctx context.Context,
 	opts AutoAuthOptions,
@@ -1950,7 +1968,7 @@ func buildIdentitiesOnlyPubkeyCandidates(
 
 	var agentByPub map[string]ssh.Signer
 	var cleanup func()
-	if !agentDisabled && agentSocket != "" && (len(candidatePaths) > 0 || len(explicitCerts) > 0) {
+	if !agentDisabled && agentSocket != "" && (len(candidatePaths) > 0 || hasUnpairedExplicitCerts(explicitCerts, pairedCertPaths)) {
 		agentByPub, cleanup = dialAgentSignersByPubKey(ctx, opts.LifecycleCtx, dialAgentFn, agentSocket, opts.HandshakeTimeout, l)
 	}
 

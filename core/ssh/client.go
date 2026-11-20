@@ -255,6 +255,7 @@ func (c *Client) configSnapshot() (ClientConfig, bool) {
 		TrustVersion:          c.connCfg.TrustVersion,
 		NodeID:                c.connCfg.NodeID,
 		OriginalHost:          c.connCfg.OriginalHost,
+		CanonicalHost:         c.connCfg.CanonicalHost,
 		Address:               c.connCfg.Address,
 		Port:                  c.connCfg.Port,
 		User:                  c.connCfg.User,

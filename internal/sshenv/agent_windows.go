@@ -17,7 +17,11 @@ import (
 const agentDialDefaultTimeout = 2 * time.Second
 
 func defaultAgentSocket() string {
-	if sock := strings.TrimSpace(os.Getenv("SSH_AUTH_SOCK")); sock != "" {
+	raw := os.Getenv("SSH_AUTH_SOCK")
+	if hasWindowsAgentControlChar(raw) {
+		return raw
+	}
+	if sock := strings.TrimSpace(raw); sock != "" {
 		return sock
 	}
 	return defaultWindowsOpenSSHAgentPipe
@@ -80,6 +84,10 @@ func dialWindowsNamedPipe(ctx context.Context, pipePath string) (net.Conn, error
 	}
 
 	const flags = uint32(windows.FILE_FLAG_OVERLAPPED | windows.SECURITY_SQOS_PRESENT | windows.SECURITY_IDENTIFICATION)
+	const desiredAccess = uint32(windows.FILE_GENERIC_READ | windows.FILE_WRITE_DATA)
+	// Compile-time lockstep check ensuring the Windows constant matches the
+	// cross-platform windowsAgentPipeDesiredAccess invariant (0x0012008b).
+	const _ = uint32(windowsAgentPipeDesiredAccess-desiredAccess) + uint32(desiredAccess-windowsAgentPipeDesiredAccess)
 	for {
 		if err := dialCtx.Err(); err != nil {
 			return nil, &net.OpError{Op: "dial", Net: "pipe", Addr: windowsPipeAddr(pipePath), Err: err}
@@ -87,7 +95,7 @@ func dialWindowsNamedPipe(ctx context.Context, pipePath string) (net.Conn, error
 
 		handle, createErr := windows.CreateFile(
 			pathPtr,
-			windows.GENERIC_READ|windows.GENERIC_WRITE,
+			desiredAccess,
 			0,
 			nil,
 			windows.OPEN_EXISTING,
@@ -173,19 +181,21 @@ func verifyWindowsAgentPipeServerOwner(pipeHandle windows.Handle) error {
 	)
 	if err := windows.GetNamedPipeServerProcessId(pipeHandle, &serverPID); err == nil && serverPID != 0 {
 		if serverPID == uint32(os.Getpid()) {
-			return nil
-		}
-		procHandle, openErr := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, serverPID)
-		if openErr == nil {
-			var tok windows.Token
-			tokErr := windows.OpenProcessToken(procHandle, windows.TOKEN_QUERY, &tok)
-			_ = windows.CloseHandle(procHandle)
-			if tokErr == nil {
-				tu, userErr := tok.GetTokenUser()
-				_ = tok.Close()
-				if userErr == nil && tu != nil && tu.User.Sid != nil {
-					tokenResolved = true
-					tokenTrusted = isTrustedWindowsPrincipalSID(tu.User.Sid, currSID)
+			tokenResolved = true
+			tokenTrusted = true
+		} else {
+			procHandle, openErr := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, serverPID)
+			if openErr == nil {
+				var tok windows.Token
+				tokErr := windows.OpenProcessToken(procHandle, windows.TOKEN_QUERY, &tok)
+				_ = windows.CloseHandle(procHandle)
+				if tokErr == nil {
+					tu, userErr := tok.GetTokenUser()
+					_ = tok.Close()
+					if userErr == nil && tu != nil && tu.User.Sid != nil {
+						tokenResolved = true
+						tokenTrusted = isTrustedWindowsPrincipalSID(tu.User.Sid, currSID)
+					}
 				}
 			}
 		}
@@ -229,7 +239,7 @@ func verifyWindowsAgentPipeServerOwner(pipeHandle windows.Handle) error {
 		}
 	}
 	effectiveSDErr := sdErr
-	if effectiveSDErr == nil && !tokenResolved {
+	if effectiveSDErr == nil {
 		effectiveSDErr = ownerErr
 	}
 	return evaluateWindowsAgentPipeSecurity(

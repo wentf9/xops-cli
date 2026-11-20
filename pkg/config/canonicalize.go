@@ -208,15 +208,12 @@ func executeCanonicalizeProbe(
 func resolveCanonicalEffectiveInputHost(parser *OpenSSHParser, rawCLI []string, orig string) string {
 	for _, raw := range rawCLI {
 		k, v, ok := splitCanonicalOptionKV(raw)
-		if !ok || canonicalOptionLookupKey(k) != "hostname" {
+		if !ok || ssh.CanonicalOptionKey(k) != ssh.OptionHostName {
 			continue
 		}
 		trimmed := strings.TrimSpace(v)
 		if trimmed == "" {
 			continue
-		}
-		if strings.EqualFold(trimmed, "none") {
-			return orig
 		}
 		if expanded, err := ssh.ExpandHostName(trimmed, orig); err == nil {
 			clean := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(expanded), "]"), "[")
@@ -409,24 +406,10 @@ type cliCanonicalTracker struct {
 	activeCLIJump      bool
 }
 
-func canonicalOptionLookupKey(key string) string {
-	lower := strings.ToLower(strings.TrimSpace(key))
-	switch lower {
-	case "proxyjump", "proxy_jump":
-		return "proxyjump"
-	case "hostname", "host_name":
-		return "hostname"
-	}
-	if spec, ok := ssh.LookupOptionSpec(lower); ok {
-		return spec.CanonicalKey
-	}
-	return lower
-}
-
 func (s *cliCanonicalTracker) applyDirective(policy *canonicalizePolicy, key, v string) {
-	lookupKey := canonicalOptionLookupKey(key)
+	lookupKey := ssh.CanonicalOptionKey(key)
 	switch lookupKey {
-	case "proxyjump", ssh.OptionProxyCommand:
+	case ssh.OptionProxyJump, ssh.OptionProxyCommand:
 		s.applyProxyDirective(policy, lookupKey, v)
 	case ssh.OptionCanonicalizeHostname:
 		if !s.seenMode {
@@ -466,12 +449,12 @@ func (s *cliCanonicalTracker) applyProxyDirective(policy *canonicalizePolicy, lo
 		return
 	}
 	switch lowerKey {
-	case "proxyjump":
+	case ssh.OptionProxyJump:
 		if !s.seenProxyJump {
 			s.seenProxyJump = true
-			isNone := ssh.IsDisabledProxyJump(v)
-			if !s.seenProxyCmd || isNone {
-				s.activeCLIJump = !isNone
+			active := ssh.HasActiveProxyJump(v)
+			if !s.seenProxyCmd || !active {
+				s.activeCLIJump = active
 				policy.setProxyJump(v)
 			}
 		}

@@ -72,7 +72,7 @@ func openSSHHostFromConfig(doc *sshConfigDoc, name, defaultUser string) (OpenSSH
 	var proxyJump string
 	if proxyWinner == "proxyjump" {
 		proxyJump = openSSHValue(doc, name, "ProxyJump", "")
-		if ssh.IsDisabledProxyJump(proxyJump) {
+		if !ssh.HasActiveProxyJump(proxyJump) {
 			proxyJump = ""
 		}
 	}

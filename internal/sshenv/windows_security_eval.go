@@ -67,6 +67,14 @@ const (
 		windowsAccessWriteOwner |
 		windowsAccessGenericWrite |
 		windowsAccessGenericAll
+
+	// Minimum client access mask for dialing Windows SSH agent named pipes:
+	// FILE_GENERIC_READ (0x00120089: READ_CONTROL|SYNCHRONIZE|FILE_READ_DATA|
+	// FILE_READ_ATTRIBUTES|FILE_READ_EA) | FILE_WRITE_DATA (0x00000002) = 0x0012008b.
+	// Deliberately excludes FILE_APPEND_DATA / FILE_CREATE_PIPE_INSTANCE (0x00000004)
+	// so non-elevated Windows users match Win32-OpenSSH's Authenticated Users ACE (0x0012019b).
+	windowsAgentPipeDesiredAccess uint32 = 0x0012008b
+	win32OpenSSHAgentAUAccessMask uint32 = 0x0012019b
 )
 
 type windowsParsedACE struct {
@@ -219,11 +227,8 @@ func evaluateWindowsAgentPipeOwner(
 	hasSDOwner bool,
 	sdOwnerTrusted bool,
 ) error {
-	if tokenResolved {
-		if !tokenTrusted {
-			return fmt.Errorf("%w (pid %d)", errUntrustedAgentPipeOwner, serverPID)
-		}
-		return nil
+	if tokenResolved && !tokenTrusted {
+		return fmt.Errorf("%w (pid %d)", errUntrustedAgentPipeOwner, serverPID)
 	}
 	if sdErr != nil {
 		return fmt.Errorf("verify ssh-agent named pipe owner: %w", sdErr)
