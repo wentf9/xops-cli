@@ -125,7 +125,7 @@ func limitFailure(path string) error {
 	if path == "" {
 		return nil
 	}
-	b, err := os.ReadFile(filepath.Join(path, "memory.events"))
+	b, err := os.ReadFile(filepath.Join(path, "memory.events")) //nolint:forbidigo // read Linux cgroup v2 kernel virtual file
 	if err != nil {
 		return errors.Join(ErrResource, err)
 	}
@@ -169,7 +169,7 @@ func removeLimit(path string) error {
 	if path == "" {
 		return nil
 	}
-	return os.Remove(path)
+	return os.Remove(path) //nolint:forbidigo // remove own delegated Linux cgroup v2 directory
 }
 
 func killProcessGroup(cmd *exec.Cmd) error {
@@ -203,7 +203,7 @@ func memoryPreflight() error {
 }
 
 func memorySnapshot() (available uint64, observed bool) {
-	b, err := os.ReadFile("/proc/meminfo")
+	b, err := os.ReadFile("/proc/meminfo") //nolint:forbidigo // read Linux /proc kernel virtual file
 	if err == nil {
 		for _, line := range strings.Split(string(b), "\n") {
 			fields := strings.Fields(line)
@@ -216,10 +216,10 @@ func memorySnapshot() (available uint64, observed bool) {
 			}
 		}
 	}
-	groups, groupErr := os.ReadFile("/proc/self/cgroup")
-	mounts, mountErr := os.ReadFile("/proc/self/mountinfo")
+	groups, groupErr := os.ReadFile("/proc/self/cgroup")    //nolint:forbidigo // read Linux /proc kernel virtual file
+	mounts, mountErr := os.ReadFile("/proc/self/mountinfo") //nolint:forbidigo // read Linux /proc kernel virtual file
 	if groupErr == nil && mountErr == nil {
-		if free, ok := cgroupMemoryAvailable(string(groups), string(mounts), os.ReadFile); ok && (!observed || free < available) {
+		if free, ok := cgroupMemoryAvailable(string(groups), string(mounts), os.ReadFile); ok && (!observed || free < available) { //nolint:forbidigo // read Linux cgroupfs kernel virtual files
 			available, observed = free, true
 		}
 	}
@@ -266,7 +266,7 @@ func createLimit(parent string) (path string, err error) {
 	}
 	defer func() {
 		if err != nil {
-			err = errors.Join(err, os.Remove(path))
+			err = errors.Join(err, os.Remove(path)) //nolint:forbidigo // rollback own MkdirTemp cgroup v2 directory on error
 		}
 	}()
 	for name, value := range map[string]string{"memory.max": "134217728", "memory.swap.max": "0"} {
@@ -274,7 +274,7 @@ func createLimit(parent string) (path string, err error) {
 		if err := os.WriteFile(file, []byte(value), 0600); err != nil {
 			return path, errors.Join(ErrResource, err)
 		}
-		b, err := os.ReadFile(file)
+		b, err := os.ReadFile(file) //nolint:forbidigo // read back Linux cgroup v2 kernel virtual control file
 		if err != nil {
 			return path, errors.Join(ErrResource, err)
 		}

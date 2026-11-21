@@ -90,7 +90,7 @@ func reopenNonBlockingWriteFile(source *os.File) (*os.File, error) {
 			openErr = pathErr
 			return
 		}
-		owned, openErr = os.OpenFile(devPath, os.O_WRONLY|unix.O_NONBLOCK|unix.O_NOCTTY, 0)
+		owned, openErr = os.OpenFile(devPath, os.O_WRONLY|unix.O_NONBLOCK|unix.O_NOCTTY, 0) //nolint:forbidigo // reopen verified TTY char device with independent non-blocking file description
 	})
 	if err != nil || openErr != nil {
 		if owned != nil {

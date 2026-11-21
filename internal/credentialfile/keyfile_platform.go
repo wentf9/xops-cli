@@ -18,7 +18,7 @@ func readKeyFile(ctx context.Context, path string) (key []byte, err error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path || path == "/" {
 		return nil, coreauth.ErrCredentialAccessDenied
 	}
-	f, err := os.Open(filepath.VolumeName(path) + string(filepath.Separator))
+	f, err := os.Open(filepath.VolumeName(path) + string(filepath.Separator)) //nolint:forbidigo // dirfd-pinned vault kernel + powercut fault injection
 	if err != nil {
 		return nil, err
 	}

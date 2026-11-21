@@ -15,7 +15,7 @@ import (
 // Open returns a PTY pair. The caller owns both files.
 // Pointer-aware ioctl helpers keep kernel output valid across Go stack moves.
 func Open() (master, slave *os.File, retErr error) {
-	opened, err := os.OpenFile("/dev/ptmx", os.O_RDWR|unix.O_NOCTTY, 0)
+	opened, err := os.OpenFile("/dev/ptmx", os.O_RDWR|unix.O_NOCTTY, 0) //nolint:forbidigo // open Linux PTY master char device for terminal test fixtures
 	if err != nil {
 		return nil, nil, fmt.Errorf("open PTY master: %w", err)
 	}
@@ -33,7 +33,7 @@ func Open() (master, slave *os.File, retErr error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("read PTY slave number: %w", err)
 	}
-	slave, err = os.OpenFile("/dev/pts/"+strconv.Itoa(number), os.O_RDWR|unix.O_NOCTTY, 0)
+	slave, err = os.OpenFile("/dev/pts/"+strconv.Itoa(number), os.O_RDWR|unix.O_NOCTTY, 0) //nolint:forbidigo // open Linux PTY slave char device for terminal test fixtures
 	if err != nil {
 		return nil, nil, fmt.Errorf("open PTY slave: %w", err)
 	}

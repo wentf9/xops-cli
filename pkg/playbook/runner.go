@@ -817,7 +817,7 @@ func (e *Engine) runTemplate(ctx context.Context, client *ssh.Client, spec *Copy
 				result = failStepResult(result, fmt.Errorf("close temp file: %w", closeErr))
 			}
 		}
-		if removeErr := os.Remove(tmpFile.Name()); removeErr != nil {
+		if removeErr := os.Remove(tmpFile.Name()); removeErr != nil { //nolint:forbidigo // cleanup own CreateTemp rendered template after SFTP upload
 			result = failStepResult(result, fmt.Errorf("remove temp file: %w", removeErr))
 		}
 	}()

@@ -84,7 +84,7 @@ func (a *AuditLogger) Log(entry AuditEntry) (err error) {
 		return fmt.Errorf("create audit directory %q failed: %w", dir, err)
 	}
 
-	f, openErr := os.OpenFile(a.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	f, openErr := os.OpenFile(a.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600) //nolint:forbidigo // append-only audit log sink under a.mu
 	if openErr != nil {
 		return fmt.Errorf("open audit file %q failed: %w", a.path, openErr)
 	}

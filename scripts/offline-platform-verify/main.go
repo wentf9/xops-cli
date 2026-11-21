@@ -47,7 +47,7 @@ func verify() (err error) {
 	if err != nil {
 		return err
 	}
-	defer func() { err = errors.Join(err, os.RemoveAll(temporary)) }()
+	defer func() { err = errors.Join(err, os.RemoveAll(temporary)) }() //nolint:forbidigo // cleanup own MkdirTemp directory in standalone release-verify script
 	root, err := filepath.EvalSymlinks(temporary)
 	if err != nil {
 		return err

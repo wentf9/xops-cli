@@ -124,7 +124,7 @@ func RunAnswerCommand(ctx context.Context, opts AnswerCommandOptions) ([]byte, e
 	cmd := exec.CommandContext(execCtx, opts.Command, opts.Args...)
 
 	// 1. Stdin 绑定到 os.DevNull
-	devNull, err := os.Open(os.DevNull)
+	devNull, err := os.Open(os.DevNull) //nolint:forbidigo // open os.DevNull for child stdin redirection
 	if err != nil {
 		return nil, fmt.Errorf("open %s for stdin: %w", os.DevNull, err)
 	}

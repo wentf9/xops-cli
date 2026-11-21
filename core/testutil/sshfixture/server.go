@@ -280,7 +280,7 @@ func (s *Server) Close() error {
 				s.errors = append(s.errors, err)
 			}
 			if strings.HasPrefix(key, "unix:") {
-				_ = os.Remove(strings.TrimPrefix(key, "unix:"))
+				_ = os.Remove(strings.TrimPrefix(key, "unix:")) //nolint:forbidigo // test fixture cleanup of fixture-bound unix socket
 			}
 		}
 		connections := make([]net.Conn, 0, len(s.connections))
@@ -418,13 +418,13 @@ func (s *Server) streamLocalForward(connection *ssh.ServerConn, request *ssh.Req
 	if s.ctx.Err() != nil {
 		s.mu.Unlock()
 		s.record(listener.Close())
-		_ = os.Remove(slPayload.SocketPath)
+		_ = os.Remove(slPayload.SocketPath) //nolint:forbidigo // test fixture cleanup of fixture-bound unix socket on shutdown
 		return
 	}
 	if _, exists := s.forwards[key]; exists {
 		s.mu.Unlock()
 		s.record(listener.Close())
-		_ = os.Remove(slPayload.SocketPath)
+		_ = os.Remove(slPayload.SocketPath) //nolint:forbidigo // test fixture cleanup of duplicate fixture-bound unix socket
 		s.record(request.Reply(false, nil))
 		return
 	}
@@ -455,7 +455,7 @@ func (s *Server) cancelStreamLocalForward(request *ssh.Request) {
 		return
 	}
 	s.record(listener.Close())
-	if err := os.Remove(slPayload.SocketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := os.Remove(slPayload.SocketPath); err != nil && !errors.Is(err, os.ErrNotExist) { //nolint:forbidigo // test fixture cleanup of canceled fixture-bound unix socket
 		s.record(err)
 	}
 	s.record(request.Reply(true, nil))

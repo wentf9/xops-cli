@@ -39,7 +39,7 @@ func mountIDWithStatx(file *os.File, statx statxMountFunc) (uint64, error) {
 }
 
 func mountIDFromFDInfo(file *os.File) (id uint64, err error) {
-	info, err := os.Open("/proc/self/fdinfo/" + strconv.FormatUint(uint64(file.Fd()), 10))
+	info, err := os.Open("/proc/self/fdinfo/" + strconv.FormatUint(uint64(file.Fd()), 10)) //nolint:forbidigo // dirfd-pinned vault kernel + powercut fault injection
 	if err != nil {
 		return 0, err
 	}

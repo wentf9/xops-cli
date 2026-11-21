@@ -121,7 +121,7 @@ func walkDirectory(ctx context.Context, path string) (_ *os.File, err error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return nil, fmt.Errorf("vault path must be a clean absolute private directory")
 	}
-	f, err := os.Open(filepath.VolumeName(path) + string(filepath.Separator))
+	f, err := os.Open(filepath.VolumeName(path) + string(filepath.Separator)) //nolint:forbidigo // dirfd-pinned vault kernel + powercut fault injection
 	if err != nil {
 		return nil, err
 	}

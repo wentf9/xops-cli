@@ -43,7 +43,7 @@ func reopenNonBlockingWriteFile(source *os.File) (*os.File, error) {
 		return nil, fmt.Errorf("access terminal output descriptor: %w", err)
 	}
 	if err := raw.Control(func(fd uintptr) {
-		owned, openErr = os.OpenFile(fmt.Sprintf("/proc/self/fd/%d", fd), os.O_WRONLY|unix.O_NONBLOCK|unix.O_NOCTTY, 0)
+		owned, openErr = os.OpenFile(fmt.Sprintf("/proc/self/fd/%d", fd), os.O_WRONLY|unix.O_NONBLOCK|unix.O_NOCTTY, 0) //nolint:forbidigo // reopen pinned terminal /proc/self/fd descriptor with independent non-blocking file description
 	}); err != nil {
 		if owned != nil {
 			_ = owned.Close()

@@ -69,7 +69,7 @@ func Fstatat(fd int, name string, st *Stat_t, flags int) error {
 }
 func Mkdirat(fd int, name string, mode uint32) error { return unix.Mkdirat(fd, name, mode) }
 func Unlinkat(fd int, name string, flags int) error  { return unix.Unlinkat(fd, name, flags) }
-func Flock(fd, flags int) error                      { return unix.Flock(fd, flags) }
+func Flock(fd, flags int) error                      { return unix.Flock(fd, flags) } //nolint:forbidigo // dirfd-pinned vault kernel + powercut fault injection
 func SyncFile(file *os.File) error                   { return file.Sync() }
 
 func normalizeStat(st unix.Stat_t) Stat_t {
