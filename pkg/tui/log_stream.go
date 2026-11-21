@@ -5,7 +5,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
+	"unicode"
 
 	"charm.land/bubbles/v2/textinput"
 	"charm.land/bubbles/v2/viewport"
@@ -14,6 +16,39 @@ import (
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 )
+
+var dockerContainerNameRe = regexp.MustCompile(`\A[a-zA-Z0-9][a-zA-Z0-9_.-]*\z`)
+
+func isNonPOSIXExecution(execCfg *ssh.ExecutionConfig) bool {
+	if execCfg == nil {
+		return false
+	}
+	return execCfg.LaunchDialect == ssh.LaunchCmd || execCfg.LaunchDialect == ssh.LaunchPowerShell ||
+		execCfg.Interpreter == ssh.InterpreterCmd || execCfg.Interpreter == ssh.InterpreterPowerShell ||
+		execCfg.Interpreter == ssh.InterpreterPwsh
+}
+
+func posixSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
+}
+
+func buildLogStreamCommand(target string) (string, error) {
+	if strings.TrimSpace(target) == "" {
+		return "", fmt.Errorf("log target must not be empty")
+	}
+	for _, r := range target {
+		if r < 0x20 || r == 0x7f || unicode.IsControl(r) {
+			return "", fmt.Errorf("log target contains invalid control character")
+		}
+	}
+	if container, ok := strings.CutPrefix(target, "docker:"); ok {
+		if !dockerContainerNameRe.MatchString(container) {
+			return "", fmt.Errorf("invalid docker container name %q", container)
+		}
+		return "docker logs --tail 100 -f -- " + posixSingleQuote(container), nil
+	}
+	return "tail -n 100 -f -- " + posixSingleQuote(target), nil
+}
 
 type logLineMsg struct {
 	sessionID int64
@@ -83,17 +118,13 @@ func (m logStreamerModel) Init() tea.Cmd {
 
 func (m *logStreamerModel) startStream() tea.Cmd {
 	return func() tea.Msg {
-		if execCfg := m.client.Execution(); execCfg != nil {
-			if execCfg.LaunchDialect == ssh.LaunchCmd || execCfg.LaunchDialect == ssh.LaunchPowerShell ||
-				execCfg.Interpreter == ssh.InterpreterCmd || execCfg.Interpreter == ssh.InterpreterPowerShell {
-				return logStreamClosedMsg{sessionID: m.sessionID, err: fmt.Errorf("log streaming requires Linux/POSIX platform, got incompatible execution config")}
-			}
+		if isNonPOSIXExecution(m.client.Execution()) {
+			return logStreamClosedMsg{sessionID: m.sessionID, err: fmt.Errorf("log streaming requires Linux/POSIX platform, got incompatible execution config")}
 		}
 
-		cmd := fmt.Sprintf("tail -n 100 -f %s", m.file)
-		if after, ok := strings.CutPrefix(m.file, "docker:"); ok {
-			container := after
-			cmd = fmt.Sprintf("docker logs --tail 100 -f %s", container)
+		cmd, err := buildLogStreamCommand(m.file)
+		if err != nil {
+			return logStreamClosedMsg{sessionID: m.sessionID, err: err}
 		}
 
 		stdout, err := m.client.RunProbeStream(m.ctx, cmd)

@@ -83,11 +83,8 @@ func (m logSelectModel) Init() tea.Cmd {
 
 func (m logSelectModel) scanLogs() tea.Cmd {
 	return func() tea.Msg {
-		if execCfg := m.client.Execution(); execCfg != nil {
-			if execCfg.LaunchDialect == ssh.LaunchCmd || execCfg.LaunchDialect == ssh.LaunchPowerShell ||
-				execCfg.Interpreter == ssh.InterpreterCmd || execCfg.Interpreter == ssh.InterpreterPowerShell {
-				return logScanResultMsg{err: fmt.Errorf("log viewer requires Linux/POSIX platform, got incompatible execution config")}
-			}
+		if isNonPOSIXExecution(m.client.Execution()) {
+			return logScanResultMsg{err: fmt.Errorf("log viewer requires Linux/POSIX platform, got incompatible execution config")}
 		}
 
 		ctx, cancel := context.WithTimeout(m.ctx, 10*time.Second)

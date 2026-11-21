@@ -121,16 +121,14 @@ func (m *Model) initForm(nodeID string) (Model, tea.Cmd) {
 				if strings.TrimSpace(s) == "" {
 					return errors.New(i18n.T("tui_validation_address_required"))
 				}
-				return nil
+				return config.ValidateConcreteHostAddress(s)
 			}),
 		huh.NewInput().
 			Title(i18n.T("tui_form_port")).
 			Value(&state.port).
 			Validate(func(s string) error {
-				if _, err := strconv.Atoi(s); err != nil {
-					return errors.New(i18n.T("tui_validation_port_invalid"))
-				}
-				return nil
+				_, err := parseFormPort(s)
+				return err
 			}),
 		// 认证信息
 		huh.NewSelect[string]().
@@ -319,6 +317,22 @@ func (m *Model) newNodeFormState(nodeID string) (*nodeFormState, error) {
 	return state, nil
 }
 
+func parseFormPort(raw string) (uint16, error) {
+	port64, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 16)
+	if err != nil || port64 == 0 {
+		return 0, errors.New(i18n.T("tui_validation_port_invalid"))
+	}
+	return uint16(port64), nil
+}
+
+func formatFormIdentityID(user, address string) string {
+	cleanAddr := config.StripHostBrackets(address)
+	if strings.Contains(cleanAddr, ":") {
+		return fmt.Sprintf("%s@[%s]", user, cleanAddr)
+	}
+	return fmt.Sprintf("%s@%s", user, cleanAddr)
+}
+
 func (m *Model) validateAliases(s string) error {
 	if s == "" {
 		return nil
@@ -329,16 +343,21 @@ func (m *Model) validateAliases(s string) error {
 		if a == "" {
 			continue
 		}
+		if err := config.ValidateNodeAlias(a); err != nil {
+			return err
+		}
 		if seen[a] {
 			return errors.New(i18n.Tf("alias_err_duplicate_input", map[string]any{"Alias": a}))
 		}
 		seen[a] = true
 
-		if existingNode := m.repository.FindAlias(a); existingNode != "" {
-			if m.formState.isEdit && existingNode == m.formState.originalID {
-				continue
+		if m.repository != nil {
+			if existingNode := m.repository.FindAlias(a); existingNode != "" {
+				if m.formState != nil && m.formState.isEdit && existingNode == m.formState.originalID {
+					continue
+				}
+				return errors.New(i18n.Tf("alias_err_exists", map[string]any{"Alias": a, "Node": existingNode}))
 			}
-			return errors.New(i18n.Tf("alias_err_exists", map[string]any{"Alias": a, "Node": existingNode}))
 		}
 	}
 	return nil
@@ -373,8 +392,11 @@ func (m *Model) validateFormState() error {
 	if strings.TrimSpace(s.address) == "" {
 		return errors.New(i18n.T("tui_validation_address_required"))
 	}
-	if _, err := strconv.Atoi(s.port); err != nil {
-		return errors.New(i18n.T("tui_validation_port_invalid"))
+	if err := config.ValidateConcreteHostAddress(s.address); err != nil {
+		return err
+	}
+	if _, err := parseFormPort(s.port); err != nil {
+		return err
 	}
 	if err := m.validateTags(s.tags); err != nil {
 		return err
@@ -431,6 +453,26 @@ func (m *Model) updateForm(msg tea.Msg) (Model, tea.Cmd) {
 	return *m, cmd
 }
 
+func normalizeSubmittedFormEndpoint(s *nodeFormState) (port uint16, identityID, hostID, nodeID string, err error) {
+	s.user = strings.TrimSpace(s.user)
+	rawAddr := strings.TrimSpace(s.address)
+	if s.user == "" {
+		return 0, "", "", "", errors.New(i18n.T("tui_validation_user_required"))
+	}
+	if rawAddr == "" {
+		return 0, "", "", "", errors.New(i18n.T("tui_validation_address_required"))
+	}
+	if err := config.ValidateConcreteHostAddress(s.address); err != nil {
+		return 0, "", "", "", err
+	}
+	port, err = parseFormPort(s.port)
+	if err != nil {
+		return 0, "", "", "", err
+	}
+	s.address = config.StripHostBrackets(rawAddr)
+	return port, formatFormIdentityID(s.user, s.address), config.FormatHostPort(s.address, port), config.FormatNodeID(s.user, s.address, port), nil
+}
+
 func (m *Model) saveFormCmd() tea.Cmd {
 	// Huh may write bound values while processing layout updates. Background
 	// verification and persistence own a snapshot of exactly what was submitted.
@@ -438,12 +480,11 @@ func (m *Model) saveFormCmd() tea.Cmd {
 	s.existingPasswordRef = s.existingPasswordRef.Clone()
 	s.existingPassphraseRef = s.existingPassphraseRef.Clone()
 
-	port, _ := strconv.Atoi(s.port)
-
-	// Prepare IDs
-	identityID := fmt.Sprintf("%s@%s", s.user, s.address)
-	hostID := fmt.Sprintf("%s:%d", s.address, port)
-	nodeID := fmt.Sprintf("%s@%s:%d", s.user, s.address, port)
+	port, identityID, hostID, nodeID, err := normalizeSubmittedFormEndpoint(&s)
+	if err != nil {
+		m.status = errorStyle.Render(err.Error())
+		return nil
+	}
 
 	view := m.repository.View()
 	// The read and conditional write are tied to the same revision. This keeps
@@ -479,7 +520,7 @@ func (m *Model) saveFormCmd() tea.Cmd {
 	// Try to get existing host to preserve any extra fields (like Host.Alias).
 	host, _ := view.Configuration.Hosts.Get(hostID)
 	host.Address = s.address
-	host.Port = uint16(port)
+	host.Port = port
 	node.HostRef = hostID
 	node.IdentityRef = identityID
 	node.SudoMode = models.SudoMode(s.sudoMode)

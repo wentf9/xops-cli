@@ -545,6 +545,15 @@ func (o *ScpOptions) runUpload(ctx context.Context, localPath string, dst PathIn
 	return errors.Join(uploadErr, finishProgress())
 }
 
+func isRemoteDirContentsPath(remotePath string) bool {
+	trimmed := strings.TrimRight(remotePath, "/")
+	return trimmed == "." || strings.HasSuffix(trimmed, "/.")
+}
+
+func isSafeLocalPathComponent(name string) bool {
+	return name != "" && name != "." && name != ".." && !strings.ContainsAny(name, `/\`) && filepath.VolumeName(name) == ""
+}
+
 func (o *ScpOptions) runDownload(ctx context.Context, src PathInfo, localPath string, provider config.ConfigProvider, connector *ssh.Connector) (err error) {
 	_, sftpCli, err := o.connectSftpForPath(ctx, src, "", provider, connector)
 	if err != nil {
@@ -570,7 +579,13 @@ func (o *ScpOptions) runDownload(ctx context.Context, src PathInfo, localPath st
 	// 处理本地路径是目录的情况
 	localDest := localPath
 	if lStat, err := os.Stat(localPath); err == nil && lStat.IsDir() {
-		localDest = filepath.Join(localPath, stat.Name())
+		if !isRemoteDirContentsPath(src.Path) {
+			if baseName := stat.Name(); isSafeLocalPathComponent(baseName) {
+				localDest = filepath.Join(localPath, baseName)
+			} else if !stat.IsDir() {
+				return fmt.Errorf("unsafe remote filename %q", baseName)
+			}
+		}
 	}
 
 	// 检查本地文件是否已存在
@@ -596,7 +611,7 @@ func (o *ScpOptions) runDownload(ctx context.Context, src PathInfo, localPath st
 	}
 	progress, finishProgress := o.createTransferProgress(ctx, size, "Downloading "+filepath.Base(src.Path), 0)
 	if stat.IsDir() {
-		downloadErr := sftpCli.WithForce(o.Force).DownloadDirectory(ctx, src.Path, localPath, progress)
+		downloadErr := sftpCli.WithForce(o.Force).DownloadDirectory(ctx, src.Path, localDest, progress)
 		return errors.Join(downloadErr, finishProgress())
 	}
 	downloadErr := sftpCli.WithForce(o.Force).DownloadFile(ctx, src.Path, localDest, stat.Size(), stat.Mode(), progress)
@@ -653,6 +668,18 @@ func (o *ScpOptions) runRemoteToRemote(ctx context.Context, src, dst PathInfo, p
 		}
 	}()
 
+	var preStat os.FileInfo
+	if err = srcSftp.Do(ctx, func(c *pkgsftp.Client) error {
+		var statErr error
+		preStat, statErr = c.Stat(src.Path)
+		return statErr
+	}); err != nil {
+		return fmt.Errorf("stat remote source %q failed: %w", src.Path, err)
+	}
+	if preStat.IsDir() {
+		return fmt.Errorf("remote-to-remote directory transfer is not supported for %q: download locally and upload instead", src.Path)
+	}
+
 	var srcFile *pkgsftp.File
 	err = srcSftp.Do(ctx, func(c *pkgsftp.Client) error {
 		var err error
@@ -667,6 +694,9 @@ func (o *ScpOptions) runRemoteToRemote(ctx context.Context, src, dst PathInfo, p
 	srcStat, err := srcFile.Stat()
 	if err != nil {
 		return fmt.Errorf("stat remote source %q failed: %w", src.Path, err)
+	}
+	if srcStat.IsDir() {
+		return fmt.Errorf("remote-to-remote directory transfer is not supported for %q: download locally and upload instead", src.Path)
 	}
 
 	dstPath := dst.Path

@@ -39,10 +39,11 @@ func sftpConnectionLostError(waitErr error) error {
 
 type SftpOptions struct {
 	SshOptions
-	maxTask     int
-	maxThread   int
-	force       bool
-	noOverwrite bool
+	maxTask             int
+	maxThread           int
+	force               bool
+	noOverwrite         bool
+	stdinCredentialUsed bool
 }
 
 func NewSftpOptions() *SftpOptions {
@@ -110,6 +111,7 @@ func (o *SftpOptions) Complete(cmd *cobra.Command, args []string) error {
 	o.hostFromPositional = false
 	o.appliedGeneralOpts = false
 	o.stdinScript = false
+	o.stdinCredentialUsed = false
 
 	var flags *pflag.FlagSet
 	if cmd != nil {
@@ -149,11 +151,24 @@ func (o *SftpOptions) Complete(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	if err := o.validateStdinOwnership(); err != nil {
+		return o.control.controlUsageError(err)
+	}
+
+	usedStdinCred := o.PasswordStdin || o.PassphraseStdin || o.OTPStdin
 	o.execution.capturePresence(cmd)
 	if err := o.completeStdinAndScriptInput(os.Getenv(sshBackgroundChildEnv) == "true", ""); err != nil {
 		return err
 	}
+	o.stdinCredentialUsed = usedStdinCred
 	o.stdinScript = false
+	return nil
+}
+
+func (o *SftpOptions) validateStdinOwnership() error {
+	if (o.PasswordStdin || o.PassphraseStdin || o.OTPStdin || o.stdinCredentialUsed) && !term.IsTerminal(int(os.Stdin.Fd())) {
+		return errors.New("stdin cannot supply both credentials (--password-stdin/--passphrase-stdin/--otp-stdin) and SFTP batch commands on non-terminal stdin; configure SSH key, agent, or credential store authentication instead")
+	}
 	return nil
 }
 
@@ -207,6 +222,9 @@ func (o *SftpOptions) RunContext(ctx context.Context) (err error) {
 		return err
 	}
 	if err := o.validateSftpInvariants(); err != nil {
+		return err
+	}
+	if err := o.validateStdinOwnership(); err != nil {
 		return err
 	}
 	batch := !term.IsTerminal(int(os.Stdin.Fd()))

@@ -429,6 +429,7 @@ type execHostTask struct {
 	pendingTarget *config.ConnectionTarget
 	pendingAddr   *utils.HostInfo
 	isTaggedTask  bool
+	outLogName    string
 }
 
 func (o *ExecOptions) Run() error {
@@ -568,11 +569,12 @@ func (o *ExecOptions) RunContext(ctx context.Context) (retErr error) {
 		return o.runInteractive(ctx, connector, tasks[0], execCmd)
 	}
 
-	// 落盘模式：在 Worker Pool 启动前一次性创建目录
+	// 落盘模式：在 Worker Pool 启动前一次性创建目录并分配无冲突日志文件名
 	if o.OutDir != "" {
 		if err := os.MkdirAll(o.OutDir, 0750); err != nil {
 			return fmt.Errorf("failed to create output directory %s: %w", o.OutDir, err)
 		}
+		assignExecTaskLogNames(tasks)
 	}
 
 	// 流式模式下多个 goroutine 共享 os.Stdout，需要用 lockedWriter 保证写入原子性
@@ -882,10 +884,8 @@ func (o *ExecOptions) executeTask(ctx context.Context, connector *ssh.Connector,
 	var outputOpts []ssh.RunOption
 
 	if o.OutDir != "" {
-		// 清洗主机名，防止路径穿越
-		safeHost := sanitizeHostForFilename(t.host)
-		logFile := filepath.Join(o.OutDir, safeHost+".log")
-		f, openErr := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		logFile := resolveTaskLogPath(o.OutDir, t)
+		f, openErr := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 		if openErr != nil {
 			return fmt.Errorf("[%s] open log file %s failed: %w", t.host, logFile, openErr)
 		}
@@ -1058,11 +1058,11 @@ func (o *ExecOptions) printTaskResult(ctx context.Context, t execHostTask, outpu
 		return writeExecResult(ctx, stdoutMu, o.stdoutWriter(), "%s\n", i18n.Tf("exec_result_success", map[string]any{"Host": t.host, "Output": output}))
 	}
 	if o.OutDir != "" {
-		safeHost := sanitizeHostForFilename(t.host)
-		message := fmt.Sprintf("[%s] Executed successfully (output saved to %s)", t.host, filepath.Join(o.OutDir, safeHost+".log"))
+		logFile := resolveTaskLogPath(o.OutDir, t)
+		message := fmt.Sprintf("[%s] Executed successfully (output saved to %s)", t.host, logFile)
 		if logger.ColorEnabled() {
 			hostPart := logger.Cyan(fmt.Sprintf("[%s] ", t.host))
-			successPart := logger.Green(fmt.Sprintf("Executed successfully (output saved to %s)", filepath.Join(o.OutDir, safeHost+".log")))
+			successPart := logger.Green(fmt.Sprintf("Executed successfully (output saved to %s)", logFile))
 			message = hostPart + successPart
 		}
 		return writeExecResult(ctx, stdoutMu, o.stdoutWriter(), "%s\n", message)
@@ -1076,17 +1076,117 @@ func (o *ExecOptions) printTaskResult(ctx context.Context, t execHostTask, outpu
 	return writeExecResult(ctx, stdoutMu, o.stdoutWriter(), "%s\n", message)
 }
 
-// sanitizeHostForFilename 清洗主机名，防止路径穿越攻击。
-// 移除目录分隔符和 ".." 等危险字符，仅保留文件名安全字符。
-func sanitizeHostForFilename(host string) string {
-	// 取 base 防止含路径分隔符
-	host = filepath.Base(host)
-	// 替换不安全字符
-	host = strings.ReplaceAll(host, "..", "_")
-	if host == "." || host == "" {
-		host = "unknown_host"
+func isWindowsReservedDeviceName(name string) bool {
+	stem := name
+	if idx := strings.IndexByte(stem, '.'); idx >= 0 {
+		stem = stem[:idx]
 	}
-	return host
+	switch strings.ToUpper(stem) {
+	case "CON", "PRN", "AUX", "NUL",
+		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
+		return true
+	default:
+		return false
+	}
+}
+
+// sanitizeHostForFilename 清洗主机名，防止路径穿越、非法文件名与 Windows 保留设备名/NTFS ADS 问题。
+func sanitizeHostForFilename(host string) string {
+	trimmed := strings.TrimSpace(host)
+	if trimmed == "" || trimmed == "." || trimmed == ".." {
+		return "unknown_host"
+	}
+	var b strings.Builder
+	b.Grow(len(host))
+	for _, r := range host {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	safe := b.String()
+	for strings.Contains(safe, "..") {
+		safe = strings.ReplaceAll(safe, "..", "_")
+	}
+	safe = strings.Trim(safe, ".")
+	if safe == "" || strings.Trim(safe, "_") == "" {
+		return "unknown_host"
+	}
+	if isWindowsReservedDeviceName(safe) {
+		safe = "_" + safe
+	}
+	return safe
+}
+
+func resolveTaskLogPath(outDir string, t execHostTask) string {
+	name := t.outLogName
+	if name == "" {
+		name = sanitizeHostForFilename(t.host) + ".log"
+	}
+	return filepath.Join(outDir, name)
+}
+
+func disambiguatedTaskLogBase(base string, t execHostTask) string {
+	var candidate string
+	switch {
+	case t.nodeID != "":
+		candidate = sanitizeHostForFilename(t.nodeID)
+	case t.user != "" && t.port != 0:
+		candidate = sanitizeHostForFilename(fmt.Sprintf("%s@%s:%d", t.user, t.host, t.port))
+	case t.user != "":
+		candidate = sanitizeHostForFilename(fmt.Sprintf("%s@%s", t.user, t.host))
+	case t.port != 0:
+		candidate = sanitizeHostForFilename(fmt.Sprintf("%s:%d", t.host, t.port))
+	default:
+		candidate = base
+	}
+	if candidate == "" {
+		return base
+	}
+	return candidate
+}
+
+func assignExecTaskLogNames(tasks []execHostTask) {
+	if len(tasks) == 0 {
+		return
+	}
+	baseNames := make([]string, len(tasks))
+	baseCounts := make(map[string]int, len(tasks))
+	for i, t := range tasks {
+		base := sanitizeHostForFilename(t.host)
+		baseNames[i] = base
+		baseCounts[strings.ToLower(base)]++
+	}
+
+	used := make(map[string]struct{}, len(tasks))
+	for i, base := range baseNames {
+		key := strings.ToLower(base)
+		if baseCounts[key] == 1 {
+			tasks[i].outLogName = base + ".log"
+			used[key] = struct{}{}
+		}
+	}
+
+	for i, t := range tasks {
+		if tasks[i].outLogName != "" {
+			continue
+		}
+		candidate := disambiguatedTaskLogBase(baseNames[i], t)
+		finalBase := candidate
+		if _, exists := used[strings.ToLower(finalBase)]; exists {
+			for n := 2; ; n++ {
+				numbered := fmt.Sprintf("%s_%d", candidate, n)
+				if _, taken := used[strings.ToLower(numbered)]; !taken {
+					finalBase = numbered
+					break
+				}
+			}
+		}
+		used[strings.ToLower(finalBase)] = struct{}{}
+		tasks[i].outLogName = finalBase + ".log"
+	}
 }
 
 func (o *ExecOptions) buildTasksFromTags(ctx context.Context, provider config.ConfigProvider) ([]execHostTask, error) {

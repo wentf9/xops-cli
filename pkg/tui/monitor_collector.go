@@ -125,12 +125,9 @@ func (mc *MetricsCollector) Start(ctx context.Context) error {
 	mc.mu.Unlock()
 
 	// 内置监控探针要求 Linux/POSIX 环境
-	if execCfg := mc.client.Execution(); execCfg != nil {
-		if execCfg.LaunchDialect == ssh.LaunchCmd || execCfg.LaunchDialect == ssh.LaunchPowerShell ||
-			execCfg.Interpreter == ssh.InterpreterCmd || execCfg.Interpreter == ssh.InterpreterPowerShell {
-			mc.finishStart(generation, cancel)
-			return fmt.Errorf("dashboard monitoring requires Linux/POSIX platform, got incompatible execution config")
-		}
+	if isNonPOSIXExecution(mc.client.Execution()) {
+		mc.finishStart(generation, cancel)
+		return fmt.Errorf("dashboard monitoring requires Linux/POSIX platform, got incompatible execution config")
 	}
 
 	// 发送探针前，先探测系统平台
@@ -266,11 +263,23 @@ func (mc *MetricsCollector) NextFrame(ctx context.Context) (*SystemMetrics, erro
 func (mc *MetricsCollector) processCPU(currentTicks *CPUTicks, metrics *SystemMetrics) {
 	metrics.CPUUsage = 0
 	if mc.lastTicks != nil && currentTicks != nil {
-		totalDelta := float64(currentTicks.Total() - mc.lastTicks.Total())
-		idleDelta := float64(currentTicks.IdleTicks() - mc.lastTicks.IdleTicks())
-		if totalDelta > 0 {
-			metrics.CPUUsage = 100.0 * (totalDelta - idleDelta) / totalDelta
+		currTotal := currentTicks.Total()
+		prevTotal := mc.lastTicks.Total()
+		if currTotal <= prevTotal {
+			return
 		}
+		totalDelta := currTotal - prevTotal
+		currIdle := currentTicks.IdleTicks()
+		prevIdle := mc.lastTicks.IdleTicks()
+		var idleDelta uint64
+		if currIdle > prevIdle {
+			idleDelta = currIdle - prevIdle
+		}
+		if idleDelta >= totalDelta {
+			metrics.CPUUsage = 0
+			return
+		}
+		metrics.CPUUsage = 100.0 * float64(totalDelta-idleDelta) / float64(totalDelta)
 	}
 }
 
@@ -310,19 +319,27 @@ func (mc *MetricsCollector) processEOF(metrics *SystemMetrics, currentProcs map[
 
 	var totalDelta uint64
 	if mc.lastTicks != nil && currentTicks != nil {
-		totalDelta = currentTicks.Total() - mc.lastTicks.Total()
+		currTotal := currentTicks.Total()
+		prevTotal := mc.lastTicks.Total()
+		if currTotal > prevTotal {
+			totalDelta = currTotal - prevTotal
+		}
 	}
 
 	for pid, curr := range currentProcs {
 		cpuPercent := 0.0
 		if prev, ok := mc.lastProcs[pid]; ok && totalDelta > 0 {
-			procDelta := (curr.Utime + curr.Stime) - (prev.Utime + prev.Stime)
-			cores := float64(mc.coresCount)
-			if cores == 0 {
-				cores = 1
+			currProc := curr.Utime + curr.Stime
+			prevProc := prev.Utime + prev.Stime
+			if currProc > prevProc {
+				procDelta := currProc - prevProc
+				cores := float64(mc.coresCount)
+				if cores == 0 {
+					cores = 1
+				}
+				// 100.0 * (process delta / total delta) * cores
+				cpuPercent = 100.0 * float64(procDelta) / float64(totalDelta) * cores
 			}
-			// 100.0 * (process delta / total delta) * cores
-			cpuPercent = 100.0 * float64(procDelta) / float64(totalDelta) * cores
 		}
 		usages = append(usages, procUsage{
 			pid:   pid,
