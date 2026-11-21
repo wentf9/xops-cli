@@ -50,11 +50,27 @@ const (
 	muxPhaseClosed
 )
 
+// PeerCheckMode controls OS peer credential verification on accepted multiplex
+// control connections. Its zero value (PeerCheckEnforce) enforces peer UID/SID
+// checks on every accepted connection so callers cannot silently omit verification.
+type PeerCheckMode uint8
+
+const (
+	// PeerCheckEnforce enforces OS peer credential verification on every accepted
+	// control connection (zero-value safe default).
+	PeerCheckEnforce PeerCheckMode = iota
+	// PeerCheckDisabledForTesting explicitly disables peer credential checks.
+	// Use ONLY for synthetic in-memory tests (e.g. net.Pipe) that bypass OS sockets.
+	PeerCheckDisabledForTesting
+)
+
 // MuxServerOptions configures the multiplex master server.
 type MuxServerOptions struct {
 	ControlPath       string
 	ExpectedUID       uint32
-	CheckPeerUID      bool
+	HasExpectedUID    bool
+	PeerCheck         PeerCheckMode
+	CheckPeerUID      bool // Retained for API compatibility; PeerCheck controls enforcement (zero-value enforces).
 	PersistEnabled    bool
 	PersistDuration   time.Duration
 	PersistIndefinite bool
@@ -156,6 +172,21 @@ func NewMuxServer(opts MuxServerOptions) (*MuxServer, error) {
 		return nil, fmt.Errorf("ssh client cannot be nil")
 	}
 
+	var checkPeer bool
+	switch opts.PeerCheck {
+	case PeerCheckEnforce:
+		checkPeer = true
+	case PeerCheckDisabledForTesting:
+		checkPeer = false
+	default:
+		return nil, fmt.Errorf("invalid peer check mode: %d", opts.PeerCheck)
+	}
+
+	expectedUID := opts.ExpectedUID
+	if checkPeer && !opts.HasExpectedUID && opts.ExpectedUID == 0 {
+		expectedUID = localPeerUID()
+	}
+
 	listener, origFi, err := bindAndLinkSocket(opts.ControlPath)
 	if err != nil {
 		return nil, err
@@ -177,8 +208,8 @@ func NewMuxServer(opts MuxServerOptions) (*MuxServer, error) {
 		serverCtx:             serverCtx,
 		serverCancel:          serverCancel,
 		controlPath:           opts.ControlPath,
-		expectedUID:           opts.ExpectedUID,
-		checkPeerUID:          opts.CheckPeerUID,
+		expectedUID:           expectedUID,
+		checkPeerUID:          checkPeer,
 		persistEnabled:        opts.PersistEnabled,
 		persistDuration:       opts.PersistDuration,
 		persistIndefinite:     opts.PersistIndefinite,
@@ -280,7 +311,6 @@ func StartMuxServer(ctx context.Context, sshClient *cryptoSSH.Client, opts MuxMa
 	env := opts.Environment
 
 	expectedUID := expectedPeerUIDFromEnvironment(env)
-	checkUID := true
 
 	var persistEnabled, persistIndefinite bool
 	var persistDuration time.Duration
@@ -324,7 +354,8 @@ func StartMuxServer(ctx context.Context, sshClient *cryptoSSH.Client, opts MuxMa
 	server, err := NewMuxServer(MuxServerOptions{
 		ControlPath:            opts.Path,
 		ExpectedUID:            expectedUID,
-		CheckPeerUID:           checkUID,
+		HasExpectedUID:         true,
+		PeerCheck:              PeerCheckEnforce,
 		PersistEnabled:         persistEnabled,
 		PersistDuration:        persistDuration,
 		PersistIndefinite:      persistIndefinite,
@@ -679,9 +710,8 @@ func (s *MuxServer) Serve() error {
 // control socket entry on disk was unlinked or replaced externally, while
 // letting any active foreground or proxy sessions drain cleanly before Shutdown.
 func (s *MuxServer) retireUnlinkedOrReplacedListener() {
-	s.idleMu.Lock()
-	firstStop := s.markStoppedListeningLocked()
-	s.idleMu.Unlock()
+	firstStop, releaseStop := s.admitStopListening()
+	defer releaseStop()
 
 	if firstStop {
 		if s.listener != nil {
@@ -692,11 +722,6 @@ func (s *MuxServer) retireUnlinkedOrReplacedListener() {
 		s.unlinkMu.Unlock()
 		activeMuxServers.CompareAndDelete(s.controlPath, s)
 	}
-
-	s.idleMu.Lock()
-	s.releaseForegroundOnStopIfArmedLocked()
-	s.onWorkCountChangedLocked()
-	s.idleMu.Unlock()
 }
 
 func (s *MuxServer) handleClient(conn net.Conn) {
@@ -915,44 +940,31 @@ func (s *MuxServer) handleTerminate(conn net.Conn, reqID uint32) error {
 // stoppedListening only run when the last active session is released, and there
 // is no such session to release.
 func (s *MuxServer) handleStopListening(conn net.Conn, reqID uint32) error {
-	s.idleMu.Lock()
-	s.stopRepliesInFlight++
-	firstStop := s.markStoppedListeningLocked()
-	s.idleMu.Unlock()
+	firstStop, releaseStop := s.admitStopListening()
+	defer releaseStop()
 
 	if firstStop && s.listener != nil {
 		_ = s.listener.Close()
 	}
 	s.unlinkControlSocketFileIfOurs()
-	sendErr := sendOk(conn, reqID)
-
-	s.idleMu.Lock()
-	s.stopRepliesInFlight--
-	s.releaseForegroundOnStopIfArmedLocked()
-	s.onWorkCountChangedLocked()
-	s.idleMu.Unlock()
-
-	return sendErr
+	return sendOk(conn, reqID)
 }
 
 func (s *MuxServer) handleProxy(conn net.Conn, reqID uint32) error {
-	if !s.beginSessionAdmission() {
+	ticket, ok := s.admitSessionOpen()
+	if !ok {
 		return sendFailure(conn, reqID, "mux master is shutting down")
 	}
-	admitted := false
-	defer func() {
-		if !admitted {
-			s.endSessionAdmission()
-		}
-	}()
+	defer ticket.Abort()
+
 	if err := s.authorize("proxy session"); err != nil {
 		return sendPermissionDenied(conn, reqID, err.Error())
 	}
-	if !s.promoteSessionAdmission() {
+	releaseSession, ok := ticket.Promote()
+	if !ok {
 		return sendFailure(conn, reqID, "mux master is shutting down")
 	}
-	admitted = true
-	defer s.removeActiveSession()
+	defer releaseSession()
 
 	if err := sendProxy(conn, reqID); err != nil {
 		return err
@@ -992,57 +1004,182 @@ func (s *MuxServer) canAdmitNewSession() bool {
 	return s.canAdmitNewWorkLocked()
 }
 
-// beginSessionAdmission atomically verifies that the master accepts new
-// sessions, tracks the admission as in-flight work, and disarms the
-// ControlPersist idle timer so authorize / recvFiles cannot race with
-// onIdleTimeout. Every true return must be matched by either a successful
-// promoteSessionAdmission or endSessionAdmission.
-func (s *MuxServer) beginSessionAdmission() bool {
-	if s == nil {
-		return false
+type muxWorkKind uint8
+
+const (
+	muxWorkSessionOpen muxWorkKind = iota + 1
+	muxWorkOpenForward
+	muxWorkCloseForward
+	muxWorkStopReply
+)
+
+func (s *MuxServer) enterMuxWorkLocked(kind muxWorkKind) (firstStop bool, ok bool) {
+	switch kind {
+	case muxWorkSessionOpen:
+		if !s.canAdmitNewWorkLocked() {
+			return false, false
+		}
+		s.sessionOpensInFlight++
+		s.disarmIdleTimerLocked()
+		return false, true
+	case muxWorkOpenForward:
+		if !s.canAdmitNewWorkLocked() {
+			return false, false
+		}
+		s.openFwdsInFlight++
+		s.disarmIdleTimerLocked()
+		return false, true
+	case muxWorkCloseForward:
+		if s.isShuttingDownLocked() {
+			return false, false
+		}
+		s.closeFwdsInFlight++
+		s.disarmIdleTimerLocked()
+		return false, true
+	case muxWorkStopReply:
+		s.stopRepliesInFlight++
+		firstStop = s.markStoppedListeningLocked()
+		s.disarmIdleTimerLocked()
+		return firstStop, true
+	default:
+		return false, false
 	}
-	s.idleMu.Lock()
-	defer s.idleMu.Unlock()
-	if !s.canAdmitNewWorkLocked() {
-		return false
-	}
-	s.sessionOpensInFlight++
-	s.disarmIdleTimerLocked()
-	return true
 }
 
-// promoteSessionAdmission atomically converts an in-flight session admission
-// into an active session under idleMu. When admission is rejected (e.g. -O stop
-// or shutdown raced with authorize/recvFiles), the caller's deferred
-// endSessionAdmission releases the slot after sending the rejection reply.
-func (s *MuxServer) promoteSessionAdmission() bool {
+func (s *MuxServer) releaseMuxWorkLocked(kind muxWorkKind) {
+	switch kind {
+	case muxWorkSessionOpen:
+		if s.sessionOpensInFlight > 0 {
+			s.sessionOpensInFlight--
+		}
+	case muxWorkOpenForward:
+		if s.openFwdsInFlight > 0 {
+			s.openFwdsInFlight--
+		}
+	case muxWorkCloseForward:
+		if s.closeFwdsInFlight > 0 {
+			s.closeFwdsInFlight--
+		}
+	case muxWorkStopReply:
+		if s.stopRepliesInFlight > 0 {
+			s.stopRepliesInFlight--
+		}
+		s.releaseForegroundOnStopIfArmedLocked()
+	default:
+		return
+	}
+	s.onWorkCountChangedLocked()
+}
+
+// admitMuxWork atomically checks lifecycle phase admission for kind, increments
+// its in-flight counter, disarms any armed idle timer, and returns an idempotent
+// release callback that decrements the counter and advances the lifecycle FSM.
+func (s *MuxServer) admitMuxWork(kind muxWorkKind) (release func(), ok bool) {
 	if s == nil {
-		return false
+		return func() {}, false
+	}
+	s.idleMu.Lock()
+	_, ok = s.enterMuxWorkLocked(kind)
+	s.idleMu.Unlock()
+	if !ok {
+		return func() {}, false
+	}
+	return sync.OnceFunc(func() {
+		s.idleMu.Lock()
+		defer s.idleMu.Unlock()
+		s.releaseMuxWorkLocked(kind)
+	}), true
+}
+
+// admitStopListening records an in-flight -O stop (or listener retirement),
+// transitions Running -> StoppingListen on the first caller, and returns an
+// idempotent release callback that drops stopRepliesInFlight, consumes any
+// armed foreground stop release, and triggers idle/drain evaluation.
+func (s *MuxServer) admitStopListening() (firstStop bool, release func()) {
+	if s == nil {
+		return false, func() {}
+	}
+	s.idleMu.Lock()
+	firstStop, _ = s.enterMuxWorkLocked(muxWorkStopReply)
+	s.idleMu.Unlock()
+	return firstStop, sync.OnceFunc(func() {
+		s.idleMu.Lock()
+		defer s.idleMu.Unlock()
+		s.releaseMuxWorkLocked(muxWorkStopReply)
+	})
+}
+
+type muxSessionTicketState uint8
+
+const (
+	muxTicketOpen muxSessionTicketState = iota
+	muxTicketPromoted
+	muxTicketAborted
+)
+
+// muxSessionTicket tracks an admitted in-flight session open (proxy, passenger
+// session, or passenger stdio forward). Callers defer ticket.Abort() and call
+// ticket.Promote() once authorization and FD/request setup succeed; both
+// transitions are serialized under server.idleMu and idempotent.
+type muxSessionTicket struct {
+	server *MuxServer
+	state  muxSessionTicketState
+}
+
+// admitSessionOpen atomically verifies that the master accepts new sessions,
+// tracks the admission in sessionOpensInFlight, and disarms the ControlPersist
+// idle timer so authorize / recvFiles cannot race with onIdleTimeout.
+func (s *MuxServer) admitSessionOpen() (*muxSessionTicket, bool) {
+	if s == nil {
+		return nil, false
 	}
 	s.idleMu.Lock()
 	defer s.idleMu.Unlock()
-	if !s.canAdmitNewWorkLocked() {
-		return false
+	if _, ok := s.enterMuxWorkLocked(muxWorkSessionOpen); !ok {
+		return nil, false
 	}
+	return &muxSessionTicket{server: s, state: muxTicketOpen}, true
+}
+
+// Promote atomically converts an in-flight session admission into an active
+// session under idleMu and returns an idempotent release function. When
+// admission is rejected (e.g. -O stop, handoff, or shutdown raced with
+// authorize/recvFiles), the ticket remains open so the caller's deferred Abort
+// releases the in-flight slot only after the rejection reply is written.
+func (t *muxSessionTicket) Promote() (releaseSession func(), ok bool) {
+	if t == nil || t.server == nil {
+		return func() {}, false
+	}
+	s := t.server
+	s.idleMu.Lock()
+	defer s.idleMu.Unlock()
+	if t.state != muxTicketOpen || !s.canAdmitNewWorkLocked() {
+		return func() {}, false
+	}
+	t.state = muxTicketPromoted
 	if s.sessionOpensInFlight > 0 {
 		s.sessionOpensInFlight--
 	}
 	s.activeSessions++
 	s.hadActiveSession = true
 	s.disarmIdleTimerLocked()
-	return true
+	return sync.OnceFunc(s.removeActiveSession), true
 }
 
-func (s *MuxServer) endSessionAdmission() {
-	if s == nil {
+// Abort idempotently releases an unpromoted session admission ticket. Once
+// Promote has succeeded (or Abort has already run), Abort is a safe no-op.
+func (t *muxSessionTicket) Abort() {
+	if t == nil || t.server == nil {
 		return
 	}
+	s := t.server
 	s.idleMu.Lock()
 	defer s.idleMu.Unlock()
-	if s.sessionOpensInFlight > 0 {
-		s.sessionOpensInFlight--
+	if t.state != muxTicketOpen {
+		return
 	}
-	s.onWorkCountChangedLocked()
+	t.state = muxTicketAborted
+	s.releaseMuxWorkLocked(muxWorkSessionOpen)
 }
 
 func (s *MuxServer) addActiveSession() bool {

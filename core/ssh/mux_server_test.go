@@ -217,6 +217,51 @@ func TestMuxServer_PeerUID_Verification(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected connection to fail with mismatched UID, got nil error")
 	}
+
+	// 3. Zero-value MuxServerOptions (without CheckPeerUID) enforces localPeerUID() by default
+	zeroDefaultPath := filepath.Join(tmpDir, "zero-default.sock")
+	serverZeroDefault, err := NewMuxServer(MuxServerOptions{
+		ControlPath: zeroDefaultPath,
+		SSHClient:   newDummySSHClient(),
+	})
+	if err != nil {
+		t.Fatalf("NewMuxServer(zero-value) failed: %v", err)
+	}
+	defer func() { _ = serverZeroDefault.Shutdown() }()
+	go func() { _ = serverZeroDefault.Serve() }()
+
+	if !serverZeroDefault.checkPeerUID || serverZeroDefault.expectedUID != localPeerUID() {
+		t.Fatalf("zero-value MuxServerOptions = (checkPeerUID=%v, expectedUID=%d), want (true, %d)",
+			serverZeroDefault.checkPeerUID, serverZeroDefault.expectedUID, localPeerUID())
+	}
+	zeroClient, err := DialMuxClient(ctx, zeroDefaultPath)
+	if err != nil {
+		t.Fatalf("DialMuxClient failed on zero-value MuxServerOptions: %v", err)
+	}
+	if _, err := zeroClient.AliveCheck(ctx); err != nil {
+		_ = zeroClient.Close()
+		t.Fatalf("AliveCheck failed on zero-value MuxServerOptions: %v", err)
+	}
+	_ = zeroClient.Close()
+
+	// 4. Zero-value CheckPeerUID with mismatched ExpectedUID must still reject (fail-closed default)
+	if os.Getuid() != 0 {
+		zeroMismatchPath := filepath.Join(tmpDir, "zero-mismatch.sock")
+		serverZeroMismatch, err := NewMuxServer(MuxServerOptions{
+			ControlPath: zeroMismatchPath,
+			ExpectedUID: currentUID + 9999,
+			SSHClient:   newDummySSHClient(),
+		})
+		if err != nil {
+			t.Fatalf("NewMuxServer(zero-value mismatch) failed: %v", err)
+		}
+		defer func() { _ = serverZeroMismatch.Shutdown() }()
+		go func() { _ = serverZeroMismatch.Serve() }()
+
+		if _, err := DialMuxClient(ctx, zeroMismatchPath); err == nil {
+			t.Fatal("expected zero-value MuxServerOptions with mismatched ExpectedUID to reject DialMuxClient")
+		}
+	}
 }
 
 func TestMuxServer_Terminate(t *testing.T) {

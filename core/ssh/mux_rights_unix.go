@@ -178,7 +178,7 @@ func retryReplaceStaleSocketLink(tempPath, targetPath string) bool {
 func checkPeerUID(conn net.Conn, expectedUID uint32) error {
 	sc, ok := conn.(syscall.Conn)
 	if !ok {
-		return fmt.Errorf("connection does not support raw socket control")
+		return fmt.Errorf("%w: connection does not support raw socket control", ErrUnauthorizedPeer)
 	}
 	rawConn, err := sc.SyscallConn()
 	if err != nil {
@@ -214,15 +214,12 @@ func localPeerUID() uint32 {
 }
 
 func handlePassengerSession(s *MuxServer, conn net.Conn, reqID uint32, payload []byte) error {
-	if !s.beginSessionAdmission() {
+	ticket, ok := s.admitSessionOpen()
+	if !ok {
 		return sendFailure(conn, reqID, "mux master is shutting down")
 	}
-	admitted := false
-	defer func() {
-		if !admitted {
-			s.endSessionAdmission()
-		}
-	}()
+	defer ticket.Abort()
+
 	if err := s.authorize("passenger session"); err != nil {
 		return sendPermissionDenied(conn, reqID, err.Error())
 	}
@@ -245,11 +242,11 @@ func handlePassengerSession(s *MuxServer, conn net.Conn, reqID uint32, payload [
 		return sendFailure(conn, reqID, fmt.Sprintf("malformed new session request: %v", err))
 	}
 
-	if !s.promoteSessionAdmission() {
+	releaseSession, ok := ticket.Promote()
+	if !ok {
 		return sendFailure(conn, reqID, "mux master is shutting down")
 	}
-	admitted = true
-	defer s.removeActiveSession()
+	defer releaseSession()
 
 	s.trackStream(conn)
 	defer s.untrackStream(conn)
@@ -1167,15 +1164,12 @@ func startPassengerStdioConnWatch(conn net.Conn) (<-chan struct{}, func() bool) 
 }
 
 func handlePassengerStdioFwd(s *MuxServer, conn net.Conn, reqID uint32, payload []byte) error {
-	if !s.beginSessionAdmission() {
+	ticket, ok := s.admitSessionOpen()
+	if !ok {
 		return sendFailure(conn, reqID, "mux master is shutting down")
 	}
-	admitted := false
-	defer func() {
-		if !admitted {
-			s.endSessionAdmission()
-		}
-	}()
+	defer ticket.Abort()
+
 	if err := s.authorize("passenger stdio forward"); err != nil {
 		return sendPermissionDenied(conn, reqID, err.Error())
 	}
@@ -1196,11 +1190,11 @@ func handlePassengerStdioFwd(s *MuxServer, conn net.Conn, reqID uint32, payload 
 		return sendFailure(conn, reqID, errMsg)
 	}
 
-	if !s.promoteSessionAdmission() {
+	releaseSession, ok := ticket.Promote()
+	if !ok {
 		return sendFailure(conn, reqID, "mux master is shutting down")
 	}
-	admitted = true
-	defer s.removeActiveSession()
+	defer releaseSession()
 
 	s.trackStream(conn)
 	defer s.untrackStream(conn)

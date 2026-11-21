@@ -1058,23 +1058,13 @@ func (s *MuxServer) registerBoundMuxForward(
 }
 
 func (s *MuxServer) handleOpenFwd(conn net.Conn, req MuxFwdRequest) error {
-	s.idleMu.Lock()
-	if s.phase != muxPhaseRunning || s.stoppedListening {
+	releaseWork, ok := s.admitMuxWork(muxWorkOpenForward)
+	if !ok {
 		// Shutdown or -O stop already took effect; accepting a forward now would
 		// leave a listener that outlives the master it belongs to.
-		s.idleMu.Unlock()
 		return sendFailure(conn, req.RequestID, "mux master is shutting down")
 	}
-	s.openFwdsInFlight++
-	s.disarmIdleTimerLocked()
-	s.idleMu.Unlock()
-
-	defer func() {
-		s.idleMu.Lock()
-		s.openFwdsInFlight--
-		s.onWorkCountChangedLocked()
-		s.idleMu.Unlock()
-	}()
+	defer releaseWork()
 
 	normListenHost, normConnectHost, err := validateAndNormalizeMuxFwdSpec(
 		req.FwdType, req.ListenHost, req.ListenPort, req.ConnectHost, req.ConnectPort,
@@ -1702,21 +1692,11 @@ func (s *MuxServer) waitClosingEndpointLocked(listenKey forwardListenKey) (waite
 }
 
 func (s *MuxServer) handleCloseFwd(conn net.Conn, req MuxFwdRequest) error {
-	s.idleMu.Lock()
-	if s.isShuttingDownLocked() {
-		s.idleMu.Unlock()
+	releaseWork, ok := s.admitMuxWork(muxWorkCloseForward)
+	if !ok {
 		return sendFailure(conn, req.RequestID, "mux master is shutting down")
 	}
-	s.closeFwdsInFlight++
-	s.disarmIdleTimerLocked()
-	s.idleMu.Unlock()
-
-	defer func() {
-		s.idleMu.Lock()
-		s.closeFwdsInFlight--
-		s.onWorkCountChangedLocked()
-		s.idleMu.Unlock()
-	}()
+	defer releaseWork()
 
 	normListenHost, normConnectHost, err := validateAndNormalizeMuxFwdSpec(
 		req.FwdType, req.ListenHost, req.ListenPort, req.ConnectHost, req.ConnectPort,
