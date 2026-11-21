@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/wentf9/xops-cli/core/fsx"
 	"github.com/wentf9/xops-cli/core/ssh"
 )
 
@@ -161,13 +162,47 @@ func (b *sshConfigBlock) matchesConcretePattern(alias string) bool {
 
 const (
 	maxIncludeFileLoads        = 256
+	maxIncludeProbes           = 1536
 	maxOpenSSHConfigFileBytes  = 16 << 20
 	maxOpenSSHConfigTotalBytes = 64 << 20
 )
 
 type includeLoadBudget struct {
 	loads      int
+	probes     int
 	totalBytes int64
+}
+
+func (b *includeLoadBudget) chargeProbe(path string) error {
+	if b == nil {
+		return nil
+	}
+	if b.probes >= maxIncludeProbes {
+		return fmt.Errorf("included ssh config probe budget (%d) exceeded at %q", maxIncludeProbes, path)
+	}
+	b.probes++
+	return nil
+}
+
+func (b *includeLoadBudget) checkMatchCount(pat string, count int) error {
+	if b == nil {
+		return nil
+	}
+	if count > maxIncludeProbes-b.probes {
+		return fmt.Errorf("included ssh config probe budget (%d) exceeded expanding %q (%d matches)", maxIncludeProbes, pat, count)
+	}
+	return nil
+}
+
+func (b *includeLoadBudget) chargeLoad(path string) error {
+	if b == nil {
+		return nil
+	}
+	if b.loads >= maxIncludeFileLoads {
+		return fmt.Errorf("included ssh config load limit (%d) exceeded at %q", maxIncludeFileLoads, path)
+	}
+	b.loads++
+	return nil
 }
 
 func sshConfigSourceLabel(path string) string {
@@ -224,30 +259,8 @@ func decodeOpenSSHConfig(r io.Reader, sourcePath string) (*sshConfigDoc, error) 
 	return decodeOpenSSHBytesWithBudget(b, isSystemSSHConfigPath(sourcePath), 0, active, budget)
 }
 
-func decodeOpenSSHFile(path string, system bool, depth int, active map[string]struct{}, budget *includeLoadBudget) (doc *sshConfigDoc, retErr error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if closeErr := f.Close(); closeErr != nil && !errors.Is(closeErr, os.ErrClosed) {
-			retErr = errors.Join(retErr, closeErr)
-		}
-	}()
-	info, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("included ssh config %q is not a regular file", path)
-	}
-	if info.Size() > maxOpenSSHConfigFileBytes {
-		return nil, fmt.Errorf("ssh config %q size limit (%d bytes) exceeded", path, maxOpenSSHConfigFileBytes)
-	}
-	if budget != nil && info.Size() > int64(maxOpenSSHConfigTotalBytes)-budget.totalBytes {
-		return nil, fmt.Errorf("ssh config %q total size limit (%d bytes) exceeded", path, maxOpenSSHConfigTotalBytes)
-	}
-	b, err := readOpenSSHConfigLimited(f, path, budget)
+func decodeOpenSSHOpenedFile(rf *fsx.RegularFile, path string, system bool, depth int, active map[string]struct{}, budget *includeLoadBudget) (*sshConfigDoc, error) {
+	b, err := readOpenSSHConfigLimited(rf, path, budget)
 	if err != nil {
 		return nil, err
 	}
@@ -696,12 +709,18 @@ func loadOpenSSHIncludeFiles(
 	var files []includedSSHConfigFile
 	seenPaths := make(map[string]struct{})
 	for _, pat := range patterns {
+		if err := budget.chargeProbe(pat); err != nil {
+			return nil, err
+		}
 		matches, skip, err := expandAndGlobIncludePattern(pat, system)
 		if err != nil {
 			return nil, err
 		}
 		if skip {
 			continue
+		}
+		if err := budget.checkMatchCount(pat, len(matches)); err != nil {
+			return nil, err
 		}
 		for _, match := range matches {
 			incFile, ok, err := loadSingleIncludedFile(match, system, depth, active, seenPaths, budget)
@@ -737,40 +756,85 @@ func loadSingleIncludedFile(
 	seenPaths map[string]struct{},
 	budget *includeLoadBudget,
 ) (includedSSHConfigFile, bool, error) {
+	if err := budget.chargeProbe(match); err != nil {
+		return includedSSHConfigFile{}, false, err
+	}
 	if _, exists := seenPaths[match]; exists {
 		return includedSSHConfigFile{}, false, nil
 	}
-	info, statErr := os.Stat(match)
-	if statErr != nil {
-		if errors.Is(statErr, os.ErrNotExist) {
-			return includedSSHConfigFile{}, false, nil
-		}
-		return includedSSHConfigFile{}, false, fmt.Errorf("stat included ssh config %q: %w", match, statErr)
+
+	rf, skip, err := openIncludedSSHConfigFile(match, budget)
+	if err != nil || skip {
+		return includedSSHConfigFile{}, false, err
 	}
-	if info.IsDir() {
+	defer func() { _ = rf.Close() }()
+
+	if rf.IsDevNull() {
+		seenPaths[match] = struct{}{}
 		return includedSSHConfigFile{}, false, nil
 	}
-	if !info.Mode().IsRegular() {
-		return includedSSHConfigFile{}, false, fmt.Errorf("included ssh config %q is not a regular file", match)
+
+	if err := budget.chargeProbe(match); err != nil {
+		return includedSSHConfigFile{}, false, err
 	}
 	canonPath := canonicalIncludePath(match)
 	if _, inCycle := active[canonPath]; inCycle {
 		return includedSSHConfigFile{}, false, nil
 	}
-	if budget != nil {
-		if budget.loads >= maxIncludeFileLoads {
-			return includedSSHConfigFile{}, false, fmt.Errorf("included ssh config load limit (%d) exceeded at %q", maxIncludeFileLoads, match)
-		}
-		budget.loads++
+	if err := budget.chargeLoad(match); err != nil {
+		return includedSSHConfigFile{}, false, err
 	}
+
 	active[canonPath] = struct{}{}
-	subDoc, decErr := decodeOpenSSHFile(match, system, depth+1, active, budget)
+	subDoc, decErr := decodeOpenSSHOpenedFile(rf, match, system, depth+1, active, budget)
 	delete(active, canonPath)
 	if decErr != nil {
 		return includedSSHConfigFile{}, false, fmt.Errorf("decode included ssh config %q: %w", match, decErr)
 	}
 	seenPaths[match] = struct{}{}
 	return includedSSHConfigFile{path: match, doc: subDoc}, true, nil
+}
+
+func openIncludedSSHConfigFile(match string, budget *includeLoadBudget) (*fsx.RegularFile, bool, error) {
+	remaining := int64(maxOpenSSHConfigTotalBytes)
+	if budget != nil {
+		remaining = int64(maxOpenSSHConfigTotalBytes) - budget.totalBytes
+		if remaining < 0 {
+			return nil, false, fmt.Errorf("ssh config %q total size limit (%d bytes) exceeded", match, maxOpenSSHConfigTotalBytes)
+		}
+	}
+	openLimit := max(min(int64(maxOpenSSHConfigFileBytes), remaining), 1)
+	// OpenSSH follows symlinks for Include targets and treats /dev/null as an
+	// empty no-op matching root -F /dev/null; fsx.OpenRegular opens handle-first
+	// without Stat-then-Open and rejects FIFOs/devices/oversize without blocking.
+	rf, err := fsx.OpenRegular(match, fsx.Limits{MaxBytes: openLimit}, fsx.AllowDevNull(), fsx.FollowSymlinks())
+	if err == nil {
+		if !rf.IsDevNull() && rf.Size() > remaining {
+			_ = rf.Close()
+			return nil, false, fmt.Errorf("ssh config %q total size limit (%d bytes) exceeded", match, maxOpenSSHConfigTotalBytes)
+		}
+		return rf, false, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, true, nil
+	}
+	if errors.Is(err, fsx.ErrTooLarge) {
+		if remaining < int64(maxOpenSSHConfigFileBytes) {
+			return nil, false, fmt.Errorf("ssh config %q total size limit (%d bytes) exceeded: %w", match, maxOpenSSHConfigTotalBytes, err)
+		}
+		return nil, false, fmt.Errorf("ssh config %q size limit (%d bytes) exceeded: %w", match, maxOpenSSHConfigFileBytes, err)
+	}
+	if errors.Is(err, fsx.ErrNonRegular) {
+		if probeErr := budget.chargeProbe(match); probeErr != nil {
+			return nil, false, probeErr
+		}
+		// Post-rejection diagnostic only: OpenSSH skips directories matched by Include globs.
+		if info, statErr := os.Stat(match); statErr == nil && info.IsDir() {
+			return nil, true, nil
+		}
+		return nil, false, fmt.Errorf("included ssh config %q is not a regular file: %w", match, err)
+	}
+	return nil, false, fmt.Errorf("open included ssh config %q: %w", match, err)
 }
 
 func expandOpenSSHIncludePattern(pat string, system bool) (string, bool, error) {

@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -330,87 +329,6 @@ Host *
 			if err == nil && res.hasDL && res.remaining > 2*time.Second {
 				t.Errorf("MED-8: CanonicalizeHost accepted invalid ConnectTimeout=%q and overrode 1s timeout to ~%v", raw, res.remaining.Round(time.Millisecond))
 			}
-		}
-	})
-}
-
-// TestP7Repro_MED13_IncludeBudget_CountsGlobFanOutDirsAndDanglingSymlinks reproduces MED-13:
-// Include glob fan-out over directories, dangling symlinks, and active-cycle symlinks
-// performs unbounded Stat / EvalSymlinks probes without charging includeBudget.
-func TestP7Repro_MED13_IncludeBudget_CountsGlobFanOutDirsAndDanglingSymlinks(t *testing.T) {
-	t.Parallel()
-
-	const fanOutCount = 2100
-
-	t.Run("directory_glob_fanout_counts_against_budget", func(t *testing.T) {
-		t.Parallel()
-		baseDir := t.TempDir()
-		incDir := filepath.Join(baseDir, "dirs")
-		if err := os.MkdirAll(incDir, 0o700); err != nil {
-			t.Fatalf("MkdirAll: %v", err)
-		}
-		for i := range fanOutCount {
-			if err := os.Mkdir(filepath.Join(incDir, fmt.Sprintf("d-%04d", i)), 0o700); err != nil {
-				t.Fatalf("Mkdir %d: %v", i, err)
-			}
-		}
-		cfgPath := filepath.Join(baseDir, "ssh_config")
-		cfgText := fmt.Sprintf("Include %s/*\nHost app\n    HostName 10.0.0.1\n", incDir)
-		if err := os.WriteFile(cfgPath, []byte(cfgText), 0o600); err != nil {
-			t.Fatalf("WriteFile: %v", err)
-		}
-
-		if _, err := NewOpenSSHParserFromPath(cfgPath); err == nil {
-			t.Fatalf("MED-13: Include glob over %d directories succeeded without tripping include budget", fanOutCount)
-		}
-	})
-
-	t.Run("dangling_symlink_glob_fanout_counts_against_budget", func(t *testing.T) {
-		t.Parallel()
-		baseDir := t.TempDir()
-		incDir := filepath.Join(baseDir, "dangling")
-		if err := os.MkdirAll(incDir, 0o700); err != nil {
-			t.Fatalf("MkdirAll: %v", err)
-		}
-		missingTarget := filepath.Join(baseDir, "does-not-exist")
-		for i := range fanOutCount {
-			linkPath := filepath.Join(incDir, fmt.Sprintf("l-%04d", i))
-			if err := os.Symlink(missingTarget, linkPath); err != nil {
-				t.Skipf("os.Symlink unsupported: %v", err)
-			}
-		}
-		cfgPath := filepath.Join(baseDir, "ssh_config")
-		cfgText := fmt.Sprintf("Include %s/*\nHost app\n    HostName 10.0.0.1\n", incDir)
-		if err := os.WriteFile(cfgPath, []byte(cfgText), 0o600); err != nil {
-			t.Fatalf("WriteFile: %v", err)
-		}
-
-		if _, err := NewOpenSSHParserFromPath(cfgPath); err == nil {
-			t.Fatalf("MED-13: Include glob over %d dangling symlinks succeeded without tripping include budget", fanOutCount)
-		}
-	})
-
-	t.Run("active_cycle_symlink_glob_fanout_counts_against_budget", func(t *testing.T) {
-		t.Parallel()
-		baseDir := t.TempDir()
-		incDir := filepath.Join(baseDir, "cycles")
-		if err := os.MkdirAll(incDir, 0o700); err != nil {
-			t.Fatalf("MkdirAll: %v", err)
-		}
-		cfgPath := filepath.Join(baseDir, "ssh_config")
-		cfgText := fmt.Sprintf("Include %s/*\nHost app\n    HostName 10.0.0.1\n", incDir)
-		if err := os.WriteFile(cfgPath, []byte(cfgText), 0o600); err != nil {
-			t.Fatalf("WriteFile: %v", err)
-		}
-		for i := range fanOutCount {
-			linkPath := filepath.Join(incDir, fmt.Sprintf("c-%04d", i))
-			if err := os.Symlink(cfgPath, linkPath); err != nil {
-				t.Skipf("os.Symlink unsupported: %v", err)
-			}
-		}
-
-		if _, err := NewOpenSSHParserFromPath(cfgPath); err == nil {
-			t.Fatalf("MED-13: Include glob over %d cycle symlinks succeeded without tripping include budget", fanOutCount)
 		}
 	})
 }

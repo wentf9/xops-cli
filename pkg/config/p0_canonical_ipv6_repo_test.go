@@ -795,12 +795,22 @@ func testP0IncludeNonRegularFiles(t *testing.T) {
 	}
 	dir := t.TempDir()
 
-	devCfg := filepath.Join(dir, "dev.conf")
-	if err := os.WriteFile(devCfg, []byte("Include /dev/null\n"), 0o600); err != nil {
+	// Include /dev/null is unified with root -F /dev/null (empty no-op),
+	// whereas other char devices like /dev/zero must still fail closed.
+	devNullCfg := filepath.Join(dir, "devnull.conf")
+	if err := os.WriteFile(devNullCfg, []byte("Include /dev/null\nHost after-null\n  HostName 10.0.0.9\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewOpenSSHParserFromPath(devCfg); err == nil || !strings.Contains(err.Error(), "not a regular file") {
-		t.Fatalf("expected non-regular file error for /dev/null Include, got %v", err)
+	if p, err := NewOpenSSHParserFromPath(devNullCfg); err != nil || !p.HasHost("after-null") {
+		t.Fatalf("expected Include /dev/null to succeed as empty no-op matching root -F /dev/null, got (%v, %v)", p, err)
+	}
+
+	devZeroCfg := filepath.Join(dir, "devzero.conf")
+	if err := os.WriteFile(devZeroCfg, []byte("Include /dev/zero\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewOpenSSHParserFromPath(devZeroCfg); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("expected non-regular file error for /dev/zero Include, got %v", err)
 	}
 
 	assertP0FIFOIncludeRejectedWithoutBlocking(t, dir)

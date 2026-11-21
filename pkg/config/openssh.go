@@ -9,12 +9,12 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"unicode"
 
+	"github.com/wentf9/xops-cli/core/fsx"
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/models"
 )
@@ -55,97 +55,48 @@ func NewOpenSSHParser() (*OpenSSHParser, error) {
 	return NewOpenSSHParserFromPath(userConfigPath)
 }
 
-func isOpenSSHDevNullPath(path string) bool {
-	if path == "" {
-		return false
-	}
-	clean := filepath.Clean(path)
-	if runtime.GOOS == "windows" {
-		return strings.EqualFold(clean, os.DevNull) || strings.EqualFold(clean, `\\.\`+os.DevNull)
-	}
-	return clean == os.DevNull
-}
-
-func isOpenSSHDevNullFileInfo(info os.FileInfo) bool {
-	if info == nil {
-		return false
-	}
-	devNullInfo, err := os.Stat(os.DevNull)
+func loadOpenSSHParserFromPath(path string, requireExist bool) (parser *OpenSSHParser, isDevNull bool, retErr error) {
+	// OpenSSH follows symlinks for root config files (~/.ssh/config and -F)
+	// and accepts os.DevNull as an empty config; fsx.OpenRegular opens
+	// handle-first without Stat-then-Open and rejects FIFOs/devices/oversize.
+	rf, err := fsx.OpenRegular(path, fsx.Limits{MaxBytes: maxOpenSSHConfigFileBytes}, fsx.AllowDevNull(), fsx.FollowSymlinks())
 	if err != nil {
-		return false
-	}
-	return os.SameFile(info, devNullInfo)
-}
-
-func validateOpenSSHRootConfigInfo(path string, info os.FileInfo) (isDevNull bool, err error) {
-	if info.IsDir() {
-		return false, fmt.Errorf("open ssh config %q failed: path is a directory", path)
-	}
-	if !info.Mode().IsRegular() {
-		if isOpenSSHDevNullFileInfo(info) {
-			return true, nil
+		if !requireExist && errors.Is(err, os.ErrNotExist) {
+			return &OpenSSHParser{cfg: nil}, false, nil
 		}
-		return false, fmt.Errorf("open ssh config %q failed: not a regular file", path)
-	}
-	return false, nil
-}
-
-// NewOpenSSHParserFromPath 从指定路径加载 SSH 配置文件。如果文件不存在，返回空的 OpenSSHParser 和 nil 错误。
-func NewOpenSSHParserFromPath(path string) (parser *OpenSSHParser, retErr error) {
-	if isOpenSSHDevNullPath(path) {
-		return &OpenSSHParser{cfg: nil}, nil
-	}
-	info, statErr := os.Stat(path)
-	if statErr != nil {
-		if errors.Is(statErr, os.ErrNotExist) {
-			return &OpenSSHParser{cfg: nil}, nil
+		if errors.Is(err, fsx.ErrTooLarge) {
+			return nil, false, fmt.Errorf("decode ssh config %q failed: ssh config %q size limit (%d bytes) exceeded: %w", path, path, maxOpenSSHConfigFileBytes, err)
 		}
-		return nil, fmt.Errorf("open ssh config %q failed: %w", path, statErr)
-	}
-	isDevNull, valErr := validateOpenSSHRootConfigInfo(path, info)
-	if valErr != nil {
-		return nil, valErr
-	}
-	if isDevNull {
-		return &OpenSSHParser{cfg: nil}, nil
-	}
-	if info.Size() > maxOpenSSHConfigFileBytes {
-		return nil, fmt.Errorf("decode ssh config %q failed: ssh config %q size limit (%d bytes) exceeded", path, path, maxOpenSSHConfigFileBytes)
-	}
-
-	f, err := os.Open(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return &OpenSSHParser{cfg: nil}, nil
+		if errors.Is(err, fsx.ErrNonRegular) {
+			// Post-rejection diagnostic only (handle open already failed closed).
+			if info, statErr := os.Stat(path); statErr == nil && info.IsDir() {
+				return nil, false, fmt.Errorf("open ssh config %q failed: path is a directory: %w", path, err)
+			}
+			return nil, false, fmt.Errorf("open ssh config %q failed: not a regular file: %w", path, err)
 		}
-		return nil, fmt.Errorf("open ssh config %q failed: %w", path, err)
+		return nil, false, fmt.Errorf("open ssh config %q failed: %w", path, err)
 	}
 	defer func() {
-		if closeErr := f.Close(); closeErr != nil && !errors.Is(closeErr, os.ErrClosed) {
+		if closeErr := rf.Close(); closeErr != nil && !errors.Is(closeErr, os.ErrClosed) {
 			retErr = errors.Join(retErr, fmt.Errorf("close ssh config %q failed: %w", path, closeErr))
 		}
 	}()
 
-	fInfo, fStatErr := f.Stat()
-	if fStatErr != nil {
-		return nil, fmt.Errorf("open ssh config %q failed: %w", path, fStatErr)
-	}
-	isDevNull, fValErr := validateOpenSSHRootConfigInfo(path, fInfo)
-	if fValErr != nil {
-		return nil, fValErr
-	}
-	if isDevNull {
-		return &OpenSSHParser{cfg: nil}, nil
-	}
-	if fInfo.Size() > maxOpenSSHConfigFileBytes {
-		return nil, fmt.Errorf("decode ssh config %q failed: ssh config %q size limit (%d bytes) exceeded", path, path, maxOpenSSHConfigFileBytes)
+	if rf.IsDevNull() {
+		return &OpenSSHParser{cfg: nil}, true, nil
 	}
 
-	cfg, decodeErr := decodeOpenSSHConfig(f, path)
+	cfg, decodeErr := decodeOpenSSHConfig(rf, path)
 	if decodeErr != nil {
-		return nil, fmt.Errorf("decode ssh config %q failed: %w", path, decodeErr)
+		return nil, false, fmt.Errorf("decode ssh config %q failed: %w", path, decodeErr)
 	}
-	return &OpenSSHParser{cfg: cfg}, nil
+	return &OpenSSHParser{cfg: cfg}, false, nil
+}
+
+// NewOpenSSHParserFromPath 从指定路径加载 SSH 配置文件。如果文件不存在，返回空的 OpenSSHParser 和 nil 错误。
+func NewOpenSSHParserFromPath(path string) (*OpenSSHParser, error) {
+	parser, _, err := loadOpenSSHParserFromPath(path, false)
+	return parser, err
 }
 
 // NewOpenSSHParserFromReader 从任意 io.Reader 加载 SSH 配置
@@ -164,35 +115,24 @@ func NewOpenSSHParserFromReader(r io.Reader) (*OpenSSHParser, error) {
 // configuration is overridden by configPath:
 //   - "" returns base unchanged;
 //   - "none" (case-insensitive) attaches an empty OpenSSHParser so ~/.ssh/config is skipped;
-//   - Any other path loads that file via NewOpenSSHParserFromPath and returns an
+//   - Any other path loads that file via loadOpenSSHParserFromPath and returns an
 //     explicit error if the file does not exist or cannot be read.
 func WithOpenSSHConfigOverride(base ConfigProvider, configPath string) (ConfigProvider, error) {
 	if configPath == "" {
 		return base, nil
 	}
 	isNone := strings.EqualFold(strings.TrimSpace(configPath), "none")
-	isDevNull := isOpenSSHDevNullPath(configPath)
-	var parser *OpenSSHParser
-	if isNone || isDevNull {
+	var (
+		parser    *OpenSSHParser
+		isDevNull bool
+		err       error
+	)
+	if isNone {
 		parser = &OpenSSHParser{cfg: nil}
 	} else {
-		info, err := os.Stat(configPath)
-		if err != nil {
-			return nil, fmt.Errorf("open ssh config %q failed: %w", configPath, err)
-		}
-		var devNullFile bool
-		devNullFile, err = validateOpenSSHRootConfigInfo(configPath, info)
+		parser, isDevNull, err = loadOpenSSHParserFromPath(configPath, true)
 		if err != nil {
 			return nil, err
-		}
-		if devNullFile {
-			isDevNull = true
-			parser = &OpenSSHParser{cfg: nil}
-		} else {
-			parser, err = NewOpenSSHParserFromPath(configPath)
-			if err != nil {
-				return nil, err
-			}
 		}
 	}
 	var (
