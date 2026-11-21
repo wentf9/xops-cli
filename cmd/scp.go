@@ -7,7 +7,6 @@ import (
 	"io"
 	"maps"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -503,7 +502,7 @@ func (o *ScpOptions) runUpload(ctx context.Context, localPath string, dst PathIn
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("stat destination failed: %w", err)
 	}
-	remoteTarget, parseErr := sftp.ParseRemoteUploadTarget(remotePath, filepath.Base(localPath), err == nil && remoteStat.IsDir())
+	remoteTarget, parseErr := sftp.ParseRemoteUploadTarget(remotePath, localPath, err == nil && remoteStat.IsDir())
 	if parseErr != nil {
 		return fmt.Errorf("resolve upload destination %q failed: %w", remotePath, parseErr)
 	}
@@ -544,7 +543,11 @@ func (o *ScpOptions) runUpload(ctx context.Context, localPath string, dst PathIn
 		if info.IsDir() {
 			size = -1
 		}
-		progress, finishProgress = o.createTransferProgress(ctx, size, "Uploading "+filepath.Base(localPath), 0)
+		uploadName := localPath
+		if base, baseErr := sftp.LocalBaseName(localPath); baseErr == nil {
+			uploadName = base.String()
+		}
+		progress, finishProgress = o.createTransferProgress(ctx, size, "Uploading "+uploadName, 0)
 	}
 	uploadErr := sftpCli.WithForce(o.Force).Upload(ctx, localPath, remotePath, progress)
 	return errors.Join(uploadErr, finishProgress())
@@ -1143,7 +1146,7 @@ func (o *ScpOptions) executeTransfer(ctx context.Context, label string, addr Pat
 	}); statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
 		return fmt.Errorf("stat remote dest %q failed: %w", remotePath, statErr)
 	}
-	remoteTarget, parseErr := sftp.ParseRemoteUploadTarget(remotePath, filepath.Base(o.Source), remoteStat != nil && remoteStat.IsDir())
+	remoteTarget, parseErr := sftp.ParseRemoteUploadTarget(remotePath, o.Source, remoteStat != nil && remoteStat.IsDir())
 	if parseErr != nil {
 		return fmt.Errorf("resolve remote dest %q failed: %w", remotePath, parseErr)
 	}
@@ -1176,7 +1179,11 @@ func (o *ScpOptions) executeTransfer(ctx context.Context, label string, addr Pat
 		if info.IsDir() {
 			size = -1
 		}
-		progress, finishProgress = o.createTransferProgress(ctx, size, "Uploading ["+label+"] "+filepath.Base(o.Source), 0)
+		uploadName := o.Source
+		if base, baseErr := sftp.LocalBaseName(o.Source); baseErr == nil {
+			uploadName = base.String()
+		}
+		progress, finishProgress = o.createTransferProgress(ctx, size, "Uploading ["+label+"] "+uploadName, 0)
 	}
 	err = errors.Join(sftpCli.Upload(ctx, o.Source, remotePath, progress), finishProgress())
 	if err != nil {

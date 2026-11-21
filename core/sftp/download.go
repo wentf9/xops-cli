@@ -162,10 +162,22 @@ func ParseRemoteDownloadPath(raw string) (RemotePath, bool, error) {
 	return p, contentsOnly, nil
 }
 
+// LocalBaseName extracts the final component of a local OS filesystem path and
+// validates it as a RemoteName. It is the sole allowlisted filepath.Base bridge
+// in transfer code so remote paths cannot accidentally pass through OS-specific
+// filepath.Base semantics.
+func LocalBaseName(localPath string) (RemoteName, error) {
+	if strings.TrimSpace(localPath) == "" {
+		return RemoteName{}, fmt.Errorf("%w: local path is empty", ErrInvalidRemoteName)
+	}
+	base := filepath.Base(localPath) //nolint:forbidigo // sole allowlisted local OS path base bridge
+	return ParseRemoteName(base)
+}
+
 // ParseRemoteUploadTarget builds a typed remote destination path for uploading
-// a local entry into a remote destination (appending localBaseName when
-// remoteIsDir is true).
-func ParseRemoteUploadTarget(remoteRaw, localBaseName string, remoteIsDir bool) (RemotePath, error) {
+// a local entry into a remote destination (appending LocalBaseName(localPath)
+// when remoteIsDir is true).
+func ParseRemoteUploadTarget(remoteRaw, localPath string, remoteIsDir bool) (RemotePath, error) {
 	dst, err := ParseRemotePath(remoteRaw)
 	if err != nil {
 		return RemotePath{}, err
@@ -173,7 +185,7 @@ func ParseRemoteUploadTarget(remoteRaw, localBaseName string, remoteIsDir bool) 
 	if !remoteIsDir {
 		return dst, nil
 	}
-	name, err := ParseRemoteName(localBaseName)
+	name, err := LocalBaseName(localPath)
 	if err != nil {
 		return RemotePath{}, err
 	}

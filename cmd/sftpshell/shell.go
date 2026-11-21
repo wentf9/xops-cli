@@ -1539,7 +1539,7 @@ func (s *Shell) handlePut(ctx context.Context, args []string) error {
 			remoteDir = s.cwd
 		}
 		for _, local := range locals {
-			remoteTarget, targetErr := sftp.ParseRemoteUploadTarget(remoteDir, filepath.Base(local), true)
+			remoteTarget, targetErr := sftp.ParseRemoteUploadTarget(remoteDir, local, true)
 			if targetErr != nil {
 				return fmt.Errorf("put: %w", targetErr)
 			}
@@ -1556,7 +1556,7 @@ func (s *Shell) handlePut(ctx context.Context, args []string) error {
 	if len(args) > 1 {
 		remote = s.resolvePath(args[1])
 	} else {
-		remoteTarget, targetErr := sftp.ParseRemoteUploadTarget(s.cwd, filepath.Base(local), true)
+		remoteTarget, targetErr := sftp.ParseRemoteUploadTarget(s.cwd, local, true)
 		if targetErr != nil {
 			return fmt.Errorf("put: %w", targetErr)
 		}
@@ -1584,7 +1584,7 @@ func (s *Shell) putSingle(ctx context.Context, local, remote string) error {
 	if statErr != nil {
 		return fmt.Errorf("put: %w", statErr)
 	}
-	remoteTarget, targetErr := sftp.ParseRemoteUploadTarget(remote, filepath.Base(local), remoteExists && remoteStat.IsDir())
+	remoteTarget, targetErr := sftp.ParseRemoteUploadTarget(remote, local, remoteExists && remoteStat.IsDir())
 	if targetErr != nil {
 		return fmt.Errorf("put: %w", targetErr)
 	}

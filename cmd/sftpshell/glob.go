@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	pkgsftp "github.com/pkg/sftp"
+	"github.com/wentf9/xops-cli/core/sftp"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 )
 
@@ -124,7 +125,11 @@ func resolveMultiSrcLocal(srcs []string, dst string, dstIsDir bool) ([]string, e
 	}
 	if len(srcs) == 1 {
 		if dstIsDir {
-			return []string{filepath.Join(dst, filepath.Base(srcs[0]))}, nil
+			base, err := sftp.LocalBaseName(srcs[0])
+			if err != nil {
+				return nil, err
+			}
+			return []string{filepath.Join(dst, base.String())}, nil
 		}
 		return []string{dst}, nil
 	}
@@ -133,7 +138,11 @@ func resolveMultiSrcLocal(srcs []string, dst string, dstIsDir bool) ([]string, e
 	}
 	out := make([]string, 0, len(srcs))
 	for _, src := range srcs {
-		out = append(out, filepath.Join(dst, filepath.Base(src)))
+		base, err := sftp.LocalBaseName(src)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, filepath.Join(dst, base.String()))
 	}
 	return out, nil
 }

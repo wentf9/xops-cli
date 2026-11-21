@@ -48,7 +48,7 @@ func (c *Client) upload(ctx context.Context, localPath, remotePath string, progr
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("stat remote destination failed: %w", err)
 	}
-	remoteTarget, parseErr := ParseRemoteUploadTarget(remotePath, filepath.Base(localPath), err == nil && remoteStat.IsDir())
+	remoteTarget, parseErr := ParseRemoteUploadTarget(remotePath, localPath, err == nil && remoteStat.IsDir())
 	if parseErr != nil {
 		return fmt.Errorf("upload %q to %q: %w", localPath, remotePath, parseErr)
 	}

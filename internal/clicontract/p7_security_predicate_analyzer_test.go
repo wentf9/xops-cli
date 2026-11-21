@@ -33,7 +33,43 @@ var (
 	// starting with is/allow/can/should/check/verify/match followed by an
 	// uppercase letter.
 	securityPredicateNameRe = regexp.MustCompile(`^([Ii]s|[Aa]llow|[Cc]an|[Ss]hould|[Cc]heck|[Vv]erify|[Mm]atch)[A-Z]`)
+
+	// secpredNolintRe matches explicit "//nolint:secpred // <reason>" (or
+	// comma-separated linter lists containing secpred) requiring a non-empty
+	// justification after the second "//".
+	secpredNolintRe = regexp.MustCompile(`^//\s*nolint:([a-z0-9_,-]+)\s+//\s*(\S.*)$`)
 )
+
+func hasJustifiedSecpredNolint(fset *token.FileSet, file *ast.File, fn *ast.FuncDecl) bool {
+	fnLine := fset.Position(fn.Pos()).Line
+	checkComment := func(text string) bool {
+		m := secpredNolintRe.FindStringSubmatch(strings.TrimSpace(text))
+		if len(m) != 3 {
+			return false
+		}
+		for part := range strings.SplitSeq(m[1], ",") {
+			if strings.TrimSpace(part) == "secpred" {
+				return strings.TrimSpace(m[2]) != ""
+			}
+		}
+		return false
+	}
+	if fn.Doc != nil {
+		for _, c := range fn.Doc.List {
+			if checkComment(c.Text) {
+				return true
+			}
+		}
+	}
+	for _, cg := range file.Comments {
+		for _, c := range cg.List {
+			if fset.Position(c.Pos()).Line == fnLine && checkComment(c.Text) {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 type securityPredicateViolation struct {
 	relPath  string
@@ -64,6 +100,9 @@ func analyzeSecurityPredicatesInFile(relPath string, fset *token.FileSet, file *
 			continue
 		}
 		if !securityPredicateNameRe.MatchString(fn.Name.Name) || !returnsBareBool(fn) {
+			continue
+		}
+		if hasJustifiedSecpredNolint(fset, file, fn) {
 			continue
 		}
 		if branchLine, retKind, hit := findErrSwallowBoolReturn(fset, fn.Body); hit {
@@ -288,7 +327,30 @@ func matchPolicyHost(x string) bool {
 	return true
 }
 
+//nolint:secpred
+func isMissingReasonNolint(x string) bool {
+	if err := check(x); err != nil {
+		return false
+	}
+	return true
+}
+
 // Allowed forms:
+
+//nolint:secpred // external library callback requires func(string) bool
+func isExemptedCallback(x string) bool {
+	if err := check(x); err != nil {
+		return false
+	}
+	return true
+}
+
+func isExemptedInline(x string) bool { //nolint:secpred // external interface constraint
+	if err := check(x); err != nil {
+		return false
+	}
+	return true
+}
 
 func isErrorTimeout(err error) bool {
 	if err == nil {
@@ -344,6 +406,7 @@ func check(string) error           { return nil }
 		"checkHostRule",
 		"VerifyPeerCert",
 		"matchPolicyHost",
+		"isMissingReasonNolint",
 	}
 	if !slices.Equal(gotNames, wantNames) {
 		t.Fatalf("analyzer flagged %v, want %v", gotNames, wantNames)
