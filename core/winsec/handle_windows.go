@@ -11,6 +11,7 @@ import (
 	"strings"
 	"unsafe"
 
+	"github.com/wentf9/xops-cli/core/verdict"
 	"golang.org/x/sys/windows"
 )
 
@@ -228,17 +229,8 @@ func OpenSecureSystemSSHFileByHandle(path string, currSID *windows.SID, verifyPa
 		return nil, err
 	}
 	if verifyParentGlobal {
-		parentDir := filepath.Dir(cleaned)
-		if parentDir == "" || parentDir == cleaned {
-			return nil, fmt.Errorf("%w: invalid parent directory for %q", ErrInsecureControlDir, path)
-		}
-		if grandParent := filepath.Dir(parentDir); grandParent != "" && grandParent != parentDir {
-			if !IsSecureSystemAncestorDirByHandle(grandParent) {
-				return nil, fmt.Errorf("%w: insecure ancestor directory %q", ErrInsecureControlDir, grandParent)
-			}
-		}
-		if !IsSecureSystemSSHObjectByHandle(parentDir, true, nil) {
-			return nil, fmt.Errorf("%w: insecure parent directory %q", ErrInsecureControlDir, parentDir)
+		if err := verifySystemSSHParentDirs(cleaned, path); err != nil {
+			return nil, err
 		}
 	}
 
@@ -251,12 +243,13 @@ func OpenSecureSystemSSHFileByHandle(path string, currSID *windows.SID, verifyPa
 		return nil, fmt.Errorf("%w: %q is not a regular non-reparse file", ErrInsecureControlDir, path)
 	}
 	sd, sdErr := GetSecurityInfoByHandle(h)
-	if sdErr != nil || !IsSecureSecurityDescriptor(attrs, false, sd, currSID) {
+	if sdErr != nil {
 		_ = windows.CloseHandle(h)
-		if sdErr != nil {
-			return nil, fmt.Errorf("%w: query security descriptor for %q: %w", ErrInsecureControlDir, path, sdErr)
-		}
-		return nil, fmt.Errorf("%w: %q fails ACL verification", ErrInsecureControlDir, path)
+		return nil, fmt.Errorf("%w: query security descriptor for %q: %w", ErrInsecureControlDir, path, sdErr)
+	}
+	if v, vErr := IsSecureSecurityDescriptor(attrs, false, sd, currSID); vErr != nil || !v.Allowed() {
+		_ = windows.CloseHandle(h)
+		return nil, wrapInsecureVerdictError(path+" fails ACL verification", vErr)
 	}
 	f := os.NewFile(uintptr(h), path)
 	if f == nil {
@@ -264,6 +257,29 @@ func OpenSecureSystemSSHFileByHandle(path string, currSID *windows.SID, verifyPa
 		return nil, fmt.Errorf("os.NewFile returned nil for %q", path)
 	}
 	return f, nil
+}
+
+func verifySystemSSHParentDirs(cleaned, origPath string) error {
+	parentDir := filepath.Dir(cleaned)
+	if parentDir == "" || parentDir == cleaned {
+		return fmt.Errorf("%w: invalid parent directory for %q", ErrInsecureControlDir, origPath)
+	}
+	if grandParent := filepath.Dir(parentDir); grandParent != "" && grandParent != parentDir {
+		if v, err := IsSecureSystemAncestorDirByHandle(grandParent); err != nil || !v.Allowed() {
+			return wrapInsecureVerdictError(fmt.Sprintf("insecure ancestor directory %q", grandParent), err)
+		}
+	}
+	if v, err := IsSecureSystemSSHObjectByHandle(parentDir, true, nil); err != nil || !v.Allowed() {
+		return wrapInsecureVerdictError(fmt.Sprintf("insecure parent directory %q", parentDir), err)
+	}
+	return nil
+}
+
+func wrapInsecureVerdictError(msg string, err error) error {
+	if err != nil {
+		return fmt.Errorf("%w: %s: %w", ErrInsecureControlDir, msg, err)
+	}
+	return fmt.Errorf("%w: %s", ErrInsecureControlDir, msg)
 }
 
 // VerifyOwnerOnlyDirectoryByHandle verifies dirPath strictly through an open
@@ -357,22 +373,22 @@ func VerifyOwnerOnlySocketByHandle(socketPath string) error {
 // IsSecureSystemSSHObject: it verifies that no ancestor directory is a reparse
 // point, opens path with FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_BACKUP_SEMANTICS,
 // and evaluates the handle's attributes and GetSecurityInfo descriptor.
-func IsSecureSystemSSHObjectByHandle(path string, expectDir bool, currSID *windows.SID) bool {
+func IsSecureSystemSSHObjectByHandle(path string, expectDir bool, currSID *windows.SID) (verdict.Verdict, error) {
 	if err := VerifyAncestorChainNoReparse(path); err != nil {
-		return false
+		return verdict.Deny, err
 	}
 	h, attrs, err := OpenObjectHandleNoFollow(path, windows.READ_CONTROL)
 	if err != nil {
-		return false
+		return verdict.Deny, err
 	}
 	defer func() { _ = windows.CloseHandle(h) }()
 
 	if !EvaluateAttributes(attrs, expectDir) {
-		return false
+		return verdict.Deny, nil
 	}
 	sd, err := GetSecurityInfoByHandle(h)
 	if err != nil {
-		return false
+		return verdict.Deny, err
 	}
 	return IsSecureSecurityDescriptor(attrs, expectDir, sd, currSID)
 }
@@ -380,22 +396,22 @@ func IsSecureSystemSSHObjectByHandle(path string, expectDir bool, currSID *windo
 // IsSecureSystemAncestorDirByHandle is the handle-based equivalent of
 // IsSecureSystemAncestorDir: it verifies ancestor reparse points and evaluates
 // the directory handle's attributes and GetSecurityInfo descriptor.
-func IsSecureSystemAncestorDirByHandle(path string) bool {
+func IsSecureSystemAncestorDirByHandle(path string) (verdict.Verdict, error) {
 	if err := VerifyAncestorChainNoReparse(path); err != nil {
-		return false
+		return verdict.Deny, err
 	}
 	h, attrs, err := OpenObjectHandleNoFollow(path, windows.READ_CONTROL)
 	if err != nil {
-		return false
+		return verdict.Deny, err
 	}
 	defer func() { _ = windows.CloseHandle(h) }()
 
 	if !EvaluateAttributes(attrs, true) {
-		return false
+		return verdict.Deny, nil
 	}
 	sd, err := GetSecurityInfoByHandle(h)
 	if err != nil {
-		return false
+		return verdict.Deny, err
 	}
 	return IsSecureSystemAncestorDirDescriptor(attrs, sd)
 }

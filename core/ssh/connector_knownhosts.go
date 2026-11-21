@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 
 	"github.com/wentf9/xops-cli/core/fsx"
+	"github.com/wentf9/xops-cli/core/verdict"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 )
@@ -304,8 +305,8 @@ func (c *Connector) resolveGlobalKnownHostsFiles(cfg *ClientConfig, target Targe
 		if path == "" || slices.Contains(userFiles, path) || slices.Contains(files, path) {
 			continue
 		}
-		if !isReadableRegularFile(path) {
-			c.getLogger().Debugf("skipping global known_hosts file %q: missing, unreadable, or not a regular file", path)
+		if v, err := isReadableRegularFile(path); err != nil || !v.Allowed() {
+			c.getLogger().Debugf("skipping global known_hosts file %q: %v", path, err)
 			continue
 		}
 		files = append(files, path)
@@ -313,13 +314,13 @@ func (c *Connector) resolveGlobalKnownHostsFiles(cfg *ClientConfig, target Targe
 	return files, nil
 }
 
-func isReadableRegularFile(path string) bool {
+func isReadableRegularFile(path string) (verdict.Verdict, error) {
 	rc, err := openGlobalKnownHostsFile(path, maxKnownHostsFileBytes)
 	if err != nil {
-		return false
+		return verdict.Deny, err
 	}
 	_ = rc.Close()
-	return true
+	return verdict.Allow, nil
 }
 
 func expandKnownHostsPath(pattern string, env Environment, target TargetContext) (string, error) {

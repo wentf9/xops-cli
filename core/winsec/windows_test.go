@@ -319,11 +319,11 @@ func TestIsSecureSystemGlobalSSHObjectAndAncestorDir_RejectsCurrentUser(t *testi
 		makeSIDExplicitAccess(usersSID, windows.TRUSTEE_IS_WELL_KNOWN_GROUP, windows.FILE_GENERIC_READ|windows.FILE_GENERIC_EXECUTE, windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT),
 	}
 	sysGlobalSD := buildTestSDWithOwnerAndACL(t, systemSID, sysGlobalEntries)
-	if !IsSecureSecurityDescriptor(windows.FILE_ATTRIBUTE_DIRECTORY, true, sysGlobalSD, nil) {
-		t.Fatal("SYSTEM/Admins dir SD must pass IsSecureSecurityDescriptor(..., nil)")
+	if v, err := IsSecureSecurityDescriptor(windows.FILE_ATTRIBUTE_DIRECTORY, true, sysGlobalSD, nil); err != nil || !v.Allowed() {
+		t.Fatalf("SYSTEM/Admins dir SD must pass IsSecureSecurityDescriptor(..., nil): (%v, %v)", v, err)
 	}
-	if !IsSecureSecurityDescriptor(windows.FILE_ATTRIBUTE_NORMAL, false, sysGlobalSD, nil) {
-		t.Fatal("SYSTEM/Admins file SD must pass IsSecureSecurityDescriptor(..., nil)")
+	if v, err := IsSecureSecurityDescriptor(windows.FILE_ATTRIBUTE_NORMAL, false, sysGlobalSD, nil); err != nil || !v.Allowed() {
+		t.Fatalf("SYSTEM/Admins file SD must pass IsSecureSecurityDescriptor(..., nil): (%v, %v)", v, err)
 	}
 
 	programDataEntries := append(append([]windows.EXPLICIT_ACCESS(nil), sysGlobalEntries...),
@@ -331,17 +331,17 @@ func TestIsSecureSystemGlobalSSHObjectAndAncestorDir_RejectsCurrentUser(t *testi
 		makeSIDExplicitAccess(usersSID, windows.TRUSTEE_IS_WELL_KNOWN_GROUP, windows.FILE_WRITE_DATA|windows.FILE_APPEND_DATA, windows.CONTAINER_INHERIT_ACE),
 	)
 	programDataSD := buildTestSDWithOwnerAndACL(t, systemSID, programDataEntries)
-	if !IsSecureSystemAncestorDirDescriptor(windows.FILE_ATTRIBUTE_DIRECTORY, programDataSD) {
-		t.Fatal("standard ProgramData ancestor SD must pass IsSecureSystemAncestorDirDescriptor")
+	if v, err := IsSecureSystemAncestorDirDescriptor(windows.FILE_ATTRIBUTE_DIRECTORY, programDataSD); err != nil || !v.Allowed() {
+		t.Fatalf("standard ProgramData ancestor SD must pass IsSecureSystemAncestorDirDescriptor: (%v, %v)", v, err)
 	}
-	if IsSecureSecurityDescriptor(windows.FILE_ATTRIBUTE_DIRECTORY, true, programDataSD, nil) {
+	if v, _ := IsSecureSecurityDescriptor(windows.FILE_ATTRIBUTE_DIRECTORY, true, programDataSD, nil); v.Allowed() {
 		t.Fatal("ProgramData ancestor SD must NOT pass strict ssh dir IsSecureSecurityDescriptor(..., nil)")
 	}
 
 	ancestorDeleteChildSD := buildTestSDWithOwnerAndACL(t, systemSID, append(append([]windows.EXPLICIT_ACCESS(nil), programDataEntries...),
 		makeSIDExplicitAccess(usersSID, windows.TRUSTEE_IS_WELL_KNOWN_GROUP, windows.ACCESS_MASK(AccessFileDeleteChild), windows.NO_INHERITANCE),
 	))
-	if IsSecureSystemAncestorDirDescriptor(windows.FILE_ATTRIBUTE_DIRECTORY, ancestorDeleteChildSD) {
+	if v, _ := IsSecureSystemAncestorDirDescriptor(windows.FILE_ATTRIBUTE_DIRECTORY, ancestorDeleteChildSD); v.Allowed() {
 		t.Fatal("ancestor SD granting FILE_DELETE_CHILD to Users must fail closed")
 	}
 
@@ -359,21 +359,21 @@ func assertCurrentUserRejectedBySystemGlobalChecks(
 	t.Helper()
 
 	currUserOwnedSD := buildTestSDWithOwnerAndACL(t, currSID, sysGlobalEntries)
-	if IsSecureSecurityDescriptor(windows.FILE_ATTRIBUTE_NORMAL, false, currUserOwnedSD, nil) {
+	if v, _ := IsSecureSecurityDescriptor(windows.FILE_ATTRIBUTE_NORMAL, false, currUserOwnedSD, nil); v.Allowed() {
 		t.Fatal("current-user-owned SD must fail IsSecureSecurityDescriptor(..., nil)")
 	}
-	if IsSecureSystemAncestorDirDescriptor(windows.FILE_ATTRIBUTE_DIRECTORY, currUserOwnedSD) {
+	if v, _ := IsSecureSystemAncestorDirDescriptor(windows.FILE_ATTRIBUTE_DIRECTORY, currUserOwnedSD); v.Allowed() {
 		t.Fatal("current-user-owned ancestor SD must fail IsSecureSystemAncestorDirDescriptor")
 	}
 
 	currUserWritableSD := buildTestSDWithOwnerAndACL(t, systemSID, append(append([]windows.EXPLICIT_ACCESS(nil), sysGlobalEntries...),
 		makeSIDExplicitAccess(currSID, windows.TRUSTEE_IS_USER, windows.FILE_WRITE_DATA, windows.NO_INHERITANCE),
 	))
-	if IsSecureSecurityDescriptor(windows.FILE_ATTRIBUTE_NORMAL, false, currUserWritableSD, nil) {
+	if v, _ := IsSecureSecurityDescriptor(windows.FILE_ATTRIBUTE_NORMAL, false, currUserWritableSD, nil); v.Allowed() {
 		t.Fatal("current-user-writable SD must fail IsSecureSecurityDescriptor(..., nil)")
 	}
-	if !IsSecureSecurityDescriptor(windows.FILE_ATTRIBUTE_NORMAL, false, currUserWritableSD, currSID) {
-		t.Fatal("current-user-writable SD should still pass user-scoped IsSecureSecurityDescriptor(..., currSID)")
+	if v, err := IsSecureSecurityDescriptor(windows.FILE_ATTRIBUTE_NORMAL, false, currUserWritableSD, currSID); err != nil || !v.Allowed() {
+		t.Fatalf("current-user-writable SD should still pass user-scoped IsSecureSecurityDescriptor(..., currSID): (%v, %v)", v, err)
 	}
 
 	base := t.TempDir()
@@ -403,10 +403,14 @@ func assertCurrentUserRejectedBySystemGlobalChecks(
 	}
 	runtime.KeepAlive(currACL)
 
-	if IsSecureSystemGlobalSSHObject(userDir, true) || IsSecureSystemGlobalSSHObject(userFile, false) {
+	vDir, _ := IsSecureSystemGlobalSSHObject(userDir, true)
+	vFile, _ := IsSecureSystemGlobalSSHObject(userFile, false)
+	if vDir.Allowed() || vFile.Allowed() {
 		t.Fatal("IsSecureSystemGlobalSSHObject must reject currSID-writable directory and file")
 	}
-	if !IsSecureSystemSSHObject(userDir, true, currSID) || !IsSecureSystemSSHObject(userFile, false, currSID) {
-		t.Fatal("user-scoped IsSecureSystemSSHObject must still accept currSID-only directory and file")
+	uDir, uDirErr := IsSecureSystemSSHObject(userDir, true, currSID)
+	uFile, uFileErr := IsSecureSystemSSHObject(userFile, false, currSID)
+	if uDirErr != nil || !uDir.Allowed() || uFileErr != nil || !uFile.Allowed() {
+		t.Fatalf("user-scoped IsSecureSystemSSHObject must still accept currSID-only directory and file: dir=(%v,%v) file=(%v,%v)", uDir, uDirErr, uFile, uFileErr)
 	}
 }

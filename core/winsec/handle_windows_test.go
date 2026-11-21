@@ -28,8 +28,8 @@ func TestHandleBasedACLHelpers_DirAndSocket(t *testing.T) {
 	if err := VerifyAncestorChainNoReparse(dir); err != nil {
 		t.Fatalf("VerifyAncestorChainNoReparse failed: %v", err)
 	}
-	if !IsSecureSystemSSHObjectByHandle(dir, true, currSID) {
-		t.Fatalf("IsSecureSystemSSHObjectByHandle(dir) = false, want true")
+	if v, err := IsSecureSystemSSHObjectByHandle(dir, true, currSID); err != nil || !v.Allowed() {
+		t.Fatalf("IsSecureSystemSSHObjectByHandle(dir) = (%v, %v), want (allow, nil)", v, err)
 	}
 
 	sockPath := filepath.Join(dir, "handle.sock")

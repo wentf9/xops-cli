@@ -66,10 +66,10 @@ func TestWindowsSecurityHelpersAndSocketAddr(t *testing.T) {
 	}
 
 	missing := filepath.Join(sshDir, "missing_known_hosts")
-	if isSecureWindowsGlobalKnownHostsFile(missing) {
+	if v, _ := isSecureWindowsGlobalKnownHostsFile(missing); v.Allowed() {
 		t.Fatal("missing global known_hosts must not be accepted")
 	}
-	if isSecureWindowsGlobalKnownHostsFile(sshDir) {
+	if v, _ := isSecureWindowsGlobalKnownHostsFile(sshDir); v.Allowed() {
 		t.Fatal("directory must not be accepted as global known_hosts")
 	}
 
@@ -200,11 +200,13 @@ func assertWindowsGlobalKnownHostsSystemTrust(
 		if resolved, ok := resolveSecureWindowsGlobalKnownHostsPath(baseDir); ok {
 			t.Fatalf("resolveSecureWindowsGlobalKnownHostsPath(%q) = (%q, true), want false for currSID-writable global known_hosts", baseDir, resolved)
 		}
-		if isSecureWindowsGlobalKnownHostsFile(knownHosts) {
+		if v, _ := isSecureWindowsGlobalKnownHostsFile(knownHosts); v.Allowed() {
 			t.Fatal("currSID-writable ssh directory and ssh_known_hosts must be rejected by global known_hosts check")
 		}
-		if !winsec.IsSecureSystemSSHObject(sshDir, true, currSID) || !winsec.IsSecureSystemSSHObject(knownHosts, false, currSID) {
-			t.Fatal("user-scoped winsec.IsSecureSystemSSHObject must still accept currSID-only directory and file")
+		vDir, dirErr := winsec.IsSecureSystemSSHObject(sshDir, true, currSID)
+		vFile, fileErr := winsec.IsSecureSystemSSHObject(knownHosts, false, currSID)
+		if dirErr != nil || !vDir.Allowed() || fileErr != nil || !vFile.Allowed() {
+			t.Fatalf("user-scoped winsec.IsSecureSystemSSHObject must still accept currSID-only directory and file: dir=(%v,%v) file=(%v,%v)", vDir, dirErr, vFile, fileErr)
 		}
 	}
 
@@ -227,7 +229,7 @@ func assertWindowsGlobalKnownHostsSystemTrust(
 	if _, ok := resolveSecureWindowsGlobalKnownHostsPath(baseDir); ok {
 		t.Fatal("parent ssh directory granting FILE_DELETE_CHILD to INTERACTIVE must be rejected")
 	}
-	if winsec.IsSecureSystemSSHObject(sshDir, true, currSID) {
+	if v, _ := winsec.IsSecureSystemSSHObject(sshDir, true, currSID); v.Allowed() {
 		t.Fatal("user-scoped check must reject parent ssh directory granting FILE_DELETE_CHILD to INTERACTIVE")
 	}
 }
@@ -294,8 +296,8 @@ func assertElevatedWindowsGlobalKnownHosts(
 	if resolved, ok := resolveSecureWindowsGlobalKnownHostsPath(baseDir); !ok || resolved != knownHosts {
 		t.Fatalf("resolveSecureWindowsGlobalKnownHostsPath(%q) = (%q, %v), want (%q, true)", baseDir, resolved, ok, knownHosts)
 	}
-	if !isSecureWindowsGlobalKnownHostsFile(knownHosts) {
-		t.Fatal("SYSTEM/Administrators ssh directory and ssh_known_hosts must be accepted")
+	if v, err := isSecureWindowsGlobalKnownHostsFile(knownHosts); err != nil || !v.Allowed() {
+		t.Fatalf("SYSTEM/Administrators ssh directory and ssh_known_hosts must be accepted: (%v, %v)", v, err)
 	}
 
 	daclDirDeleteChild := buildPinnedTestACL(t, daclSystemAdmins,
@@ -305,7 +307,7 @@ func assertElevatedWindowsGlobalKnownHosts(
 	if _, ok := resolveSecureWindowsGlobalKnownHostsPath(baseDir); ok {
 		t.Fatal("parent ssh directory granting FILE_DELETE_CHILD to INTERACTIVE must be rejected")
 	}
-	if isSecureWindowsGlobalKnownHostsFile(knownHosts) {
+	if v, _ := isSecureWindowsGlobalKnownHostsFile(knownHosts); v.Allowed() {
 		t.Fatal("isSecureWindowsGlobalKnownHostsFile must reject FILE_DELETE_CHILD for INTERACTIVE")
 	}
 }

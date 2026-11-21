@@ -235,13 +235,15 @@ func (c *Connector) loadReadOnlyKnownHostsDB(cfg *ClientConfig) *knownHostsDB {
 			if err != nil || expanded == "" || strings.EqualFold(expanded, "none") || isKnownHostsDevNull(expanded) {
 				continue
 			}
-			if isReadableRegularFile(expanded) && !slices.Contains(userFiles, expanded) {
+			if v, err := isReadableRegularFile(expanded); err == nil && v.Allowed() && !slices.Contains(userFiles, expanded) {
 				userFiles = append(userFiles, expanded)
 			}
 		}
 	default:
-		if p := strings.TrimSpace(c.environment.KnownHostsFile); p != "" && isReadableRegularFile(p) {
-			userFiles = append(userFiles, p)
+		if p := strings.TrimSpace(c.environment.KnownHostsFile); p != "" {
+			if v, err := isReadableRegularFile(p); err == nil && v.Allowed() {
+				userFiles = append(userFiles, p)
+			}
 		}
 	}
 
@@ -427,6 +429,7 @@ func (db *knownHostsDB) matchingHostKeyTypes(a khAddr) (hasCertAuthority bool, p
 	return hasCertAuthority, pinnedPlainTypes
 }
 
+//nolint:secpred // x/crypto/ssh.CertChecker.IsHostAuthority requires func(ssh.PublicKey, string) bool
 func (db *knownHostsDB) isHostAuthority(remote cryptoSSH.PublicKey, address string) bool {
 	h, p, err := net.SplitHostPort(address)
 	if err != nil {

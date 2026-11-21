@@ -11,6 +11,7 @@ import (
 	"strings"
 	"unsafe"
 
+	"github.com/wentf9/xops-cli/core/verdict"
 	"golang.org/x/sys/windows"
 )
 
@@ -176,34 +177,43 @@ func IsSecureSecurityDescriptor(
 	expectDir bool,
 	sd *windows.SECURITY_DESCRIPTOR,
 	currSID *windows.SID,
-) bool {
+) (verdict.Verdict, error) {
 	if sd == nil {
-		return false
+		return verdict.Deny, fmt.Errorf("%w: security descriptor is nil", ErrInsecureControlDir)
 	}
 	owner, _, err := sd.Owner()
-	if err != nil || owner == nil {
-		return false
+	if err != nil {
+		return verdict.Deny, fmt.Errorf("%w: query owner SID: %w", ErrInsecureControlDir, err)
+	}
+	if owner == nil {
+		return verdict.Deny, fmt.Errorf("%w: owner SID is nil", ErrInsecureControlDir)
 	}
 	ownerTrusted := IsTrustedPrincipalSID(owner, currSID)
 	if !ownerTrusted {
-		return false
+		return verdict.Deny, nil
 	}
 	dacl, _, err := sd.DACL()
 	// A nil DACL on Windows means unrestricted full access to Everyone; reject.
-	if err != nil || dacl == nil {
-		return false
+	if err != nil {
+		return verdict.Deny, fmt.Errorf("%w: query DACL: %w", ErrInsecureControlDir, err)
+	}
+	if dacl == nil {
+		return verdict.Deny, fmt.Errorf("%w: DACL is nil", ErrInsecureControlDir)
 	}
 	aces, ok := ParseACL(dacl, currSID)
 	if !ok {
-		return false
+		return verdict.Deny, fmt.Errorf("%w: parse DACL failed", ErrInsecureControlDir)
 	}
-	return EvaluateObjectSecurity(attrs, expectDir, ownerTrusted, true, aces)
+	if !EvaluateObjectSecurity(attrs, expectDir, ownerTrusted, true, aces) {
+		return verdict.Deny, nil
+	}
+	return verdict.Allow, nil
 }
 
 // IsSecureSystemSSHObject checks that path (and its ancestor chain) has no
 // reparse points or devices and satisfies IsSecureSecurityDescriptor using an
 // open no-follow handle and GetSecurityInfo.
-func IsSecureSystemSSHObject(path string, expectDir bool, currSID *windows.SID) bool {
+func IsSecureSystemSSHObject(path string, expectDir bool, currSID *windows.SID) (verdict.Verdict, error) {
 	return IsSecureSystemSSHObjectByHandle(path, expectDir, currSID)
 }
 
@@ -212,35 +222,44 @@ func IsSecureSystemSSHObject(path string, expectDir bool, currSID *windows.SID) 
 // %ProgramData%\ssh\ssh_known_hosts) owned strictly by SYSTEM or
 // Builtin\Administrators with write/mutate DACL entries restricted to those
 // same system principals (currSID == nil; never trusts the current user).
-func IsSecureSystemGlobalSSHObject(path string, expectDir bool) bool {
+func IsSecureSystemGlobalSSHObject(path string, expectDir bool) (verdict.Verdict, error) {
 	return IsSecureSystemSSHObjectByHandle(path, expectDir, nil)
 }
 
 // IsSecureSystemAncestorDirDescriptor evaluates sd for a shared system ancestor
 // directory (such as C:\ProgramData), trusting strictly LocalSystem and
 // Builtin\Administrators (currSID == nil).
-func IsSecureSystemAncestorDirDescriptor(attrs uint32, sd *windows.SECURITY_DESCRIPTOR) bool {
+func IsSecureSystemAncestorDirDescriptor(attrs uint32, sd *windows.SECURITY_DESCRIPTOR) (verdict.Verdict, error) {
 	if sd == nil {
-		return false
+		return verdict.Deny, fmt.Errorf("%w: security descriptor is nil", ErrInsecureControlDir)
 	}
 	owner, _, err := sd.Owner()
-	if err != nil || owner == nil {
-		return false
+	if err != nil {
+		return verdict.Deny, fmt.Errorf("%w: query owner SID: %w", ErrInsecureControlDir, err)
+	}
+	if owner == nil {
+		return verdict.Deny, fmt.Errorf("%w: owner SID is nil", ErrInsecureControlDir)
 	}
 	ownerTrusted := IsTrustedPrincipalSID(owner, nil)
 	if !ownerTrusted {
-		return false
+		return verdict.Deny, nil
 	}
 	dacl, _, err := sd.DACL()
 	// A nil DACL on Windows means unrestricted full access to Everyone; reject.
-	if err != nil || dacl == nil {
-		return false
+	if err != nil {
+		return verdict.Deny, fmt.Errorf("%w: query DACL: %w", ErrInsecureControlDir, err)
+	}
+	if dacl == nil {
+		return verdict.Deny, fmt.Errorf("%w: DACL is nil", ErrInsecureControlDir)
 	}
 	aces, ok := ParseACL(dacl, nil)
 	if !ok {
-		return false
+		return verdict.Deny, fmt.Errorf("%w: parse DACL failed", ErrInsecureControlDir)
 	}
-	return EvaluateSystemAncestorDirSecurity(attrs, ownerTrusted, true, aces)
+	if !EvaluateSystemAncestorDirSecurity(attrs, ownerTrusted, true, aces) {
+		return verdict.Deny, nil
+	}
+	return verdict.Allow, nil
 }
 
 // IsSecureSystemAncestorDir checks via an open no-follow handle that path is a
@@ -249,7 +268,7 @@ func IsSecureSystemAncestorDirDescriptor(attrs uint32, sd *windows.SECURITY_DESC
 // rights to untrusted principals. This accepts standard Windows C:\ProgramData
 // ACLs while rejecting junctions, user-owned roots, nil DACLs, and
 // delete/takeover permissions.
-func IsSecureSystemAncestorDir(path string) bool {
+func IsSecureSystemAncestorDir(path string) (verdict.Verdict, error) {
 	return IsSecureSystemAncestorDirByHandle(path)
 }
 

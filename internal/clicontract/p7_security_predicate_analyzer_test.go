@@ -420,24 +420,15 @@ func check(string) error           { return nil }
 func TestP7_SecurityPredicateAnalyzer_NoNewBareBoolErrSwallow(t *testing.T) {
 	t.Parallel()
 
-	// Temporary W2/W3 transition baseline (pending coordinator disposition &
-	// W2b/W2c/W2d/W2e migrations). Any NEW violation fails immediately.
+	// Remaining pre-W2b/c/d/fsx violations — will be removed completely in W3
+	// finalization once owning W2 lanes land (zero-baseline goal).
 	transitionBaseline := map[string]string{
-		"core/fsx/fsx_unix.go:isUnixDevNullStat":                          "devnull stat device comparison inside fsx",
-		"core/ssh/agent_forward.go:shouldRequestMuxProxyAgentForward":     "pending W3 verdict migration",
-		"core/ssh/auth.go:isUnencryptedPrivateKeyFile":                    "pending W3 verdict/err review",
-		"core/ssh/connector_knownhosts.go:isReadableRegularFile":          "pending W2e fsx migration",
-		"core/ssh/host_algorithms.go:isHostAuthority":                     "x/crypto/ssh.CertChecker.IsHostAuthority requires func(PublicKey,string) bool",
-		"core/winsec/handle_windows.go:IsSecureSystemSSHObjectByHandle":   "pending W2e/W3 verdict migration",
-		"core/winsec/handle_windows.go:IsSecureSystemAncestorDirByHandle": "pending W2e/W3 verdict migration",
-		"core/winsec/windows.go:IsSecureSecurityDescriptor":               "pending W2e/W3 verdict migration",
-		"core/winsec/windows.go:IsSecureSystemSSHObject":                  "pending W2e deletion/migration",
-		"core/winsec/windows.go:IsSecureSystemAncestorDirDescriptor":      "pending W2e/W3 verdict migration",
-		"core/winsec/windows.go:IsSecureSystemAncestorDir":                "pending W2e deletion/migration",
-		"pkg/adapter/ssh_adapter.go:isNonInteractiveForNode":              "pending W2b/W3 verdict migration",
-		"pkg/config/openssh.go:isOpenSSHDevNullFileInfo":                  "pending W2e fsx.AllowDevNull migration",
-		"pkg/config/target.go:IsPersistableIdentityPath":                  "pending W3 verdict/review",
-		"pkg/config/target.go:isDirectJumpTarget":                         "pending W2d TargetRef migration",
+		"core/fsx/fsx_unix.go:isUnixDevNullStat":                      "pending W3 fsx coordination with p7-w1-fsx",
+		"core/ssh/agent_forward.go:shouldRequestMuxProxyAgentForward": "pending W2b/W2c land",
+		"core/ssh/auth.go:isUnencryptedPrivateKeyFile":                "pending W2b land",
+		"pkg/adapter/ssh_adapter.go:isNonInteractiveForNode":          "pending W2b land",
+		"pkg/config/target.go:IsPersistableIdentityPath":              "pending W2d land",
+		"pkg/config/target.go:isDirectJumpTarget":                     "pending W2d land",
 	}
 
 	root := p4RepoRoot(t)

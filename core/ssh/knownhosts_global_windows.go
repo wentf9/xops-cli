@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/fsx"
+	"github.com/wentf9/xops-cli/core/verdict"
 	"github.com/wentf9/xops-cli/core/winsec"
 	"golang.org/x/sys/windows"
 )
@@ -34,7 +35,11 @@ func openGlobalKnownHostsFile(filename string, limit int64) (io.ReadCloser, erro
 		currSID            *windows.SID
 		verifyParentGlobal bool
 	)
-	if isUnderWindowsProgramData(absPath) {
+	underProgramData, pdErr := isUnderWindowsProgramData(absPath)
+	if pdErr != nil {
+		return nil, fmt.Errorf("resolve ProgramData trust scope for %q: %w", filename, pdErr)
+	}
+	if underProgramData.Allowed() {
 		verifyParentGlobal = true
 	} else {
 		currSID, err = winsec.CurrentProcessUserSID()
@@ -61,21 +66,24 @@ func openGlobalKnownHostsFile(filename string, limit int64) (io.ReadCloser, erro
 	return f, nil
 }
 
-func isUnderWindowsProgramData(absPath string) bool {
+func isUnderWindowsProgramData(absPath string) (verdict.Verdict, error) {
 	programData, err := windows.KnownFolderPath(windows.FOLDERID_ProgramData, windows.KF_FLAG_DONT_VERIFY)
 	if err != nil {
-		return false
+		return verdict.Deny, err
 	}
 	cleanPD := filepath.Clean(strings.TrimSpace(programData))
 	if cleanPD == "" {
-		return false
+		return verdict.Deny, fmt.Errorf("empty ProgramData known folder path")
 	}
 	if strings.EqualFold(absPath, cleanPD) {
-		return true
+		return verdict.Allow, nil
 	}
 	prefix := cleanPD
 	if !strings.HasSuffix(prefix, `\`) {
 		prefix += `\`
 	}
-	return len(absPath) > len(prefix) && strings.EqualFold(absPath[:len(prefix)], prefix)
+	if len(absPath) > len(prefix) && strings.EqualFold(absPath[:len(prefix)], prefix) {
+		return verdict.Allow, nil
+	}
+	return verdict.Deny, nil
 }

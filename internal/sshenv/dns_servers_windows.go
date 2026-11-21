@@ -11,6 +11,7 @@ import (
 	"strings"
 	"unsafe"
 
+	"github.com/wentf9/xops-cli/core/verdict"
 	"github.com/wentf9/xops-cli/core/winsec"
 	"golang.org/x/sys/windows"
 )
@@ -107,15 +108,15 @@ func resolveSecureWindowsGlobalKnownHostsPath(programData string) (string, bool)
 	if !filepath.IsAbs(cleanedProgramData) {
 		return "", false
 	}
-	if !isSecureWindowsSystemAncestorDir(cleanedProgramData) {
+	if v, err := isSecureWindowsSystemAncestorDir(cleanedProgramData); err != nil || !v.Allowed() {
 		return "", false
 	}
 	sshDir := filepath.Join(cleanedProgramData, "ssh")
 	candidate := filepath.Join(sshDir, "ssh_known_hosts")
-	if !isSecureWindowsSystemGlobalSSHObject(sshDir, true) {
+	if v, err := isSecureWindowsSystemGlobalSSHObject(sshDir, true); err != nil || !v.Allowed() {
 		return "", false
 	}
-	if !isSecureWindowsSystemGlobalSSHObject(candidate, false) {
+	if v, err := isSecureWindowsSystemGlobalSSHObject(candidate, false); err != nil || !v.Allowed() {
 		return "", false
 	}
 	return candidate, true
@@ -129,35 +130,35 @@ func resolveSecureWindowsGlobalKnownHostsPath(programData string) (string, bool)
 // must be non-reparse objects owned strictly by SYSTEM or Administrators with
 // every write/delete/DACL/owner allow ACE restricted to SYSTEM or Administrators
 // (never trusting the current non-admin user SID).
-func isSecureWindowsGlobalKnownHostsFile(path string) bool {
+func isSecureWindowsGlobalKnownHostsFile(path string) (verdict.Verdict, error) {
 	trimmed := strings.TrimSpace(path)
 	if trimmed == "" {
-		return false
+		return verdict.Deny, nil
 	}
 	cleaned := filepath.Clean(trimmed)
 	if !filepath.IsAbs(cleaned) {
-		return false
+		return verdict.Deny, nil
 	}
 	parentDir := filepath.Dir(cleaned)
 	if parentDir == "" || parentDir == cleaned {
-		return false
+		return verdict.Deny, nil
 	}
 	if grandParent := filepath.Dir(parentDir); grandParent != "" && grandParent != parentDir {
-		if !isSecureWindowsSystemAncestorDir(grandParent) {
-			return false
+		if v, err := isSecureWindowsSystemAncestorDir(grandParent); err != nil || !v.Allowed() {
+			return verdict.Deny, err
 		}
 	}
-	if !isSecureWindowsSystemGlobalSSHObject(parentDir, true) {
-		return false
+	if v, err := isSecureWindowsSystemGlobalSSHObject(parentDir, true); err != nil || !v.Allowed() {
+		return verdict.Deny, err
 	}
 	return isSecureWindowsSystemGlobalSSHObject(cleaned, false)
 }
 
-func isSecureWindowsSystemAncestorDir(path string) bool {
+func isSecureWindowsSystemAncestorDir(path string) (verdict.Verdict, error) {
 	return winsec.IsSecureSystemAncestorDir(path)
 }
 
-func isSecureWindowsSystemGlobalSSHObject(path string, expectDir bool) bool {
+func isSecureWindowsSystemGlobalSSHObject(path string, expectDir bool) (verdict.Verdict, error) {
 	return winsec.IsSecureSystemGlobalSSHObject(path, expectDir)
 }
 
