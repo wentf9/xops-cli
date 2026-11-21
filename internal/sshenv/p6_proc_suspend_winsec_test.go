@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/wentf9/xops-cli/core/verdict"
 )
 
 func TestP6_WaitProcessGroupExit_ReturnsImmediatelyWhenPipesCloseEvenForLivePGID(t *testing.T) {
@@ -236,94 +238,135 @@ func TestP6_EvaluateSuspendProcessGroup_Matrix(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name         string
-		pid          int
-		ppid         int
-		pgrp         int
-		sid          int
-		sidErr       error
-		parentSID    int
-		parentSIDErr error
-		wantErr      error
+		name        string
+		snap        suspendProcessSnapshot
+		wantVerdict verdict.Verdict
+		wantErr     error
 	}{
 		{
-			name:      "normal_job_control_child",
-			pid:       200,
-			ppid:      100,
-			pgrp:      200,
-			sid:       100,
-			parentSID: 100,
-			wantErr:   nil,
+			name: "normal_job_control_child",
+			snap: suspendProcessSnapshot{
+				pid:        200,
+				ppid:       100,
+				pgrp:       200,
+				sid:        100,
+				parentSID:  100,
+				parentPGRP: 100,
+			},
+			wantVerdict: verdict.Allow,
+			wantErr:     nil,
 		},
 		{
-			name:      "child_in_non_leader_job_group",
-			pid:       201,
-			ppid:      200,
-			pgrp:      200,
-			sid:       100,
-			parentSID: 100,
-			wantErr:   nil,
+			name: "child_in_same_pgrp_as_parent_is_denied",
+			snap: suspendProcessSnapshot{
+				pid:        201,
+				ppid:       200,
+				pgrp:       200,
+				sid:        100,
+				parentSID:  100,
+				parentPGRP: 200,
+			},
+			wantVerdict: verdict.Deny,
+			wantErr:     errSuspendOrphanedProcessGroup,
 		},
 		{
-			name:         "cross_uid_parent_eperm_not_falsely_orphaned",
-			pid:          200,
-			ppid:         100,
-			pgrp:         200,
-			sid:          100,
-			parentSIDErr: syscall.EPERM,
-			wantErr:      nil,
+			name: "cross_uid_parent_eperm_fails_closed",
+			snap: suspendProcessSnapshot{
+				pid:          200,
+				ppid:         100,
+				pgrp:         200,
+				sid:          100,
+				parentSIDErr: syscall.EPERM,
+				parentPGRP:   100,
+			},
+			wantVerdict: verdict.Deny,
+			wantErr:     errSuspendOrphanedProcessGroup,
 		},
 		{
-			name:      "init_reparented_ppid_1",
-			pid:       200,
-			ppid:      1,
-			pgrp:      200,
-			sid:       100,
-			parentSID: 1,
-			wantErr:   errSuspendOrphanedProcessGroup,
+			name: "init_reparented_ppid_1",
+			snap: suspendProcessSnapshot{
+				pid:        200,
+				ppid:       1,
+				pgrp:       200,
+				sid:        100,
+				parentSID:  1,
+				parentPGRP: 1,
+			},
+			wantVerdict: verdict.Deny,
+			wantErr:     errSuspendOrphanedProcessGroup,
 		},
 		{
-			name:      "session_leader_pid_eq_sid",
-			pid:       200,
-			ppid:      100,
-			pgrp:      200,
-			sid:       200,
-			parentSID: 100,
-			wantErr:   errSuspendOrphanedProcessGroup,
+			name: "session_leader_pid_eq_sid",
+			snap: suspendProcessSnapshot{
+				pid:        200,
+				ppid:       100,
+				pgrp:       200,
+				sid:        200,
+				parentSID:  100,
+				parentPGRP: 100,
+			},
+			wantVerdict: verdict.Deny,
+			wantErr:     errSuspendOrphanedProcessGroup,
 		},
 		{
-			name:      "member_of_session_leader_pgrp",
-			pid:       201,
-			ppid:      200,
-			pgrp:      200,
-			sid:       200,
-			parentSID: 200,
-			wantErr:   errSuspendOrphanedProcessGroup,
+			name: "member_of_session_leader_pgrp",
+			snap: suspendProcessSnapshot{
+				pid:        201,
+				ppid:       200,
+				pgrp:       200,
+				sid:        200,
+				parentSID:  200,
+				parentPGRP: 200,
+			},
+			wantVerdict: verdict.Deny,
+			wantErr:     errSuspendOrphanedProcessGroup,
 		},
 		{
-			name:      "parent_in_different_session_subreaper",
-			pid:       200,
-			ppid:      50,
-			pgrp:      200,
-			sid:       100,
-			parentSID: 50,
-			wantErr:   errSuspendOrphanedProcessGroup,
+			name: "parent_in_different_session_subreaper",
+			snap: suspendProcessSnapshot{
+				pid:        200,
+				ppid:       50,
+				pgrp:       200,
+				sid:        100,
+				parentSID:  50,
+				parentPGRP: 50,
+			},
+			wantVerdict: verdict.Deny,
+			wantErr:     errSuspendOrphanedProcessGroup,
 		},
 		{
-			name:    "invalid_pgrp",
-			pid:     200,
-			ppid:    100,
-			pgrp:    0,
-			sid:     100,
-			wantErr: errSuspendOrphanedProcessGroup,
+			name: "invalid_pgrp",
+			snap: suspendProcessSnapshot{
+				pid:        200,
+				ppid:       100,
+				pgrp:       0,
+				sid:        100,
+				parentSID:  100,
+				parentPGRP: 100,
+			},
+			wantVerdict: verdict.Deny,
+			wantErr:     errSuspendOrphanedProcessGroup,
+		},
+		{
+			name: "getpgid_parent_eperm_fails_closed",
+			snap: suspendProcessSnapshot{
+				pid:           200,
+				ppid:          100,
+				pgrp:          200,
+				sid:           100,
+				parentSID:     100,
+				parentPGRPErr: syscall.EPERM,
+			},
+			wantVerdict: verdict.Deny,
+			wantErr:     errSuspendOrphanedProcessGroup,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := evaluateSuspendProcessGroup(tc.pid, tc.ppid, tc.pgrp, tc.sid, tc.sidErr, tc.parentSID, tc.parentSIDErr)
-			if !errors.Is(err, tc.wantErr) {
-				t.Fatalf("evaluateSuspendProcessGroup() = %v, want %v", err, tc.wantErr)
+			v, err := evaluateSuspendProcessGroup(tc.snap)
+			if v != tc.wantVerdict || !errors.Is(err, tc.wantErr) {
+				t.Fatalf("evaluateSuspendProcessGroup() = (%v, %v), want (%v, %v)", v, err, tc.wantVerdict, tc.wantErr)
 			}
 		})
 	}

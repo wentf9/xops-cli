@@ -319,15 +319,44 @@ func waitProcessGroupExit(pgid int, termGrace time.Duration, stderrDone, sentine
 	}
 }
 
+// hasLiveGroupMemberProof reports whether there is affirmative evidence that
+// a descendant spawned inside this process group still holds the inherited
+// sentinel pipe open. After the group leader has been reaped, signaling -pgid
+// without this proof risks killing an unrelated process that reused the PGID,
+// so missing or closed sentinels fail closed (return false).
+func (p *platformProc) hasLiveGroupMemberProof(sentinelDone <-chan struct{}) bool {
+	if p == nil {
+		return false
+	}
+	p.reapMu.Lock()
+	probe := p.sentinelProbe
+	boundDone := p.sentinelDone
+	p.reapMu.Unlock()
+
+	if sentinelDone == nil {
+		sentinelDone = boundDone
+	}
+	if probe != nil {
+		if sentinelDone != nil && isClosedChan(sentinelDone) {
+			return false
+		}
+		return pipeHasOpenWriter(probe)
+	}
+	return sentinelDone != nil && !isClosedChan(sentinelDone)
+}
+
 func (p *platformProc) reapRemainingGroup(termGrace time.Duration, stderrDone, sentinelDone <-chan struct{}, alreadyExited bool) {
 	if p == nil || p.foregroundTTY || p.pgid <= 0 || alreadyExited {
 		return
 	}
-	if groupPipesClosed(stderrDone, sentinelDone) {
+	if !p.hasLiveGroupMemberProof(sentinelDone) || groupPipesClosed(stderrDone, sentinelDone) {
 		return
 	}
 	if hook := onUnixReapRemainingGroup; hook != nil {
 		hook(p.pgid)
+	}
+	if !p.hasLiveGroupMemberProof(sentinelDone) || groupPipesClosed(stderrDone, sentinelDone) {
+		return
 	}
 	if syscall.Kill(-p.pgid, 0) != nil {
 		return
@@ -336,7 +365,7 @@ func (p *platformProc) reapRemainingGroup(termGrace time.Duration, stderrDone, s
 	if termGrace > 0 && waitProcessGroupExit(p.pgid, termGrace, stderrDone, sentinelDone) {
 		return
 	}
-	if groupPipesClosed(stderrDone, sentinelDone) {
+	if !p.hasLiveGroupMemberProof(sentinelDone) || groupPipesClosed(stderrDone, sentinelDone) {
 		return
 	}
 	if syscall.Kill(-p.pgid, 0) == nil {
@@ -355,23 +384,26 @@ func (p *platformProc) cleanupAfterWait(canceled bool) {
 	if p.foregroundTTY || p.pgid <= 0 || !canceled {
 		return
 	}
-	if sentinelR != nil && !pipeHasOpenWriter(sentinelR) {
+	// Fail closed after leader reap: without an inherited sentinel pipe that
+	// still has a live writer, we cannot prove the PGID has not been recycled.
+	if sentinelR == nil || !pipeHasOpenWriter(sentinelR) {
 		return
 	}
 	if hook := onUnixReapRemainingGroup; hook != nil {
 		hook(p.pgid)
 	}
-	if syscall.Kill(-p.pgid, 0) == nil {
-		_ = syscall.Kill(-p.pgid, syscall.SIGTERM)
-		deadline := time.Now().Add(10 * time.Millisecond)
-		for time.Now().Before(deadline) {
-			if (sentinelR != nil && !pipeHasOpenWriter(sentinelR)) || syscall.Kill(-p.pgid, 0) != nil {
-				return
-			}
-			time.Sleep(time.Millisecond)
+	if !pipeHasOpenWriter(sentinelR) || syscall.Kill(-p.pgid, 0) != nil {
+		return
+	}
+	_ = syscall.Kill(-p.pgid, syscall.SIGTERM)
+	deadline := time.Now().Add(10 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if !pipeHasOpenWriter(sentinelR) || syscall.Kill(-p.pgid, 0) != nil {
+			return
 		}
-		if (sentinelR == nil || pipeHasOpenWriter(sentinelR)) && syscall.Kill(-p.pgid, 0) == nil {
-			_ = syscall.Kill(-p.pgid, syscall.SIGKILL)
-		}
+		time.Sleep(time.Millisecond)
+	}
+	if pipeHasOpenWriter(sentinelR) && syscall.Kill(-p.pgid, 0) == nil {
+		_ = syscall.Kill(-p.pgid, syscall.SIGKILL)
 	}
 }
