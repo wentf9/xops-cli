@@ -61,7 +61,11 @@ type Connector struct {
 	closed          bool
 	closeDone       chan struct{}
 	closeErr        error
-	connectWG       sync.WaitGroup
+	// retiredClients tracks pooled transports displaced by incompatible config
+	// updates so active sessions keep running while CloseAll still shuts them down.
+	// Guarded by lifecycleMu.
+	retiredClients []*PooledClient
+	connectWG      sync.WaitGroup
 
 	// kaMu 保护 keepAliveCfg 的启用/关闭（keepAlives 自带分片锁，无需 kaMu）
 	kaMu sync.Mutex
@@ -328,13 +332,40 @@ func isClientTransportClosed(client *Client) bool {
 	return ok && root.closed.Load()
 }
 
+func (c *Connector) cascadeInvalidateDownstream(
+	plan []connectionPlanNode,
+	index int,
+	cached *PooledClient,
+	beforeDownstream []*PooledClient,
+	nonDisruptive bool,
+) {
+	for downstream := 0; downstream < index; downstream++ {
+		dsKey := plan[downstream].poolKey()
+		staleDownstream, exists := c.clients.Get(dsKey)
+		if !exists {
+			continue
+		}
+		sameGeneration := (cached.RootConn != nil && staleDownstream.RootConn == cached.RootConn) ||
+			(cached.RootConn == nil && staleDownstream == beforeDownstream[downstream])
+		if !sameGeneration {
+			continue
+		}
+		if nonDisruptive {
+			c.retireIncompatibleClient(dsKey, staleDownstream)
+		} else {
+			c.evictCachedClient(dsKey, staleDownstream)
+			_ = staleDownstream.interrupt()
+		}
+	}
+}
+
 func (c *Connector) reuseJumpChainedTarget(ctx context.Context, plan []connectionPlanNode) (*Client, map[string]*Client, error) {
 	validated := make(map[string]*Client, len(plan)-1)
 	for index := len(plan) - 1; index > 0; index-- {
 		planNode := plan[index]
 		routeKey := planNode.poolKey()
 		cached, ok := c.clients.Get(routeKey)
-		if !ok || cached.SSHClient.Conn == nil {
+		if !ok || cached.SSHClient == nil || (cached.SSHClient.Conn == nil && !cached.hasSnapshot) {
 			continue
 		}
 		var beforeDownstream []*PooledClient
@@ -353,29 +384,21 @@ func (c *Connector) reuseJumpChainedTarget(ctx context.Context, plan []connectio
 			// the failure keeps the hop it happened on.
 			c.getLogger().Debugf("mux: cached jump hop %s is not reusable (%v)", planNode.name, err)
 			if errors.Is(err, errJumpChainRequired) {
-				// The cached hop was stale and evicted; cascade-evict all in-process
-				// cached downstream hops (plan[0..index-1]) that rode on the same failed
-				// transport generation, without clobbering a fresher replacement
-				// published concurrently by another caller, while still letting plan[0]
-				// attach to an external control master socket if one exists on disk.
-				for downstream := 0; downstream < index; downstream++ {
-					dsKey := plan[downstream].poolKey()
-					staleDownstream, exists := c.clients.Get(dsKey)
-					if !exists {
-						continue
-					}
-					sameGeneration := (cached.RootConn != nil && staleDownstream.RootConn == cached.RootConn) ||
-						(cached.RootConn == nil && staleDownstream == beforeDownstream[downstream])
-					if !sameGeneration {
-						continue
-					}
-					c.evictCachedClient(dsKey, staleDownstream)
-					_ = staleDownstream.interrupt()
-				}
+				// The cached hop was stale and evicted (or retired due to config change);
+				// cascade-invalidate all in-process cached downstream hops (plan[0..index-1])
+				// that rode on the same transport generation, without clobbering a fresher
+				// replacement published concurrently by another caller, while still letting
+				// plan[0] attach to an external control master socket if one exists on disk.
+				// Config-change retirements leave live sessions on the previous generation
+				// running until CloseAll; failed liveness probes interrupt dead transports.
+				c.cascadeInvalidateDownstream(plan, index, cached, beforeDownstream, errors.Is(err, ErrSnapshotMismatch))
 				validated = nil
 				break
 			}
 			return nil, nil, err
+		}
+		if hopClient.sshClient != cached.SSHClient {
+			c.cascadeInvalidateDownstream(plan, index, cached, beforeDownstream, true)
 		}
 		// This transport was validated a moment ago on the connector lifecycle;
 		// probing it again while the chain is rebuilt would repeat a network
@@ -511,6 +534,7 @@ func (c *Connector) resolveConnectionPlan(ctx context.Context, nodeName string) 
 		}
 		nodeCfg := *cfg
 		nodeCfg.Address = normalizeHostAddress(nodeCfg.Address)
+		nodeCfg.BaseHost = normalizeHostAddress(nodeCfg.BaseHost)
 		nodeCfg.KeyPaths = slices.Clone(cfg.KeyPaths)
 		if nodeCfg.Port <= 0 {
 			nodeCfg.Port = 22
@@ -543,6 +567,7 @@ func (c *Connector) resolveConnectionPlan(ctx context.Context, nodeName string) 
 				}
 				cloned := *jumpCfg
 				cloned.Address = normalizeHostAddress(jumpCfg.Address)
+				cloned.BaseHost = normalizeHostAddress(jumpCfg.BaseHost)
 				cloned.KeyPaths = slices.Clone(jumpCfg.KeyPaths)
 				if cloned.Port <= 0 {
 					cloned.Port = 22
@@ -679,20 +704,29 @@ func (c *Connector) connectNode(ctx context.Context, planNode connectionPlanNode
 	nodeName := planNode.name
 	routeKey := planNode.poolKey()
 	var probeErr error
+	var compatErr error
 	if cachedClient, ok := c.clients.Get(routeKey); ok {
-		if cachedClient.SSHClient.Conn == nil {
-			logger.EmitDiagnostic(c.diagnostics, logger.Diagnostic{Kind: logger.ConnectionReused, NodeID: nodeName})
-			return c.wrapCachedClient(planNode.cfg, cachedClient), nil
+		if cachedClient.hasSnapshot {
+			compatErr = validateTargetCompatibility(cachedClient.Snapshot, planNode.cfg)
 		}
-
-		if err := c.probeCachedClient(ctx, cachedClient); err == nil {
+		switch {
+		case compatErr != nil:
+			c.getLogger().Debugf("ssh: cached connection for node %q is incompatible with updated config (%v); retiring", nodeName, compatErr)
+			c.retireIncompatibleClient(routeKey, cachedClient)
+			c.retireDownstreamGeneration(routeKey, cachedClient)
+		case cachedClient.SSHClient.Conn == nil:
 			logger.EmitDiagnostic(c.diagnostics, logger.Diagnostic{Kind: logger.ConnectionReused, NodeID: nodeName})
 			return c.wrapCachedClient(planNode.cfg, cachedClient), nil
-		} else {
-			probeErr = err
-			c.evictCachedClient(routeKey, cachedClient)
-			if ctx.Err() != nil {
-				return nil, fmt.Errorf("probe cached SSH connection for node '%s' failed: %w", nodeName, ctx.Err())
+		default:
+			if err := c.probeCachedClient(ctx, cachedClient); err == nil {
+				logger.EmitDiagnostic(c.diagnostics, logger.Diagnostic{Kind: logger.ConnectionReused, NodeID: nodeName})
+				return c.wrapCachedClient(planNode.cfg, cachedClient), nil
+			} else {
+				probeErr = err
+				c.evictCachedClient(routeKey, cachedClient)
+				if ctx.Err() != nil {
+					return nil, fmt.Errorf("probe cached SSH connection for node '%s' failed: %w", nodeName, ctx.Err())
+				}
 			}
 		}
 	}
@@ -709,6 +743,9 @@ func (c *Connector) connectNode(ctx context.Context, planNode connectionPlanNode
 	}
 
 	if reuseOnly {
+		if compatErr != nil {
+			return nil, fmt.Errorf("%w: %w", errJumpChainRequired, compatErr)
+		}
 		return nil, errJumpChainRequired
 	}
 
@@ -788,6 +825,63 @@ func (c *Connector) evictCachedClient(nodeName string, stale *PooledClient) {
 	c.removeKeepAliveFor(nodeName, stale)
 }
 
+// retireIncompatibleClient removes displaced from the active pool and cancels
+// its keepalive without interrupting its transport while the connector remains
+// open, preserving live sessions on earlier generations until CloseAll.
+func (c *Connector) retireIncompatibleClient(routeKey string, displaced *PooledClient) {
+	if displaced == nil {
+		return
+	}
+	c.lifecycleMu.Lock()
+	if c.closed {
+		c.lifecycleMu.Unlock()
+		c.removeKeepAliveFor(routeKey, displaced)
+		_ = displaced.interrupt()
+		return
+	}
+	concurrent.RemoveIfMatch(c.clients, routeKey, displaced)
+	if !slices.Contains(c.retiredClients, displaced) {
+		c.retiredClients = append(c.retiredClients, displaced)
+	}
+	c.lifecycleMu.Unlock()
+	c.removeKeepAliveFor(routeKey, displaced)
+}
+
+func isDownstreamRouteKey(parentKey, candidateKey string) bool {
+	if candidateKey == "" || candidateKey == parentKey {
+		return false
+	}
+	var prefix string
+	if strings.HasPrefix(parentKey, "\x00route\x00") {
+		prefix = parentKey
+	} else {
+		prefix = "\x00route\x00" + strconv.Itoa(len(parentKey)) + ":" + parentKey + ";"
+	}
+	return len(candidateKey) > len(prefix) && strings.HasPrefix(candidateKey, prefix)
+}
+
+// retireDownstreamGeneration non-disruptively retires cached downstream hops
+// riding on displaced's physical transport generation after parentKey drifted.
+func (c *Connector) retireDownstreamGeneration(parentKey string, displaced *PooledClient) {
+	if displaced == nil || displaced.RootConn == nil {
+		return
+	}
+	type candidate struct {
+		key    string
+		client *PooledClient
+	}
+	var downstream []candidate
+	c.clients.IterCb(func(key string, client *PooledClient) bool {
+		if client != nil && client.RootConn == displaced.RootConn && isDownstreamRouteKey(parentKey, key) {
+			downstream = append(downstream, candidate{key: key, client: client})
+		}
+		return true
+	})
+	for _, item := range downstream {
+		c.retireIncompatibleClient(item.key, item.client)
+	}
+}
+
 func (c *Connector) resolveSecret(cfg *ClientConfig, req SecretRequest) ([]byte, error) {
 	if c.secretResolver == nil {
 		return nil, ErrInteractionRequired
@@ -803,29 +897,7 @@ func (c *Connector) resolveSecret(cfg *ClientConfig, req SecretRequest) ([]byte,
 }
 
 func (c *Connector) buildTargetContext(planNode connectionPlanNode) TargetContext {
-	cfg := planNode.cfg
-	port := cfg.Port
-	if port <= 0 {
-		port = 22
-	}
-	user := cfg.User
-	if user == "" {
-		user = c.environment.LocalUser
-	}
-	originalHost := effectiveOriginalHost(cfg.OriginalHost, cfg.NodeID)
-	if originalHost == "" {
-		originalHost = planNode.name
-	}
-	return TargetContext{
-		Host:          cleanHostLiteral(cfg.Address),
-		Port:          port,
-		User:          user,
-		OriginalHost:  originalHost,
-		CanonicalHost: strings.TrimSpace(cfg.CanonicalHost),
-		JumpHost:      NormalizeProxyJump(cfg.ProxyJump),
-		KeyPath:       cfg.KeyPath,
-		Control:       planNode.control,
-	}
+	return BuildClientTargetContext(planNode.name, planNode.cfg, c.environment, planNode.control)
 }
 
 func isFatalMultiplexSecurityError(err error) bool {
@@ -1005,6 +1077,8 @@ func (c *Connector) tryDialAndPublishProxy(ctx context.Context, planNode connect
 		RootConn:           rootConn,
 		ControlSocketPath:  expandedPath,
 		ControlExpectedUID: c.expectedPeerUID(),
+		Snapshot:           planNode.cfg.ToConnectionConfig(),
+		hasSnapshot:        true,
 	}
 	routeKey := planNode.poolKey()
 	if err := c.publishClient(routeKey, pooled); err != nil {
@@ -1702,6 +1776,8 @@ func (c *Connector) CloseAll() error {
 			ownedMasters = append(ownedMasters, master)
 		}
 	}
+	retiredClients := c.retiredClients
+	c.retiredClients = nil
 	c.masters = nil
 	c.masterOrder = nil
 	clear(c.plans)
@@ -1733,11 +1809,7 @@ func (c *Connector) CloseAll() error {
 			closeErrs = append(closeErrs, err)
 		}
 	}
-	for _, client := range pooledClients {
-		if err := client.interrupt(); err != nil {
-			closeErrs = append(closeErrs, err)
-		}
-	}
+	closeErrs = append(closeErrs, interruptUniquePooledClients(pooledClients, retiredClients)...)
 	c.connectWG.Wait()
 	c.clients.Clear()
 
@@ -1763,6 +1835,30 @@ func (c *Connector) CloseAll() error {
 	return c.closeErr
 }
 
+func interruptUniquePooledClients(groups ...[]*PooledClient) []error {
+	total := 0
+	for _, group := range groups {
+		total += len(group)
+	}
+	seen := make(map[*PooledClient]struct{}, total)
+	var errs []error
+	for _, group := range groups {
+		for _, client := range group {
+			if client == nil {
+				continue
+			}
+			if _, ok := seen[client]; ok {
+				continue
+			}
+			seen[client] = struct{}{}
+			if err := client.interrupt(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errs
+}
+
 // PooledClient retains the outermost transport, including for ProxyJump clients.
 // Interrupting it also terminates other clients sharing that transport.
 type PooledClient struct {
@@ -1772,6 +1868,8 @@ type PooledClient struct {
 	probeCache         *executionProbeCache
 	ControlSocketPath  string
 	ControlExpectedUID uint32
+	Snapshot           ConnectionConfig
+	hasSnapshot        bool
 }
 
 func (c *PooledClient) interrupt() error {

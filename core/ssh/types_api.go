@@ -450,3 +450,52 @@ func effectiveOriginalHost(originalHost, nodeID string) string {
 	}
 	return nodeID
 }
+
+// NormalizeTargetContext returns a canonicalized copy of raw using env for
+// local-user fallback.
+func NormalizeTargetContext(raw TargetContext, env Environment) TargetContext {
+	port := raw.Port
+	if port <= 0 {
+		port = 22
+	}
+	user := raw.User
+	if user == "" {
+		user = env.LocalUser
+	}
+	return TargetContext{
+		Host:          cleanHostLiteral(raw.Host),
+		Port:          port,
+		User:          user,
+		OriginalHost:  strings.TrimSpace(raw.OriginalHost),
+		CanonicalHost: strings.TrimSpace(raw.CanonicalHost),
+		JumpHost:      NormalizeProxyJump(raw.JumpHost),
+		KeyPath:       raw.KeyPath,
+		Control:       raw.Control,
+	}
+}
+
+// BuildClientTargetContext builds a canonical TargetContext from nodeName,
+// cfg, env, and ctrl. A nil cfg safely falls back to nodeName, default port,
+// env.LocalUser, and ctrl.
+func BuildClientTargetContext(nodeName string, cfg *ClientConfig, env Environment, ctrl *ControlConfig) TargetContext {
+	if cfg == nil {
+		return NormalizeTargetContext(TargetContext{
+			OriginalHost: nodeName,
+			Control:      ctrl,
+		}, env)
+	}
+	originalHost := effectiveOriginalHost(cfg.OriginalHost, cfg.NodeID)
+	if strings.TrimSpace(originalHost) == "" {
+		originalHost = nodeName
+	}
+	return NormalizeTargetContext(TargetContext{
+		Host:          cfg.Address,
+		Port:          cfg.Port,
+		User:          cfg.User,
+		OriginalHost:  originalHost,
+		CanonicalHost: cfg.CanonicalHost,
+		JumpHost:      cfg.ProxyJump,
+		KeyPath:       cfg.KeyPath,
+		Control:       ctrl,
+	}, env)
+}

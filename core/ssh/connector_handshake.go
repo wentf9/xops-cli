@@ -509,6 +509,9 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 	client.connCfg = finalConnCfg
 	client.cfgMu.Unlock()
 
+	pooled.Snapshot = finalConnCfg.Clone()
+	pooled.hasSnapshot = true
+
 	routeKey := planNode.poolKey()
 	if err := c.publishClient(routeKey, pooled); err != nil {
 		if closeErr := rootConn.Close(); closeErr != nil {
@@ -606,6 +609,7 @@ func (c *Connector) reloadConfigAfterRecording(nodeName string, hasAuthUpdate bo
 	}
 	newClone := *newCfg
 	newClone.Address = normalizeHostAddress(newCfg.Address)
+	newClone.BaseHost = normalizeHostAddress(newCfg.BaseHost)
 	newClone.KeyPaths = slices.Clone(newCfg.KeyPaths)
 	return &newClone, nil
 }
