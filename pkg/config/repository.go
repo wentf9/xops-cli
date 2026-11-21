@@ -417,7 +417,12 @@ func (r *Repository) SetNodeOpenSSHOrigin(nodeID string, origin OpenSSHOrigin) {
 	if r == nil || r.provider == nil {
 		return
 	}
+	r.pendingMu.RLock()
+	if pending := r.pending[nodeID]; pending != nil && pending.provider != nil {
+		pending.provider.SetNodeOpenSSHOrigin(nodeID, origin)
+	}
 	r.provider.SetNodeOpenSSHOrigin(nodeID, origin)
+	r.pendingMu.RUnlock()
 }
 
 // ClearNodeOpenSSHOrigin removes the session-recorded OpenSSH origin for nodeID.
@@ -425,7 +430,12 @@ func (r *Repository) ClearNodeOpenSSHOrigin(nodeID string) {
 	if r == nil || r.provider == nil {
 		return
 	}
+	r.pendingMu.RLock()
+	if pending := r.pending[nodeID]; pending != nil && pending.provider != nil {
+		pending.provider.ClearNodeOpenSSHOrigin(nodeID)
+	}
 	r.provider.ClearNodeOpenSSHOrigin(nodeID)
+	r.pendingMu.RUnlock()
 }
 
 // SetNodeOpenSSHAlias records the concrete OpenSSH Host alias from which nodeID
@@ -434,7 +444,12 @@ func (r *Repository) SetNodeOpenSSHAlias(nodeID, alias string) {
 	if r == nil || r.provider == nil {
 		return
 	}
+	r.pendingMu.RLock()
+	if pending := r.pending[nodeID]; pending != nil && pending.provider != nil {
+		pending.provider.SetNodeOpenSSHAlias(nodeID, alias)
+	}
 	r.provider.SetNodeOpenSSHAlias(nodeID, alias)
+	r.pendingMu.RUnlock()
 }
 
 // NodeOpenSSHAlias returns the session-recorded OpenSSH Host alias for nodeID.
@@ -447,7 +462,12 @@ func (r *Repository) SetNodeCanonicalHost(nodeID, canonicalHost string) {
 	if r == nil || r.provider == nil {
 		return
 	}
+	r.pendingMu.RLock()
+	if pending := r.pending[nodeID]; pending != nil && pending.provider != nil {
+		pending.provider.SetNodeCanonicalHost(nodeID, canonicalHost)
+	}
 	r.provider.SetNodeCanonicalHost(nodeID, canonicalHost)
+	r.pendingMu.RUnlock()
 }
 
 // NodeCanonicalHost returns the session-recorded canonicalized host for nodeID.
@@ -711,7 +731,7 @@ func (r *Repository) CreateIdentityContext(ctx context.Context, identityID strin
 		if _, exists := cfg.Identities.Get(identityID); exists {
 			return fmt.Errorf("create identity %q: %w", identityID, ErrConfigConflict)
 		}
-		cfg.Identities.Set(identityID, identity)
+		cfg.Identities.Set(identityID, cloneIdentity(identity))
 		return nil
 	})
 	return MutationOutcome{Applied: result.Applied, Durable: result.Durable}, err
@@ -724,7 +744,7 @@ func (r *Repository) ReplaceIdentityAtRefContext(ctx context.Context, ref Identi
 		if err := ensureIdentityRef(cfg, ref); err != nil {
 			return err
 		}
-		cfg.Identities.Set(ref.ID, identity)
+		cfg.Identities.Set(ref.ID, cloneIdentity(identity))
 		return nil
 	})
 	return MutationOutcome{Applied: result.Applied, Durable: result.Durable}, err
@@ -799,7 +819,7 @@ func (r *Repository) CreateNodeContext(ctx context.Context, nodeID string, node 
 				return fmt.Errorf("create node %q identity ref %q: %w", nodeID, node.IdentityRef, ErrConfigConflict)
 			}
 		} else {
-			cfg.Identities.Set(node.IdentityRef, identity)
+			cfg.Identities.Set(node.IdentityRef, cloneIdentity(identity))
 		}
 		storedNode := cloneNode(node)
 		storedNode.OpenSSHAlias = ""
@@ -926,7 +946,7 @@ func replaceNodeAtRef(cfg *Configuration, ref NodeRef, nodeID string, node model
 		}
 	}
 	cfg.Hosts.Set(node.HostRef, cloneHost(host))
-	cfg.Identities.Set(node.IdentityRef, identity)
+	cfg.Identities.Set(node.IdentityRef, cloneIdentity(identity))
 	cfg.Nodes.Set(nodeID, cloneNode(node))
 	if oldNodeID != "" && oldNodeID != nodeID {
 		removeNodeAndUnusedRefs(cfg, oldNodeID)
@@ -1120,18 +1140,32 @@ func (r *Repository) ImportOpenSSHHostsContext(ctx context.Context, hosts []Open
 				result.Skipped++
 				continue
 			}
+			sanitizedOpts, optErr := sanitizeAndValidateImportedSSHOptions(item.Node.SSHOptions, cfg.SSHOptions)
+			if optErr != nil {
+				result.Skipped++
+				result.Issues = append(result.Issues, ImportIssue{Name: item.Name, Err: optErr})
+				continue
+			}
 			if importErr := reserveOpenSSHAliases(aliases, item); importErr != nil {
 				result.Skipped++
 				result.Issues = append(result.Issues, ImportIssue{Name: item.Name, Err: importErr})
 				continue
 			}
-			hostRef := "openssh-host:" + item.Name
-			identityRef := "openssh-identity:" + item.Name
-			item.Node.HostRef = hostRef
-			item.Node.IdentityRef = identityRef
+			hostRef := allocateUnusedRef(func(candidate string) bool {
+				_, exists := cfg.Hosts.Get(candidate)
+				return exists
+			}, "openssh-host:"+item.Name)
+			identityRef := allocateUnusedRef(func(candidate string) bool {
+				_, exists := cfg.Identities.Get(candidate)
+				return exists
+			}, "openssh-identity:"+item.Name)
+			storedNode := cloneNode(item.Node)
+			storedNode.SSHOptions = sanitizedOpts
+			storedNode.HostRef = hostRef
+			storedNode.IdentityRef = identityRef
 			cfg.Hosts.Set(hostRef, cloneHost(item.Host))
-			cfg.Identities.Set(identityRef, item.Identity)
-			cfg.Nodes.Set(item.Name, cloneNode(item.Node))
+			cfg.Identities.Set(identityRef, cloneIdentity(item.Identity))
+			cfg.Nodes.Set(item.Name, storedNode)
 			importedNodeIDs = append(importedNodeIDs, item.Name)
 			result.Imported++
 		}
@@ -1155,22 +1189,80 @@ func (r *Repository) ImportOpenSSHHostsContext(ctx context.Context, hosts []Open
 	return result, nil
 }
 
+func allocateUnusedRef(inUse func(string) bool, base string) string {
+	if !inUse(base) {
+		return base
+	}
+	for suffix := 2; ; suffix++ {
+		candidate := fmt.Sprintf("%s:%d", base, suffix)
+		if !inUse(candidate) {
+			return candidate
+		}
+	}
+}
+
+func sanitizeAndValidateImportedSSHOptions(nodeOpts, globalOpts *ssh.Options) (*ssh.Options, error) {
+	if nodeOpts == nil || nodeOpts.IsEmpty() {
+		if globalOpts != nil {
+			if err := ValidateEffectiveSSHOptions(globalOpts); err != nil {
+				return nil, err
+			}
+		}
+		return nil, nil
+	}
+	cloned := nodeOpts.Clone()
+	if cloned.ControlMaster() == ssh.ControlMasterNo && globalOpts != nil && !ssh.IsNoneValue(cloned.ControlPath()) {
+		if gPersist, gErr := globalOpts.PersistSetting(); gErr == nil && gPersist.Enabled() {
+			if nPersist, nErr := cloned.PersistSetting(); nErr != nil || !nPersist.Explicit() || nPersist.Enabled() {
+				_ = cloned.Set(ssh.OptionControlPersist, "no")
+			}
+		}
+	}
+	if err := ValidateSSHOptions(cloned); err != nil {
+		return nil, err
+	}
+	effectiveOpts, err := ssh.ResolveOptions(cloned, globalOpts)
+	if err != nil {
+		return nil, err
+	}
+	if effectiveOpts != nil {
+		if err := ValidateEffectiveSSHOptions(effectiveOpts); err != nil {
+			return nil, err
+		}
+	}
+	return cloned, nil
+}
+
 func reserveOpenSSHAliases(aliases map[string]string, item OpenSSHHost) error {
 	if err := ValidateNodeAliases(item.Host.Alias); err != nil {
 		return err
 	}
-	for _, alias := range item.Node.Alias {
-		if alias == "" {
-			continue
+	checkList := func(list []string) error {
+		for _, alias := range list {
+			if alias == "" {
+				continue
+			}
+			if err := ValidateNodeAlias(alias); err != nil {
+				return err
+			}
+			if existingNodeID, exists := aliases[alias]; exists && existingNodeID != item.Name {
+				return fmt.Errorf("alias %q is already assigned to node %q", alias, existingNodeID)
+			}
 		}
-		if err := ValidateNodeAlias(alias); err != nil {
-			return err
-		}
-		if existingNodeID, exists := aliases[alias]; exists && existingNodeID != item.Name {
-			return fmt.Errorf("alias %q is already assigned to node %q", alias, existingNodeID)
-		}
+		return nil
+	}
+	if err := checkList(item.Node.Alias); err != nil {
+		return err
+	}
+	if err := checkList(item.Host.Alias); err != nil {
+		return err
 	}
 	for _, alias := range item.Node.Alias {
+		if alias != "" {
+			aliases[alias] = item.Name
+		}
+	}
+	for _, alias := range item.Host.Alias {
 		if alias != "" {
 			aliases[alias] = item.Name
 		}

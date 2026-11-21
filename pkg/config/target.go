@@ -1118,10 +1118,11 @@ func (r *Repository) matchOpenSSHVirtualNode(selector, effectiveUser string, eff
 	if parser == nil || parser.cfg == nil {
 		return "", "", nil
 	}
-	if selector == "" || strings.Contains(selector, "@") || strings.Contains(selector, ":") || !parser.HasHost(selector) {
+	if !IsPlainOpenSSHHostSelector(selector) || !parser.HasHost(selector) {
 		return "", "", nil
 	}
-	_, vhost, vident, err := parser.GetVirtualNode(selector)
+	cleanSelector := StripHostBrackets(selector)
+	_, vhost, vident, err := parser.GetVirtualNode(cleanSelector)
 	if err != nil {
 		return "", "", nil
 	}
@@ -1131,11 +1132,11 @@ func (r *Repository) matchOpenSSHVirtualNode(selector, effectiveUser string, eff
 		}
 	}
 	if vident.User == effectiveUser && normalizedHostPort(vhost.Port) == effectivePort {
-		alias := selector
+		alias := cleanSelector
 		if hasCanonicalAlias {
 			alias = orig
 		}
-		return OpenSSHNodePrefix + selector, alias, nil
+		return OpenSSHNodePrefix + cleanSelector, alias, nil
 	}
 	return "", "", nil
 }
@@ -1353,21 +1354,22 @@ func (r *Repository) resolveCanonicalTargetInfo(cfg *Configuration, lookup map[s
 	}
 	if parser.cfg != nil {
 		clean := strings.TrimSpace(strings.TrimPrefix(selector, OpenSSHNodePrefix))
-		allowSpec := strings.HasPrefix(selector, OpenSSHNodePrefix) || (!strings.Contains(clean, "@") && !strings.Contains(clean, ":"))
+		allowSpec := strings.HasPrefix(selector, OpenSSHNodePrefix) || IsPlainOpenSSHHostSelector(clean)
 		orig := normalizeOriginalHost(target.OriginalHost)
 		if clean != "" && allowSpec && ((orig != "" && !strings.EqualFold(orig, clean)) || parser.HasHost(clean)) {
 			vnode, vhost, vident, err := resolveVirtualNodeForTarget(parser, clean, target)
 			if err != nil {
 				return canonicalTargetInfo{}, fmt.Errorf("resolve openssh host %q: %w", clean, err)
 			}
+			cleanHost := StripHostBrackets(clean)
 			alias := resolveOpenSSHAliasName(parser, clean)
-			if orig != "" && !strings.EqualFold(orig, clean) {
+			if orig != "" && !strings.EqualFold(orig, cleanHost) {
 				alias = orig
 			}
-			canonHost := canonicalTargetHost(target, clean)
-			backfillCanonicalTargetMetadata(target, clean, &alias, &canonHost)
+			canonHost := canonicalTargetHost(target, cleanHost)
+			backfillCanonicalTargetMetadata(target, cleanHost, &alias, &canonHost)
 			return canonicalTargetInfo{
-				BaseNodeID:    OpenSSHNodePrefix + clean,
+				BaseNodeID:    OpenSSHNodePrefix + cleanHost,
 				Address:       NormalizeHostAddress(vhost.Address),
 				Port:          vhost.Port,
 				IdentityFile:  vident.KeyPath,

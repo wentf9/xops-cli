@@ -159,6 +159,12 @@ func (b *sshConfigBlock) matchesConcretePattern(alias string) bool {
 	return false
 }
 
+const maxIncludeFileLoads = 256
+
+type includeLoadBudget struct {
+	loads int
+}
+
 func decodeOpenSSHReader(r io.Reader) (*sshConfigDoc, error) {
 	var sourcePath string
 	if named, ok := r.(interface{ Name() string }); ok && named != nil {
@@ -176,18 +182,38 @@ func decodeOpenSSHConfig(r io.Reader, sourcePath string) (*sshConfigDoc, error) 
 	if sourcePath != "" {
 		active[canonicalIncludePath(sourcePath)] = struct{}{}
 	}
-	return decodeOpenSSHBytes(b, isSystemSSHConfigPath(sourcePath), 0, active)
+	return decodeOpenSSHBytesWithBudget(b, isSystemSSHConfigPath(sourcePath), 0, active, &includeLoadBudget{})
 }
 
-func decodeOpenSSHFile(path string, system bool, depth int, active map[string]struct{}) (*sshConfigDoc, error) {
-	b, err := os.ReadFile(path)
+func decodeOpenSSHFile(path string, system bool, depth int, active map[string]struct{}, budget *includeLoadBudget) (doc *sshConfigDoc, retErr error) {
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	return decodeOpenSSHBytes(b, system || isSystemSSHConfigPath(path), depth, active)
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil && !errors.Is(closeErr, os.ErrClosed) {
+			retErr = errors.Join(retErr, closeErr)
+		}
+	}()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("included ssh config %q is not a regular file", path)
+	}
+	b, err := io.ReadAll(f)
+	if err != nil {
+		return nil, err
+	}
+	return decodeOpenSSHBytesWithBudget(b, system || isSystemSSHConfigPath(path), depth, active, budget)
 }
 
 func decodeOpenSSHBytes(b []byte, system bool, depth int, active map[string]struct{}) (*sshConfigDoc, error) {
+	return decodeOpenSSHBytesWithBudget(b, system, depth, active, &includeLoadBudget{})
+}
+
+func decodeOpenSSHBytesWithBudget(b []byte, system bool, depth int, active map[string]struct{}, budget *includeLoadBudget) (*sshConfigDoc, error) {
 	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
 	current := &sshConfigBlock{implicit: true, matchAll: true}
 	doc := &sshConfigDoc{blocks: []*sshConfigBlock{current}}
@@ -203,7 +229,7 @@ func decodeOpenSSHBytes(b []byte, system bool, depth int, active map[string]stru
 		if trimmed == "" || trimmed[0] == '#' {
 			continue
 		}
-		nextBlock, err := parseOpenSSHLine(lineNum, trimmed, current, system, depth, active)
+		nextBlock, err := parseOpenSSHLine(lineNum, trimmed, current, system, depth, active, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -222,6 +248,7 @@ func parseOpenSSHLine(
 	system bool,
 	depth int,
 	active map[string]struct{},
+	budget *includeLoadBudget,
 ) (*sshConfigBlock, error) {
 	key, rest, ok := splitOpenSSHDirectiveLine(trimmedLine)
 	if !ok {
@@ -234,7 +261,7 @@ func parseOpenSSHLine(
 		if err != nil {
 			return nil, fmt.Errorf("line %d: %w", lineNum, err)
 		}
-		files, err := loadOpenSSHIncludeFiles(patterns, system, depth, active)
+		files, err := loadOpenSSHIncludeFiles(patterns, system, depth, active, budget)
 		if err != nil {
 			return nil, fmt.Errorf("line %d: %w", lineNum, err)
 		}
@@ -696,6 +723,7 @@ func loadOpenSSHIncludeFiles(
 	system bool,
 	depth int,
 	active map[string]struct{},
+	budget *includeLoadBudget,
 ) ([]includedSSHConfigFile, error) {
 	if depth >= maxIncludeDepth || len(patterns) == 0 {
 		return nil, nil
@@ -711,7 +739,7 @@ func loadOpenSSHIncludeFiles(
 			continue
 		}
 		for _, match := range matches {
-			incFile, ok, err := loadSingleIncludedFile(match, system, depth, active, seenPaths)
+			incFile, ok, err := loadSingleIncludedFile(match, system, depth, active, seenPaths, budget)
 			if err != nil {
 				return nil, err
 			}
@@ -742,6 +770,7 @@ func loadSingleIncludedFile(
 	depth int,
 	active map[string]struct{},
 	seenPaths map[string]struct{},
+	budget *includeLoadBudget,
 ) (includedSSHConfigFile, bool, error) {
 	if _, exists := seenPaths[match]; exists {
 		return includedSSHConfigFile{}, false, nil
@@ -756,12 +785,21 @@ func loadSingleIncludedFile(
 	if info.IsDir() {
 		return includedSSHConfigFile{}, false, nil
 	}
+	if !info.Mode().IsRegular() {
+		return includedSSHConfigFile{}, false, fmt.Errorf("included ssh config %q is not a regular file", match)
+	}
 	canonPath := canonicalIncludePath(match)
 	if _, inCycle := active[canonPath]; inCycle {
 		return includedSSHConfigFile{}, false, nil
 	}
+	if budget != nil {
+		if budget.loads >= maxIncludeFileLoads {
+			return includedSSHConfigFile{}, false, fmt.Errorf("included ssh config load limit (%d) exceeded at %q", maxIncludeFileLoads, match)
+		}
+		budget.loads++
+	}
 	active[canonPath] = struct{}{}
-	subDoc, decErr := decodeOpenSSHFile(match, system, depth+1, active)
+	subDoc, decErr := decodeOpenSSHFile(match, system, depth+1, active, budget)
 	delete(active, canonPath)
 	if decErr != nil {
 		return includedSSHConfigFile{}, false, fmt.Errorf("decode included ssh config %q: %w", match, decErr)

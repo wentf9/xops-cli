@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/wentf9/xops-cli/core/ssh"
 )
@@ -149,7 +150,7 @@ func CanonicalDomainCandidatesWithOptions(provider ConfigProvider, host string, 
 		return nil
 	}
 	policy := resolveCanonicalizePolicy(parser, canonicalProviderTier3Options(provider), orig, rawCLIOptions, cliProxyJump)
-	if !shouldCanonicalize(probeTarget, policy) || len(policy.domains) == 0 {
+	if !shouldProbeCanonicalDomains(probeTarget, policy) {
 		return nil
 	}
 	out := make([]string, 0, len(policy.domains))
@@ -185,7 +186,8 @@ func executeCanonicalizeProbe(
 		return CanonicalizeResult{}, parentCtx.Err()
 	}
 	trailingDot := strings.HasSuffix(probeTarget, ".")
-	if !trailingDot && len(policy.domains) > 0 {
+	dotCount := canonicalDotCount(probeTarget)
+	if !trailingDot && dotCount <= policy.maxDots && len(policy.domains) > 0 {
 		chosen, ok, pErr := probeCanonicalDomains(parentCtx, probeCtx, resolver, probeTarget, policy)
 		if pErr != nil {
 			return CanonicalizeResult{}, pErr
@@ -319,25 +321,90 @@ func resolveCanonicalCNAME(parentCtx, probeCtx context.Context, resolver Canonic
 		}
 		return host, nil
 	}
+	if hasControlOrWhitespace(cname) {
+		return host, nil
+	}
 	normHost := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
-	normCNAME := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(cname)), ".")
-	if normCNAME != "" && normCNAME != normHost && isPermittedCNAME(normHost, normCNAME, rules) {
+	normCNAME := strings.TrimSuffix(strings.ToLower(cname), ".")
+	if !isValidRFC1123CanonicalCNAME(normCNAME) {
+		return host, nil
+	}
+	if normCNAME != normHost && isPermittedCNAME(normHost, normCNAME, rules) {
 		return normCNAME, nil
 	}
 	return host, nil
 }
 
-func shouldCanonicalize(host string, policy canonicalizePolicy) bool {
+func hasControlOrWhitespace(s string) bool {
+	for _, r := range s {
+		if unicode.IsControl(r) || unicode.IsSpace(r) || r == '\u2028' || r == '\u2029' {
+			return true
+		}
+	}
+	return false
+}
+
+func isValidRFC1123CanonicalCNAME(name string) bool {
+	if name == "" || len(name) > 253 {
+		return false
+	}
+	if strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".") {
+		return false
+	}
+	if strings.HasPrefix(name, OpenSSHNodePrefix) {
+		return false
+	}
+	if isIPOrLocalhost(name) {
+		return false
+	}
+	for label := range strings.SplitSeq(name, ".") {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func canonicalDotCount(host string) int {
+	return strings.Count(strings.TrimSuffix(host, "."), ".")
+}
+
+func canCanonicalizePolicy(policy canonicalizePolicy) bool {
 	if policy.mode != "yes" && policy.mode != "always" {
 		return false
 	}
 	if (policy.hasProxyJump || policy.hasProxyCommand) && policy.mode != "always" {
 		return false
 	}
-	if strings.Count(host, ".") > policy.maxDots {
+	return true
+}
+
+func shouldProbeCanonicalDomains(host string, policy canonicalizePolicy) bool {
+	if !canCanonicalizePolicy(policy) || len(policy.domains) == 0 {
 		return false
 	}
-	return len(policy.domains) > 0 || len(policy.permittedCNAMEs) > 0
+	if strings.HasSuffix(host, ".") {
+		return false
+	}
+	return canonicalDotCount(host) <= policy.maxDots
+}
+
+func shouldCanonicalize(host string, policy canonicalizePolicy) bool {
+	if !canCanonicalizePolicy(policy) {
+		return false
+	}
+	trailingDot := strings.HasSuffix(host, ".")
+	dotCount := canonicalDotCount(host)
+	return (!trailingDot && dotCount <= policy.maxDots && len(policy.domains) > 0) || len(policy.permittedCNAMEs) > 0
 }
 
 func isIPOrLocalhost(host string) bool {

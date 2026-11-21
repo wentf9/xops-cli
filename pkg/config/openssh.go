@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
@@ -215,8 +216,12 @@ func (p *openSSHOverrideProvider) NodeCanonicalHost(nodeID string) string {
 }
 
 // ConfirmNodeContext is a no-op on the read-only override provider so ephemeral
-// pending nodes prepared under -F are never persisted to disk.
-func (*openSSHOverrideProvider) ConfirmNodeContext(context.Context, string) error {
+// pending nodes prepared under -F are never persisted to disk, while cleaning up
+// disambiguated "openssh:..." pending entries.
+func (p *openSSHOverrideProvider) ConfirmNodeContext(_ context.Context, nodeID string) error {
+	if p != nil && p.repo != nil && IsOpenSSHNodeID(nodeID) {
+		p.repo.discardPendingOpenSSH(nodeID)
+	}
 	return nil
 }
 
@@ -226,8 +231,11 @@ func (p *openSSHOverrideProvider) PendingNodeExecution(string) (*ssh.ExecutionCo
 
 // ConfirmNodeWithExecutionContext is a no-op on the read-only override provider
 // so post-authentication enrollment probing under -F never attempts Save on
-// readOnlyRejectStore.
-func (*openSSHOverrideProvider) ConfirmNodeWithExecutionContext(context.Context, string, *ssh.ExecutionConfig) error {
+// readOnlyRejectStore, while cleaning up disambiguated "openssh:..." pending entries.
+func (p *openSSHOverrideProvider) ConfirmNodeWithExecutionContext(_ context.Context, nodeID string, _ *ssh.ExecutionConfig) error {
+	if p != nil && p.repo != nil && IsOpenSSHNodeID(nodeID) {
+		p.repo.discardPendingOpenSSH(nodeID)
+	}
 	return nil
 }
 
@@ -275,16 +283,10 @@ func UnwrapOpenSSHSelector(selector string) string {
 // 在连接时利用 ssh_config 的默认回退属性来尝试连接，
 // 这样使得 xops 表现得和原生 ssh 命令的体验完全一致。
 func (p *OpenSSHParser) Find(alias string) (string, bool) {
-	if alias == "" {
+	if !IsPlainOpenSSHHostSelector(alias) {
 		return "", false
 	}
-	// xops 内部可能传入全名诸如 "user@host:port" 给 provider 检索，
-	// 这些复合物并不是原生的 ssh_config Host (除非极罕见被定义成这样)。
-	// 为了不妨碍后续拆分逻辑和别名正确分配，我们过滤掉含有 @ 和 : 的别名。
-	if strings.Contains(alias, "@") || strings.Contains(alias, ":") {
-		return "", false
-	}
-	return OpenSSHNodePrefix + alias, true
+	return OpenSSHNodePrefix + StripHostBrackets(alias), true
 }
 
 // HasHost 检查 alias 是否在 ssh_config（含 Include 子配置）中显式定义了具体的 Host 模式（排除仅通配符匹配与否定排除）。
@@ -337,6 +339,43 @@ func unwrapExpandedHostName(rawHostName, expanded string) string {
 		}
 	}
 	return clean
+}
+
+func hasInternalWhitespace(raw string) bool {
+	for _, r := range strings.TrimSpace(raw) {
+		if unicode.IsSpace(r) {
+			return true
+		}
+	}
+	return false
+}
+
+// ResolveExplicitHostName returns the expanded HostName configured for alias
+// when an explicit HostName directive matches alias, with explicit=false if
+// no HostName directive is configured.
+func (p *OpenSSHParser) ResolveExplicitHostName(alias string) (hostName string, explicit bool, err error) {
+	if p == nil || p.cfg == nil {
+		return "", false, nil
+	}
+	if p.err != nil {
+		return "", false, p.err
+	}
+	cleanAlias := strings.TrimSpace(strings.TrimPrefix(alias, OpenSSHNodePrefix))
+	if cleanAlias == "" {
+		return "", false, nil
+	}
+	lookupAlias, _, _, parseErr := parseOpenSSHHostSpec(cleanAlias)
+	if parseErr != nil || lookupAlias == "" {
+		lookupAlias = cleanAlias
+	}
+	if firstSSHConfigKeyValue(p.cfg, lookupAlias, "HostName") == "" {
+		return "", false, nil
+	}
+	resolved, resolveErr := resolveOpenSSHHostName(p.cfg, lookupAlias)
+	if resolveErr != nil {
+		return "", true, resolveErr
+	}
+	return resolved, true, nil
 }
 
 func resolveOpenSSHHostName(doc *sshConfigDoc, alias string) (string, error) {
@@ -427,6 +466,27 @@ func (p *OpenSSHParser) resolveVirtualHostAndPasses(lookupAlias, canonicalHost s
 	return passes, hostName, err
 }
 
+func validateVirtualNodeInputs(lookupAlias, canonicalHost, userOverride, nodeAlias string) (cleanLookup, cleanUser, cleanNodeAlias string, err error) {
+	if hasControlOrLineSepChar(lookupAlias) || hasInternalWhitespace(lookupAlias) {
+		return "", "", "", fmt.Errorf("hostname %q contains invalid control or whitespace characters", lookupAlias)
+	}
+	cleanLookup = strings.TrimSpace(lookupAlias)
+	if cleanLookup == "" {
+		return "", "", "", fmt.Errorf("parse openssh host %q failed: host is empty", nodeAlias)
+	}
+	cleanNodeAlias = strings.TrimSpace(nodeAlias)
+	if cleanNodeAlias == "" {
+		cleanNodeAlias = cleanLookup
+	}
+	if hasControlOrLineSepChar(canonicalHost) || hasInternalWhitespace(canonicalHost) {
+		return "", "", "", fmt.Errorf("hostname %q contains invalid control or whitespace characters", canonicalHost)
+	}
+	if hasControlOrLineSepChar(userOverride) || hasInternalWhitespace(userOverride) {
+		return "", "", "", fmt.Errorf("user %q contains invalid control or whitespace characters", userOverride)
+	}
+	return cleanLookup, strings.TrimSpace(userOverride), cleanNodeAlias, nil
+}
+
 func (p *OpenSSHParser) getVirtualNodeWithCanonical(
 	lookupAlias, canonicalHost, userOverride string,
 	portOverride uint16,
@@ -438,19 +498,10 @@ func (p *OpenSSHParser) getVirtualNodeWithCanonical(
 	if p.err != nil {
 		return models.Node{}, models.Host{}, models.Identity{}, p.err
 	}
-	if hasControlOrLineSepChar(lookupAlias) {
-		return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("HostName %q contains invalid control characters", lookupAlias)
-	}
-	lookupAlias = strings.TrimSpace(lookupAlias)
-	if lookupAlias == "" {
-		return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("parse openssh host %q failed: host is empty", nodeAlias)
-	}
-	nodeAlias = strings.TrimSpace(nodeAlias)
-	if nodeAlias == "" {
-		nodeAlias = lookupAlias
-	}
-	if hasControlOrLineSepChar(canonicalHost) {
-		return models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("HostName %q contains invalid control characters", canonicalHost)
+	var inputErr error
+	lookupAlias, userOverride, nodeAlias, inputErr = validateVirtualNodeInputs(lookupAlias, canonicalHost, userOverride, nodeAlias)
+	if inputErr != nil {
+		return models.Node{}, models.Host{}, models.Identity{}, inputErr
 	}
 	passes, hostName, expHostErr := p.resolveVirtualHostAndPasses(lookupAlias, canonicalHost)
 	if expHostErr != nil {
@@ -614,22 +665,56 @@ func applyOpenSSHSpecOptionPasses(doc *sshConfigDoc, passes []string, spec ssh.O
 		}
 	}
 	if spec.AllowList {
-		filtered := ssh.FilterSupportedListValue(spec.CanonicalKey, val)
-		if filtered == "" {
+		filtered, keep, err := filterOpenSSHAllowListOption(spec, val, passes[0])
+		if err != nil {
+			return err
+		}
+		if !keep {
 			return nil
 		}
 		val = filtered
 	}
 	if err := opts.Set(spec.CanonicalKey, val); err != nil {
-		// Preserve strict error reporting on ControlMaster and ControlPersist,
-		// while leniently skipping unsupported ~/.ssh/config values (e.g.
-		// ControlPath tokens like %k or PubkeyAuthentication=unbound).
-		if spec.CanonicalKey == ssh.OptionControlMaster || spec.CanonicalKey == ssh.OptionControlPersist {
+		// Preserve strict error reporting on ControlMaster, ControlPersist, and
+		// AllowList restrictions, while leniently skipping unsupported ~/.ssh/config
+		// values (e.g. ControlPath tokens like %k or PubkeyAuthentication=unbound).
+		if spec.CanonicalKey == ssh.OptionControlMaster || spec.CanonicalKey == ssh.OptionControlPersist || spec.AllowList {
 			hostLabel := passes[0]
 			return fmt.Errorf("invalid %s %q for %q in ssh config: %w", spec.OpenSSHName, val, hostLabel, err)
 		}
 	}
 	return nil
+}
+
+func filterOpenSSHAllowListOption(spec ssh.OptionSpec, val, hostLabel string) (filtered string, keep bool, err error) {
+	trimmedVal := strings.TrimSpace(val)
+	isModifier := spec.CanonicalKey != ssh.OptionPreferredAuthentications &&
+		len(trimmedVal) > 0 &&
+		(trimmedVal[0] == '+' || trimmedVal[0] == '-' || trimmedVal[0] == '^')
+	filtered = ssh.FilterSupportedListValue(spec.CanonicalKey, val)
+	if filtered == "" && spec.CanonicalKey == ssh.OptionPreferredAuthentications {
+		filtered = extractFailClosedPreferredAuths(trimmedVal)
+	}
+	if filtered != "" {
+		return filtered, true, nil
+	}
+	if isModifier {
+		return "", false, nil
+	}
+	return "", false, fmt.Errorf("no supported %s in %q for %q", spec.OpenSSHName, val, hostLabel)
+}
+
+func extractFailClosedPreferredAuths(raw string) string {
+	var kept []string
+	for part := range strings.SplitSeq(raw, ",") {
+		tok := strings.ToLower(strings.TrimSpace(part))
+		if tok == "gssapi-with-mic" || tok == "hostbased" {
+			if !slices.Contains(kept, tok) {
+				kept = append(kept, tok)
+			}
+		}
+	}
+	return strings.Join(kept, ",")
 }
 
 func preservesSSHConfigRawValue(canonicalKey string) bool {

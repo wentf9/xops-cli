@@ -6,11 +6,95 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // IsOpenSSHNodeID reports whether id carries the explicit "openssh:" namespace prefix.
 func IsOpenSSHNodeID(id string) bool {
 	return strings.HasPrefix(id, OpenSSHNodePrefix)
+}
+
+func isBareOrBracketedIPv6Literal(s string) bool {
+	if s == "" {
+		return false
+	}
+	candidate := s
+	if strings.HasPrefix(s, "[") {
+		if !strings.HasSuffix(s, "]") || len(s) < 3 {
+			return false
+		}
+		candidate = s[1 : len(s)-1]
+	}
+	addr, err := netip.ParseAddr(candidate)
+	return err == nil && addr.Is6()
+}
+
+// IsPlainOpenSSHHostSelector reports whether s is a single host/alias selector
+// (including bare or portless bracketed IPv6 literals such as "2001:db8::1",
+// "fe80::1%eth0", or "[2001:db8::1]") and not a composite user@host or host:port.
+func IsPlainOpenSSHHostSelector(s string) bool {
+	if s == "" || hasControlOrLineSepChar(s) {
+		return false
+	}
+	for _, r := range s {
+		if unicode.IsSpace(r) {
+			return false
+		}
+	}
+	if strings.Contains(s, "@") {
+		return false
+	}
+	if strings.Contains(s, ":") || strings.ContainsAny(s, "[]") {
+		return isBareOrBracketedIPv6Literal(s)
+	}
+	return true
+}
+
+func validateTargetRefRaw(raw, emptyMsg string) (string, error) {
+	if hasControlOrLineSepChar(raw) {
+		return "", fmt.Errorf("invalid address %q: contains invalid control character", raw)
+	}
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", fmt.Errorf("%s", emptyMsg)
+	}
+	for _, r := range trimmed {
+		if unicode.IsSpace(r) {
+			return "", fmt.Errorf("invalid address %q: contains whitespace", raw)
+		}
+	}
+	return trimmed, nil
+}
+
+// validateBareAliasTargetRef allows interior ASCII space (' ') ONLY on a bare
+// non-"openssh:" alias selector without composite/address delimiters (@, :, [, ])
+// so saved Node.Alias values such as "Prod Web 01" remain selectable through
+// ParseTargetRef while ParseHostPort, openssh: selectors, and composites stay strict.
+func validateBareAliasTargetRef(raw string) (string, bool, error) {
+	if hasControlOrLineSepChar(raw) {
+		return "", false, fmt.Errorf("invalid address %q: contains invalid control character", raw)
+	}
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", false, fmt.Errorf("address cannot be empty")
+	}
+	if strings.HasPrefix(trimmed, OpenSSHNodePrefix) || strings.ContainsAny(trimmed, "@:[]") {
+		return "", false, nil
+	}
+	hasSpace := false
+	for _, r := range trimmed {
+		if r == ' ' {
+			hasSpace = true
+			continue
+		}
+		if unicode.IsSpace(r) {
+			return "", false, fmt.Errorf("invalid address %q: contains whitespace", raw)
+		}
+	}
+	if !hasSpace {
+		return "", false, nil
+	}
+	return trimmed, true, nil
 }
 
 // TargetRef represents a parsed target selector `[openssh:][user@]host[:port]`,
@@ -47,19 +131,28 @@ func (r TargetRef) NormalizedString() string {
 	} else {
 		b.WriteString(r.Host)
 	}
-	return b.String()
+	out := b.String()
+	if !r.OpenSSH && strings.HasPrefix(out, OpenSSHNodePrefix) {
+		return ""
+	}
+	return out
 }
 
 // ParseTargetRef parses `[openssh:][user@]host[:port]`.
 func ParseTargetRef(raw string) (TargetRef, error) {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return TargetRef{}, fmt.Errorf("address cannot be empty")
+	if bareAlias, ok, err := validateBareAliasTargetRef(raw); err != nil {
+		return TargetRef{}, err
+	} else if ok {
+		return TargetRef{Host: bareAlias}, nil
+	}
+	trimmed, err := validateTargetRefRaw(raw, "address cannot be empty")
+	if err != nil {
+		return TargetRef{}, err
 	}
 	var isOpenSSH bool
 	rest := trimmed
 	if after, ok := strings.CutPrefix(trimmed, OpenSSHNodePrefix); ok {
-		if after == "" || strings.TrimSpace(after) != after || strings.HasPrefix(after, OpenSSHNodePrefix) {
+		if after == "" || strings.HasPrefix(after, OpenSSHNodePrefix) {
 			return TargetRef{}, fmt.Errorf("invalid openssh selector %q", raw)
 		}
 		isOpenSSH = true
@@ -79,14 +172,14 @@ func ParseTargetRef(raw string) (TargetRef, error) {
 }
 
 func parseTargetRefPlain(spec string) (host, userName string, port uint16, hasPort bool, err error) {
-	spec = strings.TrimSpace(spec)
-	if spec == "" {
-		return "", "", 0, false, fmt.Errorf("host is empty")
+	spec, err = validateTargetRefRaw(spec, "host is empty")
+	if err != nil {
+		return "", "", 0, false, err
 	}
 	hostPart := spec
 	if at := strings.LastIndex(spec, "@"); at >= 0 {
-		userName = strings.TrimSpace(spec[:at])
-		hostPart = strings.TrimSpace(spec[at+1:])
+		userName = spec[:at]
+		hostPart = spec[at+1:]
 		if userName == "" {
 			return "", "", 0, false, fmt.Errorf("invalid address %q: username before '@' cannot be empty", spec)
 		}
@@ -104,9 +197,9 @@ func parseTargetRefPlain(spec string) (host, userName string, port uint16, hasPo
 // ParseHostPort parses `host`, `host:port`, `[ipv6]`, `[ipv6]:port`, or bare `ipv6`
 // (including IPv6 link-local addresses with zone IDs such as `[fe80::1%eth0]:22`).
 func ParseHostPort(raw string) (host string, port uint16, hasPort bool, err error) {
-	s := strings.TrimSpace(raw)
-	if s == "" {
-		return "", 0, false, fmt.Errorf("host cannot be empty")
+	s, err := validateTargetRefRaw(raw, "host cannot be empty")
+	if err != nil {
+		return "", 0, false, err
 	}
 	if strings.HasPrefix(s, "[") {
 		return parseBracketedHostPort(s, raw)
@@ -129,7 +222,6 @@ func ParseHostPort(raw string) (host string, port uint16, hasPort bool, err erro
 		if pErr != nil {
 			return "", 0, false, pErr
 		}
-		h = strings.TrimSpace(h)
 		if h == "" {
 			return "", 0, false, fmt.Errorf("host cannot be empty")
 		}
@@ -166,9 +258,9 @@ func parseBracketedHostPort(s, raw string) (host string, port uint16, hasPort bo
 }
 
 func parseTargetPort(raw string) (uint16, error) {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return 0, fmt.Errorf("port cannot be empty")
+	trimmed, err := validateTargetRefRaw(raw, "port cannot be empty")
+	if err != nil {
+		return 0, err
 	}
 	parsedPort, err := strconv.ParseUint(trimmed, 10, 16)
 	if err != nil || parsedPort == 0 {

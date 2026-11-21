@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
@@ -571,7 +572,7 @@ func resolveScopedSavedOpenSSHAlias(
 		return "", "", false
 	}
 	orig := strings.TrimSpace(config.UnwrapOpenSSHSelector(tier1OriginalHost))
-	if orig == "" || strings.ContainsAny(orig, "@:") {
+	if !config.IsPlainOpenSSHHostSelector(orig) {
 		return "", "", false
 	}
 	canon := strings.TrimSpace(config.UnwrapOpenSSHSelector(tier1CanonicalHost))
@@ -637,8 +638,24 @@ func (a *SSHAdapter) resolveSessionOpenSSHMetadata(
 	return origin.Alias, origin.CanonicalHost
 }
 
-func (a *SSHAdapter) buildTier4OpenSSHLookupKeys(parser *config.OpenSSHParser, nodeName string, snapErr error, snapshot config.ConnectionSnapshot, openSSHAlias, canonicalHost string) []string {
-	var lookupKeys []string
+func savedNodeAllowsTier4Key(parser *config.OpenSSHParser, snapshot config.ConnectionSnapshot, key string) bool {
+	if parser == nil || !parser.HasHost(key) {
+		return true
+	}
+	resolvedHost, explicit, err := parser.ResolveExplicitHostName(key)
+	if explicit {
+		if err != nil {
+			return false
+		}
+		return config.SameHostAddress(resolvedHost, snapshot.Host.Address)
+	}
+	if ip, ipErr := netip.ParseAddr(config.StripHostBrackets(key)); ipErr == nil && ip.IsValid() {
+		return config.SameHostAddress(key, snapshot.Host.Address)
+	}
+	return true
+}
+
+func (a *SSHAdapter) buildTier4FallbackLookupKeys(parser *config.OpenSSHParser, nodeName, openSSHAlias string, lookupKeys []string) []string {
 	appendUnique := func(keys ...string) {
 		for _, k := range keys {
 			k = strings.TrimSpace(k)
@@ -647,44 +664,62 @@ func (a *SSHAdapter) buildTier4OpenSSHLookupKeys(parser *config.OpenSSHParser, n
 			}
 		}
 	}
+	if config.IsPlainOpenSSHHostSelector(nodeName) {
+		appendUnique(nodeName)
+	}
+	if addr, port, ok := parseFallbackNodeIDAddressPort(nodeName); ok {
+		if openSSHAlias == "" {
+			appendUnique(parser.FindConcreteHostsByAddress(addr, port)...)
+		}
+		if addr != nodeName {
+			appendUnique(addr)
+		}
+	} else {
+		appendUnique(nodeName)
+	}
+	return lookupKeys
+}
+
+func (a *SSHAdapter) buildTier4OpenSSHLookupKeys(parser *config.OpenSSHParser, nodeName string, snapErr error, snapshot config.ConnectionSnapshot, openSSHAlias, canonicalHost string) []string {
+	var lookupKeys []string
+	savedManaged := snapErr == nil && snapshot.Provenance == config.ProvenanceSavedManaged
+	appendKeys := func(checkScope bool, keys ...string) {
+		for _, k := range keys {
+			k = strings.TrimSpace(k)
+			if k == "" || slices.Contains(lookupKeys, k) {
+				continue
+			}
+			if checkScope && savedManaged && !savedNodeAllowsTier4Key(parser, snapshot, k) {
+				continue
+			}
+			lookupKeys = append(lookupKeys, k)
+		}
+	}
 
 	if openSSHAlias != "" {
-		appendUnique(openSSHAlias)
+		appendKeys(canonicalHost == "", openSSHAlias)
 	}
 	if canonicalHost != "" {
-		appendUnique(canonicalHost)
+		appendKeys(false, canonicalHost)
 	}
 	if snapErr != nil {
-		if !strings.Contains(nodeName, "@") && !strings.Contains(nodeName, ":") {
-			appendUnique(nodeName)
-		}
-		if addr, port, ok := parseFallbackNodeIDAddressPort(nodeName); ok {
-			if openSSHAlias == "" {
-				appendUnique(parser.FindConcreteHostsByAddress(addr, port)...)
-			}
-			if addr != nodeName {
-				appendUnique(addr)
-			}
-		} else {
-			appendUnique(nodeName)
-		}
-		return lookupKeys
+		return a.buildTier4FallbackLookupKeys(parser, nodeName, openSSHAlias, lookupKeys)
 	}
 
-	appendUnique(snapshot.Node.Alias...)
-	appendUnique(snapshot.Host.Alias...)
-	if !strings.Contains(nodeName, "@") && !strings.Contains(nodeName, ":") {
-		appendUnique(nodeName)
+	appendKeys(true, snapshot.Node.Alias...)
+	appendKeys(true, snapshot.Host.Alias...)
+	if config.IsPlainOpenSSHHostSelector(nodeName) {
+		appendKeys(true, nodeName)
 	}
 	if snapshot.Host.Address != "" {
 		if openSSHAlias == "" {
-			appendUnique(parser.FindConcreteHostsByAddress(snapshot.Host.Address, uint16(effectiveSnapshotPort(snapshot.Host.Port)))...)
+			appendKeys(false, parser.FindConcreteHostsByAddress(snapshot.Host.Address, uint16(effectiveSnapshotPort(snapshot.Host.Port)))...)
 		}
 		if snapshot.Host.Address != nodeName {
-			appendUnique(snapshot.Host.Address)
+			appendKeys(true, snapshot.Host.Address)
 		}
 	}
-	appendUnique(nodeName)
+	appendKeys(true, nodeName)
 	return lookupKeys
 }
 

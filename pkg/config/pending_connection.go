@@ -269,10 +269,7 @@ func (r *Repository) buildConfirmPublishAction(pending *pendingConnection, nodeI
 			if current == nil || current.provider == nil {
 				return
 			}
-			curOrigin := current.provider.NodeOpenSSHOrigin(nodeID)
-			if !curOrigin.IsZero() {
-				mergedOrigin = curOrigin
-			}
+			mergedOrigin = current.provider.NodeOpenSSHOrigin(nodeID)
 		},
 		applyProviderLocked: func(p *Provider, updated *Configuration) {
 			if p == nil || updated == nil || updated.Nodes == nil {
@@ -291,11 +288,21 @@ func (r *Repository) buildConfirmPublishAction(pending *pendingConnection, nodeI
 	}
 }
 
+func (r *Repository) discardPendingOpenSSH(nodeID string) {
+	if r == nil || !IsOpenSSHNodeID(nodeID) {
+		return
+	}
+	r.pendingMu.Lock()
+	delete(r.pending, nodeID)
+	r.pendingMu.Unlock()
+}
+
 func (r *Repository) confirmNodeContext(ctx context.Context, nodeID string, execution *ssh.ExecutionConfig) error {
 	if r == nil || ctx == nil {
 		return fmt.Errorf("confirm connection requires repository and context")
 	}
 	if IsOpenSSHNodeID(nodeID) {
+		r.discardPendingOpenSSH(nodeID)
 		return nil
 	}
 	pending, err := r.acquirePendingConfirmationGate(ctx, nodeID)
@@ -385,7 +392,7 @@ func mergeConfirmedNodeConfig(cfg *Configuration, nodeID string, node models.Nod
 	storedNode.OpenSSHAlias = ""
 	storedNode.CanonicalHost = ""
 	cfg.Nodes.Set(nodeID, storedNode)
-	cfg.Hosts.Set(node.HostRef, host)
-	cfg.Identities.Set(node.IdentityRef, identity)
+	cfg.Hosts.Set(node.HostRef, cloneHost(host))
+	cfg.Identities.Set(node.IdentityRef, cloneIdentity(identity))
 	return nil
 }

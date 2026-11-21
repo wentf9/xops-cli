@@ -129,6 +129,9 @@ func normalizeImportedSSHOptions(opts *ssh.Options) *ssh.Options {
 	persistSetting, persistErr := cloned.PersistSetting()
 
 	if pathErr != nil || pathSetting.Unset() {
+		if pathErr != nil {
+			cloned.Delete(ssh.OptionControlPath)
+		}
 		// An OpenSSH host with ControlMaster or ControlPersist but no ControlPath
 		// cannot form a standalone node multiplexing config without failing schema
 		// validation when no global ControlPath is set.

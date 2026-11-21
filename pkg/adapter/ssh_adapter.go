@@ -480,6 +480,9 @@ func WithGlobalSessionControl(opts SessionControlOptions) Option {
 // globally and on nodeID) while preserving any non-multiplexing session SSH
 // options already registered for nodeID or globally.
 func (a *SSHAdapter) DisableSessionControlSharing(nodeID string) {
+	if a == nil {
+		return
+	}
 	disable := func(s SessionControlOptions) SessionControlOptions {
 		var out SessionControlOptions
 		if s.Options != nil {
@@ -499,7 +502,11 @@ func (a *SSHAdapter) DisableSessionControlSharing(nodeID string) {
 	if a.sessionControlOverrides == nil {
 		a.sessionControlOverrides = make(map[string]SessionControlOptions)
 	}
-	a.sessionControlOverrides[nodeID] = disable(a.sessionControlOverrides[nodeID])
+	base, exists := a.sessionControlOverrides[nodeID]
+	if !exists && a.globalSessionControl != nil {
+		base = *a.globalSessionControl
+	}
+	a.sessionControlOverrides[nodeID] = disable(base)
 }
 
 // WithOpenSSHParser injects an explicit OpenSSHParser for Tier 4 resolution (e.g. in tests).
@@ -1114,15 +1121,24 @@ func (a *SSHAdapter) applySessionProxyJumpOverride(nodeID string, cfg *ssh.Clien
 }
 
 func (a *SSHAdapter) isNonInteractiveForNode(nodeID string) bool {
+	if a == nil {
+		return false
+	}
 	if a.nonInteractive {
 		return true
 	}
-	if a.cfgProvider == nil {
-		return false
-	}
 	sessionCtrlOpts, _ := a.getSessionControlOverride(nodeID)
+	if sessionCtrlOpts.Options != nil && sessionCtrlOpts.Options.Get(ssh.OptionBatchMode) != "" {
+		return sessionCtrlOpts.Options.BatchMode()
+	}
+	if a.cfgProvider == nil {
+		return a.isBatchModeLatched(nodeID)
+	}
 	opts, err := a.ResolveSSHOptions(nodeID, sessionCtrlOpts)
-	return err == nil && opts != nil && opts.BatchMode()
+	if err != nil {
+		return a.isBatchModeLatched(nodeID) || (sessionCtrlOpts.Options != nil && sessionCtrlOpts.Options.BatchMode())
+	}
+	return opts != nil && opts.BatchMode()
 }
 
 // UpdateAuth 处理密码或私钥密码的回写并返回本次提交后的新认证令牌
@@ -1647,6 +1663,10 @@ func validateSecretRequestSnapshotWithState(
 	}
 
 	// 1b. 若会话启用了 -o HostName 覆盖，仍须确认底层持久节点地址未被并发篡改
+	if hasOverride && strings.TrimSpace(override.HostName) != "" && req.Host != "" && strings.TrimSpace(observedBaseHost) == "" {
+		return fmt.Errorf("%w: missing base host for node %q under HostName override",
+			ssh.ErrSnapshotMismatch, req.NodeID)
+	}
 	if observedBaseHost != "" && !config.SameHostAddress(observedBaseHost, snapshot.Host.Address) {
 		return fmt.Errorf("%w: underlying host address changed for node %q: expected %q, got %q",
 			ssh.ErrSnapshotMismatch, req.NodeID, observedBaseHost, snapshot.Host.Address)
