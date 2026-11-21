@@ -1068,3 +1068,27 @@ prompt_host_key_sshfp_matched_unverified:
   other: "Matching host key fingerprint found in DNS (NOT DNSSEC verified)."
 prompt_host_key_sshfp_mismatch:
   other: "WARNING: DNS SSHFP record DOES NOT MATCH the presented host key!"
+
+# ---- config ----
+config_short:
+  other: "Inspect and repair XOps configuration files"
+config_long:
+  other: "Inspect and explicitly repair XOps configuration invariants (schema, aliases, TargetRef rules, and ProxyJump graph)."
+config_doctor_short:
+  other: "Diagnose and optionally repair configuration invariant violations"
+config_doctor_long:
+  other: "Inspect xops_config.yaml in read-only mode for schema, strict alias, TargetRef prefix, and ProxyJump cycle violations. Pass --fix to apply explicit repairs through full-graph validation."
+flag_config_doctor_fix:
+  other: "Apply explicit repairs to fixable configuration issues and persist through full-graph validation"
+config_doctor_healthy:
+  other: "Configuration passed all schema and graph invariant checks"
+config_doctor_not_found:
+  other: "Configuration file {{.Path}} does not exist yet (no issues found)"
+config_doctor_issues_found:
+  other: "configuration doctor found {{.Count}} issue(s)"
+config_doctor_fix_hint:
+  other: "Run 'xops config doctor --fix' to repair fixable issues."
+config_doctor_fixed:
+  other: "Applied {{.Count}} repair(s); configuration passed full-graph validation and was saved"
+config_doctor_unfixable:
+  other: "Unfixable configuration issues remain; configuration file was left unchanged."

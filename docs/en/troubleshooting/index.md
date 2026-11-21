@@ -42,6 +42,24 @@ Run `xops credential store probe file` to check filesystem operations for the ta
 
 If an address or alias matches several nodes, run `xops host list` and use an exact node ID. After a configuration conflict, reload the latest configuration and review changes made in other terminals before editing again.
 
+## Configuration fails to load due to validation errors
+
+XOps enforces full-graph invariants on load and on every durable commit to `xops_config.yaml` (strict alias rules, reserved `openssh:` prefix consistency, and `proxy_jump` self-reference/cycle detection). If an existing configuration violates these rules, loading fails closed and directs you to `xops config doctor`.
+
+Run read-only diagnostics first to inspect every violation:
+
+```sh
+xops config doctor
+```
+
+After reviewing the report, pass `--fix` to explicitly repair fixable violations (invalid or duplicate aliases, invalid/self-referential/cyclic `proxy_jump` hops) and persist the result through full-graph validation:
+
+```sh
+xops config doctor --fix
+```
+
+When unfixable structural errors remain (such as a missing `host_ref` or legacy v1 schema), `--fix` leaves the file on disk untouched so you can correct it manually or run `xops credential migrate`.
+
 ## Report a problem
 
 Include the command structure, XOps version, OS and terminal, expected behavior, and sanitized errors. Do not share passwords, private keys, unlock material, or full production configuration. Report problems through [GitHub Issues](https://github.com/wentf9/xops-cli/issues).

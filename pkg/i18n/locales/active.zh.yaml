@@ -1069,3 +1069,27 @@ prompt_host_key_sshfp_matched_unverified:
   other: "在 DNS 中找到匹配的主机密钥指纹 (未经 DNSSEC 验证)。"
 prompt_host_key_sshfp_mismatch:
   other: "警告：DNS SSHFP 记录与远端主机提供的密钥不匹配！"
+
+# ---- config ----
+config_short:
+  other: "检查并修复 XOps 配置文件"
+config_long:
+  other: "检查并显式修复 XOps 配置不变量（Schema、严格别名规则、TargetRef 前缀一致性与 ProxyJump 跳板图无环约束）。"
+config_doctor_short:
+  other: "诊断并可选修复配置不变量违规项"
+config_doctor_long:
+  other: "默认以只读模式检查 xops_config.yaml 中的 Schema、严格别名、TargetRef 前缀以及 ProxyJump 自引用/环路问题。指定 --fix 时通过全图校验显式修复并持久化配置。"
+flag_config_doctor_fix:
+  other: "显式修复可自动修复的配置问题，并通过全图校验保存"
+config_doctor_healthy:
+  other: "配置已通过全部 Schema 与全图不变量检查"
+config_doctor_not_found:
+  other: "配置文件 {{.Path}} 尚未创建（无异常）"
+config_doctor_issues_found:
+  other: "配置诊断发现 {{.Count}} 项问题"
+config_doctor_fix_hint:
+  other: "可运行 'xops config doctor --fix' 修复可自动修复的问题。"
+config_doctor_fixed:
+  other: "已应用 {{.Count}} 项修复；配置通过全图校验并已保存"
+config_doctor_unfixable:
+  other: "仍存在无法自动修复的配置问题；原配置文件未被修改。"

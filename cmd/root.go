@@ -146,6 +146,7 @@ func registerCommands(rootCmd *cobra.Command) {
 	rootCmd.AddCommand(NewCmdPlay())
 	rootCmd.AddCommand(NewCmdIdentity())
 	rootCmd.AddCommand(NewCmdCredential())
+	rootCmd.AddCommand(NewCmdConfig())
 }
 
 func newCmdVersion() *cobra.Command {

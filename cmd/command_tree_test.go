@@ -78,6 +78,8 @@ func TestCommandTreeUsesCanonicalCommands(t *testing.T) {
 		{[]string{"cred", "st", "ls"}, "list"},
 		{[]string{"cred", "st", "insp"}, "inspect"},
 		{[]string{"cred", "st", "pr"}, "probe"},
+		{[]string{"config", "doctor"}, "doctor"},
+		{[]string{"cfg", "doc"}, "doctor"},
 	}
 	for _, tc := range aliasChecks {
 		found, _, err := root.Find(tc.path)
