@@ -39,6 +39,9 @@ const (
 // ParseControlMasterMode normalizes string inputs into a valid ControlMasterMode.
 // Supports OpenSSH keywords ("no", "yes", "ask", "auto", "autoask") and boolean aliases ("true", "false").
 func ParseControlMasterMode(val string) (ControlMasterMode, error) {
+	if hasControlOrLineSepChar(val) {
+		return "", fmt.Errorf("unsupported ControlMaster option %q: contains invalid control character", val)
+	}
 	switch strings.ToLower(strings.TrimSpace(val)) {
 	case "no", "false", "":
 		return ControlMasterNo, nil

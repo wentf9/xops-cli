@@ -1368,6 +1368,33 @@ func expandIdentityKeyPath(rawPath string, env Environment, target TargetContext
 	return filepath.Clean(filepath.FromSlash(path)), nil
 }
 
+func buildExplicitIdentityPathList(keyPaths []string, keyPath string, sshOpts *Options, l logger.DebugLogger) PathList {
+	if l == nil {
+		l = logger.NopLogger
+	}
+	acc := UnsetPathList()
+	appendRaw := func(raw string) {
+		if strings.TrimSpace(raw) == "" {
+			return
+		}
+		if hasControlOrLineSepChar(raw) {
+			l.Debugf("Failed to expand identity key path %q: contains invalid control character", raw)
+			return
+		}
+		pl, err := ParsePathListItems([]string{raw})
+		if err != nil {
+			l.Debugf("Failed to expand identity key path %q: %v", raw, err)
+			return
+		}
+		acc = acc.Merge(pl)
+	}
+	for _, raw := range keyPaths {
+		appendRaw(raw)
+	}
+	appendRaw(keyPath)
+	return acc.Merge(sshOpts.IdentityPathList())
+}
+
 func collectExplicitKeyCandidates(
 	keyPaths []string,
 	keyPath string,
@@ -1377,32 +1404,31 @@ func collectExplicitKeyCandidates(
 	resolve func(string) string,
 	l logger.DebugLogger,
 ) ([]string, bool) {
+	paths, pl := collectExplicitKeyCandidatesWithList(keyPaths, keyPath, sshOpts, env, target, resolve, l)
+	return paths, !pl.DefaultsAllowed()
+}
+
+func collectExplicitKeyCandidatesWithList(
+	keyPaths []string,
+	keyPath string,
+	sshOpts *Options,
+	env Environment,
+	target TargetContext,
+	resolve func(string) string,
+	l logger.DebugLogger,
+) ([]string, PathList) {
 	if l == nil {
 		l = logger.NopLogger
 	}
-	var rawEntries []string
-	rawEntries = append(rawEntries, keyPaths...)
-	if strings.TrimSpace(keyPath) != "" {
-		rawEntries = append(rawEntries, keyPath)
+	identityList := buildExplicitIdentityPathList(keyPaths, keyPath, sshOpts, l)
+	rawEntries := identityList.RawItems()
+	if len(rawEntries) == 0 {
+		return nil, identityList
 	}
-	rawEntries = append(rawEntries, sshOpts.IdentityFiles()...)
 
 	var paths []string
 	seen := make(map[string]struct{}, len(rawEntries))
-	hasExplicit := false
 	for _, raw := range rawEntries {
-		if hasControlOrLineSepChar(raw) {
-			l.Debugf("Failed to expand identity key path %q: contains invalid control character", raw)
-			continue
-		}
-		trimmed := strings.TrimSpace(raw)
-		if trimmed == "" {
-			continue
-		}
-		hasExplicit = true
-		if IsNoneValue(trimmed) {
-			break
-		}
 		expanded, err := expandIdentityKeyPath(raw, env, target, resolve)
 		if err != nil {
 			l.Debugf("Failed to expand identity key path %q: %v", raw, err)
@@ -1417,7 +1443,7 @@ func collectExplicitKeyCandidates(
 		seen[expanded] = struct{}{}
 		paths = append(paths, expanded)
 	}
-	return paths, hasExplicit
+	return paths, identityList
 }
 
 func extractIdentityPublicKeyWithPolicy(keyPath string, policy *admittedMaterialPolicy, explicit bool) (ssh.PublicKey, error) {
@@ -1915,7 +1941,7 @@ func buildAutoPubkeyCandidates(
 		dialAgentFn = opts.Environment.DialAgent
 	}
 
-	explicitPaths, hasExplicit := collectExplicitKeyCandidates(
+	explicitPaths, identityPaths := collectExplicitKeyCandidatesWithList(
 		opts.KeyPaths,
 		opts.KeyPath,
 		opts.SSHOptions,
@@ -1936,7 +1962,8 @@ func buildAutoPubkeyCandidates(
 		materialPolicy,
 	)
 	agentSocket, agentDisabled := effectiveAutoAuthAgentSocket(opts, target, l)
-	hasExplicitIdentity := len(first) > 0 || len(opts.FirstCertMethods) > 0 || hasExplicit
+	allowDefaults := identityPaths.DefaultsAllowed() && len(first) == 0 && len(opts.FirstCertMethods) == 0
+	hasExplicitIdentity := !allowDefaults
 
 	if identitiesOnly {
 		return buildIdentitiesOnlyPubkeyCandidatesWithPolicy(
@@ -1962,7 +1989,10 @@ func buildAutoPubkeyCandidates(
 		)
 	}
 
-	defaultPaths := expandDefaultIdentityPaths(opts, target, l)
+	var defaultPaths []string
+	if allowDefaults {
+		defaultPaths = expandDefaultIdentityPaths(opts, target, l)
+	}
 	agentByPub, agentSignersFn, hasAgent, cleanup := openAutoAuthAgent(
 		ctx, opts, dialAgentFn, agentSocket, agentDisabled,
 		explicitPaths, defaultPaths, explicitCerts, hasExplicitCerts, materialPolicy, l,

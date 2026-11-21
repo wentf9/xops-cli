@@ -1809,6 +1809,12 @@ func isValidEnvIdentifier(s string) bool {
 // accepting both snake_case and OpenSSH standard names on input.
 type Options struct {
 	values map[string]string `digest:"include"`
+	// Typed domain option values canonically mirrored into values so HopDigest,
+	// Equal, and YAML/JSON serialization share one deterministic representation.
+	identityFiles    PathList              `json:"-" yaml:"-" digest:"exclude,reason=canonically mirrored into values map"`
+	certificateFiles PathList              `json:"-" yaml:"-" digest:"exclude,reason=canonically mirrored into values map"`
+	algoPolicies     map[string]AlgoPolicy `json:"-" yaml:"-" digest:"exclude,reason=canonically mirrored into values map"`
+	proxyCommand     ProxySetting          `json:"-" yaml:"-" digest:"exclude,reason=canonically mirrored into values map"`
 	// ImplicitTier4 is true when multiplexing was resolved solely from ~/.ssh/config
 	// without any CLI flag or xops node/global configuration.
 	ImplicitTier4 bool `json:"-" yaml:"-" digest:"include"`
@@ -1880,8 +1886,17 @@ func (o *Options) Clone() *Options {
 		return nil
 	}
 	cloned := &Options{
+		identityFiles:      o.identityFiles.clone(),
+		certificateFiles:   o.certificateFiles.clone(),
+		proxyCommand:       o.proxyCommand.clone(),
 		ImplicitTier4:      o.ImplicitTier4,
 		LiteralControlPath: o.LiteralControlPath,
+	}
+	if len(o.algoPolicies) > 0 {
+		cloned.algoPolicies = make(map[string]AlgoPolicy, len(o.algoPolicies))
+		for k, p := range o.algoPolicies {
+			cloned.algoPolicies[k] = p.clone()
+		}
 	}
 	if len(o.values) > 0 {
 		cloned.values = make(map[string]string, len(o.values))
@@ -1936,15 +1951,137 @@ func (o *Options) Set(key, rawValue string) error {
 		o.Delete(spec.CanonicalKey)
 		return nil
 	}
-	normalized, err := spec.Normalize(rawValue)
+	parsed, err := ParseOption(spec.CanonicalKey, rawValue, OptionSourceYAML)
 	if err != nil {
-		return fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
+		return err
 	}
 	if spec.CanonicalKey == OptionControlPath {
 		o.LiteralControlPath = false
 	}
-	o.setRaw(spec.CanonicalKey, normalized)
+	o.applyParsedOption(parsed)
 	return nil
+}
+
+func (o *Options) applyParsedOption(parsed ParsedOption) {
+	if parsed.IsNoOp {
+		return
+	}
+	switch parsed.CanonicalKey {
+	case OptionIdentityFile, OptionCertificateFile:
+		o.setPathList(parsed.CanonicalKey, parsed.PathList)
+	case OptionCiphers, OptionMACs, OptionKexAlgorithms, OptionHostKeyAlgorithms:
+		o.setAlgoPolicy(parsed.CanonicalKey, parsed.AlgoPolicy)
+	case OptionProxyCommand:
+		o.setProxyCommandSetting(parsed.ProxySetting)
+	default:
+		o.setRaw(parsed.CanonicalKey, parsed.Normalized)
+	}
+}
+
+func (o *Options) setPathList(canonicalKey string, pl PathList) {
+	if o == nil {
+		return
+	}
+	if pl.IsUnset() {
+		o.Delete(canonicalKey)
+		return
+	}
+	if canonicalKey == OptionIdentityFile {
+		o.identityFiles = pl.clone()
+	} else if canonicalKey == OptionCertificateFile {
+		o.certificateFiles = pl.clone()
+	}
+	if o.values == nil {
+		o.values = make(map[string]string)
+	}
+	o.values[canonicalKey] = pl.String()
+}
+
+func (o *Options) setAlgoPolicy(canonicalKey string, policy AlgoPolicy) {
+	if o == nil {
+		return
+	}
+	if policy.IsUnset() {
+		o.Delete(canonicalKey)
+		return
+	}
+	if o.algoPolicies == nil {
+		o.algoPolicies = make(map[string]AlgoPolicy)
+	}
+	o.algoPolicies[canonicalKey] = policy.clone()
+	if o.values == nil {
+		o.values = make(map[string]string)
+	}
+	o.values[canonicalKey] = policy.String()
+}
+
+func (o *Options) setProxyCommandSetting(ps ProxySetting) {
+	if o == nil {
+		return
+	}
+	if ps.IsUnset() {
+		o.Delete(OptionProxyCommand)
+		return
+	}
+	o.proxyCommand = ps.clone()
+	if o.values == nil {
+		o.values = make(map[string]string)
+	}
+	if cmd, ok := ps.Command(); ok {
+		o.values[OptionProxyCommand] = cmd
+	} else {
+		o.values[OptionProxyCommand] = "none"
+	}
+}
+
+func (o *Options) syncTypedFieldFromRaw(canonicalKey, val string) {
+	switch canonicalKey {
+	case OptionIdentityFile:
+		if pl, err := ParsePathList(val); err == nil {
+			o.identityFiles = pl
+		} else {
+			o.identityFiles = UnsetPathList()
+		}
+	case OptionCertificateFile:
+		if pl, err := ParsePathList(val); err == nil {
+			o.certificateFiles = pl
+		} else {
+			o.certificateFiles = UnsetPathList()
+		}
+	case OptionCiphers, OptionMACs, OptionKexAlgorithms, OptionHostKeyAlgorithms:
+		if policy, err := ParseAlgoPolicy(canonicalKey, val); err == nil {
+			if o.algoPolicies == nil {
+				o.algoPolicies = make(map[string]AlgoPolicy)
+			}
+			o.algoPolicies[canonicalKey] = policy
+		} else if o.algoPolicies != nil {
+			delete(o.algoPolicies, canonicalKey)
+		}
+	case OptionProxyCommand:
+		if ps, err := ParseProxyCommand(val); err == nil {
+			o.proxyCommand = ps
+		} else {
+			o.proxyCommand = UnsetProxySetting()
+		}
+	}
+}
+
+func (o *Options) clearTypedField(canonicalKey string) {
+	switch canonicalKey {
+	case OptionIdentityFile:
+		o.identityFiles = UnsetPathList()
+	case OptionCertificateFile:
+		o.certificateFiles = UnsetPathList()
+	case OptionCiphers, OptionMACs, OptionKexAlgorithms, OptionHostKeyAlgorithms:
+		if o.algoPolicies != nil {
+			delete(o.algoPolicies, canonicalKey)
+			if len(o.algoPolicies) == 0 {
+				o.algoPolicies = nil
+			}
+		}
+	case OptionProxyCommand:
+		o.proxyCommand = UnsetProxySetting()
+	}
 }
 
 // setRaw stores a value directly under its canonical key without running Normalize.
@@ -1957,6 +2094,7 @@ func (o *Options) setRaw(canonicalKey, val string) {
 		o.values = make(map[string]string)
 	}
 	o.values[canonicalKey] = val
+	o.syncTypedFieldFromRaw(canonicalKey, val)
 }
 
 // Delete removes an option by key.
@@ -1964,23 +2102,18 @@ func (o *Options) Delete(key string) {
 	if o == nil {
 		return
 	}
+	canonical := key
 	if spec, ok := LookupOptionSpec(key); ok {
-		if spec.CanonicalKey == OptionControlPath {
-			o.LiteralControlPath = false
-		}
-		if len(o.values) == 0 {
-			return
-		}
-		delete(o.values, spec.CanonicalKey)
-	} else {
-		if key == OptionControlPath {
-			o.LiteralControlPath = false
-		}
-		if len(o.values) == 0 {
-			return
-		}
-		delete(o.values, key)
+		canonical = spec.CanonicalKey
 	}
+	if canonical == OptionControlPath {
+		o.LiteralControlPath = false
+	}
+	o.clearTypedField(canonical)
+	if len(o.values) == 0 {
+		return
+	}
+	delete(o.values, canonical)
 	if len(o.values) == 0 {
 		o.values = nil
 	}
@@ -2256,23 +2389,111 @@ func (o *Options) DialNetwork() string {
 	}
 }
 
-// IdentityFiles returns all configured IdentityFile entries in order, trimmed and non-empty.
-func (o *Options) IdentityFiles() []string {
-	entries := o.GetAll(OptionIdentityFile)
-	if len(entries) == 0 {
-		return nil
+// IdentityPathList returns the typed tri-state PathList for IdentityFile.
+func (o *Options) IdentityPathList() PathList {
+	if o.IsEmpty() {
+		return UnsetPathList()
 	}
-	out := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		trimmed := strings.TrimSpace(entry)
-		if trimmed != "" {
-			out = append(out, trimmed)
+	if !o.identityFiles.IsUnset() {
+		return o.identityFiles.clone()
+	}
+	if raw := o.values[OptionIdentityFile]; raw != "" {
+		if pl, err := ParsePathList(raw); err == nil {
+			return pl
 		}
 	}
-	if len(out) == 0 {
+	return UnsetPathList()
+}
+
+// SetIdentityPathList stores a typed PathList for OptionIdentityFile.
+func (o *Options) SetIdentityPathList(pl PathList) {
+	o.setPathList(OptionIdentityFile, pl)
+}
+
+// CertificatePathList returns the typed tri-state PathList for CertificateFile.
+func (o *Options) CertificatePathList() PathList {
+	if o.IsEmpty() {
+		return UnsetPathList()
+	}
+	if !o.certificateFiles.IsUnset() {
+		return o.certificateFiles.clone()
+	}
+	if raw := o.values[OptionCertificateFile]; raw != "" {
+		if pl, err := ParsePathList(raw); err == nil {
+			return pl
+		}
+	}
+	return UnsetPathList()
+}
+
+// SetCertificatePathList stores a typed PathList for OptionCertificateFile.
+func (o *Options) SetCertificatePathList(pl PathList) {
+	o.setPathList(OptionCertificateFile, pl)
+}
+
+// AlgoPolicy returns the typed AlgoPolicy for an algorithm option key (Ciphers,
+// MACs, KexAlgorithms, or HostKeyAlgorithms) and true if configured.
+func (o *Options) AlgoPolicy(key string) (AlgoPolicy, bool) {
+	if o.IsEmpty() {
+		return UnsetAlgoPolicy(), false
+	}
+	canonical := CanonicalOptionKey(key)
+	if o.algoPolicies != nil {
+		if p, ok := o.algoPolicies[canonical]; ok && !p.IsUnset() {
+			return p.clone(), true
+		}
+	}
+	if raw := o.values[canonical]; raw != "" {
+		if p, err := ParseAlgoPolicy(canonical, raw); err == nil {
+			return p, true
+		}
+	}
+	return UnsetAlgoPolicy(), false
+}
+
+// SetAlgoPolicy stores a typed AlgoPolicy for its bound algorithm option key.
+func (o *Options) SetAlgoPolicy(policy AlgoPolicy) {
+	if policy.IsUnset() {
+		return
+	}
+	o.setAlgoPolicy(policy.OptionKey(), policy)
+}
+
+// ProxyCommandSetting returns the typed ProxySetting for OptionProxyCommand.
+func (o *Options) ProxyCommandSetting() ProxySetting {
+	if o.IsEmpty() {
+		return UnsetProxySetting()
+	}
+	if !o.proxyCommand.IsUnset() {
+		return o.proxyCommand.clone()
+	}
+	if raw := o.values[OptionProxyCommand]; raw != "" {
+		if ps, err := ParseProxyCommand(raw); err == nil {
+			return ps
+		}
+	}
+	return UnsetProxySetting()
+}
+
+// ControlSetting validates and extracts the typed ControlSetting from o.
+func (o *Options) ControlSetting() (ControlSetting, error) {
+	return ControlSettingFromOptions(o)
+}
+
+// IdentityFiles returns the configured IdentityFile entries in order:
+// nil when Unset, ["none"] when explicitly Disabled, or concrete paths when Set
+// (never including a trailing "none" terminator; inspect IdentityPathList().Terminated()
+// for merge termination state).
+func (o *Options) IdentityFiles() []string {
+	pl := o.IdentityPathList()
+	switch pl.State() {
+	case PathListDisabled:
+		return []string{"none"}
+	case PathListSet:
+		return pl.RawItems()
+	default:
 		return nil
 	}
-	return out
 }
 
 // IdentityFile returns the first configured IdentityFile entry, or "" if unset.
@@ -2284,23 +2505,18 @@ func (o *Options) IdentityFile() string {
 	return files[0]
 }
 
-// CertificateFiles returns all configured CertificateFile entries in order, trimmed and non-empty.
+// CertificateFiles returns the configured CertificateFile entries in order:
+// nil when Unset, ["none"] when explicitly Disabled, or concrete paths when Set.
 func (o *Options) CertificateFiles() []string {
-	entries := o.GetAll(OptionCertificateFile)
-	if len(entries) == 0 {
+	pl := o.CertificatePathList()
+	switch pl.State() {
+	case PathListDisabled:
+		return []string{"none"}
+	case PathListSet:
+		return pl.RawItems()
+	default:
 		return nil
 	}
-	out := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		trimmed := strings.TrimSpace(entry)
-		if trimmed != "" {
-			out = append(out, trimmed)
-		}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
 }
 
 // IdentityAgent returns the configured IdentityAgent specification, or "" if unset.
@@ -2513,10 +2729,7 @@ func (o *Options) StripClasses(classes ...OptionClass) {
 	for k := range o.values {
 		spec, ok := LookupOptionSpec(k)
 		if ok && slices.Contains(classes, spec.Class) {
-			delete(o.values, k)
-			if spec.CanonicalKey == OptionControlPath {
-				o.LiteralControlPath = false
-			}
+			o.Delete(k)
 		}
 	}
 }
@@ -2630,19 +2843,19 @@ func isActiveControlMaster(mode string) bool {
 		mode == string(ControlMasterAutoAsk)
 }
 
-// MergeOptionLayers merges a slice of Options from highest priority to lowest priority
-// according to each registered OptionSpec's MergeMode, without applying cross-field
-// effective finalization:
-//   - OptionMergeFirstWins: highest-priority layer wins.
-//   - OptionMergeAppendDedup: appends normalized entries in order, deduplicating identical entries.
-//   - OptionMergeNoneTerminated: appends normalized entries in order, truncating at "none".
-//   - OptionMergeOrderedEnv / OptionMergeSingleDirectiveOrderedEnv: merges lowest-to-highest
-//     without dropping repeated entries so higher-tier exclusions and overrides win left-to-right.
-func MergeOptionLayers(layers ...*Options) *Options {
+// MergeOptions merges layers from highest priority to lowest priority using
+// strictly associative typed value algebras:
+//   - IdentityFile / CertificateFile: PathList monoid (preserves termination bit).
+//   - Ciphers / MACs / KexAlgorithms / HostKeyAlgorithms: AlgoPolicy first-wins monoid.
+//   - ProxyCommand: ProxySetting first-wins monoid.
+//   - SendEnv: OpenSSH readconf.c merge-time pattern-against-pattern negation monoid.
+//   - SetEnv: lowest-to-highest ordered directives.
+//   - LocalForward / RemoteForward / DynamicForward: append-dedup monoid.
+//   - All other scalar options: first-wins monoid.
+func MergeOptions(layers ...*Options) *Options {
 	res := &Options{}
 	hasExplicitPersist := false
 	hasImplicitTier4 := false
-	noneTerminated := make(map[string]bool, 2)
 	for _, layer := range layers {
 		if layer.IsEmpty() {
 			continue
@@ -2653,7 +2866,7 @@ func MergeOptionLayers(layers ...*Options) *Options {
 		if layer.ImplicitTier4 {
 			hasImplicitTier4 = true
 		}
-		mergeOptionLayerValues(res, layer, noneTerminated)
+		mergeOptionLayerValues(res, layer)
 	}
 	for i := len(layers) - 1; i >= 0; i-- {
 		layer := layers[i]
@@ -2676,21 +2889,49 @@ func MergeOptionLayers(layers ...*Options) *Options {
 	return res
 }
 
-func mergeOptionLayerValues(res, layer *Options, noneTerminated map[string]bool) {
+// MergeOptionLayers is a transitional alias removed in the caller migration commit.
+func MergeOptionLayers(layers ...*Options) *Options {
+	return MergeOptions(layers...)
+}
+
+func mergeOptionLayerValues(res, layer *Options) {
 	for k, v := range layer.values {
-		if spec, ok := LookupOptionSpec(k); ok {
-			switch spec.MergeMode {
-			case OptionMergeOrderedEnv, OptionMergeSingleDirectiveOrderedEnv:
-				continue
-			case OptionMergeNoneTerminated:
-				if !noneTerminated[spec.CanonicalKey] && res.appendNoneTerminatedRaw(spec.CanonicalKey, v) {
-					noneTerminated[spec.CanonicalKey] = true
-				}
-				continue
-			case OptionMergeAppendDedup:
-				res.appendNormalizedRaw(spec.CanonicalKey, v)
-				continue
+		spec, ok := LookupOptionSpec(k)
+		if !ok {
+			if _, exists := res.values[k]; !exists {
+				res.setRaw(k, v)
 			}
+			continue
+		}
+		switch spec.CanonicalKey {
+		case OptionIdentityFile:
+			res.setPathList(OptionIdentityFile, res.IdentityPathList().Merge(layer.IdentityPathList()))
+			continue
+		case OptionCertificateFile:
+			res.setPathList(OptionCertificateFile, res.CertificatePathList().Merge(layer.CertificatePathList()))
+			continue
+		case OptionCiphers, OptionMACs, OptionKexAlgorithms, OptionHostKeyAlgorithms:
+			if lp, ok := layer.AlgoPolicy(spec.CanonicalKey); ok {
+				cur, _ := res.AlgoPolicy(spec.CanonicalKey)
+				res.setAlgoPolicy(spec.CanonicalKey, cur.Merge(lp))
+			} else if _, exists := res.values[k]; !exists {
+				res.setRaw(k, v)
+			}
+			continue
+		case OptionProxyCommand:
+			if lp := layer.ProxyCommandSetting(); !lp.IsUnset() {
+				res.setProxyCommandSetting(res.ProxyCommandSetting().Merge(lp))
+			} else if _, exists := res.values[k]; !exists {
+				res.setRaw(k, v)
+			}
+			continue
+		}
+		switch spec.MergeMode {
+		case OptionMergeOrderedEnv, OptionMergeSingleDirectiveOrderedEnv:
+			continue
+		case OptionMergeAppendDedup:
+			res.appendNormalizedRaw(spec.CanonicalKey, v)
+			continue
 		}
 		if _, exists := res.values[k]; !exists {
 			res.setRaw(k, v)
@@ -2699,37 +2940,6 @@ func mergeOptionLayerValues(res, layer *Options, noneTerminated map[string]bool)
 			}
 		}
 	}
-}
-
-// appendNoneTerminatedRaw appends normalized newline-delimited entries for IdentityFile or
-// CertificateFile, stopping at the first "none" sentinel. If "none" is the very first entry
-// for canonicalKey, "none" is stored; if concrete entries already precede "none", those
-// concrete entries are kept without "none". Returns true when a "none" terminator was seen.
-func (o *Options) appendNoneTerminatedRaw(canonicalKey, normalized string) bool {
-	if normalized == "" {
-		return false
-	}
-	existing := o.GetAll(canonicalKey)
-	terminated := false
-	for item := range strings.SplitSeq(normalized, "\n") {
-		if item == "" {
-			continue
-		}
-		if IsNoneValue(item) {
-			if len(existing) == 0 {
-				existing = append(existing, "none")
-			}
-			terminated = true
-			break
-		}
-		if !slices.Contains(existing, item) {
-			existing = append(existing, item)
-		}
-	}
-	if len(existing) > 0 {
-		o.setRaw(canonicalKey, strings.Join(existing, "\n"))
-	}
-	return terminated
 }
 
 func finalizeEffectiveOptions(opts *Options) *Options {
@@ -2907,30 +3117,23 @@ func ParseCLIOptions(optionStrings []string) (*Options, error) {
 }
 
 func applyCLIOptionDirective(opts *Options, seen map[string]bool, spec OptionSpec, val string) error {
+	parsed, err := ParseOption(spec.CanonicalKey, val, OptionSourceCLI)
+	if err != nil {
+		return err
+	}
 	switch spec.MergeMode {
 	case OptionMergeFirstWins:
-		normalized, err := spec.Normalize(val)
-		if err != nil {
-			return fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
-		}
 		if !seen[spec.CanonicalKey] {
 			if spec.CanonicalKey == OptionControlPath {
 				opts.LiteralControlPath = false
 			}
-			opts.setRaw(spec.CanonicalKey, normalized)
+			opts.applyParsedOption(parsed)
 		}
 		seen[spec.CanonicalKey] = true
 		return nil
 	case OptionMergeSingleDirectiveOrderedEnv:
-		if hasMultiValueDelimiterOrLineBreak(val) || hasKnownHostsControlChar(val) {
-			return fmt.Errorf("%w: invalid %s: value cannot contain newlines or control characters", ErrSSHOptionsValidation, spec.OpenSSHName)
-		}
-		normalized, err := spec.Normalize(val)
-		if err != nil {
-			return fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
-		}
 		if !seen[spec.CanonicalKey] {
-			opts.appendOrderedRaw(spec.CanonicalKey, normalized)
+			opts.appendOrderedRaw(spec.CanonicalKey, parsed.Normalized)
 		}
 		seen[spec.CanonicalKey] = true
 		return nil

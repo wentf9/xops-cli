@@ -162,6 +162,17 @@ func TestEndpoint_AccessorsAndWithPort(t *testing.T) {
 	if err != nil || shifted.Port() != 2222 || shifted.Equal(ipEp) {
 		t.Fatalf("WithPort(2222) = (%+v, %v)", shifted, err)
 	}
+	if !shifted.HostEqual(ipEp) || !ipEp.HostEqual(shifted) {
+		t.Fatalf("HostEqual should ignore port mismatch between %v and %v", shifted, ipEp)
+	}
+	var zeroEp Endpoint
+	if zeroEp.HostEqual(zeroEp) || zeroEp.HostEqual(ipEp) || ipEp.HostEqual(zeroEp) {
+		t.Fatal("HostEqual must fail closed for zero/invalid Endpoint")
+	}
+	otherIP, _ := NewEndpoint("192.0.2.11", 22)
+	if ipEp.HostEqual(otherIP) {
+		t.Fatalf("HostEqual(%v, %v) = true, want false", ipEp, otherIP)
+	}
 	back, err := shifted.WithPort(0)
 	if err != nil || !back.Equal(ipEp) {
 		t.Fatalf("WithPort(0) = (%+v, %v), want %+v", back, err, ipEp)

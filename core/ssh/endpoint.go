@@ -231,6 +231,21 @@ func (e Endpoint) Equal(other Endpoint) bool {
 	return e.port == other.port && e.addr == other.addr && e.hostname == other.hostname
 }
 
+// HostEqual reports whether e and other are both valid and represent the same
+// canonical host, ignoring port. Invalid (zero-value) endpoints never compare
+// equal to anything, including each other (fail-closed).
+//
+// SECURITY: NOT for security scoping (such as Tier-4 OpenSSH stanza scoping,
+// known_hosts matching, or credential binding). Always use Equal when port
+// identity matters. Use HostEqual only where port-agnostic host matching is
+// explicitly intended and justified (for example CLI --exclude <addr>).
+func (e Endpoint) HostEqual(other Endpoint) bool {
+	if !e.IsValid() || !other.IsValid() {
+		return false
+	}
+	return e.addr == other.addr && e.hostname == other.hostname
+}
+
 // String formats e in canonical host:port syntax (bracketing IPv6 literals via
 // net.JoinHostPort), or "" for an invalid zero-value Endpoint.
 func (e Endpoint) String() string {

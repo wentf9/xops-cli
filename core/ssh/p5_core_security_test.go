@@ -1176,11 +1176,17 @@ func TestP5_4_2_NoneTerminationSingleLayerAndCollectors(t *testing.T) {
 			if err := layer.Append(optKey, "/tmp/bad_%k"); !errors.Is(err, ErrSSHOptionsValidation) {
 				t.Fatalf("%s Append invalid after none: err=%v, want ErrSSHOptionsValidation", optKey, err)
 			}
-			// Merging over a lower layer must still truncate lower layer entries.
+			// Merging over a lower layer must still truncate lower layer entries while retaining termination bit.
 			lower := MustOptions(optKey, "/tmp/lower_secret")
-			merged := MergeOptionLayers(layer, lower)
-			if got := merged.GetAll(optKey); !slices.Equal(got, []string{"/tmp/first"}) {
-				t.Fatalf("%s MergeOptionLayers = %v, want [/tmp/first]", optKey, got)
+			merged := MergeOptions(layer, lower)
+			if optKey == OptionIdentityFile {
+				if got := merged.IdentityFiles(); !slices.Equal(got, []string{"/tmp/first"}) || !merged.IdentityPathList().Terminated() {
+					t.Fatalf("%s MergeOptions = (%v, terminated=%v), want ([/tmp/first], true)", optKey, got, merged.IdentityPathList().Terminated())
+				}
+			} else {
+				if got := merged.CertificateFiles(); !slices.Equal(got, []string{"/tmp/first"}) || !merged.CertificatePathList().Terminated() {
+					t.Fatalf("%s MergeOptions = (%v, terminated=%v), want ([/tmp/first], true)", optKey, got, merged.CertificatePathList().Terminated())
+				}
 			}
 		}
 	})
@@ -1190,10 +1196,10 @@ func TestP5_4_2_NoneTerminationSingleLayerAndCollectors(t *testing.T) {
 		if err := yaml.Unmarshal([]byte("identity_file:\n  - /tmp/k1\n  - none\n  - /tmp/k2\ncertificate_file:\n  - NONE\n  - /tmp/c2\n"), &fromYAML); err != nil {
 			t.Fatalf("yaml.Unmarshal: %v", err)
 		}
-		if got := fromYAML.IdentityFiles(); !slices.Equal(got, []string{"/tmp/k1", "none"}) {
-			t.Fatalf("YAML IdentityFiles = %v, want [/tmp/k1 none]", got)
+		if got := fromYAML.IdentityFiles(); !slices.Equal(got, []string{"/tmp/k1"}) || !fromYAML.IdentityPathList().Terminated() {
+			t.Fatalf("YAML IdentityFiles = (%v, terminated=%v), want ([/tmp/k1], true)", got, fromYAML.IdentityPathList().Terminated())
 		}
-		if got := fromYAML.CertificateFiles(); !slices.Equal(got, []string{"none"}) {
+		if got := fromYAML.CertificateFiles(); !slices.Equal(got, []string{"none"}) || !fromYAML.CertificatePathList().IsDisabled() {
 			t.Fatalf("YAML CertificateFiles = %v, want [none]", got)
 		}
 
@@ -1201,10 +1207,10 @@ func TestP5_4_2_NoneTerminationSingleLayerAndCollectors(t *testing.T) {
 		if err := json.Unmarshal([]byte(`{"identity_file":["/tmp/k1","none","/tmp/k2"],"certificate_file":["none","/tmp/c2"]}`), &fromJSON); err != nil {
 			t.Fatalf("json.Unmarshal: %v", err)
 		}
-		if got := fromJSON.IdentityFiles(); !slices.Equal(got, []string{"/tmp/k1", "none"}) {
-			t.Fatalf("JSON IdentityFiles = %v, want [/tmp/k1 none]", got)
+		if got := fromJSON.IdentityFiles(); !slices.Equal(got, []string{"/tmp/k1"}) || !fromJSON.IdentityPathList().Terminated() {
+			t.Fatalf("JSON IdentityFiles = (%v, terminated=%v), want ([/tmp/k1], true)", got, fromJSON.IdentityPathList().Terminated())
 		}
-		if got := fromJSON.CertificateFiles(); !slices.Equal(got, []string{"none"}) {
+		if got := fromJSON.CertificateFiles(); !slices.Equal(got, []string{"none"}) || !fromJSON.CertificatePathList().IsDisabled() {
 			t.Fatalf("JSON CertificateFiles = %v, want [none]", got)
 		}
 	})

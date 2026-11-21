@@ -1188,49 +1188,23 @@ func (o *Options) Append(key, rawValue string) error {
 	if hasMultiValueDelimiterOrLineBreak(rawValue) || hasKnownHostsControlChar(rawValue) {
 		return fmt.Errorf("%w: invalid %s: value cannot contain newlines or control characters", ErrSSHOptionsValidation, spec.OpenSSHName)
 	}
-	normalized, err := spec.Normalize(rawValue)
+	parsed, err := ParseOption(spec.CanonicalKey, rawValue, OptionSourceCLI)
 	if err != nil {
-		return fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
+		return err
 	}
 	switch {
 	case spec.MergeMode.IsOrderedOverride():
-		o.appendOrderedRaw(spec.CanonicalKey, normalized)
+		o.appendOrderedRaw(spec.CanonicalKey, parsed.Normalized)
 	case spec.MergeMode.IsNoneTerminated():
-		o.appendNoneTerminatedLayerRaw(spec.CanonicalKey, normalized)
+		if spec.CanonicalKey == OptionIdentityFile {
+			o.setPathList(OptionIdentityFile, o.IdentityPathList().Merge(parsed.PathList))
+		} else {
+			o.setPathList(OptionCertificateFile, o.CertificatePathList().Merge(parsed.PathList))
+		}
 	default:
-		o.appendNormalizedRaw(spec.CanonicalKey, normalized)
+		o.appendNormalizedRaw(spec.CanonicalKey, parsed.Normalized)
 	}
 	return nil
-}
-
-// appendNoneTerminatedLayerRaw appends normalized entries within a single option
-// layer for OptionMergeNoneTerminated options (IdentityFile, CertificateFile),
-// stopping at the first "none" sentinel and retaining "none" as the terminator
-// so lower layers are still truncated on MergeOptionLayers while dropping any
-// subsequent entries in the same layer.
-func (o *Options) appendNoneTerminatedLayerRaw(canonicalKey, normalized string) {
-	if normalized == "" {
-		return
-	}
-	existing := o.GetAll(canonicalKey)
-	if slices.ContainsFunc(existing, IsNoneValue) {
-		return
-	}
-	for item := range strings.SplitSeq(normalized, "\n") {
-		if item == "" {
-			continue
-		}
-		if IsNoneValue(item) {
-			existing = append(existing, "none")
-			break
-		}
-		if !slices.Contains(existing, item) {
-			existing = append(existing, item)
-		}
-	}
-	if len(existing) > 0 {
-		o.setRaw(canonicalKey, strings.Join(existing, "\n"))
-	}
 }
 
 func (o *Options) appendOrderedRaw(canonicalKey, normalized string) {

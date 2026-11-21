@@ -588,8 +588,11 @@ func TestP2_ParseCLIOptions_MergeModesAndValidation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ParseCLIOptions tier1: %v", err)
 		}
-		if got := tier1.IdentityFiles(); !slices.Equal(got, []string{"/tmp/cli_key", "none"}) {
-			t.Fatalf("unmerged tier1.IdentityFiles() = %v, want [/tmp/cli_key none]", got)
+		if got := tier1.IdentityFiles(); !slices.Equal(got, []string{"/tmp/cli_key"}) {
+			t.Fatalf("unmerged tier1.IdentityFiles() = %v, want [/tmp/cli_key]", got)
+		}
+		if !tier1.IdentityPathList().Terminated() {
+			t.Fatalf("unmerged tier1.IdentityPathList().Terminated() = false, want true")
 		}
 		tier2, err := ParseCLIOptions([]string{"IdentityFile=/tmp/node_key"})
 		if err != nil {
