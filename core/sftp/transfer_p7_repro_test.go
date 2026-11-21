@@ -230,6 +230,7 @@ func TestP7Repro_LOW5_DownloadSymlinkPolicyB(t *testing.T) {
 			{name: "absolute_etc_passwd", relDir: "", target: "/etc/passwd"},
 			{name: "absolute_inside_remote_root", relDir: "", target: "/remote_sym/ok.txt"},
 			{name: "escape_from_root", relDir: "", target: "../outside.txt"},
+			{name: "descend_then_escape_root", relDir: "", target: "a/../../x"},
 			{name: "escape_from_subdir", relDir: "sub", target: "../../outside.txt"},
 			{name: "intermediate_bounce_escape", relDir: "sub", target: "../../remote_sym/ok.txt"},
 			{name: "backslash_escape", relDir: "sub", target: `..\..\outside.txt`},
@@ -271,44 +272,58 @@ func TestP7Repro_LOW5_DownloadSymlinkPolicyB(t *testing.T) {
 		}
 	})
 
-	t.Run("preserve_safe_relative_in_root_symlinks", func(t *testing.T) {
-		client := newTestSFTPClientWithHandlers(t, pkgsftp.InMemHandler())
-		if err := client.state.sftpClient.MkdirAll("/remote_safe/a/b"); err != nil {
-			t.Fatalf("MkdirAll: %v", err)
+	t.Run("preserve_safe_relative_in_root_symlinks", testPreserveSafeRelativeDownloadSymlinks)
+}
+
+func testPreserveSafeRelativeDownloadSymlinks(t *testing.T) {
+	t.Helper()
+	client := newTestSFTPClientWithHandlers(t, pkgsftp.InMemHandler())
+	for _, dir := range []string{"/remote_safe/a/b", "/remote_safe/sub"} {
+		if err := client.state.sftpClient.MkdirAll(dir); err != nil {
+			t.Fatalf("MkdirAll(%q): %v", dir, err)
 		}
-		f, err := client.state.sftpClient.Create("/remote_safe/target.txt")
+	}
+	for _, filePath := range []string{"/remote_safe/target.txt", "/remote_safe/ok"} {
+		f, err := client.state.sftpClient.Create(filePath)
 		if err != nil {
-			t.Fatalf("Create: %v", err)
+			t.Fatalf("Create(%q): %v", filePath, err)
 		}
 		_, _ = f.Write([]byte("ok"))
 		_ = f.Close()
+	}
 
-		if err := client.state.sftpClient.Symlink("../../target.txt", "/remote_safe/a/b/link_to_root_file"); err != nil {
-			t.Fatalf("Symlink in-root: %v", err)
+	links := []struct {
+		remote string
+		local  []string
+		target string
+	}{
+		{remote: "/remote_safe/a/b/link_to_root_file", local: []string{"a", "b", "link_to_root_file"}, target: "../../target.txt"},
+		{remote: "/remote_safe/in_root_dotdot", local: []string{"in_root_dotdot"}, target: "sub/../ok"},
+		{remote: "/remote_safe/dangling_inside", local: []string{"dangling_inside"}, target: "missing_sibling.txt"},
+	}
+	for _, ln := range links {
+		if err := client.state.sftpClient.Symlink(ln.target, ln.remote); err != nil {
+			t.Fatalf("Symlink(%q, %q): %v", ln.target, ln.remote, err)
 		}
-		if err := client.state.sftpClient.Symlink("missing_sibling.txt", "/remote_safe/dangling_inside"); err != nil {
-			t.Fatalf("Symlink dangling inside: %v", err)
-		}
+	}
 
-		localDst := t.TempDir()
-		remoteRoot, _ := ParseRemotePath("/remote_safe")
-		dest, _ := LocalDestPath(localDst)
-		if err := client.Download(t.Context(), remoteRoot, dest, DownloadOptions{}); err != nil {
-			if runtime.GOOS == "windows" {
-				t.Skip("skipping local symlink creation check on Windows")
-			}
-			t.Fatalf("Download safe relative symlinks failed: %v", err)
+	localDst := t.TempDir()
+	remoteRoot, _ := ParseRemotePath("/remote_safe")
+	dest, _ := LocalDestPath(localDst)
+	if err := client.Download(t.Context(), remoteRoot, dest, DownloadOptions{}); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skip("skipping local symlink creation check on Windows")
 		}
+		t.Fatalf("Download safe relative symlinks failed: %v", err)
+	}
 
-		got1, err := os.Readlink(filepath.Join(localDst, "a", "b", "link_to_root_file"))
-		if err != nil || filepath.ToSlash(got1) != "../../target.txt" {
-			t.Fatalf("readlink link_to_root_file = (%q, %v), want ../../target.txt", got1, err)
+	for _, ln := range links {
+		localPath := filepath.Join(append([]string{localDst}, ln.local...)...)
+		got, err := os.Readlink(localPath)
+		if err != nil || filepath.ToSlash(got) != ln.target {
+			t.Fatalf("readlink %q = (%q, %v), want %q", localPath, got, err, ln.target)
 		}
-		got2, err := os.Readlink(filepath.Join(localDst, "dangling_inside"))
-		if err != nil || filepath.ToSlash(got2) != "missing_sibling.txt" {
-			t.Fatalf("readlink dangling_inside = (%q, %v), want missing_sibling.txt", got2, err)
-		}
-	})
+	}
 }
 
 func TestClient_Download_GlobSupport(t *testing.T) {
