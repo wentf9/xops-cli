@@ -263,7 +263,7 @@ func TestClientWaitClosedTargetPreservesHealthyJump(t *testing.T) {
 	if err := client.Wait(ctx); err == nil {
 		t.Fatal("expected closed target to report connection loss")
 	}
-	jump, ok := connector.clients.Get("node-1")
+	jump, ok := connector.clients.Get(connectionRouteKey([]string{"node-0"}, "node-1"))
 	if !ok {
 		t.Fatal("jump client missing")
 	}
@@ -292,12 +292,13 @@ func TestPoolCleanupBlackholedProxyJump(t *testing.T) {
 					timeout = time.Hour
 				}
 				connector.EnableKeepAlive(ctx, 5*time.Millisecond, timeout)
-				target, ok := connector.clients.Get("node-2")
+				targetKey := connectionRouteKey([]string{"node-0", "node-1"}, "node-2")
+				target, ok := connector.clients.Get(targetKey)
 				if !ok {
 					t.Fatal("target missing")
 				}
-				connector.startKeepAliveFor("node-2", target)
-				entry, ok := connector.keepAlives.Get("node-2")
+				connector.startKeepAliveFor(targetKey, target)
+				entry, ok := connector.keepAlives.Get(targetKey)
 				if !ok {
 					t.Fatal("keepalive missing")
 				}

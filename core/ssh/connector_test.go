@@ -487,7 +487,7 @@ func TestConnector_Connect_ResolvedProxyChainUsesRootClient(t *testing.T) {
 	}}
 	connector := newTestConnector(store, WithInteractionHandler(&mockUI{}))
 	// nil Conn 的客户端仅用于验证计划顺序和包装结果，不执行网络探测。
-	connector.clients.Set("target", &PooledClient{SSHClient: &ssh.Client{}})
+	connector.clients.Set(connectionRouteKey([]string{"jump"}, "target"), &PooledClient{SSHClient: &ssh.Client{}})
 	connector.clients.Set("jump", &PooledClient{SSHClient: &ssh.Client{}})
 
 	client, err := connector.Connect(context.Background(), "target")
@@ -674,9 +674,9 @@ func TestConnector_Connect_MultiHopProxyJump(t *testing.T) {
 		"openssh:second": {NodeID: "openssh:second"},
 	}}
 	connector := newTestConnector(store, WithInteractionHandler(&mockUI{}))
-	for nodeID := range store.cfgs {
-		connector.clients.Set(nodeID, &PooledClient{SSHClient: &ssh.Client{}})
-	}
+	connector.clients.Set("openssh:first", &PooledClient{SSHClient: &ssh.Client{}})
+	connector.clients.Set(connectionRouteKey([]string{"openssh:first"}, "openssh:second"), &PooledClient{SSHClient: &ssh.Client{}})
+	connector.clients.Set(connectionRouteKey([]string{"openssh:first", "openssh:second"}, "target"), &PooledClient{SSHClient: &ssh.Client{}})
 
 	client, err := connector.Connect(t.Context(), "target")
 	if err != nil {

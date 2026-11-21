@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"slices"
@@ -42,9 +43,9 @@ type Connector struct {
 	interactionTimeout time.Duration
 	handshakeTimeout   time.Duration
 	baseDialer         Dialer
-	// 连接池：缓存 nodeName -> *ssh.Client
+	// 连接池：按规范路由键（routeKey）缓存 *PooledClient，隔离不同 ProxyJump 路径到达的同名节点
 	clients *concurrent.Map[string, *PooledClient]
-	// singleflight 组，用来控制并发和去重
+	// singleflight 组，按规范路由键控制并发和去重
 	sf singleflight.Group
 	// 自动接受新的主机密钥
 	AcceptNewHostKey atomic.Bool
@@ -66,7 +67,7 @@ type Connector struct {
 	kaMu sync.Mutex
 	// keepAliveCfg 为 nil 表示未启用周期心跳（CLI 短生命周期命令默认不启用）
 	keepAliveCfg *keepAliveConfig
-	// keepAlives 心跳注册表：nodeName -> 运行中的心跳条目
+	// keepAlives 心跳注册表：routeKey -> 运行中的心跳条目
 	keepAlives *concurrent.Map[string, *keepAliveEntry]
 	// keepAliveWG 覆盖配置 watcher 及已从注册表驱逐、但尚未完全返回的心跳 goroutine。
 	keepAliveWG sync.WaitGroup
@@ -219,9 +220,54 @@ func WithSessionConfirmer(confirmer SessionConfirmer) Option {
 }
 
 type connectionPlanNode struct {
-	name    string
-	cfg     *ClientConfig
-	control *ControlConfig
+	name     string
+	routeKey string
+	cfg      *ClientConfig
+	control  *ControlConfig
+}
+
+// connectionRouteKey returns the canonical pool/singleflight/keepalive key for
+// reaching nodeName through the ordered upstream jump chain (outermost hop first).
+// Direct hops (no upstream jumps) keep bare nodeName as their key; jump-chained
+// hops use a length-prefixed encoding so distinct routes to the same node can
+// never collide or bypass an upstream bastion regardless of node ID characters.
+func connectionRouteKey(upstream []string, nodeName string) string {
+	if len(upstream) == 0 {
+		return nodeName
+	}
+	var b strings.Builder
+	b.WriteString("\x00route\x00")
+	for _, hop := range upstream {
+		b.WriteString(strconv.Itoa(len(hop)))
+		b.WriteByte(':')
+		b.WriteString(hop)
+		b.WriteByte(';')
+	}
+	b.WriteString(strconv.Itoa(len(nodeName)))
+	b.WriteByte(':')
+	b.WriteString(nodeName)
+	b.WriteByte(';')
+	return b.String()
+}
+
+func assignPlanRouteKeys(plan []connectionPlanNode) {
+	upstream := make([]string, 0, len(plan))
+	for i := len(plan) - 1; i >= 0; i-- {
+		plan[i].routeKey = connectionRouteKey(upstream, plan[i].name)
+		upstream = append(upstream, plan[i].name)
+	}
+}
+
+func (n connectionPlanNode) poolKey() string {
+	if n.routeKey != "" {
+		return n.routeKey
+	}
+	if n.cfg != nil {
+		if jumps := splitProxyJumpChain(n.cfg.ProxyJump); len(jumps) > 0 {
+			return connectionRouteKey(jumps, n.name)
+		}
+	}
+	return n.name
 }
 
 var errProxyTransportClosed = errors.New("proxy transport generation is closed")
@@ -274,13 +320,31 @@ func (c *Connector) Connect(ctx context.Context, nodeName string) (*Client, erro
 // connector lifecycle: one caller's cancellation must not interrupt a transport
 // other callers still use. The validated hops are returned so the chain build
 // can reuse them instead of probing the same transports a second time.
+func isClientTransportClosed(client *Client) bool {
+	if client == nil {
+		return true
+	}
+	root, ok := client.rootConn.(*physicalSSHConn)
+	return ok && root.closed.Load()
+}
+
 func (c *Connector) reuseJumpChainedTarget(ctx context.Context, plan []connectionPlanNode) (*Client, map[string]*Client, error) {
 	validated := make(map[string]*Client, len(plan)-1)
 	for index := len(plan) - 1; index > 0; index-- {
 		planNode := plan[index]
-		cached, ok := c.clients.Get(planNode.name)
+		routeKey := planNode.poolKey()
+		cached, ok := c.clients.Get(routeKey)
 		if !ok || cached.SSHClient.Conn == nil {
 			continue
+		}
+		var beforeDownstream []*PooledClient
+		if cached.RootConn == nil {
+			beforeDownstream = make([]*PooledClient, index)
+			for downstream := 0; downstream < index; downstream++ {
+				if cur, exists := c.clients.Get(plan[downstream].poolKey()); exists {
+					beforeDownstream[downstream] = cur
+				}
+			}
 		}
 		hopClient, err := c.connectPlannedNode(ctx, planNode, nil, true)
 		if err != nil {
@@ -289,12 +353,24 @@ func (c *Connector) reuseJumpChainedTarget(ctx context.Context, plan []connectio
 			// the failure keeps the hop it happened on.
 			c.getLogger().Debugf("mux: cached jump hop %s is not reusable (%v)", planNode.name, err)
 			if errors.Is(err, errJumpChainRequired) {
-				// The cached hop was stale and evicted; evict any in-process cached
-				// target that rode on it, but still let plan[0] attach to an external
-				// control master socket if one exists on disk.
-				if staleTarget, ok := c.clients.Get(plan[0].name); ok {
-					c.evictCachedClient(plan[0].name, staleTarget)
-					_ = staleTarget.interrupt()
+				// The cached hop was stale and evicted; cascade-evict all in-process
+				// cached downstream hops (plan[0..index-1]) that rode on the same failed
+				// transport generation, without clobbering a fresher replacement
+				// published concurrently by another caller, while still letting plan[0]
+				// attach to an external control master socket if one exists on disk.
+				for downstream := 0; downstream < index; downstream++ {
+					dsKey := plan[downstream].poolKey()
+					staleDownstream, exists := c.clients.Get(dsKey)
+					if !exists {
+						continue
+					}
+					sameGeneration := (cached.RootConn != nil && staleDownstream.RootConn == cached.RootConn) ||
+						(cached.RootConn == nil && staleDownstream == beforeDownstream[downstream])
+					if !sameGeneration {
+						continue
+					}
+					c.evictCachedClient(dsKey, staleDownstream)
+					_ = staleDownstream.interrupt()
 				}
 				validated = nil
 				break
@@ -304,7 +380,7 @@ func (c *Connector) reuseJumpChainedTarget(ctx context.Context, plan []connectio
 		// This transport was validated a moment ago on the connector lifecycle;
 		// probing it again while the chain is rebuilt would repeat a network
 		// round trip per cached hop.
-		validated[planNode.name] = hopClient
+		validated[routeKey] = hopClient
 	}
 	client, err := c.connectPlannedNode(ctx, plan[0], nil, true)
 	return client, validated, err
@@ -333,9 +409,10 @@ func (c *Connector) connectPlan(ctx context.Context, plan []connectionPlanNode) 
 		}
 
 		planNode := plan[index]
-		if validated, ok := validatedHops[planNode.name]; ok && validated != nil {
-			// Already validated in this call; reuse it instead of dialing the hop
-			// again. It still carries the whole chain for the next hop below.
+		if validated, ok := validatedHops[planNode.poolKey()]; ok && validated != nil && !isClientTransportClosed(validated) {
+			// Already validated in this call and its physical transport is still open;
+			// reuse it instead of dialing the hop again. It still carries the whole
+			// chain for the next hop below.
 			connected = validated
 			continue
 		}
@@ -482,6 +559,7 @@ func (c *Connector) resolveConnectionPlan(ctx context.Context, nodeName string) 
 				positions[jumpName] = len(plan)
 				plan = append(plan, connectionPlanNode{name: jumpName, cfg: &cloned, control: c.resolveControl(jumpName, &cloned)})
 			}
+			assignPlanRouteKeys(plan)
 			return plan, nil
 		}
 		if len(jumps) == 1 {
@@ -490,6 +568,7 @@ func (c *Connector) resolveConnectionPlan(ctx context.Context, nodeName string) 
 			current = ""
 		}
 	}
+	assignPlanRouteKeys(plan)
 	return plan, nil
 }
 
@@ -539,10 +618,11 @@ func splitProxyJumpChain(proxyJump string) []string {
 // reused without its bastion; a caller that finds errJumpChainRequired retries
 // with the full chain once the reuse-only task has finished.
 func (c *Connector) connectPlannedNode(ctx context.Context, planNode connectionPlanNode, dialer Dialer, reuseOnly bool) (*Client, error) {
+	routeKey := planNode.poolKey()
 	for {
 		// 缓存复检、失效驱逐和重建位于同一个共享任务内。任务仅绑定 Connector 生命周期，
 		// 单个调用者取消只停止等待，不会关闭连接池中由其他调用者共享的连接。
-		resultCh := c.sf.DoChan(planNode.name, func() (any, error) {
+		resultCh := c.sf.DoChan(routeKey, func() (any, error) {
 			sharedCtx, finish, err := c.beginSharedConnect()
 			if err != nil {
 				return nil, err
@@ -597,8 +677,9 @@ func (c *Connector) beginSharedConnect() (context.Context, func(), error) {
 
 func (c *Connector) connectNode(ctx context.Context, planNode connectionPlanNode, dialer Dialer, reuseOnly bool) (*Client, error) {
 	nodeName := planNode.name
+	routeKey := planNode.poolKey()
 	var probeErr error
-	if cachedClient, ok := c.clients.Get(nodeName); ok {
+	if cachedClient, ok := c.clients.Get(routeKey); ok {
 		if cachedClient.SSHClient.Conn == nil {
 			logger.EmitDiagnostic(c.diagnostics, logger.Diagnostic{Kind: logger.ConnectionReused, NodeID: nodeName})
 			return c.wrapCachedClient(planNode.cfg, cachedClient), nil
@@ -609,7 +690,7 @@ func (c *Connector) connectNode(ctx context.Context, planNode connectionPlanNode
 			return c.wrapCachedClient(planNode.cfg, cachedClient), nil
 		} else {
 			probeErr = err
-			c.evictCachedClient(nodeName, cachedClient)
+			c.evictCachedClient(routeKey, cachedClient)
 			if ctx.Err() != nil {
 				return nil, fmt.Errorf("probe cached SSH connection for node '%s' failed: %w", nodeName, ctx.Err())
 			}
@@ -913,18 +994,25 @@ func (c *Connector) tryDialAndPublishProxy(ctx context.Context, planNode connect
 		return nil, proxyErr
 	}
 
+	rootConn := proxyConn.RawConn()
+	if rootConn != nil {
+		if _, ok := rootConn.(*physicalSSHConn); !ok {
+			rootConn = &physicalSSHConn{Conn: rootConn}
+		}
+	}
 	pooled := &PooledClient{
 		SSHClient:          rawClient,
-		RootConn:           proxyConn.RawConn(),
+		RootConn:           rootConn,
 		ControlSocketPath:  expandedPath,
 		ControlExpectedUID: c.expectedPeerUID(),
 	}
-	if err := c.publishClient(planNode.name, pooled); err != nil {
+	routeKey := planNode.poolKey()
+	if err := c.publishClient(routeKey, pooled); err != nil {
 		_ = rawClient.Close()
 		_ = proxyConn.Close()
 		return nil, err
 	}
-	c.startKeepAliveFor(planNode.name, pooled, planNode.cfg)
+	c.startKeepAliveFor(routeKey, pooled, planNode.cfg)
 	logger.EmitDiagnostic(c.diagnostics, logger.Diagnostic{
 		Kind:   logger.ConnectionReused,
 		NodeID: planNode.name,
@@ -1486,9 +1574,9 @@ func (c *Connector) startKeepAliveFor(nodeName string, client *PooledClient, cli
 			if countMax <= 0 {
 				countMax = 3
 			}
-			timeout = nodeInterval * time.Duration(countMax)
+			timeout = multiplyDurationSaturated(nodeInterval, countMax)
 		} else if interval > 0 && countMax > 0 {
-			timeout = interval * time.Duration(countMax)
+			timeout = multiplyDurationSaturated(interval, countMax)
 		}
 	}
 	if parentCtx == nil || parentCtx.Err() != nil || interval <= 0 {
@@ -1515,6 +1603,16 @@ func (c *Connector) startKeepAliveFor(nodeName string, client *PooledClient, cli
 		<-entry.done
 		c.keepAliveWG.Done()
 	}()
+}
+
+func multiplyDurationSaturated(d time.Duration, count int) time.Duration {
+	if d <= 0 || count <= 0 {
+		return 0
+	}
+	if int64(d) > math.MaxInt64/int64(count) {
+		return time.Duration(math.MaxInt64)
+	}
+	return d * time.Duration(count)
 }
 
 func (c *Connector) removeKeepAliveFor(nodeName string, client *PooledClient) {
@@ -1677,5 +1775,9 @@ type PooledClient struct {
 }
 
 func (c *PooledClient) interrupt() error {
-	return interruptSSHTransport(c.RootConn, c.SSHClient)
+	var sshClient *ssh.Client
+	if c.SSHClient != nil && c.SSHClient.Conn != nil {
+		sshClient = c.SSHClient
+	}
+	return interruptSSHTransport(c.RootConn, sshClient)
 }

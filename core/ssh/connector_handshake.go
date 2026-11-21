@@ -509,13 +509,14 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 	client.connCfg = finalConnCfg
 	client.cfgMu.Unlock()
 
-	if err := c.publishClient(nodeName, pooled); err != nil {
+	routeKey := planNode.poolKey()
+	if err := c.publishClient(routeKey, pooled); err != nil {
 		if closeErr := rootConn.Close(); closeErr != nil {
 			return nil, fmt.Errorf("%w; close unpublished SSH client failed: %w", err, closeErr)
 		}
 		return nil, err
 	}
-	c.startKeepAliveFor(nodeName, pooled, roPolicy)
+	c.startKeepAliveFor(routeKey, pooled, roPolicy)
 	// Start multiplexing master if configured. Pass rootConn (this hop's own
 	// connection, not the bastion's transportRoot) so shutting down a jump-target
 	// master never closes the underlying bastion TCP connection.

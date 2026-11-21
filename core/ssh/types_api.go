@@ -305,6 +305,10 @@ func validateTargetCompatibility(cur ConnectionConfig, newCfg *ClientConfig) err
 		return fmt.Errorf("%w: host address changed (expected %q, got %q)",
 			ErrSnapshotMismatch, cur.Address, newCfg.Address)
 	}
+	if curBase, newBase := strings.TrimSpace(cur.BaseHost), strings.TrimSpace(newCfg.BaseHost); curBase != newBase {
+		return fmt.Errorf("%w: base host changed (expected %q, got %q)",
+			ErrSnapshotMismatch, curBase, newBase)
+	}
 	curPort := cur.Port
 	if curPort <= 0 {
 		curPort = 22
