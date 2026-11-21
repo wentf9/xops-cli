@@ -200,26 +200,11 @@ func IsSecureSecurityDescriptor(
 	return EvaluateObjectSecurity(attrs, expectDir, ownerTrusted, true, aces)
 }
 
-// IsSecureSystemSSHObject checks that path is not a reparse point/device and
-// satisfies IsSecureSecurityDescriptor before and after querying the descriptor.
+// IsSecureSystemSSHObject checks that path (and its ancestor chain) has no
+// reparse points or devices and satisfies IsSecureSecurityDescriptor using an
+// open no-follow handle and GetSecurityInfo.
 func IsSecureSystemSSHObject(path string, expectDir bool, currSID *windows.SID) bool {
-	attrs, ok := GetFileAttributesNoFollow(path)
-	if !ok || !EvaluateAttributes(attrs, expectDir) {
-		return false
-	}
-	sd, err := windows.GetNamedSecurityInfo(
-		path,
-		windows.SE_FILE_OBJECT,
-		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION,
-	)
-	if err != nil || sd == nil {
-		return false
-	}
-	if !IsSecureSecurityDescriptor(attrs, expectDir, sd, currSID) {
-		return false
-	}
-	attrsAfter, ok := GetFileAttributesNoFollow(path)
-	return ok && EvaluateAttributes(attrsAfter, expectDir)
+	return IsSecureSystemSSHObjectByHandle(path, expectDir, currSID)
 }
 
 // IsSecureSystemGlobalSSHObject checks that path is a non-reparse, non-device
@@ -228,7 +213,7 @@ func IsSecureSystemSSHObject(path string, expectDir bool, currSID *windows.SID) 
 // Builtin\Administrators with write/mutate DACL entries restricted to those
 // same system principals (currSID == nil; never trusts the current user).
 func IsSecureSystemGlobalSSHObject(path string, expectDir bool) bool {
-	return IsSecureSystemSSHObject(path, expectDir, nil)
+	return IsSecureSystemSSHObjectByHandle(path, expectDir, nil)
 }
 
 // IsSecureSystemAncestorDirDescriptor evaluates sd for a shared system ancestor
@@ -258,30 +243,14 @@ func IsSecureSystemAncestorDirDescriptor(attrs uint32, sd *windows.SECURITY_DESC
 	return EvaluateSystemAncestorDirSecurity(attrs, ownerTrusted, true, aces)
 }
 
-// IsSecureSystemAncestorDir checks that path is a real directory (not a reparse
-// point or device, verified before and after reading its security descriptor)
-// owned strictly by SYSTEM or Builtin\Administrators with a non-nil DACL that
-// denies destructive/takeover rights to untrusted principals. This accepts
-// standard Windows C:\ProgramData ACLs while rejecting junctions, user-owned
-// roots, nil DACLs, and delete/takeover permissions.
+// IsSecureSystemAncestorDir checks via an open no-follow handle that path is a
+// real directory (not a reparse point or device) owned strictly by SYSTEM or
+// Builtin\Administrators with a non-nil DACL that denies destructive/takeover
+// rights to untrusted principals. This accepts standard Windows C:\ProgramData
+// ACLs while rejecting junctions, user-owned roots, nil DACLs, and
+// delete/takeover permissions.
 func IsSecureSystemAncestorDir(path string) bool {
-	attrs, ok := GetFileAttributesNoFollow(path)
-	if !ok || !EvaluateAttributes(attrs, true) {
-		return false
-	}
-	sd, err := windows.GetNamedSecurityInfo(
-		path,
-		windows.SE_FILE_OBJECT,
-		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION,
-	)
-	if err != nil || sd == nil {
-		return false
-	}
-	if !IsSecureSystemAncestorDirDescriptor(attrs, sd) {
-		return false
-	}
-	attrsAfter, ok := GetFileAttributesNoFollow(path)
-	return ok && EvaluateAttributes(attrsAfter, true)
+	return IsSecureSystemAncestorDirByHandle(path)
 }
 
 // NewOwnerOnlyACL creates a DACL containing only GENERIC_ALL entries for
@@ -356,55 +325,17 @@ func NewOwnerOnlySecurityDescriptor(currSID *windows.SID, inheritance uint32) (*
 	return selfRel, nil
 }
 
-// VerifyOwnerOnlyDirectory verifies that dirPath is a real directory (not a
-// reparse point or device), owned by a trusted principal, with a non-nil DACL
-// granting zero access bits to any untrusted principal. It never modifies
-// existing directory permissions.
+// VerifyOwnerOnlyDirectory verifies via an open no-follow handle that dirPath
+// (and its ancestor chain) is a real directory (not a reparse point or device),
+// owned by a trusted principal, with a non-nil DACL granting zero access bits
+// to any untrusted principal. It never modifies existing directory permissions.
 func VerifyOwnerOnlyDirectory(dirPath string, currSID *windows.SID) error {
-	attrs, ok := GetFileAttributesNoFollow(dirPath)
-	if !ok || !EvaluateAttributes(attrs, true) {
-		return fmt.Errorf("%w: %q is not a secure directory", ErrInsecureControlDir, dirPath)
-	}
-	sd, err := windows.GetNamedSecurityInfo(
-		dirPath,
-		windows.SE_FILE_OBJECT,
-		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION,
-	)
-	if err != nil {
-		return fmt.Errorf("%w: query directory security descriptor for %q failed: %w", ErrInsecureControlDir, dirPath, err)
-	}
-	if sd == nil {
-		return fmt.Errorf("%w: query directory security descriptor for %q returned nil", ErrInsecureControlDir, dirPath)
-	}
-	owner, _, err := sd.Owner()
-	if err != nil {
-		return fmt.Errorf("%w: query directory owner for %q failed: %w", ErrInsecureControlDir, dirPath, err)
-	}
-	if owner == nil {
-		return fmt.Errorf("%w: query directory owner for %q returned nil", ErrInsecureControlDir, dirPath)
-	}
-	ownerTrusted := IsTrustedPrincipalSID(owner, currSID)
-	dacl, _, err := sd.DACL()
-	if err != nil || dacl == nil {
-		return fmt.Errorf("%w: directory %q has missing or nil DACL", ErrInsecureControlDir, dirPath)
-	}
-	aces, ok := ParseACL(dacl, currSID)
-	if !ok {
-		return fmt.Errorf("%w: parse directory DACL for %q failed", ErrInsecureControlDir, dirPath)
-	}
-	if !EvaluateOwnerOnlyDirectorySecurity(attrs, ownerTrusted, true, aces) {
-		return fmt.Errorf("%w: directory %q permits untrusted local access", ErrInsecureControlDir, dirPath)
-	}
-	attrsAfter, ok := GetFileAttributesNoFollow(dirPath)
-	if !ok || !EvaluateAttributes(attrsAfter, true) {
-		return fmt.Errorf("%w: directory %q changed during verification", ErrInsecureControlDir, dirPath)
-	}
-	return nil
+	return VerifyOwnerOnlyDirectoryByHandle(dirPath, currSID)
 }
 
 // EnsureOwnerOnlyDirectory creates any missing leaf directories under dirPath
 // with a protected owner-only DACL (current user + SYSTEM, no inheritance) and
-// verifies that dirPath satisfies VerifyOwnerOnlyDirectory. Existing
+// verifies that dirPath satisfies VerifyOwnerOnlyDirectoryByHandle. Existing
 // directories with overly permissive ACLs are rejected fail-closed without
 // modifying their permissions.
 func EnsureOwnerOnlyDirectory(dirPath string) error {
@@ -426,16 +357,20 @@ func EnsureOwnerOnlyDirectory(dirPath string) error {
 		return fmt.Errorf("query current Windows user SID failed: %w", err)
 	}
 
-	// Find missing trailing directories from absDir upward.
+	// Find missing trailing directories from absDir upward via no-follow handles.
 	var toCreate []string
 	cur := absDir
 	for {
-		attrs, ok := GetFileAttributesNoFollow(cur)
-		if ok {
+		h, attrs, openErr := OpenObjectHandleNoFollow(cur, windows.FILE_READ_ATTRIBUTES)
+		if openErr == nil {
+			_ = windows.CloseHandle(h)
 			if !EvaluateAttributes(attrs, true) {
 				return fmt.Errorf("%w: ancestor %q is not a secure directory", ErrInsecureControlDir, cur)
 			}
 			break
+		}
+		if !errors.Is(openErr, os.ErrNotExist) && !errors.Is(openErr, windows.ERROR_FILE_NOT_FOUND) && !errors.Is(openErr, windows.ERROR_PATH_NOT_FOUND) {
+			return fmt.Errorf("%w: inspect ancestor %q failed: %w", ErrInsecureControlDir, cur, openErr)
 		}
 		parent := filepath.Dir(cur)
 		if parent == cur {
@@ -465,93 +400,31 @@ func EnsureOwnerOnlyDirectory(dirPath string) error {
 			if createErr != nil && !errors.Is(createErr, windows.ERROR_ALREADY_EXISTS) {
 				return fmt.Errorf("create control socket directory %q failed: %w", dir, createErr)
 			}
-			// Verify every created or concurrently-existing directory level so a
-			// raced intermediate directory with weak ACLs is rejected fail-closed.
-			if err := VerifyOwnerOnlyDirectory(dir, currSID); err != nil {
+			// Verify every created or concurrently-existing directory level via handle
+			// so a raced intermediate directory with weak ACLs is rejected fail-closed.
+			if err := VerifyOwnerOnlyDirectoryByHandle(dir, currSID); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 
-	return VerifyOwnerOnlyDirectory(absDir, currSID)
+	return VerifyOwnerOnlyDirectoryByHandle(absDir, currSID)
 }
 
 // HardenFileOwnerOnly applies a protected owner-only DACL (current user +
-// SYSTEM, no inherited ACEs) to path as defense-in-depth.
+// SYSTEM, no inherited ACEs) to path using a no-follow handle and
+// SetSecurityInfo, rejecting symlinks, junctions, directories, and devices.
 func HardenFileOwnerOnly(path string) error {
-	currSID, err := CurrentProcessUserSID()
-	if err != nil {
-		return fmt.Errorf("query current Windows user SID failed: %w", err)
-	}
-	dacl, err := NewOwnerOnlyACL(currSID, windows.NO_INHERITANCE)
-	if err != nil {
-		return err
-	}
-	err = windows.SetNamedSecurityInfo(
-		path,
-		windows.SE_FILE_OBJECT,
-		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
-		nil,
-		nil,
-		dacl,
-		nil,
-	)
-	runtime.KeepAlive(dacl)
-	if err != nil {
-		return fmt.Errorf("set owner-only DACL on %q failed: %w", path, err)
-	}
-	return nil
+	return HardenObjectOwnerOnlyByHandle(path)
 }
 
-// VerifyOwnerOnlySocketFile verifies that socketPath is an AF_UNIX socket
-// (before and after reading its security descriptor, with matching file
-// identity to close symlink-swap TOCTOU), has a trusted owner, and has a
-// non-nil owner-only DACL permitting zero access bits for untrusted SIDs.
+// VerifyOwnerOnlySocketFile verifies via an open no-follow handle that
+// socketPath is an AF_UNIX socket reparse point (IO_REPARSE_TAG_AF_UNIX) with
+// a trusted owner and a non-nil owner-only DACL permitting zero access bits
+// for untrusted SIDs.
 func VerifyOwnerOnlySocketFile(socketPath string) error {
-	fiBefore, err := os.Lstat(socketPath)
-	if err != nil || fiBefore == nil || fiBefore.Mode()&os.ModeSocket == 0 {
-		return fmt.Errorf("%w: %q is not an AF_UNIX socket", ErrInsecureControlDir, socketPath)
-	}
-	currSID, err := CurrentProcessUserSID()
-	if err != nil {
-		return fmt.Errorf("query current Windows user SID failed: %w", err)
-	}
-	sd, err := windows.GetNamedSecurityInfo(
-		socketPath,
-		windows.SE_FILE_OBJECT,
-		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION,
-	)
-	if err != nil {
-		return fmt.Errorf("%w: query socket security descriptor for %q failed: %w", ErrInsecureControlDir, socketPath, err)
-	}
-	if sd == nil {
-		return fmt.Errorf("%w: query socket security descriptor for %q returned nil", ErrInsecureControlDir, socketPath)
-	}
-	owner, _, err := sd.Owner()
-	if err != nil {
-		return fmt.Errorf("%w: query socket owner for %q failed: %w", ErrInsecureControlDir, socketPath, err)
-	}
-	if owner == nil {
-		return fmt.Errorf("%w: query socket owner for %q returned nil", ErrInsecureControlDir, socketPath)
-	}
-	ownerTrusted := IsTrustedPrincipalSID(owner, currSID)
-	dacl, _, err := sd.DACL()
-	if err != nil || dacl == nil {
-		return fmt.Errorf("%w: socket %q has missing or nil DACL", ErrInsecureControlDir, socketPath)
-	}
-	aces, ok := ParseACL(dacl, currSID)
-	if !ok {
-		return fmt.Errorf("%w: parse socket DACL for %q failed", ErrInsecureControlDir, socketPath)
-	}
-	if !EvaluateOwnerOnlySocketSecurity(true, ownerTrusted, true, aces) {
-		return fmt.Errorf("%w: socket %q permits untrusted local access", ErrInsecureControlDir, socketPath)
-	}
-	fiAfter, err := os.Lstat(socketPath)
-	if err != nil || fiAfter == nil || fiAfter.Mode()&os.ModeSocket == 0 || !os.SameFile(fiBefore, fiAfter) {
-		return fmt.Errorf("%w: socket %q changed during verification", ErrInsecureControlDir, socketPath)
-	}
-	return nil
+	return VerifyOwnerOnlySocketByHandle(socketPath)
 }
 
 // VerifyAFUnixPeerCurrentUser queries the connected AF_UNIX peer PID via

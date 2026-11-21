@@ -5,6 +5,7 @@ package winsec
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -187,6 +188,82 @@ func HardenSocketOwnerOnlyByHandle(socketPath string) error {
 		return fmt.Errorf("%w: %q is not an AF_UNIX socket", ErrInsecureControlDir, socketPath)
 	}
 	return HardenFileOwnerOnlyByHandle(h)
+}
+
+// HardenObjectOwnerOnlyByHandle opens path without dereferencing reparse points,
+// verifies on the open handle that it is either a regular disk file (not a
+// reparse point, directory, or device) or an AF_UNIX socket reparse point, and
+// applies a protected owner-only DACL directly on that handle via SetSecurityInfo.
+// Symlinks, NTFS junctions, directories, and devices are rejected fail-closed.
+func HardenObjectOwnerOnlyByHandle(path string) error {
+	h, attrs, err := OpenObjectHandleNoFollow(path, windows.WRITE_DAC|windows.FILE_READ_ATTRIBUTES)
+	if err != nil {
+		return fmt.Errorf("open %q for owner-only DACL hardening failed: %w", path, err)
+	}
+	defer func() { _ = windows.CloseHandle(h) }()
+
+	if !EvaluateAttributes(attrs, false) {
+		isSock, tagErr := isAFUnixSocketHandle(h)
+		if tagErr != nil || !isSock {
+			return fmt.Errorf("%w: refusing to harden non-regular/reparse path %q", ErrInsecureControlDir, path)
+		}
+	}
+	return HardenFileOwnerOnlyByHandle(h)
+}
+
+// OpenSecureSystemSSHFileByHandle opens a regular SSH file (such as global
+// ssh_known_hosts) without following reparse points, verifies the ancestor
+// chain has no reparse points, optionally enforces system-global parent and
+// grandparent directory ACLs (verifyParentGlobal), and verifies the file's
+// own security descriptor on the opened handle via GetSecurityInfo before
+// returning an owned *os.File ready for reading.
+//
+// Ownership: on success the caller owns the returned *os.File and must Close it.
+func OpenSecureSystemSSHFileByHandle(path string, currSID *windows.SID, verifyParentGlobal bool) (*os.File, error) {
+	cleaned := filepath.Clean(strings.TrimSpace(path))
+	if cleaned == "" || !filepath.IsAbs(cleaned) {
+		return nil, fmt.Errorf("%w: global SSH file path %q must be absolute", ErrInsecureControlDir, path)
+	}
+	if err := VerifyAncestorChainNoReparse(cleaned); err != nil {
+		return nil, err
+	}
+	if verifyParentGlobal {
+		parentDir := filepath.Dir(cleaned)
+		if parentDir == "" || parentDir == cleaned {
+			return nil, fmt.Errorf("%w: invalid parent directory for %q", ErrInsecureControlDir, path)
+		}
+		if grandParent := filepath.Dir(parentDir); grandParent != "" && grandParent != parentDir {
+			if !IsSecureSystemAncestorDirByHandle(grandParent) {
+				return nil, fmt.Errorf("%w: insecure ancestor directory %q", ErrInsecureControlDir, grandParent)
+			}
+		}
+		if !IsSecureSystemSSHObjectByHandle(parentDir, true, nil) {
+			return nil, fmt.Errorf("%w: insecure parent directory %q", ErrInsecureControlDir, parentDir)
+		}
+	}
+
+	h, attrs, err := OpenObjectHandleNoFollow(cleaned, windows.GENERIC_READ|windows.READ_CONTROL)
+	if err != nil {
+		return nil, err
+	}
+	if !EvaluateAttributes(attrs, false) {
+		_ = windows.CloseHandle(h)
+		return nil, fmt.Errorf("%w: %q is not a regular non-reparse file", ErrInsecureControlDir, path)
+	}
+	sd, sdErr := GetSecurityInfoByHandle(h)
+	if sdErr != nil || !IsSecureSecurityDescriptor(attrs, false, sd, currSID) {
+		_ = windows.CloseHandle(h)
+		if sdErr != nil {
+			return nil, fmt.Errorf("%w: query security descriptor for %q: %w", ErrInsecureControlDir, path, sdErr)
+		}
+		return nil, fmt.Errorf("%w: %q fails ACL verification", ErrInsecureControlDir, path)
+	}
+	f := os.NewFile(uintptr(h), path)
+	if f == nil {
+		_ = windows.CloseHandle(h)
+		return nil, fmt.Errorf("os.NewFile returned nil for %q", path)
+	}
+	return f, nil
 }
 
 // VerifyOwnerOnlyDirectoryByHandle verifies dirPath strictly through an open
