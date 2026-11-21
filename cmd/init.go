@@ -8,11 +8,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
-	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/core/fsx"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 )
@@ -182,90 +181,52 @@ type namedOpenSSHReader struct {
 
 func (r namedOpenSSHReader) Name() string { return r.name }
 
-func isInitDevNull(path string, info os.FileInfo) bool {
-	cleaned := filepath.Clean(path)
-	if cleaned == os.DevNull {
-		return true
-	}
-	if runtime.GOOS == "windows" {
-		if strings.EqualFold(cleaned, os.DevNull) || strings.EqualFold(path, `\\.\`+os.DevNull) {
-			return true
-		}
-	}
-	if info != nil {
-		if devNullInfo, err := os.Stat(os.DevNull); err == nil && os.SameFile(info, devNullInfo) {
-			return true
-		}
-	}
-	return false
-}
-
 func loadOpenSSHHosts(path, defaultUser string) ([]config.OpenSSHHost, error) {
 	return loadOpenSSHHostsWithLimit(path, defaultUser, maxInitOpenSSHConfigBytes)
 }
 
 func loadOpenSSHHostsWithLimit(path, defaultUser string, maxBytes int64) (hosts []config.OpenSSHHost, err error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil, fmt.Errorf("open openssh configuration %q: %w", path, err)
-	}
-	if isInitDevNull(path, info) {
-		return nil, nil
-	}
-	if info.IsDir() {
-		return nil, fmt.Errorf("openssh configuration %q is a directory, expected a regular file", path)
-	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("openssh configuration %q must be a regular file", path)
-	}
-	if maxBytes > 0 && info.Size() > maxBytes {
-		return nil, fmt.Errorf("openssh configuration %q exceeds maximum size of %d bytes", path, maxBytes)
-	}
-
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("open openssh configuration %q: %w", path, err)
+	// OpenSSH follows symlinks for ~/.ssh/config and allows /dev/null as an
+	// empty config; fsx.OpenRegular opens handle-first without Stat-then-Open.
+	rf, openErr := fsx.OpenRegular(path, fsx.Limits{MaxBytes: maxBytes}, fsx.AllowDevNull(), fsx.FollowSymlinks())
+	if openErr != nil {
+		return nil, formatInitOpenSSHOpenError(path, maxBytes, openErr)
 	}
 	defer func() {
-		if closeErr := f.Close(); closeErr != nil {
+		if closeErr := rf.Close(); closeErr != nil {
 			err = errors.Join(err, fmt.Errorf("close openssh configuration %q: %w", path, closeErr))
 		}
 	}()
-
-	fdInfo, err := f.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("stat openssh configuration %q: %w", path, err)
-	}
-	if isInitDevNull(path, fdInfo) {
+	if rf.IsDevNull() {
 		return nil, nil
 	}
-	if fdInfo.IsDir() {
-		return nil, fmt.Errorf("openssh configuration %q is a directory, expected a regular file", path)
-	}
-	if !fdInfo.Mode().IsRegular() {
-		return nil, fmt.Errorf("openssh configuration %q must be a regular file", path)
-	}
-	if maxBytes > 0 && fdInfo.Size() > maxBytes {
-		return nil, fmt.Errorf("openssh configuration %q exceeds maximum size of %d bytes", path, maxBytes)
+	data, readErr := rf.ReadAll()
+	if readErr != nil {
+		if errors.Is(readErr, fsx.ErrTooLarge) {
+			return nil, fmt.Errorf("openssh configuration %q exceeds maximum size of %d bytes: %w", path, maxBytes, readErr)
+		}
+		return nil, fmt.Errorf("read openssh configuration %q: %w", path, readErr)
 	}
 
-	var reader io.Reader = f
-	if maxBytes > 0 {
-		reader = io.LimitReader(f, maxBytes+1)
-	}
-	data, err := io.ReadAll(reader)
-	if err != nil {
-		return nil, fmt.Errorf("read openssh configuration %q: %w", path, err)
-	}
-	if maxBytes > 0 && int64(len(data)) > maxBytes {
-		return nil, fmt.Errorf("openssh configuration %q exceeds maximum size of %d bytes", path, maxBytes)
-	}
-
-	hosts, err = config.ParseOpenSSHHosts(namedOpenSSHReader{Reader: bytes.NewReader(data), name: f.Name()}, defaultUser)
+	hosts, err = config.ParseOpenSSHHosts(namedOpenSSHReader{Reader: bytes.NewReader(data), name: rf.Name()}, defaultUser)
 	if err != nil {
 		return nil, fmt.Errorf("load openssh configuration %q: %w", path, err)
 	}
 	return hosts, nil
+}
+
+func formatInitOpenSSHOpenError(path string, maxBytes int64, err error) error {
+	if errors.Is(err, fsx.ErrTooLarge) {
+		return fmt.Errorf("openssh configuration %q exceeds maximum size of %d bytes: %w", path, maxBytes, err)
+	}
+	if errors.Is(err, fsx.ErrNonRegular) {
+		// Post-rejection diagnostic only (handle open already failed closed).
+		if info, statErr := os.Stat(path); statErr == nil && info.IsDir() {
+			return fmt.Errorf("openssh configuration %q is a directory, expected a regular file: %w", path, err)
+		}
+		return fmt.Errorf("openssh configuration %q must be a regular file: %w", path, err)
+	}
+	return fmt.Errorf("open openssh configuration %q: %w", path, err)
 }
 
 func defaultSSHConfigPath() string {

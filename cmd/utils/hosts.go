@@ -9,64 +9,34 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/wentf9/xops-cli/core/fsx"
 )
 
 const maxHostFileBytes int64 = 16 * 1024 * 1024 // 16 MiB
 
-func readBoundedRegularFile(path, label string, maxBytes int64) (data []byte, retErr error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("%s %q not found: %w", label, path, err)
+func readBoundedHostListFile(path, label string, maxBytes int64) ([]byte, error) {
+	// User CLI input files (--host-file / --csv) follow symlinks like standard
+	// POSIX tools while fsx.ReadAllBounded opens handle-first without
+	// Stat-then-Open and rejects directories, FIFOs, devices, and oversized files.
+	data, err := fsx.ReadAllBounded(path, fsx.Limits{MaxBytes: maxBytes}, fsx.FollowSymlinks())
+	if err == nil {
+		return data, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("%s %q not found: %w", label, path, err)
+	}
+	if errors.Is(err, fsx.ErrTooLarge) {
+		return nil, fmt.Errorf("%s %q exceeds maximum size of %d bytes: %w", label, path, maxBytes, err)
+	}
+	if errors.Is(err, fsx.ErrNonRegular) {
+		// Post-rejection diagnostic only (handle open already failed closed).
+		if info, statErr := os.Stat(path); statErr == nil && info.IsDir() {
+			return nil, fmt.Errorf("%s %q is a directory, expected a regular file: %w", label, path, err)
 		}
-		return nil, fmt.Errorf("stat %s %q failed: %w", label, path, err)
+		return nil, fmt.Errorf("%s %q must be a regular file: %w", label, path, err)
 	}
-	if info.IsDir() {
-		return nil, fmt.Errorf("%s %q is a directory, expected a regular file", label, path)
-	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s %q must be a regular file", label, path)
-	}
-	if maxBytes > 0 && info.Size() > maxBytes {
-		return nil, fmt.Errorf("%s %q exceeds maximum size of %d bytes", label, path, maxBytes)
-	}
-
-	file, err := os.Open(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("%s %q not found: %w", label, path, err)
-		}
-		return nil, fmt.Errorf("open %s %q failed: %w", label, path, err)
-	}
-	defer func() {
-		if closeErr := file.Close(); closeErr != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("close %s %q failed: %w", label, path, closeErr))
-		}
-	}()
-
-	fdInfo, err := file.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("stat %s %q failed: %w", label, path, err)
-	}
-	if fdInfo.IsDir() {
-		return nil, fmt.Errorf("%s %q is a directory, expected a regular file", label, path)
-	}
-	if !fdInfo.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s %q must be a regular file", label, path)
-	}
-
-	var reader io.Reader = file
-	if maxBytes > 0 {
-		reader = io.LimitReader(file, maxBytes+1)
-	}
-	data, err = io.ReadAll(reader)
-	if err != nil {
-		return nil, fmt.Errorf("read %s %q failed: %w", label, path, err)
-	}
-	if maxBytes > 0 && int64(len(data)) > maxBytes {
-		return nil, fmt.Errorf("%s %q exceeds maximum size of %d bytes", label, path, maxBytes)
-	}
-	return data, nil
+	return nil, fmt.Errorf("read %s %q failed: %w", label, path, err)
 }
 
 // HostInfo 存储从CSV或参数中解析出的主机信息
@@ -90,7 +60,7 @@ func ReadCSVFile(path string) (hosts []HostInfo, err error) {
 		path = filepath.Join(wd, path)
 	}
 
-	data, err := readBoundedRegularFile(path, "csv file", maxHostFileBytes)
+	data, err := readBoundedHostListFile(path, "csv file", maxHostFileBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -155,7 +125,7 @@ func ParseHosts(ip, hostFile, csvFile string) ([]HostInfo, error) {
 				hosts = append(hosts, strings.TrimSpace(p))
 			}
 		} else if hostFile != "" {
-			file, err := readBoundedRegularFile(hostFile, "host file", maxHostFileBytes)
+			file, err := readBoundedHostListFile(hostFile, "host file", maxHostFileBytes)
 			if err != nil {
 				return nil, fmt.Errorf("read host file %s failed: %w", hostFile, err)
 			}

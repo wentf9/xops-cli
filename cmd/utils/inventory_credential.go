@@ -4,11 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 
 	coreauth "github.com/wentf9/xops-cli/core/auth"
+	"github.com/wentf9/xops-cli/core/fsx"
 	coreSSH "github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
@@ -166,54 +166,6 @@ func validateInventoryCredentialStore(cfg *config.CredentialConfig) error {
 
 const maxPrivateKeyCheckBytes = 1 << 20 // 1 MiB
 
-// readBoundedPrivateKeyFile rejects non-regular files (such as FIFOs or
-// character devices like /dev/zero) both before and after opening, and bounds
-// the read to maxBytes so malicious or special key paths cannot hang or OOM.
-func readBoundedPrivateKeyFile(path string, maxBytes int64) (data []byte, retErr error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil, fmt.Errorf("inspect private key: %w", err)
-	}
-	if err := validatePrivateKeyFileInfo(info, maxBytes); err != nil {
-		return nil, err
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("open private key: %w", err)
-	}
-	defer func() {
-		if closeErr := file.Close(); closeErr != nil {
-			clear(data)
-			data = nil
-			retErr = errors.Join(retErr, fmt.Errorf("close private key: %w", closeErr))
-		}
-	}()
-	openInfo, err := file.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("inspect opened private key: %w", err)
-	}
-	if err := validatePrivateKeyFileInfo(openInfo, maxBytes); err != nil {
-		return nil, err
-	}
-	data, err = io.ReadAll(io.LimitReader(file, maxBytes+1))
-	if err != nil {
-		clear(data)
-		return nil, fmt.Errorf("read private key: %w", err)
-	}
-	if int64(len(data)) > maxBytes {
-		clear(data)
-		return nil, fmt.Errorf("private key target exceeds %d bytes", maxBytes)
-	}
-	return data, nil
-}
-
-func validatePrivateKeyFileInfo(info os.FileInfo, maxBytes int64) error {
-	if !info.Mode().IsRegular() || info.Size() > maxBytes {
-		return fmt.Errorf("private key target must be a regular file no larger than %d bytes", maxBytes)
-	}
-	return nil
-}
-
 // Never discard a passphrase reference until the replacement key is known to
 // work without one. Template paths (%tokens, ${VAR}) and "none" do not denote a
 // concrete static on-disk file and skip local file parsing.
@@ -232,7 +184,9 @@ func validateUnencryptedKey(path string) error {
 	if resolved == "" {
 		return fmt.Errorf("replacement private key path %q cannot be resolved to a local file", setting.Raw)
 	}
-	data, err := readBoundedPrivateKeyFile(resolved, maxPrivateKeyCheckBytes)
+	// OpenSSH follows symlinks for user private keys; fsx.ReadAllBounded opens
+	// handle-first without Stat-then-Open and rejects FIFOs/devices/oversize.
+	data, err := fsx.ReadAllBounded(resolved, fsx.Limits{MaxBytes: maxPrivateKeyCheckBytes}, fsx.FollowSymlinks())
 	if err != nil {
 		return fmt.Errorf("read replacement private key: %w", err)
 	}
@@ -257,7 +211,9 @@ func KeyNeedsPassphrase(path string) (bool, error) {
 	if resolved == "" {
 		return false, fmt.Errorf("private key path %q cannot be resolved to a local file", setting.Raw)
 	}
-	data, err := readBoundedPrivateKeyFile(resolved, maxPrivateKeyCheckBytes)
+	// OpenSSH follows symlinks for user private keys; fsx.ReadAllBounded opens
+	// handle-first without Stat-then-Open and rejects FIFOs/devices/oversize.
+	data, err := fsx.ReadAllBounded(resolved, fsx.Limits{MaxBytes: maxPrivateKeyCheckBytes}, fsx.FollowSymlinks())
 	if err != nil {
 		return false, err
 	}

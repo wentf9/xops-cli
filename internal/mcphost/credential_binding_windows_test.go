@@ -7,70 +7,43 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/wentf9/xops-cli/core/fsx"
 	"golang.org/x/sys/windows"
 )
 
-func TestFixLongPathWindows(t *testing.T) {
-	shortPath := `C:\certs\client.crt`
-	if got := fixLongPathWindows(shortPath); got != shortPath {
-		t.Fatalf("short path modified: got %q, want %q", got, shortPath)
-	}
-
-	alreadyExtended := `\\?\` + strings.Repeat("a", 260) + `\client.crt`
-	if got := fixLongPathWindows(alreadyExtended); got != alreadyExtended {
-		t.Fatalf("extended path modified: got %q, want %q", got, alreadyExtended)
-	}
-
-	longDrivePath := `C:\` + strings.Repeat(`dir\`, 70) + `client.crt`
-	gotLong := fixLongPathWindows(longDrivePath)
-	if !strings.HasPrefix(gotLong, `\\?\`) {
-		t.Fatalf("long drive path %q did not receive \\\\?\\ prefix: got %q", longDrivePath, gotLong)
-	}
-
-	longUNCPath := `\\server\share\` + strings.Repeat(`dir\`, 70) + `client.crt`
-	gotUNC := fixLongPathWindows(longUNCPath)
-	if !strings.HasPrefix(gotUNC, `\\?\UNC\server\share\`) {
-		t.Fatalf("long UNC path %q did not receive \\\\?\\UNC\\ prefix: got %q", longUNCPath, gotUNC)
-	}
-}
-
-func TestOpenRegularCertFile_LongPathAndDirectoryWindows(t *testing.T) {
+func TestInspectCertificateBinding_LongPathAndDirectoryWindows(t *testing.T) {
 	base := t.TempDir()
 	// Create a nested path exceeding MAX_PATH (260 chars).
 	nested := base
 	for len(nested) < 265 {
 		nested = filepath.Join(nested, strings.Repeat("d", 32))
 	}
-	if err := os.MkdirAll(fixLongPathWindows(nested), 0o700); err != nil {
+	longNested := `\\?\` + nested
+	if err := os.MkdirAll(longNested, 0o700); err != nil {
 		t.Fatalf("MkdirAll long path: %v", err)
 	}
 
 	certPath := filepath.Join(nested, "cert.pem")
-	if err := os.WriteFile(fixLongPathWindows(certPath), []byte("test-cert"), 0o600); err != nil {
+	if err := os.WriteFile(`\\?\`+certPath, []byte("test-cert"), 0o600); err != nil {
 		t.Fatalf("WriteFile long path: %v", err)
 	}
 
-	f, info, nonReg, err := openRegularCertFile(certPath)
-	if err != nil || nonReg || f == nil || info == nil {
-		if f != nil {
-			_ = f.Close()
-		}
-		t.Fatalf("openRegularCertFile(long regular file) = (file=%v, info=%v, nonReg=%v, err=%v)", f != nil, info != nil, nonReg, err)
+	rf, err := fsx.OpenRegular(certPath, fsx.Limits{MaxBytes: math.MaxInt64}, fsx.FollowSymlinks())
+	if err != nil || rf == nil {
+		t.Fatalf("fsx.OpenRegular(long regular file) = (%v, %v)", rf, err)
 	}
-	_ = f.Close()
+	_ = rf.Close()
 
 	// Directory must be flagged as non-regular without dereferencing errors.
-	dirFile, _, dirNonReg, dirErr := openRegularCertFile(base)
-	if dirFile != nil {
-		_ = dirFile.Close()
-	}
-	if !dirNonReg || dirErr == nil {
-		t.Fatalf("openRegularCertFile(directory) = (file=%v, nonReg=%v, err=%v), want nonReg=true and error", dirFile != nil, dirNonReg, dirErr)
+	binding, admitted, ok := inspectCertificateBindingWithRaw(base, true)
+	if !ok || !binding.NonRegular || !admitted.NonRegular {
+		t.Fatalf("inspectCertificateBindingWithRaw(directory) = (%+v, %+v, %v), want NonRegular=true", binding, admitted, ok)
 	}
 }
 
@@ -93,7 +66,7 @@ func createTestNamedPipe(t *testing.T, pipeName string, openMode uint32) windows
 	return h
 }
 
-func TestProbeZeroAccessSQOS_NamedPipeNonRegular(t *testing.T) {
+func TestInspectCertificateBinding_NamedPipeNonRegularWindows(t *testing.T) {
 	var nonce [6]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		t.Fatalf("rand.Read: %v", err)
@@ -103,12 +76,9 @@ func TestProbeZeroAccessSQOS_NamedPipeNonRegular(t *testing.T) {
 	t.Run("DUPLEX_AvailableSlot", func(t *testing.T) {
 		pipeName := basePipe + "-duplex-avail"
 		createTestNamedPipe(t, pipeName, windows.PIPE_ACCESS_DUPLEX)
-		f, _, nonReg, openErr := openRegularCertFile(pipeName)
-		if f != nil {
-			_ = f.Close()
-		}
-		if !nonReg || openErr != nil {
-			t.Fatalf("openRegularCertFile(available duplex pipe) = (nonReg=%v, err=%v), want nonReg=true and err=nil", nonReg, openErr)
+		binding, admitted, ok := inspectCertificateBindingWithRaw(pipeName, true)
+		if !ok || !binding.NonRegular || !admitted.NonRegular {
+			t.Fatalf("inspectCertificateBindingWithRaw(available duplex pipe) = (%+v, %+v, %v), want NonRegular=true", binding, admitted, ok)
 		}
 	})
 
@@ -125,69 +95,28 @@ func TestProbeZeroAccessSQOS_NamedPipeNonRegular(t *testing.T) {
 		}
 		defer func() { _ = windows.CloseHandle(clientHandle) }()
 
-		f, _, nonReg, openErr := openRegularCertFile(pipeName)
-		if f != nil {
-			_ = f.Close()
+		rf, openErr := fsx.OpenRegular(pipeName, fsx.Limits{MaxBytes: math.MaxInt64}, fsx.FollowSymlinks())
+		if rf != nil {
+			_ = rf.Close()
 		}
-		if !nonReg || !errors.Is(openErr, windows.ERROR_PIPE_BUSY) {
-			t.Fatalf("openRegularCertFile(busy duplex pipe) = (nonReg=%v, err=%v), want nonReg=true and ERROR_PIPE_BUSY", nonReg, openErr)
+		if !errors.Is(openErr, fsx.ErrNonRegular) || !errors.Is(openErr, windows.ERROR_PIPE_BUSY) {
+			t.Fatalf("fsx.OpenRegular(busy duplex pipe) = %v, want ErrNonRegular wrapping ERROR_PIPE_BUSY", openErr)
 		}
 	})
 
-	t.Run("INBOUND_AccessDenied_SQOSProbe", func(t *testing.T) {
+	t.Run("INBOUND_AccessDenied_FailClosed", func(t *testing.T) {
 		pipeName := basePipe + "-inbound-denied"
 		createTestNamedPipe(t, pipeName, windows.PIPE_ACCESS_INBOUND)
-		f, _, nonReg, openErr := openRegularCertFile(pipeName)
-		if f != nil {
-			_ = f.Close()
+		rf, openErr := fsx.OpenRegular(pipeName, fsx.Limits{MaxBytes: math.MaxInt64}, fsx.FollowSymlinks())
+		if rf != nil {
+			_ = rf.Close()
 		}
-		if !nonReg || !errors.Is(openErr, windows.ERROR_ACCESS_DENIED) {
-			t.Fatalf("openRegularCertFile(inbound pipe) = (nonReg=%v, err=%v), want nonReg=true and ERROR_ACCESS_DENIED", nonReg, openErr)
+		if !errors.Is(openErr, windows.ERROR_ACCESS_DENIED) {
+			t.Fatalf("fsx.OpenRegular(inbound pipe) = %v, want ERROR_ACCESS_DENIED", openErr)
+		}
+		keyBinding, admitted, ok := inspectKeyFileBinding(pipeName, true)
+		if !ok || !keyBinding.Unreadable || admitted.SHA256 != "" {
+			t.Fatalf("inspectKeyFileBinding(inbound pipe) = (%+v, %+v, %v), want Unreadable fail-closed", keyBinding, admitted, ok)
 		}
 	})
-}
-
-func pickUnusedDriveLetterForTest(t *testing.T) string {
-	t.Helper()
-	wdVol := ""
-	if wd, err := os.Getwd(); err == nil {
-		wdVol = strings.ToUpper(filepath.VolumeName(wd))
-	}
-	for ch := byte('Z'); ch >= 'D'; ch-- {
-		drive := string(ch) + ":"
-		if drive == wdVol {
-			continue
-		}
-		if _, exists := os.LookupEnv("=" + drive); exists {
-			continue
-		}
-		return drive
-	}
-	t.Skip("no unused drive letter available without existing =X: environment mapping")
-	return ""
-}
-
-func TestFixLongPathWindows_DriveRelative(t *testing.T) {
-	drive := pickUnusedDriveLetterForTest(t)
-	t.Setenv("="+drive, drive+`\short`)
-	if got := fixLongPathWindows(drive + `cert.pub`); got != drive+`cert.pub` {
-		t.Fatalf("fixLongPathWindows(short drive-relative) = %q, want %q", got, drive+`cert.pub`)
-	}
-
-	longDir := drive + `\` + strings.Repeat("d", 240)
-	t.Setenv("="+drive, longDir)
-	got := fixLongPathWindows(drive + `cert.pub`)
-	want := `\\?\` + longDir + `\cert.pub`
-	if got != want {
-		t.Fatalf("fixLongPathWindows(long drive-relative) = %q, want %q", got, want)
-	}
-}
-
-func TestIsExtendedOrDeviceWindowsPath_RejectsForwardSlashNTPrefix(t *testing.T) {
-	if isExtendedOrDeviceWindowsPath("/??/C:/Users/alice/cert.pem") {
-		t.Fatal("forward-slash /??/ must not be treated as a Win32 NT device prefix")
-	}
-	if !isExtendedOrDeviceWindowsPath(`\??\C:\Users\alice\cert.pem`) {
-		t.Fatal(`backslash \??\ must be recognized as an NT device prefix`)
-	}
 }

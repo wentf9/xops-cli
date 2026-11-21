@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 
+	"github.com/wentf9/xops-cli/core/fsx"
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/internal/sshenv"
 	"github.com/wentf9/xops-cli/pkg/config"
@@ -224,24 +226,28 @@ func inspectCertificateBinding(certPath string, includeMissing bool) (certificat
 
 func inspectCertificateBindingWithRaw(certPath string, includeMissing bool) (certificateFileBinding, ssh.AdmittedCertificate, bool) {
 	cleanPath := filepath.Clean(filepath.FromSlash(certPath))
-	f, _, nonRegular, err := openRegularCertFile(certPath)
-	if nonRegular {
+	// OpenSSH follows symlinks for user certificate files (e.g. rotated certs);
+	// fsx.OpenRegular opens handle-first without blocking on FIFOs/pipes and
+	// rejects non-regular targets with fsx.ErrNonRegular. MaxInt64 lets the
+	// bounded LimitReader below compute a truncated digest for oversized files.
+	rf, err := fsx.OpenRegular(certPath, fsx.Limits{MaxBytes: math.MaxInt64}, fsx.FollowSymlinks())
+	if errors.Is(err, fsx.ErrNonRegular) {
 		if includeMissing {
 			return certificateFileBinding{Path: certPath, NonRegular: true},
 				ssh.AdmittedCertificate{Path: cleanPath, NonRegular: true}, true
 		}
 		return certificateFileBinding{}, ssh.AdmittedCertificate{}, false
 	}
-	if err != nil || f == nil {
+	if err != nil || rf == nil {
 		if includeMissing {
 			return certificateFileBinding{Path: certPath, Missing: true},
 				ssh.AdmittedCertificate{Path: cleanPath, Missing: true}, true
 		}
 		return certificateFileBinding{}, ssh.AdmittedCertificate{}, false
 	}
-	defer func() { _ = f.Close() }()
+	defer func() { _ = rf.Close() }()
 
-	data, err := io.ReadAll(io.LimitReader(f, maxMCPCertBindingBytes+1))
+	data, err := io.ReadAll(io.LimitReader(rf, maxMCPCertBindingBytes+1))
 	if err != nil {
 		if includeMissing {
 			return certificateFileBinding{Path: certPath, Missing: true},
@@ -289,15 +295,18 @@ func inspectCertificateBindingWithRaw(certPath string, includeMissing bool) (cer
 
 func inspectKeyFileBinding(keyPath string, includeMissing bool) (keyFileBinding, ssh.AdmittedKeyDigest, bool) {
 	cleanPath := filepath.Clean(filepath.FromSlash(keyPath))
-	f, _, nonRegular, err := openRegularCertFile(keyPath)
-	if nonRegular {
+	// OpenSSH follows symlinks for user private keys; fsx.OpenRegular opens
+	// handle-first without Stat-then-Open or FIFO blocking, while MaxInt64 lets
+	// LimitReader below record a truncated digest on oversized regular files.
+	rf, err := fsx.OpenRegular(keyPath, fsx.Limits{MaxBytes: math.MaxInt64}, fsx.FollowSymlinks())
+	if errors.Is(err, fsx.ErrNonRegular) {
 		if includeMissing {
 			return keyFileBinding{Path: cleanPath, NonRegular: true},
 				ssh.AdmittedKeyDigest{Path: cleanPath, NonRegular: true}, true
 		}
 		return keyFileBinding{}, ssh.AdmittedKeyDigest{}, false
 	}
-	if err != nil || f == nil {
+	if err != nil || rf == nil {
 		if !includeMissing {
 			return keyFileBinding{}, ssh.AdmittedKeyDigest{}, false
 		}
@@ -311,12 +320,12 @@ func inspectKeyFileBinding(keyPath string, includeMissing bool) (keyFileBinding,
 		return keyFileBinding{Path: cleanPath, Unreadable: true},
 			ssh.AdmittedKeyDigest{Path: cleanPath}, true
 	}
-	defer func() { _ = f.Close() }()
+	defer func() { _ = rf.Close() }()
 
 	hasher := sha256.New()
 	var scratch [32 * 1024]byte
 	defer clear(scratch[:])
-	n, readErr := io.CopyBuffer(hasher, io.LimitReader(f, maxMCPKeyBindingBytes+1), scratch[:])
+	n, readErr := io.CopyBuffer(hasher, io.LimitReader(rf, maxMCPKeyBindingBytes+1), scratch[:])
 	if readErr != nil {
 		if !includeMissing {
 			return keyFileBinding{}, ssh.AdmittedKeyDigest{}, false
