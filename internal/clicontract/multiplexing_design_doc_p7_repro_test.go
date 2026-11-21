@@ -1,5 +1,3 @@
-//go:build p7repro
-
 package clicontract
 
 import (
@@ -10,10 +8,11 @@ import (
 	"testing"
 )
 
-// TestP7Repro_LOW4_MultiplexingDesignDocsNoLegacyChildEnvMarkers reproduces LOW-4:
-// docs/development/openssh-multiplexing-design.md and its English counterpart still
-// document legacy child env markers XOPS_CLI_SSH_MUX_DAEMON and XOPS_CLI_SSH_BG_CHILD,
-// which were replaced by pipe-FD spec flags (--mux-daemon-spec-fd / --bg-child-spec-fd).
+// TestP7Repro_LOW4_MultiplexingDesignDocsNoLegacyChildEnvMarkers verifies LOW-4:
+// docs/development/openssh-multiplexing-design.md and its English counterpart must
+// not document removed legacy child env markers XOPS_CLI_SSH_MUX_DAEMON or
+// XOPS_CLI_SSH_BG_CHILD, and must document the pipe-FD spec flags
+// (--mux-daemon-spec-fd and --bg-child-spec-fd).
 func TestP7Repro_LOW4_MultiplexingDesignDocsNoLegacyChildEnvMarkers(t *testing.T) {
 	t.Parallel()
 
@@ -27,6 +26,10 @@ func TestP7Repro_LOW4_MultiplexingDesignDocsNoLegacyChildEnvMarkers(t *testing.T
 		"XOPS_CLI_SSH_MUX_DAEMON",
 		"XOPS_CLI_SSH_BG_CHILD",
 	}
+	requiredFlags := []string{
+		"--mux-daemon-spec-fd",
+		"--bg-child-spec-fd",
+	}
 	docs := []string{
 		filepath.Join(repoRoot, "docs", "development", "openssh-multiplexing-design.md"),
 		filepath.Join(repoRoot, "docs", "en", "development", "openssh-multiplexing-design.md"),
@@ -39,11 +42,17 @@ func TestP7Repro_LOW4_MultiplexingDesignDocsNoLegacyChildEnvMarkers(t *testing.T
 			if err != nil {
 				t.Fatalf("read %s: %v", relPath, err)
 			}
-			for i, line := range strings.Split(string(raw), "\n") {
+			content := string(raw)
+			for i, line := range strings.Split(content, "\n") {
 				for _, marker := range legacyMarkers {
 					if strings.Contains(line, marker) {
 						t.Errorf("%s:%d: still mentions removed legacy child env marker %s", relPath, i+1, marker)
 					}
+				}
+			}
+			for _, flag := range requiredFlags {
+				if !strings.Contains(content, flag) {
+					t.Errorf("%s: missing required pipe-FD spec flag documentation %s", relPath, flag)
 				}
 			}
 		})
