@@ -154,25 +154,36 @@ func bindDirectControlSocket(targetPath string) (net.Listener, os.FileInfo, erro
 }
 
 func retryReplaceStaleSocketLink(tempPath, targetPath string) bool {
-	origFi, statErr := os.Lstat(targetPath)
-	if statErr != nil || !isControlSocketFileInfo(origFi) {
-		return false
-	}
-	probeConn, probeErr := net.DialTimeout("unix", targetPath, 200*time.Millisecond)
-	if probeErr == nil {
-		_ = probeConn.Close()
-		return false
-	}
-	if !isConnectionRefused(probeErr) {
-		return false
-	}
-	// Re-verify SameFile before unlinking so a concurrent new master is never clobbered.
-	currFi, currErr := os.Lstat(targetPath)
-	if currErr != nil || !isControlSocketFileInfo(currFi) || !os.SameFile(origFi, currFi) {
-		return false
-	}
-	_ = os.Remove(targetPath)
-	return os.Link(tempPath, targetPath) == nil
+	replaced := false
+	err := withControlSocketDirLock(targetPath, func() error {
+		// Fast path: if a concurrent process already unlinked the stale socket
+		// before we acquired the directory lock, link directly.
+		if linkErr := os.Link(tempPath, targetPath); linkErr == nil {
+			replaced = true
+			return nil
+		}
+		origFi, statErr := os.Lstat(targetPath)
+		if statErr != nil || !isControlSocketFileInfo(origFi) {
+			return nil
+		}
+		probeConn, probeErr := net.DialTimeout("unix", targetPath, 200*time.Millisecond)
+		if probeErr == nil {
+			_ = probeConn.Close()
+			return nil
+		}
+		if !isConnectionRefused(probeErr) {
+			return nil
+		}
+		// Re-verify SameFile before unlinking so a concurrent new master is never clobbered.
+		currFi, currErr := os.Lstat(targetPath)
+		if currErr != nil || !isControlSocketFileInfo(currFi) || !os.SameFile(origFi, currFi) {
+			return nil
+		}
+		_ = os.Remove(targetPath)
+		replaced = os.Link(tempPath, targetPath) == nil
+		return nil
+	})
+	return err == nil && replaced
 }
 
 func checkPeerUID(conn net.Conn, expectedUID uint32) error {

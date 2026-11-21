@@ -139,11 +139,56 @@ func (e ForwardEndpoint) String() string {
 	return net.JoinHostPort(e.Host, strconv.Itoa(int(e.Port)))
 }
 
+func isWindowsDrivePrefix(path string) bool {
+	return len(path) >= 3 && isASCIILetter(path[0]) && path[1] == ':' && (path[2] == '\\' || path[2] == '/')
+}
+
+func hasNonDriveColon(path string) bool {
+	start := 0
+	if isWindowsDrivePrefix(path) {
+		start = 2
+	}
+	return strings.IndexByte(path[start:], ':') >= 0
+}
+
+func isExplicitStreamLocalPath(tok string) bool {
+	return strings.HasPrefix(tok, "/") ||
+		strings.HasPrefix(tok, "./") ||
+		strings.HasPrefix(tok, "../") ||
+		strings.HasPrefix(tok, "~/") ||
+		strings.HasPrefix(tok, `.\`) ||
+		strings.HasPrefix(tok, `..\`) ||
+		strings.HasPrefix(tok, `~\`) ||
+		strings.HasPrefix(tok, `\`) ||
+		isWindowsDrivePrefix(tok)
+}
+
+func isFullyQuotedSingleToken(trimmed string) bool {
+	if len(trimmed) < 2 {
+		return false
+	}
+	quote := trimmed[0]
+	if quote != '"' && quote != '\'' {
+		return false
+	}
+	for i := 1; i < len(trimmed); {
+		if trimmed[i] == quote {
+			return i == len(trimmed)-1
+		}
+		if quote == '"' && trimmed[i] == '\\' && i+1 < len(trimmed) && (trimmed[i+1] == '"' || trimmed[i+1] == '\\') {
+			i += 2
+			continue
+		}
+		i++
+	}
+	return false
+}
+
 func needsStreamLocalQuoting(path string) bool {
 	if path == "" {
 		return false
 	}
-	if path[len(path)-1] == '\\' {
+	if path[len(path)-1] == '\\' || hasNonDriveColon(path) {
 		return true
 	}
 	for i := 0; i < len(path); i++ {
@@ -821,6 +866,19 @@ func parseColonForwardSpec4(raw string, parts []string) (ForwardSpec, error) {
 	}, nil
 }
 
+func buildDynamicUnixRemoteForward(path string) (ForwardSpec, error) {
+	if err := ValidateStreamLocalPathSyntax(path); err != nil {
+		return ForwardSpec{}, fmt.Errorf("invalid remote forward socket path %q: %w", path, err)
+	}
+	bindEp := ForwardEndpoint{SocketPath: path}
+	return ForwardSpec{
+		Bind:      bindEp,
+		IsDynamic: true,
+		BindAddr:  bindEp.SocketPath,
+		DestAddr:  "",
+	}, nil
+}
+
 // ParseRemoteForwardSpec parses a RemoteForward specification, supporting all two-endpoint
 // specifications accepted by ParseForwardSpec as well as single-endpoint reverse dynamic
 // port forwarding specifications (e.g. "1080", "127.0.0.1:1080", "*:1080", "/tmp/remote.sock").
@@ -842,76 +900,105 @@ func ParseRemoteForwardSpec(raw string) (ForwardSpec, error) {
 	if len(fields) == 2 {
 		return ParseForwardSpec(raw)
 	}
+	return parseSingleFieldRemoteForward(raw, trimmed, fields[0])
+}
 
-	parts, err := splitBracketAwareColons(fields[0])
+func parseSingleFieldRemoteForward(raw, trimmed, tok string) (ForwardSpec, error) {
+	if isUnixSocketToken(tok) && (isFullyQuotedSingleToken(trimmed) || !strings.ContainsRune(tok, ':')) {
+		return buildDynamicUnixRemoteForward(tok)
+	}
+
+	parts, err := splitBracketAwareColons(tok)
 	if err != nil {
+		if isExplicitStreamLocalPath(tok) {
+			return buildDynamicUnixRemoteForward(tok)
+		}
 		return ForwardSpec{}, fmt.Errorf("invalid remote forward specification %q: %w", raw, err)
 	}
 
 	switch len(parts) {
 	case 1:
-		if isUnixSocketToken(parts[0]) {
-			if err := ValidateStreamLocalPathSyntax(parts[0]); err != nil {
-				return ForwardSpec{}, fmt.Errorf("invalid remote forward socket path %q: %w", parts[0], err)
-			}
-			bindEp := ForwardEndpoint{SocketPath: parts[0]}
-			return ForwardSpec{
-				Bind:      bindEp,
-				IsDynamic: true,
-				BindAddr:  bindEp.SocketPath,
-				DestAddr:  "",
-			}, nil
-		}
-		port, err := parsePortNumber(parts[0], true)
-		if err != nil {
-			return ForwardSpec{}, fmt.Errorf("invalid remote forward port in %q: %w", raw, err)
-		}
-		bindEp := ForwardEndpoint{
-			Port:     port,
-			HasHost:  false,
-			Wildcard: false,
-		}
-		return ForwardSpec{
-			Bind:      bindEp,
-			IsDynamic: true,
-			BindAddr:  formatSpecBindAddr(bindEp),
-			DestAddr:  "",
-		}, nil
-
+		return parseRemoteForwardColon1(raw, parts[0])
 	case 2:
-		if isUnixSocketToken(parts[1]) {
-			return ParseForwardSpec(raw)
+		return parseRemoteForwardColon2(raw, tok, parts)
+	case 3:
+		if isExplicitStreamLocalPath(parts[0]) {
+			if spec, parseErr := ParseForwardSpec(raw); parseErr == nil {
+				return spec, nil
+			}
+			return buildDynamicUnixRemoteForward(tok)
 		}
-		if isUnixSocketToken(parts[0]) {
-			return ForwardSpec{}, fmt.Errorf("invalid remote forward specification %q: unix socket cannot have a port", raw)
-		}
-		port, err := parsePortNumber(parts[1], true)
-		if err != nil {
-			return ForwardSpec{}, fmt.Errorf("invalid remote forward port in %q: %w", raw, err)
-		}
-		host, wildcard, err := parseBindHostToken(parts[0])
-		if err != nil {
-			return ForwardSpec{}, fmt.Errorf("invalid remote forward bind host in %q: %w", raw, err)
-		}
-		bindEp := ForwardEndpoint{
-			Host:     host,
-			Port:     port,
-			HasHost:  true,
-			Wildcard: wildcard,
-		}
-		return ForwardSpec{
-			Bind:      bindEp,
-			IsDynamic: true,
-			BindAddr:  formatSpecBindAddr(bindEp),
-			DestAddr:  "",
-		}, nil
-
-	case 3, 4:
 		return ParseForwardSpec(raw)
-
+	case 4:
+		if isExplicitStreamLocalPath(parts[0]) {
+			return buildDynamicUnixRemoteForward(tok)
+		}
+		return ParseForwardSpec(raw)
 	default:
+		if isExplicitStreamLocalPath(parts[0]) {
+			return buildDynamicUnixRemoteForward(tok)
+		}
 		return ForwardSpec{}, fmt.Errorf("invalid remote forward specification %q", raw)
 	}
+}
+
+func parseRemoteForwardColon1(raw, token string) (ForwardSpec, error) {
+	if isUnixSocketToken(token) {
+		return buildDynamicUnixRemoteForward(token)
+	}
+	port, err := parsePortNumber(token, true)
+	if err != nil {
+		return ForwardSpec{}, fmt.Errorf("invalid remote forward port in %q: %w", raw, err)
+	}
+	bindEp := ForwardEndpoint{
+		Port:     port,
+		HasHost:  false,
+		Wildcard: false,
+	}
+	return ForwardSpec{
+		Bind:      bindEp,
+		IsDynamic: true,
+		BindAddr:  formatSpecBindAddr(bindEp),
+		DestAddr:  "",
+	}, nil
+}
+
+func parseRemoteForwardColon2(raw, tok string, parts []string) (ForwardSpec, error) {
+	if isExplicitStreamLocalPath(parts[0]) {
+		if isExplicitStreamLocalPath(parts[1]) {
+			return ParseForwardSpec(raw)
+		}
+		if _, portErr := parsePortNumber(parts[1], true); portErr == nil {
+			return ForwardSpec{}, fmt.Errorf("invalid remote forward specification %q: unix socket cannot have a port", raw)
+		}
+		return buildDynamicUnixRemoteForward(tok)
+	}
+	if isUnixSocketToken(parts[1]) {
+		return ParseForwardSpec(raw)
+	}
+	if isUnixSocketToken(parts[0]) {
+		return ForwardSpec{}, fmt.Errorf("invalid remote forward specification %q: unix socket cannot have a port", raw)
+	}
+	port, err := parsePortNumber(parts[1], true)
+	if err != nil {
+		return ForwardSpec{}, fmt.Errorf("invalid remote forward port in %q: %w", raw, err)
+	}
+	host, wildcard, err := parseBindHostToken(parts[0])
+	if err != nil {
+		return ForwardSpec{}, fmt.Errorf("invalid remote forward bind host in %q: %w", raw, err)
+	}
+	bindEp := ForwardEndpoint{
+		Host:     host,
+		Port:     port,
+		HasHost:  true,
+		Wildcard: wildcard,
+	}
+	return ForwardSpec{
+		Bind:      bindEp,
+		IsDynamic: true,
+		BindAddr:  formatSpecBindAddr(bindEp),
+		DestAddr:  "",
+	}, nil
 }
 
 // ParseDynamicForwardEndpoint parses a DynamicForward specification ("[bind_address:]port" or socket path)

@@ -12,6 +12,8 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -222,14 +224,14 @@ func (c *Connector) loadReadOnlyKnownHostsDB(cfg *ClientConfig) *knownHostsDB {
 
 	var userFiles []string
 	switch {
-	case strings.EqualFold(userKH, "none") || userKH == "/dev/null":
+	case strings.EqualFold(userKH, "none") || isKnownHostsDevNull(userKH):
 	case userKH != "":
 		for _, tokenPath := range strings.Fields(userKH) {
-			if strings.EqualFold(tokenPath, "none") || tokenPath == "/dev/null" {
+			if strings.EqualFold(tokenPath, "none") || isKnownHostsDevNull(tokenPath) {
 				continue
 			}
 			expanded, err := expandKnownHostsPath(tokenPath, c.environment, target)
-			if err != nil || expanded == "" || strings.EqualFold(expanded, "none") || expanded == "/dev/null" {
+			if err != nil || expanded == "" || strings.EqualFold(expanded, "none") || isKnownHostsDevNull(expanded) {
 				continue
 			}
 			if isReadableRegularFile(expanded) && !slices.Contains(userFiles, expanded) {
@@ -525,26 +527,152 @@ func wrapNilRemoteHostKeyCallback(cb cryptoSSH.HostKeyCallback) cryptoSSH.HostKe
 	}
 }
 
+const maxKnownHostsFileBytes int64 = 16 << 20 // 16 MiB
+
+func isKnownHostsDevNull(path string) bool {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return false
+	}
+	cleaned := filepath.Clean(trimmed)
+	if trimmed == "/dev/null" || cleaned == "/dev/null" || cleaned == os.DevNull {
+		return true
+	}
+	return runtime.GOOS == "windows" && strings.EqualFold(cleaned, os.DevNull)
+}
+
+type boundedKnownHostsReader struct {
+	r     io.Reader
+	limit int64
+	read  int64
+}
+
+func newBoundedKnownHostsReader(r io.Reader, limit int64) *boundedKnownHostsReader {
+	return &boundedKnownHostsReader{
+		r:     io.LimitReader(r, limit+1),
+		limit: limit,
+	}
+}
+
+func (b *boundedKnownHostsReader) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	b.read += int64(n)
+	return n, err
+}
+
+func (b *boundedKnownHostsReader) exceeded() bool {
+	return b.read > b.limit
+}
+
 func (db *knownHostsDB) parseFileStrict(filename string) error {
-	f, err := os.Open(filename)
+	return db.parseFileStrictBounded(filename, maxKnownHostsFileBytes)
+}
+
+func (db *knownHostsDB) parseFileStrictBounded(filename string, limit int64) error {
+	if isKnownHostsDevNull(filename) {
+		return nil
+	}
+	st, err := os.Lstat(filename)
+	if err != nil {
+		return err
+	}
+	if !st.Mode().IsRegular() {
+		return fmt.Errorf("knownhosts: refusing non-regular file %q (mode %s)", filename, st.Mode().Type())
+	}
+	f, err := openKnownHostsFileNoFollow(filename, os.O_RDONLY, 0)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = f.Close() }()
-	return db.readLines(f, filename, nil)
+
+	fst, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if !fst.Mode().IsRegular() {
+		return fmt.Errorf("knownhosts: refusing non-regular file %q (mode %s)", filename, fst.Mode().Type())
+	}
+
+	if err := lockKnownHostsFile(f, false); err != nil {
+		return fmt.Errorf("knownhosts: lock %q failed: %w", filename, err)
+	}
+	defer func() { _ = unlockKnownHostsFile(f) }()
+
+	if fst, err = f.Stat(); err != nil {
+		return err
+	}
+	if !fst.Mode().IsRegular() {
+		return fmt.Errorf("knownhosts: refusing non-regular file %q (mode %s)", filename, fst.Mode().Type())
+	}
+	if fst.Size() > limit {
+		return fmt.Errorf("knownhosts: %q exceeds maximum size of %d bytes", filename, limit)
+	}
+
+	bounded := newBoundedKnownHostsReader(f, limit)
+	if err := db.readLines(bounded, filename, nil); err != nil {
+		if bounded.exceeded() {
+			return fmt.Errorf("knownhosts: %q exceeds maximum size of %d bytes", filename, limit)
+		}
+		return err
+	}
+	if bounded.exceeded() {
+		return fmt.Errorf("knownhosts: %q exceeds maximum size of %d bytes", filename, limit)
+	}
+	return nil
 }
 
 func (db *knownHostsDB) parseFileLenient(filename string, l logger.DebugLogger) {
+	db.parseFileLenientBounded(filename, l, maxKnownHostsFileBytes)
+}
+
+func (db *knownHostsDB) parseFileLenientBounded(filename string, l logger.DebugLogger, limit int64) {
 	if l == nil {
 		l = logger.NopLogger
 	}
-	f, err := os.Open(filename)
+	if isKnownHostsDevNull(filename) {
+		return
+	}
+	st, err := os.Stat(filename)
+	if err != nil {
+		l.Debugf("skipping global known_hosts file %q: %v", filename, err)
+		return
+	}
+	if !st.Mode().IsRegular() {
+		l.Debugf("skipping global known_hosts file %q: non-regular file (mode %s)", filename, st.Mode().Type())
+		return
+	}
+	f, err := openKnownHostsReadOnlyFollow(filename)
 	if err != nil {
 		l.Debugf("skipping global known_hosts file %q: %v", filename, err)
 		return
 	}
 	defer func() { _ = f.Close() }()
-	_ = db.readLines(f, filename, l)
+
+	fst, err := f.Stat()
+	if err != nil || !fst.Mode().IsRegular() {
+		l.Debugf("skipping global known_hosts file %q: non-regular or unstatable handle", filename)
+		return
+	}
+	if err := lockKnownHostsFile(f, false); err != nil {
+		l.Debugf("skipping global known_hosts file %q: lock failed: %v", filename, err)
+		return
+	}
+	defer func() { _ = unlockKnownHostsFile(f) }()
+
+	if fst, err = f.Stat(); err != nil || !fst.Mode().IsRegular() {
+		l.Debugf("skipping global known_hosts file %q: non-regular or unstatable handle", filename)
+		return
+	}
+	if fst.Size() > limit {
+		l.Debugf("skipping global known_hosts file %q: exceeds maximum size of %d bytes", filename, limit)
+		return
+	}
+
+	bounded := newBoundedKnownHostsReader(f, limit)
+	_ = db.readLines(bounded, filename, l)
+	if bounded.exceeded() {
+		l.Debugf("global known_hosts file %q exceeded maximum size of %d bytes while reading", filename, limit)
+	}
 }
 
 func (db *knownHostsDB) readLines(r io.Reader, filename string, lenientLogger logger.DebugLogger) error {

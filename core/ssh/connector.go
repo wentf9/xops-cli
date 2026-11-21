@@ -1244,31 +1244,59 @@ func (c *Connector) tryDialAndPublishProxy(ctx context.Context, planNode connect
 }
 
 func (c *Connector) handleStaleControlSocket(ctx context.Context, planNode connectionPlanNode, expandedPath string, target TargetContext, origFi os.FileInfo) (*Client, error) {
-	currFi, err := os.Lstat(expandedPath)
-	if err != nil || !isControlSocketFileInfo(currFi) {
-		c.getLogger().Debugf("mux: stale socket %q already unlinked by another process", expandedPath)
-		return nil, nil
-	}
-
 	ctrl := target.Control
 	explicitMaster := ctrl != nil && (ctrl.Master == ControlMasterYes || ctrl.Master == ControlMasterAsk) && !ctrl.AllowReuse
 
-	// 1. If file identity changed, another process replaced the socket
-	if !os.SameFile(origFi, currFi) {
+	var (
+		replaced    bool
+		reactivated bool
+	)
+	lockErr := withControlSocketDirLock(expandedPath, func() error {
+		currFi, err := os.Lstat(expandedPath)
+		if err != nil || !isControlSocketFileInfo(currFi) {
+			c.getLogger().Debugf("mux: stale socket %q already unlinked by another process", expandedPath)
+			return nil
+		}
+
+		// 1. If file identity changed, another process replaced the socket.
+		if !os.SameFile(origFi, currFi) {
+			replaced = true
+			return nil
+		}
+
+		// 2. File identity is unchanged. Perform a brief non-interactive probe dial
+		// under the directory lock to ensure the socket didn't just activate.
+		probeConn, probeErr := net.DialTimeout("unix", expandedPath, 100*time.Millisecond)
+		if probeErr == nil {
+			_ = probeConn.Close()
+			reactivated = true
+			return nil
+		}
+		if !isConnectionRefused(probeErr) {
+			reactivated = true
+			return nil
+		}
+
+		// 3. Re-confirm file identity directly before unlinking under the directory lock.
+		if finalFi, finalErr := os.Lstat(expandedPath); finalErr == nil && isControlSocketFileInfo(finalFi) && os.SameFile(origFi, finalFi) {
+			c.getLogger().Debugf("mux: unlinking verified stale control socket %q", expandedPath)
+			_ = os.Remove(expandedPath)
+		}
+		return nil
+	})
+	if lockErr != nil {
+		c.getLogger().Debugf("mux: acquire control socket directory lock for %q failed: %v", expandedPath, lockErr)
+		return nil, nil
+	}
+
+	if replaced {
 		return c.probeLiveSocketBeforeUnlink(ctx, planNode, expandedPath, target, explicitMaster, 2*time.Second)
 	}
-
-	// 2. File identity is unchanged. Perform a brief probe dial to ensure the socket didn't just activate
-	if client, err, handled := c.tryAttachReactivatedSocket(ctx, planNode, expandedPath, target, explicitMaster); handled {
-		return client, err
+	if reactivated {
+		if client, err, handled := c.tryAttachReactivatedSocket(ctx, planNode, expandedPath, target, explicitMaster); handled {
+			return client, err
+		}
 	}
-
-	// 3. Atomically confirm file identity directly before unlinking to close TOCTOU window
-	if finalFi, finalErr := os.Lstat(expandedPath); finalErr == nil && isControlSocketFileInfo(finalFi) && os.SameFile(origFi, finalFi) {
-		c.getLogger().Debugf("mux: unlinking verified stale control socket %q", expandedPath)
-		_ = os.Remove(expandedPath)
-	}
-
 	return nil, nil
 }
 

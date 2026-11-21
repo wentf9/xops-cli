@@ -275,6 +275,8 @@ type OptionSpec struct {
 	Aliases               []string           // Accepted aliases (e.g. "ChallengeResponseAuthentication")
 	AllowList             bool               // Whether YAML sequence values are accepted and joined with ","
 	MultiValue            bool               // Whether multiple directives accumulate (matches MergeMode.IsMultiValue())
+	SupportedTokens       func() []string    // Returns supported tokens for AllowList options (auth methods or algorithms)
+	FailClosedTokens      []string           // Recognized unimplemented tokens retained by FilterSupportedListValue so callers fail closed
 	Normalize             func(raw string) (string, error)
 }
 
@@ -610,18 +612,7 @@ var optionRegistry = []OptionSpec{
 			return normalizeYesNoOption("IdentitiesOnly", raw)
 		},
 	},
-	{
-		CanonicalKey:          OptionPreferredAuthentications,
-		OpenSSHName:           "PreferredAuthentications",
-		Class:                 OptionClassAuth,
-		MergeMode:             OptionMergeFirstWins,
-		ConfigSyntax:          OptionSyntaxStrictScalar,
-		Tier4Policy:           OptionTier4Inherit,
-		StrictInOpenSSHConfig: true,
-		MuxPolicy:             OptionMuxAllow,
-		AllowList:             true,
-		Normalize:             normalizePreferredAuthentications,
-	},
+	newPreferredAuthenticationsOptionSpec(),
 	{
 		CanonicalKey: OptionBatchMode,
 		OpenSSHName:  "BatchMode",
@@ -635,78 +626,30 @@ var optionRegistry = []OptionSpec{
 			return normalizeYesNoOption("BatchMode", raw)
 		},
 	},
-	{
-		CanonicalKey:          OptionHostKeyAlgorithms,
-		OpenSSHName:           "HostKeyAlgorithms",
-		Class:                 OptionClassTransport,
-		MergeMode:             OptionMergeFirstWins,
-		ConfigSyntax:          OptionSyntaxStrictScalar,
-		Tier4Policy:           OptionTier4Inherit,
-		StrictInOpenSSHConfig: true,
-		MuxPolicy:             OptionMuxAllow,
-		AllowList:             true,
-		Normalize: func(raw string) (string, error) {
-			defaults := cryptoSSH.SupportedAlgorithms().HostKeys
-			return normalizeAlgorithmSpec("HostKeyAlgorithms", raw, defaults, allSupportedAlgorithms(
-				defaults,
-				cryptoSSH.InsecureAlgorithms().HostKeys,
-			))
-		},
-	},
-	{
-		CanonicalKey:          OptionCiphers,
-		OpenSSHName:           "Ciphers",
-		Class:                 OptionClassTransport,
-		MergeMode:             OptionMergeFirstWins,
-		ConfigSyntax:          OptionSyntaxStrictScalar,
-		Tier4Policy:           OptionTier4Inherit,
-		StrictInOpenSSHConfig: true,
-		MuxPolicy:             OptionMuxAllow,
-		AllowList:             true,
-		Normalize: func(raw string) (string, error) {
-			defaults := cryptoSSH.SupportedAlgorithms().Ciphers
-			return normalizeAlgorithmSpec("Ciphers", raw, defaults, allSupportedAlgorithms(
-				defaults,
-				cryptoSSH.InsecureAlgorithms().Ciphers,
-			))
-		},
-	},
-	{
-		CanonicalKey:          OptionMACs,
-		OpenSSHName:           "MACs",
-		Class:                 OptionClassTransport,
-		MergeMode:             OptionMergeFirstWins,
-		ConfigSyntax:          OptionSyntaxStrictScalar,
-		Tier4Policy:           OptionTier4Inherit,
-		StrictInOpenSSHConfig: true,
-		MuxPolicy:             OptionMuxAllow,
-		AllowList:             true,
-		Normalize: func(raw string) (string, error) {
-			defaults := cryptoSSH.SupportedAlgorithms().MACs
-			return normalizeAlgorithmSpec("MACs", raw, defaults, allSupportedAlgorithms(
-				defaults,
-				cryptoSSH.InsecureAlgorithms().MACs,
-			))
-		},
-	},
-	{
-		CanonicalKey:          OptionKexAlgorithms,
-		OpenSSHName:           "KexAlgorithms",
-		Class:                 OptionClassTransport,
-		MergeMode:             OptionMergeFirstWins,
-		ConfigSyntax:          OptionSyntaxStrictScalar,
-		Tier4Policy:           OptionTier4Inherit,
-		StrictInOpenSSHConfig: true,
-		MuxPolicy:             OptionMuxAllow,
-		AllowList:             true,
-		Normalize: func(raw string) (string, error) {
-			defaults := cryptoSSH.SupportedAlgorithms().KeyExchanges
-			return normalizeAlgorithmSpec("KexAlgorithms", raw, defaults, allSupportedAlgorithms(
-				defaults,
-				cryptoSSH.InsecureAlgorithms().KeyExchanges,
-			))
-		},
-	},
+	newAlgorithmOptionSpec(
+		OptionHostKeyAlgorithms,
+		"HostKeyAlgorithms",
+		func() []string { return cryptoSSH.SupportedAlgorithms().HostKeys },
+		func() []string { return cryptoSSH.InsecureAlgorithms().HostKeys },
+	),
+	newAlgorithmOptionSpec(
+		OptionCiphers,
+		"Ciphers",
+		func() []string { return cryptoSSH.SupportedAlgorithms().Ciphers },
+		func() []string { return cryptoSSH.InsecureAlgorithms().Ciphers },
+	),
+	newAlgorithmOptionSpec(
+		OptionMACs,
+		"MACs",
+		func() []string { return cryptoSSH.SupportedAlgorithms().MACs },
+		func() []string { return cryptoSSH.InsecureAlgorithms().MACs },
+	),
+	newAlgorithmOptionSpec(
+		OptionKexAlgorithms,
+		"KexAlgorithms",
+		func() []string { return cryptoSSH.SupportedAlgorithms().KeyExchanges },
+		func() []string { return cryptoSSH.InsecureAlgorithms().KeyExchanges },
+	),
 	{
 		CanonicalKey: OptionExitOnForwardFailure,
 		OpenSSHName:  "ExitOnForwardFailure",
@@ -1546,7 +1489,55 @@ func normalizeOptionalDurationOption(name, raw string) (string, error) {
 	return strings.TrimSpace(raw), nil
 }
 
-func normalizePreferredAuthentications(raw string) (string, error) {
+func newPreferredAuthenticationsOptionSpec() OptionSpec {
+	supportedFn := func() []string {
+		return []string{"publickey", "keyboard-interactive", "password"}
+	}
+	failClosed := []string{"gssapi-with-mic", "hostbased"}
+	return OptionSpec{
+		CanonicalKey:          OptionPreferredAuthentications,
+		OpenSSHName:           "PreferredAuthentications",
+		Class:                 OptionClassAuth,
+		MergeMode:             OptionMergeFirstWins,
+		ConfigSyntax:          OptionSyntaxStrictScalar,
+		Tier4Policy:           OptionTier4Inherit,
+		StrictInOpenSSHConfig: true,
+		MuxPolicy:             OptionMuxAllow,
+		AllowList:             true,
+		SupportedTokens:       supportedFn,
+		FailClosedTokens:      failClosed,
+		Normalize: func(raw string) (string, error) {
+			return normalizePreferredAuthentications(raw, supportedFn(), failClosed)
+		},
+	}
+}
+
+func newAlgorithmOptionSpec(
+	canonicalKey, openSSHName string,
+	defaultsFn func() []string,
+	insecureFn func() []string,
+) OptionSpec {
+	supportedFn := func() []string {
+		return allSupportedAlgorithms(defaultsFn(), insecureFn())
+	}
+	return OptionSpec{
+		CanonicalKey:          canonicalKey,
+		OpenSSHName:           openSSHName,
+		Class:                 OptionClassTransport,
+		MergeMode:             OptionMergeFirstWins,
+		ConfigSyntax:          OptionSyntaxStrictScalar,
+		Tier4Policy:           OptionTier4Inherit,
+		StrictInOpenSSHConfig: true,
+		MuxPolicy:             OptionMuxAllow,
+		AllowList:             true,
+		SupportedTokens:       supportedFn,
+		Normalize: func(raw string) (string, error) {
+			return normalizeAlgorithmSpec(openSSHName, raw, defaultsFn(), supportedFn())
+		},
+	}
+}
+
+func normalizePreferredAuthentications(raw string, supported, failClosed []string) (string, error) {
 	if hasControlOrLineSepChar(raw) {
 		return "", fmt.Errorf("invalid PreferredAuthentications %q: contains invalid control character", raw)
 	}
@@ -1558,13 +1549,11 @@ func normalizePreferredAuthentications(raw string) (string, error) {
 	var normalized []string
 	for _, p := range parts {
 		token := strings.ToLower(strings.TrimSpace(p))
-		switch token {
-		case "publickey", "keyboard-interactive", "password", "gssapi-with-mic", "hostbased":
-			if !slices.Contains(normalized, token) {
-				normalized = append(normalized, token)
-			}
-		default:
+		if !slices.Contains(supported, token) && !slices.Contains(failClosed, token) {
 			return "", fmt.Errorf("invalid PreferredAuthentications method %q", p)
+		}
+		if !slices.Contains(normalized, token) {
+			normalized = append(normalized, token)
 		}
 	}
 	if len(normalized) == 0 {
@@ -1640,20 +1629,11 @@ func normalizeAlgorithmSpec(name, raw string, defaults, supported []string) (str
 }
 
 func supportedListTokens(canonicalKey string) (supported, failClosed []string, ok bool) {
-	switch canonicalKey {
-	case OptionPreferredAuthentications:
-		return []string{"publickey", "keyboard-interactive", "password"}, []string{"gssapi-with-mic", "hostbased"}, true
-	case OptionHostKeyAlgorithms:
-		return allSupportedAlgorithms(cryptoSSH.SupportedAlgorithms().HostKeys, cryptoSSH.InsecureAlgorithms().HostKeys), nil, true
-	case OptionCiphers:
-		return allSupportedAlgorithms(cryptoSSH.SupportedAlgorithms().Ciphers, cryptoSSH.InsecureAlgorithms().Ciphers), nil, true
-	case OptionMACs:
-		return allSupportedAlgorithms(cryptoSSH.SupportedAlgorithms().MACs, cryptoSSH.InsecureAlgorithms().MACs), nil, true
-	case OptionKexAlgorithms:
-		return allSupportedAlgorithms(cryptoSSH.SupportedAlgorithms().KeyExchanges, cryptoSSH.InsecureAlgorithms().KeyExchanges), nil, true
-	default:
+	spec, found := LookupOptionSpec(canonicalKey)
+	if !found || spec.SupportedTokens == nil {
 		return nil, nil, false
 	}
+	return spec.SupportedTokens(), slices.Clone(spec.FailClosedTokens), true
 }
 
 // FilterSupportedListValue filters a comma-separated option value (for algorithm lists
@@ -1671,21 +1651,23 @@ func FilterSupportedListValue(canonicalKey, raw string) string {
 	if trimmed == "" {
 		return ""
 	}
-	supported, failClosedAuth, ok := supportedListTokens(canonicalKey)
-	if !ok {
+	spec, found := LookupOptionSpec(canonicalKey)
+	if !found || spec.SupportedTokens == nil {
 		return raw
 	}
+	supported := spec.SupportedTokens()
+	failClosedAuth := spec.FailClosedTokens
 
 	var prefix string
 	body := trimmed
-	if canonicalKey != OptionPreferredAuthentications && (body[0] == '+' || body[0] == '-' || body[0] == '^') {
+	if spec.CanonicalKey != OptionPreferredAuthentications && (body[0] == '+' || body[0] == '-' || body[0] == '^') {
 		prefix = body[:1]
 		body = strings.TrimSpace(body[1:])
 	}
 	var kept, keptFailClosed []string
 	for part := range strings.SplitSeq(body, ",") {
 		tok := strings.TrimSpace(part)
-		if canonicalKey == OptionPreferredAuthentications {
+		if spec.CanonicalKey == OptionPreferredAuthentications {
 			tok = strings.ToLower(tok)
 		}
 		if tok == "" {

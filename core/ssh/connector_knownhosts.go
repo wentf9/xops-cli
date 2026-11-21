@@ -175,7 +175,7 @@ func (c *Connector) loadUserKnownHosts(userKH string, target TargetContext, db *
 	var primaryWriteFile string
 	var userFiles []string
 	switch {
-	case strings.EqualFold(userKH, "none") || userKH == "/dev/null":
+	case strings.EqualFold(userKH, "none") || isKnownHostsDevNull(userKH):
 	case userKH != "":
 		var err error
 		primaryWriteFile, userFiles, err = c.resolveCustomKnownHostsFiles(userKH, target)
@@ -187,16 +187,20 @@ func (c *Connector) loadUserKnownHosts(userKH string, target TargetContext, db *
 			return "", nil, err
 		}
 		primaryWriteFile = c.environment.KnownHostsFile
-		f, openErr := os.OpenFile(primaryWriteFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		f, openErr := openKnownHostsFileNoFollow(primaryWriteFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 		if errors.Is(openErr, os.ErrNotExist) {
 			if mkdirErr := os.MkdirAll(filepath.Dir(primaryWriteFile), 0700); mkdirErr != nil {
 				return "", nil, fmt.Errorf("create .ssh directory failed: %w", mkdirErr)
 			}
-			f, openErr = os.OpenFile(primaryWriteFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+			f, openErr = openKnownHostsFileNoFollow(primaryWriteFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 		}
 		if openErr == nil {
 			if closeErr := f.Close(); closeErr != nil {
 				return "", nil, fmt.Errorf("create known_hosts file failed: %w", closeErr)
+			}
+			if hardenErr := hardenNewKnownHostsFile(primaryWriteFile); hardenErr != nil {
+				_ = os.Remove(primaryWriteFile)
+				return "", nil, fmt.Errorf("harden known_hosts file failed: %w", hardenErr)
 			}
 		} else if !errors.Is(openErr, os.ErrExist) {
 			return "", nil, fmt.Errorf("create known_hosts file failed: %w", openErr)
@@ -229,20 +233,20 @@ func (c *Connector) resolveCustomKnownHostsFiles(userKH string, target TargetCon
 	var existingFiles []string
 	var primaryWriteFile string
 	for idx, tokenPath := range strings.Fields(userKH) {
-		if strings.EqualFold(tokenPath, "none") || tokenPath == "/dev/null" {
+		if strings.EqualFold(tokenPath, "none") || isKnownHostsDevNull(tokenPath) {
 			continue
 		}
 		expanded, expErr := expandKnownHostsPath(tokenPath, c.environment, target)
 		if expErr != nil {
 			return "", nil, fmt.Errorf("expand UserKnownHostsFile %q failed: %w", tokenPath, expErr)
 		}
-		if expanded == "" || strings.EqualFold(expanded, "none") || expanded == "/dev/null" {
+		if expanded == "" || strings.EqualFold(expanded, "none") || isKnownHostsDevNull(expanded) {
 			continue
 		}
 		if idx == 0 {
 			primaryWriteFile = expanded
 		}
-		st, err := os.Stat(expanded)
+		st, err := os.Lstat(expanded)
 		if err != nil {
 			if !errors.Is(err, os.ErrNotExist) {
 				return "", nil, fmt.Errorf("stat UserKnownHostsFile %q failed: %w", expanded, err)
@@ -251,6 +255,9 @@ func (c *Connector) resolveCustomKnownHostsFiles(userKH string, target TargetCon
 		}
 		if st.IsDir() {
 			return "", nil, fmt.Errorf("UserKnownHostsFile %q is a directory", expanded)
+		}
+		if !st.Mode().IsRegular() {
+			return "", nil, fmt.Errorf("UserKnownHostsFile %q is not a regular file (mode %s)", expanded, st.Mode().Type())
 		}
 		existingFiles = append(existingFiles, expanded)
 	}
@@ -274,14 +281,14 @@ func (c *Connector) resolveGlobalKnownHostsFiles(cfg *ClientConfig, target Targe
 		return nil, nil
 	case spec != "":
 		for _, tokenPath := range strings.Fields(spec) {
-			if strings.EqualFold(tokenPath, "none") || tokenPath == "/dev/null" {
+			if strings.EqualFold(tokenPath, "none") || isKnownHostsDevNull(tokenPath) {
 				continue
 			}
 			expanded, err := expandKnownHostsPath(tokenPath, c.environment, target)
 			if err != nil {
 				return nil, fmt.Errorf("expand GlobalKnownHostsFile %q failed: %w", tokenPath, err)
 			}
-			if expanded == "" || strings.EqualFold(expanded, "none") || expanded == "/dev/null" {
+			if expanded == "" || strings.EqualFold(expanded, "none") || isKnownHostsDevNull(expanded) {
 				continue
 			}
 			candidates = append(candidates, expanded)
@@ -313,17 +320,18 @@ func isReadableRegularFile(path string) bool {
 	if err != nil || !st.Mode().IsRegular() {
 		return false
 	}
-	f, err := os.Open(path)
+	f, err := openKnownHostsReadOnlyFollow(path)
 	if err != nil {
 		return false
 	}
+	fst, statErr := f.Stat()
 	_ = f.Close()
-	return true
+	return statErr == nil && fst.Mode().IsRegular()
 }
 
 func expandKnownHostsPath(pattern string, env Environment, target TargetContext) (string, error) {
 	expanded, err := ExpandControlPath(pattern, env, target)
-	if err != nil || expanded == "" || strings.EqualFold(expanded, "none") || expanded == "/dev/null" {
+	if err != nil || expanded == "" || strings.EqualFold(expanded, "none") || isKnownHostsDevNull(expanded) {
 		return expanded, err
 	}
 	return filepath.Clean(filepath.FromSlash(expanded)), nil
@@ -477,6 +485,9 @@ func appendKnownHost(knownHostsFile, hostname string, key ssh.PublicKey, hash bo
 	if _, isCert := key.(*ssh.Certificate); isCert {
 		return fmt.Errorf("%w: refusing to persist host certificate for %s to known_hosts", ErrHostKeyMismatch, hostname)
 	}
+	if isKnownHostsDevNull(knownHostsFile) {
+		return nil
+	}
 	knownHostsFileMutex.Lock()
 	defer knownHostsFileMutex.Unlock()
 
@@ -484,27 +495,89 @@ func appendKnownHost(knownHostsFile, hostname string, key ssh.PublicKey, hash bo
 		return fmt.Errorf("create known_hosts directory failed: %w", mkdirErr)
 	}
 
-	f, openErr := os.OpenFile(knownHostsFile, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
+	f, created, openErr := openKnownHostsForAppend(knownHostsFile)
 	if openErr != nil {
-		return fmt.Errorf("open known_hosts file failed: %w", openErr)
+		return openErr
 	}
+	closed := false
 	defer func() {
+		if closed {
+			return
+		}
 		if closeErr := f.Close(); closeErr != nil && err == nil {
 			err = fmt.Errorf("close known_hosts file failed: %w", closeErr)
 		}
 	}()
 
-	prefix := ""
-	if st, statErr := f.Stat(); statErr == nil && st.Mode().IsRegular() && st.Size() > 0 {
-		var last [1]byte
-		if _, readErr := f.ReadAt(last[:], st.Size()-1); readErr != nil {
-			return fmt.Errorf("read known_hosts trailing byte failed: %w", readErr)
-		}
-		if last[0] != '\n' {
-			prefix = "\n"
+	if err := verifyRegularKnownHostsHandle(f, knownHostsFile); err != nil {
+		return err
+	}
+
+	if created {
+		if hardenErr := hardenNewKnownHostsFile(knownHostsFile); hardenErr != nil {
+			closed = true
+			_ = f.Close()
+			_ = os.Remove(knownHostsFile)
+			return fmt.Errorf("harden known_hosts file failed: %w", hardenErr)
 		}
 	}
 
+	if lockErr := lockKnownHostsFile(f, true); lockErr != nil {
+		return fmt.Errorf("lock known_hosts file failed: %w", lockErr)
+	}
+	defer func() {
+		if unlockErr := unlockKnownHostsFile(f); unlockErr != nil && err == nil {
+			err = fmt.Errorf("unlock known_hosts file failed: %w", unlockErr)
+		}
+	}()
+
+	prefix, prefixErr := knownHostsTrailingNewlinePrefix(f, knownHostsFile)
+	if prefixErr != nil {
+		return prefixErr
+	}
+
+	line := formatKnownHostEntry(hostname, key, hash)
+	if _, writeErr := f.WriteString(prefix + line + "\n"); writeErr != nil {
+		return fmt.Errorf("write known_hosts file failed: %w", writeErr)
+	}
+	return nil
+}
+
+func verifyRegularKnownHostsHandle(f *os.File, knownHostsFile string) error {
+	fst, statErr := f.Stat()
+	if statErr != nil {
+		return fmt.Errorf("stat known_hosts file failed: %w", statErr)
+	}
+	if !fst.Mode().IsRegular() {
+		return fmt.Errorf("open known_hosts file failed: refusing non-regular file %q (mode %s)", knownHostsFile, fst.Mode().Type())
+	}
+	return nil
+}
+
+// knownHostsTrailingNewlinePrefix re-stats f under the exclusive file lock so
+// st.Size() reflects any concurrent process's write completed before locking.
+func knownHostsTrailingNewlinePrefix(f *os.File, knownHostsFile string) (string, error) {
+	st, statErr := f.Stat()
+	if statErr != nil {
+		return "", fmt.Errorf("stat known_hosts file failed: %w", statErr)
+	}
+	if !st.Mode().IsRegular() {
+		return "", fmt.Errorf("open known_hosts file failed: refusing non-regular file %q (mode %s)", knownHostsFile, st.Mode().Type())
+	}
+	if st.Size() == 0 {
+		return "", nil
+	}
+	var last [1]byte
+	if _, readErr := f.ReadAt(last[:], st.Size()-1); readErr != nil {
+		return "", fmt.Errorf("read known_hosts trailing byte failed: %w", readErr)
+	}
+	if last[0] != '\n' {
+		return "\n", nil
+	}
+	return "", nil
+}
+
+func formatKnownHostEntry(hostname string, key ssh.PublicKey, hash bool) string {
 	var host string
 	if h, p, splitErr := net.SplitHostPort(hostname); splitErr == nil {
 		host = khOpenSSHHostPort(khAddr{host: h, port: p})
@@ -514,9 +587,34 @@ func appendKnownHost(knownHostsFile, hostname string, key ssh.PublicKey, hash bo
 	if hash {
 		host = knownhosts.HashHostname(host)
 	}
-	line := knownhosts.Line([]string{host}, key)
-	if _, writeErr := f.WriteString(prefix + line + "\n"); writeErr != nil {
-		return fmt.Errorf("write known_hosts file failed: %w", writeErr)
+	return knownhosts.Line([]string{host}, key)
+}
+
+func openKnownHostsForAppend(knownHostsFile string) (*os.File, bool, error) {
+	needCreate := false
+	if st, lstatErr := os.Lstat(knownHostsFile); lstatErr == nil {
+		if !st.Mode().IsRegular() {
+			return nil, false, fmt.Errorf("open known_hosts file failed: refusing non-regular file %q (mode %s)", knownHostsFile, st.Mode().Type())
+		}
+	} else if errors.Is(lstatErr, os.ErrNotExist) {
+		needCreate = true
+	} else {
+		return nil, false, fmt.Errorf("stat known_hosts file failed: %w", lstatErr)
 	}
-	return nil
+
+	if needCreate {
+		f, err := openKnownHostsFileNoFollow(knownHostsFile, os.O_CREATE|os.O_EXCL|os.O_APPEND|os.O_RDWR, 0600)
+		if err == nil {
+			return f, true, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, false, fmt.Errorf("open known_hosts file failed: %w", err)
+		}
+	}
+
+	f, err := openKnownHostsFileNoFollow(knownHostsFile, os.O_APPEND|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, false, fmt.Errorf("open known_hosts file failed: %w", err)
+	}
+	return f, false, nil
 }
