@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	xssh "github.com/wentf9/xops-cli/core/ssh"
+	"github.com/wentf9/xops-cli/internal/sshenv"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/models"
@@ -116,16 +117,16 @@ func TestRound6_P3_6_P3_7_P3_8_ControlProxyTunnelAndEnsureApplied(t *testing.T) 
 		t.Fatal("appendScpSessionAuthOverrides did not surface invalid -o Port=0 error")
 	}
 
-	// P3-7: targetContextFromResolvedTarget & newControlProxyFallbackConfig propagate CanonicalHost.
-	tc := targetContextFromResolvedTarget(config.ResolvedTarget{
+	// P3-7: TargetContextFromResolvedTarget & newControlProxyFallbackConfig propagate CanonicalHost.
+	tc := adapter.TargetContextFromResolvedTarget(config.ResolvedTarget{
 		NodeID:        "openssh:short.corp.example.com",
 		Host:          "10.80.0.1",
 		Port:          22,
 		User:          "ops",
 		CanonicalHost: "short.corp.example.com",
-	})
+	}, sshenv.Discover())
 	if tc.CanonicalHost != "short.corp.example.com" {
-		t.Fatalf("targetContextFromResolvedTarget CanonicalHost = %q, want short.corp.example.com", tc.CanonicalHost)
+		t.Fatalf("TargetContextFromResolvedTarget CanonicalHost = %q, want short.corp.example.com", tc.CanonicalHost)
 	}
 	fb := newControlProxyFallbackConfig(tc, nil, nil, nil, NewSshOptions())
 	if fb.CanonicalHost != "short.corp.example.com" {

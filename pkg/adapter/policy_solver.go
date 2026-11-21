@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/ssh"
+	"github.com/wentf9/xops-cli/internal/sshenv"
 	"github.com/wentf9/xops-cli/pkg/config"
 )
 
@@ -335,6 +336,10 @@ func (a *SSHAdapter) applyOptionRestrictions(merged *ssh.Options) {
 }
 
 func (p effectivePolicy) controlTargetContext(nodeID string) ssh.TargetContext {
+	return p.controlTargetContextWithEnv(nodeID, sshenv.Discover())
+}
+
+func (p effectivePolicy) controlTargetContextWithEnv(nodeID string, env ssh.Environment) ssh.TargetContext {
 	origHost := nodeID
 	if p.originalHost != "" {
 		origHost = p.originalHost
@@ -365,14 +370,14 @@ func (p effectivePolicy) controlTargetContext(nodeID string) ssh.TargetContext {
 	if p.higherTierCmdWins {
 		jumpHost = ""
 	}
-	return ssh.TargetContext{
+	return ssh.NormalizeTargetContext(ssh.TargetContext{
 		Host:          host,
 		Port:          effectiveSnapshotPort(p.snapshot.Host.Port),
-		User:          effectiveSnapshotUser(p.snapshot.Identity.User),
+		User:          strings.TrimSpace(p.snapshot.Identity.User),
 		OriginalHost:  origHost,
 		CanonicalHost: p.canonicalHost,
 		JumpHost:      jumpHost,
-	}
+	}, env)
 }
 
 func (a *SSHAdapter) resolvePolicyTiers(

@@ -249,13 +249,36 @@ func effectiveConnectionTarget(opts *SshOptions, nodeID string) config.Connectio
 	return target
 }
 
+func buildControlTargetRequest(
+	opts *SshOptions,
+	provider config.ConfigProvider,
+	nodeID string,
+	connTarget config.ConnectionTarget,
+	sessionOpts adapter.SessionControlOptions,
+) adapter.ControlTargetRequest {
+	req := adapter.ControlTargetRequest{
+		Provider:       provider,
+		NodeID:         nodeID,
+		Target:         connTarget,
+		SessionControl: sessionOpts,
+	}
+	if opts != nil {
+		req.FallbackHost = opts.Host
+		req.FallbackPort = opts.Port
+		req.FallbackUser = opts.User
+		req.ApplyTargetNodeOverrides = isTargetControlNode(opts, nodeID)
+		req.OverrideOriginalHost = opts.originalHost
+		if expandedHost, err := opts.effectiveHostName(); err == nil {
+			req.OverrideExpandedHost = expandedHost
+		}
+		req.CanonicalOriginalHost, req.CanonicalHost = canonicalControlOriginAndHost(opts)
+	}
+	return req
+}
+
 // controlSocketPath resolves and expands the effective control path for nodeID.
-// It mirrors Connector.buildTargetContext so every caller expands %h/%p/%r/%j/%C
-// against the same resolved target instead of raw CLI fields.
-//
-// nodeID may be empty for an ad-hoc host that resolves to no inventory node; the
-// session/global/OpenSSH layers are still consulted and the expansion falls back
-// to the CLI-supplied target.
+// It delegates to adapter.ResolveControlSocketPath so every caller expands
+// %h/%p/%r/%n/%j/%C against the same canonical TargetContext as Connector.
 func controlSocketPath(opts *SshOptions, provider config.ConfigProvider, nodeID string) (string, error) {
 	if opts == nil {
 		return "", nil
@@ -267,93 +290,12 @@ func controlSocketPath(opts *SshOptions, provider config.ConfigProvider, nodeID 
 	if err != nil {
 		return "", err
 	}
-	connTarget := effectiveConnectionTarget(opts, nodeID)
-	target := controlTarget(opts, provider, nodeID)
-	lookupKey, sessionAuth := resolveControlSessionLookup(opts, provider, nodeID, connTarget, target)
-	ctrl, err := resolveControlConfig(provider, lookupKey, connTarget.Selector, sessionAuth, sessionOpts)
-	if err != nil {
-		return "", err
+	if provider != nil {
+		opts.syncResolvedTargetHosts(provider)
 	}
-	if !ctrl.IsEnabled() {
-		return "", nil
-	}
-	expanded, err := ctrl.ResolvePath(sshenv.Discover(), target)
-	if err != nil {
-		return "", err
-	}
-	if strings.TrimSpace(expanded) == "" || ssh.IsNoneValue(expanded) {
-		return "", nil
-	}
-	return expanded, nil
-}
-
-func firstNonEmptySessionValue(vals ...string) string {
-	for _, v := range vals {
-		if trimmed := strings.TrimSpace(v); trimmed != "" {
-			return trimmed
-		}
-	}
-	return ""
-}
-
-func extractOpenSSHHost(nodeID string) string {
-	alias := strings.TrimSpace(config.UnwrapOpenSSHSelector(nodeID))
-	if alias == "" {
-		return ""
-	}
-	if _, parsedHost, _, err := utils.ParseAddr(alias); err == nil && parsedHost != "" {
-		return parsedHost
-	}
-	return alias
-}
-
-func resolveSavedControlSessionLookup(
-	provider config.ConfigProvider,
-	lookupKey, nodeID string,
-	connTarget config.ConnectionTarget,
-	origHost, canonHost, targetOrig, proxyJump string,
-) (key string, auth adapter.SessionAuth, handled bool, resolvedVirtual bool) {
-	auth.ProxyJump = proxyJump
-	if provider == nil {
-		return "", auth, false, false
-	}
-	if lookupKey != "" {
-		if snap, err := provider.ResolveConnection(lookupKey); err == nil {
-			if !config.IsOpenSSHNodeID(lookupKey) || snap.Provenance != config.ProvenanceOpenSSHVirtual {
-				resolvedAlias := snap.Node.OpenSSHAlias
-				resolvedCanon := snap.Node.CanonicalHost
-				if origHost != "" || canonHost != "" {
-					resolvedCanon = ""
-				}
-				if origHost == "" && strings.TrimSpace(connTarget.Selector) != "" {
-					if resolved, rErr := config.ResolveTarget(provider, connTarget); rErr == nil && resolved.MatchedNodeID == lookupKey {
-						resolvedAlias = resolved.OpenSSHAlias
-						if canonHost == "" {
-							resolvedCanon = resolved.CanonicalHost
-						}
-					}
-				}
-				auth.OriginalHost = firstNonEmptySessionValue(origHost, resolvedAlias, targetOrig)
-				auth.CanonicalHost = firstNonEmptySessionValue(canonHost, resolvedCanon)
-				return lookupKey, auth, true, false
-			}
-			if config.HasOpenSSHConfig(provider) {
-				resolvedVirtual = true
-			}
-		}
-	}
-	if strings.TrimSpace(connTarget.Selector) != "" {
-		if resolved, err := config.ResolveTarget(provider, connTarget); err == nil && resolved.MatchedNodeID != "" && !config.IsOpenSSHNodeID(resolved.MatchedNodeID) {
-			auth.OriginalHost = firstNonEmptySessionValue(origHost, resolved.OpenSSHAlias, extractOpenSSHHost(nodeID), targetOrig)
-			if origHost == "" && canonHost == "" {
-				auth.CanonicalHost = resolved.CanonicalHost
-			} else {
-				auth.CanonicalHost = canonHost
-			}
-			return resolved.MatchedNodeID, auth, true, resolvedVirtual
-		}
-	}
-	return "", auth, false, resolvedVirtual
+	req := buildControlTargetRequest(opts, provider, nodeID, effectiveConnectionTarget(opts, nodeID), sessionOpts)
+	expanded, _, err := adapter.ResolveControlSocketPath(req)
+	return expanded, err
 }
 
 // resolveControlSessionLookup computes the effective adapter lookup key and
@@ -366,136 +308,27 @@ func resolveControlSessionLookup(
 	connTarget config.ConnectionTarget,
 	target ssh.TargetContext,
 ) (string, adapter.SessionAuth) {
-	origHost, canonHost := canonicalControlOriginAndHost(opts)
-	targetOrig := strings.TrimSpace(target.OriginalHost)
-	var auth adapter.SessionAuth
+	req := buildControlTargetRequest(opts, provider, nodeID, connTarget, adapter.SessionControlOptions{})
 	if opts != nil {
-		auth.ProxyJump = strings.TrimSpace(opts.JumpHost)
+		req.Target.ProxyJump = strings.TrimSpace(opts.JumpHost)
 	}
-	lookupKey := strings.TrimSpace(nodeID)
-	key, savedAuth, handled, resolvedVirtual := resolveSavedControlSessionLookup(
-		provider, lookupKey, nodeID, connTarget, origHost, canonHost, targetOrig, auth.ProxyJump,
-	)
-	if handled {
-		return key, savedAuth
-	}
-	if canonHost != "" {
-		if lookupKey == "" || !config.IsOpenSSHNodeID(lookupKey) {
-			lookupKey = config.OpenSSHNodePrefix + canonHost
-		}
-		auth.OriginalHost = firstNonEmptySessionValue(origHost, targetOrig)
-		auth.CanonicalHost = canonHost
-		return lookupKey, auth
-	}
-	if config.IsOpenSSHNodeID(lookupKey) {
-		openSSHHost := extractOpenSSHHost(lookupKey)
-		if !resolvedVirtual {
-			if cleanOrig, ok := config.OpenSSHOriginalHost(lookupKey); ok && targetOrig != "" && targetOrig != cleanOrig && targetOrig != openSSHHost {
-				lookupKey = targetOrig
-			}
-		}
-		auth.OriginalHost = firstNonEmptySessionValue(origHost, openSSHHost, targetOrig)
-		auth.CanonicalHost = canonHost
-		return lookupKey, auth
-	}
-	if lookupKey == "" {
-		if targetOrig != "" {
-			lookupKey = targetOrig
-		} else {
-			lookupKey = strings.TrimSpace(connTarget.Selector)
-		}
-	}
-	auth.OriginalHost = firstNonEmptySessionValue(origHost, targetOrig)
-	auth.CanonicalHost = canonHost
-	return lookupKey, auth
+	return adapter.ResolveControlSessionLookup(req, target)
 }
 
-// resolveControlConfig resolves the effective multiplexing config for lookupKey with
-// the given session overrides. When the selector matches no inventory node the
-// adapter still merges session, global, and OpenSSH layers, so an ad-hoc host is
-// validated exactly like a managed one.
-func resolveControlConfig(provider config.ConfigProvider, lookupKey, selector string, sessionAuth adapter.SessionAuth, sessionOpts adapter.SessionControlOptions) (*ssh.ControlConfig, error) {
-	if provider == nil {
-		if sessionOpts.IsEmpty() {
-			return nil, nil
-		}
-		return sessionOpts.ResolveControl()
-	}
-	if lookupKey == "" {
-		// ResolveControl treats an unknown selector as "no node layer" and falls
-		// back to session > global > OpenSSH, which is the ad-hoc case.
-		lookupKey = selector
-	}
-	var adpOpts []adapter.Option
-	if lookupKey != "" && (sessionAuth.OriginalHost != "" || sessionAuth.CanonicalHost != "" || sessionAuth.ProxyJump != "") {
-		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(lookupKey, sessionAuth))
-	}
-	return adapter.NewSSHAdapter(provider, adpOpts...).ResolveControl(lookupKey, sessionOpts)
-}
-
-func applyTargetControlNodeOverrides(opts *SshOptions, nodeID string, target *ssh.TargetContext) {
-	if target == nil || !isTargetControlNode(opts, nodeID) {
-		return
-	}
-	if opts != nil && opts.originalHost != "" {
-		target.OriginalHost = opts.originalHost
-	}
-	if expandedHost, err := opts.effectiveHostName(); err == nil && expandedHost != "" {
-		target.Host = expandedHost
-	}
-}
-
-// controlTarget builds the token expansion context. The resolved target supplies
-// address, port, user, and jump host; explicit CLI values still win, mirroring
-// Connector.buildTargetContext.
+// controlTarget builds the canonical token expansion context by delegating to
+// adapter.ResolveControlTarget, mirroring Connector.buildTargetContext.
 func controlTarget(opts *SshOptions, provider config.ConfigProvider, nodeID string) ssh.TargetContext {
-	if opts != nil && provider != nil {
-		opts.syncResolvedTargetHosts(provider)
-	}
-	connTarget := effectiveConnectionTarget(opts, nodeID)
-	if strings.TrimSpace(connTarget.Selector) != "" {
-		effectiveProvider := provider
-		if effectiveProvider == nil {
-			effectiveProvider = config.NewProviderWithoutOpenSSH(nil)
-		}
-		if resolved, err := config.ResolveTarget(effectiveProvider, connTarget); err == nil {
-			target := targetContextFromResolvedTarget(resolved)
-			applyTargetControlNodeOverrides(opts, nodeID, &target)
-			return target
-		}
-	}
-
-	jump := strings.TrimSpace(connTarget.ProxyJump)
-	if ssh.IsDisabledProxyJump(jump) {
-		jump = ""
-	}
-	orig := connTarget.Selector
-	if cleanOrig, ok := config.OpenSSHOriginalHost(orig); ok {
-		orig = cleanOrig
-	}
-	target := ssh.TargetContext{
-		OriginalHost: orig,
-		JumpHost:     jump,
-	}
+	var sessionOpts adapter.SessionControlOptions
 	if opts != nil {
-		target.Host = strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(opts.Host), "]"), "[")
-		applyTargetControlNodeOverrides(opts, nodeID, &target)
-		target.Port = int(opts.Port)
-		target.User = opts.User
+		if provider != nil {
+			opts.syncResolvedTargetHosts(provider)
+		}
+		if parsed, err := opts.toSessionControlOptions(); err == nil {
+			sessionOpts = parsed
+		}
 	}
-	if connTarget.HasUser && connTarget.User != "" {
-		target.User = connTarget.User
-	}
-	if connTarget.HasPort && connTarget.Port > 0 {
-		target.Port = int(connTarget.Port)
-	}
-	if target.User == "" {
-		target.User = sshenv.Discover().LocalUser
-	}
-	if target.Port <= 0 {
-		target.Port = 22
-	}
-	return target
+	req := buildControlTargetRequest(opts, provider, nodeID, effectiveConnectionTarget(opts, nodeID), sessionOpts)
+	return adapter.ResolveControlTarget(req).Target
 }
 
 func isTargetControlNode(opts *SshOptions, nodeID string) bool {
@@ -510,35 +343,6 @@ func isTargetControlNode(opts *SshOptions, nodeID string) bool {
 
 func defaultLocalUser() string {
 	return sshenv.Discover().LocalUser
-}
-
-func targetContextFromResolvedTarget(resolved config.ResolvedTarget) ssh.TargetContext {
-	user := resolved.User
-	if user == "" {
-		user = defaultLocalUser()
-	}
-	port := int(resolved.Port)
-	if port <= 0 {
-		port = 22
-	}
-	orig := resolved.NodeID
-	if cleanOrig, ok := config.OpenSSHOriginalHost(orig); ok {
-		orig = cleanOrig
-	} else if !isResolvedSavedNode(resolved) && resolved.OpenSSHAlias != "" {
-		orig = resolved.OpenSSHAlias
-	}
-	if orig == "" && resolved.Host != "" && user != "" && port > 0 {
-		orig = config.FormatNodeID(user, resolved.Host, uint16(port))
-	}
-	return ssh.TargetContext{
-		Host:          resolved.Host,
-		Port:          port,
-		User:          user,
-		OriginalHost:  orig,
-		CanonicalHost: resolved.CanonicalHost,
-		JumpHost:      resolved.ProxyJump,
-		KeyPath:       resolved.KeyPath,
-	}
 }
 
 type generalOptionState struct {

@@ -839,7 +839,8 @@ func (a *SSHAdapter) ExpandControlPath(nodeID string, rawPath string) (string, e
 	if err != nil {
 		return "", fmt.Errorf("resolve node %q for control path expansion: %w", nodeID, err)
 	}
-	return ssh.ExpandControlPath(rawPath, sshenv.Discover(), pol.controlTargetContext(nodeID))
+	env := sshenv.Discover()
+	return ssh.ExpandControlPath(rawPath, env, pol.controlTargetContextWithEnv(nodeID, env))
 }
 
 // ConfirmConnection publishes a prepared node before credentials are recorded.

@@ -9,6 +9,7 @@ import (
 
 	cmdutils "github.com/wentf9/xops-cli/cmd/utils"
 	xssh "github.com/wentf9/xops-cli/core/ssh"
+	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/models"
 )
@@ -138,18 +139,14 @@ func TestRound7_P2_7_ControlLookupSwitchesAliasesAndDoesNotBackfillCanonicalHost
 	}
 
 	// Case 2: Explicit non-canonical origHost passed without canonHost must NOT backfill stale snap.Node.CanonicalHost.
-	explicitKey, explicitAuth, handled, _ := resolveSavedControlSessionLookup(
-		prov,
-		"ops@10.95.0.5:22",
-		"ops@10.95.0.5:22",
-		config.ConnectionTarget{Selector: "ops@10.95.0.5:22"},
-		"custom-orig",
-		"",
-		"",
-		"",
-	)
-	if !handled || explicitKey != "ops@10.95.0.5:22" || explicitAuth.OriginalHost != "custom-orig" || explicitAuth.CanonicalHost != "" {
-		t.Fatalf("explicit OriginalHost leaked snap.Node.CanonicalHost: key=%q handled=%v auth=%+v", explicitKey, handled, explicitAuth)
+	explicitKey, explicitAuth := adapter.ResolveControlSessionLookup(adapter.ControlTargetRequest{
+		Provider:              prov,
+		NodeID:                "ops@10.95.0.5:22",
+		Target:                config.ConnectionTarget{Selector: "ops@10.95.0.5:22"},
+		CanonicalOriginalHost: "custom-orig",
+	}, xssh.TargetContext{})
+	if explicitKey != "ops@10.95.0.5:22" || explicitAuth.OriginalHost != "custom-orig" || explicitAuth.CanonicalHost != "" {
+		t.Fatalf("explicit OriginalHost leaked snap.Node.CanonicalHost: key=%q auth=%+v", explicitKey, explicitAuth)
 	}
 }
 

@@ -63,29 +63,29 @@ func TestRound8_P2_15_ControlProxyAndLookupAtomicOriginNoChimera(t *testing.T) {
 		t.Fatalf("chimera leaked CanonicalHost = %q from app-a onto app-b", clientCfg.CanonicalHost)
 	}
 
-	// 2. resolveSavedControlSessionLookup first branch: non-canonicalized alias "app-b"
+	// 2. saved control session lookup first branch: non-canonicalized alias "app-b"
 	// with explicit port matching "saved-shared" MUST replace stale snap.Node.CanonicalHost with "".
-	key, auth, handled, _ := resolveSavedControlSessionLookup(
-		prov, "saved-shared", "saved-shared",
-		config.ConnectionTarget{Selector: "app-b", Port: 22, HasPort: true},
-		"", "", "app-b", "",
-	)
-	if !handled || key != "saved-shared" {
-		t.Fatalf("resolveSavedControlSessionLookup #1 = (%q, %+v, %v), want handled saved-shared", key, auth, handled)
+	key, auth := adapter.ResolveControlSessionLookup(adapter.ControlTargetRequest{
+		Provider: prov,
+		NodeID:   "saved-shared",
+		Target:   config.ConnectionTarget{Selector: "app-b", Port: 22, HasPort: true},
+	}, ssh.TargetContext{OriginalHost: "app-b"})
+	if key != "saved-shared" {
+		t.Fatalf("ResolveControlSessionLookup #1 = (%q, %+v), want saved-shared", key, auth)
 	}
 	if auth.OriginalHost != "app-b" || auth.CanonicalHost != "" {
 		t.Fatalf("first branch leaked stale origin: got (%q, %q), want (\"app-b\", \"\")", auth.OriginalHost, auth.CanonicalHost)
 	}
 
-	// 3. resolveSavedControlSessionLookup second branch: when origHost is explicitly set without
+	// 3. saved control session lookup second branch: when origHost is explicitly set without
 	// canonHost (non-canonicalized session), MUST NOT inherit resolved.CanonicalHost.
-	_, auth2, handled2, _ := resolveSavedControlSessionLookup(
-		prov, "", "openssh:app-b",
-		config.ConnectionTarget{Selector: "saved-shared"},
-		"app-b", "", "app-b", "",
-	)
-	if !handled2 {
-		t.Fatal("expected second branch to resolve saved-shared")
+	key2, auth2 := adapter.ResolveControlSessionLookup(adapter.ControlTargetRequest{
+		Provider:              prov,
+		Target:                config.ConnectionTarget{Selector: "saved-shared"},
+		CanonicalOriginalHost: "app-b",
+	}, ssh.TargetContext{OriginalHost: "app-b"})
+	if key2 != "saved-shared" {
+		t.Fatalf("expected second branch to resolve saved-shared, got %q", key2)
 	}
 	if auth2.CanonicalHost != "" {
 		t.Fatalf("second branch leaked CanonicalHost = %q onto non-canonicalized origHost=app-b", auth2.CanonicalHost)
