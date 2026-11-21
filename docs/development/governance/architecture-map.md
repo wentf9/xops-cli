@@ -1,6 +1,6 @@
 # XOps CLI 代码地图（供人和 Codex 快速进入代码）
 
-基线：`master` @ `a12d52f`（2026-10-13）。以下是**按阅读到的源码和已有设计文档绘制的工作地图**，不是完整的函数级调用图。
+基线：`feat/openssh-compatibility` @ `58a3974`（2026-11-21）。以下是**按阅读到的源码和已有设计文档绘制的工作地图**，不是完整的函数级调用图。
 
 ## 系统功能
 
@@ -34,17 +34,19 @@ flowchart TD
   CFG --> CR[pkg/credential + internal/credentialfile]
   SFTP --> SSH
   ENV[internal/sshenv] --> SSH
+  SSH --> WINSEC[core/winsec]
+  ENV --> WINSEC
 ```
 
-**注意**：上图同时展示组合关系与包依赖方向（如 `core/mcp/runtime`、`core/mcp/sshexec`、`internal/mcphost` 均单向依赖契约包 `core/mcp/ports`；`core/sftp` 依赖 `core/ssh`；`core/ssh` 保持纯净单向解耦，由 `internal/sshenv` 注入宿主环境）。要生成精确 Go import 图可使用 `go list -json ./...` 核对。
+**注意**：上图同时展示组合关系与包依赖方向（如 `core/mcp/runtime`、`core/mcp/sshexec`、`internal/mcphost` 均单向依赖契约包 `core/mcp/ports`；`core/sftp` 依赖 `core/ssh`；`core/ssh` 与 `internal/sshenv` 单向依赖 `core/winsec` 完成 Windows DACL/ACE 与 AF_UNIX 对端令牌校验，且 `core/**` 保持无 CLI 依赖的纯净解耦，由 `internal/sshenv` 注入宿主环境）。要生成精确 Go import 图可使用 `go list -json ./...` 核对。
 
 ## 推荐按以下次序理解
 
-1. **程序启动 / 模块组装**：`cmd/cli/main.go:main` -> `cmd/root.go:Execute` -> `cmd/{ssh,exec,mcp,play,credential,ssh_control,ssh_option_flag}.go`。
+1. **程序启动 / 模块组装**：`cmd/cli/main.go:main` -> `cmd/root.go:Execute` -> `cmd/{ssh,exec,mcp,play,credential,ssh_control,ssh_option_flag,mux_daemon_spec}.go`。
 2. **配置与凭据状态**：`pkg/config/{provider,repository,store,target,encrypted_runtime,schema_v2,validate,openssh}.go`; `pkg/credential/service.go`; `internal/credentialfile`。
-3. **连接/命令语义**：`pkg/adapter/ssh_adapter.go` -> `core/ssh/{connector,plan,command_plan,command_execution,execution_config,probe}.go`。
-4. **OpenSSH 连接多路复用**：`cmd/{ssh_control,ssh_option_flag}.go` -> `pkg/adapter/ssh_adapter.go:ResolveControl`（4 层解析继承体系：CLI > Node > Global > OpenSSH）-> `core/ssh/{control_config,mux_protocol,mux_client,mux_proxy_conn,mux_server,mux_rights_unix,connector}.go`（`PROTOCOL.mux` v4 二进制线缆协议、0600 套接字原子硬链接防御、对端 Peer UID 校验、`ControlPersist` 后台守护与优雅退出）。
-5. **MCP 分层**：`cmd/mcp.go:runMCPServer` -> `internal/mcphost/{config,host}.go` -> `core/mcp/runtime/{server,invocation}.go` -> `core/mcp/ports/types.go`, `core/mcp/sshexec/backend.go`, `core/mcp/guardrail/*`（注：CLI 模式下 `internal/mcphost.host` 直接实现 `StateSource` 与 `ExecutionGate`；动态发布宿主使用 `core/mcp/state.Coordinator`）。
+3. **连接 / 选项注册表与命令语义**：`pkg/adapter/{ssh_adapter,policy_solver}.go` -> `core/ssh/{ssh_options,connector,plan,command_plan,command_execution,execution_config,probe}.go`（`core/ssh/ssh_options.go` 的 `OptionSpec` 声明式注册表统一驱动 `MergeMode`、`ConfigSyntax`、`Tier4Policy`、`MuxPolicy` 与 `ProjectCLIOptions`）。
+4. **OpenSSH 连接多路复用与控制面**：`cmd/{ssh_control,ssh_option_flag,mux_daemon_spec}.go` -> `pkg/adapter/ssh_adapter.go:ResolveControl`（4 层解析继承：CLI > Node > Global > OpenSSH）与 `pkg/adapter/control_target.go:{ResolveControlTarget,ResolveControlSocketPath}`（唯一只读控制面目标与套接字路径权威）-> `core/ssh/{control_config,mux_protocol,mux_client,mux_proxy_conn,mux_server,mux_rights_unix,mux_rights_windows,connector}.go` 与 `core/winsec/{eval,windows}.go`（`PROTOCOL.mux` v4 线缆协议、Unix 0600 原子硬链接与对端 UID 校验、Windows DACL/ACE 与 AF_UNIX 对端令牌校验、`ControlPersist` 后台守护与优雅退出）。
+5. **MCP 分层**：`cmd/mcp.go:runMCPServer` -> `internal/mcphost/{config,host,connector,credential_binding}.go`（准入阶段 `CapturePlan` 冻结连接计划，exec/SFTP/transfer/tunnel 全链路统一走 `ConnectPlan`）-> `core/mcp/runtime/{server,invocation}.go` -> `core/mcp/ports/types.go`, `core/mcp/sshexec/backend.go`, `core/mcp/guardrail/*`（注：CLI 模式下 `internal/mcphost.host` 直接实现 `StateSource` 与 `ExecutionGate`；动态发布宿主使用 `core/mcp/state.Coordinator`）。
 6. **批量执行与编排**：`cmd/exec.go`、`cmd/exec_execution.go` 和 `pkg/playbook/{engine,runner}.go`（支持跨任务步骤透明复用 ControlPath 套接字）。
 7. **交互**：`pkg/tui/*`、`cmd/sftpshell/*`、`internal/terminal/*`。
 
