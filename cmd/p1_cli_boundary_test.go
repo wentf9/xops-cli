@@ -338,3 +338,44 @@ func TestP1SFTPStdinCredentialConflictFailsClosedOnNonTerminalStdin(t *testing.T
 		}
 	})
 }
+
+func TestP1CLIIdentityPathValidationDelegatesCoreSSH(t *testing.T) {
+	badInputs := []struct {
+		name string
+		raw  string
+	}{
+		{"newline", "/tmp/id\nrsa"},
+		{"nul_byte", "/tmp/id\x00rsa"},
+		{"unicode_line_sep", "/tmp/id\u2028rsa"},
+		{"unknown_percent_token", "%d/.ssh/id_%k"},
+		{"trailing_percent", "/tmp/id%"},
+		{"unclosed_env", "${SSH_KEY"},
+		{"invalid_env_ident", "${BAD-NAME}/id"},
+	}
+
+	for _, tc := range badInputs {
+		t.Run("dash_i_rejects_"+tc.name, func(t *testing.T) {
+			o := NewSshOptions()
+			c := newCmdSshWithOptions(o)
+			if err := c.Flags().Parse([]string{"-i", tc.raw, "web"}); err != nil {
+				t.Fatalf("Parse(-i %q): %v", tc.raw, err)
+			}
+			if err := ApplyGeneralOptions(o, o.control.Options, c.Flags()); err == nil {
+				t.Fatalf("ApplyGeneralOptions(-i %q) unexpectedly succeeded", tc.raw)
+			}
+		})
+
+		t.Run("dash_o_rejects_"+tc.name, func(t *testing.T) {
+			o := NewSshOptions()
+			if err := ApplyGeneralOptions(o, []string{"IdentityFile=" + tc.raw}, nil); err == nil {
+				t.Fatalf("ApplyGeneralOptions(-o IdentityFile=%q) unexpectedly succeeded", tc.raw)
+			}
+		})
+
+		t.Run("normalize_preserves_invalid_"+tc.name, func(t *testing.T) {
+			if got := normalizeCLIIdentityPath(tc.raw); got != tc.raw {
+				t.Fatalf("normalizeCLIIdentityPath(%q) = %q, want verbatim invalid input for downstream fail-closed", tc.raw, got)
+			}
+		})
+	}
+}

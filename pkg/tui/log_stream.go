@@ -28,10 +28,6 @@ func isNonPOSIXExecution(execCfg *ssh.ExecutionConfig) bool {
 		execCfg.Interpreter == ssh.InterpreterPwsh
 }
 
-func posixSingleQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
-}
-
 func buildLogStreamCommand(target string) (string, error) {
 	if strings.TrimSpace(target) == "" {
 		return "", fmt.Errorf("log target must not be empty")
@@ -45,9 +41,9 @@ func buildLogStreamCommand(target string) (string, error) {
 		if !dockerContainerNameRe.MatchString(container) {
 			return "", fmt.Errorf("invalid docker container name %q", container)
 		}
-		return "docker logs --tail 100 -f -- " + posixSingleQuote(container), nil
+		return "docker logs --tail 100 -f -- " + ssh.ShellQuote(container), nil
 	}
-	return "tail -n 100 -f -- " + posixSingleQuote(target), nil
+	return "tail -n 100 -f -- " + ssh.ShellQuote(target), nil
 }
 
 type logLineMsg struct {

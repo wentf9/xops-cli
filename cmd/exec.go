@@ -1076,46 +1076,11 @@ func (o *ExecOptions) printTaskResult(ctx context.Context, t execHostTask, outpu
 	return writeExecResult(ctx, stdoutMu, o.stdoutWriter(), "%s\n", message)
 }
 
-func isWindowsReservedDeviceName(name string) bool {
-	stem := name
-	if idx := strings.IndexByte(stem, '.'); idx >= 0 {
-		stem = stem[:idx]
-	}
-	switch strings.ToUpper(stem) {
-	case "CON", "PRN", "AUX", "NUL",
-		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
-		return true
-	default:
-		return false
-	}
-}
-
 // sanitizeHostForFilename 清洗主机名，防止路径穿越、非法文件名与 Windows 保留设备名/NTFS ADS 问题。
 func sanitizeHostForFilename(host string) string {
-	trimmed := strings.TrimSpace(host)
-	if trimmed == "" || trimmed == "." || trimmed == ".." {
+	safe := ssh.SanitizeFilenameComponent(host)
+	if strings.Trim(safe, "_") == "" {
 		return "unknown_host"
-	}
-	var b strings.Builder
-	b.Grow(len(host))
-	for _, r := range host {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' {
-			b.WriteRune(r)
-		} else {
-			b.WriteByte('_')
-		}
-	}
-	safe := b.String()
-	for strings.Contains(safe, "..") {
-		safe = strings.ReplaceAll(safe, "..", "_")
-	}
-	safe = strings.Trim(safe, ".")
-	if safe == "" || strings.Trim(safe, "_") == "" {
-		return "unknown_host"
-	}
-	if isWindowsReservedDeviceName(safe) {
-		safe = "_" + safe
 	}
 	return safe
 }

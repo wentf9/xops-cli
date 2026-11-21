@@ -202,14 +202,25 @@ func (o *SshOptions) effectiveIdentityFiles() []string {
 // normalizeCLIIdentityPath converts plain relative or ~/ paths to absolute paths
 // while preserving "none" and token/env-bearing patterns (%d, ${VAR}) for core/ssh.
 func normalizeCLIIdentityPath(raw string) string {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
+	setting, err := ssh.ParseIdentityPathSetting(raw, true)
+	if err != nil {
+		if strings.TrimSpace(raw) == "" {
+			return ""
+		}
+		// Preserve invalid syntax/control chars verbatim so downstream core/ssh
+		// option validation fails closed instead of mangling or dropping the entry.
+		return raw
+	}
+	switch {
+	case setting.Unset():
 		return ""
+	case setting.Disabled():
+		return strings.TrimSpace(raw)
+	case setting.IsTemplate():
+		return setting.Raw
+	default:
+		return utils.ToAbsolutePath(setting.Raw)
 	}
-	if strings.EqualFold(trimmed, "none") || strings.Contains(trimmed, "%") || strings.Contains(trimmed, "${") {
-		return trimmed
-	}
-	return utils.ToAbsolutePath(trimmed)
 }
 
 func (o *SshOptions) absIdentityFiles() []string {

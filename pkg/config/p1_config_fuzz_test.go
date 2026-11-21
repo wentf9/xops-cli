@@ -547,3 +547,40 @@ func TestP1_RepositoryRefChecksRespectContextWhileCommitLocked(t *testing.T) {
 		t.Fatalf("ConfirmRefDurable under locked commitMu = %v, want context.DeadlineExceeded", err)
 	}
 }
+
+func TestP1_IsPersistableIdentityPath_DelegatesCanonicalRules(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	cases := []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{"empty", "", false},
+		{"spaces_only", "   ", false},
+		{"none_lower", "none", false},
+		{"none_upper_padded", "  NONE  ", false},
+		{"percent_token", "%d/.ssh/id_%r", false},
+		{"invalid_percent_token", "~/.ssh/id_%k", false},
+		{"env_placeholder", "${SSH_KEY_PATH}", false},
+		{"invalid_env_placeholder", "${BAD-NAME}/id", false},
+		{"control_newline", "/tmp/id_ed25519\n", false},
+		{"control_nul", "/tmp/id\x00key", false},
+		{"unicode_line_sep", "/tmp/id\u2028key", false},
+		{"unresolved_tilde_user", "~nonexistent_xops_user_999/id_ed25519", false},
+		{"home_tilde", "~/.ssh/id_ed25519", true},
+		{"home_tilde_padded", "  ~/.ssh/id_ed25519  ", true},
+		{"concrete_abs", "/tmp/id_ed25519", true},
+		{"concrete_rel", "rel_id_ed25519", true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsPersistableIdentityPath(tc.raw); got != tc.want {
+				t.Errorf("IsPersistableIdentityPath(%q) = %v, want %v", tc.raw, got, tc.want)
+			}
+		})
+	}
+}

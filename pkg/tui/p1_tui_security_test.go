@@ -34,7 +34,7 @@ func TestP1BuildLogStreamCommand_QuotingAndValidation(t *testing.T) {
 		{
 			name:   "spaces backticks semicolons and single quote",
 			target: "/var/log/my 'app'; `uname` && id.log",
-			want:   `tail -n 100 -f -- '/var/log/my '"'"'app'"'"'; ` + "`uname`" + ` && id.log'`,
+			want:   `tail -n 100 -f -- '/var/log/my '\''app'\''; ` + "`uname`" + ` && id.log'`,
 		},
 		{
 			name:   "leading dash neutralized by double dash",
@@ -162,8 +162,8 @@ func TestP1LogStreamerStartStream_EndToEndCommandQuotingAndRejection(t *testing.
 	if len(seenExecs) != 1 {
 		t.Fatalf("expected exactly 1 SSH exec (rejected docker target must not execute), got %d: %v", len(seenExecs), seenExecs)
 	}
-	wantInner := `tail -n 100 -f -- '/var/log/x$(id) '"'"'quoted'"'"'.log'`
-	wantWrapped := "bash -c '" + strings.ReplaceAll(wantInner, "'", `'\''`) + "'"
+	wantInner := `tail -n 100 -f -- '/var/log/x$(id) '\''quoted'\''.log'`
+	wantWrapped := "bash -c " + ssh.ShellQuote(wantInner)
 	if seenExecs[0] != wantWrapped {
 		t.Fatalf("SSH exec command = %q, want %q", seenExecs[0], wantWrapped)
 	}

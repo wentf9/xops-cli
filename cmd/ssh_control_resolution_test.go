@@ -129,22 +129,24 @@ func TestControlCommandAmbiguousSelectorFails(t *testing.T) {
 	content := `schema_version: 2
 nodes:
   node-a:
-    alias: [shared]
     host_ref: host-a
-    identity_ref: id
+    identity_ref: id-a
     sudo_mode: none
   node-b:
-    alias: [shared]
     host_ref: host-a
-    identity_ref: id
+    identity_ref: id-b
     sudo_mode: none
 hosts:
   host-a:
     address: 10.0.0.1
+    alias: [shared]
     port: 22
 identities:
-  id:
+  id-a:
     user: deploy
+    auth_type: auto
+  id-b:
+    user: ops
     auth_type: auto
 `
 	if err := os.WriteFile(filepath.Join(directory, "xops_config.yaml"), []byte(content), 0o600); err != nil {

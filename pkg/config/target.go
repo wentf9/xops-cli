@@ -100,16 +100,13 @@ func FormatNodeID(user, address string, port uint16) string {
 
 // IsPersistableIdentityPath reports whether raw is a concrete identity key path
 // suitable for persisting into Identity.KeyPath (excluding "none", OpenSSH % tokens,
-// ${ENV} placeholders, and unresolved ~user prefixes).
+// ${ENV} placeholders, invalid control/token syntax, and unresolved ~user prefixes).
 func IsPersistableIdentityPath(raw string) bool {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" || strings.EqualFold(trimmed, "none") {
+	setting, err := ssh.ParseIdentityPathSetting(raw, true)
+	if err != nil || !setting.Persistable() {
 		return false
 	}
-	if strings.Contains(trimmed, "%") || strings.Contains(trimmed, "${") {
-		return false
-	}
-	expanded := fileutils.ToAbsolutePath(trimmed)
+	expanded := fileutils.ToAbsolutePath(setting.Raw)
 	return expanded != "" && !strings.HasPrefix(expanded, "~")
 }
 

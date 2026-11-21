@@ -614,19 +614,22 @@ func validateNonEmptyIdentityFlag(f *pflag.Flag, flags *pflag.FlagSet) error {
 	return nil
 }
 
-// normalizeCLIIdentityFlagPath converts plain relative or ~/ paths from CLI -i
-// to absolute paths while preserving % tokens and ${VAR} placeholders without
-// CWD mangling. Unlike -o IdentityFile=none, literal -i none resolves to
+// normalizeCLIIdentityFlagPath validates and converts plain relative or ~/ paths
+// from CLI -i to absolute paths while preserving % tokens and ${VAR} placeholders
+// without CWD mangling. Unlike -o IdentityFile=none, literal -i none resolves to
 // <cwd>/none matching OpenSSH ssh.c add_identity_file().
-func normalizeCLIIdentityFlagPath(raw string) string {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return ""
+func normalizeCLIIdentityFlagPath(raw string) (string, error) {
+	setting, err := ssh.ParseIdentityPathSetting(raw, false)
+	if err != nil {
+		return "", fmt.Errorf("invalid --identity (-i) path: %w", err)
 	}
-	if strings.Contains(trimmed, "%") || strings.Contains(trimmed, "${") {
-		return trimmed
+	if setting.Unset() {
+		return "", nil
 	}
-	return utils.ToAbsolutePath(trimmed)
+	if setting.IsTemplate() {
+		return setting.Raw, nil
+	}
+	return utils.ToAbsolutePath(setting.Raw), nil
 }
 
 func ApplyGeneralOptions(opts *SshOptions, optionStrings []string, flags *pflag.FlagSet) error {
@@ -638,7 +641,11 @@ func ApplyGeneralOptions(opts *SshOptions, optionStrings []string, flags *pflag.
 		normalized := make([]string, 0, len(opts.IdentityFiles))
 		persistable := ""
 		for _, k := range opts.IdentityFiles {
-			if norm := normalizeCLIIdentityFlagPath(k); norm != "" {
+			norm, err := normalizeCLIIdentityFlagPath(k)
+			if err != nil {
+				return err
+			}
+			if norm != "" {
 				normalized = append(normalized, norm)
 				if persistable == "" && config.IsPersistableIdentityPath(norm) {
 					persistable = norm
@@ -704,7 +711,11 @@ func applyGeneralOption(opts *SshOptions, st *generalOptionState, key, val strin
 }
 
 func applyIdentityFileGeneralOption(opts *SshOptions, _ *generalOptionState, key, val string) error {
-	if val == "" {
+	setting, err := ssh.ParseIdentityPathSetting(val, true)
+	if err != nil {
+		return fmt.Errorf("invalid %s in -o option: %w", key, err)
+	}
+	if setting.Unset() {
 		return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
 	}
 	opts.IdentityFiles = append(opts.IdentityFiles, val)
