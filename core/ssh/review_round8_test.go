@@ -229,12 +229,19 @@ func TestRound8_P2_2_P3_1_OptionsEqualDeleteIsNoneValueAndValidateControlPath(t 
 	if resolved, err := ctrl.ResolvePath(Environment{}, TargetContext{}); err != nil || resolved != "none" {
 		t.Fatalf("ControlConfig.ResolvePath(NONE) = (%q, %v), want (\"none\", nil)", resolved, err)
 	}
-	merged, err := ResolveControl(&ControlConfig{Path: "NONE"}, &ControlConfig{Master: ControlMasterAuto, Path: "/tmp/m.sock", Persist: "10m"})
+	eff, err := EffectiveOptions(
+		OptionsFromControl(&ControlConfig{Path: "NONE"}),
+		OptionsFromControl(&ControlConfig{Master: ControlMasterAuto, Path: "/tmp/m.sock", Persist: "10m"}),
+	)
 	if err != nil {
-		t.Fatalf("ResolveControl failed: %v", err)
+		t.Fatalf("EffectiveOptions failed: %v", err)
+	}
+	merged, err := eff.ValidatedControlConfig()
+	if err != nil {
+		t.Fatalf("ValidatedControlConfig failed: %v", err)
 	}
 	if merged.Path != "none" || merged.Master != ControlMasterNo || merged.Persist != "" || merged.LiteralPath {
-		t.Fatalf("ResolveControl(NONE child) = %+v, want disabled none", merged)
+		t.Fatalf("ValidatedControlConfig(NONE child) = %+v, want disabled none", merged)
 	}
 
 	// P3-1: ValidateControlPath rejects whitespace-only string.

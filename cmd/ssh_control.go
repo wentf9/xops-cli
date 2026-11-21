@@ -301,6 +301,9 @@ func expandControlSocketPath(o *SshOptions, provider config.ConfigProvider, node
 			if err != nil {
 				return "", controlError(stderr, fmt.Sprintf("expand ControlPath %q failed: %v", rawLiteral, err))
 			}
+			if strings.TrimSpace(expanded) == "" || ssh.IsNoneValue(expanded) {
+				return "", controlError(stderr, "ControlPath must be specified when using -O")
+			}
 			return expanded, nil
 		}
 	}
@@ -313,6 +316,9 @@ func expandControlSocketPath(o *SshOptions, provider config.ConfigProvider, node
 		if err != nil {
 			return "", controlError(stderr, fmt.Sprintf("expand ControlPath %q failed: %v", rawPath, err))
 		}
+		if strings.TrimSpace(expanded) == "" || ssh.IsNoneValue(expanded) {
+			return "", controlError(stderr, "ControlPath must be specified when using -O")
+		}
 		return expanded, nil
 	}
 
@@ -322,7 +328,7 @@ func expandControlSocketPath(o *SshOptions, provider config.ConfigProvider, node
 	if err != nil {
 		return "", controlError(stderr, fmt.Sprintf("resolve control path failed: %v", err))
 	}
-	if expanded == "" || strings.EqualFold(strings.TrimSpace(expanded), "none") {
+	if strings.TrimSpace(expanded) == "" || ssh.IsNoneValue(expanded) {
 		return "", controlError(stderr, "ControlPath must be specified when using -O")
 	}
 	return expanded, nil

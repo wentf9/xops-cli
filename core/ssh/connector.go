@@ -514,8 +514,8 @@ func (c *Connector) resolveControl(nodeName string, cfg *ClientConfig) *ControlC
 		return nil
 	}
 	if cfg != nil && cfg.Options != nil {
-		if err := cfg.Options.ValidateEffective(); err == nil {
-			return cfg.Options.ControlConfig()
+		if ctrl, err := cfg.Options.ValidatedControlConfig(); err == nil {
+			return ctrl
 		} else {
 			c.getLogger().Debugf("ssh: ignoring invalid effective control options for %q: %v", nodeName, err)
 		}
@@ -785,8 +785,7 @@ func (c *Connector) warnOrDebugf(warn bool, format string, args ...any) {
 }
 
 func isMultiplexControlEnabled(target TargetContext) bool {
-	ctrl := target.Control
-	return ctrl != nil && ctrl.Path != "" && ctrl.Path != "none" && target.Host != ""
+	return target.Control.IsEnabled() && target.Host != ""
 }
 
 func isMasterListenerMode(mode ControlMasterMode) bool {
@@ -806,6 +805,9 @@ func (c *Connector) tryConnectMultiplex(ctx context.Context, planNode connection
 	expandedPath, err := ctrl.ResolvePath(c.environment, target)
 	if err != nil {
 		c.warnOrDebugf(explicitMaster, "mux: expand control path %q failed: %v; continuing without connection sharing", ctrl.Path, err)
+		return nil, nil
+	}
+	if strings.TrimSpace(expandedPath) == "" || IsNoneValue(expandedPath) {
 		return nil, nil
 	}
 	if err := ValidateControlPath(expandedPath); err != nil {
@@ -1048,7 +1050,7 @@ func (c *Connector) maybeStartMasterListener(planNode connectionPlanNode, resolv
 	}
 
 	expandedPath, err := ctrl.ResolvePath(c.environment, target)
-	if err != nil || ValidateControlPath(expandedPath) != nil {
+	if err != nil || strings.TrimSpace(expandedPath) == "" || IsNoneValue(expandedPath) || ValidateControlPath(expandedPath) != nil {
 		return
 	}
 

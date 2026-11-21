@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -261,24 +262,13 @@ func TestEncodeDecodeTunnelFrame_PointToPoint(t *testing.T) {
 	}
 }
 
-func TestEncodeDecodeTunnelFrame_Ethernet(t *testing.T) {
-	ethPkt := bytes.Repeat([]byte{0xfe}, 14) // 14-byte minimum Ethernet header
-	frame, err := encodeTunnelFrame(nil, TunnelModeEthernet, ethPkt)
-	if err != nil {
-		t.Fatalf("encode Ethernet frame failed: %v", err)
+func TestEncodeDecodeTunnelFrame_EthernetUnsupported(t *testing.T) {
+	ethPkt := bytes.Repeat([]byte{0xfe}, 14)
+	if _, err := encodeTunnelFrame(nil, TunnelModeEthernet, ethPkt); !errors.Is(err, ErrTunnelDeviceUnsupported) {
+		t.Fatalf("encodeTunnelFrame(TunnelModeEthernet) = %v, want ErrTunnelDeviceUnsupported", err)
 	}
-	if len(frame) != len(ethPkt) {
-		t.Fatalf("Ethernet frame len = %d, want %d", len(frame), len(ethPkt))
-	}
-	if !bytes.Equal(frame, ethPkt) {
-		t.Errorf("encoded Ethernet frame mismatch: got %x, want %x", frame, ethPkt)
-	}
-	decoded, err := decodeTunnelPayload(TunnelModeEthernet, frame)
-	if err != nil {
-		t.Fatalf("decode Ethernet frame failed: %v", err)
-	}
-	if !bytes.Equal(decoded, ethPkt) {
-		t.Errorf("decoded Ethernet mismatch: got %x, want %x", decoded, ethPkt)
+	if _, err := decodeTunnelPayload(TunnelModeEthernet, ethPkt); !errors.Is(err, ErrTunnelDeviceUnsupported) {
+		t.Fatalf("decodeTunnelPayload(TunnelModeEthernet) = %v, want ErrTunnelDeviceUnsupported", err)
 	}
 }
 
@@ -331,20 +321,15 @@ func testEncodeTunnelFrameErrors(t *testing.T) {
 		t.Error("expected error encoding IP version 3")
 	}
 
-	// Ethernet frame too short (< 14 bytes)
-	if _, err := encodeTunnelFrame(nil, TunnelModeEthernet, make([]byte, 13)); err == nil {
-		t.Error("expected error encoding short Ethernet frame")
+	// Ethernet mode explicitly unsupported
+	if _, err := encodeTunnelFrame(nil, TunnelModeEthernet, make([]byte, 14)); !errors.Is(err, ErrTunnelDeviceUnsupported) {
+		t.Errorf("encodeTunnelFrame(TunnelModeEthernet) = %v, want ErrTunnelDeviceUnsupported", err)
 	}
 
 	// Payload exceeding maxTunnelWirePayloadBytes
 	hugePkt := makeTestIPv4Packet(make([]byte, maxTunnelWirePayloadBytes))
 	if _, err := encodeTunnelFrame(nil, TunnelModePointToPoint, hugePkt); err == nil {
 		t.Error("expected error encoding oversized IP packet")
-	}
-
-	hugeEth := make([]byte, maxTunnelWirePayloadBytes+1)
-	if _, err := encodeTunnelFrame(nil, TunnelModeEthernet, hugeEth); err == nil {
-		t.Error("expected error encoding oversized Ethernet frame")
 	}
 
 	// Unsupported tunnel mode
@@ -377,9 +362,9 @@ func testDecodeTunnelPayloadErrors(t *testing.T) {
 		t.Error("expected error decoding unknown address family")
 	}
 
-	// Decode short Ethernet frame (< 14 bytes)
-	if _, err := decodeTunnelPayload(TunnelModeEthernet, make([]byte, 13)); err == nil {
-		t.Error("expected error decoding short Ethernet frame")
+	// Ethernet mode explicitly unsupported
+	if _, err := decodeTunnelPayload(TunnelModeEthernet, make([]byte, 14)); !errors.Is(err, ErrTunnelDeviceUnsupported) {
+		t.Errorf("decodeTunnelPayload(TunnelModeEthernet) = %v, want ErrTunnelDeviceUnsupported", err)
 	}
 
 	// Unsupported tunnel mode
@@ -424,32 +409,6 @@ func servePointToPointBidirectionalChannel(t *testing.T, ch cryptoSSH.Channel, s
 	wire6 := append([]byte{0x00, 0x00, 0x00, 0x18}, resp6...)
 	if _, wErr := ch.Write(wire6); wErr != nil {
 		t.Errorf("server write IPv6 wire err: %v", wErr)
-		return
-	}
-
-	buf := make([]byte, 1024)
-	for {
-		if _, rErr := ch.Read(buf); rErr != nil {
-			break
-		}
-	}
-}
-
-func serveEthernetBidirectionalChannel(t *testing.T, ch cryptoSSH.Channel, sendEth, respEth []byte) {
-	defer func() { _ = ch.Close() }()
-
-	gotEth := make([]byte, len(sendEth))
-	if _, rErr := io.ReadFull(ch, gotEth); rErr != nil {
-		t.Errorf("server read eth err: %v", rErr)
-		return
-	}
-	if !bytes.Equal(gotEth, sendEth) {
-		t.Errorf("server received eth mismatch: got %x, want %x", gotEth, sendEth)
-		return
-	}
-
-	if _, wErr := ch.Write(respEth); wErr != nil {
-		t.Errorf("server write eth wire err: %v", wErr)
 		return
 	}
 
@@ -538,70 +497,32 @@ func TestTunnelDeviceForward_PointToPoint_Bidirectional(t *testing.T) {
 	}
 }
 
-func TestTunnelDeviceForward_Ethernet_Bidirectional(t *testing.T) {
+func TestTunnelDeviceForward_Ethernet_UnsupportedFailsClosed(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
-	var (
-		openMode       uint32
-		openRemoteUnit uint32
-	)
-	channelReady := make(chan struct{})
-	sendEth := bytes.Repeat([]byte{0xab}, 14)
-	respEth := bytes.Repeat([]byte{0xcd}, 14)
-
+	channelOpened := false
 	_, client, opener, teardown := startMockOpenSSHTunnelServer(t, func(newChan cryptoSSH.NewChannel) {
-		if newChan.ChannelType() != "tun@openssh.com" {
-			_ = newChan.Reject(cryptoSSH.UnknownChannelType, "not tun@openssh.com")
-			return
-		}
-		var msg tunnelChannelOpenMsg
-		_ = cryptoSSH.Unmarshal(newChan.ExtraData(), &msg)
-		openMode = msg.Mode
-		openRemoteUnit = msg.RemoteUnit
-
-		ch, reqs, err := newChan.Accept()
-		if err != nil {
-			return
-		}
-		go cryptoSSH.DiscardRequests(reqs)
-		close(channelReady)
-		serveEthernetBidirectionalChannel(t, ch, sendEth, respEth)
+		channelOpened = true
+		_ = newChan.Reject(cryptoSSH.Prohibited, "should not be called")
 	})
 	defer teardown()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	spec := TunnelDeviceSpec{LocalUnit: 1, RemoteUnit: 2}
 	forward, err := client.TunnelDeviceForward(ctx, TunnelModeEthernet, spec)
-	if err != nil {
-		t.Fatalf("TunnelDeviceForward failed: %v", err)
+	if !errors.Is(err, ErrTunnelDeviceUnsupported) {
+		t.Fatalf("TunnelDeviceForward(TunnelModeEthernet) = (%v, %v), want ErrTunnelDeviceUnsupported", forward, err)
 	}
-
-	select {
-	case <-channelReady:
-	case <-time.After(3 * time.Second):
-		t.Fatal("channel not opened")
+	if forward != nil {
+		t.Fatalf("expected nil forward on unsupported ethernet mode, got %v", forward)
 	}
-
-	if openMode != openSSHTunModeEthernet {
-		t.Errorf("openMode = %d, want %d", openMode, openSSHTunModeEthernet)
+	if opener.lastDev != nil {
+		t.Fatal("local tunnel device should not be opened when ethernet mode is unsupported")
 	}
-	if openRemoteUnit != 2 {
-		t.Errorf("openRemoteUnit = %d, want 2", openRemoteUnit)
-	}
-
-	fakeDev := opener.lastDev
-	if fakeDev == nil {
-		t.Fatal("fake tunnel device was not created")
-	}
-
-	fakeDev.outbound <- sendEth
-	expectFakeDeviceInboundPacket(t, fakeDev, respEth, "Ethernet response frame")
-
-	cancel()
-	if wErr := forward.Wait(); wErr != nil {
-		t.Errorf("forward.Wait() on cancel error = %v, want nil", wErr)
+	if channelOpened {
+		t.Fatal("remote tun@openssh.com channel should not be opened when ethernet mode is unsupported")
 	}
 }
 

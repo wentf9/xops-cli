@@ -54,12 +54,14 @@ func isAddressAlreadyInUse(err error) bool {
 }
 
 func bindAndLinkSocket(targetPath string) (net.Listener, os.FileInfo, error) {
+	maxPathLen := MaxControlPathLength() - 1 // 107 on Linux, 103 on Darwin/BSD
+	targetLen := len(targetPath)
+	if targetLen > maxPathLen {
+		return nil, nil, fmt.Errorf("control path %q exceeds maximum Unix socket path length (%d bytes)", targetPath, maxPathLen)
+	}
 	if err := os.MkdirAll(filepath.Dir(targetPath), 0700); err != nil {
 		return nil, nil, fmt.Errorf("create socket directory failed: %w", err)
 	}
-
-	maxPathLen := MaxControlPathLength() - 1 // 107 on Linux, 103 on Darwin/BSD
-	targetLen := len(targetPath)
 	suffixBudget := maxPathLen - targetLen
 	dir := filepath.Dir(targetPath)
 	dirBudget := maxPathLen - (len(dir) + 1)
@@ -69,26 +71,7 @@ func bindAndLinkSocket(targetPath string) (net.Listener, os.FileInfo, error) {
 
 	if !useSuffixTemp && !useDirTemp {
 		// Fallback: Direct bind on targetPath when path length budget is exhausted.
-		listener, err := net.Listen("unix", targetPath)
-		if err != nil {
-			if isAddressAlreadyInUse(err) {
-				return nil, nil, fmt.Errorf("%w: %s", ErrMasterAlreadyExists, targetPath)
-			}
-			return nil, nil, fmt.Errorf("listen on control socket failed: %w", err)
-		}
-		disableUnixListenerUnlinkOnClose(listener)
-		if err := os.Chmod(targetPath, 0600); err != nil {
-			_ = listener.Close()
-			_ = os.Remove(targetPath)
-			return nil, nil, fmt.Errorf("chmod control socket failed: %w", err)
-		}
-		origFi, lstatErr := os.Lstat(targetPath)
-		if lstatErr != nil {
-			_ = listener.Close()
-			_ = os.Remove(targetPath)
-			return nil, nil, fmt.Errorf("stat control socket failed: %w", lstatErr)
-		}
-		return listener, origFi, nil
+		return bindDirectControlSocket(targetPath)
 	}
 
 	// Linking Strategy: Bind tempPath -> Chmod 0600 -> Atomic Link to targetPath -> Unlink tempPath.
@@ -144,6 +127,29 @@ func bindAndLinkSocket(targetPath string) (net.Listener, os.FileInfo, error) {
 		return nil, nil, fmt.Errorf("link control socket failed: %w", err)
 	}
 
+	return listener, origFi, nil
+}
+
+func bindDirectControlSocket(targetPath string) (net.Listener, os.FileInfo, error) {
+	listener, err := net.Listen("unix", targetPath)
+	if err != nil {
+		if isAddressAlreadyInUse(err) {
+			return nil, nil, fmt.Errorf("%w: %s", ErrMasterAlreadyExists, targetPath)
+		}
+		return nil, nil, fmt.Errorf("listen on control socket failed: %w", err)
+	}
+	disableUnixListenerUnlinkOnClose(listener)
+	if err := os.Chmod(targetPath, 0600); err != nil {
+		_ = listener.Close()
+		_ = os.Remove(targetPath)
+		return nil, nil, fmt.Errorf("chmod control socket failed: %w", err)
+	}
+	origFi, lstatErr := os.Lstat(targetPath)
+	if lstatErr != nil {
+		_ = listener.Close()
+		_ = os.Remove(targetPath)
+		return nil, nil, fmt.Errorf("stat control socket failed: %w", lstatErr)
+	}
 	return listener, origFi, nil
 }
 

@@ -251,9 +251,6 @@ xops ssh -W 192.0.2.20:22 bastion
 
 # 隧道设备转发（-w）：建立点对点 (tun) 虚拟网卡隧道（需服务端开启 PermitTunnel）
 xops ssh -w 0:0 -N gw
-
-# 二层以太网 (tap) 隧道转发（须在 -w 之前指定 -o Tunnel=ethernet）
-xops ssh -o Tunnel=ethernet -w 1:any -N gw
 ```
 
 - **本地端口转发 (`-L [bind_address:]port:host:hostport` 或 `-L local_socket:remote_socket`)**：
@@ -279,9 +276,9 @@ xops ssh -o Tunnel=ethernet -w 1:any -N gw
   - 默认隐含 `-N`（不执行远程命令）、`-T`（禁止分配 PTY）、`ExitOnForwardFailure=yes` 与 `ClearAllForwardings=yes`（可通过配置文件或 `-o` 显式覆盖，例如 `-o ClearAllForwardings=no`、`-o ExitOnForwardFailure=no`）。
   - `-W` 转发为专用纯净二进制流通道，不可与远程命令、`-f` 后台运行、`--sudo` 或 `-O` 多路复用控制命令（`-O proxy` 除外）同时使用。
 - **隧道设备转发 (`-w local_tun[:remote_tun]` / `--tunnel-device`)**：
-  - 建立客户端与服务端（需 `sshd` 开启 `PermitTunnel`）之间的三层（`point-to-point`）或二层（`ethernet`）虚拟网卡隧道。
+  - 建立客户端与服务端（需 `sshd` 开启 `PermitTunnel`）之间的三层（`point-to-point`）虚拟网卡隧道。
   - 单元号可为非负整数或 `any`（由系统自动分配空闲设备），省略 `:remote_tun` 时默认为 `any`（例如 `-w 0` 等价于 `-w 0:any`）。
-  - **模式与顺序规则**：若未提前指定 `Tunnel` 指令，默认采用 `point-to-point` 模式；如需 `ethernet` 二层模式，需在 `-w` **之前**指定 `-o Tunnel=ethernet`（例如 `xops ssh -o Tunnel=ethernet -w 0:0 gw`）。
-  - **平台支持说明**：Linux 原生支持 `tun` (`point-to-point`) 与 `tap` (`ethernet`)；macOS 原生支持 `utun` (`point-to-point`)；Windows 暂不支持本地内核虚拟网卡创建（配置项与 `-o` 解析仍全平台可用）。
+  - **模式与兼容性说明**：默认采用 `point-to-point`（三层）模式；`ethernet`（二层 `tap`）模式目前**不支持**（因底层 Go `x/crypto/ssh` 通道为字节流抽象，无法保留 OpenSSH `tun@openssh.com` 二层数据报边界），配置解析阶段为兼容既有 `~/.ssh/config` 仍接受 `Tunnel ethernet`，但实际启用隧道时会显式返回不支持错误。
+  - **平台支持说明**：Linux 原生支持 `tun` (`point-to-point`)；macOS 原生支持 `utun` (`point-to-point`)；Windows 暂不支持本地内核虚拟网卡创建（配置项与 `-o` 解析仍全平台可用）。
 - **单连接故障隔离**：单次转发连接失败（如 `administratively prohibited` 或目标端口未监听）通过受控队列提示到 `stderr`，但不会中断主 SSH 会话或转发监听器。`-N` 就绪提示仍写 stdout。堵塞输出不会卡住转发回调，输出失败在结束时作为错误返回；不支持的管道可能略过辅助提示，可将对应输出流重定向到普通文件。
 - **连接保活与断开退出**：使用 `-L`、`-R`、`-D`、`-w` 或 `-N` 时自动启用连接监测——连续 15 秒无远端数据时发送 SSH 心跳，等待期间若连续 10 秒既无心跳回复也无数据进展则判定断线，自动关闭本地监听端口并以非零状态退出。后台运行可组合 `-f -N`。

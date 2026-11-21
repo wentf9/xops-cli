@@ -22,7 +22,6 @@ const (
 	openSSHTunnelChannelType = "tun@openssh.com"
 
 	openSSHTunModePointToPoint uint32 = 1
-	openSSHTunModeEthernet     uint32 = 2
 
 	// OpenSSH wire address family constants (OpenBSD AF_INET=2, AF_INET6=24).
 	openSSHAFInet  uint32 = 2
@@ -34,13 +33,14 @@ const (
 	maxTunnelRxFrameBytes     = 4 + 40 + 65535 // 65579
 )
 
-// TunnelDevice abstracts a local OS Layer-3 (tun/utun) or Layer-2 (tap) virtual interface.
+// TunnelDevice abstracts a local OS Layer-3 (tun/utun) virtual interface.
 //
 // Packet framing contract:
 //   - In TunnelModePointToPoint, ReadPacket and WritePacket exchange raw IPv4/IPv6
 //     packets WITHOUT OS-specific PI or BSD loopback headers.
-//   - In TunnelModeEthernet, ReadPacket and WritePacket exchange raw IEEE 802.3
-//     Ethernet frames.
+//   - TunnelModeEthernet (Layer-2 tap) is explicitly unsupported because
+//     golang.org/x/crypto/ssh.Channel is byte-stream oriented and does not
+//     preserve per-SSH_MSG_CHANNEL_DATA datagram boundaries.
 //   - Close must be idempotent and immediately unblock any concurrent ReadPacket/WritePacket.
 type TunnelDevice interface {
 	Name() string
@@ -85,8 +85,7 @@ func validateTunnelDeviceModeAndSpec(mode TunnelMode, spec TunnelDeviceSpec) (Tu
 		wireMode = openSSHTunModePointToPoint
 		networkName = "tun"
 	case TunnelModeEthernet:
-		wireMode = openSSHTunModeEthernet
-		networkName = "tap"
+		return "", 0, "", fmt.Errorf("%w: ethernet (layer-2 tap) tunnel forwarding is not supported because the underlying SSH channel transport does not preserve datagram packet boundaries", ErrTunnelDeviceUnsupported)
 	default:
 		return "", 0, "", fmt.Errorf("invalid tunnel mode %q for tunnel device forwarding", mode)
 	}
@@ -96,7 +95,7 @@ func validateTunnelDeviceModeAndSpec(mode TunnelMode, spec TunnelDeviceSpec) (Tu
 	return mode, wireMode, networkName, nil
 }
 
-// TunnelDeviceForward opens a local tun/tap device and bridges packets with the
+// TunnelDeviceForward opens a local Layer-3 (tun/utun) device and bridges packets with the
 // remote SSH server over an OpenSSH "tun@openssh.com" channel.
 //
 // Ownership contract: On startup error, any opened local TunnelDevice is closed
@@ -261,7 +260,7 @@ func pumpChannelToDevice(ctx context.Context, ch io.Reader, dev TunnelDevice, mo
 	case TunnelModePointToPoint:
 		return pumpPointToPointToDevice(ctx, ch, dev, onPacketErr)
 	case TunnelModeEthernet:
-		return pumpEthernetToDevice(ctx, ch, dev, onPacketErr)
+		return fmt.Errorf("%w: ethernet (layer-2 tap) tunnel forwarding is not supported", ErrTunnelDeviceUnsupported)
 	default:
 		return fmt.Errorf("unsupported tunnel mode %q", mode)
 	}
@@ -371,42 +370,8 @@ func extractNextPointToPointPacket(data []byte) (pkt []byte, consumed int, needM
 	}
 }
 
-// pumpEthernetToDevice pumps L2 Ethernet frames from the SSH channel to the local TAP device.
-// Unlike L3 point-to-point tunnels where IP headers define exact packet lengths, Ethernet II
-// frames lack a universal L2 frame length field (EtherType indicates payload protocol, not frame
-// length, and frames may contain trailing hardware padding). OpenSSH tun@openssh.com in ethernet
-// mode relies on 1:1 SSH_MSG_CHANNEL_DATA message framing per Ethernet frame, with no extra
-// inner header.
-func pumpEthernetToDevice(ctx context.Context, ch io.Reader, dev TunnelDevice, onPacketErr func(error)) error {
-	readBuf := make([]byte, maxTunnelDeviceReadBytes)
-	for {
-		n, rErr := ch.Read(readBuf)
-		if n > 0 {
-			pkt, decErr := decodeTunnelPayload(TunnelModeEthernet, readBuf[:n])
-			if decErr != nil {
-				if onPacketErr != nil && ctx.Err() == nil {
-					onPacketErr(decErr)
-				}
-			} else {
-				if writeErr := dev.WritePacket(pkt); writeErr != nil {
-					if ctx.Err() != nil || errors.Is(writeErr, os.ErrClosed) || errors.Is(writeErr, net.ErrClosed) {
-						return nil
-					}
-					return fmt.Errorf("write local tunnel device %s failed: %w", dev.Name(), writeErr)
-				}
-			}
-		}
-		if rErr != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			return fmt.Errorf("SSH connection lost on tunnel %s read: %w", dev.Name(), rErr)
-		}
-	}
-}
-
-// encodeTunnelFrame encodes a raw L3 IP packet or L2 Ethernet frame into an
-// OpenSSH tun@openssh.com wire frame ([uint32 AF][pkt] for point-to-point, [pkt] for ethernet).
+// encodeTunnelFrame encodes a raw L3 IP packet into an OpenSSH tun@openssh.com
+// wire frame ([uint32 AF][pkt] for point-to-point).
 func encodeTunnelFrame(dst []byte, mode TunnelMode, pkt []byte) ([]byte, error) {
 	switch mode {
 	case TunnelModePointToPoint:
@@ -428,20 +393,7 @@ func encodeTunnelFrame(dst []byte, mode TunnelMode, pkt []byte) ([]byte, error) 
 		return dst, nil
 
 	case TunnelModeEthernet:
-		if len(pkt) < 14 {
-			return dst, fmt.Errorf("ethernet frame too short (%d bytes)", len(pkt))
-		}
-		if len(pkt) > maxTunnelWirePayloadBytes {
-			return dst, fmt.Errorf("ethernet frame size %d exceeds maximum tunnel wire payload (%d)", len(pkt), maxTunnelWirePayloadBytes)
-		}
-		total := len(pkt)
-		if cap(dst) < total {
-			dst = make([]byte, total)
-		} else {
-			dst = dst[:total]
-		}
-		copy(dst, pkt)
-		return dst, nil
+		return dst, fmt.Errorf("%w: ethernet (layer-2 tap) tunnel forwarding is not supported", ErrTunnelDeviceUnsupported)
 
 	default:
 		return dst, fmt.Errorf("unsupported tunnel mode %q", mode)
@@ -487,10 +439,7 @@ func decodeTunnelPayload(mode TunnelMode, frame []byte) ([]byte, error) {
 	case TunnelModePointToPoint:
 		return decodePointToPointTunnelPayload(frame)
 	case TunnelModeEthernet:
-		if len(frame) < 14 {
-			return nil, fmt.Errorf("ethernet tunnel frame too short (%d bytes)", len(frame))
-		}
-		return frame, nil
+		return nil, fmt.Errorf("%w: ethernet (layer-2 tap) tunnel forwarding is not supported", ErrTunnelDeviceUnsupported)
 	default:
 		return nil, fmt.Errorf("unsupported tunnel mode %q", mode)
 	}

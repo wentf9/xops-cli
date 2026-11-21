@@ -348,18 +348,7 @@ func isConnectionWideMuxDaemonOption(opt string) bool {
 		return false
 	}
 	spec, ok := ssh.LookupOptionSpec(key)
-	if !ok {
-		return false
-	}
-	if spec.Class == ssh.OptionClassTrust {
-		return true
-	}
-	switch spec.CanonicalKey {
-	case ssh.OptionAddressFamily, ssh.OptionBatchMode, ssh.OptionConnectTimeout, ssh.OptionIdentityAgent:
-		return true
-	default:
-		return false
-	}
+	return ok && spec.IsConnectionWide()
 }
 
 func (o *SshOptions) firstCLIIdentityFile(keys []string) string {

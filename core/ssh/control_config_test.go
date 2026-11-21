@@ -1,6 +1,7 @@
 package ssh
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -336,149 +337,159 @@ func TestControlConfig_CloneAndEqual(t *testing.T) {
 	}
 }
 
-func TestControlConfig_ResolveControl(t *testing.T) {
-	// 1. Both nil
-	res, err := ResolveControl(nil, nil)
-	if err != nil || res != nil {
-		t.Fatalf("expected nil, nil; got %v, %v", res, err)
-	}
-
-	// 2. Child only
-	child := &ControlConfig{Master: ControlMasterYes, Path: "/tmp/sock"}
-	res, err = ResolveControl(child, nil)
-	if err != nil || !res.Equal(child) {
-		t.Fatalf("expected child clone, got %v, %v", res, err)
-	}
-
-	// 3. Parent only
-	parent := &ControlConfig{Master: ControlMasterAuto, Path: "~/.ssh/cm-%h", Persist: "5m"}
-	res, err = ResolveControl(nil, parent)
-	if err != nil || !res.Equal(parent) {
-		t.Fatalf("expected parent clone, got %v, %v", res, err)
-	}
-
-	// 4. Child overrides parent partially (field-by-field)
-	child = &ControlConfig{Master: ControlMasterAsk}
-	res, err = ResolveControl(child, parent)
+func mustResolveControlForTest(t *testing.T, layers ...*Options) *ControlConfig {
+	t.Helper()
+	eff, err := EffectiveOptions(layers...)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("EffectiveOptions failed: %v", err)
 	}
-	expected := &ControlConfig{Master: ControlMasterAsk, Path: "~/.ssh/cm-%h", Persist: "5m"}
-	if !res.Equal(expected) {
-		t.Fatalf("expected %v, got %v", expected, res)
-	}
-
-	// 5. Child overrides all (with valid path)
-	child = &ControlConfig{Master: ControlMasterAsk, Path: "/tmp/custom.sock", Persist: "10m"}
-	res, err = ResolveControl(child, parent)
+	res, err := eff.ValidatedControlConfig()
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("ValidatedControlConfig failed: %v", err)
 	}
-	if !res.Equal(child) {
-		t.Fatalf("expected %v, got %v", child, res)
-	}
-
-	// 6. Child disables multiplexing with Path="none" (overrides active parent)
-	child = &ControlConfig{Path: "none"}
-	res, err = ResolveControl(child, parent)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	expectedDisabled := &ControlConfig{Master: ControlMasterNo, Path: "none", Persist: ""}
-	if !res.Equal(expectedDisabled) {
-		t.Fatalf("expected %v, got %v", expectedDisabled, res)
-	}
-	if res.IsEnabled() {
-		t.Fatal("expected IsEnabled() to be false when Path is none")
-	}
-
-	// 7. Child sets Path="none" with nil parent
-	res, err = ResolveControl(&ControlConfig{Path: "none"}, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !res.Equal(expectedDisabled) {
-		t.Fatalf("expected %v, got %v", expectedDisabled, res)
-	}
-	if res.IsEnabled() {
-		t.Fatal("expected IsEnabled() to be false when Path is none")
-	}
-
-	// 8. Child sets Path="none" with explicit child Persist (Persist must still be cleared)
-	child = &ControlConfig{Path: "none", Persist: "10m"}
-	res, err = ResolveControl(child, parent)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !res.Equal(expectedDisabled) {
-		t.Fatalf("expected %v, got %v", expectedDisabled, res)
-	}
+	return res
 }
 
-func TestControlConfig_EffectiveControl(t *testing.T) {
-	// Tier 4: OpenSSH
-	t4 := &ControlConfig{Master: ControlMasterAuto, Path: "~/.ssh/cm-%r@%h:%p", Persist: "10m"}
-	// Tier 3: Global
-	t3 := &ControlConfig{Persist: "15m"}
-	// Tier 2: Node
-	t2 := &ControlConfig{Path: "/tmp/node-%h.sock"}
-	// Tier 1: CLI
-	t1 := &ControlConfig{Master: ControlMasterYes}
+func TestControlConfig_EffectiveOptionsValidatedControlConfig(t *testing.T) {
+	parentCfg := &ControlConfig{Master: ControlMasterAuto, Path: "~/.ssh/cm-%h", Persist: "5m"}
+	parent := OptionsFromControl(parentCfg)
 
-	// Layers ordered highest to lowest priority: t1, t2, t3, t4
-	eff, err := EffectiveControl(t1, t2, t3, t4)
+	t.Run("nil_and_single_layer", func(t *testing.T) {
+		if res := mustResolveControlForTest(t, nil, nil); res != nil {
+			t.Fatalf("expected nil, got %+v", res)
+		}
+		childCfg := &ControlConfig{Master: ControlMasterYes, Path: "/tmp/sock"}
+		if res := mustResolveControlForTest(t, OptionsFromControl(childCfg), nil); !res.Equal(childCfg) {
+			t.Fatalf("expected child control config, got %+v", res)
+		}
+		if res := mustResolveControlForTest(t, nil, parent); !res.Equal(parentCfg) {
+			t.Fatalf("expected parent control config, got %+v", res)
+		}
+	})
+
+	t.Run("partial_and_multi_tier_override", func(t *testing.T) {
+		res := mustResolveControlForTest(t, OptionsFromControl(&ControlConfig{Master: ControlMasterAsk}), parent)
+		expected := &ControlConfig{Master: ControlMasterAsk, Path: "~/.ssh/cm-%h", Persist: "5m"}
+		if !res.Equal(expected) {
+			t.Fatalf("expected %+v, got %+v", expected, res)
+		}
+
+		// Multi-tier hierarchy (CLI > Node > Global > OpenSSH).
+		t4 := OptionsFromControl(&ControlConfig{Master: ControlMasterAuto, Path: "~/.ssh/cm-%r@%h:%p", Persist: "10m"})
+		t3 := OptionsFromControl(&ControlConfig{Persist: "15m"})
+		t2 := OptionsFromControl(&ControlConfig{Path: "/tmp/node-%h.sock"})
+		t1 := OptionsFromControl(&ControlConfig{Master: ControlMasterYes})
+		res = mustResolveControlForTest(t, t1, t2, t3, t4)
+		want4Tier := &ControlConfig{Master: ControlMasterYes, Path: "/tmp/node-%h.sock", Persist: "15m"}
+		if !res.Equal(want4Tier) {
+			t.Fatalf("expected %+v, got %+v", want4Tier, res)
+		}
+	})
+
+	t.Run("disable_with_none_and_re_enable_override", func(t *testing.T) {
+		expectedDisabled := &ControlConfig{Master: ControlMasterNo, Path: "none", Persist: ""}
+		for _, disableChild := range []*ControlConfig{
+			{Path: "none"},
+			{Path: "NONE"},
+			{Path: "none", Persist: "10m"},
+		} {
+			res := mustResolveControlForTest(t, OptionsFromControl(disableChild), parent)
+			if !res.Equal(expectedDisabled) || res.IsEnabled() {
+				t.Fatalf("expected disabled control config for %+v, got %+v", disableChild, res)
+			}
+		}
+
+		// Inherited ControlPath="none" with higher-tier Master/Persist still normalizes to disabled.
+		res := mustResolveControlForTest(
+			t,
+			OptionsFromControl(&ControlConfig{Master: ControlMasterYes, Persist: "10m"}),
+			OptionsFromControl(&ControlConfig{Path: "NONE"}),
+		)
+		if !res.Equal(expectedDisabled) || res.IsEnabled() {
+			t.Fatalf("expected inherited Path=NONE to disable multiplexing, got %+v", res)
+		}
+
+		// Higher-tier concrete Path overrides middle-tier Path="none" while preserving lower-tier Master/Persist.
+		res = mustResolveControlForTest(
+			t,
+			OptionsFromControl(&ControlConfig{Path: "/tmp/override.sock"}),
+			OptionsFromControl(&ControlConfig{Path: "none"}),
+			parent,
+		)
+		wantOverride := &ControlConfig{Master: ControlMasterAuto, Path: "/tmp/override.sock", Persist: "5m"}
+		if !res.Equal(wantOverride) {
+			t.Fatalf("expected %+v, got %+v", wantOverride, res)
+		}
+	})
+
+	t.Run("persist_no_without_control_path_allowed", func(t *testing.T) {
+		for _, noPersist := range []string{"no", "false"} {
+			res := mustResolveControlForTest(t, OptionsFromControl(&ControlConfig{Persist: noPersist}))
+			if res == nil || res.Master != ControlMasterNo || res.Persist != noPersist || res.IsEnabled() {
+				t.Fatalf("unexpected ControlConfig for Persist=%s: %+v", noPersist, res)
+			}
+		}
+	})
+}
+
+func TestMultiplexDisableGuard_CaseInsensitiveAndEnvExpandedNone(t *testing.T) {
+	// Case-insensitive "NONE" / " none " must never be treated as enabled (M1).
+	for _, rawPath := range []string{"none", "NONE", " None "} {
+		target := TargetContext{
+			Host:    "example.com",
+			Port:    22,
+			User:    "ops",
+			Control: &ControlConfig{Master: ControlMasterAuto, Path: rawPath},
+		}
+		if isMultiplexControlEnabled(target) {
+			t.Fatalf("isMultiplexControlEnabled(%q) = true, want false", rawPath)
+		}
+	}
+
+	// Env-expanded ControlPath resolving to "none"/"NONE" must not bind ./none in CWD (M1).
+	origWD, err := os.Getwd()
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("Getwd: %v", err)
 	}
-	expected := &ControlConfig{
-		Master:  ControlMasterYes,
-		Path:    "/tmp/node-%h.sock",
-		Persist: "15m",
+	tmpDir := t.TempDir()
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("Chdir: %v", err)
 	}
-	if !eff.Equal(expected) {
-		t.Fatalf("expected %v, got %v", expected, eff)
+	defer func() { _ = os.Chdir(origWD) }()
+
+	for _, envVal := range []string{"none", "NONE"} {
+		conn := NewConnector(nil, WithEnvironment(Environment{
+			LookupEnv: func(key string) (string, bool) {
+				if key == "XOPS_CTRL_PATH" {
+					return envVal, true
+				}
+				return "", false
+			},
+		}))
+		planNode := connectionPlanNode{
+			name: "web",
+			cfg: &ClientConfig{
+				Address: "example.com",
+				Port:    22,
+				User:    "ops",
+			},
+			control: &ControlConfig{
+				Master: ControlMasterYes,
+				Path:   "${XOPS_CTRL_PATH}",
+			},
+		}
+		if cli, tryErr := conn.tryConnectMultiplex(t.Context(), planNode); cli != nil || tryErr != nil {
+			t.Fatalf("tryConnectMultiplex(env=%q) = (%v, %v), want (nil, nil)", envVal, cli, tryErr)
+		}
+		conn.maybeStartMasterListener(planNode, "", nil, nil)
+		if _, statErr := os.Lstat(filepath.Join(tmpDir, envVal)); !os.IsNotExist(statErr) {
+			t.Fatalf("expected no ./%s socket created in CWD, stat err = %v", envVal, statErr)
+		}
 	}
 
-	// Test with nil layers
-	eff2, err := EffectiveControl(nil, t2, nil, t4)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	expected2 := &ControlConfig{
-		Master:  ControlMasterAuto,
-		Path:    "/tmp/node-%h.sock",
-		Persist: "10m",
-	}
-	if !eff2.Equal(expected2) {
-		t.Fatalf("expected %v, got %v", expected2, eff2)
-	}
-
-	// All nil
-	eff3, err := EffectiveControl(nil, nil)
-	if err != nil || eff3 != nil {
-		t.Fatalf("expected nil, nil; got %v, %v", eff3, err)
-	}
-
-	// Test EffectiveControl where a higher-priority layer disables multiplexing via Path="none"
-	effDisabled, err := EffectiveControl(
-		nil,                          // Tier 1: CLI (nil)
-		&ControlConfig{Path: "none"}, // Tier 2: Node opts out
-		&ControlConfig{Master: ControlMasterAuto, Path: "~/.ssh/cm-%r@%h:%p", Persist: "10m"}, // Tier 3: Global
-		&ControlConfig{Master: ControlMasterYes, Path: "~/.ssh/mux.sock", Persist: "1h"},      // Tier 4: OpenSSH
-	)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	expectedEffDisabled := &ControlConfig{
-		Master:  ControlMasterNo,
-		Path:    "none",
-		Persist: "",
-	}
-	if !effDisabled.Equal(expectedEffDisabled) {
-		t.Fatalf("expected %v, got %v", expectedEffDisabled, effDisabled)
-	}
-	if effDisabled.IsEnabled() {
-		t.Fatal("expected effective control to be disabled")
+	// Defense in depth: NewMuxServer rejects "none" / "NONE" directly.
+	if _, err := NewMuxServer(MuxServerOptions{ControlPath: "NONE"}); err == nil {
+		t.Fatal("NewMuxServer(ControlPath=NONE) succeeded, want error")
 	}
 }
 

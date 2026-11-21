@@ -137,15 +137,33 @@ const DefaultCanonicalizeMaxDots = 1
 
 const maxCanonicalizeMaxDots = 64
 
+// OptionScope declares whether a CLI Tier-1 option propagates across ProxyJump
+// chains and jump mux daemons or applies only to the final target connection.
+type OptionScope uint8
+
+const (
+	// OptionScopeTargetOnly confines an option to the target connection (default).
+	OptionScopeTargetOnly OptionScope = iota
+	// OptionScopeConnectionWide propagates CLI Tier-1 overrides to ProxyJump hops and jump mux daemons.
+	OptionScopeConnectionWide
+)
+
 // OptionSpec describes a supported OpenSSH client option in the registry.
 type OptionSpec struct {
 	CanonicalKey string      // Persistent snake_case key (e.g. "control_master")
 	OpenSSHName  string      // Canonical OpenSSH name (e.g. "ControlMaster")
 	Class        OptionClass // Functional/security category
+	Scope        OptionScope // Propagation scope across ProxyJump hops (default: TargetOnly)
 	Aliases      []string    // Accepted aliases (e.g. "ChallengeResponseAuthentication")
 	AllowList    bool        // Whether YAML sequence values are accepted and joined with ","
 	MultiValue   bool        // Whether multiple directives accumulate (newline-delimited internally, YAML/JSON array externally)
 	Normalize    func(raw string) (string, error)
+}
+
+// IsConnectionWide reports whether CLI Tier-1 overrides for this option propagate
+// across ProxyJump chains and jump mux daemons.
+func (s OptionSpec) IsConnectionWide() bool {
+	return s.Scope == OptionScopeConnectionWide
 }
 
 var optionRegistry = []OptionSpec{
@@ -173,20 +191,14 @@ var optionRegistry = []OptionSpec{
 		OpenSSHName:  "ControlPath",
 		Class:        OptionClassMux,
 		Normalize: func(raw string) (string, error) {
-			if hasControlOrLineSepChar(raw) {
-				return "", fmt.Errorf("invalid ControlPath %q: contains invalid ASCII control character", raw)
+			setting, err := ParseControlPathSetting(raw, false)
+			if err != nil {
+				return "", err
 			}
-			trimmed := strings.TrimSpace(raw)
-			if trimmed == "" {
+			if setting.Unset() {
 				return "", errors.New("invalid ControlPath: value cannot be empty")
 			}
-			if IsNoneValue(trimmed) {
-				return "none", nil
-			}
-			if err := ValidateControlPathSyntax(trimmed); err != nil {
-				return "", fmt.Errorf("invalid ControlPath %q: %w", raw, err)
-			}
-			return trimmed, nil
+			return setting.Raw, nil
 		},
 	},
 	{
@@ -197,26 +209,28 @@ var optionRegistry = []OptionSpec{
 			if hasControlOrLineSepChar(raw) {
 				return "", fmt.Errorf("invalid ControlPersist %q: contains invalid control character", raw)
 			}
-			trimmed := strings.ToLower(strings.TrimSpace(raw))
-			if trimmed == "" {
-				return "", errors.New("invalid ControlPersist: value cannot be empty")
-			}
-			if _, _, _, err := ParseControlPersist(trimmed); err != nil {
+			setting, err := ParsePersistSetting(raw)
+			if err != nil {
 				return "", fmt.Errorf("invalid ControlPersist %q: %w", raw, err)
 			}
-			return trimmed, nil
+			if !setting.Explicit() {
+				return "", errors.New("invalid ControlPersist: value cannot be empty")
+			}
+			return setting.Raw, nil
 		},
 	},
 	{
 		CanonicalKey: OptionAddressFamily,
 		OpenSSHName:  "AddressFamily",
 		Class:        OptionClassTransport,
+		Scope:        OptionScopeConnectionWide,
 		Normalize:    validateAddressFamily,
 	},
 	{
 		CanonicalKey: OptionConnectTimeout,
 		OpenSSHName:  "ConnectTimeout",
 		Class:        OptionClassTransport,
+		Scope:        OptionScopeConnectionWide,
 		Normalize: func(raw string) (string, error) {
 			return normalizeOptionalDurationOption("ConnectTimeout", raw)
 		},
@@ -257,24 +271,28 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionStrictHostKeyChecking,
 		OpenSSHName:  "StrictHostKeyChecking",
 		Class:        OptionClassTrust,
+		Scope:        OptionScopeConnectionWide,
 		Normalize:    ParseStrictHostKeyChecking,
 	},
 	{
 		CanonicalKey: OptionUserKnownHostsFile,
 		OpenSSHName:  "UserKnownHostsFile",
 		Class:        OptionClassTrust,
+		Scope:        OptionScopeConnectionWide,
 		Normalize:    validateUserKnownHostsFile,
 	},
 	{
 		CanonicalKey: OptionGlobalKnownHostsFile,
 		OpenSSHName:  "GlobalKnownHostsFile",
 		Class:        OptionClassTrust,
+		Scope:        OptionScopeConnectionWide,
 		Normalize:    validateGlobalKnownHostsFile,
 	},
 	{
 		CanonicalKey: OptionHashKnownHosts,
 		OpenSSHName:  "HashKnownHosts",
 		Class:        OptionClassTrust,
+		Scope:        OptionScopeConnectionWide,
 		Normalize: func(raw string) (string, error) {
 			return normalizeYesNoOption("HashKnownHosts", raw)
 		},
@@ -283,6 +301,7 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionVerifyHostKeyDNS,
 		OpenSSHName:  "VerifyHostKeyDNS",
 		Class:        OptionClassTrust,
+		Scope:        OptionScopeConnectionWide,
 		Normalize:    validateVerifyHostKeyDNS,
 	},
 	{
@@ -335,6 +354,7 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionIdentityAgent,
 		OpenSSHName:  "IdentityAgent",
 		Class:        OptionClassAuth,
+		Scope:        OptionScopeConnectionWide,
 		Normalize:    validateIdentityAgent,
 	},
 	{
@@ -381,6 +401,7 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionBatchMode,
 		OpenSSHName:  "BatchMode",
 		Class:        OptionClassAuth,
+		Scope:        OptionScopeConnectionWide,
 		Normalize: func(raw string) (string, error) {
 			return normalizeYesNoOption("BatchMode", raw)
 		},
@@ -1673,25 +1694,147 @@ func (o *Options) SetControlPersist(persist string) {
 	o.setRaw(OptionControlPersist, persist)
 }
 
-// ControlConfig extracts the multiplexing ControlConfig view from o, or returns
-// nil if no multiplexing options are present.
-func (o *Options) ControlConfig() *ControlConfig {
+// ControlPathSetting parses the configured ControlPath into its typed domain representation.
+func (o *Options) ControlPathSetting() (ControlPathSetting, error) {
 	if o.IsEmpty() {
+		return ControlPathSetting{Kind: ControlPathUnset}, nil
+	}
+	return ParseControlPathSetting(o.ControlPath(), o.LiteralControlPath)
+}
+
+// PersistSetting parses the configured ControlPersist into its typed domain representation.
+func (o *Options) PersistSetting() (PersistSetting, error) {
+	if o.IsEmpty() {
+		return PersistSetting{Kind: PersistUnset}, nil
+	}
+	return ParsePersistSetting(o.ControlPersist())
+}
+
+// ControlConfig extracts the normalized multiplexing ControlConfig view from o,
+// or returns nil if no multiplexing options are present.
+func (o *Options) ControlConfig() *ControlConfig {
+	ctrl, err := o.projectControl(false)
+	if err != nil {
 		return nil
 	}
-	master := o.ControlMaster()
-	path := o.ControlPath()
-	persist := o.ControlPersist()
-	if master == "" && path == "" && persist == "" {
-		return nil
+	return ctrl
+}
+
+// ValidatedControlConfig projects and validates the effective multiplexing
+// ControlConfig from o. It shares the single canonical projection engine with
+// ControlConfig() and ValidateEffective():
+//   - "none" (case-insensitive) ControlPath disables multiplexing (Master=no, Persist="").
+//   - ControlMaster, ControlPath, and ControlPersist syntax are validated via typed settings.
+//   - Active ControlMaster modes and enabled PersistSetting values require a concrete ControlPath
+//     (explicit PersistNo values "no"/"false" do not require ControlPath).
+//   - Returns (nil, nil) when multiplexing is completely unconfigured.
+func (o *Options) ValidatedControlConfig() (*ControlConfig, error) {
+	return o.projectControl(true)
+}
+
+func (o *Options) projectControl(validateEffective bool) (*ControlConfig, error) {
+	mux := finalizeEffectiveOptions(o.FilterByClasses(OptionClassMux))
+	if mux.IsEmpty() {
+		return nil, nil
+	}
+
+	pathSetting, pathErr := mux.ControlPathSetting()
+	if validateEffective && pathErr != nil {
+		return nil, pathErr
+	}
+	if pathSetting.Disabled() || IsNoneValue(mux.ControlPath()) {
+		return &ControlConfig{
+			Master:        ControlMasterNo,
+			Path:          "none",
+			ImplicitTier4: mux.ImplicitTier4,
+		}, nil
+	}
+
+	master, err := parseProjectedControlMaster(mux.ControlMaster(), validateEffective)
+	if err != nil {
+		return nil, err
+	}
+	persistSetting, persistErr := mux.PersistSetting()
+	if validateEffective && persistErr != nil {
+		return nil, persistErr
+	}
+
+	if validateEffective {
+		if master == ControlMasterNo && pathSetting.Unset() && !persistSetting.Explicit() {
+			return nil, nil
+		}
+		if err := validateProjectedControl(master, pathSetting, persistSetting); err != nil {
+			return nil, err
+		}
+	}
+
+	effectivePath := mux.ControlPath()
+	if pathErr == nil && pathSetting.Enabled() {
+		effectivePath = pathSetting.Raw
 	}
 	return &ControlConfig{
 		Master:        master,
-		Path:          path,
-		LiteralPath:   o.LiteralControlPath && path != "" && !IsNoneValue(path),
-		Persist:       persist,
-		ImplicitTier4: o.ImplicitTier4,
+		Path:          effectivePath,
+		LiteralPath:   mux.LiteralControlPath && pathSetting.Kind == ControlPathLiteral,
+		Persist:       strings.TrimSpace(mux.ControlPersist()),
+		ImplicitTier4: mux.ImplicitTier4,
+	}, nil
+}
+
+func parseProjectedControlMaster(raw ControlMasterMode, validateEffective bool) (ControlMasterMode, error) {
+	if raw == "" {
+		if validateEffective {
+			return ControlMasterNo, nil
+		}
+		return "", nil
 	}
+	parsed, err := ParseControlMasterMode(string(raw))
+	if err != nil {
+		if validateEffective {
+			return "", err
+		}
+		return raw, nil
+	}
+	return parsed, nil
+}
+
+func validateProjectedControl(master ControlMasterMode, pathSetting ControlPathSetting, persistSetting PersistSetting) error {
+	if pathSetting.Kind == ControlPathLiteral {
+		if _, err := (&ControlConfig{Path: pathSetting.Raw, LiteralPath: true}).ResolvePath(Environment{}, TargetContext{}); err != nil {
+			return err
+		}
+	}
+	return validateEffectiveControlSetting(master, pathSetting, persistSetting)
+}
+
+func validateEffectiveControlSetting(master ControlMasterMode, pathSetting ControlPathSetting, persistSetting PersistSetting) error {
+	if isActiveControlMaster(string(master)) && !pathSetting.Enabled() {
+		return fmt.Errorf("ControlMaster %q requires non-empty ControlPath", master)
+	}
+	if persistSetting.Enabled() && !pathSetting.Enabled() {
+		return errors.New("ControlPath is required when ControlPersist is configured")
+	}
+	return nil
+}
+
+// ConnectionWideOptions returns a new Options containing only entries declared
+// OptionScopeConnectionWide in the option registry (propagated across ProxyJump chains).
+func (o *Options) ConnectionWideOptions() *Options {
+	if o.IsEmpty() {
+		return nil
+	}
+	res := &Options{}
+	for k, v := range o.values {
+		spec, ok := LookupOptionSpec(k)
+		if !ok || !spec.IsConnectionWide() {
+			continue
+		}
+		res.setRaw(k, v)
+	}
+	if res.IsEmpty() {
+		return nil
+	}
+	return res
 }
 
 // AddressFamily returns the normalized AddressFamily ("any", "inet", "inet6"), or "" if unset.
@@ -2001,15 +2144,20 @@ func (o *Options) Validate() error {
 	}
 
 	normMaster := strings.ToLower(strings.TrimSpace(string(o.ControlMaster())))
-	persist := o.ControlPersist()
-	path := o.ControlPath()
-
-	if normMaster == string(ControlMasterNo) && persist != "" &&
-		!strings.EqualFold(persist, "no") && !strings.EqualFold(persist, "false") {
-		return fmt.Errorf("%w: ControlPersist %q cannot be specified when ControlMaster is 'no'", ErrSSHOptionsValidation, persist)
+	persistSetting, err := o.PersistSetting()
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
+	}
+	pathSetting, err := o.ControlPathSetting()
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
 	}
 
-	if IsNoneValue(path) && isActiveControlMaster(normMaster) {
+	if normMaster == string(ControlMasterNo) && persistSetting.Enabled() {
+		return fmt.Errorf("%w: ControlPersist %q cannot be specified when ControlMaster is 'no'", ErrSSHOptionsValidation, o.ControlPersist())
+	}
+
+	if pathSetting.Disabled() && isActiveControlMaster(normMaster) {
 		return fmt.Errorf("%w: ControlPath cannot be 'none' when ControlMaster is %q", ErrSSHOptionsValidation, o.ControlMaster())
 	}
 
@@ -2024,16 +2172,24 @@ func (o *Options) ValidateEffective() error {
 	if err := o.Validate(); err != nil {
 		return err
 	}
-	normMaster := strings.ToLower(strings.TrimSpace(string(o.ControlMaster())))
-	path := o.ControlPath()
-	persist := o.ControlPersist()
-	if isActiveControlMaster(normMaster) {
-		if strings.TrimSpace(path) == "" || IsNoneValue(path) {
-			return fmt.Errorf("%w: ControlMaster %q requires non-empty ControlPath", ErrSSHOptionsValidation, o.ControlMaster())
+	master := ControlMasterNo
+	if rawMaster := o.ControlMaster(); rawMaster != "" {
+		parsed, err := ParseControlMasterMode(string(rawMaster))
+		if err != nil {
+			return fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
 		}
+		master = parsed
 	}
-	if persist != "" && !strings.EqualFold(persist, "no") && !strings.EqualFold(persist, "false") && strings.TrimSpace(path) == "" {
-		return fmt.Errorf("%w: ControlPath is required when ControlPersist is configured", ErrSSHOptionsValidation)
+	pathSetting, err := o.ControlPathSetting()
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
+	}
+	persistSetting, err := o.PersistSetting()
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
+	}
+	if err := validateEffectiveControlSetting(master, pathSetting, persistSetting); err != nil {
+		return fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
 	}
 	return nil
 }

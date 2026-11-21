@@ -177,30 +177,48 @@ func (s SessionControlOptions) ToSSHOptions() *ssh.Options {
 	return opts
 }
 
+// HasExplicitMaster reports whether this Tier-1 session layer explicitly specified
+// ControlMaster (via -M or -o ControlMaster=...).
+func (s SessionControlOptions) HasExplicitMaster() bool {
+	return (s.Master != nil && *s.Master != "") ||
+		(s.Options != nil && s.Options.ControlMaster() != "")
+}
+
+// ResolveControl merges this Tier-1 session layer with any lower-priority option
+// layers (filtered to OptionClassMux) via core/ssh.EffectiveOptions, projects and
+// validates the resulting ControlConfig via ValidatedControlConfig(), and applies
+// the single canonical AllowReuse derivation rule.
+func (s SessionControlOptions) ResolveControl(lowerLayers ...*ssh.Options) (*ssh.ControlConfig, error) {
+	layers := make([]*ssh.Options, 0, 1+len(lowerLayers))
+	layers = append(layers, s.ToSSHOptions().FilterByClasses(ssh.OptionClassMux))
+	for _, layer := range lowerLayers {
+		layers = append(layers, layer.FilterByClasses(ssh.OptionClassMux))
+	}
+	effMux, err := ssh.EffectiveOptions(layers...)
+	if err != nil {
+		return nil, err
+	}
+	ctrl, err := effMux.ValidatedControlConfig()
+	if err != nil || ctrl == nil {
+		return ctrl, err
+	}
+	ctrl.AllowReuse = s.AllowReuse && !s.HasExplicitMaster() && ctrl.IsEnabled()
+	return ctrl, nil
+}
+
 // ConnectionWideOptions returns a SessionControlOptions containing only the
-// explicit CLI Tier-1 options that OpenSSH applies across the entire connection
-// chain (including ProxyJump hops): OptionClassTrust (StrictHostKeyChecking,
-// UserKnownHostsFile, GlobalKnownHostsFile, HashKnownHosts, VerifyHostKeyDNS)
-// plus AddressFamily, BatchMode, ConnectTimeout, and IdentityAgent. Target-scoped options
-// (such as HostName, RemoteCommand, Control*, LocalCommand, ProxyCommand,
-// ForwardAgent, RequestTTY, EscapeChar) are excluded.
+// explicit CLI Tier-1 options declared OptionScopeConnectionWide in the core/ssh
+// option registry (OptionClassTrust plus AddressFamily, BatchMode, ConnectTimeout,
+// and IdentityAgent). Target-scoped options (including Control*, AllowReuse,
+// HostName, RemoteCommand, LocalCommand, ProxyCommand, ForwardAgent,
+// RequestTTY, EscapeChar) are excluded.
 func (s SessionControlOptions) ConnectionWideOptions() SessionControlOptions {
-	var out SessionControlOptions
-	out.AllowReuse = s.AllowReuse
 	if s.Options.IsEmpty() {
-		return out
+		return SessionControlOptions{}
 	}
-	filtered := s.Options.FilterByClasses(ssh.OptionClassTrust)
-	for _, key := range []string{ssh.OptionAddressFamily, ssh.OptionBatchMode, ssh.OptionConnectTimeout, ssh.OptionIdentityAgent} {
-		if val := s.Options.Get(key); val != "" {
-			if filtered == nil {
-				filtered = &ssh.Options{}
-			}
-			_ = filtered.Set(key, val)
-		}
+	return SessionControlOptions{
+		Options: s.Options.ConnectionWideOptions(),
 	}
-	out.Options = filtered
-	return out
 }
 
 // SplitOptionKeyValue parses an OpenSSH -o directive into its key and value tokens.
@@ -331,25 +349,28 @@ func applyControlOption(opts *SessionControlOptions, state *optionParseState, ke
 		state.seen[ssh.OptionControlMaster] = true
 		return true, nil
 	case ssh.OptionControlPath:
-		if val == "" {
-			return true, fmt.Errorf("invalid ControlPath in -o option: value cannot be empty")
-		}
-		if strings.EqualFold(val, "none") {
-			val = "none"
-		} else if err := ssh.ValidateControlPathSyntax(val); err != nil {
+		setting, err := ssh.ParseControlPathSetting(val, false)
+		if err != nil {
 			return true, fmt.Errorf("invalid ControlPath in -o option: %w", err)
 		}
+		if setting.Unset() {
+			return true, fmt.Errorf("invalid ControlPath in -o option: value cannot be empty")
+		}
 		if !state.seen[ssh.OptionControlPath] {
-			opts.SetPath(val)
+			opts.SetPath(setting.Raw)
 		}
 		state.seen[ssh.OptionControlPath] = true
 		return true, nil
 	case ssh.OptionControlPersist:
-		if _, _, _, err := ssh.ParseControlPersist(val); err != nil {
+		setting, err := ssh.ParsePersistSetting(val)
+		if err != nil {
 			return true, fmt.Errorf("invalid ControlPersist in -o option: %w", err)
 		}
+		if !setting.Explicit() {
+			return true, fmt.Errorf("invalid ControlPersist in -o option: value cannot be empty")
+		}
 		if !state.seen[ssh.OptionControlPersist] {
-			opts.SetPersist(strings.ToLower(val))
+			opts.SetPersist(setting.Raw)
 		}
 		state.seen[ssh.OptionControlPersist] = true
 		return true, nil
@@ -799,142 +820,6 @@ func (a *SSHAdapter) ResolveControl(nodeName string, sessionOpts SessionControlO
 		return nil, err
 	}
 	return pol.effectiveCtrl, nil
-}
-
-func validateMergedControl(merged *ssh.ControlConfig) error {
-	if merged.Master != "" {
-		m, err := ssh.ParseControlMasterMode(string(merged.Master))
-		if err != nil {
-			return err
-		}
-		merged.Master = m
-	}
-	if merged.Persist != "" {
-		if _, _, _, err := ssh.ParseControlPersist(merged.Persist); err != nil {
-			return err
-		}
-	}
-	// Path == "none" (case-insensitive) disables multiplexing: normalize Master to "no" and clear Persist
-	if ssh.IsNoneValue(merged.Path) {
-		merged.Path = "none"
-		merged.Master = ssh.ControlMasterNo
-		merged.Persist = ""
-		merged.LiteralPath = false
-		return nil
-	}
-	if merged.LiteralPath {
-		if _, err := (&ssh.ControlConfig{Path: merged.Path, LiteralPath: true}).ResolvePath(ssh.Environment{}, ssh.TargetContext{}); err != nil {
-			return err
-		}
-	}
-	if merged.Master != ssh.ControlMasterNo && merged.Master != "" {
-		if strings.TrimSpace(merged.Path) == "" {
-			return fmt.Errorf("ControlPath is required when ControlMaster is %s", merged.Master)
-		}
-	}
-	if merged.Persist != "" && strings.TrimSpace(merged.Path) == "" {
-		return fmt.Errorf("ControlPath is required when ControlPersist is configured")
-	}
-	return nil
-}
-
-func resolveMergedMaster(t1 SessionControlOptions, t2, t3, t4 *ssh.ControlConfig) ssh.ControlMasterMode {
-	if t1.Master != nil && *t1.Master != "" {
-		return *t1.Master
-	}
-	if t1.Options != nil && t1.Options.ControlMaster() != "" {
-		return t1.Options.ControlMaster()
-	}
-	if t2 != nil && t2.Master != "" {
-		return t2.Master
-	}
-	if t3 != nil && t3.Master != "" {
-		return t3.Master
-	}
-	if t4 != nil && t4.Master != "" {
-		return t4.Master
-	}
-	return ssh.ControlMasterNo
-}
-
-func resolveMergedPathAndLiteral(t1 SessionControlOptions, t2, t3, t4 *ssh.ControlConfig) (string, bool) {
-	if t1.Path != nil {
-		return *t1.Path, t1.LiteralPath && *t1.Path != "" && !ssh.IsNoneValue(*t1.Path)
-	}
-	if t1.Options != nil && t1.Options.ControlPath() != "" {
-		p := t1.Options.ControlPath()
-		return p, t1.Options.LiteralControlPath && !ssh.IsNoneValue(p)
-	}
-	if t2 != nil && t2.Path != "" {
-		return t2.Path, t2.LiteralPath && !ssh.IsNoneValue(t2.Path)
-	}
-	if t3 != nil && t3.Path != "" {
-		return t3.Path, t3.LiteralPath && !ssh.IsNoneValue(t3.Path)
-	}
-	if t4 != nil && t4.Path != "" {
-		return t4.Path, t4.LiteralPath && !ssh.IsNoneValue(t4.Path)
-	}
-	return "", false
-}
-
-func resolveMergedPersist(t1 SessionControlOptions, t2, t3, t4 *ssh.ControlConfig) string {
-	if t1.Persist != nil {
-		return *t1.Persist
-	}
-	if t1.Options != nil && t1.Options.ControlPersist() != "" {
-		return t1.Options.ControlPersist()
-	}
-	if t2 != nil && t2.Persist != "" {
-		return t2.Persist
-	}
-	if t3 != nil && t3.Persist != "" {
-		return t3.Persist
-	}
-	if t4 != nil && t4.Persist != "" {
-		return t4.Persist
-	}
-	return ""
-}
-
-func mergeControlFields(
-	t1 SessionControlOptions,
-	t2 *ssh.ControlConfig,
-	t3 *ssh.ControlConfig,
-	t4 *ssh.ControlConfig,
-) *ssh.ControlConfig {
-	master := resolveMergedMaster(t1, t2, t3, t4)
-	path, literalPath := resolveMergedPathAndLiteral(t1, t2, t3, t4)
-	persist := resolveMergedPersist(t1, t2, t3, t4)
-
-	// Handle "-S none" or Path == "none" (case-insensitive): disables connection sharing
-	if ssh.IsNoneValue(path) {
-		path = "none"
-		master = ssh.ControlMasterNo
-		persist = ""
-		literalPath = false
-	}
-
-	// Unconfigured check: if nothing was configured across all 4 tiers, return nil
-	if master == ssh.ControlMasterNo && path == "" && persist == "" {
-		return nil
-	}
-
-	hasExplicitPersist := (t1.Persist != nil && *t1.Persist != "") ||
-		(t1.Options != nil && t1.Options.ControlPersist() != "") ||
-		(t2 != nil && t2.Persist != "") ||
-		(t3 != nil && t3.Persist != "")
-
-	hasExplicitSessionMaster := (t1.Master != nil && *t1.Master != "") ||
-		(t1.Options != nil && t1.Options.ControlMaster() != "")
-
-	return &ssh.ControlConfig{
-		Master:        master,
-		Path:          path,
-		LiteralPath:   literalPath,
-		Persist:       persist,
-		ImplicitTier4: !hasExplicitPersist && t4 != nil,
-		AllowReuse:    t1.AllowReuse && !hasExplicitSessionMaster && !ssh.IsNoneValue(path) && strings.TrimSpace(path) != "",
-	}
 }
 
 func (a *SSHAdapter) getOpenSSHParser() *config.OpenSSHParser {

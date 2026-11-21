@@ -55,6 +55,114 @@ func ParseControlMasterMode(val string) (ControlMasterMode, error) {
 	}
 }
 
+// ControlPathKind classifies a parsed ControlPath setting into mutually exclusive states.
+type ControlPathKind uint8
+
+const (
+	// ControlPathUnset indicates no ControlPath was configured.
+	ControlPathUnset ControlPathKind = iota
+	// ControlPathDisabled indicates multiplexing was explicitly disabled via "none".
+	ControlPathDisabled
+	// ControlPathTemplate indicates an expandable ControlPath template (~, ${VAR}, % tokens).
+	ControlPathTemplate
+	// ControlPathLiteral indicates an already-expanded literal socket path.
+	ControlPathLiteral
+)
+
+// ControlPathSetting is the typed, parsed representation of a ControlPath value.
+type ControlPathSetting struct {
+	Kind ControlPathKind
+	Raw  string
+}
+
+// Unset reports whether no ControlPath is configured.
+func (s ControlPathSetting) Unset() bool { return s.Kind == ControlPathUnset }
+
+// Disabled reports whether ControlPath is explicitly disabled ("none").
+func (s ControlPathSetting) Disabled() bool { return s.Kind == ControlPathDisabled }
+
+// Enabled reports whether ControlPath specifies a concrete template or literal path.
+func (s ControlPathSetting) Enabled() bool {
+	return s.Kind == ControlPathTemplate || s.Kind == ControlPathLiteral
+}
+
+// ParseControlPathSetting parses raw into a typed ControlPathSetting.
+func ParseControlPathSetting(raw string, literal bool) (ControlPathSetting, error) {
+	if raw == "" {
+		return ControlPathSetting{Kind: ControlPathUnset}, nil
+	}
+	if hasControlOrLineSepChar(raw) {
+		return ControlPathSetting{}, fmt.Errorf("invalid ControlPath %q: contains invalid ASCII control character", raw)
+	}
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ControlPathSetting{}, errors.New("invalid ControlPath: value cannot be empty")
+	}
+	if IsNoneValue(trimmed) {
+		return ControlPathSetting{Kind: ControlPathDisabled, Raw: "none"}, nil
+	}
+	if literal {
+		return ControlPathSetting{Kind: ControlPathLiteral, Raw: raw}, nil
+	}
+	if err := ValidateControlPathSyntax(trimmed); err != nil {
+		return ControlPathSetting{}, fmt.Errorf("invalid ControlPath %q: %w", raw, err)
+	}
+	return ControlPathSetting{Kind: ControlPathTemplate, Raw: trimmed}, nil
+}
+
+// PersistKind classifies a parsed ControlPersist setting into mutually exclusive states.
+type PersistKind uint8
+
+const (
+	// PersistUnset indicates ControlPersist was not specified.
+	PersistUnset PersistKind = iota
+	// PersistNo indicates ControlPersist was explicitly disabled ("no" / "false").
+	PersistNo
+	// PersistIndefinite indicates the master persists indefinitely ("yes" / "true" / "0").
+	PersistIndefinite
+	// PersistDuration indicates the master persists for a bounded idle Duration.
+	PersistDuration
+)
+
+// PersistSetting is the typed, parsed representation of a ControlPersist value.
+type PersistSetting struct {
+	Kind     PersistKind
+	Raw      string
+	Duration time.Duration
+}
+
+// Explicit reports whether ControlPersist was explicitly specified (including "no"/"false").
+func (s PersistSetting) Explicit() bool { return s.Kind != PersistUnset }
+
+// Enabled reports whether ControlPersist keeps the master alive after client exit.
+func (s PersistSetting) Enabled() bool {
+	return s.Kind == PersistIndefinite || s.Kind == PersistDuration
+}
+
+// Indefinite reports whether ControlPersist keeps the master alive indefinitely.
+func (s PersistSetting) Indefinite() bool { return s.Kind == PersistIndefinite }
+
+// ParsePersistSetting parses OpenSSH ControlPersist values into a typed PersistSetting.
+func ParsePersistSetting(val string) (PersistSetting, error) {
+	if hasControlOrLineSepChar(val) {
+		return PersistSetting{}, fmt.Errorf("bad ControlPersist argument %q: contains invalid control character", val)
+	}
+	trimmed := strings.ToLower(strings.TrimSpace(val))
+	switch trimmed {
+	case "":
+		return PersistSetting{Kind: PersistUnset}, nil
+	case "no", "false":
+		return PersistSetting{Kind: PersistNo, Raw: trimmed}, nil
+	case "yes", "true", "0":
+		return PersistSetting{Kind: PersistIndefinite, Raw: trimmed}, nil
+	}
+	d, err := parseOpenSSHDuration(trimmed)
+	if err != nil {
+		return PersistSetting{}, fmt.Errorf("bad ControlPersist argument %q: %w", val, err)
+	}
+	return PersistSetting{Kind: PersistDuration, Raw: trimmed, Duration: d}, nil
+}
+
 // ControlConfig specifies the connection multiplexing parameters for an SSH connection.
 // Matches the contract defined in PROJECT.md and Schema V2.
 type ControlConfig struct {
@@ -75,10 +183,7 @@ type ControlConfig struct {
 // c.Path is treated as an already-expanded path and validated without rescanning
 // ~, ${VAR}, or % tokens; otherwise c.Path is expanded with ExpandControlPath.
 func (c *ControlConfig) ResolvePath(env Environment, target TargetContext) (string, error) {
-	if c == nil {
-		return "", nil
-	}
-	if c.Path == "" {
+	if c == nil || c.Path == "" {
 		return "", nil
 	}
 	if hasControlOrLineSepChar(c.Path) {
@@ -122,88 +227,6 @@ func (c *ControlConfig) Equal(other *ControlConfig) bool {
 		return false
 	}
 	return c.Master == other.Master && c.Path == other.Path && c.LiteralPath == other.LiteralPath && c.Persist == other.Persist
-}
-
-// ResolveControl merges a child (higher priority) multiplexing config with a
-// parent (lower priority) config according to inheritance rules:
-// - Master inherits from parent unless child explicitly sets it.
-// - Path inherits from parent unless child explicitly sets it.
-// - Persist inherits from parent unless child explicitly sets it.
-// - If child sets Path="none", multiplexing is disabled for the child.
-func ResolveControl(child, parent *ControlConfig) (*ControlConfig, error) {
-	if child == nil && parent == nil {
-		return nil, nil
-	}
-	if child == nil {
-		res := parent.Clone()
-		if IsNoneValue(res.Path) {
-			res.Path = "none"
-			res.Master = ControlMasterNo
-			res.Persist = ""
-			res.AllowReuse = false
-			res.LiteralPath = false
-		}
-		return res, nil
-	}
-	if parent == nil {
-		res := child.Clone()
-		if IsNoneValue(res.Path) {
-			res.Path = "none"
-			res.Master = ControlMasterNo
-			res.Persist = ""
-			res.AllowReuse = false
-			res.LiteralPath = false
-		}
-		return res, nil
-	}
-
-	res := &ControlConfig{
-		Master:      parent.Master,
-		Path:        parent.Path,
-		LiteralPath: parent.LiteralPath,
-		Persist:     parent.Persist,
-		AllowReuse:  parent.AllowReuse,
-	}
-
-	if child.Master != "" {
-		res.Master = child.Master
-		res.AllowReuse = false
-	}
-	if child.Path != "" {
-		res.Path = child.Path
-		res.LiteralPath = child.LiteralPath
-	}
-	if child.Persist != "" {
-		res.Persist = child.Persist
-	}
-	if child.AllowReuse && child.Master == "" {
-		res.AllowReuse = true
-	}
-
-	// If child sets Path="none", multiplexing is disabled for the child.
-	if IsNoneValue(child.Path) {
-		res.Path = "none"
-		res.Master = ControlMasterNo
-		res.Persist = ""
-		res.AllowReuse = false
-		res.LiteralPath = false
-	}
-
-	return res, nil
-}
-
-// EffectiveControl resolves a hierarchy of multiplexing configs from highest
-// priority to lowest priority (e.g. session CLI overrides, node, global, openssh).
-func EffectiveControl(layers ...*ControlConfig) (*ControlConfig, error) {
-	var effective *ControlConfig
-	for i := len(layers) - 1; i >= 0; i-- {
-		var err error
-		effective, err = ResolveControl(layers[i], effective)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return effective, nil
 }
 
 // ControlProvider provides multiplexing configuration for a node.
@@ -340,8 +363,11 @@ func ExpandControlPath(rawPath string, env Environment, target TargetContext) (s
 	if hasControlOrLineSepChar(rawPath) {
 		return "", fmt.Errorf("ControlPath %q contains invalid control character", rawPath)
 	}
-	if rawPath == "" || rawPath == "none" {
-		return rawPath, nil
+	if strings.TrimSpace(rawPath) == "" {
+		return "", nil
+	}
+	if IsNoneValue(rawPath) {
+		return "none", nil
 	}
 	expanded, err := expandPathTokensSinglePass(rawPath, env, target, pathExpandOptions{
 		kind:        "ControlPath",
@@ -352,6 +378,9 @@ func ExpandControlPath(rawPath string, env Environment, target TargetContext) (s
 	}
 	if hasControlOrLineSepChar(expanded) {
 		return "", fmt.Errorf("expanded ControlPath %q contains invalid control character", expanded)
+	}
+	if IsNoneValue(expanded) {
+		return "none", nil
 	}
 	return expanded, nil
 }
@@ -602,19 +631,11 @@ func ExpandStreamLocalPath(rawPath string, env Environment, target TargetContext
 // - "yes" / "true" / "0": enabled indefinitely (indefinite=true, timeout=0)
 // - duration: time formats documented in sshd_config(5), e.g. "10m", "1h", "600s", "600", "1d", "1w", "1h30m"
 func ParseControlPersist(val string) (enabled bool, indefinite bool, timeout time.Duration, err error) {
-	trimmed := strings.ToLower(strings.TrimSpace(val))
-	switch trimmed {
-	case "", "no", "false":
-		return false, false, 0, nil
-	case "yes", "true", "0":
-		return true, true, 0, nil
-	}
-
-	d, err := parseOpenSSHDuration(trimmed)
+	setting, err := ParsePersistSetting(val)
 	if err != nil {
-		return false, false, 0, fmt.Errorf("bad ControlPersist argument %q: %w", val, err)
+		return false, false, 0, err
 	}
-	return true, false, d, nil
+	return setting.Enabled(), setting.Indefinite(), setting.Duration, nil
 }
 
 // parseOpenSSHDuration parses a sequence of integer+qualifier units into time.Duration

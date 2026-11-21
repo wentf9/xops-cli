@@ -45,11 +45,11 @@ func TestEvaluateWindowsObjectSecurity_TrustedAllowlistAndObjectACEFailClosed(t 
 
 	trustedBaseline := []windowsParsedACE{
 		// SYSTEM full control
-		{aceType: windowsAccessAllowedACEType, mask: windowsAccessGenericAll, sidValid: true, sidTrusted: true},
+		{ACEType: windowsAccessAllowedACEType, Mask: windowsAccessGenericAll, SIDValid: true, SIDTrusted: true},
 		// Administrators full control
-		{aceType: windowsAccessAllowedACEType, mask: windowsAccessGenericAll, sidValid: true, sidTrusted: true},
+		{ACEType: windowsAccessAllowedACEType, Mask: windowsAccessGenericAll, SIDValid: true, SIDTrusted: true},
 		// Untrusted principal (e.g. Users / INTERACTIVE / Guests) with read-only access is allowed
-		{aceType: windowsAccessAllowedACEType, mask: readExecuteMask, sidValid: true, sidTrusted: false},
+		{ACEType: windowsAccessAllowedACEType, Mask: readExecuteMask, SIDValid: true, SIDTrusted: false},
 	}
 
 	if !evaluateWindowsObjectSecurity(fileAttrs, false, true, true, trustedBaseline) {
@@ -85,10 +85,10 @@ func TestEvaluateWindowsObjectSecurity_TrustedAllowlistAndObjectACEFailClosed(t 
 	for _, wb := range writeBits {
 		t.Run("UntrustedAllow_"+wb.name, func(t *testing.T) {
 			aces := append(append([]windowsParsedACE(nil), trustedBaseline...), windowsParsedACE{
-				aceType:    windowsAccessAllowedACEType,
-				mask:       wb.mask,
-				sidValid:   true,
-				sidTrusted: false,
+				ACEType:    windowsAccessAllowedACEType,
+				Mask:       wb.mask,
+				SIDValid:   true,
+				SIDTrusted: false,
 			})
 			if evaluateWindowsObjectSecurity(fileAttrs, false, true, true, aces) {
 				t.Fatalf("untrusted allow ACE with %s must be rejected on file", wb.name)
@@ -99,10 +99,10 @@ func TestEvaluateWindowsObjectSecurity_TrustedAllowlistAndObjectACEFailClosed(t 
 
 			// Callback allow ACE to untrusted principal with write bit must also be rejected.
 			cbAces := append(append([]windowsParsedACE(nil), trustedBaseline...), windowsParsedACE{
-				aceType:    windowsAccessAllowedCallbackACEType,
-				mask:       wb.mask,
-				sidValid:   true,
-				sidTrusted: false,
+				ACEType:    windowsAccessAllowedCallbackACEType,
+				Mask:       wb.mask,
+				SIDValid:   true,
+				SIDTrusted: false,
 			})
 			if evaluateWindowsObjectSecurity(fileAttrs, false, true, true, cbAces) {
 				t.Fatalf("untrusted callback allow ACE with %s must be rejected", wb.name)
@@ -110,10 +110,10 @@ func TestEvaluateWindowsObjectSecurity_TrustedAllowlistAndObjectACEFailClosed(t 
 
 			// Same bit granted to a trusted principal (currSID / Administrators / SYSTEM) passes.
 			trustedAces := append(append([]windowsParsedACE(nil), trustedBaseline...), windowsParsedACE{
-				aceType:    windowsAccessAllowedACEType,
-				mask:       wb.mask,
-				sidValid:   true,
-				sidTrusted: true,
+				ACEType:    windowsAccessAllowedACEType,
+				Mask:       wb.mask,
+				SIDValid:   true,
+				SIDTrusted: true,
 			})
 			if !evaluateWindowsObjectSecurity(fileAttrs, false, true, true, trustedAces) {
 				t.Fatalf("trusted allow ACE with %s must be accepted", wb.name)
@@ -123,11 +123,11 @@ func TestEvaluateWindowsObjectSecurity_TrustedAllowlistAndObjectACEFailClosed(t 
 
 	// INHERIT_ONLY_ACE does not apply to the object itself and must be skipped.
 	inheritOnlyUntrusted := append(append([]windowsParsedACE(nil), trustedBaseline...), windowsParsedACE{
-		aceType:    windowsAccessAllowedACEType,
-		aceFlags:   windowsInheritOnlyACEFlag,
-		mask:       windowsAccessGenericAll,
-		sidValid:   true,
-		sidTrusted: false,
+		ACEType:    windowsAccessAllowedACEType,
+		ACEFlags:   windowsInheritOnlyACEFlag,
+		Mask:       windowsAccessGenericAll,
+		SIDValid:   true,
+		SIDTrusted: false,
 	})
 	if !evaluateWindowsObjectSecurity(dirAttrs, true, true, true, inheritOnlyUntrusted) {
 		t.Fatal("INHERIT_ONLY_ACE must be skipped when evaluating the directory object itself")
@@ -135,10 +135,10 @@ func TestEvaluateWindowsObjectSecurity_TrustedAllowlistAndObjectACEFailClosed(t 
 
 	// ACCESS_DENIED_ACE_TYPE and audit/label ACEs must be ignored.
 	withDenyAndAudit := append(append([]windowsParsedACE(nil), trustedBaseline...),
-		windowsParsedACE{aceType: windowsAccessDeniedACEType, mask: windowsAccessGenericAll},
-		windowsParsedACE{aceType: windowsAccessDeniedObjectACEType, mask: windowsAccessGenericAll},
-		windowsParsedACE{aceType: windowsSystemAuditACEType, mask: windowsAccessGenericAll},
-		windowsParsedACE{aceType: windowsSystemMandatoryLabelACEType, mask: windowsAccessGenericAll},
+		windowsParsedACE{ACEType: windowsAccessDeniedACEType, Mask: windowsAccessGenericAll},
+		windowsParsedACE{ACEType: windowsAccessDeniedObjectACEType, Mask: windowsAccessGenericAll},
+		windowsParsedACE{ACEType: windowsSystemAuditACEType, Mask: windowsAccessGenericAll},
+		windowsParsedACE{ACEType: windowsSystemMandatoryLabelACEType, Mask: windowsAccessGenericAll},
 	)
 	if !evaluateWindowsObjectSecurity(fileAttrs, false, true, true, withDenyAndAudit) {
 		t.Fatal("deny, audit, and mandatory label ACEs must not cause rejection")
@@ -149,11 +149,11 @@ func TestEvaluateWindowsObjectSecurity_TrustedAllowlistAndObjectACEFailClosed(t 
 		name string
 		ace  windowsParsedACE
 	}{
-		{"ACCESS_ALLOWED_OBJECT_ACE_TYPE", windowsParsedACE{aceType: windowsAccessAllowedObjectACEType, sidValid: true, sidTrusted: true}},
-		{"ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE", windowsParsedACE{aceType: windowsAccessAllowedCallbackObjectACEType, sidValid: true, sidTrusted: true}},
-		{"ACCESS_ALLOWED_COMPOUND_ACE_TYPE", windowsParsedACE{aceType: windowsAccessAllowedCompoundACEType, sidValid: true, sidTrusted: true}},
-		{"UnknownACEType_99", windowsParsedACE{aceType: 99, sidValid: true, sidTrusted: true}},
-		{"InvalidSIDInAllowACE", windowsParsedACE{aceType: windowsAccessAllowedACEType, sidValid: false, sidTrusted: true}},
+		{"ACCESS_ALLOWED_OBJECT_ACE_TYPE", windowsParsedACE{ACEType: windowsAccessAllowedObjectACEType, SIDValid: true, SIDTrusted: true}},
+		{"ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE", windowsParsedACE{ACEType: windowsAccessAllowedCallbackObjectACEType, SIDValid: true, SIDTrusted: true}},
+		{"ACCESS_ALLOWED_COMPOUND_ACE_TYPE", windowsParsedACE{ACEType: windowsAccessAllowedCompoundACEType, SIDValid: true, SIDTrusted: true}},
+		{"UnknownACEType_99", windowsParsedACE{ACEType: 99, SIDValid: true, SIDTrusted: true}},
+		{"InvalidSIDInAllowACE", windowsParsedACE{ACEType: windowsAccessAllowedACEType, SIDValid: false, SIDTrusted: true}},
 	}
 	for _, tc := range failClosedTypes {
 		t.Run(tc.name, func(t *testing.T) {
@@ -205,16 +205,16 @@ func TestRound4_P2_10_EvaluateWindowsAgentPipeDACL(t *testing.T) {
 	// Win32-OpenSSH openssh-ssh-agent default client ACE for Authenticated Users:
 	// READ_CONTROL|SYNCHRONIZE|FILE_READ_DATA|FILE_WRITE_DATA|FILE_READ_ATTRIBUTES|FILE_WRITE_ATTRIBUTES|FILE_READ_EA = 0x0012019b.
 	openSSHAUACE := windowsParsedACE{
-		aceType:    windowsAccessAllowedACEType,
-		mask:       0x0012019b,
-		sidValid:   true,
-		sidTrusted: false,
+		ACEType:    windowsAccessAllowedACEType,
+		Mask:       0x0012019b,
+		SIDValid:   true,
+		SIDTrusted: false,
 	}
 	trustedOwnerACE := windowsParsedACE{
-		aceType:    windowsAccessAllowedACEType,
-		mask:       windowsAccessGenericAll | windowsAccessFileCreatePipeInstance,
-		sidValid:   true,
-		sidTrusted: true,
+		ACEType:    windowsAccessAllowedACEType,
+		Mask:       windowsAccessGenericAll | windowsAccessFileCreatePipeInstance,
+		SIDValid:   true,
+		SIDTrusted: true,
 	}
 
 	if err := evaluateWindowsAgentPipeSecurity(
@@ -256,10 +256,10 @@ func TestRound4_P2_10_EvaluateWindowsAgentPipeDACL(t *testing.T) {
 			nil, true, []windowsParsedACE{
 				trustedOwnerACE,
 				{
-					aceType:    windowsAccessAllowedACEType,
-					mask:       unsafeMask,
-					sidValid:   true,
-					sidTrusted: false,
+					ACEType:    windowsAccessAllowedACEType,
+					Mask:       unsafeMask,
+					SIDValid:   true,
+					SIDTrusted: false,
 				},
 			},
 		)
@@ -286,16 +286,16 @@ func TestRound6_P1_2_And_P3_4_WindowsAgentDesiredAccessAndUnicodeControls(t *tes
 	// A minimal-DACL pipe granting only windowsAgentPipeDesiredAccess to AU must pass evaluation.
 	if !evaluateWindowsNamedPipeDACL(true, []windowsParsedACE{
 		{
-			aceType:    windowsAccessAllowedACEType,
-			mask:       windowsAccessGenericAll,
-			sidValid:   true,
-			sidTrusted: true,
+			ACEType:    windowsAccessAllowedACEType,
+			Mask:       windowsAccessGenericAll,
+			SIDValid:   true,
+			SIDTrusted: true,
 		},
 		{
-			aceType:    windowsAccessAllowedACEType,
-			mask:       windowsAgentPipeDesiredAccess,
-			sidValid:   true,
-			sidTrusted: false,
+			ACEType:    windowsAccessAllowedACEType,
+			Mask:       windowsAgentPipeDesiredAccess,
+			SIDValid:   true,
+			SIDTrusted: false,
 		},
 	}) {
 		t.Fatal("minimal-DACL pipe granting 0x0012008b should be allowed")

@@ -148,8 +148,8 @@ type MuxServer struct {
 
 // NewMuxServer creates and binds a new OpenSSH multiplex master server.
 func NewMuxServer(opts MuxServerOptions) (*MuxServer, error) {
-	if strings.TrimSpace(opts.ControlPath) == "" {
-		return nil, fmt.Errorf("control path cannot be empty")
+	if strings.TrimSpace(opts.ControlPath) == "" || IsNoneValue(opts.ControlPath) {
+		return nil, fmt.Errorf("control path cannot be empty or none")
 	}
 	if opts.SSHClient == nil {
 		return nil, fmt.Errorf("ssh client cannot be nil")
@@ -284,11 +284,10 @@ func StartMuxServer(ctx context.Context, sshClient *cryptoSSH.Client, opts MuxMa
 	var persistEnabled, persistIndefinite bool
 	var persistDuration time.Duration
 	if target.Control != nil && target.Control.Persist != "" {
-		en, ind, dur, err := ParseControlPersist(target.Control.Persist)
-		if err == nil {
-			persistEnabled = en
-			persistIndefinite = ind
-			persistDuration = dur
+		if setting, err := ParsePersistSetting(target.Control.Persist); err == nil {
+			persistEnabled = setting.Enabled()
+			persistIndefinite = setting.Indefinite()
+			persistDuration = setting.Duration
 		}
 	}
 

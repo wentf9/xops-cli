@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wentf9/xops-cli/core/winsec"
 	"golang.org/x/sys/windows"
 )
 
@@ -183,21 +184,9 @@ func verifyWindowsAgentPipeServerOwner(pipeHandle windows.Handle) error {
 		if serverPID == uint32(os.Getpid()) {
 			tokenResolved = true
 			tokenTrusted = true
-		} else {
-			procHandle, openErr := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, serverPID)
-			if openErr == nil {
-				var tok windows.Token
-				tokErr := windows.OpenProcessToken(procHandle, windows.TOKEN_QUERY, &tok)
-				_ = windows.CloseHandle(procHandle)
-				if tokErr == nil {
-					tu, userErr := tok.GetTokenUser()
-					_ = tok.Close()
-					if userErr == nil && tu != nil && tu.User.Sid != nil {
-						tokenResolved = true
-						tokenTrusted = isTrustedWindowsPrincipalSID(tu.User.Sid, currSID)
-					}
-				}
-			}
+		} else if peerSID, sidErr := winsec.ProcessUserSID(serverPID); sidErr == nil && peerSID != nil {
+			tokenResolved = true
+			tokenTrusted = isTrustedWindowsPrincipalSID(peerSID, currSID)
 		}
 	}
 

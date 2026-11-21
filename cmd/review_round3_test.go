@@ -300,8 +300,8 @@ func TestRound3_P2_14_And_P3_9_NonProxyControlBgRejectionAndCaseInsensitiveNone(
 	if sOpts.Path == nil || *sOpts.Path != "none" {
 		t.Fatalf("SessionControlOptions.Path = %v, want \"none\"", sOpts.Path)
 	}
-	if ctrl := mergeSessionControl(sOpts); ctrl.AllowReuse || ctrl.Path != "none" {
-		t.Fatalf("mergeSessionControl(-S NONE) = %+v, want Path=\"none\" AllowReuse=false", ctrl)
+	if ctrl, ctrlErr := sOpts.ResolveControl(); ctrlErr != nil || ctrl == nil || ctrl.AllowReuse || ctrl.Path != "none" {
+		t.Fatalf("ResolveControl(-S NONE) = (%+v, %v), want Path=\"none\" AllowReuse=false", ctrl, ctrlErr)
 	}
 	if (&SSHControlFlags{CtlCmd: "stop", ControlPath: "NONE"}).ControlCommandWithoutTarget() {
 		t.Fatal("ControlCommandWithoutTarget(-S NONE) must be false")
@@ -325,6 +325,16 @@ func TestRound3_P2_14_And_P3_9_NonProxyControlBgRejectionAndCaseInsensitiveNone(
 	}
 	if err := oT4.Validate(); err != nil {
 		t.Fatalf("Validate(-O check web) unexpected error: %v", err)
+	}
+}
+
+func TestExpandControlSocketPath_EnvExpandedNoneRejected(t *testing.T) {
+	t.Setenv("XOPS_ENV_NONE", "NONE")
+	envNoneOpts := NewSshOptions()
+	envNoneOpts.control.ControlPath = "${XOPS_ENV_NONE}"
+	var envNoneErrBuf bytes.Buffer
+	if _, expErr := expandControlSocketPath(envNoneOpts, nil, "", xssh.TargetContext{Host: "example.com"}, &envNoneErrBuf); expErr == nil {
+		t.Fatal("expandControlSocketPath(-S '${XOPS_ENV_NONE}' -> NONE) must fail cleanly")
 	}
 }
 

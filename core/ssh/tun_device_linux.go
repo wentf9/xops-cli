@@ -42,9 +42,11 @@ func openPlatformTunnelDevice(mode TunnelMode, localUnit int) (TunnelDevice, err
 		return nil, fmt.Errorf("invalid local tunnel unit %d", localUnit)
 	}
 
-	var flags uint16
-	var ifrName string
-	deviceMode := mode
+	var (
+		flags      uint16
+		ifrName    string
+		deviceMode TunnelMode
+	)
 
 	switch mode {
 	case TunnelModePointToPoint, TunnelModeYes:
@@ -56,12 +58,7 @@ func openPlatformTunnelDevice(mode TunnelMode, localUnit int) (TunnelDevice, err
 			ifrName = fmt.Sprintf("tun%d", localUnit)
 		}
 	case TunnelModeEthernet:
-		flags = uint16(unix.IFF_TAP | unix.IFF_NO_PI)
-		if localUnit == TunnelIDAny {
-			ifrName = "tap%d"
-		} else {
-			ifrName = fmt.Sprintf("tap%d", localUnit)
-		}
+		return nil, fmt.Errorf("%w: ethernet (layer-2 tap) tunnel forwarding is not supported", ErrTunnelDeviceUnsupported)
 	default:
 		return nil, fmt.Errorf("%w: unsupported tunnel mode %q", ErrTunnelDeviceUnsupported, mode)
 	}

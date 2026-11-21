@@ -146,9 +146,9 @@ func (f *SSHControlFlags) ToSessionControlOptionsWithJump(cliJump string) (adapt
 	// 3. Command-line -S flag overrides any ControlPath from -o
 	if f.ControlPath != "" {
 		controlPath := f.ControlPath
-		if strings.EqualFold(strings.TrimSpace(controlPath), "none") {
+		if ssh.IsNoneValue(controlPath) {
 			controlPath = "none"
-		} else if f.MasterCount == 0 && sessionOpts.Master == nil {
+		} else if f.MasterCount == 0 && !sessionOpts.HasExplicitMaster() {
 			sessionOpts.AllowReuse = true
 		}
 		if f.controlPathLiteral && controlPath != "none" {
@@ -184,7 +184,7 @@ func (f *SSHControlFlags) Validate() error {
 		if f.MasterCount > 0 {
 			return f.controlUsageError(fmt.Errorf("control command (-O) cannot be combined with master mode (-M)"))
 		}
-		if strings.EqualFold(strings.TrimSpace(f.ControlPath), "none") {
+		if ssh.IsNoneValue(f.ControlPath) {
 			return f.controlUsageError(fmt.Errorf("control command (-O) cannot be specified with -S none"))
 		}
 	}
@@ -217,7 +217,7 @@ func (f *SSHControlFlags) ControlCommandWithoutTarget() bool {
 		return false
 	}
 	path := strings.TrimSpace(f.ControlPath)
-	return path != "" && !strings.EqualFold(path, "none")
+	return path != "" && !ssh.IsNoneValue(path)
 }
 
 func effectiveConnectionTarget(opts *SshOptions, nodeID string) config.ConnectionTarget {
@@ -274,10 +274,17 @@ func controlSocketPath(opts *SshOptions, provider config.ConfigProvider, nodeID 
 	if err != nil {
 		return "", err
 	}
-	if ctrl == nil || ctrl.Path == "" || strings.EqualFold(strings.TrimSpace(ctrl.Path), "none") {
+	if !ctrl.IsEnabled() {
 		return "", nil
 	}
-	return ctrl.ResolvePath(sshenv.Discover(), target)
+	expanded, err := ctrl.ResolvePath(sshenv.Discover(), target)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(expanded) == "" || ssh.IsNoneValue(expanded) {
+		return "", nil
+	}
+	return expanded, nil
 }
 
 func firstNonEmptySessionValue(vals ...string) string {
@@ -412,7 +419,7 @@ func resolveControlConfig(provider config.ConfigProvider, lookupKey, selector st
 		if sessionOpts.IsEmpty() {
 			return nil, nil
 		}
-		return ssh.EffectiveControl(mergeSessionControl(sessionOpts))
+		return sessionOpts.ResolveControl()
 	}
 	if lookupKey == "" {
 		// ResolveControl treats an unknown selector as "no node layer" and falls
@@ -424,35 +431,6 @@ func resolveControlConfig(provider config.ConfigProvider, lookupKey, selector st
 		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(lookupKey, sessionAuth))
 	}
 	return adapter.NewSSHAdapter(provider, adpOpts...).ResolveControl(lookupKey, sessionOpts)
-}
-
-// mergeSessionControl converts session overrides into one ControlConfig layer.
-func mergeSessionControl(sessionOpts adapter.SessionControlOptions) *ssh.ControlConfig {
-	if opts := sessionOpts.ToSSHOptions(); opts != nil {
-		if ctrl := opts.ControlConfig(); ctrl != nil {
-			ctrl.AllowReuse = sessionOpts.AllowReuse && ctrl.Master == "" && !strings.EqualFold(strings.TrimSpace(ctrl.Path), "none")
-			return ctrl
-		}
-	}
-	ctrl := &ssh.ControlConfig{
-		AllowReuse: sessionOpts.AllowReuse,
-	}
-	if sessionOpts.Master != nil {
-		ctrl.Master = *sessionOpts.Master
-		ctrl.AllowReuse = false
-	}
-	if sessionOpts.Path != nil {
-		ctrl.Path = *sessionOpts.Path
-		ctrl.LiteralPath = sessionOpts.LiteralPath
-		if strings.EqualFold(strings.TrimSpace(ctrl.Path), "none") {
-			ctrl.AllowReuse = false
-			ctrl.LiteralPath = false
-		}
-	}
-	if sessionOpts.Persist != nil {
-		ctrl.Persist = *sessionOpts.Persist
-	}
-	return ctrl
 }
 
 func applyTargetControlNodeOverrides(opts *SshOptions, nodeID string, target *ssh.TargetContext) {

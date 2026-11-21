@@ -386,8 +386,8 @@ func TestResolveControl_Error_MasterWithoutPath(t *testing.T) {
 	t1.SetMaster(ssh.ControlMasterYes)
 
 	_, err := adp.ResolveControl("testnode", t1)
-	if err == nil || !strings.Contains(err.Error(), "ControlPath is required when ControlMaster is yes") {
-		t.Fatalf("expected ControlPath is required error, got: %v", err)
+	if err == nil || !strings.Contains(err.Error(), `ControlMaster "yes" requires non-empty ControlPath`) {
+		t.Fatalf("expected ControlMaster requires non-empty ControlPath error, got: %v", err)
 	}
 }
 
@@ -973,5 +973,41 @@ func TestResolveControl_AllowReuseWithConfiguredAsk(t *testing.T) {
 	}
 	if ctrlWithMandS == nil || ctrlWithMandS.AllowReuse {
 		t.Fatalf("expected AllowReuse=false when Master is explicitly set in SessionControlOptions, got %+v", ctrlWithMandS)
+	}
+
+	// 4. ConnectionWideOptions must NOT leak AllowReuse to ProxyJump hops (M3).
+	var onlyS SessionControlOptions
+	onlyS.SetPath("/tmp/target.sock")
+	onlyS.AllowReuse = true
+	if err := onlyS.SetAddressFamily(ssh.AddressFamilyInet); err != nil {
+		t.Fatalf("SetAddressFamily: %v", err)
+	}
+	wide := onlyS.ConnectionWideOptions()
+	if wide.AllowReuse {
+		t.Fatalf("expected ConnectionWideOptions to strip AllowReuse, got %+v", wide)
+	}
+	jumpCtrl, err := adp.ResolveControl("testnode", wide)
+	if err != nil {
+		t.Fatalf("ResolveControl(wide) failed: %v", err)
+	}
+	if jumpCtrl == nil || jumpCtrl.AllowReuse {
+		t.Fatalf("expected jump hop resolved with ConnectionWideOptions to have AllowReuse=false, got %+v", jumpCtrl)
+	}
+}
+
+func TestResolveControl_PersistNoWithoutControlPathAllowed(t *testing.T) {
+	provider := setupTestProvider(t, nil, nil, "")
+	adp := NewSSHAdapter(provider)
+
+	for _, rawPersist := range []string{"no", "false"} {
+		var t1 SessionControlOptions
+		t1.SetPersist(rawPersist)
+		res, err := adp.ResolveControl("testnode", t1)
+		if err != nil {
+			t.Fatalf("ResolveControl(ControlPersist=%q without ControlPath) failed: %v", rawPersist, err)
+		}
+		if res == nil || res.Master != ssh.ControlMasterNo || res.Persist != rawPersist || res.IsEnabled() {
+			t.Fatalf("unexpected ControlConfig for ControlPersist=%q: %+v", rawPersist, res)
+		}
 	}
 }

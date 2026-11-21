@@ -138,13 +138,11 @@ func (a *SSHAdapter) applyPolicyMergeModes(
 		pol.effectiveOpts = merged
 	}
 	if mode.resolveControl && !a.disableControl {
-		merged := mergeControlFields(sessionOpts, t2.ControlConfig(), t3.ControlConfig(), t4.ControlConfig())
-		if merged != nil {
-			if err := validateMergedControl(merged); err != nil {
-				return err
-			}
-			pol.effectiveCtrl = merged
+		ctrl, err := sessionOpts.ResolveControl(t2, t3, t4)
+		if err != nil {
+			return err
 		}
+		pol.effectiveCtrl = ctrl
 	}
 	return nil
 }
@@ -413,7 +411,7 @@ func (a *SSHAdapter) resolvePolicyTiers(
 		tier4OpenSSH = filterNonVirtualTier4Options(rawT4)
 	}
 
-	if tier4OpenSSH != nil && tier4OpenSSH.ControlConfig() != nil {
+	if tier4OpenSSH != nil && !tier4OpenSSH.FilterByClasses(ssh.OptionClassMux).IsEmpty() {
 		tier4OpenSSH.ImplicitTier4 = true
 	}
 	return tier2Node, tier3Out, tier4OpenSSH, nil

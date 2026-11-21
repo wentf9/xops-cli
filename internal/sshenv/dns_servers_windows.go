@@ -12,42 +12,8 @@ import (
 	"strings"
 	"unsafe"
 
+	"github.com/wentf9/xops-cli/core/winsec"
 	"golang.org/x/sys/windows"
-)
-
-// Compile-time assertions keeping windows_security_eval.go constants in lockstep
-// with golang.org/x/sys/windows.
-const (
-	_ = uint(windowsInvalidFileAttributes - windows.INVALID_FILE_ATTRIBUTES)
-	_ = uint(windows.INVALID_FILE_ATTRIBUTES - windowsInvalidFileAttributes)
-	_ = uint(windowsFileAttributeDirectory - windows.FILE_ATTRIBUTE_DIRECTORY)
-	_ = uint(windows.FILE_ATTRIBUTE_DIRECTORY - windowsFileAttributeDirectory)
-	_ = uint(windowsFileAttributeDevice - windows.FILE_ATTRIBUTE_DEVICE)
-	_ = uint(windows.FILE_ATTRIBUTE_DEVICE - windowsFileAttributeDevice)
-	_ = uint(windowsFileAttributeReparsePoint - windows.FILE_ATTRIBUTE_REPARSE_POINT)
-	_ = uint(windows.FILE_ATTRIBUTE_REPARSE_POINT - windowsFileAttributeReparsePoint)
-
-	_ = uint(windowsInheritOnlyACEFlag - windows.INHERIT_ONLY_ACE)
-	_ = uint(windows.INHERIT_ONLY_ACE - windowsInheritOnlyACEFlag)
-	_ = uint(windowsAccessAllowedACEType - windows.ACCESS_ALLOWED_ACE_TYPE)
-	_ = uint(windows.ACCESS_ALLOWED_ACE_TYPE - windowsAccessAllowedACEType)
-	_ = uint(windowsAccessDeniedACEType - windows.ACCESS_DENIED_ACE_TYPE)
-	_ = uint(windows.ACCESS_DENIED_ACE_TYPE - windowsAccessDeniedACEType)
-
-	_ = uint(windowsAccessFileWriteData - windows.FILE_WRITE_DATA)
-	_ = uint(windows.FILE_WRITE_DATA - windowsAccessFileWriteData)
-	_ = uint(windowsAccessFileAppendData - windows.FILE_APPEND_DATA)
-	_ = uint(windows.FILE_APPEND_DATA - windowsAccessFileAppendData)
-	_ = uint(windowsAccessDelete - windows.DELETE)
-	_ = uint(windows.DELETE - windowsAccessDelete)
-	_ = uint(windowsAccessWriteDAC - windows.WRITE_DAC)
-	_ = uint(windows.WRITE_DAC - windowsAccessWriteDAC)
-	_ = uint(windowsAccessWriteOwner - windows.WRITE_OWNER)
-	_ = uint(windows.WRITE_OWNER - windowsAccessWriteOwner)
-	_ = uint(windowsAccessGenericAll - windows.GENERIC_ALL)
-	_ = uint(windows.GENERIC_ALL - windowsAccessGenericAll)
-	_ = uint(windowsAccessGenericWrite - windows.GENERIC_WRITE)
-	_ = uint(windows.GENERIC_WRITE - windowsAccessGenericWrite)
 )
 
 func systemDNSConfig() dnsConfig {
@@ -179,125 +145,21 @@ func isSecureWindowsGlobalKnownHostsFile(path string) bool {
 }
 
 func getWindowsFileAttributesNoFollow(path string) (uint32, bool) {
-	pathPtr, err := windows.UTF16PtrFromString(path)
-	if err != nil {
-		return windows.INVALID_FILE_ATTRIBUTES, false
-	}
-	var data windows.Win32FileAttributeData
-	if err := windows.GetFileAttributesEx(pathPtr, windows.GetFileExInfoStandard, (*byte)(unsafe.Pointer(&data))); err != nil {
-		return windows.INVALID_FILE_ATTRIBUTES, false
-	}
-	return data.FileAttributes, true
+	return winsec.GetFileAttributesNoFollow(path)
 }
 
 func isSecureWindowsSystemSSHObject(path string, expectDir bool, currSID *windows.SID) bool {
-	attrs, ok := getWindowsFileAttributesNoFollow(path)
-	if !ok || !evaluateWindowsAttributes(attrs, expectDir) {
-		return false
-	}
-	sd, err := windows.GetNamedSecurityInfo(
-		path,
-		windows.SE_FILE_OBJECT,
-		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION,
-	)
-	if err != nil || sd == nil {
-		return false
-	}
-	if !isSecureWindowsSecurityDescriptor(attrs, expectDir, sd, currSID) {
-		return false
-	}
-	attrsAfter, ok := getWindowsFileAttributesNoFollow(path)
-	return ok && evaluateWindowsAttributes(attrsAfter, expectDir)
-}
-
-func isSecureWindowsSecurityDescriptor(
-	attrs uint32,
-	expectDir bool,
-	sd *windows.SECURITY_DESCRIPTOR,
-	currSID *windows.SID,
-) bool {
-	if sd == nil {
-		return false
-	}
-	owner, _, err := sd.Owner()
-	if err != nil || owner == nil {
-		return false
-	}
-	ownerTrusted := isTrustedWindowsPrincipalSID(owner, currSID)
-	if !ownerTrusted {
-		return false
-	}
-	dacl, _, err := sd.DACL()
-	// A nil DACL on Windows means unrestricted full access to Everyone; reject.
-	if err != nil || dacl == nil {
-		return false
-	}
-	aces, ok := parseWindowsACL(dacl, currSID)
-	if !ok {
-		return false
-	}
-	return evaluateWindowsObjectSecurity(attrs, expectDir, ownerTrusted, true, aces)
+	return winsec.IsSecureSystemSSHObject(path, expectDir, currSID)
 }
 
 func parseWindowsACL(dacl *windows.ACL, currSID *windows.SID) ([]windowsParsedACE, bool) {
-	if dacl == nil {
-		return nil, false
-	}
-	aces := make([]windowsParsedACE, 0, dacl.AceCount)
-	for i := range uint32(dacl.AceCount) {
-		var ace *windows.ACCESS_ALLOWED_ACE
-		if err := windows.GetAce(dacl, i, &ace); err != nil || ace == nil {
-			return nil, false
-		}
-		if uintptr(ace.Header.AceSize) < unsafe.Sizeof(windows.ACE_HEADER{}) {
-			return nil, false
-		}
-		parsed := windowsParsedACE{
-			aceType:  ace.Header.AceType,
-			aceFlags: ace.Header.AceFlags,
-		}
-		if parsed.aceFlags&windowsInheritOnlyACEFlag == 0 && isStandardLayoutWindowsAllowACEType(parsed.aceType) {
-			const minWindowsSIDHeaderSize = uintptr(8)
-			sidOffset := unsafe.Offsetof(ace.SidStart)
-			if uintptr(ace.Header.AceSize) < sidOffset+minWindowsSIDHeaderSize {
-				return nil, false
-			}
-			aceSID := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
-			if !aceSID.IsValid() {
-				return nil, false
-			}
-			sidLen := aceSID.Len()
-			if sidLen < int(minWindowsSIDHeaderSize) || uintptr(ace.Header.AceSize) < sidOffset+uintptr(sidLen) {
-				return nil, false
-			}
-			parsed.mask = uint32(ace.Mask)
-			parsed.sidValid = true
-			parsed.sidTrusted = isTrustedWindowsPrincipalSID(aceSID, currSID)
-		}
-		aces = append(aces, parsed)
-	}
-	return aces, true
+	return winsec.ParseACL(dacl, currSID)
 }
 
 func currentWindowsProcessUserSID() (*windows.SID, error) {
-	var tok windows.Token
-	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &tok); err != nil {
-		return nil, err
-	}
-	defer func() { _ = tok.Close() }()
-	tu, err := tok.GetTokenUser()
-	if err != nil || tu == nil || tu.User.Sid == nil {
-		return nil, errors.New("empty process token user SID")
-	}
-	return tu.User.Sid.Copy()
+	return winsec.CurrentProcessUserSID()
 }
 
 func isTrustedWindowsPrincipalSID(sid, currentUserSID *windows.SID) bool {
-	if sid == nil || !sid.IsValid() {
-		return false
-	}
-	if sid.IsWellKnown(windows.WinLocalSystemSid) || sid.IsWellKnown(windows.WinBuiltinAdministratorsSid) {
-		return true
-	}
-	return currentUserSID != nil && currentUserSID.IsValid() && sid.Equals(currentUserSID)
+	return winsec.IsTrustedPrincipalSID(sid, currentUserSID)
 }

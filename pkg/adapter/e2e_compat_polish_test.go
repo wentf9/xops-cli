@@ -120,9 +120,10 @@ func TestSessionControlOptions_ConnectionWideOptionsIsolation(t *testing.T) {
 		t.Fatalf("SetAddressFamily failed: %v", err)
 	}
 
+	parsed.AllowReuse = true
 	globalCtrl := parsed.ConnectionWideOptions()
-	if globalCtrl.Master != nil || globalCtrl.Path != nil || globalCtrl.Persist != nil {
-		t.Fatalf("expected ConnectionWideOptions to exclude ControlMaster/Path/Persist, got %+v", globalCtrl)
+	if globalCtrl.Master != nil || globalCtrl.Path != nil || globalCtrl.Persist != nil || globalCtrl.AllowReuse {
+		t.Fatalf("expected ConnectionWideOptions to exclude ControlMaster/Path/Persist/AllowReuse, got %+v", globalCtrl)
 	}
 
 	sshCfg := `

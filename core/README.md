@@ -25,6 +25,7 @@ Implemented packages:
 - `ssh`: the shared connection/command/forwarding implementation, explicit local
   environment, signer and host-trust sources, input bridges, and captured plans.
 - `sftp`: the shared subsystem and file-transfer implementation.
+- `winsec`: platform-independent Windows NTFS DACL/owner/peer evaluation and Windows security descriptor / `AF_UNIX` peer verification helpers shared by core and CLI adapters.
 - `testutil/testleak`: portable secret-leak assertions used by core and CLI tests.
 
 Persisted transfer authorization, dual-version journals and retained-connection

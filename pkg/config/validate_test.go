@@ -110,7 +110,7 @@ func TestValidateControlConfig_CrossFieldRules(t *testing.T) {
 		t.Fatalf("expected persist with master no error, got: %v", errA)
 	}
 
-	// Rule B: Path is 'none' when Master is active
+	// Rule B: Path is 'none' (case-insensitive) when Master is active
 	activeModes := []ssh.ControlMasterMode{
 		ssh.ControlMasterYes,
 		ssh.ControlMasterAsk,
@@ -118,13 +118,15 @@ func TestValidateControlConfig_CrossFieldRules(t *testing.T) {
 		ssh.ControlMasterAutoAsk,
 	}
 	for _, mode := range activeModes {
-		ctrlB := &ssh.ControlConfig{
-			Master: mode,
-			Path:   "none",
-		}
-		errB := ValidateControlConfig(ctrlB)
-		if errB == nil || !strings.Contains(errB.Error(), "ControlPath cannot be 'none' when ControlMaster is") {
-			t.Fatalf("expected path none with master %q error, got: %v", mode, errB)
+		for _, noneVal := range []string{"none", "NONE", " None "} {
+			ctrlB := &ssh.ControlConfig{
+				Master: mode,
+				Path:   noneVal,
+			}
+			errB := ValidateControlConfig(ctrlB)
+			if errB == nil || !errors.Is(errB, ErrSchemaValidation) || !strings.Contains(errB.Error(), "ControlPath cannot be 'none' when ControlMaster is") {
+				t.Fatalf("expected path %q with master %q error, got: %v", noneVal, mode, errB)
+			}
 		}
 	}
 }
@@ -140,7 +142,19 @@ func TestValidateEffectiveControl(t *testing.T) {
 		t.Fatalf("master no with empty path should be valid, got: %v", err)
 	}
 
-	// Active master with empty path is invalid
+	// Explicit ControlPersist=no/false without ControlPath is valid (M4 parity).
+	for _, noPersist := range []string{"no", "false"} {
+		if err := ValidateEffectiveControl(&ssh.ControlConfig{Persist: noPersist}); err != nil {
+			t.Fatalf("ControlPersist=%s without ControlPath should be valid, got: %v", noPersist, err)
+		}
+	}
+
+	// Enabled ControlPersist without ControlPath fails effective validation.
+	if err := ValidateEffectiveControl(&ssh.ControlConfig{Persist: "10m"}); !errors.Is(err, ErrSchemaValidation) {
+		t.Fatalf("ControlPersist=10m without ControlPath should fail ErrSchemaValidation, got: %v", err)
+	}
+
+	// Active master with empty or none path is invalid
 	activeModes := []ssh.ControlMasterMode{
 		ssh.ControlMasterYes,
 		ssh.ControlMasterAsk,
@@ -149,13 +163,15 @@ func TestValidateEffectiveControl(t *testing.T) {
 	}
 	for _, mode := range activeModes {
 		ctrlEmpty := &ssh.ControlConfig{Master: mode, Path: ""}
-		if err := ValidateEffectiveControl(ctrlEmpty); err == nil || !strings.Contains(err.Error(), "requires non-empty ControlPath") {
+		if err := ValidateEffectiveControl(ctrlEmpty); err == nil || !errors.Is(err, ErrSchemaValidation) || !strings.Contains(err.Error(), "requires non-empty ControlPath") {
 			t.Fatalf("mode %q with empty path should fail, got: %v", mode, err)
 		}
 
-		ctrlNone := &ssh.ControlConfig{Master: mode, Path: "none"}
-		if err := ValidateEffectiveControl(ctrlNone); err == nil || !strings.Contains(err.Error(), "requires non-empty ControlPath") {
-			t.Fatalf("mode %q with path none should fail, got: %v", mode, err)
+		for _, noneVal := range []string{"none", "NONE"} {
+			ctrlNone := &ssh.ControlConfig{Master: mode, Path: noneVal}
+			if err := ValidateEffectiveControl(ctrlNone); err == nil || !errors.Is(err, ErrSchemaValidation) {
+				t.Fatalf("mode %q with path %q should fail ErrSchemaValidation, got: %v", mode, noneVal, err)
+			}
 		}
 
 		ctrlValid := &ssh.ControlConfig{Master: mode, Path: "/tmp/valid.sock"}
