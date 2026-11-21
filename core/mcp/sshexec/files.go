@@ -38,13 +38,13 @@ func (s *fileSession) Upload(ctx context.Context, local, remote string, progress
 	defer cancel()
 	return s.Client.Upload(work, local, remote, progress)
 }
-func (s *fileSession) Download(ctx context.Context, remote, local string, progress sftp.ProgressCallback) error {
+func (s *fileSession) Download(ctx context.Context, remote sftp.RemotePath, dest sftp.LocalDest, opts sftp.DownloadOptions) error {
 	work, cancel, err := s.backend.work(ctx, s.permit, s.phases...)
 	if err != nil {
 		return err
 	}
 	defer cancel()
-	return s.Client.Download(work, remote, local, progress)
+	return s.Client.Download(work, remote, dest, opts)
 }
 func (s *fileSession) CreatePrivateExclusive(ctx context.Context, name string, write func(io.Writer) error) (bool, bool, error) {
 	work, cancel, err := s.backend.work(ctx, s.permit, s.phases...)

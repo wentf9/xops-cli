@@ -234,7 +234,7 @@ func TestFinishTransferGroupPreservesParentContextCanceled(t *testing.T) {
 	}
 }
 
-func TestRemoteRelativePath(t *testing.T) {
+func TestRemotePathRelativeTo(t *testing.T) {
 	tests := []struct {
 		name    string
 		base    string
@@ -251,18 +251,34 @@ func TestRemoteRelativePath(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := remoteRelativePath(tt.base, tt.target)
+			root, err := ParseRemotePath(tt.base)
+			if err != nil {
+				t.Fatalf("ParseRemotePath(%q): %v", tt.base, err)
+			}
+			target, err := ParseRemotePath(tt.target)
+			if err != nil {
+				t.Fatalf("ParseRemotePath(%q): %v", tt.target, err)
+			}
+			segs, err := target.RelativeTo(root)
 			if tt.wantErr {
 				if err == nil {
-					t.Fatalf("remoteRelativePath(%q, %q) error = nil, want error", tt.base, tt.target)
+					t.Fatalf("RelativeTo(%q, %q) error = nil, want error", tt.target, tt.base)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("remoteRelativePath(%q, %q) error = %v", tt.base, tt.target, err)
+				t.Fatalf("RelativeTo(%q, %q) error = %v", tt.target, tt.base, err)
+			}
+			got := "."
+			if len(segs) > 0 {
+				parts := make([]string, len(segs))
+				for i, s := range segs {
+					parts[i] = s.String()
+				}
+				got = strings.Join(parts, "/")
 			}
 			if got != tt.want {
-				t.Fatalf("remoteRelativePath(%q, %q) = %q, want %q", tt.base, tt.target, got, tt.want)
+				t.Fatalf("RelativeTo(%q, %q) = %q, want %q", tt.target, tt.base, got, tt.want)
 			}
 		})
 	}
@@ -519,8 +535,16 @@ func TestClient_WithFileProgress_DownloadDirectory(t *testing.T) {
 	}
 
 	clientDown := client.WithFileProgress(downCallback)
-	if err := clientDown.DownloadDirectory(t.Context(), "/remotedir", localDownDir, nil); err != nil {
-		t.Fatalf("DownloadDirectory failed: %v", err)
+	remoteDir, err := ParseRemotePath("/remotedir")
+	if err != nil {
+		t.Fatalf("ParseRemotePath: %v", err)
+	}
+	localDest, err := LocalDestPath(localDownDir)
+	if err != nil {
+		t.Fatalf("LocalDestPath: %v", err)
+	}
+	if err := clientDown.Download(t.Context(), remoteDir, localDest, DownloadOptions{}); err != nil {
+		t.Fatalf("Download directory failed: %v", err)
 	}
 
 	mu.Lock()

@@ -306,26 +306,20 @@ func assertOneLineSplitOptionDelegate(t *testing.T, pf parsedGoFile) {
 
 func checkWindowsReservedDeviceNameAndExecSanitizer(t *testing.T, files []parsedGoFile) {
 	t.Helper()
-	var foundInCoreSSH, execCallsSanitizer bool
+	const coreFSXImportPath = "github.com/wentf9/xops-cli/core/fsx"
+	var coreSSHCallsFSX, execCallsSanitizer bool
 	for _, pf := range files {
-		for _, d := range declaredTopLevelNames(pf.file) {
-			if d.name != "isWindowsReservedDeviceName" {
-				continue
-			}
-			pos := pf.fset.Position(d.pos)
-			if strings.HasPrefix(pf.relPath, "core/ssh/") {
-				foundInCoreSSH = true
-			} else {
-				t.Errorf("isWindowsReservedDeviceName declared outside core/ssh at %s:%d (use core/ssh.SanitizeFilenameComponent)", pf.relPath, pos.Line)
-			}
+		if pf.relPath == "core/ssh/identity_path.go" {
+			fsxPkg := importLocalName(pf.file, coreFSXImportPath)
+			coreSSHCallsFSX = exprContainsSelectorCall(pf.file, fsxPkg, "ValidateLocalComponent")
 		}
 		if pf.relPath == "cmd/exec.go" {
 			sshPkg := importLocalName(pf.file, coreSSHImportPath)
 			execCallsSanitizer = exprContainsSelectorCall(pf.file, sshPkg, "SanitizeFilenameComponent")
 		}
 	}
-	if !foundInCoreSSH {
-		t.Error("expected core/ssh to declare isWindowsReservedDeviceName")
+	if !coreSSHCallsFSX {
+		t.Error("core/ssh/identity_path.go must call core/fsx.ValidateLocalComponent")
 	}
 	if !execCallsSanitizer {
 		t.Error("cmd/exec.go must call core/ssh.SanitizeFilenameComponent")

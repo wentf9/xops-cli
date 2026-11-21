@@ -1354,97 +1354,101 @@ func localDirectoryInfos(directory string, entries []os.DirEntry) ([]os.FileInfo
 	return infos, nil
 }
 
+func (s *Shell) resolveRemoteDownloadArg(rawArg string) (sftp.RemotePath, bool, error) {
+	rawPath, contentsOnly, err := sftp.ParseRemoteDownloadPath(rawArg)
+	if err != nil {
+		return sftp.RemotePath{}, false, err
+	}
+	if rawPath.IsAbs() {
+		return rawPath, contentsOnly, nil
+	}
+	resolved := s.resolvePath(rawArg)
+	cleanPath, err := sftp.ParseRemotePath(resolved)
+	if err != nil {
+		return sftp.RemotePath{}, false, err
+	}
+	return cleanPath, contentsOnly, nil
+}
+
 func (s *Shell) handleGet(ctx context.Context, args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("%s", i18n.T("sftp_shell_get_usage"))
 	}
-	remotes, err := s.expandRemote(ctx, args[0])
+
+	localPath := s.localCwd
+	if len(args) > 1 {
+		localPath = s.resolveLocalPath(args[1])
+	}
+	localDest, err := sftp.LocalDestInto(localPath)
 	if err != nil {
 		return fmt.Errorf("get: %w", err)
 	}
 
-	// 多源时：本地 dst 必须是已存在的目录或省略
-	if len(remotes) > 1 {
-		var localDir string
-		if len(args) > 1 {
-			localDir = s.resolveLocalPath(args[1])
-			info, exists, statErr := inspectPath(os.Stat, localDir)
-			if statErr != nil {
-				return fmt.Errorf("get: %w", statErr)
-			}
-			if !exists || !info.IsDir() {
-				return fmt.Errorf("%s", i18n.T("sftp_shell_dest_must_be_dir"))
-			}
-		} else {
-			localDir = s.localCwd
+	expandGlob := hasWildcard(args[0])
+	var (
+		remotePath   sftp.RemotePath
+		contentsOnly bool
+	)
+	if expandGlob {
+		remotePath, err = sftp.ParseRemotePath(s.resolvePath(args[0]))
+		if err != nil {
+			return fmt.Errorf("get: %w", err)
 		}
-		for _, remote := range remotes {
-			localTarget := filepath.Join(localDir, filepath.Base(remote))
-			if err := s.getSingle(ctx, remote, localTarget); err != nil {
-				return err
-			}
+	} else {
+		remotePath, contentsOnly, err = s.resolveRemoteDownloadArg(args[0])
+		if err != nil {
+			return fmt.Errorf("get: %w", err)
 		}
-		return nil
 	}
 
-	// 单源：保持原行为
-	remote := remotes[0]
-	local := filepath.Base(remote)
-	if len(args) > 1 {
-		local = s.resolveLocalPath(args[1])
-	}
-	if err := s.getSingle(ctx, remote, local); err != nil {
-		return err
-	}
-	return nil
-}
-
-// getSingle 下载单个远程文件/目录到本地，含覆盖确认与进度条
-//
-//nolint:gocyclo
-func (s *Shell) getSingle(ctx context.Context, remote, local string) error {
 	cli, release, err := s.acquireClient(ctx)
 	if err != nil {
 		return fmt.Errorf("get: %w", err)
 	}
 	defer release()
 
-	clientToUse := cli
-	info, exists, statErr := s.remoteStat(ctx, remote, true)
-	if statErr != nil {
-		return fmt.Errorf("get: %w", statErr)
-	}
-	if !exists {
-		return fmt.Errorf("get: remote source %q does not exist", remote)
-	}
-
-	// 检查目标文件是否已存在
-	localDest, destinationExists, statErr := resolveLocalDownloadDestination(local, remote)
-	if statErr != nil {
-		return fmt.Errorf("get: %w", statErr)
-	}
-	if destinationExists {
-		if s.noOverwrite {
-			return nil
-		}
-		if !cli.Config().Force {
-			confirmed, confirmErr := s.askConfirmation(ctx, i18n.Tf("prompt_overwrite", map[string]any{"Path": localDest}))
-			if confirmErr != nil {
-				return confirmErr
+	dlErr := cli.Download(ctx, remotePath, localDest, sftp.DownloadOptions{
+		ContentsOnly: contentsOnly,
+		ExpandGlob:   expandGlob,
+		ConfirmOverwrite: func(confirmCtx context.Context, target sftp.DownloadTargetInfo) (sftp.DownloadOverwriteDecision, error) {
+			if s.noOverwrite {
+				return sftp.DownloadOverwriteSkip, nil
 			}
-			if !confirmed {
-				return nil
+			if !cli.Config().Force {
+				confirmed, confirmErr := s.askConfirmation(confirmCtx, i18n.Tf("prompt_overwrite", map[string]any{"Path": target.LocalPath}))
+				if confirmErr != nil {
+					return sftp.DownloadOverwriteDefault, confirmErr
+				}
+				if !confirmed {
+					return sftp.DownloadOverwriteSkip, nil
+				}
+				return sftp.DownloadOverwriteForce, nil
 			}
-			clientToUse = cli.WithForce(true)
+			return sftp.DownloadOverwriteDefault, nil
+		},
+		BeforeTransfer: func(transferCtx context.Context, target sftp.DownloadTargetInfo) (*sftp.DownloadTransferHooks, error) {
+			return s.prepareDownloadTransferHooks(transferCtx, cli, target)
+		},
+	})
+	if dlErr != nil {
+		if errors.Is(dlErr, sftp.ErrGlobNoMatch) {
+			return fmt.Errorf("get: %s", i18n.Tf("sftp_shell_glob_no_match", map[string]any{"Pattern": args[0]}))
 		}
+		if errors.Is(dlErr, sftp.ErrLocalDestNotDir) {
+			return fmt.Errorf("%s", i18n.T("sftp_shell_dest_must_be_dir"))
+		}
+		return fmt.Errorf("download failed: %w", dlErr)
 	}
+	return nil
+}
 
-	s.fprintlnStdout(i18n.Tf("sftp_shell_downloading", map[string]any{"Remote": remote, "Local": localDest}))
+func (s *Shell) prepareDownloadTransferHooks(ctx context.Context, cli *sftp.Client, target sftp.DownloadTargetInfo) (*sftp.DownloadTransferHooks, error) {
+	remote := target.Remote.String()
+	s.fprintlnStdout(i18n.Tf("sftp_shell_downloading", map[string]any{"Remote": remote, "Local": target.LocalPath}))
 
-	// 计算远程文件/目录总大小以显示准确的进度条
 	var totalSize int64
 	description := "Downloading"
-	if info.IsDir() {
+	if target.Info.IsDir() {
 		description = "Total"
 		walkErr := cli.Do(ctx, func(client *pkgsftp.Client) error {
 			walker := client.Walk(remote)
@@ -1459,13 +1463,13 @@ func (s *Shell) getSingle(ctx context.Context, remote, local string) error {
 			return walker.Err()
 		})
 		if walkErr != nil {
-			return fmt.Errorf("get: walk remote source failed: %w", walkErr)
+			return nil, fmt.Errorf("get: walk remote source failed: %w", walkErr)
 		}
 	} else {
-		totalSize = info.Size()
+		totalSize = target.Info.Size()
 	}
 
-	bar, tracker := s.newTransferProgressBar(description, totalSize, info.IsDir())
+	bar, tracker := s.newTransferProgressBar(description, totalSize, target.Info.IsDir())
 	callback := func(n int64) {
 		if totalSize > 0 && n > 0 {
 			if err := bar.Add64(n); err != nil {
@@ -1473,50 +1477,34 @@ func (s *Shell) getSingle(ctx context.Context, remote, local string) error {
 			}
 		}
 	}
-	if info.IsDir() && tracker != nil {
-		clientToUse = clientToUse.WithFileProgress(tracker.onFileProgress)
+	var fileProgress sftp.FileProgressCallback
+	if target.Info.IsDir() && tracker != nil {
+		fileProgress = tracker.onFileProgress
 	}
-
-	var dlErr error
-	if info.IsDir() {
-		dlErr = clientToUse.DownloadDirectory(ctx, remote, localDest, callback)
-	} else {
-		dlErr = clientToUse.DownloadFile(ctx, remote, localDest, info.Size(), info.Mode(), callback)
-	}
-	if dlErr != nil {
-		if totalSize > 0 {
-			_ = bar.Exit()
-		}
-		if tracker != nil && tracker.hasRenderedDetail() {
-			s.fprintStdout("\n")
-		}
-		return fmt.Errorf("download failed: %w", dlErr)
-	}
-	if totalSize > 0 {
-		if finishErr := bar.Finish(); finishErr != nil {
-			s.recordDisplayError(fmt.Errorf("finish download progress failed: %w", finishErr))
-		}
-	} else if tracker != nil && tracker.hasRenderedDetail() {
-		s.fprintStdout("\n")
-	}
-	s.fprintlnStdout(i18n.T("sftp_shell_download_done"))
-	return nil
-}
-
-func resolveLocalDownloadDestination(localPath, remotePath string) (string, bool, error) {
-	localInfo, localExists, err := inspectPath(os.Stat, localPath)
-	if err != nil {
-		return "", false, err
-	}
-	localDestination := localPath
-	if localExists && localInfo.IsDir() {
-		localDestination = filepath.Join(localPath, filepath.Base(remotePath))
-	}
-	_, destinationExists, err := inspectPath(os.Lstat, localDestination)
-	if err != nil {
-		return "", false, err
-	}
-	return localDestination, destinationExists, nil
+	return &sftp.DownloadTransferHooks{
+		Progress:     callback,
+		FileProgress: fileProgress,
+		Finish: func(transferErr error) error {
+			if transferErr != nil {
+				if totalSize > 0 {
+					_ = bar.Exit()
+				}
+				if tracker != nil && tracker.hasRenderedDetail() {
+					s.fprintStdout("\n")
+				}
+				return nil
+			}
+			if totalSize > 0 {
+				if finishErr := bar.Finish(); finishErr != nil {
+					s.recordDisplayError(fmt.Errorf("finish download progress failed: %w", finishErr))
+				}
+			} else if tracker != nil && tracker.hasRenderedDetail() {
+				s.fprintStdout("\n")
+			}
+			s.fprintlnStdout(i18n.T("sftp_shell_download_done"))
+			return nil
+		},
+	}, nil
 }
 
 func (s *Shell) handlePut(ctx context.Context, args []string) error {
@@ -1551,8 +1539,11 @@ func (s *Shell) handlePut(ctx context.Context, args []string) error {
 			remoteDir = s.cwd
 		}
 		for _, local := range locals {
-			remoteTarget := s.resolvePath(path.Join(remoteDir, filepath.Base(local)))
-			if err := s.putSingle(ctx, local, remoteTarget); err != nil {
+			remoteTarget, targetErr := sftp.ParseRemoteUploadTarget(remoteDir, filepath.Base(local), true)
+			if targetErr != nil {
+				return fmt.Errorf("put: %w", targetErr)
+			}
+			if err := s.putSingle(ctx, local, remoteTarget.String()); err != nil {
 				return err
 			}
 		}
@@ -1565,7 +1556,11 @@ func (s *Shell) handlePut(ctx context.Context, args []string) error {
 	if len(args) > 1 {
 		remote = s.resolvePath(args[1])
 	} else {
-		remote = s.resolvePath(filepath.Base(local))
+		remoteTarget, targetErr := sftp.ParseRemoteUploadTarget(s.cwd, filepath.Base(local), true)
+		if targetErr != nil {
+			return fmt.Errorf("put: %w", targetErr)
+		}
+		remote = remoteTarget.String()
 	}
 	if err := s.putSingle(ctx, local, remote); err != nil {
 		return err
@@ -1589,9 +1584,11 @@ func (s *Shell) putSingle(ctx context.Context, local, remote string) error {
 	if statErr != nil {
 		return fmt.Errorf("put: %w", statErr)
 	}
-	if remoteExists && remoteStat.IsDir() {
-		remote = cli.JoinPath(remote, filepath.Base(local))
+	remoteTarget, targetErr := sftp.ParseRemoteUploadTarget(remote, filepath.Base(local), remoteExists && remoteStat.IsDir())
+	if targetErr != nil {
+		return fmt.Errorf("put: %w", targetErr)
 	}
+	remote = remoteTarget.String()
 	_, destinationExists, statErr := s.remoteStat(ctx, remote, false)
 	if statErr != nil {
 		return fmt.Errorf("put: %w", statErr)
@@ -1788,7 +1785,7 @@ func (t *directoryProgressTracker) onFileProgress(p sftp.FileTransferProgress) {
 	defer t.mu.Unlock()
 
 	now := time.Now()
-	filename := filepath.Base(filepath.ToSlash(p.Path))
+	filename := path.Base(filepath.ToSlash(p.Path))
 
 	if t.currentFile == "" {
 		t.currentFile = p.Path
@@ -1837,7 +1834,7 @@ func truncateAndPad(s string, maxLen int) string {
 }
 
 func renderFileDetail(name string, transferred, size int64) string {
-	base := filepath.Base(filepath.ToSlash(name))
+	base := path.Base(filepath.ToSlash(name))
 	namePart := truncateAndPad(base, 20)
 
 	var pct float64

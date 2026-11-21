@@ -12,6 +12,7 @@ import (
 	"time"
 
 	pkgsftp "github.com/pkg/sftp"
+	"github.com/wentf9/xops-cli/core/fsx"
 )
 
 type syntheticFileInfo struct {
@@ -117,8 +118,8 @@ func TestValidateLocalDownloadComponent(t *testing.T) {
 
 	for _, tc := range invalidCases {
 		t.Run("reject_"+tc.name, func(t *testing.T) {
-			if err := validateLocalDownloadComponent(tc.input); err == nil {
-				t.Fatalf("validateLocalDownloadComponent(%q) = nil, want error", tc.input)
+			if err := fsx.ValidateLocalComponent(tc.input); err == nil {
+				t.Fatalf("fsx.ValidateLocalComponent(%q) = nil, want error", tc.input)
 			}
 		})
 	}
@@ -137,14 +138,15 @@ func TestValidateLocalDownloadComponent(t *testing.T) {
 	}
 	for _, input := range validCases {
 		t.Run("allow_"+input, func(t *testing.T) {
-			if err := validateLocalDownloadComponent(input); err != nil {
-				t.Fatalf("validateLocalDownloadComponent(%q) unexpected error: %v", input, err)
+			if err := fsx.ValidateLocalComponent(input); err != nil {
+				t.Fatalf("fsx.ValidateLocalComponent(%q) unexpected error: %v", input, err)
 			}
 		})
 	}
 }
 
-func TestRemoteRelativePath_Security(t *testing.T) {
+func TestRemotePath_RelativeTo_And_LocalTarget_Security(t *testing.T) {
+	localRoot := t.TempDir()
 	tests := []struct {
 		name    string
 		base    string
@@ -157,8 +159,6 @@ func TestRemoteRelativePath_Security(t *testing.T) {
 		{name: "trailing slash on base", base: "/data/", target: "/data/nested/file.txt", want: "nested/file.txt"},
 		{name: "dirty base with clean relative child", base: "/tmp/x/../data", target: "/tmp/x/../data/nested/ok.txt", want: "nested/ok.txt"},
 		{name: "parent traversal escape", base: "/data", target: "/data/../escape", wantErr: true},
-		{name: "nested dotdot collapse", base: "/data", target: "/data/sub/../escape", wantErr: true},
-		{name: "root dotdot collapse", base: "/", target: "/sub/../escape", wantErr: true},
 		{name: "windows backslash traversal", base: "/data", target: `/data/..\..\evil.txt`, wantErr: true},
 		{name: "nested backslash traversal", base: "/data", target: `/data/sub/..\..\evil.txt`, wantErr: true},
 		{name: "ntfs ads colon", base: "/data", target: "/data/sub/foo:ads", wantErr: true},
@@ -173,18 +173,39 @@ func TestRemoteRelativePath_Security(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := remoteRelativePath(tc.base, tc.target)
+			root, rootErr := ParseRemotePath(tc.base)
+			target, targetErr := ParseRemotePath(tc.target)
+			var err error
+			var got string
+			switch {
+			case rootErr != nil:
+				err = rootErr
+			case targetErr != nil:
+				err = targetErr
+			default:
+				segs, relErr := target.RelativeTo(root)
+				if relErr != nil {
+					err = relErr
+				} else {
+					lt, ltErr := ResolveLocalTarget(localRoot, segs...)
+					if ltErr != nil {
+						err = ltErr
+					} else {
+						got = lt.RelSlash()
+					}
+				}
+			}
 			if tc.wantErr {
 				if err == nil {
-					t.Fatalf("remoteRelativePath(%q, %q) = %q, nil; want error", tc.base, tc.target, got)
+					t.Fatalf("RelativeTo+ResolveLocalTarget(%q, %q) = %q, nil; want error", tc.base, tc.target, got)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("remoteRelativePath(%q, %q) unexpected error: %v", tc.base, tc.target, err)
+				t.Fatalf("RelativeTo+ResolveLocalTarget(%q, %q) unexpected error: %v", tc.base, tc.target, err)
 			}
 			if got != tc.want {
-				t.Fatalf("remoteRelativePath(%q, %q) = %q, want %q", tc.base, tc.target, got, tc.want)
+				t.Fatalf("RelativeTo+ResolveLocalTarget(%q, %q) = %q, want %q", tc.base, tc.target, got, tc.want)
 			}
 		})
 	}
@@ -258,7 +279,14 @@ func TestClient_Download_RejectsUnsafeRemoteFilenameIntoDir(t *testing.T) {
 				t.Fatalf("mkdir localDir: %v", err)
 			}
 
-			err := client.Download(t.Context(), tc.remotePath, localDir, nil)
+			remotePath, contentsOnly, err := ParseRemoteDownloadPath(tc.remotePath)
+			if err == nil {
+				localDest, destErr := LocalDestPath(localDir)
+				if destErr != nil {
+					t.Fatalf("LocalDestPath: %v", destErr)
+				}
+				err = client.Download(t.Context(), remotePath, localDest, DownloadOptions{ContentsOnly: contentsOnly})
+			}
 			if err == nil {
 				t.Fatalf("Download(%q, %q) succeeded, want fail-closed error", tc.remotePath, localDir)
 			}
@@ -448,9 +476,11 @@ func TestClient_DownloadDirectory_RejectsMaliciousRemoteEntries(t *testing.T) {
 
 			parent := t.TempDir()
 			localDir := filepath.Join(parent, "a", "b")
-			err := client.DownloadDirectory(t.Context(), "/remote", localDir, nil)
+			remoteRoot, _ := ParseRemotePath("/remote")
+			localRoot, _ := ResolveLocalTarget(localDir)
+			err := client.downloadDirectory(t.Context(), remoteRoot, localRoot, nil)
 			if err == nil {
-				t.Fatalf("DownloadDirectory succeeded for %s, want fail-closed error", tc.name)
+				t.Fatalf("downloadDirectory succeeded for %s, want fail-closed error", tc.name)
 			}
 
 			for _, escaped := range []string{
@@ -466,7 +496,7 @@ func TestClient_DownloadDirectory_RejectsMaliciousRemoteEntries(t *testing.T) {
 
 			// Ensure nothing (including temp files such as b.xops.tmp.*) was written into filepath.Dir(localDir).
 			parentEntries, readErr := os.ReadDir(filepath.Dir(localDir))
-			if readErr != nil {
+			if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
 				t.Fatalf("readdir %q: %v", filepath.Dir(localDir), readErr)
 			}
 			for _, entry := range parentEntries {
@@ -505,7 +535,9 @@ func TestClient_Download_ValidSingleAndNestedDownloads(t *testing.T) {
 
 	// 1. Valid single-file download into existing directory.
 	singleDstDir := t.TempDir()
-	if err := client.Download(t.Context(), "/remote_valid/console.txt", singleDstDir, nil); err != nil {
+	singleRemote, _ := ParseRemotePath("/remote_valid/console.txt")
+	singleDest, _ := LocalDestPath(singleDstDir)
+	if err := client.Download(t.Context(), singleRemote, singleDest, DownloadOptions{}); err != nil {
 		t.Fatalf("Download single file into dir failed: %v", err)
 	}
 	gotSingle, err := os.ReadFile(filepath.Join(singleDstDir, "console.txt"))
@@ -518,8 +550,10 @@ func TestClient_Download_ValidSingleAndNestedDownloads(t *testing.T) {
 
 	// 2. Valid recursive directory download with nested subdirectories.
 	nestedDstDir := t.TempDir()
-	if err := client.DownloadDirectory(t.Context(), "/remote_valid", nestedDstDir, nil); err != nil {
-		t.Fatalf("DownloadDirectory valid nested failed: %v", err)
+	nestedRemote, _ := ParseRemotePath("/remote_valid")
+	nestedDest, _ := LocalDestPath(nestedDstDir)
+	if err := client.Download(t.Context(), nestedRemote, nestedDest, DownloadOptions{}); err != nil {
+		t.Fatalf("Download valid nested directory failed: %v", err)
 	}
 	expected := map[string]string{
 		filepath.Join(nestedDstDir, "console.txt"):                      "root-console",

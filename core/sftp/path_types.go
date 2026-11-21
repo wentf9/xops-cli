@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"unicode"
+
+	"github.com/wentf9/xops-cli/core/fsx"
 )
 
 var (
@@ -49,10 +51,9 @@ func (f LocalComponentValidatorFunc) ValidateLocalComponent(name string) error {
 	return f(name)
 }
 
-// defaultLocalComponentValidator delegates to the existing unexported validator
-// in transfer.go during W1 so core/sftp does not duplicate validation logic
-// while core/fsx is built concurrently; W2a swaps this to core/fsx.ValidateLocalComponent.
-var defaultLocalComponentValidator LocalComponentValidator = LocalComponentValidatorFunc(validateLocalDownloadComponent)
+// defaultLocalComponentValidator delegates to the single portable validator in
+// core/fsx so all local filename component validation shares one authority.
+var defaultLocalComponentValidator LocalComponentValidator = LocalComponentValidatorFunc(fsx.ValidateLocalComponent)
 
 // LocalTarget is a validated local filesystem destination rooted inside root.
 // Construct exclusively via ResolveLocalTarget or ResolveLocalTargetWithValidator.

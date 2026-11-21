@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/wentf9/xops-cli/core/fsx"
 )
 
 // IdentityPathKind classifies a parsed IdentityFile or CertificateFile setting
@@ -120,31 +122,8 @@ func SanitizeFilenameComponent(raw string) string {
 		}
 	}
 	s := string(out)
-	stem := s
-	if dot := strings.IndexByte(s, '.'); dot >= 0 {
-		stem = s[:dot]
-	}
-	if isWindowsReservedDeviceName(stem) {
+	if err := fsx.ValidateLocalComponent(s); err != nil {
 		return "_" + s
 	}
 	return s
-}
-
-func isWindowsReservedDeviceName(stem string) bool {
-	switch len(stem) {
-	case 3:
-		return strings.EqualFold(stem, "CON") ||
-			strings.EqualFold(stem, "PRN") ||
-			strings.EqualFold(stem, "AUX") ||
-			strings.EqualFold(stem, "NUL")
-	case 4:
-		d := stem[3]
-		if d < '1' || d > '9' {
-			return false
-		}
-		prefix := stem[:3]
-		return strings.EqualFold(prefix, "COM") || strings.EqualFold(prefix, "LPT")
-	default:
-		return false
-	}
 }

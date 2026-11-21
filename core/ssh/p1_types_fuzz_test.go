@@ -19,6 +19,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/wentf9/xops-cli/core/fsx"
 	cryptoSSH "golang.org/x/crypto/ssh"
 )
 
@@ -257,12 +258,8 @@ func assertSafeFilenameComponent(t *testing.T, raw, out string) {
 			t.Fatalf("SanitizeFilenameComponent(%q) = %q: disallowed rune %U", raw, out, r)
 		}
 	}
-	stem := out
-	if idx := strings.IndexByte(out, '.'); idx >= 0 {
-		stem = out[:idx]
-	}
-	if isWindowsReservedDeviceName(stem) {
-		t.Fatalf("SanitizeFilenameComponent(%q) = %q: stem %q is Windows reserved device name", raw, out, stem)
+	if err := fsx.ValidateLocalComponent(out); err != nil {
+		t.Fatalf("SanitizeFilenameComponent(%q) = %q: rejected by fsx.ValidateLocalComponent: %v", raw, out, err)
 	}
 	if again := SanitizeFilenameComponent(out); again != out {
 		t.Fatalf("SanitizeFilenameComponent is not idempotent: f(%q)=%q, f(f)=%q", raw, out, again)

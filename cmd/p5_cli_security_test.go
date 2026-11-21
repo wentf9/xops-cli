@@ -13,6 +13,8 @@ import (
 	"testing"
 
 	"github.com/wentf9/xops-cli/core/concurrent"
+	"github.com/wentf9/xops-cli/core/fsx"
+	"github.com/wentf9/xops-cli/core/sftp"
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
@@ -557,7 +559,7 @@ func testP5MuxDaemonIdentityTruncationAndFailClosed(t *testing.T) {
 
 // R2/R5: SCP local path component hardening, unsafe remote dir fail-closed, and fail-closed exclude errors.
 func TestP5_SCPLocalPathComponentHardeningAndUnsafeDirFailClosed(t *testing.T) {
-	t.Run("isSafeLocalPathComponent_matrix", func(t *testing.T) {
+	t.Run("fsx_ValidateLocalComponent_matrix", func(t *testing.T) {
 		unsafeCases := []string{
 			"", ".", "..", "a/b", `a\b`, "/abs", `\abs`,
 			"file:stream", "C:drive", "foo:bar:$DATA",
@@ -566,11 +568,12 @@ func TestP5_SCPLocalPathComponentHardeningAndUnsafeDirFailClosed(t *testing.T) {
 			"trailing.", "trailing..", "trailing ",
 			"CON", "con", "PRN", "AUX", "NUL",
 			"COM1", "com9", "LPT1", "lpt9",
+			"COM\u00b9", "LPT\u00b3",
 			"CON.txt", "nul.tar.gz", "COM3.log", "LPT2.bak", "CON .txt",
 		}
 		for _, name := range unsafeCases {
-			if isSafeLocalPathComponent(name) {
-				t.Errorf("isSafeLocalPathComponent(%q) = true, want false", name)
+			if err := fsx.ValidateLocalComponent(name); err == nil {
+				t.Errorf("fsx.ValidateLocalComponent(%q) = nil, want error", name)
 			}
 		}
 		safeCases := []string{
@@ -578,21 +581,28 @@ func TestP5_SCPLocalPathComponentHardeningAndUnsafeDirFailClosed(t *testing.T) {
 			"my file.txt", "console", "COM0", "LPT0", "null.txt",
 		}
 		for _, name := range safeCases {
-			if !isSafeLocalPathComponent(name) {
-				t.Errorf("isSafeLocalPathComponent(%q) = false, want true", name)
+			if err := fsx.ValidateLocalComponent(name); err != nil {
+				t.Errorf("fsx.ValidateLocalComponent(%q) unexpected error: %v", name, err)
 			}
 		}
 	})
 
-	t.Run("isRemoteRootOrSelfDirPath_matrix", func(t *testing.T) {
-		for _, allowed := range []string{"/", "///", ".", "./"} {
-			if !isRemoteRootOrSelfDirPath(allowed) {
-				t.Errorf("isRemoteRootOrSelfDirPath(%q) = false, want true", allowed)
+	t.Run("ParseRemoteDownloadPath_contentsOnly_matrix", func(t *testing.T) {
+		for _, allowed := range []string{"/", "///", ".", "./", "sub/."} {
+			_, contentsOnly, err := sftp.ParseRemoteDownloadPath(allowed)
+			if err != nil || !contentsOnly {
+				t.Errorf("ParseRemoteDownloadPath(%q) = (contentsOnly=%v, err=%v), want (true, nil)", allowed, contentsOnly, err)
 			}
 		}
-		for _, disallowed := range []string{"", "..", "/tmp/..", "/tmp/CON", "sub/."} {
-			if isRemoteRootOrSelfDirPath(disallowed) {
-				t.Errorf("isRemoteRootOrSelfDirPath(%q) = true, want false", disallowed)
+		for _, rejected := range []string{"", "..", "/tmp/.."} {
+			if _, _, err := sftp.ParseRemoteDownloadPath(rejected); err == nil {
+				t.Errorf("ParseRemoteDownloadPath(%q) = nil, want error", rejected)
+			}
+		}
+		for _, named := range []string{"/tmp/CON", "/tmp/release"} {
+			_, contentsOnly, err := sftp.ParseRemoteDownloadPath(named)
+			if err != nil || contentsOnly {
+				t.Errorf("ParseRemoteDownloadPath(%q) = (contentsOnly=%v, err=%v), want (false, nil)", named, contentsOnly, err)
 			}
 		}
 	})

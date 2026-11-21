@@ -197,7 +197,7 @@ type InspectRequest struct {
 type FileSession interface {
 	Do(context.Context, func(*pkgsftp.Client) error) error
 	Upload(context.Context, string, string, sftp.ProgressCallback) error
-	Download(context.Context, string, string, sftp.ProgressCallback) error
+	Download(context.Context, sftp.RemotePath, sftp.LocalDest, sftp.DownloadOptions) error
 	CreatePrivateExclusive(context.Context, string, func(io.Writer) error) (bool, bool, error)
 	RemoveAll(context.Context, string) error
 	RemoteCopy(context.Context, string, string) error

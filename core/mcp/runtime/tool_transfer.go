@@ -18,6 +18,7 @@ import (
 	"github.com/wentf9/xops-cli/core/mcp/ports"
 	"github.com/wentf9/xops-cli/core/mcp/remotefile"
 	"github.com/wentf9/xops-cli/core/mcp/transfer"
+	"github.com/wentf9/xops-cli/core/sftp"
 )
 
 // TransferFileInput is the Stdio transfer tool input (direct local <-> remote SFTP).
@@ -57,7 +58,15 @@ func (r *Runtime) stdioTransferHandler(ctx context.Context, _ *mcp.CallToolReque
 			return nil, TransferFileOutput{}, fmt.Errorf("push failed: %w", err)
 		}
 	case "pull":
-		if err := sftpClient.Download(ctx, input.RemotePath, input.LocalPath, nil); err != nil {
+		remotePath, parseErr := sftp.ParseRemotePath(input.RemotePath)
+		if parseErr != nil {
+			return nil, TransferFileOutput{}, fmt.Errorf("pull failed: %w", parseErr)
+		}
+		localDest, destErr := sftp.LocalDestPath(input.LocalPath)
+		if destErr != nil {
+			return nil, TransferFileOutput{}, fmt.Errorf("pull failed: %w", destErr)
+		}
+		if err := sftpClient.Download(ctx, remotePath, localDest, sftp.DownloadOptions{}); err != nil {
 			return nil, TransferFileOutput{}, fmt.Errorf("pull failed: %w", err)
 		}
 	}

@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/wentf9/xops-cli/core/fsx"
 )
 
 func TestP1SanitizeHostForFilename(t *testing.T) {
@@ -245,13 +247,13 @@ func TestP1SCPDownloadDirectory_PreservesBasenameIntoExistingLocalDir(t *testing
 
 	t.Run("safe_local_path_component_guard", func(t *testing.T) {
 		for _, unsafe := range []string{"", ".", "..", "a/b", `a\b`, "/abs", `\abs`} {
-			if isSafeLocalPathComponent(unsafe) {
-				t.Errorf("isSafeLocalPathComponent(%q) = true, want false", unsafe)
+			if err := fsx.ValidateLocalComponent(unsafe); err == nil {
+				t.Errorf("fsx.ValidateLocalComponent(%q) = nil, want error", unsafe)
 			}
 		}
 		for _, safe := range []string{"release", "app.log", ".hidden", "v1.2-rc1"} {
-			if !isSafeLocalPathComponent(safe) {
-				t.Errorf("isSafeLocalPathComponent(%q) = false, want true", safe)
+			if err := fsx.ValidateLocalComponent(safe); err != nil {
+				t.Errorf("fsx.ValidateLocalComponent(%q) unexpected error: %v", safe, err)
 			}
 		}
 	})

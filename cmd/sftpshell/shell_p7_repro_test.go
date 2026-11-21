@@ -1,5 +1,3 @@
-//go:build p7repro
-
 package sftpshell
 
 import (
@@ -201,10 +199,9 @@ func newP7ReproSFTPShell(t *testing.T, handler *p7ReproSFTPHandler, remoteCwd, l
 	}
 }
 
-// TestP7Repro_H2_HostileRemoteNamesReachDownloadFileAndDirectory reproduces H2 (part 1):
-// handleGet / getSingle / resolveLocalDownloadDestination compute localDest with
-// filepath.Base and call DownloadFile/DownloadDirectory directly, bypassing
-// core/sftp download validation for hostile remote names and ".." via dirty paths.
+// TestP7Repro_H2_HostileRemoteNamesReachDownloadFileAndDirectory verifies H2 (part 1):
+// handleGet routes exclusively through core/sftp.Client.Download and typed paths,
+// rejecting hostile remote names and ".." via dirty paths before any local I/O.
 func TestP7Repro_H2_HostileRemoteNamesReachDownloadFileAndDirectory(t *testing.T) {
 	fileCases := []struct {
 		name       string
@@ -278,10 +275,9 @@ func TestP7Repro_H2_HostileRemoteNamesReachDownloadFileAndDirectory(t *testing.T
 			t.Fatalf("mkdir localDir: %v", err)
 		}
 
-		// Direct check: resolveLocalDownloadDestination must not escape localDir via filepath.Base("/remote/sub/..") == "..".
-		dest, _, resErr := resolveLocalDownloadDestination(localDir, "/remote/sub/..")
-		if resErr == nil && filepath.Clean(dest) == filepath.Clean(parent) {
-			t.Errorf("resolveLocalDownloadDestination(%q, \"/remote/sub/..\") escaped into parent dir %q", localDir, dest)
+		// Direct check: ParseRemoteDownloadPath rejects trailing ".." before path.Clean.
+		if _, _, parseErr := sftp.ParseRemoteDownloadPath("/remote/sub/.."); parseErr == nil {
+			t.Errorf("sftp.ParseRemoteDownloadPath(\"/remote/sub/..\") succeeded, want error")
 		}
 
 		shell := newP7ReproSFTPShell(t, handler, "/remote", localDir)

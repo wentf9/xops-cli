@@ -1,5 +1,3 @@
-//go:build p7repro
-
 package cmd
 
 import (
@@ -22,6 +20,8 @@ import (
 	"time"
 
 	pkgsftp "github.com/pkg/sftp"
+	"github.com/wentf9/xops-cli/core/fsx"
+	"github.com/wentf9/xops-cli/core/sftp"
 	xssh "github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/internal/sshenv"
 	"github.com/wentf9/xops-cli/pkg/config"
@@ -29,10 +29,11 @@ import (
 	cryptoSSH "golang.org/x/crypto/ssh"
 )
 
-// TestP7Repro_MED15_WindowsReservedSuperscriptDeviceNames reproduces MED-15 (part 1):
-// cmd/scp's duplicate isWindowsReservedLocalDeviceName checks len(stem)==4, missing
-// 2-byte UTF-8 superscripts COM¹/COM²/COM³/LPT¹/LPT²/LPT³ (len==5).
+// TestP7Repro_MED15_WindowsReservedSuperscriptDeviceNames verifies MED-15 (part 1):
+// the single local component authority (core/fsx.ValidateLocalComponent + sftp.ResolveLocalTarget)
+// rejects 2-byte UTF-8 superscript Windows device names COM¹/COM²/COM³/LPT¹/LPT²/LPT³.
 func TestP7Repro_MED15_WindowsReservedSuperscriptDeviceNames(t *testing.T) {
+	root := t.TempDir()
 	stems := []string{
 		"COM\u00b9", "COM\u00b2", "COM\u00b3",
 		"LPT\u00b9", "LPT\u00b2", "LPT\u00b3",
@@ -40,21 +41,27 @@ func TestP7Repro_MED15_WindowsReservedSuperscriptDeviceNames(t *testing.T) {
 	}
 	for _, stem := range stems {
 		t.Run("stem_"+stem, func(t *testing.T) {
-			if !isWindowsReservedLocalDeviceName(stem) {
-				t.Errorf("isWindowsReservedLocalDeviceName(%q) = false, want true", stem)
+			if err := fsx.ValidateLocalComponent(stem); err == nil {
+				t.Errorf("fsx.ValidateLocalComponent(%q) = nil, want error", stem)
 			}
 			filename := stem + ".txt"
-			if isSafeLocalPathComponent(filename) {
-				t.Errorf("isSafeLocalPathComponent(%q) = true, want false", filename)
+			if err := fsx.ValidateLocalComponent(filename); err == nil {
+				t.Errorf("fsx.ValidateLocalComponent(%q) = nil, want error", filename)
+			}
+			rn, err := sftp.ParseRemoteName(filename)
+			if err != nil {
+				t.Fatalf("ParseRemoteName(%q): %v", filename, err)
+			}
+			if _, err := sftp.ResolveLocalTarget(root, rn); err == nil {
+				t.Errorf("ResolveLocalTarget(%q, %q) = nil, want error", root, filename)
 			}
 		})
 	}
 }
 
-// TestP7Repro_MED15_RunDownloadDirectDownloadFileBypass reproduces MED-15 (part 2):
-// ScpOptions.runDownload single-file path validates with cmd/scp's incomplete
-// isSafeLocalPathComponent and calls DownloadFile directly instead of core/sftp's
-// Download facade, allowing COM¹.txt and LPT³.log to be downloaded into a local dir.
+// TestP7Repro_MED15_RunDownloadDirectDownloadFileBypass verifies MED-15 (part 2):
+// ScpOptions.runDownload routes through core/sftp.Client.Download and fails closed
+// when downloading COM¹.txt or LPT³.log into a local directory.
 func TestP7Repro_MED15_RunDownloadDirectDownloadFileBypass(t *testing.T) {
 	cases := []struct {
 		name     string

@@ -515,13 +515,13 @@ func (s *leasedFileSession) Upload(ctx context.Context, local, remote string, pr
 	defer cancel()
 	return s.Client.Upload(work, local, remote, progress)
 }
-func (s *leasedFileSession) Download(ctx context.Context, remote, local string, progress sftp.ProgressCallback) error {
+func (s *leasedFileSession) Download(ctx context.Context, remote sftp.RemotePath, dest sftp.LocalDest, opts sftp.DownloadOptions) error {
 	work, cancel, err := ports.WorkContext(ctx, s.permit, s.phases...)
 	if err != nil {
 		return err
 	}
 	defer cancel()
-	return s.Client.Download(work, remote, local, progress)
+	return s.Client.Download(work, remote, dest, opts)
 }
 func (s *leasedFileSession) CreatePrivateExclusive(ctx context.Context, name string, write func(io.Writer) error) (bool, bool, error) {
 	work, cancel, err := ports.WorkContext(ctx, s.permit, s.phases...)

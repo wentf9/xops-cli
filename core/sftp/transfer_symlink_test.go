@@ -406,11 +406,13 @@ func TestClient_DownloadDirectory_Symlink(t *testing.T) {
 	}
 
 	localDst := t.TempDir()
-	if err := client.DownloadDirectory(t.Context(), "/remote_src", localDst, nil); err != nil {
+	remoteSrc, _ := ParseRemotePath("/remote_src")
+	dest, _ := LocalDestPath(localDst)
+	if err := client.Download(t.Context(), remoteSrc, dest, DownloadOptions{}); err != nil {
 		if runtime.GOOS == "windows" {
 			t.Skip("skipping download symlink test on Windows due to privilege requirements")
 		}
-		t.Fatalf("DownloadDirectory with symlink failed: %v", err)
+		t.Fatalf("Download directory with symlink failed: %v", err)
 	}
 
 	// Verify regular file locally
@@ -479,39 +481,63 @@ func TestClient_UploadDirectory_DanglingSymlink(t *testing.T) {
 }
 
 func TestClient_DownloadDirectory_DanglingSymlink(t *testing.T) {
-	client := newTestSFTPClientWithHandlers(t, pkgsftp.InMemHandler())
+	t.Run("in_root_dangling_symlink_preserved", func(t *testing.T) {
+		client := newTestSFTPClientWithHandlers(t, pkgsftp.InMemHandler())
 
-	if err := client.state.sftpClient.MkdirAll("/remote_dangling"); err != nil {
-		t.Fatalf("mkdir remote_dangling failed: %v", err)
-	}
-	danglingTarget := "../nonexistent/missing.txt"
-	if err := client.state.sftpClient.Symlink(danglingTarget, "/remote_dangling/dangling.txt"); err != nil {
-		t.Fatalf("create remote dangling symlink failed: %v", err)
-	}
-
-	localDst := t.TempDir()
-	if err := client.DownloadDirectory(t.Context(), "/remote_dangling", localDst, nil); err != nil {
-		if runtime.GOOS == "windows" {
-			t.Skip("skipping download symlink test on Windows due to privilege requirements")
+		if err := client.state.sftpClient.MkdirAll("/remote_dangling"); err != nil {
+			t.Fatalf("mkdir remote_dangling failed: %v", err)
 		}
-		t.Fatalf("DownloadDirectory with dangling symlink failed: %v", err)
-	}
+		danglingTarget := "nonexistent/missing.txt"
+		if err := client.state.sftpClient.Symlink(danglingTarget, "/remote_dangling/dangling.txt"); err != nil {
+			t.Fatalf("create remote dangling symlink failed: %v", err)
+		}
 
-	localLink := filepath.Join(localDst, "dangling.txt")
-	fi, err := os.Lstat(localLink)
-	if err != nil {
-		t.Fatalf("lstat local dangling symlink failed: %v", err)
-	}
-	if fi.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("expected symlink mode, got %v", fi.Mode())
-	}
-	gotTarget, err := os.Readlink(localLink)
-	if err != nil {
-		t.Fatalf("readlink local dangling symlink failed: %v", err)
-	}
-	if filepath.ToSlash(gotTarget) != danglingTarget {
-		t.Errorf("expected target %q, got %q", danglingTarget, gotTarget)
-	}
+		localDst := t.TempDir()
+		remoteRoot, _ := ParseRemotePath("/remote_dangling")
+		dest, _ := LocalDestPath(localDst)
+		if err := client.Download(t.Context(), remoteRoot, dest, DownloadOptions{}); err != nil {
+			if runtime.GOOS == "windows" {
+				t.Skip("skipping download symlink test on Windows due to privilege requirements")
+			}
+			t.Fatalf("Download with in-root dangling symlink failed: %v", err)
+		}
+
+		localLink := filepath.Join(localDst, "dangling.txt")
+		fi, err := os.Lstat(localLink)
+		if err != nil {
+			t.Fatalf("lstat local dangling symlink failed: %v", err)
+		}
+		if fi.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("expected symlink mode, got %v", fi.Mode())
+		}
+		gotTarget, err := os.Readlink(localLink)
+		if err != nil {
+			t.Fatalf("readlink local dangling symlink failed: %v", err)
+		}
+		if filepath.ToSlash(gotTarget) != danglingTarget {
+			t.Errorf("expected target %q, got %q", danglingTarget, gotTarget)
+		}
+	})
+
+	t.Run("escaping_dangling_symlink_rejected", func(t *testing.T) {
+		client := newTestSFTPClientWithHandlers(t, pkgsftp.InMemHandler())
+
+		if err := client.state.sftpClient.MkdirAll("/remote_dangling_escape"); err != nil {
+			t.Fatalf("mkdir remote_dangling_escape failed: %v", err)
+		}
+		escapingTarget := "../nonexistent/missing.txt"
+		if err := client.state.sftpClient.Symlink(escapingTarget, "/remote_dangling_escape/dangling.txt"); err != nil {
+			t.Fatalf("create escaping remote dangling symlink failed: %v", err)
+		}
+
+		localDst := t.TempDir()
+		remoteRoot, _ := ParseRemotePath("/remote_dangling_escape")
+		dest, _ := LocalDestPath(localDst)
+		err := client.Download(t.Context(), remoteRoot, dest, DownloadOptions{})
+		if !errors.Is(err, ErrUnsafeDownloadSymlink) {
+			t.Fatalf("Download escaping dangling symlink err = %v, want ErrUnsafeDownloadSymlink", err)
+		}
+	})
 }
 
 func TestClient_UploadDirectory_SymlinkOverwriteAndProgress(t *testing.T) {
@@ -592,13 +618,17 @@ func TestClient_DownloadDirectory_SymlinkOverwriteAndProgress(t *testing.T) {
 	}
 
 	var totalProgress atomic.Int64
-	if err := client.DownloadDirectory(t.Context(), "/remote_dl_overwrite", localDst, func(n int64) {
-		totalProgress.Add(n)
+	remoteDL, _ := ParseRemotePath("/remote_dl_overwrite")
+	destDL, _ := LocalDestPath(localDst)
+	if err := client.Download(t.Context(), remoteDL, destDL, DownloadOptions{
+		Progress: func(n int64) {
+			totalProgress.Add(n)
+		},
 	}); err != nil {
 		if runtime.GOOS == "windows" {
 			t.Skip("skipping download symlink test on Windows due to privilege requirements")
 		}
-		t.Fatalf("DownloadDirectory overwrite failed: %v", err)
+		t.Fatalf("Download overwrite failed: %v", err)
 	}
 	if totalProgress.Load() != int64(len(target)) {
 		t.Errorf("expected progress %d, got %d", len(target), totalProgress.Load())
@@ -613,10 +643,12 @@ func TestClient_DownloadDirectory_SymlinkOverwriteAndProgress(t *testing.T) {
 
 	// Second download with Force=false and identical target should skip and report progress
 	totalProgress.Store(0)
-	if err := client.DownloadDirectory(t.Context(), "/remote_dl_overwrite", localDst, func(n int64) {
-		totalProgress.Add(n)
+	if err := client.Download(t.Context(), remoteDL, destDL, DownloadOptions{
+		Progress: func(n int64) {
+			totalProgress.Add(n)
+		},
 	}); err != nil {
-		t.Fatalf("DownloadDirectory skip symlink failed: %v", err)
+		t.Fatalf("Download skip symlink failed: %v", err)
 	}
 	if totalProgress.Load() != int64(len(target)) {
 		t.Errorf("expected progress %d on skip, got %d", len(target), totalProgress.Load())
@@ -654,7 +686,7 @@ func TestClient_UploadAndDownloadLink_RejectOverwriteDirectory(t *testing.T) {
 		t.Fatalf("expected temporary path is a directory error, got: %v", err)
 	}
 
-	// 3. Local destination is an existing directory -> DownloadDirectory must reject
+	// 3. Local destination is an existing directory -> Download must reject
 	if err := client.state.sftpClient.MkdirAll("/remote_src_link"); err != nil {
 		t.Fatalf("mkdir remote_src_link failed: %v", err)
 	}
@@ -665,7 +697,9 @@ func TestClient_UploadAndDownloadLink_RejectOverwriteDirectory(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(localConflictDir, "entry"), 0o755); err != nil {
 		t.Fatalf("mkdir local conflict dir failed: %v", err)
 	}
-	err = client.DownloadDirectory(t.Context(), "/remote_src_link", localConflictDir, nil)
+	remoteSrcLink, _ := ParseRemotePath("/remote_src_link")
+	conflictDest, _ := LocalDestPath(localConflictDir)
+	err = client.Download(t.Context(), remoteSrcLink, conflictDest, DownloadOptions{})
 	if err == nil || !strings.Contains(err.Error(), "cannot overwrite local destination directory") {
 		t.Fatalf("expected cannot overwrite local destination directory error, got: %v", err)
 	}
@@ -704,7 +738,7 @@ func TestClient_UploadAndDownloadDirectory_RejectDestinationDirectorySymlink(t *
 		t.Fatalf("expected /outside/nested.txt to not exist, got: %v", err)
 	}
 
-	// 2. DownloadDirectory: local dst/sub is a symlink to localOutside, remote has /rsrc/sub/nested.txt
+	// 2. Download directory: local dst/sub is a symlink to localOutside, remote has /rsrc/sub/nested.txt
 	localOutside := t.TempDir()
 	localDst := t.TempDir()
 	if err := os.Symlink(localOutside, filepath.Join(localDst, "sub")); err != nil {
@@ -722,12 +756,16 @@ func TestClient_UploadAndDownloadDirectory_RejectDestinationDirectorySymlink(t *
 	}
 	_ = f.Close()
 
-	if err := client.DownloadDirectory(t.Context(), "/rsrc", localDst, nil); err == nil {
-		t.Fatal("expected DownloadDirectory to fail when local subdirectory is a symlink, but succeeded")
+	rsrcPath, _ := ParseRemotePath("/rsrc")
+	rsrcSubPath, _ := ParseRemotePath("/rsrc/sub")
+	localDstDest, _ := LocalDestPath(localDst)
+	localSubDest, _ := LocalDestPath(filepath.Join(localDst, "sub") + string(os.PathSeparator))
+	if err := client.Download(t.Context(), rsrcPath, localDstDest, DownloadOptions{}); err == nil {
+		t.Fatal("expected Download directory to fail when local subdirectory is a symlink, but succeeded")
 	}
 	// Top-level local destination symlink with trailing path separator must also be rejected
-	if err := client.DownloadDirectory(t.Context(), "/rsrc/sub", filepath.Join(localDst, "sub")+string(os.PathSeparator), nil); err == nil {
-		t.Fatal("expected DownloadDirectory to fail when top-level local destination is a symlink with trailing slash, but succeeded")
+	if err := client.Download(t.Context(), rsrcSubPath, localSubDest, DownloadOptions{}); err == nil {
+		t.Fatal("expected Download directory to fail when top-level local destination is a symlink with trailing slash, but succeeded")
 	}
 	if _, err := os.Lstat(filepath.Join(localOutside, "nested.txt")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("expected local outside/nested.txt to not exist, got: %v", err)
