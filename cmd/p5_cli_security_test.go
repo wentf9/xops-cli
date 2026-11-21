@@ -390,16 +390,13 @@ func TestP5_ExecEmptySelectorsFailClosed(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			opts := NewExecOptions()
 			execCmd := newCmdExecWithOptions(opts)
-			if err := execCmd.ParseFlags(tc.args); err != nil {
-				t.Fatalf("ParseFlags(%v): %v", tc.args, err)
-			}
-			err := opts.Complete(execCmd, execCmd.Flags().Args())
+			err := execCmd.ParseFlags(tc.args)
 			if err == nil {
-				t.Fatalf("Complete(%v) succeeded (Host=%q Command=%q), want error for %s",
-					tc.args, opts.Host, opts.Command, tc.wantFlag)
+				t.Fatalf("ParseFlags(%v) succeeded (Host=%q), want error for %s",
+					tc.args, opts.Host, tc.wantFlag)
 			}
 			if !strings.Contains(err.Error(), tc.wantFlag) {
-				t.Fatalf("Complete(%v) error = %v, want mention of %s", tc.args, err, tc.wantFlag)
+				t.Fatalf("ParseFlags(%v) error = %v, want mention of %s", tc.args, err, tc.wantFlag)
 			}
 		})
 	}

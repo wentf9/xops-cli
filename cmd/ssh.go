@@ -150,7 +150,7 @@ func newCmdSshWithOptions(o *SshOptions) *cobra.Command {
 	cmd.Flags().BoolVarP(&o.StdinRedirect, "stdin-redirect", "n", false, i18n.T("flag_stdin_redirect"))
 
 	// xops-enhanced flags (long-form only, no short flags to avoid OpenSSH conflicts)
-	cmd.Flags().StringVar(&o.Host, "host", "", i18n.T("flag_host"))
+	registerSelectorFlag(cmd.Flags(), &o.Host, "host", "", i18n.T("flag_host"))
 	cmd.Flags().BoolVar(&o.PasswordStdin, "password-stdin", false, i18n.T("flag_password_stdin"))
 	cmd.Flags().BoolVar(&o.PassphraseStdin, "passphrase-stdin", false, i18n.T("flag_passphrase_stdin"))
 	cmd.Flags().StringVar(&o.OTP, "otp", "", i18n.T("flag_otp"))
@@ -158,7 +158,7 @@ func newCmdSshWithOptions(o *SshOptions) *cobra.Command {
 	cmd.Flags().StringVar(&o.Remember, "remember", "", i18n.T("flag_remember"))
 	cmd.Flags().BoolVar(&o.Sudo, "sudo", false, i18n.T("flag_sudo"))
 	cmd.Flags().StringVar(&o.Alias, "alias", "", i18n.T("flag_alias"))
-	cmd.Flags().StringSliceVar(&o.Tags, "tag", []string{}, i18n.T("flag_tag"))
+	registerSelectorSliceFlag(cmd.Flags(), &o.Tags, "tag", i18n.T("flag_tag"))
 	o.execution.register(cmd)
 	cmd.Flags().BoolVar(&o.NoLoginShell, "no-login", false, i18n.T("flag_exec_no_login"))
 	cmd.Flags().IntVar(&o.muxDaemonSpecFD, muxDaemonSpecFDFlag, -1, "")

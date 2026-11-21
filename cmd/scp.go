@@ -42,8 +42,6 @@ type ScpOptions struct {
 	HostFile       string
 	Tag            string
 	Exclude        []string
-	rawExcludeArgs []string
-	excludeSet     bool
 	sshLogLevel    int
 	verboseSeen    bool
 	verboseLevel   int
@@ -92,7 +90,7 @@ func NewCmdScp() *cobra.Command {
 	o.control.RegisterAddressFamilyFlags(cmd)
 
 	// xops-enhanced flags (long-form only, no short flags to avoid OpenSSH conflicts)
-	cmd.Flags().StringVar(&o.Host, "host", "", i18n.T("flag_hosts"))
+	registerSelectorFlag(cmd.Flags(), &o.Host, "host", "", i18n.T("flag_hosts"))
 	cmd.Flags().BoolVar(&o.PasswordStdin, "password-stdin", false, i18n.T("flag_password_stdin"))
 	cmd.Flags().BoolVar(&o.PassphraseStdin, "passphrase-stdin", false, i18n.T("flag_passphrase_stdin"))
 	cmd.Flags().StringVar(&o.OTP, "otp", "", i18n.T("flag_otp"))
@@ -104,9 +102,9 @@ func NewCmdScp() *cobra.Command {
 	// scp-specific flags
 	cmd.Flags().StringVar(&o.Source, "src", "", i18n.T("flag_scp_src"))
 	cmd.Flags().StringVar(&o.Dest, "dest", "", i18n.T("flag_scp_dest"))
-	cmd.Flags().StringVarP(&o.HostFile, "ifile", "I", "", i18n.T("flag_ifile"))
-	cmd.Flags().StringVar(&o.Tag, "tag", "", i18n.T("flag_scp_tag"))
-	cmdutils.RegisterExcludeFlag(cmd.Flags(), &o.Exclude, &o.rawExcludeArgs, i18n.T("flag_exclude"))
+	registerSelectorFlag(cmd.Flags(), &o.HostFile, "ifile", "I", i18n.T("flag_ifile"))
+	registerSelectorFlag(cmd.Flags(), &o.Tag, "tag", "", i18n.T("flag_scp_tag"))
+	cmdutils.RegisterExcludeFlag(cmd.Flags(), &o.Exclude, i18n.T("flag_exclude"))
 	o.registerOutputFlags(cmd)
 	cmd.Flags().BoolVarP(&o.Force, "force", "f", false, i18n.T("flag_force"))
 	cmd.Flags().BoolVarP(&o.NoOverwrite, "no-clobber", "n", false, i18n.T("flag_no_overwrite"))
@@ -136,22 +134,10 @@ func (o *ScpOptions) Complete(cmd *cobra.Command, args []string) error {
 	}
 	pathFlags := o.Source != "" || o.Dest != ""
 	if cmd != nil {
-		if cmd.Flags().Changed("exclude") {
-			o.excludeSet = true
-		}
 		if err := validateExplicitZeroPort(cmd.Flags()); err != nil {
 			return err
 		}
 		pathFlags = pathFlags || cmd.Flags().Changed("src") || cmd.Flags().Changed("dest")
-		for _, name := range []string{"host", "tag", "ifile"} {
-			value, err := cmd.Flags().GetString(name)
-			if err != nil {
-				return err
-			}
-			if cmd.Flags().Changed(name) && strings.TrimSpace(value) == "" {
-				return fmt.Errorf("%s: --%s", i18n.T("scp_err_empty_selector"), name)
-			}
-		}
 	}
 	if len(args) > 0 {
 		if pathFlags {
@@ -175,22 +161,12 @@ func (o *ScpOptions) completeStdinCredentials() error {
 }
 
 func (o *ScpOptions) hasExcludeFlags() bool {
-	return o.excludeSet || len(o.Exclude) > 0 || len(o.rawExcludeArgs) > 0
+	return len(o.Exclude) > 0
 }
 
 func (o *ScpOptions) validatedExcludes() ([]string, error) {
 	if !o.hasExcludeFlags() {
 		return nil, nil
-	}
-	if len(o.rawExcludeArgs) > 0 {
-		parsed, err := cmdutils.ValidateExcludeFlagValues(o.rawExcludeArgs)
-		if err != nil {
-			return nil, err
-		}
-		if len(o.Exclude) > 0 {
-			return cmdutils.ValidateExcludeFlagValues(o.Exclude)
-		}
-		return parsed, nil
 	}
 	return cmdutils.ValidateExcludeFlagValues(o.Exclude)
 }
@@ -206,6 +182,13 @@ func (o *ScpOptions) Validate() error {
 		return err
 	}
 	if err := validateCommonSSHBaseOptions(&o.SshOptions); err != nil {
+		return err
+	}
+	if err := validateProgrammaticSelectors(
+		selectorField{name: "host", val: o.Host},
+		selectorField{name: "tag", val: o.Tag},
+		selectorField{name: "ifile", val: o.HostFile},
+	); err != nil {
 		return err
 	}
 	if _, err := o.validatedExcludes(); err != nil {

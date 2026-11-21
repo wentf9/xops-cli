@@ -143,15 +143,8 @@ func TestP0_ExecAndScp_FailClosedExcludeAndTaskCount(t *testing.T) {
 			o := NewExecOptions()
 			c := newCmdExecWithOptions(o)
 			args := append(slices.Clone(exArgs), "--host", "web1,web2", "-c", "id")
-			if err := c.Flags().Parse(args); err != nil {
-				t.Fatalf("Parse(%v): %v", args, err)
-			}
-			err := o.Complete(c, c.Flags().Args())
-			if err == nil {
-				err = o.Validate()
-			}
-			if err == nil {
-				t.Fatalf("exec accepted malformed exclude args %v", exArgs)
+			if err := c.Flags().Parse(args); err == nil {
+				t.Fatalf("exec Parse(%v) accepted malformed exclude args %v", args, exArgs)
 			}
 		})
 

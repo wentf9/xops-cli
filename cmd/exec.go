@@ -29,17 +29,15 @@ const maxBatchTaskCount = 1024
 type ExecOptions struct {
 	interaction *cliInteractionHandler
 	SshOptions
-	HostFile       string
-	ShellFile      string
-	Command        string
-	Tag            string
-	Exclude        []string
-	rawExcludeArgs []string
-	excludeSet     bool
-	TaskCount      int
-	Interactive    bool
-	Stream         bool
-	OutDir         string
+	HostFile    string
+	ShellFile   string
+	Command     string
+	Tag         string
+	Exclude     []string
+	TaskCount   int
+	Interactive bool
+	Stream      bool
+	OutDir      string
 
 	ScriptArgs []string
 
@@ -89,7 +87,7 @@ func newCmdExecWithOptions(o *ExecOptions) *cobra.Command {
 	o.control.RegisterCommonFlags(cmd)
 
 	// xops-enhanced flags (long-form only, no short flags to avoid OpenSSH conflicts)
-	cmd.Flags().StringVar(&o.Host, "host", "", i18n.T("flag_hosts"))
+	registerSelectorFlag(cmd.Flags(), &o.Host, "host", "", i18n.T("flag_hosts"))
 	cmd.Flags().BoolVar(&o.PasswordStdin, "password-stdin", false, i18n.T("flag_password_stdin"))
 	cmd.Flags().BoolVar(&o.PassphraseStdin, "passphrase-stdin", false, i18n.T("flag_passphrase_stdin"))
 	cmd.Flags().StringVar(&o.OTP, "otp", "", i18n.T("flag_otp"))
@@ -100,9 +98,9 @@ func newCmdExecWithOptions(o *ExecOptions) *cobra.Command {
 
 	// exec-specific flags
 	cmd.Flags().StringVarP(&o.Command, "cmd", "c", "", i18n.T("flag_exec_cmd"))
-	cmd.Flags().StringVarP(&o.HostFile, "ifile", "I", "", i18n.T("flag_exec_ifile"))
-	cmd.Flags().StringVar(&o.Tag, "tag", "", i18n.T("flag_exec_tag"))
-	utils.RegisterExcludeFlag(cmd.Flags(), &o.Exclude, &o.rawExcludeArgs, i18n.T("flag_exclude"))
+	registerSelectorFlag(cmd.Flags(), &o.HostFile, "ifile", "I", i18n.T("flag_exec_ifile"))
+	registerSelectorFlag(cmd.Flags(), &o.Tag, "tag", "", i18n.T("flag_exec_tag"))
+	utils.RegisterExcludeFlag(cmd.Flags(), &o.Exclude, i18n.T("flag_exclude"))
 	cmd.Flags().StringVar(&o.ShellFile, "shell", "", i18n.T("flag_exec_shell"))
 	cmd.Flags().IntVar(&o.TaskCount, "task", 3, i18n.T("flag_exec_task"))
 	cmd.Flags().BoolVarP(&o.Interactive, "interactive", "x", false, i18n.T("flag_exec_interactive"))
@@ -253,41 +251,6 @@ func (o *ExecOptions) completeNonDashArgs(cmd *cobra.Command, args []string) err
 	return nil
 }
 
-func validateExplicitEmptySelectors(cmd *cobra.Command) error {
-	if cmd == nil {
-		return nil
-	}
-	for _, name := range []string{"host", "tag", "ifile"} {
-		if !cmd.Flags().Changed(name) {
-			continue
-		}
-		value, err := cmd.Flags().GetString(name)
-		if err != nil {
-			return err
-		}
-		if strings.TrimSpace(value) == "" {
-			return fmt.Errorf("flag --%s must not be empty", name)
-		}
-	}
-	return nil
-}
-
-func (o *ExecOptions) validateNonBlankSelectors() error {
-	for _, sel := range []struct {
-		name string
-		val  string
-	}{
-		{"host", o.Host},
-		{"tag", o.Tag},
-		{"ifile", o.HostFile},
-	} {
-		if sel.val != "" && strings.TrimSpace(sel.val) == "" {
-			return fmt.Errorf("flag --%s must not be empty", sel.name)
-		}
-	}
-	return nil
-}
-
 func (o *ExecOptions) Complete(cmd *cobra.Command, args []string) error {
 	o.args = args
 	o.nonHostArgs = true
@@ -302,16 +265,10 @@ func (o *ExecOptions) Complete(cmd *cobra.Command, args []string) error {
 	if err := validateExplicitZeroPort(flags); err != nil {
 		return err
 	}
-	if err := validateExplicitEmptySelectors(cmd); err != nil {
-		return err
-	}
 	if _, err := o.toSessionControlOptions(); err != nil {
 		return err
 	}
 	o.execution.capturePresence(cmd)
-	if cmd != nil && cmd.Flags().Changed("exclude") {
-		o.excludeSet = true
-	}
 	if _, err := o.validatedExcludes(); err != nil {
 		return err
 	}
@@ -372,22 +329,12 @@ func (o *ExecOptions) readStdinIfRequired(ctx context.Context) error {
 }
 
 func (o *ExecOptions) hasExcludeFlags() bool {
-	return o.excludeSet || len(o.Exclude) > 0 || len(o.rawExcludeArgs) > 0
+	return len(o.Exclude) > 0
 }
 
 func (o *ExecOptions) validatedExcludes() ([]string, error) {
 	if !o.hasExcludeFlags() {
 		return nil, nil
-	}
-	if len(o.rawExcludeArgs) > 0 {
-		parsed, err := utils.ValidateExcludeFlagValues(o.rawExcludeArgs)
-		if err != nil {
-			return nil, err
-		}
-		if len(o.Exclude) > 0 {
-			return utils.ValidateExcludeFlagValues(o.Exclude)
-		}
-		return parsed, nil
 	}
 	return utils.ValidateExcludeFlagValues(o.Exclude)
 }
@@ -417,7 +364,11 @@ func (o *ExecOptions) Validate() error {
 	if o.Command != "" && o.ShellFile != "" {
 		return fmt.Errorf("cannot specify both command and --shell script")
 	}
-	if err := o.validateNonBlankSelectors(); err != nil {
+	if err := validateProgrammaticSelectors(
+		selectorField{name: "host", val: o.Host},
+		selectorField{name: "tag", val: o.Tag},
+		selectorField{name: "ifile", val: o.HostFile},
+	); err != nil {
 		return err
 	}
 	if o.Host == "" && o.HostFile == "" && o.Tag == "" {

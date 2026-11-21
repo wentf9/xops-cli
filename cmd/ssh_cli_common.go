@@ -60,6 +60,9 @@ func validateCommonSSHBaseOptions(o *SshOptions) error {
 	if o.OTP != "" && o.OTPStdin {
 		return errors.New(i18n.T("err_otp_mutually_exclusive"))
 	}
+	if err := validateProgrammaticSelectors(selectorField{name: "host", val: o.Host}); err != nil {
+		return err
+	}
 	if err := utils.ValidateRememberPolicy(o.Remember); err != nil {
 		return err
 	}

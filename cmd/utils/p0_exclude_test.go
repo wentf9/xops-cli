@@ -64,8 +64,8 @@ func TestP0_RegisterExcludeFlag_CapturesEmptyAndPreservesStringSlice(t *testing.
 
 	t.Run("valid_flags_preserve_GetStringSlice", func(t *testing.T) {
 		fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
-		var excludes, raw []string
-		RegisterExcludeFlag(fs, &excludes, &raw, "exclude hosts")
+		var excludes []string
+		RegisterExcludeFlag(fs, &excludes, "exclude hosts")
 
 		if err := fs.Parse([]string{"--exclude", "web1,web2", "--exclude", "db1"}); err != nil {
 			t.Fatalf("Parse failed: %v", err)
@@ -77,25 +77,22 @@ func TestP0_RegisterExcludeFlag_CapturesEmptyAndPreservesStringSlice(t *testing.
 		if !slices.Equal(gotSlice, []string{"web1", "web2", "db1"}) {
 			t.Fatalf("GetStringSlice = %v, want [web1 web2 db1]", gotSlice)
 		}
-		validated, err := ValidateExcludeFlagValues(raw)
+		validated, err := ValidateExcludeFlagValues(excludes)
 		if err != nil {
-			t.Fatalf("ValidateExcludeFlagValues(%v) failed: %v", raw, err)
+			t.Fatalf("ValidateExcludeFlagValues(%v) failed: %v", excludes, err)
 		}
 		if !slices.Equal(validated, []string{"web1", "web2", "db1"}) {
 			t.Fatalf("validated = %v, want [web1 web2 db1]", validated)
 		}
 	})
 
-	t.Run("repeated_empty_flag_captured_and_rejected", func(t *testing.T) {
+	t.Run("repeated_empty_flag_rejected_in_parse", func(t *testing.T) {
 		fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
-		var excludes, raw []string
-		RegisterExcludeFlag(fs, &excludes, &raw, "exclude hosts")
+		var excludes []string
+		RegisterExcludeFlag(fs, &excludes, "exclude hosts")
 
-		if err := fs.Parse([]string{"--exclude", "web1", "--exclude", ""}); err != nil {
-			t.Fatalf("Parse failed: %v", err)
-		}
-		if _, err := ValidateExcludeFlagValues(raw); err == nil {
-			t.Fatalf("expected ValidateExcludeFlagValues(%v) to reject repeated empty --exclude", raw)
+		if err := fs.Parse([]string{"--exclude", "web1", "--exclude", ""}); err == nil {
+			t.Fatalf("expected Parse to reject repeated empty --exclude, got excludes=%v", excludes)
 		}
 	})
 }

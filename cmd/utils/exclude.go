@@ -41,11 +41,11 @@ func ValidateExcludeFlagValues(raw []string) ([]string, error) {
 	return result, nil
 }
 
-// RegisterExcludeFlag registers the --exclude string-slice flag while recording
-// every raw CLI value passed to Set/Append/Replace so empty repeated flags
-// (such as `--exclude web1 --exclude ""`) are never silently dropped by pflag's
-// CSV slice parser.
-func RegisterExcludeFlag(flags *pflag.FlagSet, target, rawArgs *[]string, usage string) {
+// RegisterExcludeFlag registers the --exclude string-slice flag with fail-closed
+// validation directly in Set/Append/Replace so empty, whitespace-only, and empty
+// comma-separated tokens (such as `--exclude ""` or `--exclude web1 --exclude ""`)
+// are rejected immediately during flag parsing.
+func RegisterExcludeFlag(flags *pflag.FlagSet, target *[]string, usage string) {
 	flags.StringSliceVar(target, "exclude", nil, usage)
 	f := flags.Lookup("exclude")
 	if f == nil {
@@ -58,36 +58,34 @@ func RegisterExcludeFlag(flags *pflag.FlagSet, target, rawArgs *[]string, usage 
 	f.Value = &excludeFlagValue{
 		innerVal: f.Value,
 		innerSlc: sv,
-		rawArgs:  rawArgs,
 	}
 }
 
 type excludeFlagValue struct {
 	innerVal pflag.Value
 	innerSlc pflag.SliceValue
-	rawArgs  *[]string
 }
 
 func (v *excludeFlagValue) String() string { return v.innerVal.String() }
 func (v *excludeFlagValue) Type() string   { return v.innerVal.Type() }
 
 func (v *excludeFlagValue) Set(val string) error {
-	if v.rawArgs != nil {
-		*v.rawArgs = append(*v.rawArgs, val)
+	if _, err := ValidateExcludeFlagValues([]string{val}); err != nil {
+		return err
 	}
 	return v.innerVal.Set(val)
 }
 
 func (v *excludeFlagValue) Append(val string) error {
-	if v.rawArgs != nil {
-		*v.rawArgs = append(*v.rawArgs, val)
+	if _, err := ValidateExcludeFlagValues([]string{val}); err != nil {
+		return err
 	}
 	return v.innerSlc.Append(val)
 }
 
 func (v *excludeFlagValue) Replace(val []string) error {
-	if v.rawArgs != nil {
-		*v.rawArgs = append((*v.rawArgs)[:0], val...)
+	if _, err := ValidateExcludeFlagValues(val); err != nil {
+		return err
 	}
 	return v.innerSlc.Replace(val)
 }

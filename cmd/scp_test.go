@@ -49,7 +49,10 @@ func TestScpOptionsCompletePaths(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cmd := NewCmdScp()
 			if err := cmd.ParseFlags(tt.args); err != nil {
-				t.Fatal(err)
+				if !tt.wantErr {
+					t.Fatal(err)
+				}
+				return
 			}
 			o := NewScpOptions()
 			o.Source, _ = cmd.Flags().GetString("src")
