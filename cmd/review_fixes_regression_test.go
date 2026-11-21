@@ -369,7 +369,7 @@ func TestL1_L2_ExecHostNamePerTaskAndSubsystemBgReject(t *testing.T) {
 		{nodeID: "n1", wantAddr: "h1.internal"},
 		{nodeID: "n2", wantAddr: "h2.internal"},
 	} {
-		// Use ResolveSSHOptions / GetConfig if node exists, or check via GetConfig on openssh:n1
+		// Use Resolve / GetConfig if node exists, or check via GetConfig on openssh:n1
 		_ = adp
 		got, err := execOpt.effectiveHostNameForHost(strings.TrimPrefix(tc.wantAddr, "")[:2])
 		if err != nil || got != tc.wantAddr {

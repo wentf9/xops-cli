@@ -5,13 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	coreauth "github.com/wentf9/xops-cli/core/auth"
 	"github.com/wentf9/xops-cli/core/ssh"
+	"github.com/wentf9/xops-cli/core/verdict"
 	"github.com/wentf9/xops-cli/internal/credentialhelper"
 	"github.com/wentf9/xops-cli/internal/sshenv"
 	"github.com/wentf9/xops-cli/pkg/config"
@@ -184,28 +184,6 @@ func (s SessionControlOptions) HasExplicitMaster() bool {
 		(s.Options != nil && s.Options.ControlMaster() != "")
 }
 
-// ResolveControl merges this Tier-1 session layer with any lower-priority option
-// layers (filtered to OptionClassMux) via core/ssh.MergeEffectiveOptions, projects
-// and validates the resulting ControlConfig via ValidatedControlConfig(), and applies
-// the single canonical AllowReuse derivation rule.
-func (s SessionControlOptions) ResolveControl(lowerLayers ...*ssh.Options) (*ssh.ControlConfig, error) {
-	layers := make([]*ssh.Options, 0, 1+len(lowerLayers))
-	layers = append(layers, s.ToSSHOptions().FilterByClasses(ssh.OptionClassMux))
-	for _, layer := range lowerLayers {
-		layers = append(layers, layer.FilterByClasses(ssh.OptionClassMux))
-	}
-	effMux, err := ssh.MergeEffectiveOptions(layers...)
-	if err != nil {
-		return nil, err
-	}
-	ctrl, err := effMux.ValidatedControlConfig()
-	if err != nil || ctrl == nil {
-		return ctrl, err
-	}
-	ctrl.AllowReuse = s.AllowReuse && !s.HasExplicitMaster() && ctrl.IsEnabled()
-	return ctrl, nil
-}
-
 // ConnectionWideOptions returns a SessionControlOptions containing only the
 // explicit CLI Tier-1 options declared OptionScopeConnectionWide in the core/ssh
 // option registry (OptionClassTrust plus AddressFamily, BatchMode, ConnectTimeout,
@@ -228,171 +206,111 @@ func SplitOptionKeyValue(opt string) (key, val string, err error) {
 	return ssh.SplitOptionKeyValue(opt)
 }
 
-// ParseOptionStrings parses OpenSSH -o Key=Value strings into SessionControlOptions.
-// Unknown keys are rejected instead of ignored so a typo cannot silently disable
-// the requested behavior.
-type optionParseState struct {
-	seen            map[string]bool
-	proxyJumpActive bool
-}
-
-func ParseOptionStrings(options []string) (SessionControlOptions, error) {
-	return ParseOptionStringsWithJump(options, "")
-}
-
-// ParseOptionStringsWithJump parses OpenSSH -o Key=Value strings while
-// accounting for an explicit CLI -J / --jump override supplied alongside -o.
-func ParseOptionStringsWithJump(options []string, cliProxyJump string) (SessionControlOptions, error) {
+// ParseSessionOptions parses OpenSSH -o Key=Value strings via the single
+// core/ssh.ParseOption parser while accounting for an optional explicit CLI
+// -J / --jump override supplied alongside -o. Unknown keys, empty values,
+// control characters, and malformed algorithm/control directives are rejected.
+func ParseSessionOptions(options []string, cliProxyJump string) (SessionControlOptions, error) {
 	var opts SessionControlOptions
-	state := optionParseState{seen: make(map[string]bool)}
+	seen := make(map[string]bool)
+	proxy := ssh.UnsetProxySetting()
 	if trimmedJump := strings.TrimSpace(cliProxyJump); trimmedJump != "" {
-		state.seen[ssh.OptionProxyJump] = true
-		state.proxyJumpActive = ssh.HasActiveProxyJump(trimmedJump)
+		parsedJump, err := ssh.ParseOption(ssh.OptionProxyJump, trimmedJump, ssh.OptionSourceCLI)
+		if err != nil {
+			return opts, fmt.Errorf("invalid ProxyJump: %w", err)
+		}
+		proxy = parsedJump.ProxySetting
+		seen[ssh.OptionProxyJump] = true
 	}
 	for _, opt := range options {
-		key, val, err := SplitOptionKeyValue(opt)
+		key, val, err := ssh.SplitOptionKeyValue(opt)
 		if err != nil {
 			return opts, err
 		}
 		if key == "" {
 			continue
 		}
-		if err := applyParsedOption(&opts, &state, key, val); err != nil {
+		parsed, err := ssh.ParseOption(key, val, ssh.OptionSourceCLI)
+		if err != nil {
 			return opts, err
 		}
+		if err := applyParsedSessionOption(&opts, &proxy, seen, parsed, val); err != nil {
+			return opts, err
+		}
+	}
+	if err := finalizeSessionProxyOption(&opts, proxy); err != nil {
+		return opts, err
 	}
 	return opts, nil
 }
 
-func applyParsedOption(opts *SessionControlOptions, state *optionParseState, key, val string) error {
-	if handled, err := applyControlOption(opts, state, key, val); handled || err != nil {
-		return err
-	}
-	switch ssh.CanonicalOptionKey(key) {
-	case ssh.OptionPort:
-		p, err := strconv.ParseUint(val, 10, 16)
-		if err != nil || p == 0 {
-			return fmt.Errorf("invalid Port in -o option: %q", val)
+func applyParsedSessionOption(
+	opts *SessionControlOptions,
+	proxy *ssh.ProxySetting,
+	seen map[string]bool,
+	parsed ssh.ParsedOption,
+	rawVal string,
+) error {
+	switch parsed.CanonicalKey {
+	case ssh.OptionControlMaster:
+		if !seen[ssh.OptionControlMaster] {
+			opts.SetMaster(parsed.ControlMaster)
 		}
-	case ssh.OptionUser:
-		if val == "" {
-			return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
+	case ssh.OptionControlPath:
+		if !seen[ssh.OptionControlPath] {
+			opts.SetPath(parsed.ControlPath.Raw)
 		}
-		// Applied to the connection target by the CLI, see ApplyGeneralOptions.
-	case ssh.OptionHostName:
-		if val == "" {
-			return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
+	case ssh.OptionControlPersist:
+		if !seen[ssh.OptionControlPersist] {
+			opts.SetPersist(parsed.ControlPersist.Raw)
 		}
-		if _, err := ssh.ExpandHostName(val, "host"); err != nil {
-			return fmt.Errorf("invalid HostName in -o option: %w", err)
-		}
-		// Applied to the connection target by the CLI, see ApplyGeneralOptions.
-	case ssh.OptionProxyJump:
-		if val == "" {
-			return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
-		}
-		if !state.seen[ssh.OptionProxyJump] && !state.seen[ssh.OptionProxyCommand] {
-			state.seen[ssh.OptionProxyJump] = true
-			if ssh.HasActiveProxyJump(val) {
-				state.proxyJumpActive = true
-			}
-		}
-		// Applied to the connection target by the CLI, see ApplyGeneralOptions.
-	case ssh.OptionIdentityFile:
-		if val == "" {
-			return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
-		}
-		if err := opts.ensureOptions().Append(ssh.OptionIdentityFile, val); err != nil {
-			return fmt.Errorf("invalid IdentityFile in -o option: %w", err)
-		}
+	case ssh.OptionProxyJump, ssh.OptionProxyCommand:
+		*proxy = proxy.Merge(parsed.ProxySetting)
+	case ssh.OptionPort, ssh.OptionUser, ssh.OptionHostName:
+		// Validated by core/ssh.ParseOption; applied to connection target by CLI.
 	default:
-		return applySupportedOption(opts, state, key, val)
+		if err := applyParsedGenericSessionOption(opts, seen, parsed, rawVal); err != nil {
+			return err
+		}
+	}
+	seen[parsed.CanonicalKey] = true
+	return nil
+}
+
+func applyParsedGenericSessionOption(
+	opts *SessionControlOptions,
+	seen map[string]bool,
+	parsed ssh.ParsedOption,
+	rawVal string,
+) error {
+	spec, _ := ssh.LookupOptionSpec(parsed.CanonicalKey)
+	if spec.MergeMode.SingleDirectivePerLayer() && seen[parsed.CanonicalKey] {
+		return nil
+	}
+	if spec.MultiValue {
+		if err := opts.ensureOptions().Append(parsed.CanonicalKey, rawVal); err != nil {
+			return fmt.Errorf("invalid %s in -o option: %w", parsed.OpenSSHName, err)
+		}
+		return nil
+	}
+	if err := opts.ensureOptions().Set(parsed.CanonicalKey, parsed.Normalized); err != nil {
+		return fmt.Errorf("invalid %s in -o option: %w", parsed.OpenSSHName, err)
 	}
 	return nil
 }
 
-func applyControlOption(opts *SessionControlOptions, state *optionParseState, key, val string) (bool, error) {
-	switch ssh.CanonicalOptionKey(key) {
-	case ssh.OptionControlMaster:
-		m, err := ssh.ParseControlMasterMode(val)
-		if err != nil {
-			return true, fmt.Errorf("invalid ControlMaster in -o option: %w", err)
+func finalizeSessionProxyOption(opts *SessionControlOptions, proxy ssh.ProxySetting) error {
+	if cmd, ok := proxy.Command(); ok {
+		if err := opts.ensureOptions().Set(ssh.OptionProxyCommand, cmd); err != nil {
+			return fmt.Errorf("invalid ProxyCommand in -o option: %w", err)
 		}
-		if !state.seen[ssh.OptionControlMaster] {
-			opts.SetMaster(m)
-		}
-		state.seen[ssh.OptionControlMaster] = true
-		return true, nil
-	case ssh.OptionControlPath:
-		setting, err := ssh.ParseControlPathSetting(val, false)
-		if err != nil {
-			return true, fmt.Errorf("invalid ControlPath in -o option: %w", err)
-		}
-		if setting.Unset() {
-			return true, fmt.Errorf("invalid ControlPath in -o option: value cannot be empty")
-		}
-		if !state.seen[ssh.OptionControlPath] {
-			opts.SetPath(setting.Raw)
-		}
-		state.seen[ssh.OptionControlPath] = true
-		return true, nil
-	case ssh.OptionControlPersist:
-		setting, err := ssh.ParsePersistSetting(val)
-		if err != nil {
-			return true, fmt.Errorf("invalid ControlPersist in -o option: %w", err)
-		}
-		if !setting.Explicit() {
-			return true, fmt.Errorf("invalid ControlPersist in -o option: value cannot be empty")
-		}
-		if !state.seen[ssh.OptionControlPersist] {
-			opts.SetPersist(setting.Raw)
-		}
-		state.seen[ssh.OptionControlPersist] = true
-		return true, nil
-	}
-	return false, nil
-}
-
-func applySupportedOption(opts *SessionControlOptions, state *optionParseState, key, val string) error {
-	spec, supported := ssh.LookupOptionSpec(key)
-	if !supported {
-		return fmt.Errorf("unsupported -o option %q", key)
-	}
-	if val == "" {
-		return fmt.Errorf("invalid %s in -o option: value cannot be empty", spec.OpenSSHName)
-	}
-	if spec.MultiValue {
-		var scratch ssh.Options
-		if err := scratch.Append(spec.CanonicalKey, val); err != nil {
-			return fmt.Errorf("invalid %s in -o option: %w", spec.OpenSSHName, err)
-		}
-		if !spec.MergeMode.SingleDirectivePerLayer() || !state.seen[spec.CanonicalKey] {
-			if err := opts.ensureOptions().Append(spec.CanonicalKey, val); err != nil {
-				return fmt.Errorf("invalid %s in -o option: %w", spec.OpenSSHName, err)
-			}
-		}
-		state.seen[spec.CanonicalKey] = true
 		return nil
 	}
-	var scratch ssh.Options
-	if err := scratch.Set(spec.CanonicalKey, val); err != nil {
-		return fmt.Errorf("invalid %s in -o option: %w", spec.OpenSSHName, err)
-	}
-	if spec.CanonicalKey == ssh.OptionProxyCommand {
-		if !state.seen[ssh.OptionProxyCommand] && !state.proxyJumpActive {
-			if err := opts.ensureOptions().Set(spec.CanonicalKey, val); err != nil {
-				return fmt.Errorf("invalid %s in -o option: %w", spec.OpenSSHName, err)
-			}
-		}
-		state.seen[ssh.OptionProxyCommand] = true
-		return nil
-	}
-	if !spec.MergeMode.SingleDirectivePerLayer() || !state.seen[spec.CanonicalKey] {
-		if err := opts.ensureOptions().Set(spec.CanonicalKey, val); err != nil {
-			return fmt.Errorf("invalid %s in -o option: %w", spec.OpenSSHName, err)
+	if proxy.Equal(ssh.DisabledProxySetting()) {
+		if err := opts.ensureOptions().Set(ssh.OptionProxyCommand, "none"); err != nil {
+			return fmt.Errorf("invalid ProxyCommand in -o option: %w", err)
 		}
 	}
-	state.seen[spec.CanonicalKey] = true
 	return nil
 }
 
@@ -750,41 +668,6 @@ func cloneSessionControlOptions(s SessionControlOptions) SessionControlOptions {
 	return out
 }
 
-func hasNoneString(values []string) bool {
-	for _, v := range values {
-		if ssh.IsNoneValue(v) {
-			return true
-		}
-	}
-	return false
-}
-
-func hasNoneOptionValue(opts *ssh.Options, canonicalKey string) bool {
-	if opts == nil {
-		return false
-	}
-	return hasNoneString(opts.GetAll(canonicalKey))
-}
-
-func preserveNoneTerminatedSentinel(merged, overrideOpts, baseOpts *ssh.Options) {
-	if merged == nil {
-		return
-	}
-	for _, spec := range ssh.RegisteredOptionSpecs() {
-		if !spec.MergeMode.IsNoneTerminated() {
-			continue
-		}
-		if !hasNoneOptionValue(overrideOpts, spec.CanonicalKey) && !hasNoneOptionValue(baseOpts, spec.CanonicalKey) {
-			continue
-		}
-		entries := merged.GetAll(spec.CanonicalKey)
-		if len(entries) == 0 || hasNoneString(entries) {
-			continue
-		}
-		_ = merged.Append(spec.CanonicalKey, "none")
-	}
-}
-
 func mergeSessionControlOptions(override, base SessionControlOptions) SessionControlOptions {
 	if base.IsEmpty() {
 		return cloneSessionControlOptions(override)
@@ -799,8 +682,7 @@ func mergeSessionControlOptions(override, base SessionControlOptions) SessionCon
 		baseOpts = baseOpts.Clone()
 		baseOpts.StripClasses(ssh.OptionClassMux)
 	}
-	mergedOpts := ssh.MergeOptionLayers(overrideOpts, baseOpts)
-	preserveNoneTerminatedSentinel(mergedOpts, overrideOpts, baseOpts)
+	mergedOpts := ssh.MergeOptions(overrideOpts, baseOpts)
 
 	path, literalPath := mergeSessionControlPath(override, base, overrideOpts)
 	return SessionControlOptions{
@@ -896,23 +778,16 @@ func (a *SSHAdapter) getSessionControlOverride(nodeID string) (SessionControlOpt
 	}
 }
 
-// GetControlConfig implements ssh.ControlProvider.
+// GetControlConfig implements ssh.ControlProvider by delegating to Resolve.
 func (a *SSHAdapter) GetControlConfig(nodeID string) (*ssh.ControlConfig, error) {
-	if a.disableControl {
+	if a == nil || a.disableControl {
 		return nil, nil
 	}
-	sessionOpts, _ := a.getSessionControlOverride(nodeID)
-	return a.ResolveControl(nodeID, sessionOpts)
-}
-
-// ResolveSSHOptions resolves the effective ssh.Options for nodeName given session options,
-// enforcing the 4-tier precedence hierarchy (Tier 1 CLI > Tier 2 Node > Tier 3 Global > Tier 4 ~/.ssh/config).
-func (a *SSHAdapter) ResolveSSHOptions(nodeName string, sessionOpts SessionControlOptions) (*ssh.Options, error) {
-	pol, err := a.solvePolicy(nodeName, sessionOpts, policySolveMode{resolveOptions: true})
+	pol, err := a.Resolve(context.Background(), ResolveRequest{NodeID: nodeID})
 	if err != nil {
 		return nil, err
 	}
-	return pol.effectiveOpts, nil
+	return pol.Control(), nil
 }
 
 func firstLocalExecOption(opts *ssh.Options) string {
@@ -923,32 +798,6 @@ func firstLocalExecOption(opts *ssh.Options) string {
 		return "ProxyCommand"
 	}
 	return ""
-}
-
-func cloneWithoutProxyCommand(opts *ssh.Options) *ssh.Options {
-	if opts == nil || opts.Get(ssh.OptionProxyCommand) == "" {
-		return opts
-	}
-	cloned := opts.Clone()
-	cloned.Delete(ssh.OptionProxyCommand)
-	return cloned
-}
-
-func isActiveProxyJumpValue(val string) bool {
-	return ssh.HasActiveProxyJump(val)
-}
-
-// ResolveControl resolves the effective ControlConfig for nodeID given session options,
-// strictly enforcing the 4-tier precedence hierarchy and field-by-field merging semantics.
-func (a *SSHAdapter) ResolveControl(nodeName string, sessionOpts SessionControlOptions) (*ssh.ControlConfig, error) {
-	if a != nil && a.disableControl {
-		return nil, nil
-	}
-	pol, err := a.solvePolicy(nodeName, sessionOpts, policySolveMode{resolveControl: true})
-	if err != nil {
-		return nil, err
-	}
-	return pol.effectiveCtrl, nil
 }
 
 func (a *SSHAdapter) getOpenSSHParser() *config.OpenSSHParser {
@@ -984,10 +833,10 @@ func (a *SSHAdapter) ExpandControlPath(nodeID string, rawPath string) (string, e
 	if ssh.IsNoneValue(rawPath) {
 		return "none", nil
 	}
-	sessionCtrlOpts, _ := a.getSessionControlOverride(nodeID)
-	pol, err := a.solvePolicy(nodeID, sessionCtrlOpts, policySolveMode{
-		requireSnapshot: true,
-		resolveProxy:    true,
+	pol, err := a.Resolve(context.Background(), ResolveRequest{
+		NodeID:          nodeID,
+		RequireSnapshot: true,
+		ResolveProxy:    true,
 	})
 	if err != nil {
 		return "", fmt.Errorf("resolve node %q for control path expansion: %w", nodeID, err)
@@ -1006,8 +855,10 @@ func (a *SSHAdapter) ConfirmConnection(ctx context.Context, nodeID string) error
 		return nil
 	}
 	if nodeID != "" && a.cfgProvider != nil {
-		sessionCtrlOpts, _ := a.getSessionControlOverride(nodeID)
-		_, _ = a.solvePolicy(nodeID, sessionCtrlOpts, policySolveMode{resolveOptions: true, allowBatchLatch: true})
+		_, _ = a.Resolve(ctx, ResolveRequest{
+			NodeID:          nodeID,
+			AllowBatchLatch: true,
+		})
 	}
 	if provider, ok := a.cfgProvider.(interface {
 		ConfirmNodeContext(context.Context, string) error
@@ -1017,24 +868,43 @@ func (a *SSHAdapter) ConfirmConnection(ctx context.Context, nodeID string) error
 	return nil
 }
 
-// GetConfig 获取底层 SSH 客户端需要的配置
-func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
-	if a.cfgProvider == nil {
-		return nil, fmt.Errorf("configuration provider is nil")
+// SessionAuthMaterial captures typed session-level authentication inputs used
+// by DeriveAuthType. Using ssh.PathList ensures an explicitly disabled
+// IdentityFile=none list (PathListDisabled) is never treated as key material.
+type SessionAuthMaterial struct {
+	Password      string
+	Passphrase    string
+	IdentityPaths ssh.PathList
+	OTP           string
+}
+
+// DeriveAuthType computes the effective ClientConfig.AuthType purely from the
+// saved identity's AuthType and the typed SessionAuthMaterial.
+//
+// An explicitly disabled IdentityFile list (PathListDisabled, i.e. "none") is
+// NOT key material and therefore preserves savedAuthType (for example keeping a
+// saved "password" node as "password" instead of flipping it to "auto").
+func DeriveAuthType(savedAuthType string, material SessionAuthMaterial) string {
+	if savedAuthType == "keyboard-interactive" || savedAuthType == "otp" {
+		return savedAuthType
 	}
-	sessionCtrlOpts, _ := a.getSessionControlOverride(nodeID)
-	pol, err := a.solvePolicy(nodeID, sessionCtrlOpts, policySolveMode{
-		requireSnapshot: true,
-		resolveOptions:  true,
-		allowBatchLatch: true,
-	})
-	if err != nil {
-		if !pol.hasSnapshot {
-			return nil, fmt.Errorf("resolve node %q failed: %w", nodeID, err)
-		}
-		return nil, fmt.Errorf("resolve ssh options for node %q failed: %w", nodeID, err)
+	if material.Password != "" || material.Passphrase != "" || material.IdentityPaths.IsSet() {
+		return "auto"
 	}
-	snapshot := pol.snapshot
+	if material.OTP != "" && (savedAuthType == "" || savedAuthType == "password") {
+		return "auto"
+	}
+	return savedAuthType
+}
+
+// ClientConfig constructs the validated *ssh.ClientConfig projected from this
+// EffectivePolicy. Returns an error if the policy does not contain a resolved
+// node snapshot.
+func (p EffectivePolicy) ClientConfig() (*ssh.ClientConfig, error) {
+	if !p.hasSnapshot {
+		return nil, fmt.Errorf("resolve node %q failed: %w", p.nodeID, config.ErrNodeNotFound)
+	}
+	snapshot := p.snapshot
 	var authUpdateToken, sudoUpdateToken string
 	if snapshot.UpdateRef != nil {
 		authUpdateToken = string(snapshot.UpdateRef.AuthVersion[:])
@@ -1042,26 +912,32 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 	}
 
 	var globalExec *ssh.ExecutionConfig
-	if pol.globalCfg != nil {
-		globalExec = pol.globalCfg.Execution
+	if p.globalCfg != nil {
+		globalExec = p.globalCfg.Execution
 	}
 	execCfg, err := ssh.ResolveExecution(snapshot.Node.Execution, globalExec)
 	if err != nil {
-		return nil, fmt.Errorf("resolve execution for node %q failed: %w", nodeID, err)
+		return nil, fmt.Errorf("resolve execution for node %q failed: %w", p.nodeID, err)
 	}
 
-	sshOpts := pol.effectiveOpts
-	baseProxyJump := snapshot.Node.ProxyJump
-	if !ssh.HasActiveProxyJump(baseProxyJump) {
-		baseProxyJump = ""
+	sshOpts := p.Options()
+	effectiveJump := ""
+	if p.proxySetting.Kind() == ssh.ProxyJump {
+		effectiveJump = p.resolvedJumpChain
+		if effectiveJump == "" {
+			if targets, ok := p.proxySetting.JumpTargets(); ok {
+				effectiveJump = strings.Join(targets, ",")
+			}
+		}
 	}
+
 	cfg := &ssh.ClientConfig{
-		NodeID:                nodeID,
+		NodeID:                p.nodeID,
 		Address:               effectiveSnapshotHost(snapshot, false, SessionAuth{}),
 		Port:                  effectiveSnapshotPort(snapshot.Host.Port),
 		User:                  effectiveSnapshotUser(snapshot.Identity.User),
-		OriginalHost:          pol.originalHost,
-		CanonicalHost:         pol.canonicalHost,
+		OriginalHost:          p.originalHost,
+		CanonicalHost:         p.canonicalHost,
 		AuthType:              snapshot.Identity.AuthType,
 		Password:              snapshot.Identity.Password,
 		KeyPath:               snapshot.Identity.KeyPath,
@@ -1070,73 +946,105 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 		SudoMode:              ssh.SudoMode(snapshot.Node.SudoMode),
 		SuPwd:                 snapshot.Node.SuPwd,
 		SudoUpdateToken:       sudoUpdateToken,
-		ProxyJump:             baseProxyJump,
-		OriginalProxyJump:     baseProxyJump,
+		ProxyJump:             effectiveJump,
+		OriginalProxyJump:     effectiveJump,
 		HasOriginalProxyJump:  true,
 		PasswordPromptPattern: snapshot.Node.PasswordPromptPattern,
 		Execution:             execCfg,
 		Options:               sshOpts,
 	}
 
-	override := pol.tier1Auth
-	hasOverride := pol.hasTier1Auth
-	if hasOverride {
-		if err := a.applySessionOverrideToConfig(nodeID, cfg, override); err != nil {
-			return nil, err
-		}
-		if strings.TrimSpace(override.HostName) != "" {
+	cliFlagList := ssh.UnsetPathList()
+	if p.hasTier1Auth {
+		cliFlagList = pathListFromSessionAuth(p.tier1Auth)
+		applySessionOverrideToConfig(cfg, p.tier1Auth, cliFlagList)
+		if strings.TrimSpace(p.tier1Auth.HostName) != "" {
 			cfg.BaseHost = config.StripHostBrackets(snapshot.Host.Address)
 		}
 	}
-	if pol.higherTierCmdWins {
-		cfg.ProxyJump = ""
-		cfg.OriginalProxyJump = ""
-	}
 
-	var cliOptKeys []string
-	if sessionCtrlOpts.Options != nil {
-		cliOptKeys = sessionCtrlOpts.Options.IdentityFiles()
+	cliOptList := ssh.UnsetPathList()
+	if p.sessionCtrlOpts.Options != nil {
+		cliOptList = p.sessionCtrlOpts.Options.IdentityPathList()
 	}
-	managedNodeKey := a.resolveManagedNodeKey(nodeID, snapshot)
-	var mergedOptKeys []string
-	if sshOpts != nil {
-		mergedOptKeys = sshOpts.IdentityFiles()
-	}
-	var cliFlagKeys []string
-	if hasOverride {
-		if len(override.KeyPaths) > 0 {
-			cliFlagKeys = override.KeyPaths
-		} else if override.KeyPath != "" {
-			cliFlagKeys = []string{override.KeyPath}
+	managedNodeList := ssh.UnsetPathList()
+	if managedKey := resolveManagedNodeKey(p.nodeID, snapshot); managedKey != "" {
+		if pl, plErr := ssh.ParsePathListItems([]string{managedKey}); plErr == nil {
+			managedNodeList = pl
 		}
 	}
-	cfg.KeyPaths = buildOrderedKeyPaths(cliFlagKeys, cliOptKeys, managedNodeKey, mergedOptKeys)
-	if hasNoneString(cliFlagKeys) || hasNoneString(cliOptKeys) {
-		cfg.KeyPath = firstConcreteKeyPath(cfg.KeyPaths)
-	} else if cfg.KeyPath == "" {
-		cfg.KeyPath = firstConcreteKeyPath(cfg.KeyPaths)
+	mergedOptList := ssh.UnsetPathList()
+	if sshOpts != nil {
+		mergedOptList = sshOpts.IdentityPathList()
+	}
+
+	effectiveKeys := ssh.MergePathLists(cliFlagList, cliOptList, managedNodeList, mergedOptList)
+	switch effectiveKeys.State() {
+	case ssh.PathListDisabled:
+		cfg.KeyPaths = []string{"none"}
+		cfg.KeyPath = ""
+	case ssh.PathListSet:
+		items := effectiveKeys.RawItems()
+		cfg.KeyPaths = items
+		if cliFlagList.Terminated() || cliOptList.Terminated() || cfg.KeyPath == "" {
+			cfg.KeyPath = items[0]
+		}
 	}
 
 	return cfg, nil
 }
 
-func firstConcreteKeyPath(paths []string) string {
-	p, _ := firstConcreteKeyPathBeforeNone(paths)
-	return p
+// GetConfig implements ssh.ConnectionProvider by delegating to Resolve.
+func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
+	if a.cfgProvider == nil {
+		return nil, fmt.Errorf("configuration provider is nil")
+	}
+	pol, err := a.Resolve(context.Background(), ResolveRequest{
+		NodeID:          nodeID,
+		RequireSnapshot: true,
+		ResolveProxy:    true,
+		AllowBatchLatch: true,
+	})
+	if err != nil {
+		if !pol.hasSnapshot {
+			return nil, fmt.Errorf("resolve node %q failed: %w", nodeID, err)
+		}
+		return nil, fmt.Errorf("resolve ssh options for node %q failed: %w", nodeID, err)
+	}
+	return pol.ClientConfig()
 }
 
-func firstConcreteKeyPathBeforeNone(paths []string) (path string, hitNone bool) {
-	for _, p := range paths {
-		trimmed := strings.TrimSpace(p)
+func pathListFromSessionAuth(auth SessionAuth) ssh.PathList {
+	var raw []string
+	if len(auth.KeyPaths) > 0 {
+		raw = auth.KeyPaths
+	} else if auth.KeyPath != "" {
+		raw = []string{auth.KeyPath}
+	}
+	if len(raw) == 0 {
+		return ssh.UnsetPathList()
+	}
+	if pl, err := ssh.ParsePathListItems(raw); err == nil {
+		return pl
+	}
+	var entries []ssh.IdentityPathSetting
+	for _, k := range raw {
+		trimmed := strings.TrimSpace(k)
 		if trimmed == "" {
 			continue
 		}
 		if ssh.IsNoneValue(trimmed) {
-			return "", true
+			entries = append(entries, ssh.IdentityPathSetting{Kind: ssh.IdentityPathDisabled, Raw: "none"})
+			break
 		}
-		return trimmed, false
+		if setting, err := ssh.ParseIdentityPathSetting(trimmed, true); err == nil {
+			entries = append(entries, setting)
+		}
 	}
-	return "", false
+	if pl, err := ssh.NewPathList(entries...); err == nil {
+		return pl
+	}
+	return ssh.UnsetPathList()
 }
 
 func openSSHSnapshotOriginalHost(nodeID string, snapshot config.ConnectionSnapshot) string {
@@ -1149,7 +1057,7 @@ func openSSHSnapshotOriginalHost(nodeID string, snapshot config.ConnectionSnapsh
 	return ""
 }
 
-func (a *SSHAdapter) resolveManagedNodeKey(nodeID string, snapshot config.ConnectionSnapshot) string {
+func resolveManagedNodeKey(nodeID string, snapshot config.ConnectionSnapshot) string {
 	if snapshot.Provenance.IsUnpersistedOpenSSH() || config.IsOpenSSHNodeID(nodeID) {
 		return ""
 	}
@@ -1157,48 +1065,6 @@ func (a *SSHAdapter) resolveManagedNodeKey(nodeID string, snapshot config.Connec
 		return ""
 	}
 	return snapshot.Identity.KeyPath
-}
-
-func buildOrderedKeyPaths(cliFlagKeys, cliOptKeys []string, managedNodeKey string, mergedOptKeys []string) []string {
-	var out []string
-	seen := make(map[string]struct{})
-	add := func(k string) bool {
-		k = strings.TrimSpace(k)
-		if k == "" {
-			return false
-		}
-		if ssh.IsNoneValue(k) {
-			if len(out) == 0 {
-				out = []string{"none"}
-			}
-			return true
-		}
-		if _, ok := seen[k]; ok {
-			return false
-		}
-		seen[k] = struct{}{}
-		out = append(out, k)
-		return false
-	}
-	for _, k := range cliFlagKeys {
-		if add(k) {
-			return out
-		}
-	}
-	for _, k := range cliOptKeys {
-		if add(k) {
-			return out
-		}
-	}
-	if add(managedNodeKey) {
-		return out
-	}
-	for _, k := range mergedOptKeys {
-		if add(k) {
-			return out
-		}
-	}
-	return out
 }
 
 func effectiveSnapshotHost(snapshot config.ConnectionSnapshot, hasOverride bool, override SessionAuth) string {
@@ -1209,7 +1075,7 @@ func effectiveSnapshotHost(snapshot config.ConnectionSnapshot, hasOverride bool,
 	return host
 }
 
-func (a *SSHAdapter) applySessionOverrideToConfig(nodeID string, cfg *ssh.ClientConfig, override SessionAuth) error {
+func applySessionOverrideToConfig(cfg *ssh.ClientConfig, override SessionAuth, overrideKeys ssh.PathList) {
 	if strings.TrimSpace(override.HostName) != "" {
 		cfg.Address = config.StripHostBrackets(override.HostName)
 	}
@@ -1225,74 +1091,56 @@ func (a *SSHAdapter) applySessionOverrideToConfig(nodeID string, cfg *ssh.Client
 	if override.Passphrase != "" {
 		cfg.Passphrase = override.Passphrase
 	}
-	var overrideKeyPaths []string
-	if len(override.KeyPaths) > 0 {
-		overrideKeyPaths = override.KeyPaths
-	} else if override.KeyPath != "" {
-		overrideKeyPaths = []string{override.KeyPath}
-	}
-	if p, hitNone := firstConcreteKeyPathBeforeNone(overrideKeyPaths); p != "" {
-		cfg.KeyPath = p
-	} else if hitNone {
+	switch overrideKeys.State() {
+	case ssh.PathListSet:
+		cfg.KeyPath = overrideKeys.RawItems()[0]
+	case ssh.PathListDisabled:
 		cfg.KeyPath = ""
 	}
-	// Route explicit session material through auto authentication unless the
-	// identity already uses keyboard-interactive or otp. This lets the
-	// connector record discovered credentials after a successful handshake
-	// and enables stage-0 keyboard-interactive when --otp is supplied on a
-	// default password node.
-	if cfg.AuthType != "keyboard-interactive" && cfg.AuthType != "otp" {
-		if override.Password != "" || override.Passphrase != "" || override.KeyPath != "" || len(override.KeyPaths) > 0 {
-			cfg.AuthType = "auto"
-		} else if override.OTP != "" && (cfg.AuthType == "" || cfg.AuthType == "password") {
-			cfg.AuthType = "auto"
-		}
-	}
+	cfg.AuthType = DeriveAuthType(cfg.AuthType, SessionAuthMaterial{
+		Password:      override.Password,
+		Passphrase:    override.Passphrase,
+		IdentityPaths: overrideKeys,
+		OTP:           override.OTP,
+	})
 	if override.SuPwd != "" {
 		cfg.SuPwd = override.SuPwd
 	}
-	return a.applySessionProxyJumpOverride(nodeID, cfg, override.ProxyJump)
 }
 
-func (a *SSHAdapter) applySessionProxyJumpOverride(nodeID string, cfg *ssh.ClientConfig, rawJump string) error {
-	switch classifyProxyJump(rawJump) {
-	case proxyUnset:
-		return nil
-	case proxyDisabled:
-		cfg.ProxyJump = ""
-		cfg.OriginalProxyJump = ""
-		cfg.HasOriginalProxyJump = true
-		return nil
-	}
-	resolvedJump, err := a.cfgProvider.ResolveProxyJumpChain(rawJump)
-	if err != nil {
-		return fmt.Errorf("resolve proxy jump %q for node %q failed: %w", rawJump, nodeID, err)
-	}
-	cfg.ProxyJump = resolvedJump
-	cfg.OriginalProxyJump = resolvedJump
-	cfg.HasOriginalProxyJump = true
-	return nil
-}
-
-func (a *SSHAdapter) isNonInteractiveForNode(nodeID string) bool {
-	if a == nil {
-		return true
-	}
-	if a.nonInteractive {
-		return true
+func (a *SSHAdapter) interactiveVerdictForNode(nodeID string) (verdict.Verdict, error) {
+	if a == nil || a.nonInteractive {
+		return verdict.Deny, nil
 	}
 	sessionCtrlOpts, _ := a.getSessionControlOverride(nodeID)
 	if sessionCtrlOpts.Options != nil && sessionCtrlOpts.Options.Get(ssh.OptionBatchMode) != "" {
-		return sessionCtrlOpts.Options.BatchMode()
+		if sessionCtrlOpts.Options.BatchMode() {
+			return verdict.Deny, nil
+		}
+		return verdict.Allow, nil
 	}
 	if a.cfgProvider == nil {
-		return true
+		return verdict.Deny, fmt.Errorf("configuration provider is nil")
 	}
-	opts, err := a.ResolveSSHOptions(nodeID, sessionCtrlOpts)
+	pol, err := a.Resolve(context.Background(), ResolveRequest{
+		NodeID:         nodeID,
+		SessionControl: &sessionCtrlOpts,
+	})
+	if err != nil {
+		return verdict.Deny, err
+	}
+	if opts := pol.Options(); opts != nil && opts.BatchMode() {
+		return verdict.Deny, nil
+	}
+	return verdict.Allow, nil
+}
+
+func (a *SSHAdapter) isNonInteractiveForNode(nodeID string) bool {
+	v, err := a.interactiveVerdictForNode(nodeID)
 	if err != nil {
 		return true
 	}
-	return opts != nil && opts.BatchMode()
+	return v.Denied()
 }
 
 // UpdateAuth 处理密码或私钥密码的回写并返回本次提交后的新认证令牌
@@ -1821,21 +1669,27 @@ func validateSecretRequestSnapshotWithState(
 		return fmt.Errorf("%w: missing base host for node %q under HostName override",
 			ssh.ErrSnapshotMismatch, req.NodeID)
 	}
-	if observedBaseHost != "" && !config.SameHostAddress(observedBaseHost, snapshot.Host.Address) {
+	effectivePort := effectiveSnapshotPort(snapshot.Host.Port)
+	if observedBaseHost != "" && !endpointsMatch(observedBaseHost, effectivePort, snapshot.Host.Address, effectivePort) {
 		return fmt.Errorf("%w: underlying host address changed for node %q: expected %q, got %q",
 			ssh.ErrSnapshotMismatch, req.NodeID, observedBaseHost, snapshot.Host.Address)
 	}
 
 	// 2. 目标主机与用户一致性校验：防止节点目标地址、端口或用户名发生变动时将新机密用于旧目标
 	effectiveHost := effectiveSnapshotHost(snapshot, hasOverride, override)
-	if req.Host != "" && !config.SameHostAddress(effectiveHost, req.Host) {
-		return fmt.Errorf("%w: host address changed for node %q: expected %q, got %q",
-			ssh.ErrSnapshotMismatch, req.NodeID, req.Host, effectiveHost)
-	}
-	effectivePort := effectiveSnapshotPort(snapshot.Host.Port)
 	if req.Port != 0 && effectivePort != req.Port {
 		return fmt.Errorf("%w: host port changed for node %q: expected %d, got %d",
 			ssh.ErrSnapshotMismatch, req.NodeID, req.Port, effectivePort)
+	}
+	if req.Host != "" {
+		comparePort := effectivePort
+		if req.Port != 0 {
+			comparePort = req.Port
+		}
+		if !endpointsMatch(effectiveHost, effectivePort, req.Host, comparePort) {
+			return fmt.Errorf("%w: host address changed for node %q: expected %q, got %q",
+				ssh.ErrSnapshotMismatch, req.NodeID, req.Host, effectiveHost)
+		}
 	}
 	effectiveUser := effectiveSnapshotUser(snapshot.Identity.User)
 	if req.User != "" && effectiveUser != req.User {
@@ -1843,4 +1697,10 @@ func validateSecretRequestSnapshotWithState(
 			ssh.ErrSnapshotMismatch, req.NodeID, req.User, effectiveUser)
 	}
 	return nil
+}
+
+func endpointsMatch(hostA string, portA int, hostB string, portB int) bool {
+	epA, errA := ssh.NewEndpoint(hostA, portA)
+	epB, errB := ssh.NewEndpoint(hostB, portB)
+	return errA == nil && errB == nil && epA.Equal(epB)
 }

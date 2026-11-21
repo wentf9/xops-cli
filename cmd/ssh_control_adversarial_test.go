@@ -230,10 +230,11 @@ func TestAdversarial_ControlPathNone_DisablesSharing(t *testing.T) {
 	var sessionOptsNone adapter.SessionControlOptions
 	sessionOptsNone.SetPath("none")
 
-	resNone, err := adp.ResolveControl("persistent-node", sessionOptsNone)
+	polNone, err := adp.Resolve(t.Context(), adapter.ResolveRequest{NodeID: "persistent-node", SessionControl: &sessionOptsNone})
 	if err != nil {
-		t.Fatalf("ResolveControl failed: %v", err)
+		t.Fatalf("Resolve failed: %v", err)
 	}
+	resNone := polNone.Control()
 	if resNone == nil {
 		t.Fatal("expected non-nil ControlConfig with Master=no and Path=none")
 	}
@@ -248,10 +249,11 @@ func TestAdversarial_ControlPathNone_DisablesSharing(t *testing.T) {
 	}
 
 	// Case B: Verify that without -S none, persistent-node resolves to ControlMasterAuto and Persist 10m
-	resNormal, err := adp.ResolveControl("persistent-node", adapter.SessionControlOptions{})
+	polNormal, err := adp.Resolve(t.Context(), adapter.ResolveRequest{NodeID: "persistent-node"})
 	if err != nil {
-		t.Fatalf("ResolveControl failed: %v", err)
+		t.Fatalf("Resolve failed: %v", err)
 	}
+	resNormal := polNormal.Control()
 	if resNormal == nil || resNormal.Master != ssh.ControlMasterAuto || resNormal.Persist != "10m" {
 		t.Fatalf("expected normal resolve to have auto and 10m, got %+v", resNormal)
 	}

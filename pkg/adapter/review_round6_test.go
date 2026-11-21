@@ -80,17 +80,17 @@ func TestRound6_P2_4_SavedNodeWildcardPass2ExplicitIsolationAndSnapErrPrecedence
 	}
 
 	// 3. snapErr != nil (unsaved nodeName) prefers atomic Tier-1 origin over shared side-map without chimeras,
-	// verified through both ResolveSSHOptions and resolveSessionOpenSSHMetadata.
+	// verified through both Resolve and resolveSessionOpenSSHMetadata.
 	repo.SetNodeOpenSSHOrigin("unsaved-node", config.OpenSSHOrigin{Alias: "short-a", CanonicalHost: "short-a.corp.example.com"})
 	adpUnsaved := NewSSHAdapter(repo, WithSessionAuthOverride("unsaved-node", SessionAuth{
 		OriginalHost: "short-b",
 	}))
-	pubOpts, err := adpUnsaved.ResolveSSHOptions("unsaved-node", SessionControlOptions{})
+	pubPol, err := adpUnsaved.Resolve(t.Context(), ResolveRequest{NodeID: "unsaved-node"})
 	if err != nil {
-		t.Fatalf("ResolveSSHOptions(unsaved-node): %v", err)
+		t.Fatalf("Resolve(unsaved-node): %v", err)
 	}
-	if pubOpts != nil && pubOpts.Get(ssh.OptionServerAliveInterval) != "" {
-		t.Fatalf("public ResolveSSHOptions(unsaved-node) leaked old-alias option ServerAliveInterval=%q", pubOpts.Get(ssh.OptionServerAliveInterval))
+	if pubOpts := pubPol.Options(); pubOpts != nil && pubOpts.Get(ssh.OptionServerAliveInterval) != "" {
+		t.Fatalf("public Resolve(unsaved-node) leaked old-alias option ServerAliveInterval=%q", pubOpts.Get(ssh.OptionServerAliveInterval))
 	}
 	gotAlias, gotCanon := adpUnsaved.resolveSessionOpenSSHMetadata(parser, "unsaved-node", config.ErrNodeNotFound, config.ConnectionSnapshot{}, SessionAuth{
 		OriginalHost: "short-b",

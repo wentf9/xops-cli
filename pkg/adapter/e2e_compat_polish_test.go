@@ -93,7 +93,7 @@ func TestConfirmAuthenticatedConnection_WithOpenSSHConfigOverrideDoesNotCrash(t 
 func TestSessionControlOptions_ConnectionWideOptionsIsolation(t *testing.T) {
 	khFile := filepath.Join(t.TempDir(), "known_hosts")
 	gkhFile := filepath.Join(t.TempDir(), "global_known_hosts")
-	parsed, err := ParseOptionStrings([]string{
+	parsed, err := ParseSessionOptions([]string{
 		"StrictHostKeyChecking=no",
 		"UserKnownHostsFile=" + khFile,
 		"GlobalKnownHostsFile=" + gkhFile,
@@ -112,9 +112,9 @@ func TestSessionControlOptions_ConnectionWideOptionsIsolation(t *testing.T) {
 		"ControlMaster=auto",
 		"ControlPath=/tmp/cm-%C",
 		"ControlPersist=60",
-	})
+	}, "")
 	if err != nil {
-		t.Fatalf("ParseOptionStrings failed: %v", err)
+		t.Fatalf("ParseSessionOptions failed: %v", err)
 	}
 	if err := parsed.SetAddressFamily(ssh.AddressFamilyInet); err != nil {
 		t.Fatalf("SetAddressFamily failed: %v", err)

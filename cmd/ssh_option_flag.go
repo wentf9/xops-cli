@@ -128,7 +128,7 @@ func (f *SSHControlFlags) ToSessionControlOptionsWithJump(cliJump string) (adapt
 
 	// 1. Parse -o options first if provided
 	if len(f.Options) > 0 {
-		parsed, err := adapter.ParseOptionStringsWithJump(f.Options, cliJump)
+		parsed, err := adapter.ParseSessionOptions(f.Options, cliJump)
 		if err != nil {
 			return sessionOpts, err
 		}
@@ -487,20 +487,21 @@ func ApplyGeneralOptions(opts *SshOptions, optionStrings []string, flags *pflag.
 func applyGeneralOption(opts *SshOptions, st *generalOptionState, key, val string) error {
 	switch ssh.CanonicalOptionKey(key) {
 	case ssh.OptionPort:
-		p, err := strconv.ParseUint(val, 10, 16)
-		if err != nil || p == 0 {
-			return fmt.Errorf("invalid Port in -o option: %q", val)
+		parsed, err := ssh.ParseOption(key, val, ssh.OptionSourceCLI)
+		if err != nil {
+			return fmt.Errorf("invalid Port in -o option: %w", err)
 		}
 		if st.allowPort && !st.seenPort {
-			opts.Port = uint16(p)
+			opts.Port = parsed.Port
 		}
 		st.seenPort = true
 	case ssh.OptionUser:
-		if val == "" {
-			return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
+		parsed, err := ssh.ParseOption(key, val, ssh.OptionSourceCLI)
+		if err != nil {
+			return fmt.Errorf("invalid %s in -o option: %w", key, err)
 		}
 		if st.allowUser && !st.seenUser {
-			opts.User = val
+			opts.User = parsed.Normalized
 		}
 		st.seenUser = true
 	case ssh.OptionIdentityFile:
@@ -516,47 +517,46 @@ func applyGeneralOption(opts *SshOptions, st *generalOptionState, key, val strin
 }
 
 func applyIdentityFileGeneralOption(opts *SshOptions, st *generalOptionState, key, val string) error {
-	setting, err := ssh.ParseIdentityPathSetting(val, true)
+	parsed, err := ssh.ParseOption(key, val, ssh.OptionSourceCLI)
 	if err != nil {
 		return fmt.Errorf("invalid %s in -o option: %w", key, err)
-	}
-	if setting.Unset() {
-		return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
 	}
 	opts.identityFromCLIOptions = true
 	if st.seenIdentityNone || slices.ContainsFunc(opts.IdentityFiles, ssh.IsNoneValue) {
 		st.seenIdentityNone = true
 		return nil
 	}
-	if setting.Disabled() {
+	if parsed.PathList.IsDisabled() {
 		st.seenIdentityNone = true
 		opts.IdentityFiles = append(opts.IdentityFiles, "none")
 		return nil
 	}
-	opts.IdentityFiles = append(opts.IdentityFiles, val)
-	if opts.IdentityFile == "" && config.IsPersistableIdentityPath(val) {
-		opts.IdentityFile = val
+	items := parsed.PathList.RawItems()
+	if len(items) == 0 {
+		return nil
+	}
+	pathVal := items[0]
+	opts.IdentityFiles = append(opts.IdentityFiles, pathVal)
+	if opts.IdentityFile == "" && config.IsPersistableIdentityPath(pathVal) {
+		opts.IdentityFile = pathVal
 	}
 	return nil
 }
 
 func applyProxyJumpGeneralOption(opts *SshOptions, st *generalOptionState, key, val string) error {
-	if val == "" {
-		return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
+	parsed, err := ssh.ParseOption(key, val, ssh.OptionSourceCLI)
+	if err != nil {
+		return fmt.Errorf("invalid %s in -o option: %w", key, err)
 	}
-	if st.allowJump && !st.seenJump && (!st.seenProxyCmd || !ssh.HasActiveProxyJump(val)) {
-		opts.JumpHost = val
+	if st.allowJump && !st.seenJump && (!st.seenProxyCmd || parsed.ProxySetting.Kind() != ssh.ProxyJump) {
+		opts.JumpHost = parsed.Normalized
 	}
 	st.seenJump = true
 	return nil
 }
 
 func applyProxyCommandGeneralOption(st *generalOptionState, key, val string) error {
-	if val == "" {
-		return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
-	}
-	var scratch ssh.Options
-	if err := scratch.Set(ssh.OptionProxyCommand, val); err != nil {
+	if _, err := ssh.ParseOption(key, val, ssh.OptionSourceCLI); err != nil {
 		return fmt.Errorf("invalid ProxyCommand in -o option: %w", err)
 	}
 	if !st.seenJump {
@@ -566,16 +566,14 @@ func applyProxyCommandGeneralOption(st *generalOptionState, key, val string) err
 }
 
 func applyHostNameOption(opts *SshOptions, st *generalOptionState, key, val string) error {
-	if val == "" {
-		return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
-	}
-	if _, expErr := ssh.ExpandHostName(val, "host"); expErr != nil {
-		return expErr
+	parsed, err := ssh.ParseOption(key, val, ssh.OptionSourceCLI)
+	if err != nil {
+		return err
 	}
 	if st.allowHostName && !st.seenHostName {
-		opts.cliHostName = val
+		opts.cliHostName = parsed.Normalized
 		if orig := opts.originalHostForExpansion(); orig != "" {
-			if expanded, expErr := ssh.ExpandHostName(val, orig); expErr == nil {
+			if expanded, expErr := ssh.ExpandHostName(parsed.Normalized, orig); expErr == nil {
 				opts.HostName = strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(expanded), "]"), "[")
 			}
 		}

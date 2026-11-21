@@ -95,7 +95,7 @@ func TestParentDaemonDisablesNodeControlSharing(t *testing.T) {
 	// parent would bind the socket without the dedicated disable.
 	sessionOnly, err := adapter.NewSSHAdapter(provider, adpOpts...).GetControlConfig("web-01")
 	if err != nil {
-		t.Fatalf("ResolveControl failed: %v", err)
+		t.Fatalf("GetControlConfig failed: %v", err)
 	}
 	if sessionOnly == nil || sessionOnly.Master != ssh.ControlMasterYes || sessionOnly.Path != "/tmp/node.sock" {
 		t.Fatalf("expected the session -M master on the node path, got %+v", sessionOnly)
@@ -104,7 +104,7 @@ func TestParentDaemonDisablesNodeControlSharing(t *testing.T) {
 	adpOpts = append(adpOpts, disableSessionControlForParent("web-01"))
 	disabled, err := adapter.NewSSHAdapter(provider, adpOpts...).GetControlConfig("web-01")
 	if err != nil {
-		t.Fatalf("ResolveControl with the parent disable failed: %v", err)
+		t.Fatalf("GetControlConfig with the parent disable failed: %v", err)
 	}
 	if disabled == nil || disabled.Path != "none" || disabled.Master != ssh.ControlMasterNo || disabled.Persist != "" {
 		t.Fatalf("expected the -f parent to disable connection sharing, got %+v", disabled)
@@ -118,7 +118,7 @@ func TestParentDaemonDisablesNodeControlSharing(t *testing.T) {
 	})
 	jumpDisabled, err := adapter.NewSSHAdapter(provider, adpOpts...).GetControlConfig("jump-01")
 	if err != nil {
-		t.Fatalf("ResolveControl for jump hop with parent disable failed: %v", err)
+		t.Fatalf("GetControlConfig for jump hop with parent disable failed: %v", err)
 	}
 	if jumpDisabled == nil || jumpDisabled.Path != "none" || jumpDisabled.Master != ssh.ControlMasterNo || jumpDisabled.Persist != "" {
 		t.Fatalf("expected the -f parent to disable jump hop connection sharing, got %+v", jumpDisabled)
@@ -550,7 +550,7 @@ func TestMultiHostHandoff_PreservesAllTargetMasters(t *testing.T) {
 
 // TestHandoffSkipsImplicitTier4Control verifies Decision 1.A: when multiplexing
 // configuration comes solely from Tier 4 (~/.ssh/config) without explicit CLI
-// flags or xops config, ResolveControl marks ImplicitTier4=true and
+// flags or xops config, Resolve marks ImplicitTier4=true and
 // handoffMasterInstance does NOT spawn a background daemon on command exit
 // (releasing the in-process master cleanly instead).
 func TestHandoffSkipsImplicitTier4Control(t *testing.T) {
@@ -569,6 +569,7 @@ func TestHandoffSkipsImplicitTier4Control(t *testing.T) {
 
 	openSSHContent := "Host web-tier4\n" +
 		"    HostName " + host + "\n" +
+		"    Port " + portStr + "\n" +
 		"    ControlMaster auto\n" +
 		"    ControlPath " + sockPath + "\n" +
 		"    ControlPersist 10m\n"
@@ -1460,10 +1461,11 @@ func TestDerivedNodeFromOpenSSHAliasInheritsTier4Control(t *testing.T) {
 	}
 
 	adp := adapter.NewSSHAdapter(repo)
-	ctrl, err := adp.ResolveControl(res.NodeID, adapter.SessionControlOptions{})
+	pol, err := adp.Resolve(t.Context(), adapter.ResolveRequest{NodeID: res.NodeID})
 	if err != nil {
-		t.Fatalf("ResolveControl(%q) failed: %v", res.NodeID, err)
+		t.Fatalf("Resolve(%q) failed: %v", res.NodeID, err)
 	}
+	ctrl := pol.Control()
 	if ctrl == nil || ctrl.Master != ssh.ControlMasterAuto || ctrl.Path != "/tmp/cm-%n-%r@%h:%p" || ctrl.Persist != "60s" {
 		t.Fatalf("expected Tier 4 ControlConfig from demo-alias, got %+v", ctrl)
 	}
@@ -1610,10 +1612,11 @@ func TestControlCandidateFallbackAndPortOverrideJumpAlignment(t *testing.T) {
 	adp := adapter.NewSSHAdapter(repo)
 
 	// Node on 10.0.0.40:22 must fall back to Host *, not Host alias-2222 (Port 2222).
-	ctrl40, err := adp.ResolveControl("root@10.0.0.40:22", adapter.SessionControlOptions{})
+	pol40, err := adp.Resolve(t.Context(), adapter.ResolveRequest{NodeID: "root@10.0.0.40:22"})
 	if err != nil {
-		t.Fatalf("ResolveControl(root@10.0.0.40:22) failed: %v", err)
+		t.Fatalf("Resolve(root@10.0.0.40:22) failed: %v", err)
 	}
+	ctrl40 := pol40.Control()
 	if ctrl40 == nil || ctrl40.Path != "/tmp/cm-star-%C" {
 		t.Fatalf("expected Host * ControlPath /tmp/cm-star-%%C for port 22 node, got %+v", ctrl40)
 	}
@@ -1625,10 +1628,11 @@ func TestControlCandidateFallbackAndPortOverrideJumpAlignment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PrepareNodeContext(alias-b) failed: %v", err)
 	}
-	ctrlB, err := adp.ResolveControl(resB.NodeID, adapter.SessionControlOptions{})
+	polB, err := adp.Resolve(t.Context(), adapter.ResolveRequest{NodeID: resB.NodeID})
 	if err != nil {
-		t.Fatalf("ResolveControl(%q) failed: %v", resB.NodeID, err)
+		t.Fatalf("Resolve(%q) failed: %v", resB.NodeID, err)
 	}
+	ctrlB := polB.Control()
 	if ctrlB == nil || ctrlB.Path != "/tmp/cm-b-%C" || ctrlB.Persist != "20s" {
 		t.Fatalf("expected alias-b ControlConfig (/tmp/cm-b-%%C, 20s), got %+v", ctrlB)
 	}
@@ -2136,9 +2140,16 @@ Host app
 		t.Fatalf("expected unremembered override on prod to use global Tier 3 path, got %q", sockPath)
 	}
 
-	// R10-2 (Part 2): saved node ubuntu@10.0.0.20:2222 retains OpenSSHAlias="app" when resolved via selector "app".
+	// R10-2 (Part 2) + H4 Endpoint scoping: saved node ubuntu@10.0.0.20:2222 must NOT
+	// inherit Tier-4 ControlPath from Port-2200 Host app, while a saved node matching
+	// both host and port (10.0.0.20:2200) inherits Host app's ControlPath.
 	cfgNoGlobal := repo.Snapshot()
 	cfgNoGlobal.SSHOptions = nil
+	cfgNoGlobal.Hosts.Set("10.0.0.20:2200", models.Host{Address: "10.0.0.20", Port: 2200})
+	cfgNoGlobal.Nodes.Set("ubuntu@10.0.0.20:2200", models.Node{
+		HostRef:     "10.0.0.20:2200",
+		IdentityRef: "ubuntu@10.0.0.20",
+	})
 	store2 := config.NewDefaultStore(filepath.Join(t.TempDir(), "config2.yaml"), filepath.Join(t.TempDir(), "key2"))
 	repoTier4, err := config.NewRepositoryWithOpenSSHParser(cfgNoGlobal, store2, parser)
 	if err != nil {
@@ -2153,8 +2164,16 @@ Host app
 		t.Fatalf("PrepareNodeContext(-p 2222 app) = %q, err=%v", res.NodeID, err)
 	}
 	appSock, err := controlSocketPath(appOpts, repoTier4, res.NodeID)
-	if err != nil || appSock != "/tmp/app-ubuntu@10.0.0.20:2222-ubuntu@10.0.0.20:2222" {
-		t.Fatalf("expected Tier 4 OpenSSH ControlPath for saved override node, got %q (err=%v)", appSock, err)
+	if err != nil || appSock != "" {
+		t.Fatalf("H4: Port-2200 Host app must not leak Tier-4 ControlPath onto saved :2222 node, got %q (err=%v)", appSock, err)
+	}
+	appMatchOpts := NewSshOptions()
+	appMatchOpts.Host = "app"
+	appMatchOpts.Port = 2200
+	appMatchOpts.Target = config.ConnectionTarget{Selector: "app", Port: 2200, HasPort: true}
+	matchSock, err := controlSocketPath(appMatchOpts, repoTier4, "ubuntu@10.0.0.20:2200")
+	if err != nil || matchSock != "/tmp/app-ubuntu@10.0.0.20:2200-ubuntu@10.0.0.20:2200" {
+		t.Fatalf("expected matching-endpoint saved node to inherit Host app ControlPath, got %q (err=%v)", matchSock, err)
 	}
 }
 
@@ -2321,8 +2340,9 @@ Host single-addr-host
 		t.Fatalf("expected Tier 4 lookup for local node 'prod' (Alias: web-alias) to pick /tmp/specific-web-alias-*, got %q", sockProd)
 	}
 
-	// 2. Saved node root@10.0.0.55:2222 accessed via OpenSSH alias "single-addr-host" with -p 2222
-	// records OpenSSHAlias="single-addr-host" and resolves its ControlPath (/tmp/single-addr-host-%C).
+	// 2. H4 Endpoint scoping: saved node root@10.0.0.55:2222 accessed via Port-2200
+	// OpenSSH alias "single-addr-host" with -p 2222 must NOT inherit the :2200 stanza,
+	// while a saved node at matching endpoint 10.0.0.55:2200 inherits /tmp/single-addr-host-*.
 	opts55 := NewSshOptions()
 	opts55.Host = "single-addr-host"
 	opts55.Port = 2222
@@ -2331,8 +2351,22 @@ Host single-addr-host
 	if err != nil {
 		t.Fatalf("controlSocketPath(single-addr-host -p 2222): %v", err)
 	}
-	if !strings.HasPrefix(sock55, "/tmp/single-addr-host-") {
-		t.Fatalf("expected OpenSSH alias with -p 2222 on saved node to use /tmp/single-addr-host-*, got %q", sock55)
+	if sock55 != "" {
+		t.Fatalf("H4: Port-2200 Host single-addr-host must not leak onto saved :2222 node, got %q", sock55)
+	}
+	cfg.Hosts.Set("h-55-2200", models.Host{Address: "10.0.0.55", Port: 2200})
+	cfg.Nodes.Set("root@10.0.0.55:2200", models.Node{HostRef: "h-55-2200", IdentityRef: "id-root"})
+	providerMatch := config.NewProviderWithOpenSSHParser(cfg, parser)
+	opts55Match := NewSshOptions()
+	opts55Match.Host = "single-addr-host"
+	opts55Match.Port = 2200
+	opts55Match.Target = config.ConnectionTarget{Selector: "single-addr-host", Port: 2200, HasPort: true}
+	sock55Match, err := controlSocketPath(opts55Match, providerMatch, "root@10.0.0.55:2200")
+	if err != nil {
+		t.Fatalf("controlSocketPath(single-addr-host -p 2200): %v", err)
+	}
+	if !strings.HasPrefix(sock55Match, "/tmp/single-addr-host-") {
+		t.Fatalf("expected matching-endpoint saved node on :2200 to use /tmp/single-addr-host-*, got %q", sock55Match)
 	}
 }
 

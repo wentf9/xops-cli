@@ -109,40 +109,39 @@ func TestRound8_P2_10_P2_11_P3_4_LiteralControlValidationStrictIsolationAndColli
 	})
 	prov := config.NewProviderWithoutOpenSSH(cfg)
 
-	// P2-10: Invalid literal ControlPath (whitespace or control char) fails closed in ResolveControl & ResolveSSHOptions.
+	// P2-10: Invalid literal ControlPath (whitespace or control char) fails closed in Resolve.
 	adp := NewSSHAdapter(prov)
 	for _, badLit := range []string{"   ", "/tmp/bad\rpath", "/tmp/bad\u2028path"} {
 		var sc SessionControlOptions
 		sc.SetLiteralPath(badLit)
-		if _, err := adp.ResolveControl("srv", sc); err == nil {
-			t.Fatalf("ResolveControl accepted invalid literal ControlPath %q", badLit)
-		}
-		if _, err := adp.ResolveSSHOptions("srv", sc); err == nil {
-			t.Fatalf("ResolveSSHOptions accepted invalid literal ControlPath %q", badLit)
+		if _, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: "srv", SessionControl: &sc}); err == nil {
+			t.Fatalf("Resolve accepted invalid literal ControlPath %q", badLit)
 		}
 	}
 	// P2-10: Case-insensitive "NONE" disables multiplexing consistently.
 	var scNone SessionControlOptions
 	scNone.SetLiteralPath("NONE")
-	ctrl, err := adp.ResolveControl("srv", scNone)
+	polNone, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: "srv", SessionControl: &scNone})
 	if err != nil {
-		t.Fatalf("ResolveControl(NONE): %v", err)
+		t.Fatalf("Resolve(NONE): %v", err)
 	}
+	ctrl := polNone.Control()
 	if ctrl == nil || ctrl.Path != "none" || ctrl.Master != ssh.ControlMasterNo || ctrl.LiteralPath {
-		t.Fatalf("ResolveControl(NONE) = %+v, want disabled none", ctrl)
+		t.Fatalf("Resolve(NONE) = %+v, want disabled none", ctrl)
 	}
 
 	// P2-11: WithStrictIsolation strips Mux, Trust, Session, Forward, and disables LocalExec.
 	isoAdp := NewSSHAdapter(prov, WithStrictIsolation())
-	isoOpts, err := isoAdp.ResolveSSHOptions("srv", SessionControlOptions{})
+	isoPol, err := isoAdp.Resolve(t.Context(), ResolveRequest{NodeID: "srv"})
 	if err != nil {
-		t.Fatalf("WithStrictIsolation ResolveSSHOptions: %v", err)
+		t.Fatalf("WithStrictIsolation Resolve: %v", err)
 	}
+	isoOpts := isoPol.Options()
 	if isoOpts != nil && (isoOpts.Get(ssh.OptionRemoteCommand) != "" || isoOpts.Get(ssh.OptionForwardAgent) != "" || isoOpts.Get(ssh.OptionControlMaster) != "") {
 		t.Fatalf("WithStrictIsolation leaked isolated options: %v", isoOpts.Map())
 	}
-	if isoCtrl, err := isoAdp.ResolveControl("srv", SessionControlOptions{}); err != nil || isoCtrl != nil {
-		t.Fatalf("WithStrictIsolation ResolveControl = (%+v, %v), want (nil, nil)", isoCtrl, err)
+	if isoCtrl := isoPol.Control(); isoCtrl != nil {
+		t.Fatalf("WithStrictIsolation Control = %+v, want nil", isoCtrl)
 	}
 
 	// P3-4: parseFallbackNodeIDAddressPort strips collision suffix "-<digits>".

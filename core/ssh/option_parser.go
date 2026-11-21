@@ -57,20 +57,19 @@ type ParsedOption struct {
 // ControlMaster/ControlPath/ControlPersist, and ProxyJump/ProxyCommand
 // (ProxySetting).
 func ParseOption(key, raw string, source OptionSource) (ParsedOption, error) {
-	canonical := CanonicalOptionKey(key)
-	if canonical == "" {
+	if strings.TrimSpace(key) == "" {
 		return ParsedOption{}, fmt.Errorf("%w: empty ssh option key", ErrSSHOptionsValidation)
 	}
+	canonical := CanonicalOptionKey(key)
+	if canonical == "" {
+		if source == OptionSourceCLI {
+			return ParsedOption{}, fmt.Errorf("%w: unsupported -o option %q", ErrSSHOptionsValidation, key)
+		}
+		return ParsedOption{}, fmt.Errorf("%w: unknown ssh option %q", ErrSSHOptionsValidation, key)
+	}
 
-	switch canonical {
-	case OptionPort:
-		return parseTargetPortOption(raw)
-	case OptionUser:
-		return parseTargetUserOption(raw)
-	case OptionHostName:
-		return parseTargetHostNameOption(raw)
-	case OptionProxyJump:
-		return parseTargetProxyJumpOption(raw)
+	if parsed, handled, err := parseTargetOption(canonical, raw); handled {
+		return parsed, err
 	}
 
 	spec, ok := LookupOptionSpec(canonical)
@@ -80,7 +79,29 @@ func ParseOption(key, raw string, source OptionSource) (ParsedOption, error) {
 	if strings.TrimSpace(raw) == "" {
 		return ParsedOption{}, fmt.Errorf("%w: invalid %s: value cannot be empty", ErrSSHOptionsValidation, spec.OpenSSHName)
 	}
+	return parseRegisteredOption(spec, raw, source)
+}
 
+func parseTargetOption(canonical, raw string) (ParsedOption, bool, error) {
+	switch canonical {
+	case OptionPort:
+		parsed, err := parseTargetPortOption(raw)
+		return parsed, true, err
+	case OptionUser:
+		parsed, err := parseTargetUserOption(raw)
+		return parsed, true, err
+	case OptionHostName:
+		parsed, err := parseTargetHostNameOption(raw)
+		return parsed, true, err
+	case OptionProxyJump:
+		parsed, err := parseTargetProxyJumpOption(raw)
+		return parsed, true, err
+	default:
+		return ParsedOption{}, false, nil
+	}
+}
+
+func parseRegisteredOption(spec OptionSpec, raw string, source OptionSource) (ParsedOption, error) {
 	switch spec.CanonicalKey {
 	case OptionControlMaster:
 		return parseControlMasterOption(spec, raw)
@@ -97,21 +118,25 @@ func ParseOption(key, raw string, source OptionSource) (ParsedOption, error) {
 	case OptionProxyCommand:
 		return parseProxyCommandOption(spec, raw)
 	default:
-		if spec.MultiValue && (source == OptionSourceCLI || source == OptionSourceOpenSSHConfig) {
-			if hasMultiValueDelimiterOrLineBreak(raw) || hasKnownHostsControlChar(raw) {
-				return ParsedOption{}, fmt.Errorf("%w: invalid %s: value cannot contain newlines or control characters", ErrSSHOptionsValidation, spec.OpenSSHName)
-			}
-		}
-		norm, err := spec.Normalize(raw)
-		if err != nil {
-			return ParsedOption{}, fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
-		}
-		return ParsedOption{
-			CanonicalKey: spec.CanonicalKey,
-			OpenSSHName:  spec.OpenSSHName,
-			Normalized:   norm,
-		}, nil
+		return parseGenericOption(spec, raw, source)
 	}
+}
+
+func parseGenericOption(spec OptionSpec, raw string, source OptionSource) (ParsedOption, error) {
+	if spec.MultiValue && (source == OptionSourceCLI || source == OptionSourceOpenSSHConfig) {
+		if hasMultiValueDelimiterOrLineBreak(raw) || hasKnownHostsControlChar(raw) {
+			return ParsedOption{}, fmt.Errorf("%w: invalid %s: value cannot contain newlines or control characters", ErrSSHOptionsValidation, spec.OpenSSHName)
+		}
+	}
+	norm, err := spec.Normalize(raw)
+	if err != nil {
+		return ParsedOption{}, fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
+	}
+	return ParsedOption{
+		CanonicalKey: spec.CanonicalKey,
+		OpenSSHName:  spec.OpenSSHName,
+		Normalized:   norm,
+	}, nil
 }
 
 func parseTargetPortOption(raw string) (ParsedOption, error) {
@@ -171,6 +196,18 @@ func parseTargetHostNameOption(raw string) (ParsedOption, error) {
 }
 
 func parseTargetProxyJumpOption(raw string) (ParsedOption, error) {
+	if hasControlOrLineSepChar(raw) {
+		return ParsedOption{}, fmt.Errorf("%w: invalid ProxyJump %q: contains control character", ErrSSHOptionsValidation, raw)
+	}
+	if IsDisabledProxyJump(raw) {
+		return ParsedOption{
+			CanonicalKey:   OptionProxyJump,
+			OpenSSHName:    "ProxyJump",
+			Normalized:     "none",
+			IsTargetOption: true,
+			ProxySetting:   DisabledProxyJumpSetting(),
+		}, nil
+	}
 	ps, err := ParseProxyJump(raw)
 	if err != nil {
 		return ParsedOption{}, err

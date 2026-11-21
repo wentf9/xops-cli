@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"context"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/ssh"
@@ -63,9 +64,10 @@ func ResolveControlSessionLookup(req ControlTargetRequest, target ssh.TargetCont
 }
 
 // ResolveControlConfig resolves the effective multiplexing ControlConfig for
-// lookupKey with the given session overrides. When the selector matches no
-// inventory node, SSHAdapter.ResolveControl still merges session, global, and
-// OpenSSH layers so ad-hoc hosts are validated identically to managed ones.
+// lookupKey with the given session overrides via the single SSHAdapter.Resolve
+// entry point. When the selector matches no inventory node, SSHAdapter.Resolve
+// still merges session, global, and OpenSSH layers so ad-hoc hosts are
+// validated identically to managed ones.
 func ResolveControlConfig(
 	provider config.ConfigProvider,
 	lookupKey, selector string,
@@ -76,18 +78,25 @@ func ResolveControlConfig(
 		if sessionOpts.IsEmpty() {
 			return nil, nil
 		}
-		return sessionOpts.ResolveControl()
+		provider = config.NewProviderWithoutOpenSSH(nil)
 	}
 	if lookupKey == "" {
-		// ResolveControl treats an unknown selector as "no node layer" and falls
+		// Resolve treats an unknown selector as "no node layer" and falls
 		// back to session > global > OpenSSH, which is the ad-hoc case.
 		lookupKey = selector
 	}
-	var adpOpts []Option
+	adpOpts := []Option{WithControlProxyMode(true)}
 	if lookupKey != "" && (sessionAuth.OriginalHost != "" || sessionAuth.CanonicalHost != "" || sessionAuth.ProxyJump != "") {
 		adpOpts = append(adpOpts, WithSessionAuthOverride(lookupKey, sessionAuth))
 	}
-	return NewSSHAdapter(provider, adpOpts...).ResolveControl(lookupKey, sessionOpts)
+	pol, err := NewSSHAdapter(provider, adpOpts...).Resolve(context.Background(), ResolveRequest{
+		NodeID:         lookupKey,
+		SessionControl: &sessionOpts,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return pol.Control(), nil
 }
 
 // ResolveControlSocketPath resolves the control-plane target, lookup metadata,
@@ -184,9 +193,10 @@ func applyTargetNodeOverrides(req ControlTargetRequest, target *ssh.TargetContex
 	}
 }
 
-// proxyCommandOverridesControlJump mirrors solveProxyPrecedence so a higher-tier
-// active ProxyCommand clears a lower-tier ProxyJump in TargetContext.JumpHost
-// (closing %j / %C drift between control-plane lookups and SSHAdapter.GetConfig).
+// proxyCommandOverridesControlJump mirrors ProxySetting precedence so a
+// higher-tier ProxyCommand (active or "none") clears a lower-tier ProxyJump in
+// TargetContext.JumpHost (closing %j / %C drift between control-plane lookups
+// and SSHAdapter.GetConfig).
 func proxyCommandOverridesControlJump(
 	req ControlTargetRequest,
 	connTarget config.ConnectionTarget,
@@ -196,16 +206,18 @@ func proxyCommandOverridesControlJump(
 	if ssh.HasActiveProxyJump(connTarget.ProxyJump) {
 		return false
 	}
-	t1Cmd := classifyProxyCommand(req.SessionControl.Options)
-	if t1Cmd == proxyActive {
-		return true
-	}
-	if t1Cmd == proxyDisabled {
-		return false
+	if req.SessionControl.Options != nil {
+		t1Proxy := req.SessionControl.Options.ProxyCommandSetting()
+		if t1Proxy.Kind() == ssh.ProxyCommand || t1Proxy.Equal(ssh.DisabledProxySetting()) {
+			return true
+		}
 	}
 	if hasResolved && resolved.Provenance.IsUnpersistedOpenSSH() && req.Provider != nil {
-		if snap := req.Provider.Snapshot(); snap != nil && classifyProxyCommand(snap.SSHOptions) == proxyActive {
-			return true
+		if snap := req.Provider.Snapshot(); snap != nil && snap.SSHOptions != nil {
+			t3Proxy := snap.SSHOptions.ProxyCommandSetting()
+			if t3Proxy.Kind() == ssh.ProxyCommand || t3Proxy.Equal(ssh.DisabledProxySetting()) {
+				return true
+			}
 		}
 	}
 	return false

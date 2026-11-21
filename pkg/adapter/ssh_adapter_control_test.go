@@ -45,7 +45,16 @@ func setupTestProvider(
 	return config.NewProviderWithOpenSSHParser(cfg, parser)
 }
 
-func TestResolveControl_Tier1OverridesAll(t *testing.T) {
+func resolveControlInTest(t *testing.T, adp *SSHAdapter, nodeID string, sc SessionControlOptions) (*ssh.ControlConfig, error) {
+	t.Helper()
+	pol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: nodeID, SessionControl: &sc})
+	if err != nil {
+		return nil, err
+	}
+	return pol.Control(), nil
+}
+
+func TestResolve_Tier1OverridesAll(t *testing.T) {
 	// T2: Master: auto, Path: ~/.ssh/node.sock, Persist: 5m
 	t2 := &ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: "~/.ssh/node.sock", Persist: "5m"}
 	// T3: Master: auto, Path: ~/.ssh/global.sock, Persist: 10m
@@ -53,6 +62,8 @@ func TestResolveControl_Tier1OverridesAll(t *testing.T) {
 	// T4: Master: yes
 	t4OpenSSH := `
 Host testnode
+    HostName 192.168.1.100
+    Port 2222
     ControlMaster yes
 `
 	provider := setupTestProvider(t, t2, t3, t4OpenSSH)
@@ -63,7 +74,7 @@ Host testnode
 	t1.SetMaster(ssh.ControlMasterYes)
 	t1.SetPath("/tmp/custom.sock")
 
-	res, err := adp.ResolveControl("testnode", t1)
+	res, err := resolveControlInTest(t, adp, "testnode", t1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -82,7 +93,7 @@ Host testnode
 	}
 }
 
-func TestResolveControl_Tier2OverridesTier3And4(t *testing.T) {
+func TestResolve_Tier2OverridesTier3And4(t *testing.T) {
 	// T2: Master: ask, Path: ~/.ssh/node.sock (Persist empty)
 	t2 := &ssh.ControlConfig{Master: ssh.ControlMasterAsk, Path: "~/.ssh/node.sock"}
 	// T3: Master: auto, Path: ~/.ssh/global.sock, Persist: 15m
@@ -90,6 +101,8 @@ func TestResolveControl_Tier2OverridesTier3And4(t *testing.T) {
 	// T4: Master: yes
 	t4OpenSSH := `
 Host testnode
+    HostName 192.168.1.100
+    Port 2222
     ControlMaster yes
 `
 	provider := setupTestProvider(t, t2, t3, t4OpenSSH)
@@ -98,7 +111,7 @@ Host testnode
 	// T1: empty
 	var t1 SessionControlOptions
 
-	res, err := adp.ResolveControl("testnode", t1)
+	res, err := resolveControlInTest(t, adp, "testnode", t1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -117,13 +130,15 @@ Host testnode
 	}
 }
 
-func TestResolveControl_Tier3OverridesTier4(t *testing.T) {
+func TestResolve_Tier3OverridesTier4(t *testing.T) {
 	// T2: nil
 	// T3: Master: auto, Path: ~/.ssh/global-%r@%h:%p
 	t3 := &ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: "~/.ssh/global-%r@%h:%p"}
 	// T4: Master: no, Path: ~/.ssh/ssh-%h.sock
 	t4OpenSSH := `
 Host testnode
+    HostName 192.168.1.100
+    Port 2222
     ControlMaster no
     ControlPath ~/.ssh/ssh-%h.sock
 `
@@ -131,7 +146,7 @@ Host testnode
 	adp := NewSSHAdapter(provider)
 
 	var t1 SessionControlOptions
-	res, err := adp.ResolveControl("testnode", t1)
+	res, err := resolveControlInTest(t, adp, "testnode", t1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -147,11 +162,12 @@ Host testnode
 	}
 }
 
-func TestResolveControl_Tier4Fallback_NodeMatch(t *testing.T) {
+func TestResolve_Tier4Fallback_NodeMatch(t *testing.T) {
 	// T1, T2, T3: nil/empty
 	t4OpenSSH := `
 Host testnode
     HostName 192.168.1.100
+    Port 2222
     ControlMaster auto
     ControlPath ~/.ssh/mux-%r@%h:%p
     ControlPersist 10m
@@ -160,7 +176,7 @@ Host testnode
 	adp := NewSSHAdapter(provider)
 
 	var t1 SessionControlOptions
-	res, err := adp.ResolveControl("testnode", t1)
+	res, err := resolveControlInTest(t, adp, "testnode", t1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -175,7 +191,7 @@ Host testnode
 	}
 }
 
-func TestResolveControl_Tier4Fallback_Wildcard(t *testing.T) {
+func TestResolve_Tier4Fallback_Wildcard(t *testing.T) {
 	// T1, T2, T3: nil/empty
 	t4OpenSSH := `
 Host *
@@ -186,7 +202,7 @@ Host *
 	adp := NewSSHAdapter(provider)
 
 	var t1 SessionControlOptions
-	res, err := adp.ResolveControl("testnode", t1)
+	res, err := resolveControlInTest(t, adp, "testnode", t1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -199,7 +215,7 @@ Host *
 	}
 }
 
-func TestResolveControl_FieldByFieldMerging_Orthogonal(t *testing.T) {
+func TestResolve_FieldByFieldMerging_Orthogonal(t *testing.T) {
 	// T3 provides Master: auto
 	t3 := &ssh.ControlConfig{Master: ssh.ControlMasterAuto}
 	// T2 provides Path: ~/.ssh/node-%h.sock
@@ -211,7 +227,7 @@ func TestResolveControl_FieldByFieldMerging_Orthogonal(t *testing.T) {
 	var t1 SessionControlOptions
 	t1.SetPersist("20m")
 
-	res, err := adp.ResolveControl("testnode", t1)
+	res, err := resolveControlInTest(t, adp, "testnode", t1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -252,7 +268,7 @@ func assertDisabledControl(t *testing.T, res *ssh.ControlConfig, err error) {
 	}
 }
 
-func TestResolveControl_DisableSharing_SNone(t *testing.T) {
+func TestResolve_DisableSharing_SNone(t *testing.T) {
 	// T2 has active multiplexing
 	t2 := &ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: "~/.ssh/sock"}
 	provider := setupTestProvider(t, t2, nil, "")
@@ -262,11 +278,11 @@ func TestResolveControl_DisableSharing_SNone(t *testing.T) {
 	var t1 SessionControlOptions
 	t1.SetPath("none")
 
-	res, err := adp.ResolveControl("testnode", t1)
+	res, err := resolveControlInTest(t, adp, "testnode", t1)
 	assertDisabledControl(t, res, err)
 }
 
-func TestResolveControl_DisableSharing_SNone_WithLowerTierPersist(t *testing.T) {
+func TestResolve_DisableSharing_SNone_WithLowerTierPersist(t *testing.T) {
 	t.Run("Tier2_Node_Configured_Persist", func(t *testing.T) {
 		t2 := &ssh.ControlConfig{
 			Master:  ssh.ControlMasterAuto,
@@ -279,7 +295,7 @@ func TestResolveControl_DisableSharing_SNone_WithLowerTierPersist(t *testing.T) 
 		var t1 SessionControlOptions
 		t1.SetPath("none")
 
-		res, err := adp.ResolveControl("testnode", t1)
+		res, err := resolveControlInTest(t, adp, "testnode", t1)
 		assertDisabledControl(t, res, err)
 	})
 
@@ -295,13 +311,15 @@ func TestResolveControl_DisableSharing_SNone_WithLowerTierPersist(t *testing.T) 
 		var t1 SessionControlOptions
 		t1.SetPath("none")
 
-		res, err := adp.ResolveControl("testnode", t1)
+		res, err := resolveControlInTest(t, adp, "testnode", t1)
 		assertDisabledControl(t, res, err)
 	})
 
 	t.Run("Tier4_OpenSSH_Configured_Persist", func(t *testing.T) {
 		openSSH := `
 Host testnode
+    HostName 192.168.1.100
+    Port 2222
     ControlMaster auto
     ControlPath ~/.ssh/mux-%r@%h:%p
     ControlPersist 10m
@@ -312,7 +330,7 @@ Host testnode
 		var t1 SessionControlOptions
 		t1.SetPath("none")
 
-		res, err := adp.ResolveControl("testnode", t1)
+		res, err := resolveControlInTest(t, adp, "testnode", t1)
 		assertDisabledControl(t, res, err)
 	})
 
@@ -320,6 +338,7 @@ Host testnode
 		openSSH := `
 Host testnode
     HostName 192.168.1.100
+    Port 2222
     ControlPath none
 
 Host *
@@ -332,7 +351,7 @@ Host *
 
 		var t1 SessionControlOptions
 
-		res, err := adp.ResolveControl("testnode", t1)
+		res, err := resolveControlInTest(t, adp, "testnode", t1)
 		assertDisabledControl(t, res, err)
 	})
 
@@ -348,12 +367,12 @@ Host *
 
 		var t1 SessionControlOptions
 
-		res, err := adp.ResolveControl("testnode", t1)
+		res, err := resolveControlInTest(t, adp, "testnode", t1)
 		assertDisabledControl(t, res, err)
 	})
 }
 
-func TestResolveControl_ExplicitMasterNo(t *testing.T) {
+func TestResolve_ExplicitMasterNo(t *testing.T) {
 	// T3 has active multiplexing
 	t3 := &ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: "~/.ssh/sock"}
 	provider := setupTestProvider(t, nil, t3, "")
@@ -363,7 +382,7 @@ func TestResolveControl_ExplicitMasterNo(t *testing.T) {
 	var t1 SessionControlOptions
 	t1.SetMaster(ssh.ControlMasterNo)
 
-	res, err := adp.ResolveControl("testnode", t1)
+	res, err := resolveControlInTest(t, adp, "testnode", t1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -379,7 +398,7 @@ func TestResolveControl_ExplicitMasterNo(t *testing.T) {
 	}
 }
 
-func TestResolveControl_Error_MasterWithoutPath(t *testing.T) {
+func TestResolve_Error_MasterWithoutPath(t *testing.T) {
 	provider := setupTestProvider(t, nil, nil, "")
 	adp := NewSSHAdapter(provider)
 
@@ -387,13 +406,13 @@ func TestResolveControl_Error_MasterWithoutPath(t *testing.T) {
 	var t1 SessionControlOptions
 	t1.SetMaster(ssh.ControlMasterYes)
 
-	_, err := adp.ResolveControl("testnode", t1)
+	_, err := resolveControlInTest(t, adp, "testnode", t1)
 	if err == nil || !strings.Contains(err.Error(), `ControlMaster "yes" requires non-empty ControlPath`) {
 		t.Fatalf("expected ControlMaster requires non-empty ControlPath error, got: %v", err)
 	}
 }
 
-func TestResolveControl_Error_PersistWithoutPath(t *testing.T) {
+func TestResolve_Error_PersistWithoutPath(t *testing.T) {
 	provider := setupTestProvider(t, nil, nil, "")
 	adp := NewSSHAdapter(provider)
 
@@ -401,53 +420,53 @@ func TestResolveControl_Error_PersistWithoutPath(t *testing.T) {
 	var t1 SessionControlOptions
 	t1.SetPersist("10m")
 
-	_, err := adp.ResolveControl("testnode", t1)
+	_, err := resolveControlInTest(t, adp, "testnode", t1)
 	if err == nil || !strings.Contains(err.Error(), "ControlPath is required when ControlPersist is configured") {
 		t.Fatalf("expected ControlPath is required error, got: %v", err)
 	}
 }
 
-func TestResolveControl_Error_InvalidMasterMode(t *testing.T) {
+func TestResolve_Error_InvalidMasterMode(t *testing.T) {
 	provider := setupTestProvider(t, nil, nil, "")
 	adp := NewSSHAdapter(provider)
 
-	opts, err := ParseOptionStrings([]string{"ControlMaster=invalid"})
+	opts, err := ParseSessionOptions([]string{"ControlMaster=invalid"}, "")
 	if err == nil || !strings.Contains(err.Error(), "unsupported ControlMaster option") {
 		t.Fatalf("expected unsupported ControlMaster error, got: %v", err)
 	}
 	_ = opts
 
-	// Also test direct struct with invalid mode passed to ResolveControl
+	// Also test direct struct with invalid mode passed to Resolve
 	invalidMode := ssh.ControlMasterMode("invalid")
 	t1 := SessionControlOptions{Master: &invalidMode, Path: new(string)}
 	*t1.Path = "/tmp/sock"
-	_, err = adp.ResolveControl("testnode", t1)
+	_, err = resolveControlInTest(t, adp, "testnode", t1)
 	if err == nil || !strings.Contains(err.Error(), "unsupported ControlMaster option") {
 		t.Fatalf("expected unsupported ControlMaster error, got: %v", err)
 	}
 }
 
-func TestResolveControl_Error_InvalidPersistDuration(t *testing.T) {
+func TestResolve_Error_InvalidPersistDuration(t *testing.T) {
 	provider := setupTestProvider(t, nil, nil, "")
 	adp := NewSSHAdapter(provider)
 
-	opts, err := ParseOptionStrings([]string{"ControlPersist=badval"})
-	if err == nil || !strings.Contains(err.Error(), "invalid ControlPersist") {
+	opts, err := ParseSessionOptions([]string{"ControlPersist=badval"}, "")
+	if err == nil || (!strings.Contains(err.Error(), "bad ControlPersist argument") && !strings.Contains(err.Error(), "invalid ControlPersist")) {
 		t.Fatalf("expected invalid ControlPersist error, got: %v", err)
 	}
 	_ = opts
 
-	// Also test direct struct with invalid persist duration passed to ResolveControl
+	// Also test direct struct with invalid persist duration passed to Resolve
 	badPersist := "10xyz"
 	t1 := SessionControlOptions{Persist: &badPersist, Path: new(string)}
 	*t1.Path = "/tmp/sock"
-	_, err = adp.ResolveControl("testnode", t1)
+	_, err = resolveControlInTest(t, adp, "testnode", t1)
 	if err == nil || (!strings.Contains(err.Error(), "bad ControlPersist argument") && !strings.Contains(err.Error(), "invalid")) {
 		t.Fatalf("expected invalid persist duration error, got: %v", err)
 	}
 }
 
-func TestResolveControl_VirtualOpenSSHNode(t *testing.T) {
+func TestResolve_VirtualOpenSSHNode(t *testing.T) {
 	openSSHContent := `
 Host app1
     HostName 10.0.0.50
@@ -467,9 +486,9 @@ Host app1
 	var t1 SessionControlOptions
 	t1.SetPath("/tmp/override.sock")
 
-	res, err := adp.ResolveControl(config.OpenSSHNodePrefix+"app1", t1)
+	res, err := resolveControlInTest(t, adp, config.OpenSSHNodePrefix+"app1", t1)
 	if err != nil {
-		t.Fatalf("ResolveControl failed: %v", err)
+		t.Fatalf("Resolve failed: %v", err)
 	}
 	if res == nil {
 		t.Fatal("expected non-nil ControlConfig")
@@ -537,16 +556,16 @@ func TestAdapter_ExpandControlPath_Helper(t *testing.T) {
 	}
 }
 
-func TestSessionControlOptions_ParseOptionStrings(t *testing.T) {
+func TestSessionControlOptions_ParseSessionOptions(t *testing.T) {
 	options := []string{
 		"ControlMaster=auto",
 		"ControlPath=~/.ssh/sockets/%r@%h:%p",
 		"ControlPersist=15m",
 	}
 
-	opts, err := ParseOptionStrings(options)
+	opts, err := ParseSessionOptions(options, "")
 	if err != nil {
-		t.Fatalf("ParseOptionStrings failed: %v", err)
+		t.Fatalf("ParseSessionOptions failed: %v", err)
 	}
 
 	if opts.Master == nil || *opts.Master != ssh.ControlMasterAuto {
@@ -560,17 +579,18 @@ func TestSessionControlOptions_ParseOptionStrings(t *testing.T) {
 	}
 
 	// Invalid format without '='
-	_, err = ParseOptionStrings([]string{"ControlMaster"})
+	_, err = ParseSessionOptions([]string{"ControlMaster"}, "")
 	if err == nil || !strings.Contains(err.Error(), "invalid -o option format") {
 		t.Fatalf("expected invalid format error, got: %v", err)
 	}
 }
 
-func TestResolveControl_Tier4_ConcreteHostOverridesWildcard(t *testing.T) {
-	// Verifies that a concrete host IP match (Host 192.168.1.100) takes precedence
+func TestResolve_Tier4_ConcreteHostOverridesWildcard(t *testing.T) {
+	// Verifies that a concrete host IP match (Host 192.168.1.100, Port 2222) takes precedence
 	// over a generic wildcard fallback (Host *), even though nodeName is "testnode".
 	t4OpenSSH := `
 Host 192.168.1.100
+    Port 2222
     ControlMaster yes
     ControlPath ~/.ssh/specific-ip.sock
 
@@ -582,7 +602,7 @@ Host *
 	adp := NewSSHAdapter(provider)
 
 	var t1 SessionControlOptions
-	res, err := adp.ResolveControl("testnode", t1)
+	res, err := resolveControlInTest(t, adp, "testnode", t1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -598,12 +618,13 @@ Host *
 	}
 }
 
-func TestResolveControl_Tier4_ConcreteAliasOverridesWildcard(t *testing.T) {
-	// Verifies that a concrete alias match (Host node-alias) takes precedence
+func TestResolve_Tier4_ConcreteAliasOverridesWildcard(t *testing.T) {
+	// Verifies that a concrete alias match (Host node-alias, Port 2222) takes precedence
 	// over a generic wildcard fallback (Host *).
 	t4OpenSSH := `
 Host node-alias
     HostName 192.168.1.100
+    Port 2222
     ControlMaster ask
     ControlPath ~/.ssh/specific-alias.sock
 
@@ -615,7 +636,7 @@ Host *
 	adp := NewSSHAdapter(provider)
 
 	var t1 SessionControlOptions
-	res, err := adp.ResolveControl("testnode", t1)
+	res, err := resolveControlInTest(t, adp, "testnode", t1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -631,16 +652,18 @@ Host *
 	}
 }
 
-func TestResolveControl_Tier4_ConcreteNodePrecedenceOverIP(t *testing.T) {
+func TestResolve_Tier4_ConcreteNodePrecedenceOverIP(t *testing.T) {
 	// Verifies that if both nodeName and Host.Address have concrete definitions,
 	// the more specific nodeName definition takes precedence.
 	t4OpenSSH := `
 Host testnode
     HostName 192.168.1.100
+    Port 2222
     ControlMaster ask
     ControlPath ~/.ssh/specific-node.sock
 
 Host 192.168.1.100
+    Port 2222
     ControlMaster yes
     ControlPath ~/.ssh/specific-ip.sock
 
@@ -652,7 +675,7 @@ Host *
 	adp := NewSSHAdapter(provider)
 
 	var t1 SessionControlOptions
-	res, err := adp.ResolveControl("testnode", t1)
+	res, err := resolveControlInTest(t, adp, "testnode", t1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -668,10 +691,10 @@ Host *
 	}
 }
 
-// TestResolveControl_VirtualNodeStaysTier4 verifies that ~/.ssh/config values
+// TestResolve_VirtualNodeStaysTier4 verifies that ~/.ssh/config values
 // imported into an OpenSSH virtual node never outrank the persisted global
 // default (Tier 3). The virtual node is a Tier 4 source by definition.
-func TestResolveControl_VirtualNodeStaysTier4(t *testing.T) {
+func TestResolve_VirtualNodeStaysTier4(t *testing.T) {
 	openSSHContent := `
 Host app1
     HostName 10.0.0.50
@@ -691,9 +714,9 @@ Host app1
 	provider := config.NewProviderWithOpenSSHParser(cfg, parser)
 	adp := NewSSHAdapter(provider)
 
-	res, err := adp.ResolveControl(config.OpenSSHNodePrefix+"app1", SessionControlOptions{})
+	res, err := resolveControlInTest(t, adp, config.OpenSSHNodePrefix+"app1", SessionControlOptions{})
 	if err != nil {
-		t.Fatalf("ResolveControl failed: %v", err)
+		t.Fatalf("Resolve failed: %v", err)
 	}
 	if res == nil {
 		t.Fatal("expected non-nil ControlConfig")
@@ -705,19 +728,19 @@ Host app1
 	// A session override (Tier 1) still wins over everything.
 	var session SessionControlOptions
 	session.SetPath("/tmp/session.sock")
-	res, err = adp.ResolveControl(config.OpenSSHNodePrefix+"app1", session)
+	res, err = resolveControlInTest(t, adp, config.OpenSSHNodePrefix+"app1", session)
 	if err != nil {
-		t.Fatalf("ResolveControl with session override failed: %v", err)
+		t.Fatalf("Resolve with session override failed: %v", err)
 	}
 	if res.Path != "/tmp/session.sock" {
 		t.Fatalf("expected session override to win, got %+v", res)
 	}
 }
 
-// TestResolveControl_VirtualNodeInheritsMissingMaster verifies that an OpenSSH
+// TestResolve_VirtualNodeInheritsMissingMaster verifies that an OpenSSH
 // host declaring only ControlPath/ControlPersist inherits the master mode from a
 // lower tier instead of forcing "no".
-func TestResolveControl_VirtualNodeInheritsMissingMaster(t *testing.T) {
+func TestResolve_VirtualNodeInheritsMissingMaster(t *testing.T) {
 	openSSHContent := `
 Host app2
     HostName 10.0.0.60
@@ -745,9 +768,9 @@ Host app2
 		t.Fatalf("expected an unset ControlMaster for a host that omits it, got %+v", node.SSHOptions)
 	}
 
-	res, err := adp.ResolveControl(config.OpenSSHNodePrefix+"app2", SessionControlOptions{})
+	res, err := resolveControlInTest(t, adp, config.OpenSSHNodePrefix+"app2", SessionControlOptions{})
 	if err != nil {
-		t.Fatalf("ResolveControl failed: %v", err)
+		t.Fatalf("Resolve failed: %v", err)
 	}
 	if res.Master != ssh.ControlMasterAuto {
 		t.Fatalf("expected inherited ControlMaster=auto, got %q", res.Master)
@@ -757,15 +780,15 @@ Host app2
 	}
 }
 
-// TestParseOptionStrings_RejectsUnknownKey verifies that a mistyped -o key fails
+// TestParseSessionOptions_RejectsUnknownKey verifies that a mistyped -o key fails
 // loudly. Silently ignoring it would disable the behavior the user asked for.
-func TestParseOptionStrings_RejectsUnknownKey(t *testing.T) {
+func TestParseSessionOptions_RejectsUnknownKey(t *testing.T) {
 	for _, option := range []string{
 		"ControlMaste=yes",
 		"EnableMultiplexing=true",
 		"UnknownSSHDirective=yes",
 	} {
-		if _, err := ParseOptionStrings([]string{option}); err == nil {
+		if _, err := ParseSessionOptions([]string{option}, ""); err == nil {
 			t.Fatalf("expected %q to be rejected", option)
 		} else if !strings.Contains(err.Error(), "unsupported -o option") {
 			t.Fatalf("unexpected error for %q: %v", option, err)
@@ -773,7 +796,7 @@ func TestParseOptionStrings_RejectsUnknownKey(t *testing.T) {
 	}
 
 	// Supported keys parse cleanly, including target overrides and extended OpenSSH options.
-	opts, err := ParseOptionStrings([]string{
+	opts, err := ParseSessionOptions([]string{
 		"ControlMaster=auto",
 		"ControlPath=/tmp/x.sock",
 		"Port=2222",
@@ -785,7 +808,7 @@ func TestParseOptionStrings_RejectsUnknownKey(t *testing.T) {
 		"BatchMode=yes",
 		"TCPKeepAlive=no",
 		"PreferredAuthentications=publickey,password",
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("expected supported options to parse: %v", err)
 	}
@@ -799,10 +822,11 @@ func TestParseOptionStrings_RejectsUnknownKey(t *testing.T) {
 	}
 }
 
-func TestResolveSSHOptions_FourTierPrecedenceAndGetConfig(t *testing.T) {
+func TestResolve_FourTierPrecedenceAndGetConfig(t *testing.T) {
 	openSSHContent := `
 Host testnode
     HostName 192.168.1.100
+    Port 2222
     ConnectTimeout 30
     StrictHostKeyChecking no
     PasswordAuthentication no
@@ -833,9 +857,9 @@ Host testnode
 	})
 
 	provider := config.NewProviderWithOpenSSHParser(cfg, parser)
-	cliOpts, err := ParseOptionStrings([]string{"ConnectTimeout=5", "BatchMode=yes"})
+	cliOpts, err := ParseSessionOptions([]string{"ConnectTimeout=5", "BatchMode=yes"}, "")
 	if err != nil {
-		t.Fatalf("ParseOptionStrings failed: %v", err)
+		t.Fatalf("ParseSessionOptions failed: %v", err)
 	}
 	adp := NewSSHAdapter(provider, WithSessionControlOverride("testnode", cliOpts))
 
@@ -903,25 +927,23 @@ Host 192.168.1.100
 	provider := config.NewProviderWithOpenSSHParser(cfg, parser)
 	adp := NewSSHAdapter(provider)
 
-	ctrl, err := adp.ResolveControl("testnode", SessionControlOptions{})
+	pol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: "testnode"})
 	if err != nil {
-		t.Fatalf("ResolveControl failed: %v", err)
+		t.Fatalf("Resolve failed: %v", err)
 	}
+	ctrl := pol.Control()
 	if ctrl == nil || ctrl.Master != ssh.ControlMasterAuto || ctrl.Path != "~/.ssh/cm-%C" {
 		t.Fatalf("expected ControlConfig from second concrete key 192.168.1.100, got %+v", ctrl)
 	}
-	opts, err := adp.ResolveSSHOptions("testnode", SessionControlOptions{})
-	if err != nil {
-		t.Fatalf("ResolveSSHOptions failed: %v", err)
-	}
+	opts := pol.Options()
 	if opts == nil || opts.Get(ssh.OptionConnectTimeout) != "15" {
 		t.Fatalf("expected ConnectTimeout=15 from first concrete key testnode, got %+v", opts)
 	}
 	if !opts.ImplicitTier4 || !ctrl.ImplicitTier4 {
-		t.Fatalf("expected ImplicitTier4=true on both ResolveSSHOptions and ResolveControl for pure Tier 4 config, got opts=%v ctrl=%v", opts.ImplicitTier4, ctrl.ImplicitTier4)
+		t.Fatalf("expected ImplicitTier4=true on both Options and Control for pure Tier 4 config, got opts=%v ctrl=%v", opts.ImplicitTier4, ctrl.ImplicitTier4)
 	}
 
-	// Direct SessionControlOptions.Options population is respected by ResolveControl
+	// Direct SessionControlOptions.Options population is respected by Resolve
 	directSession := SessionControlOptions{
 		Options: ssh.MustOptions(
 			ssh.OptionControlMaster, "yes",
@@ -929,16 +951,16 @@ Host 192.168.1.100
 			ssh.OptionControlPersist, "5m",
 		),
 	}
-	ctrlDirect, err := adp.ResolveControl("testnode", directSession)
+	ctrlDirect, err := resolveControlInTest(t, adp, "testnode", directSession)
 	if err != nil {
-		t.Fatalf("ResolveControl(directSession) failed: %v", err)
+		t.Fatalf("Resolve(directSession) failed: %v", err)
 	}
 	if ctrlDirect == nil || ctrlDirect.Master != ssh.ControlMasterYes || ctrlDirect.Path != "/tmp/direct-%C" || ctrlDirect.Persist != "5m" || ctrlDirect.ImplicitTier4 {
 		t.Fatalf("unexpected ctrlDirect: %+v", ctrlDirect)
 	}
 }
 
-func TestResolveControl_AllowReuseWithConfiguredAsk(t *testing.T) {
+func TestResolve_AllowReuseWithConfiguredAsk(t *testing.T) {
 	t2 := &ssh.ControlConfig{
 		Master:  ssh.ControlMasterAsk,
 		Path:    "~/.ssh/cm-%C",
@@ -948,9 +970,9 @@ func TestResolveControl_AllowReuseWithConfiguredAsk(t *testing.T) {
 	adp := NewSSHAdapter(provider)
 
 	// 1. No -S flag on CLI: AllowReuse is false.
-	ctrlDefault, err := adp.ResolveControl("testnode", SessionControlOptions{})
+	ctrlDefault, err := resolveControlInTest(t, adp, "testnode", SessionControlOptions{})
 	if err != nil {
-		t.Fatalf("ResolveControl(default) failed: %v", err)
+		t.Fatalf("Resolve(default) failed: %v", err)
 	}
 	if ctrlDefault == nil || ctrlDefault.Master != ssh.ControlMasterAsk || ctrlDefault.AllowReuse {
 		t.Fatalf("expected Master=ask and AllowReuse=false when -S is not passed, got %+v", ctrlDefault)
@@ -960,9 +982,9 @@ func TestResolveControl_AllowReuseWithConfiguredAsk(t *testing.T) {
 	var withS SessionControlOptions
 	withS.SetPath("/tmp/custom.sock")
 	withS.AllowReuse = true
-	ctrlWithS, err := adp.ResolveControl("testnode", withS)
+	ctrlWithS, err := resolveControlInTest(t, adp, "testnode", withS)
 	if err != nil {
-		t.Fatalf("ResolveControl(withS) failed: %v", err)
+		t.Fatalf("Resolve(withS) failed: %v", err)
 	}
 	if ctrlWithS == nil || ctrlWithS.Master != ssh.ControlMasterAsk || ctrlWithS.Path != "/tmp/custom.sock" || !ctrlWithS.AllowReuse {
 		t.Fatalf("expected Master=ask, Path=/tmp/custom.sock, AllowReuse=true when -S is passed alone, got %+v", ctrlWithS)
@@ -973,9 +995,9 @@ func TestResolveControl_AllowReuseWithConfiguredAsk(t *testing.T) {
 	withMandS.SetMaster(ssh.ControlMasterAsk)
 	withMandS.SetPath("/tmp/custom.sock")
 	withMandS.AllowReuse = true
-	ctrlWithMandS, err := adp.ResolveControl("testnode", withMandS)
+	ctrlWithMandS, err := resolveControlInTest(t, adp, "testnode", withMandS)
 	if err != nil {
-		t.Fatalf("ResolveControl(withMandS) failed: %v", err)
+		t.Fatalf("Resolve(withMandS) failed: %v", err)
 	}
 	if ctrlWithMandS == nil || ctrlWithMandS.AllowReuse {
 		t.Fatalf("expected AllowReuse=false when Master is explicitly set in SessionControlOptions, got %+v", ctrlWithMandS)
@@ -992,25 +1014,25 @@ func TestResolveControl_AllowReuseWithConfiguredAsk(t *testing.T) {
 	if wide.AllowReuse {
 		t.Fatalf("expected ConnectionWideOptions to strip AllowReuse, got %+v", wide)
 	}
-	jumpCtrl, err := adp.ResolveControl("testnode", wide)
+	jumpCtrl, err := resolveControlInTest(t, adp, "testnode", wide)
 	if err != nil {
-		t.Fatalf("ResolveControl(wide) failed: %v", err)
+		t.Fatalf("Resolve(wide) failed: %v", err)
 	}
 	if jumpCtrl == nil || jumpCtrl.AllowReuse {
 		t.Fatalf("expected jump hop resolved with ConnectionWideOptions to have AllowReuse=false, got %+v", jumpCtrl)
 	}
 }
 
-func TestResolveControl_PersistNoWithoutControlPathAllowed(t *testing.T) {
+func TestResolve_PersistNoWithoutControlPathAllowed(t *testing.T) {
 	provider := setupTestProvider(t, nil, nil, "")
 	adp := NewSSHAdapter(provider)
 
 	for _, rawPersist := range []string{"no", "false"} {
 		var t1 SessionControlOptions
 		t1.SetPersist(rawPersist)
-		res, err := adp.ResolveControl("testnode", t1)
+		res, err := resolveControlInTest(t, adp, "testnode", t1)
 		if err != nil {
-			t.Fatalf("ResolveControl(ControlPersist=%q without ControlPath) failed: %v", rawPersist, err)
+			t.Fatalf("Resolve(ControlPersist=%q without ControlPath) failed: %v", rawPersist, err)
 		}
 		if res == nil || res.Master != ssh.ControlMasterNo || res.Persist != rawPersist || res.IsEnabled() {
 			t.Fatalf("unexpected ControlConfig for ControlPersist=%q: %+v", rawPersist, res)

@@ -229,12 +229,12 @@ func TestRound8_P2_2_P3_1_OptionsEqualDeleteIsNoneValueAndValidateControlPath(t 
 	if resolved, err := ctrl.ResolvePath(Environment{}, TargetContext{}); err != nil || resolved != "none" {
 		t.Fatalf("ControlConfig.ResolvePath(NONE) = (%q, %v), want (\"none\", nil)", resolved, err)
 	}
-	eff, err := EffectiveOptions(
+	eff, err := MergeEffectiveOptions(
 		OptionsFromControl(&ControlConfig{Path: "NONE"}),
 		OptionsFromControl(&ControlConfig{Master: ControlMasterAuto, Path: "/tmp/m.sock", Persist: "10m"}),
 	)
 	if err != nil {
-		t.Fatalf("EffectiveOptions failed: %v", err)
+		t.Fatalf("MergeEffectiveOptions failed: %v", err)
 	}
 	merged, err := eff.ValidatedControlConfig()
 	if err != nil {

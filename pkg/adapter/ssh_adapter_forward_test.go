@@ -61,8 +61,8 @@ func TestSplitOptionKeyValue(t *testing.T) {
 	}
 }
 
-func TestParseOptionStrings_MultiValueAndForwardOptions(t *testing.T) {
-	opts, err := ParseOptionStrings([]string{
+func TestParseSessionOptions_MultiValueAndForwardOptions(t *testing.T) {
+	opts, err := ParseSessionOptions([]string{
 		"LocalForward=8080 127.0.0.1:80",
 		"LocalForward 9090 remote:90",
 		"RemoteForward=8081 127.0.0.1:81",
@@ -80,9 +80,9 @@ func TestParseOptionStrings_MultiValueAndForwardOptions(t *testing.T) {
 		"ForkAfterAuthentication yes",
 		"StdinNull yes",
 		"SessionType none",
-	})
+	}, "")
 	if err != nil {
-		t.Fatalf("ParseOptionStrings failed: %v", err)
+		t.Fatalf("ParseSessionOptions failed: %v", err)
 	}
 
 	sshOpts := opts.ToSSHOptions()
@@ -97,8 +97,8 @@ func TestParseOptionStrings_MultiValueAndForwardOptions(t *testing.T) {
 		"ControlPath=",
 		"NoSuchOption=foo",
 	} {
-		if _, err := ParseOptionStrings([]string{bad}); err == nil {
-			t.Errorf("ParseOptionStrings(%q) expected error, got nil", bad)
+		if _, err := ParseSessionOptions([]string{bad}, ""); err == nil {
+			t.Errorf("ParseSessionOptions(%q) expected error, got nil", bad)
 		}
 	}
 }
@@ -154,38 +154,41 @@ func assertParsedStreamLocalAndSessionOptions(t *testing.T, sshOpts *ssh.Options
 	}
 }
 
-func TestResolveSSHOptions_Tier4Filtering_ManagedVsVirtual(t *testing.T) {
+func TestResolve_Tier4Filtering_ManagedVsVirtual(t *testing.T) {
 	adp := newTier4FilteringTestAdapter(t)
 
 	// 1. Managed node "srv": Tier 4 OptionClassForward and OptionClassSession must be filtered out
-	managedOpts, err := adp.ResolveSSHOptions("srv", SessionControlOptions{})
+	managedPol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: "srv"})
 	if err != nil {
-		t.Fatalf("ResolveSSHOptions(srv) failed: %v", err)
+		t.Fatalf("Resolve(srv) failed: %v", err)
 	}
+	managedOpts := managedPol.Options()
 	if managedOpts == nil {
 		t.Fatalf("expected non-nil managedOpts")
 	}
 	assertManagedTier4Filtered(t, managedOpts)
 
 	// 2. Virtual node "openssh:srv": Tier 4 OptionClassForward and OptionClassSession are fully preserved
-	virtualOpts, err := adp.ResolveSSHOptions(config.OpenSSHNodePrefix+"srv", SessionControlOptions{})
+	virtualPol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: config.OpenSSHNodePrefix + "srv"})
 	if err != nil {
-		t.Fatalf("ResolveSSHOptions(openssh:srv) failed: %v", err)
+		t.Fatalf("Resolve(openssh:srv) failed: %v", err)
 	}
+	virtualOpts := virtualPol.Options()
 	if virtualOpts == nil {
 		t.Fatalf("expected non-nil virtualOpts")
 	}
 	assertVirtualTier4Preserved(t, virtualOpts)
 
 	// 3. Managed node with Tier 1 CLI overrides: Tier 1 can explicitly set forwards
-	cliOpts, err := ParseOptionStrings([]string{"LocalForward 9999 127.0.0.1:99"})
+	cliOpts, err := ParseSessionOptions([]string{"LocalForward 9999 127.0.0.1:99"}, "")
 	if err != nil {
-		t.Fatalf("ParseOptionStrings failed: %v", err)
+		t.Fatalf("ParseSessionOptions failed: %v", err)
 	}
-	managedWithCLIOpts, err := adp.ResolveSSHOptions("srv", cliOpts)
+	managedWithCLIPol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: "srv", SessionControl: &cliOpts})
 	if err != nil {
-		t.Fatalf("ResolveSSHOptions with CLI opts failed: %v", err)
+		t.Fatalf("Resolve with CLI opts failed: %v", err)
 	}
+	managedWithCLIOpts := managedWithCLIPol.Options()
 	if len(managedWithCLIOpts.LocalForwards()) != 1 || managedWithCLIOpts.LocalForwards()[0] != "9999 127.0.0.1:99" {
 		t.Errorf("expected Tier 1 LocalForward on managed node, got %v", managedWithCLIOpts.LocalForwards())
 	}
@@ -375,7 +378,7 @@ func assertVirtualTier4SessionOptions(t *testing.T, virtualOpts *ssh.Options) {
 	}
 }
 
-func TestResolveSSHOptions_WithSessionAndForwardOptionsDisabled(t *testing.T) {
+func TestResolve_WithSessionAndForwardOptionsDisabled(t *testing.T) {
 	openSSHContent := `
 Host srv
     HostName 192.168.1.100
@@ -404,21 +407,22 @@ Host srv
 		WithSessionAndForwardOptions(false),
 	)
 
-	cliOpts, err := ParseOptionStrings([]string{
+	cliOpts, err := ParseSessionOptions([]string{
 		"SendEnv=LC_ALL",
 		"SetEnv=BAZ=qux",
 		"RemoteCommand=ls",
 		"EscapeChar=~",
 		"LocalForward=9999 127.0.0.1:99",
-	})
+	}, "")
 	if err != nil {
-		t.Fatalf("ParseOptionStrings failed: %v", err)
+		t.Fatalf("ParseSessionOptions failed: %v", err)
 	}
 
-	opts, err := adp.ResolveSSHOptions(config.OpenSSHNodePrefix+"srv", cliOpts)
+	pol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: config.OpenSSHNodePrefix + "srv", SessionControl: &cliOpts})
 	if err != nil {
-		t.Fatalf("ResolveSSHOptions() error = %v", err)
+		t.Fatalf("Resolve() error = %v", err)
 	}
+	opts := pol.Options()
 	if opts == nil || opts.Get(ssh.OptionConnectTimeout) != "15" {
 		t.Fatalf("expected transport option ConnectTimeout=15 preserved, got %+v", opts)
 	}
@@ -428,7 +432,7 @@ Host srv
 	}
 }
 
-func TestResolveSSHOptions_NonInteractiveStripsForwardAgent(t *testing.T) {
+func TestResolve_NonInteractiveStripsForwardAgent(t *testing.T) {
 	openSSHContent := `
 Host play-target
     HostName 192.168.1.200
@@ -443,27 +447,28 @@ Host play-target
 		t.Fatalf("parse failed: %v", err)
 	}
 	provider := config.NewProviderWithOpenSSHParser(nil, parser)
-	cliOpts, err := ParseOptionStrings([]string{"ForwardAgent=yes"})
+	cliOpts, err := ParseSessionOptions([]string{"ForwardAgent=yes"}, "")
 	if err != nil {
-		t.Fatalf("ParseOptionStrings failed: %v", err)
+		t.Fatalf("ParseSessionOptions failed: %v", err)
 	}
 
 	// 1. Default NewNonInteractiveSSHAdapter strips ForwardAgent
 	adp := NewNonInteractiveSSHAdapter(provider)
-	opts, err := adp.ResolveSSHOptions(config.OpenSSHNodePrefix+"play-target", cliOpts)
+	pol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: config.OpenSSHNodePrefix + "play-target", SessionControl: &cliOpts})
 	if err != nil {
-		t.Fatalf("ResolveSSHOptions() error = %v", err)
+		t.Fatalf("Resolve() error = %v", err)
 	}
-	if opts.ForwardAgent() != "" {
-		t.Fatalf("expected NewNonInteractiveSSHAdapter to strip ForwardAgent, got %q", opts.ForwardAgent())
+	if pol.Options().ForwardAgent() != "" {
+		t.Fatalf("expected NewNonInteractiveSSHAdapter to strip ForwardAgent, got %q", pol.Options().ForwardAgent())
 	}
 
 	// 2. Playbook adapter (WithNonInteractive(true), WithForwardOptions(false)) strips ForwardAgent and LocalForward while keeping SendEnv
 	playAdp := NewNonInteractiveSSHAdapter(provider, WithForwardOptions(false))
-	playOpts, err := playAdp.ResolveSSHOptions(config.OpenSSHNodePrefix+"play-target", cliOpts)
+	playPol, err := playAdp.Resolve(t.Context(), ResolveRequest{NodeID: config.OpenSSHNodePrefix + "play-target", SessionControl: &cliOpts})
 	if err != nil {
-		t.Fatalf("ResolveSSHOptions() error = %v", err)
+		t.Fatalf("Resolve() error = %v", err)
 	}
+	playOpts := playPol.Options()
 	if playOpts.ForwardAgent() != "" || len(playOpts.LocalForwards()) != 0 {
 		t.Fatalf("expected play adapter to strip ForwardAgent and LocalForward, got forward=%q local=%v",
 			playOpts.ForwardAgent(), playOpts.LocalForwards())
@@ -473,7 +478,7 @@ Host play-target
 	}
 }
 
-func TestResolveSSHOptions_Phase4TrustGateAndHashKnownHosts(t *testing.T) {
+func TestResolve_Phase4TrustGateAndHashKnownHosts(t *testing.T) {
 	openSSHContent := `
 Host srv-hash-yes
     HostName 192.168.1.210
@@ -508,10 +513,11 @@ Host srv-hash-no
 
 	// 1. Managed node inherits one-way HashKnownHosts=yes from Tier 4, never GlobalKnownHostsFile or VerifyHostKeyDNS
 	adp := NewSSHAdapter(provider)
-	managedOpts, err := adp.ResolveSSHOptions("srv-hash-yes", SessionControlOptions{})
+	managedPol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: "srv-hash-yes"})
 	if err != nil {
-		t.Fatalf("ResolveSSHOptions(srv-hash-yes) error = %v", err)
+		t.Fatalf("Resolve(srv-hash-yes) error = %v", err)
 	}
+	managedOpts := managedPol.Options()
 	if !managedOpts.HashKnownHosts() {
 		t.Fatalf("expected one-way HashKnownHosts=yes inherited on managed node")
 	}
@@ -520,11 +526,11 @@ Host srv-hash-no
 	}
 
 	// 2. Tier 4 HashKnownHosts=no never downgrades Tier 2 HashKnownHosts=yes
-	managedNoDowngrade, err := adp.ResolveSSHOptions("srv-hash-no", SessionControlOptions{})
+	managedNoDowngradePol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: "srv-hash-no"})
 	if err != nil {
-		t.Fatalf("ResolveSSHOptions(srv-hash-no) error = %v", err)
+		t.Fatalf("Resolve(srv-hash-no) error = %v", err)
 	}
-	if !managedNoDowngrade.HashKnownHosts() {
+	if !managedNoDowngradePol.Options().HashKnownHosts() {
 		t.Fatalf("expected Tier 4 HashKnownHosts=no NOT to downgrade Tier 2 HashKnownHosts=yes")
 	}
 
@@ -534,10 +540,11 @@ Host srv-hash-no
 
 func assertPhase4VirtualAndMCPTrustGate(t *testing.T, adp *SSHAdapter, provider config.ConfigProvider) {
 	t.Helper()
-	virtualOpts, err := adp.ResolveSSHOptions(config.OpenSSHNodePrefix+"srv-hash-yes", SessionControlOptions{})
+	virtualPol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: config.OpenSSHNodePrefix + "srv-hash-yes"})
 	if err != nil {
-		t.Fatalf("ResolveSSHOptions(openssh:srv-hash-yes) error = %v", err)
+		t.Fatalf("Resolve(openssh:srv-hash-yes) error = %v", err)
 	}
+	virtualOpts := virtualPol.Options()
 	if !virtualOpts.HashKnownHosts() || virtualOpts.GlobalKnownHostsFile() != "" || virtualOpts.VerifyHostKeyDNS() != "" {
 		t.Fatalf("Gate 1 mismatch on virtual node: got hash=%v global=%q dns=%q",
 			virtualOpts.HashKnownHosts(), virtualOpts.GlobalKnownHostsFile(), virtualOpts.VerifyHostKeyDNS())
@@ -545,28 +552,29 @@ func assertPhase4VirtualAndMCPTrustGate(t *testing.T, adp *SSHAdapter, provider 
 
 	// 4. Tier 1 CLI -o GlobalKnownHostsFile / VerifyHostKeyDNS is preserved for CLI,
 	// and stripped by Gate 4 MCP (WithHostTrustOverrides(false)).
-	cliTrustOpts, err := ParseOptionStrings([]string{
+	cliTrustOpts, err := ParseSessionOptions([]string{
 		"GlobalKnownHostsFile=/etc/ssh/custom_known_hosts",
 		"VerifyHostKeyDNS=yes",
-	})
+	}, "")
 	if err != nil {
-		t.Fatalf("ParseOptionStrings() error = %v", err)
+		t.Fatalf("ParseSessionOptions() error = %v", err)
 	}
-	cliResolved, err := adp.ResolveSSHOptions(config.OpenSSHNodePrefix+"srv-hash-yes", cliTrustOpts)
+	cliResolvedPol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: config.OpenSSHNodePrefix + "srv-hash-yes", SessionControl: &cliTrustOpts})
 	if err != nil {
-		t.Fatalf("ResolveSSHOptions(cli) error = %v", err)
+		t.Fatalf("Resolve(cli) error = %v", err)
 	}
+	cliResolved := cliResolvedPol.Options()
 	if cliResolved.GlobalKnownHostsFile() != "/etc/ssh/custom_known_hosts" || cliResolved.VerifyHostKeyDNS() != ssh.VerifyHostKeyDNSYes {
 		t.Fatalf("expected Tier 1 trust options preserved for CLI, got global=%q dns=%q",
 			cliResolved.GlobalKnownHostsFile(), cliResolved.VerifyHostKeyDNS())
 	}
 
 	mcpAdp := NewNonInteractiveSSHAdapter(provider, WithHostTrustOverrides(false))
-	mcpOpts, err := mcpAdp.ResolveSSHOptions(config.OpenSSHNodePrefix+"srv-hash-yes", cliTrustOpts)
+	mcpPol, err := mcpAdp.Resolve(t.Context(), ResolveRequest{NodeID: config.OpenSSHNodePrefix + "srv-hash-yes", SessionControl: &cliTrustOpts})
 	if err != nil {
-		t.Fatalf("ResolveSSHOptions(mcp) error = %v", err)
+		t.Fatalf("Resolve(mcp) error = %v", err)
 	}
-	if mcpOpts != nil && (mcpOpts.HashKnownHosts() || mcpOpts.GlobalKnownHostsFile() != "" || mcpOpts.VerifyHostKeyDNS() != "") {
+	if mcpOpts := mcpPol.Options(); mcpOpts != nil && (mcpOpts.HashKnownHosts() || mcpOpts.GlobalKnownHostsFile() != "" || mcpOpts.VerifyHostKeyDNS() != "") {
 		t.Fatalf("Gate 4 violation: MCP WithHostTrustOverrides(false) leaked trust options: %+v", mcpOpts)
 	}
 }

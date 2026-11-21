@@ -149,7 +149,7 @@ const (
 )
 
 // OptionMergeMode declares how an option resolves within a single CLI or
-// ssh_config layer and across priority layers in MergeOptionLayers.
+// ssh_config layer and across priority layers in MergeOptions.
 type OptionMergeMode uint8
 
 const (
@@ -162,7 +162,7 @@ const (
 	// identical entries (LocalForward, RemoteForward, DynamicForward).
 	OptionMergeAppendDedup
 	// OptionMergeNoneTerminated appends normalized entries in order, deduplicating
-	// identical entries and truncating accumulation at "none" during MergeOptionLayers
+	// identical entries and truncating accumulation at "none" during MergeOptions
 	// (IdentityFile, CertificateFile).
 	OptionMergeNoneTerminated
 	// OptionMergeOrderedEnv appends all directives within a layer and merges layers
@@ -191,7 +191,7 @@ func (m OptionMergeMode) IsOrderedOverride() bool {
 }
 
 // IsNoneTerminated reports whether encountering "none" terminates accumulation
-// of subsequent and lower-priority entries during MergeOptionLayers.
+// of subsequent and lower-priority entries during MergeOptions.
 func (m OptionMergeMode) IsNoneTerminated() bool {
 	return m == OptionMergeNoneTerminated
 }
@@ -276,7 +276,7 @@ type OptionSpec struct {
 	AllowList             bool               // Whether YAML sequence values are accepted and joined with ","
 	MultiValue            bool               // Whether multiple directives accumulate (matches MergeMode.IsMultiValue())
 	SupportedTokens       func() []string    // Returns supported tokens for AllowList options (auth methods or algorithms)
-	FailClosedTokens      []string           // Recognized unimplemented tokens retained by FilterSupportedListValue so callers fail closed
+	FailClosedTokens      []string           // Recognized unimplemented tokens retained by ParseOption so callers fail closed
 	Normalize             func(raw string) (string, error)
 }
 
@@ -1620,59 +1620,6 @@ func supportedListTokens(canonicalKey string) (supported, failClosed []string, o
 	return spec.SupportedTokens(), slices.Clone(spec.FailClosedTokens), true
 }
 
-// FilterSupportedListValue filters a comma-separated option value (for algorithm lists
-// or PreferredAuthentications) down to tokens supported by this implementation.
-// Used when leniently parsing ~/.ssh/config so OpenSSH-only algorithms (such as
-// sntrup761x25519-sha512@openssh.com or umac-128-etm@openssh.com) do not reject the
-// remaining supported algorithms.
-//
-// For PreferredAuthentications, implemented methods ("publickey", "keyboard-interactive",
-// "password") are kept when any are present; if only recognized unimplemented OpenSSH
-// methods ("gssapi-with-mic", "hostbased") are present, those tokens are retained so
-// authentication fails closed instead of falling back to defaults.
-func FilterSupportedListValue(canonicalKey, raw string) string {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return ""
-	}
-	spec, found := LookupOptionSpec(canonicalKey)
-	if !found || spec.SupportedTokens == nil {
-		return raw
-	}
-	supported := spec.SupportedTokens()
-	failClosedAuth := spec.FailClosedTokens
-
-	var prefix string
-	body := trimmed
-	if spec.CanonicalKey != OptionPreferredAuthentications && (body[0] == '+' || body[0] == '-' || body[0] == '^') {
-		prefix = body[:1]
-		body = strings.TrimSpace(body[1:])
-	}
-	var kept, keptFailClosed []string
-	for part := range strings.SplitSeq(body, ",") {
-		tok := strings.TrimSpace(part)
-		if spec.CanonicalKey == OptionPreferredAuthentications {
-			tok = strings.ToLower(tok)
-		}
-		if tok == "" {
-			continue
-		}
-		if (prefix == "-" && isValidAlgorithmName(tok)) || slices.Contains(supported, tok) {
-			if !slices.Contains(kept, tok) {
-				kept = append(kept, tok)
-			}
-			continue
-		}
-		if slices.Contains(failClosedAuth, tok) && !slices.Contains(keptFailClosed, tok) {
-			keptFailClosed = append(keptFailClosed, tok)
-		}
-	}
-	if len(kept) == 0 {
-		return strings.Join(keptFailClosed, ",")
-	}
-	return prefix + strings.Join(kept, ",")
-}
-
 // ResolveAlgorithmList resolves an OpenSSH algorithm specification (explicit list,
 // +append, -remove, or ^prepend) against the provided default list.
 func ResolveAlgorithmList(spec string, defaults []string) ([]string, error) {
@@ -1986,9 +1933,10 @@ func (o *Options) setPathList(canonicalKey string, pl PathList) {
 		o.Delete(canonicalKey)
 		return
 	}
-	if canonicalKey == OptionIdentityFile {
+	switch canonicalKey {
+	case OptionIdentityFile:
 		o.identityFiles = pl.clone()
-	} else if canonicalKey == OptionCertificateFile {
+	case OptionCertificateFile:
 		o.certificateFiles = pl.clone()
 	}
 	if o.values == nil {
@@ -2889,11 +2837,6 @@ func MergeOptions(layers ...*Options) *Options {
 	return res
 }
 
-// MergeOptionLayers is a transitional alias removed in the caller migration commit.
-func MergeOptionLayers(layers ...*Options) *Options {
-	return MergeOptions(layers...)
-}
-
 func mergeOptionLayerValues(res, layer *Options) {
 	for k, v := range layer.values {
 		spec, ok := LookupOptionSpec(k)
@@ -2960,17 +2903,13 @@ func finalizeEffectiveOptions(opts *Options) *Options {
 // Special multiplexing rule: if the effective control_path is "none", multiplexing is disabled
 // (control_master="no", control_persist="").
 func ResolveOptions(child, parent *Options) (*Options, error) {
-	return finalizeEffectiveOptions(MergeOptionLayers(child, parent)), nil
-}
-
-// EffectiveOptions resolves a hierarchy of Options from highest priority to lowest priority.
-func EffectiveOptions(layers ...*Options) (*Options, error) {
-	return finalizeEffectiveOptions(MergeOptionLayers(layers...)), nil
+	return finalizeEffectiveOptions(MergeOptions(child, parent)), nil
 }
 
 // MergeEffectiveOptions resolves a hierarchy of Options from highest priority to
-// lowest priority via EffectiveOptions and validates the resulting effective
-// option set (including cross-field constraints) via ValidateEffective.
+// lowest priority via MergeOptions, finalizes ControlPath=none semantics, and
+// validates the resulting effective option set (including cross-field
+// constraints) via ValidateEffective.
 func MergeEffectiveOptions(layers ...*Options) (*Options, error) {
 	for _, layer := range layers {
 		if layer.IsEmpty() || layer.ImplicitTier4 {
@@ -2980,10 +2919,7 @@ func MergeEffectiveOptions(layers ...*Options) (*Options, error) {
 			return nil, err
 		}
 	}
-	eff, err := EffectiveOptions(layers...)
-	if err != nil {
-		return nil, err
-	}
+	eff := finalizeEffectiveOptions(MergeOptions(layers...))
 	if eff.IsEmpty() {
 		return nil, nil
 	}

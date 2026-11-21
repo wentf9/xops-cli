@@ -933,10 +933,7 @@ func TestPortForward_ToSessionControlOptions_ProjectsFlagsOverConflictingOptions
 	if err != nil {
 		t.Fatalf("toSessionControlOptions failed: %v", err)
 	}
-	eff, err := ssh.EffectiveOptions(sessionOpts.ToSSHOptions())
-	if err != nil {
-		t.Fatalf("EffectiveOptions failed: %v", err)
-	}
+	eff := ssh.MergeOptions(sessionOpts.ToSSHOptions())
 	if fork, ok := eff.ForkAfterAuthentication(); !ok || !fork {
 		t.Errorf("expected ForkAfterAuthentication == true, got %v (ok=%v)", fork, ok)
 	}
@@ -962,10 +959,7 @@ func TestPortForward_ToSessionControlOptions_ProjectsFlagsOverConflictingOptions
 	if err != nil {
 		t.Fatalf("toSessionControlOptions failed: %v", err)
 	}
-	effDefault, err := ssh.EffectiveOptions(sessionOptsDefault.ToSSHOptions())
-	if err != nil {
-		t.Fatalf("EffectiveOptions failed: %v", err)
-	}
+	effDefault := ssh.MergeOptions(sessionOptsDefault.ToSSHOptions())
 	if fork, ok := effDefault.ForkAfterAuthentication(); !ok || fork {
 		t.Errorf("expected ForkAfterAuthentication == false, got %v (ok=%v)", fork, ok)
 	}

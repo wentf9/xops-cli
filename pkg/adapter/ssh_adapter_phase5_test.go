@@ -43,7 +43,7 @@ Host passive-local
 
 	t.Run("non-interactive adapter fails closed on active ProxyCommand", func(t *testing.T) {
 		nonInt := NewNonInteractiveSSHAdapter(provider)
-		_, err := nonInt.ResolveSSHOptions(config.OpenSSHNodePrefix+"edge", SessionControlOptions{})
+		_, err := nonInt.Resolve(t.Context(), ResolveRequest{NodeID: config.OpenSSHNodePrefix + "edge"})
 		if !errors.Is(err, ErrLocalExecutionDisabled) {
 			t.Fatalf("expected ErrLocalExecutionDisabled, got %v", err)
 		}
@@ -51,32 +51,33 @@ Host passive-local
 
 	t.Run("non-interactive adapter strips LocalCommand/PermitLocalCommand and allows ProxyCommand=none", func(t *testing.T) {
 		nonInt := NewNonInteractiveSSHAdapter(provider)
-		opts, err := nonInt.ResolveSSHOptions(config.OpenSSHNodePrefix+"passive-local", SessionControlOptions{})
+		pol, err := nonInt.Resolve(t.Context(), ResolveRequest{NodeID: config.OpenSSHNodePrefix + "passive-local"})
 		if err != nil {
-			t.Fatalf("ResolveSSHOptions(passive-local) unexpected error = %v", err)
+			t.Fatalf("Resolve(passive-local) unexpected error = %v", err)
 		}
-		if opts != nil && (opts.LocalCommand() != "" || opts.PermitLocalCommand() || opts.ActiveProxyCommand() != "") {
+		if opts := pol.Options(); opts != nil && (opts.LocalCommand() != "" || opts.PermitLocalCommand() || opts.ActiveProxyCommand() != "") {
 			t.Fatalf("expected local_exec options stripped when localExecution=false, got %+v", opts)
 		}
 	})
 
 	t.Run("managed XOps node never inherits local_exec from Tier 4", func(t *testing.T) {
 		fg := NewSSHAdapter(provider, WithLocalExecution(true))
-		opts, err := fg.ResolveSSHOptions("edge", SessionControlOptions{})
+		pol, err := fg.Resolve(t.Context(), ResolveRequest{NodeID: "edge"})
 		if err != nil {
-			t.Fatalf("ResolveSSHOptions(managed edge) error = %v", err)
+			t.Fatalf("Resolve(managed edge) error = %v", err)
 		}
-		if opts != nil && (opts.ActiveProxyCommand() != "" || opts.LocalCommand() != "" || opts.PermitLocalCommand()) {
+		if opts := pol.Options(); opts != nil && (opts.ActiveProxyCommand() != "" || opts.LocalCommand() != "" || opts.PermitLocalCommand()) {
 			t.Fatalf("Gate 2 violation: managed node inherited Tier 4 local_exec: %+v", opts)
 		}
 	})
 
 	t.Run("foreground adapter with WithLocalExecution(true) resolves virtual node local_exec", func(t *testing.T) {
 		fg := NewSSHAdapter(provider, WithLocalExecution(true))
-		opts, err := fg.ResolveSSHOptions(config.OpenSSHNodePrefix+"edge", SessionControlOptions{})
+		pol, err := fg.Resolve(t.Context(), ResolveRequest{NodeID: config.OpenSSHNodePrefix + "edge"})
 		if err != nil {
-			t.Fatalf("ResolveSSHOptions(openssh:edge) error = %v", err)
+			t.Fatalf("Resolve(openssh:edge) error = %v", err)
 		}
+		opts := pol.Options()
 		if opts == nil || opts.ActiveProxyCommand() != "nc -X 5 -x 127.0.0.1:1080 %h %p" {
 			t.Fatalf("expected ProxyCommand resolved, got %+v", opts)
 		}
@@ -87,7 +88,7 @@ Host passive-local
 
 	t.Run("WithLocalExecution(true)+WithNonInteractive(true) fails closed with ErrLocalExecutionDisabled", func(t *testing.T) {
 		batchAdp := NewSSHAdapter(provider, WithLocalExecution(true), WithNonInteractive(true))
-		_, err := batchAdp.ResolveSSHOptions(config.OpenSSHNodePrefix+"edge", SessionControlOptions{})
+		_, err := batchAdp.Resolve(t.Context(), ResolveRequest{NodeID: config.OpenSSHNodePrefix + "edge"})
 		if !errors.Is(err, ErrLocalExecutionDisabled) {
 			t.Fatalf("expected ErrLocalExecutionDisabled when nonInteractive=true, got %v", err)
 		}
@@ -147,9 +148,9 @@ Host v-cmd
 	})
 
 	t.Run("Tier 1 -o ProxyCommand clears Tier 2 ProxyJump", func(t *testing.T) {
-		cliOpts, err := ParseOptionStrings([]string{"ProxyCommand=ssh -W %h:%p cli-jump"})
+		cliOpts, err := ParseSessionOptions([]string{"ProxyCommand=ssh -W %h:%p cli-jump"}, "")
 		if err != nil {
-			t.Fatalf("ParseOptionStrings() error = %v", err)
+			t.Fatalf("ParseSessionOptions() error = %v", err)
 		}
 		adp := NewSSHAdapter(provider, WithLocalExecution(true), WithSessionControlOverride("m-jump", cliOpts))
 		clientCfg, err := adp.GetConfig("m-jump")
@@ -233,39 +234,39 @@ Host v-jump
 	})
 
 	t.Run("Tier 1 -J bastion clears Tier 1 -o ProxyCommand on merged options", func(t *testing.T) {
-		cliOpts, err := ParseOptionStrings([]string{"ProxyCommand=nc %h %p"})
+		cliOpts, err := ParseSessionOptions([]string{"ProxyCommand=nc %h %p"}, "")
 		if err != nil {
-			t.Fatalf("ParseOptionStrings() error = %v", err)
+			t.Fatalf("ParseSessionOptions() error = %v", err)
 		}
 		adp := NewSSHAdapter(provider, WithLocalExecution(true),
 			WithSessionAuthOverride("m-cmd", SessionAuth{ProxyJump: "bastion"}),
 			WithSessionControlOverride("m-cmd", cliOpts),
 		)
-		opts, err := adp.ResolveSSHOptions("m-cmd", cliOpts)
+		pol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: "m-cmd", SessionControl: &cliOpts})
 		if err != nil {
-			t.Fatalf("ResolveSSHOptions() error = %v", err)
+			t.Fatalf("Resolve() error = %v", err)
 		}
-		if opts != nil && opts.ActiveProxyCommand() != "" {
+		if opts := pol.Options(); opts != nil && opts.ActiveProxyCommand() != "" {
 			t.Fatalf("expected Tier 1 -J bastion to clear ActiveProxyCommand, got %q", opts.ActiveProxyCommand())
 		}
 	})
 
-	t.Run("Tier 1 -o ProxyCommand=none preserves Tier 2 ProxyJump", func(t *testing.T) {
-		cliOpts, err := ParseOptionStrings([]string{"ProxyCommand=none"})
+	t.Run("Tier 1 -o ProxyCommand=none disables Tier 2 ProxyJump (OpenSSH semantics)", func(t *testing.T) {
+		cliOpts, err := ParseSessionOptions([]string{"ProxyCommand=none"}, "")
 		if err != nil {
-			t.Fatalf("ParseOptionStrings() error = %v", err)
+			t.Fatalf("ParseSessionOptions() error = %v", err)
 		}
 		adp := NewSSHAdapter(provider, WithLocalExecution(true), WithSessionControlOverride("m-jump", cliOpts))
 		clientCfg, err := adp.GetConfig("m-jump")
 		if err != nil {
 			t.Fatalf("GetConfig() error = %v", err)
 		}
-		if clientCfg.ProxyJump != "bastion" {
-			t.Fatalf("expected -o ProxyCommand=none to preserve ProxyJump=bastion, got %q", clientCfg.ProxyJump)
+		if clientCfg.ProxyJump != "" {
+			t.Fatalf("expected -o ProxyCommand=none to disable Tier 2 ProxyJump, got %q", clientCfg.ProxyJump)
 		}
 	})
 
-	t.Run("Tier 3 ProxyCommand=none preserves Tier 4 ProxyJump", func(t *testing.T) {
+	t.Run("Tier 3 ProxyCommand=none disables Tier 4 ProxyJump (OpenSSH semantics)", func(t *testing.T) {
 		cfgNone := &config.Configuration{
 			Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
 			Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
@@ -280,8 +281,8 @@ Host v-jump
 		if err != nil {
 			t.Fatalf("GetConfig() error = %v", err)
 		}
-		if clientCfg.ProxyJump != config.OpenSSHNodePrefix+"bastion" {
-			t.Fatalf("expected Tier 3 ProxyCommand=none to preserve Tier 4 ProxyJump, got %q", clientCfg.ProxyJump)
+		if clientCfg.ProxyJump != "" {
+			t.Fatalf("expected Tier 3 ProxyCommand=none to disable Tier 4 ProxyJump, got %q", clientCfg.ProxyJump)
 		}
 	})
 }

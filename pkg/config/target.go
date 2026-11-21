@@ -1637,9 +1637,7 @@ func (r *Repository) resolveCandidateAddressFallback(cfg *Configuration, selecto
 			firstUser = user
 			initialized = true
 		} else {
-			firstEp, fErr := ssh.NewEndpoint(firstAddr, int(firstPort))
-			curEp, cErr := ssh.NewEndpoint(clean, int(port))
-			if fErr != nil || cErr != nil || !firstEp.HostEqual(curEp) {
+			if !endpointHostsMatch(firstAddr, firstPort, clean, port) {
 				addrConsistent = false
 				break
 			}
@@ -1688,6 +1686,12 @@ func (r *Repository) resolveCandidateAddressFallback(cfg *Configuration, selecto
 		AmbiguousDefaultUser: !target.HasUser && !userConsistent,
 		AmbiguousCandidates:  slices.Clone(candidates),
 	}, nil
+}
+
+func endpointHostsMatch(addrA string, portA uint16, addrB string, portB uint16) bool {
+	epA, errA := ssh.NewEndpoint(addrA, int(portA))
+	epB, errB := ssh.NewEndpoint(addrB, int(portB))
+	return errA == nil && errB == nil && epA.HostEqual(epB)
 }
 
 func (r *Repository) resolveLookupCandidates(cfg *Configuration, selector string, candidates []string, target ConnectionTarget) (canonicalTargetInfo, error) {

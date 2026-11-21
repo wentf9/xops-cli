@@ -139,12 +139,13 @@ func verifyDisambiguatedRoleB(t *testing.T, adp *SSHAdapter, nodeID, extraKey, k
 	if err != nil {
 		t.Fatalf("GetConfig(role-b): %v", err)
 	}
-	optsB, err := adp.ResolveSSHOptions(nodeID, SessionControlOptions{})
+	polB, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: nodeID})
 	if err != nil {
-		t.Fatalf("ResolveSSHOptions(role-b): %v", err)
+		t.Fatalf("Resolve(role-b): %v", err)
 	}
+	optsB := polB.Options()
 	if optsB == nil {
-		t.Fatalf("expected non-nil ResolveSSHOptions for role-b")
+		t.Fatalf("expected non-nil Resolve options for role-b")
 	}
 	if got := optsB.Get(ssh.OptionCiphers); got != "chacha20-poly1305@openssh.com" {
 		t.Fatalf("role-b Ciphers = %q, want chacha20-poly1305@openssh.com", got)

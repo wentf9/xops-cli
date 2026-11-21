@@ -78,9 +78,9 @@ Host virtual-host
 	provider := config.NewProviderWithOpenSSHParser(cfg, openSSHParser)
 
 	t.Run("managed node priority: CLI -i -> CLI -o IdentityFile -> managed node key (no Tier 4 IdentityFile)", func(t *testing.T) {
-		ctrlOpts, err := ParseOptionStrings([]string{"IdentityFile=/tmp/cli_opt_key"})
+		ctrlOpts, err := ParseSessionOptions([]string{"IdentityFile=/tmp/cli_opt_key"}, "")
 		if err != nil {
-			t.Fatalf("ParseOptionStrings failed: %v", err)
+			t.Fatalf("ParseSessionOptions failed: %v", err)
 		}
 		adp := NewSSHAdapter(provider,
 			WithSessionAuthOverride("managed-node", SessionAuth{
@@ -100,9 +100,9 @@ Host virtual-host
 	})
 
 	t.Run("openssh virtual node priority: CLI -i -> CLI -o IdentityFile -> Tier 4 IdentityFile", func(t *testing.T) {
-		ctrlOpts, err := ParseOptionStrings([]string{"IdentityFile=/tmp/cli_opt_key"})
+		ctrlOpts, err := ParseSessionOptions([]string{"IdentityFile=/tmp/cli_opt_key"}, "")
 		if err != nil {
-			t.Fatalf("ParseOptionStrings failed: %v", err)
+			t.Fatalf("ParseSessionOptions failed: %v", err)
 		}
 		adp := NewSSHAdapter(provider,
 			WithSessionAuthOverride("openssh:virtual-host", SessionAuth{

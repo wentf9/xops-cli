@@ -115,9 +115,9 @@ func buildP3EquivalenceFixtures(t *testing.T, globalOpts *ssh.Options) (*config.
 
 func mustParseAdapterSessionControl(t *testing.T, cliJump string, rawOpts ...string) SessionControlOptions {
 	t.Helper()
-	parsed, err := ParseOptionStringsWithJump(rawOpts, cliJump)
+	parsed, err := ParseSessionOptions(rawOpts, cliJump)
 	if err != nil {
-		t.Fatalf("ParseOptionStringsWithJump(%v, %q): %v", rawOpts, cliJump, err)
+		t.Fatalf("ParseSessionOptions(%v, %q): %v", rawOpts, cliJump, err)
 	}
 	return parsed
 }
@@ -209,11 +209,11 @@ func TestP3_ResolveControlTargetAndSocketPath_EquivalenceWithDialPath(t *testing
 			wantOrigHost: "web-01",
 		},
 		{
-			name:         "2c_saved_node_proxycommand_none_preserves_node_proxyjump",
+			name:         "2c_saved_node_proxycommand_none_disables_node_proxyjump",
 			globalOpts:   globalMux,
 			target:       config.ConnectionTarget{Selector: "web-01"},
 			sessionCtrl:  mustParseAdapterSessionControl(t, "", "ProxyCommand=none"),
-			wantJumpHost: "bastion",
+			wantJumpHost: "",
 			wantHost:     "10.10.0.1",
 			wantOrigHost: "web-01",
 		},
@@ -461,12 +461,13 @@ func TestP3_ControlTargetContextNormalization(t *testing.T) {
 		LocalUID:  "1000",
 	}
 
-	pol := effectivePolicy{
+	pol := EffectivePolicy{
 		snapshot: config.ConnectionSnapshot{
 			Host:     models.Host{Address: "[fe80::1%eth0]", Port: 0},
 			Identity: models.Identity{User: "   "},
 			Node:     models.Node{ProxyJump: " jump1 , none , jump2 "},
 		},
+		proxySetting:  proxySettingFromJumpString(" jump1 , none , jump2 "),
 		originalHost:  "  edge-v6  ",
 		canonicalHost: "  edge-v6.corp.example.com  ",
 	}

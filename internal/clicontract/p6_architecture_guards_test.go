@@ -345,7 +345,7 @@ func checkNoExtractFailClosedPreferredAuths(t *testing.T, files []parsedGoFile) 
 		ast.Inspect(pf.file, func(n ast.Node) bool {
 			if ident, ok := n.(*ast.Ident); ok && ident.Name == "extractFailClosedPreferredAuths" {
 				pos := pf.fset.Position(ident.Pos())
-				t.Errorf("%s:%d: forbidden duplicate helper extractFailClosedPreferredAuths in pkg/cmd; use core/ssh.OptionSpec.FailClosedTokens via FilterSupportedListValue", pf.relPath, pos.Line)
+				t.Errorf("%s:%d: forbidden duplicate helper extractFailClosedPreferredAuths in pkg/cmd; use core/ssh.OptionSpec.FailClosedTokens via ParseOption", pf.relPath, pos.Line)
 			}
 			return true
 		})

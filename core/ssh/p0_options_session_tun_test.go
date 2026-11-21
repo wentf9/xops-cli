@@ -87,10 +87,7 @@ func testP0ControlCrossLayerMasterNoOverPersist(t *testing.T) {
 		OptionControlPath, "/tmp/cm-%C",
 		OptionControlPersist, "10m",
 	)
-	eff, err := EffectiveOptions(tier1, tier2)
-	if err != nil {
-		t.Fatalf("EffectiveOptions failed: %v", err)
-	}
+	eff := finalizeEffectiveOptions(MergeOptions(tier1, tier2))
 	if err := eff.ValidateEffective(); !errors.Is(err, ErrSSHOptionsValidation) {
 		t.Fatalf("ValidateEffective(cross-layer Master=no + Persist=10m) = %v, want ErrSSHOptionsValidation", err)
 	}
@@ -117,12 +114,12 @@ func testP0ControlMasterNoWithPersistNo(t *testing.T) {
 }
 
 func testP0ControlPathNoneFinalizesCleanly(t *testing.T) {
-	eff, err := EffectiveOptions(
+	eff, err := MergeEffectiveOptions(
 		MustOptions(OptionControlPath, "none"),
 		MustOptions(OptionControlMaster, "auto", OptionControlPath, "/tmp/cm-%C", OptionControlPersist, "10m"),
 	)
 	if err != nil {
-		t.Fatalf("EffectiveOptions failed: %v", err)
+		t.Fatalf("MergeEffectiveOptions failed: %v", err)
 	}
 	if err := eff.ValidateEffective(); err != nil {
 		t.Fatalf("ValidateEffective(finalized none) failed: %v", err)
@@ -133,11 +130,11 @@ func testP0ControlPathNoneFinalizesCleanly(t *testing.T) {
 	}
 }
 
-// TestP0_FilterSupportedListValue_PreferredAuthFailClosed verifies that
+// TestP0_ParseOption_PreferredAuthFailClosed verifies that
 // PreferredAuthentications containing only recognized unimplemented OpenSSH
 // methods (gssapi-with-mic, hostbased) is retained so auth.go fails closed,
-// while mixed lists still filter to implemented methods and garbage yields "".
-func TestP0_FilterSupportedListValue_PreferredAuthFailClosed(t *testing.T) {
+// while mixed lists still filter to implemented methods and garbage returns error.
+func TestP0_ParseOption_PreferredAuthFailClosed(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
@@ -156,12 +153,20 @@ func TestP0_FilterSupportedListValue_PreferredAuthFailClosed(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		got := FilterSupportedListValue(OptionPreferredAuthentications, tc.raw)
-		if got != tc.wantFiltered {
-			t.Errorf("FilterSupportedListValue(PreferredAuthentications, %q) = %q, want %q", tc.raw, got, tc.wantFiltered)
+		parsed, parseErr := ParseOption(OptionPreferredAuthentications, tc.raw, OptionSourceOpenSSHConfig)
+		if tc.wantFiltered == "" {
+			if parseErr == nil {
+				t.Errorf("ParseOption(PreferredAuthentications, %q) = %q, want error", tc.raw, parsed.Normalized)
+			}
 			continue
 		}
-		if tc.wantFiltered == "" {
+		if parseErr != nil {
+			t.Errorf("ParseOption(PreferredAuthentications, %q) err = %v, want %q", tc.raw, parseErr, tc.wantFiltered)
+			continue
+		}
+		got := parsed.Normalized
+		if got != tc.wantFiltered {
+			t.Errorf("ParseOption(PreferredAuthentications, %q) = %q, want %q", tc.raw, got, tc.wantFiltered)
 			continue
 		}
 		opts, err := NewOptions(OptionPreferredAuthentications, got)
@@ -192,14 +197,14 @@ func TestP0_FilterSupportedListValue_PreferredAuthFailClosed(t *testing.T) {
 	}
 }
 
-// TestP0_MergeOptionLayers_IdentityAndCertificateNoneTruncation verifies that
+// TestP0_MergeOptions_IdentityAndCertificateNoneTruncation verifies that
 // IdentityFile=none and CertificateFile=none truncate subsequent entries and
 // all lower-priority layers while preserving preceding concrete entries.
-func TestP0_MergeOptionLayers_IdentityAndCertificateNoneTruncation(t *testing.T) {
+func TestP0_MergeOptions_IdentityAndCertificateNoneTruncation(t *testing.T) {
 	t.Parallel()
 
 	t.Run("identity_file_none_first_ignores_lower_layers", func(t *testing.T) {
-		merged := MergeOptionLayers(
+		merged := MergeOptions(
 			MustOptions(OptionIdentityFile, "none"),
 			MustOptions(OptionIdentityFile, "~/.ssh/node_key"),
 			MustOptions(OptionIdentityFile, "~/.ssh/global_key"),
@@ -214,7 +219,7 @@ func TestP0_MergeOptionLayers_IdentityAndCertificateNoneTruncation(t *testing.T)
 	})
 
 	t.Run("identity_file_concrete_before_none_keeps_concrete_and_truncates_lower", func(t *testing.T) {
-		merged := MergeOptionLayers(
+		merged := MergeOptions(
 			MustOptions(OptionIdentityFile, "/tmp/cli_key"),
 			MustOptions(OptionIdentityFile, "NONE"),
 			MustOptions(OptionIdentityFile, "/tmp/global_key"),
@@ -231,20 +236,20 @@ func TestP0_MergeOptionLayers_IdentityAndCertificateNoneTruncation(t *testing.T)
 		_ = layerConcreteFirst.Append(OptionIdentityFile, "/tmp/k2")
 		lower := MustOptions(OptionIdentityFile, "/tmp/k3")
 
-		if got := MergeOptionLayers(layerConcreteFirst, lower).IdentityFiles(); !slices.Equal(got, []string{"/tmp/k1"}) {
+		if got := MergeOptions(layerConcreteFirst, lower).IdentityFiles(); !slices.Equal(got, []string{"/tmp/k1"}) {
 			t.Fatalf("intra-layer concrete-then-none IdentityFiles() = %v, want [/tmp/k1]", got)
 		}
 
 		layerNoneFirst := &Options{}
 		_ = layerNoneFirst.Append(OptionIdentityFile, "none")
 		_ = layerNoneFirst.Append(OptionIdentityFile, "/tmp/k2")
-		if got := MergeOptionLayers(layerNoneFirst, lower).IdentityFiles(); !slices.Equal(got, []string{"none"}) {
+		if got := MergeOptions(layerNoneFirst, lower).IdentityFiles(); !slices.Equal(got, []string{"none"}) {
 			t.Fatalf("intra-layer none-then-concrete IdentityFiles() = %v, want [none]", got)
 		}
 	})
 
 	t.Run("certificate_file_none_truncation_independent_of_identity_file", func(t *testing.T) {
-		merged := MergeOptionLayers(
+		merged := MergeOptions(
 			MustOptions(OptionCertificateFile, "none", OptionIdentityFile, "/tmp/k1"),
 			MustOptions(OptionCertificateFile, "/tmp/c1-cert.pub", OptionIdentityFile, "/tmp/k2"),
 			MustOptions(OptionCertificateFile, "/tmp/c2-cert.pub", OptionIdentityFile, "none"),
@@ -263,7 +268,7 @@ func TestP0_MergeOptionLayers_IdentityAndCertificateNoneTruncation(t *testing.T)
 	})
 
 	t.Run("certificate_file_concrete_before_none_truncates_lower", func(t *testing.T) {
-		merged := MergeOptionLayers(
+		merged := MergeOptions(
 			MustOptions(OptionCertificateFile, "/tmp/c1-cert.pub"),
 			MustOptions(OptionCertificateFile, "none"),
 			MustOptions(OptionCertificateFile, "/tmp/c2-cert.pub"),
@@ -495,13 +500,13 @@ func TestP0_SendEnv_NegativePatternDoesNotPruneBroaderWildcard(t *testing.T) {
 	})
 
 	t.Run("multi_tier_merge_and_re_enable", func(t *testing.T) {
-		merged, err := EffectiveOptions(
+		merged, err := MergeEffectiveOptions(
 			MustOptions(OptionSendEnv, "LC_X"),
 			MustOptions(OptionSendEnv, "-LC_?"),
 			MustOptions(OptionSendEnv, "LC_Y LC_ALL"),
 		)
 		if err != nil {
-			t.Fatalf("EffectiveOptions: %v", err)
+			t.Fatalf("MergeEffectiveOptions: %v", err)
 		}
 		got, err := ResolveSessionEnv(merged, func() []string {
 			return []string{"LC_ALL=C", "LC_X=kept", "LC_Y=dropped"}

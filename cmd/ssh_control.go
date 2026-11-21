@@ -209,8 +209,8 @@ func validateControlCommandBackground(o *SshOptions, cmdName string) error {
 	if err != nil {
 		return err
 	}
-	eff, effErr := ssh.EffectiveOptions(sessionOpts.ToSSHOptions())
-	if effErr == nil && eff != nil {
+	eff := ssh.MergeOptions(sessionOpts.ToSSHOptions())
+	if eff != nil {
 		if fork, ok := eff.ForkAfterAuthentication(); ok && fork {
 			return fmt.Errorf("control command (-O %s) cannot be combined with ForkAfterAuthentication=yes", cmdName)
 		}
@@ -900,11 +900,14 @@ func resolveControlProxyFallbackOptions(adp *adapter.SSHAdapter, host string, o 
 		}
 	}
 	if adp != nil {
-		if opts, err := adp.ResolveSSHOptions(host, sessionCtrlOpts); err == nil {
-			return opts
+		if pol, err := adp.Resolve(context.Background(), adapter.ResolveRequest{
+			NodeID:         host,
+			SessionControl: &sessionCtrlOpts,
+		}); err == nil {
+			return pol.Options()
 		}
 	}
-	if opts, err := ssh.EffectiveOptions(sessionCtrlOpts.ToSSHOptions()); err == nil && !opts.IsEmpty() {
+	if opts := ssh.MergeOptions(sessionCtrlOpts.ToSSHOptions()); !opts.IsEmpty() {
 		return opts
 	}
 	return nil
@@ -1170,10 +1173,7 @@ func parseForwardRequestsFromOptionsWithTarget(o *SshOptions, target ssh.TargetC
 	if err != nil {
 		return nil, err
 	}
-	cliEffOpts, err := ssh.EffectiveOptions(sessionOpts.ToSSHOptions())
-	if err != nil {
-		return nil, err
-	}
+	cliEffOpts := ssh.MergeOptions(sessionOpts.ToSSHOptions())
 
 	if err := o.validateCLIForwardArgs(); err != nil {
 		return nil, err

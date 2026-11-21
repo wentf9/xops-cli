@@ -472,12 +472,13 @@ func testP5StandaloneIdentityFilesNone(t *testing.T) {
 		t.Fatalf("toSessionControlOptions: %v", err)
 	}
 	adp := adapter.NewSSHAdapter(prov)
-	eff, err := adp.ResolveSSHOptions(config.OpenSSHNodePrefix+"edge", sessionOpts)
+	pol, err := adp.Resolve(t.Context(), adapter.ResolveRequest{NodeID: config.OpenSSHNodePrefix + "edge", SessionControl: &sessionOpts})
 	if err != nil {
-		t.Fatalf("ResolveSSHOptions: %v", err)
+		t.Fatalf("Resolve: %v", err)
 	}
+	eff := pol.Options()
 	if !slices.Equal(eff.IdentityFiles(), []string{"none"}) {
-		t.Fatalf("ResolveSSHOptions IdentityFiles = %v, want [none] (lower-tier key leaked)", eff.IdentityFiles())
+		t.Fatalf("Resolve IdentityFiles = %v, want [none] (lower-tier key leaked)", eff.IdentityFiles())
 	}
 }
 

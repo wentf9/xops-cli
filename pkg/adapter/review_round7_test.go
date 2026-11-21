@@ -270,15 +270,15 @@ func verifyRound7UnpersistedJumpPrecedence(t *testing.T, repo *config.Repository
 		t.Fatalf("ProvenanceOpenSSHDerived %q leaked T4 ProxyCommand: jump=%q cmd=%q", prepDerived.NodeID, cfgDerived.ProxyJump, cfgDerived.Options.ActiveProxyCommand())
 	}
 
-	// Pure unit check on solveProxyPrecedence as well.
+	// Pure unit check on resolveFourTierProxySetting as well.
 	t4Only, _ := ssh.NewOptions()
 	_ = t4Only.Set(ssh.OptionProxyCommand, "t4-shadow %h %p")
-	_, _, m4, higherWins := solveProxyPrecedence(proxyUnset, nil, config.ConnectionSnapshot{
+	effProxy, _ := resolveFourTierProxySetting(false, SessionAuth{}, nil, config.ConnectionSnapshot{
 		Node:       models.Node{ProxyJump: "openssh:bastion-t4"},
 		Provenance: config.ProvenanceOpenSSHDerived,
 	}, true, nil, nil, t4Only)
-	if higherWins || m4.ActiveProxyCommand() != "" {
-		t.Fatalf("unpersisted OpenSSH ProxyJump leaked T4 ProxyCommand: higherWins=%v cmd=%q", higherWins, m4.ActiveProxyCommand())
+	if effProxy.Kind() != ssh.ProxyJump {
+		t.Fatalf("unpersisted OpenSSH ProxyJump leaked T4 ProxyCommand: effProxy=%v", effProxy)
 	}
 }
 
@@ -301,12 +301,13 @@ func TestRound7_P2_8_SessionControlLiteralPathPreservedAcrossMerge(t *testing.T)
 	sessCtrl.SetLiteralPath(literalSock)
 
 	adp := NewSSHAdapter(prov)
-	ctrl, err := adp.ResolveControl("v6-zone", sessCtrl)
+	pol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: "v6-zone", SessionControl: &sessCtrl})
 	if err != nil {
-		t.Fatalf("ResolveControl(literal): %v", err)
+		t.Fatalf("Resolve(literal): %v", err)
 	}
+	ctrl := pol.Control()
 	if ctrl == nil || !ctrl.LiteralPath || ctrl.Path != literalSock {
-		t.Fatalf("ResolveControl = %+v, want LiteralPath=true Path=%q", ctrl, literalSock)
+		t.Fatalf("Resolve = %+v, want LiteralPath=true Path=%q", ctrl, literalSock)
 	}
 	resolved, err := ctrl.ResolvePath(ssh.Environment{}, ssh.TargetContext{Host: "fe80::1%eth0", Port: 22, User: "root"})
 	if err != nil || resolved != literalSock {

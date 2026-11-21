@@ -2435,7 +2435,7 @@ func TestSSHAdapter_BatchModeDisablesInteractionAndWriteback(t *testing.T) {
 	}
 }
 
-func TestParseOptionStringsRejectsEmptyValuesAndSessionControlSync(t *testing.T) {
+func TestParseSessionOptionsRejectsEmptyValuesAndSessionControlSync(t *testing.T) {
 	for _, invalid := range []string{
 		"=val",
 		"ControlPath=",
@@ -2446,8 +2446,8 @@ func TestParseOptionStringsRejectsEmptyValuesAndSessionControlSync(t *testing.T)
 		"Port=",
 		"ConnectTimeout=",
 	} {
-		if _, err := ParseOptionStrings([]string{invalid}); err == nil {
-			t.Fatalf("expected ParseOptionStrings(%q) to fail on empty key/value, got nil", invalid)
+		if _, err := ParseSessionOptions([]string{invalid}, ""); err == nil {
+			t.Fatalf("expected ParseSessionOptions(%q) to fail on empty key/value, got nil", invalid)
 		}
 	}
 

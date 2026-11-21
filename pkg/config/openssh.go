@@ -609,6 +609,34 @@ func (p *OpenSSHParser) ResolveExplicitHostName(alias string) (hostName string, 
 	return resolved, true, nil
 }
 
+// ResolveExplicitPort returns the explicit Port configured for alias when a
+// Port directive matches alias, with explicit=false if no Port directive is configured.
+func (p *OpenSSHParser) ResolveExplicitPort(alias string) (port uint16, explicit bool, err error) {
+	if p == nil || p.cfg == nil {
+		return 0, false, nil
+	}
+	if p.err != nil {
+		return 0, false, p.err
+	}
+	cleanAlias := strings.TrimSpace(strings.TrimPrefix(alias, OpenSSHNodePrefix))
+	if cleanAlias == "" {
+		return 0, false, nil
+	}
+	lookupAlias, _, _, parseErr := parseOpenSSHHostSpec(cleanAlias)
+	if parseErr != nil || lookupAlias == "" {
+		lookupAlias = cleanAlias
+	}
+	rawPort := strings.TrimSpace(firstSSHConfigKeyValue(p.cfg, lookupAlias, "Port"))
+	if rawPort == "" {
+		return 0, false, nil
+	}
+	parsedPort, err := strconv.ParseUint(rawPort, 10, 16)
+	if err != nil || parsedPort == 0 {
+		return 0, true, fmt.Errorf("invalid port %q for %q in ssh config", rawPort, alias)
+	}
+	return uint16(parsedPort), true, nil
+}
+
 func resolveOpenSSHHostName(doc *sshConfigDoc, alias string) (string, error) {
 	rawHostName := firstSSHConfigKeyValue(doc, alias, "HostName")
 	if rawHostName == "" {

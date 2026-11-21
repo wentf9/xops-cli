@@ -339,10 +339,7 @@ func TestControlConfig_CloneAndEqual(t *testing.T) {
 
 func mustResolveControlForTest(t *testing.T, layers ...*Options) *ControlConfig {
 	t.Helper()
-	eff, err := EffectiveOptions(layers...)
-	if err != nil {
-		t.Fatalf("EffectiveOptions failed: %v", err)
-	}
+	eff := finalizeEffectiveOptions(MergeOptions(layers...))
 	res, err := eff.ValidatedControlConfig()
 	if err != nil {
 		t.Fatalf("ValidatedControlConfig failed: %v", err)
@@ -350,7 +347,7 @@ func mustResolveControlForTest(t *testing.T, layers ...*Options) *ControlConfig 
 	return res
 }
 
-func TestControlConfig_EffectiveOptionsValidatedControlConfig(t *testing.T) {
+func TestControlConfig_MergeOptionsValidatedControlConfig(t *testing.T) {
 	parentCfg := &ControlConfig{Master: ControlMasterAuto, Path: "~/.ssh/cm-%h", Persist: "5m"}
 	parent := OptionsFromControl(parentCfg)
 

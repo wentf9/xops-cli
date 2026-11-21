@@ -132,11 +132,11 @@ func parsePass6MuxDaemonChild(
 	if err != nil {
 		t.Fatalf("toSessionControlOptions(child): %v", err)
 	}
-	effSSHOpts, err := adp.ResolveSSHOptions(childNodeID, sessionCtrl)
+	pol, err := adp.Resolve(ctx, adapter.ResolveRequest{NodeID: childNodeID, SessionControl: &sessionCtrl})
 	if err != nil {
-		t.Fatalf("ResolveSSHOptions(child %q): %v", childNodeID, err)
+		t.Fatalf("Resolve(child %q): %v", childNodeID, err)
 	}
-	return childNodeID, childCfg, effSSHOpts
+	return childNodeID, childCfg, pol.Options()
 }
 
 func TestPass6_M5_MuxDaemonArgsPreservesHostNameAndEscapesPercent(t *testing.T) {

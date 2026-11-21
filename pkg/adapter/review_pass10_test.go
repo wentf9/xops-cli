@@ -252,9 +252,9 @@ func TestPass10_H1_RememberPassphraseScenarios(t *testing.T) {
 	// Scenario B: concrete IdentityFile followed by -o IdentityFile=none truncating lower-tier keys
 	runScenario(t, "B_identityfile_k2_then_none", func(t *testing.T, dir, _, k2, kOld string, port int) (string, *SSHAdapter, *config.Repository, string) {
 		repo, reg, svc := newPass10RepoAndService(t, dir, "127.0.0.1", port, "node-b", kOld, nil)
-		ctrlOpts, err := ParseOptionStrings([]string{"IdentityFile=" + k2, "IdentityFile=none"})
+		ctrlOpts, err := ParseSessionOptions([]string{"IdentityFile=" + k2, "IdentityFile=none"}, "")
 		if err != nil {
-			t.Fatalf("ParseOptionStrings: %v", err)
+			t.Fatalf("ParseSessionOptions: %v", err)
 		}
 		adp := NewSSHAdapter(
 			repo,

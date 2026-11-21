@@ -132,10 +132,11 @@ func TestRound4_P2_17_TwoPassTier4SkipsUnrelatedConcreteHostByAddress(t *testing
 	}, models.Host{Address: "10.77.0.5", Port: 22, Alias: []string{"app-short.corp.example.com"}}, models.Identity{User: "ops"})
 	adp := NewSSHAdapter(provider)
 
-	opts, err := adp.ResolveSSHOptions("ops@10.77.0.5:22", SessionControlOptions{})
+	pol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: "ops@10.77.0.5:22"})
 	if err != nil {
-		t.Fatalf("ResolveSSHOptions: %v", err)
+		t.Fatalf("Resolve: %v", err)
 	}
+	opts := pol.Options()
 	if got := opts.Get(ssh.OptionConnectTimeout); got != "12" {
 		t.Fatalf("ConnectTimeout = %q, want 12 from Pass 1 app-short (not 99 from unrelated same IP)", got)
 	}
@@ -197,9 +198,9 @@ func TestRound4_P2_18_BatchModeLatchedAcrossConfirmConnection(t *testing.T) {
 	}
 
 	// Explicit Tier-1 BatchMode=no overrides the latch.
-	overrideOpts, err := ParseOptionStrings([]string{"BatchMode=no"})
+	overrideOpts, err := ParseSessionOptions([]string{"BatchMode=no"}, "")
 	if err != nil {
-		t.Fatalf("ParseOptionStrings: %v", err)
+		t.Fatalf("ParseSessionOptions: %v", err)
 	}
 	if adp.sessionControlOverrides == nil {
 		adp.sessionControlOverrides = make(map[string]SessionControlOptions)
@@ -228,9 +229,9 @@ func TestRound4_P2_19_ProxyJumpMultiNoneNormalizedToDisabled(t *testing.T) {
 		t.Fatalf("GetConfig ProxyJump = %q, want empty when normalized from none,none", clientCfg.ProxyJump)
 	}
 
-	opts, err := ParseOptionStringsWithJump([]string{"proxy_jump=none,none", "ProxyCommand=echo proxy"}, "none,none")
+	opts, err := ParseSessionOptions([]string{"proxy_jump=none,none", "ProxyCommand=echo proxy"}, "none,none")
 	if err != nil {
-		t.Fatalf("ParseOptionStringsWithJump: %v", err)
+		t.Fatalf("ParseSessionOptions: %v", err)
 	}
 	if opts.ToSSHOptions().ActiveProxyCommand() == "" {
 		t.Fatal("disabled proxy_jump=none,none must allow ProxyCommand to remain active")

@@ -531,17 +531,17 @@ func TestRound7_P2_8_LiteralControlPathPreservedAcrossOptionsAndControl(t *testi
 		t.Fatalf("ctrl.ResolvePath = (%q, %v), want %q", resolved, err, literalPath)
 	}
 
-	// MergeOptionLayers preserves LiteralControlPath when winning layer is literal, and clears
+	// MergeOptions preserves LiteralControlPath when winning layer is literal, and clears
 	// it when a higher layer overrides ControlPath with "none" or a non-literal template.
-	lowMerged := MergeOptionLayers(nil, &opts)
+	lowMerged := MergeOptions(nil, &opts)
 	if lowMerged == nil || !lowMerged.LiteralControlPath || lowMerged.ControlPath() != literalPath {
-		t.Fatalf("MergeOptionLayers did not preserve LiteralControlPath: %+v", lowMerged)
+		t.Fatalf("MergeOptions did not preserve LiteralControlPath: %+v", lowMerged)
 	}
 	var highNone Options
 	_ = highNone.Set(OptionControlPath, "none")
-	effDisabled, err := EffectiveOptions(&highNone, &opts)
+	effDisabled, err := MergeEffectiveOptions(&highNone, &opts)
 	if err != nil || effDisabled == nil || effDisabled.LiteralControlPath {
-		t.Fatalf("EffectiveOptions(none override) left LiteralControlPath=true: %+v, %v", effDisabled, err)
+		t.Fatalf("MergeEffectiveOptions(none override) left LiteralControlPath=true: %+v, %v", effDisabled, err)
 	}
 }
 

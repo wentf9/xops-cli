@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/spf13/pflag"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/config"
 )
 
@@ -986,7 +987,12 @@ func recordExcludeKey(dst map[string]struct{}, keys ...string) {
 }
 
 func sameExcludeHost(a, b string) bool {
-	return config.SameHostAddress(a, b)
+	epA, errA := ssh.NewEndpoint(a, 22)
+	epB, errB := ssh.NewEndpoint(b, 22)
+	if errA != nil || errB != nil {
+		return false
+	}
+	return epA.HostEqual(epB)
 }
 
 // ExcludeTargetInfo describes a candidate target host or node for unified

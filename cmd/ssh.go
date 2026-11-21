@@ -176,22 +176,21 @@ func (o *SshOptions) readSecretsFromStdin() (bool, error) {
 	return readCLISecretsFromStdin(o)
 }
 
-// truncateIdentityFilesAtNone truncates keys at the first "none" sentinel
-// while retaining that sentinel so downstream merging also stops inheriting
-// lower-tier IdentityFile entries.
-func truncateIdentityFilesAtNone(keys []string) []string {
+// canonicalIdentityFileSlice normalizes a CLI identity-file list through
+// core/ssh.PathList so the first "none" sentinel truncates subsequent entries
+// while preserving the sentinel for downstream cross-tier merging.
+func canonicalIdentityFileSlice(keys []string) []string {
 	if len(keys) == 0 {
 		return nil
 	}
-	for i, k := range keys {
-		if ssh.IsNoneValue(k) {
-			out := make([]string, i+1)
-			copy(out, keys[:i])
-			out[i] = "none"
-			return out
-		}
+	pl, err := ssh.ParsePathListItems(keys)
+	if err != nil {
+		return slices.Clone(keys)
 	}
-	return slices.Clone(keys)
+	if pl.IsUnset() {
+		return nil
+	}
+	return strings.Split(pl.String(), "\n")
 }
 
 func (o *SshOptions) syncIdentityFiles() {
@@ -199,12 +198,12 @@ func (o *SshOptions) syncIdentityFiles() {
 		return
 	}
 	if len(o.IdentityFiles) > 0 {
-		o.IdentityFiles = truncateIdentityFilesAtNone(o.IdentityFiles)
+		o.IdentityFiles = canonicalIdentityFileSlice(o.IdentityFiles)
 		if o.IdentityFile == "" && config.IsPersistableIdentityPath(o.IdentityFiles[0]) {
 			o.IdentityFile = o.IdentityFiles[0]
 		}
 	} else if o.IdentityFile != "" {
-		o.IdentityFiles = truncateIdentityFilesAtNone([]string{o.IdentityFile})
+		o.IdentityFiles = canonicalIdentityFileSlice([]string{o.IdentityFile})
 	}
 }
 
@@ -786,8 +785,15 @@ func (o *SshOptions) probeCandidateBackgroundSession(
 	if lookupKey != "" && (sessionAuth.ProxyJump != "" || sessionAuth.OriginalHost != "" || sessionAuth.CanonicalHost != "") {
 		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(lookupKey, sessionAuth))
 	}
-	eff, err := adapter.NewSSHAdapter(provider, adpOpts...).ResolveSSHOptions(lookupKey, sessionOpts)
-	if err != nil || eff == nil {
+	pol, err := adapter.NewSSHAdapter(provider, adpOpts...).Resolve(context.Background(), adapter.ResolveRequest{
+		NodeID:         lookupKey,
+		SessionControl: &sessionOpts,
+	})
+	if err != nil {
+		return false
+	}
+	eff := pol.Options()
+	if eff == nil {
 		return false
 	}
 	if !cliSessionTypeLocked && eff.SessionType() == ssh.SessionTypeNone {
@@ -1244,8 +1250,13 @@ func (c *proxyCommandPathChecker) checkNode(id string, isTarget bool) bool {
 	if isTarget {
 		ctrlOpts = c.sessionCtrlOpts
 	}
-	if opts, err := c.adp.ResolveSSHOptions(id, ctrlOpts); err == nil && opts != nil && opts.ActiveProxyCommand() != "" {
-		return true
+	if pol, err := c.adp.Resolve(context.Background(), adapter.ResolveRequest{
+		NodeID:         id,
+		SessionControl: &ctrlOpts,
+	}); err == nil {
+		if opts := pol.Options(); opts != nil && opts.ActiveProxyCommand() != "" {
+			return true
+		}
 	}
 	var jumpChain string
 	if isTarget {
@@ -1686,8 +1697,19 @@ func resolveMasterNodeID(provider config.ConfigProvider, m *ssh.MuxServer) strin
 	return orig
 }
 
-func sameMasterHostAddress(a, b string) bool {
-	return config.SameHostAddress(a, b)
+func sameMasterHostEndpoint(snapAddr string, snapPort uint16, targetHost string, targetPort uint16) bool {
+	effSnapPort := int(snapPort)
+	if effSnapPort == 0 {
+		effSnapPort = 22
+	}
+	if targetPort != 0 {
+		snapEp, err1 := ssh.NewEndpoint(snapAddr, effSnapPort)
+		targetEp, err2 := ssh.NewEndpoint(targetHost, int(targetPort))
+		return err1 == nil && err2 == nil && snapEp.Equal(targetEp)
+	}
+	snapEp, err1 := ssh.NewEndpoint(snapAddr, effSnapPort)
+	targetEp, err2 := ssh.NewEndpoint(targetHost, effSnapPort)
+	return err1 == nil && err2 == nil && snapEp.HostEqual(targetEp)
 }
 
 func collectSavedMasterCandidates(provider config.ConfigProvider, orig, user string, port uint16) []string {
@@ -1725,7 +1747,7 @@ func savedMasterNodeMatches(snap config.ConnectionSnapshot, targetHost, user str
 	if snap.Provenance.IsUnpersistedOpenSSH() {
 		return false
 	}
-	if targetHost != "" && !sameMasterHostAddress(snap.Host.Address, targetHost) {
+	if targetHost != "" && !sameMasterHostEndpoint(snap.Host.Address, snap.Host.Port, targetHost, port) {
 		return false
 	}
 	snapUser := strings.TrimSpace(snap.Identity.User)
@@ -1844,7 +1866,7 @@ func resolveMasterVirtualOpenSSHNodeID(provider config.ConfigProvider, cleanOrig
 	if err != nil {
 		return ""
 	}
-	if targetHost == "" || sameMasterHostAddress(vhost.Address, targetHost) {
+	if targetHost == "" || sameMasterHostEndpoint(vhost.Address, 0, targetHost, 0) {
 		return config.OpenSSHNodePrefix + cleanOrig
 	}
 	if user != "" && vhost.Address != "" {

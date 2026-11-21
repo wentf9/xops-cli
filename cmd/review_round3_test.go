@@ -300,8 +300,8 @@ func TestRound3_P2_14_And_P3_9_NonProxyControlBgRejectionAndCaseInsensitiveNone(
 	if sOpts.Path == nil || *sOpts.Path != "none" {
 		t.Fatalf("SessionControlOptions.Path = %v, want \"none\"", sOpts.Path)
 	}
-	if ctrl, ctrlErr := sOpts.ResolveControl(); ctrlErr != nil || ctrl == nil || ctrl.AllowReuse || ctrl.Path != "none" {
-		t.Fatalf("ResolveControl(-S NONE) = (%+v, %v), want Path=\"none\" AllowReuse=false", ctrl, ctrlErr)
+	if ctrl, ctrlErr := adapter.ResolveControlConfig(nil, "", "", adapter.SessionAuth{}, sOpts); ctrlErr != nil || ctrl == nil || ctrl.AllowReuse || ctrl.Path != "none" {
+		t.Fatalf("ResolveControlConfig(-S NONE) = (%+v, %v), want Path=\"none\" AllowReuse=false", ctrl, ctrlErr)
 	}
 	if (&SSHControlFlags{CtlCmd: "stop", ControlPath: "NONE"}).ControlCommandWithoutTarget() {
 		t.Fatal("ControlCommandWithoutTarget(-S NONE) must be false")

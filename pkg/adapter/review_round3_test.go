@@ -10,7 +10,7 @@ import (
 	"github.com/wentf9/xops-cli/pkg/models"
 )
 
-func TestRound3_P1_1_GetConfigAndResolveControlPreservePass1AndPercentN(t *testing.T) {
+func TestRound3_P1_1_GetConfigAndResolvePreservePass1AndPercentN(t *testing.T) {
 	t.Parallel()
 
 	sshCfg := strings.Join([]string{
@@ -64,10 +64,11 @@ func TestRound3_P1_1_GetConfigAndResolveControlPreservePass1AndPercentN(t *testi
 		t.Fatalf("Pass-2 ConnectTimeout lost: %q", got)
 	}
 
-	ctrl, err := adp.ResolveControl(res.NodeID, SessionControlOptions{})
+	pol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: res.NodeID})
 	if err != nil {
-		t.Fatalf("ResolveControl error = %v", err)
+		t.Fatalf("Resolve error = %v", err)
 	}
+	ctrl := pol.Control()
 	expanded, err := adp.ExpandControlPath(res.NodeID, ctrl.Path)
 	if err != nil {
 		t.Fatalf("ExpandControlPath error = %v", err)
@@ -126,22 +127,22 @@ func TestRound3_P2_10_Tier4LookupWithOpenSSHAliasFallbackAndConcreteCanonical(t 
 	}
 }
 
-func TestRound3_P2_11_ParseOptionStringsWithJump(t *testing.T) {
+func TestRound3_P2_11_ParseSessionOptionsWithJump(t *testing.T) {
 	t.Parallel()
 
 	// CLI -J none blocks subsequent -o ProxyJump=bastion so -o ProxyCommand remains active.
-	opts, err := ParseOptionStringsWithJump([]string{"ProxyJump=bastion", "ProxyCommand=nc %h %p"}, "none")
+	opts, err := ParseSessionOptions([]string{"ProxyJump=bastion", "ProxyCommand=nc %h %p"}, "none")
 	if err != nil {
-		t.Fatalf("ParseOptionStringsWithJump error = %v", err)
+		t.Fatalf("ParseSessionOptions error = %v", err)
 	}
 	if opts.Options == nil || opts.Options.Get(ssh.OptionProxyCommand) != "nc %h %p" {
 		t.Fatalf("expected ProxyCommand preserved when CLI -J none blocks -o ProxyJump=bastion, got %+v", opts.Options)
 	}
 
 	// CLI -J bastion blocks subsequent -o ProxyCommand.
-	optsBlocked, err := ParseOptionStringsWithJump([]string{"ProxyCommand=nc %h %p"}, "bastion")
+	optsBlocked, err := ParseSessionOptions([]string{"ProxyCommand=nc %h %p"}, "bastion")
 	if err != nil {
-		t.Fatalf("ParseOptionStringsWithJump error = %v", err)
+		t.Fatalf("ParseSessionOptions error = %v", err)
 	}
 	if optsBlocked.Options != nil && optsBlocked.Options.Get(ssh.OptionProxyCommand) != "" {
 		t.Fatalf("expected active CLI -J to suppress -o ProxyCommand, got %q", optsBlocked.Options.Get(ssh.OptionProxyCommand))

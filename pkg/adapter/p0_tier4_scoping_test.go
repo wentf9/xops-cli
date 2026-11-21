@@ -68,18 +68,15 @@ Host *
 
 	adp := NewSSHAdapter(config.NewProviderWithOpenSSHParser(cfg, parser))
 
-	ctrl, err := adp.ResolveControl("web", SessionControlOptions{})
+	pol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: "web"})
 	if err != nil {
-		t.Fatalf("ResolveControl(web): %v", err)
+		t.Fatalf("Resolve(web): %v", err)
 	}
-	if ctrl != nil {
+	if ctrl := pol.Control(); ctrl != nil {
 		t.Fatalf("unrelated concrete Host web/alias leaked ControlConfig onto saved node web (10.0.0.1): %+v", ctrl)
 	}
 
-	opts, err := adp.ResolveSSHOptions("web", SessionControlOptions{})
-	if err != nil {
-		t.Fatalf("ResolveSSHOptions(web): %v", err)
-	}
+	opts := pol.Options()
 	if opts == nil {
 		t.Fatal("expected wildcard Host * ServerAliveInterval=25")
 	}
@@ -138,27 +135,26 @@ Host 10.0.0.5
 	adp := NewSSHAdapter(config.NewProviderWithOpenSSHParser(cfg, parser))
 
 	// Matching explicit HostName applies cleanly.
-	ctrl, err := adp.ResolveControl("web", SessionControlOptions{})
-	if err != nil || ctrl == nil || ctrl.Path != "/tmp/good-web-%C" {
-		t.Fatalf("matching Host web control = (%+v, %v), want /tmp/good-web-%%C", ctrl, err)
+	polWeb, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: "web"})
+	if err != nil || polWeb.Control() == nil || polWeb.Control().Path != "/tmp/good-web-%C" {
+		t.Fatalf("matching Host web control = (%+v, %v), want /tmp/good-web-%%C", polWeb.Control(), err)
 	}
-	optsWeb, err := adp.ResolveSSHOptions("web", SessionControlOptions{})
-	if err != nil || optsWeb == nil || optsWeb.Get(ssh.OptionConnectTimeout) != "14" {
+	if optsWeb := polWeb.Options(); optsWeb == nil || optsWeb.Get(ssh.OptionConnectTimeout) != "14" {
 		t.Fatalf("matching Host web opts = (%+v, %v), want ConnectTimeout=14", optsWeb, err)
 	}
 
 	// Canonical IPv6 matches v6node while rejecting mismatched alias v6mismatch.
-	optsV6, err := adp.ResolveSSHOptions("v6node", SessionControlOptions{})
-	if err != nil || optsV6 == nil || optsV6.Get(ssh.OptionConnectTimeout) != "19" {
-		t.Fatalf("matching IPv6 v6node opts = (%+v, %v), want ConnectTimeout=19", optsV6, err)
+	polV6, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: "v6node"})
+	if err != nil || polV6.Options() == nil || polV6.Options().Get(ssh.OptionConnectTimeout) != "19" {
+		t.Fatalf("matching IPv6 v6node opts = (%+v, %v), want ConnectTimeout=19", polV6.Options(), err)
 	}
 
 	// Concrete Host 10.0.0.5 redirected to 192.168.99.5 must NOT leak onto saved node at 10.0.0.5.
-	optsRedir, err := adp.ResolveSSHOptions("redir-target", SessionControlOptions{})
+	polRedir, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: "redir-target"})
 	if err != nil {
-		t.Fatalf("ResolveSSHOptions(redir-target): %v", err)
+		t.Fatalf("Resolve(redir-target): %v", err)
 	}
-	if optsRedir != nil && optsRedir.Get(ssh.OptionConnectTimeout) != "" {
+	if optsRedir := polRedir.Options(); optsRedir != nil && optsRedir.Get(ssh.OptionConnectTimeout) != "" {
 		t.Fatalf("redirected Host 10.0.0.5 leaked ConnectTimeout=%q", optsRedir.Get(ssh.OptionConnectTimeout))
 	}
 }
@@ -171,16 +167,16 @@ func TestP0_DisableSessionControlSharingPreservesGlobalOptions(t *testing.T) {
 	cfg.Identities.Set("id1", models.Identity{User: "ops", AuthType: "auto"})
 	cfg.Nodes.Set("app", models.Node{HostRef: "h1", IdentityRef: "id1"})
 
-	globalCtrl, err := ParseOptionStrings([]string{
+	globalCtrl, err := ParseSessionOptions([]string{
 		"BatchMode=yes",
 		"StrictHostKeyChecking=yes",
 		"ConnectTimeout=9",
 		"ControlMaster=auto",
 		"ControlPath=/tmp/cm-%C",
 		"ControlPersist=5m",
-	})
+	}, "")
 	if err != nil {
-		t.Fatalf("ParseOptionStrings: %v", err)
+		t.Fatalf("ParseSessionOptions: %v", err)
 	}
 
 	adp := NewSSHAdapter(
@@ -223,20 +219,20 @@ func TestP0_DisableSessionControlSharingPreservesGlobalOptions(t *testing.T) {
 func TestP0_IsNonInteractiveForNodeFailClosedAndValidateSecretMissingBaseHost(t *testing.T) {
 	t.Parallel()
 
-	t.Run("isNonInteractiveForNode honors Tier-1 BatchMode and latch even when ResolveSSHOptions fails", func(t *testing.T) {
+	t.Run("isNonInteractiveForNode honors Tier-1 BatchMode and latch even when Resolve fails", func(t *testing.T) {
 		brokenProv := config.NewProviderWithOpenSSHParser(nil, config.NewBrokenOpenSSHParser(errors.New("broken ssh_config")))
-		batchOpts, err := ParseOptionStrings([]string{"BatchMode=yes"})
+		batchOpts, err := ParseSessionOptions([]string{"BatchMode=yes"}, "")
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		// 1. Tier-1 BatchMode=yes returns true even when ResolveSSHOptions fails on broken ssh_config.
+		// 1. Tier-1 BatchMode=yes returns true even when Resolve fails on broken ssh_config.
 		adpTier1 := NewSSHAdapter(brokenProv, WithSessionControlOverride("unsaved-node", batchOpts))
 		if !adpTier1.isNonInteractiveForNode("unsaved-node") {
 			t.Fatal("expected isNonInteractiveForNode=true with Tier-1 BatchMode=yes despite broken parser")
 		}
 
-		// 2. Latched BatchMode returns true even when ResolveSSHOptions fails on broken ssh_config.
+		// 2. Latched BatchMode returns true even when Resolve fails on broken ssh_config.
 		adpLatched := NewSSHAdapter(brokenProv)
 		adpLatched.latchBatchMode("unsaved-node")
 		if !adpLatched.isNonInteractiveForNode("unsaved-node") {
@@ -244,7 +240,7 @@ func TestP0_IsNonInteractiveForNodeFailClosedAndValidateSecretMissingBaseHost(t 
 		}
 
 		// 3. Explicit Tier-1 BatchMode=no still overrides latched BatchMode.
-		batchNoOpts, err := ParseOptionStrings([]string{"BatchMode=no"})
+		batchNoOpts, err := ParseSessionOptions([]string{"BatchMode=no"}, "")
 		if err != nil {
 			t.Fatal(err)
 		}

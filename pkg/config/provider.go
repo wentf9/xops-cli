@@ -106,14 +106,6 @@ func NormalizeHostAddress(raw string) string {
 	return strings.ToLower(clean)
 }
 
-// SameHostAddress reports whether a and b share the same non-empty canonical
-// host representative induced by NormalizeHostAddress.
-func SameHostAddress(a, b string) bool {
-	na := NormalizeHostAddress(a)
-	nb := NormalizeHostAddress(b)
-	return na != "" && na == nb
-}
-
 func stripTransientNodeMetadata(cfg *Configuration) {
 	if cfg == nil || cfg.Nodes == nil {
 		return

@@ -619,9 +619,9 @@ func TestP2_MergeEffectiveOptions_CrossFieldAndBackcompat(t *testing.T) {
 	if eff, err := MergeEffectiveOptions(activeNoPath); !errors.Is(err, ErrSSHOptionsValidation) || eff != nil {
 		t.Fatalf("MergeEffectiveOptions(ControlMaster=yes without path) = (%+v, %v), want (nil, ErrSSHOptionsValidation)", eff, err)
 	}
-	// EffectiveOptions itself must remain unchanged for callers that strip classes before validating.
-	if eff, err := EffectiveOptions(activeNoPath); err != nil || eff == nil || eff.ControlMaster() != ControlMasterYes {
-		t.Fatalf("EffectiveOptions backward compatibility broken: (%+v, %v)", eff, err)
+	// MergeOptions performs non-validating associative merging for callers that strip classes before validating.
+	if eff := MergeOptions(activeNoPath); eff == nil || eff.ControlMaster() != ControlMasterYes {
+		t.Fatalf("MergeOptions(activeNoPath) = %+v, want ControlMasterYes", eff)
 	}
 
 	persistNoMaster := MustOptions(OptionControlMaster, "no", OptionControlPath, "~/.ssh/cm-%C", OptionControlPersist, "10m")

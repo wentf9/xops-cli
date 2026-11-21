@@ -464,7 +464,7 @@ func TestOptions_ForwardYAMLAndJSONSerialization(t *testing.T) {
 	}
 }
 
-func TestOptions_MergeOptionLayers(t *testing.T) {
+func TestOptions_MergeOptions(t *testing.T) {
 	layer1 := &Options{}
 	mustAppendTestOption(t, layer1, "local_forward", "8080 127.0.0.1:80")
 	mustSetTestOption(t, layer1, "connect_timeout", "5")
@@ -477,7 +477,7 @@ func TestOptions_MergeOptionLayers(t *testing.T) {
 	mustSetTestOption(t, layer2, "tunnel", "point-to-point")              // overridden by layer1
 	mustSetTestOption(t, layer2, "request_tty", "yes")
 
-	merged := MergeOptionLayers(layer1, layer2)
+	merged := MergeOptions(layer1, layer2)
 	if merged == nil {
 		t.Fatalf("expected non-nil merged options")
 	}

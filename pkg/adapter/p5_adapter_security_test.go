@@ -85,7 +85,7 @@ func testP5IsNonInteractiveUnlatchedBrokenConfig(t *testing.T) {
 	)
 
 	if !adp.isNonInteractiveForNode("unlatched-node") {
-		t.Fatal("isNonInteractiveForNode must fail closed (true) for unlatched node when ResolveSSHOptions fails")
+		t.Fatal("isNonInteractiveForNode must fail closed (true) for unlatched node when Resolve fails")
 	}
 	tok, err := adp.UpdateAuth(t.Context(), "unlatched-node", "auth-v1", "discovered-secret", "", "")
 	if err != nil || tok != "auth-v1" {
@@ -122,7 +122,7 @@ func testP5IsNonInteractiveSavedInvalidTier4(t *testing.T) {
 	resolver := &interactionCaptureResolver{}
 	adp := NewSSHAdapter(config.NewProviderWithOpenSSHParser(cfg, parser), WithCredentialSource(resolver))
 	if !adp.isNonInteractiveForNode("edge") {
-		t.Fatal("expected isNonInteractiveForNode(edge)=true when ResolveSSHOptions fails on invalid ControlMaster")
+		t.Fatal("expected isNonInteractiveForNode(edge)=true when Resolve fails on invalid ControlMaster")
 	}
 	sec, err := adp.ResolveSecret(t.Context(), ssh.SecretRequest{
 		NodeID: "edge",
@@ -135,7 +135,7 @@ func testP5IsNonInteractiveSavedInvalidTier4(t *testing.T) {
 		t.Fatalf("ResolveSecret = (%q, %v), want (resolved-secret, nil)", string(sec), err)
 	}
 	if !resolver.interactionDisabled.Load() {
-		t.Fatal("ResolveSecret did not disable interaction via credential.WithoutInteraction when ResolveSSHOptions failed")
+		t.Fatal("ResolveSecret did not disable interaction via credential.WithoutInteraction when Resolve failed")
 	}
 }
 
@@ -173,21 +173,21 @@ Host *
 
 	adp := NewSSHAdapter(config.NewProviderWithOpenSSHParser(cfg, parser))
 
-	ctrl, err := adp.ResolveControl("prod", SessionControlOptions{})
-	if err != nil || ctrl != nil {
-		t.Fatalf("Bypass 1: Host prod (without HostName) leaked ControlConfig onto 10.99.99.99: (%+v, %v)", ctrl, err)
+	pol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: "prod"})
+	if err != nil || pol.Control() != nil {
+		t.Fatalf("Bypass 1: Host prod (without HostName) leaked ControlConfig onto 10.99.99.99: (%+v, %v)", pol.Control(), err)
 	}
-	opts, err := adp.ResolveSSHOptions("prod", SessionControlOptions{})
-	if err != nil || opts == nil || opts.Get(ssh.OptionServerAliveInterval) != "25" {
+	opts := pol.Options()
+	if opts == nil || opts.Get(ssh.OptionServerAliveInterval) != "25" {
 		t.Fatalf("expected Host * ServerAliveInterval=25 fallback, got (%+v, %v)", opts, err)
 	}
 	if opts.Get(ssh.OptionConnectTimeout) != "" || opts.ControlPath() != "" {
 		t.Fatalf("Bypass 1: Host prod leaked ConnectTimeout=%q ControlPath=%q", opts.Get(ssh.OptionConnectTimeout), opts.ControlPath())
 	}
 
-	optsDNS, err := adp.ResolveSSHOptions("dns-prod", SessionControlOptions{})
-	if err != nil || optsDNS == nil || optsDNS.Get(ssh.OptionConnectTimeout) != "99" {
-		t.Fatalf("dns-prod (Host.Address=prod) opts = (%+v, %v), want ConnectTimeout=99", optsDNS, err)
+	polDNS, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: "dns-prod"})
+	if err != nil || polDNS.Options() == nil || polDNS.Options().Get(ssh.OptionConnectTimeout) != "99" {
+		t.Fatalf("dns-prod (Host.Address=prod) opts = (%+v, %v), want ConnectTimeout=99", polDNS.Options(), err)
 	}
 }
 
@@ -225,13 +225,13 @@ Host *
 
 	adp := NewSSHAdapter(config.NewProviderWithOpenSSHParser(cfg, parser))
 
-	ctrl, err := adp.ResolveControl("prod-web", SessionControlOptions{})
-	if err != nil || ctrl != nil {
-		t.Fatalf("Bypass 2: wildcard Host prod-*/stage-* leaked ControlConfig onto 192.168.1.50: (%+v, %v)", ctrl, err)
+	pol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: "prod-web"})
+	if err != nil || pol.Control() != nil {
+		t.Fatalf("Bypass 2: wildcard Host prod-*/stage-* leaked ControlConfig onto 192.168.1.50: (%+v, %v)", pol.Control(), err)
 	}
-	opts, err := adp.ResolveSSHOptions("prod-web", SessionControlOptions{})
-	if err != nil || opts == nil {
-		t.Fatalf("ResolveSSHOptions(prod-web) = (%+v, %v), want Host * fallback", opts, err)
+	opts := pol.Options()
+	if opts == nil {
+		t.Fatalf("Resolve(prod-web) = (%+v, %v), want Host * fallback", opts, err)
 	}
 	if got := opts.Get(ssh.OptionConnectTimeout); got != "" {
 		t.Fatalf("Bypass 2: wildcard leaked ConnectTimeout=%q onto prod-web (192.168.1.50)", got)
@@ -274,8 +274,8 @@ Host *
 	repo.SetNodeOpenSSHOrigin("saved-app", config.OpenSSHOrigin{Alias: "app-old"})
 
 	adp := NewSSHAdapter(repo)
-	if optsBefore, err := adp.ResolveSSHOptions("saved-app", SessionControlOptions{}); err != nil || optsBefore == nil || optsBefore.Get(ssh.OptionConnectTimeout) != "66" {
-		t.Fatalf("before address change opts = (%+v, %v), want ConnectTimeout=66", optsBefore, err)
+	if polBefore, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: "saved-app"}); err != nil || polBefore.Options() == nil || polBefore.Options().Get(ssh.OptionConnectTimeout) != "66" {
+		t.Fatalf("before address change opts = (%+v, %v), want ConnectTimeout=66", polBefore.Options(), err)
 	}
 
 	snap := repo.Snapshot()
@@ -293,14 +293,14 @@ Host *
 
 func assertP5StaleOriginRejected(t *testing.T, label string, adp *SSHAdapter) {
 	t.Helper()
-	ctrl, err := adp.ResolveControl("saved-app", SessionControlOptions{})
-	if err != nil || ctrl != nil {
-		t.Fatalf("Bypass 3 (%s): stale snapOrigin leaked ControlConfig after Host.Address changed: (%+v, %v)", label, ctrl, err)
-	}
-	opts, err := adp.ResolveSSHOptions("saved-app", SessionControlOptions{})
+	pol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: "saved-app"})
 	if err != nil {
-		t.Fatalf("ResolveSSHOptions(%s): %v", label, err)
+		t.Fatalf("Resolve(%s): %v", label, err)
 	}
+	if ctrl := pol.Control(); ctrl != nil {
+		t.Fatalf("Bypass 3 (%s): stale snapOrigin leaked ControlConfig after Host.Address changed: %+v", label, ctrl)
+	}
+	opts := pol.Options()
 	if opts != nil && opts.Get(ssh.OptionConnectTimeout) != "" {
 		t.Fatalf("Bypass 3 (%s): stale snapOrigin leaked ConnectTimeout=%q", label, opts.Get(ssh.OptionConnectTimeout))
 	}
@@ -370,7 +370,7 @@ func TestP5_IdentityFileNoneTruncationAndKeyPathClear(t *testing.T) {
 				opts = append(opts, WithSessionAuthOverride("saved", *tc.authOverride))
 			}
 			if len(tc.cliOptions) > 0 {
-				sc, err := ParseOptionStrings(tc.cliOptions)
+				sc, err := ParseSessionOptions(tc.cliOptions, "")
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -392,7 +392,7 @@ func TestP5_IdentityFileNoneTruncationAndKeyPathClear(t *testing.T) {
 			t.Fatal(err)
 		}
 		prov := config.NewProviderWithOpenSSHParser(&config.Configuration{}, parser)
-		sc, err := ParseOptionStrings([]string{"IdentityFile=none"})
+		sc, err := ParseSessionOptions([]string{"IdentityFile=none"}, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -420,7 +420,7 @@ func TestP5_LayeredSessionControlOverridesAndDisableSharing(t *testing.T) {
 	})
 	prov := config.NewProviderWithoutOpenSSH(cfg)
 
-	globalCtrl, err := ParseOptionStrings([]string{
+	globalCtrl, err := ParseSessionOptions([]string{
 		"BatchMode=yes",
 		"StrictHostKeyChecking=yes",
 		"ConnectTimeout=15",
@@ -429,17 +429,17 @@ func TestP5_LayeredSessionControlOverridesAndDisableSharing(t *testing.T) {
 		"ControlPersist=5m",
 		"SendEnv=LANG",
 		"IdentityFile=/tmp/global_cli_key",
-	})
+	}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	nodeCtrl, err := ParseOptionStrings([]string{
+	nodeCtrl, err := ParseSessionOptions([]string{
 		"ConnectTimeout=3",
 		"ServerAliveInterval=10",
 		"ControlPath=/tmp/app-%C",
 		"IdentityFile=/tmp/node_cli_key",
 		"IdentityFile=none",
-	})
+	}, "")
 	if err != nil {
 		t.Fatal(err)
 	}

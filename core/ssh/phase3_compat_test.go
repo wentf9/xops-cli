@@ -125,7 +125,7 @@ func assertPhase3MergingAndSerialization(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	merged := MergeOptionLayers(high, low)
+	merged := MergeOptions(high, low)
 	if !slices.Equal(merged.CertificateFiles(), []string{"~/.ssh/id_ed25519-cert.pub", "~/.ssh/id_rsa-cert.pub"}) {
 		t.Fatalf("merged CertificateFiles = %v", merged.CertificateFiles())
 	}

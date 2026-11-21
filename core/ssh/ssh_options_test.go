@@ -203,9 +203,9 @@ func TestOptions_InheritanceAndControlBridge(t *testing.T) {
 		OptionConnectTimeout, "5s",
 	)
 
-	eff, err := EffectiveOptions(cli, node, global)
+	eff, err := MergeEffectiveOptions(cli, node, global)
 	if err != nil {
-		t.Fatalf("EffectiveOptions failed: %v", err)
+		t.Fatalf("MergeEffectiveOptions failed: %v", err)
 	}
 	if err := eff.ValidateEffective(); err != nil {
 		t.Fatalf("ValidateEffective failed: %v", err)
@@ -268,9 +268,9 @@ func TestOptions_ControlPathNoneNormalization(t *testing.T) {
 	// M4 (Root Cause 2): Higher tier overriding ControlPath over a middle tier's ControlPath=none
 	// must preserve the lower tier's ControlMaster=auto instead of prematurely zeroing it out.
 	tier1PathOverride := MustOptions(OptionControlPath, "/tmp/override.sock")
-	effMultiLayer, err := EffectiveOptions(tier1PathOverride, disableMux, global)
+	effMultiLayer, err := MergeEffectiveOptions(tier1PathOverride, disableMux, global)
 	if err != nil {
-		t.Fatalf("EffectiveOptions multi-layer failed: %v", err)
+		t.Fatalf("MergeEffectiveOptions multi-layer failed: %v", err)
 	}
 	if effMultiLayer.ControlMaster() != ControlMasterAuto || effMultiLayer.ControlPath() != "/tmp/override.sock" || effMultiLayer.ControlPersist() != "10m" {
 		t.Fatalf("expected Tier 1 path override to preserve Tier 3 ControlMaster=auto and ControlPersist=10m, got %+v", effMultiLayer.ControlConfig())
@@ -838,16 +838,16 @@ func TestEdgeCases_KnownHostsDir_AgentIdentitiesOnly_AlgoDefaults_PlanNormalizat
 		t.Fatal("expected removing all default secure ciphers to fail normalization")
 	}
 
-	// 4. MergeOptionLayers keeps ImplicitTier4=false when a higher layer sets ControlPersist
+	// 4. MergeOptions keeps ImplicitTier4=false when a higher layer sets ControlPersist
 	t2 := MustOptions(OptionControlPersist, "10m")
 	t4 := MustOptions(OptionControlMaster, "auto", OptionControlPath, "/tmp/cm-%C")
 	t4.ImplicitTier4 = true
-	merged := MergeOptionLayers(t2, t4)
+	merged := MergeOptions(t2, t4)
 	if merged == nil || merged.ImplicitTier4 {
 		t.Fatalf("expected ImplicitTier4=false when Tier 2 explicitly sets ControlPersist, got %+v", merged)
 	}
 	t2NoPersist := MustOptions(OptionConnectTimeout, "5s")
-	mergedImplicit := MergeOptionLayers(t2NoPersist, t4)
+	mergedImplicit := MergeOptions(t2NoPersist, t4)
 	if mergedImplicit == nil || !mergedImplicit.ImplicitTier4 {
 		t.Fatalf("expected ImplicitTier4=true when only Tier 4 provides mux options, got %+v", mergedImplicit)
 	}

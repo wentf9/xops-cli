@@ -107,14 +107,14 @@ func TestPass8_H3_DisambiguatedPendingAliasPreservesAllTier4ClassesAndGuardrails
 	}
 }
 
-func TestPass8_H4_ParseOptionStringsFirstWinsAndProxyOrdering(t *testing.T) {
-	verifyPass8ParseOptionStringsFirstWins(t)
-	verifyPass8ParseOptionStringsProxyOrdering(t)
+func TestPass8_H4_ParseSessionOptionsFirstWinsAndProxyOrdering(t *testing.T) {
+	verifyPass8ParseSessionOptionsFirstWins(t)
+	verifyPass8ParseSessionOptionsProxyOrdering(t)
 }
 
-func verifyPass8ParseOptionStringsFirstWins(t *testing.T) {
+func verifyPass8ParseSessionOptionsFirstWins(t *testing.T) {
 	t.Helper()
-	parsed, err := ParseOptionStrings([]string{
+	parsed, err := ParseSessionOptions([]string{
 		"StrictHostKeyChecking=yes",
 		"StrictHostKeyChecking=no",
 		"ControlMaster=yes",
@@ -131,9 +131,9 @@ func verifyPass8ParseOptionStringsFirstWins(t *testing.T) {
 		"IdentityFile=/tmp/k2",
 		"SendEnv=LC_ALL",
 		"SendEnv=LANG",
-	})
+	}, "")
 	if err != nil {
-		t.Fatalf("ParseOptionStrings failed: %v", err)
+		t.Fatalf("ParseSessionOptions failed: %v", err)
 	}
 	if parsed.Master == nil || *parsed.Master != ssh.ControlMasterYes {
 		t.Errorf("ControlMaster = %v, want yes", parsed.Master)
@@ -166,13 +166,13 @@ func verifyPass8ParseOptionStringsFirstWins(t *testing.T) {
 		{"SetEnv=FOO=1", "SetEnv=INVALID_TOKEN"},
 		{"HostName=valid.example.com", "HostName="},
 	} {
-		if _, err := ParseOptionStrings(bad); err == nil {
-			t.Errorf("ParseOptionStrings(%v) expected validation error on subsequent entry, got nil", bad)
+		if _, err := ParseSessionOptions(bad, ""); err == nil {
+			t.Errorf("ParseSessionOptions(%v) expected validation error on subsequent entry, got nil", bad)
 		}
 	}
 }
 
-func verifyPass8ParseOptionStringsProxyOrdering(t *testing.T) {
+func verifyPass8ParseSessionOptionsProxyOrdering(t *testing.T) {
 	t.Helper()
 	cases := []struct {
 		name      string
@@ -202,9 +202,9 @@ func verifyPass8ParseOptionStringsProxyOrdering(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p, err := ParseOptionStrings(tc.opts)
+			p, err := ParseSessionOptions(tc.opts, "")
 			if err != nil {
-				t.Fatalf("ParseOptionStrings(%v) failed: %v", tc.opts, err)
+				t.Fatalf("ParseSessionOptions(%v) failed: %v", tc.opts, err)
 			}
 			got := ""
 			if s := p.ToSSHOptions(); s != nil {

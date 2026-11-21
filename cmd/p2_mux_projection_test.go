@@ -347,10 +347,11 @@ func resolveP2ParentAndDaemonChild(
 	if err != nil {
 		t.Fatalf("parent toSessionControlOptions: %v", err)
 	}
-	parentEff, err = parentAdp.ResolveSSHOptions(parentNodeID, parentCtrl)
+	parentPol, err := parentAdp.Resolve(ctx, adapter.ResolveRequest{NodeID: parentNodeID, SessionControl: &parentCtrl})
 	if err != nil {
-		t.Fatalf("parent ResolveSSHOptions(%q): %v", parentNodeID, err)
+		t.Fatalf("parent Resolve(%q): %v", parentNodeID, err)
 	}
+	parentEff = parentPol.Options()
 
 	sockPath := filepath.Join(t.TempDir(), "p2-rt.sock")
 	spec := parentOpts.buildMuxDaemonSpecWithProvider(parentRepo, parentNodeID, sockPath, nil)
@@ -381,10 +382,11 @@ func resolveP2ParentAndDaemonChild(
 	if err != nil {
 		t.Fatalf("child toSessionControlOptions: %v", err)
 	}
-	childEff, err = childAdp.ResolveSSHOptions(childNodeID, childCtrl)
+	childPol, err := childAdp.Resolve(ctx, adapter.ResolveRequest{NodeID: childNodeID, SessionControl: &childCtrl})
 	if err != nil {
-		t.Fatalf("child ResolveSSHOptions(%q): %v", childNodeID, err)
+		t.Fatalf("child Resolve(%q): %v", childNodeID, err)
 	}
+	childEff = childPol.Options()
 	return parentCfg, childCfg, parentEff, childEff, childOpts, decoded
 }
 
@@ -606,7 +608,7 @@ func assertP2IdentityFileNoneOnlyTruncation(t *testing.T, p p2RoundTripPaths, ss
 		{"child", childCfg, childEff},
 	} {
 		if !slices.Equal(pair.eff.IdentityFiles(), []string{"none"}) {
-			t.Errorf("%s ResolveSSHOptions IdentityFiles = %v, want [none] (must truncate ~/.ssh/config)", pair.name, pair.eff.IdentityFiles())
+			t.Errorf("%s Resolve IdentityFiles = %v, want [none] (must truncate ~/.ssh/config)", pair.name, pair.eff.IdentityFiles())
 		}
 		if slices.Contains(pair.cfg.KeyPaths, p.cfgKey1) || slices.Contains(pair.cfg.KeyPaths, p.cfgKey2) {
 			t.Errorf("%s GetConfig KeyPaths leaked ~/.ssh/config keys despite IdentityFile=none: %v", pair.name, pair.cfg.KeyPaths)
@@ -643,7 +645,7 @@ func assertP2CLIKeyBeforeIdentityNoneTruncation(t *testing.T, p p2RoundTripPaths
 		{"child", childCfg, childEff},
 	} {
 		if !slices.Equal(pair.eff.IdentityFiles(), []string{p.cliKey}) {
-			t.Errorf("%s ResolveSSHOptions IdentityFiles = %v, want [%s]", pair.name, pair.eff.IdentityFiles(), p.cliKey)
+			t.Errorf("%s Resolve IdentityFiles = %v, want [%s]", pair.name, pair.eff.IdentityFiles(), p.cliKey)
 		}
 		if slices.Contains(pair.cfg.KeyPaths, p.cfgKey1) || slices.Contains(pair.cfg.KeyPaths, p.cfgKey2) {
 			t.Errorf("%s GetConfig KeyPaths leaked ~/.ssh/config keys after IdentityFile=none: %v", pair.name, pair.cfg.KeyPaths)
@@ -677,7 +679,7 @@ func assertP2CLIKeyWithoutNoneInheritsConfig(t *testing.T, p p2RoundTripPaths, s
 		{"child", childCfg, childEff},
 	} {
 		if !slices.Equal(pair.eff.IdentityFiles(), wantConfigKeys) {
-			t.Errorf("%s ResolveSSHOptions IdentityFiles = %v, want %v", pair.name, pair.eff.IdentityFiles(), wantConfigKeys)
+			t.Errorf("%s Resolve IdentityFiles = %v, want %v", pair.name, pair.eff.IdentityFiles(), wantConfigKeys)
 		}
 		if !slices.Equal(pair.cfg.KeyPaths, wantKeyPaths) {
 			t.Errorf("%s GetConfig KeyPaths = %v, want %v", pair.name, pair.cfg.KeyPaths, wantKeyPaths)

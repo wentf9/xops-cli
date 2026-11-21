@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/models"
 )
 
@@ -135,18 +136,23 @@ func TestRound6_P3_5_PrepareConfigurationStripsBeforePersist(t *testing.T) {
 func TestRound6_P1_1_And_P3_5_IPv6IndexingLookupAndSymmetricZoneComparison(t *testing.T) {
 	t.Parallel()
 
-	// P3-5: SameHostAddress must be symmetric and transitive for IPv6 zone IDs and IPv4-mapped IPv6.
-	if !SameHostAddress("fe80::0001%eth0", "fe80::1%eth0") {
-		t.Fatal("SameHostAddress failed for equivalent IPv6 with identical zone")
+	// P3-5: Endpoint equality must be symmetric and transitive for IPv6 zone IDs and IPv4-mapped IPv6.
+	sameEndpoint := func(a, b string) bool {
+		epA, errA := ssh.NewEndpoint(a, 22)
+		epB, errB := ssh.NewEndpoint(b, 22)
+		return errA == nil && errB == nil && epA.Equal(epB)
 	}
-	if SameHostAddress("fe80::1%eth0", "fe80::1%ETH0") || SameHostAddress("fe80::0001%eth0", "fe80::1%ETH0") {
-		t.Fatal("SameHostAddress must compare IPv6 zone IDs symmetrically (case-sensitive)")
+	if !sameEndpoint("fe80::0001%eth0", "fe80::1%eth0") {
+		t.Fatal("Endpoint.Equal failed for equivalent IPv6 with identical zone")
 	}
-	if !SameHostAddress("::ffff:10.0.0.1", "::ffff:0a00:0001") {
-		t.Fatal("SameHostAddress failed for equivalent IPv4-mapped IPv6 forms")
+	if sameEndpoint("fe80::1%eth0", "fe80::1%ETH0") || sameEndpoint("fe80::0001%eth0", "fe80::1%ETH0") {
+		t.Fatal("Endpoint.Equal must compare IPv6 zone IDs symmetrically (case-sensitive)")
 	}
-	if SameHostAddress("::ffff:10.0.0.1", "10.0.0.1") {
-		t.Fatal("SameHostAddress must keep IPv4-mapped IPv6 distinct from IPv4")
+	if !sameEndpoint("::ffff:10.0.0.1", "::ffff:0a00:0001") {
+		t.Fatal("Endpoint.Equal failed for equivalent IPv4-mapped IPv6 forms")
+	}
+	if sameEndpoint("::ffff:10.0.0.1", "10.0.0.1") {
+		t.Fatal("Endpoint.Equal must keep IPv4-mapped IPv6 distinct from IPv4")
 	}
 
 	// P1-1 root cause: ResolveSelector & ResolveTarget must match canonical & non-canonical IPv6 symmetrically.

@@ -1071,11 +1071,11 @@ func TestP6_4_1_OptionSpecCapabilityMetadataConvergence(t *testing.T) {
 	if !slices.Equal(prefSpec.FailClosedTokens, []string{"gssapi-with-mic", "hostbased"}) {
 		t.Fatalf("PreferredAuthentications FailClosedTokens = %v, want [gssapi-with-mic hostbased]", prefSpec.FailClosedTokens)
 	}
-	if got := FilterSupportedListValue("non_allow_list_option", "raw,val"); got != "raw,val" {
-		t.Fatalf("FilterSupportedListValue(unknown) = %q, want raw,val", got)
+	if _, err := ParseOption("non_allow_list_option", "raw,val", OptionSourceOpenSSHConfig); err == nil {
+		t.Fatal("ParseOption(unknown) unexpectedly succeeded")
 	}
-	if got := FilterSupportedListValue(OptionAddressFamily, "inet,inet6"); got != "inet,inet6" {
-		t.Fatalf("FilterSupportedListValue(non-allowlist) = %q, want inet,inet6", got)
+	if _, err := ParseOption(OptionAddressFamily, "inet,inet6", OptionSourceOpenSSHConfig); err == nil {
+		t.Fatal("ParseOption(AddressFamily, inet,inet6) unexpectedly succeeded")
 	}
 
 	p6AssertNoSwitchInSupportedListTokens(t)
@@ -1120,23 +1120,28 @@ func p6AssertOptionSpecCapabilityMetadata(t *testing.T, spec OptionSpec, wantAll
 		t.Errorf("%s: SupportedTokens() returned aliased mutable slice (got %q, want %q)", spec.CanonicalKey, got, saved)
 	}
 
+	p6AssertOptionSpecTokenParsing(t, spec)
+}
+
+func p6AssertOptionSpecTokenParsing(t *testing.T, spec OptionSpec) {
+	t.Helper()
 	for _, tok := range spec.SupportedTokens() {
 		if _, err := spec.Normalize(tok); err != nil {
 			t.Errorf("%s: Normalize(%q) failed for declared SupportedToken: %v", spec.CanonicalKey, tok, err)
 		}
-		if got := FilterSupportedListValue(spec.CanonicalKey, tok+",definitely-unsupported-openssh-token"); got != tok {
-			t.Errorf("%s: FilterSupportedListValue(canonical, %q) = %q, want %q", spec.CanonicalKey, tok, got, tok)
+		if parsed, err := ParseOption(spec.CanonicalKey, tok+",definitely-unsupported-openssh-token", OptionSourceOpenSSHConfig); err != nil || parsed.Normalized != tok {
+			t.Errorf("%s: ParseOption(canonical, %q) = (%q, %v), want (%q, nil)", spec.CanonicalKey, tok, parsed.Normalized, err, tok)
 		}
-		if got := FilterSupportedListValue(spec.OpenSSHName, tok+",definitely-unsupported-openssh-token"); got != tok {
-			t.Errorf("%s: FilterSupportedListValue(openSSHName, %q) = %q, want %q", spec.CanonicalKey, tok, got, tok)
+		if parsed, err := ParseOption(spec.OpenSSHName, tok+",definitely-unsupported-openssh-token", OptionSourceOpenSSHConfig); err != nil || parsed.Normalized != tok {
+			t.Errorf("%s: ParseOption(openSSHName, %q) = (%q, %v), want (%q, nil)", spec.CanonicalKey, tok, parsed.Normalized, err, tok)
 		}
 	}
 	for _, tok := range spec.FailClosedTokens {
 		if _, err := spec.Normalize(tok); err != nil {
 			t.Errorf("%s: Normalize(%q) failed for declared FailClosedToken: %v", spec.CanonicalKey, tok, err)
 		}
-		if got := FilterSupportedListValue(spec.CanonicalKey, tok+",definitely-unsupported"); got != tok {
-			t.Errorf("%s: FilterSupportedListValue(%q) = %q, want %q", spec.CanonicalKey, tok, got, tok)
+		if parsed, err := ParseOption(spec.CanonicalKey, tok+",definitely-unsupported", OptionSourceOpenSSHConfig); err != nil || parsed.Normalized != tok {
+			t.Errorf("%s: ParseOption(%q) = (%q, %v), want (%q, nil)", spec.CanonicalKey, tok, parsed.Normalized, err, tok)
 		}
 	}
 }

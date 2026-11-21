@@ -103,7 +103,7 @@ func TestP2_SplitOptionKeyValueDelegation(t *testing.T) {
 	}
 }
 
-func TestP2_ParseOptionStringsDeclarativeMergeMode(t *testing.T) {
+func TestP2_ParseSessionOptionsDeclarativeMergeMode(t *testing.T) {
 	t.Parallel()
 
 	specs := ssh.RegisteredOptionSpecs()
@@ -117,24 +117,24 @@ func TestP2_ParseOptionStringsDeclarativeMergeMode(t *testing.T) {
 		if !ok {
 			t.Fatalf("missing sample for %q", spec.CanonicalKey)
 		}
-		assertParseOptionStringsSpec(t, spec, sample)
+		assertParseSessionOptionsSpec(t, spec, sample)
 	}
 }
 
-func assertParseOptionStringsSpec(t *testing.T, spec ssh.OptionSpec, sample p2AdapterOptionSample) {
+func assertParseSessionOptionsSpec(t *testing.T, spec ssh.OptionSpec, sample p2AdapterOptionSample) {
 	t.Helper()
 
 	first := spec.OpenSSHName + "=" + sample.val1
 	second := spec.OpenSSHName + "=" + sample.val2
 	badSecond := spec.OpenSSHName + "=" + sample.invalid
 
-	parsed, err := ParseOptionStrings([]string{first, second})
+	parsed, err := ParseSessionOptions([]string{first, second}, "")
 	if err != nil {
-		t.Fatalf("ParseOptionStrings(%s) failed: %v", spec.OpenSSHName, err)
+		t.Fatalf("ParseSessionOptions(%s) failed: %v", spec.OpenSSHName, err)
 	}
 	opts := parsed.ToSSHOptions()
 	if opts == nil {
-		t.Fatalf("ParseOptionStrings(%s) produced nil Options", spec.OpenSSHName)
+		t.Fatalf("ParseSessionOptions(%s) produced nil Options", spec.OpenSSHName)
 	}
 
 	if spec.MergeMode.SingleDirectivePerLayer() {
@@ -153,21 +153,35 @@ func assertParseOptionStringsSpec(t *testing.T, spec ssh.OptionSpec, sample p2Ad
 	}
 
 	// Second directive must still be validated even when SingleDirectivePerLayer ignores its value.
-	if _, err := ParseOptionStrings([]string{first, badSecond}); err == nil {
+	if _, err := ParseSessionOptions([]string{first, badSecond}, ""); err == nil {
 		t.Errorf("%s accepted invalid second directive %q", spec.CanonicalKey, badSecond)
 	}
 }
 
-func TestP2_ResolveControlUsesMergeEffectiveOptions(t *testing.T) {
+func TestP2_ResolveUsesMergeEffectiveOptionsForControl(t *testing.T) {
 	t.Parallel()
+
+	resolveControlWithLower := func(t *testing.T, sc SessionControlOptions, lower *ssh.Options) (*ssh.ControlConfig, error) {
+		t.Helper()
+		cfg := newP7TestConfig()
+		cfg.Hosts.Set("h1", models.Host{Address: "10.0.0.1", Port: 22})
+		cfg.Identities.Set("id1", models.Identity{User: "ops", AuthType: "auto"})
+		cfg.Nodes.Set("app", models.Node{HostRef: "h1", IdentityRef: "id1", SSHOptions: lower.Clone()})
+		adp := NewSSHAdapter(config.NewProviderWithoutOpenSSH(cfg))
+		pol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: "app", SessionControl: &sc})
+		if err != nil {
+			return nil, err
+		}
+		return pol.Control(), nil
+	}
 
 	t.Run("MasterWithoutPathWrapsValidationErr", func(t *testing.T) {
 		t.Parallel()
 		var sc SessionControlOptions
 		sc.SetMaster(ssh.ControlMasterYes)
-		_, err := sc.ResolveControl()
+		_, err := resolveControlWithLower(t, sc, nil)
 		if !errors.Is(err, ssh.ErrSSHOptionsValidation) || !strings.Contains(err.Error(), `ControlMaster "yes" requires non-empty ControlPath`) {
-			t.Fatalf("ResolveControl(master=yes) err = %v, want ErrSSHOptionsValidation + requires non-empty ControlPath", err)
+			t.Fatalf("Resolve(master=yes) err = %v, want ErrSSHOptionsValidation + requires non-empty ControlPath", err)
 		}
 	})
 
@@ -175,9 +189,9 @@ func TestP2_ResolveControlUsesMergeEffectiveOptions(t *testing.T) {
 		t.Parallel()
 		var sc SessionControlOptions
 		sc.SetPersist("10m")
-		_, err := sc.ResolveControl()
+		_, err := resolveControlWithLower(t, sc, nil)
 		if !errors.Is(err, ssh.ErrSSHOptionsValidation) || !strings.Contains(err.Error(), "ControlPath is required when ControlPersist is configured") {
-			t.Fatalf("ResolveControl(persist=10m) err = %v, want ErrSSHOptionsValidation + ControlPath is required", err)
+			t.Fatalf("Resolve(persist=10m) err = %v, want ErrSSHOptionsValidation + ControlPath is required", err)
 		}
 	})
 
@@ -190,9 +204,9 @@ func TestP2_ResolveControlUsesMergeEffectiveOptions(t *testing.T) {
 			ssh.OptionControlPath, "/tmp/cm-%C",
 			ssh.OptionControlPersist, "10m",
 		)
-		_, err := sc.ResolveControl(lower)
+		_, err := resolveControlWithLower(t, sc, lower)
 		if !errors.Is(err, ssh.ErrSSHOptionsValidation) {
-			t.Fatalf("ResolveControl(cross-layer master=no + persist=10m) err = %v, want ErrSSHOptionsValidation", err)
+			t.Fatalf("Resolve(cross-layer master=no + persist=10m) err = %v, want ErrSSHOptionsValidation", err)
 		}
 	})
 
@@ -200,9 +214,9 @@ func TestP2_ResolveControlUsesMergeEffectiveOptions(t *testing.T) {
 		t.Parallel()
 		var sc SessionControlOptions
 		sc.SetMaster(ssh.ControlMasterNo)
-		ctrl, err := sc.ResolveControl()
+		ctrl, err := resolveControlWithLower(t, sc, nil)
 		if err != nil || ctrl != nil {
-			t.Fatalf("ResolveControl(master=no alone) = (%+v, %v), want (nil, nil)", ctrl, err)
+			t.Fatalf("Resolve(master=no alone) = (%+v, %v), want (nil, nil)", ctrl, err)
 		}
 	})
 
@@ -215,12 +229,12 @@ func TestP2_ResolveControlUsesMergeEffectiveOptions(t *testing.T) {
 			ssh.OptionControlPath, "/tmp/cm-%C",
 			ssh.OptionControlPersist, "10m",
 		)
-		ctrl, err := sc.ResolveControl(lower)
+		ctrl, err := resolveControlWithLower(t, sc, lower)
 		if err != nil {
-			t.Fatalf("ResolveControl(path=NONE) unexpected err: %v", err)
+			t.Fatalf("Resolve(path=NONE) unexpected err: %v", err)
 		}
 		if ctrl == nil || ctrl.Path != "none" || ctrl.Master != ssh.ControlMasterNo || ctrl.Persist != "" || ctrl.AllowReuse {
-			t.Fatalf("ResolveControl(path=NONE) = %+v, want disabled none with AllowReuse=false", ctrl)
+			t.Fatalf("Resolve(path=NONE) = %+v, want disabled none with AllowReuse=false", ctrl)
 		}
 	})
 
@@ -229,12 +243,12 @@ func TestP2_ResolveControlUsesMergeEffectiveOptions(t *testing.T) {
 		sc := SessionControlOptions{AllowReuse: true}
 		sc.SetPath("/tmp/cli.sock")
 		lower := ssh.MustOptions(ssh.OptionControlMaster, "yes")
-		ctrl, err := sc.ResolveControl(lower)
+		ctrl, err := resolveControlWithLower(t, sc, lower)
 		if err != nil {
-			t.Fatalf("ResolveControl(-S + lower Master=yes) err: %v", err)
+			t.Fatalf("Resolve(-S + lower Master=yes) err: %v", err)
 		}
 		if ctrl == nil || !ctrl.AllowReuse || ctrl.Master != ssh.ControlMasterYes || ctrl.Path != "/tmp/cli.sock" {
-			t.Fatalf("ResolveControl(-S + lower Master=yes) = %+v, want AllowReuse=true Master=yes Path=/tmp/cli.sock", ctrl)
+			t.Fatalf("Resolve(-S + lower Master=yes) = %+v, want AllowReuse=true Master=yes Path=/tmp/cli.sock", ctrl)
 		}
 	})
 }
@@ -301,12 +315,12 @@ func TestP2_GetConfigIntraCLIIdentityFileNoneTruncation(t *testing.T) {
 	t.Run("NoneBeforeExtraTruncatesExtraOnManagedNode", func(t *testing.T) {
 		t.Parallel()
 		prov := setupManaged("", ssh.MustOptions(ssh.OptionIdentityFile, "/tmp/node_tier2_key"))
-		sc, err := ParseOptionStrings([]string{
+		sc, err := ParseSessionOptions([]string{
 			"IdentityFile=none",
 			"IdentityFile=/tmp/extra",
-		})
+		}, "")
 		if err != nil {
-			t.Fatalf("ParseOptionStrings: %v", err)
+			t.Fatalf("ParseSessionOptions: %v", err)
 		}
 		adp := NewSSHAdapter(prov, WithSessionControlOverride("srv", sc))
 		clientCfg, err := adp.GetConfig("srv")
@@ -327,13 +341,13 @@ func TestP2_GetConfigIntraCLIIdentityFileNoneTruncation(t *testing.T) {
 	t.Run("ConcreteThenNoneThenExtraTruncatesExtraAndLowerTier", func(t *testing.T) {
 		t.Parallel()
 		prov := setupManaged("", ssh.MustOptions(ssh.OptionIdentityFile, "/tmp/node_tier2_key"))
-		sc, err := ParseOptionStrings([]string{
+		sc, err := ParseSessionOptions([]string{
 			"IdentityFile=/tmp/first",
 			"IdentityFile=NONE",
 			"IdentityFile=/tmp/extra",
-		})
+		}, "")
 		if err != nil {
-			t.Fatalf("ParseOptionStrings: %v", err)
+			t.Fatalf("ParseSessionOptions: %v", err)
 		}
 		adp := NewSSHAdapter(prov, WithSessionControlOverride("srv", sc))
 		clientCfg, err := adp.GetConfig("srv")
@@ -358,12 +372,12 @@ Host vapp
 			t.Fatalf("NewOpenSSHParserFromReader: %v", err)
 		}
 		prov := config.NewProviderWithOpenSSHParser(&config.Configuration{}, parser)
-		sc, err := ParseOptionStrings([]string{
+		sc, err := ParseSessionOptions([]string{
 			"IdentityFile=none",
 			"IdentityFile=/tmp/extra",
-		})
+		}, "")
 		if err != nil {
-			t.Fatalf("ParseOptionStrings: %v", err)
+			t.Fatalf("ParseSessionOptions: %v", err)
 		}
 		nodeID := config.OpenSSHNodePrefix + "vapp"
 		adp := NewSSHAdapter(prov, WithSessionControlOverride(nodeID, sc))
@@ -382,12 +396,12 @@ Host vapp
 	t.Run("MultipleConcreteCLIIdentityFilesPreservedInOrder", func(t *testing.T) {
 		t.Parallel()
 		prov := setupManaged("", nil)
-		sc, err := ParseOptionStrings([]string{
+		sc, err := ParseSessionOptions([]string{
 			"IdentityFile=/tmp/a",
 			"IdentityFile=/tmp/b",
-		})
+		}, "")
 		if err != nil {
-			t.Fatalf("ParseOptionStrings: %v", err)
+			t.Fatalf("ParseSessionOptions: %v", err)
 		}
 		adp := NewSSHAdapter(prov, WithSessionControlOverride("srv", sc))
 		clientCfg, err := adp.GetConfig("srv")

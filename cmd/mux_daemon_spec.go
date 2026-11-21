@@ -305,7 +305,7 @@ func (o *SshOptions) resolveMuxDaemonJumpHost(master *ssh.MuxServer) string {
 }
 
 func (o *SshOptions) resolveMuxDaemonIdentityFiles(nodeID string, master *ssh.MuxServer, forTarget bool) []string {
-	keys := truncateIdentityFilesAtNone(o.effectiveIdentityFiles())
+	keys := canonicalIdentityFileSlice(o.effectiveIdentityFiles())
 	firstCLIKey := o.firstCLIIdentityFile(keys)
 	if forTarget {
 		if len(keys) > 0 {
@@ -489,7 +489,7 @@ func (o *SshOptions) applyMuxDaemonSpec(spec MuxDaemonSpec) error {
 	o.ForceTTYCount = 0
 	o.cliTTYMode = ""
 
-	o.IdentityFiles = truncateIdentityFilesAtNone(spec.IdentityFiles)
+	o.IdentityFiles = canonicalIdentityFileSlice(spec.IdentityFiles)
 	o.IdentityFile = ""
 	o.identityFromCLIOptions = len(o.IdentityFiles) > 0
 	o.syncIdentityFiles()

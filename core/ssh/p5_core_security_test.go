@@ -1159,35 +1159,7 @@ func TestP5_4_2_NoneTerminationSingleLayerAndCollectors(t *testing.T) {
 
 	t.Run("Options_Append_truncates_and_preserves_none_sentinel", func(t *testing.T) {
 		for _, optKey := range []string{OptionIdentityFile, OptionCertificateFile} {
-			layer := &Options{}
-			if err := layer.Append(optKey, "/tmp/first"); err != nil {
-				t.Fatal(err)
-			}
-			if err := layer.Append(optKey, "NONE"); err != nil {
-				t.Fatal(err)
-			}
-			if err := layer.Append(optKey, "/tmp/after_none"); err != nil {
-				t.Fatal(err)
-			}
-			if got := layer.GetAll(optKey); !slices.Equal(got, []string{"/tmp/first", "none"}) {
-				t.Fatalf("%s Append = %v, want [/tmp/first none]", optKey, got)
-			}
-			// Syntax validation still runs even after none.
-			if err := layer.Append(optKey, "/tmp/bad_%k"); !errors.Is(err, ErrSSHOptionsValidation) {
-				t.Fatalf("%s Append invalid after none: err=%v, want ErrSSHOptionsValidation", optKey, err)
-			}
-			// Merging over a lower layer must still truncate lower layer entries while retaining termination bit.
-			lower := MustOptions(optKey, "/tmp/lower_secret")
-			merged := MergeOptions(layer, lower)
-			if optKey == OptionIdentityFile {
-				if got := merged.IdentityFiles(); !slices.Equal(got, []string{"/tmp/first"}) || !merged.IdentityPathList().Terminated() {
-					t.Fatalf("%s MergeOptions = (%v, terminated=%v), want ([/tmp/first], true)", optKey, got, merged.IdentityPathList().Terminated())
-				}
-			} else {
-				if got := merged.CertificateFiles(); !slices.Equal(got, []string{"/tmp/first"}) || !merged.CertificatePathList().Terminated() {
-					t.Fatalf("%s MergeOptions = (%v, terminated=%v), want ([/tmp/first], true)", optKey, got, merged.CertificatePathList().Terminated())
-				}
-			}
+			assertNoneTerminatedAppendAndMerge(t, optKey)
 		}
 	})
 
@@ -1196,24 +1168,53 @@ func TestP5_4_2_NoneTerminationSingleLayerAndCollectors(t *testing.T) {
 		if err := yaml.Unmarshal([]byte("identity_file:\n  - /tmp/k1\n  - none\n  - /tmp/k2\ncertificate_file:\n  - NONE\n  - /tmp/c2\n"), &fromYAML); err != nil {
 			t.Fatalf("yaml.Unmarshal: %v", err)
 		}
-		if got := fromYAML.IdentityFiles(); !slices.Equal(got, []string{"/tmp/k1"}) || !fromYAML.IdentityPathList().Terminated() {
-			t.Fatalf("YAML IdentityFiles = (%v, terminated=%v), want ([/tmp/k1], true)", got, fromYAML.IdentityPathList().Terminated())
-		}
-		if got := fromYAML.CertificateFiles(); !slices.Equal(got, []string{"none"}) || !fromYAML.CertificatePathList().IsDisabled() {
-			t.Fatalf("YAML CertificateFiles = %v, want [none]", got)
-		}
+		assertNoneTerminatedDecodedOptions(t, "YAML", &fromYAML)
 
 		var fromJSON Options
 		if err := json.Unmarshal([]byte(`{"identity_file":["/tmp/k1","none","/tmp/k2"],"certificate_file":["none","/tmp/c2"]}`), &fromJSON); err != nil {
 			t.Fatalf("json.Unmarshal: %v", err)
 		}
-		if got := fromJSON.IdentityFiles(); !slices.Equal(got, []string{"/tmp/k1"}) || !fromJSON.IdentityPathList().Terminated() {
-			t.Fatalf("JSON IdentityFiles = (%v, terminated=%v), want ([/tmp/k1], true)", got, fromJSON.IdentityPathList().Terminated())
-		}
-		if got := fromJSON.CertificateFiles(); !slices.Equal(got, []string{"none"}) || !fromJSON.CertificatePathList().IsDisabled() {
-			t.Fatalf("JSON CertificateFiles = %v, want [none]", got)
-		}
+		assertNoneTerminatedDecodedOptions(t, "JSON", &fromJSON)
 	})
+}
+
+func assertNoneTerminatedAppendAndMerge(t *testing.T, optKey string) {
+	t.Helper()
+	layer := &Options{}
+	for _, v := range []string{"/tmp/first", "NONE", "/tmp/after_none"} {
+		if err := layer.Append(optKey, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := layer.GetAll(optKey); !slices.Equal(got, []string{"/tmp/first", "none"}) {
+		t.Fatalf("%s Append = %v, want [/tmp/first none]", optKey, got)
+	}
+	// Syntax validation still runs even after none.
+	if err := layer.Append(optKey, "/tmp/bad_%k"); !errors.Is(err, ErrSSHOptionsValidation) {
+		t.Fatalf("%s Append invalid after none: err=%v, want ErrSSHOptionsValidation", optKey, err)
+	}
+	// Merging over a lower layer must still truncate lower layer entries while retaining termination bit.
+	merged := MergeOptions(layer, MustOptions(optKey, "/tmp/lower_secret"))
+	var got []string
+	var terminated bool
+	if optKey == OptionIdentityFile {
+		got, terminated = merged.IdentityFiles(), merged.IdentityPathList().Terminated()
+	} else {
+		got, terminated = merged.CertificateFiles(), merged.CertificatePathList().Terminated()
+	}
+	if !slices.Equal(got, []string{"/tmp/first"}) || !terminated {
+		t.Fatalf("%s MergeOptions = (%v, terminated=%v), want ([/tmp/first], true)", optKey, got, terminated)
+	}
+}
+
+func assertNoneTerminatedDecodedOptions(t *testing.T, format string, decoded *Options) {
+	t.Helper()
+	if got := decoded.IdentityFiles(); !slices.Equal(got, []string{"/tmp/k1"}) || !decoded.IdentityPathList().Terminated() {
+		t.Fatalf("%s IdentityFiles = (%v, terminated=%v), want ([/tmp/k1], true)", format, got, decoded.IdentityPathList().Terminated())
+	}
+	if got := decoded.CertificateFiles(); !slices.Equal(got, []string{"none"}) || !decoded.CertificatePathList().IsDisabled() {
+		t.Fatalf("%s CertificateFiles = %v, want [none]", format, got)
+	}
 }
 
 func TestP5_4_2_CollectorsBreakOnNone(t *testing.T) {

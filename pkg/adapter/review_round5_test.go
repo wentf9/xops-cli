@@ -155,10 +155,11 @@ func TestRound5_P2_7_SavedSameNameOpenSSHAliasIsolationAndPrecedence(t *testing.
 		OriginalHost:  "short-app",
 		CanonicalHost: "short-app.corp.example.com",
 	}))
-	opts1, err := adpTier1.ResolveSSHOptions("shared-app", SessionControlOptions{})
+	pol1, err := adpTier1.Resolve(t.Context(), ResolveRequest{NodeID: "shared-app"})
 	if err != nil {
-		t.Fatalf("ResolveSSHOptions(tier1): %v", err)
+		t.Fatalf("Resolve(tier1): %v", err)
 	}
+	opts1 := pol1.Options()
 	if opts1.Get(ssh.OptionConnectTimeout) != "15" || opts1.Get(ssh.OptionServerAliveInterval) != "23" || opts1.Get(ssh.OptionServerAliveCountMax) != "" {
 		t.Fatalf("expected Tier 1 Pass-1 (15) + Pass-2 (23) with no leak, got ConnectTimeout=%q ServerAliveInterval=%q ServerAliveCountMax=%q",
 			opts1.Get(ssh.OptionConnectTimeout), opts1.Get(ssh.OptionServerAliveInterval), opts1.Get(ssh.OptionServerAliveCountMax))
@@ -169,17 +170,18 @@ func TestRound5_P2_7_SavedSameNameOpenSSHAliasIsolationAndPrecedence(t *testing.
 		t.Fatalf("SetNodeOpenSSHAlias(empty) did not clear side-map: got %q", got)
 	}
 	adpDefault := NewSSHAdapter(repo)
-	opts2, err := adpDefault.ResolveSSHOptions("shared-app", SessionControlOptions{})
+	pol2, err := adpDefault.Resolve(t.Context(), ResolveRequest{NodeID: "shared-app"})
 	if err != nil {
-		t.Fatalf("ResolveSSHOptions(same-name saved node): %v", err)
+		t.Fatalf("Resolve(same-name saved node): %v", err)
 	}
+	opts2 := pol2.Options()
 	if opts2.Get(ssh.OptionConnectTimeout) != "15" || opts2.Get(ssh.OptionServerAliveCountMax) != "" {
 		t.Fatalf("same-name saved node with IPv6 equivalence expected ConnectTimeout=15 and no ServerAliveCountMax leak, got ConnectTimeout=%q ServerAliveCountMax=%q",
 			opts2.Get(ssh.OptionConnectTimeout), opts2.Get(ssh.OptionServerAliveCountMax))
 	}
 }
 
-func TestRound5_P2_9_ResolveSSHOptionsDoesNotLatchBatchMode(t *testing.T) {
+func TestRound5_P2_9_ResolveDoesNotLatchBatchMode(t *testing.T) {
 	t.Parallel()
 
 	sshCfg := "Host batchbox\n  HostName 10.1.2.3\n  User ops\n  BatchMode yes\n"
@@ -203,15 +205,16 @@ func TestRound5_P2_9_ResolveSSHOptionsDoesNotLatchBatchMode(t *testing.T) {
 	}
 	adp := NewSSHAdapter(repo)
 
-	opts, err := adp.ResolveSSHOptions(prep.NodeID, SessionControlOptions{})
+	pol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: prep.NodeID})
 	if err != nil {
-		t.Fatalf("ResolveSSHOptions failed: %v", err)
+		t.Fatalf("Resolve failed: %v", err)
 	}
+	opts := pol.Options()
 	if !opts.BatchMode() {
-		t.Fatal("expected ResolveSSHOptions to report BatchMode=yes from Tier 4")
+		t.Fatal("expected Resolve to report BatchMode=yes from Tier 4")
 	}
 	if adp.isBatchModeLatched(prep.NodeID) {
-		t.Fatal("read-only ResolveSSHOptions must NOT latch BatchMode onto SSHAdapter")
+		t.Fatal("read-only Resolve must NOT latch BatchMode onto SSHAdapter")
 	}
 
 	if _, err := adp.GetConfig(prep.NodeID); err != nil {
@@ -232,8 +235,8 @@ func TestRound5_P2_10_ProxyJumpCommaPreservesProxyCommand(t *testing.T) {
 	}
 	prov := config.NewProviderWithOpenSSHParser(nil, parser)
 
-	if kind := classifyProxyJump(" , "); kind == proxyActive {
-		t.Fatalf("classifyProxyJump(\" , \") = %v, must not be proxyActive", kind)
+	if ps := proxySettingFromJumpString(" , "); ps.Kind() == ssh.ProxyJump {
+		t.Fatalf("proxySettingFromJumpString(\" , \") = %v, must not be ProxyJump", ps)
 	}
 
 	adp := NewSSHAdapter(prov, WithLocalExecution(true), WithSessionAuthOverride(config.OpenSSHNodePrefix+"target-box", SessionAuth{
@@ -248,30 +251,30 @@ func TestRound5_P2_10_ProxyJumpCommaPreservesProxyCommand(t *testing.T) {
 	}
 }
 
-func TestRound5_P2_12_ParseOptionStringsSupportsSnakeCaseIdentityFileAndProxyJump(t *testing.T) {
+func TestRound5_P2_12_ParseSessionOptionsSupportsSnakeCaseIdentityFileAndProxyJump(t *testing.T) {
 	t.Parallel()
 
-	parsed, err := ParseOptionStrings([]string{
+	parsed, err := ParseSessionOptions([]string{
 		"identity_file=/tmp/r5_id",
 		"proxy_jump=bastion-r5",
-	})
+	}, "")
 	if err != nil {
-		t.Fatalf("ParseOptionStrings failed: %v", err)
+		t.Fatalf("ParseSessionOptions failed: %v", err)
 	}
 	if files := parsed.Options.IdentityFiles(); len(files) != 1 || files[0] != "/tmp/r5_id" {
 		t.Fatalf("identity_file not parsed cleanly: %v", files)
 	}
-	suppressed, err := ParseOptionStrings([]string{
+	suppressed, err := ParseSessionOptions([]string{
 		"proxy_jump=bastion-r5",
 		"ProxyCommand=nc %h %p",
-	})
+	}, "")
 	if err != nil {
-		t.Fatalf("ParseOptionStrings(proxy_jump + ProxyCommand) failed: %v", err)
+		t.Fatalf("ParseSessionOptions(proxy_jump + ProxyCommand) failed: %v", err)
 	}
 	if sshOpts := suppressed.ToSSHOptions(); sshOpts != nil && sshOpts.Get(ssh.OptionProxyCommand) != "" {
-		t.Fatalf("proxy_jump did not activate proxyJumpActive suppression: ProxyCommand=%q", sshOpts.Get(ssh.OptionProxyCommand))
+		t.Fatalf("proxy_jump did not activate ProxyJump suppression: ProxyCommand=%q", sshOpts.Get(ssh.OptionProxyCommand))
 	}
-	if _, err := ParseOptionStrings([]string{"proxy_jump="}); err == nil {
+	if _, err := ParseSessionOptions([]string{"proxy_jump="}, ""); err == nil {
 		t.Fatal("expected empty proxy_jump value to be rejected")
 	}
 }

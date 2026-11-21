@@ -46,24 +46,22 @@ func TestSolveProxyPrecedencePureMatrix(t *testing.T) {
 			Node:       models.Node{ProxyJump: "saved-jump"},
 			Provenance: config.ProvenanceSavedManaged,
 		}
-		_, m3, _, higherCmdWins := solveProxyPrecedence(proxyDisabled, nil, snap, true, nil, t3, nil)
-		if higherCmdWins {
-			t.Fatal("tier1 ProxyJump=none must not claim higherCmdWins")
-		}
-		if got := m3.Get(ssh.OptionProxyCommand); got != "global-cmd %h %p" {
-			t.Fatalf("expected tier1 -J none to preserve Tier-3 ProxyCommand, got %q", got)
+		eff, _ := resolveFourTierProxySetting(true, SessionAuth{ProxyJump: "none"}, nil, snap, true, nil, t3, nil)
+		cmd, ok := eff.Command()
+		if !ok || cmd != "global-cmd %h %p" {
+			t.Fatalf("expected tier1 -J none to reveal Tier-3 ProxyCommand, got (%v, %q)", eff.Kind(), cmd)
 		}
 	})
 
-	t.Run("tier1_proxycommand_none_shadows_tier3_active_command_over_tier4_jump", func(t *testing.T) {
+	t.Run("tier1_proxycommand_none_disables_all_lower_proxy_directives", func(t *testing.T) {
 		t3 := mkProxyOpts("global-cmd %h %p")
 		snap := config.ConnectionSnapshot{
 			Node:       models.Node{ProxyJump: "openssh:jump"},
 			Provenance: config.ProvenanceOpenSSHVirtual,
 		}
-		_, _, _, higherCmdWins := solveProxyPrecedence(proxyUnset, mkProxyOpts("none"), snap, true, nil, t3, nil)
-		if higherCmdWins {
-			t.Fatal("tier1 ProxyCommand=none must stop higher-tier ProxyCommand search before tier3")
+		eff, _ := resolveFourTierProxySetting(false, SessionAuth{}, mkProxyOpts("none"), snap, true, nil, t3, nil)
+		if !eff.Equal(ssh.DisabledProxySetting()) {
+			t.Fatalf("tier1 ProxyCommand=none must disable all lower proxy directives, got %v", eff)
 		}
 	})
 }
@@ -77,13 +75,12 @@ func assertTier1JumpMasksAllLower(t *testing.T, mkProxyOpts func(string) *ssh.Op
 		Node:       models.Node{ProxyJump: "saved-jump"},
 		Provenance: config.ProvenanceSavedManaged,
 	}
-	m2, m3, m4, higherCmdWins := solveProxyPrecedence(proxyActive, mkProxyOpts("t1-cmd %h %p"), snap, true, t2, t3, t4)
-	if higherCmdWins {
-		t.Fatal("tier1 active ProxyJump must not allow higherTierProxyCommandWins")
+	eff, tier1Won := resolveFourTierProxySetting(true, SessionAuth{ProxyJump: "cli-jump"}, mkProxyOpts("t1-cmd %h %p"), snap, true, t2, t3, t4)
+	if !tier1Won || eff.Kind() != ssh.ProxyJump {
+		t.Fatalf("expected tier1 active ProxyJump to win, got (%v, tier1Won=%v)", eff, tier1Won)
 	}
-	if m2.Get(ssh.OptionProxyCommand) != "" || m3.Get(ssh.OptionProxyCommand) != "" || m4.Get(ssh.OptionProxyCommand) != "" {
-		t.Fatalf("expected all lower ProxyCommand masked, got m2=%q m3=%q m4=%q",
-			m2.Get(ssh.OptionProxyCommand), m3.Get(ssh.OptionProxyCommand), m4.Get(ssh.OptionProxyCommand))
+	if cmd, ok := eff.Command(); ok || cmd != "" {
+		t.Fatalf("expected all lower ProxyCommand masked, got %q", cmd)
 	}
 }
 
@@ -96,21 +93,17 @@ func assertSavedJumpMasksLowerAndTier1CmdOverrides(t *testing.T, mkProxyOpts fun
 		Node:       models.Node{ProxyJump: "saved-jump"},
 		Provenance: config.ProvenanceSavedManaged,
 	}
-	m2, m3, m4, higherCmdWinsNoT1 := solveProxyPrecedence(proxyUnset, nil, snap, true, t2, t3, t4)
-	if higherCmdWinsNoT1 {
-		t.Fatal("tier3 ProxyCommand must not override saved node ProxyJump")
+	effNoT1, _ := resolveFourTierProxySetting(false, SessionAuth{}, nil, snap, true, t2, t3, t4)
+	if effNoT1.Kind() != ssh.ProxyJump {
+		t.Fatalf("saved node ProxyJump must mask tier2/tier3/tier4 ProxyCommand, got %v", effNoT1)
 	}
-	if m2.Get(ssh.OptionProxyCommand) != "" || m3.Get(ssh.OptionProxyCommand) != "" || m4.Get(ssh.OptionProxyCommand) != "" {
-		t.Fatalf("saved node ProxyJump must mask tier2, tier3, and tier4 ProxyCommand, got m2=%q m3=%q m4=%q",
-			m2.Get(ssh.OptionProxyCommand), m3.Get(ssh.OptionProxyCommand), m4.Get(ssh.OptionProxyCommand))
+	effWithT1, _ := resolveFourTierProxySetting(false, SessionAuth{}, mkProxyOpts("cli-cmd %h %p"), snap, true, t2, t3, t4)
+	if cmd, ok := effWithT1.Command(); !ok || cmd != "cli-cmd %h %p" {
+		t.Fatalf("tier1 ProxyCommand must override saved node ProxyJump, got %v", effWithT1)
 	}
-	_, _, _, higherCmdWinsWithT1 := solveProxyPrecedence(proxyUnset, mkProxyOpts("cli-cmd %h %p"), snap, true, t2, t3, t4)
-	if !higherCmdWinsWithT1 {
-		t.Fatal("tier1 ProxyCommand must override saved node ProxyJump")
-	}
-	_, _, _, noneCmdNoOverride := solveProxyPrecedence(proxyUnset, mkProxyOpts("none"), snap, true, t2, t3, t4)
-	if noneCmdNoOverride {
-		t.Fatal("tier1 ProxyCommand=none must not claim higherTierProxyCommandWins")
+	effNoneCmd, _ := resolveFourTierProxySetting(false, SessionAuth{}, mkProxyOpts("none"), snap, true, t2, t3, t4)
+	if !effNoneCmd.Equal(ssh.DisabledProxySetting()) {
+		t.Fatalf("tier1 ProxyCommand=none must disable saved node ProxyJump (OpenSSH semantics), got %v", effNoneCmd)
 	}
 }
 
@@ -123,12 +116,9 @@ func assertUnpersistedJumpOverriddenByTier3(t *testing.T, mkProxyOpts func(strin
 			Node:       models.Node{ProxyJump: "openssh:jump"},
 			Provenance: prov,
 		}
-		_, m3, m4, higherCmdWins := solveProxyPrecedence(proxyUnset, nil, snap, true, nil, t3, t4)
-		if !higherCmdWins {
-			t.Errorf("%s: expected tier3 global ProxyCommand to override Tier-4 ProxyJump", prov)
-		}
-		if m3.Get(ssh.OptionProxyCommand) == "" || m4.Get(ssh.OptionProxyCommand) == "" {
-			t.Errorf("%s: unpersisted OpenSSH ProxyJump must not mask tier3/tier4 ProxyCommand", prov)
+		eff, _ := resolveFourTierProxySetting(false, SessionAuth{}, nil, snap, true, nil, t3, t4)
+		if cmd, ok := eff.Command(); !ok || cmd != "global-cmd %h %p" {
+			t.Errorf("%s: expected tier3 global ProxyCommand to override Tier-4 ProxyJump, got %v", prov, eff)
 		}
 	}
 }
@@ -141,12 +131,9 @@ func assertUnpersistedJumpMasksTier4(t *testing.T, mkProxyOpts func(string) *ssh
 			Node:       models.Node{ProxyJump: "openssh:jump"},
 			Provenance: prov,
 		}
-		_, _, m4, higherCmdWins := solveProxyPrecedence(proxyUnset, nil, snap, true, nil, nil, t4)
-		if higherCmdWins {
-			t.Errorf("%s: unpersisted OpenSSH ProxyJump must not report higherTierProxyCommandWins", prov)
-		}
-		if got := m4.ActiveProxyCommand(); got != "" {
-			t.Errorf("%s: unpersisted OpenSSH ProxyJump must mask tier4 ProxyCommand, got %q", prov, got)
+		eff, _ := resolveFourTierProxySetting(false, SessionAuth{}, nil, snap, true, nil, nil, t4)
+		if eff.Kind() != ssh.ProxyJump {
+			t.Errorf("%s: unpersisted OpenSSH ProxyJump must mask tier4 ProxyCommand, got %v", prov, eff)
 		}
 	}
 }
@@ -163,8 +150,8 @@ func TestPolicySolver_BrokenAndInvalidOpenSSHErrorsAndControlProxy(t *testing.T)
 		if _, err := adp.GetConfig("saved"); err != nil {
 			t.Fatalf("saved node failed with broken ssh_config: %v", err)
 		}
-		if _, err := adp.ResolveControl("missing-openssh", SessionControlOptions{}); err == nil {
-			t.Fatal("ResolveControl on non-saved target should fail closed on broken ssh_config")
+		if _, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: "missing-openssh"}); err == nil {
+			t.Fatal("Resolve on non-saved target should fail closed on broken ssh_config")
 		}
 		if _, err := adp.GetConfig(config.OpenSSHNodePrefix + "web"); err == nil {
 			t.Fatal("GetConfig(openssh:web) should fail closed on broken ssh_config")
@@ -181,8 +168,8 @@ func TestPolicySolver_BrokenAndInvalidOpenSSHErrorsAndControlProxy(t *testing.T)
 		cfg.Identities.Set("id1", models.Identity{User: "ops", AuthType: "auto"})
 		cfg.Nodes.Set("edge", models.Node{HostRef: "h1", IdentityRef: "id1"})
 		adp := NewSSHAdapter(config.NewProviderWithOpenSSHParser(cfg, parser))
-		if _, err := adp.ResolveControl("edge", SessionControlOptions{}); err == nil {
-			t.Fatal("expected invalid ControlMaster from Tier 4 to fail ResolveControl")
+		if _, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: "edge"}); err == nil {
+			t.Fatal("expected invalid ControlMaster from Tier 4 to fail Resolve")
 		}
 	})
 
@@ -213,7 +200,7 @@ func TestPolicySolver_BrokenAndInvalidOpenSSHErrorsAndControlProxy(t *testing.T)
 			t.Fatal(err)
 		}
 		prov := config.NewProviderWithOpenSSHParser(config.NewProviderWithoutOpenSSH(nil).Snapshot(), parser)
-		cliOpts, err := ParseOptionStrings([]string{"ProxyCommand=nc %h %p"})
+		cliOpts, err := ParseSessionOptions([]string{"ProxyCommand=nc %h %p"}, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -446,7 +433,7 @@ func TestPolicySolver_Round2CanonicalAndControlInvariants(t *testing.T) {
 	})
 
 	t.Run("controlTargetContext does not double-expand HostName containing %h literal", func(t *testing.T) {
-		pol := effectivePolicy{
+		pol := EffectivePolicy{
 			snapshot: config.ConnectionSnapshot{
 				Host:     models.Host{Address: "fe80::1", Port: 22},
 				Identity: models.Identity{User: "ops"},
@@ -463,12 +450,13 @@ func TestPolicySolver_Round2CanonicalAndControlInvariants(t *testing.T) {
 	})
 
 	t.Run("WithControlProxyMode(true) strips ProxyCommand even when WithLocalExecution(true)", func(t *testing.T) {
-		adp := NewSSHAdapter(nil, WithLocalExecution(true), WithControlProxyMode(true))
-		opts, err := adp.finalizeEffectiveOptions(mustParseTestSSHOptions(t, ssh.OptionProxyCommand+"=nc %h %p"), nil, nil, nil, false)
+		adp := NewSSHAdapter(config.NewProviderWithoutOpenSSH(nil), WithLocalExecution(true), WithControlProxyMode(true))
+		sc := SessionControlOptions{Options: mustParseTestSSHOptions(t, ssh.OptionProxyCommand+"=nc %h %p")}
+		pol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: "adhoc", SessionControl: &sc})
 		if err != nil {
-			t.Fatalf("finalizeEffectiveOptions: %v", err)
+			t.Fatalf("Resolve: %v", err)
 		}
-		if opts != nil && opts.Get(ssh.OptionProxyCommand) != "" {
+		if opts := pol.Options(); opts != nil && opts.Get(ssh.OptionProxyCommand) != "" {
 			t.Fatalf("WithControlProxyMode(true) kept ProxyCommand=%q with local execution enabled", opts.Get(ssh.OptionProxyCommand))
 		}
 	})

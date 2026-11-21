@@ -6,7 +6,7 @@ import (
 )
 
 // TestP7Repro_MED12_ExpandRemoteCommand_HomeAllowlistAndIPv6PercentN reproduces MED-12:
-//  1. ExpandRemoteCommand validates %d with a denylist (validateSafeRemoteHomeToken) instead of
+//  1. ExpandRemoteCommand previously validated %d with a denylist instead of
 //     the shared strict allowlist, permitting spaces, '#', backslashes, and shell globs.
 //  2. buildRemoteCommandTokenMap does not strip IPv6 brackets from TargetContext.OriginalHost (%n).
 func TestP7Repro_MED12_ExpandRemoteCommand_HomeAllowlistAndIPv6PercentN(t *testing.T) {

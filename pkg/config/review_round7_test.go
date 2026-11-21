@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/models"
 )
 
@@ -126,7 +127,7 @@ func verifyRound7CollisionPrepareConfirm(t *testing.T, repo *Repository) {
 func TestRound7_P1_5_And_P3_6_EquivalenceBracketsLookupAndJumpNormalization(t *testing.T) {
 	t.Parallel()
 
-	// Equivalence axiom: Same(a, b) <=> Norm(a) != "" && Norm(a) == Norm(b)
+	// Equivalence axiom: Endpoint.Equal(a, b) <=> Norm(a) != "" && Norm(a) == Norm(b)
 	for _, tc := range []struct {
 		a, b string
 		want bool
@@ -137,8 +138,11 @@ func TestRound7_P1_5_And_P3_6_EquivalenceBracketsLookupAndJumpNormalization(t *t
 		{"::1]", "::1", false},
 		{"[10.0.0.1]", "10.0.0.1", false},
 	} {
-		if got := SameHostAddress(tc.a, tc.b); got != tc.want {
-			t.Errorf("SameHostAddress(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
+		epA, errA := ssh.NewEndpoint(tc.a, 22)
+		epB, errB := ssh.NewEndpoint(tc.b, 22)
+		got := errA == nil && errB == nil && epA.Equal(epB)
+		if got != tc.want {
+			t.Errorf("Endpoint.Equal(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
 		}
 		if tc.want && NormalizeHostAddress(tc.a) != NormalizeHostAddress(tc.b) {
 			t.Errorf("NormalizeHostAddress split equivalence class for %q vs %q: %q != %q",

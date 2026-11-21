@@ -432,8 +432,8 @@ func assertBatchExecInlineEndpointOverridesFlags(t *testing.T) {
 }
 
 func TestCLIContract_DuplicateDashOFirstWins(t *testing.T) {
-	// 1. Control & trust options via ParseOptionStrings: first occurrence wins (StrictHostKeyChecking never downgraded).
-	ctrlOpts, err := adapter.ParseOptionStrings([]string{
+	// 1. Control & trust options via ParseSessionOptions: first occurrence wins (StrictHostKeyChecking never downgraded).
+	ctrlOpts, err := adapter.ParseSessionOptions([]string{
 		"StrictHostKeyChecking=yes",
 		"StrictHostKeyChecking=no",
 		"ControlMaster=ask",
@@ -442,9 +442,9 @@ func TestCLIContract_DuplicateDashOFirstWins(t *testing.T) {
 		"ControlPersist=no",
 		"ControlPath=/tmp/first.sock",
 		"ControlPath=/tmp/second.sock",
-	})
+	}, "")
 	if err != nil {
-		t.Fatalf("ParseOptionStrings: %v", err)
+		t.Fatalf("ParseSessionOptions: %v", err)
 	}
 	if got := ctrlOpts.Options.StrictHostKeyChecking(); got != "yes" {
 		t.Errorf("StrictHostKeyChecking = %q, want yes (first wins)", got)

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -489,10 +490,7 @@ func (o *SshOptions) resolveAndCacheSessionOptions(provider config.ConfigProvide
 	}
 	isChild := o.isBackgroundChild()
 	if provider == nil {
-		eff, effErr := ssh.EffectiveOptions(sessionOpts.ToSSHOptions())
-		if effErr != nil {
-			return nil, effErr
-		}
+		eff := ssh.MergeOptions(sessionOpts.ToSSHOptions())
 		if o.isMuxDaemon() && eff != nil {
 			eff.StripClasses(ssh.OptionClassSession, ssh.OptionClassLocalExec)
 			eff.Delete(ssh.OptionForwardAgent)
@@ -510,10 +508,14 @@ func (o *SshOptions) resolveAndCacheSessionOptions(provider config.ConfigProvide
 	if lookupKey != "" && (sessionAuth.ProxyJump != "" || sessionAuth.OriginalHost != "" || sessionAuth.CanonicalHost != "") {
 		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(lookupKey, sessionAuth))
 	}
-	eff, err := adapter.NewSSHAdapter(provider, adpOpts...).ResolveSSHOptions(lookupKey, sessionOpts)
+	pol, err := adapter.NewSSHAdapter(provider, adpOpts...).Resolve(context.Background(), adapter.ResolveRequest{
+		NodeID:         lookupKey,
+		SessionControl: &sessionOpts,
+	})
 	if err != nil {
 		return nil, err
 	}
+	eff := pol.Options()
 	if o.isMuxDaemon() && eff != nil {
 		eff.StripClasses(ssh.OptionClassSession, ssh.OptionClassLocalExec)
 		eff.Delete(ssh.OptionForwardAgent)
@@ -535,7 +537,7 @@ func (o *SshOptions) effectiveSessionOptions() (*ssh.Options, error) {
 	if err != nil {
 		return nil, err
 	}
-	return ssh.EffectiveOptions(sessionOpts.ToSSHOptions())
+	return ssh.MergeOptions(sessionOpts.ToSSHOptions()), nil
 }
 
 func (o *SshOptions) effectiveNoCmd() bool {

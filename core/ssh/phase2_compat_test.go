@@ -289,9 +289,9 @@ func assertPhase2TierMergeAndQuotes(t *testing.T) {
 	_ = tier1.Append("SendEnv", "LC_ALL")
 	_ = tier1.Append("SetEnv", `FOO=tier1 WIN_PATH="C:\\Tools\\bin" SINGLE='a b c'`)
 
-	merged, err := EffectiveOptions(tier1, tier2, tier3, tier4)
+	merged, err := MergeEffectiveOptions(tier1, tier2, tier3, tier4)
 	if err != nil {
-		t.Fatalf("EffectiveOptions: %v", err)
+		t.Fatalf("MergeEffectiveOptions: %v", err)
 	}
 	hostEnv := func() []string {
 		return []string{

@@ -181,17 +181,18 @@ Host target
 		t.Fatalf("parse OpenSSH config failed: %v", err)
 	}
 	provider := config.NewProviderWithOpenSSHParser(nil, parser)
-	cliOpts, err := adapter.ParseOptionStrings([]string{"ForwardAgent=yes", "SendEnv=LC_ALL"})
+	cliOpts, err := adapter.ParseSessionOptions([]string{"ForwardAgent=yes", "SendEnv=LC_ALL"}, "")
 	if err != nil {
-		t.Fatalf("ParseOptionStrings() error = %v", err)
+		t.Fatalf("ParseSessionOptions() error = %v", err)
 	}
 
 	t.Run("exec adapter strips ForwardAgent while keeping SendEnv and auth options", func(t *testing.T) {
 		adp := adapter.NewNonInteractiveSSHAdapter(provider, adapter.WithForwardOptions(false))
-		opts, err := adp.ResolveSSHOptions(config.OpenSSHNodePrefix+"target", cliOpts)
+		pol, err := adp.Resolve(t.Context(), adapter.ResolveRequest{NodeID: config.OpenSSHNodePrefix + "target", SessionControl: &cliOpts})
 		if err != nil {
-			t.Fatalf("ResolveSSHOptions() error = %v", err)
+			t.Fatalf("Resolve() error = %v", err)
 		}
+		opts := pol.Options()
 		if opts.ForwardAgent() != "" {
 			t.Fatalf("expected ForwardAgent stripped for exec, got %q", opts.ForwardAgent())
 		}
@@ -205,10 +206,11 @@ Host target
 
 	t.Run("scp/sftp adapter strips ForwardAgent and SendEnv while keeping auth options", func(t *testing.T) {
 		adp := adapter.NewSSHAdapter(provider, adapter.WithLocalExecution(true), adapter.WithSessionAndForwardOptions(false))
-		opts, err := adp.ResolveSSHOptions(config.OpenSSHNodePrefix+"target", cliOpts)
+		pol, err := adp.Resolve(t.Context(), adapter.ResolveRequest{NodeID: config.OpenSSHNodePrefix + "target", SessionControl: &cliOpts})
 		if err != nil {
-			t.Fatalf("ResolveSSHOptions() error = %v", err)
+			t.Fatalf("Resolve() error = %v", err)
 		}
+		opts := pol.Options()
 		if opts.ForwardAgent() != "" || len(opts.SendEnvPatterns()) != 0 {
 			t.Fatalf("expected ForwardAgent and SendEnv stripped for scp/sftp, got forward=%q sendenv=%v",
 				opts.ForwardAgent(), opts.SendEnvPatterns())
