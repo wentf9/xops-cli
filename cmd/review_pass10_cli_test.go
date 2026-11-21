@@ -127,7 +127,7 @@ func assertPass10LeadingIdentityNoneOrder(t *testing.T) {
 	if slices.Contains(child.control.Options, "ControlPath=/tmp/stale.sock") {
 		t.Fatalf("stale ControlPath leaked into daemon options: %v", child.control.Options)
 	}
-	wantIDs := []string{"none", "/tmp/k2"}
+	wantIDs := []string{"none"}
 	if !slices.Equal(spec.IdentityFiles, wantIDs) {
 		t.Fatalf("spec.IdentityFiles = %v, want %v", spec.IdentityFiles, wantIDs)
 	}

@@ -107,8 +107,6 @@ func parsePass6MuxDaemonChild(
 ) (string, *ssh.ClientConfig, *ssh.Options) {
 	t.Helper()
 	decoded := roundTripMuxDaemonSpecThroughPipe(t, spec)
-	t.Setenv(sshMuxDaemonEnv, "true")
-	t.Setenv(sshBackgroundChildEnv, "true")
 
 	childOpts := NewSshOptions()
 	if err := childOpts.applyMuxDaemonSpec(decoded); err != nil {

@@ -90,6 +90,15 @@ func TestRound4_P1_1_SftpPositionalValidateTwiceAndRejectsExtraArgs(t *testing.T
 	}
 }
 
+func mustCollectTargetPaths(t *testing.T, o *ScpOptions, provider config.ConfigProvider) []PathInfo {
+	t.Helper()
+	paths, err := o.collectTargetPaths(provider)
+	if err != nil {
+		t.Fatalf("collectTargetPaths: %v", err)
+	}
+	return paths
+}
+
 func TestRound4_P1_2_ScpBatchCanonicalizesBeforeExcludeAndPreservesOverrides(t *testing.T) {
 	t.Parallel()
 
@@ -153,7 +162,7 @@ func TestRound4_P1_2_ScpBatchCanonicalizesBeforeExcludeAndPreservesOverrides(t *
 		t.Fatalf("isBatchHostExcluded(short after Pass-2 port 2222) = (%v, %v), want (true, nil)", excluded, err)
 	}
 
-	remaining := o.collectTargetPaths(repo)
+	remaining := mustCollectTargetPaths(t, o, repo)
 	if len(remaining) != 1 || remaining[0].Host != "other" {
 		t.Fatalf("collectTargetPaths after exclude = %+v, want single target host 'other'", remaining)
 	}

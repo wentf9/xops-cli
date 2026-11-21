@@ -32,7 +32,6 @@ func startMuxDaemonCommandWithPrefix(exe string, prefixArgs []string, spec MuxDa
 	args = append(args, prefixArgs...)
 	args = append(args, "--"+muxDaemonSpecFDFlag, "3")
 	cmd := exec.Command(exe, args...)
-	cmd.Env = append(os.Environ(), sshMuxDaemonEnv+"=true", sshBackgroundChildEnv+"=true")
 	cmd.Stdin = devNull
 	cmd.Stdout = devNull
 	cmd.Stderr = devNull
@@ -60,4 +59,52 @@ func readMuxDaemonSpecFromFD(fd int) (MuxDaemonSpec, error) {
 	}
 	defer func() { _ = f.Close() }()
 	return readMuxDaemonSpec(f)
+}
+
+func startBackgroundSSHCommand(exe string, args []string, devNull *os.File) (*exec.Cmd, error) {
+	spec := bgChildSpec{Version: bgChildSpecVersion, BgChild: true}
+	payload, err := json.Marshal(spec)
+	if err != nil {
+		return nil, fmt.Errorf("marshal background child spec failed: %w", err)
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("create background child spec pipe failed: %w", err)
+	}
+	// Write the tiny (~29-byte) token and close the write end synchronously before
+	// spawning so the detached child always reads the complete token even when the
+	// -f parent exits immediately after startDaemonProcess returns.
+	if _, err := w.Write(payload); err != nil {
+		_ = r.Close()
+		_ = w.Close()
+		return nil, fmt.Errorf("write background child spec failed: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		_ = r.Close()
+		return nil, fmt.Errorf("close background child spec pipe failed: %w", err)
+	}
+	childArgs := injectBackgroundChildSpecFDFlag(args, 3)
+	cmd := exec.Command(exe, childArgs...)
+	cmd.Stdin = devNull
+	cmd.Stdout = devNull
+	cmd.Stderr = devNull
+	cmd.ExtraFiles = []*os.File{r}
+	if err := startDaemonProcess(cmd); err != nil {
+		_ = r.Close()
+		return nil, err
+	}
+	_ = r.Close()
+	return cmd, nil
+}
+
+func readBgChildSpecFromFD(fd int) (bgChildSpec, error) {
+	if fd != 3 {
+		return bgChildSpec{}, fmt.Errorf("invalid background child spec descriptor %d", fd)
+	}
+	f := os.NewFile(uintptr(fd), "bg-child-spec")
+	if f == nil {
+		return bgChildSpec{}, fmt.Errorf("open background child spec descriptor %d failed", fd)
+	}
+	defer func() { _ = f.Close() }()
+	return readBgChildSpec(f)
 }

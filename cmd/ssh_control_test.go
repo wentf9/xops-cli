@@ -1193,7 +1193,7 @@ func TestDisableSessionControlForParentPreservesNonMuxOptions(t *testing.T) {
 }
 
 func TestSshCompleteSkipsStdinSecretsForBgChildAndNonProxyControlCommands(t *testing.T) {
-	runCompleteWithOpenPipeStdin := func(t *testing.T, args []string) (*SshOptions, error) {
+	runCompleteWithOpenPipeStdin := func(t *testing.T, args []string, configure func(*SshOptions)) (*SshOptions, error) {
 		t.Helper()
 		origStdin := os.Stdin
 		r, w, err := os.Pipe()
@@ -1208,6 +1208,9 @@ func TestSshCompleteSkipsStdinSecretsForBgChildAndNonProxyControlCommands(t *tes
 		})
 
 		opts := NewSshOptions()
+		if configure != nil {
+			configure(opts)
+		}
 		sshCmd := newCmdSshWithOptions(opts)
 		if err := sshCmd.Flags().Parse(args); err != nil {
 			t.Fatalf("Parse(%v): %v", args, err)
@@ -1229,8 +1232,9 @@ func TestSshCompleteSkipsStdinSecretsForBgChildAndNonProxyControlCommands(t *tes
 	}
 
 	t.Run("bg child skips stdin secret flags", func(t *testing.T) {
-		t.Setenv("XOPS_CLI_SSH_BG_CHILD", "true")
-		opts, err := runCompleteWithOpenPipeStdin(t, []string{"--password-stdin", "--passphrase-stdin", "--otp-stdin", "example.com"})
+		opts, err := runCompleteWithOpenPipeStdin(t, []string{"--password-stdin", "--passphrase-stdin", "--otp-stdin", "example.com"}, func(o *SshOptions) {
+			o.bgChildMode = true
+		})
 		if err != nil {
 			t.Fatalf("Complete(bg child) failed: %v", err)
 		}
@@ -1241,7 +1245,7 @@ func TestSshCompleteSkipsStdinSecretsForBgChildAndNonProxyControlCommands(t *tes
 	})
 
 	t.Run("-O proxy-stream skips stdin secret flags", func(t *testing.T) {
-		opts, err := runCompleteWithOpenPipeStdin(t, []string{"-O", "proxy-stream", "-S", "/tmp/test.sock", "--password-stdin", "example.com"})
+		opts, err := runCompleteWithOpenPipeStdin(t, []string{"-O", "proxy-stream", "-S", "/tmp/test.sock", "--password-stdin", "example.com"}, nil)
 		if err != nil {
 			t.Fatalf("Complete(-O proxy-stream) failed: %v", err)
 		}
@@ -1251,7 +1255,7 @@ func TestSshCompleteSkipsStdinSecretsForBgChildAndNonProxyControlCommands(t *tes
 	})
 
 	t.Run("-O check skips stdin secret flags", func(t *testing.T) {
-		opts, err := runCompleteWithOpenPipeStdin(t, []string{"-O", "check", "-S", "/tmp/test.sock", "--passphrase-stdin", "example.com"})
+		opts, err := runCompleteWithOpenPipeStdin(t, []string{"-O", "check", "-S", "/tmp/test.sock", "--passphrase-stdin", "example.com"}, nil)
 		if err != nil {
 			t.Fatalf("Complete(-O check) failed: %v", err)
 		}

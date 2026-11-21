@@ -157,7 +157,7 @@ func (o *SftpOptions) Complete(cmd *cobra.Command, args []string) error {
 
 	usedStdinCred := o.PasswordStdin || o.PassphraseStdin || o.OTPStdin
 	o.execution.capturePresence(cmd)
-	if err := o.completeStdinAndScriptInput(os.Getenv(sshBackgroundChildEnv) == "true", ""); err != nil {
+	if err := o.completeStdinAndScriptInput(false, ""); err != nil {
 		return err
 	}
 	o.stdinCredentialUsed = usedStdinCred

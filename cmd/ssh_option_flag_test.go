@@ -298,9 +298,8 @@ func TestControlFlagsRejectUnknownOptionKey(t *testing.T) {
 // /dev/null a --password-stdin read would fail the child and silently break
 // connection persistence.
 func TestMuxDaemonChildNormalizesSession(t *testing.T) {
-	t.Setenv(sshMuxDaemonEnv, "true")
-
 	options := NewSshOptions()
+	options.muxDaemonMode = true
 	cmd := &cobra.Command{Use: "ssh"}
 	options.control.RegisterSSHFlags(cmd)
 	cmd.Flags().BoolVar(&options.PasswordStdin, "password-stdin", false, "")
@@ -330,9 +329,8 @@ func TestMuxDaemonChildNormalizesSession(t *testing.T) {
 // spawns another daemon nor claims a foreground session, so its idle timer can
 // still expire and terminate the process.
 func TestMuxDaemonChildSkipsMasterHandoff(t *testing.T) {
-	t.Setenv(sshMuxDaemonEnv, "true")
-
 	options := NewSshOptions()
+	options.muxDaemonMode = true
 	options.Host = "web-01"
 	options.NoCmd = true
 	if err := options.handoffPersistentMaster(context.Background(), nil, nil, "web-01"); err != nil {
@@ -340,7 +338,6 @@ func TestMuxDaemonChildSkipsMasterHandoff(t *testing.T) {
 	}
 
 	// A -N foreground master never hands the socket over either.
-	t.Setenv(sshMuxDaemonEnv, "")
 	noCmd := NewSshOptions()
 	noCmd.Host = "web-01"
 	noCmd.NoCmd = true
@@ -362,9 +359,8 @@ func TestMuxDaemonChildSkipsMasterHandoff(t *testing.T) {
 // rebuild a command from the preserved positional arguments after the daemon
 // normalization. Otherwise the daemon would plan and possibly run it.
 func TestMuxDaemonChildIgnoresPositionalCommand(t *testing.T) {
-	t.Setenv(sshMuxDaemonEnv, "true")
-
 	options := NewSshOptions()
+	options.muxDaemonMode = true
 	cmd := &cobra.Command{Use: "ssh"}
 	options.control.RegisterSSHFlags(cmd)
 	cmd.Flags().Uint16VarP(&options.Port, "port", "p", 0, "")

@@ -1,17 +1,23 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 )
+
+const maxInitOpenSSHConfigBytes int64 = 16 * 1024 * 1024 // 16 MiB
 
 // InitOptions contains the filesystem-only settings for xops init.
 type InitOptions struct {
@@ -169,7 +175,53 @@ func configurationNeedsCreation(path string) (bool, error) {
 	return false, fmt.Errorf("inspect xops configuration %q: %w", path, err)
 }
 
-func loadOpenSSHHosts(path, defaultUser string) (hosts []config.OpenSSHHost, err error) {
+type namedOpenSSHReader struct {
+	io.Reader
+	name string
+}
+
+func (r namedOpenSSHReader) Name() string { return r.name }
+
+func isInitDevNull(path string, info os.FileInfo) bool {
+	cleaned := filepath.Clean(path)
+	if cleaned == os.DevNull {
+		return true
+	}
+	if runtime.GOOS == "windows" {
+		if strings.EqualFold(cleaned, os.DevNull) || strings.EqualFold(path, `\\.\`+os.DevNull) {
+			return true
+		}
+	}
+	if info != nil {
+		if devNullInfo, err := os.Stat(os.DevNull); err == nil && os.SameFile(info, devNullInfo) {
+			return true
+		}
+	}
+	return false
+}
+
+func loadOpenSSHHosts(path, defaultUser string) ([]config.OpenSSHHost, error) {
+	return loadOpenSSHHostsWithLimit(path, defaultUser, maxInitOpenSSHConfigBytes)
+}
+
+func loadOpenSSHHostsWithLimit(path, defaultUser string, maxBytes int64) (hosts []config.OpenSSHHost, err error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("open openssh configuration %q: %w", path, err)
+	}
+	if isInitDevNull(path, info) {
+		return nil, nil
+	}
+	if info.IsDir() {
+		return nil, fmt.Errorf("openssh configuration %q is a directory, expected a regular file", path)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("openssh configuration %q must be a regular file", path)
+	}
+	if maxBytes > 0 && info.Size() > maxBytes {
+		return nil, fmt.Errorf("openssh configuration %q exceeds maximum size of %d bytes", path, maxBytes)
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open openssh configuration %q: %w", path, err)
@@ -180,7 +232,36 @@ func loadOpenSSHHosts(path, defaultUser string) (hosts []config.OpenSSHHost, err
 		}
 	}()
 
-	hosts, err = config.ParseOpenSSHHosts(f, defaultUser)
+	fdInfo, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat openssh configuration %q: %w", path, err)
+	}
+	if isInitDevNull(path, fdInfo) {
+		return nil, nil
+	}
+	if fdInfo.IsDir() {
+		return nil, fmt.Errorf("openssh configuration %q is a directory, expected a regular file", path)
+	}
+	if !fdInfo.Mode().IsRegular() {
+		return nil, fmt.Errorf("openssh configuration %q must be a regular file", path)
+	}
+	if maxBytes > 0 && fdInfo.Size() > maxBytes {
+		return nil, fmt.Errorf("openssh configuration %q exceeds maximum size of %d bytes", path, maxBytes)
+	}
+
+	var reader io.Reader = f
+	if maxBytes > 0 {
+		reader = io.LimitReader(f, maxBytes+1)
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, fmt.Errorf("read openssh configuration %q: %w", path, err)
+	}
+	if maxBytes > 0 && int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("openssh configuration %q exceeds maximum size of %d bytes", path, maxBytes)
+	}
+
+	hosts, err = config.ParseOpenSSHHosts(namedOpenSSHReader{Reader: bytes.NewReader(data), name: f.Name()}, defaultUser)
 	if err != nil {
 		return nil, fmt.Errorf("load openssh configuration %q: %w", path, err)
 	}

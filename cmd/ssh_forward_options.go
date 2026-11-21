@@ -357,7 +357,8 @@ func (o *SshOptions) applyCLISessionFlags(opts **ssh.Options) error {
 }
 
 func (o *SshOptions) applyCLIIdentityNoneTruncation(ensureOpts func() *ssh.Options) error {
-	if (!o.identityFromCLIOptions && !o.muxDaemonMode) || !slices.ContainsFunc(o.IdentityFiles, ssh.IsNoneValue) {
+	o.syncIdentityFiles()
+	if !slices.ContainsFunc(o.IdentityFiles, ssh.IsNoneValue) {
 		return nil
 	}
 	opts := ensureOpts()
@@ -486,7 +487,7 @@ func (o *SshOptions) resolveAndCacheSessionOptions(provider config.ConfigProvide
 	if err != nil {
 		return nil, err
 	}
-	isChild := os.Getenv(sshBackgroundChildEnv) == "true"
+	isChild := o.isBackgroundChild()
 	if provider == nil {
 		eff, effErr := ssh.EffectiveOptions(sessionOpts.ToSSHOptions())
 		if effErr != nil {

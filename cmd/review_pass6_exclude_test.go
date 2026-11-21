@@ -207,7 +207,11 @@ func verifyPass6ScpPositionalExcludeParity(t *testing.T, openSSHProv config.Conf
 	if len(cands) != 1 || cands[0].NodeID != "iaas@10.238.221.181:2222" || cands[0].BaseNodeID != "iaas@10.238.221.181:22" {
 		t.Fatalf("positional buildExcludeCandidates = %+v, want canonical 2222 candidate with saved BaseNodeID", cands)
 	}
-	if paths := oPos.collectTargetPaths(openSSHProv); len(paths) != 0 {
+	paths, err := oPos.collectTargetPaths(openSSHProv)
+	if err != nil {
+		t.Fatalf("collectTargetPaths(positional): %v", err)
+	}
+	if len(paths) != 0 {
 		t.Fatalf("positional collectTargetPaths with matching --exclude = %+v, want empty", paths)
 	}
 }

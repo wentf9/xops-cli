@@ -7,7 +7,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -85,6 +84,8 @@ type SshOptions struct {
 	isParentValidation     bool
 	muxDaemonSpecFD        int
 	muxDaemonMode          bool
+	bgChildSpecFD          int
+	bgChildMode            bool
 	preserveDaemonSelector bool
 	hostFromPositional     bool
 
@@ -107,6 +108,7 @@ func NewSshOptions() *SshOptions {
 		NoLoginShell:    false,
 		dashIdx:         -1,
 		muxDaemonSpecFD: -1,
+		bgChildSpecFD:   -1,
 	}
 }
 
@@ -162,6 +164,8 @@ func newCmdSshWithOptions(o *SshOptions) *cobra.Command {
 	cmd.Flags().BoolVar(&o.NoLoginShell, "no-login", false, i18n.T("flag_exec_no_login"))
 	cmd.Flags().IntVar(&o.muxDaemonSpecFD, muxDaemonSpecFDFlag, -1, "")
 	_ = cmd.Flags().MarkHidden(muxDaemonSpecFDFlag)
+	cmd.Flags().IntVar(&o.bgChildSpecFD, bgChildSpecFDFlag, -1, "")
+	_ = cmd.Flags().MarkHidden(bgChildSpecFDFlag)
 
 	cmd.MarkFlagsMutuallyExclusive("otp", "otp-stdin")
 
@@ -172,16 +176,35 @@ func (o *SshOptions) readSecretsFromStdin() (bool, error) {
 	return readCLISecretsFromStdin(o)
 }
 
+// truncateIdentityFilesAtNone truncates keys at the first "none" sentinel
+// while retaining that sentinel so downstream merging also stops inheriting
+// lower-tier IdentityFile entries.
+func truncateIdentityFilesAtNone(keys []string) []string {
+	if len(keys) == 0 {
+		return nil
+	}
+	for i, k := range keys {
+		if ssh.IsNoneValue(k) {
+			out := make([]string, i+1)
+			copy(out, keys[:i])
+			out[i] = "none"
+			return out
+		}
+	}
+	return slices.Clone(keys)
+}
+
 func (o *SshOptions) syncIdentityFiles() {
 	if o == nil {
 		return
 	}
-	if len(o.IdentityFiles) > 0 && o.IdentityFile == "" {
-		if config.IsPersistableIdentityPath(o.IdentityFiles[0]) {
+	if len(o.IdentityFiles) > 0 {
+		o.IdentityFiles = truncateIdentityFilesAtNone(o.IdentityFiles)
+		if o.IdentityFile == "" && config.IsPersistableIdentityPath(o.IdentityFiles[0]) {
 			o.IdentityFile = o.IdentityFiles[0]
 		}
-	} else if o.IdentityFile != "" && len(o.IdentityFiles) == 0 {
-		o.IdentityFiles = []string{o.IdentityFile}
+	} else if o.IdentityFile != "" {
+		o.IdentityFiles = truncateIdentityFilesAtNone([]string{o.IdentityFile})
 	}
 }
 
@@ -345,11 +368,20 @@ func (o *SshOptions) Complete(cmd *cobra.Command, args []string) error {
 	}
 	o.control.ctlCmdSet = flags != nil && flags.Changed("control-command")
 	if flags != nil && flags.Changed(muxDaemonSpecFDFlag) {
+		if flags.Changed(bgChildSpecFDFlag) {
+			return fmt.Errorf("--%s and --%s are mutually exclusive", muxDaemonSpecFDFlag, bgChildSpecFDFlag)
+		}
 		spec, err := readMuxDaemonSpecFromFD(o.muxDaemonSpecFD)
 		if err != nil {
 			return err
 		}
 		return o.applyMuxDaemonSpec(spec)
+	}
+	if flags != nil && flags.Changed(bgChildSpecFDFlag) {
+		if _, err := readBgChildSpecFromFD(o.bgChildSpecFD); err != nil {
+			return o.control.controlUsageError(err)
+		}
+		o.bgChildMode = true
 	}
 	if err := ApplyGeneralOptions(o, o.control.Options, flags); err != nil {
 		return o.control.controlUsageError(err)
@@ -360,7 +392,7 @@ func (o *SshOptions) Complete(cmd *cobra.Command, args []string) error {
 	if _, err := o.toSessionControlOptions(); err != nil {
 		return o.control.controlUsageError(err)
 	}
-	isChild := os.Getenv(sshBackgroundChildEnv) == "true"
+	isChild := o.isBackgroundChild()
 	ctlCmd := strings.ToLower(strings.TrimSpace(o.control.CtlCmd))
 	if o.isMuxDaemon() || isChild || (ctlCmd != "" && ctlCmd != "proxy") {
 		o.PasswordStdin = false
@@ -787,7 +819,7 @@ func (o *SshOptions) RunContext(ctx context.Context) (err error) {
 		return ExecuteControlCommand(ctx, o)
 	}
 
-	isChild := os.Getenv(sshBackgroundChildEnv) == "true"
+	isChild := o.isBackgroundChild()
 	if o.isMuxDaemon() {
 		// A detached multiplexing daemon serves the control socket only. It must
 		// never re-run the command or read the terminal the parent handed over.
@@ -926,7 +958,7 @@ func (o *SshOptions) runParentDaemonWithNode(ctx context.Context, cfg *config.Co
 			}
 		}
 	}()
-	if lcErr := runPostAuthLocalCommand(ctx, client, o.effectiveSSHOptions, os.Stderr, false); lcErr != nil {
+	if lcErr := runPostAuthLocalCommand(ctx, client, o.effectiveSSHOptions, os.Stderr, o.isBackgroundChild()); lcErr != nil {
 		return lcErr
 	}
 
@@ -961,10 +993,8 @@ func spawnBackgroundSSHChild() (err error) {
 	if err != nil {
 		return fmt.Errorf("failed to get executable path: %w", err)
 	}
-	cmd := exec.Command(exe, os.Args[1:]...)
-	cmd.Env = append(os.Environ(), sshBackgroundChildEnv+"=true")
 
-	// 子进程的 stdin/stdout/stderr 均重定向到 /dev/null
+	// 子进程的 stdin/stdout/stderr 均重定向到 /dev/null（Windows 下 stdin 为 spec 匿名管道）
 	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 	if err != nil {
 		return fmt.Errorf("failed to open /dev/null: %w", err)
@@ -974,11 +1004,8 @@ func spawnBackgroundSSHChild() (err error) {
 			err = errors.Join(err, fmt.Errorf("close SSH daemon stdio redirect failed: %w", closeErr))
 		}
 	}()
-	cmd.Stdin = devNull
-	cmd.Stdout = devNull
-	cmd.Stderr = devNull
 
-	if err := startDaemonProcess(cmd); err != nil {
+	if _, err := startBackgroundSSHCommand(exe, os.Args[1:], devNull); err != nil {
 		return fmt.Errorf("failed to start background daemon: %w", err)
 	}
 
@@ -991,7 +1018,7 @@ func (o *SshOptions) buildAdapterOptions(nodeID string, cfg *config.Configuratio
 	}
 	policy := utils.EffectiveRememberPolicy(o.Remember, cfg)
 	shouldRemember, adpOpts := o.interaction.rememberOptions(policy, cfg)
-	isChild := os.Getenv(sshBackgroundChildEnv) == "true"
+	isChild := o.isBackgroundChild()
 	suppressConfirm := policy == utils.RememberPolicyNever || o.isMuxDaemon() || isChild
 	if o.isMuxDaemon() {
 		shouldRemember = false
@@ -2143,7 +2170,7 @@ type postAuthLocalRunner interface {
 }
 
 func runPostAuthLocalCommand(ctx context.Context, client postAuthLocalRunner, effOpts *ssh.Options, stderr io.Writer, isChild bool) error {
-	if isChild || isMuxDaemonChild() || client == nil || effOpts == nil {
+	if isChild || client == nil || effOpts == nil {
 		return nil
 	}
 	if !effOpts.PermitLocalCommand() {
@@ -2774,14 +2801,12 @@ func waitForDaemonJumpMasters(ctx context.Context, connector *ssh.Connector, tar
 	}
 }
 
-// isMuxDaemonChild reports whether this process is the detached master daemon
-// started by handoffPersistentMaster.
-func isMuxDaemonChild() bool {
-	return os.Getenv(sshMuxDaemonEnv) == "true"
+func (o *SshOptions) isMuxDaemon() bool {
+	return o != nil && o.muxDaemonMode
 }
 
-func (o *SshOptions) isMuxDaemon() bool {
-	return (o != nil && o.muxDaemonMode) || isMuxDaemonChild()
+func (o *SshOptions) isBackgroundChild() bool {
+	return o != nil && (o.bgChildMode || o.muxDaemonMode)
 }
 
 func sshConnectionError(nodeID string, err error) error {
@@ -2922,7 +2947,7 @@ func (o *SshOptions) prepareNode(ctx context.Context, provider config.ConfigProv
 }
 
 func (o *SshOptions) persistPreparedNodeUpdate(ctx context.Context, provider config.ConfigProvider, nodeID string, created bool) (bool, error) {
-	if created || o.isMuxDaemon() || os.Getenv(sshBackgroundChildEnv) == "true" {
+	if created || o.isBackgroundChild() {
 		return false, nil
 	}
 	repo, isRepo := provider.(*config.Repository)
@@ -3167,7 +3192,7 @@ func (o *SshOptions) startTunnelsWithStderr(ctx context.Context, cancelParent co
 	if o.effectiveNoCmd() || hasForwards {
 		group.addWait(func() error { return client.Wait(tunnelCtx) })
 	}
-	isChild := os.Getenv(sshBackgroundChildEnv) == "true"
+	isChild := o.isBackgroundChild()
 	reportAllocPort := !o.diagnostic.quiet && !isChild && !o.isParentValidation
 	if err := startConfiguredForwards(tunnelCtx, group, client, fwdCfg, reportAllocPort); err != nil {
 		return fail(err)

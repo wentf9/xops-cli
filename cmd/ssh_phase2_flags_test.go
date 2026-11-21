@@ -231,8 +231,6 @@ func TestPhase2Flags_ResolveEffectiveRemoteCommand(t *testing.T) {
 }
 
 func TestPhase2Flags_MuxDaemonStripsOptionClassSession(t *testing.T) {
-	t.Setenv("XOPS_CLI_SSH_MUX_DAEMON", "true")
-
 	openSSH := `
 Host mux-target
     HostName 10.0.0.20
@@ -249,6 +247,7 @@ Host mux-target
 	provider := config.NewProviderWithOpenSSHParser(nil, parser)
 
 	opts := NewSshOptions()
+	opts.muxDaemonMode = true
 	opts.Host = config.OpenSSHNodePrefix + "mux-target"
 	opts.control.Options = []string{"SendEnv=LC_ALL", "SetEnv=BAZ=qux", "RemoteCommand=ls", "EscapeChar=~", "ConnectTimeout=5"}
 

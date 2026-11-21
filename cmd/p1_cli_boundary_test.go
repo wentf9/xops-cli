@@ -229,11 +229,15 @@ func TestP1SCPDownloadDirectory_PreservesBasenameIntoExistingLocalDir(t *testing
 		options := NewScpOptions()
 		options.Recursive = true
 		options.Force = true
-		if err := options.runDownload(fixture.ctx, PathInfo{Host: "scp-test", Path: "~/sub/.."}, localDestDir, fixture.repo, fixture.connector); err != nil {
-			t.Fatalf("runDownload ~/sub/.. failed: %v", err)
+		if err := options.runDownload(fixture.ctx, PathInfo{Host: "scp-test", Path: "~/sub/.."}, localDestDir, fixture.repo, fixture.connector); err == nil {
+			t.Fatalf("runDownload ~/sub/.. unexpectedly succeeded, want unsafe remote filename error")
+		} else if !strings.Contains(err.Error(), "unsafe remote filename") {
+			t.Fatalf("runDownload ~/sub/.. error = %v, want unsafe remote filename error", err)
 		}
 
-		assertSCPTestFile(t, filepath.Join(localDestDir, "escaped-check.txt"), "stay-inside")
+		if _, err := os.Stat(filepath.Join(localDestDir, "escaped-check.txt")); !os.IsNotExist(err) {
+			t.Fatalf("remote ~/sub/.. wrote into localDestDir despite unsafe basename: err=%v", err)
+		}
 		if _, err := os.Stat(filepath.Join(outerDir, "escaped-check.txt")); !os.IsNotExist(err) {
 			t.Fatalf("remote ~/sub/.. escaped localDestDir into parent dir: err=%v", err)
 		}

@@ -139,7 +139,7 @@ func TestPhase3Flags_MuxDaemonForwardsCertAndAgentAuthWhileStrippingForwardAgent
 		t.Fatalf("buildMuxDaemonSpec().Options = %v, want %v", spec.Options, want)
 	}
 
-	t.Setenv("XOPS_CLI_SSH_MUX_DAEMON", "true")
+	opts.muxDaemonMode = true
 	openSSH := `
 Host agent-host
     HostName 10.0.0.40
@@ -220,8 +220,6 @@ Host target
 }
 
 func TestPhase3Flags_MuxDaemonPreservesGatewayPortsAndStreamLocalBind(t *testing.T) {
-	t.Setenv("XOPS_CLI_SSH_MUX_DAEMON", "true")
-
 	openSSH := `
 Host mux-srv
     HostName 10.0.0.60
@@ -239,6 +237,7 @@ Host mux-srv
 	provider := config.NewProviderWithOpenSSHParser(nil, parser)
 
 	opts := NewSshOptions()
+	opts.muxDaemonMode = true
 	opts.Host = config.OpenSSHNodePrefix + "mux-srv"
 	opts.parsedArgs = true
 	opts.control.Options = []string{

@@ -253,6 +253,41 @@ func (o *ExecOptions) completeNonDashArgs(cmd *cobra.Command, args []string) err
 	return nil
 }
 
+func validateExplicitEmptySelectors(cmd *cobra.Command) error {
+	if cmd == nil {
+		return nil
+	}
+	for _, name := range []string{"host", "tag", "ifile"} {
+		if !cmd.Flags().Changed(name) {
+			continue
+		}
+		value, err := cmd.Flags().GetString(name)
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("flag --%s must not be empty", name)
+		}
+	}
+	return nil
+}
+
+func (o *ExecOptions) validateNonBlankSelectors() error {
+	for _, sel := range []struct {
+		name string
+		val  string
+	}{
+		{"host", o.Host},
+		{"tag", o.Tag},
+		{"ifile", o.HostFile},
+	} {
+		if sel.val != "" && strings.TrimSpace(sel.val) == "" {
+			return fmt.Errorf("flag --%s must not be empty", sel.name)
+		}
+	}
+	return nil
+}
+
 func (o *ExecOptions) Complete(cmd *cobra.Command, args []string) error {
 	o.args = args
 	o.nonHostArgs = true
@@ -267,7 +302,10 @@ func (o *ExecOptions) Complete(cmd *cobra.Command, args []string) error {
 	if err := validateExplicitZeroPort(flags); err != nil {
 		return err
 	}
-	if _, err := o.control.ToSessionControlOptions(); err != nil {
+	if err := validateExplicitEmptySelectors(cmd); err != nil {
+		return err
+	}
+	if _, err := o.toSessionControlOptions(); err != nil {
 		return err
 	}
 	o.execution.capturePresence(cmd)
@@ -378,6 +416,9 @@ func (o *ExecOptions) Validate() error {
 	}
 	if o.Command != "" && o.ShellFile != "" {
 		return fmt.Errorf("cannot specify both command and --shell script")
+	}
+	if err := o.validateNonBlankSelectors(); err != nil {
+		return err
 	}
 	if o.Host == "" && o.HostFile == "" && o.Tag == "" {
 		return fmt.Errorf("%s", i18n.T("err_no_host"))
@@ -698,7 +739,7 @@ func (o *ExecOptions) buildAdapterOptions(tasks []execHostTask, cfg *config.Conf
 	}
 
 	// Session Control Overrides (Tier 1)
-	sessionCtrlOpts, err := o.controlSessionOptions()
+	sessionCtrlOpts, err := o.toSessionControlOptions()
 	if err != nil {
 		return nil, err
 	}

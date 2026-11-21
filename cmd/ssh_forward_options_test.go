@@ -1635,13 +1635,11 @@ func TestSSHMuxDaemon_ParseForwardRequestsFromOptions(t *testing.T) {
 }
 
 func TestSSHMuxDaemon_ChildProcessNormalization(t *testing.T) {
-	t.Setenv(sshMuxDaemonEnv, "true")
-
-	if !isMuxDaemonChild() {
-		t.Fatal("expected isMuxDaemonChild() == true")
-	}
-
 	opts := NewSshOptions()
+	opts.muxDaemonMode = true
+	if !opts.isMuxDaemon() {
+		t.Fatal("expected opts.isMuxDaemon() == true")
+	}
 	opts.LocalForwards = []string{"8080:127.0.0.1:80"}
 	opts.RemoteForwards = []string{"9090:127.0.0.1:90"}
 	opts.DynamicForward = "1080"

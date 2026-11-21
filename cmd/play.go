@@ -53,13 +53,14 @@ func (cliEventListener) OnStepResult(host, stepName string, r playbook.StepResul
 
 // PlayOptions 保存 xops play 命令的所有选项
 type PlayOptions struct {
-	FilePath    string
-	Vars        []string // 格式: "key=value"
-	Concurrency uint
-	DryRun      bool
-	Limit       string // 逗号分隔的节点名称，覆盖 Playbook 的 targets
-	Sudo        bool
-	Out         io.Writer
+	FilePath     string
+	Vars         []string // 格式: "key=value"
+	Concurrency  uint
+	DryRun       bool
+	Limit        string // 逗号分隔的节点名称，覆盖 Playbook 的 targets
+	LimitChanged bool
+	Sudo         bool
+	Out          io.Writer
 }
 
 func NewPlayOptions() *PlayOptions {
@@ -75,6 +76,7 @@ func NewCmdPlay() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			o.FilePath = args[0]
+			o.LimitChanged = cmd.Flags().Changed("limit")
 			o.Out = cmd.OutOrStdout()
 			return o.RunContext(cmd.Context())
 		},
@@ -87,6 +89,22 @@ func NewCmdPlay() *cobra.Command {
 	cmd.Flags().BoolVar(&o.Sudo, "sudo", false, i18n.T("flag_play_sudo"))
 
 	return cmd
+}
+
+func parsePlayLimit(raw string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, errors.New("flag --limit must not be empty")
+	}
+	parts := strings.Split(raw, ",")
+	nodes := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			return nil, fmt.Errorf("invalid --limit %q: empty target segment", raw)
+		}
+		nodes = append(nodes, trimmed)
+	}
+	return nodes, nil
 }
 
 // Run 执行 Playbook。
@@ -103,6 +121,13 @@ func (o *PlayOptions) RunContext(ctx context.Context) (retErr error) {
 	if err != nil {
 		return err
 	}
+	var limitNodes []string
+	if o.LimitChanged || o.Limit != "" {
+		limitNodes, err = parsePlayLimit(o.Limit)
+		if err != nil {
+			return err
+		}
+	}
 
 	// 加载 Playbook
 	pb, err := playbook.Load(o.FilePath, extraVars)
@@ -117,9 +142,9 @@ func (o *PlayOptions) RunContext(ctx context.Context) (retErr error) {
 	if o.Sudo {
 		pb.Settings.Sudo = true
 	}
-	if o.Limit != "" {
+	if len(limitNodes) > 0 {
 		pb.Targets = playbook.Targets{
-			Nodes: strings.Split(o.Limit, ","),
+			Nodes: limitNodes,
 		}
 	}
 

@@ -122,8 +122,8 @@ func TestPass9_H6_MuxDaemonArgsAndDrainAcrossControlMasterNo(t *testing.T) {
 	opts.IdentityFile = "/tmp/k1"
 	opts.control.Options = []string{"ProxyCommand=none", "ProxyCommand=nc %h %p", "IdentityFile=/tmp/k2"}
 	spec := opts.buildMuxDaemonSpec("openssh:edge", "/tmp/edge.sock", nil)
-	if !slices.Equal(spec.IdentityFiles, []string{"/tmp/k1", "none", "/tmp/k2"}) {
-		t.Errorf("buildMuxDaemonSpec(nil).IdentityFiles = %v, want [/tmp/k1 none /tmp/k2]", spec.IdentityFiles)
+	if !slices.Equal(spec.IdentityFiles, []string{"/tmp/k1", "none"}) {
+		t.Errorf("buildMuxDaemonSpec(nil).IdentityFiles = %v, want [/tmp/k1 none]", spec.IdentityFiles)
 	}
 	if !slices.Contains(spec.Options, "ProxyCommand=none") {
 		t.Errorf("buildMuxDaemonSpec(nil) missing ProxyCommand=none in %v", spec.Options)

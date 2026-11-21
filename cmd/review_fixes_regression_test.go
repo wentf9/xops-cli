@@ -337,8 +337,8 @@ func TestM12_ControlProxyAndAlreadyReportedExit255(t *testing.T) {
 	if err := bgOpts.validateBackgroundProxyCommand(config.NewProviderWithoutOpenSSH(nil), ""); err == nil {
 		t.Fatalf("expected -f + -o ProxyCommand=... to be rejected upfront")
 	}
-	t.Setenv(sshBackgroundChildEnv, "true")
 	childOpts := NewSshOptions()
+	childOpts.bgChildMode = true
 	childOpts.control.Options = []string{"LocalCommand=echo hi"}
 	eff, err := childOpts.resolveAndCacheSessionOptions(nil, "")
 	if err != nil {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/wentf9/xops-cli/cmd/utils"
@@ -17,7 +18,93 @@ const (
 	muxDaemonSpecVersion  = 1
 	maxMuxDaemonSpecBytes = 256 * 1024
 	muxDaemonSpecFDFlag   = "mux-daemon-spec-fd"
+
+	bgChildSpecVersion  = 1
+	maxBgChildSpecBytes = 1024
+	bgChildSpecFDFlag   = "bg-child-spec-fd"
 )
+
+// bgChildSpec is the bounded JSON token delivered over an anonymous pipe FD
+// from a -f parent process to its detached background child.
+type bgChildSpec struct {
+	Version int  `json:"version"`
+	BgChild bool `json:"bg_child"`
+}
+
+func (s bgChildSpec) Validate() error {
+	if s.Version != bgChildSpecVersion {
+		return fmt.Errorf("unsupported background child spec version %d", s.Version)
+	}
+	if !s.BgChild {
+		return fmt.Errorf("background child spec requires bg_child=true")
+	}
+	return nil
+}
+
+func readBgChildSpec(r io.Reader) (bgChildSpec, error) {
+	if r == nil {
+		return bgChildSpec{}, fmt.Errorf("background child spec reader is nil")
+	}
+	data, err := io.ReadAll(io.LimitReader(r, maxBgChildSpecBytes+1))
+	if err != nil {
+		return bgChildSpec{}, fmt.Errorf("read background child spec failed: %w", err)
+	}
+	if len(data) > maxBgChildSpecBytes {
+		return bgChildSpec{}, fmt.Errorf("background child spec exceeds %d byte limit", maxBgChildSpecBytes)
+	}
+	if len(data) == 0 {
+		return bgChildSpec{}, fmt.Errorf("background child spec is empty")
+	}
+	var spec bgChildSpec
+	if err := json.Unmarshal(data, &spec); err != nil {
+		return bgChildSpec{}, fmt.Errorf("decode background child spec failed: %w", err)
+	}
+	if err := spec.Validate(); err != nil {
+		return bgChildSpec{}, err
+	}
+	return spec, nil
+}
+
+// injectBackgroundChildSpecFDFlag inserts "--bg-child-spec-fd <fd>" right after
+// the "ssh" subcommand (preserving root flags and "--" separators), or after
+// "--" for test-binary subprocesses that omit the "ssh" subcommand.
+func injectBackgroundChildSpecFDFlag(args []string, fd int) []string {
+	fdStr := strconv.Itoa(fd)
+	root := newRootCmd()
+	initRootFlags(root)
+	insertAt := -1
+	for i := 0; i < len(args); {
+		if args[i] == "--" {
+			insertAt = i + 1
+			break
+		}
+		if strings.HasPrefix(args[i], "-") {
+			n, _, ok := routingFlag(root, args[i])
+			if !ok {
+				if sepIdx := slices.Index(args, "--"); sepIdx >= 0 {
+					insertAt = sepIdx + 1
+				}
+				break
+			}
+			i += n
+			continue
+		}
+		if args[i] == "ssh" {
+			insertAt = i + 1
+		} else if sepIdx := slices.Index(args, "--"); sepIdx >= 0 {
+			insertAt = sepIdx + 1
+		}
+		break
+	}
+	if insertAt < 0 || insertAt > len(args) {
+		insertAt = len(args)
+	}
+	out := make([]string, 0, len(args)+2)
+	out = append(out, args[:insertAt]...)
+	out = append(out, "--"+bgChildSpecFDFlag, fdStr)
+	out = append(out, args[insertAt:]...)
+	return out
+}
 
 // MuxDaemonSpec carries typed startup parameters from a foreground handoff
 // session to the detached ControlPersist daemon over an inherited pipe FD,
@@ -218,11 +305,11 @@ func (o *SshOptions) resolveMuxDaemonJumpHost(master *ssh.MuxServer) string {
 }
 
 func (o *SshOptions) resolveMuxDaemonIdentityFiles(nodeID string, master *ssh.MuxServer, forTarget bool) []string {
-	keys := o.effectiveIdentityFiles()
+	keys := truncateIdentityFilesAtNone(o.effectiveIdentityFiles())
 	firstCLIKey := o.firstCLIIdentityFile(keys)
 	if forTarget {
 		if len(keys) > 0 {
-			return slices.Clone(keys)
+			return keys
 		}
 		if master != nil && master.Target().KeyPath != "" {
 			return []string{master.Target().KeyPath}
@@ -402,9 +489,9 @@ func (o *SshOptions) applyMuxDaemonSpec(spec MuxDaemonSpec) error {
 	o.ForceTTYCount = 0
 	o.cliTTYMode = ""
 
-	o.IdentityFiles = slices.Clone(spec.IdentityFiles)
+	o.IdentityFiles = truncateIdentityFilesAtNone(spec.IdentityFiles)
 	o.IdentityFile = ""
-	o.identityFromCLIOptions = len(spec.IdentityFiles) > 0
+	o.identityFromCLIOptions = len(o.IdentityFiles) > 0
 	o.syncIdentityFiles()
 
 	daemonOpts := make([]string, 0, len(spec.Options)+3)
@@ -582,14 +669,14 @@ func matchesTargetSelector(nodeID string, master *ssh.MuxServer, host, selector 
 }
 
 func isTargetOnlyMuxDaemonOption(opt string) bool {
-	key, _, err := ssh.SplitOptionKeyValue(opt)
-	if err != nil || key == "" {
-		return false
+	key, val, err := ssh.SplitOptionKeyValue(opt)
+	if err != nil || key == "" || strings.TrimSpace(val) == "" {
+		return true
 	}
 	if spec, ok := ssh.LookupOptionSpec(key); ok {
 		return !spec.IsConnectionWide()
 	}
-	return isTargetLevelDirectiveKey(key)
+	return true
 }
 
 func (o *SshOptions) resolveMuxDaemonTarget(nodeID string, master *ssh.MuxServer) (host string, port int, user string) {

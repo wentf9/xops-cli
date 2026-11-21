@@ -98,7 +98,7 @@ func TestMuxDaemonSpec_PipeRoundTripPreservesTypesAndOrders(t *testing.T) {
 	if decoded.OriginalHost != "app-alias" {
 		t.Fatalf("expected OriginalHost app-alias, got %q", decoded.OriginalHost)
 	}
-	wantIDs := []string{"/tmp/k1", "none", "/tmp/k2"}
+	wantIDs := []string{"/tmp/k1", "none"}
 	if !slices.Equal(decoded.IdentityFiles, wantIDs) {
 		t.Fatalf("IdentityFiles = %v, want %v", decoded.IdentityFiles, wantIDs)
 	}

@@ -473,10 +473,15 @@ func TestSCPTransferNumericFilename(t *testing.T) {
 	options := NewScpOptions()
 	options.Source = "scp-test:22:file"
 	options.Dest = directory
+	if err := options.runTransfer(fixture.ctx, fixture.repo, fixture.connector); err == nil || !strings.Contains(err.Error(), "unsafe remote filename") {
+		t.Fatalf("download colon-containing basename into local dir = %v, want unsafe remote filename error", err)
+	}
+
+	local := filepath.Join(directory, "numeric-downloaded.txt")
+	options.Dest = local
 	if err := options.runTransfer(fixture.ctx, fixture.repo, fixture.connector); err != nil {
 		t.Fatal(err)
 	}
-	local := filepath.Join(directory, "22:file")
 	assertSCPTestFile(t, local, "numeric filename payload")
 	options.Source = local
 	options.Dest = "scp-test:22:uploaded"

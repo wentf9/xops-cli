@@ -619,7 +619,7 @@ func TestCLIContract_MuxDaemonArgsPreservation(t *testing.T) {
 	if decoded.ControlMaster != ssh.ControlMasterAsk || decoded.ControlPersist != "5m" {
 		t.Errorf("buildMuxDaemonSpec dropped authoritative ControlMaster=ask / ControlPersist=5m: %+v", decoded)
 	}
-	wantIDs := []string{filepath.Join("/", "tmp", "k1"), "none", "/tmp/k2"}
+	wantIDs := []string{filepath.Join("/", "tmp", "k1"), "none"}
 	if !slices.Equal(decoded.IdentityFiles, wantIDs) {
 		t.Errorf("buildMuxDaemonSpec identity order broken: got %v, want %v", decoded.IdentityFiles, wantIDs)
 	}

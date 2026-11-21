@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	pkgsftp "github.com/pkg/sftp"
 	"github.com/schollz/progressbar/v3"
@@ -550,8 +551,56 @@ func isRemoteDirContentsPath(remotePath string) bool {
 	return trimmed == "." || strings.HasSuffix(trimmed, "/.")
 }
 
+func isRemoteRootOrSelfDirPath(remotePath string) bool {
+	if remotePath == "" {
+		return false
+	}
+	if strings.Trim(remotePath, "/") == "" {
+		return true
+	}
+	return strings.TrimRight(remotePath, "/") == "."
+}
+
+func isWindowsReservedLocalDeviceName(stem string) bool {
+	switch len(stem) {
+	case 3:
+		return strings.EqualFold(stem, "CON") ||
+			strings.EqualFold(stem, "PRN") ||
+			strings.EqualFold(stem, "AUX") ||
+			strings.EqualFold(stem, "NUL")
+	case 4:
+		d := stem[3]
+		if d < '1' || d > '9' {
+			return false
+		}
+		prefix := stem[:3]
+		return strings.EqualFold(prefix, "COM") || strings.EqualFold(prefix, "LPT")
+	default:
+		return false
+	}
+}
+
 func isSafeLocalPathComponent(name string) bool {
-	return name != "" && name != "." && name != ".." && !strings.ContainsAny(name, `/\`) && filepath.VolumeName(name) == ""
+	if name == "" || name == "." || name == ".." || filepath.VolumeName(name) != "" {
+		return false
+	}
+	if strings.HasSuffix(name, ".") || strings.HasSuffix(name, " ") {
+		return false
+	}
+	if strings.ContainsAny(name, `/\:*?"<>|`) {
+		return false
+	}
+	for _, r := range name {
+		if r == 0 || r < 0x20 || r == 0x7f || unicode.IsControl(r) {
+			return false
+		}
+	}
+	stem := name
+	if dot := strings.IndexByte(stem, '.'); dot >= 0 {
+		stem = stem[:dot]
+	}
+	stem = strings.TrimRight(stem, " ")
+	return !isWindowsReservedLocalDeviceName(stem)
 }
 
 func (o *ScpOptions) runDownload(ctx context.Context, src PathInfo, localPath string, provider config.ConfigProvider, connector *ssh.Connector) (err error) {
@@ -582,7 +631,7 @@ func (o *ScpOptions) runDownload(ctx context.Context, src PathInfo, localPath st
 		if !isRemoteDirContentsPath(src.Path) {
 			if baseName := stat.Name(); isSafeLocalPathComponent(baseName) {
 				localDest = filepath.Join(localPath, baseName)
-			} else if !stat.IsDir() {
+			} else if !stat.IsDir() || !isRemoteRootOrSelfDirPath(src.Path) {
 				return fmt.Errorf("unsafe remote filename %q", baseName)
 			}
 		}
@@ -1622,15 +1671,7 @@ func (o *ScpOptions) appendScpSessionAuthOverrides(adpOpts *[]adapter.Option, pr
 	if err := o.ensureGeneralOptionsApplied(); err != nil {
 		return err
 	}
-	var excludes map[string]struct{}
-	if provider != nil && o.hasExcludeFlags() {
-		var err error
-		excludes, err = o.resolveExcludes(provider)
-		if err != nil {
-			return fmt.Errorf("%s: %w", i18n.T("scp_err_exclude"), err)
-		}
-	}
-	targetPaths, err := o.collectTargetPathsWithExcludesChecked(provider, excludes)
+	targetPaths, err := o.collectTargetPaths(provider)
 	if err != nil {
 		return err
 	}
@@ -1730,7 +1771,11 @@ func hostNameHasHostToken(pattern string) bool {
 }
 
 func (o *ScpOptions) distinctRemoteHosts(provider config.ConfigProvider) []string {
-	return o.distinctRemoteHostsForPaths(provider, o.collectTargetPaths(provider))
+	paths, err := o.collectTargetPaths(provider)
+	if err != nil {
+		return nil
+	}
+	return o.distinctRemoteHostsForPaths(provider, paths)
 }
 
 func (o *ScpOptions) distinctRemoteHostsForPaths(provider config.ConfigProvider, targetPaths []PathInfo) []string {
@@ -1769,7 +1814,11 @@ func (o *ScpOptions) resolvedTargetNodeIDsWithOriginals(provider config.ConfigPr
 }
 
 func (o *ScpOptions) resolvedTargetNodeIDsWithHosts(provider config.ConfigProvider) ([]string, map[string]string, map[string]string) {
-	return o.resolvedTargetNodeIDsWithHostsForPaths(provider, o.collectTargetPaths(provider))
+	paths, err := o.collectTargetPaths(provider)
+	if err != nil {
+		return nil, nil, nil
+	}
+	return o.resolvedTargetNodeIDsWithHostsForPaths(provider, paths)
 }
 
 func (o *ScpOptions) resolvedTargetNodeIDsWithHostsForPaths(provider config.ConfigProvider, targetPaths []PathInfo) ([]string, map[string]string, map[string]string) {
@@ -1864,13 +1913,12 @@ func (o *ScpOptions) cachedCanonicalPathInfo(p PathInfo) PathInfo {
 	return canonP
 }
 
-func (o *ScpOptions) isCollectedPathExcluded(provider config.ConfigProvider, excludes map[string]struct{}, p PathInfo) bool {
+func (o *ScpOptions) isCollectedPathExcluded(provider config.ConfigProvider, excludes map[string]struct{}, p PathInfo) (bool, error) {
 	if len(excludes) == 0 || provider == nil {
-		return false
+		return false, nil
 	}
 	canonP := o.cachedCanonicalPathInfo(p)
-	excluded, exErr := o.isBatchHostExcluded(provider, excludes, p.Host, canonP)
-	return exErr == nil && excluded
+	return o.isBatchHostExcluded(provider, excludes, p.Host, canonP)
 }
 
 func (o *ScpOptions) rawHostTargetPaths() ([]PathInfo, error) {
@@ -1979,22 +2027,16 @@ func (o *ScpOptions) buildExcludeCandidatesChecked(provider config.ConfigProvide
 	return candidates, nil
 }
 
-func (o *ScpOptions) collectTargetPaths(provider config.ConfigProvider) []PathInfo {
+func (o *ScpOptions) collectTargetPaths(provider config.ConfigProvider) ([]PathInfo, error) {
 	var excludes map[string]struct{}
 	if provider != nil && o.hasExcludeFlags() {
-		if resolved, err := o.resolveExcludes(provider); err == nil {
-			excludes = resolved
+		resolved, err := o.resolveExcludes(provider)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", i18n.T("scp_err_exclude"), err)
 		}
+		excludes = resolved
 	}
-	return o.collectTargetPathsWithExcludes(provider, excludes)
-}
-
-func (o *ScpOptions) collectTargetPathsWithExcludes(provider config.ConfigProvider, excludes map[string]struct{}) []PathInfo {
-	paths, err := o.collectTargetPathsWithExcludesChecked(provider, excludes)
-	if err != nil {
-		return nil
-	}
-	return paths
+	return o.collectTargetPathsWithExcludesChecked(provider, excludes)
 }
 
 func (o *ScpOptions) collectTargetPathsWithExcludesChecked(provider config.ConfigProvider, excludes map[string]struct{}) ([]PathInfo, error) {
@@ -2004,7 +2046,11 @@ func (o *ScpOptions) collectTargetPathsWithExcludesChecked(provider config.Confi
 	}
 	paths := make([]PathInfo, 0, len(rawPaths))
 	for _, p := range rawPaths {
-		if !o.isCollectedPathExcluded(provider, excludes, p) {
+		excluded, exErr := o.isCollectedPathExcluded(provider, excludes, p)
+		if exErr != nil {
+			return nil, fmt.Errorf("%s: %w", i18n.T("scp_err_exclude"), exErr)
+		}
+		if !excluded {
 			paths = append(paths, p)
 		}
 	}

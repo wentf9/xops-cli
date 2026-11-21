@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"net"
-	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -223,7 +222,10 @@ func verifyPass5M4ScpExcludes(t *testing.T, repoWithSSH, repoNoSSH *config.Repos
 	if err := oComp.Complete(NewCmdScp(), nil); err != nil {
 		t.Fatalf("Complete(oComp): %v", err)
 	}
-	paths := oComp.collectTargetPaths(repoWithSSH)
+	paths, err := oComp.collectTargetPaths(repoWithSSH)
+	if err != nil {
+		t.Fatalf("collectTargetPaths(oComp): %v", err)
+	}
 	if len(paths) != 1 || paths[0].User != "bob" {
 		t.Fatalf("collectTargetPaths after --exclude alice@web = %+v, want [bob@web]", paths)
 	}
@@ -233,7 +235,10 @@ func verifyPass5M4ScpExcludes(t *testing.T, repoWithSSH, repoNoSSH *config.Repos
 	oAdHoc.Exclude = []string{"alice@10.0.0.77", "2001:db8::1"}
 	oAdHoc.Source = "./local.txt"
 	oAdHoc.Dest = "/tmp/remote.txt"
-	adHocPaths := oAdHoc.collectTargetPaths(repoNoSSH)
+	adHocPaths, err := oAdHoc.collectTargetPaths(repoNoSSH)
+	if err != nil {
+		t.Fatalf("collectTargetPaths(oAdHoc): %v", err)
+	}
 	if len(adHocPaths) != 1 || adHocPaths[0].User != "bob" || adHocPaths[0].Host != "10.0.0.77" {
 		t.Fatalf("collectTargetPaths(-F none ad-hoc + IPv6) = %+v, want only bob@10.0.0.77", adHocPaths)
 	}
@@ -492,9 +497,6 @@ func verifyPass5M6DaemonOriginalHostEnvRestore(t *testing.T, ctx context.Context
 	t.Helper()
 	tmpDir := shortControlTempDir(t)
 
-	t.Setenv(sshMuxDaemonEnv, "true")
-	t.Setenv(sshBackgroundChildEnv, "true")
-
 	childOpts := NewSshOptions()
 	spec := MuxDaemonSpec{
 		Version:       muxDaemonSpecVersion,
@@ -528,13 +530,6 @@ func verifyPass5M6DaemonOriginalHostEnvRestore(t *testing.T, ctx context.Context
 	}
 	if childCfg.Address != "web.corp.example.com" || childCfg.OriginalHost != "web" {
 		t.Fatalf("mux daemon child ClientConfig = (Address=%q, OriginalHost=%q), want (web.corp.example.com, web)", childCfg.Address, childCfg.OriginalHost)
-	}
-
-	if err := os.Unsetenv(sshMuxDaemonEnv); err != nil {
-		t.Fatalf("Unsetenv: %v", err)
-	}
-	if err := os.Unsetenv(sshBackgroundChildEnv); err != nil {
-		t.Fatalf("Unsetenv: %v", err)
 	}
 
 	var stderrBuf bytes.Buffer

@@ -605,7 +605,7 @@ func executeProxy(
 		return controlError(streams.Stderr, err.Error())
 	}
 
-	isChild := os.Getenv(sshBackgroundChildEnv) == "true"
+	isChild := o.isBackgroundChild()
 	if !isChild && !o.isMuxDaemon() && o.effectiveBgRun() {
 		return o.runControlProxyParentDaemon(ctx, socketPath, target, cfg, muxOpts, streams.Stderr)
 	}

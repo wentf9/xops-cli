@@ -258,7 +258,10 @@ func assertPass7ScpTagExcludeFiltersAlpha(t *testing.T, prov config.ConfigProvid
 	if err := o.Complete(NewCmdScp(), nil); err != nil {
 		t.Fatalf("Complete(scp --tag %s): %v", exSpec, err)
 	}
-	paths := o.collectTargetPaths(prov)
+	paths, err := o.collectTargetPaths(prov)
+	if err != nil {
+		t.Fatalf("collectTargetPaths(scp --tag %s): %v", exSpec, err)
+	}
 	var got []string
 	for _, p := range paths {
 		got = append(got, p.Host)
@@ -281,7 +284,10 @@ func assertPass7ScpHostExcludeFiltersAlpha(t *testing.T, prov config.ConfigProvi
 	if err := o.Complete(NewCmdScp(), nil); err != nil {
 		t.Fatalf("Complete(scp --host %s): %v", exSpec, err)
 	}
-	paths := o.collectTargetPaths(prov)
+	paths, err := o.collectTargetPaths(prov)
+	if err != nil {
+		t.Fatalf("collectTargetPaths(scp --host %s): %v", exSpec, err)
+	}
 	if len(paths) != 1 || paths[0].Host != "z-node" {
 		t.Fatalf("scp --host --exclude %q collected %+v, want [z-node]", exSpec, paths)
 	}

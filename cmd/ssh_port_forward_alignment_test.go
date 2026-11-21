@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1066,6 +1067,15 @@ func TestPortForward_ControlProxy_BackgroundFlagSpawnsDetachedSession(t *testing
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		opts := NewSshOptions()
+		if sepIdx := slices.Index(os.Args, "--"); sepIdx >= 0 && sepIdx+1 < len(os.Args) {
+			sshCmd := newCmdSshWithOptions(opts)
+			if err := sshCmd.ParseFlags(os.Args[sepIdx+1:]); err != nil {
+				t.Fatalf("helper ParseFlags(%v) failed: %v", os.Args[sepIdx+1:], err)
+			}
+			if err := opts.Complete(sshCmd, sshCmd.Flags().Args()); err != nil {
+				t.Fatalf("helper Complete(%v) failed: %v", os.Args[sepIdx+1:], err)
+			}
+		}
 		opts.BgRun = true
 		opts.NoCmd = true
 		opts.LocalForwards = []string{os.Getenv("XOPS_TEST_PROXY_BG_SPEC")}
@@ -1081,7 +1091,7 @@ func TestPortForward_ControlProxy_BackgroundFlagSpawnsDetachedSession(t *testing
 			Stderr: &stderr,
 		}); err != nil {
 			// When the parent test shuts down the MuxServer, the detached child exits with SSH connection lost.
-			if os.Getenv(sshBackgroundChildEnv) == "true" {
+			if opts.isBackgroundChild() {
 				os.Exit(0)
 			}
 			t.Fatalf("helper executeControlCommandWithStreams failed: %v (stderr: %q)", err, stderr.String())
@@ -1125,7 +1135,7 @@ func TestPortForward_ControlProxy_BackgroundFlagSpawnsDetachedSession(t *testing
 	if err != nil {
 		t.Fatalf("os.Executable failed: %v", err)
 	}
-	cmd := exec.CommandContext(ctx, exe, "-test.run=^TestPortForward_ControlProxy_BackgroundFlagSpawnsDetachedSession$")
+	cmd := exec.CommandContext(ctx, exe, "-test.run=^TestPortForward_ControlProxy_BackgroundFlagSpawnsDetachedSession$", "--")
 	cmd.Env = append(os.Environ(),
 		"XOPS_CONFIG_DIR="+cfgDir,
 		"XOPS_TEST_PROXY_BG_SOCK="+sockPath,

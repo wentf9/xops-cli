@@ -568,6 +568,7 @@ func TestHandoffSkipsImplicitTier4Control(t *testing.T) {
 	sockPath := filepath.Join(shortControlTempDir(t), "tier4.sock")
 
 	openSSHContent := "Host web-tier4\n" +
+		"    HostName " + host + "\n" +
 		"    ControlMaster auto\n" +
 		"    ControlPath " + sockPath + "\n" +
 		"    ControlPersist 10m\n"
@@ -741,7 +742,7 @@ func TestMuxDaemonArgsAndTargetResolutionForVirtualAndPendingNodes(t *testing.T)
 //     JumpHost over SshOptions fields and drops target-specific -o options
 //     (Port, User, ProxyJump) so jump-master or multi-host handoffs never inherit
 //     the foreground target's flags.
-//   - When isMuxDaemonChild() is true (XOPS_CLI_SSH_MUX_DAEMON=true), resolveNode
+//   - When muxDaemonMode is true (from validated --mux-daemon-spec-fd), resolveNode
 //     does not persist or mutate nodes even if Remember was set to "always".
 func TestMuxDaemonArgsIsolationAndRememberSuppression(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -840,7 +841,6 @@ func TestMuxDaemonArgsIsolationAndRememberSuppression(t *testing.T) {
 	}
 
 	// Verify resolveNode in mux daemon child mode never persists an unconfirmed target.
-	t.Setenv(sshMuxDaemonEnv, "true")
 	cfg := &config.Configuration{
 		Nodes:      concurrent.NewMap[string, models.Node](concurrent.HashString),
 		Hosts:      concurrent.NewMap[string, models.Host](concurrent.HashString),
@@ -852,6 +852,7 @@ func TestMuxDaemonArgsIsolationAndRememberSuppression(t *testing.T) {
 		t.Fatalf("NewRepositoryWithoutOpenSSH failed: %v", err)
 	}
 	daemonOpts := NewSshOptions()
+	daemonOpts.muxDaemonMode = true
 	daemonOpts.Host = host
 	daemonOpts.Port = uint16(port)
 	daemonOpts.User = "fixture"
@@ -2687,7 +2688,10 @@ func verifyRound15ControlProxySudoAndScpTagParity(t *testing.T) {
 	scpOpts.Source = "local.txt"
 	scpOpts.Dest = ":/tmp/remote.txt"
 
-	paths := scpOpts.collectTargetPaths(tagRepo)
+	paths, err := scpOpts.collectTargetPaths(tagRepo)
+	if err != nil {
+		t.Fatalf("collectTargetPaths(tagRepo) failed: %v", err)
+	}
 	if len(paths) != 1 {
 		t.Fatalf("expected 1 target path from collectTargetPaths, got %d", len(paths))
 	}

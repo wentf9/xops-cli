@@ -17,14 +17,13 @@ import (
 	"github.com/wentf9/xops-cli/pkg/i18n"
 )
 
-// Environment markers shared with the detached background processes.
+// Legacy internal environment marker names. Daemon/background child modes are
+// authenticated exclusively via anonymous pipe descriptors (--mux-daemon-spec-fd
+// and --bg-child-spec-fd); these constants are retained solely so
+// askpassCommandEnv can scrub them defensively from child environments.
 const (
-	// sshBackgroundChildEnv marks the child that runs the real SSH session after
-	// -f validates connectivity in the parent.
 	sshBackgroundChildEnv = "XOPS_CLI_SSH_BG_CHILD"
-	// sshMuxDaemonEnv marks the child that only serves a persistent control
-	// socket, keeping the master alive after the foreground session ended.
-	sshMuxDaemonEnv = "XOPS_CLI_SSH_MUX_DAEMON"
+	sshMuxDaemonEnv       = "XOPS_CLI_SSH_MUX_DAEMON"
 )
 
 // Valid control commands for -O
@@ -346,16 +345,17 @@ func defaultLocalUser() string {
 }
 
 type generalOptionState struct {
-	allowPort     bool
-	allowUser     bool
-	allowIdentity bool
-	allowJump     bool
-	allowHostName bool
-	seenPort      bool
-	seenUser      bool
-	seenJump      bool
-	seenProxyCmd  bool
-	seenHostName  bool
+	allowPort        bool
+	allowUser        bool
+	allowIdentity    bool
+	allowJump        bool
+	allowHostName    bool
+	seenPort         bool
+	seenUser         bool
+	seenIdentityNone bool
+	seenJump         bool
+	seenProxyCmd     bool
+	seenHostName     bool
 }
 
 // ApplyGeneralOptions parses non-multiplexing OpenSSH options from -o
@@ -440,7 +440,6 @@ func ApplyGeneralOptions(opts *SshOptions, optionStrings []string, flags *pflag.
 	if err := validateExplicitNonEmptyFlags(flags); err != nil {
 		return err
 	}
-	opts.syncIdentityFiles()
 	if flags != nil && flags.Changed("identity") && len(opts.IdentityFiles) > 0 {
 		normalized := make([]string, 0, len(opts.IdentityFiles))
 		persistable := ""
@@ -459,13 +458,15 @@ func ApplyGeneralOptions(opts *SshOptions, optionStrings []string, flags *pflag.
 		opts.IdentityFiles = normalized
 		opts.IdentityFile = persistable
 	}
+	opts.syncIdentityFiles()
 	allowJump := shouldApplyGeneralOption(flags, "jump", opts.JumpHost == "")
 	st := generalOptionState{
-		allowPort:     shouldApplyGeneralOption(flags, "port", opts.Port == 0),
-		allowUser:     shouldApplyGeneralOption(flags, "login", opts.User == ""),
-		allowIdentity: true,
-		allowJump:     allowJump,
-		allowHostName: opts.cliHostName == "" && opts.HostName == "",
+		allowPort:        shouldApplyGeneralOption(flags, "port", opts.Port == 0),
+		allowUser:        shouldApplyGeneralOption(flags, "login", opts.User == ""),
+		allowIdentity:    true,
+		allowJump:        allowJump,
+		allowHostName:    opts.cliHostName == "" && opts.HostName == "",
+		seenIdentityNone: slices.ContainsFunc(opts.IdentityFiles, ssh.IsNoneValue),
 	}
 	for _, opt := range optionStrings {
 		key, val, err := ssh.SplitOptionKeyValue(opt)
@@ -514,7 +515,7 @@ func applyGeneralOption(opts *SshOptions, st *generalOptionState, key, val strin
 	return nil
 }
 
-func applyIdentityFileGeneralOption(opts *SshOptions, _ *generalOptionState, key, val string) error {
+func applyIdentityFileGeneralOption(opts *SshOptions, st *generalOptionState, key, val string) error {
 	setting, err := ssh.ParseIdentityPathSetting(val, true)
 	if err != nil {
 		return fmt.Errorf("invalid %s in -o option: %w", key, err)
@@ -522,8 +523,17 @@ func applyIdentityFileGeneralOption(opts *SshOptions, _ *generalOptionState, key
 	if setting.Unset() {
 		return fmt.Errorf("invalid %s in -o option: value cannot be empty", key)
 	}
-	opts.IdentityFiles = append(opts.IdentityFiles, val)
 	opts.identityFromCLIOptions = true
+	if st.seenIdentityNone || slices.ContainsFunc(opts.IdentityFiles, ssh.IsNoneValue) {
+		st.seenIdentityNone = true
+		return nil
+	}
+	if setting.Disabled() {
+		st.seenIdentityNone = true
+		opts.IdentityFiles = append(opts.IdentityFiles, "none")
+		return nil
+	}
+	opts.IdentityFiles = append(opts.IdentityFiles, val)
 	if opts.IdentityFile == "" && config.IsPersistableIdentityPath(val) {
 		opts.IdentityFile = val
 	}
