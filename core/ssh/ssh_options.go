@@ -1241,29 +1241,40 @@ func normalizeAlgorithmSpec(name, raw string, defaults, supported []string) (str
 	return rebuilt, nil
 }
 
+func supportedListTokens(canonicalKey string) (supported, failClosed []string, ok bool) {
+	switch canonicalKey {
+	case OptionPreferredAuthentications:
+		return []string{"publickey", "keyboard-interactive", "password"}, []string{"gssapi-with-mic", "hostbased"}, true
+	case OptionHostKeyAlgorithms:
+		return allSupportedAlgorithms(cryptoSSH.SupportedAlgorithms().HostKeys, cryptoSSH.InsecureAlgorithms().HostKeys), nil, true
+	case OptionCiphers:
+		return allSupportedAlgorithms(cryptoSSH.SupportedAlgorithms().Ciphers, cryptoSSH.InsecureAlgorithms().Ciphers), nil, true
+	case OptionMACs:
+		return allSupportedAlgorithms(cryptoSSH.SupportedAlgorithms().MACs, cryptoSSH.InsecureAlgorithms().MACs), nil, true
+	case OptionKexAlgorithms:
+		return allSupportedAlgorithms(cryptoSSH.SupportedAlgorithms().KeyExchanges, cryptoSSH.InsecureAlgorithms().KeyExchanges), nil, true
+	default:
+		return nil, nil, false
+	}
+}
+
 // FilterSupportedListValue filters a comma-separated option value (for algorithm lists
 // or PreferredAuthentications) down to tokens supported by this implementation.
 // Used when leniently parsing ~/.ssh/config so OpenSSH-only algorithms (such as
 // sntrup761x25519-sha512@openssh.com or umac-128-etm@openssh.com) do not reject the
 // remaining supported algorithms.
+//
+// For PreferredAuthentications, implemented methods ("publickey", "keyboard-interactive",
+// "password") are kept when any are present; if only recognized unimplemented OpenSSH
+// methods ("gssapi-with-mic", "hostbased") are present, those tokens are retained so
+// authentication fails closed instead of falling back to defaults.
 func FilterSupportedListValue(canonicalKey, raw string) string {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return ""
 	}
-	var supported []string
-	switch canonicalKey {
-	case OptionPreferredAuthentications:
-		supported = []string{"publickey", "keyboard-interactive", "password"}
-	case OptionHostKeyAlgorithms:
-		supported = allSupportedAlgorithms(cryptoSSH.SupportedAlgorithms().HostKeys, cryptoSSH.InsecureAlgorithms().HostKeys)
-	case OptionCiphers:
-		supported = allSupportedAlgorithms(cryptoSSH.SupportedAlgorithms().Ciphers, cryptoSSH.InsecureAlgorithms().Ciphers)
-	case OptionMACs:
-		supported = allSupportedAlgorithms(cryptoSSH.SupportedAlgorithms().MACs, cryptoSSH.InsecureAlgorithms().MACs)
-	case OptionKexAlgorithms:
-		supported = allSupportedAlgorithms(cryptoSSH.SupportedAlgorithms().KeyExchanges, cryptoSSH.InsecureAlgorithms().KeyExchanges)
-	default:
+	supported, failClosedAuth, ok := supportedListTokens(canonicalKey)
+	if !ok {
 		return raw
 	}
 
@@ -1273,18 +1284,27 @@ func FilterSupportedListValue(canonicalKey, raw string) string {
 		prefix = body[:1]
 		body = strings.TrimSpace(body[1:])
 	}
-	var kept []string
+	var kept, keptFailClosed []string
 	for part := range strings.SplitSeq(body, ",") {
 		tok := strings.TrimSpace(part)
 		if canonicalKey == OptionPreferredAuthentications {
 			tok = strings.ToLower(tok)
 		}
-		if tok != "" && ((prefix == "-" && isValidAlgorithmName(tok)) || slices.Contains(supported, tok)) {
-			kept = append(kept, tok)
+		if tok == "" {
+			continue
+		}
+		if (prefix == "-" && isValidAlgorithmName(tok)) || slices.Contains(supported, tok) {
+			if !slices.Contains(kept, tok) {
+				kept = append(kept, tok)
+			}
+			continue
+		}
+		if slices.Contains(failClosedAuth, tok) && !slices.Contains(keptFailClosed, tok) {
+			keptFailClosed = append(keptFailClosed, tok)
 		}
 	}
 	if len(kept) == 0 {
-		return ""
+		return strings.Join(keptFailClosed, ",")
 	}
 	return prefix + strings.Join(kept, ",")
 }
@@ -1727,6 +1747,7 @@ func (o *Options) ControlConfig() *ControlConfig {
 //   - ControlMaster, ControlPath, and ControlPersist syntax are validated via typed settings.
 //   - Active ControlMaster modes and enabled PersistSetting values require a concrete ControlPath
 //     (explicit PersistNo values "no"/"false" do not require ControlPath).
+//   - Enabled ControlPersist cannot be combined with ControlMaster="no" (or unset).
 //   - Returns (nil, nil) when multiplexing is completely unconfigured.
 func (o *Options) ValidatedControlConfig() (*ControlConfig, error) {
 	return o.projectControl(true)
@@ -1813,6 +1834,9 @@ func validateEffectiveControlSetting(master ControlMasterMode, pathSetting Contr
 	}
 	if persistSetting.Enabled() && !pathSetting.Enabled() {
 		return errors.New("ControlPath is required when ControlPersist is configured")
+	}
+	if master == ControlMasterNo && persistSetting.Enabled() {
+		return fmt.Errorf("ControlPersist %q cannot be specified when ControlMaster is 'no'", persistSetting.Raw)
 	}
 	return nil
 }
@@ -2143,7 +2167,14 @@ func (o *Options) Validate() error {
 		}
 	}
 
-	normMaster := strings.ToLower(strings.TrimSpace(string(o.ControlMaster())))
+	var parsedMaster ControlMasterMode
+	if rawMaster := o.ControlMaster(); rawMaster != "" {
+		parsed, err := ParseControlMasterMode(string(rawMaster))
+		if err != nil {
+			return fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
+		}
+		parsedMaster = parsed
+	}
 	persistSetting, err := o.PersistSetting()
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
@@ -2153,11 +2184,11 @@ func (o *Options) Validate() error {
 		return fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
 	}
 
-	if normMaster == string(ControlMasterNo) && persistSetting.Enabled() {
+	if parsedMaster == ControlMasterNo && persistSetting.Enabled() {
 		return fmt.Errorf("%w: ControlPersist %q cannot be specified when ControlMaster is 'no'", ErrSSHOptionsValidation, o.ControlPersist())
 	}
 
-	if pathSetting.Disabled() && isActiveControlMaster(normMaster) {
+	if pathSetting.Disabled() && isActiveControlMaster(string(parsedMaster)) {
 		return fmt.Errorf("%w: ControlPath cannot be 'none' when ControlMaster is %q", ErrSSHOptionsValidation, o.ControlMaster())
 	}
 
@@ -2208,14 +2239,24 @@ func isOrderedOverrideMultiValue(canonicalKey string) bool {
 	return canonicalKey == OptionSendEnv || canonicalKey == OptionSetEnv
 }
 
+// isNoneTerminatedMultiValue reports whether canonicalKey is a multi-value path list
+// where an entry of "none" (case-insensitive) terminates accumulation of any subsequent
+// or lower-priority entries (IdentityFile, CertificateFile).
+func isNoneTerminatedMultiValue(canonicalKey string) bool {
+	return canonicalKey == OptionIdentityFile || canonicalKey == OptionCertificateFile
+}
+
 // MergeOptionLayers merges a slice of Options from highest priority to lowest priority
 // using first-match-wins per option key, without applying cross-field effective finalization.
 // Order-sensitive session environment options (SendEnv, SetEnv) merge from lowest priority to
 // highest priority so higher-tier exclusions and overrides win left-to-right.
+// For IdentityFile and CertificateFile, encountering "none" stops accumulation of all
+// subsequent and lower-priority entries for that key.
 func MergeOptionLayers(layers ...*Options) *Options {
 	res := &Options{}
 	hasExplicitPersist := false
 	hasImplicitTier4 := false
+	noneTerminated := make(map[string]bool, 2)
 	for _, layer := range layers {
 		if layer.IsEmpty() {
 			continue
@@ -2226,22 +2267,7 @@ func MergeOptionLayers(layers ...*Options) *Options {
 		if layer.ImplicitTier4 {
 			hasImplicitTier4 = true
 		}
-		for k, v := range layer.values {
-			spec, ok := LookupOptionSpec(k)
-			if ok && spec.MultiValue {
-				if isOrderedOverrideMultiValue(spec.CanonicalKey) {
-					continue
-				}
-				res.appendNormalizedRaw(spec.CanonicalKey, v)
-				continue
-			}
-			if _, exists := res.values[k]; !exists {
-				res.setRaw(k, v)
-				if k == OptionControlPath {
-					res.LiteralControlPath = layer.LiteralControlPath && !IsNoneValue(v)
-				}
-			}
-		}
+		mergeOptionLayerValues(res, layer, noneTerminated)
 	}
 	for i := len(layers) - 1; i >= 0; i-- {
 		layer := layers[i]
@@ -2259,6 +2285,62 @@ func MergeOptionLayers(layers ...*Options) *Options {
 	}
 	res.ImplicitTier4 = !hasExplicitPersist && hasImplicitTier4
 	return res
+}
+
+func mergeOptionLayerValues(res, layer *Options, noneTerminated map[string]bool) {
+	for k, v := range layer.values {
+		spec, ok := LookupOptionSpec(k)
+		if ok && spec.MultiValue {
+			if isOrderedOverrideMultiValue(spec.CanonicalKey) {
+				continue
+			}
+			if isNoneTerminatedMultiValue(spec.CanonicalKey) {
+				if !noneTerminated[spec.CanonicalKey] && res.appendNoneTerminatedRaw(spec.CanonicalKey, v) {
+					noneTerminated[spec.CanonicalKey] = true
+				}
+				continue
+			}
+			res.appendNormalizedRaw(spec.CanonicalKey, v)
+			continue
+		}
+		if _, exists := res.values[k]; !exists {
+			res.setRaw(k, v)
+			if k == OptionControlPath {
+				res.LiteralControlPath = layer.LiteralControlPath && !IsNoneValue(v)
+			}
+		}
+	}
+}
+
+// appendNoneTerminatedRaw appends normalized newline-delimited entries for IdentityFile or
+// CertificateFile, stopping at the first "none" sentinel. If "none" is the very first entry
+// for canonicalKey, "none" is stored; if concrete entries already precede "none", those
+// concrete entries are kept without "none". Returns true when a "none" terminator was seen.
+func (o *Options) appendNoneTerminatedRaw(canonicalKey, normalized string) bool {
+	if normalized == "" {
+		return false
+	}
+	existing := o.GetAll(canonicalKey)
+	terminated := false
+	for item := range strings.SplitSeq(normalized, "\n") {
+		if item == "" {
+			continue
+		}
+		if IsNoneValue(item) {
+			if len(existing) == 0 {
+				existing = append(existing, "none")
+			}
+			terminated = true
+			break
+		}
+		if !slices.Contains(existing, item) {
+			existing = append(existing, item)
+		}
+	}
+	if len(existing) > 0 {
+		o.setRaw(canonicalKey, strings.Join(existing, "\n"))
+	}
+	return terminated
 }
 
 func finalizeEffectiveOptions(opts *Options) *Options {

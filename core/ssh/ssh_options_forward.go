@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // TunnelIDAny represents the OpenSSH "any" tunnel unit identifier (SSH_TUNID_ANY = 0x7fffffff).
@@ -127,7 +128,7 @@ func (e ForwardEndpoint) IsUnix() bool {
 // String returns the canonical OpenSSH string representation of the endpoint.
 func (e ForwardEndpoint) String() string {
 	if e.IsUnix() {
-		return e.SocketPath
+		return formatStreamLocalEndpoint(e.SocketPath)
 	}
 	if !e.HasHost {
 		return strconv.Itoa(int(e.Port))
@@ -136,6 +137,51 @@ func (e ForwardEndpoint) String() string {
 		return "*:" + strconv.Itoa(int(e.Port))
 	}
 	return net.JoinHostPort(e.Host, strconv.Itoa(int(e.Port)))
+}
+
+func needsStreamLocalQuoting(path string) bool {
+	if path == "" {
+		return false
+	}
+	if path[len(path)-1] == '\\' {
+		return true
+	}
+	for i := 0; i < len(path); i++ {
+		switch path[i] {
+		case ' ', '\t', '"', '\'':
+			return true
+		case '\\':
+			if i+1 < len(path) && path[i+1] == '\\' {
+				return true
+			}
+		}
+	}
+	for _, r := range path {
+		if unicode.IsSpace(r) {
+			return true
+		}
+	}
+	return false
+}
+
+func formatStreamLocalEndpoint(path string) string {
+	if !needsStreamLocalQuoting(path) {
+		return path
+	}
+	var sb strings.Builder
+	sb.Grow(len(path) + 4)
+	sb.WriteByte('"')
+	for i := 0; i < len(path); i++ {
+		switch path[i] {
+		case '\\', '"':
+			sb.WriteByte('\\')
+			sb.WriteByte(path[i])
+		default:
+			sb.WriteByte(path[i])
+		}
+	}
+	sb.WriteByte('"')
+	return sb.String()
 }
 
 func normalizeTCPDialNetwork(dialNetwork string) string {
@@ -556,6 +602,9 @@ func splitForwardFields(trimmed string) ([]string, error) {
 // OpenSSH two-token whitespace form ("[bind_address:]port host:hostport") or CLI
 // colon-delimited form ("[bind_address:]port:host:hostport").
 func ParseForwardSpec(raw string) (ForwardSpec, error) {
+	if hasKnownHostsControlChar(raw) {
+		return ForwardSpec{}, fmt.Errorf("invalid forward specification %q: contains invalid control character", raw)
+	}
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return ForwardSpec{}, errors.New("forward specification cannot be empty")
@@ -776,6 +825,9 @@ func parseColonForwardSpec4(raw string, parts []string) (ForwardSpec, error) {
 // specifications accepted by ParseForwardSpec as well as single-endpoint reverse dynamic
 // port forwarding specifications (e.g. "1080", "127.0.0.1:1080", "*:1080", "/tmp/remote.sock").
 func ParseRemoteForwardSpec(raw string) (ForwardSpec, error) {
+	if hasKnownHostsControlChar(raw) {
+		return ForwardSpec{}, fmt.Errorf("invalid remote forward specification %q: contains invalid control character", raw)
+	}
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return ForwardSpec{}, errors.New("remote forward specification cannot be empty")
@@ -865,6 +917,9 @@ func ParseRemoteForwardSpec(raw string) (ForwardSpec, error) {
 // ParseDynamicForwardEndpoint parses a DynamicForward specification ("[bind_address:]port" or socket path)
 // into a ForwardEndpoint.
 func ParseDynamicForwardEndpoint(raw string) (ForwardEndpoint, error) {
+	if hasKnownHostsControlChar(raw) {
+		return ForwardEndpoint{}, fmt.Errorf("invalid dynamic forward specification %q: contains invalid control character", raw)
+	}
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return ForwardEndpoint{}, errors.New("dynamic forward specification cannot be empty")
@@ -907,12 +962,18 @@ func unwrapForwardHost(token string, allowEmpty bool) (string, error) {
 			return "", fmt.Errorf("invalid bracketed host %q", token)
 		}
 		if inner == "*" {
-			return "", nil
+			if allowEmpty {
+				return "", nil
+			}
+			return "", errors.New("wildcard host '*' is not allowed")
 		}
 		return inner, nil
 	}
 	if strings.ContainsAny(token, "[]") {
 		return "", fmt.Errorf("unexpected bracket in host %q", token)
+	}
+	if token == "*" && !allowEmpty {
+		return "", errors.New("wildcard host '*' is not allowed")
 	}
 	return token, nil
 }

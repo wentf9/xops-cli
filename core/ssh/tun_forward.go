@@ -18,6 +18,8 @@ import (
 // unavailable on the current operating system or requested TunnelMode.
 var ErrTunnelDeviceUnsupported = errors.New("tunnel device forwarding is not supported on this platform")
 
+var errTunnelDeviceClosed = errors.New("tunnel device closed")
+
 const (
 	openSSHTunnelChannelType = "tun@openssh.com"
 
@@ -281,6 +283,9 @@ func pumpPointToPointToDevice(ctx context.Context, ch io.Reader, dev TunnelDevic
 			var procErr error
 			buffered, procErr = processBufferedPointToPoint(ctx, dev, buf, buffered+n, onPacketErr)
 			if procErr != nil {
+				if errors.Is(procErr, errTunnelDeviceClosed) {
+					return nil
+				}
 				return procErr
 			}
 		}
@@ -312,7 +317,7 @@ func processBufferedPointToPoint(ctx context.Context, dev TunnelDevice, buf []by
 		}
 		if writeErr := dev.WritePacket(pkt); writeErr != nil {
 			if ctx.Err() != nil || errors.Is(writeErr, os.ErrClosed) || errors.Is(writeErr, net.ErrClosed) {
-				return 0, nil
+				return 0, errTunnelDeviceClosed
 			}
 			return 0, fmt.Errorf("write local tunnel device %s failed: %w", dev.Name(), writeErr)
 		}

@@ -42,22 +42,36 @@ func copySessionOutput(stdout, stderr io.Reader, stdoutWriter, stderrWriter io.W
 type sessionOutputCopy struct {
 	failed <-chan error
 	wait   func() error
+	stdout io.Writer
+	stderr io.Writer
+}
+
+func (s sessionOutputCopy) localOut() io.Writer {
+	if s.stderr != nil {
+		return s.stderr
+	}
+	return s.stdout
 }
 
 // Report the first pump failure immediately, independently of the other stream
 // reaching EOF. The owner closes the SSH session/transport and cancels capable
 // writers before joining both workers through wait.
 func startSessionOutput(stdout, stderr io.Reader, stdoutWriter, stderrWriter io.Writer) sessionOutputCopy {
-	if stdoutWriter == nil {
+	var outputMu sync.Mutex
+	var syncStdout, syncStderr io.Writer
+	if stdoutWriter != nil {
+		syncStdout = serializedSessionOutput{mu: &outputMu, target: stdoutWriter}
+	} else {
 		stdoutWriter = io.Discard
 	}
-	if stderrWriter == nil {
+	if stderrWriter != nil {
+		syncStderr = serializedSessionOutput{mu: &outputMu, target: stderrWriter}
+	} else {
 		stderrWriter = io.Discard
 	}
 	errCh := make(chan error, 2)
 	failed := make(chan error, 1)
 	var wg sync.WaitGroup
-	var outputMu sync.Mutex
 
 	recordFailure := func(err error) {
 		select {
@@ -95,10 +109,15 @@ func startSessionOutput(stdout, stderr io.Reader, stdoutWriter, stderrWriter io.
 	copyOne("stdout", stdoutWriter, stdout)
 	copyOne("stderr", stderrWriter, stderr)
 
-	return sessionOutputCopy{failed: failed, wait: sync.OnceValue(func() error {
-		wg.Wait()
-		return errors.Join(<-errCh, <-errCh)
-	})}
+	return sessionOutputCopy{
+		failed: failed,
+		wait: sync.OnceValue(func() error {
+			wg.Wait()
+			return errors.Join(<-errCh, <-errCh)
+		}),
+		stdout: syncStdout,
+		stderr: syncStderr,
+	}
 }
 
 func waitSessionOutput(ctx context.Context, wait func() error, cancelOutput ...context.CancelFunc) error {

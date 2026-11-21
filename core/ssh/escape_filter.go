@@ -155,6 +155,11 @@ func (e fatalSuspendTerminalError) Unwrap() error { return e.err }
 
 func (w *escapeFilterWriter) handleEscapedByte(b byte, out *[]byte, flush func() error) (bool, error) {
 	switch b {
+	case w.escapeByte:
+		*out = append(*out, w.escapeByte)
+		w.state = nextEscapeStateAfterByte(b)
+		return false, nil
+
 	case '.':
 		_ = flush()
 		w.disconnected.Store(true)
@@ -198,11 +203,6 @@ func (w *escapeFilterWriter) handleEscapedByte(b byte, out *[]byte, flush func()
 		}
 		w.state = escapeStateLineStart
 		w.writeEscapeHelp()
-		return false, nil
-
-	case w.escapeByte:
-		*out = append(*out, w.escapeByte)
-		w.state = nextEscapeStateAfterByte(b)
 		return false, nil
 
 	default:

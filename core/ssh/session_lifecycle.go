@@ -135,7 +135,7 @@ func (c *Client) runTerminalSession(ctx context.Context, payload string, streams
 	go func() { waitDone <- c.waitSession(session) }()
 	abort := combineOutputCancels(cancel, cancelOutput)
 
-	inputDst, escapeFilter := c.wrapTerminalEscapeInput(stdin, streams, escapeByte, escapeEnabled, abort, suspendTerminal)
+	inputDst, escapeFilter := c.wrapTerminalEscapeInput(stdin, output.localOut(), escapeByte, escapeEnabled, abort, suspendTerminal)
 	stopInput, inputDone, err := startInputCopy(work, c.environment.InputBridge, streams, inputDst)
 	if err != nil {
 		abort()
@@ -242,8 +242,10 @@ func (c *Client) enterTerminalRawMode(
 		}
 		state = newState
 		rawActive = true
-		if currW, currH, szErr := term.GetSize(fdOut); szErr == nil && currW > 0 && currH > 0 {
-			_ = session.WindowChange(currH, currW)
+		if session != nil {
+			if currW, currH, szErr := term.GetSize(fdOut); szErr == nil && currW > 0 && currH > 0 {
+				_ = session.WindowChange(currH, currW)
+			}
 		}
 		return suspendErr
 	}
@@ -252,7 +254,7 @@ func (c *Client) enterTerminalRawMode(
 
 func (c *Client) wrapTerminalEscapeInput(
 	stdin io.Writer,
-	streams InteractiveIO,
+	localOut io.Writer,
 	escapeByte byte,
 	escapeEnabled bool,
 	abort func(),
@@ -260,10 +262,6 @@ func (c *Client) wrapTerminalEscapeInput(
 ) (io.Writer, *escapeFilterWriter) {
 	if !escapeEnabled {
 		return stdin, nil
-	}
-	localOut := streams.Stderr
-	if localOut == nil {
-		localOut = streams.Stdout
 	}
 	filter := newEscapeFilterWriter(stdin, escapeFilterConfig{
 		escapeByte:   escapeByte,

@@ -320,7 +320,7 @@ func buildSendEnvRules(patterns []string) ([]sendEnvRule, bool, error) {
 				negPat := tok[1:]
 				kept := rules[:0]
 				for _, r := range rules {
-					if !r.negate && matchOpenSSHPattern(negPat, r.pattern) {
+					if !r.negate && r.pattern == negPat {
 						continue
 					}
 					kept = append(kept, r)

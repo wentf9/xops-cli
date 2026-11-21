@@ -27,6 +27,11 @@ type darwinTunnelDevice struct {
 	wakeRead  int
 	wakeWrite int
 
+	readMu   sync.Mutex
+	readBuf  []byte
+	writeMu  sync.Mutex
+	writeBuf []byte
+
 	mu        sync.Mutex
 	closed    bool
 	closeOnce sync.Once
@@ -47,7 +52,14 @@ func (d *darwinTunnelDevice) ReadPacket(buf []byte) ([]byte, error) {
 	d.mu.Unlock()
 	defer d.wg.Done()
 
-	rawBuf := make([]byte, len(buf)+4)
+	d.readMu.Lock()
+	defer d.readMu.Unlock()
+
+	need := len(buf) + 4
+	if cap(d.readBuf) < need {
+		d.readBuf = make([]byte, need)
+	}
+	rawBuf := d.readBuf[:need]
 	for {
 		d.mu.Lock()
 		closed := d.closed
@@ -71,7 +83,10 @@ func (d *darwinTunnelDevice) ReadPacket(buf []byte) ([]byte, error) {
 		d.mu.Lock()
 		closed = d.closed
 		d.mu.Unlock()
-		if closed || (fds[1].Revents&(unix.POLLIN|unix.POLLHUP|unix.POLLERR) != 0) {
+		if closed || (fds[1].Revents&(unix.POLLIN|unix.POLLHUP|unix.POLLERR|unix.POLLNVAL) != 0) {
+			return nil, os.ErrClosed
+		}
+		if fds[0].Revents&unix.POLLNVAL != 0 {
 			return nil, os.ErrClosed
 		}
 
@@ -82,6 +97,9 @@ func (d *darwinTunnelDevice) ReadPacket(buf []byte) ([]byte, error) {
 					continue
 				}
 				return nil, err
+			}
+			if n == 0 {
+				return nil, io.EOF
 			}
 			if n <= 4 {
 				continue
@@ -109,10 +127,6 @@ func (d *darwinTunnelDevice) WritePacket(pkt []byte) error {
 		return fmt.Errorf("unsupported IP version %d on darwin utun", pkt[0]>>4)
 	}
 
-	raw := make([]byte, 4+len(pkt))
-	binary.BigEndian.PutUint32(raw[0:4], af)
-	copy(raw[4:], pkt)
-
 	d.mu.Lock()
 	if d.closed {
 		d.mu.Unlock()
@@ -121,6 +135,17 @@ func (d *darwinTunnelDevice) WritePacket(pkt []byte) error {
 	d.wg.Add(1)
 	d.mu.Unlock()
 	defer d.wg.Done()
+
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	need := 4 + len(pkt)
+	if cap(d.writeBuf) < need {
+		d.writeBuf = make([]byte, need)
+	}
+	raw := d.writeBuf[:need]
+	binary.BigEndian.PutUint32(raw[0:4], af)
+	copy(raw[4:], pkt)
 
 	for {
 		d.mu.Lock()
@@ -156,7 +181,10 @@ func (d *darwinTunnelDevice) WritePacket(pkt []byte) error {
 		d.mu.Lock()
 		closed = d.closed
 		d.mu.Unlock()
-		if closed || (fds[1].Revents&(unix.POLLIN|unix.POLLHUP|unix.POLLERR) != 0) {
+		if closed || (fds[1].Revents&(unix.POLLIN|unix.POLLHUP|unix.POLLERR|unix.POLLNVAL) != 0) {
+			return os.ErrClosed
+		}
+		if fds[0].Revents&unix.POLLNVAL != 0 {
 			return os.ErrClosed
 		}
 	}

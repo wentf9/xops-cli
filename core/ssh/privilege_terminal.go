@@ -148,7 +148,7 @@ func (e *privilegeExchange) forwardInput(ctx context.Context, stdin io.Reader, p
 		if e.terminal.escapeEnabled {
 			wrapped, filter := e.client.wrapTerminalEscapeInput(
 				pipe,
-				InteractiveIO{Stdout: e.localOut, Stderr: e.localOut},
+				e.localOut,
 				e.terminal.escapeByte,
 				true,
 				e.abort,
