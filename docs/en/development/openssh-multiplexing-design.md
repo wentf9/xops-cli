@@ -337,7 +337,7 @@ If a prior master crashed abnormally (`kill -9` or power failure), an inactive s
 
 ### 5.1 4-Tier Resolution Precedence
 
-`pkg/adapter/ssh_adapter.go:ResolveSSHOptions` (and `ResolveControl` derived from it) evaluates OpenSSH client options and multiplexing configurations strictly according to the following precedence:
+`pkg/adapter/policy_solver.go:Resolve` (producing an immutable `EffectivePolicy`) evaluates OpenSSH client options and multiplexing configurations strictly according to the following precedence:
 
 $$\text{Tier 1 (CLI Session Overrides)} > \text{Tier 2 (Node Config)} > \text{Tier 3 (Global Defaults)} > \text{Tier 4 (OpenSSH Config)}$$
 

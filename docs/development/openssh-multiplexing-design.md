@@ -337,7 +337,7 @@ const (
 
 ### 5.1 4 层继承优先级
 
-`pkg/adapter/ssh_adapter.go:ResolveSSHOptions`（以及基于其派生的 `ResolveControl`）严格按以下优先级由高到低解析 OpenSSH 客户端选项与连接共享配置：
+`pkg/adapter/policy_solver.go:Resolve`（统一产出不可变 `EffectivePolicy`）严格按以下优先级由高到低解析 OpenSSH 客户端选项与连接共享配置：
 
 $$\text{Tier 1 (CLI Session Overrides)} > \text{Tier 2 (Node Config)} > \text{Tier 3 (Global Defaults)} > \text{Tier 4 (OpenSSH Config)}$$
 
