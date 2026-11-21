@@ -267,7 +267,7 @@ func (r *Repository) ConfirmNodeContext(ctx context.Context, nodeID string) erro
 // PendingNodeExecution returns a defensive execution snapshot only for a new,
 // unconfirmed node. Saved and OpenSSH virtual nodes are never enrollment targets.
 func (r *Repository) PendingNodeExecution(nodeID string) (*ssh.ExecutionConfig, bool) {
-	if r == nil || strings.HasPrefix(nodeID, OpenSSHNodePrefix) {
+	if r == nil || IsOpenSSHNodeID(nodeID) {
 		return nil, false
 	}
 	r.pendingMu.RLock()
@@ -411,7 +411,7 @@ func (r *Repository) acquirePendingConfirmationGate(ctx context.Context, nodeID 
 }
 
 func mergeConfirmedNodeConfig(cfg *Configuration, nodeID string, node models.Node, host models.Host, identity models.Identity) error {
-	if err := ValidateNodeAlias(nodeID); err != nil {
+	if err := ValidateNodeID(nodeID); err != nil {
 		return fmt.Errorf("save connected node %q: %w", nodeID, err)
 	}
 	if err := ValidateNodeAliases(node.Alias); err != nil {

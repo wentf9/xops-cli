@@ -1,8 +1,8 @@
-//go:build p7repro
-
 package config
 
 import (
+	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -11,7 +11,7 @@ import (
 	"github.com/wentf9/xops-cli/pkg/models"
 )
 
-func newP7MemoryRepo(t *testing.T, initial *Configuration) *Repository {
+func newP7W2dMemoryRepo(t *testing.T, initial *Configuration) *Repository {
 	t.Helper()
 	store := NewDefaultStore(filepath.Join(t.TempDir(), "config.yaml"), filepath.Join(t.TempDir(), "key"))
 	repo, err := NewRepositoryWithOpenSSHParser(initial, store, &OpenSSHParser{})
@@ -21,9 +21,9 @@ func newP7MemoryRepo(t *testing.T, initial *Configuration) *Repository {
 	return repo
 }
 
-// TestP7Repro_MED5_CyclicAndSelfProxyJump_RejectedAtWriteBoundaries reproduces MED-5:
-// cyclic and self-referential ProxyJump graphs pass ValidateV2, Repository commit
-// (CreateNodeContext / NewRepository), and ImportOpenSSHHostsContext.
+// TestP7Repro_MED5_CyclicAndSelfProxyJump_RejectedAtWriteBoundaries verifies MED-5:
+// cyclic and self-referential ProxyJump graphs are rejected at ValidateV2, Repository
+// commit (CreateNodeContext / ReplaceNodeAtRefContext / NewRepository), and ImportOpenSSHHostsContext.
 func TestP7Repro_MED5_CyclicAndSelfProxyJump_RejectedAtWriteBoundaries(t *testing.T) {
 	t.Parallel()
 
@@ -65,7 +65,7 @@ func TestP7Repro_MED5_CyclicAndSelfProxyJump_RejectedAtWriteBoundaries(t *testin
 
 	t.Run("Repository_CreateNodeContext_rejects_self_and_cycle", func(t *testing.T) {
 		t.Parallel()
-		repo := newP7MemoryRepo(t, nil)
+		repo := newP7W2dMemoryRepo(t, nil)
 
 		_, err := repo.CreateNodeContext(
 			t.Context(),
@@ -99,7 +99,7 @@ func TestP7Repro_MED5_CyclicAndSelfProxyJump_RejectedAtWriteBoundaries(t *testin
 
 	t.Run("ImportOpenSSHHostsContext_rejects_self_and_cycle", func(t *testing.T) {
 		t.Parallel()
-		repo := newP7MemoryRepo(t, nil)
+		repo := newP7W2dMemoryRepo(t, nil)
 
 		hosts := []OpenSSHHost{
 			{
@@ -135,12 +135,51 @@ func TestP7Repro_MED5_CyclicAndSelfProxyJump_RejectedAtWriteBoundaries(t *testin
 			}
 		}
 	})
+
+	t.Run("Load_nonconforming_config_fails_closed_with_doctor_hint", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		cfgPath := filepath.Join(dir, "xops_config.yaml")
+		raw := strings.Join([]string{
+			"schema_version: 2",
+			"credential:",
+			"  stores: {}",
+			"hosts:",
+			"  h-a:",
+			"    address: 10.0.0.1",
+			"    port: 22",
+			"identities:",
+			"  id-a:",
+			"    user: ops",
+			"    auth_type: auto",
+			"nodes:",
+			"  node-a:",
+			"    host_ref: h-a",
+			"    identity_ref: id-a",
+			"    proxy_jump: node-a",
+			"    sudo_mode: auto",
+		}, "\n") + "\n"
+		if err := os.WriteFile(cfgPath, []byte(raw), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		store := NewDefaultStore(cfgPath, filepath.Join(dir, "key"))
+		_, err := store.Load()
+		if err == nil {
+			t.Fatal("store.Load() accepted cyclic config, want fail-closed error")
+		}
+		if !errors.Is(err, ErrSchemaValidation) {
+			t.Errorf("store.Load() err = %v, want ErrSchemaValidation", err)
+		}
+		if !strings.Contains(err.Error(), "xops config doctor") {
+			t.Errorf("store.Load() err = %q, want actionable 'xops config doctor' hint", err.Error())
+		}
+	})
 }
 
-// TestP7Repro_MED14_ProxyJumpAndTargetRef_DoublePrefixAndCaseDrift reproduces MED-14:
-// ResolveProxyJumpChain accepts and emits double-prefixed `openssh:openssh:22`, and
-// `OPENSSH:` prefix handling drifts in case sensitivity across ResolveProxyJumpChain,
-// ParseTargetRef, and IsOpenSSHNodeID.
+// TestP7Repro_MED14_ProxyJumpAndTargetRef_DoublePrefixAndCaseDrift verifies MED-14:
+// ResolveProxyJumpChain rejects double-prefixed `openssh:openssh:22` and `openssh:OPENSSH:22`,
+// never emits double-prefixed fallback targets, and enforces one case-insensitive reserved
+// `openssh:` prefix rule across ParseTargetRef, IsOpenSSHNodeID, and ResolveProxyJumpChain.
 func TestP7Repro_MED14_ProxyJumpAndTargetRef_DoublePrefixAndCaseDrift(t *testing.T) {
 	t.Parallel()
 
@@ -197,9 +236,9 @@ func TestP7Repro_MED14_ProxyJumpAndTargetRef_DoublePrefixAndCaseDrift(t *testing
 	})
 }
 
-// TestP7Repro_LOW2_ValidateNodeAlias_RejectsAtColonAndControlChars reproduces LOW-2:
-// ValidateNodeAlias accepts '@', ':', and ASCII control characters that CLI alias
-// validation (and safe persistence boundaries) must reject.
+// TestP7Repro_LOW2_ValidateNodeAlias_RejectsAtColonAndControlChars verifies LOW-2:
+// ValidateNodeAlias enforces the single strict rule rejecting '@', ':', and control chars
+// across direct calls, ValidateV2, and Repository write paths.
 func TestP7Repro_LOW2_ValidateNodeAlias_RejectsAtColonAndControlChars(t *testing.T) {
 	t.Parallel()
 
@@ -242,7 +281,7 @@ func TestP7Repro_LOW2_ValidateNodeAlias_RejectsAtColonAndControlChars(t *testing
 				t.Errorf("LOW-2: ValidateV2 accepted invalid Node.Alias %q", alias)
 			}
 
-			repo := newP7MemoryRepo(t, nil)
+			repo := newP7W2dMemoryRepo(t, nil)
 			if _, err := repo.CreateNodeContext(
 				t.Context(),
 				"web-node",

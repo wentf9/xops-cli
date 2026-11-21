@@ -89,7 +89,6 @@ func runInventoryEdit(cmd *cobra.Command, args []string, flags *editFlags, secre
 		}
 	}
 
-	oldAliases := slices.Clone(node.Alias)
 	updated, nameChanged := applyNodeUpdates(cmd, &host, &identity, &node, flags)
 	if err := applyEditedIdentityTemplate(view, flags.identityAlias, &node, &identity, &updated, &nameChanged); err != nil {
 		return err
@@ -100,11 +99,22 @@ func runInventoryEdit(cmd *cobra.Command, args []string, flags *editFlags, secre
 		return err
 	}
 	if cmd.Flags().Changed("jump") {
-		resolvedJump, err := validateHostProxyJump(repository, oldName, newName, oldAliases, node.Alias, flags.jump)
-		if err != nil {
-			return err
+		if !ssh.HasActiveProxyJump(flags.jump) {
+			node.ProxyJump = ""
+		} else {
+			draft := repository.Snapshot()
+			draft.Hosts.Set(node.HostRef, host)
+			draft.Identities.Set(node.IdentityRef, identity)
+			if oldName != newName {
+				draft.Nodes.Remove(oldName)
+			}
+			draft.Nodes.Set(newName, node)
+			resolvedJump, err := config.ResolveProxyJumpChainWithConfig(draft, repository.GetOpenSSHParser(), flags.jump)
+			if err != nil {
+				return fmt.Errorf("resolve jump host for node %q: %w", newName, err)
+			}
+			node.ProxyJump = resolvedJump
 		}
-		node.ProxyJump = resolvedJump
 	}
 	return commitEditedNode(cmd, repository, view.NodeRefs[oldName], oldName, newName, node, host, identity, flags, updated)
 }
@@ -247,135 +257,6 @@ func applyNodeUpdates(cmd *cobra.Command, host *models.Host, identity *models.Id
 		updated = true
 	}
 	return updated, nameChanged
-}
-
-func validateHostProxyJump(
-	repository *config.Repository,
-	oldName, newName string,
-	oldAliases, newAliases []string,
-	rawJump string,
-) (string, error) {
-	if !ssh.HasActiveProxyJump(rawJump) {
-		return "", nil
-	}
-	selfIDs := buildSelfJumpIdentitySet(oldName, newName, oldAliases, newAliases)
-	for _, hop := range splitActiveJumpHops(rawJump) {
-		if rawHopMatchesSelfIdentity(hop, selfIDs) {
-			return "", fmt.Errorf("jump host %q cannot reference node %q", rawJump, newName)
-		}
-	}
-	resolvedJump, err := repository.ResolveProxyJumpChain(rawJump)
-	if err != nil {
-		return "", fmt.Errorf("resolve jump host for node %q: %w", newName, err)
-	}
-	queue := splitActiveJumpHops(resolvedJump)
-	visited := make(map[string]struct{}, len(queue))
-	for len(queue) > 0 {
-		hop := queue[0]
-		queue = queue[1:]
-		if hopMatchesSelfIdentity(repository, hop, selfIDs) {
-			return "", fmt.Errorf("jump host %q creates a proxy jump cycle with node %q", rawJump, newName)
-		}
-		if _, seen := visited[hop]; seen {
-			continue
-		}
-		visited[hop] = struct{}{}
-		queue = append(queue, resolveNextJumpHops(repository, hop)...)
-	}
-	return resolvedJump, nil
-}
-
-func rawHopMatchesSelfIdentity(hop string, selfIDs map[string]struct{}) bool {
-	if _, isSelf := selfIDs[hop]; isSelf {
-		return true
-	}
-	ref, err := config.ParseTargetRef(hop)
-	if err != nil || ref.OpenSSH {
-		return false
-	}
-	if _, isSelf := selfIDs[ref.Host]; isSelf {
-		return true
-	}
-	if ref.User == "" {
-		return false
-	}
-	port := ref.Port
-	if port == 0 {
-		port = 22
-	}
-	_, isSelf := selfIDs[config.FormatNodeID(ref.User, ref.Host, port)]
-	return isSelf
-}
-
-func buildSelfJumpIdentitySet(oldName, newName string, oldAliases, newAliases []string) map[string]struct{} {
-	selfIDs := make(map[string]struct{}, 2+len(oldAliases)+len(newAliases))
-	addSelf := func(id string) {
-		if trimmed := strings.TrimSpace(id); trimmed != "" {
-			selfIDs[trimmed] = struct{}{}
-		}
-	}
-	addSelf(oldName)
-	addSelf(newName)
-	for _, a := range oldAliases {
-		addSelf(a)
-	}
-	for _, a := range newAliases {
-		addSelf(a)
-	}
-	return selfIDs
-}
-
-func hopMatchesSelfIdentity(repository *config.Repository, hop string, selfIDs map[string]struct{}) bool {
-	if rawHopMatchesSelfIdentity(hop, selfIDs) {
-		return true
-	}
-	if config.IsOpenSSHNodeID(hop) {
-		return false
-	}
-	sel, err := repository.ResolveSelector(hop)
-	if err != nil || sel == "" {
-		return false
-	}
-	_, isSelf := selfIDs[sel]
-	return isSelf
-}
-
-func resolveNextJumpHops(repository *config.Repository, hop string) []string {
-	var nextJump string
-	if n, ok := repository.GetNode(hop); ok {
-		nextJump = n.ProxyJump
-	} else if snap, snapErr := repository.ResolveConnection(hop); snapErr == nil {
-		nextJump = snap.Node.ProxyJump
-	}
-	if !ssh.HasActiveProxyJump(nextJump) {
-		return nil
-	}
-	rawHops := splitActiveJumpHops(nextJump)
-	resolvedNext, nextErr := repository.ResolveProxyJumpChain(nextJump)
-	if nextErr != nil {
-		return rawHops
-	}
-	resolvedHops := splitActiveJumpHops(resolvedNext)
-	out := make([]string, 0, len(rawHops)+len(resolvedHops))
-	out = append(out, resolvedHops...)
-	for _, rh := range rawHops {
-		if !slices.Contains(out, rh) {
-			out = append(out, rh)
-		}
-	}
-	return out
-}
-
-func splitActiveJumpHops(chain string) []string {
-	var hops []string
-	for part := range strings.SplitSeq(chain, ",") {
-		hop := strings.TrimSpace(part)
-		if hop == "" || strings.EqualFold(hop, "none") {
-			continue
-		}
-		hops = append(hops, hop)
-	}
-	return hops
 }
 
 func applyNodeTagUpdates(cmd *cobra.Command, node *models.Node, flags *editFlags) bool {

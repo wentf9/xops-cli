@@ -8,6 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/i18n"
@@ -101,18 +102,32 @@ func runInventoryAdd(cmd *cobra.Command, args []string, flags *addFlags, secretI
 	}
 
 	hostObj := models.Host{Address: flags.address, Port: flags.port}
-	resolvedJump, err := validateHostProxyJump(repository, "", name, nil, flags.alias, flags.jump)
-	if err != nil {
-		return err
-	}
 	node := models.Node{
 		HostRef:     config.FormatHostPort(flags.address, flags.port),
 		IdentityRef: identityRef,
 		Alias:       flags.alias,
 		Tags:        normalizeTagList(flags.tags),
-		ProxyJump:   resolvedJump,
 		SudoMode:    models.SudoModeAuto,
 		Execution:   execution,
+	}
+	draft := repository.Snapshot()
+	draft.Execution = nil
+	draftNode := node
+	draftNode.Execution = nil
+	draft.Hosts.Set(draftNode.HostRef, hostObj)
+	draft.Identities.Set(draftNode.IdentityRef, identity)
+	draft.Nodes.Set(name, draftNode)
+	if ssh.HasActiveProxyJump(flags.jump) {
+		resolvedJump, jErr := config.ResolveProxyJumpChainWithConfig(draft, repository.GetOpenSSHParser(), flags.jump)
+		if jErr != nil {
+			return fmt.Errorf("resolve jump host for node %q: %w", name, jErr)
+		}
+		node.ProxyJump = resolvedJump
+		draftNode.ProxyJump = resolvedJump
+		draft.Nodes.Set(name, draftNode)
+	}
+	if err := config.ValidateGraph(draft); err != nil {
+		return fmt.Errorf("validate node %q failed: %w", name, err)
 	}
 
 	if !flags.skipVerify {
@@ -227,8 +242,11 @@ func applyAddTargetArgs(args []string, alias *[]string, address, user *string, p
 	targetArg := args[0]
 	if len(args) == 2 {
 		posAlias := strings.TrimSpace(args[0])
-		if posAlias == "" || strings.ContainsAny(posAlias, "@:") {
+		if posAlias == "" {
 			return fmt.Errorf("%s", i18n.T("ssh_err_alias_invalid"))
+		}
+		if err := config.ValidateNodeAlias(posAlias); err != nil {
+			return err
 		}
 		if !slices.Contains(*alias, posAlias) {
 			*alias = append(*alias, posAlias)

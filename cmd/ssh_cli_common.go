@@ -6,6 +6,7 @@ import (
 
 	"github.com/spf13/pflag"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 )
 
@@ -62,5 +63,5 @@ func validateCommonSSHBaseOptions(o *SshOptions) error {
 	if err := utils.ValidateRememberPolicy(o.Remember); err != nil {
 		return err
 	}
-	return validateCLIAlias(o.Alias)
+	return config.ValidateNodeAlias(o.Alias)
 }

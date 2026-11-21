@@ -121,11 +121,29 @@ func TestRound8_P1_7_ConcreteHostAddressAndHostAliasValidationAcrossAllPersisten
 		t.Fatalf("ImportOpenSSHHostsContext = %+v, want Imported=1 Skipped=2 Issues=2", imp)
 	}
 
-	// 3. PrepareNodeContext / createNodeInTransaction rejects OPENSSH:victim concrete address.
-	if _, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	// 3. OPENSSH:victim is handled case-insensitively as a read-only OpenSSH virtual
+	// selector (never persisted as a concrete host), while double-prefixed selectors
+	// and concrete Host.Address values with OPENSSH: are rejected fail-closed.
+	prepVirt, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{Selector: "OPENSSH:victim", User: "ops", HasUser: true},
+	})
+	if err != nil {
+		t.Fatalf("PrepareNodeContext(OPENSSH:victim) unexpected error: %v", err)
+	}
+	if prepVirt.Created || !IsOpenSSHNodeID(prepVirt.NodeID) {
+		t.Fatalf("PrepareNodeContext(OPENSSH:victim) = %+v, want read-only OpenSSH virtual node (Created=false)", prepVirt)
+	}
+	if _, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+		Target: ConnectionTarget{Selector: "openssh:OPENSSH:victim", User: "ops", HasUser: true},
 	}); err == nil {
-		t.Fatal("PrepareNodeContext accepted OPENSSH:victim as concrete host address")
+		t.Fatal("PrepareNodeContext accepted double-prefixed openssh:OPENSSH:victim")
+	}
+	if _, err := repo.CreateNodeContext(t.Context(), "bad-concrete-host",
+		models.Node{HostRef: "h-bad", IdentityRef: "id-bad"},
+		models.Host{Address: "OPENSSH:victim", Port: 22},
+		models.Identity{User: "ops"},
+	); err == nil {
+		t.Fatal("CreateNodeContext accepted OPENSSH:victim as concrete host address")
 	}
 
 	// 4. ValidateV2 rejects bad Host.Address, Host.Alias, Node name, and Node.Alias.

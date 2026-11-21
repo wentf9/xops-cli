@@ -50,7 +50,7 @@ func buildPass5SavedRepo(t *testing.T, sshConfigText string) *config.Repository 
 	cfg.Nodes.Set("iaas@10.238.221.181:22", models.Node{
 		HostRef:     "web-single",
 		IdentityRef: "iaas-id",
-		Alias:       []string{"Prod Web 01", "Prod\tWeb"},
+		Alias:       []string{"Prod Web 01"},
 	})
 
 	cfg.Hosts.Set("web-shared", models.Host{
@@ -295,7 +295,7 @@ func TestPass5_M5_SshSftpControlTargetExpansionAndDeferredSavedAliasHostName(t *
 
 func verifyPass5M5SavedAndUnsafeHostName(t *testing.T, repo *config.Repository) {
 	t.Helper()
-	for _, savedAlias := range []string{"Prod Web 01", "Prod\tWeb"} {
+	for _, savedAlias := range []string{"Prod Web 01"} {
 		oSaved := NewSshOptions()
 		cmdSaved := newCmdSshWithOptions(oSaved)
 		if err := cmdSaved.ParseFlags([]string{"-o", "HostName=%h", "--host", savedAlias, "true"}); err != nil {

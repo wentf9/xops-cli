@@ -576,7 +576,7 @@ func (p *Provider) resolveWithProvenance(nodeID string) (models.Node, models.Hos
 		if parser == nil {
 			parser = &OpenSSHParser{cfg: nil}
 		}
-		spec := strings.TrimPrefix(nodeID, OpenSSHNodePrefix)
+		spec, _ := cutOpenSSHPrefix(nodeID)
 		lookupHost, inlineUser, inlinePort, specErr := parseOpenSSHHostSpec(spec)
 		if specErr != nil {
 			return models.Node{}, models.Host{}, models.Identity{}, ProvenanceUnknown, fmt.Errorf("parse openssh host %q failed: %w", spec, specErr)
@@ -638,7 +638,7 @@ func (p *Provider) ResolveConnectionWithOrigin(nodeID, originalHost string) (Con
 	if parser == nil {
 		parser = &OpenSSHParser{cfg: nil}
 	}
-	spec := strings.TrimPrefix(nodeID, OpenSSHNodePrefix)
+	spec, _ := cutOpenSSHPrefix(nodeID)
 	lookupHost, inlineUser, inlinePort, specErr := parseOpenSSHHostSpec(spec)
 	if specErr != nil {
 		return ConnectionSnapshot{}, fmt.Errorf("parse openssh host %q failed: %w", spec, specErr)

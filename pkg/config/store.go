@@ -295,9 +295,13 @@ func (s *defaultStore) loadLocked() (*Configuration, error) {
 	}
 	dto, err := UnmarshalV2(data)
 	if err != nil {
-		return nil, err
+		return nil, wrapConfigDoctorHint(err)
 	}
-	return FromV2(dto)
+	cfg, err := FromV2(dto)
+	if err != nil {
+		return nil, wrapConfigDoctorHint(err)
+	}
+	return cfg, nil
 }
 
 func (s *defaultStore) Save(cfg *Configuration) error {

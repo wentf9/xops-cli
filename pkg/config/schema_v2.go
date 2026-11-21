@@ -243,7 +243,7 @@ func validateV2Nodes(cfg *ConfigurationV2) error {
 
 	for _, nodeName := range nodeNames {
 		node := cfg.Nodes[nodeName]
-		if err := ValidateNodeAlias(nodeName); err != nil {
+		if err := ValidateNodeID(nodeName); err != nil {
 			return fmt.Errorf("%w: node %q name invalid: %w", ErrSchemaValidation, nodeName, err)
 		}
 		if err := ValidateNodeAliases(node.Alias); err != nil {
@@ -256,7 +256,15 @@ func validateV2Nodes(cfg *ConfigurationV2) error {
 			return err
 		}
 	}
-	return validateV2HostAliasConflicts(cfg, nodeNames, nodeAliasOwners)
+	if err := validateV2HostAliasConflicts(cfg, nodeNames, nodeAliasOwners); err != nil {
+		return err
+	}
+	graphCfg := configurationFromV2Unchecked(cfg)
+	lookup, aliases, err := buildIndexes(graphCfg, true)
+	if err != nil {
+		return fmt.Errorf("%w: validate configuration indexes: %w", ErrSchemaValidation, err)
+	}
+	return validateProxyJumpGraph(graphCfg, lookup, aliases)
 }
 
 func recordV2NodeAliases(nodeAliasOwners map[string]string, nodeName string, aliases []string) error {
@@ -803,7 +811,10 @@ func FromV2(v2 *ConfigurationV2) (*Configuration, error) {
 	if err := ValidateV2(v2); err != nil {
 		return nil, err
 	}
+	return configurationFromV2Unchecked(v2), nil
+}
 
+func configurationFromV2Unchecked(v2 *ConfigurationV2) *Configuration {
 	cfg := &Configuration{
 		SchemaVersion:         2,
 		Credential:            v2.Credential.Clone(),
@@ -849,5 +860,5 @@ func FromV2(v2 *ConfigurationV2) (*Configuration, error) {
 		})
 	}
 
-	return cfg, nil
+	return cfg
 }

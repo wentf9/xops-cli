@@ -151,10 +151,13 @@ func newRepository(cfg *Configuration, store Store, parser *OpenSSHParser) (*Rep
 	cloned, origins := cloneConfigurationExtractingMetadata(cfg)
 	lookup, aliases, err := buildIndexes(cloned, true)
 	if err != nil {
-		return nil, fmt.Errorf("validate configuration indexes: %w", err)
+		return nil, wrapConfigDoctorHint(fmt.Errorf("%w: validate configuration indexes: %w", ErrSchemaValidation, err))
 	}
 	if err := validateRepositoryConfiguration(cloned); err != nil {
-		return nil, err
+		return nil, wrapConfigDoctorHint(err)
+	}
+	if err := validateProxyJumpGraph(cloned, lookup, aliases); err != nil {
+		return nil, wrapConfigDoctorHint(err)
 	}
 	return &Repository{
 		provider: &Provider{
@@ -682,9 +685,12 @@ func prepareConfiguration(base *Configuration, fn func(*Configuration) error) (*
 	stripTransientNodeMetadata(updated)
 	lookup, aliases, err := buildIndexes(updated, true)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("validate configuration indexes: %w", err)
+		return nil, nil, nil, fmt.Errorf("%w: validate configuration indexes: %w", ErrSchemaValidation, err)
 	}
 	if err := validateRepositoryConfiguration(updated); err != nil {
+		return nil, nil, nil, err
+	}
+	if err := validateProxyJumpGraph(updated, lookup, aliases); err != nil {
 		return nil, nil, nil, err
 	}
 	return updated, lookup, aliases, nil
@@ -797,7 +803,7 @@ func (r *Repository) CreateNodeContext(ctx context.Context, nodeID string, node 
 	if nodeID == "" {
 		return NodeMutation{}, fmt.Errorf("node ID is empty")
 	}
-	if err := ValidateNodeAlias(nodeID); err != nil {
+	if err := ValidateNodeID(nodeID); err != nil {
 		return NodeMutation{}, err
 	}
 	if err := ValidateNodeAliases(node.Alias); err != nil {
@@ -942,7 +948,7 @@ func (r *Repository) replaceNodeAtRefWithOutcome(ctx context.Context, ref NodeRe
 // replaceNodeAtRef mutates a transaction-local snapshot. Both ordinary edits
 // and credential transactions use the same conflict and shared-reference rules.
 func replaceNodeAtRef(cfg *Configuration, ref NodeRef, nodeID string, node models.Node, host models.Host, identity models.Identity) error {
-	if err := ValidateNodeAlias(nodeID); err != nil {
+	if err := ValidateNodeID(nodeID); err != nil {
 		return err
 	}
 	if err := ValidateNodeAliases(node.Alias); err != nil {
@@ -1147,7 +1153,7 @@ func (r *Repository) ImportOpenSSHHostsContext(ctx context.Context, hosts []Open
 				result.Issues = append(result.Issues, ImportIssue{Name: item.Name, Err: fmt.Errorf("openssh host name is empty")})
 				continue
 			}
-			if err := ValidateNodeAlias(item.Name); err != nil {
+			if err := ValidateNodeID(item.Name); err != nil {
 				result.Skipped++
 				result.Issues = append(result.Issues, ImportIssue{Name: item.Name, Err: err})
 				continue
@@ -1908,7 +1914,7 @@ func validateConfigurationNodes(cfg *Configuration, stores map[string]StoreConfi
 }
 
 func validateConfigurationNode(cfg *Configuration, stores map[string]StoreConfig, nodeID string, node models.Node) error {
-	if err := ValidateNodeAlias(nodeID); err != nil {
+	if err := ValidateNodeID(nodeID); err != nil {
 		return fmt.Errorf("%w: node %q name invalid: %w", ErrSchemaValidation, nodeID, err)
 	}
 	if err := ValidateNodeAliases(node.Alias); err != nil {

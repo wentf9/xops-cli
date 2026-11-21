@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os/user"
 	"slices"
 	"strconv"
@@ -120,16 +121,53 @@ func NormalizePersistableIdentityPath(raw string) string {
 	return fileutils.ToAbsolutePath(strings.TrimSpace(raw))
 }
 
-// ValidateNodeAlias ensures custom node aliases do not collide with the reserved
-// "openssh" virtual namespace.
-func ValidateNodeAlias(alias string) error {
-	trimmed := strings.TrimSpace(alias)
+// ValidateNodeID ensures a persisted node identifier is non-empty, free of
+// control or line-separator characters, and does not collide with the reserved
+// "openssh" virtual namespace (case-insensitive).
+func ValidateNodeID(nodeID string) error {
+	if hasControlOrLineSepChar(nodeID) {
+		return fmt.Errorf("invalid node ID %q: contains invalid control character", nodeID)
+	}
+	trimmed := strings.TrimSpace(nodeID)
 	if trimmed == "" {
+		return fmt.Errorf("node ID cannot be empty")
+	}
+	if strings.EqualFold(trimmed, "openssh") || hasOpenSSHPrefix(trimmed) {
+		return fmt.Errorf("node ID %q is reserved for OpenSSH virtual targets", trimmed)
+	}
+	return nil
+}
+
+// ValidateNodeAlias enforces the single strict node/host alias rule across CLI,
+// TUI, and configuration persistence: rejects control/line-separator characters,
+// whitespace-only values, '@' and ':' delimiters, the reserved "openssh" virtual
+// namespace (case-insensitive), and values that cannot round-trip as a TargetRef.
+func ValidateNodeAlias(alias string) error {
+	if alias == "" {
 		return nil
 	}
-	lower := strings.ToLower(trimmed)
-	if lower == "openssh" || strings.HasPrefix(lower, OpenSSHNodePrefix) {
+	if hasControlOrLineSepChar(alias) {
+		return fmt.Errorf("invalid alias %q: contains invalid control character", alias)
+	}
+	trimmed := strings.TrimSpace(alias)
+	if trimmed == "" {
+		return fmt.Errorf("invalid alias %q: cannot be whitespace-only", alias)
+	}
+	if strings.ContainsAny(trimmed, "@:") {
+		return fmt.Errorf("invalid alias %q: cannot contain '@' or ':'", trimmed)
+	}
+	if strings.EqualFold(trimmed, "openssh") || hasOpenSSHPrefix(trimmed) {
 		return fmt.Errorf("alias %q is reserved for OpenSSH virtual targets", trimmed)
+	}
+	ref, err := ParseTargetRef(trimmed)
+	if err != nil {
+		return fmt.Errorf("invalid alias %q: %w", trimmed, err)
+	}
+	if ref.OpenSSH {
+		return fmt.Errorf("alias %q is reserved for OpenSSH virtual targets", trimmed)
+	}
+	if err := ref.Validate(); err != nil {
+		return fmt.Errorf("invalid alias %q: %w", trimmed, err)
 	}
 	return nil
 }
@@ -156,7 +194,7 @@ func ValidateConcreteHostAddress(raw string) error {
 	if trimmed == "" {
 		return fmt.Errorf("host address cannot be empty")
 	}
-	if len(trimmed) >= len(OpenSSHNodePrefix) && strings.EqualFold(trimmed[:len(OpenSSHNodePrefix)], OpenSSHNodePrefix) {
+	if hasOpenSSHPrefix(trimmed) {
 		return fmt.Errorf("invalid host address %q: openssh selector cannot be used as a concrete host address", raw)
 	}
 	for _, r := range trimmed {
@@ -328,7 +366,7 @@ func normalizeTargetSelector(cfg *Configuration, lookup map[string][]string, ali
 }
 
 func isDirectOrIndexedSelector(cfg *Configuration, lookup map[string][]string, aliases map[string]string, selector string) bool {
-	if selector == "" || strings.HasPrefix(selector, OpenSSHNodePrefix) {
+	if selector == "" || hasOpenSSHPrefix(selector) {
 		return true
 	}
 	if cfg != nil && cfg.Nodes != nil {
@@ -461,12 +499,13 @@ func (r *Repository) resolveExplicitOpenSSHVirtualTarget(
 	target ConnectionTarget,
 	explicitDefaultUser string,
 ) (targetDecision, bool, error) {
-	if !strings.HasPrefix(selector, OpenSSHNodePrefix) {
+	after, ok := cutOpenSSHPrefix(selector)
+	if !ok {
 		return targetDecision{}, false, nil
 	}
-	clean := strings.TrimSpace(strings.TrimPrefix(selector, OpenSSHNodePrefix))
-	if clean == "" {
-		return targetDecision{}, true, fmt.Errorf("parse openssh host %q failed: host is empty", selector)
+	clean := strings.TrimSpace(after)
+	if clean == "" || hasOpenSSHPrefix(clean) {
+		return targetDecision{}, true, fmt.Errorf("parse openssh host %q failed: invalid openssh selector", selector)
 	}
 	lookupHost, inlineUser, inlinePort, err := parseOpenSSHHostSpec(clean)
 	if err != nil {
@@ -762,7 +801,7 @@ func (r *Repository) buildMatchedOpenSSHResolvedTarget(
 	matchedID, baseID, openSSHAlias, canonicalHost string,
 	target ConnectionTarget,
 ) (ResolvedTarget, error) {
-	cleanMatched := strings.TrimPrefix(matchedID, OpenSSHNodePrefix)
+	cleanMatched, _ := cutOpenSSHPrefix(matchedID)
 	lookupHost, inlineUser, inlinePort, parseErr := parseOpenSSHHostSpec(cleanMatched)
 	if parseErr != nil {
 		return ResolvedTarget{}, fmt.Errorf("parse openssh host %q failed: %w", cleanMatched, parseErr)
@@ -1041,7 +1080,8 @@ func resolveOpenSSHAliasName(parser *OpenSSHParser, spec string) string {
 	if parser == nil || parser.cfg == nil {
 		return ""
 	}
-	clean := strings.TrimSpace(strings.TrimPrefix(spec, OpenSSHNodePrefix))
+	clean, _ := cutOpenSSHPrefix(spec)
+	clean = strings.TrimSpace(clean)
 	if clean == "" {
 		return ""
 	}
@@ -1060,9 +1100,9 @@ func (r *Repository) matchBareOpenSSHSelector(selector string, target Connection
 	if err := parser.Err(); err != nil {
 		return "", "", fmt.Errorf("resolve openssh host %q: %w", selector, err)
 	}
-	if strings.HasPrefix(selector, OpenSSHNodePrefix) {
-		clean := strings.TrimSpace(strings.TrimPrefix(selector, OpenSSHNodePrefix))
-		if clean == "" {
+	if after, ok := cutOpenSSHPrefix(selector); ok {
+		clean := strings.TrimSpace(after)
+		if clean == "" || hasOpenSSHPrefix(clean) {
 			return "", "", nil
 		}
 		if _, _, _, err := resolveVirtualNodeForTarget(parser, clean, target); err != nil {
@@ -1102,7 +1142,7 @@ func (r *Repository) matchOpenSSHVirtualNode(selector, effectiveUser string, eff
 	if err := parser.Err(); err != nil {
 		return "", "", fmt.Errorf("resolve openssh host %q: %w", selector, err)
 	}
-	if strings.HasPrefix(selector, OpenSSHNodePrefix) {
+	if hasOpenSSHPrefix(selector) {
 		return matchExplicitOpenSSHVirtualNode(parser, selector, effectiveUser, effectivePort, target)
 	}
 	orig := normalizeOriginalHost(target.OriginalHost)
@@ -1143,8 +1183,9 @@ func (r *Repository) matchOpenSSHVirtualNode(selector, effectiveUser string, eff
 }
 
 func matchExplicitOpenSSHVirtualNode(parser *OpenSSHParser, selector, effectiveUser string, effectivePort uint16, target ConnectionTarget) (string, string, error) {
-	clean := strings.TrimSpace(strings.TrimPrefix(selector, OpenSSHNodePrefix))
-	if clean == "" {
+	clean, _ := cutOpenSSHPrefix(selector)
+	clean = strings.TrimSpace(clean)
+	if clean == "" || hasOpenSSHPrefix(clean) {
 		return "", "", nil
 	}
 	_, vhost, vident, err := resolveVirtualNodeForTarget(parser, clean, target)
@@ -1293,10 +1334,10 @@ func findMatchingNodes(snapshot *Configuration, user, addr string, port uint16) 
 //
 //nolint:gocyclo // canonical target resolution sequentially evaluates direct, alias, lookup, OpenSSH, and raw fallback tiers
 func (r *Repository) resolveCanonicalTargetInfo(cfg *Configuration, lookup map[string][]string, aliases map[string]string, selector string, target ConnectionTarget) (canonicalTargetInfo, error) {
-	if strings.HasPrefix(selector, OpenSSHNodePrefix) {
-		clean := strings.TrimSpace(strings.TrimPrefix(selector, OpenSSHNodePrefix))
-		if clean == "" {
-			return canonicalTargetInfo{}, fmt.Errorf("parse openssh host %q failed: host is empty", selector)
+	if after, ok := cutOpenSSHPrefix(selector); ok {
+		clean := strings.TrimSpace(after)
+		if clean == "" || hasOpenSSHPrefix(clean) {
+			return canonicalTargetInfo{}, fmt.Errorf("parse openssh host %q failed: invalid openssh selector", selector)
 		}
 		lookupHost, _, _, parseErr := parseOpenSSHHostSpec(clean)
 		if parseErr != nil || lookupHost == "" {
@@ -1360,8 +1401,9 @@ func (r *Repository) resolveCanonicalTargetInfo(cfg *Configuration, lookup map[s
 		return canonicalTargetInfo{}, fmt.Errorf("resolve openssh host %q: %w", selector, err)
 	}
 	if parser.cfg != nil {
-		clean := strings.TrimSpace(strings.TrimPrefix(selector, OpenSSHNodePrefix))
-		allowSpec := strings.HasPrefix(selector, OpenSSHNodePrefix) || IsPlainOpenSSHHostSelector(clean)
+		clean, isPrefixed := cutOpenSSHPrefix(selector)
+		clean = strings.TrimSpace(clean)
+		allowSpec := isPrefixed || IsPlainOpenSSHHostSelector(clean)
 		orig := normalizeOriginalHost(target.OriginalHost)
 		if clean != "" && allowSpec && ((orig != "" && !strings.EqualFold(orig, clean)) || parser.HasHost(clean)) {
 			vnode, vhost, vident, err := resolveVirtualNodeForTarget(parser, clean, target)
@@ -1390,7 +1432,7 @@ func (r *Repository) resolveCanonicalTargetInfo(cfg *Configuration, lookup map[s
 
 	// 5. Raw address/hostname fallback (including openssh: virtual selectors or
 	// unconfirmed user@host:port node IDs passed across process boundaries).
-	clean := strings.TrimPrefix(strings.TrimSpace(selector), OpenSSHNodePrefix)
+	clean, _ := cutOpenSSHPrefix(strings.TrimSpace(selector))
 	if parsedHost, parsedUser, parsedPort, err := parseOpenSSHHostSpec(clean); err == nil && parsedHost != "" {
 		port := parsedPort
 		if port == 0 {
@@ -2124,14 +2166,18 @@ func resolveHopAddressFallback(cfg *Configuration, hop, hopUser string, hopPort 
 	case 1:
 		return matchingNodes[0], nil
 	case 0:
-		var resolvedSpec string
-		if hopUser != "" {
-			resolvedSpec = FormatNodeID(hopUser, firstAddr, effectivePort)
-		} else {
-			resolvedSpec = FormatHostPort(firstAddr, effectivePort)
+		candidateRef := TargetRef{
+			OpenSSH: true,
+			User:    hopUser,
+			Host:    firstAddr,
+			Port:    effectivePort,
+			HasPort: effectivePort > 0,
 		}
-		if isDirectJumpTarget(resolvedSpec) {
-			return OpenSSHNodePrefix + resolvedSpec, nil
+		if err := candidateRef.Validate(); err != nil {
+			return "", fmt.Errorf("invalid jump host %q: %w", hop, err)
+		}
+		if isDirectJumpTargetRef(candidateRef) {
+			return candidateRef.NormalizedString(), nil
 		}
 		return "", errors.New(i18n.Tf("ssh_err_jump_not_found", map[string]any{"Host": hop}))
 	default:
@@ -2158,7 +2204,8 @@ func isResolvedOpenSSHJumpHost(openSSH *OpenSSHParser, hop string) (bool, error)
 	if openSSH.HasHost(hop) {
 		return true, nil
 	}
-	cleanHop := strings.TrimSpace(strings.TrimPrefix(hop, OpenSSHNodePrefix))
+	cleanHop, _ := cutOpenSSHPrefix(hop)
+	cleanHop = strings.TrimSpace(cleanHop)
 	if cleanHop == "" {
 		return false, nil
 	}
@@ -2179,9 +2226,17 @@ func isResolvedOpenSSHJumpHost(openSSH *OpenSSHParser, hop string) (bool, error)
 	return !strings.EqualFold(StripHostBrackets(hostName), StripHostBrackets(lookupAlias)), nil
 }
 
-// resolveOpenSSHJumpHop handles jump targets that are explicitly prefixed with OpenSSHNodePrefix.
-func resolveOpenSSHJumpHop(openSSH *OpenSSHParser, hop string) (string, error) {
-	cleanHop := strings.TrimPrefix(hop, OpenSSHNodePrefix)
+// resolveOpenSSHJumpHop handles jump targets that are explicitly prefixed with
+// the reserved "openssh:" namespace. It requires a pre-validated TargetRef so
+// double-prefixed or non-round-trippable selectors cannot enter this path.
+func resolveOpenSSHJumpHop(openSSH *OpenSSHParser, ref TargetRef) (string, error) {
+	if !ref.OpenSSH {
+		return "", fmt.Errorf("resolve openssh jump %q: missing openssh prefix", ref.NormalizedString())
+	}
+	if err := ref.Validate(); err != nil {
+		return "", fmt.Errorf("invalid openssh jump %q: %w", ref.NormalizedString(), err)
+	}
+	cleanHop := ref.formatNormalizedBody()
 	if err := openSSH.Err(); err != nil {
 		return "", fmt.Errorf("resolve openssh jump %q: %w", cleanHop, err)
 	}
@@ -2193,17 +2248,14 @@ func resolveOpenSSHJumpHop(openSSH *OpenSSHParser, hop string) (string, error) {
 		if _, _, _, vErr := openSSH.GetVirtualNode(cleanHop); vErr != nil {
 			return "", fmt.Errorf("resolve openssh jump %q: %w", cleanHop, vErr)
 		}
-		return OpenSSHNodePrefix + cleanHop, nil
+		return ref.NormalizedString(), nil
 	}
 
-	if isDirectJumpTarget(cleanHop) {
-		if _, _, _, parseErr := parseOpenSSHHostSpec(cleanHop); parseErr != nil {
-			return "", fmt.Errorf("invalid jump host address %q: %w", cleanHop, parseErr)
-		}
-		return OpenSSHNodePrefix + cleanHop, nil
+	if isDirectJumpTargetRef(ref) {
+		return ref.NormalizedString(), nil
 	}
 
-	return "", errors.New(i18n.Tf("ssh_err_jump_not_found", map[string]any{"Host": hop}))
+	return "", errors.New(i18n.Tf("ssh_err_jump_not_found", map[string]any{"Host": ref.NormalizedString()}))
 }
 
 // resolveLocalOrDirectJumpHop handles jump targets with unspecified origin (local first, then OpenSSH, then direct).
@@ -2232,17 +2284,32 @@ func resolveLocalOrDirectJumpHop(cfg *Configuration, openSSH *OpenSSHParser, hop
 		return "", fmt.Errorf("resolve openssh jump %q: %w", hop, matchErr)
 	}
 	if matched {
-		if _, _, _, vErr := openSSH.GetVirtualNode(hop); vErr != nil {
+		ref, refErr := ParseTargetRef(hop)
+		if refErr != nil {
+			return "", fmt.Errorf("invalid jump host address %q: %w", hop, refErr)
+		}
+		outRef := ref
+		outRef.OpenSSH = true
+		if err := outRef.Validate(); err != nil {
+			return "", fmt.Errorf("invalid jump host address %q: %w", hop, err)
+		}
+		if _, _, _, vErr := openSSH.GetVirtualNode(outRef.formatNormalizedBody()); vErr != nil {
 			return "", fmt.Errorf("resolve openssh jump %q: %w", hop, vErr)
 		}
-		return OpenSSHNodePrefix + hop, nil
+		return outRef.NormalizedString(), nil
 	}
 
-	if isDirectJumpTarget(hop) {
-		if parseErr != nil {
-			return "", fmt.Errorf("invalid jump host address %q: %w", hop, parseErr)
+	ref, refErr := ParseTargetRef(hop)
+	if refErr == nil && isDirectJumpTargetRef(ref) {
+		outRef := ref
+		outRef.OpenSSH = true
+		if err := outRef.Validate(); err != nil {
+			return "", fmt.Errorf("invalid jump host address %q: %w", hop, err)
 		}
-		return OpenSSHNodePrefix + hop, nil
+		return outRef.NormalizedString(), nil
+	}
+	if isDirectJumpTarget(hop) && parseErr != nil {
+		return "", fmt.Errorf("invalid jump host address %q: %w", hop, parseErr)
 	}
 
 	return "", errors.New(i18n.Tf("ssh_err_jump_not_found", map[string]any{"Host": hop}))
@@ -2250,7 +2317,7 @@ func resolveLocalOrDirectJumpHop(cfg *Configuration, openSSH *OpenSSHParser, hop
 
 // resolveSingleJumpHopWithConfig resolves a single jump hop selector to a canonical node ID or OpenSSH node.
 // Resolution strategy:
-//  1. Explicit OpenSSH targets (prefixed with OpenSSHNodePrefix): OpenSSH config host or direct jump target only.
+//  1. Explicit OpenSSH targets (prefixed with case-insensitive "openssh:"): OpenSSH config host or direct jump target only.
 //  2. Unspecified origin:
 //     a. Existing Node ID
 //     b. Existing Alias
@@ -2260,10 +2327,27 @@ func resolveLocalOrDirectJumpHop(cfg *Configuration, openSSH *OpenSSHParser, hop
 //
 // Single-label hostnames without port/user cannot be used as direct jumps to avoid silent misconnections on alias typos.
 func resolveSingleJumpHopWithConfig(cfg *Configuration, openSSH *OpenSSHParser, hop string) (string, error) {
-	if strings.HasPrefix(hop, OpenSSHNodePrefix) {
-		return resolveOpenSSHJumpHop(openSSH, hop)
+	if hasOpenSSHPrefix(hop) {
+		ref, err := ParseTargetRef(hop)
+		if err != nil {
+			return "", fmt.Errorf("invalid jump host %q: %w", hop, err)
+		}
+		return resolveOpenSSHJumpHop(openSSH, ref)
 	}
 	return resolveLocalOrDirectJumpHop(cfg, openSSH, hop)
+}
+
+func isDirectJumpTargetRef(ref TargetRef) bool {
+	if ref.Host == "" {
+		return false
+	}
+	if ref.User != "" || ref.HasPort {
+		return true
+	}
+	if _, err := netip.ParseAddr(ref.Host); err == nil {
+		return true
+	}
+	return isDNSHostname(ref.Host)
 }
 
 func isDirectJumpTarget(cleanHop string) bool {

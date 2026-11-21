@@ -384,19 +384,6 @@ func validateExplicitNonEmptyFlags(flags *pflag.FlagSet) error {
 	return nil
 }
 
-func validateCLIAlias(alias string) error {
-	if alias == "" {
-		return nil
-	}
-	if err := config.ValidateNodeAlias(alias); err != nil {
-		return err
-	}
-	if strings.Contains(alias, "@") || strings.Contains(alias, ":") {
-		return errors.New(i18n.T("ssh_err_alias_invalid"))
-	}
-	return nil
-}
-
 func validateNonEmptyIdentityFlag(f *pflag.Flag, flags *pflag.FlagSet) error {
 	switch f.Value.Type() {
 	case "stringArray":

@@ -9,9 +9,25 @@ import (
 	"unicode"
 )
 
-// IsOpenSSHNodeID reports whether id carries the explicit "openssh:" namespace prefix.
+// hasOpenSSHPrefix reports whether s starts with the reserved "openssh:" prefix
+// using a single case-insensitive rule shared across TargetRef, IsOpenSSHNodeID,
+// ValidateNodeAlias, and ProxyJump resolution.
+func hasOpenSSHPrefix(s string) bool {
+	return len(s) >= len(OpenSSHNodePrefix) && strings.EqualFold(s[:len(OpenSSHNodePrefix)], OpenSSHNodePrefix)
+}
+
+// cutOpenSSHPrefix trims a leading case-insensitive "openssh:" prefix from s.
+func cutOpenSSHPrefix(s string) (string, bool) {
+	if hasOpenSSHPrefix(s) {
+		return s[len(OpenSSHNodePrefix):], true
+	}
+	return s, false
+}
+
+// IsOpenSSHNodeID reports whether id carries the explicit "openssh:" namespace
+// prefix (case-insensitive).
 func IsOpenSSHNodeID(id string) bool {
-	return strings.HasPrefix(id, OpenSSHNodePrefix)
+	return hasOpenSSHPrefix(id)
 }
 
 func isBareOrBracketedIPv6Literal(s string) bool {
@@ -78,7 +94,7 @@ func validateBareAliasTargetRef(raw string) (string, bool, error) {
 	if trimmed == "" {
 		return "", false, fmt.Errorf("address cannot be empty")
 	}
-	if strings.HasPrefix(trimmed, OpenSSHNodePrefix) || strings.ContainsAny(trimmed, "@:[]") {
+	if hasOpenSSHPrefix(trimmed) || strings.ContainsAny(trimmed, "@:[]") {
 		return "", false, nil
 	}
 	hasSpace := false
@@ -156,7 +172,7 @@ func (r TargetRef) Validate() error {
 		return fmt.Errorf("target port %d specified with HasPort=false", r.Port)
 	}
 	body := r.formatNormalizedBody()
-	if strings.HasPrefix(body, OpenSSHNodePrefix) {
+	if hasOpenSSHPrefix(body) {
 		if r.OpenSSH {
 			return fmt.Errorf("invalid openssh selector %q: duplicate %q prefix", OpenSSHNodePrefix+body, OpenSSHNodePrefix)
 		}
@@ -185,7 +201,7 @@ func (r TargetRef) NormalizedString() string {
 		return ""
 	}
 	body := r.formatNormalizedBody()
-	if strings.HasPrefix(body, OpenSSHNodePrefix) {
+	if hasOpenSSHPrefix(body) {
 		return ""
 	}
 	if r.OpenSSH {
@@ -195,10 +211,11 @@ func (r TargetRef) NormalizedString() string {
 }
 
 // ParseTargetRef parses `[openssh:][user@]host[:port]`.
-// Leading "openssh:" is reserved for OpenSSH virtual selectors (e.g. "openssh:22"
-// parses as OpenSSH=true, Host="22"; use "user@openssh:22" to specify a port on
-// a non-OpenSSH host named "openssh"). Every successfully parsed TargetRef
-// satisfies Validate() and round-trips losslessly through NormalizedString().
+// Leading "openssh:" (case-insensitive) is reserved for OpenSSH virtual selectors
+// (e.g. "openssh:22" parses as OpenSSH=true, Host="22"; use "user@openssh:22" to
+// specify a port on a non-OpenSSH host named "openssh"). Double prefixes such as
+// "openssh:openssh:..." or "openssh:OPENSSH:..." are rejected. Every successfully
+// parsed TargetRef satisfies Validate() and round-trips losslessly through NormalizedString().
 func ParseTargetRef(raw string) (TargetRef, error) {
 	if bareAlias, ok, err := validateBareAliasTargetRef(raw); err != nil {
 		return TargetRef{}, err
@@ -211,8 +228,8 @@ func ParseTargetRef(raw string) (TargetRef, error) {
 	}
 	var isOpenSSH bool
 	rest := trimmed
-	if after, ok := strings.CutPrefix(trimmed, OpenSSHNodePrefix); ok {
-		if after == "" || strings.HasPrefix(after, OpenSSHNodePrefix) {
+	if after, ok := cutOpenSSHPrefix(trimmed); ok {
+		if after == "" || hasOpenSSHPrefix(after) {
 			return TargetRef{}, fmt.Errorf("invalid openssh selector %q", raw)
 		}
 		isOpenSSH = true
