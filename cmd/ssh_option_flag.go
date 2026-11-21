@@ -664,7 +664,7 @@ func ApplyGeneralOptions(opts *SshOptions, optionStrings []string, flags *pflag.
 		allowHostName: opts.cliHostName == "" && opts.HostName == "",
 	}
 	for _, opt := range optionStrings {
-		key, val, err := adapter.SplitOptionKeyValue(opt)
+		key, val, err := ssh.SplitOptionKeyValue(opt)
 		if err != nil {
 			return err
 		}

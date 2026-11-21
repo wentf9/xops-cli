@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -249,7 +250,7 @@ func (o *SshOptions) recordOptionFlag(raw string) {
 	if o == nil || o.cliTunnelLockedByW || o.cliTunnelMode != "" {
 		return
 	}
-	key, val, err := adapter.SplitOptionKeyValue(raw)
+	key, val, err := ssh.SplitOptionKeyValue(raw)
 	if err != nil {
 		return
 	}
@@ -323,24 +324,23 @@ func (o *SshOptions) applyCLISessionFlags(opts **ssh.Options) error {
 		}
 		return *opts
 	}
-	if o.GatewayPorts {
-		if setErr := ensureOpts().Set(ssh.OptionGatewayPorts, "yes"); setErr != nil {
-			return setErr
-		}
-	}
-	if o.BgRun {
-		if setErr := ensureOpts().Set(ssh.OptionForkAfterAuthentication, "yes"); setErr != nil {
-			return setErr
-		}
-	}
-	if o.NoCmd {
-		if setErr := ensureOpts().Set(ssh.OptionSessionType, string(ssh.SessionTypeNone)); setErr != nil {
-			return setErr
-		}
-	}
-	if o.StdinRedirect {
-		if setErr := ensureOpts().Set(ssh.OptionStdinNull, "yes"); setErr != nil {
-			return setErr
+	for _, kv := range []struct {
+		set bool
+		key string
+		val string
+	}{
+		{o.GatewayPorts, ssh.OptionGatewayPorts, "yes"},
+		{o.BgRun, ssh.OptionForkAfterAuthentication, "yes"},
+		{o.NoCmd, ssh.OptionSessionType, string(ssh.SessionTypeNone)},
+		{o.StdinRedirect, ssh.OptionStdinNull, "yes"},
+		{o.CipherSpec != "", ssh.OptionCiphers, o.CipherSpec},
+		{o.EscapeCharSpec != "", ssh.OptionEscapeChar, o.EscapeCharSpec},
+		{o.ForwardAgentSpec != "", ssh.OptionForwardAgent, o.ForwardAgentSpec},
+	} {
+		if kv.set {
+			if setErr := ensureOpts().Set(kv.key, kv.val); setErr != nil {
+				return setErr
+			}
 		}
 	}
 	if o.TunnelDevice != "" {
@@ -353,19 +353,18 @@ func (o *SshOptions) applyCLISessionFlags(opts **ssh.Options) error {
 			return setErr
 		}
 	}
-	if o.CipherSpec != "" {
-		if setErr := ensureOpts().Set(ssh.OptionCiphers, o.CipherSpec); setErr != nil {
-			return setErr
-		}
+	return o.applyCLIIdentityNoneTruncation(ensureOpts)
+}
+
+func (o *SshOptions) applyCLIIdentityNoneTruncation(ensureOpts func() *ssh.Options) error {
+	if (!o.identityFromCLIOptions && !o.muxDaemonMode) || !slices.ContainsFunc(o.IdentityFiles, ssh.IsNoneValue) {
+		return nil
 	}
-	if o.EscapeCharSpec != "" {
-		if setErr := ensureOpts().Set(ssh.OptionEscapeChar, o.EscapeCharSpec); setErr != nil {
-			return setErr
-		}
-	}
-	if o.ForwardAgentSpec != "" {
-		if setErr := ensureOpts().Set(ssh.OptionForwardAgent, o.ForwardAgentSpec); setErr != nil {
-			return setErr
+	opts := ensureOpts()
+	opts.Delete(ssh.OptionIdentityFile)
+	for _, keyPath := range o.absIdentityFiles() {
+		if appendErr := opts.Append(ssh.OptionIdentityFile, keyPath); appendErr != nil {
+			return appendErr
 		}
 	}
 	return nil
@@ -978,45 +977,10 @@ func (o *SshOptions) resolveSessionForwardConfigWithTarget(provider config.Confi
 	return out, nil
 }
 
-func isMuxDaemonPreservedOption(opt string) bool {
-	key, _, err := adapter.SplitOptionKeyValue(opt)
-	if err != nil || key == "" {
-		return false
-	}
-	spec, ok := ssh.LookupOptionSpec(key)
-	if !ok {
-		return false
-	}
-	return spec.CanonicalKey == ssh.OptionGatewayPorts ||
-		spec.CanonicalKey == ssh.OptionStreamLocalBindUnlink ||
-		spec.CanonicalKey == ssh.OptionStreamLocalBindMask
-}
-
-func isGatewayPortsOption(opt string) bool {
-	key, _, err := adapter.SplitOptionKeyValue(opt)
-	if err != nil || key == "" {
-		return false
-	}
-	spec, ok := ssh.LookupOptionSpec(key)
-	return ok && spec.CanonicalKey == ssh.OptionGatewayPorts
-}
-
 func isLocalTerminal(r io.Reader) (*os.File, bool) {
 	f, ok := r.(*os.File)
 	if !ok || f == nil {
 		return nil, false
 	}
 	return f, term.IsTerminal(int(f.Fd()))
-}
-
-func isSessionOrForwardOption(opt string) bool {
-	key, _, err := adapter.SplitOptionKeyValue(opt)
-	if err != nil || key == "" {
-		return false
-	}
-	spec, ok := ssh.LookupOptionSpec(key)
-	if !ok {
-		return false
-	}
-	return spec.Class == ssh.OptionClassForward || spec.Class == ssh.OptionClassSession
 }

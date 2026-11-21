@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,7 +10,6 @@ import (
 
 	"github.com/wentf9/xops-cli/cmd/utils"
 	"github.com/wentf9/xops-cli/core/ssh"
-	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 )
 
@@ -79,7 +79,10 @@ func (s MuxDaemonSpec) Validate() error {
 }
 
 func validateMuxDaemonSpecOption(opt string) error {
-	key, val, err := adapter.SplitOptionKeyValue(opt)
+	if strings.ContainsAny(opt, "\r\n\x00") {
+		return fmt.Errorf("mux daemon spec option %q contains invalid control character", opt)
+	}
+	key, val, err := ssh.SplitOptionKeyValue(opt)
 	if err != nil {
 		return fmt.Errorf("mux daemon spec invalid option %q: %w", opt, err)
 	}
@@ -90,33 +93,29 @@ func validateMuxDaemonSpecOption(opt string) error {
 	if !ok {
 		return fmt.Errorf("mux daemon spec rejects unsupported option %q", opt)
 	}
-	switch optSpec.Class {
-	case ssh.OptionClassMux:
-		return fmt.Errorf("mux daemon spec rejects mux option %q", opt)
-	case ssh.OptionClassSession:
-		return fmt.Errorf("mux daemon spec rejects session option %q", opt)
-	case ssh.OptionClassForward:
-		if !isMuxDaemonPreservedOption(opt) {
-			return fmt.Errorf("mux daemon spec rejects forward option %q", opt)
+	switch optSpec.MuxPolicy {
+	case ssh.OptionMuxAllow:
+		var check ssh.Options
+		if err := check.Append(optSpec.CanonicalKey, val); err != nil {
+			return fmt.Errorf("mux daemon spec invalid option %q: %w", opt, err)
 		}
-	case ssh.OptionClassLocalExec:
-		if optSpec.CanonicalKey != ssh.OptionProxyCommand || !ssh.IsNoneValue(val) {
-			return fmt.Errorf("mux daemon spec rejects local-exec option %q", opt)
+		return nil
+	case ssh.OptionMuxAllowNoneOnly:
+		if !ssh.IsNoneValue(val) {
+			return fmt.Errorf("mux daemon spec rejects option %q: only %s=none is allowed", opt, optSpec.OpenSSHName)
 		}
-	case ssh.OptionClassAuth:
-		if optSpec.CanonicalKey == ssh.OptionIdentityFile {
-			return fmt.Errorf("mux daemon spec rejects identity option %q", opt)
+		var check ssh.Options
+		if err := check.Set(optSpec.CanonicalKey, val); err != nil {
+			return fmt.Errorf("mux daemon spec invalid option %q: %w", opt, err)
 		}
-	case ssh.OptionClassTransport, ssh.OptionClassTrust:
-		// Connection-wide and target transport/trust options are allowed.
+		return nil
+	case ssh.OptionMuxAuthoritative:
+		return fmt.Errorf("mux daemon spec rejects authoritative option %q", opt)
+	case ssh.OptionMuxReject:
+		return fmt.Errorf("mux daemon spec rejects option %q", opt)
 	default:
 		return fmt.Errorf("mux daemon spec rejects option %q", opt)
 	}
-	var check ssh.Options
-	if err := check.Set(optSpec.CanonicalKey, val); err != nil {
-		return fmt.Errorf("mux daemon spec invalid option %q: %w", opt, err)
-	}
-	return nil
 }
 
 func readMuxDaemonSpec(r io.Reader) (MuxDaemonSpec, error) {
@@ -200,7 +199,7 @@ func (o *SshOptions) buildMuxDaemonSpecWithRawNode(provider config.ConfigProvide
 	if forTarget {
 		spec.CipherSpec = o.CipherSpec
 		spec.GatewayPorts = o.GatewayPorts
-		spec.Options = o.collectMuxDaemonTargetOptions(master, len(spec.IdentityFiles) > 0)
+		spec.Options = o.collectMuxDaemonTargetOptions()
 	} else {
 		spec.Options = o.collectMuxDaemonJumpOptions()
 	}
@@ -239,42 +238,134 @@ func (o *SshOptions) resolveMuxDaemonIdentityFiles(nodeID string, master *ssh.Mu
 }
 
 func (o *SshOptions) collectMuxDaemonJumpOptions() []string {
-	var opts []string
-	for _, opt := range o.control.Options {
-		if isConnectionWideMuxDaemonOption(opt) {
-			opts = append(opts, opt)
-		}
-	}
-	return opts
+	return projectMuxDaemonCLIOptions(o.control.Options, false, false)
 }
 
-func (o *SshOptions) collectMuxDaemonTargetOptions(master *ssh.MuxServer, hasIdentities bool) []string {
-	var opts []string
-	preserveProxyNone := isEffectiveCLIProxyCommandNone(o.control.Options)
-	emittedProxyNone := false
-	for _, opt := range o.control.Options {
-		if isMuxDaemonAuthoritativeOption(opt) {
+func (o *SshOptions) collectMuxDaemonTargetOptions() []string {
+	return projectMuxDaemonCLIOptions(o.control.Options, true, o.GatewayPorts)
+}
+
+func isTargetLevelDirectiveKey(key string) bool {
+	switch ssh.CanonicalOptionKey(key) {
+	case ssh.OptionPort, ssh.OptionUser, ssh.OptionHostName, ssh.OptionProxyJump:
+		return true
+	default:
+		return false
+	}
+}
+
+func muxDaemonCandidateAllowed(spec ssh.OptionSpec, forTarget, suppressGatewayPorts bool) bool {
+	if !forTarget {
+		return spec.IsConnectionWide() && spec.MuxPolicy == ssh.OptionMuxAllow
+	}
+	switch spec.MuxPolicy {
+	case ssh.OptionMuxAllow:
+		return !suppressGatewayPorts || spec.CanonicalKey != ssh.OptionGatewayPorts
+	case ssh.OptionMuxAllowNoneOnly:
+		return true
+	default:
+		return false
+	}
+}
+
+func projectMuxDaemonCLIOptions(rawOpts []string, forTarget, suppressGatewayPorts bool) []string {
+	if len(rawOpts) == 0 {
+		return nil
+	}
+	candidates := make([]string, 0, len(rawOpts))
+	firstOrder := make(map[string]int, len(rawOpts))
+	for _, opt := range rawOpts {
+		key, _, err := ssh.SplitOptionKeyValue(opt)
+		if err != nil || key == "" || isTargetLevelDirectiveKey(key) {
 			continue
 		}
-		if hasIdentities && isIdentityFileOption(opt) {
+		spec, ok := ssh.LookupOptionSpec(key)
+		if !ok || !muxDaemonCandidateAllowed(spec, forTarget, suppressGatewayPorts) {
 			continue
 		}
-		if o.GatewayPorts && isGatewayPortsOption(opt) {
+		if _, seen := firstOrder[spec.CanonicalKey]; !seen {
+			firstOrder[spec.CanonicalKey] = len(firstOrder)
+		}
+		candidates = append(candidates, opt)
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	parsed, err := ssh.ParseCLIOptions(candidates)
+	if err != nil {
+		return fallbackMuxDaemonCLIOptions(candidates)
+	}
+	if parsed.IsEmpty() {
+		return nil
+	}
+	if forTarget {
+		stripNonNoneAllowNoneOnlyOptions(parsed)
+	}
+	projected := ssh.ProjectCLIOptions(parsed)
+	if len(projected) <= 1 {
+		return projected
+	}
+	slices.SortStableFunc(projected, func(a, b string) int {
+		return compareProjectedOptionOrder(a, b, firstOrder)
+	})
+	return projected
+}
+
+func stripNonNoneAllowNoneOnlyOptions(opts *ssh.Options) {
+	if opts.IsEmpty() {
+		return
+	}
+	for _, spec := range ssh.RegisteredOptionSpecs() {
+		if spec.MuxPolicy != ssh.OptionMuxAllowNoneOnly {
 			continue
 		}
-		if isSessionOrForwardOption(opt) && !isMuxDaemonPreservedOption(opt) {
+		if opts.Has(spec.CanonicalKey) && !ssh.IsNoneValue(opts.Get(spec.CanonicalKey)) {
+			opts.Delete(spec.CanonicalKey)
+		}
+	}
+}
+
+func compareProjectedOptionOrder(a, b string, firstOrder map[string]int) int {
+	ka, _, _ := strings.Cut(a, "=")
+	kb, _, _ := strings.Cut(b, "=")
+	oa, oka := firstOrder[ssh.CanonicalOptionKey(ka)]
+	ob, okb := firstOrder[ssh.CanonicalOptionKey(kb)]
+	if !oka {
+		oa = len(firstOrder)
+	}
+	if !okb {
+		ob = len(firstOrder)
+	}
+	return cmp.Compare(oa, ob)
+}
+
+func fallbackMuxDaemonCLIOptions(candidates []string) []string {
+	seenNoneOnly := make(map[string]bool)
+	out := make([]string, 0, len(candidates))
+	for _, opt := range candidates {
+		key, val, err := ssh.SplitOptionKeyValue(opt)
+		if err != nil || key == "" {
 			continue
 		}
-		if isTargetOnlyMuxDaemonOption(opt) {
-			if preserveProxyNone && !emittedProxyNone && isProxyCommandNoneOption(opt) {
-				emittedProxyNone = true
-				opts = append(opts, opt)
+		spec, ok := ssh.LookupOptionSpec(key)
+		if !ok {
+			continue
+		}
+		if spec.MuxPolicy == ssh.OptionMuxAllowNoneOnly {
+			if !seenNoneOnly[spec.CanonicalKey] {
+				seenNoneOnly[spec.CanonicalKey] = true
+				if ssh.IsNoneValue(val) {
+					out = append(out, opt)
+				}
 			}
 			continue
 		}
-		opts = append(opts, opt)
+		out = append(out, opt)
 	}
-	return opts
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func (o *SshOptions) applyMuxDaemonSpec(spec MuxDaemonSpec) error {
@@ -363,7 +454,7 @@ func (o *SshOptions) resolveMuxDaemonControl(master *ssh.MuxServer) (ssh.Control
 
 func firstCLIControlPersistOption(opts []string) string {
 	for _, opt := range opts {
-		key, val, err := adapter.SplitOptionKeyValue(opt)
+		key, val, err := ssh.SplitOptionKeyValue(opt)
 		if err != nil || key == "" {
 			continue
 		}
@@ -372,41 +463,6 @@ func firstCLIControlPersistOption(opts []string) string {
 		}
 	}
 	return ""
-}
-
-func isMuxDaemonAuthoritativeOption(opt string) bool {
-	key, _, err := adapter.SplitOptionKeyValue(opt)
-	if err != nil || key == "" {
-		return false
-	}
-	spec, ok := ssh.LookupOptionSpec(key)
-	if !ok {
-		return false
-	}
-	switch spec.CanonicalKey {
-	case ssh.OptionControlMaster, ssh.OptionControlPath, ssh.OptionControlPersist, ssh.OptionClearAllForwardings:
-		return true
-	default:
-		return false
-	}
-}
-
-func isIdentityFileOption(opt string) bool {
-	key, _, err := adapter.SplitOptionKeyValue(opt)
-	if err != nil || key == "" {
-		return false
-	}
-	spec, ok := ssh.LookupOptionSpec(key)
-	return ok && spec.CanonicalKey == ssh.OptionIdentityFile
-}
-
-func isConnectionWideMuxDaemonOption(opt string) bool {
-	key, _, err := adapter.SplitOptionKeyValue(opt)
-	if err != nil || key == "" {
-		return false
-	}
-	spec, ok := ssh.LookupOptionSpec(key)
-	return ok && spec.IsConnectionWide()
 }
 
 func (o *SshOptions) firstCLIIdentityFile(keys []string) string {
@@ -424,22 +480,6 @@ func (o *SshOptions) firstCLIIdentityFile(keys []string) string {
 
 func isProxyCommandOptionKey(key string) bool {
 	return ssh.CanonicalOptionKey(key) == ssh.OptionProxyCommand
-}
-
-func isProxyCommandNoneOption(opt string) bool {
-	key, val, err := adapter.SplitOptionKeyValue(opt)
-	return err == nil && isProxyCommandOptionKey(key) && strings.EqualFold(strings.TrimSpace(val), "none")
-}
-
-func isEffectiveCLIProxyCommandNone(opts []string) bool {
-	for _, opt := range opts {
-		key, val, err := adapter.SplitOptionKeyValue(opt)
-		if err != nil || !isProxyCommandOptionKey(key) {
-			continue
-		}
-		return strings.EqualFold(strings.TrimSpace(val), "none")
-	}
-	return false
 }
 
 func (o *SshOptions) shouldPassIdentityFile(nodeID string, master *ssh.MuxServer) bool {
@@ -542,17 +582,14 @@ func matchesTargetSelector(nodeID string, master *ssh.MuxServer, host, selector 
 }
 
 func isTargetOnlyMuxDaemonOption(opt string) bool {
-	key, _, err := adapter.SplitOptionKeyValue(opt)
+	key, _, err := ssh.SplitOptionKeyValue(opt)
 	if err != nil || key == "" {
 		return false
 	}
-	switch ssh.CanonicalOptionKey(key) {
-	case ssh.OptionPort, ssh.OptionUser, ssh.OptionProxyJump, ssh.OptionIdentityFile, ssh.OptionHostName,
-		ssh.OptionProxyCommand, ssh.OptionLocalCommand, ssh.OptionPermitLocalCommand:
-		return true
-	default:
-		return false
+	if spec, ok := ssh.LookupOptionSpec(key); ok {
+		return !spec.IsConnectionWide()
 	}
+	return isTargetLevelDirectiveKey(key)
 }
 
 func (o *SshOptions) resolveMuxDaemonTarget(nodeID string, master *ssh.MuxServer) (host string, port int, user string) {
