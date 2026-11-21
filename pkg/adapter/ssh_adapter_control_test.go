@@ -151,6 +151,7 @@ func TestResolveControl_Tier4Fallback_NodeMatch(t *testing.T) {
 	// T1, T2, T3: nil/empty
 	t4OpenSSH := `
 Host testnode
+    HostName 192.168.1.100
     ControlMaster auto
     ControlPath ~/.ssh/mux-%r@%h:%p
     ControlPersist 10m
@@ -318,6 +319,7 @@ Host testnode
 	t.Run("Tier4_OpenSSH_Host_Explicit_PathNone_With_Wildcard_Persist", func(t *testing.T) {
 		openSSH := `
 Host testnode
+    HostName 192.168.1.100
     ControlPath none
 
 Host *
@@ -601,6 +603,7 @@ func TestResolveControl_Tier4_ConcreteAliasOverridesWildcard(t *testing.T) {
 	// over a generic wildcard fallback (Host *).
 	t4OpenSSH := `
 Host node-alias
+    HostName 192.168.1.100
     ControlMaster ask
     ControlPath ~/.ssh/specific-alias.sock
 
@@ -633,6 +636,7 @@ func TestResolveControl_Tier4_ConcreteNodePrecedenceOverIP(t *testing.T) {
 	// the more specific nodeName definition takes precedence.
 	t4OpenSSH := `
 Host testnode
+    HostName 192.168.1.100
     ControlMaster ask
     ControlPath ~/.ssh/specific-node.sock
 
@@ -798,6 +802,7 @@ func TestParseOptionStrings_RejectsUnknownKey(t *testing.T) {
 func TestResolveSSHOptions_FourTierPrecedenceAndGetConfig(t *testing.T) {
 	openSSHContent := `
 Host testnode
+    HostName 192.168.1.100
     ConnectTimeout 30
     StrictHostKeyChecking no
     PasswordAuthentication no
@@ -875,6 +880,7 @@ Host testnode
 func TestResolveTier4OpenSSHOptions_MergesAcrossConcreteLookupKeys(t *testing.T) {
 	openSSHContent := `
 Host testnode
+    HostName 192.168.1.100
     ConnectTimeout 15
 
 Host 192.168.1.100

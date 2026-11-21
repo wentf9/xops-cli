@@ -355,7 +355,7 @@ func assertConditionalIncludeIsolation(t *testing.T, parser *OpenSSHParser, root
 }
 
 func TestPass7_H3_IncludeCycleDepthAndConcurrencySafety(t *testing.T) {
-	parser := setupCyclicAndDeepIncludeParser(t)
+	parser, deepRootPath := setupCyclicAndDeepIncludeParser(t)
 
 	if !parser.HasHost("cycle-a") || !parser.HasHost("cycle-b") {
 		t.Fatal("expected cycle-a and cycle-b to resolve cleanly across cyclic Include")
@@ -363,15 +363,15 @@ func TestPass7_H3_IncludeCycleDepthAndConcurrencySafety(t *testing.T) {
 	if !parser.HasHost("depth-16") {
 		t.Fatalf("expected depth-16 (at maxIncludeDepth=%d) to be reachable", maxIncludeDepth)
 	}
-	if parser.HasHost("depth-17") {
-		t.Fatalf("expected depth-17 (> maxIncludeDepth=%d) to be bounded", maxIncludeDepth)
+	if _, err := NewOpenSSHParserFromPath(deepRootPath); err == nil || !strings.Contains(err.Error(), "depth limit") {
+		t.Fatalf("expected depth > maxIncludeDepth (%d) to fail closed with depth limit error, got %v", maxIncludeDepth, err)
 	}
 
 	assertInMemoryASTCycleGuard(t)
 	assertConcurrentOpenSSHReads(parser)
 }
 
-func setupCyclicAndDeepIncludeParser(t *testing.T) *OpenSSHParser {
+func setupCyclicAndDeepIncludeParser(t *testing.T) (*OpenSSHParser, string) {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -380,33 +380,49 @@ func setupCyclicAndDeepIncludeParser(t *testing.T) *OpenSSHParser {
 	sshDir := filepath.Join(home, ".ssh")
 	confDir := filepath.Join(sshDir, "conf.d")
 	chainDir := filepath.Join(sshDir, "chain")
+	deepChainDir := filepath.Join(sshDir, "deepchain")
 	if err := os.MkdirAll(confDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(chainDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(deepChainDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 
 	writeSSHTestFile(t, filepath.Join(confDir, "a.conf"), "Include conf.d/b.conf\nHost cycle-a\n    HostName 10.66.0.1\n    User user-a\n")
 	writeSSHTestFile(t, filepath.Join(confDir, "b.conf"), "Include conf.d/a.conf\nInclude config\nHost cycle-b\n    HostName 10.66.0.2\n    User user-b\n")
 
-	for i := 1; i <= 20; i++ {
+	for i := 1; i <= maxIncludeDepth; i++ {
 		var sb strings.Builder
-		if i < 20 {
+		if i < maxIncludeDepth {
 			sb.WriteString("Include chain/d" + twoDigit(i+1) + ".conf\n")
 		}
 		sb.WriteString("Host depth-" + twoDigit(i) + "\n    HostName 10.55.0." + strconv.Itoa(i) + "\n")
 		writeSSHTestFile(t, filepath.Join(chainDir, "d"+twoDigit(i)+".conf"), sb.String())
 	}
 
+	for i := 1; i <= maxIncludeDepth+1; i++ {
+		var sb strings.Builder
+		if i <= maxIncludeDepth {
+			sb.WriteString("Include deepchain/d" + twoDigit(i+1) + ".conf\n")
+		}
+		sb.WriteString("Host deep-" + twoDigit(i) + "\n    HostName 10.56.0." + strconv.Itoa(i) + "\n")
+		writeSSHTestFile(t, filepath.Join(deepChainDir, "d"+twoDigit(i)+".conf"), sb.String())
+	}
+
 	rootPath := filepath.Join(sshDir, "config")
 	writeSSHTestFile(t, rootPath, "Include conf.d/a.conf\nInclude chain/d01.conf\n")
+
+	deepRootPath := filepath.Join(sshDir, "config_too_deep")
+	writeSSHTestFile(t, deepRootPath, "Include deepchain/d01.conf\n")
 
 	parser, err := NewOpenSSHParserFromPath(rootPath)
 	if err != nil {
 		t.Fatalf("NewOpenSSHParserFromPath(cyclic) error = %v", err)
 	}
-	return parser
+	return parser, deepRootPath
 }
 
 func assertInMemoryASTCycleGuard(t *testing.T) {

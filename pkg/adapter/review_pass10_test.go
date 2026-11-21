@@ -249,10 +249,10 @@ func TestPass10_H1_RememberPassphraseScenarios(t *testing.T) {
 		return "node-a2", adp, repo, k2
 	})
 
-	// Scenario B: -o IdentityFile=none mixed with concrete IdentityFile
-	runScenario(t, "B_identityfile_none_then_k2", func(t *testing.T, dir, _, k2, _ string, port int) (string, *SSHAdapter, *config.Repository, string) {
-		repo, reg, svc := newPass10RepoAndService(t, dir, "127.0.0.1", port, "node-b", "", nil)
-		ctrlOpts, err := ParseOptionStrings([]string{"IdentityFile=none", "IdentityFile=" + k2})
+	// Scenario B: concrete IdentityFile followed by -o IdentityFile=none truncating lower-tier keys
+	runScenario(t, "B_identityfile_k2_then_none", func(t *testing.T, dir, _, k2, kOld string, port int) (string, *SSHAdapter, *config.Repository, string) {
+		repo, reg, svc := newPass10RepoAndService(t, dir, "127.0.0.1", port, "node-b", kOld, nil)
+		ctrlOpts, err := ParseOptionStrings([]string{"IdentityFile=" + k2, "IdentityFile=none"})
 		if err != nil {
 			t.Fatalf("ParseOptionStrings: %v", err)
 		}
@@ -260,7 +260,7 @@ func TestPass10_H1_RememberPassphraseScenarios(t *testing.T) {
 			repo,
 			WithCredentialSource(reg),
 			WithCredentialService(svc),
-			WithSessionAuthOverride("node-b", SessionAuth{KeyPaths: []string{"none", k2}, Remember: true}),
+			WithSessionAuthOverride("node-b", SessionAuth{KeyPaths: []string{k2, "none"}, Remember: true}),
 			WithSessionControlOverride("node-b", ctrlOpts),
 		)
 		cfgBefore, err := adp.GetConfig("node-b")
@@ -268,7 +268,7 @@ func TestPass10_H1_RememberPassphraseScenarios(t *testing.T) {
 			t.Fatalf("GetConfig: %v", err)
 		}
 		if cfgBefore.KeyPath != k2 {
-			t.Fatalf("pre-connect KeyPath = %q, want %q (must skip none)", cfgBefore.KeyPath, k2)
+			t.Fatalf("pre-connect KeyPath = %q, want %q", cfgBefore.KeyPath, k2)
 		}
 		return "node-b", adp, repo, k2
 	})

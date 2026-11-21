@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
@@ -631,16 +630,20 @@ func (a *SSHAdapter) resolveSessionOpenSSHMetadata(
 				return alias, canon
 			}
 			// Allow matching the saved node's own origin only when the session echoes
-			// both the same Alias and the same CanonicalHost (case-insensitive),
-			// never falling back when CanonicalHost is omitted for a non-canonicalized session.
+			// both the same Alias and the same CanonicalHost (case-insensitive) and
+			// re-verification confirms it still targets this saved node's Host.Address.
 			if !snapOrigin.IsZero() && t1Orig != "" && t1Orig == snapOrigin.Alias &&
 				strings.EqualFold(t1Canon, snapOrigin.CanonicalHost) {
-				return snapOrigin.Alias, snapOrigin.CanonicalHost
+				if alias, canon, ok := resolveScopedSavedOpenSSHAlias(parser, snapshot, snapOrigin.Alias, snapOrigin.CanonicalHost); ok {
+					return alias, canon
+				}
 			}
 			return "", ""
 		}
 		if !snapOrigin.IsZero() {
-			return snapOrigin.Alias, snapOrigin.CanonicalHost
+			if alias, canon, ok := resolveScopedSavedOpenSSHAlias(parser, snapshot, snapOrigin.Alias, snapOrigin.CanonicalHost); ok {
+				return alias, canon
+			}
 		}
 		if alias, canon, ok := resolveScopedSavedOpenSSHAlias(parser, snapshot, nodeName, ""); ok {
 			return alias, canon
@@ -655,7 +658,7 @@ func (a *SSHAdapter) resolveSessionOpenSSHMetadata(
 }
 
 func savedNodeAllowsTier4Key(parser *config.OpenSSHParser, snapshot config.ConnectionSnapshot, key string) bool {
-	if parser == nil || !parser.HasHost(key) {
+	if parser == nil {
 		return true
 	}
 	resolvedHost, explicit, err := parser.ResolveExplicitHostName(key)
@@ -665,10 +668,7 @@ func savedNodeAllowsTier4Key(parser *config.OpenSSHParser, snapshot config.Conne
 		}
 		return config.SameHostAddress(resolvedHost, snapshot.Host.Address)
 	}
-	if ip, ipErr := netip.ParseAddr(config.StripHostBrackets(key)); ipErr == nil && ip.IsValid() {
-		return config.SameHostAddress(key, snapshot.Host.Address)
-	}
-	return true
+	return config.SameHostAddress(key, snapshot.Host.Address)
 }
 
 func (a *SSHAdapter) buildTier4FallbackLookupKeys(parser *config.OpenSSHParser, nodeName, openSSHAlias string, lookupKeys []string) []string {

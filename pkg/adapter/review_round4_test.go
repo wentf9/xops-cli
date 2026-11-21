@@ -129,7 +129,7 @@ func TestRound4_P2_17_TwoPassTier4SkipsUnrelatedConcreteHostByAddress(t *testing
 		IdentityRef:   "id1",
 		OpenSSHAlias:  "app-short",
 		CanonicalHost: "app-short.corp.example.com",
-	}, models.Host{Address: "10.77.0.5", Port: 22}, models.Identity{User: "ops"})
+	}, models.Host{Address: "10.77.0.5", Port: 22, Alias: []string{"app-short.corp.example.com"}}, models.Identity{User: "ops"})
 	adp := NewSSHAdapter(provider)
 
 	opts, err := adp.ResolveSSHOptions("ops@10.77.0.5:22", SessionControlOptions{})

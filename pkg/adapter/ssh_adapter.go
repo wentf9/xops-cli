@@ -471,11 +471,7 @@ func (a *SSHAdapter) DisableSessionControlSharing(nodeID string) {
 	if a.sessionControlOverrides == nil {
 		a.sessionControlOverrides = make(map[string]SessionControlOptions)
 	}
-	base, exists := a.sessionControlOverrides[nodeID]
-	if !exists && a.globalSessionControl != nil {
-		base = *a.globalSessionControl
-	}
-	a.sessionControlOverrides[nodeID] = disable(base)
+	a.sessionControlOverrides[nodeID] = disable(a.sessionControlOverrides[nodeID])
 }
 
 // WithOpenSSHParser injects an explicit OpenSSHParser for Tier 4 resolution (e.g. in tests).
@@ -731,16 +727,173 @@ func (a *SSHAdapter) getSessionOverride(nodeID string) (SessionAuth, bool) {
 	return SessionAuth{}, false
 }
 
-func (a *SSHAdapter) getSessionControlOverride(nodeID string) (SessionControlOptions, bool) {
-	if a.sessionControlOverrides != nil {
-		if override, ok := a.sessionControlOverrides[nodeID]; ok {
-			return override, true
+func cloneSessionControlOptions(s SessionControlOptions) SessionControlOptions {
+	out := SessionControlOptions{
+		LiteralPath: s.LiteralPath,
+		AllowReuse:  s.AllowReuse,
+	}
+	if s.Master != nil {
+		m := *s.Master
+		out.Master = &m
+	}
+	if s.Path != nil {
+		p := *s.Path
+		out.Path = &p
+	}
+	if s.Persist != nil {
+		p := *s.Persist
+		out.Persist = &p
+	}
+	if s.Options != nil {
+		out.Options = s.Options.Clone()
+	}
+	return out
+}
+
+func hasNoneString(values []string) bool {
+	for _, v := range values {
+		if ssh.IsNoneValue(v) {
+			return true
 		}
 	}
-	if a.globalSessionControl != nil {
-		return *a.globalSessionControl, true
+	return false
+}
+
+func hasNoneOptionValue(opts *ssh.Options, canonicalKey string) bool {
+	if opts == nil {
+		return false
 	}
-	return SessionControlOptions{}, false
+	return hasNoneString(opts.GetAll(canonicalKey))
+}
+
+func preserveNoneTerminatedSentinel(merged, overrideOpts, baseOpts *ssh.Options) {
+	if merged == nil {
+		return
+	}
+	for _, spec := range ssh.RegisteredOptionSpecs() {
+		if !spec.MergeMode.IsNoneTerminated() {
+			continue
+		}
+		if !hasNoneOptionValue(overrideOpts, spec.CanonicalKey) && !hasNoneOptionValue(baseOpts, spec.CanonicalKey) {
+			continue
+		}
+		entries := merged.GetAll(spec.CanonicalKey)
+		if len(entries) == 0 || hasNoneString(entries) {
+			continue
+		}
+		_ = merged.Append(spec.CanonicalKey, "none")
+	}
+}
+
+func mergeSessionControlOptions(override, base SessionControlOptions) SessionControlOptions {
+	if base.IsEmpty() {
+		return cloneSessionControlOptions(override)
+	}
+	if override.IsEmpty() {
+		return cloneSessionControlOptions(base)
+	}
+	overrideOpts := override.ToSSHOptions()
+	baseOpts := base.ToSSHOptions()
+	overridePathIsNone := sessionControlPathIsNone(override, overrideOpts)
+	if overridePathIsNone && baseOpts != nil {
+		baseOpts = baseOpts.Clone()
+		baseOpts.StripClasses(ssh.OptionClassMux)
+	}
+	mergedOpts := ssh.MergeOptionLayers(overrideOpts, baseOpts)
+	preserveNoneTerminatedSentinel(mergedOpts, overrideOpts, baseOpts)
+
+	path, literalPath := mergeSessionControlPath(override, base, overrideOpts)
+	return SessionControlOptions{
+		Master:      mergeSessionControlMaster(override, base, overrideOpts, overridePathIsNone),
+		Path:        path,
+		LiteralPath: literalPath,
+		Persist:     mergeSessionControlPersist(override, base, overrideOpts, overridePathIsNone),
+		Options:     mergedOpts,
+		AllowReuse:  mergeSessionControlAllowReuse(override, base, overridePathIsNone),
+	}
+}
+
+func sessionControlPathIsNone(s SessionControlOptions, opts *ssh.Options) bool {
+	if s.Path != nil && ssh.IsNoneValue(*s.Path) {
+		return true
+	}
+	return opts != nil && ssh.IsNoneValue(opts.ControlPath())
+}
+
+func mergeSessionControlMaster(override, base SessionControlOptions, overrideOpts *ssh.Options, overridePathIsNone bool) *ssh.ControlMasterMode {
+	if override.Master != nil {
+		m := *override.Master
+		return &m
+	}
+	if overridePathIsNone || (overrideOpts != nil && overrideOpts.ControlMaster() != "") || base.Master == nil {
+		return nil
+	}
+	m := *base.Master
+	return &m
+}
+
+func mergeSessionControlPath(override, base SessionControlOptions, overrideOpts *ssh.Options) (*string, bool) {
+	if override.Path != nil {
+		p := *override.Path
+		return &p, override.LiteralPath && !ssh.IsNoneValue(p)
+	}
+	if overrideOpts != nil && overrideOpts.ControlPath() != "" {
+		return nil, overrideOpts.LiteralControlPath && !ssh.IsNoneValue(overrideOpts.ControlPath())
+	}
+	if base.Path != nil {
+		p := *base.Path
+		return &p, base.LiteralPath && !ssh.IsNoneValue(p)
+	}
+	return nil, false
+}
+
+func mergeSessionControlPersist(override, base SessionControlOptions, overrideOpts *ssh.Options, overridePathIsNone bool) *string {
+	if override.Persist != nil {
+		p := *override.Persist
+		return &p
+	}
+	if overridePathIsNone || (overrideOpts != nil && overrideOpts.ControlPersist() != "") || base.Persist == nil {
+		return nil
+	}
+	p := *base.Persist
+	return &p
+}
+
+func mergeSessionControlAllowReuse(override, base SessionControlOptions, overridePathIsNone bool) bool {
+	if overridePathIsNone {
+		return false
+	}
+	if override.AllowReuse {
+		return true
+	}
+	if override.HasExplicitMaster() {
+		return false
+	}
+	return base.AllowReuse
+}
+
+func (a *SSHAdapter) getSessionControlOverride(nodeID string) (SessionControlOptions, bool) {
+	if a == nil {
+		return SessionControlOptions{}, false
+	}
+	var (
+		override    SessionControlOptions
+		hasOverride bool
+	)
+	if a.sessionControlOverrides != nil {
+		override, hasOverride = a.sessionControlOverrides[nodeID]
+	}
+	hasGlobal := a.globalSessionControl != nil
+	switch {
+	case hasOverride && hasGlobal:
+		return mergeSessionControlOptions(override, *a.globalSessionControl), true
+	case hasOverride:
+		return cloneSessionControlOptions(override), true
+	case hasGlobal:
+		return cloneSessionControlOptions(*a.globalSessionControl), true
+	default:
+		return SessionControlOptions{}, false
+	}
 }
 
 // GetControlConfig implements ssh.ControlProvider.
@@ -941,8 +1094,8 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 	}
 
 	var cliOptKeys []string
-	if effCLI, _ := ssh.EffectiveOptions(sessionCtrlOpts.Options); effCLI != nil {
-		cliOptKeys = effCLI.IdentityFiles()
+	if sessionCtrlOpts.Options != nil {
+		cliOptKeys = sessionCtrlOpts.Options.IdentityFiles()
 	}
 	managedNodeKey := a.resolveManagedNodeKey(nodeID, snapshot)
 	var mergedOptKeys []string
@@ -958,7 +1111,9 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 		}
 	}
 	cfg.KeyPaths = buildOrderedKeyPaths(cliFlagKeys, cliOptKeys, managedNodeKey, mergedOptKeys)
-	if cfg.KeyPath == "" {
+	if hasNoneString(cliFlagKeys) || hasNoneString(cliOptKeys) {
+		cfg.KeyPath = firstConcreteKeyPath(cfg.KeyPaths)
+	} else if cfg.KeyPath == "" {
 		cfg.KeyPath = firstConcreteKeyPath(cfg.KeyPaths)
 	}
 
@@ -966,14 +1121,22 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 }
 
 func firstConcreteKeyPath(paths []string) string {
+	p, _ := firstConcreteKeyPathBeforeNone(paths)
+	return p
+}
+
+func firstConcreteKeyPathBeforeNone(paths []string) (path string, hitNone bool) {
 	for _, p := range paths {
 		trimmed := strings.TrimSpace(p)
-		if trimmed == "" || strings.EqualFold(trimmed, "none") {
+		if trimmed == "" {
 			continue
 		}
-		return trimmed
+		if ssh.IsNoneValue(trimmed) {
+			return "", true
+		}
+		return trimmed, false
 	}
-	return ""
+	return "", false
 }
 
 func openSSHSnapshotOriginalHost(nodeID string, snapshot config.ConnectionSnapshot) string {
@@ -999,26 +1162,41 @@ func (a *SSHAdapter) resolveManagedNodeKey(nodeID string, snapshot config.Connec
 func buildOrderedKeyPaths(cliFlagKeys, cliOptKeys []string, managedNodeKey string, mergedOptKeys []string) []string {
 	var out []string
 	seen := make(map[string]struct{})
-	add := func(k string) {
+	add := func(k string) bool {
 		k = strings.TrimSpace(k)
 		if k == "" {
-			return
+			return false
+		}
+		if ssh.IsNoneValue(k) {
+			if len(out) == 0 {
+				out = []string{"none"}
+			}
+			return true
 		}
 		if _, ok := seen[k]; ok {
-			return
+			return false
 		}
 		seen[k] = struct{}{}
 		out = append(out, k)
+		return false
 	}
 	for _, k := range cliFlagKeys {
-		add(k)
+		if add(k) {
+			return out
+		}
 	}
 	for _, k := range cliOptKeys {
-		add(k)
+		if add(k) {
+			return out
+		}
 	}
-	add(managedNodeKey)
+	if add(managedNodeKey) {
+		return out
+	}
 	for _, k := range mergedOptKeys {
-		add(k)
+		if add(k) {
+			return out
+		}
 	}
 	return out
 }
@@ -1047,10 +1225,16 @@ func (a *SSHAdapter) applySessionOverrideToConfig(nodeID string, cfg *ssh.Client
 	if override.Passphrase != "" {
 		cfg.Passphrase = override.Passphrase
 	}
-	if p := firstConcreteKeyPath(override.KeyPaths); p != "" {
+	var overrideKeyPaths []string
+	if len(override.KeyPaths) > 0 {
+		overrideKeyPaths = override.KeyPaths
+	} else if override.KeyPath != "" {
+		overrideKeyPaths = []string{override.KeyPath}
+	}
+	if p, hitNone := firstConcreteKeyPathBeforeNone(overrideKeyPaths); p != "" {
 		cfg.KeyPath = p
-	} else if p := firstConcreteKeyPath([]string{override.KeyPath}); p != "" {
-		cfg.KeyPath = p
+	} else if hitNone {
+		cfg.KeyPath = ""
 	}
 	// Route explicit session material through auto authentication unless the
 	// identity already uses keyboard-interactive or otp. This lets the
@@ -1092,7 +1276,7 @@ func (a *SSHAdapter) applySessionProxyJumpOverride(nodeID string, cfg *ssh.Clien
 
 func (a *SSHAdapter) isNonInteractiveForNode(nodeID string) bool {
 	if a == nil {
-		return false
+		return true
 	}
 	if a.nonInteractive {
 		return true
@@ -1102,11 +1286,11 @@ func (a *SSHAdapter) isNonInteractiveForNode(nodeID string) bool {
 		return sessionCtrlOpts.Options.BatchMode()
 	}
 	if a.cfgProvider == nil {
-		return a.isBatchModeLatched(nodeID)
+		return true
 	}
 	opts, err := a.ResolveSSHOptions(nodeID, sessionCtrlOpts)
 	if err != nil {
-		return a.isBatchModeLatched(nodeID) || (sessionCtrlOpts.Options != nil && sessionCtrlOpts.Options.BatchMode())
+		return true
 	}
 	return opts != nil && opts.BatchMode()
 }

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -54,8 +55,64 @@ func NewOpenSSHParser() (*OpenSSHParser, error) {
 	return NewOpenSSHParserFromPath(userConfigPath)
 }
 
+func isOpenSSHDevNullPath(path string) bool {
+	if path == "" {
+		return false
+	}
+	clean := filepath.Clean(path)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(clean, os.DevNull) || strings.EqualFold(clean, `\\.\`+os.DevNull)
+	}
+	return clean == os.DevNull
+}
+
+func isOpenSSHDevNullFileInfo(info os.FileInfo) bool {
+	if info == nil {
+		return false
+	}
+	devNullInfo, err := os.Stat(os.DevNull)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(info, devNullInfo)
+}
+
+func validateOpenSSHRootConfigInfo(path string, info os.FileInfo) (isDevNull bool, err error) {
+	if info.IsDir() {
+		return false, fmt.Errorf("open ssh config %q failed: path is a directory", path)
+	}
+	if !info.Mode().IsRegular() {
+		if isOpenSSHDevNullFileInfo(info) {
+			return true, nil
+		}
+		return false, fmt.Errorf("open ssh config %q failed: not a regular file", path)
+	}
+	return false, nil
+}
+
 // NewOpenSSHParserFromPath 从指定路径加载 SSH 配置文件。如果文件不存在，返回空的 OpenSSHParser 和 nil 错误。
 func NewOpenSSHParserFromPath(path string) (parser *OpenSSHParser, retErr error) {
+	if isOpenSSHDevNullPath(path) {
+		return &OpenSSHParser{cfg: nil}, nil
+	}
+	info, statErr := os.Stat(path)
+	if statErr != nil {
+		if errors.Is(statErr, os.ErrNotExist) {
+			return &OpenSSHParser{cfg: nil}, nil
+		}
+		return nil, fmt.Errorf("open ssh config %q failed: %w", path, statErr)
+	}
+	isDevNull, valErr := validateOpenSSHRootConfigInfo(path, info)
+	if valErr != nil {
+		return nil, valErr
+	}
+	if isDevNull {
+		return &OpenSSHParser{cfg: nil}, nil
+	}
+	if info.Size() > maxOpenSSHConfigFileBytes {
+		return nil, fmt.Errorf("decode ssh config %q failed: ssh config %q size limit (%d bytes) exceeded", path, path, maxOpenSSHConfigFileBytes)
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -68,6 +125,21 @@ func NewOpenSSHParserFromPath(path string) (parser *OpenSSHParser, retErr error)
 			retErr = errors.Join(retErr, fmt.Errorf("close ssh config %q failed: %w", path, closeErr))
 		}
 	}()
+
+	fInfo, fStatErr := f.Stat()
+	if fStatErr != nil {
+		return nil, fmt.Errorf("open ssh config %q failed: %w", path, fStatErr)
+	}
+	isDevNull, fValErr := validateOpenSSHRootConfigInfo(path, fInfo)
+	if fValErr != nil {
+		return nil, fValErr
+	}
+	if isDevNull {
+		return &OpenSSHParser{cfg: nil}, nil
+	}
+	if fInfo.Size() > maxOpenSSHConfigFileBytes {
+		return nil, fmt.Errorf("decode ssh config %q failed: ssh config %q size limit (%d bytes) exceeded", path, path, maxOpenSSHConfigFileBytes)
+	}
 
 	cfg, decodeErr := decodeOpenSSHConfig(f, path)
 	if decodeErr != nil {
@@ -99,20 +171,28 @@ func WithOpenSSHConfigOverride(base ConfigProvider, configPath string) (ConfigPr
 		return base, nil
 	}
 	isNone := strings.EqualFold(strings.TrimSpace(configPath), "none")
+	isDevNull := isOpenSSHDevNullPath(configPath)
 	var parser *OpenSSHParser
-	if isNone {
+	if isNone || isDevNull {
 		parser = &OpenSSHParser{cfg: nil}
 	} else {
 		info, err := os.Stat(configPath)
 		if err != nil {
 			return nil, fmt.Errorf("open ssh config %q failed: %w", configPath, err)
 		}
-		if info.IsDir() {
-			return nil, fmt.Errorf("open ssh config %q failed: path is a directory", configPath)
-		}
-		parser, err = NewOpenSSHParserFromPath(configPath)
+		var devNullFile bool
+		devNullFile, err = validateOpenSSHRootConfigInfo(configPath, info)
 		if err != nil {
 			return nil, err
+		}
+		if devNullFile {
+			isDevNull = true
+			parser = &OpenSSHParser{cfg: nil}
+		} else {
+			parser, err = NewOpenSSHParserFromPath(configPath)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	var (
@@ -132,7 +212,7 @@ func WithOpenSSHConfigOverride(base ConfigProvider, configPath string) (ConfigPr
 	if err != nil {
 		return nil, fmt.Errorf("create ephemeral ssh config override provider: %w", err)
 	}
-	if !isNone {
+	if !isNone && !isDevNull {
 		copyOverrideOpenSSHOrigins(repo.provider, base, parser, snap, origins, configPath)
 	}
 	return &openSSHOverrideProvider{ConfigProvider: repo, repo: repo}, nil

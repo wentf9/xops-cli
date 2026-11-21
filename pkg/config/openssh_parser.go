@@ -159,10 +159,48 @@ func (b *sshConfigBlock) matchesConcretePattern(alias string) bool {
 	return false
 }
 
-const maxIncludeFileLoads = 256
+const (
+	maxIncludeFileLoads        = 256
+	maxOpenSSHConfigFileBytes  = 16 << 20
+	maxOpenSSHConfigTotalBytes = 64 << 20
+)
 
 type includeLoadBudget struct {
-	loads int
+	loads      int
+	totalBytes int64
+}
+
+func sshConfigSourceLabel(path string) string {
+	if path == "" {
+		return "stream"
+	}
+	return fmt.Sprintf("%q", path)
+}
+
+func readOpenSSHConfigLimited(r io.Reader, path string, budget *includeLoadBudget) ([]byte, error) {
+	label := sshConfigSourceLabel(path)
+	remaining := int64(maxOpenSSHConfigTotalBytes)
+	if budget != nil {
+		remaining = int64(maxOpenSSHConfigTotalBytes) - budget.totalBytes
+		if remaining < 0 {
+			return nil, fmt.Errorf("ssh config %s total size limit (%d bytes) exceeded", label, maxOpenSSHConfigTotalBytes)
+		}
+	}
+	readLimit := min(int64(maxOpenSSHConfigFileBytes), remaining)
+	b, err := io.ReadAll(io.LimitReader(r, readLimit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > maxOpenSSHConfigFileBytes {
+		return nil, fmt.Errorf("ssh config %s size limit (%d bytes) exceeded", label, maxOpenSSHConfigFileBytes)
+	}
+	if int64(len(b)) > remaining {
+		return nil, fmt.Errorf("ssh config %s total size limit (%d bytes) exceeded", label, maxOpenSSHConfigTotalBytes)
+	}
+	if budget != nil {
+		budget.totalBytes += int64(len(b))
+	}
+	return b, nil
 }
 
 func decodeOpenSSHReader(r io.Reader) (*sshConfigDoc, error) {
@@ -174,7 +212,8 @@ func decodeOpenSSHReader(r io.Reader) (*sshConfigDoc, error) {
 }
 
 func decodeOpenSSHConfig(r io.Reader, sourcePath string) (*sshConfigDoc, error) {
-	b, err := io.ReadAll(r)
+	budget := &includeLoadBudget{}
+	b, err := readOpenSSHConfigLimited(r, sourcePath, budget)
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +221,7 @@ func decodeOpenSSHConfig(r io.Reader, sourcePath string) (*sshConfigDoc, error) 
 	if sourcePath != "" {
 		active[canonicalIncludePath(sourcePath)] = struct{}{}
 	}
-	return decodeOpenSSHBytesWithBudget(b, isSystemSSHConfigPath(sourcePath), 0, active, &includeLoadBudget{})
+	return decodeOpenSSHBytesWithBudget(b, isSystemSSHConfigPath(sourcePath), 0, active, budget)
 }
 
 func decodeOpenSSHFile(path string, system bool, depth int, active map[string]struct{}, budget *includeLoadBudget) (doc *sshConfigDoc, retErr error) {
@@ -202,7 +241,13 @@ func decodeOpenSSHFile(path string, system bool, depth int, active map[string]st
 	if !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("included ssh config %q is not a regular file", path)
 	}
-	b, err := io.ReadAll(f)
+	if info.Size() > maxOpenSSHConfigFileBytes {
+		return nil, fmt.Errorf("ssh config %q size limit (%d bytes) exceeded", path, maxOpenSSHConfigFileBytes)
+	}
+	if budget != nil && info.Size() > int64(maxOpenSSHConfigTotalBytes)-budget.totalBytes {
+		return nil, fmt.Errorf("ssh config %q total size limit (%d bytes) exceeded", path, maxOpenSSHConfigTotalBytes)
+	}
+	b, err := readOpenSSHConfigLimited(f, path, budget)
 	if err != nil {
 		return nil, err
 	}
@@ -642,8 +687,11 @@ func loadOpenSSHIncludeFiles(
 	active map[string]struct{},
 	budget *includeLoadBudget,
 ) ([]includedSSHConfigFile, error) {
-	if depth >= maxIncludeDepth || len(patterns) == 0 {
+	if len(patterns) == 0 {
 		return nil, nil
+	}
+	if depth >= maxIncludeDepth {
+		return nil, fmt.Errorf("included ssh config depth limit (%d) exceeded", maxIncludeDepth)
 	}
 	var files []includedSSHConfigFile
 	seenPaths := make(map[string]struct{})

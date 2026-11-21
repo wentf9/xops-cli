@@ -1368,6 +1368,7 @@ func (r *Repository) UpdateAuthAtVersionContext(ctx context.Context, nodeID, aut
 		if !ok {
 			return fmt.Errorf("resolve node %q for auth update: %w", nodeID, ErrIdentityNotFound)
 		}
+		identity = cloneIdentity(identity)
 		changed := false
 		if password != "" && identity.Password != password {
 			identity.Password = password
@@ -1387,6 +1388,7 @@ func (r *Repository) UpdateAuthAtVersionContext(ctx context.Context, nodeID, aut
 		if countNodeReferences(cfg, func(candidate models.Node) bool {
 			return candidate.IdentityRef == node.IdentityRef
 		}) > 1 {
+			node = cloneNode(node)
 			node.IdentityRef = privateIdentityReference(cfg, nodeID)
 			cfg.Nodes.Set(nodeID, node)
 		}
@@ -1421,6 +1423,7 @@ func (r *Repository) UpdateSudoAtVersionContext(ctx context.Context, nodeID, sud
 		if !ok {
 			return fmt.Errorf("resolve node %q for sudo update: %w", nodeID, ErrNodeNotFound)
 		}
+		node = cloneNode(node)
 		changed := false
 		if mode != "" && node.SudoMode != mode {
 			node.SudoMode = mode
@@ -1759,11 +1762,13 @@ func updateNodeAuthCredentialRef(
 	if !ok {
 		return "", fmt.Errorf("resolve identity %q for node %q: %w", node.IdentityRef, nodeID, ErrIdentityNotFound)
 	}
+	identity = cloneIdentity(identity)
 
 	// 检查是否共享：若有多个节点引用该 Identity，分裂出私有副本
 	if countNodeReferences(cfg, func(candidate models.Node) bool {
 		return candidate.IdentityRef == node.IdentityRef
 	}) > 1 {
+		node = cloneNode(node)
 		node.IdentityRef = privateIdentityReference(cfg, nodeID)
 		cfg.Nodes.Set(nodeID, node)
 	}
@@ -1807,6 +1812,7 @@ func updateNodeSudoCredentialRef(
 		}
 	}
 
+	node = cloneNode(node)
 	node.PrivilegePasswordRef = newRef.Clone()
 	node.SuPwd = ""
 	cfg.Nodes.Set(nodeID, node)
@@ -1851,6 +1857,7 @@ func (r *Repository) updateIdentityCredentialRefAtVersionContext(ctx context.Con
 		if !ok {
 			return fmt.Errorf("resolve identity %q for credential update: %w", identityID, ErrIdentityNotFound)
 		}
+		identity = cloneIdentity(identity)
 
 		currentVer, verErr := identityEntityVersion(cfg, identityID)
 		if verErr != nil {
@@ -2361,6 +2368,7 @@ func updateNodeAuthCredentialTarget(cfg *Configuration, target credential.Target
 	}
 	node, _ := cfg.Nodes.Get(target.NodeID)
 	identity, _ := cfg.Identities.Get(node.IdentityRef)
+	identity = cloneIdentity(identity)
 	identity.KeyFingerprint = target.KeyFingerprint
 	cfg.Identities.Set(node.IdentityRef, identity)
 	next, err := nodeAuthVersion(cfg, target.NodeID)
