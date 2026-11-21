@@ -281,6 +281,104 @@ func (c *Client) Execution() *ExecutionConfig {
 	return c.connCfg.Execution.Clone()
 }
 
+// SetExecution updates the client's effective execution configuration (and its
+// pooled snapshot, if pooled) after caller-side enrollment probing confirms a node.
+func (c *Client) SetExecution(exec *ExecutionConfig) {
+	if c == nil {
+		return
+	}
+	cloned := exec.Clone()
+	c.cfgMu.Lock()
+	c.connCfg.Execution = cloned
+	c.cfgMu.Unlock()
+	if c.pooled != nil {
+		c.pooled.updateSnapshot(func(snap *ConnectionConfig, pub *ClientConfig) {
+			if snap != nil {
+				snap.Execution = cloned.Clone()
+			}
+			if pub != nil {
+				pub.Execution = cloned.Clone()
+			}
+		})
+	}
+}
+
+// TransportError reports any already-observed fatal transport I/O error on this
+// client without issuing a network probe.
+func (c *Client) TransportError() error {
+	return c.transportError()
+}
+
+// ApplyRecordedAuth synchronizes the client (and its pooled snapshot, if pooled)
+// with newly committed authentication metadata after caller-side confirmation.
+func (c *Client) ApplyRecordedAuth(authToken, keyPath string, keyPaths []string) {
+	if c == nil {
+		return
+	}
+	paths := slices.Clone(keyPaths)
+	c.cfgMu.Lock()
+	if authToken != "" {
+		c.connCfg.AuthUpdateToken = authToken
+	}
+	if keyPath != "" {
+		c.connCfg.KeyPath = keyPath
+	}
+	if len(paths) > 0 {
+		c.connCfg.KeyPaths = slices.Clone(paths)
+	}
+	c.cfgMu.Unlock()
+	if c.pooled != nil {
+		c.pooled.updateSnapshot(func(snap *ConnectionConfig, pub *ClientConfig) {
+			if snap != nil {
+				if authToken != "" {
+					snap.AuthUpdateToken = authToken
+				}
+				if keyPath != "" {
+					snap.KeyPath = keyPath
+				}
+				if len(paths) > 0 {
+					snap.KeyPaths = slices.Clone(paths)
+				}
+			}
+			if pub != nil {
+				if authToken != "" {
+					pub.AuthUpdateToken = authToken
+				}
+				if keyPath != "" {
+					pub.KeyPath = keyPath
+				}
+				if len(paths) > 0 {
+					pub.KeyPaths = slices.Clone(paths)
+				}
+			}
+		})
+	}
+}
+
+// ClearUpdateTokens clears the client's auth/sudo optimistic-concurrency tokens
+// after an uncertain credential persistence write.
+func (c *Client) ClearUpdateTokens() {
+	if c == nil {
+		return
+	}
+	c.cfgMu.Lock()
+	c.connCfg.AuthUpdateToken = ""
+	c.connCfg.SudoUpdateToken = ""
+	c.cfgMu.Unlock()
+	if c.pooled != nil {
+		c.pooled.updateSnapshot(func(snap *ConnectionConfig, pub *ClientConfig) {
+			if snap != nil {
+				snap.AuthUpdateToken = ""
+				snap.SudoUpdateToken = ""
+			}
+			if pub != nil {
+				pub.AuthUpdateToken = ""
+				pub.SudoUpdateToken = ""
+			}
+		})
+	}
+}
+
 // NewTestClient creates a Client for unit testing with the provided connection config.
 func NewTestClient(connCfg ConnectionConfig) *Client {
 	return &Client{

@@ -194,34 +194,36 @@ func TestRound5_P2_9_ResolveDoesNotLatchBatchMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRepositoryWithOpenSSHParser: %v", err)
 	}
-	prep, err := repo.PrepareNodeContext(t.Context(), config.EnsureNodeOptions{
+	if err := repo.WithPendingNode(t.Context(), config.EnsureNodeOptions{
 		Target: config.ConnectionTarget{Selector: "batchbox", User: "otheruser", HasUser: true},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext: %v", err)
-	}
-	if !prep.Created {
-		t.Fatalf("expected Prepared OpenSSHDerived node, got %+v", prep)
-	}
-	adp := NewSSHAdapter(repo)
+	}, func(lease config.PendingLease) error {
+		nodeID := lease.NodeID()
+		if !repo.IsPendingNode(nodeID) {
+			t.Fatalf("expected Prepared OpenSSHDerived node, got %q", nodeID)
+		}
+		adp := NewSSHAdapter(repo)
 
-	pol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: prep.NodeID})
-	if err != nil {
-		t.Fatalf("Resolve failed: %v", err)
-	}
-	opts := pol.Options()
-	if !opts.BatchMode() {
-		t.Fatal("expected Resolve to report BatchMode=yes from Tier 4")
-	}
-	if adp.isBatchModeLatched(prep.NodeID) {
-		t.Fatal("read-only Resolve must NOT latch BatchMode onto SSHAdapter")
-	}
+		pol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: nodeID})
+		if err != nil {
+			t.Fatalf("Resolve failed: %v", err)
+		}
+		opts := pol.Options()
+		if !opts.BatchMode() {
+			t.Fatal("expected Resolve to report BatchMode=yes from Tier 4")
+		}
+		if adp.isBatchModeLatched(nodeID) {
+			t.Fatal("read-only Resolve must NOT latch BatchMode onto SSHAdapter")
+		}
 
-	if _, err := adp.GetConfig(prep.NodeID); err != nil {
-		t.Fatalf("GetConfig failed: %v", err)
-	}
-	if !adp.isBatchModeLatched(prep.NodeID) {
-		t.Fatal("GetConfig for ProvenanceOpenSSHDerived must latch BatchMode")
+		if _, err := adp.GetConfig(nodeID); err != nil {
+			t.Fatalf("GetConfig failed: %v", err)
+		}
+		if !adp.isBatchModeLatched(nodeID) {
+			t.Fatal("GetConfig for ProvenanceOpenSSHDerived must latch BatchMode")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode: %v", err)
 	}
 }
 

@@ -90,36 +90,39 @@ func TestRound4_P1_9a_VirtualOpenSSHIsolatedFromSideMapsAndResolveWithOrigin(t *
 		t.Fatalf("NewRepositoryWithOpenSSHParser: %v", err)
 	}
 
-	prepA, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	var prepAID string
+	if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{
 			Selector:     OpenSSHNodePrefix + "shared.corp.example.com",
 			OriginalHost: "short-a",
 		},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(short-a): %v", err)
-	}
-	// Decision 1.A: ProvenanceOpenSSHVirtual must neither leak into r.pending nor mutate r.provider.
-	repo.pendingMu.RLock()
-	_, hasPendingVirtual := repo.pending[prepA.NodeID]
-	repo.pendingMu.RUnlock()
-	if hasPendingVirtual {
-		t.Fatalf("r.pending leaked virtual OpenSSH entry %q", prepA.NodeID)
-	}
-	if got := repo.NodeOpenSSHAlias(prepA.NodeID); got != "" {
-		t.Fatalf("NodeOpenSSHAlias = %q, want empty (stateless virtual resolution)", got)
-	}
-	if got := repo.provider.NodeOpenSSHAlias(prepA.NodeID); got != "" {
-		t.Fatalf("committed r.provider polluted with virtual alias %q", got)
+	}, func(lease PendingLease) error {
+		prepAID = lease.NodeID()
+		// Decision 1.A: ProvenanceOpenSSHVirtual must neither leak into r.pending nor mutate r.provider.
+		repo.pendingMu.RLock()
+		_, hasPendingVirtual := repo.pending[prepAID]
+		repo.pendingMu.RUnlock()
+		if hasPendingVirtual {
+			t.Fatalf("r.pending leaked virtual OpenSSH entry %q", prepAID)
+		}
+		if got := repo.NodeOpenSSHAlias(prepAID); got != "" {
+			t.Fatalf("NodeOpenSSHAlias = %q, want empty (stateless virtual resolution)", got)
+		}
+		if got := repo.provider.NodeOpenSSHAlias(prepAID); got != "" {
+			t.Fatalf("committed r.provider polluted with virtual alias %q", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode(short-a): %v", err)
 	}
 
 	// ResolveConnectionWithOrigin isolates concurrent sessions for short-a, short-b, and direct.
-	assertResolveOriginState(t, repo, prepA.NodeID, "short-a", "user-a", "short-a", "shared.corp.example.com")
-	assertResolveOriginState(t, repo, prepA.NodeID, "openssh:short-b", "user-b", "short-b", "shared.corp.example.com")
-	assertResolveOriginState(t, repo, prepA.NodeID, "", "direct-user", "shared.corp.example.com", "")
+	assertResolveOriginState(t, repo, prepAID, "short-a", "user-a", "short-a", "shared.corp.example.com")
+	assertResolveOriginState(t, repo, prepAID, "openssh:short-b", "user-b", "short-b", "shared.corp.example.com")
+	assertResolveOriginState(t, repo, prepAID, "", "direct-user", "shared.corp.example.com", "")
 
 	// Unqualified ResolveConnection stays direct without cross-session hijack.
-	snapUnqualified, err := repo.ResolveConnection(prepA.NodeID)
+	snapUnqualified, err := repo.ResolveConnection(prepAID)
 	if err != nil {
 		t.Fatalf("ResolveConnection(unqualified): %v", err)
 	}
@@ -163,29 +166,30 @@ func TestRound4_P1_9b_PendingMetadataIsolatedFromLiveProviderAndFrozen(t *testin
 		t.Fatalf("NewRepositoryWithOpenSSHParser: %v", err)
 	}
 
-	prep, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{
 			Selector:     "edge-short.corp.example.com",
 			OriginalHost: "edge-short",
 		},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext: %v", err)
-	}
-
-	if got := repo.NodeOpenSSHAlias(prep.NodeID); got != "edge-short" {
-		t.Fatalf("Repository.NodeOpenSSHAlias = %q, want edge-short", got)
-	}
-	if got := repo.provider.NodeOpenSSHAlias(prep.NodeID); got != "" {
-		t.Fatalf("committed r.provider polluted with pending alias %q", got)
-	}
-	frozen := repo.Frozen().(*frozenRepository)
-	if got := frozen.NodeOpenSSHAlias(prep.NodeID); got != "" {
-		t.Fatalf("Frozen().NodeOpenSSHAlias leaked pending alias %q", got)
-	}
-	snap, err := repo.ResolveConnection(prep.NodeID)
-	if err != nil || snap.Node.OpenSSHAlias != "edge-short" || snap.Node.CanonicalHost != "edge-short.corp.example.com" {
-		t.Fatalf("Repository.ResolveConnection = (%+v, %v)", snap.Node, err)
+	}, func(lease PendingLease) error {
+		id := lease.NodeID()
+		if got := repo.NodeOpenSSHAlias(id); got != "edge-short" {
+			t.Fatalf("Repository.NodeOpenSSHAlias = %q, want edge-short", got)
+		}
+		if got := repo.provider.NodeOpenSSHAlias(id); got != "" {
+			t.Fatalf("committed r.provider polluted with pending alias %q", got)
+		}
+		frozen := repo.Frozen().(*frozenRepository)
+		if got := frozen.NodeOpenSSHAlias(id); got != "" {
+			t.Fatalf("Frozen().NodeOpenSSHAlias leaked pending alias %q", got)
+		}
+		snap, err := repo.ResolveConnection(id)
+		if err != nil || snap.Node.OpenSSHAlias != "edge-short" || snap.Node.CanonicalHost != "edge-short.corp.example.com" {
+			t.Fatalf("Repository.ResolveConnection = (%+v, %v)", snap.Node, err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode: %v", err)
 	}
 }
 
@@ -246,7 +250,7 @@ func TestRound4_P1_9c_PruneStaleMetadataOnHostChangeAndDeletePreserveOnTagEdit(t
 	}
 }
 
-func TestRound4_P1_10_ConfirmNodeContextAtomicallyMergesConcurrentPendingUpgrade(t *testing.T) {
+func TestRound4_P1_10_ConfirmAtomicallyMergesConcurrentPendingUpgrade(t *testing.T) {
 	t.Parallel()
 
 	inner := &repositoryTestStore{result: PersistResult{Applied: true, Durable: true}}
@@ -274,7 +278,8 @@ func TestRound4_P1_10_ConfirmNodeContextAtomicallyMergesConcurrentPendingUpgrade
 		t.Fatalf("NewRepositoryWithOpenSSHParser: %v", err)
 	}
 
-	prep, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	var nodeID string
+	if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{
 			Selector: "10.30.0.8",
 			User:     "ops",
@@ -282,62 +287,59 @@ func TestRound4_P1_10_ConfirmNodeContextAtomicallyMergesConcurrentPendingUpgrade
 			Port:     2222,
 			HasPort:  true,
 		},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(initial): %v", err)
-	}
-	if !prep.Created {
-		t.Fatalf("expected Created=true, got %+v", prep)
-	}
+	}, func(lease PendingLease) error {
+		nodeID = lease.NodeID()
+		confirmErr := make(chan error, 1)
+		go func() {
+			confirmErr <- lease.Confirm(t.Context())
+		}()
 
-	confirmErr := make(chan error, 1)
-	go func() {
-		confirmErr <- repo.ConfirmNodeContext(t.Context(), prep.NodeID)
-	}()
-
-	select {
-	case <-store.saveStarted:
-	case err := <-confirmErr:
-		t.Fatalf("ConfirmNodeContext returned before saveStarted: %v", err)
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for store.saveStarted")
-	}
-	// Concurrent PrepareNodeContext upgrades r.pending[prep.NodeID] while store.save is blocked.
-	upgraded, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
-		Target: ConnectionTarget{
-			Selector:     "edge.corp.example.com",
-			OriginalHost: "edge",
-			Port:         2222,
-			HasPort:      true,
-		},
-	})
-	if err != nil {
-		close(store.releaseSave)
-		t.Fatalf("PrepareNodeContext(upgrade): %v", err)
-	}
-	if upgraded.NodeID != prep.NodeID {
-		close(store.releaseSave)
-		t.Fatalf("upgraded NodeID = %q, want %q", upgraded.NodeID, prep.NodeID)
-	}
-
-	close(store.releaseSave)
-	select {
-	case err := <-confirmErr:
-		if err != nil {
-			t.Fatalf("ConfirmNodeContext: %v", err)
+		select {
+		case <-store.saveStarted:
+		case err := <-confirmErr:
+			t.Fatalf("Confirm returned before saveStarted: %v", err)
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for store.saveStarted")
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("ConfirmNodeContext timed out")
+		// Concurrent WithPendingNode upgrades r.pending[nodeID] while store.save is blocked.
+		if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
+			Target: ConnectionTarget{
+				Selector:     "edge.corp.example.com",
+				OriginalHost: "edge",
+				Port:         2222,
+				HasPort:      true,
+			},
+		}, func(upgraded PendingLease) error {
+			if upgraded.NodeID() != nodeID {
+				close(store.releaseSave)
+				t.Fatalf("upgraded NodeID = %q, want %q", upgraded.NodeID(), nodeID)
+			}
+			close(store.releaseSave)
+			select {
+			case err := <-confirmErr:
+				if err != nil {
+					t.Fatalf("Confirm: %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("Confirm timed out")
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("WithPendingNode(upgrade): %v", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode(initial): %v", err)
 	}
 
-	if gotAlias, gotCanon := repo.NodeOpenSSHAlias(prep.NodeID), repo.NodeCanonicalHost(prep.NodeID); gotAlias != "edge" || gotCanon != "edge.corp.example.com" {
+	if gotAlias, gotCanon := repo.NodeOpenSSHAlias(nodeID), repo.NodeCanonicalHost(nodeID); gotAlias != "edge" || gotCanon != "edge.corp.example.com" {
 		t.Fatalf("atomically committed metadata = (%q, %q), want (\"edge\", \"edge.corp.example.com\")", gotAlias, gotCanon)
 	}
 	repo.pendingMu.RLock()
-	_, stillPending := repo.pending[prep.NodeID]
+	_, stillPending := repo.pending[nodeID]
 	repo.pendingMu.RUnlock()
 	if stillPending {
-		t.Fatalf("pending entry %q was not cleaned up after atomic confirmation", prep.NodeID)
+		t.Fatalf("pending entry %q was not cleaned up after atomic confirmation", nodeID)
 	}
 }
 

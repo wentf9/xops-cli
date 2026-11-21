@@ -96,22 +96,27 @@ func (h *cliInteractionHandler) rememberOptions(policy string, cfg *config.Confi
 	return enabled, opts
 }
 
-// newCLIConnectorWithAdapterOptions builds the interactive CLI connector. The
-// explicit handler is required: WithInteractionHandler only installs secret and
-// host-key prompts, so the master connection-sharing confirmer must be wired to
-// the same handler (and prompt gate) as the rest of the session.
-func newCLIConnectorWithAdapterOptions(provider config.ConfigProvider, interaction *cliInteractionHandler, adpOpts []adapter.Option, opts ...ssh.Option) *ssh.Connector {
+// newCLIConnectorAndAdapter builds the interactive CLI connector and adapter.
+// The explicit handler is required: WithInteractionHandler only installs secret
+// and host-key prompts, so the master connection-sharing confirmer must be
+// wired to the same handler (and prompt gate) as the rest of the session.
+func newCLIConnectorAndAdapter(provider config.ConfigProvider, interaction *cliInteractionHandler, adpOpts []adapter.Option, opts ...ssh.Option) (*ssh.Connector, *adapter.SSHAdapter) {
 	if interaction == nil {
 		interaction = newCLIInteractionHandler()
 	}
 	opts = append([]ssh.Option{ssh.WithInteractionHandler(interaction), ssh.WithSessionConfirmer(interaction)}, opts...)
-	return adapter.NewConnectorWithAdapterOptions(provider, adpOpts, opts...)
+	return adapter.NewConnectorAndAdapter(provider, adpOpts, opts...)
 }
 
 // newNonInteractiveConnector 创建不安装任何交互提示器的非交互式连接器，
 // 适用于 Playbook、MCP 等批处理场景，确保缺少凭据时立即 fail-closed 而非等待终端输入。
 func newNonInteractiveConnector(provider config.ConfigProvider, adpOpts []adapter.Option, opts ...ssh.Option) *ssh.Connector {
-	return adapter.NewConnectorWithAdapterOptions(provider, adpOpts, opts...)
+	connector, _ := newNonInteractiveConnectorAndAdapter(provider, adpOpts, opts...)
+	return connector
+}
+
+func newNonInteractiveConnectorAndAdapter(provider config.ConfigProvider, adpOpts []adapter.Option, opts ...ssh.Option) (*ssh.Connector, *adapter.SSHAdapter) {
+	return adapter.NewConnectorAndAdapter(provider, adpOpts, opts...)
 }
 
 func (h *cliInteractionHandler) acquireGate(ctx context.Context) (func(), error) {

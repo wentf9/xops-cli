@@ -2406,32 +2406,33 @@ func TestSSHAdapter_BatchModeDisablesInteractionAndWriteback(t *testing.T) {
 		t.Fatal("expected rememberConfirmation not to be called when BatchMode=yes")
 	}
 
-	// Verify ConfirmAuthenticatedConnection skips enrollment probe when BatchMode=yes
+	// Verify FinalizePendingConnection skips enrollment probe when BatchMode=yes
 	repo, err := config.NewRepositoryWithoutOpenSSH(cfg, adapterTestStore{})
 	if err != nil {
 		t.Fatalf("NewRepositoryWithoutOpenSSH failed: %v", err)
 	}
-	prepared, err := repo.PrepareNodeContext(ctx, config.EnsureNodeOptions{
+	if err := repo.WithPendingNode(ctx, config.EnsureNodeOptions{
 		Target: config.ConnectionTarget{Selector: "10.88.77.66", User: "root", HasUser: true, Port: 22, HasPort: true},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext failed: %v", err)
-	}
-	probeAdp := NewSSHAdapter(
-		repo,
-		WithEnrollmentProbing(nil),
-		WithSessionAuthOverride(prepared.NodeID, SessionAuth{Password: "pw", Remember: true}),
-		WithSessionControlOverride(prepared.NodeID, SessionControlOptions{
-			Options: ssh.MustOptions(ssh.OptionBatchMode, "yes"),
-		}),
-	)
-	// Passing a nil *ssh.Client would panic if ConfirmAuthenticatedConnection attempted client.ProbeExecutionConfig(ctx)
-	execCfg, err := probeAdp.ConfirmAuthenticatedConnection(ctx, prepared.NodeID, nil)
-	if err != nil {
-		t.Fatalf("ConfirmAuthenticatedConnection failed under BatchMode=yes: %v", err)
-	}
-	if execCfg != nil {
-		t.Fatalf("expected nil execution config when enrollment probe is skipped under BatchMode=yes, got %+v", execCfg)
+	}, func(lease config.PendingLease) error {
+		nodeID := lease.NodeID()
+		probeAdp := NewSSHAdapter(
+			repo,
+			WithEnrollmentProbing(nil),
+			WithSessionAuthOverride(nodeID, SessionAuth{Password: "pw", Remember: true}),
+			WithSessionControlOverride(nodeID, SessionControlOptions{
+				Options: ssh.MustOptions(ssh.OptionBatchMode, "yes"),
+			}),
+		)
+		// Passing a nil *ssh.Client would panic if FinalizePendingConnection attempted client.ProbeExecutionConfig(ctx)
+		if err := probeAdp.FinalizePendingConnection(ctx, lease, nil); err != nil {
+			t.Fatalf("FinalizePendingConnection failed under BatchMode=yes: %v", err)
+		}
+		if node, ok := repo.GetNode(nodeID); !ok || node.Execution != nil {
+			t.Fatalf("expected persisted node with nil execution when enrollment probe is skipped under BatchMode=yes, got ok=%v exec=%+v", ok, node.Execution)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode failed: %v", err)
 	}
 }
 

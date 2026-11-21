@@ -36,45 +36,46 @@ func TestRound3_P1_1_GetConfigAndResolvePreservePass1AndPercentN(t *testing.T) {
 		t.Fatalf("NewRepositoryWithOpenSSHParser error = %v", err)
 	}
 
-	res, err := repo.PrepareNodeContext(t.Context(), config.EnsureNodeOptions{
+	if err := repo.WithPendingNode(t.Context(), config.EnsureNodeOptions{
 		Target: config.ConnectionTarget{
 			Selector:     config.OpenSSHNodePrefix + "alice@short.corp.example.com:2222",
 			OriginalHost: "short",
 		},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext error = %v", err)
-	}
+	}, func(lease config.PendingLease) error {
+		nodeID := lease.NodeID()
+		adp := NewSSHAdapter(repo, WithSessionAuthOverride(nodeID, SessionAuth{OriginalHost: "short"}))
+		cfg, err := adp.GetConfig(nodeID)
+		if err != nil {
+			t.Fatalf("GetConfig error = %v", err)
+		}
+		if cfg.OriginalHost != "short" {
+			t.Fatalf("OriginalHost = %q, want %q", cfg.OriginalHost, "short")
+		}
+		if cfg.User != "alice" || cfg.Port != 2222 {
+			t.Fatalf("user/port = (%q, %d), want (alice, 2222)", cfg.User, cfg.Port)
+		}
+		if !strings.HasSuffix(cfg.KeyPath, "/tmp/r3-adp-pass1") {
+			t.Fatalf("Pass-1 KeyPath lost: %q", cfg.KeyPath)
+		}
+		if got := cfg.Options.Get(ssh.OptionConnectTimeout); got != "11" {
+			t.Fatalf("Pass-2 ConnectTimeout lost: %q", got)
+		}
 
-	adp := NewSSHAdapter(repo, WithSessionAuthOverride(res.NodeID, SessionAuth{OriginalHost: "short"}))
-	cfg, err := adp.GetConfig(res.NodeID)
-	if err != nil {
-		t.Fatalf("GetConfig error = %v", err)
-	}
-	if cfg.OriginalHost != "short" {
-		t.Fatalf("OriginalHost = %q, want %q", cfg.OriginalHost, "short")
-	}
-	if cfg.User != "alice" || cfg.Port != 2222 {
-		t.Fatalf("user/port = (%q, %d), want (alice, 2222)", cfg.User, cfg.Port)
-	}
-	if !strings.HasSuffix(cfg.KeyPath, "/tmp/r3-adp-pass1") {
-		t.Fatalf("Pass-1 KeyPath lost: %q", cfg.KeyPath)
-	}
-	if got := cfg.Options.Get(ssh.OptionConnectTimeout); got != "11" {
-		t.Fatalf("Pass-2 ConnectTimeout lost: %q", got)
-	}
-
-	pol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: res.NodeID})
-	if err != nil {
-		t.Fatalf("Resolve error = %v", err)
-	}
-	ctrl := pol.Control()
-	expanded, err := adp.ExpandControlPath(res.NodeID, ctrl.Path)
-	if err != nil {
-		t.Fatalf("ExpandControlPath error = %v", err)
-	}
-	if !strings.HasSuffix(expanded, "/tmp/r3-cm-short-short.corp.example.com-2222") {
-		t.Fatalf("ControlPath %%n expansion = %q", expanded)
+		pol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: nodeID})
+		if err != nil {
+			t.Fatalf("Resolve error = %v", err)
+		}
+		ctrl := pol.Control()
+		expanded, err := adp.ExpandControlPath(nodeID, ctrl.Path)
+		if err != nil {
+			t.Fatalf("ExpandControlPath error = %v", err)
+		}
+		if !strings.HasSuffix(expanded, "/tmp/r3-cm-short-short.corp.example.com-2222") {
+			t.Fatalf("ControlPath %%n expansion = %q", expanded)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode error = %v", err)
 	}
 }
 

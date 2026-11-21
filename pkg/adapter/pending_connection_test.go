@@ -30,72 +30,92 @@ func TestPreparedNodeSSHAuthenticationPersistence(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			repo, diskStore, path, original := pendingAdapterRepository(t)
-			prepared, err := repo.PrepareNodeContext(t.Context(), config.EnsureNodeOptions{Target: config.ConnectionTarget{
+			if err := repo.WithPendingNode(t.Context(), config.EnsureNodeOptions{Target: config.ConnectionTarget{
 				Selector: host, User: "root", HasUser: true, Port: uint16(port), HasPort: true,
-			}})
-			if err != nil {
-				t.Fatal(err)
-			}
-			service, secrets := pendingCredentialService(t, repo)
-			connector := NewConnectorWithAdapterOptions(repo, []Option{
-				WithCredentialService(service),
-				WithNonInteractive(!tc.remember),
-				WithSessionAuthOverride(prepared.NodeID, SessionAuth{Password: tc.password, Remember: tc.remember}),
-			}, ssh.WithHandshakeTimeout(time.Second))
-			connector.AcceptNewHostKey.Store(true)
-			defer func() {
-				if err := connector.CloseAll(); err != nil {
-					t.Errorf("close connector: %v", err)
-				}
-			}()
-			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-			defer cancel()
-			client, connectErr := connector.Connect(ctx, prepared.NodeID)
-			if (connectErr == nil) != tc.success {
-				t.Fatalf("connect success = %v, error = %v", tc.success, connectErr)
-			}
-			if client != nil {
+			}}, func(lease config.PendingLease) error {
+				nodeID := lease.NodeID()
+				service, secrets := pendingCredentialService(t, repo)
+				connector, adp := NewConnectorAndAdapter(repo, []Option{
+					WithCredentialService(service),
+					WithNonInteractive(!tc.remember),
+					WithSessionAuthOverride(nodeID, SessionAuth{Password: tc.password, Remember: tc.remember}),
+				}, ssh.WithHandshakeTimeout(time.Second))
+				connector.AcceptNewHostKey.Store(true)
 				defer func() {
-					if err := client.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-						t.Errorf("close SSH client: %v", err)
+					if err := connector.CloseAll(); err != nil {
+						t.Errorf("close connector: %v", err)
 					}
 				}()
-			}
-			disk, err := diskStore.Load()
-			if err != nil {
+				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+				defer cancel()
+				client, connectErr := connector.Connect(ctx, nodeID)
+				if (connectErr == nil) != tc.success {
+					t.Fatalf("connect success = %v, error = %v", tc.success, connectErr)
+				}
+				if client != nil {
+					if err := adp.FinalizePendingConnection(ctx, lease, client); err != nil {
+						t.Fatalf("FinalizePendingConnection: %v", err)
+					}
+					defer func() {
+						if err := client.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+							t.Errorf("close SSH client: %v", err)
+						}
+					}()
+				}
+				verifyPreparedNodePersistence(t, ctx, diskStore, path, original, secrets, client, nodeID, tc.password, tc.remember, tc.success)
+				return nil
+			}); err != nil {
 				t.Fatal(err)
 			}
-			node, saved := disk.Nodes.Get(prepared.NodeID)
-			if saved != tc.success {
-				t.Fatalf("saved node = %v, expected %v", saved, tc.success)
-			}
-			if !tc.success {
-				current, err := os.ReadFile(path)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if string(current) != string(original) || len(secrets.data) != 0 {
-					t.Fatal("failed authentication modified configuration or credentials")
-				}
-				return
-			}
-			identity, ok := disk.Identities.Get(node.IdentityRef)
-			if !ok || identity.Password != "" || (identity.LoginPasswordRef != nil) != tc.remember {
-				t.Fatal("node was not saved before credential recording, or remember policy was bypassed")
-			}
-			if tc.remember {
-				secret, err := secrets.Get(ctx, *identity.LoginPasswordRef)
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer secret.Zero()
-				if string(secret.Value) != tc.password {
-					t.Fatal("remembered credential does not match authenticated password")
-				}
-			}
-			assertCommandFailureKeepsNode(t, client, diskStore, prepared.NodeID)
 		})
 	}
+}
+
+func verifyPreparedNodePersistence(
+	t *testing.T,
+	ctx context.Context,
+	diskStore config.Store,
+	path string,
+	original []byte,
+	secrets *adapterCredentialStore,
+	client *ssh.Client,
+	nodeID, password string,
+	remember, success bool,
+) {
+	t.Helper()
+	disk, err := diskStore.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, saved := disk.Nodes.Get(nodeID)
+	if saved != success {
+		t.Fatalf("saved node = %v, expected %v", saved, success)
+	}
+	if !success {
+		current, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(current) != string(original) || len(secrets.data) != 0 {
+			t.Fatal("failed authentication modified configuration or credentials")
+		}
+		return
+	}
+	identity, ok := disk.Identities.Get(node.IdentityRef)
+	if !ok || identity.Password != "" || (identity.LoginPasswordRef != nil) != remember {
+		t.Fatal("node was not saved before credential recording, or remember policy was bypassed")
+	}
+	if remember {
+		secret, err := secrets.Get(ctx, *identity.LoginPasswordRef)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer secret.Zero()
+		if string(secret.Value) != password {
+			t.Fatal("remembered credential does not match authenticated password")
+		}
+	}
+	assertCommandFailureKeepsNode(t, client, diskStore, nodeID)
 }
 
 func pendingAdapterRepository(t *testing.T) (*config.Repository, config.Store, string, []byte) {

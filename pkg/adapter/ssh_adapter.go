@@ -504,13 +504,30 @@ func WithStrictIsolation() Option {
 	}
 }
 
-// WithSuppressNodeConfirmation prevents ConfirmConnection from committing pending
+// WithSuppressNodeConfirmation prevents FinalizePendingConnection from committing pending
 // ad-hoc nodes to persistent configuration (e.g., under --remember=never or in
 // detached background child processes).
 func WithSuppressNodeConfirmation(suppress bool) Option {
 	return func(a *SSHAdapter) {
 		a.suppressNodeConfirmation = suppress
 	}
+}
+
+type deferredAuthUpdate struct {
+	authUpdateToken string
+	password        []byte
+	keyPath         string
+	passphrase      []byte
+}
+
+func (d *deferredAuthUpdate) zero() {
+	if d == nil {
+		return
+	}
+	clear(d.password)
+	clear(d.passphrase)
+	d.password = nil
+	d.passphrase = nil
 }
 
 // SSHAdapter 实现 ssh.ConnectionProvider, ssh.SecretResolver, ssh.CredentialRecorder 接口，作为业务模型与底层 SSH 的防腐层
@@ -539,6 +556,8 @@ type SSHAdapter struct {
 	enrollmentProbeExcluded  map[string]struct{}
 	batchModeMu              sync.RWMutex
 	batchModeLatched         map[string]bool
+	deferredAuthMu           sync.Mutex
+	deferredAuth             map[string]*deferredAuthUpdate
 }
 
 // WithCredentialService injects the transactional writer used when an
@@ -591,8 +610,20 @@ func NewConnector(cfgProvider config.ConfigProvider, opts ...ssh.Option) *ssh.Co
 
 // NewConnectorWithAdapterOptions 创建组装好 Adapter 选项和 SSH 选项的 Connector
 func NewConnectorWithAdapterOptions(cfgProvider config.ConfigProvider, adpOpts []Option, sshOpts ...ssh.Option) *ssh.Connector {
+	connector, _ := NewConnectorAndAdapter(cfgProvider, adpOpts, sshOpts...)
+	return connector
+}
+
+// NewConnectorAndAdapter constructs both the SSHAdapter and its bound Connector
+// so callers can run FinalizePendingConnection after Connect succeeds.
+func NewConnectorAndAdapter(cfgProvider config.ConfigProvider, adpOpts []Option, sshOpts ...ssh.Option) (*ssh.Connector, *SSHAdapter) {
 	adp := NewSSHAdapter(cfgProvider, adpOpts...)
-	return newConnector(adp, sshOpts...)
+	return newConnector(adp, sshOpts...), adp
+}
+
+// NewConnector builds an ssh.Connector bound to this adapter.
+func (a *SSHAdapter) NewConnector(opts ...ssh.Option) *ssh.Connector {
+	return newConnector(a, opts...)
 }
 
 // NewConnectorWithInteraction creates a connector with a presentation-layer
@@ -843,29 +874,6 @@ func (a *SSHAdapter) ExpandControlPath(nodeID string, rawPath string) (string, e
 	}
 	env := sshenv.Discover()
 	return ssh.ExpandControlPath(rawPath, env, pol.controlTargetContextWithEnv(nodeID, env))
-}
-
-// ConfirmConnection publishes a prepared node before credentials are recorded.
-// Providers without pending connections require no additional mutation.
-func (a *SSHAdapter) ConfirmConnection(ctx context.Context, nodeID string) error {
-	if a.suppressNodeConfirmation {
-		return nil
-	}
-	if auth, ok := a.getSessionOverride(nodeID); ok && auth.SuppressNodeConfirmation {
-		return nil
-	}
-	if nodeID != "" && a.cfgProvider != nil {
-		_, _ = a.Resolve(ctx, ResolveRequest{
-			NodeID:          nodeID,
-			AllowBatchLatch: true,
-		})
-	}
-	if provider, ok := a.cfgProvider.(interface {
-		ConfirmNodeContext(context.Context, string) error
-	}); ok {
-		return provider.ConfirmNodeContext(ctx, nodeID)
-	}
-	return nil
 }
 
 // SessionAuthMaterial captures typed session-level authentication inputs used
@@ -1154,6 +1162,14 @@ func (a *SSHAdapter) UpdateAuth(ctx context.Context, nodeID, authUpdateToken, pa
 	}
 	if override, ok := a.getSessionOverride(nodeID); ok && !override.Remember {
 		// 显式指定 session-only 覆盖，不写回持久化配置
+		return authUpdateToken, nil
+	}
+	if a.isPendingNode(nodeID) {
+		// Defer credential persistence until the caller explicitly confirms
+		// the scoped PendingLease via FinalizePendingConnection.
+		if password != "" || passphrase != "" {
+			a.stageDeferredAuth(nodeID, authUpdateToken, password, keyPath, passphrase)
+		}
 		return authUpdateToken, nil
 	}
 	if password != "" || passphrase != "" {

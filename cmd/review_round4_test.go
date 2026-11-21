@@ -209,39 +209,40 @@ func TestRound4_P1_3_ResolveAndCacheSessionOptionsPreservesDerivedAndSavedTiers(
 	repo := buildPass6Repo(t, sshCfg)
 
 	// 1. ProvenanceOpenSSHDerived (`xops ssh -l bob myalias`)
-	prep, err := repo.PrepareNodeContext(t.Context(), config.EnsureNodeOptions{
+	if err := repo.WithPendingNode(t.Context(), config.EnsureNodeOptions{
 		Target: config.ConnectionTarget{
 			Selector: "myalias",
 			User:     "bob",
 			HasUser:  true,
 		},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(myalias -l bob): %v", err)
-	}
-	o := NewSshOptions()
-	o.Host = "myalias"
-	o.User = "bob"
-	o.Target = config.ConnectionTarget{Selector: "myalias", User: "bob", HasUser: true}
+	}, func(lease config.PendingLease) error {
+		o := NewSshOptions()
+		o.Host = "myalias"
+		o.User = "bob"
+		o.Target = config.ConnectionTarget{Selector: "myalias", User: "bob", HasUser: true}
 
-	eff, err := o.resolveAndCacheSessionOptions(repo, prep.NodeID)
-	if err != nil {
-		t.Fatalf("resolveAndCacheSessionOptions(derived %q): %v", prep.NodeID, err)
-	}
-	if eff == nil {
-		t.Fatal("expected non-nil effective options")
-	}
-	if len(eff.LocalForwards()) == 0 {
-		t.Fatalf("ProvenanceOpenSSHDerived LocalForward stripped: %v", eff)
-	}
-	if fork, ok := eff.ForkAfterAuthentication(); !ok || !fork {
-		t.Fatalf("ProvenanceOpenSSHDerived ForkAfterAuthentication = (%v, %v), want (true, true)", fork, ok)
-	}
-	if eff.Get(xssh.OptionRemoteCommand) != "echo hello" {
-		t.Fatalf("ProvenanceOpenSSHDerived RemoteCommand = %q, want 'echo hello'", eff.Get(xssh.OptionRemoteCommand))
-	}
-	if eff.Get(xssh.OptionLocalCommand) != "true" {
-		t.Fatalf("ProvenanceOpenSSHDerived LocalCommand = %q, want 'true'", eff.Get(xssh.OptionLocalCommand))
+		eff, err := o.resolveAndCacheSessionOptions(repo, lease.NodeID())
+		if err != nil {
+			t.Fatalf("resolveAndCacheSessionOptions(derived %q): %v", lease.NodeID(), err)
+		}
+		if eff == nil {
+			t.Fatal("expected non-nil effective options")
+		}
+		if len(eff.LocalForwards()) == 0 {
+			t.Fatalf("ProvenanceOpenSSHDerived LocalForward stripped: %v", eff)
+		}
+		if fork, ok := eff.ForkAfterAuthentication(); !ok || !fork {
+			t.Fatalf("ProvenanceOpenSSHDerived ForkAfterAuthentication = (%v, %v), want (true, true)", fork, ok)
+		}
+		if eff.Get(xssh.OptionRemoteCommand) != "echo hello" {
+			t.Fatalf("ProvenanceOpenSSHDerived RemoteCommand = %q, want 'echo hello'", eff.Get(xssh.OptionRemoteCommand))
+		}
+		if eff.Get(xssh.OptionLocalCommand) != "true" {
+			t.Fatalf("ProvenanceOpenSSHDerived LocalCommand = %q, want 'true'", eff.Get(xssh.OptionLocalCommand))
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode(myalias -l bob): %v", err)
 	}
 
 	// 2. ProvenanceSavedManaged with an alias selector that differs from NodeID
@@ -419,63 +420,64 @@ func TestRound4_P2_23_ExecScpCanonicalizedDaemonHandoffAndResolveMasterNodeID(t 
 	repo := buildPass6Repo(t, sshCfg)
 
 	// Prepare via real flow (wildcard Pass-2; no manual SetNodeCanonicalHost on openssh:<canon>).
-	prep, err := repo.PrepareNodeContext(ctx, config.EnsureNodeOptions{
+	if err := repo.WithPendingNode(ctx, config.EnsureNodeOptions{
 		Target: config.ConnectionTarget{
 			Selector:     "short.corp.example.com",
 			OriginalHost: "short",
 		},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext: %v", err)
-	}
+	}, func(lease config.PendingLease) error {
+		nodeID := lease.NodeID()
+		tmpDir := shortControlTempDir(t)
+		sockPath := filepath.Join(tmpDir, "exec-canon.sock")
+		adp := adapter.NewSSHAdapter(
+			repo,
+			adapter.WithNonInteractive(true),
+			adapter.WithSessionAuthOverride(nodeID, adapter.SessionAuth{
+				Password:      sshfixture.Password,
+				OriginalHost:  "short",
+				CanonicalHost: "short.corp.example.com",
+			}),
+			adapter.WithSessionControlOverride(nodeID, newPass6SessionControl(t, sockPath)),
+		)
+		connector := newPass6Connector(adp)
+		defer func() { _ = connector.CloseAll() }()
 
-	tmpDir := shortControlTempDir(t)
-	sockPath := filepath.Join(tmpDir, "exec-canon.sock")
-	adp := adapter.NewSSHAdapter(
-		repo,
-		adapter.WithNonInteractive(true),
-		adapter.WithSessionAuthOverride(prep.NodeID, adapter.SessionAuth{
-			Password:      sshfixture.Password,
-			OriginalHost:  "short",
-			CanonicalHost: "short.corp.example.com",
-		}),
-		adapter.WithSessionControlOverride(prep.NodeID, newPass6SessionControl(t, sockPath)),
-	)
-	connector := newPass6Connector(adp)
-	defer func() { _ = connector.CloseAll() }()
+		client, err := connector.Connect(ctx, nodeID)
+		if err != nil {
+			t.Fatalf("connector.Connect(%q): %v", nodeID, err)
+		}
+		defer func() { _ = client.Close() }()
 
-	client, err := connector.Connect(ctx, prep.NodeID)
-	if err != nil {
-		t.Fatalf("connector.Connect(%q): %v", prep.NodeID, err)
-	}
-	defer func() { _ = client.Close() }()
+		m := connector.Masters()[0]
+		rawOwnedID := strings.TrimSpace(connector.MasterNodeID(m))
+		if m.Target().CanonicalHost != "short.corp.example.com" {
+			t.Fatalf("master.Target().CanonicalHost = %q, want short.corp.example.com", m.Target().CanonicalHost)
+		}
+		wantCanonID := config.OpenSSHNodePrefix + "short.corp.example.com"
+		if got := resolveOwnedMasterNodeID(repo, connector, m); got != wantCanonID {
+			t.Fatalf("resolveOwnedMasterNodeID = %q, want %q", got, wantCanonID)
+		}
+		if got := resolveMasterNodeID(repo, m); got != wantCanonID {
+			t.Fatalf("resolveMasterNodeID = %q, want %q", got, wantCanonID)
+		}
 
-	m := connector.Masters()[0]
-	rawOwnedID := strings.TrimSpace(connector.MasterNodeID(m))
-	if m.Target().CanonicalHost != "short.corp.example.com" {
-		t.Fatalf("master.Target().CanonicalHost = %q, want short.corp.example.com", m.Target().CanonicalHost)
-	}
-	wantCanonID := config.OpenSSHNodePrefix + "short.corp.example.com"
-	if got := resolveOwnedMasterNodeID(repo, connector, m); got != wantCanonID {
-		t.Fatalf("resolveOwnedMasterNodeID = %q, want %q", got, wantCanonID)
-	}
-	if got := resolveMasterNodeID(repo, m); got != wantCanonID {
-		t.Fatalf("resolveMasterNodeID = %q, want %q", got, wantCanonID)
-	}
+		// Simulate exec/scp handoff (batchOpts.canonicalized == false).
+		batchOpts := NewSshOptions()
+		spec := batchOpts.buildMuxDaemonSpecWithRawNode(repo, wantCanonID, rawOwnedID, sockPath, m)
+		if !spec.Canonicalized || spec.OriginalHost != "short" || spec.TargetHost != "short.corp.example.com" || !spec.OpenSSHNamespace {
+			t.Fatalf("exec/scp MuxDaemonSpec dropped canonical metadata: %+v", spec)
+		}
 
-	// Simulate exec/scp handoff (batchOpts.canonicalized == false).
-	batchOpts := NewSshOptions()
-	spec := batchOpts.buildMuxDaemonSpecWithRawNode(repo, wantCanonID, rawOwnedID, sockPath, m)
-	if !spec.Canonicalized || spec.OriginalHost != "short" || spec.TargetHost != "short.corp.example.com" || !spec.OpenSSHNamespace {
-		t.Fatalf("exec/scp MuxDaemonSpec dropped canonical metadata: %+v", spec)
-	}
-
-	// Confirmed saved node still resolves user-pending fallback metadata.
-	if err := repo.ConfirmNodeContext(ctx, prep.NodeID); err != nil {
-		t.Fatalf("ConfirmNodeContext: %v", err)
-	}
-	if got := resolveMasterNodeIDViaUserPending(repo, "short", fixHost, "fixture", uint16(portNum)); got != wantCanonID {
-		t.Fatalf("resolveMasterNodeIDViaUserPending after ConfirmNodeContext = %q, want %q", got, wantCanonID)
+		// Confirmed saved node still resolves user-pending fallback metadata.
+		if err := lease.Confirm(ctx); err != nil {
+			t.Fatalf("lease.Confirm: %v", err)
+		}
+		if got := resolveMasterNodeIDViaUserPending(repo, "short", fixHost, "fixture", uint16(portNum)); got != wantCanonID {
+			t.Fatalf("resolveMasterNodeIDViaUserPending after lease.Confirm = %q, want %q", got, wantCanonID)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode: %v", err)
 	}
 }
 

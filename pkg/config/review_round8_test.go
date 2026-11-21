@@ -124,19 +124,20 @@ func TestRound8_P1_7_ConcreteHostAddressAndHostAliasValidationAcrossAllPersisten
 	// 3. OPENSSH:victim is handled case-insensitively as a read-only OpenSSH virtual
 	// selector (never persisted as a concrete host), while double-prefixed selectors
 	// and concrete Host.Address values with OPENSSH: are rejected fail-closed.
-	prepVirt, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{Selector: "OPENSSH:victim", User: "ops", HasUser: true},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(OPENSSH:victim) unexpected error: %v", err)
+	}, func(lease PendingLease) error {
+		if repo.IsPendingNode(lease.NodeID()) || !IsOpenSSHNodeID(lease.NodeID()) {
+			t.Fatalf("WithPendingNode(OPENSSH:victim) = %q pending=%v, want read-only OpenSSH virtual node", lease.NodeID(), repo.IsPendingNode(lease.NodeID()))
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode(OPENSSH:victim) unexpected error: %v", err)
 	}
-	if prepVirt.Created || !IsOpenSSHNodeID(prepVirt.NodeID) {
-		t.Fatalf("PrepareNodeContext(OPENSSH:victim) = %+v, want read-only OpenSSH virtual node (Created=false)", prepVirt)
-	}
-	if _, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{Selector: "openssh:OPENSSH:victim", User: "ops", HasUser: true},
-	}); err == nil {
-		t.Fatal("PrepareNodeContext accepted double-prefixed openssh:OPENSSH:victim")
+	}, func(PendingLease) error { return nil }); err == nil {
+		t.Fatal("WithPendingNode accepted double-prefixed openssh:OPENSSH:victim")
 	}
 	if _, err := repo.CreateNodeContext(t.Context(), "bad-concrete-host",
 		models.Node{HostRef: "h-bad", IdentityRef: "id-bad"},

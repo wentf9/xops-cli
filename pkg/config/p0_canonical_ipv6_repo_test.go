@@ -619,67 +619,69 @@ Host role-b
 		t.Fatal(err)
 	}
 
-	prepA, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{Selector: "role-a", User: "ops", HasUser: true},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(role-a): %v", err)
-	}
-	prepB, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
-		Target: ConnectionTarget{Selector: "role-b", User: "ops", HasUser: true},
-	})
-	if err != nil || !IsOpenSSHNodeID(prepB.NodeID) {
-		t.Fatalf("PrepareNodeContext(role-b) = (%+v, %v), want disambiguated openssh: ID", prepB, err)
-	}
+	}, func(leaseA PendingLease) error {
+		return repo.WithPendingNode(t.Context(), EnsureNodeOptions{
+			Target: ConnectionTarget{Selector: "role-b", User: "ops", HasUser: true},
+		}, func(leaseB PendingLease) error {
+			if !IsOpenSSHNodeID(leaseB.NodeID()) {
+				t.Fatalf("WithPendingNode(role-b) = %q, want disambiguated openssh: ID", leaseB.NodeID())
+			}
 
-	repo.SetNodeOpenSSHOrigin(prepA.NodeID, OpenSSHOrigin{Alias: "custom-a", CanonicalHost: "a.corp.example.com"})
-	if got := repo.NodeOpenSSHOrigin(prepA.NodeID); got != (OpenSSHOrigin{Alias: "custom-a", CanonicalHost: "a.corp.example.com"}) {
-		t.Fatalf("NodeOpenSSHOrigin after Set = %+v", got)
-	}
-	repo.SetNodeCanonicalHost(prepA.NodeID, "a2.corp.example.com")
-	if got := repo.NodeCanonicalHost(prepA.NodeID); got != "a2.corp.example.com" {
-		t.Fatalf("NodeCanonicalHost after Set = %q", got)
-	}
-	repo.SetNodeOpenSSHAlias(prepA.NodeID, "alias-a2")
-	if got := repo.NodeOpenSSHAlias(prepA.NodeID); got != "alias-a2" {
-		t.Fatalf("NodeOpenSSHAlias after Set = %q", got)
-	}
-	repo.ClearNodeOpenSSHOrigin(prepA.NodeID)
-	if got := repo.NodeOpenSSHOrigin(prepA.NodeID); !got.IsZero() {
-		t.Fatalf("NodeOpenSSHOrigin after Clear = %+v, want zero", got)
-	}
+			repo.SetNodeOpenSSHOrigin(leaseA.NodeID(), OpenSSHOrigin{Alias: "custom-a", CanonicalHost: "a.corp.example.com"})
+			if got := repo.NodeOpenSSHOrigin(leaseA.NodeID()); got != (OpenSSHOrigin{Alias: "custom-a", CanonicalHost: "a.corp.example.com"}) {
+				t.Fatalf("NodeOpenSSHOrigin after Set = %+v", got)
+			}
+			repo.SetNodeCanonicalHost(leaseA.NodeID(), "a2.corp.example.com")
+			if got := repo.NodeCanonicalHost(leaseA.NodeID()); got != "a2.corp.example.com" {
+				t.Fatalf("NodeCanonicalHost after Set = %q", got)
+			}
+			repo.SetNodeOpenSSHAlias(leaseA.NodeID(), "alias-a2")
+			if got := repo.NodeOpenSSHAlias(leaseA.NodeID()); got != "alias-a2" {
+				t.Fatalf("NodeOpenSSHAlias after Set = %q", got)
+			}
+			repo.ClearNodeOpenSSHOrigin(leaseA.NodeID())
+			if got := repo.NodeOpenSSHOrigin(leaseA.NodeID()); !got.IsZero() {
+				t.Fatalf("NodeOpenSSHOrigin after Clear = %+v, want zero", got)
+			}
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		for range 20 {
-			repo.SetNodeOpenSSHOrigin(prepA.NodeID, OpenSSHOrigin{Alias: "race-a", CanonicalHost: "race.corp"})
-			_ = repo.NodeOpenSSHOrigin(prepA.NodeID)
-			_, _ = repo.ResolveConnection(prepA.NodeID)
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		for range 20 {
-			repo.SetNodeOpenSSHOrigin(prepB.NodeID, OpenSSHOrigin{Alias: "race-b", CanonicalHost: "race-b.corp"})
-			_ = repo.NodeOpenSSHOrigin(prepB.NodeID)
-		}
-	}()
-	wg.Wait()
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				for range 20 {
+					repo.SetNodeOpenSSHOrigin(leaseA.NodeID(), OpenSSHOrigin{Alias: "race-a", CanonicalHost: "race.corp"})
+					_ = repo.NodeOpenSSHOrigin(leaseA.NodeID())
+					_, _ = repo.ResolveConnection(leaseA.NodeID())
+				}
+			}()
+			go func() {
+				defer wg.Done()
+				for range 20 {
+					repo.SetNodeOpenSSHOrigin(leaseB.NodeID(), OpenSSHOrigin{Alias: "race-b", CanonicalHost: "race-b.corp"})
+					_ = repo.NodeOpenSSHOrigin(leaseB.NodeID())
+				}
+			}()
+			wg.Wait()
 
-	if err := repo.ConfirmNodeContext(t.Context(), prepB.NodeID); err != nil {
-		t.Fatalf("ConfirmNodeContext(prepB): %v", err)
-	}
-	repo.pendingMu.RLock()
-	_, stillPendingB := repo.pending[prepB.NodeID]
-	repo.pendingMu.RUnlock()
-	if stillPendingB {
-		t.Fatalf("disambiguated pending entry %q leaked in r.pending after ConfirmNodeContext", prepB.NodeID)
-	}
+			if err := leaseB.Confirm(t.Context()); err != nil {
+				t.Fatalf("leaseB.Confirm: %v", err)
+			}
+			repo.pendingMu.RLock()
+			_, stillPendingB := repo.pending[leaseB.NodeID()]
+			repo.pendingMu.RUnlock()
+			if stillPendingB {
+				t.Fatalf("disambiguated pending entry %q leaked in r.pending after Confirm", leaseB.NodeID())
+			}
 
-	if err := repo.ConfirmNodeContext(t.Context(), prepA.NodeID); err != nil {
-		t.Fatalf("ConfirmNodeContext(prepA): %v", err)
+			if err := leaseA.Confirm(t.Context()); err != nil {
+				t.Fatalf("leaseA.Confirm: %v", err)
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("WithPendingNode: %v", err)
 	}
 	repo.pendingMu.RLock()
 	remaining := len(repo.pending)
@@ -896,28 +898,27 @@ Host a2
 		t.Fatal(err)
 	}
 	ovProv := ov.(*openSSHOverrideProvider)
-	if _, err := ovProv.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	var res2ID string
+	if err := ovProv.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{Selector: "a1", User: "ops", HasUser: true},
+	}, func(PendingLease) error {
+		return ovProv.WithPendingNode(t.Context(), EnsureNodeOptions{
+			Target: ConnectionTarget{Selector: "a2", User: "ops", HasUser: true},
+		}, func(lease2 PendingLease) error {
+			res2ID = lease2.NodeID()
+			if !IsOpenSSHNodeID(res2ID) {
+				t.Fatalf("expected openssh: disambiguated ID, got %q", res2ID)
+			}
+			return lease2.Confirm(t.Context())
+		})
 	}); err != nil {
 		t.Fatal(err)
 	}
-	res2, err := ovProv.PrepareNodeContext(t.Context(), EnsureNodeOptions{
-		Target: ConnectionTarget{Selector: "a2", User: "ops", HasUser: true},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !IsOpenSSHNodeID(res2.NodeID) {
-		t.Fatalf("expected openssh: disambiguated ID, got %q", res2.NodeID)
-	}
-	if err := ovProv.ConfirmNodeContext(t.Context(), res2.NodeID); err != nil {
-		t.Fatal(err)
-	}
 	ovProv.repo.pendingMu.RLock()
-	_, stillPresent := ovProv.repo.pending[res2.NodeID]
+	_, stillPresent := ovProv.repo.pending[res2ID]
 	ovProv.repo.pendingMu.RUnlock()
 	if stillPresent {
-		t.Fatalf("override provider leaked pending entry %q", res2.NodeID)
+		t.Fatalf("override provider leaked pending entry %q", res2ID)
 	}
 	// Verify errors.Is sanity for ErrCanonicalizeFailed.
 	if !errors.Is(fmt.Errorf("%w: x", ErrCanonicalizeFailed), ErrCanonicalizeFailed) {

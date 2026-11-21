@@ -252,22 +252,24 @@ func verifyRound7UnpersistedJumpPrecedence(t *testing.T, repo *config.Repository
 		t.Fatalf("openssh:edge-v unexpected proxy resolution: jump=%q cmd=%q", cfgVirtual.ProxyJump, cfgVirtual.Options.ActiveProxyCommand())
 	}
 
-	// End-to-end ProvenanceOpenSSHDerived via PrepareNodeContext with composite admin@edge-v:
-	prepDerived, err := repo.PrepareNodeContext(t.Context(), config.EnsureNodeOptions{
+	// End-to-end ProvenanceOpenSSHDerived via WithPendingNode with composite admin@edge-v:
+	if err := repo.WithPendingNode(t.Context(), config.EnsureNodeOptions{
 		Target: config.ConnectionTarget{Selector: "edge-v", User: "admin", HasUser: true},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(admin@edge-v): %v", err)
-	}
-	if snapDerived, err := repo.ResolveConnection(prepDerived.NodeID); err != nil || snapDerived.Provenance != config.ProvenanceOpenSSHDerived {
-		t.Fatalf("ResolveConnection(%q) = (%v, %v), want ProvenanceOpenSSHDerived", prepDerived.NodeID, snapDerived.Provenance, err)
-	}
-	cfgDerived, err := adpMCP.GetConfig(prepDerived.NodeID)
-	if err != nil {
-		t.Fatalf("GetConfig(%q non-interactive): %v", prepDerived.NodeID, err)
-	}
-	if cfgDerived.ProxyJump != "openssh:bastion-t4" || (cfgDerived.Options != nil && cfgDerived.Options.ActiveProxyCommand() != "") {
-		t.Fatalf("ProvenanceOpenSSHDerived %q leaked T4 ProxyCommand: jump=%q cmd=%q", prepDerived.NodeID, cfgDerived.ProxyJump, cfgDerived.Options.ActiveProxyCommand())
+	}, func(lease config.PendingLease) error {
+		nodeID := lease.NodeID()
+		if snapDerived, err := repo.ResolveConnection(nodeID); err != nil || snapDerived.Provenance != config.ProvenanceOpenSSHDerived {
+			t.Fatalf("ResolveConnection(%q) = (%v, %v), want ProvenanceOpenSSHDerived", nodeID, snapDerived.Provenance, err)
+		}
+		cfgDerived, err := adpMCP.GetConfig(nodeID)
+		if err != nil {
+			t.Fatalf("GetConfig(%q non-interactive): %v", nodeID, err)
+		}
+		if cfgDerived.ProxyJump != "openssh:bastion-t4" || (cfgDerived.Options != nil && cfgDerived.Options.ActiveProxyCommand() != "") {
+			t.Fatalf("ProvenanceOpenSSHDerived %q leaked T4 ProxyCommand: jump=%q cmd=%q", nodeID, cfgDerived.ProxyJump, cfgDerived.Options.ActiveProxyCommand())
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode(admin@edge-v): %v", err)
 	}
 
 	// Pure unit check on resolveFourTierProxySetting as well.

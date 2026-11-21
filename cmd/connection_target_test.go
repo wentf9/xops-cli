@@ -82,26 +82,28 @@ func testSSHExplicitUserReusesHost(t *testing.T, ctx context.Context) {
 	if err := sshOpt.Validate(); err != nil {
 		t.Fatalf("validate failed: %v", err)
 	}
-	nodeID, created, err := sshOpt.resolveNode(ctx, repo)
-	if err != nil {
-		t.Fatalf("resolveNode failed: %v", err)
-	}
-	if !created || nodeID != "test@10.238.221.181:22" {
-		t.Errorf("ssh got nodeID=%q, created=%v, want test@10.238.221.181:22, true", nodeID, created)
-	}
-	snap := repo.Snapshot()
-	if len(snap.Hosts.Keys()) != 1 {
-		t.Errorf("expected host to be reused (1 host), got %d", len(snap.Hosts.Keys()))
-	}
-	node, _, ident, resolveErr := repo.Resolve(nodeID)
-	if resolveErr != nil || node.ProxyJump != "jump-01" {
-		t.Errorf("expected inherited ProxyJump 'jump-01', got %+v", node)
-	}
-	if len(node.Alias) != 0 || len(node.Tags) != 0 {
-		t.Errorf("new node must not inherit alias/tags, got %+v", node)
-	}
-	if ident.User != "test" || ident.Password != "" {
-		t.Errorf("new identity must exist and not inherit secretPassword, got %+v", ident)
+	if err := sshOpt.withTestPendingNode(ctx, repo, func(lease config.PendingLease) error {
+		nodeID := lease.NodeID()
+		if !repo.IsPendingNode(nodeID) || nodeID != "test@10.238.221.181:22" {
+			t.Errorf("ssh got nodeID=%q, pending=%v, want test@10.238.221.181:22, true", nodeID, repo.IsPendingNode(nodeID))
+		}
+		snap := repo.Snapshot()
+		if len(snap.Hosts.Keys()) != 1 {
+			t.Errorf("expected host to be reused (1 host), got %d", len(snap.Hosts.Keys()))
+		}
+		node, _, ident, resolveErr := repo.Resolve(nodeID)
+		if resolveErr != nil || node.ProxyJump != "jump-01" {
+			t.Errorf("expected inherited ProxyJump 'jump-01', got %+v", node)
+		}
+		if len(node.Alias) != 0 || len(node.Tags) != 0 {
+			t.Errorf("new node must not inherit alias/tags, got %+v", node)
+		}
+		if ident.User != "test" || ident.Password != "" {
+			t.Errorf("new identity must exist and not inherit secretPassword, got %+v", ident)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingNode failed: %v", err)
 	}
 }
 
@@ -112,16 +114,18 @@ func testSFTPExplicitUserReusesHost(t *testing.T, ctx context.Context) {
 	if err := sftpOpt.Validate(); err != nil {
 		t.Fatalf("validate failed: %v", err)
 	}
-	nodeID, created, err := sftpOpt.resolveNode(ctx, repo)
-	if err != nil {
-		t.Fatalf("resolveNode failed: %v", err)
-	}
-	if !created || nodeID != "test@10.238.221.181:22" {
-		t.Errorf("sftp got nodeID=%q, created=%v, want test@10.238.221.181:22, true", nodeID, created)
-	}
-	snap := repo.Snapshot()
-	if len(snap.Hosts.Keys()) != 1 {
-		t.Errorf("expected host to be reused (1 host), got %d", len(snap.Hosts.Keys()))
+	if err := sftpOpt.withTestPendingNode(ctx, repo, func(lease config.PendingLease) error {
+		nodeID := lease.NodeID()
+		if !repo.IsPendingNode(nodeID) || nodeID != "test@10.238.221.181:22" {
+			t.Errorf("sftp got nodeID=%q, pending=%v, want test@10.238.221.181:22, true", nodeID, repo.IsPendingNode(nodeID))
+		}
+		snap := repo.Snapshot()
+		if len(snap.Hosts.Keys()) != 1 {
+			t.Errorf("expected host to be reused (1 host), got %d", len(snap.Hosts.Keys()))
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingNode failed: %v", err)
 	}
 }
 
@@ -134,16 +138,18 @@ func testSCPExplicitUserReusesHost(t *testing.T, ctx context.Context) {
 	if err != nil {
 		t.Fatalf("parsePath failed: %v", err)
 	}
-	nodeID, created, err := scpOpt.getOrCreateNodeForPath(ctx, repo, dst, "")
-	if err != nil {
-		t.Fatalf("getOrCreateNodeForPath failed: %v", err)
-	}
-	if !created || nodeID != "test@10.238.221.181:22" {
-		t.Errorf("scp got nodeID=%q, created=%v, want test@10.238.221.181:22, true", nodeID, created)
-	}
-	snap := repo.Snapshot()
-	if len(snap.Hosts.Keys()) != 1 {
-		t.Errorf("expected host to be reused (1 host), got %d", len(snap.Hosts.Keys()))
+	if err := scpOpt.withTestPendingPath(ctx, repo, dst, "", func(lease config.PendingLease) error {
+		nodeID := lease.NodeID()
+		if !repo.IsPendingNode(nodeID) || nodeID != "test@10.238.221.181:22" {
+			t.Errorf("scp got nodeID=%q, pending=%v, want test@10.238.221.181:22, true", nodeID, repo.IsPendingNode(nodeID))
+		}
+		snap := repo.Snapshot()
+		if len(snap.Hosts.Keys()) != 1 {
+			t.Errorf("expected host to be reused (1 host), got %d", len(snap.Hosts.Keys()))
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingPath failed: %v", err)
 	}
 }
 
@@ -151,16 +157,20 @@ func testExecExplicitUserReusesHost(t *testing.T, ctx context.Context) {
 	repo := setupTestRepository(t)
 	execOpt := NewExecOptions()
 	execOpt.Host = "test@10.238.221.181"
-	tasks, hostErrs, err := execOpt.buildTasksFromHosts(ctx, repo)
-	if err != nil || len(hostErrs) > 0 {
-		t.Fatalf("buildTasksFromHosts failed: err=%v, hostErrs=%v", err, hostErrs)
-	}
-	if len(tasks) != 1 || tasks[0].nodeID != "test@10.238.221.181:22" {
-		t.Errorf("exec got tasks=%+v, want 1 task with nodeID=test@10.238.221.181:22", tasks)
-	}
-	snap := repo.Snapshot()
-	if len(snap.Hosts.Keys()) != 1 {
-		t.Errorf("expected host to be reused (1 host), got %d", len(snap.Hosts.Keys()))
+	if err := execOpt.withTestPendingHostTasks(ctx, repo, func(tasks []execHostTask, _ []config.PendingLease, hostErrs []error) error {
+		if len(hostErrs) > 0 {
+			t.Fatalf("withTestPendingHostTasks hostErrs=%v", hostErrs)
+		}
+		if len(tasks) != 1 || tasks[0].nodeID != "test@10.238.221.181:22" {
+			t.Errorf("exec got tasks=%+v, want 1 task with nodeID=test@10.238.221.181:22", tasks)
+		}
+		snap := repo.Snapshot()
+		if len(snap.Hosts.Keys()) != 1 {
+			t.Errorf("expected host to be reused (1 host), got %d", len(snap.Hosts.Keys()))
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingHostTasks failed: %v", err)
 	}
 }
 
@@ -175,12 +185,14 @@ func TestCommands_Consistency_AliasResolvesCanonicalNode(t *testing.T) {
 		if err := sshOpt.Validate(); err != nil {
 			t.Fatalf("validate failed: %v", err)
 		}
-		nodeID, created, err := sshOpt.resolveNode(ctx, repo)
-		if err != nil {
-			t.Fatalf("resolveNode failed: %v", err)
-		}
-		if !created || nodeID != "test@10.238.221.181:22" {
-			t.Errorf("got nodeID=%q, created=%v, want test@10.238.221.181:22, true", nodeID, created)
+		if err := sshOpt.withTestPendingNode(ctx, repo, func(lease config.PendingLease) error {
+			nodeID := lease.NodeID()
+			if !repo.IsPendingNode(nodeID) || nodeID != "test@10.238.221.181:22" {
+				t.Errorf("got nodeID=%q, pending=%v, want test@10.238.221.181:22, true", nodeID, repo.IsPendingNode(nodeID))
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("withTestPendingNode failed: %v", err)
 		}
 	})
 
@@ -189,12 +201,16 @@ func TestCommands_Consistency_AliasResolvesCanonicalNode(t *testing.T) {
 		repo := setupTestRepository(t)
 		execOpt := NewExecOptions()
 		execOpt.Host = "test@web-01"
-		tasks, hostErrs, err := execOpt.buildTasksFromHosts(ctx, repo)
-		if err != nil || len(hostErrs) > 0 {
-			t.Fatalf("buildTasksFromHosts failed: err=%v, hostErrs=%v", err, hostErrs)
-		}
-		if len(tasks) != 1 || tasks[0].nodeID != "test@10.238.221.181:22" {
-			t.Errorf("exec got tasks=%+v, want test@10.238.221.181:22", tasks)
+		if err := execOpt.withTestPendingHostTasks(ctx, repo, func(tasks []execHostTask, _ []config.PendingLease, hostErrs []error) error {
+			if len(hostErrs) > 0 {
+				t.Fatalf("withTestPendingHostTasks hostErrs=%v", hostErrs)
+			}
+			if len(tasks) != 1 || tasks[0].nodeID != "test@10.238.221.181:22" {
+				t.Errorf("exec got tasks=%+v, want test@10.238.221.181:22", tasks)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("withTestPendingHostTasks failed: %v", err)
 		}
 	})
 }
@@ -210,12 +226,14 @@ func TestCommands_Consistency_BareAddressSingleMatchesMultiAmbiguous(t *testing.
 		if err := sshOpt.Validate(); err != nil {
 			t.Fatalf("validate failed: %v", err)
 		}
-		nodeID, created, err := sshOpt.resolveNode(ctx, repo)
-		if err != nil {
-			t.Fatalf("resolveNode failed: %v", err)
-		}
-		if created || nodeID != "iaas@10.238.221.181:22" {
-			t.Errorf("got nodeID=%q, created=%v, want iaas@10.238.221.181:22, false", nodeID, created)
+		if err := sshOpt.withTestPendingNode(ctx, repo, func(lease config.PendingLease) error {
+			nodeID := lease.NodeID()
+			if repo.IsPendingNode(nodeID) || nodeID != "iaas@10.238.221.181:22" {
+				t.Errorf("got nodeID=%q, pending=%v, want iaas@10.238.221.181:22, false", nodeID, repo.IsPendingNode(nodeID))
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("withTestPendingNode failed: %v", err)
 		}
 	})
 
@@ -239,7 +257,7 @@ func TestCommands_Consistency_BareAddressSingleMatchesMultiAmbiguous(t *testing.
 		if err := sshOpt.Validate(); err != nil {
 			t.Fatalf("validate failed: %v", err)
 		}
-		_, _, err = sshOpt.resolveNode(ctx, repo)
+		err = sshOpt.withTestPendingNode(ctx, repo, func(config.PendingLease) error { return nil })
 		if err == nil {
 			t.Fatalf("expected ambiguous error for multi-user bare address, got nil")
 		}
@@ -250,8 +268,12 @@ func TestCommands_Consistency_BareAddressSingleMatchesMultiAmbiguous(t *testing.
 		// Exec with bare address also returns error
 		execOpt := NewExecOptions()
 		execOpt.Host = "10.238.221.181"
-		_, hostErrs, err := execOpt.buildTasksFromHosts(ctx, repo)
-		if len(hostErrs) == 0 && err == nil {
+		var execHostErrs []error
+		err = execOpt.withTestPendingHostTasks(ctx, repo, func(_ []execHostTask, _ []config.PendingLease, hostErrs []error) error {
+			execHostErrs = hostErrs
+			return nil
+		})
+		if len(execHostErrs) == 0 && err == nil {
 			t.Errorf("exec expected error for ambiguous bare address, got none")
 		}
 	})
@@ -267,20 +289,22 @@ func TestCommands_Consistency_ExplicitPort(t *testing.T) {
 	if err := sshOpt.Validate(); err != nil {
 		t.Fatalf("validate failed: %v", err)
 	}
-	nodeID, created, err := sshOpt.resolveNode(ctx, repo)
-	if err != nil {
-		t.Fatalf("resolveNode failed: %v", err)
-	}
-	if !created || nodeID != "test@10.238.221.181:2222" {
-		t.Errorf("got nodeID=%q, want test@10.238.221.181:2222", nodeID)
-	}
-	snap := repo.Snapshot()
-	if len(snap.Hosts.Keys()) != 1 {
-		t.Errorf("pending port must not create a saved host, got %d hosts", len(snap.Hosts.Keys()))
-	}
-	_, host, _, err := repo.Resolve(nodeID)
-	if err != nil || host.Port != 2222 {
-		t.Fatalf("pending connection port = %d, error = %v", host.Port, err)
+	if err := sshOpt.withTestPendingNode(ctx, repo, func(lease config.PendingLease) error {
+		nodeID := lease.NodeID()
+		if !repo.IsPendingNode(nodeID) || nodeID != "test@10.238.221.181:2222" {
+			t.Errorf("got nodeID=%q, want test@10.238.221.181:2222", nodeID)
+		}
+		snap := repo.Snapshot()
+		if len(snap.Hosts.Keys()) != 1 {
+			t.Errorf("pending port must not create a saved host, got %d hosts", len(snap.Hosts.Keys()))
+		}
+		_, host, _, err := repo.Resolve(nodeID)
+		if err != nil || host.Port != 2222 {
+			t.Fatalf("pending connection port = %d, error = %v", host.Port, err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingNode failed: %v", err)
 	}
 }
 
@@ -295,13 +319,15 @@ func TestCommands_SSH_FlagPrecedence(t *testing.T) {
 		if err := sshOpt.Validate(); err != nil {
 			t.Fatalf("validate failed: %v", err)
 		}
-		nodeID, created, err := sshOpt.resolveNode(ctx, repo)
-		if err != nil {
-			t.Fatalf("resolveNode failed: %v", err)
-		}
-		// Must use test, not iaas
-		if !created || nodeID != "test@10.238.221.181:22" {
-			t.Errorf("expected nodeID 'test@10.238.221.181:22', got %q (created=%v)", nodeID, created)
+		if err := sshOpt.withTestPendingNode(ctx, repo, func(lease config.PendingLease) error {
+			nodeID := lease.NodeID()
+			// Must use test, not iaas
+			if !repo.IsPendingNode(nodeID) || nodeID != "test@10.238.221.181:22" {
+				t.Errorf("expected nodeID 'test@10.238.221.181:22', got %q (pending=%v)", nodeID, repo.IsPendingNode(nodeID))
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("withTestPendingNode failed: %v", err)
 		}
 	})
 
@@ -313,13 +339,15 @@ func TestCommands_SSH_FlagPrecedence(t *testing.T) {
 		if err := sshOpt.Validate(); err != nil {
 			t.Fatalf("validate failed: %v", err)
 		}
-		nodeID, created, err := sshOpt.resolveNode(ctx, repo)
-		if err != nil {
-			t.Fatalf("resolveNode failed: %v", err)
-		}
-		// Must use 2222, not 22
-		if !created || nodeID != "test@10.238.221.181:2222" {
-			t.Errorf("expected nodeID 'test@10.238.221.181:2222', got %q", nodeID)
+		if err := sshOpt.withTestPendingNode(ctx, repo, func(lease config.PendingLease) error {
+			nodeID := lease.NodeID()
+			// Must use 2222, not 22
+			if !repo.IsPendingNode(nodeID) || nodeID != "test@10.238.221.181:2222" {
+				t.Errorf("expected nodeID 'test@10.238.221.181:2222', got %q", nodeID)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("withTestPendingNode failed: %v", err)
 		}
 	})
 }
@@ -332,23 +360,26 @@ func TestCommands_Exec_Sudo(t *testing.T) {
 	execOpt.Host = "test@10.238.221.181"
 	execOpt.Sudo = true
 
-	tasks, hostErrs, err := execOpt.buildTasksFromHosts(ctx, repo)
-	if err != nil || len(hostErrs) > 0 {
-		t.Fatalf("buildTasksFromHosts failed: err=%v, hostErrs=%v", err, hostErrs)
-	}
-	if len(tasks) != 1 || tasks[0].nodeID != "test@10.238.221.181:22" {
-		t.Fatalf("unexpected tasks: %+v", tasks)
-	}
-
-	node, _, _, resolveErr := repo.Resolve("test@10.238.221.181:22")
-	if resolveErr != nil {
-		t.Fatalf("node test@10.238.221.181:22 not found in snapshot")
-	}
-	if node.SudoMode != models.SudoModeSudo {
-		t.Errorf("expected SudoMode=%q, got %q", models.SudoModeSudo, node.SudoMode)
-	}
-	if node.SuPwd != "" {
-		t.Errorf("expected discovered sudo password to remain session-only, got %q", node.SuPwd)
+	if err := execOpt.withTestPendingHostTasks(ctx, repo, func(tasks []execHostTask, _ []config.PendingLease, hostErrs []error) error {
+		if len(hostErrs) > 0 {
+			t.Fatalf("withTestPendingHostTasks hostErrs=%v", hostErrs)
+		}
+		if len(tasks) != 1 || tasks[0].nodeID != "test@10.238.221.181:22" {
+			t.Fatalf("unexpected tasks: %+v", tasks)
+		}
+		node, _, _, resolveErr := repo.Resolve("test@10.238.221.181:22")
+		if resolveErr != nil {
+			t.Fatalf("node test@10.238.221.181:22 not found in snapshot")
+		}
+		if node.SudoMode != models.SudoModeSudo {
+			t.Errorf("expected SudoMode=%q, got %q", models.SudoModeSudo, node.SudoMode)
+		}
+		if node.SuPwd != "" {
+			t.Errorf("expected discovered sudo password to remain session-only, got %q", node.SuPwd)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingHostTasks failed: %v", err)
 	}
 }
 
@@ -359,29 +390,43 @@ func TestCommands_ExistingNodeCredentialsStayOutOfConfiguration(t *testing.T) {
 	sshOpt.Password = "new-synthetic-password"
 	sshOpt.Target = config.ConnectionTarget{Selector: "10.238.221.181", User: "iaas", HasUser: true}
 
-	nodeID, _, err := sshOpt.resolveNode(t.Context(), repo)
-	if err != nil {
-		t.Fatalf("resolveNode failed: %v", err)
-	}
-	snapshot, err := repo.ResolveConnection(nodeID)
-	if err != nil {
-		t.Fatalf("resolve connection failed: %v", err)
-	}
-	if snapshot.Identity.Password == sshOpt.Password {
-		t.Fatal("SSH option password was persisted in configuration")
+	if err := sshOpt.withTestPendingNode(t.Context(), repo, func(lease config.PendingLease) error {
+		if err := lease.Confirm(t.Context()); err != nil {
+			t.Fatalf("lease.Confirm: %v", err)
+		}
+		snapshot, err := repo.ResolveConnection(lease.NodeID())
+		if err != nil {
+			t.Fatalf("resolve connection failed: %v", err)
+		}
+		if snapshot.Identity.Password == sshOpt.Password {
+			t.Fatal("SSH option password was persisted in configuration")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingNode failed: %v", err)
 	}
 
 	execOpt := NewExecOptions()
 	execOpt.Remember = "always"
-	if _, err := execOpt.updateNodeFromHostInfo(t.Context(), nodeID, repo, utils.HostInfo{Host: "10.238.221.181"}); err != nil {
-		t.Fatalf("updateNodeFromHostInfo failed: %v", err)
-	}
-	snapshot, err = repo.ResolveConnection(nodeID)
-	if err != nil {
-		t.Fatalf("resolve connection after exec update failed: %v", err)
-	}
-	if snapshot.Node.SuPwd != "" {
-		t.Fatal("exec sudo password was persisted in configuration")
+	execOpt.Interactive = true
+	execOpt.Host = "iaas@10.238.221.181"
+	if err := execOpt.withTestPendingHostTasks(t.Context(), repo, func(tasks []execHostTask, leases []config.PendingLease, hostErrs []error) error {
+		if len(hostErrs) > 0 || len(tasks) != 1 {
+			t.Fatalf("withTestPendingHostTasks: tasks=%v hostErrs=%v", tasks, hostErrs)
+		}
+		if err := leases[0].Confirm(t.Context()); err != nil {
+			t.Fatalf("exec lease.Confirm: %v", err)
+		}
+		snapshot, err := repo.ResolveConnection(tasks[0].nodeID)
+		if err != nil {
+			t.Fatalf("resolve connection after exec update failed: %v", err)
+		}
+		if snapshot.Node.SuPwd != "" {
+			t.Fatal("exec sudo password was persisted in configuration")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("exec withTestPendingHostTasks failed: %v", err)
 	}
 }
 
@@ -417,28 +462,29 @@ func TestCommands_ExecTagUsesExplicitSessionCredentials(t *testing.T) {
 	execOpt.Password = "tag-password"
 	execOpt.Passphrase = "tag-passphrase"
 	execOpt.Remember = "never"
-	tasks, err := execOpt.buildTasksFromTags(t.Context(), repo)
-	if err != nil {
+	if err := execOpt.withTestPendingTagTasks(t.Context(), repo, func(tasks []execHostTask, _ []config.PendingLease) error {
+		opts, err := execOpt.buildAdapterOptions(tasks, repo.Snapshot(), repo)
+		if err != nil {
+			t.Fatalf("build adapter options: %v", err)
+		}
+		adapter := adapter.NewSSHAdapter(repo, opts...)
+		password, err := adapter.ResolveSecret(t.Context(), ssh.SecretRequest{NodeID: tasks[0].nodeID, Kind: ssh.SecretKindLoginPassword})
+		if err != nil {
+			t.Fatalf("resolve tag password: %v", err)
+		}
+		if string(password) != execOpt.Password {
+			t.Fatalf("tag password = %q, want explicit password", password)
+		}
+		passphrase, err := adapter.ResolveSecret(t.Context(), ssh.SecretRequest{NodeID: tasks[0].nodeID, Kind: ssh.SecretKindPrivateKeyPassphrase})
+		if err != nil {
+			t.Fatalf("resolve tag passphrase: %v", err)
+		}
+		if string(passphrase) != execOpt.Passphrase {
+			t.Fatalf("tag passphrase = %q, want explicit passphrase", passphrase)
+		}
+		return nil
+	}); err != nil {
 		t.Fatalf("build tag tasks: %v", err)
-	}
-	opts, err := execOpt.buildAdapterOptions(tasks, repo.Snapshot(), repo)
-	if err != nil {
-		t.Fatalf("build adapter options: %v", err)
-	}
-	adapter := adapter.NewSSHAdapter(repo, opts...)
-	password, err := adapter.ResolveSecret(t.Context(), ssh.SecretRequest{NodeID: tasks[0].nodeID, Kind: ssh.SecretKindLoginPassword})
-	if err != nil {
-		t.Fatalf("resolve tag password: %v", err)
-	}
-	if string(password) != execOpt.Password {
-		t.Fatalf("tag password = %q, want explicit password", password)
-	}
-	passphrase, err := adapter.ResolveSecret(t.Context(), ssh.SecretRequest{NodeID: tasks[0].nodeID, Kind: ssh.SecretKindPrivateKeyPassphrase})
-	if err != nil {
-		t.Fatalf("resolve tag passphrase: %v", err)
-	}
-	if string(passphrase) != execOpt.Passphrase {
-		t.Fatalf("tag passphrase = %q, want explicit passphrase", passphrase)
 	}
 }
 
@@ -517,20 +563,22 @@ func TestCommands_SSHSessionOnlyUsesSelectedKey(t *testing.T) {
 	o.Remember = "never"
 	o.IdentityFile = t.TempDir()
 	o.Target = config.ConnectionTarget{Selector: "10.238.221.181", User: "iaas", HasUser: true}
-	nodeID, _, err := o.resolveNode(t.Context(), repo)
-	if err != nil {
-		t.Fatalf("resolve node: %v", err)
-	}
-	opts, err := o.buildAdapterOptions(nodeID, repo.Snapshot(), repo)
-	if err != nil {
-		t.Fatalf("build adapter options: %v", err)
-	}
-	clientCfg, err := adapter.NewSSHAdapter(repo, opts...).GetConfig(nodeID)
-	if err != nil {
-		t.Fatalf("get connection config: %v", err)
-	}
-	if clientCfg.KeyPath != o.IdentityFile {
-		t.Fatalf("KeyPath = %q, want %q", clientCfg.KeyPath, o.IdentityFile)
+	if err := o.withTestPendingNode(t.Context(), repo, func(lease config.PendingLease) error {
+		nodeID := lease.NodeID()
+		opts, err := o.buildAdapterOptions(nodeID, repo.Snapshot(), repo)
+		if err != nil {
+			t.Fatalf("build adapter options: %v", err)
+		}
+		clientCfg, err := adapter.NewSSHAdapter(repo, opts...).GetConfig(nodeID)
+		if err != nil {
+			t.Fatalf("get connection config: %v", err)
+		}
+		if clientCfg.KeyPath != o.IdentityFile {
+			t.Fatalf("KeyPath = %q, want %q", clientCfg.KeyPath, o.IdentityFile)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingNode: %v", err)
 	}
 }
 
@@ -575,20 +623,24 @@ func TestCommands_ExecUsesSelectedSessionKey(t *testing.T) {
 	o.Host = "iaas@10.238.221.181"
 	o.IdentityFile = t.TempDir()
 	o.Remember = utils.RememberPolicyNever
-	tasks, hostErrs, err := o.buildTasksFromHosts(t.Context(), repo)
-	if err != nil || len(hostErrs) != 0 {
-		t.Fatalf("build tasks: err=%v hostErrs=%v", err, hostErrs)
-	}
-	opts, err := o.buildAdapterOptions(tasks, repo.Snapshot(), repo)
-	if err != nil {
-		t.Fatalf("build adapter options: %v", err)
-	}
-	clientCfg, err := adapter.NewSSHAdapter(repo, opts...).GetConfig(tasks[0].nodeID)
-	if err != nil {
-		t.Fatalf("get connection config: %v", err)
-	}
-	if clientCfg.KeyPath != o.IdentityFile {
-		t.Fatalf("KeyPath = %q, want %q", clientCfg.KeyPath, o.IdentityFile)
+	if err := o.withTestPendingHostTasks(t.Context(), repo, func(tasks []execHostTask, _ []config.PendingLease, hostErrs []error) error {
+		if len(hostErrs) != 0 {
+			t.Fatalf("build tasks: hostErrs=%v", hostErrs)
+		}
+		opts, err := o.buildAdapterOptions(tasks, repo.Snapshot(), repo)
+		if err != nil {
+			t.Fatalf("build adapter options: %v", err)
+		}
+		clientCfg, err := adapter.NewSSHAdapter(repo, opts...).GetConfig(tasks[0].nodeID)
+		if err != nil {
+			t.Fatalf("get connection config: %v", err)
+		}
+		if clientCfg.KeyPath != o.IdentityFile {
+			t.Fatalf("KeyPath = %q, want %q", clientCfg.KeyPath, o.IdentityFile)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("build tasks: %v", err)
 	}
 }
 
@@ -682,7 +734,12 @@ func TestCommands_SCPPortSelectionPreservesNumericFilename(t *testing.T) {
 			if target.HasPort != (tc.port != 0) {
 				t.Fatalf("HasPort = %v", target.HasPort)
 			}
-			res, err := repo.PrepareNodeContext(t.Context(), config.EnsureNodeOptions{Target: target})
+			err = repo.WithPendingNode(t.Context(), config.EnsureNodeOptions{Target: target}, func(lease config.PendingLease) error {
+				if want := fmt.Sprintf("user@scp.fixture.invalid:%d", tc.wantPort); repo.IsPendingNode(lease.NodeID()) || lease.NodeID() != want {
+					t.Fatalf("resolved %q, pending=%v; want %q", lease.NodeID(), repo.IsPendingNode(lease.NodeID()), want)
+				}
+				return nil
+			})
 			if tc.ambiguous {
 				var ambiguous *config.AmbiguousNodeError
 				if !errors.As(err, &ambiguous) || len(ambiguous.Candidates) != 2 {
@@ -692,9 +749,6 @@ func TestCommands_SCPPortSelectionPreservesNumericFilename(t *testing.T) {
 			}
 			if err != nil {
 				t.Fatal(err)
-			}
-			if want := fmt.Sprintf("user@scp.fixture.invalid:%d", tc.wantPort); res.Created || res.NodeID != want {
-				t.Fatalf("resolved %q, created=%v; want %q", res.NodeID, res.Created, want)
 			}
 		})
 	}
@@ -708,12 +762,16 @@ func TestCommands_Exec_FlagPrecedence(t *testing.T) {
 		execOpt := NewExecOptions()
 		execOpt.User = "test"
 		execOpt.Host = "iaas@10.238.221.181"
-		tasks, hostErrs, err := execOpt.buildTasksFromHosts(ctx, repo)
-		if err != nil || len(hostErrs) > 0 {
-			t.Fatalf("buildTasksFromHosts failed: err=%v, hostErrs=%v", err, hostErrs)
-		}
-		if len(tasks) != 1 || tasks[0].nodeID != "test@10.238.221.181:22" {
-			t.Fatalf("expected nodeID 'test@10.238.221.181:22', got %+v", tasks)
+		if err := execOpt.withTestPendingHostTasks(ctx, repo, func(tasks []execHostTask, _ []config.PendingLease, hostErrs []error) error {
+			if len(hostErrs) > 0 {
+				t.Fatalf("withTestPendingHostTasks hostErrs=%v", hostErrs)
+			}
+			if len(tasks) != 1 || tasks[0].nodeID != "test@10.238.221.181:22" {
+				t.Fatalf("expected nodeID 'test@10.238.221.181:22', got %+v", tasks)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("withTestPendingHostTasks failed: %v", err)
 		}
 	})
 
@@ -722,18 +780,41 @@ func TestCommands_Exec_FlagPrecedence(t *testing.T) {
 		execOpt := NewExecOptions()
 		execOpt.Port = 2222
 		execOpt.Host = "test@10.238.221.181:22"
-		tasks, hostErrs, err := execOpt.buildTasksFromHosts(ctx, repo)
-		if err != nil || len(hostErrs) > 0 {
-			t.Fatalf("buildTasksFromHosts failed: err=%v, hostErrs=%v", err, hostErrs)
-		}
-		if len(tasks) != 1 || tasks[0].nodeID != "test@10.238.221.181:2222" {
-			t.Fatalf("expected nodeID 'test@10.238.221.181:2222', got %+v", tasks)
+		if err := execOpt.withTestPendingHostTasks(ctx, repo, func(tasks []execHostTask, _ []config.PendingLease, hostErrs []error) error {
+			if len(hostErrs) > 0 {
+				t.Fatalf("withTestPendingHostTasks hostErrs=%v", hostErrs)
+			}
+			if len(tasks) != 1 || tasks[0].nodeID != "test@10.238.221.181:2222" {
+				t.Fatalf("expected nodeID 'test@10.238.221.181:2222', got %+v", tasks)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("withTestPendingHostTasks failed: %v", err)
 		}
 	})
 }
 
+func assertStagedAndConfirmedProxyJump(t *testing.T, ctx context.Context, repo *config.Repository, lease config.PendingLease, expectedPJ string) {
+	t.Helper()
+	nodeID := lease.NodeID()
+	if saved, ok := repo.Snapshot().Nodes.Get(nodeID); !ok || saved.ProxyJump != "jump-01" {
+		t.Fatalf("expected saved ProxyJump unchanged pre-confirm, got %+v", saved)
+	}
+	node, _, _, resolveErr := repo.Resolve(nodeID)
+	if resolveErr != nil || node.ProxyJump != expectedPJ {
+		t.Fatalf("expected staged node.ProxyJump=%q, got %q (err=%v)", expectedPJ, node.ProxyJump, resolveErr)
+	}
+	if err := lease.Confirm(ctx); err != nil {
+		t.Fatalf("lease.Confirm: %v", err)
+	}
+	if saved, ok := repo.Snapshot().Nodes.Get(nodeID); !ok || saved.ProxyJump != expectedPJ {
+		t.Errorf("expected persisted node.ProxyJump=%q after Confirm, got %+v", expectedPJ, saved)
+	}
+}
+
 func TestCommands_ExistingNode_ProxyJumpChainUpdate(t *testing.T) {
 	ctx := context.Background()
+	expectedPJ := config.OpenSSHNodePrefix + "10.0.0.1:22," + config.OpenSSHNodePrefix + "10.0.0.2:22"
 
 	t.Run("ssh_updates_existing_node_multihop_proxyjump", func(t *testing.T) {
 		repo := setupTestRepository(t)
@@ -743,23 +824,14 @@ func TestCommands_ExistingNode_ProxyJumpChainUpdate(t *testing.T) {
 		if err := sshOpt.Validate(); err != nil {
 			t.Fatalf("validate failed: %v", err)
 		}
-		nodeID, mutated, err := sshOpt.resolveNode(ctx, repo)
-		if err != nil {
-			t.Fatalf("resolveNode failed: %v", err)
-		}
-		if nodeID != "iaas@10.238.221.181:22" {
-			t.Fatalf("expected existing nodeID 'iaas@10.238.221.181:22', got %s", nodeID)
-		}
-		if !mutated {
-			t.Fatalf("expected node to be updated (mutated=true)")
-		}
-		node, _, _, resolveErr := repo.Resolve(nodeID)
-		if resolveErr != nil {
-			t.Fatalf("node not found: %s", nodeID)
-		}
-		expectedPJ := config.OpenSSHNodePrefix + "10.0.0.1:22," + config.OpenSSHNodePrefix + "10.0.0.2:22"
-		if node.ProxyJump != expectedPJ {
-			t.Errorf("expected node.ProxyJump=%q, got %q", expectedPJ, node.ProxyJump)
+		if err := sshOpt.withTestPendingNode(ctx, repo, func(lease config.PendingLease) error {
+			if lease.NodeID() != "iaas@10.238.221.181:22" {
+				t.Fatalf("expected existing nodeID 'iaas@10.238.221.181:22', got %s", lease.NodeID())
+			}
+			assertStagedAndConfirmedProxyJump(t, ctx, repo, lease, expectedPJ)
+			return nil
+		}); err != nil {
+			t.Fatalf("withTestPendingNode failed: %v", err)
 		}
 	})
 
@@ -767,20 +839,11 @@ func TestCommands_ExistingNode_ProxyJumpChainUpdate(t *testing.T) {
 		repo := setupTestRepository(t)
 		scpOpt := NewScpOptions()
 		scpOpt.JumpHost = "10.0.0.1:22,10.0.0.2:22"
-		nodeID, updated, err := scpOpt.getOrCreateNodeForPath(ctx, repo, PathInfo{Host: "10.238.221.181", User: "iaas", Port: 22}, "")
-		if err != nil {
-			t.Fatalf("getOrCreateNodeForPath failed: %v", err)
-		}
-		if !updated {
-			t.Fatalf("expected existing node to be updated with new ProxyJump")
-		}
-		node, _, _, resolveErr := repo.Resolve(nodeID)
-		if resolveErr != nil {
-			t.Fatalf("node not found: %s", nodeID)
-		}
-		expectedPJ := config.OpenSSHNodePrefix + "10.0.0.1:22," + config.OpenSSHNodePrefix + "10.0.0.2:22"
-		if node.ProxyJump != expectedPJ {
-			t.Errorf("expected node.ProxyJump=%q, got %q", expectedPJ, node.ProxyJump)
+		if err := scpOpt.withTestPendingPath(ctx, repo, PathInfo{Host: "10.238.221.181", User: "iaas", Port: 22}, "", func(lease config.PendingLease) error {
+			assertStagedAndConfirmedProxyJump(t, ctx, repo, lease, expectedPJ)
+			return nil
+		}); err != nil {
+			t.Fatalf("withTestPendingPath failed: %v", err)
 		}
 	})
 
@@ -790,20 +853,14 @@ func TestCommands_ExistingNode_ProxyJumpChainUpdate(t *testing.T) {
 		execOpt.Interactive = true
 		execOpt.JumpHost = "10.0.0.1:22,10.0.0.2:22"
 		execOpt.Host = "iaas@10.238.221.181"
-		tasks, hostErrs, err := execOpt.buildTasksFromHosts(ctx, repo)
-		if err != nil || len(hostErrs) > 0 {
-			t.Fatalf("buildTasksFromHosts failed: err=%v, hostErrs=%v", err, hostErrs)
-		}
-		if len(tasks) != 1 {
-			t.Fatalf("expected 1 task, got %d", len(tasks))
-		}
-		node, _, _, resolveErr := repo.Resolve(tasks[0].nodeID)
-		if resolveErr != nil {
-			t.Fatalf("node not found: %s", tasks[0].nodeID)
-		}
-		expectedPJ := config.OpenSSHNodePrefix + "10.0.0.1:22," + config.OpenSSHNodePrefix + "10.0.0.2:22"
-		if node.ProxyJump != expectedPJ {
-			t.Errorf("expected node.ProxyJump=%q, got %q", expectedPJ, node.ProxyJump)
+		if err := execOpt.withTestPendingHostTasks(ctx, repo, func(tasks []execHostTask, leases []config.PendingLease, hostErrs []error) error {
+			if len(hostErrs) > 0 || len(tasks) != 1 {
+				t.Fatalf("withTestPendingHostTasks failed: tasks=%d hostErrs=%v", len(tasks), hostErrs)
+			}
+			assertStagedAndConfirmedProxyJump(t, ctx, repo, leases[0], expectedPJ)
+			return nil
+		}); err != nil {
+			t.Fatalf("withTestPendingHostTasks failed: %v", err)
 		}
 	})
 }
@@ -846,12 +903,14 @@ func TestCommands_Consistency_MultiPortDisambiguation(t *testing.T) {
 		if err := sshOpt.Validate(); err != nil {
 			t.Fatalf("validate failed: %v", err)
 		}
-		nodeID, created, err := sshOpt.resolveNode(ctx, repo)
-		if err != nil {
-			t.Fatalf("resolveNode failed: %v", err)
-		}
-		if created || nodeID != "root@10.0.0.1:2222" {
-			t.Errorf("got nodeID=%q, created=%v, want root@10.0.0.1:2222, false", nodeID, created)
+		if err := sshOpt.withTestPendingNode(ctx, repo, func(lease config.PendingLease) error {
+			nodeID := lease.NodeID()
+			if repo.IsPendingNode(nodeID) || nodeID != "root@10.0.0.1:2222" {
+				t.Errorf("got nodeID=%q, pending=%v, want root@10.0.0.1:2222, false", nodeID, repo.IsPendingNode(nodeID))
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("withTestPendingNode failed: %v", err)
 		}
 	})
 
@@ -862,24 +921,28 @@ func TestCommands_Consistency_MultiPortDisambiguation(t *testing.T) {
 		if err := sftpOpt.Validate(); err != nil {
 			t.Fatalf("validate failed: %v", err)
 		}
-		nodeID, created, err := sftpOpt.resolveNode(ctx, repo)
-		if err != nil {
-			t.Fatalf("resolveNode failed: %v", err)
-		}
-		if created || nodeID != "root@10.0.0.1:2222" {
-			t.Errorf("got nodeID=%q, created=%v, want root@10.0.0.1:2222, false", nodeID, created)
+		if err := sftpOpt.withTestPendingNode(ctx, repo, func(lease config.PendingLease) error {
+			nodeID := lease.NodeID()
+			if repo.IsPendingNode(nodeID) || nodeID != "root@10.0.0.1:2222" {
+				t.Errorf("got nodeID=%q, pending=%v, want root@10.0.0.1:2222, false", nodeID, repo.IsPendingNode(nodeID))
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("withTestPendingNode failed: %v", err)
 		}
 	})
 
 	t.Run("scp_explicit_port_2222_resolves_existing_node", func(t *testing.T) {
 		repo := setupMultiPortRepository(t)
 		scpOpt := NewScpOptions()
-		nodeID, created, err := scpOpt.getOrCreateNodeForPath(ctx, repo, PathInfo{Host: "10.0.0.1", User: "root", Port: 2222}, "")
-		if err != nil {
-			t.Fatalf("getOrCreateNodeForPath failed: %v", err)
-		}
-		if created || nodeID != "root@10.0.0.1:2222" {
-			t.Errorf("got nodeID=%q, created=%v, want root@10.0.0.1:2222, false", nodeID, created)
+		if err := scpOpt.withTestPendingPath(ctx, repo, PathInfo{Host: "10.0.0.1", User: "root", Port: 2222}, "", func(lease config.PendingLease) error {
+			nodeID := lease.NodeID()
+			if repo.IsPendingNode(nodeID) || nodeID != "root@10.0.0.1:2222" {
+				t.Errorf("got nodeID=%q, pending=%v, want root@10.0.0.1:2222, false", nodeID, repo.IsPendingNode(nodeID))
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("withTestPendingPath failed: %v", err)
 		}
 	})
 
@@ -887,15 +950,16 @@ func TestCommands_Consistency_MultiPortDisambiguation(t *testing.T) {
 		repo := setupMultiPortRepository(t)
 		execOpt := NewExecOptions()
 		execOpt.Host = "root@10.0.0.1:2222"
-		tasks, hostErrs, err := execOpt.buildTasksFromHosts(ctx, repo)
-		if err != nil || len(hostErrs) > 0 {
-			t.Fatalf("buildTasksFromHosts failed: err=%v, hostErrs=%v", err, hostErrs)
-		}
-		if len(tasks) != 1 {
-			t.Fatalf("expected 1 task, got %d", len(tasks))
-		}
-		if tasks[0].nodeID != "root@10.0.0.1:2222" {
-			t.Errorf("got task nodeID=%q, want root@10.0.0.1:2222", tasks[0].nodeID)
+		if err := execOpt.withTestPendingHostTasks(ctx, repo, func(tasks []execHostTask, _ []config.PendingLease, hostErrs []error) error {
+			if len(hostErrs) > 0 || len(tasks) != 1 {
+				t.Fatalf("withTestPendingHostTasks failed: tasks=%d hostErrs=%v", len(tasks), hostErrs)
+			}
+			if tasks[0].nodeID != "root@10.0.0.1:2222" {
+				t.Errorf("got task nodeID=%q, want root@10.0.0.1:2222", tasks[0].nodeID)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("withTestPendingHostTasks failed: %v", err)
 		}
 	})
 }
@@ -933,16 +997,17 @@ func TestCommands_Consistency_SavedAliasWithPortProxyJump(t *testing.T) {
 		if err := sshOpt.Validate(); err != nil {
 			t.Fatalf("validate failed: %v", err)
 		}
-		nodeID, _, err := sshOpt.resolveNode(ctx, repo)
-		if err != nil {
-			t.Fatalf("resolveNode failed: %v", err)
-		}
-		node, _, _, resolveErr := repo.Resolve(nodeID)
-		if resolveErr != nil {
-			t.Fatalf("node %s not found", nodeID)
-		}
-		if node.ProxyJump != "root@10.0.0.5:22" {
-			t.Errorf("got ProxyJump=%q, want root@10.0.0.5:22", node.ProxyJump)
+		if err := sshOpt.withTestPendingNode(ctx, repo, func(lease config.PendingLease) error {
+			node, _, _, resolveErr := repo.Resolve(lease.NodeID())
+			if resolveErr != nil {
+				t.Fatalf("node %s not found", lease.NodeID())
+			}
+			if node.ProxyJump != "root@10.0.0.5:22" {
+				t.Errorf("got ProxyJump=%q, want root@10.0.0.5:22", node.ProxyJump)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("withTestPendingNode failed: %v", err)
 		}
 	})
 
@@ -951,19 +1016,20 @@ func TestCommands_Consistency_SavedAliasWithPortProxyJump(t *testing.T) {
 		execOpt := NewExecOptions()
 		execOpt.JumpHost = "bastion:22"
 		execOpt.Host = "test@10.238.221.181"
-		tasks, hostErrs, err := execOpt.buildTasksFromHosts(ctx, repo)
-		if err != nil || len(hostErrs) > 0 {
-			t.Fatalf("buildTasksFromHosts failed: err=%v, hostErrs=%v", err, hostErrs)
-		}
-		if len(tasks) != 1 {
-			t.Fatalf("expected 1 task, got %d", len(tasks))
-		}
-		node, _, _, resolveErr := repo.Resolve(tasks[0].nodeID)
-		if resolveErr != nil {
-			t.Fatalf("node %s not found", tasks[0].nodeID)
-		}
-		if node.ProxyJump != "root@10.0.0.5:22" {
-			t.Errorf("got ProxyJump=%q, want root@10.0.0.5:22", node.ProxyJump)
+		if err := execOpt.withTestPendingHostTasks(ctx, repo, func(tasks []execHostTask, _ []config.PendingLease, hostErrs []error) error {
+			if len(hostErrs) > 0 || len(tasks) != 1 {
+				t.Fatalf("withTestPendingHostTasks failed: tasks=%d hostErrs=%v", len(tasks), hostErrs)
+			}
+			node, _, _, resolveErr := repo.Resolve(tasks[0].nodeID)
+			if resolveErr != nil {
+				t.Fatalf("node %s not found", tasks[0].nodeID)
+			}
+			if node.ProxyJump != "root@10.0.0.5:22" {
+				t.Errorf("got ProxyJump=%q, want root@10.0.0.5:22", node.ProxyJump)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("withTestPendingHostTasks failed: %v", err)
 		}
 	})
 }
@@ -999,19 +1065,21 @@ func TestCommands_SSH_ChangeUserPreservesPortAndProxyJump(t *testing.T) {
 	if err := sshOpt.Validate(); err != nil {
 		t.Fatalf("validate failed: %v", err)
 	}
-	nodeID, created, err := sshOpt.resolveNode(ctx, repo)
-	if err != nil {
-		t.Fatalf("resolveNode failed: %v", err)
-	}
-	if !created || nodeID != "test@10.0.0.5:2222" {
-		t.Errorf("got nodeID=%q, created=%v, want test@10.0.0.5:2222, true", nodeID, created)
-	}
-	node, _, _, resolveErr := repo.Resolve(nodeID)
-	if resolveErr != nil {
-		t.Fatalf("node %s not found", nodeID)
-	}
-	if node.ProxyJump != "upstream" {
-		t.Errorf("got ProxyJump=%q, want upstream", node.ProxyJump)
+	if err := sshOpt.withTestPendingNode(ctx, repo, func(lease config.PendingLease) error {
+		nodeID := lease.NodeID()
+		if !repo.IsPendingNode(nodeID) || nodeID != "test@10.0.0.5:2222" {
+			t.Errorf("got nodeID=%q, pending=%v, want test@10.0.0.5:2222, true", nodeID, repo.IsPendingNode(nodeID))
+		}
+		node, _, _, resolveErr := repo.Resolve(nodeID)
+		if resolveErr != nil {
+			t.Fatalf("node %s not found", nodeID)
+		}
+		if node.ProxyJump != "upstream" {
+			t.Errorf("got ProxyJump=%q, want upstream", node.ProxyJump)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingNode failed: %v", err)
 	}
 }
 
@@ -1023,19 +1091,21 @@ func TestCommands_SFTP_ChangeUserPreservesPortAndProxyJump(t *testing.T) {
 	if err := sftpOpt.Validate(); err != nil {
 		t.Fatalf("validate failed: %v", err)
 	}
-	nodeID, created, err := sftpOpt.resolveNode(ctx, repo)
-	if err != nil {
-		t.Fatalf("resolveNode failed: %v", err)
-	}
-	if !created || nodeID != "test@10.0.0.5:2222" {
-		t.Errorf("got nodeID=%q, created=%v, want test@10.0.0.5:2222, true", nodeID, created)
-	}
-	node, _, _, resolveErr := repo.Resolve(nodeID)
-	if resolveErr != nil {
-		t.Fatalf("node %s not found", nodeID)
-	}
-	if node.ProxyJump != "upstream" {
-		t.Errorf("got ProxyJump=%q, want upstream", node.ProxyJump)
+	if err := sftpOpt.withTestPendingNode(ctx, repo, func(lease config.PendingLease) error {
+		nodeID := lease.NodeID()
+		if !repo.IsPendingNode(nodeID) || nodeID != "test@10.0.0.5:2222" {
+			t.Errorf("got nodeID=%q, pending=%v, want test@10.0.0.5:2222, true", nodeID, repo.IsPendingNode(nodeID))
+		}
+		node, _, _, resolveErr := repo.Resolve(nodeID)
+		if resolveErr != nil {
+			t.Fatalf("node %s not found", nodeID)
+		}
+		if node.ProxyJump != "upstream" {
+			t.Errorf("got ProxyJump=%q, want upstream", node.ProxyJump)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingNode failed: %v", err)
 	}
 }
 
@@ -1043,19 +1113,21 @@ func TestCommands_SCP_ChangeUserPreservesPortAndProxyJump(t *testing.T) {
 	ctx := context.Background()
 	repo := setupNonDefaultPortWithProxyJumpRepo(t)
 	scpOpt := NewScpOptions()
-	nodeID, created, err := scpOpt.getOrCreateNodeForPath(ctx, repo, PathInfo{Host: "10.0.0.5", User: "test"}, "")
-	if err != nil {
-		t.Fatalf("getOrCreateNodeForPath failed: %v", err)
-	}
-	if !created || nodeID != "test@10.0.0.5:2222" {
-		t.Errorf("got nodeID=%q, created=%v, want test@10.0.0.5:2222, true", nodeID, created)
-	}
-	node, _, _, resolveErr := repo.Resolve(nodeID)
-	if resolveErr != nil {
-		t.Fatalf("node %s not found", nodeID)
-	}
-	if node.ProxyJump != "upstream" {
-		t.Errorf("got ProxyJump=%q, want upstream", node.ProxyJump)
+	if err := scpOpt.withTestPendingPath(ctx, repo, PathInfo{Host: "10.0.0.5", User: "test"}, "", func(lease config.PendingLease) error {
+		nodeID := lease.NodeID()
+		if !repo.IsPendingNode(nodeID) || nodeID != "test@10.0.0.5:2222" {
+			t.Errorf("got nodeID=%q, pending=%v, want test@10.0.0.5:2222, true", nodeID, repo.IsPendingNode(nodeID))
+		}
+		node, _, _, resolveErr := repo.Resolve(nodeID)
+		if resolveErr != nil {
+			t.Fatalf("node %s not found", nodeID)
+		}
+		if node.ProxyJump != "upstream" {
+			t.Errorf("got ProxyJump=%q, want upstream", node.ProxyJump)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingPath failed: %v", err)
 	}
 }
 
@@ -1064,22 +1136,23 @@ func TestCommands_Exec_ChangeUserPreservesPortAndProxyJump(t *testing.T) {
 	repo := setupNonDefaultPortWithProxyJumpRepo(t)
 	execOpt := NewExecOptions()
 	execOpt.Host = "test@10.0.0.5"
-	tasks, hostErrs, err := execOpt.buildTasksFromHosts(ctx, repo)
-	if err != nil || len(hostErrs) > 0 {
-		t.Fatalf("buildTasksFromHosts failed: err=%v, hostErrs=%v", err, hostErrs)
-	}
-	if len(tasks) != 1 {
-		t.Fatalf("expected 1 task, got %d", len(tasks))
-	}
-	if tasks[0].nodeID != "test@10.0.0.5:2222" {
-		t.Errorf("got task nodeID=%q, want test@10.0.0.5:2222", tasks[0].nodeID)
-	}
-	node, _, _, resolveErr := repo.Resolve(tasks[0].nodeID)
-	if resolveErr != nil {
-		t.Fatalf("node %s not found", tasks[0].nodeID)
-	}
-	if node.ProxyJump != "upstream" {
-		t.Errorf("got ProxyJump=%q, want upstream", node.ProxyJump)
+	if err := execOpt.withTestPendingHostTasks(ctx, repo, func(tasks []execHostTask, _ []config.PendingLease, hostErrs []error) error {
+		if len(hostErrs) > 0 || len(tasks) != 1 {
+			t.Fatalf("withTestPendingHostTasks failed: tasks=%d hostErrs=%v", len(tasks), hostErrs)
+		}
+		if tasks[0].nodeID != "test@10.0.0.5:2222" {
+			t.Errorf("got task nodeID=%q, want test@10.0.0.5:2222", tasks[0].nodeID)
+		}
+		node, _, _, resolveErr := repo.Resolve(tasks[0].nodeID)
+		if resolveErr != nil {
+			t.Fatalf("node %s not found", tasks[0].nodeID)
+		}
+		if node.ProxyJump != "upstream" {
+			t.Errorf("got ProxyJump=%q, want upstream", node.ProxyJump)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingHostTasks failed: %v", err)
 	}
 }
 
@@ -1094,17 +1167,18 @@ func TestCommands_JumpAliasUserOverridePreservesPort(t *testing.T) {
 		if err := sshOpt.Validate(); err != nil {
 			t.Fatalf("validate failed: %v", err)
 		}
-		nodeID, _, err := sshOpt.resolveNode(ctx, repo)
-		if err != nil {
-			t.Fatalf("resolveNode failed: %v", err)
-		}
-		node, _, _, resolveErr := repo.Resolve(nodeID)
-		if resolveErr != nil {
-			t.Fatalf("node %s not found", nodeID)
-		}
-		expectedJump := config.OpenSSHNodePrefix + "another@10.0.0.5:2222"
-		if node.ProxyJump != expectedJump {
-			t.Errorf("got ProxyJump=%q, want %q", node.ProxyJump, expectedJump)
+		if err := sshOpt.withTestPendingNode(ctx, repo, func(lease config.PendingLease) error {
+			node, _, _, resolveErr := repo.Resolve(lease.NodeID())
+			if resolveErr != nil {
+				t.Fatalf("node %s not found", lease.NodeID())
+			}
+			expectedJump := config.OpenSSHNodePrefix + "another@10.0.0.5:2222"
+			if node.ProxyJump != expectedJump {
+				t.Errorf("got ProxyJump=%q, want %q", node.ProxyJump, expectedJump)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("withTestPendingNode failed: %v", err)
 		}
 	})
 
@@ -1113,20 +1187,21 @@ func TestCommands_JumpAliasUserOverridePreservesPort(t *testing.T) {
 		execOpt := NewExecOptions()
 		execOpt.JumpHost = "another@bastion"
 		execOpt.Host = "test@10.238.221.181"
-		tasks, hostErrs, err := execOpt.buildTasksFromHosts(ctx, repo)
-		if err != nil || len(hostErrs) > 0 {
-			t.Fatalf("buildTasksFromHosts failed: err=%v, hostErrs=%v", err, hostErrs)
-		}
-		if len(tasks) != 1 {
-			t.Fatalf("expected 1 task, got %d", len(tasks))
-		}
-		node, _, _, resolveErr := repo.Resolve(tasks[0].nodeID)
-		if resolveErr != nil {
-			t.Fatalf("node %s not found", tasks[0].nodeID)
-		}
-		expectedJump := config.OpenSSHNodePrefix + "another@10.0.0.5:2222"
-		if node.ProxyJump != expectedJump {
-			t.Errorf("got ProxyJump=%q, want %q", node.ProxyJump, expectedJump)
+		if err := execOpt.withTestPendingHostTasks(ctx, repo, func(tasks []execHostTask, _ []config.PendingLease, hostErrs []error) error {
+			if len(hostErrs) > 0 || len(tasks) != 1 {
+				t.Fatalf("withTestPendingHostTasks failed: tasks=%d hostErrs=%v", len(tasks), hostErrs)
+			}
+			node, _, _, resolveErr := repo.Resolve(tasks[0].nodeID)
+			if resolveErr != nil {
+				t.Fatalf("node %s not found", tasks[0].nodeID)
+			}
+			expectedJump := config.OpenSSHNodePrefix + "another@10.0.0.5:2222"
+			if node.ProxyJump != expectedJump {
+				t.Errorf("got ProxyJump=%q, want %q", node.ProxyJump, expectedJump)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("withTestPendingHostTasks failed: %v", err)
 		}
 	})
 }
@@ -1171,16 +1246,17 @@ Host bastion
 	if err := sshOpt.Validate(); err != nil {
 		t.Fatalf("validate failed: %v", err)
 	}
-	nodeID, _, err := sshOpt.resolveNode(ctx, repo)
-	if err != nil {
-		t.Fatalf("resolveNode failed: %v", err)
-	}
-	node, _, _, resolveErr := repo.Resolve(nodeID)
-	if resolveErr != nil {
-		t.Fatalf("node %s not found", nodeID)
-	}
-	expectedJump := config.OpenSSHNodePrefix + "bastion"
-	if node.ProxyJump != expectedJump {
-		t.Errorf("got ProxyJump=%q, want %q (must not be local node root@10.0.0.99:22)", node.ProxyJump, expectedJump)
+	if err := sshOpt.withTestPendingNode(ctx, repo, func(lease config.PendingLease) error {
+		node, _, _, resolveErr := repo.Resolve(lease.NodeID())
+		if resolveErr != nil {
+			t.Fatalf("node %s not found", lease.NodeID())
+		}
+		expectedJump := config.OpenSSHNodePrefix + "bastion"
+		if node.ProxyJump != expectedJump {
+			t.Errorf("got ProxyJump=%q, want %q (must not be local node root@10.0.0.99:22)", node.ProxyJump, expectedJump)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingNode failed: %v", err)
 	}
 }

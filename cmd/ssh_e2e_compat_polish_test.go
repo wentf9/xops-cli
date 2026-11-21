@@ -70,23 +70,25 @@ func TestCLI_IPv6TargetParsingAndNormalization(t *testing.T) {
 			if sshOpt.Host != "::1" {
 				t.Fatalf("sshOpt.Host = %q, want \"::1\"", sshOpt.Host)
 			}
-			nodeID, _, err := sshOpt.resolveNode(t.Context(), repo)
-			if err != nil {
-				t.Fatalf("resolveNode failed: %v", err)
-			}
-			if nodeID != tc.wantID {
-				t.Fatalf("nodeID = %q, want %q", nodeID, tc.wantID)
-			}
-			adpOpts, err := sshOpt.buildAdapterOptions(nodeID, repo.Snapshot(), repo)
-			if err != nil {
-				t.Fatalf("buildAdapterOptions failed: %v", err)
-			}
-			cfg, err := adapter.NewSSHAdapter(repo, adpOpts...).GetConfig(nodeID)
-			if err != nil {
-				t.Fatalf("GetConfig(%q) failed: %v", nodeID, err)
-			}
-			if cfg.Address != "::1" || cfg.Port != int(tc.wantPort) || cfg.User != tc.wantUser {
-				t.Fatalf("GetConfig = Address:%q Port:%d User:%q, want ::1 / %d / %s", cfg.Address, cfg.Port, cfg.User, tc.wantPort, tc.wantUser)
+			if err := sshOpt.withTestPendingNode(t.Context(), repo, func(lease config.PendingLease) error {
+				nodeID := lease.NodeID()
+				if nodeID != tc.wantID {
+					t.Fatalf("nodeID = %q, want %q", nodeID, tc.wantID)
+				}
+				adpOpts, err := sshOpt.buildAdapterOptions(nodeID, repo.Snapshot(), repo)
+				if err != nil {
+					t.Fatalf("buildAdapterOptions failed: %v", err)
+				}
+				cfg, err := adapter.NewSSHAdapter(repo, adpOpts...).GetConfig(nodeID)
+				if err != nil {
+					t.Fatalf("GetConfig(%q) failed: %v", nodeID, err)
+				}
+				if cfg.Address != "::1" || cfg.Port != int(tc.wantPort) || cfg.User != tc.wantUser {
+					t.Fatalf("GetConfig = Address:%q Port:%d User:%q, want ::1 / %d / %s", cfg.Address, cfg.Port, cfg.User, tc.wantPort, tc.wantUser)
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("withTestPendingNode failed: %v", err)
 			}
 		})
 	}
@@ -140,29 +142,31 @@ Host target
 		t.Fatalf("Validate failed: %v", err)
 	}
 
-	nodeID, _, err := sshOpt.resolveNode(t.Context(), repo)
-	if err != nil {
-		t.Fatalf("resolveNode failed: %v", err)
-	}
-	adpOpts, err := sshOpt.buildAdapterOptions(nodeID, repo.Snapshot(), repo)
-	if err != nil {
-		t.Fatalf("buildAdapterOptions failed: %v", err)
-	}
-	adpOpts = append(adpOpts, adapter.WithLocalExecution(true))
-	adp := adapter.NewSSHAdapter(repo, adpOpts...)
+	if err := sshOpt.withTestPendingNode(t.Context(), repo, func(lease config.PendingLease) error {
+		nodeID := lease.NodeID()
+		adpOpts, err := sshOpt.buildAdapterOptions(nodeID, repo.Snapshot(), repo)
+		if err != nil {
+			t.Fatalf("buildAdapterOptions failed: %v", err)
+		}
+		adpOpts = append(adpOpts, adapter.WithLocalExecution(true))
+		adp := adapter.NewSSHAdapter(repo, adpOpts...)
 
-	jumpCfg, err := adp.GetConfig("openssh:jump")
-	if err != nil {
-		t.Fatalf("GetConfig(openssh:jump) failed: %v", err)
-	}
-	assertCLIJumpConfigIsolated(t, adp, jumpCfg, khPath)
+		jumpCfg, err := adp.GetConfig("openssh:jump")
+		if err != nil {
+			t.Fatalf("GetConfig(openssh:jump) failed: %v", err)
+		}
+		assertCLIJumpConfigIsolated(t, adp, jumpCfg, khPath)
 
-	targetCfg, err := adp.GetConfig(nodeID)
-	if err != nil {
-		t.Fatalf("GetConfig(%q) failed: %v", nodeID, err)
-	}
-	if targetCfg.Address != "10.10.0.99" || targetCfg.Options.RemoteCommand() != "echo target-only" {
-		t.Fatalf("target node missing target-scoped overrides: Address=%q RemoteCommand=%q", targetCfg.Address, targetCfg.Options.RemoteCommand())
+		targetCfg, err := adp.GetConfig(nodeID)
+		if err != nil {
+			t.Fatalf("GetConfig(%q) failed: %v", nodeID, err)
+		}
+		if targetCfg.Address != "10.10.0.99" || targetCfg.Options.RemoteCommand() != "echo target-only" {
+			t.Fatalf("target node missing target-scoped overrides: Address=%q RemoteCommand=%q", targetCfg.Address, targetCfg.Options.RemoteCommand())
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingNode failed: %v", err)
 	}
 }
 
@@ -213,37 +217,39 @@ Host web-alias
 	if err := sshOpt.Validate(); err != nil {
 		t.Fatalf("Validate failed: %v", err)
 	}
-	nodeID, _, err := sshOpt.resolveNode(t.Context(), repo)
-	if err != nil {
-		t.Fatalf("resolveNode failed: %v", err)
-	}
-	if nodeID != "openssh:web-alias" {
-		t.Fatalf("nodeID = %q, want openssh:web-alias", nodeID)
-	}
+	if err := sshOpt.withTestPendingNode(t.Context(), repo, func(lease config.PendingLease) error {
+		nodeID := lease.NodeID()
+		if nodeID != "openssh:web-alias" {
+			t.Fatalf("nodeID = %q, want openssh:web-alias", nodeID)
+		}
 
-	sock, err := controlSocketPath(sshOpt, repo, nodeID)
-	if err != nil {
-		t.Fatalf("controlSocketPath failed: %v", err)
-	}
-	if sock != "/tmp/cm-web-alias-2222" {
-		t.Fatalf("controlSocketPath = %q, want /tmp/cm-web-alias-2222", sock)
-	}
+		sock, err := controlSocketPath(sshOpt, repo, nodeID)
+		if err != nil {
+			t.Fatalf("controlSocketPath failed: %v", err)
+		}
+		if sock != "/tmp/cm-web-alias-2222" {
+			t.Fatalf("controlSocketPath = %q, want /tmp/cm-web-alias-2222", sock)
+		}
 
-	adpOpts, err := sshOpt.buildAdapterOptions(nodeID, repo.Snapshot(), repo)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := adapter.NewSSHAdapter(repo, adpOpts...).GetConfig(nodeID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tCtx := controlTarget(sshOpt, repo, nodeID)
-	expandedCmd, err := ssh.ExpandRemoteCommand(cfg.Options.RemoteCommand(), sshenv.Discover(), tCtx)
-	if err != nil {
-		t.Fatalf("ExpandRemoteCommand failed: %v", err)
-	}
-	if expandedCmd != "echo host=web-alias" {
-		t.Fatalf("expanded RemoteCommand = %q, want %q", expandedCmd, "echo host=web-alias")
+		adpOpts, err := sshOpt.buildAdapterOptions(nodeID, repo.Snapshot(), repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := adapter.NewSSHAdapter(repo, adpOpts...).GetConfig(nodeID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tCtx := controlTarget(sshOpt, repo, nodeID)
+		expandedCmd, err := ssh.ExpandRemoteCommand(cfg.Options.RemoteCommand(), sshenv.Discover(), tCtx)
+		if err != nil {
+			t.Fatalf("ExpandRemoteCommand failed: %v", err)
+		}
+		if expandedCmd != "echo host=web-alias" {
+			t.Fatalf("expanded RemoteCommand = %q, want %q", expandedCmd, "echo host=web-alias")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingNode failed: %v", err)
 	}
 }
 
@@ -259,11 +265,15 @@ func TestCLI_RememberNeverDoesNotPersistExistingNodeMutations(t *testing.T) {
 		scpOpt := NewScpOptions()
 		scpOpt.Remember = "never"
 		scpOpt.JumpHost = "10.0.0.1:22"
-		nodeID, updated, err := scpOpt.getOrCreateNodeForPath(ctx, repo, PathInfo{Host: "10.238.221.181", User: "iaas", Port: 22}, "")
-		if err != nil || updated {
-			t.Fatalf("getOrCreateNodeForPath: updated=%v err=%v", updated, err)
+		if err := scpOpt.withTestPendingPath(ctx, repo, PathInfo{Host: "10.238.221.181", User: "iaas", Port: 22}, "", func(lease config.PendingLease) error {
+			if err := lease.Confirm(ctx); err != nil {
+				t.Fatalf("lease.Confirm: %v", err)
+			}
+			assertExistingWeb01ProxyJumpUnchanged(t, repo, lease.NodeID())
+			return nil
+		}); err != nil {
+			t.Fatalf("withTestPendingPath: %v", err)
 		}
-		assertExistingWeb01ProxyJumpUnchanged(t, repo, nodeID)
 	})
 
 	t.Run("exec_remember_never_does_not_persist_proxyjump", func(t *testing.T) {
@@ -272,11 +282,18 @@ func TestCLI_RememberNeverDoesNotPersistExistingNodeMutations(t *testing.T) {
 		execOpt.Remember = "never"
 		execOpt.JumpHost = "10.0.0.1:22"
 		execOpt.Host = "iaas@10.238.221.181"
-		tasks, hostErrs, err := execOpt.buildTasksFromHosts(ctx, repo)
-		if err != nil || len(hostErrs) > 0 || len(tasks) != 1 {
-			t.Fatalf("buildTasksFromHosts failed: tasks=%d err=%v hostErrs=%v", len(tasks), err, hostErrs)
+		if err := execOpt.withTestPendingHostTasks(ctx, repo, func(tasks []execHostTask, leases []config.PendingLease, hostErrs []error) error {
+			if len(hostErrs) > 0 || len(tasks) != 1 {
+				t.Fatalf("withTestPendingHostTasks failed: tasks=%d hostErrs=%v", len(tasks), hostErrs)
+			}
+			if err := leases[0].Confirm(ctx); err != nil {
+				t.Fatalf("lease.Confirm: %v", err)
+			}
+			assertExistingWeb01ProxyJumpUnchanged(t, repo, tasks[0].nodeID)
+			return nil
+		}); err != nil {
+			t.Fatalf("withTestPendingHostTasks: %v", err)
 		}
-		assertExistingWeb01ProxyJumpUnchanged(t, repo, tasks[0].nodeID)
 	})
 }
 
@@ -295,25 +312,30 @@ func assertSSHRememberNeverNoPersistence(t *testing.T) {
 	if err := sshOpt.Validate(); err != nil {
 		t.Fatalf("Validate failed: %v", err)
 	}
-	nodeID, mutated, err := sshOpt.resolveNode(ctx, repo)
-	if err != nil || mutated {
-		t.Fatalf("resolveNode: mutated=%v err=%v", mutated, err)
-	}
-	node := assertExistingWeb01ProxyJumpUnchanged(t, repo, nodeID)
-	if len(node.Alias) != 1 || node.Alias[0] != "web-01" || node.SudoMode == models.SudoModeSudo {
-		t.Fatalf("--remember=never persisted mutations on existing node: %+v", node)
-	}
+	if err := sshOpt.withTestPendingNode(ctx, repo, func(lease config.PendingLease) error {
+		nodeID := lease.NodeID()
+		if err := lease.Confirm(ctx); err != nil {
+			t.Fatalf("lease.Confirm: %v", err)
+		}
+		node := assertExistingWeb01ProxyJumpUnchanged(t, repo, nodeID)
+		if len(node.Alias) != 1 || node.Alias[0] != "web-01" || node.SudoMode == models.SudoModeSudo {
+			t.Fatalf("--remember=never persisted mutations on existing node: %+v", node)
+		}
 
-	adpOpts, err := sshOpt.buildAdapterOptions(nodeID, repo.Snapshot(), repo)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := adapter.NewSSHAdapter(repo, adpOpts...).GetConfig(nodeID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.ProxyJump != "openssh:10.0.0.1:22" {
-		t.Fatalf("expected session ProxyJump override to remain active, got %q", cfg.ProxyJump)
+		adpOpts, err := sshOpt.buildAdapterOptions(nodeID, repo.Snapshot(), repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := adapter.NewSSHAdapter(repo, adpOpts...).GetConfig(nodeID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.ProxyJump != "openssh:10.0.0.1:22" {
+			t.Fatalf("expected session ProxyJump override to remain active, got %q", cfg.ProxyJump)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingNode: %v", err)
 	}
 }
 

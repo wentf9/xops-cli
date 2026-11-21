@@ -4,11 +4,78 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
+	"sync"
 
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/models"
 )
+
+// PendingLease scopes a pending node registration or staged saved-node update.
+// Discard is intentionally not exported: WithPendingNode automatically discards
+// any unconfirmed pending state when its callback returns (including on error,
+// context cancellation, or panic).
+type PendingLease interface {
+	NodeID() string
+	Confirm(ctx context.Context) error
+}
+
+// PendingExecutionLease is an optional extension of PendingLease implemented by
+// leases that can persist an enrollment-probed ExecutionConfig atomically in
+// the same confirmation transaction.
+type PendingExecutionLease interface {
+	PendingLease
+	ConfirmWithExecution(ctx context.Context, execution *ssh.ExecutionConfig) error
+}
+
+// PendingNodeProvider supports scoped pending connection leases.
+type PendingNodeProvider interface {
+	WithPendingNode(ctx context.Context, req EnsureNodeOptions, fn func(PendingLease) error) error
+}
+
+type noopPendingLease struct {
+	nodeID string
+}
+
+func (l noopPendingLease) NodeID() string {
+	return l.nodeID
+}
+
+func (l noopPendingLease) Confirm(context.Context) error {
+	return nil
+}
+
+// WithPendingNode scopes pending node preparation and automatic cleanup to fn.
+// When provider implements PendingNodeProvider (such as *Repository or an
+// OpenSSH -F override provider), unconfirmed pending registrations are always
+// discarded on return, error, cancellation, or panic. Plain read-only providers
+// resolve req.Target and invoke fn with a no-op PendingLease.
+func WithPendingNode(ctx context.Context, provider ConfigProvider, req EnsureNodeOptions, fn func(PendingLease) error) error {
+	if ctx == nil || provider == nil || fn == nil {
+		return fmt.Errorf("with pending node requires context, provider, and callback")
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("prepare connection canceled: %w", err)
+	}
+	if pnp, ok := provider.(PendingNodeProvider); ok {
+		return pnp.WithPendingNode(ctx, req, fn)
+	}
+	if req.ExistingUpdate.JumpHost != "" {
+		if _, err := provider.ResolveProxyJumpChain(req.ExistingUpdate.JumpHost); err != nil {
+			return fmt.Errorf("resolve proxy jump %q failed: %w", req.ExistingUpdate.JumpHost, err)
+		}
+	}
+	resolved, err := ResolveTarget(provider, req.Target)
+	if err != nil {
+		return err
+	}
+	nodeID := resolved.NodeID
+	if resolved.MatchedNodeID != "" {
+		nodeID = resolved.MatchedNodeID
+	}
+	return fn(noopPendingLease{nodeID: nodeID})
+}
 
 func equalPersistedNode(a, b models.Node) bool {
 	a.OpenSSHAlias = ""
@@ -28,54 +95,308 @@ type pendingConnection struct {
 	provenance NodeProvenance
 	gate       *contextGate
 	refs       int
+	isUpdate   bool
+	baseRef    NodeRef
 }
 
-// PrepareNodeContext resolves a connection without writing configuration. New
-// nodes are visible only through Resolve and ResolveConnection until confirmed;
-// snapshots, selectors and unrelated transactions contain saved nodes only.
-// Explicit node creation and imports continue to use the durable mutation APIs.
-func (r *Repository) PrepareNodeContext(ctx context.Context, opts EnsureNodeOptions) (EnsureNodeResult, error) {
+type repositoryPendingLease struct {
+	repo      *Repository
+	nodeID    string
+	entry     *pendingConnection
+	mu        sync.Mutex
+	confirmed bool
+	closed    bool
+}
+
+var (
+	_ PendingLease          = (*repositoryPendingLease)(nil)
+	_ PendingExecutionLease = (*repositoryPendingLease)(nil)
+)
+
+func (l *repositoryPendingLease) NodeID() string {
+	if l == nil {
+		return ""
+	}
+	return l.nodeID
+}
+
+func (l *repositoryPendingLease) Confirm(ctx context.Context) error {
+	return l.confirm(ctx, nil)
+}
+
+func (l *repositoryPendingLease) ConfirmWithExecution(ctx context.Context, execution *ssh.ExecutionConfig) error {
+	execution = execution.Clone()
+	if err := execution.Validate(); err != nil {
+		return fmt.Errorf("validate enrollment execution: %w", err)
+	}
+	return l.confirm(ctx, execution)
+}
+
+func (l *repositoryPendingLease) confirm(ctx context.Context, execution *ssh.ExecutionConfig) error {
+	if l == nil || l.repo == nil {
+		return fmt.Errorf("confirm connection requires repository")
+	}
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return fmt.Errorf("pending lease for %q is closed", l.nodeID)
+	}
+	if l.confirmed || l.entry == nil {
+		l.mu.Unlock()
+		return nil
+	}
+	entry := l.entry
+	nodeID := l.nodeID
+	l.mu.Unlock()
+
+	if err := l.repo.confirmPendingEntry(ctx, nodeID, entry, execution); err != nil {
+		return err
+	}
+	l.mu.Lock()
+	l.confirmed = true
+	l.mu.Unlock()
+	return nil
+}
+
+// WithPendingNode resolves a connection without writing configuration and
+// executes fn with a scoped PendingLease. New nodes and staged updates to
+// existing saved nodes are visible only through Resolve and ResolveConnection
+// until lease.Confirm succeeds; snapshots, selectors, and unrelated
+// transactions contain saved nodes only. If fn returns (normally, with an
+// error, after cancellation, or via panic) without a successful Confirm, the
+// pending entry is automatically discarded.
+func (r *Repository) WithPendingNode(ctx context.Context, req EnsureNodeOptions, fn func(PendingLease) error) error {
+	if r == nil || ctx == nil || fn == nil {
+		return fmt.Errorf("prepare connection requires repository, context, and callback")
+	}
+	res, entry, err := r.prepareNodeContext(ctx, req)
+	if err != nil {
+		return err
+	}
+	lease := &repositoryPendingLease{
+		repo:   r,
+		nodeID: res.NodeID,
+		entry:  entry,
+	}
+	defer func() {
+		lease.mu.Lock()
+		wasConfirmed := lease.confirmed
+		lease.closed = true
+		lease.mu.Unlock()
+		if !wasConfirmed && entry != nil {
+			r.discardPendingEntry(res.NodeID, entry)
+		}
+	}()
+	return fn(lease)
+}
+
+// IsPendingNode reports whether nodeID currently has an active unconfirmed
+// pending connection (either a new node or a staged saved-node update).
+func (r *Repository) IsPendingNode(nodeID string) bool {
+	if r == nil || nodeID == "" {
+		return false
+	}
+	r.pendingMu.RLock()
+	defer r.pendingMu.RUnlock()
+	return r.pending[nodeID] != nil
+}
+
+func (r *Repository) prepareNodeContext(ctx context.Context, opts EnsureNodeOptions) (EnsureNodeResult, *pendingConnection, error) {
 	if r == nil || ctx == nil {
-		return EnsureNodeResult{}, fmt.Errorf("prepare connection requires repository and context")
+		return EnsureNodeResult{}, nil, fmt.Errorf("prepare connection requires repository and context")
 	}
 	if err := ctx.Err(); err != nil {
-		return EnsureNodeResult{}, fmt.Errorf("prepare connection canceled: %w", err)
+		return EnsureNodeResult{}, nil, fmt.Errorf("prepare connection canceled: %w", err)
 	}
 	selector := strings.TrimSpace(opts.Target.Selector)
 	if selector == "" {
-		return EnsureNodeResult{}, fmt.Errorf("target selector is empty")
+		return EnsureNodeResult{}, nil, fmt.Errorf("target selector is empty")
 	}
 	r.pendingMu.Lock()
 	defer r.pendingMu.Unlock()
 	defaultUser := strings.TrimSpace(opts.DefaultUser)
 	if decision, err := r.findExistingNodeDecision(opts.Target, defaultUser); err != nil {
-		return EnsureNodeResult{}, err
+		return EnsureNodeResult{}, nil, err
 	} else if !decision.NeedsCreation && decision.MatchedNodeID != "" {
-		r.syncPreparedExistingMetadataLocked(decision)
-		return EnsureNodeResult{NodeID: decision.MatchedNodeID}, nil
+		return r.prepareExistingNodeLocked(decision, opts)
 	}
 	var outcome ensureTransactionOutcome
 	cfg, _, _, err := prepareConfiguration(r.provider.Snapshot(), func(cfg *Configuration) error {
 		return r.ensureTargetInTransaction(cfg, opts, defaultUser, &outcome)
 	})
 	if err != nil {
-		return EnsureNodeResult{}, err
+		return EnsureNodeResult{}, nil, err
 	}
 	nodeID := outcome.nodeID
 	created := outcome.created
 	if created {
-		effectiveID, err := r.registerPendingConnection(cfg, nodeID, outcome.openSSHAlias, outcome.canonicalHost)
+		effectiveID, entry, err := r.registerPendingConnection(cfg, nodeID, outcome.openSSHAlias, outcome.canonicalHost)
 		if err != nil {
-			return EnsureNodeResult{}, err
+			return EnsureNodeResult{}, nil, err
 		}
-		nodeID = effectiveID
-	} else {
-		r.provider.setSavedNodeOpenSSHMetadataIfPresent(nodeID, outcome.openSSHAlias, outcome.canonicalHost)
+		return EnsureNodeResult{NodeID: effectiveID, Created: true}, entry, nil
 	}
-	return EnsureNodeResult{NodeID: nodeID, Created: created}, nil
+	r.provider.setSavedNodeOpenSSHMetadataIfPresent(nodeID, outcome.openSSHAlias, outcome.canonicalHost)
+	return EnsureNodeResult{NodeID: nodeID, Created: false}, nil, nil
 }
 
-func (r *Repository) registerPendingConnection(cfg *Configuration, nodeID, openSSHAlias, canonicalHost string) (string, error) {
+func (r *Repository) prepareExistingNodeLocked(decision targetDecision, opts EnsureNodeOptions) (EnsureNodeResult, *pendingConnection, error) {
+	id := decision.MatchedNodeID
+	var resolvedJump string
+	if opts.ExistingUpdate.JumpHost != "" {
+		var err error
+		resolvedJump, err = r.ResolveProxyJumpChain(opts.ExistingUpdate.JumpHost)
+		if err != nil {
+			return EnsureNodeResult{}, nil, fmt.Errorf("resolve proxy jump %q failed: %w", opts.ExistingUpdate.JumpHost, err)
+		}
+	}
+	if !opts.ExistingUpdate.Enabled || IsOpenSSHNodeID(id) {
+		r.syncPreparedExistingMetadataLocked(decision)
+		return EnsureNodeResult{NodeID: id}, nil, nil
+	}
+	snap := r.provider.Snapshot()
+	ver, err := nodeEntityVersion(snap, id)
+	if err != nil {
+		return EnsureNodeResult{}, nil, fmt.Errorf("resolve node %q reference: %w", id, err)
+	}
+	baseRef := NodeRef{ID: id, Version: ver}
+	node, host, identity, err := r.provider.Resolve(id)
+	if err != nil {
+		return EnsureNodeResult{}, nil, fmt.Errorf("resolve node %q for update failed: %w", id, err)
+	}
+	changed, err := applyPendingNodeUpdate(r.provider, id, &node, &identity, opts.ExistingUpdate, resolvedJump)
+	if err != nil {
+		return EnsureNodeResult{}, nil, err
+	}
+	if !changed {
+		r.syncPreparedExistingMetadataLocked(decision)
+		return EnsureNodeResult{NodeID: id}, nil, nil
+	}
+	// Validate the staged update against the full configuration graph (including
+	// ProxyJump cycle detection and strict alias rules) before dialing, without
+	// writing anything to disk until Confirm succeeds.
+	if _, _, _, err := prepareConfiguration(snap, func(cfg *Configuration) error {
+		return replaceNodeAtRef(cfg, baseRef, id, node, host, identity)
+	}); err != nil {
+		return EnsureNodeResult{}, nil, fmt.Errorf("validate staged update for node %q: %w", id, err)
+	}
+	entry, err := r.registerPendingUpdateLocked(id, baseRef, node, host, identity, decision.OpenSSHAlias, decision.CanonicalHost)
+	if err != nil {
+		return EnsureNodeResult{}, nil, err
+	}
+	return EnsureNodeResult{NodeID: id}, entry, nil
+}
+
+func applyPendingNodeUpdate(
+	provider *Provider,
+	nodeID string,
+	node *models.Node,
+	identity *models.Identity,
+	upd PendingNodeUpdate,
+	resolvedJump string,
+) (bool, error) {
+	changed := false
+	if resolvedJump != "" && resolvedJump != node.ProxyJump {
+		node.ProxyJump = resolvedJump
+		changed = true
+	}
+	if upd.Alias != "" {
+		if err := ValidateNodeAlias(upd.Alias); err != nil {
+			return false, err
+		}
+		if existing := provider.FindAlias(upd.Alias); existing == "" || existing == nodeID {
+			if !slices.Contains(node.Alias, upd.Alias) {
+				node.Alias = append(node.Alias, upd.Alias)
+				changed = true
+			}
+		}
+	}
+	if len(upd.Tags) > 0 {
+		for _, tag := range upd.Tags {
+			if tag != "" && !slices.Contains(node.Tags, tag) {
+				node.Tags = append(node.Tags, tag)
+				changed = true
+			}
+		}
+	}
+	if upd.RememberAuth && applyPendingNodeAuthUpdate(node, identity, upd) {
+		changed = true
+	}
+	return changed, nil
+}
+
+func applyPendingNodeAuthUpdate(node *models.Node, identity *models.Identity, upd PendingNodeUpdate) bool {
+	changed := false
+	if upd.HasPassword {
+		if identity.AuthType != "password" {
+			identity.AuthType = "password"
+			changed = true
+		}
+	} else if absKey := NormalizePersistableIdentityPath(upd.IdentityFile); absKey != "" {
+		if identity.KeyPath != absKey || identity.AuthType != "key" {
+			identity.KeyPath = absKey
+			identity.AuthType = "key"
+			changed = true
+		}
+	}
+	if upd.SudoMode != "" && upd.SudoMode != models.SudoModeNone && upd.SudoMode != models.SudoModeAuto && node.SudoMode != upd.SudoMode {
+		node.SudoMode = upd.SudoMode
+		changed = true
+	}
+	return changed
+}
+
+func (r *Repository) registerPendingUpdateLocked(
+	nodeID string,
+	baseRef NodeRef,
+	node models.Node,
+	host models.Host,
+	identity models.Identity,
+	openSSHAlias, canonicalHost string,
+) (*pendingConnection, error) {
+	if r.pending == nil {
+		r.pending = make(map[string]*pendingConnection)
+	}
+	origin := normalizeOpenSSHOrigin(OpenSSHOrigin{
+		Alias:         openSSHAlias,
+		CanonicalHost: canonicalHost,
+	})
+	if origin.IsZero() && r.provider != nil {
+		origin = r.provider.NodeOpenSSHOrigin(nodeID)
+	}
+	node.OpenSSHAlias = origin.Alias
+	node.CanonicalHost = origin.CanonicalHost
+	if previous := r.pending[nodeID]; previous != nil {
+		if previous.isUpdate && previous.baseRef == baseRef {
+			oldNode, oldHost, oldIdentity, err := previous.provider.Resolve(nodeID)
+			if err == nil && equalPersistedNode(oldNode, node) && reflect.DeepEqual(oldHost, host) && reflect.DeepEqual(oldIdentity, identity) {
+				previous.refs++
+				return previous, nil
+			}
+		}
+		return nil, fmt.Errorf("pending update for node %q conflicts with active pending connection: %w", nodeID, ErrConfigConflict)
+	}
+	pending := cloneConfiguration(nil)
+	pending.Nodes.Set(nodeID, cloneNode(node))
+	pending.Hosts.Set(node.HostRef, cloneHost(host))
+	pending.Identities.Set(node.IdentityRef, cloneIdentity(identity))
+	pendingProvider := NewProviderWithoutOpenSSH(pending)
+	if !origin.IsZero() {
+		pendingProvider.SetNodeOpenSSHOrigin(nodeID, origin)
+	}
+	entry := &pendingConnection{
+		provider:   pendingProvider,
+		provenance: ProvenanceSavedManaged,
+		gate:       &contextGate{},
+		refs:       1,
+		isUpdate:   true,
+		baseRef:    baseRef,
+	}
+	r.pending[nodeID] = entry
+	return entry, nil
+}
+
+func (r *Repository) registerPendingConnection(cfg *Configuration, nodeID, openSSHAlias, canonicalHost string) (string, *pendingConnection, error) {
 	// Retain only this connection's entities, never a stale copy of the
 	// whole configuration that could overwrite concurrent changes.
 	node, _ := cfg.Nodes.Get(nodeID)
@@ -87,8 +408,8 @@ func (r *Repository) registerPendingConnection(cfg *Configuration, nodeID, openS
 		r.pending = make(map[string]*pendingConnection)
 	}
 	if previous := r.pending[nodeID]; previous != nil {
-		if existingID, handled, err := r.tryReuseOrDisambiguatePending(cfg, previous, nodeID, node, host, identity); handled || err != nil {
-			return existingID, err
+		if existingID, entry, handled, err := r.tryReuseOrDisambiguatePending(cfg, previous, nodeID, node, host, identity); handled || err != nil {
+			return existingID, entry, err
 		}
 		nodeID = OpenSSHNodePrefix + FormatNodeID(identity.User, node.OpenSSHAlias, host.Port)
 	}
@@ -111,8 +432,9 @@ func (r *Repository) registerPendingConnection(cfg *Configuration, nodeID, openS
 			prov = ProvenanceOpenSSHDerived
 		}
 	}
-	r.pending[nodeID] = &pendingConnection{provider: pendingProvider, provenance: prov, gate: &contextGate{}, refs: 1}
-	return nodeID, nil
+	entry := &pendingConnection{provider: pendingProvider, provenance: prov, gate: &contextGate{}, refs: 1}
+	r.pending[nodeID] = entry
+	return nodeID, entry, nil
 }
 
 func (r *Repository) tryReuseOrDisambiguatePending(
@@ -122,47 +444,50 @@ func (r *Repository) tryReuseOrDisambiguatePending(
 	node models.Node,
 	host models.Host,
 	identity models.Identity,
-) (string, bool, error) {
+) (string, *pendingConnection, bool, error) {
+	if previous.isUpdate {
+		return "", nil, false, fmt.Errorf("pending connection %q changed: %w", nodeID, ErrConfigConflict)
+	}
 	oldNode, oldHost, oldIdentity, err := previous.provider.Resolve(nodeID)
 	if err != nil {
-		return "", false, fmt.Errorf("resolve pending connection %q: %w", nodeID, err)
+		return "", nil, false, fmt.Errorf("resolve pending connection %q: %w", nodeID, err)
 	}
 	normalizedNode := node
 	normalizedNode.IdentityRef = privateIdentityReference(cfg, nodeID)
 	if equalPersistedNode(oldNode, normalizedNode) && reflect.DeepEqual(oldHost, host) && reflect.DeepEqual(oldIdentity, identity) {
 		if oldNode.OpenSSHAlias == node.OpenSSHAlias && oldNode.CanonicalHost == node.CanonicalHost {
 			previous.refs++
-			return nodeID, true, nil
+			return nodeID, previous, true, nil
 		}
-		if upgradedID, ok := r.upgradePendingAliasAndCanonical(previous, nodeID, oldNode, normalizedNode, host, identity); ok {
-			return upgradedID, true, nil
+		if upgradedID, entry, ok := r.upgradePendingAliasAndCanonical(previous, nodeID, oldNode, normalizedNode, host, identity); ok {
+			return upgradedID, entry, true, nil
 		}
 	}
 	if node.OpenSSHAlias == "" || oldNode.OpenSSHAlias == node.OpenSSHAlias {
-		return "", false, fmt.Errorf("pending connection %q changed: %w", nodeID, ErrConfigConflict)
+		return "", nil, false, fmt.Errorf("pending connection %q changed: %w", nodeID, ErrConfigConflict)
 	}
 	altID := OpenSSHNodePrefix + FormatNodeID(identity.User, node.OpenSSHAlias, host.Port)
 	altPrev := r.pending[altID]
 	if altPrev == nil {
-		return "", false, nil
+		return "", nil, false, nil
 	}
 	altOldNode, altOldHost, altOldIdentity, altErr := altPrev.provider.Resolve(altID)
 	if altErr != nil {
-		return "", false, fmt.Errorf("resolve pending connection %q: %w", altID, altErr)
+		return "", nil, false, fmt.Errorf("resolve pending connection %q: %w", altID, altErr)
 	}
 	altNormalized := node
 	altNormalized.IdentityRef = privateIdentityReference(cfg, altID)
 	if !equalPersistedNode(altOldNode, altNormalized) || !reflect.DeepEqual(altOldHost, host) || !reflect.DeepEqual(altOldIdentity, identity) {
-		return "", false, fmt.Errorf("pending connection %q changed: %w", altID, ErrConfigConflict)
+		return "", nil, false, fmt.Errorf("pending connection %q changed: %w", altID, ErrConfigConflict)
 	}
 	if altOldNode.OpenSSHAlias == node.OpenSSHAlias && altOldNode.CanonicalHost == node.CanonicalHost {
 		altPrev.refs++
-		return altID, true, nil
+		return altID, altPrev, true, nil
 	}
-	if upgradedID, ok := r.upgradePendingAliasAndCanonical(altPrev, altID, altOldNode, altNormalized, host, identity); ok {
-		return upgradedID, true, nil
+	if upgradedID, entry, ok := r.upgradePendingAliasAndCanonical(altPrev, altID, altOldNode, altNormalized, host, identity); ok {
+		return upgradedID, entry, true, nil
 	}
-	return "", false, fmt.Errorf("pending connection %q changed: %w", altID, ErrConfigConflict)
+	return "", nil, false, fmt.Errorf("pending connection %q changed: %w", altID, ErrConfigConflict)
 }
 
 func (r *Repository) upgradePendingAliasAndCanonical(
@@ -171,11 +496,11 @@ func (r *Repository) upgradePendingAliasAndCanonical(
 	oldNode, normalizedNode models.Node,
 	host models.Host,
 	identity models.Identity,
-) (string, bool) {
+) (string, *pendingConnection, bool) {
 	aliasUpgradable := oldNode.OpenSSHAlias == normalizedNode.OpenSSHAlias || (oldNode.OpenSSHAlias == "" && normalizedNode.OpenSSHAlias != "")
 	canonUpgradable := oldNode.CanonicalHost == normalizedNode.CanonicalHost || (oldNode.CanonicalHost == "" && normalizedNode.CanonicalHost != "")
 	if !aliasUpgradable || !canonUpgradable {
-		return "", false
+		return "", nil, false
 	}
 	pending := cloneConfiguration(nil)
 	pending.Nodes.Set(nodeID, normalizedNode)
@@ -201,8 +526,9 @@ func (r *Repository) upgradePendingAliasAndCanonical(
 	if refs < 1 {
 		refs = 1
 	}
-	r.pending[nodeID] = &pendingConnection{provider: upgradedProvider, provenance: prov, gate: gate, refs: refs + 1}
-	return nodeID, true
+	upgraded := &pendingConnection{provider: upgradedProvider, provenance: prov, gate: gate, refs: refs + 1}
+	r.pending[nodeID] = upgraded
+	return nodeID, upgraded, true
 }
 
 func (r *Repository) connectionProviderWithProvenance(nodeID string) (*Provider, NodeProvenance) {
@@ -256,16 +582,9 @@ func (r *Repository) pendingConnectionSnapshot(nodeID string) (ConnectionSnapsho
 	return snap, true
 }
 
-// ConfirmNodeContext saves exactly the prepared connection after SSH
-// authentication succeeds. Conflicting concurrent edits are never overwritten.
-// A failed save leaves the pending connection available for an explicit retry;
-// an applied write is never rolled back, even if durability is uncertain.
-func (r *Repository) ConfirmNodeContext(ctx context.Context, nodeID string) error {
-	return r.confirmNodeContext(ctx, nodeID, nil)
-}
-
 // PendingNodeExecution returns a defensive execution snapshot only for a new,
-// unconfirmed node. Saved and OpenSSH virtual nodes are never enrollment targets.
+// unconfirmed node. Saved nodes (including staged updates) and OpenSSH virtual
+// nodes are never enrollment targets.
 func (r *Repository) PendingNodeExecution(nodeID string) (*ssh.ExecutionConfig, bool) {
 	if r == nil || IsOpenSSHNodeID(nodeID) {
 		return nil, false
@@ -273,21 +592,11 @@ func (r *Repository) PendingNodeExecution(nodeID string) (*ssh.ExecutionConfig, 
 	r.pendingMu.RLock()
 	defer r.pendingMu.RUnlock()
 	pending := r.pending[nodeID]
-	if pending == nil {
+	if pending == nil || pending.isUpdate {
 		return nil, false
 	}
 	node, ok := pending.provider.GetNode(nodeID)
 	return node.Execution.Clone(), ok
-}
-
-// ConfirmNodeWithExecutionContext includes a successful enrollment probe in the
-// same node-creation transaction. Existing pending execution settings win.
-func (r *Repository) ConfirmNodeWithExecutionContext(ctx context.Context, nodeID string, execution *ssh.ExecutionConfig) error {
-	execution = execution.Clone()
-	if err := execution.Validate(); err != nil {
-		return fmt.Errorf("validate enrollment execution: %w", err)
-	}
-	return r.confirmNodeContext(ctx, nodeID, execution)
 }
 
 func (r *Repository) buildConfirmPublishAction(pending *pendingConnection, nodeID, baseAlias, baseCanon string) *publishAction {
@@ -320,36 +629,34 @@ func (r *Repository) buildConfirmPublishAction(pending *pendingConnection, nodeI
 	}
 }
 
-// DiscardPendingNode releases one caller reference to an unconfirmed pending
-// connection entry. When the last reference is released (refs <= 0), the entry
-// is removed from r.pending so failed or canceled connections do not leak memory
-// or poison subsequent PrepareNodeContext calls while concurrent callers sharing
-// the same pending entry remain undisturbed.
-func (r *Repository) DiscardPendingNode(nodeID string) {
-	if r == nil || nodeID == "" {
+func (r *Repository) discardPendingEntry(nodeID string, entry *pendingConnection) {
+	if r == nil || nodeID == "" || entry == nil {
 		return
 	}
 	r.pendingMu.Lock()
 	defer r.pendingMu.Unlock()
-	pending := r.pending[nodeID]
-	if pending == nil {
+	current := r.pending[nodeID]
+	if current == nil {
 		return
 	}
-	pending.refs--
-	if pending.refs <= 0 {
+	if current != entry && current.gate != entry.gate {
+		return
+	}
+	current.refs--
+	if current.refs <= 0 {
 		delete(r.pending, nodeID)
 	}
 }
 
-func (r *Repository) confirmNodeContext(ctx context.Context, nodeID string, execution *ssh.ExecutionConfig) error {
+func (r *Repository) confirmPendingEntry(ctx context.Context, nodeID string, entry *pendingConnection, execution *ssh.ExecutionConfig) error {
 	if r == nil || ctx == nil {
 		return fmt.Errorf("confirm connection requires repository and context")
 	}
 	if IsOpenSSHNodeID(nodeID) {
-		r.DiscardPendingNode(nodeID)
+		r.discardPendingEntry(nodeID, entry)
 		return nil
 	}
-	pending, err := r.acquirePendingConfirmationGate(ctx, nodeID)
+	pending, err := r.acquirePendingConfirmationGate(ctx, nodeID, entry)
 	if err != nil || pending == nil {
 		return err
 	}
@@ -359,10 +666,22 @@ func (r *Repository) confirmNodeContext(ctx context.Context, nodeID string, exec
 	if err != nil {
 		return fmt.Errorf("resolve pending connection %q: %w", nodeID, err)
 	}
+	action := r.buildConfirmPublishAction(pending, nodeID, node.OpenSSHAlias, node.CanonicalHost)
+	if pending.isUpdate {
+		storedNode := cloneNode(node)
+		storedNode.OpenSSHAlias = ""
+		storedNode.CanonicalHost = ""
+		_, err = r.commitResultWithPublishAction(ctx, anyRevision, func(cfg *Configuration) error {
+			return replaceNodeAtRef(cfg, pending.baseRef, nodeID, storedNode, host, identity)
+		}, action)
+		if err != nil {
+			return fmt.Errorf("save authenticated node update %q: %w", nodeID, err)
+		}
+		return nil
+	}
 	if execution != nil && ssh.NeedsExecutionProbe(node.Execution) {
 		node.Execution = execution.Clone()
 	}
-	action := r.buildConfirmPublishAction(pending, nodeID, node.OpenSSHAlias, node.CanonicalHost)
 	_, err = r.commitResultWithPublishAction(ctx, anyRevision, func(cfg *Configuration) error {
 		return mergeConfirmedNodeConfig(cfg, nodeID, node, host, identity)
 	}, action)
@@ -372,7 +691,7 @@ func (r *Repository) confirmNodeContext(ctx context.Context, nodeID string, exec
 	return nil
 }
 
-func (r *Repository) acquirePendingConfirmationGate(ctx context.Context, nodeID string) (*pendingConnection, error) {
+func (r *Repository) acquirePendingConfirmationGate(ctx context.Context, nodeID string, entry *pendingConnection) (*pendingConnection, error) {
 	for {
 		r.pendingMu.RLock()
 		pending := r.pending[nodeID]
@@ -382,6 +701,9 @@ func (r *Repository) acquirePendingConfirmationGate(ctx context.Context, nodeID 
 		}
 		r.pendingMu.RUnlock()
 		if pending == nil || prov == ProvenanceOpenSSHVirtual {
+			return nil, nil
+		}
+		if entry != nil && pending != entry && pending.gate != entry.gate {
 			return nil, nil
 		}
 		// Serialize confirmation of this node without holding the pending map

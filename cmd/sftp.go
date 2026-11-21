@@ -215,9 +215,7 @@ func (o *SftpOptions) Run() error {
 }
 
 // RunContext starts the interactive SFTP session and propagates caller cancellation.
-//
-//nolint:gocyclo
-func (o *SftpOptions) RunContext(ctx context.Context) (err error) {
+func (o *SftpOptions) RunContext(ctx context.Context) error {
 	if err := o.ensureGeneralOptionsApplied(); err != nil {
 		return err
 	}
@@ -228,11 +226,6 @@ func (o *SftpOptions) RunContext(ctx context.Context) (err error) {
 		return err
 	}
 	batch := !term.IsTerminal(int(os.Stdin.Fd()))
-	connectionOptions := o.SshOptions
-	if batch {
-		ctx = credential.WithoutInteraction(ctx)
-		connectionOptions.Remember = "never"
-	}
 	configPath, keyPath, pathErr := utils.GetConfigFilePath()
 	if pathErr != nil {
 		return fmt.Errorf("get config file path failed: %w", pathErr)
@@ -247,128 +240,146 @@ func (o *SftpOptions) RunContext(ctx context.Context) (err error) {
 	if err != nil {
 		return fmt.Errorf("create configuration repository: %w", err)
 	}
-	provider, err := config.WithOpenSSHConfigOverride(repo, connectionOptions.control.ConfigFile)
+	provider, err := config.WithOpenSSHConfigOverride(repo, o.control.ConfigFile)
 	if err != nil {
 		return err
 	}
+	return o.runWithProvider(ctx, cfg, provider, batch)
+}
 
-	var nodeID string
-	nodeID, _, err = connectionOptions.resolveNode(ctx, provider)
-	if err != nil {
-		return err
-	}
-	adpOpts, optErr := connectionOptions.buildAdapterOptions(nodeID, cfg, provider)
-	if optErr != nil {
-		return optErr
-	}
-	adpOpts = append(adpOpts, adapter.WithLocalExecution(!batch), adapter.WithSessionAndForwardOptions(false), adapter.WithEnrollmentProbeExclusions(nodeID))
-	var connector *ssh.Connector
-	// The diagnostic sink must outlive the connector, SFTP client and shell, which
-	// are the event producers. Deferring it first makes it the last cleanup to run.
-	observer, finishDiagnostics, diagnosticErr := connectionOptions.startDiagnostics(ctx)
-	if diagnosticErr != nil {
-		return diagnosticErr
-	}
-	defer func() {
-		err = errors.Join(err, finishDiagnostics())
-	}()
+//nolint:gocyclo
+func (o *SftpOptions) runWithProvider(ctx context.Context, cfg *config.Configuration, provider config.ConfigProvider, batch bool) error {
+	connectionOptions := o.SshOptions
 	if batch {
-		adpOpts = append(adpOpts, adapter.WithNonInteractive(true))
-		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(observer))
-	} else {
-		connector = newCLIConnectorWithAdapterOptions(provider, connectionOptions.interaction, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(observer))
+		ctx = credential.WithoutInteraction(ctx)
+		connectionOptions.Remember = "never"
 	}
-	defer func() {
-		joinConnectorCloseError(&err, connector)
-	}()
-	client, err := connector.Connect(ctx, nodeID)
+	req, err := connectionOptions.buildPendingEnsureOptions(ctx, provider)
 	if err != nil {
-		return fmt.Errorf("%s: %w", i18n.T("err_connect_failed"), err)
+		return err
 	}
-	sftpClient, err := sftp.NewClient(
-		ctx,
-		client,
-		sftp.WithConcurrentFiles(o.maxTask),
-		sftp.WithThreadsPerFile(o.maxThread),
-		sftp.WithForce(o.force),
-		sftp.WithDiagnostics(observer),
-		sftp.WithSudo(o.Sudo),
-	)
-	if err != nil {
-		return fmt.Errorf("%s: %w", i18n.T("err_connect_failed"), err)
-	}
-	// 连接监控：
-	// 1. KeepAlive 心跳探测网络黑洞型断连（探测失败或超时会关闭底层 SSH 连接）
-	// 2. Wait watcher 感知任何原因的连接关闭（服务端断开 / 心跳主动 Close），
-	//    连接断开后取消 runCtx、唤醒交互 Prompt 并自动退出
-	runCtx, runCancel := context.WithCancel(ctx)
-	defer runCancel()
+	return config.WithPendingNode(ctx, provider, req, func(lease config.PendingLease) (err error) {
+		nodeID := lease.NodeID()
+		adpOpts, optErr := connectionOptions.buildAdapterOptions(nodeID, cfg, provider)
+		if optErr != nil {
+			return optErr
+		}
+		adpOpts = append(adpOpts, adapter.WithLocalExecution(!batch), adapter.WithSessionAndForwardOptions(false), adapter.WithEnrollmentProbeExclusions(nodeID))
+		// The diagnostic sink must outlive the connector, SFTP client and shell, which
+		// are the event producers. Deferring it first makes it the last cleanup to run.
+		observer, finishDiagnostics, diagnosticErr := connectionOptions.startDiagnostics(ctx)
+		if diagnosticErr != nil {
+			return diagnosticErr
+		}
+		defer func() {
+			err = errors.Join(err, finishDiagnostics())
+		}()
+		var (
+			connector *ssh.Connector
+			adp       *adapter.SSHAdapter
+		)
+		if batch {
+			adpOpts = append(adpOpts, adapter.WithNonInteractive(true))
+			connector, adp = newNonInteractiveConnectorAndAdapter(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(observer))
+		} else {
+			connector, adp = newCLIConnectorAndAdapter(provider, connectionOptions.interaction, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(observer))
+		}
+		defer func() {
+			joinConnectorCloseError(&err, connector)
+		}()
+		client, err := connector.Connect(ctx, nodeID)
+		if err != nil {
+			return fmt.Errorf("%s: %w", i18n.T("err_connect_failed"), err)
+		}
+		if finalizeErr := adp.FinalizePendingConnection(ctx, lease, client); finalizeErr != nil {
+			_ = connector.EvictClient(client)
+			return fmt.Errorf("%s: %w", i18n.T("err_connect_failed"), finalizeErr)
+		}
+		sftpClient, err := sftp.NewClient(
+			ctx,
+			client,
+			sftp.WithConcurrentFiles(o.maxTask),
+			sftp.WithThreadsPerFile(o.maxThread),
+			sftp.WithForce(o.force),
+			sftp.WithDiagnostics(observer),
+			sftp.WithSudo(o.Sudo),
+		)
+		if err != nil {
+			return fmt.Errorf("%s: %w", i18n.T("err_connect_failed"), err)
+		}
+		// 连接监控：
+		// 1. KeepAlive 心跳探测网络黑洞型断连（探测失败或超时会关闭底层 SSH 连接）
+		// 2. Wait watcher 感知任何原因的连接关闭（服务端断开 / 心跳主动 Close），
+		//    连接断开后取消 runCtx、唤醒交互 Prompt 并自动退出
+		runCtx, runCancel := context.WithCancel(ctx)
+		defer runCancel()
 
-	keepAliveDone := ssh.StartKeepAlive(runCtx, client.SSHClient(), sftpKeepAliveInterval, sftpKeepAliveTimeout, nil)
-	shellDone := make(chan struct{})
-	watcherDone := make(chan struct{})
-	disconnectErr := make(chan error, 1)
-	var shellDoneOnce sync.Once
-	markShellDone := func() {
-		shellDoneOnce.Do(func() { close(shellDone) })
-	}
-	defer func() {
-		markShellDone()
-		runCancel()
-		if closeErr := sftpClient.Close(); closeErr != nil {
-			err = errors.Join(err, fmt.Errorf("close SFTP client failed: %w", closeErr))
+		keepAliveDone := ssh.StartKeepAlive(runCtx, client.SSHClient(), sftpKeepAliveInterval, sftpKeepAliveTimeout, nil)
+		shellDone := make(chan struct{})
+		watcherDone := make(chan struct{})
+		disconnectErr := make(chan error, 1)
+		var shellDoneOnce sync.Once
+		markShellDone := func() {
+			shellDoneOnce.Do(func() { close(shellDone) })
 		}
-		if handoffErr := connectionOptions.handoffPersistentMaster(ctx, connector, provider, nodeID); handoffErr != nil {
-			logger.DefaultLogger().Debugf("mux: master handoff failed: %v", handoffErr)
-		}
-		if closeErr := client.Close(); closeErr != nil {
-			err = errors.Join(err, fmt.Errorf("close SSH client after SFTP shell failed: %w", closeErr))
-		}
-		<-keepAliveDone
-		<-watcherDone
-	}()
-
-	go func() {
-		defer close(watcherDone)
-		waitErr := client.SSHClient().Wait()
-		select {
-		case <-shellDone:
-			// shell 已正常退出（用户输入 exit/bye），连接关闭属于预期清理，无需提示
-		default:
-			// shell 仍在运行，说明是异常断连
-			connectionErr := sftpConnectionLostError(waitErr)
-			disconnectErr <- connectionErr
+		defer func() {
+			markShellDone()
 			runCancel()
-		}
-	}()
+			if closeErr := sftpClient.Close(); closeErr != nil {
+				err = errors.Join(err, fmt.Errorf("close SFTP client failed: %w", closeErr))
+			}
+			if handoffErr := connectionOptions.handoffPersistentMaster(ctx, connector, provider, nodeID); handoffErr != nil {
+				logger.DefaultLogger().Debugf("mux: master handoff failed: %v", handoffErr)
+			}
+			if closeErr := client.Close(); closeErr != nil {
+				err = errors.Join(err, fmt.Errorf("close SSH client after SFTP shell failed: %w", closeErr))
+			}
+			<-keepAliveDone
+			<-watcherDone
+		}()
 
-	// 启动 Shell
-	shell, err := sftpshell.New(ctx, sftpClient, client, os.Stdin, os.Stdout, os.Stderr, sftpshell.WithLogger(logger.DefaultLogger()), sftpshell.WithNoOverwrite(o.noOverwrite), sftpshell.WithSudo(o.Sudo))
-	if err != nil {
-		markShellDone()
-		return fmt.Errorf("%s: %w", i18n.T("sftp_shell_create_failed"), err)
-	}
-	defer func() {
-		closeCtx, cancelClose := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-		defer cancelClose()
-		if closeErr := shell.Close(closeCtx); closeErr != nil {
-			err = errors.Join(err, closeErr)
-		}
-	}()
-	if err := shell.Run(runCtx); err != nil {
-		markShellDone()
-		if errors.Is(err, context.Canceled) {
+		go func() {
+			defer close(watcherDone)
+			waitErr := client.SSHClient().Wait()
 			select {
-			case connectionErr := <-disconnectErr:
-				return fmt.Errorf("%s: %w", i18n.T("sftp_shell_start_failed"), errors.Join(err, connectionErr))
+			case <-shellDone:
+				// shell 已正常退出（用户输入 exit/bye），连接关闭属于预期清理，无需提示
 			default:
-				if ctxErr := ctx.Err(); ctxErr != nil {
-					return fmt.Errorf("%s: %w", i18n.T("sftp_shell_start_failed"), errors.Join(err, ctxErr))
+				// shell 仍在运行，说明是异常断连
+				connectionErr := sftpConnectionLostError(waitErr)
+				disconnectErr <- connectionErr
+				runCancel()
+			}
+		}()
+
+		// 启动 Shell
+		shell, err := sftpshell.New(ctx, sftpClient, client, os.Stdin, os.Stdout, os.Stderr, sftpshell.WithLogger(logger.DefaultLogger()), sftpshell.WithNoOverwrite(o.noOverwrite), sftpshell.WithSudo(o.Sudo))
+		if err != nil {
+			markShellDone()
+			return fmt.Errorf("%s: %w", i18n.T("sftp_shell_create_failed"), err)
+		}
+		defer func() {
+			closeCtx, cancelClose := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			defer cancelClose()
+			if closeErr := shell.Close(closeCtx); closeErr != nil {
+				err = errors.Join(err, closeErr)
+			}
+		}()
+		if err := shell.Run(runCtx); err != nil {
+			markShellDone()
+			if errors.Is(err, context.Canceled) {
+				select {
+				case connectionErr := <-disconnectErr:
+					return fmt.Errorf("%s: %w", i18n.T("sftp_shell_start_failed"), errors.Join(err, connectionErr))
+				default:
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						return fmt.Errorf("%s: %w", i18n.T("sftp_shell_start_failed"), errors.Join(err, ctxErr))
+					}
 				}
 			}
+			return fmt.Errorf("%s: %w", i18n.T("sftp_shell_start_failed"), err)
 		}
-		return fmt.Errorf("%s: %w", i18n.T("sftp_shell_start_failed"), err)
-	}
-	markShellDone()
-	return nil
+		markShellDone()
+		return nil
+	})
 }

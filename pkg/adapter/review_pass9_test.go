@@ -1,7 +1,6 @@
 package adapter
 
 import (
-	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -60,45 +59,43 @@ func TestPass9_H1_UnpersistedUserOverrideOpenSSHNodePreservesTier4AndGuardrails(
 	if err != nil {
 		t.Fatalf("WithOpenSSHConfigOverride: %v", err)
 	}
-	preparer := provider.(interface {
-		PrepareNodeContext(context.Context, config.EnsureNodeOptions) (config.EnsureNodeResult, error)
-	})
-
 	// Prepare ONLY role-b first so it gets a non-collided pending ID ("ops@10.0.0.5:22"), NOT openssh:...!
-	resB, err := preparer.PrepareNodeContext(t.Context(), config.EnsureNodeOptions{
+	if err := config.WithPendingNode(t.Context(), provider, config.EnsureNodeOptions{
 		Target: config.ConnectionTarget{Selector: "role-b", User: "ops", HasUser: true},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(role-b): %v", err)
-	}
-	if strings.HasPrefix(resB.NodeID, config.OpenSSHNodePrefix) {
-		t.Fatalf("expected non-collided pending ID, got %q", resB.NodeID)
-	}
+	}, func(leaseB config.PendingLease) error {
+		resBID := leaseB.NodeID()
+		if strings.HasPrefix(resBID, config.OpenSSHNodePrefix) {
+			t.Fatalf("expected non-collided pending ID, got %q", resBID)
+		}
 
-	restrictedAdp := NewSSHAdapter(provider, WithLocalExecution(false))
-	if _, err := restrictedAdp.GetConfig(resB.NodeID); !errors.Is(err, ErrLocalExecutionDisabled) {
-		t.Fatalf("expected ErrLocalExecutionDisabled on unpersisted pending OpenSSH alias %q, got %v", resB.NodeID, err)
-	}
+		restrictedAdp := NewSSHAdapter(provider, WithLocalExecution(false))
+		if _, err := restrictedAdp.GetConfig(resBID); !errors.Is(err, ErrLocalExecutionDisabled) {
+			t.Fatalf("expected ErrLocalExecutionDisabled on unpersisted pending OpenSSH alias %q, got %v", resBID, err)
+		}
 
-	adp := NewSSHAdapter(provider, WithLocalExecution(true), WithSessionAndForwardOptions(true))
-	cfgB, err := adp.GetConfig(resB.NodeID)
-	if err != nil {
-		t.Fatalf("GetConfig(%q): %v", resB.NodeID, err)
-	}
-	if cfgB.Options == nil {
-		t.Fatal("expected non-nil cfgB.Options")
-	}
-	if got := cfgB.Options.ActiveProxyCommand(); got != "nc %h %p" {
-		t.Errorf("ActiveProxyCommand = %q, want %q", got, "nc %h %p")
-	}
-	if !slices.Contains(cfgB.Options.SetEnvDirectives(), "APP_ROLE=b") {
-		t.Errorf("SetEnvDirectives = %v, want APP_ROLE=b", cfgB.Options.SetEnvDirectives())
-	}
-	if !slices.Contains(cfgB.Options.SendEnvPatterns(), "LC_ALL") {
-		t.Errorf("SendEnvPatterns = %v, want LC_ALL", cfgB.Options.SendEnvPatterns())
-	}
-	if !slices.Contains(cfgB.Options.IdentityFiles(), keyB) {
-		t.Errorf("IdentityFiles = %v, want %s", cfgB.Options.IdentityFiles(), keyB)
+		adp := NewSSHAdapter(provider, WithLocalExecution(true), WithSessionAndForwardOptions(true))
+		cfgB, err := adp.GetConfig(resBID)
+		if err != nil {
+			t.Fatalf("GetConfig(%q): %v", resBID, err)
+		}
+		if cfgB.Options == nil {
+			t.Fatal("expected non-nil cfgB.Options")
+		}
+		if got := cfgB.Options.ActiveProxyCommand(); got != "nc %h %p" {
+			t.Errorf("ActiveProxyCommand = %q, want %q", got, "nc %h %p")
+		}
+		if !slices.Contains(cfgB.Options.SetEnvDirectives(), "APP_ROLE=b") {
+			t.Errorf("SetEnvDirectives = %v, want APP_ROLE=b", cfgB.Options.SetEnvDirectives())
+		}
+		if !slices.Contains(cfgB.Options.SendEnvPatterns(), "LC_ALL") {
+			t.Errorf("SendEnvPatterns = %v, want LC_ALL", cfgB.Options.SendEnvPatterns())
+		}
+		if !slices.Contains(cfgB.Options.IdentityFiles(), keyB) {
+			t.Errorf("IdentityFiles = %v, want %s", cfgB.Options.IdentityFiles(), keyB)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode(role-b): %v", err)
 	}
 
 	// Collided/explicit openssh:role-jump allows Tier-3 global ProxyCommand to override Tier-4 ProxyJump.

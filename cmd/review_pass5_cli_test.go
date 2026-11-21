@@ -115,19 +115,23 @@ func verifyPass5H3ExecSavedOverrides(t *testing.T, savedRepo *config.Repository)
 		if err := oExec.Complete(NewCmdExec(), nil); err != nil {
 			t.Fatalf("Complete(%q): %v", tc.selector, err)
 		}
-		tasks, hostErrs, err := oExec.buildTasksFromHosts(t.Context(), savedRepo)
-		if err != nil || len(hostErrs) != 0 || len(tasks) != 1 {
-			t.Fatalf("buildTasksFromHosts(%q) = (%v, %v, %v)", tc.selector, tasks, hostErrs, err)
-		}
-		if tasks[0].nodeID != tc.wantNode || tasks[0].originalHost != "" {
-			t.Fatalf("task(%q) = (nodeID=%q, orig=%q), want (%q, empty)", tc.selector, tasks[0].nodeID, tasks[0].originalHost, tc.wantNode)
-		}
-		auth, err := oExec.buildTaskSessionAuth(tasks[0], nil, false, false)
-		if err != nil {
-			t.Fatalf("buildTaskSessionAuth(%q): %v", tc.selector, err)
-		}
-		if auth.OriginalHost != "" || auth.HostName != tc.wantHost+".internal" {
-			t.Fatalf("auth(%q) = (OriginalHost=%q, HostName=%q), want (empty, %q)", tc.selector, auth.OriginalHost, auth.HostName, tc.wantHost+".internal")
+		if err := oExec.withTestPendingHostTasks(t.Context(), savedRepo, func(tasks []execHostTask, _ []config.PendingLease, hostErrs []error) error {
+			if len(hostErrs) != 0 || len(tasks) != 1 {
+				t.Fatalf("withTestPendingHostTasks(%q) = (%v, %v)", tc.selector, tasks, hostErrs)
+			}
+			if tasks[0].nodeID != tc.wantNode || tasks[0].originalHost != "" {
+				t.Fatalf("task(%q) = (nodeID=%q, orig=%q), want (%q, empty)", tc.selector, tasks[0].nodeID, tasks[0].originalHost, tc.wantNode)
+			}
+			auth, err := oExec.buildTaskSessionAuth(tasks[0], nil, false, false)
+			if err != nil {
+				t.Fatalf("buildTaskSessionAuth(%q): %v", tc.selector, err)
+			}
+			if auth.OriginalHost != "" || auth.HostName != tc.wantHost+".internal" {
+				t.Fatalf("auth(%q) = (OriginalHost=%q, HostName=%q), want (empty, %q)", tc.selector, auth.OriginalHost, auth.HostName, tc.wantHost+".internal")
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("withTestPendingHostTasks(%q): %v", tc.selector, err)
 		}
 	}
 }
@@ -307,24 +311,26 @@ func verifyPass5M5SavedAndUnsafeHostName(t *testing.T, repo *config.Repository) 
 		if err := oSaved.Validate(); err != nil {
 			t.Fatalf("Validate(%q): %v", savedAlias, err)
 		}
-		nodeID, _, err := oSaved.resolveNode(t.Context(), repo)
-		if err != nil {
-			t.Fatalf("resolveNode(%q): %v", savedAlias, err)
-		}
-		adpOpts, err := oSaved.buildAdapterOptions(nodeID, repo.Snapshot(), repo)
-		if err != nil {
-			t.Fatalf("buildAdapterOptions(%q): %v", savedAlias, err)
-		}
-		clientCfg, err := adapter.NewSSHAdapter(repo, adpOpts...).GetConfig(nodeID)
-		if err != nil {
-			t.Fatalf("GetConfig(%q): %v", nodeID, err)
-		}
-		if clientCfg.Address != "10.238.221.181" || clientCfg.OriginalHost != "" {
-			t.Fatalf("saved alias %q ClientConfig = (Address=%q, OriginalHost=%q), want (10.238.221.181, empty)", savedAlias, clientCfg.Address, clientCfg.OriginalHost)
-		}
-		ctlTarget := controlTarget(oSaved, repo, nodeID)
-		if ctlTarget.Host != "10.238.221.181" || ctlTarget.OriginalHost != "iaas@10.238.221.181:22" {
-			t.Fatalf("saved alias %q controlTarget = %+v, want Host=10.238.221.181 OriginalHost=iaas@10.238.221.181:22", savedAlias, ctlTarget)
+		if err := oSaved.withTestPendingNode(t.Context(), repo, func(lease config.PendingLease) error {
+			nodeID := lease.NodeID()
+			adpOpts, err := oSaved.buildAdapterOptions(nodeID, repo.Snapshot(), repo)
+			if err != nil {
+				t.Fatalf("buildAdapterOptions(%q): %v", savedAlias, err)
+			}
+			clientCfg, err := adapter.NewSSHAdapter(repo, adpOpts...).GetConfig(nodeID)
+			if err != nil {
+				t.Fatalf("GetConfig(%q): %v", nodeID, err)
+			}
+			if clientCfg.Address != "10.238.221.181" || clientCfg.OriginalHost != "" {
+				t.Fatalf("saved alias %q ClientConfig = (Address=%q, OriginalHost=%q), want (10.238.221.181, empty)", savedAlias, clientCfg.Address, clientCfg.OriginalHost)
+			}
+			ctlTarget := controlTarget(oSaved, repo, nodeID)
+			if ctlTarget.Host != "10.238.221.181" || ctlTarget.OriginalHost != "iaas@10.238.221.181:22" {
+				t.Fatalf("saved alias %q controlTarget = %+v, want Host=10.238.221.181 OriginalHost=iaas@10.238.221.181:22", savedAlias, ctlTarget)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("withTestPendingNode(%q): %v", savedAlias, err)
 		}
 	}
 
@@ -357,41 +363,43 @@ func verifyPass5M5OpenSSHAliasParity(t *testing.T, repo *config.Repository) {
 	if err := oAlias.Validate(); err != nil {
 		t.Fatalf("Validate(alias): %v", err)
 	}
-	aliasNodeID, _, err := oAlias.resolveNode(t.Context(), repo)
-	if err != nil {
-		t.Fatalf("resolveNode(alias): %v", err)
-	}
-	aliasAdpOpts, err := oAlias.buildAdapterOptions(aliasNodeID, repo.Snapshot(), repo)
-	if err != nil {
-		t.Fatalf("buildAdapterOptions(alias): %v", err)
-	}
-	aliasCfg, err := adapter.NewSSHAdapter(repo, aliasAdpOpts...).GetConfig(aliasNodeID)
-	if err != nil {
-		t.Fatalf("GetConfig(alias): %v", err)
-	}
-	if aliasCfg.OriginalHost != "app-alias" || aliasCfg.Address != "app-alias.corp" {
-		t.Fatalf("OpenSSH alias ClientConfig = (OriginalHost=%q, Address=%q), want (app-alias, app-alias.corp)", aliasCfg.OriginalHost, aliasCfg.Address)
-	}
-	aliasCtlTarget := controlTarget(oAlias, repo, aliasNodeID)
-	if aliasCtlTarget.OriginalHost != "app-alias" || aliasCtlTarget.Host != "app-alias.corp" || aliasCtlTarget.User != "alice" {
-		t.Fatalf("OpenSSH alias controlTarget = %+v, want OriginalHost=app-alias Host=app-alias.corp User=alice", aliasCtlTarget)
-	}
-	proxyCfg, _ := buildControlProxyClientConfig(aliasCtlTarget, repo, aliasNodeID, oAlias)
-	if proxyCfg.OriginalHost != "app-alias" || proxyCfg.Address != "app-alias.corp" {
-		t.Fatalf("buildControlProxyClientConfig = (OriginalHost=%q, Address=%q), want (app-alias, app-alias.corp)", proxyCfg.OriginalHost, proxyCfg.Address)
-	}
-	wantSock, err := ssh.ExpandControlPath("/tmp/cm-%C-%n", sshenv.Discover(), ssh.TargetContext{
-		Host:         "app-alias.corp",
-		Port:         22,
-		User:         "alice",
-		OriginalHost: "app-alias",
-	})
-	if err != nil {
-		t.Fatalf("ExpandControlPath: %v", err)
-	}
-	gotSock, err := controlSocketPath(oAlias, repo, aliasNodeID)
-	if err != nil || gotSock != wantSock {
-		t.Fatalf("controlSocketPath(alice@app-alias) = %q (err=%v), want %q", gotSock, err, wantSock)
+	if err := oAlias.withTestPendingNode(t.Context(), repo, func(lease config.PendingLease) error {
+		aliasNodeID := lease.NodeID()
+		aliasAdpOpts, err := oAlias.buildAdapterOptions(aliasNodeID, repo.Snapshot(), repo)
+		if err != nil {
+			t.Fatalf("buildAdapterOptions(alias): %v", err)
+		}
+		aliasCfg, err := adapter.NewSSHAdapter(repo, aliasAdpOpts...).GetConfig(aliasNodeID)
+		if err != nil {
+			t.Fatalf("GetConfig(alias): %v", err)
+		}
+		if aliasCfg.OriginalHost != "app-alias" || aliasCfg.Address != "app-alias.corp" {
+			t.Fatalf("OpenSSH alias ClientConfig = (OriginalHost=%q, Address=%q), want (app-alias, app-alias.corp)", aliasCfg.OriginalHost, aliasCfg.Address)
+		}
+		aliasCtlTarget := controlTarget(oAlias, repo, aliasNodeID)
+		if aliasCtlTarget.OriginalHost != "app-alias" || aliasCtlTarget.Host != "app-alias.corp" || aliasCtlTarget.User != "alice" {
+			t.Fatalf("OpenSSH alias controlTarget = %+v, want OriginalHost=app-alias Host=app-alias.corp User=alice", aliasCtlTarget)
+		}
+		proxyCfg, _ := buildControlProxyClientConfig(aliasCtlTarget, repo, aliasNodeID, oAlias)
+		if proxyCfg.OriginalHost != "app-alias" || proxyCfg.Address != "app-alias.corp" {
+			t.Fatalf("buildControlProxyClientConfig = (OriginalHost=%q, Address=%q), want (app-alias, app-alias.corp)", proxyCfg.OriginalHost, proxyCfg.Address)
+		}
+		wantSock, err := ssh.ExpandControlPath("/tmp/cm-%C-%n", sshenv.Discover(), ssh.TargetContext{
+			Host:         "app-alias.corp",
+			Port:         22,
+			User:         "alice",
+			OriginalHost: "app-alias",
+		})
+		if err != nil {
+			t.Fatalf("ExpandControlPath: %v", err)
+		}
+		gotSock, err := controlSocketPath(oAlias, repo, aliasNodeID)
+		if err != nil || gotSock != wantSock {
+			t.Fatalf("controlSocketPath(alice@app-alias) = %q (err=%v), want %q", gotSock, err, wantSock)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingNode(alias): %v", err)
 	}
 }
 
@@ -516,20 +524,22 @@ func verifyPass5M6DaemonOriginalHostEnvRestore(t *testing.T, ctx context.Context
 	if childOpts.originalHost != "web" {
 		t.Fatalf("mux daemon child originalHost = %q, want web", childOpts.originalHost)
 	}
-	childNodeID, _, err := childOpts.resolveNode(ctx, repo)
-	if err != nil {
-		t.Fatalf("resolveNode(child): %v", err)
-	}
-	childAdpOpts, err := childOpts.buildAdapterOptions(childNodeID, repo.Snapshot(), repo)
-	if err != nil {
-		t.Fatalf("buildAdapterOptions(child): %v", err)
-	}
-	childCfg, err := adapter.NewSSHAdapter(repo, childAdpOpts...).GetConfig(childNodeID)
-	if err != nil {
-		t.Fatalf("GetConfig(child): %v", err)
-	}
-	if childCfg.Address != "web.corp.example.com" || childCfg.OriginalHost != "web" {
-		t.Fatalf("mux daemon child ClientConfig = (Address=%q, OriginalHost=%q), want (web.corp.example.com, web)", childCfg.Address, childCfg.OriginalHost)
+	if err := childOpts.withTestPendingNode(ctx, repo, func(lease config.PendingLease) error {
+		childNodeID := lease.NodeID()
+		childAdpOpts, err := childOpts.buildAdapterOptions(childNodeID, repo.Snapshot(), repo)
+		if err != nil {
+			t.Fatalf("buildAdapterOptions(child): %v", err)
+		}
+		childCfg, err := adapter.NewSSHAdapter(repo, childAdpOpts...).GetConfig(childNodeID)
+		if err != nil {
+			t.Fatalf("GetConfig(child): %v", err)
+		}
+		if childCfg.Address != "web.corp.example.com" || childCfg.OriginalHost != "web" {
+			t.Fatalf("mux daemon child ClientConfig = (Address=%q, OriginalHost=%q), want (web.corp.example.com, web)", childCfg.Address, childCfg.OriginalHost)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingNode(child): %v", err)
 	}
 
 	var stderrBuf bytes.Buffer

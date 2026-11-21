@@ -334,12 +334,94 @@ func (p *openSSHOverrideProvider) loadConfirmedSnapshot(nodeID string) (Connecti
 	return cloneConnectionSnapshot(snap), true
 }
 
-func (p *openSSHOverrideProvider) PrepareNodeContext(ctx context.Context, opts EnsureNodeOptions) (EnsureNodeResult, error) {
-	res, err := p.repo.PrepareNodeContext(ctx, opts)
-	if err == nil && res.Created && res.NodeID != "" {
+type overridePendingLease struct {
+	provider  *openSSHOverrideProvider
+	nodeID    string
+	entry     *pendingConnection
+	mu        sync.Mutex
+	confirmed bool
+	closed    bool
+}
+
+var (
+	_ PendingLease          = (*overridePendingLease)(nil)
+	_ PendingExecutionLease = (*overridePendingLease)(nil)
+)
+
+func (l *overridePendingLease) NodeID() string {
+	if l == nil {
+		return ""
+	}
+	return l.nodeID
+}
+
+func (l *overridePendingLease) Confirm(context.Context) error {
+	return l.confirm()
+}
+
+func (l *overridePendingLease) ConfirmWithExecution(context.Context, *ssh.ExecutionConfig) error {
+	return l.confirm()
+}
+
+func (l *overridePendingLease) confirm() error {
+	if l == nil || l.provider == nil {
+		return nil
+	}
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return fmt.Errorf("pending lease for %q is closed", l.nodeID)
+	}
+	if l.confirmed {
+		l.mu.Unlock()
+		return nil
+	}
+	l.confirmed = true
+	entry := l.entry
+	nodeID := l.nodeID
+	l.mu.Unlock()
+	l.provider.confirmEphemeralNode(nodeID, entry)
+	return nil
+}
+
+// WithPendingNode prepares an ephemeral pending node under the read-only -F
+// override provider. Ephemeral pending nodes are never persisted to disk and
+// are always discarded on return, error, cancellation, or panic.
+func (p *openSSHOverrideProvider) WithPendingNode(ctx context.Context, req EnsureNodeOptions, fn func(PendingLease) error) error {
+	if p == nil || p.repo == nil || ctx == nil || fn == nil {
+		return fmt.Errorf("prepare override connection requires provider, context, and callback")
+	}
+	// Read-only -F overrides never mutate saved nodes on disk.
+	req.ExistingUpdate.Enabled = false
+	res, entry, err := p.repo.prepareNodeContext(ctx, req)
+	if err != nil {
+		return err
+	}
+	if res.Created && res.NodeID != "" {
 		p.forgetConfirmedSnapshot(res.NodeID)
 	}
-	return res, err
+	lease := &overridePendingLease{
+		provider: p,
+		nodeID:   res.NodeID,
+		entry:    entry,
+	}
+	defer func() {
+		lease.mu.Lock()
+		wasConfirmed := lease.confirmed
+		lease.closed = true
+		lease.mu.Unlock()
+		if !wasConfirmed && entry != nil {
+			p.repo.discardPendingEntry(res.NodeID, entry)
+		}
+	}()
+	return fn(lease)
+}
+
+func (p *openSSHOverrideProvider) IsPendingNode(nodeID string) bool {
+	if p == nil || p.repo == nil {
+		return false
+	}
+	return p.repo.IsPendingNode(nodeID)
 }
 
 func (p *openSSHOverrideProvider) Resolve(nodeID string) (models.Node, models.Host, models.Identity, error) {
@@ -429,15 +511,7 @@ func (p *openSSHOverrideProvider) NodeCanonicalHost(nodeID string) string {
 	return p.NodeOpenSSHOrigin(nodeID).CanonicalHost
 }
 
-// DiscardPendingNode releases one caller reference to an ephemeral pending
-// connection prepared under the -F override provider.
-func (p *openSSHOverrideProvider) DiscardPendingNode(nodeID string) {
-	if p != nil && p.repo != nil {
-		p.repo.DiscardPendingNode(nodeID)
-	}
-}
-
-func (p *openSSHOverrideProvider) confirmEphemeralNode(nodeID string) {
+func (p *openSSHOverrideProvider) confirmEphemeralNode(nodeID string, entry *pendingConnection) {
 	if p == nil || p.repo == nil || nodeID == "" {
 		return
 	}
@@ -446,28 +520,11 @@ func (p *openSSHOverrideProvider) confirmEphemeralNode(nodeID string) {
 			p.recordConfirmedSnapshot(nodeID, snap)
 		}
 	}
-	p.repo.DiscardPendingNode(nodeID)
-}
-
-// ConfirmNodeContext is a no-op on the read-only override provider so ephemeral
-// pending nodes prepared under -F are never persisted to disk, while releasing
-// the caller's pending entry (for both disambiguated "openssh:..." and ad-hoc IDs).
-func (p *openSSHOverrideProvider) ConfirmNodeContext(_ context.Context, nodeID string) error {
-	p.confirmEphemeralNode(nodeID)
-	return nil
+	p.repo.discardPendingEntry(nodeID, entry)
 }
 
 func (p *openSSHOverrideProvider) PendingNodeExecution(string) (*ssh.ExecutionConfig, bool) {
 	return nil, false
-}
-
-// ConfirmNodeWithExecutionContext is a no-op on the read-only override provider
-// so post-authentication enrollment probing under -F never attempts Save on
-// readOnlyRejectStore, while releasing the caller's pending entry (for both
-// disambiguated "openssh:..." and ad-hoc IDs).
-func (p *openSSHOverrideProvider) ConfirmNodeWithExecutionContext(_ context.Context, nodeID string, _ *ssh.ExecutionConfig) error {
-	p.confirmEphemeralNode(nodeID)
-	return nil
 }
 
 func (*openSSHOverrideProvider) UpdateAuthAtVersionContext(_ context.Context, _, authVersion, _, _, _ string) (string, error) {

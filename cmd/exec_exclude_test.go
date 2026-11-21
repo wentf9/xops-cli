@@ -169,28 +169,29 @@ func TestExecNonInteractiveSuppressNodeConfirmation(t *testing.T) {
 		Port:     22,
 		HasPort:  true,
 	}
-	res, err := repo.PrepareNodeContext(t.Context(), config.EnsureNodeOptions{Target: target})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext: %v", err)
-	}
+	if err := repo.WithPendingNode(t.Context(), config.EnsureNodeOptions{Target: target}, func(lease config.PendingLease) error {
+		nodeID := lease.NodeID()
+		o := NewExecOptions()
+		o.Interactive = false
+		o.Remember = "always"
+		o.Command = "id"
+		o.control.ConfigFile = "none"
 
-	o := NewExecOptions()
-	o.Interactive = false
-	o.Remember = "always"
-	o.Command = "id"
-	o.control.ConfigFile = "none"
+		adpOpts, err := o.buildAdapterOptions([]execHostTask{{nodeID: nodeID}}, cfg, repo)
+		if err != nil {
+			t.Fatalf("buildAdapterOptions: %v", err)
+		}
+		adp := adapter.NewSSHAdapter(repo, adpOpts...)
+		if err := adp.FinalizePendingConnection(t.Context(), lease, nil); err != nil {
+			t.Fatalf("FinalizePendingConnection: %v", err)
+		}
 
-	adpOpts, err := o.buildAdapterOptions([]execHostTask{{nodeID: res.NodeID}}, cfg, repo)
-	if err != nil {
-		t.Fatalf("buildAdapterOptions: %v", err)
-	}
-	adp := adapter.NewSSHAdapter(repo, adpOpts...)
-	if err := adp.ConfirmConnection(t.Context(), res.NodeID); err != nil {
-		t.Fatalf("ConfirmConnection: %v", err)
-	}
-
-	if _, ok := repo.Snapshot().Nodes.Get(res.NodeID); ok {
-		t.Fatalf("expected non-interactive exec (SuppressNodeConfirmation=true) NOT to confirm pending node %q", res.NodeID)
+		if _, ok := repo.Snapshot().Nodes.Get(nodeID); ok {
+			t.Fatalf("expected non-interactive exec (SuppressNodeConfirmation=true) NOT to confirm pending node %q", nodeID)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode: %v", err)
 	}
 	after, err := os.ReadFile(path)
 	if err != nil {
@@ -239,12 +240,14 @@ func TestExecNonInteractiveNeverMutatesSavedNodeProxyJumpOrAliasOnDisk(t *testin
 	o.Alias = "mutated-alias"
 	o.Remember = "always"
 
-	updated, err := o.updateNodeFromHostInfo(t.Context(), "saved-web", repo, utils.HostInfo{Alias: "mutated-alias", Password: "pw"})
-	if err != nil {
-		t.Fatalf("updateNodeFromHostInfo(non-interactive): %v", err)
-	}
-	if updated {
-		t.Fatal("expected non-interactive updateNodeFromHostInfo to return updated=false")
+	req := o.buildExecEnsureOptions(repo, config.ConnectionTarget{Selector: "saved-web"}, utils.HostInfo{Alias: "mutated-alias", Password: "pw"})
+	if err := config.WithPendingNode(t.Context(), repo, req, func(lease config.PendingLease) error {
+		if repo.IsPendingNode(lease.NodeID()) {
+			t.Fatal("expected non-interactive exec not to stage saved-node update")
+		}
+		return lease.Confirm(t.Context())
+	}); err != nil {
+		t.Fatalf("WithPendingNode(non-interactive): %v", err)
 	}
 
 	after, err := os.ReadFile(path)
@@ -259,7 +262,8 @@ func TestExecNonInteractiveNeverMutatesSavedNodeProxyJumpOrAliasOnDisk(t *testin
 	oBadJump := NewExecOptions()
 	oBadJump.Interactive = false
 	oBadJump.JumpHost = "nonexistent-jump-host"
-	if _, err := oBadJump.updateNodeFromHostInfo(t.Context(), "saved-web", config.NewProviderWithoutOpenSSH(cfg), utils.HostInfo{}); err == nil {
+	badReq := oBadJump.buildExecEnsureOptions(config.NewProviderWithoutOpenSSH(cfg), config.ConnectionTarget{Selector: "saved-web"}, utils.HostInfo{})
+	if err := config.WithPendingNode(t.Context(), config.NewProviderWithoutOpenSSH(cfg), badReq, func(config.PendingLease) error { return nil }); err == nil {
 		t.Fatal("expected invalid -J to fail closed even when Interactive=false and provider is not *Repository")
 	}
 }

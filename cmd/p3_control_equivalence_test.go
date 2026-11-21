@@ -155,30 +155,37 @@ func resolveCmdDialForScenario(t *testing.T, tc cmdP3EquivalenceScenario, repo *
 	if err := dialOpts.ensureArgsParsed(); err != nil {
 		t.Fatalf("dialOpts.ensureArgsParsed: %v", err)
 	}
-	dialNodeID, _, err := dialOpts.prepareNode(t.Context(), repo)
-	if err != nil {
-		t.Fatalf("dialOpts.prepareNode: %v", err)
-	}
-	adpOpts, err := dialOpts.buildAdapterOptions(dialNodeID, repo.Snapshot(), repo)
-	if err != nil {
-		t.Fatalf("dialOpts.buildAdapterOptions: %v", err)
-	}
-	adp := adapter.NewSSHAdapter(repo, adpOpts...)
-	clientCfg, err := adp.GetConfig(dialNodeID)
-	if err != nil {
-		t.Fatalf("adp.GetConfig(%q): %v", dialNodeID, err)
-	}
-	dialCtrl, err := adp.GetControlConfig(dialNodeID)
-	if err != nil {
-		t.Fatalf("adp.GetControlConfig(%q): %v", dialNodeID, err)
-	}
-	if !dialCtrl.IsEnabled() {
-		t.Fatalf("expected enabled dial ControlConfig, got %+v", dialCtrl)
-	}
-	dialTarget := ssh.BuildClientTargetContext(dialNodeID, clientCfg, env, nil)
-	dialSock, err := dialCtrl.ResolvePath(env, dialTarget)
-	if err != nil {
-		t.Fatalf("dialCtrl.ResolvePath: %v", err)
+	var (
+		dialTarget ssh.TargetContext
+		dialSock   string
+	)
+	if err := dialOpts.withTestPendingNode(t.Context(), repo, func(lease config.PendingLease) error {
+		dialNodeID := lease.NodeID()
+		adpOpts, err := dialOpts.buildAdapterOptions(dialNodeID, repo.Snapshot(), repo)
+		if err != nil {
+			t.Fatalf("dialOpts.buildAdapterOptions: %v", err)
+		}
+		adp := adapter.NewSSHAdapter(repo, adpOpts...)
+		clientCfg, err := adp.GetConfig(dialNodeID)
+		if err != nil {
+			t.Fatalf("adp.GetConfig(%q): %v", dialNodeID, err)
+		}
+		dialCtrl, err := adp.GetControlConfig(dialNodeID)
+		if err != nil {
+			t.Fatalf("adp.GetControlConfig(%q): %v", dialNodeID, err)
+		}
+		if !dialCtrl.IsEnabled() {
+			t.Fatalf("expected enabled dial ControlConfig, got %+v", dialCtrl)
+		}
+		dialTarget = ssh.BuildClientTargetContext(dialNodeID, clientCfg, env, nil)
+		var pathErr error
+		dialSock, pathErr = dialCtrl.ResolvePath(env, dialTarget)
+		if pathErr != nil {
+			t.Fatalf("dialCtrl.ResolvePath: %v", pathErr)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("dialOpts.withTestPendingNode: %v", err)
 	}
 	return dialTarget, dialSock
 }

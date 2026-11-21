@@ -56,27 +56,27 @@ func TestRound5_P1_3_VirtualCanonicalTargetZeroPendingAndZeroProviderMutation(t 
 	}
 
 	canonTarget := OpenSSHNodePrefix + "short.corp.example.com"
-	prep1, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{
 			Selector:     canonTarget,
 			OriginalHost: "short",
 		},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(openssh:canon) failed: %v", err)
-	}
-	if prep1.Created || prep1.NodeID != canonTarget {
-		t.Fatalf("PrepareNodeContext = %+v, want Created=false NodeID=%q", prep1, canonTarget)
-	}
-
-	repo.pendingMu.RLock()
-	pendingCount := len(repo.pending)
-	repo.pendingMu.RUnlock()
-	if pendingCount != 0 {
-		t.Fatalf("ProvenanceOpenSSHVirtual entered r.pending (count=%d), want 0", pendingCount)
-	}
-	if gotAlias, gotCanon := repo.NodeOpenSSHAlias(canonTarget), repo.NodeCanonicalHost(canonTarget); gotAlias != "" || gotCanon != "" {
-		t.Fatalf("r.provider polluted by virtual PrepareNodeContext: alias=%q canon=%q", gotAlias, gotCanon)
+	}, func(lease PendingLease) error {
+		if lease.NodeID() != canonTarget {
+			t.Fatalf("WithPendingNode = %q, want %q", lease.NodeID(), canonTarget)
+		}
+		repo.pendingMu.RLock()
+		pendingCount := len(repo.pending)
+		repo.pendingMu.RUnlock()
+		if pendingCount != 0 {
+			t.Fatalf("ProvenanceOpenSSHVirtual entered r.pending (count=%d), want 0", pendingCount)
+		}
+		if gotAlias, gotCanon := repo.NodeOpenSSHAlias(canonTarget), repo.NodeCanonicalHost(canonTarget); gotAlias != "" || gotCanon != "" {
+			t.Fatalf("r.provider polluted by virtual WithPendingNode: alias=%q canon=%q", gotAlias, gotCanon)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode(openssh:canon) failed: %v", err)
 	}
 
 	// Subsequent resolution via different OriginalHost ("other") or bare ProxyJump must not be hijacked.
@@ -121,19 +121,22 @@ func TestRound5_P1_4_DefaultStoreConfirmAndReplaceNodePrunesAndWithOverridePrese
 		t.Fatalf("NewRepositoryWithOpenSSHParser: %v", err)
 	}
 
-	prep, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	var prepID string
+	if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{
 			Selector:     "edge.corp.example.com",
 			OriginalHost: "edge",
 		},
-	})
-	if err != nil || !prep.Created {
-		t.Fatalf("PrepareNodeContext = (%+v, %v), want Created=true", prep, err)
+	}, func(lease PendingLease) error {
+		prepID = lease.NodeID()
+		if !repo.IsPendingNode(prepID) {
+			t.Fatalf("expected pending node %q before Confirm", prepID)
+		}
+		return lease.Confirm(t.Context())
+	}); err != nil {
+		t.Fatalf("WithPendingNode/Confirm failed: %v", err)
 	}
-	if err := repo.ConfirmNodeContext(t.Context(), prep.NodeID); err != nil {
-		t.Fatalf("ConfirmNodeContext failed: %v", err)
-	}
-	if gotAlias, gotCanon := repo.NodeOpenSSHAlias(prep.NodeID), repo.NodeCanonicalHost(prep.NodeID); gotAlias != "edge" || gotCanon != "edge.corp.example.com" {
+	if gotAlias, gotCanon := repo.NodeOpenSSHAlias(prepID), repo.NodeCanonicalHost(prepID); gotAlias != "edge" || gotCanon != "edge.corp.example.com" {
 		t.Fatalf("post-confirm metadata = (%q, %q), want (edge, edge.corp.example.com)", gotAlias, gotCanon)
 	}
 
@@ -146,27 +149,27 @@ func TestRound5_P1_4_DefaultStoreConfirmAndReplaceNodePrunesAndWithOverridePrese
 	if err != nil {
 		t.Fatalf("WithOpenSSHConfigOverride: %v", err)
 	}
-	if n, ok := overrideProv.GetNode(prep.NodeID); !ok || n.OpenSSHAlias != "edge" || n.CanonicalHost != "edge.corp.example.com" {
+	if n, ok := overrideProv.GetNode(prepID); !ok || n.OpenSSHAlias != "edge" || n.CanonicalHost != "edge.corp.example.com" {
 		t.Fatalf("WithOpenSSHConfigOverride lost saved node metadata: ok=%v node=%+v", ok, n)
 	}
 
 	// ReplaceNodeAtRefContext changing Port/Address must clear stale OpenSSHAlias and CanonicalHost.
 	snap := repo.Snapshot()
-	ver, err := nodeEntityVersion(snap, prep.NodeID)
+	ver, err := nodeEntityVersion(snap, prepID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	node, _ := snap.Nodes.Get(prep.NodeID)
+	node, _ := snap.Nodes.Get(prepID)
 	ident, _ := snap.Identities.Get(node.IdentityRef)
-	if err := repo.ReplaceNodeAtRefContext(t.Context(), NodeRef{ID: prep.NodeID, Version: ver}, prep.NodeID, node, models.Host{
+	if err := repo.ReplaceNodeAtRefContext(t.Context(), NodeRef{ID: prepID, Version: ver}, prepID, node, models.Host{
 		Address: "10.99.0.1",
 		Port:    2222,
 	}, ident); err != nil {
 		t.Fatalf("ReplaceNodeAtRefContext: %v", err)
 	}
-	if repo.NodeOpenSSHAlias(prep.NodeID) != "" || repo.NodeCanonicalHost(prep.NodeID) != "" {
+	if repo.NodeOpenSSHAlias(prepID) != "" || repo.NodeCanonicalHost(prepID) != "" {
 		t.Fatalf("address change did not clear OpenSSH metadata: alias=%q canon=%q",
-			repo.NodeOpenSSHAlias(prep.NodeID), repo.NodeCanonicalHost(prep.NodeID))
+			repo.NodeOpenSSHAlias(prepID), repo.NodeCanonicalHost(prepID))
 	}
 
 	verifyCreateAndImportPrunesDirtyMetadata(t, repo)
@@ -215,41 +218,45 @@ func TestRound5_P2_6_And_P2_8_PendingEvictionAndAtomicMetadataReplacement(t *tes
 	// P2-6: Ensure CheckRefUnreferenced disk reload evicts stale pending entry,
 	// and CreateNodeContext/ImportOpenSSHHostsContext/EnsureNodeContext evict stale pending.
 	createID := "ops@10.1.0.5:22"
-	if _, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{Selector: "10.1.0.5", User: "ops", HasUser: true, Port: 22, HasPort: true},
+	}, func(PendingLease) error {
+		if _, err := repo.CreateNodeContext(t.Context(), createID, models.Node{HostRef: "h-create", IdentityRef: "id-create"}, models.Host{Address: "10.1.0.5", Port: 22}, models.Identity{User: "ops"}); err != nil {
+			t.Fatalf("CreateNodeContext: %v", err)
+		}
+		repo.pendingMu.RLock()
+		_, stillPendingCreate := repo.pending[createID]
+		repo.pendingMu.RUnlock()
+		if stillPendingCreate {
+			t.Fatalf("CreateNodeContext left stale pending entry for %q", createID)
+		}
+		return nil
 	}); err != nil {
-		t.Fatalf("PrepareNodeContext(createID): %v", err)
-	}
-	if _, err := repo.CreateNodeContext(t.Context(), createID, models.Node{HostRef: "h-create", IdentityRef: "id-create"}, models.Host{Address: "10.1.0.5", Port: 22}, models.Identity{User: "ops"}); err != nil {
-		t.Fatalf("CreateNodeContext: %v", err)
-	}
-	repo.pendingMu.RLock()
-	_, stillPendingCreate := repo.pending[createID]
-	repo.pendingMu.RUnlock()
-	if stillPendingCreate {
-		t.Fatalf("CreateNodeContext left stale pending entry for %q", createID)
+		t.Fatalf("WithPendingNode(createID): %v", err)
 	}
 
 	// ReplaceNodeAtRefContext evicts stale pending for both old and renamed nodeID.
 	renamedID := "renamed@10.1.0.6:22"
-	if _, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{Selector: "10.1.0.6", User: "renamed", HasUser: true, Port: 22, HasPort: true},
+	}, func(PendingLease) error {
+		snap := repo.Snapshot()
+		ver, err := nodeEntityVersion(snap, createID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.ReplaceNodeAtRefContext(t.Context(), NodeRef{ID: createID, Version: ver}, renamedID, models.Node{HostRef: "h-create", IdentityRef: "id-create"}, models.Host{Address: "10.1.0.6", Port: 22}, models.Identity{User: "renamed"}); err != nil {
+			t.Fatalf("ReplaceNodeAtRefContext: %v", err)
+		}
+		repo.pendingMu.RLock()
+		_, stillPendingRename := repo.pending[renamedID]
+		repo.pendingMu.RUnlock()
+		if stillPendingRename {
+			t.Fatalf("ReplaceNodeAtRefContext left stale pending entry for %q", renamedID)
+		}
+		return nil
 	}); err != nil {
-		t.Fatalf("PrepareNodeContext(renamedID): %v", err)
-	}
-	snap := repo.Snapshot()
-	ver, err := nodeEntityVersion(snap, createID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := repo.ReplaceNodeAtRefContext(t.Context(), NodeRef{ID: createID, Version: ver}, renamedID, models.Node{HostRef: "h-create", IdentityRef: "id-create"}, models.Host{Address: "10.1.0.6", Port: 22}, models.Identity{User: "renamed"}); err != nil {
-		t.Fatalf("ReplaceNodeAtRefContext: %v", err)
-	}
-	repo.pendingMu.RLock()
-	_, stillPendingRename := repo.pending[renamedID]
-	repo.pendingMu.RUnlock()
-	if stillPendingRename {
-		t.Fatalf("ReplaceNodeAtRefContext left stale pending entry for %q", renamedID)
+		t.Fatalf("WithPendingNode(renamedID): %v", err)
 	}
 
 	// CheckRefUnreferenced disk reload evicts stale pending when stale memory snapshot refreshes from disk.
@@ -265,27 +272,28 @@ func TestRound5_P2_6_And_P2_8_PendingEvictionAndAtomicMetadataReplacement(t *tes
 	}); err != nil {
 		t.Fatalf("CreateNodeContext(stale-holder): %v", err)
 	}
-	pendingDiskRes, err := repoDisk.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	if err := repoDisk.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{Selector: "10.2.0.9", User: "ops", HasUser: true, Port: 22, HasPort: true},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(pendingDiskRes): %v", err)
-	}
-	diskReplacement := cloneConfiguration(nil)
-	diskReplacement.Nodes.Set(pendingDiskRes.NodeID, models.Node{HostRef: "h-new", IdentityRef: "id-new"})
-	diskReplacement.Hosts.Set("h-new", models.Host{Address: "10.2.0.9", Port: 22})
-	diskReplacement.Identities.Set("id-new", models.Identity{User: "ops"})
-	diskStore.mu.Lock()
-	diskStore.cfg = diskReplacement
-	diskStore.mu.Unlock()
-	if _, err := repoDisk.CheckRefUnreferenced(t.Context(), staleRef); err != nil {
-		t.Fatalf("CheckRefUnreferenced: %v", err)
-	}
-	repoDisk.pendingMu.RLock()
-	_, stillPendingDisk := repoDisk.pending[pendingDiskRes.NodeID]
-	repoDisk.pendingMu.RUnlock()
-	if stillPendingDisk {
-		t.Fatal("CheckRefUnreferenced did not evict stale r.pending entry on disk refresh")
+	}, func(lease PendingLease) error {
+		diskReplacement := cloneConfiguration(nil)
+		diskReplacement.Nodes.Set(lease.NodeID(), models.Node{HostRef: "h-new", IdentityRef: "id-new"})
+		diskReplacement.Hosts.Set("h-new", models.Host{Address: "10.2.0.9", Port: 22})
+		diskReplacement.Identities.Set("id-new", models.Identity{User: "ops"})
+		diskStore.mu.Lock()
+		diskStore.cfg = diskReplacement
+		diskStore.mu.Unlock()
+		if _, err := repoDisk.CheckRefUnreferenced(t.Context(), staleRef); err != nil {
+			t.Fatalf("CheckRefUnreferenced: %v", err)
+		}
+		repoDisk.pendingMu.RLock()
+		_, stillPendingDisk := repoDisk.pending[lease.NodeID()]
+		repoDisk.pendingMu.RUnlock()
+		if stillPendingDisk {
+			t.Fatal("CheckRefUnreferenced did not evict stale r.pending entry on disk refresh")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode(pendingDiskRes): %v", err)
 	}
 
 	// P2-8: atomic replacement clears old CanonicalHost when a new session updates only OpenSSHAlias.

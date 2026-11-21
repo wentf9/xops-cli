@@ -115,28 +115,36 @@ func parsePass6MuxDaemonChild(
 	if err := childOpts.Validate(); err != nil {
 		t.Fatalf("Validate(child): %v", err)
 	}
-	childNodeID, _, err := childOpts.resolveNode(ctx, repo)
-	if err != nil {
-		t.Fatalf("resolveNode(child): %v", err)
+	var (
+		childNodeID string
+		childCfg    *ssh.ClientConfig
+		effSSHOpts  *ssh.Options
+	)
+	if err := childOpts.withTestPendingNode(ctx, repo, func(lease config.PendingLease) error {
+		childNodeID = lease.NodeID()
+		childAdpOpts, err := childOpts.buildAdapterOptions(childNodeID, repo.Snapshot(), repo)
+		if err != nil {
+			t.Fatalf("buildAdapterOptions(child): %v", err)
+		}
+		adp := adapter.NewSSHAdapter(repo, childAdpOpts...)
+		childCfg, err = adp.GetConfig(childNodeID)
+		if err != nil {
+			t.Fatalf("GetConfig(child %q): %v", childNodeID, err)
+		}
+		sessionCtrl, err := childOpts.toSessionControlOptions()
+		if err != nil {
+			t.Fatalf("toSessionControlOptions(child): %v", err)
+		}
+		pol, err := adp.Resolve(ctx, adapter.ResolveRequest{NodeID: childNodeID, SessionControl: &sessionCtrl})
+		if err != nil {
+			t.Fatalf("Resolve(child %q): %v", childNodeID, err)
+		}
+		effSSHOpts = pol.Options()
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingNode(child): %v", err)
 	}
-	childAdpOpts, err := childOpts.buildAdapterOptions(childNodeID, repo.Snapshot(), repo)
-	if err != nil {
-		t.Fatalf("buildAdapterOptions(child): %v", err)
-	}
-	adp := adapter.NewSSHAdapter(repo, childAdpOpts...)
-	childCfg, err := adp.GetConfig(childNodeID)
-	if err != nil {
-		t.Fatalf("GetConfig(child %q): %v", childNodeID, err)
-	}
-	sessionCtrl, err := childOpts.toSessionControlOptions()
-	if err != nil {
-		t.Fatalf("toSessionControlOptions(child): %v", err)
-	}
-	pol, err := adp.Resolve(ctx, adapter.ResolveRequest{NodeID: childNodeID, SessionControl: &sessionCtrl})
-	if err != nil {
-		t.Fatalf("Resolve(child %q): %v", childNodeID, err)
-	}
-	return childNodeID, childCfg, pol.Options()
+	return childNodeID, childCfg, effSSHOpts
 }
 
 func TestPass6_M5_MuxDaemonArgsPreservesHostNameAndEscapesPercent(t *testing.T) {
@@ -570,7 +578,7 @@ func verifyPass6M6PendingAliasResolution(
 	tmpDir := shortControlTempDir(t)
 
 	// Prepare first pending connection for app-alias with user+port overrides.
-	res1, err := repo.PrepareNodeContext(ctx, config.EnsureNodeOptions{
+	if err := repo.WithPendingNode(ctx, config.EnsureNodeOptions{
 		Target: config.ConnectionTarget{
 			Selector: "app-alias",
 			User:     "fixture",
@@ -579,92 +587,93 @@ func verifyPass6M6PendingAliasResolution(
 			HasPort:  true,
 		},
 		Password: sshfixture.Password,
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(app-alias): %v", err)
-	}
-	if _, isSaved := repo.GetNode(res1.NodeID); isSaved {
-		t.Fatalf("expected %q to remain pending (unsaved)", res1.NodeID)
-	}
+	}, func(lease1 config.PendingLease) error {
+		nodeID1 := lease1.NodeID()
+		if _, isSaved := repo.GetNode(nodeID1); isSaved {
+			t.Fatalf("expected %q to remain pending (unsaved)", nodeID1)
+		}
 
-	// Prepare colliding pending connection on app-alias-2 sharing (fixture, 10.0.0.5, fixPort)
-	// with a distinct IdentityFile to exercise disambiguated altID ("openssh:fixture@app-alias-2:<port>").
-	res2, err := repo.PrepareNodeContext(ctx, config.EnsureNodeOptions{
-		Target: config.ConnectionTarget{
-			Selector: "app-alias-2",
-			User:     "fixture",
-			HasUser:  true,
-			Port:     uint16(fixPort),
-			HasPort:  true,
-		},
-		Password:     sshfixture.Password,
-		IdentityFile: "/tmp/alt-key",
-		Tags:         []string{"alt"},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(app-alias-2): %v", err)
-	}
-	if !strings.HasPrefix(res2.NodeID, config.OpenSSHNodePrefix) {
-		t.Fatalf("expected colliding pending alias to allocate openssh: altID, got %q", res2.NodeID)
-	}
+		// Prepare colliding pending connection on app-alias-2 sharing (fixture, 10.0.0.5, fixPort)
+		// with a distinct IdentityFile to exercise disambiguated altID ("openssh:fixture@app-alias-2:<port>").
+		return repo.WithPendingNode(ctx, config.EnsureNodeOptions{
+			Target: config.ConnectionTarget{
+				Selector: "app-alias-2",
+				User:     "fixture",
+				HasUser:  true,
+				Port:     uint16(fixPort),
+				HasPort:  true,
+			},
+			Password:     sshfixture.Password,
+			IdentityFile: "/tmp/alt-key",
+			Tags:         []string{"alt"},
+		}, func(lease2 config.PendingLease) error {
+			nodeID2 := lease2.NodeID()
+			if !strings.HasPrefix(nodeID2, config.OpenSSHNodePrefix) {
+				t.Fatalf("expected colliding pending alias to allocate openssh: altID, got %q", nodeID2)
+			}
 
-	sock1 := filepath.Join(tmpDir, "p1.sock")
-	sock2 := filepath.Join(tmpDir, "p2.sock")
-	adp := adapter.NewSSHAdapter(
-		repo,
-		adapter.WithNonInteractive(true),
-		adapter.WithCredentialRecording(false),
-		adapter.WithSuppressNodeConfirmation(true),
-		adapter.WithSessionAuthOverride(res1.NodeID, adapter.SessionAuth{
-			Password:                 sshfixture.Password,
-			HostName:                 fixHost,
-			OriginalHost:             "app-alias",
-			SuppressNodeConfirmation: true,
-		}),
-		adapter.WithSessionControlOverride(res1.NodeID, newPass6SessionControl(t, sock1)),
-		adapter.WithSessionAuthOverride(res2.NodeID, adapter.SessionAuth{
-			Password:                 sshfixture.Password,
-			HostName:                 fixHost,
-			OriginalHost:             "app-alias-2",
-			SuppressNodeConfirmation: true,
-		}),
-		adapter.WithSessionControlOverride(res2.NodeID, newPass6SessionControl(t, sock2)),
-	)
-	connector := newPass6Connector(adp)
-	defer func() { _ = connector.CloseAll() }()
+			sock1 := filepath.Join(tmpDir, "p1.sock")
+			sock2 := filepath.Join(tmpDir, "p2.sock")
+			adp := adapter.NewSSHAdapter(
+				repo,
+				adapter.WithNonInteractive(true),
+				adapter.WithCredentialRecording(false),
+				adapter.WithSuppressNodeConfirmation(true),
+				adapter.WithSessionAuthOverride(nodeID1, adapter.SessionAuth{
+					Password:                 sshfixture.Password,
+					HostName:                 fixHost,
+					OriginalHost:             "app-alias",
+					SuppressNodeConfirmation: true,
+				}),
+				adapter.WithSessionControlOverride(nodeID1, newPass6SessionControl(t, sock1)),
+				adapter.WithSessionAuthOverride(nodeID2, adapter.SessionAuth{
+					Password:                 sshfixture.Password,
+					HostName:                 fixHost,
+					OriginalHost:             "app-alias-2",
+					SuppressNodeConfirmation: true,
+				}),
+				adapter.WithSessionControlOverride(nodeID2, newPass6SessionControl(t, sock2)),
+			)
+			connector := newPass6Connector(adp)
+			defer func() { _ = connector.CloseAll() }()
 
-	c1, err := connector.Connect(ctx, res1.NodeID)
-	if err != nil {
-		t.Fatalf("Connect(res1 %q): %v", res1.NodeID, err)
-	}
-	defer func() { _ = c1.Close() }()
+			c1, err := connector.Connect(ctx, nodeID1)
+			if err != nil {
+				t.Fatalf("Connect(res1 %q): %v", nodeID1, err)
+			}
+			defer func() { _ = c1.Close() }()
 
-	c2, err := connector.Connect(ctx, res2.NodeID)
-	if err != nil {
-		t.Fatalf("Connect(res2 %q): %v", res2.NodeID, err)
-	}
-	defer func() { _ = c2.Close() }()
+			c2, err := connector.Connect(ctx, nodeID2)
+			if err != nil {
+				t.Fatalf("Connect(res2 %q): %v", nodeID2, err)
+			}
+			defer func() { _ = c2.Close() }()
 
-	m1 := findOwnedMasterForNode(connector, res1.NodeID)
-	m2 := findOwnedMasterForNode(connector, res2.NodeID)
-	if m1 == nil || m2 == nil {
-		t.Fatalf("expected owned masters for res1 (%v) and res2 (%v)", m1, m2)
-	}
+			m1 := findOwnedMasterForNode(connector, nodeID1)
+			m2 := findOwnedMasterForNode(connector, nodeID2)
+			if m1 == nil || m2 == nil {
+				t.Fatalf("expected owned masters for res1 (%v) and res2 (%v)", m1, m2)
+			}
 
-	if got := resolveOwnedMasterNodeID(repo, connector, m1); got != "openssh:app-alias" {
-		t.Fatalf("resolveOwnedMasterNodeID(m1) = %q, want openssh:app-alias", got)
-	}
-	if got := resolveOwnedMasterNodeID(repo, nil, m1); got != "openssh:app-alias" {
-		t.Fatalf("resolveOwnedMasterNodeID(nil connector, m1) = %q, want openssh:app-alias", got)
-	}
-	if got := resolveOwnedMasterNodeID(repo, connector, m2); got != "openssh:app-alias-2" {
-		t.Fatalf("resolveOwnedMasterNodeID(m2) = %q, want openssh:app-alias-2", got)
-	}
+			if got := resolveOwnedMasterNodeID(repo, connector, m1); got != "openssh:app-alias" {
+				t.Fatalf("resolveOwnedMasterNodeID(m1) = %q, want openssh:app-alias", got)
+			}
+			if got := resolveOwnedMasterNodeID(repo, nil, m1); got != "openssh:app-alias" {
+				t.Fatalf("resolveOwnedMasterNodeID(nil connector, m1) = %q, want openssh:app-alias", got)
+			}
+			if got := resolveOwnedMasterNodeID(repo, connector, m2); got != "openssh:app-alias-2" {
+				t.Fatalf("resolveOwnedMasterNodeID(m2) = %q, want openssh:app-alias-2", got)
+			}
 
-	// Verify targetNodeIDs tracking + daemon child re-resolution in a fresh OS-like Repository
-	// where r.pending is empty.
-	verifyPass6M6FreshChildRecovery(t, ctx, sshCfg, fixHost, fixPort, res1.NodeID, sock1, m1, resolveOwnedMasterNodeID(repo, connector, m1))
-	verifyPass6M6PendingRewrittenHostNameFallback(t, ctx, tmpDir, fixHost, fixPort)
+			// Verify targetNodeIDs tracking + daemon child re-resolution in a fresh OS-like Repository
+			// where r.pending is empty.
+			verifyPass6M6FreshChildRecovery(t, ctx, sshCfg, fixHost, fixPort, nodeID1, sock1, m1, resolveOwnedMasterNodeID(repo, connector, m1))
+			verifyPass6M6PendingRewrittenHostNameFallback(t, ctx, tmpDir, fixHost, fixPort)
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("WithPendingNode(app-alias): %v", err)
+	}
 }
 
 func verifyPass6M6FreshChildRecovery(
@@ -717,7 +726,7 @@ func verifyPass6M6PendingRewrittenHostNameFallback(
 		"  Port 22",
 	}, "\n")
 	overrideRepo := buildPass6Repo(t, overrideCfg)
-	if _, prepErr := overrideRepo.PrepareNodeContext(ctx, config.EnsureNodeOptions{
+	if prepErr := overrideRepo.WithPendingNode(ctx, config.EnsureNodeOptions{
 		Target: config.ConnectionTarget{
 			Selector: "override-alias",
 			User:     "fixture",
@@ -725,28 +734,30 @@ func verifyPass6M6PendingRewrittenHostNameFallback(
 			Port:     uint16(fixPort),
 			HasPort:  true,
 		},
-	}); prepErr != nil {
-		t.Fatalf("PrepareNodeContext(override-alias): %v", prepErr)
-	}
-	rawClient := dialPass6FixtureRaw(t, net.JoinHostPort(fixHost, strconv.Itoa(fixPort)))
-	overrideSock := filepath.Join(tmpDir, "p-override.sock")
-	overrideMaster, err := ssh.StartMuxServer(ctx, rawClient, ssh.MuxMasterOptions{
-		Path: overrideSock,
-		Target: ssh.TargetContext{
-			Host:         fixHost,
-			Port:         fixPort,
-			User:         "fixture",
-			OriginalHost: "override-alias",
-			Control:      &ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: overrideSock, Persist: "5m"},
-		},
-	})
-	if err != nil {
-		t.Fatalf("StartMuxServer(overrideMaster): %v", err)
-	}
-	defer func() { _ = overrideMaster.Shutdown() }()
+	}, func(_ config.PendingLease) error {
+		rawClient := dialPass6FixtureRaw(t, net.JoinHostPort(fixHost, strconv.Itoa(fixPort)))
+		overrideSock := filepath.Join(tmpDir, "p-override.sock")
+		overrideMaster, err := ssh.StartMuxServer(ctx, rawClient, ssh.MuxMasterOptions{
+			Path: overrideSock,
+			Target: ssh.TargetContext{
+				Host:         fixHost,
+				Port:         fixPort,
+				User:         "fixture",
+				OriginalHost: "override-alias",
+				Control:      &ssh.ControlConfig{Master: ssh.ControlMasterAuto, Path: overrideSock, Persist: "5m"},
+			},
+		})
+		if err != nil {
+			t.Fatalf("StartMuxServer(overrideMaster): %v", err)
+		}
+		defer func() { _ = overrideMaster.Shutdown() }()
 
-	if got := resolveOwnedMasterNodeID(overrideRepo, nil, overrideMaster); got != "openssh:override-alias" {
-		t.Fatalf("resolveOwnedMasterNodeID(override-alias with rewritten HostName) = %q, want openssh:override-alias", got)
+		if got := resolveOwnedMasterNodeID(overrideRepo, nil, overrideMaster); got != "openssh:override-alias" {
+			t.Fatalf("resolveOwnedMasterNodeID(override-alias with rewritten HostName) = %q, want openssh:override-alias", got)
+		}
+		return nil
+	}); prepErr != nil {
+		t.Fatalf("WithPendingNode(override-alias): %v", prepErr)
 	}
 }
 
@@ -837,7 +848,7 @@ func verifyPass6M6SavedJumpChainAndRace(
 				}
 				opts := NewSshOptions()
 				_ = opts.hasActiveProxyCommandInPath(savedRepo, "target-01", connector)
-				_, _ = savedRepo.PrepareNodeContext(ctx, config.EnsureNodeOptions{
+				_ = savedRepo.WithPendingNode(ctx, config.EnsureNodeOptions{
 					Target: config.ConnectionTarget{
 						Selector: "app-alias",
 						User:     "raceuser" + strconv.Itoa(id),
@@ -845,7 +856,7 @@ func verifyPass6M6SavedJumpChainAndRace(
 						Port:     uint16(fixPort),
 						HasPort:  true,
 					},
-				})
+				}, func(config.PendingLease) error { return nil })
 			}
 		}(g)
 	}

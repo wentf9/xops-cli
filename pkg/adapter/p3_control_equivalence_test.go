@@ -340,42 +340,49 @@ func TestP3_ResolveControlTargetAndSocketPath_EquivalenceWithDialPath(t *testing
 				t.Fatalf("read-only provider mutated: node count %d -> %d", len(beforeKeys), len(afterKeys))
 			}
 
-			// Real dial plane (PrepareNodeContext + SSHAdapter.GetConfig + GetControlConfig + BuildClientTargetContext).
-			prep, err := repo.PrepareNodeContext(t.Context(), config.EnsureNodeOptions{
+			// Real dial plane (WithPendingNode + SSHAdapter.GetConfig + GetControlConfig + BuildClientTargetContext).
+			var (
+				dialTarget ssh.TargetContext
+				dialSock   string
+			)
+			if err := repo.WithPendingNode(t.Context(), config.EnsureNodeOptions{
 				Target:      tc.target,
 				DefaultUser: env.LocalUser,
-			})
-			if err != nil {
-				t.Fatalf("PrepareNodeContext: %v", err)
-			}
-			adpOpts := []Option{
-				WithLocalExecution(true),
-				WithSessionAuthOverride(prep.NodeID, SessionAuth{
-					HostName:      tc.overrideHost,
-					OriginalHost:  tc.overrideOrig,
-					CanonicalHost: tc.canonHost,
-					ProxyJump:     tc.target.ProxyJump,
-				}),
-			}
-			if !tc.sessionCtrl.IsEmpty() {
-				adpOpts = append(adpOpts, WithSessionControlOverride(prep.NodeID, tc.sessionCtrl))
-			}
-			adp := NewSSHAdapter(repo, adpOpts...)
-			clientCfg, err := adp.GetConfig(prep.NodeID)
-			if err != nil {
-				t.Fatalf("GetConfig(%q): %v", prep.NodeID, err)
-			}
-			dialCtrl, err := adp.GetControlConfig(prep.NodeID)
-			if err != nil {
-				t.Fatalf("GetControlConfig(%q): %v", prep.NodeID, err)
-			}
-			if !dialCtrl.IsEnabled() {
-				t.Fatalf("expected dial ControlConfig to be enabled, got %+v", dialCtrl)
-			}
-			dialTarget := ssh.BuildClientTargetContext(prep.NodeID, clientCfg, env, nil)
-			dialSock, err := dialCtrl.ResolvePath(env, dialTarget)
-			if err != nil {
-				t.Fatalf("dial ControlConfig.ResolvePath: %v", err)
+			}, func(lease config.PendingLease) error {
+				nodeID := lease.NodeID()
+				adpOpts := []Option{
+					WithLocalExecution(true),
+					WithSessionAuthOverride(nodeID, SessionAuth{
+						HostName:      tc.overrideHost,
+						OriginalHost:  tc.overrideOrig,
+						CanonicalHost: tc.canonHost,
+						ProxyJump:     tc.target.ProxyJump,
+					}),
+				}
+				if !tc.sessionCtrl.IsEmpty() {
+					adpOpts = append(adpOpts, WithSessionControlOverride(nodeID, tc.sessionCtrl))
+				}
+				adp := NewSSHAdapter(repo, adpOpts...)
+				clientCfg, err := adp.GetConfig(nodeID)
+				if err != nil {
+					t.Fatalf("GetConfig(%q): %v", nodeID, err)
+				}
+				dialCtrl, err := adp.GetControlConfig(nodeID)
+				if err != nil {
+					t.Fatalf("GetControlConfig(%q): %v", nodeID, err)
+				}
+				if !dialCtrl.IsEnabled() {
+					t.Fatalf("expected dial ControlConfig to be enabled, got %+v", dialCtrl)
+				}
+				dialTarget = ssh.BuildClientTargetContext(nodeID, clientCfg, env, nil)
+				var pathErr error
+				dialSock, pathErr = dialCtrl.ResolvePath(env, dialTarget)
+				if pathErr != nil {
+					t.Fatalf("dial ControlConfig.ResolvePath: %v", pathErr)
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("WithPendingNode: %v", err)
 			}
 
 			// Assert 100% byte-for-byte TargetContext equality.

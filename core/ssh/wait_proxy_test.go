@@ -305,7 +305,7 @@ func TestPoolCleanupBlackholedProxyJump(t *testing.T) {
 				if !ok {
 					t.Fatal("target missing")
 				}
-				connector.attachKeepAliveLocked(targetKey, target, nil)
+				connector.attachKeepAliveLocked(target, nil)
 				active, kaDone := target.keepAliveState()
 				if !active || kaDone == nil {
 					t.Fatal("keepalive missing")

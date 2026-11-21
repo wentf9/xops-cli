@@ -61,26 +61,26 @@ func TestRound3_P1_1_ProviderResolveWithProvenancePreservesPass1AndInlineOverrid
 		t.Fatalf("NewRepositoryWithOpenSSHParser error = %v", err)
 	}
 
-	res, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	wantID := OpenSSHNodePrefix + "alice@short.corp.example.com:2222"
+	if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{
-			Selector:     OpenSSHNodePrefix + "alice@short.corp.example.com:2222",
+			Selector:     wantID,
 			OriginalHost: "short",
 		},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext error = %v", err)
-	}
-	wantID := OpenSSHNodePrefix + "alice@short.corp.example.com:2222"
-	if res.NodeID != wantID {
-		t.Fatalf("NodeID = %q, want %q", res.NodeID, wantID)
-	}
-
-	// Decision 1.A: virtual OpenSSH targets are stateless and never retained in r.pending.
-	repo.pendingMu.RLock()
-	_, pendingStored := repo.pending[wantID]
-	repo.pendingMu.RUnlock()
-	if pendingStored {
-		t.Fatalf("r.pending unexpectedly retained virtual OpenSSH entry %q", wantID)
+	}, func(lease PendingLease) error {
+		if lease.NodeID() != wantID {
+			t.Fatalf("NodeID = %q, want %q", lease.NodeID(), wantID)
+		}
+		// Decision 1.A: virtual OpenSSH targets are stateless and never retained in r.pending.
+		repo.pendingMu.RLock()
+		_, pendingStored := repo.pending[wantID]
+		repo.pendingMu.RUnlock()
+		if pendingStored {
+			t.Fatalf("r.pending unexpectedly retained virtual OpenSSH entry %q", wantID)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode error = %v", err)
 	}
 
 	snap, err := repo.ResolveConnectionWithOrigin(wantID, "short")
@@ -119,7 +119,7 @@ func TestRound3_P1_6_PendingConfirmationGateCleanupAfterConcurrentUpgrade(t *tes
 
 	nodeID := FormatNodeID("alice", "short.corp.example.com", 22)
 	// First Prepare without OriginalHost registers initial pending entry.
-	res1, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	res1, entry1, err := repo.prepareNodeContext(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{
 			Selector: "short.corp.example.com",
 			User:     "alice",
@@ -127,12 +127,12 @@ func TestRound3_P1_6_PendingConfirmationGateCleanupAfterConcurrentUpgrade(t *tes
 		},
 	})
 	if err != nil || !res1.Created || res1.NodeID != nodeID {
-		t.Fatalf("initial PrepareNodeContext = (%+v, %v), want created %q", res1, err, nodeID)
+		t.Fatalf("initial prepareNodeContext = (%+v, %v), want created %q", res1, err, nodeID)
 	}
 
 	// Simulate concurrent confirmation in flight: hold the original pending gate,
 	// upgrade r.pending[nodeID] to a new *pendingConnection sharing the same gate,
-	// and verify both ConfirmNodeWithExecutionContext cleanup and gate re-acquisition.
+	// and verify both confirmPendingEntry cleanup and gate re-acquisition.
 	origPending := repo.pending[nodeID]
 	if origPending == nil {
 		t.Fatal("missing initial pending connection")
@@ -142,7 +142,7 @@ func TestRound3_P1_6_PendingConfirmationGateCleanupAfterConcurrentUpgrade(t *tes
 	}
 
 	// Concurrent second Prepare with OriginalHost upgrades pending pointer while reusing gate.
-	res2, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	res2, _, err := repo.prepareNodeContext(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{
 			Selector:     "short.corp.example.com",
 			OriginalHost: "short",
@@ -152,7 +152,7 @@ func TestRound3_P1_6_PendingConfirmationGateCleanupAfterConcurrentUpgrade(t *tes
 	})
 	if err != nil || res2.NodeID != nodeID {
 		origPending.gate.release()
-		t.Fatalf("upgrade PrepareNodeContext = (%+v, %v)", res2, err)
+		t.Fatalf("upgrade prepareNodeContext = (%+v, %v)", res2, err)
 	}
 	upgradedPending := repo.pending[nodeID]
 	if upgradedPending == nil || upgradedPending == origPending || upgradedPending.gate != origPending.gate {
@@ -162,13 +162,10 @@ func TestRound3_P1_6_PendingConfirmationGateCleanupAfterConcurrentUpgrade(t *tes
 
 	waiterDone := make(chan error, 1)
 	go func() {
-		_, cErr := repo.acquirePendingConfirmationGate(t.Context(), nodeID)
+		_, cErr := repo.acquirePendingConfirmationGate(t.Context(), nodeID, entry1)
 		waiterDone <- cErr
 	}()
 
-	// Commit with the upgraded pointer while release unblocks waiter after commit? No:
-	// first test that ConfirmNodeWithExecutionContext deletes upgraded r.pending[nodeID]
-	// even if gate returned the original pointer prior to upgrade.
 	origPending.gate.release()
 	if wErr := <-waiterDone; wErr != nil {
 		t.Fatalf("concurrent acquirePendingConfirmationGate failed: %v", wErr)
@@ -179,25 +176,25 @@ func TestRound3_P1_6_PendingConfirmationGateCleanupAfterConcurrentUpgrade(t *tes
 	if err != nil {
 		t.Fatalf("Resolve upgraded pending failed: %v", err)
 	}
-	// Replace r.pending[nodeID] back once more to exercise confirmNodeContext deleting via gate equality.
+	// Replace r.pending[nodeID] back once more to exercise confirmPendingEntry deleting via gate equality.
 	upgradedPending.gate.release()
 	if err := origPending.gate.acquire(t.Context()); err != nil {
 		t.Fatalf("re-acquire gate error = %v", err)
 	}
 	repo.pendingMu.Lock()
 	repo.pending[nodeID] = origPending
-	_, _ = repo.upgradePendingAliasAndCanonical(origPending, nodeID, node, node, host, ident)
+	_, _, _ = repo.upgradePendingAliasAndCanonical(origPending, nodeID, node, node, host, ident)
 	repo.pendingMu.Unlock()
 	origPending.gate.release()
 
-	if err := repo.ConfirmNodeWithExecutionContext(t.Context(), nodeID, &ssh.ExecutionConfig{}); err != nil {
-		t.Fatalf("ConfirmNodeWithExecutionContext error = %v", err)
+	if err := repo.confirmPendingEntry(t.Context(), nodeID, entry1, &ssh.ExecutionConfig{}); err != nil {
+		t.Fatalf("confirmPendingEntry error = %v", err)
 	}
 	repo.pendingMu.RLock()
 	remaining := len(repo.pending)
 	repo.pendingMu.RUnlock()
 	if remaining != 0 {
-		t.Fatalf("r.pending leaked %d entries after ConfirmNodeWithExecutionContext", remaining)
+		t.Fatalf("r.pending leaked %d entries after confirmPendingEntry", remaining)
 	}
 
 	assertGateBasedPendingCleanup(t, repo, nodeID, upgradedPending.provider)
@@ -253,11 +250,11 @@ func TestRound3_P2_13_AltIDReuseChecksCanonicalHostUpgradeAndConflict(t *testing
 	if err != nil {
 		t.Fatalf("NewRepositoryWithOpenSSHParser(2) error = %v", err)
 	}
-	if _, err := repo2.PrepareNodeContext(t.Context(), EnsureNodeOptions{Target: ConnectionTarget{Selector: "alpha", User: "deploy", HasUser: true}}); err != nil {
+	if _, _, err := repo2.prepareNodeContext(t.Context(), EnsureNodeOptions{Target: ConnectionTarget{Selector: "alpha", User: "deploy", HasUser: true}}); err != nil {
 		t.Fatalf("Prepare(alpha) error = %v", err)
 	}
 	wantAltID := OpenSSHNodePrefix + "deploy@beta:22"
-	resBeta, err := repo2.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	resBeta, _, err := repo2.prepareNodeContext(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{
 			Selector:     "beta.corp.example.com",
 			OriginalHost: "beta",
@@ -272,7 +269,7 @@ func TestRound3_P2_13_AltIDReuseChecksCanonicalHostUpgradeAndConflict(t *testing
 		t.Fatalf("NodeCanonicalHost(%q) = %q, want beta.corp.example.com", wantAltID, got)
 	}
 	// Reusing identical CanonicalHost on altID succeeds.
-	resReuse, err := repo2.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	resReuse, _, err := repo2.prepareNodeContext(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{
 			Selector:     "beta.corp.example.com",
 			OriginalHost: "beta",
@@ -285,7 +282,7 @@ func TestRound3_P2_13_AltIDReuseChecksCanonicalHostUpgradeAndConflict(t *testing
 	}
 
 	// Conflicting CanonicalHost on altID must fail with ErrConfigConflict.
-	_, conflictErr := repo2.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	_, _, conflictErr := repo2.prepareNodeContext(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{
 			Selector:     "beta.other.example.com",
 			OriginalHost: "beta",
@@ -315,7 +312,7 @@ func TestRound3_P2_13_AltIDReuseChecksCanonicalHostUpgradeAndConflict(t *testing
 	noCanonProv := NewProviderWithoutOpenSSH(noCanonCfg)
 	noCanonProv.SetNodeOpenSSHAlias(wantAltID, "beta")
 	repo2.pending[wantAltID] = &pendingConnection{provider: noCanonProv, provenance: ProvenanceOpenSSHDerived, gate: altPrev.gate}
-	upgradedID, handled, upErr := repo2.tryReuseOrDisambiguatePending(snapCfg, repo2.pending["deploy@10.20.30.40:22"], "deploy@10.20.30.40:22", oldN, oldH, oldI)
+	upgradedID, _, handled, upErr := repo2.tryReuseOrDisambiguatePending(snapCfg, repo2.pending["deploy@10.20.30.40:22"], "deploy@10.20.30.40:22", oldN, oldH, oldI)
 	repo2.pendingMu.Unlock()
 	if upErr != nil || !handled || upgradedID != wantAltID {
 		t.Fatalf("tryReuseOrDisambiguatePending altID upgrade = (%q, %v, %v), want (%q, true, nil)", upgradedID, handled, upErr, wantAltID)

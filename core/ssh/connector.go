@@ -334,11 +334,15 @@ func (c *Connector) tryAttachTargetControlMaster(ctx context.Context, plan []con
 	return c.connectPlannedNode(ctx, plan[0], nil, nil, true)
 }
 
-func reanchorPlanNodeParent(planNode *connectionPlanNode, expectParent *PooledClient) {
-	if expectParent == nil || expectParent.digest.IsZero() || expectParent.digest == planNode.parentDigest {
+func (c *Connector) reanchorPlanNodeParent(planNode *connectionPlanNode, expectParent *PooledClient) {
+	if expectParent == nil {
 		return
 	}
-	planNode.parentDigest = expectParent.digest
+	parentDigest := c.pool.DigestOf(expectParent)
+	if parentDigest.IsZero() || parentDigest == planNode.parentDigest {
+		return
+	}
+	planNode.parentDigest = parentDigest
 	planNode.digest = DigestClientConfig(planNode.cfg, planNode.parentDigest)
 }
 
@@ -382,7 +386,7 @@ func (c *Connector) connectPlan(ctx context.Context, plan []connectionPlanNode) 
 			}
 			dialer = &SSHProxyDialer{Client: connected.sshClient, RootConn: connected.rootConn}
 			expectParent = connected.pooled
-			reanchorPlanNodeParent(&planNode, expectParent)
+			c.reanchorPlanNodeParent(&planNode, expectParent)
 		case planNode.cfg.Options.ActiveProxyCommand() != "":
 			dialer = &proxyCommandDialer{connector: c, planNode: planNode}
 		case c.baseDialer != nil:
@@ -712,6 +716,22 @@ func (c *Connector) keepAliveProbeTimeout() time.Duration {
 	return DefaultKeepAliveTimeout
 }
 
+// EvictClient removes client's underlying pooled entry from the active pool and
+// closes its own transport (plus any evicted same-generation descendants)
+// without tearing down healthy upstream ancestors. Callers invoke this when
+// post-connect confirmation or enrollment validation rejects a newly returned
+// client.
+func (c *Connector) EvictClient(client *Client) error {
+	if c == nil || client == nil {
+		return nil
+	}
+	if client.pooled != nil && c.pool != nil {
+		c.pool.EvictByClient(client.pooled)
+		return nil
+	}
+	return client.Interrupt()
+}
+
 func (c *Connector) resolveSecret(cfg *ClientConfig, req SecretRequest) ([]byte, error) {
 	if c.secretResolver == nil {
 		return nil, ErrInteractionRequired
@@ -902,10 +922,16 @@ func (c *Connector) tryDialAndPublishProxy(ctx context.Context, planNode connect
 			rootConn = &physicalSSHConn{Conn: rootConn}
 		}
 	}
+	var publishedCfg *ClientConfig
+	if planNode.cfg != nil {
+		publishedCfg = NewClientConfig(*planNode.cfg)
+	}
 	pooled := &PooledClient{
 		SSHClient:          rawClient,
 		RootConn:           rootConn,
 		hopConn:            rootConn,
+		pool:               c.pool,
+		publishedCfg:       publishedCfg,
 		ControlSocketPath:  expandedPath,
 		ControlExpectedUID: c.expectedPeerUID(),
 		Snapshot:           planNode.cfg.ToConnectionConfig(),
@@ -1366,7 +1392,7 @@ func (c *Connector) confirmSessionCallback(nodeName string, cfg *ClientConfig) f
 // starts its owned keepalive (if configured) under the pool lock.
 func (c *Connector) publishPooled(key HopDigest, client *PooledClient, expectParent *PooledClient, clientCfg *ClientConfig) (*PooledClient, error) {
 	return c.pool.Publish(key, client, expectParent, func(published *PooledClient) {
-		c.attachKeepAliveLocked(key, published, clientCfg)
+		c.attachKeepAliveLocked(published, clientCfg)
 	})
 }
 
@@ -1397,14 +1423,14 @@ func (c *Connector) resolveKeepAliveParams(clientCfg *ClientConfig) (parentCtx c
 }
 
 // attachKeepAliveLocked starts client's owned keepalive while connPool.mu is held.
-// Lock ordering: connPool.mu -> Connector.kaMu -> PooledClient.kaMu.
-func (c *Connector) attachKeepAliveLocked(key HopDigest, client *PooledClient, clientCfg *ClientConfig) {
+// Lock ordering: PooledClient.probeMu -> connPool.mu -> Connector.kaMu -> PooledClient.kaMu.
+func (c *Connector) attachKeepAliveLocked(client *PooledClient, clientCfg *ClientConfig) {
 	parentCtx, interval, timeout, nodeScoped := c.resolveKeepAliveParams(clientCfg)
 	if parentCtx == nil || parentCtx.Err() != nil || interval <= 0 {
 		return
 	}
 	client.startKeepAlive(parentCtx, interval, timeout, nodeScoped, func(error) {
-		c.pool.Evict(key, client, false)
+		c.pool.Evict(ZeroHopDigest, client, false)
 	}, &c.keepAliveWG)
 }
 

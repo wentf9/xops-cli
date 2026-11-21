@@ -146,22 +146,26 @@ func TestPass4_S3_3_ExecSavedNodeOriginalHostAndExpandHost(t *testing.T) {
 	if err := o.Complete(NewCmdExec(), nil); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	tasks, hostErrs, err := o.buildTasksFromHosts(t.Context(), savedRepo)
-	if err != nil || len(hostErrs) != 0 || len(tasks) != 1 {
-		t.Fatalf("buildTasksFromHosts = (%v, %v, %v)", tasks, hostErrs, err)
-	}
-	if tasks[0].originalHost != "" {
-		t.Fatalf("saved node task.originalHost = %q, want empty string", tasks[0].originalHost)
-	}
-	auth, err := o.buildTaskSessionAuth(tasks[0], nil, false, false)
-	if err != nil {
-		t.Fatalf("buildTaskSessionAuth: %v", err)
-	}
-	if auth.OriginalHost != "" {
-		t.Fatalf("saved node SessionAuth.OriginalHost = %q, want empty string", auth.OriginalHost)
-	}
-	if auth.HostName != "10.238.221.181.internal" {
-		t.Fatalf("saved node SessionAuth.HostName = %q, want 10.238.221.181.internal", auth.HostName)
+	if err := o.withTestPendingHostTasks(t.Context(), savedRepo, func(tasks []execHostTask, _ []config.PendingLease, hostErrs []error) error {
+		if len(hostErrs) != 0 || len(tasks) != 1 {
+			t.Fatalf("withTestPendingHostTasks = (%v, %v)", tasks, hostErrs)
+		}
+		if tasks[0].originalHost != "" {
+			t.Fatalf("saved node task.originalHost = %q, want empty string", tasks[0].originalHost)
+		}
+		auth, err := o.buildTaskSessionAuth(tasks[0], nil, false, false)
+		if err != nil {
+			t.Fatalf("buildTaskSessionAuth: %v", err)
+		}
+		if auth.OriginalHost != "" {
+			t.Fatalf("saved node SessionAuth.OriginalHost = %q, want empty string", auth.OriginalHost)
+		}
+		if auth.HostName != "10.238.221.181.internal" {
+			t.Fatalf("saved node SessionAuth.HostName = %q, want 10.238.221.181.internal", auth.HostName)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingHostTasks: %v", err)
 	}
 
 	// Verify ScpOptions uses the exact same shared helper on saved Node.Alias "Prod Web 01".

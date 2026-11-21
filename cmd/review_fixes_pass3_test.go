@@ -130,12 +130,16 @@ func TestM5_ExecStaticHostNameRejectedAndOriginalHostPreserved(t *testing.T) {
 	}
 	repo := setupTestRepository(t)
 	cfg := repo.Snapshot()
-	tasks, hostErrs, err := oStatic.buildTasksFromHosts(t.Context(), repo)
-	if err != nil || len(hostErrs) != 0 || len(tasks) != 2 {
-		t.Fatalf("buildTasksFromHosts = (%v, %v, %v), want 2 tasks", tasks, hostErrs, err)
-	}
-	if _, err := oStatic.buildAdapterOptions(tasks, cfg, repo); err == nil || !strings.Contains(err.Error(), "static HostName") {
-		t.Fatalf("expected static HostName error for multi-host exec, got: %v", err)
+	if err := oStatic.withTestPendingHostTasks(t.Context(), repo, func(tasks []execHostTask, _ []config.PendingLease, hostErrs []error) error {
+		if len(hostErrs) != 0 || len(tasks) != 2 {
+			t.Fatalf("withTestPendingHostTasks = (%v, %v), want 2 tasks", tasks, hostErrs)
+		}
+		if _, err := oStatic.buildAdapterOptions(tasks, cfg, repo); err == nil || !strings.Contains(err.Error(), "static HostName") {
+			t.Fatalf("expected static HostName error for multi-host exec, got: %v", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingHostTasks(static): %v", err)
 	}
 
 	// 2. Dynamic HostName=%h.internal across multiple hosts is allowed.
@@ -147,12 +151,16 @@ func TestM5_ExecStaticHostNameRejectedAndOriginalHostPreserved(t *testing.T) {
 	if err := oDyn.Complete(NewCmdExec(), nil); err != nil {
 		t.Fatalf("Complete(dynamic): %v", err)
 	}
-	tasksDyn, hostErrsDyn, err := oDyn.buildTasksFromHosts(t.Context(), repo)
-	if err != nil || len(hostErrsDyn) != 0 || len(tasksDyn) != 2 {
-		t.Fatalf("buildTasksFromHosts(dynamic) = (%v, %v, %v)", tasksDyn, hostErrsDyn, err)
-	}
-	if _, err := oDyn.buildAdapterOptions(tasksDyn, cfg, repo); err != nil {
-		t.Fatalf("expected dynamic HostName=%%h.internal to succeed, got: %v", err)
+	if err := oDyn.withTestPendingHostTasks(t.Context(), repo, func(tasksDyn []execHostTask, _ []config.PendingLease, hostErrsDyn []error) error {
+		if len(hostErrsDyn) != 0 || len(tasksDyn) != 2 {
+			t.Fatalf("withTestPendingHostTasks(dynamic) = (%v, %v)", tasksDyn, hostErrsDyn)
+		}
+		if _, err := oDyn.buildAdapterOptions(tasksDyn, cfg, repo); err != nil {
+			t.Fatalf("expected dynamic HostName=%%h.internal to succeed, got: %v", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingHostTasks(dynamic): %v", err)
 	}
 
 	// 3. Single-target static HostName is allowed.
@@ -164,12 +172,16 @@ func TestM5_ExecStaticHostNameRejectedAndOriginalHostPreserved(t *testing.T) {
 	if err := oSingle.Complete(NewCmdExec(), nil); err != nil {
 		t.Fatalf("Complete(single): %v", err)
 	}
-	tasksSingle, _, err := oSingle.buildTasksFromHosts(t.Context(), repo)
-	if err != nil || len(tasksSingle) != 1 {
-		t.Fatalf("buildTasksFromHosts(single): %v", err)
-	}
-	if _, err := oSingle.buildAdapterOptions(tasksSingle, cfg, repo); err != nil {
-		t.Fatalf("expected single-target static HostName to succeed, got: %v", err)
+	if err := oSingle.withTestPendingHostTasks(t.Context(), repo, func(tasksSingle []execHostTask, _ []config.PendingLease, _ []error) error {
+		if len(tasksSingle) != 1 {
+			t.Fatalf("withTestPendingHostTasks(single) = %v", tasksSingle)
+		}
+		if _, err := oSingle.buildAdapterOptions(tasksSingle, cfg, repo); err != nil {
+			t.Fatalf("expected single-target static HostName to succeed, got: %v", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingHostTasks(single): %v", err)
 	}
 
 	// 4. --exclude filtering in RunContext runs BEFORE static HostName validation:
@@ -200,19 +212,23 @@ func TestM5_ExecOriginalHostPreservedWithoutCanonicalization(t *testing.T) {
 	if err := oNoCanon.Complete(NewCmdExec(), nil); err != nil {
 		t.Fatalf("Complete(no-canon): %v", err)
 	}
-	tasksNoCanon, hostErrsNoCanon, err := oNoCanon.buildTasksFromHosts(t.Context(), repo)
-	if err != nil || len(hostErrsNoCanon) != 0 || len(tasksNoCanon) != 1 {
-		t.Fatalf("buildTasksFromHosts(no-canon) = (%v, %v, %v)", tasksNoCanon, hostErrsNoCanon, err)
-	}
-	if tasksNoCanon[0].originalHost != "app-alias" {
-		t.Fatalf("task.originalHost = %q, want app-alias", tasksNoCanon[0].originalHost)
-	}
-	auth, err := oNoCanon.buildTaskSessionAuth(tasksNoCanon[0], nil, false, false)
-	if err != nil {
-		t.Fatalf("buildTaskSessionAuth: %v", err)
-	}
-	if auth.OriginalHost != "app-alias" {
-		t.Fatalf("SessionAuth.OriginalHost = %q, want app-alias", auth.OriginalHost)
+	if err := oNoCanon.withTestPendingHostTasks(t.Context(), repo, func(tasksNoCanon []execHostTask, _ []config.PendingLease, hostErrsNoCanon []error) error {
+		if len(hostErrsNoCanon) != 0 || len(tasksNoCanon) != 1 {
+			t.Fatalf("withTestPendingHostTasks(no-canon) = (%v, %v)", tasksNoCanon, hostErrsNoCanon)
+		}
+		if tasksNoCanon[0].originalHost != "app-alias" {
+			t.Fatalf("task.originalHost = %q, want app-alias", tasksNoCanon[0].originalHost)
+		}
+		auth, err := oNoCanon.buildTaskSessionAuth(tasksNoCanon[0], nil, false, false)
+		if err != nil {
+			t.Fatalf("buildTaskSessionAuth: %v", err)
+		}
+		if auth.OriginalHost != "app-alias" {
+			t.Fatalf("SessionAuth.OriginalHost = %q, want app-alias", auth.OriginalHost)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingHostTasks(no-canon): %v", err)
 	}
 }
 
@@ -265,17 +281,21 @@ func TestM6_ReadOnlyOverrideProviderDisablesProbeAndRecording(t *testing.T) {
 	if err := execOpt.Complete(NewCmdExec(), nil); err != nil {
 		t.Fatalf("Exec Complete: %v", err)
 	}
-	execTasks, hostErrs, err := execOpt.buildTasksFromHosts(t.Context(), overrideProv)
-	if err != nil || len(hostErrs) != 0 || len(execTasks) != 1 {
-		t.Fatalf("buildTasksFromHosts = (%v, %v, %v)", execTasks, hostErrs, err)
-	}
-	execAdpOpts, err := execOpt.buildAdapterOptions(execTasks, cfg, overrideProv)
-	if err != nil {
-		t.Fatalf("buildAdapterOptions: %v", err)
-	}
-	execAdp := adapter.NewSSHAdapter(overrideProv, execAdpOpts...)
-	if nextVer, err := execAdp.UpdateAuth(t.Context(), execTasks[0].nodeID, "", "secret", "", ""); err != nil || nextVer != "" {
-		t.Fatalf("expected exec UpdateAuth under -F to be disabled no-op, got (%q, %v)", nextVer, err)
+	if err := execOpt.withTestPendingHostTasks(t.Context(), overrideProv, func(execTasks []execHostTask, _ []config.PendingLease, hostErrs []error) error {
+		if len(hostErrs) != 0 || len(execTasks) != 1 {
+			t.Fatalf("withTestPendingHostTasks = (%v, %v)", execTasks, hostErrs)
+		}
+		execAdpOpts, err := execOpt.buildAdapterOptions(execTasks, cfg, overrideProv)
+		if err != nil {
+			t.Fatalf("buildAdapterOptions: %v", err)
+		}
+		execAdp := adapter.NewSSHAdapter(overrideProv, execAdpOpts...)
+		if nextVer, err := execAdp.UpdateAuth(t.Context(), execTasks[0].nodeID, "", "secret", "", ""); err != nil || nextVer != "" {
+			t.Fatalf("expected exec UpdateAuth under -F to be disabled no-op, got (%q, %v)", nextVer, err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingHostTasks: %v", err)
 	}
 
 	// 4. scp.go credentialConnectorWithInteraction succeeds without prompting under -F override.

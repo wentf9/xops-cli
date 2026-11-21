@@ -32,17 +32,35 @@ type ConnectionTarget struct {
 	HasProxyJump bool
 }
 
-// EnsureNodeOptions carries connection intent and optional creation attributes.
-type EnsureNodeOptions struct {
-	Target       ConnectionTarget
-	DefaultUser  string
-	Password     string
-	IdentityFile string
-	Passphrase   string
+// PendingNodeUpdate describes optional CLI mutations to stage against an
+// existing saved node during WithPendingNode. Staged updates are validated
+// against the full configuration graph before dialing, are visible through
+// Resolve and ResolveConnection for the scoped session, and are persisted to
+// disk only when PendingLease.Confirm succeeds.
+type PendingNodeUpdate struct {
+	Enabled      bool
+	JumpHost     string
 	Alias        string
 	Tags         []string
 	SudoMode     models.SudoMode
-	SuPwd        string
+	RememberAuth bool
+	HasPassword  bool
+	IdentityFile string
+}
+
+// EnsureNodeOptions carries connection intent and optional creation or staged
+// saved-node update attributes.
+type EnsureNodeOptions struct {
+	Target         ConnectionTarget
+	DefaultUser    string
+	Password       string
+	IdentityFile   string
+	Passphrase     string
+	Alias          string
+	Tags           []string
+	SudoMode       models.SudoMode
+	SuPwd          string
+	ExistingUpdate PendingNodeUpdate
 }
 
 // EnsureNodeResult contains the resolved or created node ID and mutation details.
@@ -404,7 +422,7 @@ type targetDecision struct {
 }
 
 // ResolveTarget resolves a ConnectionTarget against a read-only ConfigProvider
-// using the exact same resolution rules as PrepareNodeContext / EnsureNodeContext,
+// using the exact same resolution rules as WithPendingNode / EnsureNodeContext,
 // without mutating persisted state or creating pending nodes.
 func ResolveTarget(provider ConfigProvider, target ConnectionTarget) (ResolvedTarget, error) {
 	if provider == nil {

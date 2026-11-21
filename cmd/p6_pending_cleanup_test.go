@@ -83,23 +83,17 @@ func assertPendingReleasedAndRepreparable(t *testing.T, provider config.ConfigPr
 	if _, err := provider.ResolveConnection(nodeID); !errors.Is(err, config.ErrNodeNotFound) {
 		t.Fatalf("ResolveConnection(%q) after failed connect = %v, want ErrNodeNotFound (pending entry leaked)", nodeID, err)
 	}
-	preparer, ok := provider.(interface {
-		PrepareNodeContext(context.Context, config.EnsureNodeOptions) (config.EnsureNodeResult, error)
-	})
-	if !ok {
-		t.Fatalf("provider %T does not implement PrepareNodeContext", provider)
-	}
-	res, err := preparer.PrepareNodeContext(t.Context(), config.EnsureNodeOptions{
+	if err := config.WithPendingNode(t.Context(), provider, config.EnsureNodeOptions{
 		Target: target,
 		Alias:  newAlias,
-	})
-	if err != nil {
-		t.Fatalf("subsequent PrepareNodeContext(%+v, alias=%q) failed (expected clean re-prepare without ErrConfigConflict): %v", target, newAlias, err)
+	}, func(lease config.PendingLease) error {
+		if lease.NodeID() != nodeID {
+			t.Fatalf("re-prepared NodeID = %q, want %q", lease.NodeID(), nodeID)
+		}
+		return nil // auto-discarded on return without Confirm
+	}); err != nil {
+		t.Fatalf("subsequent WithPendingNode(%+v, alias=%q) failed (expected clean re-prepare without ErrConfigConflict): %v", target, newAlias, err)
 	}
-	if res.NodeID != nodeID {
-		t.Fatalf("re-prepared NodeID = %q, want %q", res.NodeID, nodeID)
-	}
-	discardPendingNode(provider, res.NodeID)
 }
 
 func TestP6_SSHPendingNodeDiscardedOnFailedAndCanceledConnect(t *testing.T) {
@@ -180,8 +174,8 @@ func TestP6_SSHPendingNodeDiscardedOnFailedAndCanceledConnect(t *testing.T) {
 		opts.Target = target
 		opts.parsedArgs = true
 
-		if _, _, err := opts.prepareValidatedConnectionNode(t.Context(), repo); err == nil {
-			t.Fatal("expected prepareValidatedConnectionNode with -N + command to fail")
+		if err := opts.withValidatedConnectionNode(t.Context(), repo, func(config.PendingLease) error { return nil }); err == nil {
+			t.Fatal("expected withValidatedConnectionNode with -N + command to fail")
 		}
 		assertPendingReleasedAndRepreparable(t, repo, nodeID, target, "ssh-after-invalid")
 	})
@@ -325,8 +319,10 @@ func TestP6_ExecPendingNodeDiscardedOnFailedAndCanceledConnect(t *testing.T) {
 				isTaggedTask:  true,
 			},
 		}
-		if _, _, err := opts.materializeExecTasks(t.Context(), repo, tasks); err == nil {
-			t.Fatal("expected materializeExecTasks to fail on second tagged task")
+		if err := opts.withPendingExecTasks(t.Context(), repo, tasks, func([]execHostTask, []config.PendingLease, []error) error {
+			return nil
+		}); err == nil {
+			t.Fatal("expected withPendingExecTasks to fail on second tagged task")
 		}
 		assertPendingReleasedAndRepreparable(t, repo, nodeID, target, "tagged-pending-retry")
 	})
@@ -461,14 +457,17 @@ func TestP6_ScpPendingNodeDiscardedOnFailedAndCanceledConnect(t *testing.T) {
 		opts.JumpHost = "a,,b" // rejected by ResolveProxyJumpChain
 		opts.Alias = "scp-badjump-first"
 
-		_, _, err := opts.getOrCreateNodeForPath(t.Context(), repo, PathInfo{
+		req, err := opts.buildScpEnsureOptions(repo, PathInfo{
 			IsRemote: true,
 			Host:     "127.0.0.1",
 			User:     "ops",
 			Port:     port,
 		}, "")
-		if err == nil {
-			t.Fatal("expected batch getOrCreateNodeForPath with invalid JumpHost to fail")
+		if err != nil {
+			t.Fatalf("buildScpEnsureOptions: %v", err)
+		}
+		if err := config.WithPendingNode(t.Context(), repo, req, func(config.PendingLease) error { return nil }); err == nil {
+			t.Fatal("expected batch WithPendingNode with invalid JumpHost to fail")
 		}
 		assertPendingReleasedAndRepreparable(t, repo, nodeID, target, "scp-badjump-second")
 	})
@@ -486,40 +485,39 @@ func TestP6_PendingDiscardPreservesConcurrentSharedCaller(t *testing.T) {
 		HasPort:  true,
 	}
 
-	// Caller 1 registers pending node (refs = 1).
-	first, err := repo.PrepareNodeContext(t.Context(), config.EnsureNodeOptions{
+	// Caller 1 registers pending node via scoped lease (refs = 1).
+	var firstNodeID string
+	if err := repo.WithPendingNode(t.Context(), config.EnsureNodeOptions{
 		Target: target,
 		Alias:  "shared-alias",
-	})
-	if err != nil || !first.Created {
-		t.Fatalf("caller 1 PrepareNodeContext = (%+v, %v), want Created=true", first, err)
+	}, func(lease config.PendingLease) error {
+		firstNodeID = lease.NodeID()
+		if !repo.IsPendingNode(firstNodeID) {
+			t.Fatalf("caller 1 expected pending node %q", firstNodeID)
+		}
+
+		// Caller 2 prepares the same target (refs = 2) and fails on connect -> auto-discards only its own ref (refs = 1).
+		opts := NewSshOptions()
+		opts.Host = "127.0.0.1"
+		opts.User = "ops"
+		opts.Port = port
+		opts.Alias = "shared-alias"
+		opts.Command = "true"
+		opts.Target = target
+		opts.parsedArgs = true
+
+		if err := opts.runConnectionWithProvider(t.Context(), cfg, repo, false); err == nil {
+			t.Fatal("expected caller 2 runConnectionWithProvider against closed port to fail")
+		}
+
+		// Caller 1's pending entry must remain resolvable until Caller 1 finishes.
+		if _, err := repo.ResolveConnection(firstNodeID); err != nil {
+			t.Fatalf("caller 2 discard clobbered concurrent caller 1 pending entry: %v", err)
+		}
+		return nil // Caller 1 exits without Confirm -> auto-discards remaining ref (refs = 0).
+	}); err != nil {
+		t.Fatalf("caller 1 WithPendingNode: %v", err)
 	}
 
-	// Caller 2 prepares the same target (refs = 2) and fails on connect -> discards only its own ref (refs = 1).
-	opts := NewSshOptions()
-	opts.Host = "127.0.0.1"
-	opts.User = "ops"
-	opts.Port = port
-	opts.Alias = "shared-alias"
-	opts.Command = "true"
-	opts.Target = target
-	opts.parsedArgs = true
-
-	if err := opts.runConnectionWithProvider(t.Context(), cfg, repo, false); err == nil {
-		t.Fatal("expected caller 2 runConnectionWithProvider against closed port to fail")
-	}
-
-	// Caller 1's pending entry must remain resolvable until Caller 1 finishes or discards.
-	if _, err := repo.ResolveConnection(first.NodeID); err != nil {
-		t.Fatalf("caller 2 discard clobbered concurrent caller 1 pending entry: %v", err)
-	}
-
-	// Once Caller 1 discards its reference, the pending entry is removed and re-preparable with different params.
-	repo.DiscardPendingNode(first.NodeID)
-	assertPendingReleasedAndRepreparable(t, repo, first.NodeID, target, "different-alias-after-both-released")
-
-	// Sanity check: confirm helper ignores nil / non-discarder providers without panicking.
-	discardPendingNode(nil, first.NodeID)
-	discardPendingNode(struct{}{}, first.NodeID)
-	discardPendingNode(repo, "")
+	assertPendingReleasedAndRepreparable(t, repo, firstNodeID, target, "different-alias-after-both-released")
 }

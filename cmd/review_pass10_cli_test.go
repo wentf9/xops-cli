@@ -199,18 +199,25 @@ func TestPass10_M1_CLIReservedAliasAndDuplicateGuard(t *testing.T) {
 
 	optsDup := NewSshOptions()
 	optsDup.Alias = "web"
-	changed, err := updateNodeFields(&node, "node1", optsDup, repo)
-	if err != nil {
-		t.Fatalf("updateNodeFields(dup): %v", err)
+	optsDup.Target = config.ConnectionTarget{Selector: "node1"}
+	if err := optsDup.withTestPendingNode(t.Context(), repo, func(lease config.PendingLease) error {
+		return lease.Confirm(t.Context())
+	}); err != nil {
+		t.Fatalf("withTestPendingNode(dup): %v", err)
 	}
-	if changed || len(node.Alias) != 1 {
-		t.Fatalf("expected duplicate alias not to append; changed=%v alias=%v", changed, node.Alias)
+	gotNode, _, _, err := repo.Resolve("node1")
+	if err != nil {
+		t.Fatalf("Resolve(node1): %v", err)
+	}
+	if len(gotNode.Alias) != 1 || gotNode.Alias[0] != "web" {
+		t.Fatalf("expected duplicate alias not to append; alias=%v", gotNode.Alias)
 	}
 
 	optsReserved := NewSshOptions()
 	optsReserved.Alias = "openssh"
-	if _, err := updateNodeFields(&node, "node1", optsReserved, repo); err == nil {
-		t.Fatal("updateNodeFields allowed reserved alias 'openssh'")
+	optsReserved.Target = config.ConnectionTarget{Selector: "node1"}
+	if err := optsReserved.withTestPendingNode(t.Context(), repo, func(config.PendingLease) error { return nil }); err == nil {
+		t.Fatal("withTestPendingNode allowed reserved alias 'openssh'")
 	}
 }
 

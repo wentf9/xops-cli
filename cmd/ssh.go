@@ -22,7 +22,6 @@ import (
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
-	"github.com/wentf9/xops-cli/pkg/models"
 )
 
 type SshOptions struct {
@@ -874,24 +873,13 @@ func (o *SshOptions) runParentDaemon(ctx context.Context) (err error) {
 	return o.runParentDaemonWithProvider(ctx, cfg, provider)
 }
 
-func (o *SshOptions) runParentDaemonWithProvider(ctx context.Context, cfg *config.Configuration, provider config.ConfigProvider) (err error) {
-	nodeID, created, err := o.prepareValidatedConnectionNode(ctx, provider)
-	if err != nil {
-		return err
-	}
-	confirmed := false
-	defer func() {
-		if created && !confirmed {
-			discardPendingNode(provider, nodeID)
+func (o *SshOptions) runParentDaemonWithProvider(ctx context.Context, cfg *config.Configuration, provider config.ConfigProvider) error {
+	return o.withValidatedConnectionNode(ctx, provider, func(lease config.PendingLease) error {
+		if err := o.validateBackgroundProxyCommand(provider, lease.NodeID()); err != nil {
+			return err
 		}
-	}()
-	if err := o.validateBackgroundProxyCommand(provider, nodeID); err != nil {
-		return err
-	}
-	if _, err := o.persistPreparedNodeUpdate(ctx, provider, nodeID, created); err != nil {
-		return err
-	}
-	return o.runParentDaemonWithNode(ctx, cfg, provider, nodeID, &confirmed)
+		return o.runParentDaemonWithLease(ctx, cfg, provider, lease)
+	})
 }
 
 func (o *SshOptions) validateBackgroundProxyCommand(provider config.ConfigProvider, nodeID string) error {
@@ -923,7 +911,8 @@ func (o *SshOptions) validatePostResolutionSessionInvariants() error {
 	return nil
 }
 
-func (o *SshOptions) runParentDaemonWithNode(ctx context.Context, cfg *config.Configuration, provider config.ConfigProvider, nodeID string, confirmed *bool) (err error) {
+func (o *SshOptions) runParentDaemonWithLease(ctx context.Context, cfg *config.Configuration, provider config.ConfigProvider, lease config.PendingLease) (err error) {
+	nodeID := lease.NodeID()
 	adpOpts, optErr := o.buildAdapterOptions(nodeID, cfg, provider)
 	if optErr != nil {
 		return optErr
@@ -934,11 +923,14 @@ func (o *SshOptions) runParentDaemonWithNode(ctx context.Context, cfg *config.Co
 	// registered a node-level session override, and a node override outranks the
 	// global default used by other nodes.
 	adpOpts = append(adpOpts, disableSessionControlForParent(nodeID))
-	var connector *ssh.Connector
+	var (
+		connector *ssh.Connector
+		adp       *adapter.SSHAdapter
+	)
 	if o.isMuxDaemon() {
-		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithSessionConfirmer(o.interaction), ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics))
+		connector, adp = newNonInteractiveConnectorAndAdapter(provider, adpOpts, ssh.WithSessionConfirmer(o.interaction), ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics))
 	} else {
-		connector = newCLIConnectorWithAdapterOptions(provider, o.interaction, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics))
+		connector, adp = newCLIConnectorAndAdapter(provider, o.interaction, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics))
 	}
 	var connectorClosed bool
 	defer func() {
@@ -951,8 +943,10 @@ func (o *SshOptions) runParentDaemonWithNode(ctx context.Context, cfg *config.Co
 		promptErr := promptPressEnterIfTUI(os.Stdin, os.Stdout)
 		return errors.Join(sshConnectionError(nodeID, err), promptErr)
 	}
-	if confirmed != nil && !o.isNodeConfirmationSuppressed(cfg, provider) {
-		*confirmed = true
+	if finalizeErr := adp.FinalizePendingConnection(ctx, lease, client); finalizeErr != nil {
+		_ = connector.EvictClient(client)
+		promptErr := promptPressEnterIfTUI(os.Stdin, os.Stdout)
+		return errors.Join(sshConnectionError(nodeID, finalizeErr), promptErr)
 	}
 
 	// 无论如何，在 runParentDaemon 退出时，或者有任何 panic 发生时，确保 client 必被关闭
@@ -2612,15 +2606,6 @@ func (o *SshOptions) maybeRedirectStdinNull() (func() error, error) {
 	}, nil
 }
 
-func discardPendingNode(provider any, nodeID string) {
-	if provider == nil || nodeID == "" {
-		return
-	}
-	if discarder, ok := provider.(interface{ DiscardPendingNode(string) }); ok {
-		discarder.DiscardPendingNode(nodeID)
-	}
-}
-
 func (o *SshOptions) isNodeConfirmationSuppressed(cfg *config.Configuration, provider config.ConfigProvider) bool {
 	if _, isRepo := provider.(*config.Repository); !isRepo {
 		return true
@@ -2629,36 +2614,33 @@ func (o *SshOptions) isNodeConfirmationSuppressed(cfg *config.Configuration, pro
 	return policy == utils.RememberPolicyNever || o.isMuxDaemon() || o.isBackgroundChild()
 }
 
-func (o *SshOptions) prepareValidatedConnectionNode(ctx context.Context, provider config.ConfigProvider) (string, bool, error) {
-	nodeID, created, err := o.prepareNode(ctx, provider)
+func (o *SshOptions) withValidatedConnectionNode(ctx context.Context, provider config.ConfigProvider, fn func(config.PendingLease) error) error {
+	req, err := o.buildPendingEnsureOptions(ctx, provider)
 	if err != nil {
-		return "", false, err
+		return err
 	}
-	validated := false
-	defer func() {
-		if created && !validated {
-			discardPendingNode(provider, nodeID)
+	return config.WithPendingNode(ctx, provider, req, func(lease config.PendingLease) error {
+		if _, err := o.resolveAndCacheSessionOptions(provider, lease.NodeID()); err != nil {
+			return err
 		}
-	}()
-	if _, err := o.resolveAndCacheSessionOptions(provider, nodeID); err != nil {
-		return "", false, err
-	}
-	if err := o.validatePostResolutionSessionInvariants(); err != nil {
-		return "", false, err
-	}
-	validated = true
-	return nodeID, created, nil
+		if err := o.validatePostResolutionSessionInvariants(); err != nil {
+			return err
+		}
+		return fn(lease)
+	})
 }
 
-func (o *SshOptions) newConnectionConnector(cfg *config.Configuration, provider config.ConfigProvider, nodeID string, isChild bool) (*ssh.Connector, error) {
+func (o *SshOptions) newConnectionConnectorAndAdapter(cfg *config.Configuration, provider config.ConfigProvider, nodeID string, isChild bool) (*ssh.Connector, *adapter.SSHAdapter, error) {
 	adpOpts, err := o.buildAdapterOptions(nodeID, cfg, provider)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if o.isMuxDaemon() || isChild {
-		return newNonInteractiveConnector(provider, adpOpts, ssh.WithSessionConfirmer(o.interaction), ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics)), nil
+		connector, adp := newNonInteractiveConnectorAndAdapter(provider, adpOpts, ssh.WithSessionConfirmer(o.interaction), ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics))
+		return connector, adp, nil
 	}
-	return newCLIConnectorWithAdapterOptions(provider, o.interaction, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics)), nil
+	connector, adp := newCLIConnectorAndAdapter(provider, o.interaction, adpOpts, ssh.WithLogger(logger.DefaultLogger()), ssh.WithDiagnostics(o.diagnostics))
+	return connector, adp, nil
 }
 
 func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error) {
@@ -2673,88 +2655,77 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 	return o.runConnectionWithProvider(ctx, cfg, provider, isChild)
 }
 
-func (o *SshOptions) runConnectionWithProvider(ctx context.Context, cfg *config.Configuration, provider config.ConfigProvider, isChild bool) (err error) {
-	nodeID, created, err := o.prepareValidatedConnectionNode(ctx, provider)
-	if err != nil {
-		return err
-	}
-	confirmed := false
-	defer func() {
-		if created && !confirmed {
-			discardPendingNode(provider, nodeID)
+func (o *SshOptions) runConnectionWithProvider(ctx context.Context, cfg *config.Configuration, provider config.ConfigProvider, isChild bool) error {
+	return o.withValidatedConnectionNode(ctx, provider, func(lease config.PendingLease) (err error) {
+		nodeID := lease.NodeID()
+		if !isChild && !o.isMuxDaemon() && o.effectiveBgRun() {
+			if err := o.validateBackgroundProxyCommand(provider, nodeID); err != nil {
+				return err
+			}
+			return o.runParentDaemonWithLease(ctx, cfg, provider, lease)
 		}
-	}()
-	if !isChild && !o.isMuxDaemon() && o.effectiveBgRun() {
-		if err := o.validateBackgroundProxyCommand(provider, nodeID); err != nil {
+		connector, adp, err := o.newConnectionConnectorAndAdapter(cfg, provider, nodeID, isChild)
+		if err != nil {
 			return err
 		}
-		if _, err := o.persistPreparedNodeUpdate(ctx, provider, nodeID, created); err != nil {
+		defer func() {
+			joinConnectorCloseError(&err, connector)
+		}()
+		client, err := o.connectClient(ctx, connector, nodeID, isChild)
+		if err != nil {
 			return err
 		}
-		return o.runParentDaemonWithNode(ctx, cfg, provider, nodeID, &confirmed)
-	}
-	if _, err := o.persistPreparedNodeUpdate(ctx, provider, nodeID, created); err != nil {
-		return err
-	}
-	connector, err := o.newConnectionConnector(cfg, provider, nodeID, isChild)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		joinConnectorCloseError(&err, connector)
-	}()
-	client, err := o.connectClient(ctx, connector, nodeID, isChild)
-	if err != nil {
-		return err
-	}
-	if !o.isNodeConfirmationSuppressed(cfg, provider) {
-		confirmed = true
-	}
-	defer func() {
-		if closeErr := client.Close(); closeErr != nil {
-			err = errors.Join(err, fmt.Errorf("close SSH client failed: %w", closeErr))
+		if finalizeErr := adp.FinalizePendingConnection(ctx, lease, client); finalizeErr != nil {
+			_ = connector.EvictClient(client)
+			promptErr := promptPressEnterIfTUI(os.Stdin, os.Stdout)
+			return errors.Join(sshConnectionError(nodeID, finalizeErr), promptErr)
 		}
-	}()
-	if lcErr := runPostAuthLocalCommand(ctx, client, o.effectiveSSHOptions, os.Stderr, isChild); lcErr != nil {
-		return lcErr
-	}
-	// Setup background context for tunnels and execution (runs until SigInt or command exit)
-	runCtx, runCancel := context.WithCancel(ctx)
-	defer runCancel()
-
-	// Keep a persistent master alive across the process boundary. Registered
-	// here so it runs after tunnels are closed but before the client and
-	// connector are torn down, and it never changes the command's exit status.
-	// Pass the outer ctx (not runCtx) so that normal tunnel closure does not
-	// look like user cancellation to handoffPersistentMaster.
-	defer func() {
-		if handoffErr := o.handoffPersistentMaster(ctx, connector, provider, nodeID); handoffErr != nil {
-			logger.DefaultLogger().Debugf("mux: master handoff failed: %v", handoffErr)
+		defer func() {
+			if closeErr := client.Close(); closeErr != nil {
+				err = errors.Join(err, fmt.Errorf("close SSH client failed: %w", closeErr))
+			}
+		}()
+		if lcErr := runPostAuthLocalCommand(ctx, client, o.effectiveSSHOptions, os.Stderr, isChild); lcErr != nil {
+			return lcErr
 		}
-	}()
+		// Setup background context for tunnels and execution (runs until SigInt or command exit)
+		runCtx, runCancel := context.WithCancel(ctx)
+		defer runCancel()
 
-	// Keep output on the command context while tunnels own their child context.
-	tunnels, err := o.startTunnels(ctx, runCancel, client)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if closeErr := tunnels.Close(); closeErr != nil {
-			err = errors.Join(err, fmt.Errorf("stop SSH tunnels failed: %w", closeErr))
+		// Keep a persistent master alive across the process boundary. Registered
+		// here so it runs after tunnels are closed but before the client and
+		// connector are torn down, and it never changes the command's exit status.
+		// Pass the outer ctx (not runCtx) so that normal tunnel closure does not
+		// look like user cancellation to handoffPersistentMaster.
+		defer func() {
+			if handoffErr := o.handoffPersistentMaster(ctx, connector, provider, nodeID); handoffErr != nil {
+				logger.DefaultLogger().Debugf("mux: master handoff failed: %v", handoffErr)
+			}
+		}()
+
+		// Keep output on the command context while tunnels own their child context.
+		tunnels, err := o.startTunnels(ctx, runCancel, client)
+		if err != nil {
+			return err
 		}
-	}()
+		defer func() {
+			if closeErr := tunnels.Close(); closeErr != nil {
+				err = errors.Join(err, fmt.Errorf("stop SSH tunnels failed: %w", closeErr))
+			}
+		}()
 
-	restoreStdin, err := o.maybeRedirectStdinNull()
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if restoreErr := restoreStdin(); restoreErr != nil {
-			err = errors.Join(err, restoreErr)
+		restoreStdin, err := o.maybeRedirectStdinNull()
+		if err != nil {
+			return err
 		}
-	}()
+		defer func() {
+			if restoreErr := restoreStdin(); restoreErr != nil {
+				err = errors.Join(err, restoreErr)
+			}
+		}()
 
-	return o.runConnectedSession(runCtx, connector, client, provider, nodeID, tunnels, isChild)
+		return o.runConnectedSession(runCtx, connector, client, provider, nodeID, tunnels, isChild)
+	})
 }
 
 func (o *SshOptions) runConnectedSession(runCtx context.Context, connector *ssh.Connector, client *ssh.Client, provider config.ConfigProvider, nodeID string, tunnels *sshTunnelGroup, isChild bool) error {
@@ -2964,36 +2935,29 @@ func (o *SshOptions) applyHostnameCanonicalization(ctx context.Context, provider
 	return nil
 }
 
-func (o *SshOptions) prepareNode(ctx context.Context, provider config.ConfigProvider) (string, bool, error) {
+func (o *SshOptions) buildPendingEnsureOptions(ctx context.Context, provider config.ConfigProvider) (config.EnsureNodeOptions, error) {
 	o.syncIdentityFiles()
 	if err := o.applyHostnameCanonicalization(ctx, provider, nil); err != nil {
-		return "", false, err
+		return config.EnsureNodeOptions{}, err
 	}
 	o.syncResolvedTargetHosts(provider)
-	preparer, isPreparer := provider.(interface {
-		PrepareNodeContext(context.Context, config.EnsureNodeOptions) (config.EnsureNodeResult, error)
-	})
-	if !isPreparer {
-		resolved, err := config.ResolveTarget(provider, o.Target)
-		if err != nil {
-			return "", false, err
-		}
-		if resolved.MatchedNodeID != "" {
-			return resolved.MatchedNodeID, false, nil
-		}
-		return resolved.NodeID, false, nil
-	}
 
 	var defaultUser string
 	if !o.Target.HasUser {
 		var err error
 		defaultUser, err = utils.GetCurrentUser()
 		if err != nil {
-			return "", false, fmt.Errorf("get current user failed: %w", err)
+			return config.EnsureNodeOptions{}, fmt.Errorf("get current user failed: %w", err)
 		}
 	}
+	var snap *config.Configuration
+	if provider != nil {
+		snap = provider.Snapshot()
+	}
+	stageUpdate := !o.isNodeConfirmationSuppressed(snap, provider)
+	shouldRemember := utils.EffectiveRememberPolicy(o.Remember, snap) == utils.RememberPolicyAlways
 
-	res, err := preparer.PrepareNodeContext(ctx, config.EnsureNodeOptions{
+	return config.EnsureNodeOptions{
 		Target:       o.Target,
 		DefaultUser:  defaultUser,
 		Password:     "",
@@ -3001,38 +2965,16 @@ func (o *SshOptions) prepareNode(ctx context.Context, provider config.ConfigProv
 		Passphrase:   "",
 		Alias:        o.Alias,
 		Tags:         o.Tags,
-	})
-	if err != nil {
-		return "", false, err
-	}
-	return res.NodeID, res.Created, nil
-}
-
-func (o *SshOptions) persistPreparedNodeUpdate(ctx context.Context, provider config.ConfigProvider, nodeID string, created bool) (bool, error) {
-	if created || o.isBackgroundChild() {
-		return false, nil
-	}
-	repo, isRepo := provider.(*config.Repository)
-	if !isRepo {
-		return false, nil
-	}
-	shouldRemember := utils.EffectiveRememberPolicy(o.Remember, provider.Snapshot()) == utils.RememberPolicyAlways
-	return update(ctx, nodeID, o, repo, shouldRemember)
-}
-
-func (o *SshOptions) resolveNode(ctx context.Context, provider config.ConfigProvider) (string, bool, error) {
-	nodeID, created, err := o.prepareNode(ctx, provider)
-	if err != nil {
-		return "", false, err
-	}
-	updated, err := o.persistPreparedNodeUpdate(ctx, provider, nodeID, created)
-	if err != nil {
-		if created {
-			discardPendingNode(provider, nodeID)
-		}
-		return nodeID, created, err
-	}
-	return nodeID, created || updated, nil
+		ExistingUpdate: config.PendingNodeUpdate{
+			Enabled:      stageUpdate,
+			JumpHost:     o.JumpHost,
+			Alias:        o.Alias,
+			Tags:         o.Tags,
+			RememberAuth: shouldRemember,
+			HasPassword:  o.Password != "",
+			IdentityFile: o.IdentityFile,
+		},
+	}, nil
 }
 
 type sshTunnelGroup struct {
@@ -3263,100 +3205,6 @@ func (o *SshOptions) startTunnelsWithStderr(ctx context.Context, cancelParent co
 		return fail(err)
 	}
 	return group, nil
-}
-
-func updateNodeFields(node *models.Node, nodeID string, o *SshOptions, provider config.ConfigProvider) (bool, error) {
-	nodeUpdated := false
-	if o.JumpHost != "" {
-		jumpHost, err := provider.ResolveProxyJumpChain(o.JumpHost)
-		if err != nil {
-			return false, fmt.Errorf("resolve SSH proxy jump %q failed: %w", o.JumpHost, err)
-		}
-		if jumpHost != "" && jumpHost != node.ProxyJump {
-			node.ProxyJump = jumpHost
-			nodeUpdated = true
-		}
-	}
-
-	if o.Alias != "" {
-		if err := config.ValidateNodeAlias(o.Alias); err != nil {
-			return false, err
-		}
-		// 检查别名是否已被其他节点使用
-		if existingNode := provider.FindAlias(o.Alias); existingNode != "" && existingNode != nodeID {
-			// 别名已存在，跳过
-		} else if !slices.Contains(node.Alias, o.Alias) {
-			node.Alias = append(node.Alias, o.Alias)
-			nodeUpdated = true
-		}
-	}
-	if len(o.Tags) > 0 {
-		tagMap := make(map[string]bool)
-		for _, t := range node.Tags {
-			tagMap[t] = true
-		}
-		for _, t := range o.Tags {
-			if !tagMap[t] {
-				node.Tags = append(node.Tags, t)
-				nodeUpdated = true
-			}
-		}
-	}
-	return nodeUpdated, nil
-}
-
-func updateIdentityFields(identity *models.Identity, o *SshOptions) bool {
-	identityUpdated := false
-	if o.Password != "" {
-		if identity.AuthType != "password" {
-			identity.AuthType = "password"
-			identityUpdated = true
-		}
-	} else if absKeyPath := config.NormalizePersistableIdentityPath(o.IdentityFile); absKeyPath != "" {
-		identity.KeyPath = absKeyPath
-		identity.AuthType = "key"
-		identityUpdated = true
-	}
-	return identityUpdated
-}
-
-func update(ctx context.Context, nodeID string, o *SshOptions, provider *config.Repository, shouldRemember bool) (bool, error) {
-	if strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) ||
-		utils.EffectiveRememberPolicy(o.Remember, provider.Snapshot()) == utils.RememberPolicyNever {
-		if o.JumpHost != "" {
-			if _, err := provider.ResolveProxyJumpChain(o.JumpHost); err != nil {
-				return false, fmt.Errorf("resolve SSH proxy jump %q failed: %w", o.JumpHost, err)
-			}
-		}
-		return false, nil
-	}
-	if o.Password == "" && o.IdentityFile == "" && o.JumpHost == "" && !o.Sudo && o.Alias == "" && len(o.Tags) == 0 {
-		return false, nil
-	}
-	ref, ok := provider.View().NodeRefs[nodeID]
-	if !ok {
-		return false, fmt.Errorf("resolve SSH node %q reference: %w", nodeID, config.ErrNodeNotFound)
-	}
-	node, host, identity, err := provider.Resolve(nodeID)
-	if err != nil {
-		return false, fmt.Errorf("resolve SSH node %q for update failed: %w", nodeID, err)
-	}
-
-	nodeUpdated, err := updateNodeFields(&node, nodeID, o, provider)
-	if err != nil {
-		return false, err
-	}
-	identityUpdated := false
-	if shouldRemember {
-		identityUpdated = updateIdentityFields(&identity, o)
-	}
-
-	if nodeUpdated || identityUpdated {
-		if err := provider.ReplaceNodeAtRefContext(ctx, ref, nodeID, node, host, identity); err != nil {
-			return false, fmt.Errorf("update SSH node %q failed: %w", nodeID, err)
-		}
-	}
-	return nodeUpdated || identityUpdated, nil
 }
 
 // Legacy launchers may still request this pause. The current TUI uses owned

@@ -95,14 +95,15 @@ func TestExec_BuildTasksFromHosts_PartialErrorsCollected(t *testing.T) {
 		},
 	}
 
-	tasks, hostErrs, err := opts.buildTasksFromHosts(context.Background(), provider)
-	if err != nil {
-		t.Fatalf("buildTasksFromHosts unexpected error: %v", err)
-	}
-	if len(tasks) != 0 {
-		t.Fatalf("expected 0 task generated due to alias conflict, got %d", len(tasks))
-	}
-	if len(hostErrs) != 1 {
-		t.Fatalf("expected 1 host resolution error collected, got %d", len(hostErrs))
+	if err := opts.withTestPendingHostTasks(context.Background(), provider, func(tasks []execHostTask, _ []config.PendingLease, hostErrs []error) error {
+		if len(tasks) != 0 {
+			t.Fatalf("expected 0 task generated due to alias conflict, got %d", len(tasks))
+		}
+		if len(hostErrs) != 1 {
+			t.Fatalf("expected 1 host resolution error collected, got %d", len(hostErrs))
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingHostTasks unexpected error: %v", err)
 	}
 }

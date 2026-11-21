@@ -27,19 +27,41 @@ type PooledClient struct {
 	digest             HopDigest
 	parentKey          HopDigest
 	parent             *PooledClient
+	pool               *connPool
 	probeMu            sync.Mutex
 	probeCache         *executionProbeCache
+	publishedCfg       *ClientConfig
 	ControlSocketPath  string
 	ControlExpectedUID uint32
 	Snapshot           ConnectionConfig
 	hasSnapshot        bool
 
 	// kaMu guards this client's owned keepalive lifecycle.
-	// Lock ordering: connPool.mu -> Connector.kaMu -> PooledClient.kaMu.
+	// Lock ordering: PooledClient.probeMu -> connPool.mu -> Connector.kaMu -> PooledClient.kaMu.
 	kaMu         sync.Mutex
 	kaCancel     context.CancelFunc
 	kaDone       <-chan struct{}
 	kaNodeScoped bool
+}
+
+func (c *PooledClient) updateSnapshot(fn func(*ConnectionConfig, *ClientConfig)) {
+	if c == nil || fn == nil {
+		return
+	}
+	c.probeMu.Lock()
+	defer c.probeMu.Unlock()
+	if !c.hasSnapshot && c.publishedCfg == nil {
+		return
+	}
+	var snapPtr *ConnectionConfig
+	if c.hasSnapshot {
+		snapPtr = &c.Snapshot
+	}
+	fn(snapPtr, c.publishedCfg)
+	if c.publishedCfg != nil && c.pool != nil {
+		newKey := DigestClientConfig(c.publishedCfg, c.parentKey)
+		c.pool.Reindex(c, newKey)
+	}
 }
 
 func (c *PooledClient) interrupt() error {
@@ -240,6 +262,17 @@ func (p *connPool) Get(key HopDigest) (*PooledClient, bool) {
 	return client, ok
 }
 
+// DigestOf returns target's current pool HopDigest under p.mu so concurrent
+// Reindex transitions never race callers reading parent digests.
+func (p *connPool) DigestOf(target *PooledClient) HopDigest {
+	if p == nil || target == nil {
+		return ZeroHopDigest
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return target.digest
+}
+
 func (p *connPool) Count() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -323,6 +356,7 @@ func (p *connPool) Publish(
 			}
 		}
 	}
+	next.pool = p
 	next.digest = key
 	p.active[key] = next
 	if onPublished != nil {
@@ -386,6 +420,22 @@ func (p *connPool) collectDescendantsLocked(ancestorKey HopDigest, ancestor *Poo
 	return keys, clients
 }
 
+// activeKeyLocked resolves the active map key currently holding target under
+// p.mu, tolerating a stale caller hint after a concurrent Reindex while never
+// matching a different fresher occupant.
+func (p *connPool) activeKeyLocked(hint HopDigest, target *PooledClient) (HopDigest, bool) {
+	if target == nil {
+		return ZeroHopDigest, false
+	}
+	if cur, ok := p.active[hint]; ok && cur == target {
+		return hint, true
+	}
+	if cur, ok := p.active[target.digest]; ok && cur == target {
+		return target.digest, true
+	}
+	return ZeroHopDigest, false
+}
+
 // Retire non-disruptively removes displaced (and any active downstream hops
 // sharing its generation) from active, stops their keepalives, and tracks them
 // in retired so CloseAll shuts them down without interrupting live sessions.
@@ -403,9 +453,16 @@ func (p *connPool) Retire(key HopDigest, displaced *PooledClient) []*PooledClien
 
 	var toStop []*PooledClient
 	var cancels []context.CancelFunc
-	descKeys, descClients := p.collectDescendantsLocked(key, displaced)
-	if cur, ok := p.active[key]; ok && cur == displaced {
-		delete(p.active, key)
+	activeKey, isActive := p.activeKeyLocked(key, displaced)
+	effectiveKey := key
+	if isActive {
+		effectiveKey = activeKey
+	} else if effectiveKey.IsZero() {
+		effectiveKey = displaced.digest
+	}
+	descKeys, descClients := p.collectDescendantsLocked(effectiveKey, displaced)
+	if isActive {
+		delete(p.active, activeKey)
 	}
 	if !slices.Contains(p.retired, displaced) {
 		p.retired = append(p.retired, displaced)
@@ -436,7 +493,7 @@ func (p *connPool) Retire(key HopDigest, displaced *PooledClient) []*PooledClien
 
 // Evict removes a dead client and any active downstream hops sharing its
 // transport generation, stops their keepalives, and closes evicted downstream
-// hop transports (plus dead itself when closeSelf is true) without killing
+// hop transports (plus dead itself when closeDead is true) without killing
 // healthy upstream ancestors.
 func (p *connPool) Evict(key HopDigest, dead *PooledClient, closeDead bool) []*PooledClient {
 	if dead == nil {
@@ -445,15 +502,18 @@ func (p *connPool) Evict(key HopDigest, dead *PooledClient, closeDead bool) []*P
 	p.mu.Lock()
 	var descKeys []HopDigest
 	var descendants []*PooledClient
-	removedSelf := false
-	if cur, ok := p.active[key]; ok && cur == dead {
-		removedSelf = true
+	activeKey, removedSelf := p.activeKeyLocked(key, dead)
+	effectiveKey := key
+	if removedSelf {
+		effectiveKey = activeKey
+	} else if effectiveKey.IsZero() {
+		effectiveKey = dead.digest
 	}
 	if removedSelf || dead.RootConn != nil {
-		descKeys, descendants = p.collectDescendantsLocked(key, dead)
+		descKeys, descendants = p.collectDescendantsLocked(effectiveKey, dead)
 	}
 	if removedSelf {
-		delete(p.active, key)
+		delete(p.active, activeKey)
 	}
 	var cancels []context.CancelFunc
 	if removedSelf || closeDead {
@@ -479,6 +539,50 @@ func (p *connPool) Evict(key HopDigest, dead *PooledClient, closeDead bool) []*P
 		_ = child.closeSelf()
 	}
 	return descendants
+}
+
+// Reindex atomically moves an active pooled entry from its current HopDigest
+// key to newKey when caller-side post-connect confirmation updates committed
+// metadata (such as Execution or AuthUpdateToken) without replacing the
+// underlying transport. If target is no longer active, another entry already
+// occupies newKey, or active descendants depend on target's current parent key,
+// active membership is left untouched.
+func (p *connPool) Reindex(target *PooledClient, newKey HopDigest) {
+	if p == nil || target == nil || newKey.IsZero() {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return
+	}
+	oldKey := target.digest
+	if cur, ok := p.active[oldKey]; !ok || cur != target {
+		return
+	}
+	if newKey == oldKey {
+		return
+	}
+	if existing, occupied := p.active[newKey]; occupied && existing != target {
+		return
+	}
+	if descKeys, _ := p.collectDescendantsLocked(oldKey, target); len(descKeys) > 0 {
+		return
+	}
+	delete(p.active, oldKey)
+	target.digest = newKey
+	p.active[newKey] = target
+}
+
+// EvictByClient atomically removes target (if currently active in the pool)
+// and any active same-generation descendants, stops their keepalives, and
+// closes target plus evicted descendants without tearing down healthy upstream
+// ancestors.
+func (p *connPool) EvictByClient(target *PooledClient) []*PooledClient {
+	if target == nil {
+		return nil
+	}
+	return p.Evict(ZeroHopDigest, target, true)
 }
 
 func (p *connPool) StopGlobalKeepAlives() {
@@ -553,6 +657,9 @@ func (p *connPool) CheckInvariants(requireKeepAlive bool) error {
 	for key, client := range p.active {
 		if client == nil {
 			return fmt.Errorf("pool invariant violated: nil client at key %s", key)
+		}
+		if client.digest != key {
+			return fmt.Errorf("pool invariant violated: active client %p digest %s != map key %s", client, client.digest, key)
 		}
 		activeSet[client] = key
 		if !client.parentKey.IsZero() && client.ControlSocketPath == "" {

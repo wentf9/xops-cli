@@ -418,24 +418,29 @@ func TestScpBatchZeroDiskMutationAndPositionalInvalidExcludeBeforeNodePrep(t *te
 		if err := o.Validate(); err != nil {
 			t.Fatalf("Validate(batch): %v", err)
 		}
-		nodeID, mutated, err := o.getOrCreateNodeForPath(t.Context(), repo, PathInfo{
+		if err := o.withTestPendingPath(t.Context(), repo, PathInfo{
 			Host:     "10.238.221.181",
 			User:     "iaas",
 			Port:     22,
 			IsRemote: true,
-		}, "")
-		if err != nil {
-			t.Fatalf("getOrCreateNodeForPath: %v", err)
-		}
-		if nodeID != "iaas@10.238.221.181:22" || mutated {
-			t.Fatalf("expected existing node without disk mutation, got nodeID=%q mutated=%v", nodeID, mutated)
+		}, "", func(lease config.PendingLease) error {
+			if lease.NodeID() != "iaas@10.238.221.181:22" {
+				t.Fatalf("expected existing node iaas@10.238.221.181:22, got %q", lease.NodeID())
+			}
+			// Even on Confirm, batch scp must not persist node updates on disk.
+			if err := lease.Confirm(t.Context()); err != nil {
+				t.Fatalf("lease.Confirm: %v", err)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("withTestPendingPath: %v", err)
 		}
 		after, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatalf("ReadFile(after): %v", err)
 		}
 		if !bytes.Equal(before, after) {
-			t.Fatal("expected batch scp getOrCreateNodeForPath NOT to mutate saved config on disk")
+			t.Fatal("expected batch scp NOT to mutate saved config on disk")
 		}
 	})
 

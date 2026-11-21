@@ -90,37 +90,42 @@ func verifyPass7ExecTagSortedAndNormalized(t *testing.T, prov config.ConfigProvi
 	o.Tag = "p7tag"
 	o.Remember = "never"
 	o.control.ConfigFile = sshCfgPath
-	tasks, err := o.buildTasksFromTags(t.Context(), prov)
-	if err != nil {
-		t.Fatalf("buildTasksFromTags: %v", err)
-	}
-	if len(tasks) != 3 {
-		t.Fatalf("expected 3 tasks, got %d", len(tasks))
-	}
-	gotIDs := []string{tasks[0].nodeID, tasks[1].nodeID, tasks[2].nodeID}
-	wantIDs := []string{"a-node", "m-node", "z-node"}
-	if !slices.Equal(gotIDs, wantIDs) {
-		t.Fatalf("task nodeIDs = %v, want deterministic sorted %v", gotIDs, wantIDs)
-	}
-	if tasks[0].openSSHAlias != "ssh-alpha" || tasks[2].openSSHAlias != "ssh-zeta" {
-		t.Fatalf("expected OpenSSHAlias parity on tagged tasks, got %q and %q", tasks[0].openSSHAlias, tasks[2].openSSHAlias)
-	}
-	if tasks[1].port != 22 {
-		t.Fatalf("expected port 0 tagged host to normalize to 22, got %d", tasks[1].port)
-	}
-	if tasks[0].pass != "iaas-stored-secret" {
-		t.Fatalf("expected default user to retain stored identity password, got %q", tasks[0].pass)
+	if err := o.withTestPendingTagTasks(t.Context(), prov, func(tasks []execHostTask, _ []config.PendingLease) error {
+		if len(tasks) != 3 {
+			t.Fatalf("expected 3 tasks, got %d", len(tasks))
+		}
+		gotIDs := []string{tasks[0].nodeID, tasks[1].nodeID, tasks[2].nodeID}
+		wantIDs := []string{"a-node", "m-node", "z-node"}
+		if !slices.Equal(gotIDs, wantIDs) {
+			t.Fatalf("task nodeIDs = %v, want deterministic sorted %v", gotIDs, wantIDs)
+		}
+		if tasks[0].openSSHAlias != "ssh-alpha" || tasks[2].openSSHAlias != "ssh-zeta" {
+			t.Fatalf("expected OpenSSHAlias parity on tagged tasks, got %q and %q", tasks[0].openSSHAlias, tasks[2].openSSHAlias)
+		}
+		if tasks[1].port != 22 {
+			t.Fatalf("expected port 0 tagged host to normalize to 22, got %d", tasks[1].port)
+		}
+		if tasks[0].pass != "iaas-stored-secret" {
+			t.Fatalf("expected default user to retain stored identity password, got %q", tasks[0].pass)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingTagTasks: %v", err)
 	}
 
 	oHost := NewExecOptions()
 	oHost.Host = "m-node"
 	oHost.Remember = "never"
-	hostTasks, hostErrs, err := oHost.buildTasksFromHosts(t.Context(), prov)
-	if err != nil || len(hostErrs) != 0 || len(hostTasks) != 1 {
-		t.Fatalf("buildTasksFromHosts(m-node): err=%v hostErrs=%v len=%d", err, hostErrs, len(hostTasks))
-	}
-	if hostTasks[0].port != 22 {
-		t.Fatalf("expected buildTasksFromHosts port 0 to normalize to 22, got %d", hostTasks[0].port)
+	if err := oHost.withTestPendingHostTasks(t.Context(), prov, func(hostTasks []execHostTask, _ []config.PendingLease, hostErrs []error) error {
+		if len(hostErrs) != 0 || len(hostTasks) != 1 {
+			t.Fatalf("withTestPendingHostTasks(m-node): hostErrs=%v len=%d", hostErrs, len(hostTasks))
+		}
+		if hostTasks[0].port != 22 {
+			t.Fatalf("expected withTestPendingHostTasks port 0 to normalize to 22, got %d", hostTasks[0].port)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingHostTasks(m-node): %v", err)
 	}
 }
 
@@ -132,20 +137,21 @@ func verifyPass7ExecTagOverridesAndPasswordSafety(t *testing.T, prov config.Conf
 	oOther.Port = 2222
 	oOther.Remember = "never"
 	oOther.control.ConfigFile = sshCfgPath
-	tasks, err := oOther.buildTasksFromTags(t.Context(), prov)
-	if err != nil {
-		t.Fatalf("buildTasksFromTags(-l otheruser -p 2222): %v", err)
-	}
-	for _, task := range tasks {
-		if task.user != "otheruser" || task.port != 2222 {
-			t.Fatalf("unexpected overridden task user/port: %+v", task)
+	if err := oOther.withTestPendingTagTasks(t.Context(), prov, func(tasks []execHostTask, _ []config.PendingLease) error {
+		for _, task := range tasks {
+			if task.user != "otheruser" || task.port != 2222 {
+				t.Fatalf("unexpected overridden task user/port: %+v", task)
+			}
+			if task.pass != "" {
+				t.Fatalf("expected stored password NOT to pair with -l otheruser on %s, got %q", task.rawHost, task.pass)
+			}
+			if task.nodeID == task.rawHost {
+				t.Fatalf("expected overridden tagged task %s to prepare distinct nodeID, got %q", task.rawHost, task.nodeID)
+			}
 		}
-		if task.pass != "" {
-			t.Fatalf("expected stored password NOT to pair with -l otheruser on %s, got %q", task.rawHost, task.pass)
-		}
-		if task.nodeID == task.rawHost {
-			t.Fatalf("expected overridden tagged task %s to prepare distinct nodeID, got %q", task.rawHost, task.nodeID)
-		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingTagTasks(-l otheruser -p 2222): %v", err)
 	}
 
 	oExplicitPass := NewExecOptions()
@@ -154,14 +160,15 @@ func verifyPass7ExecTagOverridesAndPasswordSafety(t *testing.T, prov config.Conf
 	oExplicitPass.Password = "cli-override-secret"
 	oExplicitPass.Remember = "never"
 	oExplicitPass.control.ConfigFile = sshCfgPath
-	tasksWithPass, err := oExplicitPass.buildTasksFromTags(t.Context(), prov)
-	if err != nil {
-		t.Fatalf("buildTasksFromTags(-l otheruser with explicit password): %v", err)
-	}
-	for _, task := range tasksWithPass {
-		if task.pass != "cli-override-secret" {
-			t.Fatalf("expected explicit CLI password on %s, got %q", task.rawHost, task.pass)
+	if err := oExplicitPass.withTestPendingTagTasks(t.Context(), prov, func(tasksWithPass []execHostTask, _ []config.PendingLease) error {
+		for _, task := range tasksWithPass {
+			if task.pass != "cli-override-secret" {
+				t.Fatalf("expected explicit CLI password on %s, got %q", task.rawHost, task.pass)
+			}
 		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingTagTasks(-l otheruser with explicit password): %v", err)
 	}
 }
 
@@ -187,26 +194,27 @@ func assertPass7ExecTagExcludeFiltersAlpha(t *testing.T, prov config.ConfigProvi
 	if err := o.Complete(NewCmdExec(), nil); err != nil {
 		t.Fatalf("Complete(exec --tag %s): %v", exSpec, err)
 	}
-	tasks, err := o.buildTasksFromTags(t.Context(), prov)
-	if err != nil {
-		t.Fatalf("buildTasksFromTags(%s): %v", exSpec, err)
-	}
-	cands := make([]utils.ExcludeTargetInfo, 0, len(tasks))
-	for _, task := range tasks {
-		cands = append(cands, o.execTaskExcludeInfo(task))
-	}
-	excludes, err := utils.ResolveExcludesForTargets(prov, utils.ParseExcludeFlag(o.Exclude), cands)
-	if err != nil {
-		t.Fatalf("ResolveExcludesForTargets(exec --tag %s): %v", exSpec, err)
-	}
-	var kept []string
-	for i, task := range tasks {
-		if !utils.IsTargetExcluded(excludes, cands[i]) {
-			kept = append(kept, task.rawHost)
+	if err := o.withTestPendingTagTasks(t.Context(), prov, func(tasks []execHostTask, _ []config.PendingLease) error {
+		cands := make([]utils.ExcludeTargetInfo, 0, len(tasks))
+		for _, task := range tasks {
+			cands = append(cands, o.execTaskExcludeInfo(task))
 		}
-	}
-	if !slices.Equal(kept, []string{"m-node", "z-node"}) {
-		t.Fatalf("exec --tag --exclude %q kept %v, want [m-node z-node]", exSpec, kept)
+		excludes, err := utils.ResolveExcludesForTargets(prov, utils.ParseExcludeFlag(o.Exclude), cands)
+		if err != nil {
+			t.Fatalf("ResolveExcludesForTargets(exec --tag %s): %v", exSpec, err)
+		}
+		var kept []string
+		for i, task := range tasks {
+			if !utils.IsTargetExcluded(excludes, cands[i]) {
+				kept = append(kept, task.rawHost)
+			}
+		}
+		if !slices.Equal(kept, []string{"m-node", "z-node"}) {
+			t.Fatalf("exec --tag --exclude %q kept %v, want [m-node z-node]", exSpec, kept)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingTagTasks(%s): %v", exSpec, err)
 	}
 }
 
@@ -222,26 +230,30 @@ func assertPass7ExecHostExcludeFiltersAlpha(t *testing.T, prov config.ConfigProv
 	if err := o.Complete(NewCmdExec(), nil); err != nil {
 		t.Fatalf("Complete(exec --host %s): %v", exSpec, err)
 	}
-	tasks, hostErrs, err := o.buildTasksFromHosts(t.Context(), prov)
-	if err != nil || len(hostErrs) != 0 {
-		t.Fatalf("buildTasksFromHosts(%s): err=%v hostErrs=%v", exSpec, err, hostErrs)
-	}
-	cands := make([]utils.ExcludeTargetInfo, 0, len(tasks))
-	for _, task := range tasks {
-		cands = append(cands, o.execTaskExcludeInfo(task))
-	}
-	excludes, err := utils.ResolveExcludesForTargets(prov, utils.ParseExcludeFlag(o.Exclude), cands)
-	if err != nil {
-		t.Fatalf("ResolveExcludesForTargets(exec --host %s): %v", exSpec, err)
-	}
-	var kept []string
-	for i, task := range tasks {
-		if !utils.IsTargetExcluded(excludes, cands[i]) {
-			kept = append(kept, task.rawHost)
+	if err := o.withTestPendingHostTasks(t.Context(), prov, func(tasks []execHostTask, _ []config.PendingLease, hostErrs []error) error {
+		if len(hostErrs) != 0 {
+			t.Fatalf("withTestPendingHostTasks(%s): hostErrs=%v", exSpec, hostErrs)
 		}
-	}
-	if !slices.Equal(kept, []string{"z-node"}) {
-		t.Fatalf("exec --host --exclude %q kept %v, want [z-node]", exSpec, kept)
+		cands := make([]utils.ExcludeTargetInfo, 0, len(tasks))
+		for _, task := range tasks {
+			cands = append(cands, o.execTaskExcludeInfo(task))
+		}
+		excludes, err := utils.ResolveExcludesForTargets(prov, utils.ParseExcludeFlag(o.Exclude), cands)
+		if err != nil {
+			t.Fatalf("ResolveExcludesForTargets(exec --host %s): %v", exSpec, err)
+		}
+		var kept []string
+		for i, task := range tasks {
+			if !utils.IsTargetExcluded(excludes, cands[i]) {
+				kept = append(kept, task.rawHost)
+			}
+		}
+		if !slices.Equal(kept, []string{"z-node"}) {
+			t.Fatalf("exec --host --exclude %q kept %v, want [z-node]", exSpec, kept)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingHostTasks(%s): %v", exSpec, err)
 	}
 }
 
@@ -311,12 +323,16 @@ func verifyPass7SingleExecPrecedenceAndPasswordSafety(t *testing.T, repo *config
 	oSingle.User = "flaguser"
 	oSingle.Port = 2299
 	oSingle.Remember = "never"
-	tasks, hostErrs, err := oSingle.buildTasksFromHosts(t.Context(), repo)
-	if err != nil || len(hostErrs) != 0 || len(tasks) != 1 {
-		t.Fatalf("single exec buildTasksFromHosts: err=%v hostErrs=%v len=%d", err, hostErrs, len(tasks))
-	}
-	if tasks[0].user != "flaguser" || tasks[0].port != 2299 {
-		t.Fatalf("single exec expected flaguser:2299, got %s:%d", tasks[0].user, tasks[0].port)
+	if err := oSingle.withTestPendingHostTasks(t.Context(), repo, func(tasks []execHostTask, _ []config.PendingLease, hostErrs []error) error {
+		if len(hostErrs) != 0 || len(tasks) != 1 {
+			t.Fatalf("single exec withTestPendingHostTasks: hostErrs=%v len=%d", hostErrs, len(tasks))
+		}
+		if tasks[0].user != "flaguser" || tasks[0].port != 2299 {
+			t.Fatalf("single exec expected flaguser:2299, got %s:%d", tasks[0].user, tasks[0].port)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("single exec withTestPendingHostTasks: %v", err)
 	}
 
 	// Verify resolveExecEntryCredentials drops inline password when single-target -l overrides inline user.
@@ -361,15 +377,19 @@ func verifyPass7BatchExecIFileAndMultiHostPrecedence(t *testing.T, repo *config.
 	oIFile.Port = 2200
 	oIFile.Password = "global_pw"
 	oIFile.Remember = "never"
-	tasks, hostErrs, err := oIFile.buildTasksFromHosts(t.Context(), repo)
-	if err != nil || len(hostErrs) != 0 || len(tasks) != 2 {
-		t.Fatalf("ifile buildTasksFromHosts: err=%v hostErrs=%v len=%d", err, hostErrs, len(tasks))
-	}
-	if tasks[0].user != "alice" || tasks[0].port != 2222 {
-		t.Fatalf("row 0 expected alice@:2222, got user=%q port=%d", tasks[0].user, tasks[0].port)
-	}
-	if tasks[1].user != "globaluser" || tasks[1].port != 2200 || tasks[1].pass != "global_pw" {
-		t.Fatalf("row 1 expected globaluser@:2200 with global_pw, got user=%q port=%d pass=%q", tasks[1].user, tasks[1].port, tasks[1].pass)
+	if err := oIFile.withTestPendingHostTasks(t.Context(), repo, func(tasks []execHostTask, _ []config.PendingLease, hostErrs []error) error {
+		if len(hostErrs) != 0 || len(tasks) != 2 {
+			t.Fatalf("ifile withTestPendingHostTasks: hostErrs=%v len=%d", hostErrs, len(tasks))
+		}
+		if tasks[0].user != "alice" || tasks[0].port != 2222 {
+			t.Fatalf("row 0 expected alice@:2222, got user=%q port=%d", tasks[0].user, tasks[0].port)
+		}
+		if tasks[1].user != "globaluser" || tasks[1].port != 2200 || tasks[1].pass != "global_pw" {
+			t.Fatalf("row 1 expected globaluser@:2200 with global_pw, got user=%q port=%d pass=%q", tasks[1].user, tasks[1].port, tasks[1].pass)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("ifile withTestPendingHostTasks: %v", err)
 	}
 	// Also verify per-row HostInfo password stays paired with inline user in batch mode.
 	bUser, _, bPort, _, bPw := oIFile.resolveExecEntryCredentials(utils.HostInfo{
@@ -388,15 +408,19 @@ func verifyPass7BatchExecIFileAndMultiHostPrecedence(t *testing.T, repo *config.
 	oMulti.User = "globaluser"
 	oMulti.Port = 2200
 	oMulti.Remember = "never"
-	mTasks, mErrs, err := oMulti.buildTasksFromHosts(t.Context(), repo)
-	if err != nil || len(mErrs) != 0 || len(mTasks) != 2 {
-		t.Fatalf("multi --host buildTasksFromHosts: err=%v hostErrs=%v len=%d", err, mErrs, len(mTasks))
-	}
-	if mTasks[0].user != "bob" || mTasks[0].port != 2225 {
-		t.Fatalf("multi --host[0] expected bob:2225, got %s:%d", mTasks[0].user, mTasks[0].port)
-	}
-	if mTasks[1].user != "globaluser" || mTasks[1].port != 2200 {
-		t.Fatalf("multi --host[1] expected globaluser:2200, got %s:%d", mTasks[1].user, mTasks[1].port)
+	if err := oMulti.withTestPendingHostTasks(t.Context(), repo, func(mTasks []execHostTask, _ []config.PendingLease, mErrs []error) error {
+		if len(mErrs) != 0 || len(mTasks) != 2 {
+			t.Fatalf("multi --host withTestPendingHostTasks: hostErrs=%v len=%d", mErrs, len(mTasks))
+		}
+		if mTasks[0].user != "bob" || mTasks[0].port != 2225 {
+			t.Fatalf("multi --host[0] expected bob:2225, got %s:%d", mTasks[0].user, mTasks[0].port)
+		}
+		if mTasks[1].user != "globaluser" || mTasks[1].port != 2200 {
+			t.Fatalf("multi --host[1] expected globaluser:2200, got %s:%d", mTasks[1].user, mTasks[1].port)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("multi --host withTestPendingHostTasks: %v", err)
 	}
 }
 

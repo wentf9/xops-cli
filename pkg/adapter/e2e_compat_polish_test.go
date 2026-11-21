@@ -46,39 +46,33 @@ func TestConfirmAuthenticatedConnection_WithOpenSSHConfigOverrideDoesNotCrash(t 
 	if err != nil {
 		t.Fatalf("WithOpenSSHConfigOverride failed: %v", err)
 	}
-	preparer, ok := overrideProvider.(interface {
-		PrepareNodeContext(context.Context, config.EnsureNodeOptions) (config.EnsureNodeResult, error)
-	})
-	if !ok {
-		t.Fatalf("overrideProvider %T does not implement PrepareNodeContext", overrideProvider)
-	}
-	prepared, err := preparer.PrepareNodeContext(ctx, config.EnsureNodeOptions{
+	if err := config.WithPendingNode(ctx, overrideProvider, config.EnsureNodeOptions{
 		Target: config.ConnectionTarget{Selector: host, User: "fixture", HasUser: true, Port: uint16(port), HasPort: true},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext failed: %v", err)
-	}
+	}, func(lease config.PendingLease) error {
+		nodeID := lease.NodeID()
+		adpOpts := []Option{
+			WithEnrollmentProbing(nil),
+			WithSessionAuthOverride(nodeID, SessionAuth{
+				Password: sshfixture.Password,
+				Remember: true,
+			}),
+		}
+		connector, adp := NewConnectorAndAdapter(overrideProvider, adpOpts, ssh.WithHandshakeTimeout(2*time.Second))
+		connector.AcceptNewHostKey.Store(true)
+		t.Cleanup(func() { _ = connector.CloseAll() })
 
-	adpOpts := []Option{
-		WithEnrollmentProbing(nil),
-		WithSessionAuthOverride(prepared.NodeID, SessionAuth{
-			Password: sshfixture.Password,
-			Remember: true,
-		}),
-	}
-	adp := NewSSHAdapter(overrideProvider, adpOpts...)
-	connector := NewConnectorWithAdapterOptions(overrideProvider, adpOpts, ssh.WithHandshakeTimeout(2*time.Second))
-	connector.AcceptNewHostKey.Store(true)
-	t.Cleanup(func() { _ = connector.CloseAll() })
+		client, err := connector.Connect(ctx, nodeID)
+		if err != nil {
+			t.Fatalf("Connect under WithOpenSSHConfigOverride + WithEnrollmentProbing failed: %v", err)
+		}
+		t.Cleanup(func() { _ = client.Close() })
 
-	client, err := connector.Connect(ctx, prepared.NodeID)
-	if err != nil {
-		t.Fatalf("Connect under WithOpenSSHConfigOverride + WithEnrollmentProbing failed: %v", err)
-	}
-	t.Cleanup(func() { _ = client.Close() })
-
-	if _, err := adp.ConfirmAuthenticatedConnection(ctx, prepared.NodeID, client); err != nil {
-		t.Fatalf("ConfirmAuthenticatedConnection returned error under -F override: %v", err)
+		if err := adp.FinalizePendingConnection(ctx, lease, client); err != nil {
+			t.Fatalf("FinalizePendingConnection returned error under -F override: %v", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode failed: %v", err)
 	}
 
 	after, err := os.ReadFile(cfgPath)

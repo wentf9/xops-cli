@@ -47,29 +47,41 @@ func TestEnrollmentProbeDisconnectPreservesNodeAndRejectsConnection(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	prepared, err := repo.PrepareNodeContext(ctx, config.EnsureNodeOptions{Target: config.ConnectionTarget{Selector: host, User: "fixture", HasUser: true, Port: uint16(port), HasPort: true}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	var nodeID string
 	var warnings atomic.Int32
-	connector := NewConnectorWithAdapterOptions(repo, []Option{
-		WithCredentialService(service),
-		WithSessionAuthOverride(prepared.NodeID, SessionAuth{Password: sshfixture.Password, Remember: true}),
-		WithEnrollmentProbing(func(string, error) { warnings.Add(1) }),
-	}, ssh.WithHandshakeTimeout(time.Second))
-	connector.AcceptNewHostKey.Store(true)
-	t.Cleanup(func() {
-		if err := connector.CloseAll(); err != nil {
-			t.Error(err)
-		}
-	})
-	client, connectErr := connector.Connect(ctx, prepared.NodeID)
-	if client != nil {
+	var connectErr error
+	var client *ssh.Client
+	if err := repo.WithPendingNode(ctx, config.EnsureNodeOptions{Target: config.ConnectionTarget{Selector: host, User: "fixture", HasUser: true, Port: uint16(port), HasPort: true}}, func(lease config.PendingLease) error {
+		nodeID = lease.NodeID()
+		connector, adp := NewConnectorAndAdapter(repo, []Option{
+			WithCredentialService(service),
+			WithSessionAuthOverride(nodeID, SessionAuth{Password: sshfixture.Password, Remember: true}),
+			WithEnrollmentProbing(func(string, error) { warnings.Add(1) }),
+		}, ssh.WithHandshakeTimeout(time.Second))
+		connector.AcceptNewHostKey.Store(true)
 		t.Cleanup(func() {
-			if err := client.Close(); err != nil {
+			if err := connector.CloseAll(); err != nil {
 				t.Error(err)
 			}
 		})
+		client, connectErr = connector.Connect(ctx, nodeID)
+		if connectErr == nil {
+			if finalizeErr := adp.FinalizePendingConnection(ctx, lease, client); finalizeErr != nil {
+				_ = connector.EvictClient(client)
+				client = nil
+				connectErr = finalizeErr
+			}
+		}
+		if client != nil {
+			t.Cleanup(func() {
+				if err := client.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 	var connectionErr *ssh.ConnectionError
 	if client != nil || !errors.As(connectErr, &connectionErr) {
@@ -79,7 +91,7 @@ func TestEnrollmentProbeDisconnectPreservesNodeAndRejectsConnection(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	node, saved := disk.Nodes.Get(prepared.NodeID)
+	node, saved := disk.Nodes.Get(nodeID)
 	if !saved || node.Execution != nil {
 		t.Fatal("authenticated node was lost or partial probe settings persisted")
 	}

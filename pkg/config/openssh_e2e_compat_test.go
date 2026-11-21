@@ -105,7 +105,7 @@ Host v6-percent-h
 	}
 }
 
-func TestOpenSSHOverrideProvider_ConfirmNodeWithExecutionContextNoOp(t *testing.T) {
+func TestOpenSSHOverrideProvider_WithPendingNodeConfirmWithExecutionNoOp(t *testing.T) {
 	dir := t.TempDir()
 	sshCfgPath := filepath.Join(dir, "ssh_config")
 	if err := os.WriteFile(sshCfgPath, []byte("Host demo\n  HostName 127.0.0.1\n  User ops\n"), 0o600); err != nil {
@@ -120,31 +120,21 @@ func TestOpenSSHOverrideProvider_ConfirmNodeWithExecutionContextNoOp(t *testing.
 	if err != nil {
 		t.Fatalf("WithOpenSSHConfigOverride failed: %v", err)
 	}
-	preparer, ok := override.(interface {
-		PrepareNodeContext(ctx interface{ Done() <-chan struct{} }, opts EnsureNodeOptions) (EnsureNodeResult, error)
-	})
-	_ = preparer
-	_ = ok
-
-	confirmer, ok := override.(interface {
-		ConfirmNodeWithExecutionContext(ctx interface{}, nodeID string, exec *ssh.ExecutionConfig) error
-	})
-	_ = confirmer
-	_ = ok
-
 	probeRepo, ok := override.(*openSSHOverrideProvider)
 	if !ok {
 		t.Fatalf("expected *openSSHOverrideProvider, got %T", override)
 	}
-	prepared, err := probeRepo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
-		Target: ConnectionTarget{Selector: "127.0.0.1", User: "ops", HasUser: true, Port: 2222, HasPort: true},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext failed: %v", err)
-	}
 	execCfg := &ssh.ExecutionConfig{Interpreter: ssh.InterpreterSh}
-	if err := probeRepo.ConfirmNodeWithExecutionContext(t.Context(), prepared.NodeID, execCfg); err != nil {
-		t.Fatalf("ConfirmNodeWithExecutionContext returned error on -F override provider: %v", err)
+	if err := probeRepo.WithPendingNode(t.Context(), EnsureNodeOptions{
+		Target: ConnectionTarget{Selector: "127.0.0.1", User: "ops", HasUser: true, Port: 2222, HasPort: true},
+	}, func(lease PendingLease) error {
+		execLease, ok := lease.(PendingExecutionLease)
+		if !ok {
+			t.Fatalf("expected PendingExecutionLease, got %T", lease)
+		}
+		return execLease.ConfirmWithExecution(t.Context(), execCfg)
+	}); err != nil {
+		t.Fatalf("WithPendingNode/ConfirmWithExecution returned error on -F override provider: %v", err)
 	}
 	if repo.Snapshot().Nodes.Count() != 0 {
 		t.Fatalf("expected base repository to remain untouched under -F, got %d nodes", repo.Snapshot().Nodes.Count())

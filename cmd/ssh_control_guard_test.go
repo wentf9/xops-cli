@@ -715,7 +715,7 @@ func TestMuxDaemonArgsAndTargetResolutionForVirtualAndPendingNodes(t *testing.T)
 	}
 
 	for _, sel := range []string{"openssh:" + host, "fixture@" + host + ":" + strconv.Itoa(port)} {
-		res, err := repo.PrepareNodeContext(ctx, config.EnsureNodeOptions{
+		if err := repo.WithPendingNode(ctx, config.EnsureNodeOptions{
 			Target: config.ConnectionTarget{
 				Selector: sel,
 				User:     "fixture",
@@ -723,16 +723,17 @@ func TestMuxDaemonArgsAndTargetResolutionForVirtualAndPendingNodes(t *testing.T)
 				Port:     uint16(port),
 				HasPort:  true,
 			},
-		})
-		if err != nil {
-			t.Fatalf("PrepareNodeContext(%q) failed: %v", sel, err)
-		}
-		_, hostCfg, _, err := repo.Resolve(res.NodeID)
-		if err != nil {
-			t.Fatalf("Resolve(%q) failed: %v", res.NodeID, err)
-		}
-		if hostCfg.Address != host {
-			t.Fatalf("Selector %q resolved to Address %q, want %q", sel, hostCfg.Address, host)
+		}, func(lease config.PendingLease) error {
+			_, hostCfg, _, err := repo.Resolve(lease.NodeID())
+			if err != nil {
+				t.Fatalf("Resolve(%q) failed: %v", lease.NodeID(), err)
+			}
+			if hostCfg.Address != host {
+				t.Fatalf("Selector %q resolved to Address %q, want %q", sel, hostCfg.Address, host)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("WithPendingNode(%q) failed: %v", sel, err)
 		}
 	}
 }
@@ -867,26 +868,25 @@ func TestMuxDaemonArgsIsolationAndRememberSuppression(t *testing.T) {
 		HasPort:  true,
 	}
 
-	nodeID, _, err := daemonOpts.resolveNode(ctx, repo)
-	if err != nil {
-		t.Fatalf("resolveNode in daemon mode failed: %v", err)
-	}
-	adpOpts, err := daemonOpts.buildAdapterOptions(nodeID, repo.Snapshot(), repo)
-	if err != nil {
-		t.Fatalf("buildAdapterOptions in daemon mode failed: %v", err)
-	}
-	adp := adapter.NewSSHAdapter(repo, adpOpts...)
-	if _, err := adp.UpdateAuth(ctx, nodeID, "tok", "secret", "", ""); err != nil {
-		t.Fatalf("UpdateAuth in daemon mode failed: %v", err)
-	}
-	if cfg.Nodes.Count() != 0 {
-		t.Fatalf("expected 0 persisted nodes in mux daemon child mode, got %d", cfg.Nodes.Count())
+	if err := daemonOpts.withTestPendingNode(ctx, repo, func(lease config.PendingLease) error {
+		nodeID := lease.NodeID()
+		adpOpts, err := daemonOpts.buildAdapterOptions(nodeID, repo.Snapshot(), repo)
+		if err != nil {
+			t.Fatalf("buildAdapterOptions in daemon mode failed: %v", err)
+		}
+		adp := adapter.NewSSHAdapter(repo, adpOpts...)
+		if _, err := adp.UpdateAuth(ctx, nodeID, "tok", "secret", "", ""); err != nil {
+			t.Fatalf("UpdateAuth in daemon mode failed: %v", err)
+		}
+		if cfg.Nodes.Count() != 0 {
+			t.Fatalf("expected 0 persisted nodes in mux daemon child mode, got %d", cfg.Nodes.Count())
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingNode in daemon mode failed: %v", err)
 	}
 }
 
-// TestOpenSSHVirtualNodeOverridesDoNotFailOrPersist verifies R3-2:
-// OpenSSH virtual nodes ("openssh:<alias>") work with CLI overrides (-i, -J) in
-// ssh, scp, and exec without failing with ErrNodeNotFound or writing bogus
 // TestOpenSSHVirtualNodeOverridesDoNotFailOrPersist verifies R3-2 and R4-1:
 // When connecting to an OpenSSH virtual node with CLI overrides (-i, -J, etc.),
 // ssh/scp/exec must not attempt to persist or mutate the read-only
@@ -911,31 +911,32 @@ func TestOpenSSHVirtualNodeOverridesDoNotFailOrPersist(t *testing.T) {
 		t.Fatalf("NewRepositoryWithOpenSSHParser failed: %v", err)
 	}
 
-	// 1. ssh resolveNode + buildAdapterOptions with -i and -J on an OpenSSH virtual node.
+	// 1. ssh withTestPendingNode + buildAdapterOptions with -i and -J on an OpenSSH virtual node.
 	verifyOpenSSHVirtualNodeSSHOverride(t, ctx, repo, cfg)
 
-	// 2. scp getOrCreateNodeForPath + credentialConnectorWithInteraction with -i and -J.
+	// 2. scp withTestPendingPath + credentialConnectorWithInteraction with -i and -J.
 	scpOpts := NewScpOptions()
 	scpOpts.Source = "demo-alias:/tmp/file.txt"
 	scpOpts.Dest = "/tmp/local.txt"
 	scpOpts.IdentityFile = "/tmp/override_id_ed25519"
 	scpOpts.JumpHost = "bastion"
-	scpNodeID, _, err := scpOpts.getOrCreateNodeForPath(ctx, repo, PathInfo{Host: "demo-alias", Path: "/tmp/file.txt", IsRemote: true}, "")
-	if err != nil {
-		t.Fatalf("ScpOptions.getOrCreateNodeForPath for OpenSSH alias failed: %v", err)
-	}
-	if scpNodeID != "openssh:demo-alias" {
-		t.Fatalf("expected scpNodeID %q, got %q", "openssh:demo-alias", scpNodeID)
-	}
-	if cfg.Nodes.Count() != 0 {
-		t.Fatalf("expected 0 persisted nodes after ScpOptions.getOrCreateNodeForPath, got %d", cfg.Nodes.Count())
-	}
-	conn, err := scpOpts.credentialConnectorWithInteraction(repo, cfg, newCLIInteractionHandler())
-	if err != nil || conn == nil {
-		t.Fatalf("expected non-nil connector from ScpOptions.credentialConnectorWithInteraction, err=%v", err)
+	if err := scpOpts.withTestPendingPath(ctx, repo, PathInfo{Host: "demo-alias", Path: "/tmp/file.txt", IsRemote: true}, "", func(lease config.PendingLease) error {
+		if lease.NodeID() != "openssh:demo-alias" {
+			t.Fatalf("expected scpNodeID %q, got %q", "openssh:demo-alias", lease.NodeID())
+		}
+		if cfg.Nodes.Count() != 0 {
+			t.Fatalf("expected 0 persisted nodes after ScpOptions.withTestPendingPath, got %d", cfg.Nodes.Count())
+		}
+		conn, err := scpOpts.credentialConnectorWithInteraction(repo, cfg, newCLIInteractionHandler())
+		if err != nil || conn == nil {
+			t.Fatalf("expected non-nil connector from ScpOptions.credentialConnectorWithInteraction, err=%v", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("ScpOptions.withTestPendingPath for OpenSSH alias failed: %v", err)
 	}
 
-	// 3. exec getOrCreateNode + buildAdapterOptions on an OpenSSH virtual node.
+	// 3. exec withTestPendingHostTasks + buildAdapterOptions on an OpenSSH virtual node.
 	verifyOpenSSHVirtualNodeExecOverride(t, ctx, repo, cfg)
 }
 
@@ -950,45 +951,48 @@ func verifyOpenSSHVirtualNodeSSHOverride(t *testing.T, ctx context.Context, repo
 		ProxyJump:    "bastion",
 		HasProxyJump: true,
 	}
-	nodeID, _, err := sshOpts.resolveNode(ctx, repo)
-	if err != nil {
-		t.Fatalf("SshOptions.resolveNode for OpenSSH alias with overrides failed: %v", err)
-	}
-	if nodeID != "openssh:demo-alias" {
-		t.Fatalf("expected nodeID %q, got %q", "openssh:demo-alias", nodeID)
-	}
-	if cfg.Nodes.Count() != 0 {
-		t.Fatalf("expected 0 persisted nodes after SshOptions.resolveNode, got %d", cfg.Nodes.Count())
-	}
-	sshAdpOpts, err := sshOpts.buildAdapterOptions(nodeID, cfg, repo)
-	if err != nil {
-		t.Fatalf("SshOptions.buildAdapterOptions failed: %v", err)
-	}
-	sshAdp := adapter.NewSSHAdapter(repo, sshAdpOpts...)
-	sshClientCfg, err := sshAdp.GetConfig(nodeID)
-	if err != nil {
-		t.Fatalf("sshAdp.GetConfig(%q) failed: %v", nodeID, err)
-	}
-	if sshClientCfg.ProxyJump != "openssh:bastion" {
-		t.Fatalf("expected sshClientCfg.ProxyJump == %q, got %q", "openssh:bastion", sshClientCfg.ProxyJump)
+	if err := sshOpts.withTestPendingNode(ctx, repo, func(lease config.PendingLease) error {
+		nodeID := lease.NodeID()
+		if nodeID != "openssh:demo-alias" {
+			t.Fatalf("expected nodeID %q, got %q", "openssh:demo-alias", nodeID)
+		}
+		if cfg.Nodes.Count() != 0 {
+			t.Fatalf("expected 0 persisted nodes after SshOptions.withTestPendingNode, got %d", cfg.Nodes.Count())
+		}
+		sshAdpOpts, err := sshOpts.buildAdapterOptions(nodeID, cfg, repo)
+		if err != nil {
+			t.Fatalf("SshOptions.buildAdapterOptions failed: %v", err)
+		}
+		sshAdp := adapter.NewSSHAdapter(repo, sshAdpOpts...)
+		sshClientCfg, err := sshAdp.GetConfig(nodeID)
+		if err != nil {
+			t.Fatalf("sshAdp.GetConfig(%q) failed: %v", nodeID, err)
+		}
+		if sshClientCfg.ProxyJump != "openssh:bastion" {
+			t.Fatalf("expected sshClientCfg.ProxyJump == %q, got %q", "openssh:bastion", sshClientCfg.ProxyJump)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("SshOptions.withTestPendingNode for OpenSSH alias with overrides failed: %v", err)
 	}
 
-	// Invalid -J on OpenSSH virtual node must fail validation in update.
+	// Invalid -J on OpenSSH virtual node must fail validation before dialing.
 	sshBadJump := NewSshOptions()
 	sshBadJump.Host = "demo-alias"
 	sshBadJump.JumpHost = "nonexistent-jump-alias"
 	sshBadJump.Target = config.ConnectionTarget{Selector: "demo-alias", ProxyJump: "nonexistent-jump-alias", HasProxyJump: true}
-	if _, _, err := sshBadJump.resolveNode(ctx, repo); err == nil {
-		t.Fatal("expected SshOptions.resolveNode to fail on nonexistent ProxyJump override")
+	if err := sshBadJump.withTestPendingNode(ctx, repo, func(config.PendingLease) error { return nil }); err == nil {
+		t.Fatal("expected SshOptions.withTestPendingNode to fail on nonexistent ProxyJump override")
 	}
 }
 
 func verifyOpenSSHVirtualNodeExecOverride(t *testing.T, ctx context.Context, repo *config.Repository, cfg *config.Configuration) {
 	t.Helper()
 	execOpts := NewExecOptions()
+	execOpts.Host = "demo-alias"
 	execOpts.IdentityFile = "/tmp/override_id_ed25519"
 	execOpts.JumpHost = "bastion"
-	execNodeID, _, err := execOpts.getOrCreateNode(ctx, repo, config.ConnectionTarget{
+	req := execOpts.buildExecEnsureOptions(repo, config.ConnectionTarget{
 		Selector:     "demo-alias",
 		ProxyJump:    "bastion",
 		HasProxyJump: true,
@@ -996,30 +1000,33 @@ func verifyOpenSSHVirtualNodeExecOverride(t *testing.T, ctx context.Context, rep
 		Host:    "demo-alias",
 		KeyPath: "/tmp/override_id_ed25519",
 	})
-	if err != nil {
-		t.Fatalf("ExecOptions.getOrCreateNode for OpenSSH alias failed: %v", err)
-	}
-	if execNodeID != "openssh:demo-alias" {
-		t.Fatalf("expected execNodeID %q, got %q", "openssh:demo-alias", execNodeID)
-	}
-	if cfg.Nodes.Count() != 0 {
-		t.Fatalf("expected 0 persisted nodes after ExecOptions.getOrCreateNode, got %d", cfg.Nodes.Count())
-	}
-	execAdpOpts, err := execOpts.buildAdapterOptions([]execHostTask{{
-		nodeID:  execNodeID,
-		host:    "demo-alias",
-		keyPath: "/tmp/override_id_ed25519",
-	}}, cfg, repo)
-	if err != nil {
-		t.Fatalf("ExecOptions.buildAdapterOptions failed: %v", err)
-	}
-	execAdp := adapter.NewSSHAdapter(repo, execAdpOpts...)
-	execClientCfg, err := execAdp.GetConfig(execNodeID)
-	if err != nil {
-		t.Fatalf("execAdp.GetConfig(%q) failed: %v", execNodeID, err)
-	}
-	if execClientCfg.ProxyJump != "openssh:bastion" {
-		t.Fatalf("expected execClientCfg.ProxyJump == %q, got %q", "openssh:bastion", execClientCfg.ProxyJump)
+	if err := config.WithPendingNode(ctx, repo, req, func(lease config.PendingLease) error {
+		execNodeID := lease.NodeID()
+		if execNodeID != "openssh:demo-alias" {
+			t.Fatalf("expected execNodeID %q, got %q", "openssh:demo-alias", execNodeID)
+		}
+		if cfg.Nodes.Count() != 0 {
+			t.Fatalf("expected 0 persisted nodes after ExecOptions WithPendingNode, got %d", cfg.Nodes.Count())
+		}
+		execAdpOpts, err := execOpts.buildAdapterOptions([]execHostTask{{
+			nodeID:  execNodeID,
+			host:    "demo-alias",
+			keyPath: "/tmp/override_id_ed25519",
+		}}, cfg, repo)
+		if err != nil {
+			t.Fatalf("ExecOptions.buildAdapterOptions failed: %v", err)
+		}
+		execAdp := adapter.NewSSHAdapter(repo, execAdpOpts...)
+		execClientCfg, err := execAdp.GetConfig(execNodeID)
+		if err != nil {
+			t.Fatalf("execAdp.GetConfig(%q) failed: %v", execNodeID, err)
+		}
+		if execClientCfg.ProxyJump != "openssh:bastion" {
+			t.Fatalf("expected execClientCfg.ProxyJump == %q, got %q", "openssh:bastion", execClientCfg.ProxyJump)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("ExecOptions WithPendingNode for OpenSSH alias failed: %v", err)
 	}
 }
 
@@ -1252,7 +1259,7 @@ func TestPrepareNodeContextDisambiguatesSelectorAndOpenSSHVirtualNode(t *testing
 	}
 
 	// 1a. Selector is exact node ID "node-a" with explicit -p 22 -l root.
-	res, err := repo.PrepareNodeContext(ctx, config.EnsureNodeOptions{
+	if err := repo.WithPendingNode(ctx, config.EnsureNodeOptions{
 		Target: config.ConnectionTarget{
 			Selector: "node-a",
 			User:     "root",
@@ -1260,32 +1267,34 @@ func TestPrepareNodeContextDisambiguatesSelectorAndOpenSSHVirtualNode(t *testing
 			Port:     22,
 			HasPort:  true,
 		},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(node-a, root, 22) failed: %v", err)
-	}
-	if res.NodeID != "node-a" || res.Created {
-		t.Fatalf("expected existing node-a, got NodeID=%q Created=%v", res.NodeID, res.Created)
+	}, func(lease config.PendingLease) error {
+		if lease.NodeID() != "node-a" || repo.IsPendingNode(lease.NodeID()) {
+			t.Fatalf("expected existing node-a, got NodeID=%q pending=%v", lease.NodeID(), repo.IsPendingNode(lease.NodeID()))
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode(node-a, root, 22) failed: %v", err)
 	}
 
 	// 1b. Selector is exact alias "alias-b" with explicit -p 22.
-	resAlias, err := repo.PrepareNodeContext(ctx, config.EnsureNodeOptions{
+	if err := repo.WithPendingNode(ctx, config.EnsureNodeOptions{
 		Target: config.ConnectionTarget{
 			Selector: "alias-b",
 			Port:     22,
 			HasPort:  true,
 		},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(alias-b, 22) failed: %v", err)
-	}
-	if resAlias.NodeID != "node-b" || resAlias.Created {
-		t.Fatalf("expected existing node-b, got NodeID=%q Created=%v", resAlias.NodeID, resAlias.Created)
+	}, func(lease config.PendingLease) error {
+		if lease.NodeID() != "node-b" || repo.IsPendingNode(lease.NodeID()) {
+			t.Fatalf("expected existing node-b, got NodeID=%q pending=%v", lease.NodeID(), repo.IsPendingNode(lease.NodeID()))
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode(alias-b, 22) failed: %v", err)
 	}
 
 	// 2. OpenSSH virtual node with matching explicit user and port resolves to
 	// "openssh:demo-alias" without creating a pending/persisted node.
-	resOpenSSH, err := repo.PrepareNodeContext(ctx, config.EnsureNodeOptions{
+	if err := repo.WithPendingNode(ctx, config.EnsureNodeOptions{
 		Target: config.ConnectionTarget{
 			Selector: "demo-alias",
 			User:     "demo",
@@ -1293,12 +1302,13 @@ func TestPrepareNodeContextDisambiguatesSelectorAndOpenSSHVirtualNode(t *testing
 			Port:     2222,
 			HasPort:  true,
 		},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(demo-alias, demo, 2222) failed: %v", err)
-	}
-	if resOpenSSH.NodeID != "openssh:demo-alias" || resOpenSSH.Created {
-		t.Fatalf("expected existing openssh:demo-alias, got NodeID=%q Created=%v", resOpenSSH.NodeID, resOpenSSH.Created)
+	}, func(lease config.PendingLease) error {
+		if lease.NodeID() != "openssh:demo-alias" || repo.IsPendingNode(lease.NodeID()) {
+			t.Fatalf("expected existing openssh:demo-alias, got NodeID=%q pending=%v", lease.NodeID(), repo.IsPendingNode(lease.NodeID()))
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode(demo-alias, demo, 2222) failed: %v", err)
 	}
 }
 
@@ -1452,45 +1462,47 @@ func TestDerivedNodeFromOpenSSHAliasInheritsTier4Control(t *testing.T) {
 		User:     "ops",
 		HasUser:  true,
 	}
-	res, err := repo.PrepareNodeContext(context.Background(), config.EnsureNodeOptions{Target: target})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext failed: %v", err)
-	}
-	if res.NodeID != "ops@10.0.0.20:2200" {
-		t.Fatalf("expected derived node ops@10.0.0.20:2200, got %q", res.NodeID)
-	}
+	if err := repo.WithPendingNode(context.Background(), config.EnsureNodeOptions{Target: target}, func(lease config.PendingLease) error {
+		nodeID := lease.NodeID()
+		if nodeID != "ops@10.0.0.20:2200" {
+			t.Fatalf("expected derived node ops@10.0.0.20:2200, got %q", nodeID)
+		}
 
-	adp := adapter.NewSSHAdapter(repo)
-	pol, err := adp.Resolve(t.Context(), adapter.ResolveRequest{NodeID: res.NodeID})
-	if err != nil {
-		t.Fatalf("Resolve(%q) failed: %v", res.NodeID, err)
-	}
-	ctrl := pol.Control()
-	if ctrl == nil || ctrl.Master != ssh.ControlMasterAuto || ctrl.Path != "/tmp/cm-%n-%r@%h:%p" || ctrl.Persist != "60s" {
-		t.Fatalf("expected Tier 4 ControlConfig from demo-alias, got %+v", ctrl)
-	}
+		adp := adapter.NewSSHAdapter(repo)
+		pol, err := adp.Resolve(t.Context(), adapter.ResolveRequest{NodeID: nodeID})
+		if err != nil {
+			t.Fatalf("Resolve(%q) failed: %v", nodeID, err)
+		}
+		ctrl := pol.Control()
+		if ctrl == nil || ctrl.Master != ssh.ControlMasterAuto || ctrl.Path != "/tmp/cm-%n-%r@%h:%p" || ctrl.Persist != "60s" {
+			t.Fatalf("expected Tier 4 ControlConfig from demo-alias, got %+v", ctrl)
+		}
 
-	sshOpts := NewSshOptions()
-	sshOpts.Host = "demo-alias"
-	sshOpts.User = "ops"
-	sshOpts.Target = target
-	connectSock, err := controlSocketPath(sshOpts, repo, res.NodeID)
-	if err != nil {
-		t.Fatalf("controlSocketPath(connect) failed: %v", err)
-	}
+		sshOpts := NewSshOptions()
+		sshOpts.Host = "demo-alias"
+		sshOpts.User = "ops"
+		sshOpts.Target = target
+		connectSock, err := controlSocketPath(sshOpts, repo, nodeID)
+		if err != nil {
+			t.Fatalf("controlSocketPath(connect) failed: %v", err)
+		}
 
-	// Simulate read-only -O check before derived node is persisted to disk.
-	readOnlyProvider := config.NewProviderWithOpenSSHParser(cfg, parser)
-	ctlNodeID, err := resolveControlNodeID(readOnlyProvider, target)
-	if err != nil {
-		t.Fatalf("resolveControlNodeID failed: %v", err)
-	}
-	ctlSock, err := controlSocketPath(sshOpts, readOnlyProvider, ctlNodeID)
-	if err != nil {
-		t.Fatalf("controlSocketPath(-O) failed: %v", err)
-	}
-	if connectSock != ctlSock {
-		t.Fatalf("expected connect socket %q to equal -O socket %q", connectSock, ctlSock)
+		// Simulate read-only -O check before derived node is persisted to disk.
+		readOnlyProvider := config.NewProviderWithOpenSSHParser(cfg, parser)
+		ctlNodeID, err := resolveControlNodeID(readOnlyProvider, target)
+		if err != nil {
+			t.Fatalf("resolveControlNodeID failed: %v", err)
+		}
+		ctlSock, err := controlSocketPath(sshOpts, readOnlyProvider, ctlNodeID)
+		if err != nil {
+			t.Fatalf("controlSocketPath(-O) failed: %v", err)
+		}
+		if connectSock != ctlSock {
+			t.Fatalf("expected connect socket %q to equal -O socket %q", connectSock, ctlSock)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode failed: %v", err)
 	}
 }
 
@@ -1622,19 +1634,20 @@ func TestControlCandidateFallbackAndPortOverrideJumpAlignment(t *testing.T) {
 	}
 
 	// Derived node from alias-b must resolve alias-b's ControlPath (/tmp/cm-b-%C), not alias-a's.
-	resB, err := repo.PrepareNodeContext(context.Background(), config.EnsureNodeOptions{
+	if err := repo.WithPendingNode(context.Background(), config.EnsureNodeOptions{
 		Target: config.ConnectionTarget{Selector: "alias-b", User: "ops", HasUser: true},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(alias-b) failed: %v", err)
-	}
-	polB, err := adp.Resolve(t.Context(), adapter.ResolveRequest{NodeID: resB.NodeID})
-	if err != nil {
-		t.Fatalf("Resolve(%q) failed: %v", resB.NodeID, err)
-	}
-	ctrlB := polB.Control()
-	if ctrlB == nil || ctrlB.Path != "/tmp/cm-b-%C" || ctrlB.Persist != "20s" {
-		t.Fatalf("expected alias-b ControlConfig (/tmp/cm-b-%%C, 20s), got %+v", ctrlB)
+	}, func(lease config.PendingLease) error {
+		polB, err := adp.Resolve(t.Context(), adapter.ResolveRequest{NodeID: lease.NodeID()})
+		if err != nil {
+			t.Fatalf("Resolve(%q) failed: %v", lease.NodeID(), err)
+		}
+		ctrlB := polB.Control()
+		if ctrlB == nil || ctrlB.Path != "/tmp/cm-b-%C" || ctrlB.Persist != "20s" {
+			t.Fatalf("expected alias-b ControlConfig (/tmp/cm-b-%%C, 20s), got %+v", ctrlB)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode(alias-b) failed: %v", err)
 	}
 }
 
@@ -1678,42 +1691,44 @@ func TestAdHocOverrideWithWildcardOpenSSHAndSameIPJumpIdentityIsolation(t *testi
 		User:     "ops",
 		HasUser:  true,
 	}
-	res, err := repo.PrepareNodeContext(ctx, config.EnsureNodeOptions{Target: target})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext failed: %v", err)
-	}
-	if res.NodeID != "ops@10.0.0.88:22" {
-		t.Fatalf("expected PrepareNodeContext nodeID ops@10.0.0.88:22, got %q", res.NodeID)
-	}
+	if err := repo.WithPendingNode(ctx, config.EnsureNodeOptions{Target: target}, func(lease config.PendingLease) error {
+		nodeID := lease.NodeID()
+		if nodeID != "ops@10.0.0.88:22" {
+			t.Fatalf("expected WithPendingNode nodeID ops@10.0.0.88:22, got %q", nodeID)
+		}
 
-	sshOpts := NewSshOptions()
-	sshOpts.Host = "10.0.0.88"
-	sshOpts.User = "ops"
-	sshOpts.Target = target
-	connectSock, err := controlSocketPath(sshOpts, repo, res.NodeID)
-	if err != nil {
-		t.Fatalf("controlSocketPath(connect) failed: %v", err)
-	}
+		sshOpts := NewSshOptions()
+		sshOpts.Host = "10.0.0.88"
+		sshOpts.User = "ops"
+		sshOpts.Target = target
+		connectSock, err := controlSocketPath(sshOpts, repo, nodeID)
+		if err != nil {
+			t.Fatalf("controlSocketPath(connect) failed: %v", err)
+		}
 
-	ctlNodeID, err := resolveControlNodeID(readOnlyProvider, target)
-	if err != nil {
-		t.Fatalf("resolveControlNodeID failed: %v", err)
-	}
-	ctlSock, err := controlSocketPath(sshOpts, readOnlyProvider, ctlNodeID)
-	if err != nil {
-		t.Fatalf("controlSocketPath(-O) failed: %v", err)
-	}
-	if connectSock != ctlSock {
-		t.Fatalf("expected connect socket %q to equal -O socket %q", connectSock, ctlSock)
-	}
+		ctlNodeID, err := resolveControlNodeID(readOnlyProvider, target)
+		if err != nil {
+			t.Fatalf("resolveControlNodeID failed: %v", err)
+		}
+		ctlSock, err := controlSocketPath(sshOpts, readOnlyProvider, ctlNodeID)
+		if err != nil {
+			t.Fatalf("controlSocketPath(-O) failed: %v", err)
+		}
+		if connectSock != ctlSock {
+			t.Fatalf("expected connect socket %q to equal -O socket %q", connectSock, ctlSock)
+		}
 
-	scpOpts := NewScpOptions()
-	scpOpts.User = "ops"
-	scpOpts.Source = "10.0.0.88:/tmp/a"
-	scpOpts.Dest = "/tmp/b"
-	scpIDs := scpOpts.resolvedTargetNodeIDs(repo)
-	if !slices.Contains(scpIDs, "ops@10.0.0.88:22") {
-		t.Fatalf("expected scp resolvedTargetNodeIDs to contain ops@10.0.0.88:22, got %v", scpIDs)
+		scpOpts := NewScpOptions()
+		scpOpts.User = "ops"
+		scpOpts.Source = "10.0.0.88:/tmp/a"
+		scpOpts.Dest = "/tmp/b"
+		scpIDs := scpOpts.resolvedTargetNodeIDs(repo)
+		if !slices.Contains(scpIDs, "ops@10.0.0.88:22") {
+			t.Fatalf("expected scp resolvedTargetNodeIDs to contain ops@10.0.0.88:22, got %v", scpIDs)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode failed: %v", err)
 	}
 
 	// Verify R8-2: same IP (127.0.0.1), different ports for jump (2201) and target (2200).
@@ -1925,19 +1940,20 @@ func verifyScpIsolationAndHostFlagAndLookupAlias(t *testing.T, ctx context.Conte
 	// never base node openssh:gw or root@10.0.0.10:22, and -H mode ignores colons in local Source.
 	verifyScpIsolationAndHostFlag(t, repo)
 
-	// R9-4a: PrepareNodeContext via lookup["10.0.0.10"] with -l ops -p 22 preserves OpenSSHAlias "gw".
-	resLookup, err := repo.PrepareNodeContext(ctx, config.EnsureNodeOptions{
+	// R9-4a: WithPendingNode via lookup["10.0.0.10"] with -l ops -p 22 preserves OpenSSHAlias "gw".
+	if err := repo.WithPendingNode(ctx, config.EnsureNodeOptions{
 		Target: config.ConnectionTarget{Selector: "10.0.0.10", User: "ops", HasUser: true, Port: 22, HasPort: true},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(10.0.0.10, -l ops -p 22) failed: %v", err)
-	}
-	nodeLookup, _, _, err := repo.Resolve(resLookup.NodeID)
-	if err != nil {
-		t.Fatalf("Resolve(%q) failed: %v", resLookup.NodeID, err)
-	}
-	if nodeLookup.OpenSSHAlias != "gw" {
-		t.Fatalf("expected derived node from 10.0.0.10 lookup to preserve OpenSSHAlias %q, got %q", "gw", nodeLookup.OpenSSHAlias)
+	}, func(lease config.PendingLease) error {
+		nodeLookup, _, _, err := repo.Resolve(lease.NodeID())
+		if err != nil {
+			t.Fatalf("Resolve(%q) failed: %v", lease.NodeID(), err)
+		}
+		if nodeLookup.OpenSSHAlias != "gw" {
+			t.Fatalf("expected derived node from 10.0.0.10 lookup to preserve OpenSSHAlias %q, got %q", "gw", nodeLookup.OpenSSHAlias)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode(10.0.0.10, -l ops -p 22) failed: %v", err)
 	}
 
 	// R9-4b: controlTarget for `gw -p 2222` (where base node is openssh:gw) inherits
@@ -2054,9 +2070,13 @@ Host 10.0.0.10
 	if err := opts.parseTarget(false); err != nil {
 		t.Fatalf("parseTarget: %v", err)
 	}
-	res, err := repo.PrepareNodeContext(context.Background(), config.EnsureNodeOptions{Target: opts.Target})
-	if err != nil || res.NodeID != "root@10.0.0.10:22" {
-		t.Fatalf("expected PrepareNodeContext(root@10.0.0.10:22) to resolve root@10.0.0.10:22, got %q (err=%v)", res.NodeID, err)
+	if err := repo.WithPendingNode(context.Background(), config.EnsureNodeOptions{Target: opts.Target}, func(lease config.PendingLease) error {
+		if lease.NodeID() != "root@10.0.0.10:22" {
+			t.Fatalf("expected WithPendingNode(root@10.0.0.10:22) to resolve root@10.0.0.10:22, got %q", lease.NodeID())
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode(root@10.0.0.10:22): %v", err)
 	}
 	ctlID, err := resolveControlNodeID(repo, opts.Target)
 	if err != nil || ctlID != "root@10.0.0.10:22" {
@@ -2064,7 +2084,7 @@ Host 10.0.0.10
 	}
 
 	// R10-1 Step 4: composite user@host:port selector does not match Host 10.0.0.10 block.
-	daemonRes, err := repo.PrepareNodeContext(context.Background(), config.EnsureNodeOptions{
+	if err := repo.WithPendingNode(context.Background(), config.EnsureNodeOptions{
 		Target: config.ConnectionTarget{
 			Selector:    "ops@10.0.0.10:2200",
 			RawSelector: "ops@10.0.0.10:2200",
@@ -2073,16 +2093,17 @@ Host 10.0.0.10
 			Port:        2200,
 			HasPort:     true,
 		},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(ops@10.0.0.10:2200): %v", err)
-	}
-	snap, err := repo.ResolveConnection(daemonRes.NodeID)
-	if err != nil {
-		t.Fatalf("ResolveConnection(%q): %v", daemonRes.NodeID, err)
-	}
-	if snap.Node.ProxyJump != "" || snap.Identity.KeyPath != "" {
-		t.Fatalf("expected composite selector ops@10.0.0.10:2200 not to inherit Host 10.0.0.10 ProxyJump/KeyPath, got jump=%q key=%q", snap.Node.ProxyJump, snap.Identity.KeyPath)
+	}, func(lease config.PendingLease) error {
+		snap, err := repo.ResolveConnection(lease.NodeID())
+		if err != nil {
+			t.Fatalf("ResolveConnection(%q): %v", lease.NodeID(), err)
+		}
+		if snap.Node.ProxyJump != "" || snap.Identity.KeyPath != "" {
+			t.Fatalf("expected composite selector ops@10.0.0.10:2200 not to inherit Host 10.0.0.10 ProxyJump/KeyPath, got jump=%q key=%q", snap.Node.ProxyJump, snap.Identity.KeyPath)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode(ops@10.0.0.10:2200): %v", err)
 	}
 }
 
@@ -2159,21 +2180,25 @@ Host app
 	appOpts.Host = "app"
 	appOpts.Port = 2222
 	appOpts.Target = config.ConnectionTarget{Selector: "app", Port: 2222, HasPort: true}
-	res, err := repoTier4.PrepareNodeContext(context.Background(), config.EnsureNodeOptions{Target: appOpts.Target})
-	if err != nil || res.NodeID != "ubuntu@10.0.0.20:2222" {
-		t.Fatalf("PrepareNodeContext(-p 2222 app) = %q, err=%v", res.NodeID, err)
-	}
-	appSock, err := controlSocketPath(appOpts, repoTier4, res.NodeID)
-	if err != nil || appSock != "" {
-		t.Fatalf("H4: Port-2200 Host app must not leak Tier-4 ControlPath onto saved :2222 node, got %q (err=%v)", appSock, err)
-	}
-	appMatchOpts := NewSshOptions()
-	appMatchOpts.Host = "app"
-	appMatchOpts.Port = 2200
-	appMatchOpts.Target = config.ConnectionTarget{Selector: "app", Port: 2200, HasPort: true}
-	matchSock, err := controlSocketPath(appMatchOpts, repoTier4, "ubuntu@10.0.0.20:2200")
-	if err != nil || matchSock != "/tmp/app-ubuntu@10.0.0.20:2200-ubuntu@10.0.0.20:2200" {
-		t.Fatalf("expected matching-endpoint saved node to inherit Host app ControlPath, got %q (err=%v)", matchSock, err)
+	if err := repoTier4.WithPendingNode(context.Background(), config.EnsureNodeOptions{Target: appOpts.Target}, func(lease config.PendingLease) error {
+		if lease.NodeID() != "ubuntu@10.0.0.20:2222" {
+			t.Fatalf("WithPendingNode(-p 2222 app) = %q", lease.NodeID())
+		}
+		appSock, err := controlSocketPath(appOpts, repoTier4, lease.NodeID())
+		if err != nil || appSock != "" {
+			t.Fatalf("H4: Port-2200 Host app must not leak Tier-4 ControlPath onto saved :2222 node, got %q (err=%v)", appSock, err)
+		}
+		appMatchOpts := NewSshOptions()
+		appMatchOpts.Host = "app"
+		appMatchOpts.Port = 2200
+		appMatchOpts.Target = config.ConnectionTarget{Selector: "app", Port: 2200, HasPort: true}
+		matchSock, err := controlSocketPath(appMatchOpts, repoTier4, "ubuntu@10.0.0.20:2200")
+		if err != nil || matchSock != "/tmp/app-ubuntu@10.0.0.20:2200-ubuntu@10.0.0.20:2200" {
+			t.Fatalf("expected matching-endpoint saved node to inherit Host app ControlPath, got %q (err=%v)", matchSock, err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode(-p 2222 app): %v", err)
 	}
 }
 
@@ -2230,33 +2255,39 @@ Host app
 	// 1. Prepare via raw IP first (OpenSSHAlias == ""), then re-prepare via OpenSSH alias "app"
 	// (OpenSSHAlias == "app"). Must not fail with ErrConfigConflict and must preserve "app".
 	rawTarget := config.ConnectionTarget{Selector: "10.0.0.10", User: "root", HasUser: true, Port: 2200, HasPort: true}
-	res1, err := repo.PrepareNodeContext(ctx, config.EnsureNodeOptions{Target: rawTarget})
-	if err != nil || res1.NodeID != "root@10.0.0.10:2200" {
-		t.Fatalf("PrepareNodeContext(10.0.0.10): got %q, err=%v", res1.NodeID, err)
-	}
-	aliasTarget := config.ConnectionTarget{Selector: "app", User: "root", HasUser: true}
-	res2, err := repo.PrepareNodeContext(ctx, config.EnsureNodeOptions{Target: aliasTarget})
-	if err != nil || res2.NodeID != "root@10.0.0.10:2200" {
-		t.Fatalf("PrepareNodeContext(app) after raw IP failed with conflict: got %q, err=%v", res2.NodeID, err)
-	}
-	snap, err := repo.ResolveConnection(res2.NodeID)
-	if err != nil || snap.Node.OpenSSHAlias != "app" {
-		t.Fatalf("expected pending connection to retain OpenSSHAlias='app', got %q (err=%v)", snap.Node.OpenSSHAlias, err)
-	}
+	if err := repo.WithPendingNode(ctx, config.EnsureNodeOptions{Target: rawTarget}, func(lease1 config.PendingLease) error {
+		if lease1.NodeID() != "root@10.0.0.10:2200" {
+			t.Fatalf("WithPendingNode(10.0.0.10): got %q", lease1.NodeID())
+		}
+		aliasTarget := config.ConnectionTarget{Selector: "app", User: "root", HasUser: true}
+		return repo.WithPendingNode(ctx, config.EnsureNodeOptions{Target: aliasTarget}, func(lease2 config.PendingLease) error {
+			nodeID := lease2.NodeID()
+			if nodeID != "root@10.0.0.10:2200" {
+				t.Fatalf("WithPendingNode(app) after raw IP got %q", nodeID)
+			}
+			snap, err := repo.ResolveConnection(nodeID)
+			if err != nil || snap.Node.OpenSSHAlias != "app" {
+				t.Fatalf("expected pending connection to retain OpenSSHAlias='app', got %q (err=%v)", snap.Node.OpenSSHAlias, err)
+			}
 
-	// 2. ConfirmNodeContext must succeed even if another writer already saved root@10.0.0.10:2200
-	// without OpenSSHAlias, and must keep OpenSSHAlias in session memory + Frozen().
-	if err := repo.ConfirmNodeContext(ctx, res2.NodeID); err != nil {
-		t.Fatalf("ConfirmNodeContext(%q) failed: %v", res2.NodeID, err)
-	}
-	snapAfter, err := repo.ResolveConnection(res2.NodeID)
-	if err != nil || snapAfter.Node.OpenSSHAlias != "app" {
-		t.Fatalf("expected confirmed node to retain session OpenSSHAlias='app', got %q (err=%v)", snapAfter.Node.OpenSSHAlias, err)
-	}
-	frozen := repo.Frozen()
-	frozenSnap, err := frozen.ResolveConnection(res2.NodeID)
-	if err != nil || frozenSnap.Node.OpenSSHAlias != "app" {
-		t.Fatalf("expected Frozen() provider to retain OpenSSHAlias='app', got %q (err=%v)", frozenSnap.Node.OpenSSHAlias, err)
+			// 2. Confirm must succeed even if another writer already saved root@10.0.0.10:2200
+			// without OpenSSHAlias, and must keep OpenSSHAlias in session memory + Frozen().
+			if err := lease2.Confirm(ctx); err != nil {
+				t.Fatalf("lease2.Confirm(%q) failed: %v", nodeID, err)
+			}
+			snapAfter, err := repo.ResolveConnection(nodeID)
+			if err != nil || snapAfter.Node.OpenSSHAlias != "app" {
+				t.Fatalf("expected confirmed node to retain session OpenSSHAlias='app', got %q (err=%v)", snapAfter.Node.OpenSSHAlias, err)
+			}
+			frozen := repo.Frozen()
+			frozenSnap, err := frozen.ResolveConnection(nodeID)
+			if err != nil || frozenSnap.Node.OpenSSHAlias != "app" {
+				t.Fatalf("expected Frozen() provider to retain OpenSSHAlias='app', got %q (err=%v)", frozenSnap.Node.OpenSSHAlias, err)
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("WithPendingNode(raw/alias): %v", err)
 	}
 }
 
@@ -2496,42 +2527,46 @@ Host jump-alias
 		}
 		readOnlyProvider := config.NewProviderWithOpenSSHParser(baseCfg.Snapshot(), parser)
 
-		prepRes, prepErr := repo.PrepareNodeContext(ctx, config.EnsureNodeOptions{Target: target})
 		ensureRes, ensureErr := ensureRepo.EnsureNodeContext(ctx, config.EnsureNodeOptions{Target: target})
 		resTarget, resErr := config.ResolveTarget(readOnlyProvider, target)
+		prepErr := repo.WithPendingNode(ctx, config.EnsureNodeOptions{Target: target}, func(lease config.PendingLease) error {
+			prepNodeID := lease.NodeID()
+			prepCreated := repo.IsPendingNode(prepNodeID)
+			if resErr != nil || ensureErr != nil {
+				t.Fatalf("target %+v: WithPendingNode succeeded while Ensure err=%v ResolveTarget err=%v", target, ensureErr, resErr)
+			}
+			if prepNodeID != resTarget.NodeID || prepCreated != resTarget.Created ||
+				ensureRes.NodeID != resTarget.NodeID || ensureRes.Created != resTarget.Created {
+				t.Fatalf("target %+v: Prepare=(%q,%v) Ensure=(%q,%v) ResolveTarget=(%q,%v)",
+					target, prepNodeID, prepCreated, ensureRes.NodeID, ensureRes.Created, resTarget.NodeID, resTarget.Created)
+			}
+
+			opts := NewSshOptions()
+			opts.Host = target.Selector
+			opts.User = target.User
+			opts.Port = target.Port
+			opts.JumpHost = target.ProxyJump
+			opts.Target = target
+
+			connectCtx := controlTarget(opts, repo, prepNodeID)
+			ctlNodeID, err := resolveControlNodeID(readOnlyProvider, target)
+			if err != nil {
+				t.Fatalf("target %+v: resolveControlNodeID failed: %v", target, err)
+			}
+			ctlCtx := controlTarget(opts, readOnlyProvider, ctlNodeID)
+			if connectCtx.CanonicalTargetIdentity() != ctlCtx.CanonicalTargetIdentity() {
+				t.Fatalf("target %+v: connect TargetContext %+v != control TargetContext %+v", target, connectCtx, ctlCtx)
+			}
+
+			connectSock, err1 := controlSocketPath(opts, repo, prepNodeID)
+			ctlSock, err2 := controlSocketPath(opts, readOnlyProvider, ctlNodeID)
+			if err1 != nil || err2 != nil || connectSock != ctlSock {
+				t.Fatalf("target %+v: connect socket (%q, %v) != control socket (%q, %v)", target, connectSock, err1, ctlSock, err2)
+			}
+			return nil
+		})
 		if (prepErr != nil) != (resErr != nil) || (prepErr != nil) != (ensureErr != nil) {
 			t.Fatalf("target %+v: Prepare err=%v vs Ensure err=%v vs ResolveTarget err=%v", target, prepErr, ensureErr, resErr)
-		}
-		if prepErr != nil {
-			continue
-		}
-		if prepRes.NodeID != resTarget.NodeID || prepRes.Created != resTarget.Created ||
-			ensureRes.NodeID != resTarget.NodeID || ensureRes.Created != resTarget.Created {
-			t.Fatalf("target %+v: Prepare=(%q,%v) Ensure=(%q,%v) ResolveTarget=(%q,%v)",
-				target, prepRes.NodeID, prepRes.Created, ensureRes.NodeID, ensureRes.Created, resTarget.NodeID, resTarget.Created)
-		}
-
-		opts := NewSshOptions()
-		opts.Host = target.Selector
-		opts.User = target.User
-		opts.Port = target.Port
-		opts.JumpHost = target.ProxyJump
-		opts.Target = target
-
-		connectCtx := controlTarget(opts, repo, prepRes.NodeID)
-		ctlNodeID, err := resolveControlNodeID(readOnlyProvider, target)
-		if err != nil {
-			t.Fatalf("target %+v: resolveControlNodeID failed: %v", target, err)
-		}
-		ctlCtx := controlTarget(opts, readOnlyProvider, ctlNodeID)
-		if connectCtx.CanonicalTargetIdentity() != ctlCtx.CanonicalTargetIdentity() {
-			t.Fatalf("target %+v: connect TargetContext %+v != control TargetContext %+v", target, connectCtx, ctlCtx)
-		}
-
-		connectSock, err1 := controlSocketPath(opts, repo, prepRes.NodeID)
-		ctlSock, err2 := controlSocketPath(opts, readOnlyProvider, ctlNodeID)
-		if err1 != nil || err2 != nil || connectSock != ctlSock {
-			t.Fatalf("target %+v: connect socket (%q, %v) != control socket (%q, %v)", target, connectSock, err1, ctlSock, err2)
 		}
 	}
 
@@ -2620,16 +2655,17 @@ Host jump-alias
 
 	// R13-1b: pending node with custom IdentityFile preserves KeyPath in ResolveTarget when queried by nodeID.
 	customKeyPath := filepath.Join(t.TempDir(), "pending-custom-key")
-	prep, err := repo.PrepareNodeContext(ctx, config.EnsureNodeOptions{
+	if err := repo.WithPendingNode(ctx, config.EnsureNodeOptions{
 		Target:       config.ConnectionTarget{Selector: "10.0.0.88", User: "ops", HasUser: true, Port: 2222, HasPort: true},
 		IdentityFile: customKeyPath,
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(10.0.0.88): %v", err)
-	}
-	pendingCtx := controlTarget(NewSshOptions(), repo, prep.NodeID)
-	if pendingCtx.KeyPath != customKeyPath {
-		t.Fatalf("expected controlTarget on pending node %q to retain KeyPath %q, got %q", prep.NodeID, customKeyPath, pendingCtx.KeyPath)
+	}, func(lease config.PendingLease) error {
+		pendingCtx := controlTarget(NewSshOptions(), repo, lease.NodeID())
+		if pendingCtx.KeyPath != customKeyPath {
+			t.Fatalf("expected controlTarget on pending node %q to retain KeyPath %q, got %q", lease.NodeID(), customKeyPath, pendingCtx.KeyPath)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode(10.0.0.88): %v", err)
 	}
 
 	// R13-2: controlTarget with provider == nil matches provider != nil for composite and explicit targets.
@@ -2737,24 +2773,24 @@ func verifyRound15ControlProxySudoAndScpTagParity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveTargetForPath(collectTargetPaths) failed: %v", err)
 	}
-	prepCollect, err := tagRepo.PrepareNodeContext(ctx, config.EnsureNodeOptions{
+	if err := tagRepo.WithPendingNode(ctx, config.EnsureNodeOptions{
 		Target: collectTarget,
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(collectTargetPaths) failed: %v", err)
-	}
-	batchTarget, err := scpOpts.resolveTargetForPath(batchAddr)
-	if err != nil {
-		t.Fatalf("resolveTargetForPath(runBatch) failed: %v", err)
-	}
-	prepBatch, err := tagRepo.PrepareNodeContext(ctx, config.EnsureNodeOptions{
-		Target: batchTarget,
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(runBatch) failed: %v", err)
-	}
-	if prepCollect.NodeID != "tagged-node" || prepBatch.NodeID != "tagged-node" || prepCollect.Created || prepBatch.Created {
-		t.Fatalf("expected both collectTargetPaths and runBatch to match existing 'tagged-node' without creating a new node, got collect=%+v batch=%+v", prepCollect, prepBatch)
+	}, func(collectLease config.PendingLease) error {
+		batchTarget, err := scpOpts.resolveTargetForPath(batchAddr)
+		if err != nil {
+			t.Fatalf("resolveTargetForPath(runBatch) failed: %v", err)
+		}
+		return tagRepo.WithPendingNode(ctx, config.EnsureNodeOptions{
+			Target: batchTarget,
+		}, func(batchLease config.PendingLease) error {
+			if collectLease.NodeID() != "tagged-node" || batchLease.NodeID() != "tagged-node" ||
+				tagRepo.IsPendingNode(collectLease.NodeID()) || tagRepo.IsPendingNode(batchLease.NodeID()) {
+				t.Fatalf("expected both collectTargetPaths and runBatch to match existing 'tagged-node' without creating a new node, got collect=%q batch=%q", collectLease.NodeID(), batchLease.NodeID())
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("WithPendingNode(collect/batch) failed: %v", err)
 	}
 }
 

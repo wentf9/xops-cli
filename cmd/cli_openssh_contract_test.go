@@ -228,8 +228,12 @@ func assertOpenSSHNotHijackedOrPersisted(t *testing.T, home, cfgDir string) {
 		if res.Host != "10.99.0.1" || !strings.HasPrefix(res.NodeID, config.OpenSSHNodePrefix) {
 			t.Fatalf("ResolveTarget(%q) hijacked or lost namespace: %+v", sel, res)
 		}
-		if err := savedRepo.ConfirmNodeContext(t.Context(), res.NodeID); err != nil {
-			t.Fatalf("ConfirmNodeContext(%q): %v", res.NodeID, err)
+		if err := config.WithPendingNode(t.Context(), prov, config.EnsureNodeOptions{
+			Target: config.ConnectionTarget{Selector: sel, RawSelector: sel},
+		}, func(lease config.PendingLease) error {
+			return lease.Confirm(t.Context())
+		}); err != nil {
+			t.Fatalf("WithPendingNode/Confirm(%q): %v", res.NodeID, err)
 		}
 		if _, persisted := savedRepo.Snapshot().Nodes.Get(res.NodeID); persisted {
 			t.Fatalf("openssh node %q persisted into saved config", res.NodeID)
@@ -540,26 +544,27 @@ func TestCLIContract_ExcludeFailClosedMatrix(t *testing.T) {
 	oExec.Port = 2222
 	oExec.Remember = "never"
 	oExec.control.ConfigFile = sshCfgPath
-	tasks, err := oExec.buildTasksFromTags(t.Context(), openSSHProv)
-	if err != nil {
-		t.Fatalf("exec buildTasksFromTags: %v", err)
-	}
-	infos := make([]utils.ExcludeTargetInfo, 0, len(tasks))
-	for _, task := range tasks {
-		infos = append(infos, oExec.execTaskExcludeInfo(task))
-	}
-	excl, err := utils.ResolveExcludesForTargets(openSSHProv, []string{"iaas@ssh-web:2222"}, infos)
-	if err != nil {
-		t.Fatalf("exec ResolveExcludesForTargets: %v", err)
-	}
-	var kept []string
-	for _, info := range infos {
-		if !utils.IsTargetExcluded(excl, info) {
-			kept = append(kept, info.User+"@"+info.OpenSSHAlias)
+	if err := oExec.withTestPendingTagTasks(t.Context(), openSSHProv, func(tasks []execHostTask, _ []config.PendingLease) error {
+		infos := make([]utils.ExcludeTargetInfo, 0, len(tasks))
+		for _, task := range tasks {
+			infos = append(infos, oExec.execTaskExcludeInfo(task))
 		}
-	}
-	if len(kept) != 1 {
-		t.Errorf("exec --tag after excluding iaas@ssh-web:2222 left %d tasks (%v), want 1", len(kept), kept)
+		excl, err := utils.ResolveExcludesForTargets(openSSHProv, []string{"iaas@ssh-web:2222"}, infos)
+		if err != nil {
+			t.Fatalf("exec ResolveExcludesForTargets: %v", err)
+		}
+		var kept []string
+		for _, info := range infos {
+			if !utils.IsTargetExcluded(excl, info) {
+				kept = append(kept, info.User+"@"+info.OpenSSHAlias)
+			}
+		}
+		if len(kept) != 1 {
+			t.Errorf("exec --tag after excluding iaas@ssh-web:2222 left %d tasks (%v), want 1", len(kept), kept)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("exec withTestPendingTagTasks: %v", err)
 	}
 }
 

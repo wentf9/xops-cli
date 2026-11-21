@@ -1,7 +1,6 @@
 package adapter
 
 import (
-	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -58,52 +57,50 @@ func TestPass8_H3_DisambiguatedPendingAliasPreservesAllTier4ClassesAndGuardrails
 		t.Fatalf("WithOpenSSHConfigOverride: %v", err)
 	}
 
-	preparer := provider.(interface {
-		PrepareNodeContext(context.Context, config.EnsureNodeOptions) (config.EnsureNodeResult, error)
-	})
-	if _, err := preparer.PrepareNodeContext(t.Context(), config.EnsureNodeOptions{
+	if err := config.WithPendingNode(t.Context(), provider, config.EnsureNodeOptions{
 		Target: config.ConnectionTarget{Selector: "role-a", User: "ops", HasUser: true},
+	}, func(config.PendingLease) error {
+		return config.WithPendingNode(t.Context(), provider, config.EnsureNodeOptions{
+			Target: config.ConnectionTarget{Selector: "role-b", User: "ops", HasUser: true},
+		}, func(leaseB config.PendingLease) error {
+			resBID := leaseB.NodeID()
+			if resBID != "openssh:ops@role-b:22" {
+				t.Fatalf("resB.NodeID = %q, want openssh:ops@role-b:22", resBID)
+			}
+
+			restrictedAdp := NewSSHAdapter(provider, WithLocalExecution(false))
+			if _, err := restrictedAdp.GetConfig(resBID); !errors.Is(err, ErrLocalExecutionDisabled) {
+				t.Fatalf("expected ErrLocalExecutionDisabled with ProxyCommand on pending alias, got %v", err)
+			}
+
+			adp := NewSSHAdapter(provider, WithLocalExecution(true), WithSessionAndForwardOptions(true))
+			clientCfg, err := adp.GetConfig(resBID)
+			if err != nil {
+				t.Fatalf("GetConfig(%q) error = %v", resBID, err)
+			}
+			if clientCfg.Options == nil {
+				t.Fatal("expected non-nil clientCfg.Options")
+			}
+			if got := clientCfg.Options.ActiveProxyCommand(); got != "nc %h %p" {
+				t.Errorf("ActiveProxyCommand = %q, want %q", got, "nc %h %p")
+			}
+			idFiles := clientCfg.Options.GetAll(ssh.OptionIdentityFile)
+			if !slices.Contains(idFiles, keyB1) || !slices.Contains(idFiles, keyB2) {
+				t.Errorf("IdentityFile list = %v, want both %s and %s", idFiles, keyB1, keyB2)
+			}
+			if !slices.Contains(clientCfg.Options.SendEnvPatterns(), "LC_ALL") {
+				t.Errorf("SendEnvPatterns = %v, want LC_ALL", clientCfg.Options.SendEnvPatterns())
+			}
+			if !slices.Contains(clientCfg.Options.SetEnvDirectives(), "APP_ROLE=b") {
+				t.Errorf("SetEnvDirectives = %v, want APP_ROLE=b", clientCfg.Options.SetEnvDirectives())
+			}
+			if lf := clientCfg.Options.LocalForwards(); len(lf) != 1 || !strings.Contains(lf[0], "18080") {
+				t.Errorf("LocalForwards = %v, want 18080 127.0.0.1:80", lf)
+			}
+			return nil
+		})
 	}); err != nil {
-		t.Fatalf("PrepareNodeContext(role-a): %v", err)
-	}
-	resB, err := preparer.PrepareNodeContext(t.Context(), config.EnsureNodeOptions{
-		Target: config.ConnectionTarget{Selector: "role-b", User: "ops", HasUser: true},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(role-b): %v", err)
-	}
-	if resB.NodeID != "openssh:ops@role-b:22" {
-		t.Fatalf("resB.NodeID = %q, want openssh:ops@role-b:22", resB.NodeID)
-	}
-
-	restrictedAdp := NewSSHAdapter(provider, WithLocalExecution(false))
-	if _, err := restrictedAdp.GetConfig(resB.NodeID); !errors.Is(err, ErrLocalExecutionDisabled) {
-		t.Fatalf("expected ErrLocalExecutionDisabled with ProxyCommand on pending alias, got %v", err)
-	}
-
-	adp := NewSSHAdapter(provider, WithLocalExecution(true), WithSessionAndForwardOptions(true))
-	clientCfg, err := adp.GetConfig(resB.NodeID)
-	if err != nil {
-		t.Fatalf("GetConfig(%q) error = %v", resB.NodeID, err)
-	}
-	if clientCfg.Options == nil {
-		t.Fatal("expected non-nil clientCfg.Options")
-	}
-	if got := clientCfg.Options.ActiveProxyCommand(); got != "nc %h %p" {
-		t.Errorf("ActiveProxyCommand = %q, want %q", got, "nc %h %p")
-	}
-	idFiles := clientCfg.Options.GetAll(ssh.OptionIdentityFile)
-	if !slices.Contains(idFiles, keyB1) || !slices.Contains(idFiles, keyB2) {
-		t.Errorf("IdentityFile list = %v, want both %s and %s", idFiles, keyB1, keyB2)
-	}
-	if !slices.Contains(clientCfg.Options.SendEnvPatterns(), "LC_ALL") {
-		t.Errorf("SendEnvPatterns = %v, want LC_ALL", clientCfg.Options.SendEnvPatterns())
-	}
-	if !slices.Contains(clientCfg.Options.SetEnvDirectives(), "APP_ROLE=b") {
-		t.Errorf("SetEnvDirectives = %v, want APP_ROLE=b", clientCfg.Options.SetEnvDirectives())
-	}
-	if lf := clientCfg.Options.LocalForwards(); len(lf) != 1 || !strings.Contains(lf[0], "18080") {
-		t.Errorf("LocalForwards = %v, want 18080 127.0.0.1:80", lf)
+		t.Fatalf("WithPendingNode: %v", err)
 	}
 }
 

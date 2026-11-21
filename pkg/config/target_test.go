@@ -2177,9 +2177,10 @@ func TestBrokenOpenSSHConfig_SavedWorksAndFallbacksFailClosed(t *testing.T) {
 		{"ResolveTarget(openssh:)", func() error { _, err := ResolveTarget(repo, ConnectionTarget{Selector: "openssh:app"}); return err }},
 		{"ResolveTarget(unmatched)", func() error { _, err := ResolveTarget(repo, ConnectionTarget{Selector: "10.0.0.99"}); return err }},
 		{"ResolveTarget(frozen unmatched)", func() error { _, err := ResolveTarget(frozen, ConnectionTarget{Selector: "10.0.0.99"}); return err }},
-		{"PrepareNodeContext(unmatched)", func() error {
-			_, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{Target: ConnectionTarget{Selector: "10.0.0.99"}})
-			return err
+		{"WithPendingNode(unmatched)", func() error {
+			return repo.WithPendingNode(t.Context(), EnsureNodeOptions{Target: ConnectionTarget{Selector: "10.0.0.99"}}, func(PendingLease) error {
+				return nil
+			})
 		}},
 		{"ResolveProxyJumpChain(openssh:)", func() error { _, err := repo.ResolveProxyJumpChain("openssh:jump"); return err }},
 		{"ResolveProxyJumpChain(missing)", func() error { _, err := repo.ResolveProxyJumpChain("jump.example.com"); return err }},
@@ -2341,22 +2342,23 @@ func assertCanonicalOpenSSHPortAndUserPreserved(t *testing.T) {
 		t.Fatalf("read-only ResolveTarget mutated NodeCanonicalHost = %q", gotCanon)
 	}
 
-	prep, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{
 			Selector:     "short.corp.example.com",
 			OriginalHost: "short",
 			Port:         2222,
 			HasPort:      true,
 		},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(canonical): %v", err)
-	}
-	snap, err := repo.ResolveConnection(prep.NodeID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if snap.Node.CanonicalHost != "short.corp.example.com" {
-		t.Fatalf("ResolveConnection CanonicalHost = %q, want short.corp.example.com", snap.Node.CanonicalHost)
+	}, func(lease PendingLease) error {
+		snap, err := repo.ResolveConnection(lease.NodeID())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if snap.Node.CanonicalHost != "short.corp.example.com" {
+			t.Fatalf("ResolveConnection CanonicalHost = %q, want short.corp.example.com", snap.Node.CanonicalHost)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode(canonical): %v", err)
 	}
 }

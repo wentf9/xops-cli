@@ -1,7 +1,6 @@
 package config
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"slices"
@@ -47,10 +46,9 @@ func TestPass9_H1_ExplicitOpenSSHNotHijackedAndNeverPersisted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WithOpenSSHConfigOverride: %v", err)
 	}
-	preparer := provider.(interface {
-		PrepareNodeContext(ctx context.Context, opts EnsureNodeOptions) (EnsureNodeResult, error)
-	})
-	_ = preparer
+	if _, ok := provider.(PendingNodeProvider); !ok {
+		t.Fatalf("expected PendingNodeProvider, got %T", provider)
+	}
 
 	// 1. Explicit openssh:web resolves to OpenSSH Host web (10.0.0.10), not saved alias "web" (192.0.2.99).
 	resDirect, err := ResolveTarget(provider, ConnectionTarget{Selector: "openssh:web", RawSelector: "openssh:web"})
@@ -73,30 +71,30 @@ func TestPass9_H1_ExplicitOpenSSHNotHijackedAndNeverPersisted(t *testing.T) {
 
 	// 2. Explicit openssh:ops@web:2222 preserves wildcard options and never persists.
 	overrideRepo := provider.(*openSSHOverrideProvider).repo
-	ensured, err := overrideRepo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	var ensuredID string
+	if err := overrideRepo.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{Selector: "openssh:ops@web:2222", RawSelector: "openssh:ops@web:2222"},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(openssh:ops@web:2222): %v", err)
+	}, func(lease PendingLease) error {
+		ensuredID = lease.NodeID()
+		if !strings.HasPrefix(ensuredID, OpenSSHNodePrefix) {
+			t.Fatalf("ensured.NodeID = %q, want %s prefix", ensuredID, OpenSSHNodePrefix)
+		}
+		snapOvr, err := provider.ResolveConnection(ensuredID)
+		if err != nil {
+			t.Fatalf("ResolveConnection(%q): %v", ensuredID, err)
+		}
+		if snapOvr.Host.Address != "10.0.0.10" || snapOvr.Host.Port != 2222 || snapOvr.Identity.User != "ops" {
+			t.Errorf("snapOvr = host:%q port:%d user:%q, want 10.0.0.10:2222 ops", snapOvr.Host.Address, snapOvr.Host.Port, snapOvr.Identity.User)
+		}
+		if snapOvr.Node.SSHOptions == nil || !slices.Contains(snapOvr.Node.SSHOptions.SetEnvDirectives(), "GLOBAL_MARK=1") {
+			t.Errorf("openssh:ops@web:2222 missing Host * GLOBAL_MARK=1")
+		}
+		return lease.Confirm(t.Context())
+	}); err != nil {
+		t.Fatalf("WithPendingNode(openssh:ops@web:2222): %v", err)
 	}
-	if !strings.HasPrefix(ensured.NodeID, OpenSSHNodePrefix) {
-		t.Fatalf("ensured.NodeID = %q, want %s prefix", ensured.NodeID, OpenSSHNodePrefix)
-	}
-	snapOvr, err := provider.ResolveConnection(ensured.NodeID)
-	if err != nil {
-		t.Fatalf("ResolveConnection(%q): %v", ensured.NodeID, err)
-	}
-	if snapOvr.Host.Address != "10.0.0.10" || snapOvr.Host.Port != 2222 || snapOvr.Identity.User != "ops" {
-		t.Errorf("snapOvr = host:%q port:%d user:%q, want 10.0.0.10:2222 ops", snapOvr.Host.Address, snapOvr.Host.Port, snapOvr.Identity.User)
-	}
-	if snapOvr.Node.SSHOptions == nil || !slices.Contains(snapOvr.Node.SSHOptions.SetEnvDirectives(), "GLOBAL_MARK=1") {
-		t.Errorf("openssh:ops@web:2222 missing Host * GLOBAL_MARK=1")
-	}
-	if err := overrideRepo.ConfirmNodeContext(t.Context(), ensured.NodeID); err != nil {
-		t.Fatalf("ConfirmNodeContext(openssh:...): %v", err)
-	}
-	if _, persisted := overrideRepo.Snapshot().Nodes.Get(ensured.NodeID); persisted {
-		t.Fatalf("explicit openssh node %q must never be persisted to saved config", ensured.NodeID)
+	if _, persisted := overrideRepo.Snapshot().Nodes.Get(ensuredID); persisted {
+		t.Fatalf("explicit openssh node %q must never be persisted to saved config", ensuredID)
 	}
 }
 
@@ -169,38 +167,40 @@ func TestPass9_H2_IdentityPathNormalizationAndAutoAuthInheritance(t *testing.T) 
 		t.Fatalf("WithOpenSSHConfigOverride: %v", err)
 	}
 	overrideRepo := provider.(*openSSHOverrideProvider).repo
-	prepared, err := overrideRepo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	if err := overrideRepo.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{Selector: "inherit-host", User: "ops", HasUser: true},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(ops@inherit-host): %v", err)
-	}
-	snap, err := provider.ResolveConnection(prepared.NodeID)
-	if err != nil {
-		t.Fatalf("ResolveConnection(%q): %v", prepared.NodeID, err)
-	}
-	wantExpanded := filepath.Join(home, ".ssh", "id_pass9")
-	if snap.Identity.KeyPath != wantExpanded {
-		t.Errorf("inherited KeyPath = %q, want %q", snap.Identity.KeyPath, wantExpanded)
-	}
-	if snap.Identity.AuthType != "auto" {
-		t.Errorf("inherited AuthType = %q, want auto (must allow password/agent fallback)", snap.Identity.AuthType)
+	}, func(lease PendingLease) error {
+		snap, err := provider.ResolveConnection(lease.NodeID())
+		if err != nil {
+			t.Fatalf("ResolveConnection(%q): %v", lease.NodeID(), err)
+		}
+		wantExpanded := filepath.Join(home, ".ssh", "id_pass9")
+		if snap.Identity.KeyPath != wantExpanded {
+			t.Errorf("inherited KeyPath = %q, want %q", snap.Identity.KeyPath, wantExpanded)
+		}
+		if snap.Identity.AuthType != "auto" {
+			t.Errorf("inherited AuthType = %q, want auto (must allow password/agent fallback)", snap.Identity.AuthType)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode(ops@inherit-host): %v", err)
 	}
 
-	// Passing non-persistable IdentityFile="none" via PrepareNodeContext does not store <cwd>/none.
-	prepNone, err := overrideRepo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	// Passing non-persistable IdentityFile="none" via WithPendingNode does not store <cwd>/none.
+	if err := overrideRepo.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target:       ConnectionTarget{Selector: "10.0.0.99", User: "ops", HasUser: true},
 		IdentityFile: "none",
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(10.0.0.99, IdentityFile=none): %v", err)
-	}
-	snapNone, err := provider.ResolveConnection(prepNone.NodeID)
-	if err != nil {
-		t.Fatalf("ResolveConnection(prepNone): %v", err)
-	}
-	if snapNone.Identity.KeyPath != "" {
-		t.Errorf("IdentityFile=none polluted Identity.KeyPath = %q, want empty", snapNone.Identity.KeyPath)
+	}, func(lease PendingLease) error {
+		snapNone, err := provider.ResolveConnection(lease.NodeID())
+		if err != nil {
+			t.Fatalf("ResolveConnection(prepNone): %v", err)
+		}
+		if snapNone.Identity.KeyPath != "" {
+			t.Errorf("IdentityFile=none polluted Identity.KeyPath = %q, want empty", snapNone.Identity.KeyPath)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode(10.0.0.99, IdentityFile=none): %v", err)
 	}
 }
 

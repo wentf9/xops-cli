@@ -192,6 +192,8 @@ type poolModelStormState struct {
 	invErr        error
 	casRejections atomic.Int32
 	successfulOps atomic.Int32
+	reindexOps    atomic.Int32
+	evictOps      atomic.Int32
 }
 
 func (s *poolModelStormState) recordInvErr(err error) {
@@ -221,6 +223,24 @@ func (s *poolModelStormState) runConnectWorker(ctx context.Context, id int) {
 		reqCancel()
 		if err == nil && client != nil {
 			s.successfulOps.Add(1)
+			// Exercise concurrent Reindex (leaf + parent hops) and EvictByClient
+			// against live Connect/Retire/keepalive transitions.
+			switch (id + i) % 5 {
+			case 0:
+				client.SetExecution(&ExecutionConfig{Interpreter: InterpreterSh, LaunchDialect: LaunchPOSIX})
+				s.reindexOps.Add(1)
+			case 1:
+				client.ApplyRecordedAuth("auth-storm-v2", "", nil)
+				s.reindexOps.Add(1)
+			case 2:
+				client.ClearUpdateTokens()
+				s.reindexOps.Add(1)
+			case 3:
+				if err := s.connector.EvictClient(client); err != nil {
+					s.recordInvErr(err)
+				}
+				s.evictOps.Add(1)
+			}
 		}
 	}
 }
@@ -379,6 +399,12 @@ func TestModel_ConnectorPool_ConcurrentConnectFlipRetireCloseAll(t *testing.T) {
 	if storm.successfulOps.Load() == 0 {
 		t.Fatal("expected at least one successful concurrent Connect during storm")
 	}
+	if storm.reindexOps.Load() == 0 {
+		t.Fatal("expected at least one concurrent Reindex operation during storm")
+	}
+	if storm.evictOps.Load() == 0 {
+		t.Fatal("expected at least one concurrent EvictClient operation during storm")
+	}
 
 	if err := connector.CloseAll(); err != nil {
 		t.Fatalf("CloseAll failed: %v", err)
@@ -401,6 +427,62 @@ func TestModel_ConnectorPool_ConcurrentConnectFlipRetireCloseAll(t *testing.T) {
 		if !c.closed.Load() {
 			t.Errorf("leaked unclosed transport #%d after CloseAll (total dialed=%d, casRejections=%d)", i+1, len(conns), storm.casRejections.Load())
 		}
+	}
+}
+
+// TestModel_ConnectorPool_KeepAliveDeathAfterReindex verifies that when a
+// pooled client is reindexed via SetExecution/ApplyRecordedAuth and its
+// keepalive subsequently detects peer death, the onDead callback atomically
+// evicts the client from its reindexed HopDigest key without stranding a dead,
+// keepalive-less entry in the active pool.
+func TestModel_ConnectorPool_KeepAliveDeathAfterReindex(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	server, host, port := newP0SSHFixture(t, ctx, "model-ka-reindex")
+	provider := &mutableRouteProvider{
+		cfgs: map[string]*ClientConfig{
+			"node": {
+				NodeID: "node", Address: host, Port: port,
+				User: "fixture", AuthType: "password", Password: sshfixture.Password,
+				AuthUpdateToken: "v1",
+			},
+		},
+	}
+
+	connector := newTestConnector(provider, WithHostKeyVerifier(&fixtureTrust{}))
+	kaCtx, cancelKA := context.WithCancel(ctx)
+	defer cancelKA()
+	connector.EnableKeepAlive(kaCtx, 25*time.Millisecond, 120*time.Millisecond)
+	t.Cleanup(func() { _ = connector.CloseAll() })
+
+	client, err := connector.Connect(ctx, "node")
+	if err != nil {
+		t.Fatalf("Connect(node) failed: %v", err)
+	}
+	oldKey := connector.pool.DigestOf(client.pooled)
+	client.SetExecution(&ExecutionConfig{Interpreter: InterpreterSh, LaunchDialect: LaunchPOSIX})
+	client.ApplyRecordedAuth("v2", "", nil)
+	newKey := connector.pool.DigestOf(client.pooled)
+	if newKey.IsZero() || newKey == oldKey {
+		t.Fatalf("expected Reindex to advance digest: old=%s new=%s", oldKey, newKey)
+	}
+	if err := connector.pool.CheckInvariants(true); err != nil {
+		t.Fatalf("post-Reindex pool invariant failed: %v", err)
+	}
+
+	// Shut down the server so the active keepalive detects transport death and
+	// fires onDead against the reindexed pooled entry.
+	_ = server.Close()
+	deadline := time.Now().Add(3 * time.Second)
+	for connector.pool.Count() != 0 && time.Now().Before(deadline) {
+		time.Sleep(15 * time.Millisecond)
+	}
+	if got := connector.pool.Count(); got != 0 {
+		t.Fatalf("reindexed client stranded in active pool after keepalive death: count=%d (CheckInvariants=%v)", got, connector.pool.CheckInvariants(true))
+	}
+	if err := connector.pool.CheckInvariants(true); err != nil {
+		t.Fatalf("post-keepalive-death pool invariant failed: %v", err)
 	}
 }
 

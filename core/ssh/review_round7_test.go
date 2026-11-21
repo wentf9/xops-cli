@@ -308,26 +308,30 @@ func TestRound7_P1_2_ConnectorRoutingCompatibilityAndCapturePlan(t *testing.T) {
 }
 
 type round7InitDropProvider struct {
-	mu         sync.Mutex
-	configs    map[string]*ClientConfig
-	onConfirmA func(client *Client)
+	mu           sync.Mutex
+	configs      map[string]*ClientConfig
+	targetACalls int
+	onReloadA    func()
 }
 
 func (p *round7InitDropProvider) GetConfig(nodeID string) (*ClientConfig, error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	cfg, ok := p.configs[nodeID]
+	var hook func()
+	if ok && nodeID == "targetA" {
+		p.targetACalls++
+		if p.targetACalls == 2 {
+			hook = p.onReloadA
+		}
+	}
+	p.mu.Unlock()
 	if !ok {
 		return nil, fmt.Errorf("missing node %q", nodeID)
 	}
-	return cfg, nil
-}
-
-func (p *round7InitDropProvider) ConfirmAuthenticatedConnection(_ context.Context, nodeID string, client *Client) (*ExecutionConfig, error) {
-	if nodeID == "targetA" && p.onConfirmA != nil {
-		p.onConfirmA(client)
+	if hook != nil {
+		hook()
 	}
-	return nil, nil
+	return cfg, nil
 }
 
 func TestRound7_P2_1_InitDropOnJumpTargetDoesNotKillSharedBastion(t *testing.T) {
@@ -412,24 +416,16 @@ func TestRound7_P2_1_InitDropOnJumpTargetDoesNotKillSharedBastion(t *testing.T) 
 			},
 		},
 	}
-	provider.onConfirmA = func(client *Client) {
+	provider.onReloadA = func() {
 		targetAConnMu.Lock()
 		c := targetAConn
 		targetAConnMu.Unlock()
 		if c != nil {
 			_ = c.Close()
 		}
-		if client != nil && client.SSHClient() != nil {
-			waitCh := make(chan error, 1)
-			go func() {
-				waitCh <- client.SSHClient().Wait()
-			}()
-			select {
-			case <-waitCh:
-			case <-time.After(2 * time.Second):
-				t.Error("timed out waiting for targetA SSH transport loop to observe close")
-			}
-		}
+		// Give the bastion direct-tcpip forwarder and client transport loop time
+		// to observe the closed server TCP connection before checkInitializedTransport.
+		time.Sleep(50 * time.Millisecond)
 	}
 
 	conn := NewConnector(provider, WithHostKeyVerifier(trustAnyFixtureHostKey{}))

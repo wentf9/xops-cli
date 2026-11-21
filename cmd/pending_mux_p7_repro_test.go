@@ -1,5 +1,3 @@
-//go:build p7repro
-
 package cmd
 
 import (
@@ -82,16 +80,14 @@ func assertP7ReproNodeConfirmedNotOrphaned(t *testing.T, label string, repo *con
 	_, saved := repo.Snapshot().Nodes.Get(nodeID)
 	_, stillPending := repo.PendingNodeExecution(nodeID)
 	if !saved || stillPending {
-		t.Fatalf("%s: after attaching via existing ControlMaster, node %q has saved=%v, stillPending=%v (want saved=true, stillPending=false; ConfirmNodeContext was skipped while caller marked confirmed=true, leaving pending node orphaned)",
+		t.Fatalf("%s: after attaching via existing ControlMaster, node %q has saved=%v, stillPending=%v (want saved=true, stillPending=false; pending lease was not confirmed on attach)",
 			label, nodeID, saved, stillPending)
 	}
 }
 
-// TestP7Repro_MED3_ControlMasterAttachSkipsConfirmAndOrphansPending reproduces MED-3:
-// When Connector.Connect attaches via an existing ControlMaster socket, it returns
-// before calling ConfirmConnection/ConfirmNodeContext. Meanwhile cmd ssh, scp, and
-// interactive exec unconditionally mark confirmed=true, so the pending node is
-// neither confirmed into Repository.Snapshot() nor discarded, leaving it orphaned.
+// TestP7Repro_MED3_ControlMasterAttachSkipsConfirmAndOrphansPending verifies MED-3:
+// attaching via an existing ControlMaster socket across ssh, scp, interactive exec,
+// and sftp confirms the scoped PendingLease so the node is saved and never orphaned.
 func TestP7Repro_MED3_ControlMasterAttachSkipsConfirmAndOrphansPending(t *testing.T) {
 	t.Setenv("XOPS_CLI_SSH_FROM_TUI", "")
 	home := t.TempDir()
@@ -192,5 +188,26 @@ func TestP7Repro_MED3_ControlMasterAttachSkipsConfirmAndOrphansPending(t *testin
 				authBefore, fix.Authenticated.Load())
 		}
 		assertP7ReproNodeConfirmedNotOrphaned(t, "exec", repo, nodeID)
+	})
+
+	t.Run("sftp_attach_confirms_pending", func(t *testing.T) {
+		repo, cfg := newP6PendingTestRepo(t, "")
+		opts := NewSftpOptions()
+		opts.Host = "127.0.0.1"
+		opts.User = "ops"
+		opts.Port = port
+		opts.Alias = "med3-sftp"
+		opts.Remember = "always"
+		opts.Target = target
+		opts.parsedArgs = true
+		opts.control.Options = []string{"ControlMaster=auto", "ControlPath=" + sockPath}
+
+		authBefore := fix.Authenticated.Load()
+		_ = opts.runWithProvider(ctx, cfg, repo, false)
+		if fix.Authenticated.Load() != authBefore {
+			t.Fatalf("expected sftp to attach via existing ControlMaster without new auth handshake (before=%d after=%d)",
+				authBefore, fix.Authenticated.Load())
+		}
+		assertP7ReproNodeConfirmedNotOrphaned(t, "sftp", repo, nodeID)
 	})
 }

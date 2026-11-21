@@ -37,46 +37,51 @@ func TestDynamicEnrollmentProbePolicyAndAtomicPersistence(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			prepared, err := repo.PrepareNodeContext(ctx, config.EnsureNodeOptions{Target: config.ConnectionTarget{Selector: host, User: "fixture", HasUser: true, Port: uint16(port), HasPort: true}})
-			if err != nil {
+			if err := repo.WithPendingNode(ctx, config.EnsureNodeOptions{Target: config.ConnectionTarget{Selector: host, User: "fixture", HasUser: true, Port: uint16(port), HasPort: true}}, func(lease config.PendingLease) error {
+				nodeID := lease.NodeID()
+				password := sshfixture.Password
+				if mode == "authentication failure" {
+					password = "wrong"
+				}
+				var warnings atomic.Int32
+				options := []Option{WithCredentialService(service), WithSessionAuthOverride(nodeID, SessionAuth{Password: password, Remember: mode != "session only"}), WithNonInteractive(mode == "non-interactive")}
+				if mode != "not enabled" {
+					options = append(options, WithEnrollmentProbing(func(string, error) { warnings.Add(1) }))
+				}
+				connector, adp := NewConnectorAndAdapter(repo, options, ssh.WithHandshakeTimeout(time.Second))
+				connector.AcceptNewHostKey.Store(true)
+				t.Cleanup(func() {
+					if err := connector.CloseAll(); err != nil {
+						t.Error(err)
+					}
+				})
+				client, err := connector.Connect(ctx, nodeID)
+				if mode == "authentication failure" {
+					if err == nil {
+						t.Fatal("invalid credentials authenticated")
+					}
+					after, readErr := os.ReadFile(path)
+					if readErr != nil || !bytes.Equal(before, after) || server.Executed.Load() != 0 || len(secrets.data) != 0 {
+						t.Fatal("failed authentication probed or persisted data")
+					}
+					return nil
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := adp.FinalizePendingConnection(ctx, lease, client); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() {
+					if err := client.Close(); err != nil {
+						t.Error(err)
+					}
+				})
+				assertDynamicEnrollment(t, ctx, mode, connector, client, server, repo, store, nodeID, &warnings, &userCommands)
+				return nil
+			}); err != nil {
 				t.Fatal(err)
 			}
-			password := sshfixture.Password
-			if mode == "authentication failure" {
-				password = "wrong"
-			}
-			var warnings atomic.Int32
-			options := []Option{WithCredentialService(service), WithSessionAuthOverride(prepared.NodeID, SessionAuth{Password: password, Remember: mode != "session only"}), WithNonInteractive(mode == "non-interactive")}
-			if mode != "not enabled" {
-				options = append(options, WithEnrollmentProbing(func(string, error) { warnings.Add(1) }))
-			}
-			connector := NewConnectorWithAdapterOptions(repo, options, ssh.WithHandshakeTimeout(time.Second))
-			connector.AcceptNewHostKey.Store(true)
-			t.Cleanup(func() {
-				if err := connector.CloseAll(); err != nil {
-					t.Error(err)
-				}
-			})
-			client, err := connector.Connect(ctx, prepared.NodeID)
-			if mode == "authentication failure" {
-				if err == nil {
-					t.Fatal("invalid credentials authenticated")
-				}
-				after, readErr := os.ReadFile(path)
-				if readErr != nil || !bytes.Equal(before, after) || server.Executed.Load() != 0 || len(secrets.data) != 0 {
-					t.Fatal("failed authentication probed or persisted data")
-				}
-				return
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() {
-				if err := client.Close(); err != nil {
-					t.Error(err)
-				}
-			})
-			assertDynamicEnrollment(t, ctx, mode, connector, client, server, repo, store, prepared.NodeID, &warnings, &userCommands)
 		})
 	}
 }

@@ -98,11 +98,15 @@ func assertOpenSSHVirtualProvenance(t *testing.T, repo *Repository) {
 	if virtSnap.Provenance != ProvenanceOpenSSHVirtual || virtSnap.UpdateRef != nil {
 		t.Fatalf("virtSnap = (%s, updateRef=%v), want openssh_virtual with nil UpdateRef", virtSnap.Provenance, virtSnap.UpdateRef != nil)
 	}
-	if err := repo.ConfirmNodeContext(t.Context(), "openssh:edge-a"); err != nil {
-		t.Fatalf("ConfirmNodeContext(openssh:edge-a): %v", err)
+	if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
+		Target: ConnectionTarget{Selector: "openssh:edge-a"},
+	}, func(lease PendingLease) error {
+		return lease.Confirm(t.Context())
+	}); err != nil {
+		t.Fatalf("WithPendingNode(openssh:edge-a): %v", err)
 	}
 	if _, persisted := repo.GetNode("openssh:edge-a"); persisted {
-		t.Fatal("openssh:edge-a must never be persisted by ConfirmNodeContext")
+		t.Fatal("openssh:edge-a must never be persisted by Confirm")
 	}
 }
 
@@ -115,43 +119,44 @@ func assertOpenSSHDerivedProvenance(t *testing.T, repo *Repository) {
 	if derivedRes.Provenance != ProvenanceOpenSSHDerived {
 		t.Fatalf("ResolveTarget(ops@edge-a).Provenance = %s, want openssh_derived", derivedRes.Provenance)
 	}
-	prepA, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	var nodeIDA string
+	if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{Selector: "edge-a", User: "ops", HasUser: true},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(ops@edge-a): %v", err)
-	}
-	snapA, err := repo.ResolveConnection(prepA.NodeID)
-	if err != nil {
-		t.Fatalf("ResolveConnection(%q): %v", prepA.NodeID, err)
-	}
-	if snapA.Provenance != ProvenanceOpenSSHDerived {
-		t.Fatalf("pending snapA.Provenance = %s, want openssh_derived", snapA.Provenance)
-	}
+	}, func(leaseA PendingLease) error {
+		nodeIDA = leaseA.NodeID()
+		snapA, err := repo.ResolveConnection(nodeIDA)
+		if err != nil {
+			t.Fatalf("ResolveConnection(%q): %v", nodeIDA, err)
+		}
+		if snapA.Provenance != ProvenanceOpenSSHDerived {
+			t.Fatalf("pending snapA.Provenance = %s, want openssh_derived", snapA.Provenance)
+		}
 
-	prepB, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
-		Target: ConnectionTarget{Selector: "edge-b", User: "ops", HasUser: true},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(ops@edge-b): %v", err)
-	}
-	if !IsOpenSSHNodeID(prepB.NodeID) {
-		t.Fatalf("expected collided alias to receive openssh: ID, got %q", prepB.NodeID)
-	}
-	snapB, err := repo.ResolveConnection(prepB.NodeID)
-	if err != nil {
-		t.Fatalf("ResolveConnection(%q): %v", prepB.NodeID, err)
-	}
-	if snapB.Provenance != ProvenanceOpenSSHDerived || snapB.UpdateRef != nil {
-		t.Fatalf("collided pending snapB = (%s, updateRef=%v), want openssh_derived with nil UpdateRef", snapB.Provenance, snapB.UpdateRef != nil)
-	}
+		if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
+			Target: ConnectionTarget{Selector: "edge-b", User: "ops", HasUser: true},
+		}, func(leaseB PendingLease) error {
+			if !IsOpenSSHNodeID(leaseB.NodeID()) {
+				t.Fatalf("expected collided alias to receive openssh: ID, got %q", leaseB.NodeID())
+			}
+			snapB, err := repo.ResolveConnection(leaseB.NodeID())
+			if err != nil {
+				t.Fatalf("ResolveConnection(%q): %v", leaseB.NodeID(), err)
+			}
+			if snapB.Provenance != ProvenanceOpenSSHDerived || snapB.UpdateRef != nil {
+				t.Fatalf("collided pending snapB = (%s, updateRef=%v), want openssh_derived with nil UpdateRef", snapB.Provenance, snapB.UpdateRef != nil)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("WithPendingNode(ops@edge-b): %v", err)
+		}
 
-	if err := repo.ConfirmNodeContext(t.Context(), prepA.NodeID); err != nil {
-		t.Fatalf("ConfirmNodeContext(%q): %v", prepA.NodeID, err)
+		return leaseA.Confirm(t.Context())
+	}); err != nil {
+		t.Fatalf("WithPendingNode(ops@edge-a): %v", err)
 	}
-	afterConfirmA, err := repo.ResolveConnection(prepA.NodeID)
+	afterConfirmA, err := repo.ResolveConnection(nodeIDA)
 	if err != nil {
-		t.Fatalf("ResolveConnection after confirm(%q): %v", prepA.NodeID, err)
+		t.Fatalf("ResolveConnection after confirm(%q): %v", nodeIDA, err)
 	}
 	if afterConfirmA.Provenance != ProvenanceSavedManaged {
 		t.Fatalf("afterConfirmA.Provenance = %s, want saved_managed", afterConfirmA.Provenance)
@@ -167,18 +172,19 @@ func assertAdHocPendingProvenance(t *testing.T, repo *Repository) {
 	if adhocRes.Provenance != ProvenanceAdHocPending {
 		t.Fatalf("ResolveTarget(adhoc).Provenance = %s, want adhoc_pending", adhocRes.Provenance)
 	}
-	prepAdHoc, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{Selector: "10.88.0.5", User: "adhoc", HasUser: true},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(adhoc): %v", err)
-	}
-	adhocSnap, err := repo.ResolveConnection(prepAdHoc.NodeID)
-	if err != nil {
-		t.Fatalf("ResolveConnection(%q): %v", prepAdHoc.NodeID, err)
-	}
-	if adhocSnap.Provenance != ProvenanceAdHocPending {
-		t.Fatalf("adhocSnap.Provenance = %s, want adhoc_pending", adhocSnap.Provenance)
+	}, func(lease PendingLease) error {
+		adhocSnap, err := repo.ResolveConnection(lease.NodeID())
+		if err != nil {
+			t.Fatalf("ResolveConnection(%q): %v", lease.NodeID(), err)
+		}
+		if adhocSnap.Provenance != ProvenanceAdHocPending {
+			t.Fatalf("adhocSnap.Provenance = %s, want adhoc_pending", adhocSnap.Provenance)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode(adhoc): %v", err)
 	}
 }
 

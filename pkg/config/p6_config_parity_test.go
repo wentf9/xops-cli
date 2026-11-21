@@ -188,10 +188,10 @@ func TestP6_PendingConnectionOverrideCleanupRefcountAndOriginIsolation(t *testin
 
 	t.Run("override provider cleans up all pending entries on confirm", testP6OverridePendingCleanup)
 	t.Run("override confirmed snapshot cache stays bounded", testP6OverrideConfirmedCacheBound)
-	t.Run("repository refcount and DiscardPendingNode isolate concurrent callers", testP6RepositoryPendingRefcountBasic)
+	t.Run("repository refcount and scoped lease auto-discard isolate concurrent callers", testP6RepositoryPendingRefcountBasic)
 	t.Run("repository refcount preserves upgrade and disambiguated openssh entries", testP6RepositoryPendingRefcountUpgradeAndAlt)
 	t.Run("pending origin setters stay isolated to pending.provider until confirmed", testP6PendingOriginIsolation)
-	t.Run("concurrent Prepare Discard SetOrigin and Confirm stay race-free", testP6PendingConcurrencyRace)
+	t.Run("concurrent WithPendingNode SetOrigin and Confirm stay race-free", testP6PendingConcurrencyRace)
 }
 
 func newP6OverrideProvider(t *testing.T) *openSSHOverrideProvider {
@@ -227,62 +227,66 @@ func pendingCount(repo *Repository) int {
 func testP6OverridePendingCleanup(t *testing.T) {
 	ovProv := newP6OverrideProvider(t)
 
-	resA, err := ovProv.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	var resAID string
+	if err := ovProv.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{Selector: "role-a", User: "ops", HasUser: true},
-	})
-	if err != nil || IsOpenSSHNodeID(resA.NodeID) {
-		t.Fatalf("PrepareNodeContext(role-a) = (%+v, %v), want non-openssh ad-hoc ID", resA, err)
-	}
-	resB, err := ovProv.PrepareNodeContext(t.Context(), EnsureNodeOptions{
-		Target: ConnectionTarget{Selector: "role-b", User: "ops", HasUser: true},
-	})
-	if err != nil || !IsOpenSSHNodeID(resB.NodeID) {
-		t.Fatalf("PrepareNodeContext(role-b) = (%+v, %v), want openssh disambiguated ID", resB, err)
-	}
-
-	if err := ovProv.ConfirmNodeContext(t.Context(), resA.NodeID); err != nil {
-		t.Fatalf("ConfirmNodeContext(resA): %v", err)
-	}
-	if err := ovProv.ConfirmNodeWithExecutionContext(t.Context(), resB.NodeID, nil); err != nil {
-		t.Fatalf("ConfirmNodeWithExecutionContext(resB): %v", err)
+	}, func(leaseA PendingLease) error {
+		resAID = leaseA.NodeID()
+		if IsOpenSSHNodeID(resAID) {
+			t.Fatalf("WithPendingNode(role-a) = %q, want non-openssh ad-hoc ID", resAID)
+		}
+		return ovProv.WithPendingNode(t.Context(), EnsureNodeOptions{
+			Target: ConnectionTarget{Selector: "role-b", User: "ops", HasUser: true},
+		}, func(leaseB PendingLease) error {
+			if !IsOpenSSHNodeID(leaseB.NodeID()) {
+				t.Fatalf("WithPendingNode(role-b) = %q, want openssh disambiguated ID", leaseB.NodeID())
+			}
+			if err := leaseA.Confirm(t.Context()); err != nil {
+				t.Fatalf("leaseA.Confirm: %v", err)
+			}
+			if err := leaseB.(PendingExecutionLease).ConfirmWithExecution(t.Context(), nil); err != nil {
+				t.Fatalf("leaseB.ConfirmWithExecution: %v", err)
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatal(err)
 	}
 	if n := pendingCount(ovProv.repo); n != 0 {
 		t.Fatalf("override provider leaked %d pending entries after confirm (want 0)", n)
 	}
 
-	if snap, err := ovProv.ResolveConnection(resA.NodeID); err != nil || snap.Identity.KeyPath != "/tmp/id_role_a" || snap.Node.OpenSSHAlias != "role-a" {
+	if snap, err := ovProv.ResolveConnection(resAID); err != nil || snap.Identity.KeyPath != "/tmp/id_role_a" || snap.Node.OpenSSHAlias != "role-a" {
 		t.Fatalf("post-confirm ResolveConnection(resA) = (%+v, %v), want role-a snapshot", snap, err)
 	}
 	if len(ovProv.Snapshot().Nodes.Keys()) != 0 {
 		t.Fatalf("override Snapshot() polluted with ephemeral nodes: %v", ovProv.Snapshot().Nodes.Keys())
 	}
 
-	resB2, err := ovProv.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	if err := ovProv.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{Selector: "role-b", User: "ops", HasUser: true},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(role-b) after role-a confirm failed: %v", err)
+	}, func(leaseB2 PendingLease) error {
+		if _, _, identB2, err := ovProv.Resolve(leaseB2.NodeID()); err != nil || identB2.KeyPath != "/tmp/id_role_b" {
+			t.Fatalf("Resolve(role-b after confirm) = (%q, %v), want /tmp/id_role_b", identB2.KeyPath, err)
+		}
+		return nil // auto-discarded without Confirm
+	}); err != nil {
+		t.Fatalf("WithPendingNode(role-b) after role-a confirm failed: %v", err)
 	}
-	if _, _, identB2, err := ovProv.Resolve(resB2.NodeID); err != nil || identB2.KeyPath != "/tmp/id_role_b" {
-		t.Fatalf("Resolve(role-b after confirm) = (%q, %v), want /tmp/id_role_b", identB2.KeyPath, err)
-	}
-	ovProv.DiscardPendingNode(resB2.NodeID)
 	if n := pendingCount(ovProv.repo); n != 0 {
-		t.Fatalf("override DiscardPendingNode left %d entries", n)
+		t.Fatalf("override auto-discard left %d entries", n)
 	}
 }
 
 func testP6OverrideConfirmedCacheBound(t *testing.T) {
 	ovProv := newP6OverrideProvider(t)
 	for i := range maxOverrideConfirmedSnapshots + 10 {
-		prep, prepErr := ovProv.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+		if err := ovProv.WithPendingNode(t.Context(), EnsureNodeOptions{
 			Target: ConnectionTarget{Selector: fmt.Sprintf("10.62.0.%d", i+1), User: "ops", HasUser: true, Port: 22, HasPort: true},
-		})
-		if prepErr != nil {
-			t.Fatalf("PrepareNodeContext(%d): %v", i, prepErr)
-		}
-		if err := ovProv.ConfirmNodeContext(t.Context(), prep.NodeID); err != nil {
-			t.Fatalf("ConfirmNodeContext(%d): %v", i, err)
+		}, func(lease PendingLease) error {
+			return lease.Confirm(t.Context())
+		}); err != nil {
+			t.Fatalf("WithPendingNode(%d): %v", i, err)
 		}
 	}
 	ovProv.confirmedMu.RLock()
@@ -325,40 +329,45 @@ func testP6RepositoryPendingRefcountBasic(t *testing.T) {
 	repo := newP6PendingRoleRepo(t)
 	opts := EnsureNodeOptions{Target: ConnectionTarget{Selector: "10.63.0.10", User: "ops", HasUser: true, Port: 2222, HasPort: true}}
 
-	p1, err := repo.PrepareNodeContext(t.Context(), opts)
-	if err != nil {
+	var p1ID string
+	if err := repo.WithPendingNode(t.Context(), opts, func(lease1 PendingLease) error {
+		p1ID = lease1.NodeID()
+		if err := repo.WithPendingNode(t.Context(), opts, func(lease2 PendingLease) error {
+			if lease2.NodeID() != p1ID {
+				t.Fatalf("reuse WithPendingNode = %q, want %q", lease2.NodeID(), p1ID)
+			}
+			return nil // inner exits without Confirm -> refs 2->1
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := repo.ResolveConnection(p1ID); err != nil {
+			t.Fatalf("inner auto-discard clobbered outer concurrent caller: %v", err)
+		}
+		return nil // outer exits without Confirm -> refs 1->0
+	}); err != nil {
 		t.Fatal(err)
 	}
-	p2, err := repo.PrepareNodeContext(t.Context(), opts)
-	if err != nil || p2.NodeID != p1.NodeID {
-		t.Fatalf("reuse PrepareNodeContext = (%+v, %v), want %q", p2, err, p1.NodeID)
+	if _, err := repo.ResolveConnection(p1ID); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("outer auto-discard did not delete entry: %v", err)
 	}
-	repo.DiscardPendingNode(p1.NodeID)
-	if _, err := repo.ResolveConnection(p1.NodeID); err != nil {
-		t.Fatalf("first DiscardPendingNode clobbered concurrent caller: %v", err)
-	}
-	repo.DiscardPendingNode(p1.NodeID)
-	if _, err := repo.ResolveConnection(p1.NodeID); !errors.Is(err, ErrNodeNotFound) {
-		t.Fatalf("second DiscardPendingNode did not delete entry: %v", err)
-	}
-	repo.DiscardPendingNode(p1.NodeID)
-	repo.DiscardPendingNode("")
-	repo.DiscardPendingNode("nonexistent")
 
-	failA, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{Selector: "app-a", Port: 2222, HasPort: true},
-	})
-	if err != nil {
+	}, func(PendingLease) error {
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
-	repo.DiscardPendingNode(failA.NodeID)
-	okB, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{Selector: "app-b", Port: 2222, HasPort: true},
-	})
-	if err != nil || IsOpenSSHNodeID(okB.NodeID) {
-		t.Fatalf("PrepareNodeContext(app-b) after discarding app-a = (%+v, %v), want primary ID", okB, err)
+	}, func(leaseB PendingLease) error {
+		if IsOpenSSHNodeID(leaseB.NodeID()) {
+			t.Fatalf("WithPendingNode(app-b) after discarding app-a = %q, want primary ID", leaseB.NodeID())
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
-	repo.DiscardPendingNode(okB.NodeID)
 	if n := pendingCount(repo); n != 0 {
 		t.Fatalf("expected 0 pending entries, got %d", n)
 	}
@@ -368,54 +377,60 @@ func testP6RepositoryPendingRefcountUpgradeAndAlt(t *testing.T) {
 	repo := newP6PendingRoleRepo(t)
 	rawOpts := EnsureNodeOptions{Target: ConnectionTarget{Selector: "10.63.0.10", User: "ops", HasUser: true, Port: 2222, HasPort: true}}
 
-	u1, err := repo.PrepareNodeContext(t.Context(), rawOpts)
-	if err != nil {
+	var u1ID string
+	if err := repo.WithPendingNode(t.Context(), rawOpts, func(lease1 PendingLease) error {
+		u1ID = lease1.NodeID()
+		if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
+			Target: ConnectionTarget{Selector: "app-a", Port: 2222, HasPort: true},
+		}, func(lease2 PendingLease) error {
+			if lease2.NodeID() != u1ID {
+				t.Fatalf("upgrade WithPendingNode = %q, want %q", lease2.NodeID(), u1ID)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if gotAlias := repo.NodeOpenSSHAlias(u1ID); gotAlias != "app-a" {
+			t.Fatalf("after one discard of upgraded pending entry, alias = %q, want app-a", gotAlias)
+		}
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
-	u2, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
-		Target: ConnectionTarget{Selector: "app-a", Port: 2222, HasPort: true},
-	})
-	if err != nil || u2.NodeID != u1.NodeID {
-		t.Fatalf("upgrade PrepareNodeContext = (%+v, %v), want %q", u2, err, u1.NodeID)
-	}
-	repo.DiscardPendingNode(u1.NodeID)
-	if gotAlias := repo.NodeOpenSSHAlias(u1.NodeID); gotAlias != "app-a" {
-		t.Fatalf("after one discard of upgraded pending entry, alias = %q, want app-a", gotAlias)
-	}
-	repo.DiscardPendingNode(u2.NodeID)
-	if _, err := repo.ResolveConnection(u1.NodeID); !errors.Is(err, ErrNodeNotFound) {
+	if _, err := repo.ResolveConnection(u1ID); !errors.Is(err, ErrNodeNotFound) {
 		t.Fatalf("upgraded pending entry leaked after final discard: %v", err)
 	}
 
-	holdA, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{Selector: "app-a", Port: 2222, HasPort: true},
-	})
-	if err != nil {
+	}, func(PendingLease) error {
+		return repo.WithPendingNode(t.Context(), EnsureNodeOptions{
+			Target: ConnectionTarget{Selector: "app-b", Port: 2222, HasPort: true},
+		}, func(alt1 PendingLease) error {
+			if !IsOpenSSHNodeID(alt1.NodeID()) {
+				t.Fatalf("alt1 = %q, want openssh: ID", alt1.NodeID())
+			}
+			return repo.WithPendingNode(t.Context(), EnsureNodeOptions{
+				Target: ConnectionTarget{Selector: "app-b", Port: 2222, HasPort: true},
+			}, func(alt2 PendingLease) error {
+				if alt2.NodeID() != alt1.NodeID() {
+					t.Fatalf("alt2 = %q, want reuse %q", alt2.NodeID(), alt1.NodeID())
+				}
+				if err := alt1.Confirm(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				repo.pendingMu.RLock()
+				_, altStillPending := repo.pending[alt1.NodeID()]
+				repo.pendingMu.RUnlock()
+				if !altStillPending {
+					t.Fatal("first Confirm on shared disambiguated openssh pending entry deleted it before second caller finished")
+				}
+				return nil
+			})
+		})
+	}); err != nil {
 		t.Fatal(err)
 	}
-	alt1, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
-		Target: ConnectionTarget{Selector: "app-b", Port: 2222, HasPort: true},
-	})
-	if err != nil || !IsOpenSSHNodeID(alt1.NodeID) {
-		t.Fatalf("alt1 = (%+v, %v), want openssh: ID", alt1, err)
-	}
-	alt2, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
-		Target: ConnectionTarget{Selector: "app-b", Port: 2222, HasPort: true},
-	})
-	if err != nil || alt2.NodeID != alt1.NodeID {
-		t.Fatalf("alt2 = (%+v, %v), want reuse %q", alt2, err, alt1.NodeID)
-	}
-	if err := repo.ConfirmNodeContext(t.Context(), alt1.NodeID); err != nil {
-		t.Fatal(err)
-	}
-	repo.pendingMu.RLock()
-	_, altStillPending := repo.pending[alt1.NodeID]
-	repo.pendingMu.RUnlock()
-	if !altStillPending {
-		t.Fatal("first ConfirmNodeContext on shared disambiguated openssh pending entry deleted it before second caller finished")
-	}
-	repo.DiscardPendingNode(alt2.NodeID)
-	repo.DiscardPendingNode(holdA.NodeID)
 	if n := pendingCount(repo); n != 0 {
 		t.Fatalf("expected 0 pending entries after all discards, got %d", n)
 	}
@@ -423,50 +438,50 @@ func testP6RepositoryPendingRefcountUpgradeAndAlt(t *testing.T) {
 
 func testP6PendingOriginIsolation(t *testing.T) {
 	repo, _ := pendingDiskRepository(t)
-	prep, err := repo.PrepareNodeContext(t.Context(), pendingTestOptions(2222))
-	if err != nil {
+	var prepID string
+	if err := repo.WithPendingNode(t.Context(), pendingTestOptions(2222), func(lease PendingLease) error {
+		prepID = lease.NodeID()
+		repo.SetNodeOpenSSHOrigin(prepID, OpenSSHOrigin{Alias: "pending-alias", CanonicalHost: "pending.corp.example.com"})
+		if got := repo.NodeOpenSSHOrigin(prepID); got != (OpenSSHOrigin{Alias: "pending-alias", CanonicalHost: "pending.corp.example.com"}) {
+			t.Fatalf("pending NodeOpenSSHOrigin = %+v", got)
+		}
+		if leaked := repo.provider.NodeOpenSSHOrigin(prepID); !leaked.IsZero() {
+			t.Fatalf("SetNodeOpenSSHOrigin leaked pending metadata into r.provider: %+v", leaked)
+		}
+
+		repo.SetNodeCanonicalHost(prepID, "canon2.corp.example.com")
+		if leaked := repo.provider.NodeOpenSSHOrigin(prepID); !leaked.IsZero() {
+			t.Fatalf("SetNodeCanonicalHost leaked pending metadata into r.provider: %+v", leaked)
+		}
+
+		repo.SetNodeOpenSSHAlias(prepID, "alias2")
+		if leaked := repo.provider.NodeOpenSSHOrigin(prepID); !leaked.IsZero() {
+			t.Fatalf("SetNodeOpenSSHAlias leaked pending metadata into r.provider: %+v", leaked)
+		}
+
+		frozenOrigin := repo.Frozen().(interface{ NodeOpenSSHOrigin(string) OpenSSHOrigin }).NodeOpenSSHOrigin(prepID)
+		if !frozenOrigin.IsZero() {
+			t.Fatalf("Frozen() observed unsaved pending metadata: %+v", frozenOrigin)
+		}
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
-
-	repo.SetNodeOpenSSHOrigin(prep.NodeID, OpenSSHOrigin{Alias: "pending-alias", CanonicalHost: "pending.corp.example.com"})
-	if got := repo.NodeOpenSSHOrigin(prep.NodeID); got != (OpenSSHOrigin{Alias: "pending-alias", CanonicalHost: "pending.corp.example.com"}) {
-		t.Fatalf("pending NodeOpenSSHOrigin = %+v", got)
-	}
-	if leaked := repo.provider.NodeOpenSSHOrigin(prep.NodeID); !leaked.IsZero() {
-		t.Fatalf("SetNodeOpenSSHOrigin leaked pending metadata into r.provider: %+v", leaked)
+	if got := repo.NodeOpenSSHOrigin(prepID); !got.IsZero() {
+		t.Fatalf("after auto-discard, NodeOpenSSHOrigin = %+v, want zero", got)
 	}
 
-	repo.SetNodeCanonicalHost(prep.NodeID, "canon2.corp.example.com")
-	if leaked := repo.provider.NodeOpenSSHOrigin(prep.NodeID); !leaked.IsZero() {
-		t.Fatalf("SetNodeCanonicalHost leaked pending metadata into r.provider: %+v", leaked)
-	}
-
-	repo.SetNodeOpenSSHAlias(prep.NodeID, "alias2")
-	if leaked := repo.provider.NodeOpenSSHOrigin(prep.NodeID); !leaked.IsZero() {
-		t.Fatalf("SetNodeOpenSSHAlias leaked pending metadata into r.provider: %+v", leaked)
-	}
-
-	frozenOrigin := repo.Frozen().(interface{ NodeOpenSSHOrigin(string) OpenSSHOrigin }).NodeOpenSSHOrigin(prep.NodeID)
-	if !frozenOrigin.IsZero() {
-		t.Fatalf("Frozen() observed unsaved pending metadata: %+v", frozenOrigin)
-	}
-
-	repo.DiscardPendingNode(prep.NodeID)
-	if got := repo.NodeOpenSSHOrigin(prep.NodeID); !got.IsZero() {
-		t.Fatalf("after DiscardPendingNode, NodeOpenSSHOrigin = %+v, want zero", got)
-	}
-
-	prep2, err := repo.PrepareNodeContext(t.Context(), pendingTestOptions(2223))
-	if err != nil {
-		t.Fatal(err)
-	}
 	wantOrigin := OpenSSHOrigin{Alias: "confirmed-alias", CanonicalHost: "confirmed.corp.example.com"}
-	repo.SetNodeOpenSSHOrigin(prep2.NodeID, wantOrigin)
-	if err := repo.ConfirmNodeContext(t.Context(), prep2.NodeID); err != nil {
-		t.Fatalf("ConfirmNodeContext: %v", err)
+	var prep2ID string
+	if err := repo.WithPendingNode(t.Context(), pendingTestOptions(2223), func(lease2 PendingLease) error {
+		prep2ID = lease2.NodeID()
+		repo.SetNodeOpenSSHOrigin(prep2ID, wantOrigin)
+		return lease2.Confirm(t.Context())
+	}); err != nil {
+		t.Fatalf("WithPendingNode/Confirm: %v", err)
 	}
-	if got := repo.provider.NodeOpenSSHOrigin(prep2.NodeID); got != wantOrigin {
-		t.Fatalf("r.provider origin after ConfirmNodeContext = %+v, want %+v", got, wantOrigin)
+	if got := repo.provider.NodeOpenSSHOrigin(prep2ID); got != wantOrigin {
+		t.Fatalf("r.provider origin after Confirm = %+v, want %+v", got, wantOrigin)
 	}
 }
 
@@ -482,42 +497,42 @@ func testP6PendingConcurrencyRace(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			opts := pendingTestOptions(2200 + uint16(idx%2))
-			prep, prepErr := repo.PrepareNodeContext(t.Context(), opts)
-			if prepErr != nil {
-				t.Errorf("PrepareNodeContext: %v", prepErr)
-				return
-			}
-			_, _ = repo.ResolveConnection(prep.NodeID)
-			if idx%2 == 0 {
-				repo.DiscardPendingNode(prep.NodeID)
-			} else if cErr := repo.ConfirmNodeContext(t.Context(), prep.NodeID); cErr != nil {
-				t.Errorf("ConfirmNodeContext: %v", cErr)
+			if err := repo.WithPendingNode(t.Context(), opts, func(lease PendingLease) error {
+				_, _ = repo.ResolveConnection(lease.NodeID())
+				if idx%2 == 0 {
+					return nil
+				}
+				return lease.Confirm(t.Context())
+			}); err != nil {
+				t.Errorf("WithPendingNode: %v", err)
 			}
 		}(i)
 	}
 	// Separate pending node exercises concurrent origin setters/readers alongside confirmation.
-	originPrep, err := repo.PrepareNodeContext(t.Context(), pendingTestOptions(2299))
-	if err != nil {
+	var originID string
+	if err := repo.WithPendingNode(t.Context(), pendingTestOptions(2299), func(originLease PendingLease) error {
+		originID = originLease.NodeID()
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for range 20 {
+				repo.SetNodeOpenSSHOrigin(originID, OpenSSHOrigin{Alias: "race-alias", CanonicalHost: "race.example.com"})
+				_ = repo.NodeOpenSSHOrigin(originID)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for range 20 {
+				repo.SetNodeCanonicalHost(originID, "race2.example.com")
+				_, _ = repo.ResolveConnection(originID)
+			}
+		}()
+		wg.Wait()
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		for range 20 {
-			repo.SetNodeOpenSSHOrigin(originPrep.NodeID, OpenSSHOrigin{Alias: "race-alias", CanonicalHost: "race.example.com"})
-			_ = repo.NodeOpenSSHOrigin(originPrep.NodeID)
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		for range 20 {
-			repo.SetNodeCanonicalHost(originPrep.NodeID, "race2.example.com")
-			_, _ = repo.ResolveConnection(originPrep.NodeID)
-		}
-	}()
-	wg.Wait()
-	repo.DiscardPendingNode(originPrep.NodeID)
-	if leaked := repo.provider.NodeOpenSSHOrigin(originPrep.NodeID); !leaked.IsZero() {
+	if leaked := repo.provider.NodeOpenSSHOrigin(originID); !leaked.IsZero() {
 		t.Fatalf("r.provider leaked pending origin under concurrent updates: %+v", leaked)
 	}
 }

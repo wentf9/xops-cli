@@ -1,102 +1,127 @@
-//go:build p7repro
-
 package cmd
 
 import (
-	"go/ast"
-	"go/parser"
-	"go/token"
-	"path/filepath"
-	"runtime"
+	"context"
 	"testing"
+	"time"
+
+	"github.com/wentf9/xops-cli/pkg/config"
 )
 
-type p7SftpPendingCleanupReport struct {
-	hasWithPendingNode  bool
-	hasDiscardPending   bool
-	preparesWithoutLeak bool
-	preparePos          token.Position
-	discardedCreatedPos token.Position
-}
-
-func inspectSftpPendingCleanup(fset *token.FileSet, file *ast.File) p7SftpPendingCleanupReport {
-	var r p7SftpPendingCleanupReport
-	ast.Inspect(file, func(n ast.Node) bool {
-		switch node := n.(type) {
-		case *ast.CallExpr:
-			r.inspectCall(fset, node)
-		case *ast.AssignStmt:
-			r.inspectAssign(fset, node)
-		}
-		return true
-	})
-	return r
-}
-
-func (r *p7SftpPendingCleanupReport) inspectCall(fset *token.FileSet, call *ast.CallExpr) {
-	switch fn := call.Fun.(type) {
-	case *ast.Ident:
-		if fn.Name == "discardPendingNode" {
-			r.hasDiscardPending = true
-		}
-	case *ast.SelectorExpr:
-		switch fn.Sel.Name {
-		case "WithPendingNode":
-			r.hasWithPendingNode = true
-		case "DiscardPendingNode":
-			r.hasDiscardPending = true
-		case "resolveNode", "prepareNode", "PrepareNodeContext":
-			r.preparesWithoutLeak = true
-			r.preparePos = fset.Position(call.Pos())
-		}
-	}
-}
-
-func (r *p7SftpPendingCleanupReport) inspectAssign(fset *token.FileSet, stmt *ast.AssignStmt) {
-	if len(stmt.Rhs) != 1 || len(stmt.Lhs) < 2 {
-		return
-	}
-	call, ok := stmt.Rhs[0].(*ast.CallExpr)
-	if !ok {
-		return
-	}
-	sel, ok := call.Fun.(*ast.SelectorExpr)
-	if !ok || (sel.Sel.Name != "resolveNode" && sel.Sel.Name != "prepareNode") {
-		return
-	}
-	if ident, ok := stmt.Lhs[1].(*ast.Ident); ok && ident.Name == "_" {
-		r.discardedCreatedPos = fset.Position(ident.Pos())
-	}
-}
-
-// TestP7Repro_MED2_SftpRunContextDiscardsPendingNodeOnFailure reproduces MED-2:
-// cmd/sftp.go (*SftpOptions).RunContext prepares a pending node via resolveNode,
-// throws away the created return value with "_", and never discards the pending
-// node (neither via discardPendingNode/DiscardPendingNode nor via a scoped
-// WithPendingNode lease) when connect/setup fails.
+// TestP7Repro_MED2_SftpRunContextDiscardsPendingNodeOnFailure verifies MED-2
+// behaviorally: (*SftpOptions).runWithProvider scopes pending node creation via
+// config.WithPendingNode so failed dials and mid-handshake cancellations always
+// discard the pending registration without persisting it or poisoning retries,
+// while attaching via an existing ControlMaster confirms the node cleanly.
 func TestP7Repro_MED2_SftpRunContextDiscardsPendingNodeOnFailure(t *testing.T) {
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("failed to locate test file path")
-	}
-	sftpGoPath := filepath.Join(filepath.Dir(thisFile), "sftp.go")
+	t.Setenv("XOPS_CLI_SSH_FROM_TUI", "")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XOPS_CONFIG_DIR", home)
 
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, sftpGoPath, nil, 0)
-	if err != nil {
-		t.Fatalf("parse %s: %v", sftpGoPath, err)
-	}
+	t.Run("failed_dial_discards_pending_node", func(t *testing.T) {
+		port := closedLoopbackPort(t)
+		nodeID := config.FormatNodeID("ops", "127.0.0.1", port)
+		target := config.ConnectionTarget{
+			Selector: "127.0.0.1",
+			User:     "ops",
+			HasUser:  true,
+			Port:     port,
+			HasPort:  true,
+		}
+		repo, cfg := newP6PendingTestRepo(t, "")
+		opts := NewSftpOptions()
+		opts.Host = "127.0.0.1"
+		opts.User = "ops"
+		opts.Port = port
+		opts.Alias = "sftp-fail-first"
+		opts.Remember = "always"
+		opts.Target = target
+		opts.parsedArgs = true
 
-	report := inspectSftpPendingCleanup(fset, file)
-	if report.hasWithPendingNode || !report.preparesWithoutLeak {
-		return
-	}
-	if report.discardedCreatedPos.IsValid() {
-		t.Errorf("%s:%d: (*SftpOptions).RunContext discards the created flag from resolveNode/prepareNode ('_'), making pending cleanup impossible",
-			filepath.Base(report.discardedCreatedPos.Filename), report.discardedCreatedPos.Line)
-	}
-	if !report.hasDiscardPending {
-		t.Fatalf("%s:%d: prepares pending node without any discardPendingNode/DiscardPendingNode or WithPendingNode cleanup on connect failure",
-			filepath.Base(report.preparePos.Filename), report.preparePos.Line)
-	}
+		if err := opts.runWithProvider(t.Context(), cfg, repo, false); err == nil {
+			t.Fatal("expected SftpOptions.runWithProvider against closed loopback port to fail")
+		}
+		if _, saved := repo.Snapshot().Nodes.Get(nodeID); saved {
+			t.Fatalf("failed sftp connect persisted node %q", nodeID)
+		}
+		assertPendingReleasedAndRepreparable(t, repo, nodeID, target, "sftp-fail-second")
+	})
+
+	t.Run("canceled_handshake_discards_pending_node", func(t *testing.T) {
+		silentPort, accepted := startSilentLoopbackServer(t)
+		nodeID := config.FormatNodeID("ops", "127.0.0.1", silentPort)
+		target := config.ConnectionTarget{
+			Selector: "127.0.0.1",
+			User:     "ops",
+			HasUser:  true,
+			Port:     silentPort,
+			HasPort:  true,
+		}
+		repo, cfg := newP6PendingTestRepo(t, "")
+		opts := NewSftpOptions()
+		opts.Host = "127.0.0.1"
+		opts.User = "ops"
+		opts.Port = silentPort
+		opts.Alias = "sftp-cancel-first"
+		opts.Remember = "always"
+		opts.Target = target
+		opts.parsedArgs = true
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		go func() {
+			select {
+			case <-accepted:
+				cancel()
+			case <-time.After(3 * time.Second):
+				cancel()
+			}
+		}()
+
+		if err := opts.runWithProvider(ctx, cfg, repo, false); err == nil {
+			t.Fatal("expected SftpOptions.runWithProvider canceled mid-handshake to fail")
+		}
+		if _, saved := repo.Snapshot().Nodes.Get(nodeID); saved {
+			t.Fatalf("canceled sftp connect persisted node %q", nodeID)
+		}
+		assertPendingReleasedAndRepreparable(t, repo, nodeID, target, "sftp-cancel-second")
+	})
+
+	t.Run("controlmaster_attach_confirms_pending_node", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+		defer cancel()
+
+		fix, port, sockPath := startP7ReproControlMaster(t, ctx)
+		nodeID := config.FormatNodeID("ops", "127.0.0.1", port)
+		target := config.ConnectionTarget{
+			Selector: "127.0.0.1",
+			User:     "ops",
+			HasUser:  true,
+			Port:     port,
+			HasPort:  true,
+		}
+		repo, cfg := newP6PendingTestRepo(t, "")
+		opts := NewSftpOptions()
+		opts.Host = "127.0.0.1"
+		opts.User = "ops"
+		opts.Port = port
+		opts.Alias = "sftp-mux-confirm"
+		opts.Remember = "always"
+		opts.Target = target
+		opts.parsedArgs = true
+		opts.control.Options = []string{"ControlMaster=auto", "ControlPath=" + sockPath}
+
+		authBefore := fix.Authenticated.Load()
+		// The SSH fixture does not serve an SFTP subsystem, so sftp.NewClient
+		// fails after Connect + FinalizePendingConnection; confirmation already
+		// happened right after attaching via the existing ControlMaster.
+		_ = opts.runWithProvider(ctx, cfg, repo, false)
+		if fix.Authenticated.Load() != authBefore {
+			t.Fatalf("expected sftp to attach via existing ControlMaster without new auth handshake (before=%d after=%d)",
+				authBefore, fix.Authenticated.Load())
+		}
+		assertP7ReproNodeConfirmedNotOrphaned(t, "sftp", repo, nodeID)
+	})
 }

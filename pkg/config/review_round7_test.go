@@ -62,11 +62,15 @@ func verifyRound7AliasEndpointReuse(t *testing.T, repo *Repository) {
 	if resReuse.MatchedNodeID != "custom-app" || resReuse.NodeID != "custom-app" || resReuse.Created {
 		t.Fatalf("reused-alias missed custom-app: %+v", resReuse)
 	}
-	prepReuse, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target: reuseTarget,
-	})
-	if err != nil || prepReuse.Created || prepReuse.NodeID != "custom-app" {
-		t.Fatalf("PrepareNodeContext(reused-alias) = (%+v, %v), want custom-app Created=false", prepReuse, err)
+	}, func(lease PendingLease) error {
+		if lease.NodeID() != "custom-app" || repo.IsPendingNode(lease.NodeID()) {
+			t.Fatalf("WithPendingNode(reused-alias) = %q pending=%v, want custom-app non-pending", lease.NodeID(), repo.IsPendingNode(lease.NodeID()))
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithPendingNode(reused-alias): %v", err)
 	}
 }
 
@@ -101,21 +105,26 @@ func verifyRound7EditedNodeCollisionAllocation(t *testing.T, repo *Repository) {
 
 func verifyRound7CollisionPrepareConfirm(t *testing.T, repo *Repository) {
 	t.Helper()
-	// Ensure PrepareNodeContext + ConfirmNodeContext allocate and persist "ops@10.70.0.2:22-2" cleanly.
-	prepCol, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	// Ensure WithPendingNode + Confirm allocate and persist "ops@10.70.0.2:22-2" cleanly.
+	if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{Selector: "10.70.0.2", User: "ops", HasUser: true, Port: 22, HasPort: true},
-	})
-	if err != nil || !prepCol.Created || prepCol.NodeID != "ops@10.70.0.2:22-2" {
-		t.Fatalf("PrepareNodeContext(10.70.0.2) = (%+v, %v), want ops@10.70.0.2:22-2 Created=true", prepCol, err)
+	}, func(lease PendingLease) error {
+		if lease.NodeID() != "ops@10.70.0.2:22-2" || !repo.IsPendingNode(lease.NodeID()) {
+			t.Fatalf("WithPendingNode(10.70.0.2) = %q, want pending ops@10.70.0.2:22-2", lease.NodeID())
+		}
+		return lease.Confirm(t.Context())
+	}); err != nil {
+		t.Fatalf("WithPendingNode/Confirm(10.70.0.2): %v", err)
 	}
-	if err := repo.ConfirmNodeContext(t.Context(), prepCol.NodeID); err != nil {
-		t.Fatalf("ConfirmNodeContext(%q): %v", prepCol.NodeID, err)
-	}
-	prepCol2, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{Selector: "collision-alias-same", Port: 22, HasPort: true},
-	})
-	if err != nil || prepCol2.Created || prepCol2.NodeID != "ops@10.70.0.2:22-2" {
-		t.Fatalf("second PrepareNodeContext(collision-alias-same) = (%+v, %v), want reuse ops@10.70.0.2:22-2", prepCol2, err)
+	}, func(lease PendingLease) error {
+		if lease.NodeID() != "ops@10.70.0.2:22-2" || repo.IsPendingNode(lease.NodeID()) {
+			t.Fatalf("second WithPendingNode(collision-alias-same) = %q, want reuse ops@10.70.0.2:22-2", lease.NodeID())
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("second WithPendingNode(collision-alias-same): %v", err)
 	}
 	// Original edited node must remain intact on 10.70.0.99.
 	_, editedHost, _, err := repo.Resolve("ops@10.70.0.2:22")

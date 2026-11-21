@@ -87,9 +87,24 @@ func TestPass9_H2_IdentityOptionPersistenceAndLiteralFlag(t *testing.T) {
 	if !slices.Equal(opts.IdentityFiles, []string{"none"}) {
 		t.Errorf("opts.IdentityFiles = %v, want [none]", opts.IdentityFiles)
 	}
-	ident := models.Identity{User: "alice", AuthType: "auto"}
-	if updateIdentityFields(&ident, opts) {
-		t.Errorf("updateIdentityFields mutated identity %+v for IdentityFile=none", ident)
+	repo := setupTestRepository(t)
+	if _, err := repo.CreateNodeContext(t.Context(), "alice-node",
+		models.Node{HostRef: "h-alice", IdentityRef: "id-alice"},
+		models.Host{Address: "10.0.0.77", Port: 22},
+		models.Identity{User: "alice", AuthType: "auto"},
+	); err != nil {
+		t.Fatalf("CreateNodeContext: %v", err)
+	}
+	opts.Remember = "always"
+	opts.Target = config.ConnectionTarget{Selector: "alice-node"}
+	if err := opts.withTestPendingNode(t.Context(), repo, func(lease config.PendingLease) error {
+		return lease.Confirm(t.Context())
+	}); err != nil {
+		t.Fatalf("withTestPendingNode(IdentityFile=none): %v", err)
+	}
+	_, _, ident, err := repo.Resolve("alice-node")
+	if err != nil {
+		t.Fatalf("Resolve(alice-node): %v", err)
 	}
 	if ident.KeyPath != "" || ident.AuthType != "auto" {
 		t.Errorf("identity modified: %+v", ident)

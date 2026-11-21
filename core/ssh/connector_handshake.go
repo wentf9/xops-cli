@@ -412,7 +412,6 @@ func (c *Connector) recordAndSyncAuthAfterHandshake(
 	ctx context.Context,
 	nodeName string,
 	policy dialPolicy,
-	confirmedExec *ExecutionConfig,
 	outcome authOutcome,
 	rootConn net.Conn,
 ) (ConnectionConfig, *ClientConfig, error) {
@@ -443,9 +442,6 @@ func (c *Connector) recordAndSyncAuthAfterHandshake(
 	finalConnCfg := policy.toConnectionConfig()
 	if outcome.authType != "" {
 		finalConnCfg.AuthType = outcome.authType
-	}
-	if confirmedExec != nil {
-		finalConnCfg.Execution = confirmedExec.Clone()
 	}
 
 	reloadedCfg, err := c.syncRecordedConnection(
@@ -505,18 +501,15 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 		RootConn:  transportRoot,
 		hopConn:   rootConn,
 		parentKey: planNode.parentDigest,
+		pool:      c.pool,
 	}
 	client := c.wrapAuthenticatedClient(policy, attempt, pooled)
-	confirmedExec, err := c.confirmAuthenticatedConnection(ctx, nodeName, rootConn, client)
-	if err != nil {
-		return nil, err
-	}
 	outcome := attempt.outcome()
 	if err := checkInitializedTransport(nodeName, policy, outcome, rootConn, client); err != nil {
 		return nil, err
 	}
 
-	finalConnCfg, reloadedCfg, err := c.recordAndSyncAuthAfterHandshake(ctx, nodeName, policy, confirmedExec, outcome, rootConn)
+	finalConnCfg, reloadedCfg, err := c.recordAndSyncAuthAfterHandshake(ctx, nodeName, policy, outcome, rootConn)
 	if err != nil {
 		return nil, err
 	}
@@ -529,15 +522,24 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 	client.connCfg = finalConnCfg
 	client.cfgMu.Unlock()
 
-	pooled.Snapshot = finalConnCfg.Clone()
-	pooled.hasSnapshot = true
-
-	hopKey := planNode.hopDigest()
+	var publishedCfg *ClientConfig
 	if reloadedCfg != nil {
-		publishedCfg := NewClientConfig(*reloadedCfg)
+		publishedCfg = NewClientConfig(*reloadedCfg)
 		if planNode.cfg != nil {
 			publishedCfg.ProxyJump = planNode.cfg.ProxyJump
 		}
+	} else if planNode.cfg != nil {
+		publishedCfg = NewClientConfig(*planNode.cfg)
+	}
+
+	pooled.probeMu.Lock()
+	pooled.Snapshot = finalConnCfg.Clone()
+	pooled.hasSnapshot = true
+	pooled.publishedCfg = publishedCfg
+	pooled.probeMu.Unlock()
+
+	hopKey := planNode.hopDigest()
+	if publishedCfg != nil {
 		hopKey = DigestClientConfig(publishedCfg, planNode.parentDigest)
 	}
 	if _, err := c.publishPooled(hopKey, pooled, expectParent, roPolicy); err != nil {
@@ -1944,33 +1946,6 @@ func buildKeyAuthMethod(cfg *ClientConfig, extraPassphrase []byte, resolver ...f
 		return nil, fmt.Errorf("failed to parse private key: %w", err)
 	}
 	return ssh.PublicKeys(signer), nil
-}
-
-// A confirmation failure must close the authenticated but unpublished client.
-func (c *Connector) confirmAuthenticatedConnection(ctx context.Context, nodeID string, root net.Conn, client *Client) (_ *ExecutionConfig, err error) {
-	defer func() {
-		if err != nil {
-			if closeErr := root.Close(); closeErr != nil {
-				err = errors.Join(err, fmt.Errorf("close unpublished SSH connection: %w", closeErr))
-			}
-		}
-	}()
-	if confirmer, ok := c.provider.(AuthenticatedConnectionConfirmer); ok {
-		execution, err := confirmer.ConfirmAuthenticatedConnection(ctx, nodeID, client)
-		if err != nil {
-			return nil, fmt.Errorf("confirm authenticated node %q: %w", nodeID, err)
-		}
-		if err := execution.Validate(); err != nil {
-			return nil, fmt.Errorf("validate authenticated execution: %w", err)
-		}
-		return execution.Clone(), nil
-	}
-	if confirmer, ok := c.provider.(ConnectionConfirmer); ok {
-		if err := confirmer.ConfirmConnection(ctx, nodeID); err != nil {
-			return nil, fmt.Errorf("confirm authenticated node %q: %w", nodeID, err)
-		}
-	}
-	return nil, nil
 }
 
 func (c *Connector) syncConnectionAfterRecording(node string, policy dialPolicy, outcome authOutcome, token string, updated, failed bool, rootConn net.Conn) (ConnectionConfig, error) {

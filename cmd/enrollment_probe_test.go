@@ -64,63 +64,69 @@ func verifyCLIEnrollmentProbe(t *testing.T, command string, execution execExecut
 	if err != nil {
 		t.Fatal(err)
 	}
-	prepare := func(user string) string {
-		t.Helper()
-		prepared, err := repo.PrepareNodeContext(ctx, config.EnsureNodeOptions{Target: config.ConnectionTarget{
-			Selector: host, User: user, HasUser: true, Port: uint16(port), HasPort: true,
-		}})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return prepared.NodeID
-	}
-	nodeID, otherNodeID := prepare("fixture"), prepare("other")
-	ui := newCLIInteractionHandlerWithStreams(strings.NewReader("yes\n"), new(bytes.Buffer))
-	base := SshOptions{Remember: "always", Password: sshfixture.Password, NoLoginShell: noLogin, interaction: ui, execution: execution}
-	var options []adapter.Option
-	if command == "ssh" {
-		options, err = base.buildAdapterOptions(nodeID, cfg, repo)
-	} else {
-		o := ExecOptions{SshOptions: base, Interactive: true, interaction: ui}
-		options, err = o.buildAdapterOptions([]execHostTask{{nodeID: nodeID, pass: sshfixture.Password}}, cfg, repo)
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
-	options = append(options, adapter.WithSessionAuthOverride(otherNodeID, adapter.SessionAuth{Password: sshfixture.Password, Remember: true}))
-	connector := adapter.NewConnectorWithAdapterOptions(repo, options, ssh.WithHandshakeTimeout(time.Second),
-		ssh.WithEnvironment(ssh.Environment{KnownHostsFile: filepath.Join(t.TempDir(), "known_hosts")}))
-	connector.AcceptNewHostKey.Store(true)
-	t.Cleanup(func() {
-		if err := connector.CloseAll(); err != nil {
-			t.Error(err)
-		}
-	})
-	for index, id := range []string{nodeID, otherNodeID} {
-		func() {
-			connectCtx, connectCancel := context.WithTimeout(t.Context(), operationTimeout)
-			defer connectCancel()
-			client, err := connector.Connect(connectCtx, id)
+	if err := repo.WithPendingNode(ctx, config.EnsureNodeOptions{Target: config.ConnectionTarget{
+		Selector: host, User: "fixture", HasUser: true, Port: uint16(port), HasPort: true,
+	}}, func(lease1 config.PendingLease) error {
+		return repo.WithPendingNode(ctx, config.EnsureNodeOptions{Target: config.ConnectionTarget{
+			Selector: host, User: "other", HasUser: true, Port: uint16(port), HasPort: true,
+		}}, func(lease2 config.PendingLease) error {
+			nodeID, otherNodeID := lease1.NodeID(), lease2.NodeID()
+			ui := newCLIInteractionHandlerWithStreams(strings.NewReader("yes\n"), new(bytes.Buffer))
+			base := SshOptions{Remember: "always", Password: sshfixture.Password, NoLoginShell: noLogin, interaction: ui, execution: execution}
+			var options []adapter.Option
+			if command == "ssh" {
+				options, err = base.buildAdapterOptions(nodeID, cfg, repo)
+			} else {
+				o := ExecOptions{SshOptions: base, Interactive: true, interaction: ui}
+				options, err = o.buildAdapterOptions([]execHostTask{{nodeID: nodeID, pass: sshfixture.Password}}, cfg, repo)
+			}
 			if err != nil {
 				t.Fatal(err)
 			}
+			options = append(options, adapter.WithSessionAuthOverride(otherNodeID, adapter.SessionAuth{Password: sshfixture.Password, Remember: true}))
+			connector, adp := adapter.NewConnectorAndAdapter(repo, options, ssh.WithHandshakeTimeout(time.Second),
+				ssh.WithEnvironment(ssh.Environment{KnownHostsFile: filepath.Join(t.TempDir(), "known_hosts")}))
+			connector.AcceptNewHostKey.Store(true)
 			t.Cleanup(func() {
-				if err := client.Close(); err != nil {
+				if err := connector.CloseAll(); err != nil {
 					t.Error(err)
 				}
 			})
-			wantRequests := int32(2)
-			if !execution.enabled() && !execution.noLoginSet {
-				wantRequests = 4
+			leases := []config.PendingLease{lease1, lease2}
+			for index, lease := range leases {
+				func() {
+					connectCtx, connectCancel := context.WithTimeout(t.Context(), operationTimeout)
+					defer connectCancel()
+					id := lease.NodeID()
+					client, err := connector.Connect(connectCtx, id)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := adp.FinalizePendingConnection(connectCtx, lease, client); err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() {
+						if err := client.Close(); err != nil {
+							t.Error(err)
+						}
+					})
+					wantRequests := int32(2)
+					if !execution.enabled() && !execution.noLoginSet {
+						wantRequests = 4
+					}
+					if index == 0 {
+						wantRequests -= 2
+					}
+					assertCLIEnrollmentProbe(t, client, repo, store, id, index == 1 || (!execution.enabled() && !execution.noLoginSet))
+					if server.Executed.Load() != wantRequests {
+						t.Fatalf("probe requests=%d, want %d", server.Executed.Load(), wantRequests)
+					}
+				}()
 			}
-			if index == 0 {
-				wantRequests -= 2
-			}
-			assertCLIEnrollmentProbe(t, client, repo, store, id, index == 1 || (!execution.enabled() && !execution.noLoginSet))
-			if server.Executed.Load() != wantRequests {
-				t.Fatalf("probe requests=%d, want %d", server.Executed.Load(), wantRequests)
-			}
-		}()
+			return nil
+		})
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 

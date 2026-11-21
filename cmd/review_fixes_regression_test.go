@@ -105,7 +105,7 @@ func TestH3_RememberNever_AdHocHostLeavesConfigUnchanged(t *testing.T) {
 	if err := scpOpt.Validate(); err != nil {
 		t.Fatalf("scpOpt.Validate: %v", err)
 	}
-	// Authentication + ConfirmAuthenticatedConnection runs during RunContext even if
+	// Authentication + FinalizePendingConnection runs during RunContext even if
 	// the test fixture does not serve an SFTP subsystem.
 	_ = scpOpt.RunContext(ctx)
 
@@ -137,28 +137,31 @@ func TestH4_ScpWithFOverrideAndIdentityOnSavedNode(t *testing.T) {
 	}
 
 	const savedNodeID = "iaas@10.238.221.181:22"
-	scpOpt := NewScpOptions()
-	scpOpt.IdentityFile = keyPath
-	updated, err := scpOpt.updateNode(ctx, savedNodeID, overrideProv, "", false)
-	if err != nil {
-		t.Fatalf("H4 regression: updateNode under -F failed: %v", err)
-	}
-	if updated {
-		t.Fatalf("expected updated=false under -F override provider")
-	}
-
-	// Under --remember=ask (shouldRemember=false) on a real repository, -i must not
-	// mutate the saved identity pre-auth.
 	_, _, beforeIdentity, err := repo.Resolve(savedNodeID)
 	if err != nil {
 		t.Fatalf("repo.Resolve(%q): %v", savedNodeID, err)
 	}
-	updatedRepo, err := scpOpt.updateNode(ctx, savedNodeID, repo, "", false)
-	if err != nil {
-		t.Fatalf("updateNode(repo, shouldRemember=false): %v", err)
+
+	scpOpt := NewScpOptions()
+	scpOpt.IdentityFile = keyPath
+	if err := scpOpt.withTestPendingPath(ctx, overrideProv, PathInfo{Host: savedNodeID, IsRemote: true}, "", func(lease config.PendingLease) error {
+		if lease.NodeID() != savedNodeID {
+			t.Fatalf("unexpected NodeID under -F: %q", lease.NodeID())
+		}
+		return lease.Confirm(ctx)
+	}); err != nil {
+		t.Fatalf("H4 regression: withTestPendingPath under -F failed: %v", err)
 	}
-	if updatedRepo {
-		t.Fatalf("expected updated=false when shouldRemember=false")
+
+	// Under --remember=ask (default, shouldRemember=false) on a real repository, -i must not
+	// mutate the saved identity pre-auth or on Confirm.
+	if err := scpOpt.withTestPendingPath(ctx, repo, PathInfo{Host: savedNodeID, IsRemote: true}, "", func(lease config.PendingLease) error {
+		if lease.NodeID() != savedNodeID {
+			t.Fatalf("unexpected NodeID on repo: %q", lease.NodeID())
+		}
+		return lease.Confirm(ctx)
+	}); err != nil {
+		t.Fatalf("withTestPendingPath(repo, remember=ask): %v", err)
 	}
 	_, _, afterIdentity, err := repo.Resolve(savedNodeID)
 	if err != nil {

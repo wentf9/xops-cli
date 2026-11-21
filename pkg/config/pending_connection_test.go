@@ -12,7 +12,6 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/models"
 )
 
@@ -39,31 +38,35 @@ func pendingDiskRepository(t *testing.T) (*Repository, Store) {
 
 func TestPreparedConnectionDoesNotPolluteSavedTargets(t *testing.T) {
 	repo, store := pendingDiskRepository(t)
-	wrong, err := repo.PrepareNodeContext(t.Context(), pendingTestOptions(0))
-	if err != nil || wrong.NodeID != "root@192.0.2.10:22" || !wrong.Created || wrong.Mutation.Outcome.Applied {
-		t.Fatalf("prepare default port = %+v, %v", wrong, err)
-	}
-	assertPendingConnectionInvisible(t, repo, store, wrong.NodeID)
-	// An unrelated durable write must not flush the failed attempt either.
-	if _, err := repo.CreateIdentityContext(t.Context(), "manual", models.Identity{User: "admin"}); err != nil {
+	var correctID string
+	if err := repo.WithPendingNode(t.Context(), pendingTestOptions(0), func(wrongLease PendingLease) error {
+		if wrongLease.NodeID() != "root@192.0.2.10:22" || !repo.IsPendingNode(wrongLease.NodeID()) {
+			t.Fatalf("prepare default port = %q", wrongLease.NodeID())
+		}
+		assertPendingConnectionInvisible(t, repo, store, wrongLease.NodeID())
+		// An unrelated durable write must not flush the failed attempt either.
+		if _, err := repo.CreateIdentityContext(t.Context(), "manual", models.Identity{User: "admin"}); err != nil {
+			t.Fatal(err)
+		}
+		return repo.WithPendingNode(t.Context(), pendingTestOptions(2222), func(correctLease PendingLease) error {
+			correctID = correctLease.NodeID()
+			before, err := repo.ResolveConnection(correctID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := correctLease.Confirm(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			after, err := repo.ResolveConnection(correctID)
+			if err != nil {
+				t.Fatalf("resolve confirmed connection: %v", err)
+			}
+			assertConfirmedSnapshotPreserved(t, before, after)
+			return nil
+		})
+	}); err != nil {
 		t.Fatal(err)
 	}
-	correct, err := repo.PrepareNodeContext(t.Context(), pendingTestOptions(2222))
-	if err != nil {
-		t.Fatal(err)
-	}
-	before, err := repo.ResolveConnection(correct.NodeID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := repo.ConfirmNodeContext(t.Context(), correct.NodeID); err != nil {
-		t.Fatal(err)
-	}
-	after, err := repo.ResolveConnection(correct.NodeID)
-	if err != nil {
-		t.Fatalf("resolve confirmed connection: %v", err)
-	}
-	assertConfirmedSnapshotPreserved(t, before, after)
 	disk, err := store.Load()
 	if err != nil {
 		t.Fatal(err)
@@ -75,9 +78,13 @@ func TestPreparedConnectionDoesNotPolluteSavedTargets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := reloaded.PrepareNodeContext(t.Context(), pendingTestOptions(0))
-	if err != nil || resolved.Created || resolved.NodeID != correct.NodeID {
-		t.Fatalf("omitted port after successful connection = %+v, %v", resolved, err)
+	if err := reloaded.WithPendingNode(t.Context(), pendingTestOptions(0), func(lease PendingLease) error {
+		if lease.NodeID() != correctID || reloaded.IsPendingNode(lease.NodeID()) {
+			t.Fatalf("omitted port after successful connection = %q pending=%v, want %q", lease.NodeID(), reloaded.IsPendingNode(lease.NodeID()), correctID)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -113,36 +120,37 @@ func assertPendingConnectionInvisible(t *testing.T, repo *Repository, store Stor
 
 func TestPreparedConnectionsKeepPortIdentitiesSeparate(t *testing.T) {
 	repo, _ := pendingDiskRepository(t)
-	first, err := repo.PrepareNodeContext(t.Context(), pendingTestOptions(22))
-	if err != nil {
-		t.Fatal(err)
-	}
-	repeated, err := repo.PrepareNodeContext(t.Context(), pendingTestOptions(22))
-	if err != nil || repeated.NodeID != first.NodeID {
-		t.Fatalf("repeat preparation: %+v, %v", repeated, err)
-	}
-	second, err := repo.PrepareNodeContext(t.Context(), pendingTestOptions(2222))
-	if err != nil {
-		t.Fatal(err)
-	}
-	firstNode, _, _, err := repo.Resolve(first.NodeID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	secondNode, _, _, err := repo.Resolve(second.NodeID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if firstNode.IdentityRef == secondNode.IdentityRef {
-		t.Fatal("independent pending ports share a credential identity")
-	}
-	for _, id := range []string{first.NodeID, second.NodeID} {
-		if err := repo.ConfirmNodeContext(t.Context(), id); err != nil {
+	if err := repo.WithPendingNode(t.Context(), pendingTestOptions(22), func(first PendingLease) error {
+		if err := repo.WithPendingNode(t.Context(), pendingTestOptions(22), func(repeated PendingLease) error {
+			if repeated.NodeID() != first.NodeID() {
+				t.Fatalf("repeat preparation: %q != %q", repeated.NodeID(), first.NodeID())
+			}
+			return nil
+		}); err != nil {
 			t.Fatal(err)
 		}
+		return repo.WithPendingNode(t.Context(), pendingTestOptions(2222), func(second PendingLease) error {
+			firstNode, _, _, err := repo.Resolve(first.NodeID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			secondNode, _, _, err := repo.Resolve(second.NodeID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if firstNode.IdentityRef == secondNode.IdentityRef {
+				t.Fatal("independent pending ports share a credential identity")
+			}
+			if err := first.Confirm(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			return second.Confirm(t.Context())
+		})
+	}); err != nil {
+		t.Fatal(err)
 	}
 	var ambiguous *AmbiguousNodeError
-	if _, err := repo.PrepareNodeContext(t.Context(), pendingTestOptions(0)); !errors.As(err, &ambiguous) {
+	if err := repo.WithPendingNode(t.Context(), pendingTestOptions(0), func(PendingLease) error { return nil }); !errors.As(err, &ambiguous) {
 		t.Fatalf("two saved ports must remain ambiguous: %v", err)
 	}
 }
@@ -156,12 +164,9 @@ func TestConfirmConnectionConcurrentIdempotence(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 8 {
 		wg.Go(func() {
-			prepared, err := repo.PrepareNodeContext(t.Context(), pendingTestOptions(2222))
-			if err != nil {
-				t.Error(err)
-				return
-			}
-			if err := repo.ConfirmNodeContext(t.Context(), prepared.NodeID); err != nil {
+			if err := repo.WithPendingNode(t.Context(), pendingTestOptions(2222), func(lease PendingLease) error {
+				return lease.Confirm(t.Context())
+			}); err != nil {
 				t.Error(err)
 			}
 		})
@@ -185,30 +190,34 @@ func TestConfirmConnectionSaveOutcomes(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			prepared, err := repo.PrepareNodeContext(t.Context(), pendingTestOptions(2222))
-			if err != nil || store.saves != 0 {
-				t.Fatalf("preparation attempted storage: %v", err)
-			}
-			if err := repo.ConfirmNodeContext(t.Context(), prepared.NodeID); !errors.Is(err, want) {
-				t.Fatalf("confirmation error = %v", err)
-			}
-			if _, exists := repo.GetNode(prepared.NodeID); exists != applied {
-				t.Fatalf("saved node exists = %v, applied = %v", exists, applied)
-			}
-			if _, err := repo.ResolveConnection(prepared.NodeID); err != nil {
-				t.Fatalf("failed confirmation lost connection: %v", err)
-			}
-			store.result = PersistResult{Applied: true, Durable: true}
-			store.err = nil
-			if err := repo.ConfirmNodeContext(t.Context(), prepared.NodeID); err != nil {
+			if err := repo.WithPendingNode(t.Context(), pendingTestOptions(2222), func(lease PendingLease) error {
+				if store.saves != 0 {
+					t.Fatal("preparation attempted storage")
+				}
+				if err := lease.Confirm(t.Context()); !errors.Is(err, want) {
+					t.Fatalf("confirmation error = %v", err)
+				}
+				if _, exists := repo.GetNode(lease.NodeID()); exists != applied {
+					t.Fatalf("saved node exists = %v, applied = %v", exists, applied)
+				}
+				if _, err := repo.ResolveConnection(lease.NodeID()); err != nil {
+					t.Fatalf("failed confirmation lost connection: %v", err)
+				}
+				store.result = PersistResult{Applied: true, Durable: true}
+				store.err = nil
+				if err := lease.Confirm(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				wantSaves := 2
+				if applied {
+					wantSaves = 1
+				}
+				if store.saves != wantSaves {
+					t.Fatalf("confirmation retried an applied write: saves = %d", store.saves)
+				}
+				return nil
+			}); err != nil {
 				t.Fatal(err)
-			}
-			wantSaves := 2
-			if applied {
-				wantSaves = 1
-			}
-			if store.saves != wantSaves {
-				t.Fatalf("confirmation retried an applied write: saves = %d", store.saves)
 			}
 		})
 	}
@@ -218,51 +227,53 @@ func TestConfirmConnectionRejectsConcurrentEdits(t *testing.T) {
 	for _, entity := range []string{"node", "host", "identity"} {
 		t.Run(entity, func(t *testing.T) {
 			repo, store := pendingDiskRepository(t)
-			prepared, err := repo.PrepareNodeContext(t.Context(), pendingTestOptions(2222))
-			if err != nil {
+			if err := repo.WithPendingNode(t.Context(), pendingTestOptions(2222), func(lease PendingLease) error {
+				nodeID := lease.NodeID()
+				node, host, identity, err := repo.Resolve(nodeID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				cfg, err := store.Load()
+				if err != nil {
+					t.Fatal(err)
+				}
+				switch entity {
+				case "node":
+					node.Tags = []string{"concurrent-edit"}
+					cfg.Nodes.Set(nodeID, node)
+					cfg.Hosts.Set(node.HostRef, host)
+					cfg.Identities.Set(node.IdentityRef, identity)
+				case "host":
+					host.Port = 2223
+					cfg.Hosts.Set(node.HostRef, host)
+				case "identity":
+					identity.User = "other-user"
+					cfg.Identities.Set(node.IdentityRef, identity)
+				}
+				if err := store.Save(cfg); err != nil {
+					t.Fatal(err)
+				}
+				if err := lease.Confirm(t.Context()); !errors.Is(err, ErrConfigConflict) {
+					t.Fatalf("concurrent %s edit was overwritten: %v", entity, err)
+				}
+				disk, err := store.Load()
+				if err != nil {
+					t.Fatal(err)
+				}
+				want, err := json.Marshal(cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := json.Marshal(disk)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(got) != string(want) {
+					t.Fatal("rejected confirmation changed disk configuration")
+				}
+				return nil
+			}); err != nil {
 				t.Fatal(err)
-			}
-			node, host, identity, err := repo.Resolve(prepared.NodeID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			cfg, err := store.Load()
-			if err != nil {
-				t.Fatal(err)
-			}
-			switch entity {
-			case "node":
-				node.Tags = []string{"concurrent-edit"}
-				cfg.Nodes.Set(prepared.NodeID, node)
-				cfg.Hosts.Set(node.HostRef, host)
-				cfg.Identities.Set(node.IdentityRef, identity)
-			case "host":
-				host.Port = 2223
-				cfg.Hosts.Set(node.HostRef, host)
-			case "identity":
-				identity.User = "other-user"
-				cfg.Identities.Set(node.IdentityRef, identity)
-			}
-			if err := store.Save(cfg); err != nil {
-				t.Fatal(err)
-			}
-			if err := repo.ConfirmNodeContext(t.Context(), prepared.NodeID); !errors.Is(err, ErrConfigConflict) {
-				t.Fatalf("concurrent %s edit was overwritten: %v", entity, err)
-			}
-			disk, err := store.Load()
-			if err != nil {
-				t.Fatal(err)
-			}
-			want, err := json.Marshal(cfg)
-			if err != nil {
-				t.Fatal(err)
-			}
-			got, err := json.Marshal(disk)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if string(got) != string(want) {
-				t.Fatal("rejected confirmation changed disk configuration")
 			}
 		})
 	}
@@ -272,18 +283,22 @@ func TestPrepareConnectionHonorsCancellation(t *testing.T) {
 	repo, _ := pendingDiskRepository(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	if _, err := repo.PrepareNodeContext(ctx, pendingTestOptions(22)); !errors.Is(err, context.Canceled) {
+	if err := repo.WithPendingNode(ctx, pendingTestOptions(22), func(PendingLease) error { return nil }); !errors.Is(err, context.Canceled) {
 		t.Fatalf("prepare canceled connection: %v", err)
 	}
-	prepared, err := repo.PrepareNodeContext(t.Context(), pendingTestOptions(22))
-	if err != nil {
+	if err := repo.WithPendingNode(t.Context(), pendingTestOptions(22), func(lease PendingLease) error {
+		if err := lease.Confirm(ctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("confirm canceled connection: %v", err)
+		}
+		return nil
+	}); err != nil {
 		t.Fatal(err)
-	}
-	if err := repo.ConfirmNodeContext(ctx, prepared.NodeID); !errors.Is(err, context.Canceled) {
-		t.Fatalf("confirm canceled connection: %v", err)
 	}
 	if len(repo.Snapshot().Nodes.Keys()) != 0 {
 		t.Fatal("canceled confirmation saved a node")
+	}
+	if n := pendingCount(repo); n != 0 {
+		t.Fatalf("canceled confirmation leaked %d pending entries", n)
 	}
 }
 
@@ -308,57 +323,52 @@ func TestL7_PendingConnectionDistinctOpenSSHAliases(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WithOpenSSHConfigOverride: %v", err)
 	}
-	preparer := provider.(interface {
-		PrepareNodeContext(context.Context, EnsureNodeOptions) (EnsureNodeResult, error)
-		PendingNodeExecution(string) (*ssh.ExecutionConfig, bool)
-		ConfirmNodeWithExecutionContext(context.Context, string, *ssh.ExecutionConfig) error
-	})
+	ovProv := provider.(*openSSHOverrideProvider)
+	underlyingRepo := ovProv.repo
 
-	resA, err := preparer.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+	if err := ovProv.WithPendingNode(t.Context(), EnsureNodeOptions{
 		Target: ConnectionTarget{Selector: "role-a", User: "ops", HasUser: true},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(role-a): %v", err)
-	}
-	resB, err := preparer.PrepareNodeContext(t.Context(), EnsureNodeOptions{
-		Target: ConnectionTarget{Selector: "role-b", User: "ops", HasUser: true},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(role-b): %v", err)
-	}
-	if resA.NodeID == resB.NodeID {
-		t.Fatalf("expected distinct pending NodeIDs for role-a and role-b, both got %q", resA.NodeID)
-	}
-	if _, _, identA, err := provider.Resolve(resA.NodeID); err != nil || !strings.HasSuffix(identA.KeyPath, "id_a") {
-		t.Fatalf("Resolve(role-a) = (%q, %v), want id_a", identA.KeyPath, err)
-	}
-	if _, _, identB, err := provider.Resolve(resB.NodeID); err != nil || !strings.HasSuffix(identB.KeyPath, "id_b") {
-		t.Fatalf("Resolve(role-b) = (%q, %v), want id_b", identB.KeyPath, err)
-	}
-	if _, pending := preparer.PendingNodeExecution(resA.NodeID); pending {
-		t.Fatalf("expected read-only override PendingNodeExecution(%q) to be false", resA.NodeID)
-	}
-	underlyingRepo := provider.(*openSSHOverrideProvider).repo
-	if _, pending := underlyingRepo.PendingNodeExecution(resA.NodeID); !pending {
-		t.Fatalf("expected underlying repo.PendingNodeExecution(%q) to be true", resA.NodeID)
-	}
-	if _, pending := underlyingRepo.PendingNodeExecution(resB.NodeID); pending {
-		t.Fatalf("expected underlying repo.PendingNodeExecution(%q) to be false for OpenSSH-prefixed disambiguated node", resB.NodeID)
-	}
-	if snapB, snapErr := underlyingRepo.ResolveConnection(resB.NodeID); snapErr != nil {
-		t.Fatalf("ResolveConnection(%q): %v", resB.NodeID, snapErr)
-	} else if snapB.UpdateRef != nil {
-		t.Fatalf("expected UpdateRef == nil for OpenSSH-prefixed disambiguated node %q, got %+v", resB.NodeID, snapB.UpdateRef)
-	}
-	if err := preparer.ConfirmNodeWithExecutionContext(t.Context(), resA.NodeID, nil); err != nil {
-		t.Fatalf("ConfirmNodeWithExecutionContext on read-only override provider failed: %v", err)
-	}
-	if err := repo.ConfirmNodeContext(t.Context(), resB.NodeID); err != nil {
-		t.Fatalf("ConfirmNodeContext(openssh altID) failed: %v", err)
+	}, func(leaseA PendingLease) error {
+		return ovProv.WithPendingNode(t.Context(), EnsureNodeOptions{
+			Target: ConnectionTarget{Selector: "role-b", User: "ops", HasUser: true},
+		}, func(leaseB PendingLease) error {
+			if leaseA.NodeID() == leaseB.NodeID() {
+				t.Fatalf("expected distinct pending NodeIDs for role-a and role-b, both got %q", leaseA.NodeID())
+			}
+			if _, _, identA, err := provider.Resolve(leaseA.NodeID()); err != nil || !strings.HasSuffix(identA.KeyPath, "id_a") {
+				t.Fatalf("Resolve(role-a) = (%q, %v), want id_a", identA.KeyPath, err)
+			}
+			if _, _, identB, err := provider.Resolve(leaseB.NodeID()); err != nil || !strings.HasSuffix(identB.KeyPath, "id_b") {
+				t.Fatalf("Resolve(role-b) = (%q, %v), want id_b", identB.KeyPath, err)
+			}
+			if _, pending := ovProv.PendingNodeExecution(leaseA.NodeID()); pending {
+				t.Fatalf("expected read-only override PendingNodeExecution(%q) to be false", leaseA.NodeID())
+			}
+			if _, pending := underlyingRepo.PendingNodeExecution(leaseA.NodeID()); !pending {
+				t.Fatalf("expected underlying repo.PendingNodeExecution(%q) to be true", leaseA.NodeID())
+			}
+			if _, pending := underlyingRepo.PendingNodeExecution(leaseB.NodeID()); pending {
+				t.Fatalf("expected underlying repo.PendingNodeExecution(%q) to be false for OpenSSH-prefixed disambiguated node", leaseB.NodeID())
+			}
+			if snapB, snapErr := underlyingRepo.ResolveConnection(leaseB.NodeID()); snapErr != nil {
+				t.Fatalf("ResolveConnection(%q): %v", leaseB.NodeID(), snapErr)
+			} else if snapB.UpdateRef != nil {
+				t.Fatalf("expected UpdateRef == nil for OpenSSH-prefixed disambiguated node %q, got %+v", leaseB.NodeID(), snapB.UpdateRef)
+			}
+			if err := leaseA.(PendingExecutionLease).ConfirmWithExecution(t.Context(), nil); err != nil {
+				t.Fatalf("ConfirmWithExecution on read-only override provider failed: %v", err)
+			}
+			if err := leaseB.Confirm(t.Context()); err != nil {
+				t.Fatalf("Confirm(openssh altID) failed: %v", err)
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("WithPendingNode: %v", err)
 	}
 	for _, id := range repo.Snapshot().Nodes.Keys() {
 		if strings.HasPrefix(id, OpenSSHNodePrefix) {
-			t.Fatalf("ConfirmNodeContext persisted OpenSSH virtual node ID %q into durable config", id)
+			t.Fatalf("Confirm persisted OpenSSH virtual node ID %q into durable config", id)
 		}
 	}
 }
@@ -386,20 +396,21 @@ func TestPendingConnection_ConcurrencyAndAliasIsolation(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		aliasRes, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+		if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
 			Target: ConnectionTarget{Selector: "app-alias", Port: 2222, HasPort: true},
-		})
-		if err != nil {
-			t.Fatalf("PrepareNodeContext(app-alias): %v", err)
-		}
-		if _, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
-			Target: ConnectionTarget{Selector: "10.99.0.10", User: "ops", HasUser: true, Port: 2222, HasPort: true},
-		}); !errors.Is(err, ErrConfigConflict) {
-			t.Fatalf("expected raw IP colliding with unconfirmed %s to fail closed with ErrConfigConflict, got %v", aliasRes.NodeID, err)
+		}, func(aliasLease PendingLease) error {
+			if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
+				Target: ConnectionTarget{Selector: "10.99.0.10", User: "ops", HasUser: true, Port: 2222, HasPort: true},
+			}, func(PendingLease) error { return nil }); !errors.Is(err, ErrConfigConflict) {
+				t.Fatalf("expected raw IP colliding with unconfirmed %s to fail closed with ErrConfigConflict, got %v", aliasLease.NodeID(), err)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("WithPendingNode(app-alias): %v", err)
 		}
 	})
 
-	t.Run("concurrent PrepareNodeContext upgrade and ConfirmNodeContext shares contextGate strictly", func(t *testing.T) {
+	t.Run("concurrent WithPendingNode upgrade and Confirm shares contextGate strictly", func(t *testing.T) {
 		var releaseSave = make(chan struct{})
 		var saveStarted = make(chan struct{})
 		var firstSaveDone atomic.Bool
@@ -425,57 +436,183 @@ func TestPendingConnection_ConcurrencyAndAliasIsolation(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		// Raw IP on port 2222 (differs from app-alias Port 2200) -> pending with empty OpenSSHAlias.
-		prep, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
+		var nodeID string
+		if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
 			Target: ConnectionTarget{Selector: "10.99.0.10", User: "ops", HasUser: true, Port: 2222, HasPort: true},
-		})
-		if err != nil {
+		}, func(leaseA PendingLease) error {
+			nodeID = leaseA.NodeID()
+			confirmADone := make(chan error, 1)
+			go func() {
+				confirmADone <- leaseA.Confirm(t.Context())
+			}()
+			<-saveStarted
+
+			// Upgrade the same NodeID to app-alias while Confirm A is blocked inside Store.save.
+			return repo.WithPendingNode(t.Context(), EnsureNodeOptions{
+				Target: ConnectionTarget{Selector: "app-alias", Port: 2222, HasPort: true},
+			}, func(leaseB PendingLease) error {
+				if leaseB.NodeID() != nodeID {
+					close(releaseSave)
+					t.Fatalf("upgraded NodeID = %q, want %q", leaseB.NodeID(), nodeID)
+				}
+				if gotAlias := repo.NodeOpenSSHAlias(nodeID); gotAlias != "app-alias" {
+					close(releaseSave)
+					t.Fatalf("NodeOpenSSHAlias after upgrade = %q, want app-alias", gotAlias)
+				}
+				confirmBDone := make(chan error, 1)
+				go func() {
+					confirmBDone <- leaseB.Confirm(t.Context())
+				}()
+				close(releaseSave)
+				if err := <-confirmADone; err != nil {
+					t.Fatalf("Confirm A: %v", err)
+				}
+				if err := <-confirmBDone; err != nil {
+					t.Fatalf("Confirm B: %v", err)
+				}
+				return nil
+			})
+		}); err != nil {
 			t.Fatal(err)
-		}
-
-		confirmADone := make(chan error, 1)
-		go func() {
-			confirmADone <- repo.ConfirmNodeContext(t.Context(), prep.NodeID)
-		}()
-		<-saveStarted
-
-		// Upgrade the same NodeID to app-alias while ConfirmNodeContext A is blocked inside Store.save.
-		upgraded, err := repo.PrepareNodeContext(t.Context(), EnsureNodeOptions{
-			Target: ConnectionTarget{Selector: "app-alias", Port: 2222, HasPort: true},
-		})
-		if err != nil {
-			close(releaseSave)
-			t.Fatalf("upgrade PrepareNodeContext(app-alias): %v", err)
-		}
-		if upgraded.NodeID != prep.NodeID {
-			close(releaseSave)
-			t.Fatalf("upgraded NodeID = %q, want %q", upgraded.NodeID, prep.NodeID)
-		}
-		if gotAlias := repo.NodeOpenSSHAlias(prep.NodeID); gotAlias != "app-alias" {
-			close(releaseSave)
-			t.Fatalf("NodeOpenSSHAlias after upgrade = %q, want app-alias", gotAlias)
-		}
-
-		// Confirm B must serialize behind Confirm A on the shared *contextGate (never entering save concurrently).
-		confirmBDone := make(chan error, 1)
-		go func() {
-			confirmBDone <- repo.ConfirmNodeContext(t.Context(), prep.NodeID)
-		}()
-
-		close(releaseSave)
-		if err := <-confirmADone; err != nil {
-			t.Fatalf("Confirm A: %v", err)
-		}
-		if err := <-confirmBDone; err != nil {
-			t.Fatalf("Confirm B: %v", err)
 		}
 		if maxConcurrent.Load() != 1 {
 			t.Fatalf("max concurrent Store saves = %d, want 1 (shared *contextGate violated)", maxConcurrent.Load())
 		}
-		if _, pending := repo.PendingNodeExecution(prep.NodeID); pending {
+		if _, pending := repo.PendingNodeExecution(nodeID); pending {
 			t.Fatal("pending entry remained after both confirmations finished")
 		}
 	})
+}
+
+func TestWithPendingNode_AutoDiscardsOnPanic(t *testing.T) {
+	repo, store := pendingDiskRepository(t)
+	var capturedID string
+	var panicked bool
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				panicked = true
+			}
+		}()
+		_ = repo.WithPendingNode(t.Context(), pendingTestOptions(2222), func(lease PendingLease) error {
+			capturedID = lease.NodeID()
+			if !repo.IsPendingNode(capturedID) {
+				t.Fatal("expected IsPendingNode=true inside callback")
+			}
+			panic("simulated dial panic")
+		})
+	}()
+	if !panicked {
+		t.Fatal("expected panic to propagate out of WithPendingNode")
+	}
+	if repo.IsPendingNode(capturedID) {
+		t.Fatalf("pending node %q leaked after panic", capturedID)
+	}
+	if disk, err := store.Load(); err != nil || disk.Nodes.Count() != 0 {
+		t.Fatalf("panic modified disk config: count=%d err=%v", disk.Nodes.Count(), err)
+	}
+}
+
+func TestWithPendingNode_StagedSavedNodeUpdates(t *testing.T) {
+	repo, store := pendingDiskRepository(t)
+	for _, n := range []struct {
+		id, hRef, idRef, addr string
+	}{
+		{"bastion", "h-b", "id-b", "10.0.0.1"},
+		{"web", "h-w", "id-w", "10.0.0.2"},
+	} {
+		if _, err := repo.CreateNodeContext(t.Context(), n.id,
+			models.Node{HostRef: n.hRef, IdentityRef: n.idRef},
+			models.Host{Address: n.addr, Port: 22},
+			models.Identity{User: "ops", AuthType: "auto"},
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("rejects_cyclic_proxyjump_pre_dial", func(t *testing.T) {
+		if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
+			Target:         ConnectionTarget{Selector: "web"},
+			ExistingUpdate: PendingNodeUpdate{Enabled: true, JumpHost: "web"},
+		}, func(PendingLease) error {
+			t.Fatal("callback should not run on cyclic ProxyJump staged update")
+			return nil
+		}); err == nil {
+			t.Fatal("expected self-jump staged update to fail validation")
+		}
+	})
+
+	t.Run("discards_staged_update_on_error_without_disk_write", func(t *testing.T) {
+		assertStagedUpdateDiscardsOnError(t, repo, store)
+	})
+
+	t.Run("persists_staged_update_atomically_on_confirm", func(t *testing.T) {
+		assertStagedUpdatePersistsOnConfirm(t, repo, store)
+	})
+}
+
+func assertStagedUpdateDiscardsOnError(t *testing.T, repo *Repository, store Store) {
+	t.Helper()
+	dialErr := errors.New("dial failed")
+	err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
+		Target: ConnectionTarget{Selector: "web"},
+		ExistingUpdate: PendingNodeUpdate{
+			Enabled: true, JumpHost: "bastion", Alias: "staged-web", Tags: []string{"prod"},
+		},
+	}, func(lease PendingLease) error {
+		if lease.NodeID() != "web" || !repo.IsPendingNode("web") {
+			t.Fatalf("expected staged update pending for web, got id=%q pending=%v", lease.NodeID(), repo.IsPendingNode("web"))
+		}
+		if _, isNewPending := repo.PendingNodeExecution("web"); isNewPending {
+			t.Fatal("staged update to saved node must not be treated as new enrollment target")
+		}
+		stagedNode, _, _, rErr := repo.Resolve("web")
+		if rErr != nil || stagedNode.ProxyJump != "bastion" {
+			t.Fatalf("Resolve(web) inside callback = (%+v, %v), want ProxyJump=bastion", stagedNode, rErr)
+		}
+		disk, dErr := store.Load()
+		if dErr != nil {
+			t.Fatal(dErr)
+		}
+		if savedNode, _ := disk.Nodes.Get("web"); savedNode.ProxyJump != "" {
+			t.Fatalf("pre-confirm staged update leaked to disk: ProxyJump=%q", savedNode.ProxyJump)
+		}
+		return dialErr
+	})
+	if !errors.Is(err, dialErr) {
+		t.Fatalf("got err=%v, want %v", err, dialErr)
+	}
+	if repo.IsPendingNode("web") {
+		t.Fatal("staged update leaked after failed callback")
+	}
+	if savedNode, _, _, _ := repo.Resolve("web"); savedNode.ProxyJump != "" || len(savedNode.Alias) != 0 {
+		t.Fatalf("unconfirmed staged update mutated saved node: %+v", savedNode)
+	}
+}
+
+func assertStagedUpdatePersistsOnConfirm(t *testing.T, repo *Repository, store Store) {
+	t.Helper()
+	if err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
+		Target: ConnectionTarget{Selector: "web"},
+		ExistingUpdate: PendingNodeUpdate{
+			Enabled: true, JumpHost: "bastion", Alias: "confirmed-web", Tags: []string{"prod"},
+		},
+	}, func(lease PendingLease) error {
+		return lease.Confirm(t.Context())
+	}); err != nil {
+		t.Fatalf("confirm staged update: %v", err)
+	}
+	if repo.IsPendingNode("web") {
+		t.Fatal("staged update remained pending after Confirm")
+	}
+	disk, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, _ := disk.Nodes.Get("web")
+	if persisted.ProxyJump != "bastion" || len(persisted.Alias) != 1 || persisted.Alias[0] != "confirmed-web" {
+		t.Fatalf("persisted node = %+v, want ProxyJump=bastion Alias=[confirmed-web]", persisted)
+	}
 }
 
 type blockingUpgradeStore struct {

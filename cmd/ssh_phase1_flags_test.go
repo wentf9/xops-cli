@@ -203,35 +203,38 @@ func TestPhase1Flags_ConfigOverrideAdHocSSHAndSCP(t *testing.T) {
 		t.Fatalf("WithOpenSSHConfigOverride(none) failed: %v", err)
 	}
 
-	// 1. ssh -F none ops@127.0.0.1 -> resolveNode -> GetConfig succeeds
+	// 1. ssh -F none ops@127.0.0.1 -> withTestPendingNode -> GetConfig succeeds
 	sshOpts := NewSshOptions()
 	sshOpts.Target = config.ConnectionTarget{Selector: "ops@127.0.0.1", User: "ops", HasUser: true}
-	nodeID, _, err := sshOpts.resolveNode(t.Context(), overrideProvider)
-	if err != nil {
-		t.Fatalf("ssh resolveNode with -F none failed: %v", err)
-	}
 	adp := adapter.NewSSHAdapter(overrideProvider)
-	clientCfg, err := adp.GetConfig(nodeID)
-	if err != nil {
-		t.Fatalf("GetConfig(%q) with -F none failed: %v", nodeID, err)
-	}
-	if clientCfg.Address != "127.0.0.1" || clientCfg.User != "ops" {
-		t.Fatalf("unexpected clientCfg: Address=%q User=%q", clientCfg.Address, clientCfg.User)
+	if err := sshOpts.withTestPendingNode(t.Context(), overrideProvider, func(lease config.PendingLease) error {
+		nodeID := lease.NodeID()
+		clientCfg, err := adp.GetConfig(nodeID)
+		if err != nil {
+			t.Fatalf("GetConfig(%q) with -F none failed: %v", nodeID, err)
+		}
+		if clientCfg.Address != "127.0.0.1" || clientCfg.User != "ops" {
+			t.Fatalf("unexpected clientCfg: Address=%q User=%q", clientCfg.Address, clientCfg.User)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("ssh withTestPendingNode with -F none failed: %v", err)
 	}
 
-	// 2. scp -F none ops@127.0.0.1:/tmp/a -> getOrCreateNodeForPath succeeds
+	// 2. scp -F none ops@127.0.0.1:/tmp/a -> withTestPendingPath succeeds
 	scpOpts := NewScpOptions()
-	scpNodeID, _, err := scpOpts.getOrCreateNodeForPath(t.Context(), overrideProvider, PathInfo{
+	if err := scpOpts.withTestPendingPath(t.Context(), overrideProvider, PathInfo{
 		IsRemote: true,
 		User:     "ops",
 		Host:     "127.0.0.1",
 		Path:     "/tmp/a",
-	}, "")
-	if err != nil {
-		t.Fatalf("scp getOrCreateNodeForPath with -F none failed: %v", err)
-	}
-	if _, err := adp.GetConfig(scpNodeID); err != nil {
-		t.Fatalf("scp GetConfig(%q) with -F none failed: %v", scpNodeID, err)
+	}, "", func(lease config.PendingLease) error {
+		if _, err := adp.GetConfig(lease.NodeID()); err != nil {
+			t.Fatalf("scp GetConfig(%q) with -F none failed: %v", lease.NodeID(), err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("scp withTestPendingPath with -F none failed: %v", err)
 	}
 	if len(baseRepo.ListNodes()) != 0 {
 		t.Fatalf("expected baseRepo to remain unmutated, got %d nodes", len(baseRepo.ListNodes()))
@@ -294,21 +297,23 @@ func TestPhase1Flags_IdentityPathPreservesTokensAndDeduplicates(t *testing.T) {
 	if err := ApplyGeneralOptions(opts, opts.control.Options, nil); err != nil {
 		t.Fatalf("ApplyGeneralOptions failed: %v", err)
 	}
-	nodeID, _, err := opts.resolveNode(t.Context(), provider)
-	if err != nil {
-		t.Fatalf("resolveNode failed: %v", err)
-	}
-	adpOpts, err := opts.buildAdapterOptions(nodeID, baseCfg, provider)
-	if err != nil {
-		t.Fatalf("buildAdapterOptions failed: %v", err)
-	}
-	clientCfg, err := adapter.NewSSHAdapter(provider, adpOpts...).GetConfig(nodeID)
-	if err != nil {
-		t.Fatalf("GetConfig failed: %v", err)
-	}
-	wd, _ := os.Getwd()
-	wantAbs := filepath.Join(wd, "rel_key")
-	if !slices.Equal(clientCfg.KeyPaths, []string{wantAbs}) {
-		t.Fatalf("KeyPaths = %v, want single deduplicated [%q]", clientCfg.KeyPaths, wantAbs)
+	if err := opts.withTestPendingNode(t.Context(), provider, func(lease config.PendingLease) error {
+		nodeID := lease.NodeID()
+		adpOpts, err := opts.buildAdapterOptions(nodeID, baseCfg, provider)
+		if err != nil {
+			t.Fatalf("buildAdapterOptions failed: %v", err)
+		}
+		clientCfg, err := adapter.NewSSHAdapter(provider, adpOpts...).GetConfig(nodeID)
+		if err != nil {
+			t.Fatalf("GetConfig failed: %v", err)
+		}
+		wd, _ := os.Getwd()
+		wantAbs := filepath.Join(wd, "rel_key")
+		if !slices.Equal(clientCfg.KeyPaths, []string{wantAbs}) {
+			t.Fatalf("KeyPaths = %v, want single deduplicated [%q]", clientCfg.KeyPaths, wantAbs)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withTestPendingNode failed: %v", err)
 	}
 }

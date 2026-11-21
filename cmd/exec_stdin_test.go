@@ -139,34 +139,36 @@ func TestExecNonExistingNodeNotPersisted(t *testing.T) {
 	o.Host = "non-existing-host-12345"
 	o.Command = "ls"
 
-	// 1. 调用 buildTasksFromHosts，这会在内存中临时注册该节点
-	tasks, _, err := o.buildTasksFromHosts(context.Background(), provider)
-	if err != nil {
-		t.Fatalf("expected buildTasksFromHosts to succeed, got: %v", err)
-	}
-	if len(tasks) != 1 {
-		t.Fatalf("expected 1 task, got %d", len(tasks))
-	}
-	nodeID := tasks[0].nodeID
+	// 1. 通过 WithPendingNode 在内存中临时注册该节点，直到 Confirm 后才落盘
+	var nodeID string
+	if err := o.withTestPendingHostTasks(context.Background(), provider, func(tasks []execHostTask, leases []config.PendingLease, _ []error) error {
+		if len(tasks) != 1 || len(leases) != 1 {
+			t.Fatalf("expected 1 task and lease, got %d/%d", len(tasks), len(leases))
+		}
+		nodeID = tasks[0].nodeID
 
-	// Preparation must be usable for connection but absent from saved assets.
-	if _, err := provider.ResolveConnection(nodeID); err != nil {
-		t.Fatalf("resolve pending connection: %v", err)
-	}
-	if _, ok := provider.GetNode(nodeID); ok {
-		t.Fatal("pending node was published before authentication")
+		// Preparation must be usable for connection but absent from saved assets.
+		if _, err := provider.ResolveConnection(nodeID); err != nil {
+			t.Fatalf("resolve pending connection: %v", err)
+		}
+		if _, ok := provider.GetNode(nodeID); ok {
+			t.Fatal("pending node was published before authentication")
+		}
+		disk, err := store.Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(disk.Nodes.Keys()) != 0 || len(disk.Hosts.Keys()) != 0 || len(disk.Identities.Keys()) != 0 {
+			t.Fatal("preparation persisted connection entities")
+		}
+		if err := leases[0].Confirm(t.Context()); err != nil {
+			t.Fatalf("confirm authenticated connection: %v", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("expected withTestPendingHostTasks to succeed, got: %v", err)
 	}
 	disk, err := store.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(disk.Nodes.Keys()) != 0 || len(disk.Hosts.Keys()) != 0 || len(disk.Identities.Keys()) != 0 {
-		t.Fatal("preparation persisted connection entities")
-	}
-	if err := provider.ConfirmNodeContext(t.Context(), nodeID); err != nil {
-		t.Fatalf("confirm authenticated connection: %v", err)
-	}
-	disk, err = store.Load()
 	if err != nil {
 		t.Fatal(err)
 	}

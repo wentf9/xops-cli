@@ -287,45 +287,43 @@ func TestPolicySolverSingleResolveConnectionPerGetConfig(t *testing.T) {
 	); err != nil {
 		t.Fatalf("CreateNodeContext: %v", err)
 	}
-	prepDerived, err := repo.PrepareNodeContext(t.Context(), config.EnsureNodeOptions{
+	if err := repo.WithPendingNode(t.Context(), config.EnsureNodeOptions{
 		Target: config.ConnectionTarget{Selector: "edge", User: "override", HasUser: true},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(derived): %v", err)
-	}
-	prepAdHoc, err := repo.PrepareNodeContext(t.Context(), config.EnsureNodeOptions{
-		Target: config.ConnectionTarget{Selector: "10.60.0.55", User: "adhoc", HasUser: true},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(adhoc): %v", err)
-	}
-
-	for _, tc := range []struct {
-		name     string
-		nodeID   string
-		wantOrig string
-		wantJump string
-	}{
-		{name: "saved", nodeID: "saved-node", wantOrig: "", wantJump: "jump-host"},
-		{name: "openssh_virtual", nodeID: "openssh:edge", wantOrig: "edge", wantJump: "openssh:jump-host"},
-		{name: "openssh_derived", nodeID: prepDerived.NodeID, wantOrig: "edge", wantJump: "openssh:jump-host"},
-		{name: "adhoc_pending", nodeID: prepAdHoc.NodeID, wantOrig: "", wantJump: ""},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			counting := &countingConfigProvider{ConfigProvider: repo}
-			adp := NewSSHAdapter(counting, WithLocalExecution(true))
-			cfg, err := adp.GetConfig(tc.nodeID)
-			if err != nil {
-				t.Fatalf("GetConfig(%q): %v", tc.nodeID, err)
+	}, func(derivedLease config.PendingLease) error {
+		return repo.WithPendingNode(t.Context(), config.EnsureNodeOptions{
+			Target: config.ConnectionTarget{Selector: "10.60.0.55", User: "adhoc", HasUser: true},
+		}, func(adHocLease config.PendingLease) error {
+			for _, tc := range []struct {
+				name     string
+				nodeID   string
+				wantOrig string
+				wantJump string
+			}{
+				{name: "saved", nodeID: "saved-node", wantOrig: "", wantJump: "jump-host"},
+				{name: "openssh_virtual", nodeID: "openssh:edge", wantOrig: "edge", wantJump: "openssh:jump-host"},
+				{name: "openssh_derived", nodeID: derivedLease.NodeID(), wantOrig: "edge", wantJump: "openssh:jump-host"},
+				{name: "adhoc_pending", nodeID: adHocLease.NodeID(), wantOrig: "", wantJump: ""},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					counting := &countingConfigProvider{ConfigProvider: repo}
+					adp := NewSSHAdapter(counting, WithLocalExecution(true))
+					cfg, err := adp.GetConfig(tc.nodeID)
+					if err != nil {
+						t.Fatalf("GetConfig(%q): %v", tc.nodeID, err)
+					}
+					if got := counting.resolveCalls.Load(); got != 1 {
+						t.Fatalf("GetConfig(%q) invoked ResolveConnection %d times, want 1", tc.nodeID, got)
+					}
+					if cfg.OriginalHost != tc.wantOrig || cfg.ProxyJump != tc.wantJump {
+						t.Errorf("cfg = (OriginalHost=%q, ProxyJump=%q), want (%q, %q)",
+							cfg.OriginalHost, cfg.ProxyJump, tc.wantOrig, tc.wantJump)
+					}
+				})
 			}
-			if got := counting.resolveCalls.Load(); got != 1 {
-				t.Fatalf("GetConfig(%q) invoked ResolveConnection %d times, want 1", tc.nodeID, got)
-			}
-			if cfg.OriginalHost != tc.wantOrig || cfg.ProxyJump != tc.wantJump {
-				t.Errorf("cfg = (OriginalHost=%q, ProxyJump=%q), want (%q, %q)",
-					cfg.OriginalHost, cfg.ProxyJump, tc.wantOrig, tc.wantJump)
-			}
+			return nil
 		})
+	}); err != nil {
+		t.Fatalf("WithPendingNode: %v", err)
 	}
 }
 
@@ -367,20 +365,21 @@ func TestPolicySolver_Round2CanonicalAndControlInvariants(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		prep, err := repo.PrepareNodeContext(t.Context(), config.EnsureNodeOptions{
+		if err := repo.WithPendingNode(t.Context(), config.EnsureNodeOptions{
 			Target: config.ConnectionTarget{Selector: "prod-db", Port: 2222, HasPort: true},
-		})
-		if err != nil {
-			t.Fatalf("PrepareNodeContext: %v", err)
-		}
-		adp := NewSSHAdapter(repo, WithLocalExecution(true))
-		cfg, err := adp.GetConfig(prep.NodeID)
-		if err != nil {
-			t.Fatalf("GetConfig: %v", err)
-		}
-		if cfg.Options != nil && (cfg.Options.Get(ssh.OptionForwardAgent) != "" || cfg.Options.Get(ssh.OptionRemoteCommand) != "") {
-			t.Fatalf("non-canonicalized prod-db falsely matched Host 10.20.*: ForwardAgent=%q RemoteCommand=%q",
-				cfg.Options.Get(ssh.OptionForwardAgent), cfg.Options.Get(ssh.OptionRemoteCommand))
+		}, func(lease config.PendingLease) error {
+			adp := NewSSHAdapter(repo, WithLocalExecution(true))
+			cfg, err := adp.GetConfig(lease.NodeID())
+			if err != nil {
+				t.Fatalf("GetConfig: %v", err)
+			}
+			if cfg.Options != nil && (cfg.Options.Get(ssh.OptionForwardAgent) != "" || cfg.Options.Get(ssh.OptionRemoteCommand) != "") {
+				t.Fatalf("non-canonicalized prod-db falsely matched Host 10.20.*: ForwardAgent=%q RemoteCommand=%q",
+					cfg.Options.Get(ssh.OptionForwardAgent), cfg.Options.Get(ssh.OptionRemoteCommand))
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("WithPendingNode: %v", err)
 		}
 	})
 
@@ -408,27 +407,28 @@ func TestPolicySolver_Round2CanonicalAndControlInvariants(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		prep, err := repo.PrepareNodeContext(t.Context(), config.EnsureNodeOptions{
+		if err := repo.WithPendingNode(t.Context(), config.EnsureNodeOptions{
 			Target: config.ConnectionTarget{
 				Selector:     "short.corp.example.com",
 				OriginalHost: "short",
 				Port:         2222,
 				HasPort:      true,
 			},
-		})
-		if err != nil {
-			t.Fatalf("PrepareNodeContext: %v", err)
-		}
-		adp := NewSSHAdapter(repo, WithLocalExecution(true))
-		cfg, err := adp.GetConfig(prep.NodeID)
-		if err != nil {
-			t.Fatalf("GetConfig: %v", err)
-		}
-		if cfg.Address != "10.20.0.5" || cfg.Options == nil || cfg.Options.Get(ssh.OptionConnectTimeout) != "7" {
-			t.Fatalf("canonical Pass 2 options wrong: addr=%q opts=%+v", cfg.Address, cfg.Options)
-		}
-		if cfg.Options.Get(ssh.OptionForwardAgent) != "" {
-			t.Fatalf("canonicalized short.corp.example.com falsely matched Host 10.20.*: %q", cfg.Options.Get(ssh.OptionForwardAgent))
+		}, func(lease config.PendingLease) error {
+			adp := NewSSHAdapter(repo, WithLocalExecution(true))
+			cfg, err := adp.GetConfig(lease.NodeID())
+			if err != nil {
+				t.Fatalf("GetConfig: %v", err)
+			}
+			if cfg.Address != "10.20.0.5" || cfg.Options == nil || cfg.Options.Get(ssh.OptionConnectTimeout) != "7" {
+				t.Fatalf("canonical Pass 2 options wrong: addr=%q opts=%+v", cfg.Address, cfg.Options)
+			}
+			if cfg.Options.Get(ssh.OptionForwardAgent) != "" {
+				t.Fatalf("canonicalized short.corp.example.com falsely matched Host 10.20.*: %q", cfg.Options.Get(ssh.OptionForwardAgent))
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("WithPendingNode: %v", err)
 		}
 	})
 

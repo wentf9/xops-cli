@@ -9,6 +9,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/adapter"
+	"github.com/wentf9/xops-cli/pkg/config"
 )
 
 type p2OptionSample struct {
@@ -330,31 +331,33 @@ func resolveP2ParentAndDaemonChild(
 	if err := parentOpts.Validate(); err != nil {
 		t.Fatalf("parent Validate(%v): %v", cliArgs, err)
 	}
-	parentNodeID, _, err := parentOpts.resolveNode(ctx, parentRepo)
-	if err != nil {
-		t.Fatalf("parent resolveNode: %v", err)
+	var spec MuxDaemonSpec
+	if err := parentOpts.withTestPendingNode(ctx, parentRepo, func(lease config.PendingLease) error {
+		parentNodeID := lease.NodeID()
+		parentAdpOpts, err := parentOpts.buildAdapterOptions(parentNodeID, parentRepo.Snapshot(), parentRepo)
+		if err != nil {
+			t.Fatalf("parent buildAdapterOptions: %v", err)
+		}
+		parentAdp := adapter.NewSSHAdapter(parentRepo, parentAdpOpts...)
+		parentCfg, err = parentAdp.GetConfig(parentNodeID)
+		if err != nil {
+			t.Fatalf("parent GetConfig(%q): %v", parentNodeID, err)
+		}
+		parentCtrl, err := parentOpts.toSessionControlOptions()
+		if err != nil {
+			t.Fatalf("parent toSessionControlOptions: %v", err)
+		}
+		parentPol, err := parentAdp.Resolve(ctx, adapter.ResolveRequest{NodeID: parentNodeID, SessionControl: &parentCtrl})
+		if err != nil {
+			t.Fatalf("parent Resolve(%q): %v", parentNodeID, err)
+		}
+		parentEff = parentPol.Options()
+		sockPath := filepath.Join(t.TempDir(), "p2-rt.sock")
+		spec = parentOpts.buildMuxDaemonSpecWithProvider(parentRepo, parentNodeID, sockPath, nil)
+		return nil
+	}); err != nil {
+		t.Fatalf("parent withTestPendingNode: %v", err)
 	}
-	parentAdpOpts, err := parentOpts.buildAdapterOptions(parentNodeID, parentRepo.Snapshot(), parentRepo)
-	if err != nil {
-		t.Fatalf("parent buildAdapterOptions: %v", err)
-	}
-	parentAdp := adapter.NewSSHAdapter(parentRepo, parentAdpOpts...)
-	parentCfg, err = parentAdp.GetConfig(parentNodeID)
-	if err != nil {
-		t.Fatalf("parent GetConfig(%q): %v", parentNodeID, err)
-	}
-	parentCtrl, err := parentOpts.toSessionControlOptions()
-	if err != nil {
-		t.Fatalf("parent toSessionControlOptions: %v", err)
-	}
-	parentPol, err := parentAdp.Resolve(ctx, adapter.ResolveRequest{NodeID: parentNodeID, SessionControl: &parentCtrl})
-	if err != nil {
-		t.Fatalf("parent Resolve(%q): %v", parentNodeID, err)
-	}
-	parentEff = parentPol.Options()
-
-	sockPath := filepath.Join(t.TempDir(), "p2-rt.sock")
-	spec := parentOpts.buildMuxDaemonSpecWithProvider(parentRepo, parentNodeID, sockPath, nil)
 	decoded = roundTripMuxDaemonSpecThroughPipe(t, spec)
 
 	childRepo := buildPass6Repo(t, sshConfigText)
@@ -365,28 +368,30 @@ func resolveP2ParentAndDaemonChild(
 	if err := childOpts.Validate(); err != nil {
 		t.Fatalf("child Validate: %v", err)
 	}
-	childNodeID, _, err := childOpts.resolveNode(ctx, childRepo)
-	if err != nil {
-		t.Fatalf("child resolveNode: %v", err)
+	if err := childOpts.withTestPendingNode(ctx, childRepo, func(lease config.PendingLease) error {
+		childNodeID := lease.NodeID()
+		childAdpOpts, err := childOpts.buildAdapterOptions(childNodeID, childRepo.Snapshot(), childRepo)
+		if err != nil {
+			t.Fatalf("child buildAdapterOptions: %v", err)
+		}
+		childAdp := adapter.NewSSHAdapter(childRepo, childAdpOpts...)
+		childCfg, err = childAdp.GetConfig(childNodeID)
+		if err != nil {
+			t.Fatalf("child GetConfig(%q): %v", childNodeID, err)
+		}
+		childCtrl, err := childOpts.toSessionControlOptions()
+		if err != nil {
+			t.Fatalf("child toSessionControlOptions: %v", err)
+		}
+		childPol, err := childAdp.Resolve(ctx, adapter.ResolveRequest{NodeID: childNodeID, SessionControl: &childCtrl})
+		if err != nil {
+			t.Fatalf("child Resolve(%q): %v", childNodeID, err)
+		}
+		childEff = childPol.Options()
+		return nil
+	}); err != nil {
+		t.Fatalf("child withTestPendingNode: %v", err)
 	}
-	childAdpOpts, err := childOpts.buildAdapterOptions(childNodeID, childRepo.Snapshot(), childRepo)
-	if err != nil {
-		t.Fatalf("child buildAdapterOptions: %v", err)
-	}
-	childAdp := adapter.NewSSHAdapter(childRepo, childAdpOpts...)
-	childCfg, err = childAdp.GetConfig(childNodeID)
-	if err != nil {
-		t.Fatalf("child GetConfig(%q): %v", childNodeID, err)
-	}
-	childCtrl, err := childOpts.toSessionControlOptions()
-	if err != nil {
-		t.Fatalf("child toSessionControlOptions: %v", err)
-	}
-	childPol, err := childAdp.Resolve(ctx, adapter.ResolveRequest{NodeID: childNodeID, SessionControl: &childCtrl})
-	if err != nil {
-		t.Fatalf("child Resolve(%q): %v", childNodeID, err)
-	}
-	childEff = childPol.Options()
 	return parentCfg, childCfg, parentEff, childEff, childOpts, decoded
 }
 

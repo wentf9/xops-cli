@@ -1,7 +1,6 @@
 package adapter
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -62,42 +61,38 @@ func TestH6_DisambiguatedOpenSSHPendingNodePreservesOptionsAndIdentity(t *testin
 		t.Fatalf("WithOpenSSHConfigOverride: %v", err)
 	}
 
-	preparer := provider.(interface {
-		PrepareNodeContext(context.Context, config.EnsureNodeOptions) (config.EnsureNodeResult, error)
-	})
-	resA, err := preparer.PrepareNodeContext(t.Context(), config.EnsureNodeOptions{
+	if err := config.WithPendingNode(t.Context(), provider, config.EnsureNodeOptions{
 		Target: config.ConnectionTarget{Selector: "role-a", User: "ops", HasUser: true},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(role-a): %v", err)
-	}
-	resB, err := preparer.PrepareNodeContext(t.Context(), config.EnsureNodeOptions{
-		Target: config.ConnectionTarget{Selector: "role-b", User: "ops", HasUser: true},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(role-b): %v", err)
-	}
-	if !strings.HasPrefix(resB.NodeID, config.OpenSSHNodePrefix) {
-		t.Fatalf("expected disambiguated OpenSSH nodeID for role-b, got %q", resB.NodeID)
-	}
+	}, func(leaseA config.PendingLease) error {
+		return config.WithPendingNode(t.Context(), provider, config.EnsureNodeOptions{
+			Target: config.ConnectionTarget{Selector: "role-b", User: "ops", HasUser: true},
+		}, func(leaseB config.PendingLease) error {
+			resAID := leaseA.NodeID()
+			resBID := leaseB.NodeID()
+			if !strings.HasPrefix(resBID, config.OpenSSHNodePrefix) {
+				t.Fatalf("expected disambiguated OpenSSH nodeID for role-b, got %q", resBID)
+			}
 
-	// Repository.ResolveConnection and PendingNodeExecution must treat disambiguated
-	// openssh: nodes as session-ephemeral (UpdateRef == nil, PendingNodeExecution == false).
-	underlying := config.NewProviderWithoutOpenSSH(nil)
-	_ = underlying
-	if snapB, snapErr := provider.ResolveConnection(resB.NodeID); snapErr != nil {
-		t.Fatalf("ResolveConnection(role-b): %v", snapErr)
-	} else if snapB.UpdateRef != nil {
-		t.Fatalf("expected UpdateRef == nil for %q, got %+v", resB.NodeID, snapB.UpdateRef)
+			// Repository.ResolveConnection and PendingNodeExecution must treat disambiguated
+			// openssh: nodes as session-ephemeral (UpdateRef == nil, PendingNodeExecution == false).
+			if snapB, snapErr := provider.ResolveConnection(resBID); snapErr != nil {
+				t.Fatalf("ResolveConnection(role-b): %v", snapErr)
+			} else if snapB.UpdateRef != nil {
+				t.Fatalf("expected UpdateRef == nil for %q, got %+v", resBID, snapB.UpdateRef)
+			}
+
+			adp := NewSSHAdapter(provider,
+				WithLocalExecution(true),
+				WithSessionAuthOverride(resAID, SessionAuth{KeyPaths: []string{extraKey}}),
+				WithSessionAuthOverride(resBID, SessionAuth{KeyPaths: []string{extraKey}}),
+			)
+
+			verifyDisambiguatedRoleB(t, adp, resBID, extraKey, keyB, cmPathB)
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("WithPendingNode: %v", err)
 	}
-
-	adp := NewSSHAdapter(provider,
-		WithLocalExecution(true),
-		WithSessionAuthOverride(resA.NodeID, SessionAuth{KeyPaths: []string{extraKey}}),
-		WithSessionAuthOverride(resB.NodeID, SessionAuth{KeyPaths: []string{extraKey}}),
-	)
-
-	verifyDisambiguatedRoleB(t, adp, resB.NodeID, extraKey, keyB, cmPathB)
 
 	// Without Tier-3 global ProxyCommand, collided role-b retains Tier-4 ProxyJump.
 	cfgNoProxy := config.NewProviderWithoutOpenSSH(nil).Snapshot()
@@ -109,27 +104,24 @@ func TestH6_DisambiguatedOpenSSHPendingNodePreservesOptionsAndIdentity(t *testin
 	if err != nil {
 		t.Fatalf("WithOpenSSHConfigOverride(no-proxy): %v", err)
 	}
-	prepNoProxy := provNoProxy.(interface {
-		PrepareNodeContext(context.Context, config.EnsureNodeOptions) (config.EnsureNodeResult, error)
-	})
-	if _, err := prepNoProxy.PrepareNodeContext(t.Context(), config.EnsureNodeOptions{
+	if err := config.WithPendingNode(t.Context(), provNoProxy, config.EnsureNodeOptions{
 		Target: config.ConnectionTarget{Selector: "role-a", User: "ops", HasUser: true},
+	}, func(config.PendingLease) error {
+		return config.WithPendingNode(t.Context(), provNoProxy, config.EnsureNodeOptions{
+			Target: config.ConnectionTarget{Selector: "role-b", User: "ops", HasUser: true},
+		}, func(leaseBNoProxy config.PendingLease) error {
+			adpNoProxy := NewSSHAdapter(provNoProxy, WithLocalExecution(true))
+			cfgBNoProxy, err := adpNoProxy.GetConfig(leaseBNoProxy.NodeID())
+			if err != nil {
+				t.Fatalf("GetConfig(role-b, no-proxy): %v", err)
+			}
+			if cfgBNoProxy.ProxyJump != "openssh:bastion.example.com" {
+				t.Fatalf("role-b (no Tier-3 ProxyCommand) ProxyJump = %q, want openssh:bastion.example.com", cfgBNoProxy.ProxyJump)
+			}
+			return nil
+		})
 	}); err != nil {
-		t.Fatalf("PrepareNodeContext(role-a, no-proxy): %v", err)
-	}
-	resBNoProxy, err := prepNoProxy.PrepareNodeContext(t.Context(), config.EnsureNodeOptions{
-		Target: config.ConnectionTarget{Selector: "role-b", User: "ops", HasUser: true},
-	})
-	if err != nil {
-		t.Fatalf("PrepareNodeContext(role-b, no-proxy): %v", err)
-	}
-	adpNoProxy := NewSSHAdapter(provNoProxy, WithLocalExecution(true))
-	cfgBNoProxy, err := adpNoProxy.GetConfig(resBNoProxy.NodeID)
-	if err != nil {
-		t.Fatalf("GetConfig(role-b, no-proxy): %v", err)
-	}
-	if cfgBNoProxy.ProxyJump != "openssh:bastion.example.com" {
-		t.Fatalf("role-b (no Tier-3 ProxyCommand) ProxyJump = %q, want openssh:bastion.example.com", cfgBNoProxy.ProxyJump)
+		t.Fatalf("WithPendingNode(no-proxy): %v", err)
 	}
 }
 

@@ -11,7 +11,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -453,26 +452,25 @@ func (o *ExecOptions) validateInteractiveOptions() error {
 }
 
 type execHostTask struct {
-	nodeID         string
-	matchedNodeID  string
-	baseNodeID     string
-	openSSHAlias   string
-	canonicalHost  string
-	resolvedHost   string
-	rawHost        string
-	host           string
-	originalHost   string
-	expandHost     string
-	port           uint16
-	user           string
-	pass           string
-	passphrase     string
-	keyPath        string
-	pendingTarget  *config.ConnectionTarget
-	pendingAddr    *utils.HostInfo
-	pendingCreated bool
-	isTaggedTask   bool
-	outLogName     string
+	nodeID        string
+	matchedNodeID string
+	baseNodeID    string
+	openSSHAlias  string
+	canonicalHost string
+	resolvedHost  string
+	rawHost       string
+	host          string
+	originalHost  string
+	expandHost    string
+	port          uint16
+	user          string
+	pass          string
+	passphrase    string
+	keyPath       string
+	pendingTarget *config.ConnectionTarget
+	pendingAddr   *utils.HostInfo
+	isTaggedTask  bool
+	outLogName    string
 }
 
 func (o *ExecOptions) Run() error {
@@ -586,89 +584,74 @@ func (o *ExecOptions) runWithProvider(ctx context.Context, cfg *config.Configura
 		return fmt.Errorf("%s", i18n.T("err_no_nodes_found"))
 	}
 
-	var matErrs []error
-	var matErr error
-	tasks, matErrs, matErr = o.materializeExecTasks(ctx, provider, tasks)
-	if matErr != nil {
-		return matErr
-	}
-	confirmedTasks := make([]atomic.Bool, len(tasks))
-	defer func() {
-		for i, t := range tasks {
-			if t.pendingCreated && !confirmedTasks[i].Load() {
-				discardPendingNode(provider, t.nodeID)
+	return o.withPendingExecTasks(ctx, provider, tasks, func(tasks []execHostTask, leases []config.PendingLease, matErrs []error) (innerErr error) {
+		hostErrs = append(hostErrs, matErrs...)
+		if len(tasks) == 0 {
+			if len(hostErrs) > 0 {
+				return errors.Join(hostErrs...)
 			}
+			return fmt.Errorf("%s", i18n.T("err_no_nodes_found"))
 		}
-	}()
-	hostErrs = append(hostErrs, matErrs...)
-	if len(tasks) == 0 {
-		if len(hostErrs) > 0 {
-			return errors.Join(hostErrs...)
+
+		adpOpts, optErr := o.buildAdapterOptions(tasks, cfg, provider)
+		if optErr != nil {
+			return optErr
 		}
-		return fmt.Errorf("%s", i18n.T("err_no_nodes_found"))
-	}
-
-	adpOpts, optErr := o.buildAdapterOptions(tasks, cfg, provider)
-	if optErr != nil {
-		return optErr
-	}
-	var connector *ssh.Connector
-	if o.Interactive {
-		connector = newCLIConnectorWithAdapterOptions(provider, o.interaction, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
-	} else {
-		connector = newNonInteractiveConnector(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
-	}
-	defer func() {
-		if handoffErr := o.handoffConnectorMasters(ctx, provider, connector); handoffErr != nil {
-			logger.DefaultLogger().Debugf("mux: master handoff failed: %v", handoffErr)
+		var (
+			connector *ssh.Connector
+			adp       *adapter.SSHAdapter
+		)
+		if o.Interactive {
+			connector, adp = newCLIConnectorAndAdapter(provider, o.interaction, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
+		} else {
+			connector, adp = newNonInteractiveConnectorAndAdapter(provider, adpOpts, ssh.WithLogger(logger.DefaultLogger()))
 		}
-		joinConnectorCloseError(&retErr, connector)
-	}()
-
-	confirmSuppressed := o.isExecNodeConfirmationSuppressed(cfg, provider)
-
-	// 交互模式：单主机 PTY 执行
-	if o.Interactive {
-		return o.runInteractiveWithConfirm(ctx, connector, tasks[0], execCmd, func() {
-			if !confirmSuppressed {
-				confirmedTasks[0].Store(true)
+		defer func() {
+			if handoffErr := o.handoffConnectorMasters(ctx, provider, connector); handoffErr != nil {
+				logger.DefaultLogger().Debugf("mux: master handoff failed: %v", handoffErr)
 			}
-		})
-	}
+			joinConnectorCloseError(&innerErr, connector)
+		}()
 
-	// 落盘模式：在 Worker Pool 启动前一次性创建目录并分配无冲突日志文件名
-	if o.OutDir != "" {
-		if err := os.MkdirAll(o.OutDir, 0750); err != nil {
-			return fmt.Errorf("failed to create output directory %s: %w", o.OutDir, err)
+		// 交互模式：单主机 PTY 执行
+		if o.Interactive {
+			return o.runInteractiveWithLease(ctx, connector, adp, tasks[0], leases[0], execCmd)
 		}
-		assignExecTaskLogNames(tasks)
-	}
 
-	// 流式模式下多个 goroutine 共享 os.Stdout，需要用 lockedWriter 保证写入原子性
-	var stdoutMu sync.Mutex
-	var errMu sync.Mutex
-	var taskErrs []error
-
-	// 批量模式：原有逻辑
-	if o.TaskCount < 0 || o.TaskCount > maxBatchTaskCount {
-		return fmt.Errorf("invalid --task value %d: must be between 1 and %d", o.TaskCount, maxBatchTaskCount)
-	}
-	wp := pkgutils.NewWorkerPool(uint(o.TaskCount))
-	for _, task := range tasks {
-		t := task // capture range variable
-		wp.Execute(func() {
-			if taskErr := o.executeTask(ctx, connector, t, execCmd, isScript, len(tasks), &stdoutMu); taskErr != nil {
-				errMu.Lock()
-				taskErrs = append(taskErrs, taskErr)
-				errMu.Unlock()
+		// 落盘模式：在 Worker Pool 启动前一次性创建目录并分配无冲突日志文件名
+		if o.OutDir != "" {
+			if err := os.MkdirAll(o.OutDir, 0750); err != nil {
+				return fmt.Errorf("failed to create output directory %s: %w", o.OutDir, err)
 			}
-		})
-	}
+			assignExecTaskLogNames(tasks)
+		}
 
-	wp.Wait()
+		// 流式模式下多个 goroutine 共享 os.Stdout，需要用 lockedWriter 保证写入原子性
+		var stdoutMu sync.Mutex
+		var errMu sync.Mutex
+		var taskErrs []error
 
-	allErrs := append(taskErrs, hostErrs...)
-	return errors.Join(allErrs...)
+		// 批量模式：原有逻辑
+		if o.TaskCount < 0 || o.TaskCount > maxBatchTaskCount {
+			return fmt.Errorf("invalid --task value %d: must be between 1 and %d", o.TaskCount, maxBatchTaskCount)
+		}
+		wp := pkgutils.NewWorkerPool(uint(o.TaskCount))
+		for _, task := range tasks {
+			t := task // capture range variable
+			wp.Execute(func() {
+				if taskErr := o.executeTask(ctx, connector, t, execCmd, isScript, len(tasks), &stdoutMu); taskErr != nil {
+					errMu.Lock()
+					taskErrs = append(taskErrs, taskErr)
+					errMu.Unlock()
+				}
+			})
+		}
+
+		wp.Wait()
+
+		allErrs := append(taskErrs, hostErrs...)
+		return errors.Join(allErrs...)
+	})
 }
 
 func (o *ExecOptions) runInteractive(
@@ -677,15 +660,16 @@ func (o *ExecOptions) runInteractive(
 	task execHostTask,
 	cmd string,
 ) (retErr error) {
-	return o.runInteractiveWithConfirm(ctx, connector, task, cmd, nil)
+	return o.runInteractiveWithLease(ctx, connector, nil, task, nil, cmd)
 }
 
-func (o *ExecOptions) runInteractiveWithConfirm(
+func (o *ExecOptions) runInteractiveWithLease(
 	ctx context.Context,
 	connector *ssh.Connector,
+	adp *adapter.SSHAdapter,
 	task execHostTask,
+	lease config.PendingLease,
 	cmd string,
-	onConnected func(),
 ) (retErr error) {
 	if o.commandPlan != nil && o.commandPlan.Command() != cmd {
 		return fmt.Errorf("[%s] command changed after execution planning", task.host)
@@ -694,8 +678,11 @@ func (o *ExecOptions) runInteractiveWithConfirm(
 	if err != nil {
 		return fmt.Errorf("[%s] %s: %w", task.host, i18n.T("fw_connect_failed"), err)
 	}
-	if onConnected != nil {
-		onConnected()
+	if adp != nil && lease != nil {
+		if finalizeErr := adp.FinalizePendingConnection(ctx, lease, client); finalizeErr != nil {
+			_ = connector.EvictClient(client)
+			return fmt.Errorf("[%s] %s: %w", task.host, i18n.T("fw_connect_failed"), finalizeErr)
+		}
 	}
 	defer func() {
 		if closeErr := client.Close(); closeErr != nil {
@@ -883,26 +870,8 @@ func (o *ExecOptions) shouldRememberCredential(target string, cfg *config.Config
 	return utils.ShouldRememberConfiguredCredential(utils.EffectiveRememberPolicy(o.Remember, cfg), target, cfg)
 }
 
-func (o *ExecOptions) getOrCreateNode(ctx context.Context, provider config.ConfigProvider, target config.ConnectionTarget, addr utils.HostInfo) (string, bool, error) {
-	nodeID, _, mutated, err := o.getOrCreateNodeWithPending(ctx, provider, target, addr)
-	return nodeID, mutated, err
-}
-
-func (o *ExecOptions) getOrCreateNodeWithPending(ctx context.Context, provider config.ConfigProvider, target config.ConnectionTarget, addr utils.HostInfo) (string, bool, bool, error) {
+func (o *ExecOptions) buildExecEnsureOptions(provider config.ConfigProvider, target config.ConnectionTarget, addr utils.HostInfo) config.EnsureNodeOptions {
 	o.syncIdentityFiles()
-	preparer, isPreparer := provider.(interface {
-		PrepareNodeContext(context.Context, config.EnsureNodeOptions) (config.EnsureNodeResult, error)
-	})
-	if !isPreparer {
-		resolved, err := config.ResolveTarget(provider, target)
-		if err != nil {
-			return "", false, false, err
-		}
-		if resolved.MatchedNodeID != "" {
-			return resolved.MatchedNodeID, false, false, nil
-		}
-		return resolved.NodeID, false, false, nil
-	}
 	identityFile := addr.KeyPath
 	if identityFile == "" {
 		identityFile = o.IdentityFile
@@ -911,12 +880,19 @@ func (o *ExecOptions) getOrCreateNodeWithPending(ctx context.Context, provider c
 	if alias == "" {
 		alias = o.Alias
 	}
-
 	sudoMode := models.SudoModeAuto
+	updateSudoMode := models.SudoModeNone
 	if o.Sudo {
 		sudoMode = models.SudoModeSudo
+		updateSudoMode = models.SudoModeSudo
 	}
-	res, err := preparer.PrepareNodeContext(ctx, config.EnsureNodeOptions{
+	var snap *config.Configuration
+	if provider != nil {
+		snap = provider.Snapshot()
+	}
+	suppressConfirm := o.isExecNodeConfirmationSuppressed(snap, provider)
+	shouldRemember := o.Interactive && utils.EffectiveRememberPolicy(o.Remember, snap) == utils.RememberPolicyAlways
+	return config.EnsureNodeOptions{
 		Target:       target,
 		Password:     "",
 		IdentityFile: identityFile,
@@ -924,20 +900,16 @@ func (o *ExecOptions) getOrCreateNodeWithPending(ctx context.Context, provider c
 		Alias:        alias,
 		SudoMode:     sudoMode,
 		SuPwd:        "",
-	})
-	if err != nil {
-		return "", false, false, err
+		ExistingUpdate: config.PendingNodeUpdate{
+			Enabled:      !suppressConfirm,
+			JumpHost:     o.JumpHost,
+			Alias:        alias,
+			SudoMode:     updateSudoMode,
+			RememberAuth: shouldRemember,
+			HasPassword:  addr.Password != "",
+			IdentityFile: identityFile,
+		},
 	}
-
-	if res.Created {
-		return res.NodeID, true, true, nil
-	}
-
-	updated, updateErr := o.updateNodeFromHostInfo(ctx, res.NodeID, provider, addr)
-	if updateErr != nil {
-		return "", false, false, updateErr
-	}
-	return res.NodeID, false, updated, nil
 }
 
 func (o *ExecOptions) isPlannedCommandMismatch(execCmd string, isScript bool) bool {
@@ -1239,15 +1211,6 @@ func assignExecTaskLogNames(tasks []execHostTask) {
 	}
 }
 
-func (o *ExecOptions) buildTasksFromTags(ctx context.Context, provider config.ConfigProvider) ([]execHostTask, error) {
-	tasks, err := o.planTasksFromTags(ctx, provider)
-	if err != nil || len(o.Exclude) > 0 {
-		return tasks, err
-	}
-	materialized, _, mErr := o.materializeExecTasks(ctx, provider, tasks)
-	return materialized, mErr
-}
-
 func (o *ExecOptions) planTasksFromTags(ctx context.Context, provider config.ConfigProvider) ([]execHostTask, error) {
 	if err := o.ensureGeneralOptionsApplied(); err != nil {
 		return nil, err
@@ -1531,18 +1494,6 @@ func (o *ExecOptions) resolveExecEntryCredentials(h utils.HostInfo, isBatchHosts
 	return user, hasUser, port, hasPort, password
 }
 
-func (o *ExecOptions) buildTasksFromHosts(ctx context.Context, repository config.ConfigProvider) ([]execHostTask, []error, error) {
-	tasks, hostErrs, err := o.planTasksFromHosts(ctx, repository)
-	if err != nil || len(o.Exclude) > 0 {
-		return tasks, hostErrs, err
-	}
-	materialized, matErrs, matErr := o.materializeExecTasks(ctx, repository, tasks)
-	if matErr != nil {
-		return nil, append(hostErrs, matErrs...), matErr
-	}
-	return materialized, append(hostErrs, matErrs...), nil
-}
-
 func (o *ExecOptions) planTasksFromHosts(ctx context.Context, repository config.ConfigProvider) ([]execHostTask, []error, error) {
 	if err := o.ensureGeneralOptionsApplied(); err != nil {
 		return nil, nil, err
@@ -1644,163 +1595,39 @@ func (o *ExecOptions) planTasksFromHosts(ctx context.Context, repository config.
 	return tasks, hostErrs, nil
 }
 
-func discardPendingExecTasks(provider config.ConfigProvider, tasks []execHostTask) {
-	for _, t := range tasks {
-		if t.pendingCreated {
-			discardPendingNode(provider, t.nodeID)
+func (o *ExecOptions) withPendingExecTasks(
+	ctx context.Context,
+	provider config.ConfigProvider,
+	tasks []execHostTask,
+	fn func(materialized []execHostTask, leases []config.PendingLease, hostErrs []error) error,
+) error {
+	var step func(idx int, accTasks []execHostTask, accLeases []config.PendingLease, accErrs []error) error
+	step = func(idx int, accTasks []execHostTask, accLeases []config.PendingLease, accErrs []error) error {
+		if idx >= len(tasks) {
+			return fn(accTasks, accLeases, accErrs)
 		}
-	}
-}
-
-func (o *ExecOptions) materializeExecTasks(ctx context.Context, provider config.ConfigProvider, tasks []execHostTask) ([]execHostTask, []error, error) {
-	materialized := make([]execHostTask, 0, len(tasks))
-	var hostErrs []error
-	for _, t := range tasks {
-		if t.pendingTarget != nil && t.pendingAddr != nil {
-			nodeID, pendingCreated, _, err := o.getOrCreateNodeWithPending(ctx, provider, *t.pendingTarget, *t.pendingAddr)
-			if err != nil {
-				if t.isTaggedTask {
-					discardPendingExecTasks(provider, materialized)
-					return nil, nil, fmt.Errorf("prepare tagged node %q failed: %w", t.rawHost, err)
-				}
-				hostErrs = append(hostErrs, fmt.Errorf("[%s] %w", t.host, err))
-				continue
-			}
-			t.nodeID = nodeID
-			t.pendingCreated = pendingCreated
+		t := tasks[idx]
+		if t.pendingTarget == nil || t.pendingAddr == nil {
+			return step(idx+1, append(accTasks, t), append(accLeases, nil), accErrs)
+		}
+		req := o.buildExecEnsureOptions(provider, *t.pendingTarget, *t.pendingAddr)
+		entered := false
+		prepErr := config.WithPendingNode(ctx, provider, req, func(lease config.PendingLease) error {
+			entered = true
+			t.nodeID = lease.NodeID()
 			t.pendingTarget = nil
 			t.pendingAddr = nil
+			return step(idx+1, append(accTasks, t), append(accLeases, lease), accErrs)
+		})
+		if entered {
+			return prepErr
 		}
-		materialized = append(materialized, t)
-	}
-	return materialized, hostErrs, nil
-}
-
-func appendExecAlias(slice []string, val string) ([]string, bool) {
-	if val == "" {
-		return slice, false
-	}
-	for _, item := range slice {
-		if item == val {
-			return slice, false
+		if t.isTaggedTask {
+			return fmt.Errorf("prepare tagged node %q failed: %w", t.rawHost, prepErr)
 		}
+		return step(idx+1, accTasks, accLeases, append(accErrs, fmt.Errorf("[%s] %w", t.host, prepErr)))
 	}
-	return append(slice, val), true
-}
-
-func (o *ExecOptions) updateNodeFromHostInfo(ctx context.Context, nodeID string, provider config.ConfigProvider, addr utils.HostInfo) (bool, error) {
-	var resolvedJump string
-	if o.JumpHost != "" && provider != nil {
-		var err error
-		resolvedJump, err = provider.ResolveProxyJumpChain(o.JumpHost)
-		if err != nil {
-			return false, fmt.Errorf("resolve exec proxy jump %q failed: %w", o.JumpHost, err)
-		}
-	}
-	repository, ok := provider.(*config.Repository)
-	if !o.Interactive || !ok || strings.HasPrefix(nodeID, config.OpenSSHNodePrefix) ||
-		utils.EffectiveRememberPolicy(o.Remember, repository.Snapshot()) == utils.RememberPolicyNever {
-		return false, nil
-	}
-	view := repository.View()
-	ref, ok := view.NodeRefs[nodeID]
-	if !ok {
-		return false, fmt.Errorf("resolve exec node %q reference: %w", nodeID, config.ErrNodeNotFound)
-	}
-	node, host, identity, err := repository.Resolve(nodeID)
-	if err != nil {
-		return false, fmt.Errorf("resolve exec node %q for update failed: %w", nodeID, err)
-	}
-	updated := false
-	shouldRemember := utils.EffectiveRememberPolicy(o.Remember, repository.Snapshot()) == utils.RememberPolicyAlways
-	if shouldRemember {
-		updated = o.updateIdentity(&identity, addr) || updated
-		updated = o.updateNodeSudo(&node) || updated
-	}
-	updated = o.updateNodeAlias(nodeID, &node, addr.Alias, repository) || updated
-
-	if resolvedJump != "" && resolvedJump != node.ProxyJump {
-		node.ProxyJump = resolvedJump
-		updated = true
-	}
-
-	if updated {
-		if err := repository.ReplaceNodeAtRefContext(ctx, ref, nodeID, node, host, identity); err != nil {
-			return false, fmt.Errorf("update exec node %q failed: %w", nodeID, err)
-		}
-	}
-
-	return updated, nil
-}
-
-// updateIdentity updates identity credentials and returns true if changed
-func (o *ExecOptions) updateIdentity(identity *models.Identity, addr utils.HostInfo) bool {
-	updated := false
-
-	if addr.Password != "" {
-		// Secret persistence is handled by adapter + credential.Service after
-		// store write/readback/CAS. Do not copy it into the configuration.
-		if identity.AuthType != "password" {
-			identity.AuthType = "password"
-			updated = true
-		}
-	} else if absKeyPath := config.NormalizePersistableIdentityPath(addr.KeyPath); absKeyPath != "" {
-		if identity.KeyPath != absKeyPath || identity.AuthType != "key" {
-			identity.KeyPath = absKeyPath
-			identity.AuthType = "key"
-			updated = true
-		}
-	}
-
-	return updated
-}
-
-// updateNodeAlias updates node alias and returns true if changed
-func (o *ExecOptions) updateNodeAlias(nodeID string, node *models.Node, alias string, provider config.ConfigProvider) bool {
-	if alias == "" || config.ValidateNodeAlias(alias) != nil {
-		return false
-	}
-	// 检查别名是否已被其他节点使用
-	if existingNode := provider.FindAlias(alias); existingNode != "" && existingNode != nodeID {
-		return false
-	}
-	aliases, changed := appendExecAlias(node.Alias, alias)
-	if changed {
-		node.Alias = aliases
-	}
-	return changed
-}
-
-// updateNodeSudo updates sudo settings and returns true if changed
-func (o *ExecOptions) updateNodeSudo(node *models.Node) bool {
-	updated := false
-
-	sudoMode := models.SudoModeNone
-	if o.Sudo {
-		sudoMode = models.SudoModeSudo
-	}
-
-	if sudoMode != models.SudoModeNone && node.SudoMode != sudoMode {
-		node.SudoMode = sudoMode
-		updated = true
-	}
-
-	return updated
-}
-
-// putConfiguredNodeContext is retained for SCP's shared node preparation
-// path. It accepts only Repository and chooses a create-only or exact-ref
-// replacement transaction; there is deliberately no Provider fallback.
-func putConfiguredNodeContext(ctx context.Context, provider config.ConfigProvider, nodeID string, node models.Node, host models.Host, identity models.Identity) error {
-	repository, ok := provider.(*config.Repository)
-	if !ok {
-		return fmt.Errorf("configuration mutation requires repository")
-	}
-	if ref, exists := repository.View().NodeRefs[nodeID]; exists {
-		return repository.ReplaceNodeAtRefContext(ctx, ref, nodeID, node, host, identity)
-	}
-	_, err := repository.CreateNodeContext(ctx, nodeID, node, host, identity)
-	return err
+	return step(0, make([]execHostTask, 0, len(tasks)), make([]config.PendingLease, 0, len(tasks)), nil)
 }
 
 type connectorCloser interface {
