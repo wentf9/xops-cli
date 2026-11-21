@@ -1,4 +1,4 @@
-//go:build !(linux || darwin || freebsd)
+//go:build !(linux || darwin || freebsd || windows)
 
 package ssh
 
@@ -10,8 +10,24 @@ import (
 	"os"
 )
 
+func unlinkExistingStreamLocalSocket(socketPath string) error {
+	fi, statErr := os.Lstat(socketPath)
+	if statErr != nil {
+		if errors.Is(statErr, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("stat existing streamlocal path %q failed: %w", socketPath, statErr)
+	}
+	if fi.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("cannot unlink non-socket path %q (mode %s)", socketPath, fi.Mode())
+	}
+	if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("unlink existing streamlocal socket %q failed: %w", socketPath, err)
+	}
+	return nil
+}
+
 func listenLocalStreamLocal(ctx context.Context, socketPath string, _ uint32, bindUnlink bool) (net.Listener, error) {
-	// POSIX StreamLocalBindMask mode bits do not apply to Windows AF_UNIX socket endpoints.
 	if socketPath == "" {
 		return nil, errors.New("streamlocal socket path cannot be empty")
 	}
@@ -19,12 +35,8 @@ func listenLocalStreamLocal(ctx context.Context, socketPath string, _ uint32, bi
 		return nil, fmt.Errorf("streamlocal socket path %q exceeds maximum length %d", socketPath, MaxControlPathLength())
 	}
 	if bindUnlink {
-		fi, statErr := os.Lstat(socketPath)
-		if statErr == nil {
-			if fi.IsDir() {
-				return nil, fmt.Errorf("cannot unlink streamlocal socket %q: is a directory", socketPath)
-			}
-			_ = os.Remove(socketPath)
+		if err := unlinkExistingStreamLocalSocket(socketPath); err != nil {
+			return nil, err
 		}
 	}
 	lc := net.ListenConfig{}
@@ -35,7 +47,12 @@ func listenLocalStreamLocal(ctx context.Context, socketPath string, _ uint32, bi
 	if unixLn, ok := listener.(*net.UnixListener); ok {
 		unixLn.SetUnlinkOnClose(false)
 	}
-	origFi, _ := os.Lstat(socketPath)
+	origFi, lstatErr := os.Lstat(socketPath)
+	if lstatErr != nil {
+		_ = listener.Close()
+		_ = os.Remove(socketPath)
+		return nil, fmt.Errorf("stat streamlocal socket failed: %w", lstatErr)
+	}
 	return &streamLocalListener{
 		Listener:   listener,
 		socketPath: socketPath,

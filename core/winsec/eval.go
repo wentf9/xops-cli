@@ -32,7 +32,10 @@ const (
 	FileAttributeDevice       uint32 = 0x00000040
 	FileAttributeReparsePoint uint32 = 0x00000400
 
-	InheritOnlyACEFlag uint8 = 0x08
+	ObjectInheritACEFlag      uint8 = 0x01
+	ContainerInheritACEFlag   uint8 = 0x02
+	NoPropagateInheritACEFlag uint8 = 0x04
+	InheritOnlyACEFlag        uint8 = 0x08
 
 	AccessAllowedACEType               uint8 = 0
 	AccessDeniedACEType                uint8 = 1
@@ -147,13 +150,18 @@ func EvaluateNamedPipeACE(ace ParsedACE) bool {
 	return EvaluateACEWithMask(ace, InsecureNamedPipeServerMask)
 }
 
-// EvaluateACEWithMask applies fail-closed allowlist evaluation to a decoded ACE:
-//   - INHERIT_ONLY_ACE entries do not apply to the object itself and are skipped.
+// EvaluateACEWithMask applies fail-closed allowlist evaluation to a decoded ACE
+// for a leaf/single object:
+//   - INHERIT_ONLY_ACE entries do not apply to a leaf object itself and are skipped.
 //   - Deny/audit/alarm/mandatory-label/attribute ACEs cannot grant access and are ignored.
 //   - Standard/callback allow ACEs carrying bits in disallowedMask require a valid trusted SID.
 //   - Unknown, compound, or object-specific allow ACEs fail closed.
 func EvaluateACEWithMask(ace ParsedACE, disallowedMask uint32) bool {
-	if ace.ACEFlags&InheritOnlyACEFlag != 0 {
+	return evaluateACEWithMask(ace, disallowedMask, true)
+}
+
+func evaluateACEWithMask(ace ParsedACE, disallowedMask uint32, skipInheritOnly bool) bool {
+	if skipInheritOnly && ace.ACEFlags&InheritOnlyACEFlag != 0 {
 		return true
 	}
 	if IsStandardLayoutAllowACEType(ace.ACEType) {
@@ -186,8 +194,15 @@ func EvaluateACEWithMask(ace ParsedACE, disallowedMask uint32) bool {
 	}
 }
 
+func isInheritableACE(flags uint8) bool {
+	return flags&(ObjectInheritACEFlag|ContainerInheritACEFlag) != 0
+}
+
 // EvaluateObjectSecurity verifies attributes, trusted owner, non-nil DACL, and
-// write-restricted ACEs (used for global ssh_known_hosts).
+// write-restricted ACEs (used for global ssh_known_hosts). For directories
+// (expectDir == true), inheritable INHERIT_ONLY_ACE entries carrying
+// OBJECT_INHERIT_ACE or CONTAINER_INHERIT_ACE are also evaluated because they
+// propagate onto newly created child objects.
 func EvaluateObjectSecurity(
 	attrs uint32,
 	expectDir bool,
@@ -202,7 +217,8 @@ func EvaluateObjectSecurity(
 		return false
 	}
 	for _, ace := range aces {
-		if !EvaluateACE(ace) {
+		skipInheritOnly := !expectDir || !isInheritableACE(ace.ACEFlags)
+		if !evaluateACEWithMask(ace, InsecureSSHObjectWriteMask, skipInheritOnly) {
 			return false
 		}
 	}
@@ -211,7 +227,9 @@ func EvaluateObjectSecurity(
 
 // EvaluateOwnerOnlyDirectorySecurity verifies that a directory is not a reparse
 // point/device, has a trusted owner, has a non-nil DACL, and grants zero access
-// bits to any untrusted principal.
+// bits to any untrusted principal — including via INHERIT_ONLY_ACE entries that
+// would otherwise propagate onto newly created child sockets before post-bind
+// hardening runs.
 func EvaluateOwnerOnlyDirectorySecurity(
 	attrs uint32,
 	ownerTrusted bool,
@@ -225,7 +243,7 @@ func EvaluateOwnerOnlyDirectorySecurity(
 		return false
 	}
 	for _, ace := range aces {
-		if !EvaluateOwnerOnlyACE(ace) {
+		if !evaluateACEWithMask(ace, InsecureOwnerOnlyObjectMask, false) {
 			return false
 		}
 	}

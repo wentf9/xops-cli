@@ -36,17 +36,31 @@ func listenLocalStreamLocal(ctx context.Context, socketPath string, bindMask uin
 	return listenStreamLocalTempLink(ctx, socketPath, dir, perm, useSuffixTemp, bindUnlink)
 }
 
+func unlinkExistingStreamLocalSocket(socketPath string) error {
+	fi, statErr := os.Lstat(socketPath)
+	if statErr != nil {
+		if errors.Is(statErr, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("stat existing streamlocal path %q failed: %w", socketPath, statErr)
+	}
+	if fi.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("cannot unlink non-socket path %q (mode %s)", socketPath, fi.Mode())
+	}
+	if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("unlink existing streamlocal socket %q failed: %w", socketPath, err)
+	}
+	return nil
+}
+
 // listenStreamLocalDirect runs only when socketPath is within 8 bytes of sun_path
 // capacity (so neither a sibling staging directory nor a suffix temp path fits).
 // Because Go cannot safely mutate process-global umask per-goroutine, os.Chmod
 // narrows permissions immediately after Listen before returning the listener.
 func listenStreamLocalDirect(ctx context.Context, socketPath string, perm os.FileMode, bindUnlink bool) (net.Listener, error) {
 	if bindUnlink {
-		if fi, statErr := os.Lstat(socketPath); statErr == nil {
-			if fi.IsDir() {
-				return nil, fmt.Errorf("cannot unlink streamlocal socket %q: is a directory", socketPath)
-			}
-			_ = os.Remove(socketPath)
+		if err := unlinkExistingStreamLocalSocket(socketPath); err != nil {
+			return nil, err
 		}
 	}
 	listener, err := (&net.ListenConfig{}).Listen(ctx, "unix", socketPath)
@@ -59,7 +73,12 @@ func listenStreamLocalDirect(ctx context.Context, socketPath string, perm os.Fil
 		_ = os.Remove(socketPath)
 		return nil, fmt.Errorf("chmod streamlocal socket failed: %w", err)
 	}
-	origFi, _ := os.Lstat(socketPath)
+	origFi, lstatErr := os.Lstat(socketPath)
+	if lstatErr != nil {
+		_ = listener.Close()
+		_ = os.Remove(socketPath)
+		return nil, fmt.Errorf("stat streamlocal socket failed: %w", lstatErr)
+	}
 	return &streamLocalListener{
 		Listener:   listener,
 		socketPath: socketPath,
@@ -100,13 +119,19 @@ func listenStreamLocalTempLink(ctx context.Context, socketPath, dir string, perm
 		_ = listener.Close()
 		return nil, fmt.Errorf("chmod temp streamlocal socket failed: %w", err)
 	}
+	// Capture our socket inode identity before publishing via hard link so a
+	// post-link path swap cannot trick Close into unlinking another file.
+	origFi, lstatErr := os.Lstat(tempPath)
+	if lstatErr != nil {
+		_ = listener.Close()
+		return nil, fmt.Errorf("stat temp streamlocal socket failed: %w", lstatErr)
+	}
 
 	if err := linkStreamLocalSocket(tempPath, socketPath, bindUnlink); err != nil {
 		_ = listener.Close()
 		return nil, err
 	}
 
-	origFi, _ := os.Lstat(socketPath)
 	return &streamLocalListener{
 		Listener:   listener,
 		socketPath: socketPath,
@@ -125,11 +150,9 @@ func linkStreamLocalSocket(tempPath, socketPath string, bindUnlink bool) error {
 	if !bindUnlink {
 		return fmt.Errorf("streamlocal socket %q already exists: %w", socketPath, err)
 	}
-	fi, statErr := os.Lstat(socketPath)
-	if statErr == nil && fi.IsDir() {
-		return fmt.Errorf("cannot unlink streamlocal socket %q: is a directory", socketPath)
+	if unlinkErr := unlinkExistingStreamLocalSocket(socketPath); unlinkErr != nil {
+		return unlinkErr
 	}
-	_ = os.Remove(socketPath)
 	if retryErr := os.Link(tempPath, socketPath); retryErr != nil {
 		return fmt.Errorf("link streamlocal socket failed after unlink: %w", retryErr)
 	}

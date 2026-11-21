@@ -26,6 +26,12 @@ const (
 	_ = uint(FileAttributeReparsePoint - windows.FILE_ATTRIBUTE_REPARSE_POINT)
 	_ = uint(windows.FILE_ATTRIBUTE_REPARSE_POINT - FileAttributeReparsePoint)
 
+	_ = uint(ObjectInheritACEFlag - windows.OBJECT_INHERIT_ACE)
+	_ = uint(windows.OBJECT_INHERIT_ACE - ObjectInheritACEFlag)
+	_ = uint(ContainerInheritACEFlag - windows.CONTAINER_INHERIT_ACE)
+	_ = uint(windows.CONTAINER_INHERIT_ACE - ContainerInheritACEFlag)
+	_ = uint(NoPropagateInheritACEFlag - windows.NO_PROPAGATE_INHERIT_ACE)
+	_ = uint(windows.NO_PROPAGATE_INHERIT_ACE - NoPropagateInheritACEFlag)
 	_ = uint(InheritOnlyACEFlag - windows.INHERIT_ONLY_ACE)
 	_ = uint(windows.INHERIT_ONLY_ACE - InheritOnlyACEFlag)
 	_ = uint(AccessAllowedACEType - windows.ACCESS_ALLOWED_ACE_TYPE)
@@ -133,7 +139,7 @@ func ParseACL(dacl *windows.ACL, currSID *windows.SID) ([]ParsedACE, bool) {
 			ACEType:  ace.Header.AceType,
 			ACEFlags: ace.Header.AceFlags,
 		}
-		if parsed.ACEFlags&InheritOnlyACEFlag == 0 && IsStandardLayoutAllowACEType(parsed.ACEType) {
+		if IsStandardLayoutAllowACEType(parsed.ACEType) {
 			const minWindowsSIDHeaderSize = uintptr(8)
 			sidOffset := unsafe.Offsetof(ace.SidStart)
 			if uintptr(ace.Header.AceSize) < sidOffset+minWindowsSIDHeaderSize {

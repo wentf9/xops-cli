@@ -17,6 +17,9 @@ import (
 var errPassengerUnsupported = errors.New("passenger mode with fd passing is not supported on Windows; use MUX_C_PROXY")
 
 func bindAndLinkSocket(targetPath string) (net.Listener, os.FileInfo, error) {
+	if err := validateWindowsSocketPath(targetPath); err != nil {
+		return nil, nil, err
+	}
 	maxPathLen := MaxControlPathLength() - 1
 	if len(targetPath) > maxPathLen {
 		return nil, nil, fmt.Errorf("control path %q exceeds maximum Unix socket path length (%d bytes)", targetPath, maxPathLen)

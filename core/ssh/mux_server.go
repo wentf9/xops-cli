@@ -122,6 +122,7 @@ type MuxServer struct {
 	activeSessions                int32
 	activeForwardStreams          int32
 	stopRepliesInFlight           int
+	sessionOpensInFlight          int
 	openFwdsInFlight              int
 	closeFwdsInFlight             int
 	idleTimer                     *time.Timer
@@ -500,8 +501,13 @@ func (s *MuxServer) markStoppedListeningLocked() bool {
 	return true
 }
 
+func (s *MuxServer) canAdmitNewWorkLocked() bool {
+	return s.phase == muxPhaseRunning && !s.stoppedListening
+}
+
 func (s *MuxServer) hasInFlightControlOrForwardLocked() bool {
 	return s.stopRepliesInFlight > 0 ||
+		s.sessionOpensInFlight > 0 ||
 		s.openFwdsInFlight > 0 ||
 		s.closeFwdsInFlight > 0 ||
 		s.forwardTable.hasInFlightEndpointsLocked()
@@ -891,12 +897,10 @@ func (s *MuxServer) handleTerminate(conn net.Conn, reqID uint32) error {
 	s.notifyIdleLocked()
 	s.idleMu.Unlock()
 
-	if firstStop {
-		if s.listener != nil {
-			_ = s.listener.Close()
-		}
-		s.unlinkControlSocketFileIfOurs()
+	if firstStop && s.listener != nil {
+		_ = s.listener.Close()
 	}
+	s.unlinkControlSocketFileIfOurs()
 	_ = sendOk(conn, reqID)
 	go func() {
 		time.Sleep(10 * time.Millisecond) // Allow response packet to flush
@@ -916,12 +920,10 @@ func (s *MuxServer) handleStopListening(conn net.Conn, reqID uint32) error {
 	firstStop := s.markStoppedListeningLocked()
 	s.idleMu.Unlock()
 
-	if firstStop {
-		if s.listener != nil {
-			_ = s.listener.Close()
-		}
-		s.unlinkControlSocketFileIfOurs()
+	if firstStop && s.listener != nil {
+		_ = s.listener.Close()
 	}
+	s.unlinkControlSocketFileIfOurs()
 	sendErr := sendOk(conn, reqID)
 
 	s.idleMu.Lock()
@@ -934,15 +936,22 @@ func (s *MuxServer) handleStopListening(conn net.Conn, reqID uint32) error {
 }
 
 func (s *MuxServer) handleProxy(conn net.Conn, reqID uint32) error {
-	if !s.canAdmitNewSession() {
+	if !s.beginSessionAdmission() {
 		return sendFailure(conn, reqID, "mux master is shutting down")
 	}
+	admitted := false
+	defer func() {
+		if !admitted {
+			s.endSessionAdmission()
+		}
+	}()
 	if err := s.authorize("proxy session"); err != nil {
 		return sendPermissionDenied(conn, reqID, err.Error())
 	}
-	if !s.addActiveSession() {
+	if !s.promoteSessionAdmission() {
 		return sendFailure(conn, reqID, "mux master is shutting down")
 	}
+	admitted = true
 	defer s.removeActiveSession()
 
 	if err := sendProxy(conn, reqID); err != nil {
@@ -980,7 +989,60 @@ func (s *MuxServer) canAdmitNewSession() bool {
 	}
 	s.idleMu.Lock()
 	defer s.idleMu.Unlock()
-	return s.phase == muxPhaseRunning && !s.stoppedListening
+	return s.canAdmitNewWorkLocked()
+}
+
+// beginSessionAdmission atomically verifies that the master accepts new
+// sessions, tracks the admission as in-flight work, and disarms the
+// ControlPersist idle timer so authorize / recvFiles cannot race with
+// onIdleTimeout. Every true return must be matched by either a successful
+// promoteSessionAdmission or endSessionAdmission.
+func (s *MuxServer) beginSessionAdmission() bool {
+	if s == nil {
+		return false
+	}
+	s.idleMu.Lock()
+	defer s.idleMu.Unlock()
+	if !s.canAdmitNewWorkLocked() {
+		return false
+	}
+	s.sessionOpensInFlight++
+	s.disarmIdleTimerLocked()
+	return true
+}
+
+// promoteSessionAdmission atomically converts an in-flight session admission
+// into an active session under idleMu. When admission is rejected (e.g. -O stop
+// or shutdown raced with authorize/recvFiles), the caller's deferred
+// endSessionAdmission releases the slot after sending the rejection reply.
+func (s *MuxServer) promoteSessionAdmission() bool {
+	if s == nil {
+		return false
+	}
+	s.idleMu.Lock()
+	defer s.idleMu.Unlock()
+	if !s.canAdmitNewWorkLocked() {
+		return false
+	}
+	if s.sessionOpensInFlight > 0 {
+		s.sessionOpensInFlight--
+	}
+	s.activeSessions++
+	s.hadActiveSession = true
+	s.disarmIdleTimerLocked()
+	return true
+}
+
+func (s *MuxServer) endSessionAdmission() {
+	if s == nil {
+		return
+	}
+	s.idleMu.Lock()
+	defer s.idleMu.Unlock()
+	if s.sessionOpensInFlight > 0 {
+		s.sessionOpensInFlight--
+	}
+	s.onWorkCountChangedLocked()
 }
 
 func (s *MuxServer) addActiveSession() bool {
@@ -990,7 +1052,7 @@ func (s *MuxServer) addActiveSession() bool {
 	s.idleMu.Lock()
 	defer s.idleMu.Unlock()
 
-	if s.phase != muxPhaseRunning || s.stoppedListening {
+	if !s.canAdmitNewWorkLocked() {
 		return false
 	}
 

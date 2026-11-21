@@ -851,7 +851,7 @@ func (s *MuxServer) acquireForwardEndpoint(
 ) (*muxForwardEndpointSlot, muxEndpointAcquireOutcome) {
 	for {
 		s.idleMu.Lock()
-		if s.isShuttingDownLocked() {
+		if !s.canAdmitNewWorkLocked() {
 			s.idleMu.Unlock()
 			return nil, muxEndpointShuttingDown
 		}
@@ -958,8 +958,9 @@ func (s *MuxServer) commitReservedForwardSlot(
 			s.idleMu.Lock()
 		}
 	}
-	if s.isShuttingDownLocked() {
+	if !s.canAdmitNewWorkLocked() {
 		s.releaseInFlightEndpointSlotLocked(listenKey, slot)
+		s.onWorkCountChangedLocked()
 		s.idleMu.Unlock()
 		s.closeUnpublishedMuxForward(cand)
 		return nil, false, false, true
@@ -1256,7 +1257,7 @@ func (s *MuxServer) recordDynamicEndpointLocked(dynKey forwardListenKey, cand *m
 func (s *MuxServer) lockForPublishForward(hasDynKey bool, dynKey forwardListenKey) bool {
 	for {
 		s.idleMu.Lock()
-		if s.isShuttingDownLocked() {
+		if !s.canAdmitNewWorkLocked() {
 			s.idleMu.Unlock()
 			return false
 		}

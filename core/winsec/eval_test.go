@@ -63,18 +63,6 @@ func TestEvaluateOwnerOnlyDirectoryAndSocketSecurity(t *testing.T) {
 		t.Fatal("untrusted read-only ACE must be rejected on owner-only socket")
 	}
 
-	// INHERIT_ONLY_ACE does not apply to the directory itself.
-	inheritOnlyUntrusted := append(append([]ParsedACE(nil), ownerOnlyBaseline...), ParsedACE{
-		ACEType:    AccessAllowedACEType,
-		ACEFlags:   InheritOnlyACEFlag,
-		Mask:       AccessGenericAll,
-		SIDValid:   true,
-		SIDTrusted: false,
-	})
-	if !EvaluateOwnerOnlyDirectorySecurity(FileAttributeDirectory, true, true, inheritOnlyUntrusted) {
-		t.Fatal("INHERIT_ONLY_ACE should not reject directory itself")
-	}
-
 	// Unknown / object / compound allow ACEs and invalid SIDs must fail closed.
 	for _, bad := range []ParsedACE{
 		{ACEType: AccessAllowedObjectACEType, SIDValid: true, SIDTrusted: true},
@@ -89,6 +77,124 @@ func TestEvaluateOwnerOnlyDirectoryAndSocketSecurity(t *testing.T) {
 		}
 		if EvaluateOwnerOnlySocketSecurity(true, true, true, aces) {
 			t.Fatalf("bad ACE %+v must fail closed on socket", bad)
+		}
+	}
+}
+
+func TestEvaluateOwnerOnlyAndObjectSecurity_InheritOnlyACE(t *testing.T) {
+	t.Parallel()
+
+	const readOnlyMask = uint32(0x001200a9)
+	const fileAttrs = uint32(0x00000080)
+	ownerOnlyBaseline := []ParsedACE{
+		{ACEType: AccessAllowedACEType, Mask: AccessGenericAll, SIDValid: true, SIDTrusted: true},
+		{ACEType: AccessAllowedACEType, Mask: AccessGenericAll, SIDValid: true, SIDTrusted: true},
+	}
+
+	// Inheritable (and bare) INHERIT_ONLY_ACE entries for untrusted SIDs MUST be
+	// rejected on owner-only directories because OBJECT_INHERIT_ACE /
+	// CONTAINER_INHERIT_ACE propagate onto newly created child sockets before
+	// post-bind hardening runs, whereas leaf sockets ignore INHERIT_ONLY_ACE.
+	for _, flags := range []uint8{
+		InheritOnlyACEFlag,
+		InheritOnlyACEFlag | ObjectInheritACEFlag,
+		InheritOnlyACEFlag | ContainerInheritACEFlag,
+		InheritOnlyACEFlag | ObjectInheritACEFlag | ContainerInheritACEFlag,
+	} {
+		assertOwnerOnlyInheritOnlyFlag(t, ownerOnlyBaseline, flags, readOnlyMask)
+	}
+
+	// EvaluateObjectSecurity: leaf files skip INHERIT_ONLY_ACE, while directories
+	// reject inheritable (OI/CI) untrusted write or unknown allow ACEs.
+	for _, flags := range []uint8{
+		InheritOnlyACEFlag | ObjectInheritACEFlag,
+		InheritOnlyACEFlag | ContainerInheritACEFlag,
+		InheritOnlyACEFlag | ObjectInheritACEFlag | ContainerInheritACEFlag,
+	} {
+		untrustedWrite := append(append([]ParsedACE(nil), ownerOnlyBaseline...), ParsedACE{
+			ACEType:    AccessAllowedACEType,
+			ACEFlags:   flags,
+			Mask:       AccessFileWriteData,
+			SIDValid:   true,
+			SIDTrusted: false,
+		})
+		if !EvaluateObjectSecurity(fileAttrs, false, true, true, untrustedWrite) {
+			t.Fatalf("leaf file EvaluateObjectSecurity must skip INHERIT_ONLY_ACE (flags=%#x)", flags)
+		}
+		if EvaluateObjectSecurity(FileAttributeDirectory, true, true, true, untrustedWrite) {
+			t.Fatalf("directory EvaluateObjectSecurity must reject inheritable untrusted write ACE (flags=%#x)", flags)
+		}
+		untrustedRead := append(append([]ParsedACE(nil), ownerOnlyBaseline...), ParsedACE{
+			ACEType:    AccessAllowedACEType,
+			ACEFlags:   flags,
+			Mask:       readOnlyMask,
+			SIDValid:   true,
+			SIDTrusted: false,
+		})
+		if !EvaluateObjectSecurity(FileAttributeDirectory, true, true, true, untrustedRead) {
+			t.Fatalf("directory EvaluateObjectSecurity should allow inheritable read-only ACE (flags=%#x)", flags)
+		}
+		unknownAllow := append(append([]ParsedACE(nil), ownerOnlyBaseline...), ParsedACE{
+			ACEType:    AccessAllowedObjectACEType,
+			ACEFlags:   flags,
+			SIDValid:   true,
+			SIDTrusted: true,
+		})
+		if EvaluateObjectSecurity(FileAttributeDirectory, true, true, true, unknownAllow) {
+			t.Fatalf("directory EvaluateObjectSecurity must reject inheritable object allow ACE (flags=%#x)", flags)
+		}
+	}
+}
+
+func assertOwnerOnlyInheritOnlyFlag(t *testing.T, baseline []ParsedACE, flags uint8, readOnlyMask uint32) {
+	t.Helper()
+	for _, mask := range []uint32{AccessGenericAll, readOnlyMask} {
+		inheritOnlyUntrusted := append(append([]ParsedACE(nil), baseline...), ParsedACE{
+			ACEType:    AccessAllowedACEType,
+			ACEFlags:   flags,
+			Mask:       mask,
+			SIDValid:   true,
+			SIDTrusted: false,
+		})
+		if EvaluateOwnerOnlyDirectorySecurity(FileAttributeDirectory, true, true, inheritOnlyUntrusted) {
+			t.Fatalf("INHERIT_ONLY_ACE (flags=%#x, mask=%#x) for untrusted SID must be rejected on owner-only directory", flags, mask)
+		}
+		if !EvaluateOwnerOnlySocketSecurity(true, true, true, inheritOnlyUntrusted) {
+			t.Fatalf("INHERIT_ONLY_ACE (flags=%#x, mask=%#x) should still be ignored on leaf socket", flags, mask)
+		}
+	}
+
+	inheritOnlyTrusted := append(append([]ParsedACE(nil), baseline...), ParsedACE{
+		ACEType:    AccessAllowedACEType,
+		ACEFlags:   flags,
+		Mask:       AccessGenericAll,
+		SIDValid:   true,
+		SIDTrusted: true,
+	})
+	if !EvaluateOwnerOnlyDirectorySecurity(FileAttributeDirectory, true, true, inheritOnlyTrusted) {
+		t.Fatalf("INHERIT_ONLY_ACE (flags=%#x) for trusted SID must be allowed on owner-only directory", flags)
+	}
+
+	inheritOnlyDeny := append(append([]ParsedACE(nil), baseline...), ParsedACE{
+		ACEType:  AccessDeniedACEType,
+		ACEFlags: flags,
+		Mask:     AccessGenericAll,
+	})
+	if !EvaluateOwnerOnlyDirectorySecurity(FileAttributeDirectory, true, true, inheritOnlyDeny) {
+		t.Fatalf("INHERIT_ONLY_ACE deny ACE (flags=%#x) must be allowed on owner-only directory", flags)
+	}
+
+	for _, badInheritOnly := range []ParsedACE{
+		{ACEType: AccessAllowedCallbackACEType, ACEFlags: flags, Mask: readOnlyMask, SIDValid: true, SIDTrusted: false},
+		{ACEType: AccessAllowedObjectACEType, ACEFlags: flags, SIDValid: true, SIDTrusted: true},
+		{ACEType: AccessAllowedCallbackObjectACEType, ACEFlags: flags, SIDValid: true, SIDTrusted: true},
+		{ACEType: AccessAllowedCompoundACEType, ACEFlags: flags, SIDValid: true, SIDTrusted: true},
+		{ACEType: 99, ACEFlags: flags, SIDValid: true, SIDTrusted: true},
+		{ACEType: AccessAllowedACEType, ACEFlags: flags, Mask: readOnlyMask, SIDValid: false, SIDTrusted: true},
+	} {
+		aces := append(append([]ParsedACE(nil), baseline...), badInheritOnly)
+		if EvaluateOwnerOnlyDirectorySecurity(FileAttributeDirectory, true, true, aces) {
+			t.Fatalf("bad INHERIT_ONLY_ACE %+v must fail closed on owner-only directory", badInheritOnly)
 		}
 	}
 }

@@ -214,9 +214,15 @@ func localPeerUID() uint32 {
 }
 
 func handlePassengerSession(s *MuxServer, conn net.Conn, reqID uint32, payload []byte) error {
-	if !s.canAdmitNewSession() {
+	if !s.beginSessionAdmission() {
 		return sendFailure(conn, reqID, "mux master is shutting down")
 	}
+	admitted := false
+	defer func() {
+		if !admitted {
+			s.endSessionAdmission()
+		}
+	}()
 	if err := s.authorize("passenger session"); err != nil {
 		return sendPermissionDenied(conn, reqID, err.Error())
 	}
@@ -239,9 +245,10 @@ func handlePassengerSession(s *MuxServer, conn net.Conn, reqID uint32, payload [
 		return sendFailure(conn, reqID, fmt.Sprintf("malformed new session request: %v", err))
 	}
 
-	if !s.addActiveSession() {
+	if !s.promoteSessionAdmission() {
 		return sendFailure(conn, reqID, "mux master is shutting down")
 	}
+	admitted = true
 	defer s.removeActiveSession()
 
 	s.trackStream(conn)
@@ -952,15 +959,36 @@ func waitPassengerDrainBounded(done <-chan struct{}) {
 	}
 }
 
-func drainErrorBounded(ch <-chan error) error {
-	timer := time.NewTimer(sessionShutdownTimeout)
-	defer timer.Stop()
-	select {
-	case err := <-ch:
-		return err
-	case <-timer.C:
+// passengerCopyResult pairs a close-once completion channel with the copy
+// worker's terminal error so any number of callers can safely await completion
+// without double-receiving from an unclosed value channel.
+type passengerCopyResult struct {
+	done chan struct{}
+	err  error
+}
+
+func newPassengerCopyResult() *passengerCopyResult {
+	return &passengerCopyResult{done: make(chan struct{})}
+}
+
+func (r *passengerCopyResult) finish(err error) {
+	r.err = err
+	close(r.done)
+}
+
+func (r *passengerCopyResult) Done() <-chan struct{} {
+	if r == nil {
 		return nil
 	}
+	return r.done
+}
+
+func (r *passengerCopyResult) Err() error {
+	if r == nil {
+		return nil
+	}
+	<-r.done
+	return r.err
 }
 
 func runPassengerChannelIO(s *MuxServer, conn net.Conn, ch cryptoSSH.Channel, reqs <-chan *cryptoSSH.Request, files []*os.File) uint32 {
@@ -1093,9 +1121,8 @@ func runPassengerChannelIO(s *MuxServer, conn net.Conn, ch cryptoSSH.Channel, re
 	_ = stderrFile.Close()
 	_ = stdinFile.Close()
 
-	if !hasExit.Load() {
-		return 0
-	}
+	// exitCode starts at 255 and is overwritten only by an explicit exit-status
+	// (or preserved as 255 on exit-signal / abrupt transport disconnect).
 	return exitCode.Load()
 }
 
@@ -1140,9 +1167,15 @@ func startPassengerStdioConnWatch(conn net.Conn) (<-chan struct{}, func() bool) 
 }
 
 func handlePassengerStdioFwd(s *MuxServer, conn net.Conn, reqID uint32, payload []byte) error {
-	if !s.canAdmitNewSession() {
+	if !s.beginSessionAdmission() {
 		return sendFailure(conn, reqID, "mux master is shutting down")
 	}
+	admitted := false
+	defer func() {
+		if !admitted {
+			s.endSessionAdmission()
+		}
+	}()
 	if err := s.authorize("passenger stdio forward"); err != nil {
 		return sendPermissionDenied(conn, reqID, err.Error())
 	}
@@ -1163,9 +1196,10 @@ func handlePassengerStdioFwd(s *MuxServer, conn net.Conn, reqID uint32, payload 
 		return sendFailure(conn, reqID, errMsg)
 	}
 
-	if !s.addActiveSession() {
+	if !s.promoteSessionAdmission() {
 		return sendFailure(conn, reqID, "mux master is shutting down")
 	}
+	admitted = true
 	defer s.removeActiveSession()
 
 	s.trackStream(conn)
@@ -1203,18 +1237,18 @@ func handlePassengerStdioFwd(s *MuxServer, conn net.Conn, reqID uint32, payload 
 	cancelStdin := sync.OnceFunc(func() { close(stopStdin) })
 	stopOutput := make(chan struct{})
 	cancelOutput := sync.OnceFunc(func() { close(stopOutput) })
-	stdinDone := make(chan error, 1)
-	stdoutDone := make(chan error, 1)
+	stdinRes := newPassengerCopyResult()
+	stdoutRes := newPassengerCopyResult()
 	go func() {
 		copyErr := copyFromPollableFD(ch, stdinFile, stopStdin)
 		_ = ch.CloseWrite()
-		stdinDone <- copyErr
+		stdinRes.finish(copyErr)
 	}()
 	go func() {
-		stdoutDone <- copyToPollableFD(stdoutFile, ch, stopOutput)
+		stdoutRes.finish(copyToPollableFD(stdoutFile, ch, stopOutput))
 	}()
 
-	return awaitPassengerStdioFwdCompletion(s, conn, ch, stdinFile, stdoutFile, cancelStdin, cancelOutput, stdinDone, stdoutDone, remoteClosed, stderrDone)
+	return awaitPassengerStdioFwdCompletion(s, conn, ch, stdinFile, stdoutFile, cancelStdin, cancelOutput, stdinRes, stdoutRes, remoteClosed, stderrDone)
 }
 
 func awaitPassengerStdioFwdCompletion(
@@ -1223,7 +1257,7 @@ func awaitPassengerStdioFwdCompletion(
 	ch cryptoSSH.Channel,
 	stdinFile, stdoutFile *os.File,
 	cancelStdin, cancelOutput func(),
-	stdinDone, stdoutDone <-chan error,
+	stdinRes, stdoutRes *passengerCopyResult,
 	remoteClosed, stderrDone <-chan struct{},
 ) error {
 	connClosed, stopConnWatch := startPassengerStdioConnWatch(conn)
@@ -1234,7 +1268,6 @@ func awaitPassengerStdioFwdCompletion(
 	// EOF or remote channel close.
 	var (
 		outErr, inErr error
-		stdinDrained  bool
 		aborted       bool
 		serverDone    <-chan struct{}
 	)
@@ -1242,12 +1275,13 @@ func awaitPassengerStdioFwdCompletion(
 		serverDone = s.baseContext().Done()
 	}
 	select {
-	case outErr = <-stdoutDone:
+	case <-stdoutRes.Done():
+		outErr = stdoutRes.Err()
 		if outErr == nil && !isClosedChan(remoteClosed) {
 			_ = stdoutFile.Close()
 			select {
-			case inErr = <-stdinDone:
-				stdinDrained = true
+			case <-stdinRes.Done():
+				inErr = stdinRes.Err()
 				stopConnWatch()
 			case <-remoteClosed:
 				stopConnWatch()
@@ -1267,14 +1301,15 @@ func awaitPassengerStdioFwdCompletion(
 		aborted = true
 	}
 	if aborted {
-		return abortPassengerStdioFwd(s, ch, stdinFile, stdoutFile, cancelStdin, cancelOutput, stdoutDone, stdinDone, stderrDone)
+		return abortPassengerStdioFwd(s, ch, stdinFile, stdoutFile, cancelStdin, cancelOutput, stdoutRes, stdinRes, stderrDone)
 	}
 
 	cancelStdin()
 	cancelOutput()
 	_ = s.closeMuxChannelBounded(ch, nil)
-	if !stdinDrained {
-		inErr = drainErrorBounded(stdinDone)
+	waitPassengerDrainBounded(stdinRes.Done())
+	if isClosedChan(stdinRes.Done()) {
+		inErr = stdinRes.Err()
 	}
 	waitPassengerDrainBounded(stderrDone)
 	_ = stdinFile.Close()
@@ -1297,7 +1332,7 @@ func abortPassengerStdioFwd(
 	stream io.Closer,
 	stdinFile, stdoutFile *os.File,
 	cancelStdin, cancelOutput func(),
-	stdoutDone, stdinDone <-chan error,
+	stdoutRes, stdinRes *passengerCopyResult,
 	stderrDone <-chan struct{},
 ) error {
 	cancelStdin()
@@ -1306,10 +1341,12 @@ func abortPassengerStdioFwd(
 	_ = stdoutFile.Close()
 	waitDone := make(chan struct{})
 	go func() {
-		err := <-stdoutDone
-		_ = err
-		err = <-stdinDone
-		_ = err
+		if stdoutRes != nil {
+			<-stdoutRes.Done()
+		}
+		if stdinRes != nil {
+			<-stdinRes.Done()
+		}
 		if stderrDone != nil {
 			<-stderrDone
 		}

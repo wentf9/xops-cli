@@ -111,6 +111,68 @@ func TestEnsureOwnerOnlyDirectory_CreatesProtectedTwoSIDDACLAndRejectsInsecureDi
 	}
 }
 
+func TestEnsureOwnerOnlyDirectory_RejectsInheritableInheritOnlyACE(t *testing.T) {
+	base := t.TempDir()
+	inheritBypassDir := filepath.Join(base, "everyone_inherit_only")
+	if err := os.Mkdir(inheritBypassDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	everyoneSID, err := windows.CreateWellKnownSid(windows.WinWorldSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currSID, err := CurrentProcessUserSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pinner runtime.Pinner
+	defer pinner.Unpin()
+	pinner.Pin(currSID)
+	pinner.Pin(everyoneSID)
+
+	inheritOnlyACL, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{
+		{
+			AccessPermissions: windows.GENERIC_ALL,
+			AccessMode:        windows.GRANT_ACCESS,
+			Inheritance:       windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+			Trustee: windows.TRUSTEE{
+				TrusteeForm:  windows.TRUSTEE_IS_SID,
+				TrusteeType:  windows.TRUSTEE_IS_USER,
+				TrusteeValue: windows.TrusteeValueFromSID(currSID),
+			},
+		},
+		{
+			AccessPermissions: windows.GENERIC_ALL,
+			AccessMode:        windows.GRANT_ACCESS,
+			Inheritance:       windows.OBJECT_INHERIT_ACE | windows.INHERIT_ONLY_ACE,
+			Trustee: windows.TRUSTEE{
+				TrusteeForm:  windows.TRUSTEE_IS_SID,
+				TrusteeType:  windows.TRUSTEE_IS_WELL_KNOWN_GROUP,
+				TrusteeValue: windows.TrusteeValueFromSID(everyoneSID),
+			},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := windows.SetNamedSecurityInfo(
+		inheritBypassDir,
+		windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		nil,
+		nil,
+		inheritOnlyACL,
+		nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	runtime.KeepAlive(inheritOnlyACL)
+
+	if err := EnsureOwnerOnlyDirectory(inheritBypassDir); !errors.Is(err, ErrInsecureControlDir) {
+		t.Fatalf("EnsureOwnerOnlyDirectory(INHERIT_ONLY_ACE Everyone) = %v, want ErrInsecureControlDir", err)
+	}
+}
+
 func TestVerifyAFUnixPeerCurrentUser_SameUserAndFailClosedOnInvalidHandle(t *testing.T) {
 	if err := VerifyAFUnixPeerCurrentUser(uintptr(windows.InvalidHandle)); !errors.Is(err, ErrUnauthorizedControlPeer) {
 		t.Fatalf("VerifyAFUnixPeerCurrentUser(InvalidHandle) = %v, want ErrUnauthorizedControlPeer", err)

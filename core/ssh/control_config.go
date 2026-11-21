@@ -363,7 +363,8 @@ func ExpandControlPath(rawPath string, env Environment, target TargetContext) (s
 	if hasControlOrLineSepChar(rawPath) {
 		return "", fmt.Errorf("ControlPath %q contains invalid control character", rawPath)
 	}
-	if strings.TrimSpace(rawPath) == "" {
+	rawPath = strings.TrimSpace(rawPath)
+	if rawPath == "" {
 		return "", nil
 	}
 	if IsNoneValue(rawPath) {
@@ -488,6 +489,44 @@ func expandPathEnvToken(raw string, i int, env Environment, kind string) (string
 	return val, end + 1, nil
 }
 
+func validateExpandedPathToken(tok byte, val, kind string) error {
+	if val == "" {
+		return nil
+	}
+	if strings.ContainsRune(val, 0) || hasControlOrLineSepChar(val) {
+		return fmt.Errorf("invalid %s token %%%c expansion %q: contains invalid control character", kind, tok, val)
+	}
+	if strings.ContainsAny(val, `/\`) {
+		return fmt.Errorf("invalid %s token %%%c expansion %q: contains path separator", kind, tok, val)
+	}
+	if val == "." || val == ".." || strings.Contains(val, "..") {
+		return fmt.Errorf("invalid %s token %%%c expansion %q: contains path traversal segment", kind, tok, val)
+	}
+	return nil
+}
+
+// validateWindowsSocketPath rejects Windows NTFS Alternate Data Stream (':')
+// and invalid Windows filename characters ('*', '?', '"', '<', '>', '|')
+// anywhere after an optional leading drive-letter prefix (e.g. "C:"). Enforcing
+// this at the Windows socket bind boundary covers literal ":%p", ${VAR}, and
+// IPv6 "%h" uniformly without breaking cross-platform token expansion parity.
+func validateWindowsSocketPath(socketPath string) error {
+	if socketPath == "" {
+		return errors.New("windows socket path cannot be empty")
+	}
+	if strings.ContainsRune(socketPath, 0) || hasControlOrLineSepChar(socketPath) {
+		return fmt.Errorf("windows socket path %q contains invalid control character", socketPath)
+	}
+	rest := socketPath
+	if len(rest) >= 2 && ((rest[0] >= 'a' && rest[0] <= 'z') || (rest[0] >= 'A' && rest[0] <= 'Z')) && rest[1] == ':' {
+		rest = rest[2:]
+	}
+	if strings.ContainsAny(rest, `:*?"<>|`) {
+		return fmt.Errorf("windows socket path %q contains invalid Windows filename or NTFS stream character", socketPath)
+	}
+	return nil
+}
+
 func expandPathPercentToken(
 	tok byte,
 	target TargetContext,
@@ -497,38 +536,43 @@ func expandPathPercentToken(
 	connHashReady *bool,
 	kind string,
 ) (string, error) {
+	var val string
 	switch tok {
 	case '%':
 		return "%", nil
-	case 'h':
-		return host, nil
 	case 'p':
 		return portStr, nil
-	case 'r':
-		return remoteUser, nil
-	case 'n':
-		return origHost, nil
-	case 'u':
-		return env.LocalUser, nil
-	case 'l':
-		return env.LocalHost, nil
-	case 'L':
-		return shortLocalHost, nil
-	case 'i':
-		return env.LocalUID, nil
 	case 'd':
 		return env.HomeDir, nil
-	case 'j':
-		return NormalizeProxyJump(target.JumpHost), nil
 	case 'C':
 		if !*connHashReady {
 			*connHash = ComputeConnectionHash(env.LocalHost, host, portStr, remoteUser, NormalizeProxyJump(target.JumpHost))
 			*connHashReady = true
 		}
 		return *connHash, nil
+	case 'h':
+		val = host
+	case 'r':
+		val = remoteUser
+	case 'n':
+		val = origHost
+	case 'u':
+		val = env.LocalUser
+	case 'l':
+		val = env.LocalHost
+	case 'L':
+		val = shortLocalHost
+	case 'i':
+		val = env.LocalUID
+	case 'j':
+		val = NormalizeProxyJump(target.JumpHost)
 	default:
 		return "", fmt.Errorf("unknown %s token %%%c", kind, tok)
 	}
+	if err := validateExpandedPathToken(tok, val, kind); err != nil {
+		return "", err
+	}
+	return val, nil
 }
 
 // lookupEnv reads a ControlPath ${VAR} value from the injected environment. The

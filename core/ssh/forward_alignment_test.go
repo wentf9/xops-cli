@@ -641,6 +641,20 @@ func TestForwardAlignment_StreamLocal_BindMask(t *testing.T) {
 	}
 }
 
+func createStaleUnixSocketForTest(t *testing.T, sock string) {
+	t.Helper()
+	staleLn, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("create stale unix socket failed: %v", err)
+	}
+	if unixLn, ok := staleLn.(*net.UnixListener); ok {
+		unixLn.SetUnlinkOnClose(false)
+	}
+	if err := staleLn.Close(); err != nil {
+		t.Fatalf("close stale unix socket failed: %v", err)
+	}
+}
+
 func TestForwardAlignment_StreamLocal_BindUnlink(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -667,16 +681,15 @@ func TestForwardAlignment_StreamLocal_BindUnlink(t *testing.T) {
 		}
 	})
 
-	// 2. BindUnlink true replaces existing file
+	// 2. BindUnlink true replaces existing stale Unix socket
 	t.Run("BindUnlink_True_ReplacesExisting", func(t *testing.T) {
 		sock := filepath.Join(shortSocketDir(t), "replace.sock")
-		if err := os.WriteFile(sock, []byte("stale"), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		createStaleUnixSocketForTest(t, sock)
+
 		fwdCtx, cancelFwd := context.WithCancel(ctx)
 		fwd, err := client.LocalForwardEndpoint(fwdCtx, ForwardEndpoint{SocketPath: sock}, dest, false, WithStreamLocalBindUnlink(true))
 		if err != nil {
-			t.Fatalf("expected success with bindUnlink true, got: %v", err)
+			t.Fatalf("expected success with bindUnlink true on stale socket, got: %v", err)
 		}
 		defer func() {
 			cancelFwd()
@@ -689,6 +702,11 @@ func TestForwardAlignment_StreamLocal_BindUnlink(t *testing.T) {
 		}
 		defer func() { _ = conn.Close() }()
 		verifyEchoRoundtrip(t, conn, "payload-after-replace")
+	})
+
+	// 2b. BindUnlink true refuses to delete a regular file
+	t.Run("BindUnlink_True_RefusesRegularFile", func(t *testing.T) {
+		assertBindUnlinkRefusesRegularFile(t, ctx, client, dest)
 	})
 
 	// 3. BindUnlink true refuses to delete directory
@@ -724,6 +742,21 @@ func TestForwardAlignment_StreamLocal_BindUnlink(t *testing.T) {
 			t.Fatalf("expected socket file to be removed after forward cancel, got err: %v", err)
 		}
 	})
+}
+
+func assertBindUnlinkRefusesRegularFile(t *testing.T, ctx context.Context, client *Client, dest ForwardEndpoint) {
+	t.Helper()
+	regularFile := filepath.Join(shortSocketDir(t), "regular-file.txt")
+	if err := os.WriteFile(regularFile, []byte("precious-data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.LocalForwardEndpoint(ctx, ForwardEndpoint{SocketPath: regularFile}, dest, false, WithStreamLocalBindUnlink(true)); err == nil {
+		t.Fatal("expected error when bindUnlink target is a regular file")
+	}
+	data, readErr := os.ReadFile(regularFile)
+	if readErr != nil || string(data) != "precious-data" {
+		t.Fatalf("regular file was deleted or modified: data=%q err=%v", string(data), readErr)
+	}
 }
 
 // -----------------------------------------------------------------------------
