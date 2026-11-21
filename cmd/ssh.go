@@ -865,30 +865,27 @@ func (o *SshOptions) runParentDaemon(ctx context.Context) (err error) {
 		return err
 	}
 
-	nodeID, created, err := o.prepareNode(ctx, provider)
+	return o.runParentDaemonWithProvider(ctx, cfg, provider)
+}
+
+func (o *SshOptions) runParentDaemonWithProvider(ctx context.Context, cfg *config.Configuration, provider config.ConfigProvider) (err error) {
+	nodeID, created, err := o.prepareValidatedConnectionNode(ctx, provider)
 	if err != nil {
 		return err
 	}
-	if _, err := o.resolveAndCacheSessionOptions(provider, nodeID); err != nil {
-		return err
-	}
-	if err := o.validatePostResolutionSessionInvariants(); err != nil {
-		return err
-	}
+	confirmed := false
+	defer func() {
+		if created && !confirmed {
+			discardPendingNode(provider, nodeID)
+		}
+	}()
 	if err := o.validateBackgroundProxyCommand(provider, nodeID); err != nil {
 		return err
 	}
 	if _, err := o.persistPreparedNodeUpdate(ctx, provider, nodeID, created); err != nil {
 		return err
 	}
-	return o.runParentDaemonWithNode(ctx, cfg, provider, nodeID)
-}
-
-func (o *SshOptions) runParentDaemonWithValidatedNode(ctx context.Context, cfg *config.Configuration, provider config.ConfigProvider, nodeID string) error {
-	if err := o.validateBackgroundProxyCommand(provider, nodeID); err != nil {
-		return err
-	}
-	return o.runParentDaemonWithNode(ctx, cfg, provider, nodeID)
+	return o.runParentDaemonWithNode(ctx, cfg, provider, nodeID, &confirmed)
 }
 
 func (o *SshOptions) validateBackgroundProxyCommand(provider config.ConfigProvider, nodeID string) error {
@@ -920,7 +917,7 @@ func (o *SshOptions) validatePostResolutionSessionInvariants() error {
 	return nil
 }
 
-func (o *SshOptions) runParentDaemonWithNode(ctx context.Context, cfg *config.Configuration, provider config.ConfigProvider, nodeID string) (err error) {
+func (o *SshOptions) runParentDaemonWithNode(ctx context.Context, cfg *config.Configuration, provider config.ConfigProvider, nodeID string, confirmed *bool) (err error) {
 	adpOpts, optErr := o.buildAdapterOptions(nodeID, cfg, provider)
 	if optErr != nil {
 		return optErr
@@ -947,6 +944,9 @@ func (o *SshOptions) runParentDaemonWithNode(ctx context.Context, cfg *config.Co
 	if err != nil {
 		promptErr := promptPressEnterIfTUI(os.Stdin, os.Stdout)
 		return errors.Join(sshConnectionError(nodeID, err), promptErr)
+	}
+	if confirmed != nil && !o.isNodeConfirmationSuppressed(cfg, provider) {
+		*confirmed = true
 	}
 
 	// 无论如何，在 runParentDaemon 退出时，或者有任何 panic 发生时，确保 client 必被关闭
@@ -2586,17 +2586,41 @@ func (o *SshOptions) maybeRedirectStdinNull() (func() error, error) {
 	}, nil
 }
 
+func discardPendingNode(provider any, nodeID string) {
+	if provider == nil || nodeID == "" {
+		return
+	}
+	if discarder, ok := provider.(interface{ DiscardPendingNode(string) }); ok {
+		discarder.DiscardPendingNode(nodeID)
+	}
+}
+
+func (o *SshOptions) isNodeConfirmationSuppressed(cfg *config.Configuration, provider config.ConfigProvider) bool {
+	if _, isRepo := provider.(*config.Repository); !isRepo {
+		return true
+	}
+	policy := utils.EffectiveRememberPolicy(o.Remember, cfg)
+	return policy == utils.RememberPolicyNever || o.isMuxDaemon() || o.isBackgroundChild()
+}
+
 func (o *SshOptions) prepareValidatedConnectionNode(ctx context.Context, provider config.ConfigProvider) (string, bool, error) {
 	nodeID, created, err := o.prepareNode(ctx, provider)
 	if err != nil {
 		return "", false, err
 	}
+	validated := false
+	defer func() {
+		if created && !validated {
+			discardPendingNode(provider, nodeID)
+		}
+	}()
 	if _, err := o.resolveAndCacheSessionOptions(provider, nodeID); err != nil {
 		return "", false, err
 	}
 	if err := o.validatePostResolutionSessionInvariants(); err != nil {
 		return "", false, err
 	}
+	validated = true
 	return nodeID, created, nil
 }
 
@@ -2620,11 +2644,20 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 	if err != nil {
 		return err
 	}
+	return o.runConnectionWithProvider(ctx, cfg, provider, isChild)
+}
 
+func (o *SshOptions) runConnectionWithProvider(ctx context.Context, cfg *config.Configuration, provider config.ConfigProvider, isChild bool) (err error) {
 	nodeID, created, err := o.prepareValidatedConnectionNode(ctx, provider)
 	if err != nil {
 		return err
 	}
+	confirmed := false
+	defer func() {
+		if created && !confirmed {
+			discardPendingNode(provider, nodeID)
+		}
+	}()
 	if !isChild && !o.isMuxDaemon() && o.effectiveBgRun() {
 		if err := o.validateBackgroundProxyCommand(provider, nodeID); err != nil {
 			return err
@@ -2632,7 +2665,7 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 		if _, err := o.persistPreparedNodeUpdate(ctx, provider, nodeID, created); err != nil {
 			return err
 		}
-		return o.runParentDaemonWithValidatedNode(ctx, cfg, provider, nodeID)
+		return o.runParentDaemonWithNode(ctx, cfg, provider, nodeID, &confirmed)
 	}
 	if _, err := o.persistPreparedNodeUpdate(ctx, provider, nodeID, created); err != nil {
 		return err
@@ -2647,6 +2680,9 @@ func (o *SshOptions) runConnection(ctx context.Context, isChild bool) (err error
 	client, err := o.connectClient(ctx, connector, nodeID, isChild)
 	if err != nil {
 		return err
+	}
+	if !o.isNodeConfirmationSuppressed(cfg, provider) {
+		confirmed = true
 	}
 	defer func() {
 		if closeErr := client.Close(); closeErr != nil {
@@ -2965,6 +3001,9 @@ func (o *SshOptions) resolveNode(ctx context.Context, provider config.ConfigProv
 	}
 	updated, err := o.persistPreparedNodeUpdate(ctx, provider, nodeID, created)
 	if err != nil {
+		if created {
+			discardPendingNode(provider, nodeID)
+		}
 		return nodeID, created, err
 	}
 	return nodeID, created || updated, nil

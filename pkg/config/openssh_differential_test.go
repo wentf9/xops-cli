@@ -124,6 +124,10 @@ type sshConfigDiffCase struct {
 	checkControl      bool
 	checkTransport    bool
 	checkSessionCmd   bool
+	checkTrustBatch   bool
+	checkAlgoAuth     bool
+	checkCertAgent    bool
+	checkForwardsExec bool
 }
 
 func TestOpenSSHConfigDifferentialOracle(t *testing.T) {
@@ -351,6 +355,71 @@ Host canon-check
     CanonicalizeMaxDots 2
     CanonicalizeFallbackLocal no
 
+Host trust-batch
+    HostName 10.10.0.18
+    User trustuser
+    StrictHostKeyChecking accept-new
+    VerifyHostKeyDNS ask
+    UserKnownHostsFile %s/kh_user_1 %s/kh_user_2
+    GlobalKnownHostsFile %s/kh_global
+    BatchMode yes
+
+Host trust-batch-off
+    HostName 10.10.0.19
+    User trustoff
+    StrictHostKeyChecking no
+    VerifyHostKeyDNS no
+    HashKnownHosts no
+    BatchMode no
+
+Host algo-auth
+    HostName 10.10.0.20
+    User algouser
+    KexAlgorithms curve25519-sha256,ecdh-sha2-nistp256
+    MACs hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com
+    HostKeyAlgorithms ssh-ed25519,rsa-sha2-512
+    PreferredAuthentications publickey,keyboard-interactive,password
+    PasswordAuthentication no
+    PubkeyAuthentication yes
+    KbdInteractiveAuthentication no
+
+Host algo-auth-toggles
+    HostName 10.10.0.21
+    User algotoggle
+    PasswordAuthentication yes
+    PubkeyAuthentication no
+    KbdInteractiveAuthentication yes
+
+Host cert-agent
+    HostName 10.10.0.22
+    User certuser
+    CertificateFile %s/id_a-cert.pub
+    CertificateFile %s/id_b-cert.pub
+    IdentityAgent %s/agent.sock
+
+Host cert-agent-none
+    HostName 10.10.0.23
+    User certnone
+    CertificateFile none
+    IdentityAgent none
+
+Host agent-env
+    HostName 10.10.0.24
+    User agentenv
+    IdentityAgent SSH_AUTH_SOCK
+
+Host fwd-localexec
+    HostName 10.10.0.25
+    User fwduser
+    LocalForward 127.0.0.1:8080 10.0.0.1:80
+    LocalForward 9090 [::1]:9000
+    RemoteForward 127.0.0.1:8443 127.0.0.1:443
+    RemoteForward 0
+    DynamicForward 127.0.0.1:1080
+    DynamicForward 1081
+    PermitLocalCommand yes
+    LocalCommand echo hi %%h %%p
+
 Host *
     User fallback-user
     Port 2200
@@ -359,7 +428,7 @@ Host *
     SendEnv FOO_1 GLOBAL
     SetEnv GLOBAL_ENV=fallback
     IdentityFile ~/.ssh/id_global
-`, incDir, incDir, globDir, incDir, incDir, incDir, incDir)
+`, incDir, incDir, globDir, incDir, incDir, incDir, incDir, tmpDir, tmpDir, tmpDir, tmpDir, tmpDir, tmpDir)
 	writeCfgFile(t, mainCfgPath, mainCfg)
 	return mainCfgPath
 }
@@ -423,6 +492,14 @@ func openSSHDiffCases() []sshConfigDiffCase {
 		},
 		{name: "25_canonicalize_directives_offline", host: "canon-check", checkTransport: true},
 		{name: "26_conditional_include_bare_directives", host: "outer-bare", checkSendEnv: true},
+		{name: "28_trust_and_batch_mode_tier4_policy_and_parity", host: "trust-batch", checkTrustBatch: true},
+		{name: "29_trust_off_and_hash_known_hosts_one_way_yes", host: "trust-batch-off", checkTrustBatch: true},
+		{name: "30_algorithms_and_auth_methods_parity", host: "algo-auth", checkAlgoAuth: true},
+		{name: "31_auth_method_boolean_toggles", host: "algo-auth-toggles", checkAlgoAuth: true},
+		{name: "32_certificate_files_and_identity_agent", host: "cert-agent", checkCertAgent: true},
+		{name: "33_certificate_file_and_identity_agent_none", host: "cert-agent-none", checkCertAgent: true},
+		{name: "34_identity_agent_ssh_auth_sock", host: "agent-env", checkCertAgent: true},
+		{name: "35_forwards_and_local_command_parity", host: "fwd-localexec", checkForwardsExec: true},
 	}
 }
 
@@ -501,6 +578,18 @@ func assertOpenSSHDiffCaseOptions(
 		if opts.RemoteCommand() != wantRC {
 			t.Errorf("RemoteCommand = %q, ssh -G = %q", opts.RemoteCommand(), wantRC)
 		}
+	}
+	if tc.checkTrustBatch {
+		assertDifferentialTrustAndBatch(t, dump, opts, tc.host)
+	}
+	if tc.checkAlgoAuth {
+		assertDifferentialAlgoAndAuth(t, dump, opts, tc.host)
+	}
+	if tc.checkCertAgent {
+		assertDifferentialCertAndAgent(t, dump, opts, tc.host)
+	}
+	if tc.checkForwardsExec {
+		assertDifferentialForwardsAndLocalExec(t, dump, opts)
 	}
 }
 
@@ -721,6 +810,480 @@ func assertDifferentialTransport(t *testing.T, dump map[string][]string, opts *s
 	}
 	if !opts.HashKnownHosts() || normalizeOpenSSHBool(sshDumpFirst(dump, "hashknownhosts")) != "yes" {
 		t.Errorf("HashKnownHosts = %v, ssh -G = %q", opts.HashKnownHosts(), sshDumpFirst(dump, "hashknownhosts"))
+	}
+}
+
+func assertDifferentialTrustAndBatch(t *testing.T, dump map[string][]string, opts *ssh.Options, host string) {
+	t.Helper()
+	if opts == nil {
+		t.Fatal("opts is nil")
+	}
+	wantBatch := normalizeOpenSSHBool(sshDumpFirst(dump, "batchmode"))
+	gotBatch := normalizeOpenSSHBool(opts.Get(ssh.OptionBatchMode))
+	if gotBatch != wantBatch || opts.BatchMode() != (wantBatch == "yes") {
+		t.Errorf("BatchMode = (%q, %v), ssh -G = %q", opts.Get(ssh.OptionBatchMode), opts.BatchMode(), wantBatch)
+	}
+
+	// Host-trust options carry OptionTier4Deny in core/ssh so ~/.ssh/config cannot
+	// implicitly weaken host key trust; verify both the fail-closed Tier-4 denial
+	// AND exact semantic parity when the same directives are supplied explicitly via CLI.
+	if opts.StrictHostKeyChecking() != "" {
+		t.Errorf("Tier-4 StrictHostKeyChecking must be denied (empty), got %q", opts.StrictHostKeyChecking())
+	}
+	if opts.VerifyHostKeyDNS() != "" {
+		t.Errorf("Tier-4 VerifyHostKeyDNS must be denied (empty), got %q", opts.VerifyHostKeyDNS())
+	}
+	if opts.UserKnownHostsFile() != "" {
+		t.Errorf("Tier-4 UserKnownHostsFile must be denied (empty), got %q", opts.UserKnownHostsFile())
+	}
+	if opts.GlobalKnownHostsFile() != "" {
+		t.Errorf("Tier-4 GlobalKnownHostsFile must be denied (empty), got %q", opts.GlobalKnownHostsFile())
+	}
+	if host == "trust-batch-off" && opts.HashKnownHosts() {
+		t.Error("Tier-4 HashKnownHosts=no must not enable HashKnownHosts")
+	}
+
+	cliDirectives := []string{
+		"StrictHostKeyChecking=" + sshDumpFirst(dump, "stricthostkeychecking"),
+		"VerifyHostKeyDNS=" + sshDumpFirst(dump, "verifyhostkeydns"),
+	}
+	if host == "trust-batch" {
+		cliDirectives = append(cliDirectives,
+			"UserKnownHostsFile="+sshDumpFirst(dump, "userknownhostsfile"),
+			"GlobalKnownHostsFile="+sshDumpFirst(dump, "globalknownhostsfile"),
+		)
+	}
+	cliOpts, err := ssh.ParseCLIOptions(cliDirectives)
+	if err != nil {
+		t.Fatalf("ParseCLIOptions(%v) failed: %v", cliDirectives, err)
+	}
+	if got, want := cliOpts.StrictHostKeyChecking(), normalizeOpenSSHBool(sshDumpFirst(dump, "stricthostkeychecking")); got != want {
+		t.Errorf("CLI StrictHostKeyChecking = %q, ssh -G = %q", got, want)
+	}
+	if got, want := cliOpts.VerifyHostKeyDNS(), normalizeOpenSSHBool(sshDumpFirst(dump, "verifyhostkeydns")); got != want {
+		t.Errorf("CLI VerifyHostKeyDNS = %q, ssh -G = %q", got, want)
+	}
+	if host == "trust-batch" {
+		if got, want := cliOpts.UserKnownHostsFile(), sshDumpFirst(dump, "userknownhostsfile"); got != want {
+			t.Errorf("CLI UserKnownHostsFile = %q, ssh -G = %q", got, want)
+		}
+		if got, want := cliOpts.GlobalKnownHostsFile(), sshDumpFirst(dump, "globalknownhostsfile"); got != want {
+			t.Errorf("CLI GlobalKnownHostsFile = %q, ssh -G = %q", got, want)
+		}
+	}
+}
+
+func assertDifferentialAlgoAndAuth(t *testing.T, dump map[string][]string, opts *ssh.Options, host string) {
+	t.Helper()
+	if opts == nil {
+		t.Fatal("opts is nil")
+	}
+	if host == "algo-auth" {
+		if got, want := opts.KexAlgorithms(), sshDumpFirst(dump, "kexalgorithms"); got != want {
+			t.Errorf("KexAlgorithms = %q, ssh -G = %q", got, want)
+		}
+		if got, want := opts.MACs(), sshDumpFirst(dump, "macs"); got != want {
+			t.Errorf("MACs = %q, ssh -G = %q", got, want)
+		}
+		if got, want := opts.HostKeyAlgorithms(), sshDumpFirst(dump, "hostkeyalgorithms"); got != want {
+			t.Errorf("HostKeyAlgorithms = %q, ssh -G = %q", got, want)
+		}
+		if got, want := strings.Join(opts.PreferredAuthentications(), ","), sshDumpFirst(dump, "preferredauthentications"); got != want {
+			t.Errorf("PreferredAuthentications = %q, ssh -G = %q", got, want)
+		}
+	}
+	assertDiffBoolGetter(t, "PasswordAuthentication", dump, "passwordauthentication", opts.PasswordAuthentication)
+	assertDiffBoolGetter(t, "PubkeyAuthentication", dump, "pubkeyauthentication", opts.PubkeyAuthentication)
+	assertDiffBoolGetter(t, "KbdInteractiveAuthentication", dump, "kbdinteractiveauthentication", opts.KbdInteractiveAuthentication)
+}
+
+func assertDiffBoolGetter(t *testing.T, name string, dump map[string][]string, dumpKey string, getter func() (bool, bool)) {
+	t.Helper()
+	got, ok := getter()
+	want := normalizeOpenSSHBool(sshDumpFirst(dump, dumpKey))
+	if !ok || normalizeOpenSSHBool(strconv.FormatBool(got)) != want {
+		t.Errorf("%s = (%v, %v), ssh -G = %q", name, got, ok, sshDumpFirst(dump, dumpKey))
+	}
+}
+
+func assertDifferentialCertAndAgent(t *testing.T, dump map[string][]string, opts *ssh.Options, host string) {
+	t.Helper()
+	if opts == nil {
+		t.Fatal("opts is nil")
+	}
+	if got, want := opts.IdentityAgent(), sshDumpFirst(dump, "identityagent"); got != want {
+		t.Errorf("IdentityAgent = %q, ssh -G = %q", got, want)
+	}
+	if host == "agent-env" {
+		return
+	}
+	if got, want := opts.CertificateFiles(), dump["certificatefile"]; !slices.Equal(got, want) {
+		t.Errorf("CertificateFiles = %v, ssh -G = %v", got, want)
+	}
+}
+
+func normalizeSSHDumpLocalForwards(t *testing.T, raw []string) []string {
+	t.Helper()
+	out := make([]string, 0, len(raw))
+	for _, entry := range raw {
+		spec, err := ssh.ParseForwardSpec(entry)
+		if err != nil {
+			t.Fatalf("ParseForwardSpec(%q) from ssh -G: %v", entry, err)
+		}
+		out = append(out, spec.String())
+	}
+	return out
+}
+
+func normalizeSSHDumpRemoteForwards(t *testing.T, raw []string) []string {
+	t.Helper()
+	out := make([]string, 0, len(raw))
+	for _, entry := range raw {
+		trimmed := strings.TrimSpace(entry)
+		// OpenSSH `ssh -G` formats reverse dynamic RemoteForward as "<bind> [socks]:0".
+		if bind, ok := strings.CutSuffix(trimmed, " [socks]:0"); ok {
+			trimmed = strings.TrimSpace(bind)
+		}
+		spec, err := ssh.ParseRemoteForwardSpec(trimmed)
+		if err != nil {
+			t.Fatalf("ParseRemoteForwardSpec(%q) from ssh -G: %v", entry, err)
+		}
+		out = append(out, spec.String())
+	}
+	return out
+}
+
+func normalizeSSHDumpDynamicForwards(t *testing.T, raw []string) []string {
+	t.Helper()
+	out := make([]string, 0, len(raw))
+	for _, entry := range raw {
+		norm, err := ssh.ParseDynamicForwardSpec(entry)
+		if err != nil {
+			t.Fatalf("ParseDynamicForwardSpec(%q) from ssh -G: %v", entry, err)
+		}
+		out = append(out, norm)
+	}
+	return out
+}
+
+func assertDifferentialForwardsAndLocalExec(t *testing.T, dump map[string][]string, opts *ssh.Options) {
+	t.Helper()
+	if opts == nil {
+		t.Fatal("opts is nil")
+	}
+	wantLocal := normalizeSSHDumpLocalForwards(t, dump["localforward"])
+	if got := opts.LocalForwards(); !slices.Equal(got, wantLocal) {
+		t.Errorf("LocalForwards = %v, ssh -G normalized = %v (raw=%v)", got, wantLocal, dump["localforward"])
+	}
+	wantRemote := normalizeSSHDumpRemoteForwards(t, dump["remoteforward"])
+	if got := opts.RemoteForwards(); !slices.Equal(got, wantRemote) {
+		t.Errorf("RemoteForwards = %v, ssh -G normalized = %v (raw=%v)", got, wantRemote, dump["remoteforward"])
+	}
+	wantDyn := normalizeSSHDumpDynamicForwards(t, dump["dynamicforward"])
+	if got := opts.DynamicForwards(); !slices.Equal(got, wantDyn) {
+		t.Errorf("DynamicForwards = %v, ssh -G normalized = %v (raw=%v)", got, wantDyn, dump["dynamicforward"])
+	}
+	wantPermit := normalizeOpenSSHBool(sshDumpFirst(dump, "permitlocalcommand"))
+	if normalizeOpenSSHBool(strconv.FormatBool(opts.PermitLocalCommand())) != wantPermit {
+		t.Errorf("PermitLocalCommand = %v, ssh -G = %q", opts.PermitLocalCommand(), sshDumpFirst(dump, "permitlocalcommand"))
+	}
+	if got, want := opts.LocalCommand(), sshDumpFirst(dump, "localcommand"); got != want {
+		t.Errorf("LocalCommand = %q, ssh -G = %q", got, want)
+	}
+}
+
+func writeNestedIncludeChain(t *testing.T, dir string, hops int, leafHost string) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("MkdirAll(%q): %v", dir, err)
+	}
+	for i := 0; i <= hops; i++ {
+		curPath := filepath.Join(dir, fmt.Sprintf("lvl%02d.conf", i))
+		if i < hops {
+			nextPath := filepath.Join(dir, fmt.Sprintf("lvl%02d.conf", i+1))
+			writeCfgFile(t, curPath, fmt.Sprintf("Include %s\n", nextPath))
+			continue
+		}
+		writeCfgFile(t, curPath, fmt.Sprintf("Host %s\n    HostName 10.99.0.%d\n    User deepuser\n", leafHost, hops))
+	}
+	return filepath.Join(dir, "lvl00.conf")
+}
+
+// TestOpenSSHConfigDifferential_IncludeDepthFailClosed verifies that both real
+// `ssh -F <cfg> -G` and `NewOpenSSHParserFromPath` accept depth == 16 and fail
+// closed on a 17-level nested Include chain (depth > 16).
+func TestOpenSSHConfigDifferential_IncludeDepthFailClosed(t *testing.T) {
+	sshBin := requireOpenSSHBinary(t)
+	tmpDir := t.TempDir()
+
+	okCfg := writeNestedIncludeChain(t, filepath.Join(tmpDir, "depth16"), maxIncludeDepth, "depth-ok")
+	okDump := runSSHConfigDump(t, sshBin, okCfg, "depth-ok")
+	okParser, err := NewOpenSSHParserFromPath(okCfg)
+	if err != nil {
+		t.Fatalf("NewOpenSSHParserFromPath(depth=%d) failed: %v", maxIncludeDepth, err)
+	}
+	_, okHost, _, err := okParser.GetVirtualNode("depth-ok")
+	if err != nil {
+		t.Fatalf("GetVirtualNode(depth-ok): %v", err)
+	}
+	if want := sshDumpFirst(okDump, "hostname"); okHost.Address != want {
+		t.Fatalf("depth-ok HostName = %q, ssh -G = %q", okHost.Address, want)
+	}
+
+	failCfg := writeNestedIncludeChain(t, filepath.Join(tmpDir, "depth17"), maxIncludeDepth+1, "depth-fail")
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	out, sshErr := exec.CommandContext(ctx, sshBin, "-F", failCfg, "-G", "depth-fail").CombinedOutput()
+	if sshErr == nil {
+		t.Fatalf("expected ssh -F %s -G depth-fail (depth=%d) to fail closed, but it succeeded:\n%s", failCfg, maxIncludeDepth+1, out)
+	}
+	if _, parseErr := NewOpenSSHParserFromPath(failCfg); parseErr == nil || !strings.Contains(parseErr.Error(), "depth limit") {
+		t.Fatalf("expected NewOpenSSHParserFromPath(depth=%d) to fail closed with depth limit error, got %v", maxIncludeDepth+1, parseErr)
+	}
+}
+
+func effectiveOpenSSHRuntimeIdentityFiles(dumpIDs []string) []string {
+	out := make([]string, 0, len(dumpIDs))
+	for _, id := range dumpIDs {
+		if ssh.IsNoneValue(id) {
+			if len(out) == 0 {
+				return []string{"none"}
+			}
+			return out
+		}
+		if !slices.Contains(out, id) {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+type multiLayerMergeFn func(t *testing.T, cli []string) (*ssh.Options, map[string][]string)
+
+// TestOpenSSHConfigDifferential_MultiLayerCLIOverride compares real
+// `ssh -F <cfg> -o <cliOpts...> -G <host>` against `ssh.ParseCLIOptions` +
+// `ssh.MergeEffectiveOptions(cliOpts, parserOpts)` across scalar override,
+// IdentityFile=none truncation, SendEnv/SetEnv ordering, ControlPath=none
+// cross-layer disable, and trust/algorithm overrides.
+func TestOpenSSHConfigDifferential_MultiLayerCLIOverride(t *testing.T) {
+	sshBin := requireOpenSSHBinary(t)
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "multi_layer.conf")
+	writeCfgFile(t, cfgPath, fmt.Sprintf(`
+Host ml-host
+    HostName 10.30.0.1
+    User mluser
+    ConnectTimeout 15
+    ServerAliveInterval 30
+    ServerAliveCountMax 5
+    RequestTTY no
+    IdentityFile %s/id_cfg_1
+    IdentityFile %s/id_cfg_2
+    SendEnv CFG_A CFG_B
+    SetEnv K=cfg ONLY_CFG=1
+    ControlMaster auto
+    ControlPath %s/cm-%%C
+    ControlPersist 10m
+    KexAlgorithms curve25519-sha256,ecdh-sha2-nistp256
+    MACs hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com
+    HostKeyAlgorithms ssh-ed25519,rsa-sha2-512
+    PreferredAuthentications publickey,password
+    StrictHostKeyChecking no
+    VerifyHostKeyDNS no
+`, tmpDir, tmpDir, tmpDir))
+
+	parser, err := NewOpenSSHParserFromPath(cfgPath)
+	if err != nil {
+		t.Fatalf("NewOpenSSHParserFromPath: %v", err)
+	}
+	parserOpts, err := parser.GetSSHOptions("ml-host")
+	if err != nil {
+		t.Fatalf("GetSSHOptions(ml-host): %v", err)
+	}
+
+	mergeCLI := func(t *testing.T, cli []string) (*ssh.Options, map[string][]string) {
+		t.Helper()
+		cliOpts, parseErr := ssh.ParseCLIOptions(cli)
+		if parseErr != nil {
+			t.Fatalf("ParseCLIOptions(%v): %v", cli, parseErr)
+		}
+		eff, mergeErr := ssh.MergeEffectiveOptions(cliOpts, parserOpts)
+		if mergeErr != nil {
+			t.Fatalf("MergeEffectiveOptions(%v): %v", cli, mergeErr)
+		}
+		extraArgs := make([]string, 0, len(cli)*2)
+		for _, opt := range cli {
+			extraArgs = append(extraArgs, "-o", opt)
+		}
+		return eff, runSSHConfigDump(t, sshBin, cfgPath, "ml-host", extraArgs...)
+	}
+
+	t.Run("scalar_and_trust_and_algorithm_overrides", func(t *testing.T) {
+		assertMultiLayerScalarTrustAlgo(t, tmpDir, mergeCLI)
+	})
+	t.Run("identityfile_none_truncation_and_prepend", func(t *testing.T) {
+		assertMultiLayerIdentityFileNone(t, tmpDir, mergeCLI)
+	})
+	t.Run("sendenv_and_setenv_cross_layer_ordering", func(t *testing.T) {
+		assertMultiLayerEnvOrdering(t, mergeCLI)
+	})
+	t.Run("controlpath_none_disables_config_multiplexing", func(t *testing.T) {
+		assertMultiLayerControlPathNone(t, mergeCLI)
+	})
+}
+
+func assertMultiLayerScalarTrustAlgo(t *testing.T, tmpDir string, mergeCLI multiLayerMergeFn) {
+	t.Helper()
+	cliKH := filepath.Join(tmpDir, "cli_kh")
+	cliGKH := filepath.Join(tmpDir, "cli_gkh")
+	eff, dump := mergeCLI(t, []string{
+		"ConnectTimeout=5",
+		"RequestTTY=force",
+		"StrictHostKeyChecking=yes",
+		"VerifyHostKeyDNS=ask",
+		"UserKnownHostsFile=" + cliKH,
+		"GlobalKnownHostsFile=" + cliGKH,
+		"KexAlgorithms=curve25519-sha256",
+		"MACs=hmac-sha2-512-etm@openssh.com",
+		"HostKeyAlgorithms=ssh-ed25519",
+		"PreferredAuthentications=publickey",
+	})
+	wantCT, _ := strconv.Atoi(sshDumpFirst(dump, "connecttimeout"))
+	if int(eff.ConnectTimeout().Seconds()) != wantCT {
+		t.Errorf("ConnectTimeout = %v, ssh -G = %ds", eff.ConnectTimeout(), wantCT)
+	}
+	wantSAI, _ := strconv.Atoi(sshDumpFirst(dump, "serveraliveinterval"))
+	if int(eff.ServerAliveInterval().Seconds()) != wantSAI {
+		t.Errorf("ServerAliveInterval = %v, ssh -G = %ds", eff.ServerAliveInterval(), wantSAI)
+	}
+	wantSCM, _ := strconv.Atoi(sshDumpFirst(dump, "serveralivecountmax"))
+	if eff.ServerAliveCountMax() != wantSCM {
+		t.Errorf("ServerAliveCountMax = %d, ssh -G = %d", eff.ServerAliveCountMax(), wantSCM)
+	}
+	assertMultiLayerStringParity(t, "RequestTTY", string(eff.RequestTTY()), strings.ToLower(sshDumpFirst(dump, "requesttty")))
+	assertMultiLayerStringParity(t, "StrictHostKeyChecking", eff.StrictHostKeyChecking(), normalizeOpenSSHBool(sshDumpFirst(dump, "stricthostkeychecking")))
+	assertMultiLayerStringParity(t, "VerifyHostKeyDNS", eff.VerifyHostKeyDNS(), normalizeOpenSSHBool(sshDumpFirst(dump, "verifyhostkeydns")))
+	assertMultiLayerStringParity(t, "UserKnownHostsFile", eff.UserKnownHostsFile(), sshDumpFirst(dump, "userknownhostsfile"))
+	assertMultiLayerStringParity(t, "GlobalKnownHostsFile", eff.GlobalKnownHostsFile(), sshDumpFirst(dump, "globalknownhostsfile"))
+	assertMultiLayerStringParity(t, "KexAlgorithms", eff.KexAlgorithms(), sshDumpFirst(dump, "kexalgorithms"))
+	assertMultiLayerStringParity(t, "MACs", eff.MACs(), sshDumpFirst(dump, "macs"))
+	assertMultiLayerStringParity(t, "HostKeyAlgorithms", eff.HostKeyAlgorithms(), sshDumpFirst(dump, "hostkeyalgorithms"))
+	assertMultiLayerStringParity(t, "PreferredAuthentications", strings.Join(eff.PreferredAuthentications(), ","), sshDumpFirst(dump, "preferredauthentications"))
+}
+
+func assertMultiLayerStringParity(t *testing.T, field, got, want string) {
+	t.Helper()
+	if got != want {
+		t.Errorf("%s = %q, ssh -G = %q", field, got, want)
+	}
+}
+
+func assertMultiLayerIdentityFileNone(t *testing.T, tmpDir string, mergeCLI multiLayerMergeFn) {
+	t.Helper()
+	cliKey := filepath.Join(tmpDir, "id_cli_1")
+	for _, tc := range []struct {
+		name string
+		cli  []string
+		want []string
+	}{
+		{"cli_none_blocks_config", []string{"IdentityFile=none"}, []string{"none"}},
+		{"cli_key_then_none_blocks_config", []string{"IdentityFile=" + cliKey, "IdentityFile=none"}, []string{cliKey}},
+		{"cli_key_prepends_before_config", []string{"IdentityFile=" + cliKey}, []string{cliKey, filepath.Join(tmpDir, "id_cfg_1"), filepath.Join(tmpDir, "id_cfg_2")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			eff, dump := mergeCLI(t, tc.cli)
+			wantFromOracle := effectiveOpenSSHRuntimeIdentityFiles(dump["identityfile"])
+			if !slices.Equal(eff.IdentityFiles(), tc.want) {
+				t.Errorf("eff.IdentityFiles() = %v, want %v", eff.IdentityFiles(), tc.want)
+			}
+			if !slices.Equal(eff.IdentityFiles(), wantFromOracle) {
+				t.Errorf("eff.IdentityFiles() = %v disagrees with ssh -G runtime effective %v (raw=%v)", eff.IdentityFiles(), wantFromOracle, dump["identityfile"])
+			}
+		})
+	}
+}
+
+func assertMultiLayerEnvOrdering(t *testing.T, mergeCLI multiLayerMergeFn) {
+	t.Helper()
+	effAdd, dumpAdd := mergeCLI(t, []string{"SendEnv=CLI_C", "SetEnv=K=cli CLI_ONLY=2"})
+	envKeys := []string{"CFG_A", "CFG_B", "CLI_C"}
+	sendOnly := effAdd.Clone()
+	sendOnly.Delete(ssh.OptionSetEnv)
+	gotSendVars, err := ssh.ResolveSessionEnv(sendOnly, func() []string {
+		return []string{"CFG_A=1", "CFG_B=1", "CLI_C=1"}
+	})
+	if err != nil {
+		t.Fatalf("ResolveSessionEnv(send): %v", err)
+	}
+	var gotNames, wantNames []string
+	for _, ev := range gotSendVars {
+		gotNames = append(gotNames, ev.Name)
+	}
+	for _, k := range envKeys {
+		if slices.Contains(dumpAdd["sendenv"], k) {
+			wantNames = append(wantNames, k)
+		}
+	}
+	slices.Sort(gotNames)
+	slices.Sort(wantNames)
+	if !slices.Equal(gotNames, wantNames) {
+		t.Errorf("SendEnv resolved = %v, ssh -G = %v", gotNames, wantNames)
+	}
+
+	gotSetVars, err := ssh.ResolveSessionEnv(effAdd, nil)
+	if err != nil {
+		t.Fatalf("ResolveSessionEnv(set): %v", err)
+	}
+	gotSetMap := make(map[string]string, len(gotSetVars))
+	for _, ev := range gotSetVars {
+		gotSetMap[ev.Name] = ev.Value
+	}
+	for _, wantPair := range dumpAdd["setenv"] {
+		if k, v, ok := strings.Cut(wantPair, "="); ok && gotSetMap[k] != v {
+			t.Errorf("SetEnv[%q] = %q, ssh -G = %q", k, gotSetMap[k], v)
+		}
+	}
+	if gotSetMap["ONLY_CFG"] != "1" {
+		t.Errorf("layered SetEnv dropped non-conflicting config key ONLY_CFG: %v", gotSetMap)
+	}
+
+	effExcl, _ := mergeCLI(t, []string{"SendEnv=-CFG_A CLI_C"})
+	exclSendOnly := effExcl.Clone()
+	exclSendOnly.Delete(ssh.OptionSetEnv)
+	exclVars, err := ssh.ResolveSessionEnv(exclSendOnly, func() []string {
+		return []string{"CFG_A=1", "CFG_B=1", "CLI_C=1"}
+	})
+	if err != nil {
+		t.Fatalf("ResolveSessionEnv(excl): %v", err)
+	}
+	var exclNames []string
+	for _, ev := range exclVars {
+		exclNames = append(exclNames, ev.Name)
+	}
+	slices.Sort(exclNames)
+	if !slices.Equal(exclNames, []string{"CFG_B", "CLI_C"}) {
+		t.Errorf("CLI SendEnv=-CFG_A resolved = %v, want [CFG_B CLI_C]", exclNames)
+	}
+}
+
+func assertMultiLayerControlPathNone(t *testing.T, mergeCLI multiLayerMergeFn) {
+	t.Helper()
+	eff, dump := mergeCLI(t, []string{"ControlPath=none"})
+	dumpCP := strings.TrimSpace(sshDumpFirst(dump, "controlpath"))
+	if dumpCP != "" && !ssh.IsNoneValue(dumpCP) {
+		t.Fatalf("expected ssh -G ControlPath=none to disable controlpath, got %q", dumpCP)
+	}
+	if !ssh.IsNoneValue(eff.ControlPath()) {
+		t.Errorf("eff.ControlPath() = %q, want none", eff.ControlPath())
+	}
+	if eff.ControlMaster() != ssh.ControlMasterNo {
+		t.Errorf("eff.ControlMaster() = %q, want no", eff.ControlMaster())
+	}
+	if eff.ControlPersist() != "" {
+		t.Errorf("eff.ControlPersist() = %q, want empty", eff.ControlPersist())
+	}
+	if ctrl := eff.ControlConfig(); ctrl != nil && ctrl.IsEnabled() {
+		t.Errorf("eff.ControlConfig().IsEnabled() = true, want false (%+v)", ctrl)
 	}
 }
 

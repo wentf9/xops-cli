@@ -52,6 +52,9 @@ type ScpOptions struct {
 	diagnostics    corelog.DiagnosticObserver
 	canonicalMu    sync.Mutex
 	canonicalCache map[string]config.CanonicalizeResult
+	pendingMu      sync.Mutex
+	pendingScope   bool
+	pendingNodes   []string
 }
 
 func NewScpOptions() *ScpOptions {
@@ -391,6 +394,8 @@ func (o *ScpOptions) RunContext(ctx context.Context) (retErr error) {
 		return err
 	}
 
+	defer o.beginPendingCleanupScope(provider)()
+
 	defer func() {
 		if handoffErr := o.handoffConnectorMasters(ctx, provider, connector); handoffErr != nil {
 			logger.DefaultLogger().Debugf("mux: master handoff failed: %v", handoffErr)
@@ -401,11 +406,59 @@ func (o *ScpOptions) RunContext(ctx context.Context) (retErr error) {
 	return o.runTransfer(ctx, provider, connector)
 }
 
+func (o *ScpOptions) beginPendingCleanupScope(provider config.ConfigProvider) func() {
+	if o == nil {
+		return func() {}
+	}
+	o.pendingMu.Lock()
+	if o.pendingScope {
+		o.pendingMu.Unlock()
+		return func() {}
+	}
+	o.pendingScope = true
+	o.pendingNodes = nil
+	o.pendingMu.Unlock()
+	return func() {
+		o.pendingMu.Lock()
+		nodes := o.pendingNodes
+		o.pendingNodes = nil
+		o.pendingScope = false
+		o.pendingMu.Unlock()
+		for _, nodeID := range nodes {
+			discardPendingNode(provider, nodeID)
+		}
+	}
+}
+
+func (o *ScpOptions) trackUnconfirmedPendingNode(nodeID string) bool {
+	if o == nil || nodeID == "" {
+		return false
+	}
+	o.pendingMu.Lock()
+	defer o.pendingMu.Unlock()
+	if !o.pendingScope {
+		return false
+	}
+	o.pendingNodes = append(o.pendingNodes, nodeID)
+	return true
+}
+
+func (o *ScpOptions) isScpNodeConfirmationSuppressed(provider config.ConfigProvider) bool {
+	if _, isRepo := provider.(*config.Repository); !isRepo {
+		return true
+	}
+	if o.isBatchMode() {
+		return true
+	}
+	return cmdutils.EffectiveRememberPolicy(o.Remember, provider.Snapshot()) == cmdutils.RememberPolicyNever
+}
+
 // runTransfer borrows the caller-owned connector for path routing and transfer.
 func (o *ScpOptions) runTransfer(ctx context.Context, provider config.ConfigProvider, connector *ssh.Connector) (retErr error) {
 	if err := o.ensureGeneralOptionsApplied(); err != nil {
 		return err
 	}
+	defer o.beginPendingCleanupScope(provider)()
 	if diagnostics, ok := o.diagnostics.(*scpDiagnostics); ok {
 		diagnostics.transfer(o.Source, o.Dest, "starting")
 		defer func() {
@@ -1377,13 +1430,23 @@ func (o *ScpOptions) connectSftpForPath(ctx context.Context, p PathInfo, specifi
 	if cErr != nil {
 		return "", nil, cErr
 	}
-	nodeID, _, err := o.getOrCreateNodeForPath(ctx, provider, p, specificPassword)
+	nodeID, pendingCreated, _, err := o.getOrCreateNodeForPathWithPending(ctx, provider, p, specificPassword)
 	if err != nil {
 		return "", nil, err
 	}
+	confirmed := false
+	defer func() {
+		if pendingCreated && !confirmed {
+			discardPendingNode(provider, nodeID)
+		}
+	}()
 	client, err := connector.Connect(ctx, nodeID)
 	if err != nil {
 		return "", nil, err
+	}
+	confirmSuppressed := o.isScpNodeConfirmationSuppressed(provider)
+	if !confirmSuppressed {
+		confirmed = true
 	}
 	sftpCli, err := sftp.NewClient(
 		ctx,
@@ -1395,6 +1458,9 @@ func (o *ScpOptions) connectSftpForPath(ctx context.Context, p PathInfo, specifi
 	)
 	if err != nil {
 		return "", nil, err
+	}
+	if pendingCreated && confirmSuppressed && o.trackUnconfirmedPendingNode(nodeID) {
+		confirmed = true
 	}
 	return nodeID, sftpCli, nil
 }
@@ -1450,16 +1516,21 @@ func (o *ScpOptions) isBatchMode() bool {
 }
 
 func (o *ScpOptions) getOrCreateNodeForPath(ctx context.Context, provider config.ConfigProvider, path PathInfo, specificPassword string) (string, bool, error) {
+	nodeID, _, mutated, err := o.getOrCreateNodeForPathWithPending(ctx, provider, path, specificPassword)
+	return nodeID, mutated, err
+}
+
+func (o *ScpOptions) getOrCreateNodeForPathWithPending(ctx context.Context, provider config.ConfigProvider, path PathInfo, specificPassword string) (string, bool, bool, error) {
 	preparer, ok := provider.(interface {
 		PrepareNodeContext(context.Context, config.EnsureNodeOptions) (config.EnsureNodeResult, error)
 	})
 	if !ok {
-		return "", false, fmt.Errorf("provider does not support node preparation")
+		return "", false, false, fmt.Errorf("provider does not support node preparation")
 	}
 
 	target, err := o.resolveTargetForPath(path)
 	if err != nil {
-		return "", false, err
+		return "", false, false, err
 	}
 
 	batch := o.isBatchMode()
@@ -1472,24 +1543,27 @@ func (o *ScpOptions) getOrCreateNodeForPath(ctx context.Context, provider config
 		Alias:        o.Alias,
 	})
 	if err != nil {
-		return "", false, err
+		return "", false, false, err
 	}
 
 	if batch {
 		if o.JumpHost != "" {
 			if _, jErr := provider.ResolveProxyJumpChain(o.JumpHost); jErr != nil {
-				return "", false, fmt.Errorf("resolve SCP proxy jump %q failed: %w", o.JumpHost, jErr)
+				if res.Created {
+					discardPendingNode(provider, res.NodeID)
+				}
+				return "", false, false, fmt.Errorf("resolve SCP proxy jump %q failed: %w", o.JumpHost, jErr)
 			}
 		}
-		return res.NodeID, false, nil
+		return res.NodeID, res.Created, false, nil
 	}
 
 	if res.Created {
-		return res.NodeID, true, nil
+		return res.NodeID, true, true, nil
 	}
 
 	updated, updateErr := o.updateNode(ctx, res.NodeID, provider, specificPassword, shouldRemember)
-	return res.NodeID, updated, updateErr
+	return res.NodeID, false, updated, updateErr
 }
 
 func (o *ScpOptions) updateNode(ctx context.Context, nodeID string, provider config.ConfigProvider, specificPassword string, shouldRemember bool) (bool, error) {

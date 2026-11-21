@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -452,25 +453,26 @@ func (o *ExecOptions) validateInteractiveOptions() error {
 }
 
 type execHostTask struct {
-	nodeID        string
-	matchedNodeID string
-	baseNodeID    string
-	openSSHAlias  string
-	canonicalHost string
-	resolvedHost  string
-	rawHost       string
-	host          string
-	originalHost  string
-	expandHost    string
-	port          uint16
-	user          string
-	pass          string
-	passphrase    string
-	keyPath       string
-	pendingTarget *config.ConnectionTarget
-	pendingAddr   *utils.HostInfo
-	isTaggedTask  bool
-	outLogName    string
+	nodeID         string
+	matchedNodeID  string
+	baseNodeID     string
+	openSSHAlias   string
+	canonicalHost  string
+	resolvedHost   string
+	rawHost        string
+	host           string
+	originalHost   string
+	expandHost     string
+	port           uint16
+	user           string
+	pass           string
+	passphrase     string
+	keyPath        string
+	pendingTarget  *config.ConnectionTarget
+	pendingAddr    *utils.HostInfo
+	pendingCreated bool
+	isTaggedTask   bool
+	outLogName     string
 }
 
 func (o *ExecOptions) Run() error {
@@ -478,8 +480,6 @@ func (o *ExecOptions) Run() error {
 }
 
 // RunContext executes the command on all selected hosts and propagates caller cancellation.
-//
-//nolint:gocyclo
 func (o *ExecOptions) RunContext(ctx context.Context) (retErr error) {
 	if err := o.ensureGeneralOptionsApplied(); err != nil {
 		return err
@@ -501,6 +501,18 @@ func (o *ExecOptions) RunContext(ctx context.Context) (retErr error) {
 	if err != nil {
 		return err
 	}
+	return o.runWithProvider(ctx, cfg, provider)
+}
+
+func (o *ExecOptions) isExecNodeConfirmationSuppressed(cfg *config.Configuration, provider config.ConfigProvider) bool {
+	if _, isRepo := provider.(*config.Repository); !isRepo {
+		return true
+	}
+	return !o.Interactive || utils.EffectiveRememberPolicy(o.Remember, cfg) == utils.RememberPolicyNever
+}
+
+//nolint:gocyclo
+func (o *ExecOptions) runWithProvider(ctx context.Context, cfg *config.Configuration, provider config.ConfigProvider) (retErr error) {
 	// 准备执行内容
 	var execCmd string
 	var isScript bool
@@ -580,6 +592,14 @@ func (o *ExecOptions) RunContext(ctx context.Context) (retErr error) {
 	if matErr != nil {
 		return matErr
 	}
+	confirmedTasks := make([]atomic.Bool, len(tasks))
+	defer func() {
+		for i, t := range tasks {
+			if t.pendingCreated && !confirmedTasks[i].Load() {
+				discardPendingNode(provider, t.nodeID)
+			}
+		}
+	}()
 	hostErrs = append(hostErrs, matErrs...)
 	if len(tasks) == 0 {
 		if len(hostErrs) > 0 {
@@ -605,9 +625,15 @@ func (o *ExecOptions) RunContext(ctx context.Context) (retErr error) {
 		joinConnectorCloseError(&retErr, connector)
 	}()
 
+	confirmSuppressed := o.isExecNodeConfirmationSuppressed(cfg, provider)
+
 	// 交互模式：单主机 PTY 执行
 	if o.Interactive {
-		return o.runInteractive(ctx, connector, tasks[0], execCmd)
+		return o.runInteractiveWithConfirm(ctx, connector, tasks[0], execCmd, func() {
+			if !confirmSuppressed {
+				confirmedTasks[0].Store(true)
+			}
+		})
 	}
 
 	// 落盘模式：在 Worker Pool 启动前一次性创建目录并分配无冲突日志文件名
@@ -651,12 +677,25 @@ func (o *ExecOptions) runInteractive(
 	task execHostTask,
 	cmd string,
 ) (retErr error) {
+	return o.runInteractiveWithConfirm(ctx, connector, task, cmd, nil)
+}
+
+func (o *ExecOptions) runInteractiveWithConfirm(
+	ctx context.Context,
+	connector *ssh.Connector,
+	task execHostTask,
+	cmd string,
+	onConnected func(),
+) (retErr error) {
 	if o.commandPlan != nil && o.commandPlan.Command() != cmd {
 		return fmt.Errorf("[%s] command changed after execution planning", task.host)
 	}
 	client, err := connector.Connect(ctx, task.nodeID)
 	if err != nil {
 		return fmt.Errorf("[%s] %s: %w", task.host, i18n.T("fw_connect_failed"), err)
+	}
+	if onConnected != nil {
+		onConnected()
 	}
 	defer func() {
 		if closeErr := client.Close(); closeErr != nil {
@@ -845,6 +884,11 @@ func (o *ExecOptions) shouldRememberCredential(target string, cfg *config.Config
 }
 
 func (o *ExecOptions) getOrCreateNode(ctx context.Context, provider config.ConfigProvider, target config.ConnectionTarget, addr utils.HostInfo) (string, bool, error) {
+	nodeID, _, mutated, err := o.getOrCreateNodeWithPending(ctx, provider, target, addr)
+	return nodeID, mutated, err
+}
+
+func (o *ExecOptions) getOrCreateNodeWithPending(ctx context.Context, provider config.ConfigProvider, target config.ConnectionTarget, addr utils.HostInfo) (string, bool, bool, error) {
 	o.syncIdentityFiles()
 	preparer, isPreparer := provider.(interface {
 		PrepareNodeContext(context.Context, config.EnsureNodeOptions) (config.EnsureNodeResult, error)
@@ -852,12 +896,12 @@ func (o *ExecOptions) getOrCreateNode(ctx context.Context, provider config.Confi
 	if !isPreparer {
 		resolved, err := config.ResolveTarget(provider, target)
 		if err != nil {
-			return "", false, err
+			return "", false, false, err
 		}
 		if resolved.MatchedNodeID != "" {
-			return resolved.MatchedNodeID, false, nil
+			return resolved.MatchedNodeID, false, false, nil
 		}
-		return resolved.NodeID, false, nil
+		return resolved.NodeID, false, false, nil
 	}
 	identityFile := addr.KeyPath
 	if identityFile == "" {
@@ -882,18 +926,18 @@ func (o *ExecOptions) getOrCreateNode(ctx context.Context, provider config.Confi
 		SuPwd:        "",
 	})
 	if err != nil {
-		return "", false, err
+		return "", false, false, err
 	}
 
 	if res.Created {
-		return res.NodeID, true, nil
+		return res.NodeID, true, true, nil
 	}
 
 	updated, updateErr := o.updateNodeFromHostInfo(ctx, res.NodeID, provider, addr)
 	if updateErr != nil {
-		return "", false, updateErr
+		return "", false, false, updateErr
 	}
-	return res.NodeID, updated, nil
+	return res.NodeID, false, updated, nil
 }
 
 func (o *ExecOptions) isPlannedCommandMismatch(execCmd string, isScript bool) bool {
@@ -1600,20 +1644,30 @@ func (o *ExecOptions) planTasksFromHosts(ctx context.Context, repository config.
 	return tasks, hostErrs, nil
 }
 
+func discardPendingExecTasks(provider config.ConfigProvider, tasks []execHostTask) {
+	for _, t := range tasks {
+		if t.pendingCreated {
+			discardPendingNode(provider, t.nodeID)
+		}
+	}
+}
+
 func (o *ExecOptions) materializeExecTasks(ctx context.Context, provider config.ConfigProvider, tasks []execHostTask) ([]execHostTask, []error, error) {
 	materialized := make([]execHostTask, 0, len(tasks))
 	var hostErrs []error
 	for _, t := range tasks {
 		if t.pendingTarget != nil && t.pendingAddr != nil {
-			nodeID, _, err := o.getOrCreateNode(ctx, provider, *t.pendingTarget, *t.pendingAddr)
+			nodeID, pendingCreated, _, err := o.getOrCreateNodeWithPending(ctx, provider, *t.pendingTarget, *t.pendingAddr)
 			if err != nil {
 				if t.isTaggedTask {
+					discardPendingExecTasks(provider, materialized)
 					return nil, nil, fmt.Errorf("prepare tagged node %q failed: %w", t.rawHost, err)
 				}
 				hostErrs = append(hostErrs, fmt.Errorf("[%s] %w", t.host, err))
 				continue
 			}
 			t.nodeID = nodeID
+			t.pendingCreated = pendingCreated
 			t.pendingTarget = nil
 			t.pendingAddr = nil
 		}
