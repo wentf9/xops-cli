@@ -24,6 +24,7 @@ type Guardrail struct {
 	noElicitFallback string
 	approvalMu       sync.Mutex
 	pendingApprovals map[string]pendingApproval
+	evaluateOverride func(context.Context, RiskInput) Decision
 }
 
 // New creates a Guardrail from configuration. If cfg is nil, defaults are used.
@@ -60,6 +61,13 @@ func generateOperationID() (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 
+func (g *Guardrail) evaluateDecision(ctx context.Context, input RiskInput) Decision {
+	if g.evaluateOverride != nil {
+		return g.evaluateOverride(ctx, input)
+	}
+	return g.EvaluateContext(ctx, input)
+}
+
 // WithGuardrail wraps any typed tool handler with the full guardrail pipeline:
 // classify -> policy -> approval -> pre-audit intent -> execute -> post-audit result.
 //
@@ -86,7 +94,7 @@ func WithGuardrail[In, Out any](
 		ri.ToolName = toolName
 
 		risk := Classify(ri)
-		decision := g.EvaluateContext(ctx, ri)
+		decision := g.evaluateDecision(ctx, ri)
 
 		entry := AuditEntry{
 			OperationID: opID,
@@ -101,13 +109,8 @@ func WithGuardrail[In, Out any](
 		}
 
 		switch decision {
-		case Deny:
-			entry.Outcome = "denied"
-			denyErr := fmt.Errorf("guardrail: operation %s denied — blocked by security policy", opID)
-			if auditErr := g.log(ctx, entry); auditErr != nil {
-				return nil, zero, errors.Join(denyErr, fmt.Errorf("audit log failed: %w", auditErr))
-			}
-			return nil, zero, denyErr
+		case Allow:
+			// Explicitly permitted by policy; proceed to intent audit and execution.
 
 		case NeedApproval:
 			pending, err := g.requestToolApproval(ctx, req, risk, ri, input)
@@ -127,6 +130,24 @@ func WithGuardrail[In, Out any](
 				return pending, zero, nil
 			}
 			entry.Decision = "approved"
+
+		case Deny:
+			entry.Outcome = "denied"
+			denyErr := fmt.Errorf("guardrail: operation %s denied — blocked by security policy", opID)
+			if auditErr := g.log(ctx, entry); auditErr != nil {
+				return nil, zero, errors.Join(denyErr, fmt.Errorf("audit log failed: %w", auditErr))
+			}
+			return nil, zero, denyErr
+
+		default:
+			entry.Decision = Deny.String()
+			entry.Outcome = "denied"
+			denyErr := fmt.Errorf("guardrail: operation %s denied — unexpected policy decision %d (%s)", opID, decision, decision.String())
+			entry.Error = denyErr.Error()
+			if auditErr := g.log(ctx, entry); auditErr != nil {
+				return nil, zero, errors.Join(denyErr, fmt.Errorf("audit log failed: %w", auditErr))
+			}
+			return nil, zero, denyErr
 		}
 
 		// 前置阶段：记录操作意图（Intent）。若审计强制且前置写入失败，直接拒绝执行，避免无审计操作。

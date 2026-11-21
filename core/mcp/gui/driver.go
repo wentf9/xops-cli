@@ -274,9 +274,9 @@ func buildActionSnippet(req Request) string {
 	case ActionKey:
 		quoted := ssh.ShellQuote(req.Text)
 		return fmt.Sprintf("if [ -n \"${WAYLAND_DISPLAY:-}\" ] && command -v ydotool >/dev/null 2>&1; then\n"+
-			"  ydotool key %s\n"+
+			"  ydotool key -- %s\n"+
 			"elif command -v xdotool >/dev/null 2>&1; then\n"+
-			"  xdotool key --clearmodifiers %s\n"+
+			"  xdotool key --clearmodifiers -- %s\n"+
 			"else\n"+
 			"  echo 'no supported input utility found (ydotool, xdotool)' >&2\n"+
 			"  exit 127\n"+

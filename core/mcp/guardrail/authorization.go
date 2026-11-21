@@ -12,6 +12,9 @@ import (
 // Evaluate checks policy without executing an operation or requesting approval.
 // It allows callers to reject a forbidden path before resolving remote metadata.
 func (g *Guardrail) Evaluate(input RiskInput) Decision {
+	if g == nil || g.policy == nil {
+		return Deny
+	}
 	return g.policy.Evaluate(Classify(input), input)
 }
 
@@ -22,19 +25,21 @@ func (g *Guardrail) Authorize(ctx context.Context, req *mcp.CallToolRequest, inp
 	if err := ctx.Err(); err != nil {
 		return "", nil, fmt.Errorf("authorize operation: %w", err)
 	}
+	if g == nil {
+		return "", nil, errors.New("guardrail: deferred operation denied — guardrail is not configured")
+	}
 	opID, err := generateOperationID()
 	if err != nil {
 		return "", nil, err
 	}
 	risk := Classify(input)
-	decision := g.EvaluateContext(ctx, input)
+	decision := g.evaluateDecision(ctx, input)
 	entry := AuditEntry{OperationID: opID, Tool: input.ToolName, NodeID: input.NodeID, NodeIDs: input.NodeIDs, Paths: input.Paths,
 		Command: input.Command, Details: input.Details, RiskLevel: risk.String(), Decision: decision.String()}
-	if decision == Deny {
-		entry.Outcome = "denied"
-		return "", nil, errors.Join(errors.New("guardrail: deferred operation denied by policy"), g.log(ctx, entry))
-	}
-	if decision == NeedApproval {
+	switch decision {
+	case Allow:
+		// Explicitly permitted by policy; proceed to authorization audit.
+	case NeedApproval:
 		pending, approveErr := g.requestToolApproval(ctx, req, risk, input, completeInput)
 		if approveErr != nil {
 			entry.Outcome, entry.Error = "denied", approveErr.Error()
@@ -48,6 +53,18 @@ func (g *Guardrail) Authorize(ctx context.Context, req *mcp.CallToolRequest, inp
 			return "", pending, nil
 		}
 		entry.Decision = "approved"
+	case Deny:
+		entry.Outcome = "denied"
+		return "", nil, errors.Join(errors.New("guardrail: deferred operation denied by policy"), g.log(ctx, entry))
+	default:
+		entry.Decision = Deny.String()
+		entry.Outcome = "denied"
+		denyErr := fmt.Errorf("guardrail: deferred operation %s denied — unexpected policy decision %d (%s)", opID, decision, decision.String())
+		entry.Error = denyErr.Error()
+		if auditErr := g.log(ctx, entry); auditErr != nil {
+			return "", nil, errors.Join(denyErr, fmt.Errorf("audit log failed: %w", auditErr))
+		}
+		return "", nil, denyErr
 	}
 	entry.Outcome = "authorized"
 	if err := g.log(ctx, entry); err != nil {

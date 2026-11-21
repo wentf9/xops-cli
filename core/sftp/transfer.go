@@ -14,8 +14,10 @@ import (
 	"runtime"
 	"strings"
 	"sync/atomic"
+	"unicode"
 
 	"github.com/pkg/sftp"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -84,7 +86,15 @@ func (c *Client) download(ctx context.Context, remotePath, localPath string, pro
 	}
 	stat, err := os.Stat(localPath)
 	if err == nil && stat.IsDir() {
-		localPath = filepath.Join(localPath, info.Name())
+		name := info.Name()
+		if err := validateLocalDownloadComponent(name); err != nil {
+			return fmt.Errorf("download %q into %q: %w", remotePath, localPath, err)
+		}
+		destPath := filepath.Join(localPath, name)
+		if err := ensureLocalDestWithinDir(localPath, destPath, false); err != nil {
+			return fmt.Errorf("download %q into %q: %w", remotePath, localPath, err)
+		}
+		localPath = destPath
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("stat local destination failed: %w", err)
 	}
@@ -1671,6 +1681,7 @@ func (c *Client) downloadDirectory(ctx context.Context, remoteDir, localDir stri
 
 	walker := c.SFTPClient().Walk(remoteDir)
 	var traversalErr error
+	visitedRoot := false
 	for walker.Step() {
 		if err := walker.Err(); err != nil {
 			traversalErr = err
@@ -1681,31 +1692,30 @@ func (c *Client) downloadDirectory(ctx context.Context, remoteDir, localDir stri
 			break
 		}
 
-		path := walker.Path()
+		remotePath := walker.Path()
 		info := walker.Stat()
-
-		relPath, err := remoteRelativePath(remoteDir, path)
+		isRootStep := !visitedRoot
+		visitedRoot = true
+		relPath, localDest, err := resolveLocalDownloadEntry(remoteDir, localDir, remotePath, info, isRootStep)
 		if err != nil {
 			traversalErr = err
 			break
 		}
 
-		localDest := filepath.Join(localDir, filepath.FromSlash(relPath))
-
 		if info.IsDir() {
-			if err := ensureLocalDownloadDirectory(path, localDest, info.Mode()|0700); err != nil {
+			if err := ensureLocalDownloadDirectory(remotePath, localDest, info.Mode()|0700); err != nil {
 				traversalErr = fmt.Errorf("create local directory %q failed: %w", localDest, err)
 				break
 			}
 			continue
 		}
 
-		if err := os.MkdirAll(filepath.Dir(localDest), 0755); err != nil {
-			traversalErr = fmt.Errorf("create local parent directory for %q failed: %w", localDest, err)
+		if err := prepareLocalDownloadFileParent(remotePath, localDir, relPath, localDest); err != nil {
+			traversalErr = err
 			break
 		}
 
-		loopPath := path
+		loopPath := remotePath
 		loopDest := localDest
 		loopInfo := info
 
@@ -1813,20 +1823,208 @@ func (c *Client) downloadLink(ctx context.Context, remotePath, localPath string,
 }
 
 func remoteRelativePath(base, target string) (string, error) {
-	base = path.Clean(base)
-	target = path.Clean(target)
-	if target == base {
+	// Reject raw traversal segments relative to base before path.Clean can collapse them.
+	rawBase := strings.TrimRight(base, "/")
+	if rawBase == "" && strings.HasPrefix(base, "/") {
+		rawBase = "/"
+	}
+	if rawBase == "/" && strings.HasPrefix(target, "/") {
+		for _, seg := range strings.Split(strings.TrimPrefix(target, "/"), "/") {
+			if seg == ".." {
+				return "", fmt.Errorf("unsafe remote path %q: contains parent directory traversal", target)
+			}
+		}
+	} else if rawBase != "" && strings.HasPrefix(target, rawBase+"/") {
+		for _, seg := range strings.Split(strings.TrimPrefix(target, rawBase+"/"), "/") {
+			if seg == ".." {
+				return "", fmt.Errorf("unsafe remote path %q: contains parent directory traversal", target)
+			}
+		}
+	}
+
+	cleanBase := path.Clean(base)
+	cleanTarget := path.Clean(target)
+	if cleanTarget == cleanBase {
 		return ".", nil
 	}
 
-	prefix := base
+	prefix := cleanBase
 	if prefix != "/" {
 		prefix += "/"
 	}
-	if !strings.HasPrefix(target, prefix) {
-		return "", fmt.Errorf("remote path %q is outside download root %q", target, base)
+	if !strings.HasPrefix(cleanTarget, prefix) {
+		return "", fmt.Errorf("remote path %q is outside download root %q", cleanTarget, cleanBase)
 	}
-	return strings.TrimPrefix(target, prefix), nil
+	rel := strings.TrimPrefix(cleanTarget, prefix)
+	if err := validateLocalRelativePath(rel); err != nil {
+		return "", fmt.Errorf("unsafe remote relative path %q: %w", rel, err)
+	}
+	return rel, nil
+}
+
+func validateLocalRelativePath(rel string) error {
+	if rel == "" {
+		return errors.New("unsafe remote filename: empty relative path")
+	}
+	for _, segment := range strings.Split(rel, "/") {
+		if err := validateLocalDownloadComponent(segment); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateLocalDownloadComponent(name string) error {
+	if name == "" {
+		return errors.New("unsafe remote filename: empty name")
+	}
+	if name == "." || name == ".." {
+		return fmt.Errorf("unsafe remote filename %q: traversal component", name)
+	}
+	if strings.HasSuffix(name, ".") || strings.HasSuffix(name, " ") {
+		return fmt.Errorf("unsafe remote filename %q: trailing dot or space", name)
+	}
+	if filepath.VolumeName(name) != "" {
+		return fmt.Errorf("unsafe remote filename %q: contains volume prefix", name)
+	}
+	for i := 0; i < len(name); i++ {
+		b := name[i]
+		if b < 0x20 || b == 0x7f {
+			return fmt.Errorf("unsafe remote filename %q: contains control character", name)
+		}
+		switch b {
+		case '/', '\\':
+			return fmt.Errorf("unsafe remote filename %q: contains path separator", name)
+		case ':':
+			return fmt.Errorf("unsafe remote filename %q: contains forbidden colon", name)
+		case '*', '?', '"', '<', '>', '|':
+			return fmt.Errorf("unsafe remote filename %q: contains invalid Windows filename character", name)
+		}
+	}
+	for _, r := range name {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("unsafe remote filename %q: contains control character", name)
+		}
+	}
+	if hasReservedWindowsDeviceStem(name) {
+		return fmt.Errorf("unsafe remote filename %q: reserved Windows device name", name)
+	}
+	return nil
+}
+
+func hasReservedWindowsDeviceStem(name string) bool {
+	stem := name
+	if dot := strings.IndexByte(stem, '.'); dot >= 0 {
+		stem = stem[:dot]
+	}
+	stem = strings.TrimRight(stem, " ")
+	if stem == "" {
+		return false
+	}
+	// Delegate canonical ASCII Windows device-name checks (CON/PRN/AUX/NUL,
+	// COM1-9, LPT1-9) to core/ssh.SanitizeFilenameComponent, which prefixes "_"
+	// strictly when an ASCII alphanumeric stem is a reserved Windows device name.
+	if isASCIIAlnum(stem) && ssh.SanitizeFilenameComponent(stem) != stem {
+		return true
+	}
+	switch strings.ToUpper(stem) {
+	case "COM\u00b9", "COM\u00b2", "COM\u00b3", "LPT\u00b9", "LPT\u00b2", "LPT\u00b3":
+		return true
+	default:
+		return false
+	}
+}
+
+func isASCIIAlnum(s string) bool {
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		isLetter := (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
+		isDigit := b >= '0' && b <= '9'
+		if !isLetter && !isDigit {
+			return false
+		}
+	}
+	return len(s) > 0
+}
+
+func resolveLocalDownloadEntry(remoteDir, localDir, remotePath string, info os.FileInfo, isRootStep bool) (string, string, error) {
+	if info == nil {
+		return "", "", fmt.Errorf("missing file metadata for remote path %q", remotePath)
+	}
+	relPath, err := remoteRelativePath(remoteDir, remotePath)
+	if err != nil {
+		return "", "", err
+	}
+	if relPath == "." {
+		if !isRootStep || !info.IsDir() {
+			return "", "", fmt.Errorf("download %q: unsafe remote filename %q: non-root or non-directory entry resolves to download root", remotePath, info.Name())
+		}
+		localDest := filepath.Join(localDir, filepath.FromSlash(relPath))
+		if err := ensureLocalDestWithinDir(localDir, localDest, true); err != nil {
+			return "", "", fmt.Errorf("download %q: %w", remotePath, err)
+		}
+		return relPath, localDest, nil
+	}
+	if err := validateLocalDownloadComponent(info.Name()); err != nil {
+		return "", "", fmt.Errorf("download %q: %w", remotePath, err)
+	}
+	localDest := filepath.Join(localDir, filepath.FromSlash(relPath))
+	if err := ensureLocalDestWithinDir(localDir, localDest, false); err != nil {
+		return "", "", fmt.Errorf("download %q: %w", remotePath, err)
+	}
+	return relPath, localDest, nil
+}
+
+func prepareLocalDownloadFileParent(remotePath, localDir, relPath, localDest string) error {
+	if relPath != "." {
+		if err := ensureLocalDownloadParents(remotePath, localDir, relPath); err != nil {
+			return fmt.Errorf("create local parent directory for %q failed: %w", localDest, err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(localDest), 0755); err != nil {
+		return fmt.Errorf("create local parent directory for %q failed: %w", localDest, err)
+	}
+	return nil
+}
+
+func ensureLocalDestWithinDir(baseDir, destPath string, allowEqual bool) error {
+	absBase, err := filepath.Abs(baseDir)
+	if err != nil {
+		return fmt.Errorf("resolve local download root %q failed: %w", baseDir, err)
+	}
+	absDest, err := filepath.Abs(destPath)
+	if err != nil {
+		return fmt.Errorf("resolve local download destination %q failed: %w", destPath, err)
+	}
+	rel, err := filepath.Rel(absBase, absDest)
+	if err != nil {
+		return fmt.Errorf("local destination %q escapes download root %q: %w", destPath, baseDir, err)
+	}
+	if rel == "." {
+		if !allowEqual {
+			return fmt.Errorf("local destination %q must be inside download root %q", destPath, baseDir)
+		}
+		return nil
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+		return fmt.Errorf("local destination %q escapes download root %q", destPath, baseDir)
+	}
+	return nil
+}
+
+func ensureLocalDownloadParents(remotePath, localDir, relPath string) error {
+	segments := strings.Split(relPath, "/")
+	if len(segments) <= 1 {
+		return nil
+	}
+	curr := localDir
+	for _, seg := range segments[:len(segments)-1] {
+		curr = filepath.Join(curr, seg)
+		if err := ensureLocalDownloadDirectory(remotePath, curr, 0755); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func finishTransferGroup(ctx context.Context, cancel context.CancelFunc, group *errgroup.Group, operationErr error) error {

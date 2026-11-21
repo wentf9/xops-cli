@@ -13,19 +13,19 @@ import (
 type Decision int
 
 const (
-	Allow        Decision = iota // execute without approval
+	Deny         Decision = iota // reject unconditionally (fail-closed zero value)
 	NeedApproval                 // require user confirmation via Elicitation
-	Deny                         // reject unconditionally
+	Allow                        // execute without approval
 )
 
 func (d Decision) String() string {
 	switch d {
-	case Allow:
-		return "allow"
-	case NeedApproval:
-		return "need_approval"
 	case Deny:
 		return "deny"
+	case NeedApproval:
+		return "need_approval"
+	case Allow:
+		return "allow"
 	default:
 		return "unknown"
 	}
@@ -74,6 +74,9 @@ func NewPolicy(cfg *policy.Config) *Policy {
 
 // Evaluate determines whether an invocation should be allowed, needs approval, or is denied.
 func (p *Policy) Evaluate(risk RiskLevel, input RiskInput) Decision {
+	if p == nil || p.cfg == nil {
+		return Deny
+	}
 	if !p.cfg.Enabled {
 		return Allow
 	}

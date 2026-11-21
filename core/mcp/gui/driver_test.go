@@ -697,3 +697,123 @@ exit 1
 		t.Fatalf("expected PY1=720 (scaled for 2560x1440), got stderr:\n%s", stderrStr)
 	}
 }
+
+func TestBuildScriptActionKeyTerminatesOptions(t *testing.T) {
+	tests := []struct {
+		name string
+		key  string
+	}{
+		{name: "standard key", key: "Return"},
+		{name: "leading single dash", key: "-minus"},
+		{name: "leading double dash option", key: "--window"},
+		{name: "leading delay flag injection", key: "--delay"},
+		{name: "leading clearmodifiers flag", key: "--clearmodifiers"},
+		{name: "dash with shell metacharacters", key: "-x; id"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			script, err := BuildScript(Request{Action: ActionKey, Text: tc.key})
+			if err != nil {
+				t.Fatalf("BuildScript(ActionKey, %q) failed: %v", tc.key, err)
+			}
+			quoted := ssh.ShellQuote(tc.key)
+			wantYdotool := "ydotool key -- " + quoted
+			wantXdotool := "xdotool key --clearmodifiers -- " + quoted
+			if !strings.Contains(script, wantYdotool) {
+				t.Fatalf("expected %q in script:\n%s", wantYdotool, script)
+			}
+			if !strings.Contains(script, wantXdotool) {
+				t.Fatalf("expected %q in script:\n%s", wantXdotool, script)
+			}
+		})
+	}
+}
+
+func TestBuildScriptActionKeyShellExecutionOptionSeparator(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell execution test skipped on Windows")
+	}
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available in test environment")
+	}
+
+	t.Run("xdotool_receives_option_terminator", func(t *testing.T) {
+		tmpDir := shortTempDir(t)
+		binDir := filepath.Join(tmpDir, "bin")
+		if err := os.MkdirAll(binDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		createMockSpectacle(t, tmpDir, binDir)
+
+		argsFile := filepath.Join(tmpDir, "xdotool.args")
+		mockXdotool := filepath.Join(binDir, "xdotool")
+		scriptBody := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$@\" > %s\n", ssh.ShellQuote(argsFile))
+		if err := os.WriteFile(mockXdotool, []byte(scriptBody), 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		script, err := BuildScript(Request{Action: ActionKey, Text: "--window", Display: ":0"})
+		if err != nil {
+			t.Fatalf("BuildScript failed: %v", err)
+		}
+		cmd := exec.Command("sh", "-c", script)
+		cmd.Env = buildIsolatedEnv(binDir, tmpDir, tmpDir)
+		if out, runErr := cmd.CombinedOutput(); runErr != nil {
+			t.Fatalf("script execution failed: %v\noutput:\n%s", runErr, string(out))
+		}
+
+		recorded, err := os.ReadFile(argsFile)
+		if err != nil {
+			t.Fatalf("read recorded xdotool args: %v", err)
+		}
+		want := "key\n--clearmodifiers\n--\n--window\n"
+		if string(recorded) != want {
+			t.Fatalf("xdotool argv = %q, want %q", string(recorded), want)
+		}
+	})
+
+	t.Run("ydotool_receives_option_terminator", func(t *testing.T) {
+		tmpDir := shortTempDir(t)
+		xdgDir, _, homeDir, cleanup := setupMockWaylandEnv(t, tmpDir)
+		defer cleanup()
+
+		binDir := filepath.Join(tmpDir, "bin")
+		if err := os.MkdirAll(binDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		createMockSpectacle(t, tmpDir, binDir)
+
+		argsFile := filepath.Join(tmpDir, "ydotool.args")
+		mockYdotool := filepath.Join(binDir, "ydotool")
+		scriptBody := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$@\" > %s\n", ssh.ShellQuote(argsFile))
+		if err := os.WriteFile(mockYdotool, []byte(scriptBody), 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		script, err := BuildScript(Request{Action: ActionKey, Text: "-r"})
+		if err != nil {
+			t.Fatalf("BuildScript failed: %v", err)
+		}
+		mockX11Dir := filepath.Join(tmpDir, "X11-unix")
+		if err := os.MkdirAll(mockX11Dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		script = strings.ReplaceAll(script, "/tmp/.X11-unix", mockX11Dir)
+
+		cmd := exec.Command("sh", "-c", script)
+		cmd.Env = buildIsolatedEnv(binDir, xdgDir, homeDir)
+		if out, runErr := cmd.CombinedOutput(); runErr != nil {
+			t.Fatalf("script execution failed: %v\noutput:\n%s", runErr, string(out))
+		}
+
+		recorded, err := os.ReadFile(argsFile)
+		if err != nil {
+			t.Fatalf("read recorded ydotool args: %v", err)
+		}
+		want := "key\n--\n-r\n"
+		if string(recorded) != want {
+			t.Fatalf("ydotool argv = %q, want %q", string(recorded), want)
+		}
+	})
+}
