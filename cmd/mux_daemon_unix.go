@@ -51,7 +51,7 @@ func startMuxDaemonCommandWithPrefix(exe string, prefixArgs []string, spec MuxDa
 }
 
 func readMuxDaemonSpecFromFD(fd int) (MuxDaemonSpec, error) {
-	if fd < 3 {
+	if fd != 3 {
 		return MuxDaemonSpec{}, fmt.Errorf("invalid mux daemon spec descriptor %d", fd)
 	}
 	f := os.NewFile(uintptr(fd), "mux-daemon-spec")

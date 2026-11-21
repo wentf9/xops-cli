@@ -7,8 +7,91 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/spf13/pflag"
 	"github.com/wentf9/xops-cli/pkg/config"
 )
+
+// ValidateExcludeFlagValues validates explicit --exclude flag values fail-closed.
+// Rejects empty flag lists, whitespace-only entries, and empty comma-separated
+// tokens (e.g. "", " ", ",", "web1,,web2") so unset shell variables never
+// silently degrade into excluding zero hosts.
+func ValidateExcludeFlagValues(raw []string) ([]string, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("flag --exclude must not be empty")
+	}
+	var result []string
+	for _, v := range raw {
+		if strings.TrimSpace(v) == "" {
+			return nil, fmt.Errorf("flag --exclude must not contain empty values")
+		}
+		for _, part := range strings.Split(v, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				return nil, fmt.Errorf("flag --exclude contains empty host token in %q", v)
+			}
+			if !slices.Contains(result, part) {
+				result = append(result, part)
+			}
+		}
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf("flag --exclude must not be empty")
+	}
+	return result, nil
+}
+
+// RegisterExcludeFlag registers the --exclude string-slice flag while recording
+// every raw CLI value passed to Set/Append/Replace so empty repeated flags
+// (such as `--exclude web1 --exclude ""`) are never silently dropped by pflag's
+// CSV slice parser.
+func RegisterExcludeFlag(flags *pflag.FlagSet, target, rawArgs *[]string, usage string) {
+	flags.StringSliceVar(target, "exclude", nil, usage)
+	f := flags.Lookup("exclude")
+	if f == nil {
+		return
+	}
+	sv, ok := f.Value.(pflag.SliceValue)
+	if !ok {
+		return
+	}
+	f.Value = &excludeFlagValue{
+		innerVal: f.Value,
+		innerSlc: sv,
+		rawArgs:  rawArgs,
+	}
+}
+
+type excludeFlagValue struct {
+	innerVal pflag.Value
+	innerSlc pflag.SliceValue
+	rawArgs  *[]string
+}
+
+func (v *excludeFlagValue) String() string { return v.innerVal.String() }
+func (v *excludeFlagValue) Type() string   { return v.innerVal.Type() }
+
+func (v *excludeFlagValue) Set(val string) error {
+	if v.rawArgs != nil {
+		*v.rawArgs = append(*v.rawArgs, val)
+	}
+	return v.innerVal.Set(val)
+}
+
+func (v *excludeFlagValue) Append(val string) error {
+	if v.rawArgs != nil {
+		*v.rawArgs = append(*v.rawArgs, val)
+	}
+	return v.innerSlc.Append(val)
+}
+
+func (v *excludeFlagValue) Replace(val []string) error {
+	if v.rawArgs != nil {
+		*v.rawArgs = append((*v.rawArgs)[:0], val...)
+	}
+	return v.innerSlc.Replace(val)
+}
+
+func (v *excludeFlagValue) GetSlice() []string { return v.innerSlc.GetSlice() }
 
 // ParseExcludeFlag 将 --exclude 选项的字符串值解析为规整化的列表。
 // 支持以下输入形式:

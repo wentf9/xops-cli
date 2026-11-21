@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -601,10 +602,165 @@ func (o *SshOptions) validateBackgroundFlags() error {
 	if !o.effectiveBgRun() {
 		return nil
 	}
+	if err := o.validateBackgroundCredentialInvariants(); err != nil {
+		return err
+	}
 	if !o.effectiveNoCmd() && o.Command == "" && !o.stdinScript && !o.hasNonEmptyRemoteCommand() {
+		if o.canConfigSupplyBackgroundSession() {
+			return nil
+		}
 		return errors.New(i18n.T("ssh_err_background_requires_nocmd"))
 	}
-	return o.validateBackgroundCredentialInvariants()
+	return nil
+}
+
+func (o *SshOptions) canConfigSupplyBackgroundSession() bool {
+	if o == nil || o.isMuxDaemon() {
+		return false
+	}
+	sessionOpts, err := o.toSessionControlOptions()
+	if err != nil {
+		return false
+	}
+	cliSessionTypeLocked := false
+	cliRemoteCmdLocked := false
+	if cliOpts := sessionOpts.ToSSHOptions(); cliOpts != nil {
+		cliSessionTypeLocked = strings.TrimSpace(cliOpts.Get(ssh.OptionSessionType)) != ""
+		cliRemoteCmdLocked = strings.TrimSpace(cliOpts.Get(ssh.OptionRemoteCommand)) != ""
+	}
+	if cliSessionTypeLocked && cliRemoteCmdLocked {
+		return false
+	}
+	provider, deferOnErr := o.loadBackgroundSessionProbeProvider()
+	if deferOnErr {
+		return true
+	}
+	if provider == nil {
+		return false
+	}
+	return o.probeTargetBackgroundSession(provider, sessionOpts, cliSessionTypeLocked, cliRemoteCmdLocked)
+}
+
+func (o *SshOptions) loadBackgroundSessionProbeProvider() (config.ConfigProvider, bool) {
+	var cfg *config.Configuration
+	if configPath, keyPath, pathErr := utils.GetConfigFilePath(); pathErr == nil {
+		if _, statErr := os.Stat(configPath); statErr == nil {
+			loaded, loadErr := config.NewDefaultStore(configPath, keyPath).Load()
+			if loadErr != nil {
+				return nil, true
+			}
+			cfg = loaded
+		}
+	}
+	var openSSH *config.OpenSSHParser
+	cfgFile := strings.TrimSpace(o.control.ConfigFile)
+	switch {
+	case ssh.IsNoneValue(cfgFile):
+		// -F none explicitly disables OpenSSH config.
+	case cfgFile != "":
+		p, parseErr := config.NewOpenSSHParserFromPath(cfgFile)
+		if parseErr != nil {
+			return nil, true
+		}
+		openSSH = p
+	default:
+		if home, homeErr := os.UserHomeDir(); homeErr == nil && strings.TrimSpace(home) != "" {
+			defaultPath := filepath.Join(home, ".ssh", "config")
+			if _, statErr := os.Stat(defaultPath); statErr == nil {
+				p, parseErr := config.NewOpenSSHParserFromPath(defaultPath)
+				if parseErr != nil {
+					return nil, true
+				}
+				openSSH = p
+			}
+		}
+	}
+	if cfg == nil && openSSH == nil {
+		return nil, false
+	}
+	if openSSH != nil {
+		return config.NewProviderWithOpenSSHParser(cfg, openSSH), false
+	}
+	return config.NewProviderWithoutOpenSSH(cfg), false
+}
+
+func (o *SshOptions) probeTargetBackgroundSession(
+	provider config.ConfigProvider,
+	sessionOpts adapter.SessionControlOptions,
+	cliSessionTypeLocked, cliRemoteCmdLocked bool,
+) bool {
+	probe := *o
+	connTarget := effectiveConnectionTarget(&probe, "")
+	nodeID := ""
+	if resolved, err := config.ResolveTarget(provider, connTarget); err == nil {
+		if resolved.MatchedNodeID != "" {
+			nodeID = resolved.MatchedNodeID
+		} else {
+			nodeID = resolved.NodeID
+		}
+	}
+	if probe.probeCandidateBackgroundSession(provider, nodeID, connTarget, sessionOpts, cliSessionTypeLocked, cliRemoteCmdLocked) {
+		return true
+	}
+	rawHost := strings.TrimSpace(connTarget.Selector)
+	if rawHost == "" || config.IsOpenSSHNodeID(rawHost) {
+		return false
+	}
+	for _, fqdn := range config.CanonicalDomainCandidatesWithOptions(provider, rawHost, probe.control.Options, probe.effectiveCLIJumpHost()) {
+		candProbe := *o
+		candProbe.canonicalized = true
+		candProbe.originalHost = rawHost
+		candProbe.expandHost = rawHost
+		candProbe.Host = fqdn
+		candProbe.Target.Selector = fqdn
+		candProbe.Target.OriginalHost = rawHost
+		candTarget := effectiveConnectionTarget(&candProbe, "")
+		candNodeID := config.OpenSSHNodePrefix + fqdn
+		if resolved, err := config.ResolveTarget(provider, candTarget); err == nil {
+			if resolved.MatchedNodeID != "" {
+				candNodeID = resolved.MatchedNodeID
+			} else if resolved.NodeID != "" {
+				candNodeID = resolved.NodeID
+			}
+		}
+		if candProbe.probeCandidateBackgroundSession(provider, candNodeID, candTarget, sessionOpts, cliSessionTypeLocked, cliRemoteCmdLocked) {
+			return true
+		}
+	}
+	return false
+}
+
+func (o *SshOptions) probeCandidateBackgroundSession(
+	provider config.ConfigProvider,
+	nodeID string,
+	connTarget config.ConnectionTarget,
+	sessionOpts adapter.SessionControlOptions,
+	cliSessionTypeLocked, cliRemoteCmdLocked bool,
+) bool {
+	target := controlTarget(o, provider, nodeID)
+	lookupKey, sessionAuth := resolveControlSessionLookup(o, provider, nodeID, connTarget, target)
+	var adpOpts []adapter.Option
+	if lookupKey != "" && (sessionAuth.ProxyJump != "" || sessionAuth.OriginalHost != "" || sessionAuth.CanonicalHost != "") {
+		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(lookupKey, sessionAuth))
+	}
+	eff, err := adapter.NewSSHAdapter(provider, adpOpts...).ResolveSSHOptions(lookupKey, sessionOpts)
+	if err != nil || eff == nil {
+		return false
+	}
+	if !cliSessionTypeLocked && eff.SessionType() == ssh.SessionTypeNone {
+		return true
+	}
+	if !cliRemoteCmdLocked {
+		if rc := strings.TrimSpace(eff.Get(ssh.OptionRemoteCommand)); rc != "" && !ssh.IsNoneValue(rc) {
+			return true
+		}
+	}
+	canonMode := strings.TrimSpace(eff.Get(ssh.OptionCanonicalizeHostname))
+	if (canonMode == ssh.CanonicalizeHostnameYes || canonMode == ssh.CanonicalizeHostnameAlways) &&
+		strings.TrimSpace(eff.Get(ssh.OptionCanonicalizePermittedCNAMEs)) != "" {
+		return true
+	}
+	return false
 }
 
 func (o *SshOptions) Run() error {
@@ -629,25 +785,6 @@ func (o *SshOptions) RunContext(ctx context.Context) (err error) {
 	}
 
 	ecBg := o.effectiveBgRun()
-	ecStdin := o.effectiveStdinNull()
-
-	// -n 功能：如果是非后台运行或已是后台子进程，且指定了 -n，直接重定向标准输入到 /dev/null
-	if ecStdin && (!ecBg || isChild) {
-		devNull, openErr := os.Open(os.DevNull)
-		if openErr != nil {
-			return fmt.Errorf("open %s for SSH stdin failed: %w", os.DevNull, openErr)
-		}
-		oldStdin := os.Stdin
-		os.Stdin = devNull
-		o.stdinRedirected = true
-		defer func() {
-			os.Stdin = oldStdin
-			o.stdinRedirected = false
-			if closeErr := devNull.Close(); closeErr != nil {
-				err = errors.Join(err, fmt.Errorf("close SSH stdin redirect failed: %w", closeErr))
-			}
-		}()
-	}
 
 	observer, finishDiagnostics, diagnosticErr := o.startDiagnostics(ctx)
 	if diagnosticErr != nil {
@@ -1859,9 +1996,19 @@ func (o *SshOptions) handoffMasterInstanceWithProviderAndRawNode(
 
 	// The command already finished, so a slow or unauthenticated daemon must not
 	// be reported as a command failure. Report it and keep the exit status.
-	if err := waitForControlSocket(ctx, expandedPath, 10*time.Second, daemonExited); err != nil {
+	expectedPID := 0
+	if cmd.Process != nil {
+		expectedPID = cmd.Process.Pid
+	}
+	if err := waitForControlSocketPID(ctx, expandedPath, 10*time.Second, daemonExited, expectedPID); err != nil {
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
+			killTimer := time.NewTimer(2 * time.Second)
+			select {
+			case <-daemonExited:
+			case <-killTimer.C:
+			}
+			killTimer.Stop()
 		}
 		logger.DefaultLogger().Debugf("mux: persistent master handoff on %q failed: %v", expandedPath, err)
 		if _, writeErr := fmt.Fprintf(os.Stderr, "warning: connection sharing master could not be kept alive on %s: %v\n", expandedPath, err); writeErr != nil {
@@ -2280,6 +2427,10 @@ func releaseMastersForHandoffWithProvider(
 // waitForControlSocket blocks until a master answers on path, the deadline
 // elapses, the caller cancels, or the daemon process we are waiting for exits.
 func waitForControlSocket(ctx context.Context, path string, timeout time.Duration, daemonExited <-chan struct{}) error {
+	return waitForControlSocketPID(ctx, path, timeout, daemonExited, 0)
+}
+
+func waitForControlSocketPID(ctx context.Context, path string, timeout time.Duration, daemonExited <-chan struct{}, expectedPID int) error {
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	daemonExitErr := func() error {
@@ -2301,11 +2452,16 @@ func waitForControlSocket(ctx context.Context, path string, timeout time.Duratio
 		probeCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 		client, err := ssh.DialMuxClient(probeCtx, path)
 		if err == nil {
-			_, lastErr = client.AliveCheck(probeCtx)
+			var pid uint32
+			pid, lastErr = client.AliveCheck(probeCtx)
 			_ = client.Close()
 			if lastErr == nil {
-				cancel()
-				return nil
+				if expectedPID > 0 && int(pid) != expectedPID {
+					lastErr = fmt.Errorf("control socket %q answered by pid %d, expected daemon pid %d", path, pid, expectedPID)
+				} else {
+					cancel()
+					return nil
+				}
 			}
 		} else {
 			lastErr = err

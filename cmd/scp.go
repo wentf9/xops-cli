@@ -43,6 +43,8 @@ type ScpOptions struct {
 	HostFile       string
 	Tag            string
 	Exclude        []string
+	rawExcludeArgs []string
+	excludeSet     bool
 	sshLogLevel    int
 	verboseSeen    bool
 	verboseLevel   int
@@ -103,7 +105,7 @@ func NewCmdScp() *cobra.Command {
 	cmd.Flags().StringVar(&o.Dest, "dest", "", i18n.T("flag_scp_dest"))
 	cmd.Flags().StringVarP(&o.HostFile, "ifile", "I", "", i18n.T("flag_ifile"))
 	cmd.Flags().StringVar(&o.Tag, "tag", "", i18n.T("flag_scp_tag"))
-	cmd.Flags().StringSliceVar(&o.Exclude, "exclude", nil, i18n.T("flag_exclude"))
+	cmdutils.RegisterExcludeFlag(cmd.Flags(), &o.Exclude, &o.rawExcludeArgs, i18n.T("flag_exclude"))
 	o.registerOutputFlags(cmd)
 	cmd.Flags().BoolVarP(&o.Force, "force", "f", false, i18n.T("flag_force"))
 	cmd.Flags().BoolVarP(&o.NoOverwrite, "no-clobber", "n", false, i18n.T("flag_no_overwrite"))
@@ -133,6 +135,9 @@ func (o *ScpOptions) Complete(cmd *cobra.Command, args []string) error {
 	}
 	pathFlags := o.Source != "" || o.Dest != ""
 	if cmd != nil {
+		if cmd.Flags().Changed("exclude") {
+			o.excludeSet = true
+		}
 		if err := validateExplicitZeroPort(cmd.Flags()); err != nil {
 			return err
 		}
@@ -168,6 +173,27 @@ func (o *ScpOptions) completeStdinCredentials() error {
 	return err
 }
 
+func (o *ScpOptions) hasExcludeFlags() bool {
+	return o.excludeSet || len(o.Exclude) > 0 || len(o.rawExcludeArgs) > 0
+}
+
+func (o *ScpOptions) validatedExcludes() ([]string, error) {
+	if !o.hasExcludeFlags() {
+		return nil, nil
+	}
+	if len(o.rawExcludeArgs) > 0 {
+		parsed, err := cmdutils.ValidateExcludeFlagValues(o.rawExcludeArgs)
+		if err != nil {
+			return nil, err
+		}
+		if len(o.Exclude) > 0 {
+			return cmdutils.ValidateExcludeFlagValues(o.Exclude)
+		}
+		return parsed, nil
+	}
+	return cmdutils.ValidateExcludeFlagValues(o.Exclude)
+}
+
 func (o *ScpOptions) Validate() error {
 	if err := o.ensureGeneralOptionsApplied(); err != nil {
 		return err
@@ -180,6 +206,12 @@ func (o *ScpOptions) Validate() error {
 	}
 	if err := validateCommonSSHBaseOptions(&o.SshOptions); err != nil {
 		return err
+	}
+	if _, err := o.validatedExcludes(); err != nil {
+		return err
+	}
+	if o.TaskCount < 1 || o.TaskCount > maxBatchTaskCount {
+		return fmt.Errorf("invalid --task value %d: must be between 1 and %d", o.TaskCount, maxBatchTaskCount)
 	}
 	if o.Source == "" {
 		return fmt.Errorf("%s", i18n.T("scp_err_no_src"))
@@ -425,7 +457,7 @@ func (o *ScpOptions) runTransfer(ctx context.Context, provider config.ConfigProv
 }
 
 func (o *ScpOptions) validateTransferExcludes(provider config.ConfigProvider, src, dst PathInfo) error {
-	if len(o.Exclude) == 0 || provider == nil {
+	if !o.hasExcludeFlags() || provider == nil {
 		return nil
 	}
 	excludes, err := o.resolveExcludes(provider)
@@ -831,7 +863,7 @@ func (o *ScpOptions) runBatch(ctx context.Context, provider config.ConfigProvide
 	}
 	// 解析 --exclude 排除规则（在 Worker Pool 启动前完成，确保无歧义）
 	var excludes map[string]struct{}
-	if len(o.Exclude) > 0 {
+	if o.hasExcludeFlags() {
 		resolved, err := o.resolveExcludes(provider)
 		if err != nil {
 			return fmt.Errorf("%s: %w", i18n.T("scp_err_exclude"), err)
@@ -839,6 +871,9 @@ func (o *ScpOptions) runBatch(ctx context.Context, provider config.ConfigProvide
 		excludes = resolved
 	}
 
+	if o.TaskCount < 0 || o.TaskCount > maxBatchTaskCount {
+		return fmt.Errorf("invalid --task value %d: must be between 1 and %d", o.TaskCount, maxBatchTaskCount)
+	}
 	var (
 		errMu        sync.Mutex
 		transferErrs []error
@@ -1558,7 +1593,7 @@ func (o *ScpOptions) appendScpSessionAuthOverrides(adpOpts *[]adapter.Option, pr
 		return err
 	}
 	var excludes map[string]struct{}
-	if provider != nil && len(o.Exclude) > 0 {
+	if provider != nil && o.hasExcludeFlags() {
 		var err error
 		excludes, err = o.resolveExcludes(provider)
 		if err != nil {
@@ -1872,14 +1907,18 @@ func (o *ScpOptions) resolveExcludes(provider config.ConfigProvider) (map[string
 	if err := o.ensureGeneralOptionsApplied(); err != nil {
 		return nil, err
 	}
-	if len(o.Exclude) == 0 {
+	if !o.hasExcludeFlags() {
 		return nil, nil
+	}
+	parsedExcludes, err := o.validatedExcludes()
+	if err != nil {
+		return nil, err
 	}
 	candidates, err := o.buildExcludeCandidatesChecked(provider)
 	if err != nil {
 		return nil, err
 	}
-	return cmdutils.ResolveExcludesForTargetsWithOptions(provider, cmdutils.ParseExcludeFlag(o.Exclude), candidates, o.control.Options, o.effectiveCLIJumpHost())
+	return cmdutils.ResolveExcludesForTargetsWithOptions(provider, parsedExcludes, candidates, o.control.Options, o.effectiveCLIJumpHost())
 }
 
 func (o *ScpOptions) buildExcludeCandidates(provider config.ConfigProvider) []cmdutils.ExcludeTargetInfo {
@@ -1912,7 +1951,7 @@ func (o *ScpOptions) buildExcludeCandidatesChecked(provider config.ConfigProvide
 
 func (o *ScpOptions) collectTargetPaths(provider config.ConfigProvider) []PathInfo {
 	var excludes map[string]struct{}
-	if provider != nil && len(o.Exclude) > 0 {
+	if provider != nil && o.hasExcludeFlags() {
 		if resolved, err := o.resolveExcludes(provider); err == nil {
 			excludes = resolved
 		}

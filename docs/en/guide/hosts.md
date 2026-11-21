@@ -185,7 +185,7 @@ nodes:
 | `stdin_null` | `StdinNull` | `yes` / `no` | Redirects stdin from `/dev/null` (corresponds to `-n`) |
 | `session_type` | `SessionType` | `default` / `none` | Session mode; `none` establishes forwards without a remote shell/command (corresponds to `-N`) |
 | `tunnel` | `Tunnel` | `yes` / `point-to-point` / `no` (`ethernet` is parsed for config compatibility only and rejected at startup) | Request Layer 3 tun device forwarding (`yes` maps to `point-to-point`) |
-| `tunnel_device` | `TunnelDevice` | `local_tun[:remote_tun]` (e.g. `0:0`, `any:any`) | Specifies local and remote tun/tap interface unit numbers |
+| `tunnel_device` | `TunnelDevice` | `local_tun[:remote_tun]` (e.g. `0:0`, `any:any`) | Specifies local and remote Layer 3 `tun` interface unit numbers |
 | `request_tty` | `RequestTTY` | `no` / `yes` / `force` / `auto` | Pseudo-terminal (PTY) allocation policy |
 | `local_forward` | `LocalForward` | String or array of strings | Local port or Unix domain socket forwarding; supports `"[bind_address:]port host:hostport"` or `"local_socket:remote_socket"` |
 | `remote_forward` | `RemoteForward` | String or array of strings | Remote port, Unix socket, or reverse dynamic forwarding; supports `"[bind_address:]port[:host:hostport]"` or `"remote_socket[:local_socket]"` |

@@ -106,7 +106,7 @@ ssh_err_background_requires_nocmd:
 ssh_flag_stdio_forward:
   other: "将标准输入输出通过安全通道转发至 host:port"
 ssh_flag_tunnel_device:
-  other: "请求 tun/tap 隧道设备转发 (local_tun[:remote_tun])"
+  other: "请求三层 tun 隧道设备转发 (local_tun[:remote_tun])"
 ssh_flag_disable_tty:
   other: "禁止分配伪终端 (PTY)"
 ssh_flag_force_tty:

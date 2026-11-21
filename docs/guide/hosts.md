@@ -185,7 +185,7 @@ nodes:
 | `stdin_null` | `StdinNull` | `yes` / `no` | 将标准输入重定向至 `/dev/null`（对应 `-n`） |
 | `session_type` | `SessionType` | `default` / `none` | 会话模式；`none` 表示仅转发端口或隧道，不打开远端会话（对应 `-N`） |
 | `tunnel` | `Tunnel` | `yes` / `point-to-point` / `no`（`ethernet` 仅兼容配置解析，启动时不支持） | 请求三层虚拟网卡隧道转发（`yes` 等价于 `point-to-point`） |
-| `tunnel_device` | `TunnelDevice` | `local_tun[:remote_tun]`（如 `0:0`, `any:any`） | 指定本地与远程 tun/tap 设备单元号 |
+| `tunnel_device` | `TunnelDevice` | `local_tun[:remote_tun]`（如 `0:0`, `any:any`） | 指定本地与远程三层 `tun` 设备单元号 |
 | `request_tty` | `RequestTTY` | `no` / `yes` / `force` / `auto` | 伪终端 (PTY) 分配策略 |
 | `local_forward` | `LocalForward` | 字符串或字符串数组 | 本地端口或 Unix 域套接字转发；支持 `"[bind_address:]port host:hostport"` 或 `"local_socket:remote_socket"` |
 | `remote_forward` | `RemoteForward` | 字符串或字符串数组 | 远程端口、Unix 域套接字或反向动态转发；支持 `"[bind_address:]port[:host:hostport]"` 或 `"remote_socket[:local_socket]"` |

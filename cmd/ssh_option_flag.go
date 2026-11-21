@@ -614,6 +614,21 @@ func validateNonEmptyIdentityFlag(f *pflag.Flag, flags *pflag.FlagSet) error {
 	return nil
 }
 
+// normalizeCLIIdentityFlagPath converts plain relative or ~/ paths from CLI -i
+// to absolute paths while preserving % tokens and ${VAR} placeholders without
+// CWD mangling. Unlike -o IdentityFile=none, literal -i none resolves to
+// <cwd>/none matching OpenSSH ssh.c add_identity_file().
+func normalizeCLIIdentityFlagPath(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.Contains(trimmed, "%") || strings.Contains(trimmed, "${") {
+		return trimmed
+	}
+	return utils.ToAbsolutePath(trimmed)
+}
+
 func ApplyGeneralOptions(opts *SshOptions, optionStrings []string, flags *pflag.FlagSet) error {
 	if err := validateExplicitNonEmptyFlags(flags); err != nil {
 		return err
@@ -621,15 +636,17 @@ func ApplyGeneralOptions(opts *SshOptions, optionStrings []string, flags *pflag.
 	opts.syncIdentityFiles()
 	if flags != nil && flags.Changed("identity") && len(opts.IdentityFiles) > 0 {
 		normalized := make([]string, 0, len(opts.IdentityFiles))
+		persistable := ""
 		for _, k := range opts.IdentityFiles {
-			if trimmed := strings.TrimSpace(k); trimmed != "" {
-				normalized = append(normalized, utils.ToAbsolutePath(trimmed))
+			if norm := normalizeCLIIdentityFlagPath(k); norm != "" {
+				normalized = append(normalized, norm)
+				if persistable == "" && config.IsPersistableIdentityPath(norm) {
+					persistable = norm
+				}
 			}
 		}
 		opts.IdentityFiles = normalized
-		if len(normalized) > 0 {
-			opts.IdentityFile = normalized[0]
-		}
+		opts.IdentityFile = persistable
 	}
 	allowJump := shouldApplyGeneralOption(flags, "jump", opts.JumpHost == "")
 	st := generalOptionState{

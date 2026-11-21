@@ -106,7 +106,7 @@ ssh_err_background_requires_nocmd:
 ssh_flag_stdio_forward:
   other: "Forward standard input and output to host:port over the secure channel"
 ssh_flag_tunnel_device:
-  other: "Request tun/tap tunnel device forwarding (local_tun[:remote_tun])"
+  other: "Request Layer 3 tun tunnel device forwarding (local_tun[:remote_tun])"
 ssh_flag_disable_tty:
   other: "Disable pseudo-terminal allocation"
 ssh_flag_force_tty:

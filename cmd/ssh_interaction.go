@@ -228,15 +228,23 @@ func resolveAskpassProgram() string {
 }
 
 func askpassCommandEnv(base []string) []string {
-	const prefix = "SSH_ASKPASS_PROMPT="
+	const (
+		promptPrefix = "SSH_ASKPASS_PROMPT="
+		muxPrefix    = sshMuxDaemonEnv + "="
+		bgPrefix     = sshBackgroundChildEnv + "="
+	)
 	env := make([]string, 0, len(base)+1)
 	for _, kv := range base {
-		if len(kv) >= len(prefix) && strings.EqualFold(kv[:len(prefix)], prefix) {
+		if hasEnvPrefixFold(kv, promptPrefix) || hasEnvPrefixFold(kv, muxPrefix) || hasEnvPrefixFold(kv, bgPrefix) {
 			continue
 		}
 		env = append(env, kv)
 	}
-	return append(env, prefix+"confirm")
+	return append(env, promptPrefix+"confirm")
+}
+
+func hasEnvPrefixFold(kv, prefix string) bool {
+	return len(kv) >= len(prefix) && strings.EqualFold(kv[:len(prefix)], prefix)
 }
 
 func isAskpassApproved(out []byte) bool {

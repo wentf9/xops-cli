@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"unicode"
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
@@ -237,11 +238,33 @@ func applyAddTargetArgs(args []string, alias *[]string, address, user *string, p
 	return mergeTargetAddressSpec(targetArg, address, user, port, &portChanged)
 }
 
+func validateRawTargetAddressSpec(spec string) (string, error) {
+	for _, r := range spec {
+		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
+			return "", fmt.Errorf("invalid host address %q: contains invalid control character", spec)
+		}
+	}
+	trimmed := strings.TrimSpace(spec)
+	if trimmed == "" {
+		return "", fmt.Errorf("host address cannot be empty")
+	}
+	if len(trimmed) >= len(config.OpenSSHNodePrefix) && strings.EqualFold(trimmed[:len(config.OpenSSHNodePrefix)], config.OpenSSHNodePrefix) {
+		return "", fmt.Errorf("invalid host address %q: openssh selector cannot be used as a concrete host address", spec)
+	}
+	for _, r := range trimmed {
+		if unicode.IsSpace(r) {
+			return "", fmt.Errorf("invalid host address %q: contains whitespace", spec)
+		}
+	}
+	return trimmed, nil
+}
+
 func mergeTargetAddressSpec(spec string, address, user *string, port *uint16, portChanged *bool) error {
-	if err := config.ValidateConcreteHostAddress(spec); err != nil {
+	trimmed, err := validateRawTargetAddressSpec(spec)
+	if err != nil {
 		return err
 	}
-	posUser, posHost, posPort, err := utils.ParseAddr(spec)
+	posUser, posHost, posPort, err := utils.ParseAddr(trimmed)
 	if err != nil {
 		return err
 	}

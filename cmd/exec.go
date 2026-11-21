@@ -24,18 +24,22 @@ import (
 	pkgutils "github.com/wentf9/xops-cli/pkg/utils"
 )
 
+const maxBatchTaskCount = 1024
+
 type ExecOptions struct {
 	interaction *cliInteractionHandler
 	SshOptions
-	HostFile    string
-	ShellFile   string
-	Command     string
-	Tag         string
-	Exclude     []string
-	TaskCount   int
-	Interactive bool
-	Stream      bool
-	OutDir      string
+	HostFile       string
+	ShellFile      string
+	Command        string
+	Tag            string
+	Exclude        []string
+	rawExcludeArgs []string
+	excludeSet     bool
+	TaskCount      int
+	Interactive    bool
+	Stream         bool
+	OutDir         string
 
 	ScriptArgs []string
 
@@ -98,7 +102,7 @@ func newCmdExecWithOptions(o *ExecOptions) *cobra.Command {
 	cmd.Flags().StringVarP(&o.Command, "cmd", "c", "", i18n.T("flag_exec_cmd"))
 	cmd.Flags().StringVarP(&o.HostFile, "ifile", "I", "", i18n.T("flag_exec_ifile"))
 	cmd.Flags().StringVar(&o.Tag, "tag", "", i18n.T("flag_exec_tag"))
-	cmd.Flags().StringSliceVar(&o.Exclude, "exclude", nil, i18n.T("flag_exclude"))
+	utils.RegisterExcludeFlag(cmd.Flags(), &o.Exclude, &o.rawExcludeArgs, i18n.T("flag_exclude"))
 	cmd.Flags().StringVar(&o.ShellFile, "shell", "", i18n.T("flag_exec_shell"))
 	cmd.Flags().IntVar(&o.TaskCount, "task", 3, i18n.T("flag_exec_task"))
 	cmd.Flags().BoolVarP(&o.Interactive, "interactive", "x", false, i18n.T("flag_exec_interactive"))
@@ -267,6 +271,12 @@ func (o *ExecOptions) Complete(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	o.execution.capturePresence(cmd)
+	if cmd != nil && cmd.Flags().Changed("exclude") {
+		o.excludeSet = true
+	}
+	if _, err := o.validatedExcludes(); err != nil {
+		return err
+	}
 	if cmd != nil && cmd.Flags().Changed("cmd") && o.Command == "" {
 		return fmt.Errorf("explicit command must not be empty")
 	}
@@ -323,6 +333,27 @@ func (o *ExecOptions) readStdinIfRequired(ctx context.Context) error {
 	return nil
 }
 
+func (o *ExecOptions) hasExcludeFlags() bool {
+	return o.excludeSet || len(o.Exclude) > 0 || len(o.rawExcludeArgs) > 0
+}
+
+func (o *ExecOptions) validatedExcludes() ([]string, error) {
+	if !o.hasExcludeFlags() {
+		return nil, nil
+	}
+	if len(o.rawExcludeArgs) > 0 {
+		parsed, err := utils.ValidateExcludeFlagValues(o.rawExcludeArgs)
+		if err != nil {
+			return nil, err
+		}
+		if len(o.Exclude) > 0 {
+			return utils.ValidateExcludeFlagValues(o.Exclude)
+		}
+		return parsed, nil
+	}
+	return utils.ValidateExcludeFlagValues(o.Exclude)
+}
+
 func (o *ExecOptions) Validate() error {
 	if err := o.ensureGeneralOptionsApplied(); err != nil {
 		return err
@@ -332,6 +363,12 @@ func (o *ExecOptions) Validate() error {
 	}
 	if err := validateCommonSSHBaseOptions(&o.SshOptions); err != nil {
 		return err
+	}
+	if _, err := o.validatedExcludes(); err != nil {
+		return err
+	}
+	if o.TaskCount < 1 || o.TaskCount > maxBatchTaskCount {
+		return fmt.Errorf("invalid --task value %d: must be between 1 and %d", o.TaskCount, maxBatchTaskCount)
 	}
 	if err := o.prepareCommandPlan(); err != nil {
 		return err
@@ -466,12 +503,16 @@ func (o *ExecOptions) RunContext(ctx context.Context) (retErr error) {
 	}
 
 	// 应用 --exclude 排除规则（在只读规划阶段完成过滤，避免被排除节点触碰磁盘或待定状态）
-	if len(o.Exclude) > 0 {
+	if o.hasExcludeFlags() {
+		parsedExcludes, err := o.validatedExcludes()
+		if err != nil {
+			return fmt.Errorf("%s: %w", i18n.T("exec_err_exclude"), err)
+		}
 		candidates := make([]utils.ExcludeTargetInfo, 0, len(tasks))
 		for _, t := range tasks {
 			candidates = append(candidates, o.execTaskExcludeInfo(t))
 		}
-		excludes, err := utils.ResolveExcludesForTargetsWithOptions(provider, utils.ParseExcludeFlag(o.Exclude), candidates, o.control.Options, o.effectiveCLIJumpHost())
+		excludes, err := utils.ResolveExcludesForTargetsWithOptions(provider, parsedExcludes, candidates, o.control.Options, o.effectiveCLIJumpHost())
 		if err != nil {
 			return fmt.Errorf("%s: %w", i18n.T("exec_err_exclude"), err)
 		}
@@ -540,6 +581,9 @@ func (o *ExecOptions) RunContext(ctx context.Context) (retErr error) {
 	var taskErrs []error
 
 	// 批量模式：原有逻辑
+	if o.TaskCount < 0 || o.TaskCount > maxBatchTaskCount {
+		return fmt.Errorf("invalid --task value %d: must be between 1 and %d", o.TaskCount, maxBatchTaskCount)
+	}
 	wp := pkgutils.NewWorkerPool(uint(o.TaskCount))
 	for _, task := range tasks {
 		t := task // capture range variable

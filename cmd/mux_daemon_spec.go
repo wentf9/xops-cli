@@ -65,6 +65,57 @@ func (s MuxDaemonSpec) Validate() error {
 	if s.ControlMaster != ssh.ControlMasterYes && s.ControlMaster != ssh.ControlMasterAsk {
 		return fmt.Errorf("mux daemon spec requires ControlMaster yes or ask, got %q", s.ControlMaster)
 	}
+	if strings.TrimSpace(s.ControlPersist) != "" {
+		if _, err := ssh.ParsePersistSetting(s.ControlPersist); err != nil {
+			return fmt.Errorf("mux daemon spec invalid control persist %q: %w", s.ControlPersist, err)
+		}
+	}
+	for _, opt := range s.Options {
+		if err := validateMuxDaemonSpecOption(opt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateMuxDaemonSpecOption(opt string) error {
+	key, val, err := adapter.SplitOptionKeyValue(opt)
+	if err != nil {
+		return fmt.Errorf("mux daemon spec invalid option %q: %w", opt, err)
+	}
+	if key == "" || strings.TrimSpace(val) == "" {
+		return fmt.Errorf("mux daemon spec option %q requires non-empty key and value", opt)
+	}
+	optSpec, ok := ssh.LookupOptionSpec(key)
+	if !ok {
+		return fmt.Errorf("mux daemon spec rejects unsupported option %q", opt)
+	}
+	switch optSpec.Class {
+	case ssh.OptionClassMux:
+		return fmt.Errorf("mux daemon spec rejects mux option %q", opt)
+	case ssh.OptionClassSession:
+		return fmt.Errorf("mux daemon spec rejects session option %q", opt)
+	case ssh.OptionClassForward:
+		if !isMuxDaemonPreservedOption(opt) {
+			return fmt.Errorf("mux daemon spec rejects forward option %q", opt)
+		}
+	case ssh.OptionClassLocalExec:
+		if optSpec.CanonicalKey != ssh.OptionProxyCommand || !ssh.IsNoneValue(val) {
+			return fmt.Errorf("mux daemon spec rejects local-exec option %q", opt)
+		}
+	case ssh.OptionClassAuth:
+		if optSpec.CanonicalKey == ssh.OptionIdentityFile {
+			return fmt.Errorf("mux daemon spec rejects identity option %q", opt)
+		}
+	case ssh.OptionClassTransport, ssh.OptionClassTrust:
+		// Connection-wide and target transport/trust options are allowed.
+	default:
+		return fmt.Errorf("mux daemon spec rejects option %q", opt)
+	}
+	var check ssh.Options
+	if err := check.Set(optSpec.CanonicalKey, val); err != nil {
+		return fmt.Errorf("mux daemon spec invalid option %q: %w", opt, err)
+	}
 	return nil
 }
 
@@ -214,7 +265,7 @@ func (o *SshOptions) collectMuxDaemonTargetOptions(master *ssh.MuxServer, hasIde
 		if isSessionOrForwardOption(opt) && !isMuxDaemonPreservedOption(opt) {
 			continue
 		}
-		if master != nil && isTargetOnlyMuxDaemonOption(opt) {
+		if isTargetOnlyMuxDaemonOption(opt) {
 			if preserveProxyNone && !emittedProxyNone && isProxyCommandNoneOption(opt) {
 				emittedProxyNone = true
 				opts = append(opts, opt)
@@ -249,9 +300,16 @@ func (o *SshOptions) applyMuxDaemonSpec(spec MuxDaemonSpec) error {
 	o.control.ControlPath = spec.ControlPath
 	o.control.controlPathLiteral = spec.ControlPathLiteral
 	o.control.MasterCount = 0
+	o.control.CtlCmd = ""
+	o.control.ctlCmdSet = false
 	o.CipherSpec = spec.CipherSpec
 	o.GatewayPorts = spec.GatewayPorts
 	o.Remember = "never"
+	o.Sudo = false
+	o.OTP = ""
+	o.DisableTTY = false
+	o.ForceTTYCount = 0
+	o.cliTTYMode = ""
 
 	o.IdentityFiles = slices.Clone(spec.IdentityFiles)
 	o.IdentityFile = ""
@@ -259,11 +317,11 @@ func (o *SshOptions) applyMuxDaemonSpec(spec MuxDaemonSpec) error {
 	o.syncIdentityFiles()
 
 	daemonOpts := make([]string, 0, len(spec.Options)+3)
-	daemonOpts = append(daemonOpts, spec.Options...)
+	daemonOpts = append(daemonOpts, "ControlMaster="+string(spec.ControlMaster), "ClearAllForwardings=yes")
 	if spec.ControlPersist != "" {
 		daemonOpts = append(daemonOpts, "ControlPersist="+spec.ControlPersist)
 	}
-	daemonOpts = append(daemonOpts, "ClearAllForwardings=yes", "ControlMaster="+string(spec.ControlMaster))
+	daemonOpts = append(daemonOpts, spec.Options...)
 	o.control.Options = daemonOpts
 
 	o.PasswordStdin = false
