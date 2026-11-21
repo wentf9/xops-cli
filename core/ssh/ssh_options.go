@@ -1824,13 +1824,13 @@ func isValidEnvIdentifier(s string) bool {
 // On disk (YAML/JSON) it serializes using canonical snake_case keys, while
 // accepting both snake_case and OpenSSH standard names on input.
 type Options struct {
-	values map[string]string
+	values map[string]string `digest:"include"`
 	// ImplicitTier4 is true when multiplexing was resolved solely from ~/.ssh/config
 	// without any CLI flag or xops node/global configuration.
-	ImplicitTier4 bool `json:"-" yaml:"-"`
+	ImplicitTier4 bool `json:"-" yaml:"-" digest:"include"`
 	// LiteralControlPath marks OptionControlPath as an already-expanded literal
 	// socket path so Validate and resolution skip ~, ${VAR}, and % token parsing.
-	LiteralControlPath bool `json:"-" yaml:"-"`
+	LiteralControlPath bool `json:"-" yaml:"-" digest:"include"`
 }
 
 // NewOptions creates an Options instance from alternating key, value pairs.

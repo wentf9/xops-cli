@@ -25,20 +25,20 @@ const (
 // RawBytes is excluded from JSON serialization so ConnectionKey hashes only
 // deterministic metadata (Path/SHA256/Missing/NonRegular).
 type AdmittedCertificate struct {
-	Path       string `json:",omitempty"`
-	SHA256     string `json:",omitempty"`
-	Missing    bool   `json:",omitempty"`
-	NonRegular bool   `json:",omitempty"`
-	RawBytes   []byte `json:"-"`
+	Path       string `json:",omitempty" digest:"include"`
+	SHA256     string `json:",omitempty" digest:"include"`
+	Missing    bool   `json:",omitempty" digest:"include"`
+	NonRegular bool   `json:",omitempty" digest:"include"`
+	RawBytes   []byte `json:"-" digest:"exclude,reason=pre-read certificate bytes already bound by SHA256 metadata"`
 }
 
 // AdmittedKeyDigest binds an admitted key file path to its expected SHA-256
 // digest captured at ConnectionPlan admission. Private key bytes are never stored.
 type AdmittedKeyDigest struct {
-	Path       string `json:",omitempty"`
-	SHA256     string `json:",omitempty"`
-	Missing    bool   `json:",omitempty"`
-	NonRegular bool   `json:",omitempty"`
+	Path       string `json:",omitempty" digest:"include"`
+	SHA256     string `json:",omitempty" digest:"include"`
+	Missing    bool   `json:",omitempty" digest:"include"`
+	NonRegular bool   `json:",omitempty" digest:"include"`
 }
 
 func cloneAdmittedCertificates(src []AdmittedCertificate) []AdmittedCertificate {
@@ -78,47 +78,47 @@ func equalAdmittedCertificates(a, b []AdmittedCertificate) bool {
 
 // ClientConfig 定义建立 SSH 连接所需的各种参数，代替原有的 models.Node/Host/Identity。
 type ClientConfig struct {
-	KeyRef       string
-	TrustVersion string
-	NodeID       string // 逻辑标识
+	KeyRef       string `digest:"include"`
+	TrustVersion string `digest:"include"`
+	NodeID       string `digest:"include"` // 逻辑标识
 	// OriginalHost is the user's original command-line host or alias (%n).
 	// Empty falls back to NodeID. It differs from Address (%h) after
 	// CanonicalizeHostname rewrites the target.
-	OriginalHost  string
-	CanonicalHost string
-	Address       string
+	OriginalHost  string `digest:"include"`
+	CanonicalHost string `digest:"include"`
+	Address       string `digest:"include"`
 	// BaseHost records the underlying saved host address when a session-level
 	// HostName override rewrites Address, allowing SecretResolver snapshot checks
 	// to verify both the dialed override host and the underlying saved address
 	// without mutable adapter-wide state.
-	BaseHost   string
-	Port       int
-	User       string
-	AuthType   string // "password", "key", "agent", "auto"
-	Password   string
-	KeyPath    string
-	KeyPaths   []string
-	Passphrase string
+	BaseHost   string   `digest:"include"`
+	Port       int      `digest:"include"`
+	User       string   `digest:"include"`
+	AuthType   string   `digest:"include"` // "password", "key", "agent", "auto"
+	Password   string   `digest:"exclude,reason=plaintext secret must never enter cache digest; credential versioning uses KeyRef and AuthUpdateToken"`
+	KeyPath    string   `digest:"include"`
+	KeyPaths   []string `digest:"include"`
+	Passphrase string   `digest:"exclude,reason=plaintext secret must never enter cache digest; credential versioning uses KeyRef and AuthUpdateToken"`
 	// AuthUpdateToken conditionally authorizes persistence of discovered
 	// authentication values. An empty token makes discovery session-local.
-	AuthUpdateToken string
-	SudoMode        SudoMode // "root", "sudo", "sudoer", "su", "none", "auto"
-	SuPwd           string
+	AuthUpdateToken string   `digest:"include"`
+	SudoMode        SudoMode `digest:"include"` // "root", "sudo", "sudoer", "su", "none", "auto"
+	SuPwd           string   `digest:"exclude,reason=plaintext secret must never enter cache digest; credential versioning uses SudoUpdateToken"`
 	// SudoUpdateToken conditionally authorizes persistence of discovered sudo
 	// values. An empty token makes discovery session-local.
-	SudoUpdateToken      string
-	ProxyJump            string // 跳板机的 NodeID
-	OriginalProxyJump    string // 来自 Provider 的原始 ProxyJump 配置（用于目标一致性变更检查）
-	HasOriginalProxyJump bool   // 是否显式保留了配置态 ProxyJump 快照（区分显式空字符串与未设置）
+	SudoUpdateToken      string `digest:"include"`
+	ProxyJump            string `digest:"include"` // 跳板机的 NodeID
+	OriginalProxyJump    string `digest:"include"` // 来自 Provider 的原始 ProxyJump 配置（用于目标一致性变更检查）
+	HasOriginalProxyJump bool   `digest:"include"` // 是否显式保留了配置态 ProxyJump 快照（区分显式空字符串与未设置）
 	// PasswordPromptPattern 自定义密码提示正则（节点级，可选）。
 	// 为空时回落到 Connector 的全局配置，再为空则使用内置的多语言默认模式。
-	PasswordPromptPattern       string
-	EnforceAdmittedCertificates bool                  `json:",omitempty"`
-	AdmittedCertificates        []AdmittedCertificate `json:",omitempty"`
-	EnforceAdmittedKeyDigests   bool                  `json:",omitempty"`
-	AdmittedKeyDigests          []AdmittedKeyDigest   `json:",omitempty"`
-	Execution                   *ExecutionConfig
-	Options                     *Options
+	PasswordPromptPattern       string                `digest:"include"`
+	EnforceAdmittedCertificates bool                  `json:",omitempty" digest:"include"`
+	AdmittedCertificates        []AdmittedCertificate `json:",omitempty" digest:"include"`
+	EnforceAdmittedKeyDigests   bool                  `json:",omitempty" digest:"include"`
+	AdmittedKeyDigests          []AdmittedKeyDigest   `json:",omitempty" digest:"include"`
+	Execution                   *ExecutionConfig      `digest:"include"`
+	Options                     *Options              `digest:"include"`
 }
 
 // ToConnectionConfig 将 ClientConfig 转换为仅含网络与连接参数的 ConnectionConfig，剥离所有明文密码。
@@ -163,32 +163,32 @@ func (c *ClientConfig) ToConnectionConfig() ConnectionConfig {
 
 // ConnectionConfig 包含建立连接所需的目标与网络参数，不包含登录或提权明文机密。
 type ConnectionConfig struct {
-	KeyRef                      string
-	TrustVersion                string
-	NodeID                      string
-	OriginalHost                string
-	CanonicalHost               string
-	Address                     string
-	BaseHost                    string `json:"base_host,omitempty"`
-	Port                        int
-	User                        string
-	AuthType                    string
-	configuredAuthType          string
-	KeyPath                     string
-	KeyPaths                    []string
-	AuthUpdateToken             string
-	SudoMode                    SudoMode
-	SudoUpdateToken             string
-	ProxyJump                   string
-	OriginalProxyJump           string
-	HasOriginalProxyJump        bool
-	PasswordPromptPattern       string
-	EnforceAdmittedCertificates bool                  `json:",omitempty"`
-	AdmittedCertificates        []AdmittedCertificate `json:",omitempty"`
-	EnforceAdmittedKeyDigests   bool                  `json:",omitempty"`
-	AdmittedKeyDigests          []AdmittedKeyDigest   `json:",omitempty"`
-	Execution                   *ExecutionConfig
-	Options                     *Options
+	KeyRef                      string                `digest:"include"`
+	TrustVersion                string                `digest:"include"`
+	NodeID                      string                `digest:"include"`
+	OriginalHost                string                `digest:"include"`
+	CanonicalHost               string                `digest:"include"`
+	Address                     string                `digest:"include"`
+	BaseHost                    string                `json:"base_host,omitempty" digest:"include"`
+	Port                        int                   `digest:"include"`
+	User                        string                `digest:"include"`
+	AuthType                    string                `digest:"include"`
+	configuredAuthType          string                `digest:"exclude,reason=handshake baseline copy of AuthType retained only for legacy auto-auth compatibility"`
+	KeyPath                     string                `digest:"include"`
+	KeyPaths                    []string              `digest:"include"`
+	AuthUpdateToken             string                `digest:"include"`
+	SudoMode                    SudoMode              `digest:"include"`
+	SudoUpdateToken             string                `digest:"include"`
+	ProxyJump                   string                `digest:"include"`
+	OriginalProxyJump           string                `digest:"include"`
+	HasOriginalProxyJump        bool                  `digest:"include"`
+	PasswordPromptPattern       string                `digest:"include"`
+	EnforceAdmittedCertificates bool                  `json:",omitempty" digest:"include"`
+	AdmittedCertificates        []AdmittedCertificate `json:",omitempty" digest:"include"`
+	EnforceAdmittedKeyDigests   bool                  `json:",omitempty" digest:"include"`
+	AdmittedKeyDigests          []AdmittedKeyDigest   `json:",omitempty" digest:"include"`
+	Execution                   *ExecutionConfig      `digest:"include"`
+	Options                     *Options              `digest:"include"`
 }
 
 // Clone returns a deep copy of ConnectionConfig, isolating mutable Execution and Options pointers.

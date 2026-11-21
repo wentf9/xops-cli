@@ -166,17 +166,17 @@ func ParsePersistSetting(val string) (PersistSetting, error) {
 // ControlConfig specifies the connection multiplexing parameters for an SSH connection.
 // Matches the contract defined in PROJECT.md and Schema V2.
 type ControlConfig struct {
-	Master      ControlMasterMode `json:"master,omitempty" yaml:"master,omitempty"`
-	Path        string            `json:"path,omitempty" yaml:"path,omitempty"`
-	LiteralPath bool              `json:"-" yaml:"-"`
-	Persist     string            `json:"persist,omitempty" yaml:"persist,omitempty"`
+	Master      ControlMasterMode `json:"master,omitempty" yaml:"master,omitempty" digest:"include"`
+	Path        string            `json:"path,omitempty" yaml:"path,omitempty" digest:"include"`
+	LiteralPath bool              `json:"-" yaml:"-" digest:"include"`
+	Persist     string            `json:"persist,omitempty" yaml:"persist,omitempty" digest:"include"`
 	// ImplicitTier4 is true when multiplexing was resolved solely from ~/.ssh/config
 	// (Tier 4) without any CLI flag or xops node/global configuration.
-	ImplicitTier4 bool `json:"-" yaml:"-"`
+	ImplicitTier4 bool `json:"-" yaml:"-" digest:"include"`
 	// AllowReuse is true when the CLI explicitly specified -S <path> without -M or
 	// -o ControlMaster=..., allowing attachment to an existing master even when a
 	// lower-priority config layer sets ControlMaster=yes or ControlMaster=ask.
-	AllowReuse bool `json:"-" yaml:"-"`
+	AllowReuse bool `json:"-" yaml:"-" digest:"include"`
 }
 
 // ResolvePath returns the concrete socket path for c. When LiteralPath is true,

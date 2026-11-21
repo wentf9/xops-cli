@@ -16,9 +16,9 @@ var ErrExecutionValidation = errors.New("execution validation error")
 // ExecutionConfig specifies the execution environment for commands.
 // It can be configured at global, node, playbook settings, or step levels.
 type ExecutionConfig struct {
-	Interpreter   Interpreter   `yaml:"interpreter,omitempty" json:"interpreter,omitempty"`
-	LaunchDialect LaunchDialect `yaml:"launch_dialect,omitempty" json:"launchDialect,omitempty"`
-	Login         *bool         `yaml:"login,omitempty" json:"login,omitempty"`
+	Interpreter   Interpreter   `yaml:"interpreter,omitempty" json:"interpreter,omitempty" digest:"include"`
+	LaunchDialect LaunchDialect `yaml:"launch_dialect,omitempty" json:"launchDialect,omitempty" digest:"include"`
+	Login         *bool         `yaml:"login,omitempty" json:"login,omitempty" digest:"include"`
 }
 
 // Clone returns a deep copy of ExecutionConfig.
