@@ -59,9 +59,12 @@ func FuzzTargetRefRoundTrip(f *testing.F) {
 		if err != nil {
 			return
 		}
+		if err := ref.Validate(); err != nil {
+			t.Fatalf("ParseTargetRef(%q) -> %+v failed Validate(): %v", raw, ref, err)
+		}
 		norm := ref.NormalizedString()
 		if norm == "" {
-			return
+			t.Fatalf("ParseTargetRef(%q) -> %+v produced empty NormalizedString()", raw, ref)
 		}
 		reparsed, err := ParseTargetRef(norm)
 		if err != nil {

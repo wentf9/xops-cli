@@ -10,9 +10,9 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 
 	"github.com/wentf9/xops-cli/core/ssh"
@@ -315,17 +315,118 @@ func (readOnlyRejectStore) Save(*Configuration) error {
 	return errors.New("read-only OpenSSH override store does not support Save")
 }
 
+const maxOverrideConfirmedSnapshots = 64
+
 type openSSHOverrideProvider struct {
 	ConfigProvider
 	repo *Repository
+
+	confirmedMu    sync.RWMutex
+	confirmed      map[string]ConnectionSnapshot
+	confirmedOrder []string
+}
+
+func cloneConnectionSnapshot(snap ConnectionSnapshot) ConnectionSnapshot {
+	out := ConnectionSnapshot{
+		Node:       cloneNode(snap.Node),
+		Host:       cloneHost(snap.Host),
+		Identity:   cloneIdentity(snap.Identity),
+		Provenance: snap.Provenance,
+	}
+	if snap.UpdateRef != nil {
+		refCopy := *snap.UpdateRef
+		out.UpdateRef = &refCopy
+	}
+	return out
+}
+
+func (p *openSSHOverrideProvider) recordConfirmedSnapshot(nodeID string, snap ConnectionSnapshot) {
+	p.confirmedMu.Lock()
+	defer p.confirmedMu.Unlock()
+	if p.confirmed == nil {
+		p.confirmed = make(map[string]ConnectionSnapshot)
+	}
+	if _, exists := p.confirmed[nodeID]; !exists {
+		for len(p.confirmedOrder) >= maxOverrideConfirmedSnapshots {
+			oldest := p.confirmedOrder[0]
+			p.confirmedOrder = p.confirmedOrder[1:]
+			delete(p.confirmed, oldest)
+		}
+		p.confirmedOrder = append(p.confirmedOrder, nodeID)
+	}
+	p.confirmed[nodeID] = cloneConnectionSnapshot(snap)
+}
+
+func (p *openSSHOverrideProvider) forgetConfirmedSnapshot(nodeID string) {
+	p.confirmedMu.Lock()
+	defer p.confirmedMu.Unlock()
+	if _, exists := p.confirmed[nodeID]; !exists {
+		return
+	}
+	delete(p.confirmed, nodeID)
+	for i, id := range p.confirmedOrder {
+		if id == nodeID {
+			p.confirmedOrder = append(p.confirmedOrder[:i], p.confirmedOrder[i+1:]...)
+			break
+		}
+	}
+}
+
+func (p *openSSHOverrideProvider) loadConfirmedSnapshot(nodeID string) (ConnectionSnapshot, bool) {
+	p.confirmedMu.RLock()
+	defer p.confirmedMu.RUnlock()
+	snap, ok := p.confirmed[nodeID]
+	if !ok {
+		return ConnectionSnapshot{}, false
+	}
+	return cloneConnectionSnapshot(snap), true
 }
 
 func (p *openSSHOverrideProvider) PrepareNodeContext(ctx context.Context, opts EnsureNodeOptions) (EnsureNodeResult, error) {
-	return p.repo.PrepareNodeContext(ctx, opts)
+	res, err := p.repo.PrepareNodeContext(ctx, opts)
+	if err == nil && res.Created && res.NodeID != "" {
+		p.forgetConfirmedSnapshot(res.NodeID)
+	}
+	return res, err
+}
+
+func (p *openSSHOverrideProvider) Resolve(nodeID string) (models.Node, models.Host, models.Identity, error) {
+	node, host, ident, err := p.repo.Resolve(nodeID)
+	if err == nil {
+		return node, host, ident, nil
+	}
+	if errors.Is(err, ErrNodeNotFound) {
+		if snap, ok := p.loadConfirmedSnapshot(nodeID); ok {
+			return snap.Node, snap.Host, snap.Identity, nil
+		}
+	}
+	return models.Node{}, models.Host{}, models.Identity{}, err
+}
+
+func (p *openSSHOverrideProvider) ResolveConnection(nodeID string) (ConnectionSnapshot, error) {
+	snap, err := p.repo.ResolveConnection(nodeID)
+	if err == nil {
+		return snap, nil
+	}
+	if errors.Is(err, ErrNodeNotFound) {
+		if confirmed, ok := p.loadConfirmedSnapshot(nodeID); ok {
+			return confirmed, nil
+		}
+	}
+	return ConnectionSnapshot{}, err
 }
 
 func (p *openSSHOverrideProvider) ResolveConnectionWithOrigin(nodeID, originalHost string) (ConnectionSnapshot, error) {
-	return p.repo.ResolveConnectionWithOrigin(nodeID, originalHost)
+	snap, err := p.repo.ResolveConnectionWithOrigin(nodeID, originalHost)
+	if err == nil {
+		return snap, nil
+	}
+	if errors.Is(err, ErrNodeNotFound) {
+		if confirmed, ok := p.loadConfirmedSnapshot(nodeID); ok {
+			return confirmed, nil
+		}
+	}
+	return ConnectionSnapshot{}, err
 }
 
 func (p *openSSHOverrideProvider) GetOpenSSHParser() *OpenSSHParser {
@@ -340,7 +441,16 @@ func (p *openSSHOverrideProvider) snapshotWithOrigins() (*Configuration, map[str
 }
 
 func (p *openSSHOverrideProvider) NodeOpenSSHOrigin(nodeID string) OpenSSHOrigin {
-	return p.repo.NodeOpenSSHOrigin(nodeID)
+	if origin := p.repo.NodeOpenSSHOrigin(nodeID); !origin.IsZero() {
+		return origin
+	}
+	if snap, ok := p.loadConfirmedSnapshot(nodeID); ok {
+		return normalizeOpenSSHOrigin(OpenSSHOrigin{
+			Alias:         snap.Node.OpenSSHAlias,
+			CanonicalHost: snap.Node.CanonicalHost,
+		})
+	}
+	return OpenSSHOrigin{}
 }
 
 func (p *openSSHOverrideProvider) SetNodeOpenSSHOrigin(nodeID string, origin OpenSSHOrigin) {
@@ -356,7 +466,7 @@ func (p *openSSHOverrideProvider) SetNodeOpenSSHAlias(nodeID, alias string) {
 }
 
 func (p *openSSHOverrideProvider) NodeOpenSSHAlias(nodeID string) string {
-	return p.repo.NodeOpenSSHAlias(nodeID)
+	return p.NodeOpenSSHOrigin(nodeID).Alias
 }
 
 func (p *openSSHOverrideProvider) SetNodeCanonicalHost(nodeID, canonicalHost string) {
@@ -364,16 +474,34 @@ func (p *openSSHOverrideProvider) SetNodeCanonicalHost(nodeID, canonicalHost str
 }
 
 func (p *openSSHOverrideProvider) NodeCanonicalHost(nodeID string) string {
-	return p.repo.NodeCanonicalHost(nodeID)
+	return p.NodeOpenSSHOrigin(nodeID).CanonicalHost
+}
+
+// DiscardPendingNode releases one caller reference to an ephemeral pending
+// connection prepared under the -F override provider.
+func (p *openSSHOverrideProvider) DiscardPendingNode(nodeID string) {
+	if p != nil && p.repo != nil {
+		p.repo.DiscardPendingNode(nodeID)
+	}
+}
+
+func (p *openSSHOverrideProvider) confirmEphemeralNode(nodeID string) {
+	if p == nil || p.repo == nil || nodeID == "" {
+		return
+	}
+	if !IsOpenSSHNodeID(nodeID) {
+		if snap, ok := p.repo.pendingConnectionSnapshot(nodeID); ok {
+			p.recordConfirmedSnapshot(nodeID, snap)
+		}
+	}
+	p.repo.DiscardPendingNode(nodeID)
 }
 
 // ConfirmNodeContext is a no-op on the read-only override provider so ephemeral
-// pending nodes prepared under -F are never persisted to disk, while cleaning up
-// disambiguated "openssh:..." pending entries.
+// pending nodes prepared under -F are never persisted to disk, while releasing
+// the caller's pending entry (for both disambiguated "openssh:..." and ad-hoc IDs).
 func (p *openSSHOverrideProvider) ConfirmNodeContext(_ context.Context, nodeID string) error {
-	if p != nil && p.repo != nil && IsOpenSSHNodeID(nodeID) {
-		p.repo.discardPendingOpenSSH(nodeID)
-	}
+	p.confirmEphemeralNode(nodeID)
 	return nil
 }
 
@@ -383,11 +511,10 @@ func (p *openSSHOverrideProvider) PendingNodeExecution(string) (*ssh.ExecutionCo
 
 // ConfirmNodeWithExecutionContext is a no-op on the read-only override provider
 // so post-authentication enrollment probing under -F never attempts Save on
-// readOnlyRejectStore, while cleaning up disambiguated "openssh:..." pending entries.
+// readOnlyRejectStore, while releasing the caller's pending entry (for both
+// disambiguated "openssh:..." and ad-hoc IDs).
 func (p *openSSHOverrideProvider) ConfirmNodeWithExecutionContext(_ context.Context, nodeID string, _ *ssh.ExecutionConfig) error {
-	if p != nil && p.repo != nil && IsOpenSSHNodeID(nodeID) {
-		p.repo.discardPendingOpenSSH(nodeID)
-	}
+	p.confirmEphemeralNode(nodeID)
 	return nil
 }
 
@@ -843,9 +970,6 @@ func filterOpenSSHAllowListOption(spec ssh.OptionSpec, val, hostLabel string) (f
 		len(trimmedVal) > 0 &&
 		(trimmedVal[0] == '+' || trimmedVal[0] == '-' || trimmedVal[0] == '^')
 	filtered = ssh.FilterSupportedListValue(spec.CanonicalKey, val)
-	if filtered == "" && spec.CanonicalKey == ssh.OptionPreferredAuthentications {
-		filtered = extractFailClosedPreferredAuths(trimmedVal)
-	}
 	if filtered != "" {
 		return filtered, true, nil
 	}
@@ -853,19 +977,6 @@ func filterOpenSSHAllowListOption(spec ssh.OptionSpec, val, hostLabel string) (f
 		return "", false, nil
 	}
 	return "", false, fmt.Errorf("no supported %s in %q for %q", spec.OpenSSHName, val, hostLabel)
-}
-
-func extractFailClosedPreferredAuths(raw string) string {
-	var kept []string
-	for part := range strings.SplitSeq(raw, ",") {
-		tok := strings.ToLower(strings.TrimSpace(part))
-		if tok == "gssapi-with-mic" || tok == "hostbased" {
-			if !slices.Contains(kept, tok) {
-				kept = append(kept, tok)
-			}
-		}
-	}
-	return strings.Join(kept, ",")
 }
 
 func sshConfigOptionValue(d *sshConfigDirective, spec ssh.OptionSpec) string {

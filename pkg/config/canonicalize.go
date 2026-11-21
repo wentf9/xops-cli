@@ -625,126 +625,98 @@ func (p *canonicalizePolicy) setProxyCommand(v string) {
 	p.hasProxyCommand = !strings.EqualFold(strings.TrimSpace(v), "none")
 }
 
+func normalizeCanonicalOption(key, raw string) (string, bool) {
+	spec, ok := ssh.LookupOptionSpec(key)
+	if !ok || spec.Normalize == nil {
+		return "", false
+	}
+	norm, err := spec.Normalize(raw)
+	if err != nil {
+		return "", false
+	}
+	return norm, true
+}
+
 func (p *canonicalizePolicy) setMode(v string) bool {
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "yes", "true":
-		p.mode = "yes"
-		return true
-	case "always":
-		p.mode = "always"
-		return true
-	case "no", "false":
-		p.mode = "no"
-		return true
-	default:
+	norm, ok := normalizeCanonicalOption(ssh.OptionCanonicalizeHostname, v)
+	if !ok {
 		return false
 	}
+	p.mode = norm
+	return true
 }
 
 func (p *canonicalizePolicy) setDomains(v string) bool {
-	if hasControlOrLineSepChar(strings.ReplaceAll(v, "\t", " ")) {
+	norm, ok := normalizeCanonicalOption(ssh.OptionCanonicalDomains, v)
+	if !ok {
 		return false
 	}
-	trimmed := strings.TrimSpace(v)
-	if trimmed == "" {
-		return false
-	}
-	fields := strings.Fields(strings.ReplaceAll(trimmed, ",", " "))
-	if len(fields) == 0 {
-		return false
-	}
-	if len(fields) == 1 && strings.EqualFold(fields[0], "none") {
+	if norm == "none" {
 		p.domains = nil
 		return true
 	}
-	var out []string
-	for _, f := range fields {
-		if strings.EqualFold(f, "none") {
-			return false
-		}
-		clean := strings.ToLower(strings.TrimSuffix(f, "."))
-		if !ssh.IsValidCanonicalDomain(clean) {
-			return false
-		}
-		if !slices.Contains(out, clean) {
-			out = append(out, clean)
-		}
-	}
-	if len(out) == 0 {
-		return false
-	}
-	p.domains = out
+	p.domains = strings.Fields(norm)
 	return true
 }
 
 func (p *canonicalizePolicy) setMaxDots(v string) bool {
-	if hasControlOrLineSepChar(v) {
+	norm, ok := normalizeCanonicalOption(ssh.OptionCanonicalizeMaxDots, v)
+	if !ok {
 		return false
 	}
-	if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 && n <= ssh.MaxCanonicalizeMaxDots {
-		p.maxDots = n
-		return true
+	n, err := strconv.Atoi(norm)
+	if err != nil {
+		return false
 	}
-	return false
+	p.maxDots = n
+	return true
 }
 
 func (p *canonicalizePolicy) setFallbackLocal(v string) bool {
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "yes", "true":
-		p.fallbackLocal = true
-		return true
-	case "no", "false":
-		p.fallbackLocal = false
-		return true
-	default:
+	norm, ok := normalizeCanonicalOption(ssh.OptionCanonicalizeFallbackLocal, v)
+	if !ok {
 		return false
 	}
+	p.fallbackLocal = norm == "yes"
+	return true
 }
 
-func normalizeCanonicalPatternList(list string) string {
+func stripTrailingDotFromCanonicalPatternList(list string) string {
 	parts := strings.Split(list, ",")
-	cleaned := make([]string, 0, len(parts))
-	for _, part := range parts {
-		tok := strings.TrimSpace(part)
-		if tok == "" {
-			continue
-		}
+	for i, part := range parts {
 		neg := ""
+		tok := part
 		if strings.HasPrefix(tok, "!") {
 			neg = "!"
-			tok = strings.TrimSpace(tok[1:])
+			tok = tok[1:]
 		}
-		tok = strings.TrimSuffix(strings.ToLower(tok), ".")
-		if tok != "" {
-			cleaned = append(cleaned, neg+tok)
+		if len(tok) > 1 && strings.HasSuffix(tok, ".") {
+			tok = strings.TrimSuffix(tok, ".")
 		}
+		parts[i] = neg + tok
 	}
-	return strings.Join(cleaned, ",")
+	return strings.Join(parts, ",")
 }
 
 func (p *canonicalizePolicy) setPermittedCNAMEs(v string) bool {
-	trimmed := strings.TrimSpace(v)
-	if trimmed == "" {
+	norm, ok := normalizeCanonicalOption(ssh.OptionCanonicalizePermittedCNAMEs, v)
+	if !ok {
 		return false
 	}
-	if strings.EqualFold(trimmed, "none") {
+	if norm == "none" {
 		p.permittedCNAMEs = nil
 		return true
 	}
-	var rules []cnameRule
-	for _, token := range strings.Fields(trimmed) {
+	fields := strings.Fields(norm)
+	rules := make([]cnameRule, 0, len(fields))
+	for _, token := range fields {
 		srcList, dstList, ok := strings.Cut(token, ":")
-		if !ok || strings.TrimSpace(srcList) == "" || strings.TrimSpace(dstList) == "" {
-			continue
-		}
-		srcPatternList := normalizeCanonicalPatternList(srcList)
-		dstPatternList := normalizeCanonicalPatternList(dstList)
-		if srcPatternList == "" || dstPatternList == "" {
-			continue
+		if !ok || srcList == "" || dstList == "" {
+			return false
 		}
 		rules = append(rules, cnameRule{
-			sourcePatternList: srcPatternList,
-			targetPatternList: dstPatternList,
+			sourcePatternList: stripTrailingDotFromCanonicalPatternList(srcList),
+			targetPatternList: stripTrailingDotFromCanonicalPatternList(dstList),
 		})
 	}
 	if len(rules) == 0 {
@@ -822,15 +794,22 @@ func (p *canonicalizePolicy) setTimeoutSeconds(v string) bool {
 	return false
 }
 
+func trimCanonicalHorizontalSpace(s string) string {
+	return strings.Trim(s, " \t")
+}
+
 func splitCanonicalOptionKV(raw string) (string, string, bool) {
-	trimmed := strings.TrimSpace(raw)
+	if hasControlOrLineSepChar(strings.ReplaceAll(raw, "\t", " ")) {
+		return "", "", false
+	}
+	trimmed := trimCanonicalHorizontalSpace(raw)
 	if trimmed == "" {
 		return "", "", false
 	}
 	if idx := strings.IndexAny(trimmed, "= \t"); idx >= 0 {
-		k := strings.TrimSpace(trimmed[:idx])
-		valPart := strings.TrimSpace(trimmed[idx:])
-		v := strings.TrimSpace(strings.TrimPrefix(valPart, "="))
+		k := trimCanonicalHorizontalSpace(trimmed[:idx])
+		valPart := trimCanonicalHorizontalSpace(trimmed[idx:])
+		v := trimCanonicalHorizontalSpace(strings.TrimPrefix(valPart, "="))
 		return k, v, k != ""
 	}
 	return "", "", false

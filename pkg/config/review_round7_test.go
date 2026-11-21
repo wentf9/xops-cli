@@ -246,7 +246,7 @@ func TestRound7_P2_5_And_P3_5_CanonicalizeBooleansCaseNonLatchingAndParentCancel
 		"CanonicalizeHostname=bogus",
 		"CanonicalizeHostname=true",
 		"CanonicalDomains= . , .. ",
-		"CanonicalDomains=CORP.EXAMPLE.COM,corp.example.com",
+		"CanonicalDomains=CORP.EXAMPLE.COM corp.example.com",
 		"CanonicalizeMaxDots=notanint",
 		"CanonicalizeFallbackLocal=maybe",
 		"CanonicalizePermittedCNAMEs=malformed_no_colon",

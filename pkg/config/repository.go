@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -152,7 +153,7 @@ func newRepository(cfg *Configuration, store Store, parser *OpenSSHParser) (*Rep
 	if err != nil {
 		return nil, fmt.Errorf("validate configuration indexes: %w", err)
 	}
-	if err := validateConfiguration(cloned); err != nil {
+	if err := validateRepositoryConfiguration(cloned); err != nil {
 		return nil, err
 	}
 	return &Repository{
@@ -335,6 +336,10 @@ func (r *Repository) ResolveConnection(nodeID string) (ConnectionSnapshot, error
 	}
 
 	provider, pendingProv := r.connectionProviderWithProvenance(nodeID)
+	return resolveConnectionFromProvider(provider, pendingProv, nodeID)
+}
+
+func resolveConnectionFromProvider(provider *Provider, pendingProv NodeProvenance, nodeID string) (ConnectionSnapshot, error) {
 	configuration, origin := provider.snapshotWithNodeOrigin(nodeID)
 	if node, exists := configuration.Nodes.Get(nodeID); exists {
 		host, hostExists := configuration.Hosts.Get(node.HostRef)
@@ -420,17 +425,20 @@ func (r *Repository) NodeOpenSSHOrigin(nodeID string) OpenSSHOrigin {
 }
 
 // SetNodeOpenSSHOrigin atomically replaces the session-recorded OpenSSH origin
-// for nodeID without modifying persisted state.
+// for nodeID without modifying persisted state. When nodeID is an active pending
+// node, the update is isolated to pending.provider so unsaved metadata never
+// leaks into r.provider.openSSHOrigins.
 func (r *Repository) SetNodeOpenSSHOrigin(nodeID string, origin OpenSSHOrigin) {
 	if r == nil || r.provider == nil {
 		return
 	}
 	r.pendingMu.RLock()
+	defer r.pendingMu.RUnlock()
 	if pending := r.pending[nodeID]; pending != nil && pending.provider != nil {
 		pending.provider.SetNodeOpenSSHOrigin(nodeID, origin)
+		return
 	}
 	r.provider.SetNodeOpenSSHOrigin(nodeID, origin)
-	r.pendingMu.RUnlock()
 }
 
 // ClearNodeOpenSSHOrigin removes the session-recorded OpenSSH origin for nodeID.
@@ -448,16 +456,18 @@ func (r *Repository) ClearNodeOpenSSHOrigin(nodeID string) {
 
 // SetNodeOpenSSHAlias records the concrete OpenSSH Host alias from which nodeID
 // was derived during the current session without modifying persisted state.
+// When nodeID is an active pending node, the update is isolated to pending.provider.
 func (r *Repository) SetNodeOpenSSHAlias(nodeID, alias string) {
 	if r == nil || r.provider == nil {
 		return
 	}
 	r.pendingMu.RLock()
+	defer r.pendingMu.RUnlock()
 	if pending := r.pending[nodeID]; pending != nil && pending.provider != nil {
 		pending.provider.SetNodeOpenSSHAlias(nodeID, alias)
+		return
 	}
 	r.provider.SetNodeOpenSSHAlias(nodeID, alias)
-	r.pendingMu.RUnlock()
 }
 
 // NodeOpenSSHAlias returns the session-recorded OpenSSH Host alias for nodeID.
@@ -465,17 +475,20 @@ func (r *Repository) NodeOpenSSHAlias(nodeID string) string {
 	return r.NodeOpenSSHOrigin(nodeID).Alias
 }
 
-// SetNodeCanonicalHost records the canonicalized host for nodeID without modifying persisted state.
+// SetNodeCanonicalHost records the canonicalized host for nodeID without modifying
+// persisted state. When nodeID is an active pending node, the update is isolated
+// to pending.provider.
 func (r *Repository) SetNodeCanonicalHost(nodeID, canonicalHost string) {
 	if r == nil || r.provider == nil {
 		return
 	}
 	r.pendingMu.RLock()
+	defer r.pendingMu.RUnlock()
 	if pending := r.pending[nodeID]; pending != nil && pending.provider != nil {
 		pending.provider.SetNodeCanonicalHost(nodeID, canonicalHost)
+		return
 	}
 	r.provider.SetNodeCanonicalHost(nodeID, canonicalHost)
-	r.pendingMu.RUnlock()
 }
 
 // NodeCanonicalHost returns the session-recorded canonicalized host for nodeID.
@@ -671,7 +684,7 @@ func prepareConfiguration(base *Configuration, fn func(*Configuration) error) (*
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("validate configuration indexes: %w", err)
 	}
-	if err := validateConfiguration(updated); err != nil {
+	if err := validateRepositoryConfiguration(updated); err != nil {
 		return nil, nil, nil, err
 	}
 	return updated, lookup, aliases, nil
@@ -1621,17 +1634,323 @@ func (r *frozenRepository) GetOpenSSHControl(alias string) (*ssh.ControlConfig, 
 	return nil, nil
 }
 
+func validateRepositoryConfiguration(cfg *Configuration) error {
+	if err := validateConfiguration(cfg); err != nil {
+		return err
+	}
+	if cfg.Nodes != nil {
+		nodeIDs := cfg.Nodes.Keys()
+		slices.Sort(nodeIDs)
+		for _, nodeID := range nodeIDs {
+			node, ok := cfg.Nodes.Get(nodeID)
+			if !ok {
+				continue
+			}
+			if _, err := ssh.ResolveExecution(node.Execution, cfg.Execution); err != nil {
+				return fmt.Errorf("%w: node %q effective execution invalid: %w", ErrSchemaValidation, nodeID, err)
+			}
+		}
+	}
+	return nil
+}
+
 func validateConfiguration(cfg *Configuration) error {
-	for _, nodeID := range cfg.Nodes.Keys() {
+	if cfg == nil {
+		return fmt.Errorf("%w: configuration is nil", ErrSchemaValidation)
+	}
+	if cfg.Execution != nil {
+		if err := cfg.Execution.Validate(); err != nil {
+			return fmt.Errorf("%w: global execution invalid: %w", ErrSchemaValidation, err)
+		}
+	}
+	if cfg.SSHOptions != nil {
+		if err := ValidateSSHOptions(cfg.SSHOptions); err != nil {
+			return fmt.Errorf("%w: global ssh_options invalid: %w", ErrSchemaValidation, err)
+		}
+	}
+	stores, err := validateRepositoryCredentialConfig(cfg)
+	if err != nil {
+		return err
+	}
+	if err := validateConfigurationHosts(cfg); err != nil {
+		return err
+	}
+	if err := validateConfigurationIdentities(cfg, stores); err != nil {
+		return err
+	}
+	return validateConfigurationNodes(cfg, stores)
+}
+
+func validateRepositoryCredentialConfig(cfg *Configuration) (map[string]StoreConfig, error) {
+	if cfg.Credential == nil {
+		return nil, nil
+	}
+	if cfg.SchemaVersion == 2 {
+		if err := validateCredentialConfig(cfg.Credential); err != nil {
+			return nil, err
+		}
+		return cfg.Credential.Stores, nil
+	}
+	switch cfg.Credential.RememberPrompted {
+	case "", "ask", "always", "never":
+	default:
+		return nil, fmt.Errorf("%w: invalid remember_prompted value %q (must be ask, always, or never)",
+			ErrSchemaValidation, cfg.Credential.RememberPrompted)
+	}
+	for storeID, storeCfg := range cfg.Credential.Stores {
+		if strings.TrimSpace(storeID) == "" {
+			return nil, fmt.Errorf("%w: storeID cannot be empty", ErrSchemaValidation)
+		}
+		if strings.ContainsAny(storeID, "/\\ \t\r\n\x00") {
+			return nil, fmt.Errorf("%w: storeID %q contains invalid characters", ErrSchemaValidation, storeID)
+		}
+		if storeCfg.Type == StoreTypeEncryptedFile {
+			if err := validateFileStoreIdentity(storeID, storeCfg); err != nil {
+				return nil, err
+			}
+		}
+		if storeCfg.Type == StoreTypeHelper && storeCfg.Command != "" {
+			if strings.ContainsAny(storeCfg.Command, ";|&`$\n") {
+				return nil, fmt.Errorf("%w: helper store %q command contains forbidden shell characters",
+					ErrSchemaValidation, storeID)
+			}
+		}
+		if storeCfg.Timeout < 0 {
+			return nil, fmt.Errorf("%w: store %q timeout cannot be negative", ErrSchemaValidation, storeID)
+		}
+		if storeCfg.CacheTTL < 0 {
+			return nil, fmt.Errorf("%w: store %q cache_ttl cannot be negative", ErrSchemaValidation, storeID)
+		}
+	}
+	return cfg.Credential.Stores, nil
+}
+
+func validateConfigurationHosts(cfg *Configuration) error {
+	if cfg.Hosts == nil {
+		return nil
+	}
+	hostNames := cfg.Hosts.Keys()
+	slices.Sort(hostNames)
+	for _, hostName := range hostNames {
+		host, ok := cfg.Hosts.Get(hostName)
+		if !ok {
+			continue
+		}
+		if err := ValidateConcreteHostAddress(host.Address); err != nil {
+			return fmt.Errorf("%w: host %q address invalid: %w", ErrSchemaValidation, hostName, err)
+		}
+		if err := ValidateNodeAliases(host.Alias); err != nil {
+			return fmt.Errorf("%w: host %q alias invalid: %w", ErrSchemaValidation, hostName, err)
+		}
+	}
+	return nil
+}
+
+func validateConfigurationIdentities(cfg *Configuration, stores map[string]StoreConfig) error {
+	if cfg.Identities == nil {
+		return nil
+	}
+	idNames := cfg.Identities.Keys()
+	slices.Sort(idNames)
+	for _, idName := range idNames {
+		id, ok := cfg.Identities.Get(idName)
+		if !ok {
+			continue
+		}
+		if id.LoginPasswordRef != nil {
+			if err := validateConfiguredRef(*id.LoginPasswordRef, stores); err != nil {
+				return fmt.Errorf("%w: identity %q login_password_ref invalid: %w", ErrSchemaValidation, idName, err)
+			}
+		}
+		if id.PassphraseRef != nil {
+			if err := validateConfiguredRef(*id.PassphraseRef, stores); err != nil {
+				return fmt.Errorf("%w: identity %q passphrase_ref invalid: %w", ErrSchemaValidation, idName, err)
+			}
+			if id.KeyFingerprint != "" && strings.ContainsAny(id.KeyFingerprint, " \t\r\n\x00") {
+				return fmt.Errorf("%w: identity %q has invalid key_fingerprint %q", ErrSchemaValidation, idName, id.KeyFingerprint)
+			}
+		}
+		if id.OTP != nil {
+			if err := validateConfigurationOTP(idName, id.OTP, stores); err != nil {
+				return err
+			}
+		}
+		if id.KeyboardInteractive != nil {
+			if err := validateConfigurationKeyboardInteractive(idName, id.KeyboardInteractive, stores); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func validateConfigurationOTP(idName string, otp *models.OTPConfig, stores map[string]StoreConfig) error {
+	hasRef := otp.TOTPSecretRef != nil && !otp.TOTPSecretRef.IsEmpty()
+	hasCmd := strings.TrimSpace(otp.Command) != ""
+	if hasRef && hasCmd {
+		return fmt.Errorf("%w: identity %q otp cannot specify both totp_secret_ref and command (mutually exclusive)", ErrSchemaValidation, idName)
+	}
+	if !hasRef && !hasCmd {
+		return fmt.Errorf("%w: identity %q otp must specify either totp_secret_ref or command", ErrSchemaValidation, idName)
+	}
+	if hasRef {
+		if err := validateConfiguredRef(*otp.TOTPSecretRef, stores); err != nil {
+			return fmt.Errorf("%w: identity %q otp totp_secret_ref invalid: %w", ErrSchemaValidation, idName, err)
+		}
+	}
+	if hasCmd && strings.ContainsAny(otp.Command, ";|&`$\n") {
+		return fmt.Errorf("%w: identity %q otp command contains forbidden shell characters", ErrSchemaValidation, idName)
+	}
+	if strings.TrimSpace(otp.PromptPattern) != "" {
+		if _, err := regexp.Compile(otp.PromptPattern); err != nil {
+			return fmt.Errorf("%w: identity %q otp prompt_pattern %q invalid regex: %w", ErrSchemaValidation, idName, otp.PromptPattern, err)
+		}
+	}
+	if otp.Timeout < 0 {
+		return fmt.Errorf("%w: identity %q otp timeout cannot be negative", ErrSchemaValidation, idName)
+	}
+	return nil
+}
+
+func validateConfigurationKeyboardInteractive(idName string, ki *models.KeyboardInteractiveConfig, stores map[string]StoreConfig) error {
+	seenNames := make(map[string]int)
+	for idx, rule := range ki.Rules {
+		ruleDesc := fmt.Sprintf("rule %d", idx+1)
+		if rule.Name != "" {
+			ruleDesc = fmt.Sprintf("rule %d (%q)", idx+1, rule.Name)
+			if prevIdx, exists := seenNames[rule.Name]; exists {
+				return fmt.Errorf("%w: identity %q keyboard_interactive has duplicate rule name %q in rules %d and %d", ErrSchemaValidation, idName, rule.Name, prevIdx, idx+1)
+			}
+			seenNames[rule.Name] = idx + 1
+		}
+		if strings.TrimSpace(rule.PromptPattern) == "" {
+			return fmt.Errorf("%w: identity %q keyboard_interactive %s prompt_pattern cannot be empty", ErrSchemaValidation, idName, ruleDesc)
+		}
+		if _, err := regexp.Compile(rule.PromptPattern); err != nil {
+			return fmt.Errorf("%w: identity %q keyboard_interactive %s prompt_pattern %q invalid regex: %w", ErrSchemaValidation, idName, ruleDesc, rule.PromptPattern, err)
+		}
+		if strings.TrimSpace(rule.InstructionPattern) != "" {
+			if _, err := regexp.Compile(rule.InstructionPattern); err != nil {
+				return fmt.Errorf("%w: identity %q keyboard_interactive %s instruction_pattern %q invalid regex: %w", ErrSchemaValidation, idName, ruleDesc, rule.InstructionPattern, err)
+			}
+		}
+		if rule.Timeout < 0 {
+			return fmt.Errorf("%w: identity %q keyboard_interactive %s timeout cannot be negative", ErrSchemaValidation, idName, ruleDesc)
+		}
+		if err := validateConfigurationChallengeRuleSource(idName, ruleDesc, rule, stores); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateConfigurationChallengeRuleSource(idName, ruleDesc string, rule models.ChallengeRule, stores map[string]StoreConfig) error {
+	switch rule.Source {
+	case models.ChallengeSourceOTP, models.ChallengeSourceLoginPassword:
+		return validateNoSecretRefOrCommand(idName, ruleDesc, string(rule.Source), rule)
+	case models.ChallengeSourceSecret:
+		if strings.TrimSpace(rule.Name) == "" {
+			return fmt.Errorf("%w: identity %q keyboard_interactive %s with source \"secret\" must specify non-empty name", ErrSchemaValidation, idName, ruleDesc)
+		}
+		if rule.SecretRef == nil || rule.SecretRef.IsEmpty() {
+			return fmt.Errorf("%w: identity %q keyboard_interactive %s with source \"secret\" must specify secret_ref", ErrSchemaValidation, idName, ruleDesc)
+		}
+		if strings.TrimSpace(rule.Command) != "" {
+			return fmt.Errorf("%w: identity %q keyboard_interactive %s with source \"secret\" cannot specify command", ErrSchemaValidation, idName, ruleDesc)
+		}
+		if err := validateConfiguredRef(*rule.SecretRef, stores); err != nil {
+			return fmt.Errorf("%w: identity %q keyboard_interactive %s secret_ref invalid: %w", ErrSchemaValidation, idName, ruleDesc, err)
+		}
+	case models.ChallengeSourceCommand:
+		if rule.SecretRef != nil && !rule.SecretRef.IsEmpty() {
+			return fmt.Errorf("%w: identity %q keyboard_interactive %s with source \"command\" cannot specify secret_ref", ErrSchemaValidation, idName, ruleDesc)
+		}
+		if strings.TrimSpace(rule.Command) == "" {
+			return fmt.Errorf("%w: identity %q keyboard_interactive %s with source \"command\" must specify non-empty command", ErrSchemaValidation, idName, ruleDesc)
+		}
+		if strings.ContainsAny(rule.Command, ";|&`$\n") {
+			return fmt.Errorf("%w: identity %q keyboard_interactive %s command contains forbidden shell characters", ErrSchemaValidation, idName, ruleDesc)
+		}
+	default:
+		return fmt.Errorf("%w: identity %q keyboard_interactive %s has unknown source %q", ErrSchemaValidation, idName, ruleDesc, rule.Source)
+	}
+	return nil
+}
+
+func validateConfigurationNodes(cfg *Configuration, stores map[string]StoreConfig) error {
+	if cfg.Nodes == nil {
+		return nil
+	}
+	nodeIDs := cfg.Nodes.Keys()
+	slices.Sort(nodeIDs)
+	for _, nodeID := range nodeIDs {
 		node, ok := cfg.Nodes.Get(nodeID)
 		if !ok {
 			continue
 		}
-		if _, ok := cfg.Hosts.Get(node.HostRef); !ok {
-			return fmt.Errorf("node %q host ref %q: %w", nodeID, node.HostRef, ErrHostNotFound)
+		if err := validateConfigurationNode(cfg, stores, nodeID, node); err != nil {
+			return err
 		}
-		if _, ok := cfg.Identities.Get(node.IdentityRef); !ok {
-			return fmt.Errorf("node %q identity ref %q: %w", nodeID, node.IdentityRef, ErrIdentityNotFound)
+	}
+	return nil
+}
+
+func validateConfigurationNode(cfg *Configuration, stores map[string]StoreConfig, nodeID string, node models.Node) error {
+	if err := ValidateNodeAlias(nodeID); err != nil {
+		return fmt.Errorf("%w: node %q name invalid: %w", ErrSchemaValidation, nodeID, err)
+	}
+	if err := ValidateNodeAliases(node.Alias); err != nil {
+		return fmt.Errorf("%w: node %q alias invalid: %w", ErrSchemaValidation, nodeID, err)
+	}
+	if err := validateConfigurationNodeRefs(cfg, stores, nodeID, node); err != nil {
+		return err
+	}
+	return validateConfigurationNodeOptions(cfg, nodeID, node)
+}
+
+func validateConfigurationNodeRefs(cfg *Configuration, stores map[string]StoreConfig, nodeID string, node models.Node) error {
+	if strings.TrimSpace(node.HostRef) == "" {
+		return fmt.Errorf("%w: node %q host_ref cannot be empty: %w", ErrSchemaValidation, nodeID, ErrHostNotFound)
+	}
+	if cfg.Hosts == nil {
+		return fmt.Errorf("%w: node %q host ref %q: %w", ErrSchemaValidation, nodeID, node.HostRef, ErrHostNotFound)
+	}
+	if _, ok := cfg.Hosts.Get(node.HostRef); !ok {
+		return fmt.Errorf("%w: node %q host ref %q: %w", ErrSchemaValidation, nodeID, node.HostRef, ErrHostNotFound)
+	}
+	if strings.TrimSpace(node.IdentityRef) == "" {
+		return fmt.Errorf("%w: node %q identity_ref cannot be empty: %w", ErrSchemaValidation, nodeID, ErrIdentityNotFound)
+	}
+	if cfg.Identities == nil {
+		return fmt.Errorf("%w: node %q identity ref %q: %w", ErrSchemaValidation, nodeID, node.IdentityRef, ErrIdentityNotFound)
+	}
+	if _, ok := cfg.Identities.Get(node.IdentityRef); !ok {
+		return fmt.Errorf("%w: node %q identity ref %q: %w", ErrSchemaValidation, nodeID, node.IdentityRef, ErrIdentityNotFound)
+	}
+	if node.PrivilegePasswordRef != nil {
+		if err := validateConfiguredRef(*node.PrivilegePasswordRef, stores); err != nil {
+			return fmt.Errorf("%w: node %q privilege_password_ref invalid: %w", ErrSchemaValidation, nodeID, err)
+		}
+	}
+	return nil
+}
+
+func validateConfigurationNodeOptions(cfg *Configuration, nodeID string, node models.Node) error {
+	if node.Execution != nil {
+		if err := node.Execution.Validate(); err != nil {
+			return fmt.Errorf("%w: node %q execution invalid: %w", ErrSchemaValidation, nodeID, err)
+		}
+	}
+	if node.SSHOptions != nil {
+		if err := ValidateSSHOptions(node.SSHOptions); err != nil {
+			return fmt.Errorf("%w: node %q ssh_options invalid: %w", ErrSchemaValidation, nodeID, err)
+		}
+	}
+	if effectiveOpts, err := ssh.ResolveOptions(node.SSHOptions, cfg.SSHOptions); err != nil {
+		return fmt.Errorf("%w: node %q effective ssh_options invalid: %w", ErrSchemaValidation, nodeID, err)
+	} else if effectiveOpts != nil {
+		if err := ValidateEffectiveSSHOptions(effectiveOpts); err != nil {
+			return fmt.Errorf("%w: node %q effective ssh_options invalid: %w", ErrSchemaValidation, nodeID, err)
 		}
 	}
 	return nil

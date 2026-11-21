@@ -27,6 +27,7 @@ type pendingConnection struct {
 	provider   *Provider // immutable connection bundle
 	provenance NodeProvenance
 	gate       *contextGate
+	refs       int
 }
 
 // PrepareNodeContext resolves a connection without writing configuration. New
@@ -110,7 +111,7 @@ func (r *Repository) registerPendingConnection(cfg *Configuration, nodeID, openS
 			prov = ProvenanceOpenSSHDerived
 		}
 	}
-	r.pending[nodeID] = &pendingConnection{provider: pendingProvider, provenance: prov, gate: &contextGate{}}
+	r.pending[nodeID] = &pendingConnection{provider: pendingProvider, provenance: prov, gate: &contextGate{}, refs: 1}
 	return nodeID, nil
 }
 
@@ -130,6 +131,7 @@ func (r *Repository) tryReuseOrDisambiguatePending(
 	normalizedNode.IdentityRef = privateIdentityReference(cfg, nodeID)
 	if equalPersistedNode(oldNode, normalizedNode) && reflect.DeepEqual(oldHost, host) && reflect.DeepEqual(oldIdentity, identity) {
 		if oldNode.OpenSSHAlias == node.OpenSSHAlias && oldNode.CanonicalHost == node.CanonicalHost {
+			previous.refs++
 			return nodeID, true, nil
 		}
 		if upgradedID, ok := r.upgradePendingAliasAndCanonical(previous, nodeID, oldNode, normalizedNode, host, identity); ok {
@@ -154,6 +156,7 @@ func (r *Repository) tryReuseOrDisambiguatePending(
 		return "", false, fmt.Errorf("pending connection %q changed: %w", altID, ErrConfigConflict)
 	}
 	if altOldNode.OpenSSHAlias == node.OpenSSHAlias && altOldNode.CanonicalHost == node.CanonicalHost {
+		altPrev.refs++
 		return altID, true, nil
 	}
 	if upgradedID, ok := r.upgradePendingAliasAndCanonical(altPrev, altID, altOldNode, altNormalized, host, identity); ok {
@@ -194,7 +197,11 @@ func (r *Repository) upgradePendingAliasAndCanonical(
 	if gate == nil {
 		gate = &contextGate{}
 	}
-	r.pending[nodeID] = &pendingConnection{provider: upgradedProvider, provenance: prov, gate: gate}
+	refs := previous.refs
+	if refs < 1 {
+		refs = 1
+	}
+	r.pending[nodeID] = &pendingConnection{provider: upgradedProvider, provenance: prov, gate: gate, refs: refs + 1}
 	return nodeID, true
 }
 
@@ -222,6 +229,31 @@ func (r *Repository) resolvePendingNode(nodeID string) (models.Node, models.Host
 		return models.Node{}, models.Host{}, models.Identity{}, false
 	}
 	return node, host, ident, true
+}
+
+func (r *Repository) pendingConnectionSnapshot(nodeID string) (ConnectionSnapshot, bool) {
+	if r == nil || nodeID == "" {
+		return ConnectionSnapshot{}, false
+	}
+	r.pendingMu.RLock()
+	pending := r.pending[nodeID]
+	var (
+		provider *Provider
+		prov     NodeProvenance
+	)
+	if pending != nil {
+		provider = pending.provider
+		prov = pending.provenance
+	}
+	r.pendingMu.RUnlock()
+	if provider == nil {
+		return ConnectionSnapshot{}, false
+	}
+	snap, err := resolveConnectionFromProvider(provider, prov, nodeID)
+	if err != nil {
+		return ConnectionSnapshot{}, false
+	}
+	return snap, true
 }
 
 // ConfirmNodeContext saves exactly the prepared connection after SSH
@@ -288,13 +320,25 @@ func (r *Repository) buildConfirmPublishAction(pending *pendingConnection, nodeI
 	}
 }
 
-func (r *Repository) discardPendingOpenSSH(nodeID string) {
-	if r == nil || !IsOpenSSHNodeID(nodeID) {
+// DiscardPendingNode releases one caller reference to an unconfirmed pending
+// connection entry. When the last reference is released (refs <= 0), the entry
+// is removed from r.pending so failed or canceled connections do not leak memory
+// or poison subsequent PrepareNodeContext calls while concurrent callers sharing
+// the same pending entry remain undisturbed.
+func (r *Repository) DiscardPendingNode(nodeID string) {
+	if r == nil || nodeID == "" {
 		return
 	}
 	r.pendingMu.Lock()
-	delete(r.pending, nodeID)
-	r.pendingMu.Unlock()
+	defer r.pendingMu.Unlock()
+	pending := r.pending[nodeID]
+	if pending == nil {
+		return
+	}
+	pending.refs--
+	if pending.refs <= 0 {
+		delete(r.pending, nodeID)
+	}
 }
 
 func (r *Repository) confirmNodeContext(ctx context.Context, nodeID string, execution *ssh.ExecutionConfig) error {
@@ -302,7 +346,7 @@ func (r *Repository) confirmNodeContext(ctx context.Context, nodeID string, exec
 		return fmt.Errorf("confirm connection requires repository and context")
 	}
 	if IsOpenSSHNodeID(nodeID) {
-		r.discardPendingOpenSSH(nodeID)
+		r.DiscardPendingNode(nodeID)
 		return nil
 	}
 	pending, err := r.acquirePendingConfirmationGate(ctx, nodeID)

@@ -99,6 +99,19 @@ func validateBareAliasTargetRef(raw string) (string, bool, error) {
 
 // TargetRef represents a parsed target selector `[openssh:][user@]host[:port]`,
 // supporting hostnames, IPv4 addresses, and IPv6 literals (including zone IDs).
+//
+// Reserved "openssh:" prefix invariant:
+//   - Any selector string beginning with "openssh:" is unconditionally parsed as
+//     an OpenSSH virtual selector (OpenSSH=true), never as a non-OpenSSH host
+//     named "openssh" with a port (e.g. "openssh:22" parses as OpenSSH=true,
+//     Host="22").
+//   - Consequently, a non-OpenSSH TargetRef with empty User whose formatted
+//     host:port starts with "openssh:" (such as Host="openssh", HasPort=true)
+//     has no unambiguous bare string representation: Validate() rejects it and
+//     NormalizedString() returns "". Specify an explicit user ("user@openssh:22")
+//     or omit the port ("openssh") for lossless round-trips.
+//   - Likewise, double-prefixed OpenSSH forms (OpenSSH=true whose body begins
+//     with "openssh:") are rejected by Validate() and NormalizedString().
 type TargetRef struct {
 	OpenSSH bool
 	User    string
@@ -116,12 +129,8 @@ func (r TargetRef) Selector() string {
 	return r.Host
 }
 
-// NormalizedString formats the canonical string form `[openssh:][user@]host[:port]`.
-func (r TargetRef) NormalizedString() string {
+func (r TargetRef) formatNormalizedBody() string {
 	var b strings.Builder
-	if r.OpenSSH {
-		b.WriteString(OpenSSHNodePrefix)
-	}
 	if r.User != "" {
 		b.WriteString(r.User)
 		b.WriteByte('@')
@@ -131,14 +140,65 @@ func (r TargetRef) NormalizedString() string {
 	} else {
 		b.WriteString(r.Host)
 	}
-	out := b.String()
-	if !r.OpenSSH && strings.HasPrefix(out, OpenSSHNodePrefix) {
+	return b.String()
+}
+
+// Validate verifies that r is a well-formed, canonically representable TargetRef
+// whose NormalizedString() round-trips losslessly through ParseTargetRef.
+func (r TargetRef) Validate() error {
+	if r.Host == "" {
+		return fmt.Errorf("target host cannot be empty")
+	}
+	if r.HasPort && r.Port == 0 {
+		return fmt.Errorf("invalid port 0: must be between 1 and 65535")
+	}
+	if !r.HasPort && r.Port != 0 {
+		return fmt.Errorf("target port %d specified with HasPort=false", r.Port)
+	}
+	body := r.formatNormalizedBody()
+	if strings.HasPrefix(body, OpenSSHNodePrefix) {
+		if r.OpenSSH {
+			return fmt.Errorf("invalid openssh selector %q: duplicate %q prefix", OpenSSHNodePrefix+body, OpenSSHNodePrefix)
+		}
+		return fmt.Errorf("ambiguous non-OpenSSH target %q: prefix %q is reserved for OpenSSH virtual selectors (specify user@host:port)", body, OpenSSHNodePrefix)
+	}
+	out := body
+	if r.OpenSSH {
+		out = OpenSSHNodePrefix + body
+	}
+	reparsed, err := ParseTargetRef(out)
+	if err != nil {
+		return fmt.Errorf("invalid target ref %q: %w", out, err)
+	}
+	if reparsed != r {
+		return fmt.Errorf("target ref %q is not in canonical form", out)
+	}
+	return nil
+}
+
+// NormalizedString formats the canonical string form `[openssh:][user@]host[:port]`.
+// It returns "" when r has an empty host, inconsistent port state, or would
+// collide with the reserved "openssh:" prefix (non-OpenSSH bare "openssh:<port>"
+// or duplicate "openssh:openssh:..."). Call Validate() for a diagnostic error.
+func (r TargetRef) NormalizedString() string {
+	if r.Host == "" || (r.HasPort && r.Port == 0) || (!r.HasPort && r.Port != 0) {
 		return ""
 	}
-	return out
+	body := r.formatNormalizedBody()
+	if strings.HasPrefix(body, OpenSSHNodePrefix) {
+		return ""
+	}
+	if r.OpenSSH {
+		return OpenSSHNodePrefix + body
+	}
+	return body
 }
 
 // ParseTargetRef parses `[openssh:][user@]host[:port]`.
+// Leading "openssh:" is reserved for OpenSSH virtual selectors (e.g. "openssh:22"
+// parses as OpenSSH=true, Host="22"; use "user@openssh:22" to specify a port on
+// a non-OpenSSH host named "openssh"). Every successfully parsed TargetRef
+// satisfies Validate() and round-trips losslessly through NormalizedString().
 func ParseTargetRef(raw string) (TargetRef, error) {
 	if bareAlias, ok, err := validateBareAliasTargetRef(raw); err != nil {
 		return TargetRef{}, err
