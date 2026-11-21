@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/wentf9/xops-cli/core/fsx"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 )
@@ -187,20 +189,16 @@ func (c *Connector) loadUserKnownHosts(userKH string, target TargetContext, db *
 			return "", nil, err
 		}
 		primaryWriteFile = c.environment.KnownHostsFile
-		f, openErr := openKnownHostsFileNoFollow(primaryWriteFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		f, openErr := fsx.CreateExclusive(primaryWriteFile, fsx.OwnerOnlyPerm)
 		if errors.Is(openErr, os.ErrNotExist) {
-			if mkdirErr := os.MkdirAll(filepath.Dir(primaryWriteFile), 0700); mkdirErr != nil {
+			if mkdirErr := os.MkdirAll(filepath.Dir(primaryWriteFile), 0o700); mkdirErr != nil {
 				return "", nil, fmt.Errorf("create .ssh directory failed: %w", mkdirErr)
 			}
-			f, openErr = openKnownHostsFileNoFollow(primaryWriteFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+			f, openErr = fsx.CreateExclusive(primaryWriteFile, fsx.OwnerOnlyPerm)
 		}
 		if openErr == nil {
 			if closeErr := f.Close(); closeErr != nil {
 				return "", nil, fmt.Errorf("create known_hosts file failed: %w", closeErr)
-			}
-			if hardenErr := hardenNewKnownHostsFile(primaryWriteFile); hardenErr != nil {
-				_ = os.Remove(primaryWriteFile)
-				return "", nil, fmt.Errorf("harden known_hosts file failed: %w", hardenErr)
 			}
 		} else if !errors.Is(openErr, os.ErrExist) {
 			return "", nil, fmt.Errorf("create known_hosts file failed: %w", openErr)
@@ -316,17 +314,12 @@ func (c *Connector) resolveGlobalKnownHostsFiles(cfg *ClientConfig, target Targe
 }
 
 func isReadableRegularFile(path string) bool {
-	st, err := os.Stat(path)
-	if err != nil || !st.Mode().IsRegular() {
-		return false
-	}
-	f, err := openKnownHostsReadOnlyFollow(path)
+	rc, err := openGlobalKnownHostsFile(path, maxKnownHostsFileBytes)
 	if err != nil {
 		return false
 	}
-	fst, statErr := f.Stat()
-	_ = f.Close()
-	return statErr == nil && fst.Mode().IsRegular()
+	_ = rc.Close()
+	return true
 }
 
 func expandKnownHostsPath(pattern string, env Environment, target TargetContext) (string, error) {
@@ -491,73 +484,39 @@ func appendKnownHost(knownHostsFile, hostname string, key ssh.PublicKey, hash bo
 	knownHostsFileMutex.Lock()
 	defer knownHostsFileMutex.Unlock()
 
-	if mkdirErr := os.MkdirAll(filepath.Dir(knownHostsFile), 0700); mkdirErr != nil {
+	if mkdirErr := os.MkdirAll(filepath.Dir(knownHostsFile), 0o700); mkdirErr != nil {
 		return fmt.Errorf("create known_hosts directory failed: %w", mkdirErr)
 	}
 
-	f, created, openErr := openKnownHostsForAppend(knownHostsFile)
+	lf, openErr := fsx.OpenLocked(knownHostsFile, fsx.LockExclusive, true, fsx.OwnerOnlyPerm)
 	if openErr != nil {
-		return openErr
+		return fmt.Errorf("open known_hosts file failed: %w", openErr)
 	}
-	closed := false
 	defer func() {
-		if closed {
-			return
-		}
-		if closeErr := f.Close(); closeErr != nil && err == nil {
+		if closeErr := lf.Close(); closeErr != nil && err == nil {
 			err = fmt.Errorf("close known_hosts file failed: %w", closeErr)
 		}
 	}()
 
-	if err := verifyRegularKnownHostsHandle(f, knownHostsFile); err != nil {
-		return err
-	}
-
-	if created {
-		if hardenErr := hardenNewKnownHostsFile(knownHostsFile); hardenErr != nil {
-			closed = true
-			_ = f.Close()
-			_ = os.Remove(knownHostsFile)
-			return fmt.Errorf("harden known_hosts file failed: %w", hardenErr)
-		}
-	}
-
-	if lockErr := lockKnownHostsFile(f, true); lockErr != nil {
-		return fmt.Errorf("lock known_hosts file failed: %w", lockErr)
-	}
-	defer func() {
-		if unlockErr := unlockKnownHostsFile(f); unlockErr != nil && err == nil {
-			err = fmt.Errorf("unlock known_hosts file failed: %w", unlockErr)
-		}
-	}()
-
-	prefix, prefixErr := knownHostsTrailingNewlinePrefix(f, knownHostsFile)
+	prefix, prefixErr := knownHostsTrailingNewlinePrefix(lf, knownHostsFile)
 	if prefixErr != nil {
 		return prefixErr
 	}
+	if _, seekErr := lf.Seek(0, io.SeekEnd); seekErr != nil {
+		return fmt.Errorf("seek known_hosts file failed: %w", seekErr)
+	}
 
 	line := formatKnownHostEntry(hostname, key, hash)
-	if _, writeErr := f.WriteString(prefix + line + "\n"); writeErr != nil {
+	if _, writeErr := lf.Write([]byte(prefix + line + "\n")); writeErr != nil {
 		return fmt.Errorf("write known_hosts file failed: %w", writeErr)
 	}
 	return nil
 }
 
-func verifyRegularKnownHostsHandle(f *os.File, knownHostsFile string) error {
-	fst, statErr := f.Stat()
-	if statErr != nil {
-		return fmt.Errorf("stat known_hosts file failed: %w", statErr)
-	}
-	if !fst.Mode().IsRegular() {
-		return fmt.Errorf("open known_hosts file failed: refusing non-regular file %q (mode %s)", knownHostsFile, fst.Mode().Type())
-	}
-	return nil
-}
-
-// knownHostsTrailingNewlinePrefix re-stats f under the exclusive file lock so
+// knownHostsTrailingNewlinePrefix re-stats lf under the exclusive file lock so
 // st.Size() reflects any concurrent process's write completed before locking.
-func knownHostsTrailingNewlinePrefix(f *os.File, knownHostsFile string) (string, error) {
-	st, statErr := f.Stat()
+func knownHostsTrailingNewlinePrefix(lf *fsx.LockedFile, knownHostsFile string) (string, error) {
+	st, statErr := lf.Stat()
 	if statErr != nil {
 		return "", fmt.Errorf("stat known_hosts file failed: %w", statErr)
 	}
@@ -568,7 +527,7 @@ func knownHostsTrailingNewlinePrefix(f *os.File, knownHostsFile string) (string,
 		return "", nil
 	}
 	var last [1]byte
-	if _, readErr := f.ReadAt(last[:], st.Size()-1); readErr != nil {
+	if _, readErr := lf.ReadAt(last[:], st.Size()-1); readErr != nil {
 		return "", fmt.Errorf("read known_hosts trailing byte failed: %w", readErr)
 	}
 	if last[0] != '\n' {
@@ -588,33 +547,4 @@ func formatKnownHostEntry(hostname string, key ssh.PublicKey, hash bool) string 
 		host = knownhosts.HashHostname(host)
 	}
 	return knownhosts.Line([]string{host}, key)
-}
-
-func openKnownHostsForAppend(knownHostsFile string) (*os.File, bool, error) {
-	needCreate := false
-	if st, lstatErr := os.Lstat(knownHostsFile); lstatErr == nil {
-		if !st.Mode().IsRegular() {
-			return nil, false, fmt.Errorf("open known_hosts file failed: refusing non-regular file %q (mode %s)", knownHostsFile, st.Mode().Type())
-		}
-	} else if errors.Is(lstatErr, os.ErrNotExist) {
-		needCreate = true
-	} else {
-		return nil, false, fmt.Errorf("stat known_hosts file failed: %w", lstatErr)
-	}
-
-	if needCreate {
-		f, err := openKnownHostsFileNoFollow(knownHostsFile, os.O_CREATE|os.O_EXCL|os.O_APPEND|os.O_RDWR, 0600)
-		if err == nil {
-			return f, true, nil
-		}
-		if !errors.Is(err, os.ErrExist) {
-			return nil, false, fmt.Errorf("open known_hosts file failed: %w", err)
-		}
-	}
-
-	f, err := openKnownHostsFileNoFollow(knownHostsFile, os.O_APPEND|os.O_RDWR, 0600)
-	if err != nil {
-		return nil, false, fmt.Errorf("open known_hosts file failed: %w", err)
-	}
-	return f, false, nil
 }

@@ -20,20 +20,18 @@ func TestWindowsMuxSocket_BindHardensDACLAndRejectsInsecureDir(t *testing.T) {
 
 	// 1. Overlong path rejected before directory creation or bind.
 	tooLong := filepath.Join(base, strings.Repeat("a", MaxControlPathLength()))
-	if _, _, err := bindAndLinkSocket(tooLong); err == nil {
+	if _, err := bindAndLinkSocket(tooLong); err == nil {
 		t.Fatal("expected overlong ControlPath to fail bindAndLinkSocket")
 	}
 
 	// 2. Fresh subdirectory gets owner-only protected DACL and allows same-user peer check.
 	sockPath := filepath.Join(base, "secure-mux", "cm.sock")
-	ln, fi, err := bindAndLinkSocket(sockPath)
+	slot, err := bindAndLinkSocket(sockPath)
 	if err != nil {
 		t.Fatalf("bindAndLinkSocket(%q) failed: %v", sockPath, err)
 	}
-	defer func() {
-		_ = ln.Close()
-		_ = os.Remove(sockPath)
-	}()
+	defer func() { _ = slot.Release() }()
+	ln, fi := slot.Listener(), slot.FileInfo()
 	if !isControlSocketFileInfo(fi) {
 		t.Fatalf("expected socket FileInfo, got mode %v", fi.Mode())
 	}
@@ -119,7 +117,7 @@ func TestWindowsMuxSocket_BindHardensDACLAndRejectsInsecureDir(t *testing.T) {
 	}
 	runtime.KeepAlive(acl)
 
-	if _, _, err := bindAndLinkSocket(filepath.Join(insecureDir, "cm.sock")); !errors.Is(err, winsec.ErrInsecureControlDir) {
+	if _, err := bindAndLinkSocket(filepath.Join(insecureDir, "cm.sock")); !errors.Is(err, winsec.ErrInsecureControlDir) {
 		t.Fatalf("bindAndLinkSocket(insecureDir) = %v, want winsec.ErrInsecureControlDir", err)
 	}
 }

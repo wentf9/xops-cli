@@ -530,20 +530,21 @@ func TestMuxServer_FSM_ConcurrentShutdownAndStopListeningNeverUnlinksReplacement
 			idleNotify:        make(chan struct{}),
 			shutdownChan:      make(chan struct{}),
 		}
-		l, origFi, err := bindAndLinkSocket(sockPath)
+		slot, err := bindAndLinkSocket(sockPath)
 		if err != nil {
 			t.Fatalf("iter %d bindAndLinkSocket: %v", iter, err)
 		}
-		srv.listener = l
-		srv.origFi = origFi
+		srv.listener = slot.Listener()
+		srv.slot = slot
 
 		// Replace sockPath with a fresh master's listener before stop/shutdown race.
 		_ = os.Remove(sockPath)
-		repListener, repFi, err := bindAndLinkSocket(sockPath)
+		repSlot, err := bindAndLinkSocket(sockPath)
 		if err != nil {
-			_ = l.Close()
+			_ = slot.Release()
 			t.Fatalf("iter %d replacement bindAndLinkSocket: %v", iter, err)
 		}
+		repFi := repSlot.FileInfo()
 
 		start := make(chan struct{})
 		stopErrCh := make(chan error, 1)
@@ -566,19 +567,16 @@ func TestMuxServer_FSM_ConcurrentShutdownAndStopListeningNeverUnlinksReplacement
 		wg.Wait()
 		<-srv.Wait()
 		if stopErr := <-stopErrCh; stopErr != nil {
-			_ = repListener.Close()
-			_ = os.Remove(sockPath)
+			_ = repSlot.Release()
 			t.Fatalf("iter %d handleStopListening: %v", iter, stopErr)
 		}
 		if shutErr := <-shutdownErrCh; shutErr != nil {
-			_ = repListener.Close()
-			_ = os.Remove(sockPath)
+			_ = repSlot.Release()
 			t.Fatalf("iter %d Shutdown: %v", iter, shutErr)
 		}
 
 		curFi, lstatErr := os.Lstat(sockPath)
-		_ = repListener.Close()
-		_ = os.Remove(sockPath)
+		_ = repSlot.Release()
 		if lstatErr != nil {
 			t.Fatalf("iter %d replacement socket disappeared during Shutdown/StopListening race: %v", iter, lstatErr)
 		}

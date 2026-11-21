@@ -6,35 +6,39 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"sync"
 	"time"
+
+	"github.com/wentf9/xops-cli/core/fsx"
 )
 
 type streamLocalListener struct {
-	net.Listener
-	socketPath string
-	origFi     os.FileInfo
-	closeOnce  sync.Once
-	closeErr   error
+	slot *fsx.SocketSlot
+}
+
+func (l *streamLocalListener) Accept() (net.Conn, error) {
+	if l == nil || l.slot == nil {
+		return nil, net.ErrClosed
+	}
+	ln := l.slot.Listener()
+	if ln == nil {
+		return nil, net.ErrClosed
+	}
+	return ln.Accept()
 }
 
 func (l *streamLocalListener) Addr() net.Addr {
-	return &net.UnixAddr{Name: l.socketPath, Net: "unix"}
+	if l == nil || l.slot == nil {
+		return &net.UnixAddr{Net: "unix"}
+	}
+	return &net.UnixAddr{Name: l.slot.Path(), Net: "unix"}
 }
 
 func (l *streamLocalListener) Close() error {
-	l.closeOnce.Do(func() {
-		l.closeErr = l.Listener.Close()
-		if l.origFi != nil {
-			if currFi, err := os.Lstat(l.socketPath); err == nil && os.SameFile(l.origFi, currFi) {
-				if rmErr := os.Remove(l.socketPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
-					l.closeErr = errors.Join(l.closeErr, rmErr)
-				}
-			}
-		}
-	})
-	return l.closeErr
+	if l == nil || l.slot == nil {
+		return nil
+	}
+	return l.slot.Release()
 }
 
 type forwardTCPAddr struct {

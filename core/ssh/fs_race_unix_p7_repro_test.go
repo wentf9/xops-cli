@@ -1,4 +1,4 @@
-//go:build p7repro && unix
+//go:build unix
 
 package ssh
 
@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wentf9/xops-cli/core/fsx"
 	cryptoSSH "golang.org/x/crypto/ssh"
 )
 
@@ -31,10 +32,10 @@ func p7NewEd25519PublicKey(t *testing.T) cryptoSSH.PublicKey {
 	return sshPub
 }
 
-// TestP7Repro_H8_ReadBoundedRegularFile_SwappedFIFOBlocks reproduces H8:
-// readBoundedRegularFile performs os.Stat(path) followed by os.Open(path) without O_NONBLOCK.
-// If a FIFO is swapped in between os.Stat and os.Open (via atomic hard-link rename, no symlinks),
-// os.Open blocks indefinitely waiting for a FIFO writer.
+// TestP7Repro_H8_ReadBoundedRegularFile_SwappedFIFOBlocks verifies H8 is fixed:
+// fsx.ReadAllBounded opens handle-first with O_NONBLOCK (no Stat->Open race),
+// so swapping a FIFO in atomically via hard-link rename never blocks waiting
+// for a FIFO writer.
 func TestP7Repro_H8_ReadBoundedRegularFile_SwappedFIFOBlocks(t *testing.T) {
 	dir := t.TempDir()
 	regSrc := filepath.Join(dir, "reg.src")
@@ -93,13 +94,13 @@ func TestP7Repro_H8_ReadBoundedRegularFile_SwappedFIFOBlocks(t *testing.T) {
 	for attempt := 1; attempt <= maxAttempts && time.Now().Before(overallDeadline); attempt++ {
 		doneCh := make(chan error, 1)
 		go func() {
-			_, err := readBoundedRegularFile(targetPath, 1024)
+			_, err := fsx.ReadAllBounded(targetPath, fsx.Limits{MaxBytes: 1024}, fsx.FollowSymlinks())
 			doneCh <- err
 		}()
 
 		select {
 		case <-doneCh:
-			// Completed without blocking; continue attempting to hit the Stat->Open window.
+			// Completed without blocking; continue attempting to hit the swap window.
 		case <-time.After(callDeadline):
 			// Stop flipping and unblock the stuck O_RDONLY FIFO open by briefly opening the write end.
 			close(stopFlip)
@@ -111,9 +112,9 @@ func TestP7Repro_H8_ReadBoundedRegularFile_SwappedFIFOBlocks(t *testing.T) {
 			}
 			select {
 			case err := <-doneCh:
-				t.Fatalf("H8 reproduced on attempt %d: readBoundedRegularFile blocked >%s on swapped FIFO in Stat->Open window (unblocked only after opening FIFO writer; final err=%v)", attempt, callDeadline, err)
+				t.Fatalf("H8 reproduced on attempt %d: fsx.ReadAllBounded blocked >%s on swapped FIFO (unblocked only after opening FIFO writer; final err=%v)", attempt, callDeadline, err)
 			case <-time.After(2 * time.Second):
-				t.Fatalf("H8 reproduced on attempt %d: readBoundedRegularFile remained blocked >%s on swapped FIFO (unblockErr=%v)", attempt, callDeadline, unblockErr)
+				t.Fatalf("H8 reproduced on attempt %d: fsx.ReadAllBounded remained blocked >%s on swapped FIFO (unblockErr=%v)", attempt, callDeadline, unblockErr)
 			}
 		}
 	}
@@ -132,11 +133,11 @@ func (l *p7CloseObserverListener) Close() error {
 	return err
 }
 
-// TestP7Repro_H9_MuxServer_ShutdownUnlinksWithoutDirLockAndAfterListenerClose reproduces H9:
-//  1. MuxServer.unlinkControlSocketFileIfOurs does not acquire the control socket directory lock,
-//     allowing Shutdown/StopListening to unlink concurrently with another master replacing the path.
-//  2. MuxServer.Shutdown closes s.listener BEFORE unlinking the socket file, exposing an ECONNREFUSED
-//     stale window where a new master can bind the path and subsequently be unlinked by the old master.
+// TestP7Repro_H9_MuxServer_ShutdownUnlinksWithoutDirLockAndAfterListenerClose verifies H9 is fixed:
+//  1. MuxServer releases its control socket through fsx.SocketSlot.Release, which acquires the
+//     control socket directory lock before unlinking.
+//  2. MuxServer.Shutdown unlinks the socket under the directory lock BEFORE closing the listener,
+//     preventing an ECONNREFUSED stale window where a replacement master could be unlinked.
 func TestP7Repro_H9_MuxServer_ShutdownUnlinksWithoutDirLockAndAfterListenerClose(t *testing.T) {
 	t.Run("shutdown_ignores_directory_flock", func(t *testing.T) {
 		sockDir := shortSocketDir(t)
@@ -152,8 +153,8 @@ func TestP7Repro_H9_MuxServer_ShutdownUnlinksWithoutDirLockAndAfterListenerClose
 		go func() { _ = srv.Serve() }()
 		t.Cleanup(func() { _ = srv.Shutdown() })
 
-		// Acquire the same directory flock(LOCK_EX) that retryReplaceStaleSocketLink /
-		// handleStaleControlSocket use to serialize control-socket ownership transitions.
+		// Acquire the same directory flock(LOCK_EX) that fsx.SocketSlot /
+		// fsx.PruneStaleSocket use to serialize control-socket ownership transitions.
 		dirFile, err := os.Open(sockDir)
 		if err != nil {
 			t.Fatalf("open socket dir: %v", err)

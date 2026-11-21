@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/wentf9/xops-cli/core/fsx"
 	logger "github.com/wentf9/xops-cli/core/log"
 	cryptoSSH "golang.org/x/crypto/ssh"
 )
@@ -148,9 +149,8 @@ type MuxServer struct {
 
 	shutdownOnce    sync.Once
 	shutdownChan    chan struct{}
-	origFi          os.FileInfo
-	unlinkMu        sync.Mutex
-	unlinked        bool
+	slot            *fsx.SocketSlot
+	slotReleaseOnce sync.Once
 	askConfirmation bool
 	confirmSession  func(action string) bool
 
@@ -187,7 +187,7 @@ func NewMuxServer(opts MuxServerOptions) (*MuxServer, error) {
 		expectedUID = localPeerUID()
 	}
 
-	listener, origFi, err := bindAndLinkSocket(opts.ControlPath)
+	slot, err := bindAndLinkSocket(opts.ControlPath)
 	if err != nil {
 		return nil, err
 	}
@@ -215,10 +215,10 @@ func NewMuxServer(opts MuxServerOptions) (*MuxServer, error) {
 		persistIndefinite:     opts.PersistIndefinite,
 		sshClient:             opts.SSHClient,
 		rootConn:              opts.RootConn,
-		listener:              listener,
+		listener:              slot.Listener(),
+		slot:                  slot,
 		shutdownChan:          make(chan struct{}),
 		idleNotify:            make(chan struct{}),
-		origFi:                origFi,
 		askConfirmation:       opts.AskConfirmation,
 		confirmSession:        opts.ConfirmSession,
 		target:                opts.Target,
@@ -692,7 +692,7 @@ func (s *MuxServer) Serve() error {
 						s.retireUnlinkedOrReplacedListener()
 						return nil
 					}
-				} else if s.origFi != nil && !os.SameFile(s.origFi, currFi) {
+				} else if origFi := s.socketFileInfo(); origFi != nil && !os.SameFile(origFi, currFi) {
 					// Control socket was replaced on disk
 					s.retireUnlinkedOrReplacedListener()
 					return nil
@@ -713,13 +713,8 @@ func (s *MuxServer) retireUnlinkedOrReplacedListener() {
 	firstStop, releaseStop := s.admitStopListening()
 	defer releaseStop()
 
+	s.releaseControlSocketSlot()
 	if firstStop {
-		if s.listener != nil {
-			_ = s.listener.Close()
-		}
-		s.unlinkMu.Lock()
-		s.unlinked = true
-		s.unlinkMu.Unlock()
 		activeMuxServers.CompareAndDelete(s.controlPath, s)
 	}
 }
@@ -914,7 +909,7 @@ func (s *MuxServer) handleExtInfo(conn net.Conn, reqID uint32, name string) erro
 // and the 0600 socket plus the peer-UID check already bound who may send one.
 func (s *MuxServer) handleTerminate(conn net.Conn, reqID uint32) error {
 	s.idleMu.Lock()
-	firstStop := s.markStoppedListeningLocked()
+	_ = s.markStoppedListeningLocked()
 	if s.phase != muxPhaseClosed {
 		s.phase = muxPhaseShuttingDown
 	}
@@ -922,10 +917,9 @@ func (s *MuxServer) handleTerminate(conn net.Conn, reqID uint32) error {
 	s.notifyIdleLocked()
 	s.idleMu.Unlock()
 
-	if firstStop && s.listener != nil {
-		_ = s.listener.Close()
-	}
-	s.unlinkControlSocketFileIfOurs()
+	// Unconditionally synchronize on slot release so every concurrent -O exit
+	// observes the control socket unlinked before receiving MUX_S_OK.
+	s.releaseControlSocketSlot()
 	_ = sendOk(conn, reqID)
 	go func() {
 		time.Sleep(10 * time.Millisecond) // Allow response packet to flush
@@ -940,13 +934,12 @@ func (s *MuxServer) handleTerminate(conn net.Conn, reqID uint32) error {
 // stoppedListening only run when the last active session is released, and there
 // is no such session to release.
 func (s *MuxServer) handleStopListening(conn net.Conn, reqID uint32) error {
-	firstStop, releaseStop := s.admitStopListening()
+	_, releaseStop := s.admitStopListening()
 	defer releaseStop()
 
-	if firstStop && s.listener != nil {
-		_ = s.listener.Close()
-	}
-	s.unlinkControlSocketFileIfOurs()
+	// Unconditionally synchronize on slot release so every concurrent -O stop
+	// observes the control socket unlinked before receiving MUX_S_OK.
+	s.releaseControlSocketSlot()
 	return sendOk(conn, reqID)
 }
 
@@ -1312,10 +1305,7 @@ func (s *MuxServer) Shutdown() error {
 		localItems, remoteItems := s.forwardTable.snapshotAndDrainForShutdownLocked()
 		s.idleMu.Unlock()
 
-		if s.listener != nil {
-			_ = s.listener.Close()
-		}
-		s.unlinkControlSocketFileIfOurs()
+		s.releaseControlSocketSlot()
 
 		for _, item := range localItems {
 			closeShutdownForwardItem(item)
@@ -1346,32 +1336,28 @@ func (s *MuxServer) Shutdown() error {
 	return nil
 }
 
-// unlinkControlSocketFileIfOurs removes the control socket only when the path still
-// refers to the socket this server created. After -O stop or a replacement, a
-// newer master may own the same path and must not lose its listener entry.
-func (s *MuxServer) unlinkControlSocketFileIfOurs() {
-	if s.controlPath == "" || s.origFi == nil {
+func (s *MuxServer) socketFileInfo() os.FileInfo {
+	if s == nil || s.slot == nil {
+		return nil
+	}
+	return s.slot.FileInfo()
+}
+
+// releaseControlSocketSlot releases the owned fsx.SocketSlot (which acquires
+// the directory lock, verifies os.SameFile, unlinks the socket, releases the
+// directory lock, and closes its listener) before closing any wrapped listener.
+func (s *MuxServer) releaseControlSocketSlot() {
+	if s == nil {
 		return
 	}
-	s.unlinkMu.Lock()
-	defer s.unlinkMu.Unlock()
-	if s.unlinked {
-		return
-	}
-	current, err := os.Lstat(s.controlPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			s.unlinked = true
+	s.slotReleaseOnce.Do(func() {
+		if s.slot != nil {
+			_ = s.slot.Release()
 		}
-		return
-	}
-	if !os.SameFile(s.origFi, current) {
-		s.unlinked = true
-		return
-	}
-	if rmErr := os.Remove(s.controlPath); rmErr == nil || os.IsNotExist(rmErr) {
-		s.unlinked = true
-	}
+		if s.listener != nil {
+			_ = s.listener.Close()
+		}
+	})
 }
 
 func (s *MuxServer) interruptTransportAndShutdown() error {

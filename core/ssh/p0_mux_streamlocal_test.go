@@ -651,44 +651,15 @@ func TestP0_StreamLocal_WindowsStructuralInvariants(t *testing.T) {
 	assertCalls("streamlocal_windows.go", slFuncs, "listenLocalStreamLocal",
 		"validateWindowsSocketPath",
 		"MaxControlPathLength",
-		"winsec.EnsureOwnerOnlyDirectory",
-		"unlinkExistingStreamLocalSocket",
-		"winsec.HardenFileOwnerOnly",
-		"winsec.VerifyOwnerOnlySocketFile",
-	)
-	assertCalls("streamlocal_windows.go", slFuncs, "unlinkExistingStreamLocalSocket",
-		"os.Lstat",
-		"errors.Is",
-		"os.Remove",
+		"fsx.ReplaceStaleSocketSlot",
+		"fsx.BindSocketSlot",
 	)
 
-	// Confirm unlinkExistingStreamLocalSocket checks os.ModeSocket and os.ErrNotExist.
-	foundModeSocket := false
-	foundErrNotExist := false
-	ast.Inspect(slFuncs["unlinkExistingStreamLocalSocket"].Body, func(n ast.Node) bool {
-		if sel, ok := n.(*ast.SelectorExpr); ok {
-			if ident, ok := sel.X.(*ast.Ident); ok && ident.Name == "os" {
-				if sel.Sel.Name == "ModeSocket" {
-					foundModeSocket = true
-				}
-				if sel.Sel.Name == "ErrNotExist" {
-					foundErrNotExist = true
-				}
-			}
-		}
-		return true
-	})
-	if !foundModeSocket || !foundErrNotExist {
-		t.Fatalf("streamlocal_windows.go:unlinkExistingStreamLocalSocket must check os.ModeSocket (%v) and os.ErrNotExist (%v)", foundModeSocket, foundErrNotExist)
-	}
-
-	// Confirm mux_rights_windows.go also enforces validateWindowsSocketPath.
+	// Confirm mux_rights_windows.go also enforces validateWindowsSocketPath and delegates to fsx.SocketSlot.
 	mrFuncs := inspectFile("mux_rights_windows.go")
 	assertCalls("mux_rights_windows.go", mrFuncs, "bindAndLinkSocket",
 		"validateWindowsSocketPath",
-		"winsec.EnsureOwnerOnlyDirectory",
-		"winsec.HardenFileOwnerOnly",
-		"winsec.VerifyOwnerOnlySocketFile",
+		"fsx.BindSocketSlot",
 	)
 }
 

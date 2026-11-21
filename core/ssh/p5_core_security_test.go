@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wentf9/xops-cli/core/fsx"
 	cryptoSSH "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 	"gopkg.in/yaml.v3"
@@ -772,7 +773,7 @@ func TestP5_4_11_ReadBoundedRegularFile_CapsAndNonRegular(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	if _, err := readBoundedRegularFile(dir, maxKeyFileBytes); err == nil {
+	if _, err := fsx.ReadAllBounded(dir, fsx.Limits{MaxBytes: maxKeyFileBytes}, fsx.FollowSymlinks()); err == nil {
 		t.Fatal("expected directory to be rejected as non-regular file")
 	}
 
@@ -780,7 +781,7 @@ func TestP5_4_11_ReadBoundedRegularFile_CapsAndNonRegular(t *testing.T) {
 	if err := os.WriteFile(exactCert, bytes.Repeat([]byte("a"), int(maxUserCertFileBytes)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if data, err := readBoundedRegularFile(exactCert, maxUserCertFileBytes); err != nil || int64(len(data)) != maxUserCertFileBytes {
+	if data, err := fsx.ReadAllBounded(exactCert, fsx.Limits{MaxBytes: maxUserCertFileBytes}, fsx.FollowSymlinks()); err != nil || int64(len(data)) != maxUserCertFileBytes {
 		t.Fatalf("exact cap cert read failed: len=%d err=%v", len(data), err)
 	}
 
@@ -788,7 +789,7 @@ func TestP5_4_11_ReadBoundedRegularFile_CapsAndNonRegular(t *testing.T) {
 	if err := os.WriteFile(overCert, bytes.Repeat([]byte("a"), int(maxUserCertFileBytes)+1), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readBoundedRegularFile(overCert, maxUserCertFileBytes); err == nil {
+	if _, err := fsx.ReadAllBounded(overCert, fsx.Limits{MaxBytes: maxUserCertFileBytes}, fsx.FollowSymlinks()); err == nil {
 		t.Fatal("expected oversized cert file (>256 KiB) to be rejected")
 	}
 
@@ -796,7 +797,7 @@ func TestP5_4_11_ReadBoundedRegularFile_CapsAndNonRegular(t *testing.T) {
 	if err := os.WriteFile(overKey, bytes.Repeat([]byte("b"), int(maxKeyFileBytes)+1), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readBoundedRegularFile(overKey, maxKeyFileBytes); err == nil {
+	if _, err := fsx.ReadAllBounded(overKey, fsx.Limits{MaxBytes: maxKeyFileBytes}, fsx.FollowSymlinks()); err == nil {
 		t.Fatal("expected oversized key file (>1 MiB) to be rejected")
 	}
 
@@ -808,16 +809,16 @@ func TestP5_4_11_ReadBoundedRegularFile_CapsAndNonRegular(t *testing.T) {
 			}
 			done := make(chan error, 1)
 			go func() {
-				_, err := readBoundedRegularFile(fifoPath, maxUserCertFileBytes)
+				_, err := fsx.ReadAllBounded(fifoPath, fsx.Limits{MaxBytes: maxUserCertFileBytes}, fsx.FollowSymlinks())
 				done <- err
 			}()
 			select {
 			case err := <-done:
-				if err == nil || !strings.Contains(err.Error(), "non-regular") {
-					t.Fatalf("expected non-regular error for FIFO, got %v", err)
+				if !errors.Is(err, fsx.ErrNonRegular) {
+					t.Fatalf("expected fsx.ErrNonRegular for FIFO, got %v", err)
 				}
 			case <-time.After(2 * time.Second):
-				t.Fatal("readBoundedRegularFile blocked on FIFO instead of failing closed")
+				t.Fatal("fsx.ReadAllBounded blocked on FIFO instead of failing closed")
 			}
 		}
 	}

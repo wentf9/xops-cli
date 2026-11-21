@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/wentf9/xops-cli/core/fsx"
 	logger "github.com/wentf9/xops-cli/core/log"
 	cryptoSSH "golang.org/x/crypto/ssh"
 )
@@ -26,52 +27,6 @@ const (
 	maxUserCertFileBytes int64 = 256 * 1024
 	maxKeyFileBytes      int64 = 1024 * 1024
 )
-
-// readBoundedRegularFile reads a regular file bounded to maxBytes. It inspects
-// the path with os.Stat before opening so non-regular files (FIFOs, devices,
-// sockets, directories) are rejected without blocking, then re-checks f.Stat()
-// on the opened descriptor and enforces maxBytes via io.LimitReader.
-func readBoundedRegularFile(path string, maxBytes int64) ([]byte, error) {
-	if path == "" {
-		return nil, errors.New("file path is empty")
-	}
-	if maxBytes <= 0 {
-		return nil, fmt.Errorf("invalid maximum file size %d", maxBytes)
-	}
-	st, err := os.Stat(path)
-	if err != nil {
-		return nil, err
-	}
-	if !st.Mode().IsRegular() {
-		return nil, fmt.Errorf("refusing non-regular file %q (mode %s)", path, st.Mode().Type())
-	}
-	if st.Size() > maxBytes {
-		return nil, fmt.Errorf("file %q exceeds maximum size %d bytes", path, maxBytes)
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = f.Close() }()
-	fst, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !fst.Mode().IsRegular() {
-		return nil, fmt.Errorf("refusing non-regular file %q (mode %s)", path, fst.Mode().Type())
-	}
-	if fst.Size() > maxBytes {
-		return nil, fmt.Errorf("file %q exceeds maximum size %d bytes", path, maxBytes)
-	}
-	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(data)) > maxBytes {
-		return nil, fmt.Errorf("file %q exceeds maximum size %d bytes", path, maxBytes)
-	}
-	return data, nil
-}
 
 type admittedMaterialPolicy struct {
 	enforceCerts  bool
@@ -190,8 +145,10 @@ func (p *admittedMaterialPolicy) lookupCert(certPath string) (AdmittedCertificat
 }
 
 func (p *admittedMaterialPolicy) readKeyFile(keyPath string, explicit bool) (data []byte, absentAllowed bool, err error) {
+	// OpenSSH follows symlinks for user identity key files; fsx.ReadAllBounded
+	// still opens handle-first without Stat-then-Open and rejects FIFOs/devices.
 	if p == nil || !p.enforceKeys {
-		data, err = readBoundedRegularFile(keyPath, maxKeyFileBytes)
+		data, err = fsx.ReadAllBounded(keyPath, fsx.Limits{MaxBytes: maxKeyFileBytes}, fsx.FollowSymlinks())
 		return data, false, err
 	}
 	key := canonicalAdmittedPath(keyPath)
@@ -226,7 +183,7 @@ func (p *admittedMaterialPolicy) readKeyFile(keyPath string, explicit bool) (dat
 	if len(strings.TrimSpace(entry.SHA256)) != sha256.Size*2 {
 		return nil, false, fmt.Errorf("%w: SSH key %q has invalid admitted SHA-256 digest", ErrSnapshotMismatch, keyPath)
 	}
-	data, err = readBoundedRegularFile(keyPath, maxKeyFileBytes)
+	data, err = fsx.ReadAllBounded(keyPath, fsx.Limits{MaxBytes: maxKeyFileBytes}, fsx.FollowSymlinks())
 	if err != nil {
 		return nil, false, fmt.Errorf("%w: read admitted SSH key %q failed: %w", ErrSnapshotMismatch, keyPath, err)
 	}
@@ -237,8 +194,9 @@ func (p *admittedMaterialPolicy) readKeyFile(keyPath string, explicit bool) (dat
 }
 
 func (p *admittedMaterialPolicy) readOptionalAdmittedPubFile(pubPath string) ([]byte, bool) {
+	// OpenSSH follows symlinks for user .pub files; fsx.ReadAllBounded enforces handle-first bounds.
 	if p == nil || !p.enforceKeys {
-		data, err := readBoundedRegularFile(pubPath, maxKeyFileBytes)
+		data, err := fsx.ReadAllBounded(pubPath, fsx.Limits{MaxBytes: maxKeyFileBytes}, fsx.FollowSymlinks())
 		return data, err == nil
 	}
 	key := canonicalAdmittedPath(pubPath)
@@ -252,7 +210,7 @@ func (p *admittedMaterialPolicy) readOptionalAdmittedPubFile(pubPath string) ([]
 	if !ok || entry.Missing || entry.NonRegular {
 		return nil, false
 	}
-	data, err := readBoundedRegularFile(pubPath, maxKeyFileBytes)
+	data, err := fsx.ReadAllBounded(pubPath, fsx.Limits{MaxBytes: maxKeyFileBytes}, fsx.FollowSymlinks())
 	if err != nil || !equalSHA256Hex(data, entry.SHA256) {
 		return nil, false
 	}
@@ -585,7 +543,9 @@ func parseUserCertFile(certPath string, silentIfMissing bool, l logger.DebugLogg
 			}
 			return parseUserCertData(certPath, entry.RawBytes, l)
 		}
-		data, err := readBoundedRegularFile(certPath, maxUserCertFileBytes)
+		// OpenSSH follows symlinks for user certificate files (e.g. rotated certs);
+		// fsx.ReadAllBounded opens handle-first and rejects FIFOs/devices/oversize.
+		data, err := fsx.ReadAllBounded(certPath, fsx.Limits{MaxBytes: maxUserCertFileBytes}, fsx.FollowSymlinks())
 		if err != nil {
 			l.Debugf("Failed to read admitted SSH certificate %q: %v", certPath, err)
 			return nil, false
@@ -597,7 +557,8 @@ func parseUserCertFile(certPath string, silentIfMissing bool, l logger.DebugLogg
 		return parseUserCertData(certPath, data, l)
 	}
 
-	data, err := readBoundedRegularFile(certPath, maxUserCertFileBytes)
+	// OpenSSH follows symlinks for user certificate files; fsx.ReadAllBounded opens handle-first.
+	data, err := fsx.ReadAllBounded(certPath, fsx.Limits{MaxBytes: maxUserCertFileBytes}, fsx.FollowSymlinks())
 	if err != nil {
 		if !silentIfMissing || !errors.Is(err, os.ErrNotExist) {
 			l.Debugf("Failed to read SSH certificate %q: %v", certPath, err)

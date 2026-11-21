@@ -7,25 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
-)
+	"strings"
 
-func unlinkExistingStreamLocalSocket(socketPath string) error {
-	fi, statErr := os.Lstat(socketPath)
-	if statErr != nil {
-		if errors.Is(statErr, os.ErrNotExist) {
-			return nil
-		}
-		return fmt.Errorf("stat existing streamlocal path %q failed: %w", socketPath, statErr)
-	}
-	if fi.Mode()&os.ModeSocket == 0 {
-		return fmt.Errorf("cannot unlink non-socket path %q (mode %s)", socketPath, fi.Mode())
-	}
-	if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("unlink existing streamlocal socket %q failed: %w", socketPath, err)
-	}
-	return nil
-}
+	"github.com/wentf9/xops-cli/core/fsx"
+)
 
 func listenLocalStreamLocal(ctx context.Context, socketPath string, _ uint32, bindUnlink bool) (net.Listener, error) {
 	if socketPath == "" {
@@ -34,28 +19,23 @@ func listenLocalStreamLocal(ctx context.Context, socketPath string, _ uint32, bi
 	if len(socketPath) >= MaxControlPathLength() {
 		return nil, fmt.Errorf("streamlocal socket path %q exceeds maximum length %d", socketPath, MaxControlPathLength())
 	}
-	if bindUnlink {
-		if err := unlinkExistingStreamLocalSocket(socketPath); err != nil {
-			return nil, err
-		}
+	listenFn := func(addr string) (net.Listener, error) {
+		return (&net.ListenConfig{}).Listen(ctx, "unix", addr)
 	}
-	lc := net.ListenConfig{}
-	listener, err := lc.Listen(ctx, "unix", socketPath)
+	var (
+		slot *fsx.SocketSlot
+		err  error
+	)
+	if bindUnlink {
+		slot, err = fsx.ReplaceStaleSocketSlot(socketPath, listenFn, func() bool { return true })
+	} else {
+		slot, err = fsx.BindSocketSlot(socketPath, listenFn)
+	}
 	if err != nil {
+		if strings.Contains(err.Error(), "is not a socket") {
+			return nil, fmt.Errorf("cannot unlink non-socket path %q: %w", socketPath, err)
+		}
 		return nil, err
 	}
-	if unixLn, ok := listener.(*net.UnixListener); ok {
-		unixLn.SetUnlinkOnClose(false)
-	}
-	origFi, lstatErr := os.Lstat(socketPath)
-	if lstatErr != nil {
-		_ = listener.Close()
-		_ = os.Remove(socketPath)
-		return nil, fmt.Errorf("stat streamlocal socket failed: %w", lstatErr)
-	}
-	return &streamLocalListener{
-		Listener:   listener,
-		socketPath: socketPath,
-		origFi:     origFi,
-	}, nil
+	return &streamLocalListener{slot: slot}, nil
 }

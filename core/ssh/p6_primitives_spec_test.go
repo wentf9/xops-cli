@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wentf9/xops-cli/core/fsx"
 	cryptoSSH "golang.org/x/crypto/ssh"
 )
 
@@ -62,13 +63,9 @@ func TestP6Helper_CrossProcessLockWorker(t *testing.T) {
 
 	switch mode {
 	case "hold_kh_ex":
-		f, err := openKnownHostsFileNoFollow(targetPath, os.O_RDWR|os.O_APPEND, 0o600)
+		lf, err := fsx.OpenLocked(targetPath, fsx.LockExclusive, false, fsx.OwnerOnlyPerm)
 		if err != nil {
-			t.Fatalf("open known_hosts: %v", err)
-		}
-		defer func() { _ = f.Close() }()
-		if err := lockKnownHostsFile(f, true); err != nil {
-			t.Fatalf("lockKnownHostsFile: %v", err)
+			t.Fatalf("fsx.OpenLocked(known_hosts): %v", err)
 		}
 		_, _ = fmt.Fprintln(os.Stdout, "LOCKED")
 		// Wait for parent to close stdin before writing and unlocking.
@@ -77,12 +74,17 @@ func TestP6Helper_CrossProcessLockWorker(t *testing.T) {
 		if host != "" {
 			key := p6NewTestKey(t)
 			line := fmt.Sprintf("%s %s", host, strings.TrimSpace(string(cryptoSSH.MarshalAuthorizedKey(key))))
-			if _, err := f.WriteString(line + "\n"); err != nil {
+			if _, seekErr := lf.Seek(0, io.SeekEnd); seekErr != nil {
+				_ = lf.Close()
+				t.Fatalf("seek known_hosts: %v", seekErr)
+			}
+			if _, err := lf.Write([]byte(line + "\n")); err != nil {
+				_ = lf.Close()
 				t.Fatalf("write known_hosts: %v", err)
 			}
 		}
-		if err := unlockKnownHostsFile(f); err != nil {
-			t.Fatalf("unlockKnownHostsFile: %v", err)
+		if err := lf.Close(); err != nil {
+			t.Fatalf("close known_hosts lock: %v", err)
 		}
 
 	case "append_kh_batch":
@@ -100,13 +102,13 @@ func TestP6Helper_CrossProcessLockWorker(t *testing.T) {
 		}
 
 	case "hold_sock_dir":
-		err := withControlSocketDirLock(targetPath, func() error {
+		err := holdSocketDirLockForTest(targetPath, func() error {
 			_, _ = fmt.Fprintln(os.Stdout, "LOCKED")
 			_, _ = io.ReadAll(os.Stdin)
 			return nil
 		})
 		if err != nil {
-			t.Fatalf("withControlSocketDirLock: %v", err)
+			t.Fatalf("holdSocketDirLockForTest: %v", err)
 		}
 
 	default:
@@ -577,9 +579,9 @@ func TestP6_3_3_WindowsKnownHostsLock_StructuralInvariants(t *testing.T) {
 	t.Parallel()
 
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "knownhosts_lock_windows.go", nil, 0)
+	file, err := parser.ParseFile(fset, "../fsx/fsx_windows.go", nil, 0)
 	if err != nil {
-		t.Fatalf("parse knownhosts_lock_windows.go: %v", err)
+		t.Fatalf("parse ../fsx/fsx_windows.go: %v", err)
 	}
 	funcs := make(map[string]*ast.FuncDecl)
 	for _, decl := range file.Decls {
@@ -592,7 +594,7 @@ func TestP6_3_3_WindowsKnownHostsLock_StructuralInvariants(t *testing.T) {
 		t.Helper()
 		fn := funcs[fnName]
 		if fn == nil || fn.Body == nil {
-			t.Fatalf("missing function %s in knownhosts_lock_windows.go", fnName)
+			t.Fatalf("missing function %s in core/fsx/fsx_windows.go", fnName)
 		}
 		seen := make(map[string]bool)
 		ast.Inspect(fn.Body, func(n ast.Node) bool {
@@ -612,15 +614,16 @@ func TestP6_3_3_WindowsKnownHostsLock_StructuralInvariants(t *testing.T) {
 		})
 		for _, req := range required {
 			if !seen[req] {
-				t.Errorf("%s in knownhosts_lock_windows.go must call %s (seen: %v)", fnName, req, seen)
+				t.Errorf("%s in core/fsx/fsx_windows.go must call %s (seen: %v)", fnName, req, seen)
 			}
 		}
 	}
 
-	assertCalls("openKnownHostsFileNoFollow", "winsec.GetFileAttributesNoFollow", "windows.GetFileInformationByHandle")
-	assertCalls("lockKnownHostsFile", "windows.LockFileEx")
-	assertCalls("unlockKnownHostsFile", "windows.UnlockFileEx")
-	assertCalls("hardenNewKnownHostsFile", "winsec.HardenFileOwnerOnly")
+	assertCalls("openExistingRegularForLockOS", "windows.CreateFile", "validateWindowsRegularHandle")
+	assertCalls("validateWindowsRegularHandle", "windows.GetFileType", "windows.GetFileInformationByHandle")
+	assertCalls("createExclusiveOS", "winsec.NewOwnerOnlySecurityDescriptor", "windows.CreateFile")
+	assertCalls("lockFileOS", "windows.LockFileEx")
+	assertCalls("unlockFileOS", "windows.UnlockFileEx")
 }
 
 // --- Deliverable 2 (R6 / Finding 4.6): Cross-process lock around stale Unix control socket replacement ---
@@ -732,7 +735,7 @@ func TestP6_4_6_StaleSocketConcurrentReplacement_NeverUnlinksLiveMaster(t *testi
 		var (
 			wg        sync.WaitGroup
 			mu        sync.Mutex
-			winners   []net.Listener
+			winners   []*fsx.SocketSlot
 			winnerFis []os.FileInfo
 			otherErrs []error
 			cleanErrs atomic.Int32
@@ -756,12 +759,12 @@ func TestP6_4_6_StaleSocketConcurrentReplacement_NeverUnlinksLiveMaster(t *testi
 			go func() {
 				defer wg.Done()
 				<-start
-				ln, fi, bErr := bindAndLinkSocket(sockPath)
+				slot, bErr := bindAndLinkSocket(sockPath)
 				mu.Lock()
 				defer mu.Unlock()
 				if bErr == nil {
-					winners = append(winners, ln)
-					winnerFis = append(winnerFis, fi)
+					winners = append(winners, slot)
+					winnerFis = append(winnerFis, slot.FileInfo())
 				} else if !errors.Is(bErr, ErrMasterAlreadyExists) {
 					otherErrs = append(otherErrs, bErr)
 				}
@@ -784,8 +787,8 @@ func TestP6_4_6_StaleSocketConcurrentReplacement_NeverUnlinksLiveMaster(t *testi
 		wg.Wait()
 		_ = conn.CloseAll()
 
-		for _, ln := range winners {
-			defer func(l net.Listener) { _ = l.Close() }(ln)
+		for _, slot := range winners {
+			defer func(s *fsx.SocketSlot) { _ = s.Release() }(slot)
 		}
 
 		if len(otherErrs) > 0 {

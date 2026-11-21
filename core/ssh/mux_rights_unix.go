@@ -4,14 +4,11 @@ package ssh
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,171 +16,27 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/wentf9/xops-cli/core/fsx"
 	logger "github.com/wentf9/xops-cli/core/log"
 	cryptoSSH "golang.org/x/crypto/ssh"
 	"golang.org/x/sys/unix"
 )
 
-var muxTempSeq atomic.Uint64
-
-func nextMuxTempToken() uint32 {
-	var b [4]byte
-	if _, err := rand.Read(b[:]); err == nil {
-		return binary.BigEndian.Uint32(b[:]) & 0xffff
-	}
-	seq := muxTempSeq.Add(1)
-	return (uint32(os.Getpid())&0xff)<<8 | uint32(seq&0xff)
-}
-
-func disableUnixListenerUnlinkOnClose(listener net.Listener) {
-	if unixLn, ok := listener.(*net.UnixListener); ok {
-		unixLn.SetUnlinkOnClose(false)
-	}
-}
-
-func isAddressAlreadyInUse(err error) bool {
-	if err == nil {
-		return false
-	}
-	var sysErr syscall.Errno
-	if errors.As(err, &sysErr) && (sysErr == syscall.EADDRINUSE || sysErr == syscall.EEXIST) {
-		return true
-	}
-	errStr := strings.ToLower(err.Error())
-	return strings.Contains(errStr, "address already in use") || strings.Contains(errStr, "file exists")
-}
-
-func bindAndLinkSocket(targetPath string) (net.Listener, os.FileInfo, error) {
+func bindAndLinkSocket(targetPath string) (*fsx.SocketSlot, error) {
 	maxPathLen := MaxControlPathLength() - 1 // 107 on Linux, 103 on Darwin/BSD
-	targetLen := len(targetPath)
-	if targetLen > maxPathLen {
-		return nil, nil, fmt.Errorf("control path %q exceeds maximum Unix socket path length (%d bytes)", targetPath, maxPathLen)
+	if len(targetPath) > maxPathLen {
+		return nil, fmt.Errorf("control path %q exceeds maximum Unix socket path length (%d bytes)", targetPath, maxPathLen)
 	}
-	if err := os.MkdirAll(filepath.Dir(targetPath), 0700); err != nil {
-		return nil, nil, fmt.Errorf("create socket directory failed: %w", err)
-	}
-	suffixBudget := maxPathLen - targetLen
-	dir := filepath.Dir(targetPath)
-	dirBudget := maxPathLen - (len(dir) + 1)
-
-	useSuffixTemp := suffixBudget >= 8
-	useDirTemp := !useSuffixTemp && dirBudget >= 8
-
-	if !useSuffixTemp && !useDirTemp {
-		// Fallback: Direct bind on targetPath when path length budget is exhausted.
-		return bindDirectControlSocket(targetPath)
-	}
-
-	// Linking Strategy: Bind tempPath -> Chmod 0600 -> Atomic Link to targetPath -> Unlink tempPath.
-	var (
-		listener net.Listener
-		tempPath string
-		err      error
-	)
-	for attempt := 0; attempt < 4; attempt++ {
-		val := nextMuxTempToken()
-		if useSuffixTemp {
-			tempPath = fmt.Sprintf("%s.m%04x.t", targetPath, val)
-		} else {
-			tempPath = filepath.Join(dir, fmt.Sprintf(".m%04x.t", val))
-		}
-		listener, err = net.Listen("unix", tempPath)
-		if err == nil {
-			break
-		}
-		if !isAddressAlreadyInUse(err) {
-			return nil, nil, fmt.Errorf("listen on temp control socket failed: %w", err)
-		}
-	}
-	if err != nil {
-		return nil, nil, fmt.Errorf("listen on temp control socket failed: %w", err)
-	}
-	disableUnixListenerUnlinkOnClose(listener)
-	defer func() {
-		_ = os.Remove(tempPath)
-	}()
-
-	// Enforce 0600 permissions without mutating process-global umask.
-	if err := os.Chmod(tempPath, 0600); err != nil {
-		_ = listener.Close()
-		return nil, nil, fmt.Errorf("chmod temp control socket failed: %w", err)
-	}
-	origFi, lstatErr := os.Lstat(tempPath)
-	if lstatErr != nil {
-		_ = listener.Close()
-		return nil, nil, fmt.Errorf("stat temp control socket failed: %w", lstatErr)
-	}
-
-	err = os.Link(tempPath, targetPath)
-	if err != nil {
-		if errors.Is(err, os.ErrExist) || errors.Is(err, syscall.EEXIST) {
-			if retryReplaceStaleSocketLink(tempPath, targetPath) {
-				return listener, origFi, nil
-			}
-			_ = listener.Close()
-			return nil, nil, fmt.Errorf("%w: %s", ErrMasterAlreadyExists, targetPath)
-		}
-		_ = listener.Close()
-		return nil, nil, fmt.Errorf("link control socket failed: %w", err)
-	}
-
-	return listener, origFi, nil
-}
-
-func bindDirectControlSocket(targetPath string) (net.Listener, os.FileInfo, error) {
-	listener, err := net.Listen("unix", targetPath)
-	if err != nil {
-		if isAddressAlreadyInUse(err) {
-			return nil, nil, fmt.Errorf("%w: %s", ErrMasterAlreadyExists, targetPath)
-		}
-		return nil, nil, fmt.Errorf("listen on control socket failed: %w", err)
-	}
-	disableUnixListenerUnlinkOnClose(listener)
-	if err := os.Chmod(targetPath, 0600); err != nil {
-		_ = listener.Close()
-		_ = os.Remove(targetPath)
-		return nil, nil, fmt.Errorf("chmod control socket failed: %w", err)
-	}
-	origFi, lstatErr := os.Lstat(targetPath)
-	if lstatErr != nil {
-		_ = listener.Close()
-		_ = os.Remove(targetPath)
-		return nil, nil, fmt.Errorf("stat control socket failed: %w", lstatErr)
-	}
-	return listener, origFi, nil
-}
-
-func retryReplaceStaleSocketLink(tempPath, targetPath string) bool {
-	replaced := false
-	err := withControlSocketDirLock(targetPath, func() error {
-		// Fast path: if a concurrent process already unlinked the stale socket
-		// before we acquired the directory lock, link directly.
-		if linkErr := os.Link(tempPath, targetPath); linkErr == nil {
-			replaced = true
-			return nil
-		}
-		origFi, statErr := os.Lstat(targetPath)
-		if statErr != nil || !isControlSocketFileInfo(origFi) {
-			return nil
-		}
-		probeConn, probeErr := net.DialTimeout("unix", targetPath, 200*time.Millisecond)
-		if probeErr == nil {
-			_ = probeConn.Close()
-			return nil
-		}
-		if !isConnectionRefused(probeErr) {
-			return nil
-		}
-		// Re-verify SameFile before unlinking so a concurrent new master is never clobbered.
-		currFi, currErr := os.Lstat(targetPath)
-		if currErr != nil || !isControlSocketFileInfo(currFi) || !os.SameFile(origFi, currFi) {
-			return nil
-		}
-		_ = os.Remove(targetPath)
-		replaced = os.Link(tempPath, targetPath) == nil
-		return nil
+	slot, err := fsx.ReplaceStaleSocketSlot(targetPath, nil, func() bool {
+		return fsx.ProbeStaleUnixSocket(targetPath, 200*time.Millisecond)
 	})
-	return err == nil && replaced
+	if err != nil {
+		if errors.Is(err, fsx.ErrSlotOccupied) {
+			return nil, fmt.Errorf("%w: %s", ErrMasterAlreadyExists, targetPath)
+		}
+		return nil, err
+	}
+	return slot, nil
 }
 
 func checkPeerUID(conn net.Conn, expectedUID uint32) error {

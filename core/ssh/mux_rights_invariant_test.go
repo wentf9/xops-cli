@@ -55,14 +55,14 @@ func TestWindowsMuxRights_StructuralSecurityInvariants(t *testing.T) {
 	}
 
 	assertCalls("bindAndLinkSocket",
+		"validateWindowsSocketPath",
 		"MaxControlPathLength",
-		"winsec.EnsureOwnerOnlyDirectory",
-		"winsec.HardenFileOwnerOnly",
-		"winsec.VerifyOwnerOnlySocketFile",
+		"fsx.BindSocketSlot",
 	)
 	assertCalls("checkPeerUID",
 		"winsec.VerifyAFUnixPeerCurrentUser",
 	)
+	assertFSXWindowsSocketSecurityCalls(t, fset)
 
 	// Verify checkPeerUID references ErrUnsupportedMuxPlatform when SIO_AF_UNIX_GETPEERPID is unsupported.
 	foundUnsupportedSentinel := false
@@ -74,6 +74,40 @@ func TestWindowsMuxRights_StructuralSecurityInvariants(t *testing.T) {
 	})
 	if !foundUnsupportedSentinel {
 		t.Error("checkPeerUID in mux_rights_windows.go must wrap ErrUnsupportedMuxPlatform on unsupported IOCTL")
+	}
+}
+
+func assertFSXWindowsSocketSecurityCalls(t *testing.T, fset *token.FileSet) {
+	t.Helper()
+	fsxFile, fsxErr := parser.ParseFile(fset, "../fsx/fsx_windows.go", nil, 0)
+	if fsxErr != nil {
+		t.Fatalf("parse ../fsx/fsx_windows.go failed: %v", fsxErr)
+	}
+	fsxCalls := make(map[string]bool)
+	ast.Inspect(fsxFile, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		switch fun := call.Fun.(type) {
+		case *ast.Ident:
+			fsxCalls[fun.Name] = true
+		case *ast.SelectorExpr:
+			if pkg, ok := fun.X.(*ast.Ident); ok {
+				fsxCalls[pkg.Name+"."+fun.Sel.Name] = true
+			}
+		}
+		return true
+	})
+	for _, req := range []string{
+		"winsec.EnsureOwnerOnlyDirectory",
+		"winsec.HardenSocketOwnerOnlyByHandle",
+		"winsec.VerifyOwnerOnlySocketByHandle",
+		"withDirLockOS",
+	} {
+		if !fsxCalls[req] {
+			t.Errorf("core/fsx/fsx_windows.go must call %s (seen calls: %v)", req, fsxCalls)
+		}
 	}
 }
 

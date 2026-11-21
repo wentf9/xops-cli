@@ -6,72 +6,30 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
-	"path/filepath"
-	"strings"
 	"syscall"
 
+	"github.com/wentf9/xops-cli/core/fsx"
 	"github.com/wentf9/xops-cli/core/winsec"
 )
 
 var errPassengerUnsupported = errors.New("passenger mode with fd passing is not supported on Windows; use MUX_C_PROXY")
 
-func bindAndLinkSocket(targetPath string) (net.Listener, os.FileInfo, error) {
+func bindAndLinkSocket(targetPath string) (*fsx.SocketSlot, error) {
 	if err := validateWindowsSocketPath(targetPath); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	maxPathLen := MaxControlPathLength() - 1
 	if len(targetPath) > maxPathLen {
-		return nil, nil, fmt.Errorf("control path %q exceeds maximum Unix socket path length (%d bytes)", targetPath, maxPathLen)
+		return nil, fmt.Errorf("control path %q exceeds maximum Unix socket path length (%d bytes)", targetPath, maxPathLen)
 	}
-	if err := winsec.EnsureOwnerOnlyDirectory(filepath.Dir(targetPath)); err != nil {
-		return nil, nil, fmt.Errorf("prepare secure control socket directory failed: %w", err)
-	}
-	if _, err := os.Lstat(targetPath); err == nil {
-		return nil, nil, fmt.Errorf("%w: %s", ErrMasterAlreadyExists, targetPath)
-	}
-
-	// Windows AF_UNIX does not support hard-linking socket reparse points.
-	// Bind targetPath directly inside the verified owner-only directory, then
-	// apply a protected owner-only DACL on the socket file as defense-in-depth.
-	listener, err := net.Listen("unix", targetPath)
+	slot, err := fsx.BindSocketSlot(targetPath, nil)
 	if err != nil {
-		var sysErr syscall.Errno
-		errStr := strings.ToLower(err.Error())
-		if (errors.As(err, &sysErr) && (sysErr == syscall.EADDRINUSE || sysErr == syscall.EEXIST || sysErr == syscall.Errno(10048))) ||
-			strings.Contains(errStr, "address already in use") ||
-			strings.Contains(errStr, "only one usage of each socket address") ||
-			strings.Contains(errStr, "file exists") ||
-			(strings.Contains(errStr, "access is denied") && socketPathExistsOrOccupied(targetPath)) {
-			return nil, nil, fmt.Errorf("%w: %s", ErrMasterAlreadyExists, targetPath)
+		if errors.Is(err, fsx.ErrSlotOccupied) {
+			return nil, fmt.Errorf("%w: %s", ErrMasterAlreadyExists, targetPath)
 		}
-		return nil, nil, err
+		return nil, err
 	}
-	if unixLn, ok := listener.(*net.UnixListener); ok {
-		unixLn.SetUnlinkOnClose(false)
-	}
-	if err := winsec.HardenFileOwnerOnly(targetPath); err != nil {
-		_ = listener.Close()
-		_ = os.Remove(targetPath)
-		return nil, nil, fmt.Errorf("harden control socket DACL failed: %w", err)
-	}
-	origFi, lstatErr := os.Lstat(targetPath)
-	if lstatErr != nil {
-		_ = listener.Close()
-		_ = os.Remove(targetPath)
-		return nil, nil, fmt.Errorf("stat control socket failed: %w", lstatErr)
-	}
-	if err := winsec.VerifyOwnerOnlySocketFile(targetPath); err != nil {
-		_ = listener.Close()
-		_ = os.Remove(targetPath)
-		return nil, nil, fmt.Errorf("verify control socket security failed: %w", err)
-	}
-	return listener, origFi, nil
-}
-
-func socketPathExistsOrOccupied(targetPath string) bool {
-	_, err := os.Lstat(targetPath)
-	return err == nil
+	return slot, nil
 }
 
 // checkPeerUID verifies the connected Windows AF_UNIX peer process token user

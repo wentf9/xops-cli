@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/wentf9/xops-cli/core/fsx"
 	logger "github.com/wentf9/xops-cli/core/log"
 	cryptoSSH "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
@@ -572,33 +573,14 @@ func (db *knownHostsDB) parseFileStrictBounded(filename string, limit int64) err
 	if isKnownHostsDevNull(filename) {
 		return nil
 	}
-	st, err := os.Lstat(filename)
+	lf, err := fsx.OpenLocked(filename, fsx.LockShared, false, 0)
 	if err != nil {
 		return err
 	}
-	if !st.Mode().IsRegular() {
-		return fmt.Errorf("knownhosts: refusing non-regular file %q (mode %s)", filename, st.Mode().Type())
-	}
-	f, err := openKnownHostsFileNoFollow(filename, os.O_RDONLY, 0)
+	defer func() { _ = lf.Close() }()
+
+	fst, err := lf.Stat()
 	if err != nil {
-		return err
-	}
-	defer func() { _ = f.Close() }()
-
-	fst, err := f.Stat()
-	if err != nil {
-		return err
-	}
-	if !fst.Mode().IsRegular() {
-		return fmt.Errorf("knownhosts: refusing non-regular file %q (mode %s)", filename, fst.Mode().Type())
-	}
-
-	if err := lockKnownHostsFile(f, false); err != nil {
-		return fmt.Errorf("knownhosts: lock %q failed: %w", filename, err)
-	}
-	defer func() { _ = unlockKnownHostsFile(f) }()
-
-	if fst, err = f.Stat(); err != nil {
 		return err
 	}
 	if !fst.Mode().IsRegular() {
@@ -608,7 +590,7 @@ func (db *knownHostsDB) parseFileStrictBounded(filename string, limit int64) err
 		return fmt.Errorf("knownhosts: %q exceeds maximum size of %d bytes", filename, limit)
 	}
 
-	bounded := newBoundedKnownHostsReader(f, limit)
+	bounded := newBoundedKnownHostsReader(lf, limit)
 	if err := db.readLines(bounded, filename, nil); err != nil {
 		if bounded.exceeded() {
 			return fmt.Errorf("knownhosts: %q exceeds maximum size of %d bytes", filename, limit)
@@ -632,43 +614,14 @@ func (db *knownHostsDB) parseFileLenientBounded(filename string, l logger.DebugL
 	if isKnownHostsDevNull(filename) {
 		return
 	}
-	st, err := os.Stat(filename)
+	rc, err := openGlobalKnownHostsFile(filename, limit)
 	if err != nil {
 		l.Debugf("skipping global known_hosts file %q: %v", filename, err)
 		return
 	}
-	if !st.Mode().IsRegular() {
-		l.Debugf("skipping global known_hosts file %q: non-regular file (mode %s)", filename, st.Mode().Type())
-		return
-	}
-	f, err := openKnownHostsReadOnlyFollow(filename)
-	if err != nil {
-		l.Debugf("skipping global known_hosts file %q: %v", filename, err)
-		return
-	}
-	defer func() { _ = f.Close() }()
+	defer func() { _ = rc.Close() }()
 
-	fst, err := f.Stat()
-	if err != nil || !fst.Mode().IsRegular() {
-		l.Debugf("skipping global known_hosts file %q: non-regular or unstatable handle", filename)
-		return
-	}
-	if err := lockKnownHostsFile(f, false); err != nil {
-		l.Debugf("skipping global known_hosts file %q: lock failed: %v", filename, err)
-		return
-	}
-	defer func() { _ = unlockKnownHostsFile(f) }()
-
-	if fst, err = f.Stat(); err != nil || !fst.Mode().IsRegular() {
-		l.Debugf("skipping global known_hosts file %q: non-regular or unstatable handle", filename)
-		return
-	}
-	if fst.Size() > limit {
-		l.Debugf("skipping global known_hosts file %q: exceeds maximum size of %d bytes", filename, limit)
-		return
-	}
-
-	bounded := newBoundedKnownHostsReader(f, limit)
+	bounded := newBoundedKnownHostsReader(rc, limit)
 	_ = db.readLines(bounded, filename, l)
 	if bounded.exceeded() {
 		l.Debugf("global known_hosts file %q exceeded maximum size of %d bytes while reading", filename, limit)

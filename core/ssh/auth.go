@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/wentf9/xops-cli/core/fsx"
 	logger "github.com/wentf9/xops-cli/core/log"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
@@ -517,7 +518,8 @@ type KeyAuth struct {
 }
 
 func (k *KeyAuth) GetMethod() (ssh.AuthMethod, error) {
-	keyData, err := readBoundedRegularFile(k.Path, maxKeyFileBytes)
+	// OpenSSH follows symlinks for user private keys; fsx.ReadAllBounded opens handle-first.
+	keyData, err := fsx.ReadAllBounded(k.Path, fsx.Limits{MaxBytes: maxKeyFileBytes}, fsx.FollowSymlinks())
 	if err != nil {
 		return nil, fmt.Errorf("failed to read key file %s: %w", k.Path, err)
 	}

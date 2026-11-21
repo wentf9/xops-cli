@@ -6,11 +6,13 @@ import (
 	"net"
 	"os"
 	"runtime"
+
+	"github.com/wentf9/xops-cli/core/fsx"
 )
 
-func bindAndLinkSocket(targetPath string) (net.Listener, os.FileInfo, error) {
-	ln, err := unsupportedUnixBindControlSocket(targetPath, runtime.GOOS)
-	return ln, nil, err
+func bindAndLinkSocket(targetPath string) (*fsx.SocketSlot, error) {
+	_, err := unsupportedUnixBindControlSocket(targetPath, runtime.GOOS)
+	return nil, err
 }
 
 func checkPeerUID(conn net.Conn, expectedUID uint32) error {

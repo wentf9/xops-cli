@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/wentf9/xops-cli/core/concurrent"
+	"github.com/wentf9/xops-cli/core/fsx"
 	logger "github.com/wentf9/xops-cli/core/log"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/sync/singleflight"
@@ -1247,55 +1248,25 @@ func (c *Connector) handleStaleControlSocket(ctx context.Context, planNode conne
 	ctrl := target.Control
 	explicitMaster := ctrl != nil && (ctrl.Master == ControlMasterYes || ctrl.Master == ControlMasterAsk) && !ctrl.AllowReuse
 
-	var (
-		replaced    bool
-		reactivated bool
-	)
-	lockErr := withControlSocketDirLock(expandedPath, func() error {
-		currFi, err := os.Lstat(expandedPath)
-		if err != nil || !isControlSocketFileInfo(currFi) {
-			c.getLogger().Debugf("mux: stale socket %q already unlinked by another process", expandedPath)
-			return nil
-		}
-
-		// 1. If file identity changed, another process replaced the socket.
-		if !os.SameFile(origFi, currFi) {
-			replaced = true
-			return nil
-		}
-
-		// 2. File identity is unchanged. Perform a brief non-interactive probe dial
-		// under the directory lock to ensure the socket didn't just activate.
-		probeConn, probeErr := net.DialTimeout("unix", expandedPath, 100*time.Millisecond)
-		if probeErr == nil {
-			_ = probeConn.Close()
-			reactivated = true
-			return nil
-		}
-		if !isConnectionRefused(probeErr) {
-			reactivated = true
-			return nil
-		}
-
-		// 3. Re-confirm file identity directly before unlinking under the directory lock.
-		if finalFi, finalErr := os.Lstat(expandedPath); finalErr == nil && isControlSocketFileInfo(finalFi) && os.SameFile(origFi, finalFi) {
-			c.getLogger().Debugf("mux: unlinking verified stale control socket %q", expandedPath)
-			_ = os.Remove(expandedPath)
-		}
-		return nil
+	outcome, pruneErr := fsx.PruneStaleSocket(expandedPath, origFi, func() bool {
+		return fsx.ProbeStaleUnixSocket(expandedPath, 100*time.Millisecond)
 	})
-	if lockErr != nil {
-		c.getLogger().Debugf("mux: acquire control socket directory lock for %q failed: %v", expandedPath, lockErr)
+	if pruneErr != nil {
+		c.getLogger().Debugf("mux: prune stale control socket %q failed: %v", expandedPath, pruneErr)
 		return nil, nil
 	}
 
-	if replaced {
+	switch outcome {
+	case fsx.StaleSocketReplaced:
 		return c.probeLiveSocketBeforeUnlink(ctx, planNode, expandedPath, target, explicitMaster, 2*time.Second)
-	}
-	if reactivated {
+	case fsx.StaleSocketLive:
 		if client, err, handled := c.tryAttachReactivatedSocket(ctx, planNode, expandedPath, target, explicitMaster); handled {
 			return client, err
 		}
+	case fsx.StaleSocketRemoved:
+		c.getLogger().Debugf("mux: unlinked verified stale control socket %q", expandedPath)
+	case fsx.StaleSocketAlreadyGone:
+		c.getLogger().Debugf("mux: stale socket %q already unlinked by another process", expandedPath)
 	}
 	return nil, nil
 }

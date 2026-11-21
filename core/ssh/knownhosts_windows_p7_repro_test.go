@@ -1,47 +1,32 @@
-//go:build p7repro && windows
+//go:build windows
 
 package ssh
 
 import (
+	"bytes"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 
-	"golang.org/x/sys/windows"
+	"github.com/wentf9/xops-cli/core/fsx"
+	"github.com/wentf9/xops-cli/core/winsec"
 )
 
-func p7WinFileIdentity(t *testing.T, path string) windows.ByHandleFileInformation {
-	t.Helper()
-	f, err := os.Open(path)
-	if err != nil {
-		t.Fatalf("open %q for identity: %v", path, err)
-	}
-	defer func() { _ = f.Close() }()
-	var info windows.ByHandleFileInformation
-	if err := windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &info); err != nil {
-		t.Fatalf("GetFileInformationByHandle(%q): %v", path, err)
-	}
-	return info
-}
-
-func p7SameWinFile(a, b windows.ByHandleFileInformation) bool {
-	return a.VolumeSerialNumber == b.VolumeSerialNumber &&
-		a.FileIndexHigh == b.FileIndexHigh &&
-		a.FileIndexLow == b.FileIndexLow
-}
-
-// TestP7Repro_H7_WindowsOpenKnownHostsNoFollow_ReparsePoint reproduces H7 on Windows:
-// openKnownHostsFileNoFollow performs a path-based GetFileAttributesNoFollow check followed by
-// os.OpenFile (which omits FILE_FLAG_OPEN_REPARSE_POINT). If a symlink/reparse point is swapped
-// into place between the two calls (or when the pre-check misses), os.OpenFile follows the reparse
-// point and returns a handle to the victim file; GetFileInformationByHandle then inspects the
-// victim's attributes (no FILE_ATTRIBUTE_REPARSE_POINT) and permits the open.
-// Additionally, hardenNewKnownHostsFile calls SetNamedSecurityInfo by path, following symlinks.
+// TestP7Repro_H7_WindowsOpenKnownHostsNoFollow_ReparsePoint verifies H7 is fixed on Windows:
+//   - known_hosts opening now uses fsx.OpenLocked / fsx.OpenRegular (CreateFile with
+//     FILE_FLAG_OPEN_REPARSE_POINT + handle attribute inspection) so a swapped leaf
+//     symlink/reparse point can never open or return the victim file.
+//   - New known_hosts files are created via fsx.CreateExclusive with an owner-only
+//     SECURITY_DESCRIPTOR at creation time (rejecting symlinks with os.ErrExist), and
+//     winsec.HardenFileOwnerOnly rejects symlinks via handle-based SetSecurityInfo.
 func TestP7Repro_H7_WindowsOpenKnownHostsNoFollow_ReparsePoint(t *testing.T) {
 	dir := t.TempDir()
+	victimData := []byte("victim-data\n")
 	victimPath := filepath.Join(dir, "victim.txt")
-	if err := os.WriteFile(victimPath, []byte("victim-data\n"), 0o600); err != nil {
+	if err := os.WriteFile(victimPath, victimData, 0o600); err != nil {
 		t.Fatalf("write victim: %v", err)
 	}
 	probeLink := filepath.Join(dir, "probe.link")
@@ -49,8 +34,6 @@ func TestP7Repro_H7_WindowsOpenKnownHostsNoFollow_ReparsePoint(t *testing.T) {
 		t.Skipf("Windows symlink creation unavailable (requires Developer Mode or SeCreateSymbolicLinkPrivilege): %v", err)
 	}
 	_ = os.Remove(probeLink)
-
-	victimInfo := p7WinFileIdentity(t, victimPath)
 
 	t.Run("swapped_leaf_symlink_never_opens_victim", func(t *testing.T) {
 		targetPath := filepath.Join(dir, "known_hosts_race")
@@ -82,29 +65,34 @@ func TestP7Repro_H7_WindowsOpenKnownHostsNoFollow_ReparsePoint(t *testing.T) {
 
 		const attempts = 500
 		for i := range attempts {
-			f, err := openKnownHostsFileNoFollow(targetPath, os.O_RDONLY, 0)
+			lf, err := fsx.OpenLocked(targetPath, fsx.LockShared, false, 0)
 			if err != nil {
 				continue
 			}
-			var got windows.ByHandleFileInformation
-			infoErr := windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &got)
-			_ = f.Close()
-			if infoErr != nil {
+			got, readErr := io.ReadAll(lf)
+			_ = lf.Close()
+			if readErr != nil {
 				continue
 			}
-			if p7SameWinFile(got, victimInfo) {
-				t.Fatalf("H7 reproduced on attempt %d: openKnownHostsFileNoFollow followed swapped symlink and returned a handle to victim %q", i+1, victimPath)
+			if bytes.Equal(got, victimData) {
+				t.Fatalf("H7 reproduced on attempt %d: fsx.OpenLocked followed swapped symlink and read victim %q", i+1, victimPath)
 			}
 		}
 	})
 
-	t.Run("hardenNewKnownHostsFile_follows_symlink", func(t *testing.T) {
+	t.Run("create_and_harden_reject_symlink", func(t *testing.T) {
 		linkPath := filepath.Join(dir, "known_hosts_harden_link")
 		if err := os.Symlink(victimPath, linkPath); err != nil {
 			t.Fatalf("create symlink: %v", err)
 		}
-		if err := hardenNewKnownHostsFile(linkPath); err == nil {
-			t.Fatalf("H7 reproduced: hardenNewKnownHostsFile(%q) followed symlink and mutated target DACL without error", linkPath)
+		if f, err := fsx.CreateExclusive(linkPath, fsx.OwnerOnlyPerm); !errors.Is(err, os.ErrExist) {
+			if f != nil {
+				_ = f.Close()
+			}
+			t.Fatalf("H7 reproduced: fsx.CreateExclusive(%q) = %v, want os.ErrExist", linkPath, err)
+		}
+		if err := winsec.HardenFileOwnerOnly(linkPath); err == nil {
+			t.Fatalf("H7 reproduced: winsec.HardenFileOwnerOnly(%q) followed symlink and mutated target DACL without error", linkPath)
 		}
 	})
 }
